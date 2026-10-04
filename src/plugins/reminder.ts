@@ -120,7 +120,13 @@ const ROUTES = {
  * secret).
  */
 export function httpReminderService(): ReminderService {
-  async function call(conn: ReminderConnection, method: "GET" | "POST", path: string, body?: unknown): Promise<{ status: number; result: any }> {
+  /**
+   * One request. `scrub`: values cut out of reminder-app's message before it is shortened, so a value straddling the
+   * cut cannot leave a piece of itself behind. `notFound: "null"`: a 404 without a code is an answer (an unknown
+   * reminder id); otherwise it is reminder-app saying this client cannot use the route.
+   */
+  async function call(conn: ReminderConnection, method: "GET" | "POST", path: string, body?: unknown,
+    opts: { scrub?: string[]; notFound?: "null" } = {}): Promise<{ status: number; result: any }> {
     const origin = new URL(conn.baseUrl);
     const url = new URL(path, origin);
     if (url.origin !== origin.origin) throw new ReminderServiceError("refused", "a reminder-app request escaped its configured origin");
@@ -146,12 +152,17 @@ export function httpReminderService(): ReminderService {
       return { status: response.status, result: envelope.result };
     }
     const code = typeof envelope?.error?.code === "string" ? envelope.error.code : null;
-    const said = typeof envelope?.error?.message === "string" ? oneLine(envelope.error.message, 300) : "";
+    const said = typeof envelope?.error?.message === "string" ? oneLine(without(envelope.error.message, opts.scrub ?? []), 300) : "";
     if (response.status === 404 && code === "unknown_hook") throw new ReminderServiceError("unknown_hook", "reminder-app does not know this mount's registration");
     if (response.status >= 500 || response.status === 429 || response.status === 408) {
       throw new ReminderServiceError("unavailable", `reminder-app returned HTTP ${response.status}${said ? `: ${said}` : ""}`, { mayHaveLanded: mayHaveLanded && response.status >= 500 });
     }
-    if (response.status === 404) return { status: 404, result: null };
+    if (response.status === 404) {
+      if (opts.notFound === "null") return { status: 404, result: null };
+      // 404 without a code: "a route a client cannot use" (reminder-app/docs/webhook-delivery.md, reminder-app 0.1.0,
+      // PR #6, 311b1f5, "Errors"). Nothing was done, so this is a refusal, not a request that may have landed.
+      throw new ReminderServiceError("refused", "reminder-app does not offer this request to this deployment's client (HTTP 404); nothing was done");
+    }
     if (response.status === 401) {
       throw new ReminderServiceError("refused", "reminder-app did not accept this deployment's client credential (unknown, rotated or revoked); whoever deploys has to configure a current one");
     }
@@ -173,16 +184,16 @@ export function httpReminderService(): ReminderService {
         : [];
     },
     async register(conn, hook) {
-      const { result } = await call(conn, "POST", ROUTES.hooks, { url: hook.url, secret: hook.secret });
+      const { result } = await call(conn, "POST", ROUTES.hooks, { url: hook.url, secret: hook.secret }, { scrub: [hook.url, hook.secret, new URL(hook.url).host] });
       if (typeof result?.hookId !== "string") throw new ReminderServiceError("unavailable", "reminder-app's registration answer had no hookId", { mayHaveLanded: true });
       return { hookId: result.hookId };
     },
     async create(conn, r) {
-      const { status, result } = await call(conn, "POST", ROUTES.reminders, {
+      const { result } = await call(conn, "POST", ROUTES.reminders, {
         requestId: r.requestId,
         reminder: { title: r.title, notes: r.notes, schedule: r.schedule, anchor: null, target: r.target },
       });
-      const made = status === 404 ? null : reminderOf(result);
+      const made = reminderOf(result);
       if (!made) throw new ReminderServiceError("unavailable", "reminder-app's answer had no reminder", { mayHaveLanded: true });
       return made;
     },
@@ -191,14 +202,13 @@ export function httpReminderService(): ReminderService {
       return Array.isArray(result?.reminders) ? result.reminders.map(reminderOf).filter((r: ServiceReminder | null): r is ServiceReminder => r !== null) : [];
     },
     async cancel(conn, id) {
-      const { status, result } = await call(conn, "POST", ROUTES.cancel, { id });
+      const { status, result } = await call(conn, "POST", ROUTES.cancel, { id }, { notFound: "null" });
       return status === 404 ? null : reminderOf(result);
     },
     async unregister(conn, hookId) {
       // With cascade, one transaction cancels what names the hook and deletes it; without, a hook still in use is
       // refused with 409 `hook_in_use` (webhook-delivery.md, reminder-app 0.1.0, PR #6, 311b1f5, "Unregister").
-      const { status, result } = await call(conn, "POST", ROUTES.hooksDelete, { hookId, cascade: "cancel" });
-      if (status === 404) throw new ReminderServiceError("unknown_hook", "reminder-app does not know this registration");
+      const { result } = await call(conn, "POST", ROUTES.hooksDelete, { hookId, cascade: "cancel" });
       return { cancelledReminders: Array.isArray(result?.cancelledReminders) ? result.cancelledReminders.length : 0 };
     },
   };
@@ -475,21 +485,35 @@ async function ensureRegistered(ctx: PluginContext, service: ReminderService, co
     const register = () => service.register(conn, { url: created.url, secret: created.secret });
     let before: Set<string> | null;
     try { before = new Set((await service.listHooks(conn)).map((h) => h.hookId)); } catch { before = null; }
-    let registered: { hookId: string };
-    try { registered = await register(); }
-    catch (e) {
-      const uncertain = !(e instanceof ReminderServiceError) || e.code === "unavailable";
-      if (!uncertain || before === null) throw scrubbed(e);
+    let lost: unknown = null;
+    /** One register: its answer, or null when the answer was lost (it may have landed); a refusal throws. */
+    const attempt = async (): Promise<{ hookId: string } | null> => {
+      try { return await register(); }
+      catch (e) {
+        if (e instanceof ReminderServiceError && e.code !== "unavailable") throw scrubbed(e);
+        lost = e;
+        return null;
+      }
+    };
+    // What may be left at reminder-app when the answer was lost and the registration cannot be attributed: it is not
+    // deleted, because the only hooks it could be told from are this agent's other mounts', which are in use.
+    const leftBehind = "if it was registered, that registration stays at reminder-app, where it counts towards this agent's 20 hooks";
+    let registered = await attempt();
+    for (let tries = 1; registered === null; tries++) {
+      if (before === null) {
+        throw new ReminderServiceError("unavailable", `reminder-app's answer was lost and its list of hooks could not be read beforehand, so whether this mount's endpoint was registered cannot be told; ${leftBehind}; nothing was set, try again`);
+      }
       let after: Array<{ hookId: string; origin: string }>;
-      try { after = await service.listHooks(conn); } catch { throw scrubbed(e); }
+      try { after = await service.listHooks(conn); }
+      catch { throw new ReminderServiceError("unavailable", `reminder-app's answer was lost and its list of hooks could not be read, so whether this mount's endpoint was registered cannot be told; ${leftBehind}; nothing was set, try again`); }
       const fresh = after.filter((h) => !before!.has(h.hookId) && h.origin === url.origin);
       if (fresh.length > 1) {
-        throw new ReminderServiceError("unavailable", "reminder-app's answer was lost and which new registration is this mount's cannot be told; nothing was set, try again");
+        throw new ReminderServiceError("unavailable", `reminder-app's answer was lost and more than one new registration appeared (another mount of this agent registering at that moment), so which is this mount's cannot be told; ${leftBehind}; nothing was set, try again`);
       }
-      if (fresh.length === 1) registered = { hookId: fresh[0]!.hookId };
-      else {
-        try { registered = await register(); } catch (again) { throw scrubbed(again); }
-      }
+      if (fresh.length === 1) { registered = { hookId: fresh[0]!.hookId }; break; }
+      // Nothing landed. One more try, inside this call, while the secret is still in hand.
+      if (tries >= 2) throw scrubbed(lost);
+      registered = await attempt();
     }
     if (typeof registered?.hookId !== "string" || !ID.test(registered.hookId)) {
       throw new ReminderServiceError("unavailable", "reminder-app's registration answer carried no usable id; nothing was set");
@@ -502,18 +526,35 @@ async function ensureRegistered(ctx: PluginContext, service: ReminderService, co
     throw forModel(e);
   }
   const next: HookState = { inboundHookId: created.hookId, serviceHookId, staleInboundHookIds: replaced, registeredAt: Date.now() };
-  await saveHook(ctx, next);
+  try { await saveHook(ctx, next); }
+  catch {
+    // Registered, and the id cannot be written down: nothing would ever know to delete it. This one can be
+    // identified, so it is deleted again, and the hook with it.
+    let deleted = true;
+    try { await service.unregister(conn, serviceHookId); } catch { deleted = false; }
+    await revokeAll(ctx, [created.hookId]);
+    logEvent("reminder.register", { ...line, outcome: "failed", code: "unrecorded" });
+    throw new ReminderServiceError("unavailable", `this mount could not record its registration with reminder-app, so ${deleted ? "it was deleted again" : `it could not be deleted again and stays there (${serviceHookId}), counting towards this agent's 20 hooks`}; nothing was set`);
+  }
   const left = await revokeAll(ctx, replaced);
   if (left.length !== replaced.length) await saveHook(ctx, { ...next, staleInboundHookIds: left });
   logEvent("reminder.register", { ...line, outcome: "registered" });
   return serviceHookId;
 }
 
-/** reminder-app no longer knows the registration: forget it, keeping its hook for revoking, so the next use registers anew. */
-async function forgetRegistration(ctx: PluginContext): Promise<void> {
-  const state = await loadHook(ctx);
-  const stale = state.inboundHookId ? [...state.staleInboundHookIds, state.inboundHookId] : state.staleInboundHookIds;
-  await saveHook(ctx, { inboundHookId: null, serviceHookId: null, staleInboundHookIds: [...new Set(stale)], registeredAt: null });
+/**
+ * reminder-app no longer knows `lostHookId`: forget it, keeping its inbound hook for revoking, so the next use registers
+ * anew. Only if the record still names that registration, read and written in one transaction: two calls that both
+ * met the lost one must not have the second forget the registration the first has just made in its place.
+ */
+async function forgetRegistration(ctx: PluginContext, lostHookId: string): Promise<void> {
+  await ctx.db.transaction(HOOK_STORE, "readwrite", (tx) => {
+    const state = hookState(tx.get(HOOK_STORE, HOOK_KEY));
+    if (state.serviceHookId !== lostHookId) return;
+    const stale = state.inboundHookId ? [...state.staleInboundHookIds, state.inboundHookId] : state.staleInboundHookIds;
+    const record: HookState = { inboundHookId: null, serviceHookId: null, staleInboundHookIds: [...new Set(stale)], registeredAt: null };
+    tx.put(HOOK_STORE, record as unknown as Json, HOOK_KEY);
+  });
 }
 
 /** reminder-app's `requestId` (16-100 of `[A-Za-z0-9_-]`) for one operation: a digest, since an operation id may hold other characters. */
@@ -642,6 +683,25 @@ export function createReminderPlugin(deps: { service?: ReminderService; now?: ()
   const service = deps.service ?? httpReminderService();
   const now = deps.now ?? Date.now;
   const deployment: ReminderDeployment = { serviceUrl: deps.serviceUrl || null, clientCredential: deps.clientCredential || null };
+  /**
+   * One registration in flight per mount, recovery included. pi runs a turn's tool calls in parallel ("remind me at
+   * 9 and at 17"), and two creates on a fresh mount would otherwise each open a hook and register it, the record
+   * keeping the last: the other's reminder would then target a registration the mount no longer recognises, its
+   * firing judged not this mount's and dropped, and its hook left at reminder-app. Every call joins the one in
+   * flight, and the entry goes when it settles, success or failure. In memory is enough: one runtime holds one
+   * agent's object, so every call for a mount meets this map.
+   */
+  const registering = new Map<string, Promise<string>>();
+  const registered = (ctx: PluginContext, conn: ReminderConnection): Promise<string> => {
+    const key = `${ctx.caller.tenantId}/${ctx.caller.agentId}/${ctx.alias}`;
+    const running = registering.get(key);
+    if (running) return running;
+    const flight: Promise<string> = ensureRegistered(ctx, service, conn).finally(() => {
+      if (registering.get(key) === flight) registering.delete(key);
+    });
+    registering.set(key, flight);
+    return flight;
+  };
   return {
     id: "reminder",
     version: "1.0.0",
@@ -669,12 +729,13 @@ export function createReminderPlugin(deps: { service?: ReminderService; now?: ()
         const make = async (hookId: string) => service.create(conn, { requestId, title, notes: note, schedule, target: { kind: "webhook", hookId } });
         let made: ServiceReminder;
         try {
-          try { made = await make(await ensureRegistered(ctx, service, conn)); }
+          const first = await registered(ctx, conn);
+          try { made = await make(first); }
           catch (e) {
             if (!(e instanceof ReminderServiceError) || e.code !== "unknown_hook") throw e;
             // reminder-app lost the registration: register again, once, and make the reminder against that.
-            await forgetRegistration(ctx);
-            made = await make(await ensureRegistered(ctx, service, conn));
+            await forgetRegistration(ctx, first);
+            made = await make(await registered(ctx, conn));
           }
         } catch (e) { throw forModel(e); }
         return { id: made.id, dueAt: isoOf(made.nextAt) ?? new Date(due).toISOString(), note };
@@ -729,10 +790,16 @@ export function createReminderPlugin(deps: { service?: ReminderService; now?: ()
     async unmount(ctx) {
       const state = await loadHook(ctx);
       if (state.serviceHookId) {
-        const conn = connection(ctx, deployment);
+        // What the person removing the mount is told when this fails, since only they can finish it now.
+        const remaining = "this mount's reminders are still at reminder-app and will keep firing into a push endpoint " +
+          "this removal revokes, so they wake nobody; cancel them there, or delete the registration with cascade, by hand";
+        let conn: ReminderConnection;
+        try { conn = connection(ctx, deployment); } catch (e) { throw new Error(`${(e as Error).message}; ${remaining}`); }
         try { await service.unregister(conn, state.serviceHookId); }
         catch (e) {
-          if (!(e instanceof ReminderServiceError) || e.code !== "unknown_hook") throw forModel(e);
+          if (!(e instanceof ReminderServiceError) || e.code !== "unknown_hook") {
+            throw new Error(`could not delete this mount's registration at reminder-app (${forModel(e).message}); ${remaining}`);
+          }
         }
         await saveHook(ctx, { ...state, serviceHookId: null });
       }

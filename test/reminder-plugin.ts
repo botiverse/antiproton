@@ -53,7 +53,8 @@ const future = (ms = HOUR) => new Date(Date.now() + ms).toISOString();
  * "fails" loses it without registering; "two-land-then-fails" also registers a second hook on the same origin, as
  * another mount of the agent registering at that moment would.
  */
-function fakeService(opts: { registerFails?: Error; unregisterFails?: Error; registerPlan?: Array<"ok" | "lands-then-fails" | "fails" | "two-land-then-fails"> } = {}) {
+function fakeService(opts: { registerFails?: Error; unregisterFails?: Error; registerPlan?: Array<"ok" | "lands-then-fails" | "fails" | "two-land-then-fails">;
+  registerDelayMs?: number; listHooksFails?: boolean; createDelays?: number[] } = {}) {
   const calls: Array<{ op: string; arg: any; conn: ReminderConnection }> = [];
   const registrations: Array<{ hookId: string; url: string; secret: string }> = [];
   const reminders = new Map<string, ServiceReminder>();
@@ -61,10 +62,12 @@ function fakeService(opts: { registerFails?: Error; unregisterFails?: Error; reg
   const service: ReminderService = {
     async listHooks(conn) {
       calls.push({ op: "listHooks", arg: null, conn });
+      if (opts.listHooksFails) throw new ReminderServiceError("unavailable", "reminder-app did not answer");
       return registrations.map((r) => ({ hookId: r.hookId, origin: new URL(r.url).origin }));
     },
     async register(conn, hook) {
       calls.push({ op: "register", arg: { url: hook.url }, conn });
+      if (opts.registerDelayMs) await new Promise((r) => setTimeout(r, opts.registerDelayMs));
       if (opts.registerFails) throw opts.registerFails;
       const step = opts.registerPlan?.shift() ?? "ok";
       const lost = () => new ReminderServiceError("unavailable", "reminder-app did not answer", { mayHaveLanded: true });
@@ -77,6 +80,8 @@ function fakeService(opts: { registerFails?: Error; unregisterFails?: Error; reg
     },
     async create(conn, r) {
       calls.push({ op: "create", arg: r, conn });
+      const delay = opts.createDelays?.shift();
+      if (delay) await new Promise((res) => setTimeout(res, delay));
       if (!registrations.some((x) => x.hookId === r.target.hookId)) throw new ReminderServiceError("unknown_hook", "unknown hook");
       const id = `rem-${++n}`;
       const at = "fireAt" in r.schedule ? Date.parse(r.schedule.fireAt) : Date.now() + r.schedule.delaySeconds * 1000;
@@ -363,7 +368,7 @@ await check("a deployment with no reminder-app credential or origin refuses ever
       must(why === expected, `${what}, ${tool}: refused with "${why}"`);
     }
     const why = await refusal(plugin.unmount!(m.ctx));
-    must(why === expected, `${what}, unmount: refused with "${why}"`);
+    must(why.startsWith(expected) && /still at reminder-app/.test(why), `${what}, unmount: refused with "${why}"`);
     must(svc.calls.length === 0 && m.hooks.made.length === 0, `${what}: something was sent or opened: ${svc.ops().join(",")}`);
   }
   // Control: the unconfigured registry entry is that plugin.
@@ -657,6 +662,9 @@ await check("the HTTP client maps reminder-app's errors: unknown_hook, an unknow
     must((await codeOf(create())).startsWith("unknown_hook"), `404 unknown_hook became ${await codeOf(create())}`);
     fakeServer(() => fail(404, "Not found."));
     must((await http.cancel(CONN, "rem-x")) === null, "a 404 without a code on cancel was not 'already gone'");
+    const noRoute = await create().then(() => null, (e) => e);
+    must(noRoute instanceof ReminderServiceError && noRoute.code === "refused" && !(noRoute as any).mayHaveLanded && /does not offer this request/.test(noRoute.message),
+      `a 404 without a code on create became ${noRoute?.code}${(noRoute as any)?.mayHaveLanded ? " (may have landed)" : ""}: ${noRoute?.message}`);
     fakeServer(() => fail(403, "Agent-owned reminders are not enabled on this server.", "agent_reminders_disabled"));
     must(/not switched on reminders for this deployment/.test(await codeOf(create())), `switched off became ${await codeOf(create())}`);
     fakeServer(() => fail(403, "A Raft agent receives reminders through Raft.", "raft_agent_uses_raft_channel"));
@@ -676,10 +684,104 @@ await check("the HTTP client maps reminder-app's errors: unknown_hook, an unknow
     must(/refused: .*HTTP 409.*used by 2 active/.test(await codeOf(http.unregister(CONN, "hook_1"))), `hook_in_use became ${await codeOf(http.unregister(CONN, "hook_1"))}`);
     fakeServer(() => fail(503, "Could not resolve the hook host. Retry."));
     must((await codeOf(create())).startsWith("unavailable"), `a 503 became ${await codeOf(create())}`);
+    // A URL straddling the 300-character cut: scrubbed after the cut, the part before it would stay.
+    const longUrl = `https://hooks.antiproton.example/hooks/${"p".repeat(120)}-path-that-carries-a-token`;
+    fakeServer((_m, _p, body) => fail(400, `${"f".repeat(190)} ${body?.url} is not acceptable`));
+    const straddle = await codeOf(http.register(CONN, { url: longUrl, secret: "s".repeat(64) }));
+    must(straddle.startsWith("refused") && !straddle.includes("ppppp") && !straddle.includes("hooks.antiproton.example") && !straddle.includes("/hooks/"),
+      `a URL straddling the cut left part of itself: ${straddle}`);
     fakeServer((_m, _p, body) => fail(500, `echo ${body?.secret}`));
     const echoed = await codeOf(http.register(CONN, { url: "https://hooks.antiproton.example/hooks/x", secret: "TOPSECRET".repeat(4) }));
     must(echoed.startsWith("unavailable"), `control: ${echoed}`);
   } finally { globalThis.fetch = realFetch; }
+});
+
+// ---- two creates at once
+
+/** Two creates in one turn, as pi runs them: in parallel. */
+async function both(m: ReturnType<typeof mount>) {
+  return Promise.all([m.call("create", { delayMinutes: 9 * 60, note: "at nine" }), m.call("create", { delayMinutes: 17 * 60, note: "at five" })]);
+}
+
+await check("two creates at once on a fresh mount make one registration, and both reminders are listed and delivered", async () => {
+  const svc = fakeService({ registerDelayMs: 20 });
+  const plugin = createReminderPlugin({ ...DEPLOYMENT, service: svc.service, now: () => NOW });
+  const m = mount(plugin);
+  const [a, b] = await both(m);
+  must(svc.registrations.length === 1 && m.hooks.made.length === 1,
+    `${svc.registrations.length} reminder-app hooks (${svc.registrations.map((r) => r.hookId).join(",")}) and ${m.hooks.made.length} inbound hooks for one mount`);
+  const hook = svc.registrations[0]!.hookId;
+  must(svc.reminders.get(a.id)?.target?.hookId === hook && svc.reminders.get(b.id)?.target?.hookId === hook, "a reminder targets another registration");
+  const listed = (await m.call("list", {})).reminders.map((r: any) => r.id).sort();
+  must(JSON.stringify(listed) === JSON.stringify([a.id, b.id].sort()), `list shows ${JSON.stringify(listed)}`);
+  for (const r of [a, b]) {
+    const fired = await receive(plugin, push(goodPush({ hookId: hook, firingId: `${r.id}:1:1`, reminder: { id: r.id, title: "t", notes: "n", anchor: null } }), SECRET, { ts: at() }), SECRET, m.ctx);
+    must(fired.deliver, `${r.id}'s firing was not delivered: ${JSON.stringify(fired)}`);
+  }
+});
+
+await check("two creates at once whose registration answer is lost adopt one hook between them, and both reminders are listed", async () => {
+  const svc = fakeService({ registerDelayMs: 20, registerPlan: ["lands-then-fails"] });
+  const m = mount(createReminderPlugin({ ...DEPLOYMENT, service: svc.service }));
+  const [a, b] = await both(m);
+  must(svc.registrations.length === 1 && m.hooks.made.length === 1 && svc.ops().filter((o) => o === "register").length === 1,
+    `registers ${svc.ops().join(",")}; ${svc.registrations.length} reminder-app hooks, ${m.hooks.made.length} inbound`);
+  const listed = (await m.call("list", {})).reminders.map((r: any) => r.id).sort();
+  must(JSON.stringify(listed) === JSON.stringify([a.id, b.id].sort()), `list shows ${JSON.stringify(listed)}`);
+});
+
+await check("two creates at once that both meet a lost registration register again once between them", async () => {
+  // The second create's refusal arrives after the first has registered again and recorded it: its forget must
+  // see that the record no longer names the lost registration, and leave the new one alone.
+  const svc = fakeService({ registerDelayMs: 20, createDelays: [0, 10, 80] });
+  const m = mount(createReminderPlugin({ ...DEPLOYMENT, service: svc.service }));
+  await m.call("create", { delayMinutes: 5, note: "first" });
+  svc.registrations.length = 0;
+  const [a, b] = await both(m);
+  must(svc.registrations.length === 1, `${svc.registrations.length} new registrations: ${svc.registrations.map((r) => r.hookId).join(",")}`);
+  const hook = svc.registrations[0]!.hookId;
+  must(m.state().serviceHookId === hook && svc.reminders.get(a.id)?.target?.hookId === hook && svc.reminders.get(b.id)?.target?.hookId === hook,
+    `record ${m.state().serviceHookId}, targets ${svc.reminders.get(a.id)?.target?.hookId} ${svc.reminders.get(b.id)?.target?.hookId}`);
+});
+
+await check("a registration that failed does not stay in flight: the next create on the mount registers afresh", async () => {
+  const svc = fakeService();
+  const m = mount(createReminderPlugin({ ...DEPLOYMENT, service: svc.service }));
+  const register = svc.service.register;
+  svc.service.register = async () => { svc.service.register = register; throw new ReminderServiceError("refused", "reminder-app refused the request (HTTP 400): not now"); };
+  must(/not now/.test(await refusal(m.call("create", { delayMinutes: 5, note: "n" }))), "control: the first registration did not fail");
+  await m.call("create", { delayMinutes: 5, note: "n" }).catch((e) => { throw new Error(`the create after a failed registration still met it: ${e.message}`); });
+  must(svc.registrations.length === 1, `registrations ${svc.registrations.length}`);
+});
+
+// ---- what a failed registration leaves behind
+
+await check("a registration that cannot be recorded is deleted again, and its inbound hook revoked", async () => {
+  const svc = fakeService();
+  const m = mount(createReminderPlugin({ ...DEPLOYMENT, service: svc.service }));
+  const put = m.ctx.db.put.bind(m.ctx.db);
+  let failOnce = true;
+  m.ctx.db = { ...m.ctx.db, put: async (...a: any[]) => { if (failOnce) { failOnce = false; throw new Error("disk full"); } return put(...a); } };
+  const why = await refusal(m.call("create", { delayMinutes: 5, note: "n" }));
+  must(/deleted again/.test(why), `refused with "${why}"`);
+  must(svc.registrations.length === 0 && svc.ops().includes("unregister"), `reminder-app kept ${svc.registrations.map((r) => r.hookId).join(",")}`);
+  must(m.hooks.revoked.includes(m.hooks.made[0]!.hookId), "the inbound hook was left live");
+});
+
+await check("a lost answer that cannot be attributed says the registration may stay at reminder-app and count towards the cap", async () => {
+  const unread = fakeService({ registerPlan: ["lands-then-fails"], listHooksFails: true });
+  const a = mount(createReminderPlugin({ ...DEPLOYMENT, service: unread.service }));
+  const why = await refusal(a.call("create", { delayMinutes: 5, note: "n" }));
+  must(/stays at reminder-app/.test(why) && /20 hooks/.test(why), `unreadable list: "${why}"`);
+  const two = fakeService({ registerPlan: ["two-land-then-fails"] });
+  const b = mount(createReminderPlugin({ ...DEPLOYMENT, service: two.service }));
+  const ambiguous = await refusal(b.call("create", { delayMinutes: 5, note: "n" }));
+  must(/stays at reminder-app/.test(ambiguous), `two new: "${ambiguous}"`);
+  // A second attempt whose answer is also lost but which landed is still found and adopted.
+  const late = fakeService({ registerPlan: ["fails", "lands-then-fails"] });
+  const c = mount(createReminderPlugin({ ...DEPLOYMENT, service: late.service }));
+  await c.call("create", { delayMinutes: 5, note: "n" }).catch((e) => { throw new Error(`a landed second attempt was not adopted: ${e.message}`); });
+  must(late.registrations.length === 1 && c.state().serviceHookId === late.registrations[0]!.hookId, `adopted ${c.state().serviceHookId}`);
 });
 
 // ---- unmount
@@ -730,6 +832,7 @@ await check("unmount with reminder-app down throws, and leaves the record so a l
   await m.call("create", { delayMinutes: 5, note: "one" });
   const why = await refusal(plugin.unmount!(m.ctx));
   must(/HTTP 503/.test(why), `unmount failed with "${why}"`);
+  must(/reminders are still at reminder-app/.test(why) && /revokes/.test(why), `the remover is not told the reminders remain: "${why}"`);
   must(m.state().serviceHookId === svc.registrations[0]!.hookId, "a failed unregister cleared the record");
 });
 
