@@ -1369,7 +1369,7 @@ export class AgentRuntime {
             const refused = await refuseOverCap({
               sql, owner, running,
               job: { id: res.operationId, session, mount: bg.alias, tool: shown, handle: bg.handle },
-              cancel: () => gw.cancelBackground(ctx, bg.alias, bg.handle),
+              cancel: () => gw.cancelBackground(ctx, bg.alias, bg.handle, res.operationId),
             });
             return { status: "rejected", error: { code: "background_limit", message: refused.message } };
           }
@@ -1970,7 +1970,7 @@ export class AgentRuntime {
       owner: { tenantId, agentId },
       cancel: (job) => this.#gateway.cancelBackground(
         { tenantId, agentId, taskId: job.session === MAIN_SESSION ? LEGACY_TASK : job.session },
-        job.mount, job.handle as Json),
+        job.mount, job.handle as Json, job.id),
       completeOperation: async (id, status) => { await this.store.completeOperation(tenantId, id, status, null); },
     });
     // Function tools an API caller runs itself (Agents API, task #17): offered to
@@ -2227,7 +2227,7 @@ export class AgentRuntime {
     const jobs = await stopSessionJobs({
       sql, owner: { tenantId, agentId }, session,
       cancel: (job) => this.#gateway.cancelBackground(
-        { tenantId, agentId, taskId: session === MAIN_SESSION ? LEGACY_TASK : session }, job.mount, job.handle as Json),
+        { tenantId, agentId, taskId: session === MAIN_SESSION ? LEGACY_TASK : session }, job.mount, job.handle as Json, job.id),
       completeOperation: async (id, status) => { await this.store.completeOperation(tenantId, id, status, null); },
     });
     return { cancelledTurn, stoppedJobs: jobs.stopped, stillRunning: jobs.stillRunning };
@@ -2295,8 +2295,9 @@ export class AgentRuntime {
       ({ tenantId, agentId, taskId: job.session === MAIN_SESSION ? LEGACY_TASK : job.session });
     const pass = (deliver: (session: string, text: string) => Promise<void>) => runBackgroundPass({
       sql, owner,
-      poll: (job) => this.#gateway.pollBackground(jobCtx(job), job.mount, job.handle as Json),
-      cancel: (job) => this.#gateway.cancelBackground(jobCtx(job), job.mount, job.handle as Json),
+      // A job is kept under the id of the operation that started it, so the plugin is told that operation.
+      poll: (job) => this.#gateway.pollBackground(jobCtx(job), job.mount, job.handle as Json, job.id),
+      cancel: (job) => this.#gateway.cancelBackground(jobCtx(job), job.mount, job.handle as Json, job.id),
       completeOperation: async (id, status) => { await this.store.completeOperation(tenantId, id, status, null); },
       deliver,
     });

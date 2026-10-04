@@ -6,7 +6,14 @@ export interface ToolSchema {
   summary: string;
   parameters: Json;
   sideEffects: "read" | "write";
-  /** Whether the plugin can make this call idempotent (§8.3). */
+  /**
+   * Whether the plugin can make this call idempotent (§8.3).
+   *
+   * `"native"` on a write makes it replay-safe (`replayPolicy`, src/runtime/pi-tools.ts): after a crash either engine
+   * runs the call again, as a new gateway operation with a new {@link PluginContext.operationId}. So a write that
+   * dedupes on `operationId` must not declare `"native"`: its re-run would carry a fresh key and land twice. Declare
+   * `"native"` only when the service itself recognises the repeat (by the arguments, or a key that survives a re-run).
+   */
   idempotency: "native" | "key" | "none";
   /**
    * This tool can hand back a result the runtime parked because it was too big.
@@ -287,6 +294,34 @@ export interface PluginContext {
      */
     contextId?: string;
   };
+  /**
+   * The gateway's id for the operation this context serves. Opaque; compare it for equality only. Use it as the
+   * idempotency key a plugin hands its service, so one operation reaching the plugin more than once lands once.
+   *
+   * The same id, for every step of one operation:
+   * - its `invoke`, and the `invoke` `applyApproval` runs once a person approves the held call (under the id it was
+   *   held under);
+   * - `interrupts.resume` and `interrupts.cancel` of each question it asks, including questions a resume asks in turn,
+   *   and the cancel of a question nobody could answer;
+   * - `background.poll` and `background.cancel` of work it started, by the alarm, the `jobs` tool, a session cancel,
+   *   the time ceiling or the cap.
+   *
+   * A different id for every new model tool call, including the model retrying: that is a new request. A run_js
+   * program's call gets an id derived from `${toolCallId}:${n}`, so the same run_js call run again names the same ids,
+   * and the gateway answers those `already_attempted` without reaching the plugin.
+   *
+   * What it does not cover:
+   * - Recovery. After a crash both engines re-run only replay-safe calls (a read, or a write declaring
+   *   `idempotency: "native"`), and the re-run is a new operation with a new id; see {@link ToolSchema.idempotency}.
+   * - Several writes in one operation (a call and its resume, say): the plugin tells them apart, e.g. by a suffix.
+   *
+   * Set by the gateway alone (`#contextFor`, src/runtime/gateway.ts): run_js builds a call's options field by field
+   * and the production host forwards no `operationId` (`hostCallOpts`, cf/src/runtime.ts), so no model or program
+   * names it. Absent where the context serves no operation: `promptContribution`, `Holding.activity`/`activities`/
+   * `usage`/`release`/`files`, `receive`, `reportActivity`, `snapshotTools`, and a poll or cancel by handle alone
+   * (the bench runner's `benchSweJob`).
+   */
+  operationId?: string;
   /**
    * The name this mount was given, which is the only name the model knows.
    *

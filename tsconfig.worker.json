@@ -89,6 +89,7 @@
     "test/run-js-resume.ts",
     "test/run-js-opts.ts",
     "test/caller-context.ts",
+    "test/operation-id.ts",
     "test/tool-interrupts.ts",
     "test/mcp-plugin.ts",
     "test/raft-plugin.ts",

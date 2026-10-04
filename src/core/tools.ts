@@ -33,6 +33,11 @@ export interface ToolInterrupt {
   /** An AnswerSpec (core/execution.ts), already checked by the gateway. */
   answer: Json;
   state: Json;
+  /**
+   * The operation the question belongs to, set by the gateway (`#run`) and handed back to the plugin as
+   * `PluginContext.operationId` on resume and cancel. Host-side like `state`; absent on a question built elsewhere.
+   */
+  operationId?: string;
 }
 
 import type { CredentialRefKind, CredentialState } from "../plugins/types.ts";

@@ -854,6 +854,9 @@ export class ToolGateway {
     facts: () => { callId?: string },
     step: (context: PluginContext) => Promise<Json | Backgrounded | Interrupt>,
     fromProgram = false,
+    /** What the plugin is told the operation is (`PluginContext.operationId`): this step's own row, unless it
+     *  continues an earlier operation, as a resume does. */
+    serves = operationId,
   ): Promise<ToolResult> {
     const credential = r.mount.secretRef
       ? await this.#secrets.resolve(r.mount.secretRef, { tenantId: r.mount.tenantId, agentId: r.mount.agentId })
@@ -887,7 +890,7 @@ export class ToolGateway {
         return alreadyAttempted(
           operationId, (await this.#store.getOperation(ctx.tenantId, operationId))?.status ?? null);
       }
-      const raw = await step(this.#contextFor(ctx, r.mount, credential, fromProgram));
+      const raw = await step(this.#contextFor(ctx, r.mount, credential, fromProgram, serves));
       // A tool that ended a container's lease says so under LEASE_KEY. The fact
       // is recorded and the key removed: the result object is serialised whole
       // into what the model reads, so left in place it is tokens in the
@@ -912,7 +915,7 @@ export class ToolGateway {
           : "error" in spec ? `${plugin.id} asked a question whose answer spec is unusable: ${spec.error}` : null;
         if (why !== null) {
           if (interruptsOf(plugin)?.cancel) {
-            try { await interruptsOf(plugin)!.cancel!(r.tool, result.state, this.#contextFor(ctx, r.mount, credential, fromProgram)); } catch { /* reported below either way */ }
+            try { await interruptsOf(plugin)!.cancel!(r.tool, result.state, this.#contextFor(ctx, r.mount, credential, fromProgram, serves)); } catch { /* reported below either way */ }
           }
           await this.#store.completeOperation(ctx.tenantId, operationId, "failed", null, undefined, facts());
           await counted("failed");
@@ -926,6 +929,9 @@ export class ToolGateway {
             alias: r.mount.alias, tool: r.tool, question: String(result.question),
             ...(result.context !== undefined ? { context: result.context } : {}),
             answer: (spec as { spec: Json }).spec, state: result.state,
+            // The operation the question belongs to rides with it, so its resume and its cancel are told the same
+            // one (`resumeInterrupt`, `cancelInterrupt`), and so is a question the resume asks in turn.
+            operationId: serves,
           },
         };
       }
@@ -989,7 +995,7 @@ export class ToolGateway {
    */
   async resumeInterrupt(
     ctx: CallContext,
-    i: { alias: string; tool: string; state: Json },
+    i: { alias: string; tool: string; state: Json; operationId?: string },
     answer: Json,
     opts: { callId?: string } = {},
   ): Promise<ToolResult> {
@@ -1013,8 +1019,11 @@ export class ToolGateway {
         mountAlias: mount.alias, tool: `${mount.plugin}.${i.tool}`, toolVersion: mount.toolVersion,
       });
       const facts = () => (opts.callId === undefined ? {} : { callId: opts.callId });
+      // Recorded as a step of its own, but the plugin is told the operation it continues: a resume is the same
+      // request going on, and a key the plugin derived from the id must not change because a question was asked.
+      // A question that does not carry one (built by hand, not by `#run`) is told this step's own.
       return this.#run(ctx, { mount, tool: i.tool }, plugin, operationId, facts,
-        (context) => resuming.resume(i.tool, i.state, answer, context));
+        (context) => resuming.resume(i.tool, i.state, answer, context), false, i.operationId ?? operationId);
     };
     return isExclusive(plugin) ? this.#onMount(`${ctx.tenantId}/${ctx.agentId}/${mount.alias}`, go) : go();
   }
@@ -1026,7 +1035,7 @@ export class ToolGateway {
    * throws: the caller is ending something, and a failure here is reported as
    * a string for the model, not raised.
    */
-  async cancelInterrupt(ctx: CallContext, i: { alias: string; tool: string; state: Json }): Promise<string | null> {
+  async cancelInterrupt(ctx: CallContext, i: { alias: string; tool: string; state: Json; operationId?: string }): Promise<string | null> {
     try {
       const mount = await this.#store.getMountByAlias(ctx.tenantId, ctx.agentId, i.alias);
       const plugin = mount ? this.#plugins.get(mount.plugin) : undefined;
@@ -1036,7 +1045,7 @@ export class ToolGateway {
         const credential = mount.secretRef
           ? await this.#secrets.resolve(mount.secretRef, { tenantId: mount.tenantId, agentId: mount.agentId })
           : null;
-        await cancel.call(plugin.interrupts, i.tool, i.state, this.#contextFor(ctx, mount, credential));
+        await cancel.call(plugin.interrupts, i.tool, i.state, this.#contextFor(ctx, mount, credential, false, i.operationId));
       };
       await (isExclusive(plugin) ? this.#onMount(`${ctx.tenantId}/${ctx.agentId}/${mount.alias}`, go) : go());
       return null;
@@ -1064,7 +1073,7 @@ export class ToolGateway {
    * a poll or a cancel sees exactly the context the call saw, credential
    * included, and nothing about a background job has to travel with it.
    */
-  #contextFor(ctx: CallContext, mount: MountRecord, credential: string | null, fromProgram = false) {
+  #contextFor(ctx: CallContext, mount: MountRecord, credential: string | null, fromProgram = false, operationId?: string) {
     const store = this.#store;
     const secrets = this.#secrets;
     const db = (m: MountRecord) => this.#db(ctx, m);
@@ -1076,6 +1085,8 @@ export class ToolGateway {
         ...(fromProgram ? { fromProgram: true as const } : {}),
         ...(typeof ctx.contextId === "string" ? { contextId: ctx.contextId } : {}),
       },
+      // Only from the gateway's own bookkeeping, never from what a call carries (`PluginContext.operationId`).
+      ...(operationId !== undefined ? { operationId } : {}),
       alias: mount.alias,
       credential,
       // What kind of credential the mount names, so a null `credential` can be read as "names none" or
@@ -1144,8 +1155,12 @@ export class ToolGateway {
     };
   }
 
-  /** The mount, its plugin and a fresh context, for coming back to backgrounded work. */
-  async #backgroundTarget(ctx: CallContext, alias: string) {
+  /**
+   * The mount, its plugin and a fresh context, for coming back to backgrounded work. `operationId` is the
+   * operation that started it — the runtime keeps a job under that id (cf/src/runtime.ts, `recordBackgroundJob`) —
+   * so a poll and a cancel are told the operation the call was.
+   */
+  async #backgroundTarget(ctx: CallContext, alias: string, operationId?: string) {
     const mount = await this.#store.getMountByAlias(ctx.tenantId, ctx.agentId, alias);
     if (!mount) throw new Error(`background work on ${alias}: that mount no longer exists`);
     const plugin = this.#plugins.get(mount.plugin);
@@ -1153,20 +1168,20 @@ export class ToolGateway {
     const credential = mount.secretRef
       ? await this.#secrets.resolve(mount.secretRef, { tenantId: mount.tenantId, agentId: mount.agentId })
       : null;
-    return { plugin, context: this.#contextFor(ctx, mount, credential) };
+    return { plugin, context: this.#contextFor(ctx, mount, credential, false, operationId) };
   }
 
   /** Has backgrounded work on this mount finished? Asked with the context the call had. */
-  async pollBackground(ctx: CallContext, alias: string, handle: Json) {
-    const { plugin, context } = await this.#backgroundTarget(ctx, alias);
+  async pollBackground(ctx: CallContext, alias: string, handle: Json, operationId?: string) {
+    const { plugin, context } = await this.#backgroundTarget(ctx, alias, operationId);
     const bg = backgroundOf(plugin);
     if (!bg) throw new Error(`background work on ${alias}: plugin ${plugin.id} cannot report on it`);
     return bg.poll(handle, context);
   }
 
   /** Stop backgrounded work on this mount. */
-  async cancelBackground(ctx: CallContext, alias: string, handle: Json) {
-    const { plugin, context } = await this.#backgroundTarget(ctx, alias);
+  async cancelBackground(ctx: CallContext, alias: string, handle: Json, operationId?: string) {
+    const { plugin, context } = await this.#backgroundTarget(ctx, alias, operationId);
     const bg = backgroundOf(plugin);
     if (!bg) throw new Error(`background work on ${alias}: plugin ${plugin.id} cannot stop it`);
     await bg.cancel(handle, context);

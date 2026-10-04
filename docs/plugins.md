@@ -408,6 +408,32 @@ on both engines and present only when they say something:
   provisioning, a bench shell, a background job's poll): treat that as
   "nothing is known to be seen".
 
+**Use `context.operationId` as the idempotency key you hand a service.** It is
+the gateway's id for the operation the context serves, set by the gateway
+alone on both engines (`src/runtime/gateway.ts`, `#contextFor`); compare it
+for equality only. What stays the same and what does not:
+
+| Path | `operationId` the plugin sees |
+|---|---|
+| The model's own tool call (`invoke`) | a new id per call; the model calling again is a new id |
+| The call held for approval, run after a person approves it (`applyApproval`) | the id the call was held under, which the model was told |
+| `interrupts.resume` of a question the call asked, and of each question after it | the asking call's id (the resume is recorded as a step of its own, under its own row) |
+| `interrupts.cancel` of that question (dropped, expired, asked where nobody can answer, or in a shape no answer can meet) | the asking call's id |
+| `background.poll` and `background.cancel` of work the call started (the alarm, the `jobs` tool, a session cancel, the time ceiling, the cap) | the call's id (the runtime keeps a job under it) |
+| A run_js program's call | derived from the run_js call's id and the call's position in the program (`${toolCallId}:${n}`): different per call, and the same if the program is run again under the same run_js call, where the gateway finds the operation already begun and answers `already_attempted` without reaching you again |
+| `promptContribution`, `Holding.*`, `receive`, `reportActivity`, `snapshotTools`, a bench runner's poll of a job it holds only the handle of | absent: no operation |
+
+Nothing a model or a program writes reaches it: run_js builds each call's
+options field by field and the production host forwards no `operationId`
+(`hostCallOpts`, `cf/src/runtime.ts`), and the arguments are the tool's own.
+Two things it does not do. One operation can make more than one write — a
+call and then its resume, say — so if more than one of them must land, tell
+them apart yourself (suffix the id). And it does not survive a recovery: after
+a crash both engines re-run only a replay-safe call (a read, or a write
+declaring `idempotency: "native"`), and the re-run is a new operation with a
+new id, so a write that relies on this id for its deduplication must not
+declare itself `native` on that ground.
+
 **Bound a number, shape a header list.** A `number` setting can carry `min` and
 `max`; a value outside them is refused when the mount is written, as everything
 in `validateMount` is — refused, not clamped, so the person writing it learns
