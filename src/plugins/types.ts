@@ -95,7 +95,7 @@ export interface ToolSchema {
 export interface ToolSnapshot {
   hash: string;
   tools: ToolSchema[];
-  skipped: Array<{ name: string; reason: string }>;
+  skipped: SkippedTool[];
   takenAt: number;
   /**
    * Present, and true, when the list was taken for a plugin that declares a `credential` while the mount had none
@@ -120,7 +120,7 @@ export interface ToolSnapshot {
  */
 export interface ListedTools {
   tools: ToolSchema[];
-  skipped?: Array<{ name: string; reason: string }>;
+  skipped?: SkippedTool[];
   /**
    * Present, and true, when the far end refused the mount's credential, so `tools` (normally empty) says what a
    * refused credential may do rather than what this one may. Taken as it is on a credential change and an operator's
@@ -130,6 +130,22 @@ export interface ListedTools {
    * are words for a person.
    */
   refused?: true;
+}
+
+/**
+ * One tool a mount's list leaves out, and why: shown on the mount's page, and told to a model that calls it
+ * anyway (`explainUnavailableTool`, src/runtime/unavailable-tool.ts).
+ *
+ * `every: true` makes the entry stand for every tool of the plugin (its static `tools`) that the mount's list
+ * leaves out, not one: `name` is then a label for people, never matched as a tool name. For a list that is
+ * empty for one reason that is not about any one tool — raft's mount with no credential, or one Raft refused
+ * (which also sets {@link ListedTools.refused}). Without the flag the entry is about the tool named `name` only,
+ * however its name reads.
+ */
+export interface SkippedTool {
+  name: string;
+  reason: string;
+  every?: true;
 }
 
 /**

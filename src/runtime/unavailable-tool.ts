@@ -30,8 +30,8 @@ import { modelName, modelToolName } from "./pi-tools.ts";
 /** One mount of the agent, as the explanation reads it. */
 export interface ExplainedMount {
   alias: string;
-  /** The mount's plugin; only its `retired` table is read. */
-  plugin?: Pick<Plugin, "retired"> | undefined;
+  /** The mount's plugin: its `retired` table, and its `tools` for a skipped entry that stands for all of them. */
+  plugin?: (Pick<Plugin, "retired"> & { tools?: ReadonlyArray<{ name: string }> }) | undefined;
   /** Only `skipped` is read: the tools this mount leaves out, with why. */
   toolSnapshot?: Pick<ToolSnapshot, "skipped"> | null | undefined;
 }
@@ -78,7 +78,13 @@ export function explainUnavailableTool(name: string, ctx: UnavailableToolContext
   }
   const mount = best.m;
   const alias = mount.alias;
-  const skipReason = (tool: string) => mount.toolSnapshot?.skipped?.find((s) => modelToolName(alias, s.name) === modelToolName(alias, tool))?.reason;
+  // Why the mount's list leaves out the tool the model calls `shown`: an entry naming it, else one that stands
+  // for every tool of the plugin (`SkippedTool.every`) when `shown` is one of the plugin's tools.
+  const skipFor = (shown: string) => {
+    const skipped = mount.toolSnapshot?.skipped ?? [];
+    return skipped.find((s) => !s.every && modelToolName(alias, s.name) === shown)?.reason ??
+      (mount.plugin?.tools?.some((t) => modelToolName(alias, t.name) === shown) ? skipped.find((s) => s.every)?.reason : undefined);
+  };
 
   const retired = Object.entries(mount.plugin?.retired ?? {}).find(([old]) => modelToolName(alias, old) === name);
   if (retired) {
@@ -90,12 +96,12 @@ export function explainUnavailableTool(name: string, ctx: UnavailableToolContext
     if (shown) {
       return `There is no tool named ${quoted(name)} any more: the \`${alias}\` mount renamed it to ${shown}. Call ${shown} instead. ${AGAIN}`;
     }
-    const why = skipReason(next);
+    const why = skipFor(modelToolName(alias, next));
     return `There is no tool named ${quoted(name)} any more: the \`${alias}\` mount renamed it to ${modelToolName(alias, next)}, ` +
       `which this mount does not offer you${why ? ` (${why})` : ""}. ${AGAIN} ${LIST}`;
   }
-  const skipped = mount.toolSnapshot?.skipped?.find((s) => modelToolName(alias, s.name) === name);
-  if (skipped) return `The \`${alias}\` mount does not offer ${quoted(name)} to you: ${skipped.reason}. ${AGAIN} ${LIST}`;
+  const skipped = skipFor(name);
+  if (skipped) return `The \`${alias}\` mount does not offer ${quoted(name)} to you: ${skipped}. ${AGAIN} ${LIST}`;
   return `The \`${alias}\` mount has no tool named ${quoted(name)}. ${AGAIN} ${LIST}`;
 }
 

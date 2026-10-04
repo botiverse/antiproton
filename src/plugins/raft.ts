@@ -497,7 +497,8 @@ export const GENERATED: readonly RaftOperationSpec[] = generatedFrom(EXCLUDED);
 const DEFAULT_UNOFFERED = unofferedNames(EXCLUDED);
 
 /**
- * The hand-written tools the generated ones replaced (#729), old name to new (`Plugin.retired`). Each old tool
+ * Tool names this plugin no longer offers, old name to new (`Plugin.retired`): the hand-written tools the generated
+ * ones replaced (#729), and two operations an SDK upgrade dropped (below). Each old hand-written tool
  * did what its replacement's operation does: `list_channels` paged `server.info`'s channel view, `join_channel`
  * joined through Raft's routes directly, and the rest called the SDK operation their replacement is generated
  * from. `test/unavailable-tool.ts` holds that every target is a tool this plugin offers and that no old name is
@@ -512,6 +513,12 @@ export const RETIRED: Readonly<Record<string, string | null>> = {
   channel_members: "channels_members",
   read_messages: "messages_read",
   search_messages: "messages_search",
+  // SDK 0.12.0 (#740) removed these two operations, which 0.11.0's manifest marked deprecated: `mentions.deliveries`
+  // with "use mentions.delivery", and `mentions.execute` with "use mentions.notify / mentions.add". The second has
+  // no single replacement here (`mentions.add` is excluded: membership changes go through an action card), so it is
+  // removed rather than renamed.
+  mentions_deliveries: "mentions_delivery",
+  mentions_execute: null,
 };
 
 /**
@@ -1470,12 +1477,12 @@ export function createRaftPlugin(deps: { artifacts?: RaftArtifacts | null; exclu
      */
     async snapshotTools(ctx: PluginContext): Promise<ListedTools> {
       if (!ctx.credential) {
-        return { tools: [], skipped: [{ name: EVERY_OPERATION, reason: "this mount has no Raft credential, so it has no capabilities" }] };
+        return { tools: [], skipped: [{ name: EVERY_OPERATION, reason: "this mount has no Raft credential, so it has no capabilities", every: true }] };
       }
       const me = await raftFor(ctx, { state: false }).identity.whoami();
       if (!me.ok) {
         if (me.status === 401 || me.status === 403) {
-          return { tools: [], refused: true, skipped: [{ name: EVERY_OPERATION, reason: `Raft refused this mount's credential (HTTP ${me.status})` }] };
+          return { tools: [], refused: true, skipped: [{ name: EVERY_OPERATION, reason: `Raft refused this mount's credential (HTTP ${me.status})`, every: true }] };
         }
         throw new Error(`could not ask Raft what this mount's credential may do: ${me.error.message}`);
       }

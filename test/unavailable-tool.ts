@@ -13,6 +13,7 @@ import { DurableAgent, PdHost } from "../src/runtime/durable-agent.ts";
 import { PiAgent } from "../src/runtime/pi-agent.ts";
 import { qualifyMountedTools, type MountedTool, type ToolHost } from "../src/runtime/pi-tools.ts";
 import { readPdRecords } from "../src/runtime/pd-transcript.ts";
+import { admitTools } from "../src/runtime/mount-tools.ts";
 import {
   explainUnavailableTool, isPdUnavailableEntry, isPiUnavailableResult, looksPdUnavailable, pdUnavailableText, piUnavailableText,
   type UnavailableToolContext,
@@ -129,6 +130,37 @@ const explainCases: DriveCase[] = [
   },
 ];
 
+/** What raft's own listing records for a mount with no credential, admitted as the kernel stores it. */
+const credentialless = async () => admitTools(await raftPlugin.snapshotTools!({ credential: null } as never), 0);
+
+explainCases.push(
+  {
+    group: "explanation", name: "no credential: a skipped entry marked `every` gives its reason for any tool of the plugin the mount leaves out",
+    run: async () => {
+      const snap = await credentialless();
+      check(snap.skipped.length === 1 && snap.skipped[0]!.every === true, `control: admission kept ${show(snap.skipped)}`);
+      const ctx: UnavailableToolContext = { mounts: [{ alias: "raft", plugin: raftPlugin, toolSnapshot: snap }], offered: [{ name: "raft__receive_events", address: "raft.receive_events" }] };
+      const text = explainUnavailableTool("raft__messages_send", ctx);
+      check(text === "The `raft` mount does not offer \"raft__messages_send\" to you: this mount has no Raft credential, so it has no capabilities. " +
+        `${AGAIN} The tools you can call are the ones in your tool list.`, `got ${show(text)}`);
+      const renamed = explainUnavailableTool("raft__send_message", ctx);
+      check(renamed.includes("renamed it to raft__messages_send, which this mount does not offer you (this mount has no Raft credential"), `retired on that mount: ${show(renamed)}`);
+      const none = explainUnavailableTool("raft__nope", ctx);
+      check(none === `The \`raft\` mount has no tool named "raft__nope". ${AGAIN} The tools you can call are the ones in your tool list.`, `a name raft never had: ${show(none)}`);
+    },
+  },
+  {
+    group: "explanation", name: "without `every`, a skipped entry is about the one name it carries, however that name reads",
+    run: async () => {
+      const ctx: UnavailableToolContext = {
+        mounts: [{ alias: "raft", plugin: raftPlugin, toolSnapshot: { skipped: [{ name: "(every Raft operation)", reason: "no credential" }] } }], offered: [],
+      };
+      const text = explainUnavailableTool("raft__messages_send", ctx);
+      check(text === `The \`raft\` mount has no tool named "raft__messages_send". ${AGAIN} The tools you can call are the ones in your tool list.`, `got ${show(text)}`);
+    },
+  },
+);
+
 // ---- the retired table -------------------------------------------------------------------------------
 
 /** What is wrong with a plugin's `retired` table: a target it does not offer, or an old name it offers again. */
@@ -147,9 +179,11 @@ const tableCases: DriveCase[] = [
     group: "retired table", name: "raft: every target is a tool it offers, and no retired name is offered again",
     run: async () => {
       check(raftPlugin.retired === RETIRED, "raftPlugin does not declare RETIRED");
-      check(Object.keys(RETIRED).length === 7, `control: ${show(RETIRED)}`);
+      check(Object.keys(RETIRED).length === 9, `control: ${show(RETIRED)}`);
       const problems = retiredProblems(raftPlugin);
       check(problems.length === 0, problems.join("; "));
+      // The two operations SDK 0.12.0 removed: one renamed, one gone.
+      check(RETIRED.mentions_deliveries === "mentions_delivery" && RETIRED.mentions_execute === null, `0.12.0's removals: ${show(RETIRED)}`);
     },
   },
   {

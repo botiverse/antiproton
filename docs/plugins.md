@@ -331,7 +331,11 @@ server. Every reader that is about one mount — the catalogue, the gateway,
 `tools.search`/`describe`, the console's tool column — asks `toolsOf(plugin,
 mount)`, never `plugin.tools`, so they all see one list. Names the kernel left
 out are in the snapshot's `skipped`, shown on the mount's console page and in
-`tools.mounts`. The version pin is still the plugin's `version`: a snapshot
+`tools.mounts`, and told to a model that calls one anyway. An entry is about
+the one tool it names; a plugin whose list is empty for one reason that is not
+about any tool (raft's mount with no credential, or one Raft refused) marks the
+entry `every: true` (`SkippedTool`), and its reason then answers a call to any
+of the plugin's tools the mount leaves out, its `name` being only a label. The version pin is still the plugin's `version`: a snapshot
 changes what a mount offers, not which code runs it.
 
 **Declare `toolsBasis` when the build decides which tools a listing can

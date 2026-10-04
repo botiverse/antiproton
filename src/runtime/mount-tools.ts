@@ -9,7 +9,7 @@
  * offered by one, refused by the other.
  */
 import { TOOL_SEGMENT } from "../core/tools.ts";
-import type { ListedTools, ToolSchema, ToolSnapshot } from "../plugins/types.ts";
+import type { ListedTools, SkippedTool, ToolSchema, ToolSnapshot } from "../plugins/types.ts";
 
 const SIDE_EFFECTS = new Set(["read", "write"]);
 const IDEMPOTENCY = new Set(["native", "key", "none"]);
@@ -53,7 +53,7 @@ const MAX_SKIPPED_NAME = 80;
  */
 export async function admitTools(listed: ListedTools, takenAt: number): Promise<ToolSnapshot> {
   const tools: ToolSchema[] = [];
-  const skippedAll: Array<{ name: string; reason: string }> = [...(listed.skipped ?? [])];
+  const skippedAll: SkippedTool[] = [...(listed.skipped ?? [])];
   const skip = (name: string, reason: string) => skippedAll.push({ name, reason });
   const seen = new Set<string>();
   let bytes = 0;
@@ -105,6 +105,8 @@ export async function admitTools(listed: ListedTools, takenAt: number): Promise<
   const skipped = skippedAll.slice(0, MAX_SKIPPED).map((s) => ({
     name: s.name.length > MAX_SKIPPED_NAME ? `${s.name.slice(0, MAX_SKIPPED_NAME)}…` : s.name,
     reason: s.reason,
+    // Kept through admission: it says the entry is about every tool, which the explanation reads (SkippedTool).
+    ...(s.every ? { every: true as const } : {}),
   }));
   if (skippedAll.length > MAX_SKIPPED) {
     skipped.push({ name: `(${skippedAll.length - MAX_SKIPPED} more)`, reason: "not listed one by one; the reasons above are the kinds" });
