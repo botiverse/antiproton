@@ -190,11 +190,15 @@ async function settle(w: World, n: number) {
   }
 }
 
-async function answer(w: World, i: number, text: string) {
+/** Answer job `i` with text, or with a call to the `p` mount's tool, which keeps the run going. */
+async function answer(w: World, i: number, text: string, opts: { callTool?: boolean } = {}) {
   await asked(w);
   const id = w.jobs[i]!;
   const job = JSON.parse(seen.get(id)!) as { model?: { api?: string; provider?: string } };
-  await w.D.deliverAnswer(T, A, id, { role: "assistant", content: [{ type: "text", text }], api: job.model?.api ?? "x", provider: job.model?.provider ?? "x", model: "m1", usage: USAGE, stopReason: "stop", timestamp: 0 }, 5);
+  const content = opts.callTool
+    ? [{ type: "text", text }, { type: "toolCall", id: "call-1", name: "p__noop", arguments: {} }]
+    : [{ type: "text", text }];
+  await w.D.deliverAnswer(T, A, id, { role: "assistant", content, api: job.model?.api ?? "x", provider: job.model?.provider ?? "x", model: "m1", usage: USAGE, stopReason: opts.callTool ? "toolUse" : "stop", timestamp: 0 } as never, 5);
 }
 
 const pendingRows = (w: World) => Number((w.raw.sql.exec("SELECT COUNT(*) AS n FROM inbound_pending").toArray()[0] as any).n);
@@ -342,7 +346,7 @@ await check("two quick pushes reach the agent in the order they arrived", async 
   must(show(outcomes(w)) === show(["delivered", "delivered"]), show(outcomes(w)));
 });
 
-await check("a push during a running turn is a steer: no second run, and the model reads it after the answer it was working on", async () => {
+await check("a push during a running turn is a steer: no second run, and the model reads it at the turn's next call, not after the turn", async () => {
   const w = await world();
   await w.D.uiSay(T, A, `t_${A}`, "FROM-THE-PERSON", "steer");
   await settle(w, 1);
@@ -351,10 +355,12 @@ await check("a push during a running turn is a steer: no second run, and the mod
   await w.D.alarm();
   must(jobCount(w) === 1 && pendingRows(w) === 0, `a push during the turn: ${jobCount(w)} jobs, ${pendingRows(w)} queued`);
   must(!(await asked(w))[0]!.includes("STEER-PUSH"), "the push reached the request already out");
-  await answer(w, 0, "PERSON-ANSWERED");
+  // The turn goes on (a tool call), so its next model call is inside the same turn: a steer is read there;
+  // a follow-up would wait for the turn to end.
+  await answer(w, 0, "PERSON-ANSWERED", { callTool: true });
   await settle(w, 2);
   const q = (await asked(w)).at(-1)!;
-  must(jobCount(w) === 2 && q.indexOf("PERSON-ANSWERED") > 0 && q.indexOf("STEER-PUSH") > q.indexOf("PERSON-ANSWERED"), `the next request: ${q.indexOf("PERSON-ANSWERED")} ${q.indexOf("STEER-PUSH")}`);
+  must(jobCount(w) === 2 && q.indexOf("PERSON-ANSWERED") > 0 && q.indexOf("STEER-PUSH") > q.indexOf("PERSON-ANSWERED"), `the turn's next request: ${q.indexOf("PERSON-ANSWERED")} ${q.indexOf("STEER-PUSH")}`);
 });
 
 await check("every refusal answers as it did: 401, 400, 202 ignored, 202 duplicate, 413, 503, 429, 404, 405, and none of them is queued", async () => {
