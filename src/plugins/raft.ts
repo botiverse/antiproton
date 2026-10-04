@@ -12,7 +12,7 @@
 import { clip, logEvent, routeOf } from "../core/log.ts";
 import type { Json, MountRecord } from "../core/types.ts";
 import {
-  createRaft, hashRaftSendContent, isInterrupted, RAFT_OPERATIONS, RAFT_STATE_SCHEMA,
+  createRaft, hashRaftSendContent, isInterrupted, RAFT_OPERATIONS, RAFT_STATE_SCHEMA, SeenFrontier,
   type Raft, type RaftInboxBatch, type RaftInterrupt, type RaftMessage, type RaftOperationSpec, type RaftState, type RaftStateStore, type RaftFailure,
 } from "@botiverse/raft-sdk";
 import { PARK_BYTES } from "./artifacts.ts";
@@ -355,7 +355,8 @@ function stateStore(ctx: PluginContext): RaftStateStore {
  * `{ state: false }` gives a client whose state lives only for the call and is never saved: the snapshot's
  * `identity.whoami` uses it, having nothing to record, and so does a history read, which must not count as seen
  * (`runOperation` says why). Every other operation runs on the saved state, because what the model has seen is
- * booked there per context (`originOf`) — by receive_events and by a held call's question — and a send attests it.
+ * booked there per context (`originOf`) — by receive_events, by a held call's question when it is the model's own
+ * call's result, and by the model's answer to one (`heldCall`) — and a send attests it.
  */
 function raftFor(ctx: PluginContext, options: { state?: false } = {}): Raft {
   return createRaft({
@@ -866,24 +867,38 @@ async function runOperation(
 }
 
 /**
- * A held call, as a question for the model: the conversation has messages this agent has not seen. The held
- * messages are in the question, so the model sees them now: that is recorded before asking (in the caller's
- * context), so the answer "send"/"proceed" — or the model making the same call again — attests them instead of
- * being held again. The SDK records nothing when the context was withheld, does not account for every new
- * message, or came without a boundary; then nothing is attested and the model reads the conversation first.
+ * A held call, as a question for the model: the conversation has messages this agent has not seen, and they are in
+ * the question. They count as seen only once the model has been shown them, and when that is depends on who called:
+ * - the model's own call (`originOf` → "model"): the question is that call's result, handed straight back and never
+ *   parked (only a succeeded result is), so the model sees it now. It is recorded before asking (in the caller's
+ *   context), so the answer "send"/"proceed" — or the model making the same call again — attests them instead of
+ *   being held again.
+ * - any other caller: a run_js program's call ends the program there, and its question reaches the model only if it
+ *   is the first one that run asked and the run stopped cleanly (`deliverRun`, src/runtime/pi-tools.ts); otherwise it
+ *   is dropped unseen. An approved call's replay has nobody to show it to at all. So nothing is recorded now; the
+ *   state carries what the question would attest (`attest`), and the model's answer records it (`interrupts.resume`),
+ *   since only the model can answer.
+ * The SDK attests nothing when the context was withheld, does not account for every new message, or came without
+ * a boundary (`SeenFrontier.recordHeld`); then nothing is attested and the model reads the conversation first.
  *
  * The state is the call itself: the operation, its arguments with the interrupt's `resume.idempotencyKey` under
  * the operation's key argument when it has one, for a message the `seen` boundary when the question showed
- * every new message, and `heldAt`, when the call was first held (`KEY_LIFETIME_MS`). Plain data, no credential, and never shown: the question, its context and its answers carry
+ * every new message, `attest` when it showed them all, and `heldAt`, when the call was first held
+ * (`KEY_LIFETIME_MS`). Plain data, no credential, and never shown: the question, its context and its answers carry
  * none of it, and the interrupt's `resume.argv`/`cancel`, which belong to the CLI, are not used at all.
  */
 async function heldCall(
-  op: RaftOperationSpec, raft: Raft, caller: { contextId?: string }, held: RaftInterrupt, input: Record<string, unknown>,
-  heldAt: number,
+  op: RaftOperationSpec, raft: Raft, caller: { origin: "model" | "code"; contextId?: string }, held: RaftInterrupt,
+  input: Record<string, unknown>, heldAt: number,
 ): Promise<Interrupt> {
   const n = held.newMessageCount;
-  const attested = raft.frontier.inContext(caller.contextId).recordHeld(held);
-  if (attested) await raft.state.save();
+  // Whether the question shows every new message up to a boundary: asked of a frontier nothing reads, so asking
+  // records nothing.
+  const attested = new SeenFrontier().recordHeld(held);
+  if (attested && caller.origin === "model") {
+    raft.frontier.inContext(caller.contextId).recordHeld(held);
+    await raft.state.save();
+  }
   const unshown = held.withheld ? n : Math.max(0, n - held.heldMessages.length - held.omittedMessageCount);
   const go = goAhead(op);
   const key = op.idempotency.kind === "key" && held.resume.idempotencyKey ? { [op.idempotency.arg]: held.resume.idempotencyKey } : {};
@@ -904,6 +919,7 @@ async function heldCall(
     state: {
       op: op.name, args: { ...input, ...key } as Json, heldAt,
       ...(go === "send" && attested && held.seenUpToSeq !== null ? { seen: { upToSeq: held.seenUpToSeq } } : {}),
+      ...(attested && held.seenUpToSeq !== null ? { attest: { target: held.target, upToSeq: held.seenUpToSeq } } : {}),
     },
   });
 }
@@ -1223,6 +1239,16 @@ export const raftPlugin: Plugin = {
             `Read ${where ?? "the conversation"} with messages_read to see whether it is there, and call ${op.toolName} ` +
             "again only if it is not.",
         };
+      }
+      // The answer is the model's (only the model can resume), and the question it answers showed the held
+      // messages: they are seen now, in the context answering, so a later send there attests them. Recorded before
+      // the call goes ahead, as the model's own hold records before asking; a save that fails costs one more hold.
+      const attest = object(s.attest);
+      if (typeof attest.target === "string" && typeof attest.upToSeq === "number" && Number.isSafeInteger(attest.upToSeq) && attest.upToSeq > 0) {
+        const raft = raftFor(ctx);
+        await raft.state.load();
+        raft.frontier.inContext(typeof ctx.caller.contextId === "string" ? ctx.caller.contextId : undefined).recordUpTo(attest.target, attest.upToSeq);
+        await raft.state.save();
       }
       const seen = object(s.seen);
       return runOperation(op, s.args, ctx, {

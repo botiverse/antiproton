@@ -575,6 +575,58 @@ await check("the same send again with the same key, outside resume, still attest
   }
 });
 
+/**
+ * A Server that holds a send into #general unless it attests seq 20, the newest message there, and holds the first
+ * claim. `bodies` is every request body, in order.
+ */
+function attestingServer() {
+  const bodies: any[] = [];
+  globalThis.fetch = (async (_url: any, init?: any) => {
+    const body = JSON.parse(String(init?.body ?? "{}"));
+    bodies.push(body);
+    // A claim carries no attestation (0.9.0): Raft holds the first and lets the same claim through after.
+    if ("task_numbers" in body) return bodies.filter((b) => "task_numbers" in b).length === 1 ? HELD() : json(200, { results: [{ taskNumber: 7, success: true }] });
+    return (body.seenUpToSeq ?? 0) < 20 ? HELD() : SENT();
+  }) as any;
+  return bodies;
+}
+/** What the mount's saved Raft state says was seen in #general, by context. */
+const bookedIn = (fresh: ReturnType<typeof freshDb>) => (fresh.tables.get(fresh.scope, INBOX_STORE, "state") as any)?.frontier?.targets?.["#general"] ?? null;
+
+await check("a question raised inside a program records nothing as seen; the model's answer records it, in the context answering", async () => {
+  for (const [tool, args, go] of [
+    ["messages_send", { target: "#general", content: "done", idempotencyKey: "k-prog" }, "send"],
+    ["tasks_claim", { target: "#general", taskNumbers: [7] }, "proceed"],
+  ] as const) {
+    const fresh = freshDb();
+    const model = { ...inTurn(ctx(), "ctx_turn"), db: fresh.db };
+    const fromProgram = { ...model, caller: { ...model.caller, fromProgram: true } };
+    const bodies = attestingServer();
+    const held = await raftPlugin.invoke(tool, args, fromProgram) as any;
+    if (!(held instanceof Interrupt) || !/anyway\?$/.test(held.question)) throw new Error(`${tool}: not held: ${JSON.stringify(held)}`);
+    // The program's run may close before anyone is asked: nothing is booked. (That the model's own send there is then
+    // held is the run_js case below; asked here, that send's own hold would book and hide the answer's booking.)
+    if (bookedIn(fresh) !== null) throw new Error(`${tool}: booked at the program's hold: ${JSON.stringify(bookedIn(fresh))}`);
+    // The model answers the question: the messages it showed are seen now, in the context answering.
+    const out = await raftPlugin.interrupts!.resume(tool, held.state, go, model) as any;
+    const booked = bookedIn(fresh);
+    if (out instanceof Interrupt || booked?.upTo !== 20 || booked?.upToContextId !== "ctx_turn") {
+      throw new Error(`${tool}: answered: ${JSON.stringify({ out, body: bodies.at(-1), booked })}`);
+    }
+    // So a later send of the model's there attests them and goes through.
+    const after = await raftPlugin.invoke("messages_send", { target: "#general", content: "after", idempotencyKey: "k-after" }, model) as any;
+    if (after instanceof Interrupt || bodies.at(-1)?.seenUpToSeq !== 20) throw new Error(`${tool}: after the answer: ${JSON.stringify(bodies.at(-1))}`);
+  }
+});
+
+await check("control: a question that is the model's own call's result records what it shows at once", async () => {
+  const fresh = freshDb();
+  const model = { ...inTurn(ctx(), "ctx_turn"), db: fresh.db };
+  attestingServer();
+  const held = await raftPlugin.invoke("messages_send", { target: "#general", content: "done", idempotencyKey: "k-own" }, model);
+  if (!(held instanceof Interrupt) || bookedIn(fresh)?.upTo !== 20 || bookedIn(fresh)?.upToContextId !== "ctx_turn") throw new Error(JSON.stringify(bookedIn(fresh)));
+});
+
 /** A /events answer in the shape the Raft SDK validates. */
 function events(evs: unknown[], over: Record<string, unknown> = {}) {
   return json(200, { events: evs, last_seen_msgId: null, last_seen_seq: null, reply_target: null, has_more: false, ack_mode: "cursor", ...over });
@@ -2383,6 +2435,23 @@ await check("a write that got no answer says that, not the SDK's \"did not reach
   // Control: a read has nothing to lose, and keeps the SDK's own words.
   const read = await failure(() => raftPlugin.invoke("messages_read", { target: "#general" }, inTurn(mount().ctx)));
   if (read.message !== "The request did not reach the Raft Server. — Check connectivity to the Raft Server and retry if the operation is safe to repeat.") throw new Error(`read: ${read.message}`);
+});
+
+await check("through run_js and the gateway, a send held in a program whose question nobody could answer leaves the conversation unseen", async () => {
+  const g = await raftBehindGateway();
+  const bodies = attestingServer();
+  // This run_js keeps no continuations, so the program's question is dropped: shown with a note, never answerable.
+  const out = await program(g.host, g.offered(["inbox"]),
+    "await tool`inbox.messages_send ${{ target: '#general', content: 'done', idempotencyKey: 'k-prog' }}`;");
+  if (bodies.length !== 1 || bodies[0].seenUpToSeq !== undefined || out.state !== "interrupted" || !/cannot be answered here/.test(out.note)) {
+    throw new Error(`the program's send: ${JSON.stringify({ out, bodies })}`);
+  }
+  // The model's own send in the same context is held, not let through by what the program was asked.
+  const own: any = await g.gateway.invoke({ ...g.ctx, contextId: "ctx_turn" } as any, "inbox.messages_send", { target: "#general", content: "other", idempotencyKey: "k-own" });
+  if (own.status !== "interrupted" || bodies.at(-1)?.seenUpToSeq !== undefined) throw new Error(`the model's send: ${JSON.stringify({ own, body: bodies.at(-1) })}`);
+  // Control: the model's own held call does book; the same send again in that context goes through.
+  const again: any = await g.gateway.invoke({ ...g.ctx, contextId: "ctx_turn" } as any, "inbox.messages_send", { target: "#general", content: "other", idempotencyKey: "k-own" });
+  if (again.status !== "succeeded" || bodies.at(-1)?.seenUpToSeq !== 20) throw new Error(`control: ${JSON.stringify({ again, body: bodies.at(-1) })}`);
 });
 
 globalThis.fetch = originalFetch;

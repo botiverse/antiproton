@@ -328,7 +328,11 @@ operation manifest (`RAFT_OPERATIONS`), one per operation, named by the
 manifest's `toolName`, and run through the SDK's `raft.invoke`. A history read
 (`messages_read`) never counts as seen: the SDK would record the page inside
 `invoke`, before the runtime may park it, so it runs on a client whose state is
-not saved and only `receive_events` attests. It attests only what the model
+not saved and only `receive_events` attests. (A held call's question attests the
+messages it shows too, but only once the model has them: at once when the
+question is the model's own call's result, and for one raised inside a run_js
+program — which the model is not always shown — only when the model answers
+it.) It attests only what the model
 was shown whole: it asks Raft for at most `EVENTS_LIMIT` messages (sized from
 `PARK_BYTES` and a per-message estimate), measures its result as the runtime
 does (the whole result serialised, not just the text), and shows only as many
