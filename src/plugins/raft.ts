@@ -514,9 +514,10 @@ export const RETIRED: Readonly<Record<string, string | null>> = {
   read_messages: "messages_read",
   search_messages: "messages_search",
   // SDK 0.12.0 (#740) removed these two operations, which 0.11.0's manifest marked deprecated: `mentions.deliveries`
-  // with "use mentions.delivery", and `mentions.execute` with "use mentions.notify / mentions.add". The second has
-  // no single replacement here (`mentions.add` is excluded: membership changes go through an action card), so it is
-  // removed rather than renamed.
+  // with "use mentions.delivery", and `mentions.execute` with "use mentions.notify / mentions.add". This plugin
+  // offered `mentions_deliveries` until then. It never offered `mentions_execute` (EXCLUDED from #729 until the
+  // operation was gone), but the SDK's own text named it, so a model may still call it; its entry is null, and the
+  // explanation says only that the mount does not offer it, never that it did.
   mentions_deliveries: "mentions_delivery",
   mentions_execute: null,
 };

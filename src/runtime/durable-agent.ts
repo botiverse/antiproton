@@ -79,6 +79,13 @@ import { projectEntries } from "./pd-transcript.ts";
 import { type AgentEngine, type EngineEntry, type EngineEntryScan, type EngineStatus, type StepOutcome } from "./engine.ts";
 
 const PD = prefixedNamespace("pd");
+/**
+ * How many tool call ids one query of `PdHost.#unavailableResults` binds. A Durable Object's SQLite refuses a
+ * statement with more than 100 bound parameters ("too many SQL variables", measured under wrangler dev), and the
+ * query binds the conversation id besides; pi-durable swallows a hook's throw, so one query for every candidate
+ * left a request with 100 or more unknown calls carrying pi's own text. 90 keeps a margin under that limit.
+ */
+export const UNAVAILABLE_IDS_PER_QUERY = 90;
 const PD_NAMES = new SqlQualifier(PI_DURABLE_OBJECTS, PD);
 const AP = prefixedNamespace("ap");
 
@@ -271,10 +278,14 @@ export class PdHost {
    */
   #unavailableResults(conversationId: ConversationId, callIds: readonly string[]): ReadonlySet<string> {
     const ids = [...new Set(callIds)];
-    const rows = this.#opts.storage.sql.exec(PD_NAMES.rewrite(
-      "SELECT record FROM entries WHERE conversation_id = ? AND json_extract(record, '$.kind') = 'pi.tool-result' " +
-      `AND json_extract(record, '$.model[0].toolCallId') IN (${ids.map(() => "?").join(", ")})`),
-    Number(conversationId), ...ids).toArray();
+    const rows: Array<Record<string, unknown>> = [];
+    for (let at = 0; at < ids.length; at += UNAVAILABLE_IDS_PER_QUERY) {
+      const batch = ids.slice(at, at + UNAVAILABLE_IDS_PER_QUERY);
+      rows.push(...this.#opts.storage.sql.exec(PD_NAMES.rewrite(
+        "SELECT record FROM entries WHERE conversation_id = ? AND json_extract(record, '$.kind') = 'pi.tool-result' " +
+        `AND json_extract(record, '$.model[0].toolCallId') IN (${batch.map(() => "?").join(", ")})`),
+      Number(conversationId), ...batch).toArray());
+    }
     const verdict = new Map<string, boolean>();
     for (const row of rows) {
       const record = JSON.parse(String(row.record)) as { model?: Array<{ toolCallId?: unknown; toolName?: unknown; content?: unknown }> };

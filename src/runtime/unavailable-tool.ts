@@ -16,8 +16,9 @@
  * are when the request goes out.
  *
  * Strict on what it rewrites. A result is pi's only when it has pi's exact text for the call's own name, is
- * an error with no `details`, and names a tool that is not among the tools offered now — a tool that exists
- * cannot have been answered by pi's unknown-tool path, and one that does not exist cannot have run.
+ * an error, and names a tool that is not among the tools offered now — a tool that exists cannot have been
+ * answered by pi's unknown-tool path, and one that does not exist cannot have run. It must also have no
+ * `details`, which is defence in depth and not a discriminator: a tool's thrown error has none either.
  * pi-durable also records why it wrote the result (the entry's `tool_unavailable` diagnostic), and its
  * engine checks that too (`isPdUnavailableEntry`). A real tool whose result happens to be the same text is
  * left alone. The texts and the code are pi's and no type carries them; docs/pi-upstream.md §3 lists them,
@@ -52,7 +53,7 @@ const sentence = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
 
 /**
  * Why there is no tool named `name`, in words the model can act on. In order: a name the mount's plugin
- * retired (renamed: what to call instead; removed: that nothing replaced it), a name the mount's tool list
+ * retired (renamed: what to call instead; removed: that the mount does not offer it), a name the mount's tool list
  * left out (its recorded reason), and otherwise that the mount — or no mount — has a tool by that name.
  *
  * The mount is the one whose alias, as it appears in a model-facing name, is the longest prefix of `name`
@@ -90,7 +91,8 @@ export function explainUnavailableTool(name: string, ctx: UnavailableToolContext
   if (retired) {
     const [, next] = retired;
     if (next === null) {
-      return `There is no tool named ${quoted(name)} any more: the \`${alias}\` mount no longer offers it, and no other tool replaced it. ${AGAIN} ${LIST}`;
+      // Not "no longer": a name can be retired that this mount never offered (raft's `mentions_execute`).
+      return `The \`${alias}\` mount does not offer ${quoted(name)}. ${AGAIN} ${LIST}`;
     }
     const shown = ctx.offered.find((t) => t.address === `${alias}.${next}`)?.name;
     if (shown) {
@@ -119,7 +121,10 @@ export const pdUnavailableText = (name: string) => `<harness>\n[error] ${pdUnava
 
 type ResultLike = { role?: unknown; toolName?: unknown; toolCallId?: unknown; isError?: unknown; details?: unknown; content?: unknown };
 
-/** A tool result whose whole content is `text(its own tool name)`, an error with no details, for a tool not offered now. */
+/**
+ * A tool result whose whole content is `text(its own tool name)`, an error, for a tool not offered now. "No details"
+ * is checked too, as defence in depth only: pi's result has none, but neither has a tool's thrown error.
+ */
 function shapedLike(m: ResultLike, current: ReadonlySet<string>, text: (name: string) => string): m is ResultLike & { toolName: string } {
   if (m?.role !== "toolResult" || m.isError !== true || m.details !== undefined) return false;
   if (typeof m.toolName !== "string" || current.has(m.toolName)) return false;

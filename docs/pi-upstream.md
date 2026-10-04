@@ -381,10 +381,11 @@ and fails if the recogniser no longer matches what pi wrote:
 - **pi-agent-core 0.85.1** answers with an error result whose only content is
   `Tool "<name>" is unavailable` (`JSON.stringify` of the call's name), no
   `details` (`prepareToolCall`, `dist/harness/execution/tools.js`). It is
-  recognised by that exact text for the result's own `toolName`, `isError`, no
-  `details`, and a name that is not among the harness's tools: pi takes that
-  path only for a name it does not have, and a tool that does not exist cannot
-  have answered. One case the shape cannot tell apart: a tool that existed when
+  recognised by that exact text for the result's own `toolName`, `isError`, and
+  a name that is not among the harness's tools: pi takes that path only for a
+  name it does not have, and a tool that does not exist cannot have answered.
+  "No `details`" is checked as well, as defence in depth and not as a
+  discriminator: a tool's thrown error has no `details` either. One case the shape cannot tell apart: a tool that existed when
   called, answered with exactly that text, and has since left the catalogue;
   its old result is explained as a missing tool, which is then true. The
   rewrite is the `transform_context` hook (`PiAgent.open`), whose result is

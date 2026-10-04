@@ -9,7 +9,7 @@ import { AgentRuntime } from "../cf/src/runtime.ts";
 import { fromResponse, toRequest } from "../src/model/pi-bridge.ts";
 import { RETIRED, raftPlugin } from "../src/plugins/raft.ts";
 import type { Plugin } from "../src/plugins/types.ts";
-import { DurableAgent, PdHost } from "../src/runtime/durable-agent.ts";
+import { DurableAgent, PdHost, UNAVAILABLE_IDS_PER_QUERY } from "../src/runtime/durable-agent.ts";
 import { PiAgent } from "../src/runtime/pi-agent.ts";
 import { qualifyMountedTools, type MountedTool, type ToolHost } from "../src/runtime/pi-tools.ts";
 import { readPdRecords } from "../src/runtime/pd-transcript.ts";
@@ -64,11 +64,11 @@ const explainCases: DriveCase[] = [
     },
   },
   {
-    group: "explanation", name: "removed: this mount no longer offers it",
+    group: "explanation", name: "removed (null): the mount does not offer it, without claiming it once did (raft__mentions_execute never was)",
     run: async () => {
-      const text = explainUnavailableTool("notes__fetch", { mounts: [{ alias: "notes", plugin: { retired: { fetch: null } } }], offered: [] });
-      check(text === "There is no tool named \"notes__fetch\" any more: the `notes` mount no longer offers it, and no other tool replaced it. " +
-        `${AGAIN} The tools you can call are the ones in your tool list.`, `got ${show(text)}`);
+      const text = explainUnavailableTool("raft__mentions_execute", raftCtx());
+      check(text === `The \`raft\` mount does not offer "raft__mentions_execute". ${AGAIN} The tools you can call are the ones in your tool list.`, `got ${show(text)}`);
+      check(!/no longer|any more|renamed/.test(text), `implies it was once offered: ${show(text)}`);
     },
   },
   {
@@ -343,7 +343,44 @@ function engineCases(which: Which): DriveCase[] {
   ];
 }
 
+/**
+ * `storage` with a Durable Object's limit on bound parameters, which node:sqlite does not have (it allows 32766):
+ * a statement binding more than 100 throws "too many SQL variables", as workerd's SQLite does. `most` is the
+ * largest number any statement bound.
+ */
+function doLimited(storage: DurableSqlHost): DurableSqlHost & { most: number } {
+  const out = {
+    most: 0,
+    transactionSync: storage.transactionSync,
+    sql: {
+      exec(query: string, ...bindings: unknown[]) {
+        out.most = Math.max(out.most, bindings.length);
+        if (bindings.length > 100) throw new Error(`too many SQL variables: ${bindings.length}`);
+        return (storage.sql.exec as (q: string, ...b: unknown[]) => ReturnType<DurableSqlHost["sql"]["exec"]>)(query, ...bindings);
+      },
+    },
+  };
+  return out as never;
+}
+
 const pdOnly: DriveCase[] = [
+  {
+    group: "pd", name: `250 unknown calls in one round are all explained, under a Durable Object's 100-variable limit (${UNAVAILABLE_IDS_PER_QUERY} ids a query)`,
+    run: () => withStorage(async (raw) => {
+      const storage = doLimited(raw);
+      const e = openPd(storage, { explain: explainRaft() });
+      try {
+        const n = 250;
+        const round = Array.from({ length: n }, (_, i) => [`c${i}`, `raft__gone_${i}`, {}] as [string, string, unknown]);
+        const reqs = await converse(e, "hello", [calls(...round), say("ok")]);
+        const untouched = round.filter(([id]) => resultIn(reqs[1]!, id).startsWith("<harness>"));
+        check(untouched.length === 0, `${untouched.length} of ${n} results reached the model as pi-durable's own text, first ${show(untouched[0])}`);
+        check(resultIn(reqs[1]!, "c249") === `The \`raft\` mount has no tool named "raft__gone_249". ${AGAIN} The tools you can call are the ones in your tool list.`,
+          `c249: ${show(resultIn(reqs[1]!, "c249"))}`);
+        check(storage.most <= 100, `a statement bound ${storage.most}`);
+      } finally { await e.agent.close(); }
+    }),
+  },
   {
     group: "pd", name: "a tool since removed whose answer was pi-durable's text verbatim: not rewritten, its entry has no tool_unavailable",
     run: () => withStorage(async (storage) => {
@@ -386,6 +423,25 @@ const pdOnly: DriveCase[] = [
         }
         throw new Error("no tool result was written");
       } finally { await before.agent.close(); }
+    }),
+  },
+];
+
+const piOnly: DriveCase[] = [
+  {
+    group: "pi085", name: "an old error from a tool since removed, in its own words, is not rewritten (only pi's exact line is)",
+    run: () => withStorage(async (storage) => {
+      const own = "raft__send_message: the held send's state is incomplete; call messages_send again";
+      const first = await openPi(storage, { explain: explainRaft(), extraTools: [liar("raft__send_message", own)] });
+      try {
+        await converse(first, "hello", [calls(["c1", "raft__send_message", {}]), say("ok")]);
+      } finally { await first.agent.close(); }
+      const again = await openPi(storage, { explain: explainRaft() });
+      try {
+        const reqs = await converse(again, "and now", [say("done")]);
+        const got = resultIn(reqs[0]!, "c1");
+        check(got === own, `a removed tool's own error was rewritten to ${show(got)}`);
+      } finally { await again.agent.close(); }
     }),
   },
 ];
@@ -451,7 +507,7 @@ const runtimeCases: DriveCase[] = (["pi085", "pd"] as const).map((engine) => ({
 }));
 
 const results = await runDriveCases([
-  ...explainCases, ...tableCases, ...engineCases("pi085"), ...engineCases("pd"), ...pdOnly, ...runtimeCases,
+  ...explainCases, ...tableCases, ...engineCases("pi085"), ...piOnly, ...engineCases("pd"), ...pdOnly, ...runtimeCases,
 ]);
 
 console.log(`\n  a call to a tool that is not offered\n  ${"─".repeat(56)}`);
