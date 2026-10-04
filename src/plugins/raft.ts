@@ -474,7 +474,8 @@ export const EXCLUDED: Readonly<Record<string, string>> = {
   "inbox.check": "the inbox is read with receive_events, which commits what it showed and pulls the next in one call; a second reader would move the same cursor",
   "inbox.drain": "pulls until the inbox is empty and hands it all over in one result, with no bound; receive_events pages the same inbox",
   "inbox.commit": "receive_events commits only the messages it showed, which its next pull acknowledges; a separate commit could acknowledge a batch before the model has read it",
-  "mentions.execute": "its add action changes a conversation's membership; membership changes go through an action card a person confirms (actions_prepare)",
+  "mentions.add": "it changes a conversation's membership; membership changes go through an action card a person confirms (actions_prepare)",
+  "mentions.execute": "its add action changes a conversation's membership; membership changes go through an action card a person confirms (actions_prepare). Deprecated since 0.11.0; its notify half is mentions.notify, which is offered",
   "profile.update": "changes the account's public identity (display name, description, avatar); identity changes go through an action card a person confirms",
   "tasks.delete": "destructive, and new: agents could not delete tasks before; offered when someone asks for it",
   "attachments.downloadUrl": "Raft production does not serve this route yet (Raft #8881); enable when it does",
@@ -698,6 +699,8 @@ function argumentsFor(op: RaftOperationSpec, args: unknown): Record<string, unkn
 const UNOFFERED_SAY: Readonly<Record<string, string>> = {
   // The SDK names `inbox.check` for "check for new messages"; on this mount that is receive_events.
   inbox_check: "receive_events()",
+  // Since 0.11.0 the SDK's notify hint names mentions_notify, which is offered; its add hint names mentions_add.
+  mentions_add: "adding them to the conversation, which this mount does not offer",
   mentions_execute: "delivering the mention, which this mount does not offer",
   attachments_download_url: "downloading the attachment, which this mount does not offer",
   "raft.attachments.download": "downloading the attachment, which this mount does not offer",
