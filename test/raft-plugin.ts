@@ -2231,13 +2231,14 @@ await check("a held send the model repeats with no key keeps the held send's key
   }) as any;
   const held = await raftPlugin.invoke("messages_send", { target: "#general", content: "done" }, { ...inTurn(m.ctx), operationId: "op_asked" }) as any;
   if (!(held instanceof Interrupt)) throw new Error(`not held: ${JSON.stringify(held)}`);
+  // Control, while the held send is still waiting (its continuation saved): other content to the same target is
+  // another message, under its own operation's id. After the resume below the continuation is gone, and a
+  // comparison of content that always matched would pass there unnoticed.
+  await raftPlugin.invoke("messages_send", { target: "#general", content: "something else" }, { ...inTurn(m.ctx), operationId: "op_other" });
+  if (JSON.stringify(raft.keys) !== '["op_asked","op_other"]' || raft.acted.length !== 1) throw new Error(`control: ${JSON.stringify(raft)}`);
   await raftPlugin.invoke("messages_send", { target: "#general", content: "done" }, { ...inTurn(m.ctx), operationId: "op_again" });
   await raftPlugin.interrupts!.resume("messages_send", held.state, "send", { ...inTurn(m.ctx), operationId: "op_asked" });
-  if (JSON.stringify(raft.keys) !== '["op_asked","op_asked","op_asked"]' || raft.acted.length !== 1) throw new Error(JSON.stringify(raft));
-  const landed = () => raft.acted.length;
-  // Control: other content is another message, under its own operation's id.
-  await raftPlugin.invoke("messages_send", { target: "#general", content: "something else" }, { ...inTurn(m.ctx), operationId: "op_other" });
-  if (raft.keys.at(-1) !== "op_other" || landed() !== 2) throw new Error(`control: ${JSON.stringify(raft)}`);
+  if (JSON.stringify(raft.keys) !== '["op_asked","op_other","op_asked","op_asked"]' || raft.acted.length !== 2) throw new Error(JSON.stringify(raft));
 });
 
 /** The key an uncertain failure tells the model to retry with, or null when it names none. */
