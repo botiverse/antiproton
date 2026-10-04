@@ -111,10 +111,8 @@ const ROUTES = {
   reminders: "/api/v1/agent/reminders",         // POST { requestId, reminder } → reminder; GET ?status=active → { reminders, occurrences }
   cancel: "/api/v1/agent/reminders/cancel",     // POST { id } → the cancelled reminder; 404 without a code for an unknown id
 } as const;
-/** The one refusal reminder-app words for a switched-off client (webhook-delivery.md "Authentication"). */
-
 /**
- * reminder-app over HTTP, against the mount's `serviceUrl` origin.
+ * reminder-app over HTTP, against the deployment's configured origin (`REMINDER_APP_ORIGIN`).
  *
  * Every request carries the deployment's client credential and the subject (webhook-delivery.md "Authentication").
  * Requests stay on the configured origin, redirects are not followed, every request has a timeout, and a failure is
