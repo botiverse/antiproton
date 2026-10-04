@@ -931,7 +931,8 @@ export class AgentRuntime {
     const key = result.dedupeKey ?? null;
     if (key && seenBefore(sql, hookId, key, now)) return done("duplicate", null, key);
     if (!underRate(sql, hookId, now)) return done("rate_limited", `more than ${INBOUND_PER_MINUTE} a minute`, key);
-    await this.postMessage(tenantId, agentId, inboundMessage(alias, String(result.text)), "prompt", MAIN_SESSION);
+    // The re-take in the background: the service's request is waiting on this answer (`postMessage`).
+    await this.postMessage(tenantId, agentId, inboundMessage(alias, String(result.text)), "prompt", MAIN_SESSION, { retake: "background" });
     return done("delivered", null, key);
   }
 
@@ -1790,6 +1791,8 @@ export class AgentRuntime {
    * an Agents API input, an inbound event, a finished background job), never in `agent`: that also opens the harness
    * behind a steer, a job's take and delivery, a status read and a transcript read, none of which may wait on a far
    * end's listing. Two turn starts at once share one pass (`#retaking`), so a mount is listed once, not once per caller.
+   * An inbound event's turn starts the pass without waiting for it (`postMessage`'s `retake: "background"`). The pass
+   * is forgotten when it settles either way (`finally`), so one that threw does not stand in for every later one.
    *
    * Public so a test can ask for exactly this step.
    */
@@ -2303,14 +2306,23 @@ export class AgentRuntime {
     tenantId: string, agentId: string, text: string,
     mode: "prompt" | "steer" | "followUp" = "prompt",
     session: string = MAIN_SESSION,
+    opts: { retake?: "await" | "background" } = {},
   ) {
     // A new turn, so a tool list taken under another basis is taken again first (`retakeStaleSnapshots`), before the
     // harness is judged: a re-taken list changes the snapshot's hash, which is in `catalogueKey`, so the turn is built
     // with the new tools (or, if one is still running and this lands as a steer, the next one is). Not for a steer or
     // a follow-up, which add to a turn rather than start one.
+    //
+    // `retake: "background"` starts it without waiting, for a caller that must answer someone promptly — a service's
+    // push at an inbound hook (`receiveHook`), whose request would otherwise wait out the listing's timeout. That turn
+    // runs on the list as it stands; the re-take shares the same pass (`#retaking`), and when it writes, the moved hash
+    // rebuilds the harness for the turn after. Either way a re-take that throws is logged and never fails the turn.
     if (mode === "prompt") {
       await this.ready();
-      await this.retakeStaleSnapshots(tenantId, agentId);
+      const retake = this.retakeStaleSnapshots(tenantId, agentId)
+        .catch((e) => console.error(`re-taking ${tenantId}/${agentId}'s tool lists failed:`, e));
+      if (opts.retake === "background") this.#deps.ctx.waitUntil?.(retake);
+      else await retake;
     }
     const agent = await this.agent(tenantId, agentId, session);
     // A conversation that has just been spoken to has work until a step says

@@ -349,7 +349,9 @@ stores it on every snapshot it takes (`ToolSnapshot.basis`), and when a turn
 starts, before the agent's tool list is built (`AgentRuntime.postMessage` with
 `prompt` → `retakeStaleSnapshots`, `cf/src/runtime.ts`; never on a steer, a
 follow-up, a job's delivery or a read that opens the harness, none of which
-may wait on a far end; two turn starts at once share one pass), lists again any mount whose
+may wait on a far end; two turn starts at once share one pass; an inbound
+event's turn starts it without waiting, so the service's request is answered at
+once and that turn runs on the list as it stood), lists again any mount whose
 snapshot's basis is not its plugin's — a snapshot with no basis counts as
 different; a mount with no snapshot is left alone, being offered every tool
 already; a switched-off plugin is skipped. The listing is bounded by

@@ -36,13 +36,17 @@ function lister(opts: { credential?: boolean } = {}) {
     fail: null as null | "throw" | "hang" | "hold", listings: 0,
     /** Releases the listings held under `fail: "hold"`; each answers with the list as it was when it started. */
     release: [] as Array<() => void>,
+    /** Makes reading `toolsBasis` throw, so a re-take pass rejects as a whole rather than failing one mount. */
+    basisThrows: false,
+    /** Whether `receive` hands the agent what arrived. */
+    deliver: false,
     seen: [] as Array<{ where: string; offered: readonly string[] | undefined; has: boolean }>,
   };
   const note = (where: string, c: PluginContext) => s.seen.push({ where, offered: c.offered, has: "offered" in c });
   const plugin: Plugin = {
     id: "lister", version: "1.0.0",
     get tools() { return s.all.map(tool); },
-    get toolsBasis() { return s.basis; },
+    get toolsBasis() { if (s.basisThrows) throw new Error("the basis could not be read"); return s.basis; },
     mountTools(mount) {
       const snap = mount.toolSnapshot;
       if (!snap) return s.all.map(tool);
@@ -72,7 +76,7 @@ function lister(opts: { credential?: boolean } = {}) {
       async poll(_h, c) { note("poll", c); return { done: false as const }; },
       async cancel(_h, c) { note("bgcancel", c); },
     },
-    async receive(_e, _sec, c) { note("receive", c); return { deliver: false } as never; },
+    async receive(_e, _sec, c) { note("receive", c); return (s.deliver ? { deliver: true, text: "pushed" } : { deliver: false }) as never; },
     async reportActivity(_e, c) { note("reportActivity", c); return { sent: 0 }; },
   };
   return { s, plugin };
@@ -363,6 +367,143 @@ for (const change of ["replaced", "removed"] as const) {
     must(show(await w.offered()) === show(want), `offered: ${show(await w.offered())}`);
   });
 }
+
+
+const settle = () => new Promise((r) => setTimeout(r, 20));
+
+await check("a re-take pass that throws is forgotten: the prompt goes on, and the next prompt re-takes as usual", async () => {
+  const w = await runtimeWorld();
+  w.l.s.listed = ["a", "b"];
+  w.l.s.basis = "basis-2";
+  w.l.s.basisThrows = true;
+  const realError = console.error;
+  console.error = () => {};
+  const landed = await w.turn("first").finally(() => { console.error = realError; });
+  must(landed.mode === "prompt" || landed.mode === "steer", `the prompt did not land: ${show(landed)}`);
+  must(w.l.s.listings === 1, `control: the pass threw before listing: ${w.l.s.listings}`);
+  w.l.s.basisThrows = false;
+  await w.turn("second");
+  must(w.l.s.listings === 2 && show(await w.offered()) === show(["a", "b"]), `the next prompt's re-take: ${w.l.s.listings} ${show(await w.offered())}`);
+});
+
+await check("a stale answer is no failure: it sets no back-off, so the mount is re-taken at the next turn that needs it", async () => {
+  const w = await runtimeWorld();
+  w.l.s.basis = "basis-2";
+  w.l.s.fail = "hold";
+  const retake = w.rt.retakeStaleSnapshots("t", "a");
+  await settle();
+  // Someone else's listing lands while the held one runs: the held one comes back stale.
+  w.l.s.fail = null;
+  w.l.s.listed = ["a", "b"];
+  must((await w.rt.refreshMountTools("t", "a", "m")).ok, "control: the operator's refresh");
+  w.l.s.release.splice(0).forEach((go) => go());
+  await retake;
+  must(show(await w.offered()) === show(["a", "b"]), `control: the refresh's list stood: ${show(await w.offered())}`);
+  // The same basis, a snapshot that again does not carry it: listed at once, no back-off in the way.
+  await w.rt.store.updateMountToolSnapshot("t", "a", "m", { ...(await w.mount()).toolSnapshot!, basis: "basis-0" });
+  const before = w.l.s.listings;
+  await w.rt.retakeStaleSnapshots("t", "a");
+  must(w.l.s.listings === before + 1, `a stale answer backed the mount off: ${w.l.s.listings - before} listings`);
+});
+
+/**
+ * A held re-take, then the mount's list replaced by one that differs from the list the re-take started from in exactly
+ * one of `takenAt` or `withoutCredential` (hash and basis the same): the held answer must not be written over it.
+ */
+for (const field of ["takenAt", "withoutCredential"] as const) {
+  await check(`a re-take tells the list it started from from a newer one that differs only in ${field}`, async () => {
+    const w = await runtimeWorld({ credential: true });
+    const realNow = Date.now;
+    const at = <R>(t: number, go: () => Promise<R>): Promise<R> => { Date.now = () => t; return go().finally(() => { Date.now = realNow; }); };
+    const T = realNow() + 60_000;
+    must((await at(T, () => w.rt.attachCredential("t", "a", "m", { token: "first-credential-123456" }))).ok, "attach");
+    const start = (await w.mount()).toolSnapshot!;
+    // The re-take starts under another basis, held, and will answer with a list nobody else has.
+    w.l.s.basis = "basis-2";
+    w.l.s.listed = ["a", "c"];
+    w.l.s.fail = "hold";
+    const retake = w.rt.retakeStaleSnapshots("t", "a");
+    await settle();
+    must(w.l.s.release.length === 1, "control: the re-take is in flight");
+    // The newer list: back to the first basis and the first names, so only the one field tells it apart.
+    w.l.s.fail = null;
+    w.l.s.basis = "basis-1";
+    if (field === "takenAt") {
+      w.l.s.listed = ["a", "b"];
+      await w.rt.refreshMountTools("t", "a", "m");
+      w.l.s.listed = ["a"];
+      await at(T + 1_000, () => w.rt.refreshMountTools("t", "a", "m"));
+    } else {
+      w.l.s.listed = ["a"];
+      await at(T, () => w.rt.removeCredential("t", "a", "m"));
+    }
+    const newer = (await w.mount()).toolSnapshot!;
+    const differs = (["hash", "basis", "takenAt", "withoutCredential"] as const).filter((k) => !!start[k] !== !!newer[k] || start[k] !== newer[k]);
+    must(show(differs) === show([field]), `control: the newer list differs in ${show(differs)}`);
+    w.l.s.release.splice(0).forEach((go) => go());
+    await retake;
+    must(show((await w.mount()).toolSnapshot) === show(newer), `the held re-take wrote over the newer list: ${show((await w.mount()).toolSnapshot?.tools.map((t) => t.name))}`);
+  });
+}
+
+async function hooked(w: Awaited<ReturnType<typeof runtimeWorld>>) {
+  const made = await w.rt.createHookSecret("t", "a", "m", "hook-1");
+  must(made.ok, `hook: ${show(made)}`);
+  w.l.s.deliver = true;
+  return () => w.rt.receiveHook("t", "a", "m", "hook-1", { headers: {}, body: new Uint8Array([1]) });
+}
+
+await check("an inbound push is answered at once: its turn starts the re-take without waiting, which still lands; a person's prompt waits", async () => {
+  const w = await runtimeWorld();
+  const push = await hooked(w);
+  w.l.s.listed = ["a", "b"];
+  w.l.s.basis = "basis-2";
+  w.l.s.fail = "hold";
+  const started = Date.now();
+  const r = await push();
+  const took = Date.now() - started;
+  must(r.outcome === "delivered" && took < 1_000, `the push: ${show(r)} after ${took} ms`);
+  must(w.l.s.release.length === 1 && show(await w.offered()) === show(["a"]), `control: the re-take is running, the list as it stood: ${w.l.s.release.length} ${show(await w.offered())}`);
+  // The background pass is the agent's one pass: joining it and releasing the listing lands the new list.
+  const pass = w.rt.retakeStaleSnapshots("t", "a");
+  w.l.s.release.splice(0).forEach((go) => go());
+  await pass;
+  must(w.l.s.listings === 2 && show(await w.offered()) === show(["a", "b"]), `the background re-take: ${w.l.s.listings} ${show(await w.offered())}`);
+  // A person's prompt waits for it.
+  w.l.s.basis = "basis-3";
+  w.l.s.fail = "hold";
+  let done = false;
+  const prompt = w.turn("from a person").then(() => { done = true; });
+  await settle();
+  must(!done && w.l.s.release.length === 1, `the person's prompt did not wait: done=${done}`);
+  w.l.s.release.splice(0).forEach((go) => go());
+  await prompt;
+  must(done, "the person's prompt never finished");
+});
+
+await check("a background re-take that throws is caught and logged: no unhandled rejection, and the push is delivered", async () => {
+  const w = await runtimeWorld();
+  const push = await hooked(w);
+  const unhandled: unknown[] = [];
+  const onUnhandled = (e: unknown) => { unhandled.push(e); };
+  process.on("unhandledRejection", onUnhandled);
+  const logged: unknown[][] = [];
+  const realError = console.error;
+  console.error = (...a: unknown[]) => { logged.push(a); };
+  try {
+    w.l.s.basis = "basis-2";
+    w.l.s.basisThrows = true;
+    const r = await push();
+    await settle();
+    must(r.outcome === "delivered", `the push: ${show(r)}`);
+    must(unhandled.length === 0, `unhandled: ${String(unhandled[0])}`);
+    must(logged.some((a) => /re-taking .*tool lists failed/.test(String(a[0]))), `nothing logged: ${show(logged.map((a) => String(a[0])))}`);
+  } finally {
+    console.error = realError;
+    process.off("unhandledRejection", onUnhandled);
+    w.l.s.basisThrows = false;
+  }
+});
 
 for (const r of results) console.log(`  ${r.ok ? "\x1b[32m✓\x1b[0m" : "\x1b[31m✗\x1b[0m"} ${r.name}${r.error ? `\n      ${r.error}` : ""}`);
 console.log(`  ${"─".repeat(56)}\n  ${results.filter((r) => r.ok).length} passed, ${results.filter((r) => !r.ok).length} failed`);
