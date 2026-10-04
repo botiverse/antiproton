@@ -15,7 +15,7 @@
 import { createHmac, randomBytes } from "node:crypto";
 import {
   createReminderPlugin, httpReminderService, reminderPlugin, subjectOf, ReminderServiceError, HOOK_STORE, HOOK_KEY,
-  RETRY_HORIZON_MS, MAX_CLOCK_SKEW_SECONDS, NO_CREDENTIAL, NO_ORIGIN,
+  RETRY_HORIZON_MS, MAX_CLOCK_SKEW_SECONDS, NO_CREDENTIAL, NO_ORIGIN, ON_RAFT,
   type ReminderConnection, type ReminderService, type ServiceReminder,
 } from "../src/plugins/reminder.ts";
 import type { InboundEvent, InboundResult, Plugin } from "../src/plugins/types.ts";
@@ -694,6 +694,59 @@ await check("the HTTP client maps reminder-app's errors: unknown_hook, an unknow
     const echoed = await codeOf(http.register(CONN, { url: "https://hooks.antiproton.example/hooks/x", secret: "TOPSECRET".repeat(4) }));
     must(echoed.startsWith("unavailable"), `control: ${echoed}`);
   } finally { globalThis.fetch = realFetch; }
+});
+
+// ---- an agent on Raft
+
+/** The mount's agent with another mount under `alias`, of `plugin`: what `ctx.sibling` answers for it. */
+function withSibling(m: ReturnType<typeof mount>, alias: string, plugin: string) {
+  m.ctx.sibling = async (a: string) => a === alias ? { credential: null, credentialRefKind: "none", db: null, plugin, policy: null } : null;
+}
+
+await check("an agent with a raft mount under provisioning's alias cannot create: refused before anything is opened or sent", async () => {
+  const svc = fakeService();
+  const m = mount(createReminderPlugin({ ...DEPLOYMENT, service: svc.service }));
+  withSibling(m, "raft", "raft");
+  const why = await refusal(m.call("create", { delayMinutes: 5, note: "n" }));
+  must(why === ON_RAFT, `refused with "${why}"`);
+  must(svc.calls.length === 0 && m.hooks.made.length === 0, `sent ${svc.ops().join(",")}; opened ${m.hooks.made.length} hooks`);
+});
+
+await check("a mount under the alias raft that is not the raft plugin, or no raft mount at all, does not stop create", async () => {
+  for (const [what, set] of [["alias raft, plugin http", (m: ReturnType<typeof mount>) => withSibling(m, "raft", "http")],
+    ["raft plugin under another alias", (m: ReturnType<typeof mount>) => withSibling(m, "inbox", "raft")], ["no other mount", () => {}]] as const) {
+    const svc = fakeService();
+    const m = mount(createReminderPlugin({ ...DEPLOYMENT, service: svc.service }));
+    set(m);
+    await m.call("create", { delayMinutes: 5, note: "n" }).catch((e) => { throw new Error(`${what}: create refused: ${e.message}`); });
+    must(svc.reminders.size === 1, `${what}: ${svc.reminders.size} reminders`);
+  }
+});
+
+await check("on a Raft-hosted agent, list and delete still work, so reminders set before can be cleaned up", async () => {
+  const svc = fakeService();
+  const m = mount(createReminderPlugin({ ...DEPLOYMENT, service: svc.service }));
+  const a = await m.call("create", { delayMinutes: 5, note: "set before raft" });
+  withSibling(m, "raft", "raft");
+  const listed = await m.call("list", {}).catch((e) => { throw new Error(`list refused on a Raft-hosted agent: ${e.message}`); });
+  must(listed.reminders.map((r: any) => r.id).join() === a.id, `list shows ${JSON.stringify(listed.reminders)}`);
+  const del = await m.call("delete", { id: a.id }).catch((e) => { throw new Error(`delete refused on a Raft-hosted agent: ${e.message}`); });
+  must(del.deleted === a.id && !svc.reminders.has(a.id), `delete: ${JSON.stringify(del)}`);
+});
+
+await check("through the gateway: an agent whose raft mount provisioning made cannot create, and nothing reaches reminder-app or the hook index", async () => {
+  const real = await httpRuntime();
+  try {
+    await real.rt.store.setPluginChoice("t", "a", "raft", "enable");
+    const raft = await real.rt.addMount("t", "a", { alias: "raft", plugin: "raft", config: { serverUrl: "https://api.raft.example" } });
+    must(raft.ok, `control: the raft mount was not added: ${JSON.stringify(raft)}`);
+    real.seen.length = 0;
+    const r: any = await real.rt.gateway().invoke({ tenantId: "t", agentId: "a", taskId: "k" }, "rem.create", { delayMinutes: 5, note: "n" });
+    must(r.ok === false || r.status === "failed", `create went through: ${JSON.stringify(r)}`);
+    must(JSON.stringify(r).includes("This agent is on Raft"), `refused with ${JSON.stringify(r)}`);
+    must(real.seen.length === 0, `requests reached reminder-app: ${JSON.stringify(real.seen.map((x) => x.url))}`);
+    must((await real.directory.list("t", "a")).length === 0, "an inbound hook was created");
+  } finally { real.done(); }
 });
 
 // ---- two creates at once
