@@ -12,7 +12,7 @@
 import { clip, logEvent, routeOf } from "../core/log.ts";
 import type { Json, MountRecord } from "../core/types.ts";
 import {
-  createRaft, isInterrupted, RAFT_OPERATIONS, RAFT_STATE_SCHEMA,
+  createRaft, hashRaftSendContent, isInterrupted, RAFT_OPERATIONS, RAFT_STATE_SCHEMA,
   type Raft, type RaftInboxBatch, type RaftInterrupt, type RaftMessage, type RaftOperationSpec, type RaftState, type RaftStateStore, type RaftFailure,
 } from "@botiverse/raft-sdk";
 import { PARK_BYTES } from "./artifacts.ts";
@@ -494,6 +494,12 @@ const ARGUMENT_CHECKS: Readonly<Record<string, { check(input: Record<string, unk
  * paging argument capped (`pagingArg`). `sideEffect` decides the mount's policy half (an unknown value is a
  * write); `modelOnly` is carried, so the gateway refuses it from a program as a second layer over the SDK's own
  * MODEL_ONLY refusal; idempotency is the manifest's, `natural` being what this runtime calls `native`.
+ *
+ * A keyed operation (`{ kind: "key" }`) stays `"key"`, never `"native"`: when the model gives no key, its key is the
+ * gateway's operation id (`keyedInput`), and a re-run after a crash is a new operation with a new id, so it would
+ * land twice. `"key"` is not replayed on its own (`replayPolicy`, src/runtime/pi-tools.ts). Its key argument stays
+ * optional and is described for the model in plain words (`keyDescription`), since the manifest's text names the
+ * SDK's interrupt and a key handed back that this mount never shows.
  */
 export function toolOf(op: RaftOperationSpec): ToolSchema {
   const parameters = structuredClone(op.inputSchema) as Record<string, any>;
@@ -502,6 +508,9 @@ export function toolOf(op: RaftOperationSpec): ToolSchema {
     const p = parameters.properties[paging];
     p.maximum = Math.min(typeof p.maximum === "number" ? p.maximum : PAGE_ROWS, PAGE_ROWS);
     p.description = `${p.description ? `${p.description} ` : ""}At most ${PAGE_ROWS} on this mount, and ${PAGE_ROWS} when omitted, so a page fits in the conversation.`;
+  }
+  if (op.idempotency.kind === "key" && parameters.properties?.[op.idempotency.arg]) {
+    parameters.properties[op.idempotency.arg].description = keyDescription(op);
   }
   const described = op.description.replace(/\b[a-z]+\.[a-z][A-Za-z]*\b/g, (name) => TOOL_NAME.get(name) ?? name);
   const held = op.mayInterrupt
@@ -517,6 +526,15 @@ export function toolOf(op: RaftOperationSpec): ToolSchema {
   };
 }
 
+/** What a keyed operation's key argument is for, as the model reads it. */
+function keyDescription(op: RaftOperationSpec): string {
+  const one = op.name.startsWith("messages.") ? "message" : op.name === "tasks.create" ? "set of tasks" : op.name === "actions.prepare" ? "card" : "call";
+  return `Optional: a name you choose for this one ${one}, such as a short random string. Raft acts at most once per name: ` +
+    `if a call failed in a way that may still have gone through, call again with the same arguments and the same ` +
+    `idempotencyKey, and you get the first call's answer instead of a second ${one}. Use a new name for anything ` +
+    `different; the same name with different arguments is refused. Without one, calling again is a new request.`;
+}
+
 const GENERATED_TOOLS: readonly ToolSchema[] = GENERATED.map(toolOf);
 const OPERATION_OF = new Map(GENERATED.map((op) => [op.toolName, op]));
 
@@ -526,7 +544,7 @@ const OPERATION_OF = new Map(GENERATED.map((op) => [op.toolName, op]));
  * carries. Every other call is "code": a run_js program, an approved call's replay (run with nobody reading the
  * result), provisioning, a bench shell. Under "code" the SDK refuses a model-only operation with MODEL_ONLY
  * before any request, and reads history with `consume: false`, recording nothing as seen. That is all "code"
- * changes in the SDK (0.8.0's `invoke`): a send, a claim or a task write runs the same under either, attesting
+ * changes in the SDK (0.9.0's `invoke`): a send, a claim or a task write runs the same under either, attesting
  * what was seen in the context it names. The context id goes along whatever the origin, so what a program sends
  * is attested by what its model read in that context.
  */
@@ -613,7 +631,7 @@ export const CLI_HINT = /\braft (?:message|server|inbox|user|task|mention|channe
  * The lines in which the SDK's formatters write a command hint, by how each line starts. Only these lines are
  * rewritten: a line that quotes what a person wrote — a message line (`[target=…`) or its continuation (`  │ `), a
  * task's title or description, a channel's or a user's description, a search preview, an attachment comment —
- * starts some other way, and is passed on as written. Each shape is one formatter's (0.8.0's), named beside it.
+ * starts some other way, and is passed on as written. Each shape is one formatter's (0.9.0's), named beside it.
  */
 const SDK_HINT_LINES: readonly RegExp[] = [
   /^(?:Older|Newer) exist: raft message read /, // a history page's next window
@@ -707,6 +725,44 @@ function isMessage(value: unknown): value is RaftMessage {
   return !!m && typeof m === "object" && typeof m.text === "string" && Array.isArray(m.attachments) && !!m.raw;
 }
 
+/**
+ * The arguments of a keyed operation (the manifest's `idempotency.kind === "key"`: a send, a reply, a task create,
+ * an action card) with the key Raft dedupes on (for 24 hours, by the SDK's README for a create or a card):
+ * - the model's own `idempotencyKey` when it gave one. A model calling again after an outcome it could not know
+ *   (a timeout, a 5xx) reuses its own key, so Raft answers the first call instead of acting twice; and a held
+ *   message re-sent with the same key is that message going ahead, attesting what the question showed (`heldCall`).
+ *   A resume passes the interrupt's key here too, which is the key the held call was sent with;
+ * - else the gateway's operation id (`PluginContext.operationId`). An approved call's replay and a resume carry no
+ *   key of the model's but run under the id of the call they continue, so they dedupe on it; two model calls are
+ *   two operations, two ids, and never dedupe by accident;
+ * - else, with no operation (no id), nothing: the SDK makes a key of its own, as it always has.
+ *
+ * One exception to the operation id: a send or reply the model repeats, without a key, after it was held. The
+ * SDK reuses the held send's key for the same target and content (its saved continuation), so the repeat and a
+ * later "send" answer to the question land once; a fresh operation id would make them two messages.
+ */
+async function keyedInput(op: RaftOperationSpec, input: Record<string, unknown>, ctx: PluginContext, raft: Raft): Promise<Record<string, unknown>> {
+  if (op.idempotency.kind !== "key") return input;
+  const arg = op.idempotency.arg;
+  const given = input[arg];
+  if (typeof given === "string" && given.trim()) return input;
+  if (!ctx.operationId) return input;
+  if (await continuesHeldSend(op, input, raft)) return input;
+  return { ...input, [arg]: ctx.operationId };
+}
+
+/** Whether the SDK will send this as the continuation of a held send (`sendWithState` in the SDK, 0.9.0). */
+async function continuesHeldSend(op: RaftOperationSpec, input: Record<string, unknown>, raft: Raft): Promise<boolean> {
+  const target = op.name === "messages.send" ? input.target : op.name === "messages.reply" ? object(input.message).target : undefined;
+  if (typeof target !== "string" || typeof input.content !== "string") return false;
+  const ids = Array.isArray(input.attachmentIds) ? input.attachmentIds.filter((id): id is string => typeof id === "string") : [];
+  await raft.state.load();
+  const held = raft.state.snapshot().continuations ?? [];
+  if (!held.some((c) => c.target === target)) return false;
+  const hash = await hashRaftSendContent(target, input.content, ids);
+  return held.some((c) => c.target === target && c.contentHash === hash);
+}
+
 /** One operation, run through the SDK's `invoke` under the caller's origin and context. */
 async function runOperation(
   op: RaftOperationSpec, args: unknown, ctx: PluginContext, seen?: { upToSeq: number },
@@ -721,7 +777,8 @@ async function runOperation(
   // Only `messages.read` books it among the generated tools (the manifest's `consumes.model`; the inbox pulls,
   // which also do, are excluded and stay with receive_events).
   const raft = raftFor(ctx, op.consumes.model.includes("seen") ? { state: false } : {});
-  const out = await raft.invoke(op.name, seen ? { ...input, seen } : input, caller);
+  const keyed = await keyedInput(op, input, ctx, raft);
+  const out = await raft.invoke(op.name, seen ? { ...keyed, seen } : keyed, caller);
   if (!out.ok) throw sdkFailure(out as RaftFailure, op.sideEffect !== "read");
   if (isInterrupted(out)) return heldCall(op, raft, caller, out.interrupt, input);
   // The SDK's text is the outcome as the model reads it (the CLI's output for the same operation, its command hints
