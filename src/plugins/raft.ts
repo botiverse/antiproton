@@ -437,6 +437,7 @@ export const EXCLUDED: Readonly<Record<string, string>> = {
   "inbox.commit": "receive_events commits on its next call; a separate commit could acknowledge a batch before the model has read it",
   "mentions.execute": "its add action changes a conversation's membership; membership changes go through an action card a person confirms (actions_prepare)",
   "profile.update": "changes the account's public identity (display name, description, avatar); identity changes go through an action card a person confirms",
+  "tasks.delete": "destructive, and new: agents could not delete tasks before; offered when someone asks for it",
 };
 
 /** The operations this plugin offers as tools: the manifest, less `EXCLUDED`, in the manifest's order. */

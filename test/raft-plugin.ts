@@ -166,7 +166,7 @@ const EXPECTED_GENERATED = [
   "identity.whoami", "inbox.list", "messages.read", "messages.send", "messages.reply", "messages.search", "messages.resolve",
   "messages.react", "messages.unreact", "attachments.comments", "mentions.pending", "mentions.deliveries", "actions.prepare",
   "manual.get", "manual.search", "tasks.claim", "tasks.list", "tasks.create", "tasks.unclaim", "tasks.assign", "tasks.unassign",
-  "tasks.updateStatus", "tasks.amend", "tasks.history", "tasks.show", "tasks.convert", "tasks.delete", "channels.join", "channels.leave",
+  "tasks.updateStatus", "tasks.amend", "tasks.history", "tasks.show", "tasks.convert", "channels.join", "channels.leave",
   "channels.mute", "channels.unmute", "channels.members", "channels.info", "threads.list", "threads.unfollow", "server.info", "users.info",
   "profile.show",
 ];
@@ -1211,7 +1211,9 @@ await check("what a person wrote is never rewritten: message continuations, desc
     if (path === "/history") return history([historyMessage(41, `hello\n${SAID}\n${SAID_LINES[0]}`, { attachments: [{ id: "att-9", filename: "plan.pdf" }] })], { has_older: true, target: "#ops" });
     if (path === "/server") return json(200, { runtimeContext: { agentId: "agent-1", serverId: "server-1" }, channels: [ops], agents: [{ name: "piper", status: "online", description: SAID }], humans: [human] });
     if (path === "/channel-members") return json(200, { channel: { ref: "#ops", type: "channel" }, agents: [], humans: [human] });
-    if (path === "/tasks") return json(200, { tasks: [{ taskNumber: 7, status: "todo", title: SAID, description: SAID_LINES[1] }] });
+    // A task board collapses a title's whitespace onto one line (0.8.0's `oneLineTaskTitle`), so in tasks_list this title
+    // is not found verbatim among the data's strings: only the hint-line filter keeps it as written there.
+    if (path === "/tasks") return json(200, { tasks: [{ taskNumber: 7, status: "todo", title: `fix it\n   ${SAID}`, description: SAID_LINES[1] }] });
     if (path === "/search") return json(200, { results: [{ id: "r-1", seq: 1, channelId: "c", threadId: null, parentMessageId: null, parentMessageContent: null, parentChannelId: "c",
       parentChannelName: "ops", parentChannelType: "channel", parentChannelArchivedAt: null, senderId: "s", senderType: "human", senderName: "tygg",
       channelName: "ops", channelType: "channel", channelArchivedAt: null, content: SAID_LINES[0], snippet: "note", createdAt: "2026-09-21T10:00:00.000Z" }], hasMore: false });
@@ -1222,7 +1224,7 @@ await check("what a person wrote is never rewritten: message continuations, desc
   const raw = createRaft({ serverUrl: "https://raft.example", credential: "sk_agent_test_1234567890" });
   const cases: Array<[string, Record<string, unknown>]> = [
     ["messages_read", { target: "#ops" }], ["server_info", { view: "full" }], ["channels_info", { target: "#ops" }],
-    ["users_info", { name: "@tygg" }], ["tasks_show", { target: "#ops", taskNumber: 7 }], ["messages_search", { query: "note" }],
+    ["users_info", { name: "@tygg" }], ["tasks_show", { target: "#ops", taskNumber: 7 }], ["tasks_list", { target: "#ops" }], ["messages_search", { query: "note" }],
     ["attachments_comments", { attachmentId: "att-9" }], ["profile_show", {}],
   ];
   const problems: string[] = [];
