@@ -3,6 +3,7 @@ import { createRaft, isInterrupted, RAFT_OPERATIONS } from "@botiverse/raft-sdk"
 import { raftPlugin, EXCLUDED, EVENTS_LIMIT, GENERATED, handOver, INBOX_STORE, KEY_LIFETIME_MS, PAGE_ROWS, PUSH_KEY, PUSH_STORE, originOf, pagingArg, toolOf, offeredTerms, escapeMarks, unescapeMarks, createRaftPlugin, downloadAttachment, ATTACHMENT_MAX_BYTES } from "../src/plugins/raft.ts";
 import { readFileSync } from "node:fs";
 import { PARK_BYTES } from "../src/plugins/artifacts.ts";
+import { setLogSink } from "../src/core/log.ts";
 import { Interrupt, toolsOf, type PluginErrorFields } from "../src/plugins/types.ts";
 import { admitTools } from "../src/runtime/mount-tools.ts";
 import { AgentRuntime, limitForCall, tooLargeResult } from "../cf/src/runtime.ts";
@@ -2881,6 +2882,134 @@ await check("a Server that cannot mint a URL (CONFLICT) is answered by the binar
   attachmentServer({ mint: "notfound" });
   const nf = await failure(() => downloadAttachment({ attachmentId: "att-1" }, inTurn(ctx()), fakeArtifacts()));
   if (!/does not exist or is not visible/.test(nf.message)) throw new Error(`not found: ${nf.message}`);
+});
+
+/**
+ * Everything the process writes while `fn` runs: every `console` method and every structured line (`logEvent`, through
+ * a sink installed for the call; tests run with none). Restored afterwards whatever `fn` does.
+ */
+async function written(fn: () => Promise<unknown>): Promise<string[]> {
+  const lines: string[] = [];
+  const methods = ["log", "info", "warn", "error", "debug", "trace"] as const;
+  const saved = methods.map((m) => console[m]);
+  for (const m of methods) (console as any)[m] = (...a: unknown[]) => { lines.push(`console.${m}: ${a.map((x) => x instanceof Error ? `${x.message} ${x.stack}` : typeof x === "string" ? x : JSON.stringify(x)).join(" ")}`); };
+  setLogSink((line) => lines.push(`logEvent: ${line}`));
+  try { await fn().catch(() => {}); }
+  finally { methods.forEach((m, i) => { (console as any)[m] = saved[i]; }); setLogSink(null); }
+  return lines;
+}
+
+await check("the presigned URL is never logged: no console line and no structured line carries it, on success or on any failure", async () => {
+  const leaks = (lines: string[], url: string) => {
+    const u = new URL(url);
+    return lines.filter((l) => l.includes(u.hostname) || l.includes(u.search.slice(1)) || /SIGNATURE|SIGsecret/.test(l));
+  };
+  // Success: the file is kept, and the Raft call is logged (control: the sink was reached) — without the URL.
+  const store = fakeArtifacts();
+  attachmentServer();
+  const ok = await written(() => downloadAttachment({ attachmentId: "att-1" }, inTurn(ctx()), store));
+  if (store.puts.length !== 1) throw new Error("control: the download did not succeed");
+  if (!ok.some((l) => l.startsWith("logEvent: ") && l.includes("raft.call"))) throw new Error(`control: nothing was logged: ${JSON.stringify(ok)}`);
+  if (leaks(ok, PRESIGNED).length) throw new Error(`success logged the URL: ${leaks(ok, PRESIGNED).join(" | ")}`);
+  // Failures from storage: refused, down, not answering (the error names the URL), over the cap.
+  for (const [what, storageAnswer] of [
+    ["storage 5xx", () => new Response("upstream broke", { status: 503 })],
+    ["storage refused", () => new Response("denied", { status: 403 })],
+    ["storage unreachable", () => { throw new Error(`connect ECONNREFUSED ${PRESIGNED}`); }],
+    ["too large", () => new Response(new Uint8Array(8), { headers: { "content-length": String(ATTACHMENT_MAX_BYTES + 1) } })],
+  ] as const) {
+    const kept = fakeArtifacts();
+    attachmentServer({ storage: storageAnswer as () => Response });
+    const lines = await written(() => downloadAttachment({ attachmentId: "att-1" }, inTurn(ctx()), kept));
+    if (kept.puts.length) throw new Error(`${what}: kept`);
+    if (leaks(lines, PRESIGNED).length) throw new Error(`${what}: logged the URL: ${leaks(lines, PRESIGNED).join(" | ")}`);
+  }
+  // A refused host: never fetched, never logged.
+  const inward = "https://169.254.169.254/latest/meta-data/?X-Amz-Signature=SIGsecret";
+  globalThis.fetch = (async (u: any) => new URL(String(u)).pathname.endsWith("/url")
+    ? json(200, { url: inward, expiresAt: "2026-10-04T10:05:00Z", filename: "plan.pdf", mimeType: "application/pdf" })
+    : new Response(FILE)) as any;
+  const refused = await written(() => downloadAttachment({ attachmentId: "att-1" }, inTurn(ctx()), fakeArtifacts()));
+  if (leaks(refused, inward).length) throw new Error(`refused host logged the URL: ${leaks(refused, inward).join(" | ")}`);
+});
+
+await check("a storage redirect is a failure: the Location is never fetched, nothing is kept, and neither address is in the error", async () => {
+  for (const location of ["https://169.254.169.254/latest/meta-data/iam?X-Amz-Signature=LOCsecret", "https://elsewhere.example/obj?X-Amz-Signature=LOCsecret", "/relative/obj?X-Amz-Signature=LOCsecret"]) {
+    const target = new URL(location, PRESIGNED).href;
+    const hits: string[] = [];
+    const modes: string[] = [];
+    // Storage as fetch meets it, honouring `redirect` the way fetch does: "manual" hands back the 3xx, "error" throws,
+    // and "follow" (also what an absent option means) fetches the Location and hands back what it answers.
+    const answer = async (href: string, init: any, depth: number): Promise<Response> => {
+      if (href === target) { hits.push(href); return new Response(new TextEncoder().encode("instance credentials"), { headers: { "content-type": "text/plain" } }); }
+      if (href !== PRESIGNED) return json(404, { error: "not found" });
+      const mode = init?.redirect ?? "follow";
+      modes.push(mode);
+      const res = new Response(null, { status: 302, headers: { location } });
+      if (mode === "manual") return res;
+      if (mode === "error" || depth > 5) throw new TypeError("fetch failed: redirect");
+      return answer(target, init, depth + 1);
+    };
+    globalThis.fetch = (async (url: any, init?: any) => {
+      const u = new URL(String(url));
+      if (u.pathname === "/internal/agent-api/attachments/att-1/url") {
+        return json(200, { url: PRESIGNED, expiresAt: "2026-10-04T10:05:00Z", filename: "plan.pdf", mimeType: "application/pdf" });
+      }
+      return answer(u.href, init, 0);
+    }) as any;
+    const store = fakeArtifacts();
+    let why: Error;
+    try {
+      const out = await downloadAttachment({ attachmentId: "att-1" }, inTurn(ctx()), store);
+      throw new Error(`${location}: the redirect was followed and kept (modes ${JSON.stringify(modes)}, Location fetched ${hits.length}x): ${JSON.stringify(out)}`);
+    } catch (e) { why = e as Error; if (/was followed and kept/.test(why.message)) throw why; }
+    if (modes.length !== 1) throw new Error(`${location}: storage asked ${modes.length} times`);
+    if (hits.length) throw new Error(`${location}: the Location was fetched (redirect: ${modes[0]})`);
+    if (store.puts.length) throw new Error(`${location}: kept ${store.puts.length}`);
+    const msg = why.message;
+    if (/storage\.example|elsewhere\.example|169\.254|relative|SIGNATURE|LOCsecret|https?:/.test(msg)) throw new Error(`${location}: the error carries an address: ${msg}`);
+    if (!/nothing was kept/.test(msg)) throw new Error(`${location}: ${msg}`);
+  }
+});
+
+await check("a stored reference outside this agent's scope is refused: the call fails cleanly, shows no reference, and carries no URL", async () => {
+  for (const ref of ["r2://bucket/t/other-tenant/agent/raft/attachments/att-1/plan.pdf", "r2://bucket/t/tenant/agent/raft/../../x/plan.pdf", "not-a-ref"]) {
+    const puts: string[] = [];
+    const elsewhere = { async put(key: string, body: Uint8Array) { puts.push(key); return { ref, bytes: body.byteLength }; } };
+    attachmentServer();
+    let lines: string[] = [];
+    let out: unknown;
+    let why: Error | null = null;
+    lines = await written(async () => {
+      try { out = await downloadAttachment({ attachmentId: "att-1" }, inTurn(ctx()), elsewhere); } catch (e) { why = e as Error; }
+    });
+    if (puts.length !== 1) throw new Error(`control: ${ref}: not stored (${puts.length})`);
+    if (!why) throw new Error(`${ref}: answered instead of refusing: ${JSON.stringify(out)}`);
+    const msg = (why as Error).message;
+    if (!/stored where this agent cannot read it back/.test(msg)) throw new Error(`${ref}: ${msg}`);
+    if (/storage\.example|SIGNATURE|https?:|r2:|other-tenant|t\/tenant/.test(msg)) throw new Error(`${ref}: the error carries too much: ${msg}`);
+    const leaked = lines.filter((l) => /storage\.example|SIGNATURE/.test(l));
+    if (leaked.length) throw new Error(`${ref}: logged the URL: ${leaked.join(" | ")}`);
+  }
+});
+
+await check("the runtime hands the raft plugin its object storage: attachments_download_url, offered as built, keeps the file in the bucket", async () => {
+  const bucketPuts: Array<{ key: string; bytes: number }> = [];
+  // The real runtime, over a bucket that records what reaches it, as the deployment's R2 would.
+  const host = sqliteHost();
+  const built: any = new AgentRuntime({
+    ctx: { storage: host } as any, bucketName: "b", models: { resolve: () => null } as any, extraPlugins: [],
+    bucket: { async put(key: string, body: Uint8Array) { bucketPuts.push({ key, bytes: body.byteLength }); return {}; } } as any,
+    secretKek: Buffer.from(new Uint8Array(32)).toString("base64"),
+  } as any);
+  const raft = (built.plugins() as Array<{ id: string; invoke: (n: string, a: unknown, c: any) => Promise<unknown>; tools: Array<{ name: string }> }>).find((p) => p.id === "raft");
+  if (!raft || !raft.tools.some((t) => t.name === "attachments_download_url")) throw new Error("the runtime's raft plugin does not offer the download");
+  attachmentServer();
+  const out: any = await raft.invoke("attachments_download_url", { attachmentId: "att-1" }, inTurn(ctx()));
+  if (out?.ref !== "artifact://raft/attachments/att-1/plan.pdf" || JSON.stringify(out).includes("storage.example")) throw new Error(JSON.stringify(out));
+  if (bucketPuts.length !== 1 || bucketPuts[0]!.key !== "t/tenant/agent/raft/attachments/att-1/plan.pdf" || bucketPuts[0]!.bytes !== FILE.byteLength) {
+    throw new Error(`bucket: ${JSON.stringify(bucketPuts)}`);
+  }
 });
 
 await check("the attachment download is offered: not in EXCLUDED, so as built the tool is generated, offered, described and run, and a table that excludes it takes all of that back", async () => {
