@@ -31,6 +31,13 @@ export interface OpenOptions {
    * whose rule it is.
    */
   readOnly?: boolean;
+  /**
+   * The context this database was handed in has ended: once `closed` is set, every operation refuses, a
+   * transaction's `tx` included, the same way `handle.closed` ends one transaction's handle. For a context that
+   * outlives its purpose — `Plugin.unmount` past its deadline, whose mount is about to be deleted and whose alias a
+   * new mount may take, so a late write would land in the new mount's rows (src/runtime/gateway.ts `unmount`).
+   */
+  lease?: { readonly closed: boolean; readonly reason: string };
 }
 
 const READ_ONLY = "read-only: a diagnosis does not change a mount's state";
@@ -62,6 +69,8 @@ export function openPluginDatabase(
 ): PluginDatabase {
   const who = `plugin ${scope.plugin}`;
   const readOnly = opts.readOnly === true;
+  const lease = opts.lease;
+  const live = (): void => { if (lease?.closed) throw new Error(lease.reason); };
   if (spec && (!Number.isInteger(spec.version) || spec.version < 1)) {
     throw new Error(`${who} declares database version ${String(spec.version)}; it must be a positive integer`);
   }
@@ -88,6 +97,7 @@ export function openPluginDatabase(
   const ops = (writes: boolean, only: ReadonlySet<string> | null = null, handle: { closed: boolean } = { closed: false }): DbOperations => {
     const storeIn = (name: string): DbStoreSpec => {
       if (handle.closed) throw new Error("this transaction has ended; its handle cannot be used outside its callback");
+      live();
       const s = storeOf(name);
       if (only && !only.has(name)) throw new Error(`store ${name} is not in this transaction; it named ${[...only].join(", ")}`);
       return s;
@@ -150,6 +160,7 @@ export function openPluginDatabase(
    * nothing. Read-only openings never write, so they never upgrade.
    */
   const ready = (): void => {
+    live();
     if (upgraded || readOnly || !spec) return;
     const stored = tables.version(scope);
     if (stored === null || stored < spec.version) {

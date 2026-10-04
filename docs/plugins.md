@@ -566,9 +566,13 @@ removed.** Removing a mount deletes what is filed under its alias here — its
 database, its tool list, its hooks — and nothing the plugin registered
 elsewhere: a webhook created through the service's API, a subscription. Only
 the plugin knows those, so the runtime (`removeMount` in `cf/src/runtime.ts`)
-calls `unmount` with the mount's normal context (`db`, `credential`, and
-`inbound` for a plugin that receives) and the plugin cancels them there,
-reading the ids it kept in `ctx.db`. What the runtime promises:
+calls `unmount` with the mount's normal context (`db`, and `inbound` for a
+plugin that receives) and the plugin cancels them there, reading the ids it
+kept in `ctx.db`. `ctx.credential` is always null: a removal is refused while
+an account is attached, so it has been detached by the time `unmount` runs. A
+plugin that must authenticate to deregister uses `ctx.ownerSecret` or a
+credential of the deployment's (detaching an account could one day call
+`unmount` too). What the runtime promises:
 
 - it is called **once**, and only once the removal is going to happen: a
   removal refused for any of the reasons above never calls it;
@@ -578,7 +582,13 @@ reading the ids it kept in `ctx.db`. What the runtime promises:
   the reason is shown to the person who removed it (above the panel, and as
   `unmountError` in `/ui/mount/remove`'s JSON), since whatever it could not
   cancel is now theirs to cancel by hand. A call past the deadline is not
-  stopped;
+  stopped, but its context is closed: from then on every `ctx.db`,
+  `ctx.inbound` and other context call throws, so a late write cannot land
+  under the removed alias, nor in a new mount that has taken it since;
+- **nothing else reaches the mount meanwhile**: once the removal is decided,
+  tool calls on it are refused and pushed events are ignored without waking the
+  agent, and `unmount` runs under the mount's lock, after any exclusive call
+  already running;
 - **then every hook of the mount still live is revoked** — the index row first,
   so the URL answers 404 at once, then its secret — so a hook the plugin forgot,
   or could not reach because it failed, does not stay a public address for an

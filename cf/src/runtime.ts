@@ -2051,6 +2051,24 @@ export class AgentRuntime {
     };
     const readable = await liveHooks();
     if ("error" in readable) return refuse(readable.error);
+    // From here the removal is decided: no call or pushed event reaches the mount until it is gone, or until a
+    // refusal below calls it off (`ToolGateway.markRemoving`).
+    const unmark = this.#gateway.markRemoving(tenantId, agentId, alias);
+    try {
+      return await this.#removeDecided(tenantId, agentId, alias, plugin, hooks, liveHooks, refuse);
+    } finally {
+      unmark();
+    }
+  }
+
+  /** `removeMount` past its refusals: `unmount`, the hooks, the delete. */
+  async #removeDecided(
+    tenantId: string, agentId: string, alias: string, plugin: Plugin,
+    hooks: Pick<HookDirectory, "list" | "revoke"> | null,
+    liveHooks: () => Promise<HookRow[] | { error: string }>,
+    refuse: (error: string) => { ok: false; error: string; conflict: true },
+  ): Promise<{ ok: true; unmountError?: string } | { ok: false; error: string; conflict?: true }> {
+    const sql = this.#deps.ctx.storage.sql;
     const unmountError = plugin.unmount ? await this.#unmount(tenantId, agentId, alias) : null;
     const live = await liveHooks();
     if ("error" in live) return refuse(live.error);
@@ -2079,21 +2097,27 @@ export class AgentRuntime {
 
   /**
    * The plugin's `unmount`, under its timeout: null when it returned, else why not, in words for the person who
-   * removed the mount. A call past the deadline is not stopped (nothing can stop a promise); its late failure is
-   * caught so it is not an unhandled rejection, and what it does lands on a mount that is gone.
+   * removed the mount. The context is closed on every way out, before the caller deletes anything: a call past the
+   * deadline is not stopped (nothing can stop a promise), but from then on every `ctx.db`, `ctx.inbound` and other
+   * context call it makes refuses, so it cannot write under an alias that is being deleted — or that a new mount
+   * has taken by the time it gets there (`ToolGateway.unmount`).
    */
   async #unmount(tenantId: string, agentId: string, alias: string): Promise<string | null> {
     const ms = this.#deps.unmountTimeoutMs ?? UNMOUNT_TIMEOUT_MS;
-    const call = this.#gateway.unmount(tenantId, agentId, alias).then(() => null,
-      (e) => `${alias}'s plugin could not clean up: ${String((e as Error)?.message ?? e).slice(0, 300)}`);
+    let started: Awaited<ReturnType<ToolGateway["unmount"]>> = null;
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const timedOut = new Promise<string>((resolve) => {
-      timer = setTimeout(() => resolve(`${alias}'s plugin did not finish cleaning up within ${ms} ms`), ms);
-    });
     try {
+      started = await this.#gateway.unmount(tenantId, agentId, alias);
+      if (!started) return null;
+      const call = started.done.then(() => null,
+        (e) => `${alias}'s plugin could not clean up: ${String((e as Error)?.message ?? e).slice(0, 300)}`);
+      const timedOut = new Promise<string>((resolve) => {
+        timer = setTimeout(() => resolve(`${alias}'s plugin did not finish cleaning up within ${ms} ms`), ms);
+      });
       return await Promise.race([call, timedOut]);
     } finally {
       clearTimeout(timer);
+      started?.close();
     }
   }
 

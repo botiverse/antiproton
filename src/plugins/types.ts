@@ -2061,8 +2061,13 @@ export interface Plugin {
    * Deleting a mount deletes everything filed under its alias here — its database, its tool list, its hooks — but
    * nothing the plugin registered elsewhere: a webhook it created with the service's API, a subscription, a
    * session the service keeps open. Only the plugin knows those, so it is asked, with the mount's own context
-   * (`db`, `credential`, `inbound` for a plugin that receives), before any of it goes. Typical: read the ids kept
-   * in `ctx.db`, tell the service to forget them, and revoke the mount's hooks through `ctx.inbound`.
+   * (`db`, and `inbound` for a plugin that receives), before any of it goes. Typical: read the ids kept in
+   * `ctx.db`, tell the service to forget them, and revoke the mount's hooks through `ctx.inbound`.
+   *
+   * **`ctx.credential` is always null here.** A removal is refused while the mount has an account attached, so by
+   * the time `unmount` runs the account has already been detached. A plugin that must authenticate to deregister
+   * uses `ctx.ownerSecret` (with `readsOwnerSecrets`) or a credential of the deployment's. (Detaching an account
+   * could one day call `unmount` too, while the account is still there.)
    *
    * What the runtime promises around it (`AgentRuntime.removeMount`, cf/src/runtime.ts):
    * - **Called once per removal, after every refusal.** A removal that is refused (an account still attached, a
@@ -2072,8 +2077,12 @@ export interface Plugin {
    * - **A throw or a timeout does not block the removal.** The mount is removed anyway and the reason is shown to
    *   the person who removed it, because a service that is down would otherwise make a mount impossible to delete.
    *   So this is best effort: whatever it could not cancel is that person's to clean up by hand, with the reason
-   *   in front of them. A timed-out call is not stopped; whatever it does after the deadline lands on a mount
-   *   that is already gone.
+   *   in front of them. A timed-out call is not stopped, but its context is closed at the deadline: every
+   *   `ctx.db`, `ctx.inbound` and other context call it makes after that throws, so it cannot write under an
+   *   alias that is being deleted, or that a new mount has taken since.
+   * - **Nothing else reaches the mount meanwhile.** From the moment the removal is decided, tool calls on the
+   *   mount are refused and pushed events are ignored without waking the agent; `unmount` runs under the mount's
+   *   lock, after any exclusive call already running on it.
    * - **Then the runtime revokes every hook of the mount still live**, so a hook the plugin forgot, or could not
    *   reach because it failed, does not stay a public URL pointing at a removed alias.
    *

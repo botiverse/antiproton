@@ -265,6 +265,25 @@ export class ToolGateway {
 
   #inbound?: (tenantId: string, agentId: string, alias: string) => InboundHooks;
 
+  /**
+   * Mounts being removed (`markRemoving`), by `tenant/agent/alias`: a call or a pushed event for one is refused
+   * from the moment the removal is decided until the mount is gone, or the removal is called off.
+   */
+  readonly #removing = new Set<string>();
+
+  /**
+   * Refuse calls and pushed events for this mount until the returned function is called. `AgentRuntime.removeMount`
+   * holds it from the moment its refusals have passed until the store's delete, so nothing reaches the plugin while
+   * `unmount` runs or after: a tool call would act on a mount whose cleanup has begun, and a push would wake the
+   * agent for a mount that is going (`#invoke`, `#receiveGate`). A call already queued behind the mount's lock is
+   * refused when its turn comes, by the same check.
+   */
+  markRemoving(tenantId: string, agentId: string, alias: string): () => void {
+    const key = `${tenantId}/${agentId}/${alias}`;
+    this.#removing.add(key);
+    return () => { this.#removing.delete(key); };
+  }
+
   /** alias.tool  →  exact mount.  plugin.tool  →  only if unambiguous. */
   async resolve(ctx: CallContext, raw: string): Promise<Resolution> {
     const ref = parseToolRef(raw);
@@ -696,6 +715,9 @@ export class ToolGateway {
   ): Promise<ToolResult> {
     const r = await this.resolve(ctx, raw);
     if ("error" in r) return { status: "rejected", error: r.error };
+    if (this.#removing.has(`${ctx.tenantId}/${ctx.agentId}/${r.mount.alias}`)) {
+      return { status: "rejected", error: { code: "not_mounted", message: `the \`${r.mount.alias}\` mount is being removed` } };
+    }
     // The agent's own hold: a call sent with `opts.confirm` is held exactly as
     // a policy hold would be, and the person decides. It is an option, not an
     // argument, so the plugin's parameter names stay its own (appworld
@@ -1065,11 +1087,12 @@ export class ToolGateway {
    * that plugin's declaration. Opened fresh per context: the version rule
    * runs on first use, and a context that never touches storage pays nothing.
    */
-  #db(ctx: { tenantId: string; agentId: string }, mount: MountRecord) {
+  #db(ctx: { tenantId: string; agentId: string }, mount: MountRecord, lease?: Lease) {
     return openPluginDatabase(
       this.#store.pluginDb,
       { tenantId: ctx.tenantId, agentId: ctx.agentId, alias: mount.alias, plugin: mount.plugin },
       this.#plugins.get(mount.plugin)?.database,
+      lease ? { lease } : {},
     );
   }
 
@@ -1079,10 +1102,10 @@ export class ToolGateway {
    * a poll or a cancel sees exactly the context the call saw, credential
    * included, and nothing about a background job has to travel with it.
    */
-  #contextFor(ctx: CallContext, mount: MountRecord, credential: string | null, fromProgram = false, operationId?: string, listing = false) {
+  #contextFor(ctx: CallContext, mount: MountRecord, credential: string | null, fromProgram = false, operationId?: string, listing = false, lease?: Lease) {
     const store = this.#store;
     const secrets = this.#secrets;
-    const db = (m: MountRecord) => this.#db(ctx, m);
+    const db = (m: MountRecord) => this.#db(ctx, m, lease);
     const plugin = this.#plugins.get(mount.plugin);
     return {
       // Both extras are present only when they say something: `fromProgram` only ever true, `contextId` only for a
@@ -1222,24 +1245,51 @@ export class ToolGateway {
   }
 
   /**
-   * Tell a mount's plugin the mount is being removed (`Plugin.unmount`), with the context a call on it would get,
-   * minus a task. Whether there was anything to ask; a plugin's throw propagates, and the caller decides what it
-   * means (`AgentRuntime.removeMount` records it and removes the mount anyway).
+   * Start telling a mount's plugin the mount is being removed (`Plugin.unmount`), with the context a call on it
+   * would get, minus a task. Null when there is nothing to ask. Otherwise `done` settles when the plugin's `unmount`
+   * does (its throw propagates; the caller decides what it means — `AgentRuntime.removeMount` records it and removes
+   * the mount anyway), and `close` ends the context.
+   *
+   * **Closing is what makes a deadline real.** Nothing can stop a promise, and the context is keyed by the alias:
+   * `ctx.db` opens rows under it and `ctx.inbound` makes hooks for it. An `unmount` still running after the caller
+   * stopped waiting would write into rows the delete has already swept — recreating them under a removed alias — or,
+   * once a new mount takes the alias, into that mount's database. So once `close` is called every function on the
+   * context refuses: `db` (and a sibling's `db`) through its lease (src/runtime/plugin-db.ts), `inbound.create`/
+   * `revoke`, `sibling`, `sandboxForms`, `agentSecret`, `ownerSecret`. The caller closes it on every path, before
+   * anything is deleted.
+   *
+   * Run under the mount's lock (`#onMount`), so an exclusive call already running on the mount finishes first and
+   * one queued after waits — and is then refused, as everything is while the mount is marked (`markRemoving`). The
+   * lock is let go at `close` as well as when `unmount` settles: an `unmount` that never returns must not hold the
+   * queue a new mount under the same alias would use.
+   *
+   * No credential: the removal refuses a mount with an account attached before it gets here, so the context's
+   * `credential` is always null. A plugin that must authenticate to deregister uses `ownerSecret` or a credential
+   * of the deployment's (detaching an account could one day ask `unmount` too, while the account is still there).
    *
    * Not behind the switch or the version pin that gate a pushed event: those keep strangers' events and
    * unfamiliar code away from a mount that stays, and this is the last word to a mount that is going. What it
-   * registered with the service while it was switched on is still registered after a person switched it off.
+   * registered with the service while it was switched on is still registered after a person switched it off. That
+   * also means a switched-off plugin is handed, for the length of `unmount`, everything its context carries:
+   * `sibling` (another mount's credential and database), `sandboxForms` (every container form and its credential),
+   * and `ownerSecret` if it declares `readsOwnerSecrets` — as it would on any call while it was switched on.
    */
-  async unmount(tenantId: string, agentId: string, alias: string): Promise<boolean> {
+  async unmount(tenantId: string, agentId: string, alias: string): Promise<{ done: Promise<void>; close(): void } | null> {
     const mount = await this.#store.getMountByAlias(tenantId, agentId, alias);
-    if (!mount) return false;
+    if (!mount) return null;
     const plugin = this.#plugins.get(mount.plugin);
-    if (!plugin?.unmount) return false;
-    const credential = mount.secretRef
-      ? await this.#secrets.resolve(mount.secretRef, { tenantId: mount.tenantId, agentId: mount.agentId })
-      : null;
-    await plugin.unmount(this.#contextFor({ tenantId, agentId, taskId: "" }, mount, credential));
-    return true;
+    if (!plugin?.unmount) return null;
+    const lease = { closed: false, reason: `the unmount of ${alias} has ended; its context cannot be used any more` };
+    const context = closable(this.#contextFor({ tenantId, agentId, taskId: "" }, mount, null, false, undefined, false, lease), lease);
+    let release!: () => void;
+    const released = new Promise<void>((r) => { release = r; });
+    const done = this.#onMount(`${tenantId}/${agentId}/${alias}`, async () => {
+      if (lease.closed) return; // closed while it waited for the lock: there is no deadline left to run in
+      const call = plugin.unmount!(context);
+      call.catch(() => {}); // a rejection after `close` has nobody left to hear it
+      await Promise.race([call, released]);
+    });
+    return { done, close: () => { lease.closed = true; release(); } };
   }
 
   /**
@@ -1295,6 +1345,7 @@ export class ToolGateway {
     Promise<{ skipped: string } | { mount: MountRecord; plugin: Plugin }> {
     const mount = await this.#store.getMountByAlias(tenantId, agentId, alias);
     if (!mount) return { skipped: `no mount named ${alias}` };
+    if (this.#removing.has(`${tenantId}/${agentId}/${alias}`)) return { skipped: `${alias} is being removed` };
     const plugin = this.#plugins.get(mount.plugin);
     if (!plugin?.receive) return { skipped: `the plugin on ${alias} cannot receive pushed events` };
     const choices = await this.#store.pluginChoices(tenantId, agentId);
@@ -1435,4 +1486,28 @@ export class ToolGateway {
       return { ok: false, kind: "unreachable", reason: String((e as Error).message ?? e).slice(0, 200) };
     }
   }
+}
+
+/** Whether a plugin context has ended, and the words its refusal uses (`ToolGateway.unmount`). */
+type Lease = { closed: boolean; readonly reason: string };
+
+/**
+ * The same context, with every function on it — and on `inbound` — refusing once `lease` is closed. `db` closes
+ * itself through the lease it was opened with, so it is passed through as it is.
+ */
+function closable<C extends Record<string, unknown>>(ctx: C, lease: Lease): C {
+  const guard = <F extends (...a: any[]) => any>(f: F): F => ((...a: any[]) => {
+    if (lease.closed) throw new Error(lease.reason);
+    return f(...a);
+  }) as F;
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(ctx)) {
+    if (k === "db") out[k] = v;
+    else if (typeof v === "function") out[k] = guard(v as (...a: any[]) => any);
+    else if (k === "inbound" && v) {
+      const hooks = v as InboundHooks;
+      out[k] = { create: guard(hooks.create), revoke: guard(hooks.revoke) } satisfies InboundHooks;
+    } else out[k] = v;
+  }
+  return out as C;
 }

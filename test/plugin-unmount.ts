@@ -58,7 +58,14 @@ function d1() {
 const order: string[] = [];
 let unmountCalls = 0;
 let receives = 0;
-let mode: "ok" | "throw" | "hang" = "ok";
+let mode: "ok" | "throw" | "hang" | "late" | "gate" = "ok";
+/** "late": how long unmount sleeps before trying `ctx.db.put` and `ctx.inbound.create()`, and what each did. */
+let lateMs = 0;
+let late: { db: string; create: string } | null = null;
+let lateDone: Promise<void> = Promise.resolve();
+let lateFinished: () => void = () => {};
+/** "gate": unmount waits until the case lets it go. */
+let gate: Promise<void> = Promise.resolve();
 /** A hook the plugin's unmount revokes itself, through `ctx.inbound`. */
 let revokeOwn: string | null = null;
 let seenByUnmount: { alias: string; inbound: boolean; db: boolean } | null = null;
@@ -69,9 +76,11 @@ const SWEEP: Plugin = {
   tools: [{ name: "grab", summary: "", parameters: {}, sideEffects: "read", idempotency: "native" }],
   async invoke(_t, _a, ctx) { handed[ctx.alias] = ctx.inbound; return { has: !!ctx.inbound }; },
   // Signed requests are seen and ignored: nothing is delivered, so no turn runs.
+  database: { version: 1, stores: { s: {} } },
   async receive(event, secret) {
     receives++;
     if (event.headers["x-signed-with"] !== secret) return { deliver: false, reason: "bad", rejected: true };
+    if (event.headers["x-deliver"]) return { deliver: true, text: "an event" };
     return { deliver: false, reason: "seen" };
   },
   async unmount(ctx) {
@@ -80,6 +89,17 @@ const SWEEP: Plugin = {
     order.push("unmount:start");
     if (mode === "throw") throw new Error("the service said no");
     if (mode === "hang") await new Promise(() => {});
+    if (mode === "gate") await gate;
+    if (mode === "late") {
+      await new Promise((r) => setTimeout(r, lateMs));
+      const tried = async (f: () => Promise<unknown>) => { try { await f(); return "ok"; } catch (e) { return String((e as Error).message); } };
+      late = {
+        db: await tried(() => ctx.db.put("s", { stale: "from the removed mount" }, "k")),
+        create: await tried(() => ctx.inbound!.create()),
+      };
+      lateFinished();
+      return;
+    }
     if (revokeOwn) await ctx.inbound!.revoke(revokeOwn);
     order.push("unmount:end");
   },
@@ -89,6 +109,7 @@ const PLAIN: Plugin = { ...SWEEP, id: "plain", unmount: undefined };
 
 function reset() {
   order.length = 0; unmountCalls = 0; receives = 0; mode = "ok"; revokeOwn = null; seenByUnmount = null;
+  late = null; lateMs = 0; lateDone = new Promise((r) => { lateFinished = r; });
   for (const k of Object.keys(handed)) delete handed[k];
 }
 
@@ -127,7 +148,25 @@ async function runtime(opts: { unmountTimeoutMs?: number } = {}) {
     resolves: !!(await real.lookup(hookId)),
     secret: !!(await rt.store.getSecret("t", "a", hookSecretName(hookId))),
   });
-  return { rt, host, directory, mount, hook, alive };
+  /**
+   * The index as handed to `removeMount` only, with its read after `unmount` held until `until` settles (the read
+   * before it is not held). Not the runtime's own handle, which `ctx.inbound.create()` reads for its cap.
+   */
+  const holding = (until: Promise<void>) => ({
+    ...directory,
+    async list(t: string, a: string) { if (unmountCalls > 0) await until; return real.list(t, a); },
+  });
+  return { rt, host, real, directory, holding, mount, hook, alive };
+}
+
+/** The removal, or a named failure if it has not answered within `ms`: a hang is reported, not waited out. */
+async function removeWithin(rt: any, alias: string, directory: unknown, ms: number) {
+  let guard: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<never>((_, reject) => {
+    guard = setTimeout(() => reject(new Error(`the removal of ${alias} had not answered ${ms} ms after it began, so the unmount timeout did not end it`)), ms);
+  });
+  try { return await Promise.race([rt.removeMount("t", "a", alias, directory), late]); }
+  finally { clearTimeout(guard); }
 }
 
 // ---- the runtime ------------------------------------------------------------
@@ -170,13 +209,82 @@ await check(`unmount hangs: the removal completes after the timeout (${UNMOUNT_T
   const h = await hook("svc", "h");
   mode = "hang";
   const started = Date.now();
-  const r = await rt.removeMount("t", "a", "svc", directory);
+  const r = await removeWithin(rt, "svc", directory, 2_000);
   const took = Date.now() - started;
   must(r.ok && r.unmountError === "svc's plugin did not finish cleaning up within 40 ms", `remove: ${show(r)}`);
   must(took >= 35 && took < 2_000, `took ${took} ms`);
   must(show(order) === show(["unmount:start", "revoke:h"]), `order: ${show(order)}`);
   must(show(await alive(h.hookId)) === show({ resolves: false, secret: false }), `the hook survived: ${show(await alive(h.hookId))}`);
   must(!(await rt.store.getMountByAlias("t", "a", "svc")), "the mount is still there");
+  host.dispose();
+});
+
+const LEASE = "the unmount of svc has ended; its context cannot be used any more";
+
+await check("past the deadline the context is closed before anything is deleted: a late ctx.db.put and ctx.inbound.create() throw", async () => {
+  const { rt, host, holding, mount } = await runtime({ unmountTimeoutMs: 40 });
+  await mount("sweep", "svc");
+  mode = "late"; lateMs = 100;
+  // The index read after unmount waits for the late attempts, so they happen after the deadline and before the
+  // hooks are revoked and the mount deleted: the window a close placed after the delete would leave open.
+  const r = await removeWithin(rt, "svc", holding(lateDone), 2_000);
+  must(r.ok && /within 40 ms/.test(r.unmountError ?? ""), `remove: ${show(r)}`);
+  must(late?.db === LEASE, `the late ctx.db.put: ${late?.db}`);
+  must(late?.create === LEASE, `the late ctx.inbound.create(): ${late?.create}`);
+  host.dispose();
+});
+
+await check("a late unmount writes nothing into a new mount that took the alias: its database is empty and it has no extra hook", async () => {
+  const { rt, host, real, directory, mount } = await runtime({ unmountTimeoutMs: 40 });
+  await mount("sweep", "svc");
+  mode = "late"; lateMs = 300;
+  const r = await removeWithin(rt, "svc", directory, 2_000);
+  must(r.ok && /within 40 ms/.test(r.unmountError ?? ""), `remove: ${show(r)}`);
+  await mount("sweep", "svc");
+  await lateDone;
+  // The state first, so a red names what reached the new mount rather than only that the calls were let through.
+  const rows = host.sql.exec("SELECT store, key, value FROM plugin_db WHERE alias = 'svc'").toArray();
+  const hooks = (await real.list("t", "a")).filter((h) => h.alias === "svc" && h.revokedAt === null);
+  must(rows.length === 0 && hooks.length === 0, `the new mount's database: ${show(rows)}; live hooks it never made: ${hooks.length}`);
+  must(late?.db === LEASE && late?.create === LEASE, `the late calls: ${show(late)}`);
+  host.dispose();
+});
+
+await check("while unmount runs, a tool call on the mount is refused and a push does not reach the plugin or wake the agent", async () => {
+  const { rt, host, directory, mount, hook } = await runtime();
+  await mount("sweep", "svc");
+  const h = await hook("svc", "h");
+  const posted: string[] = [];
+  rt.postMessage = async (_t: string, _a: string, text: string) => { posted.push(text); };
+  const ev = { headers: { "x-signed-with": h.secret, "x-deliver": "1" }, body: new Uint8Array([1]) };
+  // Control: before the removal the same push is delivered.
+  must((await rt.receiveHook("t", "a", "svc", h.hookId, ev)).outcome === "delivered" && posted.length === 1, `control: ${show(posted)}`);
+  posted.length = 0; receives = 0;
+  let open!: () => void;
+  gate = new Promise<void>((r) => { open = r; });
+  mode = "gate";
+  const removal = rt.removeMount("t", "a", "svc", directory);
+  for (let i = 0; i < 50 && unmountCalls === 0; i++) await new Promise((r) => setTimeout(r, 5));
+  must(unmountCalls === 1, "unmount did not start");
+  const call: any = await rt.gateway().invoke({ tenantId: "t", agentId: "a", taskId: "k" }, "svc.grab", {});
+  must(call.status === "rejected" && call.error?.message === "the `svc` mount is being removed", `the tool call during unmount: ${show(call)}`);
+  const pushed = await rt.receiveHook("t", "a", "svc", h.hookId, ev);
+  must(pushed.outcome === "ignored" && receives === 0 && posted.length === 0, `the push during unmount: ${show(pushed)}, receives ${receives}, posted ${posted.length}`);
+  const log = await rt.inboundLog(1);
+  must(log[0]?.reason === "svc is being removed", `record: ${show(log[0])}`);
+  open();
+  must((await removal).ok, "the removal failed");
+  host.dispose();
+});
+
+await check("a removal called off after unmount (a revoke failed) lets calls reach the mount again", async () => {
+  const { rt, host, directory, mount, hook } = await runtime();
+  await mount("sweep", "svc");
+  await hook("svc", "h");
+  const r = await rt.removeMount("t", "a", "svc", { ...directory, revoke: async () => { throw new Error("D1 write failed"); } });
+  must(!r.ok, `remove: ${show(r)}`);
+  const call: any = await rt.gateway().invoke({ tenantId: "t", agentId: "a", taskId: "k" }, "svc.grab", {});
+  must(call.status !== "rejected", `a call after the refusal: ${show(call)}`);
   host.dispose();
 });
 
