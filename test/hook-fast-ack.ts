@@ -548,7 +548,7 @@ await check("a full queue stuck behind a failing head says to retry at the head'
     // harness, which takes most of a second, before the row reads `posting`: held there, then held in the post.
     const rt = w.D.runtime() as any;
     const open = rt.agent;
-    let opened!: () => void, failed!: () => void;
+    let opened: (() => void) | undefined, failed: (() => void) | undefined;
     // Only the post's open is held; the step after the pass opens as usual.
     rt.agent = (...a: unknown[]) => {
       rt.agent = open;
