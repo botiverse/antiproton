@@ -162,8 +162,10 @@ async function runtimeWorld(opts: { credential?: boolean } = {}) {
   const l = lister(opts);
   const host = sqliteHost();
   const standIn = standInLoader();
+  /** Every promise the runtime hands the object's `waitUntil`, as a Durable Object's state would take it. */
+  const waited: Array<Promise<unknown>> = [];
   const rt = new AgentRuntime({
-    ctx: { storage: { sql: host.sql, transactionSync: host.transactionSync } },
+    ctx: { storage: { sql: host.sql, transactionSync: host.transactionSync }, waitUntil: (p: Promise<unknown>) => { waited.push(p); } },
     bucket: {} as never, bucketName: "b", models: { resolve: () => null },
     autoRelease: false, extraPlugins: [l.plugin],
     loader: standIn.loader, makeToolBinding: standIn.makeToolBinding,
@@ -181,7 +183,7 @@ async function runtimeWorld(opts: { credential?: boolean } = {}) {
   const offered = async () => toolsOf(l.plugin, await mount()).map((t) => t.name);
   /** A new turn, as a person's message starts one. */
   const turn = (text = "hello") => rt.postMessage("t", "a", text, "prompt");
-  return { l, rt, mount, offered, turn };
+  return { l, rt, mount, offered, turn, waited };
 }
 
 await check("a deploy that moves the basis: the next turn re-takes the list before the tools are built, and the new tool is offered", async () => {
@@ -464,11 +466,19 @@ await check("an inbound push is answered at once: its turn starts the re-take wi
   const took = Date.now() - started;
   must(r.outcome === "delivered" && took < 1_000, `the push: ${show(r)} after ${took} ms`);
   must(w.l.s.release.length === 1 && show(await w.offered()) === show(["a"]), `control: the re-take is running, the list as it stood: ${w.l.s.release.length} ${show(await w.offered())}`);
+  // The running re-take was handed to the object's `waitUntil`, once, and is still open while the listing is held.
+  must(w.waited.length === 1, `promises handed to waitUntil: ${w.waited.length}`);
+  const kept = { state: "open" as "open" | "resolved" | "rejected" };
+  w.waited[0]!.then(() => { kept.state = "resolved"; }, () => { kept.state = "rejected"; });
+  await settle();
+  must(kept.state === "open", `the waitUntil promise settled before the re-take did: ${kept.state}`);
   // The background pass is the agent's one pass: joining it and releasing the listing lands the new list.
   const pass = w.rt.retakeStaleSnapshots("t", "a");
   w.l.s.release.splice(0).forEach((go) => go());
   await pass;
   must(w.l.s.listings === 2 && show(await w.offered()) === show(["a", "b"]), `the background re-take: ${w.l.s.listings} ${show(await w.offered())}`);
+  await settle();
+  must(kept.state === "resolved", `the waitUntil promise, once the re-take finished: ${kept.state}`);
   // A person's prompt waits for it.
   w.l.s.basis = "basis-3";
   w.l.s.fail = "hold";
@@ -479,6 +489,7 @@ await check("an inbound push is answered at once: its turn starts the re-take wi
   w.l.s.release.splice(0).forEach((go) => go());
   await prompt;
   must(done, "the person's prompt never finished");
+  must(w.waited.length === 1, `the person's prompt handed waitUntil something: ${w.waited.length}`);
 });
 
 await check("a background re-take that throws is caught and logged: no unhandled rejection, and the push is delivered", async () => {
@@ -496,6 +507,10 @@ await check("a background re-take that throws is caught and logged: no unhandled
     const r = await push();
     await settle();
     must(r.outcome === "delivered", `the push: ${show(r)}`);
+    // What `waitUntil` holds is the caught pass: it resolves, so the platform never sees a rejection.
+    must(w.waited.length === 1, `promises handed to waitUntil: ${w.waited.length}`);
+    const ended = await w.waited[0]!.then(() => "resolved", (e) => `rejected: ${String(e)}`);
+    must(ended === "resolved", `the waitUntil promise ${ended}`);
     must(unhandled.length === 0, `unhandled: ${String(unhandled[0])}`);
     must(logged.some((a) => /re-taking .*tool lists failed/.test(String(a[0]))), `nothing logged: ${show(logged.map((a) => String(a[0])))}`);
   } finally {
