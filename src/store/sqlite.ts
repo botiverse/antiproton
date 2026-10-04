@@ -1149,9 +1149,12 @@ export class SqliteStore implements StorageAdapter {
     }
   }
 
-  async removeMount(tenantId: string, agentId: string, alias: string, secretName: string | null) {
+  async removeMount(tenantId: string, agentId: string, alias: string, secretName: string | null, installationId?: string) {
     return this.#tx(() => {
-      const r = this.#db.prepare("DELETE FROM mounts WHERE tenant_id=? AND agent_id=? AND alias=?").run(tenantId, agentId, alias);
+      // Only that installation, when one is named (`Store.removeMount`).
+      const r = installationId === undefined
+        ? this.#db.prepare("DELETE FROM mounts WHERE tenant_id=? AND agent_id=? AND alias=?").run(tenantId, agentId, alias)
+        : this.#db.prepare("DELETE FROM mounts WHERE tenant_id=? AND agent_id=? AND alias=? AND installation_id=?").run(tenantId, agentId, alias, installationId);
       if (Number(r.changes) === 0) return false;
       this.pluginDb.remove(tenantId, agentId, alias);
       if (secretName !== null) this.#db.prepare("DELETE FROM secrets WHERE tenant_id=? AND agent_id=? AND name=?").run(tenantId, agentId, secretName);

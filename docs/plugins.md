@@ -374,8 +374,8 @@ changes that list.
 names of the tools this mount offers right now, as `toolsOf(plugin, mount)`
 answers — the list the model was given and the gateway admits calls against —
 filled by the gateway (`#contextFor`) on a call's `invoke`, `interrupts.resume`
-and `cancel`, `background.poll` and `cancel`, `receive` and `reportActivity`.
-It is absent from `snapshotTools` (which is deciding the list, so the one it
+and `cancel`, `background.poll` and `cancel`, `receive`, `reportActivity` and
+`unmount`. It is absent from `snapshotTools` (which is deciding the list, so the one it
 would be handed is the one being replaced) and from contexts built without a
 call (`promptContribution`, `Holding.*`, `checkCredential`); read absence as
 "not reported" and fall back to your static `tools`, never as "offers nothing".
@@ -517,7 +517,7 @@ for equality only. What stays the same and what does not:
 | `interrupts.cancel` of that question (dropped, expired, asked where nobody can answer, or in a shape no answer can meet) | the asking call's id |
 | `background.poll` and `background.cancel` of work the call started (the alarm, the `jobs` tool, a session cancel, the time ceiling, the cap) | the call's id (the runtime keeps a job under it) |
 | A run_js program's call | derived from the run_js call's id and the call's position in the program (`${toolCallId}:${n}`): different per call, and the same if the program is run again under the same run_js call, where the gateway finds the operation already begun and answers `already_attempted` without reaching you again |
-| `promptContribution`, `Holding.*`, `receive`, `reportActivity`, `snapshotTools`, a bench runner's poll of a job it holds only the handle of | absent: no operation |
+| `promptContribution`, `Holding.*`, `receive`, `reportActivity`, `snapshotTools`, `unmount`, a bench runner's poll of a job it holds only the handle of | absent: no operation |
 
 Nothing a model or a program writes reaches it: run_js builds each call's
 options field by field and the production host forwards no `operationId`
@@ -555,10 +555,59 @@ one field per setting, and `POST /ui/mount/add` coerces each (`configFromForm`
 in `src/runtime/mount-config.ts`) before the usual checks. Declare it only when
 every setting is one a stranger may type, and a mount is safe to delete: the
 console can also refresh and remove the mounts it added (at most eight per
-agent), refusing a removal while the mount holds a credential, a live inbound
-hook, a held call or running work (the last two only for a plugin that holds
-or backgrounds something; `mcp` does neither, so a call already in flight
-finishes and the next one is refused with `not_mounted`).
+agent), refusing a removal while the mount holds a credential, a held call or
+running work (the last two only for a plugin that holds or backgrounds
+something; `mcp` does neither, so a call already in flight finishes and the
+next one is refused with `not_mounted`). A live inbound hook does not refuse
+it: the runtime revokes the mount's hooks itself, after `unmount` (below).
+
+**`unmount(ctx)` is a plugin's one chance to clean up when its mount is
+removed.** Removing a mount deletes what is filed under its alias here — its
+database, its tool list, its hooks — and nothing the plugin registered
+elsewhere: a webhook created through the service's API, a subscription. Only
+the plugin knows those, so the runtime (`removeMount` in `cf/src/runtime.ts`)
+calls `unmount` with the mount's normal context (`db`, and `inbound` for a
+plugin that receives) and the plugin cancels them there, reading the ids it
+kept in `ctx.db`. `ctx.credential` is always null: a removal is refused while
+an account is attached, so it has been detached by the time `unmount` runs. A
+plugin that must authenticate to deregister uses `ctx.ownerSecret` or a
+credential of the deployment's (detaching an account could one day call
+`unmount` too). What the runtime promises:
+
+- it is called **once**, and only once the removal is going to happen: a
+  removal refused for any of the reasons above never calls it;
+- it is **bounded by a timeout** (`UNMOUNT_TIMEOUT_MS`, ten seconds), because
+  a person is waiting on the console;
+- **a throw or a timeout does not block the removal.** The mount is removed and
+  the reason is shown to the person who removed it (above the panel, and as
+  `unmountError` in `/ui/mount/remove`'s JSON), since whatever it could not
+  cancel is now theirs to cancel by hand. A call past the deadline is not
+  stopped, but its context is closed: from then on every `ctx.db`,
+  `ctx.inbound` and other context call throws, so a late write cannot land
+  under the removed alias, nor in a new mount that has taken it since;
+- **nothing else reaches the mount meanwhile**: once the removal is decided,
+  tool calls on it are refused and pushed events are ignored without waking the
+  agent, and `unmount` runs under the mount's lock, after any exclusive call
+  already running;
+- **then every hook of the mount still live is revoked** — the index row first,
+  so the URL answers 404 at once, then its secret — so a hook the plugin forgot,
+  or could not reach because it failed, does not stay a public address for an
+  alias a later mount may take. If that revoke fails, the removal is refused
+  with the reason and can be tried again; `unmount` will have run, so make it
+  safe to run a second time over what it already cancelled.
+
+It runs even when the plugin is switched off or the agent is pinned to another
+version: switching off stops tools and deliveries, not the cleanup owed for what
+the plugin registered while it was on. That is safe because `unmount` is
+**cleanup only** — cancel registrations, subscriptions, reminders — and never
+wakes the agent, posts a message or calls a model. That is a rule the plugin
+keeps, not a limit the runtime enforces: the context has nothing that wakes the
+agent, but `sibling` hands over another mount's credential and the network is
+open, so a plugin could still post somewhere.
+
+Revoking through `ctx.inbound` inside `unmount` is allowed and changes nothing
+about the order; telling the service to stop sending is the part only the
+plugin can do. `test/plugin-unmount.ts` holds these rules.
 
 **Two kinds of kept secret, and who reads which.** The agent keeps its own with
 `state.secret_put` under `kept:`; a plugin reaches them by name through
@@ -831,6 +880,10 @@ The rules that go with them:
   service may already be posting to it.
 - **A tool that calls `create()` is not natively idempotent.** A replay makes
   another hook, so declare it `idempotency: "none"` or key it yourself.
+- **Cancel what you registered in `unmount`.** When the mount is removed, the
+  runtime revokes its hooks after `unmount` returns, but the service still
+  holds the registration and keeps posting to a URL that now answers 404
+  unless the plugin deregistered it.
 - **Turning push off must not depend on the service.** Revoking the mount's
   own hooks is what stops the wakes: a later event finds no hook and gets a
   404. So revoke them and record push as off even when the service's

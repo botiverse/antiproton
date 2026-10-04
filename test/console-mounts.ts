@@ -84,7 +84,7 @@ async function runtime(opts: { kek?: boolean } = {}) {
   return { rt, host };
 }
 const form = (url: string, extra: Record<string, string> = {}) => ({ url, ...extra });
-const noHooks = { list: async () => [] };
+const noHooks = { list: async () => [], revoke: async () => null };
 
 // Who can reach an owner's secret, one property per case so a red names which one broke.
 const pluginsDir = new URL("../src/plugins/", import.meta.url);
@@ -323,18 +323,16 @@ await check("a listing still in flight when its mount is removed and added again
   } finally { slowGate = null; releaseSlow(); }
 });
 
-await check("remove is refused while a credential, a live hook or a held call is on the mount, and for an operator-only plugin", async () => {
+// A live hook is no longer a refusal: the runtime revokes it (test/plugin-unmount.ts holds that).
+await check("remove is refused while a credential or a held call is on the mount, when the hook index cannot be read, and for an operator-only plugin", async () => {
   const { rt } = await runtime();
   await rt.addConsoleMount("t", "a", "remote", "srv", form("https://srv.test"));
   await rt.store.setMountSecretRef("t", "a", "srv", "agent:srv");
   const cred = await rt.removeMount("t", "a", "srv", noHooks);
   must(!cred.ok && cred.conflict && /account attached/.test(cred.error), `credential: ${show(cred)}`);
   await rt.store.setMountSecretRef("t", "a", "srv", null);
-  const live = { list: async () => [{ hookId: "h", tenantId: "t", agentId: "a", alias: "srv", createdAt: 0, revokedAt: null }] };
-  const hook = await rt.removeMount("t", "a", "srv", live);
-  must(!hook.ok && hook.conflict && /live inbound hook/.test(hook.error), `hook: ${show(hook)}`);
-  const revoked = { list: async () => [{ hookId: "h", tenantId: "t", agentId: "a", alias: "srv", createdAt: 0, revokedAt: 1 }] };
-  const broken = { list: async () => { throw new Error("D1 is away"); } };
+  const revoked = { list: async () => [{ hookId: "h", tenantId: "t", agentId: "a", alias: "srv", createdAt: 0, revokedAt: 1 }], revoke: async () => null };
+  const broken = { list: async () => { throw new Error("D1 is away"); }, revoke: async () => null };
   const unread = await rt.removeMount("t", "a", "srv", broken);
   must(!unread.ok && unread.conflict && /could not check/.test(unread.error), `an unreadable index: ${show(unread)}`);
   await rt.store.requireApproval({ tenantId: "t", operationId: "op1", agentId: "a", taskId: "main", mountAlias: "srv", tool: "ping", request: {} });
@@ -342,7 +340,7 @@ await check("remove is refused while a credential, a live hook or a held call is
   must(!held.ok && held.conflict && /waiting for a decision/.test(held.error), `held: ${show(held)}`);
   must(await rt.store.getMountByAlias("t", "a", "srv"), "a refused remove deleted the mount");
   await rt.store.decideApproval("t", "op1", "denied", "me");
-  must((await rt.removeMount("t", "a", "srv", revoked)).ok, "with the hook revoked and the call decided, the remove is refused");
+  must((await rt.removeMount("t", "a", "srv", revoked)).ok, "with the call decided, the remove is refused");
   await rt.addMount("t", "a", { alias: "op", plugin: "operator-only", config: { url: "https://op.test" } });
   await rt.store.setPluginChoice("t", "a", "operator-only", "enable");
   await rt.addMount("t", "a", { alias: "op", plugin: "operator-only", config: { url: "https://op.test" } });
@@ -415,10 +413,17 @@ globalThis.fetch = (async (input: unknown, init: RequestInit = {}) => {
 }) as typeof fetch;
 
 let liveHooks: Array<Record<string, unknown>> = [];
+/** Every hook id the route's index was asked to revoke. */
+const revokedHooks: unknown[] = [];
 const d1 = () => {
   const stmt = (sql: string) => {
     const s: any = {
-      bind: () => s, first: async () => null, run: async () => ({ meta: { changes: 1 } }),
+      bind: (...b: unknown[]) => {
+        // A revoke marks the row, as D1's does, so the removal's second pass finds nothing left.
+        if (sql.startsWith("UPDATE inbound_hooks SET revoked_at")) { revokedHooks.push(b[1]); liveHooks = liveHooks.filter((h) => h.hook_id !== b[1]); }
+        return s;
+      },
+      first: async () => null, run: async () => ({ meta: { changes: 1 } }),
       all: async () => ({ results: sql.includes("inbound_hooks") ? liveHooks : [] }),
     };
     return s;
@@ -632,20 +637,19 @@ await check("route: an operator's mount, added through /admin/mounts, is neither
   must(await home().runtime().store.getMountByAlias(T, A, "opmcp"), "the operator's mount was removed");
 });
 
-await check("route: remove answers 409 with the reason while a hook or a credential is on it, then removes and leaves no snapshot", async () => {
-  liveHooks = [{ hook_id: "h1", tenant_id: T, agent_id: A, alias: "docs", created_at: 1, revoked_at: null }];
-  try {
-    const held = await post("/ui/mount/remove", { alias: "docs" }, { json: true });
-    must(held.status === 409 && /live inbound hook/.test(held.json().error), `with a hook: ${held.status} ${held.text}`);
-  } finally { liveHooks = []; }
+await check("route: remove answers 409 with the reason while a credential is on it, then removes, revokes its live hook through the index, and leaves no snapshot", async () => {
   const store = home().runtime().store;
   await store.setMountSecretRef(T, A, "docs", "agent:docs");
   const cred = await post("/ui/mount/remove", { alias: "docs" });
   must(cred.status === 409 && /account attached/.test(cred.text), `with a credential: ${cred.status} ${cred.text}`);
   await store.setMountSecretRef(T, A, "docs", null);
   must((await store.getMountByAlias(T, A, "docs"))?.toolSnapshot, "control: no snapshot before the remove");
-  const r = await post("/ui/mount/remove", { alias: "docs" }, { json: true });
-  must(r.status === 200 && r.json().removed === true && panel(r.json().html), `remove: ${r.status} ${r.text}`);
+  liveHooks = [{ hook_id: "h1", tenant_id: T, agent_id: A, alias: "docs", created_at: 1, revoked_at: null }];
+  revokedHooks.length = 0;
+  let r;
+  try { r = await post("/ui/mount/remove", { alias: "docs" }, { json: true }); } finally { liveHooks = []; }
+  must(r.status === 200 && r.json().removed === true && panel(r.json().html) && !("unmountError" in r.json()), `remove: ${r.status} ${r.text}`);
+  must(show(revokedHooks) === show(["h1"]), `the live hook was not revoked through the index: ${show(revokedHooks)}`);
   must(!(await store.getMountByAlias(T, A, "docs")), "the mount is still stored");
   const raw = home().ctx.storage.sql;
   const left = raw.exec("SELECT alias, tool_snapshot FROM mounts WHERE alias = 'docs'").toArray();

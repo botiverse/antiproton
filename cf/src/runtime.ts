@@ -100,7 +100,7 @@ export function hostCallOpts(call: { opts?: unknown; callId?: string }): InvokeO
   };
 }
 import type { MountPolicy, MountRecord } from "../../src/core/types.ts";
-import type { HookDirectory } from "./control-plane.ts";
+import type { HookDirectory, HookRow } from "./control-plane.ts";
 import { jsRunRows } from "../../src/usage/outbox.ts";
 import { RunJsContinuations } from "../../src/runtime/run-js-resume.ts";
 
@@ -119,6 +119,10 @@ export const MOUNT_ALIAS = /^[a-z][a-z0-9-]{0,23}$/;
  */
 export const CONSOLE_INSTALLATION = "console:";
 /** Whether a person added this mount from the console. */
+/** Why a removal stopped part-way: the alias no longer names the mount it set out to remove. */
+const changedWhileRemoving = (alias: string) =>
+  `${alias} was removed or added again while this removal was running; it stopped, and the mount now named ${alias} was not touched`;
+
 export function consoleAdded(m: Pick<MountRecord, "installationId">): boolean {
   return m.installationId.startsWith(CONSOLE_INSTALLATION);
 }
@@ -191,6 +195,8 @@ export interface InboundPass {
   posted: number;
   /** Rows settled as failed: given up after `INBOUND_POST_ATTEMPTS`, or found interrupted mid-post. */
   failed: number;
+  /** Rows settled as ignored, unposted: accepted by a mount that has since been removed. */
+  ignored: number;
   /** Rows still queued when the pass ended. */
   left: number;
   /** When to come back for a row that could not be posted yet; null when none is waiting on a retry. */
@@ -466,6 +472,8 @@ export interface RuntimeDeps {
    * are offered no `inbound` and cannot make hooks themselves.
    */
   hooks?: { origin: string; directory: Pick<HookDirectory, "create" | "lookup" | "revoke" | "list"> };
+  /** How long `removeMount` waits on a plugin's `unmount`; {@link UNMOUNT_TIMEOUT_MS} when unset. A test's knob. */
+  unmountTimeoutMs?: number;
   maxTurns?: number;
   /**
    * What the bound model can hold, in tokens.
@@ -704,6 +712,22 @@ export const RETAKE_TIMEOUT_MS = 3_000;
  * the basis should try at once).
  */
 export const RETAKE_BACKOFF_MS = 10 * 60_000;
+/**
+ * How long a removal waits on the plugin's `unmount` (`Plugin.unmount`, `AgentRuntime.removeMount`). A person is
+ * waiting on the console's answer, and the call is a few requests to the plugin's service to cancel what it
+ * registered — a webhook delete is one. Ten seconds is room for a slow service and a couple of those, and the
+ * same order as the ten seconds GitHub gives a webhook delivery, past which nobody reads a service as merely slow.
+ * Running out does not block the removal; it is reported like a failure.
+ */
+export const UNMOUNT_TIMEOUT_MS = 10_000;
+/**
+ * How soon the inbound pass comes back for a queued push whose mount is being removed
+ * (`AgentRuntime.deliverPendingInbound`). A removal takes up to `UNMOUNT_TIMEOUT_MS` plus a few index writes;
+ * two seconds keeps the pushes behind it from waiting much past its end without spinning the alarm.
+ */
+export const INBOUND_REMOVING_RETRY_MS = 2_000;
+/** Why a push accepted for a mount that is gone, or was replaced under its alias, is never handed to the agent. */
+export const MOUNT_REMOVED_REASON = "the mount that received it was removed";
 
 /** The refusal's text when `e` is one, or null. `e` is whatever a catch holds, so it is asked before it is
  *  read: an object with a `message` is read there, anything else is read as itself. */
@@ -883,6 +907,13 @@ export class AgentRuntime {
         const hookId = newHookId();
         const made = await this.createHookSecret(tenantId, agentId, alias, hookId);
         if (!made.ok) throw new Error(made.error);
+        // Asked again here, right before the row that makes the URL live: a call that began before its mount's
+        // removal was decided passed every earlier check, and the removal's revoke pass may already be behind it.
+        // A row written after this check is the removal's second pass to find (`#removeDecided`).
+        if (this.#gateway.isRemoving(tenantId, agentId, alias)) {
+          await this.dropHookSecret(tenantId, agentId, hookId);
+          throw new Error(`${alias} is being removed; no hook was made`);
+        }
         await hooks.directory.create({ hookId, tenantId, agentId, alias });
         return { hookId, url: `${hooks.origin}/hooks/${hookId}`, secret: made.secret };
       },
@@ -932,6 +963,9 @@ export class AgentRuntime {
     if (!secret && routed === "cache") return { outcome: "failed", unrouted: true };
     if (!event) return done("too_large", `the body passed ${INBOUND_MAX_BYTES} bytes`);
     if (!secret) return done("failed", "this hook has no secret in the agent's store");
+    // The installation the push is for, read before the plugin is asked: if the mount is removed, or removed and
+    // added again, while `receive` runs, the push is not this alias's any more (checked again below).
+    const receiving = (await this.store.getMountByAlias(tenantId, agentId, alias))?.installationId ?? null;
     let answer;
     try {
       // The hook travels with the event: verified against this hook's secret, the delivery is the
@@ -946,13 +980,23 @@ export class AgentRuntime {
     if ("skipped" in answer) return done("ignored", answer.skipped);
     const result = answer.result;
     if (!result.deliver) return done(result.rejected ? "rejected" : result.malformed ? "malformed" : "ignored", result.reason);
+    // Which installation accepted it, read before the synchronous run below (which must not await): the pass
+    // that posts it gives it up if the alias names another by then (`#deliverInbound`). A mount gone, or replaced,
+    // since `receive` began is refused here rather than stamped, so every row this writes carries an installation
+    // and a null in `inbound_pending` can only be a row queued before the column existed.
+    const accepting = await this.store.getMountByAlias(tenantId, agentId, alias);
+    // A mount that only appeared while `receive` ran (none before) is not the one the push was checked for either.
+    if (!accepting || accepting.installationId !== receiving) {
+      return done("ignored", MOUNT_REMOVED_REASON);
+    }
+    const installationId = accepting.installationId;
     const key = result.dedupeKey ?? null;
     if (key && seenBefore(sql, hookId, key, now)) return done("duplicate", null, key);
     if (!underRate(sql, hookId, now)) return done("rate_limited", `more than ${INBOUND_PER_MINUTE} a minute`, key);
     if (queueFull(sql, hookId)) return done("rate_limited", `${INBOUND_QUEUE_MAX} pushes from this hook are already waiting to be posted`, key);
     // The claim on the key: in the same synchronous run as the two checks above, with no await between,
     // so a second push with this key that is already past its own await finds this row (`acceptInbound`).
-    acceptInbound(sql, { hookId, alias, dedupeKey: key, message: inboundMessage(alias, String(result.text)), now });
+    acceptInbound(sql, { hookId, alias, dedupeKey: key, message: inboundMessage(alias, String(result.text)), now, installationId });
     // The answer the service has always had for a push the agent will be given.
     return { outcome: "delivered" };
   }
@@ -986,9 +1030,9 @@ export class AgentRuntime {
     ensureInboundTable(sql);
     const storage = this.#deps.ctx.storage;
     const transact = <T>(fn: () => T): T => storage.transactionSync ? storage.transactionSync(fn) : fn();
-    const settle = (row: PendingInbound, outcome: "delivered" | "failed", reason?: string) =>
+    const settle = (row: PendingInbound, outcome: "delivered" | "failed" | "ignored", reason?: string) =>
       settleInbound(sql, transact, { ...row, tenantId, agentId, outcome, reason });
-    const out: InboundPass = { posted: 0, failed: 0, left: 0, retryInMs: null, waitedMs: null, error: null };
+    const out: InboundPass = { posted: 0, failed: 0, ignored: 0, left: 0, retryInMs: null, waitedMs: null, error: null };
     // Too old to be worth reading, wherever they stand: a long outage must not end in notices hours late.
     for (const seq of expiredPendingInbound(sql, Date.now())) {
       const row = pendingInboundRow(sql, seq);
@@ -1007,6 +1051,27 @@ export class AgentRuntime {
         continue;
       }
       const now = Date.now();
+      // Its mount is being removed right now: neither posted nor settled yet. Once the removal is done the check
+      // below gives it up; if the removal is called off, it is posted as usual. Order is strict, so the rows
+      // behind it wait too, for the few seconds a removal takes (`UNMOUNT_TIMEOUT_MS` bounds the longest part),
+      // and `retryInMs` brings the pass back, so the row is never left without an alarm.
+      if (this.#gateway.isRemoving(tenantId, agentId, head.alias)) {
+        out.retryInMs = INBOUND_REMOVING_RETRY_MS;
+        break;
+      }
+      // Accepted by a mount that is gone — removed, or removed and added again under the alias — since the
+      // service was answered: not the agent's to read, and never worth a retry. Null can only be a row queued
+      // before the column existed: `acceptInbound` is the one INSERT, and `receiveHook` checks the mount is still
+      // there (and still the one `receive` ran for) before it, so it always stamps it. A null is never read as
+      // "mount removed": it is posted as it would have been, and pushes accepted across the deploy are not dropped.
+      if (head.installationId !== null) {
+        const mount = await this.store.getMountByAlias(tenantId, agentId, head.alias);
+        if (!mount || mount.installationId !== head.installationId) {
+          settle(head, "ignored", MOUNT_REMOVED_REASON);
+          out.ignored++;
+          continue;
+        }
+      }
       // The head is the oldest row, so its expiry is the queue's first.
       if (head.nextAt > now) { out.retryInMs = Math.min(head.nextAt, head.receivedAt + INBOUND_MAX_AGE_MS) - now; break; }
       // Only a pass that is about to post prepares for it (the caller's provisioning), and only once.
@@ -1355,6 +1420,13 @@ export class AgentRuntime {
     if (!MOUNT_ALIAS.test(to)) return { ok: false, error: `an alias is ${MOUNT_ALIAS}` };
     const mount = await this.store.getMountByAlias(tenantId, agentId, from);
     if (!mount) return { ok: false, error: `no mount named ${from}` };
+    // Not while the mount is being removed (`removeMount`). A removal keys its mark and its hook revokes by
+    // alias, and renaming frees the alias: the one way those alias-keyed parts could meet a different mount.
+    // The old mount would also live on under the new name with its cleanup already done, while its hooks,
+    // still filed under the old alias, would point at whatever mount takes that alias next. Asked here and
+    // again right before the store's rename, since the activity read between them awaits.
+    const removing = `${from} is being removed; it cannot be renamed`;
+    if (this.#gateway.isRemoving(tenantId, agentId, from)) return { ok: false, error: removing };
     const safety = renameSafety(
       await this.#gateway.mountActivity({ tenantId, agentId, taskId: LEGACY_TASK }, from),
       Date.now(),
@@ -1369,6 +1441,7 @@ export class AgentRuntime {
     // something the deployment owns, under a name that has nothing to do with
     // this mount's alias.
     const own = isAgentRef(mount.secretRef);
+    if (this.#gateway.isRemoving(tenantId, agentId, from)) return { ok: false, error: removing };
     const r = await this.store.renameMount(tenantId, agentId, from, to, own ? { newRef: agentRef(to) } : null);
     // The last snapshot error is keyed by the alias too, and is about the same mount under its new name.
     if (r.ok) this.#snapshotErrors()?.exec("UPDATE mount_snapshot_errors SET alias = ? WHERE alias = ?", to, from);
@@ -1972,17 +2045,48 @@ export class AgentRuntime {
    * plugin off can. Each refusal names what is in the way:
    *  - a credential reference: an account on it is the owner's to take back
    *    first (or the operator's, for one this agent did not attach);
-   *  - a live inbound hook: a service is still posting to this alias, and a
-   *    mount added later under the same name would receive it;
    *  - a held call waiting for a person: deciding it would run against a mount
    *    that is gone;
    *  - something running under it, or a background job: the same guard a
-   *    rename and a release use (`renameSafety`, `mountsWithRunningJobs`).
+   *    rename and a release use (`renameSafety`, `mountsWithRunningJobs`);
+   *  - a removal of the same mount already under way (a double click): two
+   *    would each run `unmount`, and the second could delete a mount added
+   *    under the alias after the first had finished.
+   *
+   * The mount is identified by its installation id, which a console add makes
+   * fresh: if the alias names another installation by the time `unmount` is
+   * done, or by the delete (which is conditional on it, in the store's own
+   * transaction), the removal stops and leaves that mount alone.
+   *
+   * Past those, the removal is going to happen, and in this order:
+   *  1. the plugin's `unmount`, if it declares one, bounded by
+   *     `UNMOUNT_TIMEOUT_MS`. A throw or a timeout does not stop the removal —
+   *     a service that is down must not make a mount undeletable — and comes
+   *     back as `unmountError`, for the person who removed it to read. It runs
+   *     after every refusal so a plugin never cancels its registrations for a
+   *     mount that then stays, and before the hooks go so it can still use
+   *     `ctx.inbound` and find its hooks live.
+   *  2. every hook of the alias still live is revoked, the way
+   *     `ctx.inbound.revoke` does it: the index row first, so the URL stops
+   *     resolving, then the secret — in two passes, the second just before
+   *     the delete, for a `ctx.inbound.create()` already past its last check
+   *     of the mark when the first list was read. A live hook is not a refusal: only the
+   *     plugin's own tools or the operator can revoke one, so "revoke it
+   *     first" would leave the owner with a mount they cannot delete; the hook
+   *     is the runtime's resource, so the runtime closes it. If the index
+   *     cannot be read (it is read once before step 1 too, so an index that is
+   *     down refuses before the plugin has cancelled anything) or a revoke
+   *     fails, the removal is REFUSED with that
+   *     reason, even though `unmount` has already run: a public URL left live
+   *     for an alias that a later mount may take is worse than a mount that
+   *     stays until the index answers, and trying again is safe — an `unmount`
+   *     that finds nothing left to cancel has nothing to do.
+   *  3. the store's delete, as before.
    *
    * `hooks` is the hook index, passed in by the caller that holds it: the
    * runtime's own handle exists only where plugins may make hooks, while the
-   * operator's route can make one anywhere. An index that cannot be read
-   * refuses, rather than deleting past a hook nobody checked for.
+   * operator's route can make one anywhere. Null means there is no index, so
+   * no hook to revoke.
    *
    * After the store's delete, the caches keyed by the alias go too: a
    * credential check's held error, the held-thing warnings and the last
@@ -1991,23 +2095,18 @@ export class AgentRuntime {
    */
   async removeMount(
     tenantId: string, agentId: string, alias: string,
-    hooks: Pick<HookDirectory, "list"> | null,
-  ): Promise<{ ok: true } | { ok: false; error: string; conflict?: true }> {
+    hooks: Pick<HookDirectory, "list" | "revoke"> | null,
+  ): Promise<{ ok: true; unmountError?: string } | { ok: false; error: string; conflict?: true }> {
     await this.ready();
     const mount = await this.store.getMountByAlias(tenantId, agentId, alias);
     if (!mount) return { ok: false, error: `no mount named ${alias}` };
     const plugin = this.#plugins.find((p) => p.id === mount.plugin);
     const refuse = (error: string) => ({ ok: false as const, error, conflict: true as const });
+    // Early, so a second click costs nothing; the check that decides is the one beside the mark, below.
+    if (this.#gateway.isRemoving(tenantId, agentId, alias)) return refuse(`${alias} is already being removed`);
     if (plugin?.consoleMount !== true) return refuse(`${mount.plugin} mounts cannot be removed from the console`);
     if (!consoleAdded(mount)) return refuse(`${alias} was not added from the console; only the operator can remove it`);
     if (mount.secretRef) return refuse(`${alias} has an account attached; remove it first`);
-    let live: number;
-    try {
-      live = hooks ? (await hooks.list(tenantId, agentId)).filter((h) => h.alias === alias && h.revokedAt === null).length : 0;
-    } catch (e) {
-      return refuse(`could not check ${alias}'s inbound hooks, so it was not removed: ${String((e as Error)?.message ?? e).slice(0, 200)}`);
-    }
-    if (live) return refuse(`${alias} has ${live} live inbound hook${live === 1 ? "" : "s"}; revoke ${live === 1 ? "it" : "them"} first`);
     const held = (await this.store.listApprovals(tenantId, "pending")).filter((a) => a.agentId === agentId && a.mountAlias === alias).length;
     if (held) return refuse(`${alias} has ${held} call${held === 1 ? "" : "s"} waiting for a decision; decide ${held === 1 ? "it" : "them"} first`);
     const sql = this.#deps.ctx.storage.sql;
@@ -2016,18 +2115,114 @@ export class AgentRuntime {
     }
     const safety = renameSafety(await this.#gateway.mountActivity({ tenantId, agentId, taskId: LEGACY_TASK }, alias), Date.now());
     if (!safety.safe) return refuse(`${safety.reason} (${safety.live.id}, idle ${Math.round(safety.live.idleMs / 60_000)}m)`);
+    // Read before `unmount` as well as after: an index that cannot be read refuses before the plugin has cancelled
+    // anything, which is the common way step 2 fails. The second read is what the plugin left live.
+    const liveHooks = async (): Promise<HookRow[] | { error: string }> => {
+      try {
+        return hooks ? (await hooks.list(tenantId, agentId)).filter((h) => h.alias === alias && h.revokedAt === null) : [];
+      } catch (e) {
+        return { error: `could not check ${alias}'s inbound hooks, so it was not removed: ${String((e as Error)?.message ?? e).slice(0, 200)}` };
+      }
+    };
+    const readable = await liveHooks();
+    if ("error" in readable) return refuse(readable.error);
+    // The refusals above awaited; the mount they judged is read again, and the identity check, the check for a
+    // removal already under way and the mark are one synchronous run, so two removals (a double click) cannot
+    // both pass it. A console mount's installation id is made fresh on every add (`addMount`), so a mount
+    // removed and added again under the same alias is told apart from the one these refusals judged.
+    const current = await this.store.getMountByAlias(tenantId, agentId, alias);
+    if (!current || current.installationId !== mount.installationId) return refuse(changedWhileRemoving(alias));
+    if (this.#gateway.isRemoving(tenantId, agentId, alias)) return refuse(`${alias} is already being removed`);
+    // From here the removal is decided: no call or pushed event reaches the mount until it is gone, or until a
+    // refusal below calls it off (`ToolGateway.markRemoving`).
+    const unmark = this.#gateway.markRemoving(tenantId, agentId, alias);
+    try {
+      return await this.#removeDecided(current, plugin, hooks, liveHooks, refuse);
+    } finally {
+      unmark();
+    }
+  }
+
+  /** `removeMount` past its refusals: `unmount`, the hooks, the delete. */
+  async #removeDecided(
+    mount: MountRecord, plugin: Plugin,
+    hooks: Pick<HookDirectory, "list" | "revoke"> | null,
+    liveHooks: () => Promise<HookRow[] | { error: string }>,
+    refuse: (error: string) => { ok: false; error: string; conflict: true },
+  ): Promise<{ ok: true; unmountError?: string } | { ok: false; error: string; conflict?: true }> {
+    const { tenantId, agentId, alias } = mount;
+    const sql = this.#deps.ctx.storage.sql;
+    const unmountError = plugin.unmount ? await this.#unmount(mount) : null;
+    // Still the same mount? Only another path that deletes rows (the store, an operator) could have taken it away
+    // while this one was marked; if one did and a new mount took the alias, its hooks are not this removal's.
+    const still = await this.store.getMountByAlias(tenantId, agentId, alias);
+    if (!still || still.installationId !== mount.installationId) return refuse(changedWhileRemoving(alias));
+    const revokeLive = async (): Promise<string | null> => {
+      const live = await liveHooks();
+      if ("error" in live) return live.error;
+      for (const h of live) {
+        try {
+          // Null is a hook revoked since the list was read; its secret goes all the same.
+          await hooks!.revoke(h.hookId);
+          await this.dropHookSecret(tenantId, agentId, h.hookId);
+        } catch (e) {
+          return `could not revoke ${alias}'s inbound hook, so it was not removed: ${String((e as Error)?.message ?? e).slice(0, 200)}`;
+        }
+      }
+      return null;
+    };
+    // Twice. A `ctx.inbound.create()` that began before the removal was decided can be past its last check of the
+    // mark (`#inboundFor`) and still write its row after the first list was read; the second pass, right before the
+    // delete, revokes what such a call left. Either pass failing refuses, by the same rule.
+    for (let pass = 0; pass < 2; pass++) {
+      const failed = await revokeLive();
+      if (failed) return refuse(failed);
+    }
     // The row a credential attached here would have been kept under. This mount
     // does not reference it (refused above), but another may: a reference is a
     // name, and `agent:<alias>` can sit on any mount. Only an unreferenced row
     // is a leftover; a referenced one is someone's credential and stays.
     const row = agentRef(alias);
     const shared = (await this.store.listMounts(tenantId, agentId)).some((m) => m.alias !== alias && m.secretRef === row);
-    if (!(await this.store.removeMount(tenantId, agentId, alias, shared ? null : alias))) return { ok: false, error: `no mount named ${alias}` };
+    // Conditional on the installation, in the store's own transaction: there is no await between that check and
+    // the delete, so a mount that took the alias since the check above is never the one deleted.
+    if (!(await this.store.removeMount(tenantId, agentId, alias, shared ? null : alias, mount.installationId))) {
+      return refuse(changedWhileRemoving(alias));
+    }
     this.#unchecked.delete(`${tenantId}/${agentId}/${alias}`);
     const warned = sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='held_warnings'").toArray().length > 0;
     if (warned) sql.exec("DELETE FROM held_warnings WHERE alias = ?", alias);
     this.#snapshotErrors()?.exec("DELETE FROM mount_snapshot_errors WHERE alias = ?", alias);
-    return { ok: true };
+    return unmountError ? { ok: true, unmountError } : { ok: true };
+  }
+
+  /**
+   * The plugin's `unmount`, under its timeout: null when it returned, else why not, in words for the person who
+   * removed the mount. The context is closed on every way out, before the caller deletes anything: a call past the
+   * deadline is not stopped (nothing can stop a promise), but from then on every `ctx.db`, `ctx.inbound` and other
+   * context call it makes refuses, so it cannot write under an alias that is being deleted — or that a new mount
+   * has taken by the time it gets there (`ToolGateway.unmount`).
+   */
+  async #unmount(mount: MountRecord): Promise<string | null> {
+    const alias = mount.alias;
+    const ms = this.#deps.unmountTimeoutMs ?? UNMOUNT_TIMEOUT_MS;
+    const failed = (e: unknown) => `${alias}'s plugin could not clean up: ${String((e as Error)?.message ?? e).slice(0, 300)}`;
+    let started: Awaited<ReturnType<ToolGateway["unmount"]>> = null;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      // Building the context can throw too (a plugin's `mountTools`, say): that is a failed cleanup like any
+      // other, recorded, and the removal goes on.
+      try { started = await this.#gateway.unmount(mount); } catch (e) { return failed(e); }
+      if (!started) return null;
+      const call = started.done.then(() => null, failed);
+      const timedOut = new Promise<string>((resolve) => {
+        timer = setTimeout(() => resolve(`${alias}'s plugin did not finish cleaning up within ${ms} ms`), ms);
+      });
+      return await Promise.race([call, timedOut]);
+    } finally {
+      clearTimeout(timer);
+      started?.close();
+    }
   }
 
   /**

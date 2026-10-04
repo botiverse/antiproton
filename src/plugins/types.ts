@@ -354,7 +354,7 @@ export interface PluginContext {
    * Set by the gateway alone (`#contextFor`, src/runtime/gateway.ts): run_js builds a call's options field by field
    * and the production host forwards no `operationId` (`hostCallOpts`, cf/src/runtime.ts), so no model or program
    * names it. Absent where the context serves no operation: `promptContribution`, `Holding.activity`/`activities`/
-   * `usage`/`release`/`files`, `receive`, `reportActivity`, `snapshotTools`, and a poll or cancel by handle alone
+   * `usage`/`release`/`files`, `receive`, `reportActivity`, `snapshotTools`, `unmount`, and a poll or cancel by handle alone
    * (the bench runner's `benchSweJob`).
    */
   operationId?: string;
@@ -379,8 +379,8 @@ export interface PluginContext {
    * reads the mount's list, so it hands it over rather than have each plugin re-derive it from the record.
    *
    * Set by the gateway (`#contextFor`, src/runtime/gateway.ts) on every context it builds for one of the agent's
-   * mounts: a call's `invoke`, `interrupts.resume`/`cancel`, `background.poll`/`cancel`, `receive` and
-   * `reportActivity`. Absent from `snapshotTools`'s context, which is asking what the list should be — the list it
+   * mounts: a call's `invoke`, `interrupts.resume`/`cancel`, `background.poll`/`cancel`, `receive`,
+   * `reportActivity` and `unmount`. Absent from `snapshotTools`'s context, which is asking what the list should be — the list it
    * would be handed is the one being replaced — and from the contexts built without a call (`promptContribution`,
    * `Holding.activity`/`activities`/`usage`/`release`/`files`, `checkCredential`). A plugin reads absence as "not
    * reported", never as "offers nothing", and falls back to its static `tools`.
@@ -438,6 +438,10 @@ export interface PluginContext {
    *   makes another hook. Declare it `idempotency: "none"` or key it yourself.
    * - **A mount holds at most `INBOUND_HOOKS_PER_MOUNT` live hooks**; `create()`
    *   past that is refused, so a leak stops at a few addresses.
+   * - **On removal, `unmount` is the place to cancel what was registered with
+   *   the service** ({@link Plugin.unmount}). Revoking here is optional: the
+   *   runtime revokes whatever hook of the mount is still live once `unmount`
+   *   returns, but only the plugin can tell the service to stop sending.
    */
   inbound?: InboundHooks;
   /**
@@ -2050,5 +2054,48 @@ export interface Plugin {
    * new meaning (the same word would read as the old thing to anyone who knew it).
    */
   reportActivity?(events: readonly ActivityEvent[], ctx: PluginContext): Promise<{ sent: number } | { skipped: string }>;
+
+  /**
+   * This mount is being removed: the plugin's one chance to clean up what it set up outside this agent.
+   *
+   * Deleting a mount deletes everything filed under its alias here — its database, its tool list, its hooks — but
+   * nothing the plugin registered elsewhere: a webhook it created with the service's API, a subscription, a
+   * session the service keeps open. Only the plugin knows those, so it is asked, with the mount's own context
+   * (`db`, and `inbound` for a plugin that receives), before any of it goes. Typical: read the ids kept in
+   * `ctx.db`, tell the service to forget them, and revoke the mount's hooks through `ctx.inbound`.
+   *
+   * **`ctx.credential` is always null here.** A removal is refused while the mount has an account attached, so by
+   * the time `unmount` runs the account has already been detached. A plugin that must authenticate to deregister
+   * uses `ctx.ownerSecret` (with `readsOwnerSecrets`) or a credential of the deployment's. (Detaching an account
+   * could one day call `unmount` too, while the account is still there.)
+   *
+   * What the runtime promises around it (`AgentRuntime.removeMount`, cf/src/runtime.ts):
+   * - **Called once per removal, after every refusal.** A removal that is refused (an account still attached, a
+   *   call waiting for a decision, something running) does not call it, so a plugin never cleans up for a mount
+   *   that then stays.
+   * - **Bounded by a timeout** (`UNMOUNT_TIMEOUT_MS`). The person removing the mount is waiting on it.
+   * - **A throw or a timeout does not block the removal.** The mount is removed anyway and the reason is shown to
+   *   the person who removed it, because a service that is down would otherwise make a mount impossible to delete.
+   *   So this is best effort: whatever it could not cancel is that person's to clean up by hand, with the reason
+   *   in front of them. A timed-out call is not stopped, but its context is closed at the deadline: every
+   *   `ctx.db`, `ctx.inbound` and other context call it makes after that throws, so it cannot write under an
+   *   alias that is being deleted, or that a new mount has taken since.
+   * - **Nothing else reaches the mount meanwhile.** From the moment the removal is decided, tool calls on the
+   *   mount are refused and pushed events are ignored without waking the agent; `unmount` runs under the mount's
+   *   lock, after any exclusive call already running on it.
+   * - **Then the runtime revokes every hook of the mount still live**, so a hook the plugin forgot, or could not
+   *   reach because it failed, does not stay a public URL pointing at a removed alias.
+   *
+   * - **Not gated by the switch or the version pin** that pushed events pass: switching a plugin off stops its
+   *   tools and its deliveries, not the cleanup owed for what it registered while it was on.
+   *
+   * Cleanup only: cancel registrations, subscriptions, reminders. It never wakes the agent, posts a message or
+   * calls a model — that is what makes running it for a switched-off plugin safe. It is a rule, not a limit: the
+   * context has nothing that wakes the agent, but `sibling` hands over another mount's credential and the plugin
+   * can reach the network, so a plugin could still post somewhere. It must not.
+   *
+   * Never a tool: the model cannot call it. Absent: nothing is asked, and the runtime still revokes the hooks.
+   */
+  unmount?(ctx: PluginContext): Promise<void>;
 
 }
