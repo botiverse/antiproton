@@ -2909,6 +2909,41 @@ await check("a Server that cannot mint a URL (CONFLICT) is answered by the binar
   if (!/does not exist or is not visible/.test(nf.message)) throw new Error(`not found: ${nf.message}`);
 });
 
+await check("an attachment Raft refuses (404 ATTACHMENT_UNAVAILABLE) is told as a neutral step, never the Server's Feedback Admin CLI command (SDK 0.12.1)", async () => {
+  const STEP = "This id is not an attachment you can read. Use an attachment id from a message you can see.";
+  // What the Server sends: one uniform 404 for a missing, unreadable or other-subsystem id, its next action a CLI command.
+  const refused = () => json(404, {
+    error: "Attachment not found.", code: "ATTACHMENT_UNAVAILABLE",
+    suggestedNextAction: "A Feedback Admin can open it with `raft feedback attachment view att-1 --server acme`.",
+  });
+  const cli = (text: string) => /\braft [a-z]/.test(text) || CLI_HINT.test(text) || /Feedback Admin/i.test(text) || /(^|[\s`'"(])--[a-z]/.test(text);
+  const plugin = createRaftPlugin({ artifacts: fakeArtifacts() });
+  const paths: Array<[string, string, (p: string) => Response | null]> = [
+    // The mint refused.
+    ["attachments_download_url (mint)", "attachments_download_url", (p) => p === "/internal/agent-api/attachments/att-1/url" ? refused() : null],
+    // The mint cannot presign (CONFLICT), and the binary download it falls back to is refused.
+    ["attachments_download_url (binary fallback)", "attachments_download_url", (p) =>
+      p === "/internal/agent-api/attachments/att-1/url" ? json(409, { error: "This Server's storage cannot presign.", code: "download_url_unavailable" })
+        : p === "/internal/agent-api/attachments/att-1" ? refused() : null],
+    // The attachment's comments, the other attachment route a tool reads.
+    ["attachments_comments", "attachments_comments", (p) => p === "/internal/agent-api/attachments/att-1/comments" ? refused() : null],
+  ];
+  for (const [what, tool, answer] of paths) {
+    const asked: string[] = [];
+    globalThis.fetch = (async (url: any) => {
+      const p = new URL(String(url)).pathname;
+      asked.push(p);
+      return answer(p) ?? json(500, { error: `unexpected ${p}` });
+    }) as any;
+    const why = await failure(() => plugin.invoke(tool, { attachmentId: "att-1" }, inTurn(ctx())));
+    if (!asked.some((p) => answer(p)?.status === 404)) throw new Error(`${what}: the refusal was never asked for: ${JSON.stringify(asked)}`);
+    if (!why.message.includes(STEP)) throw new Error(`${what}: no neutral step: ${why.message}`);
+    if (cli(why.message)) throw new Error(`${what}: a CLI command reached the model: ${why.message}`);
+  }
+  // Control: the guard sees the Server's own next action.
+  if (!cli("A Feedback Admin can open it with `raft feedback attachment view att-1 --server acme`.")) throw new Error("control: the guard misses the Server's command");
+});
+
 /**
  * Everything the process writes while `fn` runs: every `console` method and every structured line (`logEvent`, through
  * a sink installed for the call; tests run with none). Restored afterwards whatever `fn` does.
