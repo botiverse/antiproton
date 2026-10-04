@@ -6,7 +6,7 @@
  * reminders, the registration is made once and its id kept, the hook's secret is kept nowhere and said nowhere, and a
  * push is delivered only under a valid signature, once per firing, with the note quoted. The HTTP client is checked
  * against a fake server for the documented shapes (reminder-app/docs/webhook-delivery.md and reminder-app/docs/api.md, reminder-app 0.1.0, PR #6,
- * 66279b3). The last cases run through the real runtime (`AgentRuntime.receiveHook`), where the dedupe, the
+ * 311b1f5). The last cases run through the real runtime (`AgentRuntime.receiveHook`), where the dedupe, the
  * operator credential and the missing-secret refusal live.
  *
  * Pushes are signed here with node's HMAC, independently of the plugin's WebCrypto check, so a wrong implementation
@@ -15,7 +15,7 @@
 import { createHmac, randomBytes } from "node:crypto";
 import {
   createReminderPlugin, httpReminderService, reminderPlugin, subjectOf, ReminderServiceError, HOOK_STORE, HOOK_KEY,
-  RETRY_HORIZON_MS, SIGNATURE_MAX_SKEW_S,
+  RETRY_HORIZON_MS, MAX_CLOCK_SKEW_SECONDS,
   type ReminderConnection, type ReminderService, type ServiceReminder,
 } from "../src/plugins/reminder.ts";
 import type { InboundEvent, InboundResult, Plugin } from "../src/plugins/types.ts";
@@ -46,12 +46,13 @@ const HOUR = 3_600_000;
 const future = (ms = HOUR) => new Date(Date.now() + ms).toISOString();
 
 /** reminder-app, in memory: registrations, reminders by id, and every call made with the connection it came on. */
-function fakeService(opts: { registerFails?: Error } = {}) {
+function fakeService(opts: { registerFails?: Error; unregisterFails?: Error } = {}) {
   const calls: Array<{ op: string; arg: any; conn: ReminderConnection }> = [];
   const registrations: Array<{ hookId: string; url: string; secret: string }> = [];
   const reminders = new Map<string, ServiceReminder>();
   let n = 0;
   const service: ReminderService = {
+    async check(conn) { calls.push({ op: "check", arg: null, conn }); },
     async register(conn, hook) {
       calls.push({ op: "register", arg: { url: hook.url }, conn });
       if (opts.registerFails) throw opts.registerFails;
@@ -76,7 +77,17 @@ function fakeService(opts: { registerFails?: Error } = {}) {
       reminders.delete(id);
       return { ...r, status: "cancelled", nextAt: null };
     },
-    async unregister(conn, hookId) { calls.push({ op: "unregister", arg: hookId, conn }); return { activeRemindersUsingIt: 0 }; },
+    // As reminder-app does with cascade: cancel what names the hook and delete it, in one step; a second time, unknown_hook.
+    async unregister(conn, hookId) {
+      calls.push({ op: "unregister", arg: hookId, conn });
+      if (opts.unregisterFails) throw opts.unregisterFails;
+      const at = registrations.findIndex((r) => r.hookId === hookId);
+      if (at < 0) throw new ReminderServiceError("unknown_hook", "unknown hook");
+      registrations.splice(at, 1);
+      let cancelled = 0;
+      for (const [id, r] of reminders) if (r.target?.hookId === hookId) { reminders.delete(id); cancelled++; }
+      return { cancelledReminders: cancelled };
+    },
   };
   return { service, calls, registrations, reminders, ops: () => calls.map((c) => c.op) };
 }
@@ -411,7 +422,7 @@ await check("a validly signed push is delivered, with firingId as the dedupe key
 
 await check("the timestamp window: 299 s either way is accepted, 301 s either way is rejected", async () => {
   const { plugin, m } = await registeredMount();
-  must(SIGNATURE_MAX_SKEW_S === 300, `the window is ${SIGNATURE_MAX_SKEW_S}`);
+  must(MAX_CLOCK_SKEW_SECONDS === 300, `the window is ${MAX_CLOCK_SKEW_SECONDS}`);
   for (const skew of [-299, 299]) {
     const r = await receive(plugin, push(goodPush(), SECRET, { ts: at(skew) }), SECRET, m.ctx);
     must(r.deliver, `${skew} s: ${JSON.stringify(r)}`);
@@ -484,7 +495,7 @@ await check("a signed push with no record of the registration rebuilds it from t
 
 await check("the runtime's dedupe window outlasts reminder-app's retry horizon, so a firing's last retry is still a duplicate", async () => {
   must(RETRY_HORIZON_MS === 12 * HOUR, `the horizon is ${RETRY_HORIZON_MS} ms`);
-  must(INBOUND_DEDUPE_MS >= RETRY_HORIZON_MS + SIGNATURE_MAX_SKEW_S * 1000,
+  must(INBOUND_DEDUPE_MS >= RETRY_HORIZON_MS + MAX_CLOCK_SKEW_SECONDS * 1000,
     `INBOUND_DEDUPE_MS (${INBOUND_DEDUPE_MS} ms) no longer covers reminder-app's ${RETRY_HORIZON_MS} ms of retries: a late retry would wake the agent twice`);
 });
 
@@ -529,21 +540,24 @@ const REMINDER = { id: "rem-9", owner: "x", title: "T", notes: "N", schedule: { 
 await check("the HTTP client sends the documented requests, with the credential and the subject on every one", async () => {
   try {
     const seen = fakeServer((method, path) =>
-      path === "/api/v1/agent/hooks" ? ok({ hookId: "hook_1", origin: "https://hooks.antiproton.example", revision: 1, createdAt: 1, updatedAt: 1 })
+      path === "/api/v1/agent/hooks" && method === "GET" ? ok({ hooks: [] })
+      : path === "/api/v1/agent/hooks" ? ok({ hookId: "hook_1", origin: "https://hooks.antiproton.example", revision: 1, createdAt: 1, updatedAt: 1 })
       : path === "/api/v1/agent/reminders" && method === "POST" ? ok(REMINDER)
       : path === "/api/v1/agent/reminders?status=active" ? ok({ reminders: [REMINDER], occurrences: [] })
       : path === "/api/v1/agent/reminders/cancel" ? ok({ ...REMINDER, status: "cancelled", nextAt: null })
-      : path === "/api/v1/agent/hooks/delete" ? ok({ hookId: "hook_1", deleted: true, activeRemindersUsingIt: 2 })
+      : path === "/api/v1/agent/hooks/delete" ? ok({ hookId: "hook_1", deleted: true, cancelledReminders: ["rem-9", "rem-8"], cancelledFirings: [] })
       : fail(404, "no such route"));
     const http = httpReminderService();
+    await http.check(CONN);
     must((await http.register(CONN, { url: "https://hooks.antiproton.example/hooks/x", secret: "s".repeat(64) })).hookId === "hook_1", "register");
     const made = await http.create(CONN, { requestId: "0b6c7f2e9d8a4b1c0b6c", title: "T", notes: "N", schedule: { fireAt: "2026-10-05T09:00:00.000Z" }, target: { kind: "webhook", hookId: "hook_1" } });
     must(made.id === "rem-9" && made.nextAt === 1791190800000 && made.target?.hookId === "hook_1", `create read ${JSON.stringify(made)}`);
     must((await http.list(CONN)).map((r) => r.id).join() === "rem-9", "list");
     must((await http.cancel(CONN, "rem-9"))?.status === "cancelled", "cancel");
-    must((await http.unregister(CONN, "hook_1")).activeRemindersUsingIt === 2, "unregister");
+    must((await http.unregister(CONN, "hook_1")).cancelledReminders === 2, "unregister");
     const shape = seen.map((s) => `${s.method} ${s.path} ${JSON.stringify(s.body ?? null)}`);
     const expected = [
+      `GET /api/v1/agent/hooks null`,
       `POST /api/v1/agent/hooks {"url":"https://hooks.antiproton.example/hooks/x","secret":"${"s".repeat(64)}"}`,
       `POST /api/v1/agent/reminders {"requestId":"0b6c7f2e9d8a4b1c0b6c","reminder":{"title":"T","notes":"N","schedule":{"fireAt":"2026-10-05T09:00:00.000Z"},"anchor":null,"target":{"kind":"webhook","hookId":"hook_1"}}}`,
       `GET /api/v1/agent/reminders?status=active null`,
@@ -578,11 +592,112 @@ await check("the HTTP client maps reminder-app's errors: unknown_hook, an unknow
     fakeServer(() => fail(401, `Unknown credential ${CREDENTIAL}`));
     const bad = await codeOf(create());
     must(/client credential/.test(bad) && !bad.includes(CREDENTIAL), `a 401 became ${bad}`);
+    fakeServer(() => fail(404, "Unknown hook. Register it again.", "unknown_hook"));
+    must((await codeOf(http.unregister(CONN, "hook_1"))).startsWith("unknown_hook"), `unregister of a deleted hook became ${await codeOf(http.unregister(CONN, "hook_1"))}`);
+    fakeServer(() => ({ status: 409, body: { ok: false, error: { message: "This hook is used by 2 active reminder(s) and 0 pending firing(s).", code: "hook_in_use", activeReminders: 2, pendingFirings: 0 }, status: 409 } }));
+    must(/refused: .*HTTP 409.*used by 2 active/.test(await codeOf(http.unregister(CONN, "hook_1"))), `hook_in_use became ${await codeOf(http.unregister(CONN, "hook_1"))}`);
     fakeServer(() => fail(503, "Could not resolve the hook host. Retry."));
     must((await codeOf(create())).startsWith("unavailable"), `a 503 became ${await codeOf(create())}`);
     fakeServer((_m, _p, body) => fail(500, `echo ${body?.secret}`));
     const echoed = await codeOf(http.register(CONN, { url: "https://hooks.antiproton.example/hooks/x", secret: "TOPSECRET".repeat(4) }));
     must(echoed.startsWith("unavailable"), `control: ${echoed}`);
+  } finally { globalThis.fetch = realFetch; }
+});
+
+// ---- checkCredential
+
+await check("checkCredential asks reminder-app with the credential and subject, names the client, and tells a refusal from silence", async () => {
+  const plugin = createReminderPlugin(); // the HTTP client
+  const m = mount(plugin);
+  const seen: string[] = [];
+  const answer = (status: number, body: unknown) => { globalThis.fetch = (async (u: any, init: any) => {
+    seen.push(`${init.method} ${new URL(String(u)).pathname} ${new Headers(init.headers).get("x-reminder-subject")}`);
+    return new Response(JSON.stringify(body), { status });
+  }) as any; };
+  try {
+    answer(200, { ok: true, result: { hooks: [] }, status: 200 });
+    const good = await plugin.checkCredential!(m.ctx);
+    must(good.ok && good.account === "reminder-app client test-client", `a working credential: ${JSON.stringify(good)}`);
+    must(seen[0] === "GET /api/v1/agent/hooks t:a", `asked ${seen[0]}`);
+    answer(401, { ok: false, error: { message: "Unknown credential." }, status: 401 });
+    const bad = await plugin.checkCredential!(m.ctx);
+    must(!bad.ok && bad.kind === "rejected" && !JSON.stringify(bad).includes(CREDENTIAL), `a refused credential: ${JSON.stringify(bad)}`);
+    globalThis.fetch = (async () => { throw new Error(`connect ECONNREFUSED ${SERVICE_URL}`); }) as any;
+    const down = await plugin.checkCredential!(m.ctx);
+    must(!down.ok && down.kind === "unreachable", `reminder-app down: ${JSON.stringify(down)}`);
+  } finally { globalThis.fetch = realFetch; }
+  must(!(await plugin.checkCredential!({ ...m.ctx, credential: null })).ok, "no credential checked as working");
+});
+
+// ---- unmount
+
+await check("unmount deletes the registration with cascade, so its reminders go with it, and revokes the mount's inbound hooks", async () => {
+  const svc = fakeService();
+  const plugin = createReminderPlugin({ service: svc.service });
+  const m = mount(plugin);
+  const other = mount(plugin, { alias: "rem2", shared: { host: m.host, tables: m.tables } });
+  await m.call("create", { delayMinutes: 5, note: "one" });
+  await m.call("create", { delayMinutes: 6, note: "two" });
+  await other.call("create", { delayMinutes: 7, note: "theirs" });
+  const mine = m.state().serviceHookId, inbound = m.state().inboundHookId;
+  const posted = await written(() => plugin.unmount!(m.ctx));
+  must(posted.error === null, `unmount failed: ${posted.error}`);
+  const del = svc.calls.filter((c) => c.op === "unregister");
+  must(del.length === 1 && del[0]!.arg === mine && del[0]!.conn.subject === "t:a", `unregister calls ${JSON.stringify(del.map((c) => c.arg))}`);
+  must([...svc.reminders.values()].every((r) => r.target?.hookId !== mine) && svc.reminders.size === 1, `reminders left ${JSON.stringify([...svc.reminders.values()].map((r) => r.notes))}`);
+  must(m.hooks.revoked.includes(inbound), "the inbound hook was not revoked");
+  must(!m.state().serviceHookId && !m.state().inboundHookId, `record after unmount ${JSON.stringify(m.state())}`);
+  must(!JSON.stringify(posted).includes(m.hooks.made[0]!.secret), "unmount wrote the secret somewhere");
+});
+
+await check("unmount is safe to run twice: the second run finds the registration gone and succeeds", async () => {
+  const svc = fakeService();
+  const plugin = createReminderPlugin({ service: svc.service });
+  const m = mount(plugin);
+  await m.call("create", { delayMinutes: 5, note: "one" });
+  const record = m.state();
+  await plugin.unmount!(m.ctx);
+  // A removal whose hook revoke failed is tried again with unmount already run; and a record that outlived the first
+  // run (written back by hand here) must read reminder-app's unknown_hook as "already deleted".
+  await plugin.unmount!(m.ctx).catch((e) => { throw new Error(`a second unmount over a cleared record failed: ${e.message}`); });
+  m.tables.put({ tenantId: "t", agentId: "a", alias: "rem", plugin: plugin.id }, HOOK_STORE, HOOK_KEY, record, null);
+  await plugin.unmount!(m.ctx).catch((e) => { throw new Error(`a second unmount that met unknown_hook failed: ${e.message}`); });
+  must(svc.calls.filter((c) => c.op === "unregister").length === 2, `unregister called ${svc.calls.filter((c) => c.op === "unregister").length} times`);
+  // A mount that never registered asks nobody.
+  const fresh = fakeService();
+  const f = mount(createReminderPlugin({ service: fresh.service }), { alias: "rem3" });
+  await createReminderPlugin({ service: fresh.service }).unmount!(f.ctx);
+  must(fresh.calls.length === 0, `an unregistered mount called ${fresh.ops().join(",")}`);
+});
+
+await check("unmount with reminder-app down throws, and leaves the record so a later run can still unregister", async () => {
+  const svc = fakeService({ unregisterFails: new ReminderServiceError("unavailable", "reminder-app returned HTTP 503", { mayHaveLanded: true }) });
+  const plugin = createReminderPlugin({ service: svc.service });
+  const m = mount(plugin);
+  await m.call("create", { delayMinutes: 5, note: "one" });
+  const why = await refusal(plugin.unmount!(m.ctx));
+  must(/HTTP 503/.test(why), `unmount failed with "${why}"`);
+  must(m.state().serviceHookId === svc.registrations[0]!.hookId, "a failed unregister cleared the record");
+});
+
+await check("unmount never meets hook_in_use: every delete it sends asks for cascade", async () => {
+  const sent: any[] = [];
+  globalThis.fetch = (async (u: any, init: any) => {
+    const body = init.body ? JSON.parse(init.body) : undefined;
+    sent.push({ path: new URL(String(u)).pathname, body });
+    // reminder-app's rule: without cascade, a hook still in use is refused.
+    const answer = body?.cascade === "cancel"
+      ? { ok: true, result: { hookId: body.hookId, deleted: true, cancelledReminders: ["rem-1"], cancelledFirings: [] }, status: 200 }
+      : { ok: false, error: { message: "This hook is used by 1 active reminder(s) and 0 pending firing(s).", code: "hook_in_use", activeReminders: 1, pendingFirings: 0 }, status: 409 };
+    return new Response(JSON.stringify(answer), { status: answer.status });
+  }) as any;
+  try {
+    const plugin = createReminderPlugin(); // the HTTP client
+    const m = mount(plugin);
+    m.tables.put({ tenantId: "t", agentId: "a", alias: "rem", plugin: plugin.id }, HOOK_STORE, HOOK_KEY,
+      { inboundHookId: "ih-rem-1", serviceHookId: "hook_1", staleInboundHookIds: [], registeredAt: 1 }, null);
+    await plugin.unmount!(m.ctx).catch((e) => { throw new Error(`unmount hit: ${e.message}`); });
+    must(sent.length === 1 && sent[0].path === "/api/v1/agent/hooks/delete" && JSON.stringify(sent[0].body) === `{"hookId":"hook_1","cascade":"cancel"}`, JSON.stringify(sent));
   } finally { globalThis.fetch = realFetch; }
 });
 

@@ -8,9 +8,9 @@
  * here and never taken from the model, so an agent cannot aim a reminder at another mount's hook. When one fires,
  * reminder-app posts it signed with the registered secret, and `receive` checks the signature and wakes the agent.
  *
- * The wire format is reminder-app/docs/webhook-delivery.md (reminder-app 0.1.0, PR #6, 66279b3), with the agent-owned reminder routes
- * of reminder-app/docs/api.md (reminder-app 0.1.0, PR #6, 66279b3); the reminder object's fields, which neither document lists, are
- * those reminder-app/src/server/workspace.ts (reminder-app 0.1.0, PR #6, 66279b3) returns. Every call to reminder-app goes through one
+ * The wire format is reminder-app/docs/webhook-delivery.md (reminder-app 0.1.0, PR #6, 311b1f5), with the agent-owned reminder routes
+ * of reminder-app/docs/api.md (reminder-app 0.1.0, PR #6, 311b1f5); the reminder object's fields, which neither document lists, are
+ * those reminder-app/src/server/workspace.ts (reminder-app 0.1.0, PR #6, 311b1f5) returns. Every call to reminder-app goes through one
  * interface, {@link ReminderService}, injected into {@link createReminderPlugin}; {@link httpReminderService} is
  * that format over HTTP.
  *
@@ -61,6 +61,8 @@ export interface ReminderConnection {
  * stands in for the whole service. Failures are {@link ReminderServiceError}s; the plugin reads their `code`.
  */
 export interface ReminderService {
+  /** Whether the credential and subject are accepted: the subject's hooks, read and dropped. For `checkCredential`. */
+  check(conn: ReminderConnection): Promise<void>;
   /** Register a push URL and the secret it signs with; reminder-app's id for the registration. */
   register(conn: ReminderConnection, hook: { url: string; secret: string }): Promise<{ hookId: string }>;
   /** Make one reminder. The same `requestId` and body make one reminder however often they are sent. */
@@ -71,15 +73,16 @@ export interface ReminderService {
   /** Cancel one reminder: the cancelled reminder, or null when reminder-app has none by that id for this subject. */
   cancel(conn: ReminderConnection, id: string): Promise<ServiceReminder | null>;
   /**
-   * Delete a registration, cancelling the reminders that name it first. Nothing in the plugin calls it yet: the
-   * plugin contract has no member a runtime calls when a mount is removed (TODO, see the end of this file).
+   * Delete a registration and, in the same step, cancel the reminders and pending firings that name it
+   * (`cascade: "cancel"`). For `unmount`. A registration reminder-app does not know is `unknown_hook`.
    */
-  unregister(conn: ReminderConnection, hookId: string): Promise<{ activeRemindersUsingIt: number | null }>;
+  unregister(conn: ReminderConnection, hookId: string): Promise<{ cancelledReminders: number }>;
 }
 
 /**
  * - `unknown_hook`: the registration is not this subject's (any more); the plugin registers again and retries once.
- * - `refused`: reminder-app said no to the request as made; the message says why, in words for the model.
+ * - `refused`: reminder-app said no to the request as made; the message says why, in words for the model. A
+ *   delete refused with `hook_in_use` is one, which the plugin never sees: it always deletes with cascade.
  * - `unavailable`: no usable answer (a 5xx, a timeout, an unreadable body); `mayHaveLanded` when it may have taken.
  */
 export type ReminderServiceErrorCode = "unknown_hook" | "refused" | "unavailable";
@@ -98,10 +101,10 @@ export class ReminderServiceError extends Error {
 
 // ---- reminder-app over HTTP
 
-/** reminder-app/docs/webhook-delivery.md (reminder-app 0.1.0, PR #6, 66279b3) "Hooks", and reminder-app/docs/api.md (reminder-app 0.1.0, PR #6, 66279b3) "Agent-owned reminders". */
+/** reminder-app/docs/webhook-delivery.md (reminder-app 0.1.0, PR #6, 311b1f5) "Hooks", and reminder-app/docs/api.md (reminder-app 0.1.0, PR #6, 311b1f5) "Agent-owned reminders". */
 const ROUTES = {
-  hooks: "/api/v1/agent/hooks",                 // POST { url, secret } → { hookId, origin, revision, createdAt, updatedAt }
-  hooksDelete: "/api/v1/agent/hooks/delete",    // POST { hookId, cascade } → { hookId, deleted, activeRemindersUsingIt }
+  hooks: "/api/v1/agent/hooks",                 // POST { url, secret } → { hookId, origin, revision, createdAt, updatedAt }; GET → { hooks }
+  hooksDelete: "/api/v1/agent/hooks/delete",    // POST { hookId, cascade: "cancel" } → { hookId, deleted, cancelledReminders, cancelledFirings }
   reminders: "/api/v1/agent/reminders",         // POST { requestId, reminder } → reminder; GET ?status=active → { reminders, occurrences }
   cancel: "/api/v1/agent/reminders/cancel",     // POST { id } → the cancelled reminder; 404 without a code for an unknown id
 } as const;
@@ -150,11 +153,12 @@ export function httpReminderService(): ReminderService {
     }
     if (response.status === 404) return { status: 404, result: null };
     if (response.status === 401) {
-      throw new ReminderServiceError("refused", "reminder-app did not accept this deployment's client credential; whoever deploys has to issue or configure it again");
+      throw new ReminderServiceError("refused", "reminder-app did not accept this deployment's client credential (unknown, rotated or revoked); whoever deploys has to configure a current one");
     }
     if (response.status === 403) {
-      // TODO(reminder-app): Raft agents cannot use hooks, and reminder-app is to refuse them with its own code; until
-      // the document names it, every 403 that is not the switched-off client is read as that refusal.
+      // TODO(reminder-app): a Raft agent cannot register hooks or create webhook-targeted reminders
+      // (webhook-delivery.md, "Authentication"), and the document names no code for that refusal; until it does,
+      // every 403 that is not the switched-off client is read as that refusal.
       if (said === CLIENT_SWITCHED_OFF) throw new ReminderServiceError("refused", "reminder-app has not switched on reminders for this deployment, so none can be set yet");
       throw new ReminderServiceError("refused", `reminder-app refused this agent${said ? ` (${said})` : ""}; an agent with a Raft identity sets reminders with Raft's own reminder tools instead`);
     }
@@ -162,6 +166,9 @@ export function httpReminderService(): ReminderService {
     throw new ReminderServiceError("refused", `reminder-app refused the request (HTTP ${response.status})${said ? `: ${said}` : ""}`);
   }
   return {
+    async check(conn) {
+      await call(conn, "GET", ROUTES.hooks);
+    },
     async register(conn, hook) {
       const { result } = await call(conn, "POST", ROUTES.hooks, { url: hook.url, secret: hook.secret });
       if (typeof result?.hookId !== "string") throw new ReminderServiceError("unavailable", "reminder-app's registration answer had no hookId", { mayHaveLanded: true });
@@ -185,11 +192,11 @@ export function httpReminderService(): ReminderService {
       return status === 404 ? null : reminderOf(result);
     },
     async unregister(conn, hookId) {
-      // TODO(reminder-app): `cascade: "cancel"` is the decided form of "cancel its reminders, then delete the hook";
-      // the document at 66279b3 has no such field and refuses unknown ones, so this waits on its next revision.
+      // With cascade, one transaction cancels what names the hook and deletes it; without, a hook still in use is
+      // refused with 409 `hook_in_use` (webhook-delivery.md, reminder-app 0.1.0, PR #6, 311b1f5, "Unregister").
       const { status, result } = await call(conn, "POST", ROUTES.hooksDelete, { hookId, cascade: "cancel" });
       if (status === 404) throw new ReminderServiceError("unknown_hook", "reminder-app does not know this registration");
-      return { activeRemindersUsingIt: typeof result?.activeRemindersUsingIt === "number" ? result.activeRemindersUsingIt : null };
+      return { cancelledReminders: Array.isArray(result?.cancelledReminders) ? result.cancelledReminders.length : 0 };
     },
   };
 }
@@ -278,7 +285,7 @@ async function revokeAll(ctx: PluginContext, ids: string[]): Promise<string[]> {
 // ---- the tools
 
 export const NOTE_MAX = 1_000;
-/** reminder-app's `title` is 1-200 characters (reminder-app/docs/api.md, reminder-app 0.1.0, PR #6, 66279b3); the note's first line, cut to fit. */
+/** reminder-app's `title` is 1-200 characters (reminder-app/docs/api.md, reminder-app 0.1.0, PR #6, 311b1f5); the note's first line, cut to fit. */
 const TITLE_MAX = 200;
 /** The furthest ahead a reminder may be set. A bound, so a typo in a year is refused rather than kept for ever. */
 export const MAX_AHEAD_MS = 366 * 24 * 60 * 60 * 1000;
@@ -430,8 +437,8 @@ async function ensureRegistered(ctx: PluginContext, service: ReminderService, co
   let serviceHookId: string;
   try {
     const url = new URL(created.url);
-    // https on its default port only: reminder-app refuses anything else, and a refusal there would cost a round trip
-    // and leave the reason in its words. URL drops an explicit ":443", so any port left is another one.
+    // https on port 443 only, reminder-app's rule ("Hooks", URL rules): refused here rather than there, so nothing is
+    // registered and the reason is ours. URL drops an explicit ":443", so any port left is another one.
     if (url.protocol !== "https:" || url.port !== "") {
       throw new ReminderServiceError("refused", "this deployment's push endpoints are not https on port 443, which reminder-app requires; nothing was set");
     }
@@ -483,13 +490,14 @@ const shown = (r: ServiceReminder) => ({ id: r.id, dueAt: isoOf(r.nextAt), creat
 // ---- receiving
 
 /**
- * How far a push's `X-Reminder-Timestamp` may be from this clock: reminder-app/docs/webhook-delivery.md (reminder-app 0.1.0, PR #6,
- * 66279b3), "Verifying a push", step 3. It bounds a replay of one captured request, not the retry schedule: every
- * attempt is signed again with its own timestamp, so a retry hours later is as fresh as the first.
+ * How far a push's `X-Reminder-Timestamp` may be from this clock, in either direction: `MAX_CLOCK_SKEW_SECONDS` of
+ * reminder-app/docs/webhook-delivery.md (reminder-app 0.1.0, PR #6, 311b1f5), "Verifying a push". It bounds a replay
+ * of one captured request, not the retry schedule: every attempt is signed again with the time it was sent, so a
+ * retry hours later is as fresh as the first, and a replay inside the window repeats a firingId the dedupe drops.
  */
-export const SIGNATURE_MAX_SKEW_S = 300;
+export const MAX_CLOCK_SKEW_SECONDS = 300;
 /**
- * Every attempt of a firing ends within this long of its first (webhook-delivery.md, reminder-app 0.1.0, PR #6, 66279b3, "Responses and
+ * Every attempt of a firing ends within this long of its first (webhook-delivery.md, reminder-app 0.1.0, PR #6, 311b1f5, "Responses and
  * retries", Horizon). The runtime remembers a dedupe key for INBOUND_DEDUPE_MS (src/runtime/inbound.ts), 24 hours,
  * which is the plugin's whole dedupe; the two are held together by test/reminder-plugin.ts, so neither changes alone.
  */
@@ -528,15 +536,15 @@ export function reminderText(fired: { reminderId: string; scheduledAt: string | 
   return `Reminder (${due}; id ${fired.reminderId}). Your note:\n${note}`;
 }
 
-/** One signed push from reminder-app, checked as webhook-delivery.md (reminder-app 0.1.0, PR #6, 66279b3) "Verifying a push" says. */
+/** One signed push from reminder-app, checked as webhook-delivery.md (reminder-app 0.1.0, PR #6, 311b1f5) "Verifying a push" says. */
 async function receiveFire(event: InboundEvent, secret: string, ctx: PluginContext, now: number): Promise<InboundResult> {
   const timestamp = event.headers["x-reminder-timestamp"] ?? "";
   const signature = event.headers["x-reminder-signature"] ?? "";
   if (!/^\d{1,15}$/.test(timestamp)) return { deliver: false, rejected: true, reason: "unsigned: X-Reminder-Timestamp is missing or not digits" };
   const hex = /^v1=([0-9a-f]{64})$/.exec(signature)?.[1];
   if (!hex) return { deliver: false, rejected: true, reason: "unsigned: X-Reminder-Signature is missing or not v1=<64 hex>" };
-  if (Math.abs(now / 1000 - Number(timestamp)) > SIGNATURE_MAX_SKEW_S) {
-    return { deliver: false, rejected: true, reason: `the signature's timestamp is more than ${SIGNATURE_MAX_SKEW_S} s from this clock` };
+  if (Math.abs(now / 1000 - Number(timestamp)) > MAX_CLOCK_SKEW_SECONDS) {
+    return { deliver: false, rejected: true, reason: `the signature's timestamp is more than ${MAX_CLOCK_SKEW_SECONDS} s from this clock` };
   }
   if (!(await signedWith(timestamp, event.body, hex, secret))) {
     return { deliver: false, rejected: true, reason: "the signature does not match this hook's secret" };
@@ -609,10 +617,28 @@ export function createReminderPlugin(deps: { service?: ReminderService; now?: ()
       shape: "token",
       grants: "Registering this agent's push endpoint with reminder-app and creating, listing and cancelling the reminders that wake it.",
       // rmc.<clientId>.<secret>: clientId 1-63 of [a-z0-9-], the secret two UUIDs without dashes
-      // (reminder-app/src/server/workspace.ts and reminder-app/src/server/crypto.ts, reminder-app 0.1.0, PR #6, 66279b3).
+      // (reminder-app/src/server/workspace.ts and reminder-app/src/server/crypto.ts, reminder-app 0.1.0, PR #6, 311b1f5).
       looksLike: [{ kind: "reminder-app client credential", pattern: "\\brmc\\.[a-z0-9][a-z0-9-]{0,62}\\.[0-9a-f]{64}\\b" }],
     },
     tools: TOOLS,
+
+    /**
+     * Asks reminder-app for the subject's hooks, the cheapest call that needs both the credential and the subject. The
+     * account is the client id the credential names (`rmc.<clientId>.…`): the name reminder-app's operator gave this
+     * deployment, and no part of the secret.
+     */
+    async checkCredential(ctx) {
+      if (!ctx.credential) return { ok: false, kind: "rejected", reason: "no reminder-app client credential was supplied" };
+      let conn: ReminderConnection;
+      try { conn = connection(ctx); } catch (e) { return { ok: false, kind: "unreachable", reason: (e as Error).message }; }
+      try { await service.check(conn); }
+      catch (e) {
+        const refused = e instanceof ReminderServiceError && e.code === "refused";
+        return { ok: false, kind: refused ? "rejected" : "unreachable", reason: forModel(e).message };
+      }
+      const client = /^rmc\.([a-z0-9][a-z0-9-]{0,62})\./.exec(ctx.credential)?.[1];
+      return client ? { ok: true, account: `reminder-app client ${client}` } : { ok: true };
+    },
 
     async invoke(tool, raw, ctx): Promise<Json> {
       if (tool === "create") {
@@ -675,13 +701,31 @@ export function createReminderPlugin(deps: { service?: ReminderService; now?: ()
     },
 
     receive: (event, secret, ctx) => receiveFire(event, secret, ctx, now()),
+
+    /**
+     * The mount is being removed: delete its registration with `cascade: "cancel"`, so reminder-app cancels every
+     * reminder and pending firing that names it in the same step and none is left that could only fail; then revoke
+     * the mount's inbound hooks (the runtime revokes any left after this too). Safe to run twice: a registration
+     * reminder-app no longer knows is one already deleted, and the record is cleared once it is. A failure throws,
+     * and the runtime shows it to whoever removed the mount and removes it anyway. Cleanup only: nothing here
+     * wakes the agent.
+     */
+    async unmount(ctx) {
+      const state = await loadHook(ctx);
+      if (state.serviceHookId) {
+        try { await service.unregister(connection(ctx), state.serviceHookId); }
+        catch (e) {
+          if (!(e instanceof ReminderServiceError) || e.code !== "unknown_hook") throw forModel(e);
+        }
+        await saveHook(ctx, { ...state, serviceHookId: null });
+      }
+      const ids = [...new Set([state.inboundHookId, ...state.staleInboundHookIds].filter((x): x is string => x !== null))];
+      const left = await revokeAll(ctx, ids);
+      await saveHook(ctx, { inboundHookId: null, serviceHookId: null, staleInboundHookIds: left, registeredAt: null });
+      logEvent("reminder.unmount", { tenantId: ctx.caller.tenantId, agentId: ctx.caller.agentId, mount: ctx.alias, unregistered: !!state.serviceHookId, revokeFailed: left.length });
+    },
   };
 }
 
 /** The plugin as the deployment registers it: reminder-app over HTTP. */
 export const reminderPlugin: Plugin = createReminderPlugin();
-
-// TODO(plugin contract): when a mount of this plugin is removed, its registration should be deleted with
-// `cascade: "cancel"` (`ReminderService.unregister`) and its inbound hook revoked. The contract has no member a runtime
-// calls on removal — `AgentRuntime.removeMount` instead refuses while a live inbound hook remains — so nothing calls
-// `unregister` yet, and a removal goes through an operator revoking the hook first.
