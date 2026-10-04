@@ -227,6 +227,20 @@ export function failureText(m: { errorMessage?: unknown; providerError?: unknown
   return typeof m?.errorMessage === "string" ? m.errorMessage : undefined;
 }
 
+/**
+ * The answer for a provider call that threw, where no queue consumer stands between the client and the agent
+ * (the bench runners' worker, bench/node-worker.ts). `errorMessage` is the error's own message, at most 300
+ * characters, as it always was; a refusal (`ModelRequestRefused`, src/model/openai-compatible.ts) adds its
+ * `turnError` as `providerError`, since its `errorMessage` is fixed text that says only the status. Read by
+ * shape rather than `instanceof`, so this file does not import the client.
+ */
+export function failedAnswer(e: unknown, model: { api: string; provider: string; id: string }): AnsweredMessage {
+  const err = e as { message?: unknown; permanent?: unknown; turnError?: unknown } | null;
+  const answer: AnsweredMessage = errorMessage(String(err?.message ?? e).slice(0, 300), model);
+  if (err?.permanent === true && typeof err.turnError === "string") answer.providerError = err.turnError;
+  return answer;
+}
+
 export function errorMessage(
   error: string,
   model: { api: string; provider: string; id: string },

@@ -11,6 +11,7 @@ import { consumeModelCalls, replyingUnknownJob, type ModelJobStub, type ModelQue
 import { callQueuedModel, operatorModelOf } from "../cf/src/model-request.ts";
 import { readEntries } from "../cf/src/transcript-read.ts";
 import { sessionTranscript } from "../cf/src/agents-api/transcript.ts";
+import { entriesToEvents } from "../cf/src/pi-view.ts";
 import { GATEWAY_401_HINT, ModelRequestRefused, OpenAiCompatibleModel, isPermanentRefusal } from "../src/model/openai-compatible.ts";
 import { ApStore } from "../src/store/ap-store.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
@@ -182,6 +183,10 @@ for (const engine of ["pi085", "pd"] as const) {
         const { turns } = sessionTranscript({ entries, running: false, pending: [] } as never, { sessionId: "s", agentId: "a" });
         const turn = turns.at(-1);
         must(turn?.status === "failed" && turn.error?.message === last.providerError, `turn ${show(turn)}`);
+        // What the console shows for it: the same message, on its failed-model event.
+        const failedEvents = entriesToEvents(entries as never).filter((e) => e.kind === "model.failed");
+        must(failedEvents.length === 1 && (failedEvents[0]!.payload as { error?: string }).error === last.providerError,
+          `console events ${show(failedEvents)}`);
         // Delivered once: a redelivery of the message takes nothing and calls nothing.
         const again = answering(400, body);
         try { await consumeModelCalls({ queue: "model-calls", messages: [msg] }, deps); } finally { again.restore(); }

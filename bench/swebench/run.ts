@@ -30,7 +30,7 @@ import { PiAgent } from "../../src/runtime/pi-agent.ts";
 import { QuickJsExecutor } from "../../src/runtime/executor.ts";
 import { ToolGateway } from "../../src/runtime/gateway.ts";
 import { OpenAiCompatibleModel } from "../../src/model/openai-compatible.ts";
-import { toRequest, fromResponse, errorMessage } from "../../src/model/pi-bridge.ts";
+import { nodeWorker } from "../node-worker.ts";
 import { contextWindowFor } from "../../src/model/context-windows.ts";
 import { systemPrompt } from "../../src/runtime/pi-prompt.ts";
 import { runJsTool, bridgeTools, refuseWithheld, type MountedTool } from "../../src/runtime/pi-tools.ts";
@@ -97,47 +97,6 @@ Work in small steps: read the failing code first, then make the smallest change 
 Do not modify test files; the graders supply their own.
 When the fix is in place, say so and stop.
 `.trim();
-
-/**
- * What the queue does in production, as a function.
- *
- * The shape that matters is preserved, and it is the reason this is not simply
- * an inline call: `dispatch` returns immediately, so `step()` is never blocked
- * on the provider, and the answer arrives later through `deliver()` exactly as
- * it does when a Worker hands it back. On Cloudflare the waiting happens in a
- * Worker billed for CPU; here it happens on a promise nobody is awaiting.
- */
-function nodeWorker(agentOf: () => PiAgent) {
-  let inFlight = 0;
-  let calls = 0;
-  return {
-    get inFlight() { return inFlight; },
-    get calls() { return calls; },
-    dispatch(jobId: string) {
-      const agent = agentOf();
-      const job = agent.takeJob(jobId) as any;
-      // Null means it was already answered — a second dispatch of the same job
-      // must not call the provider again.
-      if (!job) return;
-      inFlight += 1;
-      calls += 1;
-      const identity = {
-        api: String(job.model?.api ?? "offloaded"),
-        provider: String(job.model?.provider ?? "openai-compatible"),
-        id: String(job.model?.id ?? MODEL_ID),
-      };
-      void (async () => {
-        try {
-          const { messages, tools } = toRequest(job.context);
-          const r = await model.complete(messages, tools ? { tools } : {});
-          agent.deliver(jobId, fromResponse(r, identity));
-        } catch (e: any) {
-          agent.deliver(jobId, errorMessage(String(e?.message ?? e).slice(0, 300), identity));
-        } finally { inFlight -= 1; }
-      })();
-    },
-  };
-}
 
 async function runOne(inst: Instance) {
   const t0 = Date.now();
@@ -206,7 +165,7 @@ async function runOne(inst: Instance) {
     }))).filter((t) => !OWNED_BY_THE_RUNNER.has(t.address));
 
   const holder: { agent?: PiAgent } = {};
-  const w = nodeWorker(() => holder.agent!);
+  const w = nodeWorker(model, () => holder.agent!, MODEL_ID);
   const agent = await PiAgent.open({
     host: sqliteHost(),
     sessionId: `${T}/${AGENT}`,
