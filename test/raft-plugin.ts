@@ -133,6 +133,12 @@ async function failure(fn: () => Promise<unknown>): Promise<Error & PluginErrorF
 const OWN = ["receive_events", "enable_push", "disable_push", "push_status"];
 const toolNamed = (name: string) => raftPlugin.tools.find((t) => t.name === name);
 const opNamed = (name: string) => RAFT_OPERATIONS.find((op) => op.name === name)!;
+/**
+ * A mount built with the download excluded again, as one whose table leaves it out would be: the path where a message
+ * line's attachment suffix is put in words (`modelLine`) and a hint at the download is said, not named.
+ */
+const WITHOUT_DOWNLOAD: Readonly<Record<string, string>> = { ...EXCLUDED, "attachments.downloadUrl": "left out here to exercise a mount that does not offer the download" };
+const noDownload = createRaftPlugin({ excluded: WITHOUT_DOWNLOAD });
 /** A context in the model's own turn: no fromProgram, and a context id. */
 const inTurn = (c: any, contextId = "ctx_turn") => ({ ...c, caller: { ...c.caller, contextId } });
 
@@ -164,7 +170,7 @@ await check("declares the inbox pull as a model-only write that repeats safely, 
  */
 const EXPECTED_GENERATED = [
   "identity.whoami", "inbox.list", "messages.read", "messages.send", "messages.reply", "messages.search", "messages.resolve",
-  "messages.react", "messages.unreact", "attachments.comments", "mentions.pending", "mentions.notify", "mentions.delivery",
+  "messages.react", "messages.unreact", "attachments.downloadUrl", "attachments.comments", "mentions.pending", "mentions.notify", "mentions.delivery",
   "mentions.deliveries", "actions.prepare",
   "manual.get", "manual.search", "tasks.claim", "tasks.list", "tasks.create", "tasks.unclaim", "tasks.assign", "tasks.unassign",
   "tasks.updateStatus", "tasks.amend", "tasks.history", "tasks.show", "tasks.convert", "channels.join", "channels.leave",
@@ -282,7 +288,10 @@ await check("the manifest's declarations map onto the tool: side effect, model-o
     if ((t.modelOnly === true) !== op.modelOnly) throw new Error(`${op.name}: modelOnly ${t.modelOnly}`);
     const want = { natural: "native", key: "key", none: "none" }[op.idempotency.kind];
     if (t.idempotency !== want) throw new Error(`${op.name}: idempotency ${t.idempotency}`);
-    if (!t.summary.startsWith(op.description.slice(0, 12))) throw new Error(`${op.name}: description ${t.summary}`);
+    // The download's manifest text is about the URL Raft mints, which this mount fetches and never shows: its own words, below.
+    if (op.name === "attachments.downloadUrl") {
+      if (!/^Download an attachment .* into this agent's storage, up to 25 MiB: returns an artifact reference/.test(t.summary) || /URL|url/.test(t.summary)) throw new Error(`${op.name}: description ${t.summary}`);
+    } else if (!t.summary.startsWith(op.description.slice(0, 12))) throw new Error(`${op.name}: description ${t.summary}`);
     const props = Object.keys((t.parameters as any).properties ?? {});
     if (JSON.stringify(props) !== JSON.stringify(Object.keys(op.inputSchema.properties ?? {}))) throw new Error(`${op.name}: parameters ${props.join()}`);
     if (JSON.stringify((t.parameters as any).required ?? null) !== JSON.stringify(op.inputSchema.required ?? null)) throw new Error(`${op.name}: required`);
@@ -713,21 +722,40 @@ await check("a message line never points at a CLI command this mount lacks, and 
   ], { last_seen_seq: 2 }));
   const out = await raftPlugin.invoke("receive_events", {}, m.ctx) as any;
   const [withFile, cut] = out.messages as string[];
-  if (/raft attachment view/.test(withFile!) || !/1 attachment: plan\.pdf — this mount has no tool to open attachments\]$/.test(withFile!)) {
+  // As built the download is offered, so the SDK's pointer at it is kept as the SDK wrote it, once.
+  if (/raft attachment view/.test(withFile!) || /no tool to open attachments/.test(withFile!) || (withFile!.match(/\[1 attachment/g) ?? []).length !== 1 ||
+      !/@t: see file \[1 attachment: plan\.pdf \(id:att-1\) — use attachments_download_url\(\{ attachmentId: "att-1" \}\) to download\]$/.test(withFile!)) {
     throw new Error(`attachment line: ${withFile}`);
   }
   if (!/content left out by Raft: too large/.test(cut!)) throw new Error(`a left-out body read as an empty message: ${cut}`);
-  // An attachment on a task: the CLI puts the task suffix after the attachment's, so the attachment's is
-  // not last. It must be replaced where it stands, once, with nothing of the CLI's left.
-  const t = mount();
+  // A mount that does not offer the download: the suffix names the attachment and says there is no tool, nothing of the SDK's left.
+  const n = mount();
   one(events([
+    { id: "m-6aaaaaa", seq: 1, content: "see file", sender_type: "human", sender_name: "t", channel_name: "g", channel_type: "channel",
+      attachments: [{ id: "att-1", filename: "plan.pdf" }] },
+  ], { last_seen_seq: 1 }));
+  const [without] = ((await noDownload.invoke("receive_events", {}, n.ctx)) as any).messages as string[];
+  if (/raft attachment view|attachments_download_url|att-1/.test(without!) || !/@t: see file \[1 attachment: plan\.pdf — this mount has no tool to open attachments\]$/.test(without!)) {
+    throw new Error(`attachment line without the download: ${without}`);
+  }
+  // An attachment on a task: the CLI puts the task suffix after the attachment's, so the attachment's is
+  // not last. Without the download it must be replaced where it stands, once, with nothing of the CLI's left;
+  // with it, the SDK's stands where it is.
+  const task = () => one(events([
     { id: "m-8aaaaaa", seq: 3, content: "hi", sender_type: "human", sender_name: "t", channel_name: "g", channel_type: "channel",
       attachments: [{ id: "a1", filename: "f.png" }], task_number: 7, task_status: "todo" },
   ], { last_seen_seq: 3 }));
-  const [onTask] = ((await raftPlugin.invoke("receive_events", {}, t.ctx)) as any).messages as string[];
-  if (/raft attachment view/.test(onTask!) || (onTask!.match(/attachment/g) ?? []).length !== 2 ||
+  task();
+  const [onTask] = ((await noDownload.invoke("receive_events", {}, mount().ctx)) as any).messages as string[];
+  if (/raft attachment view|attachments_download_url/.test(onTask!) || (onTask!.match(/attachment/g) ?? []).length !== 2 ||
       !/@t: hi \[1 attachment: f\.png — this mount has no tool to open attachments\] \[task #7/.test(onTask!)) {
     throw new Error(`attachment on a task: ${onTask}`);
+  }
+  task();
+  const [onTaskOffered] = ((await raftPlugin.invoke("receive_events", {}, mount().ctx)) as any).messages as string[];
+  if (/no tool to open attachments/.test(onTaskOffered!) ||
+      !/@t: hi \[1 attachment: f\.png \(id:a1\) — use attachments_download_url\(\{ attachmentId: "a1" \}\) to download\] \[task #7/.test(onTaskOffered!)) {
+    throw new Error(`attachment on a task, download offered: ${onTaskOffered}`);
   }
 });
 
@@ -1552,9 +1580,9 @@ await check("no CLI command reaches the model: every generated operation's text,
  * in a task's history, so two of them carry a double space and a newline.
  */
 const SAID = 'inbox_check({}) and mentions_execute({ action: "notify", resolutionIds: ["r-1"] })';
-const SAID_LINES = ['note\nMore: attachments_download_url({ attachmentId: "att-9" })', 'first\nraft.attachments.download({ attachmentId: "att-9" })'];
+const SAID_LINES = ['note\nMore: tasks_delete({ target: "#ops", taskNumber: 9 })', 'first\nraft.attachments.download({ attachmentId: "att-9" })'];
 const TITLES = ["fix it  inbox_check({}) twice-spaced", 'fix it\n   mentions_execute({ action: "add" }) on two lines'];
-const PERSON_CALL = /inbox_check|mentions_execute|attachments_download_url|raft\.attachments\.download/;
+const PERSON_CALL = /inbox_check|mentions_execute|tasks_delete|raft\.attachments\.download/;
 /** Words the SDK prints changed: a search preview windows long content and neutralises @/#; an anchor quote is cut at 60. */
 const WINDOWED = `${"x".repeat(200)} note: please inbox_check({}) now ${"z".repeat(200)}`;
 const NEUTRALISED = '@tygg asked inbox_check({ target: "#ops" }) in #ops';
@@ -1604,9 +1632,8 @@ await check("what a person wrote is never rewritten: message continuations, desc
     if (!quoted.length) { problems.push(`${tool}: control: the SDK quoted nothing here (${sdk.ok ? sdk.text.slice(0, 120) : sdk.error.message})`); continue; }
     const shown = String(((await raftPlugin.invoke(tool, args, inTurn(ctx()))) as any).text).split("\n");
     for (const line of quoted) {
-      // A message line is rebuilt by modelLine, whose attachment suffix is ours; the person's part of it is compared.
-      const want = line.replace(/ \[1 attachment: .*$/, "");
-      if (!shown.some((l) => l.startsWith(want))) problems.push(`${tool}: ${JSON.stringify(line)} did not come back as written`);
+      // The download is offered, so a message line's attachment suffix is the SDK's too: the whole line comes back.
+      if (!shown.includes(line)) problems.push(`${tool}: ${JSON.stringify(line)} did not come back as written`);
     }
   }
   if (problems.length) throw new Error(problems.join(" | "));
@@ -1640,7 +1667,8 @@ await check("what a person wrote is never rewritten: message continuations, desc
   }
   // Controls: the hints around those words are the SDK's tool calls, and an admin write points at an action card.
   const page = String(((await raftPlugin.invoke("messages_read", { target: "#ops" }, inTurn(ctx()))) as any).text);
-  if (!/^Older exist: messages_read\(\{ target: "#ops", before: 41 \}\)$/m.test(page) || !/this mount has no tool to open attachments\]/.test(page)) throw new Error(`page: ${page}`);
+  if (!/^Older exist: messages_read\(\{ target: "#ops", before: 41 \}\)$/m.test(page) || /no tool to open attachments/.test(page) ||
+      !page.includes('[1 attachment: plan.pdf (id:att-9) — use attachments_download_url({ attachmentId: "att-9" }) to download]')) throw new Error(`page: ${page}`);
   const full = String(((await raftPlugin.invoke("server_info", { view: "full" }, inTurn(ctx()))) as any).text);
   if (!/^Server-profile changes have no tool and remain server-role gated: ask a human via an action card \(`actions_prepare`\)\.$/m.test(full)) throw new Error(`overview: ${full}`);
 });
@@ -1654,8 +1682,13 @@ await check("what a person wrote is never rewritten: message continuations, desc
  */
 const MARKS = ["0", "99", "0", "ab", "",
   "ttachments_download_url({ id: 1 })", "tasks_delete({})", "tasks_delete({})"];
-/** A tool name this mount does not offer, where `offeredTerms` would see one (its `unofferedPattern`). */
-const UNOFFERED_AT = new RegExp(`(?<![\\w.])(?:${NOT_OFFERED.join("|")})(?![\\w])`, "g");
+/**
+ * The tool names a mount built with `WITHOUT_DOWNLOAD` does not offer. The marks below need one starting with a letter an
+ * escape could write (`attachments_download_url`), which the table as built no longer excludes.
+ */
+const NOT_OFFERED_WITHOUT_DOWNLOAD = RAFT_OPERATIONS.filter((op) => Object.hasOwn(WITHOUT_DOWNLOAD, op.name)).map((op) => op.toolName);
+/** A tool name such a mount does not offer, where `offeredTerms` would see one (its `unofferedPattern`). */
+const UNOFFERED_AT = new RegExp(`(?<![\\w.])(?:${NOT_OFFERED_WITHOUT_DOWNLOAD.join("|")})(?![\\w])`, "g");
 
 await check("a person's text shaped as offeredTerms' placeholder comes back byte-identical: messages_read, tasks_list, a search preview", async () => {
   // Each mark in its own message, title and result, so one person's call nearby cannot set aside another's mark.
@@ -1683,8 +1716,10 @@ await check("a person's text shaped as offeredTerms' placeholder comes back byte
     const lines = sdk.split("\n").filter((l) => / end$/.test(l) && l.includes("marks"));
     const missing = MARKS.filter((m) => !lines.some((l) => l.includes(` ${m} end`)));
     if (missing.length) { problems.push(`${tool}: control: the SDK did not print ${JSON.stringify(missing)}`); continue; }
-    const shown = String(((await raftPlugin.invoke(tool, args, inTurn(ctx()))) as any).text).split("\n");
-    for (const line of lines) if (!shown.includes(line)) problems.push(`${tool}: ${JSON.stringify(line)} came back otherwise`);
+    for (const [built, plugin] of [["as built", raftPlugin], ["without the download", noDownload]] as const) {
+      const shown = String(((await plugin.invoke(tool, args, inTurn(ctx()))) as any).text).split("\n");
+      for (const line of lines) if (!shown.includes(line)) problems.push(`${tool} (${built}): ${JSON.stringify(line)} came back otherwise`);
+    }
   }
   if (problems.length) throw new Error(problems.join(" | "));
   // Directly, with nothing set aside and with a quoted form set aside: byte-identical either way, and a hint still in
@@ -1694,7 +1729,7 @@ await check("a person's text shaped as offeredTerms' placeholder comes back byte
       const quoted = [...(m.match(UNOFFERED_AT) ? [m] : []), ...extra];
       // The hint is not the person's call, which a quoted form would leave alone (`offeredTerms`).
       const text = `run inbox_check({}) now\n${m}\nnext: inbox_check({ limit: 5 })`;
-      const out = offeredTerms(text, new Set(NOT_OFFERED), quoted);
+      const out = offeredTerms(text, new Set(NOT_OFFERED_WITHOUT_DOWNLOAD), quoted);
       if (out !== `${extra.length ? "run inbox_check({}) now" : "run receive_events() now"}\n${m}\nnext: receive_events()`) throw new Error(JSON.stringify(out));
     }
   }
@@ -2648,7 +2683,7 @@ await check("through run_js and the gateway, a send held in a program whose ques
 });
 
 /** The tool names a hint may carry that this mount does not offer, and the SDK's code-only form. */
-const UNOFFERED_NAMES = /(?<![\w.])(?:inbox_check|inbox_drain|inbox_commit|mentions_add|mentions_execute|profile_update|tasks_delete|attachments_download_url|raft\.[a-z]+\.[A-Za-z]+)(?![\w])/;
+const UNOFFERED_NAMES = /(?<![\w.])(?:inbox_check|inbox_drain|inbox_commit|mentions_add|mentions_execute|profile_update|tasks_delete|raft\.[a-z]+\.[A-Za-z]+)(?![\w])/;
 const PENDING_ID = "0b7c3a1e-1111-4222-8333-944455556666";
 
 await check("no hint reaches the model naming a tool this mount does not offer; the SDK's own tool hints do name them", async () => {
@@ -2669,7 +2704,11 @@ await check("no hint reaches the model naming a tool this mount does not offer; 
     if (UNOFFERED_NAMES.test(shown)) leaks.push(`${op.toolName}: ${shown.match(new RegExp(`.{0,60}${UNOFFERED_NAMES.source}.{0,60}`))?.[0]}`);
   }
   if (leaks.length) throw new Error(`a tool this mount does not offer reached the model: ${leaks.join(" | ")}`);
-  for (const want of ["messages_read", "mentions_pending"]) if (!named.includes(want)) throw new Error(`control: the SDK named no unoffered tool in ${want} (named: ${named.join(", ")})`);
+  if (!named.includes("mentions_pending")) throw new Error(`control: the SDK named no unoffered tool in mentions_pending (named: ${named.join(", ")})`);
+  // The SDK's hint at the attachment download names a tool this mount offers, so it reaches the model as the SDK wrote it.
+  const page = await shownBy("messages_read", { target: "#ops" });
+  if (!page.includes(`[1 attachment: plan.pdf (id:att-9) — use attachments_download_url({ attachmentId: \\"att-9\\" }) to download]`) ||
+      /no tool to open attachments/.test(page)) throw new Error(`messages_read: ${page}`);
   const pending = await shownBy("mentions_pending", {});
   // Since 0.11.0 the SDK writes notify as mentions_notify, which this mount offers, and add as mentions_add, which it does not.
   if (!pending.includes(`  notify: mentions_notify({ resolutionIds: [\\"${PENDING_ID}\\"] })`) ||
@@ -2844,29 +2883,32 @@ await check("a Server that cannot mint a URL (CONFLICT) is answered by the binar
   if (!/does not exist or is not visible/.test(nf.message)) throw new Error(`not found: ${nf.message}`);
 });
 
-await check("offering the attachment download is the one line in EXCLUDED: without it the tool is generated, offered, described and run", async () => {
-  // The line itself: one entry, on one line, with the reason.
+await check("the attachment download is offered: not in EXCLUDED, so as built the tool is generated, offered, described and run, and a table that excludes it takes all of that back", async () => {
+  // Not in the table: no entry in the source, none in the table as built.
   const source = readFileSync(new URL("../src/plugins/raft.ts", import.meta.url), "utf8").split("\n");
   const lines = source.filter((l) => l.includes('"attachments.downloadUrl":'));
-  if (lines.length !== 1 || !/Raft production does not serve this route yet \(Raft #8881\); enable when it does/.test(lines[0]!)) throw new Error(JSON.stringify(lines));
-  // As built: excluded, so not offered, and a message line says there is no tool for attachments.
-  if (toolNamed("attachments_download_url") || !EXCLUDED["attachments.downloadUrl"]) throw new Error("offered while excluded");
-  // Built without that entry, and nothing else changed.
-  const { ["attachments.downloadUrl"]: _gone, ...enabled } = EXCLUDED;
-  const store = fakeArtifacts();
-  const plugin = createRaftPlugin({ excluded: enabled, artifacts: store });
-  const tool = plugin.tools.find((t) => t.name === "attachments_download_url");
-  if (!tool || !plugin.mountTools!({ toolSnapshot: null } as any).some((t) => t.name === "attachments_download_url")) throw new Error("not offered");
+  if (lines.length !== 0 || Object.hasOwn(EXCLUDED, "attachments.downloadUrl")) throw new Error(`excluded: ${JSON.stringify(lines)}`);
+  // As built: generated, among the plugin's tools, and offered to a mount with no snapshot.
+  if (!GENERATED.some((op) => op.name === "attachments.downloadUrl")) throw new Error("not generated");
+  const tool = toolNamed("attachments_download_url");
+  if (!tool || !raftPlugin.mountTools!({ toolSnapshot: null } as any).some((t) => t.name === "attachments_download_url")) throw new Error("not offered");
   if (/URL|url/.test(tool.summary) || !/artifact reference/.test(tool.summary)) throw new Error(`description: ${tool.summary}`);
+  // Run with the real table, only the storage given: the file is kept and the model gets its reference, never the URL.
+  const store = fakeArtifacts();
+  const plugin = createRaftPlugin({ artifacts: store });
   attachmentServer();
   const out: any = await plugin.invoke("attachments_download_url", { attachmentId: "att-1" }, inTurn(ctx()));
-  if (out.ref !== "artifact://raft/attachments/att-1/plan.pdf" || JSON.stringify(out).includes("storage.example")) throw new Error(JSON.stringify(out));
-  // And its message lines keep the SDK's pointer at the tool, which it now has.
+  if (out.ref !== "artifact://raft/attachments/att-1/plan.pdf" || JSON.stringify(out).includes("storage.example") || store.puts.length !== 1) throw new Error(JSON.stringify(out));
+  // Its message lines keep the SDK's pointer at the tool, untouched.
   globalThis.fetch = (async () => history([historyMessage(41, "see", { attachments: [{ id: "att-1", filename: "plan.pdf" }] })], { target: "#ops" })) as any;
-  const page = String(((await plugin.invoke("messages_read", { target: "#ops" }, inTurn(ctx()))) as any).text);
-  if (!page.includes('use attachments_download_url({ attachmentId: "att-1" }) to download]')) throw new Error(page);
-  const asBuilt = String(((await raftPlugin.invoke("messages_read", { target: "#ops" }, inTurn(ctx()))) as any).text);
-  if (!asBuilt.includes("[1 attachment: plan.pdf — this mount has no tool to open attachments]")) throw new Error(asBuilt);
+  const page = String(((await raftPlugin.invoke("messages_read", { target: "#ops" }, inTurn(ctx()))) as any).text);
+  if (!page.includes('@tygg: see [1 attachment: plan.pdf (id:att-1) — use attachments_download_url({ attachmentId: "att-1" }) to download]') ||
+      /no tool to open attachments/.test(page)) throw new Error(page);
+  // Control: a table that excludes it again neither generates nor offers it, and its message lines say there is no tool.
+  if (noDownload.tools.some((t) => t.name === "attachments_download_url") ||
+      noDownload.mountTools!({ toolSnapshot: null } as any).some((t) => t.name === "attachments_download_url")) throw new Error("offered while excluded");
+  const without = String(((await noDownload.invoke("messages_read", { target: "#ops" }, inTurn(ctx()))) as any).text);
+  if (!without.includes("@tygg: see [1 attachment: plan.pdf — this mount has no tool to open attachments]") || /attachments_download_url/.test(without)) throw new Error(without);
 });
 
 await check("server_info takes query (SDK 0.10.0) and keeps its paging cap", async () => {
