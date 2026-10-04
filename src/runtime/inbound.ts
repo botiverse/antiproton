@@ -33,7 +33,7 @@ export const INBOUND_DEDUPE_MS = 24 * 60 * 60_000;
 /** How long the per-hook record is kept at all. */
 export const INBOUND_KEEP_MS = 7 * 24 * 60 * 60_000;
 
-export type InboundOutcome = "delivered" | "ignored" | "rejected" | "malformed" | "duplicate" | "rate_limited" | "too_large" | "failed";
+export type InboundOutcome = "accepted" | "delivered" | "ignored" | "rejected" | "malformed" | "duplicate" | "rate_limited" | "too_large" | "failed";
 
 /**
  * The request body, or a refusal once it passes `max` bytes. A declared length
@@ -90,7 +90,7 @@ export function inboundMessage(alias: string, text: string): string {
  */
 export function inboundStatus(outcome: InboundOutcome): number {
   switch (outcome) {
-    case "delivered": case "ignored": case "duplicate": return 202;
+    case "accepted": case "delivered": case "ignored": case "duplicate": return 202;
     case "rejected": return 401;
     case "malformed": return 400;
     case "too_large": return 413;
@@ -104,25 +104,189 @@ const TABLE = `CREATE TABLE IF NOT EXISTS inbound_events (
   outcome TEXT NOT NULL, reason TEXT, dedupe_key TEXT)`;
 const INDEX = `CREATE INDEX IF NOT EXISTS inbound_events_by_hook ON inbound_events(hook_id, received_at)`;
 
+/**
+ * Accepted pushes the agent has not been handed yet, oldest first: an outbox
+ * in the shape of src/usage/outbox.ts (an AUTOINCREMENT `seq`, appended next to
+ * the work, drained in order by the alarm pass, a row deleted once settled).
+ *
+ * The hook is answered once a push is verified, deduplicated, rate-checked and
+ * written here; the message is posted afterwards by the object's alarm pass
+ * (`AgentRuntime.deliverPendingInbound`), because opening the harness and
+ * posting cost the waiting service most of a second. A row survives eviction,
+ * so work promised by an answer already sent is never held only in memory.
+ *
+ * `inbound_events` stays append-only and holds final outcomes: a push gets its
+ * `delivered` or `failed` row there when it leaves this table, under its
+ * original arrival time. Until then this row is its record — `recentInbound`
+ * shows it as `accepted` — and it holds the key (`seenBefore`) and counts
+ * against the rate (`underRate`).
+ *
+ * `state` is `queued`, or `posting` from the moment the message is handed to
+ * the engine until the row is settled; `attempts` counts passes that started
+ * on the row, `next_at` is when it may be tried again, `last_error` why the
+ * last try threw. One row per key: `UNIQUE(hook_id, dedupe_key)` makes a
+ * second row for a key an error rather than a second delivery, and a retry
+ * updates its own row. Every row has a key; a push whose plugin names none
+ * is given one of its own (`acceptInbound`), which nothing else can repeat.
+ */
+const PENDING = `CREATE TABLE IF NOT EXISTS inbound_pending (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT, hook_id TEXT NOT NULL, alias TEXT NOT NULL, dedupe_key TEXT NOT NULL,
+  message TEXT NOT NULL, received_at INTEGER NOT NULL, state TEXT NOT NULL DEFAULT 'queued',
+  attempts INTEGER NOT NULL DEFAULT 0, next_at INTEGER NOT NULL DEFAULT 0, last_error TEXT,
+  UNIQUE(hook_id, dedupe_key))`;
+
+/**
+ * How long after its n-th failed attempt a queued push is tried again. Five attempts: the first, then one
+ * after each of these waits, 17.5 minutes from the first failure to the last; the fifth failure gives it
+ * up, and its record says `failed` with the reason. Long enough to outlast a deploy or a provider's bad
+ * minutes, short enough that a push nobody can post shows well inside the hour.
+ */
+export const INBOUND_RETRY_MS = [30_000, 2 * 60_000, 5 * 60_000, 10 * 60_000] as const;
+export const INBOUND_POST_ATTEMPTS = INBOUND_RETRY_MS.length + 1;
+
+/**
+ * The oldest a queued push may get before it is given up, wherever it stands in the queue. Order is
+ * strict, so while posting keeps failing every row waits behind the head's retries: without this a long
+ * outage would end with the agent reading notices hours old. A bound on age rather than "fail everything
+ * behind a head that was given up", because the pass cannot tell a failure that is about posting at all
+ * from one that is about the head's own message, and age needs no such judgement. Longer than the retry
+ * schedule (17.5 min), so a head always gets its five attempts.
+ */
+export const INBOUND_MAX_AGE_MS = 30 * 60_000;
+
+/**
+ * The most pushes one hook may have queued. Normally the queue empties within the second; it fills only
+ * while posting is failing, and past this the push is answered as the rate limit answers (429), so the
+ * service sees backpressure rather than a 202 the agent cannot honour.
+ */
+export const INBOUND_QUEUE_MAX = 30;
+
 export function ensureInboundTable(sql: SqlHost["sql"]) {
   sql.exec(TABLE);
   sql.exec(INDEX);
+  sql.exec(PENDING);
 }
 
-/** Whether this hook may deliver one more event now. Counts deliveries, not refusals. */
+export interface PendingInbound {
+  seq: number; hookId: string; alias: string; dedupeKey: string; message: string;
+  receivedAt: number; state: "queued" | "posting"; attempts: number; nextAt: number; lastError: string | null;
+}
+
+/**
+ * Accept one push: queue its message. This row is the claim on its key, so the caller writes it in the same
+ * synchronous run as `seenBefore` and `underRate` — no await between — and a second push with the same key,
+ * however close behind, finds the first already there.
+ */
+export function acceptInbound(sql: SqlHost["sql"], row: { hookId: string; alias: string; dedupeKey: string | null; message: string; now: number }) {
+  sql.exec("INSERT INTO inbound_pending(hook_id, alias, dedupe_key, message, received_at) VALUES (?, ?, ?, ?, ?)",
+    row.hookId, row.alias, row.dedupeKey ?? `${LOCAL_KEY}${crypto.randomUUID()}`, row.message, row.now);
+}
+
+/** The prefix of a key made here for a push its plugin named none for; such a key is never a duplicate of anything. */
+export const LOCAL_KEY = "local:";
+
+/** The oldest push not yet settled; arrival order is delivery order. */
+export function nextPendingInbound(sql: SqlHost["sql"]): PendingInbound | null {
+  return readPending(sql.exec(
+    "SELECT seq, hook_id, alias, dedupe_key, message, received_at, state, attempts, next_at, last_error FROM inbound_pending ORDER BY seq LIMIT 1",
+  ).toArray()[0]);
+}
+
+function readPending(r: any): PendingInbound | null {
+  return r ? {
+    seq: Number(r.seq), hookId: String(r.hook_id), alias: String(r.alias), dedupeKey: String(r.dedupe_key),
+    message: String(r.message), receivedAt: Number(r.received_at), state: r.state === "posting" ? "posting" : "queued",
+    attempts: Number(r.attempts), nextAt: Number(r.next_at), lastError: r.last_error === null ? null : String(r.last_error),
+  } : null;
+}
+
+/** Whether anything is queued, without creating the table where there has never been one. */
+export function hasPendingInbound(sql: SqlHost["sql"]): boolean {
+  try { return sql.exec("SELECT 1 AS hit FROM inbound_pending LIMIT 1").toArray().length > 0; }
+  catch { return false; }
+}
+
+/** Whether this hook already has `max` pushes queued. Read in the same synchronous run as the claim. */
+export function queueFull(sql: SqlHost["sql"], hookId: string, max: number = INBOUND_QUEUE_MAX): boolean {
+  return Number((sql.exec("SELECT COUNT(*) AS n FROM inbound_pending WHERE hook_id = ?", hookId).toArray()[0] as any)?.n ?? 0) >= max;
+}
+
+/** Queued pushes older than `INBOUND_MAX_AGE_MS`, oldest first, wherever they stand. */
+export function expiredPendingInbound(sql: SqlHost["sql"], now: number): number[] {
+  return (sql.exec("SELECT seq FROM inbound_pending WHERE received_at <= ? ORDER BY seq", now - INBOUND_MAX_AGE_MS).toArray() as any[])
+    .map((r) => Number(r.seq));
+}
+
+/** One queued row by its seq, or null when it is gone. */
+export function pendingInboundRow(sql: SqlHost["sql"], seq: number): PendingInbound | null {
+  return readPending(sql.exec(
+    "SELECT seq, hook_id, alias, dedupe_key, message, received_at, state, attempts, next_at, last_error FROM inbound_pending WHERE seq = ?", seq,
+  ).toArray()[0]);
+}
+
+export function pendingInboundCount(sql: SqlHost["sql"]): number {
+  return Number((sql.exec("SELECT COUNT(*) AS n FROM inbound_pending").toArray()[0] as any)?.n ?? 0);
+}
+
+/**
+ * A pass starts on this row: counted, and its next try set, before anything is tried, so a pass that dies
+ * mid-way is counted and waited out like one that threw.
+ */
+export function claimPendingInbound(sql: SqlHost["sql"], row: PendingInbound, now: number): PendingInbound {
+  const nextAt = now + INBOUND_RETRY_MS[Math.min(row.attempts, INBOUND_RETRY_MS.length - 1)]!;
+  sql.exec("UPDATE inbound_pending SET attempts = attempts + 1, next_at = ? WHERE seq = ?", nextAt, row.seq);
+  return { ...row, attempts: row.attempts + 1, nextAt };
+}
+
+/** The message is being handed to the engine: from here a pass that dies cannot know whether it landed. */
+export function markPostingInbound(sql: SqlHost["sql"], seq: number) {
+  sql.exec("UPDATE inbound_pending SET state = 'posting' WHERE seq = ?", seq);
+}
+
+/** The post threw, so it wrote nothing: back in the queue on its own row, with why. */
+export function requeueInbound(sql: SqlHost["sql"], seq: number, error: string) {
+  sql.exec("UPDATE inbound_pending SET state = 'queued', last_error = ? WHERE seq = ?", error.slice(0, 500), seq);
+}
+
+/**
+ * A push leaves the queue: its final record, under its arrival time and with its key, and the queued row
+ * gone, in one transaction, so the key is held by one or the other throughout.
+ */
+export function settleInbound(sql: SqlHost["sql"], transact: <T>(fn: () => T) => T, row: PendingInbound & {
+  tenantId: string; agentId: string; outcome: "delivered" | "failed"; reason?: string | null;
+}) {
+  transact(() => {
+    sql.exec("DELETE FROM inbound_pending WHERE seq = ?", row.seq);
+    recordInbound(sql, {
+      tenantId: row.tenantId, agentId: row.agentId, hookId: row.hookId, alias: row.alias,
+      outcome: row.outcome, reason: row.reason ?? null, dedupeKey: row.dedupeKey, now: row.receivedAt,
+    });
+  });
+}
+
+/**
+ * The final records that hold a key and count against the rate: a push delivered, and one accepted and
+ * then given up. A failure before acceptance — no secret, a plugin that threw — is recorded before the
+ * plugin has named a key, so it never holds one, and its redelivery is not a duplicate.
+ */
+const TAKEN = "(outcome = 'delivered' OR (outcome = 'failed' AND dedupe_key IS NOT NULL))";
+
+/** Whether this hook may deliver one more event now. Counts accepted pushes — queued, delivered or given up — not refusals. */
 export function underRate(sql: SqlHost["sql"], hookId: string, now: number, perMinute: number = INBOUND_PER_MINUTE): boolean {
   const row = sql.exec(
-    "SELECT COUNT(*) AS n FROM inbound_events WHERE hook_id = ? AND outcome = 'delivered' AND received_at > ?",
-    hookId, now - 60_000,
+    `SELECT (SELECT COUNT(*) FROM inbound_events WHERE hook_id = ? AND ${TAKEN} AND received_at > ?)` +
+    " + (SELECT COUNT(*) FROM inbound_pending WHERE hook_id = ? AND received_at > ?) AS n",
+    hookId, now - 60_000, hookId, now - 60_000,
   ).toArray()[0] as any;
   return Number(row?.n ?? 0) < perMinute;
 }
 
-/** Whether this key was already delivered on this hook within the window. */
+/** Whether this key was already accepted on this hook: queued now, or delivered or given up within the window. */
 export function seenBefore(sql: SqlHost["sql"], hookId: string, key: string, now: number): boolean {
   const row = sql.exec(
-    "SELECT 1 AS hit FROM inbound_events WHERE hook_id = ? AND dedupe_key = ? AND outcome = 'delivered' AND received_at > ? LIMIT 1",
-    hookId, key, now - INBOUND_DEDUPE_MS,
+    `SELECT 1 AS hit FROM inbound_events WHERE hook_id = ? AND dedupe_key = ? AND ${TAKEN} AND received_at > ?` +
+    " UNION ALL SELECT 1 FROM inbound_pending WHERE hook_id = ? AND dedupe_key = ? LIMIT 1",
+    hookId, key, now - INBOUND_DEDUPE_MS, hookId, key,
   ).toArray()[0];
   return !!row;
 }
@@ -139,7 +303,7 @@ export function seenBefore(sql: SqlHost["sql"], hookId: string, key: string, now
  */
 export function inboundVerdict(outcome: InboundOutcome): TraceVerdict {
   switch (outcome) {
-    case "delivered": case "ignored": case "duplicate": return "ok";
+    case "accepted": case "delivered": case "ignored": case "duplicate": return "ok";
     case "rejected": case "malformed": case "rate_limited": case "too_large": return "blocked";
     case "failed": return "failed";
   }
@@ -174,8 +338,12 @@ export function recordInbound(sql: SqlHost["sql"], row: {
 }
 
 export function recentInbound(sql: SqlHost["sql"], limit = 50) {
+  // A queued push has no final record yet; it reads as `accepted` until it has.
   return sql.exec(
-    "SELECT hook_id, received_at, alias, outcome, reason FROM inbound_events ORDER BY received_at DESC LIMIT ?", limit,
+    "SELECT hook_id, received_at, alias, outcome, reason FROM (" +
+    " SELECT hook_id, received_at, alias, outcome, reason FROM inbound_events" +
+    " UNION ALL SELECT hook_id, received_at, alias, 'accepted' AS outcome, last_error AS reason FROM inbound_pending" +
+    ") ORDER BY received_at DESC LIMIT ?", limit,
   ).toArray().map((r: any) => ({
     hookId: String(r.hook_id), receivedAt: Number(r.received_at), alias: String(r.alias),
     outcome: String(r.outcome) as InboundOutcome, reason: r.reason === null ? null : String(r.reason),

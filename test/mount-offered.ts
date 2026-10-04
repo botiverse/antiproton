@@ -453,7 +453,13 @@ async function hooked(w: Awaited<ReturnType<typeof runtimeWorld>>) {
   const made = await w.rt.createHookSecret("t", "a", "m", "hook-1");
   must(made.ok, `hook: ${show(made)}`);
   w.l.s.deliver = true;
-  return () => w.rt.receiveHook("t", "a", "m", "hook-1", { headers: {}, body: new Uint8Array([1]) });
+  // The answer, then the pass that posts what it queued (`deliverPendingInbound`), which is where the turn starts.
+  return async () => {
+    const r = await w.rt.receiveHook("t", "a", "m", "hook-1", { headers: {}, body: new Uint8Array([1]) });
+    const pass = await w.rt.deliverPendingInbound("t", "a");
+    must(pass.posted === (r.outcome === "delivered" ? 1 : 0) && pass.error === null, `the pass: ${show(pass)}`);
+    return r;
+  };
 }
 
 await check("an inbound push is answered at once: its turn starts the re-take without waiting, which still lands; a person's prompt waits", async () => {

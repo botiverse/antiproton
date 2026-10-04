@@ -106,6 +106,8 @@ await check("what a plugin delivers reaches the agent under the label that says 
   (rt as any).postMessage = async (_t: string, _a: string, text: string) => { posted.push(text); };
   const made = await (await grab("a", "p"))!.create();
   must((await rt.receiveHook("t", "a", "p", made.hookId, ev(made.secret))).outcome === "delivered", "not delivered");
+  must(posted.length === 0, `posted before the answer: ${posted.length}`);
+  must((await rt.deliverPendingInbound("t", "a")).posted === 1, "the queued push was not posted");
   // The event names the hook it arrived at, which the runtime resolved before the plugin saw it.
   must(arrivedAt.at(-1) === made.hookId, `the plugin saw hookId ${arrivedAt.at(-1)}, not the hook the delivery came to`);
   must(posted.length === 1 && /not by the user/.test(posted[0]!) && posted[0]!.endsWith("\nok"), `posted ${JSON.stringify(posted)}`);

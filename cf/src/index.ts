@@ -96,7 +96,8 @@ import { hashProviderToken, looksLikeProviderToken } from "./provider-token.ts";
 import { handleProvision, type ProvisionDeps, type ProvisionTool } from "./provision/handlers.ts";
 import { adoptProvisionedAgent, provisionTool, provisionPushStatus, PROVIDER_HOME, PROVISION_MOUNT_ALIAS } from "./provision/steps.ts";
 import { repairPush } from "./provision/handlers.ts";
-import { inboundStatus, lowerHeaders, newHookId, readCapped } from "../../src/runtime/inbound.ts";
+import { hasPendingInbound, inboundStatus, lowerHeaders, newHookId, readCapped } from "../../src/runtime/inbound.ts";
+import { forgetHookRoute, routeHook, type HookRoute, type RouteSource } from "./hook-route.ts";
 import { HTMX_SRC, staticAsset } from "./static.ts";
 import { clip, logEvent, routeOf, setLogSink } from "../../src/core/log.ts";
 import { callQueuedModel, choiceOf, operatorModelOf, planBinding } from "./model-request.ts";
@@ -2034,24 +2035,58 @@ export class AgentDO extends DurableObject<Env> {
     if (plan.bind) await rt.bindOperatorModel(tenantId, agentId, plan.choice);
   }
 
+  /**
+   * A push at one of this agent's hooks, answered once it is verified, deduplicated, rate-checked and queued
+   * (`AgentRuntime.receiveHook`). Everything else — the post, the harness it opens, provisioning and the
+   * model binding — is the alarm pass's (`#deliverInbound`), armed here before the answer leaves: the queue
+   * is durable and the alarm is, so an eviction after the answer loses neither. `ms` is this object's own
+   * share of the answer, for the worker's `http` line.
+   */
   async hookReceive(tenantId: string, agentId: string, alias: string, hookId: string,
-    event: { headers: Record<string, string>; body: Uint8Array } | null) {
+    event: { headers: Record<string, string>; body: Uint8Array } | null, routed: "cache" | "index" = "index") {
+    const started = Date.now();
     this.#claim(tenantId, agentId);
     return this.#busy("hookReceive", async () => {
       const rt = this.runtime();
-      const r = await rt.receiveHook(tenantId, agentId, alias, hookId, event);
-      if (r.outcome === "delivered") {
-        // An agent Raft made has the default mounts (provision/steps.ts), and gets one added since on its
-        // next wake, the way a console agent gets it when its page opens. Only what is missing is added.
-        const agent = await rt.store.loadAgent(tenantId, agentId);
-        if ((agent?.config as { provisionedBy?: unknown } | undefined)?.provisionedBy === "raft") {
-          await rt.provision(tenantId, agentId);
-          await this.#bindModel(rt, tenantId, agentId, { onlyIfStale: true });
+      const r = await rt.receiveHook(tenantId, agentId, alias, hookId, event, routed);
+      if (r.outcome === "delivered") await this.#wake();
+      return { ...r, path: "deferred" as const, ms: Date.now() - started };
+    });
+  }
+
+  /**
+   * The deferred half of a push (`hookReceive`), from the alarm pass, before the step: the step then drives
+   * the turn the post started. Provisioning and the model binding go first, once in a pass that posts rather
+   * than once per push, so the turn is built with what they add; neither may stop the post, which the
+   * service was already told about.
+   */
+  async #deliverInbound(tenantId: string, agentId: string) {
+    // Asked of the table itself, before any runtime is built: most passes have nothing queued, and an
+    // object that never had a hook has no table and should not be given one.
+    if (!hasPendingInbound(this.sql as any)) return;
+    const rt = this.runtime();
+    await rt.ready();
+    const started = Date.now();
+    const out = await rt.deliverPendingInbound(tenantId, agentId, {
+      // Only when a row is about to be posted, never in a pass that only waits out a retry.
+      beforeFirstPost: async () => {
+        try {
+          // An agent Raft made has the default mounts (provision/steps.ts), and gets one added since on its
+          // next wake, the way a console agent gets it when its page opens. Only what is missing is added.
+          const agent = await rt.store.loadAgent(tenantId, agentId);
+          if ((agent?.config as { provisionedBy?: unknown } | undefined)?.provisionedBy === "raft") {
+            await rt.provision(tenantId, agentId);
+            await this.#bindModel(rt, tenantId, agentId, { onlyIfStale: true });
+          }
+        } catch (e: any) {
+          console.warn(`provisioning before a push for ${agentId} failed: ${String(e?.message ?? e).slice(0, 200)}`);
         }
-        await this.#wake();
-        await this.broadcast();
-      }
-      return r;
+      },
+    });
+    if (out.retryInMs !== null) await this.#wake(Date.now() + out.retryInMs);
+    logEvent("hook.deliver", {
+      tenantId, agentId, ms: Date.now() - started, posted: out.posted, failed: out.failed, left: out.left,
+      waitedMs: out.waitedMs ?? undefined, retryInMs: out.retryInMs ?? undefined, error: out.error ?? undefined,
     });
   }
 
@@ -2383,6 +2418,7 @@ export class AgentDO extends DurableObject<Env> {
         if (!who) { await this.ctx.storage.deleteAlarm(); return; }
         // A start without its end, below, is a pass that was cut short (a deploy cancels one).
         logEvent("alarm.start", { tenantId: who.tenantId, agentId: who.agentId, failures });
+        await this.#deliverInbound(who.tenantId, who.agentId);
         const out = await rt.step(who.tenantId, who.agentId);
         // A container that could not be handed back is billed for merely
         // existing, so it is written down where diagnose can find it rather
@@ -2939,32 +2975,57 @@ async function inboundHook(request: Request, env: Env, url: URL): Promise<Respon
   const hookId = url.pathname.slice("/hooks/".length);
   if (!/^[A-Za-z0-9_-]{43}$/.test(hookId)) return new Response(null, { status: 404 });
   if (request.method !== "POST") return new Response(null, { status: 405, headers: { allow: "POST" } });
-  const hook = await d1InboundHooks(env.CONTROL_DB).lookup(hookId);
-  if (!hook) return new Response(null, { status: 404 });
+  const dir = d1InboundHooks(env.CONTROL_DB);
+  const found = await routeHook(dir, url.origin, hookId);
+  if (!found) return hookAnswer(new Response(null, { status: 404 }), { lookup: "index" });
   const read = await readCapped(request);
   const event = read.ok ? { headers: lowerHeaders(request.headers), body: read.body } : null;
-  // A fresh stub each try: Cloudflare can move the object mid-request ("object has moved to a different
-  // machine", seen when four copies of one Raft notice arrived from different edges at once, 2026-09-30),
-  // and says so with `retryable`. One more try reaches it where it now is; a delivery is deduplicated by
-  // its id, so a try that landed before the move is not delivered twice.
-  const deliver = () => env.AGENT.get(env.AGENT.idFromName(agentObjectName(hook.tenantId, hook.agentId)))
-    .hookReceive(hook.tenantId, hook.agentId, hook.alias, hookId, event);
-  let r: Awaited<ReturnType<typeof deliver>>;
-  try {
-    r = await deliver();
-  } catch (e) {
-    if (!objectMoved(e)) throw e;
+  const reach = async (route: HookRoute, routed: "cache" | "index") => {
+    // A fresh stub each try: Cloudflare can move the object mid-request ("object has moved to a different
+    // machine", seen when four copies of one Raft notice arrived from different edges at once, 2026-09-30),
+    // and says so with `retryable`. One more try reaches it where it now is; a delivery is deduplicated by
+    // its id, so a try that landed before the move is not delivered twice.
+    const deliver = () => env.AGENT.get(env.AGENT.idFromName(agentObjectName(route.tenantId, route.agentId)))
+      .hookReceive(route.tenantId, route.agentId, route.alias, hookId, event, routed);
     try {
-      r = await deliver();
-    } catch (again) {
-      if (!objectMoved(again)) throw again;
-      // Still moving: say "try again" (503), which the sender retries, rather than a 500.
-      return Response.json({ outcome: "unavailable" }, { status: 503, headers: { "retry-after": "1" } });
+      return await deliver();
+    } catch (e) {
+      if (!objectMoved(e)) throw e;
+      try {
+        return await deliver();
+      } catch (again) {
+        if (!objectMoved(again)) throw again;
+        return null;
+      }
     }
+  };
+  const objectStarted = Date.now();
+  let lookup: RouteSource | "index-again" = found.from;
+  let r = await reach(found.route, found.from === "index" ? "index" : "cache");
+  if (r && "unrouted" in r && r.unrouted) {
+    // The object has no secret for a hook the cache routed: revoked since, most likely. The index decides,
+    // as it did before there was a cache.
+    await forgetHookRoute(url.origin, hookId);
+    const again = await routeHook(dir, url.origin, hookId);
+    if (!again) return hookAnswer(new Response(null, { status: 404 }), { lookup: "index-again" });
+    lookup = "index-again";
+    r = await reach(again.route, "index");
   }
-  return Response.json({ outcome: r.outcome }, { status: inboundStatus(r.outcome) });
+  const timing = { lookup, path: r && "path" in r ? r.path : undefined, objectMs: Date.now() - objectStarted, doMs: r && "ms" in r ? r.ms : undefined };
+  // Still moving: say "try again" (503), which the sender retries, rather than a 500.
+  if (!r) return hookAnswer(Response.json({ outcome: "unavailable" }, { status: 503, headers: { "retry-after": "1" } }), timing);
+  return hookAnswer(Response.json({ outcome: r.outcome }, { status: inboundStatus(r.outcome) }), timing);
 }
 
+/**
+ * What a hook's `http` line carries beyond the common fields (`observed`): where the route came from and
+ * which path the object took, so production can be compared across the change that deferred the post.
+ */
+const hookLines = new WeakMap<Response, Record<string, unknown>>();
+function hookAnswer(res: Response, fields: Record<string, unknown>): Response {
+  hookLines.set(res, fields);
+  return res;
+}
 
 /**
  * `/admin/hooks`, automation token only, until the console has a page:
@@ -4343,7 +4404,7 @@ async function observed(request: Request, handle: () => Promise<Response>): Prom
     logEvent("http", { ...line, status: 500, ms: Date.now() - started, error: String((e as { message?: unknown })?.message ?? e).slice(0, 200) });
     throw e;
   }
-  logEvent("http", { ...line, status: res.status, ms: Date.now() - started });
+  logEvent("http", { ...line, ...hookLines.get(res), status: res.status, ms: Date.now() - started });
   if (res.status === 101 || (res as { webSocket?: unknown }).webSocket) return res;
   const out = new Response(res.body, res);
   out.headers.set("x-request-id", requestId);
