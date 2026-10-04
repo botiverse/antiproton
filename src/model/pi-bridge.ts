@@ -154,7 +154,7 @@ function usageOf(res: ModelResponse): Usage {
  * "the field is still there when it is read back" is said by the type, not
  * only by the test that reads the stored entry.
  */
-export type AnsweredMessage = AssistantMessage & { jobId?: string };
+export type AnsweredMessage = AssistantMessage & { jobId?: string; providerError?: string };
 
 /**
  * `jobId` is the trace spine's one durable link from an answer back to the
@@ -214,6 +214,17 @@ export function fromResponse(
     timestamp: Date.now(),
     ...(jobId ? { jobId } : {}),
   };
+}
+
+/**
+ * The text a failed answer shows a reader: the provider's own refusal when it carries one (`providerError`,
+ * set for a refused request by `callQueuedModel`, cf/src/model-request.ts), else its `errorMessage`. The two
+ * are apart because the harness's retry check scans `errorMessage` and must never see provider text
+ * (src/model/openai-compatible.ts, `ModelRequestRefused`); every reader that shows a failed turn reads this.
+ */
+export function failureText(m: { errorMessage?: unknown; providerError?: unknown } | undefined): string | undefined {
+  if (typeof m?.providerError === "string" && m.providerError) return m.providerError;
+  return typeof m?.errorMessage === "string" ? m.errorMessage : undefined;
 }
 
 export function errorMessage(

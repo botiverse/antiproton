@@ -39,26 +39,42 @@ const REFUSAL_DETAIL_CHARS = 300;
  * job as a failed turn by the queue consumer (`callQueuedModel`, cf/src/model-request.ts) instead of going
  * back to the queue.
  *
- * The message carries the status and the provider's own explanation, so the turn says what to fix. It is
- * built from the response body only, never its headers; the request's own credentials are blanked in it,
- * and so is anything shaped like a key or a bearer token, since an auth refusal can quote what it was sent.
- * The wording does not match pi-ai's retryable-error patterns (`isRetryableAssistantError`,
- * `utils/retry.js`), so neither engine's harness retries the failed turn either; test/model-refusal.ts
- * checks that against both pi-ai versions.
+ * Two texts, kept apart on purpose. `message` is fixed: it is what becomes the answer's `errorMessage`, and
+ * both engines' harnesses decide whether to retry a failed turn by scanning that string for patterns such as
+ * `timeout`, `500` or `server error` (pi-ai's `isRetryableAssistantError`, `utils/retry.js`). A provider's
+ * own text can contain any of them — "In context=('properties', 'timeout')" in a tool schema, or
+ * "messages[502]" — and was read as retryable by both pi-ai versions, so pd dispatched the job again. No
+ * provider text is ever in `message`; it holds only the status, which is never a retryable one here.
+ *
+ * `turnError` is what the turn shows: the status and the provider's own explanation, so it says what to fix.
+ * It travels beside `errorMessage` on the answer (`providerError`, src/model/pi-bridge.ts), which no retry
+ * check reads. It is built from the response body only, never its headers; the request's own credentials
+ * are blanked in it (exact values only), and so is anything shaped like a key or a bearer token, since an
+ * auth refusal can quote what it was sent.
  */
 export class ModelRequestRefused extends Error {
   readonly status: number;
   /** The provider's error message, redacted and truncated. */
   readonly detail: string;
+  /** The status and `detail`, and `hint` when one was given: the turn's error. */
+  readonly turnError: string;
   readonly permanent = true;
-  constructor(status: number, body: string, secrets: string[] = []) {
-    const detail = refusalDetail(body, secrets);
-    super(`the model provider refused the request (HTTP ${status})${detail ? `: ${detail}` : ""}`);
+  constructor(status: number, body: string, secrets: string[] = [], hint?: string) {
+    super(`model refused (HTTP ${status}, permanent): see the turn's error`);
     this.name = "ModelRequestRefused";
     this.status = status;
-    this.detail = detail;
+    this.detail = refusalDetail(body, secrets);
+    this.turnError = `the model provider refused the request (HTTP ${status})${this.detail ? `: ${this.detail}` : ""}${hint ? ` ${hint}` : ""}`;
   }
 }
+
+/**
+ * Said with a 401 when the request carried no key of ours for a `vendor/model` name, so the gateway supplied
+ * the vendor's credential itself. An id the vendor does not have comes back that way too, not as a 404:
+ * `openai/gpt-nonexistent-rev749` through Cloudflare AI Gateway answered 401 "You didn't provide an API
+ * key" (measured 2026-10-04), which points at auth when the name is what is wrong.
+ */
+export const GATEWAY_401_HINT = "(through the gateway, an unknown model id also comes back as 401; check the model name)";
 
 function refusalDetail(body: string, secrets: string[]): string {
   let text = body;
@@ -185,7 +201,9 @@ export class OpenAiCompatibleModel implements ModelAdapter {
         if (!res.ok) {
           const body = await res.text();
           if (isPermanentRefusal(res.status, body)) {
-            throw new ModelRequestRefused(res.status, body, [this.#apiKey, ...Object.values(this.#headers)]);
+            const gatewayKeyed = res.status === 401 && !this.#apiKey && this.#model.includes("/");
+            throw new ModelRequestRefused(res.status, body, [this.#apiKey, ...Object.values(this.#headers)],
+              gatewayKeyed ? GATEWAY_401_HINT : undefined);
           }
           const err = new Error(`model ${res.status}: ${body.slice(0, 300)}`);
           if (res.status >= 500 || res.status === 429) {

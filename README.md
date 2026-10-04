@@ -241,7 +241,9 @@ Antiproton is designed to run as a Cloudflare Worker backed by Durable Objects:
    chat/completions needs before it accepts function tools; `src/model/chat-request-shape.ts`); every
    other model's request, DeepSeek's included, is unchanged. A provider's refusal of the request itself
    (HTTP 400, 401, 403, 404, 422) is not retried: the turn fails at once with the provider's status and
-   message. 408, 409, 429, 5xx and network errors are retried, and then dead-lettered, as before.
+   message. That message travels beside the harness's error text rather than in it, since pi's retry
+   check scans the error text for words like `timeout` that a provider's message can contain. 408, 409,
+   429, 5xx and network errors are retried, and then dead-lettered, as before.
 
 2. **Run locally with Wrangler:**
    ```bash

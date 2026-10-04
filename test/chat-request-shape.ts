@@ -7,6 +7,11 @@
  * request builder (`stream` with `onPayload`, which hands over the body before anything is sent) for every
  * model in pi's OpenAI catalog, in both installed pi-ai versions, and compare. A pi upgrade that changes the
  * rule turns them red here rather than reaching a tenant as a 400.
+ *
+ * Those cases force `api: "openai-completions"` on catalog entries pi itself sends through
+ * `openai-responses`: pi never builds a chat/completions body for these models. What they compare is pi's
+ * chat/completions rule applied to pi's description of the model, which is the rule this client follows;
+ * they say nothing about what pi sends on its own route.
  */
 import { OpenAiCompatibleModel } from "../src/model/openai-compatible.ts";
 import { chatShapeFor } from "../src/model/chat-request-shape.ts";

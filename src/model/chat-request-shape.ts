@@ -1,10 +1,12 @@
 /**
  * Which fields a chat/completions request carries for a model, decided from the model's name alone.
  *
- * The provider does not enter into it: `openai/gpt-5.6-luna` needs the same fields whether Cloudflare AI
- * Gateway's /compat or OpenRouter routes it, because what refuses the request is OpenAI's own endpoint
- * behind either one. Only OpenAI's models are shaped here; every other model, DeepSeek's included, is sent
- * the body it always was (`null` below).
+ * The provider does not enter into it, because what refuses the request is OpenAI's own endpoint behind
+ * whichever provider routes it; that was measured through Cloudflare AI Gateway's /compat only. OpenRouter
+ * was not probed, and pi addresses it differently (`thinkingFormat: "openrouter"`, a `reasoning: { effort }`
+ * object rather than `reasoning_effort`), so these fields are not known to be what OpenRouter wants. Only
+ * OpenAI's models are shaped here; every other model, DeepSeek's included, is sent the body it always was
+ * (`null` below).
  *
  * The rules are pi's, not ours. pi-ai's `openai-completions` provider decides them per model
  * (`dist/api/openai-completions.js`, `detectCompat` and `buildParams`, the same rule in 0.85.1 and 1.0.0),

@@ -84,12 +84,12 @@ export async function callQueuedModel(env: ModelEnv, job: any, jobId: string): P
   } catch (e) {
     // A refusal of the request itself is this job's answer, not a failure to retry: the queue would send the
     // same request again and be refused again (src/model/openai-compatible.ts, `isPermanentRefusal`). Answered
-    // as an error, it fails the turn once, with the provider's status and message as the turn's error on both
-    // engines, which read a failed turn's error from the answer's `errorMessage`. Anything else is thrown, so
-    // the queue retries it as before.
+    // as an error, it fails the turn once. `errorMessage` is the refusal's fixed text, the one string the
+    // harness's retry check scans; the provider's status and message go in `providerError`, which the turn's
+    // readers show (`failureText`, src/model/pi-bridge.ts). Anything else is thrown, so the queue retries it.
     if (!(e instanceof ModelRequestRefused)) throw e;
     logEvent("model_job.refused", { jobId, provider, model: called, status: e.status });
-    return { ...errorMessage(e.message, identity), jobId };
+    return { ...errorMessage(e.message, identity), providerError: e.turnError, jobId };
   }
   return fromResponse(res, identity, jobId);
 }

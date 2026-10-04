@@ -15,6 +15,7 @@
  */
 
 import { CLIENT_PENDING } from "../../../src/runtime/client-calls.ts";
+import { failureText } from "../../../src/model/pi-bridge.ts";
 
 type Json = Record<string, unknown>;
 
@@ -121,7 +122,7 @@ export function sessionTranscript(
       id: turnId, object: "agent.session.turn", agent_id: ids.agentId, session_id: ids.sessionId, subagent_id: null,
       status, created_at: seconds(first.at), started_at: status === "queued" ? null : seconds(first.at),
       completed_at: ended ? seconds(group[group.length - 1]!.at) : null,
-      error: status === "failed" ? { code: "server_error", message: String(final!.m.errorMessage ?? "the model call failed") } : null,
+      error: status === "failed" ? { code: "server_error", message: String(failureText(final!.m) ?? "the model call failed") } : null,
       usage: hasUsage
         ? {
             input_tokens: input, input_tokens_details: { cached_tokens: cached },

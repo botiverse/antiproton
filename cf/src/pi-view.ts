@@ -15,6 +15,7 @@
  * happened — the split was an artefact of the old loop emitting commands.
  */
 import type { Entry } from "@earendil-works/pi-agent-core/harness/session";
+import { failureText } from "../../src/model/pi-bridge.ts";
 
 export interface ViewEvent {
   sequence: number;
@@ -83,7 +84,7 @@ export function entriesToEvents(entries: Entry[]): ViewEvent[] {
       if (m.stopReason === "error") {
         out.push({
           sequence: e.seq, kind: "model.failed",
-          payload: { error: m.errorMessage ?? "the model call failed", at: e.timestamp },
+          payload: { error: failureText(m as never) ?? "the model call failed", at: e.timestamp },
         });
         continue;
       }

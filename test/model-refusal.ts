@@ -11,7 +11,7 @@ import { consumeModelCalls, replyingUnknownJob, type ModelJobStub, type ModelQue
 import { callQueuedModel, operatorModelOf } from "../cf/src/model-request.ts";
 import { readEntries } from "../cf/src/transcript-read.ts";
 import { sessionTranscript } from "../cf/src/agents-api/transcript.ts";
-import { ModelRequestRefused, OpenAiCompatibleModel, isPermanentRefusal } from "../src/model/openai-compatible.ts";
+import { GATEWAY_401_HINT, ModelRequestRefused, OpenAiCompatibleModel, isPermanentRefusal } from "../src/model/openai-compatible.ts";
 import { ApStore } from "../src/store/ap-store.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { prefixedNamespace } from "../src/store/sql-namespace.ts";
@@ -31,6 +31,15 @@ const LUNA_400 = JSON.stringify({ error: {
   message: "Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead.",
   type: "invalid_request_error", param: "max_tokens", code: "unsupported_parameter" } });
 
+// Provider refusals whose own text matches pi-ai's retryable patterns (`timeout`, `502`): the refusal's text is
+// kept out of the string the harness scans, or pd sends the job again (measured on the first version of this file's subject).
+const TIMEOUT_SCHEMA_400 = JSON.stringify({ error: {
+  message: "Invalid schema for function 'run_js': In context=('properties', 'timeout'), 'additionalProperties' is required to be supplied and to be false.",
+  type: "invalid_request_error", param: "tools[0].function.parameters", code: "invalid_function_parameters" } });
+const MESSAGES_502_400 = JSON.stringify({ error: {
+  message: "Invalid 'messages[502].content': string too long. Expected a string with maximum length 10485760.",
+  type: "invalid_request_error", param: "messages[502].content", code: "string_above_max_length" } });
+
 /** `fetch` answering every call with `status` and `body`, counting the calls. */
 function answering(status: number, body: string) {
   const real = globalThis.fetch;
@@ -49,25 +58,44 @@ await check("classification: 400/401/403/404/422 and an invalid_request_error 4x
   must(!isPermanentRefusal(413, "too large"), "a 413 without invalid_request_error read as permanent");
 });
 
-await check("a 400 makes exactly one provider call and throws the provider's status and message", async () => {
+await check("a 400 makes exactly one provider call; its error says only the status, and the turn's error carries the provider's message", async () => {
   const f = answering(400, LUNA_400);
   let thrown: unknown;
   try { await model().complete([{ role: "user", content: "hi" }]); } catch (e) { thrown = e; } finally { f.restore(); }
   must(f.seen.calls === 1, `provider called ${f.seen.calls} times`);
   must(thrown instanceof ModelRequestRefused && thrown.status === 400, `threw ${String(thrown)}`);
-  must(thrown.message === "the model provider refused the request (HTTP 400): Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead. (invalid_request_error, unsupported_parameter)",
-    thrown.message);
+  must(thrown.message === "model refused (HTTP 400, permanent): see the turn's error", thrown.message);
+  must(thrown.turnError === "the model provider refused the request (HTTP 400): Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead. (invalid_request_error, unsupported_parameter)",
+    thrown.turnError);
 });
 
-await check("a refusal's message holds no credential the request carried, nothing key- or bearer-shaped, and is truncated", async () => {
+await check("a refusal's text holds no credential the request carried, nothing key- or bearer-shaped, and is truncated", async () => {
   const body = JSON.stringify({ error: { message: `Incorrect API key provided: sk-operatorkey123456 and gwtoken-abcdef via Bearer zzzzzzzz; ${"x".repeat(1000)}`, type: "invalid_request_error" } });
   const f = answering(401, body);
   let thrown: unknown;
   try { await model("sk-operatorkey123456", { "cf-aig-authorization": "Bearer gwtoken-abcdef" }).complete([{ role: "user", content: "hi" }]); }
   catch (e) { thrown = e; } finally { f.restore(); }
   must(thrown instanceof ModelRequestRefused && f.seen.calls === 1, `${String(thrown)} after ${f.seen.calls} calls`);
-  for (const secret of ["sk-operatorkey123456", "operatorkey123456", "gwtoken-abcdef", "zzzzzzzz"]) must(!thrown.message.includes(secret), `${secret} in ${thrown.message}`);
-  must(thrown.message.includes("HTTP 401") && thrown.detail.length <= 301, `${thrown.detail.length}: ${thrown.message.slice(0, 200)}`);
+  for (const secret of ["sk-operatorkey123456", "operatorkey123456", "gwtoken-abcdef", "zzzzzzzz"]) {
+    must(!thrown.turnError.includes(secret) && !thrown.message.includes(secret), `${secret} in ${thrown.turnError}`);
+  }
+  must(thrown.turnError.includes("HTTP 401") && thrown.detail.length <= 301, `${thrown.detail.length}: ${thrown.turnError.slice(0, 200)}`);
+});
+
+await check("a 401 for a vendor/model the gateway keyed itself says an unknown model id looks like that; one with our key, or a bare name, does not", async () => {
+  const unknown = JSON.stringify({ error: { message: "You didn't provide an API key. You need to provide your API key in an Authorization header.", type: "invalid_request_error" } });
+  const turnErrorOf = async (apiKey: string, name: string) => {
+    const f = answering(401, unknown);
+    try { await new OpenAiCompatibleModel({ baseUrl: "https://gw.example/compat", apiKey, model: name, headers: { "cf-aig-authorization": "Bearer gt" } }).complete([{ role: "user", content: "hi" }]); }
+    catch (e) { return (e as ModelRequestRefused).turnError; } finally { f.restore(); }
+    return "no refusal";
+  };
+  const keyedByGateway = await turnErrorOf("", "openai/gpt-nonexistent-rev749");
+  must(keyedByGateway.endsWith(` ${GATEWAY_401_HINT}`) && keyedByGateway.includes("You didn't provide an API key"), keyedByGateway);
+  for (const [key, name] of [["dk", "deepseek/deepseek-flash"], ["dk", "deepseek-flash"]] as const) {
+    const t = await turnErrorOf(key, name);
+    must(t.includes("HTTP 401") && !t.includes(GATEWAY_401_HINT), `${name}: ${t}`);
+  }
 });
 
 for (const status of [429, 503]) {
@@ -120,34 +148,47 @@ async function turnOn(engine: "pi085" | "pd") {
   };
   const q = { acked: 0, retried: 0 };
   const msg: ModelQueueMessage = { body: { doId: "do-1", tenantId: "t", agentId: "a", jobId: sent[0]! }, ack() { q.acked++; }, retry() { q.retried++; } };
-  return { host, rt, deps, msg, q };
+  return { host, rt, deps, msg, q, sent };
 }
 
 for (const engine of ["pi085", "pd"] as const) {
-  await check(`${engine}: a 400 is one provider call and one delivery; the turn fails with the provider's message, which neither pi retries`, async () => {
-    const { host, rt, deps, msg, q } = await turnOn(engine);
-    try {
-      const f = answering(400, LUNA_400);
-      try { await consumeModelCalls({ queue: "model-calls", messages: [msg] }, deps); } finally { f.restore(); }
-      must(f.seen.calls === 1 && q.acked === 1 && q.retried === 0, `provider calls ${f.seen.calls}, queue ${show(q)}`);
-      await rt.step("t", "a");
-      const entries = readEntries(host.sql as never, "main");
-      const last = (entries.at(-1) as { message?: { stopReason?: string; errorMessage?: string } } | undefined)?.message;
-      must(last?.stopReason === "error" && last.errorMessage?.includes("HTTP 400") && last.errorMessage.includes("max_completion_tokens"),
-        `last entry ${show(entries.at(-1))}`);
-      for (const [name, isRetryable] of [["pi-ai 0.85.1", retryable085], ["pi-ai 1.0.0", retryable1]] as const) {
-        must(!isRetryable(last as never), `${name} reads the refusal as retryable: ${last.errorMessage}`);
-      }
-      // What the Agents API shows for the turn.
-      const { turns } = sessionTranscript({ entries, running: false, pending: [] } as never, { sessionId: "s", agentId: "a" });
-      const turn = turns.at(-1);
-      must(turn?.status === "failed" && turn.error?.message === last.errorMessage, `turn ${show(turn)}`);
-      // Delivered once: a redelivery of the message takes nothing and calls nothing.
-      const again = answering(400, LUNA_400);
-      try { await consumeModelCalls({ queue: "model-calls", messages: [msg] }, deps); } finally { again.restore(); }
-      must(again.seen.calls === 0, `a redelivery called the provider ${again.seen.calls} times`);
-    } finally { host.dispose(); }
-  });
+  for (const [what, body, said] of [
+    ["max_tokens refused", LUNA_400, "max_completion_tokens"],
+    ["a refusal whose text says 'timeout'", TIMEOUT_SCHEMA_400, "'timeout'"],
+    ["a refusal whose text says '502'", MESSAGES_502_400, "messages[502]"],
+  ] as const) {
+    await check(`${engine}: ${what}: one model call, one delivery, no second job; the turn fails with the provider's message, and pi's retry check sees only fixed text`, async () => {
+      const { host, rt, deps, msg, q, sent } = await turnOn(engine);
+      try {
+        const f = answering(400, body);
+        try { await consumeModelCalls({ queue: "model-calls", messages: [msg] }, deps); } finally { f.restore(); }
+        must(f.seen.calls === 1 && q.acked === 1 && q.retried === 0, `provider calls ${f.seen.calls}, queue ${show(q)}`);
+        // Let the engine do whatever it means to with the failure, a harness retry included: pd's waits 2 s
+        // (pi-durable's DEFAULT_RETRY_POLICY) and then sends the job again.
+        for (let pass = 0; pass < 3; pass++) {
+          const r = await rt.step("t", "a");
+          if (r.wakeInMs === null || r.wakeInMs > 10_000) break;
+          await new Promise((res) => setTimeout(res, r.wakeInMs! + 50));
+        }
+        must(sent.length === 1, `${engine} sent the model job ${sent.length} times: ${show(sent)}`);
+        const entries = readEntries(host.sql as never, "main");
+        const last = (entries.at(-1) as { message?: { stopReason?: string; errorMessage?: string; providerError?: string } } | undefined)?.message;
+        must(last?.stopReason === "error" && last.errorMessage === "model refused (HTTP 400, permanent): see the turn's error"
+          && last.providerError?.includes("HTTP 400") && last.providerError.includes(said), `last entry ${show(entries.at(-1))}`);
+        for (const [name, isRetryable] of [["pi-ai 0.85.1", retryable085], ["pi-ai 1.0.0", retryable1]] as const) {
+          must(!isRetryable(last as never), `${name} reads the refusal as retryable: ${last.errorMessage}`);
+        }
+        // What the Agents API shows for the turn: the provider's message, read from the stored entry.
+        const { turns } = sessionTranscript({ entries, running: false, pending: [] } as never, { sessionId: "s", agentId: "a" });
+        const turn = turns.at(-1);
+        must(turn?.status === "failed" && turn.error?.message === last.providerError, `turn ${show(turn)}`);
+        // Delivered once: a redelivery of the message takes nothing and calls nothing.
+        const again = answering(400, body);
+        try { await consumeModelCalls({ queue: "model-calls", messages: [msg] }, deps); } finally { again.restore(); }
+        must(again.seen.calls === 0, `a redelivery called the provider ${again.seen.calls} times`);
+      } finally { host.dispose(); }
+    });
+  }
 
   await check(`${engine}: a 503 is still handed back to the queue to retry, and the retry answers the turn`, async () => {
     const { host, rt, deps, msg, q } = await turnOn(engine);
