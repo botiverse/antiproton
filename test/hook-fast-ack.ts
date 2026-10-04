@@ -544,19 +544,33 @@ await check("a full queue stuck behind a failing head says to retry at the head'
     at(90_700);
     const stuck = await push(w, "s30", "stuck");
     answers.push(["stuck", stuck.status, stuck.retryAfter]);
-    // A pass posting right now has claimed the head (its next try set ahead) and is moving the queue.
-    let release!: () => void;
-    (engine as any).say = () => new Promise<void>((_, fail) => { release = () => fail(new Error("still down")); });
+    // A pass at work is moving the queue. It claims the head (its next try set 5 min ahead) and then opens the
+    // harness, which takes most of a second, before the row reads `posting`: held there, then held in the post.
+    const rt = w.D.runtime() as any;
+    const open = rt.agent;
+    let opened!: () => void, failed!: () => void;
+    // Only the post's open is held; the step after the pass opens as usual.
+    rt.agent = (...a: unknown[]) => {
+      rt.agent = open;
+      return new Promise((resolve) => { opened = () => resolve(open.apply(rt, a)); });
+    };
+    (engine as any).say = () => new Promise<void>((_, fail) => { failed = () => fail(new Error("still down")); });
+    const row = () => (w.raw.sql.exec("SELECT state, next_at FROM inbound_pending ORDER BY seq LIMIT 1").toArray()[0] as any);
     at(210_000);
     const pass = w.D.alarm();
-    for (let i = 0; i < 50 && !release; i++) await sleep(5);
-    must(release, "control: the pass reached the post");
-    const moving = await push(w, "s31", "stuck");
-    answers.push(["moving", moving.status, moving.retryAfter]);
-    release();
+    for (let i = 0; i < 100 && !opened; i++) await sleep(5);
+    must(opened && row().state === "queued" && row().next_at === base + 510_000, `control: claimed, opening the harness: ${show(row())}`);
+    const opening = await push(w, "s31", "stuck");
+    answers.push(["opening", opening.status, opening.retryAfter]);
+    opened();
+    for (let i = 0; i < 100 && !failed; i++) await sleep(5);
+    must(failed && row().state === "posting", `control: posting: ${show(row())}`);
+    const posting = await push(w, "s32", "stuck");
+    answers.push(["posting", posting.status, posting.retryAfter]);
+    failed();
     await pass;
   } finally { Date.now = realNow; }
-  must(show(answers) === show([["stuck", 429, "120"], ["moving", 429, "3"]]), show(answers));
+  must(show(answers) === show([["stuck", 429, "120"], ["opening", 429, "3"], ["posting", 429, "3"]]), show(answers));
 });
 
 await check("provisioning and the model choice run once in a pass that posts, and not in one that only waits out a retry", async () => {
