@@ -1252,7 +1252,7 @@ export const raftPlugin: Plugin = {
       }
       if (answer !== go) throw new Error(`raft: the answer must be "${go}" or "drop", not ${JSON.stringify(answer)}`);
       // A state with no `heldAt` was made before it was recorded. Such a state cannot reach this line: held calls
-      // live only in the object's memory (plugins/types.ts `Interrupt`) for about a minute (RUN_JS_RESUME_MS), and a
+      // live only in the object's memory (src/plugins/types.ts `Interrupt`) for about a minute (RUN_JS_RESUME_MS), and a
       // deploy restarts the object, so none outlives the change that added it. It goes ahead as it always did, rather
       // than refusing an answer for a reason that cannot apply to it.
       const heldAt = typeof s.heldAt === "number" && Number.isFinite(s.heldAt) ? s.heldAt : undefined;

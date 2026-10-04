@@ -2331,11 +2331,13 @@ await check("a held send the model repeats with no key keeps the held send's key
   // Control, while the held send is still waiting (its continuation saved): other content to the same target is
   // another message, under its own operation's id. After the resume below the continuation is gone, and a
   // comparison of content that always matched would pass there unnoticed.
+  // A function, so the check after the resume reads the count again rather than one narrowed by this check.
+  const landed = () => raft.acted.length;
   await raftPlugin.invoke("messages_send", { target: "#general", content: "something else" }, { ...inTurn(m.ctx), operationId: "op_other" });
-  if (JSON.stringify(raft.keys) !== '["op_asked","op_other"]' || raft.acted.length !== 1) throw new Error(`control: ${JSON.stringify(raft)}`);
+  if (JSON.stringify(raft.keys) !== '["op_asked","op_other"]' || landed() !== 1) throw new Error(`control: ${JSON.stringify(raft)}`);
   await raftPlugin.invoke("messages_send", { target: "#general", content: "done" }, { ...inTurn(m.ctx), operationId: "op_again" });
   await raftPlugin.interrupts!.resume("messages_send", held.state, "send", { ...inTurn(m.ctx), operationId: "op_asked" });
-  if (JSON.stringify(raft.keys) !== '["op_asked","op_other","op_asked","op_asked"]' || raft.acted.length !== 2) throw new Error(JSON.stringify(raft));
+  if (JSON.stringify(raft.keys) !== '["op_asked","op_other","op_asked","op_asked"]' || landed() !== 2) throw new Error(JSON.stringify(raft));
 });
 
 await check("a held send repeated and landed is not sent again by a \"send\" given after Raft forgot its key: the model is told to check first", async () => {
