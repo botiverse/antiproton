@@ -50,11 +50,14 @@ function probe(seen: Seen[]): Plugin {
       { name: "ask", description: "Asks first.", parameters: { type: "object", properties: {} }, sideEffects: "write", idempotency: "none" },
       { name: "twice", description: "Asks twice.", parameters: { type: "object", properties: {} }, sideEffects: "write", idempotency: "none" },
       { name: "long", description: "Backgrounds.", parameters: { type: "object", properties: {} }, sideEffects: "write", idempotency: "none" },
+      { name: "garbled", description: "Asks in a shape nobody can answer.", parameters: { type: "object", properties: {} }, sideEffects: "write", idempotency: "none" },
     ] as never,
     async invoke(tool, args, context) {
       at(tool, context, args);
       if (tool === "ask" || tool === "twice") return interrupt({ question: "go on?", answer: { choices: ["yes", "no"] }, state: { round: 1 } });
       if (tool === "long") return backgrounded({ job: seen.length }, "still going");
+      // An answer spec no answer can meet: the gateway cancels the question at once (`#run`) and fails the call.
+      if (tool === "garbled") return interrupt({ question: "which?", answer: { kind: "bogus" } as never, state: { round: 1 } });
       return { ok: tool };
     },
     interrupts: {
@@ -251,6 +254,59 @@ for (const engine of ["pi085", "pd"] as const) {
     } finally { w.host.dispose(); }
   });
 
+  await check(`${engine}: a job refused over the cap is cancelled under its own call's id`, async () => {
+    const w = await world(engine);
+    try {
+      await turn(w.r, "start four", [
+        call("c_l1", "probe__long", {}), call("c_l2", "probe__long", {}), call("c_l3", "probe__long", {}), call("c_l4", "probe__long", {}),
+        say("started"),
+      ], { leaveHeld: true });
+      const started = stepsOf(w.seen, "long").map((s) => s.op);
+      must(started.length === 4 && new Set(started).size === 4 && started.every(isOpId), `started: ${show(started)}`);
+      const cancelled = stepsOf(w.seen, "long:cancel").map((s) => s.op);
+      must(show(cancelled) === show([started[3]]), `the over-cap cancel ${show(cancelled)}, the fourth call ${started[3]}`);
+    } finally { w.host.dispose(); }
+  });
+
+  await check(`${engine}: a job past the time ceiling is cancelled under the starting call's id`, async () => {
+    const w = await world(engine);
+    try {
+      await turn(w.r, "start", [call("c_l1", "probe__long", {}), say("started")], { leaveHeld: true });
+      const started = stepsOf(w.seen, "long")[0]?.op;
+      must(isOpId(started), `started: ${show(w.seen)}`);
+      w.host.sql.exec("UPDATE background_jobs SET created_at = 0, next_poll_at = 0");
+      await w.r.rt.step("t", "a");
+      const cancelled = stepsOf(w.seen, "long:cancel").map((s) => s.op);
+      must(show(cancelled) === show([started]) && stepsOf(w.seen, "long:poll").length === 0, `ceiling cancel ${show(cancelled)}, started ${started}: ${show(w.seen)}`);
+      const job = w.host.sql.exec("SELECT state FROM background_jobs WHERE id = ?", started).toArray()[0];
+      must(job?.state === "failed", `control: the job ended ${show(job)}`);
+    } finally { w.host.dispose(); }
+  });
+
+  await check(`${engine}: a question nobody could answer is cancelled at once under the asking call's id`, async () => {
+    const w = await world(engine);
+    try {
+      await turn(w.r, "garbled", [call("c_g", "probe__garbled", {}), say("failed")]);
+      const asked = stepsOf(w.seen, "garbled")[0]?.op;
+      const cancelled = stepsOf(w.seen, "garbled:cancel").map((s) => s.op);
+      must(isOpId(asked) && show(cancelled) === show([asked]), `call ${asked}, cancel ${show(cancelled)}`);
+      const row = await w.r.rt.store.getOperation("t", asked!);
+      must(row?.status === "failed", `control: the unusable question did not fail the call: ${show(row)}`);
+    } finally { w.host.dispose(); }
+  });
+
+  await check(`${engine}: a question a program's call asked, resumed by the model, reaches the plugin under the program call's id`, async () => {
+    const w = await world(engine);
+    try {
+      await turn(w.r, "program", [call("c_js", "run_js", { source: "await tool`probe__ask ${{}}`; output('unreached');" }), resume("c_r"), say("done")]);
+      const asked = stepsOf(w.seen, "ask")[0]?.op;
+      const resumed = stepsOf(w.seen, "ask:resume1").map((s) => s.op);
+      const task = String(w.host.sql.exec("SELECT task_id FROM operations WHERE operation_id = ?", asked).toArray()[0]?.task_id);
+      must(asked === keyed("t", task, "c_js:0"), `the program's call ran under ${asked}`);
+      must(show(resumed) === show([asked]), `resume ${show(resumed)}, asked ${asked}: ${show(w.seen)}`);
+    } finally { w.host.dispose(); }
+  });
+
   await check(`${engine}: a program's calls get distinct ids derived from the run_js call; nothing it writes names one`, async () => {
     const w = await world(engine);
     try {
@@ -336,6 +392,74 @@ await check("a model call through the bridge: a fresh id each call, never one th
   await (see as any).execute("d1", {});
   const ops = w.seen.map((s) => s.op);
   must(ops.length === 2 && ops.every(isOpId) && ops[0] !== ops[1] && !ops.includes("op_forged000000000000"), `ids ${show(ops)}`);
+});
+
+// ---- contexts that serve no operation carry no id ---------------------------------------------------------------
+
+await check("a context that serves no operation has no operationId: prompt, holding, release, files, receive, activity report, tool snapshot, a poll by handle alone", async () => {
+  const got: Array<{ where: string; has: boolean; op: unknown }> = [];
+  const note = (where: string, c: { operationId?: string }) => { got.push({ where, has: "operationId" in c, op: c.operationId }); };
+  const one = { name: "x", description: "", parameters: { type: "object" }, sideEffects: "read", idempotency: "none" } as never;
+  const keeper: Plugin = {
+    id: "keeper", version: "1.0.0", tools: [one],
+    async invoke() { return null; },
+    async promptContribution(c) { note("promptContribution", c); return "keeper"; },
+    holds: {
+      tools: { release: "x" },
+      async activity(c) { note("activity", c); return { live: null }; },
+      async activities(c) { note("activities", c); return [{ live: null }]; },
+      async usage(c) { note("usage", c); return []; },
+      async release(c) { note("release", c); },
+      files: {
+        async list(c) { note("files.list", c); return { running: false }; },
+        async read(c) { note("files.read", c); return { running: false }; },
+      },
+    },
+    background: {
+      async poll(_h, c) { note("poll", c); return { done: false as const }; },
+      async cancel(_h, c) { note("cancel", c); },
+    },
+    async receive(_e, _s, c) { note("receive", c); return { deliver: false } as never; },
+    async reportActivity(_e, c) { note("reportActivity", c); return { sent: 0 }; },
+  };
+  const lister: Plugin = {
+    id: "lister", version: "1.0.0", tools: [],
+    async invoke() { return null; },
+    mountTools() { return []; },
+    async snapshotTools(c) { note("snapshotTools", c); return { tools: [] }; },
+  };
+  const store = new SqliteStore(":memory:");
+  await store.init();
+  await store.createAgent("t", "a");
+  for (const [alias, plugin] of [["keep", "keeper"], ["list", "lister"]] as const) {
+    await store.addMount({
+      tenantId: "t", agentId: "a", alias, plugin, installationId: "i", connectionId: null,
+      toolVersion: "1.0.0", publicConfig: {}, secretRef: null, policy: null,
+    });
+  }
+  const gw = new ToolGateway(store, [keeper, lister], new Set(["keeper", "lister"]), { async resolve() { return null; } });
+  const ctx = { tenantId: "t", agentId: "a", taskId: "k" };
+  await gw.promptContributions(ctx);
+  await gw.mountActivity(ctx, "keep");
+  await gw.mountActivities(ctx, "keep");
+  await gw.mountUsage(ctx, "keep");
+  await gw.heldFiles(ctx, { op: "list", path: "" });
+  await gw.heldFiles(ctx, { op: "read", path: "f", maxBytes: 10 });
+  await gw.releaseTask(ctx, { alias: "keep" });
+  await gw.receive("t", "a", "keep", { headers: {}, body: new Uint8Array(1) } as never, "s");
+  await gw.reportActivity("t", "a", []);
+  await gw.refreshMountTools("t", "a", "list");
+  // The bench runner's poll and a cancel with no operation named (cf/src/index.ts `benchSweJob`).
+  await gw.pollBackground(ctx, "keep", { h: 1 });
+  await gw.cancelBackground(ctx, "keep", { h: 1 });
+  const where = ["promptContribution", "activity", "activities", "usage", "files.list", "files.read", "release", "receive", "reportActivity", "snapshotTools", "poll", "cancel"];
+  must(show(got.map((g) => g.where).sort()) === show([...where].sort()), `control: reached ${show(got.map((g) => g.where))}`);
+  const named = got.filter((g) => g.has);
+  must(named.length === 0, `contexts that serve no operation carried one: ${show(named)}`);
+  // Control: the same poll, naming the operation, carries it.
+  got.length = 0;
+  await gw.pollBackground(ctx, "keep", { h: 1 }, "op_0123456789abcdef0123");
+  must(got[0]?.op === "op_0123456789abcdef0123", `a named poll: ${show(got)}`);
 });
 
 await check("hostCallOpts forwards no operationId and no approval, whatever a call's options carry", async () => {

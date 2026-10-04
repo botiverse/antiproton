@@ -418,10 +418,10 @@ for equality only. What stays the same and what does not:
 | The model's own tool call (`invoke`) | a new id per call; the model calling again is a new id |
 | The call held for approval, run after a person approves it (`applyApproval`) | the id the call was held under, which the model was told |
 | `interrupts.resume` of a question the call asked, and of each question after it | the asking call's id (the resume is recorded as a step of its own, under its own row) |
-| `interrupts.cancel` of that question (dropped, expired, or asked where nobody can answer) | the asking call's id |
-| `background.poll` and `background.cancel` of work the call started | the call's id (the runtime keeps a job under it) |
+| `interrupts.cancel` of that question (dropped, expired, asked where nobody can answer, or in a shape no answer can meet) | the asking call's id |
+| `background.poll` and `background.cancel` of work the call started (the alarm, the `jobs` tool, a session cancel, the time ceiling, the cap) | the call's id (the runtime keeps a job under it) |
 | A run_js program's call | derived from the run_js call's id and the call's position in the program (`${toolCallId}:${n}`): different per call, and the same if the program is run again under the same run_js call, where the gateway finds the operation already begun and answers `already_attempted` without reaching you again |
-| `promptContribution`, `Holding.*`, `receive`, `snapshotTools`, a bench runner's poll of a job it holds only the handle of | absent: no operation |
+| `promptContribution`, `Holding.*`, `receive`, `reportActivity`, `snapshotTools`, a bench runner's poll of a job it holds only the handle of | absent: no operation |
 
 Nothing a model or a program writes reaches it: run_js builds each call's
 options field by field and the production host forwards no `operationId`
