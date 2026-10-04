@@ -697,9 +697,10 @@ const parked = (out: unknown) => JSON.stringify(out).length > PULL_LINE;
  * and each response replaces it; `since = n` acknowledges the pending rows with seq ≤ n (seq is the message's
  * global seq) and the rest are handed out again, first; then the queue in delivery order, which is not seq order,
  * at most `cap` rows per conversation and `limit` in all. So a lower seq can be handed out after a cut that left it.
- * `last_seen_seq` is the highest seq in the response.
+ * `last_seen_seq` is the highest seq in the response. The pulls numbered in `lose` (from 1) are built, so their rows
+ * become pending, and their answer is lost.
  */
-function raftInbox(queue: Array<{ seq: number; channel_name: string }>, cap = 50) {
+function raftInbox(queue: Array<{ seq: number; channel_name: string }>, cap = 50, lose: readonly number[] = []) {
   let waiting = [...queue];
   let pending: Array<{ seq: number; channel_name: string }> = [];
   const acked: number[] = [];
@@ -722,6 +723,8 @@ function raftInbox(queue: Array<{ seq: number; channel_name: string }>, cap = 50
       out.push(r); per.set(r.channel_name, (per.get(r.channel_name) ?? 0) + 1); waiting = waiting.filter((q) => q !== r);
     }
     pending = out;
+    // A response built and made pending, then lost on the way: the client sees only a dropped connection.
+    if (lose.includes(pulls.length)) throw new Error("connection reset");
     return events(out, { last_seen_seq: out.length ? Math.max(...out.map((r) => r.seq)) : null, has_more: waiting.length > 0 });
   }) as any;
   return { pulls, acked, left: () => waiting.length + pending.length };
@@ -826,6 +829,69 @@ await check("a cut that leaves a lower seq than the last cursor sends that lower
   if (JSON.stringify([...shown].sort((x, y) => x - y)) !== "[1,2,3,4,5,6,10]" || server.acked.length !== 7) throw new Error(`shown ${shown}, acked ${server.acked}`);
 });
 
+/**
+ * The reviewer's queue: at most three per conversation per response, with long messages that force partial cuts, so
+ * a lower seq is handed out after a cursor above it. An old cursor sent again then acknowledges rows unshown.
+ */
+const lowerAfterCut = () => [inboxRow(1, "x", "a"), inboxRow(2, "x", "a"), inboxRow(3, "x", "a"), inboxRow(10, "x".repeat(3800), "b"),
+  inboxRow(4, "x", "a"), inboxRow(5, "x".repeat(3800), "a"), inboxRow(6, "x", "a")];
+const bookedSeqs = (fresh: ReturnType<typeof freshDb>) =>
+  Object.values((fresh.tables.get(fresh.scope, INBOX_STORE, "state") as any)?.frontier?.targets ?? {}).flatMap((t: any) => t.exact ?? []) as number[];
+/**
+ * Calls receive_events until Raft has nothing left; `failing(call)` may make a call fail. After every call, what
+ * Raft acknowledged and what is booked as seen must both be among what successful calls showed the model.
+ */
+async function pullThroughFailures(fresh: ReturnType<typeof freshDb>, server: ReturnType<typeof raftInbox>, failing: (call: number) => any = () => fresh.db) {
+  const shown: number[] = [];
+  const failed: number[] = [];
+  for (let call = 1; call <= 30; call++) {
+    const m = { ...ctx(), db: failing(call) };
+    try {
+      shown.push(...shownSeqs(await raftPlugin.invoke("receive_events", {}, inTurn(m, "ctx_a"))));
+    } catch { failed.push(call); }
+    const unseen = server.acked.filter((x) => !shown.includes(x));
+    if (unseen.length) throw new Error(`after call ${call} (since=${server.pulls.at(-1)?.since}) Raft acknowledged ${unseen} unshown; shown ${shown}`);
+    const unshownSeen = bookedSeqs(fresh).filter((x) => !shown.includes(x));
+    if (unshownSeen.length) throw new Error(`after call ${call} ${unshownSeen} booked as seen, never shown; shown ${shown}`);
+    if (server.left() === 0 && call > (failed.at(-1) ?? 0) + 1) return { shown, failed, calls: call };
+  }
+  throw new Error(`no end: shown ${shown}`);
+}
+/** The mount's database, with its `put` of receive_events' cursor failing at the given writes (counted from 1). */
+function failingSinceWrites(db: any, at: readonly number[]) {
+  let n = 0;
+  return new Proxy(db, { get: (t, k) => k !== "put" ? (typeof t[k] === "function" ? t[k].bind(t) : t[k])
+    : async (store: string, value: unknown, key: string) => {
+      if (store === INBOX_STORE && key === "since" && at.includes(++n)) throw new Error("database unavailable");
+      return t.put(store, value, key);
+    } });
+}
+
+await check("a response lost after Raft built it is acknowledged by no later pull: the next pull sends no cursor and the batch is shown again", async () => {
+  const fresh = freshDb();
+  const server = raftInbox(lowerAfterCut(), 3, [2]);
+  const { shown, failed } = await pullThroughFailures(fresh, server);
+  if (JSON.stringify(failed) !== "[2]" || server.pulls[2]!.since !== "latest") throw new Error(`failed ${failed}, pull 3 since=${server.pulls[2]!.since}`);
+  if (JSON.stringify([...new Set(shown)].sort((x, y) => x - y)) !== "[1,2,3,4,5,6,10]" || server.acked.length !== 7) throw new Error(`shown ${shown}, acked ${server.acked}`);
+});
+
+await check("a cursor write that fails, before the pull or after it, fails the call with nothing acknowledged or seen that was not shown", async () => {
+  // Writes 1 and 2 are the first call's. The second call's: 3 spends the cursor before its pull, 4 keeps the new one.
+  for (const at of [3, 4]) {
+    const fresh = freshDb();
+    const server = raftInbox(lowerAfterCut(), 3);
+    const db = failingSinceWrites(fresh.db, [at]);
+    const { shown, failed, calls } = await pullThroughFailures(fresh, server, () => db);
+    if (JSON.stringify(failed) !== "[2]") throw new Error(`write ${at}: failed calls ${failed}`);
+    // Before the pull: call 2 asked Raft nothing, and its cursor, never spent, is call 3's. After it: Raft built
+    // call 2's batch, and call 3 sends no cursor.
+    const sinces = server.pulls.map((p) => p.since);
+    if (at === 3 && (server.pulls.length !== calls - 1 || sinces[1] !== "9")) throw new Error(`write 3: ${calls} calls, sinces ${sinces}`);
+    if (at === 4 && (server.pulls.length !== calls || sinces[1] !== "9" || sinces[2] !== "latest")) throw new Error(`write 4: ${calls} calls, sinces ${sinces}`);
+    if (JSON.stringify([...new Set(shown)].sort((x, y) => x - y)) !== "[1,2,3,4,5,6,10]") throw new Error(`write ${at}: shown ${shown}`);
+  }
+});
+
 await check("seq-less events too long together are shown alone, and no queued message is acknowledged with them", async () => {
   const rows = [inboxRow(7, "short", "a"), inboxRow(8, "y".repeat(PULL_LINE), "b")];
   const sdk = await createRaft({ serverUrl: "https://raft.example", credential: "sk_agent_test_1234567890",
@@ -867,7 +933,7 @@ await check("a message too long to fit alone is handed over alone and acknowledg
   if (new URL(pulls[0]!).searchParams.get("since") !== "42") throw new Error(`the oversized message was not acknowledged alone: ${pulls[0]}`);
 });
 
-await check("a failed pull loses nothing: the cursor stays, and the next pull asks for the same batch again", async () => {
+await check("a failed pull acknowledges nothing after it: the cursor was spent when sent, so the next pull sends none", async () => {
   const m = mount();
   const calls = many(events([{ id: "m-3aaaaaa", seq: 5, content: "x", sender_type: "human", sender_name: "t", channel_name: "g", channel_type: "channel" }], { last_seen_seq: 5 }));
   await raftPlugin.invoke("receive_events", {}, m.ctx);
@@ -880,8 +946,8 @@ await check("a failed pull loses nothing: the cursor stays, and the next pull as
   if (/socket closed/.test(why.message)) throw new Error(`the transport cause leaked: ${why.message}`);
   const again = one(events([]));
   await raftPlugin.invoke("receive_events", {}, m.ctx);
-  if (new URL(seen[0]!).searchParams.get("since") !== "5" || new URL(again[0]!.url).searchParams.get("since") !== "5") {
-    throw new Error(`the failed pull moved the cursor: ${JSON.stringify({ failed: seen[0], next: again[0]!.url })}`);
+  if (new URL(seen[0]!).searchParams.get("since") !== "5" || new URL(again[0]!.url).searchParams.get("since") !== "latest") {
+    throw new Error(`the pull after a failed one sent a cursor: ${JSON.stringify({ failed: seen[0], next: again[0]!.url })}`);
   }
   if (calls.length !== 1) throw new Error("the first pull made more than one request");
 });

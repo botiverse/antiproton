@@ -318,6 +318,11 @@ const STATE_KEY = "state";
  * one before (a lower seq handed out again, or newly, after an earlier cursor). The SDK's `inbox.commit` never
  * lowers its cursor, so it cannot hold this one: it would keep the higher value and acknowledge rows the model
  * was not shown. `null` sends no cursor, which acknowledges nothing.
+ *
+ * A cursor is spent once sent: the call that sends it sets `null` before its pull, and the new cursor only once
+ * the pull has answered. A request that reached Raft and whose answer was lost made that lost batch Raft's
+ * pending one, and an old cursor sent again would acknowledge it unread; so after any failure the next pull
+ * acknowledges nothing, and the worst a failure costs is one batch handed out again.
  */
 const SINCE_KEY = "since";
 
@@ -381,7 +386,8 @@ function raftFor(ctx: PluginContext, options: { state?: false } = {}): Raft {
  * An SDK failure as this plugin's error: the SDK's safe text and next step, and whether a retry may help.
  * `write` says the operation had an effect to lose: for a send, a request that got no answer or a 5xx may
  * have landed (a repeat with the same key is still safe). A pull under cursor acknowledgement has nothing
- * to lose, since the batch it asked for is acknowledged only by the next pull.
+ * to lose: what its cursor may have acknowledged the previous call showed, and a cursor is spent once sent
+ * (`SINCE_KEY`), so the next pull acknowledges nothing of the batch this one asked for.
  */
 function sdkFailure(out: RaftFailure, write = false): Error {
   // The next action is the SDK's own sentence, so its command is rewritten wherever it stands; the message is left
@@ -933,7 +939,7 @@ const OWN_TOOLS: readonly ToolSchema[] = [
     summary: "Read your queued Raft messages: the way to read after an inbox notice. Each message is one line, " +
       "`[target=… msg=… time=… type=…] @sender: content`; reply with messages_send to that target. A call hands out at most " +
       `${EVENTS_LIMIT} messages, fewer when they are long, and Raft at most a few per conversation: while hasMore is true, call again. ` +
-      "What a call showed you is acknowledged by your next call, so a failed call loses nothing and may simply be repeated.",
+      "What a call showed you is acknowledged by your next call. A call that fails acknowledges nothing: repeat it, and it may hand you messages you were already given.",
     parameters: {
       type: "object", additionalProperties: false,
       properties: {
@@ -1123,8 +1129,7 @@ export const raftPlugin: Plugin = {
       const raft = raftFor(ctx);
       // Cursor acknowledgement: nothing is acknowledged by being fetched. The cursor the previous call computed
       // (`SINCE_KEY`, kept in the mount's database, since the object may be a new process by now) goes as `since`,
-      // which is what acknowledges what that call showed. A pull that fails moves nothing, so the next call sends
-      // the same cursor and gets the same messages again.
+      // which is what acknowledges what that call showed.
       //
       // A mount with no such record yet takes the SDK's own cursor, `commit()` first promoting a pending one. Only the
       // flow before this record existed wrote it, and that flow kept the cursor of a whole response, every message of
@@ -1133,6 +1138,8 @@ export const raftPlugin: Plugin = {
       let since: number | null;
       if ("since" in kept) since = typeof kept.since === "number" ? kept.since : null;
       else { await raft.inbox.commit(); since = raft.state.snapshot().cursor; }
+      // Spent before it is sent (`SINCE_KEY` says why); a write that fails here fails the call before any pull.
+      await ctx.db.put(INBOX_STORE, { since: null }, SINCE_KEY);
       // The pull runs on a client whose state is not saved: the SDK books every message a pull returns as seen,
       // and only those `handOver` shows may be. As the model's own: receive_events is model-only, so the gateway
       // has already refused it from a program and from an approved call's replay.
@@ -1141,17 +1148,20 @@ export const raftPlugin: Plugin = {
       if (!out.ok) throw sdkFailure(out as RaftFailure);
       const batch = (out as { data: RaftInboxBatch }).data;
       const given = handOver(batch);
-      // Booked under the caller's context id, the one a later send in that context attests with (`originOf`).
-      if (given.attested) {
+      // Exactly this call's cursor, lower than the last one or not: the next pull acknowledges what was shown here.
+      // A Server that acknowledged on read has nothing pending, so the next pull sends none. Written before anything
+      // is recorded as seen, so a write that fails leaves nothing attested and the next pull acknowledging nothing.
+      await ctx.db.put(INBOX_STORE, { since: batch.ackMode === "cursor" ? given.cursor : null }, SINCE_KEY);
+      // Booked under the caller's context id, the one a later send in that context attests with (`originOf`). A
+      // save that fails is reported and does not fail the call (`raftFor`): the messages are then shown unattested,
+      // which only means a send into their conversation is held first.
+      if (given.attested && given.shown.length) {
         const seen = raft.frontier.inContext(typeof ctx.caller.contextId === "string" ? ctx.caller.contextId : undefined);
         const byTarget = new Map<string, number[]>();
         for (const m of given.shown) if (m.seq !== null) byTarget.set(m.target, [...(byTarget.get(m.target) ?? []), m.seq]);
         for (const [target, seqs] of byTarget) seen.recordExact(target, seqs);
+        await raft.state.save();
       }
-      if (given.attested && given.shown.length) await raft.state.save();
-      // Exactly this call's cursor, lower than the last one or not: the next pull acknowledges what was shown here.
-      // A Server that acknowledged on read has nothing pending, so the next pull sends none.
-      await ctx.db.put(INBOX_STORE, { since: batch.ackMode === "cursor" ? given.cursor : null }, SINCE_KEY);
       return given.result;
     }
     if (name === "enable_push") {
