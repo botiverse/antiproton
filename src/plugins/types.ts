@@ -79,6 +79,9 @@ export interface ToolSchema {
  * mount's tools on every harness build and every call, and neither may wait on
  * somebody else's server; a wake that reached the network to learn its own
  * tool list would also offer a different list each time the server moved.
+ * The one exception is bounded: a snapshot taken by a build whose tool set
+ * differs ({@link ToolSnapshot.basis}) is re-taken once at a turn's start,
+ * under a timeout, and kept as it was when that fails.
  *
  * `tools` is already admitted: every name in it is addressable, so every
  * reader of {@link toolsOf} sees the same list. What was left out is in
@@ -101,6 +104,14 @@ export interface ToolSnapshot {
    * (`AgentRuntime.attachCredential`). Not covered by `hash`, which is about the list itself.
    */
   withoutCredential?: true;
+  /**
+   * The plugin's {@link Plugin.toolsBasis} when the list was taken: which tool set the code that took it could offer.
+   * The runtime re-takes, at the start of a turn, a snapshot whose basis is not the running plugin's — absent counts
+   * as different — because a list taken by an older build lacks whatever a newer one added, and nothing else asks
+   * again (`AgentRuntime.retakeStaleSnapshots`, cf/src/runtime.ts). Not covered by `hash`, which is about the
+   * list itself.
+   */
+  basis?: string;
 }
 
 /**
@@ -110,6 +121,15 @@ export interface ToolSnapshot {
 export interface ListedTools {
   tools: ToolSchema[];
   skipped?: Array<{ name: string; reason: string }>;
+  /**
+   * Present, and true, when the far end refused the mount's credential, so `tools` (normally empty) says what a
+   * refused credential may do rather than what this one may. Taken as it is on a credential change and an operator's
+   * refresh — a refused new credential lists nothing. A re-take nobody asked for (the runtime's, at a turn's start)
+   * keeps a list a credential was behind instead and reports the refusal (`ToolGateway.refreshMountTools`), since one
+   * refused moment must not shrink a working list for good. A flag rather than a reading of `skipped`, whose reasons
+   * are words for a person.
+   */
+  refused?: true;
 }
 
 /**
@@ -332,6 +352,24 @@ export interface PluginContext {
    * already hands a plugin another mount's name, and this is its own.
    */
   alias: string;
+  /**
+   * The names of the tools this mount offers right now, as {@link toolsOf} answers for it: the list the model was
+   * given and the gateway admits calls against. Unqualified, as in `ToolSchema.name`.
+   *
+   * For a plugin that names its own tools in what it writes — a hint, a next step, a suffix — and must not name one
+   * this mount lacks. Its static `tools` cannot say that: a mount's list can be narrower, because its credential
+   * lacks a capability (the plugin's `snapshotTools` left the tool out), or because its stored snapshot was taken by
+   * an older build that did not have the tool yet ({@link ToolSnapshot.basis}). The kernel is the one place that
+   * reads the mount's list, so it hands it over rather than have each plugin re-derive it from the record.
+   *
+   * Set by the gateway (`#contextFor`, src/runtime/gateway.ts) on every context it builds for one of the agent's
+   * mounts: a call's `invoke`, `interrupts.resume`/`cancel`, `background.poll`/`cancel`, `receive` and
+   * `reportActivity`. Absent from `snapshotTools`'s context, which is asking what the list should be — the list it
+   * would be handed is the one being replaced — and from the contexts built without a call (`promptContribution`,
+   * `Holding.activity`/`activities`/`usage`/`release`/`files`, `checkCredential`). A plugin reads absence as "not
+   * reported", never as "offers nothing", and falls back to its static `tools`.
+   */
+  offered?: readonly string[];
   /** Resolved server-side; the agent never sees the credential itself. */
   credential: string | null;
   /**
@@ -1753,7 +1791,8 @@ export interface Plugin {
   /**
    * List the tools a mount should offer, by asking whoever knows. Called when
    * the mount is created and when an operator asks for a refresh — never on a
-   * wake, a harness build or a call. For a plugin that also declares a
+   * call — and, for a plugin that declares `toolsBasis`, at the start of a turn
+   * whose mount's snapshot was taken under another basis. For a plugin that also declares a
    * `credential`, it is called again whenever the mount's credential is
    * attached, replaced or removed, since what a credential may do can decide
    * the list (raft); if that listing fails, the stored list stays as it was.
@@ -1765,6 +1804,18 @@ export interface Plugin {
    * operator who asked.
    */
   snapshotTools?(ctx: PluginContext): Promise<ListedTools>;
+  /**
+   * Which tool set this build of the plugin can offer, as an opaque string that moves whenever that set does (an
+   * upgraded dependency that adds an operation, say). Only meaningful beside `snapshotTools`.
+   *
+   * The kernel stores it on every snapshot it takes ({@link ToolSnapshot.basis}), and at the start of a turn, before
+   * the tool list is built, re-takes the snapshot of a mount whose stored basis differs — or is absent — with a
+   * short timeout, keeping the old list when that fails (cf/src/runtime.ts, `AgentRuntime.retakeStaleSnapshots`). Without it a
+   * deploy that adds a tool reaches no mount whose list was already taken, since nothing else asks again. Static,
+   * like `version`, because it is compared on every turn and must not cost a call. A plugin whose list depends only
+   * on the far end (an MCP server) leaves it out: nothing in the build changes that list.
+   */
+  toolsBasis?: string;
   /** This mount holds something real; see {@link Holding}. Declaring it is what
    *  makes the mount exclusive — ask {@link isExclusive}, never the two separately. */
   holds?: Holding;

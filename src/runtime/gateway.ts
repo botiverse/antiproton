@@ -8,7 +8,7 @@ import type { Plugin, PluginContext, MountActivity, MountUsage, InboundEvent, In
 import { type ActivityEvent, type SandboxForm, holdingOf, backgroundOf, isExclusive } from "../plugins/types.ts";
 import { Backgrounded, Interrupt, interruptsOf } from "../plugins/types.ts";
 import { answerSpecOf } from "./run-js-resume.ts";
-import type { PluginErrorFields } from "../plugins/types.ts";
+import type { PluginErrorFields, ToolSnapshot } from "../plugins/types.ts";
 import { callSideEffects, pluginEnabled, LEASE_KEY, toolsOf } from "../plugins/types.ts";
 import { admitTools } from "./mount-tools.ts";
 import { isReleased, leaseRow, releasedFacts } from "../trace/seams.ts";
@@ -153,6 +153,12 @@ export interface InvokeOpts {
 }
 
 type Resolution = { mount: MountRecord; tool: string } | { error: ToolError };
+
+/** Whether two stored tool lists are the same record: what a re-take compares before it writes (`refreshMountTools`). */
+function sameSnapshot(a: ToolSnapshot | null | undefined, b: ToolSnapshot | null | undefined): boolean {
+  if (!a || !b) return !a && !b;
+  return a.hash === b.hash && a.takenAt === b.takenAt && !!a.withoutCredential === !!b.withoutCredential && a.basis === b.basis;
+}
 
 /**
  * What a mount may do without a human.
@@ -1073,10 +1079,11 @@ export class ToolGateway {
    * a poll or a cancel sees exactly the context the call saw, credential
    * included, and nothing about a background job has to travel with it.
    */
-  #contextFor(ctx: CallContext, mount: MountRecord, credential: string | null, fromProgram = false, operationId?: string) {
+  #contextFor(ctx: CallContext, mount: MountRecord, credential: string | null, fromProgram = false, operationId?: string, listing = false) {
     const store = this.#store;
     const secrets = this.#secrets;
     const db = (m: MountRecord) => this.#db(ctx, m);
+    const plugin = this.#plugins.get(mount.plugin);
     return {
       // Both extras are present only when they say something: `fromProgram` only ever true, `contextId` only for a
       // call made in a session's turn. A plugin reads absence as "not a program" and "no context to scope by".
@@ -1088,6 +1095,10 @@ export class ToolGateway {
       // Only from the gateway's own bookkeeping, never from what a call carries (`PluginContext.operationId`).
       ...(operationId !== undefined ? { operationId } : {}),
       alias: mount.alias,
+      // The mount's list as the catalogue and the call check read it (`toolsOf`), so a plugin that names its own
+      // tools in what it writes names only these (`PluginContext.offered`). Not for a listing: that context is
+      // asking what the list should be, and the answer it would be handed is the one being replaced.
+      ...(plugin && !listing ? { offered: toolsOf(plugin, mount).map((t) => t.name) } : {}),
       credential,
       // What kind of credential the mount names, so a null `credential` can be read as "names none" or
       // "names one that did not arrive" rather than guessed. The KIND, never the reference: a reference
@@ -1099,7 +1110,7 @@ export class ToolGateway {
       // must never see each other's session.
       db: db(mount),
       // A mount's own hooks, and only for a plugin that can take what they carry.
-      ...(this.#inbound && this.#plugins.get(mount.plugin)?.receive
+      ...(this.#inbound && plugin?.receive
         ? { inbound: this.#inbound(ctx.tenantId, ctx.agentId, mount.alias) } : {}),
       async sibling(alias: string) {
         // Only this agent's own mounts: never a lookup by tenant or by plugin.
@@ -1146,7 +1157,7 @@ export class ToolGateway {
       },
       // The owner's rows only (`owner:`), apart from the agent's, and only to a plugin that declared
       // it reads them (`Plugin.readsOwnerSecrets`): see `PluginContext.ownerSecret`.
-      ...(this.#plugins.get(mount.plugin)?.readsOwnerSecrets ? {
+      ...(plugin?.readsOwnerSecrets ? {
         async ownerSecret(name: string) {
           if (!KEPT_NAME.test(name)) return null;
           return secrets.resolve(agentRef(OWNER_PREFIX + name), { tenantId: ctx.tenantId, agentId: ctx.agentId });
@@ -1277,9 +1288,10 @@ export class ToolGateway {
    * Operator-only: ask a mount's plugin what tools the mount offers, and keep
    * the answer on the mount (`Plugin.snapshotTools`, `ToolSnapshot`).
    *
-   * The one place a mount's tool list is fetched. Nothing on a wake, a harness
-   * build or a call reaches here, so a server that is down or slow costs the
-   * operator who asked and never an agent's turn. The stored snapshot is
+   * The one place a mount's tool list is fetched. Nothing on a call reaches
+   * here, so a server that is down or slow costs the operator who asked; the
+   * one turn-time caller, the runtime re-taking a snapshot whose basis is not
+   * the plugin's (`Plugin.toolsBasis`), bounds it with a timeout and backs off. The stored snapshot is
    * replaced only when the admitted list hashes differently, so a refresh that
    * hears the same list leaves the record and the harness cache as they were.
    *
@@ -1288,7 +1300,7 @@ export class ToolGateway {
    * a call would get, minus a task, so `{{secret}}` headers resolve as they do
    * on a call.
    */
-  async refreshMountTools(tenantId: string, agentId: string, alias: string): Promise<
+  async refreshMountTools(tenantId: string, agentId: string, alias: string, opts?: { keepCredentialed?: true }): Promise<
     | { ok: true; changed: boolean; hash: string; tools: string[]; skipped: Array<{ name: string; reason: string }> }
     | { ok: false; error: string; stale?: true }
   > {
@@ -1306,10 +1318,33 @@ export class ToolGateway {
     const credential = mount.secretRef
       ? await this.#secrets.resolve(mount.secretRef, { tenantId: mount.tenantId, agentId: mount.agentId })
       : null;
+    // A re-take nobody asked for (the runtime's, `keepCredentialed`) must not swap a list a credential was behind for
+    // one that says what no credential may do, only because the credential did not resolve this time.
+    if (opts?.keepCredentialed && plugin.credential && !credential && mount.toolSnapshot && !mount.toolSnapshot.withoutCredential) {
+      return { ok: false, error: `${alias}'s credential did not resolve, so its tools were not listed again; the list taken under it is kept` };
+    }
     let snapshot;
     try {
-      const listed = await plugin.snapshotTools(this.#contextFor({ tenantId, agentId, taskId: "tool-snapshot" }, mount, credential));
+      const listed = await plugin.snapshotTools(this.#contextFor({ tenantId, agentId, taskId: "tool-snapshot" }, mount, credential, false, undefined, true));
+      // A re-take keeps a list a credential was behind unless the new answer is about that credential's reach: the far
+      // end refusing it (`ListedTools.refused`) says nothing about what it may do, and one unreachable or refused
+      // moment must not shrink a working list for good — the basis the shrunken list would carry stops every later
+      // re-take. Likewise a credentialed list that comes back empty: kept, and reported, until a person refreshes
+      // (an operator's refresh and a credential change still take the answer as it is).
+      const prior = mount.toolSnapshot;
+      if (opts?.keepCredentialed && prior && !prior.withoutCredential && prior.tools.length > 0 && (listed.refused || listed.tools.length === 0)) {
+        return {
+          ok: false,
+          error: listed.refused
+            ? `${alias}'s credential was refused while its tools were listed again; the list taken under it is kept`
+            : `${alias}'s tools were listed again and came back empty; the list taken under its credential is kept`,
+        };
+      }
       snapshot = await admitTools(listed, Date.now());
+      // Which of the plugin's tool sets this list was taken under, so a build whose set moved re-takes it at the
+      // next turn (`Plugin.toolsBasis`, `AgentRuntime.retakeStaleSnapshots`). Not covered by `hash`, like
+      // `withoutCredential`: it is about the plugin, not the list.
+      if (plugin.toolsBasis !== undefined) snapshot.basis = plugin.toolsBasis;
       // Taken for a plugin that wants an account while the mount has none: marked, so a later failure to list under
       // a real credential does not keep it as that credential's list (`ToolSnapshot.withoutCredential`).
       if (plugin.credential && !credential) snapshot.withoutCredential = true;
@@ -1325,7 +1360,16 @@ export class ToolGateway {
     if (!now || now.installationId !== mount.installationId) {
       return { ok: false, stale: true, error: `${alias} was removed or replaced while its tools were being listed; nothing was kept` };
     }
-    const changed = now.toolSnapshot?.hash !== snapshot.hash || !!now.toolSnapshot?.withoutCredential !== !!snapshot.withoutCredential;
+    // A re-take nobody asked for answers for the list it started from, and nothing else: if that list was replaced
+    // while this one was being taken — a credential attached, replaced or removed, an operator's refresh, each of
+    // which keeps the `installationId` and lists again — the newer list is the truer one, and writing over it would
+    // stick, since it would carry the current basis and no later turn would ask again. The listing may outlive the
+    // runtime's timeout (it runs to the plugin's own), so this is checked here, at the write.
+    if (opts?.keepCredentialed && !sameSnapshot(now.toolSnapshot, mount.toolSnapshot)) {
+      return { ok: false, stale: true, error: `${alias}'s tools were listed again by someone else while this listing ran; theirs is kept` };
+    }
+    const changed = now.toolSnapshot?.hash !== snapshot.hash || !!now.toolSnapshot?.withoutCredential !== !!snapshot.withoutCredential ||
+      now.toolSnapshot?.basis !== snapshot.basis;
     // A write that fails is a failed snapshot, answered like one: the mount and
     // whatever list it had stay as they were, and the operator reads why.
     if (changed) {

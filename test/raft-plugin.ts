@@ -1,12 +1,12 @@
 import { createHmac } from "node:crypto";
 import { createRaft, isInterrupted, RAFT_OPERATIONS } from "@botiverse/raft-sdk";
-import { raftPlugin, EXCLUDED, EVENTS_LIMIT, GENERATED, handOver, INBOX_STORE, KEY_LIFETIME_MS, PAGE_ROWS, PUSH_KEY, PUSH_STORE, originOf, pagingArg, toolOf, offeredTerms, escapeMarks, unescapeMarks, createRaftPlugin, downloadAttachment, ATTACHMENT_MAX_BYTES } from "../src/plugins/raft.ts";
+import { raftPlugin as raftWithoutStorage, EXCLUDED, EVENTS_LIMIT, GENERATED, handOver, INBOX_STORE, KEY_LIFETIME_MS, PAGE_ROWS, PUSH_KEY, PUSH_STORE, originOf, pagingArg, toolOf, offeredTerms, escapeMarks, unescapeMarks, createRaftPlugin, downloadAttachment, ATTACHMENT_MAX_BYTES, toolsBasisOf } from "../src/plugins/raft.ts";
 import { readFileSync } from "node:fs";
 import { PARK_BYTES } from "../src/plugins/artifacts.ts";
 import { setLogSink } from "../src/core/log.ts";
 import { Interrupt, toolsOf, type PluginErrorFields } from "../src/plugins/types.ts";
 import { admitTools } from "../src/runtime/mount-tools.ts";
-import { AgentRuntime, limitForCall, tooLargeResult } from "../cf/src/runtime.ts";
+import { AgentRuntime, limitForCall, tooLargeResult, RETAKE_BACKOFF_MS } from "../cf/src/runtime.ts";
 import { ToolGateway } from "../src/runtime/gateway.ts";
 import { SqliteStore } from "../src/store/sqlite.ts";
 import { PluginDbTables } from "../src/store/plugin-db.ts";
@@ -15,9 +15,17 @@ import { openPluginDatabase } from "../src/runtime/plugin-db.ts";
 import { QuickJsExecutor } from "../src/runtime/executor.ts";
 import { bridgeTools, qualifyMountedTools, runJsTool, type MountedTool } from "../src/runtime/pi-tools.ts";
 
+/**
+ * The plugin as the runtime builds it (cf/src/runtime.ts): with object storage, so the attachment download is offered.
+ * The module's `raftPlugin` has none, and so does not offer it (`raftWithoutStorage`, held below).
+ */
+const raftPlugin = createRaftPlugin({ artifacts: { async put() { throw new Error("test: nothing should be stored here"); } } });
+
 const originalFetch = globalThis.fetch;
 const PUSH_SECRET = "raft-push-secret-for-tests";
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
+
+function must(cond: unknown, msg: string): void { if (!cond) throw new Error(msg); }
 
 async function check(name: string, fn: () => Promise<void>) {
   try { await fn(); results.push({ name, ok: true }); }
@@ -3149,6 +3157,142 @@ await check("mentions_add is never named in what the model reads: no description
   if (!/\bmentions_add\b/.test(doctored.summary)) throw new Error(`control: a description naming mentions.add came out as ${JSON.stringify(doctored.summary)}`);
   const said = `  add: mentions_add({ resolutionIds: ["${PENDING_ID}"] })`;
   if (offeredTerms(said, new Set(["mentions_add"])) !== "  add: adding them to the conversation, which this mount does not offer") throw new Error(offeredTerms(said, new Set(["mentions_add"])));
+});
+
+// ---- what this mount offers is the kernel's answer (`PluginContext.offered`) --------------------------------------
+
+/** A page with an attachment and older messages: the SDK points at attachments_download_url and at messages_read. */
+const pointing = () => history([historyMessage(41, "see", { attachments: [{ id: "att-1", filename: "plan.pdf" }] })], { has_older: true, target: "#ops" });
+const SDK_SUFFIX = '@tygg: see [1 attachment: plan.pdf (id:att-1) — use attachments_download_url({ attachmentId: "att-1" }) to download]';
+const SDK_OLDER = 'Older exist: messages_read({ target: "#ops", before: 41 })';
+const OUR_SUFFIX = "@tygg: see [1 attachment: plan.pdf — this mount has no tool to open attachments]";
+const OUR_OLDER = "Older exist: a Raft operation this mount does not offer";
+
+await check("a generated tool missing from ctx.offered is said in words, in a hint and in the attachment suffix; one in it is left as the SDK wrote it", async () => {
+  const every = raftPlugin.tools.map((t) => t.name);
+  const page = async (offered?: readonly string[]) => {
+    globalThis.fetch = (async () => pointing()) as any;
+    return String(((await raftPlugin.invoke("messages_read", { target: "#ops" }, inTurn({ ...ctx(), ...(offered ? { offered } : {}) }))) as any).text);
+  };
+  // Offered: the SDK's words stand.
+  const all = await page(every);
+  if (!all.includes(SDK_SUFFIX) || !all.split("\n").includes(SDK_OLDER) || /does not offer|no tool to open/.test(all)) throw new Error(`everything offered: ${all}`);
+  // The mount lacks both (a stale snapshot, a narrower credential): neither is named.
+  const lacking = await page(every.filter((n) => n !== "attachments_download_url" && n !== "messages_read"));
+  if (!lacking.includes(OUR_SUFFIX) || !lacking.split("\n").includes(OUR_OLDER) || /attachments_download_url|messages_read\(/.test(lacking)) throw new Error(`both lacking: ${lacking}`);
+  // One lacking, the other offered: each follows its own name.
+  const onlyRead = await page(every.filter((n) => n !== "attachments_download_url"));
+  if (!onlyRead.includes(OUR_SUFFIX) || !onlyRead.split("\n").includes(SDK_OLDER)) throw new Error(`only the download lacking: ${onlyRead}`);
+  // No `offered` (a context the gateway did not build): the plugin's own set, which offers both.
+  const plain = await page();
+  if (!plain.includes(SDK_SUFFIX) || !plain.split("\n").includes(SDK_OLDER)) throw new Error(`no offered: ${plain}`);
+});
+
+await check("through the gateway, a tool the credential lacks is not named: the mount's list reaches the plugin as ctx.offered", async () => {
+  const listedUnder = async (caps: string[]) => {
+    one(context(caps));
+    return admitTools(await raftPlugin.snapshotTools!(ctx()), 0);
+  };
+  const store = new SqliteStore(":memory:");
+  await store.init();
+  await store.createAgent("tenant", "agent");
+  await store.addMount({ tenantId: "tenant", agentId: "agent", alias: "inbox", plugin: "raft", installationId: "i", connectionId: null,
+    toolVersion: raftPlugin.version, publicConfig: { serverUrl: "https://raft.example" }, secretRef: "secret:raft", policy: null });
+  const gateway = new ToolGateway(store, [raftPlugin], new Set([raftPlugin.id]), { async resolve() { return "sk_agent_test_1234567890"; } });
+  const overview = async () => {
+    globalThis.fetch = (async () => server([{ id: "c1", name: "ops", joined: true, type: "channel" }])) as any;
+    const out: any = await gateway.invoke({ tenantId: "tenant", agentId: "agent", taskId: "task", contextId: "c" } as any, "inbox.server_info", { view: "full" });
+    return String(out.result?.text ?? JSON.stringify(out));
+  };
+  const LINE = /^Server-profile changes have no tool and remain server-role gated: ask a human via an action card \((.*)\)\.$/m;
+  // A credential with tasks: actions_prepare is on the mount's list, and the SDK's pointer at it stands.
+  await store.updateMountToolSnapshot("tenant", "agent", "inbox", await listedUnder(["read", "tasks"]));
+  const withTasks = await overview();
+  if (LINE.exec(withTasks)?.[1] !== "`actions_prepare`") throw new Error(`with tasks: ${withTasks}`);
+  // One without: the same line says it in words.
+  await store.updateMountToolSnapshot("tenant", "agent", "inbox", await listedUnder(["read"]));
+  const readOnly = await overview();
+  if (/actions_prepare/.test(readOnly) || LINE.exec(readOnly)?.[1] !== "`a Raft operation this mount does not offer`") throw new Error(`read only: ${readOnly}`);
+});
+
+await check("a plugin built with no object storage does not offer the download at all, and every pointer at it says so", async () => {
+  const has = (tools: readonly { name: string }[]) => tools.some((t) => t.name === "attachments_download_url");
+  if (has(raftWithoutStorage.tools) || has(raftWithoutStorage.mountTools!({ toolSnapshot: null } as any))) throw new Error("offered with no storage");
+  // Not even when a snapshot taken by a build with storage lists it.
+  one(context(["read"]));
+  const stored = await admitTools(await raftPlugin.snapshotTools!(ctx()), 0);
+  if (!has(stored.tools) || has(raftWithoutStorage.mountTools!({ toolSnapshot: stored } as any))) throw new Error("offered from a snapshot");
+  one(context(["read"]));
+  if (has((await raftWithoutStorage.snapshotTools!(ctx())).tools)) throw new Error("listed with no storage");
+  // Its message lines say there is no tool, with or without the kernel's list, while the other hints stand.
+  for (const offered of [undefined, raftWithoutStorage.tools.map((t) => t.name)]) {
+    globalThis.fetch = (async () => pointing()) as any;
+    const page = String(((await raftWithoutStorage.invoke("messages_read", { target: "#ops" }, inTurn({ ...ctx(), ...(offered ? { offered } : {}) }))) as any).text);
+    if (!page.includes(OUR_SUFFIX) || /attachments_download_url/.test(page) || !page.split("\n").includes(SDK_OLDER)) throw new Error(`offered=${offered ? "given" : "absent"}: ${page}`);
+  }
+  // Control: the same build with storage offers it and keeps the SDK's pointer.
+  if (!has(raftPlugin.tools)) throw new Error("control: not offered with storage");
+  // The two builds offer different sets, so they have different bases (`toolsBasis`).
+  if (!raftPlugin.toolsBasis || raftPlugin.toolsBasis === raftWithoutStorage.toolsBasis || createRaftPlugin({ artifacts: fakeArtifacts() }).toolsBasis !== raftPlugin.toolsBasis) {
+    throw new Error(`bases: ${raftPlugin.toolsBasis} ${raftWithoutStorage.toolsBasis}`);
+  }
+});
+
+await check("a turn's re-take that Raft refuses, or that lists nothing, keeps the working list, says why, and backs off; an operator's refresh still takes it", async () => {
+  const { rt, offered } = await raftRuntime();
+  const every = ["read", "send", "reactions", "mentions", "tasks", "knowledge", "channels"];
+  let answer: "ok" | "refuse" | "empty" = "ok";
+  let asked = 0;
+  globalThis.fetch = (async (url: any) => {
+    const path = new URL(String(url)).pathname;
+    if (path === "/internal/agent-api") return json(200, { agentId: "agent-1", agentName: "raft-bot", agentDisplayName: null, serverId: "server-1" });
+    if (path === "/internal/agent-api/context") {
+      asked++;
+      return answer === "refuse" ? json(401, { error: "unauthorized" }) : context(answer === "empty" ? [] : every);
+    }
+    throw new Error(`unexpected request: ${path}`);
+  }) as any;
+  must((await rt.attachCredential("t", "a", "raft", { token: "sk_agent_first_1234567890" })).ok, "attach");
+  const working = await offered();
+  must(working.length === raftPlugin.tools.length && working.length > OWN.length + 30, `control: the credential reaches every tool: ${working.length}`);
+  const stale = async () => {
+    const m = (await rt.store.getMountByAlias("t", "a", "raft"))!;
+    await rt.store.updateMountToolSnapshot("t", "a", "raft", { ...m.toolSnapshot!, basis: "raft-tools:an-older-build" });
+  };
+  for (const [what, mode, reason] of [["refused", "refuse", /refused/], ["empty", "empty", /came back empty/]] as const) {
+    await stale();
+    answer = mode;
+    const before = asked;
+    const realNow = Date.now;
+    try {
+      Date.now = () => realNow() + (what === "empty" ? RETAKE_BACKOFF_MS + 1 : 0);
+      await rt.retakeStaleSnapshots("t", "a");
+      must(asked === before + 1, `${what}: control: Raft was asked: ${asked - before}`);
+      must(JSON.stringify(await offered()) === JSON.stringify(working), `${what}: the list shrank to ${(await offered()).length}: ${(await offered()).join(", ")}`);
+      must(reason.test(rt.snapshotError("raft") ?? ""), `${what}: snapshotError: ${rt.snapshotError("raft")}`);
+      await rt.retakeStaleSnapshots("t", "a");
+      must(asked === before + 1, `${what}: asked again within the back-off`);
+    } finally { Date.now = realNow; }
+  }
+  // An operator's refresh is not a re-take: a refused credential lists nothing, as it always has.
+  answer = "refuse";
+  await rt.refreshMountTools("t", "a", "raft");
+  must(JSON.stringify(await offered()) === JSON.stringify(OWN), `operator refresh: ${(await offered()).join(", ")}`);
+});
+
+await check("the basis covers each tool's name and the capability it needs, in any order", async () => {
+  const tools = GENERATED.map((op) => ({ name: op.toolName, capability: op.capability }));
+  const base = toolsBasisOf(tools);
+  must(toolsBasisOf([...OWN.map((name) => ({ name })), ...tools]) === raftPlugin.toolsBasis, `control: the plugin's basis is made this way: ${raftPlugin.toolsBasis}`);
+  // Same names and capabilities, other orders (the tools reversed, a capability list reversed): the same basis.
+  const reordered = [...tools].reverse().map((t) => ({ ...t, capability: [...t.capability].reverse() }));
+  must(toolsBasisOf(reordered) === base, "the order moved the basis");
+  // One operation's capability changed, names untouched: a different basis.
+  const i = tools.findIndex((t) => t.name === "messages_read");
+  const moved = tools.map((t, k) => (k === i ? { ...t, capability: [...t.capability, "channels"] } : t));
+  must(toolsBasisOf(moved) !== base, "a capability change left the basis as it was");
+  // And a name change does too.
+  must(toolsBasisOf(tools.slice(1)) !== base, "a removed tool left the basis as it was");
 });
 
 globalThis.fetch = originalFetch;
