@@ -338,6 +338,35 @@ rests on:
 `test/pd-outbox.ts` and `npm run pd-outbox:do` compare the rows with PiAgent's
 for the same conversation, and cover the jobs' crash, cancel and rollback cases.
 
+#### What `caller.contextId` rests on
+
+`PluginContext.caller.contextId` (`src/runtime/context-id.ts`) promises a
+plugin that the id changes when the model's context is rebuilt. It does not
+read the context to find out. It reads the entry each engine rebuilds the
+context from, so it rests on how each engine does that. Each point below is
+pinned in `test/caller-context.ts`:
+
+- **pi-agent-core 0.85 starts a session's context at its newest `compaction`
+  entry on the path** (`buildContextEntries`, `dist/harness/session/context.js`).
+  An entry before it contributes nothing, and an entry after it is not a
+  boundary. The id hashes the newest `compaction`, `branch_summary` or
+  `pi.reset` entry, which it finds through the partial index `<entries>_boundary`.
+- **pi-durable 1.0.0 starts a conversation's context at its newest head marker**
+  (`captureContextBounds` → `findLatestHeadMarker`, `dist/harness/context.js`),
+  and both a compaction and a reset write one (`head` set). The id hashes
+  `MAX(id)` of entries with `head IS NOT NULL`.
+- **pi-durable applies context edits with no head marker.** An entry's
+  `edits` (`omit` / `replace`, `deriveContext`) can take an earlier read out
+  of the model's context while the newest head marker stays where it was, so
+  the id would not change. Nothing in `src/` or `cf/src/` writes an edit, and a
+  test fails if anything starts to. Whoever starts writing edits has to make
+  the id change with them: one way is to add the editing entry to what the id
+  hashes.
+- **pi085's `navigateTree`** moves the tip back without writing a boundary.
+  Its one caller, `resumeClientCalls` (`src/runtime/client-calls.ts`), carries
+  every result of the paused message onto the new branch, so no read leaves
+  the context. A new caller that rewinds past a read has to write a boundary.
+
 ### 4. pi-mcp — what `src/plugins/mcp.ts` rests on
 
 The plugin imports exactly `McpClient`, `StreamableHttpTransport` and

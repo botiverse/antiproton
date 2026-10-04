@@ -346,6 +346,33 @@ saw. So does `read_messages`, because Raft marks what a history read returns
 as read. A tool a server lists never carries it (the kernel admits only the
 fields it knows).
 
+**Read `context.caller` for where a call came from.** Besides `tenantId`,
+`agentId` and `taskId` it carries two read-only fields, filled by the gateway
+on both engines and present only when they say something:
+
+- `fromProgram: true` — the call came from a run_js program, not from the
+  model's own tool call. It is `InvokeOpts.fromProgram`, which run_js sets
+  after the program's options, so a program can neither clear it nor set it on
+  someone else's call. Absent for the model's calls, an approved call's replay,
+  provisioning and bench shells. Use it for a tool a program may call but whose
+  result the model has not necessarily seen; a tool a program must never reach
+  declares `modelOnly` instead.
+- `contextId` — an opaque id for the model's current context window in this
+  agent's session. It is the same on every call of one context and never per
+  turn, and a restarted object computes the same value, because it is derived
+  from durable state (`src/runtime/context-id.ts`). It changes on exactly
+  these: a new session, a compaction, a reset, a move between engines, and a
+  transcript that was remade — and, on pi085, a branch summary, which nothing
+  writes today. Two ways a read can leave the context do **not**
+  change it, and neither drops a read today: pi085 moving the conversation's
+  tip back (`navigateTree`, used only to resume a caller's paused functions,
+  which carries every result along) and pi-durable's context edits (`omit` /
+  `replace`, which nothing writes; a test fails if something starts to). Scope
+  "what the model has seen" by it and compare it for equality only. Absent
+  when the call is not made in a session's turn (an approved call's replay,
+  provisioning, a bench shell, a background job's poll): treat that as
+  "nothing is known to be seen".
+
 **Bound a number, shape a header list.** A `number` setting can carry `min` and
 `max`; a value outside them is refused when the mount is written, as everything
 in `validateMount` is — refused, not clamped, so the person writing it learns

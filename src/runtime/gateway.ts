@@ -111,6 +111,13 @@ export interface CallContext {
   tenantId: string;
   agentId: string;
   taskId: string;
+  /**
+   * Which context window of the session the model is in (`contextIdOf`, src/runtime/context-id.ts), handed to the
+   * plugin as `caller.contextId`. Set only by the agent's tool host for a call made in a session's turn; a caller
+   * outside one (an approval's replay, provisioning, a bench shell, a background poll) leaves it out, and so does
+   * the plugin's context. A program never builds this object, so it cannot name one.
+   */
+  contextId?: string;
 }
 
 /**
@@ -139,7 +146,8 @@ export interface InvokeOpts {
    * after the program's own options, so a program cannot clear it. A tool that
    * declares `modelOnly` is refused for it here, whatever name reached the
    * gateway — run_js can only check the names it offered, and `plugin.tool`
-   * resolves here to the one mount of that plugin under any alias.
+   * resolves here to the one mount of that plugin under any alias. Any other
+   * tool is told through `PluginContext.caller.fromProgram`.
    */
   fromProgram?: true;
 }
@@ -826,7 +834,9 @@ export class ToolGateway {
       } as ToolResult;
     }
 
-    return this.#run(ctx, r, plugin, operationId, facts, (context) => plugin.invoke(r.tool, args, context));
+    // `fromProgram` reaches the plugin as `caller.fromProgram`, so a plugin can tell a program's call from the
+    // model's own without declaring the tool model-only.
+    return this.#run(ctx, r, plugin, operationId, facts, (context) => plugin.invoke(r.tool, args, context), opts.fromProgram === true);
   }
 
   /**
@@ -842,6 +852,7 @@ export class ToolGateway {
     operationId: string,
     facts: () => { callId?: string },
     step: (context: PluginContext) => Promise<Json | Backgrounded | Interrupt>,
+    fromProgram = false,
   ): Promise<ToolResult> {
     const credential = r.mount.secretRef
       ? await this.#secrets.resolve(r.mount.secretRef, { tenantId: r.mount.tenantId, agentId: r.mount.agentId })
@@ -875,7 +886,7 @@ export class ToolGateway {
         return alreadyAttempted(
           operationId, (await this.#store.getOperation(ctx.tenantId, operationId))?.status ?? null);
       }
-      const raw = await step(this.#contextFor(ctx, r.mount, credential));
+      const raw = await step(this.#contextFor(ctx, r.mount, credential, fromProgram));
       // A tool that ended a container's lease says so under LEASE_KEY. The fact
       // is recorded and the key removed: the result object is serialised whole
       // into what the model reads, so left in place it is tokens in the
@@ -900,7 +911,7 @@ export class ToolGateway {
           : "error" in spec ? `${plugin.id} asked a question whose answer spec is unusable: ${spec.error}` : null;
         if (why !== null) {
           if (interruptsOf(plugin)?.cancel) {
-            try { await interruptsOf(plugin)!.cancel!(r.tool, result.state, this.#contextFor(ctx, r.mount, credential)); } catch { /* reported below either way */ }
+            try { await interruptsOf(plugin)!.cancel!(r.tool, result.state, this.#contextFor(ctx, r.mount, credential, fromProgram)); } catch { /* reported below either way */ }
           }
           await this.#store.completeOperation(ctx.tenantId, operationId, "failed", null, undefined, facts());
           await counted("failed");
@@ -1052,12 +1063,18 @@ export class ToolGateway {
    * a poll or a cancel sees exactly the context the call saw, credential
    * included, and nothing about a background job has to travel with it.
    */
-  #contextFor(ctx: CallContext, mount: MountRecord, credential: string | null) {
+  #contextFor(ctx: CallContext, mount: MountRecord, credential: string | null, fromProgram = false) {
     const store = this.#store;
     const secrets = this.#secrets;
     const db = (m: MountRecord) => this.#db(ctx, m);
     return {
-      caller: { tenantId: ctx.tenantId, agentId: ctx.agentId, taskId: ctx.taskId },
+      // Both extras are present only when they say something: `fromProgram` only ever true, `contextId` only for a
+      // call made in a session's turn. A plugin reads absence as "not a program" and "no context to scope by".
+      caller: {
+        tenantId: ctx.tenantId, agentId: ctx.agentId, taskId: ctx.taskId,
+        ...(fromProgram ? { fromProgram: true as const } : {}),
+        ...(typeof ctx.contextId === "string" ? { contextId: ctx.contextId } : {}),
+      },
       alias: mount.alias,
       credential,
       // What kind of credential the mount names, so a null `credential` can be read as "names none" or
