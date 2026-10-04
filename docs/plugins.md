@@ -107,6 +107,17 @@ the names it was opened with. Renaming a tool, or changing how names are
 formed, makes every session opened before the change fail at admission. A
 rename is a migration, not a relabel.
 
+**A retired tool name is declared.** When a tool is renamed or removed anyway,
+list the old name in `retired`: old name to the tool that replaced it, or
+`null` when nothing did (`raft` declares the hand-written tools its generated
+ones replaced, `RETIRED` in `src/plugins/raft.ts`). A model goes on calling a
+name it has seen, and pi answers an unknown name with a line that reads as a
+passing fault, so an agent retries it. The runtime puts what `retired` says in
+that line's place before the next request — renamed, and what to call instead;
+or removed (`src/runtime/unavailable-tool.ts`). Names are the plugin's own, not
+`<alias>__<tool>`. Every target must be one of the plugin's `tools` and no old
+name may be one; test both, as `test/unavailable-tool.ts` does for raft.
+
 **Do not write the alias into text.** The operator picks the alias. When an
 error or a prompt paragraph has to name one of the plugin's tools, build the
 name from `ctx.alias`, not from the plugin id.
@@ -320,7 +331,11 @@ server. Every reader that is about one mount — the catalogue, the gateway,
 `tools.search`/`describe`, the console's tool column — asks `toolsOf(plugin,
 mount)`, never `plugin.tools`, so they all see one list. Names the kernel left
 out are in the snapshot's `skipped`, shown on the mount's console page and in
-`tools.mounts`. The version pin is still the plugin's `version`: a snapshot
+`tools.mounts`, and told to a model that calls one anyway. An entry is about
+the one tool it names; a plugin whose list is empty for one reason that is not
+about any tool (raft's mount with no credential, or one Raft refused) marks the
+entry `every: true` (`SkippedTool`), and its reason then answers a call to any
+of the plugin's tools the mount leaves out, its `name` being only a label. The version pin is still the plugin's `version`: a snapshot
 changes what a mount offers, not which code runs it.
 
 **Declare `toolsBasis` when the build decides which tools a listing can

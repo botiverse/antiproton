@@ -367,6 +367,43 @@ pinned in `test/caller-context.ts`:
   every result of the paused message onto the new branch, so no read leaves
   the context. A new caller that rewinds past a read has to write a boundary.
 
+#### What the unknown-tool explanation rests on
+
+A call to a tool the model was not offered is answered by pi itself, before any
+hook of ours, with a fixed line. The runtime replaces that line with why
+(`explainUnavailableTool`, `src/runtime/unavailable-tool.ts`: a name the plugin
+retired, a name the mount's tool list left out, no such tool) in each request as
+it goes out; the transcript keeps pi's result as pi wrote it. Recognising pi's
+result means keying on its text, which no type carries. Each point is pinned in
+`test/unavailable-tool.ts`, which drives the real engine with an unknown name
+and fails if the recogniser no longer matches what pi wrote:
+
+- **pi-agent-core 0.85.1** answers with an error result whose only content is
+  `Tool "<name>" is unavailable` (`JSON.stringify` of the call's name), no
+  `details` (`prepareToolCall`, `dist/harness/execution/tools.js`). It is
+  recognised by that exact text for the result's own `toolName`, `isError`, and
+  a name that is not among the harness's tools: pi takes that path only for a
+  name it does not have, and a tool that does not exist cannot have answered.
+  "No `details`" is checked as well, as defence in depth and not as a
+  discriminator: a tool's thrown error has no `details` either. One case the shape cannot tell apart: a tool that existed when
+  called, answered with exactly that text, and has since left the catalogue;
+  its old result is explained as a missing tool, which is then true. The
+  rewrite is the `transform_context` hook (`PiAgent.open`), whose result is
+  used for that request only.
+- **pi-durable 1.0.0** answers with `harnessError("tool_unavailable", "Tool
+  <name> is not available")`, rendered into the content as
+  `<harness>\n[error] Tool <name> is not available\n</harness>`, from two
+  places: the round (`startToolRound`, `dist/harness/generation.js`) for a call
+  the request did not offer, and the tool task (`dist/harness/tool.js`, the
+  `call` phase) for a tool that is gone when the task runs. Besides the text,
+  the entry must carry exactly that one `tool_unavailable` diagnostic
+  (`isPdUnavailableEntry`, read from the entries table by
+  `PdHost.#unavailableResults`): our tools record no diagnostic, so a real
+  tool's identical text is never taken for it, even once the tool is gone. The
+  rewrite is the generation's `beforeRequest` hook, on the session's tools
+  extension (`toolsExtension`, `src/runtime/durable-tools.ts`); pi-durable uses
+  its result for that request only.
+
 ### 4. pi-mcp — what `src/plugins/mcp.ts` rests on
 
 The plugin imports exactly `McpClient`, `StreamableHttpTransport` and

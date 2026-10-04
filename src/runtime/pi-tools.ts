@@ -108,10 +108,21 @@ export interface InterruptKeeping {
  * `issues.list`, which the provider rejects with a 400 for the whole request —
  * one badly named tool anywhere in the catalogue stops every call.
  */
-const modelName = (name: string) => name.replace(/[^A-Za-z0-9_-]/g, "_");
+export const modelName = (name: string) => name.replace(/[^A-Za-z0-9_-]/g, "_");
 
 /** Providers cap a tool name; 64 is the smallest cap among the ones we target. */
 const MAX_NAME = 64;
+
+/**
+ * The name `qualifyMountedTools` gives a mount's tool when nothing else on the agent took it first: the one
+ * string a model would have been shown for `tool` on `alias`. Exported for reading a name back (which mount,
+ * which of its tools, src/runtime/unavailable-tool.ts); a name that took the collision tie-break is not this.
+ */
+export function modelToolName(alias: string, tool: string): string {
+  const a = modelName(alias);
+  const room = Math.max(1, MAX_NAME - a.length - 2);
+  return `${a}__${modelName(tool).slice(0, room)}`;
+}
 
 /**
  * Model-facing names must be unique, because that is all the model can say —
@@ -246,9 +257,7 @@ export function qualifyMountedTools<T extends MountedTool>(tools: T[]): T[] {
       used.add(t.name);
       return t;
     }
-    const bare = modelName(t.name);
-    const room = Math.max(1, MAX_NAME - alias.length - 2);
-    let name = `${alias}__${bare.slice(0, room)}`;
+    let name = modelToolName(alias, t.name);
     for (let n = 2; used.has(name); n++) {
       const tag = String(n);
       name = `${name.slice(0, MAX_NAME - tag.length)}${tag}`;

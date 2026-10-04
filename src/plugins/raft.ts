@@ -497,6 +497,32 @@ export const GENERATED: readonly RaftOperationSpec[] = generatedFrom(EXCLUDED);
 const DEFAULT_UNOFFERED = unofferedNames(EXCLUDED);
 
 /**
+ * Tool names this plugin no longer offers, old name to new (`Plugin.retired`): the hand-written tools the generated
+ * ones replaced (#729), and two operations an SDK upgrade dropped (below). Each old hand-written tool
+ * did what its replacement's operation does: `list_channels` paged `server.info`'s channel view, `join_channel`
+ * joined through Raft's routes directly, and the rest called the SDK operation their replacement is generated
+ * from. `test/unavailable-tool.ts` holds that every target is a tool this plugin offers and that no old name is
+ * offered again. `receive_events` and the push tools stayed hand-written, under
+ * their names, so they are not here.
+ */
+export const RETIRED: Readonly<Record<string, string | null>> = {
+  send_message: "messages_send",
+  join_channel: "channels_join",
+  prepare_action: "actions_prepare",
+  list_channels: "server_info",
+  channel_members: "channels_members",
+  read_messages: "messages_read",
+  search_messages: "messages_search",
+  // SDK 0.12.0 (#740) removed these two operations, which 0.11.0's manifest marked deprecated: `mentions.deliveries`
+  // with "use mentions.delivery", and `mentions.execute` with "use mentions.notify / mentions.add". This plugin
+  // offered `mentions_deliveries` until then. It never offered `mentions_execute` (EXCLUDED from #729 until the
+  // operation was gone), but the SDK's own text named it, so a model may still call it; its entry is null, and the
+  // explanation says only that the mount does not offer it, never that it did.
+  mentions_deliveries: "mentions_delivery",
+  mentions_execute: null,
+};
+
+/**
  * The parking line, in rows. A result longer than `PARK_BYTES` (src/plugins/artifacts.ts, which the runtime's
  * `offloadLimit` reads) is parked and the model is handed a preview. A page of `PAGE_ROWS` rows stays under it
  * when a row takes `ROW_CHARS` characters of the result — one message line with its header and a few
@@ -1420,6 +1446,7 @@ export function createRaftPlugin(deps: { artifacts?: RaftArtifacts | null; exclu
     },
     /** Every tool any mount can be offered; one mount's own list is `mountTools`. */
     tools: allTools,
+    retired: RETIRED,
 
     /**
      * The tools this mount offers: its own tools, and the generated ones its snapshot lists — the operations whose
@@ -1451,12 +1478,12 @@ export function createRaftPlugin(deps: { artifacts?: RaftArtifacts | null; exclu
      */
     async snapshotTools(ctx: PluginContext): Promise<ListedTools> {
       if (!ctx.credential) {
-        return { tools: [], skipped: [{ name: EVERY_OPERATION, reason: "this mount has no Raft credential, so it has no capabilities" }] };
+        return { tools: [], skipped: [{ name: EVERY_OPERATION, reason: "this mount has no Raft credential, so it has no capabilities", every: true }] };
       }
       const me = await raftFor(ctx, { state: false }).identity.whoami();
       if (!me.ok) {
         if (me.status === 401 || me.status === 403) {
-          return { tools: [], refused: true, skipped: [{ name: EVERY_OPERATION, reason: `Raft refused this mount's credential (HTTP ${me.status})` }] };
+          return { tools: [], refused: true, skipped: [{ name: EVERY_OPERATION, reason: `Raft refused this mount's credential (HTTP ${me.status})`, every: true }] };
         }
         throw new Error(`could not ask Raft what this mount's credential may do: ${me.error.message}`);
       }

@@ -28,6 +28,7 @@ import {
   withholdTools,
   refuseWithheld,
 } from "../../src/runtime/pi-tools.ts";
+import { explainUnavailableTool } from "../../src/runtime/unavailable-tool.ts";
 import { systemPrompt } from "../../src/runtime/pi-prompt.ts";
 import { ASSUMED_CONTEXT_WINDOW } from "../../src/model/context-windows.ts";
 import { BACKGROUND_CONTEXT } from "@earendil-works/pi-agent-core/harness/context";
@@ -2158,6 +2159,12 @@ export class AgentRuntime {
     });
     const model = this.#modelOf(binding);
     const dispatch = this.#dispatchFor(tenantId, agentId);
+    // A call to a tool the model was not offered is answered by pi with its own line; each engine sends this
+    // instead (src/runtime/unavailable-tool.ts), read from the same mounts the catalogue was built from.
+    const explainUnavailable = (name: string) => explainUnavailableTool(name, {
+      mounts: records.map((m) => ({ alias: m.alias, plugin: this.#plugins.find((pl) => pl.id === m.plugin), toolSnapshot: m.toolSnapshot })),
+      offered: offered as MountedTool[], unoffered,
+    });
 
     if (engine === "pd") {
       // The same catalogue PiAgent gets, through the same host and the same continuations
@@ -2172,6 +2179,7 @@ export class AgentRuntime {
         extraTools: extraTools as never, clientTools: callerDefs,
         // The cancel marker's model message, as PiAgent's entry projector below makes it.
         cancelNote: CANCELLED_NOTE,
+        explainUnavailable,
       });
       this.#agents.set(cacheKey, { agent: pd, builtFrom });
       return pd;
@@ -2194,6 +2202,7 @@ export class AgentRuntime {
       toolHost: host,
       ...(keeping ? { interrupts: keeping } : {}),
       dispatch,
+      explainUnavailable,
     });
     agentRef.current = agent;
     this.#agents.set(cacheKey, { agent, builtFrom });

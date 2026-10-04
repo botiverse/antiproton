@@ -95,7 +95,7 @@ export interface ToolSchema {
 export interface ToolSnapshot {
   hash: string;
   tools: ToolSchema[];
-  skipped: Array<{ name: string; reason: string }>;
+  skipped: SkippedTool[];
   takenAt: number;
   /**
    * Present, and true, when the list was taken for a plugin that declares a `credential` while the mount had none
@@ -120,7 +120,7 @@ export interface ToolSnapshot {
  */
 export interface ListedTools {
   tools: ToolSchema[];
-  skipped?: Array<{ name: string; reason: string }>;
+  skipped?: SkippedTool[];
   /**
    * Present, and true, when the far end refused the mount's credential, so `tools` (normally empty) says what a
    * refused credential may do rather than what this one may. Taken as it is on a credential change and an operator's
@@ -130,6 +130,22 @@ export interface ListedTools {
    * are words for a person.
    */
   refused?: true;
+}
+
+/**
+ * One tool a mount's list leaves out, and why: shown on the mount's page, and told to a model that calls it
+ * anyway (`explainUnavailableTool`, src/runtime/unavailable-tool.ts).
+ *
+ * `every: true` makes the entry stand for every tool of the plugin (its static `tools`) that the mount's list
+ * leaves out, not one: `name` is then a label for people, never matched as a tool name. For a list that is
+ * empty for one reason that is not about any one tool — raft's mount with no credential, or one Raft refused
+ * (which also sets {@link ListedTools.refused}). Without the flag the entry is about the tool named `name` only,
+ * however its name reads.
+ */
+export interface SkippedTool {
+  name: string;
+  reason: string;
+  every?: true;
 }
 
 /**
@@ -1779,6 +1795,22 @@ export interface Plugin {
   version: string;
   /** The tools every mount of this plugin offers; see `mountTools` for a plugin whose mounts differ. */
   tools: ToolSchema[];
+  /**
+   * Tool names this plugin used to offer and no longer does: each old name to the name of the tool that took
+   * its place, or `null` when it was removed with nothing in its place.
+   *
+   * A model keeps calling a name it saw — an older turn, a note it wrote, a session opened before the change —
+   * and pi answers a name it does not know with its own fixed text ("Tool … is unavailable"), which reads as a
+   * passing fault: an agent retried a renamed tool three times on exactly that. The runtime replaces that
+   * text, before the next request, with what this table says (`explainUnavailableTool`,
+   * src/runtime/unavailable-tool.ts): renamed, and what to call instead; or removed. Without an entry the
+   * model is told only that the mount has no such tool.
+   *
+   * Names are the plugin's own (`ToolSchema.name`), not `<alias>__<tool>`. Every target is a name in `tools`,
+   * and no old name is a current one; a plugin's test should hold both, as test/unavailable-tool.ts does for
+   * raft. Static, like `tools`: a rename is a fact about the code, not about one mount.
+   */
+  retired?: Readonly<Record<string, string | null>>;
   /**
    * The tools one mount offers, when they differ by mount; read through
    * {@link toolsOf}, never directly.
