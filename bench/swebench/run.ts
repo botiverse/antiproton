@@ -40,7 +40,7 @@ import type { Plugin } from "../../src/plugins/types.ts";
 import { isExclusive } from "../../src/plugins/types.ts";
 import type { ToolResult } from "../../src/core/tools.ts";
 import { readMeter, ratesFromEnv, meterLine } from "../meter.ts";
-import { gradeCommand, gradeFromLog, readGradeLog, settleShell, type GradedInstance, type ShellAnswer } from "./grade.ts";
+import { gradeCommand, gradeFromLog, gradeLogFrom, settleShell, type GradedInstance, type ShellAnswer } from "./grade.ts";
 import { BENCH_SWE_WITHHELD } from "./withheld.ts";
 import { BACKGROUND_CONTEXT as CTX } from "@earendil-works/pi-agent-core/harness/context";
 
@@ -261,10 +261,13 @@ async function runOne(inst: Instance) {
   // FAIL_TO_PASS and PASS_TO_PASS test, from one run of the repository's own test command. A command that
   // outlives the sandbox's grace window comes back `running` and is polled until it ends.
   const GRADE_DEADLINE_MS = Number(process.env.GRADE_DEADLINE_MS ?? 1_800_000);
-  const shellOut = async (command: string): Promise<string> => {
+  const shell = async (command: string): Promise<ShellAnswer> => {
     const first = await gw.invoke(ctx, `${SANDBOX_ALIAS}.shell`, { command }) as ShellAnswer;
-    const r = await settleShell(first, (bg) => gw.pollBackground(ctx, bg.alias, bg.handle as any),
+    return settleShell(first, (bg) => gw.pollBackground(ctx, bg.alias, bg.handle as any),
       { deadlineAt: Date.now() + GRADE_DEADLINE_MS });
+  };
+  const shellOut = async (command: string): Promise<string> => {
+    const r = await shell(command);
     if (r.status !== "succeeded") throw new Error(`grading command ${r.status}: ${r.error?.message ?? JSON.stringify(r.error ?? null)}`);
     return String(r.result?.output ?? "");
   };
@@ -272,8 +275,7 @@ async function runOne(inst: Instance) {
   let report: ReturnType<typeof gradeFromLog> | null = null;
   let gradeError: string | undefined;
   try {
-    await shellOut(gradeCommand(inst));
-    report = gradeFromLog(inst, await readGradeLog(shellOut));
+    report = gradeFromLog(inst, await gradeLogFrom(await shell(gradeCommand(inst)), shellOut));
     gradeError = report.error;
   } catch (e) {
     gradeError = String((e as Error)?.message ?? e).slice(0, 300);

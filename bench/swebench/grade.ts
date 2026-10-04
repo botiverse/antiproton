@@ -142,6 +142,12 @@ export const GRADE_LOG = "/tmp/swe-grade.log";
 export const APPLY_FAILED = ">>>>> Patch Apply Failed";
 export const START = ">>>>> Start Test Output";
 export const END = ">>>>> End Test Output";
+/**
+ * Printed by the grading command, on its own output, when it could not write the log or its gzip. The
+ * agent shares the box's disk, and one that fills it (a 2 GB dump of the git object store into /tmp) left a
+ * cut .gz that passed every length check and failed only at gunzip, as "unexpected end of file".
+ */
+export const OUTPUT_NOT_WRITTEN = ">>>>> Grading Output Not Written";
 
 /**
  * One shell command that grades: reinstall where the image's install is not editable, reset the files the
@@ -150,6 +156,10 @@ export const END = ">>>>> End Test Output";
  * so its own answer is never the thing that gets cut. A reinstall that fails leaves its marker and the
  * instance is not graded: the tests would run against the image's copy, not the agent's fix.
  */
+/** The command's failure: the marker, what failed and the free space where the log is, then a non-zero exit. */
+const notWritten = (what: string) =>
+  `{ echo ${q(`${OUTPUT_NOT_WRITTEN}: ${what}`)}"; $(df -Pk ${GRADE_LOG.replace(/\/[^/]*$/, "") || "/"} 2>/dev/null | awk 'NR==2 {print $4 " KiB free on " $6}')"; exit 1; }`;
+
 export function gradeCommand(inst: GradedInstance, workdir = "/testbed"): string {
   const reset = modifiedFiles(inst.test_patch);
   const reinstall = reinstallCommand(inst.repo, inst.version);
@@ -168,8 +178,9 @@ export function gradeCommand(inst: GradedInstance, workdir = "/testbed"): string
     `${test}`,
     `echo ${q(END)}`,
     `else echo ${q(APPLY_FAILED)}; fi`,
-    `} > ${GRADE_LOG} 2>&1`,
-    `gzip -c ${GRADE_LOG} > ${GRADE_LOG}.gz`,
+    // The block's status is its last echo's, so a log that could not be written to the end fails here.
+    `} > ${GRADE_LOG} 2>&1 || ${notWritten("writing the log failed")}`,
+    `gzip -c ${GRADE_LOG} > ${GRADE_LOG}.gz || ${notWritten("gzip failed")}`,
     `echo "log_gz_bytes=$(wc -c < ${GRADE_LOG}.gz)"`,
   ].join("\n");
 }
@@ -327,7 +338,10 @@ export function gradeFromLog(inst: GradedInstance, log: string): GradeReport {
   const f2p: string[] = JSON.parse(inst.FAIL_TO_PASS);
   const p2p: string[] = JSON.parse(inst.PASS_TO_PASS);
   const none = (ids: string[]) => ({ total: ids.length, passed: 0, failed: ids });
-  const bad = [APPLY_FAILED, ">>>>> Reset Failed", REINSTALL_FAILED].find((c) => log.includes(c))
+  const unwritten = log.split("\n").find((l) => l.startsWith(OUTPUT_NOT_WRITTEN));
+  const bad = (unwritten !== undefined
+    ? `grading output could not be written (disk full?): ${unwritten.slice(OUTPUT_NOT_WRITTEN.length).replace(/^:\s*/, "")}` : undefined)
+    ?? [APPLY_FAILED, ">>>>> Reset Failed", REINSTALL_FAILED].find((c) => log.includes(c))
     ?? (!(log.includes(START) && log.includes(END)) ? "the test output markers are missing" : undefined);
   if (bad) return { resolved: false, error: bad, failToPass: none(f2p), passToPass: none(p2p) };
   const m = parseTestLog(inst.repo, log);
@@ -429,5 +443,22 @@ export async function readBoxFile(run: (command: string) => Promise<string>, pat
 
 /** The grading log the command above left, unzipped. */
 export async function readGradeLog(run: (command: string) => Promise<string>): Promise<string> {
-  return gunzipSync(await readBoxFile(run, `${GRADE_LOG}.gz`)).toString("utf8");
+  const gz = await readBoxFile(run, `${GRADE_LOG}.gz`);
+  try { return gunzipSync(gz).toString("utf8"); }
+  catch (e) { throw new Error(`the grading log's gzip is cut or corrupt (disk full?): ${String((e as Error)?.message ?? e)}`); }
+}
+
+/**
+ * What to grade from, given the grading command's own answer: its marker when it could not write its output
+ * (gradeFromLog names that), the log it left otherwise. Read before the command's status, because that
+ * command exits non-zero exactly when it prints the marker, and a failed answer's output is otherwise dropped.
+ */
+export async function gradeLogFrom(graded: ShellAnswer, run: (command: string) => Promise<string>): Promise<string> {
+  const out = String(graded.result?.output ?? "");
+  const at = out.indexOf(OUTPUT_NOT_WRITTEN);
+  if (at >= 0) return out.slice(at);
+  if (graded.status !== "succeeded") {
+    throw new Error(`grading command ${graded.status}: ${graded.error?.message ?? JSON.stringify(graded.error ?? null)}`);
+  }
+  return readGradeLog(run);
 }

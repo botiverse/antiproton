@@ -33,7 +33,7 @@ import { stallAtDeadline, type StallEvidence } from "../poll-fallback.ts";
 import { benchEngine, objectsShape, sumActivity, taskObject } from "../objects.ts";
 import { SANDBOX_ALIAS } from "../../src/plugins/sandbox.ts";
 import { waitForAnswer, type WaitDeps } from "./wait.ts";
-import { gradeCommand, gradeFromLog, readGradeLog, settleShell, type GradedInstance, type ShellAnswer } from "./grade.ts";
+import { gradeCommand, gradeFromLog, gradeLogFrom, settleShell, type GradedInstance, type ShellAnswer } from "./grade.ts";
 
 for (const l of readFileSync(`${homedir()}/.secrets/antiproton.env`, "utf8").split("\n")) {
   const m = /^([A-Z0-9_]+)=(.*)$/.exec(l.trim());
@@ -212,8 +212,8 @@ async function runOne(inst: Instance) {
     // and PASS_TO_PASS test, from one run of the repository's own test command over the test patch's files.
     const diff = (await shellOut(taskId, "cd /testbed && git diff --stat | tail -3").catch(() => "")).trim().split("\n").pop() ?? "";
     try {
-      await shellOut(taskId, gradeCommand(inst));
-      const report = gradeFromLog(inst, await readGradeLog((c) => shellOut(taskId, c)));
+      const graded = await shell(taskId, gradeCommand(inst));
+      const report = gradeFromLog(inst, await gradeLogFrom(graded, (c) => shellOut(taskId, c)));
       grade = gradeRecord(report, diff);
     } catch (e) {
       grade = { ...grade, diff, gradeError: String((e as Error)?.message ?? e).slice(0, 300) };
