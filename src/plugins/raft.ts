@@ -757,12 +757,23 @@ export function offeredTerms(text: string, unoffered: ReadonlySet<string>, quote
   return (out + masked.slice(at)).replace(/\uE000(\d+)\uE001/g, (_, i: string) => kept[Number(i)]!);
 }
 
-/** The strings in an outcome's data that contain a call `offeredTerms` would rewrite, and each of their lines. */
+/**
+ * The strings in an outcome's data that contain a call `offeredTerms` would rewrite: each as written, each of its
+ * lines, and each of those with its whitespace collapsed, since the SDK prints some of what a person wrote that way
+ * (a task title on a board is one line with single spaces), and the collapsed form is then the only one in the text;
+ * and each of those JSON-escaped, as a formatter that prints a value through JSON.stringify shows it.
+ */
 function quotedCalls(value: unknown, pattern: RegExp, depth = 0, out: string[] = []): string[] {
   if (depth > 8) return out;
   const names = (v: string) => { pattern.lastIndex = 0; return pattern.test(v); };
+  const collapsed = (v: string) => v.replace(/\s+/g, " ").trim();
   if (typeof value === "string") {
-    if (names(value)) out.push(value, ...value.split(/\r\n|[\n\r]/).filter(names));
+    if (names(value)) {
+      const lines = value.split(/\r\n|[\n\r]/);
+      // And as JSON writes it, for a formatter that prints a value through JSON.stringify (a task event's payload).
+      const forms = [value, collapsed(value), ...lines, ...lines.map(collapsed)];
+      out.push(...[...forms, ...forms.map((f) => JSON.stringify(f).slice(1, -1))].filter(names));
+    }
   } else if (Array.isArray(value)) for (const v of value) quotedCalls(v, pattern, depth + 1, out);
   else if (value && typeof value === "object") {
     // The SDK's own command fields are hints, not quotes.
@@ -1127,6 +1138,8 @@ function capped(res: Response, over: () => void): Response {
   const declared = Number(res.headers.get("content-length"));
   if (Number.isFinite(declared) && declared > ATTACHMENT_MAX_BYTES) {
     over();
+    // Not read at all, so the connection is let go of now rather than left holding the rest.
+    res.body?.cancel().catch(() => {});
     return new Response(null, { status: 413, headers: res.headers });
   }
   if (!res.body) return res;

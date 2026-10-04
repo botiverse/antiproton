@@ -1545,9 +1545,15 @@ await check("no CLI command reaches the model: every generated operation's text,
   }
 });
 
-/** What a person might write that reads like a CLI command, quoted by the SDK in many places. */
-const SAID = "raft message read --target #x";
-const SAID_LINES = ["note\nMore: raft message read --target #x", 'first\nraft message send --target "#ops"'];
+/**
+ * What a person might write that names a tool this mount does not offer, the one thing `offeredTerms` rewrites in the
+ * SDK's text, quoted by the SDK in many places. A task title is printed with its whitespace collapsed on a board and
+ * in a task's history, so two of them carry a double space and a newline.
+ */
+const SAID = 'inbox_check({}) and mentions_execute({ action: "notify", resolutionIds: ["r-1"] })';
+const SAID_LINES = ['note\nMore: attachments_download_url({ attachmentId: "att-9" })', 'first\nraft.attachments.download({ attachmentId: "att-9" })'];
+const TITLES = ["fix it  inbox_check({}) twice-spaced", 'fix it\n   mentions_execute({ action: "add" }) on two lines'];
+const PERSON_CALL = /inbox_check|mentions_execute|attachments_download_url|raft\.attachments\.download/;
 
 await check("what a person wrote is never rewritten: message continuations, descriptions, titles, previews, comments, profiles", async () => {
   const human = { name: "tygg", role: "owner", description: SAID_LINES[0] };
@@ -1557,9 +1563,10 @@ await check("what a person wrote is never rewritten: message continuations, desc
     if (path === "/history") return history([historyMessage(41, `hello\n${SAID}\n${SAID_LINES[0]}`, { attachments: [{ id: "att-9", filename: "plan.pdf" }] })], { has_older: true, target: "#ops" });
     if (path === "/server") return json(200, { runtimeContext: { agentId: "agent-1", serverId: "server-1" }, channels: [ops], agents: [{ name: "piper", status: "online", description: SAID }], humans: [human] });
     if (path === "/channel-members") return json(200, { channel: { ref: "#ops", type: "channel" }, agents: [], humans: [human] });
-    // A task board collapses a title's whitespace onto one line (0.8.0's `oneLineTaskTitle`), so in tasks_list this title
-    // is not found verbatim among the data's strings: only the hint-line filter keeps it as written there.
-    if (path === "/tasks") return json(200, { tasks: [{ taskNumber: 7, status: "todo", title: `fix it\n   ${SAID}`, description: SAID_LINES[1] }] });
+    // A board and a history print a title with its whitespace collapsed, so it is not found verbatim among the data's strings.
+    if (path === "/tasks") return json(200, { tasks: [{ taskNumber: 7, status: "todo", title: TITLES[0], description: SAID_LINES[1] }, { taskNumber: 8, status: "todo", title: TITLES[1], description: null }] });
+    if (path === "/tasks/history") return json(200, { task: { taskNumber: 7, title: TITLES[0], description: null, revision: 2 },
+      events: [{ id: "0b7c3a1e-1111-4222-8333-944455556666", seq: 1, eventType: "amended", actorType: "user", actorName: "tygg", payload: { title: TITLES[1] }, createdAt: "2026-09-28T10:00:00.000Z" }] });
     if (path === "/search") return json(200, { results: [{ id: "r-1", seq: 1, channelId: "c", threadId: null, parentMessageId: null, parentMessageContent: null, parentChannelId: "c",
       parentChannelName: "ops", parentChannelType: "channel", parentChannelArchivedAt: null, senderId: "s", senderType: "human", senderName: "tygg",
       channelName: "ops", channelType: "channel", channelArchivedAt: null, content: SAID_LINES[0], snippet: "note", createdAt: "2026-09-21T10:00:00.000Z" }], hasMore: false });
@@ -1567,18 +1574,19 @@ await check("what a person wrote is never rewritten: message continuations, desc
     if (/profile/.test(path)) return json(200, { kind: "human", id: "u1", isSelf: true, name: "tygg", displayName: null, description: SAID_LINES[0], avatarUrl: null, email: null, role: "owner", joinedAt: null, membershipStatus: "active", createdAgents: [] });
     return json(404, { error: "not found" });
   }) as any;
-  const raw = createRaft({ serverUrl: "https://raft.example", credential: "sk_agent_test_1234567890" });
+  const raw = createRaft({ serverUrl: "https://raft.example", credential: "sk_agent_test_1234567890", hints: "tool" });
   const cases: Array<[string, Record<string, unknown>]> = [
     ["messages_read", { target: "#ops" }], ["server_info", { view: "full" }], ["channels_info", { target: "#ops" }],
-    ["users_info", { name: "@tygg" }], ["tasks_show", { target: "#ops", taskNumber: 7 }], ["tasks_list", { target: "#ops" }], ["messages_search", { query: "note" }],
+    ["users_info", { name: "@tygg" }], ["tasks_show", { target: "#ops", taskNumber: 7 }], ["tasks_list", { target: "#ops" }],
+    ["tasks_history", { target: "#ops", taskNumber: 7 }], ["messages_search", { query: "note" }],
     ["attachments_comments", { attachmentId: "att-9" }], ["profile_show", {}],
   ];
   const problems: string[] = [];
   for (const [tool, args] of cases) {
     const op = GENERATED.find((o) => o.toolName === tool)!;
     const sdk: any = await raw.invoke(op.name, { ...args, ...(pagingArg(op) ? { limit: PAGE_ROWS } : {}) }, { origin: "code" });
-    // Control: the SDK quotes the person's words, on lines a CLI command starts or sits in.
-    const quoted = sdk.ok ? String(sdk.text).split("\n").filter((l: string) => /raft message read --target (?:#x|channel:x)/.test(l) || l.includes('raft message send --target "#ops"')) : [];
+    // Control: the SDK quotes the person's words, on lines that name a tool this mount does not offer.
+    const quoted = sdk.ok ? String(sdk.text).split("\n").filter((l: string) => PERSON_CALL.test(l)) : [];
     if (!quoted.length) { problems.push(`${tool}: control: the SDK quoted nothing here (${sdk.ok ? sdk.text.slice(0, 120) : sdk.error.message})`); continue; }
     const shown = String(((await raftPlugin.invoke(tool, args, inTurn(ctx()))) as any).text).split("\n");
     for (const line of quoted) {
@@ -1588,6 +1596,13 @@ await check("what a person wrote is never rewritten: message continuations, desc
     }
   }
   if (problems.length) throw new Error(problems.join(" | "));
+  // The collapsed titles were among what was checked: the board and the history print them on one line.
+  const board = String(((await raftPlugin.invoke("tasks_list", { target: "#ops" }, inTurn(ctx()))) as any).text);
+  const story = String(((await raftPlugin.invoke("tasks_history", { target: "#ops", taskNumber: 7 }, inTurn(ctx()))) as any).text);
+  for (const [where, text, want] of [["tasks_list", board, "fix it inbox_check({}) twice-spaced"], ["tasks_list", board, 'fix it mentions_execute({ action: "add" }) on two lines'],
+    ["tasks_history", story, "Current title: fix it inbox_check({}) twice-spaced"], ["tasks_history", story, JSON.stringify({ title: TITLES[1] })]] as const) {
+    if (!text.includes(want)) throw new Error(`${where}: ${JSON.stringify(want)} did not come back as written: ${text}`);
+  }
   // Controls: the hints around those words are the SDK's tool calls, and an admin write points at an action card.
   const page = String(((await raftPlugin.invoke("messages_read", { target: "#ops" }, inTurn(ctx()))) as any).text);
   if (!/^Older exist: messages_read\(\{ target: "#ops", before: 41 \}\)$/m.test(page) || !/this mount has no tool to open attachments\]/.test(page)) throw new Error(`page: ${page}`);
@@ -2621,6 +2636,44 @@ await check("a download address that is inward, or carries a user name, is refus
     : new Response(FILE)) as any;
   const out: any = await downloadAttachment({ attachmentId: "att-1" }, inTurn(ctx()), store);
   if (out.bytes !== FILE.byteLength || store.puts.length !== 1) throw new Error(JSON.stringify(out));
+});
+
+await check("the size cap stops a body that keeps coming: past the cap it fails at once, without waiting for an end", async () => {
+  const store = fakeArtifacts();
+  attachmentServer({ storage: () => new Response(new ReadableStream({
+    // The cap and one byte more, in two chunks, and then nothing: never closed, so only the streaming check can end it.
+    start(c) { c.enqueue(new Uint8Array(ATTACHMENT_MAX_BYTES)); c.enqueue(new Uint8Array(1)); },
+  })) });
+  // A guard that keeps the process alive while it waits (not unref'd): a hang is reported as one, not as an exit.
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timedOut = new Promise<string>((resolve) => { timer = setTimeout(() => resolve("hung: no answer within 5 s"), 5_000); });
+  const outcome = await Promise.race([downloadAttachment({ attachmentId: "att-1" }, inTurn(ctx()), store).then(() => "kept", (e: Error) => e.message), timedOut]);
+  clearTimeout(timer);
+  if (!/larger than 25 MiB/.test(outcome) || store.puts.length !== 0) throw new Error(`outcome: ${outcome}`);
+});
+
+await check("a declared length over the cap is refused unread, and the body is let go of", async () => {
+  let cancelled = false;
+  attachmentServer({ storage: () => new Response(new ReadableStream({ pull() { /* never read */ }, cancel() { cancelled = true; } }),
+    { headers: { "content-length": String(ATTACHMENT_MAX_BYTES + 1) } }) });
+  const why = await failure(() => downloadAttachment({ attachmentId: "att-1" }, inTurn(ctx()), fakeArtifacts()));
+  if (!/larger than 25 MiB/.test(why.message) || !cancelled) throw new Error(`cancelled=${cancelled}: ${why.message}`);
+});
+
+await check("an http:// download address is refused before any fetch", async () => {
+  const fetched: string[] = [];
+  globalThis.fetch = (async (u: any) => {
+    const url = new URL(String(u));
+    if (url.pathname === "/internal/agent-api/attachments/att-1/url") {
+      return json(200, { url: "http://storage.example/obj?X-Amz-Signature=SIGsecret", expiresAt: "2026-10-04T10:05:00Z", filename: "plan.pdf", mimeType: "application/pdf" });
+    }
+    fetched.push(url.href);
+    return new Response(FILE);
+  }) as any;
+  const why = await failure(() => downloadAttachment({ attachmentId: "att-1" }, inTurn(ctx()), fakeArtifacts())).catch(() => {
+    throw new Error(`not refused (fetched ${JSON.stringify(fetched)})`);
+  });
+  if (fetched.length || !/not https/.test(why.message) || why.message.includes("SIGsecret")) throw new Error(`${why.message} fetched=${JSON.stringify(fetched)}`);
 });
 
 await check("a Server that cannot mint a URL (CONFLICT) is answered by the binary download, in the same call", async () => {
