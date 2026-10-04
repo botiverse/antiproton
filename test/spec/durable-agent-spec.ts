@@ -42,6 +42,8 @@ const reply = (text: string): ModelResponse => ({
  */
 const STEP_DEADLINE_MS = 3_000;
 const CASE_DEADLINE_MS = 15_000;
+/** How long the onSleep case waits for a park only the notice can bring: past any slowness seen, inside the case's deadline. */
+const NOTICE_WAIT_MS = 10_000;
 /** The hosts the running case opened, closed at its deadline. Cases run one at a time. */
 let caseHosts: PdHost[] = [];
 
@@ -181,18 +183,27 @@ export function durableAgentCases(withHost: WithDriveHost, activeTimers: TimerPr
       },
       abort: async (_task, runtime, context) => { await runtime.commit(() => ({ status: "terminal", outcome: { status: "aborted" } }), context); },
     });
-    const o = object(storage, [], { extensions: [defineExtension({ name: "pd-test", tasks: [Nap] })] });
+    // Which read parks is the assertion, not how long the park took: under load the notice can come after a second,
+    // so a time bound could not tell a slow notice from none. With settle's recheck far longer than the case, no
+    // recheck can bring the read that parks, and no commit follows the sleep: the read that parks is the notice's (or one
+    // a commit brought that was still reading as the sleep began, which the notice follows anyway). The step deadline
+    // is lifted to the case's for the same reason: a slow machine must not end the step before the notice.
+    const o = object(storage, [], { extensions: [defineExtension({ name: "pd-test", tasks: [Nap] })], recheckMs: 60_000, stepDeadlineMs: CASE_DEADLINE_MS });
     const a = o.agent();
     await o.host.withHarness(async (h) => {
       const root = await h.root(BACKGROUND);
       await root.commit((tx) => tx.createTask(Nap, {}, { ownership: { kind: "conversation" } }), BACKGROUND);
     });
     const t0 = Date.now();
-    const parked = await a.step();
-    const took = Date.now() - t0;
-    check(until > t0 && parked.open === 1 && parked.wakeInMs !== null && Math.abs(Date.now() + parked.wakeInMs - until) < 1_000,
-      `step ${show(parked)}, the task sleeps until ${until - t0} ms after it started`);
-    check(took < 900, `the park took ${took} ms: settle saw the sleep only at its 1 s recheck`);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const noPark = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`no park in ${NOTICE_WAIT_MS} ms with settle's recheck off: the onSleep notice did not reach settle`)), NOTICE_WAIT_MS);
+    });
+    const parked = await Promise.race([a.step(), noPark]).finally(() => clearTimeout(timer));
+    const t1 = Date.now();
+    // wakeInMs is `until` less the clock read between t0 and t1.
+    check(until > t0 && parked.open === 1 && parked.wakeInMs !== null && parked.wakeInMs >= until - t1 && parked.wakeInMs <= until - t0,
+      `step ${show(parked)}, the task sleeps until ${until - t0} ms after it started, the step took ${t1 - t0} ms`);
     await a.close();
   });
 

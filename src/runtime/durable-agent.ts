@@ -143,6 +143,11 @@ export interface PdHostOptions {
   /** A sleeper due sooner than this is waited for in-process instead of parked (settle's `minParkMs`). */
   minParkMs?: number;
   stepDeadlineMs?: number;
+  /**
+   * settle's `recheckMs`, its backstop re-read; settle's default (1 s) when absent. For tests: one longer than the
+   * case takes away the backstop, so a park can only come from a read a commit or an `onSleep` notice brought.
+   */
+  recheckMs?: number;
   /** `REDELIVERY_MS` when absent. For tests. */
   redeliveryMs?: number;
   /** `TAKE_HOLD_MS` when absent. For tests. */
@@ -494,6 +499,7 @@ export class PdHost {
         externalWaits: (ids) => externalWaitsOf(h, ids),
         subscribe: (notify) => { this.#onSleep.add(notify); return () => { this.#onSleep.delete(notify); }; },
         ...(this.#opts.minParkMs === undefined ? {} : { minParkMs: this.#opts.minParkMs }),
+        ...(this.#opts.recheckMs === undefined ? {} : { recheckMs: this.#opts.recheckMs }),
         deadlineMs: this.#opts.stepDeadlineMs ?? STEP_DEADLINE_MS,
       });
     })();

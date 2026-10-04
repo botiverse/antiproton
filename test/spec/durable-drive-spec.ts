@@ -38,13 +38,30 @@ export type WithDriveHost = (use: (host: DurableSqlHost) => Promise<void>) => Pr
 export type TimerProbe = (() => number) | undefined;
 
 const POLL_AFTER_MS = 300;
-const RETRY_BASE_MS = 300;
+/**
+ * The retry backoff. Only case (6) meets a retryable error, and it moves its clock to the backoff's end rather than
+ * waiting it out (`movableClock`), so this is long: longer than settle's read can come late after the retry sleep
+ * starts, however loaded the machine. A backoff that elapses before that read is waited for in-process, and the
+ * object calls again instead of parking.
+ */
+const RETRY_BASE_MS = 30_000;
 const PROVIDER = "queue";
 const MODEL = "m1";
 
 function check(cond: unknown, msg: string): asserts cond { if (!cond) throw new Error(msg); }
 const show = (v: unknown) => JSON.stringify(v);
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, Math.max(0, ms)));
+
+/**
+ * A harness clock that runs with `Date.now` and can be moved forward: a case moves it to a park's T instead of
+ * sleeping until T, so its intervals can be longer than any delay the machine adds between a sleep starting and the
+ * read that parks it.
+ */
+function movableClock() {
+  let skew = 0;
+  const now = () => Date.now() + skew;
+  return { now, moveTo: (t: number) => { skew += Math.max(0, t - now()); } };
+}
 
 type JobRow = { id: string; request: string; answer: string | null };
 
@@ -125,11 +142,15 @@ const extension = defineExtension({
   tasks: [NapTask],
 });
 
-function world(host: DurableSqlHost, settings: HarnessSettings = {}, activeTimers?: TimerProbe, pollDelayMs = 0) {
+/** `now` is the harness's clock and settle's; `pollAfterMs` the provider's poll interval, `POLL_AFTER_MS` when absent. */
+type WorldTime = { readonly now?: () => number; readonly pollAfterMs?: number };
+
+function world(host: DurableSqlHost, settings: HarnessSettings = {}, activeTimers?: TimerProbe, pollDelayMs = 0, time: WorldTime = {}) {
+  const now = time.now ?? Date.now;
   const jobs = jobTable(host, pollDelayMs);
   const models = createModels();
   models.setProvider(durableOffloadedProvider({
-    port: jobs.port, id: PROVIDER, pollAfterMs: POLL_AFTER_MS, models: [{ id: MODEL, contextWindow: 100_000 }],
+    port: jobs.port, id: PROVIDER, pollAfterMs: time.pollAfterMs ?? POLL_AFTER_MS, models: [{ id: MODEL, contextWindow: 100_000 }],
   }));
   const registry = createRegistry();
   registry.install(extension);
@@ -143,13 +164,14 @@ function world(host: DurableSqlHost, settings: HarnessSettings = {}, activeTimer
     settings: { stream: { deferred: true }, retry: { enabled: true, maxRetries: 3, baseDelayMs: RETRY_BASE_MS }, ...settings },
     onReport: (e) => reports.push(e instanceof Error ? e.message : String(e)),
     onSleep: (sleep) => { sleeps.push(sleep); for (const l of [...listeners]) l(); },
+    now,
   };
   const open = async () => Harness.open(await SqliteStorage.open(new PiDurableSqlite(host, prefixedNamespace("pd"))), options, bg);
   /** Each verdict, with the live timers at that moment where they can be counted. */
   const verdicts: Array<{ verdict: ParkVerdict; timers?: number }> = [];
   /** A timeout leaves the harness open (the runtime asks again); here it is closed, so a failing case cannot leak a live harness into the next. */
   const drive = async (h: Harness): Promise<SettleResult> => {
-    const r = await settle(h, { context: bg, deadlineMs: 10_000, minParkMs: 1, subscribe, onVerdict: (verdict) => verdicts.push({ verdict, ...(activeTimers ? { timers: activeTimers() } : {}) }) });
+    const r = await settle(h, { context: bg, now, deadlineMs: 10_000, minParkMs: 1, subscribe, onVerdict: (verdict) => verdicts.push({ verdict, ...(activeTimers ? { timers: activeTimers() } : {}) }) });
     if (r.state === "timeout") await h.close(bg);
     return r;
   };
@@ -244,14 +266,22 @@ export function durableDriveCases(withHost: WithDriveHost, activeTimers: TimerPr
   });
 
   add("park", "(3) wake at T with no answer: one fetch, parks again later, and again — no busy loop", async (host) => {
-    const w = world(host);
+    // A poll interval no read can come that late after, and the clock moved to each T: with POLL_AFTER_MS, a read
+    // more than 300 ms late found the poll due and fetched twice, and a check against Date.now() after the wake
+    // failed once 300 ms had passed since the park.
+    const pollAfterMs = 30_000;
+    const clock = movableClock();
+    const w = world(host, {}, undefined, 0, { now: clock.now, pollAfterMs });
     let r = parked(await w.submit("Q1"));
     for (let i = 0; i < 3; i++) {
-      await sleep(r.parkedUntil - Date.now());
+      clock.moveTo(r.parkedUntil);
       const polls = w.jobs.polls();
       const again = parked(await w.wake());
+      const after = clock.now();
       check(w.jobs.polls() - polls === 1, `wake ${i}: ${w.jobs.polls() - polls} fetches`);
-      check(again.parkedUntil > r.parkedUntil && again.parkedUntil > Date.now(), `wake ${i}: T ${again.parkedUntil} after ${r.parkedUntil}`);
+      // The fetch ran at or after T and before the wake returned, and the next T is one interval after the fetch.
+      check(again.parkedUntil >= r.parkedUntil + pollAfterMs && again.parkedUntil <= after + pollAfterMs,
+        `wake ${i}: T ${again.parkedUntil - r.parkedUntil} ms after the last, the interval is ${pollAfterMs}, the wake returned ${after - r.parkedUntil} ms after it`);
       r = again;
     }
     check(w.jobs.rows().length === 1, `jobs ${w.jobs.rows().length}: a not-ready poll must not start a new call`);
@@ -294,19 +324,26 @@ export function durableDriveCases(withHost: WithDriveHost, activeTimers: TimerPr
   });
 
   add("park", "(6) a retryable error parks for the retry backoff, then calls again", async (host) => {
-    const w = world(host);
+    // The backoff is RETRY_BASE_MS, and the clock is moved to its end. With a 300 ms backoff, a read more than 300 ms
+    // late found the retry due, and the object called again and parked on the new call's poll instead.
+    const clock = movableClock();
+    const w = world(host, {}, undefined, 0, { now: clock.now });
     const r = parked(await w.submit("Q1"));
     w.jobs.consume(w.jobs.rows()[0]!.id, () => ({ error: "503 Service Unavailable: the model is overloaded" }));
-    await sleep(r.parkedUntil - Date.now());
+    clock.moveTo(r.parkedUntil);
+    const before = clock.now();
     const backoff = parked(await w.wake());
+    const after = clock.now();
     check(backoff.sleepers.length === 1 && backoff.sleepers[0]?.phase === "retry", `sleepers ${show(backoff.sleepers)}`);
-    check(backoff.parkedUntil > Date.now(), "retry T is in the past");
+    // The error was read at or after `before` and before the wake returned; the backoff of a first retry is the base.
+    check(backoff.parkedUntil >= before + RETRY_BASE_MS && backoff.parkedUntil <= after + RETRY_BASE_MS,
+      `retry T ${backoff.parkedUntil - before} ms after the wake, the backoff is ${RETRY_BASE_MS}, the wake took ${after - before} ms`);
     check(w.jobs.rows().length === 1, `a new call started before the backoff: ${w.jobs.rows().length} jobs`);
-    await sleep(backoff.parkedUntil - Date.now());
+    clock.moveTo(backoff.parkedUntil);
     const polling = parked(await w.wake());
     check(polling.sleepers[0]?.phase === "poll" && w.jobs.rows().length === 2, `after backoff: ${show(polling)}, jobs ${w.jobs.rows().length}`);
     w.jobs.consume(w.jobs.rows()[1]!.id, () => reply("Paris"));
-    await sleep(polling.parkedUntil - Date.now());
+    clock.moveTo(polling.parkedUntil);
     check((await w.wake()).state === "idle", "did not finish");
     const t = await w.transcript();
     check(t.at(-1) === "assistant(stop): Paris", `transcript ${show(t)}`);
