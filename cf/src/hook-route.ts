@@ -8,7 +8,8 @@
  * isolate's memory and in the colo's Cache API, and the index is read on a miss.
  *
  * Revocation does not wait for the TTL. Every revoke path drops the hook's secret from the agent's object
- * right after the index (cf/src/index.ts `adminHooks`, cf/src/runtime.ts `#inboundFor`), and an object asked
+ * right after the index (cf/src/index.ts `adminHooks`, cf/src/runtime.ts `#inboundFor` and `removeMount`, whose
+ * passes revoke every hook a removed mount left live the same way), and an object asked
  * through a cached route about a hook with no secret answers `unrouted` (`AgentRuntime.receiveHook`): the
  * worker then forgets the route and asks the index, so a revoked hook answers 404 at once, as before. The
  * TTL bounds only the case where the index was revoked and the secret drop failed: such a hook is routed,

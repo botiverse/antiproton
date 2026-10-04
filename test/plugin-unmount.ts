@@ -71,8 +71,11 @@ let revokeOwn: string | null = null;
 let seenByUnmount: { alias: string; inbound: boolean; db: boolean } | null = null;
 const handed: Record<string, InboundHooks | undefined> = {};
 
+/** Set by a case to make building the mount's context throw (`#contextFor` asks `mountTools`). */
+let toolsThrow = false;
 const SWEEP: Plugin = {
   id: "sweep", version: "1.0.0", consoleMount: true,
+  mountTools() { if (toolsThrow) throw new Error("the tool list cannot be read"); return SWEEP.tools; },
   tools: [
     { name: "grab", summary: "", parameters: {}, sideEffects: "read", idempotency: "native" },
     { name: "make", summary: "", parameters: {}, sideEffects: "write", idempotency: "none" },
@@ -117,7 +120,7 @@ const PLAIN: Plugin = { ...SWEEP, id: "plain", unmount: undefined };
 
 function reset() {
   order.length = 0; unmountCalls = 0; receives = 0; mode = "ok"; revokeOwn = null; seenByUnmount = null;
-  late = null; lateMs = 0; lateDone = new Promise((r) => { lateFinished = r; });
+  late = null; lateMs = 0; toolsThrow = false; lateDone = new Promise((r) => { lateFinished = r; });
   for (const k of Object.keys(handed)) delete handed[k];
 }
 
@@ -274,8 +277,10 @@ await check("while unmount runs, a tool call on the mount is refused and a push 
   const posted: string[] = [];
   rt.postMessage = async (_t: string, _a: string, text: string) => { posted.push(text); };
   const ev = { headers: { "x-signed-with": h.secret, "x-deliver": "1" }, body: new Uint8Array([1]) };
-  // Control: before the removal the same push is delivered.
-  must((await rt.receiveHook("t", "a", "svc", h.hookId, ev)).outcome === "delivered" && posted.length === 1, `control: ${show(posted)}`);
+  // Control: before the removal the same push is accepted, and the pass that follows hands it to the agent.
+  must((await rt.receiveHook("t", "a", "svc", h.hookId, ev)).outcome === "delivered", "control: not accepted");
+  await rt.deliverPendingInbound("t", "a");
+  must(posted.length === 1, `control: ${show(posted)}`);
   posted.length = 0; receives = 0;
   let open!: () => void;
   gate = new Promise<void>((r) => { open = r; });
@@ -289,6 +294,9 @@ await check("while unmount runs, a tool call on the mount is refused and a push 
   must(pushed.outcome === "ignored" && receives === 0 && posted.length === 0, `the push during unmount: ${show(pushed)}, receives ${receives}, posted ${posted.length}`);
   const log = await rt.inboundLog(1);
   must(log[0]?.reason === "svc is being removed", `record: ${show(log[0])}`);
+  // Nothing was queued for the agent either: the pass that would post it finds nothing.
+  const pass = await rt.deliverPendingInbound("t", "a");
+  must(pass.posted === 0 && posted.length === 0, `the pass during unmount: ${show(pass)}`);
   open();
   must((await removal).ok, "the removal failed");
   host.dispose();
@@ -302,6 +310,108 @@ await check("a removal called off after unmount (a revoke failed) lets calls rea
   must(!r.ok, `remove: ${show(r)}`);
   const call: any = await rt.gateway().invoke({ tenantId: "t", agentId: "a", taskId: "k" }, "svc.grab", {});
   must(call.status !== "rejected", `a call after the refusal: ${show(call)}`);
+  host.dispose();
+});
+
+// ---- two removals, and a mount that changes under one -----------------------------
+
+/** Start a removal whose unmount waits on a gate; resolves once unmount has begun. */
+async function heldRemoval(rt: any, alias: string, directory: unknown) {
+  let open!: () => void;
+  gate = new Promise<void>((r) => { open = r; });
+  mode = "gate";
+  const removal = rt.removeMount("t", "a", alias, directory);
+  for (let i = 0; i < 50 && unmountCalls === 0; i++) await new Promise((r) => setTimeout(r, 5));
+  must(unmountCalls === 1, "unmount did not start");
+  return { removal, open };
+}
+
+const CHANGED = "svc was removed or added again while this removal was running; it stopped, and the mount now named svc was not touched";
+
+await check("a second removal of the same mount while one runs (a double click) is refused, and does not call unmount", async () => {
+  const { rt, host, directory, mount } = await runtime();
+  await mount("sweep", "svc");
+  const { removal, open } = await heldRemoval(rt, "svc", directory);
+  const second = await rt.removeMount("t", "a", "svc", directory);
+  must(!second.ok && second.conflict && second.error === "svc is already being removed", `the second removal: ${show(second)}`);
+  must(unmountCalls === 1, `unmount was called ${unmountCalls} times`);
+  open();
+  must((await removal).ok, "the first removal failed");
+  host.dispose();
+});
+
+await check("a mount removed and added again while the removal's unmount runs: the removal stops, and the new mount and its hook are untouched", async () => {
+  const { rt, host, real, directory, mount } = await runtime();
+  await mount("sweep", "svc");
+  const { removal, open } = await heldRemoval(rt, "svc", directory);
+  // Another path deletes the row, and the alias is taken again; the new mount's hook is written straight into the
+  // index (its own tools are refused while the alias is marked).
+  must(await rt.store.removeMount("t", "a", "svc", null), "control: the row was not there to delete");
+  must((await rt.addConsoleMount("t", "a", "sweep", "svc", {})).ok, "the re-add failed");
+  const fresh = await rt.store.getMountByAlias("t", "a", "svc");
+  await real.create({ hookId: "new-hook", tenantId: "t", agentId: "a", alias: "svc" });
+  open();
+  const r = await removal;
+  must(!r.ok && r.error === CHANGED, `the removal: ${show(r)}`);
+  const now = await rt.store.getMountByAlias("t", "a", "svc");
+  must(now && now.installationId === fresh.installationId, `the new mount: ${show(now?.installationId)}`);
+  must(await real.lookup("new-hook"), "the new mount's hook was revoked");
+  host.dispose();
+});
+
+await check("a mount added again between the removal's last check and its delete is not deleted: the delete names the installation", async () => {
+  const { rt, host, real, directory, mount } = await runtime();
+  await mount("sweep", "svc");
+  let fresh: any = null;
+  let lists = 0;
+  // The second revoke pass's read is past every check the runtime makes before the delete.
+  const swapping = {
+    ...directory,
+    async list(t: string, a: string) {
+      lists++;
+      if (lists === 3) {
+        await rt.store.removeMount("t", "a", "svc", null);
+        await rt.addConsoleMount("t", "a", "sweep", "svc", {});
+        fresh = await rt.store.getMountByAlias("t", "a", "svc");
+      }
+      return real.list(t, a);
+    },
+  };
+  const r = await rt.removeMount("t", "a", "svc", swapping);
+  must(fresh, "control: the swap did not happen");
+  must(!r.ok && r.error === CHANGED, `the removal: ${show(r)}`);
+  const now = await rt.store.getMountByAlias("t", "a", "svc");
+  must(now && now.installationId === fresh.installationId, `the mount now named svc: ${show(now?.installationId ?? null)}`);
+  host.dispose();
+});
+
+await check("both stores delete only the named installation, and leave another mount under the alias with its databases", async () => {
+  const { DurableObjectStore } = await import("../src/store/durable-object.ts");
+  const { SqliteStore } = await import("../src/store/sqlite.ts");
+  const h = sqliteHost();
+  for (const [name, store] of [["durable-object", new DurableObjectStore({ storage: { sql: h.sql, transactionSync: h.transactionSync } } as any)], ["sqlite", new SqliteStore(":memory:")]] as const) {
+    await store.init();
+    await store.addMount({ tenantId: "t", agentId: "a", alias: "svc", plugin: "sweep", installationId: "console:svc:new", connectionId: null,
+      toolVersion: "1.0.0", publicConfig: {}, secretRef: null, policy: null });
+    store.pluginDb.put({ tenantId: "t", agentId: "a", alias: "svc", plugin: "sweep" }, "s", "k", "v", null);
+    must(!(await store.removeMount("t", "a", "svc", null, "console:svc:old")), `${name}: deleted another installation`);
+    must(await store.getMountByAlias("t", "a", "svc"), `${name}: the row went`);
+    must(store.pluginDb.summary("t", "a").some((r: any) => r.alias === "svc"), `${name}: its database went`);
+    must(await store.removeMount("t", "a", "svc", null, "console:svc:new"), `${name}: the named installation was not deleted`);
+  }
+  h.dispose();
+});
+
+await check("building unmount's context throws: recorded as the reason, and the removal goes on", async () => {
+  const { rt, host, directory, mount, hook, alive } = await runtime();
+  await mount("sweep", "svc");
+  const h = await hook("svc", "h");
+  toolsThrow = true;
+  const r = await rt.removeMount("t", "a", "svc", directory);
+  must(r.ok && r.unmountError === "svc's plugin could not clean up: the tool list cannot be read", `remove: ${show(r)}`);
+  must(unmountCalls === 0, "unmount ran although its context could not be built");
+  must(show(await alive(h.hookId)) === show({ resolves: false, secret: false }), "the hook survived");
+  must(!(await rt.store.getMountByAlias("t", "a", "svc")), "the mount is still there");
   host.dispose();
 });
 
@@ -381,9 +491,9 @@ function fresh(n: string) {
   return o;
 }
 const object = () => objects.get(agentObjectName(T, A)) ?? fresh(agentObjectName(T, A));
-const push = async (hookId: string, secret: string) => {
+const push = async (hookId: string, secret: string, extra: Record<string, string> = {}) => {
   const r = await worker.fetch(new Request(`https://hooks.test/hooks/${hookId}`, {
-    method: "POST", headers: { "x-signed-with": secret }, body: "{}",
+    method: "POST", headers: { "x-signed-with": secret, ...extra }, body: "{}",
   }), env as never);
   return { status: r.status, text: await r.text() };
 };
@@ -400,15 +510,19 @@ async function mountWithHook(alias: string) {
 }
 
 // Two different "gone" hooks, answered by two different layers:
-//  (a) the Worker: the index row is revoked, which is what a removal (and `ctx.inbound.revoke`) does first. The
-//      route's lookup reads only live rows, so the push is a 404 before any object is chosen — the agent's object
-//      is never reached, and neither is the plugin. This is what a service sees after a removal.
+//  (a) the Worker: the index row is revoked and the secret dropped, which is what a removal (and
+//      `ctx.inbound.revoke`) does. A route the Worker still holds in its cache (cf/src/hook-route.ts) takes the
+//      push to the object once, which finds no secret and answers `unrouted` without asking the plugin; the
+//      Worker forgets the route and asks the index, which has no live row: 404. A push after that is a 404
+//      before any object is chosen. This is what a service sees after a removal.
 //  (b) the agent's object: the row is still live but the secret is gone. A revoke cannot leave this state — it
 //      marks the row first and drops the secret second — so it is made here by deleting the secret alone. The
 //      Worker resolves the hook and hands it to the object, which finds no secret and records `failed` (503)
 //      without asking the plugin, since there is nothing to check a signature against.
-await check("(a) after the removal a push to the hook's URL is 404 at the Worker: no object and no plugin is reached", async () => {
-  const { made } = await mountWithHook("svc");
+await check("(a) after the removal a push to the hook's URL is 404: a cached route reaches the object once, which refuses without the plugin or a wake; then the front door answers alone", async () => {
+  const { rt, made } = await mountWithHook("svc");
+  const posted: string[] = [];
+  rt.postMessage = async (_t: string, _a: string, text: string) => { posted.push(text); };
   objectsReached = 0;
   const before = await push(made.hookId, made.secret);
   must(before.status === 202 && JSON.parse(before.text).outcome === "ignored" && receives === 1 && objectsReached === 1,
@@ -416,10 +530,37 @@ await check("(a) after the removal a push to the hook's URL is 404 at the Worker
   const removed = await object().uiRemoveMount(T, A, "svc");
   must(removed.ok && unmountCalls === 1, `remove: ${show(removed)}, unmount ${unmountCalls}`);
   objectsReached = 0;
-  const after = await push(made.hookId, made.secret);
+  // The control push cached the route, so this one reaches the object, which has no secret for it.
+  const after = await push(made.hookId, made.secret, { "x-deliver": "1" });
   must(after.status === 404 && after.text === "", `after the removal: ${after.status} ${after.text}`);
-  must(objectsReached === 0, `the agent's object was reached ${objectsReached} times`);
+  must(objectsReached === 1, `a cache-routed push reached the agent's object ${objectsReached} times, not once`);
   must(receives === 1, `the plugin's receive ran ${receives - 1} more times`);
+  await rt.deliverPendingInbound(T, A);
+  must(posted.length === 0, `the agent was given: ${show(posted)}`);
+  // The route is forgotten now: the next push is answered at the front door.
+  objectsReached = 0;
+  const again = await push(made.hookId, made.secret, { "x-deliver": "1" });
+  must(again.status === 404 && objectsReached === 0, `the push after: ${again.status}, objects ${objectsReached}`);
+});
+
+await check("a push accepted with 202 through the Worker while unmount runs is ignored: the plugin is not asked and the agent is not woken", async () => {
+  const { rt, made } = await mountWithHook("svc4");
+  const posted: string[] = [];
+  rt.postMessage = async (_t: string, _a: string, text: string) => { posted.push(text); };
+  let open!: () => void;
+  gate = new Promise<void>((r) => { open = r; });
+  mode = "gate";
+  const removal = object().uiRemoveMount(T, A, "svc4");
+  for (let i = 0; i < 50 && unmountCalls === 0; i++) await new Promise((r) => setTimeout(r, 5));
+  must(unmountCalls === 1, "unmount did not start");
+  const r = await push(made.hookId, made.secret, { "x-deliver": "1" });
+  must(r.status === 202 && JSON.parse(r.text).outcome === "ignored", `the push during unmount: ${r.status} ${r.text}`);
+  must(receives === 0, `the plugin's receive ran ${receives} times`);
+  must((await rt.inboundLog(1))[0]?.reason === "svc4 is being removed", `record: ${show((await rt.inboundLog(1))[0])}`);
+  open();
+  must((await removal).ok, "the removal failed");
+  await rt.deliverPendingInbound(T, A);
+  must(posted.length === 0, `the agent was given: ${show(posted)}`);
 });
 
 await check("(b) a live row whose secret is gone: the object answers 503, records \"this hook has no secret in the agent's store\", and the plugin is not asked", async () => {

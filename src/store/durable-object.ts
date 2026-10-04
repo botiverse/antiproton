@@ -827,10 +827,13 @@ export class DurableObjectStore implements StorageAdapter {
     }
   }
 
-  async removeMount(tenantId: string, agentId: string, alias: string, secretName: string | null) {
+  async removeMount(tenantId: string, agentId: string, alias: string, secretName: string | null, installationId?: string) {
     return this.#tx(() => {
-      if (!this.#one("SELECT alias FROM mounts WHERE tenant_id=? AND agent_id=? AND alias=?", tenantId, agentId, alias)) return false;
-      this.#sql.exec("DELETE FROM mounts WHERE tenant_id=? AND agent_id=? AND alias=?", tenantId, agentId, alias);
+      // Only that installation, when one is named (`Store.removeMount`).
+      const which = installationId === undefined ? "" : " AND installation_id=?";
+      const args = installationId === undefined ? [tenantId, agentId, alias] : [tenantId, agentId, alias, installationId];
+      if (!this.#one(`SELECT alias FROM mounts WHERE tenant_id=? AND agent_id=? AND alias=?${which}`, ...args)) return false;
+      this.#sql.exec(`DELETE FROM mounts WHERE tenant_id=? AND agent_id=? AND alias=?${which}`, ...args);
       this.pluginDb.remove(tenantId, agentId, alias);
       if (secretName !== null) this.#sql.exec("DELETE FROM secrets WHERE tenant_id=? AND agent_id=? AND name=?", tenantId, agentId, secretName);
       return true;

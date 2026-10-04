@@ -269,7 +269,7 @@ export class ToolGateway {
    * Mounts being removed (`markRemoving`), by `tenant/agent/alias`: a call or a pushed event for one is refused
    * from the moment the removal is decided until the mount is gone, or the removal is called off.
    */
-  readonly #removing = new Set<string>();
+  readonly #removing = new Map<string, object>();
 
   /**
    * Refuse calls and pushed events for this mount until the returned function is called. `AgentRuntime.removeMount`
@@ -280,8 +280,11 @@ export class ToolGateway {
    */
   markRemoving(tenantId: string, agentId: string, alias: string): () => void {
     const key = `${tenantId}/${agentId}/${alias}`;
-    this.#removing.add(key);
-    return () => { this.#removing.delete(key); };
+    // Each mark is its holder's: an unmark takes away only the mark it set, never one set after it. The caller
+    // refuses a second removal while one is marked (`AgentRuntime.removeMount`), so this is the second guard.
+    const mine = {};
+    this.#removing.set(key, mine);
+    return () => { if (this.#removing.get(key) === mine) this.#removing.delete(key); };
   }
 
   /** Whether this mount is marked as being removed (`markRemoving`). */
@@ -1279,9 +1282,9 @@ export class ToolGateway {
    * `sibling` (another mount's credential and database), `sandboxForms` (every container form and its credential),
    * and `ownerSecret` if it declares `readsOwnerSecrets` — as it would on any call while it was switched on.
    */
-  async unmount(tenantId: string, agentId: string, alias: string): Promise<{ done: Promise<void>; close(): void } | null> {
-    const mount = await this.#store.getMountByAlias(tenantId, agentId, alias);
-    if (!mount) return null;
+  async unmount(mount: MountRecord): Promise<{ done: Promise<void>; close(): void } | null> {
+    // The record the removal judged, not a fresh read by alias: the caller has checked it is still the mount there.
+    const { tenantId, agentId, alias } = mount;
     const plugin = this.#plugins.get(mount.plugin);
     if (!plugin?.unmount) return null;
     const lease = { closed: false, reason: `the unmount of ${alias} has ended; its context cannot be used any more` };

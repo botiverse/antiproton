@@ -434,6 +434,11 @@ export interface StorageAdapter {
    * and `approvals` record the alias a call happened under. Whether removing is
    * safe (nothing held, nothing running) is the caller's question; this only
    * makes it all-or-nothing. False when there was no such mount.
+   *
+   * `installationId`, when given, makes the delete conditional on the row still being that mount: a row under
+   * the alias with another installation id — a mount removed and added again while the caller was waiting — is
+   * left alone, with its databases and credential row, and the answer is false. The check and the delete are one
+   * statement inside the transaction, so nothing can slip between them (`AgentRuntime.removeMount`).
    */
-  removeMount(tenantId: string, agentId: string, alias: string, secretName: string | null): Promise<boolean>;
+  removeMount(tenantId: string, agentId: string, alias: string, secretName: string | null, installationId?: string): Promise<boolean>;
 }
