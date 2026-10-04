@@ -322,8 +322,9 @@ export function underRate(sql: SqlHost["sql"], hookId: string, now: number, perM
 /**
  * Seconds until `underRate` lets this hook deliver again, for `Retry-After` on a rate-limited push: the
  * moment enough of the counted rows (the same rows `underRate` counts) have left the minute that the count
- * is under `perMinute` again. Rounded up so a sender that waits exactly this long is not refused again, and
- * at least 1. Null when the hook is under the rate now.
+ * is under `perMinute` again. Rounded up so a sender that waits exactly this long is not refused again. It is
+ * at least 1 with no clamp: a row counts only while `received_at > now - 60 s`, so it leaves strictly after
+ * `now`. Null when the hook is under the rate now.
  */
 export function rateRetryAfterS(sql: SqlHost["sql"], hookId: string, now: number, perMinute: number = INBOUND_PER_MINUTE): number | null {
   const since = now - 60_000;
@@ -336,7 +337,7 @@ export function rateRetryAfterS(sql: SqlHost["sql"], hookId: string, now: number
   // Counted while `received_at > now - 60 s`, so a row stops counting at `received_at + 60 s`; once the
   // oldest `times.length - perMinute + 1` rows have, the count is `perMinute - 1`.
   const opensAt = times[times.length - perMinute]! + 60_000;
-  return Math.max(1, Math.ceil((opensAt - now) / 1000));
+  return Math.ceil((opensAt - now) / 1000);
 }
 
 /** Whether this key was already accepted on this hook: queued now, or delivered or given up within the window. */

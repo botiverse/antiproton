@@ -508,8 +508,9 @@ await check("a rate-limited push is told to retry when the minute lets it in; on
     // One a second: the rate fills at the 30th push, and those 30 also fill the queue (the alarm never runs).
     for (let i = 0; i < INBOUND_PER_MINUTE; i++) must((await at(i * 1_000, `r${i}`)).status === 202, `push ${i}`);
     const answers: Array<[number, number, string, string | null]> = [];
-    // The oldest counted push, at +0, stops counting at +60 000: the rate refuses until then, rounding up.
-    for (const ms of [29_500, 59_000, 59_999]) {
+    // The oldest counted push, at +0, stops counting at +60 000: the rate refuses until then, rounding up
+    // (30.3 s is 31, where rounding to nearest would say 30).
+    for (const ms of [29_700, 59_000, 59_999]) {
       const r = await at(ms, `over-${ms}`);
       answers.push([ms, r.status, r.body, r.retryAfter]);
     }
@@ -517,7 +518,7 @@ await check("a rate-limited push is told to retry when the minute lets it in; on
     const full = await at(60_000, "over-60000");
     answers.push([60_000, full.status, full.body, full.retryAfter]);
     const limited = '{"outcome":"rate_limited"}';
-    must(show(answers) === show([[29_500, 429, limited, "31"], [59_000, 429, limited, "1"], [59_999, 429, limited, "1"], [60_000, 429, limited, "3"]]), show(answers));
+    must(show(answers) === show([[29_700, 429, limited, "31"], [59_000, 429, limited, "1"], [59_999, 429, limited, "1"], [60_000, 429, limited, "3"]]), show(answers));
   } finally { Date.now = realNow; }
   const reasons = (w.raw.sql.exec("SELECT reason FROM inbound_events WHERE outcome = 'rate_limited' ORDER BY rowid").toArray() as any[]).map((r) => r.reason);
   must(reasons.length === 4 && reasons.slice(0, 3).every((r) => /a minute/.test(r)) && /already waiting/.test(reasons[3]), `records: ${show(reasons)}`);
