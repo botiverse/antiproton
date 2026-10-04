@@ -8,18 +8,21 @@
  * here and never taken from the model, so an agent cannot aim a reminder at another mount's hook. When one fires,
  * reminder-app posts it signed with the registered secret, and `receive` checks the signature and wakes the agent.
  *
- * Every call to reminder-app goes through one interface, {@link ReminderService}, injected into
- * {@link createReminderPlugin}. Its HTTP implementation ({@link httpReminderService}) is provisional: reminder-app's
- * wire format and its authentication are not settled, and every place that depends on them says TODO.
+ * The wire format is reminder-app/docs/webhook-delivery.md (reminder-app 0.1.0, PR #6, 66279b3), with the agent-owned reminder routes
+ * of reminder-app/docs/api.md (reminder-app 0.1.0, PR #6, 66279b3); the reminder object's fields, which neither document lists, are
+ * those reminder-app/src/server/workspace.ts (reminder-app 0.1.0, PR #6, 66279b3) returns. Every call to reminder-app goes through one
+ * interface, {@link ReminderService}, injected into {@link createReminderPlugin}; {@link httpReminderService} is
+ * that format over HTTP.
  *
  * Two ids, kept apart by name throughout: the INBOUND hook id is the runtime's (the address reminder-app posts to,
  * `InboundEvent.hookId`), and the SERVICE hook id is reminder-app's (what a reminder's target names).
  *
- * Recurrence is not offered: a repeating reminder needs a rule reminder-app evaluates, and its format for one is not
- * known yet. An agent that wants a repeat creates the next reminder when one fires.
+ * Recurrence is not offered: reminder-app has a rule grammar for it, but a one-shot tool is what the agent needs
+ * first, and an agent that wants a repeat creates the next reminder when one fires.
  */
 import { clip, logEvent } from "../core/log.ts";
 import type { Json } from "../core/types.ts";
+import { identityNote, markIdentity } from "./types.ts";
 import type { InboundEvent, InboundResult, Plugin, PluginContext, PluginErrorFields, ToolSchema } from "./types.ts";
 
 // ---- the reminder-app boundary
@@ -27,47 +30,56 @@ import type { InboundEvent, InboundResult, Plugin, PluginContext, PluginErrorFie
 /** Where a reminder is delivered. reminder-app also knows `{ kind: "raft", agentId }`; this plugin never makes one. */
 export type ReminderTarget = { kind: "webhook"; hookId: string };
 
-/** One reminder as reminder-app reports it. `target` is whatever reminder-app says, and is checked before use. */
+/** When a one-shot reminder fires, as reminder-app's `schedule` takes it: an instant, or seconds from now. */
+export type ReminderSchedule = { fireAt: string } | { delaySeconds: number };
+
+/** One reminder as reminder-app reports it, reduced to what this plugin reads. `target` is checked before use. */
 export interface ServiceReminder {
   id: string;
-  dueAt: string;
-  note: string;
-  createdAt: string | null;
-  target: { kind: string; hookId?: string; [k: string]: unknown };
+  title: string;
+  notes: string;
+  /** Absent on a reminder with no target, which reminder-app delivers to Raft. */
+  target: { kind: string; hookId?: string; [k: string]: unknown } | null;
+  status: string;
+  /** The next fire, epoch milliseconds; null once finished or cancelled. */
+  nextAt: number | null;
+  createdAt: number | null;
 }
 
-/** What a call to reminder-app needs from the mount: its settings, and its credential once one is declared. */
+/** What a call to reminder-app needs from the mount. */
 export interface ReminderConnection {
   baseUrl: string;
-  /** Always null today: the plugin declares no credential until reminder-app's authentication is known. */
-  credential: string | null;
+  /** The deployment's client credential (`rmc.<clientId>.<secret>`); resolved server-side, never shown to the model. */
+  credential: string;
+  /** The agent the call acts for (`X-Reminder-Subject`): always {@link subjectOf} the call's context. */
+  subject: string;
   timeoutMs: number;
 }
 
 /**
  * Every call this plugin makes to reminder-app. One interface, so the wire format is decided in one place and a test
- * stands in for the whole service.
- *
- * Failures are {@link ReminderServiceError}s; the plugin reads their `code`, never their message.
+ * stands in for the whole service. Failures are {@link ReminderServiceError}s; the plugin reads their `code`.
  */
 export interface ReminderService {
-  /** Register a push URL and its signing secret; reminder-app's id for the registration. https URLs only. */
+  /** Register a push URL and the secret it signs with; reminder-app's id for the registration. */
   register(conn: ReminderConnection, hook: { url: string; secret: string }): Promise<{ hookId: string }>;
-  /** Make one reminder. `idempotencyKey` is the gateway's operation id: the same key twice makes one reminder. */
-  create(conn: ReminderConnection, reminder: { target: ReminderTarget; dueAt: string; note: string; idempotencyKey?: string }):
-    Promise<{ id: string; dueAt: string }>;
-  /** Reminders not yet fired that target this registration, oldest due first. */
-  list(conn: ReminderConnection, query: { hookId: string; limit: number; cursor?: string }):
-    Promise<{ reminders: ServiceReminder[]; nextCursor: string | null }>;
-  /** One reminder, or null when reminder-app has none by that id (fired, deleted, or never existed). */
-  get(conn: ReminderConnection, id: string): Promise<ServiceReminder | null>;
-  /** Delete one reminder: false when it was already gone. */
-  delete(conn: ReminderConnection, id: string): Promise<boolean>;
+  /** Make one reminder. The same `requestId` and body make one reminder however often they are sent. */
+  create(conn: ReminderConnection, reminder: { requestId: string; title: string; notes: string; schedule: ReminderSchedule; target: ReminderTarget }):
+    Promise<ServiceReminder>;
+  /** The subject's active reminders, every hook's: reminder-app does not filter by hook, and the plugin does. */
+  list(conn: ReminderConnection): Promise<ServiceReminder[]>;
+  /** Cancel one reminder: the cancelled reminder, or null when reminder-app has none by that id for this subject. */
+  cancel(conn: ReminderConnection, id: string): Promise<ServiceReminder | null>;
+  /**
+   * Delete a registration, cancelling the reminders that name it first. Nothing in the plugin calls it yet: the
+   * plugin contract has no member a runtime calls when a mount is removed (TODO, see the end of this file).
+   */
+  unregister(conn: ReminderConnection, hookId: string): Promise<{ activeRemindersUsingIt: number | null }>;
 }
 
 /**
- * - `unknown_hook`: the registration a reminder names is not reminder-app's (any more); the plugin registers again.
- * - `refused`: reminder-app said no to the request as made (a 4xx); the message says why, for the model.
+ * - `unknown_hook`: the registration is not this subject's (any more); the plugin registers again and retries once.
+ * - `refused`: reminder-app said no to the request as made; the message says why, in words for the model.
  * - `unavailable`: no usable answer (a 5xx, a timeout, an unreadable body); `mayHaveLanded` when it may have taken.
  */
 export type ReminderServiceErrorCode = "unknown_hook" | "refused" | "unavailable";
@@ -84,98 +96,129 @@ export class ReminderServiceError extends Error {
   }
 }
 
-// ---- the provisional HTTP client
+// ---- reminder-app over HTTP
 
-/**
- * TODO(reminder-app): every path and field name in this table is a proposal, not reminder-app's API. Confirm or
- * replace each with the reminder-app owner; nothing outside `httpReminderService` depends on them.
- */
-const PROVISIONAL = {
-  hooks: "/v1/hooks",                       // POST { url, secret } → { hookId }
-  reminders: "/v1/reminders",               // POST { target, dueAt, note } → { id, dueAt }; GET ?hookId&limit&cursor → { reminders, nextCursor }
-  reminder: (id: string) => `/v1/reminders/${encodeURIComponent(id)}`, // GET → reminder | 404; DELETE → 204 | 404
-  unknownHookCode: "unknown_hook",          // the error code a create answers when the target's registration is gone
+/** reminder-app/docs/webhook-delivery.md (reminder-app 0.1.0, PR #6, 66279b3) "Hooks", and reminder-app/docs/api.md (reminder-app 0.1.0, PR #6, 66279b3) "Agent-owned reminders". */
+const ROUTES = {
+  hooks: "/api/v1/agent/hooks",                 // POST { url, secret } → { hookId, origin, revision, createdAt, updatedAt }
+  hooksDelete: "/api/v1/agent/hooks/delete",    // POST { hookId, cascade } → { hookId, deleted, activeRemindersUsingIt }
+  reminders: "/api/v1/agent/reminders",         // POST { requestId, reminder } → reminder; GET ?status=active → { reminders, occurrences }
+  cancel: "/api/v1/agent/reminders/cancel",     // POST { id } → the cancelled reminder; 404 without a code for an unknown id
 } as const;
+/** The one refusal reminder-app words for a switched-off client (webhook-delivery.md "Authentication"). */
+const CLIENT_SWITCHED_OFF = "Agent-owned reminders are not enabled on this server.";
 
 /**
  * reminder-app over HTTP, against the mount's `serviceUrl` origin.
  *
- * What is settled here is what does not depend on reminder-app's format: requests stay on the configured origin,
- * redirects are not followed, every request has a timeout, and a failure is reported by status, never with the
- * request body (a registration's body carries the secret).
- *
- * TODO(reminder-app): authentication. No credential is sent, because none is known: reminder-app's rule that a hook
- * serves only its registrant's reminders needs it to know who the registrant is, so a real deployment cannot use this
- * until it does. When the scheme is known, declare `credential` on the plugin and send `conn.credential` here.
+ * Every request carries the deployment's client credential and the subject (webhook-delivery.md "Authentication").
+ * Requests stay on the configured origin, redirects are not followed, every request has a timeout, and a failure is
+ * reported by status and reminder-app's own message, never with the request body (a registration's carries the
+ * secret).
  */
 export function httpReminderService(): ReminderService {
-  async function call(conn: ReminderConnection, method: "GET" | "POST" | "DELETE", path: string,
-    body?: unknown, extra: Record<string, string> = {}): Promise<{ status: number; data: any }> {
+  async function call(conn: ReminderConnection, method: "GET" | "POST", path: string, body?: unknown): Promise<{ status: number; result: any }> {
     const origin = new URL(conn.baseUrl);
     const url = new URL(path, origin);
     if (url.origin !== origin.origin) throw new ReminderServiceError("refused", "a reminder-app request escaped its configured origin");
-    const headers: Record<string, string> = { accept: "application/json", ...extra };
+    const headers: Record<string, string> = {
+      accept: "application/json",
+      authorization: `Bearer ${conn.credential}`,
+      "x-reminder-subject": conn.subject,
+    };
     if (body !== undefined) headers["content-type"] = "application/json";
+    const mayHaveLanded = method === "POST";
     let response: Response;
     try {
-      response = await fetch(url, {
-        method, headers,
-        body: body === undefined ? undefined : JSON.stringify(body),
-        redirect: "manual",
-        signal: AbortSignal.timeout(conn.timeoutMs),
-      });
+      response = await fetch(url, { method, headers, body: body === undefined ? undefined : JSON.stringify(body), redirect: "manual", signal: AbortSignal.timeout(conn.timeoutMs) });
     } catch {
       // The transport's own message can name the URL; it is not passed on.
-      throw new ReminderServiceError("unavailable", "reminder-app did not answer", { mayHaveLanded: method !== "GET" });
+      throw new ReminderServiceError("unavailable", "reminder-app did not answer", { mayHaveLanded });
     }
-    if (response.status === 204) return { status: 204, data: null };
-    let data: any = null;
-    try { const raw = await response.text(); data = raw.trim() ? JSON.parse(raw) : null; }
-    catch { if (response.ok) throw new ReminderServiceError("unavailable", "reminder-app answered with something that is not JSON", { mayHaveLanded: method !== "GET" }); }
-    if (response.ok) return { status: response.status, data };
-    const code = typeof data?.code === "string" ? data.code : null;
-    if (code === PROVISIONAL.unknownHookCode) throw new ReminderServiceError("unknown_hook", "reminder-app does not know this mount's registration");
-    if (response.status >= 500 || response.status === 429) {
-      throw new ReminderServiceError("unavailable", `reminder-app returned HTTP ${response.status}`, { mayHaveLanded: method !== "GET" && response.status !== 429 });
+    // The envelope: { ok: true, result, status } or { ok: false, error: { message, code? }, status }.
+    let envelope: any = null;
+    try { const raw = await response.text(); envelope = raw.trim() ? JSON.parse(raw) : null; } catch { envelope = null; }
+    if (response.ok) {
+      if (envelope?.ok !== true || !("result" in envelope)) throw new ReminderServiceError("unavailable", "reminder-app answered with something that is not its envelope", { mayHaveLanded });
+      return { status: response.status, result: envelope.result };
     }
-    if (response.status === 404) return { status: 404, data: null };
-    // reminder-app's own reason, clipped and on one line: it is about the request the model made.
-    const reason = typeof data?.message === "string" ? `: ${oneLine(data.message, 200)}` : "";
-    throw new ReminderServiceError("refused", `reminder-app refused the request (HTTP ${response.status}${code ? `, ${oneLine(code, 40)}` : ""})${reason}`);
+    const code = typeof envelope?.error?.code === "string" ? envelope.error.code : null;
+    const said = typeof envelope?.error?.message === "string" ? oneLine(envelope.error.message, 300) : "";
+    if (response.status === 404 && code === "unknown_hook") throw new ReminderServiceError("unknown_hook", "reminder-app does not know this mount's registration");
+    if (response.status >= 500 || response.status === 429 || response.status === 408) {
+      throw new ReminderServiceError("unavailable", `reminder-app returned HTTP ${response.status}${said ? `: ${said}` : ""}`, { mayHaveLanded: mayHaveLanded && response.status >= 500 });
+    }
+    if (response.status === 404) return { status: 404, result: null };
+    if (response.status === 401) {
+      throw new ReminderServiceError("refused", "reminder-app did not accept this deployment's client credential; whoever deploys has to issue or configure it again");
+    }
+    if (response.status === 403) {
+      // TODO(reminder-app): Raft agents cannot use hooks, and reminder-app is to refuse them with its own code; until
+      // the document names it, every 403 that is not the switched-off client is read as that refusal.
+      if (said === CLIENT_SWITCHED_OFF) throw new ReminderServiceError("refused", "reminder-app has not switched on reminders for this deployment, so none can be set yet");
+      throw new ReminderServiceError("refused", `reminder-app refused this agent${said ? ` (${said})` : ""}; an agent with a Raft identity sets reminders with Raft's own reminder tools instead`);
+    }
+    // 400, 409 (a cap reached, a key reused), 413, 415: reminder-app's own sentence is about the request the model made.
+    throw new ReminderServiceError("refused", `reminder-app refused the request (HTTP ${response.status})${said ? `: ${said}` : ""}`);
   }
-  const reminderOf = (r: any): ServiceReminder | null =>
-    r && typeof r.id === "string" && typeof r.dueAt === "string" && r.target && typeof r.target === "object"
-      ? { id: r.id, dueAt: r.dueAt, note: typeof r.note === "string" ? r.note : "", createdAt: typeof r.createdAt === "string" ? r.createdAt : null, target: r.target }
-      : null;
   return {
     async register(conn, hook) {
-      const { status, data } = await call(conn, "POST", PROVISIONAL.hooks, { url: hook.url, secret: hook.secret });
-      if (status === 404 || typeof data?.hookId !== "string") throw new ReminderServiceError("unavailable", "reminder-app's registration answer had no hookId", { mayHaveLanded: true });
-      return { hookId: data.hookId };
+      const { result } = await call(conn, "POST", ROUTES.hooks, { url: hook.url, secret: hook.secret });
+      if (typeof result?.hookId !== "string") throw new ReminderServiceError("unavailable", "reminder-app's registration answer had no hookId", { mayHaveLanded: true });
+      return { hookId: result.hookId };
     },
-    async create(conn, reminder) {
-      const { idempotencyKey, ...body } = reminder;
-      // TODO(reminder-app): whether it honours an idempotency key, and under which header.
-      const { status, data } = await call(conn, "POST", PROVISIONAL.reminders, body, idempotencyKey ? { "idempotency-key": idempotencyKey } : {});
-      if (status === 404) throw new ReminderServiceError("unknown_hook", "reminder-app does not know this mount's registration");
-      if (typeof data?.id !== "string") throw new ReminderServiceError("unavailable", "reminder-app's answer had no reminder id", { mayHaveLanded: true });
-      return { id: data.id, dueAt: typeof data.dueAt === "string" ? data.dueAt : reminder.dueAt };
+    async create(conn, r) {
+      const { status, result } = await call(conn, "POST", ROUTES.reminders, {
+        requestId: r.requestId,
+        reminder: { title: r.title, notes: r.notes, schedule: r.schedule, anchor: null, target: r.target },
+      });
+      const made = status === 404 ? null : reminderOf(result);
+      if (!made) throw new ReminderServiceError("unavailable", "reminder-app's answer had no reminder", { mayHaveLanded: true });
+      return made;
     },
-    async list(conn, query) {
-      const q = new URLSearchParams({ hookId: query.hookId, limit: String(query.limit), ...(query.cursor ? { cursor: query.cursor } : {}) });
-      const { data } = await call(conn, "GET", `${PROVISIONAL.reminders}?${q}`);
-      const reminders = Array.isArray(data?.reminders) ? data.reminders.map(reminderOf).filter((r: ServiceReminder | null): r is ServiceReminder => r !== null) : [];
-      return { reminders, nextCursor: typeof data?.nextCursor === "string" ? data.nextCursor : null };
+    async list(conn) {
+      const { result } = await call(conn, "GET", `${ROUTES.reminders}?status=active`);
+      return Array.isArray(result?.reminders) ? result.reminders.map(reminderOf).filter((r: ServiceReminder | null): r is ServiceReminder => r !== null) : [];
     },
-    async get(conn, id) {
-      const { status, data } = await call(conn, "GET", PROVISIONAL.reminder(id));
-      return status === 404 ? null : reminderOf(data);
+    async cancel(conn, id) {
+      const { status, result } = await call(conn, "POST", ROUTES.cancel, { id });
+      return status === 404 ? null : reminderOf(result);
     },
-    async delete(conn, id) {
-      const { status } = await call(conn, "DELETE", PROVISIONAL.reminder(id));
-      return status !== 404;
+    async unregister(conn, hookId) {
+      // TODO(reminder-app): `cascade: "cancel"` is the decided form of "cancel its reminders, then delete the hook";
+      // the document at 66279b3 has no such field and refuses unknown ones, so this waits on its next revision.
+      const { status, result } = await call(conn, "POST", ROUTES.hooksDelete, { hookId, cascade: "cancel" });
+      if (status === 404) throw new ReminderServiceError("unknown_hook", "reminder-app does not know this registration");
+      return { activeRemindersUsingIt: typeof result?.activeRemindersUsingIt === "number" ? result.activeRemindersUsingIt : null };
     },
   };
+}
+
+function reminderOf(r: any): ServiceReminder | null {
+  if (!r || typeof r !== "object" || typeof r.id !== "string") return null;
+  const num = (v: unknown) => typeof v === "number" && Number.isFinite(v) ? v : null;
+  return {
+    id: r.id,
+    title: typeof r.title === "string" ? r.title : "",
+    notes: typeof r.notes === "string" ? r.notes : "",
+    target: r.target && typeof r.target === "object" && !Array.isArray(r.target) ? r.target : null,
+    status: typeof r.status === "string" ? r.status : "unknown",
+    nextAt: num(r.nextAt),
+    createdAt: num(r.createdAt),
+  };
+}
+
+// ---- who the calls are for
+
+/**
+ * The subject a call names: the agent, as this deployment identifies it. Both halves, because an agent id is unique
+ * only within its tenant (one Durable Object per pair, cf/src/object-name.ts): two tenants' agents with one id would
+ * otherwise share reminders and hooks at reminder-app, which trusts the subject it is told. Neither id may contain a
+ * colon there, so no two pairs make one subject, and the result fits reminder-app's 1-200 of `[A-Za-z0-9_.:@-]`.
+ * From the call's context only, never from a tool argument.
+ */
+export function subjectOf(ctx: Pick<PluginContext, "caller">): string {
+  return `${ctx.caller.tenantId}:${ctx.caller.agentId}`;
 }
 
 // ---- the mount's record
@@ -235,6 +278,8 @@ async function revokeAll(ctx: PluginContext, ids: string[]): Promise<string[]> {
 // ---- the tools
 
 export const NOTE_MAX = 1_000;
+/** reminder-app's `title` is 1-200 characters (reminder-app/docs/api.md, reminder-app 0.1.0, PR #6, 66279b3); the note's first line, cut to fit. */
+const TITLE_MAX = 200;
 /** The furthest ahead a reminder may be set. A bound, so a typo in a year is refused rather than kept for ever. */
 export const MAX_AHEAD_MS = 366 * 24 * 60 * 60 * 1000;
 const MAX_DELAY_MINUTES = MAX_AHEAD_MS / 60_000;
@@ -257,8 +302,9 @@ const TOOLS: ToolSchema[] = [
       required: ["note"],
     },
     sideEffects: "write",
-    // Keyed by the gateway's operation id, which reminder-app is asked to honour; not "native", because a re-run after
-    // a crash is a new operation with a new id (PluginContext.operationId), and the first call may open the push hook.
+    // Keyed: reminder-app makes one reminder per requestId, which is derived from the gateway's operation id. Not
+    // "native", because a re-run after a crash is a new operation with a new id (PluginContext.operationId), and the
+    // first call may open the push hook.
     idempotency: "key",
   },
   {
@@ -268,7 +314,7 @@ const TOOLS: ToolSchema[] = [
       type: "object", additionalProperties: false,
       properties: {
         limit: { type: "integer", minimum: 1, maximum: LIST_MAX, description: `At most this many (default ${LIST_DEFAULT}).` },
-        cursor: { type: "string", description: "The nextCursor of a previous list, for the next page." },
+        offset: { type: "integer", minimum: 0, description: "Skip this many, for the next page: the nextOffset of a previous list." },
       },
     },
     sideEffects: "read",
@@ -292,9 +338,9 @@ function args(value: Json, allowed: readonly string[], tool: string): Record<str
   const a = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
   const extra = Object.keys(a).filter((k) => !allowed.includes(k));
   if (extra.length) {
-    // The delivery target in particular is the plugin's to fill: refused, not ignored, so the model learns it.
-    const target = extra.some((k) => /target|hook/i.test(k)) ? " Where a reminder is delivered is fixed by this mount: it always wakes you here." : "";
-    throw new Error(`${tool} does not take ${extra.map((k) => JSON.stringify(k)).join(", ")}; it takes ${allowed.join(", ")}.${target}`);
+    // Where a reminder goes and whose it is are the plugin's to fill: refused, not ignored, so the model learns it.
+    const fixed = extra.some((k) => /target|hook|subject|agent/i.test(k)) ? " Where a reminder is delivered and whose it is are fixed by this mount: it always wakes you here." : "";
+    throw new Error(`${tool} does not take ${extra.map((k) => JSON.stringify(k)).join(", ")}; it takes ${allowed.join(", ")}.${fixed}`);
   }
   return a;
 }
@@ -302,20 +348,22 @@ function args(value: Json, allowed: readonly string[], tool: string): Record<str
 const ISO_WITH_ZONE = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.\d{1,3})?)?(Z|[+-]\d{2}:\d{2})$/;
 
 /** When a reminder is due, from exactly one of `at` and `delayMinutes`; refused when unreadable, past, or too far. */
-export function dueTime(a: Record<string, unknown>, now: number): number {
+export function dueTime(a: Record<string, unknown>, now: number): { due: number; schedule: ReminderSchedule } {
   const hasAt = a.at !== undefined, hasDelay = a.delayMinutes !== undefined;
   if (hasAt === hasDelay) throw new Error("give exactly one of `at` (an ISO 8601 time with a zone) or `delayMinutes`");
-  let due: number;
+  let due: number, schedule: ReminderSchedule;
   if (hasDelay) {
     const m = a.delayMinutes;
     if (typeof m !== "number" || !Number.isInteger(m) || m < 1 || m > MAX_DELAY_MINUTES) {
       throw new Error(`delayMinutes must be a whole number from 1 to ${MAX_DELAY_MINUTES}`);
     }
     due = now + m * 60_000;
+    schedule = { delaySeconds: m * 60 };
   } else {
     const s = a.at;
     const parts = typeof s === "string" ? ISO_WITH_ZONE.exec(s) : null;
-    // Date.parse alone accepts 2026-02-30 (as 2 March) and a time with no zone (as local time, whichever that is).
+    // Date.parse alone accepts 2026-02-30 (as 2 March) and a time with no zone (as local time, whichever that is);
+    // reminder-app would read the second in its own default zone, which is no better.
     const [, y, mo, d, h, mi, sec] = parts ?? [];
     const valid = parts && +mo! >= 1 && +mo! <= 12 && +d! >= 1 && +d! <= new Date(Date.UTC(+y!, +mo!, 0)).getUTCDate() &&
       +h! <= 23 && +mi! <= 59 && +(sec ?? 0) <= 59;
@@ -324,22 +372,32 @@ export function dueTime(a: Record<string, unknown>, now: number): number {
       throw new Error(`at ${JSON.stringify(typeof s === "string" ? clip(s, 60) : s)} is not a time this reads: write ISO 8601 with a zone, such as 2026-10-05T09:00:00Z`);
     }
     if (due <= now) throw new Error(`at ${new Date(due).toISOString()} has already passed (it is now ${new Date(now).toISOString()}); choose a future time`);
+    // Sent as the instant this read, in UTC: the same time, in the one spelling with nothing left to interpret.
+    schedule = { fireAt: new Date(due).toISOString() };
   }
   if (due - now > MAX_AHEAD_MS) throw new Error("a reminder can be set at most a year ahead");
-  return due;
+  return { due, schedule };
 }
 
 function connection(ctx: PluginContext): ReminderConnection {
   const baseUrl = ctx.publicConfig.serviceUrl;
   if (typeof baseUrl !== "string" || !baseUrl) throw new Error("this mount has no serviceUrl setting; its operator sets reminder-app's origin");
+  if (!ctx.credential) {
+    throw markIdentity(new Error(`reminder-app needs this deployment's client credential and the call has none: ${identityNote(ctx)}`), ctx);
+  }
   const t = ctx.publicConfig.timeoutMs;
   const timeoutMs = typeof t === "number" && Number.isFinite(t) ? Math.min(60_000, Math.max(1_000, t)) : DEFAULT_TIMEOUT_MS;
-  return { baseUrl, credential: ctx.credential ?? null, timeoutMs };
+  return { baseUrl, credential: ctx.credential, subject: subjectOf(ctx), timeoutMs };
 }
 
-/** The line a failure from reminder-app becomes for the model: its message, which our client writes and never fills with a URL or a secret. */
+/** A failure from reminder-app as the model sees it: our client's message (which never carries a URL, a secret or the credential), or a plain line. */
 function forModel(e: unknown): Error {
   return e instanceof ReminderServiceError ? e : new Error("reminder-app could not be reached");
+}
+
+/** `text` with every occurrence of each value cut out: for a message composed with a secret in reach. */
+function without(text: string, values: string[]): string {
+  return values.filter((v) => v.length > 0).reduce((t, v) => t.split(v).join("[withheld]"), text);
 }
 
 /**
@@ -349,9 +407,11 @@ function forModel(e: unknown): Error {
  * itself"): leftovers of failed attempts are revoked before anything new is made, the new hook's id is written down
  * before it is relied on, and a registration that fails takes its hook away again. Unlike Raft's push, a
  * registration that MAY have landed is revoked too: no reminder can name a registration whose id never came back, so
- * nothing would ever post to that hook.
+ * nothing would ever post to that hook. (reminder-app keeps such an orphan until it is deleted; it counts towards
+ * the subject's 20 hooks.)
  *
- * The secret is used once, for `register`, and dropped: see {@link HOOK_STORE}.
+ * The secret is the one `ctx.inbound.create()` made — 64 hex characters, inside reminder-app's 32-256 printable
+ * ASCII — used once, for `register`, and dropped: see {@link HOOK_STORE}.
  */
 async function ensureRegistered(ctx: PluginContext, service: ReminderService, conn: ReminderConnection): Promise<string> {
   let state = await loadHook(ctx);
@@ -369,18 +429,20 @@ async function ensureRegistered(ctx: PluginContext, service: ReminderService, co
   const created = await ctx.inbound.create();
   let serviceHookId: string;
   try {
-    if (new URL(created.url).protocol !== "https:") {
-      throw new ReminderServiceError("refused", "this deployment's push endpoints are not https, and reminder-app accepts only https");
+    const url = new URL(created.url);
+    // https on its default port only: reminder-app refuses anything else, and a refusal there would cost a round trip
+    // and leave the reason in its words. URL drops an explicit ":443", so any port left is another one.
+    if (url.protocol !== "https:" || url.port !== "") {
+      throw new ReminderServiceError("refused", "this deployment's push endpoints are not https on port 443, which reminder-app requires; nothing was set");
     }
     let registered: { hookId: string };
     try { registered = await service.register(conn, { url: created.url, secret: created.secret }); }
     catch (e) {
-      // Written here from the code alone: whatever a client put in its message was composed with the URL and the
-      // secret in reach, and a tool error lands in the transcript.
+      // Whatever a client put in its message was composed with the URL and the secret in reach, and a tool error
+      // lands in the transcript: both are cut out of it, and anything that is not a service error is not repeated.
       const code: ReminderServiceErrorCode = e instanceof ReminderServiceError ? e.code : "unavailable";
-      throw new ReminderServiceError(code, code === "refused"
-        ? "reminder-app refused this mount's push endpoint; nothing was set"
-        : "reminder-app could not register this mount's push endpoint; nothing was set, try again later");
+      const said = e instanceof ReminderServiceError ? without(e.message, [created.secret, created.url, url.host]) : "";
+      throw new ReminderServiceError(code, `reminder-app could not register this mount's push endpoint${said ? ` (${said})` : ""}; nothing was set`);
     }
     if (typeof registered?.hookId !== "string" || !ID.test(registered.hookId)) {
       throw new ReminderServiceError("unavailable", "reminder-app's registration answer carried no usable id; nothing was set");
@@ -407,21 +469,44 @@ async function forgetRegistration(ctx: PluginContext): Promise<void> {
   await saveHook(ctx, { inboundHookId: null, serviceHookId: null, staleInboundHookIds: [...new Set(stale)], registeredAt: null });
 }
 
+/** reminder-app's `requestId` (16-100 of `[A-Za-z0-9_-]`) for one operation: a digest, since an operation id may hold other characters. */
+async function requestIdOf(operationId: string | undefined): Promise<string> {
+  const basis = operationId ?? crypto.randomUUID();
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`reminder.create:${basis}`)));
+  return [...digest].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 const ownedBy = (r: ServiceReminder, serviceHookId: string) => r.target?.kind === "webhook" && r.target.hookId === serviceHookId;
-const shown = (r: ServiceReminder) => ({ id: r.id, dueAt: isoOrNull(r.dueAt), createdAt: isoOrNull(r.createdAt), note: clip(r.note, NOTE_MAX) ?? "" });
+const isoOf = (ms: number | null) => ms === null ? null : new Date(ms).toISOString();
+const shown = (r: ServiceReminder) => ({ id: r.id, dueAt: isoOf(r.nextAt), createdAt: isoOf(r.createdAt), note: clip(r.notes || r.title, NOTE_MAX) ?? "" });
 
 // ---- receiving
 
-/** TODO(reminder-app): the header it signs under, and the signature's form; this is GitHub's form, which Raft also uses. */
-export const SIGNATURE_HEADER = "x-reminder-signature-256";
+/**
+ * How far a push's `X-Reminder-Timestamp` may be from this clock: reminder-app/docs/webhook-delivery.md (reminder-app 0.1.0, PR #6,
+ * 66279b3), "Verifying a push", step 3. It bounds a replay of one captured request, not the retry schedule: every
+ * attempt is signed again with its own timestamp, so a retry hours later is as fresh as the first.
+ */
+export const SIGNATURE_MAX_SKEW_S = 300;
+/**
+ * Every attempt of a firing ends within this long of its first (webhook-delivery.md, reminder-app 0.1.0, PR #6, 66279b3, "Responses and
+ * retries", Horizon). The runtime remembers a dedupe key for INBOUND_DEDUPE_MS (src/runtime/inbound.ts), 24 hours,
+ * which is the plugin's whole dedupe; the two are held together by test/reminder-plugin.ts, so neither changes alone.
+ */
+export const RETRY_HORIZON_MS = 12 * 60 * 60_000;
 
-/** HMAC-SHA256 of the exact body bytes, compared by WebCrypto's `verify`, which is constant-time. */
-async function signedWith(body: Uint8Array, header: string | undefined, secret: string): Promise<boolean> {
-  const hex = /^sha256=([0-9a-f]{64})$/i.exec(header ?? "")?.[1];
-  if (!hex || !secret) return false;
+const PUSH_SCHEMA = "reminder.fired.v1";
+
+/** HMAC-SHA256, keyed by the secret as UTF-8, over `<timestamp>.<raw body>`, checked by WebCrypto's `verify`, which is constant-time. */
+async function signedWith(timestamp: string, body: Uint8Array, hex: string, secret: string): Promise<boolean> {
+  if (!secret) return false;
+  const prefix = new TextEncoder().encode(`${timestamp}.`);
+  const message = new Uint8Array(prefix.length + body.length);
+  message.set(prefix, 0);
+  message.set(body, prefix.length);
   const sig = Uint8Array.from(hex.match(/../g)!, (h) => Number.parseInt(h, 16));
   const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["verify"]);
-  return crypto.subtle.verify("HMAC", key, sig, body);
+  return crypto.subtle.verify("HMAC", key, sig, message);
 }
 
 const oneLine = (s: unknown, n: number) => clip(String(s ?? "").replace(/\s+/g, " ").trim(), n) ?? "";
@@ -432,63 +517,74 @@ function isoOrNull(s: unknown): string | null {
 }
 
 /**
- * The text that wakes the agent. One line the plugin writes from checked fields (ids matched by {@link ID}, times
- * re-printed from a parsed instant), then the note with every line quoted: the note is data — the agent wrote it, and
- * it came back through reminder-app — so no line of it can start where the plugin's own line or the runtime's label
- * would.
+ * The text that wakes the agent. One line the plugin writes from checked fields (the id matched by {@link ID}, the
+ * time re-printed from a parsed instant), then the note with every line quoted: the note is data — the agent wrote
+ * it, and it came back through reminder-app — so no line of it can start where the plugin's own line or the runtime's
+ * label would. The push carries no creation time, so the line says when it was due.
  */
-export function reminderText(fired: { reminderId: string; dueAt: string | null; createdAt: string | null; note: string }): string {
-  const set = fired.createdAt ? `set ${fired.createdAt}` : "set earlier";
-  const due = fired.dueAt ? `, due ${fired.dueAt}` : "";
+export function reminderText(fired: { reminderId: string; scheduledAt: string | null; note: string }): string {
+  const due = fired.scheduledAt ? `due ${fired.scheduledAt}` : "due earlier";
   const note = (clip(fired.note, NOTE_MAX) ?? "").split(/\r\n|[\n\r\v\f\u0085\u2028\u2029]/).map((l) => `> ${l}`).join("\n");
-  return `Reminder (${set}${due}; id ${fired.reminderId}). Your note:\n${note}`;
+  return `Reminder (${due}; id ${fired.reminderId}). Your note:\n${note}`;
 }
 
-/**
- * One signed fire from reminder-app.
- *
- * TODO(reminder-app): the body's fields. Expected: `{ fireId, reminderId, hookId, dueAt, createdAt, note }`, the fire
- * id unique per fire and the same on every retry of it. It is read from the signed body, not a header, so a replayed
- * body cannot be given a new id to slip past the dedupe.
- */
-async function receiveFire(event: InboundEvent, secret: string, ctx: PluginContext): Promise<InboundResult> {
-  const header = event.headers[SIGNATURE_HEADER];
-  if (!header) return { deliver: false, rejected: true, reason: `unsigned: no ${SIGNATURE_HEADER} header` };
-  if (!(await signedWith(event.body, header, secret))) {
+/** One signed push from reminder-app, checked as webhook-delivery.md (reminder-app 0.1.0, PR #6, 66279b3) "Verifying a push" says. */
+async function receiveFire(event: InboundEvent, secret: string, ctx: PluginContext, now: number): Promise<InboundResult> {
+  const timestamp = event.headers["x-reminder-timestamp"] ?? "";
+  const signature = event.headers["x-reminder-signature"] ?? "";
+  if (!/^\d{1,15}$/.test(timestamp)) return { deliver: false, rejected: true, reason: "unsigned: X-Reminder-Timestamp is missing or not digits" };
+  const hex = /^v1=([0-9a-f]{64})$/.exec(signature)?.[1];
+  if (!hex) return { deliver: false, rejected: true, reason: "unsigned: X-Reminder-Signature is missing or not v1=<64 hex>" };
+  if (Math.abs(now / 1000 - Number(timestamp)) > SIGNATURE_MAX_SKEW_S) {
+    return { deliver: false, rejected: true, reason: `the signature's timestamp is more than ${SIGNATURE_MAX_SKEW_S} s from this clock` };
+  }
+  if (!(await signedWith(timestamp, event.body, hex, secret))) {
     return { deliver: false, rejected: true, reason: "the signature does not match this hook's secret" };
   }
   // Signed by reminder-app from here on: a body that does not fit is its bug to fix (400), not a stranger (401).
-  let p: Record<string, unknown>;
+  // reminder-app reads 400 as final for the firing, so these are the shapes its document promises never to send.
+  let p: Record<string, any>;
   try {
     const parsed: unknown = JSON.parse(new TextDecoder().decode(event.body));
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("not an object");
-    p = parsed as Record<string, unknown>;
+    p = parsed as Record<string, any>;
   } catch {
     return { deliver: false, malformed: true, reason: "signed, but the body is not a JSON object" };
   }
+  if (p.schema !== PUSH_SCHEMA) {
+    const schema = typeof p.schema === "string" ? p.schema.slice(0, 64) : typeof p.schema;
+    return { deliver: false, malformed: true, reason: `signed, but the schema is ${JSON.stringify(schema)}, not ${PUSH_SCHEMA}` };
+  }
+  const r = p.reminder && typeof p.reminder === "object" && !Array.isArray(p.reminder) ? p.reminder : {};
   const bad = [
-    typeof p.fireId === "string" && ID.test(p.fireId) ? null : "fireId",
-    typeof p.reminderId === "string" && ID.test(p.reminderId) ? null : "reminderId",
+    typeof p.firingId === "string" && ID.test(p.firingId) ? null : "firingId",
     typeof p.hookId === "string" && ID.test(p.hookId) ? null : "hookId",
-    typeof p.note === "string" ? null : "note",
+    typeof p.subject === "string" ? null : "subject",
+    typeof r.id === "string" && ID.test(r.id) ? null : "reminder.id",
+    typeof r.title === "string" ? null : "reminder.title",
+    typeof r.notes === "string" ? null : "reminder.notes",
   ].filter((f): f is string => f !== null);
   // Field names only, never values: the record is read by an operator, and a value may be anything.
-  if (bad.length) return { deliver: false, malformed: true, reason: `signed, but ${bad.join(", ")} missing or malformed` };
+  if (bad.length) return { deliver: false, malformed: true, reason: `signed ${PUSH_SCHEMA}, but ${bad.join(", ")} missing or malformed` };
+  if (event.headers["x-reminder-firing-id"] !== p.firingId) {
+    return { deliver: false, malformed: true, reason: "X-Reminder-Firing-Id does not match the signed firingId" };
+  }
+  if (p.subject !== subjectOf(ctx)) return { deliver: false, reason: "signed, but for another agent" };
   const state = await loadHook(ctx);
   if (!state.known) {
-    // No record, yet a fire signed with this hook's secret: reminder-app still points here and names its
+    // No record, yet a push signed with this hook's secret: reminder-app still points here and names its
     // registration, which is everything `ensureRegistered` would have written (InboundEvent.hookId).
     if (ID.test(event.hookId)) {
-      await saveHook(ctx, { inboundHookId: event.hookId, serviceHookId: p.hookId as string, staleInboundHookIds: [], registeredAt: null });
+      await saveHook(ctx, { inboundHookId: event.hookId, serviceHookId: p.hookId, staleInboundHookIds: [], registeredAt: null });
     }
   } else if (p.hookId !== state.serviceHookId) {
     return { deliver: false, reason: "signed, but for a registration this mount no longer uses" };
   }
   return {
     deliver: true,
-    text: reminderText({ reminderId: p.reminderId as string, dueAt: isoOrNull(p.dueAt), createdAt: isoOrNull(p.createdAt), note: p.note as string }),
-    // The runtime drops a repeat of this key for 24 hours (`receiveHook`), which is the plugin's whole dedupe.
-    dedupeKey: p.fireId as string,
+    text: reminderText({ reminderId: r.id, scheduledAt: isoOrNull(p.scheduledAt), note: r.notes || r.title }),
+    // The runtime drops a repeat of this key within INBOUND_DEDUPE_MS, which covers RETRY_HORIZON_MS: the plugin's whole dedupe.
+    dedupeKey: p.firingId,
   };
 }
 
@@ -506,24 +602,31 @@ export function createReminderPlugin(deps: { service?: ReminderService; now?: ()
       { name: "serviceUrl", type: "string", required: true, format: "origin", summary: "reminder-app's origin, for example https://reminders.example.com." },
       { name: "timeoutMs", type: "number", default: DEFAULT_TIMEOUT_MS, min: 1_000, max: 60_000, summary: "How long one request to reminder-app may take, in milliseconds." },
     ],
-    // No `credential`: reminder-app's authentication is not known yet, and a declared one would put a form for an
-    // invented key in front of people. TODO(reminder-app): declare it with the real shape, and send it in
-    // `httpReminderService`.
+    credential: {
+      required: true,
+      summary: "reminder-app's client credential for this deployment, issued once by reminder-app's operator. One per deployment, " +
+        "not per agent: a mount names operator:reminder, which resolves to the deployment's REMINDER_APP_CREDENTIAL.",
+      shape: "token",
+      grants: "Registering this agent's push endpoint with reminder-app and creating, listing and cancelling the reminders that wake it.",
+      // rmc.<clientId>.<secret>: clientId 1-63 of [a-z0-9-], the secret two UUIDs without dashes
+      // (reminder-app/src/server/workspace.ts and reminder-app/src/server/crypto.ts, reminder-app 0.1.0, PR #6, 66279b3).
+      looksLike: [{ kind: "reminder-app client credential", pattern: "\\brmc\\.[a-z0-9][a-z0-9-]{0,62}\\.[0-9a-f]{64}\\b" }],
+    },
     tools: TOOLS,
 
     async invoke(tool, raw, ctx): Promise<Json> {
-      const conn = connection(ctx);
       if (tool === "create") {
         const a = args(raw, ["at", "delayMinutes", "note"], tool);
         const note = typeof a.note === "string" ? a.note.trim() : "";
         if (!note) throw new Error("note is required: write what the reminder should tell you");
         if (note.length > NOTE_MAX) throw new Error(`note has ${note.length} characters; the limit is ${NOTE_MAX}`);
-        const dueAt = new Date(dueTime(a, now())).toISOString();
-        const make = async (hookId: string) => service.create(conn, {
-          target: { kind: "webhook", hookId }, dueAt, note,
-          ...(ctx.operationId ? { idempotencyKey: ctx.operationId } : {}),
-        });
-        let made: { id: string; dueAt: string };
+        const { due, schedule } = dueTime(a, now());
+        const conn = connection(ctx);
+        // One key for the whole call, retry included: a create refused with unknown_hook does not use up its key.
+        const requestId = await requestIdOf(ctx.operationId);
+        const title = oneLine(note.split(/\r?\n/)[0], TITLE_MAX) || "Reminder";
+        const make = async (hookId: string) => service.create(conn, { requestId, title, notes: note, schedule, target: { kind: "webhook", hookId } });
+        let made: ServiceReminder;
         try {
           try { made = await make(await ensureRegistered(ctx, service, conn)); }
           catch (e) {
@@ -533,24 +636,23 @@ export function createReminderPlugin(deps: { service?: ReminderService; now?: ()
             made = await make(await ensureRegistered(ctx, service, conn));
           }
         } catch (e) { throw forModel(e); }
-        return { id: made.id, dueAt: isoOrNull(made.dueAt) ?? dueAt, note };
+        return { id: made.id, dueAt: isoOf(made.nextAt) ?? new Date(due).toISOString(), note };
       }
       if (tool === "list") {
-        const a = args(raw, ["limit", "cursor"], tool);
+        const a = args(raw, ["limit", "offset"], tool);
         const limit = a.limit === undefined ? LIST_DEFAULT : a.limit;
+        const offset = a.offset === undefined ? 0 : a.offset;
         if (typeof limit !== "number" || !Number.isInteger(limit) || limit < 1 || limit > LIST_MAX) throw new Error(`limit must be a whole number from 1 to ${LIST_MAX}`);
-        if (a.cursor !== undefined && typeof a.cursor !== "string") throw new Error("cursor must be the nextCursor a previous list returned");
+        if (typeof offset !== "number" || !Number.isInteger(offset) || offset < 0) throw new Error("offset must be a whole number, 0 or more");
         const state = await loadHook(ctx);
-        if (!state.serviceHookId) return { reminders: [], nextCursor: null };
-        let page;
-        try { page = await service.list(conn, { hookId: state.serviceHookId, limit, ...(a.cursor ? { cursor: a.cursor as string } : {}) }); }
-        catch (e) {
-          if (e instanceof ReminderServiceError && e.code === "unknown_hook") return { reminders: [], nextCursor: null };
-          throw forModel(e);
-        }
-        // Filtered here too: what this mount shows is what targets its own registration, whatever reminder-app returned.
-        const mine = page.reminders.filter((r) => ownedBy(r, state.serviceHookId!)).slice(0, limit);
-        return { reminders: mine.map(shown), nextCursor: page.nextCursor };
+        if (!state.serviceHookId) return { reminders: [], total: 0, nextOffset: null };
+        let all: ServiceReminder[];
+        try { all = await service.list(connection(ctx)); } catch (e) { throw forModel(e); }
+        // reminder-app answers with every hook's reminders of this agent; a mount shows those that target its own.
+        const mine = all.filter((r) => ownedBy(r, state.serviceHookId!) && r.status === "active")
+          .sort((x, y) => (x.nextAt ?? Infinity) - (y.nextAt ?? Infinity));
+        const page = mine.slice(offset, offset + limit);
+        return { reminders: page.map(shown), total: mine.length, nextOffset: offset + page.length < mine.length ? offset + page.length : null };
       }
       if (tool === "delete") {
         const a = args(raw, ["id"], tool);
@@ -559,20 +661,27 @@ export function createReminderPlugin(deps: { service?: ReminderService; now?: ()
         const state = await loadHook(ctx);
         const notMine = new Error(`this mount has no pending reminder ${id}; list shows the ones it can cancel`);
         if (!state.serviceHookId) throw notMine;
-        let found: ServiceReminder | null;
-        try { found = await service.get(conn, id); } catch (e) { throw forModel(e); }
-        // Another mount's reminder, or another registrant's, reads the same as none: this mount cannot touch it.
+        const conn = connection(ctx);
+        // reminder-app has no read of one reminder for this caller; its list is what says which hook one targets.
+        let found: ServiceReminder | undefined;
+        try { found = (await service.list(conn)).find((r) => r.id === id); } catch (e) { throw forModel(e); }
+        // Another mount's reminder reads the same as none: this mount cannot touch it.
         if (!found || !ownedBy(found, state.serviceHookId)) throw notMine;
-        let deleted: boolean;
-        try { deleted = await service.delete(conn, id); } catch (e) { throw forModel(e); }
-        return deleted ? { deleted: id } : { deleted: null, note: `reminder ${id} had already fired or been cancelled` };
+        let cancelled: ServiceReminder | null;
+        try { cancelled = await service.cancel(conn, id); } catch (e) { throw forModel(e); }
+        return cancelled ? { deleted: id } : { deleted: null, note: `reminder ${id} had already fired or been cancelled` };
       }
       throw new Error(`unknown reminder tool: ${tool}`);
     },
 
-    receive: receiveFire,
+    receive: (event, secret, ctx) => receiveFire(event, secret, ctx, now()),
   };
 }
 
 /** The plugin as the deployment registers it: reminder-app over HTTP. */
 export const reminderPlugin: Plugin = createReminderPlugin();
+
+// TODO(plugin contract): when a mount of this plugin is removed, its registration should be deleted with
+// `cascade: "cancel"` (`ReminderService.unregister`) and its inbound hook revoked. The contract has no member a runtime
+// calls on removal — `AgentRuntime.removeMount` instead refuses while a live inbound hook remains — so nothing calls
+// `unregister` yet, and a removal goes through an operator revoking the hook first.

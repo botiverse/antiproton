@@ -435,6 +435,8 @@ export const isOperatorModelRef = (ref: string) => providerOfRef(ref) !== null;
 export const OPERATOR_RUN9_REF = "operator:run9";
 /** The operator's Exa key, for the web search every agent is seeded with. */
 export const OPERATOR_EXA_REF = "operator:exa";
+/** reminder-app's client credential for this deployment: one per deployment, every agent's `reminder` mount names it. */
+export const OPERATOR_REMINDER_REF = "operator:reminder";
 
 export interface RuntimeDeps {
   ctx: any;
@@ -456,6 +458,9 @@ export interface RuntimeDeps {
   /** The operator's Exa key, behind OPERATOR_EXA_REF. Absent means the `search`
    *  mount resolves to no credential and says it cannot search. */
   operatorExa?: string;
+  /** reminder-app's client credential, behind OPERATOR_REMINDER_REF. Absent means a `reminder` mount naming it
+   *  resolves to no credential and says the deployment does not hold it. */
+  operatorReminder?: string;
   /** The key under which per-agent secrets are sealed at rest: 32 bytes,
    *  base64, a Worker secret. Absent means `agent:` references cannot be
    *  stored or resolved, and the credential form says so. */
@@ -848,7 +853,9 @@ export class AgentRuntime {
           ? (deps.operatorRun9 ? JSON.stringify(deps.operatorRun9) : null)
           : ref === OPERATOR_EXA_REF
             ? (deps.operatorExa || null)
-            : envSecrets.resolve(ref),
+            : ref === OPERATOR_REMINDER_REF
+              ? (deps.operatorReminder || null)
+              : envSecrets.resolve(ref),
     };
     this.#kek = kekPromise;
     this.#secrets = {
