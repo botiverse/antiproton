@@ -759,6 +759,11 @@ function neutralizedRefs(text: string): string {
  * not have. That costs one refused call; rewriting would change someone's words.
  */
 export function offeredTerms(text: string, unoffered: ReadonlySet<string>, quoted: readonly string[] = []): string {
+  // What is set aside is put back through a placeholder, `\uE000<index>\uE001`. A person can write those characters
+  // too, and one of theirs would be "put back" as something else (or as `undefined`), so the text and every quoted
+  // form are escaped first (`escapeMarks`): after that no `\uE000` is left but the ones placed here.
+  text = escapeMarks(text);
+  quoted = quoted.map(escapeMarks);
   const kept: string[] = [];
   // A search result's preview is a person's words and nothing else: the SDK (0.10.0 `formatAgentSearchResults`) puts
   // `renderSearchPreview` alone between a `<preview>` line and a `</preview>` line, and that renders only the content,
@@ -788,7 +793,15 @@ export function offeredTerms(text: string, unoffered: ReadonlySet<string>, quote
     out += masked.slice(at, m.index) + (UNOFFERED_SAY[name] ?? UNOFFERED_DEFAULT);
     at = end;
   }
-  return (out + masked.slice(at)).replace(/\uE000(\d+)\uE001/g, (_, i: string) => kept[Number(i)]!);
+  return unescapeMarks((out + masked.slice(at)).replace(/\uE000(\d+)\uE001/g, (_, i: string) => kept[Number(i)]!));
+}
+
+/** `offeredTerms`'s placeholder opener, and the escape character itself, written so neither appears in the result. */
+function escapeMarks(text: string): string {
+  return text.replace(/[\uE000\uE002]/g, (c) => (c === "\uE000" ? "\uE002a" : "\uE002b"));
+}
+function unescapeMarks(text: string): string {
+  return text.replace(/\uE002([ab])/g, (_, c: string) => (c === "a" ? "\uE000" : "\uE002"));
 }
 
 /**

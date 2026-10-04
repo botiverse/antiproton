@@ -1645,6 +1645,47 @@ await check("what a person wrote is never rewritten: message continuations, desc
   if (!/^Server-profile changes have no tool and remain server-role gated: ask a human via an action card \(`actions_prepare`\)\.$/m.test(full)) throw new Error(`overview: ${full}`);
 });
 
+/**
+ * Text shaped as `offeredTerms`'s own placeholder (`<index>`, private-use characters) and its escape
+ * (``): an index that will exist, one that will not, one inside another, and the escape's two forms.
+ */
+const MARKS = ["0", "99", "0", "ab"];
+
+await check("a person's text shaped as offeredTerms' placeholder comes back byte-identical: messages_read, tasks_list, a search preview", async () => {
+  const said = `marks ${MARKS.join(" | ")} end`;
+  globalThis.fetch = (async (url: any) => {
+    const path = new URL(String(url)).pathname.replace("/internal/agent-api", "");
+    // Next to each, a person's call at a tool this mount does not offer, so something is set aside and index 0 exists.
+    if (path === "/history") return history([historyMessage(41, "run inbox_check({}) now"), historyMessage(42, said)], { target: "#ops" });
+    if (path === "/tasks") return json(200, { tasks: [{ taskNumber: 7, status: "todo", title: "fix inbox_check({}) now", description: null }, { taskNumber: 8, status: "todo", title: said, description: null }] });
+    if (path === "/search") return json(200, { results: ["run inbox_check({}) now", said].map((content, i) => ({ id: `r-${i}`, seq: i + 1, channelId: "c", threadId: null,
+      parentMessageId: null, parentMessageContent: null, parentChannelId: "c", parentChannelName: "ops", parentChannelType: "channel", parentChannelArchivedAt: null,
+      senderId: "s", senderType: "human", senderName: "tygg", channelName: "ops", channelType: "channel", channelArchivedAt: null, content, snippet: "marks",
+      createdAt: "2026-09-21T10:00:00.000Z" })), hasMore: false });
+    return json(404, { error: "not found" });
+  }) as any;
+  const raw = createRaft({ serverUrl: "https://raft.example", credential: "sk_agent_test_1234567890", hints: "tool" });
+  const problems: string[] = [];
+  for (const [tool, args] of [["messages_read", { target: "#ops" }], ["tasks_list", { target: "#ops" }], ["messages_search", { query: "marks" }]] as const) {
+    const op = GENERATED.find((o) => o.toolName === tool)!;
+    const sdk = String(((await raw.invoke(op.name, { ...args, ...(pagingArg(op) ? { limit: PAGE_ROWS } : {}) }, { origin: "code" })) as any).text);
+    // Control: the SDK prints every mark as the person wrote it, on the lines compared below.
+    const lines = sdk.split("\n").filter((l) => l.includes("") || l.includes(""));
+    const missing = MARKS.filter((m) => !lines.some((l) => l.includes(m)));
+    if (missing.length) { problems.push(`${tool}: control: the SDK did not print ${JSON.stringify(missing)}`); continue; }
+    const shown = String(((await raftPlugin.invoke(tool, args, inTurn(ctx()))) as any).text).split("\n");
+    for (const line of lines) if (!shown.includes(line)) problems.push(`${tool}: ${JSON.stringify(line)} came back as ${JSON.stringify(shown.find((l) => l.includes("marks") && l.includes("end")))}`);
+  }
+  if (problems.length) throw new Error(problems.join(" | "));
+  // Directly, with nothing set aside and with a quoted form set aside: byte-identical either way, and a hint still in words.
+  for (const quoted of [[], ["run inbox_check({}) now"]]) {
+    // The hint is not the person's call, which a quoted form would leave alone (`offeredTerms`).
+    const text = `run inbox_check({}) now\n${said}\nnext: inbox_check({ limit: 5 })`;
+    const out = offeredTerms(text, new Set(["inbox_check"]), quoted);
+    if (out !== `${quoted.length ? "run inbox_check({}) now" : "run receive_events() now"}\n${said}\nnext: receive_events()`) throw new Error(JSON.stringify(out));
+  }
+});
+
 await check("nothing inside a search preview is rewritten: a hit marked inside a call, a person's literal <match>, a forged </preview>", async () => {
   const contents = [
     'please run mentions_execute({ action: "notify", resolutionIds: ["r-1"] }) for the deploy',
@@ -1664,11 +1705,17 @@ await check("nothing inside a search preview is rewritten: a hit marked inside a
   }
   const ours = String(((await raftPlugin.invoke("messages_search", { query: "notify" }, inTurn(ctx()))) as any).text);
   if (ours !== sdk.trim()) throw new Error(`the previews were rewritten:\n${ours}`);
-  // Positive control: the same text with an SDK hint outside the preview still has the hint put in words — the 0.11.0 add
-  // hint, at a tool this mount does not offer (`NOT_OFFERED`, the tool names of `EXCLUDED`).
+  // Positive control, which also pins where a preview ends: the same text with an SDK hint BETWEEN two results, outside
+  // both previews, has the hint put in words and both previews as they were. The hint is the 0.11.0 add hint, at a tool
+  // this mount does not offer (`NOT_OFFERED`, the tool names of `EXCLUDED`). The line before it names the tag mid-line,
+  // which is not a preview's opening line: a block runs from a line that is exactly `<preview>` to the first line that
+  // is exactly `</preview>`, and neither one reaching across results nor one opened mid-line may swallow the hint.
   if (!NOT_OFFERED.includes("mentions_add")) throw new Error(`control: mentions_add is offered: ${NOT_OFFERED.join(", ")}`);
-  const hinted = offeredTerms(`${sdk}\n  add: mentions_add({ resolutionIds: ["r-2"] })`, new Set(NOT_OFFERED));
-  if (!hinted.endsWith("  add: adding them to the conversation, which this mount does not offer") || !hinted.startsWith(sdk)) throw new Error(hinted);
+  const cut = sdk.indexOf("</result>\n") + "</result>\n".length;
+  if (cut < "</result>\n".length || (sdk.slice(cut).match(/^<preview>$/gm) ?? []).length < 2) throw new Error(`control: no two results after the first: ${sdk}`);
+  const between = (hint: string) => `${sdk.slice(0, cut)}this line names a <preview>\n${hint}\n${sdk.slice(cut)}`;
+  const hinted = offeredTerms(between('  add: mentions_add({ resolutionIds: ["r-2"] })'), new Set(NOT_OFFERED));
+  if (hinted !== between("  add: adding them to the conversation, which this mount does not offer")) throw new Error(hinted);
 });
 
 /** The preview line of the windowed result, as the SDK printed it (for the control that it was cut). */
