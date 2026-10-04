@@ -507,7 +507,7 @@ const OPERATION_OF = new Map(GENERATED.map((op) => [op.toolName, op]));
  * carries. Every other call is "code": a run_js program, an approved call's replay (run with nobody reading the
  * result), provisioning, a bench shell. Under "code" the SDK refuses a model-only operation with MODEL_ONLY
  * before any request, and reads history with `consume: false`, recording nothing as seen. That is all "code"
- * changes in the SDK (0.7.0's `invoke`): a send, a claim or a task write runs the same under either, attesting
+ * changes in the SDK (0.8.0's `invoke`): a send, a claim or a task write runs the same under either, attesting
  * what was seen in the context it names. The context id goes along whatever the origin, so what a program sends
  * is attested by what its model read in that context.
  */

@@ -165,8 +165,9 @@ const EXPECTED_GENERATED = [
   "identity.whoami", "inbox.list", "messages.read", "messages.send", "messages.reply", "messages.search", "messages.resolve",
   "messages.react", "messages.unreact", "attachments.comments", "mentions.pending", "mentions.deliveries", "actions.prepare",
   "manual.get", "manual.search", "tasks.claim", "tasks.list", "tasks.create", "tasks.unclaim", "tasks.assign", "tasks.unassign",
-  "tasks.updateStatus", "tasks.amend", "tasks.history", "tasks.convert", "tasks.delete", "channels.join", "channels.leave",
-  "channels.mute", "channels.unmute", "channels.members", "threads.list", "threads.unfollow", "server.info", "profile.show",
+  "tasks.updateStatus", "tasks.amend", "tasks.history", "tasks.show", "tasks.convert", "tasks.delete", "channels.join", "channels.leave",
+  "channels.mute", "channels.unmute", "channels.members", "channels.info", "threads.list", "threads.unfollow", "server.info", "users.info",
+  "profile.show",
 ];
 
 await check("every manifest operation is a generated tool or in the exclusion table, never both, and every exclusion names a real operation", async () => {
@@ -884,7 +885,9 @@ await check("messages_search passes its parameters through and answers with the 
 });
 
 /** The operations whose result the manifest says may be large and that page by `limit`: the ones capped here. */
-const CAPPED = ["inbox.list", "messages.read", "messages.search", "attachments.comments", "mentions.pending", "server.info"];
+// users.info's limit is how many visible channels it inspects for memberships, one request each: capped, it bounds
+// both the result and the requests one call makes.
+const CAPPED = ["inbox.list", "messages.read", "messages.search", "attachments.comments", "mentions.pending", "server.info", "users.info"];
 
 await check("a paged result stays under the parking line: limit is capped and defaulted on every operation that pages by it", async () => {
   if (PAGE_ROWS < 1 || PAGE_ROWS * 400 > PARK_BYTES) throw new Error(`PAGE_ROWS=${PAGE_ROWS} against PARK_BYTES=${PARK_BYTES}`);
@@ -908,6 +911,22 @@ await check("a paged result stays under the parking line: limit is capped and de
   const page = await raftPlugin.invoke("messages_read", { target: "#wg-raft-sdk" }, inTurn(ctx()));
   const size = JSON.stringify(page).length;
   if (size > PARK_BYTES) throw new Error(`a full page of ${body.length}-character messages is ${size} characters; the parking line is ${PARK_BYTES}`);
+});
+
+await check("users_info inspects at most a capped page of channels, one members request each, and the page fits under the parking line", async () => {
+  const channels = Array.from({ length: PAGE_ROWS + 5 }, (_, i) => ({ id: `c${i}`, name: `ch${i}`, joined: true, type: "channel" }));
+  const urls: string[] = [];
+  globalThis.fetch = (async (url: any) => {
+    urls.push(String(url));
+    return new URL(String(url)).pathname.endsWith("/server") ? server(channels)
+      : json(200, { channel: { ref: "#x", type: "channel" }, agents: [], humans: [{ name: "tygg", role: "owner" }] });
+  }) as any;
+  const out = await raftPlugin.invoke("users_info", { name: "@tygg" }, inTurn(ctx())) as any;
+  const memberRequests = urls.filter((u) => /channel-members/.test(u)).length;
+  if (memberRequests !== PAGE_ROWS || out.state !== "info") throw new Error(`requests: ${memberRequests} ${JSON.stringify(out).slice(0, 300)}`);
+  if (JSON.stringify(out).length > PARK_BYTES) throw new Error(`a full page is ${JSON.stringify(out).length} characters`);
+  const toolInfo = toolNamed("users_info")!;
+  if (toolInfo.sideEffects !== "read" || toolInfo.idempotency !== "native" || toolInfo.modelOnly) throw new Error(JSON.stringify(toolInfo));
 });
 
 /**
@@ -1034,6 +1053,11 @@ await check("a mount's snapshot lists only the operations whose every capability
   if (JSON.stringify(names) !== JSON.stringify(allowedBy(["read", "send"]))) throw new Error(`listed: ${names.join(", ")}`);
   // channels.join needs channels and read; a task operation needs tasks: neither is offered, and each says which scope it lacks.
   if (!names.includes("messages_send") || !names.includes("messages_read") || names.includes("channels_join") || names.includes("tasks_list")) throw new Error(names.join(", "));
+  // The read-only operations 0.8.0 added are filtered the same way: channels_info and users_info need channels, tasks_show needs tasks.
+  if (names.includes("channels_info") || names.includes("users_info") || names.includes("tasks_show")) throw new Error(`a new operation escaped the filter: ${names.join(", ")}`);
+  one(context(["read", "channels", "tasks"]));
+  const wider = (await raftPlugin.snapshotTools!(ctx())).tools.map((t) => t.name);
+  if (!wider.includes("channels_info") || !wider.includes("users_info") || !wider.includes("tasks_show")) throw new Error(`control: ${wider.join(", ")}`);
   const join = listed.skipped?.find((s) => s.name === "channels_join");
   if (!join || !/lacks the Raft capability channels$/.test(join.reason)) throw new Error(`skipped: ${JSON.stringify(listed.skipped)}`);
   // No credential, or one Raft refuses, has no capabilities at all; Raft not answering is a throw, which keeps the stored list.
