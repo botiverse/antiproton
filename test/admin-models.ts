@@ -89,7 +89,7 @@ await check("a model must be named the way its provider names models, under a pr
   const s = store();
   const { AI_GATEWAY_TOKEN: _, ...noToken } = ENV;
   const off = await call("PUT", { scope: "tenant", tenantId: "t", provider: "cloudflare", model: "openai/gpt-5" }, s, noToken);
-  must(off.status === 422 && off.body.error.code === "unavailable" && /AI_GATEWAY_TOKEN not set/.test(off.body.error.message) && s.rows.size === 0, off.text);
+  must(off.status === 422 && off.body.error.code === "unavailable" && /AI_GATEWAY_TOKEN not set/.test(off.body.error.message) && s.rows.size === 0, `a provider without its secret was accepted: ${off.text}`);
   const listed = await call("GET", undefined, s, noToken);
   must(listed.body.providers.find((p: any) => p.id === "cloudflare").available === false, "an unavailable provider was listed as available");
 });
