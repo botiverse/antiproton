@@ -325,13 +325,22 @@ await check("a post that throws is retried on its own row and then delivered; on
   await push(v, "n2", "BROKEN");
   const broken = await v.D.runtime().agent(T, A);
   (broken as any).say = () => Promise.reject(new Error("harness would not open"));
+  // The schedule, read pass by pass: a second before each wait ends nothing is tried, a second after it the
+  // next attempt is; the fifth attempt fails it, 17.5 minutes after the first.
+  const attempts = () => Number((v.raw.sql.exec("SELECT attempts FROM inbound_pending").toArray()[0] as any)?.attempts ?? -1);
   let shift = 0;
+  const at = async (ms: number) => { shift = ms; Date.now = () => realNow() + shift; await v.D.alarm(); };
   try {
-    for (let i = 0; i < 5; i++) {
-      Date.now = () => realNow() + shift;
-      await v.D.alarm();
-      shift += 16 * 60_000;
+    await at(0);
+    must(attempts() === 1, `first attempt: ${attempts()}`);
+    for (const [i, wait] of [30_000, 120_000, 300_000, 600_000].entries()) {
+      const tried = shift;
+      await at(tried + wait - 1_000);
+      must(attempts() === i + 1, `retry ${i + 1} came before its ${wait} ms wait: attempts ${attempts()}`);
+      await at(tried + wait + 1_000);
+      if (i < 3) must(attempts() === i + 2, `retry ${i + 1} did not come after its ${wait} ms wait: attempts ${attempts()}`);
     }
+    must(shift === 1_054_000 && pendingRows(v) === 0, `given up at ${shift} ms, ${pendingRows(v)} queued`);
   } finally { Date.now = realNow; }
   const rec = v.raw.sql.exec("SELECT outcome, reason, dedupe_key FROM inbound_events").toArray() as any[];
   must(pendingRows(v) === 0 && rec.length === 1 && rec[0].outcome === "failed" && /after 5 attempts: harness would not open/.test(rec[0].reason), `given up: ${show(rec)} ${pendingRows(v)} queued`);
@@ -411,6 +420,9 @@ await check("revocation: a revoked hook answers 404 at once though its route is 
   }), w.env as never);
   must((await revoked.json() as { revoked?: boolean }).revoked === true, "revoke");
   const before = outcomes(w).length;
+  // Oversized, through the cached route: the hook is unknown before the body is too large.
+  const oversized = await push(w, "n3", "x", {}, new Uint8Array(1_000_001));
+  must(oversized.status === 404 && oversized.body === "", `an oversized push to the revoked hook: ${show({ ...oversized, d1: undefined })}`);
   const after = await push(w, "n3", "x");
   must(after.status === 404 && after.body === "" && after.d1.length === 1, `after the revoke: ${show(after)}`);
   must(outcomes(w).length === before, `the revoked push left a record: ${show(outcomes(w))}`);
@@ -437,6 +449,132 @@ await check("a live hook whose secret is gone answers 503 and is recorded once, 
   must(r.status === 503 && r.body === '{"outcome":"failed"}' && r.d1.length === 1, `answer: ${show(r)}`);
   const failed = (w.raw.sql.exec("SELECT reason FROM inbound_events WHERE outcome = 'failed'").toArray() as any[]);
   must(failed.length === 1 && /no secret/.test(failed[0].reason), `records: ${show(failed)}`);
+});
+
+await check("while posting keeps failing, a push queued 30 minutes is given up wherever it stands, and the alarm is set for it", async () => {
+  const w = await world();
+  await push(w, "a", "HEAD");
+  await push(w, "b", "BEHIND");
+  const engine = await w.D.runtime().agent(T, A);
+  (engine as any).say = () => Promise.reject(new Error("posting is down"));
+  const realNow = Date.now;
+  try {
+    await w.D.alarm();
+    must(pendingRows(w) === 2 && w.alarmAt() !== null, "control: both queued, the head waiting on its retry");
+    const behind = () => (w.raw.sql.exec("SELECT attempts FROM inbound_pending WHERE dedupe_key = 'b'").toArray()[0] as any)?.attempts;
+    must(behind() === 0, `the row behind was tried: ${behind()}`);
+    Date.now = () => realNow() + 30 * 60_000 + 1_000;
+    await w.D.alarm();
+  } finally { Date.now = realNow; }
+  const rec = w.raw.sql.exec("SELECT dedupe_key, outcome, reason FROM inbound_events ORDER BY rowid").toArray() as any[];
+  must(pendingRows(w) === 0 && rec.length === 2 && rec.every((r) => r.outcome === "failed" && /queued for more than 30 minutes/.test(r.reason)),
+    `after 30 minutes: ${show(rec)}, ${pendingRows(w)} queued`);
+  must(/posting is down/.test(rec[0].reason), `the head's record lost why: ${rec[0].reason}`);
+  must(jobCount(w) === 0, "something was posted");
+});
+
+await check("a hook with 30 pushes queued is answered as the rate limit answers, and recorded with why", async () => {
+  const w = await world();
+  const realNow = Date.now;
+  try {
+    // Three seconds apart, so the per-minute rate never trips: only the queue can.
+    for (let i = 0; i < 30; i++) {
+      Date.now = () => realNow() + i * 3_000;
+      must((await push(w, `q${i}`, "waiting")).status === 202, `push ${i}`);
+    }
+    Date.now = () => realNow() + 30 * 3_000;
+    const full = await push(w, "q30", "waiting");
+    must(full.status === 429 && full.body === '{"outcome":"rate_limited"}', `the 31st: ${show({ ...full, d1: undefined })}`);
+  } finally { Date.now = realNow; }
+  const last = (w.raw.sql.exec("SELECT outcome, reason FROM inbound_events ORDER BY rowid DESC LIMIT 1").toArray()[0] as any);
+  must(last?.outcome === "rate_limited" && /30 pushes from this hook are already waiting/.test(last.reason), `record: ${show(last)}`);
+  must(pendingRows(w) === 30, `queued: ${pendingRows(w)}`);
+});
+
+await check("provisioning and the model choice run once in a pass that posts, and not in one that only waits out a retry", async () => {
+  const w = await world({ raftMade: true });
+  await push(w, "a", "P-ONE");
+  await push(w, "b", "P-TWO");
+  const choices = (from: number) => w.d1.log.slice(from).filter((q) => /model_overrides/.test(q)).length;
+  // Provisioning changes the catalogue, so the harness is rebuilt: the first say of whichever engine is open fails.
+  const rt = w.D.runtime();
+  const open = rt.agent.bind(rt);
+  let fail = 1;
+  (rt as any).agent = async (...a: Parameters<typeof open>) => {
+    const engine = await open(...a);
+    if (!(engine as any).__wrapped) {
+      const say = engine.say.bind(engine);
+      Object.assign(engine, { __wrapped: true, say: (...b: Parameters<typeof say>) => (fail-- > 0 ? Promise.reject(new Error("once")) : say(...b)) });
+    }
+    return engine;
+  };
+  let from = w.d1.log.length;
+  await w.D.alarm();
+  const failing = choices(from);
+  must(failing === 1 && pendingRows(w) === 2, `the pass that tried: ${failing} model-choice reads, ${pendingRows(w)} queued`);
+  from = w.d1.log.length;
+  await w.D.alarm();
+  must(choices(from) === 0 && pendingRows(w) === 2, `the pass that only waited: ${choices(from)} model-choice reads`);
+  const realNow = Date.now;
+  try {
+    Date.now = () => realNow() + 31_000;
+    from = w.d1.log.length;
+    await w.D.alarm();
+  } finally { Date.now = realNow; }
+  must(choices(from) === 1 && pendingRows(w) === 0, `the pass that posted two rows: ${choices(from)} model-choice reads, ${pendingRows(w)} queued`);
+});
+
+await check("a settle whose record cannot be written leaves its queued row, and the push is not posted again", async () => {
+  const w = await world();
+  await push(w, "a", "ATOMIC");
+  w.raw.sql.exec("CREATE TRIGGER refuse_events BEFORE INSERT ON inbound_events BEGIN SELECT RAISE(ABORT, 'the record cannot be written'); END");
+  let threw = "";
+  try { await w.D.alarm(); } catch (e) { threw = String((e as Error).message); }
+  must(/cannot be written/.test(threw), `control: the settle failed: ${threw || "it did not"}`);
+  must(pendingRows(w) === 1 && outcomes(w).length === 0, `after the failed settle: ${pendingRows(w)} queued, records ${show(outcomes(w))}`);
+  w.raw.sql.exec("DROP TRIGGER refuse_events");
+  await settle(w, 1);
+  must(pendingRows(w) === 0 && await timesAsked(w, "ATOMIC") === 1 && outcomes(w).length === 1, `after: asked ${await timesAsked(w, "ATOMIC")}, ${show(outcomes(w))}`);
+});
+
+await check("two hooks whose ids differ only in the last character route apart, from memory and from the colo's cache", async () => {
+  const store = new Map<string, string>();
+  (globalThis as any).caches = { default: {
+    async match(r: Request) { const v = store.get(r.url); return v ? new Response(v) : undefined; },
+    async put(r: Request, res: Response) { store.set(r.url, await res.text()); },
+    async delete(r: Request) { return store.delete(r.url); },
+  } };
+  try {
+    const w = await world();
+    const rt = w.D.runtime();
+    await rt.store.addMount({ tenantId: T, agentId: A, alias: "p2", plugin: "pushy", installationId: "i", connectionId: null,
+      toolVersion: "1.0.0", publicConfig: {}, secretRef: null, policy: null });
+    const ids = ["Z".repeat(42) + "a", "Z".repeat(42) + "b"];
+    const secrets: string[] = [];
+    for (const [i, id] of ids.entries()) {
+      const made = await w.D.hookCreateSecret(T, A, i === 0 ? "p" : "p2", id) as { ok: boolean; secret?: string };
+      must(made.ok && made.secret, `secret ${i}`);
+      secrets.push(made.secret!);
+      w.d1.hooks.set(id, { hook_id: id, tenant_id: T, agent_id: A, alias: i === 0 ? "p" : "p2", created_at: 1, revoked_at: null });
+    }
+    const send = async (i: number, n: string) => {
+      w.hookId = ids[i]!; w.secret = secrets[i]!;
+      return push(w, n, "x");
+    };
+    const aliasOf = (n: string) => (w.raw.sql.exec("SELECT alias, hook_id FROM inbound_pending WHERE dedupe_key = ?", n).toArray()[0] as any);
+    const reads: number[] = [];
+    for (const round of ["index", "memory", "cache"]) {
+      if (round === "cache") clearHookRoutes();
+      for (const i of [0, 1]) {
+        const n = `${round}-${i}`;
+        const r = await send(i, n);
+        reads.push(r.d1.length);
+        const got = aliasOf(n);
+        must(r.status === 202 && got?.alias === (i === 0 ? "p" : "p2") && got.hook_id === ids[i], `${round} ${i}: ${r.status} ${show(got)}`);
+      }
+    }
+    must(show(reads) === show([1, 1, 0, 0, 0, 0]), `index reads per push: ${show(reads)}`);
+  } finally { delete (globalThis as any).caches; }
 });
 
 await check("the colo's cache serves a route another isolate read, with no index lookup", async () => {

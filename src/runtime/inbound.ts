@@ -136,12 +136,30 @@ const PENDING = `CREATE TABLE IF NOT EXISTS inbound_pending (
   UNIQUE(hook_id, dedupe_key))`;
 
 /**
- * How long after its n-th failed attempt a queued push is tried again; the last failure gives it up, and
- * its record says `failed` with the reason. Five attempts over about half an hour: long enough to outlast
- * a deploy or a provider's bad minutes, short enough that a push nobody can post shows the same hour.
+ * How long after its n-th failed attempt a queued push is tried again. Five attempts: the first, then one
+ * after each of these waits, 17.5 minutes from the first failure to the last; the fifth failure gives it
+ * up, and its record says `failed` with the reason. Long enough to outlast a deploy or a provider's bad
+ * minutes, short enough that a push nobody can post shows well inside the hour.
  */
-export const INBOUND_RETRY_MS = [30_000, 2 * 60_000, 5 * 60_000, 10 * 60_000, 15 * 60_000] as const;
-export const INBOUND_POST_ATTEMPTS = INBOUND_RETRY_MS.length;
+export const INBOUND_RETRY_MS = [30_000, 2 * 60_000, 5 * 60_000, 10 * 60_000] as const;
+export const INBOUND_POST_ATTEMPTS = INBOUND_RETRY_MS.length + 1;
+
+/**
+ * The oldest a queued push may get before it is given up, wherever it stands in the queue. Order is
+ * strict, so while posting keeps failing every row waits behind the head's retries: without this a long
+ * outage would end with the agent reading notices hours old. A bound on age rather than "fail everything
+ * behind a head that was given up", because the pass cannot tell a failure that is about posting at all
+ * from one that is about the head's own message, and age needs no such judgement. Longer than the retry
+ * schedule (17.5 min), so a head always gets its five attempts.
+ */
+export const INBOUND_MAX_AGE_MS = 30 * 60_000;
+
+/**
+ * The most pushes one hook may have queued. Normally the queue empties within the second; it fills only
+ * while posting is failing, and past this the push is answered as the rate limit answers (429), so the
+ * service sees backpressure rather than a 202 the agent cannot honour.
+ */
+export const INBOUND_QUEUE_MAX = 30;
 
 export function ensureInboundTable(sql: SqlHost["sql"]) {
   sql.exec(TABLE);
@@ -169,9 +187,12 @@ export const LOCAL_KEY = "local:";
 
 /** The oldest push not yet settled; arrival order is delivery order. */
 export function nextPendingInbound(sql: SqlHost["sql"]): PendingInbound | null {
-  const r = sql.exec(
+  return readPending(sql.exec(
     "SELECT seq, hook_id, alias, dedupe_key, message, received_at, state, attempts, next_at, last_error FROM inbound_pending ORDER BY seq LIMIT 1",
-  ).toArray()[0] as any;
+  ).toArray()[0]);
+}
+
+function readPending(r: any): PendingInbound | null {
   return r ? {
     seq: Number(r.seq), hookId: String(r.hook_id), alias: String(r.alias), dedupeKey: String(r.dedupe_key),
     message: String(r.message), receivedAt: Number(r.received_at), state: r.state === "posting" ? "posting" : "queued",
@@ -183,6 +204,24 @@ export function nextPendingInbound(sql: SqlHost["sql"]): PendingInbound | null {
 export function hasPendingInbound(sql: SqlHost["sql"]): boolean {
   try { return sql.exec("SELECT 1 AS hit FROM inbound_pending LIMIT 1").toArray().length > 0; }
   catch { return false; }
+}
+
+/** Whether this hook already has `max` pushes queued. Read in the same synchronous run as the claim. */
+export function queueFull(sql: SqlHost["sql"], hookId: string, max: number = INBOUND_QUEUE_MAX): boolean {
+  return Number((sql.exec("SELECT COUNT(*) AS n FROM inbound_pending WHERE hook_id = ?", hookId).toArray()[0] as any)?.n ?? 0) >= max;
+}
+
+/** Queued pushes older than `INBOUND_MAX_AGE_MS`, oldest first, wherever they stand. */
+export function expiredPendingInbound(sql: SqlHost["sql"], now: number): number[] {
+  return (sql.exec("SELECT seq FROM inbound_pending WHERE received_at <= ? ORDER BY seq", now - INBOUND_MAX_AGE_MS).toArray() as any[])
+    .map((r) => Number(r.seq));
+}
+
+/** One queued row by its seq, or null when it is gone. */
+export function pendingInboundRow(sql: SqlHost["sql"], seq: number): PendingInbound | null {
+  return readPending(sql.exec(
+    "SELECT seq, hook_id, alias, dedupe_key, message, received_at, state, attempts, next_at, last_error FROM inbound_pending WHERE seq = ?", seq,
+  ).toArray()[0]);
 }
 
 export function pendingInboundCount(sql: SqlHost["sql"]): number {

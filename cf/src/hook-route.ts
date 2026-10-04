@@ -48,7 +48,7 @@ function valid(v: unknown, hookId: string): v is { route: HookRoute; until: numb
 export async function routeHook(dir: HookDirectory, origin: string, hookId: string, now: () => number = Date.now):
   Promise<{ route: HookRoute; from: RouteSource } | null> {
   const held = memory.get(hookId);
-  if (held && held.until > now()) return { route: held.route, from: "memory" };
+  if (held && held.until > now() && held.route.hookId === hookId) return { route: held.route, from: "memory" };
   memory.delete(hookId);
   const cache = colo();
   if (cache) {

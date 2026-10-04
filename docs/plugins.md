@@ -779,8 +779,12 @@ does need one; see the GitHub example below.
    order they arrived: an idle agent starts a turn, and a busy one takes the
    message into the turn it is already running. The queue is in the agent's
    own storage, so an eviction between the answer and the post loses nothing.
-   A post that fails is retried 5 times over about half an hour, then recorded
-   as `failed` with the reason. An event is never posted twice: if a pass ends
+   A post that fails is tried 5 times in all, again after 30 s, 2 min, 5 min
+   and 10 min (17.5 minutes from the first failure), then recorded as `failed`
+   with the reason. Events wait in order, so while posting keeps failing the
+   queue grows: an event queued for 30 minutes is recorded as `failed` wherever
+   it stands, and a hook with 30 events queued is answered 429, as the rate
+   limit answers. An event is never posted twice: if a pass ends
    while handing an event over, it cannot tell whether the event arrived, and
    records it as `failed` rather than posting it again.
 
@@ -900,7 +904,7 @@ was given up.
 | rejected | 401 | `deliver: false, rejected: true` |
 | malformed | 400 | `deliver: false, malformed: true` |
 | too_large | 413 | body over 1 MB |
-| rate_limited | 429 | over 30 deliveries a minute for this hook |
+| rate_limited | 429 | over 30 deliveries a minute for this hook, or 30 already queued |
 | failed | 503 | `receive` threw, or the hook has no secret; in the record also an accepted event that was given up (the service was already answered 202) |
 
 When an expected event never arrived, read the record with

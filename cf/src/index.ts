@@ -2056,9 +2056,9 @@ export class AgentDO extends DurableObject<Env> {
 
   /**
    * The deferred half of a push (`hookReceive`), from the alarm pass, before the step: the step then drives
-   * the turn the post started. Provisioning and the model binding go first, once per pass rather than once
-   * per push, so the turn is built with what they add; neither may stop the post, which the service was
-   * already told about.
+   * the turn the post started. Provisioning and the model binding go first, once in a pass that posts rather
+   * than once per push, so the turn is built with what they add; neither may stop the post, which the
+   * service was already told about.
    */
   async #deliverInbound(tenantId: string, agentId: string) {
     // Asked of the table itself, before any runtime is built: most passes have nothing queued, and an
@@ -2067,18 +2067,22 @@ export class AgentDO extends DurableObject<Env> {
     const rt = this.runtime();
     await rt.ready();
     const started = Date.now();
-    try {
-      // An agent Raft made has the default mounts (provision/steps.ts), and gets one added since on its
-      // next wake, the way a console agent gets it when its page opens. Only what is missing is added.
-      const agent = await rt.store.loadAgent(tenantId, agentId);
-      if ((agent?.config as { provisionedBy?: unknown } | undefined)?.provisionedBy === "raft") {
-        await rt.provision(tenantId, agentId);
-        await this.#bindModel(rt, tenantId, agentId, { onlyIfStale: true });
-      }
-    } catch (e: any) {
-      console.warn(`provisioning before a push for ${agentId} failed: ${String(e?.message ?? e).slice(0, 200)}`);
-    }
-    const out = await rt.deliverPendingInbound(tenantId, agentId);
+    const out = await rt.deliverPendingInbound(tenantId, agentId, {
+      // Only when a row is about to be posted, never in a pass that only waits out a retry.
+      beforeFirstPost: async () => {
+        try {
+          // An agent Raft made has the default mounts (provision/steps.ts), and gets one added since on its
+          // next wake, the way a console agent gets it when its page opens. Only what is missing is added.
+          const agent = await rt.store.loadAgent(tenantId, agentId);
+          if ((agent?.config as { provisionedBy?: unknown } | undefined)?.provisionedBy === "raft") {
+            await rt.provision(tenantId, agentId);
+            await this.#bindModel(rt, tenantId, agentId, { onlyIfStale: true });
+          }
+        } catch (e: any) {
+          console.warn(`provisioning before a push for ${agentId} failed: ${String(e?.message ?? e).slice(0, 200)}`);
+        }
+      },
+    });
     if (out.retryInMs !== null) await this.#wake(Date.now() + out.retryInMs);
     logEvent("hook.deliver", {
       tenantId, agentId, ms: Date.now() - started, posted: out.posted, failed: out.failed, left: out.left,

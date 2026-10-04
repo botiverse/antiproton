@@ -7,7 +7,7 @@ import { sqliteHost } from "../src/store/sqlite-host.ts";
 import {
   ensureInboundTable, inboundMessage, inboundStatus, lowerHeaders, newHookId, newHookSecret, readCapped,
   recordInbound, recentInbound, seenBefore, underRate, INBOUND_DEDUPE_MS, INBOUND_KEEP_MS, INBOUND_TEXT_MAX,
-  inboundVerdict, acceptInbound, nextPendingInbound, settleInbound, type InboundOutcome,
+  inboundVerdict, acceptInbound, nextPendingInbound, queueFull, settleInbound, type InboundOutcome,
 } from "../src/runtime/inbound.ts";
 import { pendingTrace, TRACE_VERDICTS } from "../src/trace/outbox.ts";
 
@@ -142,6 +142,29 @@ await check("a settled push keeps its key as a final record: delivered, or faile
   assert(JSON.stringify(rows.map((r) => [r.outcome, r.dedupe_key, r.received_at - t])) === JSON.stringify([["delivered", "ok", 0], ["failed", "gave-up", 1], ["failed", null, 2]]),
     `final records: ${JSON.stringify(rows)}`);
   assert(!underRate(host.sql, "h1", t + 10, 2) && underRate(host.sql, "h1", t + 10, 3), "the rate did not count exactly the two accepted pushes");
+  host.dispose();
+});
+
+await check("a settle is one transaction: a record that cannot be written leaves the queued row where it was", () => {
+  const host = sqliteHost();
+  ensureInboundTable(host.sql);
+  acceptInbound(host.sql, { hookId: "h1", alias: "gh", dedupeKey: "k", message: "m", now: 1000 });
+  host.sql.exec("CREATE TRIGGER refuse BEFORE INSERT ON inbound_events BEGIN SELECT RAISE(ABORT, 'no record'); END");
+  let threw = "";
+  try {
+    settleInbound(host.sql, <T>(fn: () => T) => host.transactionSync(fn), { ...nextPendingInbound(host.sql)!, tenantId: "t", agentId: "a", outcome: "delivered" });
+  } catch (e) { threw = String((e as Error).message); }
+  assert(/no record/.test(threw), `control: the record insert failed: ${threw || "it did not"}`);
+  assert(nextPendingInbound(host.sql)?.dedupeKey === "k", "the queued row went with the failed settle");
+  host.dispose();
+});
+
+await check("the queue cap counts this hook's queued pushes only", () => {
+  const host = sqliteHost();
+  ensureInboundTable(host.sql);
+  for (let i = 0; i < 3; i++) acceptInbound(host.sql, { hookId: "h1", alias: "gh", dedupeKey: `k${i}`, message: "m", now: i });
+  acceptInbound(host.sql, { hookId: "h2", alias: "gh", dedupeKey: "k", message: "m", now: 9 });
+  assert(queueFull(host.sql, "h1", 3) && !queueFull(host.sql, "h1", 4) && !queueFull(host.sql, "h2", 2), "the cap counted the wrong rows");
   host.dispose();
 });
 

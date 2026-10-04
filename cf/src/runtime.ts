@@ -62,7 +62,8 @@ import { agentSecrets, agentRef, importKek, isAgentRef, open, OWNER_PREFIX, seal
 import {
   acceptInbound, claimPendingInbound, ensureInboundTable, hookSecretName, inboundMessage, markPostingInbound, newHookId, newHookSecret,
   nextPendingInbound, pendingInboundCount, recentInbound, recordInbound, requeueInbound, seenBefore, settleInbound, underRate,
-  INBOUND_MAX_BYTES, INBOUND_PER_MINUTE, INBOUND_POST_ATTEMPTS, type InboundOutcome, type PendingInbound,
+  expiredPendingInbound, pendingInboundRow, queueFull,
+  INBOUND_MAX_AGE_MS, INBOUND_MAX_BYTES, INBOUND_PER_MINUTE, INBOUND_POST_ATTEMPTS, INBOUND_QUEUE_MAX, type InboundOutcome, type PendingInbound,
 } from "../../src/runtime/inbound.ts";
 import type { InboundEvent, InboundHooks } from "../../src/plugins/types.ts";
 import { INBOUND_HOOKS_PER_MOUNT } from "../../src/plugins/types.ts";
@@ -925,9 +926,11 @@ export class AgentRuntime {
       recordInbound(sql, { tenantId, agentId, hookId, alias, outcome, reason, dedupeKey, now });
       return { outcome };
     };
-    if (!event) return done("too_large", `the body passed ${INBOUND_MAX_BYTES} bytes`);
     const secret = await this.#secrets.resolve(agentRef(hookSecretName(hookId)), { tenantId, agentId });
+    // Before the size: a cache-routed push to a hook revoked since must read as unknown (404) whatever its
+    // body, as it did when every push asked the index first.
     if (!secret && routed === "cache") return { outcome: "failed", unrouted: true };
+    if (!event) return done("too_large", `the body passed ${INBOUND_MAX_BYTES} bytes`);
     if (!secret) return done("failed", "this hook has no secret in the agent's store");
     let answer;
     try {
@@ -946,6 +949,7 @@ export class AgentRuntime {
     const key = result.dedupeKey ?? null;
     if (key && seenBefore(sql, hookId, key, now)) return done("duplicate", null, key);
     if (!underRate(sql, hookId, now)) return done("rate_limited", `more than ${INBOUND_PER_MINUTE} a minute`, key);
+    if (queueFull(sql, hookId)) return done("rate_limited", `${INBOUND_QUEUE_MAX} pushes from this hook are already waiting to be posted`, key);
     // The claim on the key: in the same synchronous run as the two checks above, with no await between,
     // so a second push with this key that is already past its own await finds this row (`acceptInbound`).
     acceptInbound(sql, { hookId, alias, dedupeKey: key, message: inboundMessage(alias, String(result.text)), now });
@@ -966,16 +970,17 @@ export class AgentRuntime {
    * message landed, so the row is settled as `failed`, saying so, rather than posted a second time. A post
    * that throws wrote nothing and is retried on its own row (`INBOUND_RETRY_MS`); its last failure settles it
    * as `failed` with the reason. A row waiting for its retry holds back the rows behind it, keeping the order,
-   * and the pass says when to come back.
+   * and the pass says when to come back. A row queued longer than `INBOUND_MAX_AGE_MS` is given up wherever it
+   * stands. `beforeFirstPost` runs once, and only in a pass that is about to post a row.
    */
-  deliverPendingInbound(tenantId: string, agentId: string): Promise<InboundPass> {
+  deliverPendingInbound(tenantId: string, agentId: string, opts: { beforeFirstPost?: () => Promise<void> } = {}): Promise<InboundPass> {
     if (this.#inboundPass) return this.#inboundPass;
-    const pass = this.#deliverInbound(tenantId, agentId).finally(() => { this.#inboundPass = null; });
+    const pass = this.#deliverInbound(tenantId, agentId, opts).finally(() => { this.#inboundPass = null; });
     this.#inboundPass = pass;
     return pass;
   }
 
-  async #deliverInbound(tenantId: string, agentId: string): Promise<InboundPass> {
+  async #deliverInbound(tenantId: string, agentId: string, opts: { beforeFirstPost?: () => Promise<void> }): Promise<InboundPass> {
     await this.ready();
     const sql = this.#deps.ctx.storage.sql;
     ensureInboundTable(sql);
@@ -984,6 +989,15 @@ export class AgentRuntime {
     const settle = (row: PendingInbound, outcome: "delivered" | "failed", reason?: string) =>
       settleInbound(sql, transact, { ...row, tenantId, agentId, outcome, reason });
     const out: InboundPass = { posted: 0, failed: 0, left: 0, retryInMs: null, waitedMs: null, error: null };
+    // Too old to be worth reading, wherever they stand: a long outage must not end in notices hours late.
+    for (const seq of expiredPendingInbound(sql, Date.now())) {
+      const row = pendingInboundRow(sql, seq);
+      if (!row) continue;
+      settle(row, "failed", `queued for more than ${INBOUND_MAX_AGE_MS / 60_000} minutes without being posted` +
+        (row.lastError ? `: ${row.lastError}` : ""));
+      out.failed++;
+    }
+    let prepared = false;
     for (;;) {
       const head = nextPendingInbound(sql);
       if (!head) break;
@@ -993,8 +1007,14 @@ export class AgentRuntime {
         continue;
       }
       const now = Date.now();
-      if (head.nextAt > now) { out.retryInMs = head.nextAt - now; break; }
-      const row = claimPendingInbound(sql, head, now);
+      // The head is the oldest row, so its expiry is the queue's first.
+      if (head.nextAt > now) { out.retryInMs = Math.min(head.nextAt, head.receivedAt + INBOUND_MAX_AGE_MS) - now; break; }
+      // Only a pass that is about to post prepares for it (the caller's provisioning), and only once.
+      if (!prepared) {
+        prepared = true;
+        await opts.beforeFirstPost?.();
+      }
+      const row = claimPendingInbound(sql, head, Date.now());
       try {
         await this.postMessage(tenantId, agentId, row.message, "prompt", MAIN_SESSION,
           { retake: "background", beforeSay: () => markPostingInbound(sql, row.seq) });
