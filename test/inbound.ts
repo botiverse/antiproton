@@ -7,7 +7,7 @@ import { sqliteHost } from "../src/store/sqlite-host.ts";
 import {
   ensureInboundTable, inboundMessage, inboundStatus, lowerHeaders, newHookId, newHookSecret, readCapped,
   recordInbound, recentInbound, seenBefore, underRate, INBOUND_DEDUPE_MS, INBOUND_KEEP_MS, INBOUND_TEXT_MAX,
-  inboundVerdict, acceptInbound, nextPendingInbound, queueFull, settleInbound, type InboundOutcome,
+  inboundVerdict, acceptInbound, nextPendingInbound, queueFull, rateRetryAfterS, settleInbound, type InboundOutcome,
 } from "../src/runtime/inbound.ts";
 import { pendingTrace, TRACE_VERDICTS } from "../src/trace/outbox.ts";
 
@@ -101,6 +101,32 @@ await check("the rate counts deliveries on this hook in the last minute, and not
   assert(!underRate(host.sql, "h1", t + 10, 3), "a fourth delivery in the minute was allowed at a limit of 3");
   assert(underRate(host.sql, "h1", t + 10, 4), "an ignored event or another hook's delivery was counted");
   assert(underRate(host.sql, "h1", t + 60_003, 3), "deliveries older than a minute were still counted");
+  host.dispose();
+});
+
+await check("the rate's Retry-After is the first whole second at which the rate lets the hook in again, and null while it does", () => {
+  const host = sqliteHost();
+  ensureInboundTable(host.sql);
+  const t = 1_800_000_000_000;
+  // Four counted rows, one of them still queued, at uneven times; the ignored row and the other hook's are not counted.
+  for (const at of [t, t + 1_250, t + 20_000]) recordInbound(host.sql, { tenantId: "t", agentId: "a", hookId: "h1", alias: "gh", outcome: "delivered", now: at });
+  acceptInbound(host.sql, { hookId: "h1", alias: "gh", dedupeKey: "q", message: "m", now: t + 20_500 });
+  recordInbound(host.sql, { tenantId: "t", agentId: "a", hookId: "h1", alias: "gh", outcome: "ignored", now: t + 10 });
+  recordInbound(host.sql, { tenantId: "t", agentId: "a", hookId: "h2", alias: "gh", outcome: "delivered", now: t + 10 });
+  assert(rateRetryAfterS(host.sql, "h1", t + 30_000, 3) === 32, `four counted at a limit of 3: ${rateRetryAfterS(host.sql, "h1", t + 30_000, 3)}`);
+  assert(rateRetryAfterS(host.sql, "h1", t + 30_000, 4) === 30, `at a limit of 4: ${rateRetryAfterS(host.sql, "h1", t + 30_000, 4)}`);
+  assert(rateRetryAfterS(host.sql, "h1", t + 59_999, 4) === 1, `a millisecond before it opens: ${rateRetryAfterS(host.sql, "h1", t + 59_999, 4)}`);
+  // Agreement with underRate wherever it is asked: null exactly when under, and when not, the wait is the
+  // smallest whole number of seconds after which underRate says yes.
+  for (const limit of [2, 3, 4, 5]) {
+    for (let now = t + 20_500; now <= t + 81_000; now += 250) {
+      const s = rateRetryAfterS(host.sql, "h1", now, limit);
+      assert((s === null) === underRate(host.sql, "h1", now, limit), `limit ${limit} at +${now - t}: ${s} vs underRate`);
+      if (s === null) continue;
+      assert(s >= 1 && underRate(host.sql, "h1", now + s * 1000, limit), `limit ${limit} at +${now - t}: still refused after ${s} s`);
+      assert(s === 1 || !underRate(host.sql, "h1", now + (s - 1) * 1000, limit), `limit ${limit} at +${now - t}: ${s} s is longer than needed`);
+    }
+  }
   host.dispose();
 });
 

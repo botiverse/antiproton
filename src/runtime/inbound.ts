@@ -177,6 +177,13 @@ const ADDED_COLUMNS = [
 /** Storage handles already brought up to `ADDED_COLUMNS`: this runs on every push, the probe once per handle. */
 const columnsAdded = new WeakSet<object>();
 
+/**
+ * `Retry-After` (seconds) on a 429 for a full queue. When the queue is moving it empties in a few seconds, so
+ * a sender that waits this long usually finds room; a sender that ignores the header backs off on its own
+ * schedule anyway (Raft's: 5 s, 15 s, 60 s, …), and one that honours it retries no sooner than this.
+ */
+export const INBOUND_QUEUE_RETRY_AFTER_S = 3;
+
 export function ensureInboundTable(sql: SqlHost["sql"]) {
   sql.exec(TABLE);
   sql.exec(INDEX);
@@ -310,6 +317,26 @@ export function underRate(sql: SqlHost["sql"], hookId: string, now: number, perM
     hookId, now - 60_000, hookId, now - 60_000,
   ).toArray()[0] as any;
   return Number(row?.n ?? 0) < perMinute;
+}
+
+/**
+ * Seconds until `underRate` lets this hook deliver again, for `Retry-After` on a rate-limited push: the
+ * moment enough of the counted rows (the same rows `underRate` counts) have left the minute that the count
+ * is under `perMinute` again. Rounded up so a sender that waits exactly this long is not refused again, and
+ * at least 1. Null when the hook is under the rate now.
+ */
+export function rateRetryAfterS(sql: SqlHost["sql"], hookId: string, now: number, perMinute: number = INBOUND_PER_MINUTE): number | null {
+  const since = now - 60_000;
+  const times = (sql.exec(
+    `SELECT received_at FROM inbound_events WHERE hook_id = ? AND ${TAKEN} AND received_at > ?` +
+    " UNION ALL SELECT received_at FROM inbound_pending WHERE hook_id = ? AND received_at > ? ORDER BY received_at",
+    hookId, since, hookId, since,
+  ).toArray() as any[]).map((r) => Number(r.received_at));
+  if (times.length < perMinute) return null;
+  // Counted while `received_at > now - 60 s`, so a row stops counting at `received_at + 60 s`; once the
+  // oldest `times.length - perMinute + 1` rows have, the count is `perMinute - 1`.
+  const opensAt = times[times.length - perMinute]! + 60_000;
+  return Math.max(1, Math.ceil((opensAt - now) / 1000));
 }
 
 /** Whether this key was already accepted on this hook: queued now, or delivered or given up within the window. */

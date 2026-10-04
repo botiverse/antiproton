@@ -3021,7 +3021,9 @@ async function inboundHook(request: Request, env: Env, url: URL): Promise<Respon
   const timing = { lookup, path: r && "path" in r ? r.path : undefined, objectMs: Date.now() - objectStarted, doMs: r && "ms" in r ? r.ms : undefined };
   // Still moving: say "try again" (503), which the sender retries, rather than a 500.
   if (!r) return hookAnswer(Response.json({ outcome: "unavailable" }, { status: 503, headers: { "retry-after": "1" } }), timing);
-  return hookAnswer(Response.json({ outcome: r.outcome }, { status: inboundStatus(r.outcome) }), timing);
+  // A 429 carries when to retry (`receiveHook`); without it a sender falls back on its own schedule.
+  const headers = r.retryAfterS ? { "retry-after": String(r.retryAfterS) } : undefined;
+  return hookAnswer(Response.json({ outcome: r.outcome }, { status: inboundStatus(r.outcome), headers }), timing);
 }
 
 /**
