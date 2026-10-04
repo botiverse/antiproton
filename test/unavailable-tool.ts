@@ -133,7 +133,36 @@ const explainCases: DriveCase[] = [
 /** What raft's own listing records for a mount with no credential, admitted as the kernel stores it. */
 const credentialless = async () => admitTools(await raftPlugin.snapshotTools!({ credential: null } as never), 0);
 
+/**
+ * What raft's own listing records for a mount whose credential Raft refuses (`identity.whoami` answering 401), admitted
+ * as the kernel stores it. The listing itself is returned too, for its `refused` flag, which admission does not keep.
+ */
+const refusedListing = async () => {
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response(JSON.stringify({ error: "unauthorized" }), { status: 401, headers: { "content-type": "application/json" } })) as never;
+  try {
+    const listed = await raftPlugin.snapshotTools!({
+      caller: { tenantId: "t", agentId: "a", taskId: "tool-snapshot" }, alias: "raft", credential: "sk_agent_refused_1234567890",
+      publicConfig: { serverUrl: "https://raft.example" },
+    } as never);
+    return { listed, snap: await admitTools(listed, 0) };
+  } finally { globalThis.fetch = realFetch; }
+};
+
 explainCases.push(
+  {
+    group: "explanation", name: "a refused credential: the listing says so (`refused`, and a skipped entry marked `every`), and any tool of the plugin the mount leaves out gets Raft's refusal as the reason",
+    run: async () => {
+      const { listed, snap } = await refusedListing();
+      check(listed.refused === true && listed.tools.length === 0, `the listing: ${show({ refused: listed.refused, tools: listed.tools.length })}`);
+      check(snap.skipped.length === 1 && snap.skipped[0]!.every === true && /^Raft refused this mount's credential \(HTTP 401\)$/.test(snap.skipped[0]!.reason),
+        `admission kept ${show(snap.skipped)}`);
+      const ctx: UnavailableToolContext = { mounts: [{ alias: "raft", plugin: raftPlugin, toolSnapshot: snap }], offered: [{ name: "raft__receive_events", address: "raft.receive_events" }] };
+      const text = explainUnavailableTool("raft__messages_send", ctx);
+      check(text === "The `raft` mount does not offer \"raft__messages_send\" to you: Raft refused this mount's credential (HTTP 401). " +
+        `${AGAIN} The tools you can call are the ones in your tool list.`, `got ${show(text)}`);
+    },
+  },
   {
     group: "explanation", name: "no credential: a skipped entry marked `every` gives its reason for any tool of the plugin the mount leaves out",
     run: async () => {
