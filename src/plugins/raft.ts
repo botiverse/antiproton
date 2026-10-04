@@ -340,10 +340,9 @@ function stateStore(ctx: PluginContext): RaftStateStore {
  * A Raft SDK client for this mount: its origin, its credential, its timeout, and its saved state.
  *
  * `{ state: false }` gives a client whose state lives only for the call and is never saved: the snapshot's
- * `identity.whoami` uses it, having nothing to record. Every operation runs on the saved state, because what
- * the model has seen is booked there per context (`originOf`): the model's own history read in its turn counts
- * as seen in that context, as Raft's own CLI counts it, and a read made as code (a program, an approved call's
- * replay) is sent with `consume: false` and books nothing.
+ * `identity.whoami` uses it, having nothing to record, and so does a history read, which must not count as seen
+ * (`runOperation` says why). Every other operation runs on the saved state, because what the model has seen is
+ * booked there per context (`originOf`) — by receive_events and by a held call's question — and a send attests it.
  */
 function raftFor(ctx: PluginContext, options: { state?: false } = {}): Raft {
   return createRaft({
@@ -377,7 +376,7 @@ function raftFor(ctx: PluginContext, options: { state?: false } = {}): Raft {
  * to lose, since the batch it asked for is acknowledged only by the next pull.
  */
 function sdkFailure(out: RaftFailure, write = false): Error {
-  const e = new Error(`${out.error.message}${out.error.nextAction ? ` — ${out.error.nextAction}` : ""}`);
+  const e = new Error(toolTerms(`${out.error.message}${out.error.nextAction ? ` — ${out.error.nextAction}` : ""}`));
   const unanswered = out.error.code === "TRANSPORT_ERROR" || out.error.code === "UNAVAILABLE" ||
     (out.error.status !== undefined && out.error.status >= 500);
   // `retryable` is still what the gateway reads as "may have landed" (it records such a call as unknown), so it
@@ -434,8 +433,8 @@ export const EXCLUDED: Readonly<Record<string, string>> = {
   "inbox.check": "the inbox is read with receive_events, which commits the batch it handed over and pulls the next in one call; a second reader would move the same cursor",
   "inbox.drain": "pulls until the inbox is empty and hands it all over in one result, with no bound; receive_events pages the same inbox",
   "inbox.commit": "receive_events commits on its next call; a separate commit could acknowledge a batch before the model has read it",
-  "mentions.execute": "its add action adds people to a conversation, a membership change; the agent proposes that with actions_prepare for a person to confirm",
-  "profile.update": "changes the account's public identity (display name, description, avatar), which the person who owns the account sets",
+  "mentions.execute": "its add action changes a conversation's membership; membership changes go through an action card a person confirms (actions_prepare)",
+  "profile.update": "changes the account's public identity (display name, description, avatar); identity changes go through an action card a person confirms",
 };
 
 /** The operations this plugin offers as tools: the manifest, less `EXCLUDED`, in the manifest's order. */
@@ -469,6 +468,23 @@ function goAhead(op: RaftOperationSpec): "send" | "proceed" {
 }
 
 /**
+ * What this plugin refuses of an operation's arguments before any request, and the sentence its tool's
+ * description gains so the model knows before calling. The manifest's schema stays as it is; this narrows it.
+ */
+const ARGUMENT_CHECKS: Readonly<Record<string, { check(input: Record<string, unknown>): string | null; described: string }>> = {
+  // The three cards a model may prepare. The integration cards take ids a model has no way to know, and are made
+  // by Raft's own integration commands.
+  "actions.prepare": {
+    check: (input) => {
+      const type = (input.action as { type?: unknown } | undefined)?.type;
+      return type === "channel:create" || type === "channel:add_member" || type === "agent:create" ? null
+        : "action.type must be channel:create, channel:add_member or agent:create: the integration cards take ids you have no way to know, and are made by Raft's own integration commands";
+    },
+    described: " Only channel:create, channel:add_member and agent:create cards can be prepared here: the integration cards take ids you have no way to know, and are made by Raft's own integration commands.",
+  },
+};
+
+/**
  * One manifest operation as a tool. The description is the manifest's, with an operation named by its dotted
  * name (`tasks.unassign`) written as the tool name the model is offered (`tasks_unassign`), and, for an
  * operation that may be held, the answers the question takes here. The parameters are the manifest's, with the
@@ -490,7 +506,7 @@ export function toolOf(op: RaftOperationSpec): ToolSchema {
     : "";
   return {
     name: op.toolName,
-    summary: described + held,
+    summary: described + (ARGUMENT_CHECKS[op.name]?.described ?? "") + held,
     parameters: parameters as Json,
     sideEffects: op.sideEffect === "read" ? "read" : "write",
     idempotency: IDEMPOTENCY[op.idempotency.kind] ?? "none",
@@ -529,6 +545,8 @@ function argumentsFor(op: RaftOperationSpec, args: unknown): Record<string, unkn
   }
   const advertised = op.inputSchema.properties ?? {};
   const input = Object.fromEntries(Object.entries(args ?? {}).filter(([name]) => Object.hasOwn(advertised, name)));
+  const refused = ARGUMENT_CHECKS[op.name]?.check(input);
+  if (refused) throw new Error(refused);
   const paging = pagingArg(op);
   if (paging) {
     const value = input[paging];
@@ -540,19 +558,104 @@ function argumentsFor(op: RaftOperationSpec, args: unknown): Record<string, unkn
   return input;
 }
 
+/**
+ * The CLI commands the SDK's text names, in this mount's terms. The SDK's text is the CLI's output, so its hints say
+ * `raft message read --target "#ops" --before 41`, a command this mount does not have; a model would go looking for
+ * it. Each `raft <noun> <verb> …` is rewritten here, in one place, as the tool call it stands for
+ * (`messages_read({ target: "#ops", before: 41 })`), or in neutral words where no tool does it. A stopgap: once the
+ * SDK's `invoke` can write its hints as tool calls itself, `toolTerms` and `CLI_COMMANDS` are deleted together.
+ *
+ * Applied to text the SDK wrote — an outcome's text, a failure's message — and never to a line that is a message
+ * (`[target=…`), which is what a person wrote and is passed on as written.
+ */
+export const CLI_COMMANDS: Readonly<Record<string, { op?: string; tool?: string; positional?: string; flags?: Record<string, string | [string, Json]>; say?: string }>> = {
+  "message read": { op: "messages.read", flags: { target: "target", after: "after", before: "before", around: "around", limit: "limit" } },
+  "message send": { op: "messages.send", flags: { target: "target", "attachment-id": "attachmentIds" } },
+  "message check": { tool: "receive_events" },
+  "inbox check": { op: "inbox.list", flags: { view: "view", before: "before", limit: "limit" } },
+  "server info": { op: "server.info", flags: { channels: ["view", "channels"], agents: ["view", "agents"], humans: ["view", "humans"], full: ["view", "full"], offset: "offset", limit: "limit", joined: ["joined", true] } },
+  "server update": { say: "a server setting a person with a server role changes" },
+  "user info": { op: "users.info", positional: "name", flags: { offset: "offset", limit: "limit" } },
+  "channel info": { op: "channels.info", positional: "target" },
+  "channel members": { op: "channels.members", positional: "target" },
+  "channel join": { op: "channels.join", positional: "target" },
+  "channel leave": { op: "channels.leave", positional: "target" },
+  "channel mute": { op: "channels.mute", positional: "target" },
+  "channel unmute": { op: "channels.unmute", positional: "target" },
+  "channel create": { say: "an action card for a person to confirm (actions_prepare)" },
+  "thread unfollow": { op: "threads.unfollow", positional: "target" },
+  "task claim": { op: "tasks.claim", flags: { target: "target", number: "taskNumbers" } },
+  "task show": { op: "tasks.show", flags: { target: "target", number: "taskNumber" } },
+  "task list": { op: "tasks.list", flags: { target: "target", status: "status" } },
+  "task update": { op: "tasks.updateStatus", flags: { target: "target", number: "taskNumber", status: "status" } },
+  "task unassign": { op: "tasks.unassign", flags: { target: "target", number: "taskNumber" } },
+  "mention pending": { op: "mentions.pending" },
+  "mention notify": { say: "delivering the mention, which this mount does not offer" },
+  "mention add": { say: "delivering the mention, which this mount does not offer" },
+  "manual get": { op: "manual.get", positional: "topic", flags: { intent: "intent", reason: "reason" } },
+  "manual search": { op: "manual.search", positional: "query", flags: { intent: "intent", reason: "reason" } },
+  "attachment view": { say: "the attachment viewer, which this mount does not have," },
+  "action prepare": { op: "actions.prepare" },
+};
+/** Arguments that are lists in the operation's schema, though the CLI takes one per flag. */
+const LIST_ARGUMENTS = new Set(["attachmentIds", "taskNumbers"]);
+const CLI_VALUE = String.raw`(?:"[^"\n]*"|'[^'\n]*'|<[^>\n]*>|…|[^\s\x60'"<>()\[\]-](?:[^\s\x60()\[\]]*[^\s\x60.,;:()\[\]])?)`;
+const CLI_COMMAND = new RegExp(String.raw`\braft ([a-z][a-z-]*)(?: ([a-z][a-z-]*))?((?: +(?:--[a-z][a-z-]*(?: ${CLI_VALUE})?|"[^"\n]*"|<[^>\n]*>|@[\w.-]+|#[\w:.~-]+|[A-Za-z0-9_][\w.-]*\d[\w.-]*|[a-z0-9]+(?:-[a-z0-9]+)+|[\w.-]+(?= --)))*)`, "g");
+const CLI_TOKEN = new RegExp(String.raw`--([a-z][a-z-]*)|${CLI_VALUE}`, "g");
+
+export function toolTerms(text: string): string {
+  return text.split("\n").map((line) => line.startsWith("[target=")
+    // A message line is a person's words, but its attachment suffix is the SDK's.
+    ? line.replace(/ — use raft attachment view to download\]/g, " — this mount has no tool to open attachments]")
+    : line.replace(CLI_COMMAND, (whole, noun: string, verb: string | undefined, rest: string) => {
+    const entry = CLI_COMMANDS[`${noun} ${verb ?? ""}`.trim()];
+    const op = entry?.op && !Object.hasOwn(EXCLUDED, entry.op) ? TOOL_NAME.get(entry.op) : undefined;
+    const tool = entry?.tool ?? op;
+    // A command this mount has no tool for keeps no CLI word, and the hint loses nothing a tool could act on.
+    if (!tool) return entry?.say ?? (noun === "mention" ? CLI_COMMANDS["mention notify"]!.say! : "a Raft command this mount has no tool for");
+    const args: Record<string, Json> = {};
+    let flag: string | null = null;
+    let trailing = "";
+    const put = (name: string, raw: string) => {
+      const value: Json = /^\d+$/.test(raw) ? Number(raw) : raw.replace(/^["']|["']$/g, "");
+      args[name] = LIST_ARGUMENTS.has(name) ? [...((args[name] as Json[] | undefined) ?? []), value] : value;
+    };
+    for (const m of rest.matchAll(CLI_TOKEN)) {
+      if (m[1] !== undefined) {
+        const spec = entry?.flags?.[m[1]];
+        if (Array.isArray(spec)) { args[spec[0]] = spec[1]; flag = null; } else flag = spec ?? "";
+        continue;
+      }
+      if (flag !== null) { if (flag) put(flag, m[0]); flag = null; continue; }
+      if (entry?.positional && !(entry.positional in args)) put(entry.positional, m[0]);
+      else trailing += ` ${m[0]}`;
+    }
+    const shown = Object.entries(args).map(([k, v]) => `${k}: ${JSON.stringify(v)}`).join(", ");
+    return `${tool}(${shown ? `{ ${shown} }` : ""})${trailing}`;
+  })).join("\n");
+}
+
 /** One operation, run through the SDK's `invoke` under the caller's origin and context. */
 async function runOperation(
   op: RaftOperationSpec, args: unknown, ctx: PluginContext, seen?: { upToSeq: number },
 ): Promise<Json | Interrupt> {
   const input = argumentsFor(op, args);
   const caller = originOf(ctx);
-  const raft = raftFor(ctx);
+  // A history read does not count as seen, whoever makes it: only receive_events attests. The SDK records a
+  // model-origin `messages.read` page as seen inside `invoke`, before this plugin hands the result on — and a page
+  // over PARK_BYTES is then parked, so the model has read a preview, not the page, while the record says it saw
+  // all of it. So an operation that books "seen" runs on a client whose state is not saved; what that costs is one
+  // extra hold on a send after reading history, which asks the model with the newer messages: the safe side.
+  // Only `messages.read` books it among the generated tools (the manifest's `consumes.model`; the inbox pulls,
+  // which also do, are excluded and stay with receive_events).
+  const raft = raftFor(ctx, op.consumes.model.includes("seen") ? { state: false } : {});
   const out = await raft.invoke(op.name, seen ? { ...input, seen } : input, caller);
   if (!out.ok) throw sdkFailure(out as RaftFailure, op.sideEffect !== "read");
   if (isInterrupted(out)) return heldCall(op, raft, caller, out.interrupt, input);
-  // The SDK's text is the outcome as the model reads it (the CLI's output for the same operation); `data` is the
-  // Server's projection and stays out, so a new server field cannot silently enter the model's context.
-  return { state: out.state, text: out.text.trim() };
+  // The SDK's text is the outcome as the model reads it (the CLI's output for the same operation, its command hints
+  // put in this mount's terms); `data` is the Server's projection and stays out, so a new server field cannot
+  // silently enter the model's context.
+  return { state: out.state, text: toolTerms(out.text.trim()) };
 }
 
 /**
@@ -781,7 +884,7 @@ export const raftPlugin: Plugin = {
    * is added, when an operator refreshes it, and whenever the mount's credential is attached, replaced or removed
    * (`AgentRuntime.attachCredential`/`removeCredential`), so a credential that lost a scope stops offering its
    * tools. No credential, or one Raft refuses, has no capabilities and lists nothing; Raft not answering is a
-   * throw, which leaves the stored list as it was (and, after a credential change, the runtime empties it).
+   * throw, which leaves the stored list as it was (after a credential change too).
    */
   async snapshotTools(ctx: PluginContext): Promise<ListedTools> {
     if (!ctx.credential) {

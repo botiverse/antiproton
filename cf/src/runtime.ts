@@ -169,7 +169,6 @@ import { sandboxPlugin, SANDBOX_ALIAS } from "../../src/plugins/sandbox.ts";
 import { builtinToolsPlugin } from "../../src/plugins/builtin.ts";
 import { artifactsPlugin, PARK_BYTES, READ_WHOLE_MAX } from "../../src/plugins/artifacts.ts";
 import { raftPlugin } from "../../src/plugins/raft.ts";
-import { admitTools } from "../../src/runtime/mount-tools.ts";
 import { mcpPlugin } from "../../src/plugins/mcp.ts";
 import { toAgentRef } from "../../src/store/refs.ts";
 import type { Plugin, PluginChoice } from "../../src/plugins/types.ts";
@@ -1015,27 +1014,19 @@ export class AgentRuntime {
   }
 
   /**
-   * A mount's credential was attached, replaced or removed, so a tool list that depends on it no longer holds:
-   * raft lists only the operations its credential's capabilities allow (`Plugin.snapshotTools`). The list is
-   * asked for again now, for a plugin that both lists its tools and takes a credential. When that fails, the
-   * stored list is emptied rather than kept: a list taken under the old credential says nothing about the new
-   * one, and a mount whose credential lost a scope must stop offering what the scope allowed. An operator's
-   * refresh fills it again, and why it failed is on the mount's page (`snapshotError`).
+   * A mount's credential was attached, replaced or removed, so a tool list that depends on it may no longer hold:
+   * raft lists only the operations its credential's capabilities allow (`Plugin.snapshotTools`). The list is asked
+   * for again now, for a plugin that both lists its tools and takes a credential, and replaced when the answer
+   * moved, so a credential that lost a scope stops offering what the scope allowed. When the listing fails, the
+   * stored list is left as it was — the previous credential's, or none, which for raft offers every tool, as at
+   * deploy — and Raft refuses what the credential may not do; why it failed is on the mount's page
+   * (`snapshotError`), and an operator's refresh asks again.
    */
   async #toolsAfterCredentialChange(tenantId: string, agentId: string, alias: string) {
     const mount = await this.store.getMountByAlias(tenantId, agentId, alias);
     const plugin = mount ? this.#plugins.find((p) => p.id === mount.plugin) : undefined;
     if (!plugin?.snapshotTools || !plugin.credential) return null;
-    const r = await this.#snapshot(tenantId, agentId, alias);
-    if (r.ok || "stale" in r) return r;
-    try {
-      await this.store.updateMountToolSnapshot(tenantId, agentId, alias, await admitTools({
-        tools: [], skipped: [{ name: "(every listed tool)", reason: `the credential changed and listing the tools again failed: ${r.error}` }],
-      }, Date.now()));
-    } catch (e) {
-      console.error(`could not empty ${alias}'s tool list after its credential changed:`, e);
-    }
-    return r;
+    return this.#snapshot(tenantId, agentId, alias);
   }
 
   /**

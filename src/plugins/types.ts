@@ -1714,8 +1714,8 @@ export interface Plugin {
    * wake, a harness build or a call. For a plugin that also declares a
    * `credential`, it is called again whenever the mount's credential is
    * attached, replaced or removed, since what a credential may do can decide
-   * the list (raft); if that listing fails, the stored list is emptied rather
-   * than kept for a credential it was not taken under. The kernel admits the list (names an agent
+   * the list (raft); if that listing fails, the stored list stays as it was.
+   * The kernel admits the list (names an agent
    * can address, no duplicates), hashes it and stores it on the mount as its
    * {@link ToolSnapshot}; the stored copy is replaced only when the hash moved.
    *

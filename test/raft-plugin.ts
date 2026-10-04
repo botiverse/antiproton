@@ -1,6 +1,7 @@
 import { createHmac } from "node:crypto";
 import { createRaft, isInterrupted, RAFT_OPERATIONS } from "@botiverse/raft-sdk";
-import { raftPlugin, EXCLUDED, GENERATED, INBOX_STORE, PAGE_ROWS, PUSH_KEY, PUSH_STORE, originOf, pagingArg, toolOf } from "../src/plugins/raft.ts";
+import { raftPlugin, EXCLUDED, GENERATED, INBOX_STORE, PAGE_ROWS, PUSH_KEY, PUSH_STORE, originOf, pagingArg, toolOf, toolTerms, CLI_COMMANDS } from "../src/plugins/raft.ts";
+import { readFileSync } from "node:fs";
 import { PARK_BYTES } from "../src/plugins/artifacts.ts";
 import { Interrupt, toolsOf, type PluginErrorFields } from "../src/plugins/types.ts";
 import { admitTools } from "../src/runtime/mount-tools.ts";
@@ -654,6 +655,18 @@ await check("actions_prepare posts the card the manifest describes, as a write t
   globalThis.fetch = (async () => { sent++; return json(200, {}); }) as any;
   const tooLong = await failure(() => raftPlugin.invoke("actions_prepare", { target: "#general", action: { type: "channel:create", name: "x".repeat(121) } }, inTurn(ctx())));
   if (sent !== 0 || tooLong.mayHaveLanded === true || !/Invalid request/.test(tooLong.message)) throw new Error(`contract refusal: sent=${sent} ${tooLong.message}`);
+  // An integration card needs ids a model cannot know: refused before anything is sent, and the description says so.
+  for (const type of ["integration:register_app", "integration:approve_agent_login", undefined]) {
+    const why = await failure(() => raftPlugin.invoke("actions_prepare", { target: "#general", action: { type, name: "x", returnUrl: "https://x" } }, inTurn(ctx())));
+    if (sent !== 0 || !/action\.type must be channel:create, channel:add_member or agent:create: the integration cards take ids/.test(why.message)) throw new Error(`${type}: sent=${sent} ${why.message}`);
+  }
+  if (!/Only channel:create, channel:add_member and agent:create cards can be prepared here/.test(toolNamed("actions_prepare")!.summary)) throw new Error(toolNamed("actions_prepare")!.summary);
+  // Control: the three a model may prepare all reach Raft.
+  for (const type of ["channel:create", "channel:add_member", "agent:create"]) {
+    one(json(200, { messageId: "abcdef12-3456", metadata: { kind: "action-card" } }));
+    const action = type === "channel:add_member" ? { type, channel: "#general", humans: ["tygg"] } : { type, name: "launch-room" };
+    await raftPlugin.invoke("actions_prepare", { target: "#general", action }, inTurn(ctx()));
+  }
 });
 
 await check("a truncated pull says so in words, and a complete one carries no such note", async () => {
@@ -953,23 +966,32 @@ function freshnessServer(answers: { history?: Response; events?: Response }) {
 const SEEN_PAGE = { target: "#wg-raft-sdk", messages: [historyMessage(41, "one"), historyMessage(42, "wait, one more thing")],
   has_more: false, has_older: false, has_newer: false, last_read_seq: 42, model_seen_up_to_seq: 42 };
 
-await check("the model's own messages_read in its turn consumes, and counts as seen in that context only", async () => {
-  const m = mount();
+await check("a history read does not count as seen, even the model's own in its turn: a send after it is still held, and nothing is saved", async () => {
+  // The SDK would book the page as seen inside invoke, before the runtime parks a result over PARK_BYTES: the model
+  // would then have read a preview while the record says it saw the page. Only receive_events attests.
+  const fresh = freshDb();
+  const m = { ...inTurn(ctx(), "ctx_a"), db: fresh.db };
   const reads: string[] = [];
   freshnessServer({ history: json(200, SEEN_PAGE) });
   const serve = globalThis.fetch;
   globalThis.fetch = (async (url: any, init?: any) => { if (new URL(String(url)).pathname.endsWith("/history")) reads.push(String(url)); return serve(url, init); }) as any;
-  await raftPlugin.invoke("messages_read", { target: "#wg-raft-sdk" }, inTurn(m.ctx, "ctx_a"));
+  await raftPlugin.invoke("messages_read", { target: "#wg-raft-sdk" }, m);
+  // The model's own read still consumes on the Server's side (no consume=false): only the seen record is withheld.
   if (reads.length !== 1 || new URL(reads[0]!).searchParams.has("consume")) throw new Error(`request: ${reads[0]}`);
-  // The same context: the read attests, and the send goes through.
-  const sent = await raftPlugin.invoke("messages_send", { target: "#wg-raft-sdk", content: "y", idempotencyKey: "k-a" }, inTurn(m.ctx, "ctx_a")) as any;
-  if (sent instanceof Interrupt || sent.state !== "sent") throw new Error(`the model's read did not attest its own context: ${JSON.stringify(sent)}`);
-  // Another context (a compaction since, say) does not inherit the read: the send is held.
-  const other = mount();
-  freshnessServer({ history: json(200, SEEN_PAGE) });
-  await raftPlugin.invoke("messages_read", { target: "#wg-raft-sdk" }, inTurn(other.ctx, "ctx_a"));
-  const elsewhere = await raftPlugin.invoke("messages_send", { target: "#wg-raft-sdk", content: "x", idempotencyKey: "k-b" }, inTurn(other.ctx, "ctx_b"));
-  if (!(elsewhere instanceof Interrupt)) throw new Error("a read in one context attested a send in another");
+  if (fresh.tables.get(fresh.scope, INBOX_STORE, "state") !== undefined) throw new Error("the read saved the mount's Raft state");
+  const held = await raftPlugin.invoke("messages_send", { target: "#wg-raft-sdk", content: "y", idempotencyKey: "k-a" }, m);
+  if (!(held instanceof Interrupt)) throw new Error(`the read let the send through: ${JSON.stringify(held)}`);
+  // Positive control: the same conversation handed over by receive_events, in the same context, does attest.
+  const c = mount();
+  freshnessServer({ events: events([historyMessage(42, "wait, one more thing")], { last_seen_seq: 42 }) });
+  await raftPlugin.invoke("receive_events", {}, inTurn(c.ctx, "ctx_a"));
+  const sent = await raftPlugin.invoke("messages_send", { target: "#wg-raft-sdk", content: "y", idempotencyKey: "k-c" }, inTurn(c.ctx, "ctx_a")) as any;
+  if (sent instanceof Interrupt || sent.state !== "sent") throw new Error(`control: receive_events did not attest: ${JSON.stringify(sent)}`);
+});
+
+await check("of the generated tools, only messages_read books anything as seen, so it is the one run without saved state", async () => {
+  const booking = GENERATED.filter((op) => op.consumes.model.includes("seen")).map((op) => op.name);
+  if (JSON.stringify(booking) !== JSON.stringify(["messages.read"])) throw new Error(`book seen: ${booking.join(", ")}`);
 });
 
 await check("a program's messages_read, made in a turn and so carrying a context id, still reads with consume=false and counts nothing as seen", async () => {
@@ -1098,6 +1120,84 @@ await check("mountTools offers the snapshot's operations and the plugin's own to
   if (out.status !== "rejected" || out.error?.code !== "unknown_tool" || fetched !== 0) throw new Error(`tasks_list on a read-only mount: ${JSON.stringify(out)}`);
 });
 
+/** A CLI command as the SDK's text writes one: `raft` and one of the CLI's nouns. */
+const CLI_HINT = /\braft (?:message|server|inbox|user|task|mention|channel|thread|manual|attachment|action|profile|agent|integration)\b/;
+
+/** Arguments a schema accepts, made up from the schema: what a model might send. */
+function sampleArgs(schema: any, name = ""): any {
+  if (schema.enum) return schema.enum[0];
+  switch (schema.type) {
+    case "object": return Object.fromEntries((schema.required ?? []).map((k: string) => [k, sampleArgs(schema.properties[k], k)]));
+    case "array": return [sampleArgs(schema.items, name)];
+    case "integer": case "number": return Math.max(schema.minimum ?? 0, 7);
+    case "boolean": return true;
+    default: {
+      const v = name === "target" ? "#ops" : name === "name" ? "@nobody" : "sample-value-xyz";
+      return v.length < (schema.minLength ?? 0) ? v.padEnd(schema.minLength, "-") : v;
+    }
+  }
+}
+
+/** A Server whose answers carry the SDK's command hints: an older page, a held send and claim, a summary, members, a missing user. */
+function hintingServer() {
+  globalThis.fetch = (async (url: any) => {
+    const path = new URL(String(url)).pathname.replace("/internal/agent-api", "");
+    if (path === "/history") return history([historyMessage(41, "one", { attachments: [{ id: "att-9", filename: "plan.pdf" }] })], { has_older: true, target: "#ops" });
+    if (path === "/v2/send" || path === "/tasks/claim" || path === "/tasks/status") return HELD();
+    if (path === "/server") return server([{ id: "c1", name: "ops", joined: true, type: "channel", description: "Ops" }]);
+    if (path === "/channel-members") return json(200, { channel: { ref: "#ops", type: "channel" }, agents: [{ name: "piper", status: "online" }], humans: [{ name: "tygg", role: "owner" }] });
+    if (path === "/tasks") return json(200, { tasks: [] });
+    if (path === "/context") return context(["read", "send", "channels", "tasks"]);
+    return json(404, { error: "not found", code: "NOT_FOUND" });
+  }) as any;
+}
+
+/** Everything one call shows the model: its result, or its question and choices, or its error. */
+async function shownBy(tool: string, args: unknown): Promise<string> {
+  try {
+    const out = await raftPlugin.invoke(tool, args as any, inTurn(mount().ctx));
+    return out instanceof Interrupt ? JSON.stringify({ q: out.question, c: out.context, a: out.answer }) : JSON.stringify(out);
+  } catch (e) { return String((e as Error).message); }
+}
+
+await check("no CLI command reaches the model: every generated operation's text, errors, held questions and next hints are in tool terms", async () => {
+  hintingServer();
+  const raw = createRaft({ serverUrl: "https://raft.example", credential: "sk_agent_test_1234567890" });
+  const leaks: string[] = [];
+  const hinted: string[] = [];
+  for (const op of GENERATED) {
+    const args = { ...sampleArgs(op.inputSchema), ...(op.name === "tasks.claim" ? { taskNumbers: [7] } : {}) };
+    // Control: what the SDK itself says for the same call, which is where a hint would come from.
+    const sdk: any = await raw.invoke(op.name, args, { origin: "model", contextId: "ctx_turn" });
+    const said = sdk.ok ? `${sdk.text} ${sdk.interrupt?.context ?? ""}` : `${sdk.error.message} ${sdk.error.nextAction ?? ""}`;
+    if (CLI_HINT.test(said)) hinted.push(op.toolName);
+    const shown = await shownBy(op.toolName, args);
+    if (CLI_HINT.test(shown)) leaks.push(`${op.toolName}: ${shown.match(new RegExp(`.{0,60}${CLI_HINT.source}.{0,60}`))?.[0]}`);
+  }
+  if (leaks.length) throw new Error(`a CLI command reached the model: ${leaks.join(" | ")}`);
+  // The fixtures above must make the SDK hint at all, or this check proves nothing: the older page, the summary's
+  // narrow queries, the missing user's next step, the held claim, the missing task.
+  for (const want of ["messages_read", "server_info", "users_info", "tasks_claim", "tasks_show"]) {
+    if (!hinted.includes(want)) throw new Error(`control: the SDK gave ${want} no CLI hint here (hinted: ${hinted.join(", ")})`);
+  }
+});
+
+await check("no CLI command the SDK can write survives the rewrite: every line of its source that names one", async () => {
+  // Static, so a hint behind a fixture nobody wrote is covered too. Template slots are filled with a sample value.
+  const source = readFileSync(new URL(import.meta.resolve("@botiverse/raft-sdk")), "utf8").split("\n")
+    .filter((l) => CLI_HINT.test(l) && !/^\s*(\*|\/\*|\/\/)/.test(l))
+    .map((l) => l.replace(/\$\{[^}]*\}/g, " x12"));
+  if (source.length < 40) throw new Error(`control: only ${source.length} lines name a CLI command; the SDK's text moved`);
+  // Every command the SDK names has its own entry, so a command a new SDK adds is mapped on purpose, not left to the
+  // neutral fallback. (A verb filled in at run time, `raft mention <verb>`, has none to look up.)
+  const commands = new Set(source.flatMap((l) => [...l.matchAll(new RegExp(`${CLI_HINT.source} ([a-z][a-z-]*)`, "g"))].map((m) => m[0].slice("raft ".length))));
+  const unmapped = [...commands].filter((c) => !Object.hasOwn(CLI_COMMANDS, c));
+  if (unmapped.length) throw new Error(`CLI commands with no entry in CLI_COMMANDS: ${unmapped.join(", ")}`);
+  if (commands.size < 15) throw new Error(`control: found only ${[...commands].join(", ")}`);
+  const left = source.map((l) => toolTerms(l)).filter((l) => CLI_HINT.test(l));
+  if (left.length) throw new Error(`${left.length} line(s) keep a CLI command: ${left.slice(0, 3).join(" | ")}`);
+});
+
 /** The real runtime over a SQLite host, with raft mounted, its credential attached through the console's path. */
 async function raftRuntime() {
   const host = sqliteHost();
@@ -1138,17 +1238,26 @@ await check("attaching, replacing and removing a mount's credential re-lists its
   if (!second.ok) throw new Error(`replace: ${JSON.stringify(second)}`);
   const narrowed = await offered();
   if (narrowed.includes("tasks_list") || narrowed.includes("channels_join") || !narrowed.includes("messages_send")) throw new Error(`after replace: ${narrowed.join(", ")}`);
-  // Replaced while Raft cannot say what the new one may do: the old list is not kept for it.
+  // Replaced while Raft cannot say what the new one may do: the previous list stays, and why is kept for the mount's page.
   caps = "down";
   await rt.attachCredential("t", "a", "raft", { token: "sk_agent_third_12345678901" });
-  if (JSON.stringify(await offered()) !== JSON.stringify(OWN)) throw new Error(`after an unlistable replace: ${(await offered()).join(", ")}`);
-  if (!/listing the tools again failed/.test(rt.snapshotError("raft") ?? "") && !/could not ask Raft/.test(rt.snapshotError("raft") ?? "")) throw new Error(`no reason kept: ${rt.snapshotError("raft")}`);
+  if (JSON.stringify(await offered()) !== JSON.stringify(narrowed)) throw new Error(`after an unlistable replace: ${(await offered()).join(", ")}`);
+  if (!/could not ask Raft/.test(rt.snapshotError("raft") ?? "")) throw new Error(`no reason kept: ${rt.snapshotError("raft")}`);
   // Removed: no credential, no capabilities.
   caps = ["read", "send"];
   await rt.attachCredential("t", "a", "raft", { token: "sk_agent_fourth_1234567890" });
   if (!(await offered()).includes("messages_send")) throw new Error("control: re-attached credential offers nothing");
   if (!(await rt.removeCredential("t", "a", "raft"))) throw new Error("remove refused");
   if (JSON.stringify(await offered()) !== JSON.stringify(OWN)) throw new Error(`after remove: ${(await offered()).join(", ")}`);
+});
+
+await check("a mount whose first listing fails, with no list before it, is offered every tool, as at deploy", async () => {
+  const { rt, offered } = await raftRuntime();
+  raftServer(() => "down");
+  const r = await rt.attachCredential("t", "a", "raft", { token: "sk_agent_first_1234567890" });
+  if (!r.ok) throw new Error(`attach: ${JSON.stringify(r)}`);
+  if ((await rt.store.getMountByAlias("t", "a", "raft"))?.toolSnapshot) throw new Error("a list was stored from a failed listing");
+  if (JSON.stringify(await offered()) !== JSON.stringify(raftPlugin.tools.map((t) => t.name))) throw new Error(`offered: ${(await offered()).join(", ")}`);
 });
 
 await check("a credential Raft refuses on attach changes neither the credential nor the tool list", async () => {

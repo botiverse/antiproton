@@ -325,7 +325,12 @@ changes what a mount offers, not which code runs it.
 **A plugin whose tools depend on the credential lists them per mount too.**
 `raft` is the one that does: its tools are generated from the Raft SDK's
 operation manifest (`RAFT_OPERATIONS`), one per operation, named by the
-manifest's `toolName`, and run through the SDK's `raft.invoke`. Its
+manifest's `toolName`, and run through the SDK's `raft.invoke`. A history read
+(`messages_read`) never counts as seen: the SDK would record the page inside
+`invoke`, before the runtime may park it, so it runs on a client whose state is
+not saved and only `receive_events` attests. The CLI commands the SDK's text
+names are rewritten as tool calls in one place (`toolTerms`), a stopgap until
+the SDK can write them that way. Its
 `snapshotTools` asks Raft what the mount's credential may do
 (`identity.whoami` → `capabilities`) and lists only the operations whose every
 capability the credential holds; `mountTools` offers those names, with each
@@ -333,11 +338,12 @@ tool's description and schema taken from the running build, never from the
 stored copy. Because the list depends on the credential, the runtime takes it
 again whenever a mount's credential is attached, replaced or removed
 (`AgentRuntime.attachCredential`/`removeCredential`, for a plugin that declares
-both `snapshotTools` and a `credential`), and empties it when that listing
-fails, so a credential that lost a scope stops offering the scope's tools. A
-mount with no snapshot at all — one made before the tools were generated, or
-one whose credential was seeded rather than attached — is offered every
-generated tool, and Raft refuses what its credential may not do. Which
+both `snapshotTools` and a `credential`), so a credential that lost a scope
+stops offering the scope's tools. A listing that fails leaves the stored list
+as it was: the previous credential's, or none. A mount with no snapshot at
+all — one made before the tools were generated, one whose credential was
+seeded rather than attached, or one whose first listing failed — is offered
+every generated tool, and Raft refuses what its credential may not do. Which
 manifest operations are not offered, and why, is one table (`EXCLUDED` in
 `src/plugins/raft.ts`); `test/raft-plugin.ts` turns red when the manifest has
 an operation that is neither generated nor excluded.
