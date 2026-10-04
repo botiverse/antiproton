@@ -726,6 +726,8 @@ export const UNMOUNT_TIMEOUT_MS = 10_000;
  * two seconds keeps the pushes behind it from waiting much past its end without spinning the alarm.
  */
 export const INBOUND_REMOVING_RETRY_MS = 2_000;
+/** Why a push accepted for a mount that is gone, or was replaced under its alias, is never handed to the agent. */
+export const MOUNT_REMOVED_REASON = "the mount that received it was removed";
 
 /** The refusal's text when `e` is one, or null. `e` is whatever a catch holds, so it is asked before it is
  *  read: an object with a `message` is read there, anything else is read as itself. */
@@ -961,6 +963,9 @@ export class AgentRuntime {
     if (!secret && routed === "cache") return { outcome: "failed", unrouted: true };
     if (!event) return done("too_large", `the body passed ${INBOUND_MAX_BYTES} bytes`);
     if (!secret) return done("failed", "this hook has no secret in the agent's store");
+    // The installation the push is for, read before the plugin is asked: if the mount is removed, or removed and
+    // added again, while `receive` runs, the push is not this alias's any more (checked again below).
+    const receiving = (await this.store.getMountByAlias(tenantId, agentId, alias))?.installationId ?? null;
     let answer;
     try {
       // The hook travels with the event: verified against this hook's secret, the delivery is the
@@ -976,8 +981,15 @@ export class AgentRuntime {
     const result = answer.result;
     if (!result.deliver) return done(result.rejected ? "rejected" : result.malformed ? "malformed" : "ignored", result.reason);
     // Which installation accepted it, read before the synchronous run below (which must not await): the pass
-    // that posts it gives it up if the alias names another by then (`#deliverInbound`).
-    const installationId = (await this.store.getMountByAlias(tenantId, agentId, alias))?.installationId ?? null;
+    // that posts it gives it up if the alias names another by then (`#deliverInbound`). A mount gone, or replaced,
+    // since `receive` began is refused here rather than stamped, so every row this writes carries an installation
+    // and a null in `inbound_pending` can only be a row queued before the column existed.
+    const accepting = await this.store.getMountByAlias(tenantId, agentId, alias);
+    // A mount that only appeared while `receive` ran (none before) is not the one the push was checked for either.
+    if (!accepting || accepting.installationId !== receiving) {
+      return done("ignored", MOUNT_REMOVED_REASON);
+    }
+    const installationId = accepting.installationId;
     const key = result.dedupeKey ?? null;
     if (key && seenBefore(sql, hookId, key, now)) return done("duplicate", null, key);
     if (!underRate(sql, hookId, now)) return done("rate_limited", `more than ${INBOUND_PER_MINUTE} a minute`, key);
@@ -1049,13 +1061,13 @@ export class AgentRuntime {
       }
       // Accepted by a mount that is gone — removed, or removed and added again under the alias — since the
       // service was answered: not the agent's to read, and never worth a retry. Null can only be a row queued
-      // before the column existed: `acceptInbound` is the one INSERT and always stamps it (`receiveHook`), so a
-      // null is never read as "mount removed" — it is posted as it would have been, and pushes accepted across
-      // the deploy are not dropped.
+      // before the column existed: `acceptInbound` is the one INSERT, and `receiveHook` checks the mount is still
+      // there (and still the one `receive` ran for) before it, so it always stamps it. A null is never read as
+      // "mount removed": it is posted as it would have been, and pushes accepted across the deploy are not dropped.
       if (head.installationId !== null) {
         const mount = await this.store.getMountByAlias(tenantId, agentId, head.alias);
         if (!mount || mount.installationId !== head.installationId) {
-          settle(head, "ignored", "the mount that received it was removed");
+          settle(head, "ignored", MOUNT_REMOVED_REASON);
           out.ignored++;
           continue;
         }

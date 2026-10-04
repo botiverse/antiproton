@@ -66,6 +66,8 @@ let lateDone: Promise<void> = Promise.resolve();
 let lateFinished: () => void = () => {};
 /** "gate": unmount waits until the case lets it go. */
 let gate: Promise<void> = Promise.resolve();
+/** Set by a case to hold the plugin's `receive` (after its signature check) until it settles. */
+let receiveGate: Promise<void> | null = null;
 /** A hook the plugin's unmount revokes itself, through `ctx.inbound`. */
 let revokeOwn: string | null = null;
 let seenByUnmount: { alias: string; inbound: boolean; db: boolean } | null = null;
@@ -91,6 +93,7 @@ const SWEEP: Plugin = {
   async receive(event, secret) {
     receives++;
     if (event.headers["x-signed-with"] !== secret) return { deliver: false, reason: "bad", rejected: true };
+    if (receiveGate) await receiveGate;
     if (event.headers["x-deliver"]) return { deliver: true, text: "an event" };
     return { deliver: false, reason: "seen" };
   },
@@ -120,7 +123,7 @@ const PLAIN: Plugin = { ...SWEEP, id: "plain", unmount: undefined };
 
 function reset() {
   order.length = 0; unmountCalls = 0; receives = 0; mode = "ok"; revokeOwn = null; seenByUnmount = null;
-  late = null; lateMs = 0; toolsThrow = false; lateDone = new Promise((r) => { lateFinished = r; });
+  late = null; lateMs = 0; toolsThrow = false; receiveGate = null; lateDone = new Promise((r) => { lateFinished = r; });
   for (const k of Object.keys(handed)) delete handed[k];
 }
 
@@ -493,6 +496,58 @@ await check("the same, with the alias added again before the pass: a different i
   await acceptedPush(rt, "svc", h2);
   await rt.deliverPendingInbound("t", "a");
   must((posted.length as number) === 1, `the new mount's own push: ${show(posted)}`);
+  host.dispose();
+});
+
+/** A push whose plugin `receive` is held until the case lets it go; resolves once `receive` has begun. */
+async function heldReceive(rt: any, alias: string, h: { hookId: string; secret: string }) {
+  let open!: () => void;
+  receiveGate = new Promise<void>((r) => { open = r; });
+  const before = receives;
+  const pushed = rt.receiveHook("t", "a", alias, h.hookId, { headers: { "x-signed-with": h.secret, "x-deliver": "1" }, body: new Uint8Array([1]) });
+  for (let i = 0; i < 50 && receives === before; i++) await new Promise((r) => setTimeout(r, 5));
+  must(receives === before + 1, "receive did not start");
+  return { pushed, open };
+}
+
+await check("a push whose receive spans a whole removal is ignored with the reason: no queued row, nothing posted", async () => {
+  const { pendingInboundCount } = await import("../src/runtime/inbound.ts");
+  const { rt, host, directory, mount, hook } = await runtime();
+  await mount("sweep", "svc");
+  const h = await hook("svc", "h");
+  const posted: string[] = [];
+  rt.postMessage = async (_t: string, _a: string, text: string) => { posted.push(text); };
+  const { pushed, open } = await heldReceive(rt, "svc", h);
+  must(show(await rt.removeMount("t", "a", "svc", directory)) === show({ ok: true }), "the removal failed");
+  open();
+  const r = await pushed;
+  must(r.outcome === "ignored", `the push: ${show(r)}`);
+  must(pendingInboundCount(host.sql) === 0, `a row was queued: ${pendingInboundCount(host.sql)}`);
+  const rec = (await rt.inboundLog(5)).find((e: any) => e.hookId === h.hookId);
+  must(rec?.outcome === "ignored" && rec?.reason === GONE, `record: ${show(rec)}`);
+  await rt.deliverPendingInbound("t", "a");
+  must(posted.length === 0, `the agent was given: ${show(posted)}`);
+  host.dispose();
+});
+
+await check("a push whose receive spans a removal and a re-add of the alias is ignored too: a different installation", async () => {
+  const { pendingInboundCount } = await import("../src/runtime/inbound.ts");
+  const { rt, host, directory, mount, hook } = await runtime();
+  await mount("sweep", "svc");
+  const h = await hook("svc", "h");
+  const posted: string[] = [];
+  rt.postMessage = async (_t: string, _a: string, text: string) => { posted.push(text); };
+  const { pushed, open } = await heldReceive(rt, "svc", h);
+  must(show(await rt.removeMount("t", "a", "svc", directory)) === show({ ok: true }), "the removal failed");
+  await mount("sweep", "svc");
+  open();
+  const r = await pushed;
+  must(r.outcome === "ignored", `the push: ${show(r)}`);
+  must(pendingInboundCount(host.sql) === 0, `a row was queued for the new mount: ${pendingInboundCount(host.sql)}`);
+  const rec = (await rt.inboundLog(5)).find((e: any) => e.hookId === h.hookId);
+  must(rec?.outcome === "ignored" && rec?.reason === GONE, `record: ${show(rec)}`);
+  await rt.deliverPendingInbound("t", "a");
+  must(posted.length === 0, `the agent was given: ${show(posted)}`);
   host.dispose();
 });
 
