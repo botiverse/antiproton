@@ -28,7 +28,11 @@ export const INBOUND_MAX_BYTES = 1_000_000;
 export const INBOUND_TEXT_MAX = 4_000;
 /** Deliveries per hook per minute. Past it the event is recorded and dropped. */
 export const INBOUND_PER_MINUTE = 30;
-/** How long a delivery key is remembered. GitHub's manual redelivery repeats the key. */
+/**
+ * How long a delivery key is remembered. GitHub's manual redelivery repeats the key. The `reminder` plugin relies
+ * on it as its whole dedupe, so it must stay longer than reminder-app's retry horizon (RETRY_HORIZON_MS in
+ * src/plugins/reminder.ts, 12 hours); test/reminder-plugin.ts holds the two together.
+ */
 export const INBOUND_DEDUPE_MS = 24 * 60 * 60_000;
 /** How long the per-hook record is kept at all. */
 export const INBOUND_KEEP_MS = 7 * 24 * 60 * 60_000;

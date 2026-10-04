@@ -20,6 +20,7 @@ import { statePlugin } from "../src/plugins/state.ts";
 import { artifactsPlugin } from "../src/plugins/artifacts.ts";
 import { builtinToolsPlugin } from "../src/plugins/builtin.ts";
 import { appworldPlugins } from "../src/plugins/appworld.ts";
+import { reminderPlugin } from "../src/plugins/reminder.ts";
 import { credentialForm } from "../src/plugins/types.ts";
 // The capability list lives in its own module so a test can run it over a
 // plugin it made up: the guard over the real registry cannot tell a column
@@ -73,6 +74,7 @@ plugins.push(
   sandboxPlugin(bucket, "artifacts"),
   statePlugin(store, bucket, "artifacts"),
   artifactsPlugin(bucket, "artifacts"),
+  reminderPlugin,
   builtinToolsPlugin(store, () => plugins),
 );
 

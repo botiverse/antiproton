@@ -1075,6 +1075,7 @@ it distinguishes comes from a single plugin (`test/mount-config.ts`). Run
 | Examples | `src/plugins/demo.ts`, `http.ts`, `github.ts` |
 | Tools a mount learns from a server | `src/plugins/mcp.ts`, `src/runtime/mount-tools.ts`, `test/mcp-plugin.ts` |
 | Tools generated from a manifest, filtered by the credential | `src/plugins/raft.ts`, `test/raft-plugin.ts` |
+| A hook the plugin opens and registers on first use, its service behind one injected interface | `src/plugins/reminder.ts`, `test/reminder-plugin.ts` |
 | Settings and activity tests | `test/mount-config.ts` |
 | Version and plugin-id refusals | `test/mount-pin.ts` |
 | Pushed events: limits and statuses | `src/runtime/inbound.ts` |

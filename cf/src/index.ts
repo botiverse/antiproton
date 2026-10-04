@@ -139,6 +139,11 @@ export interface Env {
   RUN9?: string;
   /** The operator's Exa key: the default `search` mount's credential. Absent means that mount cannot search. */
   EXA_API_KEY?: string;
+  /** reminder-app's origin (https), where the `reminder` plugin sends this deployment's client credential. */
+  REMINDER_APP_ORIGIN?: string;
+  /** This deployment's client credential at reminder-app (`rmc.<clientId>.<secret>`), handed to the `reminder` plugin
+   *  when it is built. Absent means that plugin's tools refuse and send nothing. */
+  REMINDER_APP_CREDENTIAL?: string;
   /** 32 bytes, base64: the key per-agent credentials are sealed under. */
   SECRET_KEK?: string;
   HARNESS_MODE?: string;
@@ -426,6 +431,7 @@ export class AgentDO extends DurableObject<Env> {
       operatorModel: operatorModelOf(this.env),
       operatorRun9: this.env.RUN9 ? JSON.parse(this.env.RUN9) : undefined,
       operatorExa: this.env.EXA_API_KEY,
+      reminderApp: { origin: this.env.REMINDER_APP_ORIGIN, credential: this.env.REMINDER_APP_CREDENTIAL },
       secretKek: this.env.SECRET_KEK,
       // Plugins may make their own mount's hooks (Raft push); the URL must be
       // one a service can reach, which the console's own origin may not be.
@@ -870,6 +876,7 @@ export class AgentDO extends DurableObject<Env> {
       operatorModel: operatorModelOf(this.env),
       operatorRun9: this.env.RUN9 ? JSON.parse(this.env.RUN9) : undefined,
       operatorExa: this.env.EXA_API_KEY,
+      reminderApp: { origin: this.env.REMINDER_APP_ORIGIN, credential: this.env.REMINDER_APP_CREDENTIAL },
       secretKek: this.env.SECRET_KEK,
       // τ² mounts its domain as a plugin; SWE-bench mounts a machine, which
       // the runtime already has.

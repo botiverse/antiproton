@@ -68,6 +68,7 @@
     "test/mount-config.ts",
     "test/plugin-enable.ts",
     "test/plugin-hooks.ts",
+    "test/reminder-plugin.ts",
     "test/provision.ts",
     "test/connect.ts",
     "test/activity-flush.ts",

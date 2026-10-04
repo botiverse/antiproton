@@ -184,10 +184,10 @@ await check("a plugin without consoleMount is refused from the console, before a
   }
   must((await rt.store.listMounts("t", "a")).length === 0, "something was mounted");
   must(Object.keys(await rt.store.pluginChoices("t", "a")).length === 0, "a choice was recorded");
-  // The flag itself: mcp sets it, and no other installed plugin does.
+  // The flag itself: mcp and reminder set it, and no other installed plugin does.
   must(mcpPlugin.consoleMount === true, "mcp is not offered to the console");
   const flagged = rt.plugins().filter((p: Plugin) => p.consoleMount).map((p: Plugin) => p.id).sort();
-  must(show(flagged) === show(["mcp", "remote"]), `offered to the console: ${show(flagged)}`);
+  must(show(flagged) === show(["mcp", "reminder", "remote"]), `offered to the console: ${show(flagged)}`);
 });
 
 await check("an explicit disable is refused, not overridden", async () => {
@@ -489,7 +489,8 @@ await check("route: add, through the sign-in gate, answers the plugins panel and
   const d = await home().uiPlugins(T, A);
   const row = d.mounts.find((x: any) => x.alias === "plain");
   must(row?.fromConsole === true && row.snapshotError === null && d.consoleMountsMax === 8, `payload: ${show(row)}`);
-  must(d.installed.find((p: any) => p.id === "mcp")?.addable === true && d.installed.filter((p: any) => p.addable).length === 1, "addable is not exactly mcp");
+  const addable = d.installed.filter((p: any) => p.addable).map((p: any) => p.id).sort();
+  must(show(addable) === show(["mcp", "reminder"]), `addable is ${show(addable)}, not exactly mcp and reminder`);
   // htmx's answer is the panel itself.
   const plain = await post("/ui/mount/add", { plugin: "mcp", alias: "plain", url: MCP_URL });
   must(plain.status === 200 && panel(plain.text) && !plain.text.trimStart().startsWith("{"), `html: ${plain.status} ${plain.text.slice(0, 80)}`);
