@@ -4,7 +4,8 @@
  * test/provision-runtime.ts can drive them through a real runtime, gateway and store.
  */
 import type { Json } from "../../../src/core/types.ts";
-import { OPERATOR_SECRET_REF, type AgentRuntime } from "../runtime.ts";
+import { isOperatorModelRef, type AgentRuntime } from "../runtime.ts";
+import type { ModelChoice } from "../../../src/model/providers.ts";
 import { PUSH_KEY, PUSH_STORE, raftPlugin } from "../../../src/plugins/raft.ts";
 import type { ProvisionTool, PushStatus } from "./handlers.ts";
 
@@ -22,7 +23,7 @@ export const PROVIDER_HOME = "u-raft-provider";
 export async function adoptProvisionedAgent(
   rt: AgentRuntime, tenantId: string, agentId: string,
   spec: { name: string; instructions: string; raftOrigin: string; avatar: string },
-  model?: string | null,
+  model?: ModelChoice | null,
 ): Promise<{ ok: true; avatar: string } | { ok: false; error: string }> {
   await rt.ready();
   const existing = await rt.store.loadAgent(tenantId, agentId);
@@ -35,7 +36,7 @@ export async function adoptProvisionedAgent(
   // contract offers no choice of its own. `model` null is a choice that could not be read: an existing
   // binding stays as it is, and a new agent gets the default. An agent's own credential is not touched.
   const bound = await rt.store.getModelBinding(tenantId, agentId);
-  if (!(bound && (bound.secretRef !== OPERATOR_SECRET_REF || model === null))) await rt.bindOperatorModel(tenantId, agentId, model);
+  if (!(bound && (!isOperatorModelRef(bound.secretRef) || model === null))) await rt.bindOperatorModel(tenantId, agentId, model);
   // The same default mounts every agent gets — memory (state), artifacts, web, GitHub, sandbox, tools — the way the
   // console and the Agents API seed them. Missed on the first cut: Ant2 on staging had the raft mount and nothing
   // else, so the agent truthfully said it had no memory. Idempotent: adds only what is missing.

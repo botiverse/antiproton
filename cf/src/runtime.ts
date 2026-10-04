@@ -11,7 +11,8 @@
  * credential each mount resolves to, and who is allowed to spend what.
  */
 import { contextWindowFor } from "../../src/model/context-windows.ts";
-import { operatorRequest, type OperatorModel } from "../../src/model/operator-request.ts";
+import { OPERATOR_MODEL_REF, operatorRefFor, operatorRequest, providerOfRef, type OperatorModel } from "../../src/model/operator-request.ts";
+import { DEFAULT_PROVIDER, providerFor, type ModelChoice } from "../../src/model/providers.ts";
 import { DurableObjectStore } from "../../src/store/durable-object.ts";
 import { DynamicWorkerExecutor } from "../../src/runtime/dynamic-worker-executor.ts";
 import type { AgentEngine } from "../../src/runtime/engine.ts";
@@ -405,9 +406,12 @@ class BoundArtifacts {
   }
 }
 
-/** The one reference that maps to the operator's configured key. A tenant that
- *  wants its own account uses its own reference instead. */
-export const OPERATOR_SECRET_REF = "operator:model";
+/** The reference that maps to the operator's configured key, for the default
+ *  provider; another provider's is this plus `:<id>` (operatorRefFor). A tenant
+ *  that wants its own account uses its own reference instead. */
+export const OPERATOR_SECRET_REF = OPERATOR_MODEL_REF;
+/** Whether a binding spends the operator's model account, through any provider. */
+export const isOperatorModelRef = (ref: string) => providerOfRef(ref) !== null;
 /** Same idea for the sandbox account. Kept distinct so a tenant can be moved
  *  onto its own run9 project without touching its model binding. */
 export const OPERATOR_RUN9_REF = "operator:run9";
@@ -827,11 +831,14 @@ export class AgentRuntime {
     });
     // Credentials come from the same resolver mounts use, so a model key is
     // dereferenced server-side and never travels with the binding.
-    // A binding on the operator's reference is called the way the queued call is (operatorRequest):
-    // the key a request would carry is not the same for every provider behind a gateway.
+    // A binding on the operator's reference is called the way the queued call is (operatorRequest): the
+    // provider its reference names decides the URL and what is sent. The URL is the provider's as declared
+    // now, not the one the binding recorded, so a credential only ever goes where it is declared to go.
     const op = deps.operatorModel;
-    this.#models = new ModelResolver(this.store, envSecrets,
-      op ? { ref: OPERATOR_SECRET_REF, request: (b) => operatorRequest({ ...op, baseUrl: b.baseUrl }, b.model) } : undefined);
+    this.#models = new ModelResolver(this.store, envSecrets, op ? {
+      owns: isOperatorModelRef,
+      request: (b) => operatorRequest(op, { provider: providerOfRef(b.secretRef)!, model: b.model }),
+    } : undefined);
   }
 
   /** The run_js programs suspended in this object's memory: what keeps it awake (step). */
@@ -1966,17 +1973,25 @@ export class AgentRuntime {
    * deliberate act with a visible binding row behind it, not a default that
    * quietly applies to everyone who forgot to configure one.
    */
-  /** `model`: the operator's account's model for this agent when not the deployment's default (model_overrides). */
-  async bindOperatorModel(tenantId: string, agentId: string | null = null, model?: string | null) {
+  /**
+   * `choice`: the provider and model this agent is served by when not the deployment's default
+   * (model_overrides). The provider must be one the deployment declares; the binding records its URL for
+   * whoever reads the row, and names the provider in its reference (operatorRefFor).
+   */
+  async bindOperatorModel(tenantId: string, agentId: string | null = null, choice?: ModelChoice | null) {
     await this.ready();
     const m = this.#deps.operatorModel;
     if (!m) throw new Error("no operator model configured on this deployment");
-    const chosen = model || m.model;
+    const provider = choice?.provider || DEFAULT_PROVIDER;
+    const chosen = choice?.model || m.model;
+    // Checked against the declaration, so a binding is never written for a provider or a model name a
+    // call would refuse. A provider whose secret is unset is still bound: the call says what is missing.
+    const { baseUrl } = providerFor(m.providers, { provider, model: chosen });
     await this.store.setModelBinding({
       tenantId, agentId, provider: "openai-compatible",
-      model: chosen, baseUrl: m.baseUrl, secretRef: OPERATOR_SECRET_REF,
+      model: chosen, baseUrl, secretRef: operatorRefFor(provider),
     });
-    return { tenantId, agentId, model: chosen };
+    return { tenantId, agentId, provider, model: chosen };
   }
 
   /** Mounts as the model sees them: a plain name, plus the mount-qualified
@@ -2618,10 +2633,11 @@ export class AgentRuntime {
     const session = this.#jobSessionFor(jobId);
     const job = await (await this.agent(tenantId, agentId, session)).takeJob(jobId, taker);
     if (!job) return job;
-    // The model the queued call asks for, when it spends the operator's account; null leaves it at the
-    // deployment's default, which is also what an agent with its own credential got before.
+    // The provider and model the queued call asks for, when it spends the operator's account; null leaves it
+    // at the deployment's default, which is also what an agent with its own credential got before.
     const b = await this.store.getModelBinding(tenantId, agentId);
-    return { ...job, operatorModel: b?.secretRef === OPERATOR_SECRET_REF ? b.model : null };
+    const provider = b ? providerOfRef(b.secretRef) : null;
+    return { ...job, operatorModel: provider ? b!.model : null, operatorProvider: provider };
   }
 
   /** A taker's failed call gives its take back (`AgentEngine.releaseJob`); false where nothing was held. */

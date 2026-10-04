@@ -8,6 +8,7 @@ import { AgentRuntime } from "../cf/src/runtime.ts";
 import { adoptProvisionedAgent, provisionTool, provisionPushStatus, PROVISION_MOUNT_ALIAS } from "../cf/src/provision/steps.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 import type { HookRow } from "../cf/src/control-plane.ts";
+import { operatorModelOf } from "../cf/src/model-request.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void>) {
@@ -51,7 +52,10 @@ async function runtime() {
     ctx: { storage: { sql: host.sql, transactionSync: host.transactionSync } } as any,
     bucket: {} as any, bucketName: "b", models: { resolve: () => null } as any,
     secretKek: Buffer.from(new Uint8Array(32).fill(3)).toString("base64"),
-    operatorModel: { baseUrl: "https://model.example/v1", apiKey: "operator-key", model: "deepseek-flash" },
+    operatorModel: operatorModelOf({ DEEPSEEK_BASE_URL: "https://model.example/v1", DEEPSEEK_API_KEY: "operator-key", HARNESS_MODEL: "deepseek-flash",
+      MODEL_PROVIDERS: [{ id: "deepseek", baseUrl: "https://model.example/v1", auth: { secret: "DEEPSEEK_API_KEY", header: "authorization" } },
+        { id: "gw", baseUrl: "https://gw.example/compat", auth: { secret: "GW_TOKEN", header: "cf-aig-authorization" }, modelFormat: "vendor/model" }],
+      GW_TOKEN: "gt" } as any),
     hooks: { origin: "https://hooks.test", directory },
   } as any);
   await rt.ready();
@@ -127,16 +131,17 @@ await check("a push tool without a credential on the mount fails as a tool failu
 await check("adopt binds the operator's model as chosen for the agent, and the default when nothing is chosen", async () => {
   const { rt, host } = await runtime();
   raft();
-  must((await adoptProvisionedAgent(rt, "t", "raft_m1", SPEC, "anthropic/claude-sonnet-5")).ok, "adopt");
+  must((await adoptProvisionedAgent(rt, "t", "raft_m1", SPEC, { provider: "gw", model: "anthropic/claude-sonnet-5" })).ok, "adopt");
   const chosen = await rt.store.getModelBinding("t", "raft_m1");
-  must(chosen?.model === "anthropic/claude-sonnet-5" && chosen.secretRef === "operator:model", JSON.stringify(chosen));
+  must(chosen?.model === "anthropic/claude-sonnet-5" && chosen.secretRef === "operator:model:gw" && chosen.baseUrl === "https://gw.example/compat", JSON.stringify(chosen));
   // A choice that could not be read (null) leaves the existing binding alone: a control plane that did not
   // answer does not move the agent back to the default.
   must((await adoptProvisionedAgent(rt, "t", "raft_m1", SPEC, null)).ok, "adopt again");
   must((await rt.store.getModelBinding("t", "raft_m1"))?.model === "anthropic/claude-sonnet-5", "an unread choice moved the agent back to the default");
   // No choice at all (undefined) is the default.
   must((await adoptProvisionedAgent(rt, "t", "raft_m1", SPEC)).ok, "adopt a third time");
-  must((await rt.store.getModelBinding("t", "raft_m1"))?.model === "deepseek-flash", "no choice did not fall back to the default");
+  const back = await rt.store.getModelBinding("t", "raft_m1");
+  must(back?.model === "deepseek-flash" && back.secretRef === "operator:model" && back.baseUrl === "https://model.example/v1", `no choice did not fall back to the default: ${JSON.stringify(back)}`);
   // A new agent whose choice could not be read still gets a binding: the default.
   must((await adoptProvisionedAgent(rt, "t", "raft_m2", SPEC, null)).ok && (await rt.store.getModelBinding("t", "raft_m2"))?.model === "deepseek-flash", "a new agent was left unbound");
   host.dispose();

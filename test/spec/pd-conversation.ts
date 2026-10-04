@@ -11,6 +11,7 @@ import { fromResponse } from "../../src/model/pi-bridge.ts";
 import { ApStore } from "../../src/store/ap-store.ts";
 import { prefixedNamespace } from "../../src/store/sql-namespace.ts";
 import type { sqliteHost } from "../../src/store/sqlite-host.ts";
+import { operatorModelOf } from "../../cf/src/model-request.ts";
 
 type Host = ReturnType<typeof sqliteHost>;
 export type Engine = "pi085" | "pd";
@@ -42,7 +43,7 @@ export async function agentRuntime(host: Host, engine: Engine) {
     ctx: { storage: { sql: host.sql, transactionSync: host.transactionSync } },
     bucket: {} as never, bucketName: "b", models: { resolve: () => null },
     sandbox: false, autoRelease: false,
-    operatorModel: { baseUrl: "https://model.example/v1", apiKey: "operator-key", model: "m1" },
+    operatorModel: operatorModelOf({ DEEPSEEK_BASE_URL: "https://model.example/v1", DEEPSEEK_API_KEY: "operator-key", HARNESS_MODEL: "m1" }),
     offloadModel: async (job: { commandId: string }) => { sent.push(job.commandId); },
   } as never);
   await rt.ready();

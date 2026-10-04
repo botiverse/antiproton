@@ -26,6 +26,7 @@ import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { SqliteStore } from "../src/store/sqlite.ts";
 import { standInLoader } from "./spec/worker-stand-in.ts";
 import { createHash } from "node:crypto";
+import { operatorModelOf } from "../cf/src/model-request.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void>) {
@@ -98,7 +99,7 @@ function runtime(host: ReturnType<typeof sqliteHost>, plugin: Plugin): Rt {
     bucket: {} as never, bucketName: "b", models: { resolve: () => null },
     autoRelease: false, extraPlugins: [plugin],
     loader: standIn.loader, makeToolBinding: standIn.makeToolBinding,
-    operatorModel: { baseUrl: "https://model.example/v1", apiKey: "operator-key", model: "m1" },
+    operatorModel: operatorModelOf({ DEEPSEEK_BASE_URL: "https://model.example/v1", DEEPSEEK_API_KEY: "operator-key", HARNESS_MODEL: "m1" }),
     offloadModel: async (job: { commandId: string }) => { sent.push(job.commandId); },
   } as never);
   return { rt, sent, answered: new Set() };

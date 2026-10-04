@@ -16,6 +16,7 @@ import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { MAIN_SESSION } from "../src/store/pi-storage.ts";
 import { ensureAgentTables } from "../src/runtime/pi-agent.ts";
 import { setLogSink } from "../src/core/log.ts";
+import { operatorModelOf } from "../cf/src/model-request.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void>) {
@@ -27,13 +28,14 @@ function must(cond: unknown, msg: string): asserts cond { if (!cond) throw new E
 const T = "t", A = "agent-1", SESSION = "conv-a";
 const REQUEST = { model: { api: "offloaded", provider: "openai-compatible", id: "m" }, context: { messages: [] } };
 
-async function runtime() {
+async function runtime(providers?: unknown[]) {
   const host = sqliteHost();
   const rt = new AgentRuntime({
     ctx: { storage: { sql: host.sql, transactionSync: host.transactionSync } } as any,
     bucket: {} as any, bucketName: "b", models: { resolve: () => null } as any,
     secretKek: Buffer.from(new Uint8Array(32).fill(3)).toString("base64"),
-    operatorModel: { baseUrl: "https://model.example/v1", apiKey: "operator-key", model: "deepseek-flash" },
+    operatorModel: operatorModelOf({ DEEPSEEK_BASE_URL: "https://model.example/v1", DEEPSEEK_API_KEY: "operator-key", HARNESS_MODEL: "deepseek-flash",
+      ...(providers ? { MODEL_PROVIDERS: providers, GW_TOKEN: "gt" } : {}) } as any),
   } as any);
   await rt.ready();
   // An agent with a model binding, as provisioning makes one: the runtime opens a session only for that.
@@ -106,11 +108,26 @@ await check("runtime: an unknown job id throws UnknownJob on take and on deliver
   host.dispose();
 });
 
+await check("runtime: a take names the provider the agent is bound to, so the consumer calls that provider", async () => {
+  const { rt, host, addJob } = await runtime([
+    { id: "deepseek", baseUrl: "https://model.example/v1", auth: { secret: "DEEPSEEK_API_KEY", header: "authorization" } },
+    { id: "gw", baseUrl: "https://gw.example/compat", auth: { secret: "GW_TOKEN", header: "cf-aig-authorization" }, modelFormat: "vendor/model" },
+  ]);
+  await rt.bindOperatorModel(T, A, { provider: "gw", model: "openai/gpt-5" });
+  addJob("job-g", SESSION);
+  const job = await rt.takeJob(T, A, "job-g") as Record<string, unknown> | null;
+  must(job && job.operatorModel === "openai/gpt-5" && job.operatorProvider === "gw", JSON.stringify(job));
+  let refused = "";
+  try { await rt.bindOperatorModel(T, A, { provider: "gw", model: "gpt-5" }); } catch (e) { refused = String((e as Error).message); }
+  must(/vendor\/model/.test(refused), `a binding was written for a name its provider refuses: ${refused || "no refusal"}`);
+  host.dispose();
+});
+
 await check("runtime: a known job is taken and answered in its own session, unchanged", async () => {
   const { rt, host, opened, addJob, answerOf } = await runtime();
   addJob("job-a", SESSION);
   const job = await rt.takeJob(T, A, "job-a") as Record<string, unknown> | null;
-  must(job && JSON.stringify(job.model) === JSON.stringify(REQUEST.model) && "operatorModel" in job, JSON.stringify(job));
+  must(job && JSON.stringify(job.model) === JSON.stringify(REQUEST.model) && job.operatorModel === "deepseek-flash" && job.operatorProvider === "deepseek", JSON.stringify(job));
   must(await rt.deliverAnswer(T, A, "job-a", { role: "assistant", content: [], jobId: "job-a" }, undefined) === true, "deliver did not write");
   must(answerOf("job-a"), "no answer on the row");
   must(await rt.takeJob(T, A, "job-a") === null, "an answered job was taken again");

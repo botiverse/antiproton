@@ -23,6 +23,7 @@ import { RunJsContinuations } from "../src/runtime/run-js-resume.ts";
 import { systemPrompt } from "../src/runtime/pi-prompt.ts";
 import { raftPlugin } from "../src/plugins/raft.ts";
 import { standInLoader } from "./spec/worker-stand-in.ts";
+import { operatorModelOf } from "../cf/src/model-request.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void>) {
@@ -537,7 +538,7 @@ await check("runtime: resume is offered without run_js when a mounted plugin can
   const rt = new AgentRuntime({
     ctx: { storage: { sql: host.sql, transactionSync: host.transactionSync } } as any,
     bucket: {} as any, bucketName: "b", loader: {} as any, makeToolBinding: () => ({}),
-    operatorModel: { baseUrl: "https://model.example/v1", apiKey: "k", model: "deepseek-flash" },
+    operatorModel: operatorModelOf({ DEEPSEEK_BASE_URL: "https://model.example/v1", DEEPSEEK_API_KEY: "k", HARNESS_MODEL: "deepseek-flash" }),
     extraPlugins: [sqlPlugin(db)], sandbox: false, autoRelease: false,
   } as any);
   await rt.ready();
@@ -571,7 +572,7 @@ await check("runtime: once the task has ended, a call and the answer to a questi
   const rt = new AgentRuntime({
     ctx: { storage: { sql: host.sql, transactionSync: host.transactionSync } } as any,
     bucket: {} as any, bucketName: "b", loader: {} as any, makeToolBinding: () => ({}),
-    operatorModel: { baseUrl: "https://model.example/v1", apiKey: "k", model: "deepseek-flash" },
+    operatorModel: operatorModelOf({ DEEPSEEK_BASE_URL: "https://model.example/v1", DEEPSEEK_API_KEY: "k", HARNESS_MODEL: "deepseek-flash" }),
     extraPlugins: [sqlPlugin(db)], sandbox: false, autoRelease: false,
     ended: (o: { agentId: string }) => ended && o.agentId === "a",
   } as any);

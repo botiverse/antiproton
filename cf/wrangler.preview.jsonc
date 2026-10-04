@@ -30,6 +30,17 @@
   "vars": {
     "DEEPSEEK_BASE_URL": "https://api.deepseek.com",
     "HARNESS_MODEL": "deepseek-flash",
+    // The providers the operator's account reaches (src/model/providers.ts). Each credential is named by
+    // its Worker secret, never written here. `cloudflare` is offered once AI_GATEWAY_TOKEN is set; until
+    // then it is listed as unavailable. The gateway holds the other vendors' keys, so DeepSeek's is passed
+    // through only for deepseek/ models.
+    "MODEL_PROVIDERS": [
+      { "id": "deepseek", "baseUrl": "https://api.deepseek.com",
+        "auth": { "secret": "DEEPSEEK_API_KEY", "header": "authorization" } },
+      { "id": "cloudflare", "baseUrl": "https://gateway.ai.cloudflare.com/v1/a084c4564dfdce5a7775b08ece638a79/antiproton-preview/compat",
+        "auth": { "secret": "AI_GATEWAY_TOKEN", "header": "cf-aig-authorization" },
+        "modelFormat": "vendor/model", "passKeys": { "deepseek/": "DEEPSEEK_API_KEY" } }
+    ],
     "ARTIFACT_BUCKET": "antiproton-preview-artifacts",
     "HOOK_ORIGIN": "https://preview.antiproton.ai",
     // Open to look at until the Access application exists; the write routes
