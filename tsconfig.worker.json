@@ -93,6 +93,7 @@
     "test/tool-interrupts.ts",
     "test/mcp-plugin.ts",
     "test/raft-plugin.ts",
+    "test/mount-offered.ts",
     "test/model-queue.ts",
     "test/durable-agent.ts",
     "test/spec/durable-agent-spec.ts",

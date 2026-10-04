@@ -673,6 +673,22 @@ export function parsePluginChoice(value: unknown): PluginChoice | null {
  *  its message and loses its class, so a route that wants to answer 409 rather than 500 matches on these. */
 export const MESSAGE_REFUSED = "message refused by the lane";
 
+/**
+ * How long a turn waits for a mount's tool list to be re-taken when its snapshot's basis is not the plugin's
+ * (`AgentRuntime.retakeStaleSnapshots`). Raft answers with one small `identity.whoami` GET, well under a second when
+ * it is up; three seconds is room for a slow answer while keeping a down Raft from holding the turn for the 15 s its
+ * calls may take (raft.ts `DEFAULT_TIMEOUT_MS`). Running out keeps the old list, which still works, minus the new tools.
+ */
+export const RETAKE_TIMEOUT_MS = 3_000;
+/**
+ * How long after a re-take that failed the same mount is not tried again for the same basis. Without it a Raft that
+ * stays down would cost every turn the timeout above; with it the cost is one timeout per mount per ten minutes, and
+ * a recovered Raft is asked again within ten minutes. Kept in the isolate's memory: an evicted object asks again on its
+ * next wake, which is at most one more attempt, and nothing about it needs to survive a deploy (a deploy that moves
+ * the basis should try at once).
+ */
+export const RETAKE_BACKOFF_MS = 10 * 60_000;
+
 /** The refusal's text when `e` is one, or null. `e` is whatever a catch holds, so it is asked before it is
  *  read: an object with a `message` is read there, anything else is read as itself. */
 export function messageRefusal(e: unknown): string | null {
@@ -737,6 +753,8 @@ export class AgentRuntime {
   }
 
   #gateway: ToolGateway;
+  /** The last failed re-take per mount (`tenant/agent/alias`), under which basis and when; see `RETAKE_BACKOFF_MS`. */
+  #retakeFailed = new Map<string, { basis: string; at: number }>();
   #secrets!: import("../../src/runtime/gateway.ts").SecretResolver;
   #kek: Promise<CryptoKey | null> = Promise.resolve(null);
   #unchecked = new Map<string, string>();
@@ -1733,18 +1751,79 @@ export class AgentRuntime {
    * `held_warnings` (one object is one agent), so neither store's schema moves;
    * a success, a rename and a remove each update it.
    */
-  async #snapshot(tenantId: string, agentId: string, alias: string) {
-    const r = await this.#gateway.refreshMountTools(tenantId, agentId, alias);
-    const sql = this.#snapshotErrors();
-    if (sql) {
-      if (r.ok) sql.exec("DELETE FROM mount_snapshot_errors WHERE alias = ?", alias);
-      // A stale answer is about a mount that is gone; the one now under the alias has its own.
-      else if (!("stale" in r) && await this.store.getMountByAlias(tenantId, agentId, alias)) {
-        sql.exec("INSERT INTO mount_snapshot_errors(alias, error, at) VALUES (?,?,?) ON CONFLICT(alias) DO UPDATE SET error = excluded.error, at = excluded.at",
-          alias, r.error, Date.now());
-      }
-    }
+  async #snapshot(tenantId: string, agentId: string, alias: string, opts?: { keepCredentialed?: true }) {
+    const r = await this.#gateway.refreshMountTools(tenantId, agentId, alias, opts);
+    if (r.ok) this.#snapshotErrors()?.exec("DELETE FROM mount_snapshot_errors WHERE alias = ?", alias);
+    // A stale answer is about a mount that is gone; the one now under the alias has its own.
+    else if (!("stale" in r)) await this.#snapshotFailed(tenantId, agentId, alias, r.error);
     return r;
+  }
+
+  /** Keep why a mount's listing failed, for its page (`snapshotError`), while the mount is still there. */
+  async #snapshotFailed(tenantId: string, agentId: string, alias: string, error: string) {
+    const sql = this.#snapshotErrors();
+    if (!sql || !await this.store.getMountByAlias(tenantId, agentId, alias)) return;
+    sql.exec("INSERT INTO mount_snapshot_errors(alias, error, at) VALUES (?,?,?) ON CONFLICT(alias) DO UPDATE SET error = excluded.error, at = excluded.at",
+      alias, error, Date.now());
+  }
+
+  /**
+   * Re-take, at the start of a turn, every tool list taken under a basis that is not its plugin's now
+   * (`Plugin.toolsBasis`, `ToolSnapshot.basis`). A snapshot is otherwise taken only when a mount is added, its
+   * credential changes or an operator refreshes it, so a deploy that adds a tool would never reach a mount whose list
+   * already existed: the model was not offered the tool, and a plugin that hinted at it named a tool the mount lacked.
+   *
+   * Asked of a mount only when its plugin lists its own tools and declares a basis, the mount has a snapshot whose
+   * basis differs (one with none differs: it was taken before bases existed), and its plugin is switched on. A mount
+   * with no snapshot is left alone: it is offered every tool already. Each re-take goes through `#snapshot`, so it is
+   * written only when the list or its marks moved, with `RETAKE_TIMEOUT_MS` as its bound; a failure or a timeout keeps
+   * the old list, which `mountTools` still reads against this build's tools (a removed tool is not offered), records
+   * why (`snapshotError`), and is not tried again for that basis for `RETAKE_BACKOFF_MS`. A list taken under a
+   * credential is never replaced by one taken without it because the credential did not resolve this time
+   * (`keepCredentialed`, the rule `ToolSnapshot.withoutCredential` states for an attach).
+   *
+   * Public so a test can ask for exactly this step; `agent` is the caller that matters.
+   */
+  async retakeStaleSnapshots(tenantId: string, agentId: string): Promise<void> {
+    const byId = new Map(this.#plugins.map((p) => [p.id, p]));
+    const stale = (await this.store.listMounts(tenantId, agentId)).filter((m) => {
+      const p = byId.get(m.plugin);
+      return !!p?.snapshotTools && p.toolsBasis !== undefined && !!m.toolSnapshot && m.toolSnapshot.basis !== p.toolsBasis;
+    });
+    if (!stale.length) return;
+    const choices = await this.store.pluginChoices(tenantId, agentId);
+    const now = Date.now();
+    const due = stale.filter((m) => {
+      if (!pluginEnabled(SEEDED_PLUGINS.has(m.plugin), choices[m.plugin])) return false;
+      const failed = this.#retakeFailed.get(`${tenantId}/${agentId}/${m.alias}`);
+      return !failed || failed.basis !== byId.get(m.plugin)!.toolsBasis || now - failed.at >= RETAKE_BACKOFF_MS;
+    });
+    if (!due.length) return;
+    // The gateway refuses to list for a mount whose pin is not the registry's, and the build that moved the basis
+    // usually moved the version too; `agent` would repin anyway, a few lines later.
+    if (due.some((m) => this.pluginVersion(m.plugin) !== m.toolVersion)) await this.repinMounts(tenantId, agentId);
+    for (const m of due) {
+      const key = `${tenantId}/${agentId}/${m.alias}`;
+      const basis = byId.get(m.plugin)!.toolsBasis!;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timedOut = new Promise<"timeout">((resolve) => { timer = setTimeout(() => resolve("timeout"), RETAKE_TIMEOUT_MS); });
+      let r: Awaited<ReturnType<AgentRuntime["refreshMountTools"]>> | "timeout";
+      try {
+        r = await Promise.race([this.#snapshot(tenantId, agentId, m.alias, { keepCredentialed: true }), timedOut]);
+      } catch (e) {
+        r = { ok: false, error: `could not list ${m.alias}'s tools: ${String((e as Error)?.message ?? e).slice(0, 300)}` };
+        await this.#snapshotFailed(tenantId, agentId, m.alias, r.error);
+      } finally {
+        clearTimeout(timer);
+      }
+      // Timed out: the listing goes on, and lands (or records its own failure) if it ever answers.
+      if (r === "timeout") {
+        await this.#snapshotFailed(tenantId, agentId, m.alias,
+          `could not list ${m.alias}'s tools: no answer within ${RETAKE_TIMEOUT_MS} ms at the start of a turn; the previous list is kept`);
+      }
+      if (r === "timeout" || !r.ok) this.#retakeFailed.set(key, { basis, at: Date.now() });
+      else this.#retakeFailed.delete(key);
+    }
   }
 
   #snapshotErrors() {
@@ -1911,6 +1990,9 @@ export class AgentRuntime {
    */
   async agent(tenantId: string, agentId: string, session: string = MAIN_SESSION): Promise<AgentEngine> {
     await this.ready();
+    // Before the cached harness is judged: a re-taken list changes the snapshot's hash, which is in `catalogueKey`,
+    // so the turn that re-took it is built with the new tools (or, if one is running, the next one is).
+    await this.retakeStaleSnapshots(tenantId, agentId);
     const key = `${tenantId}/${agentId}`;
     const cacheKey = `${key}#${session}`;
     const cached = this.#agents.get(cacheKey);

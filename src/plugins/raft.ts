@@ -9,6 +9,7 @@
  * runtime's plumbing rather than Raft operations. The Raft credential stays in the host plugin and is
  * attached only to the operator-configured Raft origin.
  */
+import { createHash } from "node:crypto";
 import { clip, logEvent, routeOf } from "../core/log.ts";
 import type { Json, MountRecord } from "../core/types.ts";
 import {
@@ -426,8 +427,10 @@ function sdkFailure(
 /**
  * One message as the model reads it: the SDK's canonical line, with the two things it says that may not be true on
  * this mount put right. The SDK ends a message that has attachments with "use attachments_download_url(…) to
- * download"; on a mount built with an exclusion table that leaves that tool out (not the default `EXCLUDED`, which
- * offers it), a model would go looking for it, so there the attachments are named and the missing tool is said.
+ * download"; on a mount that is not offered that tool — a plugin built with no object storage or with an exclusion table
+ * that leaves it out, a credential without its capability, a snapshot older than the build that added it
+ * (`unofferedFor` in `createRaftPlugin`) — a model would go looking for it, so there the attachments are named and the
+ * missing tool is said.
  * And a message whose content Raft left out because it was too large renders as a sender and nothing after the
  * colon, which reads as an empty message; here it says the content
  * was left out. Both are fixed by rebuilding the suffix from the message's own fields and replaced where the SDK put
@@ -685,22 +688,26 @@ function argumentsFor(op: RaftOperationSpec, args: unknown): Record<string, unkn
  * call it stands for — `messages_read({ target: "#ops", before: 41 })` — in its text, its failures' next actions and
  * its message lines, using the manifest's `toolName`, which is the name this plugin gives each tool. What the SDK
  * cannot know is which of those tools this mount offers. A hint naming one it does not — an operation in `EXCLUDED`,
+ * a generated tool missing from the mount's own list (`PluginContext.offered`: its credential lacks the capability,
+ * or its stored snapshot predates the build that added the tool), the download on a plugin with no object storage,
  * or the SDK's code-only `raft.<operation>(…)` form — would send the model after a tool it does not have, so such a
  * call is written here as what it stands for instead (`UNOFFERED_SAY`), or as the tool this mount has for it.
  *
  * Only that, and only in text the SDK wrote: a string a person wrote that happens to contain such a call (a message,
  * a description, a title) is set aside first (`quotedCalls`) and comes back as written.
  *
- * Not covered: a tool the mount's credential does not reach (`snapshotTools` leaves it out of the mount's list). A
- * call carries no record of which tools its mount offers, so a hint may still name one of those; calling it is
- * refused by the gateway as a tool this mount does not have, before anything reaches Raft.
+ * Which generated tools the mount offers is the kernel's answer, not this file's: `ctx.offered` is the mount's list
+ * as the model was given it (`toolsOf`), so a tool the credential does not reach (`snapshotTools` leaves it out) is
+ * said in words like an excluded one. A context without `offered` is read as offering every generated tool. A name
+ * missing from `UNOFFERED_SAY` is said with `UNOFFERED_DEFAULT`, so a tool left out only by a credential needs no
+ * entry here.
  */
 const UNOFFERED_SAY: Readonly<Record<string, string>> = {
   // The SDK names `inbox.check` for "check for new messages"; on this mount that is receive_events.
   inbox_check: "receive_events()",
   // Since 0.11.0 the SDK's notify hint names mentions_notify, which is offered; its add hint names mentions_add.
   mentions_add: "adding them to the conversation, which this mount does not offer",
-  // Offered as built; reached only on a mount whose exclusion table leaves the download out.
+  // Reached on a plugin built with no object storage, a credential without the capability, or a table that excludes it.
   attachments_download_url: "downloading the attachment, which this mount does not offer",
   "raft.attachments.download": "downloading the attachment, which this mount does not offer",
 };
@@ -1300,6 +1307,16 @@ export async function downloadAttachment(
   return { attachmentId, ref, name: file.filename, type: file.type, bytes: file.bytes.byteLength };
 }
 
+/**
+ * The basis of a raft snapshot (`Plugin.toolsBasis`): a digest of the names of every tool this build can offer, sorted,
+ * so it moves exactly when the set does — an SDK upgrade that adds or removes an operation, a change to `EXCLUDED`, a
+ * plugin built with or without object storage — and not when a description or a schema is reworded, which a snapshot
+ * never carried anyway (`mountTools` reads only its names).
+ */
+function toolsBasisOf(tools: readonly ToolSchema[]): string {
+  return `raft-tools:${createHash("sha256").update(JSON.stringify(tools.map((t) => t.name).sort())).digest("hex").slice(0, 16)}`;
+}
+
 /** What a mount whose credential has no capability at all is told, in its snapshot's `skipped`. */
 const EVERY_OPERATION = "(every Raft operation)";
 
@@ -1314,8 +1331,8 @@ export interface RaftArtifacts {
 
 /**
  * The plugin, built for a runtime. `artifacts` is where `attachments_download_url` keeps what it fetches (none: the
- * tool says nothing can be kept). `excluded` is the exclusion table, `EXCLUDED` unless a test builds it otherwise:
- * every list below derives from it — which tools are generated and offered, how each is dispatched, which hints are
+ * tool is not offered, and every pointer at it is said in words). `excluded` is the exclusion table, `EXCLUDED` unless
+ * a test builds it otherwise: every list below derives from it — which tools are generated and offered, how each is dispatched, which hints are
  * put in words (`offeredTerms`), and a message line's attachment suffix (`modelLine`) — so taking an operation out of
  * the table is the whole change that offers it.
  */
@@ -1323,17 +1340,43 @@ export function createRaftPlugin(deps: { artifacts?: RaftArtifacts | null; exclu
   const excluded = deps.excluded ?? EXCLUDED;
   const artifacts = deps.artifacts ?? null;
   const generated = excluded === EXCLUDED ? GENERATED : generatedFrom(excluded);
-  const unoffered = excluded === EXCLUDED ? DEFAULT_UNOFFERED : unofferedNames(excluded);
-  const generatedTools: readonly ToolSchema[] = generated.map(toolOf);
+  // With nowhere to keep a file the download could only fail, so it is not offered at all: not in `tools`, not in
+  // any mount's list, and named in words wherever the SDK points at it. It stays in `operationOf`, so a direct
+  // `invoke` (which the gateway never makes for a tool the mount lacks) still says why nothing was downloaded.
+  const offerable = artifacts ? generated : generated.filter((op) => op.name !== DOWNLOAD_OP);
+  /** What no mount of this plugin offers: the excluded operations, and the download when there is no storage. */
+  const notGenerated = excluded === EXCLUDED ? DEFAULT_UNOFFERED : unofferedNames(excluded);
+  const unoffered: ReadonlySet<string> = artifacts ? notGenerated : new Set([...notGenerated, DOWNLOAD_TOOL]);
+  const generatedTools: readonly ToolSchema[] = offerable.map(toolOf);
   const operationOf = new Map(generated.map((op) => [op.toolName, op]));
   /** Every tool a mount can be offered: what a mount with no snapshot is offered, and the plugin's `tools`. */
   const allTools: ToolSchema[] = [...OWN_TOOLS, ...generatedTools];
+  /**
+   * What this call's mount does not offer, for the hints and the attachment suffix: `unoffered`, plus every generated
+   * tool the kernel says this mount is not offered right now (`PluginContext.offered`) — one its credential lacks the
+   * capability for, or one this build added that the mount's stored snapshot predates. A context without `offered`
+   * (a test's, or one made outside the gateway) is answered with `unoffered` alone, which is what a mount with no
+   * snapshot is offered.
+   */
+  const unofferedFor = (ctx: PluginContext): ReadonlySet<string> => {
+    const offered = ctx.offered;
+    if (!offered) return unoffered;
+    const on = new Set(offered);
+    const missing = generatedTools.filter((t) => !on.has(t.name));
+    return missing.length ? new Set([...unoffered, ...missing.map((t) => t.name)]) : unoffered;
+  };
   /** One generated operation: the attachment download is this plugin's own (`downloadAttachment`), the rest the SDK's. */
   const operate = (op: RaftOperationSpec, args: unknown, ctx: PluginContext, resumed?: { seen?: { upToSeq: number }; heldAt?: number }) =>
-    op.name === DOWNLOAD_OP ? downloadAttachment(args, ctx, artifacts, unoffered) : runOperation(op, args, ctx, unoffered, resumed);
+    op.name === DOWNLOAD_OP ? downloadAttachment(args, ctx, artifacts, unofferedFor(ctx)) : runOperation(op, args, ctx, unofferedFor(ctx), resumed);
   return {
     id: "raft",
     version: "1.0.0",
+    /**
+     * Which tools this build can offer, as one string: it moves when the SDK's manifest, `EXCLUDED` or the presence
+     * of object storage changes the generated set, and a snapshot taken under another basis is re-taken at the next
+     * turn (`Plugin.toolsBasis`), so a tool a deploy added reaches a mount without anyone refreshing it.
+     */
+    toolsBasis: toolsBasisOf(allTools),
     /** The push registration this mount holds: whether it exists is listable, what it holds is not. */
     database: {
       version: 3, stores: { [PUSH_STORE]: { listed: [PUSH_KEY] }, [INBOX_STORE]: { listed: [STATE_KEY, SINCE_KEY] } },
@@ -1377,8 +1420,10 @@ export function createRaftPlugin(deps: { artifacts?: RaftArtifacts | null; exclu
     /**
      * The tools this mount offers: its own tools, and the generated ones its snapshot lists — the operations whose
      * every capability the mount's credential held when the snapshot was taken (`snapshotTools`). Only the names
-     * are read from the snapshot; each tool's description and schema are this build's, so the stored copy cannot
-     * offer a schema this code does not run.
+     * are read from the snapshot, and only those this build generates; each tool's description and schema are this
+     * build's, so the stored copy cannot offer a schema this code does not run, nor a tool this build no longer has.
+     * A snapshot taken by an older build lacks what this one added until it is re-taken, which the runtime does at
+     * the next turn when its `basis` is not this plugin's `toolsBasis`.
      *
      * A mount with no snapshot is offered every generated tool. That is every mount made before tools were
      * generated, which nothing recomputes, and one whose credential was seeded rather than attached: its model sees
@@ -1414,7 +1459,7 @@ export function createRaftPlugin(deps: { artifacts?: RaftArtifacts | null; exclu
       const capabilities = new Set(me.data.capabilities);
       const tools: ToolSchema[] = [];
       const skipped: Array<{ name: string; reason: string }> = [];
-      for (const op of generated) {
+      for (const op of offerable) {
         const missing = op.capability.filter((c) => !capabilities.has(c));
         if (missing.length) skipped.push({ name: op.toolName, reason: `the credential lacks the Raft capability ${missing.join(", ")}` });
         else tools.push(toolOf(op));
@@ -1432,7 +1477,7 @@ export function createRaftPlugin(deps: { artifacts?: RaftArtifacts | null; exclu
      */
     interrupts: {
       async resume(tool, state, answer, ctx) {
-        if (tool === LEGACY_SEND) return legacyResume(state, answer, ctx, unoffered);
+        if (tool === LEGACY_SEND) return legacyResume(state, answer, ctx, unofferedFor(ctx));
         const op = operationOf.get(tool);
         if (!op?.mayInterrupt) throw new Error(`raft: ${tool} does not ask questions`);
         const s = object(state);
@@ -1526,9 +1571,9 @@ export function createRaftPlugin(deps: { artifacts?: RaftArtifacts | null; exclu
         // has already refused it from a program and from an approved call's replay.
         const out = await raftFor(ctx, { state: false }).invoke("inbox.check",
           { ack: "cursor", limit, ...(since !== null ? { since } : {}) }, { origin: "model" });
-        if (!out.ok) throw sdkFailure(out as RaftFailure, unoffered);
+        if (!out.ok) throw sdkFailure(out as RaftFailure, unofferedFor(ctx));
         const batch = (out as { data: RaftInboxBatch }).data;
-        const given = handOver(batch, unoffered);
+        const given = handOver(batch, unofferedFor(ctx));
         // Exactly this call's cursor, lower than the last one or not: the next pull acknowledges what was shown here.
         // A Server that acknowledged on read has nothing pending, so the next pull sends none. Written before anything
         // is recorded as seen, so a write that fails leaves nothing attested and the next pull acknowledging nothing.
@@ -1716,7 +1761,7 @@ export function createRaftPlugin(deps: { artifacts?: RaftArtifacts | null; exclu
   };
 }
 
-/** The plugin as most of the codebase names it: the exclusion table as written, and no object storage. */
+/** The plugin as most of the codebase names it: the exclusion table as written, and no object storage, so no download. */
 export const raftPlugin: Plugin = createRaftPlugin();
 
 /**

@@ -306,7 +306,8 @@ Swallowing that failure reports a cancellation that did not happen.
 one that does). `snapshotTools` asks the server and is called only when the
 mount is added (`/admin/mounts`) and when an operator asks for a refresh
 (`POST /admin/mounts {tenantId, agentId, refreshTools: alias}`) — never on a
-wake, a harness build or a call. The kernel admits the list (names an agent
+call (the one turn-time exception, a snapshot under another `toolsBasis`, is
+below). The kernel admits the list (names an agent
 can address, each once; `reads` dropped; anything unrecognised made a write;
 every tool `replay: "never"`; at most `MAX_SNAPSHOT_TOOLS` tools, each within a
 description and a schema bound, all within a total — the constants and their
@@ -321,6 +322,42 @@ mount)`, never `plugin.tools`, so they all see one list. Names the kernel left
 out are in the snapshot's `skipped`, shown on the mount's console page and in
 `tools.mounts`. The version pin is still the plugin's `version`: a snapshot
 changes what a mount offers, not which code runs it.
+
+**Declare `toolsBasis` when the build decides which tools a listing can
+return.** A snapshot is taken only on the occasions above, so a deploy that adds
+a tool reaches no mount whose list already exists. `toolsBasis` is a static
+string that moves whenever the set of tools this build can offer moves (raft's
+is a digest of its generated tool names, so an SDK upgrade, a change to
+`EXCLUDED` or a build with or without object storage changes it). The kernel
+stores it on every snapshot it takes (`ToolSnapshot.basis`), and at the start
+of each turn, before the agent's tool list is built (`AgentRuntime.agent` →
+`retakeStaleSnapshots`, `cf/src/runtime.ts`), lists again any mount whose
+snapshot's basis is not its plugin's — a snapshot with no basis counts as
+different; a mount with no snapshot is left alone, being offered every tool
+already; a switched-off plugin is skipped. The listing is bounded by
+`RETAKE_TIMEOUT_MS` (3 s). When it fails or runs out, the old list stays —
+`mountTools` still reads it against the running build, so a tool the build
+removed is not offered — the reason goes where every failed listing's does
+(`snapshotError`, on the mount's page), and the mount is not tried again for
+that basis for `RETAKE_BACKOFF_MS` (10 minutes, kept in the object's memory).
+A list taken under a credential is never replaced by one taken without it just
+because the credential did not resolve at that moment. A plugin whose list
+depends only on its server (`mcp.ts`) declares no basis: nothing in the build
+changes that list.
+
+**Read `context.offered` before naming one of your own tools.** It is the
+names of the tools this mount offers right now, as `toolsOf(plugin, mount)`
+answers — the list the model was given and the gateway admits calls against —
+filled by the gateway (`#contextFor`) on a call's `invoke`, `interrupts.resume`
+and `cancel`, `background.poll` and `cancel`, `receive` and `reportActivity`.
+It is absent from `snapshotTools` (which is deciding the list, so the one it
+would be handed is the one being replaced) and from contexts built without a
+call (`promptContribution`, `Holding.*`, `checkCredential`); read absence as
+"not reported" and fall back to your static `tools`, never as "offers nothing".
+A plugin that writes a hint, a next step or a suffix naming one of its tools
+checks the name is in it: a mount's list can be narrower than `tools`, because
+its credential lacks a capability or its snapshot predates the build that added
+the tool.
 
 **A plugin whose tools depend on the credential lists them per mount too.**
 `raft` is the one that does: its tools are generated from the Raft SDK's
@@ -352,15 +389,18 @@ got a parked preview, so a send into that conversation is still held. Every clie
 made with the SDK's `hints: "tool"`, so its hints are tool calls
 (`messages_read({ target: "#ops" })`), named by the manifest's `toolName`
 without the mount's alias, as every other tool reference in Raft's text is. A
-hint naming a tool the mount does not offer (an `EXCLUDED` operation, or the
-SDK's code-only `raft.<operation>(…)`) is put in words in one place
-(`offeredTerms`); what a person wrote (a message, a description, a title, a
-preview) is passed on as written. A hint at a tool the credential does not
-reach is not caught there — a call carries no record of its mount's list — and
-calling it is refused by the gateway. `attachments_download_url` fetches the
-file Raft points at into the agent's object storage (at most
-`ATTACHMENT_MAX_BYTES`) and returns its `artifact://` reference, never the
-URL; it is offered (Raft serves the route), falling back to `attachments.download` when the Server cannot mint a URL. A tool's description and every parameter description in its
+hint naming a tool the mount does not offer (an `EXCLUDED` operation, a
+generated tool missing from `context.offered` — one the credential does not
+reach, or one added after the mount's snapshot was taken — or the SDK's
+code-only `raft.<operation>(…)`) is put in words in one place
+(`offeredTerms`), and so is a message line's attachment suffix when the
+download is not offered (`modelLine`); what a person wrote (a message, a
+description, a title, a preview) is passed on as written.
+`attachments_download_url` fetches the file Raft points at into the agent's
+object storage (at most `ATTACHMENT_MAX_BYTES`) and returns its `artifact://`
+reference, never the URL; it is offered when the plugin is built with object
+storage (`createRaftPlugin({ artifacts })`, as the runtime builds it) and not
+at all without, falling back to `attachments.download` when the Server cannot mint a URL. A tool's description and every parameter description in its
 schema name operations by their tool names, never by the manifest's dotted
 names, SDK field paths or CLI flags (`inMountTerms`). Its
 `snapshotTools` asks Raft what the mount's credential may do
@@ -371,7 +411,8 @@ stored copy. Because the list depends on the credential, the runtime takes it
 again whenever a mount's credential is attached, replaced or removed
 (`AgentRuntime.attachCredential`/`removeCredential`, for a plugin that declares
 both `snapshotTools` and a `credential`), so a credential that lost a scope
-stops offering the scope's tools. A listing that fails leaves the stored list
+stops offering the scope's tools; it declares `toolsBasis`, so a deploy that
+changes the generated set re-lists each mount at its next turn. A listing that fails leaves the stored list
 as it was when a credential was behind it; a list taken with no credential
 (`ToolSnapshot.withoutCredential`, which a mount added before its account has)
 is cleared instead. A mount with no snapshot at all — one made before the
