@@ -345,11 +345,18 @@ await check("record: the `/bench` record's fields, plus runnerMethod and modelRe
   } finally { rmSync(tree, { recursive: true, force: true }); }
 });
 
-await check("record: none when two rows ran on different providers; a record without the field reads as the `/bench` method", () => {
+await check("record: none when two rows ran on different providers, or when rows reached the agent and none has a provider; a record without the field reads as the `/bench` method", () => {
   const DS = { name: "deepseek-flash", endpoint: "api.deepseek.com" };
   const built = apiRunRecord(input([row(0, 1, 1, LUNA), row(1, 1, 1, DS)]));
   must(!built.ok && /2 providers/.test(built.why), show(built));
   must(!runProvider([{ provider: LUNA }, { provider: { ...LUNA, endpoint: "elsewhere" } }]).ok, "the same model at two endpoints agreed");
+  // Rows that reached the agent and no provider anywhere: the model never answered, and that is no round.
+  const failed = (id: number) => ({ ...row(id, 1, 0, null), ended: "model: 401: the gateway refused the token", turns: 0, usage: { prompt: 0, completion: 0, calls: 0 } });
+  const none = apiRunRecord(input([failed(0), failed(1)]));
+  must(!none.ok && /none has a provider/.test(none.why), show(none));
+  must(!apiRunRecord(input([{ ...row(0, 1, 0, null), ended: "transfer", turns: 2 }])).ok, "a row with turns and no provider was recorded");
+  // A run whose customer ended every task before the agent spoke has no provider to give, and is recorded.
+  must(apiRunRecord(input([{ ...row(0, 1, 0, null), ended: "stop", turns: 0 }])).ok, "a run that never reached the agent was refused");
   must(runnerMethodOf({}) === "bench" && runnerMethodOf({ runnerMethod: "agents-api" }) === "agents-api", "runnerMethodOf");
 });
 

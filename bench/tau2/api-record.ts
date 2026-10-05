@@ -204,6 +204,13 @@ export function apiRunRecord(i: {
 }): { ok: true; body: Record<string, unknown> } | { ok: false; why: string } {
   const provider = runProvider(i.results);
   if (!provider.ok) return provider;
+  // No row has a provider, yet some row reached the agent: every model call failed (a refused or expired
+  // provider token fails at the call, after the agent was made, so the preflight cannot see it). A record
+  // would publish a 0% round on a model that never answered once, with model and provider null.
+  const reached = i.results.filter((r) => Number(r.turns) > 0 || String(r.ended ?? "").startsWith("model:"));
+  if (!provider.provider && reached.length) {
+    return { ok: false, why: `${reached.length} row(s) reached the agent and none has a provider: the model never answered (first: ${String(reached[0].ended).slice(0, 80)})` };
+  }
   const tools: Record<string, number> = {};
   for (const r of i.results) for (const [n, c] of Object.entries(r.byTool ?? {})) tools[n] = (tools[n] ?? 0) + (c as number);
   const engines = new Set(i.results.map((r) => r.engine).filter(Boolean));

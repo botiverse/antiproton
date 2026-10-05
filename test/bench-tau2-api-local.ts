@@ -115,11 +115,14 @@ function agentReply(messages: any[]) {
   return { content: "Your order #W1 is cancelled." };
 }
 const realFetch = globalThis.fetch;
+/** When on, the provider refuses every call, as a gateway does with a wrong or expired token. */
+const providerRefuses = { on: false };
 globalThis.fetch = (async (input: any, init?: RequestInit) => {
   const url = String(input?.url ?? input);
   if (!/api\.deepseek\.com|gateway\.ai\.cloudflare\.com/.test(url)) return realFetch(input, init);
   const body = JSON.parse(String(init?.body ?? (await (input as Request).text())));
   asked.push({ host: new URL(url).host, model: body.model, system: String(body.messages?.[0]?.content ?? ""), tools: body.tools ?? [] });
+  if (providerRefuses.on) return Response.json({ error: { message: "invalid token", type: "invalid_request_error", code: "invalid_api_key" } }, { status: 401 });
   const message: { role: string; content: string | null; tool_calls?: unknown[] } = { role: "assistant", ...agentReply(body.messages) };
   return Response.json({
     id: "x", object: "chat.completion", model: body.model,
@@ -289,6 +292,23 @@ await check("MODEL=no-such-model: the run stops before task 1, writes no record,
     try { await r.runClient.v1("GET", "/agents"); } catch (e) { revoked = /no API key/.test(String(e)); }
     must(revoked, "the run's key was left live");
     must((await observer.v1All("/agents")).length === 0, "an agent was left in the index");
+  } finally { r.done(); }
+});
+
+await check("every model call refused at the provider (a bad token): the rows end `model: …`, and the run exits non-zero with no record", async () => {
+  const before = asked.length;
+  providerRefuses.on = true;
+  let r: Awaited<ReturnType<typeof wholeRun>> | null = null;
+  try {
+    r = await wholeRun("default");
+  } finally { providerRefuses.on = false; }
+  try {
+    // The preflight passed (making an agent calls no model); the provider was asked, and refused.
+    must(asked.length > before, "the provider was never called");
+    must(r.out.code !== 0 && r.out.record === null && /none has a provider/.test(String(r.out.why)), show(r.out));
+    // The run had begun, so its directory exists (with the log that says why, when it is teed); no record in it.
+    must(r.files.length === 0, `a record was written: ${show(r.files)}`);
+    must((await observer.v1All("/agents")).length === 0, "the run left agents in the index");
   } finally { r.done(); }
 });
 
