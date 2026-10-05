@@ -125,6 +125,7 @@
     "test/plugin-unmount.ts",
     "test/bench-pd.ts",
     "test/bench-swe.ts",
-    "test/bench-swe-grade.ts"
+    "test/bench-swe-grade.ts",
+    "test/client-tool-alarms.ts"
   ]
 }
