@@ -4234,16 +4234,16 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
               defaultModel: env.HARNESS_MODEL,
               now: Date.now,
             });
-          // A refusal (409 locked, 422 unknown id) stays the handler's JSON
-          // {error: {code, message}}: the page's write-error banner reads
-          // .error.message and speaks it under the form. Anything the picker
-          // asked for with hx-request renders the block.
           // A stored pick is bound at once (AgentDO.rebindModel), so whatever starts the agent's next turn runs
           // on it. Not the request's failure: the pick is stored, and a page open or a message binds it anyway.
           if (answered.ok && request.method === "POST") {
             await env.AGENT.get(env.AGENT.idFromName(agentObjectName(gate.tenantId, agentId))).rebindModel(gate.tenantId, agentId)
               .catch((e: unknown) => console.warn(`rebinding ${agentId} after a pick failed: ${String((e as Error)?.message ?? e).slice(0, 200)}`));
           }
+          // A refusal (409 locked, 422 unknown id) stays the handler's JSON
+          // {error: {code, message}}: the page's write-error banner reads
+          // .error.message and speaks it under the form. Anything the picker
+          // asked for with hx-request renders the block.
           if (!answered.ok || !request.headers.get("hx-request")) return answered;
           const data = await answered.json();
           return new Response(agentModelBlock(data as Parameters<typeof agentModelBlock>[0]), {
