@@ -31,7 +31,7 @@ import {
   apiRunRecord, exactFigures, kindsOf, ledgerModels, rowFigures, runnerMethodOf, runProvider, taskProvider, type ModelsList,
 } from "../bench/tau2/api-record.ts";
 import { beginRun, recordRun } from "../bench/record.ts";
-import { SIM, simEnding, simSystem } from "../bench/tau2/episode.ts";
+import { MAX_TURNS, OPENING, SIM, simEnding, simSystem } from "../bench/tau2/episode.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => void | Promise<void>) {
@@ -94,7 +94,8 @@ await check("the functions are the retail tools under `retail__`, each with its 
   const fns = retailFunctions();
   must(fns.length === 16 && fns.every((f) => f.type === "function" && f.name.startsWith(RETAIL_PREFIX) && /^[A-Za-z0-9_-]{1,64}$/.test(f.name)), show(fns.map((f) => f.name)));
   const order = fns.find((f) => f.name === "retail__get_order_details")!;
-  must(order.description === "Get the status and details of an order." && /'#' symbol/.test(show(order.parameters)), show(order));
+  must(order.description === "Get the status and details of an order. A result over 32 KB comes back as a summary (preview); the rest is discarded."
+    && /'#' symbol/.test(show(order.parameters)), show(order));
 });
 
 await check("a read runs on the task's database and answers the plugin's value as JSON; a write changes that database and is logged", async () => {
@@ -125,6 +126,15 @@ await check("the customer both runners simulate: guidelines then scenario, and t
   must(simSystem(task, "G") === "G\n\n# Your scenario\nStyle: terse\nWhy you are contacting support: cancel\nWhat you know: email\nWhat you do NOT know: id", show(simSystem(task, "G")));
   must(simEnding({ text: "ok ###TRANSFER###" }) === "transfer" && simEnding({ text: " ", finishReason: "length" }) === "sim_empty (length)" && simEnding({ text: "hi" }) === null, "endings");
   must(show(SIM) === '{"maxTokens":8192,"reasoning":"low"}', show(SIM));
+});
+
+await check("the series' constants, as the `/bench` runner has always run them: 14 customer turns, the opening line, the three stop tags", () => {
+  must(MAX_TURNS === 14, `MAX_TURNS is ${MAX_TURNS}`);
+  must(OPENING === "Hi! How can I help you today?", show(OPENING));
+  for (const [tag, ended] of [["###STOP###", "stop"], ["###TRANSFER###", "transfer"], ["###OUT-OF-SCOPE###", "out-of-scope"]]) {
+    must(simEnding({ text: `Bye. ${tag}` }) === ended, `${tag}: ${simEnding({ text: `Bye. ${tag}` })}`);
+  }
+  for (const other of ["###DONE###", "###END###", "STOP", "###stop###"]) must(simEnding({ text: `Bye. ${other}` }) === null, `${other} ended the conversation`);
 });
 
 // ---- decisions ------------------------------------------------------------------
@@ -273,14 +283,17 @@ await check("provider: the ledger's model, at the endpoint of the provider the a
   must(show(taskProvider("deepseek-flash", ["deepseek-flash"], MODELS)) === show({ ok: true, provider: { name: "deepseek-flash", endpoint: "api.deepseek.com" } }), "flash");
   // An admin's model reads as <provider>/<model> (cf/src/agents-api/model.ts modelName).
   must(show(taskProvider("deepseek/deepseek-v4-pro", ["deepseek-v4-pro"], MODELS)) === show({ ok: true, provider: { name: "deepseek-v4-pro", endpoint: "api.deepseek.com" } }), "admin's");
-  must(show(taskProvider("gpt-5.6-luna", [], MODELS)) === show({ ok: true, provider: null }), "no model call");
+  must(show(taskProvider("gpt-5.6-luna", [], MODELS, 0)) === show({ ok: true, provider: null }), "no model call");
 });
 
-await check("provider: refused when the ledger disagrees with the agent, holds two models, or the agent's model names nothing listed", () => {
+await check("provider: refused when the ledger disagrees with the agent, holds two models, is empty after model calls, or the agent's model names nothing listed", () => {
   const luna = taskProvider("gpt-5.6-luna", ["deepseek-flash"], MODELS);
   must(!luna.ok && /gpt-5.6-luna.*deepseek-flash/.test(luna.why), show(luna));
   const two = taskProvider("deepseek-flash", ["deepseek-flash", "openai/gpt-5.6-luna"], MODELS);
   must(!two.ok && /2 models/.test(two.why), show(two));
+  // Calls made and nothing in the ledger: usage not arrived or lost, never "no model".
+  const empty = taskProvider("gpt-5.6-luna", [], MODELS, 3);
+  must(!empty.ok && /3 model call/.test(empty.why), show(empty));
   const unknown = taskProvider("gpt-6", ["gpt-6"], MODELS);
   must(!unknown.ok, show(unknown));
   must(!taskProvider("gpt-5.6-luna", ["openai/gpt-5.6-luna"], { providers: MODELS.providers }).ok, "an option id resolved with no options listed");

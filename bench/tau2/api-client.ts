@@ -10,6 +10,13 @@
  */
 import { sseEvents, type SessionEvent } from "./api-turn.ts";
 
+/** A non-2xx answer: the status and the parsed body, so a caller can tell a refused model from a broken request. */
+export class ApiError extends Error {
+  readonly status: number;
+  readonly body: any;
+  constructor(message: string, status: number, body: any) { super(message); this.status = status; this.body = body; }
+}
+
 export type Fetch = (url: string, init?: RequestInit) => Promise<Response>;
 
 export interface ApiClient {
@@ -40,7 +47,11 @@ export function apiClient(o: { base: string; harnessToken: string; fetch?: Fetch
       signal: timeout(),
     });
     const text = await r.text();
-    if (!r.ok) throw new Error(`${method} ${path} → ${r.status}: ${text.slice(0, 300)}`);
+    if (!r.ok) {
+      let body: any = null;
+      try { body = JSON.parse(text); } catch { /* not JSON: the message carries the text */ }
+      throw new ApiError(`${method} ${path} → ${r.status}: ${text.slice(0, 300)}`, r.status, body);
+    }
     return text ? JSON.parse(text) : null;
   }
   const bearer = () => {

@@ -21,7 +21,7 @@ import { apiStallAtDeadline, waitForTurn, type Delivered, type Snapshot } from "
 import {
   exactFigures, kindsOf, ledgerModels, rowFigures, taskProvider, type ModelsList, type Provider, type TranscriptEvent,
 } from "./api-record.ts";
-import type { ApiClient } from "./api-client.ts";
+import { ApiError, type ApiClient } from "./api-client.ts";
 import type { StallEvidence } from "../poll-fallback.ts";
 import type { Activity } from "../objects.ts";
 
@@ -49,33 +49,84 @@ export interface ApiTaskDeps {
   /** IGNORE_ANSWERS, for when deafness is spent (bench/tau2/cf.ts does the same). */
   deafSetting?: "socket" | "all";
   say?(line: string): void;
+  /** The `/v1` paths of the agents and sessions this run has made and not yet deleted, for an interrupt. */
+  live?: Set<string>;
 }
 
-/** Thrown when a task's provider cannot be vouched for: the run stops rather than record a model it did not run. */
-export class ProviderRefusal extends Error {}
+/**
+ * Thrown when the run cannot say truthfully which model it ran: the deployment refused the model, made the agent
+ * on another, or the ledger cannot vouch for it. The run stops and writes no record (bench/tau2/api-run.ts),
+ * rather than recording error rows or a model it did not run.
+ */
+export class RunRefusal extends Error {}
 
 const zero = (): Delivered => ({ push: 0, poll: 0, pollAnswered: 0, pollFailed: 0, dropped: 0 });
 
+/**
+ * Make an agent the way every task does. A refusal of the model (400 `model_not_found`, 409 `model_locked`,
+ * cf/src/agents-api/model.ts) is a `RunRefusal`: every other task would be refused the same way, and their
+ * error rows would make a record of nothing. Registered in `live` as soon as it exists, so an interrupt can
+ * delete it (`deleteLive`).
+ */
+async function makeAgent(d: ApiTaskDeps): Promise<{ id: string; model: string }> {
+  let agent: any;
+  try {
+    // `name: ""`, not null: a null name is given a generated one, and "You are <name>." would then come before
+    // the policy in the system prompt (cf/src/index.ts #apiPersona, src/runtime/pi-prompt.ts personaSection),
+    // a line the `/bench` agent's prompt never had. An empty name adds nothing, so the policy is first.
+    agent = await d.client.v1("POST", "/agents", { model: d.model, name: "", instructions: d.policy, tools: d.tools });
+  } catch (e) {
+    const err = e instanceof ApiError ? e.body?.error : null;
+    if (err && (err.param === "model" || /^model_/.test(String(err.code ?? "")))) {
+      throw new RunRefusal(`the deployment refused MODEL=${d.model}: ${err.code}: ${String(err.message ?? "").slice(0, 200)}`);
+    }
+    throw e;
+  }
+  d.live?.add(`/agents/${agent.id}`);
+  return { id: String(agent.id), model: String(agent.model) };
+}
+
+/** The model the agent reads as must be the one asked for; anything else is a run on a model nobody chose. */
+function checkModel(d: ApiTaskDeps, made: { model: string }) {
+  if (d.model !== "default" && made.model !== d.model) throw new RunRefusal(`asked for ${d.model}, the agent was made on ${made.model}`);
+}
+
+async function remove(d: ApiTaskDeps, path: string) {
+  await d.client.v1("DELETE", path).then(() => d.live?.delete(path),
+    (e) => d.say?.(`      (could not delete ${path}: ${(e as Error).message.slice(0, 120)})`));
+}
+
+/** Delete whatever a run still has in the API's index: sessions first, then agents. For an interrupt. */
+export async function deleteLive(client: ApiClient, live: Set<string>): Promise<void> {
+  for (const path of [...live].sort((a, b) => Number(b.includes("/sessions/")) - Number(a.includes("/sessions/")))) {
+    await client.v1("DELETE", path).then(() => live.delete(path), () => {});
+  }
+}
+
+/**
+ * Before task 1: make an agent on MODEL and delete it, so a model the deployment refuses, or replaces, stops the
+ * run before any task has run or any file is written.
+ */
+export async function preflight(d: ApiTaskDeps): Promise<void> {
+  const made = await makeAgent(d);
+  try { checkModel(d, made); } finally { await remove(d, `/agents/${made.id}`); }
+}
+
 export async function runApiTask(task: any, d: ApiTaskDeps) {
   const t0 = Date.now();
-  const c = d.client;
-  // `name: ""`, not null: a null name is given a generated one, and "You are <name>." would then come before
-  // the policy in the system prompt (cf/src/index.ts #apiPersona, src/runtime/pi-prompt.ts personaSection),
-  // a line the `/bench` agent's prompt never had. An empty name adds nothing, so the policy is first.
-  const agent = await c.v1("POST", "/agents", { model: d.model, name: "", instructions: d.policy, tools: d.tools });
-  if (d.model !== "default" && agent.model !== d.model) {
-    throw new ProviderRefusal(`asked for ${d.model}, the agent was made on ${agent.model}`);
-  }
-  const agentId = String(agent.id);
+  const made = await makeAgent(d);
+  const agentId = made.id;
   let sessionId = "";
   try {
-    const session = await c.v1("POST", "/agents/sessions", { agent_id: agentId, environment: { type: "none" } });
+    checkModel(d, made);
+    const session = await d.client.v1("POST", "/agents/sessions", { agent_id: agentId, environment: { type: "none" } });
     sessionId = String(session.id);
+    d.live?.add(`/agents/sessions/${sessionId}`);
     return await converse(task, d, t0, agentId, sessionId);
   } finally {
     // The objects keep their transcripts either way; what goes is the API's index of them.
-    if (sessionId) await c.v1("DELETE", `/agents/sessions/${sessionId}`).catch((e) => d.say?.(`      (could not delete ${sessionId}: ${(e as Error).message.slice(0, 120)})`));
-    await c.v1("DELETE", `/agents/${agentId}`).catch((e) => d.say?.(`      (could not delete ${agentId}: ${(e as Error).message.slice(0, 120)})`));
+    if (sessionId) await remove(d, `/agents/sessions/${sessionId}`);
+    await remove(d, `/agents/${agentId}`);
   }
 }
 
@@ -161,16 +212,16 @@ async function converse(task: any, d: ApiTaskDeps, t0: number, agentId: string, 
   const final = await snapshot();
   const figures = rowFigures(final.items, final.turns);
   const owner = `tenantId=${encodeURIComponent(d.tenantId)}&agentId=${encodeURIComponent(agentId)}`;
-  const transcript: { events?: TranscriptEvent[] } | null = await c.operator(`/admin/transcript?${owner}&taskId=${encodeURIComponent(sessionId)}`)
-    .catch((e) => { d.say?.(`      (no transcript: ${(e as Error).message.slice(0, 120)})`); return null; });
-  const kinds = transcript?.events ? kindsOf(transcript.events) : null;
-  if (transcript?.events) {
-    // The derivation from items, against the computation `/bench/result` made over the same entries.
-    const exact = exactFigures(transcript.events);
-    if (canon(exact) !== canon(figures)) d.say?.(`      items and entries disagree: items ${JSON.stringify(figures)} entries ${JSON.stringify(exact)}`);
-  }
+  // A transcript that cannot be read fails the row, as a `/bench/result` that could not be read did in the
+  // `/bench` runner: `{}` would read as "nothing happened", which the record would then state as a fact.
+  const transcript: { events?: TranscriptEvent[] } = await c.operator(`/admin/transcript?${owner}&taskId=${encodeURIComponent(sessionId)}`);
+  if (!Array.isArray(transcript?.events)) throw new Error("/admin/transcript answered without events");
+  const kinds = kindsOf(transcript.events);
+  // The derivation from items, against the computation `/bench/result` made over the same entries.
+  const exact = exactFigures(transcript.events);
+  if (canon(exact) !== canon(figures)) d.say?.(`      items and entries disagree: items ${JSON.stringify(figures)} entries ${JSON.stringify(exact)}`);
   const activity: Activity | null = await c.operator(`/agent/activity?${owner}`).catch(() => null);
-  const provider = await providerOf(d, agentId, t0, conversationEnded);
+  const provider = await providerOf(d, agentId, t0, conversationEnded, figures.usage.calls);
 
   const object = `api:${d.tenantId}/${agentId}`;
   return {
@@ -194,7 +245,7 @@ async function converse(task: any, d: ApiTaskDeps, t0: number, agentId: string, 
  * usage on its next alarm pass, so the read waits until the ledger speaks for the time the conversation
  * ended (`asOf`, cf/src/agent-surface/usage.ts), and reads what is there if it never does.
  */
-async function providerOf(d: ApiTaskDeps, agentId: string, t0: number, ended: number): Promise<Provider | null> {
+async function providerOf(d: ApiTaskDeps, agentId: string, t0: number, ended: number, calls: number): Promise<Provider | null> {
   const from = new Date(t0 - 60_000).toISOString(), until = Date.now() + (d.ledgerWaitMs ?? 60_000);
   let usage: any = null;
   for (;;) {
@@ -204,9 +255,9 @@ async function providerOf(d: ApiTaskDeps, agentId: string, t0: number, ended: nu
     await new Promise((r) => setTimeout(r, 2_000));
   }
   // Unreadable is not empty: a ledger that could not be asked cannot say the agent ran on nothing.
-  if (!usage) throw new ProviderRefusal(`agent ${agentId}: its usage could not be read, so its provider cannot be vouched for`);
+  if (!usage) throw new RunRefusal(`agent ${agentId}: its usage could not be read, so its provider cannot be vouched for`);
   const agent = await d.client.v1("GET", `/agents/${agentId}`);
-  const p = taskProvider(String(agent.model), ledgerModels(usage), d.models);
-  if (!p.ok) throw new ProviderRefusal(`agent ${agentId}: ${p.why}`);
+  const p = taskProvider(String(agent.model), ledgerModels(usage), d.models, calls);
+  if (!p.ok) throw new RunRefusal(`agent ${agentId}: ${p.why}`);
   return p.provider;
 }

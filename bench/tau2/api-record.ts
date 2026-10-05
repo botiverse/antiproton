@@ -58,13 +58,15 @@ export interface TranscriptEvent { sequence: number; kind: string; payload?: any
 /**
  * The events `/bench/result` counted, out of what `/admin/transcript` answers for the session.
  *
- * Both project the object's entries with the same function (cf/src/pi-view.ts `entriesToEvents`), but the
- * operator's read differs in two ways that would make the counts disagree for reasons unrelated to the agent:
- *   - It reads every entry, not the branch the model's context is built from. A caller's function pauses its
- *     turn by recording a placeholder result and resumes on a new branch from the call (src/runtime/
- *     client-calls.ts), so every call has its placeholder off the branch as well as its real result on it.
- *     One result per call is kept: the last, which is the one on the branch.
- *   - It adds runs that failed before their first model call, from the engine's outcome records (cf/src/
+ * Both project every entry of the conversation with the same function (cf/src/pi-view.ts `entriesToEvents`;
+ * `/bench/result` read them with `scanEntries`, the operator's route with `readEntries`), but two things make
+ * the counts disagree for reasons unrelated to the agent:
+ *   - Entries off the branch the model's context is built from. The `/bench` agent never had any: its tools ran
+ *     inside the step. A caller's function pauses its turn by recording a placeholder result and resumes on a
+ *     new branch from the call (src/runtime/client-calls.ts), so every call here has its placeholder off the
+ *     branch as well as its real result on it. One result per call is kept: the last, which is the one on the
+ *     branch.
+ *   - The operator's route adds runs that failed before their first model call, from the engine's outcome records (cf/src/
  *     engine-read.ts `readFailedRuns`), as `model.failed` events carrying an `operationId`. `/bench/result`
  *     never counted those; they are left out here too, so `kinds` stays the same count.
  */
@@ -147,11 +149,17 @@ export type Provider = { name: string; endpoint: string };
  * agent's own model names. The two are checked against each other, and a disagreement is a refusal: a row
  * that says "this ran on Luna" must not rest on a request when the ledger says otherwise.
  *
- * A ledger with nothing in it (the customer ended before the agent ran) is no provider and no refusal.
+ * An empty ledger is no provider only when the transcript shows no model call (`calls`, the row's
+ * `usage.calls`): the customer ended before the agent ran. With calls made, an empty ledger is usage that has
+ * not arrived or was lost, not evidence of no model, and it is refused like any other ledger that cannot vouch.
  */
-export function taskProvider(agentModel: string, ledger: readonly string[], list: ModelsList):
+export function taskProvider(agentModel: string, ledger: readonly string[], list: ModelsList, calls = 0):
   { ok: true; provider: Provider | null } | { ok: false; why: string } {
-  if (ledger.length === 0) return { ok: true, provider: null };
+  if (ledger.length === 0) {
+    return calls > 0
+      ? { ok: false, why: `the agent made ${calls} model call(s) and the ledger shows none, so its provider cannot be vouched for` }
+      : { ok: true, provider: null };
+  }
   if (ledger.length > 1) return { ok: false, why: `the ledger counted this agent's tokens under ${ledger.length} models: ${ledger.join(", ")}` };
   const resolved = resolveApiModel(agentModel, list);
   if (!resolved) return { ok: false, why: `the agent's model ${JSON.stringify(agentModel)} names no option or provider /admin/models lists, so the ledger's ${ledger[0]} cannot be checked against it` };

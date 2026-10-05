@@ -8,21 +8,33 @@
  *
  * What the model is shown has to be what the `/bench` object showed it, or the comparison between the two
  * runners measures a different catalogue. So the names are the mount-qualified ones the gateway built for the
- * `retail` mount, `retail__<tool>`, the descriptions are the tools' summaries, and the parameters are the
- * same objects; test/bench-tau2-api.ts holds this list byte-equal to the gateway's own construction
- * (cf/src/runtime.ts `mountedToolEntries`, src/runtime/pi-tools.ts `qualifyMountedTools`).
+ * `retail` mount, `retail__<tool>`; each description is the tool's summary followed by the sentence the
+ * runtime appends to every mounted tool (`LIMIT_NOTE`); and the parameters are the same objects.
+ * test/bench-tau2-api-local.ts holds this list byte-equal to the gateway's own construction (cf/src/runtime.ts
+ * `mountedToolEntries`, `withLimitNote`; src/runtime/pi-tools.ts `qualifyMountedTools`) and to what the provider
+ * is handed on this path.
  */
 import { retailPlugin, type RetailDB } from "./retail.ts";
 
 /** The alias the `/bench` object mounted the domain under, and so the prefix of every name the model saw. */
 export const RETAIL_PREFIX = "retail__";
 
+/**
+ * The sentence the runtime appends to a mounted tool's description when no reader of parked results is
+ * mounted, as on the `/bench` object (cf/src/runtime.ts `withLimitNote` with no reader, at its 32 KB line).
+ * Restated rather than imported: that module is the Worker's and does not load under node, where this runner
+ * runs. A caller's function is not given it by the runtime, so without it here every retail description
+ * would be one sentence shorter than on the `/bench` path. Whether the sentence holds for a function's result
+ * on this path — the runtime does not park those — does not change what the model reads, which is the point.
+ */
+export const LIMIT_NOTE = " A result over 32 KB comes back as a summary (preview); the rest is discarded.";
+
 export interface FunctionTool { type: "function"; name: string; description: string; parameters: unknown }
 
 /** The function tools an agent is created with. */
 export function retailFunctions(): FunctionTool[] {
   return retailPlugin({ products: {}, users: {}, orders: {} } as RetailDB, []).tools.map((t) => ({
-    type: "function", name: `${RETAIL_PREFIX}${t.name}`, description: t.summary, parameters: t.parameters,
+    type: "function", name: `${RETAIL_PREFIX}${t.name}`, description: `${t.summary}${LIMIT_NOTE}`, parameters: t.parameters,
   }));
 }
 
