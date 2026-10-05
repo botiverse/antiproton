@@ -718,13 +718,23 @@ await check("the colo's cache serves a route another isolate read, with no index
   } finally { delete (globalThis as any).caches; }
 });
 
-/** An invocation's `waitUntil`, as the worker's `fetch` is handed it: every promise it was given, and how each ended. */
+/**
+ * An invocation's `waitUntil`, as the worker's `fetch` is handed it: every promise it was given, and how each ended.
+ * Called other than as a method of its context it throws, as workerd's does ("Illegal invocation"), so a caller
+ * that detaches it (`const defer = ctx.waitUntil`) fails here as it would in production.
+ */
 function invocation() {
   const waited: Array<{ state: "open" | "resolved" | "rejected" }> = [];
-  return {
-    waited,
-    ctx: { waitUntil(p: Promise<unknown>) { const e = { state: "open" as "open" | "resolved" | "rejected" }; waited.push(e); p.then(() => { e.state = "resolved"; }, () => { e.state = "rejected"; }); }, passThroughOnException() {} },
+  const ctx = {
+    waitUntil(this: unknown, p: Promise<unknown>) {
+      if (this !== ctx) throw new TypeError("Illegal invocation: waitUntil called without its context as `this`");
+      const e = { state: "open" as "open" | "resolved" | "rejected" };
+      waited.push(e);
+      p.then(() => { e.state = "resolved"; }, () => { e.state = "rejected"; });
+    },
+    passThroughOnException() {},
   };
+  return { waited, ctx };
 }
 /** A push through the worker with an invocation context; null if no answer came within `ms`. */
 async function pushIn(w: World, id: string, ctx: unknown, ms = 3000) {
@@ -790,6 +800,44 @@ await check("a route filled into the colo's cache through waitUntil still refuse
     must(lines.find((l) => l.evt === "http")?.lookup === "index-again", `lookup: ${show(lines.find((l) => l.evt === "http"))}`);
     must([...store.keys()].length === 0, "the revoked hook's route is still in the colo's cache");
     must(outcomes(w).length === before, `the revoked push left a record: ${show(outcomes(w))}`);
+  } finally { delete (globalThis as any).caches; }
+});
+
+await check("a cached route its object disowns is read again from the index, and that cache write is handed to waitUntil too", async () => {
+  // A stale route in the colo's cache names an object that has no secret for the hook; the hook is still live in the index.
+  const stale = { route: { hookId: "", tenantId: T, agentId: "b", alias: "p" }, until: Date.now() + 60_000 };
+  const store = new Map<string, string>();
+  const puts = { n: 0 };
+  (globalThis as any).caches = { default: {
+    async match(r: Request) { const v = store.get(r.url); return v ? new Response(v) : undefined; },
+    put(_r: Request, _res: Response) { puts.n++; return new Promise<void>(() => {}); },
+    async delete(r: Request) { return store.delete(r.url); },
+  } };
+  try {
+    const w = await world();
+    stale.route.hookId = w.hookId;
+    store.set(`https://x/__hook-route/${w.hookId}`, JSON.stringify(stale));
+    const real = w.env.AGENT as { idFromName(n: string): string; get(n: string): unknown };
+    const asked: string[] = [];
+    w.env.AGENT = {
+      idFromName: real.idFromName,
+      get: (n: string) => {
+        asked.push(n);
+        // The stale route's object: no secret for this hook, so it answers as `receiveHook` does for a cache-routed push.
+        return n === agentObjectName(T, "b") ? { hookReceive: async () => ({ outcome: "failed", unrouted: true }) } : real.get(n);
+      },
+    };
+    const { ctx, waited } = invocation();
+    lines.length = 0;
+    const started = Date.now();
+    const a = await pushIn(w, "again-1", ctx);
+    must(a !== null, "no answer within 3 s: the push waited on the cache write after the second index read");
+    must(a.status === 202 && a.body === '{"outcome":"delivered"}', `answer ${show(a)}`);
+    must(Date.now() - started < 1000, `answered in ${Date.now() - started} ms`);
+    must(show(asked) === show([agentObjectName(T, "b"), agentObjectName(T, A)]), `control: objects asked ${show(asked)}`);
+    must(lines.find((l) => l.evt === "http")?.lookup === "index-again", `control: lookup ${show(lines.find((l) => l.evt === "http"))}`);
+    must(!store.has(`https://x/__hook-route/${w.hookId}`), "control: the stale route is still in the colo's cache");
+    must(puts.n === 1 && waited.length === 1 && waited[0]!.state === "open", `${puts.n} cache writes, waitUntil was handed ${show(waited)}`);
   } finally { delete (globalThis as any).caches; }
 });
 
