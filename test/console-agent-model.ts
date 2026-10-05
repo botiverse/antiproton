@@ -42,6 +42,8 @@ check("the selector posts the choice on change, and default is the way back", ()
     effective: { label: "GPT-5.6 Luna", provider: "openai", model: "gpt-5.6-luna", source: "owner" } });
   must(/<select name="choice" hx-post="\/ui\/agent\/model"[^>]*hx-trigger="change"/.test(html.replace(/\n/g, " ")),
     "choosing posts the choice");
+  must(/<form class="model-choice" hx-post="\/ui\/agent\/model">[\s\S]*<select name="choice"/.test(html),
+    "the select sits in a form so the page's write-error banner can speak a refusal (409 locked, 422 unknown)");
   must(/<option value="default">deployment default<\/option>/.test(html), "the default is an explicit option — going back is a choice, not a deletion");
   must(/<option value="openai\/gpt-5\.6-luna" selected>GPT-5\.6 Luna<\/option>/.test(html), "the owner pick is the selected one");
   const none = agentModelBlock({ ...base, effective: { label: "DeepSeek Flash", provider: "deepseek", model: "deepseek-flash", source: "default" } });

@@ -2096,8 +2096,10 @@ export function agentModelBlock(d: {
   ].join("");
   return `<div class="card">
   <div class="state"><b>${esc(d.effective.label)}</b><span class="sub">${esc(d.effective.provider)}</span>${source}</div>
-  <label><span>model</span>
-    <select name="choice" hx-post="/ui/agent/model" hx-target="closest .card" hx-swap="outerHTML" hx-trigger="change"${d.locked ? " disabled" : ""}>${opts}</select></label>
+  <form class="model-choice" hx-post="/ui/agent/model">
+    <label><span>model</span>
+      <select name="choice" hx-post="/ui/agent/model" hx-target="closest .card" hx-swap="outerHTML" hx-trigger="change"${d.locked ? " disabled" : ""}>${opts}</select></label>
+  </form>
   ${d.locked
     ? `<div class="hint" style="padding-top:4px">an admin chose this agent's model; it changes here only when the admin lifts the override</div>`
     : `<div class="hint" style="padding-top:4px">your choice takes effect the next time the agent runs</div>`}
