@@ -2095,6 +2095,10 @@ export class AgentDO extends DurableObject<Env> {
       const rt = this.runtime();
       const r = await rt.receiveHook(tenantId, agentId, alias, hookId, event, routed);
       if (r.outcome === "delivered") await this.#wake();
+      // A duplicate wakes too when something is queued and no alarm is armed: the call that queued the original
+      // can be cut off between its row and its wake (a worker that stopped waiting, #783), and the retry is then
+      // the only knock that comes. Never with an alarm armed, so a row waiting out its retry is not pulled early.
+      else if (r.outcome === "duplicate" && hasPendingInbound(this.sql as any) && (await this.ctx.storage.getAlarm()) === null) await this.#wake();
       return { ...r, path: "deferred" as const, ms: Date.now() - started };
     });
   }
@@ -3087,7 +3091,8 @@ async function inboundHook(request: Request, env: Env, url: URL, ctx?: Pick<Exec
     const fields = { doId, hook: hookId.slice(0, 8), limitMs, elapsedMs: Date.now() - objectStarted };
     logEvent("hook.timeout", { ...fields, outcome: "503" });
     // Deliberately kept alive past the answer: the object may be slow rather than dead, and a push it lands now
-    // is a wake the agent gets sooner. Not made safe by deduplication: a sender may retry with a different
+    // is a wake the agent gets sooner. `waitUntil` lives about 30 s past the answer, so a call to an object that
+    // cannot start is cut off then and logs nothing: `hook.timeout` with no `hook.late` reads as a cut-off call. Not made safe by deduplication: a sender may retry with a different
     // delivery id (Raft resends its latest notice, merged since), so both can reach the agent. A Raft notice is
     // only a wake to read the inbox, whose reads are acknowledged by cursor, so the second costs one inbox read
     // that finds nothing new. A retry with the same id is still a `duplicate` (`seenBefore`).

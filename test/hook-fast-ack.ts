@@ -874,7 +874,8 @@ await check("a route is held for an hour: served without the index just inside i
  * (Infinity: never), as an object that cannot start holds every call; everything else is the real object.
  */
 function slowObject(w: World) {
-  const hold = { ms: 0 };
+  // `next`, when non-empty, holds the next calls in turn (one entry each) before `ms` applies again.
+  const hold = { ms: 0, next: [] as number[] };
   const realGet = (w.env.AGENT as { get: (n: string) => any }).get;
   w.env.AGENT = {
     idFromName: (n: string) => n,
@@ -883,8 +884,9 @@ function slowObject(w: World) {
       return new Proxy(real, { get(target, prop) {
         if (prop !== "hookReceive") { const v = target[prop]; return typeof v === "function" ? v.bind(target) : v; }
         return async (...args: unknown[]) => {
-          if (hold.ms === Infinity) return new Promise(() => {});
-          await sleep(hold.ms);
+          const ms = hold.next.length ? hold.next.shift()! : hold.ms;
+          if (ms === Infinity) return new Promise(() => {});
+          await sleep(ms);
           return target.hookReceive(...args);
         };
       } });
@@ -934,6 +936,41 @@ await check("a timeout is never a 202: a push with a bad signature, or for a rev
   const revoked = await push(w, "t3", "REVOKED");
   must(revoked.status === 503 && revoked.retryAfter === "5", `revoked, cached route: ${show(revoked)}`);
   must(pendingRows(w) === 1, `queued ${pendingRows(w)} (the warm push only)`);
+});
+
+await check("the limit bounds the re-route too: a fast first call that disowns a cached route, then a second call that never answers, is answered 503 at the limit", async () => {
+  const w = await world();
+  w.env.HOOK_OBJECT_TIMEOUT_MS = String(LIMIT_MS);
+  const hold = slowObject(w);
+  must((await push(w, "warm", "WARM")).status === 202, "warming the route");
+  // The secret gone while the index row stays: the cached route's call answers `unrouted`, and the worker asks again.
+  must(await w.D.hookDropSecret(T, A, w.hookId), "dropping the secret");
+  hold.next = [0, Infinity];
+  lines.length = 0;
+  const started = Date.now();
+  const r = await push(w, "rr", "REROUTED");
+  const took = Date.now() - started;
+  must(hold.next.length === 0, `the object was called ${2 - hold.next.length} of 2 times`);
+  must(r.status === 503 && r.retryAfter === "5" && r.body === '{"outcome":"unavailable"}', `answer: ${show(r)}`);
+  must(took >= LIMIT_MS && took < LIMIT_MS + 1000, `answered after ${took} ms with a ${LIMIT_MS} ms limit`);
+  const http = lines.find((l) => l.evt === "http" && l.route === "/hooks/:hook");
+  must(http?.timedOut === true && http.lookup === "index-again", `http line: ${show(http)}`);
+});
+
+await check("a duplicate wakes an object with something queued and no alarm armed (the original's wake was cut off), and leaves an armed alarm where it is", async () => {
+  const w = await world();
+  must((await push(w, "q1", "QUEUED-ONLY")).status === 202, "first");
+  await (w.D as any).ctx.storage.deleteAlarm();
+  must(pendingRows(w) === 1 && w.alarmAt() === null, `control: ${pendingRows(w)} queued, alarm ${w.alarmAt()}`);
+  const again = await push(w, "q1", "QUEUED-ONLY");
+  must(again.status === 202 && again.body === '{"outcome":"duplicate"}', `retry: ${show(again)}`);
+  must(w.alarmAt() !== null && w.alarmAt()! <= Date.now(), `the duplicate did not wake it: alarm ${w.alarmAt()}`);
+  const later = Date.now() + 60_000;
+  await (w.D as any).ctx.storage.setAlarm(later);
+  must((await push(w, "q1", "QUEUED-ONLY")).body === '{"outcome":"duplicate"}', "third");
+  must(w.alarmAt() === later, `an armed alarm was moved: ${w.alarmAt()} not ${later}`);
+  await settle(w, 1);
+  must(await timesAsked(w, "QUEUED-ONLY") === 1, `asked ${await timesAsked(w, "QUEUED-ONLY")} times`);
 });
 
 await check("an object that answers within the limit answers exactly as before: 202, 401, 400, 429 with its Retry-After, 404, and no timeout line", async () => {
