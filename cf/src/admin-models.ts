@@ -3,7 +3,7 @@
  * agent (0013_model_overrides.sql, 0014_model_override_provider.sql). For the admin area of the console; the
  * caller has already been found to be an admin (auth.ts isAdmin), and this decides nothing about who.
  *
- *   GET                                          → { default: { provider, model, endpoint }, providers: [...], overrides: [...] }
+ *   GET                                          → { default: { provider, model, endpoint }, providers: [...], options: [...], overrides: [...] }
  *   PUT    { scope, tenantId?, agentId?, provider?, model }  → the row as kept
  *   DELETE { scope, tenantId?, agentId? }                    → 204, or 404 when there was none
  *
@@ -14,6 +14,7 @@
  */
 import type { ModelOverrides } from "./control-plane.ts";
 import { DEFAULT_PROVIDER, modelProblem, providerStatus, type ModelProviders } from "../../src/model/providers.ts";
+import type { UserModel } from "../../src/model/user-models.ts";
 
 export interface AdminModelsDeps {
   overrides: ModelOverrides;
@@ -26,6 +27,13 @@ export interface AdminModelsDeps {
    * is no options, which an owner's picker shows as a feature that is off, not as a mistake to fix.
    */
   userModelsError?: string;
+  /**
+   * The options an owner may pick now (USER_MODELS, offered), as `{ id, label, provider, model }`. Listed so a
+   * reader holding an agent's API model name — an option's id — can say which provider and model that is
+   * without restating the deployment's configuration: bench/tau2/api.ts checks the model a run asked for
+   * against the one its usage was counted under this way.
+   */
+  options?: UserModel[];
   now(): number;
 }
 
@@ -37,6 +45,7 @@ export async function adminModels(method: string, body: unknown, actor: string, 
     return Response.json({
       default: { provider: DEFAULT_PROVIDER, model: deps.defaults.model, endpoint: providers.find((p) => p.id === DEFAULT_PROVIDER)?.endpoint ?? "" },
       providers,
+      options: (deps.options ?? []).map(({ id, label, provider, model }) => ({ id, label, provider, model })),
       ...(deps.providers.error ? { providersError: deps.providers.error } : {}),
       ...(deps.userModelsError ? { userModelsError: deps.userModelsError } : {}),
       // A row from before providers existed is shown as what serves it.

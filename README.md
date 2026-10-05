@@ -235,7 +235,8 @@ Antiproton is designed to run as a Cloudflare Worker backed by Durable Objects:
    provider and a model under it; one stored with no provider is `deepseek`'s, which is also where
    `HARNESS_MODEL` is served. `cf/wrangler.preview.jsonc` declares Cloudflare AI Gateway as a second
    provider (`vendor/model` names, its token in `cf-aig-authorization`, DeepSeek's key passed through only
-   for `deepseek/` models). Admins choose per deployment, tenant or agent through `/admin/models`.
+   for `deepseek/` models). Admins choose per deployment, tenant or agent through `/admin/models`, whose
+   `GET` also lists the owner options below with the provider and model each stands for.
    Owners pick for their own agents from the `USER_MODELS` var — a JSON array of
    `{ id, label, provider, model }` under those providers (`src/model/user-models.ts` validates it; unset,
    nothing is offered, and an option whose provider's secret is unset is not offered) — through

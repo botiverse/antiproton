@@ -38,4 +38,21 @@ export const actionMatch = (
 ): boolean =>
   expected.every((e) => performed.some((p) => p.name === e.name && canonArgs(p.args) === canonArgs(e.args)));
 
+/**
+ * Which expected write had no performed write with the same name *and* arguments — the actual criterion —
+ * with both sides shown, for a runner's log. The match is on the arguments, not the names, so a line that
+ * printed only names could show `expected [X] performed [X]` next to act=NO and look like the grader is broken.
+ */
+export function argDiff(expected: Array<{ name: string; args: unknown }>, performed: Array<{ name: string; args: unknown }>): string[] {
+  const out: string[] = [];
+  for (const e of expected) {
+    const same = performed.filter((p) => p.name === e.name);
+    if (same.some((p) => canonArgs(p.args) === canonArgs(e.args))) continue;
+    out.push(`${e.name} expected ${canonArgs(e.args).slice(0, 160)}`);
+    for (const p of same) out.push(`${" ".repeat(e.name.length)} performed ${canonArgs(p.args).slice(0, 160)}`);
+    if (!same.length) out.push(`${" ".repeat(e.name.length)} performed (nothing by that name)`);
+  }
+  return out;
+}
+
 export { canonJson };

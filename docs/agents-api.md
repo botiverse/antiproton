@@ -91,6 +91,16 @@ Response:
 }
 ```
 
+The same route revokes a key, named by the key itself; the answer says whether a live key was revoked:
+
+```bash
+curl -X POST https://preview.antiproton.ai/admin/api-keys \
+  -H "x-harness-token: <AUTOMATION_TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{"revoke": "ap-abc123xyz..."}'
+# {"revoked": true}
+```
+
 ---
 
 ## 3. Core Capabilities & Workflows

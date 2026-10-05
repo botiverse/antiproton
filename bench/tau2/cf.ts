@@ -22,9 +22,9 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { OpenAiCompatibleModel } from "../../src/model/openai-compatible.ts";
-import { applyRetailAction, WRITE_TOOLS, type RetailDB } from "./retail.ts";
-import { canonJson as canon, canonArgs, actionMatch as grade } from "./grade.ts";
-import { createHash } from "node:crypto";
+import { WRITE_TOOLS, type RetailDB } from "./retail.ts";
+import { argDiff, actionMatch as grade } from "./grade.ts";
+import { gold as goldOf, MAX_TURNS, OPENING, SIM, SIM_LAST_MAX, simEnding, simSystem } from "./episode.ts";
 import { beginRun, driverCommit, recordRun, teeRun, workerBuild, workerModel } from "../record.ts";
 import { stallAtDeadline, type StallEvidence } from "../poll-fallback.ts";
 import { endingsAllRows, failingRowsByEndingAndCause } from "./endings.ts";
@@ -66,8 +66,6 @@ const GUIDELINES = readFileSync(here + "simulation_guidelines.md", "utf8");
 const model = new OpenAiCompatibleModel({
   baseUrl: process.env.DEEPSEEK_BASE_URL!, apiKey: process.env.DEEPSEEK_API_KEY!, model: MODEL_ID,
 });
-/** How the user simulator is called; written into every record so a series can be split where it changed. */
-const SIM = { maxTokens: 8192, reasoning: "low" } as const;
 
 // Each arm gets its own object, so one arm's activity is never read as
 // another's — the meter is per object and it does not reset itself.
@@ -92,21 +90,8 @@ async function api(path: string, init: RequestInit = {}, obj = OBJ): Promise<any
 const post = (path: string, body: unknown, obj = OBJ) =>
   api(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }, obj);
 
-const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
-
-/** The database the annotated solution leaves behind, hashed the same way the
- *  object hashes its own — the comparison is a hash because the database is
- *  2.8 MB and no part of it needs to travel. */
-function gold(task: any) {
-  const db = structuredClone(BASE_DB);
-  const applied: Array<{ name: string; args: any }> = [];
-  for (const a of task.evaluation_criteria?.actions ?? []) {
-    if (!WRITE_TOOLS.has(a.name)) continue;
-    applyRetailAction(db, a.name, a.arguments);
-    applied.push({ name: a.name, args: a.arguments });
-  }
-  return { hash: sha256(canon(db)), expected: applied };
-}
+/** The simulator, its settings and the gold database are bench/tau2/episode.ts, shared with bench/tau2/api.ts. */
+const gold = (task: any) => goldOf(task, BASE_DB);
 
 /**
  * Wait for the object to finish a turn.
@@ -174,53 +159,29 @@ async function runTask(task: any) {
   const engine = started?.engine ?? (ENGINE === "pi085" ? "pi085" : null);
   if (engine !== ENGINE) throw new Error(`asked for ${ENGINE}, the object runs ${engine ?? "an engine it did not name"}`);
 
-  const instr = task.user_scenario?.instructions ?? {};
-  const scenario = [
-    instr.task_instructions && `Style: ${instr.task_instructions}`,
-    instr.reason_for_call && `Why you are contacting support: ${instr.reason_for_call}`,
-    instr.known_info && `What you know: ${instr.known_info}`,
-    instr.unknown_info && `What you do NOT know: ${instr.unknown_info}`,
-  ].filter(Boolean).join("\n");
   const sim: Array<{ role: "system" | "user" | "assistant"; content: string }> = [
-    { role: "system", content: `${GUIDELINES}\n\n# Your scenario\n${scenario}` },
+    { role: "system", content: simSystem(task, GUIDELINES) },
   ];
 
-  let agentSaid = "Hi! How can I help you today?";
+  let agentSaid = OPENING;
   let turns = 0, simCalls = 0, ended = "max_turns";
   let simLast = "";
   let stall: string | undefined;
   // The values that cause was decided from, so a record can be re-decided rather than believed.
   let stallWhy: StallEvidence | undefined;
 
-  while (turns++ < 14) {
+  while (turns++ < MAX_TURNS) {
     sim.push({ role: "user", content: agentSaid });
-    // The simulator plays a customer from a script, and two things went wrong in
-    // turn. Thinking at the provider's default effort, a 2000 cap was a budget for
-    // the trace and the reply together, and three rounds in three days the trace
-    // spent it all and the reply came back empty. Thinking off, the reply always
-    // came, but a script with a condition in it ("if the agent asks for
-    // confirmation, only exchange the desk lamp") was never applied: the simulator
-    // repeated "keep everything on hold" verbatim until the turn limit
-    // (2026-09-25 18:53Z, task 6), and at that point a replay with any reasoning
-    // at all decided the lamp, three times out of three. So the script needs a
-    // little judgement, and the cap needs to be one a little judgement cannot
-    // exhaust: low effort, and four times the reply's budget. The record carries
-    // the condition, since rounds before it were run each of the other two ways.
+    // Why the simulator thinks a little under a large cap: SIM in bench/tau2/episode.ts.
     const u = await model.complete(sim, SIM);
     simCalls += 1;
     sim.push({ role: "assistant", content: u.text });
     // Verbatim, including a stop tag when the turn carried one (a STOP turn's text
-    // is never posted to the agent — see the break below). Capped so a runaway
-    // reply cannot bloat the record; scripted lines are far under it.
+    // is never posted to the agent — see the break below). Capped where the row is built.
     simLast = u.text;
-    const stop = /###(STOP|TRANSFER|OUT-OF-SCOPE)###/.exec(u.text);
     if (VERBOSE) console.log(`    user  > ${u.text.replace(/\s+/g, " ").slice(0, 130)}`);
-    if (stop) { ended = stop[1]!.toLowerCase(); break; }
-    // The simulator, not the agent, ran out of words: a reasoning model that
-    // spends its budget before the reply returns empty content (twice on
-    // 2026-09-22). Posting "" asked the object a question it refused, and the
-    // refusal was filed as a stall of the agent. Named for whose turn it was.
-    if (u.text.trim() === "") { ended = `sim_empty (${u.finishReason})`; break; }
+    const simEnded = simEnding(u);
+    if (simEnded) { ended = simEnded; break; }
 
     await post("/bench/say", { taskId, text: u.text }, obj);
 
@@ -252,7 +213,7 @@ async function runTask(task: any) {
   return {
     id: task.id, taskId, engine, object: `bench-${obj}`, ...(activity === undefined ? {} : { activity }),
     reward: dbMatch && actionMatch ? 1 : 0, dbMatch, actionMatch, ended, stall, stallWhy,
-    simLast: simLast.slice(0, 1000),
+    simLast: simLast.slice(0, SIM_LAST_MAX),
     delivered: delivered.get(taskId) ?? { push: 0, poll: 0, pollAnswered: 0, pollFailed: 0, dropped: 0 },
     turns: turns - 1, simCalls,
     usage: res.usage ?? {}, kinds: res.kinds ?? {}, byTool: res.byTool ?? {}, toolErrors: res.toolErrors ?? null,
@@ -263,19 +224,6 @@ async function runTask(task: any) {
   };
 }
 
-/** Which expected write had no performed write with the same name *and*
- *  arguments — the actual criterion — with both sides shown. */
-function argDiff(expected: Array<{ name: string; args: any }>, performed: Array<{ name: string; args: any }>): string[] {
-  const out: string[] = [];
-  for (const e of expected) {
-    const same = performed.filter((p) => p.name === e.name);
-    if (same.some((p) => canonArgs(p.args) === canonArgs(e.args))) continue;
-    out.push(`${e.name} expected ${canonArgs(e.args).slice(0, 160)}`);
-    for (const p of same) out.push(`${" ".repeat(e.name.length)} performed ${canonArgs(p.args).slice(0, 160)}`);
-    if (!same.length) out.push(`${" ".repeat(e.name.length)} performed (nothing by that name)`);
-  }
-  return out;
-}
 
 
 // The base database has to be where the object can read it, and it is 2.8 MB,
