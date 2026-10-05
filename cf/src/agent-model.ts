@@ -10,11 +10,13 @@
  *   { effective: { label, provider, model, source: "default" | "owner" | "admin" },
  *     options: [{ id, label }], selected: id | null, locked: boolean }
  *
- * JSON, not a panel: the console's picker renders it. The form body is the console's other writes' shape, so
- * a plain form post works too. `selected` is the stored pick only while it is offered; a pick whose option is
- * gone reads as null, the way it binds. `locked`: an admin's agent or tenant row decides this agent, and a
- * new pick is refused with 409 rather than stored to no effect — a pick that is kept but never runs would
- * read, to the owner, as one that does.
+ * JSON from this module; the route in cf/src/index.ts renders agentModelBlock when the request
+ * carries hx-request, so the same answer is a panel for the picker and data for anything else. The
+ * form body is the console's other writes' shape, so a plain form post works too. `selected` is the
+ * stored pick only while it is offered; a pick whose option is gone reads as null, the way it binds.
+ * `locked`: an admin's agent or tenant row decides this agent, and a new pick is refused with 409
+ * rather than stored to no effect — a pick that is kept but never runs would read, to the owner,
+ * as one that does.
  *
  * Nothing here names an endpoint, a gateway or a secret: an option is an id and a label, and the effective
  * model is a provider's id and a model's name, neither of them an address or a credential.

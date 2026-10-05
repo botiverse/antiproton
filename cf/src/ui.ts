@@ -540,6 +540,10 @@ ${HEAD_ASSETS}
     </form>
     <div id="agents" data-lazy hx-get="/ui/agents" hx-swap="innerHTML" hx-trigger="ap:show, every 5s[${awake} && document.body.dataset.view==='agents']"
          hx-on::after-swap="ap.markAgent()"></div>
+    <h3 style="margin-top:14px">model</h3>
+    <!-- The current agent's model. The request carries the agent id from the page's
+         own state, so switching agents re-reads this for the one that is current. -->
+    <div id="agent-model" data-lazy hx-get="/ui/agent/model" hx-swap="innerHTML" hx-trigger="ap:show">loading…</div>
   </div>
   <div class="side-view" data-for="plugins">
     <h3>mounts</h3>
@@ -838,11 +842,18 @@ ${HEAD_ASSETS}
     slot.hidden = ok;
     if (ok) return;
     // The outer catch answers JSON with an error and a stack: show the error,
-    // never the stack. A plain-text reason keeps its own words.
+    // never the stack. A refusal may shape its error as a bare string or as
+    // { code, message } — the admin and agent-model routes do the latter — and
+    // stringifying the object is how a lock once read as "[object Object]".
     let reason = '';
     if (xhr && xhr.responseText) {
       const ct = String(xhr.getResponseHeader('content-type') || '');
-      if (ct.includes('json')) { try { reason = String((JSON.parse(xhr.responseText) ?? {}).error ?? ''); } catch { reason = ''; } }
+      if (ct.includes('json')) {
+        try {
+          const e = (JSON.parse(xhr.responseText) ?? {}).error;
+          reason = String(typeof e === "object" && e ? e.message ?? "" : e ?? "");
+        } catch { reason = ""; }
+      }
       if (!reason) reason = String(xhr.responseText).replace(/<[^>]*>/g, '').trim().slice(0, 160);
     }
     slot.textContent = 'not saved' + (xhr && xhr.status ? ' (' + xhr.status + ')' : '') + (reason ? ': ' + reason : '');
@@ -2064,6 +2075,48 @@ function credentialRegion(m: any, spec: CredentialSpec | null | undefined): stri
         </form></div>
       <details><summary>replace</summary>${paste("replace")}</details>
     </div>`;
+}
+
+/**
+ * The current agent's model, and where it comes from. The selector offers what the
+ * deployment puts in the user's list; the effective line names what actually runs
+ * and its source, because "GPT-5.6 Luna" means different things when it is the
+ * default, the owner's pick, or an admin's override — and only one of them can be
+ * changed here. An admin's choice locks the selector and says so. The select posts
+ * on change and the answer swaps this card back in; a refusal speaks through the
+ * page's write-error line.
+ */
+export function agentModelBlock(d: {
+  effective: { label: string; provider: string; model: string; source: "default" | "owner" | "admin" };
+  options: Array<{ id: string; label: string }>;
+  selected: string | null;
+  locked: boolean;
+}): string {
+  const source = d.effective.source === "admin"
+    ? `<span class="tag">set by an admin — an admin choice wins</span>`
+    : d.effective.source === "owner"
+      ? `<span class="tag ok">your choice</span>`
+      : `<span class="tag">the deployment default</span>`;
+  // A lock shows the model that actually runs, not the pick it displaced:
+  // the owner's stored choice is still in `selected`, but marking it on a
+  // disabled control would argue with the "an admin chose" line above.
+  const shown = d.locked
+    ? (d.options.find((o) => o.label === d.effective.label)?.id ?? null)
+    : d.selected;
+  const opts = [
+    `<option value="default"${shown === null ? " selected" : ""}>deployment default</option>`,
+    ...d.options.map((o) => `<option value="${esc(o.id)}"${shown === o.id ? " selected" : ""}>${esc(o.label)}</option>`),
+  ].join("");
+  return `<div class="card">
+  <div class="state"><b>${esc(d.effective.label)}</b><span class="sub">${esc(d.effective.provider)}</span>${source}</div>
+  <form class="model-choice" hx-post="/ui/agent/model">
+    <label><span>model</span>
+      <select name="choice" hx-post="/ui/agent/model" hx-target="closest .card" hx-swap="outerHTML" hx-trigger="change"${d.locked ? " disabled" : ""}>${opts}</select></label>
+  </form>
+  ${d.locked
+    ? `<div class="hint" style="padding-top:4px">an admin chose this agent's model; it changes here only when the admin lifts the override</div>`
+    : `<div class="hint" style="padding-top:4px">your choice takes effect the next time the agent runs</div>`}
+</div>`;
 }
 
 /** One mount, rendered on its own: what the credential routes return. Read-only
