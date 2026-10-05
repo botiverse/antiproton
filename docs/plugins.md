@@ -448,6 +448,24 @@ manifest operations are not offered, and why, is one table (`EXCLUDED` in
 `src/plugins/raft.ts`); `test/raft-plugin.ts` turns red when the manifest has
 an operation that is neither generated nor excluded.
 
+Three of `raft`'s hand-written tools are Raft Agent Login for Connected Apps
+(`src/plugins/raft-agent-login.ts`, the steps of Raft's CLI `integration login`
+and `integration invoke`): `integrations_login` asks Raft for a grant and turns
+the app's one-time callback into a session, `integrations_actions` lists the
+actions the app's manifest offers, and `integrations_invoke` runs one of them.
+The app's session cookie is a credential the agent holds for that app, so it is
+kept only in the mount's database, sealed under a key derived from the mount's
+Raft credential, and every result is walked for it before the model sees one.
+An action is run only if the manifest names it, and sent only to the origin the
+manifest was read from (the URL Raft registered for the app), over https, never
+to an internal host and never along a redirect; the Raft credential goes to
+Raft alone. `approval_required` and `install_required` are handed back as Raft
+gave them, with the card Raft posts when the call names a `target`; an action
+the app answers 401 is sent once more after a fresh login. Only v0 manifests
+(`raft-agent-manifest.v0`) with `http_api` actions that answer JSON or text are
+run, and a manifest whose `base_url` has a path is refused rather than joined; `test/raft-agent-login.ts` holds all of it against a fake Raft and a fake
+app.
+
 **`replay: "never"` overrides the read rule.** A tool that declares it is not
 run again on its own after an interruption, even when it is a read
 (`replayPolicy` asks it first). Declare it on a read whose claim to be harmless

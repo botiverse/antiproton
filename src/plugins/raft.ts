@@ -17,6 +17,10 @@ import {
   type Raft, type RaftInboxBatch, type RaftInterrupt, type RaftMessage, type RaftOperationSpec, type RaftState, type RaftStateStore, type RaftFailure,
 } from "@botiverse/raft-sdk";
 import { PARK_BYTES } from "./artifacts.ts";
+import {
+  ACTIONS_TOOL, AGENT_LOGIN_TOOLS, INVOKE_TOOL, LOGIN_TOOL, SESSION_STORE, integrationsActions, integrationsInvoke, integrationsLogin,
+  type AgentLoginDeps, type ManifestCache,
+} from "./raft-agent-login.ts";
 import { internalHost } from "./http.ts";
 import { toAgentRef } from "../store/refs.ts";
 import {
@@ -1152,8 +1156,9 @@ export function handOver(batch: RaftInboxBatch, unoffered: ReadonlySet<string> =
 }
 
 /**
- * The tools every mount has whatever its credential allows: the inbox pull and push, which are this runtime's
- * plumbing rather than Raft operations, and are written here by hand.
+ * The tools every mount has whatever its credential allows, written here by hand: the inbox pull and push, which are
+ * this runtime's plumbing rather than Raft operations, and Agent Login for Connected Apps (src/plugins/raft-agent-login.ts),
+ * which the SDK offers only as raw routes plus steps that happen outside Raft (the app's callback, its manifest, its actions).
  */
 const OWN_TOOLS: readonly ToolSchema[] = [
   {
@@ -1195,6 +1200,7 @@ const OWN_TOOLS: readonly ToolSchema[] = [
     sideEffects: "read",
     idempotency: "native",
   },
+  ...AGENT_LOGIN_TOOLS,
 ];
 
 /**
@@ -1395,6 +1401,10 @@ export function createRaftPlugin(deps: { artifacts?: RaftArtifacts | null; exclu
     const missing = generatedTools.filter((t) => !on.has(t.name));
     return missing.length ? new Set([...unoffered, ...missing.map((t) => t.name)]) : unoffered;
   };
+  /** Connected Apps' manifests, by URL, for `MANIFEST_TTL_MS`: public documents, so one cache serves every mount. */
+  const manifests: ManifestCache = new Map();
+  /** Agent Login's Raft client: its state is never saved, since a login and a list book nothing as seen. */
+  const agentLogin = (ctx: PluginContext): AgentLoginDeps => ({ raft: () => raftFor(ctx, { state: false }), timeoutMs: timeout(ctx) });
   /** One generated operation: the attachment download is this plugin's own (`downloadAttachment`), the rest the SDK's. */
   const operate = (op: RaftOperationSpec, args: unknown, ctx: PluginContext, resumed?: { seen?: { upToSeq: number }; heldAt?: number }) =>
     op.name === DOWNLOAD_OP ? downloadAttachment(args, ctx, artifacts, unofferedFor(ctx)) : runOperation(op, args, ctx, unofferedFor(ctx), resumed);
@@ -1409,7 +1419,8 @@ export function createRaftPlugin(deps: { artifacts?: RaftArtifacts | null; exclu
     toolsBasis: toolsBasisOf([...OWN_TOOLS.map((t) => ({ name: t.name })), ...offerable.map((op) => ({ name: op.toolName, capability: op.capability }))]),
     /** The push registration this mount holds: whether it exists is listable, what it holds is not. */
     database: {
-      version: 3, stores: { [PUSH_STORE]: { listed: [PUSH_KEY] }, [INBOX_STORE]: { listed: [STATE_KEY, SINCE_KEY] } },
+      // Version 4 added the Agent Login sessions: one sealed row per Connected App, none listed, since each is a credential.
+      version: 4, stores: { [PUSH_STORE]: { listed: [PUSH_KEY] }, [INBOX_STORE]: { listed: [STATE_KEY, SINCE_KEY] }, [SESSION_STORE]: {} },
       /**
        * Version 2 kept the cursor and the frontier under their own keys; version 3 keeps the SDK's state record.
        * The version-2 cursor was the last batch handed to the model, not yet acknowledged, which is exactly the
@@ -1441,7 +1452,8 @@ export function createRaftPlugin(deps: { artifacts?: RaftArtifacts | null; exclu
       summary: "A Raft agent credential for the agent account this mount represents.",
       shape: "token",
       grants: "As that Raft agent, and only as far as the credential's capabilities reach: send, read and search messages, receive queued events, " +
-        "join, leave and mute channels and see their members, react, work its task boards, read the Raft Manual, and post action cards for a person to confirm.",
+        "join, leave and mute channels and see their members, react, work its task boards, read the Raft Manual, post action cards for a person to confirm, " +
+        "and sign into the Connected Apps on its Server as that agent (Agent Login) to run the actions their manifests offer.",
       looksLike: [{ kind: "Raft agent credential", pattern: "sk_agent_[A-Za-z0-9_-]{16,}" }],
     },
     /** Every tool any mount can be offered; one mount's own list is `mountTools`. */
@@ -1581,6 +1593,9 @@ export function createRaftPlugin(deps: { artifacts?: RaftArtifacts | null; exclu
       const op = operationOf.get(name);
       if (op) return operate(op, args, ctx) as Promise<Json>;
       const a = object(args);
+      if (name === LOGIN_TOOL) return integrationsLogin(args, ctx, agentLogin(ctx));
+      if (name === ACTIONS_TOOL) return integrationsActions(args, ctx, agentLogin(ctx), manifests);
+      if (name === INVOKE_TOOL) return integrationsInvoke(args, ctx, agentLogin(ctx), manifests);
       if (name === "receive_events") {
         const limit = integer(a.limit, "limit", 1, EVENTS_LIMIT) ?? EVENTS_LIMIT;
         const raft = raftFor(ctx);
