@@ -319,7 +319,7 @@ const row = (id: number, trial: number, reward: number, provider: unknown) => ({
 const LUNA = { name: "openai/gpt-5.6-luna", endpoint: "gateway.ai.cloudflare.com" };
 const input = (rows: any[]) => ({
   base: "http://w", build: "abc1234", driver: { commit: "def5678", dirty: false }, tenantId: "bench", owner: "tau2-api",
-  modelRequested: "gpt-5.6-luna", sim: { maxTokens: 8192, reasoning: "low" }, tasks: [0, 1], trials: 2, order: "trial-major",
+  modelRequested: "gpt-5.6-luna", sim: { maxTokens: 8192, reasoning: "low" }, simId: "api.deepseek.com/deepseek-flash", tasks: [0, 1], trials: 2, order: "trial-major",
   startedAt: "2026-10-05T00:00:00.000Z", results: rows,
 });
 
@@ -358,6 +358,29 @@ await check("record: none when two rows ran on different providers, or when rows
   // A run whose customer ended every task before the agent spoke has no provider to give, and is recorded.
   must(apiRunRecord(input([{ ...row(0, 1, 0, null), ended: "stop", turns: 0 }])).ok, "a run that never reached the agent was refused");
   must(runnerMethodOf({}) === "bench" && runnerMethodOf({ runnerMethod: "agents-api" }) === "agents-api", "runnerMethodOf");
+});
+
+await check("record: none when the run never got going (a simulator that failed every row), yet a customer that ends before the agent speaks is recorded", () => {
+  // The simulator speaks first, so an empty or refused simulator key fails each row at its first call:
+  // `error: …`, 0 turns, 0 simulator calls, no provider. That is no round of the agent.
+  const simFailed = (id: number) => ({ ...row(id, 1, 0, null), ended: "error: 401 Unauthorized", turns: 0, simCalls: 0,
+    usage: {}, kinds: {}, byTool: {}, activity: undefined });
+  const none = apiRunRecord(input([simFailed(0), simFailed(1)]));
+  must(!none.ok && /got going/.test(none.why), show(none));
+  // Either half alone is enough: 0 simulator calls without an error, or an error after a simulator call.
+  must(!apiRunRecord(input([{ ...simFailed(0), ended: "max_turns" }, { ...simFailed(1), simCalls: 1 }])).ok, "a run with no simulator answer was recorded");
+  // The customer ended every task at its first line: it called the simulator, so the run did get going.
+  const early = apiRunRecord(input([{ ...row(0, 1, 0, null), ended: "stop", turns: 0, simCalls: 1 }, { ...row(1, 1, 0, null), ended: "stop", turns: 0, simCalls: 1 }]));
+  must(early.ok, show(early));
+  // One row that ran is enough for the round to stand beside rows the simulator failed.
+  must(apiRunRecord(input([simFailed(0), row(1, 1, 1, LUNA)])).ok, "a run with one good row was refused");
+});
+
+await check("record: `sim` carries the simulator's id beside its settings", () => {
+  const built = apiRunRecord(input([row(0, 1, 1, LUNA)]));
+  must(built.ok, show(built));
+  const sim = (built.body as any).sim;
+  must(show(sim) === show({ maxTokens: 8192, reasoning: "low", id: "api.deepseek.com/deepseek-flash" }), show(sim));
 });
 
 for (const r of results) console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);

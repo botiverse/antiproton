@@ -17,7 +17,12 @@
  *
  * MODEL is what the agents are created with: "default" (what the deployment runs for the tenant) or one of
  * the options /admin/models lists. The simulator stays on HARNESS_MODEL through DEEPSEEK_BASE_URL, as in the
- * `/bench` runner, in both arms. Credentials come from ~/.secrets/antiproton.env as there.
+ * `/bench` runner, in both arms, and the record's `sim.id` names the host and model it ran on. Credentials
+ * come from ~/.secrets/antiproton.env as there, with one exception: a non-empty HARNESS_AUTOMATION_TOKEN in
+ * the environment wins over the file's, so a run can aim at another deployment with that deployment's
+ * operator token:
+ *
+ *   HARNESS_AUTOMATION_TOKEN=<preview operator token> BENCH_BASE=https://preview.antiproton.ai MODEL=default N=1 node bench/tau2/api.ts
  */
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -29,10 +34,15 @@ import { readDeafness } from "./deafness.ts";
 import { apiClient } from "./api-client.ts";
 import { runApiBench } from "./api-run.ts";
 
+// Only the operator token may come from the environment: it names the deployment's operator and nothing else.
+// Every other name is the file's, as in the /bench runner, because a stale shell DEEPSEEK_BASE_URL or
+// DEEPSEEK_API_KEY would otherwise replace the simulator's endpoint or key without a word in the record.
+const tokenFromEnv = process.env.HARNESS_AUTOMATION_TOKEN || undefined;
 for (const l of readFileSync(`${homedir()}/.secrets/antiproton.env`, "utf8").split("\n")) {
   const m = /^([A-Z0-9_]+)=(.*)$/.exec(l.trim());
   if (m) process.env[m[1]!] = m[2]!;
 }
+if (tokenFromEnv) process.env.HARNESS_AUTOMATION_TOKEN = tokenFromEnv;
 
 // As in the `/bench` runner: the workers.dev address, without the interactive gate in front of the custom host.
 const BASE = process.env.BENCH_BASE ?? "https://antiproton.botiverse.workers.dev";
@@ -53,6 +63,7 @@ const simModel = new OpenAiCompatibleModel({
 const { code } = await runApiBench({
   client: apiClient({ base: BASE, harnessToken: TOKEN }),
   sim: (m, o) => simModel.complete(m, o),
+  simId: simModel.id,
   baseDb: BASE_DB,
   tasks: TASKS.slice(OFFSET, OFFSET + N),
   policy: readFileSync(here + "policy.md", "utf8"),

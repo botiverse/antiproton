@@ -239,11 +239,11 @@ await check("the Luna arm: made on gpt-5.6-luna, called through the gateway, its
   const luna = await runApiTask(TASK, deps("gpt-5.6-luna"));
   must(luna.reward === 1 && show(luna.provider) === show({ name: "openai/gpt-5.6-luna", endpoint: "gateway.ai.cloudflare.com" }), show([luna.reward, luna.provider]));
   must(asked.filter((a) => a.model === "openai/gpt-5.6-luna" && a.host === "gateway.ai.cloudflare.com").length === 3, show(asked.map((a) => [a.host, a.model])));
-  const record = apiRunRecord({ base: "https://w.test", build: null, driver: null, tenantId: "bench", owner: "tau2-api", modelRequested: "gpt-5.6-luna",
+  const record = apiRunRecord({ base: "https://w.test", build: null, driver: null, tenantId: "bench", owner: "tau2-api", modelRequested: "gpt-5.6-luna", simId: "sim.test/fixture",
     sim: {}, tasks: ["fx"], trials: 1, order: "trial-major", startedAt: "", results: [{ ...luna, trial: 1 }] });
   must(record.ok && (record.body as any).model === "openai/gpt-5.6-luna" && (record.body as any).runnerMethod === "agents-api", show(record).slice(0, 300));
   // Rows on two providers make no record.
-  must(!apiRunRecord({ base: "", build: null, driver: null, tenantId: "bench", owner: "o", modelRequested: "x", sim: {}, tasks: [], trials: 1, order: "trial-major",
+  must(!apiRunRecord({ base: "", build: null, driver: null, tenantId: "bench", owner: "o", modelRequested: "x", sim: {}, simId: "sim.test/fixture", tasks: [], trials: 1, order: "trial-major",
     startedAt: "", results: [{ ...luna, trial: 1 }, { ...flash, trial: 1 }] }).ok, "a record was built over two providers");
 });
 
@@ -262,7 +262,7 @@ async function wholeRun(model: string, extra: Partial<ApiRunOptions> = {}) {
   const runs = join(tree, "report/runs/");
   const runClient = apiClient({ base: "https://w.test", harnessToken: OPERATOR, fetch: workerFetch });
   const out = await runApiBench({
-    client: runClient, sim, baseDb: BASE_DB, tasks: [TASK], policy: POLICY, guidelines: "Play the customer.", model,
+    client: runClient, sim, simId: "sim.test/fixture", baseDb: BASE_DB, tasks: [TASK], policy: POLICY, guidelines: "Play the customer.", model,
     trials: 1, order: "trial-major", base: "https://w.test", build: async () => null, driver: null, runs,
     onSignal: () => {}, timing: { turnTimeoutMs: 30_000, lookEveryMs: 1_000, ledgerWaitMs: 20_000 }, ...extra,
   });
@@ -276,6 +276,7 @@ await check("a whole run writes one record, runnerMethod agents-api, and exits 0
     must(r.out.code === 0 && r.files.length === 1, show({ out: r.out, files: r.files }));
     const rec = JSON.parse(readFileSync(join(r.runs, r.files[0]!), "utf8"));
     must(rec.runnerMethod === "agents-api" && rec.model === "deepseek-flash" && rec.modelRequested === "default" && rec.results[0].reward === 1, show(rec).slice(0, 300));
+    must(rec.sim?.id === "sim.test/fixture" && rec.sim.reasoning === "low", show(rec.sim));
     must((await observer.v1All("/agents")).length === 0, "the run left agents in the index");
   } finally { r.done(); }
 });
@@ -324,7 +325,7 @@ await check("SIGINT mid-task: the task's agent and session are deleted, the key 
       client: runClient, baseDb: BASE_DB, tasks: [TASK], policy: POLICY, guidelines: "g", model: "default", trials: 1, order: "trial-major",
       base: "https://w.test", build: async () => null, driver: null, runs: join(tree, "report/runs/"),
       // The customer never answers: the run is inside its task, with an agent and a session made, when the signal comes.
-      sim: () => { entered(); return new Promise(() => {}); },
+      sim: () => { entered(); return new Promise(() => {}); }, simId: "sim.test/fixture",
       onSignal: (sig, h) => { handlers.set(sig, h); }, exit: (code) => { exited = code; },
     });
     await inTask;
