@@ -30,6 +30,7 @@ import { apiClient } from "../bench/tau2/api-client.ts";
 import { RunRefusal, runApiTask, type ApiTaskDeps } from "../bench/tau2/api-task.ts";
 import { runApiBench, type ApiRunOptions } from "../bench/tau2/api-run.ts";
 import { apiRunRecord } from "../bench/tau2/api-record.ts";
+import { rowTaskId } from "../bench/tau2/episode.ts";
 import { deafnessBudget } from "../bench/tau2/deafness.ts";
 import { agentObjectName } from "../cf/src/object-name.ts";
 
@@ -186,8 +187,12 @@ const deps = (model: string): ApiTaskDeps => ({
 });
 
 let flash: any;
+/** When the first task was started and when it returned, for the row's `taskId`. */
+const flashWindow = { from: 0, to: 0 };
 await check("a task over the API runs to dbMatch: the customer's message, two calls run here, the answer, the grade", async () => {
+  flashWindow.from = Date.now();
   flash = await runApiTask(TASK, deps("default"));
+  flashWindow.to = Date.now();
   must(flash.dbMatch && flash.actionMatch && flash.reward === 1, show(flash));
   must(flash.ended === "stop" && flash.turns === 1 && flash.simCalls === 2, show([flash.ended, flash.turns, flash.simCalls]));
   must(flash.simLast === "Thanks! ###STOP###", show(flash.simLast));
@@ -204,6 +209,19 @@ await check("its row: usage, calls, byTool and kinds as `/bench/result` counted 
   must(!said.some((l) => /disagree/.test(l)), `items and entries disagreed: ${said.filter((l) => /disagree/.test(l)).join(" | ")}`);
   must(flash.engine === "pi085" && flash.object === `api:bench/${flash.agentId}` && flash.activity?.activeMs > 0, show([flash.engine, flash.object, flash.activity]));
   must(show(flash.provider) === show({ name: "deepseek-flash", endpoint: "api.deepseek.com" }), show(flash.provider));
+});
+
+await check("its row's taskId is the task key the `/bench` runner writes, not the session; session and agent are fields of their own", () => {
+  // The `/bench` runner's construction (bench/tau2/cf.ts `runTask`), pinned by value as well as by the shared
+  // function, so a change to that function that renames the old runner's rows reddens here too.
+  must(rowTaskId("fx", 1_790_000_000_000) === "t_fx_mubbs7i8", rowTaskId("fx", 1_790_000_000_000));
+  const m = /^t_fx_([0-9a-z]+)$/.exec(String(flash.taskId));
+  must(m, `taskId is not the task key: ${show(flash.taskId)}`);
+  const began = parseInt(m[1]!, 36);
+  must(began >= flashWindow.from && began <= flashWindow.to && flash.taskId === rowTaskId(TASK.id, began),
+    `taskId's time ${began} is outside the task's run ${show(flashWindow)}`);
+  must(flash.taskId !== flash.sessionId && !/^sess_/.test(String(flash.taskId)), show([flash.taskId, flash.sessionId]));
+  must(/^sess_/.test(String(flash.sessionId)) && String(flash.agentId).length > 0 && flash.agentId !== flash.taskId, show([flash.sessionId, flash.agentId]));
 });
 
 await check("what the provider was handed: the gateway's own `retail` catalogue, byte for byte with its limit sentence, and nothing else; the system prompt is the core and the policy", () => {
