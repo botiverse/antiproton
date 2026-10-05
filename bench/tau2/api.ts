@@ -31,7 +31,9 @@ import { runApiBench } from "./api-run.ts";
 
 for (const l of readFileSync(`${homedir()}/.secrets/antiproton.env`, "utf8").split("\n")) {
   const m = /^([A-Z0-9_]+)=(.*)$/.exec(l.trim());
-  if (m) process.env[m[1]!] = m[2]!;
+  // A variable already set wins over the file, so a run can aim at preview with that deployment's
+  // operator token without editing the secrets file (the /bench runner overwrites; this one need not).
+  if (m) process.env[m[1]!] ??= m[2]!;
 }
 
 // As in the `/bench` runner: the workers.dev address, without the interactive gate in front of the custom host.
