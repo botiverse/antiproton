@@ -7,7 +7,7 @@
  */
 import { createRaftPlugin } from "../src/plugins/raft.ts";
 import {
-  ACTION_MAX_BYTES, AGENT_LOGIN_TOOLS, SESSION_STORE, actionUrl, appUrlProblem, cookieHeaderFor, freshCookies, parseSetCookie, readManifest, withheld,
+  ACTION_MAX_BYTES, AGENT_LOGIN_TOOLS, SESSION_STORE, actionUrl, followsTemplate, appUrlProblem, cookieHeaderFor, freshCookies, parseSetCookie, readManifest, withheld,
 } from "../src/plugins/raft-agent-login.ts";
 import { setLogSink } from "../src/core/log.ts";
 import { ToolGateway } from "../src/runtime/gateway.ts";
@@ -55,6 +55,7 @@ function manifest(overrides: Record<string, unknown> = {}) {
       action("create-reminder", { reminder: { type: "object", required: true }, requestId: { type: "string", required: true } }),
       action("list-reminders", { status: { type: "string" } }),
       action("cancel-reminder", { id: { type: "string", required: true } }),
+      { name: "view-item", description: "a path parameter", endpoint: { method: "POST", path: "/api/items/{id}/view" }, parameters: { id: { type: "string", required: true } } },
     ],
     ...overrides,
   };
@@ -74,6 +75,12 @@ type Options = {
   actionStatus?: number;
   actionHeaders?: Record<string, string>;
   actionBody?: string;
+  /** The session cookie's value, when a fixed one is wanted (a short one, say). */
+  cookieValue?: string;
+  /** Raft answers every login with this HTTP status. */
+  loginStatus?: number;
+  /** The action's 2xx body is cut off after this text. */
+  cutBodyAfter?: string;
   /** The service record Raft answers with, changed. */
   service?: Record<string, unknown>;
 };
@@ -101,6 +108,7 @@ function world(o: Options = {}) {
       if (url.pathname === "/internal/agent-api/integrations/login" && method === "POST") {
         const req = JSON.parse(body ?? "{}");
         logins.push(req);
+        if (o.loginStatus) return json(o.loginStatus, { error: "login store unavailable" });
         const mode = logins.length > 1 && o.laterLogin ? o.laterLogin : (o.login ?? "ok");
         if (mode === "approval") {
           return json(200, { status: "approval_required", service: svc, scopes: req.scopes ?? ["openid"], requestId: "req_pending_1",
@@ -127,17 +135,25 @@ function world(o: Options = {}) {
         if (issued.scopes || o.noSessionEver) {
           return json(400, { error: "grant_recorded_no_session", hint: "Raft recorded the requested agent scope for this app. No reminder-app session was created: for one, log in without a scope." });
         }
-        const value = `sealed.session.${serial}.${crypto.randomUUID()}`;
+        const value = o.cookieValue ?? `sealed.session.${serial}.${crypto.randomUUID()}`;
         sessions.add(value);
         const h = new Headers({ location: o.callbackRedirectsTo ?? "/", "cache-control": "no-store" });
         h.append("set-cookie", `reminder_session=${value}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${o.maxAge ?? 3600}; Secure`);
         h.append("set-cookie", "reminder_login=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0; Secure");
         return new Response(null, { status: 302, headers: h });
       }
-      if (url.pathname.startsWith("/api/raft/actions/") && method === "POST") {
+      if (url.pathname.startsWith("/api/") && method === "POST") {
         const cookie = /(?:^|; )reminder_session=([^;]+)/.exec(headers.cookie ?? "")?.[1];
         if (!cookie || !sessions.has(cookie)) return json(401, { ok: false, error: { message: "Your session expired. Sign in again." } });
         if (headers["content-type"] !== "application/json" || headers.origin) return json(415, { ok: false, error: { message: "Use application/json." } });
+        if (o.cutBodyAfter !== undefined) {
+          const cut = o.cutBodyAfter;
+          const stream = new ReadableStream({
+            start(c) { c.enqueue(new TextEncoder().encode(cut)); },
+            pull(c) { c.error(new Error("connection reset mid-body")); },
+          });
+          return new Response(stream, { status: 200, headers: { "content-type": "application/json" } });
+        }
         if (o.actionStatus || o.actionBody) {
           return new Response(o.actionBody ?? "{}", { status: o.actionStatus ?? 200, headers: { "content-type": "application/json", ...(o.actionHeaders ?? {}) } });
         }
@@ -152,7 +168,7 @@ function world(o: Options = {}) {
     fetch, seen, logins, sessions,
     accept(credential: string) { accepted.add(credential); },
     install() { globalThis.fetch = fetch as any; },
-    actions: () => seen.filter((r) => new URL(r.url).pathname.startsWith("/api/raft/actions/")),
+    actions: () => seen.filter((r) => new URL(r.url).pathname.startsWith("/api/")),
     callbacks: () => seen.filter((r) => new URL(r.url).pathname === "/auth/raft/callback"),
     cookieValues: () => [...sessions],
     revokeAll() { sessions.clear(); },
@@ -169,6 +185,19 @@ function mount(credential: string | null = CREDENTIAL, tables = new PluginDbTabl
     sibling: async () => null, sandboxForms: async () => [], agentSecret: async () => null,
   } as any;
   return { plugin, ctx, tables, scope, row: () => tables.get(scope, SESSION_STORE, SERVICE.id) as any };
+}
+
+async function behindGateway() {
+  const store = new SqliteStore(":memory:");
+  await store.init();
+  await store.createAgent("tenant", "agent");
+  const plugin = createRaftPlugin();
+  await store.addMount({
+    tenantId: "tenant", agentId: "agent", alias: "raft", plugin: "raft", installationId: "i", connectionId: null,
+    toolVersion: plugin.version, publicConfig: { serverUrl: RAFT }, secretRef: "secret:raft", policy: null,
+  });
+  const gateway = new ToolGateway(store, [plugin], new Set([plugin.id]), { async resolve() { return CREDENTIAL; } });
+  return { store, gateway, caller: { tenantId: "tenant", agentId: "agent", taskId: "task", contextId: "ctx_turn" } as any };
 }
 
 // -------------------------------------------------------------------------------------------------------------
@@ -222,7 +251,7 @@ await check("app URLs: https only, no user info, no internal host", async () => 
 
 await check("the manifest: v0 is read; v1, a path that leaves the app, and duplicate names are refused", async () => {
   const m = readManifest(manifest(), new URL(MANIFEST_URL));
-  must(m.actions.map((a) => a.name).join() === "create-reminder,list-reminders,cancel-reminder", m.actions.map((a) => a.name).join());
+  must(m.actions.map((a) => a.name).join() === "create-reminder,list-reminders,cancel-reminder,view-item", m.actions.map((a) => a.name).join());
   must(m.actions[0]!.parameters!.requestId!.required === true, "required lost");
   const refused = (value: unknown, why: RegExp) => {
     try { readManifest(value, new URL(MANIFEST_URL)); } catch (e) { must(why.test(String((e as Error).message)), String((e as Error).message)); return; }
@@ -326,7 +355,7 @@ await check("the action list is the manifest's, with the session's state and not
   w.install();
   const m = mount();
   const before = await m.plugin.invoke("integrations_actions", { service: "Reminder" }, m.ctx) as any;
-  must(before.actions?.map((a: any) => a.name).join() === "create-reminder,list-reminders,cancel-reminder" && before.session.status === "none", JSON.stringify(before));
+  must(before.actions?.map((a: any) => a.name).join() === "create-reminder,list-reminders,cancel-reminder,view-item" && before.session.status === "none", JSON.stringify(before));
   must(before.actions[0].parameters.requestId.required === true && before.actions[0].method === "POST", JSON.stringify(before.actions[0]));
   await m.plugin.invoke("integrations_login", { service: "reminder-app" }, m.ctx);
   const after = await m.plugin.invoke("integrations_actions", { service: "svc_reminder" }, m.ctx) as any;
@@ -363,7 +392,7 @@ await check("only a manifest action is run: any other name is refused before a l
   const m = mount();
   for (const action of ["delete-everything", "../auth/logout", "admin/agent-reminders"]) {
     const e = await failure(() => m.plugin.invoke("integrations_invoke", { service: "reminder-app", action }, m.ctx));
-    must(/manifest has no action/.test(e.message) && /create-reminder, list-reminders, cancel-reminder/.test(e.message), e.message);
+    must(/manifest has no action/.test(e.message) && /create-reminder, list-reminders, cancel-reminder, view-item/.test(e.message), e.message);
   }
   must(w.logins.length === 0 && w.actions().length === 0 && w.seen.every((r) => r.url === MANIFEST_URL || new URL(r.url).origin === RAFT), JSON.stringify(w.seen.map((r) => r.url)));
 });
@@ -408,6 +437,89 @@ await check("a return URL or manifest URL Raft names on an internal host, or ove
     const e = await failure(() => m.plugin.invoke("integrations_actions", { service: "reminder-app" }, m.ctx));
     must(/manifest URL/.test(e.message) && w.seen.every((r) => new URL(r.url).origin === RAFT), `${agentManifestUrl}: ${e.message}`);
   }
+});
+
+await check("a path parameter of . or .. is refused with that reason and nothing is sent; an ordinary value goes out on the template", async () => {
+  const w = world();
+  w.install();
+  const m = mount();
+  await m.plugin.invoke("integrations_login", { service: "reminder-app" }, m.ctx);
+  for (const id of ["..", "."]) {
+    const e = await failure(() => m.plugin.invoke("integrations_invoke", { service: "reminder-app", action: "view-item", params: { id } }, m.ctx));
+    must(/^a parameter cannot be \. or \.\. \(path parameter id\)/.test(e.message), `${id}: ${e.message}`);
+    must(w.actions().length === 0, `${id}: ${w.actions().length} request(s) reached the app: ${w.actions().map((r) => r.url).join()}`);
+  }
+  // Dot segments inside a value, or ones a server would decode, are refused too.
+  for (const id of ["a/../b", "%2e%2e", "..\\x"]) {
+    const e = await failure(() => m.plugin.invoke("integrations_invoke", { service: "reminder-app", action: "view-item", params: { id } }, m.ctx));
+    must(/^a parameter cannot be \. or \.\./.test(e.message) && w.actions().length === 0, `${id}: ${e.message}`);
+  }
+  // Control: an ordinary value (with characters that need encoding) is sent, as one segment of the template.
+  const out = await m.plugin.invoke("integrations_invoke", { service: "reminder-app", action: "view-item", params: { id: "item 42/x" } }, m.ctx) as any;
+  must(out.result?.ok === true && w.actions().length === 1 && new URL(w.actions()[0]!.url).pathname === "/api/items/item%2042%2Fx/view",
+    `${JSON.stringify(out)} ${w.actions().map((r) => r.url)}`);
+});
+
+await check("the resolved path is compared with the template segment by segment: a collapsed or grown path is refused, a matching one accepted", async () => {
+  const t = "/api/items/{id}/view";
+  must(followsTemplate(t, "/api/items/item-42/view"), "a matching path was refused");
+  must(followsTemplate(t, "/api/items/item%2042%2Fx/view"), "an encoded one-segment value was refused");
+  for (const p of ["/api/view", "/api/items/view", "/api/items//view", "/api/items/a/b/view", "/api/items/a/view/x", "/api/things/a/view"]) {
+    must(!followsTemplate(t, p), `accepted ${p}`);
+  }
+  must(followsTemplate("/a/x-{id}.json", "/a/x-7.json") && !followsTemplate("/a/x-{id}.json", "/a/y-7.json"), "a parameter inside a fixed segment");
+  must(followsTemplate("/api/raft/actions/list-reminders", "/api/raft/actions/list-reminders") && !followsTemplate("/api/raft/actions/list-reminders", "/api/raft/actions"), "a template with no parameter");
+});
+
+await check("a 2xx whose body breaks off mid-read may have landed: marked so, and the gateway records it unknown, not failed", async () => {
+  const w = world({ cutBodyAfter: '{"ok":' });
+  w.install();
+  const m = mount();
+  await m.plugin.invoke("integrations_login", { service: "reminder-app" }, m.ctx);
+  const e = await failure(() => m.plugin.invoke("integrations_invoke", { service: "reminder-app", action: "list-reminders" }, m.ctx)) as any;
+  must(e.mayHaveLanded === true && e.transient === true && e.retryable === true && /broke off/.test(e.message), `${e.message} landed=${e.mayHaveLanded} transient=${e.transient}`);
+  must(w.actions().length === 1, `actions: ${w.actions().length}`);
+  const g = await behindGateway();
+  const res: any = await g.gateway.invoke(g.caller, "raft.integrations_invoke", { service: "reminder-app", action: "list-reminders" });
+  must(res.status === "unknown", `gateway status: ${res.status} ${JSON.stringify(res).slice(0, 300)}`);
+});
+
+await check("a session cookie value of any length is withheld, a short one included", async () => {
+  const w = world({ cookieValue: "q7Z", echoCookie: true });
+  w.install();
+  const m = mount();
+  await m.plugin.invoke("integrations_login", { service: "reminder-app" }, m.ctx);
+  const out = JSON.stringify(await m.plugin.invoke("integrations_invoke", { service: "reminder-app", action: "list-reminders" }, m.ctx));
+  must(out.includes("reminder_session=[withheld]") && !out.includes("q7Z"), out);
+});
+
+await check("a login Raft does not answer, or answers 5xx, may have landed (it records a grant and may post a card)", async () => {
+  const w = world({ loginStatus: 503 });
+  w.install();
+  const m = mount();
+  const e = await failure(() => m.plugin.invoke("integrations_login", { service: "reminder-app" }, m.ctx)) as any;
+  must(e.mayHaveLanded === true && e.transient === true && /HTTP 503/.test(e.message), `${e.message} landed=${e.mayHaveLanded}`);
+  globalThis.fetch = (async () => { throw new Error("socket closed"); }) as any;
+  const t = await failure(() => m.plugin.invoke("integrations_login", { service: "reminder-app" }, m.ctx)) as any;
+  must(t.mayHaveLanded === true && t.transient === true, `transport: ${t.message} landed=${t.mayHaveLanded}`);
+  // Control: a 4xx is Raft refusing, which did nothing.
+  world({ loginStatus: 404 }).install();
+  const f = await failure(() => m.plugin.invoke("integrations_login", { service: "nope" }, m.ctx)) as any;
+  must(f.mayHaveLanded !== true && /HTTP 404/.test(f.message), `404: landed=${f.mayHaveLanded}`);
+});
+
+await check("an action carries the gateway's operation id as Idempotency-Key, the same on the 401 retry", async () => {
+  const w = world();
+  w.install();
+  const m = mount();
+  await m.plugin.invoke("integrations_login", { service: "reminder-app" }, m.ctx);
+  w.revokeAll();
+  await m.plugin.invoke("integrations_invoke", { service: "reminder-app", action: "list-reminders" }, { ...m.ctx, operationId: "op_abc123" });
+  const keys = w.actions().map((r) => r.headers["idempotency-key"]);
+  must(keys.length === 2 && keys.every((k) => k === "op_abc123"), `keys: ${JSON.stringify(keys)}`);
+  // No operation id, no header.
+  await m.plugin.invoke("integrations_invoke", { service: "reminder-app", action: "list-reminders" }, m.ctx);
+  must(w.actions().at(-1)!.headers["idempotency-key"] === undefined, "a header was sent with no operation id");
 });
 
 await check("an action the app answers 401 drops the session, signs in again and is sent once more — once", async () => {

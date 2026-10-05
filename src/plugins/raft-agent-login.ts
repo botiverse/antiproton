@@ -306,7 +306,8 @@ function sessionView(row: StoredSession): Json {
 // What goes back to the model: nothing that is a session or a credential.
 
 function cookieValues(cookies: readonly SessionCookie[]): string[] {
-  return cookies.map((c) => c.pair.slice(c.pair.indexOf("=") + 1)).filter((v) => v.length >= 8);
+  // Every value, however short: a short session is still the session. Only an empty one is skipped, which would match everywhere.
+  return cookies.map((c) => c.pair.slice(c.pair.indexOf("=") + 1)).filter((v) => v.length > 0);
 }
 
 /**
@@ -424,7 +425,9 @@ async function raftLogin(deps: AgentLoginDeps, service: string, scopes: string[]
     const status = out.status;
     const code = out.error?.errorCode ? ` (${out.error.errorCode})` : "";
     const transient = out.error?.kind === "transport" || (status !== undefined && (status === 429 || status >= 500));
-    throw fail(`Agent Login failed${status ? ` with HTTP ${status}` : ""}${code}: ${out.error?.message ?? "no answer from Raft"}`, { transient });
+    // A login is a write (it records a grant or a request, and may post a card): one with no answer, or a 5xx, may have landed.
+    const landed = out.error?.kind === "transport" || (status !== undefined && status >= 500);
+    throw fail(`Agent Login failed${status ? ` with HTTP ${status}` : ""}${code}: ${out.error?.message ?? "no answer from Raft"}`, { transient, mayHaveLanded: landed });
   }
   const data = obj(out.data);
   const record = serviceOf(data.service);
@@ -666,17 +669,53 @@ async function fetchManifest(ctx: PluginContext, deps: AgentLoginDeps, service: 
  * (and its parameters) to any host; pinned to the origin the manifest was read from, it reaches only the app that
  * served it, which is the app Raft registered.
  */
+const PATH_PARAM = /\{([A-Za-z][A-Za-z0-9_]*)\}/g;
+
+function traverses(value: string): boolean {
+  let decoded = value;
+  // Twice, so a value encoded once more than expected (`%252e%252e`) is judged by what a server decoding twice sees.
+  for (let i = 0; i < 2; i++) { try { decoded = decodeURIComponent(decoded); } catch { break; } }
+  return [value, decoded].some((v) => v.split(/[/\\]/).some((seg) => seg === "." || seg === ".."));
+}
+
+/**
+ * Whether a resolved pathname is still the manifest's template, compared segment by segment: the template's fixed
+ * segments as URL writes them (so a template URL re-encodes still matches) must be equal, and each segment holding a
+ * parameter must be exactly one non-empty segment. A value that made the path fold, climb or grow fails here.
+ */
+export function followsTemplate(template: string, pathname: string): boolean {
+  const slot = "zzslotzz";
+  const want = new URL(template.replace(/\{[A-Za-z][A-Za-z0-9_]*\}/g, slot), "https://manifest.local").pathname.split("/");
+  const got = pathname.split("/");
+  if (want.length !== got.length) return false;
+  return want.every((seg, i) => {
+    if (!seg.includes(slot)) return seg === got[i];
+    // A segment holding a parameter: its fixed text around the parameter(s) as written, each parameter non-empty.
+    const pattern = new RegExp(`^${seg.split(slot).map((lit) => lit.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("[^/]+")}$`);
+    return pattern.test(got[i]!);
+  });
+}
+
 export function actionUrl(service: ServiceRecord, manifest: Manifest, action: ManifestAction, payload: Record<string, unknown>): URL {
   const base = manifest.baseUrl ?? manifest.appOrigin ?? service.homepageUrl ?? (service.returnUrl ? new URL(service.returnUrl).origin : null);
   if (!base) throw fail("the manifest names no base URL for its actions");
   let baseUrl: URL;
   try { baseUrl = new URL(base); } catch { throw fail("the manifest's base URL is not a URL"); }
-  const path = action.endpoint.path.replace(/\{([A-Za-z][A-Za-z0-9_]*)\}/g, (_m, name: string) => {
+  const path = action.endpoint.path.replace(PATH_PARAM, (_m, name: string) => {
     const v = payload[name];
     if (v === undefined || v === null || v === "") throw fail(`missing path parameter ${name}`);
-    return encodeURIComponent(typeof v === "string" ? v : JSON.stringify(v));
+    const text = typeof v === "string" ? v : JSON.stringify(v);
+    // encodeURIComponent leaves `.` alone and URL folds `.` and `..` segments, so `{id}` = ".." would climb out of the
+    // action's path to another route of the app; a value that is, or decodes to, a dot segment is refused.
+    if (text === "." || text === "..") throw fail(`a parameter cannot be . or .. (path parameter ${name}); nothing was sent`);
+    if (traverses(text)) throw fail(`a parameter cannot be . or .., nor contain one as a path segment once decoded (path parameter ${name}); nothing was sent`);
+    return encodeURIComponent(text);
   });
   const url = new URL(path, baseUrl);
+  // Whatever the values were, the URL must still be the manifest's template, each parameter one whole segment.
+  if (!followsTemplate(action.endpoint.path, url.pathname)) {
+    throw fail(`${action.name}'s parameters change its path (${url.pathname} does not match ${action.endpoint.path}); nothing was sent`);
+  }
   if (url.origin !== manifest.url.origin) {
     throw fail(`${service.name}'s manifest sends ${action.name} to ${url.origin}, not to ${manifest.url.origin} where the manifest is served; this mount sends an action only to the manifest's own origin`);
   }
@@ -736,6 +775,8 @@ async function send(ctx: PluginContext, deps: AgentLoginDeps, service: ServiceRe
   const pathParams = new Set(Array.from(action.endpoint.path.matchAll(/\{([A-Za-z][A-Za-z0-9_]*)\}/g), (m) => m[1]));
   const body = Object.fromEntries(Object.entries(payload).filter(([k]) => !pathParams.has(k)));
   const headers: Record<string, string> = { accept: "application/json,text/plain,*/*", cookie };
+  // The gateway's id for this call: the same on the 401 retry below, so an app that honours the header acts once.
+  if (ctx.operationId) headers["idempotency-key"] = ctx.operationId;
   const init: RequestInit = { method: action.endpoint.method, headers };
   if (action.endpoint.method === "GET") {
     for (const [k, v] of Object.entries(body)) if (v !== undefined && v !== null) url.searchParams.set(k, typeof v === "string" ? v : JSON.stringify(v));
@@ -758,7 +799,13 @@ async function send(ctx: PluginContext, deps: AgentLoginDeps, service: ServiceRe
     await res.body?.cancel().catch(() => {});
     throw fail(`${service.name} answered ${action.name} with a redirect (HTTP ${res.status}), which this mount does not follow`);
   }
-  const raw = await boundedText(res, ACTION_MAX_BYTES);
+  let raw: string | null;
+  try { raw = await boundedText(res, ACTION_MAX_BYTES); }
+  catch {
+    // The status arrived, the body did not (a cut stream, a timeout mid-read). A 2xx means the app acted.
+    throw fail(`${service.name}'s answer to ${action.name} (HTTP ${res.status}) broke off before it was read whole, so what it did is not known; check before running it again`,
+      { mayHaveLanded: res.ok || res.status >= 500, transient: true });
+  }
   if (raw === null) throw fail(`${service.name}'s answer to ${action.name} is larger than ${ACTION_MAX_BYTES} bytes`, { mayHaveLanded: res.ok });
   if (!res.ok) {
     const landed = res.status >= 500;
