@@ -983,6 +983,7 @@ was given up.
 | too_large | 413 | body over 1 MB |
 | rate_limited | 429 | over 30 deliveries a minute for this hook, or 30 already queued; `Retry-After` says when to try again: for the rate, the whole seconds until the minute lets one more in; for the queue, until the oldest queued event's next try, 3–600 s (3 while the queue is moving) |
 | failed | 503 | `receive` threw, or the hook has no secret; in the record also an accepted event that was given up (the service was already answered 202) |
+| unavailable | 503 | not in the record: the agent's object did not answer within `HOOK_OBJECT_TIMEOUT_MS` (default 4.5 s), or kept moving between machines. `Retry-After: 5` on a timeout (1 while moving). Never 202, because only the object can check the signature. The call in flight may still land, and the retry is then answered `duplicate` |
 
 When an expected event never arrived, read the record with
 `GET /admin/hooks?tenantId=…&agentId=…`, which lists the agent's hooks and
