@@ -4201,8 +4201,10 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
               defaultModel: env.HARNESS_MODEL,
               now: Date.now,
             });
-          // A refusal (409 locked, 422 unknown id) is plain text for the page's
-          // write-error banner; anything the picker asked for renders the block.
+          // A refusal (409 locked, 422 unknown id) stays the handler's JSON
+          // {error: {code, message}}: the page's write-error banner reads
+          // .error.message and speaks it under the form. Anything the picker
+          // asked for with hx-request renders the block.
           if (!answered.ok || !request.headers.get("hx-request")) return answered;
           const data = await answered.json();
           return new Response(agentModelBlock(data as Parameters<typeof agentModelBlock>[0]), {

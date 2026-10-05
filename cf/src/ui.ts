@@ -842,11 +842,18 @@ ${HEAD_ASSETS}
     slot.hidden = ok;
     if (ok) return;
     // The outer catch answers JSON with an error and a stack: show the error,
-    // never the stack. A plain-text reason keeps its own words.
+    // never the stack. A refusal may shape its error as a bare string or as
+    // { code, message } — the admin and agent-model routes do the latter — and
+    // stringifying the object is how a lock once read as "[object Object]".
     let reason = '';
     if (xhr && xhr.responseText) {
       const ct = String(xhr.getResponseHeader('content-type') || '');
-      if (ct.includes('json')) { try { reason = String((JSON.parse(xhr.responseText) ?? {}).error ?? ''); } catch { reason = ''; } }
+      if (ct.includes('json')) {
+        try {
+          const e = (JSON.parse(xhr.responseText) ?? {}).error;
+          reason = String(typeof e === "object" && e ? e.message ?? "" : e ?? "");
+        } catch { reason = ""; }
+      }
       if (!reason) reason = String(xhr.responseText).replace(/<[^>]*>/g, '').trim().slice(0, 160);
     }
     slot.textContent = 'not saved' + (xhr && xhr.status ? ' (' + xhr.status + ')' : '') + (reason ? ': ' + reason : '');
@@ -2090,9 +2097,15 @@ export function agentModelBlock(d: {
     : d.effective.source === "owner"
       ? `<span class="tag ok">your choice</span>`
       : `<span class="tag">the deployment default</span>`;
+  // A lock shows the model that actually runs, not the pick it displaced:
+  // the owner's stored choice is still in `selected`, but marking it on a
+  // disabled control would argue with the "an admin chose" line above.
+  const shown = d.locked
+    ? (d.options.find((o) => o.label === d.effective.label)?.id ?? null)
+    : d.selected;
   const opts = [
-    `<option value="default"${d.selected === null ? " selected" : ""}>deployment default</option>`,
-    ...d.options.map((o) => `<option value="${esc(o.id)}"${d.selected === o.id ? " selected" : ""}>${esc(o.label)}</option>`),
+    `<option value="default"${shown === null ? " selected" : ""}>deployment default</option>`,
+    ...d.options.map((o) => `<option value="${esc(o.id)}"${shown === o.id ? " selected" : ""}>${esc(o.label)}</option>`),
   ].join("");
   return `<div class="card">
   <div class="state"><b>${esc(d.effective.label)}</b><span class="sub">${esc(d.effective.provider)}</span>${source}</div>
