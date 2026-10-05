@@ -14,7 +14,7 @@ import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { parseProviders, providersFrom } from "../src/model/providers.ts";
 import { parseUserModels, userModelsFrom } from "../src/model/user-models.ts";
 import { resolveModel } from "../cf/src/model-request.ts";
-import { d1ModelChoices, d1ModelOverrides } from "../cf/src/control-plane.ts";
+import { d1ModelChoices, d1ModelOverrides, type ModelLayers } from "../cf/src/control-plane.ts";
 import { agentObjectName } from "../cf/src/object-name.ts";
 import { sessionCookieFor, uiAgent } from "../cf/src/auth.ts";
 
@@ -104,9 +104,9 @@ const UM = userModelsFrom({ USER_MODELS: [FLASH, LUNA] }, both);
 const AGENT = { provider: "cloudflare", model: "anthropic/claude-agent" };
 const TENANT = { provider: "cloudflare", model: "anthropic/claude-tenant" };
 const DEPLOY = { provider: "deepseek", model: "deepseek-v4-pro" };
-const none = { agent: null, tenant: null, deployment: null, owner: null };
-const pick = (layers: Partial<typeof none> & Record<string, unknown>, um = UM) => {
-  const r = resolveModel({ ...none, ...layers } as any, um, "deepseek-flash");
+const none: ModelLayers = { agent: null, tenant: null, deployment: null, owner: null };
+const pick = (layers: Partial<ModelLayers>, um = UM) => {
+  const r = resolveModel({ ...none, ...layers }, um, "deepseek-flash");
   return `${r.choice.provider}/${r.choice.model} ${r.source}${r.locked ? " locked" : ""}`;
 };
 
