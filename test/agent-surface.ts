@@ -594,6 +594,7 @@ function v1Deps(f: ReturnType<typeof fakeSurface>, tenantId: string, agents: Rec
     surface: { tenantId, deps: f.deps },
     index: { getAgent: async (id: string) => agents[id] ?? null } as any,
     agents: { adopt: nope, openSession: nope, postInput: nope, status: nope, toolResults: nope, cancel: nope, transcript: nope } as any,
+    models: { userModels: { offered: [] }, defaultModel: "deepseek-flash", layers: nope, put: nope, remove: nope },
   };
 }
 async function v1(deps: AgentsApiDeps, path: string, qs: string) {

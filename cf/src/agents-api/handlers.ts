@@ -19,6 +19,7 @@ import { sessionTranscript } from "./transcript.ts";
 import { pumpSessionEvents, type PendingCall, type Snapshot } from "./events.ts";
 import type { Watch } from "./watch.ts";
 import { surface, surfaceReadOf, type SurfaceDeps } from "../agent-surface/surface.ts";
+import { effectiveModel, planModel, type ApiModelDeps } from "./model.ts";
 
 export type SessionStatus = "idle" | "in_progress" | "requires_action" | "failed";
 
@@ -70,6 +71,11 @@ export interface AgentsApiDeps {
    * Absent: those routes answer 404.
    */
   surface?: { tenantId: string; deps: SurfaceDeps };
+  /**
+   * The owner's model pick and what decides over it (model.ts), in the key's tenant. Required: without it a
+   * `model` would be taken and stored to no effect, which is what this API refuses to do with any setting.
+   */
+  models: ApiModelDeps;
 }
 
 type Refusal = { ok: false; status: number; message: string; param: string; code: string };
@@ -104,9 +110,30 @@ export function inputText(input: unknown): { ok: true; text: string | null } | R
   return { ok: true, text: parts.join("\n\n") };
 }
 
+/**
+ * The agent as the API answers it: `model` is what its next turn runs on (model.ts), not what was last sent,
+ * since a console pick or an admin's row may have decided since.
+ */
+async function shown(deps: AgentsApiDeps, id: string, a: StoredAgent): Promise<StoredAgent> {
+  return { ...a, model: await effectiveModel(deps.models, id) };
+}
+
+/**
+ * Check the requested model for `id` and give back the record with the model as stored, and the pick's write.
+ * The caller writes the index row first and the pick after it: a create that fails at its index row then leaves
+ * no pick behind for an agent that was never made. `prior` is the record before an update.
+ */
+async function chooseModel(deps: AgentsApiDeps, id: string, a: StoredAgent, param: string, prior?: StoredAgent):
+  Promise<{ ok: true; agent: StoredAgent; apply(): Promise<void> } | Refusal> {
+  const plan = await planModel(deps.models, id, a.model, param, prior?.model);
+  if (!plan.ok) return plan;
+  return { ok: true, agent: { ...a, model: plan.stored }, apply: plan.apply };
+}
+
 async function sessionObject(deps: AgentsApiDeps, s: StoredSession) {
-  const agent = await deps.index.getAgent(s.agentId);
-  if (!agent) return null;
+  const stored = await deps.index.getAgent(s.agentId);
+  if (!stored) return null;
+  const agent = await shown(deps, s.agentId, stored);
   const live = await deps.agents.status(s.agentId, s.id);
   return toOpenAISession(s, agent, { status: live.status, pending: live.pending });
 }
@@ -117,8 +144,9 @@ async function sessionObject(deps: AgentsApiDeps, s: StoredSession) {
  * baseline is read, so a turn it starts is streamed rather than counted as history.
  */
 async function eventStream(deps: AgentsApiDeps, s: StoredSession, thenStart?: () => Promise<void>): Promise<Response> {
-  const agent = await deps.index.getAgent(s.agentId);
-  if (!agent) return notFound("agent", s.agentId);
+  const stored = await deps.index.getAgent(s.agentId);
+  if (!stored) return notFound("agent", s.agentId);
+  const agent = await shown(deps, s.agentId, stored);
   const read = async (): Promise<Snapshot> => {
     const t = await deps.agents.transcript(s.agentId, s.id);
     const pending = t.running ? [] : t.pending;
@@ -196,8 +224,12 @@ export async function handleAgentsApi(
         if (!isObj(body.agent)) return openAIError(400, "agent_id or agent is required", { param: "agent", code: "invalid_value" });
         const parsed = parseAgentParams(body.agent, "create", undefined, deps.now());
         if (!parsed.ok) return refuse(parsed);
-        agentId = deps.mintAgentId(); agent = parsed.value;
+        agentId = deps.mintAgentId();
+        const chosen = await chooseModel(deps, agentId, parsed.value, "agent.model");
+        if (!chosen.ok) return refuse(chosen);
+        agent = chosen.agent;
         await deps.index.putAgent(agentId, agent);
+        await chosen.apply();
       }
       const now = deps.now();
       const session: StoredSession = {
@@ -330,14 +362,21 @@ export async function handleAgentsApi(
     const parsed = parseAgentParams(body, "create", undefined, deps.now());
     if (!parsed.ok) return refuse(parsed);
     const id = deps.mintAgentId();
-    // The index row first: a create that fails there has made nothing, so a retry cannot duplicate it.
-    await deps.index.putAgent(id, parsed.value);
-    await repairedLater(deps.agents.adopt(id, parsed.value));
-    return ok(toOpenAIAgent(id, parsed.value));
+    const chosen = await chooseModel(deps, id, parsed.value, "model");
+    if (!chosen.ok) return refuse(chosen);
+    // The index row before the agent's object: a create that fails there has made nothing, so a retry cannot duplicate it.
+    await deps.index.putAgent(id, chosen.agent);
+    await chosen.apply();
+    await repairedLater(deps.agents.adopt(id, chosen.agent));
+    return ok(toOpenAIAgent(id, await shown(deps, id, chosen.agent)));
   }
   if (seg.length === 1 && method === "GET") {
-    const page = cursorPage((await deps.index.listAgents()).map((x) => ({ ...toOpenAIAgent(x.id, x.agent) })), q);
-    return page.ok ? ok(page.page) : refuse(page);
+    // Paged before each agent's model is read, so a page reads its own agents' models and no others.
+    const page = cursorPage(await deps.index.listAgents(), q);
+    if (!page.ok) return refuse(page);
+    const data = [];
+    for (const x of page.page.data) data.push(toOpenAIAgent(x.id, await shown(deps, x.id, x.agent)));
+    return ok({ ...page.page, data });
   }
   // `/agents/:id/usage`, `/agents/:id/workspace/files`, `/agents/:id/workspace/files/read`: an agent
   // this key made (its index), read through the core the provider binding uses.
@@ -357,14 +396,27 @@ export async function handleAgentsApi(
     const id = seg[1]!;
     const a = await deps.index.getAgent(id);
     if (!a) return notFound("agent", id);
-    if (method === "GET") return ok(toOpenAIAgent(id, a));
-    if (method === "DELETE") { await deps.index.deleteAgent(id); return ok(agentDeleted(id)); }
+    if (method === "GET") return ok(toOpenAIAgent(id, await shown(deps, id, a)));
+    if (method === "DELETE") {
+      await deps.index.deleteAgent(id);
+      // Its pick too: model_choices is keyed by the agent, and no agent is left to read it.
+      await deps.models.remove(id);
+      return ok(agentDeleted(id));
+    }
     if (method === "POST") {
       const parsed = parseAgentParams(body, "update", a, deps.now());
       if (!parsed.ok) return refuse(parsed);
-      await deps.index.putAgent(id, parsed.value);
-      await repairedLater(deps.agents.adopt(id, parsed.value));
-      return ok(toOpenAIAgent(id, parsed.value));
+      // An update without `model` leaves the pick as it is, whoever made it.
+      let next = parsed.value, apply = async () => {};
+      if (isObj(body) && body.model !== undefined) {
+        const chosen = await chooseModel(deps, id, parsed.value, "model", a);
+        if (!chosen.ok) return refuse(chosen);
+        next = chosen.agent; apply = chosen.apply;
+      }
+      await deps.index.putAgent(id, next);
+      await apply();
+      await repairedLater(deps.agents.adopt(id, next));
+      return ok(toOpenAIAgent(id, await shown(deps, id, next)));
     }
   }
   return openAIError(404, `${method} /v1/${seg.join("/")} is not supported by this deployment yet`, { code: "not_found" });

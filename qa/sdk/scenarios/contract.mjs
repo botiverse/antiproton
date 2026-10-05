@@ -5,7 +5,7 @@
 //   (sessions.stream). When the SDK changes, re-run and re-check these expectations.
 
 async function agentWithSession({ client, tag, cleanup }, extra = {}) {
-  const agent = await client.beta.agents.create({ model: "gpt-6-astra", name: tag, instructions: "Answer in one short sentence.", ...extra });
+  const agent = await client.beta.agents.create({ model: "default", name: tag, instructions: "Answer in one short sentence.", ...extra });
   cleanup(() => client.beta.agents.delete(agent.id));
   const session = await client.beta.agents.sessions.create({ agent_id: agent.id, environment: { type: "none" } });
   cleanup(() => client.beta.agents.sessions.delete(session.id));
@@ -18,7 +18,7 @@ export default [
     tier: "contract",
     async run({ client, assert, tag }) {
       const api = client.beta.agents;
-      const a = await api.create({ model: "gpt-6-astra", name: tag, instructions: "Write clean code." });
+      const a = await api.create({ model: "default", name: tag, instructions: "Write clean code." });
       assert(a.object === "agent" && a.name === tag && a.multi_agent && a.reasoning && a.text && Array.isArray(a.tools), `agent: ${JSON.stringify(a)}`);
       assert((await api.retrieve(a.id)).id === a.id, "retrieve");
       const u = await api.update(a.id, { instructions: "Be brief." });
@@ -39,7 +39,7 @@ export default [
       const { client, assert, tag, cleanup } = ctx;
       const { agent, session } = await agentWithSession(ctx);
       assert(session.object === "agent.session" && session.status === "idle" && session.agent?.id === agent.id, `session: ${JSON.stringify(session)}`);
-      const inline = await client.beta.agents.sessions.create({ agent: { model: "gpt-6-astra", instructions: "inline" }, environment: { type: "none" } });
+      const inline = await client.beta.agents.sessions.create({ agent: { model: "default", instructions: "inline" }, environment: { type: "none" } });
       cleanup(() => client.beta.agents.sessions.delete(inline.id));
       assert(inline.agent?.instructions === "inline" && inline.environment?.type === "none", `inline: ${JSON.stringify(inline)}`);
       const u = await client.beta.agents.sessions.update(session.id, { metadata: { run: tag } });
@@ -61,10 +61,10 @@ export default [
         }
         throw new Error(`expected ${cls.name}, but the call succeeded`);
       };
-      const a = await client.beta.agents.create({ model: "m", name: "refusals" });
+      const a = await client.beta.agents.create({ model: "default", name: "refusals" });
       try {
         await expect(() => client.beta.agents.sessions.create({ agent_id: a.id, environment: { type: "openai_hosted" }, vault_ids: ["v1"] }), OpenAI.BadRequestError, "vault_ids");
-        await expect(() => client.beta.agents.create({ model: "m", tools: [{ type: "mcp", server_label: "x", server_url: "https://example.com/mcp" }] }), OpenAI.BadRequestError, "tools[0].type");
+        await expect(() => client.beta.agents.create({ model: "default", tools: [{ type: "mcp", server_label: "x", server_url: "https://example.com/mcp" }] }), OpenAI.BadRequestError, "tools[0].type");
         await expect(() => client.beta.agents.sessions.create({ agent_id: a.id, environment: { type: "openai_hosted", packages: { npm: ["zod"] } } }), OpenAI.BadRequestError, "environment.packages");
         const bad = new OpenAI({ apiKey: "ap-" + "x".repeat(43), baseURL: client.baseURL, maxRetries: 0 });
         await expect(() => bad.beta.agents.list(), OpenAI.AuthenticationError);
@@ -106,7 +106,7 @@ export default [
     tier: "contract",
     async run(ctx) {
       const { client, assert, TERMINAL, tag, cleanup } = ctx;
-      const agent = await client.beta.agents.create({ model: "gpt-6-astra", name: tag, instructions: "Answer in one short sentence." });
+      const agent = await client.beta.agents.create({ model: "default", name: tag, instructions: "Answer in one short sentence." });
       cleanup(() => client.beta.agents.delete(agent.id));
       const stream = await client.beta.agents.sessions.create({ agent_id: agent.id, environment: { type: "none" }, input: "Say bye.", stream: true });
       const types = [];

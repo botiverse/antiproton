@@ -5,7 +5,7 @@
 //   resources/beta/agents/sessions/{items,turns}. When the SDK changes, re-run and re-check these.
 
 async function agentWithSession({ client, tag, cleanup }, agentParams = {}) {
-  const agent = await client.beta.agents.create({ model: "gpt-6-astra", name: tag, ...agentParams });
+  const agent = await client.beta.agents.create({ model: "default", name: tag, ...agentParams });
   cleanup(() => client.beta.agents.delete(agent.id));
   const session = await client.beta.agents.sessions.create({ agent_id: agent.id, environment: { type: "none" } });
   cleanup(() => client.beta.agents.sessions.delete(session.id));

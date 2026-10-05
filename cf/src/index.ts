@@ -3313,6 +3313,14 @@ async function v1(request: Request, env: Env, url: URL): Promise<Response> {
   const deps: AgentsApiDeps = {
     now: () => Date.now(),
     surface: { tenantId, deps: surfaceDeps(env) },
+    // The owner's pick, as the console's picker stores it (agents-api/model.ts): the key acts for the owner.
+    models: {
+      userModels: userModelsFrom(env as unknown as Record<string, unknown>, operatorModelOf(env).providers),
+      defaultModel: env.HARNESS_MODEL,
+      layers: (agentId) => d1ModelChoices(env.CONTROL_DB).layers(tenantId, agentId),
+      put: (agentId, choiceId) => d1ModelChoices(env.CONTROL_DB).put({ tenantId, agentId, choiceId, setBy: `api:${ownerAgentId}`, setAt: Date.now() }),
+      remove: async (agentId) => { await d1ModelChoices(env.CONTROL_DB).remove(tenantId, agentId); },
+    },
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
     // The agent's object pushes after every change; the stream reads when it hears (agents-api/watch.ts).
     watch: async (agentId) => {

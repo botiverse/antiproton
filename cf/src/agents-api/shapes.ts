@@ -45,6 +45,12 @@ export interface FunctionTool { name: string; description: string; parameters: R
 export interface StoredAgent {
   name: string | null;
   instructions: string | null;
+  /**
+   * A record of what the caller asked for, not what runs: "default" or an option's id when the API took a pick,
+   * but any string at all in a record made before `model` was the owner's pick (an echo of which changes nothing,
+   * model.ts planModel). The API answers with what runs instead (model.ts effectiveModel); the pick itself is
+   * kept in model_choices, where the console's picker and an admin's rows are read beside it.
+   */
   model: string;
   metadata: Record<string, string>;
   tools: FunctionTool[];
