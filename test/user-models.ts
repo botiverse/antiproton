@@ -326,6 +326,37 @@ await check("route: an id that is not offered is 422 and stores nothing; a missi
   } finally { env.AI_GATEWAY_TOKEN = saved; }
 });
 
+await check("route: with hx-request a 200 is the block's HTML and a 409 or 422 stays JSON {error: {code, message}}; without it a 200 is JSON", async () => {
+  const send = async (method: "GET" | "POST", fields: Record<string, string> | null, hx: boolean) => {
+    const headers: Record<string, string> = { cookie: mine, ...(hx ? { "hx-request": "true" } : {}) };
+    if (method === "POST") Object.assign(headers, { "content-type": "application/x-www-form-urlencoded", "sec-fetch-site": "same-origin" });
+    const r = await worker.fetch(new Request(`https://console.test/ui/agent/model?agentId=${A}`, { method, headers, ...(fields ? { body: new URLSearchParams(fields) } : {}) }), env as never);
+    const text = await r.text();
+    responses.push(text);
+    return { status: r.status, type: r.headers.get("content-type") ?? "", text };
+  };
+  const isError = (x: { type: string; text: string }, code: string) => {
+    if (!/^application\/json/.test(x.type)) return false;
+    const j = JSON.parse(x.text);
+    return show(Object.keys(j)) === '["error"]' && show(Object.keys(j.error)) === '["code","message"]' && j.error.code === code && typeof j.error.message === "string";
+  };
+  const block = await send("POST", { agentId: A, choice: LUNA.id }, true);
+  must(block.status === 200 && /^text\/html/.test(block.type) && block.text.startsWith('<div class="card">')
+    && block.text.includes("<b>GPT-5.6 Luna</b>") && block.text.includes(`<option value="${LUNA.id}" selected>`), `a pick with hx-request: ${block.status} ${block.type} ${block.text.slice(0, 200)}`);
+  const read = await send("GET", null, true);
+  must(read.status === 200 && /^text\/html/.test(read.type) && read.text.includes("<b>GPT-5.6 Luna</b>"), `a read with hx-request: ${read.status} ${read.type} ${read.text.slice(0, 200)}`);
+  const unknown = await send("POST", { agentId: A, choice: "no-such-option" }, true);
+  must(unknown.status === 422 && isError(unknown, "unknown_choice"), `422 with hx-request: ${unknown.status} ${unknown.type} ${unknown.text.slice(0, 200)}`);
+  await overrides.put({ tenantId: T, agentId: A, provider: "deepseek", model: "deepseek-v4-pro", setBy: "adm", setAt: 1 });
+  try {
+    const locked = await send("POST", { agentId: A, choice: FLASH.id }, true);
+    must(locked.status === 409 && isError(locked, "locked"), `409 with hx-request: ${locked.status} ${locked.type} ${locked.text.slice(0, 200)}`);
+  } finally { await overrides.remove(T, A); }
+  // Control: the same pick without hx-request is the data, not the panel.
+  const data = await send("POST", { agentId: A, choice: "default" }, false);
+  must(data.status === 200 && /^application\/json/.test(data.type) && JSON.parse(data.text).selected === null, `a pick without hx-request: ${data.status} ${data.type} ${data.text.slice(0, 200)}`);
+});
+
 await check("route: a stored pick whose option was removed reads as no pick and runs the default, and returns when the option does", async () => {
   await postModel({ agentId: A, choice: LUNA.id });
   env.USER_MODELS = [FLASH];
