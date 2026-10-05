@@ -50,7 +50,8 @@ function fake() {
   let t = 1_800_000_000_000, n = 0;
   const agents = new Map<string, StoredAgent>(), sessions = new Map<string, StoredSession>();
   const picks = new Map<string, string>();
-  const admin = { agent: new Map<string, { provider: string; model: string }>(), tenant: null as { provider: string; model: string } | null };
+  const admin = { agent: new Map<string, { provider: string; model: string }>(), tenant: null as { provider: string; model: string } | null, deployment: null as { provider: string; model: string } | null };
+  let failPut = false;
   const adopted: string[] = [];
   const deps: AgentsApiDeps = {
     now: () => (t += 1000),
@@ -59,7 +60,7 @@ function fake() {
     mintAgentId: () => `agent_${++n}`,
     mintSessionId: () => `sess_${++n}`,
     index: {
-      putAgent: async (id, a) => { agents.set(id, a); },
+      putAgent: async (id, a) => { if (failPut) throw new Error("index down"); agents.set(id, a); },
       getAgent: async (id) => agents.get(id) ?? null,
       listAgents: async () => [...agents.entries()].map(([id, agent]) => ({ id, agent })),
       deleteAgent: async (id) => agents.delete(id),
@@ -79,12 +80,12 @@ function fake() {
     },
     models: {
       userModels: UM, defaultModel: "deepseek-flash",
-      layers: async (id): Promise<ModelLayers> => ({ agent: admin.agent.get(id) ?? null, tenant: admin.tenant, deployment: null, owner: picks.get(id) ?? null }),
+      layers: async (id): Promise<ModelLayers> => ({ agent: admin.agent.get(id) ?? null, tenant: admin.tenant, deployment: admin.deployment, owner: picks.get(id) ?? null }),
       put: async (id, choice) => { picks.set(id, choice); },
       remove: async (id) => { picks.delete(id); },
     },
   };
-  return { deps, agents, sessions, picks, admin, adopted };
+  return { deps, agents, sessions, picks, admin, adopted, failPut: (v: boolean) => { failPut = v; } };
 }
 const call = async (deps: AgentsApiDeps, method: string, path: string, body?: unknown, qs = "") => {
   const r = (await handleAgentsApi(method, path, new URLSearchParams(qs), body, deps))!;
@@ -140,7 +141,7 @@ await check("update: `model` moves the pick, `default` clears it, and an update 
   must(s.body.agent.model === "gpt-5.6-luna", `session.agent.model: ${show(s.body.agent)}`);
 });
 
-await check("an admin's row: the agent reads as the admin's model; another option is 409 `model_locked` and stores nothing; `default` and the name read back are accepted, the latter changing nothing", async () => {
+await check("an admin's row: the agent reads as the admin's model; another option or `default` is 409 `model_locked` and stores nothing; the name read back is accepted and changes nothing", async () => {
   const f = fake();
   const a = await call(f.deps, "POST", "/agents", { model: "gpt-5.6-luna" });
   const id = a.body.id;
@@ -153,8 +154,10 @@ await check("an admin's row: the agent reads as the admin's model; another optio
   const echo = await call(f.deps, "POST", `/agents/${id}`, { model: "deepseek/deepseek-v4-pro" });
   must(echo.status === 200 && echo.body.model === "deepseek/deepseek-v4-pro", `echo: ${echo.status} ${show(echo.body)}`);
   must(f.picks.get(id) === LUNA.id, "echoing the admin's model cleared the owner's pick");
-  // `default` under the lock is accepted and clears the pick, which only matters once the row is gone.
-  must((await call(f.deps, "POST", `/agents/${id}`, { model: "default" })).status === 200 && !f.picks.has(id), "default under a lock");
+  // `default` under the lock is refused too, as the console's picker refuses clearing: it would not change what runs.
+  const def = await call(f.deps, "POST", `/agents/${id}`, { model: "default", instructions: "changed" });
+  must(def.status === 409 && def.body.error.code === "model_locked", `default under a lock: ${def.status} ${show(def.body)}`);
+  must(f.picks.get(id) === LUNA.id && f.agents.get(id)!.instructions === null, "a refused `default` under a lock changed the pick or the agent");
   // The admin's name is accepted only while it is what runs: with the row gone it is an unknown model.
   f.admin.agent.delete(id);
   must((await call(f.deps, "POST", `/agents/${id}`, { model: "deepseek/deepseek-v4-pro" })).status === 400, "a stale echo was accepted");
@@ -163,7 +166,71 @@ await check("an admin's row: the agent reads as the admin's model; another optio
   const c = await call(f.deps, "POST", "/agents", { model: "gpt-5.6-luna" });
   must(c.status === 409 && c.body.error.code === "model_locked" && f.agents.size === 1, `create under a tenant row: ${c.status} ${show(c.body)}`);
   const d = await call(f.deps, "POST", "/agents", { model: "default" });
-  must(d.status === 200 && d.body.model === "deepseek/deepseek-v4-pro", `default under a tenant row: ${show(d.body)}`);
+  must(d.status === 409 && d.body.error.code === "model_locked" && f.agents.size === 1, `default under a tenant row: ${d.status} ${show(d.body)}`);
+  const e = await call(f.deps, "POST", "/agents", { model: "deepseek/deepseek-v4-pro" });
+  must(e.status === 200 && e.body.model === "deepseek/deepseek-v4-pro" && !f.picks.has(e.body.id), `the admin's name under a tenant row: ${show(e.body)} ${show([...f.picks])}`);
+});
+
+await check("echoing the default's option id stores no pick: the agent still follows the deployment, not pinned above its row", async () => {
+  const f = fake();
+  const a = await call(f.deps, "POST", "/agents", { model: "default" });
+  const id = a.body.id;
+  must(a.body.model === "deepseek-flash", `read back: ${show(a.body)}`);
+  const u = await call(f.deps, "POST", `/agents/${id}`, { ...a.body, instructions: "edited" });
+  must(u.status === 200 && u.body.model === "deepseek-flash" && u.body.instructions === "edited", `echo: ${u.status} ${show(u.body)}`);
+  must(!f.picks.has(id), `echoing the read-back name stored a pick: ${show([...f.picks])}`);
+  // An admin's deployment row now applies to the agent; a pick would have outranked it.
+  f.admin.deployment = { provider: LUNA.provider, model: LUNA.model };
+  must((await call(f.deps, "GET", `/agents/${id}`)).body.model === "gpt-5.6-luna", "the agent does not follow the deployment row");
+  // Created with the read-back name, too: nothing is pinned.
+  f.admin.deployment = null;
+  const c = await call(f.deps, "POST", "/agents", { model: "deepseek-flash" });
+  must(c.status === 200 && !f.picks.has(c.body.id), `create with the read-back name stored a pick: ${show([...f.picks])}`);
+});
+
+await check("an admin's row on an option: echoing that option's id keeps the owner's pick", async () => {
+  const f = fake();
+  const a = await call(f.deps, "POST", "/agents", { model: "gpt-5.6-luna" });
+  const id = a.body.id;
+  // The owner pins the default's option in the console's picker, then an admin moves the agent to Luna.
+  f.picks.set(id, FLASH.id);
+  f.admin.agent.set(id, { provider: LUNA.provider, model: LUNA.model });
+  const read = await call(f.deps, "GET", `/agents/${id}`);
+  must(read.body.model === "gpt-5.6-luna", `read back under the admin's row: ${show(read.body)}`);
+  const echo = await call(f.deps, "POST", `/agents/${id}`, { model: "gpt-5.6-luna" });
+  must(echo.status === 200 && echo.body.model === "gpt-5.6-luna", `echo: ${echo.status} ${show(echo.body)}`);
+  must(f.picks.get(id) === FLASH.id, `echoing the admin's option overwrote the owner's pick: ${show([...f.picks])}`);
+  // The owner's pick comes back when the row goes.
+  f.admin.agent.delete(id);
+  must((await call(f.deps, "GET", `/agents/${id}`)).body.model === "deepseek-flash", "the owner's pick did not return");
+});
+
+await check("an agent created before `model` was the pick: sending back its old string changes nothing; another unknown string is 400", async () => {
+  const f = fake();
+  const legacy: StoredAgent = { name: "old", instructions: null, model: "gpt-6-astra", metadata: {}, tools: [], createdAt: 1, updatedAt: 1 };
+  f.agents.set("agent_old", legacy);
+  must((await call(f.deps, "GET", "/agents/agent_old")).body.model === "deepseek-flash", "a legacy agent does not read as what runs");
+  const u = await call(f.deps, "POST", "/agents/agent_old", { model: "gpt-6-astra", instructions: "edited" });
+  must(u.status === 200 && u.body.model === "deepseek-flash" && u.body.instructions === "edited", `legacy echo: ${u.status} ${show(u.body)}`);
+  must(!f.picks.has("agent_old") && f.agents.get("agent_old")!.model === "gpt-6-astra", `legacy echo stored a pick or lost the record: ${show([...f.picks])} ${f.agents.get("agent_old")!.model}`);
+  // Twice: the record still holds it.
+  must((await call(f.deps, "POST", "/agents/agent_old", { model: "gpt-6-astra" })).status === 200, "a second legacy echo");
+  const bad = await call(f.deps, "POST", "/agents/agent_old", { model: "gpt-7" });
+  must(bad.status === 400 && bad.body.error.code === "model_not_found", `another unknown string: ${bad.status} ${show(bad.body)}`);
+});
+
+await check("delete removes the agent's pick; a create whose index row fails leaves no pick", async () => {
+  const f = fake();
+  const a = await call(f.deps, "POST", "/agents", { model: "gpt-5.6-luna" });
+  must(f.picks.has(a.body.id), "no pick to delete");
+  must((await call(f.deps, "DELETE", `/agents/${a.body.id}`)).status === 200 && !f.picks.has(a.body.id), `the pick outlived its agent: ${show([...f.picks])}`);
+  f.failPut(true);
+  let threw = false;
+  try { await call(f.deps, "POST", "/agents", { model: "gpt-5.6-luna" }); } catch { threw = true; }
+  must(threw && f.picks.size === 0, `a create that failed at its index row left a pick: ${threw} ${show([...f.picks])}`);
+  threw = false;
+  try { await call(f.deps, "POST", "/agents/sessions", { agent: { model: "gpt-5.6-luna" }, environment: { type: "none" } }); } catch { threw = true; }
+  must(threw && f.picks.size === 0, `an inline create that failed at its index row left a pick: ${threw} ${show([...f.picks])}`);
 });
 
 // ---- through the Worker, to the binding --------------------------------------

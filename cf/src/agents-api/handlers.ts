@@ -118,14 +118,16 @@ async function shown(deps: AgentsApiDeps, id: string, a: StoredAgent): Promise<S
   return { ...a, model: await effectiveModel(deps.models, id) };
 }
 
-/** Check the requested model for `id`, write the pick, and give back the record with the model as stored. */
-async function chooseModel(deps: AgentsApiDeps, id: string, a: StoredAgent, param: string): Promise<{ ok: true; agent: StoredAgent } | Refusal> {
-  const plan = await planModel(deps.models, id, a.model, param);
+/**
+ * Check the requested model for `id` and give back the record with the model as stored, and the pick's write.
+ * The caller writes the index row first and the pick after it: a create that fails at its index row then leaves
+ * no pick behind for an agent that was never made. `prior` is the record before an update.
+ */
+async function chooseModel(deps: AgentsApiDeps, id: string, a: StoredAgent, param: string, prior?: StoredAgent):
+  Promise<{ ok: true; agent: StoredAgent; apply(): Promise<void> } | Refusal> {
+  const plan = await planModel(deps.models, id, a.model, param, prior?.model);
   if (!plan.ok) return plan;
-  // Before the index row: a create refused or failed here has made no agent, and a pick for an id that never
-  // got one is read by nothing.
-  await plan.apply();
-  return { ok: true, agent: { ...a, model: plan.stored } };
+  return { ok: true, agent: { ...a, model: plan.stored }, apply: plan.apply };
 }
 
 async function sessionObject(deps: AgentsApiDeps, s: StoredSession) {
@@ -227,6 +229,7 @@ export async function handleAgentsApi(
         if (!chosen.ok) return refuse(chosen);
         agent = chosen.agent;
         await deps.index.putAgent(agentId, agent);
+        await chosen.apply();
       }
       const now = deps.now();
       const session: StoredSession = {
@@ -363,6 +366,7 @@ export async function handleAgentsApi(
     if (!chosen.ok) return refuse(chosen);
     // The index row before the agent's object: a create that fails there has made nothing, so a retry cannot duplicate it.
     await deps.index.putAgent(id, chosen.agent);
+    await chosen.apply();
     await repairedLater(deps.agents.adopt(id, chosen.agent));
     return ok(toOpenAIAgent(id, await shown(deps, id, chosen.agent)));
   }
@@ -393,18 +397,24 @@ export async function handleAgentsApi(
     const a = await deps.index.getAgent(id);
     if (!a) return notFound("agent", id);
     if (method === "GET") return ok(toOpenAIAgent(id, await shown(deps, id, a)));
-    if (method === "DELETE") { await deps.index.deleteAgent(id); return ok(agentDeleted(id)); }
+    if (method === "DELETE") {
+      await deps.index.deleteAgent(id);
+      // Its pick too: model_choices is keyed by the agent, and no agent is left to read it.
+      await deps.models.remove(id);
+      return ok(agentDeleted(id));
+    }
     if (method === "POST") {
       const parsed = parseAgentParams(body, "update", a, deps.now());
       if (!parsed.ok) return refuse(parsed);
       // An update without `model` leaves the pick as it is, whoever made it.
-      let next = parsed.value;
+      let next = parsed.value, apply = async () => {};
       if (isObj(body) && body.model !== undefined) {
-        const chosen = await chooseModel(deps, id, parsed.value, "model");
+        const chosen = await chooseModel(deps, id, parsed.value, "model", a);
         if (!chosen.ok) return refuse(chosen);
-        next = chosen.agent;
+        next = chosen.agent; apply = chosen.apply;
       }
       await deps.index.putAgent(id, next);
+      await apply();
       await repairedLater(deps.agents.adopt(id, next));
       return ok(toOpenAIAgent(id, await shown(deps, id, next)));
     }
