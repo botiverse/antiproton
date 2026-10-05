@@ -614,3 +614,59 @@ export function d1ModelOverrides(db: D1Database): ModelOverrides {
     },
   };
 }
+
+/** An owner's pick for one agent (0015_model_choices.sql): the id of a USER_MODELS option. */
+export interface ModelChoiceRow { tenantId: string; agentId: string; choiceId: string; setBy: string; setAt: number }
+
+/**
+ * Everything that may decide an agent's operator model, each scope separately, so the order between the admin's rows
+ * and the owner's pick is decided in one place (cf/src/model-request.ts resolveModel) rather than in SQL.
+ */
+export interface ModelLayers {
+  agent: { provider: string | null; model: string } | null;
+  tenant: { provider: string | null; model: string } | null;
+  deployment: { provider: string | null; model: string } | null;
+  /** The owner's option id, as stored: whether it is still offered is the resolver's question. */
+  owner: string | null;
+}
+
+export interface ModelChoices {
+  layers(tenantId: string, agentId: string): Promise<ModelLayers>;
+  put(c: ModelChoiceRow): Promise<void>;
+  remove(tenantId: string, agentId: string): Promise<boolean>;
+}
+
+export function d1ModelChoices(db: D1Database): ModelChoices {
+  const chosen = (x: any) => ({ provider: x.provider === null || x.provider === undefined ? null : String(x.provider), model: String(x.model) });
+  return {
+    async layers(tenantId, agentId) {
+      // One statement, so a run that binds reads the model once, as it did before owners could choose
+      // (test/hook-fast-ack.ts counts those reads). `model_overrides` is named within the first 80 characters,
+      // which is what that count matches on.
+      const r = await db.prepare(
+        `SELECT tenant_id, agent_id, provider, model, 0 AS owner FROM model_overrides
+          WHERE (tenant_id = ?1 AND agent_id = ?2) OR (tenant_id = ?1 AND agent_id = '') OR (tenant_id = '' AND agent_id = '')
+         UNION ALL
+         SELECT tenant_id, agent_id, NULL, choice_id, 1 FROM model_choices WHERE tenant_id = ?1 AND agent_id = ?2`,
+      ).bind(tenantId, agentId).all<any>();
+      const out: ModelLayers = { agent: null, tenant: null, deployment: null, owner: null };
+      for (const x of r.results ?? []) {
+        if (Number(x.owner) === 1) out.owner = String(x.model);
+        else if (x.agent_id !== "") out.agent = chosen(x);
+        else if (x.tenant_id !== "") out.tenant = chosen(x);
+        else out.deployment = chosen(x);
+      }
+      return out;
+    },
+    async put(c) {
+      await db.prepare(
+        `INSERT INTO model_choices (tenant_id, agent_id, choice_id, set_by, set_at) VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT (tenant_id, agent_id) DO UPDATE SET choice_id = excluded.choice_id, set_by = excluded.set_by, set_at = excluded.set_at`,
+      ).bind(c.tenantId, c.agentId, c.choiceId, c.setBy, c.setAt).run();
+    },
+    async remove(tenantId, agentId) {
+      const r = await db.prepare("DELETE FROM model_choices WHERE tenant_id = ? AND agent_id = ?").bind(tenantId, agentId).run();
+      return (r.meta?.changes ?? 0) > 0;
+    },
+  };
+}
