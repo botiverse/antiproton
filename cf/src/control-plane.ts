@@ -579,9 +579,12 @@ export function d1Connectors(db: D1Database): ConnectorStore {
  */
 export interface ModelOverride { tenantId: string; agentId: string; provider: string | null; model: string; setBy: string; setAt: number }
 
+/**
+ * The admin's rows, written and listed. Nothing here says which row decides an agent: that is d1ModelChoices.layers
+ * read through resolveModel (cf/src/model-request.ts), the one place the order between scopes and the owner's pick
+ * is kept, so a second rule cannot drift from it.
+ */
 export interface ModelOverrides {
-  /** The most specific choice for this agent: its own, then its tenant's, then the deployment's; null for the env default. */
-  effective(tenantId: string, agentId: string): Promise<{ provider: string | null; model: string } | null>;
   list(): Promise<ModelOverride[]>;
   put(o: ModelOverride): Promise<void>;
   remove(tenantId: string, agentId: string): Promise<boolean>;
@@ -590,14 +593,6 @@ export interface ModelOverrides {
 export function d1ModelOverrides(db: D1Database): ModelOverrides {
   const providerOf = (x: any) => (x.provider === null || x.provider === undefined ? null : String(x.provider));
   return {
-    async effective(tenantId, agentId) {
-      const r = await db.prepare(
-        `SELECT provider, model FROM model_overrides
-          WHERE (tenant_id = ?1 AND agent_id = ?2) OR (tenant_id = ?1 AND agent_id = '') OR (tenant_id = '' AND agent_id = '')
-          ORDER BY (tenant_id <> '') + (agent_id <> '') DESC LIMIT 1`,
-      ).bind(tenantId, agentId).first<any>();
-      return r ? { provider: providerOf(r), model: String(r.model) } : null;
-    },
     async list() {
       const r = await db.prepare("SELECT * FROM model_overrides ORDER BY tenant_id, agent_id").all<any>();
       return (r.results ?? []).map((x) => ({ tenantId: String(x.tenant_id), agentId: String(x.agent_id), provider: providerOf(x), model: String(x.model), setBy: String(x.set_by), setAt: Number(x.set_at) }));
