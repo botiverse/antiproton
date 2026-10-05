@@ -2778,15 +2778,27 @@ export class AgentRuntime {
     const settled: Array<{ operationId: string; status: string }> = [];
     for (const session of sessions) {
       const agent = await this.agent(tenantId, agentId, session);
-      const out = await agent.step();
+      let out = await agent.step();
       // A turn paused for an API caller's function results continues once they
-      // have all arrived; the next pass drives the run this starts.
-      const resumed = out.open === 0 && await agent.resumeClientCalls();
-      open += out.open + (resumed ? 1 : 0);
+      // have all arrived, and this pass drives the run that starts: a second
+      // step, so the next model call is sent now rather than by an alarm armed
+      // for 0 ms that would do only that (#778). Bounded at one: a resume needs
+      // every paused call answered, and the run it starts cannot pause on a
+      // client call again before a model answer, which only a later delivery
+      // brings. pd never resumes here (its engine resumes when answered), so it
+      // takes one step as before. That step's outcome is this session's, like
+      // any step's — its open run, its wake — and if it throws the pass fails
+      // as a first step's throw does: the alarm's fallback is already armed and
+      // the session is still marked, by the results that woke this pass.
+      if (out.open === 0 && await agent.resumeClientCalls()) {
+        const before = out.settled;
+        out = await agent.step();
+        out = { ...out, settled: [...before, ...out.settled] };
+      }
+      open += out.open;
       settled.push(...out.settled);
-      const wake = resumed ? 0 : out.wakeInMs;
-      if (wake !== null) wakeInMs = wakeInMs === null ? wake : Math.min(wakeInMs, wake);
-      if (!pd) markSession(sql, session, resumed || out.open > 0 || out.wakeInMs !== null);
+      if (out.wakeInMs !== null) wakeInMs = wakeInMs === null ? out.wakeInMs : Math.min(wakeInMs, out.wakeInMs);
+      if (!pd) markSession(sql, session, out.open > 0 || out.wakeInMs !== null);
     }
     // A finished run should not still be holding a metered container — either
     // by handing it back at once, or, where the deployment leases them, by
