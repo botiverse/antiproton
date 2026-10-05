@@ -152,6 +152,26 @@ is evidence. As of 2026-09-19, over the 26 records on this manifest:
 **Real sequences, and a cause that means something, need a `build` of
 `ea4c913` or later.**
 
+## Reading a τ² record: `runnerMethod`, and which runner drove it
+
+Two runners write τ² records into one series. A record with `runnerMethod:
+"agents-api"` was driven over the public Agents API (`bench/tau2/api.ts`); a
+record without the field was driven over the `/bench` routes
+(`bench/tau2/cf.ts`), the only runner there was before the field existed, and
+reads as `"bench"` (`runnerMethodOf` in `bench/tau2/api-record.ts`). Compare
+the two only as two methods: the fields an `agents-api` record computes
+differently, and how, are listed in that file. The ones a reader trips on:
+
+- `model` is the model the rows ran on, read from the usage ledger;
+  `modelRequested` is what the agents were created with (`default`, or an
+  option such as `gpt-5.6-luna`). `/bench` records carry only `model`, the
+  runner's `HARNESS_MODEL`.
+- `wait` is `sse`, and `delivered.push` counts answers that arrived on the
+  session's event stream.
+- `activity.pollMs` is 0 by construction: the runner's watching goes through
+  the Worker and never wakes the agent's object, so it is not in the object's
+  bill the way `/bench/poll` was.
+
 ## Publishing a run
 
 `bench/record.ts` writes each record under `report/runs/<day>/` in the working

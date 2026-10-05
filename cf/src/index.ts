@@ -2969,6 +2969,11 @@ function consoleRefusal(request: Request, error: string, status: number): Respon
 /**
  * `/admin/api-keys` (automation token only): issue a key for an owner. The key
  * is in this one response and nowhere else; the table keeps its hash.
+ *
+ * `{revoke: <key>}` revokes one, so a program that minted a key for one run can
+ * end it with the run (bench/tau2/api.ts) rather than leave a live key behind.
+ * Named by the key itself, which only its holder has: the answer says whether a
+ * live key was revoked, and nothing about any other.
  */
 async function adminApiKeys(request: Request, env: Env): Promise<Response> {
   if (!env.AUTOMATION_TOKEN || request.headers.get("x-harness-token") !== env.AUTOMATION_TOKEN) {
@@ -2976,6 +2981,10 @@ async function adminApiKeys(request: Request, env: Env): Promise<Response> {
   }
   if (request.method !== "POST") return Response.json({ error: "POST" }, { status: 405 });
   const b = (await request.json().catch(() => null)) as any;
+  if (b && typeof b === "object" && "revoke" in b) {
+    if (typeof b.revoke !== "string" || !b.revoke) return Response.json({ error: "revoke names a key" }, { status: 400 });
+    return Response.json({ revoked: await d1ApiKeys(env.CONTROL_DB).revoke(await hashApiKey(b.revoke)) });
+  }
   const tenantId = String(b?.tenantId ?? ""), ownerAgentId = String(b?.ownerAgentId ?? ""), label = String(b?.label ?? "");
   try { agentObjectName(tenantId, ownerAgentId); } catch (e: any) { return Response.json({ error: String(e?.message ?? e) }, { status: 400 }); }
   const key = newApiKey();
@@ -3564,9 +3573,10 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
         try { body = JSON.parse((await request.text()) || "{}"); } catch { return Response.json({ error: { code: "invalid_json", message: "the body is not JSON" } }, { status: 400 }); }
       }
       const providers = operatorModelOf(env).providers;
+      const userModels = userModelsFrom(env as unknown as Record<string, unknown>, providers);
       return adminModels(request.method, body, v!.sub ?? v!.email, {
         overrides: d1ModelOverrides(env.CONTROL_DB), providers, defaults: { model: env.HARNESS_MODEL }, now: Date.now,
-        userModelsError: userModelsFrom(env as unknown as Record<string, unknown>, providers).error,
+        userModelsError: userModels.error, options: userModels.offered,
       });
     }
     if (url.pathname.startsWith("/v1/")) return v1(request, env, url);

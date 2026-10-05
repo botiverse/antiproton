@@ -7,6 +7,7 @@ import { adminModels } from "../cf/src/admin-models.ts";
 import { isAdmin, type Viewer } from "../cf/src/auth.ts";
 import type { ModelOverride } from "../cf/src/control-plane.ts";
 import { providersFrom } from "../src/model/providers.ts";
+import { userModelsFrom } from "../src/model/user-models.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => void | Promise<void>) {
@@ -92,6 +93,29 @@ await check("a model must be named the way its provider names models, under a pr
   must(off.status === 422 && off.body.error.code === "unavailable" && /AI_GATEWAY_TOKEN not set/.test(off.body.error.message) && s.rows.size === 0, `a provider without its secret was accepted: ${off.text}`);
   const listed = await call("GET", undefined, s, noToken);
   must(listed.body.providers.find((p: any) => p.id === "cloudflare").available === false, "an unavailable provider was listed as available");
+});
+
+await check("GET lists the options an owner may pick now, by id, provider and model, so an API model name can be read as a provider", async () => {
+  const USER_MODELS = [
+    { id: "deepseek-flash", label: "DeepSeek Flash", provider: "deepseek", model: "deepseek-flash" },
+    { id: "gpt-5.6-luna", label: "GPT-5.6 Luna", provider: "cloudflare", model: "openai/gpt-5.6-luna" },
+  ];
+  const list = async (env: Record<string, unknown>) => {
+    const providers = providersFrom(env);
+    const r = await adminModels("GET", undefined, "github:1", {
+      overrides: store().overrides, providers, defaults: { model: "deepseek-flash" }, now: () => 7,
+      options: userModelsFrom({ ...env, USER_MODELS }, providers).offered,
+    });
+    return JSON.parse(await r.text());
+  };
+  const all = await list(ENV);
+  must(JSON.stringify(all.options) === JSON.stringify(USER_MODELS), JSON.stringify(all.options));
+  // An option whose provider has no secret is not offered (src/model/user-models.ts), so it is not listed either.
+  const { AI_GATEWAY_TOKEN: _, ...noToken } = ENV;
+  must(JSON.stringify((await list(noToken)).options.map((o: any) => o.id)) === '["deepseek-flash"]', "an option that cannot be picked was listed");
+  // A deployment that offers none says so with an empty list, not by leaving the field out.
+  const none = await call("GET", undefined);
+  must(Array.isArray(none.body.options) && none.body.options.length === 0, JSON.stringify(none.body));
 });
 
 await check("a deployment without MODEL_PROVIDERS offers DeepSeek alone", async () => {
