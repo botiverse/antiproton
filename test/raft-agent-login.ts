@@ -408,6 +408,26 @@ await check("origin pinning: a manifest whose base is another host sends nothing
   must(!w.seen.some((r) => r.headers.cookie), "a cookie was sent while the action was refused");
 });
 
+await check("a manifest base_url with a path is refused and nothing is sent; one with no path, with or without a trailing slash, works", async () => {
+  for (const base_url of [`${APP}/v1`, `${APP}/v1/`]) {
+    const w = world({ manifest: manifest({ execution: { mode: "http_api", base_url } }) });
+    w.install();
+    const m = mount();
+    const e = await failure(() => m.plugin.invoke("integrations_invoke", { service: "reminder-app", action: "list-reminders" }, m.ctx));
+    must(/base_url with a path is not supported/.test(e.message), `${base_url}: ${e.message}`);
+    must(w.actions().length === 0 && w.logins.length === 0 && w.callbacks().length === 0, `${base_url}: requests were sent: ${w.seen.map((r) => r.url).join()}`);
+    const listed = await failure(() => m.plugin.invoke("integrations_actions", { service: "reminder-app" }, m.ctx));
+    must(/base_url with a path is not supported/.test(listed.message), `${base_url}: listing: ${listed.message}`);
+  }
+  for (const base_url of [APP, `${APP}/`]) {
+    const w = world({ manifest: manifest({ execution: { mode: "http_api", base_url } }) });
+    w.install();
+    const m = mount();
+    const out = await m.plugin.invoke("integrations_invoke", { service: "reminder-app", action: "list-reminders" }, m.ctx) as any;
+    must(out.result?.ok === true && w.actions().length === 1 && w.actions()[0]!.url === `${APP}/api/raft/actions/list-reminders`, `${base_url}: ${JSON.stringify(out)}`);
+  }
+});
+
 await check("redirects are never followed: not the callback's, and an action answered with one is a failure, not a hop", async () => {
   const w = world({ callbackRedirectsTo: "https://collector.example/steal" });
   w.install();

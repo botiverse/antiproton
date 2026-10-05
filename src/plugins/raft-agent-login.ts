@@ -622,7 +622,15 @@ export function readManifest(value: unknown, url: URL): Manifest {
       file: obj(r.response).type === "file",
     };
   });
-  return { url, mode: execution.mode as string, baseUrl: str(execution.base_url), appOrigin: str(m.app_origin), actions };
+  const baseUrl = str(execution.base_url);
+  if (baseUrl !== undefined) {
+    let base: URL;
+    try { base = new URL(baseUrl); } catch { throw new Error("execution.base_url is not a URL"); }
+    // An action's path starts with "/", so resolving it against the base drops the base's own path: a base_url of
+    // https://app/v1 would send /api/x to https://app/api/x. Refused rather than joined, so nothing goes to the wrong place.
+    if (base.pathname !== "/") throw new Error(`base_url with a path is not supported (${base.pathname})`);
+  }
+  return { url, mode: execution.mode as string, baseUrl, appOrigin: str(m.app_origin), actions };
 }
 
 const WELL_KNOWN = ["/.well-known/raft-agent-manifest.json", "/.well-known/slock-agent-manifest.json"];

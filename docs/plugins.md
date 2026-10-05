@@ -463,7 +463,7 @@ Raft alone. `approval_required` and `install_required` are handed back as Raft
 gave them, with the card Raft posts when the call names a `target`; an action
 the app answers 401 is sent once more after a fresh login. Only v0 manifests
 (`raft-agent-manifest.v0`) with `http_api` actions that answer JSON or text are
-run; `test/raft-agent-login.ts` holds all of it against a fake Raft and a fake
+run, and a manifest whose `base_url` has a path is refused rather than joined; `test/raft-agent-login.ts` holds all of it against a fake Raft and a fake
 app.
 
 **`replay: "never"` overrides the read rule.** A tool that declares it is not
