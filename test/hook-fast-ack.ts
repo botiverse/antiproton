@@ -158,10 +158,11 @@ type World = Awaited<ReturnType<typeof world>>;
 /** A push as a service sends it; the answer's status and body, and the D1 statements it cost. */
 async function push(w: World, id: string, text: string, headers: Record<string, string> = {}, body?: BodyInit) {
   const before = w.d1.log.length;
-  const res = await worker.fetch(new Request(`https://x/hooks/${w.hookId}`, {
+  // Bounded, so a worker that waits on a stuck object forever fails the case that sent it rather than hanging the suite.
+  const res = await Promise.race([worker.fetch(new Request(`https://x/hooks/${w.hookId}`, {
     method: "POST", headers: { "x-signed-with": w.secret, "content-type": "application/json", ...headers },
     body: body ?? JSON.stringify({ id, text }),
-  }), w.env as never);
+  }), w.env as never), sleep(10_000).then(() => { throw new Error("no answer within 10 s: the worker is still waiting on the object"); })]);
   return { status: res.status, body: await res.text(), retryAfter: res.headers.get("retry-after"), d1: w.d1.log.slice(before) };
 }
 
