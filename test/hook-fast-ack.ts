@@ -23,6 +23,7 @@ register("data:text/javascript," + encodeURIComponent(
 const { AgentDO, default: worker } = await import("../cf/src/index.ts");
 const { clearHookRoutes, HOOK_ROUTE_TTL_MS } = await import("../cf/src/hook-route.ts");
 const { setLogSink } = await import("../src/core/log.ts");
+const { USAGE_WAKE_DELAY_MS } = await import("../cf/src/usage-flush.ts");
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void>) {
@@ -45,11 +46,14 @@ setLogSink((line) => { try { lines.push(JSON.parse(line)); } catch { /* not ours
  * (401 otherwise), the body is `{id, text}`, the id is the dedupe key. Headers ask for the other answers.
  */
 const received: string[] = [];
+/** The service's inbox the pushes point at: a push is only a wake to read it (Raft's notice). */
+const inbox = { messages: [] as string[], cursor: 0, reads: [] as string[][] };
 const barrier: Array<() => void> = [];
 const pushy: Plugin = {
   id: "pushy", version: "1.0.0",
   tools: [{ name: "noop", summary: "", parameters: {}, sideEffects: "read", idempotency: "native" }],
-  async invoke() { return {}; },
+  // A stand-in for Raft's inbox read (`receive_events`): what is unread, and the read acknowledges it.
+  async invoke() { const messages = inbox.messages.slice(inbox.cursor); inbox.cursor = inbox.messages.length; inbox.reads.push(messages); return { messages }; },
   async receive(event, secret) {
     if (event.headers["x-throw"]) throw new Error("the plugin fell over");
     // Held until two pushes are both inside `receive`, so both resume past the plugin's await together.
@@ -158,10 +162,11 @@ type World = Awaited<ReturnType<typeof world>>;
 /** A push as a service sends it; the answer's status and body, and the D1 statements it cost. */
 async function push(w: World, id: string, text: string, headers: Record<string, string> = {}, body?: BodyInit) {
   const before = w.d1.log.length;
-  const res = await worker.fetch(new Request(`https://x/hooks/${w.hookId}`, {
+  // Bounded, so a worker that waits on a stuck object forever fails the case that sent it rather than hanging the suite.
+  const res = await Promise.race([worker.fetch(new Request(`https://x/hooks/${w.hookId}`, {
     method: "POST", headers: { "x-signed-with": w.secret, "content-type": "application/json", ...headers },
     body: body ?? JSON.stringify({ id, text }),
-  }), w.env as never);
+  }), w.env as never), sleep(10_000).then(() => { throw new Error("no answer within 10 s: the worker is still waiting on the object"); })]);
   return { status: res.status, body: await res.text(), retryAfter: res.headers.get("retry-after"), d1: w.d1.log.slice(before) };
 }
 
@@ -863,6 +868,225 @@ await check("a route is held for an hour: served without the index just inside i
     const past = await push(w, "h3", "x");
     must(past.status === 202 && past.d1.length === 1, `just past the hour: ${show(past)}`);
   } finally { Date.now = realNow; delete (globalThis as any).caches; }
+});
+
+/**
+ * The agent's object as Cloudflare sometimes gives it: `hookReceive` held for `hold.ms` before it is even called
+ * (Infinity: never), as an object that cannot start holds every call; everything else is the real object.
+ */
+function slowObject(w: World) {
+  // `next`, when non-empty, holds the next calls in turn (one entry each) before `ms` applies again.
+  const hold = { ms: 0, next: [] as number[] };
+  const realGet = (w.env.AGENT as { get: (n: string) => any }).get;
+  w.env.AGENT = {
+    idFromName: (n: string) => n,
+    get: (n: string) => {
+      const real = realGet(n);
+      return new Proxy(real, { get(target, prop) {
+        if (prop !== "hookReceive") { const v = target[prop]; return typeof v === "function" ? v.bind(target) : v; }
+        return async (...args: unknown[]) => {
+          const ms = hold.next.length ? hold.next.shift()! : hold.ms;
+          if (ms === Infinity) return new Promise(() => {});
+          await sleep(ms);
+          return target.hookReceive(...args);
+        };
+      } });
+    },
+  };
+  return hold;
+}
+const LIMIT_MS = 150;
+
+await check("an object that never answers: the push is answered 503 Retry-After 5 at the limit, not held, nothing is queued, and the timeout is logged", async () => {
+  const w = await world();
+  w.env.HOOK_OBJECT_TIMEOUT_MS = String(LIMIT_MS);
+  const hold = slowObject(w);
+  hold.ms = Infinity;
+  lines.length = 0;
+  const started = Date.now();
+  // Bounded here, so a worker that waits on the object forever reddens this case rather than hanging the suite.
+  const r = await Promise.race([push(w, "t1", "NEVER"), sleep(3000).then(() => null)]);
+  const took = Date.now() - started;
+  must(r !== null, "no answer within 3 s: the worker is still waiting on the object");
+  must(r.status === 503 && r.retryAfter === "5" && r.body === '{"outcome":"unavailable"}', `answer: ${show(r)}`);
+  must(took >= LIMIT_MS && took < LIMIT_MS + 1000, `answered after ${took} ms with a ${LIMIT_MS} ms limit`);
+  // The object was never reached, so it never made its tables: none is as empty as an empty one.
+  const tables = (w.raw.sql.exec("SELECT name FROM sqlite_master WHERE name IN ('inbound_pending', 'inbound_events')").toArray() as any[]).length;
+  must(tables === 0 || (pendingRows(w) === 0 && outcomes(w).length === 0), `the object recorded the push: ${tables} tables`);
+  const t = lines.find((l) => l.evt === "hook.timeout");
+  must(t && t.doId === agentObjectName(T, A) && t.hook === w.hookId.slice(0, 8) && t.outcome === "503" && t.limitMs === LIMIT_MS
+    && typeof t.elapsedMs === "number" && (t.elapsedMs as number) >= LIMIT_MS, `hook.timeout line: ${show(t)}`);
+  must(!show(t).includes(w.hookId) && !show(t).includes(w.secret), `the line carries the whole hook id or the secret: ${show(t)}`);
+  const http = lines.find((l) => l.evt === "http" && l.route === "/hooks/:hook");
+  must(http?.status === 503 && http.timedOut === true, `http line: ${show(http)}`);
+});
+
+await check("a timeout is never a 202: a push with a bad signature, or for a revoked hook whose route is cached, answers 503 and queues nothing", async () => {
+  const w = await world();
+  w.env.HOOK_OBJECT_TIMEOUT_MS = String(LIMIT_MS);
+  const hold = slowObject(w);
+  must((await push(w, "warm", "WARM")).status === 202, "warming the route");
+  hold.ms = Infinity;
+  const forged = await push(w, "t2", "FORGED", { "x-signed-with": "not-the-secret" });
+  must(forged.status === 503 && forged.retryAfter === "5", `forged: ${show(forged)}`);
+  hold.ms = 0;
+  must((await worker.fetch(new Request("https://x/admin/hooks", {
+    method: "POST", headers: { "x-harness-token": TOKEN, "content-type": "application/json" }, body: JSON.stringify({ revoke: w.hookId }),
+  }), w.env as never)).status === 200, "revoke");
+  hold.ms = Infinity;
+  const revoked = await push(w, "t3", "REVOKED");
+  must(revoked.status === 503 && revoked.retryAfter === "5", `revoked, cached route: ${show(revoked)}`);
+  must(pendingRows(w) === 1, `queued ${pendingRows(w)} (the warm push only)`);
+});
+
+await check("the limit bounds the re-route too: a fast first call that disowns a cached route, then a second call that never answers, is answered 503 at the limit", async () => {
+  const w = await world();
+  w.env.HOOK_OBJECT_TIMEOUT_MS = String(LIMIT_MS);
+  const hold = slowObject(w);
+  must((await push(w, "warm", "WARM")).status === 202, "warming the route");
+  // The secret gone while the index row stays: the cached route's call answers `unrouted`, and the worker asks again.
+  must(await w.D.hookDropSecret(T, A, w.hookId), "dropping the secret");
+  hold.next = [0, Infinity];
+  lines.length = 0;
+  const started = Date.now();
+  const r = await push(w, "rr", "REROUTED");
+  const took = Date.now() - started;
+  must(hold.next.length === 0, `the object was called ${2 - hold.next.length} of 2 times`);
+  must(r.status === 503 && r.retryAfter === "5" && r.body === '{"outcome":"unavailable"}', `answer: ${show(r)}`);
+  must(took >= LIMIT_MS && took < LIMIT_MS + 1000, `answered after ${took} ms with a ${LIMIT_MS} ms limit`);
+  const http = lines.find((l) => l.evt === "http" && l.route === "/hooks/:hook");
+  must(http?.timedOut === true && http.lookup === "index-again", `http line: ${show(http)}`);
+});
+
+await check("a queued push whose wake was cut off is still posted: the duplicate retry's outbox wake arms a pass within 5 s, and that pass posts it once", async () => {
+  const w = await world();
+  must((await push(w, "q1", "QUEUED-ONLY")).status === 202, "first");
+  await (w.D as any).ctx.storage.deleteAlarm();
+  must(pendingRows(w) === 1 && w.alarmAt() === null, `control: ${pendingRows(w)} queued, alarm ${w.alarmAt()}`);
+  const again = await push(w, "q1", "QUEUED-ONLY");
+  must(again.status === 202 && again.body === '{"outcome":"duplicate"}', `retry: ${show(again)}`);
+  // Not `hookReceive`'s own wake (only a delivered push arms one): `#usageWake`, for the record the duplicate wrote.
+  const at = w.alarmAt();
+  must(at !== null && at - Date.now() <= USAGE_WAKE_DELAY_MS, `no pass within ${USAGE_WAKE_DELAY_MS} ms: alarm ${at === null ? null : at - Date.now()}`);
+  await sleep(at - Date.now());
+  await w.D.alarm();
+  must(jobCount(w) === 1 && pendingRows(w) === 0 && await timesAsked(w, "QUEUED-ONLY") === 1, `after that pass: ${jobCount(w)} jobs, ${pendingRows(w)} queued`);
+});
+
+await check("an object that answers within the limit answers exactly as before: 202, 401, 400, 429 with its Retry-After, 404, and no timeout line", async () => {
+  const w = await world();
+  w.env.HOOK_OBJECT_TIMEOUT_MS = String(LIMIT_MS * 4);
+  const hold = slowObject(w);
+  hold.ms = LIMIT_MS;
+  lines.length = 0;
+  const ok = await push(w, "f1", "FAST");
+  must(ok.status === 202 && ok.body === '{"outcome":"delivered"}' && ok.retryAfter === null, `delivered: ${show(ok)}`);
+  const dup = await push(w, "f1", "FAST");
+  must(dup.status === 202 && dup.body === '{"outcome":"duplicate"}', `duplicate: ${show(dup)}`);
+  const bad = await push(w, "f2", "x", { "x-signed-with": "wrong" });
+  must(bad.status === 401 && bad.body === '{"outcome":"rejected"}' && bad.retryAfter === null, `rejected: ${show(bad)}`);
+  const shape = await push(w, "f3", "x", { "x-malformed": "1" });
+  must(shape.status === 400 && shape.body === '{"outcome":"malformed"}', `malformed: ${show(shape)}`);
+  hold.ms = 0;
+  for (let i = 0; i < INBOUND_PER_MINUTE; i++) await push(w, `burst${i}`, "x");
+  const limited = await push(w, "over", "x");
+  must(limited.status === 429 && /^\d+$/.test(limited.retryAfter ?? ""), `rate limited: ${show(limited)}`);
+  const unknown = await worker.fetch(new Request(`https://x/hooks/${"z".repeat(43)}`, { method: "POST", body: "{}" }), w.env as never);
+  must(unknown.status === 404 && (await unknown.text()) === "", `unknown hook: ${unknown.status}`);
+  must(!lines.some((l) => l.evt === "hook.timeout"), "a timeout line for an object that answered in time");
+});
+
+await check("a slow object, not a dead one: the call that timed out still lands through waitUntil; a retry with the same id is a duplicate", async () => {
+  const w = await world();
+  w.env.HOOK_OBJECT_TIMEOUT_MS = String(LIMIT_MS);
+  const hold = slowObject(w);
+  hold.ms = LIMIT_MS * 3;
+  lines.length = 0;
+  const { waited, ctx } = invocation();
+  const first = await pushIn(w, "s1", ctx);
+  must(first?.status === 503, `first: ${show(first)}`);
+  must(waited.length >= 1, "the call in flight was not handed to waitUntil");
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline && waited.some((e) => e.state === "open")) await sleep(20);
+  must(waited.every((e) => e.state === "resolved"), `waitUntil: ${show(waited)}`);
+  must(pendingRows(w) === 1, `the late call queued ${pendingRows(w)}`);
+  const late = lines.find((l) => l.evt === "hook.late");
+  must(late?.outcome === "delivered", `hook.late line: ${show(late)}`);
+  hold.ms = 0;
+  const retry = await push(w, "s1", "x");
+  must(retry.status === 202 && retry.body === '{"outcome":"duplicate"}', `same-id retry: ${show(retry)}`);
+  await settle(w, 1);
+  must(jobCount(w) === 1 && pendingRows(w) === 0, `${jobCount(w)} jobs, ${pendingRows(w)} queued`);
+  must(show(outcomes(w)) === show(["duplicate", "delivered"]), `records: ${show(outcomes(w))}`);
+});
+
+await check("a retry with a new notice id after a late landing (Raft resends its latest notice): the agent is woken for each, reads every inbox message once, and an extra wake reads nothing", async () => {
+  const w = await world();
+  w.env.HOOK_OBJECT_TIMEOUT_MS = String(LIMIT_MS);
+  Object.assign(inbox, { messages: ["MSG-ONE"], cursor: 0, reads: [] });
+  const hold = slowObject(w);
+  hold.ms = LIMIT_MS * 3;
+  const { waited, ctx } = invocation();
+  // The notice for MSG-ONE times out at the worker, and the object lands it late.
+  const first = await Promise.race([worker.fetch(new Request(`https://x/hooks/${w.hookId}`, {
+    method: "POST", headers: { "x-signed-with": w.secret, "content-type": "application/json" }, body: JSON.stringify({ id: "notice-1", text: "WAKE-ONE" }),
+  }), w.env as never, ctx as never), sleep(3000).then(() => null)]);
+  must(first?.status === 503, `first: ${first?.status}`);
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline && waited.some((e) => e.state === "open")) await sleep(20);
+  must(waited.length >= 1 && waited.every((e) => e.state === "resolved"), `waitUntil: ${show(waited)}`);
+  hold.ms = 0;
+  // The agent is woken by the late landing and reads its inbox.
+  await settle(w, 1);
+  await answer(w, 0, "READING", { callTool: true });
+  await settle(w, 2);
+  await answer(w, 1, "DONE-ONE");
+  // Meanwhile a second message arrived, and Raft's retry carries its latest notice, under a new id.
+  inbox.messages.push("MSG-TWO");
+  const retry = await push(w, "notice-2", "WAKE-TWO");
+  must(retry.status === 202 && retry.body === '{"outcome":"delivered"}', `new-id retry: ${show(retry)}`);
+  await settle(w, 3);
+  await answer(w, 2, "READING", { callTool: true });
+  await settle(w, 4);
+  await answer(w, 3, "DONE-TWO");
+  // And a retry that merged nothing new: one more wake, whose read finds the inbox already read.
+  const extra = await push(w, "notice-3", "WAKE-THREE");
+  must(extra.status === 202 && extra.body === '{"outcome":"delivered"}', `extra wake: ${show(extra)}`);
+  await settle(w, 5);
+  await answer(w, 4, "READING", { callTool: true });
+  await settle(w, 6);
+  for (const wake of ["WAKE-ONE", "WAKE-TWO", "WAKE-THREE"]) {
+    must(await timesAsked(w, wake) === 1, `${wake} reached the agent ${await timesAsked(w, wake)} times`);
+  }
+  must(show(inbox.reads) === show([["MSG-ONE"], ["MSG-TWO"], []]), `inbox reads: ${show(inbox.reads)}`);
+  must(show(inbox.reads.flat()) === show(inbox.messages), `messages lost or read twice: ${show(inbox.reads.flat())} of ${show(inbox.messages)}`);
+  must(show(outcomes(w)) === show(["delivered", "delivered", "delivered"]), `records: ${show(outcomes(w))}`);
+});
+
+await check("a sender retrying on 503 (Raft's 5 s, 15 s, 1 min, scaled down) gets 503s while the object is down and one 202 once it answers; the agent is told once", async () => {
+  const w = await world();
+  w.env.HOOK_OBJECT_TIMEOUT_MS = String(LIMIT_MS);
+  const hold = slowObject(w);
+  hold.ms = Infinity;
+  const statuses: number[] = [];
+  for (let attempt = 0; attempt < 6; attempt++) {
+    if (attempt === 3) hold.ms = 0;
+    const r = await push(w, "r1", "RETRIED");
+    statuses.push(r.status);
+    if (r.status === 202) { must(r.body === '{"outcome":"delivered"}', `the 202: ${show(r)}`); break; }
+    must(r.retryAfter === "5", `a 503 without Retry-After 5: ${show(r)}`);
+    await sleep([5, 15, 60][Math.min(attempt, 2)]!);
+  }
+  must(show(statuses) === show([503, 503, 503, 202]), `statuses: ${show(statuses)}`);
+  await settle(w, 1);
+  must(await timesAsked(w, "RETRIED") === 1 && show(outcomes(w)) === show(["delivered"]), `asked ${await timesAsked(w, "RETRIED")}, records ${show(outcomes(w))}`);
+});
+
+await check("the limit: 4500 ms unless HOOK_OBJECT_TIMEOUT_MS is a positive number", async () => {
+  const { hookObjectLimitMs, HOOK_OBJECT_TIMEOUT_MS } = await import("../cf/src/index.ts");
+  must(HOOK_OBJECT_TIMEOUT_MS === 4500, `default ${HOOK_OBJECT_TIMEOUT_MS}`);
+  const read = [undefined, "", "0", "-1", "abc", "2000"].map((v) => hookObjectLimitMs({ HOOK_OBJECT_TIMEOUT_MS: v }));
+  must(show(read) === show([4500, 4500, 4500, 4500, 4500, 2000]), `read: ${show(read)}`);
 });
 
 console.log(`\n  An inbound hook answers before the turn\n  ${"─".repeat(56)}`);

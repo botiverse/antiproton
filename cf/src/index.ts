@@ -178,6 +178,8 @@ export interface Env {
   UI_ORIGIN?: string;
   /** The public origin hook URLs a plugin makes point at. Unset: plugins cannot make hooks. */
   HOOK_ORIGIN?: string;
+  /** How long a push waits on the agent's object before it is answered 503, in ms (`hookObjectLimitMs`; default 4500). */
+  HOOK_OBJECT_TIMEOUT_MS?: string;
   /** The commit this Worker was built from, set per deploy by
    *  cf/scripts/deploy.sh (`--var GIT_COMMIT:<sha>`); whoami shows it, and
    *  the bench drivers write it into every record. A record that names its
@@ -3055,22 +3057,72 @@ async function inboundHook(request: Request, env: Env, url: URL, ctx?: Pick<Exec
   };
   const objectStarted = Date.now();
   let lookup: RouteSource | "index-again" = found.from;
-  let r = await reach(found.route, found.from === "index" ? "index" : "cache");
-  if (r && "unrouted" in r && r.unrouted) {
-    // The object has no secret for a hook the cache routed: revoked since, most likely. The index decides,
-    // as it did before there was a cache.
-    await forgetHookRoute(url.origin, hookId);
-    const again = await routeHook(dir, url.origin, hookId, Date.now, defer);
-    if (!again) return hookAnswer(new Response(null, { status: 404 }), { lookup: "index-again" });
-    lookup = "index-again";
-    r = await reach(again.route, "index");
+  // The object's part, start to finish, so one limit bounds all of it: the moved-object retry and the re-route.
+  const objectPart = async (): Promise<Awaited<ReturnType<typeof reach>> | "gone"> => {
+    let r = await reach(found.route, found.from === "index" ? "index" : "cache");
+    if (r && "unrouted" in r && r.unrouted) {
+      // The object has no secret for a hook the cache routed: revoked since, most likely. The index decides,
+      // as it did before there was a cache.
+      await forgetHookRoute(url.origin, hookId);
+      const again = await routeHook(dir, url.origin, hookId, Date.now, defer);
+      if (!again) return "gone";
+      lookup = "index-again";
+      r = await reach(again.route, "index");
+    }
+    return r;
+  };
+  const limitMs = hookObjectLimitMs(env);
+  const work = objectPart();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const raced = await Promise.race([
+    work,
+    new Promise<typeof HOOK_TIMED_OUT>((resolve) => { timer = setTimeout(() => resolve(HOOK_TIMED_OUT), limitMs); }),
+  ]).finally(() => clearTimeout(timer));
+  if (raced === HOOK_TIMED_OUT) {
+    // The object did not answer in time: one Cloudflare could not start hung every push until the sender's own
+    // timeout (about 10 s for Raft), which the sender counts as a failure and backs off from for 15-30 minutes
+    // (#783). A 503 is retried on the sender's short schedule instead. Never a 202: only the object holds the
+    // hook's secret, so nothing here can tell a valid push from a forged one or a revoked hook's.
+    const doId = String(env.AGENT.idFromName(agentObjectName(found.route.tenantId, found.route.agentId)));
+    const fields = { doId, hook: hookId.slice(0, 8), limitMs, elapsedMs: Date.now() - objectStarted };
+    logEvent("hook.timeout", { ...fields, outcome: "503" });
+    // Deliberately kept alive past the answer: the object may be slow rather than dead, and a push it lands now
+    // is a wake the agent gets sooner. `waitUntil` lives about 30 s past the answer, so a call to an object that
+    // cannot start is cut off then and logs nothing: `hook.timeout` with no `hook.late` reads as a cut-off call. Not made safe by deduplication: a sender may retry with a different
+    // delivery id (Raft resends its latest notice, merged since), so both can reach the agent. A Raft notice is
+    // only a wake to read the inbox, whose reads are acknowledged by cursor, so the second costs one inbox read
+    // that finds nothing new. A retry with the same id is still a `duplicate` (`seenBefore`).
+    const late = work.then(
+      (r) => logEvent("hook.late", { ...fields, elapsedMs: Date.now() - objectStarted, outcome: r === "gone" ? "gone" : r ? r.outcome : "unavailable" }),
+      (e) => logEvent("hook.late", { ...fields, elapsedMs: Date.now() - objectStarted, error: clip(String((e as Error)?.message ?? e), 200) }),
+    );
+    if (ctx) ctx.waitUntil(late);
+    return hookAnswer(Response.json({ outcome: "unavailable" }, { status: 503, headers: { "retry-after": String(HOOK_TIMEOUT_RETRY_AFTER_S) } }),
+      { lookup, objectMs: Date.now() - objectStarted, timedOut: true });
   }
+  if (raced === "gone") return hookAnswer(new Response(null, { status: 404 }), { lookup: "index-again" });
+  const r = raced;
   const timing = { lookup, path: r && "path" in r ? r.path : undefined, objectMs: Date.now() - objectStarted, doMs: r && "ms" in r ? r.ms : undefined };
   // Still moving: say "try again" (503), which the sender retries, rather than a 500.
   if (!r) return hookAnswer(Response.json({ outcome: "unavailable" }, { status: 503, headers: { "retry-after": "1" } }), timing);
   // A 429 carries when to retry (`receiveHook`); without it a sender falls back on its own schedule.
   const headers = r.retryAfterS ? { "retry-after": String(r.retryAfterS) } : undefined;
   return hookAnswer(Response.json({ outcome: r.outcome }, { status: inboundStatus(r.outcome), headers }), timing);
+}
+
+/**
+ * How long a push waits on the agent's object. Below Raft's client timeout (about 10 s) with room for the route
+ * lookup and the body read before it, so the sender hears a 503 it retries soon rather than a timeout it backs off
+ * from for a quarter of an hour (#783). `HOOK_OBJECT_TIMEOUT_MS` overrides it; anything but a positive number is
+ * the default.
+ */
+export const HOOK_OBJECT_TIMEOUT_MS = 4500;
+/** `Retry-After` on a push the object did not answer in time. */
+export const HOOK_TIMEOUT_RETRY_AFTER_S = 5;
+const HOOK_TIMED_OUT = Symbol("timed out");
+export function hookObjectLimitMs(env: Pick<Env, "HOOK_OBJECT_TIMEOUT_MS">): number {
+  const n = Number(env.HOOK_OBJECT_TIMEOUT_MS);
+  return Number.isFinite(n) && n > 0 ? n : HOOK_OBJECT_TIMEOUT_MS;
 }
 
 /**

@@ -983,6 +983,7 @@ was given up.
 | too_large | 413 | body over 1 MB |
 | rate_limited | 429 | over 30 deliveries a minute for this hook, or 30 already queued; `Retry-After` says when to try again: for the rate, the whole seconds until the minute lets one more in; for the queue, until the oldest queued event's next try, 3–600 s (3 while the queue is moving) |
 | failed | 503 | `receive` threw, or the hook has no secret; in the record also an accepted event that was given up (the service was already answered 202) |
+| unavailable | 503 | not in the record: the agent's object did not answer within `HOOK_OBJECT_TIMEOUT_MS` (default 4.5 s), or kept moving between machines. `Retry-After: 5` on a timeout (1 while moving). Never 202, because only the object can check the signature. The call in flight is kept alive and may still land. A retry with the same `dedupeKey` is then `duplicate`; one with a new key (Raft resends its latest notice) is a second delivery, so the agent may be woken twice. A service that does not retry a failed delivery on its own (GitHub) shows a push the object took 4.5–10 s over as failed, although it still lands. The call is kept for about 30 s past the answer (`waitUntil`); the `hook.timeout` log line with no `hook.late` after it means it was cut off |
 
 When an expected event never arrived, read the record with
 `GET /admin/hooks?tenantId=…&agentId=…`, which lists the agent's hooks and
