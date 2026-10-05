@@ -36,6 +36,13 @@ export const OPENING = "Hi! How can I help you today?";
  */
 export const SIM_LAST_MAX = 1000;
 
+/**
+ * A row's `taskId`: the τ² task's id and the time the row began, so it is unique per row (`id` is the task,
+ * shared by its trials; bench/tau2/plan.ts). Both runners write it, so a consumer joins their rows on it; the
+ * Agents API runner keeps its session and agent beside it as `sessionId` and `agentId`.
+ */
+export const rowTaskId = (id: string | number, startedMs: number): string => `t_${id}_${startedMs.toString(36)}`;
+
 /** How many customer turns a conversation may take before it ends as `max_turns`. */
 export const MAX_TURNS = 14;
 

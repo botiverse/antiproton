@@ -24,7 +24,7 @@ import { homedir } from "node:os";
 import { OpenAiCompatibleModel } from "../../src/model/openai-compatible.ts";
 import { WRITE_TOOLS, type RetailDB } from "./retail.ts";
 import { argDiff, actionMatch as grade } from "./grade.ts";
-import { gold as goldOf, MAX_TURNS, OPENING, SIM, SIM_LAST_MAX, simEnding, simSystem } from "./episode.ts";
+import { gold as goldOf, MAX_TURNS, OPENING, rowTaskId, SIM, SIM_LAST_MAX, simEnding, simSystem } from "./episode.ts";
 import { beginRun, driverCommit, recordRun, teeRun, workerBuild, workerModel } from "../record.ts";
 import { stallAtDeadline, type StallEvidence } from "../poll-fallback.ts";
 import { endingsAllRows, failingRowsByEndingAndCause } from "./endings.ts";
@@ -151,7 +151,7 @@ const failed = new Map<string, string>();
 
 async function runTask(task: any) {
   const t0 = Date.now();
-  const taskId = `t_${task.id}_${Date.now().toString(36)}`;
+  const taskId = rowTaskId(task.id, t0);
   const obj = objOf(taskId);
   // The engine is named only when it is not the default, so a pi085 run sends what it always sent.
   const started = await post("/bench/start", { taskId, policy: POLICY, offload: true, ...(ENGINE === "pi085" ? {} : { engine: ENGINE }) }, obj);
