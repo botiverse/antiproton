@@ -106,7 +106,7 @@ import { userModelsFrom } from "../../src/model/user-models.ts";
 import { DEFAULT_PROVIDER, providerStatus, type ModelChoice } from "../../src/model/providers.ts";
 import { consumeModelCalls, isUnknownJobReply, replyingUnknownJob, type ModelQueueDeps, type QueuedModelCall, type UnknownJobReply } from "./model-queue.ts";
 import {
-  page, trajectory, approvals, conversation, eventList, storage, memoryPanel, sandboxPanel, adminPanel,
+  page, trajectory, approvals, conversation, eventList, storage, memoryPanel, sandboxPanel, adminPanel, agentModelBlock,
   runtimePanel, timeline, tokens, plugins, mountFragment, mountList, catalogue, agentList, apiKeysPanel } from "./ui.ts";
 
 /** The inspector's runtime tab: the object, then its containers. Storage is a
@@ -4194,13 +4194,20 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
           if (gate instanceof Response) return gate;
           const agentId = uiSelected?.agentId ?? gate.agentId;
           const providers = operatorModelOf(env).providers;
-          return await agentModel(request.method, request.method === "POST" ? await formOf(request) : null,
+          const answered = await agentModel(request.method, request.method === "POST" ? await formOf(request) : null,
             { tenantId: gate.tenantId, agentId, actor: gate.viewer.sub ?? gate.viewer.email }, {
               choices: d1ModelChoices(env.CONTROL_DB),
               userModels: userModelsFrom(env as unknown as Record<string, unknown>, providers),
               defaultModel: env.HARNESS_MODEL,
               now: Date.now,
             });
+          // A refusal (409 locked, 422 unknown id) is plain text for the page's
+          // write-error banner; anything the picker asked for renders the block.
+          if (!answered.ok || !request.headers.get("hx-request")) return answered;
+          const data = await answered.json();
+          return new Response(agentModelBlock(data as Parameters<typeof agentModelBlock>[0]), {
+            headers: { "cache-control": "no-store", "content-type": "text/html; charset=utf-8" },
+          });
         }
         case "/ui/usage": {
           // The signed-in person's tenant, all of its agents: no agent in the
