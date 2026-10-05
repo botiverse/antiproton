@@ -187,6 +187,7 @@ async function runTask(task: any) {
 
   let agentSaid = "Hi! How can I help you today?";
   let turns = 0, simCalls = 0, ended = "max_turns";
+  let simLast = "";
   let stall: string | undefined;
   // The values that cause was decided from, so a record can be re-decided rather than believed.
   let stallWhy: StallEvidence | undefined;
@@ -208,6 +209,10 @@ async function runTask(task: any) {
     const u = await model.complete(sim, SIM);
     simCalls += 1;
     sim.push({ role: "assistant", content: u.text });
+    // Verbatim, including a stop tag when the turn carried one (a STOP turn's text
+    // is never posted to the agent — see the break below). Capped so a runaway
+    // reply cannot bloat the record; scripted lines are far under it.
+    simLast = u.text;
     const stop = /###(STOP|TRANSFER|OUT-OF-SCOPE)###/.exec(u.text);
     if (VERBOSE) console.log(`    user  > ${u.text.replace(/\s+/g, " ").slice(0, 130)}`);
     if (stop) { ended = stop[1]!.toLowerCase(); break; }
@@ -247,6 +252,7 @@ async function runTask(task: any) {
   return {
     id: task.id, taskId, engine, object: `bench-${obj}`, ...(activity === undefined ? {} : { activity }),
     reward: dbMatch && actionMatch ? 1 : 0, dbMatch, actionMatch, ended, stall, stallWhy,
+    simLast: simLast.slice(0, 1000),
     delivered: delivered.get(taskId) ?? { push: 0, poll: 0, pollAnswered: 0, pollFailed: 0, dropped: 0 },
     turns: turns - 1, simCalls,
     usage: res.usage ?? {}, kinds: res.kinds ?? {}, byTool: res.byTool ?? {}, toolErrors: res.toolErrors ?? null,
