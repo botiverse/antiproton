@@ -2978,12 +2978,14 @@ async function adminApiKeys(request: Request, env: Env): Promise<Response> {
  * mapped; past that, the agent's object records every request, and the
  * plugin's reason stays there rather than in the response.
  */
-async function inboundHook(request: Request, env: Env, url: URL): Promise<Response> {
+async function inboundHook(request: Request, env: Env, url: URL, ctx?: Pick<ExecutionContext, "waitUntil">): Promise<Response> {
   const hookId = url.pathname.slice("/hooks/".length);
   if (!/^[A-Za-z0-9_-]{43}$/.test(hookId)) return new Response(null, { status: 404 });
   if (request.method !== "POST") return new Response(null, { status: 405, headers: { allow: "POST" } });
   const dir = d1InboundHooks(env.CONTROL_DB);
-  const found = await routeHook(dir, url.origin, hookId);
+  // The colo-cache write after an index read goes to the invocation's `waitUntil`, off the answer's path.
+  const defer = ctx ? (p: Promise<unknown>) => ctx.waitUntil(p) : undefined;
+  const found = await routeHook(dir, url.origin, hookId, Date.now, defer);
   if (!found) return hookAnswer(new Response(null, { status: 404 }), { lookup: "index" });
   const read = await readCapped(request);
   const event = read.ok ? { headers: lowerHeaders(request.headers), body: read.body } : null;
@@ -3013,7 +3015,7 @@ async function inboundHook(request: Request, env: Env, url: URL): Promise<Respon
     // The object has no secret for a hook the cache routed: revoked since, most likely. The index decides,
     // as it did before there was a cache.
     await forgetHookRoute(url.origin, hookId);
-    const again = await routeHook(dir, url.origin, hookId);
+    const again = await routeHook(dir, url.origin, hookId, Date.now, defer);
     if (!again) return hookAnswer(new Response(null, { status: 404 }), { lookup: "index-again" });
     lookup = "index-again";
     r = await reach(again.route, "index");
@@ -3495,12 +3497,12 @@ export default {
     await consumeModelCalls(batch, modelQueueDeps(env));
   },
 
-  async fetch(request: Request, env: Env): Promise<Response> {
-    return observed(request, () => route(request, env));
+  async fetch(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
+    return observed(request, () => route(request, env, ctx));
   },
 };
 
-async function route(request: Request, env: Env): Promise<Response> {
+async function route(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     // Every cookie here is Secure, so a page served over http can start a sign-in whose cookie the browser
     // refuses to keep. Anything but a local dev server is sent to https first.
@@ -3531,7 +3533,7 @@ async function route(request: Request, env: Env): Promise<Response> {
     if (url.pathname === "/admin/provider-tokens") return adminProviderTokens(request, env.AUTOMATION_TOKEN, d1ProviderTokens(env.CONTROL_DB), url);
     if (url.pathname.startsWith("/provision/")) return provision(request, env, url);
     // A service's push: addressed by the hook id alone, before any sign-in.
-    if (url.pathname.startsWith("/hooks/")) return inboundHook(request, env, url);
+    if (url.pathname.startsWith("/hooks/")) return inboundHook(request, env, url, ctx);
     if (url.pathname === "/admin/hooks") return adminHooks(request, env, url);
     if (url.pathname === "/admin/mounts") return adminMounts(request, env);
     if (url.pathname === "/admin/models") {

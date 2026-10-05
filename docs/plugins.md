@@ -804,12 +804,12 @@ does need one; see the GitHub example below.
    them to the service's own API with the mount's credential.
 3. **The service posts to the URL.** The runtime looks up the agent, and an
    unknown or revoked hook gets the same 404. The body may be at most 1 MB.
-   The worker keeps a hook's route for up to 5 minutes (`HOOK_ROUTE_TTL_MS`,
+   The worker keeps a hook's route for up to an hour (`HOOK_ROUTE_TTL_MS`,
    `cf/src/hook-route.ts`), so a push to a known hook does not wait on the
    control plane. Revoking still takes effect at once: revoke drops the hook's
    secret from the agent, and a routed push to a hook with no secret is checked
    against the index again before it is answered. Only a revoke whose secret
-   drop failed leaves the route usable, for at most those 5 minutes.
+   drop failed leaves the route usable, for at most that hour.
 4. **The mount is checked the way a tool call is.** It must exist, its plugin
    must implement `receive`, the plugin must be switched on for this agent,
    and the mount's version must match. If any check fails, the event is
