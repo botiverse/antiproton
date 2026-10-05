@@ -139,7 +139,7 @@ async function failure(fn: () => Promise<unknown>): Promise<Error & PluginErrorF
 }
 
 /** The tools this plugin writes by hand; every other tool is generated from the manifest. */
-const OWN = ["receive_events", "enable_push", "disable_push", "push_status"];
+const OWN = ["receive_events", "enable_push", "disable_push", "push_status", "integrations_login", "integrations_actions", "integrations_invoke"];
 const toolNamed = (name: string) => raftPlugin.tools.find((t) => t.name === name);
 const opNamed = (name: string) => RAFT_OPERATIONS.find((op) => op.name === name)!;
 /**
@@ -780,7 +780,7 @@ await check("a version-2 mount's cursor and frontier become the SDK's state: the
   const since = new URL(calls[0]!.url).searchParams.get("since");
   if (since !== "41") throw new Error(`the carried-over batch was not the one acknowledged: since=${since}`);
   const st = tables.get(scope, "inbox", "state") as any;
-  if (tables.version(scope) !== 3 || st?.schema !== "raft-sdk-state.v1" || st.frontier?.targets?.["#general"]?.upTo !== 30) {
+  if (tables.version(scope) !== 4 || st?.schema !== "raft-sdk-state.v1" || st.frontier?.targets?.["#general"]?.upTo !== 30) {
     throw new Error(`upgrade: version ${tables.version(scope)}, state ${JSON.stringify(st)}`);
   }
   if (tables.get(scope, "inbox", "cursor") !== undefined || tables.get(scope, "inbox", "frontier") !== undefined) throw new Error("version-2 keys survived");
