@@ -196,10 +196,12 @@ export function runProvider(rows: ReadonlyArray<{ provider?: Provider | null }>)
  *   wait       `sse`
  *   activity   summed over the rows' objects, as the `/bench` runner does per task; its `pollMs` is 0, since
  *              the stream is read in the Worker and never wakes the object the way `/bench/poll` did
+ *   sim        the simulator's settings plus `id`, the host and model it was called on, so a record says
+ *              which simulator ran rather than leaving it to whatever the environment held
  */
 export function apiRunRecord(i: {
   base: string; build: string | null; driver: unknown; tenantId: string; owner: string;
-  modelRequested: string; sim: unknown; tasks: unknown[]; trials: number; order: string;
+  modelRequested: string; sim: Record<string, unknown>; simId: string; tasks: unknown[]; trials: number; order: string;
   ignoreAnswers?: string; startedAt: string; results: any[];
 }): { ok: true; body: Record<string, unknown> } | { ok: false; why: string } {
   const provider = runProvider(i.results);
@@ -211,6 +213,15 @@ export function apiRunRecord(i: {
   if (!provider.provider && reached.length) {
     return { ok: false, why: `${reached.length} row(s) reached the agent and none has a provider: the model never answered (first: ${String(reached[0].ended).slice(0, 80)})` };
   }
+  // No row has a provider and no row got going: every row either never called the simulator or ended in an
+  // error. The simulator speaks first (bench/tau2/api-task.ts), so an empty or refused simulator key fails
+  // every row before the agent is reached, and the check above cannot fire. A customer that ends a task
+  // before the agent speaks did call the simulator, ends `stop`, and is still recorded.
+  const stalled = (r: any) => Number(r.simCalls ?? 0) === 0 || String(r.ended ?? "").startsWith("error:");
+  if (!provider.provider && i.results.every(stalled)) {
+    const first = i.results[0];
+    return { ok: false, why: `none of ${i.results.length} row(s) got going: each called the simulator 0 times or ended in an error, and none has a provider${first ? ` (first: ${String(first.ended).slice(0, 80)})` : ""}` };
+  }
   const tools: Record<string, number> = {};
   for (const r of i.results) for (const [n, c] of Object.entries(r.byTool ?? {})) tools[n] = (tools[n] ?? 0) + (c as number);
   const engines = new Set(i.results.map((r) => r.engine).filter(Boolean));
@@ -219,7 +230,7 @@ export function apiRunRecord(i: {
     body: {
       bench: "tau2-retail", runnerMethod: RUNNER_METHOD, base: i.base, build: i.build, driver: i.driver,
       object: `api:${i.tenantId}/${i.owner}`, engine: engines.size === 1 ? [...engines][0] : null, objects: "per-task",
-      model: provider.provider?.name ?? null, modelRequested: i.modelRequested, wait: "sse", sim: i.sim,
+      model: provider.provider?.name ?? null, modelRequested: i.modelRequested, wait: "sse", sim: { ...i.sim, id: i.simId },
       provider: provider.provider,
       tasks: i.tasks, trials: i.trials, order: i.order,
       ...(i.ignoreAnswers ? { ignoreAnswers: i.ignoreAnswers } : {}),

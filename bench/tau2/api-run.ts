@@ -25,6 +25,8 @@ import type { ApiClient } from "./api-client.ts";
 export interface ApiRunOptions {
   client: ApiClient;
   sim: ApiTaskDeps["sim"];
+  /** Which simulator `sim` calls, `<host>/<model>` (src/model/openai-compatible.ts `id`), for the record. */
+  simId: string;
   baseDb: RetailDB;
   tasks: any[];
   policy: string;
@@ -130,7 +132,7 @@ export async function runApiBench(o: ApiRunOptions): Promise<{ code: number; rec
 
   const built = apiRunRecord({
     base: o.base, build: await o.build(), driver: o.driver, tenantId: TENANT, owner: OWNER,
-    modelRequested: o.model, sim: SIM, tasks: o.tasks.map((t) => t.id), trials: o.trials, order: o.order,
+    modelRequested: o.model, sim: SIM, simId: o.simId, tasks: o.tasks.map((t) => t.id), trials: o.trials, order: o.order,
     ...(o.deafness ? { ignoreAnswers: o.deafness } : {}), startedAt: new Date(t0Run).toISOString(), results,
   });
   if (refused || !built.ok) {
