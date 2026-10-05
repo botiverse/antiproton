@@ -15,6 +15,7 @@ import { objectMoved } from "./do-retry.ts";
 import { HANDOFF_PATH, adminHostServes, adminShell, handoffTicket, redeemTicket, safeReturnTo } from "./admin-host.ts";
 import { nextAlarm } from "./alarm-next.ts";
 import { adminModels } from "./admin-models.ts";
+import { agentModel } from "./agent-model.ts";
 import { html, conditional, holds, notModified } from "./version.ts";
 import type { Json } from "../../src/core/types.ts";
 import { canonJson } from "../../src/core/canon-json.ts";
@@ -90,7 +91,7 @@ import { d1ServiceTokens } from "./control-plane.ts";
 import { adminServiceTokens } from "./admin-service-tokens.ts";
 import { hashServiceToken, looksLikeServiceToken } from "./service-token.ts";
 import { adminProviderTokens } from "./admin-provider-tokens.ts";
-import { d1Connections, d1Connectors, d1ModelOverrides, d1ProviderTokens, d1ProvisionedAgents } from "./control-plane.ts";
+import { d1Connections, d1Connectors, d1ModelChoices, d1ModelOverrides, d1ProviderTokens, d1ProvisionedAgents } from "./control-plane.ts";
 import { CONNECT_START_PATH, CONNECTION_PLUGIN, connectCallback, connectLink, connectStart, isConnectCallback, type ConnectDeps } from "./provision/connect.ts";
 import { hashProviderToken, looksLikeProviderToken } from "./provider-token.ts";
 import { handleProvision, type ProvisionDeps, type ProvisionTool } from "./provision/handlers.ts";
@@ -100,7 +101,8 @@ import { hasPendingInbound, inboundStatus, lowerHeaders, newHookId, readCapped }
 import { forgetHookRoute, routeHook, type HookRoute, type RouteSource } from "./hook-route.ts";
 import { HTMX_SRC, staticAsset } from "./static.ts";
 import { clip, logEvent, routeOf, setLogSink } from "../../src/core/log.ts";
-import { callQueuedModel, choiceOf, operatorModelOf, planBinding } from "./model-request.ts";
+import { callQueuedModel, operatorModelOf, planBinding, resolveModel } from "./model-request.ts";
+import { userModelsFrom } from "../../src/model/user-models.ts";
 import { DEFAULT_PROVIDER, providerStatus, type ModelChoice } from "../../src/model/providers.ts";
 import { consumeModelCalls, isUnknownJobReply, replyingUnknownJob, type ModelQueueDeps, type QueuedModelCall, type UnknownJobReply } from "./model-queue.ts";
 import {
@@ -131,6 +133,12 @@ export interface Env {
    * rather than holding it. Unset: DeepSeek alone, at DEEPSEEK_BASE_URL with DEEPSEEK_API_KEY.
    */
   MODEL_PROVIDERS?: unknown;
+  /**
+   * The models an owner may pick for their own agent (src/model/user-models.ts): a JSON array of
+   * { id, label, provider, model } under the providers above. Unset: nothing to pick, and the owner's route
+   * lists no options.
+   */
+  USER_MODELS?: unknown;
   DEEPSEEK_BASE_URL: string;
   HARNESS_MODEL: string;
   ARTIFACT_BUCKET: string;
@@ -2014,13 +2022,16 @@ export class AgentDO extends DurableObject<Env> {
   }
 
   /**
-   * The provider and model this agent's operator binding should name: the admin's choice (model_overrides), else
-   * the deployment's. A choice stored with no provider is the default provider's. Null when the choice could not
-   * be read, which is not the same as "no choice".
+   * The provider and model this agent's operator binding should name: the admin's rows (model_overrides) and the
+   * owner's pick (model_choices), in the order resolveModel (cf/src/model-request.ts) gives them, else the
+   * deployment's. A choice stored with no provider is the default provider's. Null when the choice could not be
+   * read, which is not the same as "no choice".
    */
   async #modelFor(tenantId: string, agentId: string): Promise<ModelChoice | null> {
     try {
-      return choiceOf(await d1ModelOverrides(this.env.CONTROL_DB).effective(tenantId, agentId), this.env.HARNESS_MODEL);
+      const providers = operatorModelOf(this.env).providers;
+      return resolveModel(await d1ModelChoices(this.env.CONTROL_DB).layers(tenantId, agentId),
+        userModelsFrom(this.env as unknown as Record<string, unknown>, providers), this.env.HARNESS_MODEL).choice;
     } catch (e) {
       console.warn(`model choice for ${agentId} could not be read: ${String((e as Error)?.message ?? e).slice(0, 200)}`);
       return null;
@@ -2887,7 +2898,7 @@ async function formOf(request: Request): Promise<FormData | null> {
  *  authorised as (credential, credential/remove). */
 // What a held call in the first conversation is recorded under (runtime.ts LEGACY_TASK).
 const LEGACY_TASK_ID = MAIN_SESSION;
-const UI_WRITE_ROUTES = new Set(["/ui/message", "/ui/decide", "/ui/compact", "/ui/credential", "/ui/credential/remove", "/ui/agent", "/ui/api-keys/new", "/ui/api-keys/revoke", "/ui/sandbox/release", "/ui/plugin/choice", "/ui/mount/add", "/ui/mount/refresh", "/ui/mount/remove", "/ui/secret", "/ui/secret/remove"]);
+const UI_WRITE_ROUTES = new Set(["/ui/agent/model", "/ui/message", "/ui/decide", "/ui/compact", "/ui/credential", "/ui/credential/remove", "/ui/agent", "/ui/api-keys/new", "/ui/api-keys/revoke", "/ui/sandbox/release", "/ui/plugin/choice", "/ui/mount/add", "/ui/mount/refresh", "/ui/mount/remove", "/ui/secret", "/ui/secret/remove"]);
 
 /**
  * Why a console write is refused as one this console's pages did not send, or
@@ -3544,8 +3555,10 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
       if (request.method === "PUT" || request.method === "DELETE") {
         try { body = JSON.parse((await request.text()) || "{}"); } catch { return Response.json({ error: { code: "invalid_json", message: "the body is not JSON" } }, { status: 400 }); }
       }
+      const providers = operatorModelOf(env).providers;
       return adminModels(request.method, body, v!.sub ?? v!.email, {
-        overrides: d1ModelOverrides(env.CONTROL_DB), providers: operatorModelOf(env).providers, defaults: { model: env.HARNESS_MODEL }, now: Date.now,
+        overrides: d1ModelOverrides(env.CONTROL_DB), providers, defaults: { model: env.HARNESS_MODEL }, now: Date.now,
+        userModelsError: userModelsFrom(env as unknown as Record<string, unknown>, providers).error,
       });
     }
     if (url.pathname.startsWith("/v1/")) return v1(request, env, url);
@@ -3580,10 +3593,13 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
       // key; the two credential routes arm nothing and succeed regardless,
       // because they only touch the store, and they change what the agent is
       // authorised as. The second pair is the one the refusal exists for.
-      if (who.startsWith("anonymous") && UI_WRITE_ROUTES.has(url.pathname)) {
+      // A route in the set that also answers a read (`/ui/agent/model`) writes only when it is posted to; a GET
+      // there is a read, open to whoever may read the agent.
+      const writes = UI_WRITE_ROUTES.has(url.pathname) && !(url.pathname === "/ui/agent/model" && request.method === "GET");
+      if (who.startsWith("anonymous") && writes) {
         return new Response("read-only: the console is open to anonymous viewers, but not for writes", { status: 403 });
       }
-      if (UI_WRITE_ROUTES.has(url.pathname)) {
+      if (writes) {
         const forged = await forgedWrite(request, url, env);
         if (forged) return new Response(forged, { status: 403 });
       }
@@ -4169,6 +4185,22 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
           const homeStub = env.AGENT.get(env.AGENT.idFromName(agentObjectName(gate.tenantId, home)));
           await homeStub.uiRecordAgent(gate.tenantId, home, made);
           return Response.json(made);
+        }
+        // The owner's pick of a model for this agent (cf/src/agent-model.ts). The gate above has already
+        // answered 404 for an agent that is not the viewer's, so `agentId` here is theirs; the answer is JSON
+        // for the console's picker, the request the console's usual form post.
+        case "/ui/agent/model": {
+          const gate = await requireViewer(request, env);
+          if (gate instanceof Response) return gate;
+          const agentId = uiSelected?.agentId ?? gate.agentId;
+          const providers = operatorModelOf(env).providers;
+          return await agentModel(request.method, request.method === "POST" ? await formOf(request) : null,
+            { tenantId: gate.tenantId, agentId, actor: gate.viewer.sub ?? gate.viewer.email }, {
+              choices: d1ModelChoices(env.CONTROL_DB),
+              userModels: userModelsFrom(env as unknown as Record<string, unknown>, providers),
+              defaultModel: env.HARNESS_MODEL,
+              now: Date.now,
+            });
         }
         case "/ui/usage": {
           // The signed-in person's tenant, all of its agents: no agent in the

@@ -3,7 +3,7 @@
  * against a local database the migrations in cf/migrations were applied to; see
  * test/control-plane-d1.sh. Each case starts from an empty table.
  */
-import { d1ApiKeys, d1Connections, d1Connectors, d1ModelOverrides, d1Identities, d1InboundHooks, d1ProviderTokens, d1ProvisionedAgents, d1ServiceTokens } from "../../cf/src/control-plane.ts";
+import { d1ApiKeys, d1Connections, d1Connectors, d1ModelChoices, d1ModelOverrides, d1Identities, d1InboundHooks, d1ProviderTokens, d1ProvisionedAgents, d1ServiceTokens } from "../../cf/src/control-plane.ts";
 
 export interface SpecCase { name: string; run(): Promise<void> }
 
@@ -19,7 +19,7 @@ export function controlPlaneCases(db: D1Database): SpecCase[] {
   const registry = d1ProvisionedAgents(db, () => clock);
   const wipe = () => db.batch([db.prepare("DELETE FROM identities"), db.prepare("DELETE FROM api_keys"), db.prepare("DELETE FROM inbound_hooks"), db.prepare("DELETE FROM service_tokens"),
     db.prepare("DELETE FROM provider_tokens"), db.prepare("DELETE FROM provisioned_agents"),
-    db.prepare("DELETE FROM provisioned_connections"), db.prepare("DELETE FROM connect_links"), db.prepare("DELETE FROM model_overrides")]);
+    db.prepare("DELETE FROM provisioned_connections"), db.prepare("DELETE FROM connect_links"), db.prepare("DELETE FROM model_overrides"), db.prepare("DELETE FROM model_choices")]);
   const cases: SpecCase[] = [];
   const add = (name: string, fn: () => Promise<void>) => cases.push({ name, run: async () => { await wipe(); await fn(); } });
 
@@ -276,6 +276,29 @@ export function controlPlaneCases(db: D1Database): SpecCase[] {
     const { results } = await db.prepare("PRAGMA table_info(model_overrides)").all();
     const cols = (results as any[]).map((r) => `${r.name}${r.notnull ? "!" : ""}`).sort().join(",");
     assert(cols === "agent_id!,model!,provider,set_at!,set_by!,tenant_id!", `columns ${cols}`);
+  });
+
+  add("model_choices has exactly the columns its queries read", async () => {
+    const { results } = await db.prepare("PRAGMA table_info(model_choices)").all();
+    const cols = (results as any[]).map((r) => `${r.name}${r.notnull ? "!" : ""}${r.pk ? "*" : ""}`).sort().join(",");
+    assert(cols === "agent_id!*,choice_id!,set_at!,set_by!,tenant_id!*", `columns ${cols}`);
+  });
+
+  add("an agent's model layers are read in one statement, each scope apart, the owner's pick for that agent only", async () => {
+    const m = d1ModelOverrides(db), c = d1ModelChoices(db);
+    const eff = async (t: string, a: string) => JSON.stringify(await c.layers(t, a));
+    assert((await eff("t", "a")) === '{"agent":null,"tenant":null,"deployment":null,"owner":null}', `empty: ${await eff("t", "a")}`);
+    await m.put({ tenantId: "", agentId: "", provider: "deepseek", model: "deepseek-v4-pro", setBy: "u", setAt: 1 });
+    await m.put({ tenantId: "t", agentId: "", provider: "cloudflare", model: "anthropic/claude-sonnet-5", setBy: "u", setAt: 1 });
+    await db.prepare("INSERT INTO model_overrides (tenant_id, agent_id, model, set_by, set_at) VALUES ('t', 'a', 'deepseek-flash', 'u', 1)").run();
+    await c.put({ tenantId: "t", agentId: "a", choiceId: "gpt-5.6-luna", setBy: "github:1", setAt: 2 });
+    await c.put({ tenantId: "t", agentId: "b", choiceId: "deepseek-flash", setBy: "github:1", setAt: 2 });
+    assert((await eff("t", "a")) === '{"agent":{"provider":null,"model":"deepseek-flash"},"tenant":{"provider":"cloudflare","model":"anthropic/claude-sonnet-5"},"deployment":{"provider":"deepseek","model":"deepseek-v4-pro"},"owner":"gpt-5.6-luna"}', `all: ${await eff("t", "a")}`);
+    assert((await eff("t2", "a")) === '{"agent":null,"tenant":null,"deployment":{"provider":"deepseek","model":"deepseek-v4-pro"},"owner":null}', `another tenant: ${await eff("t2", "a")}`);
+    await c.put({ tenantId: "t", agentId: "a", choiceId: "deepseek-flash", setBy: "github:2", setAt: 3 });
+    const row: any = await db.prepare("SELECT choice_id, set_by, set_at FROM model_choices WHERE tenant_id = 't' AND agent_id = 'a'").first();
+    assert(row.choice_id === "deepseek-flash" && row.set_by === "github:2" && row.set_at === 3, `replaced: ${JSON.stringify(row)}`);
+    assert((await c.remove("t", "a")) && !(await c.remove("t", "a")) && JSON.parse(await eff("t", "a")).owner === null, "remove");
   });
 
   add("provider_tokens and provisioned_agents have exactly the columns their queries read", async () => {

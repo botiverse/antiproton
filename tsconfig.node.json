@@ -75,6 +75,7 @@
     "test/exa-default.ts",
     "test/model-gateway.ts",
     "test/admin-models.ts",
+    "test/user-models.ts",
     "test/alarm-next.ts",
     "test/admin-host.ts",
     "test/do-retry.ts",

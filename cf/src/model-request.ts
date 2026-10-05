@@ -1,5 +1,6 @@
 import { operatorRequest, providerOfRef, type OperatorModel } from "../../src/model/operator-request.ts";
 import { DEFAULT_PROVIDER, modelProblem, providersFrom, type ModelChoice, type ModelProviders } from "../../src/model/providers.ts";
+import type { UserModel, UserModels } from "../../src/model/user-models.ts";
 import { ModelRequestRefused, OpenAiCompatibleModel } from "../../src/model/openai-compatible.ts";
 import { errorMessage, fromResponse, toRequest, type AnsweredMessage } from "../../src/model/pi-bridge.ts";
 import { logEvent } from "../../src/core/log.ts";
@@ -9,7 +10,7 @@ import { logEvent } from "../../src/core/log.ts";
  * DeepSeek from DEEPSEEK_BASE_URL and DEEPSEEK_API_KEY), the secrets they name, and the default model.
  * The secrets are looked up by the names the declaration gives, so the type is open.
  */
-export type ModelEnv = { DEEPSEEK_BASE_URL?: string; DEEPSEEK_API_KEY?: string; HARNESS_MODEL: string; MODEL_PROVIDERS?: unknown };
+export type ModelEnv = { DEEPSEEK_BASE_URL?: string; DEEPSEEK_API_KEY?: string; HARNESS_MODEL: string; MODEL_PROVIDERS?: unknown; USER_MODELS?: unknown };
 
 /** The deployment's operator model, read from its environment (src/model/operator-request.ts says how it is called). */
 export function operatorModelOf(env: ModelEnv): OperatorModel {
@@ -27,6 +28,41 @@ export function operatorModelRequest(env: ModelEnv) {
 export function choiceOf(chosen: { provider: string | null; model: string } | null, defaultModel: string): ModelChoice {
   return { provider: chosen?.provider ?? DEFAULT_PROVIDER, model: chosen?.model ?? defaultModel };
 }
+
+/** Where an agent's model came from, as the owner's route says it: an admin's row at any scope, the owner's pick, or neither. */
+export type ModelSource = "admin" | "owner" | "default";
+
+/**
+ * The provider and model an agent is bound to, from every scope that may decide it (`ModelLayers`,
+ * cf/src/control-plane.ts). Most specific wins:
+ *
+ *   admin's agent row > admin's tenant row > the owner's pick > admin's deployment row > HARNESS_MODEL
+ *
+ * The owner sits under the admin's agent and tenant rows because those are someone deciding about this
+ * agent or its tenant in particular — a cost or a compliance call an owner must not undo — and above the
+ * deployment row because that one is the operator moving everyone's default, which a person who picked a
+ * model for their own agent did not ask to be moved by. `locked` is "an agent or tenant row applies": the
+ * owner's pick, whatever it is, is not what runs, and the route refuses to take a new one (409).
+ *
+ * An owner's id that is not offered now — removed from USER_MODELS, its provider's secret unset, or the
+ * declaration refused — is passed over as if absent, not an error: the agent binds what it would have bound
+ * without it, and the row stays, so the pick returns if the option does. Every path that binds asks this
+ * (#modelFor in cf/src/index.ts), and the binding it names is checked against the stored one on each run
+ * (planBinding with onlyIfStale), so a changed pick is bound on the agent's next run the way an admin's is.
+ */
+export function resolveModel(
+  layers: { agent: Chosen | null; tenant: Chosen | null; deployment: Chosen | null; owner: string | null },
+  userModels: UserModels,
+  defaultModel: string,
+): { choice: ModelChoice; source: ModelSource; locked: boolean; selected: UserModel | null } {
+  const selected = layers.owner === null ? null : userModels.offered.find((o) => o.id === layers.owner) ?? null;
+  const admin = layers.agent ?? layers.tenant;
+  if (admin) return { choice: choiceOf(admin, defaultModel), source: "admin", locked: true, selected };
+  if (selected) return { choice: { provider: selected.provider, model: selected.model }, source: "owner", locked: false, selected };
+  if (layers.deployment) return { choice: choiceOf(layers.deployment, defaultModel), source: "admin", locked: false, selected };
+  return { choice: choiceOf(null, defaultModel), source: "default", locked: false, selected };
+}
+type Chosen = { provider: string | null; model: string };
 
 /** Whether an operator binding already names `choice`: the same provider, the same model, and the provider's endpoint as declared now. */
 export function bindingIsCurrent(b: { model: string; baseUrl: string; secretRef: string }, choice: ModelChoice, providers: ModelProviders): boolean {

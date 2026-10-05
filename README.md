@@ -236,6 +236,12 @@ Antiproton is designed to run as a Cloudflare Worker backed by Durable Objects:
    `HARNESS_MODEL` is served. `cf/wrangler.preview.jsonc` declares Cloudflare AI Gateway as a second
    provider (`vendor/model` names, its token in `cf-aig-authorization`, DeepSeek's key passed through only
    for `deepseek/` models). Admins choose per deployment, tenant or agent through `/admin/models`.
+   Owners pick for their own agents from the `USER_MODELS` var — a JSON array of
+   `{ id, label, provider, model }` under those providers (`src/model/user-models.ts` validates it; unset,
+   nothing is offered, and an option whose provider's secret is unset is not offered) — through
+   `GET`/`POST /ui/agent/model`. Most specific wins: an admin's agent row, then their tenant row (either
+   locks the owner's pick), then the owner's pick, then the admin's deployment row, then `HARNESS_MODEL`.
+   A pick whose option is no longer offered is passed over. Any change is bound on the agent's next run.
    An `openai/…` model is sent the fields pi-ai's OpenAI-compatible provider would send it
    (`max_completion_tokens`, and a reasoning model's "off" level as `reasoning_effort`, which
    chat/completions needs before it accepts function tools; `src/model/chat-request-shape.ts`); every

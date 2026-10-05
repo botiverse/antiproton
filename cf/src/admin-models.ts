@@ -21,6 +21,11 @@ export interface AdminModelsDeps {
   providers: ModelProviders;
   /** The deployment's default model (HARNESS_MODEL), under DEFAULT_PROVIDER. */
   defaults: { model: string };
+  /**
+   * Why USER_MODELS (src/model/user-models.ts) was refused, when it was. Said here because a refused declaration
+   * is no options, which an owner's picker shows as a feature that is off, not as a mistake to fix.
+   */
+  userModelsError?: string;
   now(): number;
 }
 
@@ -33,6 +38,7 @@ export async function adminModels(method: string, body: unknown, actor: string, 
       default: { provider: DEFAULT_PROVIDER, model: deps.defaults.model, endpoint: providers.find((p) => p.id === DEFAULT_PROVIDER)?.endpoint ?? "" },
       providers,
       ...(deps.providers.error ? { providersError: deps.providers.error } : {}),
+      ...(deps.userModelsError ? { userModelsError: deps.userModelsError } : {}),
       // A row from before providers existed is shown as what serves it.
       overrides: (await deps.overrides.list()).map((o) => ({ ...o, provider: o.provider ?? DEFAULT_PROVIDER })),
     }, { headers: { "cache-control": "no-store" } });
