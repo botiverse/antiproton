@@ -47,8 +47,9 @@ export type ModelSource = "admin" | "owner" | "default";
  * An owner's id that is not offered now — removed from USER_MODELS, its provider's secret unset, or the
  * declaration refused — is passed over as if absent, not an error: the agent binds what it would have bound
  * without it, and the row stays, so the pick returns if the option does. Every path that binds asks this
- * (#modelFor in cf/src/index.ts), and the binding it names is checked against the stored one on each run
- * (planBinding with onlyIfStale), so a changed pick is bound on the agent's next run the way an admin's is.
+ * (#modelFor in cf/src/index.ts), and the binding it names is checked against the stored one there (planBinding
+ * with onlyIfStale) — not on every run: a hook push to a console agent checks nothing. An owner's pick is also bound when it is stored (AgentDO.rebindModel, apiAdopt);
+ * an admin's row waits for the next path that checks (README.md, "Model providers").
  */
 export function resolveModel(
   layers: { agent: Chosen | null; tenant: Chosen | null; deployment: Chosen | null; owner: string | null },

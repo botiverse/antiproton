@@ -1421,12 +1421,19 @@ export class AgentDO extends DurableObject<Env> {
    * Run in the agent's own object: make it match the API's record of the agent (the owner's index,
    * which is written first). Created when absent; the persona rewritten only when it differs, so the
    * calls that repeat this on every use write nothing once it matches. Returns what the console lists.
+   *
+   * The model binding is brought to match too, since the create or update that calls this may have just stored
+   * the owner's pick (agents-api/model.ts): as `rebindModel` for the console's picker, an agent already bound
+   * runs its next model call on the pick rather than waiting for its next input. A new agent has no binding,
+   * and its first input binds it.
    */
   async apiAdopt(tenantId: string, agentId: string, agentJson: string) {
     this.#claim(tenantId, agentId);
     const rt = this.runtime();
     await rt.ready();
-    return this.#adopt(rt, tenantId, agentId, JSON.parse(agentJson) as StoredAgent);
+    const listed = await this.#adopt(rt, tenantId, agentId, JSON.parse(agentJson) as StoredAgent);
+    if (await rt.store.getModelBinding(tenantId, agentId)) await this.#bindModel(rt, tenantId, agentId, { onlyIfStale: true });
+    return listed;
   }
 
   async #adopt(rt: AgentRuntime, tenantId: string, agentId: string, a: StoredAgent) {
@@ -2051,6 +2058,24 @@ export class AgentDO extends DurableObject<Env> {
     const plan = planBinding(b, await this.#modelFor(tenantId, agentId), operatorModelOf(this.env).providers, opts);
     if (plan.refused) console.warn(`model choice for ${agentId} refused: ${plan.refused.slice(0, 200)}`);
     if (plan.bind) await rt.bindOperatorModel(tenantId, agentId, plan.choice);
+  }
+
+  /**
+   * Bind what is chosen now, when an owner's pick has just been stored (`/ui/agent/model`, and the Agents API
+   * through apiAdopt). Without it a pick waits for a path that rebinds — a page open, a console message, an API
+   * input — and a turn started some other way (a hook push to a console agent) runs on the old model while the
+   * picker says the new one. The queue consumer reads the binding when it takes each call (runtime.takeJob), so
+   * the agent's next model call runs on the pick. An agent with no binding yet is left to its first open or
+   * input, which binds it.
+   */
+  async rebindModel(tenantId: string, agentId: string) {
+    this.#claim(tenantId, agentId);
+    return this.#busy("rebindModel", async () => {
+      const rt = this.runtime();
+      await rt.ready();
+      if (!(await rt.store.getModelBinding(tenantId, agentId))) return;
+      await this.#bindModel(rt, tenantId, agentId, { onlyIfStale: true });
+    });
   }
 
   /**
@@ -4213,6 +4238,12 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
           // {error: {code, message}}: the page's write-error banner reads
           // .error.message and speaks it under the form. Anything the picker
           // asked for with hx-request renders the block.
+          // A stored pick is bound at once (AgentDO.rebindModel), so whatever starts the agent's next turn runs
+          // on it. Not the request's failure: the pick is stored, and a page open or a message binds it anyway.
+          if (answered.ok && request.method === "POST") {
+            await env.AGENT.get(env.AGENT.idFromName(agentObjectName(gate.tenantId, agentId))).rebindModel(gate.tenantId, agentId)
+              .catch((e: unknown) => console.warn(`rebinding ${agentId} after a pick failed: ${String((e as Error)?.message ?? e).slice(0, 200)}`));
+          }
           if (!answered.ok || !request.headers.get("hx-request")) return answered;
           const data = await answered.json();
           return new Response(agentModelBlock(data as Parameters<typeof agentModelBlock>[0]), {

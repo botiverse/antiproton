@@ -306,14 +306,19 @@ await check("worker: an agent created with `gpt-5.6-luna` runs its first input o
   must(await bound(flash.body.agent.id) === "operator:model deepseek-flash", `bound: ${await bound(flash.body.agent.id)}`);
 });
 
-await check("worker: an update moves the binding on the next input; an admin's agent row then wins, reads back, and refuses another pick", async () => {
+await check("worker: an update moves the binding when it is made, before any input; an admin's agent row then wins, reads back, and refuses another pick", async () => {
   const a = await v1("POST", "/agents", { model: "default" });
   const id = a.body.id;
   const s = await v1("POST", "/agents/sessions", { agent_id: id, environment: { type: "none" }, input: "one" });
   must(await bound(id) === "operator:model deepseek-flash", `first: ${await bound(id)}`);
   must((await v1("POST", `/agents/${id}`, { model: "gpt-5.6-luna" })).body.model === "gpt-5.6-luna", "update");
+  // Bound by the update itself (AgentDO.apiAdopt), so the agent's next model call runs on the pick whatever starts it.
+  must(await bound(id) === "operator:model:cloudflare openai/gpt-5.6-luna", `the update did not rebind: ${await bound(id)}`);
+  must((await v1("POST", `/agents/${id}`, { model: "default" })).body.model === "deepseek-flash" && await bound(id) === "operator:model deepseek-flash",
+    `clearing the pick did not rebind: ${await bound(id)}`);
+  must((await v1("POST", `/agents/${id}`, { model: "gpt-5.6-luna" })).status === 200, "back to luna");
   await v1("POST", `/agents/sessions/${s.body.id}/events`, { events: [{ type: "agent.session.input.message", input: "two" }] });
-  must(await bound(id) === "operator:model:cloudflare openai/gpt-5.6-luna", `after the update: ${await bound(id)}`);
+  must(await bound(id) === "operator:model:cloudflare openai/gpt-5.6-luna", `after the next input: ${await bound(id)}`);
   await d1ModelOverrides(DB).put({ tenantId: T, agentId: id, ...ADMIN, setBy: "adm", setAt: 1 });
   must((await v1("GET", `/agents/${id}`)).body.model === "deepseek/deepseek-v4-pro", "an admin-set agent reads as its pick");
   const locked = await v1("POST", `/agents/${id}`, { model: "deepseek-flash" });

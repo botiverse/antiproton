@@ -5,7 +5,7 @@
  *
  * The store is the real migrations on node:sqlite; the routes go through the Worker's own `fetch` and `AgentDO` (the
  * `cloudflare:workers` stand-in test/console-mounts.ts uses), so the sign-in gate, the ownership check, the anonymous
- * refusal and the bind on the agent's next run are the shipped ones.
+ * refusal, the bind when a pick is made and the bind on the agent's next run are the shipped ones.
  */
 import { register } from "node:module";
 import { DatabaseSync } from "node:sqlite";
@@ -252,7 +252,7 @@ await check("route: GET answers the exact shape — the default, both options, n
   }), r.text);
 });
 
-await check("route: POST a pick answers the new state and stores it with who set it; `default` clears it; the agent's model moves on its next run, not before", async () => {
+await check("route: POST a pick answers the new state and stores it with who set it; `default` clears it; the agent's binding moves with the pick, before any run", async () => {
   await nextRun(T, A);
   must(await bound(T, A) === "operator:model deepseek-flash", `before: ${await bound(T, A)}`);
   const r = await postModel({ agentId: A, choice: LUNA.id });
@@ -263,17 +263,17 @@ await check("route: POST a pick answers the new state and stores it with who set
   }), `${r.status} ${r.text}`);
   const row: any = DB.raw.prepare("SELECT * FROM model_choices WHERE tenant_id = ? AND agent_id = ?").get(T, A);
   must(row?.choice_id === LUNA.id && row.set_by === `gh-${A}`, show(row));
-  must(await bound(T, A) === "operator:model deepseek-flash", `the binding moved before a run: ${await bound(T, A)}`);
-  await nextRun(T, A);
-  must(await bound(T, A) === "operator:model:cloudflare openai/gpt-5.6-luna", `the next run did not rebind: ${await bound(T, A)}`);
+  // Bound by the post itself: a turn a hook push starts on a console agent rebinds nothing, so a pick left for
+  // the next run would run the old model while the picker shows the new one.
+  must(await bound(T, A) === "operator:model:cloudflare openai/gpt-5.6-luna", `the pick was not bound when made: ${await bound(T, A)}`);
   // An owner picking the default's own option: the label is the option's, the source the owner's.
   const flash = await postModel({ agentId: A, choice: FLASH.id });
   must(flash.json().effective.source === "owner" && flash.json().selected === FLASH.id, flash.text);
-  await nextRun(T, A);
   must(await bound(T, A) === "operator:model deepseek-flash", `back: ${await bound(T, A)}`);
   await postModel({ agentId: A, choice: LUNA.id });
   const cleared = await postModel({ agentId: A, choice: "default" });
   must(cleared.status === 200 && cleared.json().selected === null && cleared.json().effective.source === "default", cleared.text);
+  must(await bound(T, A) === "operator:model deepseek-flash", `clearing the pick did not rebind: ${await bound(T, A)}`);
   must(!DB.raw.prepare("SELECT 1 FROM model_choices WHERE agent_id = ?").get(A), "the row is still there");
   // Clearing what is not set is still the answer, not an error.
   must((await postModel({ agentId: A, choice: "default" })).status === 200, "a second clear");

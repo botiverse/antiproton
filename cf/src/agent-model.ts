@@ -21,8 +21,9 @@
  * Nothing here names an endpoint, a gateway or a secret: an option is an id and a label, and the effective
  * model is a provider's id and a model's name, neither of them an address or a credential.
  *
- * A pick takes effect on the agent's next run, when its binding is found stale and bound again (#bindModel in
- * cf/src/index.ts, with resolveModel deciding what is current).
+ * A stored pick is bound at once: the route in cf/src/index.ts asks the agent's object to rebind
+ * (AgentDO.rebindModel, #bindModel with resolveModel deciding what is current), so the agent's next model call
+ * runs on it whatever starts the turn.
  */
 import type { ModelChoices } from "./control-plane.ts";
 import { resolveModel } from "./model-request.ts";
