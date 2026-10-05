@@ -55,6 +55,7 @@
     "test/console-events.ts",
     "test/console-identity-record.ts",
     "test/console-admin.ts",
+    "test/console-agent-model.ts",
     "test/console-login.ts",
     "test/console-plugins.ts",
     "test/console-poll.ts",
