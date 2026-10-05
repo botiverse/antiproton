@@ -23,8 +23,8 @@
  *
  * What the API answers as `model` is what the agent's next turn runs on, not what was sent: the option's id
  * when an offered option names it, else "<provider>/<model>" — which is how an agent an admin moved to a model
- * no option names reads. The binding follows on the next input (#bindModel in cf/src/index.ts), as it does for
- * a console pick.
+ * no option names reads. The binding follows when the create or update adopts the agent (AgentDO.apiAdopt in
+ * cf/src/index.ts, for an agent already bound; a new one is bound by its first input), as it does for a console pick.
  *
  * Nothing here names an endpoint or a secret: a provider's id and a model's name are neither.
  */

@@ -10,7 +10,9 @@
  *
  * The cases are the shapes a live job takes: version 1 (pi085, untagged 0.85 Context) and version 2 (pd, tagged,
  * system messages inline), each with tools, a tool round and an earlier reasoning trace that must not be replayed;
- * at DeepSeek directly, and through the gateway's /compat for a DeepSeek and an OpenAI model. The providers are
+ * at DeepSeek directly, and through the gateway's /compat for a DeepSeek and an OpenAI model.
+ * Beside them, the tool-less shapes (no `tools`, or an empty set: no `tools` key is sent), and a job whose options
+ * ask a tool choice, which the consumer does not forward. The providers are
  * declared here, not read from cf/wrangler*.jsonc, so a change to a deployment's providers does not move these
  * literals; a change to how a declared provider is called does.
  *
@@ -78,10 +80,15 @@ const V2 = {
   tools: TOOLS,
 };
 
-const job = (context: unknown, operator?: { provider: string; model: string }) => ({
+/** Version 1 with no tool offered (a compaction summary's call): `tools` absent. */
+const V1_NO_TOOLS = { systemPrompt: V1.systemPrompt, messages: V1.messages };
+/** Version 2 with an empty tool set: `tools: []` is no tools, not an empty list sent. */
+const V2_NO_TOOLS = { ...V2, tools: [] };
+
+const job = (context: unknown, operator?: { provider: string; model: string }, options: Record<string, unknown> = {}) => ({
   model: { api: "offloaded", provider: "openai-compatible", id: "deepseek-flash" },
   context,
-  options: {},
+  options,
   ...(operator ? { operatorModel: operator.model, operatorProvider: operator.provider } : { operatorModel: null, operatorProvider: null }),
 });
 
@@ -131,6 +138,23 @@ const CASES: Array<{ name: string; env: ModelEnv; job: unknown; request: string;
     job: job(V2, { provider: "cloudflare", model: "openai/gpt-5.6-luna" }),
     request: String.raw`{"url":"https://gateway.ai.cloudflare.com/v1/acct/gw/compat/chat/completions","method":"POST","headers":[["cf-aig-authorization","Bearer snapshot-gateway-token"],["content-type","application/json"]],"body":"{\"model\":\"openai/gpt-5.6-luna\",\"messages\":[{\"role\":\"system\",\"content\":\"You are a careful agent.\"},{\"role\":\"user\",\"content\":\"Read https://example.com\"},{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"url\\\":\\\"https://example.com\\\"}\"}}]},{\"role\":\"tool\",\"tool_call_id\":\"call_1\",\"content\":\"Example Domain\"},{\"role\":\"system\",\"content\":\"Updated system prompt section \\\"time\\\":\\n\\n<time>2026-10-05</time>\"},{\"role\":\"user\",\"content\":\"summarise\"}],\"max_completion_tokens\":32768,\"temperature\":0,\"reasoning_effort\":\"none\",\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"read\",\"description\":\"Read a page\",\"parameters\":{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\"}},\"required\":[\"url\"]}}},{\"type\":\"function\",\"function\":{\"name\":\"run_js\",\"description\":\"Run code\",\"parameters\":{\"type\":\"object\",\"properties\":{\"code\":{\"type\":\"string\"},\"timeout\":{\"type\":\"number\"}}}}}]}"}`,
     answer: String.raw`{"role":"assistant","content":[{"type":"thinking","thinking":"Short trace."},{"type":"text","text":"Summarising."},{"type":"toolCall","id":"call_2","name":"run_js","arguments":{"code":"1+1"}}],"api":"offloaded","provider":"openai-compatible","model":"openai/gpt-5.6-luna","usage":{"input":120,"output":30,"cacheRead":64,"cacheWrite":0,"reasoning":9,"totalTokens":150,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"toolUse","rawStopReason":"tool_calls","jobId":"mj_2"}` },
+  // No tool offered: no `tools` key at all, and so no `tool_choice` — at DeepSeek directly and through /compat.
+  { name: "deepseek, version 1 with no tools", env: ENV, job: job(V1_NO_TOOLS),
+    
+    request: String.raw`{"url":"https://api.deepseek.com/chat/completions","method":"POST","headers":[["authorization","Bearer sk-snapshot-deepseek"],["content-type","application/json"]],"body":"{\"model\":\"deepseek-flash\",\"messages\":[{\"role\":\"system\",\"content\":\"You are a careful agent.\"},{\"role\":\"user\",\"content\":\"Read https://example.com\"},{\"role\":\"assistant\",\"content\":\"Reading.\",\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"url\\\":\\\"https://example.com\\\"}\"}}]},{\"role\":\"tool\",\"tool_call_id\":\"call_1\",\"content\":\"Example Domain\"},{\"role\":\"user\",\"content\":\"And now summarise.\"}],\"max_tokens\":32768,\"temperature\":0}"}`,
+    answer: String.raw`{"role":"assistant","content":[{"type":"thinking","thinking":"Short trace."},{"type":"text","text":"Summarising."},{"type":"toolCall","id":"call_2","name":"run_js","arguments":{"code":"1+1"}}],"api":"offloaded","provider":"openai-compatible","model":"deepseek-flash","usage":{"input":120,"output":30,"cacheRead":64,"cacheWrite":0,"reasoning":9,"totalTokens":150,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"toolUse","rawStopReason":"tool_calls","jobId":"mj_2"}` },
+  { name: "cloudflare /compat, deepseek/deepseek-flash, version 2 with an empty tool set", env: ENV,
+    job: job(V2_NO_TOOLS, { provider: "cloudflare", model: "deepseek/deepseek-flash" }),
+    
+    request: String.raw`{"url":"https://gateway.ai.cloudflare.com/v1/acct/gw/compat/chat/completions","method":"POST","headers":[["authorization","Bearer sk-snapshot-deepseek"],["cf-aig-authorization","Bearer snapshot-gateway-token"],["content-type","application/json"]],"body":"{\"model\":\"deepseek/deepseek-flash\",\"messages\":[{\"role\":\"system\",\"content\":\"You are a careful agent.\"},{\"role\":\"user\",\"content\":\"Read https://example.com\"},{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"url\\\":\\\"https://example.com\\\"}\"}}]},{\"role\":\"tool\",\"tool_call_id\":\"call_1\",\"content\":\"Example Domain\"},{\"role\":\"system\",\"content\":\"Updated system prompt section \\\"time\\\":\\n\\n<time>2026-10-05</time>\"},{\"role\":\"user\",\"content\":\"summarise\"}],\"max_tokens\":32768,\"temperature\":0}"}`,
+    answer: String.raw`{"role":"assistant","content":[{"type":"thinking","thinking":"Short trace."},{"type":"text","text":"Summarising."},{"type":"toolCall","id":"call_2","name":"run_js","arguments":{"code":"1+1"}}],"api":"offloaded","provider":"openai-compatible","model":"deepseek/deepseek-flash","usage":{"input":120,"output":30,"cacheRead":64,"cacheWrite":0,"reasoning":9,"totalTokens":150,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"toolUse","rawStopReason":"tool_calls","jobId":"mj_2"}` },
+  // pi's SimpleStreamOptions may carry a toolChoice into the job's options. The consumer passes tools alone to
+  // OpenAiCompatibleModel.complete, so its `tool_choice` branch is not reached from here: nothing is sent for it.
+  { name: "cloudflare /compat, deepseek/deepseek-flash, version 2, the job's options asking toolChoice required", env: ENV,
+    job: job(V2, { provider: "cloudflare", model: "deepseek/deepseek-flash" }, { toolChoice: "required" }),
+    
+    request: String.raw`{"url":"https://gateway.ai.cloudflare.com/v1/acct/gw/compat/chat/completions","method":"POST","headers":[["authorization","Bearer sk-snapshot-deepseek"],["cf-aig-authorization","Bearer snapshot-gateway-token"],["content-type","application/json"]],"body":"{\"model\":\"deepseek/deepseek-flash\",\"messages\":[{\"role\":\"system\",\"content\":\"You are a careful agent.\"},{\"role\":\"user\",\"content\":\"Read https://example.com\"},{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"url\\\":\\\"https://example.com\\\"}\"}}]},{\"role\":\"tool\",\"tool_call_id\":\"call_1\",\"content\":\"Example Domain\"},{\"role\":\"system\",\"content\":\"Updated system prompt section \\\"time\\\":\\n\\n<time>2026-10-05</time>\"},{\"role\":\"user\",\"content\":\"summarise\"}],\"max_tokens\":32768,\"temperature\":0,\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"read\",\"description\":\"Read a page\",\"parameters\":{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\"}},\"required\":[\"url\"]}}},{\"type\":\"function\",\"function\":{\"name\":\"run_js\",\"description\":\"Run code\",\"parameters\":{\"type\":\"object\",\"properties\":{\"code\":{\"type\":\"string\"},\"timeout\":{\"type\":\"number\"}}}}}]}"}`,
+    answer: String.raw`{"role":"assistant","content":[{"type":"thinking","thinking":"Short trace."},{"type":"text","text":"Summarising."},{"type":"toolCall","id":"call_2","name":"run_js","arguments":{"code":"1+1"}}],"api":"offloaded","provider":"openai-compatible","model":"deepseek/deepseek-flash","usage":{"input":120,"output":30,"cacheRead":64,"cacheWrite":0,"reasoning":9,"totalTokens":150,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"toolUse","rawStopReason":"tool_calls","jobId":"mj_2"}` },
 ];
 
 for (const c of CASES) {

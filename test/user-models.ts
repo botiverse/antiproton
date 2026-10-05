@@ -5,7 +5,7 @@
  *
  * The store is the real migrations on node:sqlite; the routes go through the Worker's own `fetch` and `AgentDO` (the
  * `cloudflare:workers` stand-in test/console-mounts.ts uses), so the sign-in gate, the ownership check, the anonymous
- * refusal and the bind on the agent's next run are the shipped ones.
+ * refusal, the bind when a pick is made and the bind on the agent's next run are the shipped ones.
  */
 import { register } from "node:module";
 import { DatabaseSync } from "node:sqlite";
@@ -252,7 +252,7 @@ await check("route: GET answers the exact shape — the default, both options, n
   }), r.text);
 });
 
-await check("route: POST a pick answers the new state and stores it with who set it; `default` clears it; the agent's model moves on its next run, not before", async () => {
+await check("route: POST a pick answers the new state and stores it with who set it; `default` clears it; the agent's binding moves with the pick, before any run", async () => {
   await nextRun(T, A);
   must(await bound(T, A) === "operator:model deepseek-flash", `before: ${await bound(T, A)}`);
   const r = await postModel({ agentId: A, choice: LUNA.id });
@@ -263,17 +263,17 @@ await check("route: POST a pick answers the new state and stores it with who set
   }), `${r.status} ${r.text}`);
   const row: any = DB.raw.prepare("SELECT * FROM model_choices WHERE tenant_id = ? AND agent_id = ?").get(T, A);
   must(row?.choice_id === LUNA.id && row.set_by === `gh-${A}`, show(row));
-  must(await bound(T, A) === "operator:model deepseek-flash", `the binding moved before a run: ${await bound(T, A)}`);
-  await nextRun(T, A);
-  must(await bound(T, A) === "operator:model:cloudflare openai/gpt-5.6-luna", `the next run did not rebind: ${await bound(T, A)}`);
+  // Bound by the post itself: a turn a hook push starts on a console agent rebinds nothing, so a pick left for
+  // the next run would run the old model while the picker shows the new one.
+  must(await bound(T, A) === "operator:model:cloudflare openai/gpt-5.6-luna", `the pick was not bound when made: ${await bound(T, A)}`);
   // An owner picking the default's own option: the label is the option's, the source the owner's.
   const flash = await postModel({ agentId: A, choice: FLASH.id });
   must(flash.json().effective.source === "owner" && flash.json().selected === FLASH.id, flash.text);
-  await nextRun(T, A);
   must(await bound(T, A) === "operator:model deepseek-flash", `back: ${await bound(T, A)}`);
   await postModel({ agentId: A, choice: LUNA.id });
   const cleared = await postModel({ agentId: A, choice: "default" });
   must(cleared.status === 200 && cleared.json().selected === null && cleared.json().effective.source === "default", cleared.text);
+  must(await bound(T, A) === "operator:model deepseek-flash", `clearing the pick did not rebind: ${await bound(T, A)}`);
   must(!DB.raw.prepare("SELECT 1 FROM model_choices WHERE agent_id = ?").get(A), "the row is still there");
   // Clearing what is not set is still the answer, not an error.
   must((await postModel({ agentId: A, choice: "default" })).status === 200, "a second clear");
@@ -324,6 +324,37 @@ await check("route: an id that is not offered is 422 and stores nothing; a missi
     must(r.status === 422, `an unavailable option was accepted: ${r.status} ${r.text}`);
     must(show((await getModel(A)).json().options) === show([{ id: FLASH.id, label: FLASH.label }]), "an unavailable option was listed");
   } finally { env.AI_GATEWAY_TOKEN = saved; }
+});
+
+await check("route: with hx-request a 200 is the block's HTML and a 409 or 422 stays JSON {error: {code, message}}; without it a 200 is JSON", async () => {
+  const send = async (method: "GET" | "POST", fields: Record<string, string> | null, hx: boolean) => {
+    const headers: Record<string, string> = { cookie: mine, ...(hx ? { "hx-request": "true" } : {}) };
+    if (method === "POST") Object.assign(headers, { "content-type": "application/x-www-form-urlencoded", "sec-fetch-site": "same-origin" });
+    const r = await worker.fetch(new Request(`https://console.test/ui/agent/model?agentId=${A}`, { method, headers, ...(fields ? { body: new URLSearchParams(fields) } : {}) }), env as never);
+    const text = await r.text();
+    responses.push(text);
+    return { status: r.status, type: r.headers.get("content-type") ?? "", text };
+  };
+  const isError = (x: { type: string; text: string }, code: string) => {
+    if (!/^application\/json/.test(x.type)) return false;
+    const j = JSON.parse(x.text);
+    return show(Object.keys(j)) === '["error"]' && show(Object.keys(j.error)) === '["code","message"]' && j.error.code === code && typeof j.error.message === "string";
+  };
+  const block = await send("POST", { agentId: A, choice: LUNA.id }, true);
+  must(block.status === 200 && /^text\/html/.test(block.type) && block.text.startsWith('<div class="card">')
+    && block.text.includes("<b>GPT-5.6 Luna</b>") && block.text.includes(`<option value="${LUNA.id}" selected>`), `a pick with hx-request: ${block.status} ${block.type} ${block.text.slice(0, 200)}`);
+  const read = await send("GET", null, true);
+  must(read.status === 200 && /^text\/html/.test(read.type) && read.text.includes("<b>GPT-5.6 Luna</b>"), `a read with hx-request: ${read.status} ${read.type} ${read.text.slice(0, 200)}`);
+  const unknown = await send("POST", { agentId: A, choice: "no-such-option" }, true);
+  must(unknown.status === 422 && isError(unknown, "unknown_choice"), `422 with hx-request: ${unknown.status} ${unknown.type} ${unknown.text.slice(0, 200)}`);
+  await overrides.put({ tenantId: T, agentId: A, provider: "deepseek", model: "deepseek-v4-pro", setBy: "adm", setAt: 1 });
+  try {
+    const locked = await send("POST", { agentId: A, choice: FLASH.id }, true);
+    must(locked.status === 409 && isError(locked, "locked"), `409 with hx-request: ${locked.status} ${locked.type} ${locked.text.slice(0, 200)}`);
+  } finally { await overrides.remove(T, A); }
+  // Control: the same pick without hx-request is the data, not the panel.
+  const data = await send("POST", { agentId: A, choice: "default" }, false);
+  must(data.status === 200 && /^application\/json/.test(data.type) && JSON.parse(data.text).selected === null, `a pick without hx-request: ${data.status} ${data.type} ${data.text.slice(0, 200)}`);
 });
 
 await check("route: a stored pick whose option was removed reads as no pick and runs the default, and returns when the option does", async () => {

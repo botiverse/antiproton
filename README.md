@@ -242,7 +242,11 @@ Antiproton is designed to run as a Cloudflare Worker backed by Durable Objects:
    `GET`/`POST /ui/agent/model`, or the Agents API's `model` field (`cf/src/agents-api/model.ts`; an option's
    id, its `<provider>/<model>`, or `default`, anything else a 400). Most specific wins: an admin's agent row, then their tenant row (either
    locks the owner's pick), then the owner's pick, then the admin's deployment row, then `HARNESS_MODEL`.
-   A pick whose option is no longer offered is passed over. Any change is bound on the agent's next run.
+   A pick whose option is no longer offered is passed over. An owner's pick is bound when it is made (the
+   console's POST, or the Agents API's create or update of an agent already bound), so the agent's next model
+   call runs on it. An admin's change is bound when something next checks the agent's binding: its console
+   page opening, a console message, an Agents API input, an owner's pick, or, for an agent Raft made, a hook
+   push; a turn started any other way runs on the binding it has.
    An `openai/…` model is sent the fields pi-ai's OpenAI-compatible provider would send it
    (`max_completion_tokens`, and a reasoning model's "off" level as `reasoning_effort`, which
    chat/completions needs before it accepts function tools; `src/model/chat-request-shape.ts`); every

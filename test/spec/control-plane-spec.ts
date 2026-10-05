@@ -4,6 +4,7 @@
  * test/control-plane-d1.sh. Each case starts from an empty table.
  */
 import { d1ApiKeys, d1Connections, d1Connectors, d1ModelChoices, d1ModelOverrides, d1Identities, d1InboundHooks, d1ProviderTokens, d1ProvisionedAgents, d1ServiceTokens } from "../../cf/src/control-plane.ts";
+import { resolveModel } from "../../cf/src/model-request.ts";
 
 export interface SpecCase { name: string; run(): Promise<void> }
 
@@ -247,27 +248,33 @@ export function controlPlaneCases(db: D1Database): SpecCase[] {
     assert(ev.length === 1 && ev[0].acting_role === "admin" && ev[0].raft_agent_id === "a1", `events: ${JSON.stringify(ev)}`);
   });
 
-  add("a model choice, provider and model together: the agent's own, else its tenant's, else the deployment's, else none", async () => {
+  // The admin's rows as the agent's binding reads them: through layers and resolveModel, the one precedence rule
+  // (cf/src/model-request.ts). No owner's pick and nothing offered, so only the admin's scopes decide.
+  const noOptions = { offered: [] };
+  const decided = async (t: string, a: string) => JSON.stringify(resolveModel(await d1ModelChoices(db).layers(t, a), noOptions, "env-default").choice);
+
+  add("a model choice, provider and model together: the agent's own, else its tenant's, else the deployment's, else the env default", async () => {
     const m = d1ModelOverrides(db);
-    const eff = async (t: string, a: string) => JSON.stringify(await m.effective(t, a));
-    assert((await m.effective("t", "a")) === null, "a choice out of nothing");
+    assert((await decided("t", "a")) === '{"provider":"deepseek","model":"env-default"}', `a choice out of nothing: ${await decided("t", "a")}`);
     await m.put({ tenantId: "", agentId: "", provider: "deepseek", model: "deepseek-v4-pro", setBy: "u", setAt: 1 });
-    assert((await eff("t", "a")) === '{"provider":"deepseek","model":"deepseek-v4-pro"}', `the deployment's: ${await eff("t", "a")}`);
+    assert((await decided("t", "a")) === '{"provider":"deepseek","model":"deepseek-v4-pro"}', `the deployment's: ${await decided("t", "a")}`);
     await m.put({ tenantId: "t", agentId: "", provider: "cloudflare", model: "anthropic/claude-sonnet-5", setBy: "u", setAt: 2 });
-    assert((await eff("t", "a")) === '{"provider":"cloudflare","model":"anthropic/claude-sonnet-5"}' && (await eff("t2", "a")) === '{"provider":"deepseek","model":"deepseek-v4-pro"}', "the tenant's, and only for it");
+    assert((await decided("t", "a")) === '{"provider":"cloudflare","model":"anthropic/claude-sonnet-5"}' && (await decided("t2", "a")) === '{"provider":"deepseek","model":"deepseek-v4-pro"}', "the tenant's, and only for it");
     await m.put({ tenantId: "t", agentId: "a", provider: "cloudflare", model: "openai/gpt-5", setBy: "u", setAt: 3 });
-    assert((await eff("t", "a")) === '{"provider":"cloudflare","model":"openai/gpt-5"}' && (await eff("t", "b")) === '{"provider":"cloudflare","model":"anthropic/claude-sonnet-5"}', "the agent's, and only for it");
+    assert((await decided("t", "a")) === '{"provider":"cloudflare","model":"openai/gpt-5"}' && (await decided("t", "b")) === '{"provider":"cloudflare","model":"anthropic/claude-sonnet-5"}', "the agent's, and only for it");
     // A second choice replaces the provider with the model: a row never pairs one choice's provider with another's model.
     await m.put({ tenantId: "t", agentId: "a", provider: "deepseek", model: "deepseek-flash", setBy: "v", setAt: 4 });
-    assert((await m.list()).length === 3 && (await eff("t", "a")) === '{"provider":"deepseek","model":"deepseek-flash"}', `a second choice replaced the first: ${await eff("t", "a")}`);
-    assert((await m.remove("t", "a")) && (await eff("t", "a")) === '{"provider":"cloudflare","model":"anthropic/claude-sonnet-5"}', "removing the agent's falls back to the tenant's");
+    assert((await m.list()).length === 3 && (await decided("t", "a")) === '{"provider":"deepseek","model":"deepseek-flash"}', `a second choice replaced the first: ${await decided("t", "a")}`);
+    assert((await m.remove("t", "a")) && (await decided("t", "a")) === '{"provider":"cloudflare","model":"anthropic/claude-sonnet-5"}', "removing the agent's falls back to the tenant's");
   });
 
-  add("a model choice written before the provider column reads with no provider, which the caller takes as the default", async () => {
+  add("a model choice written before the provider column reads with no provider, which the resolver takes as the default provider", async () => {
     // The row as 0013 wrote it: the INSERT names no provider, so the column 0014 added holds what it adds.
     await db.prepare("INSERT INTO model_overrides (tenant_id, agent_id, model, set_by, set_at) VALUES ('t', 'a', 'deepseek-flash', 'u', 1)").run();
     const m = d1ModelOverrides(db);
-    assert(JSON.stringify(await m.effective("t", "a")) === '{"provider":null,"model":"deepseek-flash"}', JSON.stringify(await m.effective("t", "a")));
+    const layers = await d1ModelChoices(db).layers("t", "a");
+    assert(JSON.stringify(layers.agent) === '{"provider":null,"model":"deepseek-flash"}', JSON.stringify(layers));
+    assert((await decided("t", "a")) === '{"provider":"deepseek","model":"deepseek-flash"}', await decided("t", "a"));
     const listed = (await m.list())[0]!;
     assert(listed.provider === null && listed.model === "deepseek-flash", JSON.stringify(listed));
   });

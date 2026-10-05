@@ -219,6 +219,48 @@ await check("an agent created before `model` was the pick: sending back its old 
   must(bad.status === 400 && bad.body.error.code === "model_not_found", `another unknown string: ${bad.status} ${show(bad.body)}`);
 });
 
+await check("orderings under a lock: an unknown name is 409 `model_locked`, not 400; a legacy agent echoing its stored string is a 200 no-op, not 409", async () => {
+  const f = fake();
+  const a = await call(f.deps, "POST", "/agents", { model: "gpt-5.6-luna" });
+  const id = a.body.id;
+  f.admin.agent.set(id, ADMIN);
+  // The lock is checked before the name is looked up: under it nothing but an echo is taken, so naming an
+  // unknown model would mislead the caller into trying another name that is refused just the same.
+  const unknown = await call(f.deps, "POST", `/agents/${id}`, { model: "gpt-6-astra" });
+  must(unknown.status === 409 && unknown.body.error.code === "model_locked", `an unknown name under a lock: ${unknown.status} ${show(unknown.body)}`);
+  must(f.picks.get(id) === LUNA.id, "a refused name changed the pick");
+  // A record from before `model` was the pick, under an admin's row: sending back what it holds changes nothing.
+  const legacy: StoredAgent = { name: "old", instructions: null, model: "gpt-6-astra", metadata: {}, tools: [], createdAt: 1, updatedAt: 1 };
+  f.agents.set("agent_old", legacy);
+  f.admin.agent.set("agent_old", ADMIN);
+  const echo = await call(f.deps, "POST", "/agents/agent_old", { model: "gpt-6-astra", instructions: "edited" });
+  must(echo.status === 200 && echo.body.model === "deepseek/deepseek-v4-pro" && echo.body.instructions === "edited", `legacy echo under a lock: ${echo.status} ${show(echo.body)}`);
+  must(!f.picks.has("agent_old") && f.agents.get("agent_old")!.model === "gpt-6-astra", `legacy echo under a lock stored a pick or lost the record: ${show([...f.picks])}`);
+});
+
+await check("an agent created with an option's id, moved in the console: sending that id again moves the pick back", async () => {
+  const f = fake();
+  // Created with an option's id, then moved to Flash in the console's picker: sending "gpt-5.6-luna" is a pick
+  // of Luna, not an echo of the record, because an offered option means what it says.
+  const a = await call(f.deps, "POST", "/agents", { model: "gpt-5.6-luna" });
+  const id = a.body.id;
+  must(f.agents.get(id)!.model === LUNA.id, `the record: ${show(f.agents.get(id))}`);
+  f.picks.set(id, FLASH.id);
+  must((await call(f.deps, "GET", `/agents/${id}`)).body.model === "deepseek-flash", "the console pick does not read back");
+  const back = await call(f.deps, "POST", `/agents/${id}`, { model: "gpt-5.6-luna" });
+  must(back.status === 200 && back.body.model === "gpt-5.6-luna" && f.picks.get(id) === LUNA.id, `luna after a console pick: ${back.status} ${show(back.body)} ${show([...f.picks])}`);
+});
+
+await check("an agent created with `default`, given a pick in the console: sending `default` again clears it", async () => {
+  const f = fake();
+  // Not an echo of the record: "default" means no pick, whatever the agent was created with.
+  const d = await call(f.deps, "POST", "/agents", { model: "default" });
+  must(f.agents.get(d.body.id)!.model === "default", `the record: ${show(f.agents.get(d.body.id))}`);
+  f.picks.set(d.body.id, LUNA.id);
+  const cleared = await call(f.deps, "POST", `/agents/${d.body.id}`, { model: "default" });
+  must(cleared.status === 200 && cleared.body.model === "deepseek-flash" && !f.picks.has(d.body.id), `default after a console pick: ${cleared.status} ${show(cleared.body)} ${show([...f.picks])}`);
+});
+
 await check("delete removes the agent's pick; a create whose index row fails leaves no pick", async () => {
   const f = fake();
   const a = await call(f.deps, "POST", "/agents", { model: "gpt-5.6-luna" });
@@ -306,14 +348,19 @@ await check("worker: an agent created with `gpt-5.6-luna` runs its first input o
   must(await bound(flash.body.agent.id) === "operator:model deepseek-flash", `bound: ${await bound(flash.body.agent.id)}`);
 });
 
-await check("worker: an update moves the binding on the next input; an admin's agent row then wins, reads back, and refuses another pick", async () => {
+await check("worker: an update moves the binding when it is made, before any input; an admin's agent row then wins, reads back, and refuses another pick", async () => {
   const a = await v1("POST", "/agents", { model: "default" });
   const id = a.body.id;
   const s = await v1("POST", "/agents/sessions", { agent_id: id, environment: { type: "none" }, input: "one" });
   must(await bound(id) === "operator:model deepseek-flash", `first: ${await bound(id)}`);
   must((await v1("POST", `/agents/${id}`, { model: "gpt-5.6-luna" })).body.model === "gpt-5.6-luna", "update");
+  // Bound by the update itself (AgentDO.apiAdopt), so the agent's next model call runs on the pick whatever starts it.
+  must(await bound(id) === "operator:model:cloudflare openai/gpt-5.6-luna", `the update did not rebind: ${await bound(id)}`);
+  must((await v1("POST", `/agents/${id}`, { model: "default" })).body.model === "deepseek-flash" && await bound(id) === "operator:model deepseek-flash",
+    `clearing the pick did not rebind: ${await bound(id)}`);
+  must((await v1("POST", `/agents/${id}`, { model: "gpt-5.6-luna" })).status === 200, "back to luna");
   await v1("POST", `/agents/sessions/${s.body.id}/events`, { events: [{ type: "agent.session.input.message", input: "two" }] });
-  must(await bound(id) === "operator:model:cloudflare openai/gpt-5.6-luna", `after the update: ${await bound(id)}`);
+  must(await bound(id) === "operator:model:cloudflare openai/gpt-5.6-luna", `after the next input: ${await bound(id)}`);
   await d1ModelOverrides(DB).put({ tenantId: T, agentId: id, ...ADMIN, setBy: "adm", setAt: 1 });
   must((await v1("GET", `/agents/${id}`)).body.model === "deepseek/deepseek-v4-pro", "an admin-set agent reads as its pick");
   const locked = await v1("POST", `/agents/${id}`, { model: "deepseek-flash" });

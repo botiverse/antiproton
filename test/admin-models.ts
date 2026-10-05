@@ -33,7 +33,6 @@ function store() {
   return {
     rows,
     overrides: {
-      async effective() { return null; },
       async list() { return [...rows.values()]; },
       async put(o: ModelOverride) { rows.set(`${o.tenantId}/${o.agentId}`, o); },
       async remove(t: string, a: string) { return rows.delete(`${t}/${a}`); },
