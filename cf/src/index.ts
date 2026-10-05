@@ -2095,10 +2095,6 @@ export class AgentDO extends DurableObject<Env> {
       const rt = this.runtime();
       const r = await rt.receiveHook(tenantId, agentId, alias, hookId, event, routed);
       if (r.outcome === "delivered") await this.#wake();
-      // A duplicate wakes too when something is queued and no alarm is armed: the call that queued the original
-      // can be cut off between its row and its wake (a worker that stopped waiting, #783), and the retry is then
-      // the only knock that comes. Never with an alarm armed, so a row waiting out its retry is not pulled early.
-      else if (r.outcome === "duplicate" && hasPendingInbound(this.sql as any) && (await this.ctx.storage.getAlarm()) === null) await this.#wake();
       return { ...r, path: "deferred" as const, ms: Date.now() - started };
     });
   }

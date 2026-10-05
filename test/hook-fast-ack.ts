@@ -23,6 +23,7 @@ register("data:text/javascript," + encodeURIComponent(
 const { AgentDO, default: worker } = await import("../cf/src/index.ts");
 const { clearHookRoutes, HOOK_ROUTE_TTL_MS } = await import("../cf/src/hook-route.ts");
 const { setLogSink } = await import("../src/core/log.ts");
+const { USAGE_WAKE_DELAY_MS } = await import("../cf/src/usage-flush.ts");
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void>) {
@@ -957,20 +958,19 @@ await check("the limit bounds the re-route too: a fast first call that disowns a
   must(http?.timedOut === true && http.lookup === "index-again", `http line: ${show(http)}`);
 });
 
-await check("a duplicate wakes an object with something queued and no alarm armed (the original's wake was cut off), and leaves an armed alarm where it is", async () => {
+await check("a queued push whose wake was cut off is still posted: the duplicate retry's outbox wake arms a pass within 5 s, and that pass posts it once", async () => {
   const w = await world();
   must((await push(w, "q1", "QUEUED-ONLY")).status === 202, "first");
   await (w.D as any).ctx.storage.deleteAlarm();
   must(pendingRows(w) === 1 && w.alarmAt() === null, `control: ${pendingRows(w)} queued, alarm ${w.alarmAt()}`);
   const again = await push(w, "q1", "QUEUED-ONLY");
   must(again.status === 202 && again.body === '{"outcome":"duplicate"}', `retry: ${show(again)}`);
-  must(w.alarmAt() !== null && w.alarmAt()! <= Date.now(), `the duplicate did not wake it: alarm ${w.alarmAt()}`);
-  const later = Date.now() + 60_000;
-  await (w.D as any).ctx.storage.setAlarm(later);
-  must((await push(w, "q1", "QUEUED-ONLY")).body === '{"outcome":"duplicate"}', "third");
-  must(w.alarmAt() === later, `an armed alarm was moved: ${w.alarmAt()} not ${later}`);
-  await settle(w, 1);
-  must(await timesAsked(w, "QUEUED-ONLY") === 1, `asked ${await timesAsked(w, "QUEUED-ONLY")} times`);
+  // Not `hookReceive`'s own wake (only a delivered push arms one): `#usageWake`, for the record the duplicate wrote.
+  const at = w.alarmAt();
+  must(at !== null && at - Date.now() <= USAGE_WAKE_DELAY_MS, `no pass within ${USAGE_WAKE_DELAY_MS} ms: alarm ${at === null ? null : at - Date.now()}`);
+  await sleep(at - Date.now());
+  await w.D.alarm();
+  must(jobCount(w) === 1 && pendingRows(w) === 0 && await timesAsked(w, "QUEUED-ONLY") === 1, `after that pass: ${jobCount(w)} jobs, ${pendingRows(w)} queued`);
 });
 
 await check("an object that answers within the limit answers exactly as before: 202, 401, 400, 429 with its Retry-After, 404, and no timeout line", async () => {
