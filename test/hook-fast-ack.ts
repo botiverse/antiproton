@@ -45,11 +45,14 @@ setLogSink((line) => { try { lines.push(JSON.parse(line)); } catch { /* not ours
  * (401 otherwise), the body is `{id, text}`, the id is the dedupe key. Headers ask for the other answers.
  */
 const received: string[] = [];
+/** The service's inbox the pushes point at: a push is only a wake to read it (Raft's notice). */
+const inbox = { messages: [] as string[], cursor: 0, reads: [] as string[][] };
 const barrier: Array<() => void> = [];
 const pushy: Plugin = {
   id: "pushy", version: "1.0.0",
   tools: [{ name: "noop", summary: "", parameters: {}, sideEffects: "read", idempotency: "native" }],
-  async invoke() { return {}; },
+  // A stand-in for Raft's inbox read (`receive_events`): what is unread, and the read acknowledges it.
+  async invoke() { const messages = inbox.messages.slice(inbox.cursor); inbox.cursor = inbox.messages.length; inbox.reads.push(messages); return { messages }; },
   async receive(event, secret) {
     if (event.headers["x-throw"]) throw new Error("the plugin fell over");
     // Held until two pushes are both inside `receive`, so both resume past the plugin's await together.
@@ -956,7 +959,7 @@ await check("an object that answers within the limit answers exactly as before: 
   must(!lines.some((l) => l.evt === "hook.timeout"), "a timeout line for an object that answered in time");
 });
 
-await check("a slow object, not a dead one: the call that timed out still lands through waitUntil, the sender's retry is a duplicate, and the agent is told once", async () => {
+await check("a slow object, not a dead one: the call that timed out still lands through waitUntil; a retry with the same id is a duplicate", async () => {
   const w = await world();
   w.env.HOOK_OBJECT_TIMEOUT_MS = String(LIMIT_MS);
   const hold = slowObject(w);
@@ -974,10 +977,53 @@ await check("a slow object, not a dead one: the call that timed out still lands 
   must(late?.outcome === "delivered", `hook.late line: ${show(late)}`);
   hold.ms = 0;
   const retry = await push(w, "s1", "x");
-  must(retry.status === 202 && retry.body === '{"outcome":"duplicate"}', `retry: ${show(retry)}`);
+  must(retry.status === 202 && retry.body === '{"outcome":"duplicate"}', `same-id retry: ${show(retry)}`);
   await settle(w, 1);
   must(jobCount(w) === 1 && pendingRows(w) === 0, `${jobCount(w)} jobs, ${pendingRows(w)} queued`);
   must(show(outcomes(w)) === show(["duplicate", "delivered"]), `records: ${show(outcomes(w))}`);
+});
+
+await check("a retry with a new notice id after a late landing (Raft resends its latest notice): the agent is woken for each, reads every inbox message once, and an extra wake reads nothing", async () => {
+  const w = await world();
+  w.env.HOOK_OBJECT_TIMEOUT_MS = String(LIMIT_MS);
+  Object.assign(inbox, { messages: ["MSG-ONE"], cursor: 0, reads: [] });
+  const hold = slowObject(w);
+  hold.ms = LIMIT_MS * 3;
+  const { waited, ctx } = invocation();
+  // The notice for MSG-ONE times out at the worker, and the object lands it late.
+  const first = await Promise.race([worker.fetch(new Request(`https://x/hooks/${w.hookId}`, {
+    method: "POST", headers: { "x-signed-with": w.secret, "content-type": "application/json" }, body: JSON.stringify({ id: "notice-1", text: "WAKE-ONE" }),
+  }), w.env as never, ctx as never), sleep(3000).then(() => null)]);
+  must(first?.status === 503, `first: ${first?.status}`);
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline && waited.some((e) => e.state === "open")) await sleep(20);
+  must(waited.length >= 1 && waited.every((e) => e.state === "resolved"), `waitUntil: ${show(waited)}`);
+  hold.ms = 0;
+  // The agent is woken by the late landing and reads its inbox.
+  await settle(w, 1);
+  await answer(w, 0, "READING", { callTool: true });
+  await settle(w, 2);
+  await answer(w, 1, "DONE-ONE");
+  // Meanwhile a second message arrived, and Raft's retry carries its latest notice, under a new id.
+  inbox.messages.push("MSG-TWO");
+  const retry = await push(w, "notice-2", "WAKE-TWO");
+  must(retry.status === 202 && retry.body === '{"outcome":"delivered"}', `new-id retry: ${show(retry)}`);
+  await settle(w, 3);
+  await answer(w, 2, "READING", { callTool: true });
+  await settle(w, 4);
+  await answer(w, 3, "DONE-TWO");
+  // And a retry that merged nothing new: one more wake, whose read finds the inbox already read.
+  const extra = await push(w, "notice-3", "WAKE-THREE");
+  must(extra.status === 202 && extra.body === '{"outcome":"delivered"}', `extra wake: ${show(extra)}`);
+  await settle(w, 5);
+  await answer(w, 4, "READING", { callTool: true });
+  await settle(w, 6);
+  for (const wake of ["WAKE-ONE", "WAKE-TWO", "WAKE-THREE"]) {
+    must(await timesAsked(w, wake) === 1, `${wake} reached the agent ${await timesAsked(w, wake)} times`);
+  }
+  must(show(inbox.reads) === show([["MSG-ONE"], ["MSG-TWO"], []]), `inbox reads: ${show(inbox.reads)}`);
+  must(show(inbox.reads.flat()) === show(inbox.messages), `messages lost or read twice: ${show(inbox.reads.flat())} of ${show(inbox.messages)}`);
+  must(show(outcomes(w)) === show(["delivered", "delivered", "delivered"]), `records: ${show(outcomes(w))}`);
 });
 
 await check("a sender retrying on 503 (Raft's 5 s, 15 s, 1 min, scaled down) gets 503s while the object is down and one 202 once it answers; the agent is told once", async () => {

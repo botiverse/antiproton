@@ -3086,8 +3086,11 @@ async function inboundHook(request: Request, env: Env, url: URL, ctx?: Pick<Exec
     const doId = String(env.AGENT.idFromName(agentObjectName(found.route.tenantId, found.route.agentId)));
     const fields = { doId, hook: hookId.slice(0, 8), limitMs, elapsedMs: Date.now() - objectStarted };
     logEvent("hook.timeout", { ...fields, outcome: "503" });
-    // The call may still land: a slow object, not a dead one. Kept alive past the answer, and harmless if it does,
-    // since the object deduplicates the sender's retry by its delivery id (`seenBefore`).
+    // Deliberately kept alive past the answer: the object may be slow rather than dead, and a push it lands now
+    // is a wake the agent gets sooner. Not made safe by deduplication: a sender may retry with a different
+    // delivery id (Raft resends its latest notice, merged since), so both can reach the agent. A Raft notice is
+    // only a wake to read the inbox, whose reads are acknowledged by cursor, so the second costs one inbox read
+    // that finds nothing new. A retry with the same id is still a `duplicate` (`seenBefore`).
     const late = work.then(
       (r) => logEvent("hook.late", { ...fields, elapsedMs: Date.now() - objectStarted, outcome: r === "gone" ? "gone" : r ? r.outcome : "unavailable" }),
       (e) => logEvent("hook.late", { ...fields, elapsedMs: Date.now() - objectStarted, error: clip(String((e as Error)?.message ?? e), 200) }),
