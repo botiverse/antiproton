@@ -115,17 +115,21 @@ async function varsOf(file: string): Promise<Record<string, unknown>> {
   return JSON.parse(text.split("\n").filter((l) => !l.trim().startsWith("//")).join("\n")).vars;
 }
 
-await check("the preview declaration is accepted, offers cloudflare under vendor/model, and holds no secret; production declares none yet", async () => {
-  const preview = await varsOf("wrangler.preview.jsonc");
-  const configs = parseProviders(preview.MODEL_PROVIDERS);
-  must(configs.map((p) => p.id).join() === `${DEFAULT_PROVIDER},cloudflare`, JSON.stringify(configs));
-  const cf = configs.find((p) => p.id === "cloudflare")!;
-  must(/^https:\/\/gateway\.ai\.cloudflare\.com\/v1\/[0-9a-f]{32}\/antiproton-preview\/compat$/.test(cf.baseUrl), cf.baseUrl);
-  must(cf.modelFormat === "vendor/model" && cf.auth?.header === "cf-aig-authorization" && JSON.stringify(cf.passKeys) === '{"deepseek/":"DEEPSEEK_API_KEY"}', JSON.stringify(cf));
-  // The default stays where the benchmark and /ui/whoami expect it.
-  must(configs[0]!.baseUrl === preview.DEEPSEEK_BASE_URL && preview.HARNESS_MODEL === "deepseek-flash", "the preview default moved");
-  const production = await varsOf("wrangler.jsonc");
-  must(production.MODEL_PROVIDERS === undefined && production.DEEPSEEK_BASE_URL === "https://api.deepseek.com", "production's providers changed in this config");
+await check("each deployment's declaration is accepted, offers cloudflare under vendor/model through its own gateway, and holds no secret; DeepSeek is the default and production's is exactly the provider it derived before", async () => {
+  for (const [file, gateway] of [["wrangler.preview.jsonc", "antiproton-preview"], ["wrangler.jsonc", "antiproton"]] as const) {
+    const vars = await varsOf(file);
+    const configs = parseProviders(vars.MODEL_PROVIDERS);
+    must(configs.map((p) => p.id).join() === `${DEFAULT_PROVIDER},cloudflare`, `${file}: ${JSON.stringify(configs)}`);
+    const cf = configs.find((p) => p.id === "cloudflare")!;
+    // Each deployment through its own gateway: production's calls must not land in preview's logs or billing.
+    must(new RegExp(`^https://gateway\\.ai\\.cloudflare\\.com/v1/[0-9a-f]{32}/${gateway}/compat$`).test(cf.baseUrl), `${file}: ${cf.baseUrl}`);
+    must(cf.modelFormat === "vendor/model" && cf.auth?.header === "cf-aig-authorization" && JSON.stringify(cf.passKeys) === '{"deepseek/":"DEEPSEEK_API_KEY"}', `${file}: ${JSON.stringify(cf)}`);
+    // The default stays where the benchmark and /ui/whoami expect it.
+    must(configs[0]!.baseUrl === vars.DEEPSEEK_BASE_URL && vars.HARNESS_MODEL === "deepseek-flash", `${file}: the default moved`);
+    // Declaring providers must not change a DeepSeek call: the entry is the one providersFrom derives without them.
+    const derived = providersFrom({ DEEPSEEK_BASE_URL: vars.DEEPSEEK_BASE_URL }).configs[0];
+    must(JSON.stringify(configs[0]) === JSON.stringify(derived), `${file}: ${JSON.stringify(configs[0])} is not ${JSON.stringify(derived)}`);
+  }
 });
 
 for (const r of results) console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);
