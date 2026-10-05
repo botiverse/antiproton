@@ -718,6 +718,153 @@ await check("the colo's cache serves a route another isolate read, with no index
   } finally { delete (globalThis as any).caches; }
 });
 
+/**
+ * An invocation's `waitUntil`, as the worker's `fetch` is handed it: every promise it was given, and how each ended.
+ * Called other than as a method of its context it throws, as workerd's does ("Illegal invocation"), so a caller
+ * that detaches it (`const defer = ctx.waitUntil`) fails here as it would in production.
+ */
+function invocation() {
+  const waited: Array<{ state: "open" | "resolved" | "rejected" }> = [];
+  const ctx = {
+    waitUntil(this: unknown, p: Promise<unknown>) {
+      if (this !== ctx) throw new TypeError("Illegal invocation: waitUntil called without its context as `this`");
+      const e = { state: "open" as "open" | "resolved" | "rejected" };
+      waited.push(e);
+      p.then(() => { e.state = "resolved"; }, () => { e.state = "rejected"; });
+    },
+    passThroughOnException() {},
+  };
+  return { waited, ctx };
+}
+/** A push through the worker with an invocation context; null if no answer came within `ms`. */
+async function pushIn(w: World, id: string, ctx: unknown, ms = 3000) {
+  const res = worker.fetch(new Request(`https://x/hooks/${w.hookId}`, {
+    method: "POST", headers: { "x-signed-with": w.secret, "content-type": "application/json" }, body: JSON.stringify({ id, text: "x" }),
+  }), w.env as never, ctx as never);
+  const answer = await Promise.race([res.then(async (r) => ({ status: r.status, body: await r.text() })), sleep(ms).then(() => null)]);
+  return answer;
+}
+
+await check("the colo-cache write after an index read is handed to waitUntil: one that never settles, rejects or throws does not hold or change the answer", async () => {
+  const kinds: Record<string, () => Promise<void>> = {
+    never: () => new Promise<void>(() => {}),
+    rejects: () => Promise.reject(new Error("cache down")),
+    throws: () => { throw new Error("cache down, synchronously"); },
+  };
+  for (const [kind, put] of Object.entries(kinds)) {
+    const puts = { n: 0 };
+    (globalThis as any).caches = { default: {
+      async match() { return undefined; },
+      put(_r: Request, _res: Response) { puts.n++; return put(); },
+      async delete() { return true; },
+    } };
+    try {
+      const w = await world();
+      const { ctx, waited } = invocation();
+      const started = Date.now();
+      const a = await pushIn(w, `${kind}-1`, ctx);
+      must(a !== null, `${kind}: no answer within 3 s: the push waited on the cache write`);
+      must(a.status === 202 && a.body === '{"outcome":"delivered"}', `${kind}: answer ${show(a)}`);
+      must(Date.now() - started < 1000, `${kind}: answered in ${Date.now() - started} ms`);
+      must(puts.n === 1 && waited.length === 1, `${kind}: control: ${puts.n} cache writes, ${waited.length} promises handed to waitUntil`);
+      await sleep(0);
+      must(waited[0]!.state === (kind === "never" ? "open" : "resolved"), `${kind}: the waitUntil promise is ${waited[0]!.state}`);
+      // The route is held in this isolate all the same: the next push reads no index.
+      must((await push(w, `${kind}-2`, "x")).d1.length === 0, `${kind}: the next push read the index`);
+    } finally { delete (globalThis as any).caches; }
+  }
+});
+
+await check("a route filled into the colo's cache through waitUntil still refuses its hook once revoked, and is forgotten", async () => {
+  const store = new Map<string, string>();
+  (globalThis as any).caches = { default: {
+    async match(r: Request) { const v = store.get(r.url); return v ? new Response(v) : undefined; },
+    async put(r: Request, res: Response) { store.set(r.url, await res.text()); },
+    async delete(r: Request) { return store.delete(r.url); },
+  } };
+  try {
+    const w = await world();
+    const { ctx, waited } = invocation();
+    must((await pushIn(w, "r1", ctx))?.status === 202, "control: routed");
+    await sleep(0);
+    must(waited.length === 1 && waited[0]!.state === "resolved" && store.size === 1, `control: the cache was filled (${store.size}, ${show(waited)})`);
+    const revoked = await worker.fetch(new Request("https://x/admin/hooks", {
+      method: "POST", headers: { "x-harness-token": TOKEN, "content-type": "application/json" }, body: JSON.stringify({ revoke: w.hookId }),
+    }), w.env as never);
+    must((await revoked.json() as { revoked?: boolean }).revoked === true, "revoke");
+    clearHookRoutes(); // another isolate in the colo: only the cache knows the route
+    lines.length = 0;
+    const before = outcomes(w).length;
+    const after = await pushIn(w, "r2", invocation().ctx);
+    must(after?.status === 404 && after.body === "", `after the revoke: ${show(after)}`);
+    must(lines.find((l) => l.evt === "http")?.lookup === "index-again", `lookup: ${show(lines.find((l) => l.evt === "http"))}`);
+    must([...store.keys()].length === 0, "the revoked hook's route is still in the colo's cache");
+    must(outcomes(w).length === before, `the revoked push left a record: ${show(outcomes(w))}`);
+  } finally { delete (globalThis as any).caches; }
+});
+
+await check("a cached route its object disowns is read again from the index, and that cache write is handed to waitUntil too", async () => {
+  // A stale route in the colo's cache names an object that has no secret for the hook; the hook is still live in the index.
+  const stale = { route: { hookId: "", tenantId: T, agentId: "b", alias: "p" }, until: Date.now() + 60_000 };
+  const store = new Map<string, string>();
+  const puts = { n: 0 };
+  (globalThis as any).caches = { default: {
+    async match(r: Request) { const v = store.get(r.url); return v ? new Response(v) : undefined; },
+    put(_r: Request, _res: Response) { puts.n++; return new Promise<void>(() => {}); },
+    async delete(r: Request) { return store.delete(r.url); },
+  } };
+  try {
+    const w = await world();
+    stale.route.hookId = w.hookId;
+    store.set(`https://x/__hook-route/${w.hookId}`, JSON.stringify(stale));
+    const real = w.env.AGENT as { idFromName(n: string): string; get(n: string): unknown };
+    const asked: string[] = [];
+    w.env.AGENT = {
+      idFromName: real.idFromName,
+      get: (n: string) => {
+        asked.push(n);
+        // The stale route's object: no secret for this hook, so it answers as `receiveHook` does for a cache-routed push.
+        return n === agentObjectName(T, "b") ? { hookReceive: async () => ({ outcome: "failed", unrouted: true }) } : real.get(n);
+      },
+    };
+    const { ctx, waited } = invocation();
+    lines.length = 0;
+    const started = Date.now();
+    const a = await pushIn(w, "again-1", ctx);
+    must(a !== null, "no answer within 3 s: the push waited on the cache write after the second index read");
+    must(a.status === 202 && a.body === '{"outcome":"delivered"}', `answer ${show(a)}`);
+    must(Date.now() - started < 1000, `answered in ${Date.now() - started} ms`);
+    must(show(asked) === show([agentObjectName(T, "b"), agentObjectName(T, A)]), `control: objects asked ${show(asked)}`);
+    must(lines.find((l) => l.evt === "http")?.lookup === "index-again", `control: lookup ${show(lines.find((l) => l.evt === "http"))}`);
+    must(!store.has(`https://x/__hook-route/${w.hookId}`), "control: the stale route is still in the colo's cache");
+    must(puts.n === 1 && waited.length === 1 && waited[0]!.state === "open", `${puts.n} cache writes, waitUntil was handed ${show(waited)}`);
+  } finally { delete (globalThis as any).caches; }
+});
+
+await check("a route is held for an hour: served without the index just inside it, read again just past it, and the cache is told the same", async () => {
+  must(HOOK_ROUTE_TTL_MS === 60 * 60_000, `HOOK_ROUTE_TTL_MS = ${HOOK_ROUTE_TTL_MS}`);
+  const maxAge: string[] = [];
+  (globalThis as any).caches = { default: {
+    async match() { return undefined; },
+    async put(_r: Request, res: Response) { maxAge.push(res.headers.get("cache-control") ?? ""); },
+    async delete() { return true; },
+  } };
+  const realNow = Date.now;
+  try {
+    const w = await world();
+    const t0 = realNow();
+    Date.now = () => t0;
+    must((await push(w, "h1", "x")).d1.length === 1, "control: the first push read the index");
+    must(show(maxAge) === show(["max-age=3600"]), `cache-control: ${show(maxAge)}`);
+    Date.now = () => t0 + HOOK_ROUTE_TTL_MS - 1000;
+    const inside = await push(w, "h2", "x");
+    must(inside.status === 202 && inside.d1.length === 0, `just inside the hour: ${show(inside)}`);
+    Date.now = () => t0 + HOOK_ROUTE_TTL_MS + 1;
+    const past = await push(w, "h3", "x");
+    must(past.status === 202 && past.d1.length === 1, `just past the hour: ${show(past)}`);
+  } finally { Date.now = realNow; delete (globalThis as any).caches; }
+});
+
 console.log(`\n  An inbound hook answers before the turn\n  ${"─".repeat(56)}`);
 for (const r of results) {
   console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);

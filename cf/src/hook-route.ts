@@ -13,13 +13,18 @@
  * through a cached route about a hook with no secret answers `unrouted` (`AgentRuntime.receiveHook`): the
  * worker then forgets the route and asks the index, so a revoked hook answers 404 at once, as before. The
  * TTL bounds only the case where the index was revoked and the secret drop failed: such a hook is routed,
- * and delivers, for at most `HOOK_ROUTE_TTL_MS` after the last index read that cached it.
+ * and delivers, for at most `HOOK_ROUTE_TTL_MS` after the last index read that cached it. Nothing else
+ * catches that case, and retrying the revoke does not either (the index row is already revoked, so the
+ * retry finds nothing to drop the secret for), which is why the TTL is an hour rather than a day: longer
+ * would save a few more index reads and widen that window to match.
  *
- * Only a hook the index found is cached; an unknown id is asked about every time.
+ * Only a hook the index found is cached; an unknown id is asked about every time. Writing the colo's cache
+ * is not on the push's path: the caller hands it to `defer` (the invocation's `waitUntil`), so a slow or
+ * failing cache write delays and changes nothing the service is answered.
  */
 import type { HookDirectory } from "./control-plane.ts";
 
-export const HOOK_ROUTE_TTL_MS = 5 * 60_000;
+export const HOOK_ROUTE_TTL_MS = 60 * 60_000;
 
 export interface HookRoute { hookId: string; tenantId: string; agentId: string; alias: string }
 
@@ -45,9 +50,12 @@ function valid(v: unknown, hookId: string): v is { route: HookRoute; until: numb
  * The route for `hookId`, and where it came from; null when the index has no live hook by that id. The
  * expiry is carried inside the entry and checked here, so the bound does not rest on the cache honouring
  * its own max-age.
+ *
+ * `defer` takes the colo-cache write after an index read (a Worker's `ctx.waitUntil`); the promise it is
+ * handed never rejects. Without one the write is awaited here, as it was before there was a `defer`.
  */
-export async function routeHook(dir: HookDirectory, origin: string, hookId: string, now: () => number = Date.now):
-  Promise<{ route: HookRoute; from: RouteSource } | null> {
+export async function routeHook(dir: HookDirectory, origin: string, hookId: string, now: () => number = Date.now,
+  defer?: (p: Promise<unknown>) => void): Promise<{ route: HookRoute; from: RouteSource } | null> {
   const held = memory.get(hookId);
   if (held && held.until > now() && held.route.hookId === hookId) return { route: held.route, from: "memory" };
   memory.delete(hookId);
@@ -68,11 +76,15 @@ export async function routeHook(dir: HookDirectory, origin: string, hookId: stri
   memory.set(hookId, entry);
   if (cache) {
     const seconds = Math.ceil(HOOK_ROUTE_TTL_MS / 1000);
-    try {
-      await cache.put(cacheKey(origin, hookId), new Response(JSON.stringify(entry), {
-        headers: { "content-type": "application/json", "cache-control": `max-age=${seconds}` },
-      }));
-    } catch { /* not cached: the next push reads the index again */ }
+    // `put` can throw before it returns a promise as well as reject after, so both are caught inside one async run.
+    const write = (async () => {
+      try {
+        await cache.put(cacheKey(origin, hookId), new Response(JSON.stringify(entry), {
+          headers: { "content-type": "application/json", "cache-control": `max-age=${seconds}` },
+        }));
+      } catch { /* not cached: the next push in this colo reads the index again */ }
+    })();
+    if (defer) defer(write); else await write;
   }
   return { route: entry.route, from: "index" };
 }
