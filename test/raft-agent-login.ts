@@ -468,6 +468,10 @@ await check("the resolved path is compared with the template segment by segment:
     must(!followsTemplate(t, p), `accepted ${p}`);
   }
   must(followsTemplate("/a/x-{id}.json", "/a/x-7.json") && !followsTemplate("/a/x-{id}.json", "/a/y-7.json"), "a parameter inside a fixed segment");
+  // A fixed segment is fixed whatever its text: one spelled like a marker (the sentinel an earlier version used) is not a wildcard.
+  must(followsTemplate("/api/zzslotzz/view", "/api/zzslotzz/view"), "a fixed segment spelled like a marker does not match itself");
+  for (const p of ["/api/anything/view", "/api/x/view"]) must(!followsTemplate("/api/zzslotzz/view", p), `a fixed segment became a wildcard: ${p}`);
+  must(!followsTemplate("/api/zzslotzz/{id}", "/api/other/7") && followsTemplate("/api/zzslotzz/{id}", "/api/zzslotzz/7"), "marker-like text beside a parameter");
   must(followsTemplate("/api/raft/actions/list-reminders", "/api/raft/actions/list-reminders") && !followsTemplate("/api/raft/actions/list-reminders", "/api/raft/actions"), "a template with no parameter");
 });
 

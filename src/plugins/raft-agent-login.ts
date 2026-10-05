@@ -679,20 +679,30 @@ function traverses(value: string): boolean {
 }
 
 /**
- * Whether a resolved pathname is still the manifest's template, compared segment by segment: the template's fixed
- * segments as URL writes them (so a template URL re-encodes still matches) must be equal, and each segment holding a
- * parameter must be exactly one non-empty segment. A value that made the path fold, climb or grow fails here.
+ * Whether a resolved pathname is still the manifest's template, compared segment by segment. Which segments hold a
+ * parameter is read from the `{name}` matches in the template itself, by position, never from a marker put into the
+ * text (a marker could also be written in a fixed segment and turn it into a wildcard). A fixed segment must equal the
+ * pathname's as URL writes it (so a template URL re-encodes still matches); a segment holding a parameter must be its
+ * fixed text around each parameter, with each parameter non-empty and inside that one segment.
  */
 export function followsTemplate(template: string, pathname: string): boolean {
-  const slot = "zzslotzz";
-  const want = new URL(template.replace(/\{[A-Za-z][A-Za-z0-9_]*\}/g, slot), "https://manifest.local").pathname.split("/");
+  const want = template.split("/");
   const got = pathname.split("/");
   if (want.length !== got.length) return false;
+  // A literal as URL writes it in a path; the leading "x" keeps a literal "." or ".." from being folded away.
+  const written = (lit: string) => new URL(`/x${lit}`, "https://manifest.local").pathname.slice(2);
+  const escape = (lit: string) => lit.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   return want.every((seg, i) => {
-    if (!seg.includes(slot)) return seg === got[i];
-    // A segment holding a parameter: its fixed text around the parameter(s) as written, each parameter non-empty.
-    const pattern = new RegExp(`^${seg.split(slot).map((lit) => lit.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("[^/]+")}$`);
-    return pattern.test(got[i]!);
+    const params = [...seg.matchAll(/\{[A-Za-z][A-Za-z0-9_]*\}/g)];
+    if (!params.length) return written(seg) === got[i];
+    let pattern = "";
+    let at = 0;
+    for (const m of params) {
+      pattern += `${escape(written(seg.slice(at, m.index)))}[^/]+`;
+      at = m.index! + m[0].length;
+    }
+    pattern += escape(written(seg.slice(at)));
+    return new RegExp(`^${pattern}$`).test(got[i]!);
   });
 }
 
