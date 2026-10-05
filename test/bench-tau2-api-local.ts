@@ -282,7 +282,8 @@ await check("MODEL=no-such-model: the run stops before task 1, writes no record,
   const r = await wholeRun("no-such-model");
   try {
     must(r.out.code !== 0 && r.out.record === null && /model_not_found/.test(String(r.out.why)), show(r.out));
-    must(r.files.length === 0, `files were written: ${show(r.files)}`);
+    // Not even the run's directory: the refusal comes before the run begins (`preflight`), not at task 1.
+    must(r.files.length === 0 && !existsSync(r.runs), `the run began: ${show(r.files)} ${existsSync(r.runs)}`);
     must(asked.length === before, "a model was called");
     let revoked = false;
     try { await r.runClient.v1("GET", "/agents"); } catch (e) { revoked = /no API key/.test(String(e)); }
