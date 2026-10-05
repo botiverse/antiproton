@@ -8,11 +8,12 @@
  * Worker billed for CPU; here it happens on a promise nobody is awaiting.
  *
  * Shared by both benchmarks so neither measures a loop the deployment does not
- * run.
+ * run. A failed call is answered as `callQueuedModel` answers it: a provider's
+ * refusal keeps its own message in `providerError` (`failedAnswer`).
  */
 import type { PiAgent } from "../src/runtime/pi-agent.ts";
 import type { ModelAdapter } from "../src/model/types.ts";
-import { toRequest, fromResponse, errorMessage } from "../src/model/pi-bridge.ts";
+import { toRequest, fromResponse, failedAnswer } from "../src/model/pi-bridge.ts";
 
 export function nodeWorker(model: ModelAdapter, agentOf: () => PiAgent, fallbackModelId: string) {
   let inFlight = 0;
@@ -39,7 +40,7 @@ export function nodeWorker(model: ModelAdapter, agentOf: () => PiAgent, fallback
           const r = await model.complete(messages, tools ? { tools } : {});
           agent.deliver(jobId, fromResponse(r, identity));
         } catch (e: any) {
-          agent.deliver(jobId, errorMessage(String(e?.message ?? e).slice(0, 300), identity));
+          agent.deliver(jobId, failedAnswer(e, identity));
         } finally { inFlight -= 1; }
       })();
     },

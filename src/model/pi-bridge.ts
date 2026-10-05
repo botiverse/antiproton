@@ -154,7 +154,7 @@ function usageOf(res: ModelResponse): Usage {
  * "the field is still there when it is read back" is said by the type, not
  * only by the test that reads the stored entry.
  */
-export type AnsweredMessage = AssistantMessage & { jobId?: string };
+export type AnsweredMessage = AssistantMessage & { jobId?: string; providerError?: string };
 
 /**
  * `jobId` is the trace spine's one durable link from an answer back to the
@@ -214,6 +214,31 @@ export function fromResponse(
     timestamp: Date.now(),
     ...(jobId ? { jobId } : {}),
   };
+}
+
+/**
+ * The text a failed answer shows a reader: the provider's own refusal when it carries one (`providerError`,
+ * set for a refused request by `callQueuedModel`, cf/src/model-request.ts), else its `errorMessage`. The two
+ * are apart because the harness's retry check scans `errorMessage` and must never see provider text
+ * (src/model/openai-compatible.ts, `ModelRequestRefused`); every reader that shows a failed turn reads this.
+ */
+export function failureText(m: { errorMessage?: unknown; providerError?: unknown } | undefined): string | undefined {
+  if (typeof m?.providerError === "string" && m.providerError) return m.providerError;
+  return typeof m?.errorMessage === "string" ? m.errorMessage : undefined;
+}
+
+/**
+ * The answer for a provider call that threw, where no queue consumer stands between the client and the agent
+ * (the bench runners' worker, bench/node-worker.ts). `errorMessage` is the error's own message, at most 300
+ * characters, as it always was; a refusal (`ModelRequestRefused`, src/model/openai-compatible.ts) adds its
+ * `turnError` as `providerError`, since its `errorMessage` is fixed text that says only the status. Read by
+ * shape rather than `instanceof`, so this file does not import the client.
+ */
+export function failedAnswer(e: unknown, model: { api: string; provider: string; id: string }): AnsweredMessage {
+  const err = e as { message?: unknown; permanent?: unknown; turnError?: unknown } | null;
+  const answer: AnsweredMessage = errorMessage(String(err?.message ?? e).slice(0, 300), model);
+  if (err?.permanent === true && typeof err.turnError === "string") answer.providerError = err.turnError;
+  return answer;
 }
 
 export function errorMessage(

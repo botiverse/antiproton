@@ -1,7 +1,8 @@
 import { operatorRequest, providerOfRef, type OperatorModel } from "../../src/model/operator-request.ts";
 import { DEFAULT_PROVIDER, modelProblem, providersFrom, type ModelChoice, type ModelProviders } from "../../src/model/providers.ts";
-import { OpenAiCompatibleModel } from "../../src/model/openai-compatible.ts";
-import { fromResponse, toRequest, type AnsweredMessage } from "../../src/model/pi-bridge.ts";
+import { ModelRequestRefused, OpenAiCompatibleModel } from "../../src/model/openai-compatible.ts";
+import { errorMessage, fromResponse, toRequest, type AnsweredMessage } from "../../src/model/pi-bridge.ts";
+import { logEvent } from "../../src/core/log.ts";
 
 /**
  * What the operator's model account reads from the environment: the providers (MODEL_PROVIDERS, else
@@ -72,11 +73,23 @@ export async function callQueuedModel(env: ModelEnv, job: any, jobId: string): P
   const provider = job.operatorModel ? String(job.operatorProvider ?? DEFAULT_PROVIDER) : DEFAULT_PROVIDER;
   const model = new OpenAiCompatibleModel(operatorRequest(operatorModelOf(env), { provider, model: called }));
   const { messages, tools } = toRequest(job.context);
-  const res = await model.complete(messages, tools ? { tools } : {});
   const identity = {
     api: String(job.model?.api ?? "offloaded"),
     provider: String(job.model?.provider ?? "openai-compatible"),
     id: called,
   };
+  let res;
+  try {
+    res = await model.complete(messages, tools ? { tools } : {});
+  } catch (e) {
+    // A refusal of the request itself is this job's answer, not a failure to retry: the queue would send the
+    // same request again and be refused again (src/model/openai-compatible.ts, `isPermanentRefusal`). Answered
+    // as an error, it fails the turn once. `errorMessage` is the refusal's fixed text, the one string the
+    // harness's retry check scans; the provider's status and message go in `providerError`, which the turn's
+    // readers show (`failureText`, src/model/pi-bridge.ts). Anything else is thrown, so the queue retries it.
+    if (!(e instanceof ModelRequestRefused)) throw e;
+    logEvent("model_job.refused", { jobId, provider, model: called, status: e.status });
+    return { ...errorMessage(e.message, identity), providerError: e.turnError, jobId };
+  }
   return fromResponse(res, identity, jobId);
 }
