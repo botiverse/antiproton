@@ -239,7 +239,8 @@ Antiproton is designed to run as a Cloudflare Worker backed by Durable Objects:
    Owners pick for their own agents from the `USER_MODELS` var — a JSON array of
    `{ id, label, provider, model }` under those providers (`src/model/user-models.ts` validates it; unset,
    nothing is offered, and an option whose provider's secret is unset is not offered) — through
-   `GET`/`POST /ui/agent/model`. Most specific wins: an admin's agent row, then their tenant row (either
+   `GET`/`POST /ui/agent/model`, or the Agents API's `model` field (`cf/src/agents-api/model.ts`; an option's
+   id, its `<provider>/<model>`, or `default`, anything else a 400). Most specific wins: an admin's agent row, then their tenant row (either
    locks the owner's pick), then the owner's pick, then the admin's deployment row, then `HARNESS_MODEL`.
    A pick whose option is no longer offered is passed over. Any change is bound on the agent's next run.
    An `openai/…` model is sent the fields pi-ai's OpenAI-compatible provider would send it

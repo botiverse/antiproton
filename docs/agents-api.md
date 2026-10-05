@@ -104,7 +104,7 @@ Create, retrieve, update, list, and delete agents using `client.beta.agents`:
 const agent = await client.beta.agents.create({
   name: "support-analyst",
   instructions: "You are a tier-2 technical support analyst. Always be precise and concise.",
-  model: "gpt-6-astra", // Stored for metadata; actual inference uses the deployment's configured model
+  model: "gpt-5.6-luna", // One of the models the deployment offers, or "default" (see Known Behavioral Differences)
 });
 
 console.log("Agent created:", agent.id);
@@ -233,7 +233,7 @@ The official SDK automatically handles tool invocations when `toolHandlers` are 
 const agent = await client.beta.agents.create({
   name: "weather-agent",
   instructions: "For weather questions always call get_weather, then answer using its result.",
-  model: "gpt-6-astra",
+  model: "default",
   tools: [
     {
       type: "function",
@@ -381,6 +381,6 @@ When an unsupported parameter or event is provided to a supported Agents API rou
 
 ## 6. Known Behavioral Differences & Limits
 
-1. **Model Parameter:** The `model` parameter is accepted and preserved on the agent entity. However, actual inference execution routes through the preview deployment's configured model provider (`deepseek-flash`).
+1. **Model Parameter:** `model` is the owner's pick for the agent — the same pick the console's model picker makes — and takes effect from the agent's next input. It accepts `"default"` (whatever the deployment runs), the id of a model the deployment offers in `USER_MODELS` (production and preview: `deepseek-flash`, `gpt-5.6-luna`), that option's `<provider>/<model>` (e.g. `cloudflare/openai/gpt-5.6-luna`), or the name the API last answered for the agent, which changes nothing. Anything else is `400` with `param: "model"` (`agent.model` for an inline session agent) and `code: "model_not_found"`, and nothing is created. An administrator's agent or tenant setting outranks the owner's pick: choosing another model then is `409` with `code: "model_locked"`, and `"default"` is accepted. The `model` the API returns is what the agent's next turn runs on, not what was sent: an offered option's id, or `<provider>/<model>` when an administrator set a model no option names (e.g. `deepseek/deepseek-v4-pro`).
 2. **Container Lease Lifecycles:** While a turn waits for a caller's client function result, the agent's underlying sandbox container **may be handed back**, and anything in the container filesystem not persisted with `keep` is lost.
 3. **Event Batching Rules:** Several `tool_result` events may be submitted in a single request. However, `tool_result` events cannot be mixed with `input.message` or `input.cancel` in the same request. Furthermore, every result must name a valid `call_id` emitted by the model during that turn; unknown `call_id`s return a 400 error and discard the request.

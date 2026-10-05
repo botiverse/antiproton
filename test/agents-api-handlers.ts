@@ -47,6 +47,13 @@ function fakeDeps() {
       cancel: async (_a, s) => { log.cancelled.push(s); },
       transcript: async () => ({ entries: [], running: false, pending: [] }),
     },
+    // No options and no admin rows: "default" is the one model a caller may send (test/agents-api-model.ts covers the rest).
+    models: {
+      userModels: { offered: [] }, defaultModel: "deepseek-flash",
+      layers: async () => ({ agent: null, tenant: null, deployment: null, owner: null }),
+      put: async () => { throw new Error("no option is offered, so nothing may be picked"); },
+      remove: async () => {},
+    },
   };
   return { deps, log, agents, sessions, built, fail };
 }
@@ -62,14 +69,14 @@ await check("input that looks like a credential is refused before anything is ma
   // so nothing in this file is itself shaped like a real secret.
   const token = "gh" + "p_" + "e".repeat(36);
   const created = fakeDeps();
-  const r = await call(created.deps, "POST", "/agents/sessions", { agent: { model: "m", name: "n" }, environment: { type: "none" }, input: `my token is ${token}` });
+  const r = await call(created.deps, "POST", "/agents/sessions", { agent: { model: "default", name: "n" }, environment: { type: "none" }, input: `my token is ${token}` });
   assert(r.status === 400 && r.body?.error?.code === "secret_in_input" && r.body.error.param === "input", `create: ${r.status} ${JSON.stringify(r.body)}`);
   assert(!JSON.stringify(r.body).includes("eeee"), "the refusal carries the text");
   assert(created.agents.size === 0 && created.sessions.size === 0 && created.log.inputs.length === 0 && created.log.opened.length === 0,
     `a refused create left something behind: agents ${created.agents.size} sessions ${created.sessions.size} inputs ${created.log.inputs.length}`);
 
   const later = fakeDeps();
-  const s = await call(later.deps, "POST", "/agents/sessions", { agent: { model: "m", name: "n" }, environment: { type: "none" } });
+  const s = await call(later.deps, "POST", "/agents/sessions", { agent: { model: "default", name: "n" }, environment: { type: "none" } });
   assert(s.status === 200, `session: ${s.status} ${JSON.stringify(s.body)}`);
   const sent = await call(later.deps, "POST", `/agents/sessions/${s.body.id}/events`, { events: [
     { type: "agent.session.input.message", input: "an ordinary message" },
@@ -81,7 +88,7 @@ await check("input that looks like a credential is refused before anything is ma
 
 await check("agents: create, retrieve, list, update reaching the persona, delete making it unreachable", async () => {
   const { deps, log } = fakeDeps();
-  const c = await call(deps, "POST", "/agents", { model: "gpt-6-astra", name: "coder", instructions: "Write clean code." });
+  const c = await call(deps, "POST", "/agents", { model: "default", name: "coder", instructions: "Write clean code." });
   assert(c.status === 200 && c.body.object === "agent" && c.body.id === "agent_1", `create: ${JSON.stringify(c)}`);
   assert(log.adopted.join() === "agent_1", "the agent's own object was not created");
   assert((await call(deps, "GET", "/agents/agent_1")).body.name === "coder", "retrieve");
@@ -98,7 +105,7 @@ await check("agents: create, retrieve, list, update reaching the persona, delete
 
 await check("sessions: create with agent_id and text input, retrieve, list by agent, update metadata, delete", async () => {
   const { deps, log } = fakeDeps();
-  await call(deps, "POST", "/agents", { model: "m" });
+  await call(deps, "POST", "/agents", { model: "default" });
   const s = await call(deps, "POST", "/agents/sessions", { agent_id: "agent_1", environment: { type: "openai_hosted" }, input: "Create tree.py", metadata: { job: "1" } });
   assert(s.status === 200 && s.body.object === "agent.session" && s.body.agent.id === "agent_1", `create: ${JSON.stringify(s)}`);
   assert(s.body.environment.type === "openai_hosted" && s.body.metadata.job === "1", `fields: ${JSON.stringify(s.body)}`);
@@ -120,12 +127,12 @@ const throws = async (p: Promise<unknown>) => { try { await p; return false; } c
 await check("a create that fails at the index has made nothing in any agent's object", async () => {
   const a = fakeDeps();
   a.fail.add("putAgent");
-  assert(await throws(call(a.deps, "POST", "/agents", { model: "m", instructions: "x" })), "a failed index write did not fail the create");
-  assert(await throws(call(a.deps, "POST", "/agents/sessions", { agent: { model: "m" }, environment: { type: "none" }, input: "hi" })), "a failed index write did not fail the inline create");
+  assert(await throws(call(a.deps, "POST", "/agents", { model: "default", instructions: "x" })), "a failed index write did not fail the create");
+  assert(await throws(call(a.deps, "POST", "/agents/sessions", { agent: { model: "default" }, environment: { type: "none" }, input: "hi" })), "a failed index write did not fail the inline create");
   assert(a.built.size === 0 && a.log.opened.length === 0 && a.log.inputs.length === 0, `an object was written without its index row: ${JSON.stringify([...a.built])}`);
 
   const s = fakeDeps();
-  await call(s.deps, "POST", "/agents", { model: "m" });
+  await call(s.deps, "POST", "/agents", { model: "default" });
   s.fail.add("putSession");
   assert(await throws(call(s.deps, "POST", "/agents/sessions", { agent_id: "agent_1", environment: { type: "none" }, input: "hi" })), "a failed session index write did not fail the create");
   assert(s.log.opened.length === 0 && s.log.inputs.length === 0, `a session was opened without its index row: ${JSON.stringify(s.log)}`);
@@ -134,7 +141,7 @@ await check("a create that fails at the index has made nothing in any agent's ob
 await check("a failure in the agent's object after the index write is repaired by the next use, not duplicated by a retry", async () => {
   const { deps, log, agents, sessions, built, fail } = fakeDeps();
   fail.add("adopt");
-  const c = await call(deps, "POST", "/agents", { model: "m", instructions: "Write clean code." });
+  const c = await call(deps, "POST", "/agents", { model: "default", instructions: "Write clean code." });
   assert(c.status === 200 && agents.size === 1 && !built.has("agent_1"), `create with a failing object: ${JSON.stringify(c)}`);
   const u = await call(deps, "POST", "/agents/agent_1", { instructions: "Be brief." });
   assert(u.status === 200 && agents.get("agent_1")?.instructions === "Be brief." && !built.has("agent_1"), `update with a failing object: ${JSON.stringify(u)}`);
@@ -156,7 +163,7 @@ await check("a failure in the agent's object after the index write is repaired b
 
 await check("input to a session whose agent was deleted is refused like every other read of that agent", async () => {
   const { deps, log } = fakeDeps();
-  await call(deps, "POST", "/agents", { model: "m" });
+  await call(deps, "POST", "/agents", { model: "default" });
   const s = await call(deps, "POST", "/agents/sessions", { agent_id: "agent_1", environment: { type: "none" } });
   await call(deps, "DELETE", "/agents/agent_1");
   const sent = await call(deps, "POST", `/agents/sessions/${s.body.id}/events`, { events: [{ type: "agent.session.input.message", input: "go" }] });
@@ -165,7 +172,7 @@ await check("input to a session whose agent was deleted is refused like every ot
 
 await check("a session with an inline agent creates that agent; the sessions path is never read as an agent id", async () => {
   const { deps, log, agents, built } = fakeDeps();
-  const s = await call(deps, "POST", "/agents/sessions", { agent: { model: "gpt-6-astra", instructions: "Run it." }, environment: { type: "none" } });
+  const s = await call(deps, "POST", "/agents/sessions", { agent: { model: "default", instructions: "Run it." }, environment: { type: "none" } });
   assert(s.status === 200 && agents.size === 1 && log.opened.length === 1 && built.get(s.body.agent.id) === "Run it.", `inline agent: ${JSON.stringify(s)}`);
   assert(s.body.environment.type === "none" && s.body.agent.instructions === "Run it.", `fields: ${JSON.stringify(s.body)}`);
   const list = await call(deps, "GET", "/agents/sessions");
@@ -174,7 +181,7 @@ await check("a session with an inline agent creates that agent; the sessions pat
 
 await check("what is not supported yet is refused by name, and unknown or not-owned paths are distinguished", async () => {
   const { deps } = fakeDeps();
-  await call(deps, "POST", "/agents", { model: "m" });
+  await call(deps, "POST", "/agents", { model: "default" });
   const cases: Array<[unknown, string]> = [
     [{ agent_id: "agent_1", environment: { type: "openai_hosted" }, vault_ids: ["v1"] }, "vault_ids"],
     [{ agent_id: "agent_1", environment: { type: "openai_hosted", packages: { npm: ["zod"] } } }, "environment.packages"],
@@ -216,7 +223,7 @@ await check("events: GET streams from now on; POST input starts a turn it report
       { type: "message", seq: seq + 1, timestamp: 3_000, message: { role: "user", content: text } },
       { type: "message", seq: seq + 2, timestamp: 4_000, message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: `re: ${text}` }] } }];
   };
-  await call(deps, "POST", "/agents", { model: "m", name: "a" });
+  await call(deps, "POST", "/agents", { model: "default", name: "a" });
   const sess = (await call(deps, "POST", "/agents/sessions", { agent_id: "agent_1", environment: { type: "none" } })).body;
 
   const stream = (await handleAgentsApi("GET", `/agents/sessions/${sess.id}/events`, new URLSearchParams(), undefined, deps))!;
