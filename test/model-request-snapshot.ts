@@ -10,7 +10,9 @@
  *
  * The cases are the shapes a live job takes: version 1 (pi085, untagged 0.85 Context) and version 2 (pd, tagged,
  * system messages inline), each with tools, a tool round and an earlier reasoning trace that must not be replayed;
- * at DeepSeek directly, and through the gateway's /compat for a DeepSeek and an OpenAI model.
+ * at DeepSeek directly, and through the gateway's /compat for a DeepSeek and an OpenAI model. The OpenAI model is
+ * a reasoning one, called through the Responses API (src/model/openai-responses.ts) with a Responses reply, and
+ * one more case pins its own earlier reasoning item being replayed.
  * Beside them, the tool-less shapes (no `tools`, or an empty set: no `tools` key is sent), and a job whose options
  * ask a tool choice, which the consumer does not forward. The providers are
  * declared here, not read from cf/wrangler*.jsonc, so a change to a deployment's providers does not move these
@@ -80,6 +82,31 @@ const V2 = {
   tools: TOOLS,
 };
 
+/** A reasoning item as `fromResponse` stores it: the item, as JSON, in the thinking block's `thinkingSignature`. */
+const reasoningBlock = (id: string, text: string) => ({ type: "thinking", thinking: text,
+  thinkingSignature: JSON.stringify({ type: "reasoning", id, summary: [{ type: "summary_text", text }], encrypted_content: `enc-${id}` }) });
+
+/**
+ * Version 2 where Luna answered the first call (a reasoning item, then the tool call), and a turn of another
+ * OpenAI model's sits before it: Luna's item is replayed in its place, the other model's is not.
+ */
+const V2_LUNA = {
+  version: 2,
+  messages: [
+    { role: "system", content: "You are a careful agent." },
+    { role: "user", content: "Hello", timestamp: 1 },
+    { role: "assistant", api: "offloaded", provider: "openai-compatible", model: "openai/gpt-5.6-terra",
+      content: [reasoningBlock("rs_other", "Another model's."), { type: "text", text: "Hi." }], stopReason: "stop", jobId: "mj_0", timestamp: 2 },
+    { role: "user", content: "Read https://example.com", timestamp: 3 },
+    { role: "assistant", api: "offloaded", provider: "openai-compatible", model: "openai/gpt-5.6-luna",
+      content: [reasoningBlock("rs_1", "I should read it."),
+        { type: "toolCall", id: "call_1", name: "read", arguments: { url: "https://example.com" } }],
+      stopReason: "toolUse", jobId: "mj_1", timestamp: 4 },
+    { role: "toolResult", toolCallId: "call_1", toolName: "read", content: [{ type: "text", text: "Example Domain" }], isError: false, timestamp: 5 },
+  ],
+  tools: TOOLS,
+};
+
 /** Version 1 with no tool offered (a compaction summary's call): `tools` absent. */
 const V1_NO_TOOLS = { systemPrompt: V1.systemPrompt, messages: V1.messages };
 /** Version 2 with an empty tool set: `tools: []` is no tools, not an empty list sent. */
@@ -99,15 +126,26 @@ const REPLY = JSON.stringify({
   usage: { prompt_tokens: 120, completion_tokens: 30, prompt_cache_hit_tokens: 64, completion_tokens_details: { reasoning_tokens: 9 } },
 });
 
+/** A Responses API reply carrying the same: a reasoning item (summary and encrypted reasoning), text, a tool call, and usage with its cached and reasoning parts. */
+const RESPONSES_REPLY = JSON.stringify({
+  id: "resp_2", object: "response", status: "completed",
+  output: [
+    { type: "reasoning", id: "rs_2", summary: [{ type: "summary_text", text: "Short trace." }], encrypted_content: "enc-2" },
+    { type: "message", id: "msg_2", role: "assistant", status: "completed", content: [{ type: "output_text", text: "Summarising.", annotations: [] }] },
+    { type: "function_call", id: "fc_2", call_id: "call_2", name: "run_js", arguments: "{\"code\":\"1+1\"}", status: "completed" },
+  ],
+  usage: { input_tokens: 120, input_tokens_details: { cached_tokens: 64 }, output_tokens: 30, output_tokens_details: { reasoning_tokens: 9 }, total_tokens: 150 },
+});
+
 /** Runs the job with `fetch` replaced; returns the one request it made, in the snapshot's form, and the answer. */
-async function capture(env: ModelEnv, j: unknown): Promise<{ request: string; answer: string }> {
+async function capture(env: ModelEnv, j: unknown, reply = REPLY): Promise<{ request: string; answer: string }> {
   const real = globalThis.fetch;
   const seen: string[] = [];
   globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
     const raw = (init?.headers ?? {}) as Record<string, string>;
     const headers = Object.keys(raw).sort().map((k) => [k, raw[k]]);
     seen.push(JSON.stringify({ url: String(input), method: init?.method, headers, body: init?.body }));
-    return new Response(REPLY, { status: 200, headers: { "content-type": "application/json" } });
+    return new Response(reply, { status: 200, headers: { "content-type": "application/json" } });
   }) as typeof fetch;
   let answer;
   try { answer = await callQueuedModel(env, j, "mj_2"); } finally { globalThis.fetch = real; }
@@ -116,7 +154,7 @@ async function capture(env: ModelEnv, j: unknown): Promise<{ request: string; an
   return { request: seen[0]!, answer: JSON.stringify(stable) };
 }
 
-const CASES: Array<{ name: string; env: ModelEnv; job: unknown; request: string; answer: string }> = [
+const CASES: Array<{ name: string; env: ModelEnv; job: unknown; reply?: string; request: string; answer: string }> = [
   { name: "deepseek, version 1 (pi085), the deployment's default model", env: ENV, job: job(V1),
     request: String.raw`{"url":"https://api.deepseek.com/chat/completions","method":"POST","headers":[["authorization","Bearer sk-snapshot-deepseek"],["content-type","application/json"]],"body":"{\"model\":\"deepseek-flash\",\"messages\":[{\"role\":\"system\",\"content\":\"You are a careful agent.\"},{\"role\":\"user\",\"content\":\"Read https://example.com\"},{\"role\":\"assistant\",\"content\":\"Reading.\",\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"url\\\":\\\"https://example.com\\\"}\"}}]},{\"role\":\"tool\",\"tool_call_id\":\"call_1\",\"content\":\"Example Domain\"},{\"role\":\"user\",\"content\":\"And now summarise.\"}],\"max_tokens\":32768,\"temperature\":0,\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"read\",\"description\":\"Read a page\",\"parameters\":{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\"}},\"required\":[\"url\"]}}},{\"type\":\"function\",\"function\":{\"name\":\"run_js\",\"description\":\"Run code\",\"parameters\":{\"type\":\"object\",\"properties\":{\"code\":{\"type\":\"string\"},\"timeout\":{\"type\":\"number\"}}}}}]}"}`,
     answer: String.raw`{"role":"assistant","content":[{"type":"thinking","thinking":"Short trace."},{"type":"text","text":"Summarising."},{"type":"toolCall","id":"call_2","name":"run_js","arguments":{"code":"1+1"}}],"api":"offloaded","provider":"openai-compatible","model":"deepseek-flash","usage":{"input":120,"output":30,"cacheRead":64,"cacheWrite":0,"reasoning":9,"totalTokens":150,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"toolUse","rawStopReason":"tool_calls","jobId":"mj_2"}` },
@@ -130,14 +168,21 @@ const CASES: Array<{ name: string; env: ModelEnv; job: unknown; request: string;
     job: job(V2, { provider: "cloudflare", model: "deepseek/deepseek-flash" }),
     request: String.raw`{"url":"https://gateway.ai.cloudflare.com/v1/acct/gw/compat/chat/completions","method":"POST","headers":[["authorization","Bearer sk-snapshot-deepseek"],["cf-aig-authorization","Bearer snapshot-gateway-token"],["content-type","application/json"]],"body":"{\"model\":\"deepseek/deepseek-flash\",\"messages\":[{\"role\":\"system\",\"content\":\"You are a careful agent.\"},{\"role\":\"user\",\"content\":\"Read https://example.com\"},{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"url\\\":\\\"https://example.com\\\"}\"}}]},{\"role\":\"tool\",\"tool_call_id\":\"call_1\",\"content\":\"Example Domain\"},{\"role\":\"system\",\"content\":\"Updated system prompt section \\\"time\\\":\\n\\n<time>2026-10-05</time>\"},{\"role\":\"user\",\"content\":\"summarise\"}],\"max_tokens\":32768,\"temperature\":0,\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"read\",\"description\":\"Read a page\",\"parameters\":{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\"}},\"required\":[\"url\"]}}},{\"type\":\"function\",\"function\":{\"name\":\"run_js\",\"description\":\"Run code\",\"parameters\":{\"type\":\"object\",\"properties\":{\"code\":{\"type\":\"string\"},\"timeout\":{\"type\":\"number\"}}}}}]}"}`,
     answer: String.raw`{"role":"assistant","content":[{"type":"thinking","thinking":"Short trace."},{"type":"text","text":"Summarising."},{"type":"toolCall","id":"call_2","name":"run_js","arguments":{"code":"1+1"}}],"api":"offloaded","provider":"openai-compatible","model":"deepseek/deepseek-flash","usage":{"input":120,"output":30,"cacheRead":64,"cacheWrite":0,"reasoning":9,"totalTokens":150,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"toolUse","rawStopReason":"tool_calls","jobId":"mj_2"}` },
-  { name: "cloudflare /compat, openai/gpt-5.6-luna (gateway-keyed), version 1", env: ENV,
-    job: job(V1, { provider: "cloudflare", model: "openai/gpt-5.6-luna" }),
-    request: String.raw`{"url":"https://gateway.ai.cloudflare.com/v1/acct/gw/compat/chat/completions","method":"POST","headers":[["cf-aig-authorization","Bearer snapshot-gateway-token"],["content-type","application/json"]],"body":"{\"model\":\"openai/gpt-5.6-luna\",\"messages\":[{\"role\":\"system\",\"content\":\"You are a careful agent.\"},{\"role\":\"user\",\"content\":\"Read https://example.com\"},{\"role\":\"assistant\",\"content\":\"Reading.\",\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"url\\\":\\\"https://example.com\\\"}\"}}]},{\"role\":\"tool\",\"tool_call_id\":\"call_1\",\"content\":\"Example Domain\"},{\"role\":\"user\",\"content\":\"And now summarise.\"}],\"max_completion_tokens\":32768,\"temperature\":0,\"reasoning_effort\":\"none\",\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"read\",\"description\":\"Read a page\",\"parameters\":{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\"}},\"required\":[\"url\"]}}},{\"type\":\"function\",\"function\":{\"name\":\"run_js\",\"description\":\"Run code\",\"parameters\":{\"type\":\"object\",\"properties\":{\"code\":{\"type\":\"string\"},\"timeout\":{\"type\":\"number\"}}}}}]}"}`,
-    answer: String.raw`{"role":"assistant","content":[{"type":"thinking","thinking":"Short trace."},{"type":"text","text":"Summarising."},{"type":"toolCall","id":"call_2","name":"run_js","arguments":{"code":"1+1"}}],"api":"offloaded","provider":"openai-compatible","model":"openai/gpt-5.6-luna","usage":{"input":120,"output":30,"cacheRead":64,"cacheWrite":0,"reasoning":9,"totalTokens":150,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"toolUse","rawStopReason":"tool_calls","jobId":"mj_2"}` },
-  { name: "cloudflare /compat, openai/gpt-5.6-luna (gateway-keyed), version 2", env: ENV,
-    job: job(V2, { provider: "cloudflare", model: "openai/gpt-5.6-luna" }),
-    request: String.raw`{"url":"https://gateway.ai.cloudflare.com/v1/acct/gw/compat/chat/completions","method":"POST","headers":[["cf-aig-authorization","Bearer snapshot-gateway-token"],["content-type","application/json"]],"body":"{\"model\":\"openai/gpt-5.6-luna\",\"messages\":[{\"role\":\"system\",\"content\":\"You are a careful agent.\"},{\"role\":\"user\",\"content\":\"Read https://example.com\"},{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"url\\\":\\\"https://example.com\\\"}\"}}]},{\"role\":\"tool\",\"tool_call_id\":\"call_1\",\"content\":\"Example Domain\"},{\"role\":\"system\",\"content\":\"Updated system prompt section \\\"time\\\":\\n\\n<time>2026-10-05</time>\"},{\"role\":\"user\",\"content\":\"summarise\"}],\"max_completion_tokens\":32768,\"temperature\":0,\"reasoning_effort\":\"none\",\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"read\",\"description\":\"Read a page\",\"parameters\":{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\"}},\"required\":[\"url\"]}}},{\"type\":\"function\",\"function\":{\"name\":\"run_js\",\"description\":\"Run code\",\"parameters\":{\"type\":\"object\",\"properties\":{\"code\":{\"type\":\"string\"},\"timeout\":{\"type\":\"number\"}}}}}]}"}`,
-    answer: String.raw`{"role":"assistant","content":[{"type":"thinking","thinking":"Short trace."},{"type":"text","text":"Summarising."},{"type":"toolCall","id":"call_2","name":"run_js","arguments":{"code":"1+1"}}],"api":"offloaded","provider":"openai-compatible","model":"openai/gpt-5.6-luna","usage":{"input":120,"output":30,"cacheRead":64,"cacheWrite":0,"reasoning":9,"totalTokens":150,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"toolUse","rawStopReason":"tool_calls","jobId":"mj_2"}` },
+  // An OpenAI reasoning model goes to the Responses API at the same provider (src/model/openai-responses.ts): the
+  // reasoning on at its default effort, tools beside it, and an earlier reasoning item replayed only when it is
+  // the same model's own. The earlier turn in V1 and V2 is DeepSeek's (a trace with no signature): nothing replayed.
+  { name: "cloudflare /compat, openai/gpt-5.6-luna (gateway-keyed), version 1, through the Responses API", env: ENV,
+    job: job(V1, { provider: "cloudflare", model: "openai/gpt-5.6-luna" }), reply: RESPONSES_REPLY,
+    request: String.raw`{"url":"https://gateway.ai.cloudflare.com/v1/acct/gw/compat/responses","method":"POST","headers":[["cf-aig-authorization","Bearer snapshot-gateway-token"],["content-type","application/json"]],"body":"{\"model\":\"openai/gpt-5.6-luna\",\"input\":[{\"role\":\"developer\",\"content\":\"You are a careful agent.\"},{\"role\":\"user\",\"content\":\"Read https://example.com\"},{\"role\":\"assistant\",\"content\":\"Reading.\"},{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read\",\"arguments\":\"{\\\"url\\\":\\\"https://example.com\\\"}\"},{\"type\":\"function_call_output\",\"call_id\":\"call_1\",\"output\":\"Example Domain\"},{\"role\":\"user\",\"content\":\"And now summarise.\"}],\"max_output_tokens\":32768,\"store\":false,\"reasoning\":{\"effort\":\"medium\",\"summary\":\"auto\"},\"include\":[\"reasoning.encrypted_content\"],\"tools\":[{\"type\":\"function\",\"name\":\"read\",\"description\":\"Read a page\",\"parameters\":{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\"}},\"required\":[\"url\"]},\"strict\":false},{\"type\":\"function\",\"name\":\"run_js\",\"description\":\"Run code\",\"parameters\":{\"type\":\"object\",\"properties\":{\"code\":{\"type\":\"string\"},\"timeout\":{\"type\":\"number\"}}},\"strict\":false}]}"}`,
+    answer: String.raw`{"role":"assistant","content":[{"type":"thinking","thinking":"Short trace.","thinkingSignature":"{\"type\":\"reasoning\",\"id\":\"rs_2\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"Short trace.\"}],\"encrypted_content\":\"enc-2\"}"},{"type":"text","text":"Summarising."},{"type":"toolCall","id":"call_2","name":"run_js","arguments":{"code":"1+1"}}],"api":"offloaded","provider":"openai-compatible","model":"openai/gpt-5.6-luna","usage":{"input":120,"output":30,"cacheRead":64,"cacheWrite":0,"reasoning":9,"totalTokens":150,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"toolUse","rawStopReason":"tool_calls","jobId":"mj_2"}` },
+  { name: "cloudflare /compat, openai/gpt-5.6-luna (gateway-keyed), version 2, through the Responses API", env: ENV,
+    job: job(V2, { provider: "cloudflare", model: "openai/gpt-5.6-luna" }), reply: RESPONSES_REPLY,
+    request: String.raw`{"url":"https://gateway.ai.cloudflare.com/v1/acct/gw/compat/responses","method":"POST","headers":[["cf-aig-authorization","Bearer snapshot-gateway-token"],["content-type","application/json"]],"body":"{\"model\":\"openai/gpt-5.6-luna\",\"input\":[{\"role\":\"developer\",\"content\":\"You are a careful agent.\"},{\"role\":\"user\",\"content\":\"Read https://example.com\"},{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read\",\"arguments\":\"{\\\"url\\\":\\\"https://example.com\\\"}\"},{\"type\":\"function_call_output\",\"call_id\":\"call_1\",\"output\":\"Example Domain\"},{\"role\":\"developer\",\"content\":\"Updated system prompt section \\\"time\\\":\\n\\n<time>2026-10-05</time>\"},{\"role\":\"user\",\"content\":\"summarise\"}],\"max_output_tokens\":32768,\"store\":false,\"reasoning\":{\"effort\":\"medium\",\"summary\":\"auto\"},\"include\":[\"reasoning.encrypted_content\"],\"tools\":[{\"type\":\"function\",\"name\":\"read\",\"description\":\"Read a page\",\"parameters\":{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\"}},\"required\":[\"url\"]},\"strict\":false},{\"type\":\"function\",\"name\":\"run_js\",\"description\":\"Run code\",\"parameters\":{\"type\":\"object\",\"properties\":{\"code\":{\"type\":\"string\"},\"timeout\":{\"type\":\"number\"}}},\"strict\":false}]}"}`,
+    answer: String.raw`{"role":"assistant","content":[{"type":"thinking","thinking":"Short trace.","thinkingSignature":"{\"type\":\"reasoning\",\"id\":\"rs_2\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"Short trace.\"}],\"encrypted_content\":\"enc-2\"}"},{"type":"text","text":"Summarising."},{"type":"toolCall","id":"call_2","name":"run_js","arguments":{"code":"1+1"}}],"api":"offloaded","provider":"openai-compatible","model":"openai/gpt-5.6-luna","usage":{"input":120,"output":30,"cacheRead":64,"cacheWrite":0,"reasoning":9,"totalTokens":150,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"toolUse","rawStopReason":"tool_calls","jobId":"mj_2"}` },
+  { name: "cloudflare /compat, openai/gpt-5.6-luna, version 2, its own earlier reasoning replayed and another model's not", env: ENV,
+    job: job(V2_LUNA, { provider: "cloudflare", model: "openai/gpt-5.6-luna" }), reply: RESPONSES_REPLY,
+    request: String.raw`{"url":"https://gateway.ai.cloudflare.com/v1/acct/gw/compat/responses","method":"POST","headers":[["cf-aig-authorization","Bearer snapshot-gateway-token"],["content-type","application/json"]],"body":"{\"model\":\"openai/gpt-5.6-luna\",\"input\":[{\"role\":\"developer\",\"content\":\"You are a careful agent.\"},{\"role\":\"user\",\"content\":\"Hello\"},{\"role\":\"assistant\",\"content\":\"Hi.\"},{\"role\":\"user\",\"content\":\"Read https://example.com\"},{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"I should read it.\"}],\"encrypted_content\":\"enc-rs_1\"},{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read\",\"arguments\":\"{\\\"url\\\":\\\"https://example.com\\\"}\"},{\"type\":\"function_call_output\",\"call_id\":\"call_1\",\"output\":\"Example Domain\"}],\"max_output_tokens\":32768,\"store\":false,\"reasoning\":{\"effort\":\"medium\",\"summary\":\"auto\"},\"include\":[\"reasoning.encrypted_content\"],\"tools\":[{\"type\":\"function\",\"name\":\"read\",\"description\":\"Read a page\",\"parameters\":{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\"}},\"required\":[\"url\"]},\"strict\":false},{\"type\":\"function\",\"name\":\"run_js\",\"description\":\"Run code\",\"parameters\":{\"type\":\"object\",\"properties\":{\"code\":{\"type\":\"string\"},\"timeout\":{\"type\":\"number\"}}},\"strict\":false}]}"}`,
+    answer: String.raw`{"role":"assistant","content":[{"type":"thinking","thinking":"Short trace.","thinkingSignature":"{\"type\":\"reasoning\",\"id\":\"rs_2\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"Short trace.\"}],\"encrypted_content\":\"enc-2\"}"},{"type":"text","text":"Summarising."},{"type":"toolCall","id":"call_2","name":"run_js","arguments":{"code":"1+1"}}],"api":"offloaded","provider":"openai-compatible","model":"openai/gpt-5.6-luna","usage":{"input":120,"output":30,"cacheRead":64,"cacheWrite":0,"reasoning":9,"totalTokens":150,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"toolUse","rawStopReason":"tool_calls","jobId":"mj_2"}` },
   // No tool offered: no `tools` key at all, and so no `tool_choice` — at DeepSeek directly and through /compat.
   { name: "deepseek, version 1 with no tools", env: ENV, job: job(V1_NO_TOOLS),
     
@@ -159,7 +204,7 @@ const CASES: Array<{ name: string; env: ModelEnv; job: unknown; request: string;
 
 for (const c of CASES) {
   await check(`${c.name}: the request and the answer are the pinned ones`, async () => {
-    const got = await capture(c.env, c.job);
+    const got = await capture(c.env, c.job, c.reply);
     const diffs: string[] = [];
     if (got.request !== c.request) diffs.push(`request changed\n    got  ${got.request}\n    want ${c.request}`);
     if (got.answer !== c.answer) diffs.push(`answer changed\n    got  ${got.answer}\n    want ${c.answer}`);

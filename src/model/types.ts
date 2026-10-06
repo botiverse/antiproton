@@ -33,12 +33,22 @@ export interface ModelResponse {
   /**
    * The provider's reasoning trace, when it returns one.
    *
-   * Recorded so a person can see why the agent did what it did, and never fed
-   * back: the next request carries the reply, not the thinking behind it.
-   * Sending it back would grow every prompt for no gain, and the provider does
-   * not expect it.
+   * Recorded so a person can see why the agent did what it did. Through
+   * chat/completions it is never fed back: the next request carries the reply,
+   * not the thinking behind it. Sending it back would grow every prompt for no
+   * gain, and the provider does not expect it.
    */
   reasoning?: string;
+  /**
+   * Reasoning the provider expects back, as opaque items: OpenAI's Responses API
+   * (src/model/openai-responses.ts), whose reasoning items carry the model's
+   * encrypted reasoning. `text` is the item's readable summary, `signature` the
+   * whole item as JSON, which is what pi stores in a thinking block's
+   * `thinkingSignature` for the same purpose. Answered into the transcript by
+   * `fromResponse` and replayed by `toResponsesInput` (src/model/pi-bridge.ts),
+   * so the model keeps its reasoning across the tool calls of one turn.
+   */
+  reasoningItems?: Array<{ text: string; signature: string }>;
 }
 
 /** Provider-native tool definition, normalised. */

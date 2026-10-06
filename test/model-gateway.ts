@@ -118,7 +118,8 @@ await check("the queue consumer calls the provider the take names, and a take fr
     await callQueuedModel(ENV, job(null, null), "mj_3");
   } finally { rec.restore(); }
   const [gw, legacy, dflt] = rec.seen;
-  must(gw?.url === `${GW}/chat/completions` && gw.model === "openai/gpt-5" && !("authorization" in gw.headers) && gw.headers["cf-aig-authorization"] === "Bearer gt", JSON.stringify(gw));
+  // gpt-5 is a reasoning model, called through the Responses API at the same provider (src/model/openai-responses.ts).
+  must(gw?.url === `${GW}/responses` && gw.model === "openai/gpt-5" && !("authorization" in gw.headers) && gw.headers["cf-aig-authorization"] === "Bearer gt", JSON.stringify(gw));
   must(legacy?.url === "https://api.deepseek.com/chat/completions" && legacy.headers.authorization === "Bearer dk", JSON.stringify(legacy));
   must(dflt?.url === "https://api.deepseek.com/chat/completions" && dflt.model === "deepseek-flash", JSON.stringify(dflt));
 });

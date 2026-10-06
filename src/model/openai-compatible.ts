@@ -167,60 +167,29 @@ export class OpenAiCompatibleModel implements ModelAdapter {
           ...(shape.reasoningEffort !== undefined ? { reasoning_effort: shape.reasoningEffort } : {}),
         }
       : { max_tokens: maxTokens, temperature: opts.temperature ?? 0, ...reasoningDial };
-    let lastErr: Error | null = null;
-    // One signal for the whole call rather than one per attempt: three attempts each under the
-    // deadline would add up past the limit the deadline exists to stay under. It reaches the body
-    // read too, since a response whose headers arrived can still stall before its last byte.
-    const deadline = AbortSignal.timeout(this.#deadlineMs);
-
-    for (let attempt = 0; attempt < 3; attempt++) {
-      try {
-        const res = await fetch(`${this.#baseUrl}/chat/completions`, {
-          signal: deadline,
-          method: "POST",
-          headers: {
-            ...this.#headers,
-            ...(this.#apiKey ? { authorization: `Bearer ${this.#apiKey}` } : {}),
-            "content-type": "application/json",
-          },
-          body: JSON.stringify({
-            model: this.#model,
-            messages,
-            ...capAndDial,
-            ...(opts.tools?.length
-              ? {
-                  tools: opts.tools.map((t) => ({
-                    type: "function",
-                    function: { name: t.name, description: t.description, parameters: t.parameters },
-                  })),
-                  ...(opts.toolChoice ? { tool_choice: opts.toolChoice } : {}),
-                }
-              : {}),
-          }),
-        });
-        if (!res.ok) {
-          const body = await res.text();
-          if (isPermanentRefusal(res.status, body)) {
-            const gatewayKeyed = res.status === 401 && !this.#apiKey && this.#model.includes("/");
-            throw new ModelRequestRefused(res.status, body, [this.#apiKey, ...Object.values(this.#headers)],
-              gatewayKeyed ? GATEWAY_401_HINT : undefined);
+    const body = JSON.stringify({
+      model: this.#model,
+      messages,
+      ...capAndDial,
+      ...(opts.tools?.length
+        ? {
+            tools: opts.tools.map((t) => ({
+              type: "function",
+              function: { name: t.name, description: t.description, parameters: t.parameters },
+            })),
+            ...(opts.toolChoice ? { tool_choice: opts.toolChoice } : {}),
           }
-          const err = new Error(`model ${res.status}: ${body.slice(0, 300)}`);
-          if (res.status >= 500 || res.status === 429) {
-            lastErr = err;
-            await new Promise((r) => setTimeout(r, 400 * (attempt + 1)));
-            continue;
-          }
-          throw err;
-        }
-        const data = (await res.json()) as any;
+        : {}),
+    });
+    return postModelRequest(
+      { url: `${this.#baseUrl}/chat/completions`, apiKey: this.#apiKey, model: this.#model, headers: this.#headers, deadlineMs: this.#deadlineMs },
+      body,
+      (data) => {
         const choice = data.choices?.[0];
         const u = data.usage ?? {};
         const finishReason = choice?.finish_reason ?? "unknown";
         const rawCalls = choice?.message?.tool_calls ?? [];
-        // Bounded: a reasoning trace can run to thousands of tokens, and this
-        // goes into an append-only log that is never trimmed.
-        const reasoning = String(choice?.message?.reasoning_content ?? "").slice(0, 8000);
+        const reasoning = String(choice?.message?.reasoning_content ?? "").slice(0, REASONING_CHARS);
         return {
           text: choice?.message?.content ?? "",
           ...(reasoning ? { reasoning } : {}),
@@ -228,10 +197,7 @@ export class OpenAiCompatibleModel implements ModelAdapter {
             ? rawCalls.map((c: any) => ({
                 id: c.id,
                 name: c.function?.name,
-                arguments: (() => {
-                  try { return JSON.parse(c.function?.arguments ?? "{}"); }
-                  catch { return { __unparsable: c.function?.arguments }; }
-                })(),
+                arguments: parseArguments(c.function?.arguments),
               }))
             : undefined,
           finishReason,
@@ -243,22 +209,83 @@ export class OpenAiCompatibleModel implements ModelAdapter {
             cachedPromptTokens: u.prompt_cache_hit_tokens ?? u.prompt_tokens_details?.cached_tokens ?? 0,
           },
         };
-      } catch (err) {
-        // Thrown rather than retried here: no time is left to retry in. It fails the call the way an
-        // exhausted run of 5xx does, so the queue redelivers it, and the message says which bound
-        // ended it — a bare AbortError would read as a cancel, which nothing on this path issues.
-        if (deadline.aborted) {
-          throw new Error(
-            `model call timed out: no complete response within the ${this.#deadlineMs / 1000} s total deadline` +
-            (lastErr ? ` (last error before it: ${lastErr.message})` : ""));
-        }
-        // The same request would be refused the same way: one call is the whole answer.
-        if (err instanceof ModelRequestRefused) throw err;
-        lastErr = err as Error;
-        if (attempt === 2) break;
-        await new Promise((r) => setTimeout(r, 400 * (attempt + 1)));
-      }
-    }
-    throw lastErr ?? new Error("model call failed");
+      });
   }
+}
+
+/**
+ * Longest reasoning trace kept on an answer as text. Bounded: a trace can run to thousands of tokens, and
+ * this goes into an append-only log that is never trimmed.
+ */
+export const REASONING_CHARS = 8000;
+
+/** A tool call's arguments as the provider sent them, a JSON string; one that does not parse is kept, not dropped. */
+export function parseArguments(raw: unknown): unknown {
+  try { return JSON.parse((raw as string | undefined) ?? "{}"); }
+  catch { return { __unparsable: raw }; }
+}
+
+/**
+ * One model call over HTTP, shared by both of our clients (chat/completions here, Responses in
+ * src/model/openai-responses.ts) so they cannot differ in how a call is retried, bounded or refused: three
+ * attempts, a 5xx or 429 retried with a growing pause, a refusal of the request itself (`isPermanentRefusal`)
+ * thrown at once as `ModelRequestRefused`, and every attempt under one deadline. `read` turns a 2xx JSON body
+ * into the answer.
+ */
+export async function postModelRequest(
+  cfg: { url: string; apiKey: string; model: string; headers: Record<string, string>; deadlineMs: number },
+  body: string,
+  read: (data: any) => ModelResponse,
+): Promise<ModelResponse> {
+  let lastErr: Error | null = null;
+  // One signal for the whole call rather than one per attempt: three attempts each under the
+  // deadline would add up past the limit the deadline exists to stay under. It reaches the body
+  // read too, since a response whose headers arrived can still stall before its last byte.
+  const deadline = AbortSignal.timeout(cfg.deadlineMs);
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const res = await fetch(cfg.url, {
+        signal: deadline,
+        method: "POST",
+        headers: {
+          ...cfg.headers,
+          ...(cfg.apiKey ? { authorization: `Bearer ${cfg.apiKey}` } : {}),
+          "content-type": "application/json",
+        },
+        body,
+      });
+      if (!res.ok) {
+        const text = await res.text();
+        if (isPermanentRefusal(res.status, text)) {
+          const gatewayKeyed = res.status === 401 && !cfg.apiKey && cfg.model.includes("/");
+          throw new ModelRequestRefused(res.status, text, [cfg.apiKey, ...Object.values(cfg.headers)],
+            gatewayKeyed ? GATEWAY_401_HINT : undefined);
+        }
+        const err = new Error(`model ${res.status}: ${text.slice(0, 300)}`);
+        if (res.status >= 500 || res.status === 429) {
+          lastErr = err;
+          await new Promise((r) => setTimeout(r, 400 * (attempt + 1)));
+          continue;
+        }
+        throw err;
+      }
+      return read(await res.json());
+    } catch (err) {
+      // Thrown rather than retried here: no time is left to retry in. It fails the call the way an
+      // exhausted run of 5xx does, so the queue redelivers it, and the message says which bound
+      // ended it — a bare AbortError would read as a cancel, which nothing on this path issues.
+      if (deadline.aborted) {
+        throw new Error(
+          `model call timed out: no complete response within the ${cfg.deadlineMs / 1000} s total deadline` +
+          (lastErr ? ` (last error before it: ${lastErr.message})` : ""));
+      }
+      // The same request would be refused the same way: one call is the whole answer.
+      if (err instanceof ModelRequestRefused) throw err;
+      lastErr = err as Error;
+      if (attempt === 2) break;
+      await new Promise((r) => setTimeout(r, 400 * (attempt + 1)));
+    }
+  }
+  throw lastErr ?? new Error("model call failed");
 }
