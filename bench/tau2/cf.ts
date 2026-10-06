@@ -24,7 +24,7 @@ import { homedir } from "node:os";
 import { OpenAiCompatibleModel } from "../../src/model/openai-compatible.ts";
 import { WRITE_TOOLS, type RetailDB } from "./retail.ts";
 import { argDiff, actionMatch as grade } from "./grade.ts";
-import { gold as goldOf, MAX_TURNS, OPENING, rowTaskId, SIM, SIM_LAST_MAX, simEnding, simSystem } from "./episode.ts";
+import { gold as goldOf, MAX_TURNS, OPENING, rowTaskId, SIM, SIM_LAST_MAX, simEnding, simRecord, simSystem } from "./episode.ts";
 import { beginRun, driverCommit, recordRun, teeRun, workerBuild, workerModel } from "../record.ts";
 import { stallAtDeadline, type StallEvidence } from "../poll-fallback.ts";
 import { endingsAllRows, failingRowsByEndingAndCause } from "./endings.ts";
@@ -313,7 +313,7 @@ if (act) {
     (act.pollMs ? `, of which ${(act.pollMs / 1000).toFixed(1)}s is this runner polling` : ""));
 }
 const recorded = recordRun(run, {
-  bench: "tau2-retail", base: BASE, build: await workerBuild(BASE), driver: driverCommit(), object: OBJECTS === "shared" ? `bench-${OBJ}` : `bench-${OBJ}-<task>`, engine: ENGINE, objects: OBJECTS, model: MODEL_ID, wait: WAIT, sim: SIM,
+  bench: "tau2-retail", base: BASE, build: await workerBuild(BASE), driver: driverCommit(), object: OBJECTS === "shared" ? `bench-${OBJ}` : `bench-${OBJ}-<task>`, engine: ENGINE, objects: OBJECTS, model: MODEL_ID, wait: WAIT, sim: simRecord(GUIDELINES),
   provider: await workerModel(BASE),
   tasks: selected.map((t) => t.id), trials: TRIALS, order: ORDER,
   ...(DEAFNESS ? { ignoreAnswers: DEAFNESS } : {}),

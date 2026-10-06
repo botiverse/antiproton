@@ -12,7 +12,7 @@
  */
 import type { RetailDB } from "./retail.ts";
 import { argDiff } from "./grade.ts";
-import { SIM } from "./episode.ts";
+import { simRecord } from "./episode.ts";
 import { beginRun, recordRun, teeRun } from "../record.ts";
 import { passLines } from "./passk.ts";
 import { runPlan, type RunOrder } from "./plan.ts";
@@ -132,7 +132,7 @@ export async function runApiBench(o: ApiRunOptions): Promise<{ code: number; rec
 
   const built = apiRunRecord({
     base: o.base, build: await o.build(), driver: o.driver, tenantId: TENANT, owner: OWNER,
-    modelRequested: o.model, sim: SIM, simId: o.simId, tasks: o.tasks.map((t) => t.id), trials: o.trials, order: o.order,
+    modelRequested: o.model, sim: simRecord(o.guidelines), simId: o.simId, tasks: o.tasks.map((t) => t.id), trials: o.trials, order: o.order,
     ...(o.deafness ? { ignoreAnswers: o.deafness } : {}), startedAt: new Date(t0Run).toISOString(), results,
   });
   if (refused || !built.ok) {

@@ -172,6 +172,27 @@ differently, and how, are listed in that file. The ones a reader trips on:
   the Worker and never wakes the agent's object, so it is not in the object's
   bill the way `/bench/poll` was.
 
+## Reading a τ² record: `sim.guideline`, and which customer it played
+
+`sim.guideline` names the user simulator's guidelines
+(`bench/tau2/data/simulation_guidelines.md`): the first 12 hex digits of the
+sha256 of the file's text (`guidelineId` in `bench/tau2/episode.ts`), written
+by both runners. Compare rows only within one value; a record without the
+field ran on upstream τ²'s text, which is `740a29dfa64d`.
+
+`33686f55b74d` departs from upstream τ² by one line, on purpose:
+
+> - Never generate '###STOP###', '###TRANSFER###' or '###OUT-OF-SCOPE###' in a message that confirms, authorizes or asks the agent to perform an action. Wait for the agent to report the result, and end the conversation only in a later message.
+
+The runner ends an episode on any of those tags, wherever it falls in the
+message. Under upstream's text the simulator often answered the agent's "shall
+I proceed?" with "Yes, please proceed … ###STOP###" in one message, so the
+episode ended before the agent made the write it had just been authorised to
+make, and the trial failed on the customer rather than the agent. In one
+analysed round that was 6 of `gpt-5.6-luna`'s 9 failures and 5 of
+`deepseek-flash`'s 6. A rise in pass rate at the change of `sim.guideline` is
+therefore partly that, and is not the agent improving.
+
 ## Publishing a run
 
 `bench/record.ts` writes each record under `report/runs/<day>/` in the working

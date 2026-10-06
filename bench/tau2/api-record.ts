@@ -196,8 +196,9 @@ export function runProvider(rows: ReadonlyArray<{ provider?: Provider | null }>)
  *   wait       `sse`
  *   activity   summed over the rows' objects, as the `/bench` runner does per task; its `pollMs` is 0, since
  *              the stream is read in the Worker and never wakes the object the way `/bench/poll` did
- *   sim        the simulator's settings plus `id`, the host and model it was called on, so a record says
- *              which simulator ran rather than leaving it to whatever the environment held
+ *   sim        the simulator's settings and guidelines (`simRecord`, bench/tau2/episode.ts) plus `id`, the
+ *              host and model it was called on, so a record says which simulator ran rather than leaving it
+ *              to whatever the environment held
  */
 export function apiRunRecord(i: {
   base: string; build: string | null; driver: unknown; tenantId: string; owner: string;

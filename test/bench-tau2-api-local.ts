@@ -30,7 +30,7 @@ import { apiClient } from "../bench/tau2/api-client.ts";
 import { RunRefusal, runApiTask, type ApiTaskDeps } from "../bench/tau2/api-task.ts";
 import { runApiBench, type ApiRunOptions } from "../bench/tau2/api-run.ts";
 import { apiRunRecord } from "../bench/tau2/api-record.ts";
-import { rowTaskId } from "../bench/tau2/episode.ts";
+import { guidelineId, rowTaskId } from "../bench/tau2/episode.ts";
 import { deafnessBudget } from "../bench/tau2/deafness.ts";
 import { agentObjectName } from "../cf/src/object-name.ts";
 
@@ -295,6 +295,7 @@ await check("a whole run writes one record, runnerMethod agents-api, and exits 0
     const rec = JSON.parse(readFileSync(join(r.runs, r.files[0]!), "utf8"));
     must(rec.runnerMethod === "agents-api" && rec.model === "deepseek-flash" && rec.modelRequested === "default" && rec.results[0].reward === 1, show(rec).slice(0, 300));
     must(rec.sim?.id === "sim.test/fixture" && rec.sim.reasoning === "low", show(rec.sim));
+    must(rec.sim.guideline === guidelineId("Play the customer."), show(rec.sim));
     must((await observer.v1All("/agents")).length === 0, "the run left agents in the index");
   } finally { r.done(); }
 });
