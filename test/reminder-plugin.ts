@@ -15,10 +15,11 @@
 import { createHmac, randomBytes } from "node:crypto";
 import {
   createReminderPlugin, httpReminderService, reminderPlugin, subjectOf, ReminderServiceError, HOOK_STORE, HOOK_KEY,
-  RETRY_HORIZON_MS, MAX_CLOCK_SKEW_SECONDS, NO_CREDENTIAL, NO_ORIGIN, ON_RAFT,
+  RETRY_HORIZON_MS, MAX_CLOCK_SKEW_SECONDS, NO_CREDENTIAL, NO_ORIGIN, ON_RAFT, RAFT_REMINDER_ROUTE,
   type ReminderConnection, type ReminderService, type ServiceReminder,
 } from "../src/plugins/reminder.ts";
 import type { InboundEvent, InboundResult, Plugin } from "../src/plugins/types.ts";
+import { createRaftPlugin } from "../src/plugins/raft.ts";
 import { setLogSink } from "../src/core/log.ts";
 import { PluginDbTables } from "../src/store/plugin-db.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
@@ -668,7 +669,8 @@ await check("the HTTP client maps reminder-app's errors: unknown_hook, an unknow
     fakeServer(() => fail(403, "Agent-owned reminders are not enabled on this server.", "agent_reminders_disabled"));
     must(/not switched on reminders for this deployment/.test(await codeOf(create())), `switched off became ${await codeOf(create())}`);
     fakeServer(() => fail(403, "A Raft agent receives reminders through Raft.", "raft_agent_uses_raft_channel"));
-    must(/Raft's own reminder tools/.test(await codeOf(create())), `a refused Raft agent became ${await codeOf(create())}`);
+    const raftRefusal = await codeOf(create());
+    must(raftRefusal.includes(RAFT_REMINDER_ROUTE) && /integrations_list/.test(raftRefusal), `a refused Raft agent became ${raftRefusal}`);
     // Read by code: the switched-off sentence without its code, or any other 403, is neither of the two named refusals.
     fakeServer(() => fail(403, "Agent-owned reminders are not enabled on this server."));
     const uncoded = await codeOf(create());
@@ -710,6 +712,18 @@ await check("an agent with a raft mount under provisioning's alias cannot create
   const why = await refusal(m.call("create", { delayMinutes: 5, note: "n" }));
   must(why === ON_RAFT, `refused with "${why}"`);
   must(svc.calls.length === 0 && m.hooks.made.length === 0, `sent ${svc.ops().join(",")}; opened ${m.hooks.made.length} hooks`);
+});
+
+await check("the refusal on Raft says where a reminder is set instead: the Reminder Connected App, found by listing, never by a fixed id", async () => {
+  // Each step names a tool the raft plugin offers under that name, so the sentence cannot point at a tool that is gone.
+  const offered = new Set(createRaftPlugin().tools.map((t) => t.name));
+  for (const tool of ["integrations_list", "integrations_login", "integrations_invoke", "integrations_actions"]) {
+    must(ON_RAFT.includes(tool) && offered.has(tool), `${tool}: named ${ON_RAFT.includes(tool)}, offered ${offered.has(tool)}`);
+  }
+  must(ON_RAFT.includes("raft__integrations_list"), `the model-facing name is missing: ${ON_RAFT}`);
+  must(/Reminder/.test(ON_RAFT) && /create-reminder/.test(ON_RAFT), `the app and its action are not named: ${ON_RAFT}`);
+  // A Server's install of the app has its own service id; one written here would be wrong everywhere else.
+  must(!/reminder-[0-9a-f]{6}/.test(ON_RAFT) && !/remove the reminder mount/.test(ON_RAFT), `a fixed id or the old advice: ${ON_RAFT}`);
 });
 
 await check("a mount under the alias raft that is not the raft plugin, or no raft mount at all, does not stop create", async () => {

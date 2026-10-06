@@ -139,7 +139,7 @@ async function failure(fn: () => Promise<unknown>): Promise<Error & PluginErrorF
 }
 
 /** The tools this plugin writes by hand; every other tool is generated from the manifest. */
-const OWN = ["receive_events", "enable_push", "disable_push", "push_status", "integrations_login", "integrations_actions", "integrations_invoke"];
+const OWN = ["receive_events", "enable_push", "disable_push", "push_status", "integrations_list", "integrations_login", "integrations_actions", "integrations_invoke"];
 const toolNamed = (name: string) => raftPlugin.tools.find((t) => t.name === name);
 const opNamed = (name: string) => RAFT_OPERATIONS.find((op) => op.name === name)!;
 /**

@@ -448,9 +448,14 @@ manifest operations are not offered, and why, is one table (`EXCLUDED` in
 `src/plugins/raft.ts`); `test/raft-plugin.ts` turns red when the manifest has
 an operation that is neither generated nor excluded.
 
-Three of `raft`'s hand-written tools are Raft Agent Login for Connected Apps
-(`src/plugins/raft-agent-login.ts`, the steps of Raft's CLI `integration login`
-and `integration invoke`): `integrations_login` asks Raft for a grant and turns
+Four of `raft`'s hand-written tools are Raft Agent Login for Connected Apps
+(`src/plugins/raft-agent-login.ts`, the steps of Raft's CLI `integration list`,
+`integration login` and `integration invoke`): `integrations_list` lists the
+apps installed on the agent's Raft Server with their service ids, whether the
+agent has an active login and their manifest URLs (built-in Raft services left
+out, and every name and description an app wrote about itself handed over as
+untrusted data, one line each, clipped, with credential shapes removed),
+`integrations_login` asks Raft for a grant and turns
 the app's one-time callback into a session, `integrations_actions` lists the
 actions the app's manifest offers, and `integrations_invoke` runs one of them.
 The app's session cookie is a credential the agent holds for that app, so it is

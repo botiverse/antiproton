@@ -22,6 +22,7 @@
  */
 import { clip, logEvent } from "../core/log.ts";
 import type { Json } from "../core/types.ts";
+import { ACTIONS_TOOL, INVOKE_TOOL, LIST_TOOL, LOGIN_TOOL } from "./raft-agent-login.ts";
 import { originProblem } from "./types.ts";
 import type { InboundEvent, InboundResult, Plugin, PluginContext, PluginErrorFields, ToolSchema } from "./types.ts";
 
@@ -170,7 +171,7 @@ export function httpReminderService(): ReminderService {
       // The two refusals reminder-app names (reminder-app#7): a client switched off, and an agent with a Raft identity,
       // which reaches its reminders through Raft. Read by code, never by the sentence; any other 403 is passed on as said.
       if (code === "agent_reminders_disabled") throw new ReminderServiceError("refused", "reminder-app has not switched on reminders for this deployment, so none can be set yet; whoever runs this deployment has to ask for them to be switched on");
-      if (code === "raft_agent_uses_raft_channel") throw new ReminderServiceError("refused", "reminder-app refused this agent because it has a Raft identity; it sets reminders with Raft's own reminder tools instead");
+      if (code === "raft_agent_uses_raft_channel") throw new ReminderServiceError("refused", `reminder-app refused this agent because it has a Raft identity; nothing was set. ${RAFT_REMINDER_ROUTE}`);
       throw new ReminderServiceError("refused", `reminder-app refused the request (HTTP 403)${said ? `: ${said}` : ""}`);
     }
     // 400, 409 (a cap reached, a key reused), 413, 415: reminder-app's own sentence is about the request the model made.
@@ -416,8 +417,16 @@ export interface ReminderDeployment {
  * rather than imported: a plugin does not import the Worker.
  */
 const RAFT_ALIAS = "raft";
-export const ON_RAFT = "This agent is on Raft: its reminders go through Raft's own channel, and this reminder mount would add a second " +
-  "way to wake it. Ask whoever runs this deployment to remove the reminder mount.";
+/**
+ * Where an agent on Raft sets a reminder: the Reminder Connected App on its Raft Server, reached through its raft
+ * mount's Agent Login tools (src/plugins/raft-agent-login.ts). The app is found by listing, never named here: its
+ * service id differs from Server to Server, and a Server may have none installed.
+ */
+export const RAFT_REMINDER_ROUTE = `Set it through Raft instead: run ${LIST_TOOL} on the ${RAFT_ALIAS} mount (${RAFT_ALIAS}__${LIST_TOOL}) ` +
+  "to find the Connected App for reminders (a service named Reminder, say), " +
+  `sign in to it with ${LOGIN_TOOL}, and call its create-reminder action with ${INVOKE_TOOL} (${ACTIONS_TOOL} shows that action's parameters).`;
+export const ON_RAFT = "This agent is on Raft, so this reminder mount does not set its reminders: they reach it through Raft, and a " +
+  `second way to wake it here would deliver each one twice. Nothing was set. ${RAFT_REMINDER_ROUTE}`;
 
 /**
  * Whether this agent is hosted on Raft, which wakes it through its own channel: a second wake-up path through a
