@@ -792,11 +792,12 @@ function appText(value: unknown, max: number): string | null {
 }
 
 /**
- * `integrations_list`: the CLI's `integration list` (`projectCurrentIntegrationList` and `pushServiceBlock` in
- * packages/cli/src/commands/integration/_format.ts) as data. Built-in Raft services are left out, as the CLI leaves
- * them out, and an active login counts only for a service still listed. Only the fields named here are read, so a
- * field Raft adds later reaches the model only once someone has decided how to show it. `official` and `purpose` are
- * shown only when Raft marks the app official, as the CLI shows them: the mark is the platform's, never the app's.
+ * `integrations_list`: the CLI's `integration list` as data (`projectCurrentIntegrationList` and `pushServiceBlock`;
+ * @botiverse/raft 0.0.33, botiverse/slock at 625a162: packages/cli/src/commands/integration/_format.ts). Built-in Raft
+ * services are left out, as the CLI leaves them out, and an active login counts only for a service still listed. Only
+ * the fields named here are read, so a field Raft adds later reaches the model only once someone has decided how to
+ * show it. `official` and `purpose` are shown only when Raft marks the app official, as the CLI shows them: the mark
+ * is the platform's, never the app's.
  */
 export async function integrationsList(ctx: PluginContext, deps: AgentLoginDeps): Promise<Json> {
   const data = await listed(deps);
