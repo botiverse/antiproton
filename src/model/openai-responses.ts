@@ -21,9 +21,10 @@
  *
  * - Reasoning: with no level asked for, the effort is RESPONSES_DEFAULT_EFFORT, "medium", which is pi's own
  *   default when reasoning is wanted and OpenAI's documented default for its reasoning models. That matches how
- *   DeepSeek is called, where nothing is sent and the model thinks at its default. A level asked for (`low`,
- *   `high`) is sent mapped by the catalog's `thinkingLevelMap`; `off` sends the catalog's off value ("none" for
- *   gpt-5.6-luna). With reasoning on, `summary: "auto"` asks for a readable summary (the transcript's thinking
+ *   DeepSeek is called, where nothing is sent and the model thinks at its default. A caller of `complete` may ask
+ *   a level (`low`, `high`), sent mapped by the catalog's `thinkingLevelMap`, or `off`, which sends the catalog's
+ *   off value ("none" for gpt-5.6-luna). The queue consumer asks none (it does not forward a job's options,
+ *   `callQueuedModel` in cf/src/model-request.ts), so every agent's call runs at the default. With reasoning on, `summary: "auto"` asks for a readable summary (the transcript's thinking
  *   text) and `include: ["reasoning.encrypted_content"]` for the reasoning itself, which is what is replayed.
  * - `store: false`, as pi sends it: nothing is kept at OpenAI, and no `previous_response_id` is used. The model's
  *   earlier reasoning reaches the next request because the request carries it back as items

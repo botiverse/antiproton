@@ -250,7 +250,8 @@ Antiproton is designed to run as a Cloudflare Worker backed by Durable Objects:
    push; a turn started any other way runs on the binding it has.
    An `openai/…` reasoning model (gpt-5.6-luna among them; pi-ai's OpenAI catalog decides) is called
    through the Responses API at the same provider (`<baseUrl>/responses`, the same model name, token and
-   billing), with its reasoning on at `medium` unless the call asks another level, its tools beside it, and
+   billing), with its reasoning on at `medium` (every agent's call: the queue consumer forwards no job option
+   that could ask another level; only a direct caller of the client can), its tools beside it, and
    its encrypted reasoning items carried back on the turn's next call (`store: false`; stored in the
    transcript as the thinking block's `thinkingSignature`; `src/model/openai-responses.ts`). Through
    chat/completions such a model accepts function tools only with its reasoning off, so it reasoned on no

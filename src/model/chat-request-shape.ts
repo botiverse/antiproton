@@ -29,8 +29,8 @@
  *   answered 200 with a correct tool call once "none" was sent. A model whose catalog entry has no "off"
  *   (o3, o4-mini) is sent nothing, as pi sends nothing. The Responses API, which pi itself uses for these
  *   models, is the way to keep reasoning on with tools: the queue consumer sends every such model there
- *   (src/model/openai-responses.ts, `usesResponses`), so this shape is what a caller of our chat client
- *   directly (a benchmark's driver) sends them.
+ *   (src/model/openai-responses.ts, `usesResponses`). This shape applies only if something calls our chat
+ *   client directly with such a model, which would then still run with its reasoning off.
  * - `temperature` is ours, not pi's (pi sends one only when asked): the harness has always sent 0, and an
  *   OpenAI reasoning model with its reasoning on refuses any temperature but the default, so it is left out
  *   exactly then. With reasoning off gpt-5.6-luna accepted temperature 0 (measured 2026-10-04).
