@@ -153,7 +153,8 @@ await check("live path: an agent bound to openai/ under the gateway is called at
   const b = (await r.rt.store.getModelBinding(T, A))!;
   await r.rt.store.setModelBinding({ ...b, baseUrl: "https://stale.example/compat" });
   const s = await callThrough(r, "job-live");
-  must(s.url === "https://gw.example/compat/chat/completions" && s.model === "openai/gpt-5" && s.headers["cf-aig-authorization"] === "Bearer gt"
+  // gpt-5 is a reasoning model, called through the Responses API at the same provider (src/model/openai-responses.ts).
+  must(s.url === "https://gw.example/compat/responses" && s.model === "openai/gpt-5" && s.headers["cf-aig-authorization"] === "Bearer gt"
     && !("authorization" in s.headers) && !JSON.stringify(s).includes("operator-key"), JSON.stringify(s));
   r.host.dispose();
 });

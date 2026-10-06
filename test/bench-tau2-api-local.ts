@@ -122,9 +122,25 @@ globalThis.fetch = (async (input: any, init?: RequestInit) => {
   const url = String(input?.url ?? input);
   if (!/api\.deepseek\.com|gateway\.ai\.cloudflare\.com/.test(url)) return realFetch(input, init);
   const body = JSON.parse(String(init?.body ?? (await (input as Request).text())));
-  asked.push({ host: new URL(url).host, model: body.model, system: String(body.messages?.[0]?.content ?? ""), tools: body.tools ?? [] });
+  // An OpenAI reasoning model is called through the Responses API (src/model/openai-responses.ts): its input
+  // items are read as the chat messages the script keys on, and its answer is written as a response.
+  const responses = url.endsWith("/responses");
+  const messages = responses
+    ? body.input.map((i: any) => (i.type === "function_call_output" ? { role: "tool" } : i.type ? { role: i.type } : i))
+    : body.messages;
+  asked.push({ host: new URL(url).host, model: body.model, system: String(messages?.[0]?.content ?? ""), tools: body.tools ?? [] });
   if (providerRefuses.on) return Response.json({ error: { message: "invalid token", type: "invalid_request_error", code: "invalid_api_key" } }, { status: 401 });
-  const message: { role: string; content: string | null; tool_calls?: unknown[] } = { role: "assistant", ...agentReply(body.messages) };
+  if (responses) {
+    const r: { content?: string | null; tool_calls?: any[] } = agentReply(messages);
+    return Response.json({
+      id: "x", object: "response", status: "completed", model: body.model,
+      output: r.tool_calls
+        ? r.tool_calls.map((c) => ({ type: "function_call", call_id: c.id, name: c.function.name, arguments: c.function.arguments }))
+        : [{ type: "message", role: "assistant", content: [{ type: "output_text", text: r.content }] }],
+      usage: { input_tokens: 100, output_tokens: 10, total_tokens: 110 },
+    });
+  }
+  const message: { role: string; content: string | null; tool_calls?: unknown[] } = { role: "assistant", ...agentReply(messages) };
   return Response.json({
     id: "x", object: "chat.completion", model: body.model,
     choices: [{ index: 0, message, finish_reason: message.tool_calls ? "tool_calls" : "stop" }],

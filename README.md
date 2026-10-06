@@ -248,10 +248,16 @@ Antiproton is designed to run as a Cloudflare Worker backed by Durable Objects:
    call runs on it. An admin's change is bound when something next checks the agent's binding: its console
    page opening, a console message, an Agents API input, an owner's pick, or, for an agent Raft made, a hook
    push; a turn started any other way runs on the binding it has.
-   An `openai/…` model is sent the fields pi-ai's OpenAI-compatible provider would send it
-   (`max_completion_tokens`, and a reasoning model's "off" level as `reasoning_effort`, which
-   chat/completions needs before it accepts function tools; `src/model/chat-request-shape.ts`); every
-   other model's request, DeepSeek's included, is unchanged. A provider's refusal of the request itself
+   An `openai/…` reasoning model (gpt-5.6-luna among them; pi-ai's OpenAI catalog decides) is called
+   through the Responses API at the same provider (`<baseUrl>/responses`, the same model name, token and
+   billing), with its reasoning on at `medium` (every agent's call: the queue consumer forwards no job option
+   that could ask another level; only a direct caller of the client can), its tools beside it, and
+   its encrypted reasoning items carried back on the turn's next call (`store: false`; stored in the
+   transcript as the thinking block's `thinkingSignature`; `src/model/openai-responses.ts`). Through
+   chat/completions such a model accepts function tools only with its reasoning off, so it reasoned on no
+   call. Any other `openai/…` model is sent the fields pi-ai's OpenAI-compatible provider would send it
+   (`max_completion_tokens`; `src/model/chat-request-shape.ts`); every other model's request, DeepSeek's
+   included, is unchanged (`test/model-request-snapshot.ts` pins it). A provider's refusal of the request itself
    (HTTP 400, 401, 403, 404, 422) is not retried: the turn fails at once with the provider's status and
    message. That message travels beside the harness's error text rather than in it, since pi's retry
    check scans the error text for words like `timeout` that a provider's message can contain. 408, 409,

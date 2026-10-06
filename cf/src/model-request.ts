@@ -2,7 +2,9 @@ import { operatorRequest, providerOfRef, type OperatorModel } from "../../src/mo
 import { DEFAULT_PROVIDER, modelProblem, providersFrom, type ModelChoice, type ModelProviders } from "../../src/model/providers.ts";
 import type { UserModel, UserModels } from "../../src/model/user-models.ts";
 import { ModelRequestRefused, OpenAiCompatibleModel } from "../../src/model/openai-compatible.ts";
-import { errorMessage, fromResponse, toRequest, type AnsweredMessage } from "../../src/model/pi-bridge.ts";
+import { OpenAiResponsesModel, usesResponses } from "../../src/model/openai-responses.ts";
+import { errorMessage, fromResponse, toRequest, toResponsesInput, type AnsweredMessage } from "../../src/model/pi-bridge.ts";
+import type { ModelResponse } from "../../src/model/types.ts";
 import { logEvent } from "../../src/core/log.ts";
 
 /**
@@ -105,12 +107,26 @@ export function planBinding(
  * the binding's provider and model when it spends that account (`operatorProvider`, `operatorModel`) and the
  * deployment's otherwise. A job taken before providers existed carries no provider, which is the default one. The answer
  * names the model this call reached, not the one the binding named: that is the model the ledger meters (docs/metering.md).
+ *
+ * An OpenAI reasoning model (`usesResponses`) is called through the Responses API at the same provider, with its
+ * reasoning on and its earlier reasoning replayed (src/model/openai-responses.ts); every other model through
+ * chat/completions, whose request — DeepSeek's among them — test/model-request-snapshot.ts pins byte for byte.
+ * The job's own options are not forwarded on either path: the reasoning level is each client's default.
  */
 export async function callQueuedModel(env: ModelEnv, job: any, jobId: string): Promise<AnsweredMessage> {
   const called = String(job.operatorModel ?? env.HARNESS_MODEL);
   const provider = job.operatorModel ? String(job.operatorProvider ?? DEFAULT_PROVIDER) : DEFAULT_PROVIDER;
-  const model = new OpenAiCompatibleModel(operatorRequest(operatorModelOf(env), { provider, model: called }));
-  const { messages, tools } = toRequest(job.context);
+  const request = operatorRequest(operatorModelOf(env), { provider, model: called });
+  let call: () => Promise<ModelResponse>;
+  if (usesResponses(called)) {
+    const { input, tools } = toResponsesInput(job.context, called);
+    const model = new OpenAiResponsesModel(request);
+    call = () => model.complete(input, tools ? { tools } : {});
+  } else {
+    const model = new OpenAiCompatibleModel(request);
+    const { messages, tools } = toRequest(job.context);
+    call = () => model.complete(messages, tools ? { tools } : {});
+  }
   const identity = {
     api: String(job.model?.api ?? "offloaded"),
     provider: String(job.model?.provider ?? "openai-compatible"),
@@ -118,7 +134,7 @@ export async function callQueuedModel(env: ModelEnv, job: any, jobId: string): P
   };
   let res;
   try {
-    res = await model.complete(messages, tools ? { tools } : {});
+    res = await call();
   } catch (e) {
     // A refusal of the request itself is this job's answer, not a failure to retry: the queue would send the
     // same request again and be refused again (src/model/openai-compatible.ts, `isPermanentRefusal`). Answered

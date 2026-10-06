@@ -11,7 +11,9 @@
  * Both directions are lossy in one place each, and deliberately. Images are
  * dropped on the way out because this provider has never accepted them. The
  * reasoning trace is kept on the way back but not replayed on the way out: the
- * next request carries the reply, not the thinking behind it.
+ * next request carries the reply, not the thinking behind it. The exception is
+ * an OpenAI reasoning model, called through the Responses API, whose reasoning
+ * comes back as opaque items the next request must carry (`toResponsesInput`).
  */
 import type { AssistantMessage, Context as PiContext, Message as PiMessage, Tool as PiTool, Usage } from "@earendil-works/pi-ai";
 import type { ModelMessage, ModelResponse, ToolDefinition } from "./types.ts";
@@ -131,6 +133,68 @@ export function toRequest(context: JobContext): {
   return { messages, ...(tools?.length ? { tools } : {}) };
 }
 
+/**
+ * A stored job's context as Responses API input (src/model/openai-responses.ts), for `model`, the model the call
+ * reaches.
+ *
+ * The conversation is `toRequest`'s, item for item, in the Responses API's form (pi's own conversion is
+ * `convertResponsesMessages`, pi-ai-1 dist/api/openai-responses-shared.js): a system message, the leading prompt
+ * or a later one in place, is a `developer` message, as pi sends instructions to a reasoning model; a tool call is a
+ * `function_call` item and its result a `function_call_output`. Images are dropped as there.
+ *
+ * The one difference is reasoning. An assistant turn's thinking block that carries a `thinkingSignature` is
+ * replayed as the reasoning item it holds, in its place before the text and calls it led to, so the model sees
+ * its own reasoning again across the tool calls of a turn instead of starting each call from the visible
+ * transcript alone. Only an answer from `model` itself is replayed (its `model`, which `fromResponse` sets to the
+ * model called): encrypted reasoning is the model's own, and pi drops it for any other model too
+ * (`transformMessages`, pi-ai-1 dist/api/transform-messages.js). A thinking block with no signature — DeepSeek's
+ * trace, or one written before this existed — is dropped, as `toRequest` drops it.
+ */
+export function toResponsesInput(context: JobContext, model: string): {
+  input: Array<Record<string, unknown>>;
+  tools?: ToolDefinition[];
+} {
+  const inline = wireVersion(context) === 2;
+  const input: Array<Record<string, unknown>> = [];
+  if ("systemPrompt" in context && context.systemPrompt) input.push({ role: "developer", content: context.systemPrompt });
+
+  for (const m of context.messages) {
+    if (m.role === "system") {
+      if (!inline) throw new Error("a version 1 model job carries a system message in its conversation");
+      input.push({ role: "developer", content: m.content });
+      continue;
+    }
+    if (m.role === "user") {
+      input.push({ role: "user", content: textOf(m.content) });
+      continue;
+    }
+    if (m.role === "toolResult") {
+      input.push({ type: "function_call_output", call_id: m.toolCallId, output: textOf(m.content) });
+      continue;
+    }
+    // assistant: its blocks in order, as pi replays them
+    const own = m.model === model;
+    for (const c of (m.content ?? []) as any[]) {
+      if (c?.type === "thinking") {
+        if (!own || typeof c.thinkingSignature !== "string" || !c.thinkingSignature) continue;
+        let item: unknown;
+        try { item = JSON.parse(c.thinkingSignature); } catch { continue; }
+        if (item && typeof item === "object" && (item as { type?: unknown }).type === "reasoning") input.push(item as Record<string, unknown>);
+      } else if (c?.type === "text") {
+        if (c.text) input.push({ role: "assistant", content: String(c.text) });
+      } else if (c?.type === "toolCall") {
+        input.push({ type: "function_call", call_id: c.id, name: c.name, arguments: JSON.stringify(c.arguments ?? {}) });
+      }
+    }
+  }
+
+  const tools = context.tools?.map((t) => ({
+    name: t.name, description: t.description, parameters: t.parameters as unknown,
+  })) as ToolDefinition[] | undefined;
+
+  return { input, ...(tools?.length ? { tools } : {}) };
+}
+
 const NO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
 
 /** Cost is left at zero: this deployment prices per tenant elsewhere, and a
@@ -171,7 +235,11 @@ export function fromResponse(
   jobId?: string,
 ): AnsweredMessage {
   const content: AssistantMessage["content"] = [];
-  if (res.reasoning) content.push({ type: "thinking", thinking: res.reasoning } as any);
+  // Reasoning to replay (the Responses API's items) is one thinking block per item, its item in
+  // `thinkingSignature`; a trace that is only text is one block with no signature, as it always was.
+  if (res.reasoningItems?.length) {
+    for (const r of res.reasoningItems) content.push({ type: "thinking", thinking: r.text, thinkingSignature: r.signature } as any);
+  } else if (res.reasoning) content.push({ type: "thinking", thinking: res.reasoning } as any);
   if (res.text) content.push({ type: "text", text: res.text });
   for (const c of res.toolCalls ?? []) {
     content.push({
