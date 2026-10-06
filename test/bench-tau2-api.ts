@@ -31,7 +31,7 @@ import {
   apiRunRecord, exactFigures, kindsOf, ledgerModels, rowFigures, runnerMethodOf, runProvider, taskProvider, type ModelsList,
 } from "../bench/tau2/api-record.ts";
 import { beginRun, recordRun } from "../bench/record.ts";
-import { MAX_TURNS, OPENING, SIM, simEnding, simSystem } from "../bench/tau2/episode.ts";
+import { guidelineId, MAX_TURNS, OPENING, SIM, simEnding, simRecord, simSystem } from "../bench/tau2/episode.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => void | Promise<void>) {
@@ -126,6 +126,19 @@ await check("the customer both runners simulate: guidelines then scenario, and t
   must(simSystem(task, "G") === "G\n\n# Your scenario\nStyle: terse\nWhy you are contacting support: cancel\nWhat you know: email\nWhat you do NOT know: id", show(simSystem(task, "G")));
   must(simEnding({ text: "ok ###TRANSFER###" }) === "transfer" && simEnding({ text: " ", finishReason: "length" }) === "sim_empty (length)" && simEnding({ text: "hi" }) === null, "endings");
   must(show(SIM) === '{"maxTokens":8192,"reasoning":"low"}', show(SIM));
+});
+
+await check("the customer's guidelines: upstream τ²'s plus one line, never end in the message that confirms an action, and the record names them", () => {
+  const text = readFileSync(new URL("../bench/tau2/data/simulation_guidelines.md", import.meta.url), "utf8");
+  const rule = "- Never generate '###STOP###', '###TRANSFER###' or '###OUT-OF-SCOPE###' in a message that confirms, authorizes or asks the agent to perform an action. " +
+    "Wait for the agent to report the result, and end the conversation only in a later message.";
+  must(text.split("\n").includes(rule), "the guidelines lack the rule");
+  const task = { user_scenario: { instructions: { reason_for_call: "cancel" } } };
+  must(simSystem(task, text).startsWith(text) && simSystem(task, text).includes(rule), "the simulator's system message lacks the rule");
+  // Upstream's text is this file without that line; its id is the one report/runs/README.md gives for records without the field.
+  must(guidelineId(text.replace(rule + "\n", "")) === "740a29dfa64d", guidelineId(text.replace(rule + "\n", "")));
+  must(guidelineId(text) === "33686f55b74d", guidelineId(text));
+  must(show(simRecord(text)) === '{"maxTokens":8192,"reasoning":"low","guideline":"33686f55b74d"}', show(simRecord(text)));
 });
 
 await check("the series' constants, as the `/bench` runner has always run them: 14 customer turns, the opening line, the three stop tags", () => {

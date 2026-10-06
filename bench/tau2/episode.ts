@@ -75,6 +75,21 @@ export function simEnding(reply: { text: string; finishReason?: string }): strin
 export const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
 
 /**
+ * Which simulator guidelines (bench/tau2/data/simulation_guidelines.md) a run used: the first 12 hex digits of
+ * the sha256 of the file's text, so any edit to the file moves it without anyone remembering to bump a version.
+ *
+ * The file is upstream τ²'s, `740a29dfa64d`, plus one line: never end the conversation in the message that
+ * confirms an action. Without it the simulator answered "shall I proceed?" with "Yes, please proceed …
+ * ###STOP###", the episode ended on the tag, and the confirmed write never ran — 6 of 9 failures on one arm
+ * and 5 of 6 on the other in one analysed round. That line is a departure from upstream, so a series is split
+ * where this changes (report/runs/README.md).
+ */
+export const guidelineId = (guidelines: string): string => sha256(guidelines).slice(0, 12);
+
+/** The record's `sim`: how the simulator is called (SIM) and which guidelines it was given. */
+export const simRecord = (guidelines: string) => ({ ...SIM, guideline: guidelineId(guidelines) });
+
+/**
  * The database the annotated solution leaves behind, hashed the same way the object hashes its own — the
  * comparison is a hash because the database is 2.8 MB and no part of it needs to travel.
  */
