@@ -18,7 +18,7 @@ import {
 } from "@botiverse/raft-sdk";
 import { PARK_BYTES } from "./artifacts.ts";
 import {
-  ACTIONS_TOOL, AGENT_LOGIN_TOOLS, INVOKE_TOOL, LOGIN_TOOL, SESSION_STORE, integrationsActions, integrationsInvoke, integrationsLogin,
+  ACTIONS_TOOL, AGENT_LOGIN_TOOLS, INVOKE_TOOL, LIST_TOOL, LOGIN_TOOL, SESSION_STORE, integrationsActions, integrationsInvoke, integrationsList, integrationsLogin,
   type AgentLoginDeps, type ManifestCache,
 } from "./raft-agent-login.ts";
 import { internalHost } from "./http.ts";
@@ -1593,6 +1593,7 @@ export function createRaftPlugin(deps: { artifacts?: RaftArtifacts | null; exclu
       const op = operationOf.get(name);
       if (op) return operate(op, args, ctx) as Promise<Json>;
       const a = object(args);
+      if (name === LIST_TOOL) return integrationsList(ctx, agentLogin(ctx));
       if (name === LOGIN_TOOL) return integrationsLogin(args, ctx, agentLogin(ctx));
       if (name === ACTIONS_TOOL) return integrationsActions(args, ctx, agentLogin(ctx), manifests);
       if (name === INVOKE_TOOL) return integrationsInvoke(args, ctx, agentLogin(ctx), manifests);
