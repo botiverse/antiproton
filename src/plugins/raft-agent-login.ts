@@ -783,12 +783,19 @@ async function findService(deps: AgentLoginDeps, query: string): Promise<Service
 const NAME_MAX = 200;
 const TEXT_MAX = 500;
 
-/** App-supplied text as a list shows it: one line, clipped, with credential shapes left out. */
-function appText(value: unknown, max: number): string | null {
-  const text = str(value);
+/** Zero-width and bidi control characters: invisible, and able to make shown text read other than it is. */
+const INVISIBLE = /[\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF]/g;
+
+/**
+ * App-supplied text as a list shows it: invisible controls dropped, one line, credential shapes and `secrets` left
+ * out, then clipped. Redacted before the cut, so a credential that straddles it cannot survive as a prefix the
+ * patterns no longer match.
+ */
+function appText(value: unknown, max: number, secrets: readonly string[]): string | null {
+  const text = str(typeof value === "string" ? value.replace(INVISIBLE, "") : value);
   if (!text) return null;
-  const line = text.replace(/\s+/g, " ");
-  return redactedError(line.length > max ? `${line.slice(0, max)}…` : line) as string;
+  const line = withheld(redactedError(text.replace(/\s+/g, " ")), secrets) as string;
+  return line.length > max ? `${line.slice(0, max)}…` : line;
 }
 
 /**
@@ -801,6 +808,7 @@ function appText(value: unknown, max: number): string | null {
  */
 export async function integrationsList(ctx: PluginContext, deps: AgentLoginDeps): Promise<Json> {
   const data = await listed(deps);
+  const secrets = ctx.credential ? [ctx.credential] : [];
   const visible = (data.services as unknown[]).map(obj).filter((s) => s.appType !== "slock_builtin" && serviceOf(s) !== null);
   const ids = new Set(visible.map((s) => s.id as string));
   const logins = new Map<string, Obj>();
@@ -811,18 +819,18 @@ export async function integrationsList(ctx: PluginContext, deps: AgentLoginDeps)
     const record = serviceOf(s)!;
     const login = logins.get(record.id);
     const official = s.official === true;
-    const purpose = official ? appText(s.purpose, TEXT_MAX) : null;
-    const description = appText(s.description, TEXT_MAX);
-    const whenToUse = appText(s.whenToUse, TEXT_MAX);
+    const purpose = official ? appText(s.purpose, TEXT_MAX, secrets) : null;
+    const description = appText(s.description, TEXT_MAX, secrets);
+    const whenToUse = appText(s.whenToUse, TEXT_MAX, secrets);
     return {
-      service: appText(record.clientId, NAME_MAX), id: appText(record.id, NAME_MAX), name: appText(record.name, NAME_MAX),
+      service: appText(record.clientId, NAME_MAX, secrets), id: appText(record.id, NAME_MAX, secrets), name: appText(record.name, NAME_MAX, secrets),
       ...(official ? { official: true } : {}),
       ...(purpose ? { purpose } : {}),
       ...(description ? { description } : {}),
       ...(whenToUse ? { whenToUse } : {}),
       activeLogin: login !== undefined,
-      ...(login && Array.isArray(login.scopes) ? { scopes: login.scopes.filter((x): x is string => typeof x === "string").map((x) => appText(x, NAME_MAX)) } : {}),
-      manifestUrl: appText(record.agentManifestUrl, TEXT_MAX),
+      ...(login && Array.isArray(login.scopes) ? { scopes: login.scopes.filter((x): x is string => typeof x === "string").map((x) => appText(x, NAME_MAX, secrets)) } : {}),
+      manifestUrl: appText(record.agentManifestUrl, TEXT_MAX, secrets),
     };
   });
   // Walked whole for the mount's own credential too, as every result here is: Raft echoing it must not hand it on.
@@ -833,7 +841,7 @@ export async function integrationsList(ctx: PluginContext, deps: AgentLoginDeps)
     next: services.length
       ? `${LOGIN_TOOL} signs in to one by its service; ${ACTIONS_TOOL} lists what it offers; ${INVOKE_TOOL} runs an action (signing in first when needed).`
       : "No Connected App is installed on this Server; a Server owner or admin installs one from the Raft Marketplace.",
-  }, ctx.credential ? [ctx.credential] : []);
+  }, secrets);
 }
 
 function actionView(a: ManifestAction): Json {

@@ -15,7 +15,7 @@
 import { createHmac, randomBytes } from "node:crypto";
 import {
   createReminderPlugin, httpReminderService, reminderPlugin, subjectOf, ReminderServiceError, HOOK_STORE, HOOK_KEY,
-  RETRY_HORIZON_MS, MAX_CLOCK_SKEW_SECONDS, NO_CREDENTIAL, NO_ORIGIN, ON_RAFT, RAFT_REMINDER_ROUTE,
+  RETRY_HORIZON_MS, MAX_CLOCK_SKEW_SECONDS, NO_CREDENTIAL, NO_ORIGIN, ON_RAFT, RAFT_REMINDER_ROUTE_ANY_MOUNT,
   type ReminderConnection, type ReminderService, type ServiceReminder,
 } from "../src/plugins/reminder.ts";
 import type { InboundEvent, InboundResult, Plugin } from "../src/plugins/types.ts";
@@ -670,7 +670,7 @@ await check("the HTTP client maps reminder-app's errors: unknown_hook, an unknow
     must(/not switched on reminders for this deployment/.test(await codeOf(create())), `switched off became ${await codeOf(create())}`);
     fakeServer(() => fail(403, "A Raft agent receives reminders through Raft.", "raft_agent_uses_raft_channel"));
     const raftRefusal = await codeOf(create());
-    must(raftRefusal.includes(RAFT_REMINDER_ROUTE) && /integrations_list/.test(raftRefusal), `a refused Raft agent became ${raftRefusal}`);
+    must(raftRefusal.includes(RAFT_REMINDER_ROUTE_ANY_MOUNT) && /integrations_list on your Raft mount/.test(raftRefusal) && !/raft__/.test(raftRefusal), `a refused Raft agent became ${raftRefusal}`);
     // Read by code: the switched-off sentence without its code, or any other 403, is neither of the two named refusals.
     fakeServer(() => fail(403, "Agent-owned reminders are not enabled on this server."));
     const uncoded = await codeOf(create());
@@ -721,7 +721,9 @@ await check("the refusal on Raft says where a reminder is set instead: the Remin
     must(ON_RAFT.includes(tool) && offered.has(tool), `${tool}: named ${ON_RAFT.includes(tool)}, offered ${offered.has(tool)}`);
   }
   must(ON_RAFT.includes("raft__integrations_list"), `the model-facing name is missing: ${ON_RAFT}`);
-  must(/Reminder/.test(ON_RAFT) && /create-reminder/.test(ON_RAFT), `the app and its action are not named: ${ON_RAFT}`);
+  // Picked by Raft's official mark and purpose first, not by a name the app chose for itself.
+  must(/marked official whose purpose is reminders/.test(ON_RAFT) && /create-reminder/.test(ON_RAFT), `the app and its action are not named: ${ON_RAFT}`);
+  must(!/named Reminder/.test(ON_RAFT), `steers by the app's own name: ${ON_RAFT}`);
   // A Server's install of the app has its own service id; one written here would be wrong everywhere else.
   must(!/reminder-[0-9a-f]{6}/.test(ON_RAFT) && !/remove the reminder mount/.test(ON_RAFT), `a fixed id or the old advice: ${ON_RAFT}`);
 });
@@ -735,6 +737,22 @@ await check("a mount under the alias raft that is not the raft plugin, or no raf
     await m.call("create", { delayMinutes: 5, note: "n" }).catch((e) => { throw new Error(`${what}: create refused: ${e.message}`); });
     must(svc.reminders.size === 1, `${what}: ${svc.reminders.size} reminders`);
   }
+});
+
+await check("reminder-app refusing a Raft identity the plugin did not see (raft under another alias) names no alias and no prefixed tool", async () => {
+  try {
+    fakeServer((method, path) =>
+      path === "/api/v1/agent/hooks" && method === "GET" ? ok({ hooks: [] })
+      : path === "/api/v1/agent/hooks" ? ok({ hookId: "hook_1", origin: "https://hooks.antiproton.example", revision: 1, createdAt: 1, updatedAt: 1 })
+      : path === "/api/v1/agent/reminders" && method === "POST" ? fail(403, "A Raft agent receives reminders through Raft.", "raft_agent_uses_raft_channel")
+      : fail(404, "no such route"));
+    const m = mount(createReminderPlugin({ ...DEPLOYMENT, service: httpReminderService() }));
+    withSibling(m, "inbox", "raft");
+    const why = await refusal(m.call("create", { delayMinutes: 5, note: "n" }));
+    // Control: the refusal came from reminder-app, past the plugin's own check (which does not see the alias inbox).
+    must(why !== ON_RAFT && /reminder-app refused this agent because it has a Raft identity/.test(why), `not reminder-app's refusal: ${why}`);
+    must(why.includes("integrations_list on your Raft mount") && !/raft__|on the raft mount/.test(why), `names a mount it cannot know: ${why}`);
+  } finally { globalThis.fetch = realFetch; }
 });
 
 await check("on a Raft-hosted agent, list and delete still work, so reminders set before can be cleaned up", async () => {

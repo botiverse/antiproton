@@ -720,6 +720,27 @@ await check("list: an app's text is data: one line, clipped, credential shapes a
   must(s.description.includes("evil.example"), "the description was dropped rather than shown as data");
 });
 
+await check("list: a credential straddling the clip is withheld whole, not left as a prefix the patterns no longer match", async () => {
+  const jwt = `eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ${"x".repeat(40)}In0.c2lnbmF0dXJlc2lnbmF0dXJl`;
+  // Glued to the text before it, so only the walk for the mount's credential can find it; and a JWT whose cut would
+  // leave two of its three parts.
+  const straddling = { ...ORDINARY, description: `${"d".repeat(480)}${CREDENTIAL}`, whenToUse: `${"w".repeat(470)} ${jwt}` };
+  world({ list: { body: { services: [straddling], activeLogins: [] } } }).install();
+  const m = mount();
+  const s = (await m.plugin.invoke("integrations_list", {}, m.ctx) as any).services[0];
+  // Both crossed the 500-character cut as sent; redacted first, what is left is short enough to need none.
+  must(s.description === `${"d".repeat(480)}[withheld]` && !s.description.includes(CREDENTIAL.slice(0, 12)), `description: …${s.description.slice(470)}`);
+  must(s.whenToUse.includes("<redacted>") && !s.whenToUse.includes("eyJhbGciOiJIUzI1NiJ9"), `whenToUse: …${s.whenToUse.slice(460)}`);
+});
+
+await check("list: zero-width and bidi control characters are dropped from an app's text", async () => {
+  const hidden = { ...ORDINARY, name: "Va\u202Eult\u200B", description: "\uFEFFKeeps\u2066 credentials\u2069.\u200F" };
+  world({ list: { body: { services: [hidden], activeLogins: [] } } }).install();
+  const m = mount();
+  const s = (await m.plugin.invoke("integrations_list", {}, m.ctx) as any).services[0];
+  must(s.name === "Vault" && s.description === "Keeps credentials.", `name ${JSON.stringify(s.name)}, description ${JSON.stringify(s.description)}`);
+});
+
 await check("list: no apps installed says so and how one gets installed", async () => {
   world({ list: { body: { services: [BUILTIN], activeLogins: [] } } }).install();
   const m = mount();

@@ -171,7 +171,7 @@ export function httpReminderService(): ReminderService {
       // The two refusals reminder-app names (reminder-app#7): a client switched off, and an agent with a Raft identity,
       // which reaches its reminders through Raft. Read by code, never by the sentence; any other 403 is passed on as said.
       if (code === "agent_reminders_disabled") throw new ReminderServiceError("refused", "reminder-app has not switched on reminders for this deployment, so none can be set yet; whoever runs this deployment has to ask for them to be switched on");
-      if (code === "raft_agent_uses_raft_channel") throw new ReminderServiceError("refused", `reminder-app refused this agent because it has a Raft identity; nothing was set. ${RAFT_REMINDER_ROUTE}`);
+      if (code === "raft_agent_uses_raft_channel") throw new ReminderServiceError("refused", `reminder-app refused this agent because it has a Raft identity; nothing was set. ${RAFT_REMINDER_ROUTE_ANY_MOUNT}`);
       throw new ReminderServiceError("refused", `reminder-app refused the request (HTTP 403)${said ? `: ${said}` : ""}`);
     }
     // 400, 409 (a cap reached, a key reused), 413, 415: reminder-app's own sentence is about the request the model made.
@@ -418,15 +418,24 @@ export interface ReminderDeployment {
  */
 const RAFT_ALIAS = "raft";
 /**
- * Where an agent on Raft sets a reminder: the Reminder Connected App on its Raft Server, reached through its raft
+ * Where an agent on Raft sets a reminder: the reminder Connected App on its Raft Server, reached through its raft
  * mount's Agent Login tools (src/plugins/raft-agent-login.ts). The app is found by listing, never named here: its
- * service id differs from Server to Server, and a Server may have none installed.
+ * service id differs from Server to Server, and a Server may have none installed. It is picked by Raft's official
+ * mark and purpose before anything the app wrote about itself, since an app chooses its own name. `where` names the
+ * list tool as the agent can reach it: the model-facing name only where the raft mount's alias is known (`ON_RAFT`).
  */
-export const RAFT_REMINDER_ROUTE = `Set it through Raft instead: run ${LIST_TOOL} on the ${RAFT_ALIAS} mount (${RAFT_ALIAS}__${LIST_TOOL}) ` +
-  "to find the Connected App for reminders (a service named Reminder, say), " +
-  `sign in to it with ${LOGIN_TOOL}, and call its create-reminder action with ${INVOKE_TOOL} (${ACTIONS_TOOL} shows that action's parameters).`;
+export function raftReminderRoute(where: string): string {
+  return `Set it through Raft instead: run ${where} to find the Connected App for reminders ` +
+    "(an app marked official whose purpose is reminders; if none is official, one whose description says it sets reminders), " +
+    `sign in to it with ${LOGIN_TOOL}, and call its create-reminder action with ${INVOKE_TOOL} (${ACTIONS_TOOL} shows that action's parameters).`;
+}
+/**
+ * The same, where the raft mount is not known: reminder-app refuses a Raft identity whether or not `onRaft` saw a raft
+ * mount under provisioning's alias, so this one names no alias and no model-facing name.
+ */
+export const RAFT_REMINDER_ROUTE_ANY_MOUNT = raftReminderRoute(`${LIST_TOOL} on your Raft mount`);
 export const ON_RAFT = "This agent is on Raft, so this reminder mount does not set its reminders: they reach it through Raft, and a " +
-  `second way to wake it here would deliver each one twice. Nothing was set. ${RAFT_REMINDER_ROUTE}`;
+  `second way to wake it here would deliver each one twice. Nothing was set. ${raftReminderRoute(`${LIST_TOOL} on the ${RAFT_ALIAS} mount (${RAFT_ALIAS}__${LIST_TOOL})`)}`;
 
 /**
  * Whether this agent is hosted on Raft, which wakes it through its own channel: a second wake-up path through a
