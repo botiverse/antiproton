@@ -1,0 +1,14 @@
+{
+  // A stand-in model provider for load tests (src/index.ts says what it answers). A standalone Worker with no
+  // bindings: it reads nothing and calls nothing, so it has no state to lose and costs only its requests.
+  // Deploy: npx wrangler deploy -c tools/mock-model/wrangler.jsonc
+  // Key:    npx wrangler secret put MOCK_MODEL_KEY -c tools/mock-model/wrangler.jsonc (the same value as the
+  //         preview Worker's MOCK_MODEL_KEY, which cf/wrangler.preview.jsonc's `mock` provider sends)
+  // Remove: npx wrangler delete -c tools/mock-model/wrangler.jsonc
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "antiproton-mock-model",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-05",
+  "workers_dev": true,
+  "observability": { "enabled": false }
+}

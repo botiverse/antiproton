@@ -130,7 +130,8 @@
     "test/bench-pd.ts",
     "test/bench-swe.ts",
     "test/bench-swe-grade.ts",
-    "test/client-tool-alarms.ts"
+    "test/client-tool-alarms.ts",
+    "test/mock-model.ts"
   ],
   "exclude": ["node_modules"]
 }
