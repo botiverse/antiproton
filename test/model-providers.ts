@@ -116,10 +116,11 @@ async function varsOf(file: string): Promise<Record<string, unknown>> {
 }
 
 await check("each deployment's declaration is accepted, offers cloudflare under vendor/model through its own gateway, and holds no secret; DeepSeek is the default and production's is exactly the provider it derived before", async () => {
-  for (const [file, gateway] of [["wrangler.preview.jsonc", "antiproton-preview"], ["wrangler.jsonc", "antiproton"]] as const) {
+  // Preview also declares the load-test mock (tools/mock-model, test/mock-model.ts); production must not.
+  for (const [file, gateway, extra] of [["wrangler.preview.jsonc", "antiproton-preview", ",mock"], ["wrangler.jsonc", "antiproton", ""]] as const) {
     const vars = await varsOf(file);
     const configs = parseProviders(vars.MODEL_PROVIDERS);
-    must(configs.map((p) => p.id).join() === `${DEFAULT_PROVIDER},cloudflare`, `${file}: ${JSON.stringify(configs)}`);
+    must(configs.map((p) => p.id).join() === `${DEFAULT_PROVIDER},cloudflare${extra}`, `${file}: ${JSON.stringify(configs)}`);
     const cf = configs.find((p) => p.id === "cloudflare")!;
     // Each deployment through its own gateway: production's calls must not land in preview's logs or billing.
     must(new RegExp(`^https://gateway\\.ai\\.cloudflare\\.com/v1/[0-9a-f]{32}/${gateway}/compat$`).test(cf.baseUrl), `${file}: ${cf.baseUrl}`);

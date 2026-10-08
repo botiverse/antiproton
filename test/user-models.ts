@@ -89,11 +89,17 @@ function varsOf(file: string): Record<string, unknown> {
   return JSON.parse(text.split("\n").filter((l) => !l.trim().startsWith("//")).join("\n")).vars;
 }
 
-await check("config: each deployment offers exactly DeepSeek Flash and GPT-5.6 Luna, accepted against its own providers, and DeepSeek stays the default", () => {
-  for (const file of ["wrangler.jsonc", "wrangler.preview.jsonc"]) {
+// Preview also offers the load-test mock (tools/mock-model, test/mock-model.ts); production must not.
+const MOCKS = [
+  { id: "mock", label: "Mock (no cost, load tests)", provider: "mock", model: "mock" },
+  { id: "mock-tool", label: "Mock with a tool call (no cost)", provider: "mock", model: "mock-tool" },
+];
+
+await check("config: each deployment offers exactly DeepSeek Flash and GPT-5.6 Luna (and preview the mocks), accepted against its own providers, and DeepSeek stays the default", () => {
+  for (const [file, offered] of [["wrangler.jsonc", [FLASH, LUNA]], ["wrangler.preview.jsonc", [FLASH, LUNA, ...MOCKS]]] as const) {
     const vars = varsOf(file);
     const ps = { configs: parseProviders(vars.MODEL_PROVIDERS), secrets: {} };
-    must(show(parseUserModels(vars.USER_MODELS, ps)) === show([FLASH, LUNA]), `${file}: ${show(vars.USER_MODELS)}`);
+    must(show(parseUserModels(vars.USER_MODELS, ps)) === show(offered), `${file}: ${show(vars.USER_MODELS)}`);
     must(vars.HARNESS_MODEL === "deepseek-flash", `${file}: the default moved`);
   }
 });
