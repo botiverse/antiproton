@@ -23,7 +23,7 @@ import type {
 import { appendTrace, type TraceRow } from "../trace/outbox.ts";
 import { approvalRow, operationEnded, toolCallRow } from "../trace/seams.ts";
 import {
-  applySeedPass, markSeedsChosen, pendingSeedNotices, readSeedRecord, returnSeedNotices, SEED_RECORD_SCHEMA, takeSeedNotices,
+  applySeedPass, markSeedsChosen, pendingSeedNotices, readSeedRecord, returnSeedNotices, SEED_RECORD_SCHEMA, takeSeedNotices, voidSeedNotices,
   type SeedNoticeRow, type SeedPlan,
 } from "./seed-record.ts";
 
@@ -1128,6 +1128,10 @@ export class SqliteStore implements StorageAdapter {
 
   async takeSeedNotices(tenantId: string, agentId: string, which: ReadonlySet<string>) {
     return this.#tx(() => takeSeedNotices(this.#usageSql(), tenantId, agentId, which, now()));
+  }
+
+  async voidSeedNotices(tenantId: string, agentId: string, rows: ReadonlyArray<{ alias: string; since: number; reason: string }>) {
+    this.#tx(() => voidSeedNotices(this.#usageSql(), tenantId, agentId, rows, now()));
   }
 
   async returnSeedNotices(tenantId: string, agentId: string, rows: readonly SeedNoticeRow[]) {

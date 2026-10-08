@@ -2901,16 +2901,38 @@ export class AgentRuntime {
    * does not always, `postMessage`). What qualifies a notice is the harness taking the message: one built before the mount was
    * added (a steer into a turn already running) does not offer its tools, so naming them would send the model to a
    * tool it cannot call; that notice waits for a message whose harness does.
+   *
+   * Said only of the plugin that was added. The line names tools by alias, so a notice whose alias now holds another
+   * plugin's mount (the entry removed, then something else mounted under its name) would point the model at that
+   * plugin's tools in the harness's own voice — and, without a row `notice`, put that plugin's own descriptions there.
+   * Such a notice is voided, as is one whose mount is gone or whose plugin is switched off or no longer installed:
+   * none of them can become true by waiting, and voiding is what keeps every later message from judging it again.
    */
   async #takeNotices(tenantId: string, agentId: string, agent: AgentEngine) {
-    const pending = await this.store.pendingSeedNotices(tenantId, agentId);
+    let pending = await this.store.pendingSeedNotices(tenantId, agentId);
     if (!pending.length) return null;
+    const choices = await this.store.pluginChoices(tenantId, agentId);
+    const dead: Array<{ alias: string; since: number; reason: string }> = [];
+    for (const n of pending) {
+      const mount = await this.store.getMountByAlias(tenantId, agentId, n.alias);
+      const reason = !mount ? `the ${n.alias} mount is gone`
+        : mount.plugin !== n.plugin ? `${n.alias} is now a ${mount.plugin} mount, not the ${n.plugin} that was added`
+        : !this.#plugins.some((p) => p.id === n.plugin) ? `${n.plugin} is not installed`
+        : !pluginEnabled(SEEDED_PLUGINS.has(n.plugin), choices[n.plugin]) ? `${n.plugin} is switched off for this agent`
+        : null;
+      if (reason) dead.push({ alias: n.alias, since: n.since, reason });
+    }
+    if (dead.length) {
+      await this.store.voidSeedNotices(tenantId, agentId, dead);
+      pending = pending.filter((n) => !dead.some((d) => d.alias === n.alias && d.since === n.since));
+      if (!pending.length) return null;
+    }
     const { tools } = await this.#catalogueFor(tenantId, agentId);
     const here = new Set((await agent.tools()).map((t) => t.name));
     const offered = (tools as MountedTool[]).filter((t) => here.has(t.name));
     const lines = new Map<string, string>();
     for (const n of pending) {
-      const entry = AgentRuntime.DEFAULT_MOUNTS.find((m) => m.alias === n.alias && (m.since ?? 1) === n.since);
+      const entry = AgentRuntime.DEFAULT_MOUNTS.find((m) => m.alias === n.alias && (m.since ?? 1) === n.since && m.plugin === n.plugin);
       const line = capabilityNotice({ alias: n.alias, ...(entry?.notice ? { notice: entry.notice } : {}) }, offered);
       if (line) lines.set(`${n.alias}@${n.since}`, line);
     }

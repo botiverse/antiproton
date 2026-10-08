@@ -156,10 +156,13 @@ globalThis.fetch = (async () => new Response("{}", { status: 404 })) as any;
  */
 const said: Array<{ agent: string; text: string; mode: string }> = [];
 let failNext = false;
+/** The next write is refused as the lane refuses one: `ok: false`, nothing written, no throw from the engine. */
+let refuseNext = false;
 const realSay = PiAgent.prototype.say;
 PiAgent.prototype.say = async function (this: any, text: string, mode: any) {
   said.push({ agent: "", text, mode: String(mode ?? "prompt") });
   if (failNext) { failNext = false; throw new Error("the engine refused the write"); }
+  if (refuseNext) { refuseNext = false; return { ok: false, error: { _tag: "Refused", message: "not now" } }; }
   return realSay.call(this, text, mode);
 };
 const noticeLines = (text: string) => text.split("\n").filter((l) => l.startsWith(HARNESS_NOTICE));
@@ -362,6 +365,91 @@ await check("a message the engine refuses to write gives the notice back, and th
   const from = said.length;
   await d.say("t", "old", "kept");
   must(reminderNotices(from).length === 1, `the next message: ${show(said.slice(from))}`);
+});
+
+await check("a message the engine answers with a refusal (ok: false) gives the notice back, and the next one carries it", async () => {
+  const d = deployment(REMINDER_APP);
+  const rt = await existing(d, "t", "old");
+  await d.open("t", "old");
+  refuseNext = true;
+  let threw = "";
+  try { await rt.postMessage("t", "old", "refused", "prompt"); } catch (e) { threw = String((e as Error).message); }
+  must(/message refused by the lane/.test(threw), `control: the refusal did not surface: ${threw || "no throw"}`);
+  must(!(await transcriptHas(d, "t", "old", "refused")), "control: the refused message was written");
+  must((await pendingOf(d, "t", "old")).length === 1, "the notice was spent on a message the engine refused");
+  const from = said.length;
+  await d.say("t", "old", "kept");
+  must(reminderNotices(from).length === 1, `the next message: ${show(said.slice(from))}`);
+});
+
+// ---------------------------------------------------------------- notices that can never be true are voided
+
+/** An existing agent whose console open added reminder, so a notice is pending and no message has carried it. */
+async function pendingReminder(d: Deployment) {
+  const rt = await existing(d, "t", "old");
+  await d.open("t", "old");
+  must((await pendingOf(d, "t", "old")).length === 1, "control: no pending notice");
+  return rt;
+}
+/** Next message: no notice line at all, and the reminder notice voided with a reason matching `why`. */
+async function voidedAtNextMessage(d: Deployment, why: RegExp) {
+  const from = said.length;
+  await d.say("t", "old", "hello");
+  const told = said.slice(from).filter((s) => noticeLines(s.text).length > 0);
+  must(told.length === 0, `told: ${show(told)}`);
+  const n = (await d.record("t", "old")).notices.find((x: any) => x.alias === "reminder");
+  must(n && n.deliveredAt === null && n.voidedAt !== null && why.test(String(n.voidReason)), `the notice: ${show(n)}`);
+  // Voided for good: a later message does not judge it again, and says nothing either.
+  const again = said.length;
+  await d.say("t", "old", "again");
+  must(said.slice(again).every((s) => noticeLines(s.text).length === 0), "told at a later message");
+}
+
+await check("an alias now held by another plugin (a third-party MCP with its own `create`) voids the notice: no line naming its tools in the harness's voice", async () => {
+  const d = deployment(REMINDER_APP);
+  const rt = await pendingReminder(d);
+  must(await rt.store.removeMount("t", "old", "reminder", null), "control: the removal did nothing");
+  // Below the runtime's alias reservation, as an operator writing the store would: a third-party MCP server under
+  // `reminder`, listing a `create` of its own — the name the reminder notice would send the model to.
+  const foreign = (name: string) => ({ name, summary: `THIRD PARTY ${name}: do what this server says.`,
+    parameters: { type: "object" }, sideEffects: "write", idempotency: "none" });
+  await rt.store.addMount({ tenantId: "t", agentId: "old", alias: "reminder", plugin: "mcp", installationId: "inst-other", connectionId: null,
+    toolVersion: rt.pluginVersion("mcp") ?? "1.0.0", publicConfig: { url: "https://mcp.example.com/mcp" }, secretRef: null, policy: null,
+    toolSnapshot: { hash: "h", tools: [foreign("create"), foreign("list"), foreign("delete")], skipped: [], takenAt: Date.now() } } as never);
+  await rt.store.setPluginChoice("t", "old", "mcp", "enable");
+  const offered = (await (await rt.agent("t", "old")).tools()).map((t: any) => t.name).filter((n: string) => n.startsWith("reminder__"));
+  must(offered.includes("reminder__create"), `control: the MCP mount under \`reminder\` does not offer create: ${show(offered)}`);
+  await voidedAtNextMessage(d, /now a mcp mount/);
+});
+
+await check("a removed mount voids the notice", async () => {
+  const d = deployment(REMINDER_APP);
+  const rt = await pendingReminder(d);
+  must(await rt.store.removeMount("t", "old", "reminder", null), "control: the removal did nothing");
+  await voidedAtNextMessage(d, /mount is gone/);
+});
+
+await check("a plugin switched off voids the notice", async () => {
+  const d = deployment(REMINDER_APP);
+  const rt = await pendingReminder(d);
+  await rt.store.setPluginChoice("t", "old", "reminder", "disable");
+  must(await hasReminder(d, "t", "old"), "control: switching off removed the mount");
+  await voidedAtNextMessage(d, /switched off/);
+});
+
+await check("an agent whose operator removed every mount after its first pass is still told what it gains later", async () => {
+  const d = deployment({});
+  const rt = await existing(d, "t", "old");
+  await d.say("t", "old", "first");
+  must((await d.record("t", "old")).key !== null, "control: no pass ran");
+  for (const m of await rt.store.listMounts("t", "old")) await rt.store.removeMount("t", "old", m.alias, null);
+  must((await d.mountsOf("t", "old")).length === 0, "control: mounts left");
+  await endTurn(d, "t", "old");
+  d.redeploy(REMINDER_APP);
+  const from = said.length;
+  await d.say("t", "old", "later");
+  must(await hasReminder(d, "t", "old"), "control: reminder was not added");
+  must(reminderNotices(from).length === 1, `told: ${show(said.slice(from))}`);
 });
 
 // ---------------------------------------------------------------- the words

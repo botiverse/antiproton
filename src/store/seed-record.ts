@@ -16,7 +16,8 @@
  *
  * A third table, `seed_notices`, is what the agent is still to be told: one row per entry a pass added to an agent
  * that already had tools, written in the transaction that adds the mount, and stamped `delivered_at` when a turn's
- * message carries it (`takeSeedNotices`). The row is kept after that, so the record says when the agent was told.
+ * message carries it (`takeSeedNotices`), or `voided_at` with the reason when it can never be said truthfully
+ * (`voidSeedNotices`). The row is kept either way, so the record says when the agent was told, or why it was not.
  */
 import type { MountRecord } from "../core/types.ts";
 import { appendTrace } from "../trace/outbox.ts";
@@ -46,11 +47,12 @@ export interface SeedRecord {
 }
 
 /**
- * One added entry the agent is to be told about. `delivered_at` is null while it is pending, and the time a turn's
- * message carried it after that.
+ * One added entry the agent is to be told about. Pending while both `deliveredAt` and `voidedAt` are null; then either
+ * the time a turn's message carried it, or the time it was given up and why.
  */
 export interface SeedNoticeRow {
   alias: string; since: number; plugin: string; addedAt: number; deliveredAt: number | null;
+  voidedAt: number | null; voidReason: string | null;
 }
 
 /**
@@ -81,7 +83,7 @@ export const SEED_RECORD_SCHEMA = [
      PRIMARY KEY (tenant_id, agent_id, alias, since))`,
   `CREATE TABLE IF NOT EXISTS seed_notices (
      tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL, alias TEXT NOT NULL, since INTEGER NOT NULL,
-     plugin TEXT NOT NULL, added_at INTEGER NOT NULL, delivered_at INTEGER,
+     plugin TEXT NOT NULL, added_at INTEGER NOT NULL, delivered_at INTEGER, voided_at INTEGER, void_reason TEXT,
      PRIMARY KEY (tenant_id, agent_id, alias, since))`,
 ];
 
@@ -94,6 +96,8 @@ const outcomeRow = (r: any): SeedOutcomeRow => ({
 const noticeRow = (r: any): SeedNoticeRow => ({
   alias: String(r.alias), since: Number(r.since), plugin: String(r.plugin), addedAt: Number(r.added_at),
   deliveredAt: r.delivered_at === null || r.delivered_at === undefined ? null : Number(r.delivered_at),
+  voidedAt: r.voided_at === null || r.voided_at === undefined ? null : Number(r.voided_at),
+  voidReason: r.void_reason === null || r.void_reason === undefined ? null : String(r.void_reason),
 });
 
 export function readSeedRecord(sql: Sql, tenantId: string, agentId: string): SeedRecord {
@@ -103,7 +107,7 @@ export function readSeedRecord(sql: Sql, tenantId: string, agentId: string): See
     "SELECT alias, since, plugin, outcome, reason, at FROM seed_outcomes WHERE tenant_id=? AND agent_id=? ORDER BY since, alias",
     tenantId, agentId).toArray().map(outcomeRow);
   const notices = sql.exec(
-    "SELECT alias, since, plugin, added_at, delivered_at FROM seed_notices WHERE tenant_id=? AND agent_id=? ORDER BY since, alias",
+    "SELECT alias, since, plugin, added_at, delivered_at, voided_at, void_reason FROM seed_notices WHERE tenant_id=? AND agent_id=? ORDER BY since, alias",
     tenantId, agentId).toArray().map(noticeRow);
   return {
     key: s?.key ?? null, revision: s?.revision === null || s?.revision === undefined ? null : Number(s.revision),
@@ -114,7 +118,8 @@ export function readSeedRecord(sql: Sql, tenantId: string, agentId: string): See
 /** The notices still to be told, oldest entry first. A read: a turn that finds none pays this and nothing else. */
 export function pendingSeedNotices(sql: Sql, tenantId: string, agentId: string): SeedNoticeRow[] {
   return sql.exec(
-    "SELECT alias, since, plugin, added_at, delivered_at FROM seed_notices WHERE tenant_id=? AND agent_id=? AND delivered_at IS NULL ORDER BY since, alias",
+    "SELECT alias, since, plugin, added_at, delivered_at, voided_at, void_reason FROM seed_notices WHERE tenant_id=? AND agent_id=? " +
+      "AND delivered_at IS NULL AND voided_at IS NULL ORDER BY since, alias",
     tenantId, agentId).toArray().map(noticeRow);
 }
 
@@ -128,10 +133,23 @@ export function takeSeedNotices(
 ): SeedNoticeRow[] {
   const taken = pendingSeedNotices(sql, tenantId, agentId).filter((n) => which.has(`${n.alias}@${n.since}`));
   for (const n of taken) {
-    sql.exec("UPDATE seed_notices SET delivered_at=? WHERE tenant_id=? AND agent_id=? AND alias=? AND since=? AND delivered_at IS NULL",
+    sql.exec("UPDATE seed_notices SET delivered_at=? WHERE tenant_id=? AND agent_id=? AND alias=? AND since=? AND delivered_at IS NULL AND voided_at IS NULL",
       now, tenantId, agentId, n.alias, n.since);
   }
   return taken.map((n) => ({ ...n, deliveredAt: now }));
+}
+
+/**
+ * Give up pending notices that can never be said truthfully, each with its reason (the mount gone, its alias now
+ * another plugin's, the plugin switched off). Never undone: the next message must not pay to judge them again.
+ */
+export function voidSeedNotices(
+  sql: Sql, tenantId: string, agentId: string, rows: ReadonlyArray<{ alias: string; since: number; reason: string }>, now: number,
+) {
+  for (const r of rows) {
+    sql.exec("UPDATE seed_notices SET voided_at=?, void_reason=? WHERE tenant_id=? AND agent_id=? AND alias=? AND since=? AND delivered_at IS NULL AND voided_at IS NULL",
+      now, r.reason, tenantId, agentId, r.alias, r.since);
+  }
 }
 
 /** Put taken notices back to pending: the message that carried them was not written. */

@@ -411,6 +411,8 @@ export interface StorageAdapter {
    * call stamped: of two callers racing for the same notice, one gets it.
    */
   takeSeedNotices(tenantId: string, agentId: string, which: ReadonlySet<string>): Promise<SeedNoticeRow[]>;
+  /** Give up pending notices that can never be said truthfully, recording why; never undone. */
+  voidSeedNotices(tenantId: string, agentId: string, rows: ReadonlyArray<{ alias: string; since: number; reason: string }>): Promise<void>;
   /** Put taken notices back to pending, when the message that was to carry them was not written. */
   returnSeedNotices(tenantId: string, agentId: string, rows: readonly SeedNoticeRow[]): Promise<void>;
   /** `"inherit"` is stored as the absence of a row, not as a third value. */

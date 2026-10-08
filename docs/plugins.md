@@ -321,7 +321,10 @@ what the model was offered, never a guessed `alias__tool`), saying what the
 capability is and how to use it — never the deployment behind it; without one
 the line is the plugin's own tool descriptions. A notice waits while the
 harness taking the message does not offer the entry's tools (a steer into a
-turn that began before the mount). What a new agent's first pass mounts is
+turn that began before the mount). One that can never be true is voided,
+with its reason, and never judged again: its mount is gone, its alias now
+holds another plugin's mount (the line would name that plugin's tools in the
+harness's voice), or the plugin is switched off or no longer installed. What a new agent's first pass mounts is
 not announced: that pass (no record yet, no mounts) gives the agent its first
 tools, so there is nothing for them to be news against; an agent made before
 the record existed has its mounts, and is told what its first pass adds. The
