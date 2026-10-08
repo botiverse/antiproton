@@ -126,6 +126,15 @@ const changedWhileRemoving = (alias: string) =>
 export function consoleAdded(m: Pick<MountRecord, "installationId">): boolean {
   return m.installationId.startsWith(CONSOLE_INSTALLATION);
 }
+
+/**
+ * The installation id `provision` gives a seed's mount, and `/admin/mounts` an operator's: the one a catalogue
+ * row's reconcile (`uiEnsure`) may update. Anything else under the alias — a mount a person added from the
+ * console — has settings that are its owner's, not the catalogue's.
+ */
+export function seedInstallation(alias: string): string {
+  return `inst-${alias}`;
+}
 /**
  * How many mounts one agent may have added from the console. Each is a server
  * asked for its tools at add time and a block of tools in every prompt, and a
@@ -1859,7 +1868,7 @@ export class AgentRuntime {
       if (plugin) assertMountConfig(plugin, (m.config ?? { account: m.account }) as Record<string, Json>, m.secretRef ?? null);
       await this.store.addMount({
         tenantId, agentId, alias: m.alias, plugin: m.plugin,
-        installationId: `inst-${m.alias}`, connectionId: null,
+        installationId: seedInstallation(m.alias), connectionId: null,
         toolVersion: this.pluginVersion(m.plugin) ?? "1.0.0",
         publicConfig: m.config ?? { account: m.account }, secretRef: m.secretRef ?? null, policy: m.policy ?? null,
       });
@@ -1931,7 +1940,7 @@ export class AgentRuntime {
       tenantId, agentId, alias: seed.alias, plugin: plugin.id,
       // A console mount's id is new on every add, so a listing still in flight for a removed one
       // cannot be written onto its successor under the same alias (gateway `refreshMountTools`).
-      installationId: opts.console ? `${CONSOLE_INSTALLATION}${seed.alias}:${crypto.randomUUID()}` : `inst-${seed.alias}`, connectionId: null,
+      installationId: opts.console ? `${CONSOLE_INSTALLATION}${seed.alias}:${crypto.randomUUID()}` : seedInstallation(seed.alias), connectionId: null,
       toolVersion: this.pluginVersion(plugin.id) ?? "1.0.0",
       publicConfig: seed.config, secretRef: null, policy: null,
     });

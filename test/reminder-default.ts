@@ -123,6 +123,29 @@ await check("console open of an agent Raft made, reminder-app configured: no rem
   must(JSON.stringify(kept?.publicConfig) === JSON.stringify({ timeoutMs: 5_000 }), `the open rewrote its settings: ${JSON.stringify(kept?.publicConfig)}`);
 });
 
+await check("console open, reminder-app configured: a reminder mount the owner added from the console keeps its settings and policy", async () => {
+  const d = deployment(REMINDER_APP);
+  const rt = d.obj("t", "a3").runtime();
+  await rt.ready();
+  await rt.store.createAgent("t", "a3", { name: "Mine" });
+  const added = await rt.addMount("t", "a3", { alias: "reminder", plugin: "reminder", config: { timeoutMs: 5_000 } }, { console: true });
+  must(added.ok, `the console add was refused: ${JSON.stringify(added)}`);
+  const policy = { write: "approval" };
+  await rt.store.updateMountPolicy("t", "a3", "reminder", policy as never);
+  const before = await rt.store.getMountByAlias("t", "a3", "reminder");
+  must(before && before.installationId.startsWith("console:"), `control: not a console mount: ${JSON.stringify(before)}`);
+  await d.open("t", "a3");
+  // Control: a seed's own mount, drifted, is put back by the next open, so the reconcile did run.
+  await rt.store.updateMountConfig("t", "a3", "web", { account: "open web", maxBytes: 48_000 });
+  await d.open("t", "a3");
+  const after = await rt.store.getMountByAlias("t", "a3", "reminder");
+  must(after?.installationId === before.installationId, `the mount was replaced: ${JSON.stringify(after)}`);
+  must(JSON.stringify(after?.publicConfig) === JSON.stringify({ timeoutMs: 5_000 }), `the open rewrote its settings: ${JSON.stringify(after?.publicConfig)}`);
+  must(JSON.stringify(after?.policy) === JSON.stringify(policy), `the open rewrote its policy: ${JSON.stringify(after?.policy)}`);
+  const web = await rt.store.getMountByAlias("t", "a3", "web");
+  must((web?.publicConfig as { maxBytes?: number } | undefined)?.maxBytes === 24_000, `control: the seed's own mount was not reconciled: ${JSON.stringify(web?.publicConfig)}`);
+});
+
 globalThis.fetch = originalFetch;
 for (const h of hosts) h.dispose();
 for (const r of results) console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);

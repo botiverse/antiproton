@@ -36,7 +36,7 @@ import { secretRefKind } from "../../src/runtime/secrets.ts";
 import { DynamicWorkerExecutor, handleSandboxCall, handleSandboxSuspend, type SuspendRequest } from "../../src/runtime/dynamic-worker-executor.ts";
 import { executorSpec } from "../../test/spec/executor-spec.ts";
 import {
-  AgentRuntime, reconcileSeed, OPERATOR_RUN9_REF, isOperatorModelRef, parsePluginChoice, SEEDED_PLUGINS, installedRows, messageRefusal, consoleAdded, CONSOLE_MOUNTS_MAX, agentKind } from "./runtime.ts";
+  AgentRuntime, reconcileSeed, OPERATOR_RUN9_REF, isOperatorModelRef, parsePluginChoice, SEEDED_PLUGINS, installedRows, messageRefusal, consoleAdded, CONSOLE_MOUNTS_MAX, agentKind, seedInstallation } from "./runtime.ts";
 import { readMeter } from "../../bench/meter.ts";
 import { BENCH_SWE_WITHHELD } from "../../bench/swebench/withheld.ts";
 import { contextWindowFor } from "../../src/model/context-windows.ts";
@@ -1613,6 +1613,9 @@ export class AgentDO extends DurableObject<Env> {
       for (const d of seeds) {
         const have = await rt.store.getMountByAlias(tenantId, agentId, d.alias);
         if (!have) continue;
+        // Only the seed's own installation: a mount added from the console under the alias keeps the settings
+        // and policy its owner chose, and is not a refusal either, since it was never this seed's.
+        if (have.installationId !== seedInstallation(d.alias)) continue;
         const step = reconcileSeed(have, d, byId.get(d.plugin));
         if ("refused" in step) {
           console.warn(`reconcile refused for ${agentId}/${d.alias}: ${step.refused}`);
