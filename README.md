@@ -394,7 +394,7 @@ may leave the list unset, and then any public host is reachable.
   agent. The table is the whole of the admission rule: an account not on it
   is refused, and a deployment can instead run open sign-up, in which a
   first sign-in writes its own row and gets a new agent — seven seeded
-  mounts, an empty memory, and a **tenant of its own**, so one person's
+  mounts (eight where reminder-app is configured), an empty memory, and a **tenant of its own**, so one person's
   quota and storage are not another's.
 
 [appworld]: https://github.com/StonyBrookNLP/appworld

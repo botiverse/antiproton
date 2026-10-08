@@ -293,12 +293,12 @@ check("the mount list names each mount, its plugin and its credential state, and
  * it for exactly this reason and withdrew it, #492).
  *
  * So this one starts at the real registry and the real catalogue and ends at
- * the rendered string. **Both groups are asserted**, not just the seeded six:
- * a case that only checks "these six say default" stays green when the
- * catalogue widens to everything, because the six are still in it. The
+ * the rendered string. **Both groups are asserted**, not just the seeded ones:
+ * a case that only checks "these say default" stays green when the
+ * catalogue widens to everything, because they are still in it. The
  * opt-in rows are what notice that direction.
  */
-check("the real catalogue reaches the page: seven rows say default, four say opt-in", () => {
+check("the real catalogue reaches the page: eight rows say default, three say opt-in", () => {
   const rt = new AgentRuntime({
     ctx: { storage: {} } as any, bucket: {} as any, bucketName: "b",
     models: { resolve: () => null } as any,
@@ -308,9 +308,9 @@ check("the real catalogue reaches the page: seven rows say default, four say opt
 
   const seeded = rows.filter((r) => r.defaultForAllAgents).map((r) => r.id).sort();
   const optIn = rows.filter((r) => !r.defaultForAllAgents).map((r) => r.id).sort();
-  must(seeded.join() === "artifacts,exa,github,http,sandbox,state,tools",
+  must(seeded.join() === "artifacts,exa,github,http,reminder,sandbox,state,tools",
     `the seeded rows are ${seeded.join()}`);
-  must(optIn.join() === "demo,mcp,raft,reminder", `the opt-in rows are ${optIn.join()}`);
+  must(optIn.join() === "demo,mcp,raft", `the opt-in rows are ${optIn.join()}`);
 
   // And the words, read out of the rendered page rather than the payload.
   //

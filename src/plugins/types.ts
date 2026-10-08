@@ -1884,6 +1884,13 @@ export interface Plugin {
    */
   consoleMount?: true;
   /**
+   * Why this deployment cannot run the plugin at all, or null when it can: deployment-level configuration the
+   * plugin was built with and that no mount can supply (a service's origin, the deployment's client credential).
+   * No context, because the answer is the same for every agent. Asked by provisioning, which does not seed a
+   * mount whose every call would refuse (`AgentRuntime.provision`). Absent means always available.
+   */
+  unavailable?(): string | null;
+  /**
    * The plugin's own verdict on a mount's settings, for a rule `config` cannot
    * declare. A string is the reason the mount is refused, shown to whoever
    * asked; `undefined` accepts it.
