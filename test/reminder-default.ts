@@ -1,7 +1,7 @@
 /**
  * The `reminder` seed through the agent's own object (cf/src/index.ts `AgentDO`), on the two paths that run
  * `provision` there: the console's open (`uiEnsure`, which also reconciles the seeds) and Raft's adopt
- * (`provisionAdopt`). Who gets the seed is decided by its `when` (cf/src/runtime.ts `SeedMount`): every agent
+ * (`provisionAdopt`). Who gets the seed is decided by its `for` and its plugin's `unavailable` (cf/src/runtime.ts): every agent
  * on a deployment with reminder-app configured, except one Raft made. test/provision-runtime.ts holds the same
  * rule at the runtime; this file holds it where a person opening an agent actually reaches it.
  */
@@ -171,6 +171,24 @@ await check("console open: an agent whose `web` was renamed to `x` gets no new `
   await d.open("t", "a5");
   const http = (await d.mountsOf("t", "a5")).filter((m) => m.plugin === "http").map((m) => m.alias);
   must(http.join() === "x", `http mounts after the open: ${http.join(",")}`);
+});
+
+await check("an Agents API agent opened in the console gets no default mounts; a container session still gets the sandbox", async () => {
+  const d = deployment(REMINDER_APP);
+  const agentJson = JSON.stringify({ name: "Api", instructions: "be brief" });
+  // No container: the agent has what its caller declared, which is no mount at all.
+  await d.obj("t", "api_1").apiAdopt("t", "api_1", agentJson);
+  await d.open("t", "api_1");
+  await d.open("t", "api_1");
+  const none = (await d.mountsOf("t", "api_1")).map((m) => m.alias);
+  must(none.length === 0, `the console open seeded an API agent: ${none.join(",")}`);
+  // A session that asks for a container gets the sandbox, and a console open after it adds nothing more.
+  await d.obj("t", "api_2").apiPostInput("t", "api_2", agentJson, "s1", "hello", "container");
+  const hosted = (await d.mountsOf("t", "api_2")).map((m) => `${m.alias}:${m.plugin}`);
+  must(hosted.join() === "sandbox:sandbox", `a container session's mounts: ${hosted.join(",")}`);
+  await d.open("t", "api_2");
+  const after = (await d.mountsOf("t", "api_2")).map((m) => `${m.alias}:${m.plugin}`);
+  must(after.join() === "sandbox:sandbox", `the console open seeded a container API agent: ${after.join(",")}`);
 });
 
 globalThis.fetch = originalFetch;

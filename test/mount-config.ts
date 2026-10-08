@@ -694,6 +694,14 @@ await check("每个 agent 一开始就有记忆", () => {
   if (dupes.length) throw new Error(`the seed list repeats an alias: ${dupes.join(", ")}`);
 });
 
+await check("every catalogue row seeds a different plugin", () => {
+  // `provision` skips a row whose plugin the agent already holds under any alias, and counts what it adds as
+  // held: two rows of one plugin would mean the second is never seeded, on any agent, with nothing saying so.
+  const plugins = seeded.map((m) => m.plugin);
+  const dupes = plugins.filter((p, i) => plugins.indexOf(p) !== i);
+  if (dupes.length) throw new Error(`the catalogue seeds one plugin twice: ${dupes.join(", ")}`);
+});
+
 await check("陌生人注册进来,拿到的不是一套假的运维工具", () => {
   // `ops` (the demo plugin) was seeded until sign-up opened. Its tools are a
   // fake fleet — `deploy` says "Changes production" and restarts a server that

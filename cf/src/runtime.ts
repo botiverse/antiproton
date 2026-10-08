@@ -181,26 +181,32 @@ export interface SeedMount {
 }
 
 /**
- * What kind of agent this is, for a seed's `for`: "raft" when its record says Raft made it (`provisionedBy`),
- * else "console". The record is the fact because provisioning writes it, then seeds, then adds its own mount
- * (cf/src/provision/steps.ts), and every agent Raft made carries it. "api" names the Agents API's agents, which
- * are seeded from their own list (`apiAgentSeeds`) and never reach this question.
+ * What kind of agent this is, for a seed's `for`, read from its record: "raft" when Raft made it
+ * (`provisionedBy`), "api" when the Agents API did (the `openai` config its adopt writes, cf/src/index.ts
+ * `#apiPersona`, which the harness also reads), else "console". The record is the fact because both write it
+ * before anything is seeded (cf/src/provision/steps.ts; `#adopt` before `apiAgentSeeds`), and every agent either
+ * made carries it. An API agent still reaches the catalogue: a console open (`uiEnsure`) provisions every agent
+ * it opens, so the rows' `for` is what keeps the console's defaults off one.
  */
 export type AgentKind = "console" | "raft" | "api";
 export function agentKind(config: unknown): AgentKind {
-  return (config as { provisionedBy?: unknown } | null | undefined)?.provisionedBy === PROVISIONED_BY ? "raft" : "console";
+  const c = config as { provisionedBy?: unknown; openai?: unknown } | null | undefined;
+  if (c?.provisionedBy === PROVISIONED_BY) return "raft";
+  if (c?.openai !== undefined && c?.openai !== null) return "api";
+  return "console";
 }
 
 /** A row of the catalogue: a seed that says which agents it is for and when it was added. */
 export type CatalogueMount = SeedMount & { for: readonly AgentKind[]; since: number };
 
 /**
- * Whether `provision` adds this seed to this agent: it is for the agent's kind, and its plugin (when installed)
- * does not report the deployment unable to run it. Asked on every pass, not only at creation; like a
- * switched-off plugin, it governs only the adding (and `uiEnsure`'s reconcile), never a mount already there.
+ * Whether `provision` adds this seed to this agent: it is for the agent's kind (null: the caller's own list,
+ * where `for` is not asked), and its plugin (when installed) does not report the deployment unable to run it.
+ * Asked on every pass, not only at creation; like a switched-off plugin, it governs only the adding (and
+ * `uiEnsure`'s reconcile), never a mount already there.
  */
-export function seedApplies(seed: SeedMount, kind: AgentKind, plugin: Plugin | undefined): boolean {
-  if (seed.for && !seed.for.includes(kind)) return false;
+export function seedApplies(seed: SeedMount, kind: AgentKind | null, plugin: Plugin | undefined): boolean {
+  if (kind !== null && seed.for && !seed.for.includes(kind)) return false;
   return !plugin?.unavailable?.();
 }
 import { credentialForm, pluginEnabled, renameSafety, isExclusive, backgroundOf, interruptsOf, toolsOf } from "../../src/plugins/types.ts";
@@ -1808,7 +1814,6 @@ export class AgentRuntime {
     opts: { chosen?: boolean } = {},
   ) {
     await this.ready();
-    if (await this.store.loadTask(tenantId, `${agentId}:probe`)) return { agentId, created: false, seeds: mounts };
     // The record and the mounts are separate questions. An agent the console
     // created has a record (name, description) and no mounts yet; the old
     // guard read "record exists" as "already provisioned" and gave such an
@@ -1820,7 +1825,9 @@ export class AgentRuntime {
       await this.store.createAgent(tenantId, agentId, {});
       created = true;
     }
-    const kind = agentKind(record?.config);
+    // A caller's own list is its choice of mounts for this agent (a bench arm, the Agents API's container), so
+    // a row's `for` is not asked of it; whether the deployment can run the plugin still is.
+    const kind = opts.chosen === true ? null : agentKind(record?.config);
     const applies = mounts.filter((m) => seedApplies(m, kind, this.#plugins.find((p) => p.id === m.plugin)));
     // Asked before anything is added, because this runs on every console open
     // and not only at creation: without it, turning a plugin off would last
@@ -1845,7 +1852,7 @@ export class AgentRuntime {
     for (const m of mounts) {
       // The skip comes first on purpose: the assert below runs only for a
       // mount being added, so an open of an agent that already has its seeds
-      // costs one read per seed and no validation. Moving the assert above
+      // costs one list and one read per seed, and no validation. Moving the assert above
       // this line would run it on every open of every agent.
       if (await this.store.getMountByAlias(tenantId, agentId, m.alias)) continue;
       // Nor beside a mount of the same plugin under another alias: two identical tool sets under two aliases

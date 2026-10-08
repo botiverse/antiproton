@@ -1473,8 +1473,10 @@ export class AgentDO extends DurableObject<Env> {
       const made = await this.#adopt(rt, tenantId, agentId, JSON.parse(agentJson) as StoredAgent);
       await this.#openTask(rt, tenantId, agentId, sessionId);
       // Not the console's default mounts: an API agent has what its caller declared (agents-api/provisioning.ts).
+      // Said to be chosen: the rows are for console and Raft agents, and this list is the API path's own pick
+      // from them (the container a session asked for), so their `for` is not asked of it.
       const provides = (id: string) => rt.plugins().find((pl) => pl.id === id)?.provides;
-      await rt.provision(tenantId, agentId, apiAgentSeeds(AgentRuntime.DEFAULT_MOUNTS, environment, provides));
+      await rt.provision(tenantId, agentId, apiAgentSeeds(AgentRuntime.DEFAULT_MOUNTS, environment, provides), { chosen: true });
       await this.#bindModel(rt, tenantId, agentId);
       await rt.postMessage(tenantId, agentId, text, "prompt", sessionId);
       await this.#wake();
