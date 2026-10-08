@@ -146,6 +146,33 @@ await check("console open, reminder-app configured: a reminder mount the owner a
   must((web?.publicConfig as { maxBytes?: number } | undefined)?.maxBytes === 24_000, `control: the seed's own mount was not reconciled: ${JSON.stringify(web?.publicConfig)}`);
 });
 
+await check("console open, reminder-app configured: an agent with a reminder mount under another alias gets no second one as `reminder`", async () => {
+  const d = deployment(REMINDER_APP);
+  const rt = d.obj("t", "a4").runtime();
+  await rt.ready();
+  await rt.store.createAgent("t", "a4", { name: "Mine" });
+  const added = await rt.addMount("t", "a4", { alias: "remind", plugin: "reminder", config: { timeoutMs: 5_000 } }, { console: true });
+  must(added.ok, `the console add was refused: ${JSON.stringify(added)}`);
+  await d.open("t", "a4");
+  await d.open("t", "a4");
+  const reminders = (await d.mountsOf("t", "a4")).filter((m) => m.plugin === "reminder").map((m) => m.alias);
+  must(reminders.join() === "remind", `reminder mounts: ${reminders.join(",")}`);
+  // Control: the open did seed the rest.
+  must((await d.mountsOf("t", "a4")).some((m) => m.alias === "state"), "the open seeded nothing");
+});
+
+await check("console open: an agent whose `web` was renamed to `x` gets no new `web`", async () => {
+  const d = deployment({});
+  await d.open("t", "a5");
+  const rt = d.obj("t", "a5").runtime();
+  must((await d.mountsOf("t", "a5")).some((m) => m.alias === "web" && m.plugin === "http"), "control: no web seed to rename");
+  const renamed = await rt.renameMount("t", "a5", "web", "x");
+  must(renamed.ok, `the rename was refused: ${JSON.stringify(renamed)}`);
+  await d.open("t", "a5");
+  const http = (await d.mountsOf("t", "a5")).filter((m) => m.plugin === "http").map((m) => m.alias);
+  must(http.join() === "x", `http mounts after the open: ${http.join(",")}`);
+});
+
 globalThis.fetch = originalFetch;
 for (const h of hosts) h.dispose();
 for (const r of results) console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);

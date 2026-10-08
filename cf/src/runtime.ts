@@ -1840,12 +1840,20 @@ export class AgentRuntime {
     // Said, not inferred: array identity told a fresh copy of the defaults apart from the defaults,
     // which is not the question.
     const explicit = opts.chosen === true;
+    // The plugins this agent already has a mount of, under any alias: read once, and kept as seeds are added.
+    const held = new Set((await this.store.listMounts(tenantId, agentId)).map((x) => x.plugin));
     for (const m of mounts) {
       // The skip comes first on purpose: the assert below runs only for a
       // mount being added, so an open of an agent that already has its seeds
       // costs one read per seed and no validation. Moving the assert above
       // this line would run it on every open of every agent.
       if (await this.store.getMountByAlias(tenantId, agentId, m.alias)) continue;
+      // Nor beside a mount of the same plugin under another alias: two identical tool sets under two aliases
+      // confuse the model, and can create duplicates (a second reminder registration, a second hook). For the
+      // first rows it also keeps an operator's rename (`web` -> `x`) from re-adding a second http mount as `web`
+      // on the next open. The catalogue's rows only: an explicit list is the caller's own choice of mounts, and
+      // may name one plugin twice on purpose (two accounts).
+      if (!explicit && held.has(m.plugin)) continue;
       // Before the choice below is recorded: a seed that is not for this agent is not one it has chosen either.
       if (!applies.includes(m)) continue;
       // A seed the agent has turned off is not added. Only the adding is
@@ -1872,6 +1880,7 @@ export class AgentRuntime {
         toolVersion: this.pluginVersion(m.plugin) ?? "1.0.0",
         publicConfig: m.config ?? { account: m.account }, secretRef: m.secretRef ?? null, policy: m.policy ?? null,
       });
+      held.add(m.plugin);
     }
     // The seeds that apply to this agent, so a caller that reconciles them (`uiEnsure`) judges the same set.
     return { agentId, created, seeds: applies };

@@ -275,7 +275,11 @@ before any mount does: provisioning writes it, then seeds, then adds the
 
 `provision` skips a row whose `for` excludes the agent's kind, or whose
 plugin reports itself `unavailable` (below) — `seedApplies` in
-`cf/src/runtime.ts`. Like a switched-off plugin, this governs only the
+`cf/src/runtime.ts`. It also skips a row whose plugin the agent already has
+a mount of under any alias: two identical tool sets under two aliases confuse
+the model, and an operator's rename (`web` to `x`) would otherwise bring a
+second `web` back on the next open. That rule is for the catalogue's rows
+only; a caller's explicit list (`chosen: true`) may name a plugin twice. Like a switched-off plugin, this governs only the
 adding, and the console's reconcile (`uiEnsure`) touches only the rows
 `provision` says applied; a mount already there is left alone. Seeding is not
 creation-only — `provision` adds every missing row on each console open, task

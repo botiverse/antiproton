@@ -256,6 +256,22 @@ await check("an agent made before reminder was seeded gets it on its next provis
   host.dispose();
 });
 
+await check("an explicit seed list may name one plugin under two aliases; the catalogue's rows may not add a second", async () => {
+  const { rt, host } = await runtime();
+  // A caller's own list (a bench arm, a demo) is its choice of mounts: both are added.
+  await rt.provision("t", "two", [
+    { alias: "gh1", plugin: "github", config: { account: "one" }, secretRef: null, policy: null },
+    { alias: "gh2", plugin: "github", config: { account: "two" }, secretRef: null, policy: null },
+  ], { chosen: true });
+  const explicit = (await rt.store.listMounts("t", "two")).filter((m) => m.plugin === "github").map((m) => m.alias).sort();
+  must(explicit.join() === "gh1,gh2", `an explicit list lost a mount: ${explicit.join(",")}`);
+  // The catalogue then adds no `gh` beside them.
+  await rt.provision("t", "two");
+  const after = (await rt.store.listMounts("t", "two")).filter((m) => m.plugin === "github").map((m) => m.alias).sort();
+  must(after.join() === "gh1,gh2", `the catalogue added a second github mount: ${after.join(",")}`);
+  host.dispose();
+});
+
 globalThis.fetch = originalFetch;
 console.log(`\n  provision runtime steps\n  ${"─".repeat(56)}`);
 await check("a held connection becomes the GitHub mount's credential once, only for the user it was held for, and only before it expires", async () => {
