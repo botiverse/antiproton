@@ -9,6 +9,7 @@ import type {
 } from "../core/types.ts";
 import { appendTrace, type TraceRow } from "../trace/outbox.ts";
 import { approvalRow, operationEnded, toolCallRow } from "../trace/seams.ts";
+import { applySeedPass, markSeedsChosen, readSeedRecord, SEED_RECORD_SCHEMA, type SeedPlan } from "./seed-record.ts";
 
 /**
  * Durable Object SQLite backend. Same schema and same guards as the sqlite
@@ -126,6 +127,7 @@ export class DurableObjectStore implements StorageAdapter {
 
   async init() {
     for (const stmt of SCHEMA) this.#sql.exec(stmt);
+    for (const stmt of SEED_RECORD_SCHEMA) this.#sql.exec(stmt);
     this.pluginDb.ensure();
     // Columns added after a table already exists are invisible to
     // CREATE TABLE IF NOT EXISTS; each ALTER is idempotent by trial.
@@ -777,6 +779,18 @@ export class DurableObjectStore implements StorageAdapter {
     for (const r of this.#all("SELECT plugin, state FROM agent_plugins WHERE tenant_id=? AND agent_id=?",
       tenantId, agentId)) out[r.plugin] = r.state as PluginChoice;
     return out;
+  }
+
+  async seedRecord(tenantId: string, agentId: string) {
+    return readSeedRecord(this.#sql, tenantId, agentId);
+  }
+
+  async markSeedsChosen(tenantId: string, agentId: string) {
+    markSeedsChosen(this.#sql, tenantId, agentId, this.#now());
+  }
+
+  async reconcileSeeds(tenantId: string, agentId: string, pass: { key: string; revision: number; plan: readonly SeedPlan[] }) {
+    return this.#tx(() => applySeedPass(this.#sql, tenantId, agentId, pass, this.#now()));
   }
 
   async setPluginChoice(tenantId: string, agentId: string, plugin: string, choice: PluginChoice) {

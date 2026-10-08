@@ -46,7 +46,9 @@ const TABLE = "CREATE TABLE IF NOT EXISTS trace_outbox(" +
   "ms INTEGER, " +
   "attrs TEXT NOT NULL)";
 
-export const TRACE_KINDS = ["model.call", "tool.call", "approval.wait", "container.lease", "inbound"] as const;
+// `mount.seeded` is one catalogue entry's outcome on one agent (src/store/seed-record.ts): written when the outcome
+// changes, in the transaction that adds the mount when there is one. Activity and status skip it (their `default`).
+export const TRACE_KINDS = ["model.call", "tool.call", "approval.wait", "container.lease", "inbound", "mount.seeded"] as const;
 export type TraceKind = (typeof TRACE_KINDS)[number];
 
 export const TRACE_VERDICTS = ["ok", "failed", "blocked", "cancelled"] as const;

@@ -146,6 +146,10 @@ async function world(opts: { raftMade?: boolean } = {}) {
     await rt.store.updateAgentConfig(T, A, { ...(agent?.config as object), provisionedBy: "raft" } as never);
   }
   await rt.store.setPluginChoice(T, A, "pushy", "enable");
+  // The agent has exactly the mounts this file gives it: without the mark, the first post's catalogue reconcile
+  // would add the defaults and rebuild the harness, dropping an engine a case has wrapped (test/capability-reconcile.ts
+  // holds the reconcile itself).
+  await rt.store.markSeedsChosen(T, A);
   await rt.store.addMount({ tenantId: T, agentId: A, alias: "p", plugin: "pushy", installationId: "i", connectionId: null,
     toolVersion: "1.0.0", publicConfig: {}, secretRef: null, policy: null });
   const made = await (await worker.fetch(new Request("https://x/admin/hooks", {

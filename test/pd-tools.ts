@@ -48,6 +48,8 @@ async function firstRequest(engine: "pi085" | "pd") {
     } as never);
     await rt.ready();
     await rt.store.createAgent("t", "a");
+    // Exactly the `notes` mount: the post's catalogue reconcile would otherwise add the defaults after `agent` was taken.
+    await rt.store.markSeedsChosen("t", "a");
     await rt.store.setPluginChoice("t", "a", "kv", "enable");
     const added = await rt.addMount("t", "a", { alias: "notes", plugin: "kv", config: {} });
     check(added.ok, `${engine}: the mount was refused: ${show(added)}`);

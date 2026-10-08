@@ -272,7 +272,7 @@ plugin's `create` refuses there. No row is for `"api"`: an API agent opened
 in the console is provisioned like any other, and gets nothing from the
 catalogue. Its container comes from the Agents API's own pick of the rows
 (`apiAgentSeeds`), passed as an explicit list, where `for` is not asked.
-`since` is declared only; nothing reads it yet. The record is the fact
+The record is the fact
 because it exists before any mount does: Raft provisioning writes it, then
 seeds, then adds the `raft` mount (`cf/src/provision/steps.ts`), and the
 Agents API adopts before it seeds.
@@ -282,18 +282,39 @@ applies to it: `addMount` refuses another plugin under it, so no mount from
 the console or `/admin/mounts` can be called `reminder` unless it is a
 `reminder` mount, even on a Raft agent or a deployment without reminder-app.
 
-`provision` skips a row whose `for` excludes the agent's kind, or whose
-plugin reports itself `unavailable` (below) — `seedApplies` in
-`cf/src/runtime.ts`. It also skips a row whose plugin the agent already has
-a mount of under any alias: two identical tool sets under two aliases confuse
-the model, and an operator's rename (`web` to `x`) would otherwise bring a
-second `web` back on the next open. That rule is for the catalogue's rows
-only; a caller's explicit list (`chosen: true`) may name a plugin twice.
-Like a switched-off plugin, this governs only the adding, and the console's reconcile (`uiEnsure`) touches only the rows
-`provision` says applied; a mount already there is left alone. Seeding is not
-creation-only — `provision` adds every missing row on each console open, task
-start, and Raft agent's push wake — so a new row reaches existing agents the
-next time one of those runs, and its `for` holds on every pass.
+Each agent is reconciled with the catalogue where a turn starts — every
+message goes through `postMessage`: a prompt, a console steer or follow-up, a
+hook or Raft push, a background job's completion, a lease warning — and where
+`provision` makes an agent or the console opens one (`reconcileSeeds` in
+`cf/src/runtime.ts`). Not when an agent is only read: status, transcripts and
+`/admin/diagnose` change nothing. A pass judges each row: `not-for` when its
+`for` excludes the agent's kind, `unavailable` when its plugin says so
+(below), `declined` when the agent has switched the plugin off, `refused`
+when its settings do not validate or another plugin holds its alias,
+`present` when the agent already has it — under its alias, or under any
+alias, since two identical tool sets confuse the model and an operator's
+rename (`web` to `x`) would otherwise bring a second `web` back — and
+otherwise `added`. `present` is asked first, before `not-for`, `unavailable`
+and `declined`, so a mount the agent had while its plugin was switched off is
+not brought back after an operator removes it. The outcomes are kept per agent, one row per entry (alias
+and `since`), beside the key the pass was judged from: the catalogue and its
+revision (the highest `since`), the agent's kind, its plugin choices, and
+which plugins are unavailable (`src/store/seed-record.ts`). A pass whose key
+is unchanged reads and does nothing; when it moves, only the entries the agent
+never had are judged again — `declined`, `unavailable`, `refused`, or a new
+row — so the owner switching a plugin on or the deployment gaining the
+configuration adds it. An entry once `added` or `present` is never added
+again, even after its alias is freed: an operator's removal stays removed.
+Each changed outcome is a `mount.seeded` trace row, written in
+the transaction that adds the mount. An Agents API agent is never reconciled,
+nor one provisioned with an explicit list (`chosen: true`: a bench arm, the
+Agents API's container), which `provision` marks so, nor any agent under the
+bench tenant (`BENCH_TENANT`), which also covers bench agents made before the
+mark existed; a caller's list may name a plugin twice. No path provisions a
+demo agent today: an agent carrying the `ops` mount the seed list gave every
+agent before #213 is a console agent and is reconciled as one, and the
+console's default tenant `demo` names no demo. A mount already there is left alone, and the console's
+settings reconcile (`uiEnsure`) touches only the rows that apply to the agent.
 
 **Declare `provides` for what the plugin can give a session.** Today the one
 value is `"container"`. The agents API picks a plugin to seed by asking what
