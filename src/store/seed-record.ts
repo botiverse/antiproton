@@ -10,9 +10,9 @@
  * API's pick), so it is never reconciled. `seed_outcomes` is one row per catalogue entry (alias and `since`) the
  * agent has been reconciled against.
  *
- * The rule that is only here: an entry whose outcome is `added` is never added again, whatever the key says and
- * whether or not its alias has been freed since (a rename, a removal). Everything else is re-judged whenever the
- * key moves, which is what makes `declined` and `unavailable` not terminal.
+ * The rule that is only here: an entry whose outcome is `added` or `present` is never added again, whatever the key
+ * says and whether or not its alias has been freed since (a rename, a removal). `declined`, `unavailable` and
+ * `refused` are re-judged whenever the key moves, which is what makes them not terminal.
  */
 import type { MountRecord } from "../core/types.ts";
 import { appendTrace } from "../trace/outbox.ts";
@@ -114,9 +114,12 @@ export function applySeedPass(
   const added: SeedOutcomeRow[] = [];
   for (const p of pass.plan) {
     const before = prior.get(`${p.alias}@${p.since}`);
-    // Never twice: the alias may have been freed since (a rename, a removal), and adding it back would hand the
-    // agent a second copy of a plugin it already has under another name, or undo an operator's removal.
-    if (before?.outcome === "added") continue;
+    // Settled once the agent has had it, whether this added it or found it there: the alias may have been freed
+    // since (a rename, a removal), and adding it back would hand the agent a second copy of a plugin it already has
+    // under another name, or undo an operator's removal the next time an unrelated plugin choice or the deployment's
+    // configuration moved the key. Only an entry the agent never had (declined, unavailable, refused, or no outcome
+    // yet: a new catalogue row) is judged again.
+    if (before?.outcome === "added" || before?.outcome === "present") continue;
     let outcome: SeedOutcome;
     let reason: string | null = null;
     if ("withheld" in p) {

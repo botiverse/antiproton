@@ -197,6 +197,9 @@ export function agentKind(config: unknown): AgentKind {
   return "console";
 }
 
+/** The tenant every benchmark agent lives under (the bench paths in cf/src/index.ts); never reconciled (`reconcileSeeds`). */
+export const BENCH_TENANT = "bench";
+
 /** A row of the catalogue: a seed that says which agents it is for and when it was added. */
 export type CatalogueMount = SeedMount & { for: readonly AgentKind[]; since: number };
 
@@ -1922,7 +1925,7 @@ export class AgentRuntime {
    * (`catalogueKey`) moved is rebuilt unless a turn is running, so what is added here is offered in this same turn.
    *
    * Never an Agents API agent (its kind), nor one whose mounts a caller chose (a bench arm; `provision` with
-   * `chosen` marks it). An agent with no record is not made here; `provision` makes agents.
+   * `chosen` marks it), nor any agent under the bench tenant, marked or not. An agent with no record is not made here; `provision` makes agents.
    *
    * An unchanged key is three reads (the record, the plugin choices, the agent's catalogue row) and no write. A
    * changed one is a single store transaction, so two turn starts racing add each mount once.
@@ -1931,7 +1934,13 @@ export class AgentRuntime {
    */
   async reconcileSeeds(
     tenantId: string, agentId: string, catalogue: readonly SeedMount[] = AgentRuntime.DEFAULT_MOUNTS,
-  ): Promise<SeedPassResult | { ran: false; why: "no agent" | "api" }> {
+  ): Promise<SeedPassResult | { ran: false; why: "no agent" | "api" | "bench" }> {
+    // Asked before anything is read. A bench agent is marked `chosen` when `provision` makes it, but the mark is
+    // only as old as this rule: a bench agent made before it has none, reads as a console agent (its record is
+    // `{}`), and its first post would mount the catalogue into an arm that measures exactly the tools it chose. The
+    // tenant is the fact every bench agent carries whenever it was made: only the bench paths in cf/src/index.ts
+    // use it, and no viewer's tenant can be it (`demo`, `t-github_…`).
+    if (tenantId === BENCH_TENANT) return { ran: false, why: "bench" };
     await this.ready();
     const record = await this.store.loadAgent(tenantId, agentId);
     if (!record) return { ran: false, why: "no agent" };

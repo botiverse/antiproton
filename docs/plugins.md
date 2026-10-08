@@ -298,14 +298,20 @@ otherwise `added`. The outcomes are kept per agent, one row per entry (alias
 and `since`), beside the key the pass was judged from: the catalogue and its
 revision (the highest `since`), the agent's kind, its plugin choices, and
 which plugins are unavailable (`src/store/seed-record.ts`). A pass whose key
-is unchanged reads and does nothing, so `declined` and `unavailable` are
-re-judged when the owner switches the plugin on or the deployment gains the
-configuration. An entry once `added` is never added again, even after its
-alias is freed. Each changed outcome is a `mount.seeded` trace row, written in
+is unchanged reads and does nothing; when it moves, only the entries the agent
+never had are judged again — `declined`, `unavailable`, `refused`, or a new
+row — so the owner switching a plugin on or the deployment gaining the
+configuration adds it. An entry once `added` or `present` is never added
+again, even after its alias is freed: an operator's removal stays removed.
+Each changed outcome is a `mount.seeded` trace row, written in
 the transaction that adds the mount. An Agents API agent is never reconciled,
 nor one provisioned with an explicit list (`chosen: true`: a bench arm, the
-Agents API's container), which `provision` marks so; a caller's list may name
-a plugin twice. A mount already there is left alone, and the console's
+Agents API's container), which `provision` marks so, nor any agent under the
+bench tenant (`BENCH_TENANT`), which also covers bench agents made before the
+mark existed; a caller's list may name a plugin twice. No path provisions a
+demo agent today: an agent carrying the `ops` mount the seed list gave every
+agent before #213 is a console agent and is reconciled as one, and the
+console's default tenant `demo` names no demo. A mount already there is left alone, and the console's
 settings reconcile (`uiEnsure`) touches only the rows that apply to the agent.
 
 **Declare `provides` for what the plugin can give a session.** Today the one

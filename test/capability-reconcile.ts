@@ -247,20 +247,38 @@ await check("an entry added once is never added again: not after a rename, not a
   must(await hasReminder(d, "t", "old"), "control: reminder was not added");
   const renamed = await rt.renameMount("t", "old", "reminder", "rem");
   must(renamed.ok, `rename: ${show(renamed)}`);
-  // Moves the key, so the next pass judges every entry again.
+  // Moves the key, so the next pass runs.
+  const k1 = (await d.record("t", "old")).key;
   await rt.store.setPluginChoice("t", "old", "github", "disable");
   await d.say("t", "old", "after the rename");
-  must((await d.record("t", "old")).outcomes.find((o: any) => o.alias === "gh")?.outcome === "declined", "control: the key did not move, so no pass ran");
+  must((await d.record("t", "old")).key !== k1, "control: the key did not move, so no pass ran");
   const afterRename = (await d.mountsOf("t", "old")).filter((m) => m.plugin === "reminder").map((m) => m.alias);
   must(afterRename.join() === "rem", `after the rename: ${afterRename.join(",")}`);
   // Removed outright, as an operator would: the alias and the plugin are both free now.
   must(await rt.store.removeMount("t", "old", "rem", null), "control: the removal did nothing");
+  const k2 = (await d.record("t", "old")).key;
   await rt.store.setPluginChoice("t", "old", "github", "inherit");
   await d.say("t", "old", "after the removal");
-  must((await d.record("t", "old")).outcomes.find((o: any) => o.alias === "gh")?.outcome === "present", "control: the key did not move, so no pass ran");
+  must((await d.record("t", "old")).key !== k2, "control: the key did not move, so no pass ran");
   const afterRemoval = (await d.mountsOf("t", "old")).filter((m) => m.plugin === "reminder").map((m) => m.alias);
   must(afterRemoval.length === 0, `after the removal: ${afterRemoval.join(",")}`);
   must((await d.outcome("t", "old", "reminder"))?.outcome === "added", "the record forgot it was added");
+});
+
+await check("an entry found present is never added again: its mount removed, then the key moved by another plugin's choice", async () => {
+  const d = deployment(REMINDER_APP);
+  const rt = await existing(d, "t", "old");
+  await d.say("t", "old", "first");
+  must((await d.outcome("t", "old", "state"))?.outcome === "present", `control: state was not present: ${show(await d.outcome("t", "old", "state"))}`);
+  // Removed as an operator would: the alias and the plugin are both free.
+  must(await rt.store.removeMount("t", "old", "state", null), "control: the removal did nothing");
+  const k = (await d.record("t", "old")).key;
+  await rt.store.setPluginChoice("t", "old", "github", "disable");
+  await d.say("t", "old", "after the removal");
+  must((await d.record("t", "old")).key !== k, "control: the key did not move, so no pass ran");
+  const state = (await d.mountsOf("t", "old")).filter((m) => m.plugin === "state").map((m) => m.alias);
+  must(state.length === 0, `state came back: ${state.join(",")}`);
+  must((await d.outcome("t", "old", "state"))?.outcome === "present", `the record moved: ${show(await d.outcome("t", "old", "state"))}`);
 });
 
 // ---------------------------------------------------------------- concurrency
@@ -323,6 +341,42 @@ await check("a bench agent (an explicit list) is never reconciled: not by a mess
   must(rec.chosen && rec.key === null && rec.outcomes.length === 0 && d.seededRows("bench", "b_1").length === 0, `record: ${show(rec)}`);
 });
 
+await check("a bench agent made before the chosen mark existed (bench tenant, no mark) is never reconciled, by any entry", async () => {
+  const d = deployment(REMINDER_APP);
+  const o = d.obj("bench", "b_old");
+  const rt = o.runtime();
+  await rt.ready();
+  // What a bench task left behind before this change: the record `provision` wrote ({}), its own list, no mark.
+  await rt.store.createAgent("bench", "b_old", {});
+  for (const [alias, plugin] of [["tools", "tools"], ["retail", "retail"]]) {
+    await rt.store.addMount({ tenantId: "bench", agentId: "b_old", alias, plugin, installationId: seedInstallation(alias), connectionId: null,
+      toolVersion: "1.0.0", publicConfig: { account: "x" }, secretRef: null, policy: null });
+  }
+  await rt.bindOperatorModel("bench", "b_old");
+  o.sql.exec("CREATE TABLE IF NOT EXISTS owner(k TEXT PRIMARY KEY, tenant_id TEXT, agent_id TEXT)");
+  o.sql.exec("INSERT OR REPLACE INTO owner(k, tenant_id, agent_id) VALUES ('self','bench','b_old')");
+  must(!(await d.record("bench", "b_old")).chosen, "control: the agent was marked");
+  await rt.postMessage("bench", "b_old", "a bench turn");
+  must(await transcriptHas(d, "bench", "b_old", "a bench turn"), "control: the bench message did not land");
+  await pushWake(d, "bench", "b_old");
+  await backgroundWake(d, "bench", "b_old");
+  await d.say("bench", "b_old", "via the console");
+  await o.startTask("bench", "b_old", "t_b_old", "via startTask");
+  await d.open("bench", "b_old");
+  const got = (await d.mountsOf("bench", "b_old")).map((m) => m.alias).sort().join();
+  must(got === "retail,tools", `mounts: ${got}`);
+  const rec = await d.record("bench", "b_old");
+  must(rec.key === null && rec.outcomes.length === 0 && d.seededRows("bench", "b_old").length === 0, `record: ${show(rec)}`);
+  // Control: the same agent under a console tenant is reconciled, so it is the tenant that keeps it out.
+  const c = deployment(REMINDER_APP);
+  const crt = c.obj("t", "b_old").runtime();
+  await crt.ready();
+  await crt.store.createAgent("t", "b_old", {});
+  await crt.bindOperatorModel("t", "b_old");
+  await crt.postMessage("t", "b_old", "a turn");
+  must(await hasReminder(c, "t", "b_old"), "control: an unmarked console-tenant agent was not reconciled");
+});
+
 await check("a tau² bench task through its own entry points (benchStart, benchSay) is never reconciled", async () => {
   const d = deployment(REMINDER_APP);
   const o = d.obj("bench", "bench-object");
@@ -333,7 +387,7 @@ await check("a tau² bench task through its own entry points (benchStart, benchS
   must((await o.runtime().store.seedRecord("bench", "b_task1")).chosen, "the bench agent was not marked");
 });
 
-await check("a demo agent (an explicit list, any tenant) is never reconciled, by any entry", async () => {
+await check("an agent provisioned with an explicit list outside the bench tenant is never reconciled, by any entry", async () => {
   const d = deployment(REMINDER_APP);
   const o = d.obj("t", "demo");
   const rt = o.runtime();
@@ -347,6 +401,17 @@ await check("a demo agent (an explicit list, any tenant) is never reconciled, by
   const got = (await d.mountsOf("t", "demo")).map((m) => m.alias).join();
   must(got === "ops", `mounts: ${got}`);
   must(d.seededRows("t", "demo").length === 0, "a demo agent has mount.seeded rows");
+});
+
+await check("an ordinary console agent under the console's default tenant `demo` is reconciled: that tenant names no demo", async () => {
+  const d = deployment(REMINDER_APP);
+  // An agent made before #213 still carries the `ops` mount the seed list gave everyone: no mark of a demo either.
+  const rt = await existing(d, "demo", "u-qa_console");
+  await rt.store.addMount({ tenantId: "demo", agentId: "u-qa_console", alias: "ops", plugin: "demo", installationId: seedInstallation("ops"),
+    connectionId: null, toolVersion: "1.0.0", publicConfig: { account: "demo-fleet" }, secretRef: null, policy: null });
+  await d.say("demo", "u-qa_console", "hello");
+  must(await hasReminder(d, "demo", "u-qa_console"), `mounts: ${(await d.mountsOf("demo", "u-qa_console")).map((m) => m.alias)}`);
+  must((await d.outcome("demo", "u-qa_console", "reminder"))?.outcome === "added", "not recorded as added");
 });
 
 await check("an Agents API agent is never reconciled: not by apiPostInput, a console open, a steer, startTask or a push", async () => {
