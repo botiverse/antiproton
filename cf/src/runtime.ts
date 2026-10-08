@@ -179,6 +179,15 @@ export interface SeedMount {
   /** The catalogue revision that added this entry; with the alias, the entry's identity in an agent's record
    *  (src/store/seed-record.ts). Absent reads as 1. */
   since?: number;
+  /**
+   * What an agent that gains this entry after it was made is told, once, at the head of its next turn's message
+   * (`capabilityNotice`): what the capability is and how to use it. Written for the model, so it names tools only
+   * through `tool`, which answers the name this agent's model was offered (`offeredToolName`) or null when it was
+   * not offered, and says nothing about the deployment behind the capability (origins, credentials, services).
+   * Null: nothing to say with what is offered, and the notice waits. Absent: derived from the plugin's own tool
+   * descriptions.
+   */
+  notice?: (tool: (name: string) => string | null) => string | null;
 }
 
 /**
@@ -195,6 +204,30 @@ export function agentKind(config: unknown): AgentKind {
   if (c?.provisionedBy === PROVISIONED_BY) return "raft";
   if (c?.openai !== undefined && c?.openai !== null) return "api";
   return "console";
+}
+
+/** How a message the harness writes into the conversation says whose it is (src/runtime/idle-lease.ts `warningText`). */
+export const HARNESS_NOTICE = "[a notice from the harness, not a message from the user] ";
+
+/**
+ * The line telling an agent it now has one catalogue entry, or null when there is nothing to tell with the tools
+ * `offered`: none of the entry's tools is in the list, which is the case while a running turn's harness predates the
+ * mount (it is rebuilt for the next turn, `reuseHarness`). One line, so each capability is one notice.
+ *
+ * `offered` is the list the model is offered, and every tool name in the line is read from it (`offeredToolName`):
+ * qualification sanitises an alias and breaks ties, so a name built from `${alias}__${tool}` can be another mount's.
+ * Without the row's own `notice`, the line is the plugin's own description of each tool it offers, first sentence.
+ */
+export function capabilityNotice(
+  entry: { alias: string; notice?: SeedMount["notice"] }, offered: readonly MountedTool[],
+): string | null {
+  const own = offered.filter((t) => t.address.startsWith(`${entry.alias}.`));
+  if (!own.length) return null;
+  const said = entry.notice
+    ? entry.notice((tool) => offeredToolName(offered, entry.alias, tool))
+    : `You now have a \`${entry.alias}\` mount: ` +
+      own.map((t) => `\`${t.name}\` (${(t.description.split(/(?<=[.!?])\s/)[0] ?? "").trim().replace(/[.!?]$/, "")})`).join("; ") + ".";
+  return said ? HARNESS_NOTICE + said.replace(/\s*\n\s*/g, " ") : null;
 }
 
 /** The tenant every benchmark agent lives under (the bench paths in cf/src/index.ts); never reconciled (`reconcileSeeds`). */
@@ -1799,7 +1832,18 @@ export class AgentRuntime {
     // Nor seeded on a deployment without REMINDER_APP_ORIGIN and REMINDER_APP_CREDENTIAL: the plugin reports
     // itself `unavailable` there, since every call would refuse.
     { alias: "reminder", plugin: "reminder", config: { account: "reminder-app" },
-      secretRef: null, policy: null, for: ["console"], since: 2 },
+      secretRef: null, policy: null, for: ["console"], since: 2,
+      // The tool names are the plugin's own (src/plugins/reminder.ts `TOOLS`); `tool` answers what they were offered as.
+      notice: (tool) => {
+        const create = tool("create");
+        if (!create) return null;
+        const list = tool("list"), remove = tool("delete");
+        const rest = [list && `\`${list}\` lists the ones that have not fired yet`, remove && `\`${remove}\` cancels one by its id`]
+          .filter(Boolean).join(", and ");
+        return `You can now set reminders. \`${create}\` sets one for a later time, as an absolute time or minutes from ` +
+          `now, with a note you write for yourself; when it is due, a message carrying the note wakes you in this ` +
+          `conversation, even if nothing else would have.` + (rest ? ` ${rest}.` : "");
+      } },
 
   ];
 
@@ -1930,7 +1974,8 @@ export class AgentRuntime {
    * An unchanged key is three reads (the record, the plugin choices, the agent's catalogue row) and no write. A
    * changed one is a single store transaction, so two turn starts racing add each mount once.
    *
-   * `added` is what this pass mounted: what the agent should be told it now has.
+   * `added` is what this pass mounted; `noticed`, those of them the agent is to be told about at the head of its next
+   * message (`#takeNotices`), which is all of them unless the pass gave the agent its first tools.
    */
   async reconcileSeeds(
     tenantId: string, agentId: string, catalogue: readonly SeedMount[] = AgentRuntime.DEFAULT_MOUNTS,
@@ -2801,7 +2846,7 @@ export class AgentRuntime {
     // completions and lease warnings are prompts — so the catalogue is reconciled here, before the harness is
     // opened below, and what it adds is offered in this turn (`reconcileSeeds`). A failure is logged and never
     // fails the message: the next turn tries again, since nothing was stored.
-    // The pass's `added` rows are the seam for telling the agent, in this turn, what it now has.
+    // What this pass, or one before it (a console open), added is told at the head of this message: `#takeNotices`.
     await this.reconcileSeeds(tenantId, agentId)
       .catch((e) => console.error(`reconciling ${tenantId}/${agentId} with the catalogue failed:`, e));
     // A new turn, so a tool list taken under another basis is taken again first (`retakeStaleSnapshots`), before the
@@ -2825,11 +2870,76 @@ export class AgentRuntime {
     // otherwise, so the next wake steps it. pd keeps no such list: its harness
     // holds the input, and a step drives every conversation (`step` below).
     if (!this.#isPd()) markSession(this.#deps.ctx.storage.sql, session, true);
+    // Not a follow-up: on an idle pi085 lane one is queued and starts no run (`PiAgent.say`; measured 2026-10-08, the
+    // text was in no transcript after the post and after an alarm), so a notice it carried could wait unread behind
+    // a run that never comes, while the next prompt or steer, which does reach the model, would no longer carry it.
+    const told = mode === "followUp" ? null : await this.#takeNotices(tenantId, agentId, agent);
     // Synchronously before the engine's write, with the harness already open: what a caller retires here
     // (`deliverPendingInbound`'s queued row) is gone exactly when the message is about to be written.
     opts.beforeSay?.();
-    const res: any = await agent.say(text, mode);
+    let res: any;
+    try {
+      res = await agent.say(told ? `${told.lines.join("\n")}\n\n${text}` : text, mode);
+    } catch (e) {
+      // A post that throws wrote nothing (the rule `deliverPendingInbound` retries by), so the notices were not said.
+      if (told) await this.store.returnSeedNotices(tenantId, agentId, told.rows).catch(() => {});
+      throw e;
+    }
+    if (told && res?.ok === false) await this.store.returnSeedNotices(tenantId, agentId, told.rows).catch(() => {});
     return { ...messageLanded(res, mode), result: res };
+  }
+
+  /**
+   * The notices this message carries: one line per capability a catalogue pass added to the agent after it was made
+   * (src/store/seed-record.ts `seed_notices`), each taken — stamped delivered — as the message is about to be written,
+   * in one store transaction, so two messages racing tell it once between them. Null, and nothing written, when none
+   * is pending, which is one read.
+   *
+   * At the head of a message rather than in a turn of its own, which would cost a model call to say nothing anyone
+   * asked about, and not in the system prompt, which holds only what is true for the whole session (src/runtime/held.ts).
+   * A prompt or a steer: each reaches the model as a user message, at once or at the run's next boundary (a follow-up
+   * does not always, `postMessage`). What qualifies a notice is the harness taking the message: one built before the mount was
+   * added (a steer into a turn already running) does not offer its tools, so naming them would send the model to a
+   * tool it cannot call; that notice waits for a message whose harness does.
+   *
+   * Said only of the plugin that was added. The line names tools by alias, so a notice whose alias now holds another
+   * plugin's mount (the entry removed, then something else mounted under its name) would point the model at that
+   * plugin's tools in the harness's own voice — and, without a row `notice`, put that plugin's own descriptions there.
+   * Such a notice is voided, as is one whose mount is gone or whose plugin is switched off or no longer installed:
+   * none of them can become true by waiting, and voiding is what keeps every later message from judging it again.
+   */
+  async #takeNotices(tenantId: string, agentId: string, agent: AgentEngine) {
+    let pending = await this.store.pendingSeedNotices(tenantId, agentId);
+    if (!pending.length) return null;
+    const choices = await this.store.pluginChoices(tenantId, agentId);
+    const dead: Array<{ alias: string; since: number; reason: string }> = [];
+    for (const n of pending) {
+      const mount = await this.store.getMountByAlias(tenantId, agentId, n.alias);
+      const reason = !mount ? `the ${n.alias} mount is gone`
+        : mount.plugin !== n.plugin ? `${n.alias} is now a ${mount.plugin} mount, not the ${n.plugin} that was added`
+        : !this.#plugins.some((p) => p.id === n.plugin) ? `${n.plugin} is not installed`
+        : !pluginEnabled(SEEDED_PLUGINS.has(n.plugin), choices[n.plugin]) ? `${n.plugin} is switched off for this agent`
+        : null;
+      if (reason) dead.push({ alias: n.alias, since: n.since, reason });
+    }
+    if (dead.length) {
+      await this.store.voidSeedNotices(tenantId, agentId, dead);
+      pending = pending.filter((n) => !dead.some((d) => d.alias === n.alias && d.since === n.since));
+      if (!pending.length) return null;
+    }
+    const { tools } = await this.#catalogueFor(tenantId, agentId);
+    const here = new Set((await agent.tools()).map((t) => t.name));
+    const offered = (tools as MountedTool[]).filter((t) => here.has(t.name));
+    const lines = new Map<string, string>();
+    for (const n of pending) {
+      const entry = AgentRuntime.DEFAULT_MOUNTS.find((m) => m.alias === n.alias && (m.since ?? 1) === n.since && m.plugin === n.plugin);
+      const line = capabilityNotice({ alias: n.alias, ...(entry?.notice ? { notice: entry.notice } : {}) }, offered);
+      if (line) lines.set(`${n.alias}@${n.since}`, line);
+    }
+    if (!lines.size) return null;
+    const rows = await this.store.takeSeedNotices(tenantId, agentId, new Set(lines.keys()));
+    if (!rows.length) return null;
+    return { rows, lines: rows.map((r) => lines.get(`${r.alias}@${r.since}`)!) };
   }
 
   /**

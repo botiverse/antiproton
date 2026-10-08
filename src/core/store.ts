@@ -1,4 +1,4 @@
-import type { SeedPassResult, SeedPlan, SeedRecord } from "../store/seed-record.ts";
+import type { SeedNoticeRow, SeedPassResult, SeedPlan, SeedRecord } from "../store/seed-record.ts";
 import type {
   AdvanceTxn,
   CommitResult,
@@ -404,6 +404,17 @@ export interface StorageAdapter {
   reconcileSeeds(
     tenantId: string, agentId: string, pass: { key: string; revision: number; plan: readonly SeedPlan[] },
   ): Promise<SeedPassResult>;
+  /** The notices of added entries the agent has not been told yet (src/store/seed-record.ts). Read-only. */
+  pendingSeedNotices(tenantId: string, agentId: string): Promise<SeedNoticeRow[]>;
+  /**
+   * Stamp the pending notices named by `which` (`alias@since`) delivered, in one transaction, and return the ones this
+   * call stamped: of two callers racing for the same notice, one gets it.
+   */
+  takeSeedNotices(tenantId: string, agentId: string, which: ReadonlySet<string>): Promise<SeedNoticeRow[]>;
+  /** Give up pending notices that can never be said truthfully, recording why; never undone. */
+  voidSeedNotices(tenantId: string, agentId: string, rows: ReadonlyArray<{ alias: string; since: number; reason: string }>): Promise<void>;
+  /** Put taken notices back to pending, when the message that was to carry them was not written. */
+  returnSeedNotices(tenantId: string, agentId: string, rows: readonly SeedNoticeRow[]): Promise<void>;
   /** `"inherit"` is stored as the absence of a row, not as a third value. */
   setPluginChoice(
     tenantId: string, agentId: string, plugin: string, choice: PluginChoice,

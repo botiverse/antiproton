@@ -22,7 +22,10 @@ import type {
 } from "../core/types.ts";
 import { appendTrace, type TraceRow } from "../trace/outbox.ts";
 import { approvalRow, operationEnded, toolCallRow } from "../trace/seams.ts";
-import { applySeedPass, markSeedsChosen, readSeedRecord, SEED_RECORD_SCHEMA, type SeedPlan } from "./seed-record.ts";
+import {
+  applySeedPass, markSeedsChosen, pendingSeedNotices, readSeedRecord, returnSeedNotices, SEED_RECORD_SCHEMA, takeSeedNotices, voidSeedNotices,
+  type SeedNoticeRow, type SeedPlan,
+} from "./seed-record.ts";
 
 const SCHEMA = `
 PRAGMA journal_mode = WAL;
@@ -1117,6 +1120,22 @@ export class SqliteStore implements StorageAdapter {
 
   async reconcileSeeds(tenantId: string, agentId: string, pass: { key: string; revision: number; plan: readonly SeedPlan[] }) {
     return this.#tx(() => applySeedPass(this.#usageSql(), tenantId, agentId, pass, now()));
+  }
+
+  async pendingSeedNotices(tenantId: string, agentId: string) {
+    return pendingSeedNotices(this.#usageSql(), tenantId, agentId);
+  }
+
+  async takeSeedNotices(tenantId: string, agentId: string, which: ReadonlySet<string>) {
+    return this.#tx(() => takeSeedNotices(this.#usageSql(), tenantId, agentId, which, now()));
+  }
+
+  async voidSeedNotices(tenantId: string, agentId: string, rows: ReadonlyArray<{ alias: string; since: number; reason: string }>) {
+    this.#tx(() => voidSeedNotices(this.#usageSql(), tenantId, agentId, rows, now()));
+  }
+
+  async returnSeedNotices(tenantId: string, agentId: string, rows: readonly SeedNoticeRow[]) {
+    this.#tx(() => returnSeedNotices(this.#usageSql(), tenantId, agentId, rows));
   }
 
   async setPluginChoice(tenantId: string, agentId: string, plugin: string, choice: PluginChoice) {

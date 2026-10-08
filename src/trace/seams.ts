@@ -184,6 +184,9 @@ export function releasedFacts(x: unknown): Released[] {
 export function seededRow(s: {
   tenantId: string; agentId: string; alias: string; plugin: string; since: number;
   outcome: "added" | "present" | "declined" | "not-for" | "unavailable" | "refused"; reason: string | null; at: number;
+  /** On an `added` row only: whether the agent is to be told (`pending`) or the pass gave it its first tools, so there
+   *  was nothing for this to be news against (src/store/seed-record.ts). When it was told is the record's `seed_notices`. */
+  notice?: "pending" | "first tools";
 }): TraceRow {
   const verdict: TraceVerdict = s.outcome === "refused" ? "failed"
     : s.outcome === "declined" || s.outcome === "unavailable" ? "blocked" : "ok";
@@ -191,6 +194,6 @@ export function seededRow(s: {
     at: s.at, tenantId: s.tenantId, agentId: s.agentId,
     kind: "mount.seeded", spanId: `${s.alias}@${s.since}`,
     status: s.outcome, verdict,
-    attrs: { alias: s.alias, plugin: s.plugin, since: s.since, outcome: s.outcome, reason: s.reason },
+    attrs: { alias: s.alias, plugin: s.plugin, since: s.since, outcome: s.outcome, reason: s.reason, ...(s.notice ? { notice: s.notice } : {}) },
   };
 }

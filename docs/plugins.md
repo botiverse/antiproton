@@ -306,7 +306,31 @@ row — so the owner switching a plugin on or the deployment gaining the
 configuration adds it. An entry once `added` or `present` is never added
 again, even after its alias is freed: an operator's removal stays removed.
 Each changed outcome is a `mount.seeded` trace row, written in
-the transaction that adds the mount. An Agents API agent is never reconciled,
+the transaction that adds the mount.
+
+An agent that gains an entry after it was made is told, once. The pass that
+adds the mount records a pending notice in the same transaction, and the next
+prompt or steer (`postMessage`; not a follow-up, which on an idle agent is
+queued and reaches the model only behind some later run) carries one line
+per pending capability at its head, in the harness's own voice (`[a notice
+from the harness, not a message from the user] …`); the notice is stamped
+delivered as that message is written, so two racing messages say it once. No
+turn is started to say it, and it is not put in the system prompt. A row may
+carry `notice`, a function of the offered tool names (`tool("create")` answers
+what the model was offered, never a guessed `alias__tool`), saying what the
+capability is and how to use it — never the deployment behind it; without one
+the line is the plugin's own tool descriptions. A notice waits while the
+harness taking the message does not offer the entry's tools (a steer into a
+turn that began before the mount). One that can never be true is voided,
+with its reason, and never judged again: its mount is gone, its alias now
+holds another plugin's mount (the line would name that plugin's tools in the
+harness's voice), or the plugin is switched off or no longer installed. What a new agent's first pass mounts is
+not announced: that pass (no record yet, no mounts) gives the agent its first
+tools, so there is nothing for them to be news against; an agent made before
+the record existed has its mounts, and is told what its first pass adds. The
+`mount.seeded` row of an `added` entry says which (`notice`: `pending` or
+`first tools`), and the record keeps when each notice was delivered
+(`seed_notices`). An Agents API agent is never reconciled,
 nor one provisioned with an explicit list (`chosen: true`: a bench arm, the
 Agents API's container), which `provision` marks so, nor any agent under the
 bench tenant (`BENCH_TENANT`), which also covers bench agents made before the
