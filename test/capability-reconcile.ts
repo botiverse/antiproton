@@ -517,7 +517,7 @@ await check("each changed outcome is a mount.seeded trace row, and the added one
   const reminder = rows.filter((r) => r.attrs.alias === "reminder");
   must(reminder.length === 1, `reminder rows: ${show(reminder)}`);
   must(show(reminder[0]) === show({ status: "added", verdict: "ok", spanId: "reminder@2",
-    attrs: { alias: "reminder", plugin: "reminder", since: 2, outcome: "added", reason: null } }), `the row: ${show(reminder[0])}`);
+    attrs: { alias: "reminder", plugin: "reminder", since: 2, outcome: "added", reason: null, notice: "pending" } }), `the row: ${show(reminder[0])}`);
   must(rows.length === 8 && rows.filter((r) => r.status === "present").length === 7, `rows: ${show(rows.map((r) => r.spanId + ":" + r.status))}`);
   // A trace row that cannot be written takes the mount and the record with it.
   const e = deployment(REMINDER_APP);
