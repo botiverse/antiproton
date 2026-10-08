@@ -281,6 +281,36 @@ await check("an entry found present is never added again: its mount removed, the
   must((await d.outcome("t", "old", "state"))?.outcome === "present", `the record moved: ${show(await d.outcome("t", "old", "state"))}`);
 });
 
+await check("an operator's rename before the first reconcile (`web` -> `x`): web is recorded present as x, and no second http mount", async () => {
+  const d = deployment(REMINDER_APP);
+  const rt = await existing(d, "t", "old");
+  const renamed = await rt.renameMount("t", "old", "web", "x");
+  must(renamed.ok, `rename: ${show(renamed)}`);
+  await d.say("t", "old", "hello");
+  must((await d.record("t", "old")).key !== null, "control: no pass ran");
+  const http = (await d.mountsOf("t", "old")).filter((m) => m.plugin === "http").map((m) => m.alias);
+  must(http.join() === "x", `http mounts: ${http.join(",")}`);
+  const web = await d.outcome("t", "old", "web");
+  must(web?.outcome === "present" && /\bx\b/.test(String(web.reason)), `web: ${show(web)}`);
+});
+
+await check("a mount the agent had while its plugin was off is present, not declined: removed, then switched back on, it does not return", async () => {
+  const d = deployment(REMINDER_APP);
+  const rt = await existing(d, "t", "old");
+  await rt.store.setPluginChoice("t", "old", "github", "disable");
+  await d.say("t", "old", "while off");
+  const off = await d.outcome("t", "old", "gh");
+  must(await rt.store.removeMount("t", "old", "gh", null), "control: the removal did nothing");
+  const k = (await d.record("t", "old")).key;
+  await rt.store.setPluginChoice("t", "old", "github", "inherit");
+  await d.say("t", "old", "back on");
+  must((await d.record("t", "old")).key !== k, "control: the key did not move, so no pass ran");
+  const gh = (await d.mountsOf("t", "old")).filter((m) => m.plugin === "github").map((m) => m.alias);
+  must(gh.length === 0, `github came back: ${gh.join(",")}`);
+  // Asked last, so the consequence above is what a wrong order reddens first.
+  must(off?.outcome === "present", `gh while off, mounted: ${show(off)}`);
+});
+
 // ---------------------------------------------------------------- concurrency
 
 await check("two turn starts racing add each mount once, write one added trace row, and neither fails", async () => {

@@ -294,7 +294,9 @@ when its settings do not validate or another plugin holds its alias,
 `present` when the agent already has it — under its alias, or under any
 alias, since two identical tool sets confuse the model and an operator's
 rename (`web` to `x`) would otherwise bring a second `web` back — and
-otherwise `added`. The outcomes are kept per agent, one row per entry (alias
+otherwise `added`. `present` is asked first, before `not-for`, `unavailable`
+and `declined`, so a mount the agent had while its plugin was switched off is
+not brought back after an operator removes it. The outcomes are kept per agent, one row per entry (alias
 and `since`), beside the key the pass was judged from: the catalogue and its
 revision (the highest `since`), the agent's kind, its plugin choices, and
 which plugins are unavailable (`src/store/seed-record.ts`). A pass whose key

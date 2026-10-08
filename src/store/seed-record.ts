@@ -122,17 +122,20 @@ export function applySeedPass(
     if (before?.outcome === "added" || before?.outcome === "present") continue;
     let outcome: SeedOutcome;
     let reason: string | null = null;
-    if ("withheld" in p) {
-      outcome = p.withheld;
-      reason = p.reason;
-    } else {
-      const have = mounts.find((m) => m.alias === p.alias);
-      const elsewhere = mounts.find((m) => m.plugin === p.plugin);
-      if (have && have.plugin === p.plugin) outcome = "present";
-      else if (have) { outcome = "refused"; reason = `${p.alias} is a ${have.plugin} mount, not the ${p.plugin} seed`; }
-      // Two identical tool sets under two aliases confuse the model, and an operator's rename (`web` -> `x`) would
-      // otherwise bring a second `web` back.
-      else if (elsewhere) { outcome = "present"; reason = `already mounted as ${elsewhere.alias}`; }
+    // Whether the agent already has it is asked first, before any of the runtime's reasons to withhold it: an
+    // entry declined or unavailable while its mount was there would otherwise be re-judged on the next key change,
+    // and come back after an operator removed it. The same for `not-for`: an agent of another kind that has the
+    // plugin anyway (an operator mounted it) has it, and `present` only ever means "never add this", which is what
+    // `not-for` wants too.
+    const have = mounts.find((m) => m.alias === p.alias);
+    const elsewhere = mounts.find((m) => m.plugin === p.plugin);
+    if (have && have.plugin === p.plugin) outcome = "present";
+    // Two identical tool sets under two aliases confuse the model, and an operator's rename (`web` -> `x`) would
+    // otherwise bring a second `web` back.
+    else if (elsewhere) { outcome = "present"; reason = `already mounted as ${elsewhere.alias}`; }
+    else if ("withheld" in p) { outcome = p.withheld; reason = p.reason; }
+    else {
+      if (have) { outcome = "refused"; reason = `${p.alias} is a ${have.plugin} mount, not the ${p.plugin} seed`; }
       else {
         const m = p.mount;
         sql.exec(
