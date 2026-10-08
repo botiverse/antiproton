@@ -450,11 +450,21 @@ async function onRaft(ctx: PluginContext): Promise<boolean> {
 export const NO_CREDENTIAL = "this deployment has no reminder-app credential configured; nothing was sent";
 export const NO_ORIGIN = "this deployment has no reminder-app origin configured; nothing was sent";
 
-function connection(ctx: PluginContext, deployment: ReminderDeployment): ReminderConnection {
-  if (!deployment.clientCredential) throw new Error(NO_CREDENTIAL);
+/**
+ * Why this deployment cannot reach reminder-app, or null when it can: the one answer both a call (`connection`) and
+ * the plugin's `unavailable` give, so a mount is not seeded exactly where every call would refuse.
+ */
+export function deploymentProblem(deployment: Partial<ReminderDeployment>): string | null {
+  if (!deployment.clientCredential) return NO_CREDENTIAL;
   // Checked as a mount's origin setting would be: https, no path, written as the origin. The deployment's own value,
   // but it is where the credential goes.
-  if (!deployment.serviceUrl || originProblem(deployment.serviceUrl)) throw new Error(NO_ORIGIN);
+  if (!deployment.serviceUrl || originProblem(deployment.serviceUrl)) return NO_ORIGIN;
+  return null;
+}
+
+function connection(ctx: PluginContext, deployment: ReminderDeployment): ReminderConnection {
+  const problem = deploymentProblem(deployment);
+  if (problem || !deployment.serviceUrl || !deployment.clientCredential) throw new Error(problem ?? NO_CREDENTIAL);
   const t = ctx.publicConfig.timeoutMs;
   const timeoutMs = typeof t === "number" && Number.isFinite(t) ? Math.min(60_000, Math.max(1_000, t)) : DEFAULT_TIMEOUT_MS;
   return { baseUrl: deployment.serviceUrl, credential: deployment.clientCredential, subject: subjectOf(ctx), timeoutMs };
@@ -750,6 +760,7 @@ export function createReminderPlugin(deps: { service?: ReminderService; now?: ()
       { name: "timeoutMs", type: "number", default: DEFAULT_TIMEOUT_MS, min: 1_000, max: 60_000, summary: "How long one request to reminder-app may take, in milliseconds." },
     ],
     tools: TOOLS,
+    unavailable: () => deploymentProblem(deployment),
 
     async invoke(tool, raw, ctx): Promise<Json> {
       if (tool === "create") {

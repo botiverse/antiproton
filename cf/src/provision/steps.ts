@@ -12,6 +12,12 @@ import type { ProvisionTool, PushStatus } from "./handlers.ts";
 
 /** The alias the provisioned mount carries: the plugin's own name, as a person would pick. */
 export const PROVISION_MOUNT_ALIAS = "raft";
+/**
+ * What the agent's record says made it (`provisionedBy`). Written before the default mounts are seeded, and on
+ * every agent Raft has made, so a seed that is not for a Raft-hosted agent can be told from the record alone
+ * (`agentKind` and a catalogue row's `for`, cf/src/runtime.ts).
+ */
+export const PROVISIONED_BY = "raft";
 /** The task the push tools run under when the provider, not the model, calls them. */
 export const PROVISION_TASK = "provision";
 /** The home the provisioned agents are listed under, so the console can find them. */
@@ -30,7 +36,7 @@ export async function adoptProvisionedAgent(
   const existing = await rt.store.loadAgent(tenantId, agentId);
   const config = (existing?.config ?? {}) as Record<string, unknown>;
   const avatar = typeof config.avatar === "string" ? config.avatar : spec.avatar;
-  const persona = { ...config, name: spec.name, description: spec.instructions, avatar, provisionedBy: "raft" };
+  const persona = { ...config, name: spec.name, description: spec.instructions, avatar, provisionedBy: PROVISIONED_BY };
   if (!existing) await rt.store.createAgent(tenantId, agentId, persona as Json);
   else await rt.store.updateAgentConfig(tenantId, agentId, persona as Json);
   // The operator's model, as the deployment's admin chose it for this agent (model_overrides); Raft's
@@ -42,7 +48,8 @@ export async function adoptProvisionedAgent(
   if (plan.bind) await rt.bindOperatorModel(tenantId, agentId, plan.choice);
   // The same default mounts every agent gets — memory (state), artifacts, web, GitHub, sandbox, tools — the way the
   // console and the Agents API seed them. Missed on the first cut: Ant2 on staging had the raft mount and nothing
-  // else, so the agent truthfully said it had no memory. Idempotent: adds only what is missing.
+  // else, so the agent truthfully said it had no memory. Idempotent: adds only what is missing. The record above
+  // is written first on purpose: a seed not for an agent Raft hosts (`reminder`) is told apart by it.
   await rt.provision(tenantId, agentId);
   // The raft plugin is not seeded for every agent; this agent has chosen it, the way a person would in the console.
   await rt.store.setPluginChoice(tenantId, agentId, "raft", "enable");

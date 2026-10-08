@@ -261,6 +261,27 @@ every agent, and one that is not has to be switched on and mounted. To change
 the default, change the catalogue — an agent's own answer still overrides it
 either way (`pluginEnabled`).
 
+Each catalogue row says which agents it is for and when it was added: `for`
+lists agent kinds (`"console"`, `"raft"`, `"api"`) and `since` the catalogue
+revision. An agent's kind is `"raft"` when its record says Raft made it
+(`provisionedBy`), else `"console"` (`agentKind`); the Agents API seeds its
+agents from its own list (`apiAgentSeeds`) and does not ask. The seven
+original rows are `for: ["console", "raft"]`, `since: 1`; `reminder` is
+`for: ["console"]`, `since: 2`, because Raft wakes its agents through its own
+channel and the plugin's `create` refuses there. `since` is declared only;
+nothing reads it yet. The record is the fact for Raft because it exists
+before any mount does: provisioning writes it, then seeds, then adds the
+`raft` mount (`cf/src/provision/steps.ts`).
+
+`provision` skips a row whose `for` excludes the agent's kind, or whose
+plugin reports itself `unavailable` (below) — `seedApplies` in
+`cf/src/runtime.ts`. Like a switched-off plugin, this governs only the
+adding, and the console's reconcile (`uiEnsure`) touches only the rows
+`provision` says applied; a mount already there is left alone. Seeding is not
+creation-only — `provision` adds every missing row on each console open, task
+start, and Raft agent's push wake — so a new row reaches existing agents the
+next time one of those runs, and its `for` holds on every pass.
+
 **Declare `provides` for what the plugin can give a session.** Today the one
 value is `"container"`. The agents API picks a plugin to seed by asking what
 each one offers rather than by looking for the id `sandbox`, so a second
@@ -583,6 +604,17 @@ running work (the last two only for a plugin that holds or backgrounds
 something; `mcp` does neither, so a call already in flight finishes and the
 next one is refused with `not_mounted`). A live inbound hook does not refuse
 it: the runtime revokes the mount's hooks itself, after `unmount` (below).
+
+**`unavailable()` says the deployment cannot run the plugin at all.** It
+takes no context, because the answer is the same for every agent: return a
+reason when configuration the plugin was built with, and no mount can supply,
+is missing (a service's origin, the deployment's client credential), and
+`null` otherwise. Provisioning does not seed a catalogue row whose plugin is
+unavailable, so a new agent is not handed tools whose every call would
+refuse; a mount that already exists stays, and its calls should refuse with
+the same reason. Absent means always available. `reminder` is the first
+declarer: it is unavailable without `REMINDER_APP_ORIGIN` and
+`REMINDER_APP_CREDENTIAL`.
 
 **`unmount(ctx)` is a plugin's one chance to clean up when its mount is
 removed.** Removing a mount deletes what is filed under its alias here — its

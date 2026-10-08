@@ -5,7 +5,9 @@
  * own tools. The hook index is a stand-in, as in test/plugin-hooks.ts.
  */
 import { AgentRuntime } from "../cf/src/runtime.ts";
-import { adoptProvisionedAgent, provisionTool, provisionPushStatus, PROVISION_MOUNT_ALIAS } from "../cf/src/provision/steps.ts";
+import { adoptProvisionedAgent, provisionTool, provisionPushStatus, PROVISION_MOUNT_ALIAS, PROVISIONED_BY } from "../cf/src/provision/steps.ts";
+import { NO_CREDENTIAL, reminderPlugin } from "../src/plugins/reminder.ts";
+import { toolsOf } from "../src/plugins/types.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 import type { HookRow } from "../cf/src/control-plane.ts";
 import { operatorModelOf } from "../cf/src/model-request.ts";
@@ -39,7 +41,7 @@ function raft() {
   return calls;
 }
 
-async function runtime() {
+async function runtime(opts: { reminderApp?: { origin?: string; credential?: string } } = {}) {
   const host = sqliteHost();
   const rows = new Map<string, HookRow>();
   const directory = {
@@ -57,6 +59,7 @@ async function runtime() {
         { id: "gw", baseUrl: "https://gw.example/compat", auth: { secret: "GW_TOKEN", header: "cf-aig-authorization" }, modelFormat: "vendor/model" }],
       GW_TOKEN: "gt" } as any),
     hooks: { origin: "https://hooks.test", directory },
+    ...(opts.reminderApp ? { reminderApp: opts.reminderApp } : {}),
   } as any);
   await rt.ready();
   return { rt, host, rows };
@@ -78,6 +81,8 @@ await check("adopt makes the record with the persona, binds the operator model, 
   // The defaults every agent gets, memory and artifacts among them: a provisioned agent is not a lesser agent.
   const aliases = (await rt.store.listMounts("t", "raft_01J")).map((m) => m.alias).sort();
   for (const a of ["artifacts", "state", "tools", "web", "gh", "sandbox", "raft"]) must(aliases.includes(a), `no ${a} mount: ${aliases.join(",")}`);
+  // All but the one seed that cannot work on Raft.
+  must(!aliases.includes("reminder"), `a Raft agent was seeded reminder: ${aliases.join(",")}`);
   const second = await adoptProvisionedAgent(rt, "t", "raft_01J", { ...SPEC, name: "Cody 2", instructions: "be thorough", avatar: "ffffffff" });
   must(second.ok && second.avatar === "0badcafe", `avatar changed: ${JSON.stringify(second)}`);
   const after = (await rt.store.loadAgent("t", "raft_01J"))?.config as any;
@@ -153,6 +158,101 @@ await check("adopt binds the operator's model as chosen for the agent, and the d
   }
   // A new agent whose choice could not be read still gets a binding: the default.
   must((await adoptProvisionedAgent(rt, "t", "raft_m2", SPEC, null)).ok && (await rt.store.getModelBinding("t", "raft_m2"))?.model === "deepseek-flash", "a new agent was left unbound");
+  host.dispose();
+});
+
+/** A deployment with reminder-app configured, as REMINDER_APP_ORIGIN and REMINDER_APP_CREDENTIAL give it. */
+const REMINDER_APP = { origin: "https://reminders.example", credential: "rmc.client.secret" };
+
+/** Every request the code under test makes, answered 404. */
+function recordFetch() {
+  const urls: string[] = [];
+  globalThis.fetch = (async (url: any) => { urls.push(String(url)); return new Response("{}", { status: 404 }); }) as any;
+  return urls;
+}
+
+await check("on a deployment with reminder-app configured, a new agent Raft did not make is seeded a reminder mount, which lists its tools and opens in the harness", async () => {
+  const { rt, host, rows } = await runtime({ reminderApp: REMINDER_APP });
+  const urls = recordFetch();
+  try {
+    // The path the console's first open and a bench seed take: the record does not exist yet.
+    const made = await rt.provision("t", "plain_1");
+    must(made.created, "provision did not create the agent");
+    const mount = await rt.store.getMountByAlias("t", "plain_1", "reminder");
+    must(mount?.plugin === "reminder" && mount.secretRef === null && mount.policy === null, `no reminder mount: ${JSON.stringify(mount)}`);
+    // Seeded, not chosen: no plugin answer is written for it, so the owner's switch starts at the default.
+    must((await rt.store.pluginChoices("t", "plain_1")).reminder === undefined, "seeding recorded a choice for reminder");
+    must(AgentRuntime.seededSecretRef(mount!) === null, "the seed says the mount reverts to a credential");
+    must(toolsOf(reminderPlugin, mount!).map((t) => t.name).sort().join() === "create,delete,list", "the mount does not list create, list and delete");
+    await rt.bindOperatorModel("t", "plain_1");
+    await rt.agent("t", "plain_1");
+  } finally { globalThis.fetch = originalFetch; }
+  // Mounting reaches nothing: the hook is opened on the first create, not at mount time.
+  must(urls.length === 0, `requests went out: ${urls.join(", ")}`);
+  must([...rows.values()].length === 0, `a hook was opened: ${JSON.stringify([...rows.values()])}`);
+  host.dispose();
+});
+
+await check("on a deployment missing reminder-app's origin or credential, no agent is seeded reminder; a mount added anyway refuses and sends nothing", async () => {
+  for (const [why, reminderApp] of [
+    ["neither", undefined],
+    ["no credential", { origin: REMINDER_APP.origin }],
+    ["no origin", { credential: REMINDER_APP.credential }],
+    ["an origin that is not one", { origin: "http://reminders.example/path", credential: REMINDER_APP.credential }],
+  ] as const) {
+    const { rt, host } = await runtime({ reminderApp });
+    await rt.provision("t", "plain_2");
+    must(!(await rt.store.getMountByAlias("t", "plain_2", "reminder")), `${why}: reminder was seeded`);
+    // Control: the rest of the defaults arrived in the same pass.
+    must(!!(await rt.store.getMountByAlias("t", "plain_2", "state")), `${why}: nothing was seeded at all`);
+    host.dispose();
+  }
+  // An agent can still hold one (seeded while the deployment had the config, or added by an operator): it refuses.
+  const { rt, host, rows } = await runtime();
+  await rt.provision("t", "plain_3");
+  must((await rt.addMount("t", "plain_3", { alias: "reminder", plugin: "reminder", config: {} })).ok, "the explicit mount was refused");
+  const urls = recordFetch();
+  try {
+    const ctx = { tenantId: "t", agentId: "plain_3", taskId: "plain_3:main" };
+    const created: any = await rt.gateway().invoke(ctx, "reminder.create", { delayMinutes: 5, note: "stretch" });
+    must(created.status === "failed" && JSON.stringify(created.error).includes(NO_CREDENTIAL), `create was not refused for the missing config: ${JSON.stringify(created)}`);
+  } finally { globalThis.fetch = originalFetch; }
+  must(urls.length === 0 && [...rows.values()].length === 0, `something was sent or opened: ${urls.join(", ")}`);
+  host.dispose();
+});
+
+await check("an agent Raft made gets no reminder mount: not at adopt, not on a later provision, not on a second adopt", async () => {
+  const { rt, host } = await runtime({ reminderApp: REMINDER_APP });
+  raft();
+  must((await adoptProvisionedAgent(rt, "t", "raft_r1", SPEC)).ok, "adopt failed");
+  must(((await rt.store.loadAgent("t", "raft_r1"))?.config as any)?.provisionedBy === PROVISIONED_BY, "the record does not say Raft made it");
+  const reminders = async () => (await rt.store.listMounts("t", "raft_r1")).filter((m) => m.plugin === "reminder" || m.alias === "reminder");
+  must((await reminders()).length === 0, `adopt seeded reminder: ${JSON.stringify(await reminders())}`);
+  // Control: the rest of the defaults did arrive in the same pass, so the absence is the exception and not an empty seed.
+  must(!!(await rt.store.getMountByAlias("t", "raft_r1", "state")), "adopt seeded nothing at all");
+  // A push's wake (#deliverInbound) and the console's open (uiEnsure; test/reminder-default.ts drives that one whole).
+  await rt.provision("t", "raft_r1");
+  const { seeds } = await rt.provision("t", "raft_r1", AgentRuntime.DEFAULT_MOUNTS);
+  must(!seeds.some((d) => d.plugin === "reminder"), "provision reports the reminder seed as this agent's, so uiEnsure would reconcile it");
+  must((await adoptProvisionedAgent(rt, "t", "raft_r1", { ...SPEC, name: "Cody 2" })).ok, "second adopt failed");
+  must((await reminders()).length === 0, `a later provision seeded reminder: ${JSON.stringify(await reminders())}`);
+  // Left out, not switched off: the owner's switch has nothing written on it.
+  must((await rt.store.pluginChoices("t", "raft_r1")).reminder === undefined, "the exclusion recorded a choice for reminder");
+  host.dispose();
+});
+
+await check("an agent made before reminder was seeded gets it on its next provision, unless Raft made it", async () => {
+  // What `provision` does on every console open (uiEnsure) and, for a Raft agent, before a push is posted
+  // (#deliverInbound): it adds each missing seed, so a new seed reaches existing agents too.
+  const { rt, host } = await runtime({ reminderApp: REMINDER_APP });
+  const without = AgentRuntime.DEFAULT_MOUNTS.filter((d) => d.plugin !== "reminder");
+  await rt.store.createAgent("t", "old_console", { name: "Old" });
+  await rt.store.createAgent("t", "old_raft", { name: "Old Raft", provisionedBy: PROVISIONED_BY });
+  for (const a of ["old_console", "old_raft"]) await rt.provision("t", a, without);
+  for (const a of ["old_console", "old_raft"]) must(!(await rt.store.getMountByAlias("t", a, "reminder")), `control: ${a} already had reminder`);
+  for (const a of ["old_console", "old_raft"]) await rt.provision("t", a);
+  must((await rt.store.getMountByAlias("t", "old_console", "reminder"))?.plugin === "reminder", "an existing console agent was not given reminder on its next open");
+  must(!(await rt.store.getMountByAlias("t", "old_raft", "reminder")), "an existing Raft agent was given reminder on its next wake");
   host.dispose();
 });
 

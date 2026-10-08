@@ -32,6 +32,7 @@ import { artifactsPlugin } from "../src/plugins/artifacts.ts";
 import { sandboxPlugin } from "../src/plugins/sandbox.ts";
 import { builtinToolsPlugin } from "../src/plugins/builtin.ts";
 import { demoPlugin } from "../src/plugins/demo.ts";
+import { reminderPlugin } from "../src/plugins/reminder.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void>) {
@@ -198,7 +199,7 @@ await check("种子只包含【用户什么都不用给就能用】的插件", a
   const registry: Plugin[] = [];
   registry.push(githubPlugin, demoPlugin, httpPlugin, exaPlugin, sandboxPlugin(artifacts, "b"),
     statePlugin(store, artifacts, "b"), artifactsPlugin(artifacts, "b"),
-    builtinToolsPlugin(store, () => registry));
+    builtinToolsPlugin(store, () => registry), reminderPlugin);
 
   for (const seed of AgentRuntime.DEFAULT_MOUNTS as any[]) {
     const plugin = registry.find((p) => p.id === seed.plugin);

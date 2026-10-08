@@ -165,6 +165,34 @@ export interface SeedMount {
   alias: string; plugin: string;
   account?: string; config?: Json;
   secretRef?: string | null; policy?: MountPolicy | null;
+  /** Which kinds of agent the seed is for; absent means every kind. Judged by `seedApplies`. */
+  for?: readonly AgentKind[];
+  /** The catalogue revision that added this entry. Declared only: nothing reads it yet. */
+  since?: number;
+}
+
+/**
+ * What kind of agent this is, for a seed's `for`: "raft" when its record says Raft made it (`provisionedBy`),
+ * else "console". The record is the fact because provisioning writes it, then seeds, then adds its own mount
+ * (cf/src/provision/steps.ts), and every agent Raft made carries it. "api" names the Agents API's agents, which
+ * are seeded from their own list (`apiAgentSeeds`) and never reach this question.
+ */
+export type AgentKind = "console" | "raft" | "api";
+export function agentKind(config: unknown): AgentKind {
+  return (config as { provisionedBy?: unknown } | null | undefined)?.provisionedBy === PROVISIONED_BY ? "raft" : "console";
+}
+
+/** A row of the catalogue: a seed that says which agents it is for and when it was added. */
+export type CatalogueMount = SeedMount & { for: readonly AgentKind[]; since: number };
+
+/**
+ * Whether `provision` adds this seed to this agent: it is for the agent's kind, and its plugin (when installed)
+ * does not report the deployment unable to run it. Asked on every pass, not only at creation; like a
+ * switched-off plugin, it governs only the adding (and `uiEnsure`'s reconcile), never a mount already there.
+ */
+export function seedApplies(seed: SeedMount, kind: AgentKind, plugin: Plugin | undefined): boolean {
+  if (seed.for && !seed.for.includes(kind)) return false;
+  return !plugin?.unavailable?.();
 }
 import { credentialForm, pluginEnabled, renameSafety, isExclusive, backgroundOf, interruptsOf, toolsOf } from "../../src/plugins/types.ts";
 import { githubPlugin } from "../../src/plugins/github.ts";
@@ -178,7 +206,7 @@ import { artifactsPlugin, PARK_BYTES, READ_WHOLE_MAX } from "../../src/plugins/a
 import { createRaftPlugin } from "../../src/plugins/raft.ts";
 import { mcpPlugin } from "../../src/plugins/mcp.ts";
 import { createReminderPlugin } from "../../src/plugins/reminder.ts";
-import { PROVISION_MOUNT_ALIAS } from "./provision/steps.ts";
+import { PROVISION_MOUNT_ALIAS, PROVISIONED_BY } from "./provision/steps.ts";
 import { toAgentRef } from "../../src/store/refs.ts";
 import type { Plugin, PluginChoice } from "../../src/plugins/types.ts";
 import type { ToolInterrupt, ToolResult } from "../../src/core/tools.ts";
@@ -1671,12 +1699,12 @@ export class AgentRuntime {
    * for the API path once, and an agent run before it was opened had no
    * memory; one list, read by both, is the only way that stays fixed.
    */
-  static readonly DEFAULT_MOUNTS: SeedMount[] = [
+  static readonly DEFAULT_MOUNTS: CatalogueMount[] = [
     { alias: "tools", plugin: "tools", config: { account: "builtin" },
-      secretRef: null, policy: null },
+      secretRef: null, policy: null, for: ["console", "raft"], since: 1 },
     // Without this a parked result is a reference the agent cannot open.
     { alias: "artifacts", plugin: "artifacts", config: { account: "builtin" },
-      secretRef: null, policy: null },
+      secretRef: null, policy: null, for: ["console", "raft"], since: 1 },
     // `ops` (the demo plugin) used to be seeded here, and stopped being
     // defensible the day sign-up opened: it is a fake fleet — `list_servers`,
     // `deploy`, `restart`, with summaries that say "Changes production" — and
@@ -1698,11 +1726,11 @@ export class AgentRuntime {
     // The gate still exists and still works; a mount that reaches
     // something that matters should use it, and use an allowlist too.
     { alias: "web", plugin: "http", config: { account: "open web", maxBytes: 24_000 },
-      secretRef: null, policy: null },
+      secretRef: null, policy: null, for: ["console", "raft"], since: 1 },
     // Search with the operator's Exa key. Its host is fixed by the plugin, so the key can only ever
     // reach Exa.
     { alias: "search", plugin: "exa", config: { account: "Exa" },
-      secretRef: OPERATOR_EXA_REF, policy: null },
+      secretRef: OPERATOR_EXA_REF, policy: null, for: ["console", "raft"], since: 1 },
     // GitHub, the first real user of the credential page. Seeded with no
     // token, so it reads public repositories; the person attaches their
     // own token there and the mount acts as that account. Writes are open:
@@ -1710,18 +1738,24 @@ export class AgentRuntime {
     // operation a tool offers, and the agent decides which of its own calls
     // to hold for a person, by sending `confirm: true` with the call.
     { alias: "gh", plugin: "github", config: { account: "GitHub" },
-      secretRef: null, policy: null },
+      secretRef: null, policy: null, for: ["console", "raft"], since: 1 },
     // A real container, for tasks that need one. Its tools describe
     // themselves as a last resort so the agent reaches for free in-process
     // JS first, and the framework releases the box once the agent has no
     // conversation with work open (the scope is the agent, not a task).
     { alias: SANDBOX_ALIAS, plugin: "sandbox", config: { account: "container" },
-      secretRef: OPERATOR_RUN9_REF, policy: null },
+      secretRef: OPERATOR_RUN9_REF, policy: null, for: ["console", "raft"], since: 1 },
     // The agent's own store. Deliberately not behind approval: an agent
     // that must ask a person before writing a note will not keep notes, and
     // the blast radius is its own memory, scoped to this (tenant, agent).
     { alias: "state", plugin: "state", config: { account: "agent memory" },
-      secretRef: null, policy: null },
+      secretRef: null, policy: null, for: ["console", "raft"], since: 1 },
+    // Reminders that wake the agent later, through reminder-app. Not for an agent Raft hosts: Raft wakes it
+    // through its own channel, and the plugin's `create` refuses there (`onRaft` in src/plugins/reminder.ts).
+    // Nor seeded on a deployment without REMINDER_APP_ORIGIN and REMINDER_APP_CREDENTIAL: the plugin reports
+    // itself `unavailable` there, since every call would refuse.
+    { alias: "reminder", plugin: "reminder", config: { account: "reminder-app" },
+      secretRef: null, policy: null, for: ["console"], since: 2 },
 
   ];
 
@@ -1765,17 +1799,20 @@ export class AgentRuntime {
     opts: { chosen?: boolean } = {},
   ) {
     await this.ready();
-    if (await this.store.loadTask(tenantId, `${agentId}:probe`)) return { agentId, created: false };
+    if (await this.store.loadTask(tenantId, `${agentId}:probe`)) return { agentId, created: false, seeds: mounts };
     // The record and the mounts are separate questions. An agent the console
     // created has a record (name, description) and no mounts yet; the old
     // guard read "record exists" as "already provisioned" and gave such an
     // agent its first run with no tools and no memory. Each seed mount is
     // added only if absent, so this is safe to call on every first run.
     let created = false;
-    if (!(await this.store.loadAgent(tenantId, agentId))) {
+    const record = await this.store.loadAgent(tenantId, agentId);
+    if (!record) {
       await this.store.createAgent(tenantId, agentId, {});
       created = true;
     }
+    const kind = agentKind(record?.config);
+    const applies = mounts.filter((m) => seedApplies(m, kind, this.#plugins.find((p) => p.id === m.plugin)));
     // Asked before anything is added, because this runs on every console open
     // and not only at creation: without it, turning a plugin off would last
     // until the next page load and then be undone by the reconcile, which
@@ -1796,10 +1833,12 @@ export class AgentRuntime {
     const explicit = opts.chosen === true;
     for (const m of mounts) {
       // The skip comes first on purpose: the assert below runs only for a
-      // mount being added, so an open of an agent that already has its seven
+      // mount being added, so an open of an agent that already has its seeds
       // costs one read per seed and no validation. Moving the assert above
       // this line would run it on every open of every agent.
       if (await this.store.getMountByAlias(tenantId, agentId, m.alias)) continue;
+      // Before the choice below is recorded: a seed that is not for this agent is not one it has chosen either.
+      if (!applies.includes(m)) continue;
       // A seed the agent has turned off is not added. Only the adding is
       // governed here: a mount that already exists is left alone, because
       // switching a plugin off must not destroy the credential and the
@@ -1825,7 +1864,8 @@ export class AgentRuntime {
         publicConfig: m.config ?? { account: m.account }, secretRef: m.secretRef ?? null, policy: m.policy ?? null,
       });
     }
-    return { agentId, created };
+    // The seeds that apply to this agent, so a caller that reconciles them (`uiEnsure`) judges the same set.
+    return { agentId, created, seeds: applies };
   }
 
   /**

@@ -36,7 +36,7 @@ import { secretRefKind } from "../../src/runtime/secrets.ts";
 import { DynamicWorkerExecutor, handleSandboxCall, handleSandboxSuspend, type SuspendRequest } from "../../src/runtime/dynamic-worker-executor.ts";
 import { executorSpec } from "../../test/spec/executor-spec.ts";
 import {
-  AgentRuntime, reconcileSeed, OPERATOR_RUN9_REF, isOperatorModelRef, parsePluginChoice, SEEDED_PLUGINS, installedRows, messageRefusal, consoleAdded, CONSOLE_MOUNTS_MAX } from "./runtime.ts";
+  AgentRuntime, reconcileSeed, OPERATOR_RUN9_REF, isOperatorModelRef, parsePluginChoice, SEEDED_PLUGINS, installedRows, messageRefusal, consoleAdded, CONSOLE_MOUNTS_MAX, agentKind } from "./runtime.ts";
 import { readMeter } from "../../bench/meter.ts";
 import { BENCH_SWE_WITHHELD } from "../../bench/swebench/withheld.ts";
 import { contextWindowFor } from "../../src/model/context-windows.ts";
@@ -1606,9 +1606,11 @@ export class AgentDO extends DurableObject<Env> {
       // One add path for both routes in: provision adds what is missing and
       // validates each seed as it goes. What the console adds on top is the
       // reconcile below, for a mount that exists but no longer matches.
-      await rt.provision(tenantId, agentId, desired);
+      // Reconciled over the seeds that apply to this agent (`seedApplies`: its kind, the plugin's availability):
+      // one that does not is not this agent's, so a mount under its alias is left as it is.
+      const { seeds } = await rt.provision(tenantId, agentId, desired);
       const byId = new Map(rt.plugins().map((p) => [p.id, p]));
-      for (const d of desired) {
+      for (const d of seeds) {
         const have = await rt.store.getMountByAlias(tenantId, agentId, d.alias);
         if (!have) continue;
         const step = reconcileSeed(have, d, byId.get(d.plugin));
@@ -2119,7 +2121,7 @@ export class AgentDO extends DurableObject<Env> {
           // An agent Raft made has the default mounts (provision/steps.ts), and gets one added since on its
           // next wake, the way a console agent gets it when its page opens. Only what is missing is added.
           const agent = await rt.store.loadAgent(tenantId, agentId);
-          if ((agent?.config as { provisionedBy?: unknown } | undefined)?.provisionedBy === "raft") {
+          if (agentKind(agent?.config) === "raft") {
             await rt.provision(tenantId, agentId);
             await this.#bindModel(rt, tenantId, agentId, { onlyIfStale: true });
           }

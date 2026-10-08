@@ -77,6 +77,7 @@
     "test/model-gateway.ts",
     "test/admin-models.ts",
     "test/user-models.ts",
+    "test/reminder-default.ts",
     "test/agents-api-model.ts",
     "test/bench-tau2-api.ts",
     "test/bench-tau2-api-local.ts",

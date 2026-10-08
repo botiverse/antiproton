@@ -592,10 +592,21 @@ await check("settings: an empty mount is complete and console-addable; a misspel
   must(reminderPlugin.consoleMount === true && !reminderPlugin.credential && !reminderPlugin.checkCredential, "consoleMount, or a mount credential, is not as decided");
 });
 
-await check("the deployment registers reminder but seeds it for nobody", async () => {
+await check("the deployment registers reminder and seeds it for console agents, revision 2, where reminder-app is configured", async () => {
+  // Who gets it is the catalogue's to say; test/provision-runtime.ts drives both sides of it through a runtime.
   const rt = new AgentRuntime({ ctx: { storage: {} } as any, bucket: {} as any, bucketName: "b", models: { resolve: () => null } as any } as any);
   must(rt.plugins().some((p) => p.id === "reminder"), "the runtime does not register reminder");
-  must(!AgentRuntime.DEFAULT_MOUNTS.some((d) => d.plugin === "reminder"), "reminder is in DEFAULT_MOUNTS");
+  const seeds = AgentRuntime.DEFAULT_MOUNTS.filter((d) => d.plugin === "reminder");
+  must(seeds.length === 1 && seeds[0]!.alias === "reminder" && !seeds[0]!.secretRef, `the reminder seed: ${JSON.stringify(seeds)}`);
+  must(seeds[0]!.for.join() === "console" && seeds[0]!.since === 2, `the seed is not for console agents only, added in revision 2: ${JSON.stringify(seeds[0])}`);
+  // The rows before it: every kind of agent provisioning judges, revision 1.
+  const before = AgentRuntime.DEFAULT_MOUNTS.filter((d) => d.plugin !== "reminder");
+  must(before.length === 7 && before.every((d) => d.for.join() === "console,raft" && d.since === 1), `the first seven rows: ${JSON.stringify(before.map((d) => [d.alias, d.for, d.since]))}`);
+  // Unavailable exactly where every call refuses, with the same reason.
+  must(createReminderPlugin().unavailable?.() === NO_CREDENTIAL, "no config: not unavailable");
+  must(createReminderPlugin({ clientCredential: CREDENTIAL }).unavailable?.() === NO_ORIGIN, "no origin: not unavailable");
+  must(createReminderPlugin({ clientCredential: CREDENTIAL, serviceUrl: "http://reminders.example.com" }).unavailable?.() === NO_ORIGIN, "an http origin: not unavailable");
+  must(createReminderPlugin({ clientCredential: CREDENTIAL, serviceUrl: SERVICE_URL }).unavailable?.() === null, "configured: unavailable");
 });
 
 // ---- the HTTP client, against a fake reminder-app
