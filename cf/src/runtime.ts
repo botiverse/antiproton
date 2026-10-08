@@ -176,7 +176,8 @@ export interface SeedMount {
   secretRef?: string | null; policy?: MountPolicy | null;
   /** Which kinds of agent the seed is for; absent means every kind. Judged by `seedApplies`. */
   for?: readonly AgentKind[];
-  /** The catalogue revision that added this entry. Declared only: nothing reads it yet. */
+  /** The catalogue revision that added this entry; with the alias, the entry's identity in an agent's record
+   *  (src/store/seed-record.ts). Absent reads as 1. */
   since?: number;
 }
 
@@ -209,6 +210,30 @@ export function seedApplies(seed: SeedMount, kind: AgentKind | null, plugin: Plu
   if (kind !== null && seed.for && !seed.for.includes(kind)) return false;
   return !plugin?.unavailable?.();
 }
+
+/**
+ * What a catalogue pass on one agent is judged from, as one string: the catalogue (its revision, the highest
+ * `since`, and the entries themselves), the agent's kind, its answers about the catalogue's plugins, and which of
+ * those plugins the deployment cannot run. A pass whose key equals the one stored on the agent does nothing
+ * (src/store/seed-record.ts). Each part is here because a change in it can change an outcome: an owner switching a
+ * plugin back on, a deployment gaining the configuration a plugin lacked, an agent Raft adopts. So `declined` and
+ * `unavailable` are not final; `added` is, and that is the record's rule, not the key's.
+ */
+export function seedKey(
+  catalogue: readonly SeedMount[], kind: AgentKind, choices: Record<string, PluginChoice>, unavailable: readonly string[],
+): { key: string; revision: number } {
+  const revision = Math.max(0, ...catalogue.map((m) => m.since ?? 1));
+  const ids = [...new Set(catalogue.map((m) => m.plugin))].sort();
+  return {
+    revision,
+    key: JSON.stringify({
+      revision, kind,
+      entries: catalogue.map((m) => `${m.alias}@${m.since ?? 1}:${m.plugin}`),
+      choices: ids.filter((p) => choices[p] !== undefined).map((p) => `${p}:${choices[p]}`),
+      unavailable: [...unavailable].sort(),
+    }),
+  };
+}
 import { credentialForm, pluginEnabled, renameSafety, isExclusive, backgroundOf, interruptsOf, toolsOf } from "../../src/plugins/types.ts";
 import { githubPlugin } from "../../src/plugins/github.ts";
 import { demoPlugin } from "../../src/plugins/demo.ts";
@@ -224,6 +249,7 @@ import { createReminderPlugin } from "../../src/plugins/reminder.ts";
 import { PROVISION_MOUNT_ALIAS, PROVISIONED_BY } from "./provision/steps.ts";
 import { toAgentRef } from "../../src/store/refs.ts";
 import type { Plugin, PluginChoice } from "../../src/plugins/types.ts";
+import type { SeedPassResult, SeedPlan } from "../../src/store/seed-record.ts";
 import type { ToolInterrupt, ToolResult } from "../../src/core/tools.ts";
 import type { Json } from "../../src/core/types.ts";
 import type { ModelResponse } from "../../src/model/types.ts";
@@ -1781,8 +1807,9 @@ export class AgentRuntime {
    * Derived rather than stored. The catalogue is already the one place that
    * says which mounts an agent gets and what each is seeded with, and a copy
    * kept beside the mount would be a second answer that can disagree with it
-   * (#531). `provision` applies these at creation only, so this says what the
-   * deployed catalogue holds now, not what this agent was seeded from; where
+   * (#531). An entry reaches an agent once (`reconcileSeeds`) and its settings
+   * are not re-applied by that, so this says what the deployed catalogue holds
+   * now, not what this agent was seeded from; where
    * those differ, the revert points at today's answer, which is the same rule
    * a new agent gets.
    *
@@ -1807,6 +1834,13 @@ export class AgentRuntime {
     return this.#gateway;
   }
 
+  /**
+   * The agent's record, then its mounts. With the catalogue (no `chosen`), the mounts are the turn-start reconcile's
+   * (`reconcileSeeds`), so a new agent and an existing one are seeded by the same pass and the same record. With
+   * `chosen`, the list is the caller's own and is added as given, and the agent is marked so that no reconcile ever
+   * touches it: a bench arm measures exactly the tools it mounted, and an Agents API agent has what its caller
+   * declared.
+   */
   async provision(
     tenantId: string,
     agentId: string,
@@ -1817,8 +1851,7 @@ export class AgentRuntime {
     // The record and the mounts are separate questions. An agent the console
     // created has a record (name, description) and no mounts yet; the old
     // guard read "record exists" as "already provisioned" and gave such an
-    // agent its first run with no tools and no memory. Each seed mount is
-    // added only if absent, so this is safe to call on every first run.
+    // agent its first run with no tools and no memory.
     let created = false;
     const record = await this.store.loadAgent(tenantId, agentId);
     if (!record) {
@@ -1827,70 +1860,120 @@ export class AgentRuntime {
     }
     // A caller's own list is its choice of mounts for this agent (a bench arm, the Agents API's container), so
     // a row's `for` is not asked of it; whether the deployment can run the plugin still is.
-    const kind = opts.chosen === true ? null : agentKind(record?.config);
-    const applies = mounts.filter((m) => seedApplies(m, kind, this.#plugins.find((p) => p.id === m.plugin)));
-    // Asked before anything is added, because this runs on every console open
-    // and not only at creation: without it, turning a plugin off would last
-    // until the next page load and then be undone by the reconcile, which
-    // would look like the switch not working rather than like a rule being
-    // applied twice.
-    const choices = await this.store.pluginChoices(tenantId, agentId);
-    // A caller that hands over its own seed list has chosen those plugins: a
-    // benchmark arm seeding `retail`, a demo seeding `ops`. #491 made the
-    // catalogue the only source of "on by default", and this path was never
-    // told — so a non-default plugin in an explicit list was skipped below
-    // without a word, and the retail tools vanished from every bench agent the
-    // first time #491 reached production: the 2026-09-28 12:53Z τ² round (build c26ebd4) went
-    // 0/24 with no retail tool in the histogram.
-    // The choice is recorded, not bypassed, so the catalogue and the gateway
-    // agree with what was mounted; an explicit "disable" still wins.
-    // Said, not inferred: array identity told a fresh copy of the defaults apart from the defaults,
-    // which is not the question.
+    // Said, not inferred: array identity told a fresh copy of the defaults apart from the defaults, which is not the question.
     const explicit = opts.chosen === true;
-    // The plugins this agent already has a mount of, under any alias: read once, and kept as seeds are added.
-    const held = new Set((await this.store.listMounts(tenantId, agentId)).map((x) => x.plugin));
+    const kind = explicit ? null : agentKind(record?.config);
+    const applies = mounts.filter((m) => seedApplies(m, kind, this.#plugins.find((p) => p.id === m.plugin)));
+    if (!explicit) {
+      await this.reconcileSeeds(tenantId, agentId, mounts);
+      // The seeds that apply to this agent, so a caller that reconciles their settings (`uiEnsure`) judges the same set.
+      return { agentId, created, seeds: applies };
+    }
+    // Before anything is added: a pass between the adds and the mark would read this agent as the catalogue's.
+    await this.store.markSeedsChosen(tenantId, agentId);
+    const choices = await this.store.pluginChoices(tenantId, agentId);
     for (const m of mounts) {
       // The skip comes first on purpose: the assert below runs only for a
-      // mount being added, so an open of an agent that already has its seeds
-      // costs one list and one read per seed, and no validation. Moving the assert above
-      // this line would run it on every open of every agent.
+      // mount being added, so a repeat costs one read per seed, and no validation.
       if (await this.store.getMountByAlias(tenantId, agentId, m.alias)) continue;
-      // Nor beside a mount of the same plugin under another alias: two identical tool sets under two aliases
-      // confuse the model, and can create duplicates (a second reminder registration, a second hook). For the
-      // first rows it also keeps an operator's rename (`web` -> `x`) from re-adding a second http mount as `web`
-      // on the next open. The catalogue's rows only: an explicit list is the caller's own choice of mounts, and
-      // may name one plugin twice on purpose (two accounts).
-      if (!explicit && held.has(m.plugin)) continue;
-      // Before the choice below is recorded: a seed that is not for this agent is not one it has chosen either.
+      // Before the choice below is recorded: a seed the deployment cannot run is not one the agent has chosen either.
+      // No rule against a plugin already held under another alias: the list may name one plugin twice on purpose
+      // (two accounts).
       if (!applies.includes(m)) continue;
-      // A seed the agent has turned off is not added. Only the adding is
-      // governed here: a mount that already exists is left alone, because
-      // switching a plugin off must not destroy the credential and the
-      // database behind it — the gateway and the catalogue withhold
-      // it instead, and switching it back on returns what was there.
+      // A caller that hands over its own seed list has chosen those plugins: a
+      // benchmark arm seeding `retail`, a demo seeding `ops`. #491 made the
+      // catalogue the only source of "on by default", and this path was never
+      // told — so a non-default plugin in an explicit list was skipped below
+      // without a word, and the retail tools vanished from every bench agent the
+      // first time #491 reached production: the 2026-09-28 12:53Z τ² round (build c26ebd4) went
+      // 0/24 with no retail tool in the histogram.
+      // The choice is recorded, not bypassed, so the catalogue and the gateway
+      // agree with what was mounted; an explicit "disable" still wins.
       const declared = this.#plugins.find((p) => p.id === m.plugin);
-      if (declared && explicit && !SEEDED_PLUGINS.has(m.plugin) && choices[m.plugin] !== "disable" && choices[m.plugin] !== "enable") {
+      if (declared && !SEEDED_PLUGINS.has(m.plugin) && choices[m.plugin] !== "disable" && choices[m.plugin] !== "enable") {
         await this.store.setPluginChoice(tenantId, agentId, m.plugin, "enable");
         choices[m.plugin] = "enable";
       }
+      // Only the adding is governed here: a mount that already exists is left
+      // alone, because switching a plugin off must not destroy the credential and
+      // the database behind it.
       if (declared && !pluginEnabled(SEEDED_PLUGINS.has(m.plugin), choices[m.plugin])) continue;
-      // The seed is hand-written and reaches every agent, and the console's
-      // validator only shows problems to whoever opens the plugins page. The
-      // throwing one had no caller at all. A misspelt setting is refused here,
-      // at the first agent it would have reached, rather than becoming the
-      // plugin's silent default everywhere.
-      const plugin = this.#plugins.find((p) => p.id === m.plugin);
-      if (plugin) assertMountConfig(plugin, (m.config ?? { account: m.account }) as Record<string, Json>, m.secretRef ?? null);
+      // A misspelt setting is refused here, at the first agent it would have
+      // reached, rather than becoming the plugin's silent default everywhere.
+      if (declared) assertMountConfig(declared, (m.config ?? { account: m.account }) as Record<string, Json>, m.secretRef ?? null);
       await this.store.addMount({
         tenantId, agentId, alias: m.alias, plugin: m.plugin,
         installationId: seedInstallation(m.alias), connectionId: null,
         toolVersion: this.pluginVersion(m.plugin) ?? "1.0.0",
         publicConfig: m.config ?? { account: m.account }, secretRef: m.secretRef ?? null, policy: m.policy ?? null,
       });
-      held.add(m.plugin);
     }
-    // The seeds that apply to this agent, so a caller that reconciles them (`uiEnsure`) judges the same set.
     return { agentId, created, seeds: applies };
+  }
+
+  /**
+   * Bring an agent up to the deployment catalogue: add the entries it is missing, and record what became of each
+   * (src/store/seed-record.ts). Called where a turn starts — `postMessage`, which every prompt, steer, follow-up,
+   * hook or Raft push, background completion and lease warning goes through — and where an agent is made or its
+   * console page opened (`provision`). Never from `agent()`, which status, transcript and queue reads also open,
+   * nor from any read path: reading an agent must not change it.
+   *
+   * Before the turn reads its tools: `postMessage` opens the harness after this, and a harness whose catalogue key
+   * (`catalogueKey`) moved is rebuilt unless a turn is running, so what is added here is offered in this same turn.
+   *
+   * Never an Agents API agent (its kind), nor one whose mounts a caller chose (a bench arm; `provision` with
+   * `chosen` marks it). An agent with no record is not made here; `provision` makes agents.
+   *
+   * An unchanged key is three reads (the record, the plugin choices, the agent's catalogue row) and no write. A
+   * changed one is a single store transaction, so two turn starts racing add each mount once.
+   *
+   * `added` is what this pass mounted: what the agent should be told it now has.
+   */
+  async reconcileSeeds(
+    tenantId: string, agentId: string, catalogue: readonly SeedMount[] = AgentRuntime.DEFAULT_MOUNTS,
+  ): Promise<SeedPassResult | { ran: false; why: "no agent" | "api" }> {
+    await this.ready();
+    const record = await this.store.loadAgent(tenantId, agentId);
+    if (!record) return { ran: false, why: "no agent" };
+    const kind = agentKind(record.config);
+    if (kind === "api") return { ran: false, why: "api" };
+    const choices = await this.store.pluginChoices(tenantId, agentId);
+    const byId = new Map(this.#plugins.map((p) => [p.id, p]));
+    const unavailable = new Map<string, string>();
+    for (const m of catalogue) {
+      const why = byId.get(m.plugin)?.unavailable?.();
+      if (why) unavailable.set(m.plugin, why);
+    }
+    const { key, revision } = seedKey(catalogue, kind, choices, [...unavailable.keys()]);
+    const plan: SeedPlan[] = catalogue.map((m) => {
+      const entry = { alias: m.alias, plugin: m.plugin, since: m.since ?? 1 };
+      if (m.for && !m.for.includes(kind)) return { ...entry, withheld: "not-for", reason: `for ${m.for.join(", ")} agents; this one is ${kind}` };
+      const missing = unavailable.get(m.plugin);
+      if (missing) return { ...entry, withheld: "unavailable", reason: missing };
+      const plugin = byId.get(m.plugin);
+      if (plugin && !pluginEnabled(SEEDED_PLUGINS.has(m.plugin), choices[m.plugin])) {
+        return { ...entry, withheld: "declined", reason: `${m.plugin} is switched off for this agent` };
+      }
+      const config = (m.config ?? { account: m.account }) as Record<string, Json>;
+      // The seed is hand-written and reaches every agent: a misspelt setting is refused at the first agent it
+      // would have reached, and said in the record, rather than becoming the plugin's silent default everywhere.
+      const problems = plugin ? validateMount(plugin, config, m.secretRef ?? null) : [];
+      if (problems.length) return { ...entry, withheld: "refused", reason: problems.map((x) => x.message).join("; ") };
+      return {
+        ...entry,
+        mount: {
+          tenantId, agentId, alias: m.alias, plugin: m.plugin,
+          installationId: seedInstallation(m.alias), connectionId: null,
+          toolVersion: this.pluginVersion(m.plugin) ?? "1.0.0",
+          publicConfig: config, secretRef: m.secretRef ?? null, policy: m.policy ?? null,
+        },
+      };
+    });
+    const out = await this.store.reconcileSeeds(tenantId, agentId, { key, revision, plan });
+    if (out.ran) {
+      for (const r of out.changed) if (r.outcome === "refused") console.warn(`seed ${r.alias}@${r.since} refused for ${agentId}: ${r.reason}`);
+    }
+    return out;
   }
 
   /**
@@ -2705,6 +2788,13 @@ export class AgentRuntime {
     session: string = MAIN_SESSION,
     opts: { retake?: "await" | "background"; beforeSay?: () => void } = {},
   ) {
+    // Every turn starts here, in every mode — a steer is how a console message arrives, and pushes, background
+    // completions and lease warnings are prompts — so the catalogue is reconciled here, before the harness is
+    // opened below, and what it adds is offered in this turn (`reconcileSeeds`). A failure is logged and never
+    // fails the message: the next turn tries again, since nothing was stored.
+    // The pass's `added` rows are the seam for telling the agent, in this turn, what it now has.
+    await this.reconcileSeeds(tenantId, agentId)
+      .catch((e) => console.error(`reconciling ${tenantId}/${agentId} with the catalogue failed:`, e));
     // A new turn, so a tool list taken under another basis is taken again first (`retakeStaleSnapshots`), before the
     // harness is judged: a re-taken list changes the snapshot's hash, which is in `catalogueKey`, so the turn is built
     // with the new tools (or, if one is still running and this lands as a steer, the next one is). Not for a steer or

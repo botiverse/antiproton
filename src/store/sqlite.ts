@@ -22,6 +22,7 @@ import type {
 } from "../core/types.ts";
 import { appendTrace, type TraceRow } from "../trace/outbox.ts";
 import { approvalRow, operationEnded, toolCallRow } from "../trace/seams.ts";
+import { applySeedPass, markSeedsChosen, readSeedRecord, SEED_RECORD_SCHEMA, type SeedPlan } from "./seed-record.ts";
 
 const SCHEMA = `
 PRAGMA journal_mode = WAL;
@@ -179,6 +180,7 @@ export class SqliteStore implements StorageAdapter {
 
   async init() {
     this.#db.exec(SCHEMA);
+    for (const stmt of SEED_RECORD_SCHEMA) this.#db.exec(stmt);
     this.pluginDb.ensure();
     // CREATE TABLE IF NOT EXISTS silently accepts an existing table that lacks
     // the column, so an object created before this change would never get it.
@@ -1103,6 +1105,18 @@ export class SqliteStore implements StorageAdapter {
       .prepare("SELECT plugin, state FROM agent_plugins WHERE tenant_id=? AND agent_id=?")
       .all(tenantId, agentId) as any[]) out[r.plugin] = r.state as PluginChoice;
     return out;
+  }
+
+  async seedRecord(tenantId: string, agentId: string) {
+    return readSeedRecord(this.#usageSql(), tenantId, agentId);
+  }
+
+  async markSeedsChosen(tenantId: string, agentId: string) {
+    markSeedsChosen(this.#usageSql(), tenantId, agentId, now());
+  }
+
+  async reconcileSeeds(tenantId: string, agentId: string, pass: { key: string; revision: number; plan: readonly SeedPlan[] }) {
+    return this.#tx(() => applySeedPass(this.#usageSql(), tenantId, agentId, pass, now()));
   }
 
   async setPluginChoice(tenantId: string, agentId: string, plugin: string, choice: PluginChoice) {

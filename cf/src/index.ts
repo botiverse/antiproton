@@ -1605,9 +1605,10 @@ export class AgentDO extends DurableObject<Env> {
       // storage instead of as text. Both were invisible until something else
       // broke. Config and policy are now compared, not merely defaulted.
       const desired = AgentRuntime.DEFAULT_MOUNTS;
-      // One add path for both routes in: provision adds what is missing and
-      // validates each seed as it goes. What the console adds on top is the
-      // reconcile below, for a mount that exists but no longer matches.
+      // One add path for every route in: provision makes the record and runs
+      // the catalogue reconcile (`reconcileSeeds`), which a turn start runs too.
+      // What the console adds on top is the settings reconcile below, for a
+      // mount that exists but no longer matches.
       // Reconciled over the seeds that apply to this agent (`seedApplies`: its kind, the plugin's availability):
       // one that does not is not this agent's, so a mount under its alias is left as it is.
       const { seeds } = await rt.provision(tenantId, agentId, desired);
@@ -2089,7 +2090,7 @@ export class AgentDO extends DurableObject<Env> {
 
   /**
    * A push at one of this agent's hooks, answered once it is verified, deduplicated, rate-checked and queued
-   * (`AgentRuntime.receiveHook`). Everything else — the post, the harness it opens, provisioning and the
+   * (`AgentRuntime.receiveHook`). Everything else — the post, the harness it opens, the catalogue reconcile and the
    * model binding — is the alarm pass's (`#deliverInbound`), armed here before the answer leaves: the queue
    * is durable and the alarm is, so an eviction after the answer loses neither. `ms` is this object's own
    * share of the answer, for the worker's `http` line.
@@ -2108,9 +2109,9 @@ export class AgentDO extends DurableObject<Env> {
 
   /**
    * The deferred half of a push (`hookReceive`), from the alarm pass, before the step: the step then drives
-   * the turn the post started. Provisioning and the model binding go first, once in a pass that posts rather
-   * than once per push, so the turn is built with what they add; neither may stop the post, which the
-   * service was already told about.
+   * the turn the post started. The model binding goes first, once in a pass that posts rather than once per
+   * push, so the turn is built with it; it may not stop the post, which the service was already told about.
+   * The catalogue is reconciled by the post itself (`postMessage`).
    */
   async #deliverInbound(tenantId: string, agentId: string) {
     // Asked of the table itself, before any runtime is built: most passes have nothing queued, and an
@@ -2123,11 +2124,11 @@ export class AgentDO extends DurableObject<Env> {
       // Only when a row is about to be posted, never in a pass that only waits out a retry.
       beforeFirstPost: async () => {
         try {
-          // An agent Raft made has the default mounts (provision/steps.ts), and gets one added since on its
-          // next wake, the way a console agent gets it when its page opens. Only what is missing is added.
+          // The catalogue is not this hook's: the post below is a turn start, and `postMessage` reconciles every
+          // agent's mounts there (`reconcileSeeds`). The model binding follows the operator's choice for an agent
+          // Raft made, which has no console page to do it on open.
           const agent = await rt.store.loadAgent(tenantId, agentId);
           if (agentKind(agent?.config) === "raft") {
-            await rt.provision(tenantId, agentId);
             await this.#bindModel(rt, tenantId, agentId, { onlyIfStale: true });
           }
         } catch (e: any) {

@@ -173,3 +173,24 @@ export function leaseRow(o: { tenantId: string; agentId: string; alias: string }
 export function releasedFacts(x: unknown): Released[] {
   return Array.isArray(x) ? x.filter(isReleased) : isReleased(x) ? [x] : [];
 }
+
+/**
+ * The mount.seeded row for one catalogue entry whose outcome on this agent just changed
+ * (src/store/seed-record.ts). Its span is the entry, `<alias>@<since>`, which is the outcome row's key, so the
+ * row joins back to the record that says the same thing. `added` and `present` are the entry reaching the agent;
+ * `not-for` is the catalogue saying it should not; the two an owner or operator can lift are `blocked`, and a
+ * refusal (the alias taken by another plugin, a seed whose settings do not validate) is `failed`.
+ */
+export function seededRow(s: {
+  tenantId: string; agentId: string; alias: string; plugin: string; since: number;
+  outcome: "added" | "present" | "declined" | "not-for" | "unavailable" | "refused"; reason: string | null; at: number;
+}): TraceRow {
+  const verdict: TraceVerdict = s.outcome === "refused" ? "failed"
+    : s.outcome === "declined" || s.outcome === "unavailable" ? "blocked" : "ok";
+  return {
+    at: s.at, tenantId: s.tenantId, agentId: s.agentId,
+    kind: "mount.seeded", spanId: `${s.alias}@${s.since}`,
+    status: s.outcome, verdict,
+    attrs: { alias: s.alias, plugin: s.plugin, since: s.since, outcome: s.outcome, reason: s.reason },
+  };
+}

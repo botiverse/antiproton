@@ -1,3 +1,4 @@
+import type { SeedPassResult, SeedPlan, SeedRecord } from "../store/seed-record.ts";
 import type {
   AdvanceTxn,
   CommitResult,
@@ -388,6 +389,21 @@ export interface StorageAdapter {
    * per installed plugin.
    */
   pluginChoices(tenantId: string, agentId: string): Promise<Record<string, PluginChoice>>;
+
+  /**
+   * This agent's record of the deployment catalogue: the key it last reconciled to and each entry's outcome
+   * (src/store/seed-record.ts). Read-only.
+   */
+  seedRecord(tenantId: string, agentId: string): Promise<SeedRecord>;
+  /** This agent's mounts are its caller's explicit list (`provision` with `chosen`): never reconciled. */
+  markSeedsChosen(tenantId: string, agentId: string): Promise<void>;
+  /**
+   * One catalogue pass, in one transaction: the key compared, the mounts added, the outcomes and their
+   * `mount.seeded` trace rows written, the key stored. Two passes racing therefore add one mount between them.
+   */
+  reconcileSeeds(
+    tenantId: string, agentId: string, pass: { key: string; revision: number; plan: readonly SeedPlan[] },
+  ): Promise<SeedPassResult>;
   /** `"inherit"` is stored as the absence of a row, not as a third value. */
   setPluginChoice(
     tenantId: string, agentId: string, plugin: string, choice: PluginChoice,
