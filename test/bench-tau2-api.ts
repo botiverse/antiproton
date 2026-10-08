@@ -207,8 +207,12 @@ function stream(events: SessionEvent[], endAfter = false) {
 }
 function waitDeps(open: TurnWaitDeps["open"], snapshot: TurnWaitDeps["snapshot"], extra: Partial<TurnWaitDeps> = {}) {
   const delivered: Delivered = { push: 0, poll: 0, pollAnswered: 0, pollFailed: 0, dropped: 0 };
-  const deps: TurnWaitDeps = { open, snapshot, count: (w) => { delivered[w] += 1; }, deaf: () => false, lookEveryMs: 30, ...extra };
-  return { deps, delivered };
+  const whys: string[] = [];
+  const deps: TurnWaitDeps = {
+    open, snapshot, count: (w) => { delivered[w] += 1; }, dropWhy: (why) => { whys.push(why); },
+    deaf: () => false, lookEveryMs: 30, ...extra,
+  };
+  return { deps, delivered, whys };
 }
 const answerEvents = between(wire([user(1, "hi")], { running: true }), wire(T1));
 
@@ -228,6 +232,41 @@ await check("wait: a stream that ends early is a drop, and the answer it missed 
   const d = await waitForTurn(-1, Date.now() + 5_000, async () => {}, deps);
   must(d?.kind === "answer" && d.text === "Hello", show(d));
   must(delivered.dropped >= 1 && delivered.poll === 1 && delivered.push === 0 && opened >= 2, show({ delivered, opened }));
+});
+
+await check("wait: a stream that ends early says why `end`", async () => {
+  const { deps, delivered, whys } = waitDeps(async () => stream([], true).open(), async () => snap(wire(T1)));
+  const d = await waitForTurn(-1, Date.now() + 5_000, async () => {}, deps);
+  must(d?.kind === "answer", show(d));
+  must(delivered.dropped >= 1 && whys.length >= 1 && whys[0] === "end", show({ delivered, whys }));
+});
+
+await check("wait: a stream whose open rejects once, then opens, says why `open: …` for the failure", async () => {
+  // Open keeps failing with no successful open: the status-read fallback never runs (it lives inside a
+  // stream), so the wait ends at the deadline — a permanently-down stream is the caller's stall, not a drop.
+  let first = true;
+  const flaky = async () => {
+    if (first) { first = false; throw new Error("GET events → 503: busy"); }
+    return stream(answerEvents).open();
+  };
+  const { deps, delivered, whys } = waitDeps(flaky, async () => snap(wire(T1)), { lookEveryMs: 10_000 });
+  const d = await waitForTurn(-1, Date.now() + 5_000, async () => {}, deps);
+  must(d?.kind === "answer" && d.text === "Hello", show(d));
+  must(delivered.dropped === 1 && whys.length === 1 && whys[0] === "open: GET events → 503: busy", show({ delivered, whys }));
+});
+
+await check("wait: a stream whose reader throws says why `error: …`, not `end`", async () => {
+  const broken = async () => ({
+    close: () => {},
+    events: (async function* () {
+      await new Promise((r) => setTimeout(r, 5));
+      throw new Error("read exploded");
+    })(),
+  });
+  const { deps, delivered, whys } = waitDeps(broken, async () => snap(wire(T1)));
+  const d = await waitForTurn(-1, Date.now() + 5_000, async () => {}, deps);
+  must(d?.kind === "answer", show(d));
+  must(delivered.dropped >= 1 && whys.some((w) => w.startsWith("error: read exploded")) && !whys.includes("end"), show({ delivered, whys }));
 });
 
 await check("wait: deaf to the stream, the stream's answer is dropped and the status read brings it; deaf to both, the deadline comes", async () => {

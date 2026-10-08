@@ -136,6 +136,8 @@ async function converse(task: any, d: ApiTaskDeps, t0: number, agentId: string, 
   const performed: Array<{ name: string; args: any }> = [];
   const delivered = zero();
   const answered = new Set<string>();
+  /** Why each drop happened (bench/tau2/api-turn.ts); capped, diagnostic only, no metric rides on it. */
+  const dropInfo: Array<{ why: string; atSec: number }> = [];
   const snapshot = async (): Promise<Snapshot> => {
     const [session, turns, items] = await Promise.all([
       c.v1("GET", `/agents/sessions/${sessionId}`), c.v1All(`/agents/sessions/${sessionId}/turns`), c.v1All(`/agents/sessions/${sessionId}/items`),
@@ -146,6 +148,7 @@ async function converse(task: any, d: ApiTaskDeps, t0: number, agentId: string, 
     open: () => c.openStream(sessionId),
     snapshot,
     count: (what: keyof Delivered) => { delivered[what] += 1; },
+    dropWhy: (why: string) => { if (dropInfo.length < 8) dropInfo.push({ why, atSec: Math.round((Date.now() - t0) / 1000) }); },
     deaf: (to: "socket" | "poll") => d.deafness.deaf(to),
     say: d.say,
     lookEveryMs: d.lookEveryMs,
@@ -231,6 +234,7 @@ async function converse(task: any, d: ApiTaskDeps, t0: number, agentId: string, 
     object, activity, provider,
     reward: dbMatch && actionMatch ? 1 : 0, dbMatch, actionMatch, ended, stall, stallWhy,
     simLast: simLast.slice(0, SIM_LAST_MAX),
+    ...(dropInfo.length ? { dropInfo } : {}),
     delivered, turns: turns - 1, simCalls,
     usage: figures.usage, kinds, byTool: figures.byTool, toolErrors: figures.toolErrors,
     seconds: Math.round((Date.now() - t0) / 1000),
