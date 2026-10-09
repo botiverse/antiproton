@@ -20,6 +20,8 @@ import { canonJson } from "../src/core/canon-json.ts";
 import { seedSnapshot, sha256Hex } from "../src/store/seed-files.ts";
 import { ensureClientCalls } from "../src/runtime/client-calls.ts";
 import { callQueuedModel } from "../cf/src/model-request.ts";
+import { appendTrace } from "../src/trace/outbox.ts";
+import { evalTranscript, type EvalTranscript } from "../cf/src/eval-read.ts";
 
 const STAND_IN = "export class DurableObject { constructor(ctx, env) { this.ctx = ctx; this.env = env; } }" +
   " export class WorkerEntrypoint { constructor(ctx, env) { this.ctx = ctx; this.env = env; } }" +
@@ -46,11 +48,13 @@ const USAGE = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2
 const lines: string[] = [];
 setLogSink((line) => { lines.push(line); });
 
+/** What `pushy`'s one tool answers: `{}`, or what a case that needs a particular tool result sets. */
+let pushyAnswer: Record<string, unknown> = {};
 /** A push plugin as in test/hook-fast-ack.ts, minus the HMAC: the hook's secret in a header, `{id, text}` as the body. */
 const pushy: Plugin = {
   id: "pushy", version: "1.0.0",
   tools: [{ name: "noop", summary: "", parameters: {}, sideEffects: "read", idempotency: "native" }],
-  async invoke() { return {}; },
+  async invoke() { return pushyAnswer as never; },
   async receive(event, secret) {
     if (event.headers["x-signed-with"] !== secret) return { deliver: false, reason: "bad signature", rejected: true };
     const body = JSON.parse(new TextDecoder().decode(event.body)) as { id: string; text: string };
@@ -258,7 +262,8 @@ await check("without EVAL_SEED_ROUTES = \"1\" every setup route is 404 as an unk
   for (const flag of [null, "0", "true", " 1"]) {
     const w = await world(flag);
     for (const [method, path, body] of [["PUT", `${A}/seed?path=MEMORY.md`, "x"], ["POST", `${A}/seed/seal`, undefined],
-      ["GET", `${A}/seed/manifest`, undefined], ["POST", `${A}/fresh-context`, undefined], ["POST", `${A}/restart`, undefined], ["GET", `${A}/model-input`, undefined], ["GET", `${A}/tools`, undefined]] as const) {
+      ["GET", `${A}/seed/manifest`, undefined], ["POST", `${A}/fresh-context`, undefined], ["POST", `${A}/restart`, undefined], ["GET", `${A}/model-input`, undefined], ["GET", `${A}/tools`, undefined],
+      ["GET", `${A}/transcript`, undefined], ["GET", `${A}/trace`, undefined]] as const) {
       const r = await call(w, method, path, { ...(body === undefined ? {} : { body }) });
       must(r.status === 404 && r.body?.error?.code === "not_found" && /raft-agent-provider\.v1/.test(r.body.error.message), `${flag} ${method} ${path}: ${r.status} ${r.text}`);
     }
@@ -1143,6 +1148,278 @@ await check("toolConfig: under minimal a held raft send reaches the model as res
     await settle(w, 4);
     must(sendCount() === 2 && jobCount(w) === 3, `after the turn ended: ${sendCount()} sends, ${jobCount(w)} jobs`);
   } finally { globalThis.fetch = real; }
+});
+
+// ---- the transcript and trace exports ---------------------------------------
+
+/** Every table of the object and every row of each, so a read can be seen to have changed nothing at all. */
+const dump = (sql: { exec(q: string): { toArray(): any[] } }) => show(tableNames(sql).map((t) =>
+  [t, sql.exec(`SELECT * FROM "${t}"`).toArray().map((r) => JSON.stringify(r, (_k: string, v: unknown) => (v instanceof Uint8Array ? [...v] : v))).sort()]));
+/** The bucket's keys and bytes. */
+const bucketDump = (w: World) => show([...w.R2.objects.entries()].map(([k, v]) => [k, [...v].length]).sort());
+/** The fake bucket lists nothing (other cases rely on that); the trace export lists one agent's prefix, so here it does. */
+function listByPrefix(w: World) {
+  (w.R2 as any).list = async (o: { prefix?: string } = {}) => ({
+    objects: [...w.R2.objects.keys()].filter((k) => k.startsWith(o.prefix ?? "")).sort().map((key) => ({ key, uploaded: new Date() })),
+    delimitedPrefixes: [], truncated: false,
+  });
+}
+/**
+ * One turn in which the model calls `tool` (`p__noop`, which answers `result`, unless another is named), and then ends
+ * with `reply`; `base` is the jobs before it.
+ */
+async function toolTurn(w: World, prompt: string, result: Record<string, unknown>, reply: string, args: Record<string, unknown> = {}, tool = "p__noop") {
+  const base = jobCount(w);
+  pushyAnswer = result;
+  try {
+    await w.rt.postMessage(T, A, prompt, "prompt");
+    await settle(w, base + 1);
+    must(jobCount(w) === base + 1, `the turn did not reach the model: ${jobCount(w)} jobs`);
+    const job = JSON.parse(await asked(w, base)) as { model?: { api?: string; provider?: string } };
+    await w.D.deliverAnswer(T, A, w.jobs[base]!, { role: "assistant", content: [{ type: "text", text: "calling" }, { type: "toolCall", id: `call-${base}`, name: tool, arguments: args }],
+      api: job.model?.api ?? "x", provider: job.model?.provider ?? "x", model: "m1", usage: USAGE, stopReason: "toolUse", timestamp: 0 } as never, 5);
+    await settle(w, base + 2);
+    must(jobCount(w) === base + 2, `the tool's result did not go back to the model: ${jobCount(w)} jobs`);
+    await answer(w, base + 1, reply);
+    for (let i = 0; i < 5 && !(await engineIdle(w)); i++) await w.D.alarm();
+    must(await engineIdle(w), "the turn did not end");
+  } finally { pushyAnswer = {}; }
+}
+const admin = async (w: World, taskId?: string) => {
+  const res = await worker.fetch(new Request(`https://x/admin/transcript?tenantId=${T}&agentId=${A}${taskId ? `&taskId=${taskId}` : ""}`,
+    { headers: { "x-harness-token": AUTOMATION } }), w.env as never);
+  return { status: res.status, body: await res.json() as any };
+};
+
+await check("transcript and trace: another tenant's token and an unknown agent are 404, no token is 401", async () => {
+  const w = await world();
+  for (const route of ["transcript", "trace"]) {
+    const other = await call(w, "GET", `${A}/${route}`, { auth: w.other });
+    must(other.status === 404 && other.body?.error?.code === "not_found" && !other.text.includes('"events"') && !other.text.includes('"rows"'), `${route} another tenant: ${other.status} ${other.text}`);
+    must((await call(w, "GET", `raft_nobody/${route}`)).status === 404, `${route}: an unknown agent`);
+    must((await call(w, "GET", `${A}/${route}`, { auth: null })).status === 401, `${route}: no credential`);
+    must((await call(w, "POST", `${A}/${route}`)).status === 404, `${route}: POST is a route`);
+    const ok = await call(w, "GET", `by-raft-agent/01JEVAL/${route}`);
+    must(ok.status === 200 && ok.body.agentId === A && ok.body.redactions === 0, `${route} control: ${ok.status} ${ok.text.slice(0, 300)}`);
+  }
+});
+
+await check("transcript: the same events, approvals and total as /admin/transcript for the agent, tool calls with arguments and results with status and body", async () => {
+  const w = await world();
+  await toolTurn(w, "PROMPT-MARKER-1a2b", { rows: [{ id: 1, note: "RESULT-MARKER-3c4d" }] }, "REPLY-MARKER-5e6f", { q: "ARGS-MARKER-7a8b" });
+  const ours = await call(w, "GET", `${A}/transcript`);
+  const theirs = await admin(w);
+  must(ours.status === 200 && theirs.status === 200, `${ours.status} ${theirs.status}`);
+  must(ours.body.sessionId === "main" && ours.body.current === true && ours.body.redactions === 0 && ours.body.nextCursor === null, ours.text.slice(0, 300));
+  must(show(ours.body.events) === show(theirs.body.events), `events differ:\n ours   ${show(ours.body.events).slice(0, 600)}\n admin  ${show(theirs.body.events).slice(0, 600)}`);
+  must(show(ours.body.byOp) === show(theirs.body.byOp) && ours.body.total === theirs.body.total && ours.body.shown === theirs.body.total, "byOp or total differ");
+  const kinds = ours.body.events.map((e: any) => e.kind);
+  must(show(kinds) === show(["message", "model.response", "tool.result", "model.response"]), `kinds: ${show(kinds)}`);
+  const callEv = ours.body.events[1].payload.toolCalls?.[0];
+  must(callEv?.name === "p__noop" && callEv.arguments.q === "ARGS-MARKER-7a8b", `the call: ${show(callEv)}`);
+  const result = ours.body.events[2].payload;
+  must(result.status === "succeeded" && result.isError === false && result.result.rows[0].note === "RESULT-MARKER-3c4d", `the result: ${show(result)}`);
+  must(ours.body.events[0].payload.text === "PROMPT-MARKER-1a2b" && ours.body.events[3].payload.text === "REPLY-MARKER-5e6f", "the prompt or reply");
+  // Paging: the same events, a page at a time, each page saying where the next starts.
+  const pages: any[] = [];
+  for (let cursor: string | null = "0"; cursor !== null;) {
+    const p = await call(w, "GET", `${A}/transcript?limit=3&cursor=${cursor}`);
+    must(p.status === 200 && p.body.shown <= 3 && p.body.total === 4, p.text.slice(0, 300));
+    pages.push(...p.body.events);
+    cursor = p.body.nextCursor;
+  }
+  must(show(pages) === show(theirs.body.events), "the pages are not the transcript");
+});
+
+await check("transcript: after a fresh context the ended conversation is read by its id, the current one by default, an unknown id is 404", async () => {
+  const w = await world();
+  await toolTurn(w, "OLD-PROMPT-91aa", { v: "OLD-RESULT-22bb" }, "OLD-REPLY-33cc");
+  must((await call(w, "POST", `${A}/fresh-context`)).body.newSessionId === "main.1", "fresh context");
+  await w.rt.postMessage(T, A, "NEW-PROMPT-44dd", "prompt");
+  const old = await call(w, "GET", `${A}/transcript?session=main`);
+  must(old.status === 200 && old.body.sessionId === "main" && old.body.current === false, old.text.slice(0, 300));
+  must(old.text.includes("OLD-RESULT-22bb") && old.text.includes("OLD-REPLY-33cc") && !old.text.includes("NEW-PROMPT-44dd"), "the ended conversation's content");
+  must(show(old.body.events) === show((await admin(w, "main")).body.events), "the ended conversation differs from the operator's read of it");
+  const now = await call(w, "GET", `${A}/transcript`);
+  const named = await call(w, "GET", `${A}/transcript?session=main.1`);
+  must(now.body.sessionId === "main.1" && now.body.current === true && now.text.includes("NEW-PROMPT-44dd") && !now.text.includes("OLD-PROMPT-91aa"), now.text.slice(0, 300));
+  must(show(named.body.events) === show(now.body.events) && show(now.body.events) === show((await admin(w)).body.events), "main.1 by name, by default and the operator's read differ");
+  const none = await call(w, "GET", `${A}/transcript?session=main.7`);
+  must(none.status === 404 && none.body.error.code === "not_found", none.text);
+});
+
+await check("transcript: a credential anywhere in a tool's result or arguments is replaced and counted; the sealed credential and mount secrets are never in it", async () => {
+  const v = await world("1", { post: {} });
+  await v.rt.store.setPluginChoice(T, A, "pushy", "enable");
+  await v.rt.store.addMount({ tenantId: T, agentId: A, alias: "p", plugin: "pushy", installationId: "i-p", connectionId: null,
+    toolVersion: "1.0.0", publicConfig: {}, secretRef: null, policy: null });
+  const KEY = "sk-" + "proj-" + "Kx7".repeat(12), AGENT_KEY = "sk_agent_" + "Ab3".repeat(8), GH = "ghp_" + "M".repeat(36);
+  await toolTurn(v, "use the tool", { page: { items: [{ meta: { auth: { header: `Bearer ${AGENT_KEY}` } } }, [[[KEY]]]], [GH]: "x" } }, "done", { token: KEY });
+  const r = await call(v, "GET", `${A}/transcript`);
+  must(r.status === 200, r.text.slice(0, 300));
+  for (const secret of [KEY, AGENT_KEY, GH, RAFT_CRED]) must(!r.text.includes(secret), `the export carries ${secret.slice(0, 8)}…`);
+  const result = r.body.events.find((e: any) => e.kind === "tool.result").payload.result;
+  must(result.page.items[0].meta.auth.header === "<redacted:Raft agent credential>" && result.page.items[1][0][0][0] === "<redacted:api-key>", show(result));
+  must(result.page["<redacted:github-token>"] === "x", show(result));
+  must(r.body.events.find((e: any) => e.kind === "model.response").payload.toolCalls[0].arguments.token === "<redacted:api-key>", "the call's argument");
+  // Exactly the four planted: the agent's sealed Raft credential (which has the same shape) was never there to count.
+  must(r.body.redactions === 4, `redactions: ${r.body.redactions}`);
+  // Positive control: the sealed credential is on the agent's mount, and the operator's unredacted read holds none of it either.
+  const mount = (await v.rt.store.listMounts(T, A)).find((m: any) => m.alias === "raft") as any;
+  must(mount?.secretRef, `the raft mount holds no sealed credential: ${show(mount)}`);
+  const plain = show((await admin(v)).body);
+  must(plain.includes(KEY) && !plain.includes(RAFT_CRED) && !plain.includes(String(mount.secretRef)), "the operator's read carries the sealed credential or its reference");
+  must(!r.text.includes(String(mount.secretRef)), "the export carries the mount's secret reference");
+});
+
+await check("transcript and trace: a kept secret never leaves — secret_put's value and secret_get's by tool, every exact appearance elsewhere, each counted", async () => {
+  const w = await world();
+  listByPrefix(w);
+  // A bare UUID, as Exa's key is: no shape finds it, so only the tool and the exact match can.
+  const SECRET = "0f8fad5b-d9cb-469f-a165-70867728950e";
+  await toolTurn(w, "keep this key", {}, "kept", { name: "exa", value: SECRET }, "state__secret_put");
+  await toolTurn(w, "read it back", {}, `the key is ${SECRET}`, { name: "exa" }, "state__secret_get");
+  await toolTurn(w, "echo", { [SECRET]: `x ${SECRET} y`, nested: JSON.stringify({ k: SECRET }) }, "done");
+  appendTrace(w.raw.sql as never, [{ at: Date.now(), tenantId: T, agentId: A, kind: "tool.call", spanId: "op_s", status: "succeeded", verdict: "ok", attrs: { tool: "pushy.noop", note: `saw ${SECRET}` } }]);
+  // Positive control: the operator's unredacted read holds it, in the call, the result, the reply and the echo.
+  const plain = show((await admin(w)).body);
+  must(plain.split(SECRET).length - 1 >= 6, `the fixture does not carry the secret where planted: ${plain.split(SECRET).length - 1}`);
+  const r = await call(w, "GET", `${A}/transcript`);
+  must(r.status === 200 && !r.text.includes(SECRET), `the export carries the secret: ${r.text.slice(0, 400)}`);
+  const calls = r.body.events.filter((e: any) => e.kind === "model.response").flatMap((e: any) => e.payload.toolCalls ?? []);
+  const put = calls.find((c: any) => c.name === "state__secret_put");
+  must(put?.arguments.name === "exa" && put.arguments.value === "<redacted:kept-secret>", `secret_put's arguments: ${show(put)}`);
+  const got = r.body.events.find((e: any) => e.kind === "tool.result" && e.payload.tool === "state__secret_get")?.payload;
+  must(got?.status === "succeeded" && got.result.name === "exa" && got.result.value === "<redacted:kept-secret>", `secret_get's result: ${show(got)}`);
+  must(r.body.events.some((e: any) => e.kind === "model.response" && e.payload.text === "the key is <redacted:agent-secret>"), "the reply that repeats it");
+  const echo = r.body.events.filter((e: any) => e.kind === "tool.result" && e.payload.tool === "p__noop").at(-1)?.payload.result;
+  must(echo?.["<redacted:agent-secret>"] === "x <redacted:agent-secret> y" && echo.nested === '{"k":"<redacted:agent-secret>"}', `the echo: ${show(echo)}`);
+  // One each: put's value, get's value (by tool), the reply, the echo's key, its value, the JSON inside a string.
+  must(r.body.redactions === 6, `redactions: ${r.body.redactions}`);
+  const t = await call(w, "GET", `${A}/trace`);
+  must(t.status === 200 && !t.text.includes(SECRET) && t.body.rows.some((x: any) => x.attrs.note === "saw <redacted:agent-secret>") && t.body.redactions >= 1, t.text.slice(0, 400));
+});
+
+await check("transcript and trace: a sealed value the object cannot open refuses the export (503) rather than send it unscrubbed", async () => {
+  const w = await world();
+  w.raw.sql.exec("INSERT INTO secrets(tenant_id, agent_id, name, ciphertext, iv, created_at, updated_at) VALUES (?, ?, 'kept:x', 'AAAA', 'AAAAAAAAAAAAAAAA', 0, 0)", T, A);
+  for (const route of ["transcript", "trace"]) {
+    const r = await call(w, "GET", `${A}/${route}`);
+    must(r.status === 503 && r.body.error.code === "unavailable" && !r.text.includes('"events"') && !r.text.includes('"rows"'), `${route}: ${r.status} ${r.text}`);
+  }
+});
+
+await check("transcript: a page stops before its serialized events pass the byte bound, at least one event, and says where to go on", async () => {
+  const w = await world();
+  await toolTurn(w, "a".repeat(3000), { big: "b".repeat(3000) }, "c".repeat(3000));
+  const id = (v: unknown) => ({ value: v, redactions: 0 });
+  const whole = evalTranscript(w.raw.sql as never, T, A, null, 0, 100, id)!;
+  must(whole.shown === whole.total && whole.total === 4 && whole.nextCursor === null, show({ shown: whole.shown, total: whole.total }));
+  const first = evalTranscript(w.raw.sql as never, T, A, null, 0, 100, id, 4000)!;
+  const bytes = (v: unknown) => new TextEncoder().encode(JSON.stringify(v)).byteLength;
+  must(first.shown > 0 && first.shown < first.total && first.nextCursor === String(first.shown), `a bound of 4000 bytes: ${show({ shown: first.shown, next: first.nextCursor })}`);
+  must(bytes(first.byOp) + first.events.reduce((n, e) => n + bytes(e), 0) <= 4000, "the page passes its bound");
+  const tiny = evalTranscript(w.raw.sql as never, T, A, null, 1, 100, id, 1)!;
+  must(tiny.shown === 1 && tiny.nextCursor === "2" && show(tiny.events[0]) === show(whole.events[1]), "a page under any bound still holds one event");
+  // Paging under the bound reaches every event once.
+  const all: unknown[] = [];
+  for (let c: string | null = "0"; c !== null;) { const p: EvalTranscript = evalTranscript(w.raw.sql as never, T, A, null, Number(c), 100, id, 4000)!; all.push(...p.events); c = p.nextCursor; }
+  must(show(all) === show(whole.events), "the bounded pages are not the conversation");
+});
+
+await check("transcript: a session that is not main or main.<n> is 422 before the object is asked, a task of the agent included", async () => {
+  const w = await world();
+  await toolTurn(w, "hello", {}, "done");
+  const task = String(w.raw.sql.exec("SELECT task_id FROM tasks LIMIT 1").toArray()[0]?.task_id ?? `t_${A}`);
+  for (const s of [task, `t_${A}`, "main.0", "main.01", "MAIN", "main.1.2"]) {
+    const r = await call(w, "GET", `${A}/transcript?session=${encodeURIComponent(s)}`);
+    must(r.status === 422 && r.body.error.param === "session", `${s}: ${r.status} ${r.text.slice(0, 200)}`);
+  }
+});
+
+await check("each transcript or trace read logs one eval.read line: route, session or window, count, redactions, token hash; never content", async () => {
+  const w = await world();
+  listByPrefix(w);
+  await toolTurn(w, "PROMPT-AUDIT-77", { key: "sk-" + "proj-" + "Kx7".repeat(12) }, "REPLY-AUDIT-88");
+  lines.length = 0;
+  const tr = await call(w, "GET", `${A}/transcript?limit=2`);
+  const tc = await call(w, "GET", `${A}/trace?from=${Date.now() - 3_600_000}`);
+  must(tr.status === 200 && tc.status === 200, `${tr.status} ${tc.status}`);
+  const ours = lines.map((l) => JSON.parse(l)).filter((l) => l.evt === "eval.read");
+  must(ours.length === 2, `lines: ${show(ours)}`);
+  const [a, b] = ours;
+  must(a.route === "transcript" && a.tenant === T && a.agent === A && a.session === "main" && a.count === 2 && a.cursor === 0 && a.redactions === tr.body.redactions && a.credentialId === w.tokenHash, show(a));
+  must(b.route === "trace" && b.from === tc.body.from && b.to === tc.body.to && b.count === tc.body.rows.length && b.redactions === tc.body.redactions && b.credentialId === w.tokenHash, show(b));
+  const logged = lines.join("\n");
+  must(!logged.includes("PROMPT-AUDIT-77") && !logged.includes("REPLY-AUDIT-88") && !logged.includes("Kx7Kx7") && !logged.includes(w.token), "a log line carries content or the token");
+});
+
+await check("trace: a turn's rows are read from the object, then from the bucket once the alarm pass exports and prunes them; the same rows either way", async () => {
+  const w = await world();
+  listByPrefix(w);
+  const t0 = Date.now() - 1;
+  await toolTurn(w, "trace me", { ok: 1 }, "done");
+  const before = await call(w, "GET", `${A}/trace`);
+  must(before.status === 200 && before.body.rows.length > 0 && before.body.redactions === 0, before.text.slice(0, 400));
+  must(before.body.rows.every((r: any) => r.tenantId === T && r.agentId === A && r.at >= t0), "a row of someone else or from before");
+  must(before.body.rows.some((r: any) => r.kind === "tool.call" && r.attrs.tool === "pushy.noop" && r.attrs.mount === "p"), `the tool call: ${show(before.body.rows)}`);
+  const seqs = before.body.rows.map((r: any) => r.seq);
+  must(show(seqs) === show([...seqs].sort((a: number, b: number) => a - b)), "rows not in seq order");
+  // The export: a pass with nothing else due still drains the outbox to the bucket.
+  for (let i = 0; i < 3 && w.raw.sql.exec("SELECT COUNT(*) AS n FROM trace_outbox").toArray()[0]!.n > 0; i++) await w.D.alarm();
+  const keys = [...w.R2.objects.keys()].filter((k) => k.startsWith(`trace/${T}/${A}/`));
+  must(keys.length > 0, `nothing exported: ${show([...w.R2.objects.keys()])}`);
+  const left = Number(w.raw.sql.exec("SELECT COUNT(*) AS n FROM trace_outbox").toArray()[0]!.n);
+  // Every row now only in the bucket: what follows reads it from there or not at all.
+  must(left === 0, `${left} rows still in the object after the export`);
+  const after = await call(w, "GET", `${A}/trace`);
+  must(after.status === 200 && show(after.body.rows) === show(before.body.rows), `rows moved across the export (${left} left locally):\n before ${show(before.body.rows.map((r: any) => r.seq))}\n after  ${show(after.body.rows.map((r: any) => r.seq))}`);
+  must(after.body.scanned.objects === keys.length, show(after.body.scanned));
+  // Limit and cursor: one row at a time reaches the same rows.
+  const one: any[] = [];
+  for (let cursor = "0"; ;) {
+    const p = await call(w, "GET", `${A}/trace?limit=1&cursor=${cursor}`);
+    must(p.status === 200 && p.body.rows.length <= 1, p.text.slice(0, 300));
+    one.push(...p.body.rows);
+    if (p.body.nextCursor === null) break;
+    cursor = p.body.nextCursor;
+  }
+  must(show(one) === show(before.body.rows), "paging one row at a time does not reach the same rows");
+  // A window that ends before the turn holds none of it.
+  const early = await call(w, "GET", `${A}/trace?from=${t0 - 3_600_000}&to=${t0}`);
+  must(early.status === 200 && early.body.rows.length === 0 && early.body.from === new Date(t0 - 3_600_000).toISOString(), early.text.slice(0, 300));
+});
+
+await check("transcript and trace write nothing: every table and row of the object, and the bucket, are as they were; no table is made", async () => {
+  // An agent that never traced anything: the outbox table does not exist, and reading it must not make it.
+  const fresh = await world();
+  listByPrefix(fresh);
+  must(!tableNames(fresh.raw.sql as never).includes("trace_outbox"), "the fixture already has an outbox");
+  const fresh0 = dump(fresh.raw.sql as never);
+  must((await call(fresh, "GET", `${A}/trace`)).status === 200 && (await call(fresh, "GET", `${A}/transcript`)).status === 200, "the reads");
+  must(dump(fresh.raw.sql as never) === fresh0, `the reads changed the object: tables now ${show(tableNames(fresh.raw.sql as never))}`);
+  // An agent with a conversation, a tool call, an ended conversation, exported trace and rows still held.
+  const w = await world();
+  listByPrefix(w);
+  await toolTurn(w, "one", { a: 1 }, "done");
+  await w.D.alarm();
+  must((await call(w, "POST", `${A}/fresh-context`)).status === 200, "fresh context");
+  await toolTurn(w, "two", { b: 2 }, "done");
+  await w.rt.postMessage(T, A, "three", "prompt");
+  await settle(w, 5);
+  // Every alarm pass above exported what it found; a row written since is held in the object until the next one.
+  appendTrace(w.raw.sql as never, [{ at: Date.now(), tenantId: T, agentId: A, kind: "tool.call", spanId: "op_held", status: "succeeded", verdict: "ok", attrs: { tool: "pushy.noop" } }]);
+  // Both sources hold rows, so a read that drained, pruned or moved a cursor would have something to change.
+  must(Number(w.raw.sql.exec("SELECT COUNT(*) AS n FROM trace_outbox").toArray()[0]!.n) > 0, "no trace row is held in the object");
+  must([...w.R2.objects.keys()].some((k) => k.startsWith(`trace/${T}/${A}/`)), "no trace batch is in the bucket");
+  const db0 = dump(w.raw.sql as never), r20 = bucketDump(w), jobs0 = jobCount(w), sealed0 = await w.rt.store.isSealed(T, A);
+  must((await call(w, "GET", `${A}/trace`)).body.rows.some((r: any) => r.spanId === "op_held"), "the held row is not in the export");
+  for (const q of ["transcript", "transcript?session=main", "transcript?limit=1&cursor=1", "trace", "trace?limit=1", `trace?from=${Date.now() - 60_000}`]) {
+    const r = await call(w, "GET", `${A}/${q}`);
+    must(r.status === 200, `${q}: ${r.status} ${r.text.slice(0, 200)}`);
+  }
+  must(dump(w.raw.sql as never) === db0, "a read changed the object's rows or tables");
+  must(bucketDump(w) === r20 && jobCount(w) === jobs0 && (await w.rt.store.isSealed(T, A)) === sealed0, "a read wrote to the bucket, started a turn or sealed");
 });
 
 // ---- audit -----------------------------------------------------------------

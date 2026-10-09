@@ -193,7 +193,8 @@ A deployment serving the evaluation routes counts them differently ([below](#ins
 ## Evaluation setup (preview only)
 
 Routes for an evaluator to give an agent its workspace before the agent first runs, start it on a
-fresh conversation, read back what its model was sent, and read the tools its next turn is offered. They are served only where the deployment
+fresh conversation, read back what its model was sent, read the tools its next turn is offered, and export
+its conversation and its trace afterwards. They are served only where the deployment
 sets `EVAL_SEED_ROUTES` to `"1"` — `cf/wrangler.preview.jsonc`, never `cf/wrangler.jsonc`
 (`test/eval-seed.ts` fails if production sets it). Anywhere else every one of them is `404`, as an
 unknown route is. Authentication, tenant and which agents are as for the reads above: the provider
@@ -209,6 +210,8 @@ for an agent that is not a live provisioned agent of the tenant.
 | `POST` | `/provision/agents/{agentId}/restart` | restart the agent, keeping its conversation |
 | `GET` | `/provision/agents/{agentId}/model-input?session=&call=` | what one model call was sent |
 | `GET` | `/provision/agents/{agentId}/tools` | the tools the next turn offers the model |
+| `GET` | `/provision/agents/{agentId}/transcript?session=&limit=&cursor=` | a main conversation, every event of it |
+| `GET` | `/provision/agents/{agentId}/trace?from=&to=&limit=&cursor=` | the agent's trace rows in a window |
 
 The same flag lets `POST /provision/agents` choose the agent's tools ([below](#choosing-the-agents-tools)),
 and gives `instructions` a larger bound ([below](#instructions)).
@@ -403,7 +406,115 @@ offer a different list if the re-take finds different tools. `backed_off` is a r
 recently and is not asked again yet (`snapshotError` says why); the list above is then the one
 offered. A mount's config and credential are never included.
 
+### Transcript
+
+`GET …/transcript` answers one conversation of the agent as the operator's `/admin/transcript` reads it:
+the same reader (`readTranscript`, `cf/src/transcript-read.ts`), the same events in the same shapes, and
+the same approvals — every user or pushed message, each model reply with its reasoning and its tool calls
+and their arguments, each tool result with its status and its whole body, and runs that failed. It is
+read from the agent's storage with SELECTs only: nothing is written, no table is made, no turn starts and
+nothing is sealed (`test/eval-seed-object.ts` compares every table and row before and after, and the
+answer with `/admin/transcript`'s for the same agent).
+
+- `session` — the conversation: `main` for the agent's first main conversation, `main.<n>` for the n-th
+  [fresh one](#fresh-context), current or ended (an ended one is read from where the fresh context kept
+  it). Without it, the current main conversation. Only main conversations: anything else, a task id
+  of the agent included, is `422` (`param: "session"`) before the agent is asked; `main.<n>` the agent
+  never had is `404`.
+- `limit` — events per page, 1 to 2000, default 500. `cursor` — where the page starts, from the
+  previous page's `nextCursor` (`0` or absent for the first). Events are in sequence order and a
+  conversation only grows at its end, so the pages of a finished conversation are the whole of it.
+- A page also stops early, with a `nextCursor`, before its events and `byOp` would pass 4 MiB
+  serialized after [redaction](#redaction); it always holds at least one event while any are left, so
+  one event larger than that is a page of its own. The reader has no range of its own, so each page
+  reads the whole conversation from storage; only the page's events are masked and walked.
+
+```json
+{ "agentId": "raft_…", "sessionId": "main.1", "current": true, "total": 4, "shown": 4,
+  "cursor": "0", "nextCursor": null,
+  "events": [{ "sequence": 1, "kind": "message", "payload": { "text": "…", "at": 1791536400000 }, "createdAt": 1791536400000 },
+             { "sequence": 2, "kind": "model.response", "payload": { "text": "…", "toolCalls": [{ "id": "…", "name": "p__noop", "arguments": {} }], "finishReason": "toolUse", "at": 0 }, "createdAt": 0 },
+             { "sequence": 3, "kind": "tool.result", "payload": { "tool": "p__noop", "callId": "…", "isError": false, "status": "succeeded", "result": {}, "at": 0 }, "createdAt": 0 }],
+  "byOp": {}, "redactions": 0 }
+```
+
+### Trace
+
+`GET …/trace` answers the agent's trace rows — the spans of its work, one row each when it ended
+(`model.call`, `tool.call`, `approval.wait`, `container.lease`, `inbound`, `mount.seeded`;
+`src/trace/outbox.ts`) — with `from <= at < to`, in `seq` order.
+
+- `from`, `to` — ISO 8601 or milliseconds since the epoch; the window is at most 24 hours. One alone
+  puts the other 24 hours away; neither is the 24 hours up to now. `to` before or at `from`, a wider
+  window, and a window reaching past ±8.64e15 ms (the last time a date holds) are `422`, before the
+  agent is asked.
+- `limit` — rows per page, 1 to 1000, default 200. `cursor` — a `seq`: only rows after it, from the
+  previous page's `nextCursor`. A page may hold fewer rows than `limit`, none even, and still have a
+  `nextCursor`: one request reads at most 5,000 rows from the agent and 20 exported batches, and says
+  where it stopped. Only a `null` `nextCursor` means nothing is left.
+
+**Source and lag.** A row is written to the agent's own outbox (`trace_outbox`) in the step that ends its
+span, and the agent's next alarm pass exports it in batches of up to 500 to object storage
+(`trace/<tenant>/<agent>/<fromSeq>-<toSeq>.ndjson`, `cf/src/trace-r2.ts`), then forgets it. The route
+reads the outbox first and the exported batches second, so a row is found whether or not it was
+exported, and one exported between the two reads is found in its batch: no lag past the span's end.
+What is never there: a span still open (a model call awaiting its answer, a tool still running), and
+anything the trace does not record (`src/trace/outbox.ts` names the documented silences). Each row is
+as exported: `{ seq, at, tenantId, agentId, kind, spanId, parentId?, status, verdict, ms?, attrs }`.
+The answer adds `from`, `to` (ISO), `cursor`, `nextCursor` and `scanned: { local, objects }`. Nothing
+is written.
+
+### Redaction
+
+**Treat every export as sensitive.** It is an agent's whole conversation and trace, written by a model
+that saw tool results, files and messages from people; redaction narrows what a credential in it can
+reach and does not make the export safe to publish. What is caught is exactly the list below; anything
+else, a credential in a shape not listed or split across two strings, is not guaranteed to be caught.
+
+Both exports are walked whole — every string at any depth, and every key — first inside the agent's
+own object, which alone can open its sealed values and never returns them, and once more by the route
+(`cf/src/eval-read.ts` `redactCredentials`). Each replacement is `<redacted:KIND>` and is counted in
+`redactions` at the top level. Caught:
+
+- **By tool.** A call to or result of a kept-secret tool — any tool named `secret_*` under any alias
+  (`<alias>__secret_put`, `<alias>__secret_get`, …; `state.secret_get` in a trace row or approval) —
+  loses every string in its arguments, result and approval request but the secret's `name`
+  (`<redacted:kept-secret>`), whatever the shape: an object, JSON in a string, or text.
+- **By exact value.** Every value the agent's object holds sealed — the secrets it kept, its mounts'
+  sealed credentials, its owner's and its hooks' secrets — and the Worker environment value any of its
+  mounts names (`env:NAME`), of 8 characters or more: each exact appearance, and its JSON-escaped,
+  URL-encoded and base64 forms, anywhere in a value or a key (`<redacted:agent-secret>`, one per
+  appearance). If a sealed value cannot be opened the export is `503` (`unavailable`), not sent
+  without this.
+- **By key.** The string values under a key named like a credential — containing `token`, `secret`,
+  `password`/`passwd`, `passphrase`, `authorization`, `api_key`/`api-key`/`apikey`, `credential`,
+  `private_key` or `cookie`, any case — replaced whole, and every string under such a key when its
+  value is an object or array.
+- **By shape**, whole strings: what the console refuses to send (`cf/src/secret-shape.ts`: API keys,
+  Raft agent credentials, GitHub tokens, AWS access keys, private keys, Slack tokens, URLs with a
+  password, labelled keys, our own service and provider tokens).
+- **By shape**, the credential part only: JWTs (three base64url segments, the first a JSON object);
+  `Authorization:`/`Proxy-Authorization:` values; `Bearer <token>` with a digit in it; `Basic <base64
+  of user:pass>`; `Set-Cookie:`/`Cookie:` values; the values of `X-Amz-Signature`, `X-Amz-Credential`,
+  `X-Amz-Security-Token`, `X-Goog-Signature`, `X-Goog-Credential`, `Signature`, `sig`, `token`,
+  `access_token`, `refresh_token`, `id_token`, `client_secret`, `password`, `passwd`, `api_key` and
+  `apikey` parameters; env lines `*_TOKEN=`, `*_KEY=`, `*_SECRET=`, `*_PASSWORD=`, `*_PAT=`,
+  `*_CREDENTIAL(S)=`, `PASSWORD=` (no spaces round `=`, not a `$REFERENCE`); Google `AIza…` keys;
+  Stripe `sk_`/`rk_` `live_`/`test_` keys; `<prefix>_live_…` keys; `ghp_`/`gho_`/`ghs_`/`ghu_`/`ghr_`
+  tokens of 20 characters or more and `github_pat_…`; `sk_agent_…` of 8 or more; `sk-…` of 20 or more.
+- **Inside an encoding**: JSON in a string is parsed and walked (and written back when anything in it
+  was replaced); `%xx`-encoded text holding any of the shapes is decoded and kept decoded; a base64
+  run of 24 to 65,536 characters whose decoded text holds any of the shapes is replaced whole.
+
+A subtree nested more than 100 deep is replaced whole (`<redacted:too-deep>`). A credential sealed
+on a mount, and a mount's config, are not in a transcript or a trace row to begin with; the exact-value
+scrub is for when the agent repeated one.
+
 ### Audit
+
+Every transcript or trace read logs one line, `evt: "eval.read"`, with `tenant`, `agent`, `route`
+(`transcript` or `trace`), `session` (transcript) or `from` and `to` (trace), `cursor`, `count` (events
+or rows answered), `redactions`, and `credentialId`; never any content.
 
 Every seed write, explicit seal, fresh context and restart logs one line, `evt: "eval.seed"`, with
 `tenant`, `agent`, `op` (`write`, `seal`, `fresh-context`, `restart`), the `path` and `sha256` where

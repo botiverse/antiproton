@@ -44,7 +44,7 @@ const PLATFORM = { label: "raft-deployment", raftOrigin: "https://raft.example",
 const TOKEN_HASH = "a".repeat(64);
 const AGENT = "raft_01JEVAL";
 
-function fakeDeps(opts: { seed?: boolean; answer?: Awaited<ReturnType<SeedOps["write"]>> } = {}) {
+function fakeDeps(opts: { seed?: boolean; answer?: Awaited<ReturnType<SeedOps["write"]>>; transcript?: unknown; trace?: Awaited<ReturnType<SeedOps["trace"]>> } = {}) {
   const calls: Array<{ op: string; args: unknown[] }> = [];
   const rows = new Map<string, ProvisionedAgent>();
   const t = 1_800_000_000_000;
@@ -71,6 +71,8 @@ function fakeDeps(opts: { seed?: boolean; answer?: Awaited<ReturnType<SeedOps["w
     restart: async (...args) => { calls.push({ op: "restart", args }); return { ok: true, sessionId: "main", restartedAt: t }; },
     modelInput: async (...args) => { calls.push({ op: "modelInput", args }); return { sessionId: "main", call: 1 }; },
     tools: async (...args) => { calls.push({ op: "tools", args }); return { agentId: args[1], tools: [], mounts: [] }; },
+    transcript: async (...args) => { calls.push({ op: "transcript", args }); return opts.transcript === undefined ? { agentId: args[1], sessionId: "main", events: [] } : opts.transcript; },
+    trace: async (...args) => { calls.push({ op: "trace", args }); return opts.trace ?? { ok: true, rows: [], nextCursor: null, scanned: { local: 0, objects: 0 } }; },
     mountable: ["tools", "artifacts", "web", "search", "gh", "sandbox", "state"],
   };
   const deps: ProvisionDeps = {
@@ -95,7 +97,7 @@ async function call(deps: ProvisionDeps, method: string, path: string, opts: { b
 const ROUTES: Array<[string, string]> = [
   ["PUT", `/agents/${AGENT}/seed?path=MEMORY.md`], ["POST", `/agents/${AGENT}/seed/seal`], ["GET", `/agents/${AGENT}/seed/manifest`],
   ["POST", `/agents/${AGENT}/fresh-context`], ["POST", `/agents/${AGENT}/restart`], ["GET", `/agents/${AGENT}/model-input?session=main&call=1`],
-  ["GET", `/agents/${AGENT}/tools`],
+  ["GET", `/agents/${AGENT}/tools`], ["GET", `/agents/${AGENT}/transcript`], ["GET", `/agents/${AGENT}/trace`],
 ];
 
 await check("no seed deps (EVAL_SEED_ROUTES unset): every setup route falls through to the unknown-route answer", async () => {
@@ -194,6 +196,116 @@ await check("model-input's call must be a whole number from 1; the seal answers 
   const seal = await call(f.deps, "POST", `/agents/${AGENT}/seed/seal`);
   must(seal.status === 200 && show(Object.keys(seal.body).sort()) === show(["how", "manifest", "manifestSha256", "sealedAt", "toolConfig"]) && seal.body.sealedAt === new Date(1_800_000_000_000).toISOString(), seal.text);
   must(f.calls.find((c) => c.op === "seal")?.args[2] === TOKEN_HASH, "the seal is not told which token asked");
+});
+
+// ---- the two exports, over fake deps -----------------------------------------
+
+/** Credential-shaped values, assembled so this file's own text carries none of them whole. */
+const FAKE_API_KEY = "sk-" + "proj-" + "A1b2C3d4".repeat(5);
+const FAKE_AGENT_KEY = "sk_agent_" + "Z9y8X7w6".repeat(4);
+const FAKE_GH = "ghp_" + "Q".repeat(36);
+
+await check("transcript: limit and cursor are whole numbers in range, refused before the object is asked; session and paging reach it", async () => {
+  const f = fakeDeps();
+  for (const [param, v] of [["limit", "0"], ["limit", "2001"], ["limit", "1.5"], ["limit", "x"], ["limit", "-1"], ["cursor", "-1"], ["cursor", "a"], ["cursor", "1e3"]] as const) {
+    const r = await call(f.deps, "GET", `/agents/${AGENT}/transcript?${param}=${v}`);
+    must(r.status === 422 && r.body.error.param === param, `${param}=${v}: ${r.text}`);
+  }
+  must(f.calls.length === 0, `reached the object: ${show(f.calls)}`);
+  const r = await call(f.deps, "GET", `/agents/${AGENT}/transcript?session=main.1&cursor=7&limit=20`);
+  must(r.status === 200 && r.body.redactions === 0, r.text);
+  must(show(f.calls[0]!.args) === show(["t-raft", AGENT, "main.1", 7, 20]), show(f.calls));
+  await call(f.deps, "GET", `/agents/${AGENT}/transcript`);
+  must(show(f.calls[1]!.args) === show(["t-raft", AGENT, null, 0, 500]), `defaults: ${show(f.calls[1])}`);
+  const none = await call(fakeDeps({ transcript: null }).deps, "GET", `/agents/${AGENT}/transcript?session=main.9`);
+  must(none.status === 404 && /main\.9/.test(none.body.error.message), none.text);
+  must((await call(f.deps, "POST", `/agents/${AGENT}/transcript`)).status === 0, "POST is a route");
+});
+
+await check("transcript: a credential at any depth, in a value or a key, is replaced by its kind and counted; nothing else changes", async () => {
+  const body = {
+    agentId: AGENT, sessionId: "main",
+    events: [
+      { sequence: 1, kind: "message", payload: { text: "plain words" } },
+      { sequence: 2, kind: "model.response", payload: { toolCalls: [{ id: "c1", name: "p__noop", arguments: { auth: `Bearer ${FAKE_AGENT_KEY}` } }] } },
+      { sequence: 3, kind: "tool.result", payload: { result: { a: [{ b: { c: [[{ d: FAKE_API_KEY }]] } }], [FAKE_GH]: "the key was a key" } } },
+    ],
+    byOp: { op_1: { request: { deep: { deeper: [FAKE_GH] } } } },
+  };
+  const r = await call(fakeDeps({ transcript: body }).deps, "GET", `/agents/${AGENT}/transcript`);
+  must(r.status === 200 && r.body.redactions === 4, `count: ${r.text}`);
+  for (const secret of [FAKE_API_KEY, FAKE_AGENT_KEY, FAKE_GH]) must(!r.text.includes(secret), `leaked ${secret.slice(0, 6)}…: ${r.text}`);
+  must(r.body.events[1].payload.toolCalls[0].arguments.auth === "<redacted:Raft agent credential>", show(r.body.events[1]));
+  must(r.body.events[2].payload.result.a[0].b.c[0][0].d === "<redacted:api-key>", show(r.body.events[2]));
+  must(r.body.events[2].payload.result["<redacted:github-token>"] === "the key was a key", show(r.body.events[2]));
+  must(r.body.byOp.op_1.request.deep.deeper[0] === "<redacted:github-token>", show(r.body.byOp));
+  must(r.body.events[0].payload.text === "plain words" && r.body.sessionId === "main", "an ordinary value changed");
+});
+
+await check("trace: the window is at most 24 hours, from before to, times as ISO or milliseconds; limit and cursor in range; all before the object", async () => {
+  const f = fakeDeps();
+  const H = 3_600_000, T0 = 1_800_000_000_000;
+  for (const [q, param] of [
+    [`from=${T0}&to=${T0 + 24 * H + 1}`, "to"], [`from=${T0}&to=${T0}`, "from"], [`from=${T0 + 1}&to=${T0}`, "from"],
+    ["from=yesterday", "from"], ["to=2026-13", "to"], ["from=-5", "from"], ["limit=0", "limit"], ["limit=1001", "limit"], ["cursor=x", "cursor"],
+  ] as const) {
+    const r = await call(f.deps, "GET", `/agents/${AGENT}/trace?${q}`);
+    must(r.status === 422 && r.body.error.param === param, `${q}: ${r.text}`);
+  }
+  must(f.calls.length === 0, `reached the object: ${show(f.calls)}`);
+  const iso = await call(f.deps, "GET", `/agents/${AGENT}/trace?from=${new Date(T0).toISOString()}&to=${T0 + 24 * H}&limit=5&cursor=40`);
+  must(iso.status === 200 && iso.body.from === new Date(T0).toISOString() && iso.body.to === new Date(T0 + 24 * H).toISOString(), iso.text);
+  must(show(f.calls[0]!.args) === show(["t-raft", AGENT, { from: T0, to: T0 + 24 * H, afterSeq: 40, limit: 5 }]), show(f.calls[0]));
+  // One end alone: the other is 24 hours away. Neither: the 24 hours to now.
+  await call(f.deps, "GET", `/agents/${AGENT}/trace?from=${T0}`);
+  must(show(f.calls[1]!.args[2]) === show({ from: T0, to: T0 + 24 * H, afterSeq: 0, limit: 200 }), show(f.calls[1]));
+  const before = Date.now();
+  await call(f.deps, "GET", `/agents/${AGENT}/trace`);
+  const q = f.calls[2]!.args[2] as { from: number; to: number };
+  must(q.to - q.from === 24 * H && q.to >= before && q.to <= Date.now() + 1, show(q));
+});
+
+await check("trace: rows are walked for credentials as the transcript is, and the source's refusals are answered", async () => {
+  const row = { seq: 3, at: 1, tenantId: "t-raft", agentId: AGENT, kind: "tool.call", spanId: "op_1", status: "succeeded", verdict: "ok", attrs: { mount: "p", note: { why: [FAKE_API_KEY] } } };
+  const r = await call(fakeDeps({ trace: { ok: true, rows: [row as never], nextCursor: "3", scanned: { local: 1, objects: 0 } } }).deps, "GET", `/agents/${AGENT}/trace`);
+  must(r.status === 200 && r.body.redactions === 1 && r.body.rows[0].attrs.note.why[0] === "<redacted:api-key>" && !r.text.includes(FAKE_API_KEY), r.text);
+  must(r.body.nextCursor === "3" && r.body.rows[0].attrs.mount === "p", r.text);
+  const gone = await call(fakeDeps({ trace: { ok: false, status: 404, message: "no agent" } }).deps, "GET", `/agents/${AGENT}/trace`);
+  must(gone.status === 404 && gone.body.error.code === "not_found", gone.text);
+  const away = await call(fakeDeps({ trace: { ok: false, status: 502, message: "listing" } }).deps, "GET", `/agents/${AGENT}/trace`);
+  must(away.status === 502 && away.body.error.code === "unavailable", away.text);
+});
+
+await check("transcript: a session other than main or main.<n> is 422 before the object is asked; the object's refusal to scrub is 503; its count is added to", async () => {
+  const f = fakeDeps();
+  for (const s of ["t_" + AGENT, "task-1", "main.0", "main.01", "main.x", "Main", "main.1.1", "main."]) {
+    const r = await call(f.deps, "GET", `/agents/${AGENT}/transcript?session=${encodeURIComponent(s)}`);
+    must(r.status === 422 && r.body.error.param === "session", `${s}: ${r.text}`);
+  }
+  must(f.calls.length === 0, `reached the object: ${show(f.calls)}`);
+  for (const s of ["main", "main.1", "main.12"]) must((await call(f.deps, "GET", `/agents/${AGENT}/transcript?session=${s}`)).status === 200, s);
+  const away = await call(fakeDeps({ transcript: { unavailable: "cannot open" } }).deps, "GET", `/agents/${AGENT}/transcript`);
+  must(away.status === 503 && away.body.error.code === "unavailable" && !away.text.includes('"events"'), away.text);
+  const counted = await call(fakeDeps({ transcript: { agentId: AGENT, sessionId: "main", shown: 1, events: [{ payload: { k: FAKE_GH } }], redactions: 3 } }).deps, "GET", `/agents/${AGENT}/transcript`);
+  must(counted.status === 200 && counted.body.redactions === 4, `the object's 3 and this walk's 1: ${counted.text}`);
+});
+
+await check("trace: a time past what a Date holds, alone or by the 24 hours added to it, is 422 before the object is asked, never 500", async () => {
+  const f = fakeDeps();
+  const MAX = 8.64e15, H = 3_600_000;
+  for (const [q, param] of [
+    [`from=${MAX + 1}`, "from"], [`to=${MAX + 1}`, "to"], ["from=99999999999999999999", "from"], ["to=" + "9".repeat(31), "to"],
+    [`from=${MAX}`, "from"], [`from=${MAX - 24 * H}&to=${MAX + 1}`, "to"], ["from=+275760-09-13T00:00:00.001Z", "from"],
+  ] as const) {
+    const r = await call(f.deps, "GET", `/agents/${AGENT}/trace?${q}`);
+    must(r.status === 422 && r.body.error.param === param, `${q}: ${r.status} ${r.text}`);
+  }
+  must(f.calls.length === 0, `reached the object: ${show(f.calls)}`);
+  // The last whole window a Date holds is served.
+  const edge = await call(f.deps, "GET", `/agents/${AGENT}/trace?from=${MAX - 24 * H}&to=${MAX}`);
+  must(edge.status === 200 && edge.body.to === new Date(MAX).toISOString(), edge.text);
+  const away = await call(fakeDeps({ trace: { ok: false, status: 503, message: "cannot open" } }).deps, "GET", `/agents/${AGENT}/trace`);
+  must(away.status === 503 && away.body.error.code === "unavailable", away.text);
 });
 
 await check("audit: one line per write, fresh context and restart, each its own op, with the credential's id; never the body", async () => {

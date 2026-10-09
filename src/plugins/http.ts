@@ -204,8 +204,24 @@ export async function fillSecrets(spec: string, kept: Map<string, string>, ctx: 
  * first and leave the rest of the longer in the text.
  */
 export function hideSecrets(text: string, kept: Map<string, string>): string {
-  return [...kept].sort(([, a], [, b]) => b.length - a.length).reduce(
-    (t, [name, value]) => (value.length >= 4 ? t.split(value).join(`[secret ${name}]`) : t), text);
+  return replaceSecrets(text, kept, 4, (name) => `[secret ${name}]`).text;
+}
+
+/**
+ * `hideSecrets` with the shortest value it replaces and the mark it leaves chosen by the caller, and how many
+ * appearances it replaced. The evaluation export (cf/src/eval-read.ts) scrubs an agent's own sealed values with it.
+ */
+export function replaceSecrets(
+  text: string, kept: Map<string, string>, min: number, mark: (name: string) => string,
+): { text: string; count: number } {
+  let count = 0;
+  const out = [...kept].sort(([, a], [, b]) => b.length - a.length).reduce((t, [name, value]) => {
+    if (value.length < min) return t;
+    const parts = t.split(value);
+    count += parts.length - 1;
+    return parts.length > 1 ? parts.join(mark(name)) : t;
+  }, text);
+  return { text: out, count };
 }
 
 /**

@@ -22,8 +22,10 @@
  * The sink is the private ARTIFACTS bucket under `trace/…` — a new bucket
  * would be a new resource, and the public runs bucket must never carry this.
  * Artifact references are scoped to `t/<tenant>/<agent>/` (src/store/refs.ts),
- * so a trace key is never mistaken for one, and nothing lists the bucket by
- * prefix on an agent's behalf.
+ * so a trace key is never mistaken for one. The one reader lists a single
+ * agent's prefix (`tracePrefix`) for an evaluation's trace route
+ * (cf/src/eval-read.ts), never the bucket at large and never on the agent's own
+ * behalf.
  *
  * A row the outbox read but refused (`dropped`: kind or verdict outside the
  * contract's vocabulary) is not carried and not silent: the pass warns, and
@@ -36,8 +38,9 @@
  *   nothing deleting them. The usage ledger's is the daily Cron Trigger
  *   (`scheduled` in cf/src/index.ts, `retainUsage` in cf/src/usage-d1.ts);
  *   that handler is where a trace sweep would run too.
- * - reads across tenants: nothing consumes these objects yet; the first
- *   reader decides the layout it needs and this key scheme may move.
+ * - reads across tenants or by time: the one reader (cf/src/eval-read.ts)
+ *   lists one agent's prefix and orders by the seq range in each key, so a
+ *   change to the key scheme must change `traceKeyRange` with it.
  * - a stall detector: a run that stops silently leaves no row here, so "no
  *   row" must not be read as "nothing stalled" until one exists.
  */
@@ -57,9 +60,21 @@ const DROPS = "CREATE TABLE IF NOT EXISTS trace_drops (at INTEGER NOT NULL, drop
  */
 export const TRACE_DROPS_KEEP_MS = 7 * 24 * 60 * 60_000;
 
+/** Every batch of one agent's lands under this. */
+export function tracePrefix(tenantId: string, agentId: string): string {
+  return `trace/${tenantId}/${agentId}/`;
+}
+
 /** Where a batch lands: the owner and the seq range, so a replay is the same key. */
 export function traceKey(tenantId: string, agentId: string, fromSeq: number, toSeq: number): string {
-  return `trace/${tenantId}/${agentId}/${fromSeq}-${toSeq}.ndjson`;
+  return `${tracePrefix(tenantId, agentId)}${fromSeq}-${toSeq}.ndjson`;
+}
+
+/** The seq range `traceKey` put in a key under `prefix`, or null for a key it did not make. */
+export function traceKeyRange(prefix: string, key: string): { fromSeq: number; toSeq: number } | null {
+  if (!key.startsWith(prefix)) return null;
+  const m = /^(\d+)-(\d+)\.ndjson$/.exec(key.slice(prefix.length));
+  return m ? { fromSeq: Number(m[1]), toSeq: Number(m[2]) } : null;
 }
 
 /** One line per row, keys in the order pendingTrace produced them, so a replay is the same bytes. */
