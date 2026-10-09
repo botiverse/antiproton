@@ -193,7 +193,8 @@ A deployment serving the evaluation routes counts them differently ([below](#ins
 ## Evaluation setup (preview only)
 
 Routes for an evaluator to give an agent its workspace before the agent first runs, start it on a
-fresh conversation, read back what its model was sent, and read the tools its next turn is offered. They are served only where the deployment
+fresh conversation, read back what its model was sent, read the tools its next turn is offered, and export
+its conversation and its trace afterwards. They are served only where the deployment
 sets `EVAL_SEED_ROUTES` to `"1"` — `cf/wrangler.preview.jsonc`, never `cf/wrangler.jsonc`
 (`test/eval-seed.ts` fails if production sets it). Anywhere else every one of them is `404`, as an
 unknown route is. Authentication, tenant and which agents are as for the reads above: the provider
@@ -209,6 +210,8 @@ for an agent that is not a live provisioned agent of the tenant.
 | `POST` | `/provision/agents/{agentId}/restart` | restart the agent, keeping its conversation |
 | `GET` | `/provision/agents/{agentId}/model-input?session=&call=` | what one model call was sent |
 | `GET` | `/provision/agents/{agentId}/tools` | the tools the next turn offers the model |
+| `GET` | `/provision/agents/{agentId}/transcript?session=&limit=&cursor=` | a conversation, every event of it |
+| `GET` | `/provision/agents/{agentId}/trace?from=&to=&limit=&cursor=` | the agent's trace rows in a window |
 
 The same flag lets `POST /provision/agents` choose the agent's tools ([below](#choosing-the-agents-tools)),
 and gives `instructions` a larger bound ([below](#instructions)).
@@ -402,6 +405,66 @@ is not its plugin's: until then `retake` is `due` and `retakePending` is true, a
 offer a different list if the re-take finds different tools. `backed_off` is a re-take that failed
 recently and is not asked again yet (`snapshotError` says why); the list above is then the one
 offered. A mount's config and credential are never included.
+
+### Transcript
+
+`GET …/transcript` answers one conversation of the agent as the operator's `/admin/transcript` reads it:
+the same reader (`readTranscript`, `cf/src/transcript-read.ts`), the same events in the same shapes, and
+the same approvals — every user or pushed message, each model reply with its reasoning and its tool calls
+and their arguments, each tool result with its status and its whole body, and runs that failed. It is
+read from the agent's storage with SELECTs only: nothing is written, no table is made, no turn starts and
+nothing is sealed (`test/eval-seed-object.ts` compares every table and row before and after, and the
+answer with `/admin/transcript`'s for the same agent).
+
+- `session` — the conversation: `main` for the agent's first main conversation, `main.<n>` for the n-th
+  [fresh one](#fresh-context), current or ended (an ended one is read from where the fresh context kept
+  it). Without it, the current main conversation. An id that is no conversation of the agent is `404`.
+- `limit` — events per page, 1 to 2000, default 500. `cursor` — where the page starts, from the
+  previous page's `nextCursor` (`0` or absent for the first). Events are in sequence order and a
+  conversation only grows at its end, so the pages of a finished conversation are the whole of it.
+
+```json
+{ "agentId": "raft_…", "sessionId": "main.1", "current": true, "total": 4, "shown": 4,
+  "cursor": "0", "nextCursor": null,
+  "events": [{ "sequence": 1, "kind": "message", "payload": { "text": "…", "at": 1791536400000 }, "createdAt": 1791536400000 },
+             { "sequence": 2, "kind": "model.response", "payload": { "text": "…", "toolCalls": [{ "id": "…", "name": "p__noop", "arguments": {} }], "finishReason": "toolUse", "at": 0 }, "createdAt": 0 },
+             { "sequence": 3, "kind": "tool.result", "payload": { "tool": "p__noop", "callId": "…", "isError": false, "status": "succeeded", "result": {}, "at": 0 }, "createdAt": 0 }],
+  "byOp": {}, "redactions": 0 }
+```
+
+### Trace
+
+`GET …/trace` answers the agent's trace rows — the spans of its work, one row each when it ended
+(`model.call`, `tool.call`, `approval.wait`, `container.lease`, `inbound`, `mount.seeded`;
+`src/trace/outbox.ts`) — with `from <= at < to`, in `seq` order.
+
+- `from`, `to` — ISO 8601 or milliseconds since the epoch; the window is at most 24 hours. One alone
+  puts the other 24 hours away; neither is the 24 hours up to now. `to` before or at `from` and a wider
+  window are `422`.
+- `limit` — rows per page, 1 to 1000, default 200. `cursor` — a `seq`: only rows after it, from the
+  previous page's `nextCursor`. A page may hold fewer rows than `limit`, none even, and still have a
+  `nextCursor`: one request reads at most 5,000 rows from the agent and 20 exported batches, and says
+  where it stopped. Only a `null` `nextCursor` means nothing is left.
+
+**Source and lag.** A row is written to the agent's own outbox (`trace_outbox`) in the step that ends its
+span, and the agent's next alarm pass exports it in batches of up to 500 to object storage
+(`trace/<tenant>/<agent>/<fromSeq>-<toSeq>.ndjson`, `cf/src/trace-r2.ts`), then forgets it. The route
+reads the outbox first and the exported batches second, so a row is found whether or not it was
+exported, and one exported between the two reads is found in its batch: no lag past the span's end.
+What is never there: a span still open (a model call awaiting its answer, a tool still running), and
+anything the trace does not record (`src/trace/outbox.ts` names the documented silences). Each row is
+as exported: `{ seq, at, tenantId, agentId, kind, spanId, parentId?, status, verdict, ms?, attrs }`.
+The answer adds `from`, `to` (ISO), `cursor`, `nextCursor` and `scanned: { local, objects }`. Nothing
+is written.
+
+### Redaction
+
+Both exports are walked whole before they leave — every string at any depth, and every key — and
+any that looks like a credential, by the shapes the console refuses to send (`cf/src/secret-shape.ts`:
+API keys, Raft agent credentials, GitHub tokens, private keys, URLs with a password, labelled keys, our
+own service and provider tokens), is replaced by `<redacted:KIND>`, the whole string. `redactions` at
+the top level is how many were. A credential sealed on a mount, and a mount's config, are never in
+either export to begin with: they are not in a transcript or a trace row.
 
 ### Audit
 

@@ -133,6 +133,7 @@
     "test/bench-swe-grade.ts",
     "test/client-tool-alarms.ts",
     "test/eval-seed.ts",
-    "test/eval-seed-object.ts"
+    "test/eval-seed-object.ts",
+    "test/eval-read.ts"
   ]
 }

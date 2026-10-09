@@ -20,6 +20,10 @@
 import type { Json } from "../../../src/core/types.ts";
 import { originProblem } from "../../../src/plugins/types.ts";
 import { secretShape } from "../secret-shape.ts";
+import {
+  redactCredentials, TRACE_LIMIT_DEFAULT, TRACE_LIMIT_MAX, TRACE_WINDOW_MAX_MS, TRANSCRIPT_LIMIT_DEFAULT, TRANSCRIPT_LIMIT_MAX,
+  type TraceQuery, type TraceWindow,
+} from "../eval-read.ts";
 import type { ConnectionRegistry, ConnectorStore, ProviderTokenIdentity, ProvisionRegistry, ProvisionedAgent } from "../control-plane.ts";
 import { CONNECTION_PROVIDERS, returnUrlProblem, scopesFor, type ConnectionProvider } from "./connect.ts";
 import { surface, surfaceReadOf, type SurfaceDeps } from "../agent-surface/surface.ts";
@@ -121,6 +125,10 @@ export interface SeedOps {
   modelInput(tenantId: string, agentId: string, session: string | null, call: number | null): Promise<unknown | null>;
   /** The tools the agent's next turn offers the model, read without retaking or writing anything. */
   tools(tenantId: string, agentId: string): Promise<unknown | null>;
+  /** One page of a conversation, as /admin/transcript reads it (cf/src/eval-read.ts `evalTranscript`); null: no such agent or conversation. */
+  transcript(tenantId: string, agentId: string, session: string | null, offset: number, limit: number): Promise<unknown | null>;
+  /** The agent's trace rows in a window (cf/src/eval-read.ts `readTraceWindow`). */
+  trace(tenantId: string, agentId: string, q: TraceQuery): Promise<TraceWindow>;
   /**
    * The catalogue aliases a provisioned agent may be given by name (`mounts` on POST): the deployment catalogue's
    * entries for an agent Raft hosts (`AgentRuntime.DEFAULT_MOUNTS`, cf/src/runtime.ts). Asked here so a name is refused
@@ -628,7 +636,7 @@ async function disconnect(tenantId: string, connectorId: string, body: unknown, 
 }
 
 /** The setup routes, after the agent's id. */
-const EVAL_ROUTES = new Set(["seed", "seed/seal", "seed/manifest", "fresh-context", "restart", "model-input", "tools"]);
+const EVAL_ROUTES = new Set(["seed", "seed/seal", "seed/manifest", "fresh-context", "restart", "model-input", "tools", "transcript", "trace"]);
 
 /**
  * An evaluation's setup (EVAL_SEED_ROUTES): files put in the agent's workspace before it first runs, the seal that
@@ -711,5 +719,63 @@ async function evalSetup(
     const r = await seed.tools(tenantId, agentId);
     return r ? ok(r) : gone();
   }
+  // The two exports: read-only, and walked whole for credential shapes before they leave (cf/src/eval-read.ts).
+  if (route === "transcript" && method === "GET") {
+    const limit = wholeParam(query, "limit", TRANSCRIPT_LIMIT_DEFAULT, 1, TRANSCRIPT_LIMIT_MAX);
+    if (isFail(limit)) return fail(limit);
+    const offset = wholeParam(query, "cursor", 0, 0, Number.MAX_SAFE_INTEGER);
+    if (isFail(offset)) return fail(offset);
+    const session = query.get("session") || null;
+    const r = await seed.transcript(tenantId, agentId, session, offset, limit);
+    if (!r) return fail({ status: 404, code: "not_found", message: session === null ? `no agent ${agentId}` : `no conversation ${session} of agent ${agentId}` });
+    return redacted(r);
+  }
+  if (route === "trace" && method === "GET") {
+    const now = Date.now();
+    const fromText = query.get("from"), toText = query.get("to");
+    // Exclusive at its end, so the default reaches a row that ended this millisecond.
+    const to = toText === null ? (fromText === null ? now + 1 : null) : instant(toText);
+    const from = fromText === null ? null : instant(fromText);
+    if (Number.isNaN(from)) return fail({ status: 422, code: "invalid", message: "from is an ISO 8601 time or milliseconds since the epoch", param: "from" });
+    if (Number.isNaN(to)) return fail({ status: 422, code: "invalid", message: "to is an ISO 8601 time or milliseconds since the epoch", param: "to" });
+    const window = { from: from ?? to! - TRACE_WINDOW_MAX_MS, to: to ?? from! + TRACE_WINDOW_MAX_MS };
+    if (!(window.from < window.to)) return fail({ status: 422, code: "invalid", message: "from is before to", param: "from" });
+    if (window.to - window.from > TRACE_WINDOW_MAX_MS) {
+      return fail({ status: 422, code: "invalid", message: `the window is at most ${TRACE_WINDOW_MAX_MS / 3_600_000} hours; page through a longer one`, param: "to" });
+    }
+    const limit = wholeParam(query, "limit", TRACE_LIMIT_DEFAULT, 1, TRACE_LIMIT_MAX);
+    if (isFail(limit)) return fail(limit);
+    const afterSeq = wholeParam(query, "cursor", 0, 0, Number.MAX_SAFE_INTEGER);
+    if (isFail(afterSeq)) return fail(afterSeq);
+    const r = await seed.trace(tenantId, agentId, { ...window, afterSeq, limit });
+    if (!r.ok) return fail({ status: r.status, code: r.status === 404 ? "not_found" : "unavailable", message: r.message });
+    return redacted({
+      agentId, from: new Date(window.from).toISOString(), to: new Date(window.to).toISOString(),
+      cursor: String(afterSeq), nextCursor: r.nextCursor, rows: r.rows, scanned: r.scanned,
+    });
+  }
   return null;
+}
+
+/** The body, walked whole for credential shapes, with how many were replaced (cf/src/eval-read.ts). */
+function redacted(body: unknown): Response {
+  const r = redactCredentials(body);
+  return ok({ ...(r.value as Record<string, unknown>), redactions: r.redactions });
+}
+
+/** A whole-number query parameter in [min, max], `fallback` when absent. */
+function wholeParam(query: URLSearchParams, name: string, fallback: number, min: number, max: number): number | Fail {
+  const text = query.get(name);
+  if (text === null) return fallback;
+  const n = /^\d+$/.test(text) ? Number(text) : NaN;
+  if (!(Number.isSafeInteger(n) && n >= min && n <= max)) {
+    return { status: 422, code: "invalid", message: `${name} is a whole number from ${min}${max === Number.MAX_SAFE_INTEGER ? "" : ` to ${max}`}`, param: name };
+  }
+  return n;
+}
+
+/** Milliseconds since the epoch, from digits or an ISO 8601 time; NaN for anything else. */
+function instant(text: string): number {
+  if (/^\d+$/.test(text)) return Number(text);
+  return /^\d{4}-\d{2}-\d{2}T/.test(text) ? Date.parse(text) : NaN;
 }

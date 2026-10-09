@@ -72,6 +72,8 @@ import { adminMigrateEngine, type MigrateOp } from "./admin-migrate.ts";
 import { readDiagnosis } from "./diagnose-read.ts";
 import { agentObjectName } from "./object-name.ts";
 import { readTranscript, transcriptEvents, approvalsByOp, isPd, type TranscriptEvents } from "./transcript-read.ts";
+import { evalTranscript, localTrace, readTraceWindow, type EvalTranscript } from "./eval-read.ts";
+import type { TraceOutboxRow } from "../../src/trace/outbox.ts";
 import { readEngineStorage } from "./engine-read.ts";
 import { pdVersion } from "../../src/runtime/pd-transcript.ts";
 import { compactionRefusal, refusingCompaction } from "./compact-refusal.ts";
@@ -2055,6 +2057,21 @@ export class AgentDO extends DurableObject<Env> {
     return this.runtime().offeredTools(tenantId, agentId);
   }
 
+  /**
+   * An evaluation's transcript export: one page of a conversation, read as /admin/transcript reads it, straight from
+   * this object's SQLite with SELECTs only (cf/src/eval-read.ts). Not through the runtime, whose agent() re-pins mounts.
+   */
+  async evalTranscript(tenantId: string, agentId: string, session: string | null, offset: number, limit: number): Promise<EvalTranscript | null> {
+    if (!this.#isAgent(tenantId, agentId)) return null;
+    return evalTranscript(this.sql, tenantId, agentId, session, offset, limit);
+  }
+
+  /** The trace rows this object still holds after `afterSeq` (cf/src/eval-read.ts `localTrace`); a read, made table or not. */
+  async evalTraceLocal(tenantId: string, agentId: string, afterSeq: number, limit: number): Promise<TraceOutboxRow[] | null> {
+    if (!this.#isAgent(tenantId, agentId)) return null;
+    return localTrace(this.sql, tenantId, agentId, afterSeq, limit);
+  }
+
   /** The raft mount's push state, read from the store: no tool call, no trace, no usage. */
   async provisionPushStatus(tenantId: string, agentId: string) {
     this.#claim(tenantId, agentId);
@@ -3404,6 +3421,16 @@ function provisionDeps(env: Env): ProvisionDeps {
         restart: (tenantId, agentId) => stub(tenantId, agentId).restart(tenantId, agentId),
         modelInput: (tenantId, agentId, session, call) => stub(tenantId, agentId).modelInput(tenantId, agentId, session, call),
         tools: (tenantId, agentId) => stub(tenantId, agentId).offeredTools(tenantId, agentId),
+        transcript: (tenantId, agentId, session, offset, limit) => stub(tenantId, agentId).evalTranscript(tenantId, agentId, session, offset, limit),
+        // The object first, then the bucket: the order cf/src/eval-read.ts needs so a flush between them loses nothing.
+        trace: (tenantId, agentId, q) => readTraceWindow({
+          local: (afterSeq, limit) => stub(tenantId, agentId).evalTraceLocal(tenantId, agentId, afterSeq, limit) as Promise<TraceOutboxRow[] | null>,
+          list: async (prefix, cursor) => {
+            const page = await env.ARTIFACTS.list({ prefix, ...(cursor ? { cursor } : {}) });
+            return { objects: page.objects.map((o) => ({ key: o.key, uploaded: o.uploaded })), truncated: page.truncated, ...(page.truncated ? { cursor: page.cursor } : {}) };
+          },
+          get: async (key) => { const o = await env.ARTIFACTS.get(key); return o ? new TextDecoder().decode(await o.arrayBuffer()) : null; },
+        }, tenantId, agentId, q),
         mountable: AgentRuntime.DEFAULT_MOUNTS.filter((m) => m.for.includes("raft")).map((m) => m.alias),
       },
     } : {}),
