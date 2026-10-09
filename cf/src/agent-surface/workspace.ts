@@ -19,6 +19,7 @@
  */
 
 import type { HeldListing, HeldRead } from "../../../src/plugins/types.ts";
+import { sha256Hex } from "../../../src/store/seed-files.ts";
 
 export const ROOTS = ["state", "artifacts", "sandbox"] as const;
 export type Root = typeof ROOTS[number];
@@ -212,6 +213,15 @@ export function asRead(bytes: Uint8Array, name: string, contentType?: string): F
   let bin = "";
   for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
   return { content: btoa(bin), binary: true, size: bytes.byteLength, mimeType: mimeOf(name, contentType, true), encoding: "base64" };
+}
+/**
+ * The hex SHA-256 of the bytes a read's `content` stands for — its text as UTF-8, or the base64 decoded — and null
+ * when the content is not returned. So a caller can tell a file is unchanged (a seeded file's working copy against
+ * its manifest, src/store/seed-files.ts) without comparing text.
+ */
+export function readSha256(file: FileRead): string | null {
+  if (file.content === null) return null;
+  return sha256Hex(file.encoding === "base64" ? Uint8Array.from(atob(file.content), (c) => c.charCodeAt(0)) : file.content);
 }
 const tooLarge = (name: string, size: number, contentType?: string): FileRead =>
   ({ content: null, binary: true, size, mimeType: mimeOf(name, contentType, true), encoding: "base64" });

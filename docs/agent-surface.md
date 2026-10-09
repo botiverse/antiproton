@@ -129,13 +129,16 @@ is awake and start the look.
 | `path` | Required. A file under one of the three roots, e.g. `state/memory`. |
 
 ```json
-{ "content": "the user prefers short answers", "binary": false, "size": 31, "mimeType": "text/plain", "encoding": "utf-8" }
+{ "content": "the user prefers short answers", "binary": false, "size": 31, "mimeType": "text/plain", "encoding": "utf-8", "sha256": "…" }
 ```
 
 - Text (valid UTF-8 with no NUL byte) comes back as `content` with `encoding: "utf-8"`.
 - Anything else comes back base64-encoded: `binary: true`, `encoding: "base64"`.
 - A file over **1 MB** (1,048,576 bytes) is not returned: `content: null`, `binary: true`,
   `encoding: "base64"`, and `size` still says how large it is.
+- `sha256` is the hex SHA-256 of the bytes `content` stands for (its text as UTF-8, or the base64
+  decoded), and `null` when `content` is. A seeded file's working copy
+  ([evaluation setup](#evaluation-setup-preview-only)) hashes to its manifest entry until it changes.
 - `mimeType` is taken from the name's extension, else what the store recorded, else `text/plain` or
   `application/octet-stream`.
 - A path to a directory is `400`; a path that does not exist is `404`.
@@ -171,10 +174,7 @@ The same three reads for an agent a Raft server provisioned, with the provider t
 - **Which agents.** Only a provisioned agent of the token's tenant that has not been deleted. Another
   tenant's agent, a deleted agent, and an id that never existed are all `404`, `code: "not_found"`.
 - **Bodies.** Identical to the public API's, except that the usage answer names the agent as
-  `raftAgentId` and `providerAgentId` instead of `agentId`, and the read carries `sha256`: the hex
-  SHA-256 of the bytes `content` stands for (its text as UTF-8, or the base64 decoded), `null` when
-  `content` is. A seeded file's working copy read this way hashes to its manifest entry until the agent
-  changes it.
+  `raftAgentId` and `providerAgentId` instead of `agentId`.
 - **Errors.** The provider envelope: `{ "error": { "code", "message", "param"? } }`. A bad parameter is
   `400`, `code: "invalid"`, `param` naming it; a missing agent, file or directory is `404`,
   `code: "not_found"`; a failure underneath is `502`, `code: "unavailable"`.

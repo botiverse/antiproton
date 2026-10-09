@@ -6,12 +6,12 @@
  * the same body for both. A caller adds how it named the agent and its own error envelope.
  */
 import { agentUsage, parseUsageQuery, type AgentUsage, type UsageDeps } from "./usage.ts";
-import { workspaceList, workspaceRead, type FileRead, type Listing, type WorkspaceDeps } from "./workspace.ts";
+import { readSha256, workspaceList, workspaceRead, type FileRead, type Listing, type WorkspaceDeps } from "./workspace.ts";
 
 export type SurfaceDeps = { usage: UsageDeps; workspace: WorkspaceDeps };
 export type SurfaceRead = "usage" | "files" | "read";
 export type SurfaceAnswer =
-  | { ok: true; body: AgentUsage | Listing | FileRead }
+  | { ok: true; body: AgentUsage | Listing | (FileRead & { sha256: string | null }) }
   | { ok: false; status: 400 | 404 | 502; param?: string; message: string };
 
 /** The read a path's tail names (`usage`, `workspace-files`, `workspace-files/read`), or null. */
@@ -55,5 +55,5 @@ async function answer(deps: SurfaceDeps, read: SurfaceRead, tenantId: string, ag
   const path = query.get("path");
   if (path === null || path === "") return { ok: false, status: 400, param: "path", message: "path is required" };
   const r = await workspaceRead(deps.workspace, tenantId, agentId, path);
-  return r.ok ? { ok: true, body: r.file } : r;
+  return r.ok ? { ok: true, body: { ...r.file, sha256: readSha256(r.file) } } : r;
 }

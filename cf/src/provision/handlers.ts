@@ -24,7 +24,7 @@ import type { ConnectionRegistry, ConnectorStore, ProviderTokenIdentity, Provisi
 import { CONNECTION_PROVIDERS, returnUrlProblem, scopesFor, type ConnectionProvider } from "./connect.ts";
 import { surface, surfaceReadOf, type SurfaceDeps } from "../agent-surface/surface.ts";
 import { logEvent } from "../../../src/core/log.ts";
-import { SEED_MODES, seedPathProblem, seedText, sha256Hex as sha256Sync, type SeedFileMeta, type SeedMode, type SeedSeal, type SeedWriteResult } from "../../../src/store/seed-files.ts";
+import { SEED_MODES, seedPathProblem, seedText, type SeedFileMeta, type SeedMode, type SeedSeal, type SeedWriteResult } from "../../../src/store/seed-files.ts";
 import type { FreshContextResult, RestartResult } from "../runtime.ts";
 
 export type ProvisionTool = "enable_push" | "disable_push";
@@ -317,14 +317,6 @@ export async function handleProvision(
     }
     const a = await surface(deps.surface, read, tenantId, found.agentId, query);
     if (!a.ok) return fail({ status: a.status, code: a.status === 404 ? "not_found" : a.status === 502 ? "unavailable" : "invalid", message: a.message, ...(a.param ? { param: a.param } : {}) });
-    if (read === "read") {
-      // The hash of the bytes the content stands for (its text as UTF-8, or the base64 decoded), so a caller can
-      // compare a working copy with the seeded file it began as (`…/seed/manifest`) without comparing text.
-      const file = a.body as { content: string | null; encoding: "utf-8" | "base64" };
-      const sha256 = file.content === null ? null
-        : sha256Sync(file.encoding === "base64" ? Uint8Array.from(atob(file.content), (c) => c.charCodeAt(0)) : file.content);
-      return ok({ ...file, sha256 });
-    }
     return ok(read === "usage" ? { raftAgentId: found.raftAgentId, providerAgentId: found.agentId, ...a.body } : a.body);
   }
   if (rest.length < 1 || rest.length > 2 || (rest.length === 2 && rest[1] !== "credential")) return null;
