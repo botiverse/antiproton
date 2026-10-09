@@ -14,12 +14,12 @@
  * Whatever either returns is walked whole before it leaves (`redactCredentials`): every string, at any depth, and
  * every key, because a tool result is whatever the tool returned and nothing about its path says where a key may sit.
  * The walk runs in the agent's object (cf/src/index.ts `evalTranscript`, `evalRedact`) with the agent's own sealed
- * values (`agentSecretValues`), which are opened there and never returned; docs/agent-surface.md "Redaction" lists
+ * values and the operator credentials its mounts name (`agentSecretValues`), which are opened there and never returned; docs/agent-surface.md "Redaction" lists
  * what it catches.
  */
 import { secretShape } from "./secret-shape.ts";
-import { replaceSecrets } from "../../src/plugins/http.ts";
-import { importKek, open } from "../../src/runtime/secrets.ts";
+import { importKek, open, secretRefKind } from "../../src/runtime/secrets.ts";
+import { operatorCredentials, resolveOperatorRef } from "./operator-ref.ts";
 import { hasTable, readTranscript, type TranscriptEvents } from "./transcript-read.ts";
 import { currentMainId, mainSessions } from "./fresh-context.ts";
 import { pendingTrace, type TraceOutboxRow } from "../../src/trace/outbox.ts";
@@ -32,17 +32,22 @@ export interface Redacted { value: unknown; redactions: number }
 
 export interface RedactOptions {
   /**
-   * The agent's own sealed values (`agentSecretValues`): every exact appearance of one of at least EXACT_MIN
-   * characters, and of its JSON-escaped, URL-encoded and base64 forms, is replaced wherever it is.
+   * The values this agent's mounts and tools can be handed (`agentSecretValues`): every appearance of one of at least
+   * EXACT_MIN characters, in any spelling `secretForms` lists, is replaced wherever it is; so is a %-encoded or base64
+   * run that decodes to text holding one.
    */
   secrets?: ReadonlyArray<string>;
 }
 
 /** The shortest sealed value scrubbed by exact match: shorter ones would match ordinary text. */
 export const EXACT_MIN = 8;
+/** The shortest sealed value matched in any letter case: a shorter one in another case is too likely an ordinary word. */
+export const EXACT_ANY_CASE_MIN = 16;
+/** How many times a %-encoded run is decoded, looking for a sealed value under encodings stacked that deep. */
+export const PERCENT_ROUNDS = 3;
 /** Deeper than this a subtree is replaced whole: a walk that recursed without bound would crash the export. */
 export const REDACT_MAX_DEPTH = 100;
-/** The longest base64 run decoded to be checked again; a longer one is left as it is. */
+/** The longest base64 or %-encoded run decoded to be checked again; a longer one is left as it is. */
 export const BASE64_DECODE_MAX = 64 * 1024;
 
 const mark = (kind: string) => `<redacted:${kind}>`;
@@ -50,14 +55,20 @@ const MARKED = /^<redacted:[^<>]*>(?:#\d+)?$/;
 
 /**
  * A tool that handles an agent's kept secrets (`<alias>__secret_get`, `secret_put`…, src/plugins/state.ts), as a model
- * call names it, as a trace row (`state.secret_get`) and an approval (`<alias>.secret_put`) do. Any alias and any
+ * call names it (`name`, or pi's `toolName` on a tool result), as a trace row (`state.secret_get`) and an approval
+ * (`<alias>.secret_put`) do (`tool`). Any alias and any
  * plugin: a tool of another plugin with a name like that loses its arguments and result too, which is the safe side.
  */
 const SECRET_TOOL = /(?:^|__|\.)secret_[A-Za-z0-9_]+$/;
-/** The fields of a call to such a tool kept as they are; every string under any other field is replaced. */
+/**
+ * A call's fields that name the tool and say where and when it ran (ids, names, times, outcomes; a trace row's `task`,
+ * src/trace/seams.ts; pi's `toolName` and `toolCallId`): walked as any other text is, where every string under any
+ * other field of such a call is replaced whole.
+ */
 const SECRET_TOOL_KEEP = new Set([
-  "id", "name", "tool", "callId", "isError", "status", "at", "createdAt", "sequence", "kind", "spanId", "parentId", "verdict",
-  "ms", "seq", "tenantId", "agentId", "mount", "mountAlias", "operationId", "state", "approver", "taskId", "type",
+  "id", "name", "tool", "toolName", "callId", "toolCallId", "isError", "status", "at", "createdAt", "timestamp", "sequence",
+  "kind", "role", "spanId", "parentId", "verdict", "ms", "seq", "tenantId", "agentId", "task", "taskId", "sessionId",
+  "contextId", "messageId", "jobId", "mount", "mountAlias", "alias", "plugin", "operationId", "state", "approver", "type",
 ]);
 /** A key whose string values are credentials whatever they look like. */
 const CREDENTIAL_KEY = /token|secret|passw(?:or)?d|passphrase|authorization|api[_-]?key|credential|private[_-]?key|cookie/i;
@@ -125,33 +136,205 @@ function percentDecode(text: string): string {
   try { return decodeURIComponent(text); }
   catch { return text.replace(/(?:%[0-9A-Fa-f]{2})+/g, (run) => { try { return decodeURIComponent(run); } catch { return run; } }); }
 }
+/**
+ * `run` %-decoded up to PERCENT_ROUNDS times, each round both as a URL encodes (`+` is `+`) and as a form does
+ * (`+` is a space): every text a decoder along the way could have read. Empty when there is nothing to decode.
+ */
+function percentDecodings(run: string): string[] {
+  if (!/%[0-9A-Fa-f]{2}|\+/.test(run)) return [];
+  const seen = new Set<string>([run]);
+  let frontier = [run];
+  for (let round = 0; round < PERCENT_ROUNDS && frontier.length; round++) {
+    const next: string[] = [];
+    for (const t of frontier) {
+      for (const d of [percentDecode(t), percentDecode(t.replace(/\+/g, " "))]) if (!seen.has(d)) { seen.add(d); next.push(d); }
+    }
+    frontier = next;
+  }
+  seen.delete(run);
+  return [...seen];
+}
+
+const utf8 = (v: string) => new TextEncoder().encode(v);
+function base64Of(bytes: Uint8Array): string {
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin);
+}
+const base64url = (b64: string) => b64.replace(/=+$/, "").replace(/\+/g, "-").replace(/\//g, "_");
+/** `encodeURIComponent` with `!'()*` escaped too, as RFC 3986 strict encoders do. */
+const strictUriEncode = (v: string) => encodeURIComponent(v).replace(/[!'()*]/g, (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase());
+/** As an HTML form or `URLSearchParams` encodes a value: a space is `+`. */
+const formEncode = (v: string) => new URLSearchParams([["", v]]).toString().slice(1);
+const htmlEscape = (v: string) => v.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+/** Every UTF-16 unit as `\uXXXX`, the way an ASCII-only JSON writer spells text. */
+const unicodeEscape = (v: string) => Array.from({ length: v.length }, (_, i) => "\\u" + v.charCodeAt(i).toString(16).padStart(4, "0")).join("");
+
+/**
+ * The spellings of sealed value `v` an export is scrubbed of, each with whether it is matched in any letter case: `v`
+ * itself, JSON-escaped once and twice, `\uXXXX`-escaped, HTML-escaped; URL-encoded as `encodeURIComponent`, a strict
+ * encoder, a form and `encodeURI` do, and each of the first three encoded again; base64 and base64url, whole and at each
+ * of the three alignments the value can have inside a longer run (the characters encoding its bytes alone); and hex.
+ * Any case for a value of EXACT_ANY_CASE_MIN or more, and always for hex and `\uXXXX`, whose letters are digits.
+ */
+export function secretForms(v: string): Array<{ text: string; anyCase: boolean }> {
+  const anyCase = v.length >= EXACT_ANY_CASE_MIN;
+  const json = JSON.stringify(v).slice(1, -1);
+  const bytes = utf8(v);
+  const texts = [
+    v, json, JSON.stringify(json).slice(1, -1), htmlEscape(v),
+    encodeURIComponent(v), strictUriEncode(v), formEncode(v), encodeURI(v),
+    encodeURIComponent(encodeURIComponent(v)), encodeURIComponent(strictUriEncode(v)), encodeURIComponent(formEncode(v)),
+  ];
+  const whole = base64Of(bytes);
+  texts.push(whole, base64url(whole));
+  for (let k = 0; k < 3; k++) {
+    const padded = new Uint8Array(k + bytes.length);
+    padded.set(bytes, k);
+    // A group of four characters encodes three bytes: the first holds the k bytes before the value when k > 0, and
+    // the last holds the bytes after it unless the value ends a group. Only the groups between are the value's alone.
+    const core = base64Of(padded).slice(k === 0 ? 0 : 4, Math.floor((k + bytes.length) / 3) * 4);
+    texts.push(core, base64url(core));
+  }
+  const forms = new Map<string, boolean>();
+  const add = (text: string, ci: boolean) => { if (text.length >= EXACT_MIN) forms.set(text, (forms.get(text) ?? true) && ci); };
+  for (const t of texts) add(t, anyCase);
+  add(Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join(""), true);
+  add(unicodeEscape(v), true);
+  return [...forms].map(([text, ci]) => ({ text, anyCase: ci }));
+}
+
+/** Alternatives per compiled pattern: a few thousand literals compile and scan quickly; far more stops paying. */
+const EXACT_CHUNK = 1000;
+const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\/-]/g, "\\$&");
+
+/**
+ * Every form of every value in `secrets` (`secretForms`), as patterns made once for a whole walk: the any-case forms,
+ * then the exact-case ones, each list longest first, so a form that holds another is replaced before the shorter one
+ * could split it. Null when no value is long enough to be scrubbed.
+ */
+function exactPatterns(secrets: ReadonlyArray<string>): RegExp[] | null {
+  const anyCase = new Set<string>(), exactCase = new Set<string>();
+  for (const v of secrets) {
+    if (typeof v !== "string" || v.length < EXACT_MIN) continue;
+    for (const f of secretForms(v)) (f.anyCase ? anyCase : exactCase).add(f.text);
+  }
+  const res: RegExp[] = [];
+  for (const [set, flags] of [[anyCase, "gi"], [exactCase, "g"]] as const) {
+    const sorted = [...set].sort((a, b) => b.length - a.length);
+    for (let i = 0; i < sorted.length; i += EXACT_CHUNK) res.push(new RegExp(sorted.slice(i, i + EXACT_CHUNK).map(escapeRe).join("|"), flags));
+  }
+  return res.length ? res : null;
+}
+
+/** Each run of base64 characters in `text` (24 or more, at most BASE64_DECODE_MAX) given to `swap`; a string back replaces it. */
+function eachBase64Run(text: string, swap: (run: string) => string | null): string {
+  // Scanned by hand: a regex over one run of megabytes overflows the engine's backtracking stack.
+  const out: string[] = [];
+  let last = 0;
+  for (let i = 0; i < text.length;) {
+    if (!isB64(text.charCodeAt(i))) { i++; continue; }
+    let j = i;
+    while (j < text.length && isB64(text.charCodeAt(j))) j++;
+    while (j < text.length && j - i < BASE64_DECODE_MAX + 2 && text.charCodeAt(j) === 61) j++;
+    const run = text.slice(i, j);
+    if (run.length >= 24 && run.length <= BASE64_DECODE_MAX) {
+      const r = swap(run);
+      if (r !== null) { out.push(text.slice(last, i), r); last = j; }
+    }
+    i = j;
+  }
+  return last === 0 ? text : out.join("") + text.slice(last);
+}
+
+/** A character that ends a %-encoded run: whitespace, a quote, an angle bracket. */
+const RUN_END = /[\s"'`<>]/;
+/** Each run between RUN_END characters holding a `%xx` escape given to `swap`; a string back replaces it. */
+function eachPercentRun(text: string, swap: (run: string) => string | null): string {
+  const out: string[] = [];
+  let last = 0, from = 0;
+  for (;;) {
+    const p = text.indexOf("%", from);
+    if (p < 0) break;
+    let i = p, j = p + 1;
+    while (i > from && !RUN_END.test(text[i - 1]!)) i--;
+    while (j < text.length && !RUN_END.test(text[j]!)) j++;
+    from = j;
+    const run = text.slice(i, j);
+    if (run.length > BASE64_DECODE_MAX || !/%[0-9A-Fa-f]{2}/.test(run)) continue;
+    const r = swap(run);
+    if (r !== null) { out.push(text.slice(last, i), r); last = j; }
+  }
+  return last === 0 ? text : out.join("") + text.slice(last);
+}
 
 /**
  * `value` walked whole, every string at any depth and every key, with what looks like a credential replaced by
  * `<redacted:KIND>`, and how many replacements were made. Walked, never addressed by path: a credential nested in a
  * tool's result is found where it is. In order, for each string:
  *
- * 1. each exact appearance of one of `opts.secrets` (and its escaped, encoded and base64 forms);
- * 2. a string the console would refuse (cf/src/secret-shape.ts), replaced whole;
- * 3. JSON in the string, parsed and walked, and written back when anything in it was replaced;
- * 4. `%xx`-encoded text, decoded, and kept decoded when the decoded text held a credential;
- * 5. EXPORT_PATTERNS, each match's credential part;
- * 6. base64 runs of 24 characters or more (up to BASE64_DECODE_MAX) that decode to text holding any of the above.
+ * 1. with `opts.secrets`, a base64 run or a %-encoded run whose decoded text holds one of them, replaced whole
+ *    (`holdsSecret`);
+ * 2. each appearance of one of `opts.secrets` in any of its forms (`secretForms`);
+ * 3. a string the console would refuse (cf/src/secret-shape.ts), replaced whole;
+ * 4. JSON in the string, parsed and walked, and written back when anything in it was replaced;
+ * 5. `%xx`-encoded text, decoded (up to PERCENT_ROUNDS times), and kept decoded when the decoded text held a credential;
+ * 6. EXPORT_PATTERNS, each match's credential part;
+ * 7. base64 runs of 24 characters or more (up to BASE64_DECODE_MAX) that decode to text holding any of the above.
  *
  * And by place rather than by shape: every string under a key named like a credential (CREDENTIAL_KEY), and every
  * string in a call to or result of a kept-secret tool (SECRET_TOOL) but its name. A subtree deeper than
  * REDACT_MAX_DEPTH is replaced whole.
  */
 export function redactCredentials(value: unknown, opts: RedactOptions = {}): Redacted {
+  return credentialRedactor(opts)(value);
+}
+
+/**
+ * `redactCredentials` with `opts` prepared once, for many walks: the forms of every sealed value are made and sorted
+ * here, not for each string or each walk. A page of a transcript walks each event on its own.
+ */
+export function credentialRedactor(opts: RedactOptions = {}): (value: unknown) => Redacted {
+  const exact = exactPatterns(opts.secrets ?? []);
+  return (value) => walkRedacting(value, exact);
+}
+
+function walkRedacting(value: unknown, exact: RegExp[] | null): Redacted {
   let redactions = 0;
-  const exact = new Map<string, string>();
-  for (const [i, v] of (opts.secrets ?? []).entries()) {
-    if (typeof v !== "string" || v.length < EXACT_MIN) continue;
-    const forms = [v, JSON.stringify(v).slice(1, -1), encodeURIComponent(v)];
-    const b64 = btoa(String.fromCharCode(...new TextEncoder().encode(v)));
-    forms.push(b64, b64.replace(/=+$/, "").replace(/\+/g, "-").replace(/\//g, "_"));
-    for (const [j, f] of forms.entries()) if (f.length >= EXACT_MIN) exact.set(`${i}.${j}`, f);
-  }
+
+  const holds = (t: string): boolean => exact!.some((re) => { re.lastIndex = 0; const hit = re.test(t); re.lastIndex = 0; return hit; });
+  /** Whether text decoded from a run holds a sealed value, as it is or %-decoded (a form encodes it again). */
+  const holdsSecret = (decoded: string): boolean => holds(decoded) || percentDecodings(decoded).some(holds);
+  const scrubExact = (s: string): string => {
+    let t = s;
+    for (const re of exact!) t = t.replace(re, () => { redactions++; return mark("agent-secret"); });
+    return t;
+  };
+  /** A %-encoded run decoding to a sealed value: the `&`/`?`/`=`-separated parts that do, or else the whole run. */
+  const percentRun = (run: string): string | null => {
+    if (!percentDecodings(run).some(holds)) return null;
+    let hit = false;
+    const parts = run.split(/([&?=])/).map((p, i) => {
+      if (i % 2 === 1 || !percentDecodings(p).some(holds)) return p;
+      hit = true;
+      redactions++;
+      return mark("agent-secret");
+    });
+    if (hit) return parts.join("");
+    redactions++;
+    return mark("agent-secret");
+  };
+  /** A base64 run whose decoded text, from any of its first four characters, holds a sealed value. */
+  const base64Run = (run: string): string | null => {
+    const body = run.replace(/=+$/, "");
+    for (let k = 0; k < 4; k++) {
+      let t = body.slice(k);
+      if (t.length % 4 === 1) t = t.slice(0, -1);
+      const d = b64decode(t);
+      if (d !== null && holdsSecret(d)) { redactions++; return mark("agent-secret"); }
+    }
+    return null;
+  };
 
   const patterns = (text: string): string => {
     let t = text;
@@ -162,35 +345,22 @@ export function redactCredentials(value: unknown, opts: RedactOptions = {}): Red
         return pre + mark(p.kind);
       });
     }
-    // Scanned by hand: a regex over one run of megabytes overflows the engine's backtracking stack.
-    const out: string[] = [];
-    let last = 0;
-    for (let i = 0; i < t.length;) {
-      if (!isB64(t.charCodeAt(i))) { i++; continue; }
-      let j = i;
-      while (j < t.length && isB64(t.charCodeAt(j))) j++;
-      while (j < t.length && j - i < BASE64_DECODE_MAX + 2 && t.charCodeAt(j) === 61) j++;
-      const run = t.slice(i, j);
-      if (run.length >= 24 && run.length <= BASE64_DECODE_MAX) {
-        const d = b64decode(run);
-        if (d !== null && printable(d) && anyShape(d)) {
-          redactions++;
-          out.push(t.slice(last, i), mark("base64-credential"));
-          last = j;
-        }
-      }
-      i = j;
-    }
-    return last === 0 ? t : out.join("") + t.slice(last);
+    return eachBase64Run(t, (run) => {
+      const d = b64decode(run);
+      if (d === null || !printable(d) || !anyShape(d)) return null;
+      redactions++;
+      return mark("base64-credential");
+    });
   };
 
   const text = (s: string, depth: number): string => {
     if (MARKED.test(s)) return s;
     let t = s;
-    if (exact.size) {
-      const r = replaceSecrets(t, exact, EXACT_MIN, () => mark("agent-secret"));
-      redactions += r.count;
-      t = r.text;
+    if (exact) {
+      // The encoded runs first: a run is replaced whole, where a form found inside it first would leave the rest.
+      t = eachBase64Run(t, base64Run);
+      if (t.includes("%")) t = eachPercentRun(t, percentRun);
+      t = scrubExact(t);
     }
     const kind = secretShape(t);
     if (kind !== null) { redactions++; return mark(kind); }
@@ -204,12 +374,14 @@ export function redactCredentials(value: unknown, opts: RedactOptions = {}): Red
       }
     }
     if (depth < REDACT_MAX_DEPTH && /%[0-9A-Fa-f]{2}/.test(t)) {
-      const d = percentDecode(t);
-      if (d !== t && anyShape(d)) return text(d, depth + 1);
+      const d = percentDecodings(t).find(anyShape);
+      if (d !== undefined) return text(d, depth + 1);
     }
     return patterns(t);
   };
 
+  const secretTool = (o: Record<string, unknown>) =>
+    [o.name, o.tool, o.toolName].some((n) => typeof n === "string" && SECRET_TOOL.test(n));
   type Mode = "normal" | "tool" | "field";
   const walk = (v: unknown, depth: number, mode: Mode): unknown => {
     if (depth > REDACT_MAX_DEPTH && v !== null && typeof v === "object") { redactions++; return mark("too-deep"); }
@@ -226,13 +398,12 @@ export function redactCredentials(value: unknown, opts: RedactOptions = {}): Red
     if (Array.isArray(v)) return v.map((x) => walk(x, depth + 1, mode));
     if (v === null || typeof v !== "object") return v;
     const o = v as Record<string, unknown>;
-    const secretTool = mode === "normal" &&
-      ((typeof o.name === "string" && SECRET_TOOL.test(o.name)) || (typeof o.tool === "string" && SECRET_TOOL.test(o.tool)));
+    const isSecretTool = mode === "normal" && secretTool(o);
     const out: Record<string, unknown> = {};
     for (const [key, inner] of Object.entries(o)) {
       let child: Mode = mode;
       if (mode === "normal") {
-        if (secretTool && !SECRET_TOOL_KEEP.has(key)) child = "tool";
+        if (isSecretTool && !SECRET_TOOL_KEEP.has(key)) child = "tool";
         else if (!MARKED.test(key) && CREDENTIAL_KEY.test(key)) child = "field";
       } else if (mode === "tool" && key === "name") child = "normal";
       let name = text(key, depth);
@@ -248,13 +419,16 @@ export function redactCredentials(value: unknown, opts: RedactOptions = {}): Red
 
 /**
  * Every value this agent's object holds sealed (`secrets`: what the agent kept with `secret_put`, its mounts' sealed
- * credentials, its owner's and its hooks' secrets) and the Worker environment value any of its mounts names
- * (`env:NAME`), so the export can scrub an exact appearance of each (`redactCredentials`'s `secrets`). Read with
- * SELECTs only: nothing is touched, unlike a resolver's read. Unreadable when a sealed value cannot be opened (no key,
- * or another key): the export is then refused rather than sent without that scrub.
+ * credentials, its owner's and its hooks' secrets), the Worker environment value any of its mounts names (`env:NAME`),
+ * and the operator's credential any of its mounts names (`operator:exa`, `operator:run9`…), resolved as the runtime
+ * resolves it for the plugin's call (`resolveOperatorRef`), so the export can scrub an exact appearance of each
+ * (`redactCredentials`'s `secrets`). A value that is a JSON object (the run9 account) adds each string in it too. Read
+ * with SELECTs only: nothing is touched, unlike a resolver's read. Unreadable when a sealed value cannot be opened (no
+ * key, or another key), or an operator credential a mount names cannot be read: the export is then refused rather
+ * than sent without that scrub.
  */
 export async function agentSecretValues(
-  sql: Sql, tenantId: string, agentId: string, env: { SECRET_KEK?: string },
+  sql: Sql, tenantId: string, agentId: string, env: { SECRET_KEK?: string; RUN9?: string; EXA_API_KEY?: string },
 ): Promise<{ ok: true; values: string[] } | { ok: false; message: string }> {
   const values: string[] = [];
   if (hasTable(sql as never, "secrets")) {
@@ -269,10 +443,22 @@ export async function agentSecretValues(
     }
   }
   if (hasTable(sql as never, "mounts")) {
-    for (const r of sql.exec("SELECT secret_ref FROM mounts WHERE tenant_id=? AND agent_id=?", tenantId, agentId).toArray()) {
+    const envValue = (ref: string) => {
+      const v = (env as Record<string, unknown>)[ref.replace(/^env:/, "")];
+      return Promise.resolve(typeof v === "string" ? v : null);
+    };
+    for (const r of sql.exec("SELECT DISTINCT secret_ref FROM mounts WHERE tenant_id=? AND agent_id=?", tenantId, agentId).toArray()) {
       const ref = typeof r.secret_ref === "string" ? r.secret_ref : "";
-      const v = ref.startsWith("env:") ? (env as Record<string, unknown>)[ref.slice(4)] : undefined;
-      if (typeof v === "string") values.push(v);
+      let v: string | null = null;
+      if (ref.startsWith("env:")) v = await envValue(ref);
+      else if (secretRefKind(ref) === "operator") {
+        try { v = await resolveOperatorRef(ref, operatorCredentials(env), envValue); }
+        catch { return { ok: false, message: `the operator credential a mount names (${ref}) cannot be read, so it cannot be scrubbed from an export` }; }
+      }
+      if (v === null) continue;
+      values.push(v);
+      try { const o = JSON.parse(v); if (o && typeof o === "object") for (const x of Object.values(o)) if (typeof x === "string") values.push(x); }
+      catch { /* not JSON: the value alone */ }
     }
   }
   return { ok: true, values };

@@ -209,7 +209,8 @@ export function hideSecrets(text: string, kept: Map<string, string>): string {
 
 /**
  * `hideSecrets` with the shortest value it replaces and the mark it leaves chosen by the caller, and how many
- * appearances it replaced. The evaluation export (cf/src/eval-read.ts) scrubs an agent's own sealed values with it.
+ * appearances it replaced. It sorts `kept` on every call, which is right for one response; the evaluation export
+ * (cf/src/eval-read.ts `credentialRedactor`) walks thousands of strings, so it prepares its own patterns once instead.
  */
 export function replaceSecrets(
   text: string, kept: Map<string, string>, min: number, mark: (name: string) => string,

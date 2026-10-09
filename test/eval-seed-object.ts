@@ -29,7 +29,7 @@ const STAND_IN = "export class DurableObject { constructor(ctx, env) { this.ctx 
 register("data:text/javascript," + encodeURIComponent(
   `export async function resolve(s, c, next) { if (s.startsWith("cloudflare:")) return { url: ${JSON.stringify("data:text/javascript," + encodeURIComponent(STAND_IN))}, shortCircuit: true }; return next(s, c); }`));
 const { AgentDO, default: worker } = await import("../cf/src/index.ts");
-const { AgentRuntime } = await import("../cf/src/runtime.ts");
+const { AgentRuntime, OPERATOR_EXA_REF } = await import("../cf/src/runtime.ts");
 const { clearHookRoutes } = await import("../cf/src/hook-route.ts");
 const { setLogSink } = await import("../src/core/log.ts");
 
@@ -1298,6 +1298,27 @@ await check("transcript and trace: a kept secret never leaves — secret_put's v
   must(r.body.redactions === 6, `redactions: ${r.body.redactions}`);
   const t = await call(w, "GET", `${A}/trace`);
   must(t.status === 200 && !t.text.includes(SECRET) && t.body.rows.some((x: any) => x.attrs.note === "saw <redacted:agent-secret>") && t.body.redactions >= 1, t.text.slice(0, 400));
+});
+
+await check("transcript and trace: the operator's key behind an operator: mount never leaves, in any case or base64'd", async () => {
+  const w = await world();
+  listByPrefix(w);
+  // The seeded search mount, on the operator's key (cf/src/runtime.ts SEEDED_PLUGINS).
+  await w.rt.store.addMount({ tenantId: T, agentId: A, alias: "search", plugin: "exa", installationId: "i-search", connectionId: null,
+    toolVersion: "1.0.0", publicConfig: {}, secretRef: OPERATOR_EXA_REF, policy: null });
+  // A bare key, as Exa's is: no shape finds it, so only resolving the mount's reference can.
+  const KEY = "9c1e4b7a-d2f3-4e5a-8b6c-7d8e9f0a1b2c";
+  w.env.EXA_API_KEY = KEY;
+  await toolTurn(w, "echo", { leaked: `key ${KEY.toUpperCase()}`, log: Buffer.from(`x-api-key=${KEY}`).toString("base64") }, `the key is ${KEY}`);
+  appendTrace(w.raw.sql as never, [{ at: Date.now(), tenantId: T, agentId: A, kind: "tool.call", spanId: "op_x", status: "succeeded", verdict: "ok", attrs: { tool: "pushy.noop", note: `saw ${KEY}` } }]);
+  // Positive control: the operator's unredacted read holds it.
+  must(show((await admin(w)).body).includes(KEY), "the fixture does not carry the key");
+  const r = await call(w, "GET", `${A}/transcript`);
+  must(r.status === 200 && !r.text.toLowerCase().includes(KEY) && !r.text.includes("eC1hcGkta2V5"), `the export carries the key: ${r.text.slice(0, 400)}`);
+  const echo = r.body.events.filter((e: any) => e.kind === "tool.result" && e.payload.tool === "p__noop").at(-1)?.payload.result;
+  must(echo?.leaked === "key <redacted:agent-secret>" && echo.log === "<redacted:agent-secret>", `the echo: ${show(echo)}`);
+  const t = await call(w, "GET", `${A}/trace`);
+  must(t.status === 200 && !t.text.includes(KEY) && t.body.rows.some((x: any) => x.attrs.note === "saw <redacted:agent-secret>"), t.text.slice(0, 400));
 });
 
 await check("transcript and trace: a sealed value the object cannot open refuses the export (503) rather than send it unscrubbed", async () => {

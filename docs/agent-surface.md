@@ -210,8 +210,8 @@ for an agent that is not a live provisioned agent of the tenant.
 | `POST` | `/provision/agents/{agentId}/restart` | restart the agent, keeping its conversation |
 | `GET` | `/provision/agents/{agentId}/model-input?session=&call=` | what one model call was sent |
 | `GET` | `/provision/agents/{agentId}/tools` | the tools the next turn offers the model |
-| `GET` | `/provision/agents/{agentId}/transcript?session=&limit=&cursor=` | a main conversation, every event of it |
-| `GET` | `/provision/agents/{agentId}/trace?from=&to=&limit=&cursor=` | the agent's trace rows in a window |
+| `GET` | `/provision/agents/{agentId}/transcript?session=&limit=&cursor=` | a main conversation, every event of it; `limit` 1–2000, default 500; a page also stops before 4 MiB ([below](#transcript)) |
+| `GET` | `/provision/agents/{agentId}/trace?from=&to=&limit=&cursor=` | the agent's trace rows in a window of at most 24 hours; `limit` 1–1000, default 200 ([below](#trace)) |
 
 The same flag lets `POST /provision/agents` choose the agent's tools ([below](#choosing-the-agents-tools)),
 and gives `instructions` a larger bound ([below](#instructions)).
@@ -481,11 +481,19 @@ own object, which alone can open its sealed values and never returns them, and o
   loses every string in its arguments, result and approval request but the secret's `name`
   (`<redacted:kept-secret>`), whatever the shape: an object, JSON in a string, or text.
 - **By exact value.** Every value the agent's object holds sealed — the secrets it kept, its mounts'
-  sealed credentials, its owner's and its hooks' secrets — and the Worker environment value any of its
-  mounts names (`env:NAME`), of 8 characters or more: each exact appearance, and its JSON-escaped,
-  URL-encoded and base64 forms, anywhere in a value or a key (`<redacted:agent-secret>`, one per
-  appearance). If a sealed value cannot be opened the export is `503` (`unavailable`), not sent
-  without this.
+  sealed credentials, its owner's and its hooks' secrets — the Worker environment value any of its
+  mounts names (`env:NAME`), and the operator's credential any of its mounts names (`operator:exa`,
+  `operator:run9`, resolved as the plugin's call resolves it; each string of a JSON one too), of 8
+  characters or more: each appearance, anywhere in a value or a key (`<redacted:agent-secret>`, one
+  per appearance), spelled as it is or JSON-escaped (once or twice), `\uXXXX`-escaped, HTML-escaped,
+  URL-encoded (`encodeURIComponent`, strict with `!'()*` escaped, form-encoded with `+` for a space,
+  `encodeURI`, and the first three encoded again), base64 or base64url (whole, or inside a longer run
+  at any alignment) or hex; a value of 16 characters or more, and its hex, in any letter case. And a
+  run that decodes to text holding one is replaced whole: a `%xx`-encoded run (up to three rounds of
+  decoding, `+` read both ways; only its `&`/`?`/`=`-separated parts that hold one, when some do) and
+  a base64 or base64url run of 24 to 65,536 characters, decoded from each of its first four characters.
+  If a sealed value or an operator credential a mount names cannot be read, the export is `503`
+  (`unavailable`), not sent without this.
 - **By key.** The string values under a key named like a credential — containing `token`, `secret`,
   `password`/`passwd`, `passphrase`, `authorization`, `api_key`/`api-key`/`apikey`, `credential`,
   `private_key` or `cookie`, any case — replaced whole, and every string under such a key when its
@@ -503,12 +511,27 @@ own object, which alone can open its sealed values and never returns them, and o
   Stripe `sk_`/`rk_` `live_`/`test_` keys; `<prefix>_live_…` keys; `ghp_`/`gho_`/`ghs_`/`ghu_`/`ghr_`
   tokens of 20 characters or more and `github_pat_…`; `sk_agent_…` of 8 or more; `sk-…` of 20 or more.
 - **Inside an encoding**: JSON in a string is parsed and walked (and written back when anything in it
-  was replaced); `%xx`-encoded text holding any of the shapes is decoded and kept decoded; a base64
-  run of 24 to 65,536 characters whose decoded text holds any of the shapes is replaced whole.
+  was replaced); `%xx`-encoded text holding any of the shapes, decoded up to three times, is kept
+  decoded; a base64 run of 24 to 65,536 characters whose decoded text holds any of the shapes is
+  replaced whole.
 
 A subtree nested more than 100 deep is replaced whole (`<redacted:too-deep>`). A credential sealed
 on a mount, and a mount's config, are not in a transcript or a trace row to begin with; the exact-value
 scrub is for when the agent repeated one.
+
+**Not caught.** The exact-value scrub knows only what the agent holds when the export is read: a
+secret the agent deleted, or overwrote with `secret_put`, is no longer known, and neither is a mount's
+credential since replaced or a mount since removed. A value shorter than 8 characters is not
+scrubbed at all, and one shorter than 16 only in its own letter case. A value split across two strings
+or two events, reversed, spaced out, compressed (gzip or deflate under base64), or in any spelling not
+listed above, is not found by value. In a kept-secret tool's call, the fields that name it and say
+where and when it ran (`id`, `name`, `tool`, `toolName`, `callId`, `toolCallId`, `task`, `taskId`,
+`status`, times, sequence numbers, `mount`, `approver`…, `cf/src/eval-read.ts` `SECRET_TOOL_KEEP`)
+are walked as ordinary text, so a secret the tool put in one of them is caught only by value or shape.
+The shapes are heuristics: a credential with none of the shapes or keys above — a bare opaque token
+outside `Authorization`, `Bearer` without a digit, a `key: value` or `KEY = value` line, an
+upper-cased key prefix (`SK-PROJ-…`), a JWT whose header is not JSON, a header given as a
+`[name, value]` pair or `{name, value}` object — is not caught unless it is one of the agent's values.
 
 ### Audit
 

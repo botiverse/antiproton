@@ -6,7 +6,10 @@
  *
  * Through the Worker and a real object, with a real alarm pass exporting the batches: test/eval-seed-object.ts.
  */
-import { readTraceWindow, redactCredentials, TRACE_OBJECTS_SCAN, type TraceSource } from "../cf/src/eval-read.ts";
+import { createHash } from "node:crypto";
+import { DatabaseSync } from "node:sqlite";
+import { agentSecretValues, credentialRedactor, readTraceWindow, redactCredentials, TRACE_OBJECTS_SCAN, type TraceSource } from "../cf/src/eval-read.ts";
+import { OPERATOR_EXA_REF, OPERATOR_RUN9_REF, operatorCredentials, resolveOperatorRef } from "../cf/src/operator-ref.ts";
 import { traceBody, traceKey, traceKeyRange, tracePrefix } from "../cf/src/trace-r2.ts";
 import type { TraceOutboxRow } from "../src/trace/outbox.ts";
 
@@ -269,6 +272,123 @@ await check("a walk survives what a hostile result can hold: deep nesting, a __p
   redactCredentials("a ".repeat(4_000_000));
   redactCredentials("x".repeat(8_000_000));
   must(Date.now() - t0 < 20_000, `16 MB of text took ${Date.now() - t0} ms`);
+});
+
+// ---- a sealed value in another spelling (follow-up to PR #827's review) --------------------------------------------
+
+/** Each spelling a reviewer found leaking, with the sealed values in play and the text that must not survive. */
+const u00 = (t: string) => [...t].map((c) => "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0")).join("");
+const hex = (t: string) => Buffer.from(t).toString("hex");
+const QUOTED = 'p@ss/w0rd+key!"\\x';
+const SPELLINGS: Array<[string, string, string]> = [
+  // Forms (`secretForms`): escaped, form-encoded, strict, encodeURI, twice-encoded, HTML.
+  ["json twice", "out: " + JSON.stringify(JSON.stringify({ a: QUOTED })), "w0rd"],
+  ["\\u escaped", '{"v":"' + u00(PW) + '"}', u00(PW).slice(0, 30)],
+  ["form", "q=" + new URLSearchParams({ q: QUOTED }).toString(), "w0rd"],
+  ["strict", "q=" + encodeURIComponent(QUOTED).replace(/[!'()*]/g, (c) => "%" + c.charCodeAt(0).toString(16)), "w0rd"],
+  ["encodeURI", encodeURI("https://h/?" + QUOTED), "w0rd"],
+  ["twice", "q=" + encodeURIComponent(encodeURIComponent(QUOTED)), "w0rd"],
+  ["html", QUOTED.replace(/"/g, "&quot;"), "w0rd"],
+  ["base64url", Buffer.from(QUOTED).toString("base64url"), Buffer.from(QUOTED).toString("base64url").slice(4, 16)],
+  ["base64 offset 1", b64("x" + PW), b64("x" + PW).slice(4, 28)],
+  ["base64 offset 2", b64("xy" + PW), b64("xy" + PW).slice(4, 28)],
+  ["base64 in text", "data: " + b64("prefix " + PW + " suffix"), b64("prefix " + PW + " suffix").slice(8, 40)],
+  ["basic, no prefix", b64("u:" + QUOTED), b64("u:" + QUOTED).slice(4, 16)],
+  // Any case (16 characters or more), and hex.
+  ["upper", PW.toUpperCase(), PW.toUpperCase()],
+  ["uuid upper", SECRET.toUpperCase(), SECRET.toUpperCase()],
+  ["hex", hex(PW), hex(PW)],
+  ["hex upper", hex(PW).toUpperCase(), hex(PW).toUpperCase()],
+];
+
+await check("a sealed value is replaced in every spelling: escaped, form- and strictly encoded, twice, HTML, base64 at any alignment, any case, hex", () => {
+  for (const [name, input, left] of SPELLINGS) {
+    const r = redactCredentials(input, { secrets: [PW, SECRET, QUOTED] });
+    const out = show(r.value);
+    must(r.redactions > 0 && !out.includes(left) && !out.includes(JSON.stringify(left).slice(1, -1)), `${name}: ${out}`);
+  }
+});
+
+await check("a %-encoded or base64 run whose decoded text holds a sealed value is replaced, however the value is spelled inside it", () => {
+  const thrice = encodeURIComponent(encodeURIComponent(encodeURIComponent(QUOTED)));
+  const url = redactCredentials(`see https://h.example/cb?page=2&q=${thrice}&x=1 now`, { secrets: [QUOTED] });
+  must(url.value === "see https://h.example/cb?page=2&q=<redacted:agent-secret>&x=1 now" && url.redactions === 1, `three times: ${show(url)}`);
+  for (const [name, inner] of [["JSON", JSON.stringify({ v: QUOTED })], ["%-encoded", "v=" + encodeURIComponent(QUOTED)], ["upper", "v=" + PW.toUpperCase()]] as const) {
+    const run = b64("{prefix} " + inner);
+    const r = redactCredentials(`blob ${run} end`, { secrets: [QUOTED, PW] });
+    must(r.value === "blob <redacted:agent-secret> end" && r.redactions === 1, `base64 of ${name}: ${show(r)}`);
+  }
+  // The control: the same runs without the value in them are left whole.
+  const plain = redactCredentials(`blob ${b64("{prefix} " + JSON.stringify({ v: "nothing here" }))} end ?q=${encodeURIComponent("a/b c")}`, { secrets: [QUOTED, PW] });
+  must(plain.redactions === 0, show(plain));
+});
+
+await check("a value shorter than 16 characters is matched in its own case only; 16 or more in any case", () => {
+  const short = redactCredentials("ABC12345 and abc12345 and Abc12345", { secrets: ["Abc12345"] });
+  must(short.value === "ABC12345 and abc12345 and <redacted:agent-secret>" && short.redactions === 1, show(short));
+  const long = redactCredentials(`${PW.toUpperCase()} ${PW}`, { secrets: [PW] });
+  must(long.value === "<redacted:agent-secret> <redacted:agent-secret>" && long.redactions === 2, show(long));
+});
+
+await check("a kept-secret tool is found by pi's toolName too; its call's names, ids and a trace row's task stay readable", () => {
+  const pi = redactCredentials({ role: "toolResult", toolCallId: "call_7", toolName: "state__secret_get", content: [{ type: "text", text: "zz-plain-value-99" }], isError: false, timestamp: 5 });
+  must(show(pi.value) === show({ role: "toolResult", toolCallId: "call_7", toolName: "state__secret_get", content: [{ type: "<redacted:kept-secret>", text: "<redacted:kept-secret>" }], isError: false, timestamp: 5 }), show(pi));
+  const rowAttrs = { tool: "state.secret_get", mount: "state", task: "t_raft_01JEVAL", callId: "call_7", approver: "u" };
+  const traced = redactCredentials({ seq: 3, kind: "tool.call", spanId: "op_1", status: "succeeded", attrs: rowAttrs });
+  must(traced.redactions === 0 && show((traced.value as any).attrs) === show(rowAttrs), show(traced));
+});
+
+await check("ordinary text and hashes are left alone with sealed values in play: 200 of them, every form, any case", () => {
+  const secrets = Array.from({ length: 200 }, (_, i) => i % 2 ? createHash("sha256").update(`s${i}`).digest("hex").slice(0, 32) : `k-${i}-${createHash("sha256").update(`t${i}`).digest("base64url").slice(0, 20)}`);
+  const h = (t: string) => createHash("sha256").update(t).digest("hex");
+  const hb = (t: string) => createHash("sha256").update(t).digest("base64");
+  const ordinary = {
+    manifestSha256: h("a"), files: [{ path: "a.txt", sha256: h("b"), size: 3 }], sha256b64: hb("c"), integrity: "sha256-" + hb("d"),
+    text: "commit " + h("x").slice(0, 40) + " https://github.com/o/r/pull/827?tab=files&page=2&q=a%20b%2Fc token+bucket",
+    image: "data:image/png;base64," + Buffer.from(Array.from({ length: 3000 }, (_, i) => (i * 7919) % 256)).toString("base64"),
+    readme: b64("hello world, this is a readme %41 with no value in it"), upper: "ABC12345 ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+  };
+  const r = redactCredentials(ordinary, { secrets: [...secrets, "Abc12345"] });
+  must(r.redactions === 0 && show(r.value) === show(ordinary), `changed (${r.redactions}): ${show(r.value).slice(0, 400)}`);
+});
+
+await check("200 sealed values over 2000 events: the forms are made once, and the walk is well inside the old 22 s", () => {
+  const secrets = Array.from({ length: 200 }, (_, i) => createHash("sha256").update(`v${i}`).digest(i % 2 ? "hex" : "base64url").slice(0, 32));
+  const words = "the quick brown fox jumps over a lazy dog while tool results stream in https://example.com/a?b=c".split(" ");
+  const txt = (n: number, at: number) => Array.from({ length: n }, (_, k) => words[(at * 7 + k * 3) % words.length]).join(" ");
+  const events = Array.from({ length: 2000 }, (_, i) => ({
+    sequence: i, kind: "tool.result",
+    payload: { tool: "p__get", callId: `call_${i}`, result: { body: txt(80, i) + (i % 97 === 0 ? ` ${secrets[i % 200]} ` : ""), items: [{ title: txt(8, i + 1), url: `https://h.example/x/${i}` }] } },
+  }));
+  const t0 = performance.now();
+  const redact = credentialRedactor({ secrets });
+  let n = 0;
+  for (const e of events) n += redact(e).redactions;
+  const ms = performance.now() - t0;
+  console.log(`  200 values x 2000 events: ${ms.toFixed(0)} ms`);
+  must(n === 21, `redactions: ${n}`);
+  must(ms < 5000, `${ms.toFixed(0)} ms`);
+});
+
+await check("agentSecretValues adds the operator's credential a mount names, as the runtime resolves it, and refuses when it cannot be read", async () => {
+  const db = new DatabaseSync(":memory:");
+  const sql = { exec: (q: string, ...b: unknown[]) => ({ toArray: () => db.prepare(q).all(...(b as never[])) as any[] }) };
+  db.exec("CREATE TABLE mounts (tenant_id TEXT, agent_id TEXT, alias TEXT, secret_ref TEXT)");
+  const add = (alias: string, ref: string | null, agent = A) => db.prepare("INSERT INTO mounts VALUES (?, ?, ?, ?)").run(T, agent, alias, ref);
+  add("search", OPERATOR_EXA_REF); add("box", OPERATOR_RUN9_REF); add("x", "env:X_KEY"); add("web", null); add("search", OPERATOR_EXA_REF, "raft_other");
+  const EXA = "exa-0f8fad5b-d9cb-469f-a165", AK = "ak-operator-1234", SK = "sk-operator-5678-abcd";
+  const env = { EXA_API_KEY: EXA, RUN9: JSON.stringify({ ak: AK, sk: SK }), X_KEY: "env-value-123" };
+  const got = await agentSecretValues(sql, T, A, env);
+  must(got.ok, show(got));
+  const run9 = await resolveOperatorRef(OPERATOR_RUN9_REF, operatorCredentials(env), async () => null);
+  must([EXA, AK, SK, "env-value-123", run9!].every((v) => got.values.includes(v)), show(got));
+  // So the export scrubs them: the Exa key upper-cased and the run9 secret base64'd inside a log line.
+  const r = redactCredentials(`search with ${EXA.toUpperCase()} then ${b64("sk=" + SK)}`, { secrets: got.values });
+  must(r.value === "search with <redacted:agent-secret> then <redacted:agent-secret>", show(r));
+  const none = await agentSecretValues(sql, T, A, {});
+  must(none.ok && none.values.length === 0, `a deployment without them: ${show(none)}`);
+  const bad = await agentSecretValues(sql, T, A, { RUN9: "{not json" });
+  must(!bad.ok, `an unreadable run9 account: ${show(bad)}`);
 });
 
 const failed = results.filter((r) => !r.ok);
