@@ -592,6 +592,44 @@ export function fenceFor(text: string): string {
 }
 
 /**
+ * The sizes a seeded path's line can give, each from a number written as
+ * digits: the working copy's now, the setup's when the copy is in object
+ * storage, or none because it was removed. One table, read by `seedLine` to
+ * write a line and by `isSeedLine` to recognise one.
+ */
+const SEED_SIZES = {
+  now: (n: string) => `${n} bytes`,
+  setup: (n: string) => `${n} bytes at setup, kept in object storage`,
+  removed: (_n: string) => "removed",
+} as const;
+
+/**
+ * The start of the line the setup block gives a seeded path: the heading over
+ * `MEMORY.md`'s text, or an item in the list of the others. Everything after it
+ * is prose for the model and free to change; this part is what the
+ * evaluation's record recognises (`isSeedLine`), so it is written only here.
+ */
+export function seedLine(path: string, size: string, mode: SeedMode): string {
+  return `${path === SEEDED_MEMORY ? "## " : "- "}\`${path}\` (${size}, ${mode})`;
+}
+
+const escapeRe = (t: string) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/**
+ * Whether `line` is the setup block's line for `path`: what `seedLine` writes
+ * for it, with any size `SEED_SIZES` can give and either mode. Built from those
+ * two, so a change to the line's shape is a change to what is recognised.
+ */
+export function isSeedLine(line: string, path: string): boolean {
+  const SIZE = "\u0000size\u0000", MODE = "\u0000mode\u0000", N = "\u0000n\u0000";
+  const sizes = Object.values(SEED_SIZES).map((f) => escapeRe(f(N)).replace(escapeRe(N), "\\d+"));
+  const pattern = escapeRe(seedLine(path, SIZE, MODE as SeedMode))
+    .replace(escapeRe(SIZE), `(?:${sizes.join("|")})`)
+    .replace(escapeRe(MODE), `(?:${(["writable", "readonly"] satisfies SeedMode[]).join("|")})`);
+  return new RegExp(`^${pattern}`).test(line);
+}
+
+/**
  * A working copy's size as the setup counted the file: UTF-8 bytes of its
  * text, so an unedited copy reads the same number as its manifest entry (the
  * binary-payload exception in AGENTS.md's convention, as in seed-files.ts).
@@ -620,8 +658,11 @@ function utf8Bytes(value: Json | undefined): number | null {
  * agent did not write these, and a model told it did will defend their
  * content as its own conclusion.
  *
- * A path is printed exactly as stored, since the evaluation's record counts
- * the seeded paths a prompt names by literal match (cf/src/fresh-context.ts).
+ * A path is printed exactly as stored, in the line `seedLine` makes for it,
+ * since the evaluation's record counts a seeded path as listed only where a
+ * line `isSeedLine` recognises names it (cf/src/fresh-context.ts
+ * `seededPathsListed`); a mention elsewhere, in the fenced file included, is
+ * not a listing.
  * It is operator text becoming prompt text, so one that fails the key rule —
  * which no setup route lets through, as the rule has no room for a newline, a
  * backtick or any control character — is not printed at all, only counted.
@@ -637,9 +678,9 @@ export async function seededFiles(
   const shown = files.filter((f) => STATE_KEY.test(f.path));
   const hidden = files.length - shown.length;
   const sizeOf = (f: SeedFileMeta, got: { value: Json; ref: string | null } | null) => {
-    if (!got) return "removed";
+    if (!got) return SEED_SIZES.removed("");
     const now = utf8Bytes(got.value);
-    return now === null ? `${f.bytes} bytes at setup, kept in object storage` : `${now} bytes`;
+    return now === null ? SEED_SIZES.setup(String(f.bytes)) : SEED_SIZES.now(String(now));
   };
   const parts: string[] = [
     "# Workspace files provided at setup\n" +
@@ -679,7 +720,7 @@ export async function seededFiles(
       body = `${what} Its current content is the text inside the fence below:\n\n` +
         `${fence}\n${kept}\n${fence}${cut}`;
     }
-    parts.push(`## \`${memory.path}\` (${sizeOf(memory, got)}, ${mode})\n${body}`);
+    parts.push(`${seedLine(memory.path, sizeOf(memory, got), mode)}\n${body}`);
   }
   const others = shown.filter((f) => f !== memory);
   const lines: string[] = [];
@@ -694,7 +735,7 @@ export async function seededFiles(
         ? "a working file handed to you to maintain; " +
           (getTool ? `open it with ${getTool}` : "you have no tool mounted for opening it")
         : (getTool ? `it can be read with ${getTool}` : "it can be read") + " but not changed or removed";
-    lines.push(`- \`${f.path}\` (${sizeOf(f, got)}, ${mode}): ${how}.`);
+    lines.push(`${seedLine(f.path, sizeOf(f, got), mode)}: ${how}.`);
   }
   if (hidden) lines.push(`- and ${hidden} more whose ${hidden === 1 ? "name" : "names"} cannot be shown here.`);
   if (lines.length) parts.push((memory ? "## Other files\n" : "") + lines.join("\n"));

@@ -393,6 +393,33 @@ await check("model-input counts a seeded path only where the setup block lists i
   must(show(ev?.seedPathsInSystemPrompt) === show(["MEMORY.md"]), `recorded: ${show(ev?.seedPathsInSystemPrompt)}`);
 });
 
+await check("model-input counts every path the state plugin's rendered block lists, in every form a line takes, and no mention", async () => {
+  const store = new SqliteStore(":memory:");
+  await store.init();
+  await store.createAgent("t", "a");
+  await store.addMount({ tenantId: "t", agentId: "a", alias: "state", installationId: "i", connectionId: null,
+    plugin: "state", toolVersion: "1.0.0", publicConfig: {}, secretRef: null, policy: null } as never);
+  const plugin = statePlugin(store, null, "local");
+  const ctx = { publicConfig: {}, credential: null, caller: { tenantId: "t", agentId: "a", taskId: "k" }, alias: "state" } as unknown as PluginContext;
+  const big = file("notes/big.md", "é".repeat(20_000));
+  for (const w of [
+    file("MEMORY.md", "see notes/w.md first; `a` (1 bytes, writable) is not a line"), file("notes/w.md", "w"), file("notes/r.md", "r", "readonly"),
+    file("notes/gone.md", "g"), { ...big, content: null, ref: "r2://b/t/t/a/seed/big.txt", working: { value: null, ref: "r2://b/t/t/a/state/notes/big.md.json", bytes: 20_002 } },
+  ]) must((await store.seedWrite("t", "a", w)).ok, w.path);
+  await plugin.invoke("forget", { key: "notes/gone.md" }, ctx);
+  const block = (await plugin.promptContribution!(ctx))!;
+  const seeded = ["MEMORY.md", "notes/big.md", "notes/gone.md", "notes/r.md", "notes/w.md"];
+  must(show(seededPathsListed(block, seeded)) === show(seeded), `listed: ${show(seededPathsListed(block, seeded))}`);
+  // Each form a line takes is in this block: sized, read-only, removed, and kept in object storage.
+  for (const form of ["(1 bytes, writable)", "(1 bytes, readonly)", "(removed, writable)", "(40000 bytes at setup, kept in object storage, writable)"]) {
+    must(block.includes(form), `the sample lacks ${form}: ${block}`);
+  }
+  // Prose around it that names the paths, and paths that are only mentioned, count for nothing.
+  const prose = "Keep MEMORY.md tidy. See `notes/x.md` (3 bytes, writable) and a, and - `a` (1 bytes, writable) mid-line.";
+  must(show(seededPathsListed(`${prose}\n${block}`, [...seeded, "a", "notes/x.md"])) === show(seeded), "a mention was counted");
+  must(seededPathsListed(prose, ["MEMORY.md", "a", "notes/x.md"]).length === 0, "a mention was counted without a block");
+});
+
 await check("production (cf/wrangler.jsonc) does not set EVAL_SEED_ROUTES; preview sets it to \"1\"", () => {
   const prod = varsOf("wrangler.jsonc");
   must(!("EVAL_SEED_ROUTES" in prod), `cf/wrangler.jsonc sets EVAL_SEED_ROUTES = ${show(prod.EVAL_SEED_ROUTES)}: the evaluation routes would be served in production`);
