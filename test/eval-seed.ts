@@ -3,6 +3,9 @@
  * fake deps, the two stores keeping the same rows by the same rule, the state plugin agreeing with the seeded paths'
  * key rule and spill threshold, and the production configuration not serving the routes.
  *
+ * What the state plugin does with a seeded path (the read-only guard, `seed` on `get` and `list`, the prompt):
+ * test/state-seed.ts.
+ *
  * Through the Worker, the whole object, an inbound push and a fresh conversation: test/eval-seed-object.ts.
  */
 import { readFileSync } from "node:fs";
@@ -302,6 +305,21 @@ await check("a spilled snapshot keeps its reference and no text in the row", asy
 
 // ---- the rules shared with the state plugin --------------------------------
 
+/*
+ * One declaration of each rule (src/plugins/state-key.ts), so there is no second copy to hold to the first. What is
+ * left to check is that it stays one — the plugin imports both and declares neither again — and, by asking the
+ * plugin itself, that what the setup route adds on top of the key rule only narrows it and that the two measure a
+ * value's size the same way, which a shared constant does not give.
+ */
+await check("state.ts takes its key rule and spill threshold from state-key.ts, and declares neither of its own", () => {
+  const code = readFileSync(new URL("../src/plugins/state.ts", import.meta.url), "utf8");
+  const imported = /import\s*\{([^}]*)\}\s*from\s*"\.\/state-key\.ts"/.exec(code)?.[1] ?? "";
+  for (const name of ["STATE_KEY", "STATE_INLINE_MAX"]) must(new RegExp(`\\b${name}\\b`).test(imported), `state.ts does not import ${name} from ./state-key.ts`);
+  must(!/\/\^\[A-Za-z0-9\]/.test(code), "state.ts declares a key pattern of its own");
+  must(!/32\s*\*\s*1024/.test(code), "state.ts declares a spill threshold of its own");
+  must(!/\bconst\s+(KEY|INLINE_MAX)\b/.test(code), "state.ts declares KEY or INLINE_MAX again");
+});
+
 await check("a path the state plugin would refuse as a key is refused as a seeded path, and its plain keys are accepted by both", async () => {
   const store = new SqliteStore(":memory:");
   await store.init();
@@ -373,6 +391,33 @@ await check("model-input counts a seeded path only where the setup block lists i
   sql.exec("INSERT INTO pi_model_jobs(id, request, session) VALUES ('j1', ?, 'main')", JSON.stringify({ context: { systemPrompt: system, messages: [] } }));
   const ev = recordModelInput(sql as never, "j1", ["a", "MEMORY.md", "notes/c.md"], 1);
   must(show(ev?.seedPathsInSystemPrompt) === show(["MEMORY.md"]), `recorded: ${show(ev?.seedPathsInSystemPrompt)}`);
+});
+
+await check("model-input counts every path the state plugin's rendered block lists, in every form a line takes, and no mention", async () => {
+  const store = new SqliteStore(":memory:");
+  await store.init();
+  await store.createAgent("t", "a");
+  await store.addMount({ tenantId: "t", agentId: "a", alias: "state", installationId: "i", connectionId: null,
+    plugin: "state", toolVersion: "1.0.0", publicConfig: {}, secretRef: null, policy: null } as never);
+  const plugin = statePlugin(store, null, "local");
+  const ctx = { publicConfig: {}, credential: null, caller: { tenantId: "t", agentId: "a", taskId: "k" }, alias: "state" } as unknown as PluginContext;
+  const big = file("notes/big.md", "é".repeat(20_000));
+  for (const w of [
+    file("MEMORY.md", "see notes/w.md first; `a` (1 bytes, writable) is not a line"), file("notes/w.md", "w"), file("notes/r.md", "r", "readonly"),
+    file("notes/gone.md", "g"), { ...big, content: null, ref: "r2://b/t/t/a/seed/big.txt", working: { value: null, ref: "r2://b/t/t/a/state/notes/big.md.json", bytes: 20_002 } },
+  ]) must((await store.seedWrite("t", "a", w)).ok, w.path);
+  await plugin.invoke("forget", { key: "notes/gone.md" }, ctx);
+  const block = (await plugin.promptContribution!(ctx))!;
+  const seeded = ["MEMORY.md", "notes/big.md", "notes/gone.md", "notes/r.md", "notes/w.md"];
+  must(show(seededPathsListed(block, seeded)) === show(seeded), `listed: ${show(seededPathsListed(block, seeded))}`);
+  // Each form a line takes is in this block: sized, read-only, removed, and kept in object storage.
+  for (const form of ["(1 bytes, writable)", "(1 bytes, readonly)", "(removed, writable)", "(40000 bytes at setup, kept in object storage, writable)"]) {
+    must(block.includes(form), `the sample lacks ${form}: ${block}`);
+  }
+  // Prose around it that names the paths, and paths that are only mentioned, count for nothing.
+  const prose = "Keep MEMORY.md tidy. See `notes/x.md` (3 bytes, writable) and a, and - `a` (1 bytes, writable) mid-line.";
+  must(show(seededPathsListed(`${prose}\n${block}`, [...seeded, "a", "notes/x.md"])) === show(seeded), "a mention was counted");
+  must(seededPathsListed(prose, ["MEMORY.md", "a", "notes/x.md"]).length === 0, "a mention was counted without a block");
 });
 
 await check("production (cf/wrangler.jsonc) does not set EVAL_SEED_ROUTES; preview sets it to \"1\"", () => {

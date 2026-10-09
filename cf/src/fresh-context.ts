@@ -21,7 +21,7 @@
  */
 import { BRANCH_SUMMARY_PREFIX, COMPACTION_SUMMARY_PREFIX } from "@earendil-works/pi-agent-core";
 import { canonJson } from "../../src/core/canon-json.ts";
-import { WORKING_SET } from "../../src/plugins/state.ts";
+import { isSeedLine, WORKING_SET } from "../../src/plugins/state.ts";
 import { ensurePiTables, MAIN_SESSION, piTables } from "../../src/store/pi-storage.ts";
 import { sha256Hex } from "../../src/store/seed-files.ts";
 
@@ -147,15 +147,13 @@ function textOf(content: unknown): string {
 }
 
 /**
- * The seeded paths the system prompt carries as seeded files: a line the state plugin's setup block writes for one
- * (src/plugins/state.ts `seededFiles`), the `MEMORY.md` heading "## `path` (<size>, <mode>)" or a list line
- * "- `path` (<size>, <mode>): …", where size is "<n> bytes" or "removed". A path that is merely mentioned, or that
- * is part of a longer word or path, is not listed.
+ * The seeded paths the system prompt carries as seeded files: a line of the state plugin's setup block names each
+ * (src/plugins/state.ts `seedLine`, recognised by its `isSeedLine`, so the shape is written once). A path that is
+ * merely mentioned, or that is part of a longer word or path, is not listed.
  */
 export function seededPathsListed(system: string, seedPaths: readonly string[]): string[] {
-  const listed = new Set<string>();
-  for (const m of system.matchAll(/^(?:## |- )`([^`\n]+)` \((?:\d+ bytes|removed), (?:writable|readonly)\)/gm)) listed.add(m[1]!);
-  return seedPaths.filter((p) => listed.has(p));
+  const lines = system.split("\n");
+  return seedPaths.filter((p) => lines.some((l) => isSeedLine(l, p)));
 }
 
 const messageHash = (m: unknown) => sha256Hex(canonJson(m));

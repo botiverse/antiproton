@@ -809,7 +809,8 @@ and `progress`, and `promptContribution`. A prompt contribution is a paragraph
 added to the system prompt; it is asked for once per mount each time the
 harness opens. Use it for something the
 agent should know before its first call (the `state` plugin lists the agent's
-saved notes). Return `null` when there is nothing to say. Something that
+saved notes, after the files an evaluation's setup seeded, if any:
+[`docs/agent-surface.md`](agent-surface.md#seeded-files)). Return `null` when there is nothing to say. Something that
 changes often costs a re-read of everything after it on the next turn, so keep
 the paragraph stable — and in particular **write instants, not durations**. "in
 use since 12:03" does not move when the reader does; "idle for 7 minutes" is
