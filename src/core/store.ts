@@ -1,4 +1,5 @@
 import type { SeedNoticeRow, SeedPassResult, SeedPlan, SeedRecord } from "../store/seed-record.ts";
+import type { SealHow, SeedFileMeta, SeedSeal, SeedStoreResult, SeedWrite } from "../store/seed-files.ts";
 import type {
   AdvanceTxn,
   CommitResult,
@@ -415,6 +416,22 @@ export interface StorageAdapter {
   voidSeedNotices(tenantId: string, agentId: string, rows: ReadonlyArray<{ alias: string; since: number; reason: string }>): Promise<void>;
   /** Put taken notices back to pending, when the message that was to carry them was not written. */
   returnSeedNotices(tenantId: string, agentId: string, rows: readonly SeedNoticeRow[]): Promise<void>;
+  /**
+   * Workspace files given to the agent before it first runs, and the seal that ends that window
+   * (src/store/seed-files.ts). Both copies of a file — the snapshot and the working copy at key = path — in one
+   * transaction, refused once sealed.
+   */
+  seedWrite(tenantId: string, agentId: string, file: SeedWrite): Promise<SeedStoreResult>;
+  /** The seeded files as they stand, their hash, and the seal if there is one. Read-only. */
+  seedManifest(tenantId: string, agentId: string): Promise<{ manifest: SeedFileMeta[]; manifestSha256: string; seal: SeedSeal | null }>;
+  /** Close the window; the first call writes the seal, every later one returns it unchanged (`sealedNow` false). */
+  seal(tenantId: string, agentId: string, how: SealHow): Promise<{ seal: SeedSeal; sealedNow: boolean }>;
+  isSealed(tenantId: string, agentId: string): Promise<boolean>;
+  /**
+   * What the state plugin asks before a write: every seeded path with its mode, size and hash, sorted by path. No
+   * content, so asking costs one indexed read whatever the files hold.
+   */
+  listSeedFiles(tenantId: string, agentId: string): Promise<SeedFileMeta[]>;
   /** `"inherit"` is stored as the absence of a row, not as a third value. */
   setPluginChoice(
     tenantId: string, agentId: string, plugin: string, choice: PluginChoice,

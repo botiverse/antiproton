@@ -55,7 +55,10 @@
     "UI_ALLOW_ANONYMOUS": "1",
     // Same container lease as production (cf/wrangler.jsonc says why).
     "RUN9_WARN_MINUTES": "5",
-    "RUN9_MAX_IDLE_MINUTES": "30"
+    "RUN9_MAX_IDLE_MINUTES": "30",
+    // An evaluation's setup routes under /provision (seeded workspace files, fresh context, model-input evidence;
+    // cf/src/provision/handlers.ts). Preview only: test/eval-seed.ts fails if cf/wrangler.jsonc sets it.
+    "EVAL_SEED_ROUTES": "1"
   },
   "observability": { "enabled": true }
 }

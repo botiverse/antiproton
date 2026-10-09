@@ -36,7 +36,7 @@ import { secretRefKind } from "../../src/runtime/secrets.ts";
 import { DynamicWorkerExecutor, handleSandboxCall, handleSandboxSuspend, type SuspendRequest } from "../../src/runtime/dynamic-worker-executor.ts";
 import { executorSpec } from "../../test/spec/executor-spec.ts";
 import {
-  AgentRuntime, reconcileSeed, OPERATOR_RUN9_REF, isOperatorModelRef, parsePluginChoice, SEEDED_PLUGINS, installedRows, messageRefusal, consoleAdded, CONSOLE_MOUNTS_MAX, agentKind, seedInstallation } from "./runtime.ts";
+  AgentRuntime, type FreshContextResult, type RestartResult, reconcileSeed, OPERATOR_RUN9_REF, isOperatorModelRef, parsePluginChoice, SEEDED_PLUGINS, installedRows, messageRefusal, consoleAdded, CONSOLE_MOUNTS_MAX, agentKind, seedInstallation } from "./runtime.ts";
 import { readMeter } from "../../bench/meter.ts";
 import { BENCH_SWE_WITHHELD } from "../../bench/swebench/withheld.ts";
 import { contextWindowFor } from "../../src/model/context-windows.ts";
@@ -95,6 +95,8 @@ import { d1Connections, d1Connectors, d1ModelChoices, d1ModelOverrides, d1Provid
 import { CONNECT_START_PATH, CONNECTION_PLUGIN, connectCallback, connectLink, connectStart, isConnectCallback, type ConnectDeps } from "./provision/connect.ts";
 import { hashProviderToken, looksLikeProviderToken } from "./provider-token.ts";
 import { handleProvision, type ProvisionDeps, type ProvisionTool } from "./provision/handlers.ts";
+import type { SeedMode } from "../../src/store/seed-files.ts";
+import { currentMainId } from "./fresh-context.ts";
 import { adoptProvisionedAgent, provisionTool, provisionPushStatus, PROVIDER_HOME, PROVISION_MOUNT_ALIAS } from "./provision/steps.ts";
 import { repairPush } from "./provision/handlers.ts";
 import { hasPendingInbound, inboundStatus, lowerHeaders, newHookId, readCapped } from "../../src/runtime/inbound.ts";
@@ -161,6 +163,12 @@ export interface Env {
   RUN_JS_RESUME_MS?: string;
   /** "1" opens the demo UI with no identity at all. Off by default. */
   UI_ALLOW_ANONYMOUS?: string;
+  /**
+   * "1" serves an evaluation's setup routes under /provision (seeded workspace files, a fresh context, model-input
+   * evidence: cf/src/provision/handlers.ts) and records the evidence. Set in cf/wrangler.preview.jsonc only;
+   * test/eval-seed.ts fails if cf/wrangler.jsonc sets it. Anything else: the routes answer 404.
+   */
+  EVAL_SEED_ROUTES?: string;
   /** The canonical origin, so the registered callback URL is built from a
    *  constant and never from an inbound Host header. */
   /** Login with GitHub: the OAuth App tygg owns, callback /login/github/callback. */
@@ -443,6 +451,7 @@ export class AgentDO extends DurableObject<Env> {
       operatorExa: this.env.EXA_API_KEY,
       reminderApp: { origin: this.env.REMINDER_APP_ORIGIN, credential: this.env.REMINDER_APP_CREDENTIAL },
       secretKek: this.env.SECRET_KEK,
+      modelInputEvidence: evalSeedRoutes(this.env),
       // Plugins may make their own mount's hooks (Raft push); the URL must be
       // one a service can reach, which the console's own origin may not be.
       hooks: this.env.HOOK_ORIGIN
@@ -1991,6 +2000,58 @@ export class AgentDO extends DurableObject<Env> {
     return this.#busy("provisionTool", () => provisionTool(this.runtime(), tenantId, agentId, name));
   }
 
+  /**
+   * An evaluation's setup (cf/src/provision/handlers.ts, behind EVAL_SEED_ROUTES): each is a method of this object, so
+   * a seed write and the first inbound push or turn, which close the window, are serialized here. Each answers only
+   * for the agent this object already is, and makes nothing.
+   */
+  async seedWrite(tenantId: string, agentId: string, path: string, mode: SeedMode, text: string) {
+    if (!this.#isAgent(tenantId, agentId)) return { ok: false as const, code: "not_found" as const, message: `no agent ${agentId}` };
+    return this.#busy("seedWrite", () => this.runtime().seedWrite(tenantId, agentId, { path, mode, text }));
+  }
+
+  async seedSeal(tenantId: string, agentId: string, credentialId: string | null) {
+    if (!this.#isAgent(tenantId, agentId)) return null;
+    return this.#busy("seedSeal", () => this.runtime().sealSeed(tenantId, agentId, credentialId));
+  }
+
+  async seedManifest(tenantId: string, agentId: string) {
+    if (!this.#isAgent(tenantId, agentId)) return null;
+    return this.runtime().seedManifest(tenantId, agentId);
+  }
+
+  /** Nothing else runs in the object while the transcript's tables move (cf/src/fresh-context.ts). */
+  async freshContext(tenantId: string, agentId: string): Promise<FreshContextResult> {
+    if (!this.#isAgent(tenantId, agentId)) return { ok: false, status: 404, error: `no agent ${agentId}` };
+    return this.#busy("freshContext", () => this.ctx.blockConcurrencyWhile(() => this.runtime().freshContext(tenantId, agentId)));
+  }
+
+  /**
+   * The ordinary restart, as an eviction would do it (`simulateEviction`): every harness, cached tool list and
+   * held program in this object's memory is dropped, and the next turn rebuilds from storage, on the same main
+   * conversation with its whole transcript. Not a fresh context (`freshContext`), which starts a new conversation.
+   * Refused while a turn is out: an eviction would kill a step in flight, and dropping the runtime under one would
+   * leave it running beside its replacement.
+   */
+  async restart(tenantId: string, agentId: string): Promise<RestartResult> {
+    if (!this.#isAgent(tenantId, agentId)) return { ok: false, status: 404, error: `no agent ${agentId}` };
+    return this.#busy("restart", () => this.ctx.blockConcurrencyWhile(async (): Promise<RestartResult> => {
+      const rt = this.runtime();
+      await rt.ready();
+      const busy = rt.notIdle();
+      if (busy) return { ok: false, status: 409, error: `${busy}; a restart happens only between turns` };
+      const sessionId = currentMainId(this.sql as never);
+      await rt.dropHarnesses(tenantId, agentId);
+      await this.simulateEviction();
+      return { ok: true, sessionId, restartedAt: Date.now() };
+    }));
+  }
+
+  async modelInput(tenantId: string, agentId: string, session: string | null, call: number | null) {
+    if (!this.#isAgent(tenantId, agentId)) return null;
+    return this.runtime().modelInput(tenantId, agentId, session, call);
+  }
+
   /** The raft mount's push state, read from the store: no tool call, no trace, no usage. */
   async provisionPushStatus(tenantId: string, agentId: string) {
     this.#claim(tenantId, agentId);
@@ -3232,7 +3293,12 @@ async function provision(request: Request, env: Env, url: URL): Promise<Response
   if (!who) return refuse(401, "unauthorized", "the provider token is not one this deployment issued, or was revoked");
   await tokens.touch(hash);
   let body: unknown = undefined;
-  if (request.method === "POST" || request.method === "PATCH" || request.method === "PUT" || request.method === "DELETE") {
+  let raw: Uint8Array | null = null;
+  // A seeded file is sent as itself, not as JSON (cf/src/provision/handlers.ts `evalSetup`): kept as bytes, so text
+  // that is not UTF-8 is refused there rather than quietly replaced while being decoded here.
+  if (request.method === "PUT" && /^\/provision\/agents\/(?:by-raft-agent\/)?[^/]+\/seed$/.test(url.pathname)) {
+    raw = new Uint8Array(await request.arrayBuffer());
+  } else if (request.method === "POST" || request.method === "PATCH" || request.method === "PUT" || request.method === "DELETE") {
     const text = await request.text();
     // A DELETE may carry who is acting (a connector's disconnect); without a body it stays undefined.
     try { body = text ? JSON.parse(text) : request.method === "DELETE" ? undefined : {}; }
@@ -3241,7 +3307,9 @@ async function provision(request: Request, env: Env, url: URL): Promise<Response
   const deps = provisionDeps(env);
   try {
     const res = await handleProvision(request.method, url.pathname.slice("/provision".length),
-      { idempotencyKey: request.headers.get("idempotency-key"), raftServerId: url.searchParams.get("raftServerId") }, body, who, deps, url.searchParams);
+      // The token's hash names it in the operator's listing (cf/src/admin-provider-tokens.ts): what an audit line may say.
+      { idempotencyKey: request.headers.get("idempotency-key"), raftServerId: url.searchParams.get("raftServerId"), credentialId: hash },
+      body, who, deps, url.searchParams, raw);
     return res ?? refuse(404, "not_found", `${request.method} ${url.pathname} is not part of raft-agent-provider.v1`);
   } catch (e) {
     const message = typeof e === "object" && e !== null && "message" in e ? String((e as { message?: unknown }).message) : String(e);
@@ -3303,6 +3371,11 @@ function surfaceDeps(env: Env): SurfaceDeps {
   };
 }
 
+/** Whether this deployment serves an evaluation's setup routes and records their evidence: exactly "1", nothing looser. */
+export function evalSeedRoutes(env: Pick<Env, "EVAL_SEED_ROUTES">): boolean {
+  return env.EVAL_SEED_ROUTES === "1";
+}
+
 /**
  * What the provisioning rules act through: D1 for the registry, the agents' objects for everything
  * else. Shared by the provider route and the operator's push repair, so both reach an agent the same way.
@@ -3315,6 +3388,16 @@ function provisionDeps(env: Env): ProvisionDeps {
     now: () => Date.now(),
     registry: d1ProvisionedAgents(env.CONTROL_DB),
     surface: surfaceDeps(env),
+    ...(evalSeedRoutes(env) ? {
+      seed: {
+        write: (tenantId, agentId, f) => stub(tenantId, agentId).seedWrite(tenantId, agentId, f.path, f.mode, f.text),
+        seal: (tenantId, agentId, credentialId) => stub(tenantId, agentId).seedSeal(tenantId, agentId, credentialId),
+        manifest: (tenantId, agentId) => stub(tenantId, agentId).seedManifest(tenantId, agentId),
+        freshContext: (tenantId, agentId) => stub(tenantId, agentId).freshContext(tenantId, agentId),
+        restart: (tenantId, agentId) => stub(tenantId, agentId).restart(tenantId, agentId),
+        modelInput: (tenantId, agentId, session, call) => stub(tenantId, agentId).modelInput(tenantId, agentId, session, call),
+      },
+    } : {}),
     agent: {
       adopt: async (tenantId, agentId, spec) => {
         const r = await stub(tenantId, agentId).provisionAdopt(tenantId, agentId, JSON.stringify(spec));

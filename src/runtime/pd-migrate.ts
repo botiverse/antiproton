@@ -263,6 +263,12 @@ function waitingCalls(sql: Sql, session: string): number {
   return Number(sql.exec("SELECT COUNT(*) AS n FROM api_client_calls WHERE session = ? AND state = 'pending' AND name != ''", session).toArray()[0]?.n ?? 0);
 }
 
+/** `waitingCalls` of every session together; no table is none. */
+export function clientCallsWaiting(sql: Sql): number {
+  if (!tableExists(sql, "api_client_calls")) return 0;
+  return Number(sql.exec("SELECT COUNT(*) AS n FROM api_client_calls WHERE state = 'pending' AND name != ''").toArray()[0]?.n ?? 0);
+}
+
 /**
  * Every session's import, as it would be written, and whether it already was. Writes nothing. A session whose turn
  * waits for the caller's functions ends with a cancel entry, when `cancel` is given: the turn is cancelled, as

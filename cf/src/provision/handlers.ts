@@ -23,6 +23,10 @@ import { secretShape } from "../secret-shape.ts";
 import type { ConnectionRegistry, ConnectorStore, ProviderTokenIdentity, ProvisionRegistry, ProvisionedAgent } from "../control-plane.ts";
 import { CONNECTION_PROVIDERS, returnUrlProblem, scopesFor, type ConnectionProvider } from "./connect.ts";
 import { surface, surfaceReadOf, type SurfaceDeps } from "../agent-surface/surface.ts";
+import { logEvent } from "../../../src/core/log.ts";
+import { WORKING_SET } from "../../../src/plugins/state.ts";
+import { SEED_MODES, seedPathProblem, seedText, type SeedFileMeta, type SeedMode, type SeedSeal, type SeedWriteResult } from "../../../src/store/seed-files.ts";
+import type { FreshContextResult, RestartResult } from "../runtime.ts";
 
 export type ProvisionTool = "enable_push" | "disable_push";
 
@@ -93,6 +97,22 @@ export interface ProvisionDeps {
    * (cf/src/agent-surface/). Absent: those routes answer 404.
    */
   surface?: SurfaceDeps;
+  /**
+   * An evaluation's setup, in the agent's own object (cf/src/index.ts, behind EVAL_SEED_ROUTES). Absent: every
+   * route of it answers 404, as on a deployment that never had them.
+   */
+  seed?: SeedOps;
+}
+
+/** What the setup routes ask of the agent's object; each is one RPC (cf/src/index.ts AgentDO). */
+export interface SeedOps {
+  write(tenantId: string, agentId: string, file: { path: string; mode: SeedMode; text: string }):
+    Promise<SeedWriteResult | { ok: false; code: "not_found"; message: string }>;
+  seal(tenantId: string, agentId: string, credentialId: string | null): Promise<SeedSeal | null>;
+  manifest(tenantId: string, agentId: string): Promise<{ manifest: SeedFileMeta[]; manifestSha256: string; seal: SeedSeal | null } | null>;
+  freshContext(tenantId: string, agentId: string): Promise<FreshContextResult>;
+  restart(tenantId: string, agentId: string): Promise<RestartResult>;
+  modelInput(tenantId: string, agentId: string, session: string | null, call: number | null): Promise<unknown | null>;
 }
 
 export const PROVIDER_AGENT_PREFIX = "raft_";
@@ -186,8 +206,11 @@ async function registerPush(deps: ProvisionDeps, row: ProvisionedAgent): Promise
 }
 
 export async function handleProvision(
-  method: string, path: string, headers: { idempotencyKey: string | null; raftServerId: string | null }, body: unknown,
+  method: string, path: string,
+  headers: { idempotencyKey: string | null; raftServerId: string | null; credentialId?: string | null }, body: unknown,
   who: ProviderTokenIdentity, deps: ProvisionDeps, query: URLSearchParams = new URLSearchParams(),
+  /** The body as sent, for the one route whose body is not JSON (`PUT …/seed`). */
+  raw: Uint8Array | null = null,
 ): Promise<Response | null> {
   const seg = path.split("/").filter(Boolean);
   if (seg[0] === "connectors" && seg.length === 2 && method === "DELETE") {
@@ -279,6 +302,14 @@ export async function handleProvision(
   }
   // `…/usage`, `…/workspace-files`, `…/workspace-files/read`: the agent's own surface, read through
   // the core the public API uses; only how the agent is found, and the envelope, are this binding's.
+  if (EVAL_ROUTES.has(rest.slice(1).join("/"))) {
+    if (!deps.seed) return null;
+    const found = byRaft ? await deps.registry.get(tenantId, rest[0]!) : await deps.registry.getByAgentId(tenantId, rest[0]!);
+    if (!found || found.status === "deleted") {
+      return fail({ status: 404, code: "not_found", message: `no provisioned agent ${byRaft ? "made from Raft agent " : ""}${rest[0]}` });
+    }
+    return evalSetup(method, rest.slice(1).join("/"), tenantId, found.agentId, query, raw, headers.credentialId ?? null, deps.seed);
+  }
   const read = method === "GET" && rest.length >= 2 ? surfaceReadOf(rest.slice(1), "provider") : null;
   if (read && deps.surface) {
     const found = byRaft ? await deps.registry.get(tenantId, rest[0]!) : await deps.registry.getByAgentId(tenantId, rest[0]!);
@@ -522,4 +553,85 @@ async function disconnect(tenantId: string, connectorId: string, body: unknown, 
   await c.connectors.remove(tenantId, k.id);
   await c.connectors.record({ tenantId, connectorId: k.id, raftAgentId: null, action: "disconnect", ...acting, at: deps.now() });
   return ok({ disconnected: true, connectorId: k.id, detached });
+}
+
+/** The setup routes, after the agent's id. */
+const EVAL_ROUTES = new Set(["seed", "seed/seal", "seed/manifest", "fresh-context", "restart", "model-input"]);
+
+/**
+ * An evaluation's setup (EVAL_SEED_ROUTES): files put in the agent's workspace before it first runs, the seal that
+ * ends that window, a fresh main conversation or an ordinary restart of the same one, and what the model was sent. The rules of a file are src/store/seed-files.ts's; the one checked only here is the credential
+ * shape, which lives with the Worker (cf/src/secret-shape.ts). Each change leaves one log line naming the token it
+ * came by (its hash, the name the operator's listing gives it), never the token or a file's text.
+ */
+async function evalSetup(
+  method: string, route: string, tenantId: string, agentId: string, query: URLSearchParams, raw: Uint8Array | null,
+  credentialId: string | null, seed: SeedOps,
+): Promise<Response | null> {
+  const audit = (op: string, fields: Record<string, string | number | boolean | null>) =>
+    logEvent("eval.seed", { tenant: tenantId, agent: agentId, op, ...fields, credentialId });
+  const gone = () => fail({ status: 404, code: "not_found", message: `no agent ${agentId} in this object` });
+  if (route === "seed" && method === "PUT") {
+    const path = query.get("path");
+    const problem = seedPathProblem(path);
+    if (problem) return fail({ status: 422, code: "invalid", message: problem, param: "path" });
+    // The working set's documents are shown to the agent as written by it (src/plugins/state.ts `workingSet`); a
+    // seeded file under one of their keys would reach its prompt as its own notes.
+    if (WORKING_SET.some((d) => d.key === path)) {
+      return fail({ status: 400, code: "reserved", param: "path",
+        message: `${path} is one of the agent's own working-set documents (${WORKING_SET.map((d) => d.key).join(", ")}), shown to it as written by it; seed under another path` });
+    }
+    const mode = query.get("mode") ?? "writable";
+    if (!(SEED_MODES as readonly string[]).includes(mode)) return fail({ status: 422, code: "invalid", message: `mode is ${SEED_MODES.join(" or ")}`, param: "mode" });
+    const body = seedText(raw ?? new Uint8Array());
+    if ("problem" in body) return fail({ status: body.status, code: body.status === 413 ? "too_large" : "invalid", message: body.problem });
+    const shape = secretShape(body.text);
+    if (shape) return fail({ status: 422, code: "credential_in_text", message: `the file carries what looks like a ${shape}; credentials are never seeded` });
+    const r = await seed.write(tenantId, agentId, { path: path!, mode: mode as SeedMode, text: body.text });
+    if (!r.ok) {
+      audit("write", { path: path!, outcome: r.code });
+      if (r.code === "not_found") return gone();
+      return fail(r.code === "sealed"
+        ? { status: 409, code: "sealed", message: r.message }
+        : { status: 413, code: "too_large", message: r.message });
+    }
+    audit("write", { path: r.file.path, mode: r.file.mode, sha256: r.file.sha256, bytes: r.file.bytes, changed: r.changed, outcome: "ok" });
+    return ok({ ...r.file, changed: r.changed });
+  }
+  const sealView = (s: SeedSeal) => ({
+    manifest: s.manifest, manifestSha256: s.manifestSha256, sealedAt: new Date(s.sealedAt).toISOString(), how: s.how,
+  });
+  if (route === "seed/seal" && method === "POST") {
+    const s = await seed.seal(tenantId, agentId, credentialId);
+    return s ? ok(sealView(s)) : gone();
+  }
+  if (route === "seed/manifest" && method === "GET") {
+    const m = await seed.manifest(tenantId, agentId);
+    if (!m) return gone();
+    // Once sealed, the manifest is the one the seal closed on, which is also what the files still are.
+    return ok(m.seal ? { sealed: true, ...sealView(m.seal) } : { sealed: false, manifest: m.manifest, manifestSha256: m.manifestSha256, sealedAt: null, how: null });
+  }
+  if (route === "fresh-context" && method === "POST") {
+    const r = await seed.freshContext(tenantId, agentId);
+    if (!r.ok) return fail({ status: r.status, code: r.status === 404 ? "not_found" : "busy", message: r.error });
+    audit("fresh-context", { oldSessionId: r.oldSessionId, newSessionId: r.newSessionId });
+    return ok({ oldSessionId: r.oldSessionId, newSessionId: r.newSessionId });
+  }
+  // Not a fresh context: the same conversation, rebuilt from storage as after an eviction.
+  if (route === "restart" && method === "POST") {
+    const r = await seed.restart(tenantId, agentId);
+    if (!r.ok) return fail({ status: r.status, code: r.status === 404 ? "not_found" : "busy", message: r.error });
+    audit("restart", { sessionId: r.sessionId });
+    return ok({ sessionId: r.sessionId, restartedAt: new Date(r.restartedAt).toISOString() });
+  }
+  if (route === "model-input" && method === "GET") {
+    const session = query.get("session");
+    const callText = query.get("call");
+    const call = callText === null ? null : Number(callText);
+    if (call !== null && !(Number.isInteger(call) && call >= 1)) return fail({ status: 422, code: "invalid", message: "call is a whole number from 1", param: "call" });
+    const r = await seed.modelInput(tenantId, agentId, session, call);
+    if (!r) return fail({ status: 404, code: "not_found", message: session === null ? `no agent ${agentId}` : `no recorded call ${call ?? 1} of session ${session}` });
+    return ok(r);
+  }
+  return null;
 }

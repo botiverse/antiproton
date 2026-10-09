@@ -24,6 +24,7 @@ import { maskRawRefs } from "../../src/store/refs.ts";
 import { piTables, MAIN_SESSION, type SqlHost } from "../../src/store/pi-storage.ts";
 import { readPdEntries } from "../../src/runtime/pd-transcript.ts";
 import { isPd, readFailedRuns } from "./engine-read.ts";
+import { physicalSession } from "./fresh-context.ts";
 
 export { isPd };
 
@@ -80,14 +81,19 @@ export function hasTable(sql: Sql, name: string): boolean {
 /**
  * The session `taskId` names for this object's agent, or null when the object
  * holds no such agent or the agent no such conversation. `t_<agentId>` is the
- * agent's main session, as the console's own lookup has it; any other id must be
- * a task of this agent.
+ * agent's main session, as the console's own lookup has it; the id of a main
+ * conversation (cf/src/fresh-context.ts) names that one, current or ended; any
+ * other id must be a task of this agent.
  */
 export function sessionFor(sql: Sql, tenantId: string, agentId: string, taskId: string): string | null {
   if (!hasTable(sql, "owner")) return null;
   const owner = sql.exec("SELECT tenant_id, agent_id FROM owner WHERE k='self'").toArray()[0] as any;
   if (!owner || owner.tenant_id !== tenantId || owner.agent_id !== agentId) return null;
   if (taskId === `t_${agentId}`) return MAIN_SESSION;
+  // A main conversation by its id (cf/src/fresh-context.ts): one that ended is read from its archived tables. The bare
+  // first id while it is still the current one is left to the rule below, as it was before conversations had ids.
+  const main = physicalSession(sql, taskId);
+  if (main !== null && !(main === MAIN_SESSION && taskId === MAIN_SESSION)) return main;
   const task = hasTable(sql, "tasks")
     ? sql.exec("SELECT agent_id FROM tasks WHERE tenant_id=? AND task_id=?", tenantId, taskId).toArray()[0] as any
     : undefined;
