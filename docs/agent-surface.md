@@ -8,7 +8,9 @@ surfaces that answer the same bodies from the same code (`cf/src/agent-surface/`
 - **The Raft provider binding** (`/provision/agents/:agentId/...`), authenticated with a provider token.
   This is the same contract addressed the way a Raft server addresses its agents.
 
-Nothing here writes, starts a container, or shows a secret.
+Nothing here writes, starts a container, or shows a secret — except the
+[evaluation setup](#evaluation-setup-preview-only) routes at the end, which exist only on the preview
+deployment.
 
 ## The public API
 
@@ -169,7 +171,110 @@ The same three reads for an agent a Raft server provisioned, with the provider t
 - **Which agents.** Only a provisioned agent of the token's tenant that has not been deleted. Another
   tenant's agent, a deleted agent, and an id that never existed are all `404`, `code: "not_found"`.
 - **Bodies.** Identical to the public API's, except that the usage answer names the agent as
-  `raftAgentId` and `providerAgentId` instead of `agentId`.
+  `raftAgentId` and `providerAgentId` instead of `agentId`, and the read carries `sha256`: the hex
+  SHA-256 of the bytes `content` stands for (its text as UTF-8, or the base64 decoded), `null` when
+  `content` is. A seeded file's working copy read this way hashes to its manifest entry until the agent
+  changes it.
 - **Errors.** The provider envelope: `{ "error": { "code", "message", "param"? } }`. A bad parameter is
   `400`, `code: "invalid"`, `param` naming it; a missing agent, file or directory is `404`,
   `code: "not_found"`; a failure underneath is `502`, `code: "unavailable"`.
+
+## Evaluation setup (preview only)
+
+Routes for an evaluator to give an agent its workspace before the agent first runs, start it on a
+fresh conversation, and read back what its model was sent. They are served only where the deployment
+sets `EVAL_SEED_ROUTES` to `"1"` — `cf/wrangler.preview.jsonc`, never `cf/wrangler.jsonc`
+(`test/eval-seed.ts` fails if production sets it). Anywhere else every one of them is `404`, as an
+unknown route is. Authentication, tenant and which agents are as for the reads above: the provider
+token, `?raftServerId=` for a platform token, `{agentId}` or `by-raft-agent/{raftAgentId}`, and `404`
+for an agent that is not a live provisioned agent of the tenant.
+
+| Method | Path | Does |
+|---|---|---|
+| `PUT` | `/provision/agents/{agentId}/seed?path=&mode=` | seed one file; the body is the file |
+| `POST` | `/provision/agents/{agentId}/seed/seal` | close the window now |
+| `GET` | `/provision/agents/{agentId}/seed/manifest` | what is seeded, and whether it is sealed |
+| `POST` | `/provision/agents/{agentId}/fresh-context` | start a new main conversation |
+| `POST` | `/provision/agents/{agentId}/restart` | restart the agent, keeping its conversation |
+| `GET` | `/provision/agents/{agentId}/model-input?session=&call=` | what one model call was sent |
+
+### Seeded files
+
+A seeded file has two copies, written together in one transaction: a **snapshot** nothing the agent
+can call reads or changes, and a **working copy**, the agent's ordinary state key `path` (its
+`get` reads it; `state/{path}` in the workspace reads above). `mode` is `writable` (default) or
+`readonly`; the state plugin refuses to change a `readonly` path. Rules for `PUT …/seed`:
+
+- `path` follows the state plugin's key rule (`^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$`), with no empty,
+  `.` or `..` segment and never under `kept:`; else `422`, `param: "path"`.
+- The body is the file as sent, not JSON: UTF-8 text with no NUL byte (`422` otherwise), at most
+  262,144 bytes (`413`), and nothing shaped like a credential (`422`, `code: "credential_in_text"`, the
+  kind named and none of the text). All of an agent's files together are at most 2,097,152 bytes
+  (`413`). A file larger than 32 KiB as a state value is kept in object storage, both copies, as the
+  state plugin keeps a large value; it reads back the same.
+- The answer is `{ path, mode, bytes, sha256, changed }`: `bytes` the body's length and `sha256` the
+  hex SHA-256 of the body, both as sent. The same bytes and mode again change nothing (`200`,
+  `changed: false`); different bytes or mode before the seal replace both copies.
+- `409`, `code: "sealed"`, once the window is closed.
+
+**The seal.** The window closes at the first of: `POST …/seed/seal`; the agent's first accepted
+inbound push (in the same step that queues it, before its turn starts); the agent's first turn by any
+other route. A write that arrives after that is refused, even while the turn is still queued or
+running. `POST …/seed/seal` is idempotent and answers the seal it finds:
+
+```json
+{ "manifest": [{ "path": "MEMORY.md", "mode": "writable", "bytes": 120, "sha256": "…" }],
+  "manifestSha256": "…", "sealedAt": "2026-10-09T09:00:00.000Z", "how": "explicit" }
+```
+
+`manifest` is sorted by `path`; `manifestSha256` is the SHA-256 of its canonical JSON (keys sorted, no
+spaces: `src/core/canon-json.ts`), so it is the same however it was read. `how` is `explicit`,
+`first-inbound` or `first-turn`. `GET …/seed/manifest` answers the same body plus `sealed: true`, or,
+before the seal, `sealed: false` with the files as they stand and `sealedAt` and `how` null.
+
+### Fresh context
+
+`POST …/fresh-context` answers `{ oldSessionId, newSessionId }`. The agent's main conversation — the
+one inbound pushes and the console post to — starts empty: the next model call is sent none of the
+old conversation's messages and no summary of them. The old transcript is kept, readable under
+`oldSessionId`. The agent's state, its working copies and its seeded files are not touched. The first
+main conversation's id is `main`; each fresh one is `main.<n>`. Refused with `409`, `code: "busy"`,
+while anything is in flight (a run, a queued input, an unanswered model call, background work), and
+for an agent on the `pd` engine.
+
+### Restart
+
+`POST …/restart` answers `{ sessionId, restartedAt }`. It is the ordinary restart, **not** a fresh
+context: the agent's object drops everything it holds in memory — the harness built for each
+conversation, cached tool lists, programs held for `resume` — as an eviction would, and the next turn
+rebuilds from storage on the **same** main conversation (`sessionId`), so its model is sent the whole
+earlier conversation again. Refused with `409`, `code: "busy"`, while a turn is in flight.
+
+### Model input
+
+`GET …/model-input?session={id}&call={n}` (`call` from 1, default 1) answers what call `n` of that
+conversation was sent, recorded when the call was handed to the model queue. Hashes, ids and roles
+only, never text:
+
+```json
+{ "sessionId": "main.1", "call": 1, "jobId": "mj_…", "at": 1791536400000,
+  "systemPromptSha256": "…",
+  "messages": [{ "role": "user", "sha256": "…", "length": 42, "sourceSessionId": "main.1", "messageId": "…" }],
+  "summaryBlock": false, "workingSetKeys": ["memory"], "seedPathsInSystemPrompt": ["MEMORY.md"] }
+```
+
+Each message's `sha256` is of its canonical JSON as sent; `sourceSessionId` and `messageId` name the
+main conversation whose transcript holds exactly that message, current or ended, and are `null` for
+one no transcript holds. `summaryBlock` says whether a compaction or branch summary is in the input.
+`workingSetKeys` are the working-set documents (`todo`, `memory`, `journal`) the system prompt carries;
+`seedPathsInSystemPrompt` are the seeded paths it names. Without `session`, the answer lists the main
+conversations: `{ current, sessions: [{ sessionId, generation, current, startedAt, endedAt, calls }] }`.
+Only calls of the `pi085` engine are recorded; `404` when there is no such record.
+
+### Audit
+
+Every seed write, explicit seal, fresh context and restart logs one line, `evt: "eval.seed"`, with
+`tenant`, `agent`, `op` (`write`, `seal`, `fresh-context`, `restart`), the `path` and `sha256` where
+there is one, and `credentialId`: the provider token's
+hash, the name the operator's token listing gives it. Never the token and never a file's text. A seal
+made by the first push or turn logs the same line, `credentialId: null`, when files were seeded.
