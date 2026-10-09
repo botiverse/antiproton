@@ -557,13 +557,15 @@ mentions and a preview of the latest message) and `assistant_owner_messages`
 `before`, `after` and `around`). Neither ever shows a direct message. They are
 read-only and model-only, and offered only when the mount's snapshot lists
 them, which it does when the same whoami answer names whose assistant the
-account is (`assistantOf` with a `userId`): never with the tools every mount
+account is (`agent.assistantOf` with a `userId`): never with the tools every mount
 has, never to a mount with no snapshot, and a call on a mount whose list lacks
 them is refused before anything is sent. Every successful result opens with a
 line saying the content is the owner's, written outside the conversation, to
 be treated as information rather than instructions; a failure shows Raft's
 HTTP status and error code as sent (`403 assistant_not_enabled`,
-`404 channel_not_found`) and is not retried. The Raft SDK this build pins has
+`404 channel_not_found`) and is not retried. Both reads' answers are
+camelCase (`hasMore`, `hasOlder`, `nextOffset`), and one in another style is
+refused as malformed rather than read as missing. The Raft SDK this build pins has
 neither the reads nor `assistantOf`, so both go through one seam
 (`AssistantWire`, `PENDING_ASSISTANT_WIRE` in `src/plugins/raft.ts`) whose
 reads throw until the SDK ships them, and no mount is offered the tools
