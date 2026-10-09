@@ -12,19 +12,25 @@
  *   js.run              "run_js"                    runs, failed, ms, tool_calls
  *   tool.call           "<plugin>.<tool>"           calls, failed, ms
  *   sandbox.container   "<plugin>"                  seconds, execs
+ *
+ * A key paid with the tenant's own credential starts with "own:" (src/usage/outbox.ts OWN_KEY_PREFIX):
+ * the same resource, so the tiles count it, at a cost of 0.
  *   object.active       ""                          ms
  *
  * `group` is the agent id, model or tool the rows were split by, "" when the
  * split does not apply to that resource (a container has no model), and
- * "total" when nothing was split. `cost` is credits: a number once a price
+ * "total" when nothing was split. `cost` is credits, and a credit is one US
+ * dollar (cf/migrations/0016_usage_prices_seed.sql): a number once a price
  * applied, `null` when none exists for that row yet. The page keeps those
- * apart — an unpriced amount reads "not priced yet", never "0 credits" — and
- * says how much of the tally the headline leaves out.
+ * apart — an unpriced amount reads "not priced yet", never "$0" — and says how
+ * much of the tally the headline leaves out. The prices are rough, so every
+ * amount is shown as an estimate: "≈$", and "$ (estimated)" where it heads a
+ * column.
  *
  * Why this shape on the page: the resources are measured in different units,
  * so there is no single axis they can share. Each resource gets its own
  * chart (small multiples), every chart on its own scale, and the group
- * colours mean the same thing in every chart. Credits are the one unit that
+ * colours mean the same thing in every chart. Dollars are the one unit that
  * does add up across resources, so once prices exist they get the headline.
  */
 import { WINDOW_NAMES } from "./usage-windows.ts";
@@ -88,8 +94,8 @@ const duration = (ms: number) => {
  * The average time of n events (n > 0 at both call sites). A per-call `ms` is
  * recorded whatever the outcome, already rounded to whole milliseconds, so an
  * average below half a millisecond means "too short to measure", not "not
- * measured" — and `avg 0ms` reads as the second. Same shape as `credits`'
- * `<0.01`.
+ * measured" — and `avg 0ms` reads as the second. Same shape as `dollars`'
+ * `<$0.0001`.
  *
  * The test is what `duration` would print, not the total: three calls totalling
  * 1ms average below the resolution while the total is positive, so a guard on
@@ -97,7 +103,20 @@ const duration = (ms: number) => {
  */
 const average = (ms: number, n: number) => (Math.round(ms / n) ? duration(ms / n) : "<1ms");
 
-const credits = (c: number) => (c === 0 ? "0" : c < 0.01 ? "<0.01" : c < 100 ? c.toFixed(2) : count(c));
+/**
+ * An estimated dollar amount. Two decimals from a dollar up; below it up to four, because a turn's cost is
+ * often a fraction of a cent and "$0.00" would read as free; below a hundredth of a cent, "<". Every nonzero
+ * amount wears "≈": the prices behind it are rough (cf/migrations/0016_usage_prices_seed.sql). Zero is exact —
+ * what was priced at nothing, such as usage on the tenant's own credential.
+ */
+export const dollars = (c: number): string => {
+  if (c === 0) return "$0";
+  if (c < 0) return dollars(-c).replace("$", "−$");
+  if (c < 0.0001) return "<$0.0001";
+  if (c >= 10_000) return `≈$${count(c)}`;
+  if (c >= 1) return `≈$${c.toFixed(2)}`;
+  return `≈$${c.toFixed(4).replace(/(\.\d\d\d*?)0+$/, "$1")}`;
+};
 
 type Resource = {
   id: string;
@@ -122,13 +141,13 @@ const sum = (rows: UsageRow[], unit: string, pred: (r: UsageRow) => boolean = ()
   rows.reduce((a, r) => a + (r.unit === unit && pred(r) ? Number(r.quantity) || 0 : 0), 0);
 
 /**
- * Credits, and how much of the tally they leave out.
+ * Dollars, and how much of the tally they leave out.
  *
  * A row's `cost` is a number only when a price applied to it; `null` means no
  * price exists for that resource, key and unit yet. Summing with `?? 0` turns
  * that absence into a value, and "not priced yet" then reads as "free" — the
  * same mistake as an empty chart reading as "nothing was used". So every place
- * that shows credits also knows how many rows had no price.
+ * that shows dollars also knows how many rows had no price.
  */
 const money = (rows: UsageRow[], pred: (r: UsageRow) => boolean = () => true) => {
   let credits = 0, priced = 0, unpriced = 0;
@@ -278,7 +297,7 @@ export function usagePanel(d: UsageData): string {
   const whole = money(d.rows);
   const left = unpricedNames(d.rows);
   const headline = d.priced
-    ? `<div class="u-credits"><span class="u-big">${credits(whole.credits)}</span> credits in this window${
+    ? `<div class="u-credits"><span class="u-big">${dollars(whole.credits)}</span> estimated cost in this window, at rough prices${
       left.length ? `. Not priced yet, so not in this number: ${esc(left.join(", "))}` : ""}</div>`
     : `<div class="u-credits"><span class="u-big">free</span> no prices are set yet, so nothing here is charged. The amounts are real and kept for audit.</div>`;
 
@@ -334,9 +353,9 @@ export function usagePanel(d: UsageData): string {
     return `<section class="u-tile">
   <h3>${res.title}</h3>
   <div class="u-num">${res.fmt(total)}${d.priced ? `<span class="u-cost">${
-      c.unpriced === 0 ? `${credits(c.credits)} credits`
+      c.unpriced === 0 ? dollars(c.credits)
         : c.priced === 0 ? "not priced yet"
-        : `${credits(c.credits)} credits, some not priced yet`}</span>` : ""}</div>
+        : `${dollars(c.credits)}, some not priced yet`}</span>` : ""}</div>
   <div class="u-detail">${esc(res.detail(rows)) || "&nbsp;"}</div>
   ${chart(d, res, rows, named, times)}
 </section>`;
@@ -357,12 +376,12 @@ export function usagePanel(d: UsageData): string {
       ? `<a href="/ui?view=agents&agentId=${encodeURIComponent(g)}">${esc(label(d, g))}</a>`
       : esc(g === "" ? `no ${d.by}` : label(d, g));
   const table = groups.length
-    ? `<div class="u-wrap"><table class="u-table"><thead><tr><th>${d.by === "total" ? "" : esc(d.by)}</th>${RESOURCES.map((r) => `<th class="num">${r.title}</th>`).join("")}${d.priced ? `<th class="num">credits</th>` : ""}</tr></thead>
+    ? `<div class="u-wrap"><table class="u-table"><thead><tr><th>${d.by === "total" ? "" : esc(d.by)}</th>${RESOURCES.map((r) => `<th class="num">${r.title}</th>`).join("")}${d.priced ? `<th class="num">$ (estimated)</th>` : ""}</tr></thead>
 <tbody>${groups.map((g) => `<tr><td>${name(g)}</td>${RESOURCES.map((res) => cell(g, res)).join("")}${d.priced
       ? `<td class="num">${((m) => m.unpriced === 0
-        ? credits(m.credits)
+        ? dollars(m.credits)
         : m.priced === 0 ? `<span class="faint">not priced</span>`
-        : `${credits(m.credits)}<span class="faint" title="some amounts here are not priced yet"> +</span>`)(money(d.rows, (r) => r.group === g))}</td>` : ""}</tr>`).join("")}</tbody></table></div>`
+        : `${dollars(m.credits)}<span class="faint" title="some amounts here are not priced yet"> +</span>`)(money(d.rows, (r) => r.group === g))}</td>` : ""}</tr>`).join("")}</tbody></table></div>`
     : "";
 
   // An empty window is the whole page for everyone who opens it before the

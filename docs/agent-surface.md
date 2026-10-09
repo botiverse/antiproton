@@ -47,8 +47,8 @@ names the window it covers:
   "asOf": "2026-10-02T12:00:00.000Z",
   "partial": false,
   "rows": [
-    { "at": "2026-10-01T00:00:00.000Z", "resource": "model.tokens", "dimensions": { "model": "deepseek-chat", "kind": "output" }, "unit": "tokens", "quantity": 30 },
-    { "at": "2026-10-01T00:00:00.000Z", "resource": "tool.call", "dimensions": { "tool": "gh.issue_list", "outcome": "failed" }, "unit": "calls", "quantity": 2 }
+    { "at": "2026-10-01T00:00:00.000Z", "resource": "model.tokens", "dimensions": { "model": "deepseek-flash", "kind": "output" }, "unit": "tokens", "quantity": 30, "cost": 0.000036 },
+    { "at": "2026-10-01T00:00:00.000Z", "resource": "tool.call", "dimensions": { "tool": "gh.issue_list", "outcome": "failed" }, "unit": "calls", "quantity": 2, "cost": null }
   ]
 }
 ```
@@ -57,12 +57,17 @@ names the window it covers:
   quantity would be zero is left out; no quantity is negative.
 - `asOf` is how far the ledger speaks for this agent: the time of the read, or, when the agent holds
   usage it has not yet sent to the ledger, the time of the oldest such usage.
+- `cost` is the row's estimated cost in US dollars (one credit is one dollar), from rough prices
+  (docs/metering.md, "Prices"); `null` when nothing prices that row — which is not the same as free. Usage
+  paid with the agent's own credential (a tool `own:<plugin>.<tool>`, a container `own:sandbox`) is `0`.
+  The costs of a bucket's rows can be summed even where the quantities cannot (`input`, below).
 - `partial` is `true` when the window ends after `asOf` (a bucket in it is not finished, or holds usage
   not yet counted), when the agent's unsent usage could not be read, or when the ledger marks part of
   the window as unreadable. A `partial` answer is a lower bound.
 
 **One rule: rows of the same resource share a unit and can be summed directly — no kind contains
-another.** The ledger's own `tool.call` time rows (unit `ms`) are therefore emitted as their own
+another, except `input`.** `input` is the whole prompt as the provider counts it, so `cache_read` is the
+part of it served from cache; its `cost` is for the uncached part only. The ledger's own `tool.call` time rows (unit `ms`) are therefore emitted as their own
 resource, `tool.duration`. The one exception is a resource passed through as the ledger holds it (last
 row below), which keeps the ledger's units: sum those per `unit`.
 

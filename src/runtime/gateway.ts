@@ -13,7 +13,7 @@ import { callSideEffects, pluginEnabled, LEASE_KEY, toolsOf } from "../plugins/t
 import { admitTools } from "./mount-tools.ts";
 import { isReleased, leaseRow, releasedFacts } from "../trace/seams.ts";
 import { openPluginDatabase } from "./plugin-db.ts";
-import { toolCallRows } from "../usage/outbox.ts";
+import { payerKey, toolCallRows } from "../usage/outbox.ts";
 
 /** Resolves secret_ref -> credential. Values never enter the JS sandbox, a
  *  checkpoint, the trajectory, or a model prompt. */
@@ -903,10 +903,13 @@ export class ToolGateway {
     // when it fails would leave the failures — the ones worth looking at — as the unlinkable ones.
     // Counting is never the call's problem: a failure here must not turn a
     // call that succeeded into one reported as failed.
+    // A mount holding the agent's own credential spends the tenant's account, not ours: its key says so
+    // (`payerKey`), and no price applies to it.
+    const key = payerKey(`${r.mount.plugin}.${r.tool}`, secretRefKind(r.mount.secretRef) === "agent");
     const counted = async (outcome: "ok" | "failed") => {
       try {
         await this.#store.recordUsage?.(toolCallRows(
-          { at: started, tenantId: ctx.tenantId, agentId: ctx.agentId }, `${r.mount.plugin}.${r.tool}`, outcome, Date.now() - started,
+          { at: started, tenantId: ctx.tenantId, agentId: ctx.agentId }, key, outcome, Date.now() - started,
         ));
       } catch { /* the count is lost, the call is not */ }
     };

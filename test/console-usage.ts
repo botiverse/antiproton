@@ -10,7 +10,7 @@
  * reaches the markup unescaped.
  */
 import { page } from "../cf/src/ui.ts";
-import { usagePanel, buckets, namedGroups, RESOURCES, type UsageData, type UsageRow } from "../cf/src/usage.ts";
+import { usagePanel, buckets, namedGroups, dollars, RESOURCES, type UsageData, type UsageRow } from "../cf/src/usage.ts";
 import { WINDOW_NAMES } from "../cf/src/usage-windows.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
@@ -114,16 +114,17 @@ check("a resource the split does not apply to is drawn whole, in a neutral colou
   must(/no model/.test(html), "the table names the unsplit row");
 });
 
-check("without prices the page says free; with prices it adds credits up", () => {
+check("without prices the page says free; with prices it adds the estimated dollars up", () => {
   const rows = [row("a1", "model.tokens", "m:input", "tokens", 1000, 1, 1.5), row("a1", "tool.call", "gh.x", "calls", 2, 1, 0.25)];
   const free = usagePanel(data(rows));
-  must(/<span class="u-big">free<\/span>/.test(free) && !/credits in this window/.test(free), "free when nothing is priced");
+  must(/<span class="u-big">free<\/span>/.test(free) && !/estimated cost in this window/.test(free), "free when nothing is priced");
   const paid = usagePanel(data(rows, { priced: true }));
-  must(/<span class="u-big">1\.75<\/span> credits in this window/.test(paid), "credits add across resources");
-  must(/<th class="num">credits<\/th>/.test(paid), "the table gains a credits column");
+  must(/<span class="u-big">≈\$1\.75<\/span> estimated cost in this window, at rough prices/.test(paid), "dollars add across resources, as an estimate");
+  must(/<th class="num">\$ \(estimated\)<\/th>/.test(paid), "the table gains an estimated-dollars column");
+  must(!/credits/.test(paid.replace(/u-credits/g, "")), "no amount is labelled credits any more");
 });
 
-check("an amount with no price reads 'not priced yet', never 0 credits", () => {
+check("an amount with no price reads 'not priced yet', never $0", () => {
   // What the page looks like the day the first price is set: model tokens are
   // priced, tool calls are not. A `cost` of null is the ledger saying no price
   // exists for that row — summing it as 0 would make it read as free.
@@ -132,12 +133,12 @@ check("an amount with no price reads 'not priced yet', never 0 credits", () => {
     row("a1", "model.tokens", "m:input", "tokens", 1000, 1, 1.5),
     unpriced(row("a1", "tool.call", "gh.x", "calls", 2)),
   ], { priced: true }));
-  must(/<span class="u-big">1\.50<\/span> credits in this window/.test(html), "the headline counts only what has a price");
+  must(/<span class="u-big">≈\$1\.50<\/span> estimated cost in this window/.test(html), "the headline counts only what has a price");
   must(/Not priced yet, so not in this number: tool calls<\/div>/.test(html), "and names what it leaves out, by resource, not by row count");
   const calls = tile(html, "tool calls");
-  must(/<span class="u-cost">not priced yet<\/span>/.test(calls), "the unpriced tile says so instead of 0 credits");
-  must(!/<span class="u-cost">0 credits/.test(calls), "the unpriced tile never claims a zero cost it cannot know");
-  must(/1\.50<span class="faint" title="some amounts here are not priced yet"> \+<\/span>/.test(html), "the table marks a group whose sum leaves something out");
+  must(/<span class="u-cost">not priced yet<\/span>/.test(calls), "the unpriced tile says so instead of $0");
+  must(!/<span class="u-cost">\$0/.test(calls), "the unpriced tile never claims a zero cost it cannot know");
+  must(/≈\$1\.50<span class="faint" title="some amounts here are not priced yet"> \+<\/span>/.test(html), "the table marks a group whose sum leaves something out");
 });
 
 check("a resource priced in part says so, and the sum stays the priced part", () => {
@@ -145,8 +146,22 @@ check("a resource priced in part says so, and the sum stays the priced part", ()
     row("a1", "model.tokens", "m:input", "tokens", 1000, 1, 2),
     { ...row("a1", "model.tokens", "n:input", "tokens", 500), cost: null },
   ], { priced: true }));
-  must(/<span class="u-cost">2\.00 credits, some not priced yet<\/span>/.test(html), "the tile names the part it could not price");
-  must(/<span class="u-big">2\.00<\/span> credits in this window\. Not priced yet, so not in this number: some model tokens/.test(html), "the headline agrees with the tile, and says only part of that resource is priced");
+  must(/<span class="u-cost">≈\$2\.00, some not priced yet<\/span>/.test(html), "the tile names the part it could not price");
+  must(/<span class="u-big">≈\$2\.00<\/span> estimated cost in this window, at rough prices\. Not priced yet, so not in this number: some model tokens/.test(html), "the headline agrees with the tile, and says only part of that resource is priced");
+});
+
+check("an amount is an estimate in dollars, a fraction of a cent keeps its digits, and a priced zero is exactly $0", () => {
+  // A turn costs a fraction of a cent; two decimals would print it as free.
+  const want: Array<[number, string]> = [[0, "$0"], [0.5, "≈$0.50"], [0.0123, "≈$0.0123"], [0.012, "≈$0.012"], [0.00004, "<$0.0001"], [1.75, "≈$1.75"], [12_345, "≈$12.3k"]];
+  for (const [n, s] of want) must(dollars(n) === s, `${n} reads ${dollars(n)}, not ${s}`);
+  // Container time on the tenant's own run9 account: priced, at nothing — not "not priced yet".
+  const html = usagePanel(data([
+    row("a1", "sandbox.container", "own:sandbox", "seconds", 600, 1, 0),
+    row("a1", "model.tokens", "m:input", "tokens", 1000, 1, 0.0034),
+  ], { priced: true }));
+  must(/<span class="u-cost">\$0<\/span>/.test(tile(html, "container time")), "own-credential container time reads $0");
+  must(/<span class="u-cost">≈\$0\.0034<\/span>/.test(tile(html, "model tokens")), "a third of a cent keeps its digits");
+  must(!/not priced/.test(html), "a zero price is a price");
 });
 
 check("many unpriced rows of one resource are named once, not counted", () => {

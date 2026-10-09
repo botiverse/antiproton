@@ -657,14 +657,11 @@ them:
   eventually exhaust one object's 10 GB.
 - **Usage retention.** Each agent's object prunes its own usage outbox on every
   send, bounded by the cursor, so the object side cannot grow. The table those
-  rows land in, `usage_hourly` in the control-plane database, is never trimmed:
-  nothing deletes it, nothing folds it, and no schedule touches it. It grows
-  with tenants × agents × hours × (resource, key, unit) — an agent using one
-  model and a few tools writes on the order of fifteen rows for each hour it is
-  active, so a busy agent adds tens of thousands of rows a year. Folding whole
-  hours into days past a cutoff is the intended fix and is not written yet. The
-  care taken over the outbox's pruning has no counterpart on the side that can
-  actually grow (Rex, reviewing #391).
+  rows land in, `usage_hourly` in the control-plane database, keeps 35 days of
+  hours: a daily Cron Trigger folds older whole days into `usage_daily` and
+  deletes the hours it folded (docs/metering.md, "Retention"). `usage_daily`
+  itself is never trimmed, and grows with tenants × agents × days × (resource,
+  key, unit).
 - **A container's last seconds can go uncounted.** All five resources the usage
   view names are recorded now. Container time is asked of the mounts themselves
   once per pass, so a box alive across ten turns is counted in the hours it was

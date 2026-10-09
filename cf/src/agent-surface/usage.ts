@@ -11,6 +11,14 @@
  * `cache_write_5m` (the total less the 1h part), `cache_write_1h`, and a tool's `succeeded` and
  * `failed` calls.
  *
+ * Each row carries `cost` once the deployment prices anything (`UsageDeps.pricer`): estimated US dollars,
+ * null for a row nobody priced. The ledger prices a subset key at its DIFFERENCE from the key that contains it
+ * (cf/migrations/0005_usage.sql), so a row here is priced at its kind's whole rate — reasoning at output's rate
+ * plus reasoning's difference, and so on — and the costs of a bucket's rows add up to what the ledger's
+ * delta-priced rows add up to. `input` is the one quantity that still holds another (the whole prompt,
+ * `cache_read` included); its cost is that of the uncached part, so the costs, unlike those two quantities,
+ * can be summed.
+ *
  * No caller's concepts here: the public API (cf/src/agents-api/handlers.ts) and the provider binding
  * (cf/src/provision/handlers.ts) both call `agentUsage` and add only how they named the agent.
  */
@@ -43,12 +51,24 @@ export interface UsageDeps {
   backlogSince(tenantId: string, agentId: string): Promise<number | null>;
   /** Where a clamp is reported. */
   warn?(message: string): void;
+  /**
+   * The price of one ledger row, in dollars per unit, or null when nothing prices it (cf/src/usage-d1.ts
+   * priceFor over the deployment's prices). Absent: rows carry no `cost` at all.
+   */
+  pricer?(): Promise<Pricer>;
 }
+
+/** Dollars per unit for a ledger row at its bucket's start; null: unpriced. */
+export type Pricer = (row: { bucket: number; resource: string; key: string; unit: string }) => number | null;
 
 export interface UsageQuery { from: number; to: number; bucket: UsageBucket }
 export type UsageRefusal = { param: string; message: string };
 
-export interface UsageRow { at: string; resource: string; dimensions: Record<string, string>; unit: string; quantity: number }
+export interface UsageRow {
+  at: string; resource: string; dimensions: Record<string, string>; unit: string; quantity: number;
+  /** Estimated US dollars; null when unpriced. Present only where the deployment has prices (`UsageDeps.pricer`). */
+  cost?: number | null;
+}
 export interface AgentUsage { bucket: UsageBucket; from: string; to: string; asOf: string; partial: boolean; rows: UsageRow[] }
 
 const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d{1,3})?)?(Z|[+-]\d{2}:\d{2})$/;
@@ -96,8 +116,22 @@ const MODEL_KINDS = new Set(["input", "output", "reasoning", "cache_read", "cach
  * The ledger's rows as non-overlapping ones. Pure: the window, the bucket and the clamp report are
  * the only inputs besides the rows.
  */
-export function nonOverlapping(rows: readonly LedgerRow[], warn: (m: string) => void = () => {}): Array<Omit<UsageRow, "at"> & { bucket: number }> {
+export function nonOverlapping(rows: readonly LedgerRow[], warn: (m: string) => void = () => {}, price?: Pricer): Array<Omit<UsageRow, "at"> & { bucket: number }> {
   const out: Array<Omit<UsageRow, "at"> & { bucket: number }> = [];
+  /**
+   * A row's whole rate: the price of its own ledger key and unit plus those of every key or unit containing it
+   * (`parts`, as [key, unit]); null if any of them is unpriced.
+   */
+  const rate = (bucket: number, resource: string, parts: Array<[string, string]>): number | null => {
+    let r = 0;
+    for (const [key, unit] of parts) {
+      const p = price!({ bucket, resource, key, unit });
+      if (p === null) return null;
+      r += p;
+    }
+    return r;
+  };
+  const times = (q: number, r: number | null) => (r === null ? null : q * r);
   const models = new Map<string, { bucket: number; model: string; q: Record<string, number> }>();
   const tools = new Map<string, { bucket: number; tool: string; calls: number; failed: number }>();
   for (const r of rows) {
@@ -116,18 +150,19 @@ export function nonOverlapping(rows: readonly LedgerRow[], warn: (m: string) => 
       tools.set(id, t);
       continue;
     }
+    const asIs = price ? { cost: times(r.quantity, rate(r.bucket, r.resource, [[r.key, r.unit]])) } : {};
     if (r.resource === "tool.call" && r.unit === "ms") {
       // A tool's time is its own resource, so every tool.call row counts calls and every
       // tool.duration row counts milliseconds: rows of one resource always share a unit.
-      out.push({ bucket: r.bucket, resource: "tool.duration", dimensions: { tool: r.key }, unit: "ms", quantity: r.quantity });
+      out.push({ bucket: r.bucket, resource: "tool.duration", dimensions: { tool: r.key }, unit: "ms", quantity: r.quantity, ...asIs });
       continue;
     }
     if (split && r.resource === "model.tokens") {
       // A kind this reader does not know overlaps nothing it knows of; passed on under its own name.
-      out.push({ bucket: r.bucket, resource: r.resource, dimensions: { model: split.model, kind: split.kind }, unit: r.unit, quantity: r.quantity });
+      out.push({ bucket: r.bucket, resource: r.resource, dimensions: { model: split.model, kind: split.kind }, unit: r.unit, quantity: r.quantity, ...asIs });
       continue;
     }
-    out.push({ bucket: r.bucket, resource: r.resource, dimensions: { key: r.key }, unit: r.unit, quantity: r.quantity });
+    out.push({ bucket: r.bucket, resource: r.resource, dimensions: { key: r.key }, unit: r.unit, quantity: r.quantity, ...asIs });
   }
   /** A difference that went below zero means the ledger disagrees with itself; said, and shown as none. */
   const part = (what: string, n: number) => {
@@ -138,6 +173,10 @@ export function nonOverlapping(rows: readonly LedgerRow[], warn: (m: string) => 
   for (const m of models.values()) {
     const q = (k: string) => m.q[k] ?? 0;
     const at = `${iso(m.bucket)} ${m.model}`;
+    const k = (kind: string) => `${m.model}:${kind}`;
+    const r = (...kinds: string[]) => (price ? rate(m.bucket, "model.tokens", kinds.map((kind): [string, string] => [k(kind), "tokens"])) : null);
+    // `input` is the whole prompt and `cache_read` the cached part of it: input's cost is the uncached part's,
+    // so it is the one cost here that is not quantity × rate (the module's header says why).
     const kinds: Array<[string, number]> = [
       ["input", part(`input for ${at}`, q("input"))],
       ["output", part(`output less reasoning for ${at}`, q("output") - q("reasoning"))],
@@ -146,17 +185,27 @@ export function nonOverlapping(rows: readonly LedgerRow[], warn: (m: string) => 
       ["cache_write_5m", part(`cache_write less cache_write_1h for ${at}`, q("cache_write") - q("cache_write_1h"))],
       ["cache_write_1h", part(`cache_write_1h for ${at}`, q("cache_write_1h"))],
     ];
+    /** The ledger keys whose prices add up to each kind's whole rate. */
+    const rates: Record<string, string[]> = {
+      input: ["input"], output: ["output"], reasoning: ["output", "reasoning"], cache_read: ["input", "cache_read"],
+      cache_write_5m: ["cache_write"], cache_write_1h: ["cache_write", "cache_write_1h"],
+    };
     for (const [kind, n] of kinds) {
       if (n === 0) continue;
-      out.push({ bucket: m.bucket, resource: "model.tokens", dimensions: { model: m.model, kind }, unit: "tokens", quantity: n });
+      const billed = kind === "input" ? Math.max(0, n - q("cache_read")) : n;
+      const cost = price ? { cost: times(billed, r(...rates[kind]!)) } : {};
+      out.push({ bucket: m.bucket, resource: "model.tokens", dimensions: { model: m.model, kind }, unit: "tokens", quantity: n, ...cost });
     }
   }
   for (const t of tools.values()) {
     const at = `${iso(t.bucket)} ${t.tool}`;
     const succeeded = part(`calls less failed for ${at}`, t.calls - t.failed);
     const failed = part(`failed calls for ${at}`, t.failed);
-    if (succeeded) out.push({ bucket: t.bucket, resource: "tool.call", dimensions: { tool: t.tool, outcome: "succeeded" }, unit: "calls", quantity: succeeded });
-    if (failed) out.push({ bucket: t.bucket, resource: "tool.call", dimensions: { tool: t.tool, outcome: "failed" }, unit: "calls", quantity: failed });
+    // A failed call is priced as a call plus the `failed` unit's difference (`failed` ⊂ `calls`).
+    const cost = (n: number, units: string[]) =>
+      (price ? { cost: times(n, rate(t.bucket, "tool.call", units.map((u): [string, string] => [t.tool, u]))) } : {});
+    if (succeeded) out.push({ bucket: t.bucket, resource: "tool.call", dimensions: { tool: t.tool, outcome: "succeeded" }, unit: "calls", quantity: succeeded, ...cost(succeeded, ["calls"]) });
+    if (failed) out.push({ bucket: t.bucket, resource: "tool.call", dimensions: { tool: t.tool, outcome: "failed" }, unit: "calls", quantity: failed, ...cost(failed, ["calls", "failed"]) });
   }
   const order = (r: { bucket: number; resource: string; dimensions: Record<string, string>; unit: string }) =>
     JSON.stringify([r.resource, Object.entries(r.dimensions), r.unit]);
@@ -194,6 +243,7 @@ export async function agentUsage(deps: UsageDeps, tenantId: string, agentId: str
   }
   const ledger = await deps.ledger(tenantId, agentId, from, to, size);
   const damaged = ledger.some((r) => r.unit === "unreadable");
-  const rows = nonOverlapping(ledger, deps.warn).map(({ bucket, ...r }) => ({ at: iso(bucket), ...r }));
+  const price = deps.pricer ? await deps.pricer() : undefined;
+  const rows = nonOverlapping(ledger, deps.warn, price).map(({ bucket, ...r }) => ({ at: iso(bucket), ...r }));
   return { bucket: q.bucket, from: iso(from), to: iso(to), asOf: iso(asOf), partial: to > asOf || damaged || unknown, rows };
 }

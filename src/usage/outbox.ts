@@ -153,6 +153,23 @@ export function modelTokenRows(
 export const UNACCEPTED_TOKENS = "model.tokens.unaccepted";
 
 /**
+ * The start of a key whose usage the tenant paid for directly, with a credential of their own: a sandbox box on
+ * their own run9 account, a tool call through a mount holding their own key (secretRefKind "agent",
+ * src/runtime/secrets.ts). Same resource, same units, so every view that totals a resource still counts it as the
+ * tenant's usage; only the price differs, and `priceFor` (cf/src/usage-d1.ts) makes it 0 whatever the table says,
+ * because the provider already billed the tenant for it.
+ *
+ * A key prefix rather than a resource of its own (as `UNACCEPTED_TOKENS` is): an unaccepted answer is kept OUT of
+ * the tenant's views, and a resource of its own is what lets one predicate do that; own-credential usage is kept
+ * IN them, and a prefix is what needs no reader to learn a second resource name. Model calls never carry it: every
+ * model call is made on the operator's account (cf/src/runtime.ts takeJob, docs/metering.md "Who pays").
+ */
+export const OWN_KEY_PREFIX = "own:";
+
+/** `key`, marked as paid by the tenant's own credential when `own`. */
+export const payerKey = (key: string, own: boolean) => (own ? `${OWN_KEY_PREFIX}${key}` : key);
+
+/**
  * A tool call through a mount: one call, one more failure if it failed, and
  * how long it took. The key is the tool alone; `failed` is a unit, so a
  * reader sums calls and failures for one tool without joining two keys.

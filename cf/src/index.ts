@@ -77,9 +77,10 @@ import { pdVersion } from "../../src/runtime/pd-transcript.ts";
 import { compactionRefusal, refusingCompaction } from "./compact-refusal.ts";
 import { loginPage, refusedPage, keyPage } from "./login.ts";
 import { busySpans, countActiveTime, unionMs, type ActivitySpan } from "../../src/usage/active.ts";
-import { countHeldTime } from "../../src/usage/container.ts";
+import { countHeldTime, heldReports } from "../../src/usage/container.ts";
 import { benchPollBody } from "../../src/bench/poll-body.ts";
-import { flushUsage, parseUsageQuery, readAgentLedger, readUsage, usageBacklogSince } from "./usage-d1.ts";
+import { flushUsage, parseUsageQuery, readAgentLedger, readUsage, priceFor, readUsageCosts, retainUsage, usageBacklogSince, usagePrices } from "./usage-d1.ts";
+import { adminUsageCosts } from "./admin-usage-costs.ts";
 import { drainCursors, hasUnsent, standDownDelay, USAGE_WAKE_DELAY_MS } from "./usage-flush.ts";
 import type { SurfaceDeps } from "./agent-surface/surface.ts";
 import type { HeldListing, HeldRead } from "../../src/plugins/types.ts";
@@ -643,13 +644,8 @@ export class AgentDO extends DurableObject<Env> {
     try {
       const mounts = await rt.store.listMounts(tenantId, agentId);
       const reports = await this.#mountReports(rt, tenantId, agentId, LEGACY_TASK_ID, mounts);
-      const byAlias = new Map(mounts.map((m) => [m.alias, m.plugin]));
-      const named: Record<string, { plugin: string; report: unknown }> = {};
-      for (const [alias, report] of Object.entries(reports)) {
-        const plugin = byAlias.get(alias);
-        if (plugin) named[alias] = { plugin, report };
-      }
-      countHeldTime(this.sql as any, named, { tenantId, agentId });
+      // Named by mount, and marked with whose run9 account each box runs on (`heldReports`).
+      countHeldTime(this.sql as any, heldReports(mounts, reports), { tenantId, agentId });
     } catch (e: any) {
       console.warn(`held-time accounting skipped: ${String(e?.message ?? e).slice(0, 200)}`);
     }
@@ -3273,6 +3269,10 @@ function surfaceDeps(env: Env): SurfaceDeps {
     usage: {
       now: () => Date.now(),
       ledger: (tenantId, agentId, from, to, size) => readAgentLedger(env.CONTROL_DB, tenantId, agentId, from, to, size),
+      pricer: async () => {
+        const prices = await usagePrices(env.CONTROL_DB);
+        return (row) => priceFor(prices, row);
+      },
       backlogSince: (tenantId, agentId) => stub(tenantId, agentId).surfaceUsageBacklog(tenantId, agentId),
       warn: (m) => console.warn(m),
     },
@@ -3613,6 +3613,17 @@ export default {
   async fetch(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
     return observed(request, () => route(request, env, ctx));
   },
+
+  /**
+   * The daily Cron Trigger (`triggers.crons` in cf/wrangler.jsonc and the preview's): the usage ledger's
+   * retention, hours older than KEEP_HOURLY_DAYS folded into days (`retainUsage`, cf/src/usage-d1.ts).
+   * Idempotent, so a trigger that fires twice, or a manual one, changes nothing the first did not.
+   */
+  async scheduled(controller: ScheduledController, env: Env) {
+    // Awaited, not handed to waitUntil: a fold that throws then marks this invocation failed in the
+    // trigger's own history, which is where a missed retention day is looked for.
+    await retainUsage(env.CONTROL_DB, controller.scheduledTime);
+  },
 };
 
 async function route(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
@@ -3644,6 +3655,10 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
     if (url.pathname === "/admin/service-tokens") return adminServiceTokens(request, env.AUTOMATION_TOKEN, d1ServiceTokens(env.CONTROL_DB), url);
     // A Raft server's provider tokens, and the agents it provisions with them (raft-agent-provider.v1).
     if (url.pathname === "/admin/provider-tokens") return adminProviderTokens(request, env.AUTOMATION_TOKEN, d1ProviderTokens(env.CONTROL_DB), url);
+    // Every tenant's estimated cost (credits phase 1: accounting, nothing enforced). Operator header only.
+    if (url.pathname === "/admin/usage-costs") {
+      return adminUsageCosts(request, env.AUTOMATION_TOKEN, (from, to, bucket) => readUsageCosts(env.CONTROL_DB, from, to, bucket), url);
+    }
     if (url.pathname.startsWith("/provision/")) return provision(request, env, url);
     // A service's push: addressed by the hook id alone, before any sign-in.
     if (url.pathname.startsWith("/hooks/")) return inboundHook(request, env, url, ctx);

@@ -33,9 +33,9 @@
  *
  * Not here, each with what is already waiting on it:
  * - a retention scheme for the objects: they accumulate under `trace/` with
- *   nothing deleting them. The usage ledger has the same unpaid item —
- *   `foldUsage` (cf/src/usage-d1.ts) is defined and has no caller — so the
- *   two are one job, and doing one without the other leaves the pattern.
+ *   nothing deleting them. The usage ledger's is the daily Cron Trigger
+ *   (`scheduled` in cf/src/index.ts, `retainUsage` in cf/src/usage-d1.ts);
+ *   that handler is where a trace sweep would run too.
  * - reads across tenants: nothing consumes these objects yet; the first
  *   reader decides the layout it needs and this key scheme may move.
  * - a stall detector: a run that stops silently leaves no row here, so "no

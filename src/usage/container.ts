@@ -38,7 +38,8 @@
  * A later run that disagrees says WHICH side moved: a different shape means run9
  * changed, a different total means this file did.
  */
-import { appendUsage, msByHour, type UsageRow } from "./outbox.ts";
+import { appendUsage, msByHour, payerKey, type UsageRow } from "./outbox.ts";
+import { secretRefKind } from "../runtime/secrets.ts";
 import type { SqlHost } from "../store/pi-storage.ts";
 
 type Sql = SqlHost["sql"];
@@ -166,6 +167,25 @@ export function heldUnreadableRows(
 }
 
 /**
+ * The mount reports `countHeldTime` reads, named by mount and marked with whose account each box runs on: a mount
+ * whose credential is the agent's own sealed one (secretRefKind "agent") spends the tenant's run9 account; the
+ * operator's reference (`operator:run9`) or an environment one spends ours. A report for a mount no longer listed
+ * is left out.
+ */
+export function heldReports(
+  mounts: ReadonlyArray<{ alias: string; plugin: string; secretRef: string | null }>,
+  reports: Record<string, unknown>,
+): Record<string, { plugin: string; report: unknown; own: boolean }> {
+  const byAlias = new Map(mounts.map((m) => [m.alias, m]));
+  const named: Record<string, { plugin: string; report: unknown; own: boolean }> = {};
+  for (const [alias, report] of Object.entries(reports)) {
+    const m = byAlias.get(alias);
+    if (m) named[alias] = { plugin: m.plugin, report, own: secretRefKind(m.secretRef) === "agent" };
+  }
+  return named;
+}
+
+/**
  * Append what every mount has held since the last pass, and remember it.
  * Returns one line per mount that contributed, for a caller that wants to say
  * what happened.
@@ -185,7 +205,7 @@ export function heldUnreadableRows(
  */
 export function countHeldTime(
   sql: Sql,
-  reports: Record<string, { plugin: string; report: unknown }>,
+  reports: Record<string, { plugin: string; report: unknown; own?: boolean }>,
   base: { tenantId: string; agentId: string },
   now = Date.now(),
 ): Array<{ key: string; rows: number }> {
@@ -194,11 +214,13 @@ export function countHeldTime(
     .map((r: any) => [String(r.box_id), { through: Number(r.through), uses: Number(r.uses) }]));
   const seen = new Set<string>();
   const out: Array<{ key: string; rows: number }> = [];
-  for (const { plugin, report } of Object.values(reports)) {
+  for (const { plugin, report, own } of Object.values(reports)) {
     const boxes = boxesOf(report as any);
     for (const b of boxes) seen.add(b.id);
-    const { rows, marks } = heldRows(base, plugin, boxes, counted, now);
-    const marker = heldUnreadableRows(base, plugin, (report as any)?.activity ?? null, now);
+    // A box on the tenant's own credential is theirs to pay for: kept, under a key that says so (`payerKey`).
+    const key = payerKey(plugin, own === true);
+    const { rows, marks } = heldRows(base, key, boxes, counted, now);
+    const marker = heldUnreadableRows(base, key, (report as any)?.activity ?? null, now);
     if (rows.length || marker.length) appendUsage(sql, [...rows, ...marker]);
     for (const { id, mark } of marks) {
       sql.exec(
@@ -206,7 +228,7 @@ export function countHeldTime(
         "ON CONFLICT(box_id) DO UPDATE SET through = excluded.through, uses = excluded.uses",
         id, Math.round(mark.through), Math.round(mark.uses));
     }
-    if (rows.length || marker.length) out.push({ key: plugin, rows: rows.length + marker.length });
+    if (rows.length || marker.length) out.push({ key, rows: rows.length + marker.length });
   }
   for (const [id, mark] of counted) {
     if (!seen.has(id) && mark.through < now - KEEP_MARKS_MS) sql.exec("DELETE FROM usage_held WHERE box_id = ?", id);

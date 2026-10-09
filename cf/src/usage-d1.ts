@@ -10,7 +10,8 @@
  * hour a thing happened in, and only for days older than any window the page
  * offers.
  */
-import { pendingUsage, pruneUsage, toHourly, UNACCEPTED_TOKENS, type OutboxRow } from "../../src/usage/outbox.ts";
+import { OWN_KEY_PREFIX, pendingUsage, pruneUsage, toHourly, UNACCEPTED_TOKENS, type OutboxRow } from "../../src/usage/outbox.ts";
+import { logEvent } from "../../src/core/log.ts";
 import { DAY_MS, USAGE_WINDOWS } from "./usage-windows.ts";
 
 // Both live in usage-windows.ts so the page and this parser cannot hold
@@ -115,6 +116,19 @@ export async function foldUsage(
   return { days, hours };
 }
 
+/**
+ * The Worker's daily Cron Trigger (`scheduled` in cf/src/index.ts, `triggers.crons` in cf/wrangler.jsonc):
+ * one fold at the trigger's own time. Hours are kept for `KEEP_HOURLY_DAYS`, not less, because that is what
+ * the views were promised (the hourly-detail guard in test/spec/usage-spec.ts, `HOURLY_KEPT_MS` in
+ * cf/src/agent-surface/usage.ts). A run that leaves days behind (`maxDays`) is finished by the next one; a
+ * run that repeats one finds nothing to move (`foldUsage`).
+ */
+export async function retainUsage(db: D1Database, now: number): Promise<{ days: number[]; hours: number }> {
+  const done = await foldUsage(db, now);
+  logEvent("usage.fold", { days: done.days.length, hours: done.hours, first: done.days[0] ?? null });
+  return done;
+}
+
 export type UsageGroupBy = "total" | "agent" | "model" | "tool";
 
 export interface UsageReadRow {
@@ -126,7 +140,7 @@ export interface UsageReadRow {
   key: string;
   quantity: number;
   unit: string;
-  /** Credits, once any price exists; absent before. */
+  /** Credits — US dollars, 1 credit = $1 (migration 0016) — once any price exists; absent before. */
   cost?: number | null;
 }
 
@@ -166,11 +180,17 @@ export async function usagePrices(db: D1Database): Promise<UsagePrice[]> {
 }
 
 /**
- * The price that applied to a row: the newest one in effect at the start of
- * its bucket, for its exact key before the resource's `*`. Null: free.
- * A bucket straddling a price change is priced at its start.
+ * The price that applied to a row, in credits (US dollars) per unit: the newest
+ * one in effect at the start of its bucket, for its exact key before the
+ * resource's `*`. Null: nobody priced it — which a reader must keep apart from
+ * 0, "priced, and free". A bucket straddling a price change is priced at its start.
+ *
+ * A key marked as paid by the tenant's own credential (`OWN_KEY_PREFIX`) is 0
+ * whatever the table holds: the provider billed the tenant for it already, and
+ * a `*` row written for our own account must not reach it.
  */
 export function priceFor(prices: readonly UsagePrice[], row: { bucket: number; resource: string; key: string; unit: string }): number | null {
+  if (row.key.startsWith(OWN_KEY_PREFIX)) return 0;
   const newest = (key: string) => prices
     .filter((p) => p.resource === row.resource && p.key === key && p.unit === row.unit && p.effectiveFrom <= row.bucket)
     .sort((a, b) => b.effectiveFrom - a.effectiveFrom)[0];
@@ -269,6 +289,67 @@ export async function readUsage(db: D1Database, tenantId: string, q: UsageQuery)
     return row;
   });
   return { rows, priced, firstHours, ...(partial ? { partial } : {}) };
+}
+
+/** One tenant's estimated cost of one resource over one period (`readUsageCosts`). */
+export interface ResourceCost {
+  resource: string;
+  /** Dollars, summed over the rows that had a price. */
+  cost: number;
+  /** `key unit` of every row with no price, so a total that leaves something out says what. */
+  unpriced: string[];
+}
+export interface TenantCosts { tenantId: string; total: number; periods: Array<{ start: number; total: number; resources: ResourceCost[] }> }
+
+/** The start of the UTC day or month `t` falls in. */
+export function periodStart(t: number, bucket: "day" | "month"): number {
+  if (bucket === "day") return Math.floor(t / DAY_MS) * DAY_MS;
+  const d = new Date(t);
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1);
+}
+
+/**
+ * Every tenant's estimated cost over `from <= t < to`, by day or UTC month and resource: the operator's view
+ * (/admin/usage-costs, cf/src/admin-usage-costs.ts), never a tenant's.
+ *
+ * Unlike `readUsage` this keeps `UNACCEPTED_TOKENS`: an answer no job accepted is our cost, and this is where
+ * our cost is read. Rows are priced at their own granularity — an hourly row at its hour, a folded day at its
+ * day — and only then summed into the period, so a price change inside a day prices this view exactly as the
+ * tenant's hourly view prices it, and a fold does not move a total.
+ */
+export async function readUsageCosts(db: D1Database, from: number, to: number, bucket: "day" | "month"): Promise<TenantCosts[]> {
+  const { results } = await db.prepare(
+    `SELECT tenant_id, at, resource, key, unit, SUM(quantity) AS quantity FROM (
+       SELECT tenant_id, hour AS at, resource, key, unit, quantity FROM usage_hourly WHERE hour >= ? AND hour < ?
+       UNION ALL
+       SELECT tenant_id, day AS at, resource, key, unit, quantity FROM usage_daily WHERE day >= ? AND day < ?
+     ) GROUP BY tenant_id, at, resource, key, unit ORDER BY tenant_id, at, resource, key, unit`,
+  ).bind(from, to, from, to).all();
+  const prices = await usagePrices(db);
+  const tenants = new Map<string, Map<number, Map<string, { cost: number; unpriced: Set<string> }>>>();
+  for (const r of results as any[]) {
+    const row = { bucket: Number(r.at), resource: String(r.resource), key: String(r.key), unit: String(r.unit) };
+    const p = priceFor(prices, row);
+    const periods = tenants.get(String(r.tenant_id)) ?? new Map();
+    tenants.set(String(r.tenant_id), periods);
+    const start = periodStart(row.bucket, bucket);
+    const resources = periods.get(start) ?? new Map();
+    periods.set(start, resources);
+    const c = resources.get(row.resource) ?? { cost: 0, unpriced: new Set<string>() };
+    resources.set(row.resource, c);
+    if (p === null) c.unpriced.add(`${row.key} ${row.unit}`);
+    else c.cost += p * Number(r.quantity);
+  }
+  // Float sums of per-row products carry noise past the tenth decimal; a dollar figure does not need it.
+  const tidy = (n: number) => Math.round(n * 1e10) / 1e10;
+  return [...tenants.entries()].map(([tenantId, periods]) => {
+    const list = [...periods.entries()].sort(([a], [b]) => a - b).map(([start, resources]) => {
+      const rs = [...resources.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+        .map(([resource, c]) => ({ resource, cost: tidy(c.cost), unpriced: [...c.unpriced].sort() }));
+      return { start, total: tidy(rs.reduce((a, r) => a + r.cost, 0)), resources: rs };
+    });
+    return { tenantId, total: tidy(list.reduce((a, p) => a + p.total, 0)), periods: list };
+  });
 }
 
 const LOCAL = "CREATE TABLE IF NOT EXISTS usage_sent (id INTEGER PRIMARY KEY CHECK (id = 1), through_seq INTEGER NOT NULL)";
