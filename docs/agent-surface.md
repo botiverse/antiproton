@@ -531,7 +531,9 @@ are walked as ordinary text, so a secret the tool put in one of them is caught o
 The shapes are heuristics: a credential with none of the shapes or keys above — a bare opaque token
 outside `Authorization`, `Bearer` without a digit, a `key: value` or `KEY = value` line, an
 upper-cased key prefix (`SK-PROJ-…`), a JWT whose header is not JSON, a header given as a
-`[name, value]` pair or `{name, value}` object — is not caught unless it is one of the agent's values.
+`[name, value]` pair or `{name, value}` object, or JSON embedded in prose (`result: {"token":"…"}`: a
+string is parsed as JSON only when it starts as JSON, so a credential key inside such text is not
+read as one) — is not caught unless it is one of the agent's values.
 
 ### Audit
 
