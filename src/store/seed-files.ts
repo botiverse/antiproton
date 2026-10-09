@@ -22,6 +22,7 @@
  */
 import { createHash } from "node:crypto";
 import { canonJson } from "../core/canon-json.ts";
+import { toolConfigOf, type ToolConfig } from "../core/tool-config.ts";
 import { STATE_INLINE_MAX, STATE_KEY } from "../plugins/state-key.ts";
 
 type Sql = { exec(query: string, ...bindings: unknown[]): { toArray(): any[] } };
@@ -45,10 +46,12 @@ export interface SeedFileMeta { path: string; mode: SeedMode; bytes: number; sha
 export interface SeedSeal {
   sealedAt: number;
   how: SealHow;
-  /** sha256 of `canonJson(manifest)` (src/core/canon-json.ts). */
+  /** `manifestSha256(manifest, toolConfig)`. */
   manifestSha256: string;
   /** Sorted by path. */
   manifest: SeedFileMeta[];
+  /** What the agent's tools were provisioned as (src/core/tool-config.ts); null for an agent provisioned as every agent is. */
+  toolConfig: ToolConfig | null;
 }
 
 export const SEED_FILES_SCHEMA = [
@@ -58,8 +61,18 @@ export const SEED_FILES_SCHEMA = [
      PRIMARY KEY (tenant_id, agent_id, path))`,
   `CREATE TABLE IF NOT EXISTS seed_seal (
      tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL, sealed_at INTEGER NOT NULL, how TEXT NOT NULL,
-     manifest_sha256 TEXT NOT NULL, manifest TEXT NOT NULL,
+     manifest_sha256 TEXT NOT NULL, manifest TEXT NOT NULL, tool_config TEXT,
      PRIMARY KEY (tenant_id, agent_id))`,
+];
+
+/**
+ * Columns added to the tables above after they first shipped, for a store to try once each at init (an existing
+ * table never gets them from CREATE TABLE IF NOT EXISTS). `seed_seal.tool_config` is the seal's own copy of the
+ * agent's `toolConfig`; a row sealed before it existed has NULL, which is right for it: no agent had a `toolConfig`
+ * then, so its hash was of the files alone.
+ */
+export const SEED_FILES_ALTERS = [
+  "ALTER TABLE seed_seal ADD COLUMN tool_config TEXT",
 ];
 
 /**
@@ -92,9 +105,29 @@ export function sha256Hex(value: Uint8Array | string): string {
   return createHash("sha256").update(typeof value === "string" ? new TextEncoder().encode(value) : value).digest("hex");
 }
 
-/** The manifest's hash: of its canonical JSON, so it is the same however the rows were read. */
-export function manifestSha256(manifest: readonly SeedFileMeta[]): string {
-  return sha256Hex(canonJson(manifest));
+/**
+ * The manifest's hash: of its canonical JSON, so it is the same however the rows were read. An agent provisioned with
+ * a `toolConfig` has it hashed with the files, `{ manifest, toolConfig }`, so an evaluator's recorded hash also pins
+ * which tools the agent was given; without one the input is the manifest alone, which is every hash recorded before
+ * `toolConfig` existed. `toolConfig` is required rather than defaulted: a caller that forgot it would hash a minimal
+ * agent as a default one, and the two hashes would still look like hashes.
+ */
+export function manifestSha256(manifest: readonly SeedFileMeta[], toolConfig: ToolConfig | null): string {
+  return sha256Hex(canonJson(toolConfig === null ? manifest : { manifest, toolConfig }));
+}
+
+/** The agent record's `toolConfig`, read in the caller's transaction from the table the record lives in. */
+export function readToolConfig(sql: Sql, tenantId: string, agentId: string): ToolConfig | null {
+  const r = sql.exec("SELECT config FROM agents WHERE tenant_id=? AND agent_id=?", tenantId, agentId).toArray()[0];
+  if (!r) return null;
+  try { return toolConfigOf(JSON.parse(String(r.config ?? "{}"))); } catch { return null; }
+}
+
+/** What `GET …/seed/manifest` reports, for both stores: the files as they stand, their hash, and the seal if any. */
+export function seedManifestOf(sql: Sql, tenantId: string, agentId: string) {
+  const manifest = listSeedFiles(sql, tenantId, agentId);
+  const toolConfig = readToolConfig(sql, tenantId, agentId);
+  return { manifest, toolConfig, manifestSha256: manifestSha256(manifest, toolConfig), seal: readSeal(sql, tenantId, agentId) };
 }
 
 /** Whether a text kept as a state value stays in its row: the plugin's own measure, the length of its JSON. */
@@ -118,9 +151,14 @@ export function seedSnapshot(sql: Sql, tenantId: string, agentId: string, path: 
 }
 
 export function readSeal(sql: Sql, tenantId: string, agentId: string): SeedSeal | null {
-  const r = sql.exec("SELECT sealed_at, how, manifest_sha256, manifest FROM seed_seal WHERE tenant_id=? AND agent_id=?",
+  const r = sql.exec("SELECT sealed_at, how, manifest_sha256, manifest, tool_config FROM seed_seal WHERE tenant_id=? AND agent_id=?",
     tenantId, agentId).toArray()[0];
-  return r ? { sealedAt: Number(r.sealed_at), how: String(r.how) as SealHow, manifestSha256: String(r.manifest_sha256), manifest: JSON.parse(String(r.manifest)) } : null;
+  // `toolConfig` is the seal's own copy, written with the hash (`sealSeedFiles`), never the live record's: whatever
+  // later becomes of the record, the seal reports what its hash was computed over, so it can always be recomputed.
+  return r ? {
+    sealedAt: Number(r.sealed_at), how: String(r.how) as SealHow, manifestSha256: String(r.manifest_sha256), manifest: JSON.parse(String(r.manifest)),
+    toolConfig: r.tool_config == null ? null : toolConfigOf({ toolConfig: JSON.parse(String(r.tool_config)) }),
+  } : null;
 }
 
 /**
@@ -131,9 +169,10 @@ export function sealSeedFiles(sql: Sql, tenantId: string, agentId: string, how: 
   const had = readSeal(sql, tenantId, agentId);
   if (had) return { seal: had, sealedNow: false };
   const manifest = listSeedFiles(sql, tenantId, agentId);
-  const seal: SeedSeal = { sealedAt: now, how, manifestSha256: manifestSha256(manifest), manifest };
-  sql.exec("INSERT INTO seed_seal(tenant_id, agent_id, sealed_at, how, manifest_sha256, manifest) VALUES (?,?,?,?,?,?)",
-    tenantId, agentId, now, how, seal.manifestSha256, JSON.stringify(manifest));
+  const toolConfig = readToolConfig(sql, tenantId, agentId);
+  const seal: SeedSeal = { sealedAt: now, how, manifestSha256: manifestSha256(manifest, toolConfig), manifest, toolConfig };
+  sql.exec("INSERT INTO seed_seal(tenant_id, agent_id, sealed_at, how, manifest_sha256, manifest, tool_config) VALUES (?,?,?,?,?,?,?)",
+    tenantId, agentId, now, how, seal.manifestSha256, JSON.stringify(manifest), toolConfig === null ? null : JSON.stringify(toolConfig));
   return { seal, sealedNow: true };
 }
 

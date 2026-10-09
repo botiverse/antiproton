@@ -27,7 +27,7 @@ import {
   type SeedNoticeRow, type SeedPlan,
 } from "./seed-record.ts";
 import {
-  listSeedFiles, manifestSha256, readSeal, SEED_FILES_SCHEMA, sealSeedFiles, writeSeedFile, type SealHow, type SeedWrite,
+  listSeedFiles, readSeal, SEED_FILES_ALTERS, SEED_FILES_SCHEMA, seedManifestOf, sealSeedFiles, writeSeedFile, type SealHow, type SeedWrite,
 } from "./seed-files.ts";
 
 const SCHEMA = `
@@ -199,6 +199,7 @@ export class SqliteStore implements StorageAdapter {
       // NOT NULL column the insert no longer fills; drop it, and with it the
       // one plaintext fragment of a value the row ever held.
       "ALTER TABLE secrets DROP COLUMN last4",
+      ...SEED_FILES_ALTERS,
     ]) {
       try { this.#db.exec(alter); } catch { /* already present */ }
     }
@@ -1147,8 +1148,7 @@ export class SqliteStore implements StorageAdapter {
   }
 
   async seedManifest(tenantId: string, agentId: string) {
-    const manifest = listSeedFiles(this.#usageSql(), tenantId, agentId);
-    return { manifest, manifestSha256: manifestSha256(manifest), seal: readSeal(this.#usageSql(), tenantId, agentId) };
+    return seedManifestOf(this.#usageSql(), tenantId, agentId);
   }
 
   async seal(tenantId: string, agentId: string, how: SealHow) {

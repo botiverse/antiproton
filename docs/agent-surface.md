@@ -204,6 +204,50 @@ for an agent that is not a live provisioned agent of the tenant.
 | `GET` | `/provision/agents/{agentId}/model-input?session=&call=` | what one model call was sent |
 | `GET` | `/provision/agents/{agentId}/tools` | the tools the next turn offers the model |
 
+The same flag lets `POST /provision/agents` choose the agent's tools ([below](#choosing-the-agents-tools)).
+
+### Choosing the agent's tools
+
+`POST /provision/agents` takes two optional fields, served only where `EVAL_SEED_ROUTES` is `"1"`. On
+any other deployment either field is refused with `400`, `code: "eval_only"`, `param` naming it, and
+nothing is made: an evaluation that asked for a minimal agent is never given the default one in
+silence. Sending neither is today's agent exactly — every default mount, reconciled as the catalogue
+grows, and run_js, resume and jobs (`test/eval-seed-object.ts` checks such an agent's export against
+a real turn's request, and measured its request identical to the base commit's, 2026-10-09).
+
+- **`mounts: string[]`** — the default mounts to give the agent, named by the alias the catalogue
+  gives them for an agent Raft hosts (`tools`, `artifacts`, `web`, `search`, `gh`, `sandbox`,
+  `state`; `AgentRuntime.DEFAULT_MOUNTS`, `cf/src/runtime.ts`). `raft` is always added and must not
+  be named. The agent gets exactly those plus `raft`, and is marked as having chosen its mounts
+  (`chosen`, `src/store/seed-record.ts`), so no catalogue reconcile — at a turn's start, a console
+  open or a later provision — ever adds one. `[]` is `raft` alone. An unknown name, a name given
+  twice, `raft`, a non-string entry or a non-array is `400` naming the entry; so is a mount whose
+  plugin cannot run on this deployment (asked of the agent's object before anything is written).
+- **`harness: "minimal"`** — the harness offers none of its own tools: no `run_js`, no `resume`, no
+  `jobs`. The one accepted value; anything else is `400`. It holds on every turn — a prompt, a steer,
+  a pushed event — under both engines, and in `GET …/tools`, which is built by the same step. The
+  system prompt's run_js paragraph goes with the tool. Without `mounts`, the agent keeps the default
+  mounts (still reconciled) and only the harness's tools go.
+
+**Questions under `minimal`.** A tool that asks the model a question before acting needs `resume` to
+be answered. With none offered, the harness's existing no-resume path applies: the question is
+dropped, nothing is done, and the model is shown the question with a note to call the tool again if
+it still applies (`toolQuestion`, `src/runtime/pi-tools.ts`). `raft`'s only question is a held send or
+task write when newer messages arrived; the model's own call records those messages as seen before
+asking, so calling again goes ahead (`heldCall`, `src/plugins/raft.ts`; `test/raft-plugin.ts`, "the
+same send again … goes through"). Any other mount whose plugin asks questions is refused under
+`minimal` with `400`, rather than given that changed flow; a default mount that comes to ask questions
+later is not added to a `minimal` agent by the catalogue reconcile either (recorded as `refused`, with
+the reason). No default mount asks questions today.
+
+**Recorded, and fixed.** The choice is kept on the agent's record as `toolConfig: { mounts, harness }`
+(`mounts` `null` when not sent, otherwise sorted, since the list is a set and its order means nothing;
+`harness` `"default"` when not sent; no `toolConfig` at all when neither was). A later `POST` for the same agent must ask for the same tools (in any order): one asking for others —
+including one sending neither field, for an agent made with them, or either field for an agent made
+without — is `409`, `code: "tool_config_conflict"`, and changes nothing. A `PATCH` says nothing about
+tools and keeps them. A different set of tools needs a new agent. `GET …/tools` answers the record's
+`toolConfig` beside the list, and the seed manifest carries it ([the seal](#seeded-files)).
+
 ### Seeded files
 
 A seeded file has two copies, written together in one transaction: a **snapshot** nothing the agent
@@ -243,11 +287,16 @@ that write is refused. `POST …/seed/seal` is idempotent and answers the seal i
 
 ```json
 { "manifest": [{ "path": "MEMORY.md", "mode": "writable", "bytes": 120, "sha256": "…" }],
+  "toolConfig": { "mounts": ["state"], "harness": "minimal" },
   "manifestSha256": "…", "sealedAt": "2026-10-09T09:00:00.000Z", "how": "explicit" }
 ```
 
-`manifest` is sorted by `path`; `manifestSha256` is the SHA-256 of its canonical JSON (keys sorted, no
-spaces: `src/core/canon-json.ts`), so it is the same however it was read. `how` is `explicit`,
+`manifest` is sorted by `path`. `toolConfig` is the agent's [tool choice](#choosing-the-agents-tools),
+`null` for an agent made without one; once sealed it is the seal's own copy, the one its hash was computed
+over, whatever later happens to the agent's record. `manifestSha256` is the SHA-256 of canonical JSON (keys sorted,
+no spaces: `src/core/canon-json.ts`), so it is the same however it was read: of `manifest` alone when
+`toolConfig` is `null` — every hash recorded before `toolConfig` existed — and of
+`{ "manifest": …, "toolConfig": … }` otherwise, so the hash also pins which tools the agent was given. `how` is `explicit`,
 `first-inbound`, `first-turn` or `prior-activity`. `GET …/seed/manifest` answers the same body plus `sealed: true`, or,
 before the seal, `sealed: false` with the files as they stand and `sealedAt` and `how` null.
 
@@ -304,6 +353,7 @@ carries.
 
 ```json
 { "agentId": "raft_…", "asOf": "2026-10-09T09:00:00.000Z", "engine": "pi085", "retakePending": false,
+  "toolConfig": null,
   "tools": [{ "name": "raft__inbox_list", "description": "…", "parameters": { "type": "object" },
               "source": "mount", "alias": "raft", "plugin": "raft", "tool": "inbox_list",
               "sideEffects": "read", "idempotency": "native", "replay": "never" }],

@@ -27,6 +27,7 @@ const STAND_IN = "export class DurableObject { constructor(ctx, env) { this.ctx 
 register("data:text/javascript," + encodeURIComponent(
   `export async function resolve(s, c, next) { if (s.startsWith("cloudflare:")) return { url: ${JSON.stringify("data:text/javascript," + encodeURIComponent(STAND_IN))}, shortCircuit: true }; return next(s, c); }`));
 const { AgentDO, default: worker } = await import("../cf/src/index.ts");
+const { AgentRuntime } = await import("../cf/src/runtime.ts");
 const { clearHookRoutes } = await import("../cf/src/hook-route.ts");
 const { setLogSink } = await import("../src/core/log.ts");
 
@@ -56,6 +57,17 @@ const pushy: Plugin = {
     return { deliver: true, text: body.text, dedupeKey: body.id };
   },
 };
+
+/** A plugin whose one tool asks the model a question before acting: what `resume` exists to answer. */
+const asker: Plugin = {
+  id: "asker", version: "1.0.0",
+  tools: [{ name: "ask", summary: "asks first", parameters: {}, sideEffects: "write", idempotency: "native" }],
+  async invoke() { return {}; },
+  interrupts: { async resume() { return { done: true }; } },
+};
+/** Why `asker` cannot run on this deployment, or null: what a plugin's `unavailable()` says, set by the case that needs it. */
+let askerOffline: string | null = null;
+asker.unavailable = () => askerOffline;
 
 /** D1 as node:sqlite, with every migration in cf/migrations applied (test/agents-api-model.ts). */
 function d1() {
@@ -97,7 +109,7 @@ function bucket() {
  * `state` mount (with `raft`, the mounts Raft's adopt makes instead, beside the same two), and two provider tokens: T's and another tenant's. `flag` is EVAL_SEED_ROUTES as the deployment sets it,
  * null for not at all.
  */
-async function world(flag: string | null = "1", opts: { raft?: boolean } = {}) {
+async function world(flag: string | null = "1", opts: { raft?: boolean; post?: Record<string, unknown>; none?: true } = {}) {
   clearHookRoutes();
   const DB = d1();
   const raw = sqliteHost();
@@ -111,8 +123,14 @@ async function world(flag: string | null = "1", opts: { raft?: boolean } = {}) {
     blockConcurrencyWhile: async <R>(fn: () => Promise<R>) => fn(),
     id: { toString: () => "do-1" }, getWebSockets: () => [], exports: {},
   };
-  class TestDO extends AgentDO { protected override extraPlugins() { return [pushy]; } }
+  class TestDO extends AgentDO { protected override extraPlugins() { return [pushy, asker]; } }
   const objects = new Map<string, InstanceType<typeof TestDO>>();
+  const another = (n: string) => {
+    const host = sqliteHost();
+    const o = new TestDO({ ...ctx, storage: { ...ctx.storage, sql: host.sql, transactionSync: host.transactionSync }, id: { toString: () => n } } as never, env as never);
+    objects.set(n, o);
+    return o;
+  };
   const R2 = bucket();
   const env: Record<string, unknown> = {
     MODEL_QUEUE: { send: async (m: { jobId: string }) => { jobs.push(m.jobId); } },
@@ -120,10 +138,24 @@ async function world(flag: string | null = "1", opts: { raft?: boolean } = {}) {
     DEEPSEEK_BASE_URL: "https://model.example/v1", DEEPSEEK_API_KEY: "k", AUTOMATION_TOKEN: AUTOMATION,
     SECRET_KEK: Buffer.from(new Uint8Array(32).fill(3)).toString("base64"),
     ...(flag === null ? {} : { EVAL_SEED_ROUTES: flag }),
-    AGENT: { idFromName: (n: string) => n, get: (n: string) => objects.get(n)! },
+    // Any other object (the provider's home, which a POST lists the agent under) is made when first asked for.
+    AGENT: { idFromName: (n: string) => n, get: (n: string) => objects.get(n) ?? another(n) },
   };
   const D = new TestDO(ctx as never, env as never);
   objects.set(agentObjectName(T, A), D);
+  const token = newProviderToken(), other = newProviderToken();
+  await d1ProviderTokens(DB).issue({ hash: await hashProviderToken(token), label: "raft-test", raftOrigin: "https://raft.example", scope: "tenant", tenantId: T });
+  await d1ProviderTokens(DB).issue({ hash: await hashProviderToken(other), label: "raft-other", raftOrigin: "https://raft.example", scope: "tenant", tenantId: OTHER_T });
+  const made0 = { D, rt: D.runtime(), raw, DB, R2, env, jobs, token, other, tokenHash: await hashProviderToken(token), alarmAt: () => alarmAt };
+  // Made by Raft's own call (`POST /provision/agents`), with Raft stood in for: nothing else is added, so the agent has
+  // exactly what that request gave it. The answer is kept for the cases that read it.
+  if (opts.none) { await made0.rt.ready(); return { ...made0, hook: { hookId: "", secret: "" }, posted: null }; }
+  if (opts.post) {
+    const posted = await provisionPost(made0, opts.post);
+    must(posted.status === 201, `POST /provision/agents: ${posted.status} ${posted.text}`);
+    await made0.rt.ready();
+    return { ...made0, hook: { hookId: "", secret: "" }, posted };
+  }
   // A Raft-provisioned agent is made the way Raft makes one (`provisionAdopt`: the default mounts, then a raft mount).
   if (opts.raft) {
     const adopted = await D.provisionAdopt(T, A, JSON.stringify({ name: "n", instructions: "be brief", raftOrigin: "https://raft.example" }));
@@ -146,12 +178,37 @@ async function world(flag: string | null = "1", opts: { raft?: boolean } = {}) {
   must(made.hookId && made.secret, `hook: ${show(made)}`);
   await d1ProvisionedAgents(DB).create({ tenantId: T, raftAgentId: "01JEVAL", agentId: A, raftServerId: "srv-1", raftOrigin: "https://raft.example",
     name: "n", instructions: "", credentialHash: null, status: "active", pushRegistered: true, pushError: null });
-  const token = newProviderToken(), other = newProviderToken();
-  await d1ProviderTokens(DB).issue({ hash: await hashProviderToken(token), label: "raft-test", raftOrigin: "https://raft.example", scope: "tenant", tenantId: T });
-  await d1ProviderTokens(DB).issue({ hash: await hashProviderToken(other), label: "raft-other", raftOrigin: "https://raft.example", scope: "tenant", tenantId: OTHER_T });
-  return { D, rt, raw, DB, R2, env, jobs, token, other, tokenHash: await hashProviderToken(token), hook: made, alarmAt: () => alarmAt };
+  return { ...made0, rt, hook: made, posted: null };
 }
 type World = Awaited<ReturnType<typeof world>>;
+/** The deployment and its tokens, and no agent yet: a POST's refusal can be seen to make nothing. */
+const bareWorld = (flag: string | null) => world(flag, { none: true });
+
+const RAFT_CRED = "sk_agent_" + "R".repeat(32);
+/**
+ * `POST /provision/agents` as Raft sends it, for this world's agent (`raftAgentId` 01JEVAL is A), with Raft stood in
+ * for by a fetch that answers the credential's identity check (test/provision-runtime.ts) and refuses everything else.
+ */
+async function provisionPost(w: Pick<World, "env" | "token">, extra: Record<string, unknown>, auth?: string) {
+  const real = globalThis.fetch;
+  globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+    const headers = new Headers(init?.headers ?? {});
+    if (String(url) === "https://raft.example/internal/agent-api" && headers.get("authorization") === `Bearer ${RAFT_CRED}`) {
+      return Response.json({ agentId: "ag-1", agentName: "cody", agentDisplayName: "Cody", serverId: "srv-1" });
+    }
+    return Response.json({ errorCode: "NOT_FOUND" }, { status: 404 });
+  }) as typeof fetch;
+  try {
+    const res = await worker.fetch(new Request("https://x/provision/agents", {
+      method: "POST", headers: { authorization: `Bearer ${auth ?? w.token}`, "content-type": "application/json" },
+      body: JSON.stringify({ raftAgentId: "01JEVAL", raftServerId: "srv-1", raftOrigin: "https://raft.example", name: "n", instructions: "", credential: RAFT_CRED, ...extra }),
+    }), w.env as never);
+    const text = await res.text();
+    let body: any = null;
+    try { body = text ? JSON.parse(text) : null; } catch { body = text; }
+    return { status: res.status, body, text };
+  } finally { globalThis.fetch = real; }
+}
 
 /** A provider route, as Raft calls it. `auth` null sends no credential. */
 async function call(w: World, method: string, path: string, opts: { body?: BodyInit; auth?: string | null } = {}) {
@@ -667,6 +724,344 @@ await check("tools: every mount tool a turn offers carries the result-limit note
   const reader = /with the (\S+) call that reads all of it/.exec(mountWire.find((t) => NOTE.test(t.description))?.description ?? "")?.[1] ?? null;
   must(without.length <= 1 && without.every((t) => t.name === reader), `without the note: ${show(without.map((t) => t.name))}, reader ${reader}`);
   must(wire.filter((t) => !mountNames.has(t.name)).every((t) => !NOTE.test(t.description)), "a harness tool carries the mount note");
+});
+
+// ---- an evaluation's tool choice (mounts, harness) -------------------------
+
+const HARNESS_OWN = ["run_js", "resume", "jobs"];
+const mountAliases = async (w: World) => (await w.rt.store.listMounts(T, A)).map((m) => m.alias).sort();
+const toolConfigOfRecord = (a: { config: unknown } | null) => (a?.config as { toolConfig?: unknown } | undefined)?.toolConfig;
+const raftCatalogue = () => AgentRuntime.DEFAULT_MOUNTS.filter((m) => m.for.includes("raft"));
+
+await check("toolConfig: a POST without mounts or harness makes today's agent — every catalogue mount, run_js, resume and jobs, reconciled as ever", async () => {
+  const w = await world("1", { post: {} });
+  const config = (await w.rt.store.loadAgent(T, A))?.config as Record<string, unknown>;
+  must(!("toolConfig" in config), `the record carries a toolConfig: ${show(config)}`);
+  must((await w.rt.store.seedRecord(T, A)).chosen === false, "a default agent is marked chosen");
+  const ex = (await call(w, "GET", `${A}/tools`)).body;
+  must(ex.toolConfig === null, `export toolConfig: ${show(ex.toolConfig)}`);
+  const names = ex.tools.map((t: any) => t.name);
+  must(HARNESS_OWN.every((n) => names.includes(n)), `harness tools: ${show(names.filter((n: string) => !n.includes("__")))}`);
+  const want = [...raftCatalogue().map((m) => m.alias), "raft"].sort();
+  must(show(await mountAliases(w)) === show(want), `mounts ${show(await mountAliases(w))}, want ${show(want)}`);
+  const manifest = (await call(w, "GET", `${A}/seed/manifest`)).body;
+  must(manifest.toolConfig === null && manifest.manifestSha256 === sha256Hex(canonJson([])), `manifest: ${show(manifest)}`);
+  await w.rt.postMessage(T, A, "a real turn", "prompt");
+  await settle(w, 1);
+  must(show(shape(ex.tools)) === show(await wireTools(w, 0)), "the export and the request differ");
+});
+
+/** A minimal agent with only state and raft, its raft list snapshotted as test/eval-seed-object's other Raft cases do. */
+async function minimalWorld(extra: Record<string, unknown> = { mounts: ["state"], harness: "minimal" }) {
+  const w = await world("1", { post: extra });
+  await raftSnapshot(w);
+  return w;
+}
+
+for (const engine of ["pi085", "pd"] as const) {
+  await check(`toolConfig: mounts ["state"] and harness minimal offer only raft__* and state__*, and the real model request (${engine}) carries exactly that`, async () => {
+    const w = await minimalWorld();
+    must(w.posted?.status === 201, "made");
+    must(show(await mountAliases(w)) === show(["raft", "state"]), `mounts: ${show(await mountAliases(w))}`);
+    must(show(toolConfigOfRecord(await w.rt.store.loadAgent(T, A))) === show({ mounts: ["state"], harness: "minimal" }), "the record");
+    if (engine === "pd") {
+      const m = await w.D.migrateEngine(T, A, "migrate", false);
+      must(!!m && (m as any).ok, `migrate: ${show(m)}`);
+    }
+    const ex = (await call(w, "GET", `${A}/tools`)).body;
+    must(ex.engine === engine, `engine ${ex.engine}`);
+    const names: string[] = ex.tools.map((t: any) => t.name);
+    must(names.length > 0 && names.every((n) => n.startsWith("raft__") || n.startsWith("state__")), `offered: ${show(names)}`);
+    must(names.some((n) => n.startsWith("raft__")) && names.some((n) => n.startsWith("state__")), `both mounts: ${show(names)}`);
+    must(show(ex.toolConfig) === show({ mounts: ["state"], harness: "minimal" }), `export toolConfig: ${show(ex.toolConfig)}`);
+    await w.rt.postMessage(T, A, "a real turn", "prompt");
+    await settle(w, 1);
+    must(jobCount(w) === 1, `jobs: ${jobCount(w)}`);
+    const wire = await wireTools(w, 0);
+    must(show(shape(ex.tools)) === show(wire),
+      `export and request differ:\n export  ${show(names)}\n request ${show(wire.map((t) => t.name))}`);
+    // The system prompt says nothing of run_js either: its paragraph follows the tool.
+    must(!(await asked(w, 0)).includes("special tool, run_js"), "the prompt describes run_js");
+  });
+}
+
+
+await check("toolConfig: a steer and a push delivered to a minimal agent are offered no harness tool either", async () => {
+  const w = await minimalWorld();
+  // An operator's mount with an inbound hook, so a push can start a turn; the catalogue never adds one.
+  await w.rt.store.setPluginChoice(T, A, "pushy", "enable");
+  await w.rt.store.addMount({ tenantId: T, agentId: A, alias: "p", plugin: "pushy", installationId: "i-p", connectionId: null,
+    toolVersion: "1.0.0", publicConfig: {}, secretRef: null, policy: null });
+  const hook = await (await worker.fetch(new Request("https://x/admin/hooks", {
+    method: "POST", headers: { "x-harness-token": AUTOMATION, "content-type": "application/json" },
+    body: JSON.stringify({ tenantId: T, agentId: A, alias: "p" }),
+  }), w.env as never)).json() as { hookId: string; secret: string };
+  w.hook.hookId = hook.hookId; w.hook.secret = hook.secret;
+  const pushed = await push(w, "e1", "a pushed event");
+  must(pushed.status < 300, `push: ${show(pushed)}`);
+  await settle(w, 1);
+  must(jobCount(w) === 1 && (await asked(w, 0)).includes("a pushed event"), `the push did not reach the model: ${jobCount(w)}`);
+  const pushedWire = (await wireTools(w, 0)).map((t) => t.name);
+  must(pushedWire.length > 0 && !pushedWire.some((n) => HARNESS_OWN.includes(n)), `push turn: ${show(pushedWire)}`);
+  await answer(w, 0, "ok");
+  await w.rt.postMessage(T, A, "a steer", "steer");
+  await settle(w, 2);
+  must(jobCount(w) === 2, `jobs: ${jobCount(w)}`);
+  const steerWire = (await wireTools(w, 1)).map((t) => t.name);
+  must(steerWire.length > 0 && !steerWire.some((n) => HARNESS_OWN.includes(n)), `steer turn: ${show(steerWire)}`);
+  const ex = (await call(w, "GET", `${A}/tools`)).body;
+  must(show(ex.tools.map((t: any) => t.name)) === show(steerWire), `export ${show(ex.tools.map((t: any) => t.name))} vs ${show(steerWire)}`);
+});
+
+await check("toolConfig: mounts [] is raft alone; harness minimal alone keeps the catalogue's mounts and drops only run_js, resume and jobs", async () => {
+  const bare = await minimalWorld({ mounts: [] });
+  must(show(await mountAliases(bare)) === show(["raft"]), `mounts []: ${show(await mountAliases(bare))}`);
+  const bareNames = (await call(bare, "GET", `${A}/tools`)).body.tools.map((t: any) => t.name);
+  // harness is the default here: raft's questions still need resume, so it is offered; run_js and jobs as ever.
+  must(bareNames.every((n: string) => n.startsWith("raft__") || HARNESS_OWN.includes(n)) && bareNames.includes("resume"), `mounts []: ${show(bareNames)}`);
+  const h = await minimalWorld({ harness: "minimal" });
+  must(show(await mountAliases(h)) === show([...raftCatalogue().map((m) => m.alias), "raft"].sort()), `harness only: ${show(await mountAliases(h))}`);
+  const names = (await call(h, "GET", `${A}/tools`)).body.tools.map((t: any) => t.name);
+  must(!names.some((n: string) => HARNESS_OWN.includes(n)) && names.some((n: string) => n.startsWith("web__")), `harness only: ${show(names)}`);
+  must((await h.rt.store.seedRecord(T, A)).chosen === false, "harness alone marked the agent chosen");
+});
+
+await check("toolConfig: the catalogue never adds a mount to an agent given mounts, at a turn or a reconcile; a default agent does get it", async () => {
+  // A plugin no catalogue entry gives yet, switched on for both agents, so only the catalogue decides.
+  const entry = { alias: "p2", plugin: "pushy", config: {}, secretRef: null, policy: null, for: ["console", "raft"] as const, since: 99 };
+  AgentRuntime.DEFAULT_MOUNTS.push(entry as never);
+  try {
+    const w = await minimalWorld();
+    await w.rt.store.setPluginChoice(T, A, "pushy", "enable");
+    const before = await mountAliases(w);
+    const pass = await w.rt.reconcileSeeds(T, A);
+    must(pass.ran === false && (pass as { why: string }).why === "chosen", `reconcile: ${show(pass)}`);
+    await w.rt.postMessage(T, A, "a real turn", "prompt");
+    await settle(w, 1);
+    must(jobCount(w) === 1, `jobs: ${jobCount(w)}`);
+    must(show(await mountAliases(w)) === show(before), `mounts moved: ${show(before)} -> ${show(await mountAliases(w))}`);
+    must(!(await wireTools(w, 0)).some((t) => t.name.startsWith("p2__")), "the new entry was offered");
+    // Control: the same catalogue reaches an agent provisioned without the fields, at its next turn.
+    const d = await world("1", { post: {} });
+    await d.rt.store.setPluginChoice(T, A, "pushy", "enable");
+    await d.rt.postMessage(T, A, "a real turn", "prompt");
+    await settle(d, 1);
+    must((await mountAliases(d)).includes("p2"), `control: a default agent did not get the bumped entry: ${show(await mountAliases(d))}`);
+  } finally { AgentRuntime.DEFAULT_MOUNTS.splice(AgentRuntime.DEFAULT_MOUNTS.indexOf(entry as never), 1); }
+});
+
+await check("toolConfig: a re-POST asking other tools is 409 and changes nothing; the same ones again is 200; a default agent cannot be made minimal", async () => {
+  const w = await minimalWorld();
+  const before = everything(w.raw.sql as never);
+  for (const extra of [{}, { mounts: ["state", "web"], harness: "minimal" }, { mounts: ["state"] }, { harness: "minimal" }]) {
+    const r = await provisionPost(w, extra);
+    must(r.status === 409 && r.body?.error?.code === "tool_config_conflict", `${show(extra)}: ${r.status} ${r.text}`);
+  }
+  must(show(await mountAliases(w)) === show(["raft", "state"]), `mounts after the refusals: ${show(await mountAliases(w))}`);
+  must(show(toolConfigOfRecord(await w.rt.store.loadAgent(T, A))) === show({ mounts: ["state"], harness: "minimal" }), "the record moved");
+  const now = everything(w.raw.sql as never);
+  const [a, b] = [JSON.parse(before), JSON.parse(now)];
+  // The object's own busy-time log records each RPC it served; that the refused ones went no further is read there.
+  const served = b.do_activity.slice(a.do_activity.length).map((r: any) => r.kind);
+  must(served.length === 4 && served.every((k: string) => k === "provisionAdopt"), `after a refusal the POST went on: ${show(served)}`);
+  delete a.do_activity; delete b.do_activity;
+  if (show(a) !== show(b)) {
+    const moved = Object.keys(b).filter((t) => show(a[t]) !== show(b[t]));
+    throw new Error(`a refused re-POST wrote: ${moved.map((t) => `${t}: ${show(a[t])?.slice(0, 300)} -> ${show(b[t])?.slice(0, 300)}`).join("\n")}`);
+  }
+  const same = await provisionPost(w, { harness: "minimal", mounts: ["state"] });
+  must(same.status === 200, `the same request: ${same.status} ${same.text}`);
+  must(show(await mountAliases(w)) === show(["raft", "state"]), "the replay added a mount");
+  const d = await world("1", { post: {} });
+  const r = await provisionPost(d, { harness: "minimal" });
+  must(r.status === 409 && r.body?.error?.code === "tool_config_conflict", `default -> minimal: ${r.status} ${r.text}`);
+  must(toolConfigOfRecord(await d.rt.store.loadAgent(T, A)) === undefined, "the default agent's record gained a toolConfig");
+});
+
+await check("toolConfig: on a deployment without the setup routes either field is 400 and no agent is made; an unknown mount is 400 here too", async () => {
+  for (const flag of [null, "0"]) {
+    const w = await world(flag, {}).catch(() => null);
+    must(w, "world");
+    for (const extra of [{ mounts: ["state"] }, { harness: "minimal" }]) {
+      const r = await provisionPost(w, { ...extra });
+      must(r.status === 400 && r.body?.error?.code === "eval_only", `${flag} ${show(extra)}: ${r.status} ${r.text}`);
+    }
+  }
+  const fresh = await bareWorld(null);
+  const r = await provisionPost(fresh, { mounts: ["state"], harness: "minimal" });
+  must(r.status === 400 && r.body?.error?.code === "eval_only", `${r.status} ${r.text}`);
+  must(!(await fresh.rt.store.loadAgent(T, A)), "an agent was made");
+  must(!(await d1ProvisionedAgents(fresh.DB).get(T, "01JEVAL")), "a registry row was made");
+  const on = await bareWorld("1");
+  const unknown = await provisionPost(on, { mounts: ["state", "nosuch"] });
+  must(unknown.status === 400 && /"nosuch"/.test(unknown.body?.error?.message ?? ""), `${unknown.status} ${unknown.text}`);
+  must(!(await on.rt.store.loadAgent(T, A)) && !(await d1ProvisionedAgents(on.DB).get(T, "01JEVAL")), "an unknown mount made something");
+});
+
+await check("toolConfig: under minimal a mount whose plugin asks questions is refused (400, nothing recorded); without minimal it is given", async () => {
+  const entry = { alias: "asker", plugin: "asker", config: { account: "a" }, secretRef: null, policy: null, for: ["console", "raft"] as const, since: 98 };
+  AgentRuntime.DEFAULT_MOUNTS.push(entry as never);
+  try {
+    const w = await bareWorld("1");
+    const r = await provisionPost(w, { mounts: ["asker"], harness: "minimal" });
+    must(r.status === 400 && /asks the model questions/.test(r.body?.error?.message ?? ""), `${r.status} ${r.text}`);
+    must(!(await w.rt.store.loadAgent(T, A)), "the refused agent's record was written");
+    // The refused POST made the registry row (D1, before the object is asked), so this is its replay finishing it.
+    const ok = await provisionPost(w, { mounts: ["asker"] });
+    must(ok.status === 200 && ok.body.status === "active", `control: ${ok.status} ${ok.text}`);
+    const names = (await call(w, "GET", `${A}/tools`)).body.tools.map((t: any) => t.name);
+    must(names.includes("asker__ask") && names.includes("resume"), `control: ${show(names)}`);
+  } finally { AgentRuntime.DEFAULT_MOUNTS.splice(AgentRuntime.DEFAULT_MOUNTS.indexOf(entry as never), 1); }
+});
+
+await check("toolConfig: the seed manifest and the seal carry it, and manifestSha256 covers it", async () => {
+  const w = await minimalWorld();
+  must((await seed(w, "MEMORY.md", "hello")).status === 200, "seed");
+  const tc = { mounts: ["state"], harness: "minimal" };
+  const m = (await call(w, "GET", `${A}/seed/manifest`)).body;
+  must(m.sealed === false && show(m.toolConfig) === show(tc), `manifest: ${show(m)}`);
+  must(m.manifestSha256 === sha256Hex(canonJson({ manifest: m.manifest, toolConfig: tc })), "the unsealed hash does not cover toolConfig");
+  must(m.manifestSha256 !== sha256Hex(canonJson(m.manifest)), "the hash is the files' alone");
+  const s = (await call(w, "POST", `${A}/seed/seal`)).body;
+  must(show(s.toolConfig) === show(tc) && s.manifestSha256 === m.manifestSha256, `seal: ${show(s)}`);
+  const after = (await call(w, "GET", `${A}/seed/manifest`)).body;
+  must(after.sealed === true && show(after.toolConfig) === show(tc) && after.manifestSha256 === m.manifestSha256, `sealed manifest: ${show(after)}`);
+});
+
+await check("toolConfig: mounts are kept sorted, so the same mounts in either order are one agent: same record, same hash", async () => {
+  const a = await world("1", { post: { mounts: ["state", "web"] } });
+  const b = await world("1", { post: { mounts: ["web", "state"] } });
+  for (const w of [a, b]) {
+    must(show(toolConfigOfRecord(await w.rt.store.loadAgent(T, A))) === show({ mounts: ["state", "web"], harness: "default" }), `record: ${show(toolConfigOfRecord(await w.rt.store.loadAgent(T, A)))}`);
+    must((await seed(w, "MEMORY.md", "hello")).status === 200, "seed");
+  }
+  const [ma, mb] = [(await call(a, "GET", `${A}/seed/manifest`)).body, (await call(b, "GET", `${A}/seed/manifest`)).body];
+  must(ma.manifestSha256 === mb.manifestSha256 && show(ma.toolConfig) === show(mb.toolConfig), `by order: ${show([ma.toolConfig, mb.toolConfig])} ${ma.manifestSha256} ${mb.manifestSha256}`);
+});
+
+await check("toolConfig: after the seal a re-POST in another order is 200 and changes nothing; the seal reports its own copy, recomputable, whatever the record later says", async () => {
+  const w = await world("1", { post: { mounts: ["state", "web"], harness: "minimal" } });
+  must((await seed(w, "MEMORY.md", "hello")).status === 200, "seed");
+  const s = (await call(w, "POST", `${A}/seed/seal`)).body;
+  const recompute = (m: any) => sha256Hex(canonJson({ manifest: m.manifest, toolConfig: m.toolConfig }));
+  must(s.manifestSha256 === recompute(s), `the seal's hash is not its own manifest and toolConfig's: ${show(s)}`);
+  const r = await provisionPost(w, { mounts: ["web", "state"], harness: "minimal" });
+  must(r.status === 200, `reordered replay: ${r.status} ${r.text}`);
+  const after = (await call(w, "GET", `${A}/seed/manifest`)).body;
+  must(after.sealed === true && show(after.toolConfig) === show(s.toolConfig) && after.manifestSha256 === s.manifestSha256, `after the replay: ${show(after)} vs ${show(s)}`);
+  must(after.manifestSha256 === recompute(after), "the published manifest no longer recomputes to its hash");
+  // The record moved by a path no route offers: the seal still reports what it closed on.
+  const config = (await w.rt.store.loadAgent(T, A))!.config as Record<string, unknown>;
+  await w.rt.store.updateAgentConfig(T, A, { ...config, toolConfig: { mounts: ["state"], harness: "default" } } as never);
+  const moved = (await call(w, "GET", `${A}/seed/manifest`)).body;
+  must(show(moved.toolConfig) === show(s.toolConfig) && moved.manifestSha256 === s.manifestSha256 && moved.manifestSha256 === recompute(moved),
+    `the seal followed the record: ${show(moved)}`);
+});
+
+await check("toolConfig: a named mount whose plugin cannot run on this deployment is 400 naming it, and no agent is made", async () => {
+  const entry = { alias: "asker", plugin: "asker", config: { account: "a" }, secretRef: null, policy: null, for: ["console", "raft"] as const, since: 97 };
+  AgentRuntime.DEFAULT_MOUNTS.push(entry as never);
+  askerOffline = "the asker service is not configured here";
+  try {
+    const w = await bareWorld("1");
+    const r = await provisionPost(w, { mounts: ["asker"] });
+    must(r.status === 400 && /"asker"/.test(r.body?.error?.message ?? "") && /not configured here/.test(r.body?.error?.message ?? ""), `${r.status} ${r.text}`);
+    must(!(await w.rt.store.loadAgent(T, A)), "the refused agent's record was written");
+    askerOffline = null;
+    const ok = await provisionPost(w, { mounts: ["asker"] });
+    must(ok.status === 200 && show(await mountAliases(w)) === show(["asker", "raft"]), `control: ${ok.status} ${ok.text} ${show(await mountAliases(w))}`);
+  } finally {
+    askerOffline = null;
+    AgentRuntime.DEFAULT_MOUNTS.splice(AgentRuntime.DEFAULT_MOUNTS.indexOf(entry as never), 1);
+  }
+});
+
+await check("toolConfig: a catalogue entry that asks questions, added after a minimal agent was made, is refused at reconcile and recorded with its reason", async () => {
+  const w = await minimalWorld({ harness: "minimal" });
+  const before = await mountAliases(w);
+  const entry = { alias: "asker", plugin: "asker", config: { account: "a" }, secretRef: null, policy: null, for: ["console", "raft"] as const, since: 96 };
+  AgentRuntime.DEFAULT_MOUNTS.push(entry as never);
+  try {
+    await w.rt.store.setPluginChoice(T, A, "asker", "enable");
+    const pass = await w.rt.reconcileSeeds(T, A);
+    must(pass.ran === true, `reconcile: ${show(pass)}`);
+    const row = pass.changed.find((c) => c.alias === "asker");
+    must(row?.outcome === "refused" && /harness is "minimal"/.test(row.reason ?? ""), `outcome: ${show(pass.changed)}`);
+    must(show(await mountAliases(w)) === show(before), `mounts moved: ${show(before)} -> ${show(await mountAliases(w))}`);
+    // Control: a default agent is given it by the same pass.
+    const d = await world("1", { post: {} });
+    await d.rt.store.setPluginChoice(T, A, "asker", "enable");
+    await d.rt.reconcileSeeds(T, A);
+    must((await mountAliases(d)).includes("asker"), `control: ${show(await mountAliases(d))}`);
+  } finally { AgentRuntime.DEFAULT_MOUNTS.splice(AgentRuntime.DEFAULT_MOUNTS.indexOf(entry as never), 1); }
+});
+
+await check("toolConfig: an agent whose record names its mounts is never reconciled, even if it was never marked chosen", async () => {
+  const w = await minimalWorld();
+  w.raw.sql.exec("UPDATE seed_reconcile SET chosen=0");
+  const pass = await w.rt.reconcileSeeds(T, A);
+  must(pass.ran === false && (pass as { why: string }).why === "chosen", `reconcile: ${show(pass)}`);
+});
+
+await check("toolConfig: under minimal a held raft send reaches the model as resumable:false with \"Call it again\", no resume offered, and calling again sends it once", async () => {
+  const w = await world("1", { post: { mounts: ["state"], harness: "minimal" } });
+  // The raft list a credential that can send leaves, under this build's basis, so the turn does not re-take it.
+  const raft = w.rt.plugins().find((p) => p.id === "raft")!;
+  await w.rt.store.updateMountToolSnapshot(T, A, "raft", {
+    hash: "snap-send", takenAt: 1_800_000_000_000, basis: raft.toolsBasis,
+    tools: [{ name: "messages_send", summary: "", parameters: {}, sideEffects: "write", idempotency: "native" }], skipped: [],
+  } as never);
+  // Raft stood in for: the first send is held (a newer message arrived), any later one is sent. Every request is kept.
+  const sends: any[] = [];
+  /** A function, as `jobCount`: an assertion would narrow `sends.length` to one literal. */
+  const sendCount = () => sends.length;
+  const real = globalThis.fetch;
+  globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+    const u = String(url);
+    if (init?.method === "POST" && /\/internal\/agent-api\/v2\/send$/.test(new URL(u).pathname)) {
+      const body = JSON.parse(String(init.body));
+      sends.push(body);
+      if (sends.length === 1) {
+        return Response.json({ ok: true, state: "held", newMessageCount: 1, seenUpToSeq: 20, omittedMessageCount: 0, freshnessContextMode: "inline",
+          heldMessages: [{ seq: 20, id: "abcdef12-0000", content: "wait, one more thing", sender_type: "human", sender_name: "tygg", channel_name: "general", channel_type: "channel", timestamp: "2026-09-28T10:00:00Z" }] });
+      }
+      return Response.json({ ok: true, state: "sent", messageId: "m-21", messageSeq: 21 });
+    }
+    return Response.json({ errorCode: "NOT_FOUND" }, { status: 404 });
+  }) as typeof fetch;
+  try {
+    const args = { target: "#general", content: "done", idempotencyKey: "k1" };
+    const callSend = async (i: number, id: string) => {
+      const job = JSON.parse(await asked(w, i)) as { model?: { api?: string; provider?: string } };
+      await w.D.deliverAnswer(T, A, w.jobs[i]!, { role: "assistant", content: [{ type: "toolCall", id, name: "raft__messages_send", arguments: args }],
+        api: job.model?.api ?? "x", provider: job.model?.provider ?? "x", model: "m1", usage: USAGE, stopReason: "toolUse", timestamp: 0 } as never, 5);
+    };
+    await w.rt.postMessage(T, A, "tell #general you are done", "prompt");
+    await settle(w, 1);
+    must(jobCount(w) === 1, `jobs: ${jobCount(w)}`);
+    const offered = (await wireTools(w, 0)).map((t) => t.name);
+    must(offered.includes("raft__messages_send") && !offered.some((n) => HARNESS_OWN.includes(n)), `offered: ${show(offered)}`);
+    await callSend(0, "call-1");
+    await settle(w, 2);
+    must(jobCount(w) === 2 && sendCount() === 1, `after the held send: ${jobCount(w)} jobs, ${sendCount()} sends`);
+    // What the model is shown next: the question, dropped, with the note; and the turn's record says it is not resumable.
+    const second = await asked(w, 1);
+    must(second.includes("Call it again if it still applies") && second.includes("wait, one more thing"), `the model was not shown the dropped question: ${second.slice(-1500)}`);
+    const results = (await (await w.rt.agent(T, A)).branch() as any[]).filter((m) => m?.role === "toolResult" || m?.message?.role === "toolResult");
+    const held = results.map((m) => m.message ?? m).find((m: any) => m.toolCallId === "call-1");
+    must(held?.details?.interrupted === true && held.details.resumable === false, `the held result's details: ${show(held?.details)}`);
+    must(!(await wireTools(w, 1)).some((t) => HARNESS_OWN.includes(t.name)), "resume offered after the question");
+    await callSend(1, "call-2");
+    await settle(w, 3);
+    must(sendCount() === 2, `sends: ${sendCount()}`);
+    must(sends[1].seenUpToSeq === 20 && sends[1].content === "done", `the repeat did not go ahead on what was shown: ${show(sends[1])}`);
+    const repeat = ((await (await w.rt.agent(T, A)).branch()) as any[]).map((m) => m.message ?? m).find((m: any) => m.toolCallId === "call-2");
+    must(repeat && !repeat.details?.interrupted && /"state":"sent"/.test(repeat.content?.[0]?.text ?? "") && (await asked(w, 2)).includes("m-21"),
+      `the repeated call's result: ${show(repeat)}`);
+    await answer(w, 2, "done");
+    await settle(w, 4);
+    must(sendCount() === 2 && jobCount(w) === 3, `after the turn ended: ${sendCount()} sends, ${jobCount(w)} jobs`);
+  } finally { globalThis.fetch = real; }
 });
 
 // ---- audit -----------------------------------------------------------------
