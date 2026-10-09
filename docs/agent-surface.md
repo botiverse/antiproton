@@ -236,11 +236,13 @@ it still applies (`toolQuestion`, `src/runtime/pi-tools.ts`). `raft`'s only ques
 task write when newer messages arrived; the model's own call records those messages as seen before
 asking, so calling again goes ahead (`heldCall`, `src/plugins/raft.ts`; `test/raft-plugin.ts`, "the
 same send again … goes through"). Any other mount whose plugin asks questions is refused under
-`minimal` with `400`, rather than given that changed flow. No default mount asks questions today.
+`minimal` with `400`, rather than given that changed flow; a default mount that comes to ask questions
+later is not added to a `minimal` agent by the catalogue reconcile either (recorded as `refused`, with
+the reason). No default mount asks questions today.
 
 **Recorded, and fixed.** The choice is kept on the agent's record as `toolConfig: { mounts, harness }`
-(`mounts` `null` when not sent, `harness` `"default"` when not sent; no `toolConfig` at all when
-neither was). A later `POST` for the same agent must ask for the same tools: one asking for others —
+(`mounts` `null` when not sent, otherwise sorted, since the list is a set and its order means nothing;
+`harness` `"default"` when not sent; no `toolConfig` at all when neither was). A later `POST` for the same agent must ask for the same tools (in any order): one asking for others —
 including one sending neither field, for an agent made with them, or either field for an agent made
 without — is `409`, `code: "tool_config_conflict"`, and changes nothing. A `PATCH` says nothing about
 tools and keeps them. A different set of tools needs a new agent. `GET …/tools` answers the record's
@@ -290,7 +292,8 @@ that write is refused. `POST …/seed/seal` is idempotent and answers the seal i
 ```
 
 `manifest` is sorted by `path`. `toolConfig` is the agent's [tool choice](#choosing-the-agents-tools),
-`null` for an agent made without one. `manifestSha256` is the SHA-256 of canonical JSON (keys sorted,
+`null` for an agent made without one; once sealed it is the seal's own copy, the one its hash was computed
+over, whatever later happens to the agent's record. `manifestSha256` is the SHA-256 of canonical JSON (keys sorted,
 no spaces: `src/core/canon-json.ts`), so it is the same however it was read: of `manifest` alone when
 `toolConfig` is `null` — every hash recorded before `toolConfig` existed — and of
 `{ "manifest": …, "toolConfig": … }` otherwise, so the hash also pins which tools the agent was given. `how` is `explicit`,

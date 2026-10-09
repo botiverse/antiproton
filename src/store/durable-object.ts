@@ -14,7 +14,7 @@ import {
   type SeedNoticeRow, type SeedPlan,
 } from "./seed-record.ts";
 import {
-  listSeedFiles, readSeal, SEED_FILES_SCHEMA, seedManifestOf, sealSeedFiles, writeSeedFile, type SealHow, type SeedWrite,
+  listSeedFiles, readSeal, SEED_FILES_ALTERS, SEED_FILES_SCHEMA, seedManifestOf, sealSeedFiles, writeSeedFile, type SealHow, type SeedWrite,
 } from "./seed-files.ts";
 
 /**
@@ -146,6 +146,7 @@ export class DurableObjectStore implements StorageAdapter {
       // NOT NULL column the insert no longer fills; drop it, and with it the
       // one plaintext fragment of a value the row ever held.
       "ALTER TABLE secrets DROP COLUMN last4",
+      ...SEED_FILES_ALTERS,
     ]) {
       try { this.#sql.exec(alter); } catch { /* already present */ }
     }

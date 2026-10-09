@@ -9,7 +9,7 @@ import { planBinding } from "../model-request.ts";
 import type { ModelChoice } from "../../../src/model/providers.ts";
 import { PUSH_KEY, PUSH_STORE, raftPlugin } from "../../../src/plugins/raft.ts";
 import type { Fail, ProvisionTool, PushStatus } from "./handlers.ts";
-import { sameToolConfig, toolConfigOf, type ToolConfig } from "../../../src/core/tool-config.ts";
+import { canonicalToolConfig, sameToolConfig, toolConfigOf, type ToolConfig } from "../../../src/core/tool-config.ts";
 import { interruptsOf } from "../../../src/plugins/types.ts";
 
 /** The alias the provisioned mount carries: the plugin's own name, as a person would pick. */
@@ -80,7 +80,8 @@ export async function adoptProvisionedAgent(
       "an agent's tools are fixed when it is made, so a different set needs a new agent";
     return { ok: false, error, refused: { status: 409, code: "tool_config_conflict", message: error } };
   }
-  const toolConfig = spec.toolConfig === undefined ? recorded : spec.toolConfig;
+  // Written canonical whoever called (src/core/tool-config.ts), so the stored form is the compared and hashed one.
+  const toolConfig = spec.toolConfig === undefined ? recorded : spec.toolConfig && canonicalToolConfig(spec.toolConfig);
   const problem = toolConfig ? toolConfigProblem(rt, toolConfig) : null;
   if (problem) return { ok: false, error: problem, refused: { status: 400, code: "invalid", message: problem, param: "mounts" } };
   const avatar = typeof config.avatar === "string" ? config.avatar : spec.avatar;

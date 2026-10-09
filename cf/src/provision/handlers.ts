@@ -27,7 +27,7 @@ import { logEvent } from "../../../src/core/log.ts";
 import { WORKING_SET } from "../../../src/plugins/state.ts";
 import { SEED_MODES, seedPathProblem, seedText, type SeedFileMeta, type SeedMode, type SeedSeal, type SeedWriteResult } from "../../../src/store/seed-files.ts";
 import type { FreshContextResult, RestartResult } from "../runtime.ts";
-import type { ToolConfig } from "../../../src/core/tool-config.ts";
+import { canonicalToolConfig, type ToolConfig } from "../../../src/core/tool-config.ts";
 
 export type ProvisionTool = "enable_push" | "disable_push";
 
@@ -164,7 +164,9 @@ export function toolConfigField(body: unknown, seed: Pick<SeedOps, "mountable"> 
   if (harness !== undefined && harness !== "minimal") {
     return { status: 400, code: "invalid", param: "harness", message: `harness ${JSON.stringify(harness)} is not one this deployment offers; the one value is "minimal" (omit it for the default)` };
   }
-  return { mounts: list, harness: harness === "minimal" ? "minimal" : "default" };
+  // Canonical from here on (sorted): the record, a replay's comparison and the manifest hash all see one form, so the
+  // order a caller listed the mounts in can neither change a sealed agent's published toolConfig nor its hash.
+  return canonicalToolConfig({ mounts: list, harness: harness === "minimal" ? "minimal" : "default" });
 }
 
 export const PROVIDER_AGENT_PREFIX = "raft_";

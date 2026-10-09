@@ -61,8 +61,18 @@ export const SEED_FILES_SCHEMA = [
      PRIMARY KEY (tenant_id, agent_id, path))`,
   `CREATE TABLE IF NOT EXISTS seed_seal (
      tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL, sealed_at INTEGER NOT NULL, how TEXT NOT NULL,
-     manifest_sha256 TEXT NOT NULL, manifest TEXT NOT NULL,
+     manifest_sha256 TEXT NOT NULL, manifest TEXT NOT NULL, tool_config TEXT,
      PRIMARY KEY (tenant_id, agent_id))`,
+];
+
+/**
+ * Columns added to the tables above after they first shipped, for a store to try once each at init (an existing
+ * table never gets them from CREATE TABLE IF NOT EXISTS). `seed_seal.tool_config` is the seal's own copy of the
+ * agent's `toolConfig`; a row sealed before it existed has NULL, which is right for it: no agent had a `toolConfig`
+ * then, so its hash was of the files alone.
+ */
+export const SEED_FILES_ALTERS = [
+  "ALTER TABLE seed_seal ADD COLUMN tool_config TEXT",
 ];
 
 /**
@@ -141,13 +151,13 @@ export function seedSnapshot(sql: Sql, tenantId: string, agentId: string, path: 
 }
 
 export function readSeal(sql: Sql, tenantId: string, agentId: string): SeedSeal | null {
-  const r = sql.exec("SELECT sealed_at, how, manifest_sha256, manifest FROM seed_seal WHERE tenant_id=? AND agent_id=?",
+  const r = sql.exec("SELECT sealed_at, how, manifest_sha256, manifest, tool_config FROM seed_seal WHERE tenant_id=? AND agent_id=?",
     tenantId, agentId).toArray()[0];
-  // `toolConfig` is the record's: it is fixed once the agent is provisioned (a re-provision asking for another is
-  // refused, cf/src/provision/steps.ts), so it is the one the stored hash was computed with.
+  // `toolConfig` is the seal's own copy, written with the hash (`sealSeedFiles`), never the live record's: whatever
+  // later becomes of the record, the seal reports what its hash was computed over, so it can always be recomputed.
   return r ? {
     sealedAt: Number(r.sealed_at), how: String(r.how) as SealHow, manifestSha256: String(r.manifest_sha256), manifest: JSON.parse(String(r.manifest)),
-    toolConfig: readToolConfig(sql, tenantId, agentId),
+    toolConfig: r.tool_config == null ? null : toolConfigOf({ toolConfig: JSON.parse(String(r.tool_config)) }),
   } : null;
 }
 
@@ -161,8 +171,8 @@ export function sealSeedFiles(sql: Sql, tenantId: string, agentId: string, how: 
   const manifest = listSeedFiles(sql, tenantId, agentId);
   const toolConfig = readToolConfig(sql, tenantId, agentId);
   const seal: SeedSeal = { sealedAt: now, how, manifestSha256: manifestSha256(manifest, toolConfig), manifest, toolConfig };
-  sql.exec("INSERT INTO seed_seal(tenant_id, agent_id, sealed_at, how, manifest_sha256, manifest) VALUES (?,?,?,?,?,?)",
-    tenantId, agentId, now, how, seal.manifestSha256, JSON.stringify(manifest));
+  sql.exec("INSERT INTO seed_seal(tenant_id, agent_id, sealed_at, how, manifest_sha256, manifest, tool_config) VALUES (?,?,?,?,?,?,?)",
+    tenantId, agentId, now, how, seal.manifestSha256, JSON.stringify(manifest), toolConfig === null ? null : JSON.stringify(toolConfig));
   return { seal, sealedNow: true };
 }
 

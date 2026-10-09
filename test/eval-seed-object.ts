@@ -65,6 +65,9 @@ const asker: Plugin = {
   async invoke() { return {}; },
   interrupts: { async resume() { return { done: true }; } },
 };
+/** Why `asker` cannot run on this deployment, or null: what a plugin's `unavailable()` says, set by the case that needs it. */
+let askerOffline: string | null = null;
+asker.unavailable = () => askerOffline;
 
 /** D1 as node:sqlite, with every migration in cf/migrations applied (test/agents-api-model.ts). */
 function d1() {
@@ -923,6 +926,142 @@ await check("toolConfig: the seed manifest and the seal carry it, and manifestSh
   must(show(s.toolConfig) === show(tc) && s.manifestSha256 === m.manifestSha256, `seal: ${show(s)}`);
   const after = (await call(w, "GET", `${A}/seed/manifest`)).body;
   must(after.sealed === true && show(after.toolConfig) === show(tc) && after.manifestSha256 === m.manifestSha256, `sealed manifest: ${show(after)}`);
+});
+
+await check("toolConfig: mounts are kept sorted, so the same mounts in either order are one agent: same record, same hash", async () => {
+  const a = await world("1", { post: { mounts: ["state", "web"] } });
+  const b = await world("1", { post: { mounts: ["web", "state"] } });
+  for (const w of [a, b]) {
+    must(show(toolConfigOfRecord(await w.rt.store.loadAgent(T, A))) === show({ mounts: ["state", "web"], harness: "default" }), `record: ${show(toolConfigOfRecord(await w.rt.store.loadAgent(T, A)))}`);
+    must((await seed(w, "MEMORY.md", "hello")).status === 200, "seed");
+  }
+  const [ma, mb] = [(await call(a, "GET", `${A}/seed/manifest`)).body, (await call(b, "GET", `${A}/seed/manifest`)).body];
+  must(ma.manifestSha256 === mb.manifestSha256 && show(ma.toolConfig) === show(mb.toolConfig), `by order: ${show([ma.toolConfig, mb.toolConfig])} ${ma.manifestSha256} ${mb.manifestSha256}`);
+});
+
+await check("toolConfig: after the seal a re-POST in another order is 200 and changes nothing; the seal reports its own copy, recomputable, whatever the record later says", async () => {
+  const w = await world("1", { post: { mounts: ["state", "web"], harness: "minimal" } });
+  must((await seed(w, "MEMORY.md", "hello")).status === 200, "seed");
+  const s = (await call(w, "POST", `${A}/seed/seal`)).body;
+  const recompute = (m: any) => sha256Hex(canonJson({ manifest: m.manifest, toolConfig: m.toolConfig }));
+  must(s.manifestSha256 === recompute(s), `the seal's hash is not its own manifest and toolConfig's: ${show(s)}`);
+  const r = await provisionPost(w, { mounts: ["web", "state"], harness: "minimal" });
+  must(r.status === 200, `reordered replay: ${r.status} ${r.text}`);
+  const after = (await call(w, "GET", `${A}/seed/manifest`)).body;
+  must(after.sealed === true && show(after.toolConfig) === show(s.toolConfig) && after.manifestSha256 === s.manifestSha256, `after the replay: ${show(after)} vs ${show(s)}`);
+  must(after.manifestSha256 === recompute(after), "the published manifest no longer recomputes to its hash");
+  // The record moved by a path no route offers: the seal still reports what it closed on.
+  const config = (await w.rt.store.loadAgent(T, A))!.config as Record<string, unknown>;
+  await w.rt.store.updateAgentConfig(T, A, { ...config, toolConfig: { mounts: ["state"], harness: "default" } } as never);
+  const moved = (await call(w, "GET", `${A}/seed/manifest`)).body;
+  must(show(moved.toolConfig) === show(s.toolConfig) && moved.manifestSha256 === s.manifestSha256 && moved.manifestSha256 === recompute(moved),
+    `the seal followed the record: ${show(moved)}`);
+});
+
+await check("toolConfig: a named mount whose plugin cannot run on this deployment is 400 naming it, and no agent is made", async () => {
+  const entry = { alias: "asker", plugin: "asker", config: { account: "a" }, secretRef: null, policy: null, for: ["console", "raft"] as const, since: 97 };
+  AgentRuntime.DEFAULT_MOUNTS.push(entry as never);
+  askerOffline = "the asker service is not configured here";
+  try {
+    const w = await bareWorld("1");
+    const r = await provisionPost(w, { mounts: ["asker"] });
+    must(r.status === 400 && /"asker"/.test(r.body?.error?.message ?? "") && /not configured here/.test(r.body?.error?.message ?? ""), `${r.status} ${r.text}`);
+    must(!(await w.rt.store.loadAgent(T, A)), "the refused agent's record was written");
+    askerOffline = null;
+    const ok = await provisionPost(w, { mounts: ["asker"] });
+    must(ok.status === 200 && show(await mountAliases(w)) === show(["asker", "raft"]), `control: ${ok.status} ${ok.text} ${show(await mountAliases(w))}`);
+  } finally {
+    askerOffline = null;
+    AgentRuntime.DEFAULT_MOUNTS.splice(AgentRuntime.DEFAULT_MOUNTS.indexOf(entry as never), 1);
+  }
+});
+
+await check("toolConfig: a catalogue entry that asks questions, added after a minimal agent was made, is refused at reconcile and recorded with its reason", async () => {
+  const w = await minimalWorld({ harness: "minimal" });
+  const before = await mountAliases(w);
+  const entry = { alias: "asker", plugin: "asker", config: { account: "a" }, secretRef: null, policy: null, for: ["console", "raft"] as const, since: 96 };
+  AgentRuntime.DEFAULT_MOUNTS.push(entry as never);
+  try {
+    await w.rt.store.setPluginChoice(T, A, "asker", "enable");
+    const pass = await w.rt.reconcileSeeds(T, A);
+    must(pass.ran === true, `reconcile: ${show(pass)}`);
+    const row = pass.changed.find((c) => c.alias === "asker");
+    must(row?.outcome === "refused" && /harness is "minimal"/.test(row.reason ?? ""), `outcome: ${show(pass.changed)}`);
+    must(show(await mountAliases(w)) === show(before), `mounts moved: ${show(before)} -> ${show(await mountAliases(w))}`);
+    // Control: a default agent is given it by the same pass.
+    const d = await world("1", { post: {} });
+    await d.rt.store.setPluginChoice(T, A, "asker", "enable");
+    await d.rt.reconcileSeeds(T, A);
+    must((await mountAliases(d)).includes("asker"), `control: ${show(await mountAliases(d))}`);
+  } finally { AgentRuntime.DEFAULT_MOUNTS.splice(AgentRuntime.DEFAULT_MOUNTS.indexOf(entry as never), 1); }
+});
+
+await check("toolConfig: an agent whose record names its mounts is never reconciled, even if it was never marked chosen", async () => {
+  const w = await minimalWorld();
+  w.raw.sql.exec("UPDATE seed_reconcile SET chosen=0");
+  const pass = await w.rt.reconcileSeeds(T, A);
+  must(pass.ran === false && (pass as { why: string }).why === "chosen", `reconcile: ${show(pass)}`);
+});
+
+await check("toolConfig: under minimal a held raft send reaches the model as resumable:false with \"Call it again\", no resume offered, and calling again sends it once", async () => {
+  const w = await world("1", { post: { mounts: ["state"], harness: "minimal" } });
+  // The raft list a credential that can send leaves, under this build's basis, so the turn does not re-take it.
+  const raft = w.rt.plugins().find((p) => p.id === "raft")!;
+  await w.rt.store.updateMountToolSnapshot(T, A, "raft", {
+    hash: "snap-send", takenAt: 1_800_000_000_000, basis: raft.toolsBasis,
+    tools: [{ name: "messages_send", summary: "", parameters: {}, sideEffects: "write", idempotency: "native" }], skipped: [],
+  } as never);
+  // Raft stood in for: the first send is held (a newer message arrived), any later one is sent. Every request is kept.
+  const sends: any[] = [];
+  /** A function, as `jobCount`: an assertion would narrow `sends.length` to one literal. */
+  const sendCount = () => sends.length;
+  const real = globalThis.fetch;
+  globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+    const u = String(url);
+    if (init?.method === "POST" && /\/internal\/agent-api\/v2\/send$/.test(new URL(u).pathname)) {
+      const body = JSON.parse(String(init.body));
+      sends.push(body);
+      if (sends.length === 1) {
+        return Response.json({ ok: true, state: "held", newMessageCount: 1, seenUpToSeq: 20, omittedMessageCount: 0, freshnessContextMode: "inline",
+          heldMessages: [{ seq: 20, id: "abcdef12-0000", content: "wait, one more thing", sender_type: "human", sender_name: "tygg", channel_name: "general", channel_type: "channel", timestamp: "2026-09-28T10:00:00Z" }] });
+      }
+      return Response.json({ ok: true, state: "sent", messageId: "m-21", messageSeq: 21 });
+    }
+    return Response.json({ errorCode: "NOT_FOUND" }, { status: 404 });
+  }) as typeof fetch;
+  try {
+    const args = { target: "#general", content: "done", idempotencyKey: "k1" };
+    const callSend = async (i: number, id: string) => {
+      const job = JSON.parse(await asked(w, i)) as { model?: { api?: string; provider?: string } };
+      await w.D.deliverAnswer(T, A, w.jobs[i]!, { role: "assistant", content: [{ type: "toolCall", id, name: "raft__messages_send", arguments: args }],
+        api: job.model?.api ?? "x", provider: job.model?.provider ?? "x", model: "m1", usage: USAGE, stopReason: "toolUse", timestamp: 0 } as never, 5);
+    };
+    await w.rt.postMessage(T, A, "tell #general you are done", "prompt");
+    await settle(w, 1);
+    must(jobCount(w) === 1, `jobs: ${jobCount(w)}`);
+    const offered = (await wireTools(w, 0)).map((t) => t.name);
+    must(offered.includes("raft__messages_send") && !offered.some((n) => HARNESS_OWN.includes(n)), `offered: ${show(offered)}`);
+    await callSend(0, "call-1");
+    await settle(w, 2);
+    must(jobCount(w) === 2 && sendCount() === 1, `after the held send: ${jobCount(w)} jobs, ${sendCount()} sends`);
+    // What the model is shown next: the question, dropped, with the note; and the turn's record says it is not resumable.
+    const second = await asked(w, 1);
+    must(second.includes("Call it again if it still applies") && second.includes("wait, one more thing"), `the model was not shown the dropped question: ${second.slice(-1500)}`);
+    const results = (await (await w.rt.agent(T, A)).branch() as any[]).filter((m) => m?.role === "toolResult" || m?.message?.role === "toolResult");
+    const held = results.map((m) => m.message ?? m).find((m: any) => m.toolCallId === "call-1");
+    must(held?.details?.interrupted === true && held.details.resumable === false, `the held result's details: ${show(held?.details)}`);
+    must(!(await wireTools(w, 1)).some((t) => HARNESS_OWN.includes(t.name)), "resume offered after the question");
+    await callSend(1, "call-2");
+    await settle(w, 3);
+    must(sendCount() === 2, `sends: ${sendCount()}`);
+    must(sends[1].seenUpToSeq === 20 && sends[1].content === "done", `the repeat did not go ahead on what was shown: ${show(sends[1])}`);
+    const repeat = ((await (await w.rt.agent(T, A)).branch()) as any[]).map((m) => m.message ?? m).find((m: any) => m.toolCallId === "call-2");
+    must(repeat && !repeat.details?.interrupted && /"state":"sent"/.test(repeat.content?.[0]?.text ?? "") && (await asked(w, 2)).includes("m-21"),
+      `the repeated call's result: ${show(repeat)}`);
+    await answer(w, 2, "done");
+    await settle(w, 4);
+    must(sendCount() === 2 && jobCount(w) === 3, `after the turn ended: ${sendCount()} sends, ${jobCount(w)} jobs`);
+  } finally { globalThis.fetch = real; }
 });
 
 // ---- audit -----------------------------------------------------------------

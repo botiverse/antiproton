@@ -2070,6 +2070,12 @@ export class AgentRuntime {
     if (!record) return { ran: false, why: "no agent" };
     const kind = agentKind(record.config);
     if (kind === "api") return { ran: false, why: "api" };
+    // An evaluation's own mount list (src/core/tool-config.ts) is a choice like `chosen`, read from the record too:
+    // provisioning writes the record before it marks the agent, and an agent left between the two (a crash) must
+    // still never be given the catalogue.
+    const toolConfig = toolConfigOf(record.config);
+    if (toolConfig?.mounts) return { ran: false, why: "chosen" };
+    const minimal = toolConfig?.harness === "minimal";
     const choices = await this.store.pluginChoices(tenantId, agentId);
     const byId = new Map(this.#plugins.map((p) => [p.id, p]));
     const unavailable = new Map<string, string>();
@@ -2092,6 +2098,11 @@ export class AgentRuntime {
       // would have reached, and said in the record, rather than becoming the plugin's silent default everywhere.
       const problems = plugin ? validateMount(plugin, config, m.secretRef ?? null) : [];
       if (problems.length) return { ...entry, withheld: "refused", reason: problems.map((x) => x.message).join("; ") };
+      // Under `minimal` there is no resume, so a plugin's question would be dropped (cf/src/provision/steps.ts
+      // `toolConfigProblem` refuses one when the agent is made; this is the same rule for an entry added later).
+      if (minimal && plugin && interruptsOf(plugin)) {
+        return { ...entry, withheld: "refused", reason: `${m.plugin} asks the model questions, which need resume, and this agent's harness is "minimal"` };
+      }
       return {
         ...entry,
         mount: {
