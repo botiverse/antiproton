@@ -2048,6 +2048,12 @@ export class AgentDO extends DurableObject<Env> {
     return this.runtime().modelInput(tenantId, agentId, session, call);
   }
 
+  /** The tools the next turn offers (`AgentRuntime.offeredTools`): a read, so not serialized behind `#busy`. */
+  async offeredTools(tenantId: string, agentId: string) {
+    if (!this.#isAgent(tenantId, agentId)) return null;
+    return this.runtime().offeredTools(tenantId, agentId);
+  }
+
   /** The raft mount's push state, read from the store: no tool call, no trace, no usage. */
   async provisionPushStatus(tenantId: string, agentId: string) {
     this.#claim(tenantId, agentId);
@@ -3396,6 +3402,7 @@ function provisionDeps(env: Env): ProvisionDeps {
         freshContext: (tenantId, agentId) => stub(tenantId, agentId).freshContext(tenantId, agentId),
         restart: (tenantId, agentId) => stub(tenantId, agentId).restart(tenantId, agentId),
         modelInput: (tenantId, agentId, session, call) => stub(tenantId, agentId).modelInput(tenantId, agentId, session, call),
+        tools: (tenantId, agentId) => stub(tenantId, agentId).offeredTools(tenantId, agentId),
       },
     } : {}),
     agent: {

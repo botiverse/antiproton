@@ -113,6 +113,8 @@ export interface SeedOps {
   freshContext(tenantId: string, agentId: string): Promise<FreshContextResult>;
   restart(tenantId: string, agentId: string): Promise<RestartResult>;
   modelInput(tenantId: string, agentId: string, session: string | null, call: number | null): Promise<unknown | null>;
+  /** The tools the agent's next turn offers the model, read without retaking or writing anything. */
+  tools(tenantId: string, agentId: string): Promise<unknown | null>;
 }
 
 export const PROVIDER_AGENT_PREFIX = "raft_";
@@ -556,11 +558,12 @@ async function disconnect(tenantId: string, connectorId: string, body: unknown, 
 }
 
 /** The setup routes, after the agent's id. */
-const EVAL_ROUTES = new Set(["seed", "seed/seal", "seed/manifest", "fresh-context", "restart", "model-input"]);
+const EVAL_ROUTES = new Set(["seed", "seed/seal", "seed/manifest", "fresh-context", "restart", "model-input", "tools"]);
 
 /**
  * An evaluation's setup (EVAL_SEED_ROUTES): files put in the agent's workspace before it first runs, the seal that
- * ends that window, a fresh main conversation or an ordinary restart of the same one, and what the model was sent. The rules of a file are src/store/seed-files.ts's; the one checked only here is the credential
+ * ends that window, a fresh main conversation or an ordinary restart of the same one, what the model was sent, and the
+ * tools its next turn is offered. The rules of a file are src/store/seed-files.ts's; the one checked only here is the credential
  * shape, which lives with the Worker (cf/src/secret-shape.ts). Each change leaves one log line naming the token it
  * came by (its hash, the name the operator's listing gives it), never the token or a file's text.
  */
@@ -632,6 +635,11 @@ async function evalSetup(
     const r = await seed.modelInput(tenantId, agentId, session, call);
     if (!r) return fail({ status: 404, code: "not_found", message: session === null ? `no agent ${agentId}` : `no recorded call ${call ?? 1} of session ${session}` });
     return ok(r);
+  }
+  // What the next turn offers the model, as its harness would be built now (cf/src/runtime.ts `offeredTools`).
+  if (route === "tools" && method === "GET") {
+    const r = await seed.tools(tenantId, agentId);
+    return r ? ok(r) : gone();
   }
   return null;
 }

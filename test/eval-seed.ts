@@ -65,6 +65,7 @@ function fakeDeps(opts: { seed?: boolean; answer?: Awaited<ReturnType<SeedOps["w
     freshContext: async (...args) => { calls.push({ op: "fresh", args }); return { ok: true, oldSessionId: "main", newSessionId: "main.1" }; },
     restart: async (...args) => { calls.push({ op: "restart", args }); return { ok: true, sessionId: "main", restartedAt: t }; },
     modelInput: async (...args) => { calls.push({ op: "modelInput", args }); return { sessionId: "main", call: 1 }; },
+    tools: async (...args) => { calls.push({ op: "tools", args }); return { agentId: args[1], tools: [], mounts: [] }; },
   };
   const deps: ProvisionDeps = {
     now: () => t, registry,
@@ -88,6 +89,7 @@ async function call(deps: ProvisionDeps, method: string, path: string, opts: { b
 const ROUTES: Array<[string, string]> = [
   ["PUT", `/agents/${AGENT}/seed?path=MEMORY.md`], ["POST", `/agents/${AGENT}/seed/seal`], ["GET", `/agents/${AGENT}/seed/manifest`],
   ["POST", `/agents/${AGENT}/fresh-context`], ["POST", `/agents/${AGENT}/restart`], ["GET", `/agents/${AGENT}/model-input?session=main&call=1`],
+  ["GET", `/agents/${AGENT}/tools`],
 ];
 
 await check("no seed deps (EVAL_SEED_ROUTES unset): every setup route falls through to the unknown-route answer", async () => {

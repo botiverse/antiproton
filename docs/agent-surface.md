@@ -187,7 +187,7 @@ The same three reads for an agent a Raft server provisioned, with the provider t
 ## Evaluation setup (preview only)
 
 Routes for an evaluator to give an agent its workspace before the agent first runs, start it on a
-fresh conversation, and read back what its model was sent. They are served only where the deployment
+fresh conversation, read back what its model was sent, and read the tools its next turn is offered. They are served only where the deployment
 sets `EVAL_SEED_ROUTES` to `"1"` — `cf/wrangler.preview.jsonc`, never `cf/wrangler.jsonc`
 (`test/eval-seed.ts` fails if production sets it). Anywhere else every one of them is `404`, as an
 unknown route is. Authentication, tenant and which agents are as for the reads above: the provider
@@ -202,6 +202,7 @@ for an agent that is not a live provisioned agent of the tenant.
 | `POST` | `/provision/agents/{agentId}/fresh-context` | start a new main conversation |
 | `POST` | `/provision/agents/{agentId}/restart` | restart the agent, keeping its conversation |
 | `GET` | `/provision/agents/{agentId}/model-input?session=&call=` | what one model call was sent |
+| `GET` | `/provision/agents/{agentId}/tools` | the tools the next turn offers the model |
 
 ### Seeded files
 
@@ -291,6 +292,45 @@ one no transcript holds. `summaryBlock` says whether a compaction or branch summ
 provided at setup" block; a mere mention does not count). Without `session`, the answer lists the main
 conversations: `{ current, sessions: [{ sessionId, generation, current, startedAt, endedAt, calls }] }`.
 Only calls of the `pi085` engine are recorded; `404` when there is no such record.
+
+### Tools
+
+`GET …/tools` answers the tools the agent's next turn offers its model, in the order its model request
+lists them, read without changing anything: no snapshot is re-taken, no turn starts, nothing is sealed
+and no row is written. It is built by the step that builds a turn's harness (`#turnTools` and
+`harnessTools`, `cf/src/runtime.ts` and `src/runtime/pi-tools.ts`), so it is that list rather than a
+second derivation of it; `test/eval-seed-object.ts` compares it with what a real turn's model request
+carries.
+
+```json
+{ "agentId": "raft_…", "asOf": "2026-10-09T09:00:00.000Z", "engine": "pi085", "retakePending": false,
+  "tools": [{ "name": "raft__inbox_list", "description": "…", "parameters": { "type": "object" },
+              "source": "mount", "alias": "raft", "plugin": "raft", "tool": "inbox_list",
+              "sideEffects": "read", "idempotency": "native", "replay": "never" }],
+  "mounts": [{ "alias": "raft", "plugin": "raft", "toolVersion": "1.0.0", "offered": true,
+               "tools": ["raft__inbox_list"], "withheld": [],
+               "snapshot": { "takenAt": "…", "hash": "…", "basis": "raft-tools:…", "tools": ["inbox_list"],
+                             "skipped": [{ "name": "messages_read", "reason": "…" }] },
+               "basis": "raft-tools:…", "retake": null, "snapshotError": null }] }
+```
+
+Each tool's `name`, `description` and `parameters` are exactly what the model is sent: the name as
+offered (`<alias>__<tool>`, as the harness names it, `offeredToolName`), the description with
+whatever the harness appends. `source` is `mount` for a mount's tool, `harness` for the harness's own
+(`run_js`, `resume`, `jobs`) and `caller` for an Agents API caller's function; a mount's tool also
+carries `alias`, `plugin`, `tool` (its name in the plugin), `sideEffects`, `idempotency`, `replay`
+(whether the harness may run it again after an interruption: `safe` or `never`), and `modelOnly`,
+`reads` and `exclusive` where they are set.
+
+`mounts` lists every mount the agent has, offered or not: `offered: false` with `notOffered`
+(`switched_off`, or `plugin_unavailable`) for one whose tools the model is not offered; `withheld`,
+the tools this deployment withholds; `snapshot`, the tool list the mount was last listed with (`null`
+for a plugin that does not list its tools, or a mount never listed), with what its plugin left out and
+why in `skipped`; `basis`, the plugin's current basis. A turn's start re-takes a snapshot whose basis
+is not its plugin's: until then `retake` is `due` and `retakePending` is true, and the next turn may
+offer a different list if the re-take finds different tools. `backed_off` is a re-take that failed
+recently and is not asked again yet (`snapshotError` says why); the list above is then the one
+offered. A mount's config and credential are never included.
 
 ### Audit
 

@@ -19,6 +19,7 @@ import { readTranscript } from "../cf/src/transcript-read.ts";
 import { canonJson } from "../src/core/canon-json.ts";
 import { seedSnapshot, sha256Hex } from "../src/store/seed-files.ts";
 import { ensureClientCalls } from "../src/runtime/client-calls.ts";
+import { callQueuedModel } from "../cf/src/model-request.ts";
 
 const STAND_IN = "export class DurableObject { constructor(ctx, env) { this.ctx = ctx; this.env = env; } }" +
   " export class WorkerEntrypoint { constructor(ctx, env) { this.ctx = ctx; this.env = env; } }" +
@@ -93,10 +94,10 @@ function bucket() {
 
 /**
  * One provisioned agent of tenant T in its object, the Worker in front of it, a hook on its `pushy` mount and a
- * `state` mount, and two provider tokens: T's and another tenant's. `flag` is EVAL_SEED_ROUTES as the deployment sets it,
+ * `state` mount (with `raft`, the mounts Raft's adopt makes instead, beside the same two), and two provider tokens: T's and another tenant's. `flag` is EVAL_SEED_ROUTES as the deployment sets it,
  * null for not at all.
  */
-async function world(flag: string | null = "1") {
+async function world(flag: string | null = "1", opts: { raft?: boolean } = {}) {
   clearHookRoutes();
   const DB = d1();
   const raw = sqliteHost();
@@ -123,13 +124,18 @@ async function world(flag: string | null = "1") {
   };
   const D = new TestDO(ctx as never, env as never);
   objects.set(agentObjectName(T, A), D);
-  await D.uiAdoptAgent(T, A, { name: "n", description: "d", avatar: "x" });
+  // A Raft-provisioned agent is made the way Raft makes one (`provisionAdopt`: the default mounts, then a raft mount).
+  if (opts.raft) {
+    const adopted = await D.provisionAdopt(T, A, JSON.stringify({ name: "n", instructions: "be brief", raftOrigin: "https://raft.example" }));
+    must(adopted.ok, `adopt: ${JSON.stringify(adopted)}`);
+  } else await D.uiAdoptAgent(T, A, { name: "n", description: "d", avatar: "x" });
   const rt = D.runtime();
   await rt.ready();
   await rt.bindOperatorModel(T, A);
   await rt.store.setPluginChoice(T, A, "pushy", "enable");
   await rt.store.markSeedsChosen(T, A);
-  for (const [alias, plugin] of [["p", "pushy"], ["state", "state"]] as const) {
+  // Adopt has made `state` already.
+  for (const [alias, plugin] of opts.raft ? [["p", "pushy"]] as const : [["p", "pushy"], ["state", "state"]] as const) {
     await rt.store.addMount({ tenantId: T, agentId: A, alias, plugin, installationId: `i-${alias}`, connectionId: null,
       toolVersion: "1.0.0", publicConfig: {}, secretRef: null, policy: null });
   }
@@ -195,7 +201,7 @@ await check("without EVAL_SEED_ROUTES = \"1\" every setup route is 404 as an unk
   for (const flag of [null, "0", "true", " 1"]) {
     const w = await world(flag);
     for (const [method, path, body] of [["PUT", `${A}/seed?path=MEMORY.md`, "x"], ["POST", `${A}/seed/seal`, undefined],
-      ["GET", `${A}/seed/manifest`, undefined], ["POST", `${A}/fresh-context`, undefined], ["POST", `${A}/restart`, undefined], ["GET", `${A}/model-input`, undefined]] as const) {
+      ["GET", `${A}/seed/manifest`, undefined], ["POST", `${A}/fresh-context`, undefined], ["POST", `${A}/restart`, undefined], ["GET", `${A}/model-input`, undefined], ["GET", `${A}/tools`, undefined]] as const) {
       const r = await call(w, method, path, { ...(body === undefined ? {} : { body }) });
       must(r.status === 404 && r.body?.error?.code === "not_found" && /raft-agent-provider\.v1/.test(r.body.error.message), `${flag} ${method} ${path}: ${r.status} ${r.text}`);
     }
@@ -486,6 +492,132 @@ await check("restart keeps the conversation: the next call after it carries the 
   await w.rt.postMessage(T, A, "after the fresh context", "prompt");
   await settle(w, 3);
   must(jobCount(w) === 3 && !(await asked(w, 2)).includes(OLD), "the fresh context kept the conversation");
+});
+
+// ---- the tool export -------------------------------------------------------
+
+/** Every table's every row, so "nothing was written" is a comparison rather than a list of places someone thought of. */
+function everything(sql: { exec(q: string): { toArray(): any[] } }): string {
+  const out: Record<string, unknown[]> = {};
+  for (const t of tableNames(sql)) out[t] = sql.exec(`SELECT * FROM "${t}"`).toArray().map((r) => ({ ...r }));
+  return show(out);
+}
+
+/** The tools the model request for job `i` sends, as they leave for the provider: the real consumer with `fetch` replaced. */
+async function wireTools(w: World, i: number): Promise<Array<{ name: string; description: string; parameters: unknown }>> {
+  const job = JSON.parse(await asked(w, i));
+  const real = globalThis.fetch;
+  const bodies: string[] = [];
+  globalThis.fetch = (async (_u: unknown, init?: RequestInit) => {
+    bodies.push(String(init?.body));
+    return new Response(JSON.stringify({ choices: [{ finish_reason: "stop", message: { content: "ok" } }], usage: { prompt_tokens: 1, completion_tokens: 1 } }),
+      { status: 200, headers: { "content-type": "application/json" } });
+  }) as typeof fetch;
+  try { await callQueuedModel(w.env as never, job, w.jobs[i]!); } finally { globalThis.fetch = real; }
+  must(bodies.length === 1, `requests: ${bodies.length}`);
+  return (JSON.parse(bodies[0]!).tools ?? []).map((t: any) => ({ name: t.function.name, description: t.function.description, parameters: t.function.parameters }));
+}
+const shape = (tools: Array<{ name: string; description: string; parameters: unknown }>) =>
+  tools.map((t) => ({ name: t.name, description: t.description, parameters: t.parameters }));
+
+/**
+ * The raft mount's list as a credential that holds two capabilities' worth would leave it: a snapshot under this build's
+ * basis, so a turn's start does not re-take it, naming two generated tools and skipping a third with a reason.
+ */
+async function raftSnapshot(w: World, basis?: string) {
+  const raft = w.rt.plugins().find((p) => p.id === "raft")!;
+  const own = new Set(raft.mountTools!({ toolSnapshot: { hash: "h", tools: [], skipped: [], takenAt: 0 } } as never).map((t) => t.name));
+  const generated = raft.tools.filter((t) => !own.has(t.name)).map((t) => t.name);
+  must(generated.length >= 3, `generated raft tools: ${generated.length}`);
+  await w.rt.store.updateMountToolSnapshot(T, A, "raft", {
+    hash: "snap-1", takenAt: 1_800_000_000_000, basis: basis ?? raft.toolsBasis,
+    tools: generated.slice(0, 2).map((name) => ({ name, summary: "", parameters: {}, sideEffects: "read", idempotency: "native" })),
+    skipped: [{ name: generated[2]!, reason: "the credential lacks the capability it needs" }],
+  } as never);
+  return { kept: generated.slice(0, 2), skipped: generated[2]!, basis: raft.toolsBasis! };
+}
+
+await check("tools: another tenant's token and an unknown agent are 404, no token is 401, this tenant's token answers", async () => {
+  const w = await world();
+  const other = await call(w, "GET", `${A}/tools`, { auth: w.other });
+  must(other.status === 404 && other.body?.error?.code === "not_found", `another tenant: ${other.status} ${other.text}`);
+  must(!other.text.includes('"tools"'), "another tenant's answer carries a tool list");
+  must((await call(w, "GET", `raft_nobody/tools`)).status === 404, "an unknown agent");
+  must((await call(w, "GET", `${A}/tools`, { auth: null })).status === 401, "no credential");
+  must((await call(w, "POST", `${A}/tools`)).status !== 200, "POST is not the route");
+  const ok = await call(w, "GET", `${A}/tools`);
+  must(ok.status === 200 && ok.body.agentId === A && Array.isArray(ok.body.tools) && ok.body.tools.length > 0, `control: ${ok.status} ${ok.text.slice(0, 300)}`);
+});
+
+await check("tools: a Raft-provisioned agent's export is exactly what its next turn's model request carries, state and raft tools included, in order", async () => {
+  const w = await world("1", { raft: true });
+  const snap = await raftSnapshot(w);
+  const before = await call(w, "GET", `by-raft-agent/01JEVAL/tools`);
+  must(before.status === 200, `${before.status} ${before.text.slice(0, 300)}`);
+  const ex = before.body;
+  must(typeof ex.asOf === "string" && !Number.isNaN(Date.parse(ex.asOf)) && ex.retakePending === false, `asOf/retake: ${show({ asOf: ex.asOf, retakePending: ex.retakePending })}`);
+  await w.rt.postMessage(T, A, "a real turn", "prompt");
+  await settle(w, 1);
+  must(jobCount(w) === 1, `jobs: ${jobCount(w)}`);
+  const wire = await wireTools(w, 0);
+  must(wire.length > 0, "the model request carries no tools");
+  must(show(shape(ex.tools)) === show(wire),
+    `export and request differ:\n export  ${show(ex.tools.map((t: any) => t.name))}\n request ${show(wire.map((t) => t.name))}`);
+  // What the comparison covers: both mounts this is about, and the harness's own.
+  const byAlias = (alias: string) => ex.tools.filter((t: any) => t.alias === alias);
+  must(byAlias("state").length > 0 && byAlias("state").every((t: any) => t.plugin === "state" && t.name.startsWith("state__")), `state: ${show(byAlias("state").map((t: any) => t.name))}`);
+  const raftNames = byAlias("raft").map((t: any) => t.tool);
+  must(snap.kept.every((n) => raftNames.includes(n)) && !raftNames.includes(snap.skipped), `raft: ${show(raftNames)}`);
+  must(byAlias("raft").every((t: any) => t.plugin === "raft" && t.source === "mount" && typeof t.sideEffects === "string" && (t.replay === "never" || t.replay === "safe")), "raft flags");
+  must(ex.tools.some((t: any) => t.name === "run_js" && t.source === "harness" && t.alias === null), "run_js is not listed as the harness's");
+  must(ex.tools.some((t: any) => t.modelOnly === true), "no model-only tool is marked (raft's receive_events is one)");
+  const raftMount = ex.mounts.find((m: any) => m.alias === "raft");
+  must(raftMount.offered === true && raftMount.snapshot.basis === snap.basis && raftMount.basis === snap.basis && raftMount.retake === null, `raft mount: ${show(raftMount)}`);
+  must(raftMount.snapshot.takenAt === new Date(1_800_000_000_000).toISOString() && show(raftMount.snapshot.skipped) === show([{ name: snap.skipped, reason: "the credential lacks the capability it needs" }]), `snapshot: ${show(raftMount.snapshot)}`);
+  must(show(raftMount.tools) === show(byAlias("raft").map((t: any) => t.name)), "the mount's tools are not its offered names");
+  // Nothing secret: no mount config, no secret ref, no token.
+  must(!before.text.includes("secretRef") && !before.text.includes("publicConfig") && !before.text.includes(w.token), "the export carries a mount's config, a secret ref or the token");
+  // After the turn the export is unchanged: the turn offered what it said.
+  const after = await call(w, "GET", `${A}/tools`);
+  must(show(after.body.tools) === show(ex.tools), "the export moved across the turn");
+});
+
+await check("tools: a plugin switched off is no tool and is listed as not offered, with its reason; the turn agrees", async () => {
+  const w = await world();
+  await w.rt.store.setPluginChoice(T, A, "pushy", "disable");
+  const ex = (await call(w, "GET", `${A}/tools`)).body;
+  const p = ex.mounts.find((m: any) => m.alias === "p");
+  must(p.offered === false && p.notOffered === "switched_off" && p.tools.length === 0, `p: ${show(p)}`);
+  must(!ex.tools.some((t: any) => t.alias === "p"), "a switched-off mount's tool is listed");
+  await w.rt.postMessage(T, A, "a real turn", "prompt");
+  await settle(w, 1);
+  must(show(shape(ex.tools)) === show(await wireTools(w, 0)), "the export and the request differ");
+});
+
+await check("tools: reading the export writes nothing — no row, no table, no seal, no turn, no re-take of a stale snapshot", async () => {
+  const w = await world("1", { raft: true });
+  await raftSnapshot(w, "an-older-basis");
+  must(!(await w.rt.store.isSealed(T, A)), "sealed before the read");
+  const rows = everything(w.raw.sql as never);
+  const r = await call(w, "GET", `${A}/tools`);
+  must(r.status === 200, r.text);
+  const raftMount = r.body.mounts.find((m: any) => m.alias === "raft");
+  must(raftMount.retake === "due" && r.body.retakePending === true && raftMount.snapshot.basis === "an-older-basis", `the stale snapshot: ${show(raftMount)}`);
+  must(everything(w.raw.sql as never) === rows, "a row or a table moved");
+  must(!(await w.rt.store.isSealed(T, A)), "the read sealed");
+  must(jobCount(w) === 0, "the read started a turn");
+  must(raftMount.snapshotError === null, `a snapshot error before any re-take: ${raftMount.snapshotError}`);
+  // Control: a turn's start does ask for the re-take. With no credential behind the mount it fails and keeps the list
+  // (the gateway's keepCredentialed), which it records — the write the read did not make — and backs off.
+  await w.rt.postMessage(T, A, "a real turn", "prompt");
+  await settle(w, 1);
+  must(everything(w.raw.sql as never) !== rows, "control: the turn wrote nothing either");
+  const after = (await call(w, "GET", `${A}/tools`)).body;
+  const asked = after.mounts.find((m: any) => m.alias === "raft");
+  must(asked.retake === "backed_off" && typeof asked.snapshotError === "string" && asked.snapshot.basis === "an-older-basis",
+    `the turn did not ask for the re-take: ${show(asked)}`);
+  must(after.retakePending === false, "a backed-off re-take is still pending");
+  must(show(shape(after.tools)) === show(await wireTools(w, 0)), "the export and the request differ");
 });
 
 // ---- audit -----------------------------------------------------------------
