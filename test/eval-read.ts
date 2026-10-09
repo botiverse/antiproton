@@ -29,6 +29,8 @@ function source(batches: TraceOutboxRow[][], local: TraceOutboxRow[], opts: { up
   // A foreign agent's batch under a neighbouring prefix, and a key this scheme never makes.
   objects.push({ key: traceKey(T, `${A}x`, 1, 1), body: new TextDecoder().decode(traceBody([row(1, T0, { a: `${A}x` })])) });
   objects.push({ key: `${tracePrefix(T, A)}notes.txt`, body: "not a batch" });
+  // The same agent id in another tenant: its rows must never come through either.
+  objects.push({ key: traceKey("t-other", A, 1, 3), body: new TextDecoder().decode(traceBody([row(1, T0, { t: "t-other" }), row(2, T0, { t: "t-other" }), row(3, T0, { t: "t-other" })])) });
   objects.sort((a, b) => a.key.localeCompare(b.key));
   const size = opts.pageSize ?? 1000;
   const src: TraceSource = {
@@ -58,7 +60,7 @@ await check("the object is read before the bucket is listed; a row in both is on
   must(show(seqs(r.rows)) === show(range(2, 22)), `rows: ${show(seqs(r.rows))}`);
   must(asked[0] === "local" && asked[1] === "list:", `order: ${show(asked)}`);
   must(r.nextCursor === null && r.scanned.objects === 2, show(r));
-  must(r.rows.every((x) => x.agentId === A), "a neighbouring agent's row came through its prefix");
+  must(r.rows.every((x) => x.agentId === A && x.tenantId === T), "another agent's or tenant's row came through");
 });
 
 await check("the window is from <= at < to, and the cursor is a seq: only rows after it", async () => {
