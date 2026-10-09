@@ -81,6 +81,7 @@
     "test/capability-reconcile.ts",
     "test/capability-notice.ts",
     "test/agents-api-model.ts",
+    "test/usage-costs.ts",
     "test/bench-tau2-api.ts",
     "test/bench-tau2-api-local.ts",
     "test/alarm-next.ts",

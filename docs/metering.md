@@ -1,7 +1,8 @@
 # Metering model calls
 
 What a model call costs, where that cost is recorded, and how the record is
-checked. This is the contract for the `pd` engine (pi-durable). pi 0.85
+checked; and, for every resource the ledger counts, what it is priced at, who
+paid for it, and how long its hours are kept (the last three sections). This is the contract for the `pd` engine (pi-durable). pi 0.85
 (`pi085`) still meters at commit, from its own `pi_usage` rows
 (`src/store/pi-storage.ts`); the one thing it shares is the model name the
 consumer stamps on an answer (below).
@@ -130,3 +131,96 @@ provider for. The pd engine does not meter it. pi085 still writes it as
 - **An answer for a job deleted by a revert to pi085**: the object is a pi085
   object by then, and pi085 meters at commit, so a delivery it cannot place is
   not metered there.
+
+## Prices
+
+**One credit is one US dollar.** `usage_prices.credits_per_unit`
+(`cf/migrations/0005_usage.sql`) is dollars per unit, and every reader shows it
+as an estimated dollar amount. This is accounting only: nothing is charged,
+limited or refused because of it.
+
+The first prices are seeded by `cf/migrations/0016_usage_prices_seed.sql`, all
+effective from 2026-10-09T00:00:00Z; usage before that reads as unpriced. Every
+row is **rough, to be refined**, and the migration names each one's source. A
+better number is a new row with a later `effective_from`, never an edit of an
+old one, because cost is worked out when read.
+
+| resource | key | unit | $ per unit | source |
+|---|---|---|---|---|
+| `model.tokens` | `deepseek-flash:input` | tokens | 0.30 / 1M | DeepSeek's pricing page, cache miss, peak rate (off-peak is half) |
+| | `deepseek-flash:cache_read` | tokens | (0.006 − 0.30) / 1M | cache hit $0.006/1M, as a difference (below) |
+| | `deepseek-flash:output` | tokens | 1.20 / 1M | DeepSeek, peak |
+| | `openai/gpt-5.6-luna:input` | tokens | 0.20 / 1M | third-party aggregators after OpenAI's August 2026 cut; to verify |
+| | `openai/gpt-5.6-luna:output` | tokens | 1.20 / 1M | the same; to verify |
+| | `openai/gpt-5.6-luna:cache_read` | tokens | 0 extra | unknown, priced as input |
+| | `…:reasoning`, `…:cache_write`, `…:cache_write_1h` | tokens | 0 extra | already inside output / input / cache_write |
+| `model.tokens.unaccepted` | the same keys | tokens | the same | our cost; never in a tenant's view |
+| `object.active` | `*` | ms | 0.0000000015625 | Cloudflare Durable Objects, $12.50 per 1M GB-s at 128 MB |
+| `sandbox.container` | `*` | seconds | 0.00004 | an estimate: run9 publishes no prices |
+| | `*` | execs, unreadable | 0 | in the seconds; a marker, not usage |
+| `tool.call` | `exa.search` | calls | 0.007 | Exa's per-search rate; to verify |
+| | `exa.search` | failed, ms | 0 extra | in the call |
+
+Anything else — other tools, `js.run`, a model not in the table — is
+unpriced: its cost reads `null`, and the views say what they left out rather
+than counting it as free.
+
+**A subset is priced at its difference.** The ledger keeps three keys that
+are part of another one: `reasoning` of `output`, `cache_write_1h` of
+`cache_write`, and — because the clients put the provider's whole prompt into
+`input` (`usageOf` in `src/model/pi-bridge.ts`; `prompt_tokens` and
+`input_tokens` both count cache hits) — `cache_read` of `input`. A per-row
+`price × quantity` sum is right only if each subset row carries the difference
+between its rate and its parent's, so `cache_read` for DeepSeek is negative:
+`input × miss + cache_read × (hit − miss)` is `(input − cache_read) × miss +
+cache_read × hit`. Each subset has an explicit row, so no `*` can price one at
+full rate, and `model.tokens` has no `*` at all.
+
+Where cost is shown:
+
+- **The console's usage view** (`/ui/usage`, `cf/src/usage.ts`): "≈$" amounts,
+  "estimated cost … at rough prices", a "$ (estimated)" column.
+- **`/v1/agents/{id}/usage`** and its provider binding: every row gains a `cost`
+  (docs/agent-surface.md). Rows there are split so no kind contains another
+  except `input`, so each row's cost is its kind's whole rate, and `input`'s is
+  for its uncached part; the costs add up to the ledger's.
+- **`GET /admin/usage-costs?from=&to=&bucket=day|month`**
+  (`cf/src/admin-usage-costs.ts`), the operator's: every tenant's cost by
+  period and resource, `model.tokens.unaccepted` included, with the keys each
+  total leaves out unpriced. The `x-harness-token` header must equal
+  `AUTOMATION_TOKEN`, and with no token configured it refuses everyone.
+
+## Who pays
+
+Usage the tenant paid for with **their own credential** is still their usage —
+it is counted, in the same resource, and every view totals it — but it is
+never priced: its key starts with `own:` (`OWN_KEY_PREFIX`,
+`src/usage/outbox.ts`), and `priceFor` returns 0 for such a key whatever the
+table holds, so a `*` meant for our account cannot reach it.
+
+- **A container** on a sandbox mount whose credential is the agent's own
+  sealed one (`secretRefKind` "agent") is `sandbox.container` / `own:sandbox`;
+  the operator's (`operator:run9`) stays `sandbox`.
+- **A tool call** through a mount holding the agent's own key is
+  `tool.call` / `own:<plugin>.<tool>` — an Exa search on the tenant's own key
+  is `own:exa.search` and costs 0; the seeded `search` mount on
+  `operator:exa` is `exa.search` and is priced. This also renames the calls
+  of a GitHub mount with the person's own token (`own:github.…`): those were
+  unpriced before and are 0 now.
+- **A model call has no own-credential case.** Every call is a queued job made
+  on the operator's account (`callQueuedModel`); an agent bound to a
+  credential of its own is called on the deployment's default model with the
+  operator's key (`takeJob`, `cf/src/runtime.ts`). So all `model.tokens` are
+  ours to pay and are priced.
+
+## Retention
+
+A daily Cron Trigger (`17 3 * * *`, `triggers.crons` in `cf/wrangler.jsonc`
+and the preview's) runs the Worker's `scheduled` handler, which folds whole
+days of `usage_hourly` older than `KEEP_HOURLY_DAYS` (35) into `usage_daily`
+and deletes the hours it folded, in one batch per day (`retainUsage` and
+`foldUsage`, `cf/src/usage-d1.ts`). A second run finds nothing to move. Every
+reader sums both tables, so a total — quantity or cost — does not change when
+a day is folded. The hours are kept for 35 days rather than fewer because the
+views promise hourly buckets that far back: a folded day would sit in an
+hourly bucket at 00:00Z as if it had happened at midnight.

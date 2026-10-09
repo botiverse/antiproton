@@ -96,5 +96,8 @@
     "RUN9_WARN_MINUTES": "5",
     "RUN9_MAX_IDLE_MINUTES": "30"
   },
+  // Once a day, 03:17 UTC: the usage ledger's retention, whole days of
+  // hours past KEEP_HOURLY_DAYS folded into usage_daily (`scheduled` in src/index.ts).
+  "triggers": { "crons": ["17 3 * * *"] },
   "observability": { "enabled": true }
 }

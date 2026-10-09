@@ -3,7 +3,7 @@
  * the agent's outbox (cf/src/usage-d1.ts, src/usage/outbox.ts). Run inside
  * workerd by cf/src/conformance.ts; see test/control-plane-d1.sh.
  */
-import { flushUsage, foldUsage, parseUsageQuery, priceFor, readAgentLedger, readUsage, sendUsage, usageBacklogSince, usageCursor, usageFirstHours, usageGroup, DAY_MS, KEEP_HOURLY_DAYS, USAGE_WINDOWS, type UsageQuery } from "../../cf/src/usage-d1.ts";
+import { flushUsage, foldUsage, parseUsageQuery, priceFor, readAgentLedger, readUsage, readUsageCosts, retainUsage, sendUsage, usagePrices, usageBacklogSince, usageCursor, usageFirstHours, usageGroup, DAY_MS, KEEP_HOURLY_DAYS, USAGE_WINDOWS, type UsageQuery } from "../../cf/src/usage-d1.ts";
 import { appendUsage, pendingUsage, UNACCEPTED_TOKENS, type OutboxRow } from "../../src/usage/outbox.ts";
 import type { SpecCase } from "./control-plane-spec.ts";
 
@@ -21,6 +21,24 @@ export function usageCases(db: D1Database, sql: Sql): SpecCase[] {
   };
   const cases: SpecCase[] = [];
   const add = (name: string, fn: () => Promise<void>) => cases.push({ name, run: async () => { await wipe(); await fn(); } });
+
+  // FIRST, and without the wipe every other case starts with: the wipe empties usage_prices, so this is the one
+  // moment the table holds what the migrations wrote — here through wrangler's own migration runner on real D1.
+  cases.push({ name: "the price seed (0016) is applied: dollars per unit, from 2026-10-09T00:00Z", run: async () => {
+    const prices = await usagePrices(db);
+    const at = (resource: string, key: string, unit: string) =>
+      priceFor(prices, { bucket: Date.parse("2026-10-10T00:00:00Z"), resource, key, unit });
+    const spot: Array<[string, string, string, number]> = [
+      ["model.tokens", "deepseek-flash:input", "tokens", 0.3e-6], ["model.tokens", "deepseek-flash:reasoning", "tokens", 0],
+      ["model.tokens", "openai/gpt-5.6-luna:output", "tokens", 1.2e-6], ["model.tokens.unaccepted", "deepseek-flash:output", "tokens", 1.2e-6],
+      ["sandbox.container", "sandbox", "seconds", 0.00004], ["tool.call", "exa.search", "calls", 0.007],
+    ];
+    for (const [resource, key, unit, want] of spot) {
+      const got = at(resource, key, unit);
+      assert(got !== null && Math.abs(got - want) < 1e-15, `${resource} ${key} ${unit}: ${got}, want ${want}`);
+    }
+    assert(prices.every((p) => p.effectiveFrom === Date.parse("2026-10-09T00:00:00Z")), "a seed row with another date");
+  } });
   const row = (seq: number, over: Partial<OutboxRow> = {}): OutboxRow => ({
     seq, at: T0 + 10 * 60_000, tenantId: "t", agentId: "a", resource: "model.tokens", key: "m1:input", quantity: 10, unit: "tokens", ...over,
   });
@@ -315,6 +333,31 @@ export function usageCases(db: D1Database, sql: Sql): SpecCase[] {
     // starts.
     const longest = Math.max(...Object.values(USAGE_WINDOWS));
     assert(KEEP_HOURLY_DAYS * DAY_MS > longest, `${KEEP_HOURLY_DAYS} days of hours does not cover a ${longest / DAY_MS}-day window`);
+  });
+
+  add("the retention run keeps every cost a read across the fold reports, and a second run changes nothing", async () => {
+    // Priced rows on both sides of the cutoff, read by the tenant's view and by the operator's.
+    await db.batch([
+      db.prepare("INSERT INTO usage_prices VALUES ('model.tokens', 'm1:input', 'tokens', 0.001, 0)"),
+      db.prepare("INSERT INTO usage_prices VALUES ('model.tokens.unaccepted', 'm1:input', 'tokens', 0.001, 0)"),
+    ]);
+    await sendUsage(db, "t", "a", 0, [
+      row(1, { at: OLD + 2 * H, quantity: 10 }), row(2, { at: OLD + 7 * H, quantity: 5 }),
+      row(3, { at: OLD + 3 * H, resource: UNACCEPTED_TOKENS, quantity: 40 }),
+      row(4, { at: YOUNG + H, quantity: 1000 }),
+    ]);
+    const tenant = async () => (await readUsage(db, "t", { window: "custom", from: OLD, to: NOW, bucket: "1d", by: "total" })).rows
+      .map((r) => `${(r.bucket - T0) / DAY_MS}/${r.resource}/${r.key}=${r.quantity}$${r.cost}`).join(" ");
+    const operator = async () => JSON.stringify(await readUsageCosts(db, OLD, NOW, "day"));
+    const before = [await tenant(), await operator()];
+    const first = await retainUsage(db, NOW);
+    assert(first.days.length === 1 && first.days[0] === OLD, `days ${JSON.stringify(first.days)}`);
+    const after = [await tenant(), await operator()];
+    assert(before[0] === after[0], `tenant view moved:\n  ${before[0]}\n  ${after[0]}`);
+    assert(before[1] === after[1], `operator view moved:\n  ${before[1]}\n  ${after[1]}`);
+    assert(after[0]!.includes("0/model.tokens/m1:input=15$0.015") && after[1]!.includes(UNACCEPTED_TOKENS), `${after[0]} ${after[1]}`);
+    const second = await retainUsage(db, NOW);
+    assert(second.days.length === 0 && second.hours === 0 && (await tenant()) === before[0], `second run ${JSON.stringify(second)}`);
   });
 
   add("a fold keeps tenants apart", async () => {

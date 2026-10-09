@@ -60,5 +60,8 @@
     // cf/src/provision/handlers.ts). Preview only: test/eval-seed.ts fails if cf/wrangler.jsonc sets it.
     "EVAL_SEED_ROUTES": "1"
   },
+  // Once a day, 03:17 UTC: the usage ledger's retention, whole days of
+  // hours past KEEP_HOURLY_DAYS folded into usage_daily (`scheduled` in src/index.ts). The preview has its own database, so it folds its own.
+  "triggers": { "crons": ["17 3 * * *"] },
   "observability": { "enabled": true }
 }
