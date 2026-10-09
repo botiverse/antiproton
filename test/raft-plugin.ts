@@ -1338,6 +1338,17 @@ await check("a paged result stays under the parking line: limit is capped and de
   if (size > PARK_BYTES) throw new Error(`a full page of ${body.length}-character messages is ${size} characters; the parking line is ${PARK_BYTES}`);
 });
 
+await check("every operation and argument WITHHELD_ARGUMENTS names is in the manifest, so an SDK rename cannot leave an entry withholding nothing", async () => {
+  for (const [name, args] of Object.entries(WITHHELD_ARGUMENTS)) {
+    const op = RAFT_OPERATIONS.find((o) => o.name === name);
+    must(op, `WITHHELD_ARGUMENTS names ${name}, which the manifest does not have`);
+    for (const arg of Object.keys(args)) {
+      must(Object.hasOwn(op!.inputSchema.properties ?? {}, arg), `WITHHELD_ARGUMENTS names ${name}'s ${arg}, which its manifest schema does not have`);
+    }
+  }
+  must(Object.keys(WITHHELD_ARGUMENTS).length > 0, "control: the table is empty");
+});
+
 await check("messages_read does not offer unread (SDK 0.13.0): not in its schema, and a call naming it is refused before any request", async () => {
   // The manifest has it; this mount withholds it.
   must(Object.hasOwn(opNamed("messages.read").inputSchema.properties ?? {}, "unread"), "control: the manifest no longer has messages.read's unread");

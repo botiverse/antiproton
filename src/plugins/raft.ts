@@ -531,8 +531,10 @@ function integer(value: unknown, name: string, min: number, max: number): number
  *
  * The manifest carries no channel or server administration (creating, updating or archiving a channel, adding
  * or removing its members, updating the server): those are Agent API routes reachable only through the SDK's
- * raw `routes`, which nothing here calls. A hosted agent proposes them with `actions_prepare`, for a person to
- * confirm.
+ * raw `routes`, and none of them is called here. The routes this file does call are reads with no operation behind
+ * them: the credential context the listing reads (`routes.agent.context`) and a personal assistant's two owner
+ * reads (`routes.assistant.*`, `RAFT_ASSISTANT_WIRE`); Agent Login's `routes.integrations.list` and
+ * `login` are in raft-agent-login.ts. A hosted agent proposes the administration with `actions_prepare`, for a person to confirm.
  */
 export const EXCLUDED: Readonly<Record<string, string>> = {
   "inbox.check": "the inbox is read with receive_events, which commits what it showed and pulls the next in one call; a second reader would move the same cursor",
@@ -1345,7 +1347,7 @@ const ASSISTANT_TOOLS: readonly ToolSchema[] = [
     parameters: {
       type: "object", additionalProperties: false, required: ["channelId"],
       properties: {
-        channelId: { type: "string", description: `The conversation's channelId, from ${OWNER_INBOX_TOOL}.` },
+        channelId: { type: "string", description: `The conversation's channelId, a UUID: the channelId of a line of ${OWNER_INBOX_TOOL}. Anything else is refused before it is sent.` },
         before: anchorParameter("Only messages before this one (older)"),
         after: anchorParameter("Only messages after this one (newer)"),
         around: anchorParameter("A window around this message"),
@@ -1391,6 +1393,14 @@ type RouteAnswer =
       | { kind: "http"; status: number; errorCode?: string | null; response?: unknown }
       | { kind: "validation"; reason: string; cause?: unknown } };
 
+/**
+ * The most of the Server's `error` text an owner read's failure shows, in characters; past it the text is cut and ends
+ * in `… (cut)`, the mark the push notice uses (`NOTICE_TEXT_MAX`, whose bound is for a whole message and so far larger).
+ * Raft's own texts are one short sentence ("Channel not found or not visible"); what is longer is not Raft's sentence —
+ * a proxy's page, a stack — and the model gains nothing from all of it.
+ */
+export const OWNER_ERROR_TEXT_MAX = 300;
+
 /** A Server error code as Raft documents them; anything else (a gateway's HTML, a forged line) is not passed on. */
 const SERVER_CODE = /^[A-Za-z0-9_.:-]{1,64}$/;
 
@@ -1420,7 +1430,8 @@ function ownerAnswer(out: RouteAnswer, tool: string): OwnerAnswer {
   const e = out.error;
   if (e.kind === "http") {
     const body = e.response;
-    const said = body && typeof body === "object" && "error" in body && typeof body.error === "string" ? oneLine(body.error).trim() : "";
+    const text = body && typeof body === "object" && "error" in body && typeof body.error === "string" ? oneLine(body.error).trim() : "";
+    const said = text.length > OWNER_ERROR_TEXT_MAX ? `${text.slice(0, OWNER_ERROR_TEXT_MAX)}… (cut)` : text;
     const code = typeof e.errorCode === "string" && SERVER_CODE.test(e.errorCode) ? e.errorCode : undefined;
     return { ok: false, status: e.status, ...(code ? { code } : {}), ...(said ? { message: said } : {}) };
   }

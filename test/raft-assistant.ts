@@ -7,7 +7,7 @@
 // would refuse first.
 //
 //   node test/raft-assistant.ts
-import { GENERATED, createRaftPlugin, isAssistantOf, type AssistantWire, type OwnerAnswer, type OwnerInboxRequest, type OwnerMessagesRequest } from "../src/plugins/raft.ts";
+import { GENERATED, createRaftPlugin, isAssistantOf, OWNER_ERROR_TEXT_MAX, type AssistantWire, type OwnerAnswer, type OwnerInboxRequest, type OwnerMessagesRequest } from "../src/plugins/raft.ts";
 import { toolsOf, type PluginErrorFields } from "../src/plugins/types.ts";
 import { admitTools } from "../src/runtime/mount-tools.ts";
 import { ToolGateway } from "../src/runtime/gateway.ts";
@@ -188,6 +188,9 @@ await check("mountTools: a mount with no snapshot is not offered them; a snapsho
   const plainSnap = await admitTools({ tools: plugin.tools.filter((t) => t.name === "messages_read") }, 0);
   const plain = toolsOf(plugin, { ...base, toolSnapshot: plainSnap }).map((t) => t.name);
   must(!plain.some((n) => ASSISTANT.includes(n)), `a snapshot without them offered: ${plain.join(", ")}`);
+  // channelId is a UUID (the route's contract), and the description says so and where it comes from.
+  const channelId = (plugin.tools.find((t) => t.name === MESSAGES)!.parameters as any).properties.channelId;
+  must(/\bUUID\b/.test(channelId.description) && channelId.description.includes(INBOX), `channelId: ${channelId.description}`);
   // Each tool is this build's: read-only, model-only.
   const tool = toolsOf(plugin, { ...base, toolSnapshot: assistantSnap }).find((t) => t.name === MESSAGES);
   must(tool?.sideEffects === "read" && tool.modelOnly === true, `declaration: ${JSON.stringify(tool)}`);
@@ -328,6 +331,19 @@ await check("through the SDK: 403 assistant_not_enabled and 404 channel_not_foun
     must(e.retryable === false && e.transient === false && e.mayHaveLanded !== true, `${name} ${status} marks: ${JSON.stringify({ r: e.retryable, t: e.transient, m: e.mayHaveLanded })}`);
     must(c.touched.length === 0, `${name} touched the mount's database: ${c.touched.join(", ")}`);
   }
+});
+
+await check("through the SDK: the Server's error text is cut at OWNER_ERROR_TEXT_MAX and marked; one at the bound is shown whole", async () => {
+  must(OWNER_ERROR_TEXT_MAX === 300, `bound: ${OWNER_ERROR_TEXT_MAX}`);
+  const long = "x".repeat(OWNER_ERROR_TEXT_MAX) + "TAIL-NOT-SHOWN";
+  const { plugin } = realWire(() => json(404, { error: long, code: "channel_not_found" }));
+  const e = await failure(() => plugin.invoke(MESSAGES, { channelId: CH }, ctx(ASSISTANT).ctx));
+  must(e.message === `404 channel_not_found: ${"x".repeat(OWNER_ERROR_TEXT_MAX)}… (cut)`, `long: ${e.message.length} ${e.message.slice(-40)}`);
+  // Control: exactly at the bound, nothing is cut or marked.
+  const exact = "y".repeat(OWNER_ERROR_TEXT_MAX);
+  const { plugin: p2 } = realWire(() => json(404, { error: exact, code: "channel_not_found" }));
+  const e2 = await failure(() => p2.invoke(MESSAGES, { channelId: CH }, ctx(ASSISTANT).ctx));
+  must(e2.message === `404 channel_not_found: ${exact}`, `at the bound: ${e2.message.slice(-40)}`);
 });
 
 await check("through the SDK: a 503, a 429 or no answer at all is transient (not retryable: a read has nothing that may have landed)", async () => {
