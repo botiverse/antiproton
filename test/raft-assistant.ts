@@ -16,7 +16,7 @@ import { SqliteStore } from "../src/store/sqlite.ts";
 const INBOX = "assistant_owner_inbox";
 const MESSAGES = "assistant_owner_messages";
 const ASSISTANT = [INBOX, MESSAGES];
-// A UUID, as Raft sends it and as the SDK's contract requires.
+// A UUID, as Raft sends it (the SDK's contract takes any text since 0.13.1; 0.13.0 required a UUID).
 const OWNER = { userId: "7a0e1b2c-3d4e-4f50-8a61-72839405a6b7", name: "Ada" };
 const CH = "c0ffee00-0000-4000-8000-000000000001";
 
@@ -130,16 +130,25 @@ await check("the credential context's agent.assistantOf decides the two tools: n
   }
 });
 
-await check("a malformed assistantOf fails the whole listing (the SDK's contract), so the stored list stays as it was; isAssistantOf holds the same line", async () => {
-  // The SDK's contract for the context answer requires `{ userId: <uuid> }` or null, and refuses the whole answer
-  // otherwise: the listing throws, which leaves a mount's stored list as it was, rather than offering or withdrawing.
+await check("assistantOf with a userId that is not text, or not an object, fails the whole listing (the SDK's contract); a text userId is the plugin's to judge", async () => {
+  // SDK 0.13.1: the context answer's contract takes `{ userId: <string> }` or null (0.13.0 required a UUID) and still
+  // refuses the whole answer otherwise: the listing throws, which leaves a mount's stored list as it was.
   for (const [what, assistantOf] of [
-    ["no userId", { name: "Ada" }], ["numeric userId", { userId: 42 }], ["empty userId", { userId: "" }],
-    ["a userId that is not a UUID", { userId: "user-7" }], ["a bare string", OWNER.userId], ["an array", [OWNER]],
+    ["no userId", { name: "Ada" }], ["numeric userId", { userId: 42 }], ["a bare string", OWNER.userId], ["an array", [OWNER]],
   ] as const) {
     answering(() => context(CAPS, { assistantOf }));
     const e = await failure(() => createRaftPlugin().snapshotTools!(ctx().ctx));
     must(e.message === "could not ask Raft what this mount's credential may do: Raft's answer did not match the Raft SDK's contract", `${what}: ${e.message}`);
+  }
+  // A text userId passes the contract, and isAssistantOf decides: an empty one is not an owner (listed, without the
+  // two tools); any other text is, UUID or not — nothing here sends the owner's id, so its form decides nothing.
+  for (const [what, assistantOf, offered] of [
+    ["empty userId", { userId: "" }, false], ["a userId that is not a UUID", { userId: "user-7" }, true],
+  ] as const) {
+    answering(() => context(CAPS, { assistantOf }));
+    const names = (await createRaftPlugin().snapshotTools!(ctx().ctx)).tools.map((t) => t.name);
+    must(names.includes("messages_read"), `${what}: control: the listing is empty: ${names.join(", ")}`);
+    must(ASSISTANT.filter((n) => names.includes(n)).length === (offered ? 2 : 0), `${what}: assistant tools: ${names.filter((n) => ASSISTANT.includes(n))}`);
   }
   // The plugin's own check, which does not lean on the SDK's: only an object with a non-empty string userId counts.
   for (const v of [null, undefined, { name: "Ada" }, { userId: 42 }, { userId: "" }, OWNER.userId, [OWNER]]) {
@@ -160,8 +169,8 @@ await check("no credential, a refused credential, or Raft not answering: neither
 });
 
 await check("through the real SDK, agent.assistantOf reaches the listing: the default plugin offers both to an assistant, neither for null", async () => {
-  // The SDK's `identity.whoami` (0.13.0) still projects the agent without `assistantOf`, though its CHANGELOG says it
-  // returns it; the listing reads the context route, whose contract carries it. Going back to whoami turns this red.
+  // The listing reads the context route, whose contract carries it. (`identity.whoami` carries it too since SDK 0.13.1;
+  // 0.13.0's projection dropped it, which is why the listing does not depend on that projection.)
   answering(() => context(CAPS, { assistantOf: OWNER }));
   const names = (await createRaftPlugin().snapshotTools!(ctx().ctx)).tools.map((t) => t.name);
   must(ASSISTANT.every((n) => names.includes(n)), `an assistant was not offered the owner reads: ${names.join(", ")}`);
