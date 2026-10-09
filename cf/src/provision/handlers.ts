@@ -171,7 +171,19 @@ export function toolConfigField(body: unknown, seed: Pick<SeedOps, "mountable"> 
 
 export const PROVIDER_AGENT_PREFIX = "raft_";
 const NAME_MAX = 60;
+/** `instructions` everywhere but an evaluation deployment: characters, as `String.length` counts them. */
 const INSTRUCTIONS_MAX = 8_000;
+/**
+ * `instructions` where the evaluation setup routes are served (`seed` present, EVAL_SEED_ROUTES): 64 KiB, counted in
+ * UTF-8 bytes rather than characters, so a persona in CJK or emoji meets the same bound as one in ASCII. Not a
+ * `…Bytes` name on purpose: those count UTF-16 code units (AGENTS.md), and this one does not. Over it is refused,
+ * never cut: an evaluation measuring an agent given part of its instructions would measure the wrong agent.
+ */
+export const EVAL_INSTRUCTIONS_MAX_UTF8 = 65_536;
+type Limit = { max: number; unit: "characters" | "UTF-8 bytes" };
+const instructionsLimit = (seed: SeedOps | undefined): Limit =>
+  seed ? { max: EVAL_INSTRUCTIONS_MAX_UTF8, unit: "UTF-8 bytes" } : { max: INSTRUCTIONS_MAX, unit: "characters" };
+const sizeIn = (v: string, unit: Limit["unit"]) => unit === "characters" ? v.length : new TextEncoder().encode(v).byteLength;
 const RAFT_ID = /^[A-Za-z0-9._:-]{1,64}$/;
 /** The plugin's own reading of its credential (src/plugins/raft.ts looksLike). */
 const RAFT_CREDENTIAL = /^sk_agent_[A-Za-z0-9_-]{16,}$/;
@@ -191,12 +203,14 @@ const ok = (body: unknown, status = 200) => Response.json(body, { status, header
 const field = (body: unknown, key: string): unknown => (typeof body === "object" && body !== null ? (body as Record<string, unknown>)[key] : undefined);
 
 /** A text field within bounds, and not a credential someone pasted where a name goes. */
-function textField(body: unknown, key: string, max: number, required: boolean): string | undefined | Fail {
+function textField(body: unknown, key: string, limit: number | Limit, required: boolean): string | undefined | Fail {
+  const { max, unit } = typeof limit === "number" ? { max: limit, unit: "characters" as const } : limit;
   const v = field(body, key);
   if (v === undefined) return required ? { status: 422, code: "missing", message: `${key} is required`, param: key } : undefined;
   if (typeof v !== "string") return { status: 422, code: "invalid", message: `${key} must be a string`, param: key };
   if (required && !v.trim()) return { status: 422, code: "invalid", message: `${key} must not be empty`, param: key };
-  if (v.length > max) return { status: 422, code: "invalid", message: `${key} is at most ${max} characters`, param: key };
+  const size = sizeIn(v, unit);
+  if (size > max) return { status: 422, code: "invalid", message: `${key} is at most ${max} ${unit}; this one is ${size}`, param: key };
   const shape = secretShape(v);
   if (shape) return { status: 422, code: "credential_in_text", message: `${key} carries what looks like a ${shape}; credentials go in the credential field only`, param: key };
   return v;
@@ -302,7 +316,7 @@ export async function handleProvision(
     }
     const name = textField(body, "name", NAME_MAX, true);
     if (isFail(name)) return fail(name);
-    const instructions = textField(body, "instructions", INSTRUCTIONS_MAX, false) ?? "";
+    const instructions = textField(body, "instructions", instructionsLimit(deps.seed), false) ?? "";
     if (isFail(instructions)) return fail(instructions);
     const credential = credentialField(body);
     if (isFail(credential)) return fail(credential);
@@ -393,7 +407,7 @@ export async function handleProvision(
     if (!row || row.status === "deleted") return gone();
     const name = textField(body, "name", NAME_MAX, false);
     if (isFail(name)) return fail(name);
-    const instructions = textField(body, "instructions", INSTRUCTIONS_MAX, false);
+    const instructions = textField(body, "instructions", instructionsLimit(deps.seed), false);
     if (isFail(instructions)) return fail(instructions);
     if (name === undefined && instructions === undefined) {
       return fail({ status: 422, code: "empty", message: "nothing to change: give name or instructions" });

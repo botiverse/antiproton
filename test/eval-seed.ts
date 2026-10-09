@@ -9,7 +9,7 @@
  * Through the Worker, the whole object, an inbound push and a fresh conversation: test/eval-seed-object.ts.
  */
 import { readFileSync } from "node:fs";
-import { handleProvision, type ProvisionDeps, type SeedOps } from "../cf/src/provision/handlers.ts";
+import { EVAL_INSTRUCTIONS_MAX_UTF8, handleProvision, type ProvisionDeps, type SeedOps } from "../cf/src/provision/handlers.ts";
 import type { ProvisionedAgent, ProvisionRegistry } from "../cf/src/control-plane.ts";
 import type { SurfaceDeps } from "../cf/src/agent-surface/surface.ts";
 import { SqliteStore } from "../src/store/sqlite.ts";
@@ -307,6 +307,51 @@ await check("toolConfig: the object's refusal is the answer (a 409 for another r
   const patched = await handleProvision("PATCH", `/agents/${AGENT}`, { idempotencyKey: null, raftServerId: null }, { name: "m" }, WHO, f.deps);
   must(patched?.status === 200, `PATCH: ${patched?.status}`);
   must(adoptedWith(f.calls).at(-1) === undefined, `PATCH asked about tools: ${show(adoptedWith(f.calls))}`);
+});
+
+// ---- instructions ----------------------------------------------------------
+
+const utf8 = (s: string) => new TextEncoder().encode(s).byteLength;
+/** Exactly `n` UTF-8 bytes, of three-byte CJK characters and four-byte emoji, topped up with ASCII. */
+function bytesOf(n: number, unit: "汉" | "😀"): string {
+  const each = utf8(unit);
+  const s = unit.repeat(Math.floor(n / each)) + "a".repeat(n % each);
+  must(utf8(s) === n, `built ${utf8(s)} bytes, wanted ${n}`);
+  return s;
+}
+const instructionsAdopted = (calls: Array<{ op: string; args: unknown[] }>) =>
+  calls.filter((c) => c.op === "adopt").map((c) => (c.args[2] as { instructions: string }).instructions);
+
+await check("instructions with the setup routes: 64 KiB counted in UTF-8 bytes on POST and PATCH, given whole to the agent; one byte over is refused with both sizes, never cut", async () => {
+  must(EVAL_INSTRUCTIONS_MAX_UTF8 === 65_536, `limit ${EVAL_INSTRUCTIONS_MAX_UTF8}`);
+  for (const unit of ["汉", "😀"] as const) {
+    const at = bytesOf(65_536, unit), over = bytesOf(65_537, unit);
+    // Under the limit in characters (and in UTF-16 units) while over it in bytes: what tells the two counts apart.
+    must(over.length < 65_536, `${unit}: ${over.length} UTF-16 units`);
+    const f = fakeDeps();
+    const made = await provisionPost(f.deps, { instructions: at });
+    must(made.status === 201 && made.body.instructions === at, `${unit} at 65536 bytes: ${made.status} ${made.text.slice(0, 300)}`);
+    must(show(instructionsAdopted(f.calls)) === show([at]), `${unit}: the agent was given ${instructionsAdopted(f.calls).map(utf8)} bytes`);
+    const g = fakeDeps();
+    const refused = await provisionPost(g.deps, { instructions: over });
+    must(refused.status === 422 && refused.body.error.code === "invalid" && refused.body.error.param === "instructions", `${unit} over: ${refused.status} ${refused.text.slice(0, 300)}`);
+    must(refused.body.error.message === "instructions is at most 65536 UTF-8 bytes; this one is 65537", refused.body.error.message);
+    must(g.calls.length === 0, `${unit} over: something was made: ${show(g.calls.map((c) => c.op))}`);
+    // PATCH: the same bound, the same refusal, and the agent given the value whole or not asked at all.
+    const p = fakeDeps();
+    const patch = (instructions: string) => handleProvision("PATCH", `/agents/${AGENT}`, { idempotencyKey: null, raftServerId: null }, { instructions }, WHO, p.deps);
+    const okP = await patch(at);
+    must(okP?.status === 200 && (await okP.json() as any).instructions === at, `${unit} PATCH at the limit: ${okP?.status}`);
+    must(show(instructionsAdopted(p.calls)) === show([at]), `${unit} PATCH: the agent was given ${instructionsAdopted(p.calls).map(utf8)} bytes`);
+    const badP = await patch(over);
+    const badBody = await badP!.json() as any;
+    must(badP?.status === 422 && badBody.error.param === "instructions" && badBody.error.message === "instructions is at most 65536 UTF-8 bytes; this one is 65537", `${unit} PATCH over: ${badP?.status} ${show(badBody)}`);
+    must(instructionsAdopted(p.calls).length === 1, `${unit} PATCH over reached the agent`);
+    must((await p.deps.registry.get("t-raft", "01JEVAL"))!.instructions === at, `${unit} PATCH over changed the registry`);
+  }
+  // Production's 8000 characters is not a bound here.
+  const f = fakeDeps();
+  must((await provisionPost(f.deps, { instructions: "x".repeat(8_001) })).status === 201, "8001 characters refused with the setup routes");
 });
 
 // ---- the two stores --------------------------------------------------------

@@ -197,6 +197,30 @@ await check("PATCH changes what it is given, re-adopts with the merged persona, 
   assert(unknown.status === 404, unknown.text);
 });
 
+await check("without the evaluation routes (production) instructions stay at 8000 characters, counted as characters, on POST and PATCH; over is refused whole, never cut", async () => {
+  const f = fakeDeps();
+  assert(!("seed" in f.deps), "these deps serve the evaluation routes");
+  // 8000 CJK characters are 24000 UTF-8 bytes: still within a limit that counts characters.
+  for (const instructions of ["x".repeat(8000), "汉".repeat(8000)]) {
+    const g = fakeDeps();
+    const r = await call(g.deps, "POST", "/agents", body({ instructions }));
+    assert(r.status === 201 && r.body.instructions === instructions, `${instructions.length} chars → ${r.status} ${r.text.slice(0, 200)}`);
+    assert(g.rows.get("t-raft/01JAGENT")!.instructions === instructions, "the registry kept something else");
+  }
+  const over = await call(f.deps, "POST", "/agents", body({ instructions: "x".repeat(8001) }));
+  assert(over.status === 422 && over.body.error.code === "invalid" && over.body.error.param === "instructions", over.text.slice(0, 300));
+  assert(/at most 8000 characters; this one is 8001/.test(over.body.error.message), over.body.error.message);
+  assert(f.rows.size === 0 && f.calls.length === 0, "a refused POST made something");
+  await call(f.deps, "POST", "/agents", body());
+  f.calls.length = 0;
+  const ok = await call(f.deps, "PATCH", "/agents/raft_01JAGENT", { instructions: "y".repeat(8000) });
+  assert(ok.status === 200 && ok.body.instructions === "y".repeat(8000), `PATCH 8000: ${ok.status}`);
+  const bad = await call(f.deps, "PATCH", "/agents/raft_01JAGENT", { instructions: "z".repeat(8001) });
+  assert(bad.status === 422 && bad.body.error.param === "instructions" && /at most 8000 characters; this one is 8001/.test(bad.body.error.message), bad.text.slice(0, 300));
+  assert(f.rows.get("t-raft/01JAGENT")!.instructions === "y".repeat(8000), "a refused PATCH changed the registry");
+  assert(f.calls.length === 1, `a refused PATCH reached the agent: ${f.calls.length} calls`);
+});
+
 await check("PUT credential seals the new one and re-registers push; a bad shape is 422", async () => {
   const f = fakeDeps();
   await call(f.deps, "POST", "/agents", body());
