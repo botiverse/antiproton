@@ -1218,9 +1218,14 @@ export const OWNER_INBOX_TOOL = "assistant_owner_inbox";
 export const OWNER_MESSAGES_TOOL = "assistant_owner_messages";
 const OWNER_INBOX_FILTERS = ["unread", "all", "mentions", "unread_mentions"] as const;
 type OwnerInboxFilter = (typeof OWNER_INBOX_FILTERS)[number];
-/** Raft's own bounds on each read: a limit over them is refused rather than cut down, so the model knows. */
-export const OWNER_INBOX_LIMIT = { default: 20, max: 50 } as const;
-export const OWNER_MESSAGES_LIMIT = { default: 50, max: 100 } as const;
+/**
+ * Each read's bounds. `max` is Raft's own: a limit over it is refused rather than cut down, so the model knows.
+ * `default` is ours, sent explicitly, and below Raft's (20 and 50): `PAGE_ROWS`, the page that stays under the
+ * parking line, so the usual read on waking (the latest few) comes back whole instead of parked; the model asks for
+ * more with `limit` or pages.
+ */
+export const OWNER_INBOX_LIMIT = { default: PAGE_ROWS, max: 50 } as const;
+export const OWNER_MESSAGES_LIMIT = { default: PAGE_ROWS, max: 100 } as const;
 const OWNER_ANCHORS = ["before", "after", "around"] as const;
 
 const anchorParameter = (what: string) => ({
