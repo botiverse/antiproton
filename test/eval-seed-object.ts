@@ -20,6 +20,7 @@ import { canonJson } from "../src/core/canon-json.ts";
 import { seedSnapshot, sha256Hex } from "../src/store/seed-files.ts";
 import { ensureClientCalls } from "../src/runtime/client-calls.ts";
 import { callQueuedModel } from "../cf/src/model-request.ts";
+import { appendTrace } from "../src/trace/outbox.ts";
 
 const STAND_IN = "export class DurableObject { constructor(ctx, env) { this.ctx = ctx; this.env = env; } }" +
   " export class WorkerEntrypoint { constructor(ctx, env) { this.ctx = ctx; this.env = env; } }" +
@@ -1317,8 +1318,15 @@ await check("transcript and trace write nothing: every table and row of the obje
   await toolTurn(w, "one", { a: 1 }, "done");
   await w.D.alarm();
   must((await call(w, "POST", `${A}/fresh-context`)).status === 200, "fresh context");
-  await w.rt.postMessage(T, A, "two", "prompt");
-  await settle(w, 3);
+  await toolTurn(w, "two", { b: 2 }, "done");
+  await w.rt.postMessage(T, A, "three", "prompt");
+  await settle(w, 5);
+  // Every alarm pass above exported what it found; a row written since is held in the object until the next one.
+  appendTrace(w.raw.sql as never, [{ at: Date.now(), tenantId: T, agentId: A, kind: "tool.call", spanId: "op_held", status: "succeeded", verdict: "ok", attrs: { tool: "pushy.noop" } }]);
+  // Both sources hold rows, so a read that drained, pruned or moved a cursor would have something to change.
+  must(Number(w.raw.sql.exec("SELECT COUNT(*) AS n FROM trace_outbox").toArray()[0]!.n) > 0, "no trace row is held in the object");
+  must([...w.R2.objects.keys()].some((k) => k.startsWith(`trace/${T}/${A}/`)), "no trace batch is in the bucket");
+  must((await call(w, "GET", `${A}/trace`)).body.rows.some((r: any) => r.spanId === "op_held"), "the held row is not in the export");
   const db0 = dump(w.raw.sql as never), r20 = bucketDump(w), jobs0 = jobCount(w), sealed0 = await w.rt.store.isSealed(T, A);
   for (const q of ["transcript", "transcript?session=main", "transcript?limit=1&cursor=1", "trace", "trace?limit=1", `trace?from=${Date.now() - 60_000}`]) {
     const r = await call(w, "GET", `${A}/${q}`);
