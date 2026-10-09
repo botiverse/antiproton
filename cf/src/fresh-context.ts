@@ -21,7 +21,7 @@
  */
 import { BRANCH_SUMMARY_PREFIX, COMPACTION_SUMMARY_PREFIX } from "@earendil-works/pi-agent-core";
 import { canonJson } from "../../src/core/canon-json.ts";
-import { isSeedLine, WORKING_SET } from "../../src/plugins/state.ts";
+import { isSeedLine, unfencedLines, WORKING_SET } from "../../src/plugins/state.ts";
 import { ensurePiTables, MAIN_SESSION, piTables } from "../../src/store/pi-storage.ts";
 import { sha256Hex } from "../../src/store/seed-files.ts";
 
@@ -152,8 +152,18 @@ function textOf(content: unknown): string {
  * merely mentioned, or that is part of a longer word or path, is not listed.
  */
 export function seededPathsListed(system: string, seedPaths: readonly string[]): string[] {
-  const lines = system.split("\n");
+  const lines = unfencedLines(system);
   return seedPaths.filter((p) => lines.some((l) => isSeedLine(l, p)));
+}
+
+/**
+ * The working-set documents whose heading the system prompt carries: the line src/plugins/state.ts `workingSet`
+ * writes over each, whole, outside any code fence. Read the same way as `seededPathsListed`, because `MEMORY.md` is
+ * shown fenced and the agent can write it, so the heading's text inside it is the file speaking, not the prompt.
+ */
+export function workingSetKeys(system: string): string[] {
+  const lines = new Set(unfencedLines(system));
+  return WORKING_SET.filter((d) => lines.has(`## ${d.key} (${d.what})`)).map((d) => d.key);
 }
 
 const messageHash = (m: unknown) => sha256Hex(canonJson(m));
@@ -198,7 +208,7 @@ export function recordModelInput(sql: Sql, jobId: string, seedPaths: readonly st
   const call = Number(sql.exec("SELECT COALESCE(MAX(call), 0) AS n FROM model_input_digests WHERE session_id = ?", sessionId).toArray()[0]?.n ?? 0) + 1;
   const evidence: ModelInputEvidence = {
     sessionId, call, jobId, at: now, systemPromptSha256: sha256Hex(system), messages, summaryBlock,
-    workingSetKeys: WORKING_SET.filter((d) => system.includes(`## ${d.key} (`)).map((d) => d.key),
+    workingSetKeys: workingSetKeys(system),
     seedPathsInSystemPrompt: seededPathsListed(system, seedPaths),
   };
   sql.exec("INSERT INTO model_input_digests(session_id, call, job_id, at, digest) VALUES (?,?,?,?,?)",

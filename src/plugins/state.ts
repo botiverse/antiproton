@@ -592,6 +592,36 @@ export function fenceFor(text: string): string {
 }
 
 /**
+ * The lines of `text` that are not inside a code fence, read by `fenceFor`'s
+ * own rule rather than a copy of it: a line beginning with a run of backticks
+ * at least as long as the shortest fence (`fenceFor("")`) opens one, and only a
+ * line of backticks and nothing else that the open fence is not proof against
+ * (`fenceFor(line)` longer than it, i.e. at least as many backticks) closes it;
+ * a fence never closed runs to the end. The fence lines themselves are dropped
+ * too. Lines end at `\n`, `\r\n` or a lone `\r`.
+ *
+ * What the evaluation's record reads the system prompt through
+ * (cf/src/fresh-context.ts `seededPathsListed`, `workingSetKeys`): `MEMORY.md`
+ * is shown inside a fence and the agent can write it, so a line in it shaped
+ * like the prompt's own would otherwise be counted as the prompt saying it.
+ */
+export function unfencedLines(text: string): string[] {
+  const out: string[] = [];
+  const shortest = fenceFor("").length;
+  let open = 0;
+  for (const line of text.split(/\r\n|\r|\n/)) {
+    if (open) {
+      if (/^`+$/.test(line) && fenceFor(line).length > open) open = 0;
+      continue;
+    }
+    const run = /^`+/.exec(line)?.[0].length ?? 0;
+    if (run >= shortest) { open = run; continue; }
+    out.push(line);
+  }
+  return out;
+}
+
+/**
  * The sizes a seeded path's line can give, each from a number written as
  * digits: the working copy's now, the setup's when the copy is in object
  * storage, or none because it was removed. One table, read by `seedLine` to
@@ -661,8 +691,8 @@ function utf8Bytes(value: Json | undefined): number | null {
  * A path is printed exactly as stored, in the line `seedLine` makes for it,
  * since the evaluation's record counts a seeded path as listed only where a
  * line `isSeedLine` recognises names it (cf/src/fresh-context.ts
- * `seededPathsListed`); a mention elsewhere, in the fenced file included, is
- * not a listing.
+ * `seededPathsListed`, which skips fenced text by `unfencedLines`); a mention
+ * elsewhere, in the fenced file included, is not a listing.
  * It is operator text becoming prompt text, so one that fails the key rule —
  * which no setup route lets through, as the rule has no room for a newline, a
  * backtick or any control character — is not printed at all, only counted.
