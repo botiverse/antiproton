@@ -13,6 +13,9 @@ import {
   applySeedPass, markSeedsChosen, pendingSeedNotices, readSeedRecord, returnSeedNotices, SEED_RECORD_SCHEMA, takeSeedNotices, voidSeedNotices,
   type SeedNoticeRow, type SeedPlan,
 } from "./seed-record.ts";
+import {
+  listSeedFiles, manifestSha256, readSeal, SEED_FILES_SCHEMA, sealSeedFiles, writeSeedFile, type SealHow, type SeedWrite,
+} from "./seed-files.ts";
 
 /**
  * Durable Object SQLite backend. Same schema and same guards as the sqlite
@@ -131,6 +134,7 @@ export class DurableObjectStore implements StorageAdapter {
   async init() {
     for (const stmt of SCHEMA) this.#sql.exec(stmt);
     for (const stmt of SEED_RECORD_SCHEMA) this.#sql.exec(stmt);
+    for (const stmt of SEED_FILES_SCHEMA) this.#sql.exec(stmt);
     this.pluginDb.ensure();
     // Columns added after a table already exists are invisible to
     // CREATE TABLE IF NOT EXISTS; each ALTER is idempotent by trial.
@@ -810,6 +814,27 @@ export class DurableObjectStore implements StorageAdapter {
 
   async returnSeedNotices(tenantId: string, agentId: string, rows: readonly SeedNoticeRow[]) {
     this.#tx(() => returnSeedNotices(this.#sql, tenantId, agentId, rows));
+  }
+
+  async seedWrite(tenantId: string, agentId: string, file: SeedWrite) {
+    return this.#tx(() => writeSeedFile(this.#sql, tenantId, agentId, file, this.#now()));
+  }
+
+  async seedManifest(tenantId: string, agentId: string) {
+    const manifest = listSeedFiles(this.#sql, tenantId, agentId);
+    return { manifest, manifestSha256: manifestSha256(manifest), seal: readSeal(this.#sql, tenantId, agentId) };
+  }
+
+  async seal(tenantId: string, agentId: string, how: SealHow) {
+    return this.#tx(() => sealSeedFiles(this.#sql, tenantId, agentId, how, this.#now()));
+  }
+
+  async isSealed(tenantId: string, agentId: string) {
+    return readSeal(this.#sql, tenantId, agentId) !== null;
+  }
+
+  async listSeedFiles(tenantId: string, agentId: string) {
+    return listSeedFiles(this.#sql, tenantId, agentId);
   }
 
   async setPluginChoice(tenantId: string, agentId: string, plugin: string, choice: PluginChoice) {

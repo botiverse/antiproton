@@ -26,6 +26,9 @@ import {
   applySeedPass, markSeedsChosen, pendingSeedNotices, readSeedRecord, returnSeedNotices, SEED_RECORD_SCHEMA, takeSeedNotices, voidSeedNotices,
   type SeedNoticeRow, type SeedPlan,
 } from "./seed-record.ts";
+import {
+  listSeedFiles, manifestSha256, readSeal, SEED_FILES_SCHEMA, sealSeedFiles, writeSeedFile, type SealHow, type SeedWrite,
+} from "./seed-files.ts";
 
 const SCHEMA = `
 PRAGMA journal_mode = WAL;
@@ -184,6 +187,7 @@ export class SqliteStore implements StorageAdapter {
   async init() {
     this.#db.exec(SCHEMA);
     for (const stmt of SEED_RECORD_SCHEMA) this.#db.exec(stmt);
+    for (const stmt of SEED_FILES_SCHEMA) this.#db.exec(stmt);
     this.pluginDb.ensure();
     // CREATE TABLE IF NOT EXISTS silently accepts an existing table that lacks
     // the column, so an object created before this change would never get it.
@@ -1136,6 +1140,27 @@ export class SqliteStore implements StorageAdapter {
 
   async returnSeedNotices(tenantId: string, agentId: string, rows: readonly SeedNoticeRow[]) {
     this.#tx(() => returnSeedNotices(this.#usageSql(), tenantId, agentId, rows));
+  }
+
+  async seedWrite(tenantId: string, agentId: string, file: SeedWrite) {
+    return this.#tx(() => writeSeedFile(this.#usageSql(), tenantId, agentId, file, now()));
+  }
+
+  async seedManifest(tenantId: string, agentId: string) {
+    const manifest = listSeedFiles(this.#usageSql(), tenantId, agentId);
+    return { manifest, manifestSha256: manifestSha256(manifest), seal: readSeal(this.#usageSql(), tenantId, agentId) };
+  }
+
+  async seal(tenantId: string, agentId: string, how: SealHow) {
+    return this.#tx(() => sealSeedFiles(this.#usageSql(), tenantId, agentId, how, now()));
+  }
+
+  async isSealed(tenantId: string, agentId: string) {
+    return readSeal(this.#usageSql(), tenantId, agentId) !== null;
+  }
+
+  async listSeedFiles(tenantId: string, agentId: string) {
+    return listSeedFiles(this.#usageSql(), tenantId, agentId);
   }
 
   async setPluginChoice(tenantId: string, agentId: string, plugin: string, choice: PluginChoice) {
