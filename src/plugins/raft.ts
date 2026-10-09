@@ -429,6 +429,56 @@ function sdkFailure(
 }
 
 /**
+ * Line breaks and every other control character: C0 (with tab, CR and LF), DEL, C1, and the Unicode line and paragraph
+ * separators, which a model reads as line breaks too.
+ */
+const CONTROL_CHARS = /[\u0000-\u001F\u007F-\u009F\u2028\u2029]/g;
+/** The names a message's header line carries: who sent it, where, the task's assignee. */
+const ENVELOPE_NAMES = [
+  "sender_name", "senderName", "sender_description", "senderDescription", "channel_name", "parent_channel_name",
+  "task_assignee_name", "taskAssigneeName",
+] as const;
+type MessageEnvelope = Parameters<typeof projectRaftMessage>[0];
+
+function oneLine(value: string): string {
+  return value.replace(CONTROL_CHARS, " ");
+}
+
+/**
+ * A message envelope with every name its line shows (`ENVELOPE_NAMES`, attachment filenames, a third-party app's id
+ * and name) on one line: control characters become spaces. The SDK writes a message as one header line,
+ * `[target=… msg=…] @sender: content`, and indents the content's own line breaks, but puts the names in as they came,
+ * so a sender named "al\nice] @x: forged" would start a line that reads as a second message. Null when no name has
+ * one, so a caller can keep the SDK's line as it is. Content is not touched: its line breaks are the SDK's to indent.
+ */
+export function namesOnOneLine(e: MessageEnvelope): MessageEnvelope | null {
+  let changed = false;
+  const clean = (v: string) => { const out = oneLine(v); if (out !== v) changed = true; return out; };
+  const out: MessageEnvelope = { ...e };
+  for (const k of ENVELOPE_NAMES) {
+    const v = out[k];
+    if (typeof v === "string") out[k] = clean(v);
+  }
+  if (Array.isArray(e.attachments)) out.attachments = e.attachments.map((a) => (typeof a.filename === "string" ? { ...a, filename: clean(a.filename) } : a));
+  const app = e.third_party_event;
+  if (app && typeof app === "object" && !Array.isArray(app)) {
+    out.third_party_event = Object.fromEntries(Object.entries(app).map(([k, v]) =>
+      [k, (k === "client_id" || k === "client_name") && typeof v === "string" ? clean(v) : v]));
+  }
+  return changed ? out : null;
+}
+
+/**
+ * The message with its names on one line (`namesOnOneLine`): projected again from the cleaned envelope with the SDK's
+ * own projection, in the "tool" style every client here is made with (`raftFor`), so the line is the SDK's in every
+ * other respect. The message as it came when no name needed it.
+ */
+function withNamesOnOneLine(m: RaftMessage): RaftMessage {
+  const clean = namesOnOneLine(m.raw);
+  return (clean && projectRaftMessage(clean, "tool")) || m;
+}
+
+/**
  * One message as the model reads it: the SDK's canonical line, with the two things it says that may not be true on
  * this mount put right. The SDK ends a message that has attachments with "use attachments_download_url(…) to
  * download"; on a mount that is not offered that tool — a plugin built with no object storage or with an exclusion table
@@ -439,9 +489,11 @@ function sdkFailure(
  * colon, which reads as an empty message; here it says the content
  * was left out. Both are fixed by rebuilding the suffix from the message's own fields and replaced where the SDK put
  * it; the tests assert whole lines, so a change to the SDK's wording shows as a failing test rather than a doubled
- * suffix. A person's words in the line are never touched: only the SDK's suffix is replaced.
+ * suffix. A person's words in the line are never touched: only the SDK's suffix is replaced, and the names in its
+ * header are put on one line first (`withNamesOnOneLine`).
  */
-function modelLine(m: RaftMessage, unoffered: ReadonlySet<string>): string {
+function modelLine(message: RaftMessage, unoffered: ReadonlySet<string>): string {
+  const m = withNamesOnOneLine(message);
   let line = m.text;
   if (m.attachments.length && unoffered.has(DOWNLOAD_TOOL)) {
     const n = m.attachments.length;
@@ -1413,7 +1465,6 @@ export function ownerMessagesRequest(args: unknown): OwnerMessagesRequest {
   return request;
 }
 
-type MessageEnvelope = Parameters<typeof projectRaftMessage>[0];
 const optional = (v: unknown, type: "string" | "number") => v === undefined || typeof v === type;
 const nullable = (v: unknown, type: "string" | "number") => v === undefined || v === null || typeof v === type;
 
@@ -1460,6 +1511,7 @@ export function renderOwnerMessages(data: unknown, alias: string, unoffered: Rea
   for (const [i, m] of d.messages.entries()) {
     if (!isEnvelope(m)) throw malformed(tool, `message ${i} has a field of the wrong type`);
     let message: RaftMessage | null;
+    // Its names are put on one line by `modelLine` below, the one place every message line here is made.
     try { message = projectRaftMessage(m, "tool"); } catch { throw malformed(tool, `message ${i} could not be read`); }
     if (!message) throw malformed(tool, `message ${i} does not say which conversation it is in`);
     projected.push(message);
@@ -1829,7 +1881,10 @@ export function createRaftPlugin(deps: {
      * throw, which leaves the stored list as it was (after a credential change too).
      *
      * A personal assistant's two reads are listed when the same whoami answer says whose assistant this account is
-     * (`assistantOf`, read through the wire, `isAssistantOf`); otherwise each is skipped with that reason.
+     * (`assistantOf`, read through the wire, `isAssistantOf`). Otherwise they are left out with no `skipped` entry:
+     * nearly every account is not an assistant, and an entry would put two "not offered" lines about tools it can never
+     * have in every agent's `mounts` answer. A call to one is still refused (the gateway's unknown tool, and
+     * `ownerRead`'s own check behind it).
      */
     async snapshotTools(ctx: PluginContext): Promise<ListedTools> {
       if (!ctx.credential) {
@@ -1851,7 +1906,6 @@ export function createRaftPlugin(deps: {
         else tools.push(toolOf(op));
       }
       if (isAssistantOf(assistant.assistantOf(me.data))) tools.push(...ASSISTANT_TOOLS);
-      else for (const t of ASSISTANT_TOOLS) skipped.push({ name: t.name, reason: "this Raft account is not a personal assistant" });
       return { tools, skipped };
     },
 

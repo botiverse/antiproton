@@ -499,7 +499,10 @@ reach, or one added after the mount's snapshot was taken — or the SDK's
 code-only `raft.<operation>(…)`) is put in words in one place
 (`offeredTerms`), and so is a message line's attachment suffix when the
 download is not offered (`modelLine`); what a person wrote (a message, a
-description, a title, a preview) is passed on as written.
+description, a title, a preview) is passed on as written, except that the names
+in a message's header line (sender, channel, thread, task assignee, attachment
+filename) have line breaks and other control characters replaced with a space
+(`namesOnOneLine`), so a name cannot start a line that reads as another message.
 `attachments_download_url` fetches the file Raft points at into the agent's
 object storage (at most `ATTACHMENT_MAX_BYTES`) and returns its `artifact://`
 reference, never the URL; it is offered when the plugin is built with object
