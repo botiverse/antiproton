@@ -898,6 +898,85 @@ await check("toolConfig: on a deployment without the setup routes either field i
   must(!(await on.rt.store.loadAgent(T, A)) && !(await d1ProvisionedAgents(on.DB).get(T, "01JEVAL")), "an unknown mount made something");
 });
 
+// ---- instructions ----------------------------------------------------------
+
+/** What call `i` sent the provider, as the bytes on the wire, and its system message's text. */
+async function wireSystem(w: World, i: number): Promise<{ raw: Buffer; system: string }> {
+  const job = JSON.parse(await asked(w, i));
+  const real = globalThis.fetch;
+  const bodies: string[] = [];
+  globalThis.fetch = (async (_u: unknown, init?: RequestInit) => {
+    bodies.push(String(init?.body));
+    return new Response(JSON.stringify({ choices: [{ finish_reason: "stop", message: { content: "ok" } }], usage: { prompt_tokens: 1, completion_tokens: 1 } }),
+      { status: 200, headers: { "content-type": "application/json" } });
+  }) as typeof fetch;
+  try { await callQueuedModel(w.env as never, job, w.jobs[i]!); } finally { globalThis.fetch = real; }
+  must(bodies.length === 1, `requests: ${bodies.length}`);
+  const sys = (JSON.parse(bodies[0]!).messages ?? []).filter((m: any) => m.role === "system" || m.role === "developer");
+  must(sys.length === 1 && typeof sys[0].content === "string", `system messages: ${sys.length}`);
+  return { raw: Buffer.from(bodies[0]!, "utf8"), system: sys[0].content };
+}
+/** About `n` UTF-8 bytes of persona: CJK, emoji and ASCII, every line numbered so no stretch repeats another. */
+function persona(n: number, tag: string): string {
+  const out: string[] = [];
+  for (let i = 0; Buffer.byteLength(out.join("\n"), "utf8") < n; i++) out.push(`${tag} 第${i}条：请逐步核对每一个结果 🚀✅🧪 then answer in English, line ${i}.`);
+  return out.join("\n");
+}
+
+await check("instructions: with EVAL_SEED_ROUTES a 35 KB CJK-and-emoji persona is made (201), kept whole, and reaches the model byte for byte; a PATCH to another does too", async () => {
+  const INSTR = persona(35_000, "甲"), NEXT = persona(36_000, "乙");
+  const size = Buffer.byteLength(INSTR, "utf8");
+  must(size >= 35_000 && size < 65_536 && INSTR.length < size && /\p{Extended_Pictographic}/u.test(INSTR), `persona: ${size} bytes, ${INSTR.length} units`);
+  const w = await world("1", { post: { instructions: INSTR } });
+  must(w.posted?.status === 201 && w.posted.body.instructions === INSTR, `POST answered ${w.posted?.status}, ${Buffer.byteLength(String(w.posted?.body?.instructions), "utf8")} bytes`);
+  must((await d1ProvisionedAgents(w.DB).get(T, "01JEVAL"))?.instructions === INSTR, "the registry row is not the persona sent");
+  must(((await w.rt.store.loadAgent(T, A))?.config as any)?.description === INSTR, "the agent's record is not the persona sent");
+  const replay = await provisionPost(w, { instructions: INSTR });
+  must(replay.status === 200, `the same POST again: ${replay.status} ${replay.text.slice(0, 200)}`);
+  await w.rt.postMessage(T, A, "a real turn", "prompt");
+  await settle(w, 1);
+  must(jobCount(w) === 1, `jobs: ${jobCount(w)}`);
+  const first = await wireSystem(w, 0);
+  // Compared as bytes, in the request body as sent (where JSON escapes only the newlines; CJK and emoji travel as
+  // their own UTF-8) and in its system message once parsed: the persona follows "You are n." whole.
+  must(first.raw.includes(Buffer.from(JSON.stringify(INSTR).slice(1, -1), "utf8")), "the request body does not carry the persona's bytes");
+  must(Buffer.from(first.system, "utf8").includes(Buffer.from(`You are n.\n\n${INSTR}\n\n`, "utf8")), `system prompt: ${Buffer.byteLength(first.system, "utf8")} bytes, persona ${size}`);
+  await answer(w, 0, "ok");
+  for (let i = 0; i < 5 && !(await engineIdle(w)); i++) await w.D.alarm();
+  const patched = await call(w, "PATCH", A, { body: JSON.stringify({ instructions: NEXT }) });
+  must(patched.status === 200 && patched.body.instructions === NEXT, `PATCH: ${patched.status} ${patched.text.slice(0, 200)}`);
+  must((await d1ProvisionedAgents(w.DB).get(T, "01JEVAL"))?.instructions === NEXT, "PATCH: the registry row");
+  must(((await w.rt.store.loadAgent(T, A))?.config as any)?.description === NEXT, "PATCH: the agent's record");
+  // The harness already built keeps the prompt it was built with (AgentRuntime.agent, cf/src/runtime.ts, rebuilds on a
+  // catalogue change or an eviction, not on a persona edit); a restart builds the next one from the record.
+  const restarted = await call(w, "POST", `${A}/restart`);
+  must(restarted.status === 200, `restart: ${restarted.status} ${restarted.text}`);
+  w.rt = w.D.runtime();
+  await w.rt.postMessage(T, A, "the next turn", "prompt");
+  await settle(w, 2);
+  must(jobCount(w) === 2, `jobs after PATCH: ${jobCount(w)}`);
+  const second = await wireSystem(w, 1);
+  must(Buffer.from(second.system, "utf8").includes(Buffer.from(`You are n.\n\n${NEXT}\n\n`, "utf8")) && !second.system.includes(INSTR), `after PATCH: new ${second.system.includes(NEXT)} old ${second.system.includes(INSTR)} same-as-first ${second.system === first.system}`);
+});
+
+await check("instructions: with EVAL_SEED_ROUTES one byte over 64 KiB is 422 with both sizes and makes nothing; without it, 8000 characters is the bound", async () => {
+  const on = await bareWorld("1");
+  const over = "汉".repeat(21_845) + "ab";
+  const r = await provisionPost(on, { instructions: over });
+  must(r.status === 422 && r.body?.error?.param === "instructions" && r.body.error.message === "instructions is at most 65536 UTF-8 bytes; this one is 65537", `${r.status} ${r.text.slice(0, 300)}`);
+  must(!(await on.rt.store.loadAgent(T, A)) && !(await d1ProvisionedAgents(on.DB).get(T, "01JEVAL")), "a refused POST made something");
+  for (const flag of [null, "0"]) {
+    const off = await bareWorld(flag);
+    const no = await provisionPost(off, { instructions: "x".repeat(8_001) });
+    must(no.status === 422 && no.body?.error?.param === "instructions" && /at most 8000 characters; this one is 8001/.test(no.body.error.message), `${flag} 8001: ${no.status} ${no.text.slice(0, 300)}`);
+    must(!(await d1ProvisionedAgents(off.DB).get(T, "01JEVAL")), `${flag}: a refused POST made a row`);
+    const yes = await provisionPost(off, { instructions: "x".repeat(8_000) });
+    must(yes.status === 201 && yes.body.instructions === "x".repeat(8_000), `${flag} 8000: ${yes.status} ${yes.text.slice(0, 300)}`);
+    const patch = await call(off as World, "PATCH", A, { body: JSON.stringify({ instructions: "x".repeat(8_001) }) });
+    must(patch.status === 422 && patch.body?.error?.param === "instructions", `${flag} PATCH 8001: ${patch.status} ${patch.text.slice(0, 300)}`);
+  }
+});
+
 await check("toolConfig: under minimal a mount whose plugin asks questions is refused (400, nothing recorded); without minimal it is given", async () => {
   const entry = { alias: "asker", plugin: "asker", config: { account: "a" }, secretRef: null, policy: null, for: ["console", "raft"] as const, since: 98 };
   AgentRuntime.DEFAULT_MOUNTS.push(entry as never);

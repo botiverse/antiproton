@@ -184,6 +184,12 @@ The same three reads for an agent a Raft server provisioned, with the provider t
   `400`, `code: "invalid"`, `param` naming it; a missing agent, file or directory is `404`,
   `code: "not_found"`; a failure underneath is `502`, `code: "unavailable"`.
 
+**An agent's `instructions`** (`POST /provision/agents` and `PATCH /provision/agents/{agentId}`) are
+at most 8000 characters, counted as `String.length` counts them (`INSTRUCTIONS_MAX`,
+`cf/src/provision/handlers.ts`). Over it is `422`, `code: "invalid"`, `param: "instructions"`, with
+the limit and the value's size in the message, and nothing is made or changed; a value is never cut.
+A deployment serving the evaluation routes counts them differently ([below](#instructions)).
+
 ## Evaluation setup (preview only)
 
 Routes for an evaluator to give an agent its workspace before the agent first runs, start it on a
@@ -204,7 +210,22 @@ for an agent that is not a live provisioned agent of the tenant.
 | `GET` | `/provision/agents/{agentId}/model-input?session=&call=` | what one model call was sent |
 | `GET` | `/provision/agents/{agentId}/tools` | the tools the next turn offers the model |
 
-The same flag lets `POST /provision/agents` choose the agent's tools ([below](#choosing-the-agents-tools)).
+The same flag lets `POST /provision/agents` choose the agent's tools ([below](#choosing-the-agents-tools)),
+and gives `instructions` a larger bound ([below](#instructions)).
+
+### Instructions
+
+Where `EVAL_SEED_ROUTES` is `"1"`, an agent's `instructions` on `POST /provision/agents` and
+`PATCH /provision/agents/{agentId}` are at most 65,536 bytes of UTF-8 (`EVAL_INSTRUCTIONS_MAX_UTF8`,
+`cf/src/provision/handlers.ts`) instead of 8000 characters, so a persona in CJK or emoji meets the
+same bound as one in ASCII. One byte over is `422`, `code: "invalid"`, `param: "instructions"`,
+message `instructions is at most 65536 UTF-8 bytes; this one is <n>`, and nothing is made or
+changed: never cut, since an evaluation of an agent given part of its instructions measures the
+wrong agent. Nothing after the check bounds them: the registry row, the agent's record and the
+system prompt carry the value as sent (`test/eval-seed-object.ts` sends a 35 KB CJK-and-emoji
+persona and finds its bytes in the model request). The prompt drops surrounding whitespace, as it
+does for every persona (`personaSection`, `src/runtime/pi-prompt.ts`). A `PATCH` reaches the next
+harness built, not one already open: `POST …/restart` between turns makes the next turn use it.
 
 ### Choosing the agent's tools
 
