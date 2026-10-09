@@ -16,7 +16,7 @@ import type { StorageAdapter } from "../src/core/store.ts";
 import { statePlugin } from "../src/plugins/state.ts";
 import type { PluginContext } from "../src/plugins/types.ts";
 import { canonJson } from "../src/core/canon-json.ts";
-import { seededPathsListed } from "../cf/src/fresh-context.ts";
+import { recordModelInput, seededPathsListed } from "../cf/src/fresh-context.ts";
 import { setLogSink } from "../src/core/log.ts";
 import {
   manifestSha256, SEED_AGENT_MAX_BYTES, SEED_FILE_MAX_BYTES, seedInline, seedPathProblem, seedSnapshot, seedText, sha256Hex,
@@ -367,6 +367,12 @@ await check("model-input counts a seeded path only where the setup block lists i
   const got = seededPathsListed(system, ["MEMORY.md", "a", "notes/b.md", "notes/c.md", "notes/d.md", "notes/gone.md", "b.md"]);
   must(show(got) === show(["MEMORY.md", "notes/b.md", "notes/gone.md"]), `listed: ${show(got)}`);
   must(seededPathsListed("- `a` is not a seeded line\na plain a", ["a"]).length === 0, "a short path counted from a mention");
+  // The record a model call gets is counted the same way.
+  const { sql } = sqliteHost();
+  sql.exec("CREATE TABLE pi_model_jobs (id TEXT PRIMARY KEY, request TEXT, session TEXT, answer TEXT)");
+  sql.exec("INSERT INTO pi_model_jobs(id, request, session) VALUES ('j1', ?, 'main')", JSON.stringify({ context: { systemPrompt: system, messages: [] } }));
+  const ev = recordModelInput(sql as never, "j1", ["a", "MEMORY.md", "notes/c.md"], 1);
+  must(show(ev?.seedPathsInSystemPrompt) === show(["MEMORY.md"]), `recorded: ${show(ev?.seedPathsInSystemPrompt)}`);
 });
 
 await check("production (cf/wrangler.jsonc) does not set EVAL_SEED_ROUTES; preview sets it to \"1\"", () => {
