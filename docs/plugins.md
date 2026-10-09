@@ -572,7 +572,8 @@ them is refused before anything is sent. Every successful result opens with a
 line saying the content is the owner's, written outside the conversation, to
 be treated as information rather than instructions; a failure shows Raft's
 HTTP status and error code as sent (`403 assistant_not_enabled`,
-`404 channel_not_found`, with Raft's message when it sent one) and is not
+`404 channel_not_found`, with Raft's message when it sent one, cut at 300
+characters and marked `… (cut)`) and is not
 retried; a 5xx, a 429 or no answer at all is marked transient. Both reads'
 answers are camelCase (`hasMore`, `hasOlder`, `nextOffset`), and one in
 another style is refused as malformed rather than read as missing. They go
