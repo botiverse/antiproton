@@ -72,7 +72,7 @@ import { adminMigrateEngine, type MigrateOp } from "./admin-migrate.ts";
 import { readDiagnosis } from "./diagnose-read.ts";
 import { agentObjectName } from "./object-name.ts";
 import { readTranscript, transcriptEvents, approvalsByOp, isPd, type TranscriptEvents } from "./transcript-read.ts";
-import { evalTranscript, localTrace, readTraceWindow, type EvalTranscript } from "./eval-read.ts";
+import { agentSecretValues, evalTranscript, localTrace, readTraceWindow, redactCredentials, type EvalTranscript } from "./eval-read.ts";
 import type { TraceOutboxRow } from "../../src/trace/outbox.ts";
 import { readEngineStorage } from "./engine-read.ts";
 import { pdVersion } from "../../src/runtime/pd-transcript.ts";
@@ -2058,18 +2058,34 @@ export class AgentDO extends DurableObject<Env> {
   }
 
   /**
-   * An evaluation's transcript export: one page of a conversation, read as /admin/transcript reads it, straight from
-   * this object's SQLite with SELECTs only (cf/src/eval-read.ts). Not through the runtime, whose agent() re-pins mounts.
+   * An evaluation's transcript export: one page of a main conversation, read as /admin/transcript reads it, straight
+   * from this object's SQLite with SELECTs only (cf/src/eval-read.ts). Not through the runtime, whose agent() re-pins
+   * mounts. Redacted here, before it leaves the object, with the agent's own sealed values scrubbed by exact match:
+   * those values are opened in this object and never returned. Refused (503) when they cannot be opened.
    */
-  async evalTranscript(tenantId: string, agentId: string, session: string | null, offset: number, limit: number): Promise<EvalTranscript | null> {
+  async evalTranscript(tenantId: string, agentId: string, session: string | null, offset: number, limit: number): Promise<EvalTranscript | null | { unavailable: string }> {
     if (!this.#isAgent(tenantId, agentId)) return null;
-    return evalTranscript(this.sql, tenantId, agentId, session, offset, limit);
+    const secrets = await agentSecretValues(this.sql, tenantId, agentId, this.env);
+    if (!secrets.ok) return { unavailable: secrets.message };
+    return evalTranscript(this.sql, tenantId, agentId, session, offset, limit, (v) => redactCredentials(v, { secrets: secrets.values }));
   }
 
   /** The trace rows this object still holds after `afterSeq` (cf/src/eval-read.ts `localTrace`); a read, made table or not. */
   async evalTraceLocal(tenantId: string, agentId: string, afterSeq: number, limit: number): Promise<TraceOutboxRow[] | null> {
     if (!this.#isAgent(tenantId, agentId)) return null;
     return localTrace(this.sql, tenantId, agentId, afterSeq, limit);
+  }
+
+  /**
+   * `rows` (the trace export's, from this object and the bucket) redacted here as the transcript is, with this agent's
+   * sealed values scrubbed by exact match, so those values never leave the object. Null for no such agent.
+   */
+  async evalRedact(tenantId: string, agentId: string, rows: TraceOutboxRow[]): Promise<{ rows: TraceOutboxRow[]; redactions: number } | null | { unavailable: string }> {
+    if (!this.#isAgent(tenantId, agentId)) return null;
+    const secrets = await agentSecretValues(this.sql, tenantId, agentId, this.env);
+    if (!secrets.ok) return { unavailable: secrets.message };
+    const r = redactCredentials(rows, { secrets: secrets.values });
+    return { rows: r.value as TraceOutboxRow[], redactions: r.redactions };
   }
 
   /** The raft mount's push state, read from the store: no tool call, no trace, no usage. */
@@ -3423,14 +3439,22 @@ function provisionDeps(env: Env): ProvisionDeps {
         tools: (tenantId, agentId) => stub(tenantId, agentId).offeredTools(tenantId, agentId),
         transcript: (tenantId, agentId, session, offset, limit) => stub(tenantId, agentId).evalTranscript(tenantId, agentId, session, offset, limit),
         // The object first, then the bucket: the order cf/src/eval-read.ts needs so a flush between them loses nothing.
-        trace: (tenantId, agentId, q) => readTraceWindow({
-          local: (afterSeq, limit) => stub(tenantId, agentId).evalTraceLocal(tenantId, agentId, afterSeq, limit) as Promise<TraceOutboxRow[] | null>,
-          list: async (prefix, cursor) => {
-            const page = await env.ARTIFACTS.list({ prefix, ...(cursor ? { cursor } : {}) });
-            return { objects: page.objects.map((o) => ({ key: o.key, uploaded: o.uploaded })), truncated: page.truncated, ...(page.truncated ? { cursor: page.cursor } : {}) };
-          },
-          get: async (key) => { const o = await env.ARTIFACTS.get(key); return o ? new TextDecoder().decode(await o.arrayBuffer()) : null; },
-        }, tenantId, agentId, q),
+        // Then back to the object to be redacted with the agent's sealed values, which never come out of it.
+        trace: async (tenantId, agentId, q) => {
+          const w = await readTraceWindow({
+            local: (afterSeq, limit) => stub(tenantId, agentId).evalTraceLocal(tenantId, agentId, afterSeq, limit) as Promise<TraceOutboxRow[] | null>,
+            list: async (prefix, cursor) => {
+              const page = await env.ARTIFACTS.list({ prefix, ...(cursor ? { cursor } : {}) });
+              return { objects: page.objects.map((o) => ({ key: o.key, uploaded: o.uploaded })), truncated: page.truncated, ...(page.truncated ? { cursor: page.cursor } : {}) };
+            },
+            get: async (key) => { const o = await env.ARTIFACTS.get(key); return o ? new TextDecoder().decode(await o.arrayBuffer()) : null; },
+          }, tenantId, agentId, q);
+          if (!w.ok) return w;
+          const r = await (stub(tenantId, agentId).evalRedact(tenantId, agentId, w.rows) as Promise<{ rows: TraceOutboxRow[]; redactions: number } | null | { unavailable: string }>);
+          if (r === null) return { ok: false, status: 404, message: `no agent ${agentId}` };
+          if ("unavailable" in r) return { ok: false, status: 503, message: r.unavailable };
+          return { ...w, rows: r.rows, redactions: r.redactions };
+        },
         mountable: AgentRuntime.DEFAULT_MOUNTS.filter((m) => m.for.includes("raft")).map((m) => m.alias),
       },
     } : {}),

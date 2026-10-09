@@ -21,6 +21,7 @@ import { seedSnapshot, sha256Hex } from "../src/store/seed-files.ts";
 import { ensureClientCalls } from "../src/runtime/client-calls.ts";
 import { callQueuedModel } from "../cf/src/model-request.ts";
 import { appendTrace } from "../src/trace/outbox.ts";
+import { evalTranscript, type EvalTranscript } from "../cf/src/eval-read.ts";
 
 const STAND_IN = "export class DurableObject { constructor(ctx, env) { this.ctx = ctx; this.env = env; } }" +
   " export class WorkerEntrypoint { constructor(ctx, env) { this.ctx = ctx; this.env = env; } }" +
@@ -1163,8 +1164,11 @@ function listByPrefix(w: World) {
     delimitedPrefixes: [], truncated: false,
   });
 }
-/** One turn in which the model calls `p__noop`, which answers `result`, and then ends with `reply`; `base` is the jobs before it. */
-async function toolTurn(w: World, prompt: string, result: Record<string, unknown>, reply: string, args: Record<string, unknown> = {}) {
+/**
+ * One turn in which the model calls `tool` (`p__noop`, which answers `result`, unless another is named), and then ends
+ * with `reply`; `base` is the jobs before it.
+ */
+async function toolTurn(w: World, prompt: string, result: Record<string, unknown>, reply: string, args: Record<string, unknown> = {}, tool = "p__noop") {
   const base = jobCount(w);
   pushyAnswer = result;
   try {
@@ -1172,7 +1176,7 @@ async function toolTurn(w: World, prompt: string, result: Record<string, unknown
     await settle(w, base + 1);
     must(jobCount(w) === base + 1, `the turn did not reach the model: ${jobCount(w)} jobs`);
     const job = JSON.parse(await asked(w, base)) as { model?: { api?: string; provider?: string } };
-    await w.D.deliverAnswer(T, A, w.jobs[base]!, { role: "assistant", content: [{ type: "text", text: "calling" }, { type: "toolCall", id: `call-${base}`, name: "p__noop", arguments: args }],
+    await w.D.deliverAnswer(T, A, w.jobs[base]!, { role: "assistant", content: [{ type: "text", text: "calling" }, { type: "toolCall", id: `call-${base}`, name: tool, arguments: args }],
       api: job.model?.api ?? "x", provider: job.model?.provider ?? "x", model: "m1", usage: USAGE, stopReason: "toolUse", timestamp: 0 } as never, 5);
     await settle(w, base + 2);
     must(jobCount(w) === base + 2, `the tool's result did not go back to the model: ${jobCount(w)} jobs`);
@@ -1266,6 +1270,88 @@ await check("transcript: a credential anywhere in a tool's result or arguments i
   const plain = show((await admin(v)).body);
   must(plain.includes(KEY) && !plain.includes(RAFT_CRED) && !plain.includes(String(mount.secretRef)), "the operator's read carries the sealed credential or its reference");
   must(!r.text.includes(String(mount.secretRef)), "the export carries the mount's secret reference");
+});
+
+await check("transcript and trace: a kept secret never leaves — secret_put's value and secret_get's by tool, every exact appearance elsewhere, each counted", async () => {
+  const w = await world();
+  listByPrefix(w);
+  // A bare UUID, as Exa's key is: no shape finds it, so only the tool and the exact match can.
+  const SECRET = "0f8fad5b-d9cb-469f-a165-70867728950e";
+  await toolTurn(w, "keep this key", {}, "kept", { name: "exa", value: SECRET }, "state__secret_put");
+  await toolTurn(w, "read it back", {}, `the key is ${SECRET}`, { name: "exa" }, "state__secret_get");
+  await toolTurn(w, "echo", { [SECRET]: `x ${SECRET} y`, nested: JSON.stringify({ k: SECRET }) }, "done");
+  appendTrace(w.raw.sql as never, [{ at: Date.now(), tenantId: T, agentId: A, kind: "tool.call", spanId: "op_s", status: "succeeded", verdict: "ok", attrs: { tool: "pushy.noop", note: `saw ${SECRET}` } }]);
+  // Positive control: the operator's unredacted read holds it, in the call, the result, the reply and the echo.
+  const plain = show((await admin(w)).body);
+  must(plain.split(SECRET).length - 1 >= 6, `the fixture does not carry the secret where planted: ${plain.split(SECRET).length - 1}`);
+  const r = await call(w, "GET", `${A}/transcript`);
+  must(r.status === 200 && !r.text.includes(SECRET), `the export carries the secret: ${r.text.slice(0, 400)}`);
+  const calls = r.body.events.filter((e: any) => e.kind === "model.response").flatMap((e: any) => e.payload.toolCalls ?? []);
+  const put = calls.find((c: any) => c.name === "state__secret_put");
+  must(put?.arguments.name === "exa" && put.arguments.value === "<redacted:kept-secret>", `secret_put's arguments: ${show(put)}`);
+  const got = r.body.events.find((e: any) => e.kind === "tool.result" && e.payload.tool === "state__secret_get")?.payload;
+  must(got?.status === "succeeded" && got.result.name === "exa" && got.result.value === "<redacted:kept-secret>", `secret_get's result: ${show(got)}`);
+  must(r.body.events.some((e: any) => e.kind === "model.response" && e.payload.text === "the key is <redacted:agent-secret>"), "the reply that repeats it");
+  const echo = r.body.events.filter((e: any) => e.kind === "tool.result" && e.payload.tool === "p__noop").at(-1)?.payload.result;
+  must(echo?.["<redacted:agent-secret>"] === "x <redacted:agent-secret> y" && echo.nested === '{"k":"<redacted:agent-secret>"}', `the echo: ${show(echo)}`);
+  // One each: put's value, get's value (by tool), the reply, the echo's key, its value, the JSON inside a string.
+  must(r.body.redactions === 6, `redactions: ${r.body.redactions}`);
+  const t = await call(w, "GET", `${A}/trace`);
+  must(t.status === 200 && !t.text.includes(SECRET) && t.body.rows.some((x: any) => x.attrs.note === "saw <redacted:agent-secret>") && t.body.redactions >= 1, t.text.slice(0, 400));
+});
+
+await check("transcript and trace: a sealed value the object cannot open refuses the export (503) rather than send it unscrubbed", async () => {
+  const w = await world();
+  w.raw.sql.exec("INSERT INTO secrets(tenant_id, agent_id, name, ciphertext, iv, created_at, updated_at) VALUES (?, ?, 'kept:x', 'AAAA', 'AAAAAAAAAAAAAAAA', 0, 0)", T, A);
+  for (const route of ["transcript", "trace"]) {
+    const r = await call(w, "GET", `${A}/${route}`);
+    must(r.status === 503 && r.body.error.code === "unavailable" && !r.text.includes('"events"') && !r.text.includes('"rows"'), `${route}: ${r.status} ${r.text}`);
+  }
+});
+
+await check("transcript: a page stops before its serialized events pass the byte bound, at least one event, and says where to go on", async () => {
+  const w = await world();
+  await toolTurn(w, "a".repeat(3000), { big: "b".repeat(3000) }, "c".repeat(3000));
+  const id = (v: unknown) => ({ value: v, redactions: 0 });
+  const whole = evalTranscript(w.raw.sql as never, T, A, null, 0, 100, id)!;
+  must(whole.shown === whole.total && whole.total === 4 && whole.nextCursor === null, show({ shown: whole.shown, total: whole.total }));
+  const first = evalTranscript(w.raw.sql as never, T, A, null, 0, 100, id, 4000)!;
+  const bytes = (v: unknown) => new TextEncoder().encode(JSON.stringify(v)).byteLength;
+  must(first.shown > 0 && first.shown < first.total && first.nextCursor === String(first.shown), `a bound of 4000 bytes: ${show({ shown: first.shown, next: first.nextCursor })}`);
+  must(bytes(first.byOp) + first.events.reduce((n, e) => n + bytes(e), 0) <= 4000, "the page passes its bound");
+  const tiny = evalTranscript(w.raw.sql as never, T, A, null, 1, 100, id, 1)!;
+  must(tiny.shown === 1 && tiny.nextCursor === "2" && show(tiny.events[0]) === show(whole.events[1]), "a page under any bound still holds one event");
+  // Paging under the bound reaches every event once.
+  const all: unknown[] = [];
+  for (let c: string | null = "0"; c !== null;) { const p: EvalTranscript = evalTranscript(w.raw.sql as never, T, A, null, Number(c), 100, id, 4000)!; all.push(...p.events); c = p.nextCursor; }
+  must(show(all) === show(whole.events), "the bounded pages are not the conversation");
+});
+
+await check("transcript: a session that is not main or main.<n> is 422 before the object is asked, a task of the agent included", async () => {
+  const w = await world();
+  await toolTurn(w, "hello", {}, "done");
+  const task = String(w.raw.sql.exec("SELECT task_id FROM tasks LIMIT 1").toArray()[0]?.task_id ?? `t_${A}`);
+  for (const s of [task, `t_${A}`, "main.0", "main.01", "MAIN", "main.1.2"]) {
+    const r = await call(w, "GET", `${A}/transcript?session=${encodeURIComponent(s)}`);
+    must(r.status === 422 && r.body.error.param === "session", `${s}: ${r.status} ${r.text.slice(0, 200)}`);
+  }
+});
+
+await check("each transcript or trace read logs one eval.read line: route, session or window, count, redactions, token hash; never content", async () => {
+  const w = await world();
+  listByPrefix(w);
+  await toolTurn(w, "PROMPT-AUDIT-77", { key: "sk-" + "proj-" + "Kx7".repeat(12) }, "REPLY-AUDIT-88");
+  lines.length = 0;
+  const tr = await call(w, "GET", `${A}/transcript?limit=2`);
+  const tc = await call(w, "GET", `${A}/trace?from=${Date.now() - 3_600_000}`);
+  must(tr.status === 200 && tc.status === 200, `${tr.status} ${tc.status}`);
+  const ours = lines.map((l) => JSON.parse(l)).filter((l) => l.evt === "eval.read");
+  must(ours.length === 2, `lines: ${show(ours)}`);
+  const [a, b] = ours;
+  must(a.route === "transcript" && a.tenant === T && a.agent === A && a.session === "main" && a.count === 2 && a.cursor === 0 && a.redactions === tr.body.redactions && a.credentialId === w.tokenHash, show(a));
+  must(b.route === "trace" && b.from === tc.body.from && b.to === tc.body.to && b.count === tc.body.rows.length && b.redactions === tc.body.redactions && b.credentialId === w.tokenHash, show(b));
+  const logged = lines.join("\n");
+  must(!logged.includes("PROMPT-AUDIT-77") && !logged.includes("REPLY-AUDIT-88") && !logged.includes("Kx7Kx7") && !logged.includes(w.token), "a log line carries content or the token");
 });
 
 await check("trace: a turn's rows are read from the object, then from the bucket once the alarm pass exports and prunes them; the same rows either way", async () => {

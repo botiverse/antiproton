@@ -21,8 +21,8 @@ import type { Json } from "../../../src/core/types.ts";
 import { originProblem } from "../../../src/plugins/types.ts";
 import { secretShape } from "../secret-shape.ts";
 import {
-  redactCredentials, TRACE_LIMIT_DEFAULT, TRACE_LIMIT_MAX, TRACE_WINDOW_MAX_MS, TRANSCRIPT_LIMIT_DEFAULT, TRANSCRIPT_LIMIT_MAX,
-  type TraceQuery, type TraceWindow,
+  MAIN_SESSION_ID, redactCredentials, TRACE_LIMIT_DEFAULT, TRACE_LIMIT_MAX, TRACE_WINDOW_MAX_MS, TRANSCRIPT_LIMIT_DEFAULT, TRANSCRIPT_LIMIT_MAX,
+  type EvalTranscript, type TraceQuery, type TraceWindow,
 } from "../eval-read.ts";
 import type { ConnectionRegistry, ConnectorStore, ProviderTokenIdentity, ProvisionRegistry, ProvisionedAgent } from "../control-plane.ts";
 import { CONNECTION_PROVIDERS, returnUrlProblem, scopesFor, type ConnectionProvider } from "./connect.ts";
@@ -125,7 +125,10 @@ export interface SeedOps {
   modelInput(tenantId: string, agentId: string, session: string | null, call: number | null): Promise<unknown | null>;
   /** The tools the agent's next turn offers the model, read without retaking or writing anything. */
   tools(tenantId: string, agentId: string): Promise<unknown | null>;
-  /** One page of a conversation, as /admin/transcript reads it (cf/src/eval-read.ts `evalTranscript`); null: no such agent or conversation. */
+  /**
+   * One page of a main conversation, as /admin/transcript reads it, redacted in the agent's object (cf/src/eval-read.ts
+   * `evalTranscript`); null: no such agent or conversation; `unavailable`: its sealed values could not be opened to scrub.
+   */
   transcript(tenantId: string, agentId: string, session: string | null, offset: number, limit: number): Promise<unknown | null>;
   /** The agent's trace rows in a window (cf/src/eval-read.ts `readTraceWindow`). */
   trace(tenantId: string, agentId: string, q: TraceQuery): Promise<TraceWindow>;
@@ -719,16 +722,25 @@ async function evalSetup(
     const r = await seed.tools(tenantId, agentId);
     return r ? ok(r) : gone();
   }
-  // The two exports: read-only, and walked whole for credential shapes before they leave (cf/src/eval-read.ts).
+  // The two exports: read-only, and walked whole for credentials before they leave (cf/src/eval-read.ts): in the
+  // agent's object, with its own sealed values, and once more here. Each read logs one line, never its content.
+  const read = (fields: Record<string, string | number | null>) =>
+    logEvent("eval.read", { tenant: tenantId, agent: agentId, ...fields, credentialId });
   if (route === "transcript" && method === "GET") {
     const limit = wholeParam(query, "limit", TRANSCRIPT_LIMIT_DEFAULT, 1, TRANSCRIPT_LIMIT_MAX);
     if (isFail(limit)) return fail(limit);
     const offset = wholeParam(query, "cursor", 0, 0, Number.MAX_SAFE_INTEGER);
     if (isFail(offset)) return fail(offset);
     const session = query.get("session") || null;
-    const r = await seed.transcript(tenantId, agentId, session, offset, limit);
+    if (session !== null && !MAIN_SESSION_ID.test(session)) {
+      return fail({ status: 422, code: "invalid", message: "session is a main conversation's id: main or main.<n>", param: "session" });
+    }
+    const r = await seed.transcript(tenantId, agentId, session, offset, limit) as EvalTranscript | { unavailable: string } | null;
     if (!r) return fail({ status: 404, code: "not_found", message: session === null ? `no agent ${agentId}` : `no conversation ${session} of agent ${agentId}` });
-    return redacted(r);
+    if ("unavailable" in r) return fail({ status: 503, code: "unavailable", message: r.unavailable });
+    const body = redacted(r);
+    read({ route, session: r.sessionId, cursor: offset, count: r.shown, redactions: body.redactions });
+    return ok(body);
   }
   if (route === "trace" && method === "GET") {
     const now = Date.now();
@@ -736,9 +748,13 @@ async function evalSetup(
     // Exclusive at its end, so the default reaches a row that ended this millisecond.
     const to = toText === null ? (fromText === null ? now + 1 : null) : instant(toText);
     const from = fromText === null ? null : instant(fromText);
-    if (Number.isNaN(from)) return fail({ status: 422, code: "invalid", message: "from is an ISO 8601 time or milliseconds since the epoch", param: "from" });
-    if (Number.isNaN(to)) return fail({ status: 422, code: "invalid", message: "to is an ISO 8601 time or milliseconds since the epoch", param: "to" });
+    if (Number.isNaN(from)) return fail({ status: 422, code: "invalid", message: `from is an ISO 8601 time or milliseconds since the epoch, at most ${MAX_INSTANT}`, param: "from" });
+    if (Number.isNaN(to)) return fail({ status: 422, code: "invalid", message: `to is an ISO 8601 time or milliseconds since the epoch, at most ${MAX_INSTANT}`, param: "to" });
     const window = { from: from ?? to! - TRACE_WINDOW_MAX_MS, to: to ?? from! + TRACE_WINDOW_MAX_MS };
+    // The one bound alone puts the other 24 hours away, which may pass the last time a Date can hold.
+    if (!(Math.abs(window.from) <= MAX_INSTANT && Math.abs(window.to) <= MAX_INSTANT)) {
+      return fail({ status: 422, code: "invalid", message: `the window must lie within ${MAX_INSTANT} milliseconds of the epoch`, param: fromText === null ? "to" : "from" });
+    }
     if (!(window.from < window.to)) return fail({ status: 422, code: "invalid", message: "from is before to", param: "from" });
     if (window.to - window.from > TRACE_WINDOW_MAX_MS) {
       return fail({ status: 422, code: "invalid", message: `the window is at most ${TRACE_WINDOW_MAX_MS / 3_600_000} hours; page through a longer one`, param: "to" });
@@ -749,18 +765,27 @@ async function evalSetup(
     if (isFail(afterSeq)) return fail(afterSeq);
     const r = await seed.trace(tenantId, agentId, { ...window, afterSeq, limit });
     if (!r.ok) return fail({ status: r.status, code: r.status === 404 ? "not_found" : "unavailable", message: r.message });
-    return redacted({
+    const body = redacted({
       agentId, from: new Date(window.from).toISOString(), to: new Date(window.to).toISOString(),
-      cursor: String(afterSeq), nextCursor: r.nextCursor, rows: r.rows, scanned: r.scanned,
+      cursor: String(afterSeq), nextCursor: r.nextCursor, rows: r.rows, scanned: r.scanned, redactions: r.redactions ?? 0,
     });
+    read({ route, from: body.from as string, to: body.to as string, cursor: afterSeq, count: r.rows.length, redactions: body.redactions });
+    return ok(body);
   }
   return null;
 }
 
-/** The body, walked whole for credential shapes, with how many were replaced (cf/src/eval-read.ts). */
-function redacted(body: unknown): Response {
+/** The latest time a Date holds, either side of the epoch (ECMA-262 21.4.1.1). */
+const MAX_INSTANT = 8.64e15;
+
+/**
+ * The body walked once more for credential shapes (cf/src/eval-read.ts), its `redactions` (the object's own walk's,
+ * when it made one) plus this walk's.
+ */
+function redacted(body: object): Record<string, unknown> & { redactions: number } {
   const r = redactCredentials(body);
-  return ok({ ...(r.value as Record<string, unknown>), redactions: r.redactions });
+  const before = (body as { redactions?: unknown }).redactions;
+  return { ...(r.value as Record<string, unknown>), redactions: (typeof before === "number" ? before : 0) + r.redactions };
 }
 
 /** A whole-number query parameter in [min, max], `fallback` when absent. */
@@ -774,8 +799,8 @@ function wholeParam(query: URLSearchParams, name: string, fallback: number, min:
   return n;
 }
 
-/** Milliseconds since the epoch, from digits or an ISO 8601 time; NaN for anything else. */
+/** Milliseconds since the epoch, from digits or an ISO 8601 time; NaN for anything else, and past what a Date holds. */
 function instant(text: string): number {
-  if (/^\d+$/.test(text)) return Number(text);
-  return /^\d{4}-\d{2}-\d{2}T/.test(text) ? Date.parse(text) : NaN;
+  const n = /^\d+$/.test(text) ? Number(text) : /^\d{4}-\d{2}-\d{2}T/.test(text) ? Date.parse(text) : NaN;
+  return Math.abs(n) <= MAX_INSTANT ? n : NaN;
 }

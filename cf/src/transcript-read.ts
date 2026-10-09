@@ -47,17 +47,20 @@ export interface ApprovalMark {
  * A conversation's entries, with runs that failed before their first model call
  * (which leave no entry, only the engine's outcome record: `readFailedRuns`) in sequence, and references
  * masked: a stored tool result written before references changed shape still
- * names the bucket, tenant and agent (tygg, 2026-09-14). `tail` > 0 keeps the last ones.
+ * names the bucket, tenant and agent (tygg, 2026-09-14). `tail` > 0 keeps the last ones; `range`, when given, keeps
+ * those from `offset` instead, at most `limit`, so only the events kept are masked.
  */
 export function transcriptEvents(
   entries: Entry[], sql: Sql, session: string, owner: { tenantId: string; agentId: string }, tail: number,
+  range?: { offset: number; limit: number },
 ): Pick<TranscriptEvents, "total" | "shown" | "events"> {
   const failed = readFailedRuns(sql, session).map((f) => ({
     sequence: f.seq, kind: "model.failed",
     payload: { error: `${f.code}: ${f.message}`, operationId: f.operationId, at: f.at } as Record<string, unknown>,
   }));
   const all = [...entriesToEvents(entries), ...failed].sort((a, b) => a.sequence - b.sequence);
-  const events = (tail > 0 ? all.slice(-tail) : all).map((e) => ({
+  const kept = range ? all.slice(range.offset, range.offset + range.limit) : tail > 0 ? all.slice(-tail) : all;
+  const events = kept.map((e) => ({
     sequence: e.sequence, kind: e.kind,
     payload: JSON.parse(maskRawRefs(JSON.stringify(e.payload), owner)) as typeof e.payload,
     createdAt: Number((e.payload as any)?.at ?? 0),
@@ -121,12 +124,14 @@ export function readApprovals(sql: Sql, tenantId: string): ApprovalMark[] {
     : [];
 }
 
-/** The conversation `taskId` of this object's agent, as the console shows it; null as sessionFor. */
-export function readTranscript(sql: Sql, tenantId: string, agentId: string, taskId: string): TranscriptEvents | null {
+/** The conversation `taskId` of this object's agent, as the console shows it (`range`: transcriptEvents'); null as sessionFor. */
+export function readTranscript(
+  sql: Sql, tenantId: string, agentId: string, taskId: string, range?: { offset: number; limit: number },
+): TranscriptEvents | null {
   const session = sessionFor(sql, tenantId, agentId, taskId);
   if (session === null) return null;
   return {
-    ...transcriptEvents(readEntries(sql, session), sql, session, { tenantId, agentId }, 0),
+    ...transcriptEvents(readEntries(sql, session), sql, session, { tenantId, agentId }, 0, range),
     byOp: approvalsByOp(readApprovals(sql, tenantId)),
   };
 }

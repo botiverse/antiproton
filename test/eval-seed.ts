@@ -276,6 +276,38 @@ await check("trace: rows are walked for credentials as the transcript is, and th
   must(away.status === 502 && away.body.error.code === "unavailable", away.text);
 });
 
+await check("transcript: a session other than main or main.<n> is 422 before the object is asked; the object's refusal to scrub is 503; its count is added to", async () => {
+  const f = fakeDeps();
+  for (const s of ["t_" + AGENT, "task-1", "main.0", "main.01", "main.x", "Main", "main.1.1", "main."]) {
+    const r = await call(f.deps, "GET", `/agents/${AGENT}/transcript?session=${encodeURIComponent(s)}`);
+    must(r.status === 422 && r.body.error.param === "session", `${s}: ${r.text}`);
+  }
+  must(f.calls.length === 0, `reached the object: ${show(f.calls)}`);
+  for (const s of ["main", "main.1", "main.12"]) must((await call(f.deps, "GET", `/agents/${AGENT}/transcript?session=${s}`)).status === 200, s);
+  const away = await call(fakeDeps({ transcript: { unavailable: "cannot open" } }).deps, "GET", `/agents/${AGENT}/transcript`);
+  must(away.status === 503 && away.body.error.code === "unavailable" && !away.text.includes('"events"'), away.text);
+  const counted = await call(fakeDeps({ transcript: { agentId: AGENT, sessionId: "main", shown: 1, events: [{ payload: { k: FAKE_GH } }], redactions: 3 } }).deps, "GET", `/agents/${AGENT}/transcript`);
+  must(counted.status === 200 && counted.body.redactions === 4, `the object's 3 and this walk's 1: ${counted.text}`);
+});
+
+await check("trace: a time past what a Date holds, alone or by the 24 hours added to it, is 422 before the object is asked, never 500", async () => {
+  const f = fakeDeps();
+  const MAX = 8.64e15, H = 3_600_000;
+  for (const [q, param] of [
+    [`from=${MAX + 1}`, "from"], [`to=${MAX + 1}`, "to"], ["from=99999999999999999999", "from"], ["to=" + "9".repeat(31), "to"],
+    [`from=${MAX}`, "from"], [`from=${MAX - 24 * H}&to=${MAX + 1}`, "to"], ["from=+275760-09-13T00:00:00.001Z", "from"],
+  ] as const) {
+    const r = await call(f.deps, "GET", `/agents/${AGENT}/trace?${q}`);
+    must(r.status === 422 && r.body.error.param === param, `${q}: ${r.status} ${r.text}`);
+  }
+  must(f.calls.length === 0, `reached the object: ${show(f.calls)}`);
+  // The last whole window a Date holds is served.
+  const edge = await call(f.deps, "GET", `/agents/${AGENT}/trace?from=${MAX - 24 * H}&to=${MAX}`);
+  must(edge.status === 200 && edge.body.to === new Date(MAX).toISOString(), edge.text);
+  const away = await call(fakeDeps({ trace: { ok: false, status: 503, message: "cannot open" } }).deps, "GET", `/agents/${AGENT}/trace`);
+  must(away.status === 503 && away.body.error.code === "unavailable", away.text);
+});
+
 await check("audit: one line per write, fresh context and restart, each its own op, with the credential's id; never the body", async () => {
   const f = fakeDeps();
   lines.length = 0;
