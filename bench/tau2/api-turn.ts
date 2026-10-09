@@ -142,6 +142,8 @@ export interface TurnWaitDeps {
   snapshot(): Promise<Snapshot>;
   /** Counts one delivery event (`Delivered`). */
   count(what: keyof Delivered): void;
+  /** Why a drop happened, at most diagnostic-detail: `open: …`, `end` (the body finished early) or `error: …`. */
+  dropWhy?(why: string): void;
   /** Whether this turn is deliberately not hearing answers from that path (bench/tau2/deafness.ts). */
   deaf(to: "socket" | "poll"): boolean;
   /** Where a deliberately ignored answer is mentioned. */
@@ -166,7 +168,12 @@ export async function waitForTurn(
   while (Date.now() < deadline) {
     let stream: Awaited<ReturnType<TurnWaitDeps["open"]>>;
     try { stream = await deps.open(); }
-    catch { deps.count("dropped"); await sleepUntil(Math.min(deadline, Date.now() + 1_000)); continue; }
+    catch (e) {
+      deps.count("dropped");
+      deps.dropWhy?.(`open: ${errText(e)}`);
+      await sleepUntil(Math.min(deadline, Date.now() + 1_000));
+      continue;
+    }
     const reconnect = !first;
     if (first && start) {
       try { await start(); } catch (e) { stream.close(); throw e; }
@@ -210,6 +217,9 @@ async function oneStream(
   if (lookNow) poll();
 
   void (async () => {
+    // A body that finishes before the answer is a clean `end`; a reader that throws is an `error`.
+    // HTTP has no close code to record (this is not a WebSocket), so the why is the finest honest grain.
+    let why = "end";
     try {
       for await (const e of stream.events) {
         if (done) return;
@@ -220,14 +230,16 @@ async function oneStream(
         stop(d);
         return;
       }
-    } catch { /* a stream that errors has ended, as below */ }
+    } catch (e) { why = `error: ${errText(e)}`; }
     // A stream that ends before this wait has its answer is a drop, whatever comes next.
-    if (!done) { deps.count("dropped"); stop("dropped"); }
+    if (!done) { deps.count("dropped"); deps.dropWhy?.(why); stop("dropped"); }
   })();
   return result;
 }
 
 const sleepUntil = (t: number) => new Promise((r) => setTimeout(r, Math.max(0, t - Date.now())));
+
+const errText = (e: unknown) => (e instanceof Error ? e.message : String(e)).slice(0, 120);
 
 /**
  * The deadline reading, over the API's objects: the same evidence and the same criterion as the `/bench`
