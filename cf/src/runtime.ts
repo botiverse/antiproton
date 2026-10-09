@@ -28,7 +28,7 @@ import {
   admitBackground, jobsTool, mountsWithRunningJobs, recordBackgroundJob, refuseOverCap, runBackgroundPass, runningBackgroundJobs, startedResult, stopSessionJobs,
 } from "../../src/runtime/background-jobs.ts";
 import {
-  bridgeTools, offeredToolName, offersPlugin, offersCapability, qualifyMountedTools, resumeTool, runJsTools, type MountedTool,
+  bridgeTools, harnessTools, offeredToolName, offersPlugin, replayPolicy, offersCapability, qualifyMountedTools, resumeTool, runJsTools, type MountedTool,
   withholdTools,
   refuseWithheld,
 } from "../../src/runtime/pi-tools.ts";
@@ -773,6 +773,45 @@ export function mountedToolEntries(records: MountRecord[], byId: ReadonlyMap<str
       exclusive: pl ? isExclusive(pl) : undefined,
     }));
   });
+}
+
+/** One tool as the model is offered it (`AgentRuntime.offeredTools`). `source` says whose it is. */
+export type OfferedTool = {
+  name: string; description: string; parameters: Json;
+  source: "mount" | "harness" | "caller"; alias: string | null; plugin: string | null; tool: string | null;
+  sideEffects?: "read" | "write"; idempotency?: string; replay?: "never" | "safe";
+  modelOnly?: true; reads?: string; exclusive?: true;
+};
+
+/** One of the agent's mounts, offered or not, and its tool list's provenance. */
+export type OfferedMount = {
+  alias: string; plugin: string; toolVersion: string; offered: boolean;
+  notOffered?: "switched_off" | "plugin_unavailable";
+  tools: string[];
+  withheld: Array<{ name: string; reason: string }>;
+  snapshot: null | {
+    takenAt: string; hash: string; basis: string | null; withoutCredential?: true;
+    tools: string[]; skipped: Array<{ name: string; reason: string; every?: true }>;
+  };
+  basis: string | null;
+  retake: "due" | "backed_off" | null;
+  snapshotError: string | null;
+};
+
+export type OfferedToolsExport = {
+  agentId: string; asOf: string; engine: "pi085" | "pd"; retakePending: boolean;
+  tools: OfferedTool[]; mounts: OfferedMount[];
+};
+
+/**
+ * Whether a turn's start re-takes this mount's tool list (`AgentRuntime.retakeStaleSnapshots`): its plugin lists its
+ * own tools and declares a basis, and the mount has a snapshot taken under another basis (one with none differs). The
+ * re-take itself and the tool export (`AgentRuntime.offeredTools`) both ask this, so the export's "due" is the pass's.
+ */
+export function snapshotStale(
+  m: Pick<MountRecord, "toolSnapshot">, p: Pick<Plugin, "snapshotTools" | "toolsBasis"> | undefined,
+): boolean {
+  return !!p?.snapshotTools && p.toolsBasis !== undefined && !!m.toolSnapshot && m.toolSnapshot.basis !== p.toolsBasis;
 }
 
 /**
@@ -2238,10 +2277,7 @@ export class AgentRuntime {
 
   async #retakeStale(tenantId: string, agentId: string): Promise<void> {
     const byId = new Map(this.#plugins.map((p) => [p.id, p]));
-    const stale = (await this.store.listMounts(tenantId, agentId)).filter((m) => {
-      const p = byId.get(m.plugin);
-      return !!p?.snapshotTools && p.toolsBasis !== undefined && !!m.toolSnapshot && m.toolSnapshot.basis !== p.toolsBasis;
-    });
+    const stale = (await this.store.listMounts(tenantId, agentId)).filter((m) => snapshotStale(m, byId.get(m.plugin)));
     if (!stale.length) return;
     const choices = await this.store.pluginChoices(tenantId, agentId);
     const now = Date.now();
@@ -2279,16 +2315,23 @@ export class AgentRuntime {
     }
   }
 
-  #snapshotErrors() {
+  /** The table of listing failures, made when absent; with `readOnly`, null instead of making it. */
+  #snapshotErrors(opts: { readOnly?: boolean } = {}) {
     const sql = this.#deps.ctx.storage?.sql;
     if (!sql) return null;
+    if (opts.readOnly) {
+      return sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'mount_snapshot_errors'").toArray().length ? sql : null;
+    }
     sql.exec("CREATE TABLE IF NOT EXISTS mount_snapshot_errors(alias TEXT PRIMARY KEY, error TEXT NOT NULL, at INTEGER NOT NULL)");
     return sql;
   }
 
-  /** Why this mount's last tool listing failed, or null when it succeeded or was never asked. */
-  snapshotError(alias: string): string | null {
-    const row = this.#snapshotErrors()?.exec("SELECT error FROM mount_snapshot_errors WHERE alias = ?", alias).toArray()[0] as any;
+  /**
+   * Why this mount's last tool listing failed, or null when it succeeded or was never asked. `readOnly` reads without
+   * making the table (null when there is none), for a report that must not write (`offeredTools`).
+   */
+  snapshotError(alias: string, opts: { readOnly?: boolean } = {}): string | null {
+    const row = this.#snapshotErrors(opts)?.exec("SELECT error FROM mount_snapshot_errors WHERE alias = ?", alias).toArray()[0] as any;
     return row ? String(row.error) : null;
   }
 
@@ -2569,39 +2612,18 @@ export class AgentRuntime {
   }
 
   /**
-   * The agent, built from storage.
-   *
-   * Rebuilt whenever the object is asked about a different agent, and on every
-   * wake, because the object may have been evicted since the last one. Building
-   * it starts no timers and no provider work — it reads the transcript and
-   * reports what was left open.
+   * The tools a harness for this conversation is handed, read from storage: the mounts' tools as the model is offered
+   * them (enabled mounts only, withheld ones out, names qualified, the result-limit note on each description) and the
+   * harness's own (run_js or resume, jobs, an Agents API caller's functions). `agent` builds its harness from this, and
+   * `offeredTools` reports it, so the report is the list a turn is offered rather than a second derivation of it.
+   * Reads only: a tool built here runs nothing until the model calls it, and the closures read state when called.
    */
-  async agent(tenantId: string, agentId: string, session: string = MAIN_SESSION): Promise<AgentEngine> {
-    await this.ready();
-    const key = `${tenantId}/${agentId}`;
-    const cacheKey = `${key}#${session}`;
-    const cached = this.#agents.get(cacheKey);
-    if (cached) {
-      const now = await this.#catalogueKeyFor(tenantId, agentId);
-      const running = cached.builtFrom !== now && await cached.agent.running();
-      if (reuseHarness(cached.builtFrom, now, running)) return cached.agent;
-      this.#agents.delete(cacheKey);
-    }
-
-    const binding = await this.store.getModelBinding(tenantId, agentId);
-    if (!binding) throw new Error(`no model binding for ${key}`);
-    // Which kernel runs this agent: `pd` (src/runtime/durable-agent.ts) only where the object's `ap_meta`
-    // says so. Every creation path still leaves that row absent, so an agent is opened as `PiAgent` unless
-    // the operator migrated it (`migrateEngine` below, src/runtime/pd-migrate.ts). An object with no
-    // `ap_meta` table is read without creating one.
-    const engine = this.#engine();
-    // Before the catalogue is read: a stale pin is a mount whose every call
-    // the gateway refuses, and the harness opening is the one moment every
-    // agent passes through, console-made or API-made.
-    await this.repinMounts(tenantId, agentId);
-    const builtFrom = await this.#catalogueKeyFor(tenantId, agentId);
+  async #turnTools(
+    tenantId: string, agentId: string, session: string, engine: "pi085" | "pd" | null, agentRef: { current: PiAgent | null },
+  ) {
     const { tools, records, unoffered } = await this.#catalogueFor(tenantId, agentId);
     const sandbox = this.#deps.sandbox ?? true;
+    const store = this.store;
     // The call context's task is the conversation, so held calls and audit
     // rows say which conversation asked. The first session's id is the same
     // string the single-conversation object always used.
@@ -2624,7 +2646,6 @@ export class AgentRuntime {
     const host = this.#host(
       { tenantId, agentId, taskId: session === MAIN_SESSION ? LEGACY_TASK : session }, reader, offered, heldOn,
       () => contextIdOf(this.#deps.ctx.storage.sql, { tenantId, agentId, session, engine: engine === "pd" ? "pd" : "pi085" }));
-    const store = this.store;
     // The tools the model is offered are the mounts plus the sandbox. run_js is
     // not a mount — it is the one tool whose body is this object rather than a
     // plugin — so it is built here and handed to open beside the mounts. It
@@ -2643,7 +2664,6 @@ export class AgentRuntime {
     // Function tools an API caller runs itself (Agents API, task #17): offered to
     // the model like any tool; calling one pauses the turn for the caller's
     // result (client-calls.ts). A name the model is already offered is skipped.
-    const agentRef: { current: PiAgent | null } = { current: null };
     const apiConfig = ((await store.loadAgent(tenantId, agentId))?.config as any)?.openai;
     const apiTools = apiConfig?.tools;
     // An agent made through the Agents API is offered only what its caller declared, plus a container when a
@@ -2699,6 +2719,44 @@ export class AgentRuntime {
       ...(extras.jobs ? [jobs] : []),
       ...callerTools,
     ];
+    return { tools, records, unoffered, reader, offered, activityOf, nameOf, host, extras, callerDefs, keeping, extraTools };
+  }
+
+  /**
+   * The agent, built from storage.
+   *
+   * Rebuilt whenever the object is asked about a different agent, and on every
+   * wake, because the object may have been evicted since the last one. Building
+   * it starts no timers and no provider work — it reads the transcript and
+   * reports what was left open.
+   */
+  async agent(tenantId: string, agentId: string, session: string = MAIN_SESSION): Promise<AgentEngine> {
+    await this.ready();
+    const key = `${tenantId}/${agentId}`;
+    const cacheKey = `${key}#${session}`;
+    const cached = this.#agents.get(cacheKey);
+    if (cached) {
+      const now = await this.#catalogueKeyFor(tenantId, agentId);
+      const running = cached.builtFrom !== now && await cached.agent.running();
+      if (reuseHarness(cached.builtFrom, now, running)) return cached.agent;
+      this.#agents.delete(cacheKey);
+    }
+
+    const binding = await this.store.getModelBinding(tenantId, agentId);
+    if (!binding) throw new Error(`no model binding for ${key}`);
+    // Which kernel runs this agent: `pd` (src/runtime/durable-agent.ts) only where the object's `ap_meta`
+    // says so. Every creation path still leaves that row absent, so an agent is opened as `PiAgent` unless
+    // the operator migrated it (`migrateEngine` below, src/runtime/pd-migrate.ts). An object with no
+    // `ap_meta` table is read without creating one.
+    const engine = this.#engine();
+    // Before the catalogue is read: a stale pin is a mount whose every call
+    // the gateway refuses, and the harness opening is the one moment every
+    // agent passes through, console-made or API-made.
+    await this.repinMounts(tenantId, agentId);
+    const builtFrom = await this.#catalogueKeyFor(tenantId, agentId);
+    const agentRef: { current: PiAgent | null } = { current: null };
+    const { records, unoffered, offered, activityOf, nameOf, host, extras, callerDefs, keeping, extraTools } =
+      await this.#turnTools(tenantId, agentId, session, engine, agentRef);
 
     // Read here rather than inside the harness, so the harness keeps holding
     // no I/O of its own.
@@ -2971,6 +3029,91 @@ export class AgentRuntime {
       return { current: currentMainId(sql), sessions: mainSessions(sql).map((s) => ({ ...s, calls: modelInputCalls(sql, s.sessionId) })) };
     }
     return readModelInput(sql, sessionId, call ?? 1);
+  }
+
+  /**
+   * The tools the model is offered on this agent's next turn, and why each mount offers what it does (the evaluation
+   * setup's `GET …/tools`, cf/src/provision/handlers.ts). Built by `#turnTools`, the step `agent` builds a harness
+   * from, and listed by `harnessTools`, the list both engines open with, so it is that list and not a re-derivation.
+   *
+   * Read only: no re-take, no repin, no harness, no turn, no table made. What a turn's start would still change is
+   * reported instead: a mount whose snapshot the start re-takes (`snapshotStale`) says `retake: "due"`, or
+   * `"backed_off"` while an earlier failure holds it back, and `retakePending` is true while any is due — until it is
+   * taken the list below is the one that would be offered if the re-take fails or finds the same tools. A repin moves
+   * only a mount's version, which no tool list reads. Null when there is no such agent.
+   *
+   * Never a credential: a mount is described by its alias, plugin, version and snapshot, not its config or secret.
+   */
+  async offeredTools(tenantId: string, agentId: string): Promise<OfferedToolsExport | null> {
+    await this.ready();
+    if (!(await this.store.loadAgent(tenantId, agentId))) return null;
+    const asOf = Date.now();
+    const engine = this.#engine();
+    const t = await this.#turnTools(tenantId, agentId, MAIN_SESSION, engine, { current: null });
+    // pd appends an Agents API caller's functions after the harness's own (`DurableAgent.open`, `toolsExtension` in
+    // src/runtime/durable-tools.ts); pi085 has them in `extraTools` already.
+    const listed: Array<{ name: string; description: string; parameters: unknown; executionMode?: string }> = [
+      ...harnessTools(t.offered as MountedTool[], t.host, t.keeping, t.extraTools as never),
+      ...(engine === "pd" ? t.callerDefs : []),
+    ];
+    const pluginOf = new Map(t.records.map((m) => [m.alias, m.plugin]));
+    const callers = new Set(t.callerDefs.map((d: { name: string }) => d.name));
+    // Joined by the name the model was offered, as the harness answers it (`offeredToolName`).
+    const mounted = new Map<string, MountedTool>();
+    for (const m of t.offered as MountedTool[]) {
+      const dot = m.address.indexOf(".");
+      const name = offeredToolName(t.offered as MountedTool[], m.address.slice(0, dot), m.address.slice(dot + 1));
+      if (name !== null) mounted.set(name, m);
+    }
+    const tools = listed.map((b): OfferedTool => {
+      const m = mounted.get(b.name);
+      const base = { name: b.name, description: b.description, parameters: b.parameters as Json };
+      if (!m) return { ...base, source: callers.has(b.name) ? "caller" : "harness", alias: null, plugin: null, tool: null };
+      const dot = m.address.indexOf(".");
+      const alias = m.address.slice(0, dot);
+      return {
+        ...base, source: "mount", alias, plugin: pluginOf.get(alias) ?? null, tool: m.address.slice(dot + 1),
+        sideEffects: m.sideEffects, idempotency: m.idempotency, replay: replayPolicy(m),
+        ...(m.modelOnly ? { modelOnly: true as const } : {}),
+        ...(m.reads ? { reads: m.reads } : {}),
+        ...(m.exclusive ? { exclusive: true as const } : {}),
+      };
+    });
+    const byId = new Map(this.#plugins.map((p) => [p.id, p]));
+    const enabled = new Set(t.records.map((m) => m.alias));
+    const notOffered = new Map(t.unoffered.map((u) => [u.alias, u.reason]));
+    const withheld = new Set(this.#deps.withholdTools ?? []);
+    const all = await this.store.listMounts(tenantId, agentId);
+    const entries = mountedToolEntries(t.records, byId);
+    const now = Date.now();
+    const mounts = all.map((m): OfferedMount => {
+      const p = byId.get(m.plugin);
+      const snap = m.toolSnapshot;
+      const failed = this.#retakeFailed.get(`${tenantId}/${agentId}/${m.alias}`);
+      const backedOff = !!failed && failed.basis === p?.toolsBasis && now - failed.at < RETAKE_BACKOFF_MS;
+      const offeredHere = tools.filter((x) => x.alias === m.alias).map((x) => x.name);
+      return {
+        alias: m.alias, plugin: m.plugin, toolVersion: m.toolVersion,
+        offered: enabled.has(m.alias),
+        ...(notOffered.has(m.alias) ? { notOffered: notOffered.get(m.alias)! } : {}),
+        tools: offeredHere,
+        withheld: entries.filter((e) => e.address.startsWith(`${m.alias}.`) && withheld.has(e.address))
+          .map((e) => ({ name: e.name, reason: "withheld by this deployment" })),
+        snapshot: snap ? {
+          takenAt: new Date(snap.takenAt).toISOString(), hash: snap.hash, basis: snap.basis ?? null,
+          ...(snap.withoutCredential ? { withoutCredential: true as const } : {}),
+          tools: snap.tools.map((x) => x.name), skipped: snap.skipped.map((x) => ({ ...x })),
+        } : null,
+        basis: p?.toolsBasis ?? null,
+        retake: enabled.has(m.alias) && snapshotStale(m, p) ? (backedOff ? "backed_off" : "due") : null,
+        snapshotError: this.snapshotError(m.alias, { readOnly: true }),
+      };
+    });
+    return {
+      agentId, asOf: new Date(asOf).toISOString(), engine: engine ?? "pi085",
+      retakePending: mounts.some((m) => m.retake === "due"),
+      tools, mounts,
+    };
   }
 
   /** Compact on demand. pi085 refuses with `CompactionUnavailable`

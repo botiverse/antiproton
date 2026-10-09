@@ -308,6 +308,21 @@ export function bridgeTools(
 }
 
 /**
+ * Every tool a harness offers the model, in the order it offers them: the mounts' tools bridged, then the harness's
+ * own (`run_js` or `resume`, `jobs`, an Agents API caller's functions under pi085). Both engines open with this list
+ * (`PiAgent.open`, `DurableAgent.open`), and the evaluation setup's tool export reads the same one
+ * (`AgentRuntime.offeredTools`, cf/src/runtime.ts), so what is reported cannot drift from what is offered.
+ */
+export function harnessTools(
+  tools: MountedTool[],
+  host: ToolHost,
+  keeping: InterruptKeeping | undefined,
+  extraTools: readonly AgentHarnessTool<undefined>[] = [],
+): AgentHarnessTool<undefined>[] {
+  return [...bridgeTools(tools, host, keeping), ...extraTools];
+}
+
+/**
  * One tool result as the model receives it: from a direct call, or from
  * `resume` taking a tool's question back to it. The two answer in one shape,
  * so a resumed tool reads exactly like a call — a result, a refusal, or

@@ -73,7 +73,7 @@ import { PI_DURABLE_OBJECTS, PiDurableSqlite, type DurableSqlHost } from "../sto
 import { prefixedNamespace, SqlQualifier } from "../store/sql-namespace.ts";
 import { settle, type ExternalWaits, type SettleResult } from "./durable-drive.ts";
 import { ClientCallsDoc, toolsExtension, waitingCalls, type ClientToolDef } from "./durable-tools.ts";
-import { bridgeTools, type InterruptKeeping, type MountedTool, type ToolHost } from "./pi-tools.ts";
+import { bridgeTools, harnessTools, type InterruptKeeping, type MountedTool, type ToolHost } from "./pi-tools.ts";
 import { isPdUnavailableEntry, pdUnavailableText } from "./unavailable-tool.ts";
 import { projectEntries } from "./pd-transcript.ts";
 import { type AgentEngine, type EngineEntry, type EngineEntryScan, type EngineStatus, type StepOutcome } from "./engine.ts";
@@ -780,10 +780,9 @@ export class DurableAgent implements AgentEngine {
   static open(opts: DurableAgentOptions): DurableAgent {
     opts.host.bind(opts);
     // pi085's list, in pi085's order: the bridged mounts, then run_js, resume, jobs (PiAgent.open).
-    const bridged = [
-      ...(opts.tools && opts.toolHost ? bridgeTools(opts.tools, opts.toolHost, opts.interrupts) : []),
-      ...(opts.extraTools ?? []),
-    ];
+    const bridged = opts.tools && opts.toolHost
+      ? harnessTools(opts.tools, opts.toolHost, opts.interrupts, opts.extraTools)
+      : [...(opts.extraTools ?? [])];
     opts.host.installTools(opts.session ?? MAIN_SESSION, bridged, opts.clientTools ?? [], opts.explainUnavailable);
     return new DurableAgent(opts);
   }

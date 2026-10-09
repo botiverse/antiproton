@@ -30,7 +30,7 @@ import { StorageBackedSession } from "@earendil-works/pi-agent-core/harness/sess
 import { BACKGROUND_CONTEXT as CTX } from "@earendil-works/pi-agent-core/harness/context";
 import { PiSqliteStorage, ensurePiTables, piTables, type SqlHost, MAIN_SESSION } from "../store/pi-storage.ts";
 import { offloadedProvider, type OffloadPort, type Answered } from "../model/pi-offloaded.ts";
-import { bridgeTools, type InterruptKeeping, type MountedTool, type ToolHost } from "./pi-tools.ts";
+import { bridgeTools, harnessTools, type InterruptKeeping, type MountedTool, type ToolHost } from "./pi-tools.ts";
 import { answerClientCall, dropClientCalls, pendingClientCalls, resumeClientCalls } from "./client-calls.ts";
 import { CompactionUnavailable, type AgentEngine, type EngineEntry, type EngineEntryScan, type EngineStatus, type StepOutcome } from "./engine.ts";
 
@@ -248,7 +248,7 @@ export class PiAgent implements AgentEngine {
       }],
     }));
 
-    const bridged = [...bridgeTools(opts.tools, opts.toolHost, opts.interrupts), ...(opts.extraTools ?? [])];
+    const bridged = harnessTools(opts.tools, opts.toolHost, opts.interrupts, opts.extraTools);
     const { harness, open } = await AgentHarness.create({
       session: session as any,
       models,
