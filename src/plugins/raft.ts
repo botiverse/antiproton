@@ -360,7 +360,7 @@ function stateStore(ctx: PluginContext): RaftStateStore {
  * A Raft SDK client for this mount: its origin, its credential, its timeout, and its saved state.
  *
  * `{ state: false }` gives a client whose state lives only for the call and is never saved: the snapshot's
- * `identity.whoami` uses it, having nothing to record, and so does a history read, which must not count as seen
+ * credential context and a personal assistant's owner reads use it, having nothing to record, and so does a history read, which must not count as seen
  * (`runOperation` says why). Every other operation runs on the saved state, because what the model has seen is
  * booked there per context (`originOf`) — by receive_events, by a held call's question when it is the model's own
  * call's result, and by the model's answer to one (`heldCall`) — and a send attests it.
@@ -433,10 +433,14 @@ function sdkFailure(
  * separators, which a model reads as line breaks too.
  */
 const CONTROL_CHARS = /[\u0000-\u001F\u007F-\u009F\u2028\u2029]/g;
-/** The names a message's header line carries: who sent it, where, the task's assignee. */
+/**
+ * The names a message's header line carries: who sent it, where, the task's assignee, and the sender's time zone,
+ * which the SDK puts after the sender's name since 0.13.0 (`@name (Zone) — description`) and which a web client
+ * reports for itself, so it is the sender's text like the rest.
+ */
 const ENVELOPE_NAMES = [
-  "sender_name", "senderName", "sender_description", "senderDescription", "channel_name", "parent_channel_name",
-  "task_assignee_name", "taskAssigneeName",
+  "sender_name", "senderName", "sender_description", "senderDescription", "sender_timezone", "senderTimezone",
+  "channel_name", "parent_channel_name", "task_assignee_name", "taskAssigneeName",
 ] as const;
 type MessageEnvelope = Parameters<typeof projectRaftMessage>[0];
 
@@ -641,6 +645,21 @@ const ARGUMENT_CHECKS: Readonly<Record<string, { check(input: Record<string, unk
 };
 
 /**
+ * Arguments of an operation's manifest schema that its tool does not offer, each with the reason: left out of the
+ * tool's schema (`toolOf`) and refused at call time before anything is sent (`argumentsFor`). The refusal is needed
+ * because nothing else stops one: the gateway does not check a call against the tool's schema, the manifest's schemas
+ * do not forbid other properties, and `argumentsFor` passes on what the manifest advertises, which still includes it.
+ * Offering one is a change of its own: take it out of this table, with a test of what it does.
+ */
+export const WITHHELD_ARGUMENTS: Readonly<Record<string, Readonly<Record<string, string>>>> = {
+  "messages.read": {
+    // SDK 0.13.0. It moves this agent's own read position, a second mechanism beside receive_events; and under code
+    // origin the SDK sends it with `consume: false`, a combination whose handling by the Server is not verified.
+    unread: "it moves your read position, which receive_events keeps; read new messages with receive_events, or page this conversation with after, before or around",
+  },
+};
+
+/**
  * The manifest's text in this mount's terms, for a tool's description and every parameter description in its schema:
  * an operation named by its dotted name (`tasks.unassign`) is written as the tool name the model is offered
  * (`tasks_unassign`); a parenthesised SDK field path (`(interrupt.resume.idempotencyKey)`), which names an object this
@@ -683,6 +702,10 @@ function describeInMountTerms(schema: unknown): void {
  */
 export function toolOf(op: RaftOperationSpec): ToolSchema {
   const parameters = structuredClone(op.inputSchema) as Record<string, any>;
+  for (const name of Object.keys(WITHHELD_ARGUMENTS[op.name] ?? {})) {
+    delete parameters.properties?.[name];
+    if (Array.isArray(parameters.required)) parameters.required = parameters.required.filter((r: unknown) => r !== name);
+  }
   const paging = pagingArg(op);
   if (paging) {
     const p = parameters.properties[paging];
@@ -741,7 +764,8 @@ export function originOf(ctx: PluginContext): { origin: "model" | "code"; contex
 }
 
 /**
- * The arguments a caller may give an operation: what its manifest schema advertises, and nothing else. The SDK
+ * The arguments a caller may give an operation: what its manifest schema advertises, and nothing else; one this
+ * mount withholds (`WITHHELD_ARGUMENTS`) is refused, so a call that names it fails rather than run without it. The SDK
  * also accepts arguments it does not advertise — a send's `seen` overrides what the send attests, which is the
  * hold's whole question — so one of those from a caller is dropped here, and only a resume this plugin made
  * itself passes `seen`. The paging argument gets its cap and its default (`pagingArg`).
@@ -750,6 +774,8 @@ function argumentsFor(op: RaftOperationSpec, args: unknown): Record<string, unkn
   if (args !== undefined && args !== null && (typeof args !== "object" || Array.isArray(args))) {
     throw new Error(`${op.toolName} takes an object of arguments`);
   }
+  const withheld = Object.entries(WITHHELD_ARGUMENTS[op.name] ?? {}).find(([name]) => Object.hasOwn(args ?? {}, name));
+  if (withheld) throw new Error(`${op.toolName} does not take ${withheld[0]} on this mount: ${withheld[1]}. Nothing was sent`);
   const advertised = op.inputSchema.properties ?? {};
   const input = Object.fromEntries(Object.entries(args ?? {}).filter(([name]) => Object.hasOwn(advertised, name)));
   const refused = ARGUMENT_CHECKS[op.name]?.check(input);
@@ -1257,11 +1283,12 @@ const OWN_TOOLS: readonly ToolSchema[] = [
 
 /**
  * A personal assistant's two reads of its owner's Raft: the owner's inbox, and one of the owner's channels or
- * threads. Raft offers them only to an agent account that is someone's assistant (whoami's `assistantOf`), and
+ * threads. Raft offers them only to an agent account that is someone's assistant (the credential context's
+ * `agent.assistantOf`), and
  * never shows a direct message through them.
  *
  * They are offered by the snapshot and nowhere else: not with `OWN_TOOLS`, which every mount has, and not in the
- * no-snapshot fallback of `mountTools`, which offers everything else. A mount with no snapshot never asked whoami,
+ * no-snapshot fallback of `mountTools`, which offers everything else. A mount with no snapshot never asked Raft for that context,
  * so it does not know it is an assistant, and offering them there would hand every non-assistant mount two tools
  * Raft refuses. For the same reason a call is refused unless the mount's list as the gateway reports it
  * (`PluginContext.offered`) names the tool; a context without that list is not taken as offering it.
@@ -1339,50 +1366,100 @@ export interface OwnerMessagesRequest {
   before?: string | number; after?: string | number; around?: string | number;
 }
 /**
- * Raft's answer to one owner read: the response body, unread, or the HTTP status with the Server's error code and
- * message as it sent them. The body is external data and is checked here before anything is shown. The message is
- * optional because Raft sends some refusals as a code alone (a 403 is `{ code: "assistant_not_enabled" }`).
+ * Raft's answer to one owner read: the response body, or the HTTP status with the Server's error code and message as
+ * it sent them. The body is external data and is checked here before anything is shown, whatever the SDK checked
+ * before it. The code and the message are each optional because Raft may leave either out (a 403 is
+ * `{ code: "assistant_not_enabled" }` alone; a gateway's 502 may carry neither).
  */
-export type OwnerAnswer = { ok: true; data: unknown } | { ok: false; status: number; code: string; message?: string };
+export type OwnerAnswer = { ok: true; data: unknown } | { ok: false; status: number; code?: string; message?: string };
 
 /**
- * The wire for a personal assistant's reads: everything about them that only Raft can answer.
- * - `assistantOf`: whose assistant this account is, from the whoami answer (`identity.whoami()`'s data, where Raft puts
- *   it on the agent: `agent.assistantOf`), unread;
- *   `snapshotTools` decides what counts (`isAssistantOf`).
- * - `ownerInbox` / `ownerMessages`: one request each, answered as an `OwnerAnswer`.
+ * The wire a personal assistant's two reads go through: one request each, answered as an `OwnerAnswer`.
+ * `RAFT_ASSISTANT_WIRE` is the real one; it is a seam so a test can hand the renderers an answer the SDK's own
+ * contract would refuse before it got here, which is the only way to reach their checks.
  */
 export interface AssistantWire {
-  assistantOf(whoami: unknown): unknown;
   ownerInbox(ctx: PluginContext, request: OwnerInboxRequest): Promise<OwnerAnswer>;
   ownerMessages(ctx: PluginContext, request: OwnerMessagesRequest): Promise<OwnerAnswer>;
 }
 
-function ownerReadPending(method: string): Error {
-  return marked(new Error(`reading your owner's Raft is not available on this deployment yet: it needs the Raft SDK's ${method}, which this build does not have`), { retryable: false, transient: false });
+/** What a Raft route answers (`raft.routes.<resource>.<method>`), as far as `ownerAnswer` reads it. */
+type RouteAnswer =
+  | { ok: true; data: unknown }
+  | { ok: false; status?: number; error:
+      | { kind: "transport" }
+      | { kind: "http"; status: number; errorCode?: string | null; response?: unknown }
+      | { kind: "validation"; reason: string; cause?: unknown } };
+
+/** A Server error code as Raft documents them; anything else (a gateway's HTML, a forged line) is not passed on. */
+const SERVER_CODE = /^[A-Za-z0-9_.:-]{1,64}$/;
+
+/** The zod issues of a request the SDK refused before sending, as one line: `channelId: Invalid UUID`. */
+function contractIssues(cause: unknown): string {
+  const issues = cause && typeof cause === "object" && "issues" in cause && Array.isArray(cause.issues) ? cause.issues : [];
+  const said = issues.map((i: unknown) => {
+    if (!i || typeof i !== "object") return "";
+    const path = "path" in i && Array.isArray(i.path) ? i.path.join(".") : "";
+    const message = "message" in i && typeof i.message === "string" ? oneLine(i.message) : "";
+    return path ? `${path}: ${message}` : message;
+  }).filter(Boolean);
+  return said.length ? said.join("; ") : "it did not match the Raft SDK's contract";
 }
 
 /**
- * PENDING: the Raft SDK this build pins has no `assistant` namespace (`assistant.ownerInbox`,
- * `assistant.ownerMessages`), and its `identity.whoami()` rebuilds its data with its own schema, whose `agent` object
- * keeps only the fields it names, so `agent.assistantOf` never reaches this plugin even when the Server sends it. When the SDK ships them, this object is the one place
- * that changes: the two reads call the SDK and turn its failure into an `OwnerAnswer` (status, the Server's error
- * code, its message), and `assistantOf` reads the field the SDK then types. Until then the reads throw, and the
- * tools are never offered, because `assistantOf` finds nothing; `test/raft-assistant.ts` holds that a whoami answer
- * carrying `agent.assistantOf` still offers nothing through this wire, so the SDK upgrade that starts passing the field
- * through turns that test red before it offers two tools whose reads would only throw.
+ * A route's answer as an `OwnerAnswer`, or a throw for what is not Raft's answer to the read:
+ * - an HTTP failure is the Server's: its status, its `code` (the SDK reads `errorCode`, then `code`) and its `error`
+ *   text, as sent; `ownerFailure` marks a 5xx or a 429 transient, as every other Raft read's failure is;
+ * - no answer at all (`transport`: the request failed or timed out) is transient and not retryable, as `sdkFailure`
+ *   marks a read's: a read has nothing that may have landed;
+ * - a request the SDK refused before sending (its contract: `channelId` a UUID, for one) is said with what it refused;
+ * - an answer the SDK's contract refused is malformed, as an answer that fails this file's own checks is.
  */
-export const PENDING_ASSISTANT_WIRE: AssistantWire = {
-  assistantOf(whoami) {
-    const agent = whoami && typeof whoami === "object" && "agent" in whoami ? whoami.agent : undefined;
-    return agent && typeof agent === "object" && "assistantOf" in agent ? agent.assistantOf : undefined;
+function ownerAnswer(out: RouteAnswer, tool: string): OwnerAnswer {
+  if (out.ok) return { ok: true, data: out.data };
+  const e = out.error;
+  if (e.kind === "http") {
+    const body = e.response;
+    const said = body && typeof body === "object" && "error" in body && typeof body.error === "string" ? oneLine(body.error).trim() : "";
+    const code = typeof e.errorCode === "string" && SERVER_CODE.test(e.errorCode) ? e.errorCode : undefined;
+    return { ok: false, status: e.status, ...(code ? { code } : {}), ...(said ? { message: said } : {}) };
+  }
+  if (e.kind === "transport") {
+    throw marked(new Error(`${tool}: no answer from Raft (the request did not complete); nothing was read`), { retryable: false, transient: true });
+  }
+  if (e.reason === "request_contract_mismatch") {
+    throw ownerRefusal(`${tool}: the arguments were refused before anything was sent (${contractIssues(e.cause)})`);
+  }
+  throw malformed(tool, "it does not match the Raft SDK's contract for this read");
+}
+
+/**
+ * The SDK's routes (`routes.assistant.ownerInbox` / `ownerMessages`, SDK 0.13.0; no operation wraps them yet), on the
+ * mount's own client with no saved state: neither read marks anything read or seen, for the owner or for this agent,
+ * so there is nothing to load or record, and the mount's state record is never touched by them. The query is
+ * strings, as the route's contract takes it.
+ */
+export const RAFT_ASSISTANT_WIRE: AssistantWire = {
+  async ownerInbox(ctx, r) {
+    const query = { filter: r.filter, limit: String(r.limit), ...(r.offset !== undefined ? { offset: String(r.offset) } : {}) };
+    return ownerAnswer(await raftFor(ctx, { state: false }).routes.assistant.ownerInbox({ query }), OWNER_INBOX_TOOL);
   },
-  async ownerInbox() { throw ownerReadPending("assistant.ownerInbox"); },
-  async ownerMessages() { throw ownerReadPending("assistant.ownerMessages"); },
+  async ownerMessages(ctx, r) {
+    const query = {
+      channelId: r.channelId, limit: String(r.limit),
+      ...(r.before !== undefined ? { before: String(r.before) } : {}),
+      ...(r.after !== undefined ? { after: String(r.after) } : {}),
+      ...(r.around !== undefined ? { around: String(r.around) } : {}),
+    };
+    return ownerAnswer(await raftFor(ctx, { state: false }).routes.assistant.ownerMessages({ query }), OWNER_MESSAGES_TOOL);
+  },
 };
 
-/** Whether whoami's `assistantOf` names an owner: an object with a non-empty string `userId`. Null, absent (an older
- * Server) or any other shape is "not an assistant". */
+/**
+ * Whether the credential context's `agent.assistantOf` names an owner: an object with a non-empty string `userId`.
+ * Null or absent (an older Server) is "not an assistant". The SDK's contract already refuses any other shape (the
+ * whole context answer, so the listing fails rather than guesses); this holds the line here too, rather than lean on it.
+ */
 export function isAssistantOf(value: unknown): boolean {
   return !!value && typeof value === "object" && !Array.isArray(value) && "userId" in value &&
     typeof value.userId === "string" && value.userId.length > 0;
@@ -1409,12 +1486,12 @@ function ownerRefusal(message: string): Error {
 }
 
 /**
- * A failure Raft answered, as the model reads it: the status and Raft's own code verbatim, then its message when it
- * sent one (`403 assistant_not_enabled` alone otherwise).
+ * A failure Raft answered, as the model reads it: the status and Raft's own code verbatim when it sent one, then its
+ * message when it sent one (`403 assistant_not_enabled` alone otherwise).
  */
-function ownerFailure(out: { status: number; code: string; message?: string }): Error {
+function ownerFailure(out: { status: number; code?: string; message?: string }): Error {
   const said = out.message?.trim();
-  return marked(new Error(`${out.status} ${out.code}${said ? `: ${said}` : ""}`), {
+  return marked(new Error(`${out.status}${out.code ? ` ${out.code}` : ""}${said ? `: ${said}` : ""}`), {
     retryable: false, transient: out.status === 429 || out.status >= 500,
   });
 }
@@ -1477,7 +1554,7 @@ function isEnvelope(v: unknown): v is MessageEnvelope {
   const e = Object.fromEntries(Object.entries(v));
   const strings = ["id", "message_id", "timestamp", "createdAt", "senderType", "sender_type", "senderName", "sender_name",
     "channel_type", "channel_name", "parent_channel_type", "parent_channel_name", "content"];
-  const nullableStrings = ["senderDescription", "sender_description", "taskStatus", "task_status", "taskAssigneeId",
+  const nullableStrings = ["senderDescription", "sender_description", "senderTimezone", "sender_timezone", "taskStatus", "task_status", "taskAssigneeId",
     "task_assignee_id", "taskAssigneeName", "task_assignee_name", "threadId"];
   const nullableNumbers = ["taskNumber", "task_number", "replyCount"];
   if (!optional(e.seq, "number")) return false;
@@ -1754,13 +1831,13 @@ export interface RaftArtifacts {
  * a test builds it otherwise: every list below derives from it — which tools are generated and offered, how each is dispatched, which hints are
  * put in words (`offeredTerms`), and a message line's attachment suffix (`modelLine`) — so taking an operation out of
  * the table is the whole change that offers it. `assistant` is the wire a personal assistant's owner reads go
- * through (`AssistantWire`), `PENDING_ASSISTANT_WIRE` unless a test hands in a fake.
+ * through (`AssistantWire`), `RAFT_ASSISTANT_WIRE` unless a test hands in a fake.
  */
 export function createRaftPlugin(deps: {
   artifacts?: RaftArtifacts | null; excluded?: Readonly<Record<string, string>>; assistant?: AssistantWire;
 } = {}): Plugin {
   const excluded = deps.excluded ?? EXCLUDED;
-  const assistant = deps.assistant ?? PENDING_ASSISTANT_WIRE;
+  const assistant = deps.assistant ?? RAFT_ASSISTANT_WIRE;
   const artifacts = deps.artifacts ?? null;
   const generated = excluded === EXCLUDED ? GENERATED : generatedFrom(excluded);
   // With nowhere to keep a file the download could only fail, so it is not offered at all: not in `tools`, not in
@@ -1874,14 +1951,18 @@ export function createRaftPlugin(deps: {
 
     /**
      * Which generated tools this mount's credential may use: an operation is listed only when the credential holds
-     * every capability it names (`identity.whoami` → `capabilities`, the credential's scopes). Asked when the mount
+     * every capability it names (the credential context's `credential.capabilities`, the credential's scopes). Asked when the mount
      * is added, when an operator refreshes it, and whenever the mount's credential is attached, replaced or removed
      * (`AgentRuntime.attachCredential`/`removeCredential`), so a credential that lost a scope stops offering its
      * tools. No credential, or one Raft refuses, has no capabilities and lists nothing; Raft not answering is a
      * throw, which leaves the stored list as it was (after a credential change too).
      *
-     * A personal assistant's two reads are listed when the same whoami answer says whose assistant this account is
-     * (`assistantOf`, read through the wire, `isAssistantOf`). Otherwise they are left out with no `skipped` entry:
+     * The context is the Agent API's `GET /context`, read through the SDK's typed route (`routes.agent.context`), the
+     * one request `identity.whoami` makes: whoami rebuilds its answer with a projection that keeps only the agent
+     * fields it names, which in SDK 0.13.0 still leaves out `agent.assistantOf` though the route's contract carries it.
+     *
+     * A personal assistant's two reads are listed when the same answer says whose assistant this account is
+     * (`agent.assistantOf`, `isAssistantOf`). Otherwise they are left out with no `skipped` entry:
      * nearly every account is not an assistant, and an entry would put two "not offered" lines about tools it can never
      * have in every agent's `mounts` answer. A call to one is still refused (the gateway's unknown tool, and
      * `ownerRead`'s own check behind it).
@@ -1890,14 +1971,17 @@ export function createRaftPlugin(deps: {
       if (!ctx.credential) {
         return { tools: [], skipped: [{ name: EVERY_OPERATION, reason: "this mount has no Raft credential, so it has no capabilities", every: true }] };
       }
-      const me = await raftFor(ctx, { state: false }).identity.whoami();
+      const me = await raftFor(ctx, { state: false }).routes.agent.context();
       if (!me.ok) {
         if (me.status === 401 || me.status === 403) {
           return { tools: [], refused: true, skipped: [{ name: EVERY_OPERATION, reason: `Raft refused this mount's credential (HTTP ${me.status})`, every: true }] };
         }
-        throw new Error(`could not ask Raft what this mount's credential may do: ${me.error.message}`);
+        // Said in this file's words, not the route's: an HTTP failure's message is the Server's own text.
+        const why = me.error.kind === "transport" ? "no answer from Raft" : me.error.kind === "http" ? `Raft answered HTTP ${me.error.status}`
+          : "Raft's answer did not match the Raft SDK's contract";
+        throw new Error(`could not ask Raft what this mount's credential may do: ${why}`);
       }
-      const capabilities = new Set(me.data.capabilities);
+      const capabilities = new Set(me.data.credential.capabilities);
       const tools: ToolSchema[] = [];
       const skipped: Array<{ name: string; reason: string }> = [];
       for (const op of offerable) {
@@ -1905,7 +1989,7 @@ export function createRaftPlugin(deps: {
         if (missing.length) skipped.push({ name: op.toolName, reason: `the credential lacks the Raft capability ${missing.join(", ")}` });
         else tools.push(toolOf(op));
       }
-      if (isAssistantOf(assistant.assistantOf(me.data))) tools.push(...ASSISTANT_TOOLS);
+      if (isAssistantOf(me.data.agent.assistantOf)) tools.push(...ASSISTANT_TOOLS);
       return { tools, skipped };
     },
 

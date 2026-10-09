@@ -135,7 +135,7 @@ const explainCases: DriveCase[] = [
 const credentialless = async () => admitTools(await raftPlugin.snapshotTools!({ credential: null } as never), 0);
 
 /**
- * What raft's own listing records for a mount whose credential Raft refuses (`identity.whoami` answering 401), admitted
+ * What raft's own listing records for a mount whose credential Raft refuses (its credential context, `GET /context`, answering 401), admitted
  * as the kernel stores it. The listing itself is returned too, for its `refused` flag, which admission does not keep.
  */
 const refusedListing = async () => {

@@ -511,7 +511,8 @@ at all without, falling back to `attachments.download` when the Server cannot mi
 schema name operations by their tool names, never by the manifest's dotted
 names, SDK field paths or CLI flags (`inMountTerms`). Its
 `snapshotTools` asks Raft what the mount's credential may do
-(`identity.whoami` → `capabilities`) and lists only the operations whose every
+(the Agent API's credential context, `GET /context`, read through the SDK's
+`routes.agent.context` → `credential.capabilities`) and lists only the operations whose every
 capability the credential holds; `mountTools` offers those names, with each
 tool's description and schema taken from the running build, never from the
 stored copy. Because the list depends on the credential, the runtime takes it
@@ -528,7 +529,12 @@ one whose first listing under a credential failed — is offered
 every generated tool, and Raft refuses what its credential may not do. Which
 manifest operations are not offered, and why, is one table (`EXCLUDED` in
 `src/plugins/raft.ts`); `test/raft-plugin.ts` turns red when the manifest has
-an operation that is neither generated nor excluded.
+an operation that is neither generated nor excluded. Arguments of an offered
+operation can be withheld the same way (`WITHHELD_ARGUMENTS`): left out of the
+tool's schema and refused at call time before anything is sent, since nothing
+else checks a call against the schema. `messages_read` does not offer the SDK's
+`unread` (0.13.0), which moves the agent's own read position beside
+`receive_events`.
 
 Four of `raft`'s hand-written tools are Raft Agent Login for Connected Apps
 (`src/plugins/raft-agent-login.ts`, the steps of Raft's CLI `integration list`,
@@ -559,20 +565,27 @@ mentions and a preview of the latest message) and `assistant_owner_messages`
 (one of those conversations by its `channelId`, paged with at most one of
 `before`, `after` and `around`). Neither ever shows a direct message. They are
 read-only and model-only, and offered only when the mount's snapshot lists
-them, which it does when the same whoami answer names whose assistant the
+them, which it does when the same credential context names whose assistant the
 account is (`agent.assistantOf` with a `userId`): never with the tools every mount
 has, never to a mount with no snapshot, and a call on a mount whose list lacks
 them is refused before anything is sent. Every successful result opens with a
 line saying the content is the owner's, written outside the conversation, to
 be treated as information rather than instructions; a failure shows Raft's
 HTTP status and error code as sent (`403 assistant_not_enabled`,
-`404 channel_not_found`) and is not retried. Both reads' answers are
-camelCase (`hasMore`, `hasOlder`, `nextOffset`), and one in another style is
-refused as malformed rather than read as missing. The Raft SDK this build pins has
-neither the reads nor `assistantOf`, so both go through one seam
-(`AssistantWire`, `PENDING_ASSISTANT_WIRE` in `src/plugins/raft.ts`) whose
-reads throw until the SDK ships them, and no mount is offered the tools
-meanwhile; `test/raft-assistant.ts` holds them against a fake wire.
+`404 channel_not_found`, with Raft's message when it sent one) and is not
+retried; a 5xx, a 429 or no answer at all is marked transient. Both reads'
+answers are camelCase (`hasMore`, `hasOlder`, `nextOffset`), and one in
+another style is refused as malformed rather than read as missing. They go
+through the SDK's routes (`routes.assistant.ownerInbox` / `ownerMessages`,
+SDK 0.13.0, `RAFT_ASSISTANT_WIRE` in `src/plugins/raft.ts`) on the mount's own
+credential, with no saved state: neither marks anything read for anyone. The
+SDK's `identity.whoami` still drops `agent.assistantOf` in 0.13.0, which is why
+the listing reads the context route rather than whoami; and the SDK's contract
+for that answer refuses an `assistantOf` that is not `{ userId: <uuid> }` or
+null, which fails the whole listing (the stored list stays as it was).
+`test/raft-assistant.ts` holds the reads end to end through the SDK against a
+fake Raft, and the rendering against a fake wire, which can hand it answers
+the SDK's contract would refuse first.
 
 **`replay: "never"` overrides the read rule.** A tool that declares it is not
 run again on its own after an interruption, even when it is a read

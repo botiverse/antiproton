@@ -809,7 +809,7 @@ export const MESSAGE_REFUSED = "message refused by the lane";
 
 /**
  * How long a turn waits for a mount's tool list to be re-taken when its snapshot's basis is not the plugin's
- * (`AgentRuntime.retakeStaleSnapshots`). Raft answers with one small `identity.whoami` GET, well under a second when
+ * (`AgentRuntime.retakeStaleSnapshots`). Raft answers with one small credential-context GET (`/context`), well under a second when
  * it is up; three seconds is room for a slow answer while keeping a down Raft from holding the turn for the 15 s its
  * calls may take (raft.ts `DEFAULT_TIMEOUT_MS`). Running out keeps the old list, which still works, minus the new tools.
  */
