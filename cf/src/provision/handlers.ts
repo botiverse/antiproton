@@ -24,6 +24,7 @@ import type { ConnectionRegistry, ConnectorStore, ProviderTokenIdentity, Provisi
 import { CONNECTION_PROVIDERS, returnUrlProblem, scopesFor, type ConnectionProvider } from "./connect.ts";
 import { surface, surfaceReadOf, type SurfaceDeps } from "../agent-surface/surface.ts";
 import { logEvent } from "../../../src/core/log.ts";
+import { WORKING_SET } from "../../../src/plugins/state.ts";
 import { SEED_MODES, seedPathProblem, seedText, type SeedFileMeta, type SeedMode, type SeedSeal, type SeedWriteResult } from "../../../src/store/seed-files.ts";
 import type { FreshContextResult, RestartResult } from "../runtime.ts";
 
@@ -574,6 +575,12 @@ async function evalSetup(
     const path = query.get("path");
     const problem = seedPathProblem(path);
     if (problem) return fail({ status: 422, code: "invalid", message: problem, param: "path" });
+    // The working set's documents are shown to the agent as written by it (src/plugins/state.ts `workingSet`); a
+    // seeded file under one of their keys would reach its prompt as its own notes.
+    if (WORKING_SET.some((d) => d.key === path)) {
+      return fail({ status: 400, code: "reserved", param: "path",
+        message: `${path} is one of the agent's own working-set documents (${WORKING_SET.map((d) => d.key).join(", ")}), shown to it as written by it; seed under another path` });
+    }
     const mode = query.get("mode") ?? "writable";
     if (!(SEED_MODES as readonly string[]).includes(mode)) return fail({ status: 422, code: "invalid", message: `mode is ${SEED_MODES.join(" or ")}`, param: "mode" });
     const body = seedText(raw ?? new Uint8Array());

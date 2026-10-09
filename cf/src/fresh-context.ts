@@ -134,7 +134,7 @@ export interface ModelInputEvidence {
   summaryBlock: boolean;
   /** The working-set documents (src/plugins/state.ts WORKING_SET) whose heading the system prompt carries. */
   workingSetKeys: string[];
-  /** The seeded paths the system prompt names. */
+  /** The seeded paths the system prompt lists as seeded files (`seededPathsListed`). */
   seedPathsInSystemPrompt: string[];
 }
 
@@ -144,6 +144,18 @@ function textOf(content: unknown): string {
   return content.map((p: any) => typeof p?.text === "string" ? p.text
     : typeof p?.thinking === "string" ? p.thinking
     : p?.type === "toolCall" ? `${p.name ?? ""}${JSON.stringify(p.arguments ?? null)}` : "").join("");
+}
+
+/**
+ * The seeded paths the system prompt carries as seeded files: a line the state plugin's setup block writes for one
+ * (src/plugins/state.ts `seededFiles`), the `MEMORY.md` heading "## `path` (<size>, <mode>)" or a list line
+ * "- `path` (<size>, <mode>): …", where size is "<n> bytes" or "removed". A path that is merely mentioned, or that
+ * is part of a longer word or path, is not listed.
+ */
+export function seededPathsListed(system: string, seedPaths: readonly string[]): string[] {
+  const listed = new Set<string>();
+  for (const m of system.matchAll(/^(?:## |- )`([^`\n]+)` \((?:\d+ bytes|removed), (?:writable|readonly)\)/gm)) listed.add(m[1]!);
+  return seedPaths.filter((p) => listed.has(p));
 }
 
 const messageHash = (m: unknown) => sha256Hex(canonJson(m));
@@ -189,7 +201,7 @@ export function recordModelInput(sql: Sql, jobId: string, seedPaths: readonly st
   const evidence: ModelInputEvidence = {
     sessionId, call, jobId, at: now, systemPromptSha256: sha256Hex(system), messages, summaryBlock,
     workingSetKeys: WORKING_SET.filter((d) => system.includes(`## ${d.key} (`)).map((d) => d.key),
-    seedPathsInSystemPrompt: seedPaths.filter((p) => system.includes(p)),
+    seedPathsInSystemPrompt: seededPathsListed(system, seedPaths),
   };
   sql.exec("INSERT INTO model_input_digests(session_id, call, job_id, at, digest) VALUES (?,?,?,?,?)",
     sessionId, call, jobId, now, JSON.stringify(evidence));

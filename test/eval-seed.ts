@@ -16,6 +16,7 @@ import type { StorageAdapter } from "../src/core/store.ts";
 import { statePlugin } from "../src/plugins/state.ts";
 import type { PluginContext } from "../src/plugins/types.ts";
 import { canonJson } from "../src/core/canon-json.ts";
+import { seededPathsListed } from "../cf/src/fresh-context.ts";
 import { setLogSink } from "../src/core/log.ts";
 import {
   manifestSha256, SEED_AGENT_MAX_BYTES, SEED_FILE_MAX_BYTES, seedInline, seedPathProblem, seedSnapshot, seedText, sha256Hex,
@@ -123,6 +124,18 @@ await check("paths outside the state key rule are refused before the object is a
   for (const path of ["MEMORY.md", "notes/onboarding_objectives.md", "a-b_c.d/e", "x".repeat(128)]) {
     const r = await call(f.deps, "PUT", `/agents/${AGENT}/seed?path=${encodeURIComponent(path)}&mode=readonly`, { body: "hello" });
     must(r.status === 200 && r.body.path === path && r.body.mode === "readonly", `${path}: ${r.text}`);
+  }
+});
+
+await check("the working set's own keys are refused as seeded paths (400 reserved); a path that only resembles one is not", async () => {
+  const f = fakeDeps();
+  for (const path of ["memory", "todo", "journal"]) {
+    const r = await call(f.deps, "PUT", `/agents/${AGENT}/seed?path=${path}`, { body: "hello" });
+    must(r.status === 400 && r.body.error.code === "reserved" && r.body.error.param === "path" && r.body.error.message.includes(path), `${path}: ${r.status} ${r.text}`);
+  }
+  must(f.calls.length === 0, `reached the object: ${show(f.calls)}`);
+  for (const path of ["memory.md", "notes/todo", "Journal"]) {
+    must((await call(f.deps, "PUT", `/agents/${AGENT}/seed?path=${encodeURIComponent(path)}`, { body: "hello" })).status === 200, path);
   }
 });
 
@@ -338,6 +351,23 @@ function varsOf(file: string): Record<string, unknown> {
   // Every environment's vars too: a production environment nested in the file is production as much as the top.
   return Object.assign({}, parsed.vars, ...Object.values(parsed.env ?? {}).map((e) => e.vars ?? {}));
 }
+
+await check("model-input counts a seeded path only where the setup block lists it, not a short path inside words or a passing mention", () => {
+  // The two line shapes of the state plugin's "Workspace files provided at setup" block, and text around them.
+  const system = [
+    "You are an agent. Read a file and act on it; see notes/c.md and `notes/d.md` when you can.",
+    "# Workspace files provided at setup",
+    "## `MEMORY.md` (120 bytes, writable)",
+    "A working file handed to you to maintain. Its current text:",
+    "",
+    "## Other files",
+    "- `notes/b.md` (40 bytes, readonly): it can be read but not changed or removed.",
+    "- `notes/gone.md` (removed, writable): handed to you to maintain, and since removed from your workspace.",
+  ].join("\n");
+  const got = seededPathsListed(system, ["MEMORY.md", "a", "notes/b.md", "notes/c.md", "notes/d.md", "notes/gone.md", "b.md"]);
+  must(show(got) === show(["MEMORY.md", "notes/b.md", "notes/gone.md"]), `listed: ${show(got)}`);
+  must(seededPathsListed("- `a` is not a seeded line\na plain a", ["a"]).length === 0, "a short path counted from a mention");
+});
 
 await check("production (cf/wrangler.jsonc) does not set EVAL_SEED_ROUTES; preview sets it to \"1\"", () => {
   const prod = varsOf("wrangler.jsonc");

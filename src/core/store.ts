@@ -1,5 +1,5 @@
 import type { SeedNoticeRow, SeedPassResult, SeedPlan, SeedRecord } from "../store/seed-record.ts";
-import type { SealHow, SeedFileMeta, SeedSeal, SeedWrite, SeedWriteResult } from "../store/seed-files.ts";
+import type { SealHow, SeedFileMeta, SeedSeal, SeedStoreResult, SeedWrite } from "../store/seed-files.ts";
 import type {
   AdvanceTxn,
   CommitResult,
@@ -421,7 +421,7 @@ export interface StorageAdapter {
    * (src/store/seed-files.ts). Both copies of a file — the snapshot and the working copy at key = path — in one
    * transaction, refused once sealed.
    */
-  seedWrite(tenantId: string, agentId: string, file: SeedWrite): Promise<SeedWriteResult>;
+  seedWrite(tenantId: string, agentId: string, file: SeedWrite): Promise<SeedStoreResult>;
   /** The seeded files as they stand, their hash, and the seal if there is one. Read-only. */
   seedManifest(tenantId: string, agentId: string): Promise<{ manifest: SeedFileMeta[]; manifestSha256: string; seal: SeedSeal | null }>;
   /** Close the window; the first call writes the seal, every later one returns it unchanged (`sealedNow` false). */

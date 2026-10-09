@@ -28,7 +28,11 @@ type Sql = { exec(query: string, ...bindings: unknown[]): { toArray(): any[] } }
 
 export type SeedMode = "writable" | "readonly";
 export const SEED_MODES: readonly SeedMode[] = ["writable", "readonly"];
-export type SealHow = "explicit" | "first-inbound" | "first-turn";
+/**
+ * `prior-activity` is the seal a write finds was owed: the agent has run already (`priorActivity`), but before the
+ * seal existed, so nothing closed its window then.
+ */
+export type SealHow = "explicit" | "first-inbound" | "first-turn" | "prior-activity";
 
 /** One file, as large as an evaluation's notes plausibly are. */
 export const SEED_FILE_MAX_BYTES = 256 * 1024;
@@ -147,18 +151,55 @@ export type SeedWriteResult =
   | { ok: false; code: "sealed" | "agent_cap"; message: string };
 
 /**
- * Write both copies, or neither, inside the caller's transaction. Refused once sealed; refused when the agent's files
- * would pass `SEED_AGENT_MAX_BYTES` together. The same bytes and mode as the file already holds is no write at all, so
- * a retried setup changes nothing, not even the time; anything different replaces both copies.
+ * What the store may answer besides: the write came with its text inline, too large for a row, on the strength of
+ * a repeat (the same bytes and mode as the file held when the caller looked), and the file no longer holds them. The
+ * caller spills and writes again (cf/src/runtime.ts `seedWrite`); it is never a route's answer.
  */
-export function writeSeedFile(sql: Sql, tenantId: string, agentId: string, w: SeedWrite, now: number): SeedWriteResult {
-  const sealed = readSeal(sql, tenantId, agentId);
+export type SeedStoreResult = SeedWriteResult | { ok: false; code: "spill"; message: string };
+
+/** Rows of a read, or none when the table was never made: asking whether an agent ran must not create its tables. */
+function rowsIfAny(sql: Sql, query: string, ...b: unknown[]): any[] {
+  try { return sql.exec(query, ...b).toArray(); }
+  catch (e) { if (/no such table/i.test(String((e as Error)?.message ?? e))) return []; throw e; }
+}
+
+/**
+ * Why this agent has already run, or null: a message in its main transcript (pi's unprefixed `pi_entries`,
+ * src/store/pi-storage.ts `piTables`), a main conversation ended by a fresh context (`main_sessions`,
+ * cf/src/fresh-context.ts), or a push accepted for it (`inbound_pending`, or `delivered` in `inbound_events`,
+ * src/runtime/inbound.ts). An agent that ran before seals existed has no seal and would otherwise take a seed over
+ * the state it built; the turn or push that seals today (`first-turn`, `first-inbound`) leaves one of these too.
+ * The names are spelled here rather than imported, so the stores do not load the engine; test/eval-seed-object.ts
+ * runs a real turn and a real push against this.
+ */
+export function priorActivity(sql: Sql): string | null {
+  if (rowsIfAny(sql, "SELECT 1 FROM pi_entries WHERE type = 'message' LIMIT 1").length) return "its main conversation has messages";
+  if (rowsIfAny(sql, "SELECT 1 FROM main_sessions WHERE ended_at IS NOT NULL LIMIT 1").length) return "it has had a fresh context";
+  if (rowsIfAny(sql, "SELECT 1 FROM inbound_pending LIMIT 1").length
+    || rowsIfAny(sql, "SELECT 1 FROM inbound_events WHERE outcome = 'delivered' LIMIT 1").length) return "a push was accepted for it";
+  return null;
+}
+
+/**
+ * Write both copies, or neither, inside the caller's transaction. Refused once sealed, and an agent that has already
+ * run (`priorActivity`) is sealed here, as `prior-activity`, and refused; refused when the agent's files would pass
+ * `SEED_AGENT_MAX_BYTES` together. The same bytes and mode as the file already holds is no write at all, so a retried
+ * setup changes nothing, not even the time; anything different replaces both copies. Whether that repeat is one is
+ * decided here, in the transaction: a caller that sent a large text inline because it looked like a repeat is told
+ * to spill (`spill`) when it no longer is, so no row ever keeps more than a value's inline limit.
+ */
+export function writeSeedFile(sql: Sql, tenantId: string, agentId: string, w: SeedWrite, now: number): SeedStoreResult {
+  let sealed = readSeal(sql, tenantId, agentId);
+  if (!sealed && priorActivity(sql)) sealed = sealSeedFiles(sql, tenantId, agentId, "prior-activity", now).seal;
   if (sealed) {
     return { ok: false, code: "sealed", message: `the workspace was sealed (${sealed.how}) at ${new Date(sealed.sealedAt).toISOString()}; seeded files can no longer change` };
   }
   const file: SeedFileMeta = { path: w.path, mode: w.mode, bytes: w.bytes, sha256: w.sha256 };
   const prior = sql.exec("SELECT mode, sha256 FROM seed_files WHERE tenant_id=? AND agent_id=? AND path=?", tenantId, agentId, w.path).toArray()[0];
   if (prior && prior.mode === w.mode && prior.sha256 === w.sha256) return { ok: true, changed: false, file };
+  if ((w.content !== null && !seedInline(w.content)) || (w.working.value !== null && w.working.value.length > STATE_INLINE_MAX)) {
+    return { ok: false, code: "spill", message: `${w.path} is too large to keep in its row and is no longer a repeat; spill it` };
+  }
   const others = Number(sql.exec("SELECT COALESCE(SUM(bytes), 0) AS n FROM seed_files WHERE tenant_id=? AND agent_id=? AND path != ?",
     tenantId, agentId, w.path).toArray()[0]?.n ?? 0);
   if (others + w.bytes > SEED_AGENT_MAX_BYTES) {

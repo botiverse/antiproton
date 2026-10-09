@@ -17,7 +17,8 @@ import { d1ProviderTokens, d1ProvisionedAgents } from "../cf/src/control-plane.t
 import { hashProviderToken, newProviderToken } from "../cf/src/provider-token.ts";
 import { readTranscript } from "../cf/src/transcript-read.ts";
 import { canonJson } from "../src/core/canon-json.ts";
-import { sha256Hex } from "../src/store/seed-files.ts";
+import { seedSnapshot, sha256Hex } from "../src/store/seed-files.ts";
+import { ensureClientCalls } from "../src/runtime/client-calls.ts";
 
 const STAND_IN = "export class DurableObject { constructor(ctx, env) { this.ctx = ctx; this.env = env; } }" +
   " export class WorkerEntrypoint { constructor(ctx, env) { this.ctx = ctx; this.env = env; } }" +
@@ -219,6 +220,43 @@ await check("with the flag the routes answer: no credential is 401, another tena
   must(byRaft.status === 200 && byRaft.body.manifest.length === 1 && byRaft.body.sealed === false, `by Raft id: ${byRaft.text}`);
 });
 
+const tableNames = (sql: { exec(q: string): { toArray(): any[] } }) =>
+  sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").toArray().map((r) => String(r.name));
+
+await check("without the flag a real turn records no model input: no evidence table is made; with it, the same turn writes its row", async () => {
+  for (const flag of [null, "1"] as const) {
+    const w = await world(flag);
+    await w.rt.postMessage(T, A, "a real turn", "prompt");
+    await settle(w, 1);
+    must(jobCount(w) === 1 && (await asked(w, 0)).includes("a real turn"), `${flag}: the turn did not reach the model: ${jobCount(w)} jobs`);
+    const has = tableNames(w.raw.sql as never).includes("model_input_digests");
+    if (flag === null) must(!has, "production made the model_input_digests table");
+    else must(has && w.raw.sql.exec("SELECT COUNT(*) AS n FROM model_input_digests").toArray()[0]!.n === 1, "the flagged object recorded nothing");
+  }
+});
+
+await check("a seed write to an object that is no agent's is not_found and makes no table", async () => {
+  const raw = sqliteHost();
+  const ctx = {
+    storage: { sql: raw.sql, transactionSync: raw.transactionSync, getAlarm: async () => null, setAlarm: async () => {}, deleteAlarm: async () => {} },
+    blockConcurrencyWhile: async <R>(fn: () => Promise<R>) => fn(), id: { toString: () => "do-unclaimed" }, getWebSockets: () => [], exports: {},
+  };
+  const D = new AgentDO(ctx as never, (await world()).env as never);
+  const before = tableNames(raw.sql as never);
+  const r = await D.seedWrite(T, A, "MEMORY.md", "writable", "hello");
+  must(!r.ok && r.code === "not_found", show(r));
+  const after = tableNames(raw.sql as never);
+  must(show(after) === show(before), `tables made: ${after.filter((t) => !before.includes(t))}`);
+});
+
+await check("the transcript id \"main\" is not the console's main conversation while it is the current one", async () => {
+  const w = await world();
+  const MARK = "MAIN-ALIAS-MARKER-0e9d";
+  await w.rt.postMessage(T, A, MARK, "prompt");
+  must(show(readTranscript(w.raw.sql as never, T, A, `t_${A}`)).includes(MARK), "the console's id does not read the main conversation");
+  must(readTranscript(w.raw.sql as never, T, A, "main") === null, "\"main\" read the current main conversation");
+});
+
 // ---- the seal --------------------------------------------------------------
 
 await check("the first accepted push seals in the step that queues it: a write while that push waits to be posted is 409, and so is one while its turn runs", async () => {
@@ -256,6 +294,22 @@ await check("a rejected push seals nothing; the first turn by another route seal
   must(m.body.how === "first-turn" && m.body.manifest.length === 1, m.text);
 });
 
+await check("an agent that ran before seals existed is sealed by the first write that finds it, as prior-activity, by a turn or by an accepted push", async () => {
+  for (const how of ["turn", "push"] as const) {
+    const w = await world();
+    if (how === "turn") { await w.rt.postMessage(T, A, "before seals", "prompt"); await settle(w, 1); }
+    else must((await push(w, "old-1", "before seals")).status === 202, "push");
+    // What an agent that ran before this deploy looks like: the activity, and no seal row.
+    w.raw.sql.exec("DELETE FROM seed_seal");
+    must(!(await w.rt.store.isSealed(T, A)), `${how}: still sealed`);
+    const r = await seed(w, "MEMORY.md", "over its own state");
+    must(r.status === 409 && r.body.error.code === "sealed", `${how}: ${r.status} ${r.text}`);
+    const m = await call(w, "GET", `${A}/seed/manifest`);
+    must(m.body.sealed === true && m.body.how === "prior-activity" && m.body.manifest.length === 0, `${how}: ${m.text}`);
+    must((await w.rt.store.getState(T, A, "MEMORY.md")) === null, `${how}: the working copy was written`);
+  }
+});
+
 await check("POST seal is idempotent and answers the manifest it closed on, with its hash", async () => {
   const w = await world();
   must((await seed(w, "notes/b.md", "bee", "readonly")).status === 200 && (await seed(w, "MEMORY.md", "mem")).status === 200, "seeding");
@@ -285,6 +339,27 @@ await check("a file over 32 KiB is spilled, both copies, and reads back through 
   const small = await seed(w, "notes/small.md", "small");
   const smallRead = await call(w, "GET", `${A}/workspace-files/read?path=state/notes/small.md`);
   must(smallRead.body.sha256 === small.body.sha256 && smallRead.body.content === "small", smallRead.text);
+});
+
+await check("a large file sent inline as a repeat that stopped being one is spilled: no row keeps more than 32 KiB", async () => {
+  const w = await world();
+  const X = "x".repeat(40_000), Y = "y".repeat(40_000);
+  must((await seed(w, "notes/big.md", X)).status === 200, "X");
+  const xMeta = (await w.rt.store.listSeedFiles(T, A))[0]!;
+  must((await seed(w, "notes/big.md", Y)).status === 200, "Y");
+  // The runtime's look at the files, taken before Y landed: X again reads as a repeat.
+  const store = w.rt.store as unknown as { listSeedFiles: (t: string, a: string) => Promise<unknown[]> };
+  const real = store.listSeedFiles;
+  store.listSeedFiles = async () => [xMeta];
+  let r;
+  try { r = await seed(w, "notes/big.md", X); } finally { store.listSeedFiles = real; }
+  must(r.status === 200 && r.body.changed === true && r.body.sha256 === sha256Hex(X), `${r.status} ${r.text}`);
+  const snap = seedSnapshot(w.raw.sql as never, T, A, "notes/big.md")!;
+  must(snap.content === null && snap.ref && snap.sha256 === sha256Hex(X), `the snapshot is inline: ${snap.content?.length} chars`);
+  const working = await w.rt.store.getState(T, A, "notes/big.md");
+  must(working?.value === null && working.ref, `the working copy is inline: ${show(working)?.length} chars`);
+  const read = await call(w, "GET", `${A}/workspace-files/read?path=${encodeURIComponent("state/notes/big.md")}`);
+  must(read.body.content === X, "the spilled working copy does not read back as X");
 });
 
 // ---- fresh context ---------------------------------------------------------
@@ -347,6 +422,41 @@ await check("fresh-context is refused while a turn is out, and a second one afte
   const second = await call(w, "POST", `${A}/fresh-context`);
   must(second.status === 200 && second.body.oldSessionId === "main.1" && second.body.newSessionId === "main.2", second.text);
   must(show(readTranscript(w.raw.sql as never, T, A, "main")).includes("hello"), "the first conversation is gone");
+});
+
+await check("fresh-context and restart are 409 while a push is queued, and while a delivery pass is handing one over", async () => {
+  const w = await world();
+  must((await push(w, "q1", "queued push")).status === 202, "push");
+  must(jobCount(w) === 0 && await engineIdle(w), "the push was delivered before the alarm");
+  for (const route of ["fresh-context", "restart"]) {
+    const r = await call(w, "POST", `${A}/${route}`);
+    must(r.status === 409 && r.body.error.code === "busy" && /push is queued/.test(r.body.error.message), `${route} while queued: ${r.status} ${r.text}`);
+  }
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const pass = w.rt.deliverPendingInbound(T, A, { beforeFirstPost: () => gate });
+  await sleep(20);
+  for (const route of ["fresh-context", "restart"]) {
+    const r = await call(w, "POST", `${A}/${route}`);
+    must(r.status === 409 && /push is being delivered/.test(r.body.error.message), `${route} during delivery: ${r.status} ${r.text}`);
+  }
+  release();
+  const out = await pass;
+  must(out.posted === 1, `the pass: ${show(out)}`);
+  must(readTranscript(w.raw.sql as never, T, A, "main") === null && show(readTranscript(w.raw.sql as never, T, A, `t_${A}`)).includes("queued push"),
+    "the push did not land in the main conversation it was queued for");
+});
+
+await check("fresh-context and restart are 409 while a function call waits for the Agents API caller", async () => {
+  const w = await world();
+  ensureClientCalls(w.raw.sql as never);
+  w.raw.sql.exec("INSERT INTO api_client_calls(session, call_id, name, arguments, state, created_at) VALUES ('s1', 'c1', 'lookup', '{}', 'pending', 1)");
+  for (const route of ["fresh-context", "restart"]) {
+    const r = await call(w, "POST", `${A}/${route}`);
+    must(r.status === 409 && /1 function call\(s\) wait for the Agents API caller/.test(r.body.error.message), `${route}: ${r.status} ${r.text}`);
+  }
+  w.raw.sql.exec("UPDATE api_client_calls SET state = 'done'");
+  must((await call(w, "POST", `${A}/fresh-context`)).status === 200, "after the call was answered");
 });
 
 await check("restart keeps the conversation: the next call after it carries the earlier messages, from the same session; a fresh context after it does not", async () => {

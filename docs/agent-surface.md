@@ -206,7 +206,9 @@ can call reads or changes, and a **working copy**, the agent's ordinary state ke
 `readonly`; the state plugin refuses to change a `readonly` path. Rules for `PUT …/seed`:
 
 - `path` follows the state plugin's key rule (`^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$`), with no empty,
-  `.` or `..` segment and never under `kept:`; else `422`, `param: "path"`.
+  `.` or `..` segment and never under `kept:`; else `422`, `param: "path"`. The working set's own
+  keys (`memory`, `todo`, `journal`), which the agent is shown as written by itself, are refused with
+  `400`, `code: "reserved"`.
 - The body is the file as sent, not JSON: UTF-8 text with no NUL byte (`422` otherwise), at most
   262,144 bytes (`413`), and nothing shaped like a credential (`422`, `code: "credential_in_text"`, the
   kind named and none of the text). All of an agent's files together are at most 2,097,152 bytes
@@ -220,7 +222,9 @@ can call reads or changes, and a **working copy**, the agent's ordinary state ke
 **The seal.** The window closes at the first of: `POST …/seed/seal`; the agent's first accepted
 inbound push (in the same step that queues it, before its turn starts); the agent's first turn by any
 other route. A write that arrives after that is refused, even while the turn is still queued or
-running. `POST …/seed/seal` is idempotent and answers the seal it finds:
+running. An agent that already ran before seals existed (a message in its main conversation, a fresh
+context, or an accepted push) is sealed by the first write that finds it, as `prior-activity`, and
+that write is refused. `POST …/seed/seal` is idempotent and answers the seal it finds:
 
 ```json
 { "manifest": [{ "path": "MEMORY.md", "mode": "writable", "bytes": 120, "sha256": "…" }],
@@ -229,7 +233,7 @@ running. `POST …/seed/seal` is idempotent and answers the seal it finds:
 
 `manifest` is sorted by `path`; `manifestSha256` is the SHA-256 of its canonical JSON (keys sorted, no
 spaces: `src/core/canon-json.ts`), so it is the same however it was read. `how` is `explicit`,
-`first-inbound` or `first-turn`. `GET …/seed/manifest` answers the same body plus `sealed: true`, or,
+`first-inbound`, `first-turn` or `prior-activity`. `GET …/seed/manifest` answers the same body plus `sealed: true`, or,
 before the seal, `sealed: false` with the files as they stand and `sealedAt` and `how` null.
 
 ### Fresh context
@@ -239,8 +243,9 @@ one inbound pushes and the console post to — starts empty: the next model call
 old conversation's messages and no summary of them. The old transcript is kept, readable under
 `oldSessionId`. The agent's state, its working copies and its seeded files are not touched. The first
 main conversation's id is `main`; each fresh one is `main.<n>`. Refused with `409`, `code: "busy"`,
-while anything is in flight (a run, a queued input, an unanswered model call, background work), and
-for an agent on the `pd` engine.
+while anything is in flight (a run, a queued input, an unanswered model call, background work, a push
+queued or being delivered, a function call waiting for the Agents API caller), and for an agent on the
+`pd` engine. The `409`'s message says which.
 
 ### Restart
 
@@ -248,7 +253,8 @@ for an agent on the `pd` engine.
 context: the agent's object drops everything it holds in memory — the harness built for each
 conversation, cached tool lists, programs held for `resume` — as an eviction would, and the next turn
 rebuilds from storage on the **same** main conversation (`sessionId`), so its model is sent the whole
-earlier conversation again. Refused with `409`, `code: "busy"`, while a turn is in flight.
+earlier conversation again. Refused with `409`, `code: "busy"`, on the same conditions as a fresh
+context.
 
 ### Model input
 
@@ -267,7 +273,8 @@ Each message's `sha256` is of its canonical JSON as sent; `sourceSessionId` and 
 main conversation whose transcript holds exactly that message, current or ended, and are `null` for
 one no transcript holds. `summaryBlock` says whether a compaction or branch summary is in the input.
 `workingSetKeys` are the working-set documents (`todo`, `memory`, `journal`) the system prompt carries;
-`seedPathsInSystemPrompt` are the seeded paths it names. Without `session`, the answer lists the main
+`seedPathsInSystemPrompt` are the seeded paths it lists as seeded files (a heading or list line of the "Workspace files
+provided at setup" block; a mere mention does not count). Without `session`, the answer lists the main
 conversations: `{ current, sessions: [{ sessionId, generation, current, startedAt, endedAt, calls }] }`.
 Only calls of the `pi085` engine are recorded; `404` when there is no such record.
 

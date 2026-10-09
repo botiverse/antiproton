@@ -18,7 +18,7 @@ import { DynamicWorkerExecutor } from "../../src/runtime/dynamic-worker-executor
 import type { AgentEngine } from "../../src/runtime/engine.ts";
 import { PiAgent, ensureAgentTables, jobSession, sessionsWithWork, markSession } from "../../src/runtime/pi-agent.ts";
 import { DurableAgent, PdHost, recordedEngine } from "../../src/runtime/durable-agent.ts";
-import { busyReason, migrateToPd, revertToPi085, type MigrationResult, type RevertResult } from "../../src/runtime/pd-migrate.ts";
+import { busyReason, clientCallsWaiting, migrateToPd, revertToPi085, type MigrationResult, type RevertResult } from "../../src/runtime/pd-migrate.ts";
 import { sealSeedFiles, seedInline, sha256Hex, type SealHow, type SeedMode, type SeedWriteResult } from "../../src/store/seed-files.ts";
 import { logEvent } from "../../src/core/log.ts";
 import { currentMainId, mainSessions, modelInputCalls, readModelInput, recordModelInput, startFreshMain, type MainSessionRow, type ModelInputEvidence } from "./fresh-context.ts";
@@ -63,7 +63,7 @@ import { assertMountConfig, configFromForm, validateMount } from "../../src/runt
 import { envSecrets } from "../../src/runtime/gateway.ts";
 import { agentSecrets, agentRef, importKek, isAgentRef, open, OWNER_PREFIX, seal, secretRefKind, type Sealed } from "../../src/runtime/secrets.ts";
 import {
-  acceptInbound, claimPendingInbound, ensureInboundTable, hookSecretName, inboundMessage, markPostingInbound, newHookId, newHookSecret,
+  acceptInbound, claimPendingInbound, ensureInboundTable, hasPendingInbound, hookSecretName, inboundMessage, markPostingInbound, newHookId, newHookSecret,
   nextPendingInbound, pendingInboundCount, recentInbound, recordInbound, requeueInbound, seenBefore, settleInbound, underRate,
   expiredPendingInbound, pendingInboundRow, queueFull, queueRetryAfterS, rateRetryAfterS, INBOUND_QUEUE_RETRY_AFTER_S,
   INBOUND_MAX_AGE_MS, INBOUND_MAX_BYTES, INBOUND_PER_MINUTE, INBOUND_POST_ATTEMPTS, INBOUND_QUEUE_MAX, type InboundOutcome, type PendingInbound,
@@ -2871,19 +2871,24 @@ export class AgentRuntime {
     if (!(await this.store.loadAgent(tenantId, agentId))) return { ok: false, code: "not_found", message: `no agent ${agentId}` };
     const bytes = new TextEncoder().encode(file.text);
     const sha256 = sha256Hex(bytes);
-    const same = (await this.store.listSeedFiles(tenantId, agentId)).find((f) => f.path === file.path);
     const json = JSON.stringify(file.text);
-    let content: string | null = file.text, ref: string | null = null;
-    let working: { value: string | null; ref: string | null; bytes: number } = { value: json, ref: null, bytes: json.length };
-    // Asked first so a refusal or a repeat uploads nothing; the store asks again inside its transaction, which is the
-    // answer that counts.
-    if (!(await this.store.isSealed(tenantId, agentId)) && !(same && same.sha256 === sha256 && same.mode === file.mode) && !seedInline(file.text)) {
+    const write = { path: file.path, mode: file.mode, bytes: bytes.byteLength, sha256 };
+    const inline = { ...write, content: file.text, ref: null, working: { value: json, ref: null, bytes: json.length } };
+    const spilled = async () => {
       const base = `t/${tenantId}/${agentId}/seed/${sha256}`;
-      ref = (await this.#artifacts.put(`${base}.txt`, bytes)).ref;
-      content = null;
-      working = { value: null, ref: (await this.#artifacts.put(`${base}.json`, json)).ref, bytes: json.length };
-    }
-    return this.store.seedWrite(tenantId, agentId, { path: file.path, mode: file.mode, bytes: bytes.byteLength, sha256, content, ref, working });
+      const ref = (await this.#artifacts.put(`${base}.txt`, bytes)).ref;
+      return { ...write, content: null, ref, working: { value: null, ref: (await this.#artifacts.put(`${base}.json`, json)).ref, bytes: json.length } };
+    };
+    // Asked first so a refusal or a repeat uploads nothing. Only a guess: the store decides both inside its
+    // transaction, and a large text sent inline as a repeat that is no longer one comes back as `spill`.
+    const same = (await this.store.listSeedFiles(tenantId, agentId)).find((f) => f.path === file.path);
+    const guessInline = seedInline(file.text) || (await this.store.isSealed(tenantId, agentId))
+      || (same !== undefined && same.sha256 === sha256 && same.mode === file.mode);
+    const first = await this.store.seedWrite(tenantId, agentId, guessInline ? inline : await spilled());
+    if (first.ok || first.code !== "spill") return first;
+    const second = await this.store.seedWrite(tenantId, agentId, await spilled());
+    if (second.ok || second.code !== "spill") return second;
+    throw new Error(`seed write of ${file.path}: the store refused a spilled write as too large`);
   }
 
   /** Close the seeded workspace now; idempotent. Null when there is no such agent. */
@@ -2905,9 +2910,8 @@ export class AgentRuntime {
   /**
    * Start a new main conversation (cf/src/fresh-context.ts): the next turn's model is sent none of the old one's
    * messages and no summary of them, the old transcript stays readable under its id, and the agent's state, working
-   * copies and seeded files are untouched (they are not the transcript). Refused while anything is in flight — a
-   * run, a queued input, a model call not answered, a program held for `resume`, background work — since each of
-   * those belongs to the conversation that started it; pd keeps its conversations elsewhere and is refused too.
+   * copies and seeded files are untouched (they are not the transcript). Refused while anything is in flight
+   * (`notIdle`), since each of those belongs to the conversation that started it or lands in the main one; pd keeps its conversations elsewhere and is refused too.
    * Run with nothing else in the object (AgentDO.freshContext). The harnesses built on the old transcript are dropped.
    */
   async freshContext(tenantId: string, agentId: string): Promise<FreshContextResult> {
@@ -2923,13 +2927,24 @@ export class AgentRuntime {
 
   /**
    * What is in flight in this object, or null between turns: a run or queued input in any conversation, a model call
-   * not answered, background work (src/runtime/pd-migrate.ts `busyReason`), a program held for `resume`. pi085's
-   * tables only, which is what both callers act on (`freshContext`, AgentDO.restart).
+   * not answered, background work (src/runtime/pd-migrate.ts `busyReason`), a program held for `resume`, a push
+   * queued or being delivered, a function call waiting for the Agents API caller. pi085's tables only, which is what
+   * both callers act on (`freshContext`, AgentDO.restart).
    */
   notIdle(): string | null {
     const sql = this.#deps.ctx.storage.sql;
     ensureAgentTables(sql);
-    return busyReason(sql) ?? (this.#continuations.size > 0 ? `${this.#continuations.size} program(s) are held for resume` : null);
+    const busy = busyReason(sql);
+    const reasons: string[] = [];
+    if (this.#continuations.size > 0) reasons.push(`${this.#continuations.size} program(s) are held for resume`);
+    // Each of these lands in the main conversation when it arrives: a push queued or being handed over
+    // (`deliverPendingInbound`), an Agents API caller's answer to a function call its turn waits on.
+    if (hasPendingInbound(sql)) reasons.push("a push is queued for the agent");
+    if (this.#inboundPass !== null) reasons.push("a push is being delivered to the agent");
+    const waiting = clientCallsWaiting(sql);
+    if (waiting > 0) reasons.push(`${waiting} function call(s) wait for the Agents API caller`);
+    if (!reasons.length) return busy;
+    return busy ? `${busy}; ${reasons.join("; ")}` : `the agent is not idle: ${reasons.join("; ")}`;
   }
 
   /** Close and forget the harnesses built for this agent, so the next turn builds its own from storage. */
