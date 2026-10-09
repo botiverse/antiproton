@@ -127,8 +127,11 @@ const PLUGIN_ID = "state";
  * fail closed rather than open.
  */
 async function seedModes(store: StorageAdapter, tenantId: string, agentId: string): Promise<Map<string, SeedMode>> {
-  const modeOf = (f: SeedFileMeta): SeedMode => f.mode === "writable" ? "writable" : "readonly";
-  return new Map((await store.listSeedFiles(tenantId, agentId)).map((f) => [f.path, modeOf(f)]));
+  return new Map((await store.listSeedFiles(tenantId, agentId)).map((f) => [f.path, seedModeOf(f)]));
+}
+
+function seedModeOf(f: SeedFileMeta): SeedMode {
+  return f.mode === "writable" ? "writable" : "readonly";
 }
 
 /** Whether `tool` is declared as a write that takes a `key`: what the read-only guard holds to it. */
@@ -169,8 +172,13 @@ export function statePlugin(
       const first = (await store.findMountsByPlugin(
         ctx.caller.tenantId, ctx.caller.agentId, PLUGIN_ID))[0]?.alias;
       if (first && first !== ctx.alias) return null;
-      const text = await seededFiles(store, ctx.caller.tenantId, ctx.caller.agentId)
-        + await workingSet(store, ctx.caller.tenantId, ctx.caller.agentId);
+      const { tenantId, agentId } = ctx.caller;
+      const seeds = await store.listSeedFiles(tenantId, agentId);
+      // A working-set document that is also a seeded path is shown once, in
+      // the seeded block: under "What you already know" it would be headed
+      // "written by you", which a file the setup gave is not.
+      const text = await seededFiles(store, tenantId, agentId, seeds)
+        + await workingSet(store, tenantId, agentId, new Set(seeds.map((f) => f.path)));
       return text.trim() ? text : null;
     },
 
@@ -518,9 +526,12 @@ export function statePlugin(
  */
 export async function workingSet(
   store: StorageAdapter, tenantId: string, agentId: string,
+  /** Keys left out: the seeded paths, which are not the agent's own writing. */
+  skip: ReadonlySet<string> = new Set(),
 ): Promise<string> {
   const parts: string[] = [];
   for (const doc of WORKING_SET) {
+    if (skip.has(doc.key)) continue;
     const got = await store.getState(tenantId, agentId, doc.key);
     const text = typeof got?.value === "string" ? got.value : got?.value ? JSON.stringify(got.value) : "";
     if (!text.trim()) continue;
@@ -569,16 +580,41 @@ export const SEEDED_MEMORY = "MEMORY.md";
 export const SEEDED_MEMORY_BUDGET = 4000;
 
 /**
+ * A code fence `text` cannot close: one backtick longer than its longest run of
+ * backticks, and never shorter than three. A closing fence has to be at least
+ * as long as the opening one, so nothing inside can end the block early and
+ * have the rest read as the prompt's own sections. Begin and end markers made
+ * of words would not do: the file can contain the same words.
+ */
+export function fenceFor(text: string): string {
+  const longest = Math.max(0, ...(text.match(/`+/g) ?? []).map((r) => r.length));
+  return "`".repeat(Math.max(3, longest + 1));
+}
+
+/**
+ * A working copy's size as the setup counted the file: UTF-8 bytes of its
+ * text, so an unedited copy reads the same number as its manifest entry (the
+ * binary-payload exception in AGENTS.md's convention, as in seed-files.ts).
+ * Null when the value is not in the row; it is not fetched.
+ */
+function utf8Bytes(value: Json | undefined): number | null {
+  if (value == null) return null;
+  return new TextEncoder().encode(typeof value === "string" ? value : JSON.stringify(value)).byteLength;
+}
+
+/**
  * The files an evaluation's setup put in the workspace (src/store/seed-files.ts),
  * as the agent is shown them when the harness opens: `MEMORY.md`'s working copy
- * in full up to a budget, then every other seeded path with its working copy's
- * size now and its mode. Empty when nothing was seeded, so the prompt of an
- * agent without seeds is the prompt it always had.
+ * in full up to a budget, fenced, then every other seeded path with its working
+ * copy's size now and its mode. Empty when nothing was seeded, so the prompt of
+ * an agent without seeds is the prompt it always had. `files` is the seed list
+ * when the caller has already read it.
  *
  * Read from the working copies, never the snapshot: what the agent is told is
  * what its `get` would answer, so a file it removed is said to be removed. A
  * working copy kept in object storage is not fetched — opening the harness
- * does not wait on a bucket — and the agent is told to `get` it instead.
+ * does not wait on a bucket — so its size is the one the setup recorded, said
+ * to be that, and the agent is told to `get` it.
  *
  * Never "written by you", which is how the working set below begins: the
  * agent did not write these, and a model told it did will defend their
@@ -590,15 +626,21 @@ export const SEEDED_MEMORY_BUDGET = 4000;
  * which no setup route lets through, as the rule has no room for a newline, a
  * backtick or any control character — is not printed at all, only counted.
  */
-export async function seededFiles(store: StorageAdapter, tenantId: string, agentId: string): Promise<string> {
-  const files = await store.listSeedFiles(tenantId, agentId);
+export async function seededFiles(
+  store: StorageAdapter, tenantId: string, agentId: string, files?: readonly SeedFileMeta[],
+): Promise<string> {
+  files ??= await store.listSeedFiles(tenantId, agentId);
   if (!files.length) return "";
-  const modes = await seedModes(store, tenantId, agentId);
   const alias = (await store.findMountsByPlugin(tenantId, agentId, PLUGIN_ID))[0]?.alias;
   // Named the way the working set names its tools: the tool, on the mount.
   const getTool = alias ? `the \`get\` tool on the \`${alias}\` mount` : null;
   const shown = files.filter((f) => STATE_KEY.test(f.path));
   const hidden = files.length - shown.length;
+  const sizeOf = (f: SeedFileMeta, got: { value: Json; ref: string | null } | null) => {
+    if (!got) return "removed";
+    const now = utf8Bytes(got.value);
+    return now === null ? `${f.bytes} bytes at setup, kept in object storage` : `${now} bytes`;
+  };
   const parts: string[] = [
     "# Workspace files provided at setup\n" +
     "These files were put in your workspace when it was set up, before your first task. Each is a key in your " +
@@ -609,7 +651,7 @@ export async function seededFiles(store: StorageAdapter, tenantId: string, agent
   ];
   const memory = shown.find((f) => f.path === SEEDED_MEMORY);
   if (memory) {
-    const mode = modes.get(memory.path)!;
+    const mode = seedModeOf(memory);
     const got = await store.getState(tenantId, agentId, memory.path);
     const what = mode === "writable"
       ? "A working file handed to you to maintain."
@@ -622,24 +664,28 @@ export async function seededFiles(store: StorageAdapter, tenantId: string, agent
         (getTool ? `read it with ${getTool}.` : "you have no tool mounted for reading it.");
     } else {
       const text = typeof got.value === "string" ? got.value : JSON.stringify(got.value);
-      let kept = text.trimEnd();
+      let kept = text;
+      let cut = "";
       if (text.length > SEEDED_MEMORY_BUDGET) {
         // Not between the two halves of a surrogate pair.
         const end = /[\uD800-\uDBFF]/.test(text[SEEDED_MEMORY_BUDGET - 1]!) ? SEEDED_MEMORY_BUDGET - 1 : SEEDED_MEMORY_BUDGET;
-        kept = `${text.slice(0, end).trimEnd()}\n…\n` +
-          `(cut at ${end} of ${text.length} characters; ` +
-          (getTool ? `get \`${SEEDED_MEMORY}\` with ${getTool} for the rest)` : "the rest is not shown)");
+        kept = text.slice(0, end);
+        cut = `\n… cut at ${end} of ${text.length} characters; ` +
+          (getTool ? `get \`${SEEDED_MEMORY}\` with ${getTool} for the rest.` : "the rest is not shown.");
       }
-      body = `${what} Its current text:\n\n${kept}`;
+      kept = kept.trimEnd();
+      const fence = fenceFor(kept);
+      // The cut line is outside the fence: it is the prompt speaking, not the file.
+      body = `${what} Its current content is the text inside the fence below:\n\n` +
+        `${fence}\n${kept}\n${fence}${cut}`;
     }
-    parts.push(`## \`${memory.path}\` (${got ? `${got.bytes} bytes` : "removed"}, ${mode})\n${body}`);
+    parts.push(`## \`${memory.path}\` (${sizeOf(memory, got)}, ${mode})\n${body}`);
   }
   const others = shown.filter((f) => f !== memory);
   const lines: string[] = [];
   for (const f of others) {
-    const mode = modes.get(f.path)!;
+    const mode = seedModeOf(f);
     const got = await store.getState(tenantId, agentId, f.path);
-    const size = got ? `${got.bytes} bytes` : "removed";
     const how = !got
       ? (mode === "writable"
         ? "handed to you to maintain, and since removed from your workspace"
@@ -648,7 +694,7 @@ export async function seededFiles(store: StorageAdapter, tenantId: string, agent
         ? "a working file handed to you to maintain; " +
           (getTool ? `open it with ${getTool}` : "you have no tool mounted for opening it")
         : (getTool ? `it can be read with ${getTool}` : "it can be read") + " but not changed or removed";
-    lines.push(`- \`${f.path}\` (${size}, ${mode}): ${how}.`);
+    lines.push(`- \`${f.path}\` (${sizeOf(f, got)}, ${mode}): ${how}.`);
   }
   if (hidden) lines.push(`- and ${hidden} more whose ${hidden === 1 ? "name" : "names"} cannot be shown here.`);
   if (lines.length) parts.push((memory ? "## Other files\n" : "") + lines.join("\n"));
