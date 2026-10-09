@@ -310,17 +310,24 @@ function walkRedacting(value: unknown, exact: RegExp[] | null): Redacted {
     for (const re of exact!) t = t.replace(re, () => { redactions++; return mark("agent-secret"); });
     return t;
   };
-  /** A %-encoded run decoding to a sealed value: the `&`/`?`/`=`-separated parts that do, or else the whole run. */
+  /**
+   * A %-encoded run decoding to a sealed value: the `&`/`?`/`=`-separated parts that do, or else the whole run. The
+   * whole run too when those parts are replaced and what is left still holds one: a value spelled with `=`, `&` or `?`
+   * spans parts, and no single part decodes to it.
+   */
   const percentRun = (run: string): string | null => {
     if (!percentDecodings(run).some(holds)) return null;
-    let hit = false;
+    const before = redactions;
     const parts = run.split(/([&?=])/).map((p, i) => {
       if (i % 2 === 1 || !percentDecodings(p).some(holds)) return p;
-      hit = true;
       redactions++;
       return mark("agent-secret");
     });
-    if (hit) return parts.join("");
+    if (redactions > before) {
+      const joined = parts.join("");
+      if (!holds(joined) && !percentDecodings(joined).some(holds)) return joined;
+      redactions = before;
+    }
     redactions++;
     return mark("agent-secret");
   };

@@ -323,6 +323,20 @@ await check("a %-encoded or base64 run whose decoded text holds a sealed value i
   must(plain.redactions === 0, show(plain));
 });
 
+await check("a %-run whose sealed value is spelled with = & or ? is replaced whole, even when another part of the run is replaced first", () => {
+  // `=` survives a path encoder (Go's url.PathEscape), so S spans two `=`-separated parts and no single part decodes to it.
+  const S = "Kx7/AbQ9=zT4mLp0Wv8", T2 = "ak/operator-12345678";
+  const two = redactCredentials("https://h/x?a=ak%2Foperator-12345678&b=Kx7%2FAbQ9=zT4mLp0Wv8", { secrets: [S, T2] });
+  must(!show(two.value).includes("zT4mLp0Wv8") && !show(two.value).includes("AbQ9") && two.redactions >= 1, `two values: ${show(two)}`);
+  // One value twice in one run, escaped two ways: the strict spelling is a part of its own, the path one spans two.
+  const twice = redactCredentials(`https://h/x?a=${encodeURIComponent(S)}&b=Kx7%2FAbQ9=zT4mLp0Wv8`, { secrets: [S] });
+  must(!show(twice.value).includes("zT4mLp0Wv8") && !show(twice.value).includes("AbQ9") && twice.redactions >= 1, `twice: ${show(twice)}`);
+  // The control: a value that sits in one part still leaves the rest of the URL readable.
+  const KEY = "Zq9/Wm4LpX7tR2vN8kB";
+  const one = redactCredentials(`see https://h.example/cb?page=2&key=${encodeURIComponent(KEY)}&x=1 now`, { secrets: [KEY, S] });
+  must(one.value === "see https://h.example/cb?page=2&key=<redacted:agent-secret>&x=1 now" && one.redactions === 1, `one part: ${show(one)}`);
+});
+
 await check("a value shorter than 16 characters is matched in its own case only; 16 or more in any case", () => {
   const short = redactCredentials("ABC12345 and abc12345 and Abc12345", { secrets: ["Abc12345"] });
   must(short.value === "ABC12345 and abc12345 and <redacted:agent-secret>" && short.redactions === 1, show(short));
