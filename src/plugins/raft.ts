@@ -645,6 +645,21 @@ const ARGUMENT_CHECKS: Readonly<Record<string, { check(input: Record<string, unk
 };
 
 /**
+ * Arguments of an operation's manifest schema that its tool does not offer, each with the reason: left out of the
+ * tool's schema (`toolOf`) and refused at call time before anything is sent (`argumentsFor`). The refusal is needed
+ * because nothing else stops one: the gateway does not check a call against the tool's schema, the manifest's schemas
+ * do not forbid other properties, and `argumentsFor` passes on what the manifest advertises, which still includes it.
+ * Offering one is a change of its own: take it out of this table, with a test of what it does.
+ */
+export const WITHHELD_ARGUMENTS: Readonly<Record<string, Readonly<Record<string, string>>>> = {
+  "messages.read": {
+    // SDK 0.13.0. It moves this agent's own read position, a second mechanism beside receive_events; and under code
+    // origin the SDK sends it with `consume: false`, a combination whose handling by the Server is not verified.
+    unread: "it moves your read position, which receive_events keeps; read new messages with receive_events, or page this conversation with after, before or around",
+  },
+};
+
+/**
  * The manifest's text in this mount's terms, for a tool's description and every parameter description in its schema:
  * an operation named by its dotted name (`tasks.unassign`) is written as the tool name the model is offered
  * (`tasks_unassign`); a parenthesised SDK field path (`(interrupt.resume.idempotencyKey)`), which names an object this
@@ -687,6 +702,10 @@ function describeInMountTerms(schema: unknown): void {
  */
 export function toolOf(op: RaftOperationSpec): ToolSchema {
   const parameters = structuredClone(op.inputSchema) as Record<string, any>;
+  for (const name of Object.keys(WITHHELD_ARGUMENTS[op.name] ?? {})) {
+    delete parameters.properties?.[name];
+    if (Array.isArray(parameters.required)) parameters.required = parameters.required.filter((r: unknown) => r !== name);
+  }
   const paging = pagingArg(op);
   if (paging) {
     const p = parameters.properties[paging];
@@ -745,7 +764,8 @@ export function originOf(ctx: PluginContext): { origin: "model" | "code"; contex
 }
 
 /**
- * The arguments a caller may give an operation: what its manifest schema advertises, and nothing else. The SDK
+ * The arguments a caller may give an operation: what its manifest schema advertises, and nothing else; one this
+ * mount withholds (`WITHHELD_ARGUMENTS`) is refused, so a call that names it fails rather than run without it. The SDK
  * also accepts arguments it does not advertise — a send's `seen` overrides what the send attests, which is the
  * hold's whole question — so one of those from a caller is dropped here, and only a resume this plugin made
  * itself passes `seen`. The paging argument gets its cap and its default (`pagingArg`).
@@ -754,6 +774,8 @@ function argumentsFor(op: RaftOperationSpec, args: unknown): Record<string, unkn
   if (args !== undefined && args !== null && (typeof args !== "object" || Array.isArray(args))) {
     throw new Error(`${op.toolName} takes an object of arguments`);
   }
+  const withheld = Object.entries(WITHHELD_ARGUMENTS[op.name] ?? {}).find(([name]) => Object.hasOwn(args ?? {}, name));
+  if (withheld) throw new Error(`${op.toolName} does not take ${withheld[0]} on this mount: ${withheld[1]}. Nothing was sent`);
   const advertised = op.inputSchema.properties ?? {};
   const input = Object.fromEntries(Object.entries(args ?? {}).filter(([name]) => Object.hasOwn(advertised, name)));
   const refused = ARGUMENT_CHECKS[op.name]?.check(input);

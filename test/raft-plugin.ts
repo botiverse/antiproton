@@ -1,6 +1,6 @@
 import { createHmac } from "node:crypto";
 import { createRaft, isInterrupted, RAFT_OPERATIONS } from "@botiverse/raft-sdk";
-import { raftPlugin as raftWithoutStorage, EXCLUDED, EVENTS_LIMIT, GENERATED, handOver, INBOX_STORE, KEY_LIFETIME_MS, PAGE_ROWS, PUSH_KEY, PUSH_STORE, originOf, pagingArg, toolOf, offeredTerms, escapeMarks, unescapeMarks, createRaftPlugin, downloadAttachment, ATTACHMENT_MAX_BYTES, toolsBasisOf } from "../src/plugins/raft.ts";
+import { raftPlugin as raftWithoutStorage, EXCLUDED, EVENTS_LIMIT, GENERATED, handOver, INBOX_STORE, KEY_LIFETIME_MS, PAGE_ROWS, PUSH_KEY, PUSH_STORE, originOf, pagingArg, toolOf, offeredTerms, escapeMarks, unescapeMarks, createRaftPlugin, downloadAttachment, ATTACHMENT_MAX_BYTES, toolsBasisOf, WITHHELD_ARGUMENTS } from "../src/plugins/raft.ts";
 import { readFileSync } from "node:fs";
 import { PARK_BYTES } from "../src/plugins/artifacts.ts";
 import { setLogSink } from "../src/core/log.ts";
@@ -309,9 +309,12 @@ await check("the manifest's declarations map onto the tool: side effect, model-o
     if (op.name === "attachments.downloadUrl") {
       if (!/^Download an attachment .* into this agent's storage, up to 25 MiB: returns an artifact reference/.test(t.summary) || /URL|url/.test(t.summary)) throw new Error(`${op.name}: description ${t.summary}`);
     } else if (!t.summary.startsWith(op.description.slice(0, 12))) throw new Error(`${op.name}: description ${t.summary}`);
+    // The manifest's, less the arguments this mount withholds (WITHHELD_ARGUMENTS, held in its own case below).
+    const withheld = Object.keys(WITHHELD_ARGUMENTS[op.name] ?? {});
     const props = Object.keys((t.parameters as any).properties ?? {});
-    if (JSON.stringify(props) !== JSON.stringify(Object.keys(op.inputSchema.properties ?? {}))) throw new Error(`${op.name}: parameters ${props.join()}`);
-    if (JSON.stringify((t.parameters as any).required ?? null) !== JSON.stringify(op.inputSchema.required ?? null)) throw new Error(`${op.name}: required`);
+    if (JSON.stringify(props) !== JSON.stringify(Object.keys(op.inputSchema.properties ?? {}).filter((p) => !withheld.includes(p)))) throw new Error(`${op.name}: parameters ${props.join()}`);
+    const required = op.inputSchema.required ? op.inputSchema.required.filter((r) => !withheld.includes(r)) : null;
+    if (JSON.stringify((t.parameters as any).required ?? null) !== JSON.stringify(required)) throw new Error(`${op.name}: required`);
   }
   // The decisions the manifest makes that a hand-written tool once made differently.
   // Keyed since 0.9.0 like a send: "key", never "native". When the model gives no key the key is the operation id, which
@@ -1333,6 +1336,49 @@ await check("a paged result stays under the parking line: limit is capped and de
   const page = await raftPlugin.invoke("messages_read", { target: "#wg-raft-sdk" }, inTurn(ctx()));
   const size = JSON.stringify(page).length;
   if (size > PARK_BYTES) throw new Error(`a full page of ${body.length}-character messages is ${size} characters; the parking line is ${PARK_BYTES}`);
+});
+
+await check("messages_read does not offer unread (SDK 0.13.0): not in its schema, and a call naming it is refused before any request", async () => {
+  // The manifest has it; this mount withholds it.
+  must(Object.hasOwn(opNamed("messages.read").inputSchema.properties ?? {}, "unread"), "control: the manifest no longer has messages.read's unread");
+  must(JSON.stringify(Object.keys(WITHHELD_ARGUMENTS)) === JSON.stringify(["messages.read"]) && JSON.stringify(Object.keys(WITHHELD_ARGUMENTS["messages.read"]!)) === JSON.stringify(["unread"]), `withheld: ${JSON.stringify(WITHHELD_ARGUMENTS)}`);
+  const t = toolNamed("messages_read")!;
+  const params = t.parameters as any;
+  must(!("unread" in params.properties), `unread offered: ${Object.keys(params.properties).join()}`);
+  // Nothing left in the tool that names it, so the model is not pointed at it.
+  must(!/unread/i.test(JSON.stringify(params)) && !/unread/i.test(t.summary), `a mention of unread: ${t.summary} ${JSON.stringify(params)}`);
+  // Control: the rest of the schema is the manifest's.
+  must(["target", "after", "before", "around", "limit", "consume"].every((k) => k in params.properties) && JSON.stringify(params.required) === JSON.stringify(["target"]), `schema: ${JSON.stringify(params)}`);
+  // A withheld argument a manifest made required would leave the schema requiring what it does not offer: dropped there too.
+  const op = opNamed("messages.read");
+  const requiring = toolOf({ ...op, inputSchema: { ...op.inputSchema, required: ["target", "unread"] } }).parameters as any;
+  must(JSON.stringify(requiring.required) === JSON.stringify(["target"]), `a required withheld argument: ${JSON.stringify(requiring.required)}`);
+  for (const [what, args, c] of [
+    ["unread: true", { target: "#wg-raft-sdk", unread: true }, inTurn(ctx())],
+    ["unread: false", { target: "#wg-raft-sdk", unread: false }, inTurn(ctx())],
+    ["with an anchor", { target: "#wg-raft-sdk", unread: true, after: 3 }, inTurn(ctx())],
+    ["from a program", { target: "#wg-raft-sdk", unread: true }, { ...inTurn(ctx()), caller: { ...inTurn(ctx()).caller, fromProgram: true } }],
+  ] as const) {
+    const calls = one(history([]));
+    const e = await failure(() => raftPlugin.invoke("messages_read", args, c));
+    must(calls.length === 0, `${what}: a request was sent: ${JSON.stringify(calls.map((x) => x.url))}`);
+    must(/^messages_read does not take unread on this mount: it moves your read position, which receive_events keeps; .*Nothing was sent$/.test(e.message), `${what}: ${e.message}`);
+  }
+  // The gateway does not check a call against the tool's schema, so this refusal is the only thing that stops it: through
+  // the gateway, as a run_js program's call arrives, the call reaches the plugin and is refused there.
+  const store = new SqliteStore(":memory:");
+  await store.init();
+  await store.createAgent("tenant", "agent");
+  await store.addMount({ tenantId: "tenant", agentId: "agent", alias: "raft", plugin: "raft", installationId: "i", connectionId: null,
+    toolVersion: raftPlugin.version, publicConfig: { serverUrl: "https://raft.example" }, secretRef: "secret:raft", policy: null });
+  const gateway = new ToolGateway(store, [raftPlugin], new Set([raftPlugin.id]), { async resolve() { return "sk_agent_test_1234567890"; } });
+  const viaGateway = one(history([]));
+  const out: any = await gateway.invoke({ tenantId: "tenant", agentId: "agent", taskId: "task", contextId: "ctx_turn" } as any, "raft.messages_read", { target: "#wg-raft-sdk", unread: true }, { fromProgram: true });
+  must(viaGateway.length === 0 && out.status === "failed" && /does not take unread on this mount/.test(JSON.stringify(out.error)), `through the gateway: ${JSON.stringify(out)} ${viaGateway.length}`);
+  // Control: without it, the read goes out, and with no unread in it.
+  const calls = one(history([]));
+  await raftPlugin.invoke("messages_read", { target: "#wg-raft-sdk", around: "12" }, inTurn(ctx()));
+  must(calls.length === 1 && !new URL(calls[0]!.url).searchParams.has("unread") && new URL(calls[0]!.url).searchParams.get("around") === "12", `control: ${JSON.stringify(calls.map((x) => x.url))}`);
 });
 
 await check("messages_read: a name with a line break or another control character cannot forge a line in the page", async () => {

@@ -529,7 +529,12 @@ one whose first listing under a credential failed — is offered
 every generated tool, and Raft refuses what its credential may not do. Which
 manifest operations are not offered, and why, is one table (`EXCLUDED` in
 `src/plugins/raft.ts`); `test/raft-plugin.ts` turns red when the manifest has
-an operation that is neither generated nor excluded.
+an operation that is neither generated nor excluded. Arguments of an offered
+operation can be withheld the same way (`WITHHELD_ARGUMENTS`): left out of the
+tool's schema and refused at call time before anything is sent, since nothing
+else checks a call against the schema. `messages_read` does not offer the SDK's
+`unread` (0.13.0), which moves the agent's own read position beside
+`receive_events`.
 
 Four of `raft`'s hand-written tools are Raft Agent Login for Connected Apps
 (`src/plugins/raft-agent-login.ts`, the steps of Raft's CLI `integration list`,
