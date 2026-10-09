@@ -550,6 +550,25 @@ the app answers 401 is sent once more after a fresh login. Only v0 manifests
 run, and a manifest whose `base_url` has a path is refused rather than joined; `test/raft-agent-login.ts` holds all of it against a fake Raft and a fake
 app.
 
+Two more are a personal assistant's reads of its owner's Raft:
+`assistant_owner_inbox` (the owner's channels and threads with unread counts,
+mentions and a preview of the latest message) and `assistant_owner_messages`
+(one of those conversations by its `channelId`, paged with at most one of
+`before`, `after` and `around`). Neither ever shows a direct message. They are
+read-only and model-only, and offered only when the mount's snapshot lists
+them, which it does when the same whoami answer names whose assistant the
+account is (`assistantOf` with a `userId`): never with the tools every mount
+has, never to a mount with no snapshot, and a call on a mount whose list lacks
+them is refused before anything is sent. Every successful result opens with a
+line saying the content is the owner's, written outside the conversation, to
+be treated as information rather than instructions; a failure shows Raft's
+HTTP status and error code as sent (`403 assistant_not_enabled`,
+`404 channel_not_found`) and is not retried. The Raft SDK this build pins has
+neither the reads nor `assistantOf`, so both go through one seam
+(`AssistantWire`, `PENDING_ASSISTANT_WIRE` in `src/plugins/raft.ts`) whose
+reads throw until the SDK ships them, and no mount is offered the tools
+meanwhile; `test/raft-assistant.ts` holds them against a fake wire.
+
 **`replay: "never"` overrides the read rule.** A tool that declares it is not
 run again on its own after an interruption, even when it is a read
 (`replayPolicy` asks it first). Declare it on a read whose claim to be harmless
