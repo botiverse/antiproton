@@ -18,7 +18,10 @@ import { DynamicWorkerExecutor } from "../../src/runtime/dynamic-worker-executor
 import type { AgentEngine } from "../../src/runtime/engine.ts";
 import { PiAgent, ensureAgentTables, jobSession, sessionsWithWork, markSession } from "../../src/runtime/pi-agent.ts";
 import { DurableAgent, PdHost, recordedEngine } from "../../src/runtime/durable-agent.ts";
-import { migrateToPd, revertToPi085, type MigrationResult, type RevertResult } from "../../src/runtime/pd-migrate.ts";
+import { busyReason, migrateToPd, revertToPi085, type MigrationResult, type RevertResult } from "../../src/runtime/pd-migrate.ts";
+import { sealSeedFiles, seedInline, sha256Hex, type SealHow, type SeedMode, type SeedWriteResult } from "../../src/store/seed-files.ts";
+import { logEvent } from "../../src/core/log.ts";
+import { currentMainId, mainSessions, modelInputCalls, readModelInput, recordModelInput, startFreshMain, type MainSessionRow, type ModelInputEvidence } from "./fresh-context.ts";
 import { heldDecision, warningText } from "../../src/runtime/idle-lease.ts";
 import { heldLines, heldPrompt, heldResources, withHeldNote } from "../../src/runtime/held.ts";
 import {
@@ -667,6 +670,12 @@ export interface RuntimeDeps {
    * a wake already set: it only ever brings the alarm forward.
    */
   keepAlive?: (at: number) => void | Promise<void>;
+  /**
+   * Record what each model call of a pi085 conversation is sent, as hashes (cf/src/fresh-context.ts
+   * `recordModelInput`), for an evaluation to read back. Only where a deployment serves the evaluation routes
+   * (EVAL_SEED_ROUTES, cf/wrangler.preview.jsonc): it reads the whole transcript on every call.
+   */
+  modelInputEvidence?: boolean;
 }
 
 /**
@@ -863,6 +872,25 @@ export function messageLanded(
   const landed = res?.value?.operationId ? "prompt" : mode === "followUp" ? "followUp" : "steer";
   return { mode: landed, queued: landed !== "prompt" };
 }
+
+/**
+ * The audit line of a seal (src/store/seed-files.ts). A seal the first turn or push made on an agent given no files
+ * is every agent's first turn, so it is not a seed event and says nothing; an explicit one always does.
+ */
+function sealedBy(tenantId: string, agentId: string, r: { seal: { how: SealHow; manifestSha256: string; manifest: unknown[] }; sealedNow: boolean }, credentialId: string | null = null) {
+  if (!r.sealedNow || (r.seal.how !== "explicit" && !r.seal.manifest.length)) return;
+  logEvent("eval.seed", { tenant: tenantId, agent: agentId, op: "seal", how: r.seal.how, sha256: r.seal.manifestSha256, credentialId });
+}
+
+/** Why a fresh context was refused, as the route answers it. */
+export type FreshContextResult =
+  | { ok: true; oldSessionId: string; newSessionId: string }
+  | { ok: false; status: 404 | 409; error: string };
+
+/** A restart: the same main conversation, every harness and in-memory state rebuilt from storage (AgentDO.restart). */
+export type RestartResult =
+  | { ok: true; sessionId: string; restartedAt: number }
+  | { ok: false; status: 404 | 409; error: string };
 
 export class AgentRuntime {
   readonly store: DurableObjectStore;
@@ -1115,6 +1143,10 @@ export class AgentRuntime {
     }
     // The claim on the key: in the same synchronous run as the two checks above, with no await between,
     // so a second push with this key that is already past its own await finds this row (`acceptInbound`).
+    // The seeded workspace closes in that same run, before the row that starts the agent's first turn: a seed write
+    // is a statement in this object too, so it either came first or finds the seal, even while this push is queued
+    // and its turn has not begun (src/store/seed-files.ts).
+    sealedBy(tenantId, agentId, sealSeedFiles(sql, tenantId, agentId, "first-inbound", now));
     acceptInbound(sql, { hookId, alias, dedupeKey: key, message: inboundMessage(alias, String(result.text)), now, installationId });
     // The answer the service has always had for a push the agent will be given.
     return { outcome: "delivered" };
@@ -2762,6 +2794,14 @@ export class AgentRuntime {
     return async (jobId: string) => {
       const send = this.#deps.offloadModel;
       if (!send) throw new Error("no dispatcher configured");
+      // Before the send, so a call that leaves is one that was recorded; once per job, however often it is sent.
+      // Evidence never fails the call it describes.
+      if (this.#deps.modelInputEvidence) {
+        try {
+          const seeded = (await this.store.listSeedFiles(tenantId, agentId)).map((f) => f.path);
+          recordModelInput(this.#deps.ctx.storage.sql, jobId, seeded, Date.now());
+        } catch (e) { console.error(`recording the input of ${jobId} failed:`, e); }
+      }
       await send({ tenantId, agentId, taskId: LEGACY_TASK, commandId: jobId, payload: null });
     };
   }
@@ -2817,6 +2857,107 @@ export class AgentRuntime {
     return out;
   }
 
+  // ---- an evaluation's setup: seeded workspace files, a fresh context, what the model was sent.
+
+  /**
+   * Seed one workspace file: its snapshot and its working copy at key = path, both or neither, refused once sealed
+   * (src/store/seed-files.ts). The request was checked by the route (cf/src/provision/handlers.ts). A file too large
+   * for its row is spilled the way the state plugin spills a value, under a name made from its hash rather than its
+   * key: an object written for a write the seal then refuses must not have replaced one a stored row still names.
+   */
+  async seedWrite(tenantId: string, agentId: string, file: { path: string; mode: SeedMode; text: string }):
+    Promise<SeedWriteResult | { ok: false; code: "not_found"; message: string }> {
+    await this.ready();
+    if (!(await this.store.loadAgent(tenantId, agentId))) return { ok: false, code: "not_found", message: `no agent ${agentId}` };
+    const bytes = new TextEncoder().encode(file.text);
+    const sha256 = sha256Hex(bytes);
+    const same = (await this.store.listSeedFiles(tenantId, agentId)).find((f) => f.path === file.path);
+    const json = JSON.stringify(file.text);
+    let content: string | null = file.text, ref: string | null = null;
+    let working: { value: string | null; ref: string | null; bytes: number } = { value: json, ref: null, bytes: json.length };
+    // Asked first so a refusal or a repeat uploads nothing; the store asks again inside its transaction, which is the
+    // answer that counts.
+    if (!(await this.store.isSealed(tenantId, agentId)) && !(same && same.sha256 === sha256 && same.mode === file.mode) && !seedInline(file.text)) {
+      const base = `t/${tenantId}/${agentId}/seed/${sha256}`;
+      ref = (await this.#artifacts.put(`${base}.txt`, bytes)).ref;
+      content = null;
+      working = { value: null, ref: (await this.#artifacts.put(`${base}.json`, json)).ref, bytes: json.length };
+    }
+    return this.store.seedWrite(tenantId, agentId, { path: file.path, mode: file.mode, bytes: bytes.byteLength, sha256, content, ref, working });
+  }
+
+  /** Close the seeded workspace now; idempotent. Null when there is no such agent. */
+  async sealSeed(tenantId: string, agentId: string, credentialId: string | null) {
+    await this.ready();
+    if (!(await this.store.loadAgent(tenantId, agentId))) return null;
+    const r = await this.store.seal(tenantId, agentId, "explicit");
+    sealedBy(tenantId, agentId, r, credentialId);
+    return r.seal;
+  }
+
+  /** The seeded files, their hash, and the seal if there is one. Null when there is no such agent. */
+  async seedManifest(tenantId: string, agentId: string) {
+    await this.ready();
+    if (!(await this.store.loadAgent(tenantId, agentId))) return null;
+    return this.store.seedManifest(tenantId, agentId);
+  }
+
+  /**
+   * Start a new main conversation (cf/src/fresh-context.ts): the next turn's model is sent none of the old one's
+   * messages and no summary of them, the old transcript stays readable under its id, and the agent's state, working
+   * copies and seeded files are untouched (they are not the transcript). Refused while anything is in flight — a
+   * run, a queued input, a model call not answered, a program held for `resume`, background work — since each of
+   * those belongs to the conversation that started it; pd keeps its conversations elsewhere and is refused too.
+   * Run with nothing else in the object (AgentDO.freshContext). The harnesses built on the old transcript are dropped.
+   */
+  async freshContext(tenantId: string, agentId: string): Promise<FreshContextResult> {
+    await this.ready();
+    if (!(await this.store.loadAgent(tenantId, agentId))) return { ok: false, status: 404, error: `no agent ${agentId}` };
+    if (this.#isPd()) return { ok: false, status: 409, error: "this agent runs on the pd engine, whose conversations a fresh context does not reach" };
+    const busy = this.notIdle();
+    if (busy) return { ok: false, status: 409, error: `${busy}; a fresh context starts only between turns` };
+    const out = startFreshMain(this.#deps.ctx.storage, Date.now());
+    await this.dropHarnesses(tenantId, agentId);
+    return { ok: true, ...out };
+  }
+
+  /**
+   * What is in flight in this object, or null between turns: a run or queued input in any conversation, a model call
+   * not answered, background work (src/runtime/pd-migrate.ts `busyReason`), a program held for `resume`. pi085's
+   * tables only, which is what both callers act on (`freshContext`, AgentDO.restart).
+   */
+  notIdle(): string | null {
+    const sql = this.#deps.ctx.storage.sql;
+    ensureAgentTables(sql);
+    return busyReason(sql) ?? (this.#continuations.size > 0 ? `${this.#continuations.size} program(s) are held for resume` : null);
+  }
+
+  /** Close and forget the harnesses built for this agent, so the next turn builds its own from storage. */
+  async dropHarnesses(tenantId: string, agentId: string) {
+    const prefix = `${tenantId}/${agentId}#`;
+    for (const [k, built] of [...this.#agents]) {
+      if (!k.startsWith(prefix)) continue;
+      this.#agents.delete(k);
+      await built.agent.close().catch(() => {});
+    }
+  }
+
+  /**
+   * What call `call` of conversation `sessionId` was sent (cf/src/fresh-context.ts `ModelInputEvidence`); with no
+   * session, the agent's main conversations and how many calls of each are recorded. Null when there is no such
+   * agent, or no such record.
+   */
+  async modelInput(tenantId: string, agentId: string, sessionId: string | null, call: number | null):
+    Promise<ModelInputEvidence | { current: string; sessions: Array<MainSessionRow & { calls: number }> } | null> {
+    await this.ready();
+    if (!(await this.store.loadAgent(tenantId, agentId))) return null;
+    const sql = this.#deps.ctx.storage.sql;
+    if (sessionId === null) {
+      return { current: currentMainId(sql), sessions: mainSessions(sql).map((s) => ({ ...s, calls: modelInputCalls(sql, s.sessionId) })) };
+    }
+    return readModelInput(sql, sessionId, call ?? 1);
+  }
+
   /** Compact on demand. pi085 refuses with `CompactionUnavailable`
    *  (src/runtime/engine.ts), writing nothing; the object turns that into a
    *  value its routes answer 409 with (cf/src/compact-refusal.ts). pd starts a
@@ -2842,6 +2983,10 @@ export class AgentRuntime {
     session: string = MAIN_SESSION,
     opts: { retake?: "await" | "background"; beforeSay?: () => void } = {},
   ) {
+    // Before anything awaits a plugin or the model: the first turn closes the seeded workspace, whichever route it
+    // came by (an inbound push already did, when it was accepted).
+    await this.ready();
+    sealedBy(tenantId, agentId, await this.store.seal(tenantId, agentId, "first-turn"));
     // Every turn starts here, in every mode — a steer is how a console message arrives, and pushes, background
     // completions and lease warnings are prompts — so the catalogue is reconciled here, before the harness is
     // opened below, and what it adds is offered in this turn (`reconcileSeeds`). A failure is logged and never
