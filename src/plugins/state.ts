@@ -5,6 +5,8 @@ import type { StorageAdapter } from "../core/store.ts";
 import type { R2Artifacts } from "../store/artifacts.ts";
 import type { Json } from "../core/types.ts";
 import { importKek, KEPT_NAME, KEPT_PREFIX, open, seal } from "../runtime/secrets.ts";
+import { STATE_INLINE_MAX, STATE_KEY } from "./state-key.ts";
+import type { SeedFileMeta, SeedMode } from "../store/seed-files.ts";
 
 type SealingKey = Awaited<ReturnType<typeof importKek>>;
 
@@ -85,10 +87,6 @@ export async function keptList(store: StorageAdapter, tenantId: string, agentId:
  * `artifacts.read` that already exists, rather than a second paging tool.
  */
 
-/** Above this a value is spilled rather than kept in a row. Matches the
- *  tool-result offload threshold: the same question, the same answer. */
-const INLINE_MAX = 32 * 1024;
-
 interface StateConfig {
   account?: string;
   /** Refuse writes once the agent's own store passes this. Not a quota on the
@@ -118,11 +116,27 @@ export const WORKING_SET: ReadonlyArray<{
   { key: "journal", budget: 3000, what: "recent log", tail: true },
 ];
 
-const KEY = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/;
-
 /** Named once because `workingSet` looks a mount up by it. A second copy of the
  *  string is how the injected text came to name a tool nothing had to provide. */
 const PLUGIN_ID = "state";
+
+/**
+ * The mode of each path an evaluation's setup seeded (src/store/seed-files.ts),
+ * by path. Anything but `writable` is held as `readonly`: the setup route
+ * writes only those two, and a third would be a row nobody meant, which should
+ * fail closed rather than open.
+ */
+async function seedModes(store: StorageAdapter, tenantId: string, agentId: string): Promise<Map<string, SeedMode>> {
+  const modeOf = (f: SeedFileMeta): SeedMode => f.mode === "writable" ? "writable" : "readonly";
+  return new Map((await store.listSeedFiles(tenantId, agentId)).map((f) => [f.path, modeOf(f)]));
+}
+
+/** Whether `tool` is declared as a write that takes a `key`: what the read-only guard holds to it. */
+function writesAKey(plugin: Plugin, tool: string): boolean {
+  const t = plugin.tools.find((x) => x.name === tool);
+  const props = (t?.parameters as { properties?: Record<string, unknown> } | null)?.properties;
+  return t?.sideEffects === "write" && !!props && "key" in props;
+}
 
 export function statePlugin(
   store: StorageAdapter,
@@ -131,7 +145,7 @@ export function statePlugin(
   /** The deployment's key for sealing secrets; resolves to null where none is configured. */
   kek: () => Promise<SealingKey | null> = async () => null,
 ): Plugin {
-  return {
+  const plugin: Plugin = {
     id: PLUGIN_ID,
 
     /**
@@ -146,18 +160,23 @@ export function statePlugin(
      * two mounts of this plugin read the same documents — and two mounts would
      * otherwise put the same paragraph in the prompt twice. The first mount, in
      * the order the gateway itself resolves them, is the one that speaks.
+     *
+     * The files an evaluation's setup put in the workspace come first, from
+     * the same mount and for the same reason (`seededFiles`): an agent with
+     * none gets exactly the paragraph it got before there were any.
      */
     async promptContribution(ctx) {
       const first = (await store.findMountsByPlugin(
         ctx.caller.tenantId, ctx.caller.agentId, PLUGIN_ID))[0]?.alias;
       if (first && first !== ctx.alias) return null;
-      const text = await workingSet(store, ctx.caller.tenantId, ctx.caller.agentId);
+      const text = await seededFiles(store, ctx.caller.tenantId, ctx.caller.agentId)
+        + await workingSet(store, ctx.caller.tenantId, ctx.caller.agentId);
       return text.trim() ? text : null;
     },
 
     config: [
       // Two thresholds, and only one of them is this setting. A value over
-      // INLINE_MAX spills to object storage and comes back as a reference; a
+      // STATE_INLINE_MAX spills to object storage and comes back as a reference; a
       // value over this is refused outright. "Anything bigger must go to object
       // storage" described the first while naming the second.
       //
@@ -165,7 +184,7 @@ export function statePlugin(
       // again here: a console showing a blank default for a setting that has
       // one is how a person learns the wrong number.
       { name: "maxValueBytes", type: "number", default: DEFAULTS.maxValueBytes,
-        summary: `Largest single value; anything bigger is refused. Values over ${INLINE_MAX / 1024} KiB are kept in object storage and handed back as a reference, which is not configurable.` },
+        summary: `Largest single value; anything bigger is refused. Values over ${STATE_INLINE_MAX / 1024} KiB are kept in object storage and handed back as a reference, which is not configurable.` },
       { name: "maxDocumentBytes", type: "number", default: DEFAULTS.maxDocumentBytes,
         summary: "Largest working-set document before its head is trimmed." },
       { name: "maxTotalBytes", type: "number", default: DEFAULTS.maxTotalBytes,
@@ -346,16 +365,37 @@ export function statePlugin(
         // Each row's reference as this agent may be shown it; null where the
         // stored key names nothing of its own, which is the same answer `get`
         // gives for that row.
-        const shownRows = rows.map((r: any) => ({ ...r, ref: r.ref ? toAgentRef(r.ref, ctx.caller) : null }));
+        // A seeded path says how it was given, so a refusal to change it is
+        // not the first the agent hears of it; any other row has no `seed`.
+        const modes = await seedModes(store, tenantId, agentId);
+        const shownRows = rows.map((r: any) => ({
+          ...r, ref: r.ref ? toAgentRef(r.ref, ctx.caller) : null,
+          ...(modes.has(r.key) ? { seed: modes.get(r.key) } : {}),
+        }));
         return { keys: shownRows, total: { keys: usage.keys, bytes: usage.bytes } };
       }
 
       const key = String(a.key ?? "");
       // A key is a name, not a path into someone else's data. The store scopes
       // by (tenant, agent) anyway; this keeps the names readable to an operator.
-      if (!KEY.test(key)) {
+      if (!STATE_KEY.test(key)) {
         throw new Error(`invalid key ${JSON.stringify(key).slice(0, 60)}: letters, digits and . _ - / only`);
       }
+
+      // The one place a write to a seeded path is judged, before any tool's
+      // own case: every tool declared as a write that takes a `key` is asked
+      // here, by its declaration rather than by a list of names, so a write
+      // tool added later is held to it without anyone remembering to. A
+      // `writable` seeded path is an ordinary key from here on. The secret
+      // tools returned above: they write `secrets`, never `agent_state`.
+      const seed = (await seedModes(store, tenantId, agentId)).get(key);
+      if (seed === "readonly" && writesAKey(plugin, tool)) {
+        throw new Error(
+          `\`${key}\` was provided at setup as read-only; it cannot be changed or removed. `
+          + "Keep your own notes under another key.",
+        );
+      }
+      const seeded = seed ? { seed } : {};
 
       switch (tool) {
         case "remember": {
@@ -370,7 +410,7 @@ export function statePlugin(
 
         case "get": {
           const got = await store.getState(tenantId, agentId, key);
-          if (!got) return { key, found: false };
+          if (!got) return { key, found: false, ...seeded };
           // What this agent may be shown, and whether it may be shown anything:
           // `toAgentRef` is null exactly when the stored key names nothing of
           // this agent's — a legacy row whose key moves through the path. The
@@ -390,7 +430,7 @@ export function statePlugin(
             // so it stays where it is diagnostic and goes where it would be an
             // instruction.
             return {
-              key, found: true, bytes: got.bytes, readable: false,
+              key, found: true, bytes: got.bytes, readable: false, ...seeded,
               note: `this value was stored under a key that is no longer valid, so it cannot be read back; `
                 + `remove it with forget { key: "${key}" }`,
             };
@@ -404,7 +444,7 @@ export function statePlugin(
             // agent, 2026-09-13, the case behind f0a3bcc.
             const whole = got.bytes <= READ_WHOLE_MAX;
             return {
-              key, found: true, bytes: got.bytes, ref: shown,
+              key, found: true, bytes: got.bytes, ref: shown, ...seeded,
               note: whole
                 ? `too large to return here; read it from the artifacts mount: `
                   + `read { ref: "${shown}" }`
@@ -412,7 +452,7 @@ export function statePlugin(
                   + `the artifacts mount: read { ref: "${shown}", from: 0 } — each page's note gives the next`,
             };
           }
-          return { key, found: true, bytes: got.bytes, updatedAt: got.updatedAt, value: got.value };
+          return { key, found: true, bytes: got.bytes, updatedAt: got.updatedAt, value: got.value, ...seeded };
         }
 
         case "forget":
@@ -448,7 +488,7 @@ export function statePlugin(
               `delete something with the \`forget\` tool on \`${ctx.alias}\``,
             );
           }
-          if (body.length <= INLINE_MAX) {
+          if (body.length <= STATE_INLINE_MAX) {
             await store.putState(tenantId, agentId, key, {
               value: a.value ?? null, ref: null, bytes: body.length,
             });
@@ -465,6 +505,7 @@ export function statePlugin(
       throw new Error(`unknown tool: ${tool}`);
     },
   };
+  return plugin;
 }
 
 /**
@@ -520,4 +561,96 @@ export async function workingSet(
     correcting + "\n\n" +
     parts.join("\n\n")
   );
+}
+
+/** The seeded file whose text is shown in the prompt, not only named. */
+export const SEEDED_MEMORY = "MEMORY.md";
+/** How much of it, in characters: the working set's own `memory` budget. */
+export const SEEDED_MEMORY_BUDGET = 4000;
+
+/**
+ * The files an evaluation's setup put in the workspace (src/store/seed-files.ts),
+ * as the agent is shown them when the harness opens: `MEMORY.md`'s working copy
+ * in full up to a budget, then every other seeded path with its working copy's
+ * size now and its mode. Empty when nothing was seeded, so the prompt of an
+ * agent without seeds is the prompt it always had.
+ *
+ * Read from the working copies, never the snapshot: what the agent is told is
+ * what its `get` would answer, so a file it removed is said to be removed. A
+ * working copy kept in object storage is not fetched — opening the harness
+ * does not wait on a bucket — and the agent is told to `get` it instead.
+ *
+ * Never "written by you", which is how the working set below begins: the
+ * agent did not write these, and a model told it did will defend their
+ * content as its own conclusion.
+ *
+ * A path is printed exactly as stored, since the evaluation's record counts
+ * the seeded paths a prompt names by literal match (cf/src/fresh-context.ts).
+ * It is operator text becoming prompt text, so one that fails the key rule —
+ * which no setup route lets through, as the rule has no room for a newline, a
+ * backtick or any control character — is not printed at all, only counted.
+ */
+export async function seededFiles(store: StorageAdapter, tenantId: string, agentId: string): Promise<string> {
+  const files = await store.listSeedFiles(tenantId, agentId);
+  if (!files.length) return "";
+  const modes = await seedModes(store, tenantId, agentId);
+  const alias = (await store.findMountsByPlugin(tenantId, agentId, PLUGIN_ID))[0]?.alias;
+  // Named the way the working set names its tools: the tool, on the mount.
+  const getTool = alias ? `the \`get\` tool on the \`${alias}\` mount` : null;
+  const shown = files.filter((f) => STATE_KEY.test(f.path));
+  const hidden = files.length - shown.length;
+  const parts: string[] = [
+    "# Workspace files provided at setup\n" +
+    "These files were put in your workspace when it was set up, before your first task. Each is a key in your " +
+    "state store, named by its path. " +
+    (getTool
+      ? `Open one with ${getTool}, its path as the \`key\`.`
+      : "You have no tool mounted for opening them."),
+  ];
+  const memory = shown.find((f) => f.path === SEEDED_MEMORY);
+  if (memory) {
+    const mode = modes.get(memory.path)!;
+    const got = await store.getState(tenantId, agentId, memory.path);
+    const what = mode === "writable"
+      ? "A working file handed to you to maintain."
+      : "Provided as read-only: you can read it but not change or remove it.";
+    let body: string;
+    if (!got) {
+      body = "It has since been removed from your workspace.";
+    } else if (got.ref && got.value == null) {
+      body = `${what} It is too large to show here and is kept in object storage; ` +
+        (getTool ? `read it with ${getTool}.` : "you have no tool mounted for reading it.");
+    } else {
+      const text = typeof got.value === "string" ? got.value : JSON.stringify(got.value);
+      let kept = text.trimEnd();
+      if (text.length > SEEDED_MEMORY_BUDGET) {
+        // Not between the two halves of a surrogate pair.
+        const end = /[\uD800-\uDBFF]/.test(text[SEEDED_MEMORY_BUDGET - 1]!) ? SEEDED_MEMORY_BUDGET - 1 : SEEDED_MEMORY_BUDGET;
+        kept = `${text.slice(0, end).trimEnd()}\n…\n` +
+          `(cut at ${end} of ${text.length} characters; ` +
+          (getTool ? `get \`${SEEDED_MEMORY}\` with ${getTool} for the rest)` : "the rest is not shown)");
+      }
+      body = `${what} Its current text:\n\n${kept}`;
+    }
+    parts.push(`## \`${memory.path}\` (${got ? `${got.bytes} bytes` : "removed"}, ${mode})\n${body}`);
+  }
+  const others = shown.filter((f) => f !== memory);
+  const lines: string[] = [];
+  for (const f of others) {
+    const mode = modes.get(f.path)!;
+    const got = await store.getState(tenantId, agentId, f.path);
+    const size = got ? `${got.bytes} bytes` : "removed";
+    const how = !got
+      ? (mode === "writable"
+        ? "handed to you to maintain, and since removed from your workspace"
+        : "provided as read-only, and no longer in your workspace")
+      : mode === "writable"
+        ? "a working file handed to you to maintain; " +
+          (getTool ? `open it with ${getTool}` : "you have no tool mounted for opening it")
+        : (getTool ? `it can be read with ${getTool}` : "it can be read") + " but not changed or removed";
+    lines.push(`- \`${f.path}\` (${size}, ${mode}): ${how}.`);
+  }
+  if (hidden) lines.push(`- and ${hidden} more whose ${hidden === 1 ? "name" : "names"} cannot be shown here.`);
+  if (lines.length) parts.push((memory ? "## Other files\n" : "") + lines.join("\n"));
+  return "\n\n" + parts.join("\n\n");
 }

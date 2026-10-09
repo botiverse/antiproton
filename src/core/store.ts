@@ -428,8 +428,9 @@ export interface StorageAdapter {
   seal(tenantId: string, agentId: string, how: SealHow): Promise<{ seal: SeedSeal; sealedNow: boolean }>;
   isSealed(tenantId: string, agentId: string): Promise<boolean>;
   /**
-   * What the state plugin asks before a write: every seeded path with its mode, size and hash, sorted by path. No
-   * content, so asking costs one indexed read whatever the files hold.
+   * What the state plugin asks before a write, and for `get`, `list` and its prompt paragraph: every seeded path
+   * with its mode, size and hash, sorted by path. No content, so asking costs one indexed read whatever the files
+   * hold.
    */
   listSeedFiles(tenantId: string, agentId: string): Promise<SeedFileMeta[]>;
   /** `"inherit"` is stored as the absence of a row, not as a third value. */

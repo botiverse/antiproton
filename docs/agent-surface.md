@@ -208,7 +208,13 @@ for an agent that is not a live provisioned agent of the tenant.
 A seeded file has two copies, written together in one transaction: a **snapshot** nothing the agent
 can call reads or changes, and a **working copy**, the agent's ordinary state key `path` (its
 `get` reads it; `state/{path}` in the workspace reads above). `mode` is `writable` (default) or
-`readonly`; the state plugin refuses to change a `readonly` path. Rules for `PUT …/seed`:
+`readonly`. The state plugin refuses every tool of its own that writes a key — `put`, `remember`,
+`forget` — on a `readonly` path, with a reason naming the path; a `writable` one is an ordinary key
+the agent may change or remove. Its `get` and `list` mark a seeded path with `seed: "writable"` or
+`seed: "readonly"`, and its first mount puts a "Workspace files provided at setup" paragraph in the
+system prompt ahead of the working set: `MEMORY.md`'s working copy (its first 4,000 characters), then
+every other seeded path, printed exactly as stored, with its working copy's size now and its mode. With
+nothing seeded the paragraph is absent and the prompt is as it was. Rules for `PUT …/seed`:
 
 - `path` follows the state plugin's key rule (`^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$`), with no empty,
   `.` or `..` segment and never under `kept:`; else `422`, `param: "path"`. The working set's own

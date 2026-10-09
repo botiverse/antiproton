@@ -3,6 +3,9 @@
  * fake deps, the two stores keeping the same rows by the same rule, the state plugin agreeing with the seeded paths'
  * key rule and spill threshold, and the production configuration not serving the routes.
  *
+ * What the state plugin does with a seeded path (the read-only guard, `seed` on `get` and `list`, the prompt):
+ * test/state-seed.ts.
+ *
  * Through the Worker, the whole object, an inbound push and a fresh conversation: test/eval-seed-object.ts.
  */
 import { readFileSync } from "node:fs";
@@ -301,6 +304,21 @@ await check("a spilled snapshot keeps its reference and no text in the row", asy
 });
 
 // ---- the rules shared with the state plugin --------------------------------
+
+/*
+ * One declaration of each rule (src/plugins/state-key.ts), so there is no second copy to hold to the first. What is
+ * left to check is that it stays one — the plugin imports both and declares neither again — and, by asking the
+ * plugin itself, that what the setup route adds on top of the key rule only narrows it and that the two measure a
+ * value's size the same way, which a shared constant does not give.
+ */
+await check("state.ts takes its key rule and spill threshold from state-key.ts, and declares neither of its own", () => {
+  const code = readFileSync(new URL("../src/plugins/state.ts", import.meta.url), "utf8");
+  const imported = /import\s*\{([^}]*)\}\s*from\s*"\.\/state-key\.ts"/.exec(code)?.[1] ?? "";
+  for (const name of ["STATE_KEY", "STATE_INLINE_MAX"]) must(new RegExp(`\\b${name}\\b`).test(imported), `state.ts does not import ${name} from ./state-key.ts`);
+  must(!/\/\^\[A-Za-z0-9\]/.test(code), "state.ts declares a key pattern of its own");
+  must(!/32\s*\*\s*1024/.test(code), "state.ts declares a spill threshold of its own");
+  must(!/\bconst\s+(KEY|INLINE_MAX)\b/.test(code), "state.ts declares KEY or INLINE_MAX again");
+});
 
 await check("a path the state plugin would refuse as a key is refused as a seeded path, and its plain keys are accepted by both", async () => {
   const store = new SqliteStore(":memory:");
