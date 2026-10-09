@@ -29,7 +29,7 @@ const STAND_IN = "export class DurableObject { constructor(ctx, env) { this.ctx 
 register("data:text/javascript," + encodeURIComponent(
   `export async function resolve(s, c, next) { if (s.startsWith("cloudflare:")) return { url: ${JSON.stringify("data:text/javascript," + encodeURIComponent(STAND_IN))}, shortCircuit: true }; return next(s, c); }`));
 const { AgentDO, default: worker } = await import("../cf/src/index.ts");
-const { AgentRuntime } = await import("../cf/src/runtime.ts");
+const { AgentRuntime, OPERATOR_EXA_REF, OPERATOR_RUN9_REF } = await import("../cf/src/runtime.ts");
 const { clearHookRoutes } = await import("../cf/src/hook-route.ts");
 const { setLogSink } = await import("../src/core/log.ts");
 
@@ -50,11 +50,13 @@ setLogSink((line) => { lines.push(line); });
 
 /** What `pushy`'s one tool answers: `{}`, or what a case that needs a particular tool result sets. */
 let pushyAnswer: Record<string, unknown> = {};
+/** The credential each call of `pushy`'s tool was handed, by mount alias: what the runtime resolved its reference to. */
+const pushyCredential = new Map<string, string | null>();
 /** A push plugin as in test/hook-fast-ack.ts, minus the HMAC: the hook's secret in a header, `{id, text}` as the body. */
 const pushy: Plugin = {
   id: "pushy", version: "1.0.0",
   tools: [{ name: "noop", summary: "", parameters: {}, sideEffects: "read", idempotency: "native" }],
-  async invoke() { return pushyAnswer as never; },
+  async invoke(_tool, _args, ctx) { pushyCredential.set(ctx.alias, ctx.credential); return pushyAnswer as never; },
   async receive(event, secret) {
     if (event.headers["x-signed-with"] !== secret) return { deliver: false, reason: "bad signature", rejected: true };
     const body = JSON.parse(new TextDecoder().decode(event.body)) as { id: string; text: string };
@@ -113,7 +115,7 @@ function bucket() {
  * `state` mount (with `raft`, the mounts Raft's adopt makes instead, beside the same two), and two provider tokens: T's and another tenant's. `flag` is EVAL_SEED_ROUTES as the deployment sets it,
  * null for not at all.
  */
-async function world(flag: string | null = "1", opts: { raft?: boolean; post?: Record<string, unknown>; none?: true } = {}) {
+async function world(flag: string | null = "1", opts: { raft?: boolean; post?: Record<string, unknown>; none?: true; env?: Record<string, unknown> } = {}) {
   clearHookRoutes();
   const DB = d1();
   const raw = sqliteHost();
@@ -144,6 +146,8 @@ async function world(flag: string | null = "1", opts: { raft?: boolean; post?: R
     ...(flag === null ? {} : { EVAL_SEED_ROUTES: flag }),
     // Any other object (the provider's home, which a POST lists the agent under) is made when first asked for.
     AGENT: { idFromName: (n: string) => n, get: (n: string) => objects.get(n) ?? another(n) },
+    // Before the object is made: it reads the Worker's credentials once, when it makes its runtime.
+    ...opts.env,
   };
   const D = new TestDO(ctx as never, env as never);
   objects.set(agentObjectName(T, A), D);
@@ -1298,6 +1302,63 @@ await check("transcript and trace: a kept secret never leaves — secret_put's v
   must(r.body.redactions === 6, `redactions: ${r.body.redactions}`);
   const t = await call(w, "GET", `${A}/trace`);
   must(t.status === 200 && !t.text.includes(SECRET) && t.body.rows.some((x: any) => x.attrs.note === "saw <redacted:agent-secret>") && t.body.redactions >= 1, t.text.slice(0, 400));
+});
+
+await check("transcript and trace: the operator's key behind an operator: mount never leaves, in any case or base64'd", async () => {
+  const w = await world();
+  listByPrefix(w);
+  // The seeded search mount, on the operator's key (cf/src/runtime.ts SEEDED_PLUGINS).
+  await w.rt.store.addMount({ tenantId: T, agentId: A, alias: "search", plugin: "exa", installationId: "i-search", connectionId: null,
+    toolVersion: "1.0.0", publicConfig: {}, secretRef: OPERATOR_EXA_REF, policy: null });
+  // A bare key, as Exa's is: no shape finds it, so only resolving the mount's reference can.
+  const KEY = "9c1e4b7a-d2f3-4e5a-8b6c-7d8e9f0a1b2c";
+  w.env.EXA_API_KEY = KEY;
+  await toolTurn(w, "echo", { leaked: `key ${KEY.toUpperCase()}`, log: Buffer.from(`x-api-key=${KEY}`).toString("base64") }, `the key is ${KEY}`);
+  appendTrace(w.raw.sql as never, [{ at: Date.now(), tenantId: T, agentId: A, kind: "tool.call", spanId: "op_x", status: "succeeded", verdict: "ok", attrs: { tool: "pushy.noop", note: `saw ${KEY}` } }]);
+  // Positive control: the operator's unredacted read holds it.
+  must(show((await admin(w)).body).includes(KEY), "the fixture does not carry the key");
+  const r = await call(w, "GET", `${A}/transcript`);
+  must(r.status === 200 && !r.text.toLowerCase().includes(KEY) && !r.text.includes("eC1hcGkta2V5"), `the export carries the key: ${r.text.slice(0, 400)}`);
+  const echo = r.body.events.filter((e: any) => e.kind === "tool.result" && e.payload.tool === "p__noop").at(-1)?.payload.result;
+  must(echo?.leaked === "key <redacted:agent-secret>" && echo.log === "<redacted:agent-secret>", `the echo: ${show(echo)}`);
+  const t = await call(w, "GET", `${A}/trace`);
+  must(t.status === 200 && !t.text.includes(KEY) && t.body.rows.some((x: any) => x.attrs.note === "saw <redacted:agent-secret>"), t.text.slice(0, 400));
+});
+
+await check("operator: and env: references resolve at call time from the Worker's env: no Exa key is none, run9's ak and sk reach the sandbox as they are", async () => {
+  const AK = "ak-operator-1234", SK = "sk-operator-5678-abcd", ENV_VALUE = "env-value-123";
+  process.env.OPERATOR_REF_TEST_KEY = ENV_VALUE;
+  try {
+    // An empty EXA_API_KEY is how an unset secret can arrive: the deployment holds no key.
+    const w = await world("1", { env: { EXA_API_KEY: "", RUN9: JSON.stringify({ ak: AK, sk: SK }) } });
+    for (const [alias, ref] of [["opexa", OPERATOR_EXA_REF], ["oprun9", OPERATOR_RUN9_REF], ["openv", "env:OPERATOR_REF_TEST_KEY"]] as const) {
+      await w.rt.store.addMount({ tenantId: T, agentId: A, alias, plugin: "pushy", installationId: `i-${alias}`, connectionId: null,
+        toolVersion: "1.0.0", publicConfig: {}, secretRef: ref, policy: null });
+    }
+    pushyCredential.clear();
+    for (const alias of ["opexa", "oprun9", "openv"]) {
+      const r: any = await w.rt.gateway().invoke({ tenantId: T, agentId: A, taskId: "k" }, `${alias}.noop`, {});
+      must(r.ok !== false, `${alias}: ${show(r)}`);
+    }
+    must(pushyCredential.has("opexa") && pushyCredential.get("opexa") === null, `an empty Exa key: ${show(pushyCredential.get("opexa"))}`);
+    const run9 = JSON.parse(pushyCredential.get("oprun9") ?? "null");
+    must(run9?.ak === AK && run9?.sk === SK, `the run9 account: ${show(run9)}`);
+    must(pushyCredential.get("openv") === ENV_VALUE, `an env: reference: ${show(pushyCredential.get("openv"))}`);
+    // The sandbox itself, on its seeded mount: the request run9 is sent carries ak:sk, in that order.
+    if (!(await w.rt.store.getMountByAlias(T, A, "sandbox"))) {
+      await w.rt.store.addMount({ tenantId: T, agentId: A, alias: "sandbox", plugin: "sandbox", installationId: "i-sandbox", connectionId: null,
+        toolVersion: "1.0.0", publicConfig: {}, secretRef: OPERATOR_RUN9_REF, policy: null });
+    }
+    const real = globalThis.fetch;
+    const auth: string[] = [];
+    globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+      auth.push(new Headers(init?.headers ?? {}).get("authorization") ?? "");
+      return new Response("stand-in refuses", { status: 503 });
+    }) as typeof fetch;
+    try { await w.rt.gateway().invoke({ tenantId: T, agentId: A, taskId: "k" }, "sandbox.run", { code: "1" }); }
+    finally { globalThis.fetch = real; }
+    must(auth.length > 0 && auth.every((a) => a === "Basic " + btoa(`${AK}:${SK}`)), `run9 was sent: ${show(auth)}`);
+  } finally { delete process.env.OPERATOR_REF_TEST_KEY; }
 });
 
 await check("transcript and trace: a sealed value the object cannot open refuses the export (503) rather than send it unscrubbed", async () => {

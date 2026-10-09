@@ -72,7 +72,8 @@ import { adminMigrateEngine, type MigrateOp } from "./admin-migrate.ts";
 import { readDiagnosis } from "./diagnose-read.ts";
 import { agentObjectName } from "./object-name.ts";
 import { readTranscript, transcriptEvents, approvalsByOp, isPd, type TranscriptEvents } from "./transcript-read.ts";
-import { agentSecretValues, evalTranscript, localTrace, readTraceWindow, redactCredentials, type EvalTranscript } from "./eval-read.ts";
+import { operatorCredentials } from "./operator-ref.ts";
+import { agentSecretValues, credentialRedactor, evalTranscript, localTrace, readTraceWindow, redactCredentials, type EvalTranscript } from "./eval-read.ts";
 import type { TraceOutboxRow } from "../../src/trace/outbox.ts";
 import { readEngineStorage } from "./engine-read.ts";
 import { pdVersion } from "../../src/runtime/pd-transcript.ts";
@@ -451,8 +452,7 @@ export class AgentDO extends DurableObject<Env> {
       runJsResumeMs: Number(this.env.RUN_JS_RESUME_MS) || undefined,
       keepAlive: (at) => this.#keepAlive(at),
       operatorModel: operatorModelOf(this.env),
-      operatorRun9: this.env.RUN9 ? JSON.parse(this.env.RUN9) : undefined,
-      operatorExa: this.env.EXA_API_KEY,
+      ...operatorCredentials(this.env),
       reminderApp: { origin: this.env.REMINDER_APP_ORIGIN, credential: this.env.REMINDER_APP_CREDENTIAL },
       secretKek: this.env.SECRET_KEK,
       modelInputEvidence: evalSeedRoutes(this.env),
@@ -892,8 +892,7 @@ export class AgentDO extends DurableObject<Env> {
       runJsResumeMs: Number(this.env.RUN_JS_RESUME_MS) || undefined,
       keepAlive: (at) => this.#keepAlive(at),
       operatorModel: operatorModelOf(this.env),
-      operatorRun9: this.env.RUN9 ? JSON.parse(this.env.RUN9) : undefined,
-      operatorExa: this.env.EXA_API_KEY,
+      ...operatorCredentials(this.env),
       reminderApp: { origin: this.env.REMINDER_APP_ORIGIN, credential: this.env.REMINDER_APP_CREDENTIAL },
       secretKek: this.env.SECRET_KEK,
       // τ² mounts its domain as a plugin; SWE-bench mounts a machine, which
@@ -2067,7 +2066,7 @@ export class AgentDO extends DurableObject<Env> {
     if (!this.#isAgent(tenantId, agentId)) return null;
     const secrets = await agentSecretValues(this.sql, tenantId, agentId, this.env);
     if (!secrets.ok) return { unavailable: secrets.message };
-    return evalTranscript(this.sql, tenantId, agentId, session, offset, limit, (v) => redactCredentials(v, { secrets: secrets.values }));
+    return evalTranscript(this.sql, tenantId, agentId, session, offset, limit, credentialRedactor({ secrets: secrets.values }));
   }
 
   /** The trace rows this object still holds after `afterSeq` (cf/src/eval-read.ts `localTrace`); a read, made table or not. */

@@ -62,6 +62,7 @@ function taskEndedRefusal(address: string): { status: "rejected"; error: { code:
 import { ToolGateway, type InvokeOpts } from "../../src/runtime/gateway.ts";
 import { assertMountConfig, configFromForm, validateMount } from "../../src/runtime/mount-config.ts";
 import { envSecrets } from "../../src/runtime/gateway.ts";
+import { OPERATOR_EXA_REF, OPERATOR_RUN9_REF, resolveOperatorRef } from "./operator-ref.ts";
 import { agentSecrets, agentRef, importKek, isAgentRef, open, OWNER_PREFIX, seal, secretRefKind, type Sealed } from "../../src/runtime/secrets.ts";
 import {
   acceptInbound, claimPendingInbound, ensureInboundTable, hasPendingInbound, hookSecretName, inboundMessage, markPostingInbound, newHookId, newHookSecret,
@@ -540,11 +541,7 @@ class BoundArtifacts {
 
 /** Whether a binding spends the operator's model account, through any provider. */
 export const isOperatorModelRef = (ref: string) => providerOfRef(ref) !== null;
-/** The operator's sandbox account. Kept distinct from the model's reference so a
- *  tenant can be moved onto its own run9 project without touching its model binding. */
-export const OPERATOR_RUN9_REF = "operator:run9";
-/** The operator's Exa key, for the web search every agent is seeded with. */
-export const OPERATOR_EXA_REF = "operator:exa";
+export { OPERATOR_RUN9_REF, OPERATOR_EXA_REF } from "./operator-ref.ts";
 
 export interface RuntimeDeps {
   ctx: any;
@@ -1021,14 +1018,7 @@ export class AgentRuntime {
     // passes the mount's owner as scope, so an `agent:` reference only ever
     // reaches the store of the agent whose mount names it.
     const kekPromise = deps.secretKek ? importKek(deps.secretKek) : Promise.resolve(null);
-    const operator = {
-      resolve: async (ref: string) =>
-        ref === OPERATOR_RUN9_REF
-          ? (deps.operatorRun9 ? JSON.stringify(deps.operatorRun9) : null)
-          : ref === OPERATOR_EXA_REF
-            ? (deps.operatorExa || null)
-            : envSecrets.resolve(ref),
-    };
+    const operator = { resolve: (ref: string) => resolveOperatorRef(ref, deps, (r) => envSecrets.resolve(r)) };
     this.#kek = kekPromise;
     this.#secrets = {
       resolve: async (ref, scope, opts) => agentSecrets(this.store, await kekPromise, operator).resolve(ref, scope, opts),
