@@ -620,6 +620,55 @@ await check("tools: reading the export writes nothing — no row, no table, no s
   must(show(shape(after.tools)) === show(await wireTools(w, 0)), "the export and the request differ");
 });
 
+await check("tools: reading the export on an agent whose mount_snapshot_errors table was never made does not make it", async () => {
+  // The Raft world above has the table already (adopt's mounts listed theirs), so it cannot see the read making it.
+  const w = await world();
+  const has = () => tableNames(w.raw.sql as never).includes("mount_snapshot_errors");
+  must(!has(), "the table exists before the read: this case would test nothing");
+  const rows = everything(w.raw.sql as never);
+  const r = await call(w, "GET", `${A}/tools`);
+  must(r.status === 200 && r.body.mounts.length >= 2, `${r.status} ${r.text.slice(0, 300)}`);
+  must(r.body.mounts.every((m: any) => m.snapshotError === null), `snapshot errors: ${show(r.body.mounts.map((m: any) => m.snapshotError))}`);
+  must(!has(), "the read made mount_snapshot_errors");
+  must(everything(w.raw.sql as never) === rows, "a row or a table moved");
+  // Control: the console's read of the same field does make it, so `has` can see the table appear.
+  w.rt.snapshotError("p");
+  must(has(), "control: snapshotError made no table");
+});
+
+await check("tools: under pd the export is exactly what the next turn's model request carries", async () => {
+  const w = await world();
+  const m = await w.D.migrateEngine(T, A, "migrate", false);
+  must(!!m && (m as any).ok, `migrate: ${show(m)}`);
+  const ex = (await call(w, "GET", `${A}/tools`)).body;
+  must(ex.engine === "pd", `engine: ${ex.engine}`);
+  must(ex.tools.some((t: any) => t.alias === "p") && ex.tools.some((t: any) => t.alias === "state"), `tools: ${show(ex.tools.map((t: any) => t.name))}`);
+  await w.rt.postMessage(T, A, "a real turn", "prompt");
+  await settle(w, 1);
+  must(jobCount(w) === 1, `jobs: ${jobCount(w)}`);
+  const wire = await wireTools(w, 0);
+  must(wire.length > 0, "the model request carries no tools");
+  must(show(shape(ex.tools)) === show(wire),
+    `export and request differ:\n export  ${show(ex.tools.map((t: any) => t.name))}\n request ${show(wire.map((t) => t.name))}`);
+});
+
+await check("tools: every mount tool a turn offers carries the result-limit note, but the tool that reads a parked result", async () => {
+  const w = await world();
+  const ex = (await call(w, "GET", `${A}/tools`)).body;
+  await w.rt.postMessage(T, A, "a real turn", "prompt");
+  await settle(w, 1);
+  const wire = await wireTools(w, 0);
+  const NOTE = /A result over \d+ KB comes back as a summary \(preview\)/;
+  const mountNames = new Set(ex.tools.filter((t: any) => t.source === "mount").map((t: any) => t.name));
+  const mountWire = wire.filter((t) => mountNames.has(t.name));
+  must(mountWire.length >= 2 && mountWire.length === mountNames.size, `mount tools on the request: ${show(mountWire.map((t) => t.name))}`);
+  const without = mountWire.filter((t) => !NOTE.test(t.description));
+  // The reader (`parkedReader`) is named in the others' note and is the one tool left without it.
+  const reader = /with the (\S+) call that reads all of it/.exec(mountWire.find((t) => NOTE.test(t.description))?.description ?? "")?.[1] ?? null;
+  must(without.length <= 1 && without.every((t) => t.name === reader), `without the note: ${show(without.map((t) => t.name))}, reader ${reader}`);
+  must(wire.filter((t) => !mountNames.has(t.name)).every((t) => !NOTE.test(t.description)), "a harness tool carries the mount note");
+});
+
 // ---- audit -----------------------------------------------------------------
 
 await check("each write, explicit seal, fresh context and restart logs one line with the token's hash, never the token or the text", async () => {

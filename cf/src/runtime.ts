@@ -2315,16 +2315,23 @@ export class AgentRuntime {
     }
   }
 
-  #snapshotErrors() {
+  /** The table of listing failures, made when absent; with `readOnly`, null instead of making it. */
+  #snapshotErrors(opts: { readOnly?: boolean } = {}) {
     const sql = this.#deps.ctx.storage?.sql;
     if (!sql) return null;
+    if (opts.readOnly) {
+      return sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'mount_snapshot_errors'").toArray().length ? sql : null;
+    }
     sql.exec("CREATE TABLE IF NOT EXISTS mount_snapshot_errors(alias TEXT PRIMARY KEY, error TEXT NOT NULL, at INTEGER NOT NULL)");
     return sql;
   }
 
-  /** Why this mount's last tool listing failed, or null when it succeeded or was never asked. */
-  snapshotError(alias: string): string | null {
-    const row = this.#snapshotErrors()?.exec("SELECT error FROM mount_snapshot_errors WHERE alias = ?", alias).toArray()[0] as any;
+  /**
+   * Why this mount's last tool listing failed, or null when it succeeded or was never asked. `readOnly` reads without
+   * making the table (null when there is none), for a report that must not write (`offeredTools`).
+   */
+  snapshotError(alias: string, opts: { readOnly?: boolean } = {}): string | null {
+    const row = this.#snapshotErrors(opts)?.exec("SELECT error FROM mount_snapshot_errors WHERE alias = ?", alias).toArray()[0] as any;
     return row ? String(row.error) : null;
   }
 
@@ -3099,7 +3106,7 @@ export class AgentRuntime {
         } : null,
         basis: p?.toolsBasis ?? null,
         retake: enabled.has(m.alias) && snapshotStale(m, p) ? (backedOff ? "backed_off" : "due") : null,
-        snapshotError: this.#readSnapshotError(m.alias),
+        snapshotError: this.snapshotError(m.alias, { readOnly: true }),
       };
     });
     return {
@@ -3107,14 +3114,6 @@ export class AgentRuntime {
       retakePending: mounts.some((m) => m.retake === "due"),
       tools, mounts,
     };
-  }
-
-  /** `snapshotError` without making its table: a read for a report must not write. */
-  #readSnapshotError(alias: string): string | null {
-    const sql = this.#deps.ctx.storage?.sql;
-    if (!sql || !sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'mount_snapshot_errors'").toArray().length) return null;
-    const row = sql.exec("SELECT error FROM mount_snapshot_errors WHERE alias = ?", alias).toArray()[0] as any;
-    return row ? String(row.error) : null;
   }
 
   /** Compact on demand. pi085 refuses with `CompactionUnavailable`
