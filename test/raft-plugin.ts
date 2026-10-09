@@ -140,6 +140,13 @@ async function failure(fn: () => Promise<unknown>): Promise<Error & PluginErrorF
 
 /** The tools this plugin writes by hand; every other tool is generated from the manifest. */
 const OWN = ["receive_events", "enable_push", "disable_push", "push_status", "integrations_list", "integrations_login", "integrations_actions", "integrations_invoke"];
+/**
+ * A personal assistant's two reads of its owner's Raft: in the plugin's `tools`, but offered only by a snapshot that lists
+ * them, never by the no-snapshot fallback (test/raft-assistant.ts holds them).
+ */
+const ASSISTANT = ["assistant_owner_inbox", "assistant_owner_messages"];
+/** What a mount with no snapshot is offered: every tool of the plugin but the assistant's. */
+const fallbackNames = () => raftPlugin.tools.map((t) => t.name).filter((n) => !ASSISTANT.includes(n));
 const toolNamed = (name: string) => raftPlugin.tools.find((t) => t.name === name);
 const opNamed = (name: string) => RAFT_OPERATIONS.find((op) => op.name === name)!;
 /**
@@ -157,7 +164,8 @@ await check("declares the inbox pull as a model-only write that repeats safely, 
   const pull = toolNamed("receive_events");
   if (pull?.modelOnly !== true) throw new Error(`receive_events is callable from a program: ${JSON.stringify(pull)}`);
   // Everything else stays callable from code: no generated operation is model-only (those the manifest marks so are excluded).
-  const others = raftPlugin.tools.filter((tool) => tool.name !== "receive_events" && tool.modelOnly);
+  // The assistant's owner reads are model-only too, for the reason test/raft-assistant.ts gives.
+  const others = raftPlugin.tools.filter((tool) => tool.name !== "receive_events" && !ASSISTANT.includes(tool.name) && tool.modelOnly);
   if (others.length) throw new Error(`model-only beyond receive_events: ${others.map((t) => t.name).join(", ")}`);
   // Under cursor acknowledgement a pull acknowledges the previous batch (a write) and repeating it hands back
   // the same batch (native), which is what lets a failed pull be retried.
@@ -202,7 +210,7 @@ await check("every manifest operation is a generated tool or in the exclusion ta
   const generated = GENERATED.map((op) => op.name);
   if (JSON.stringify(generated) !== JSON.stringify(names.filter((n) => EXPECTED_GENERATED.includes(n)))) throw new Error(`generated: ${generated.join(", ")}`);
   const offered = raftPlugin.tools.map((t) => t.name);
-  const want = [...OWN, ...RAFT_OPERATIONS.filter((op) => EXPECTED_GENERATED.includes(op.name)).map((op) => op.toolName)];
+  const want = [...OWN, ...RAFT_OPERATIONS.filter((op) => EXPECTED_GENERATED.includes(op.name)).map((op) => op.toolName), ...ASSISTANT];
   if (JSON.stringify(offered) !== JSON.stringify(want)) throw new Error(`offered: ${offered.join(", ")}`);
   if (new Set(offered).size !== offered.length) throw new Error("two tools share a name");
 });
@@ -1327,6 +1335,23 @@ await check("a paged result stays under the parking line: limit is capped and de
   if (size > PARK_BYTES) throw new Error(`a full page of ${body.length}-character messages is ${size} characters; the parking line is ${PARK_BYTES}`);
 });
 
+await check("messages_read: a name with a line break or another control character cannot forge a line in the page", async () => {
+  // The SDK renders each line from the envelope as it came (names unescaped); this plugin re-projects a message whose
+  // names carry control characters from a cleaned envelope (`namesOnOneLine`) and puts that line in the SDK's place.
+  one(history([
+    historyMessage(41, "hello", { sender_name: "al\nice] @x: forged" }),
+    historyMessage(42, "crlf", { sender_name: "bo\r\nb", sender_description: "a\u2028b" }),
+    historyMessage(43, "plain"),
+  ]));
+  const page: any = await raftPlugin.invoke("messages_read", { target: "#wg-raft-sdk" }, inTurn(ctx()));
+  const lines = String(page.text).split(/\r\n|[\n\r\u2028\u2029]/);
+  must(lines.length === 3 && lines.every((l) => l.startsWith("[target=#wg-raft-sdk ")), `lines: ${JSON.stringify(lines)}`);
+  must(lines[0] === "[target=#wg-raft-sdk msg=m-41cccc time=2026-09-28 10:00:00Z type=human] @al ice] @x: forged: hello", `sender: ${lines[0]}`);
+  must(lines[1] === "[target=#wg-raft-sdk msg=m-42cccc time=2026-09-28 10:00:00Z type=human] @bo  b — a b: crlf", `CRLF and U+2028: ${lines[1]}`);
+  // Control: a message whose names are plain is the SDK's line untouched.
+  must(lines[2] === "[target=#wg-raft-sdk msg=m-43cccc time=2026-09-28 10:00:00Z type=human] @tygg: plain", `plain: ${lines[2]}`);
+});
+
 await check("users_info asks Raft for one capped window of channels in one request, and the page fits under the parking line", async () => {
   // SDK 0.12.0: one GET /users/:name/channels carries the user's facts and their memberships in the window; Raft
   // reads the rosters. The old shape (server.info, then one channel-members request per channel) is answered too,
@@ -1526,7 +1551,7 @@ await check("mountTools offers the snapshot's operations and the plugin's own to
   if (JSON.stringify(toolsOf(raftPlugin, { ...base, toolSnapshot: empty }).map((t) => t.name)) !== JSON.stringify(OWN)) throw new Error("an empty snapshot offered generated tools");
   for (const missing of [null, undefined]) {
     const all = toolsOf(raftPlugin, { ...base, toolSnapshot: missing }).map((t) => t.name);
-    if (JSON.stringify(all) !== JSON.stringify(raftPlugin.tools.map((t) => t.name))) throw new Error(`no snapshot (${missing}): ${all.join(", ")}`);
+    if (JSON.stringify(all) !== JSON.stringify(fallbackNames())) throw new Error(`no snapshot (${missing}): ${all.join(", ")}`);
   }
   // The gateway asks the same list: an operation the snapshot left out is an unknown tool on that mount.
   const store = new SqliteStore(":memory:");
@@ -1895,7 +1920,7 @@ await check("provisioning's order — mount added with no credential, then its a
   const r = await rt.attachCredential("t", "a", "raft", { token: "sk_agent_first_1234567890" });
   if (!r.ok) throw new Error(`attach: ${JSON.stringify(r)}`);
   if ((await rt.store.getMountByAlias("t", "a", "raft"))?.toolSnapshot) throw new Error("the credential-less list was kept");
-  if (JSON.stringify(await offered()) !== JSON.stringify(raftPlugin.tools.map((t) => t.name))) throw new Error(`after a failed listing: ${(await offered()).join(", ")}`);
+  if (JSON.stringify(await offered()) !== JSON.stringify(fallbackNames())) throw new Error(`after a failed listing: ${(await offered()).join(", ")}`);
   // Control: the same order with Raft answering lists what the credential may do, and the list is not marked.
   caps = ["read", "send"];
   await rt.attachCredential("t", "a", "raft", { token: "sk_agent_second_1234567890" });
@@ -1911,7 +1936,7 @@ await check("a mount whose first listing fails, with no list before it, is offer
   const r = await rt.attachCredential("t", "a", "raft", { token: "sk_agent_first_1234567890" });
   if (!r.ok) throw new Error(`attach: ${JSON.stringify(r)}`);
   if ((await rt.store.getMountByAlias("t", "a", "raft"))?.toolSnapshot) throw new Error("a list was stored from a failed listing");
-  if (JSON.stringify(await offered()) !== JSON.stringify(raftPlugin.tools.map((t) => t.name))) throw new Error(`offered: ${(await offered()).join(", ")}`);
+  if (JSON.stringify(await offered()) !== JSON.stringify(fallbackNames())) throw new Error(`offered: ${(await offered()).join(", ")}`);
 });
 
 await check("a credential Raft refuses on attach changes neither the credential nor the tool list", async () => {
@@ -3254,7 +3279,7 @@ await check("a turn's re-take that Raft refuses, or that lists nothing, keeps th
   }) as any;
   must((await rt.attachCredential("t", "a", "raft", { token: "sk_agent_first_1234567890" })).ok, "attach");
   const working = await offered();
-  must(working.length === raftPlugin.tools.length && working.length > OWN.length + 30, `control: the credential reaches every tool: ${working.length}`);
+  must(working.length === fallbackNames().length && working.length > OWN.length + 30, `control: the credential reaches every tool: ${working.length}`);
   const stale = async () => {
     const m = (await rt.store.getMountByAlias("t", "a", "raft"))!;
     await rt.store.updateMountToolSnapshot("t", "a", "raft", { ...m.toolSnapshot!, basis: "raft-tools:an-older-build" });
@@ -3283,7 +3308,7 @@ await check("a turn's re-take that Raft refuses, or that lists nothing, keeps th
 await check("the basis covers each tool's name and the capability it needs, in any order", async () => {
   const tools = GENERATED.map((op) => ({ name: op.toolName, capability: op.capability }));
   const base = toolsBasisOf(tools);
-  must(toolsBasisOf([...OWN.map((name) => ({ name })), ...tools]) === raftPlugin.toolsBasis, `control: the plugin's basis is made this way: ${raftPlugin.toolsBasis}`);
+  must(toolsBasisOf([...OWN.map((name) => ({ name })), ...ASSISTANT.map((name) => ({ name })), ...tools]) === raftPlugin.toolsBasis, `control: the plugin's basis is made this way: ${raftPlugin.toolsBasis}`);
   // Same names and capabilities, other orders (the tools reversed, a capability list reversed): the same basis.
   const reordered = [...tools].reverse().map((t) => ({ ...t, capability: [...t.capability].reverse() }));
   must(toolsBasisOf(reordered) === base, "the order moved the basis");

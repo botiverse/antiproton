@@ -499,7 +499,10 @@ reach, or one added after the mount's snapshot was taken — or the SDK's
 code-only `raft.<operation>(…)`) is put in words in one place
 (`offeredTerms`), and so is a message line's attachment suffix when the
 download is not offered (`modelLine`); what a person wrote (a message, a
-description, a title, a preview) is passed on as written.
+description, a title, a preview) is passed on as written, except that the names
+in a message's header line (sender, channel, thread, task assignee, attachment
+filename) have line breaks and other control characters replaced with a space
+(`namesOnOneLine`), so a name cannot start a line that reads as another message.
 `attachments_download_url` fetches the file Raft points at into the agent's
 object storage (at most `ATTACHMENT_MAX_BYTES`) and returns its `artifact://`
 reference, never the URL; it is offered when the plugin is built with object
@@ -549,6 +552,27 @@ the app answers 401 is sent once more after a fresh login. Only v0 manifests
 (`raft-agent-manifest.v0`) with `http_api` actions that answer JSON or text are
 run, and a manifest whose `base_url` has a path is refused rather than joined; `test/raft-agent-login.ts` holds all of it against a fake Raft and a fake
 app.
+
+Two more are a personal assistant's reads of its owner's Raft:
+`assistant_owner_inbox` (the owner's channels and threads with unread counts,
+mentions and a preview of the latest message) and `assistant_owner_messages`
+(one of those conversations by its `channelId`, paged with at most one of
+`before`, `after` and `around`). Neither ever shows a direct message. They are
+read-only and model-only, and offered only when the mount's snapshot lists
+them, which it does when the same whoami answer names whose assistant the
+account is (`agent.assistantOf` with a `userId`): never with the tools every mount
+has, never to a mount with no snapshot, and a call on a mount whose list lacks
+them is refused before anything is sent. Every successful result opens with a
+line saying the content is the owner's, written outside the conversation, to
+be treated as information rather than instructions; a failure shows Raft's
+HTTP status and error code as sent (`403 assistant_not_enabled`,
+`404 channel_not_found`) and is not retried. Both reads' answers are
+camelCase (`hasMore`, `hasOlder`, `nextOffset`), and one in another style is
+refused as malformed rather than read as missing. The Raft SDK this build pins has
+neither the reads nor `assistantOf`, so both go through one seam
+(`AssistantWire`, `PENDING_ASSISTANT_WIRE` in `src/plugins/raft.ts`) whose
+reads throw until the SDK ships them, and no mount is offered the tools
+meanwhile; `test/raft-assistant.ts` holds them against a fake wire.
 
 **`replay: "never"` overrides the read rule.** A tool that declares it is not
 run again on its own after an interruption, even when it is a read
