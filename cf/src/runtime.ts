@@ -38,6 +38,7 @@ import { ASSUMED_CONTEXT_WINDOW } from "../../src/model/context-windows.ts";
 import { BACKGROUND_CONTEXT } from "@earendil-works/pi-agent-core/harness/context";
 import { callTurns, CANCELLED_NOTE, TURN_CANCELLED } from "./agents-api/transcript.ts";
 import { apiAgentSeeds, harnessExtras } from "./agents-api/provisioning.ts";
+import { toolConfigOf, type ToolConfig } from "../../src/core/tool-config.ts";
 import {
   answerClientCall, clientTools, pendingClientCalls,
 } from "../../src/runtime/client-calls.ts";
@@ -800,6 +801,8 @@ export type OfferedMount = {
 
 export type OfferedToolsExport = {
   agentId: string; asOf: string; engine: "pi085" | "pd"; retakePending: boolean;
+  /** What the agent's tools were provisioned as (src/core/tool-config.ts); null: as every agent's are. */
+  toolConfig: ToolConfig | null;
   tools: OfferedTool[]; mounts: OfferedMount[];
 };
 
@@ -1941,6 +1944,11 @@ export class AgentRuntime {
       .find((d) => d.alias === mount.alias && d.plugin === mount.plugin)?.secretRef ?? null;
   }
 
+  /** The deployment catalogue (`DEFAULT_MOUNTS`), for provisioning that names its entries (cf/src/provision/steps.ts). */
+  catalogue(): readonly CatalogueMount[] {
+    return AgentRuntime.DEFAULT_MOUNTS;
+  }
+
   /** What is installed, for a console that wants to show settings rather than
    *  guess them from whichever mounts happen to exist. */
   plugins(): Plugin[] {
@@ -2664,13 +2672,16 @@ export class AgentRuntime {
     // Function tools an API caller runs itself (Agents API, task #17): offered to
     // the model like any tool; calling one pauses the turn for the caller's
     // result (client-calls.ts). A name the model is already offered is skipped.
-    const apiConfig = ((await store.loadAgent(tenantId, agentId))?.config as any)?.openai;
+    const agentConfig = (await store.loadAgent(tenantId, agentId))?.config;
+    const apiConfig = (agentConfig as any)?.openai;
     const apiTools = apiConfig?.tools;
     // An agent made through the Agents API is offered only what its caller declared, plus a container when a
     // session asked for one: no run_js, and jobs only where a sandbox can start background work
     // (agents-api/provisioning.ts).
+    // An evaluation's `harness: "minimal"` (src/core/tool-config.ts), read from the record every turn path and the
+    // tool export build from here, so a prompt, a steer and a push are offered the same list, under either engine.
     const extras = harnessExtras({
-      apiAgent: !!apiConfig, sandbox,
+      apiAgent: !!apiConfig, sandbox, minimal: toolConfigOf(agentConfig)?.harness === "minimal",
       hasBackgroundMount: offersCapability(
         records, offered as MountedTool[],
         (id) => !!backgroundOf(this.#plugins.find((pl) => pl.id === id) ?? {}),
@@ -2697,7 +2708,7 @@ export class AgentRuntime {
     // with run_js or without it (an Agents API agent has no run_js). Asked as
     // a capability, like `jobs`, so a plugin that declares `interrupts` is
     // answerable without anyone coming back here.
-    const asks = offersCapability(
+    const asks = extras.resume && offersCapability(
       records, offered as MountedTool[],
       (id) => !!interruptsOf(this.#plugins.find((pl) => pl.id === id) ?? {}),
     );
@@ -3046,7 +3057,8 @@ export class AgentRuntime {
    */
   async offeredTools(tenantId: string, agentId: string): Promise<OfferedToolsExport | null> {
     await this.ready();
-    if (!(await this.store.loadAgent(tenantId, agentId))) return null;
+    const record = await this.store.loadAgent(tenantId, agentId);
+    if (!record) return null;
     const asOf = Date.now();
     const engine = this.#engine();
     const t = await this.#turnTools(tenantId, agentId, MAIN_SESSION, engine, { current: null });
@@ -3110,7 +3122,7 @@ export class AgentRuntime {
       };
     });
     return {
-      agentId, asOf: new Date(asOf).toISOString(), engine: engine ?? "pi085",
+      agentId, asOf: new Date(asOf).toISOString(), engine: engine ?? "pi085", toolConfig: toolConfigOf(record.config),
       retakePending: mounts.some((m) => m.retake === "due"),
       tools, mounts,
     };

@@ -96,6 +96,7 @@ import { d1Connections, d1Connectors, d1ModelChoices, d1ModelOverrides, d1Provid
 import { CONNECT_START_PATH, CONNECTION_PLUGIN, connectCallback, connectLink, connectStart, isConnectCallback, type ConnectDeps } from "./provision/connect.ts";
 import { hashProviderToken, looksLikeProviderToken } from "./provider-token.ts";
 import { handleProvision, type ProvisionDeps, type ProvisionTool } from "./provision/handlers.ts";
+import type { ToolConfig } from "../../src/core/tool-config.ts";
 import type { SeedMode } from "../../src/store/seed-files.ts";
 import { currentMainId } from "./fresh-context.ts";
 import { adoptProvisionedAgent, provisionTool, provisionPushStatus, PROVIDER_HOME, PROVISION_MOUNT_ALIAS } from "./provision/steps.ts";
@@ -1985,7 +1986,7 @@ export class AgentDO extends DurableObject<Env> {
   /** Provisioning's record + model + mount, in this agent's object (cf/src/provision/steps.ts). */
   async provisionAdopt(tenantId: string, agentId: string, specJson: string) {
     this.#claim(tenantId, agentId);
-    const spec = JSON.parse(specJson) as { name: string; instructions: string; raftOrigin: string };
+    const spec = JSON.parse(specJson) as { name: string; instructions: string; raftOrigin: string; toolConfig?: ToolConfig | null };
     return this.#busy("provisionAdopt", async () =>
       adoptProvisionedAgent(this.runtime(), tenantId, agentId, { ...spec, avatar: mintAvatar() }, await this.#modelFor(tenantId, agentId)));
   }
@@ -3403,11 +3404,14 @@ function provisionDeps(env: Env): ProvisionDeps {
         restart: (tenantId, agentId) => stub(tenantId, agentId).restart(tenantId, agentId),
         modelInput: (tenantId, agentId, session, call) => stub(tenantId, agentId).modelInput(tenantId, agentId, session, call),
         tools: (tenantId, agentId) => stub(tenantId, agentId).offeredTools(tenantId, agentId),
+        mountable: AgentRuntime.DEFAULT_MOUNTS.filter((m) => m.for.includes("raft")).map((m) => m.alias),
       },
     } : {}),
     agent: {
       adopt: async (tenantId, agentId, spec) => {
         const r = await stub(tenantId, agentId).provisionAdopt(tenantId, agentId, JSON.stringify(spec));
+        // The agent's refusal of the tools asked for is an answer to the caller; any other failure is a 500 to retry.
+        if (!r.ok && r.refused) return r.refused;
         if (!r.ok) throw new Error(r.error);
         // Listed under the provider's home in that tenant, so the console shows what Raft made. Idempotent.
         await stub(tenantId, PROVIDER_HOME).uiRecordAgent(tenantId, PROVIDER_HOME, { agentId, name: spec.name, description: spec.instructions, avatar: r.avatar, createdAt: Date.now() });

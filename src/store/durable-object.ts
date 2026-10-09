@@ -14,7 +14,7 @@ import {
   type SeedNoticeRow, type SeedPlan,
 } from "./seed-record.ts";
 import {
-  listSeedFiles, manifestSha256, readSeal, SEED_FILES_SCHEMA, sealSeedFiles, writeSeedFile, type SealHow, type SeedWrite,
+  listSeedFiles, readSeal, SEED_FILES_SCHEMA, seedManifestOf, sealSeedFiles, writeSeedFile, type SealHow, type SeedWrite,
 } from "./seed-files.ts";
 
 /**
@@ -821,8 +821,7 @@ export class DurableObjectStore implements StorageAdapter {
   }
 
   async seedManifest(tenantId: string, agentId: string) {
-    const manifest = listSeedFiles(this.#sql, tenantId, agentId);
-    return { manifest, manifestSha256: manifestSha256(manifest), seal: readSeal(this.#sql, tenantId, agentId) };
+    return seedManifestOf(this.#sql, tenantId, agentId);
   }
 
   async seal(tenantId: string, agentId: string, how: SealHow) {

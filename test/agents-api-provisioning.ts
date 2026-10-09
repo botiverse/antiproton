@@ -62,6 +62,17 @@ await check("an API agent is not offered run_js, and jobs only when something of
   assert(!noSandboxDeployment.runJs && noSandboxDeployment.jobs, `deployment without run_js: ${JSON.stringify(noSandboxDeployment)}`);
 });
 
+await check("harness minimal offers none of the harness's own tools, whatever the agent is and can do", () => {
+  for (const apiAgent of [false, true]) for (const sandbox of [false, true]) for (const hasBackgroundMount of [false, true]) {
+    const o = { apiAgent, sandbox, hasBackgroundMount };
+    const minimal = harnessExtras({ ...o, minimal: true });
+    assert(!minimal.runJs && !minimal.jobs && !minimal.resume, `minimal ${JSON.stringify(o)}: ${JSON.stringify(minimal)}`);
+    // Control: the same inputs without it are what they always were, and resume is left to the mounts.
+    const plain = harnessExtras(o), asFalse = harnessExtras({ ...o, minimal: false });
+    assert(plain.resume && JSON.stringify(plain) === JSON.stringify(asFalse), `default ${JSON.stringify(o)}: ${JSON.stringify(plain)}`);
+  }
+});
+
 await check("`jobs` follows the capability, not the sandbox's name", () => {
   // The point of the step: a plugin that is not the sandbox, declaring
   // `background`, gets `jobs`; and the sandbox's name alone no longer does.

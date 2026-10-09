@@ -27,7 +27,7 @@ import {
   type SeedNoticeRow, type SeedPlan,
 } from "./seed-record.ts";
 import {
-  listSeedFiles, manifestSha256, readSeal, SEED_FILES_SCHEMA, sealSeedFiles, writeSeedFile, type SealHow, type SeedWrite,
+  listSeedFiles, readSeal, SEED_FILES_SCHEMA, seedManifestOf, sealSeedFiles, writeSeedFile, type SealHow, type SeedWrite,
 } from "./seed-files.ts";
 
 const SCHEMA = `
@@ -1147,8 +1147,7 @@ export class SqliteStore implements StorageAdapter {
   }
 
   async seedManifest(tenantId: string, agentId: string) {
-    const manifest = listSeedFiles(this.#usageSql(), tenantId, agentId);
-    return { manifest, manifestSha256: manifestSha256(manifest), seal: readSeal(this.#usageSql(), tenantId, agentId) };
+    return seedManifestOf(this.#usageSql(), tenantId, agentId);
   }
 
   async seal(tenantId: string, agentId: string, how: SealHow) {

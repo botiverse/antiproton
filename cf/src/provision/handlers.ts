@@ -27,6 +27,7 @@ import { logEvent } from "../../../src/core/log.ts";
 import { WORKING_SET } from "../../../src/plugins/state.ts";
 import { SEED_MODES, seedPathProblem, seedText, type SeedFileMeta, type SeedMode, type SeedSeal, type SeedWriteResult } from "../../../src/store/seed-files.ts";
 import type { FreshContextResult, RestartResult } from "../runtime.ts";
+import type { ToolConfig } from "../../../src/core/tool-config.ts";
 
 export type ProvisionTool = "enable_push" | "disable_push";
 
@@ -35,8 +36,13 @@ export interface PushStatus { enabled: boolean; registration: "active" | "uncert
 
 /** What the handler asks of the agent's own object. Each is one RPC in cf/src/index.ts. */
 export interface ProvisionAgentOps {
-  /** Create or update the record (persona), bind the model, make sure the `raft` mount points at `raftOrigin`. */
-  adopt(tenantId: string, agentId: string, spec: { name: string; instructions: string; raftOrigin: string }): Promise<void>;
+  /**
+   * Create or update the record (persona), bind the model, make sure the `raft` mount points at `raftOrigin`.
+   * `toolConfig` is what a POST asked of the agent's tools (null: nothing, today's agent); absent on a PATCH, which
+   * says nothing about them. A Fail is the agent's refusal of it (cf/src/provision/steps.ts): another one recorded
+   * already (409), or one this deployment cannot give (400). Nothing is written when it refuses.
+   */
+  adopt(tenantId: string, agentId: string, spec: { name: string; instructions: string; raftOrigin: string; toolConfig?: ToolConfig | null }): Promise<void | Fail>;
   /** Seal the credential onto the `raft` mount; the plugin checks it against Raft. */
   attachCredential(tenantId: string, agentId: string, credential: string): Promise<{ ok: true; account: string | null } | { ok: false; error: string }>;
   removeCredential(tenantId: string, agentId: string): Promise<boolean>;
@@ -109,12 +115,56 @@ export interface SeedOps {
   write(tenantId: string, agentId: string, file: { path: string; mode: SeedMode; text: string }):
     Promise<SeedWriteResult | { ok: false; code: "not_found"; message: string }>;
   seal(tenantId: string, agentId: string, credentialId: string | null): Promise<SeedSeal | null>;
-  manifest(tenantId: string, agentId: string): Promise<{ manifest: SeedFileMeta[]; manifestSha256: string; seal: SeedSeal | null } | null>;
+  manifest(tenantId: string, agentId: string): Promise<{ manifest: SeedFileMeta[]; toolConfig: ToolConfig | null; manifestSha256: string; seal: SeedSeal | null } | null>;
   freshContext(tenantId: string, agentId: string): Promise<FreshContextResult>;
   restart(tenantId: string, agentId: string): Promise<RestartResult>;
   modelInput(tenantId: string, agentId: string, session: string | null, call: number | null): Promise<unknown | null>;
   /** The tools the agent's next turn offers the model, read without retaking or writing anything. */
   tools(tenantId: string, agentId: string): Promise<unknown | null>;
+  /**
+   * The catalogue aliases a provisioned agent may be given by name (`mounts` on POST): the deployment catalogue's
+   * entries for an agent Raft hosts (`AgentRuntime.DEFAULT_MOUNTS`, cf/src/runtime.ts). Asked here so a name is refused
+   * before anything is made; the agent's object asks again of its own plugins (whether each can run here).
+   */
+  mountable: readonly string[];
+}
+
+/** The alias provisioning always mounts (cf/src/provision/steps.ts `PROVISION_MOUNT_ALIAS`), so never one to name. */
+const RAFT_ALIAS = "raft";
+
+/**
+ * `mounts` and `harness` of a POST: an evaluation's choice of the agent's tools (docs/agent-surface.md "Evaluation
+ * setup (preview only)"). Null when neither is sent, which is today's agent exactly. Only where the setup routes are
+ * served (`seed` present, EVAL_SEED_ROUTES): anywhere else either field is a 400 naming it, never ignored, because an
+ * evaluation that asked for a minimal agent and was quietly given the default one would measure the wrong agent.
+ */
+export function toolConfigField(body: unknown, seed: Pick<SeedOps, "mountable"> | undefined): ToolConfig | null | Fail {
+  const mounts = field(body, "mounts"), harness = field(body, "harness");
+  if (mounts === undefined && harness === undefined) return null;
+  if (!seed) {
+    const named = mounts !== undefined ? "mounts" : "harness";
+    return { status: 400, code: "eval_only", param: named,
+      message: `${named} is accepted only where the evaluation setup routes are served (EVAL_SEED_ROUTES), and this deployment does not serve them` };
+  }
+  let list: string[] | null = null;
+  if (mounts !== undefined) {
+    if (!Array.isArray(mounts)) return { status: 400, code: "invalid", param: "mounts", message: "mounts is an array of the default catalogue's aliases" };
+    const seen = new Set<string>();
+    for (const m of mounts) {
+      if (typeof m !== "string") return { status: 400, code: "invalid", param: "mounts", message: `mounts entry ${JSON.stringify(m)} is not a string` };
+      if (m === RAFT_ALIAS) return { status: 400, code: "invalid", param: "mounts", message: `mounts entry "${RAFT_ALIAS}" is always added by provisioning; leave it out` };
+      if (seen.has(m)) return { status: 400, code: "invalid", param: "mounts", message: `mounts entry "${m}" is named twice` };
+      if (!seed.mountable.includes(m)) {
+        return { status: 400, code: "unknown_mount", param: "mounts", message: `mounts entry "${m}" is not a default mount here; one of ${seed.mountable.join(", ")}` };
+      }
+      seen.add(m);
+    }
+    list = [...mounts] as string[];
+  }
+  if (harness !== undefined && harness !== "minimal") {
+    return { status: 400, code: "invalid", param: "harness", message: `harness ${JSON.stringify(harness)} is not one this deployment offers; the one value is "minimal" (omit it for the default)` };
+  }
+  return { mounts: list, harness: harness === "minimal" ? "minimal" : "default" };
 }
 
 export const PROVIDER_AGENT_PREFIX = "raft_";
@@ -254,6 +304,8 @@ export async function handleProvision(
     if (isFail(instructions)) return fail(instructions);
     const credential = credentialField(body);
     if (isFail(credential)) return fail(credential);
+    const toolConfig = toolConfigField(body, deps.seed);
+    if (isFail(toolConfig)) return fail(toolConfig);
 
     const agentId = providerAgentId(raftAgentId);
     const asked = { raftServerId: raftServerId!, raftOrigin, name: name!, instructions };
@@ -286,8 +338,10 @@ export async function handleProvision(
       }
       created = true;
     }
-    // From here every step is idempotent, so a replay of a request that died half-way finishes it.
-    await deps.agent.adopt(tenantId, agentId, { name: row.name, instructions: row.instructions, raftOrigin: row.raftOrigin });
+    // From here every step is idempotent, so a replay of a request that died half-way finishes it. The tool choice is
+    // compared by the agent's object, where it is recorded: a replay asking for other tools is 409, as for any field.
+    const adopted = await deps.agent.adopt(tenantId, agentId, { name: row.name, instructions: row.instructions, raftOrigin: row.raftOrigin, toolConfig });
+    if (adopted) return fail(adopted);
     const attached = await deps.agent.attachCredential(tenantId, agentId, credential);
     if (!attached.ok) return fail({ status: 422, code: "credential_refused", message: attached.error, param: "credential" });
     row = await registerPush(deps, row);
@@ -602,7 +656,7 @@ async function evalSetup(
     return ok({ ...r.file, changed: r.changed });
   }
   const sealView = (s: SeedSeal) => ({
-    manifest: s.manifest, manifestSha256: s.manifestSha256, sealedAt: new Date(s.sealedAt).toISOString(), how: s.how,
+    manifest: s.manifest, toolConfig: s.toolConfig, manifestSha256: s.manifestSha256, sealedAt: new Date(s.sealedAt).toISOString(), how: s.how,
   });
   if (route === "seed/seal" && method === "POST") {
     const s = await seed.seal(tenantId, agentId, credentialId);
@@ -612,7 +666,7 @@ async function evalSetup(
     const m = await seed.manifest(tenantId, agentId);
     if (!m) return gone();
     // Once sealed, the manifest is the one the seal closed on, which is also what the files still are.
-    return ok(m.seal ? { sealed: true, ...sealView(m.seal) } : { sealed: false, manifest: m.manifest, manifestSha256: m.manifestSha256, sealedAt: null, how: null });
+    return ok(m.seal ? { sealed: true, ...sealView(m.seal) } : { sealed: false, manifest: m.manifest, toolConfig: m.toolConfig, manifestSha256: m.manifestSha256, sealedAt: null, how: null });
   }
   if (route === "fresh-context" && method === "POST") {
     const r = await seed.freshContext(tenantId, agentId);

@@ -45,32 +45,38 @@ const TOKEN_HASH = "a".repeat(64);
 const AGENT = "raft_01JEVAL";
 
 function fakeDeps(opts: { seed?: boolean; answer?: Awaited<ReturnType<SeedOps["write"]>> } = {}) {
+  const calls: Array<{ op: string; args: unknown[] }> = [];
   const rows = new Map<string, ProvisionedAgent>();
   const t = 1_800_000_000_000;
   rows.set(`t-raft/01JEVAL`, { tenantId: "t-raft", raftAgentId: "01JEVAL", agentId: AGENT, raftServerId: "srv-1", raftOrigin: WHO.raftOrigin,
     name: "n", instructions: "", credentialHash: null, status: "active", pushRegistered: true, pushError: null, createdAt: t, updatedAt: t, deletedAt: null });
   rows.set(`t-raft/01JGONE`, { ...rows.get("t-raft/01JEVAL")!, raftAgentId: "01JGONE", agentId: "raft_01JGONE", status: "deleted", deletedAt: t });
   const registry: ProvisionRegistry = {
-    async create() { throw new Error("not here"); },
+    async create(r) { rows.set(`${r.tenantId}/${r.raftAgentId}`, { ...r, createdAt: t, updatedAt: t, deletedAt: null }); calls.push({ op: "create", args: [r.raftAgentId] }); },
     async get(tenantId, id) { return rows.get(`${tenantId}/${id}`) ?? null; },
     async getByAgentId(tenantId, agentId) { return [...rows.values()].find((r) => r.tenantId === tenantId && r.agentId === agentId) ?? null; },
-    async update() { return false; },
+    async update(tenantId, id, patch) {
+      const r = rows.get(`${tenantId}/${id}`);
+      if (!r) return false;
+      rows.set(`${tenantId}/${id}`, { ...r, ...Object.fromEntries(Object.entries(patch).filter(([, v]) => v !== undefined)) });
+      return true;
+    },
   };
-  const calls: Array<{ op: string; args: unknown[] }> = [];
-  const seal = { sealedAt: t, how: "explicit" as const, manifestSha256: manifestSha256([]), manifest: [] };
+  const seal = { sealedAt: t, how: "explicit" as const, manifestSha256: manifestSha256([], null), manifest: [], toolConfig: null };
   const seed: SeedOps = {
     write: async (...args) => { calls.push({ op: "write", args }); return opts.answer ?? { ok: true, changed: true, file: { path: args[2].path, mode: args[2].mode, bytes: new TextEncoder().encode(args[2].text).byteLength, sha256: sha256Hex(args[2].text) } }; },
     seal: async (...args) => { calls.push({ op: "seal", args }); return seal; },
-    manifest: async (...args) => { calls.push({ op: "manifest", args }); return { manifest: [], manifestSha256: manifestSha256([]), seal: null }; },
+    manifest: async (...args) => { calls.push({ op: "manifest", args }); return { manifest: [], toolConfig: null, manifestSha256: manifestSha256([], null), seal: null }; },
     freshContext: async (...args) => { calls.push({ op: "fresh", args }); return { ok: true, oldSessionId: "main", newSessionId: "main.1" }; },
     restart: async (...args) => { calls.push({ op: "restart", args }); return { ok: true, sessionId: "main", restartedAt: t }; },
     modelInput: async (...args) => { calls.push({ op: "modelInput", args }); return { sessionId: "main", call: 1 }; },
     tools: async (...args) => { calls.push({ op: "tools", args }); return { agentId: args[1], tools: [], mounts: [] }; },
+    mountable: ["tools", "artifacts", "web", "search", "gh", "sandbox", "state"],
   };
   const deps: ProvisionDeps = {
     now: () => t, registry,
-    agent: { adopt: async () => {}, attachCredential: async () => ({ ok: true, account: null }), removeCredential: async () => true,
-      tool: async () => ({ ok: true, result: null }), pushStatus: async () => null },
+    agent: { adopt: async (...args) => { calls.push({ op: "adopt", args }); }, attachCredential: async (...args) => { calls.push({ op: "attach", args }); return { ok: true, account: null }; }, removeCredential: async () => true,
+      tool: async (...args) => { calls.push({ op: "tool", args }); return { ok: true, result: null }; }, pushStatus: async () => null },
     ...(opts.seed === false ? {} : { seed }),
   };
   return { deps, calls };
@@ -186,7 +192,7 @@ await check("model-input's call must be a whole number from 1; the seal answers 
     must(r.status === 422 && r.body.error.param === "call", `${c}: ${r.text}`);
   }
   const seal = await call(f.deps, "POST", `/agents/${AGENT}/seed/seal`);
-  must(seal.status === 200 && show(Object.keys(seal.body).sort()) === show(["how", "manifest", "manifestSha256", "sealedAt"]) && seal.body.sealedAt === new Date(1_800_000_000_000).toISOString(), seal.text);
+  must(seal.status === 200 && show(Object.keys(seal.body).sort()) === show(["how", "manifest", "manifestSha256", "sealedAt", "toolConfig"]) && seal.body.sealedAt === new Date(1_800_000_000_000).toISOString(), seal.text);
   must(f.calls.find((c) => c.op === "seal")?.args[2] === TOKEN_HASH, "the seal is not told which token asked");
 });
 
@@ -225,6 +231,82 @@ await check("workspace-files/read carries the sha256 of the bytes its content st
   must(bin.body.encoding === "base64" && bin.body.sha256 === sha256Hex(binary), bin.text);
   const huge = await call(deps, "GET", `/agents/${AGENT}/workspace-files/read?path=artifacts/huge.txt`);
   must(huge.body.content === null && huge.body.sha256 === null, huge.text);
+});
+
+// ---- an evaluation's tool choice on POST /provision/agents --------------------
+
+const CRED = "sk_agent_" + "R".repeat(32);
+async function provisionPost(deps: ProvisionDeps, extra: Record<string, unknown>, raftAgentId = "01JNEW") {
+  const body = { raftAgentId, raftServerId: "srv-1", raftOrigin: WHO.raftOrigin, name: "n", instructions: "", credential: CRED, ...extra };
+  const r = await handleProvision("POST", "/agents", { idempotencyKey: null, raftServerId: null }, body, WHO, deps);
+  const text = r ? await r.text() : "";
+  return { status: r?.status ?? 0, body: (text ? JSON.parse(text) : null) as any, text };
+}
+const adoptedWith = (calls: Array<{ op: string; args: unknown[] }>) =>
+  calls.filter((c) => c.op === "adopt").map((c) => (c.args[2] as { toolConfig?: unknown }).toolConfig);
+
+await check("toolConfig: without the setup routes, mounts or harness on POST is 400 naming the field, before anything is made", async () => {
+  for (const extra of [{ mounts: ["state"] }, { harness: "minimal" }, { mounts: [] }, { mounts: ["state"], harness: "minimal" }]) {
+    const f = fakeDeps({ seed: false });
+    const r = await provisionPost(f.deps, extra);
+    must(r.status === 400 && r.body.error.code === "eval_only" && r.body.error.param === Object.keys(extra)[0] && /EVAL_SEED_ROUTES/.test(r.body.error.message), `${show(extra)}: ${r.text}`);
+    must(f.calls.length === 0, `${show(extra)}: something was made: ${show(f.calls)}`);
+  }
+  // Control: the same deployment makes the agent when neither field is sent, and asks for no tool choice.
+  const f = fakeDeps({ seed: false });
+  const ok = await provisionPost(f.deps, {});
+  must(ok.status === 201 && show(adoptedWith(f.calls)) === show([null]), `control: ${ok.text} ${show(f.calls)}`);
+});
+
+await check("toolConfig: an unknown, repeated or non-string mount, raft itself, a non-array, or any harness but minimal is 400 naming it; nothing is made", async () => {
+  const cases: Array<[Record<string, unknown>, RegExp]> = [
+    [{ mounts: ["state", "nosuch"] }, /"nosuch" is not a default mount/],
+    [{ mounts: ["reminder"] }, /"reminder" is not a default mount/],
+    [{ mounts: ["state", "state"] }, /"state" is named twice/],
+    [{ mounts: ["raft"] }, /"raft" is always added/],
+    [{ mounts: [3] }, /3 is not a string/],
+    [{ mounts: "state" }, /mounts is an array/],
+    [{ mounts: null }, /mounts is an array/],
+    [{ harness: "default" }, /harness "default"/],
+    [{ harness: "full" }, /harness "full"/],
+    [{ harness: 1 }, /harness 1/],
+    [{ mounts: ["state"], harness: "Minimal" }, /harness "Minimal"/],
+  ];
+  for (const [extra, says] of cases) {
+    const f = fakeDeps();
+    const r = await provisionPost(f.deps, extra);
+    must(r.status === 400 && says.test(r.body.error.message) && (r.body.error.param === "mounts" || r.body.error.param === "harness"), `${show(extra)}: ${r.status} ${r.text}`);
+    must(f.calls.length === 0, `${show(extra)}: something was made: ${show(f.calls)}`);
+  }
+});
+
+await check("toolConfig: what the agent's object is asked to adopt — the fields as given, null when neither is sent", async () => {
+  const cases: Array<[Record<string, unknown>, unknown]> = [
+    [{}, null],
+    [{ mounts: ["state"], harness: "minimal" }, { mounts: ["state"], harness: "minimal" }],
+    [{ mounts: [] }, { mounts: [], harness: "default" }],
+    [{ harness: "minimal" }, { mounts: null, harness: "minimal" }],
+  ];
+  for (const [extra, want] of cases) {
+    const f = fakeDeps();
+    const r = await provisionPost(f.deps, extra);
+    must(r.status === 201, `${show(extra)}: ${r.text}`);
+    must(show(adoptedWith(f.calls)) === show([want]), `${show(extra)}: adopted with ${show(adoptedWith(f.calls))}`);
+  }
+});
+
+await check("toolConfig: the object's refusal is the answer (a 409 for another recorded choice), and a PATCH asks nothing of the tools", async () => {
+  const f = fakeDeps();
+  f.deps.agent.adopt = async (...args) => {
+    f.calls.push({ op: "adopt", args });
+    return args[2].toolConfig === undefined ? undefined : { status: 409, code: "tool_config_conflict", message: "recorded another" };
+  };
+  const r = await provisionPost(f.deps, { harness: "minimal" }, "01JEVAL");
+  must(r.status === 409 && r.body.error.code === "tool_config_conflict", r.text);
+  must(!f.calls.some((c) => c.op === "attach" || c.op === "tool"), "went on after the refusal");
+  const patched = await handleProvision("PATCH", `/agents/${AGENT}`, { idempotencyKey: null, raftServerId: null }, { name: "m" }, WHO, f.deps);
+  must(patched?.status === 200, `PATCH: ${patched?.status}`);
+  must(adoptedWith(f.calls).at(-1) === undefined, `PATCH asked about tools: ${show(adoptedWith(f.calls))}`);
 });
 
 // ---- the two stores --------------------------------------------------------
@@ -291,6 +373,28 @@ await check("both stores: sealed is final and idempotent; the manifest is sorted
     hashes.push(first.seal.manifestSha256);
   }
   must(hashes[0] === hashes[1], `the two stores, written in opposite orders, disagree: ${show(hashes)}`);
+});
+
+await check("both stores: a toolConfig on the record is in the manifest and its hash, sealed or not; without one the hash is the manifest's alone", async () => {
+  const tc = { mounts: ["state"], harness: "minimal" as const };
+  const hashes: string[] = [];
+  for (const [name, store] of await stores()) {
+    await store.createAgent("t", "plain", {});
+    await store.createAgent("t", "min", { toolConfig: tc });
+    for (const a of ["plain", "min"]) must((await store.seedWrite("t", a, file("MEMORY.md", "mem"))).ok, `${name} ${a}`);
+    const plain = await store.seedManifest("t", "plain");
+    must(plain.toolConfig === null && plain.manifestSha256 === sha256Hex(canonJson(plain.manifest)), `${name} plain: ${show(plain)}`);
+    const min = await store.seedManifest("t", "min");
+    must(show(min.toolConfig) === show(tc), `${name}: the manifest does not carry the toolConfig: ${show(min)}`);
+    must(min.manifestSha256 === sha256Hex(canonJson({ manifest: min.manifest, toolConfig: tc })), `${name}: the hash does not cover the toolConfig`);
+    must(min.manifestSha256 !== plain.manifestSha256 && show(min.manifest) === show(plain.manifest), `${name}: same files, the hashes should differ only by toolConfig`);
+    const sealed = await store.seal("t", "min", "explicit");
+    must(sealed.seal.manifestSha256 === min.manifestSha256 && show(sealed.seal.toolConfig) === show(tc), `${name} seal: ${show(sealed)}`);
+    const after = await store.seedManifest("t", "min");
+    must(after.seal?.manifestSha256 === min.manifestSha256 && show(after.seal?.toolConfig) === show(tc), `${name} sealed manifest: ${show(after)}`);
+    hashes.push(min.manifestSha256);
+  }
+  must(hashes[0] === hashes[1], `the two stores disagree: ${show(hashes)}`);
 });
 
 await check("a spilled snapshot keeps its reference and no text in the row", async () => {

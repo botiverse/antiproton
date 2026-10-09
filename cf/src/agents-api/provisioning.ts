@@ -30,9 +30,19 @@ export function apiAgentSeeds<T extends { alias: string; plugin: string }>(
   return defaults.filter((m) => provides(m.plugin)?.includes("container"));
 }
 
-/** Which of the harness's own tools the model is offered. */
-export function harnessExtras(o: { apiAgent: boolean; sandbox: boolean; hasBackgroundMount: boolean }): { runJs: boolean; jobs: boolean } {
+/**
+ * Which of the harness's own tools the model is offered. `resume` is offered where run_js is, or where a mount can ask
+ * a question; `resume: false` says it is not offered even then.
+ *
+ * `minimal` (an evaluation's `harness: "minimal"`, src/core/tool-config.ts) is none of them: no run_js, no resume, no
+ * jobs, whatever the agent's mounts can do. A tool's question then takes the harness's no-resume path (it is dropped
+ * and the model told to call again, src/runtime/pi-tools.ts `toolQuestion`); provisioning refuses a minimal agent a
+ * mount that would depend on answering one (cf/src/provision/steps.ts `toolConfigProblem`).
+ */
+export function harnessExtras(o: { apiAgent: boolean; sandbox: boolean; hasBackgroundMount: boolean; minimal?: boolean }): { runJs: boolean; jobs: boolean; resume: boolean } {
+  if (o.minimal) return { runJs: false, jobs: false, resume: false };
   return {
+    resume: true,
     runJs: o.sandbox && !o.apiAgent,
     // `jobs` lists and stops work that a call left running, so it is worth
     // offering exactly when something offered can leave work running. That was
