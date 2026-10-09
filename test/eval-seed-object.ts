@@ -1326,8 +1326,8 @@ await check("transcript and trace write nothing: every table and row of the obje
   // Both sources hold rows, so a read that drained, pruned or moved a cursor would have something to change.
   must(Number(w.raw.sql.exec("SELECT COUNT(*) AS n FROM trace_outbox").toArray()[0]!.n) > 0, "no trace row is held in the object");
   must([...w.R2.objects.keys()].some((k) => k.startsWith(`trace/${T}/${A}/`)), "no trace batch is in the bucket");
-  must((await call(w, "GET", `${A}/trace`)).body.rows.some((r: any) => r.spanId === "op_held"), "the held row is not in the export");
   const db0 = dump(w.raw.sql as never), r20 = bucketDump(w), jobs0 = jobCount(w), sealed0 = await w.rt.store.isSealed(T, A);
+  must((await call(w, "GET", `${A}/trace`)).body.rows.some((r: any) => r.spanId === "op_held"), "the held row is not in the export");
   for (const q of ["transcript", "transcript?session=main", "transcript?limit=1&cursor=1", "trace", "trace?limit=1", `trace?from=${Date.now() - 60_000}`]) {
     const r = await call(w, "GET", `${A}/${q}`);
     must(r.status === 200, `${q}: ${r.status} ${r.text.slice(0, 200)}`);
