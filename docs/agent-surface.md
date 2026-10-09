@@ -223,7 +223,7 @@ message `instructions is at most 65536 UTF-8 bytes; this one is <n>`, and nothin
 changed: never cut, since an evaluation of an agent given part of its instructions measures the
 wrong agent. Nothing after the check bounds them: the registry row, the agent's record and the
 system prompt carry the value as sent (`test/eval-seed-object.ts` sends a 35 KB CJK-and-emoji
-persona and finds its bytes in the model request). The prompt drops surrounding whitespace, as it
+persona, then PATCHes one of exactly 65,536 bytes, and finds each one's bytes in the model request). The prompt drops surrounding whitespace, as it
 does for every persona (`personaSection`, `src/runtime/pi-prompt.ts`). A `PATCH` reaches the next
 harness built, not one already open: `POST …/restart` between turns makes the next turn use it.
 
