@@ -1468,8 +1468,10 @@ export const RAFT_ASSISTANT_WIRE: AssistantWire = {
 
 /**
  * Whether the credential context's `agent.assistantOf` names an owner: an object with a non-empty string `userId`.
- * Null or absent (an older Server) is "not an assistant". The SDK's contract already refuses any other shape (the
- * whole context answer, so the listing fails rather than guesses); this holds the line here too, rather than lean on it.
+ * Null or absent (an older Server) is "not an assistant". The SDK's contract (0.13.1) refuses an `assistantOf` that is
+ * not an object with a string `userId`, and with it the whole context answer, so the listing fails rather than
+ * guesses; it lets an empty `userId` through, which is not an owner here. Any other text counts, UUID or not: nothing
+ * here sends the owner's id, so its form decides nothing.
  */
 export function isAssistantOf(value: unknown): boolean {
   return !!value && typeof value === "object" && !Array.isArray(value) && "userId" in value &&
@@ -1969,8 +1971,9 @@ export function createRaftPlugin(deps: {
      * throw, which leaves the stored list as it was (after a credential change too).
      *
      * The context is the Agent API's `GET /context`, read through the SDK's typed route (`routes.agent.context`), the
-     * one request `identity.whoami` makes: whoami rebuilds its answer with a projection that keeps only the agent
-     * fields it names, which in SDK 0.13.0 still leaves out `agent.assistantOf` though the route's contract carries it.
+     * one request `identity.whoami` makes. Since SDK 0.13.1 whoami carries `agent.assistantOf` too (0.13.0 dropped it);
+     * the listing stays on the route because whoami is a second projection over the same answer, which every field the
+     * listing reads has to survive, and 0.13.0 showed it can leave one out while the route's contract carries it.
      *
      * A personal assistant's two reads are listed when the same answer says whose assistant this account is
      * (`agent.assistantOf`, `isAssistantOf`). Otherwise they are left out with no `skipped` entry:

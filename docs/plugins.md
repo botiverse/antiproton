@@ -580,10 +580,13 @@ another style is refused as malformed rather than read as missing. They go
 through the SDK's routes (`routes.assistant.ownerInbox` / `ownerMessages`,
 SDK 0.13.0, `RAFT_ASSISTANT_WIRE` in `src/plugins/raft.ts`) on the mount's own
 credential, with no saved state: neither marks anything read for anyone. The
-SDK's `identity.whoami` still drops `agent.assistantOf` in 0.13.0, which is why
-the listing reads the context route rather than whoami; and the SDK's contract
-for that answer refuses an `assistantOf` that is not `{ userId: <uuid> }` or
-null, which fails the whole listing (the stored list stays as it was).
+listing reads `agent.assistantOf` from the context route itself
+(`routes.agent.context`), not from `identity.whoami`, which is a second
+projection over the same answer: 0.13.0's left the field out, and since 0.13.1
+it carries it. The SDK's contract for that answer refuses an `assistantOf`
+that is not null or an object with a string `userId`, which fails the whole
+listing (the stored list stays as it was); an empty `userId` passes it and is
+not an owner here, and any other text is, UUID or not.
 `test/raft-assistant.ts` holds the reads end to end through the SDK against a
 fake Raft, and the rendering against a fake wire, which can hand it answers
 the SDK's contract would refuse first.
