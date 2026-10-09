@@ -923,9 +923,11 @@ function persona(n: number, tag: string): string {
   return out.join("\n");
 }
 
-await check("instructions: with EVAL_SEED_ROUTES a 35 KB CJK-and-emoji persona is made (201), kept whole, and reaches the model byte for byte; a PATCH to another does too", async () => {
-  const INSTR = persona(35_000, "甲"), NEXT = persona(36_000, "乙");
+await check("instructions: with EVAL_SEED_ROUTES a 35 KB CJK-and-emoji persona is made (201), kept whole, and reaches the model byte for byte; a PATCH to one of exactly 64 KiB does too", async () => {
+  // NEXT is exactly the limit, so a cap anywhere downstream short of it reddens the PATCH half.
+  const INSTR = persona(35_000, "甲"), body = persona(65_400, "乙"), NEXT = body + ".".repeat(65_536 - Buffer.byteLength(body, "utf8"));
   const size = Buffer.byteLength(INSTR, "utf8");
+  must(Buffer.byteLength(NEXT, "utf8") === 65_536, `NEXT: ${Buffer.byteLength(NEXT, "utf8")} bytes`);
   must(size >= 35_000 && size < 65_536 && INSTR.length < size && /\p{Extended_Pictographic}/u.test(INSTR), `persona: ${size} bytes, ${INSTR.length} units`);
   const w = await world("1", { post: { instructions: INSTR } });
   must(w.posted?.status === 201 && w.posted.body.instructions === INSTR, `POST answered ${w.posted?.status}, ${Buffer.byteLength(String(w.posted?.body?.instructions), "utf8")} bytes`);
