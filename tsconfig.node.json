@@ -134,6 +134,7 @@
     "test/client-tool-alarms.ts",
     "test/eval-seed.ts",
     "test/eval-seed-object.ts",
+    "test/provision-model.ts",
     "test/eval-read.ts"
   ]
 }

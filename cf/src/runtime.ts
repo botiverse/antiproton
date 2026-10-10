@@ -817,7 +817,9 @@ export function snapshotStale(
 /**
  * What a harness was built from beyond its catalogue: the persona its system prompt opens with and the model binding
  * it registers. Each is read once, when the harness is built, so a cached one went on with the old instructions after
- * a PATCH and the old model after a pick until the object was evicted (#826). Kept apart from `catalogueKey` because
+ * a PATCH, and after a pick with the old model as its own — the model its transcript records and its context window
+ * is taken from — while the queued call went to the new one (`takeJob` reads the binding), until the object was
+ * evicted (#826). Kept apart from `catalogueKey` because
  * that one is about tools and is tested as such. The binding's reference names the provider, never a credential.
  */
 export function harnessKey(
