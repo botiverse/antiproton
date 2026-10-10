@@ -815,7 +815,24 @@ export function snapshotStale(
 }
 
 /**
- * Whether a cached harness may be handed out again. A changed catalogue
+ * What a harness was built from beyond its catalogue: the persona its system prompt opens with and the model binding
+ * it registers. Each is read once, when the harness is built, so a cached one went on with the old instructions after
+ * a PATCH, and after a pick with the old model as its own — the model its transcript records and its context window
+ * is taken from — while the queued call went to the new one (`takeJob` reads the binding), until the object was
+ * evicted (#826). Kept apart from `catalogueKey` because
+ * that one is about tools and is tested as such. The binding's reference names the provider, never a credential.
+ */
+export function harnessKey(
+  catalogue: string,
+  persona: { name?: string; description?: string } | null,
+  binding: { provider: string; model: string; baseUrl: string; secretRef: string } | null,
+): string {
+  return JSON.stringify([catalogue, persona ? [persona.name ?? null, persona.description ?? null] : null,
+    binding ? [binding.provider, binding.model, binding.baseUrl, binding.secretRef] : null]);
+}
+
+/**
+ * Whether a cached harness may be handed out again. A changed catalogue, persona or model binding (`harnessKey`)
  * rebuilds it, but never under a turn that is running: that turn keeps the
  * tools it started with, and the next call after it ends gets the new list.
  * Rebuilding an idle one is what an eviction does anyway.
@@ -2604,6 +2621,12 @@ export class AgentRuntime {
     return catalogueKey(await this.store.listMounts(tenantId, agentId), await this.store.pluginChoices(tenantId, agentId));
   }
 
+  /** The key a cached harness is checked against (`harnessKey`): its catalogue, its persona and its model binding, as stored now. */
+  async #harnessKeyFor(tenantId: string, agentId: string): Promise<string> {
+    return harnessKey(await this.#catalogueKeyFor(tenantId, agentId),
+      personaOf((await this.store.loadAgent(tenantId, agentId))?.config), await this.store.getModelBinding(tenantId, agentId));
+  }
+
   async #catalogueFor(tenantId: string, agentId: string) {
     const byId = new Map(this.#plugins.map((pl) => [pl.id, pl]));
     const all = await this.store.listMounts(tenantId, agentId);
@@ -2748,7 +2771,7 @@ export class AgentRuntime {
     const cacheKey = `${key}#${session}`;
     const cached = this.#agents.get(cacheKey);
     if (cached) {
-      const now = await this.#catalogueKeyFor(tenantId, agentId);
+      const now = await this.#harnessKeyFor(tenantId, agentId);
       const running = cached.builtFrom !== now && await cached.agent.running();
       if (reuseHarness(cached.builtFrom, now, running)) return cached.agent;
       this.#agents.delete(cacheKey);
@@ -2765,7 +2788,7 @@ export class AgentRuntime {
     // the gateway refuses, and the harness opening is the one moment every
     // agent passes through, console-made or API-made.
     await this.repinMounts(tenantId, agentId);
-    const builtFrom = await this.#catalogueKeyFor(tenantId, agentId);
+    const builtFrom = await this.#harnessKeyFor(tenantId, agentId);
     const agentRef: { current: PiAgent | null } = { current: null };
     const { records, unoffered, offered, activityOf, nameOf, host, extras, callerDefs, keeping, extraTools } =
       await this.#turnTools(tenantId, agentId, session, engine, agentRef);
