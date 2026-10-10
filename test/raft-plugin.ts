@@ -1414,6 +1414,25 @@ await check("messages_read: a name with a line break or another control characte
   must(lines[2] === "[target=#wg-raft-sdk msg=m-43cccc time=2026-09-28 10:00:00Z type=human] @tygg: plain", `plain: ${lines[2]}`);
 });
 
+await check("messages_read lists a history page whose messages carry no channel_type/channel_name, only the page's target (SDK 0.13.2)", async () => {
+  // Raft's history answer may give each message in camelCase with no channel fields of its own; the channel is the
+  // page's top-level `target`. Before SDK 0.13.2, readHistory dropped every such message and the page read as empty.
+  const calls = one(json(200, {
+    target: "#onboarding-eval",
+    messages: [
+      { id: "a1b2c3d4e5f6", seq: 7, content: "first", senderType: "human", senderName: "tygg", channelId: "ch_onboarding", createdAt: "2026-10-08T09:00:00Z" },
+      { id: "b2c3d4e5f6a1", seq: 8, content: "second", senderType: "human", senderName: "qizhi", channelId: "ch_onboarding", createdAt: "2026-10-08T09:01:00Z" },
+    ],
+    has_more: false, has_older: false, has_newer: false,
+  }));
+  const page: any = await raftPlugin.invoke("messages_read", { target: "#onboarding-eval" }, inTurn(ctx()));
+  must(calls.length === 1, `requests: ${calls.length}`);
+  must(page.state === "page" && page.text === [
+    "[target=#onboarding-eval msg=a1b2c3d4 time=2026-10-08 09:00:00Z type=human] @tygg: first",
+    "[target=#onboarding-eval msg=b2c3d4e5 time=2026-10-08 09:01:00Z type=human] @qizhi: second",
+  ].join("\n"), `page: ${JSON.stringify(page)}`);
+});
+
 await check("users_info asks Raft for one capped window of channels in one request, and the page fits under the parking line", async () => {
   // SDK 0.12.0: one GET /users/:name/channels carries the user's facts and their memberships in the window; Raft
   // reads the rosters. The old shape (server.info, then one channel-members request per channel) is answered too,
