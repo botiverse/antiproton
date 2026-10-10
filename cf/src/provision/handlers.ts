@@ -32,6 +32,10 @@ import { WORKING_SET } from "../../../src/plugins/state.ts";
 import { SEED_MODES, seedPathProblem, seedText, type SeedFileMeta, type SeedMode, type SeedSeal, type SeedWriteResult } from "../../../src/store/seed-files.ts";
 import type { FreshContextResult, RestartResult } from "../runtime.ts";
 import { canonicalToolConfig, type ToolConfig } from "../../../src/core/tool-config.ts";
+import type { ModelChoices } from "../control-plane.ts";
+import { resolveModel } from "../model-request.ts";
+import { optionFor, type UserModels } from "../../../src/model/user-models.ts";
+import type { ModelChoice } from "../../../src/model/providers.ts";
 
 export type ProvisionTool = "enable_push" | "disable_push";
 
@@ -75,9 +79,19 @@ export function tenantFor(who: ProviderTokenIdentity, raftServerId: string | nul
 }
 
 /**
- * No `model` anywhere: a provisioned agent runs on the deployment's default, and Raft shows no
- * selector. If choice comes later it is a new field, not a revived one.
+ * The model routes' sources (`/provision/models`, `…/model`): the deployment's options (USER_MODELS), its default
+ * (HARNESS_MODEL), the stored choices and the admin's rows read through one `layers` (cf/src/control-plane.ts
+ * d1ModelChoices), and the agent's object asked to bind what is chosen now (AgentDO.rebindModel). A pick made here is
+ * the owner's pick — the same row the console's picker (cf/src/agent-model.ts) and the Agents API's `model` write — so
+ * all three read one value, and resolveModel (cf/src/model-request.ts) decides it against the admin's rows for each.
  */
+export interface ProvisionModels {
+  userModels: UserModels;
+  defaultModel: string;
+  choices: ModelChoices;
+  rebind(tenantId: string, agentId: string): Promise<void>;
+}
+
 export interface ProvisionDeps {
   now(): number;
   registry: ProvisionRegistry;
@@ -107,6 +121,8 @@ export interface ProvisionDeps {
    * (cf/src/agent-surface/). Absent: those routes answer 404.
    */
   surface?: SurfaceDeps;
+  /** The model routes (`modelRoute`). Absent: they answer 404, as on a deployment that never had them. */
+  models?: ProvisionModels;
   /**
    * An evaluation's setup, in the agent's own object (cf/src/index.ts, behind EVAL_SEED_ROUTES). Absent: every
    * route of it answers 404, as on a deployment that never had them.
@@ -297,6 +313,12 @@ export async function handleProvision(
     if (isFail(tenant)) return fail(tenant);
     return disconnect(tenant, seg[1]!, body, deps);
   }
+  if (seg[0] === "models" && seg.length === 1 && method === "GET") {
+    if (!deps.models) return null;
+    const tenant = tenantFor(who, headers.raftServerId);
+    if (isFail(tenant)) return fail(tenant);
+    return ok(await modelList(tenant, deps.models));
+  }
   if (seg[0] !== "agents") return null;
   // On POST the body names the server; elsewhere the URL does.
   const serverForTenant = method === "POST" && seg.length === 1
@@ -402,6 +424,14 @@ export async function handleProvision(
     const a = await surface(deps.surface, read, tenantId, found.agentId, query);
     if (!a.ok) return fail({ status: a.status, code: a.status === 404 ? "not_found" : a.status === 502 ? "unavailable" : "invalid", message: a.message, ...(a.param ? { param: a.param } : {}) });
     return ok(read === "usage" ? { raftAgentId: found.raftAgentId, providerAgentId: found.agentId, ...a.body } : a.body);
+  }
+  if (rest.length === 2 && rest[1] === "model") {
+    if (!deps.models) return null;
+    const found = byRaft ? await deps.registry.get(tenantId, rest[0]!) : await deps.registry.getByAgentId(tenantId, rest[0]!);
+    if (!found || found.status === "deleted") {
+      return fail({ status: 404, code: "not_found", message: `no provisioned agent ${byRaft ? "made from Raft agent " : ""}${rest[0]}` });
+    }
+    return modelRoute(method, body, tenantId, found.agentId, headers.credentialId ?? null, deps.models, deps.now);
   }
   if (rest.length < 1 || rest.length > 2 || (rest.length === 2 && rest[1] !== "credential")) return null;
   const row = byRaft ? await deps.registry.get(tenantId, rest[0]!) : await deps.registry.getByAgentId(tenantId, rest[0]!);
@@ -636,6 +666,82 @@ async function disconnect(tenantId: string, connectorId: string, body: unknown, 
   await c.connectors.remove(tenantId, k.id);
   await c.connectors.record({ tenantId, connectorId: k.id, raftAgentId: null, action: "disconnect", ...acting, at: deps.now() });
   return ok({ disconnected: true, connectorId: k.id, detached });
+}
+
+/**
+ * The name these routes give what runs: the offered option's id when one names it, else `<provider>/<model>` — the
+ * Agents API's name (cf/src/agents-api/model.ts `modelName`), so an admin's model no option names still reads as itself.
+ */
+function modelView(choice: ModelChoice, um: UserModels): { model: string; label: string } {
+  const o = optionFor(um, choice);
+  return o ? { model: o.id, label: o.label } : { model: `${choice.provider}/${choice.model}`, label: choice.model };
+}
+
+/**
+ * `GET /provision/models`: what Raft's model picker may offer. Each option's id, label and provider id — fields named
+ * one by one, so a field added to UserModel later does not reach Raft by default — and never a model's address, a
+ * gateway or a secret. `default` is what an agent that follows the default runs on in this tenant (the admin's tenant
+ * or deployment row, else HARNESS_MODEL), named as `modelView` names it; `locked` says a tenant row decides every agent
+ * of the tenant, so no pick would run.
+ */
+async function modelList(tenantId: string, m: ProvisionModels) {
+  // `layers` with no agent reads the tenant's and the deployment's rows: the agent clause names agent_id '', which is
+  // the tenant row itself.
+  const r = resolveModel({ ...(await m.choices.layers(tenantId, "")), agent: null, owner: null }, m.userModels, m.defaultModel);
+  const d = modelView(r.choice, m.userModels);
+  return {
+    models: m.userModels.offered.map((o) => ({ id: o.id, label: o.label, provider: o.provider })),
+    default: d.model, defaultLabel: d.label, locked: r.locked,
+  };
+}
+
+/**
+ * `GET|PUT …/model`: one agent's model as Raft's Agent Panel shows and sets it. PUT `{ model: "<id>" }` picks an
+ * offered option; `{ model: null }` follows the default again. Stored as the owner's pick (model_choices), with the
+ * provider token's hash as who set it, and bound at once (AgentDO.rebindModel), so the agent's next model call runs on
+ * it; a harness already open is rebuilt for its next turn because the binding is in its key (cf/src/runtime.ts
+ * `harnessKey`).
+ *
+ * Precedence is resolveModel's: an admin's agent or tenant row outranks the pick, and while one applies (`locked`) a
+ * PUT is refused with 409 rather than stored to no effect — as the console's picker and the Agents API refuse it. An
+ * admin's deployment row is below the pick, so it reads as source "admin" without locking.
+ */
+async function modelRoute(
+  method: string, body: unknown, tenantId: string, agentId: string, credentialId: string | null, m: ProvisionModels, now: () => number,
+): Promise<Response | null> {
+  const state = async () => {
+    const r = resolveModel(await m.choices.layers(tenantId, agentId), m.userModels, m.defaultModel);
+    return { ...modelView(r.choice, m.userModels), source: r.source === "owner" ? "chosen" : r.source, locked: r.locked };
+  };
+  if (method === "GET") return ok(await state());
+  if (method !== "PUT") return null;
+  const b = (body && typeof body === "object" && !Array.isArray(body) ? body : {}) as Record<string, unknown>;
+  const unknown = Object.keys(b).find((k) => k !== "model");
+  if (unknown) return fail({ status: 400, code: "unknown_field", message: `unknown field ${unknown}`, param: unknown });
+  if (!("model" in b)) return fail({ status: 422, code: "missing", message: "model is required: an offered option's id, or null for the default", param: "model" });
+  const asked = b.model;
+  if (asked !== null && typeof asked !== "string") {
+    return fail({ status: 422, code: "invalid", message: "model is an offered option's id, or null for the default", param: "model" });
+  }
+  const current = resolveModel(await m.choices.layers(tenantId, agentId), m.userModels, m.defaultModel);
+  if (current.locked) {
+    return fail({ status: 409, code: "model_locked", param: "model",
+      message: `an administrator has set this agent's model to ${JSON.stringify(modelView(current.choice, m.userModels).model)}, so it cannot be chosen here` });
+  }
+  if (asked === null) await m.choices.remove(tenantId, agentId);
+  else {
+    // Only an id offered now: one listed once, or whose provider has no secret, would be stored and passed over at every run.
+    if (!m.userModels.offered.some((o) => o.id === asked)) {
+      const ids = m.userModels.offered.map((o) => JSON.stringify(o.id)).join(", ");
+      return fail({ status: 422, code: "unknown_model", param: "model",
+        message: `no model option ${JSON.stringify(asked.slice(0, 64))} is offered here; ${ids ? `one of ${ids}, ` : ""}or null for the default` });
+    }
+    await m.choices.put({ tenantId, agentId, choiceId: asked, setBy: `provider:${credentialId ?? "unknown"}`, setAt: now() });
+  }
+  // Not the request's failure: the pick is stored, and the next path that binds (a message, a page open) binds it anyway.
+  await m.rebind(tenantId, agentId).catch((e: unknown) => console.warn(`rebinding ${agentId} after a provider pick failed: ${String((e as Error)?.message ?? e).slice(0, 200)}`));
+  logEvent("provision.model", { tenant: tenantId, agent: agentId, model: asked, credentialId });
+  return ok(await state());
 }
 
 /** The setup routes, after the agent's id. */

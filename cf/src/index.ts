@@ -3427,6 +3427,13 @@ function provisionDeps(env: Env): ProvisionDeps {
     now: () => Date.now(),
     registry: d1ProvisionedAgents(env.CONTROL_DB),
     surface: surfaceDeps(env),
+    // The same sources as the console's picker (`/ui/agent/model`) and the Agents API's `model`, so all three agree.
+    models: {
+      userModels: userModelsFrom(env as unknown as Record<string, unknown>, operatorModelOf(env).providers),
+      defaultModel: env.HARNESS_MODEL,
+      choices: d1ModelChoices(env.CONTROL_DB),
+      rebind: (tenantId, agentId) => stub(tenantId, agentId).rebindModel(tenantId, agentId),
+    },
     ...(evalSeedRoutes(env) ? {
       seed: {
         write: (tenantId, agentId, f) => stub(tenantId, agentId).seedWrite(tenantId, agentId, f.path, f.mode, f.text),

@@ -189,6 +189,58 @@ at most 8000 characters, counted as `String.length` counts them (`INSTRUCTIONS_M
 `cf/src/provision/handlers.ts`). Over it is `422`, `code: "invalid"`, `param: "instructions"`, with
 the limit and the value's size in the message, and nothing is made or changed; a value is never cut.
 A deployment serving the evaluation routes counts them differently ([below](#instructions)).
+A `PATCH` of `name` or `instructions` reaches the agent's next turn, including when its harness is
+already open: the harness is rebuilt when its persona or its model binding differs from what it was
+built from (`harnessKey`, `cf/src/runtime.ts`), never under a turn that is running. On a `pd` agent the
+changed section reaches the model as a newer system message after the conversation's first one, as
+pi-durable sends any prompt change; on `pi085` the prompt is rebuilt whole.
+
+### The agent's model
+
+Raft's Agent Panel lets a person pick the model of an agent Raft hosts. Production routes, not part of
+the evaluation set; authentication and tenant as above (`?raftServerId=` for a platform token, on
+`/provision/models` too), and `404` for an agent that is not a live provisioned agent of the tenant.
+
+| Method | Path | Does |
+|---|---|---|
+| `GET` | `/provision/models` | the models this deployment offers, and the default |
+| `GET` | `/provision/agents/{agentId}/model` | what the agent's next turn runs on, and why |
+| `PUT` | `/provision/agents/{agentId}/model` | `{ "model": "<id>" }` picks an option; `{ "model": null }` follows the default |
+
+```json
+GET /provision/models
+{ "models": [{ "id": "deepseek-flash", "label": "DeepSeek Flash", "provider": "deepseek" }],
+  "default": "deepseek-flash", "defaultLabel": "DeepSeek Flash", "locked": false }
+
+GET or PUT /provision/agents/{agentId}/model
+{ "model": "deepseek-flash", "label": "DeepSeek Flash", "source": "default", "locked": false }
+```
+
+- **The options** are the deployment's `USER_MODELS` (README.md, "Model providers"), the list the
+  console's model picker and `/admin/models` read: each option's `id`, `label` and provider id, never a
+  model's address, a gateway or a secret. An option whose provider's secret is unset is not listed.
+  Without `USER_MODELS` the list is empty, and only `null` is accepted.
+- **`model`** (and `default`) is the offered option's id when one names what runs, else
+  `<provider>/<model>` — the Agents API's name for it — which is how a model an administrator set and no
+  option names reads.
+- **`source`**: `"default"` (nothing chosen), `"chosen"` (a pick made here, in the console's picker or
+  through the Agents API's `model` — one stored value, so the three surfaces agree), or `"admin"` (an
+  administrator's row decides it).
+- **Precedence** is the console's (`resolveModel`, `cf/src/model-request.ts`): an administrator's row for
+  this agent, then one for its tenant, then the pick, then the administrator's deployment row, then
+  `HARNESS_MODEL`. While an agent or tenant row applies, `locked` is `true` and a `PUT` — `null` included
+  — is `409`, `code: "model_locked"`, `param: "model"`: kept but never run, a pick would be a setting
+  accepted and ignored. The pick stays stored under the lock, and runs again once the row is removed. A
+  deployment row does not lock: it reads as `"admin"` until something is picked.
+- **A `PUT`** stores the pick (`model_choices`, `set_by` `provider:<the token's hash>`, the hash the
+  operator's token listing names it by) and binds it at once, so the agent's next model request goes to
+  the new model even while its harness is open (see the `PATCH` note above). An id not offered now
+  (`"default"` and `<provider>/<model>` included) is `422`, `code: "unknown_model"`, `param: "model"`; a
+  `model` that is neither a string nor `null` is `422 invalid`; any other field is `400 unknown_field`.
+  The same body twice answers the same. Each accepted `PUT` leaves one `provision.model` log line naming
+  the token by its hash.
+- **An agent never given a pick** is unchanged by these routes: reading them stores nothing and rebuilds
+  nothing, and it runs on the default as before (`test/provision-model.ts`).
 
 ## Evaluation setup (preview only)
 
@@ -228,7 +280,7 @@ wrong agent. Nothing after the check bounds them: the registry row, the agent's 
 system prompt carry the value as sent (`test/eval-seed-object.ts` sends a 35 KB CJK-and-emoji
 persona, then PATCHes one of exactly 65,536 bytes, and finds each one's bytes in the model request). The prompt drops surrounding whitespace, as it
 does for every persona (`personaSection`, `src/runtime/pi-prompt.ts`). A `PATCH` reaches the next
-harness built, not one already open: `POST …/restart` between turns makes the next turn use it.
+turn, as on every deployment ([above](#the-raft-provider-binding)).
 
 ### Choosing the agent's tools
 
