@@ -116,7 +116,7 @@ import {
   coldWakeRecord, idleRebuild, idleRebuildRecord, nearWindow, readWakeFacts, recordRebuildDecision, ruleFor, shouldRebuild, windowRecord,
   type RebuildPolicy, type RebuildRequest,
 } from "../../src/runtime/rebuild.ts";
-import { priorCallKeys, readWatch, dropWatch, recordBehaviour, runEnded, summariseBehaviour, watchRebuild } from "../../src/runtime/rebuild-behaviour.ts";
+import { priorCallKeys, readWatch, dropWatch, recordBehaviour, summariseBehaviour, watchRebuild } from "../../src/runtime/rebuild-behaviour.ts";
 import { contextIdOf } from "../../src/runtime/context-id.ts";
 import { UnknownJob } from "./model-queue.ts";
 
@@ -1304,9 +1304,9 @@ export class AgentRuntime {
       const coldHitRate = ruleFor(policy, binding.provider, binding.model).coldHitRate;
       const transact = this.#transact();
       const idle = idleRebuild(facts, policy);
-      let passed: string = idle.reason;
+      let passed: { reason: string; entry: string } = { reason: idle.reason, entry: idle.entry };
       // Judged as the post will judge it (`needsReset`): a mark a binding change or its age has cleared does not hold.
-      if (idle.rebuild && needsReset(sql, await this.#judge(tenantId, agentId))) passed = "needs-reset";
+      if (idle.rebuild && needsReset(sql, await this.#judge(tenantId, agentId))) passed = { reason: "needs-reset", entry: idle.entry };
       else if (idle.rebuild) {
         try {
           const built = await this.#rebuildContext(tenantId, agentId, { trigger: "cold-wake", strategy: "briefing" }, now);
@@ -1321,7 +1321,7 @@ export class AgentRuntime {
           return;
         } catch (e) {
           logEvent("rebuild.failed", { tenantId, agentId, trigger: "cold-wake", error: String((e as Error)?.message ?? e).slice(0, 200) });
-          passed = "rebuild-failed";
+          passed = { reason: "rebuild-failed", entry: idle.entry };
         }
       }
       recordRebuildDecision(sql, transact, coldWakeRecord({
@@ -3888,7 +3888,7 @@ export class AgentRuntime {
 
   /**
    * The `rebuild.behaviour` row for the first run of a transcript an idle rebuild started (src/runtime/rebuild-behaviour.ts),
-   * once that run has ended; the watch is dropped with it. A watch whose transcript is no longer the main one (a
+   * once that run has ended (`mainBusy` reads the step's own mark, set just before); the watch is dropped with it. A watch whose transcript is no longer the main one (a
    * fresh context, another rebuild) is dropped with no row. One table read when nothing is watched. A reading: a
    * failure is logged and never fails the step.
    */
@@ -3902,9 +3902,9 @@ export class AgentRuntime {
         logEvent("rebuild.behaviour.dropped", { tenantId, agentId, decision: watch.decision, why: "conversation-replaced" });
         return;
       }
+      // Ended: the step that just ran left nothing open and asked for no wake, and no call of it is out.
       if (mainBusy(sql)) return;
       const entries = mainMessages(sql);
-      if (!runEnded(entries)) return;
       recordBehaviour(sql, this.#transact(), {
         tenantId, agentId, watch, behaviour: summariseBehaviour(entries, { wakeAt: watch.wakeAt, prior: watch.prior }), at: Date.now(),
       });

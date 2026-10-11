@@ -4,7 +4,7 @@
  *
  * At the rebuild (`#coldWake`, cf/src/runtime.ts) a watch is kept: the decision's id, the transcript it started, the
  * wake's time, and the keys (`callKey`: tool name and a hash of its arguments) of the calls that succeeded among the
- * replaced conversation's last `PRIOR_ACTIONS`. When that transcript's first run has ended (`runEnded`), one
+ * replaced conversation's last `PRIOR_ACTIONS`. When that transcript's first run has ended (`#settleBehaviour`), one
  * `rebuild.behaviour` row is written (`summariseBehaviour`, `recordBehaviour`) and the watch dropped:
  *
  *   - `firstSendMs`: from the wake to the first message the agent sent (`isSendTool`), null when it sent none;
@@ -67,12 +67,6 @@ function callsOf(entries: readonly BriefingEntry[]): Call[] {
 /** The keys of the calls that succeeded among the last `n` of a conversation: what a repeat is a repeat of. */
 export function priorCallKeys(entries: readonly BriefingEntry[], n = PRIOR_ACTIONS): string[] {
   return callsOf(entries).slice(-n).filter((c) => c.ok === true).map((c) => callKey(c.name, c.args));
-}
-
-/** Whether a transcript's run has ended: its last message is an answer that asks for nothing more. */
-export function runEnded(entries: readonly BriefingEntry[]): boolean {
-  const m = entries.at(-1)?.message;
-  return m?.role === "assistant" && ["stop", "length", "error", "aborted"].includes(m.stopReason);
 }
 
 export interface Behaviour {
