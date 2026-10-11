@@ -3871,8 +3871,17 @@ export class AgentRuntime {
     // A push being handed over, or queued to be (a post that failed waits for its retry), carries a pending briefing
     // ahead of it (`postMessage`), and an idle rebuild (`#coldWake`) leaves one for exactly that push: posted alone
     // here, it would start a run without the wake, and the push's retry a second one.
+    // An idle rebuild's briefing is never posted alone, even once its wake is gone (its push settled failed after its
+    // last attempt, or too old): a run on the briefing alone answers nothing. It waits for the next post, which carries
+    // it (`postMessage`); the transcript it starts stays empty until then.
     if (readBackstop(sql).pending !== null) {
-      return this.#inboundPass !== null || hasPendingInbound(sql) ? null : this.#postBriefing(tenantId, agentId);
+      if (this.#inboundPass !== null || hasPendingInbound(sql)) return null;
+      const watch = readWatch(sql);
+      if (watch?.group === "rebuilt" && watch.conversation === currentMainId(sql)) {
+        logEvent("rebuild.briefing_held", { tenantId, agentId, decision: watch.decision, why: "its wake was not delivered" });
+        return null;
+      }
+      return this.#postBriefing(tenantId, agentId);
     }
     const tip = mainTip(sql);
     const failedJob = tip?.message?.stopReason === "error" && typeof tip.message.jobId === "string" ? tip.message.jobId as string : null;

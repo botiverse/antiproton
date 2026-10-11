@@ -175,8 +175,11 @@ function sixtyRounds(): BriefingEntry[] {
       messages: [`[target=${target} msg=m${r}aaaa time=${rtime(at)} type=human] @alice: round ${r}: please look at item ${r} ${"detail ".repeat(40)}`],
       hasMore: false,
     }, at + 1000));
-    if (r < 58) out.push(...callWith(`sd${r}`, "raft__messages_send", { target, content: `reply ${r}: done with item ${r}` }, { ok: true, id: `s${r}bbbb` }, at + 2000));
-    if (r === 57) out.push(...callWith(`rp${r}`, "raft__messages_reply", { message: `m${r}aaaa`, content: `and a follow-up on ${r}` }, { ok: true, id: `f${r}cccc` }, at + 2500));
+    // Results as Raft answers them (`state`, and the id in the text).
+    if (r < 58) out.push(...callWith(`sd${r}`, "raft__messages_send", { target, content: `reply ${r}: done with item ${r}` },
+      { state: "sent", text: `Message sent to ${target}. Message ID: s${r}bbbb` }, at + 2000));
+    if (r === 57) out.push(...callWith(`rp${r}`, "raft__messages_reply", { message: `m${r}aaaa`, content: `and a follow-up on ${r}` },
+      { state: "sent", text: `Message sent to ${target}. Message ID: f${r}cccc` }, at + 2500));
     out.push(wrote("done", at + 3000));
   }
   return out;
@@ -195,6 +198,54 @@ await check("the reviewer's probe — 60 Raft rounds over 3 days: the recent ask
   must(b.text.includes("you replied to msg=m57aaaa in #proj-0:t57 as msg=f57cccc with raft__messages_reply]") && b.text.includes("and a follow-up on 57"), "the reply's label");
   must(!b.text.includes("round 0: please"), "the oldest round should have fallen out of the budget");
   must(b.text.indexOf("round 59:") < b.text.indexOf("round 50:"), "not newest first");
+});
+
+/**
+ * A Damy-like stretch, in the shapes the real transcript has (2026-10-10, replayed by the reviewer): a push notice, a
+ * `receive_events` with `replyTarget`, a direct `messages_send` answered "Message sent to … Message ID: <uuid>", a
+ * `run_js` program that read history and sent a message (its outputs JSON in strings), an action card, and a reply.
+ */
+function damyLike(): BriefingEntry[] {
+  const t = T0 - 6 * 60 * MIN, dm = "dm:@tygg";
+  const line = (id: string, at: number, text: string) => `[target=${dm} msg=${id} time=${rtime(at)} type=human] @tygg (Asia/Shanghai): ${text}`;
+  return [
+    user(NOTICE(1), t),
+    ...callWith("c1", "raft__receive_events", { limit: 9 }, { messages: [line("c986f2d4", t, "A backyard cottage")], hasMore: false, replyTarget: dm }, t + 1000),
+    ...callWith("c2", "raft__messages_send", { target: dm, content: "CARD: backyard cottage" },
+      { state: "sent", text: `Message sent to ${dm}. Message ID: 575fdcd8-efe2-44b0-9af5-b09dfcd9c3e6` }, t + 2000),
+    wrote("", t + 3000),
+    user(NOTICE(1), t + 60 * MIN),
+    ...callWith("c3", "raft__receive_events", { limit: 9 }, { messages: [line("5b2b246d", t + 60 * MIN, "freeway是高速公路，不过我不知道区别")], hasMore: false, replyTarget: dm }, t + 60 * MIN + 1000),
+    ...callWith("c4", "run_js", { source: "const older = await tool`raft__messages_read ${ {target:\"dm:@tygg\"} }`;\nconst s = await tool`raft__messages_send ${ {target:\"dm:@tygg\", content:msg} }`;" },
+      [JSON.stringify({ older: { status: "succeeded", result: { state: "page", text: line("c986f2d4", t, "A backyard cottage") } },
+        sent: "Message sent to dm:@tygg. Message ID: 12eb23a3-a1ac-4423-98b4-1c69a5469c0f" })], t + 60 * MIN + 2000),
+    wrote("", t + 60 * MIN + 3000),
+    user(NOTICE(1), t + 120 * MIN),
+    ...callWith("c5", "raft__receive_events", { limit: 9 }, { messages: [line("4c811558", t + 120 * MIN, "公开的，描述你自己感受")], hasMore: false, replyTarget: dm }, t + 120 * MIN + 1000),
+    ...callWith("c6", "raft__actions_prepare", { target: dm, action: { type: "channel:create", name: "English learning", draftHint: "按你的要求创建公开 Channel" } },
+      { state: "prepared", text: `Action card posted to ${dm} as message 3639fc29-8d0e-4375-a518-c129fe96890b (short 3639fc29). The human can click the action verb to commit.` }, t + 120 * MIN + 2000),
+    wrote("", t + 120 * MIN + 3000),
+    user(NOTICE(1), t + 180 * MIN),
+    ...callWith("c7", "raft__receive_events", { limit: 9 }, { messages: [line("9299effd", t + 180 * MIN, "你能不能不要创建卡片？"), line("07d599aa", t + 180 * MIN, "你试一下用那个操作行不行？")], hasMore: false, replyTarget: dm }, t + 180 * MIN + 1000),
+    ...callWith("c8", "raft__messages_reply", { message: "9299effd", content: "好的，不再建卡片" },
+      { state: "sent", text: `Message sent to ${dm}. Message ID: 0ea6879e-0cb9-44ad-8c97-034a5fb73033` }, t + 180 * MIN + 2000),
+    wrote("", t + 180 * MIN + 3000),
+  ];
+}
+
+await check("a Damy-like replay in the real result shapes: sends with their target and Raft's own id, a program's read and send, an action card, a reply judged by its msg id", () => {
+  const b = buildBriefing(damyLike(), { conversation: "main", redact: (v) => v });
+  must(b.text.includes("you sent to dm:@tygg as msg=575fdcd8-efe2-44b0-9af5-b09dfcd9c3e6 with raft__messages_send]"), `the direct send:\n${b.text}`);
+  must(b.text.includes("you sent to dm:@tygg as msg=12eb23a3-a1ac-4423-98b4-1c69a5469c0f from a run_js program]"), `the program's send:\n${b.text}`);
+  must(b.text.includes("msg=c986f2d4, read with run_js"), `the program's read (newest read of c986f2d4):\n${b.text}`);
+  must(b.text.includes("you sent to dm:@tygg as msg=3639fc29-8d0e-4375-a518-c129fe96890b with raft__actions_prepare]") && b.text.includes("(an action card: channel:create)"), `the card:\n${b.text}`);
+  must(b.text.includes("you replied to msg=9299effd in dm:@tygg as msg=0ea6879e-0cb9-44ad-8c97-034a5fb73033 with raft__messages_reply]"), `the reply:\n${b.text}`);
+  // The reply named 9299effd: it answers that one, not 07d599aa beside it in the same DM.
+  must(b.text.includes("received in dm:@tygg msg=9299effd, read with raft__receive_events · you answered there after it]")
+    && b.text.includes("received in dm:@tygg msg=07d599aa, read with raft__receive_events · not answered by you since]"), `answered flags:\n${b.text}`);
+  must(b.text.includes("received in dm:@tygg msg=5b2b246d, read with raft__receive_events · you answered there after it]"), "the program's send answers its target");
+  const sb = summariseBehaviour(damyLike().slice(6, 12), { wakeAt: T0, prior: [] });
+  must(sb.sent && sb.toolCallsBeforeSend === 1 && sb.inboxReads === 1 && sb.firstAction === "send", `a program's send counts as the first send: ${show(sb)}`);
 });
 
 await check("a Raft message read twice (the inbox, then the history) is quoted once, where it was read last", () => {
@@ -455,6 +506,32 @@ await check("Raft's own sends are quoted as sent: `messages_send` and `messages_
   const b = buildBriefing(entries, { conversation: "main", redact: (v) => v });
   must(/you sent to #general with raft__messages_send\]\n`+\nSENT TEXT\n/.test(b.text) && /you replied to msg=msg_123 with raft__messages_reply\]\n`+\nREPLY TEXT\n/.test(b.text), `not quoted as sent:\n${b.text}`);
   must(isSendTool("raft__messages_send") && isSendTool("raft__messages_reply") && !isSendTool("raft__messages_read"), "send tools");
+});
+
+await check("a wake lost after its rebuild (its push failed every attempt): the briefing is held for the next post, never run alone", async () => {
+  const w = await world();
+  await primed(w, 51 * MIN);
+  const store = w.rt.store as unknown as { seal: (...a: unknown[]) => Promise<unknown> };
+  const seal = store.seal.bind(store);
+  let broken = true;
+  store.seal = async (...a: unknown[]) => { if (broken && rebuilds(w) === 1) throw new Error("storage hiccup"); return seal(...a); };
+  w.answer = say("answered");
+  must((await push(w, "LOST WAKE")).posted === 0 && rebuilds(w) === 1, "control: rebuilt, then the post failed");
+  // Its last attempt: the row is settled failed, and no push is left.
+  w.host.sql.exec("UPDATE inbound_pending SET next_at = 0, attempts = 99");
+  const last = await w.rt.deliverPendingInbound(w.tenant, "a");
+  must(last.failed === 1 && last.left === 0, `control: the wake was given up: ${show(last)}`);
+  must(readBackstop(w.host.sql as never).pending !== null, "control: the briefing is still owed");
+  for (let i = 0; i < 3; i++) await w.rt.step(w.tenant, "a");
+  must(w.sent.length === 3, `the briefing ran alone after its wake was lost: ${w.sent.length - 3} call(s)`);
+  // The next push carries it.
+  broken = false;
+  must((await push(w, "NEXT WAKE")).posted === 1, "the next push was not posted");
+  must(await settle(w) === 1, "the next wake did not make one call");
+  const text = textOf(w.calls[3]!.messages[0]);
+  must(w.calls[3]!.messages.length === 1 && text.startsWith(briefingOf(w.host.sql as never, "main.1")!) && text.endsWith("NEXT WAKE"), `the request:\n${text.slice(-300)}`);
+  must(coldWakes(w).filter((r) => r.attrs.shadow === false).length === 1 && coldWakes(w).length === 2, `decisions: ${show(coldWakes(w))}`);
+  w.host.dispose();
 });
 
 /** Every request of a world, with what differs between two runs by construction folded: the clock and the ids (job, call, operation). */

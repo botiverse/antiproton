@@ -290,7 +290,7 @@ export interface Briefing {
  * (`send_message`) or, as the Raft SDK names its operations, noun first (`messages_send`, `messages_reply`). A raw
  * transport (`http__send`, `sandbox__post`) is not one: its arguments are a request, not something a person read.
  */
-const SENDS = /^(?:(?:send|post|create)_(?:message|reply|comment|chat_message)s?|(?:message|comment)s?_(?:send|reply|post|create)|reply(?:_\w+)?|comment(?:_\w+)?|say|notify(?:_\w+)?)$/i;
+const SENDS = /^(?:(?:send|post|create)_(?:message|reply|comment|chat_message)s?|(?:message|comment)s?_(?:send|reply|post|create)|actions_prepare|reply(?:_\w+)?|comment(?:_\w+)?|say|notify(?:_\w+)?)$/i;
 const toolPart = (name: string) => { const i = name.lastIndexOf("__"); return i < 0 ? name : name.slice(i + 2); };
 export const isSendTool = (name: string) => SENDS.test(toolPart(name));
 /** The longest single message the briefing quotes, in characters; a longer one is cut with a mark. */
@@ -314,6 +314,12 @@ function sentText(args: unknown): string | null {
   for (const k of ["text", "content", "body", "message"]) {
     const v = (args as Record<string, unknown>)[k];
     if (typeof v === "string" && v.trim()) return v;
+  }
+  // Raft's `actions_prepare` posts an action card: what it asks the person to confirm.
+  const action = (args as Record<string, unknown>).action as Record<string, unknown> | undefined;
+  if (action && typeof action === "object") {
+    const hint = typeof action.draftHint === "string" ? action.draftHint : "";
+    return `(an action card${typeof action.type === "string" ? `: ${action.type}` : ""})${hint ? ` ${hint}` : ""}`;
   }
   return null;
 }
@@ -360,7 +366,13 @@ export function raftLines(text: string): RaftLine[] {
   const out: RaftLine[] = [];
   const take = (s: string) => { for (const part of s.split(/\n(?=\[target=)/)) { const l = raftLineOf(part); if (l) out.push(l); } };
   const walk = (v: unknown, depth: number): void => {
-    if (depth > 6) return;
+    if (depth > 8) return;
+    // A program's outputs (`run_js`) are strings that are themselves JSON: read inside them too.
+    if (typeof v === "string" && /^\s*[[{]/.test(v)) {
+      let inner: unknown;
+      try { inner = JSON.parse(v); } catch { inner = undefined; }
+      if (inner !== undefined) { walk(inner, depth + 1); return; }
+    }
     if (typeof v === "string") take(v);
     else if (Array.isArray(v)) for (const x of v) walk(x, depth + 1);
     else if (v && typeof v === "object") for (const x of Object.values(v)) walk(x, depth + 1);
@@ -378,8 +390,34 @@ function sendPlace(args: unknown): { target: string | null; replyTo: string | nu
   return { target: str("target", "channel", "thread", "to"), replyTo: str("replyTo", "messageId", "message_id") ?? (typeof a.content === "string" ? str("message") : null) };
 }
 
-/** The id of the message a send made, when its result names one. */
+/**
+ * What Raft says a send did, in its result's text: `Message sent to <target>. Message ID: <id>` (`messages_send`,
+ * `messages_reply`) or `Action card posted to <target> as message <id>` (`actions_prepare`).
+ */
+const SENT_SAYS = /(?:Message sent to|posted to) (\S+?)\.? (?:Message ID: |as message )([0-9A-Za-z-]{6,64})/g;
+
+/** Every send a result reports (`SENT_SAYS`), in any string at any depth, a program's JSON-in-string outputs included. */
+export function sendsReported(resultText: string): Array<{ target: string; id: string }> {
+  const out: Array<{ target: string; id: string }> = [];
+  const scan = (t: string) => { for (const m of t.matchAll(SENT_SAYS)) out.push({ target: m[1]!, id: m[2]! }); };
+  const walk = (v: unknown, depth: number): void => {
+    if (depth > 8) return;
+    if (typeof v === "string") {
+      if (/^\s*[[{]/.test(v)) { try { walk(JSON.parse(v), depth + 1); return; } catch { /* text */ } }
+      scan(v);
+    } else if (Array.isArray(v)) for (const x of v) walk(x, depth + 1);
+    else if (v && typeof v === "object") for (const x of Object.values(v)) walk(x, depth + 1);
+  };
+  let parsed: unknown;
+  try { parsed = JSON.parse(resultText); } catch { parsed = undefined; }
+  if (parsed === undefined) scan(resultText); else walk(parsed, 0);
+  return out;
+}
+
+/** The id of the message a send made, when its result names one: Raft's words (`sendsReported`), or a JSON field. */
 function sentId(resultText: string): string | null {
+  const said = sendsReported(resultText)[0];
+  if (said) return said.id;
   let v: unknown;
   try { v = JSON.parse(resultText); } catch { return null; }
   for (const o of [v, (v as any)?.data, (v as any)?.message]) {
@@ -388,6 +426,9 @@ function sentId(resultText: string): string | null {
   }
   return null;
 }
+
+/** Two Raft message ids for one message: a short id (`msg=c986f2d4`) is the head of the full one. */
+const sameMsg = (a: string, b: string) => a === b || (a.length >= 6 && b.length >= 6 && (a.startsWith(b) || b.startsWith(a)));
 
 /** A value from outside put in a label: only the characters a target or an id is made of, so it cannot end the label. */
 const tag = (s: string) => s.replace(/[^\w#:@.\/-]/g, "_").slice(0, 80);
@@ -468,10 +509,21 @@ export function buildBriefing(entries: readonly BriefingEntry[], o: {
     read.set(at, lines);
     for (const l of lines) if (l.msg) placeOf.set(l.msg, l.target);
   }
-  const sends = calls.filter((c) => isSendTool(c.name)).map((c) => ({ index: c.index, ...sendPlace(c.args) }));
+  // A send is a messaging tool's call, or one a program made (`run_js`), known by what its result reports.
+  const nested = new Map<string, Array<{ target: string; id: string }>>();
+  for (const c of calls) {
+    if (isSendTool(c.name)) continue;
+    const r = results.get(c.id);
+    const said = r && !r.isError ? sendsReported(r.text) : [];
+    if (said.length) nested.set(c.id, said);
+  }
+  const sends = [
+    ...calls.filter((c) => isSendTool(c.name)).map((c) => ({ index: c.index, ...sendPlace(c.args) })),
+    ...calls.flatMap((c) => (nested.get(c.id) ?? []).map((n) => ({ index: c.index, target: n.target as string | null, replyTo: null as string | null }))),
+  ];
+  // A reply names the message it answers, and answers that one alone; any other send answers its whole target.
   const answered = (l: RaftLine, i: number) => sends.some((s) => s.index > i
-    && ((l.msg !== null && s.replyTo === l.msg) || (s.target !== null && s.target === l.target)
-      || (s.replyTo !== null && placeOf.get(s.replyTo) === l.target)));
+    && (s.replyTo !== null ? l.msg !== null && sameMsg(s.replyTo, l.msg) : s.target !== null && s.target === l.target));
 
   type Said = { label: string; text: string; msg?: string; kind: "received" | "wrote" | "sent" };
   /**
@@ -504,6 +556,12 @@ export function buildBriefing(entries: readonly BriefingEntry[], o: {
       const where = replyTo !== null ? ` replied to msg=${tag(replyTo)}${placeOf.has(replyTo) ? ` in ${tag(placeOf.get(replyTo)!)}` : ""}`
         : target !== null ? ` sent to ${tag(target)}` : " sent";
       out.push({ label: `[${o.conversation} · ${at} · you${where}${id ? ` as msg=${tag(id)}` : ""} with ${c.name}]`, text: sent, kind: "sent" });
+    }
+    for (const c of calls.filter((c) => c.index === i && nested.has(c.id))) {
+      for (const n of nested.get(c.id)!) {
+        out.push({ label: `[${o.conversation} · ${at} · you sent to ${tag(n.target)} as msg=${tag(n.id)} from a ${tag(c.name)} program]`,
+          text: "(its text was put together inside the program)", kind: "sent" });
+      }
     }
     return out;
   };

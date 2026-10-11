@@ -25,7 +25,7 @@ import { canonJson } from "../core/canon-json.ts";
 import { logEvent } from "../core/log.ts";
 import { appendTrace } from "../trace/outbox.ts";
 import { MAIN_SESSION, piTables, type SqlHost } from "../store/pi-storage.ts";
-import { isSendTool, type BriefingEntry } from "./overflow-backstop.ts";
+import { isSendTool, sendsReported, type BriefingEntry } from "./overflow-backstop.ts";
 
 type Sql = SqlHost["sql"];
 
@@ -50,14 +50,20 @@ export const isInboxRead = (name: string) => INBOX.test(toolPart(name));
 export const callKey = (name: string, args: unknown) =>
   `${name}#${createHash("sha256").update(canonJson(args ?? {})).digest("hex").slice(0, 16)}`;
 
-interface Call { name: string; args: unknown; id: string; at: number; ok: boolean | null; endedAt: number | null }
+interface Call {
+  name: string; args: unknown; id: string; at: number; ok: boolean | null; endedAt: number | null;
+  /** A message went out: a messaging tool, or a program (`run_js`) whose result reports a send (`sendsReported`). */
+  sends: boolean;
+}
 
 /** Every tool call in `entries`, in order, with whether it succeeded and when its result came. */
 function callsOf(entries: readonly BriefingEntry[]): Call[] {
-  const results = new Map<string, { ok: boolean; at: number }>();
+  const results = new Map<string, { ok: boolean; at: number; text: string }>();
   for (const e of entries) {
     const m = e.message;
-    if (m?.role === "toolResult" && typeof m.toolCallId === "string") results.set(m.toolCallId, { ok: m.isError !== true, at: Number(m.timestamp ?? e.timestamp) });
+    if (m?.role !== "toolResult" || typeof m.toolCallId !== "string") continue;
+    const text = Array.isArray(m.content) ? m.content.map((p: any) => p?.type === "text" && typeof p.text === "string" ? p.text : "").join("") : "";
+    results.set(m.toolCallId, { ok: m.isError !== true, at: Number(m.timestamp ?? e.timestamp), text });
   }
   const out: Call[] = [];
   for (const e of entries) {
@@ -66,8 +72,10 @@ function callsOf(entries: readonly BriefingEntry[]): Call[] {
     for (const p of m.content) {
       if (p?.type !== "toolCall") continue;
       const r = results.get(String(p.id ?? ""));
-      out.push({ name: String(p.name ?? ""), args: p.arguments ?? {}, id: String(p.id ?? ""), at: Number(m.timestamp ?? e.timestamp),
-        ok: r ? r.ok : null, endedAt: r ? r.at : null });
+      const name = String(p.name ?? "");
+      out.push({ name, args: p.arguments ?? {}, id: String(p.id ?? ""), at: Number(m.timestamp ?? e.timestamp),
+        ok: r ? r.ok : null, endedAt: r ? r.at : null,
+        sends: isSendTool(name) || (!!r && r.ok && sendsReported(r.text).length > 0) });
     }
   }
   return out;
@@ -99,7 +107,7 @@ export interface Behaviour {
 export function summariseBehaviour(entries: readonly BriefingEntry[], o: { wakeAt: number; prior: readonly string[] }): Behaviour {
   const calls = callsOf(entries);
   const prior = new Set(o.prior);
-  const send = calls.findIndex((c) => isSendTool(c.name));
+  const send = calls.findIndex((c) => c.sends);
   const before = send < 0 ? calls : calls.slice(0, send);
   // An inbox read is never among `prior` (`priorCallKeys`), so it never counts as a repeat.
   const repeated = (cs: readonly Call[]) => cs.filter((c) => prior.has(callKey(c.name, c.args))).length;
@@ -116,7 +124,7 @@ export function summariseBehaviour(entries: readonly BriefingEntry[], o: { wakeA
     failedToolCalls: calls.filter((c) => c.ok === false).length,
     toolCallsBeforeSend: before.length,
     recapCallsBeforeSend: before.filter((c) => isRecapTool(c.name)).length,
-    firstAction: !first ? null : isSendTool(first.name) ? "send" : isRecapTool(first.name) ? "recap" : "act",
+    firstAction: !first ? null : first.sends ? "send" : isRecapTool(first.name) ? "recap" : "act",
     repeatedCalls: repeated(calls),
     repeatedBeforeSend: repeated(before),
     priorActions: prior.size,
