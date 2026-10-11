@@ -553,7 +553,8 @@ export function buildBriefing(entries: readonly BriefingEntry[], o: {
       if (!sent) continue;
       const { target, replyTo } = sendPlace(c.args);
       const id = sentId(results.get(c.id)?.text ?? "");
-      const where = replyTo !== null ? ` replied to msg=${tag(replyTo)}${placeOf.has(replyTo) ? ` in ${tag(placeOf.get(replyTo)!)}` : ""}`
+      const place = replyTo === null ? undefined : placeOf.get(replyTo) ?? [...placeOf].find(([m]) => sameMsg(m, replyTo))?.[1];
+      const where = replyTo !== null ? ` replied to msg=${tag(replyTo)}${place !== undefined ? ` in ${tag(place)}` : ""}`
         : target !== null ? ` sent to ${tag(target)}` : " sent";
       out.push({ label: `[${o.conversation} · ${at} · you${where}${id ? ` as msg=${tag(id)}` : ""} with ${c.name}]`, text: sent, kind: "sent" });
     }

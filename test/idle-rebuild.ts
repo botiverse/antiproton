@@ -227,7 +227,7 @@ function damyLike(): BriefingEntry[] {
     wrote("", t + 120 * MIN + 3000),
     user(NOTICE(1), t + 180 * MIN),
     ...callWith("c7", "raft__receive_events", { limit: 9 }, { messages: [line("9299effd", t + 180 * MIN, "你能不能不要创建卡片？"), line("07d599aa", t + 180 * MIN, "你试一下用那个操作行不行？")], hasMore: false, replyTarget: dm }, t + 180 * MIN + 1000),
-    ...callWith("c8", "raft__messages_reply", { message: "9299effd", content: "好的，不再建卡片" },
+    ...callWith("c8", "raft__messages_reply", { message: "9299effd-5c1e-4b1a-9d1e-2f0a7c3b8e11", content: "好的，不再建卡片" },
       { state: "sent", text: `Message sent to ${dm}. Message ID: 0ea6879e-0cb9-44ad-8c97-034a5fb73033` }, t + 180 * MIN + 2000),
     wrote("", t + 180 * MIN + 3000),
   ];
@@ -239,8 +239,9 @@ await check("a Damy-like replay in the real result shapes: sends with their targ
   must(b.text.includes("you sent to dm:@tygg as msg=12eb23a3-a1ac-4423-98b4-1c69a5469c0f from a run_js program]"), `the program's send:\n${b.text}`);
   must(b.text.includes("msg=c986f2d4, read with run_js"), `the program's read (newest read of c986f2d4):\n${b.text}`);
   must(b.text.includes("you sent to dm:@tygg as msg=3639fc29-8d0e-4375-a518-c129fe96890b with raft__actions_prepare]") && b.text.includes("(an action card: channel:create)"), `the card:\n${b.text}`);
-  must(b.text.includes("you replied to msg=9299effd in dm:@tygg as msg=0ea6879e-0cb9-44ad-8c97-034a5fb73033 with raft__messages_reply]"), `the reply:\n${b.text}`);
-  // The reply named 9299effd: it answers that one, not 07d599aa beside it in the same DM.
+  must(b.text.includes("you replied to msg=9299effd-5c1e-4b1a-9d1e-2f0a7c3b8e11 in dm:@tygg as msg=0ea6879e-0cb9-44ad-8c97-034a5fb73033 with raft__messages_reply]"), `the reply:\n${b.text}`);
+  // The reply named 9299effd (by its full id; the inbox showed the short one): it answers that one, not 07d599aa
+  // beside it in the same DM.
   must(b.text.includes("received in dm:@tygg msg=9299effd, read with raft__receive_events · you answered there after it]")
     && b.text.includes("received in dm:@tygg msg=07d599aa, read with raft__receive_events · not answered by you since]"), `answered flags:\n${b.text}`);
   must(b.text.includes("received in dm:@tygg msg=5b2b246d, read with raft__receive_events · you answered there after it]"), "the program's send answers its target");
@@ -517,15 +518,15 @@ await check("a wake lost after its rebuild (its push failed every attempt): the 
   store.seal = async (...a: unknown[]) => { if (broken && rebuilds(w) === 1) throw new Error("storage hiccup"); return seal(...a); };
   w.answer = say("answered");
   must((await push(w, "LOST WAKE")).posted === 0 && rebuilds(w) === 1, "control: rebuilt, then the post failed");
-  // Its last attempt: the row is settled failed, and no push is left.
+  // Its last attempt: the row is settled failed, and no push is left. Storage then recovers: a post would now work.
   w.host.sql.exec("UPDATE inbound_pending SET next_at = 0, attempts = 99");
   const last = await w.rt.deliverPendingInbound(w.tenant, "a");
   must(last.failed === 1 && last.left === 0, `control: the wake was given up: ${show(last)}`);
+  broken = false;
   must(readBackstop(w.host.sql as never).pending !== null, "control: the briefing is still owed");
   for (let i = 0; i < 3; i++) await w.rt.step(w.tenant, "a");
   must(w.sent.length === 3, `the briefing ran alone after its wake was lost: ${w.sent.length - 3} call(s)`);
   // The next push carries it.
-  broken = false;
   must((await push(w, "NEXT WAKE")).posted === 1, "the next push was not posted");
   must(await settle(w) === 1, "the next wake did not make one call");
   const text = textOf(w.calls[3]!.messages[0]);
