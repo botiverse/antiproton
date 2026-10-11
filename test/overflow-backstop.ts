@@ -50,6 +50,10 @@ const refused = (status: number, body: string, jobId?: string) => {
   const e = new ModelRequestRefused(status, body);
   return { ...errorMessage(e.message, identity), providerError: e.turnError, ...(jobId ? { jobId } : {}) };
 };
+/** DeepSeek's refusal for a request of `m` message tokens and a `c` completion budget, in a window of `n`. */
+const splitRefusal = (n: number, m: number, c: number, jobId?: string) => refused(400, JSON.stringify({ error: {
+  message: `This model's maximum context length is ${n} tokens. However, you requested ${m + c} tokens (${m} in the messages, ${c} in the completion). Please reduce the length of the messages or completion.`,
+  type: "invalid_request_error" } }), jobId);
 const usage = { promptTokens: 1, completionTokens: 1, reasoningTokens: 0, cachedPromptTokens: 0 };
 
 // ---- recognising an overflow ---------------------------------------------------------------------------------------
@@ -75,9 +79,15 @@ await check("an overflow is recognised in every shape this deployment is answere
     ["nothing", null],
   ];
   for (const [what, m] of no) must(!isContextOverflowAnswer(m), `read as an overflow: ${what}: ${show(m)}`);
-  const budget = refused(400, JSON.stringify({ error: { message: "This model's maximum context length is 131072 tokens. However, you requested 140000 tokens (107000 in the messages, 33000 in the completion). Please reduce the length of the messages or completion.", type: "invalid_request_error" } }));
-  must(overflowKind(budget) === "output-budget" && !isContextOverflowAnswer(budget), `the output budget read as history: ${overflowKind(budget)}`);
-  must(overflowKind(refused(400, DEEPSEEK_OVERFLOW)) === "history", "control: messages over the window are history");
+  // It fails whenever messages + completion pass the window: a rebuild helps unless the completion budget alone leaves
+  // no room for a rebuilt request (system prompt, tools, briefing).
+  for (const [n, m, c] of [[131072, 100000, 32768], [131072, 131000, 32768], [131072, 107000, 33000], [131072, 139211, 1000]]) {
+    must(overflowKind(splitRefusal(n, m, c)) === "history", `${m} + ${c} over ${n} not read as a history overflow: ${overflowKind(splitRefusal(n, m, c))}`);
+  }
+  const budget = splitRefusal(32768, 2000, 32768);
+  must(overflowKind(budget) === "output-budget" && !isContextOverflowAnswer(budget), `a small window's output budget read as history: ${overflowKind(budget)}`);
+  must(overflowKind(splitRefusal(131072, 100000, 32768), { fixedTokens: 95_000 }) === "output-budget",
+    "a completion budget that leaves no room once the system prompt and tools are counted is the output budget");
 });
 
 // ---- the briefing, as a pure function -------------------------------------------------------------------------------
@@ -183,7 +193,26 @@ await check("the briefing keeps to its budget: the input and the tool calls alwa
   must(b.text.includes("message 39 ") && !b.text.includes("message 0 "), "the newest are not the ones kept");
   must(b.text.endsWith("the wake"), "the wake is not last");
   const huge = buildBriefing([user("w".repeat(100_000), T0)], { conversation: "main", budgetTokens: 1_000, redact: ID });
-  must(huge.tokens <= 1_000 && huge.inputs === 1 && huge.text.includes("(cut at 2000 characters)"), `a huge wake: ${huge.tokens}`);
+  must(huge.tokens <= 1_000 && huge.inputs === 1 && /\(cut at \d+ characters\)$/.test(huge.text), `a huge wake: ${huge.tokens}`);
+});
+
+await check("forty failed wakes, a new one and a reply sent for it: the newest input and the reply are kept, the oldest counted", () => {
+  const entries: BriefingEntry[] = [user("first", T0), wrote("ok", T0 + 1)];
+  for (let i = 0; i < 40; i++) {
+    entries.push(user(`failed wake ${i} ${"p".repeat(1_500)}`, T0 + 1000 * (i + 1)));
+    entries.push(entry({ role: "assistant", content: [], stopReason: "error", errorMessage: "x", timestamp: T0 + 1000 * (i + 1) + 1 }, T0 + 1000 * (i + 1) + 1));
+  }
+  entries.push(user("NEWEST WAKE", T0 + 100_000));
+  entries.push(wrote("", T0 + 100_001, [{ id: "r1", name: "raft__send_message", arguments: { text: "REPLY-TO-NEWEST" } }]));
+  entries.push(result("r1", "raft__send_message", false, "sent", T0 + 100_002));
+  entries.push(entry({ role: "assistant", content: [], stopReason: "error", errorMessage: "x", timestamp: T0 + 100_003 }, T0 + 100_003));
+  const b = buildBriefing(entries, { conversation: "main", redact: ID });
+  must(b.inputs === 41 && b.done === 1, `blocks: ${show(b)}`);
+  must(b.text.includes("NEWEST WAKE") && b.text.includes("failed wake 39 ") && !b.text.includes("failed wake 0 "), `the newest inputs are not the ones kept:\n${b.text.slice(-3000)}`);
+  must(/\(\d+ earlier messages omitted\)/.test(b.text), "the omitted inputs are not counted");
+  must(b.text.endsWith(q("[main · 2026-10-11 14:01Z · you sent with raft__send_message]", "REPLY-TO-NEWEST")), `the reply sent is not kept last:\n${b.text.slice(-800)}`);
+  must(b.text.indexOf("NEWEST WAKE") < b.text.indexOf("Already sent or written"), "the newest input is not before what was sent for it");
+  must(b.tokens <= b.budgetTokens, `over budget: ${b.tokens}`);
 });
 
 await check("a notice the wake carried at its head is left out when its text was recorded", () => {
@@ -404,10 +433,35 @@ await check("a refusal for the output budget alone is not a history overflow: no
   const w = await world();
   w.answer = say("fine");
   await turn(w, "first");
-  const budget = JSON.stringify({ error: { message: "This model's maximum context length is 131072 tokens. However, you requested 140000 tokens (107000 in the messages, 33000 in the completion). Please reduce the length of the messages or completion.", type: "invalid_request_error" } });
-  w.answer = (_c, id) => refused(400, budget, id);
+  // A small window whose whole size is the completion budget: no briefing can make that request fit.
+  w.answer = (_c, id) => splitRefusal(32768, 2000, 32768, id);
   must(await turn(w, "second") === 1, "an output-budget refusal was retried");
   must(currentMainId(w.host.sql as never) === "main" && !traceRows(w, "rebuild.decision").length && !hasTable(w, "overflow_backstop"), "rebuilt for the output budget");
+  // A window 100 tokens wider than the completion budget and a briefing: room only if the system prompt and tools the
+  // failed request carried are not counted, and they are.
+  w.answer = (_c, id) => splitRefusal(32768 + 8000 + 100, 2000, 32768, id);
+  must(await turn(w, "third") === 1 && currentMainId(w.host.sql as never) === "main", "rebuilt into a request the system prompt alone would overflow");
+});
+
+await check("a conversation just under the window, with the completion budget on top: a history overflow, rebuilt", async () => {
+  const w = await world();
+  w.answer = say("fine");
+  await turn(w, "first");
+  w.answer = script((_c, id) => splitRefusal(131072, 130000, 32768, id), say("answered"));
+  must(await turn(w, "second") === 2, "not rebuilt");
+  must(traceRows(w, "rebuild.decision").map((r) => r.status).join() === "ran", "no rebuild row");
+});
+
+await check("when the agent's sealed values cannot be opened, tool arguments are withheld from the briefing", async () => {
+  const w = await world();
+  // A sealed value this runtime has no key to open (no secretKek): the redactor cannot scrub it by exact match.
+  await (w.rt.store as any).putSecret("t", "a", "gh", { ciphertext: "x", iv: "y", account: null, verified: false });
+  w.answer = script(callTool("chat__send_message", { text: "sealed words here" }), say("ok"));
+  await turn(w, "first");
+  w.answer = script(overflow, say("answered"));
+  must(await turn(w, "second") === 2, "control: rebuilt");
+  const brief = textOf(w.calls.at(-1)!.messages[0]);
+  must(!brief.includes("sealed words here") && brief.includes("<withheld>"), `arguments not withheld:\n${brief}`);
 });
 
 await check("needs_reset: the sender is told once, posts are refused, an operator reset clears it and answers the input", async () => {
@@ -527,12 +581,14 @@ await check("a briefing whose post fails stays pending, is posted on a later pas
   }
   await w.rt.step("t", "a");
   must(readBackstop(w.host.sql as never).pending !== null && mainSessions(w.host.sql as never).length === 2, "the briefing was not kept pending");
-  // A typed message lands before the retry: it carries the briefing first, once.
-  await w.rt.postMessage("t", "a", "typed meanwhile", "steer", "main");
+  // A follow-up lands before the retry: it carries the briefing first, once, and starts the run (an idle follow-up
+  // would start none, and the briefing would sit unread).
+  const landed = await w.rt.postMessage("t", "a", "a follow-up", "followUp", "main");
+  must(landed.mode === "prompt" && readBackstop(w.host.sql as never).pending === null, `the follow-up: ${show(landed.mode)}`);
   must(await settle(w) === 1, "the rebuilt call");
   const msgs = w.calls.at(-1)!.messages;
   const text = textOf(msgs[0]);
-  must(msgs.length === 1 && text.includes("\n\nsecond") && text.endsWith("typed meanwhile") && readBackstop(w.host.sql as never).pending === null, `the first message:\n${text}`);
+  must(msgs.length === 1 && text.startsWith("Messages before") && text.includes("\n\nsecond") && text.endsWith("a follow-up"), `the first message:\n${text}`);
 });
 
 await check("an overflow while a push is being handed over waits for that push's run, and is judged with it", async () => {

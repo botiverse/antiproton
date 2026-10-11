@@ -64,7 +64,9 @@ const NOT_OVERFLOW = [/rate limit/i, /too many requests/i, /tokens per min/i];
 /**
  * The OpenAI-compatible refusal that splits the request: "maximum context length is N tokens. However, you requested T
  * tokens (M in the messages, C in the completion)" (DeepSeek, vLLM), or "(M in your prompt; C for the completion)"
- * (OpenAI's older text). When M is under N the history fits and it is the output budget that does not.
+ * (OpenAI's older text). It fails whenever M + C > N, so M under N does not mean the history fits: only the output
+ * budget C says whether a rebuild can help. When C alone leaves no room for the smallest request a rebuild sends
+ * (system prompt, tools and a briefing), no rebuild can, and it is the output budget that does not fit.
  */
 const SPLIT = /maximum context length is ([\d,]+) tokens[\s\S]*?\(([\d,]+) in (?:the messages|your prompt)[,;] ([\d,]+) (?:in|for) the completion\)/i;
 
@@ -78,7 +80,7 @@ export type OverflowKind = "history" | "output-budget";
  * `callQueuedModel`). Only a failed answer counts; a successful one is never read as an overflow by its usage, since a
  * window figure this deployment assumes could be wrong and would then rebuild a conversation that was working.
  */
-export function overflowKind(m: unknown): OverflowKind | null {
+export function overflowKind(m: unknown, o: { fixedTokens?: number; budgetTokens?: number } = {}): OverflowKind | null {
   const a = m as { stopReason?: unknown; errorMessage?: unknown; providerError?: unknown } | null;
   if (a?.stopReason !== "error") return null;
   const texts = [a.providerError, a.errorMessage].filter((t): t is string => typeof t === "string" && t.length > 0);
@@ -88,7 +90,7 @@ export function overflowKind(m: unknown): OverflowKind | null {
   const n = (s: string) => Number(s.replace(/,/g, ""));
   for (const t of over) {
     const split = SPLIT.exec(t);
-    if (split && n(split[2]!) < n(split[1]!)) return "output-budget";
+    if (split && n(split[3]!) >= n(split[1]!) - (o.fixedTokens ?? 0) - (o.budgetTokens ?? BRIEFING_BUDGET_TOKENS)) return "output-budget";
   }
   return "history";
 }
@@ -406,11 +408,25 @@ export function buildBriefing(entries: readonly BriefingEntry[], o: {
   const done: string[] = [];
   for (let i = from; i < msgs.length; i++) if (msgs[i]!.message.role !== "user") for (const s of said(i)) if (s.text.trim()) done.push(quote(s.label, redactText(s.text)));
 
+  // The input and what was done for it take up to half the budget. What was already sent is kept whole, since leaving
+  // it out is what would have the agent send it again; then the inputs, newest first, and the oldest that do not fit
+  // are counted rather than quoted. The newest is always there, cut if it alone is too long.
   const budgetChars = budgetTokens * CHARS_PER_TOKEN;
-  const tail = cut([
-    inputs.join("\n\n"),
-    ...(done.length ? [`Already sent or written for the message${inputs.length > 1 ? "s" : ""} above, in order:\n\n${done.join("\n\n")}`] : []),
-  ].filter(Boolean).join("\n\n---\n\n"), Math.floor(budgetChars / 2));
+  const doneBlock = done.length ? `Already sent or written for the message${inputs.length > 1 ? "s" : ""} above, in order:\n\n${done.join("\n\n")}` : "";
+  let room = Math.floor(budgetChars / 2) - doneBlock.length - (doneBlock ? 7 : 0) - 60;
+  const keptInputs: string[] = [];
+  for (let i = inputs.length - 1; i >= 0; i--) {
+    const t = inputs[i]!;
+    if (!keptInputs.length) { const c = cut(t, Math.max(200, room - 40)); keptInputs.unshift(c); room -= c.length + 2; continue; }
+    if (t.length + 2 > room) break;
+    keptInputs.unshift(t);
+    room -= t.length + 2;
+  }
+  const omitted = inputs.length - keptInputs.length;
+  const tail = [
+    [...(omitted ? [`(${omitted} earlier message${omitted > 1 ? "s" : ""} omitted)`] : []), ...keptInputs].join("\n\n"),
+    doneBlock,
+  ].filter(Boolean).join("\n\n---\n\n");
   const parts = (history: string[]) => [
     ...(history.length ? [`Messages before ${inputs.length > 1 ? "the ones" : "the one"} below in this conversation, newest first:\n\n${history.join("\n\n")}`] : []),
     ...(actionLines.length ? [`Your most recent tool calls, newest first:\n${actionLines.join("\n")}`] : []),
@@ -586,6 +602,19 @@ export function hasAnswer(entries: readonly BriefingEntry[]): boolean {
 export function requestTokens(sql: Sql, jobId: string): number | null {
   const r = sql.exec("SELECT length(request) AS n FROM pi_model_jobs WHERE id = ?", jobId).toArray()[0] as any;
   return r ? Math.ceil(Number(r.n) / CHARS_PER_TOKEN) : null;
+}
+
+/**
+ * What every request of a conversation carries before its messages, in estimated tokens: the failed job's system
+ * prompt and tool list, which a rebuilt request carries too. Zero when the job is not found.
+ */
+export function requestFixedTokens(sql: Sql, jobId: string): number {
+  const r = sql.exec("SELECT request FROM pi_model_jobs WHERE id = ?", jobId).toArray()[0] as any;
+  if (!r) return 0;
+  try {
+    const c = JSON.parse(String(r.request))?.context ?? {};
+    return estimateTokens(String(c.systemPrompt ?? "") + JSON.stringify(c.tools ?? []));
+  } catch { return 0; }
 }
 
 /** The main conversation's newest model call still out, if any: its id. */

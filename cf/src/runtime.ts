@@ -39,7 +39,7 @@ import {
 import { explainUnavailableTool } from "../../src/runtime/unavailable-tool.ts";
 import {
   bindingKey, buildBriefing, clearBackstop, conversationMessages, hasAnswer, judgeOverflow, mainCallOut, mainMessages, mainTip, needsReset, noteRebuilt,
-  noteRunEndedWell, noticeHeads, overflowKind, readBackstop, recordBackstop, recordNoticeHead, requestTokens, returnPendingBriefing,
+  noteRunEndedWell, noticeHeads, overflowKind, readBackstop, recordBackstop, recordNoticeHead, requestFixedTokens, requestTokens, returnPendingBriefing,
   SessionNeedsReset, takePendingBriefing, type Briefing, type Judge,
 } from "../../src/runtime/overflow-backstop.ts";
 import { credentialRedactor, agentSecretValues } from "./eval-read.ts";
@@ -3538,7 +3538,10 @@ export class AgentRuntime {
     };
     // A rebuilt transcript's briefing not yet posted is the first thing it holds, whichever post comes first: taken
     // here, in the synchronous step before the write, and put back if the write does not happen.
+    // A follow-up starts no run on an idle lane (as for the notices above), and a lane owed a briefing is idle: carried
+    // as a follow-up, the briefing would sit unread behind it. So a post that carries it is a prompt, whatever it asked.
     const brief = backstop ? takePendingBriefing(this.#deps.ctx.storage.sql) : null;
+    if (brief !== null && mode === "followUp") mode = "prompt";
     if (opts.pendingOnly && brief === null) {
       // Another post carried it already: nothing is written.
       await giveBack();
@@ -3799,7 +3802,8 @@ export class AgentRuntime {
    * Once per run that ended on an overflow, and bounded (`judgeOverflow`): when the rebuilt conversation's request
    * overflows again, or overflows come `MAX_CONSECUTIVE_OVERFLOWS` in a row, the session is marked `needs_reset` instead
    * and nothing is retried. A run that ended on anything else resets the count. A request refused only for its output
-   * budget (`overflowKind` `output-budget`) is not rebuilt: the history fits, and a briefing would not change that.
+   * budget (`overflowKind` `output-budget`: the completion budget alone leaves no room for a rebuilt request) is not
+   * rebuilt, since no briefing could make it fit.
    * Not while a push is being handed over: renaming the transcript under a post in flight could leave it on the closed
    * harness; that post's run ends the same way, and is judged then. A briefing whose post failed is posted again here.
    */
@@ -3807,7 +3811,8 @@ export class AgentRuntime {
     const storage = this.#deps.ctx.storage, sql = storage.sql;
     if (readBackstop(sql).pending !== null) return this.#postBriefing(tenantId, agentId);
     const tip = mainTip(sql);
-    const kind = tip ? overflowKind(tip.message) : null;
+    const failedJob = tip?.message?.stopReason === "error" && typeof tip.message.jobId === "string" ? tip.message.jobId as string : null;
+    const kind = tip ? overflowKind(tip.message, { fixedTokens: failedJob ? requestFixedTokens(sql, failedJob) : 0 }) : null;
     if (kind !== "history") {
       if (kind === "output-budget") logEvent("overflow.output_budget", { tenantId, agentId, job: tip?.message?.jobId ?? null });
       else if (tip?.message?.role === "assistant" && tip.message.stopReason !== "error") noteRunEndedWell(sql);

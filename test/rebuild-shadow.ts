@@ -280,9 +280,11 @@ await check("a push into a running turn is not a wake: no decision", async () =>
 });
 
 /** A request with what differs between two runs by construction (clock, ids) folded: the clock in an overflow
- *  briefing's labels too (src/runtime/overflow-backstop.ts), which quotes message times. */
+ *  briefing's labels too (src/runtime/overflow-backstop.ts `buildBriefing`), `[conversation · time · source]` and a
+ *  tool line's `- time name`, and nowhere else. */
+const BRIEFING_TIME = /(\[[^\]\n]* · )\d{4}-\d\d-\d\d \d\d:\d\dZ( · [^\]\n]*\])|(^- )\d{4}-\d\d-\d\d \d\d:\d\dZ( )/gm;
 const normal = (c: Ctx) => JSON.stringify(c, (k, v) => (k === "timestamp" ? 0 : k === "jobId" || k === "responseId" ? "id"
-  : typeof v === "string" ? v.replace(/\d{4}-\d\d-\d\d \d\d:\d\dZ/g, "T") : v));
+  : typeof v === "string" ? v.replace(BRIEFING_TIME, (_m, a, b, c2, d) => a !== undefined ? `${a}T${b}` : `${c2}T${d}`) : v));
 
 await check("shadow mode alters no model input: every request is byte-identical with the decision recorded and without it", async () => {
   const run = async (policy: RebuildPolicy | null) => {
