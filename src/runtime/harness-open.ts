@@ -9,6 +9,8 @@
  *   key-change     a cached harness was refused because `harnessKey` moved; `changed` names what did.
  *   dropped        `dropHarnesses` (or an engine migration) closed it on purpose; `detail` says who asked.
  *   fresh-context  a fresh context ended the conversation the old harness was built on.
+ *   rebuild        the overflow backstop continued the conversation in a new transcript (src/runtime/overflow-backstop.ts);
+ *                  `detail` says the rebuild's trigger and strategy and the transcript it replaced.
  *
  * Each conversation's last open is kept in `harness_opens`, next to the agent's own tables, because the two facts a
  * reason needs outlive the runtime that knew them: a restart drops its harnesses and then the runtime itself
@@ -23,7 +25,9 @@ import { appendTrace, type TraceRow } from "../trace/outbox.ts";
 
 type Sql = { exec(query: string, ...bindings: unknown[]): { toArray(): any[] } };
 
-export type HarnessOpenReason = "cold-start" | "key-change" | "dropped" | "fresh-context";
+export type HarnessOpenReason = "cold-start" | "key-change" | "dropped" | "fresh-context" | "rebuild";
+/** The reasons a drop leaves for the next open to read. */
+export type HarnessDropReason = "dropped" | "fresh-context" | "rebuild";
 /** For a cold start: `deploy` when the Worker version moved since the last open, `evicted` when it did not (any
  *  rebuild of the runtime inside one version reads so), `first` for a conversation never opened, `unknown` when either
  *  version is not known (no version metadata binding). */
@@ -67,7 +71,7 @@ export function harnessKeyChange(before: string, after: string): HarnessKeyPart[
  * Note on every conversation of `owner` (`<tenant>/<agent>`) that its next open is because of this drop. A
  * conversation never opened has no row and needs none: its next open is a first one.
  */
-export function markHarnessDrop(sql: Sql, owner: string, reason: "dropped" | "fresh-context", detail: string | null) {
+export function markHarnessDrop(sql: Sql, owner: string, reason: HarnessDropReason, detail: string | null) {
   sql.exec(TABLE);
   const prefix = `${owner}#`;
   sql.exec("UPDATE harness_opens SET pending_reason = ?, pending_detail = ? WHERE substr(conversation_key, 1, ?) = ?",
@@ -101,7 +105,7 @@ export function harnessOpenAttrs(prev: { at: number; built_from: string; version
   const changed = prev ? harnessKeyChange(String(prev.built_from), o.builtFrom) : [];
   let reason: HarnessOpenReason;
   let cause: ColdStartCause | undefined;
-  if (prev?.pending_reason === "dropped" || prev?.pending_reason === "fresh-context") reason = prev.pending_reason;
+  if (prev?.pending_reason === "dropped" || prev?.pending_reason === "fresh-context" || prev?.pending_reason === "rebuild") reason = prev.pending_reason;
   else if (o.replaced !== null) reason = "key-change";
   else {
     reason = "cold-start";

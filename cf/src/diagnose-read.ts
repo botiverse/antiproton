@@ -21,6 +21,8 @@ import { hasTable, readEntries, readTranscript, sessionFor } from "./transcript-
 import { isPd, readModelJobs } from "./engine-read.ts";
 import { pdUsageDrift } from "../../src/runtime/pd-outbox.ts";
 import { trajectory } from "./ui.ts";
+import { logicalMain, mainSessions } from "./fresh-context.ts";
+import { readBackstop } from "../../src/runtime/overflow-backstop.ts";
 import type { MountReports } from "./mount-reports.ts";
 import { worthReporting } from "./mount-reports.ts";
 
@@ -189,6 +191,19 @@ export async function readDiagnosis(
       seq: e.sequence, kind: e.kind, detail: JSON.stringify(e.payload).slice(0, 220),
     })),
     backgroundJobs: hasTable(sql, "background_jobs") ? recentBackgroundJobs(sql, owner, 10) : [],
+    // The main conversation as the agent knows it. The overflow backstop (src/runtime/overflow-backstop.ts) continues
+    // it in a new transcript, so each transcript since it began is listed with why it began, and `needsReset` is set
+    // once the backstop gave up: pushes are then refused until an operator starts a fresh context.
+    mainConversation: (() => {
+      const chain = logicalMain(sql);
+      const rows = mainSessions(sql).filter((m) => chain.transcripts.includes(m.sessionId));
+      const b = readBackstop(sql);
+      return {
+        conversation: chain.conversation, rebuilds: chain.rebuilds,
+        transcripts: rows.map((m) => ({ id: m.sessionId, cause: m.cause, startedAt: m.startedAt, endedAt: m.endedAt })),
+        needsReset: b.needsReset, consecutiveOverflows: b.consecutive, lastRebuildAt: b.lastRebuildAt,
+      };
+    })(),
     alarm: await deps.alarm(),
     state: { ...(hasState ? await store.stateUsage(tenantId, agentId) : { keys: 0, bytes: 0 }), docs },
     alarmFailures: Number(rows(sql, "counters2", "SELECT v FROM counters2 WHERE k='alarmFailures'")[0]?.v ?? 0),

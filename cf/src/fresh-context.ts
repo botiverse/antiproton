@@ -23,6 +23,7 @@ import { BRANCH_SUMMARY_PREFIX, COMPACTION_SUMMARY_PREFIX } from "@earendil-work
 import { canonJson } from "../../src/core/canon-json.ts";
 import { isSeedLine, unfencedLines, WORKING_SET } from "../../src/plugins/state.ts";
 import { ensurePiTables, MAIN_SESSION, piTables } from "../../src/store/pi-storage.ts";
+import { clearBackstop } from "../../src/runtime/overflow-backstop.ts";
 import { sha256Hex } from "../../src/store/seed-files.ts";
 
 type Sql = { exec(query: string, ...bindings: unknown[]): { toArray(): any[] } };
@@ -51,16 +52,47 @@ export function currentMainId(sql: Sql): string {
   return r ? String(r.session_id) : FIRST_MAIN_ID;
 }
 
-export interface MainSessionRow { sessionId: string; generation: number; current: boolean; startedAt: number | null; endedAt: number | null }
+/**
+ * Why a main conversation's transcript began: `fresh-context`, an operator's new conversation, or `rebuild`, the
+ * overflow backstop's new transcript for the SAME conversation (src/runtime/overflow-backstop.ts). Null for the first
+ * one, and for rows written before the cause was.
+ */
+export type MainCause = "fresh-context" | "rebuild";
+
+export interface MainSessionRow {
+  sessionId: string; generation: number; current: boolean; startedAt: number | null; endedAt: number | null;
+  cause: MainCause | null;
+}
 
 /** Every main conversation the agent has had, oldest first; the first one, before any fresh context, included. */
 export function mainSessions(sql: Sql): MainSessionRow[] {
-  const got = rows(sql, "SELECT generation, session_id, started_at, ended_at FROM main_sessions ORDER BY generation").map((r) => ({
+  // A table written before the cause was has no such column; a read does not add it.
+  let read: any[];
+  try { read = rows(sql, "SELECT generation, session_id, started_at, ended_at, cause FROM main_sessions ORDER BY generation"); }
+  catch (e) {
+    if (!/no such column/i.test(String((e as Error)?.message ?? e))) throw e;
+    read = rows(sql, "SELECT generation, session_id, started_at, ended_at FROM main_sessions ORDER BY generation");
+  }
+  const got = read.map((r) => ({
     sessionId: String(r.session_id), generation: Number(r.generation), current: r.ended_at === null || r.ended_at === undefined,
     startedAt: r.started_at === null || r.started_at === undefined ? null : Number(r.started_at),
     endedAt: r.ended_at === null || r.ended_at === undefined ? null : Number(r.ended_at),
+    cause: r.cause === "rebuild" || r.cause === "fresh-context" ? r.cause as MainCause : null,
   }));
-  return got.length ? got : [{ sessionId: FIRST_MAIN_ID, generation: 0, current: true, startedAt: null, endedAt: null }];
+  return got.length ? got : [{ sessionId: FIRST_MAIN_ID, generation: 0, current: true, startedAt: null, endedAt: null, cause: null }];
+}
+
+/**
+ * The main conversation as the agent and its readers know it: a rebuild continues the conversation it replaced, so
+ * this is the id of the newest transcript that did not begin as a rebuild, and `transcripts` every id since, oldest
+ * first (the current one last).
+ */
+export function logicalMain(sql: Sql): { conversation: string; transcripts: string[]; rebuilds: number } {
+  const all = mainSessions(sql);
+  let i = all.length - 1;
+  while (i > 0 && all[i]!.cause === "rebuild") i--;
+  const chain = all.slice(i).map((r) => r.sessionId);
+  return { conversation: chain[0]!, transcripts: chain, rebuilds: chain.length - 1 };
 }
 
 /**
@@ -82,10 +114,13 @@ const archivedName = (id: string) => `archived:${id}`;
  * name and the new main tables' `CREATE INDEX IF NOT EXISTS` would otherwise find it taken), and the row of each id
  * written. The caller has made sure nothing is running (`AgentRuntime.freshContext`).
  */
-export function startFreshMain(host: Host, now: number): { oldSessionId: string; newSessionId: string } {
+export function startFreshMain(host: Host, now: number, cause: MainCause = "fresh-context"): { oldSessionId: string; newSessionId: string } {
   const sql = host.sql;
   const run = () => {
     sql.exec(MAIN_SESSIONS);
+    try { sql.exec("ALTER TABLE main_sessions ADD COLUMN cause TEXT"); } catch { /* already there */ }
+    // An operator's fresh context starts over; a rebuild keeps the backstop's count, which is what bounds it.
+    if (cause === "fresh-context") clearBackstop(sql as never);
     ensurePiTables(sql, MAIN_SESSION);
     const oldSessionId = currentMainId(sql);
     const last = Number(sql.exec("SELECT COALESCE(MAX(generation), 0) AS g FROM main_sessions").toArray()[0]?.g ?? 0);
@@ -104,7 +139,7 @@ export function startFreshMain(host: Host, now: number): { oldSessionId: string;
     ensurePiTables(sql, MAIN_SESSION);
     sql.exec("INSERT OR IGNORE INTO main_sessions(generation, session_id, started_at) VALUES (0, ?, NULL)", FIRST_MAIN_ID);
     sql.exec("UPDATE main_sessions SET ended_at = ?, archived_as = ? WHERE session_id = ?", now, archive, oldSessionId);
-    sql.exec("INSERT INTO main_sessions(generation, session_id, started_at) VALUES (?, ?, ?)", generation, newSessionId, now);
+    sql.exec("INSERT INTO main_sessions(generation, session_id, started_at, cause) VALUES (?, ?, ?, ?)", generation, newSessionId, now, cause);
     return { oldSessionId, newSessionId };
   };
   return host.transactionSync ? host.transactionSync(run) : run();
