@@ -531,11 +531,11 @@ that is a context overflow, or a pd compaction that ran) or `operator` (a manual
 Its `rebuild.outcome` row (`parentId` the decision's `spanId`, `spanId` the model job) is the next call measured:
 `input`, `cacheRead`, `hitRate`, and `status` `agree`, `false-cold`, `false-warm` (`predictedCold` against the
 measurement), `expected-cold` (cold by construction, out of the rate) or `unmeasured` (an error, or no input).
-One cold-wake rule is acted on: a wake more than `idleMinutes` (60) after the conversation's last answered call, on a
+One cold-wake rule is acted on: a wake more than `idleMinutes` (50) after the conversation's last answered call, on a
 context over `minContextTokens` (8,000, the briefing's size), is rebuilt before it is answered — a new transcript of
 the same conversation whose first message is a briefing, the wake after it. The rule is per model, in
 `REBUILD_POLICY`'s `idle` section: `{ "default": {…}, "byModel": { "<model id, or a part of it>": {…} } }` (an exact
-id first, else the longest key the id contains; the defaults name `deepseek` and `gpt-5.6-luna`, both 60 minutes and
+id first, else the longest key the id contains; the defaults name `deepseek` and `gpt-5.6-luna`, both 50 minutes and
 8,000 tokens); `"idleMinutes": null` turns one model's off, `"idle": false` all of them. A partial policy is laid
 over the default (`{"idle": false}` alone is the kill switch), and a policy that is refused leaves the default shadow
 rules with idle rebuilds off. Its decision is that wake's

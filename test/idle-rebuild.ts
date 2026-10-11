@@ -40,11 +40,11 @@ const MIN = 60_000;
 const DS = "deepseek-flash", LUNA = "openai/gpt-5.6-luna";
 const off = (model: string): RebuildPolicy => ({ ...DEFAULT_REBUILD_POLICY, idle: { ...DEFAULT_IDLE_POLICY, byModel: { ...DEFAULT_IDLE_POLICY.byModel, [model]: { idleMinutes: null, minContextTokens: 8_000 } } } });
 const table: Array<[string, { gapMs: number | null; contextTokens: number | null; model?: string }, RebuildPolicy, boolean, string, string]> = [
-  ["deepseek: 61 minutes on a large context", { gapMs: 61 * MIN, contextTokens: 200_000 }, DEFAULT_REBUILD_POLICY, true, "idle-over-limit", "byModel:deepseek"],
-  ["luna: 61 minutes on a large context", { gapMs: 61 * MIN, contextTokens: 200_000, model: LUNA }, DEFAULT_REBUILD_POLICY, true, "idle-over-limit", "byModel:gpt-5.6-luna"],
-  ["another model: the default entry", { gapMs: 61 * MIN, contextTokens: 200_000, model: "m1" }, DEFAULT_REBUILD_POLICY, true, "idle-over-limit", "default"],
-  ["59 minutes", { gapMs: 59 * MIN, contextTokens: 200_000 }, DEFAULT_REBUILD_POLICY, false, "gap-under-idle", "byModel:deepseek"],
-  ["exactly 60 minutes is not over it", { gapMs: 60 * MIN, contextTokens: 200_000 }, DEFAULT_REBUILD_POLICY, false, "gap-under-idle", "byModel:deepseek"],
+  ["deepseek: 51 minutes on a large context", { gapMs: 51 * MIN, contextTokens: 200_000 }, DEFAULT_REBUILD_POLICY, true, "idle-over-limit", "byModel:deepseek"],
+  ["luna: 51 minutes on a large context", { gapMs: 51 * MIN, contextTokens: 200_000, model: LUNA }, DEFAULT_REBUILD_POLICY, true, "idle-over-limit", "byModel:gpt-5.6-luna"],
+  ["another model: the default entry", { gapMs: 51 * MIN, contextTokens: 200_000, model: "m1" }, DEFAULT_REBUILD_POLICY, true, "idle-over-limit", "default"],
+  ["49 minutes", { gapMs: 49 * MIN, contextTokens: 200_000 }, DEFAULT_REBUILD_POLICY, false, "gap-under-idle", "byModel:deepseek"],
+  ["exactly 50 minutes is not over it", { gapMs: 50 * MIN, contextTokens: 200_000 }, DEFAULT_REBUILD_POLICY, false, "gap-under-idle", "byModel:deepseek"],
   ["a context no larger than a briefing", { gapMs: 3 * 60 * MIN, contextTokens: 8_000 }, DEFAULT_REBUILD_POLICY, false, "context-below-briefing", "byModel:deepseek"],
   ["a context just over a briefing", { gapMs: 3 * 60 * MIN, contextTokens: 8_001 }, DEFAULT_REBUILD_POLICY, true, "idle-over-limit", "byModel:deepseek"],
   ["no answered call yet", { gapMs: null, contextTokens: null }, DEFAULT_REBUILD_POLICY, false, "no-previous-call", "byModel:deepseek"],
@@ -64,7 +64,7 @@ for (const [name, f, policy, rebuild, reason, entry] of table) {
 }
 
 await check("rebuildPolicyOf — partial policies are laid over the default; a refused one turns idle rebuilds off", () => {
-  must(DEFAULT_IDLE_RULE.idleMinutes === 60 && DEFAULT_IDLE_RULE.minContextTokens === 8_000, `default: ${show(DEFAULT_IDLE_RULE)}`);
+  must(DEFAULT_IDLE_RULE.idleMinutes === 50 && DEFAULT_IDLE_RULE.minContextTokens === 8_000, `default: ${show(DEFAULT_IDLE_RULE)}`);
   // The kill switch alone: shadow rules as the default's, idle off.
   const kill = rebuildPolicyOf('{"idle":false}');
   must(kill?.idle === false && kill.rules === DEFAULT_REBUILD_POLICY.rules && kill.fallback === DEFAULT_REBUILD_POLICY.fallback, `{"idle":false}: ${show(kill)}`);
@@ -328,14 +328,14 @@ async function primed(w: World, gapMs: number, contextTokens = 200_000) {
   age(w, gapMs);
 }
 
-await check("61 minutes on a large context: rebuilt before it is answered — the request starts with the briefing and ends with the wake; one decision, its outcome, its behaviour", async () => {
+await check("51 minutes on a large context: rebuilt before it is answered — the request starts with the briefing and ends with the wake; one decision, its outcome, its behaviour", async () => {
   const w = await world();
   await primed(w, 5 * MIN);
   // A warm wake in between, measured: the previous wake's hit rate and gap the rebuild's row carries.
   w.answer = say("warm");
   must((await push(w, "WARM WAKE")).posted === 1 && await settle(w) === 1, "control: the warm wake");
   must(coldWakes(w).at(-1)!.attrs.idleRebuild === "gap-under-idle", `control: the warm wake was not rebuilt: ${show(coldWakes(w).at(-1))}`);
-  age(w, 61 * MIN);
+  age(w, 51 * MIN);
   const decidedBefore = coldWakes(w).length;
   w.promptTokens = 3_000;
   w.answer = script(callTool("state__get", { key: "notes" }), callTool("chat__send_message", { text: "answer" }), say("sent"));
@@ -358,11 +358,12 @@ await check("61 minutes on a large context: rebuilt before it is answered — th
   must(decided.length === 1, `one cold-wake decision for the wake, not ${decided.length}: ${show(decided)}`);
   const d = decided[0]!, a = d.attrs;
   must(d.status === "ran" && a.shadow === false && a.acted === true && a.strategy === "briefing" && a.reason === "idle-over-limit" && a.rule === "idle", `decision: ${show(d)}`);
-  must(a.gapMs >= 61 * MIN && a.gapMs < 62 * MIN && a.contextTokens === 200_000 && a.idleMs === 60 * MIN && a.minContextTokens === 8_000, `facts: ${show(a)}`);
+  must(a.gapMs >= 51 * MIN && a.gapMs < 52 * MIN && a.contextTokens === 200_000 && a.idleMs === 50 * MIN && a.minContextTokens === 8_000, `facts: ${show(a)}`);
   must(a.conversation === "main" && a.to === "main.1" && a.logicalConversation === "main" && a.provider && a.model === "deepseek-flash", `ids: ${show(a)}`);
   must(a.budgetTokens === 8_000 && a.briefingTokens > 0 && a.briefingTokens <= 8_000 && a.messages >= 2 && a.actions === 2 && a.inputs === 0, `briefing: ${show(a)}`);
-  must(a.idleEntry === "byModel:deepseek" && a.predictedCold === true && a.shadowReason === "gap-over-limit" && a.shadowRule === "deepseek", `prediction: ${show(a)}`);
-  // The warm wake's measurement (200k sent, none of it cached) and its gap (5 minutes), as the shadow rows read them.
+  must(a.idleEntry === "byModel:deepseek" && a.predictedCold === true && a.shadowReason === "previous-wake-cold" && a.shadowRule === "deepseek", `prediction: ${show(a)}`);
+  // The warm wake's measurement (200k sent, none of it cached) and its gap (5 minutes), as the shadow rows read them;
+  // at 51 minutes the shadow's own gap rule (an hour) is not past, so it predicts cold from that measurement.
   must(a.prevWakeHitRate === 0 && a.prevWakeGapMs >= 5 * MIN && a.prevWakeGapMs < 6 * MIN, `the previous wake: ${show(a)}`);
   const o = rows(w, "rebuild.outcome").filter((r) => r.parentId === d.spanId);
   must(o.length === 1 && o[0]!.attrs.input === 3_000 && o[0]!.attrs.hitRate === 0 && o[0]!.status === "expected-cold", `outcome: ${show(o)}`);
@@ -389,7 +390,7 @@ await check("61 minutes on a large context: rebuilt before it is answered — th
 
 await check("an alarm's step while the wake is being posted leaves the briefing to that post: no run on the briefing alone", async () => {
   const w = await world();
-  await primed(w, 61 * MIN);
+  await primed(w, 51 * MIN);
   // `seal` is awaited inside the wake's post after the rebuild and before the post takes the briefing: a step there is
   // the alarm that lands in between.
   const store = w.rt.store as unknown as { seal: (...a: unknown[]) => Promise<unknown> };
@@ -413,7 +414,7 @@ await check("an alarm's step while the wake is being posted leaves the briefing 
 
 await check("a wake whose post fails after its rebuild: the briefing waits for the push's retry, which carries it; one decision, one run", async () => {
   const w = await world();
-  await primed(w, 61 * MIN);
+  await primed(w, 51 * MIN);
   const store = w.rt.store as unknown as { seal: (...a: unknown[]) => Promise<unknown> };
   const seal = store.seal.bind(store);
   let failed = 0;
@@ -461,7 +462,7 @@ const normal = (c: Ctx) => JSON.stringify(c, (k, v) => (k === "timestamp" ? 0 : 
   : typeof v === "string" ? v.replace(/call_mj_[a-z0-9]+/g, "call") : v));
 
 for (const [what, gap, ctx, why] of [
-  ["59 minutes on a large context", 59 * MIN, 200_000, "gap-under-idle"],
+  ["49 minutes on a large context", 49 * MIN, 200_000, "gap-under-idle"],
   ["three hours on a small context", 3 * 60 * MIN, 5_000, "context-below-briefing"],
 ] as const) {
   await check(`${what}: not rebuilt, the shadow row says why, and every request is byte-identical with no policy at all`, async () => {
@@ -478,7 +479,7 @@ for (const [what, gap, ctx, why] of [
     const on = await run(DEFAULT_REBUILD_POLICY), off = await run(null);
     must(on.rebuilds === 0, `rebuilt: ${on.rebuilds}`);
     // Past the idle time and not rebuilt: in the comparison group, with its run's numbers; under it (and no sample), none.
-    if (gap > 60 * MIN) {
+    if (gap > 50 * MIN) {
       const b = on.behaviour;
       must(b.length === 1 && b[0]!.attrs.rebuilt === false && b[0]!.attrs.group === "idle-not-rebuilt" && b[0]!.attrs.idleReason === why
         && b[0]!.parentId === on.decided.at(-1)!.spanId && b[0]!.attrs.sent === true && b[0]!.attrs.toolCalls === 1 && b[0]!.attrs.modelCalls === 2

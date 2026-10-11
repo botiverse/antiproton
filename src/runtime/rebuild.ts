@@ -115,8 +115,8 @@ const HOUR_MS = 60 * 60_000;
 export const DEFAULT_MIN_CONTEXT_TOKENS = 128_000;
 export const DEFAULT_WINDOW_SHARE = 0.8;
 
-/** Rebuild a wake after an hour idle when the context is larger than a briefing (tygg, 2026-10-11). */
-export const DEFAULT_IDLE_RULE: IdleRule = { idleMinutes: 60, minContextTokens: BRIEFING_BUDGET_TOKENS };
+/** Rebuild a wake after 50 minutes idle when the context is larger than a briefing (tygg, 2026-10-11). */
+export const DEFAULT_IDLE_RULE: IdleRule = { idleMinutes: 50, minContextTokens: BRIEFING_BUDGET_TOKENS };
 /** The two model families in production named on their own, so each can be tuned or turned off apart. */
 export const DEFAULT_IDLE_POLICY: IdlePolicy = {
   default: DEFAULT_IDLE_RULE,
