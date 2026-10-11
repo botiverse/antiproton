@@ -16,7 +16,7 @@ import { DEFAULT_PROVIDER, providerFor, type ModelChoice, type ModelProviders } 
 import { DurableObjectStore } from "../../src/store/durable-object.ts";
 import { DynamicWorkerExecutor } from "../../src/runtime/dynamic-worker-executor.ts";
 import type { AgentEngine } from "../../src/runtime/engine.ts";
-import { PiAgent, ensureAgentTables, jobSession, sessionsWithWork, markSession } from "../../src/runtime/pi-agent.ts";
+import { PiAgent, ensureAgentTables, jobSession, sessionsWithWork, markSession, mainBusy } from "../../src/runtime/pi-agent.ts";
 import { DurableAgent, PdHost, recordedEngine } from "../../src/runtime/durable-agent.ts";
 import { busyReason, clientCallsWaiting, migrateToPd, revertToPi085, type MigrationResult, type RevertResult } from "../../src/runtime/pd-migrate.ts";
 import { sealSeedFiles, seedInline, sha256Hex, type SealHow, type SeedMode, type SeedWriteResult } from "../../src/store/seed-files.ts";
@@ -104,7 +104,8 @@ import {
 } from "../../src/runtime/inbound.ts";
 import type { InboundEvent, InboundHooks } from "../../src/plugins/types.ts";
 import { INBOUND_HOOKS_PER_MOUNT } from "../../src/plugins/types.ts";
-import { MAIN_SESSION } from "../../src/store/pi-storage.ts";
+import { CONTEXT_BOUNDARY_WHERE, MAIN_SESSION, piTables } from "../../src/store/pi-storage.ts";
+import { coldWakeRecord, compactionRecord, readWakeFacts, recordRebuildDecision, ruleFor, shouldRebuild, type RebuildPolicy } from "../../src/runtime/rebuild.ts";
 import { contextIdOf } from "../../src/runtime/context-id.ts";
 import { UnknownJob } from "./model-queue.ts";
 
@@ -631,6 +632,12 @@ export interface RuntimeDeps {
    * limit from a refused call.
    */
   contextWindow?: number;
+  /**
+   * The rules a context rebuild is decided by (src/runtime/rebuild.ts), in shadow: each inbound wake of a pi085 main
+   * conversation records what they would decide and what the wake's first call then measured, and each compaction is
+   * recorded in the same terms; nothing is acted on. Absent: nothing is recorded (the benchmark's runtime).
+   */
+  rebuildPolicy?: RebuildPolicy | null;
   /** Domain policy handed to the harness at task initialisation. */
   policy?: string;
   /**
@@ -1238,6 +1245,53 @@ export class AgentRuntime {
 
   #inboundPass: Promise<InboundPass> | null = null;
 
+  /** Whether this agent's rebuilds are recorded: a policy is configured, and it is not a benchmark agent. */
+  #recordsRebuilds(tenantId: string): boolean {
+    return !!this.#deps.rebuildPolicy && tenantId !== BENCH_TENANT;
+  }
+
+  /**
+   * The cold-wake rebuild decision for the wake an inbound post is about to start (src/runtime/rebuild.ts), in shadow:
+   * recorded, never acted on. It reads the transcript and writes only its own rows, so the message, the harness and
+   * every request the model is sent are what they would have been without it. pi085's main conversation only, and
+   * only when it is idle: a post into a running turn is a steer, not a wake, and is logged as such. A failure is
+   * logged and never fails the post.
+   */
+  async #shadowColdWake(tenantId: string, agentId: string) {
+    const policy = this.#deps.rebuildPolicy;
+    if (!policy || !this.#recordsRebuilds(tenantId) || this.#isPd()) return;
+    try {
+      const sql = this.#deps.ctx.storage.sql;
+      const busy = mainBusy(sql);
+      if (busy) { logEvent("rebuild.skip", { tenantId, agentId, trigger: "cold-wake", reason: busy }); return; }
+      const binding = await this.store.getModelBinding(tenantId, agentId);
+      if (!binding) { logEvent("rebuild.skip", { tenantId, agentId, trigger: "cold-wake", reason: "no-model-binding" }); return; }
+      const now = Date.now();
+      const entries = piTables(MAIN_SESSION).entries;
+      const facts = {
+        ...readWakeFacts(sql, entries, now, CONTEXT_BOUNDARY_WHERE),
+        provider: binding.provider, model: binding.model, contextWindow: this.#modelOf(binding).contextWindow,
+      };
+      const decision = shouldRebuild(facts, policy);
+      const storage = this.#deps.ctx.storage;
+      recordRebuildDecision(sql, <T>(fn: () => T): T => storage.transactionSync ? storage.transactionSync(fn) : fn(), coldWakeRecord({
+        tenantId, agentId, key: entries, conversation: this.#conversationOf(MAIN_SESSION), facts, decision,
+        coldHitRate: ruleFor(policy, binding.provider, binding.model).coldHitRate, at: now,
+      }));
+    } catch (e) { console.error(`the rebuild decision for ${tenantId}/${agentId}'s wake failed:`, e); }
+  }
+
+  /** pi085 declines every compaction (src/runtime/pi-agent.ts); each one pi asked for is recorded as a rebuild that did not run. */
+  #declinedCompaction(tenantId: string, agentId: string) {
+    return (reason: string, tokensBefore: number) => {
+      const storage = this.#deps.ctx.storage;
+      recordRebuildDecision(storage.sql, <T>(fn: () => T): T => storage.transactionSync ? storage.transactionSync(fn) : fn(), compactionRecord({
+        tenantId, agentId, key: piTables(MAIN_SESSION).entries, reason, ran: false,
+        contextTokens: Number.isFinite(tokensBefore) ? tokensBefore : null, at: Date.now(),
+      }));
+    };
+  }
+
   /**
    * Hand queued pushes to the agent, oldest first, each as `postMessage(..., "prompt")`, which joins a running
    * turn as a steer and starts one otherwise. One pass at a time: a second caller joins the running one, so
@@ -1313,6 +1367,8 @@ export class AgentRuntime {
       if (!prepared) {
         prepared = true;
         await opts.beforeFirstPost?.();
+        // The last thing before the post that starts the wake: every fact it reads is one the first call cannot change.
+        await this.#shadowColdWake(tenantId, agentId);
       }
       const row = claimPendingInbound(sql, head, Date.now());
       try {
@@ -2988,7 +3044,7 @@ export class AgentRuntime {
       // The same catalogue PiAgent gets, through the same host and the same continuations
       // (src/runtime/durable-tools.ts). The caller's functions are pd's own tools there (`clientTool`), which record
       // their call in pi-durable state and wait for the caller, so they are handed over as definitions.
-      const pdHost = this.#pd ??= new PdHost({ storage: this.#deps.ctx.storage });
+      const pdHost = this.#pd ??= new PdHost({ storage: this.#deps.ctx.storage, rebuilds: this.#recordsRebuilds(tenantId) });
       const pd = DurableAgent.open({
         host: pdHost, tenantId, agentId, session, systemPrompt: prompt, model, dispatch,
         unknownJob: (id) => new UnknownJob(id),
@@ -3013,6 +3069,7 @@ export class AgentRuntime {
       },
       host: this.#deps.ctx.storage,
       usageOwner: { tenantId, agentId },
+      ...(session === MAIN_SESSION && this.#recordsRebuilds(tenantId) ? { onCompaction: this.#declinedCompaction(tenantId, agentId) } : {}),
       sessionId: session === MAIN_SESSION ? key : `${key}#${session}`,
       // The conversation, not the session: a fresh context keeps the session's name and starts a new conversation,
       // and its first call is compared with nothing rather than with the last call of the one it ended.

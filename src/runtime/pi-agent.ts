@@ -135,6 +135,22 @@ export function sessionsWithWork(sql: SqlHost["sql"]): string[] {
   return rows.map((r) => String(r.session));
 }
 
+/**
+ * Why the main session is not idle, or null when it is: a model call of it still unanswered, or its last step left it
+ * with work. A post to an idle session starts a wake; one to a busy session joins the turn that is running. A
+ * background tool call does not count: the turn that started it has ended, and its completion is a wake of its own.
+ */
+export function mainBusy(sql: SqlHost["sql"]): "model-call-in-flight" | "turn-running" | null {
+  const has = (name: string) => sql.exec("SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = ?", name).toArray().length > 0;
+  if (has("pi_model_jobs") && sql.exec("SELECT 1 AS x FROM pi_model_jobs WHERE session = ? AND answer IS NULL LIMIT 1", MAIN_SESSION).toArray().length) {
+    return "model-call-in-flight";
+  }
+  if (has("pi_sessions") && sql.exec("SELECT 1 AS x FROM pi_sessions WHERE session = ? AND active = 1", MAIN_SESSION).toArray().length) {
+    return "turn-running";
+  }
+  return null;
+}
+
 export function markSession(sql: SqlHost["sql"], session: string, active: boolean) {
   sql.exec("INSERT INTO pi_sessions(session, created_at, active) VALUES (?, ?, ?)" +
     " ON CONFLICT(session) DO UPDATE SET active = excluded.active", session, Date.now(), active ? 1 : 0);
@@ -185,6 +201,9 @@ export interface PiAgentOptions {
    * out (`transform_context`); the transcript keeps pi's result as written. Absent: pi's text is sent.
    */
   explainUnavailable?: (name: string) => string;
+  /** Told of each compaction pi asks for, which this engine declines (`open`), with pi's reason and its token
+   *  estimate of the context: a record (src/runtime/rebuild.ts), never a say in whether it runs. */
+  onCompaction?: (reason: string, tokensBefore: number) => void;
   /** Wake whatever does the waiting. Failure here is not fatal: the job row is
    *  already durable, so a later pass can re-send it. */
   dispatch(jobId: string): Promise<void>;
@@ -281,7 +300,15 @@ export class PiAgent implements AgentEngine {
     // and `setCompactionSettings` can turn it back on. Every compaction passes
     // this hook before its model call, so declining here means none of them
     // writes an empty summary or dispatches a job.
-    harness.hooks.on("before_compaction", () => ({ decline: true }));
+    // Each one declined is also told to `onCompaction`, which records it and decides nothing.
+    const told = opts.onCompaction;
+    harness.hooks.on("before_compaction", (event) => {
+      if (told) {
+        try { told(String(event.reason), Number(event.preparation?.tokensBefore)); }
+        catch (e) { console.error("recording a declined compaction failed:", e); }
+      }
+      return { decline: true };
+    });
 
     // pi answers a call to a tool it does not have with its own line before any hook runs; the request
     // that carries that result to the model says why instead (src/runtime/unavailable-tool.ts). The

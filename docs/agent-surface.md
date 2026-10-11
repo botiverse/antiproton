@@ -496,8 +496,8 @@ answer with `/admin/transcript`'s for the same agent).
 ### Trace
 
 `GET …/trace` answers the agent's trace rows — the spans of its work, one row each when it ended
-(`model.call`, `tool.call`, `approval.wait`, `container.lease`, `inbound`, `mount.seeded`;
-`src/trace/outbox.ts`) — with `from <= at < to`, in `seq` order.
+(`model.call`, `tool.call`, `approval.wait`, `container.lease`, `inbound`, `mount.seeded`,
+`rebuild.decision`, `rebuild.outcome`; `src/trace/outbox.ts`) — with `from <= at < to`, in `seq` order.
 
 - `from`, `to` — ISO 8601 or milliseconds since the epoch; the window is at most 24 hours. One alone
   puts the other 24 hours away; neither is the 24 hours up to now. `to` before or at `from`, a wider
@@ -521,6 +521,12 @@ on the pi085 engine also `prefix` (`src/runtime/request-prefix.ts`): the sha256 
 and of the tool list, the request's message count and characters, how many leading messages (and their
 characters) are the previous request's byte for byte, and `broken` — `system`, `tools`, `message`, or
 null when the previous request is all a prefix of this one. No content is recorded.
+A `rebuild.decision` row is a context rebuild decided (`src/runtime/rebuild.ts`), recorded and not acted on:
+`trigger` `cold-wake` (each inbound wake of a pi085 agent's main conversation: whether the deployment's rules,
+`REBUILD_POLICY`, would rebuild, `reason`, and the facts — gap, context tokens, model, the previous wake's
+first-call hit rate), or `window` / `operator` (a compaction the engine ran, or on pi085 declined), with
+`strategy`. Its `rebuild.outcome` row (`parentId` the decision's `spanId`, `spanId` the model job) is the next
+call measured: `input`, `cacheRead`, `hitRate`, and `status` `agree`, `false-cold`, `false-warm` or `unmeasured`.
 The answer adds `from`, `to` (ISO), `cursor`, `nextCursor` and `scanned: { local, objects }`. Nothing
 is written.
 

@@ -138,6 +138,7 @@
     "test/eval-seed-object.ts",
     "test/provision-model.ts",
     "test/admin-fail-closed.ts",
-    "test/eval-read.ts"
+    "test/eval-read.ts",
+    "test/rebuild-shadow.ts"
   ]
 }

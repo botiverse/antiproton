@@ -158,6 +158,8 @@ export interface PdHostOptions {
   onPoll?: (jobId: string, ready: boolean) => void;
   /** A test seam into the commit hook (src/runtime/pd-outbox.ts, `BookContext.fault`): a throw rolls the commit back. */
   commitFault?: (writes: readonly StorageWrite[]) => void;
+  /** Record each compaction, and the answer after it, as a rebuild (src/runtime/pd-outbox.ts `bookRebuilds`). Off when absent. */
+  rebuilds?: boolean;
   /** pi-durable's compaction thresholds, over its defaults (harness/agent.js `DEFAULT_COMPACTION_POLICY`). For tests. */
   compaction?: { reserveTokens?: number; keepRecentTokens?: number; backgroundTokens?: number };
   /** Extensions installed beside the sessions' tools. For tests: a task of their own, such as one that sleeps after work it did not commit. */
@@ -383,6 +385,7 @@ export class PdHost {
         owner: binding ? { tenantId: binding.tenantId, agentId: binding.agentId } : null,
         now: this.#now(), raw: this.#opts.storage.sql, ap: this.#ap, staged: this.#staged,
         ...(this.#opts.commitFault ? { fault: this.#opts.commitFault } : {}),
+        ...(this.#opts.rebuilds ? { rebuilds: true } : {}),
       });
       recordSettledRuns(this.#ap, writes, this.#now());
     } finally {

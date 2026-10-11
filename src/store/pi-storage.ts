@@ -46,6 +46,7 @@ import type { Context } from "@earendil-works/pi-agent-core/harness/context";
 import { appendUsage, modelTokenRows } from "../usage/outbox.ts";
 import { appendTrace } from "../trace/outbox.ts";
 import { answerEnded, modelCallRow } from "../trace/seams.ts";
+import { settleRebuildOutcome } from "../runtime/rebuild.ts";
 
 type Usage = SessionStats["usage"];
 
@@ -282,6 +283,11 @@ export class PiSqliteStorage implements Storage {
                 prefix: parsedPrefix(prefix),
                 usage: m.usage,
               })]);
+              // A rebuild decision waiting for this transcript's next call is measured by it (src/runtime/rebuild.ts).
+              // A shadow reading: its failure is logged and never fails the answer it reads.
+              try {
+                settleRebuildOutcome(this.#host.sql, { ...this.#usageOwner, entries: this.#t.entries, jobId: m.jobId, at: this.#now(), usage: m.usage });
+              } catch (e) { console.error(`settling the rebuild outcome of ${m.jobId} failed:`, e); }
             }
           }
           break;
