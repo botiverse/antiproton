@@ -1173,6 +1173,8 @@ export interface MountActivity {
      * name. Absent: the tools act on this thing when called with no such argument.
      */
     args?: Record<string, Json>;
+    /** What kind of credential it was created under ({@link MountUsage.credentialRef}). */
+    credentialRef?: CredentialRefKind;
   } | null;
   /** Until when the agent asked not to be reminded about it, if it did. */
   quietUntil?: number | null;
@@ -1186,6 +1188,13 @@ export interface MountActivity {
    * exists to end.
    */
   billing?: string;
+  /**
+   * Things this mount still holds but set aside (`Holding.strand`): made with a credential that stopped working,
+   * out of the agent's reach, still billed until they are deleted. Not `live` — the agent's machine is — but held
+   * all the same, so usage counts their time (src/usage/container.ts `boxesOf`) and the console lists each with a
+   * way to drop it (`Holding.release` `forget`, by its id). Absent when none.
+   */
+  aside?: Array<{ id: string; startedAt: number; since: number; credentialRef?: CredentialRefKind }>;
   /**
    * Entries of this mount's record it could not read and ignored, and the
    * record itself when that is what did not read; absent when none. A record is
@@ -1225,6 +1234,13 @@ export interface MountUsage {
   uses?: number;
   /** What was carried out of it, when anything was. */
   kept?: string[];
+  /**
+   * What kind of credential it was created under: whose account it runs on, which is who pays for it. Recorded at
+   * creation because the mount's credential can change while it lives, and the mount's reference after the change
+   * names somebody else's account (src/usage/container.ts reads this before the mount's). The kind, never the
+   * reference or the value. Absent for a thing recorded before this existed; a reader falls back to the mount's.
+   */
+  credentialRef?: CredentialRefKind;
 }
 
 /** Whether a mount can be renamed right now, and if not, what to say. */
@@ -1614,6 +1630,16 @@ export const LEASE_KEY = "__ap_lease__";
  * carries it instead, the way `markIdentity` carries the identity of a failed
  * call.
  */
+/**
+ * How long to wait before trying again to release a thing that refused: doubling with each failure, from 5 minutes
+ * to 6 hours. One schedule for every path that retries — the idle pass (cf/src/runtime.ts) and a plugin retrying
+ * a thing it holds on every release it is asked for (src/plugins/sandbox.ts stranded boxes) — so no path asks the
+ * far end once a turn.
+ */
+export function releaseRetryMs(failures: number): number {
+  return Math.min(5 * 60_000 * 2 ** Math.max(0, failures - 1), 6 * 3_600_000);
+}
+
 export function markReleased<E extends Error, F extends Released | Released[]>(error: E, fact: F): E & { released: F } {
   const marked = error as E & { released: F };
   marked.released = fact;
@@ -1686,7 +1712,23 @@ export interface Holding {
    * Letting go of several may report a fact for each (an array), and a failure among them throws with
    * every fact attached (`markReleased`).
    */
-  release(ctx: PluginContext, opts?: { reason?: "idle"; id?: string }): Promise<Released | Released[] | boolean | void>;
+  release(ctx: PluginContext, opts?: {
+    reason?: "idle"; id?: string;
+    /**
+     * An operator's explicit way out: a thing the far end refuses outright to release (a key that no longer
+     * works) is dropped from the mount's record anyway, and reported as an error fact naming it, since it may
+     * still be alive. Never set by the agent or the idle pass. A plugin without such a case ignores it.
+     */
+    forget?: boolean;
+  }): Promise<Released | Released[] | boolean | void>;
+  /**
+   * Set one held thing aside, by its `live.id`: the credential that made it has stopped working (cf/src/runtime.ts
+   * `#releaseBeforeCredentialChange`), so nothing the mount holds now can be relied on to reach it. It leaves
+   * whatever slot the agent uses — so the agent can start afresh under the new credential — and stays held for
+   * later attempts to release it, in which the far end's "not found" is not believed (asked with another account's
+   * key, it proves nothing). `release` with `forget` is the way to drop it. True when something was set aside.
+   */
+  strand?(ctx: PluginContext, id: string, reason: string): Promise<boolean>;
   /**
    * The files of the thing held, for a person looking at the agent's workspace (cf/src/agent-surface/
    * workspace.ts). Only while it is already running: **neither method may start it**, since starting is
@@ -1943,6 +1985,21 @@ export interface Plugin {
    * which say nothing about whether it is the right key.
    */
   checkCredential?(ctx: PluginContext): Promise<CredentialCheck>;
+  /**
+   * Which billing account `ctx.credential` acts on, as an identifier two credentials can be compared by: two keys
+   * of one account answer the same, keys of different accounts never do. Null when that cannot be said for
+   * certain. Operator-only like `checkCredential`; compared and dropped, never stored or shown.
+   *
+   * What it decides: whether what a mount holds survives a change of key (cf/src/runtime.ts
+   * `#releaseBeforeCredentialChange`). A thing on the account the new key also acts on stays reachable, so it is
+   * kept; anything else is released under the old key first. So a wrong "same" leaks a billed thing nothing can
+   * delete, and a plugin answers null rather than guess.
+   *
+   * Null is "this key has no account to name" (refused, or a far end that cannot say); a throw is "nobody
+   * answered" (an outage). The two are acted on differently: a key change goes ahead over the first, releasing
+   * what is held, and waits over the second rather than delete what a working key might have kept.
+   */
+  credentialAccount?(ctx: PluginContext): Promise<string | null>;
   /**
    * Do the thing. Returning {@link Backgrounded} means it has started and the
    * caller should be given a job rather than a result; returning

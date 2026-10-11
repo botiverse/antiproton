@@ -505,6 +505,20 @@ export class ToolGateway {
   }
 
   /**
+   * Set a held thing aside (`Holding.strand`): the credential that made it no longer works, so it leaves the slot
+   * the agent uses and is kept only for later attempts to delete it. Under the mount's lock, as a release is: both
+   * rewrite the plugin's record. False when the plugin cannot, or holds nothing by that id.
+   */
+  async strandHeld(ctx: { tenantId: string; agentId: string; taskId: string }, alias: string, id: string, reason: string): Promise<boolean> {
+    const mount = await this.#store.getMountByAlias(ctx.tenantId, ctx.agentId, alias);
+    const plugin = mount ? this.#plugins.get(mount.plugin) : null;
+    const holding = plugin ? holdingOf(plugin) : null;
+    if (!mount || !plugin || !holding?.strand) return false;
+    const strand = () => holding.strand!(this.#quietContext(ctx, mount), id, reason);
+    return isExclusive(plugin) ? this.#onMount(`${ctx.tenantId}/${ctx.agentId}/${mount.alias}`, strand) : strand();
+  }
+
+  /**
    * The files of what the agent's first file-showing mount holds (`Holding.files`), for a person
    * looking at its workspace. `{ running: false }` when no mount can show any.
    *
@@ -607,6 +621,8 @@ export class ToolGateway {
       alias?: string; reason?: "idle";
       /** One held thing of that mount, by its `live.id` (`Holding.release`); absent, all it holds. */
       id?: string;
+      /** An operator's `Holding.release` `forget`. */
+      forget?: boolean;
     },
   ): Promise<{ released: string[]; failed: Array<{ alias: string; error: string }> }> {
     const released: string[] = [];
@@ -629,8 +645,8 @@ export class ToolGateway {
           async sibling() { return null; },
           async sandboxForms() { return []; },
           async agentSecret() { return null; },
-        }, opts?.reason || opts?.id
-          ? { ...(opts.reason ? { reason: opts.reason } : {}), ...(opts.id ? { id: opts.id } : {}) }
+        }, opts?.reason || opts?.id || opts?.forget
+          ? { ...(opts.reason ? { reason: opts.reason } : {}), ...(opts.id ? { id: opts.id } : {}), ...(opts.forget ? { forget: true } : {}) }
           : undefined);
         // Behind the same lock as a call on this mount, for an exclusive
         // plugin: a release reads the state, destroys the box and writes the
@@ -1472,23 +1488,14 @@ export class ToolGateway {
    * Never a tool, so the model cannot ask; the value still never leaves the
    * plugin's call context.
    */
-  async checkMount(tenantId: string, agentId: string, alias: string):
+  async checkMount(tenantId: string, agentId: string, alias: string, candidate?: string):
     Promise<{ ok: true; account?: string } | { ok: false; kind: "rejected" | "unreachable"; reason: string } | null> {
     const mount = await this.#store.getMountByAlias(tenantId, agentId, alias);
     if (!mount) return null;
     const plugin = this.#plugins.get(mount.plugin);
     if (!plugin?.checkCredential) return null;
-    const credential = mount.secretRef
-      ? await this.#secrets.resolve(mount.secretRef, { tenantId, agentId }) : null;
     try {
-      return await plugin.checkCredential({
-        caller: { tenantId, agentId, taskId: "credential-check" },
-        alias,
-        credential, publicConfig: mount.publicConfig, db: this.#db({ tenantId, agentId }, mount),
-        async sibling() { return null; },
-        async sandboxForms() { return []; },
-        async agentSecret() { return null; },
-      });
+      return await plugin.checkCredential(await this.#credentialContext(tenantId, agentId, mount, candidate));
     } catch (e) {
       // A check that threw gave no verdict on the key: the provider was not
       // reached, or the plugin failed before asking it. Either way it is not
@@ -1496,6 +1503,44 @@ export class ToolGateway {
       // refusing it. Said explicitly, since the route reads `kind`.
       return { ok: false, kind: "unreachable", reason: String((e as Error).message ?? e).slice(0, 200) };
     }
+  }
+
+  /**
+   * Operator-only: which billing account a credential acts on (`Plugin.credentialAccount`) — the mount's own, or
+   * `candidate`, a value not stored anywhere yet. "unknown" when the key has none to name (no such hook, no
+   * credential, a refusal); "unreachable" when nobody answered. Only ever compared, never stored or shown.
+   */
+  async mountCredentialAccount(tenantId: string, agentId: string, alias: string, candidate?: string):
+    Promise<{ kind: "account"; id: string } | { kind: "unknown" } | { kind: "unreachable"; reason: string }> {
+    const mount = await this.#store.getMountByAlias(tenantId, agentId, alias);
+    if (!mount) return { kind: "unknown" };
+    const plugin = this.#plugins.get(mount.plugin);
+    if (!plugin?.credentialAccount) return { kind: "unknown" };
+    try {
+      const id = await plugin.credentialAccount(await this.#credentialContext(tenantId, agentId, mount, candidate));
+      return typeof id === "string" && id ? { kind: "account", id } : { kind: "unknown" };
+    } catch (e) {
+      // A throw is the plugin saying nobody answered (`Plugin.credentialAccount`), not that the key has no account.
+      return { kind: "unreachable", reason: String((e as Error)?.message ?? e).slice(0, 200) };
+    }
+  }
+
+  /**
+   * The context a credential is judged in: the one a call would get, minus a task. `candidate` stands in for the
+   * mount's stored credential, so a value can be judged before anything is written — and before anything that
+   * depends on the stored one, like releasing what it made, has happened.
+   */
+  async #credentialContext(tenantId: string, agentId: string, mount: MountRecord, candidate?: string): Promise<PluginContext> {
+    const credential = candidate !== undefined ? candidate
+      : mount.secretRef ? await this.#secrets.resolve(mount.secretRef, { tenantId, agentId }) : null;
+    return {
+      caller: { tenantId, agentId, taskId: "credential-check" },
+      alias: mount.alias,
+      credential, publicConfig: mount.publicConfig, db: this.#db({ tenantId, agentId }, mount),
+      async sibling() { return null; },
+      async sandboxForms() { return []; },
+      async agentSecret() { return null; },
+    };
   }
 }
 

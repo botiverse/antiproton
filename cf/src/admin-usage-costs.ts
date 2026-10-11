@@ -32,7 +32,7 @@ export function parseCostsQuery(q: URLSearchParams, now: number): { from: number
     const v = q.get(name);
     if (v === null || v === "") return fallback;
     const given = v.replace(/ (\d{2}:\d{2})$/, "+$1");
-    const t = ISO.test(given) ? Date.parse(given) : NaN;
+    const t = ISO.test(given) && onTheCalendar(given) ? Date.parse(given) : NaN;
     return Number.isFinite(t) ? t : `${name} is an ISO 8601 date or time with a zone, e.g. 2026-10-01 or 2026-10-01T00:00:00Z`;
   };
   const to = time("to", now);
@@ -45,6 +45,20 @@ export function parseCostsQuery(q: URLSearchParams, now: number): { from: number
   // `to` up to the next period boundary, unless it is on one already.
   const end = periodStart(to, bucket) === to ? to : bucket === "day" ? periodStart(to, "day") + DAY_MS : nextMonth(to);
   return { from: start, to: end, bucket };
+}
+
+/**
+ * Whether the date and time written are ones the calendar has. `Date.parse` rolls an impossible one over rather
+ * than refusing it — 2026-02-31 reads as 2026-03-03, T24:00 as the next day's midnight — so a window asked for in
+ * a typo would answer for days nobody asked about. The fields are checked as written, before any zone applies.
+ */
+export function onTheCalendar(v: string): boolean {
+  const m = /^(\d{4})-(\d{2})-(\d{2})(?:T(\d{2}):(\d{2})(?::(\d{2}))?)?/.exec(v);
+  if (!m) return false;
+  const [y, mo, d, h = "0", mi = "0", sec = "0"] = m.slice(1) as string[];
+  const day = new Date(Date.UTC(Number(y), Number(mo) - 1, Number(d)));
+  return day.getUTCFullYear() === Number(y) && day.getUTCMonth() === Number(mo) - 1 && day.getUTCDate() === Number(d)
+    && Number(h) <= 23 && Number(mi) <= 59 && Number(sec) <= 59;
 }
 
 function nextMonth(t: number): number {

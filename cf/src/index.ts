@@ -36,7 +36,7 @@ import { secretRefKind } from "../../src/runtime/secrets.ts";
 import { DynamicWorkerExecutor, handleSandboxCall, handleSandboxSuspend, type SuspendRequest } from "../../src/runtime/dynamic-worker-executor.ts";
 import { executorSpec } from "../../test/spec/executor-spec.ts";
 import {
-  AgentRuntime, type FreshContextResult, type RestartResult, reconcileSeed, OPERATOR_RUN9_REF, isOperatorModelRef, parsePluginChoice, SEEDED_PLUGINS, installedRows, messageRefusal, consoleAdded, CONSOLE_MOUNTS_MAX, agentKind, seedInstallation } from "./runtime.ts";
+  AgentRuntime, type FreshContextResult, type RestartResult, reconcileSeed, OPERATOR_RUN9_REF, isOperatorModelRef, parsePluginChoice, SEEDED_PLUGINS, installedRows, messageRefusal, consoleAdded, CONSOLE_MOUNTS_MAX, agentKind, seedInstallation, recordReleaseError } from "./runtime.ts";
 import { readMeter } from "../../bench/meter.ts";
 import { BENCH_SWE_WITHHELD } from "../../bench/swebench/withheld.ts";
 import { contextWindowFor } from "../../src/model/context-windows.ts";
@@ -1931,7 +1931,7 @@ export class AgentDO extends DurableObject<Env> {
 
   async uiRemoveCredential(tenantId: string, agentId: string, alias: string) {
     this.#claim(tenantId, agentId);
-    return this.#busy("uiRemoveCredential", () => this.runtime().removeCredential(tenantId, agentId, alias));
+    return this.#busy("uiRemoveCredential", () => this.runtime().removeCredentialOrWhy(tenantId, agentId, alias));
   }
 
   /** Hand a container back now. Refused while a job is running on that mount;
@@ -2244,9 +2244,9 @@ export class AgentDO extends DurableObject<Env> {
     return this.runtime().inboundLog();
   }
 
-  async uiReleaseSandbox(tenantId: string, agentId: string, alias: string) {
+  async uiReleaseSandbox(tenantId: string, agentId: string, alias: string, opts?: { forget?: boolean; id?: string }) {
     this.#claim(tenantId, agentId);
-    return this.#busy("uiReleaseSandbox", () => this.runtime().releaseMount(tenantId, agentId, alias));
+    return this.#busy("uiReleaseSandbox", () => this.runtime().releaseMount(tenantId, agentId, alias, opts));
   }
 
   async uiCompact(tenantId: string, agentId: string, taskId: string) {
@@ -2572,10 +2572,7 @@ export class AgentDO extends DurableObject<Env> {
         // A container that could not be handed back is billed for merely
         // existing, so it is written down where diagnose can find it rather
         // than left to be noticed on an invoice.
-        for (const f of out.releaseFailed ?? []) {
-          this.sql.exec("CREATE TABLE IF NOT EXISTS release_errors(at INTEGER, alias TEXT, message TEXT)");
-          this.sql.exec("INSERT INTO release_errors VALUES (?,?,?)", Date.now(), f.alias, f.error);
-        }
+        for (const f of out.releaseFailed ?? []) recordReleaseError(this.sql as any, f.alias, f.error);
         await this.broadcast();
         // Where the drains stood before this pass sent anything: a pass that moved none of them is a retry.
         const drainedFrom = drainCursors(this.sql as any);
@@ -3477,7 +3474,7 @@ function provisionDeps(env: Env): ProvisionDeps {
         const r = await stub(tenantId, agentId).uiAttachCredential(tenantId, agentId, PROVISION_MOUNT_ALIAS, { token: credential });
         return r.ok ? { ok: true, account: r.account } : { ok: false, error: r.error };
       },
-      removeCredential: (tenantId, agentId) => stub(tenantId, agentId).uiRemoveCredential(tenantId, agentId, PROVISION_MOUNT_ALIAS),
+      removeCredential: async (tenantId, agentId) => (await stub(tenantId, agentId).uiRemoveCredential(tenantId, agentId, PROVISION_MOUNT_ALIAS)).ok,
       tool: (tenantId, agentId, name) => stub(tenantId, agentId).provisionTool(tenantId, agentId, name),
       pushStatus: (tenantId, agentId) => stub(tenantId, agentId).provisionPushStatus(tenantId, agentId),
     },
@@ -4296,8 +4293,12 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
           const form = await formOf(request);
           if (!form) return new Response("expected a form body", { status: 400 });
           const alias = String(form.get("alias") ?? "").trim();
-          if (alias) await stub.uiRemoveCredential(gate.tenantId, agentId, alias);
-          return html(mountFragment(await stub.uiPlugins(gate.tenantId, agentId), alias));
+          const r = alias ? await stub.uiRemoveCredential(gate.tenantId, agentId, alias) : { ok: false as const, error: "no mount named" };
+          const d: any = await stub.uiPlugins(gate.tenantId, agentId);
+          // A refusal is shown on the mount, as a refused attach is: a page that comes back unchanged reads as a
+          // remove that silently did nothing, and the reason (a machine that would not delete) is the news.
+          if (!r.ok) for (const m of d.mounts ?? []) if (m.alias === alias && m.credential) m.credential.refused = r.error;
+          return html(mountFragment(d, alias));
         }
         // The console's mount and kept-secret writes. Each answers the whole plugins panel, as
         // `/ui/plugin/choice` does: the page swaps it into `.plugins-root`, and one write can move
@@ -4399,7 +4400,13 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
           if (!form) return new Response("expected a form body", { status: 400 });
           const alias = String(form.get("alias") ?? "").trim();
           if (!alias) return new Response("expected an alias", { status: 400 });
-          const r = await stub.uiReleaseSandbox(gate.tenantId, agentId, alias);
+          // `forget`, only ever from the button a refusal below offers: drop a container run9 refuses outright to
+          // delete (its key revoked) from the record, reported as possibly still alive (`Holding.release`).
+          const forget = form.get("forget") === "1";
+          // One box by its id: a set-aside box listed in the panel, released or forgotten without the live machine.
+          const id = String(form.get("id") ?? "").trim();
+          const opts = { ...(forget ? { forget: true } : {}), ...(id ? { id } : {}) };
+          const r = await stub.uiReleaseSandbox(gate.tenantId, agentId, alias, Object.keys(opts).length ? opts : undefined);
           const taskId = url.searchParams.get("taskId") || `t_${agentId}`;
           // The button lives in the inspector's runtime tab, which shows the
           // panels stacked, so the answer is that same stack: a lone container
@@ -4411,7 +4418,18 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
           // `esc` is ui.ts's, and this file does not import a renderer.
           const reason = r.ok ? "" : String(r.error).replace(/[&<>"']/g, (c) =>
             ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c] as string);
-          return html(r.ok ? panel : `<div class="err">${reason}</div>${panel}`);
+          const aliasAttr = alias.replace(/[&<>"']/g, (c) =>
+            ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c] as string);
+          // The way out of a refusal that a retry cannot fix: a container whose delete run9 refuses (its key
+          // revoked or its project gone) would otherwise stay named here, and be retried, for ever.
+          // Offered only for a delete run9 answered with a refusal (`delete returned <status>`): not for a mount that
+          // does not exist, a background job, or an outage the next attempt may get past.
+          const forgetForm = r.ok || forget || !/delete returned 4(?!08|09|29)\d\d/.test(String(r.error)) ? "" :
+            `<form hx-post="/ui/sandbox/release" hx-target="closest .body" hx-swap="innerHTML" style="padding:0;border:0"
+               hx-confirm="Forget this container? Only if run9 refused the delete outright. It may still be alive and billed on run9; it stops being named here and is recorded as forgotten.">
+               <input type="hidden" name="alias" value="${aliasAttr}"><input type="hidden" name="forget" value="1">
+               <button type="submit" class="ghost">forget it</button></form>`;
+          return html(r.ok ? panel : `<div class="err">${reason}</div>${forgetForm}${panel}`);
         }
         case "/ui/memory":
         case "/ui/runtime": {

@@ -288,7 +288,33 @@ export async function readUsage(db: D1Database, tenantId: string, q: UsageQuery)
     }
     return row;
   });
+  if (priced) foldCacheReadCost(rows, prices);
   return { rows, priced, firstHours, ...(partial ? { partial } : {}) };
+}
+
+/**
+ * Move the input rate's share of the cached tokens from the `input` row to the `cache_read` row, in place.
+ *
+ * The table prices `cache_read` as a delta on `input` (cf/migrations/0016_usage_prices_seed.sql: input × miss +
+ * cache_read × (hit − miss)), which adds up right and leaves the `cache_read` row alone with a negative cost, for a
+ * reader of one row a refund. After this each row says what its own tokens cost — `input` the uncached part at the
+ * miss rate, `cache_read` the cached part at the hit rate, as the agent's own reading splits them
+ * (cf/src/agent-surface/usage.ts) — and every sum over rows is unchanged. Only where both rows are in the same
+ * bucket and group and the input row is priced; a cache_read row without its input row keeps the delta.
+ */
+export function foldCacheReadCost(rows: UsageReadRow[], prices: readonly UsagePrice[]): void {
+  const at = (r: UsageReadRow, key: string) => `${r.bucket}\u0000${r.group}\u0000${r.resource}\u0000${key}\u0000${r.unit}`;
+  const inputs = new Map<string, UsageReadRow>();
+  for (const r of rows) if (r.resource === "model.tokens" && r.key.endsWith(":input")) inputs.set(at(r, r.key), r);
+  for (const r of rows) {
+    if (r.resource !== "model.tokens" || !r.key.endsWith(":cache_read") || typeof r.cost !== "number") continue;
+    const input = inputs.get(at(r, `${r.key.slice(0, -":cache_read".length)}:input`));
+    const rate = input && typeof input.cost === "number" ? priceFor(prices, input) : null;
+    if (!input || rate === null) continue;
+    const share = rate * r.quantity;
+    r.cost += share;
+    input.cost = (input.cost as number) - share;
+  }
 }
 
 /** One tenant's estimated cost of one resource over one period (`readUsageCosts`). */

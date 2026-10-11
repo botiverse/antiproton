@@ -1640,6 +1640,7 @@ export function sandboxPanel(d: any): string {
   const billing = rep?.activity.billing ?? null;
   const unreadable = rep?.activity.unreadable ?? 0;
   const sessions = rep?.usage ?? [];
+  const aside = rep?.activity.aside ?? [];
 
   // The third case is not "nothing": when part of the mount's own record would
   // not read, whether anything is still running — and still billing — is
@@ -1651,7 +1652,7 @@ export function sandboxPanel(d: any): string {
      record${n === 1 ? "" : "s"} would not read, so anything it was keeping alive may still be running —
      and still billing. Do not read this mount as idle.</div>`;
 
-  if (!live && !sessions.length) {
+  if (!live && !sessions.length && !aside.length) {
     if (unreadable > 0) return unknownNotice(unreadable);
     return `<div class="empty">no container has ever been started for this agent</div>
       <div class="hint" style="padding:8px 0">${aliases.size
@@ -1702,6 +1703,21 @@ ${live
     : unreadable > 0
       ? unknownNotice(unreadable)
       : `<div class="empty">nothing is running — this costs nothing until the next box starts</div>`}
+${aside.length ? `
+<h3>set aside — ${aside.length} box${aside.length === 1 ? "" : "es"} still billing</h3>
+<div class="hint" style="padding:0 0 6px">Made with a credential that no longer works, so the agent cannot reach
+  ${aside.length === 1 ? "it" : "them"} and the key now on the mount may not be able to delete ${aside.length === 1 ? "it" : "them"}.
+  Deletion is retried on its own; <b>forget</b> tries once more and, if run9 refuses outright, stops tracking the box
+  here — it may still be alive and billed on run9. The agent's own machine is not touched.</div>
+${aside.map((a) => `<div class="card"><div class="tool">box ${esc(a.id)} <span class="tag bad">still billing</span>
+     <form hx-post="/ui/sandbox/release" hx-target="closest .body" hx-swap="innerHTML" style="padding:0;border:0"
+           hx-confirm="Forget box ${esc(a.id)}? If run9 still refuses to delete it, it stops being tracked here and may stay alive on run9.">
+       <input type="hidden" name="alias" value="${esc(name)}"><input type="hidden" name="id" value="${esc(a.id)}">
+       <input type="hidden" name="forget" value="1">
+       <button type="submit" class="ghost">forget it</button>
+     </form></div>
+   <div class="kv" style="margin-top:6px"><div>set aside</div><div>${esc(ago(Number(a.since)))}</div>
+     <div>started</div><div>${esc(when(Number(a.startedAt)))}</div></div></div>`).join("")}` : ""}
 
 <h3>sessions — ${esc(secs(total))} of container time across ${sessions.length + (live ? 1 : 0)}</h3>
 ${live && unreadable > 0
@@ -1997,9 +2013,25 @@ function credentialRegion(m: any, spec: CredentialSpec | null | undefined): stri
       <label><span>${esc(f.summary)}${f.required ? "" : " <i>(optional)</i>"}</span>
         <input type="${f.secret ? "password" : "text"}" name="${esc(f.name)}"${f.required ? " required" : ""}
                autocomplete="off" spellcheck="false"></label>`).join("");
-  const paste = (verb: string, showError = true) => `
+  // A sandbox's machines live on the account of the key that made them, and only that key can delete them: a
+  // change of key deletes them first (cf/src/runtime.ts `#releaseBeforeCredentialChange`), unless the new key is
+  // on the same run9 account, which reaches them as well. Said before the click, because what goes is a running
+  // program and every unsaved file.
+  const deletes = m.plugin === "sandbox";
+  const loses = "Its machines, running and switched off, are deleted first, with every file not saved or kept; " +
+    "kept environments survive.";
+  // "Unless the same account" only on a replace, the one form where the key being replaced and the new one can
+  // both be the tenant's, and so the one case the runtime keeps machines for in practice. Over the operator's
+  // shared key, or with no key at all, the machines simply go.
+  const pasteWarning = (sameAccountPossible: boolean) => !deletes ? "" :
+    `<div class="hint" style="padding:4px 0 0">${esc(sameAccountPossible
+      ? loses.replace(/^Its/, `Unless the new key is on the same run9 account, ${m.alias}'s`)
+      : loses.replace(/^Its/, `${m.alias}'s`))}</div>`;
+  const refused = typeof c.refused === "string" && c.refused ? c.refused : null;
+  const paste = (verb: string, showError = true, sameAccountPossible = false) => `
     <form hx-post="/ui/credential" ${target}>
       <input type="hidden" name="alias" value="${esc(m.alias)}">${inputs}
+      ${pasteWarning(sameAccountPossible)}
       ${showError && error ? `<div class="err">${esc(error)}</div>` : ""}
       <div class="row"><button type="submit">${verb}</button></div>
     </form>`;
@@ -2046,6 +2078,7 @@ function credentialRegion(m: any, spec: CredentialSpec | null | undefined): stri
     return `<div class="cred">
       <div class="state"><b>included</b><span class="tag">Limited Free</span><span class="when">configured at deploy time${times ? ` · ${times}` : ""}</span></div>
       ${error ? `<div class="err">${esc(error)}</div>` : ""}
+      ${refused ? `<div class="err">${esc(refused)}</div>` : ""}
       <details><summary>use your own key</summary>${paste("use your own key", false)}</details>
     </div>`;
   }
@@ -2069,11 +2102,12 @@ function credentialRegion(m: any, spec: CredentialSpec | null | undefined): stri
         <form class="inline" hx-post="/ui/credential/remove" ${target}
               hx-confirm="${shared
                 ? `Return ${esc(m.alias)} to the deployment's shared account? Your own key is dropped and the operator's comes back.`
-                : `Remove the credential from ${esc(m.alias)}? The agent keeps the mount but loses the account.`}">
+                : `Remove the credential from ${esc(m.alias)}? The agent keeps the mount but loses the account.`}${deletes ? ` ${loses}` : ""}">
           <input type="hidden" name="alias" value="${esc(m.alias)}">
           <button type="submit" class="ghost">${shared ? "go back to the shared key" : "remove"}</button>
         </form></div>
-      <details><summary>replace</summary>${paste("replace")}</details>
+      ${refused ? `<div class="err">${esc(refused)}</div>` : ""}
+      <details${error && verified ? " open" : ""}><summary>replace</summary>${paste("replace", true, true)}</details>
     </div>`;
 }
 

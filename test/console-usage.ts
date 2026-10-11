@@ -154,6 +154,9 @@ check("an amount is an estimate in dollars, a fraction of a cent keeps its digit
   // A turn costs a fraction of a cent; two decimals would print it as free.
   const want: Array<[number, string]> = [[0, "$0"], [0.5, "≈$0.50"], [0.0123, "≈$0.0123"], [0.012, "≈$0.012"], [0.00004, "<$0.0001"], [1.75, "≈$1.75"], [12_345, "≈$12.3k"]];
   for (const [n, s] of want) must(dollars(n) === s, `${n} reads ${dollars(n)}, not ${s}`);
+  // A negative amount (a credit, or a ledger that disagrees with itself) keeps its size and wears a real minus.
+  const negative: Array<[number, string]> = [[-0.5, "≈−$0.50"], [-0.0123, "≈−$0.0123"], [-0.00004, "<−$0.0001"], [-1.75, "≈−$1.75"]];
+  for (const [n, s] of negative) must(dollars(n) === s, `${n} reads ${dollars(n)}, not ${s}`);
   // Container time on the tenant's own run9 account: priced, at nothing — not "not priced yet".
   const html = usagePanel(data([
     row("a1", "sandbox.container", "own:sandbox", "seconds", 600, 1, 0),

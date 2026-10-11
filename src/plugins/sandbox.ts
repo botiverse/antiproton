@@ -1,6 +1,6 @@
 import type { Json } from "../core/types.ts";
-import type { HeldFiles, Plugin, PluginContext, MountActivity, MountUsage, Released, SandboxForm } from "./types.ts";
-import { backgrounded, LEASE_KEY, markReleased } from "./types.ts";
+import type { CredentialRefKind, HeldFiles, Plugin, PluginContext, MountActivity, MountUsage, Released, SandboxForm } from "./types.ts";
+import { backgrounded, LEASE_KEY, markReleased, releaseRetryMs } from "./types.ts";
 import type { R2Artifacts } from "../store/artifacts.ts";
 import { toAgentRef } from "../store/refs.ts";
 import { spanText } from "../runtime/idle-lease.ts";
@@ -123,6 +123,11 @@ interface Session {
   saved: string[];
   /** Which of the mount's machines it was, when not the default one ("main"). */
   machine?: string;
+  /**
+   * The kind of credential the box was created under, as on `BoxState`; absent for one recorded before. Read only
+   * through `createdUnder`, since a stored record may carry a kind this build does not know (`isSession`).
+   */
+  credentialRef?: CredentialRefKind;
 }
 
 /**
@@ -151,6 +156,19 @@ interface BoxState {
   image?: string;
   /** The mounts wired into this container (see `SandboxForm`); never a credential. */
   wired?: Wired[];
+  /**
+   * What kind of credential created this box (`ctx.credentialRefKind` at creation): whose run9 account it is on,
+   * so whose money it spends. The mount's reference can change while the box lives — a key of the tenant's own
+   * may go over the operator's seeded one (cf/src/runtime.ts `attachCredential`) — and the reference read later
+   * then names an account this box is not on. Usage reads this (src/usage/container.ts `countHeldTime`), so time
+   * on our account is not booked as the tenant's own. The kind only, never the reference or the value.
+   */
+  credentialRef?: CredentialRefKind;
+  /**
+   * When run9 first refused to delete this box (`stopBox`). The box is still recorded, since it is still alive;
+   * this says its error lease has been reported, so later attempts that fail the same way do not report another.
+   */
+  deleteFailedAt?: number;
   /** Mounts that declare a container form and hold a credential but were left out, and why. */
   leftOut?: LeftOut[];
   execs?: number;
@@ -232,7 +250,19 @@ interface MountState {
   machines: Record<string, MachineState>;
   sessions?: Session[];
   envs?: Env[];
+  /**
+   * Boxes set aside, by box id (`holds.strand`): the credential that made each stopped working, so it is out of
+   * every machine slot — the agent starts afresh under the new one — and kept only to be deleted later, by a key
+   * that can, or dropped by an operator's `forget`. Reported as held, released on the idle schedule, never used.
+   */
+  stranded?: Record<string, StrandedBox>;
 }
+
+type StrandedBox = MachineState & {
+  strandedAt: number; strandReason?: string;
+  /** Failed attempts to delete it, when the next may be made (`releaseRetryMs`), and what the last one said. */
+  tries?: number; nextTryAt?: number; lastError?: string;
+};
 
 /**
  * The alias every agent's container is mounted under: the catalogue's seed
@@ -316,10 +346,16 @@ async function writeView(ctx: PluginContext, machine: string, view: BoxState): P
   else delete machines[machine];
   const keptSessions = sessions ?? cur.sessions;
   const keptEnvs = envs ?? cur.envs;
+  await writeMount(ctx, { machines, ...(keptSessions ? { sessions: keptSessions } : {}), ...(keptEnvs ? { envs: keptEnvs } : {}), ...(cur.stranded ? { stranded: cur.stranded } : {}) });
+}
+
+/** The whole record, as `writeView` writes it: an empty list of environments or of stranded boxes is left out. */
+async function writeMount(ctx: PluginContext, m: MountState): Promise<void> {
   await ctx.db.put(BOX_STORE, {
-    machines,
-    ...(keptSessions ? { sessions: keptSessions } : {}),
-    ...(keptEnvs?.length ? { envs: keptEnvs } : {}),
+    machines: m.machines,
+    ...(m.sessions ? { sessions: m.sessions } : {}),
+    ...(m.envs?.length ? { envs: m.envs } : {}),
+    ...(m.stranded && Object.keys(m.stranded).length ? { stranded: m.stranded } : {}),
   } as unknown as Json, BOX_KEY);
 }
 
@@ -640,10 +676,21 @@ export function asMountState(v: Json): MountState | null {
     const { sessions: _s, envs: _e, ...box } = read;
     machines[name] = box;
   }
+  // Read like a machine, entry by entry: an entry that does not read is dropped, the others kept.
+  const stranded: Record<string, StrandedBox> = {};
+  if (o.stranded && typeof o.stranded === "object" && !Array.isArray(o.stranded)) {
+    for (const [id, entry] of Object.entries(o.stranded as Record<string, unknown>)) {
+      const read = readBox(entry as Json);
+      if (!read || read.boxId !== id || typeof (entry as any).strandedAt !== "number") continue;
+      const { sessions: _s, envs: _e, ...box } = read;
+      stranded[id] = box as StrandedBox;
+    }
+  }
   return {
     machines,
     ...(Array.isArray(o.sessions) ? { sessions: o.sessions.filter(isSession) } : {}),
     ...(Array.isArray(o.envs) ? { envs: o.envs.filter(isEnv) } : {}),
+    ...(Object.keys(stranded).length ? { stranded } : {}),
   };
 }
 
@@ -716,6 +763,15 @@ function isSession(v: unknown): v is Session {
     && typeof s.execs === "number"
     && Array.isArray(s.saved) && s.saved.every((x) => typeof x === "string")
     && (s.machine === undefined || typeof s.machine === "string");
+  // `credentialRef` is not judged here: a kind this build does not know (one a later build added) costs the session
+  // nothing but that field, which every reader takes through `createdUnder` and reads as absent — a session from
+  // before the field existed. Refusing the whole session over it would drop time that was really spent.
+}
+
+const REF_KINDS: readonly CredentialRefKind[] = ["none", "agent", "operator", "env", "other"];
+/** A stored credential kind, or undefined when it is not one: read leniently, like the rest of the record. */
+function refKindOf(v: unknown): CredentialRefKind | undefined {
+  return REF_KINDS.includes(v as CredentialRefKind) ? v as CredentialRefKind : undefined;
 }
 
 function isEnv(v: unknown): v is Env {
@@ -819,29 +875,75 @@ const DEFAULTS = {
  * on the theory that "the box stops itself eventually"; the result was thirteen
  * live boxes and a release path that had been announcing success the whole time.
  */
-async function stopBox(
-  ctx: PluginContext, machine: string,
-): Promise<{ boxId: string; freed: boolean; error?: string; liveMs: number; lease: Released } | null> {
-  const state = await readView(ctx, machine);
-  if (!state.boxId || !ctx.credential) return null;
+/**
+ * Stop, then delete, one box at run9 with the mount's credential. `error` when it is not gone; `definitive` when
+ * run9 answered with a refusal that a retry will not change (a 4xx other than 408 timeout, 409 conflict and 429
+ * rate limit, which are run9 busy, not a verdict) — the only refusal an operator's `forget` acts on.
+ *
+ * Already gone is what a delete is for. run9 answers a GET for a box it does not have with 400 "box not found"
+ * (measured for `checkCredential`, which relies on it); that a DELETE answers the same is assumed from that, not
+ * measured, and a 404 is read the same way. Believed only when `believeGone`: the caller knows whether this key
+ * could be shown the box at all.
+ */
+async function deleteBox(ctx: PluginContext, boxId: string, believeGone: boolean): Promise<{ error?: string; definitive: boolean }> {
   const cfg = { ...DEFAULTS, ...(ctx.publicConfig as SandboxConfig) };
   providerOf(cfg);
-  const cred = JSON.parse(ctx.credential) as Run9Credential;
+  const cred = JSON.parse(ctx.credential!) as Run9Credential;
   const auth = "Basic " + btoa(`${cred.ak}:${cred.sk}`);
-  const base = `${cfg.endpoint}/projects/${cfg.project}/workspace/boxes/${state.boxId}`;
-  let error: string | undefined;
+  const base = `${cfg.endpoint}/projects/${cfg.project}/workspace/boxes/${boxId}`;
   try {
     await fetch(`${base}/stop`, { method: "POST", headers: { authorization: auth },
       signal: AbortSignal.timeout(20_000) }).catch(() => {});
     const res = await fetch(base, { method: "DELETE", headers: { authorization: auth },
       signal: AbortSignal.timeout(30_000) });
-    if (!res.ok) error = `delete returned ${res.status}: ${(await res.text()).slice(0, 120)}`;
+    if (res.ok) return { definitive: false };
+    const said = (await res.text()).slice(0, 120);
+    if (believeGone && (res.status === 404 || /box not found/i.test(said))) return { definitive: false };
+    return {
+      error: `delete returned ${res.status}: ${said}`,
+      definitive: res.status >= 400 && res.status < 500 && ![408, 409, 429].includes(res.status),
+    };
   } catch (e) {
-    error = String((e as Error)?.message ?? e).slice(0, 160);
+    return { error: String((e as Error)?.message ?? e).slice(0, 160), definitive: false };
   }
-  // The box record goes either way — keeping a pointer to one we failed to
-  // delete only means the next call tries to reuse something that may not be
-  // there — but the session survives it. A container is the one thing here
+}
+
+async function stopBox(
+  ctx: PluginContext, machine: string, opts?: { forget?: boolean },
+): Promise<{ boxId: string; freed: boolean; error?: string; forgotten?: true; liveMs: number; lease: Released | null } | null> {
+  const state = await readView(ctx, machine);
+  if (!state.boxId || !ctx.credential) return null;
+  // Already gone is believed only when the mount's credential is the same KIND as the one the box records it
+  // was made under (`credentialRef`) — a kind check, not an account check: a key of another account is not shown
+  // the box, so its "not found" says nothing, and a kind that differs is certainly another key; two keys of one
+  // kind may still be two accounts, which the kind cannot tell apart.
+  const maker = state.credentialRef === undefined || state.credentialRef === ctx.credentialRefKind;
+  const { error, definitive } = await deleteBox(ctx, state.boxId, maker);
+  const endedAt = Date.now();
+  const stoppedAt = parkedAt(state);
+  const session = sessionOf(state, stoppedAt ?? endedAt, machine);
+  // A box run9 would not delete is still there, still billed, and still reachable by the key that made it — so
+  // the record keeps naming it, and every later release (the agent's, the idle pass's, an operator's, the one a
+  // change of key makes first) tries again until the delete succeeds. Forgetting it here made a refusal hold
+  // once: the next attempt found nothing held and let the key change, and the box was never reachable again
+  // (#818). Its session is not recorded either: it has not ended.
+  //
+  // The exception is an operator's explicit `forget`, after run9 refused the delete outright (a 4xx, not an
+  // outage): the way out when the key that made the box is gone for good. The record goes as on success, and the
+  // lease is reported as an error naming what was forgotten, so the box is on the record as possibly still alive.
+  if (error && !(opts?.forget && definitive)) {
+    // One error lease per box, not one per attempt: a box that keeps refusing is retried by every release, and
+    // its first failure already put it on the record as alive and billed (`deleteFailedAt`).
+    const now = await readView(ctx, machine);
+    const first = !now.deleteFailedAt;
+    if (first && now.boxId === state.boxId) await writeView(ctx, machine, { ...now, deleteFailedAt: endedAt });
+    return {
+      boxId: state.boxId, freed: false, error, liveMs: session.endedAt - session.startedAt,
+      lease: first ? { id: state.boxId, startedAt: stoppedAt ?? session.startedAt, endedAt, status: "error", error } : null,
+    };
+  }
+  const forgotten = error ? `forgotten on an operator's request; run9 refused the delete (${error}), so it may still be alive` : undefined;
+  // The record goes once the box has, but the session survives it. A container is the one thing here
   // billed for merely existing, so how long it lived outlives the box.
   //
   // Built from the state this call read, not from whatever the record says now:
@@ -852,9 +954,6 @@ async function stopBox(
   // A box switched off for being idle already recorded its compute session
   // when it was switched off (parkBox), so deleting it adds none: a second
   // one from `createdAt` would count the days it sat stopped as compute.
-  const endedAt = Date.now();
-  const stoppedAt = parkedAt(state);
-  const session = sessionOf(state, stoppedAt ?? endedAt, machine);
   // Read again before overwriting. `releaseTask` does not take the per-mount
   // lock that `invoke` takes, so an operator release or the idle sweep can
   // interleave with a command on this mount: the command finds no container,
@@ -887,11 +986,11 @@ async function stopBox(
   // span was reported when it was switched off, and this release ended the
   // rest of its life, the disk.
   return {
-    boxId: state.boxId, freed: !error, error, liveMs: session.endedAt - session.startedAt,
-    lease: {
-      id: state.boxId, startedAt: stoppedAt ?? session.startedAt, endedAt,
-      status: error ? "error" : "freed", ...(error ? { error } : {}),
-    },
+    boxId: state.boxId, freed: true, liveMs: session.endedAt - session.startedAt,
+    ...(forgotten ? { forgotten: true as const, error: forgotten } : {}),
+    lease: forgotten
+      ? { id: state.boxId, startedAt: stoppedAt ?? session.startedAt, endedAt, status: "error", error: forgotten }
+      : { id: state.boxId, startedAt: stoppedAt ?? session.startedAt, endedAt, status: "freed" },
   };
 }
 
@@ -1002,6 +1101,7 @@ export function activityOf(
         id: state.boxId,
         startedAt: state.createdAt,
         lastUsedAt: Math.max(stopped, used),
+        ...createdUnder(state),
         lease: {
           maxMs,
           warnMs: stoppedWarnMs(days),
@@ -1022,6 +1122,7 @@ export function activityOf(
       id: state.boxId,
       startedAt: state.createdAt,
       lastUsedAt: used,
+      ...createdUnder(state),
       // Running: the idle step only switches it off and loses nothing on its
       // disk, so it is taken at the deployment's limit without a warning — a
       // warning is a model turn, and there is nothing to answer it with.
@@ -1053,8 +1154,29 @@ export function activitiesOf(
   mount: MountState | null, unreadable = 0, keepStoppedDays: number = DEFAULTS.keepStoppedDays,
 ): MountActivity[] {
   const names = boxedMachines(mount);
-  if (!names.length) return [activityOf(null, unreadable, keepStoppedDays)];
-  return names.map((n) => activityOf(viewOf(mount, n), unreadable, keepStoppedDays, labelOf(n, names.length > 1)));
+  const aside = Object.values(mount?.stranded ?? {}).map(strandedActivity);
+  if (!names.length) return aside.length ? aside : [activityOf(null, unreadable, keepStoppedDays)];
+  return [...names.map((n) => activityOf(viewOf(mount, n), unreadable, keepStoppedDays, labelOf(n, names.length > 1))), ...aside];
+}
+
+/**
+ * A stranded box as held: no machine of the agent's, nothing to warn it about (it can neither use nor save from
+ * it), so it is released at the deployment's limit without a warning, counted from when it was set aside.
+ *
+ * A trade-off, chosen: if the new key is on the same account as the dead one, that release succeeds — the box is
+ * deleted about `maxMs` (30 minutes by default) after it was set aside, with no warning to the agent, and any file
+ * in it that was not saved or kept is lost. Warning would mean a turn about a machine the agent cannot reach, and
+ * keeping it would leave it billed for nobody; the console showed the deletion would happen when the key changed.
+ */
+function strandedActivity(b: StrandedBox): MountActivity {
+  return {
+    live: {
+      id: b.boxId, startedAt: b.createdAt, lastUsedAt: b.strandedAt, ...createdUnder(b),
+      lease: { warnMs: 0 }, name: `stranded box ${b.boxId}`,
+    },
+    quietUntil: null,
+    billing: "set aside: made with a credential that no longer works; still billed until it is deleted",
+  };
 }
 
 /**
@@ -1070,9 +1192,18 @@ export function summaryActivity(
   const used = (n: string) => { const b = mount!.machines[n]!; return b.lastUsedAt || b.createdAt; };
   const off = (n: string) => parkedAt(mount!.machines[n]) === null ? 0 : 1;
   const pick = [...names].sort((a, b) => off(a) - off(b) || used(b) - used(a))[0];
-  return pick === undefined
+  const one = pick === undefined
     ? activityOf(null, unreadable, keepStoppedDays)
     : activityOf(viewOf(mount, pick), unreadable, keepStoppedDays, labelOf(pick, names.length > 1));
+  // Set-aside boxes beside it: still held and billed, so the console lists them and usage counts them.
+  const aside = Object.values(mount?.stranded ?? {}).map((b) => ({ id: b.boxId, startedAt: b.createdAt, since: b.strandedAt, ...createdUnder(b) }));
+  return aside.length ? { ...one, aside } : one;
+}
+
+/** The kind of credential a box or session records it was created under, when it records one that reads. */
+function createdUnder(v: { credentialRef?: unknown }): { credentialRef?: CredentialRefKind } {
+  const kind = refKindOf(v.credentialRef);
+  return kind ? { credentialRef: kind } : {};
 }
 
 /** What this mount has finished with, newest first, from its own window. */
@@ -1084,6 +1215,7 @@ export function usageOf(state: BoxState | null | undefined): MountUsage[] {
     lastUsedAt: s.lastUsedAt,
     uses: s.execs,
     kept: s.saved,
+    ...createdUnder(s),
   }));
 }
 
@@ -1100,7 +1232,7 @@ export function keepSessions(prior: Session[] | undefined, next: Session): Sessi
 }
 
 export function sessionOf(
-  state: { boxId: string; createdAt: number; lastUsedAt?: number; execs?: number; saved?: string[] },
+  state: { boxId: string; createdAt: number; lastUsedAt?: number; execs?: number; saved?: string[]; credentialRef?: CredentialRefKind },
   endedAt: number,
   machine: string = MAIN_MACHINE,
 ): Session {
@@ -1114,6 +1246,7 @@ export function sessionOf(
     lastUsedAt: state.lastUsedAt || state.createdAt,
     execs: state.execs ?? 0,
     saved: state.saved ?? [],
+    ...createdUnder(state),
   };
 }
 
@@ -1385,18 +1518,69 @@ async function reconcileAccounts(
  * switches a running box off; an operator's or a benchmark's release means delete.
  */
 async function releaseMachine(
-  ctx: PluginContext, machine: string, reason: "idle" | undefined, lease: BoxLease | null,
+  ctx: PluginContext, machine: string, reason: "idle" | undefined, lease: BoxLease | null, forget = false,
 ): Promise<Released | false> {
   if (lease && reason === "idle") {
     const state = await readView(ctx, machine);
     if (state.boxId && parkedAt(state) === null) return parkBox(ctx, machine, state);
   }
-  const r = await stopBox(ctx, machine);
+  const r = await stopBox(ctx, machine, { forget });
   if (r === null) return false;
   if (!r.freed) {
-    throw markReleased(new Error(`run9 box ${r.boxId} not released: ${r.error ?? "unknown"}`), r.lease);
+    const e = new Error(`run9 box ${r.boxId} not released: ${r.error ?? "unknown"}`);
+    throw r.lease ? markReleased(e, r.lease) : e;
   }
-  return r.lease;
+  return r.lease ?? false;
+}
+
+/**
+ * Let a stranded box go (`MountState.stranded`), as `releaseMachine` does a machine: deleted with the mount's key
+ * now, which is not the key that made it — so run9's "not found" is never believed, and only a delete that
+ * succeeded, or an operator's `forget` after a definitive refusal, takes it off the record. Its error lease is
+ * reported once (`deleteFailedAt`). False when no credential is there to try with.
+ */
+async function releaseStranded(ctx: PluginContext, id: string, forget: boolean): Promise<Released | false> {
+  const b = (await readMount(ctx))?.stranded?.[id];
+  if (!b) return false;
+  const now = Date.now();
+  let error: string | undefined;
+  let definitive = false;
+  if (!ctx.credential) {
+    // Nothing to try with. Not "released": the box is still there, so it stays held and is retried once a
+    // credential is back — and an operator's forget, the only way out without one, drops it.
+    error = "the mount has no credential to delete it with";
+    definitive = true;
+  } else if (!forget && (b.nextTryAt ?? 0) > now) {
+    // Retried on the shared schedule (`releaseRetryMs`) whichever path asks — the idle pass, or a release after
+    // every settled turn where the deployment has no idle lease — not on every ask. Its error lease is reported.
+    throw new Error(`run9 box ${id} (stranded) not released: not retried before ${new Date(b.nextTryAt!).toISOString()}; last: ${b.lastError ?? "unknown"}`);
+  } else {
+    ({ error, definitive } = await deleteBox(ctx, id, false));
+  }
+  const endedAt = Date.now();
+  const after = (await readMount(ctx)) ?? { machines: {} };
+  const rest = { ...(after.stranded ?? {}) };
+  if (error && !(forget && definitive)) {
+    const cur = rest[id];
+    const first = !cur?.deleteFailedAt;
+    if (cur) {
+      const tries = (cur.tries ?? 0) + 1;
+      rest[id] = { ...cur, deleteFailedAt: cur.deleteFailedAt ?? endedAt, tries, nextTryAt: endedAt + releaseRetryMs(tries), lastError: error.slice(0, 200) };
+      await writeMount(ctx, { ...after, stranded: rest });
+    }
+    const e = new Error(`run9 box ${id} (stranded) not released: ${error}`);
+    throw first ? markReleased(e, { id, startedAt: b.createdAt, endedAt, status: "error", error } as Released) : e;
+  }
+  delete rest[id];
+  // Its time to the end goes on the record as a finished session, as `stopBox` does for a machine: usage counted
+  // it as held while it was set aside (`activity.aside`), and this closes it. A switched-off one already recorded
+  // its compute session when it was switched off.
+  const sessions = parkedAt(b) === null ? keepSessions(after.sessions, sessionOf(b, endedAt, `stranded`)) : after.sessions;
+  await writeMount(ctx, { ...after, stranded: rest, ...(sessions ? { sessions } : {}) });
+  const forgotten = error ? `forgotten on an operator's request; ${error.startsWith("the mount has no") ? error : `run9 refused the delete (${error})`}, so it may still be alive` : undefined;
+  return forgotten
+    ? { id, startedAt: b.createdAt, endedAt, status: "error", error: forgotten }
+    : { id, startedAt: b.createdAt, endedAt, status: "freed" };
 }
 
 /**
@@ -1732,19 +1916,30 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
      *  task.
      *
      *  What happens to each machine is `releaseMachine`'s. */
-    async release(ctx: PluginContext, opts?: { reason?: "idle"; id?: string }): Promise<Released | Released[] | false> {
+    async release(ctx: PluginContext, opts?: { reason?: "idle"; id?: string; forget?: boolean }): Promise<Released | Released[] | false> {
       // Which machines: the one whose box the framework named (the idle pass acts on one thing at a
       // time, each on its own clock), or every one the mount has (an operator releasing the mount, a
       // benchmark, a settled turn without a lease). An id that names no machine now names nothing to
       // release: the box it meant is already gone or was replaced.
       const mount = await readMount(ctx);
       const targets = boxedMachines(mount).filter((n) => !opts?.id || mount!.machines[n]!.boxId === opts.id);
+      const aside = Object.keys(mount?.stranded ?? {}).filter((id) => !opts?.id || id === opts.id);
       const facts: Released[] = [];
       const errors: string[] = [];
+      for (const id of aside) {
+        try {
+          const fact = await releaseStranded(ctx, id, opts?.forget === true);
+          if (fact) facts.push(fact);
+        } catch (e) {
+          const fact = (e as { released?: Released })?.released;
+          if (fact) facts.push(fact);
+          errors.push(String((e as Error)?.message ?? e));
+        }
+      }
       // One after another, each to the end: a machine that would not go must not keep the next from going.
       for (const machine of targets) {
         try {
-          const fact = await releaseMachine(ctx, machine, opts?.reason, lease);
+          const fact = await releaseMachine(ctx, machine, opts?.reason, lease, opts?.forget === true);
           if (fact) facts.push(fact);
         } catch (e) {
           const fact = (e as { released?: Released })?.released;
@@ -1762,6 +1957,20 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       if (errors.length) throw markReleased(new Error(errors.join("; ")), facts.length === 1 ? facts[0]! : facts);
       if (!facts.length) return false;
       return facts.length === 1 ? facts[0]! : facts;
+    },
+    /** Moves the machine holding `id` out of its slot into `stranded` (`Holding.strand`). Calls nothing at run9. */
+    async strand(ctx: PluginContext, id: string, reason: string): Promise<boolean> {
+      const mount = await readMount(ctx);
+      const name = mount ? Object.keys(mount.machines).find((n) => mount.machines[n]!.boxId === id) : undefined;
+      if (!mount || name === undefined) return false;
+      const { [name]: box, ...machines } = mount.machines;
+      // The slot keeps what is not about this box: an environment chosen to start from next.
+      if (box!.startFrom) machines[name] = { ...NO_BOX, startFrom: box!.startFrom };
+      await writeMount(ctx, {
+        ...mount, machines,
+        stranded: { ...(mount.stranded ?? {}), [id]: { ...box!, strandedAt: Date.now(), strandReason: reason.slice(0, 300) } },
+      });
+      return true;
     },
   },
   /** `run_js` and `shell` may only have STARTED the work; see `Backgrounding`. */
@@ -2196,6 +2405,33 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     }
   },
 
+  /**
+   * The run9 organisation these keys act on, by run9's `GET /whoami` (`org.org_id`), with the project the mount
+   * names: a box lives in a project of an organisation, and keys of the same organisation reach the same project.
+   * The access key is not it — each key of one account has its own.
+   *
+   * Null for an endpoint that is not run9 itself (`verifyWith: "endpoint"`): what a service in front answers for
+   * `/whoami` is its own business, and could be one identity for every tenant — a "same" that is not.
+   */
+  async credentialAccount(ctx) {
+    if (!ctx.credential) return null;
+    const cfg = cfgOf(ctx);
+    if (cfg.verifyWith === "endpoint") return null;
+    let cred: Run9Credential;
+    try { cred = JSON.parse(ctx.credential) as Run9Credential; } catch { return null; }
+    if (!cred.ak || !cred.sk) return null;
+    // A network failure throws through: nobody answered, which is not "no account" (`Plugin.credentialAccount`).
+    const res = await fetch(`${cfg.endpoint}/whoami`, {
+      headers: { authorization: "Basic " + btoa(`${cred.ak}:${cred.sk}`) },
+      signal: AbortSignal.timeout(cfg.timeoutMs),
+    });
+    // Busy is not an answer either: a timeout, a conflict, a rate limit, or a server error. Thrown, so the change
+    // waits rather than reading "no account" and deleting machines a same-account key would have kept.
+    if (res.status >= 500 || [408, 409, 429].includes(res.status)) throw new Error(`run9 answered ${res.status} to /whoami`);
+    if (!res.ok) return null;
+    const org = (await res.json().catch(() => null) as { org?: { org_id?: unknown } } | null)?.org?.org_id;
+    return typeof org === "string" && org ? `${org}/${cfg.project}` : null;
+  },
 
 
   async invoke(tool: string, args: Json, ctx: PluginContext): Promise<Json> {
@@ -2237,6 +2473,12 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       // Releasing first, because the choice applies to the next container and
       // silently leaving the old one running is how a machine gets forgotten.
       const released = prior.boxId ? await stopBox(ctx, machine) : null;
+      // Not deleted, the old container is still the machine (`stopBox` keeps naming it), so the choice would not
+      // apply to anything: refused, with the release fact the recorder needs for a box still billing.
+      if (released && !released.freed) {
+        const e = new Error(`run9 box ${released.boxId} not released, so ${env.name} was not chosen: ${released.error ?? "unknown"}`);
+        throw released.lease ? markReleased(e, released.lease) : e;
+      }
       const after = await readView(ctx, machine);
       await writeView(ctx, machine, { ...after, startFrom: env.snapId });
       return {
@@ -2247,7 +2489,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
         released: !!released,
         // The kernel reads this by name; `released` above is the model's
         // boolean and stays what it was.
-        ...(released ? { [LEASE_KEY]: released.lease } : {}),
+        ...(released?.lease ? { [LEASE_KEY]: released.lease } : {}),
         ...(released ? { releasedPrevious: released.boxId } : {}),
       };
     }
@@ -2383,6 +2625,8 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       // The record gains each placeholder only once run9 has accepted it.
       state = {
         boxId, createdAt: Date.now(), lastUsedAt: Date.now(), execs: 0, saved: [],
+        // Whose account this box is on, for as long as it lives (`BoxState.credentialRef`).
+        ...(ctx.credentialRefKind ? { credentialRef: ctx.credentialRefKind } : {}),
         sessions: history,
         ...(image ? { image } : {}),
         ...(kept.length ? { envs: kept } : {}),
@@ -2501,7 +2745,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       return r.freed
         ? { released: true, box: r.boxId, ...named, liveMs: r.liveMs, saved: kept, [LEASE_KEY]: r.lease,
             note: "the container and its files are gone; anything saved above is not" }
-        : { released: false, box: r.boxId, ...named, error: r.error, saved: kept, [LEASE_KEY]: r.lease };
+        : { released: false, box: r.boxId, ...named, error: r.error, saved: kept, ...(r.lease ? { [LEASE_KEY]: r.lease } : {}) };
     }
 
     const wd = cfg.workdir;
@@ -2576,7 +2820,10 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     // and both have to produce the same thing — `finished` is that thing, in
     // one place, because a result built twice is two rules about one shape
     // and they drift (the lesson of #291).
-    const afterStart: BoxState = { ...state, lastUsedAt: Date.now(), execs: (state.execs ?? 0) + 1 };
+    // A box that runs a command after run9 refused to delete it is in use again: its earlier failure was reported
+    // (`deleteFailedAt`), and a later one is news of its own, worth its own error lease.
+    const { deleteFailedAt: _failed, ...usable } = state;
+    const afterStart: BoxState = { ...usable, lastUsedAt: Date.now(), execs: (state.execs ?? 0) + 1 };
     await writeView(ctx, machine, afterStart);
 
     const grace = Date.now() + cfg.graceMs;

@@ -13,6 +13,7 @@ import {
   BOX_KEY, BOX_STORE, MAIN_MACHINE, asBoxState, asMountState, machineOf, sandboxPlugin, unreadableEntries, usageOf,
 } from "../src/plugins/sandbox.ts";
 import type { MountActivity, Released } from "../src/plugins/types.ts";
+import { LEASE_KEY } from "../src/plugins/types.ts";
 import { PluginDbTables } from "../src/store/plugin-db.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { openPluginDatabase } from "../src/runtime/plugin-db.ts";
@@ -324,6 +325,148 @@ await check("save or keep on a named machine that does not exist is refused, and
     must(thrown && /no machine "ghost"/.test(String(thrown.message)), `${tool}: ${thrown}`);
     must(f.calls.length === 0, `${tool} started something: ${JSON.stringify(f.calls)}`);
   }
+});
+
+await check("a box records the kind of credential that created it, and keeps it through a swap of the mount's key and its release (#818)", async () => {
+  const f = fixture(null);
+  f.ctx.credentialRefKind = "operator";
+  await f.plugin.invoke("shell", { command: "ls" }, f.ctx);
+  must(f.mount().machines.main!.credentialRef === "operator", `not recorded at creation: ${JSON.stringify(f.raw())}`);
+  // The tenant's key goes on the mount: the box was made on the operator's account and says so still.
+  f.ctx.credentialRefKind = "agent";
+  await f.plugin.invoke("shell", { command: "ls" }, f.ctx);
+  must(f.creates().length === 1, "a second box");
+  const [act] = await f.plugin.holds!.activities!(f.ctx);
+  must(act!.live?.credentialRef === "operator", `activity reports ${act!.live?.credentialRef}`);
+  await f.plugin.holds!.release(f.ctx);
+  const used = await f.plugin.holds!.usage!(f.ctx);
+  must(used.length === 1 && used[0]!.credentialRef === "operator", `the finished record says ${JSON.stringify(used)}`);
+  // A context that does not report the kind records nothing, rather than a guess.
+  const g = fixture(null);
+  await g.plugin.invoke("shell", { command: "ls" }, g.ctx);
+  must(!("credentialRef" in g.mount().machines.main!), `a kind nobody reported: ${JSON.stringify(g.raw())}`);
+});
+
+await check("a box run9 would not delete stays recorded, so every later release tries it again until one succeeds (#818)", async () => {
+  let refuse = 2;
+  const f = fixture({ machines: { main: box("b1", { credentialRef: "operator" }) } }, {},
+    (c) => c.method === "DELETE" && c.path.endsWith("/boxes/b1") && refuse-- > 0);
+  f.ctx.credentialRefKind = "operator";
+  // The agent's release, then an operator's (no id, no reason): both refused, the box still named after each.
+  const r: any = await f.plugin.invoke("release", {}, f.ctx);
+  must(r.released === false && r.box === "b1" && /500/.test(r.error), `the agent's release: ${JSON.stringify(r)}`);
+  must(f.mount().machines.main?.boxId === "b1", `forgotten after the first refusal: ${JSON.stringify(f.raw())}`);
+  let thrown: any = null;
+  try { await f.plugin.holds!.release(f.ctx); } catch (e) { thrown = e; }
+  must(thrown && /b1 not released/.test(String(thrown.message)), `the second refusal was not reported: ${thrown}`);
+  must(f.mount().machines.main?.boxId === "b1", `forgotten after the second refusal: ${JSON.stringify(f.raw())}`);
+  must(!f.raw().sessions?.length, `a session recorded for a box still alive: ${JSON.stringify(f.raw().sessions)}`);
+  const [act] = await f.plugin.holds!.activities!(f.ctx);
+  must(act?.live?.id === "b1", `not reported as held: ${JSON.stringify(act)}`);
+  // run9 deletes it now: the record lets go, and the session is the box's.
+  const done = await f.plugin.holds!.release(f.ctx) as Released;
+  must(done && done.status === "freed" && !f.mount().machines.main, `not let go once deleted: ${JSON.stringify(f.raw())}`);
+  must(f.deletes("b1").length === 3, `deletes sent: ${f.deletes("b1").length}`);
+  must(usageOf(asBoxState(f.raw())).map((u) => u.id).join() === "b1", `the session: ${JSON.stringify(f.raw().sessions)}`);
+});
+
+await check("an idle deletion run9 refuses keeps the switched-off box recorded", async () => {
+  const f = fixture({ machines: { main: box("b1", { parkedAt: T0 + 2 * MIN }) } }, {}, (c) => c.method === "DELETE");
+  let thrown: any = null;
+  try { await f.plugin.holds!.release(f.ctx, { reason: "idle", id: "b1" }); } catch (e) { thrown = e; }
+  must(thrown && /b1 not released/.test(String(thrown.message)), `not reported: ${thrown}`);
+  must(f.mount().machines.main?.boxId === "b1" && typeof f.mount().machines.main?.parkedAt === "number",
+    `the switched-off box was forgotten or changed: ${JSON.stringify(f.raw())}`);
+});
+
+await check("start_from refuses while the old box will not delete, and the old box stays the machine", async () => {
+  const f = fixture({ machines: { main: box("b1") }, envs: [{ name: "e", snapId: "s1", savedAt: 1 }] }, {}, (c) => c.method === "DELETE");
+  let thrown: any = null;
+  try { await f.plugin.invoke("start_from", { name: "e" }, f.ctx); } catch (e) { thrown = e; }
+  must(thrown && /b1 not released/.test(String(thrown.message)) && thrown.released, `not refused with its fact: ${thrown}`);
+  must(f.mount().machines.main?.boxId === "b1" && !f.mount().machines.main?.startFrom, `record: ${JSON.stringify(f.raw())}`);
+});
+
+await check("run9's \"box not found\" is gone only when the key is the kind that made the box", async () => {
+  const gone = (c: Call) => c.method === "DELETE";
+  const notFound = async (made: string | undefined, now: string) => {
+    const f = fixture({ machines: { main: box("b1", made ? { credentialRef: made } : {}) } });
+    f.ctx.credentialRefKind = now;
+    const real = globalThis.fetch;
+    globalThis.fetch = (async (url: string, init?: any) => gone({ method: String(init?.method ?? "GET"), path: String(url) })
+      ? new Response(JSON.stringify({ error: "box not found" }), { status: 400 }) : real(url, init)) as any;
+    const r: any = await f.plugin.invoke("release", {}, f.ctx);
+    return { released: r.released, held: !!f.mount().machines.main?.boxId };
+  };
+  const same = await notFound("agent", "agent");
+  must(same.released === true && !same.held, `the maker's "not found" kept it: ${JSON.stringify(same)}`);
+  const legacy = await notFound(undefined, "agent");
+  must(legacy.released === true && !legacy.held, `a box recorded before the field: ${JSON.stringify(legacy)}`);
+  const other = await notFound("operator", "agent");
+  must(other.released === false && other.held, `another account's "not found" let it go: ${JSON.stringify(other)}`);
+});
+
+await check("using a switched-off box again keeps the kind of credential it was made under (S3)", async () => {
+  const f = fixture({ machines: { main: box("b1", { parkedAt: T0 + 2 * MIN, credentialRef: "operator" }) } });
+  f.ctx.credentialRefKind = "agent";
+  await f.plugin.invoke("shell", { command: "ls" }, f.ctx);
+  must(f.creates().length === 0, "a new box was made");
+  const m = f.mount().machines.main!;
+  must(m.boxId === "b1" && m.parkedAt === undefined, `not running again: ${JSON.stringify(f.raw())}`);
+  must(m.credentialRef === "operator", `the unparked box now says ${m.credentialRef}`);
+  const [act] = await f.plugin.holds!.activities!(f.ctx);
+  must(act?.live?.credentialRef === "operator", `activity says ${act?.live?.credentialRef}`);
+});
+
+await check("a session recorded with a kind this build does not know is kept, read as one recorded before the field", async () => {
+  const s = { boxId: "b-old", startedAt: T0, endedAt: T0 + MIN, lastUsedAt: T0, execs: 1, saved: [], credentialRef: "a-later-kind" };
+  const known = { ...s, boxId: "b-ops", credentialRef: "operator" };
+  const used = usageOf(asBoxState({ boxId: "", createdAt: 0, lastUsedAt: 0, sessions: [s, known] } as any));
+  must(used.map((u) => u.id).join() === "b-old,b-ops", `a session was dropped: ${JSON.stringify(used)}`);
+  must(!("credentialRef" in used[0]!) && used[1]!.credentialRef === "operator", `kinds: ${JSON.stringify(used)}`);
+});
+
+await check("a box that keeps refusing reports its error lease once, not once per attempt (N3)", async () => {
+  let refuse = 2;
+  const f = fixture({ machines: { main: box("b1") } }, {}, (c) => c.method === "DELETE" && refuse-- > 0);
+  const first: any = await f.plugin.invoke("release", {}, f.ctx);
+  const second: any = await f.plugin.invoke("release", {}, f.ctx);
+  must(first.released === false && first[LEASE_KEY]?.status === "error", `the first failure: ${JSON.stringify(first)}`);
+  must(second.released === false && !(LEASE_KEY in second), `a second error lease: ${JSON.stringify(second)}`);
+  const done: any = await f.plugin.invoke("release", {}, f.ctx);
+  must(done.released === true && done[LEASE_KEY]?.status === "freed", `the release that worked: ${JSON.stringify(done)}`);
+});
+
+await check("a box used again after a refused delete reports its next refusal afresh (N-d)", async () => {
+  let refuse = true;
+  const f = fixture({ machines: { main: box("b1") } }, {}, (c) => c.method === "DELETE" && refuse);
+  const first: any = await f.plugin.invoke("release", {}, f.ctx);
+  must(first[LEASE_KEY]?.status === "error" && typeof f.mount().machines.main?.deleteFailedAt === "number", `first: ${JSON.stringify(first)}`);
+  await f.plugin.invoke("shell", { command: "ls" }, f.ctx);
+  must(f.mount().machines.main?.deleteFailedAt === undefined, `still marked after use: ${JSON.stringify(f.raw())}`);
+  const again: any = await f.plugin.invoke("release", {}, f.ctx);
+  must(again[LEASE_KEY]?.status === "error", `the refusal after use was not reported: ${JSON.stringify(again)}`);
+  refuse = false;
+});
+
+await check("forget drops a box only after run9 refuses its delete outright (4xx), reporting it as forgotten", async () => {
+  const f = fixture({ machines: { main: box("b1") } });
+  globalThis.fetch = ((inner) => (async (url: string, init?: any) => String(init?.method) === "DELETE"
+    ? new Response(JSON.stringify({ error: "invalid api key" }), { status: 401 }) : inner(url, init)))(globalThis.fetch) as any;
+  const fact = await f.plugin.holds!.release(f.ctx, { forget: true }) as Released;
+  must(fact && fact.status === "error" && /forgotten/.test(String(fact.error)) && /401/.test(String(fact.error)), `the fact: ${JSON.stringify(fact)}`);
+  must(!f.mount().machines.main, `still recorded: ${JSON.stringify(f.raw())}`);
+  // An outage (5xx) is not a verdict: kept even when asked to forget.
+  const g = fixture({ machines: { main: box("b2") } }, {}, (c) => c.method === "DELETE");
+  let thrown: any = null;
+  try { await g.plugin.holds!.release(g.ctx, { forget: true }); } catch (e) { thrown = e; }
+  must(thrown && g.mount().machines.main?.boxId === "b2", `a 500 was forgotten: ${JSON.stringify(g.raw())}`);
+  // And without the flag a 4xx keeps it, as every failure does.
+  const h = fixture({ machines: { main: box("b3") } });
+  globalThis.fetch = ((inner) => (async (url: string, init?: any) => String(init?.method) === "DELETE"
+    ? new Response("{}", { status: 401 }) : inner(url, init)))(globalThis.fetch) as any;
+  try { await h.plugin.holds!.release(h.ctx); } catch { /* reported */ }
+  must(h.mount().machines.main?.boxId === "b3", "a 4xx without forget let it go");
 });
 
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.error ? `\n    ${r.error}` : ""}`);

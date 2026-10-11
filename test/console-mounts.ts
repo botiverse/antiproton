@@ -733,6 +733,78 @@ await check("no secret value appears in any response or log line", async () => {
   must(logLeaks.length === 0, `${logLeaks.length} log line(s) carried the value`);
 });
 
+await check("POST /ui/credential/remove: a refusal comes back on the mount, escaped, rather than a page that did not change (#818)", async () => {
+  const real = AgentRuntime.prototype.removeCredentialOrWhy;
+  const asked: string[] = [];
+  AgentRuntime.prototype.removeCredentialOrWhy = async function (_t: string, _a: string, alias: string) {
+    asked.push(alias);
+    return { ok: false as const, error: `${alias} still holds <b>b-1</b>, so the credential was not changed: delete returned 500` };
+  };
+  try {
+    // A mount holding a key of this agent's, so the page has a remove to answer; the refusal is the runtime's
+    // (test/credential-writers.ts covers when it refuses).
+    const store = (home() as any).runtime().store;
+    await store.addMount({ tenantId: T, agentId: A, alias: "keyed", plugin: "github", installationId: "i-keyed", connectionId: null,
+      toolVersion: "1", publicConfig: {}, secretRef: "agent:keyed", policy: null });
+    await store.putSecret(T, A, "keyed", { ciphertext: "c", iv: "v" });
+    const r = await post("/ui/credential/remove", { alias: "keyed" });
+    must(r.status === 200 && asked.join() === "keyed", `status ${r.status}, asked ${show(asked)}: ${r.text.slice(0, 300)}`);
+    must(r.text.includes("keyed still holds &lt;b&gt;b-1&lt;/b&gt;, so the credential was not changed") && !r.text.includes("<b>b-1</b>"),
+      `the refusal is not on the page, or not escaped: ${r.text.slice(0, 400)}`);
+  } finally { AgentRuntime.prototype.removeCredentialOrWhy = real; }
+});
+
+await check("POST /ui/sandbox/release: a refused release offers forget, and forget reaches the runtime only when sent", async () => {
+  const real = AgentRuntime.prototype.releaseMount;
+  const asked: unknown[] = [];
+  AgentRuntime.prototype.releaseMount = async function (_t: string, _a: string, alias: string, opts?: { forget?: boolean }) {
+    asked.push(opts ?? null);
+    return opts?.forget ? { ok: true as const, released: true } : { ok: false as const, error: `${alias} was not released: delete returned 401` };
+  };
+  // The answer carries the runtime tab under the refusal; its panels read storage this harness does not
+  // offer as an iterable, and are not what this checks, so they are stood in for.
+  const o: any = home();
+  const storage = o.uiStorage;
+  o.uiStorage = async () => ({});
+  try {
+    const refused = await post("/ui/sandbox/release", { alias: "keyed" });
+    must(refused.status === 200 && /delete returned 401/.test(refused.text), `no refusal: ${refused.text.slice(0, 300)}`);
+    must(/name="forget" value="1"/.test(refused.text) && />forget it</.test(refused.text), "no way out offered");
+    const forgot = await post("/ui/sandbox/release", { alias: "keyed", forget: "1" });
+    must(forgot.status === 200 && !/forget it/.test(forgot.text), `forget: ${forgot.text.slice(0, 200)}`);
+    must(show(asked) === show([null, { forget: true }]), `asked: ${show(asked)}`);
+    // The panel's forget for a set-aside box names it: only that one is asked for.
+    await post("/ui/sandbox/release", { alias: "keyed", id: "b-old", forget: "1" });
+    must(show(asked[2]) === show({ forget: true, id: "b-old" }), `by id: ${show(asked)}`);
+  } finally { AgentRuntime.prototype.releaseMount = real; o.uiStorage = storage; }
+});
+
+await check("POST /ui/sandbox/release: forget is offered only after run9 refused a delete, and the alias in it is escaped", async () => {
+  const real = AgentRuntime.prototype.releaseMount;
+  let error = "";
+  AgentRuntime.prototype.releaseMount = async function () { return { ok: false as const, error }; };
+  const o: any = home();
+  const storage = o.uiStorage;
+  o.uiStorage = async () => ({});
+  try {
+    for (const e of ["no mount named nope", "x is running a background job; releasing it now would discard that work",
+      "x was not released: run9 box b1 not released: delete returned 503: busy", "x was not released: connect ECONNREFUSED",
+      "x was not released: run9 box b1 not released: delete returned 429: slow down",
+      "x was not released: run9 box b1 not released: delete returned 408: timeout",
+      "x was not released: run9 box b1 not released: delete returned 409: conflict"]) {
+      error = e;
+      const r = await post("/ui/sandbox/release", { alias: "x" });
+      must(!/forget it/.test(r.text), `forget offered for: ${e}`);
+    }
+    error = "was not released: run9 box b1 not released: delete returned 401: {}";
+    const hostile = `x"><script>alert(1)</script>`;
+    const r = await post("/ui/sandbox/release", { alias: hostile });
+    must(/forget it/.test(r.text), `not offered for a 401: ${r.text.slice(0, 300)}`);
+    must(!r.text.includes("<script>alert(1)</script>") && r.text.includes('value="x&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;"'),
+      `the alias is not escaped: ${r.text.slice(0, 400)}`);
+  } finally { AgentRuntime.prototype.releaseMount = real; o.uiStorage = storage; }
+});
+
 globalThis.fetch = realFetch;
 for (const h of hosts) h.dispose();
 
