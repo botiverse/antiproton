@@ -561,15 +561,19 @@ function integer(value: unknown, name: string, min: number, max: number): number
  * raw `routes`, and none of them is called here. The routes this file does call are reads with no operation behind
  * them: the credential context the listing reads (`routes.agent.context`) and a personal assistant's two owner
  * reads (`routes.assistant.*`, `RAFT_ASSISTANT_WIRE`); Agent Login's `routes.integrations.list` and
- * `login` are in raft-agent-login.ts. A hosted agent proposes the administration with `actions_prepare`, for a person to confirm.
+ * `login` are in raft-agent-login.ts.
+ *
+ * The rule for what is left out: a hosted agent is offered every operation an agent inside Raft has (its CLI's
+ * `raft mention add`, `raft profile update`, `raft task delete` among them). The Raft Server checks the agent's
+ * permission on every call, so a call its role does not allow is refused there, not here. An entry here is for an
+ * operation this mount does in another way (the three inbox operations, which `receive_events` replaces), never for
+ * one an agent "should not" do. `actions_prepare` stays for what the agent's role does not allow it to do itself
+ * (the channel and server administration above), and for a proposal a person should confirm.
  */
 export const EXCLUDED: Readonly<Record<string, string>> = {
   "inbox.check": "the inbox is read with receive_events, which commits what it showed and pulls the next in one call; a second reader would move the same cursor",
   "inbox.drain": "pulls until the inbox is empty and hands it all over in one result, with no bound; receive_events pages the same inbox",
   "inbox.commit": "receive_events commits only the messages it showed, which its next pull acknowledges; a separate commit could acknowledge a batch before the model has read it",
-  "mentions.add": "it changes a conversation's membership; membership changes go through an action card a person confirms (actions_prepare)",
-  "profile.update": "changes the account's public identity (display name, description, avatar); identity changes go through an action card a person confirms",
-  "tasks.delete": "destructive, and new: agents could not delete tasks before; offered when someone asks for it",
 };
 
 /**
@@ -669,7 +673,9 @@ const ARGUMENT_CHECKS: Readonly<Record<string, { check(input: Record<string, unk
       return type === "channel:create" || type === "channel:add_member" || type === "agent:create" ? null
         : "action.type must be channel:create, channel:add_member or agent:create: the integration cards take ids you have no way to know, and are made by Raft's own integration commands";
     },
-    described: " Only channel:create, channel:add_member and agent:create cards can be prepared here: the integration cards take ids you have no way to know, and are made by Raft's own integration commands.",
+    described: " A card is the route for a change your role does not allow you to make yourself, or one you want a person to confirm;" +
+      " what Raft lets you do directly, do with its own tool (mentions_add, profile_update, tasks_delete and the rest), with no card." +
+      " Only channel:create, channel:add_member and agent:create cards can be prepared here: the integration cards take ids you have no way to know, and are made by Raft's own integration commands.",
   },
 };
 
@@ -842,7 +848,8 @@ function argumentsFor(op: RaftOperationSpec, args: unknown): Record<string, unkn
 const UNOFFERED_SAY: Readonly<Record<string, string>> = {
   // The SDK names `inbox.check` for "check for new messages"; on this mount that is receive_events.
   inbox_check: "receive_events()",
-  // Since 0.11.0 the SDK's notify hint names mentions_notify, which is offered; its add hint names mentions_add.
+  // Since 0.11.0 the SDK's notify hint names mentions_notify and its add hint mentions_add, both generated; the add
+  // hint is said in words only on a mount whose credential lacks the `mentions` capability.
   mentions_add: "adding them to the conversation, which this mount does not offer",
   // Reached on a plugin built with no object storage, a credential without the capability, or a table that excludes it.
   attachments_download_url: "downloading the attachment, which this mount does not offer",
@@ -1957,7 +1964,8 @@ export function createRaftPlugin(deps: {
       summary: "A Raft agent credential for the agent account this mount represents.",
       shape: "token",
       grants: "As that Raft agent, and only as far as the credential's capabilities reach: send, read and search messages, receive queued events, " +
-        "join, leave and mute channels and see their members, react, work its task boards, read the Raft Manual, post action cards for a person to confirm, " +
+        "join, leave and mute channels and see their members, add the people it mentions to a conversation, react, work its task boards (deleting tasks among it), " +
+        "update its own profile (display name, description, avatar), read the Raft Manual, post action cards for a person to confirm, " +
         "and sign into the Connected Apps on its Server as that agent (Agent Login) to run the actions their manifests offer.",
       looksLike: [{ kind: "Raft agent credential", pattern: "sk_agent_[A-Za-z0-9_-]{16,}" }],
     },
