@@ -692,6 +692,21 @@ export const WITHHELD_ARGUMENTS: Readonly<Record<string, Readonly<Record<string,
     // origin the SDK sends it with `consume: false`, a combination whose handling by the Server is not verified.
     unread: "it moves your read position, which receive_events keeps; read new messages with receive_events, or page this conversation with after, before or around",
   },
+  "profile.update": {
+    // Raft sends a hosted agent's profile description to this runtime as the agent's whole instructions on the next
+    // edit a person makes, so an agent that wrote its own description could rewrite its own instructions. Lift this
+    // entry, and profile.update's in `DESCRIPTION_OVERRIDES`, when Raft keeps the instructions a person wrote apart
+    // from the profile description.
+    description: "a hosted agent cannot change its description yet, because Raft uses it as this agent's instructions; ask a person to edit it in Raft",
+  },
+};
+
+/**
+ * A tool description written here in place of the manifest's, where the manifest's names an argument this mount
+ * withholds (`WITHHELD_ARGUMENTS`). Each entry goes when the withholding it describes does.
+ */
+const DESCRIPTION_OVERRIDES: Readonly<Record<string, string>> = {
+  "profile.update": "Update your display name or avatar URL. Your profile description cannot be changed here: Raft uses it as your instructions, so a person edits it in Raft.",
 };
 
 /**
@@ -752,10 +767,10 @@ export function toolOf(op: RaftOperationSpec): ToolSchema {
   }
   describeInMountTerms(parameters);
   // The download's manifest text is about the URL Raft mints; this mount keeps the file and never shows the URL.
-  const described = op.name === DOWNLOAD_OP
+  const described = DESCRIPTION_OVERRIDES[op.name] ?? (op.name === DOWNLOAD_OP
     ? `Download an attachment (by the id a message line shows) into this agent's storage, up to ${ATTACHMENT_MAX_BYTES / 1024 / 1024} MiB: ` +
       "returns an artifact reference to the file with its name, type and size."
-    : inMountTerms(op.description);
+    : inMountTerms(op.description));
   const held = op.mayInterrupt
     ? ` Held here, the call comes back as a question with those messages: answer "${goAhead(op)}" to go ahead as written, or "drop" to do nothing.` +
       (op.idempotency.kind === "key"
