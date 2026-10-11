@@ -270,6 +270,10 @@ await check("a lost cursor race leaves rows behind, and the object comes back fo
 await check("a send that keeps losing is retried a bounded number of times, with growing gaps, then left for the next wake", async () => {
   const o = await object();
   await adopt(o);
+  // The first pass opens the harness and exports its `harness.open` row (src/runtime/harness-open.ts), which moves a
+  // cursor; that pass is run here, before the stuck row, because this case counts the passes that move nothing.
+  o.state.alarmAt = clock;
+  await o.settle();
   appendUsage(o.raw.sql as any, [{ at: clock, tenantId: T, agentId: A, resource: "tool.call", key: "stuck", quantity: 1, unit: "calls" }]);
   o.db.lose(1_000);
   o.state.alarmAt = clock;
