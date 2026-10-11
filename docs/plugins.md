@@ -807,14 +807,20 @@ Three readers look at a plugin's work, and each has its own hook.
 **The model** sees the tool result, the error message, the background `note`
 and `progress`, and `promptContribution`. A prompt contribution is a paragraph
 added to the system prompt; it is asked for once per mount each time the
-harness opens. Use it for something the
+harness opens. On the pi085 engine the system prompt shows the paragraph as it
+was when the conversation began, and a harness opened later in the same
+conversation is built from that copy; when the paragraph has changed since, the
+next message the model is sent begins with a harness notice giving the changed
+sections (split at the paragraph's markdown headings outside code fences, the
+lines added where a section only grew), so name sections with headings if parts
+of the paragraph change on their own (`src/runtime/prompt-context.ts`). Use it for something the
 agent should know before its first call (the `state` plugin lists the agent's
 saved notes, after the files an evaluation's setup seeded, if any:
 [`docs/agent-surface.md`](agent-surface.md#seeded-files)). Return `null` when there is nothing to say. Something that
 changes often costs a re-read of everything after it on the next turn, so keep
 the paragraph stable — and in particular **write instants, not durations**. "in
 use since 12:03" does not move when the reader does; "idle for 7 minutes" is
-different on every rebuild, and the prompt is rebuilt on every `open`. Anything
+different on every rebuild, and pd rebuilds the prompt on every `open`. Anything
 that has to count is a message, not a paragraph
 (`test/prompt-contributions.ts`).
 

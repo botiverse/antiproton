@@ -453,8 +453,13 @@ The load-bearing part is theirs too: the working set is **pushed into the
 prompt**, not left to be pulled, because an agent that has to remember to go and
 look will not look. What does not carry over is doing it before every turn. That
 is affordable in a local CLI and not here — see the cache numbers above — so it
-is injected once when the harness opens, where the prefix stays stable and
-cached.
+is injected once when a conversation begins, where the prefix stays stable and
+cached. The system prompt then stays byte for byte the same for the
+conversation's life, however often its harness is opened again; a document that
+changes later reaches the model as a short harness notice at the head of the
+next message, with only the lines added where the document only grew
+(`src/runtime/prompt-context.ts`). A fresh context begins from the documents as
+they are then.
 
 Demonstrated across two tasks: told a deploy window, a formatting preference and
 an unhandled certificate expiry in one, then asked in a *new* task when to ship,
