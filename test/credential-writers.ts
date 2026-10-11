@@ -149,7 +149,7 @@ await check("a shared account the catalogue does not name is still refused, even
  * and records which account each request came with. No request leaves the process. `deleteStatus` is what run9
  * says to the box's deletion.
  */
-async function heldSandbox(deleteStatus: number | (() => number) = 200, opts: {
+async function heldSandbox(deleteStatus: number | ((who: string) => number) = 200, opts: {
   /** run9's `/whoami` organisation for each access key; a key not named answers 401. */
   orgs?: Record<string, string>;
   /** Access keys whose credential check run9 refuses. */
@@ -181,7 +181,7 @@ async function heldSandbox(deleteStatus: number | (() => number) = 200, opts: {
       return new Response("{\"error\":\"no\"}", { status: opts.stopStatus });
     }
     if (method === "DELETE") {
-      const status = typeof deleteStatus === "function" ? deleteStatus() : deleteStatus;
+      const status = typeof deleteStatus === "function" ? deleteStatus(who) : deleteStatus;
       return new Response(status === 200 ? "{}" : "{\"error\":\"no\"}", { status });
     }
     if (path === "/whoami") {
@@ -371,6 +371,21 @@ await check("the old key revoked: a new key goes on at the first attempt, the bo
     v.calls.length = 0;
     const again = await v.rt.attachCredential("t", "a", "sandbox", { ak: "own3-ak", sk: "own3-sk" });
     must(again.ok && v.deletes().some((c) => c.who === "own2-ak") && !v.box(), `the next change: ${JSON.stringify(again)} ${JSON.stringify(v.calls)}`);
+  } finally { v.restore(); }
+});
+
+await check("a stranded box another account's key cannot delete holds up no later change", async () => {
+  const revoked: string[] = [];
+  // own2-ak is on another account: run9 refuses it the box (403).
+  const v = await heldSandbox((who) => who === "own2-ak" ? 403 : 200, { revoked });
+  try {
+    await v.ownKeyHolding("b-own");
+    revoked.push("own-ak");
+    must((await v.rt.attachCredential("t", "a", "sandbox", { ak: "own2-ak", sk: "own2-sk" })).ok, "the first change");
+    v.calls.length = 0;
+    const next = await v.rt.attachCredential("t", "a", "sandbox", { ak: "own3-ak", sk: "own3-sk" });
+    must(next.ok, `wedged on a box the key never made: ${JSON.stringify(next)}`);
+    must(v.deletes().some((c) => c.who === "own2-ak") && v.box() === "b-own", `not tried, or forgotten: ${JSON.stringify(v.calls)}`);
   } finally { v.restore(); }
 });
 
