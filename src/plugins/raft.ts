@@ -556,10 +556,10 @@ function integer(value: unknown, name: string, min: number, max: number): number
  * real operation — so an operation a new SDK adds turns that test red until someone decides which side it
  * belongs on.
  *
- * The manifest carries no channel or server administration (creating, updating or archiving a channel, adding
- * or removing its members, updating the server): those are Agent API routes reachable only through the SDK's
- * raw `routes`, and none of them is called here. The routes this file does call are reads with no operation behind
- * them: the credential context the listing reads (`routes.agent.context`) and a personal assistant's two owner
+ * Since SDK 0.14.0 the manifest carries channel and server administration as operations (creating, updating,
+ * archiving and unarchiving a channel, adding and removing its members, updating the server), so they are generated
+ * like the rest, as are SDK 0.15.0's Labs (`labs.list`, `labs.setAccess`, `labs.setEnrollment`). `server.update` and
+ * the two Labs writes need the `server` capability, so a credential without it is not offered them (`snapshotTools`). The routes this file calls directly, outside any operation, are reads: the credential context the listing reads (`routes.agent.context`) and a personal assistant's two owner
  * reads (`routes.assistant.*`, `RAFT_ASSISTANT_WIRE`); Agent Login's `routes.integrations.list` and
  * `login` are in raft-agent-login.ts.
  *
@@ -568,7 +568,8 @@ function integer(value: unknown, name: string, min: number, max: number): number
  * permission on every call, so a call its role does not allow is refused there, not here. An entry here is for an
  * operation this mount does in another way (the three inbox operations, which `receive_events` replaces), never for
  * one an agent "should not" do. `actions_prepare` stays for what the agent's role does not allow it to do itself
- * (the channel and server administration above), and for a proposal a person should confirm.
+ * (a channel:create or channel:add_member card, which a person whose role allows it carries out), and for a proposal
+ * a person should confirm.
  */
 export const EXCLUDED: Readonly<Record<string, string>> = {
   "inbox.check": "the inbox is read with receive_events, which commits what it showed and pulls the next in one call; a second reader would move the same cursor",
@@ -673,7 +674,7 @@ const ARGUMENT_CHECKS: Readonly<Record<string, { check(input: Record<string, unk
       return type === "channel:create" || type === "channel:add_member" || type === "agent:create" ? null
         : "action.type must be channel:create, channel:add_member or agent:create: the integration cards take ids you have no way to know, and are made by Raft's own integration commands";
     },
-    described: " A card is the route for a change your role does not allow you to make yourself, or one you want a person to confirm;" +
+    described: " A card is the route for a change your role does not allow you to make yourself (a person whose role allows it carries it out), or one you want a person to confirm;" +
       " what Raft lets you do directly, do with its own tool, with no card." +
       " Only channel:create, channel:add_member and agent:create cards can be prepared here: the integration cards take ids you have no way to know, and are made by Raft's own integration commands.",
   },
@@ -1980,7 +1981,8 @@ export function createRaftPlugin(deps: {
       shape: "token",
       grants: "As that Raft agent, and only as far as the credential's capabilities reach: send, read and search messages, receive queued events, " +
         "join, leave and mute channels and see their members, add the people it mentions to a conversation, react, work its task boards (deleting tasks among it), " +
-        "update its own profile (display name, description, avatar), read the Raft Manual, post action cards for a person to confirm, " +
+        "create, update, archive and unarchive channels and add or remove their members, update the server and its Labs, where its role on the Server allows it, " +
+        "update its own profile (display name, avatar), read the Raft Manual, post action cards for a person to confirm, " +
         "and sign into the Connected Apps on its Server as that agent (Agent Login) to run the actions their manifests offer.",
       looksLike: [{ kind: "Raft agent credential", pattern: "sk_agent_[A-Za-z0-9_-]{16,}" }],
     },

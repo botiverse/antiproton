@@ -197,8 +197,8 @@ const EXPECTED_GENERATED = [
   "messages.react", "messages.unreact", "attachments.downloadUrl", "attachments.comments", "mentions.pending", "mentions.notify", "mentions.add", "mentions.delivery",
   "actions.prepare",
   "manual.get", "manual.search", "tasks.claim", "tasks.list", "tasks.create", "tasks.unclaim", "tasks.assign", "tasks.unassign",
-  "tasks.updateStatus", "tasks.amend", "tasks.history", "tasks.show", "tasks.convert", "tasks.delete", "channels.join", "channels.leave",
-  "channels.mute", "channels.unmute", "channels.members", "channels.info", "threads.list", "threads.unfollow", "server.info", "users.info",
+  "tasks.updateStatus", "tasks.amend", "tasks.history", "tasks.show", "tasks.convert", "tasks.delete", "channels.create", "channels.update", "channels.archive", "channels.unarchive", "channels.addMember", "channels.removeMember", "channels.join", "channels.leave",
+  "channels.mute", "channels.unmute", "channels.members", "channels.info", "threads.list", "threads.unfollow", "server.info", "server.update", "labs.list", "labs.setAccess", "labs.setEnrollment", "users.info",
   "profile.show", "profile.update",
 ];
 
@@ -1873,12 +1873,12 @@ await check("what a person wrote is never rewritten: message continuations, desc
     ["tasks_history", story, "Current title: fix it inbox_check({}) twice-spaced"], ["tasks_history", story, JSON.stringify({ title: TITLES[1] })]] as const) {
     if (!text.includes(want)) throw new Error(`${where}: ${JSON.stringify(want)} did not come back as written: ${text}`);
   }
-  // Controls: the hints around those words are the SDK's tool calls, and an admin write points at an action card.
+  // Controls: the hints around those words are the SDK's tool calls, and an admin write names its own tool (SDK 0.14.0).
   const page = String(((await raftPlugin.invoke("messages_read", { target: "#ops" }, lacking())) as any).text);
   if (!/^Older exist: messages_read\(\{ target: "#ops", before: 41 \}\)$/m.test(page) || /no tool to open attachments/.test(page) ||
       !page.includes('[1 attachment: plan.pdf (id:att-9) — use attachments_download_url({ attachmentId: "att-9" }) to download]')) throw new Error(`page: ${page}`);
   const full = String(((await raftPlugin.invoke("server_info", { view: "full" }, lacking())) as any).text);
-  if (!/^Server-profile changes have no tool and remain server-role gated: ask a human via an action card \(`actions_prepare`\)\.$/m.test(full)) throw new Error(`overview: ${full}`);
+  if (!/^Server-profile changes use `server_update` and remain server-role gated\.$/m.test(full)) throw new Error(`overview: ${full}`);
 });
 
 /**
@@ -3351,7 +3351,7 @@ await check("mentions_add, profile_update and tasks_delete are offered, describe
   }
   // actions_prepare names them as what needs no card.
   const card = toolNamed("actions_prepare")!.summary;
-  if (!/your role does not allow you to make yourself, or one you want a person to confirm/.test(card) || !/do with its own tool, with no card/.test(card)) throw new Error(card);
+  if (!/your role does not allow you to make yourself \(a person whose role allows it carries it out\), or one you want a person to confirm/.test(card) || !/do with its own tool, with no card/.test(card)) throw new Error(card);
   const calls: Array<{ url: string; method: string; body: any }> = [];
   globalThis.fetch = (async (url: any, init?: any) => {
     const u = new URL(String(url));
@@ -3378,6 +3378,39 @@ await check("mentions_add, profile_update and tasks_delete are offered, describe
       JSON.stringify(calls[2].body) !== JSON.stringify({ avatarUrl: "https://img.example/p.png", displayName: "Piper" })) throw new Error(`profile_update request: ${JSON.stringify(calls[2])}`);
   if (!/Piper/.test(updated)) throw new Error(`profile_update: ${updated}`);
   if (calls.length !== 3) throw new Error(`requests: ${JSON.stringify(calls)}`);
+});
+
+/**
+ * SDK 0.14.0 made channel and server administration operations, generated like the rest. The Server checks the agent's
+ * role on every call; its refusal reaches the model with its status, code and next action (`withServerCode`).
+ */
+await check("the administration operations (SDK 0.14.0) are offered and pass through; a role refusal shows its code and next action", async () => {
+  for (const name of ["channels_create", "channels_update", "channels_archive", "channels_unarchive", "channels_add_member", "channels_remove_member", "server_update"]) {
+    const t = toolNamed(name);
+    if (!t || t.sideEffects !== "write" || /Held here/.test(t.summary)) throw new Error(`${name}: ${JSON.stringify(t)}`);
+  }
+  const calls: Array<{ url: string; method: string; body: any }> = [];
+  let answer: () => Response = () => json(200, { id: "c9", name: "launch-room", type: "private", description: null });
+  globalThis.fetch = (async (url: any, init?: any) => {
+    calls.push({ url: new URL(String(url)).pathname, method: init?.method ?? "GET", body: init?.body ? JSON.parse(String(init.body)) : undefined });
+    return answer();
+  }) as any;
+  const created = String(((await raftPlugin.invoke("channels_create", { name: "#launch-room", visibility: "private" }, inTurn(ctx()))) as any).text);
+  if (calls.length !== 1 || calls[0]!.method !== "POST" || calls[0]!.url !== "/internal/agent-api/channels" ||
+      JSON.stringify(calls[0]!.body) !== JSON.stringify({ name: "launch-room", visibility: "private" })) throw new Error(`request: ${JSON.stringify(calls)}`);
+  if (!created.startsWith("Created #launch-room (private).")) throw new Error(`created: ${created}`);
+  // The Server refuses: its code and its next action reach the model.
+  const next = "Creating channels needs the admin role; ask a server owner or admin.";
+  answer = () => json(403, { errorCode: "server_role_required", suggestedNextAction: next, error: "raw body text that stays out" });
+  const refused = await failure(() => raftPlugin.invoke("channels_create", { name: "launch-room" }, inTurn(ctx())));
+  if (refused.message !== `The Raft Server rejected the request (HTTP 403, server_role_required). — ${next}`) throw new Error(`refused: ${refused.message}`);
+  // A 403 with neither: the SDK's permission sentence, not "read the error code".
+  answer = () => json(403, {});
+  const bare = await failure(() => raftPlugin.invoke("channels_create", { name: "launch-room" }, inTurn(ctx())));
+  if (bare.message !== "The Raft Server rejected the request (HTTP 403). — Your role does not allow this here; ask a server owner or admin to do it, or to change your role.") throw new Error(`bare: ${bare.message}`);
+  // Read through a function: the first check narrowed calls.length to 1, and the two refusals since sent two more.
+  const sent = (): number => calls.length;
+  if (sent() !== 3) throw new Error(`requests: ${sent()}`);
 });
 
 /**
@@ -3452,15 +3485,23 @@ await check("through the gateway, a tool the credential lacks is not named: the 
     const out: any = await gateway.invoke({ tenantId: "tenant", agentId: "agent", taskId: "task", contextId: "c" } as any, "inbox.server_info", { view: "full" });
     return String(out.result?.text ?? JSON.stringify(out));
   };
-  const LINE = /^Server-profile changes have no tool and remain server-role gated: ask a human via an action card \((.*)\)\.$/m;
-  // A credential with tasks: actions_prepare is on the mount's list, and the SDK's pointer at it stands.
-  await store.updateMountToolSnapshot("tenant", "agent", "inbox", await listedUnder(["read", "tasks"]));
-  const withTasks = await overview();
-  if (LINE.exec(withTasks)?.[1] !== "`actions_prepare`") throw new Error(`with tasks: ${withTasks}`);
-  // One without: the same line says it in words.
-  await store.updateMountToolSnapshot("tenant", "agent", "inbox", await listedUnder(["read"]));
+  // SDK 0.14.0: the overview names server_update, which needs the `server` capability.
+  const LINE = /^Server-profile changes use (.*) and remain server-role gated\.$/m;
+  // A credential with server: server_update is on the mount's list, and the SDK's pointer at it stands.
+  await store.updateMountToolSnapshot("tenant", "agent", "inbox", await listedUnder(["read", "server"]));
+  const withServer = await overview();
+  if (LINE.exec(withServer)?.[1] !== "`server_update`") throw new Error(`with server: ${withServer}`);
+  // One without: server_update is not listed, and the same line says it in words.
+  const readOnlyList = await listedUnder(["read"]);
+  if (readOnlyList.tools.some((t: any) => t.name === "server_update")) throw new Error("server_update listed without the server capability");
+  await store.updateMountToolSnapshot("tenant", "agent", "inbox", readOnlyList);
   const readOnly = await overview();
-  if (/actions_prepare/.test(readOnly) || LINE.exec(readOnly)?.[1] !== "`a Raft operation this mount does not offer`") throw new Error(`read only: ${readOnly}`);
+  if (/server_update/.test(readOnly) || LINE.exec(readOnly)?.[1] !== "`a Raft operation this mount does not offer`") throw new Error(`read only: ${readOnly}`);
+  // SDK 0.15.0's Labs: the list needs read, its two writes read and server. Without server only the list is listed.
+  const names = (l: { tools: Array<{ name: string }> }) => l.tools.map((t) => t.name).filter((n) => n.startsWith("labs_") || n === "server_update").sort();
+  if (JSON.stringify(names(readOnlyList)) !== JSON.stringify(["labs_list"])) throw new Error(`read only lists: ${names(readOnlyList)}`);
+  const withServerList = await listedUnder(["read", "server"]);
+  if (JSON.stringify(names(withServerList)) !== JSON.stringify(["labs_list", "labs_set_access", "labs_set_enrollment", "server_update"])) throw new Error(`with server lists: ${names(withServerList)}`);
 });
 
 await check("a plugin built with no object storage does not offer the download at all, and every pointer at it says so", async () => {
@@ -3488,7 +3529,7 @@ await check("a plugin built with no object storage does not offer the download a
 
 await check("a turn's re-take that Raft refuses, or that lists nothing, keeps the working list, says why, and backs off; an operator's refresh still takes it", async () => {
   const { rt, offered } = await raftRuntime();
-  const every = ["read", "send", "reactions", "mentions", "tasks", "knowledge", "channels"];
+  const every = ["read", "send", "reactions", "mentions", "tasks", "knowledge", "channels", "server"];
   let answer: "ok" | "refuse" | "empty" = "ok";
   let asked = 0;
   globalThis.fetch = (async (url: any) => {
