@@ -19,6 +19,9 @@ import { operatorModelOf } from "../cf/src/model-request.ts";
 import { canonJson } from "../src/core/canon-json.ts";
 import { addedLines, contextNotice, returnContextChange, takeContextChange, promptContextFor, type PromptContext } from "../src/runtime/prompt-context.ts";
 import { recordRequestPrefix } from "../src/runtime/request-prefix.ts";
+import { SqliteStore } from "../src/store/sqlite.ts";
+import { ToolGateway } from "../src/runtime/gateway.ts";
+import { statePlugin } from "../src/plugins/state.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void> | void) {
@@ -323,6 +326,33 @@ await check("the notice: per part, labelled, agent and setup text fenced; an emp
   must(show(n.keys) === show(["memory", "todo", "held"]), `keys told: ${show(n.keys)}`);
   const plugin = contextNotice(ctxOf([part("p", "old words", "plugin")]), ctxOf([part("p", "new words", "plugin")]))!;
   must(plugin.text.includes("`p` — now reads:\nnew words"), `the plugin's own words are not fenced: ${plugin.text}`);
+});
+
+await check("a document ending in a newline: an append is told as the lines added, not the whole document", () => {
+  must(show(addedLines(["- a", ""], ["- a", "- b", ""])) === show(["- b"]), "trailing newline on both");
+  must(show(addedLines(["- a"], ["- a", "- b", ""])) === show(["- b"]), "a newline that arrived with the append");
+  const n = contextNotice(ctxOf([part("memory", "- a\n")]), ctxOf([part("memory", "- a\n- b\n")]))!;
+  must(n.text.includes("Your `memory`, written by you — lines added since you last saw it:\n```\n- b\n```"), n.text);
+});
+
+await check("the paragraph and its parts come from one read: a write between two reads cannot leave them disagreeing", async () => {
+  const store = new SqliteStore(":memory:");
+  await store.init();
+  await store.createAgent("t", "a");
+  await store.addMount({ tenantId: "t", agentId: "a", alias: "state", installationId: "i-state", connectionId: null,
+    plugin: "state", toolVersion: "1.0.0", publicConfig: {}, secretRef: null, policy: null } as any);
+  // Every read of `memory` sees a newer write: what a write landing between two reads of it looks like.
+  let version = 0;
+  const read = store.getState.bind(store);
+  (store as any).getState = async (t: string, a: string, key: string) =>
+    key === "memory" ? { value: `- version ${++version}`, ref: null, bytes: 11 } : read(t, a, key);
+  const plugin = statePlugin(store, null, "b");
+  const gw = new ToolGateway(store, [plugin], new Set(["state"]), { async resolve() { return null; } } as any);
+  const [p] = await gw.promptParagraphs({ tenantId: "t", agentId: "a", taskId: "k" } as any);
+  const memory = p!.parts.find((x) => x.key === "state:doc:memory");
+  must(memory && memory.text && p!.text.includes(`## memory (durable facts)\n${memory.text}`),
+    `the prompt says ${show(p!.text.match(/version \d+/g))}, the stored part ${show(memory?.text)}`);
+  must(version === 1, `memory was read ${version} times for one paragraph`);
 });
 
 await check("parts are compared by key, never by what the agent wrote: two documents with the same heading inside, and a repeated entry heading", () => {

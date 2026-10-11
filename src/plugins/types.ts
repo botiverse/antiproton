@@ -2079,8 +2079,12 @@ export interface Plugin {
    * message (src/runtime/prompt-context.ts): one entry per part that changed, labelled with the part's `label`, its
    * text fenced and said to be the agent's own when `by` is `agent`. The parts are compared by `key` and never parsed,
    * so text the agent wrote cannot be read as structure. Absent or null: the whole paragraph is one part.
+   *
+   * It answers the paragraph's text with its parts, from one read, and where it is declared the runtime asks it in
+   * place of `promptContribution`: two reads could straddle a write, leaving the prompt with the older text and the
+   * stored parts with the newer, and the change would then never be told.
    */
-  promptParts?(ctx: PluginContext): Promise<PromptPart[] | null>;
+  promptParts?(ctx: PluginContext): Promise<{ text: string | null; parts: PromptPart[] } | null>;
 
 
 

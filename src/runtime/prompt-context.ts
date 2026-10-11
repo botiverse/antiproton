@@ -153,8 +153,10 @@ const CUT = "…";
  */
 export function addedLines(before: readonly string[], now: readonly string[]): string[] | null {
   const cutNow = now[0] === CUT;
-  const b = before[0] === CUT ? before.slice(1) : [...before];
-  const n = cutNow ? now.slice(1) : [...now];
+  // A document that ends in a newline splits into a last empty line, which an append moves; it is not a line of its own.
+  const trimEnd = (l: string[]) => { while (l.length && l[l.length - 1] === "") l.pop(); return l; };
+  const b = trimEnd(before[0] === CUT ? before.slice(1) : [...before]);
+  const n = trimEnd(cutNow ? now.slice(1) : [...now]);
   const equal = (i: number, partialFirst: boolean) => {
     for (let k = 0; k < i; k++) {
       const was = b[b.length - i + k]!, is = n[k]!;

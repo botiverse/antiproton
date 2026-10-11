@@ -459,18 +459,23 @@ export class ToolGateway {
           async agentSecret() { return null; },
         };
         let text: string | null = null;
-        try {
-          text = await plugin.promptContribution(pctx);
-        } catch (e: any) {
-          // A plugin that cannot describe itself must not stop the agent from
-          // opening: the paragraph is dropped and the run continues.
-          console.warn(`promptContribution failed for ${mount.alias}: ${String(e?.message ?? e)}`);
-          text = null;
-        }
         let own: PromptPart[] | null = null;
+        // One read gives both, where the plugin can: text and parts read apart could straddle a write.
         if (plugin.promptParts) {
-          try { own = await plugin.promptParts(pctx); }
-          catch (e: any) { console.warn(`promptParts failed for ${mount.alias}: ${String(e?.message ?? e)}`); own = null; }
+          try {
+            const both = await plugin.promptParts(pctx);
+            if (both) { text = both.text; own = both.parts; }
+          } catch (e: any) { console.warn(`promptParts failed for ${mount.alias}: ${String(e?.message ?? e)}`); }
+        }
+        if (own === null) {
+          try {
+            text = await plugin.promptContribution(pctx);
+          } catch (e: any) {
+            // A plugin that cannot describe itself must not stop the agent from
+            // opening: the paragraph is dropped and the run continues.
+            console.warn(`promptContribution failed for ${mount.alias}: ${String(e?.message ?? e)}`);
+            text = null;
+          }
         }
         const trimmed = text?.trim() ?? "";
         const parts = own

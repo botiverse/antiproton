@@ -188,12 +188,13 @@ export function statePlugin(
       return text.trim() ? text : null;
     },
 
-    /** The same paragraph's parts: the seeded block's two, the working set's heading and each document. */
+    /** The same paragraph with its parts, from one read: the seeded block's two, the working set's heading and each document. */
     async promptParts(ctx) {
       const first = (await store.findMountsByPlugin(
         ctx.caller.tenantId, ctx.caller.agentId, PLUGIN_ID))[0]?.alias;
-      if (first && first !== ctx.alias) return null;
-      return (await paragraph(ctx)).parts;
+      if (first && first !== ctx.alias) return { text: null, parts: [] };
+      const { text, parts } = await paragraph(ctx);
+      return { text: text.trim() ? text : null, parts };
     },
 
     config: [
