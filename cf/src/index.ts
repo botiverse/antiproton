@@ -3107,7 +3107,7 @@ function consoleRefusal(request: Request, error: string, status: number): Respon
  * live key was revoked, and nothing about any other.
  */
 async function adminApiKeys(request: Request, env: Env): Promise<Response> {
-  if (!env.AUTOMATION_TOKEN || request.headers.get("x-harness-token") !== env.AUTOMATION_TOKEN) {
+  if (!isOperator(env.AUTOMATION_TOKEN, request.headers.get("x-harness-token"))) {
     return Response.json({ error: "unauthorized" }, { status: 401 });
   }
   if (request.method !== "POST") return Response.json({ error: "POST" }, { status: 405 });
@@ -3246,7 +3246,7 @@ function hookAnswer(res: Response, fields: Record<string, unknown>): Response {
  *   GET  ?tenantId=&agentId=          -> {hooks, recent}
  */
 async function adminHooks(request: Request, env: Env, url: URL): Promise<Response> {
-  if (!env.AUTOMATION_TOKEN || request.headers.get("x-harness-token") !== env.AUTOMATION_TOKEN) {
+  if (!isOperator(env.AUTOMATION_TOKEN, request.headers.get("x-harness-token"))) {
     return Response.json({ error: "unauthorized" }, { status: 401 });
   }
   const dir = d1InboundHooks(env.CONTROL_DB);
@@ -4075,7 +4075,7 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
           // Who may sign in with GitHub, and as which agent. Header-only like
           // the other /admin routes, and closed when no token is configured:
           // the operator adds a row before a person's first sign-in.
-          if (!env.AUTOMATION_TOKEN || request.headers.get("x-harness-token") !== env.AUTOMATION_TOKEN) {
+          if (!isOperator(env.AUTOMATION_TOKEN, request.headers.get("x-harness-token"))) {
             return Response.json({ error: "unauthorized" }, { status: 401 });
           }
           const dir = identities(env);
@@ -4127,7 +4127,7 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
           // The operator's way in, alongside /admin/diagnose. The UI button
           // derives the agent from whoever is signed in, which is right for a
           // person and useless for unsticking someone else's task.
-          if (env.AUTOMATION_TOKEN && request.headers.get("x-harness-token") !== env.AUTOMATION_TOKEN) {
+          if (!isOperator(env.AUTOMATION_TOKEN, request.headers.get("x-harness-token"))) {
             return Response.json({ error: "unauthorized" }, { status: 401 });
           }
           const t = url.searchParams.get("tenantId") ?? "demo";
@@ -4148,7 +4148,7 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
           // occasion it exists for is a deployment-wide rename someone decided
           // to apply, and that decision does not belong to whoever has the
           // page open.
-          if (env.AUTOMATION_TOKEN && request.headers.get("x-harness-token") !== env.AUTOMATION_TOKEN) {
+          if (!isOperator(env.AUTOMATION_TOKEN, request.headers.get("x-harness-token"))) {
             return Response.json({ error: "unauthorized" }, { status: 401 });
           }
           if (request.method !== "POST") return Response.json({ error: "POST" }, { status: 405 });
@@ -4168,7 +4168,7 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
           // old hook — a storage change that dropped per-mount state was the first occasion. Raft
           // need do nothing: the plugin rebuilds the hook and re-registers it with the agent's own
           // credential, so this is ours to run, and it is idempotent.
-          if (env.AUTOMATION_TOKEN && request.headers.get("x-harness-token") !== env.AUTOMATION_TOKEN) {
+          if (!isOperator(env.AUTOMATION_TOKEN, request.headers.get("x-harness-token"))) {
             return Response.json({ error: "unauthorized" }, { status: 401 });
           }
           if (request.method !== "POST") return Response.json({ error: "POST" }, { status: 405 });

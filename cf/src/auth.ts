@@ -289,8 +289,9 @@ export function programmaticAccess(
 
 /**
  * The operator's token, and nothing else: no token configured refuses rather
- * than opens. The older /admin routes open when AUTOMATION_TOKEN is unset, for
- * a local dev server; a route that returns a person's conversation does not.
+ * than opens. Every operator route checks through here, so none of them can
+ * open by accident: /admin/compact, /admin/rename-mount and /admin/provision-push
+ * once let every caller in when AUTOMATION_TOKEN was unset (issue #814).
  */
 export function isOperator(expected: string | undefined, presented: string | null): boolean {
   return !!expected && presented !== null && constantTimeEqual(presented, expected);

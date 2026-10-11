@@ -1,0 +1,108 @@
+/**
+ * Every operator route, through the Worker's own `fetch`: with AUTOMATION_TOKEN unset nobody is let in, a wrong
+ * token is refused, and the right one gets past the gate. /admin/compact, /admin/rename-mount and
+ * /admin/provision-push once checked `env.AUTOMATION_TOKEN && header !== token`, which opens when the secret is unset
+ * (issue #814); every route now asks auth.ts `isOperator`.
+ *
+ * "Gets past the gate" is read from the route's own work where it is cheap to see (the object's method was called),
+ * and otherwise as an answer that is neither the refusal nor a crash: a method the route does not serve (405) or a
+ * query it rejects (400) is an answer only a caller past the gate receives.
+ */
+import { register } from "node:module";
+
+const STAND_IN = "export class DurableObject { constructor(ctx, env) { this.ctx = ctx; this.env = env; } }" +
+  " export class WorkerEntrypoint { constructor(ctx, env) { this.ctx = ctx; this.env = env; } }" +
+  " export class RpcTarget {} export const env = {};";
+register("data:text/javascript," + encodeURIComponent(
+  `export async function resolve(s, c, next) { if (s.startsWith("cloudflare:")) return { url: ${JSON.stringify("data:text/javascript," + encodeURIComponent(STAND_IN))}, shortCircuit: true }; return next(s, c); }`));
+const { default: worker } = await import("../cf/src/index.ts");
+const { setLogSink } = await import("../src/core/log.ts");
+setLogSink(() => {});
+
+const results: Array<{ name: string; ok: boolean; error?: string }> = [];
+async function check(name: string, fn: () => Promise<void> | void) {
+  try { await fn(); results.push({ name, ok: true }); }
+  catch (e) { results.push({ name, ok: false, error: String((e as Error)?.stack ?? e).split("\n").slice(0, 3).join("\n      ") }); }
+}
+function must(cond: unknown, msg: string): asserts cond { if (!cond) throw new Error(msg); }
+
+const TOKEN = "operator-token-814";
+
+/** An env whose object and database record every call and answer harmlessly. */
+function world(token: string | undefined) {
+  const calls: string[] = [];
+  const objectStub = new Proxy({}, {
+    get: (_t, prop) => {
+      if (prop === "then") return undefined;
+      return async (...args: unknown[]) => { calls.push(`object.${String(prop)}`); return { ok: true, args }; };
+    },
+  });
+  const stmt: any = {
+    bind: () => stmt,
+    first: async () => { calls.push("db.first"); return null; },
+    all: async () => { calls.push("db.all"); return { results: [] }; },
+    run: async () => { calls.push("db.run"); return { meta: { changes: 0 } }; },
+  };
+  const env: Record<string, unknown> = {
+    AGENT: { idFromName: (n: string) => n, get: () => objectStub },
+    CONTROL_DB: { prepare: () => stmt, batch: async () => [] },
+    ...(token === undefined ? {} : { AUTOMATION_TOKEN: token }),
+  };
+  return { env, calls };
+}
+
+type Route = { path: string; method: string; refused: number; passed: (status: number, calls: string[]) => boolean };
+const ROUTES: Route[] = [
+  // The three that opened (#814): their work is a call on the agent's object, so "passed" is that call.
+  { path: "/admin/compact?tenantId=demo&agentId=u-a", method: "POST", refused: 401, passed: (_s, c) => c.includes("object.uiCompact") },
+  { path: "/admin/rename-mount?tenantId=demo&agentId=u-a&from=x&to=y", method: "POST", refused: 401, passed: (s, c) => s === 200 && c.includes("object.uiRenameMount") },
+  { path: "/admin/provision-push", method: "GET", refused: 401, passed: (s) => s === 405 },
+  // The ones that were already closed, held to it.
+  { path: "/admin/identity", method: "GET", refused: 401, passed: (s, c) => s === 200 && c.includes("db.all") },
+  { path: "/admin/api-keys", method: "GET", refused: 401, passed: (s) => s === 405 },
+  { path: "/admin/hooks", method: "PUT", refused: 401, passed: (s) => s === 405 },
+  { path: "/admin/mounts", method: "GET", refused: 401, passed: (s) => s === 405 },
+  { path: "/admin/service-tokens", method: "PATCH", refused: 401, passed: (s) => s === 405 },
+  { path: "/admin/provider-tokens", method: "PATCH", refused: 401, passed: (s) => s === 405 },
+  { path: "/admin/usage-costs", method: "GET", refused: 401, passed: (s, c) => s === 200 && c.includes("db.all") },
+  { path: "/admin/migrate-engine", method: "GET", refused: 401, passed: (s) => s === 405 },
+  { path: "/admin/diagnose", method: "GET", refused: 401, passed: (s) => s === 400 },
+  { path: "/admin/transcript", method: "GET", refused: 401, passed: (s) => s === 400 },
+  // A signed-in admin or the operator's token (auth.ts isAdmin); its refusal is "no such route".
+  { path: "/admin/models", method: "PATCH", refused: 404, passed: (s) => s === 405 },
+];
+
+async function hit(r: Route, token: string | undefined, presented: string | null) {
+  const w = world(token);
+  const headers: Record<string, string> = {};
+  if (presented !== null) headers["x-harness-token"] = presented;
+  const res = await worker.fetch(new Request(`https://x${r.path}`, { method: r.method, headers }), w.env as never, { waitUntil() {}, passThroughOnException() {} } as never);
+  return { status: res.status, text: await res.text(), calls: w.calls };
+}
+
+for (const r of ROUTES) {
+  const name = r.path.split("?")[0];
+  await check(`${name}: AUTOMATION_TOKEN unset refuses every caller`, async () => {
+    for (const presented of [null, "", "anything", "undefined"]) {
+      const out = await hit(r, undefined, presented);
+      must(out.status === r.refused, `header ${JSON.stringify(presented)}: ${out.status} ${out.text.slice(0, 200)}`);
+      must(!out.calls.some((c) => c.startsWith("object.")), `header ${JSON.stringify(presented)} reached the object: ${out.calls}`);
+    }
+  });
+  await check(`${name}: a wrong or missing token is refused`, async () => {
+    for (const presented of [null, "", "operator-token-81", TOKEN + "x"]) {
+      const out = await hit(r, TOKEN, presented);
+      must(out.status === r.refused, `header ${JSON.stringify(presented)}: ${out.status} ${out.text.slice(0, 200)}`);
+      must(!out.calls.some((c) => c.startsWith("object.")), `header ${JSON.stringify(presented)} reached the object: ${out.calls}`);
+    }
+  });
+  await check(`${name}: the configured token gets past the gate`, async () => {
+    const out = await hit(r, TOKEN, TOKEN);
+    must(r.passed(out.status, out.calls), `${out.status} ${out.text.slice(0, 200)} calls=${out.calls}`);
+  });
+}
+
+const failed = results.filter((r) => !r.ok);
+for (const r of results) console.log(`${r.ok ? "PASS" : "FAIL"}  ${r.name}${r.ok ? "" : `\n      ${r.error}`}`);
+console.log(`\n${results.length - failed.length}/${results.length} passed`);
+process.exit(failed.length ? 1 : 0);

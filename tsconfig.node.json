@@ -135,6 +135,7 @@
     "test/eval-seed.ts",
     "test/eval-seed-object.ts",
     "test/provision-model.ts",
+    "test/admin-fail-closed.ts",
     "test/eval-read.ts"
   ]
 }
