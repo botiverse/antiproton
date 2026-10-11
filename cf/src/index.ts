@@ -1246,7 +1246,7 @@ export class AgentDO extends DurableObject<Env> {
           prev.agent_id);
       }
     } catch { /* nothing to keep is not a failure */ }
-    for (const t of ["pi_entries", "pi_usage", "pi_values", "pi_list", "pi_meta", "pi_model_jobs"]) {
+    for (const t of ["pi_entries", "pi_usage", "pi_values", "pi_list", "pi_meta", "pi_model_jobs", "prompt_context", "model_request_prefix"]) {
       try { this.sql.exec(`DELETE FROM ${t}`); } catch { /* not created yet */ }
     }
     // The cached runtime holds a built session over the rows just deleted.
@@ -1261,7 +1261,7 @@ export class AgentDO extends DurableObject<Env> {
     }
     // The transcript is object-local and has no tenant column: a bench object
     // holds nothing else, so clearing it is clearing the run.
-    for (const t of ["pi_entries", "pi_usage", "pi_values", "pi_list", "pi_meta", "pi_model_jobs"]) {
+    for (const t of ["pi_entries", "pi_usage", "pi_values", "pi_list", "pi_meta", "pi_model_jobs", "prompt_context", "model_request_prefix"]) {
       try { this.sql.exec(`DELETE FROM ${t}`); } catch { /* not created yet */ }
     }
     // Tolerant on purpose: purge is what you reach for when an object is in a

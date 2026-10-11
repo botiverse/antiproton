@@ -1646,6 +1646,18 @@ export function markReleased<E extends Error, F extends Released | Released[]>(e
   return marked;
 }
 
+/** One unit of a plugin's prompt paragraph (`Plugin.promptParts`). */
+export interface PromptPart {
+  /** Stable across renders and unique within the plugin: what two renders are compared by. */
+  key: string;
+  /** What the model is told the part is, e.g. "`memory` (durable facts)". */
+  label: string;
+  /** The part's text as the paragraph shows it; empty when the part is absent. */
+  text: string;
+  /** Who wrote the text: the agent, the evaluation's setup (seeded files), or the plugin itself. */
+  by: "agent" | "setup" | "plugin";
+}
+
 export interface Holding {
   /**
    * Which of this plugin's tools lets go of the thing, and which postpones.
@@ -2059,6 +2071,16 @@ export interface Plugin {
    * Called once per harness open, per mount.
    */
   promptContribution?(ctx: PluginContext): Promise<string | null>;
+
+  /**
+   * The same paragraph as `promptContribution`, cut into the units a change is told by, when the paragraph is made
+   * of parts that change on their own (the state plugin's documents). On pi085 the system prompt keeps a
+   * conversation's paragraph as it was when it began, and a later change is told in a notice at the head of the next
+   * message (src/runtime/prompt-context.ts): one entry per part that changed, labelled with the part's `label`, its
+   * text fenced and said to be the agent's own when `by` is `agent`. The parts are compared by `key` and never parsed,
+   * so text the agent wrote cannot be read as structure. Absent or null: the whole paragraph is one part.
+   */
+  promptParts?(ctx: PluginContext): Promise<PromptPart[] | null>;
 
 
 

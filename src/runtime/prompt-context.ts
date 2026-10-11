@@ -14,9 +14,12 @@
  * So the two parts are taken once per conversation (`promptContextFor`) and every later open of a harness for it is
  * built from what was taken, byte for byte. What moved since is not lost: before a message reaches the model the
  * runtime compares the parts as they are now with what the model last saw (`takeContextChange`), and when they
- * differ the message carries one notice that says, section by section, what is new — appended lines where a document
- * only grew, the section as it now reads otherwise. Earlier messages are never rewritten; the notice is part of the
- * new message, so the request before it is the request the provider already has.
+ * differ the message carries one notice that says, part by part, what is new — appended lines where a document only
+ * grew, the part as it now reads otherwise. The parts are the plugin's own (`Plugin.promptParts`: the state plugin's
+ * documents, its seeded files, its headings), compared by key and never parsed, so what the agent wrote cannot be
+ * mistaken for structure; text the agent or the setup wrote is fenced in the notice and said to be theirs. Earlier
+ * messages are never rewritten; the notice is part of the new message, so the request before it is the request the
+ * provider already has.
  *
  * A new conversation (a fresh context, or a transcript with no message yet, as a reused bench object starts) takes
  * the parts again, so a conversation starts from what is true when it starts.
@@ -25,7 +28,8 @@
  * (src/model/durable-offloaded.ts `jobContext`), which leaves the prefix before it alone.
  */
 import { canonJson } from "../core/canon-json.ts";
-import { fencedLines } from "../plugins/state.ts";
+import { fenceFor } from "../plugins/state.ts";
+import type { PromptPart } from "../plugins/types.ts";
 import { piTables } from "../store/pi-storage.ts";
 
 type Sql = { exec(query: string, ...bindings: unknown[]): { toArray(): any[] } };
@@ -34,25 +38,38 @@ type Sql = { exec(query: string, ...bindings: unknown[]): { toArray(): any[] } }
 export interface PromptContext {
   /** The mounted plugins' paragraphs, in the gateway's order (`ToolGateway.promptContributions`). */
   contributions: string[];
+  /** The same paragraphs as the units a change is told by (`ToolGateway.promptParagraphs`). */
+  parts: PromptPart[];
   /** One line per held thing (src/runtime/held.ts `heldItems`). */
   held: string[];
 }
 
+/** The key `held` is owed under (`returnContextChange`), beside the parts' own. */
+const HELD = "held";
+
 const TABLE = `CREATE TABLE IF NOT EXISTS prompt_context (
   owner TEXT NOT NULL, conversation TEXT NOT NULL, snapshot TEXT NOT NULL, seen TEXT NOT NULL,
-  taken_at INTEGER NOT NULL, PRIMARY KEY (owner, conversation))`;
+  owed TEXT NOT NULL DEFAULT '[]', taken_at INTEGER NOT NULL, PRIMARY KEY (owner, conversation))`;
 
-const asText = (c: PromptContext) => canonJson({ contributions: c.contributions, held: c.held });
+const asText = (c: PromptContext) => canonJson({ contributions: c.contributions, parts: c.parts, held: c.held });
+/** What the model is told about, so what "nothing moved" compares: the parts and the held lines. */
+const toldOf = (c: PromptContext) => canonJson({ parts: c.parts, held: c.held });
 
 function parse(text: string): PromptContext {
   const v = JSON.parse(text) as Partial<PromptContext>;
-  return { contributions: Array.isArray(v.contributions) ? v.contributions.map(String) : [], held: Array.isArray(v.held) ? v.held.map(String) : [] };
+  return {
+    contributions: Array.isArray(v.contributions) ? v.contributions.map(String) : [],
+    parts: Array.isArray(v.parts) ? v.parts.map((p: any) => ({ key: String(p?.key), label: String(p?.label ?? ""), text: String(p?.text ?? ""), by: p?.by === "agent" || p?.by === "setup" ? p.by : "plugin" })) : [],
+    held: Array.isArray(v.held) ? v.held.map(String) : [],
+  };
 }
 
-function row(sql: Sql, owner: string, conversation: string): { snapshot: string; seen: string } | null {
+const keysOf = (text: string): string[] => { try { const v = JSON.parse(text); return Array.isArray(v) ? v.map(String) : []; } catch { return []; } };
+
+function row(sql: Sql, owner: string, conversation: string): { snapshot: string; seen: string; owed: string } | null {
   sql.exec(TABLE);
-  const r = sql.exec("SELECT snapshot, seen FROM prompt_context WHERE owner = ? AND conversation = ?", owner, conversation).toArray()[0];
-  return r ? { snapshot: String(r.snapshot), seen: String(r.seen) } : null;
+  const r = sql.exec("SELECT snapshot, seen, owed FROM prompt_context WHERE owner = ? AND conversation = ?", owner, conversation).toArray()[0];
+  return r ? { snapshot: String(r.snapshot), seen: String(r.seen), owed: String(r.owed ?? "[]") } : null;
 }
 
 /**
@@ -73,120 +90,129 @@ export function promptContextFor(sql: Sql, owner: string, conversation: string, 
   const had = row(sql, owner, conversation);
   if (had && started) return parse(had.snapshot);
   const text = asText(current);
-  sql.exec("INSERT INTO prompt_context(owner, conversation, snapshot, seen, taken_at) VALUES (?,?,?,?,?)" +
-    " ON CONFLICT(owner, conversation) DO UPDATE SET snapshot = excluded.snapshot, seen = excluded.seen, taken_at = excluded.taken_at",
+  sql.exec("INSERT INTO prompt_context(owner, conversation, snapshot, seen, owed, taken_at) VALUES (?,?,?,?,'[]',?)" +
+    " ON CONFLICT(owner, conversation) DO UPDATE SET snapshot = excluded.snapshot, seen = excluded.seen, owed = '[]', taken_at = excluded.taken_at",
     owner, conversation, text, text, now);
   return current;
 }
 
 /** A change taken for one message: the notice it carries, and what to put back if the message is not written. */
-export interface ContextChange { notice: string; before: string; after: string }
+export interface ContextChange { notice: string; before: string; beforeOwed: string; after: string; told: string[] }
 
 /**
  * The notice for what moved since the model last saw these parts, with `seen` moved to `current` in the same
- * synchronous step, so two messages racing tell it once between them. Null, and nothing written, when nothing moved
- * or the conversation has no parts taken yet (no harness of pi085's has opened on it).
+ * synchronous step, so two messages racing tell it once between them. Null when nothing moved and nothing is owed,
+ * or the conversation has no parts taken yet (no harness of pi085's has opened on it). `seen` moves only when a notice
+ * is returned, so a change is never marked seen without being told.
  */
 export function takeContextChange(sql: Sql, owner: string, conversation: string, current: PromptContext, header: string): ContextChange | null {
   const had = row(sql, owner, conversation);
   if (!had) return null;
+  const seen = parse(had.seen);
+  const owed = new Set(keysOf(had.owed));
+  if (toldOf(seen) === toldOf(current) && !owed.size) return null;
+  const said = contextNotice(seen, current, owed);
+  if (!said) {
+    // Nothing a reader could be told: what was owed no longer exists, or only the paragraphs' joins moved.
+    if (toldOf(seen) === toldOf(current)) sql.exec("UPDATE prompt_context SET owed = '[]' WHERE owner = ? AND conversation = ?", owner, conversation);
+    return null;
+  }
   const after = asText(current);
-  if (after === had.seen) return null;
-  const body = contextNotice(parse(had.seen), current);
-  sql.exec("UPDATE prompt_context SET seen = ? WHERE owner = ? AND conversation = ?", after, owner, conversation);
-  // Unequal texts with nothing to say (a paragraph that only moved whitespace): seen moves, nobody is told.
-  if (!body) return null;
-  return { notice: header + body, before: had.seen, after };
+  sql.exec("UPDATE prompt_context SET seen = ?, owed = '[]' WHERE owner = ? AND conversation = ?", after, owner, conversation);
+  return { notice: header + said.text, before: had.seen, beforeOwed: had.owed, after, told: said.keys };
 }
 
-/** Put back what `takeContextChange` moved, when the message that carried it was not written. Only if nothing moved it since. */
+/**
+ * Put back what `takeContextChange` moved, when the message that carried it was not written. When nothing moved it
+ * since, `seen` is as it was, so the next message tells the same change. When another message has taken a change in
+ * between, `seen` stays — that message told its part — and what this one would have told is owed instead: the next
+ * notice gives each of those parts in full, whether or not it moved again.
+ */
 export function returnContextChange(sql: Sql, owner: string, conversation: string, change: ContextChange) {
-  sql.exec(TABLE);
-  sql.exec("UPDATE prompt_context SET seen = ? WHERE owner = ? AND conversation = ? AND seen = ?",
-    change.before, owner, conversation, change.after);
+  const had = row(sql, owner, conversation);
+  if (!had) return;
+  if (had.seen === change.after && keysOf(had.owed).length === 0) {
+    sql.exec("UPDATE prompt_context SET seen = ?, owed = ? WHERE owner = ? AND conversation = ?",
+      change.before, change.beforeOwed, owner, conversation);
+    return;
+  }
+  const owed = [...new Set([...keysOf(had.owed), ...change.told])];
+  sql.exec("UPDATE prompt_context SET owed = ? WHERE owner = ? AND conversation = ?", JSON.stringify(owed), owner, conversation);
 }
 
 // ---- the notice ------------------------------------------------------------------------------------------------
-
-interface Section { key: string; heading: string | null; body: string[] }
-
-/** A heading's identity across renders: its text without a trailing parenthetical, which can carry a size. */
-const keyOf = (heading: string) => heading.replace(/\s*\([^()]*\)\s*$/, "").trim();
-
-/**
- * A paragraph's sections, split at its markdown headings outside code fences. Text before the first heading is a
- * section of its own, keyed by its whole text, so any change to it reads as the old one gone and a new one there.
- */
-export function sectionsOf(text: string): Section[] {
-  const out: Section[] = [];
-  let cur: Section | null = null;
-  for (const { line, fenced } of fencedLines(text)) {
-    if (!fenced && /^#{1,6} /.test(line)) {
-      cur = { key: keyOf(line), heading: line, body: [] };
-      out.push(cur);
-      continue;
-    }
-    if (!cur) { cur = { key: "", heading: null, body: [] }; out.push(cur); }
-    cur.body.push(line);
-  }
-  for (const s of out) {
-    while (s.body.length && !s.body[s.body.length - 1]!.trim()) s.body.pop();
-    while (s.body.length && !s.body[0]!.trim()) s.body.shift();
-    if (s.heading === null) s.key = `¶${s.body.join("\n")}`;
-  }
-  return out.filter((s) => s.heading !== null || s.body.length);
-}
 
 /** The marker the working set puts where a document was cut to its budget (src/plugins/state.ts `workingSet`). */
 const CUT = "…";
 
 /**
  * The lines `now` adds to `before` when it only grew: `before` whole and then more, or — where the document is kept
- * from its end and `now` was cut — some tail of `before` and then more. Null when anything else changed.
+ * from its end and `now` was cut — some tail of `before` and then more. The cut is at a character, not a line, so the
+ * first line kept after it may be the end of a line `before` has whole (or had cut too): it is matched as a suffix.
+ * Null when anything else changed.
  */
 export function addedLines(before: readonly string[], now: readonly string[]): string[] | null {
   const cutNow = now[0] === CUT;
   const b = before[0] === CUT ? before.slice(1) : [...before];
   const n = cutNow ? now.slice(1) : [...now];
-  const equal = (i: number) => {
-    for (let k = 0; k < i; k++) if (n[k] !== b[b.length - i + k]) return false;
+  const equal = (i: number, partialFirst: boolean) => {
+    for (let k = 0; k < i; k++) {
+      const was = b[b.length - i + k]!, is = n[k]!;
+      if (k === 0 && partialFirst ? !was.endsWith(is) : was !== is) return false;
+    }
     return true;
   };
   // Only grew: every line it had, then more.
-  if (n.length > b.length && equal(b.length)) return n.slice(b.length);
+  if (n.length > b.length && equal(b.length, false)) return n.slice(b.length);
   // Cut from the front to fit, so a tail of what it had, then more. The longest overlap is the honest reading.
   if (cutNow) {
-    for (let i = Math.min(b.length, n.length - 1); i >= 1; i--) if (equal(i)) return n.slice(i);
+    for (let i = Math.min(b.length, n.length - 1); i >= 1; i--) if (equal(i, true)) return n.slice(i);
   }
   return null;
 }
 
-/** What changed from `before` to `now`, as the lines of a notice; null when nothing a reader could see did. */
-export function contextNotice(before: PromptContext, now: PromptContext): string | null {
-  const was = new Map<string, Section>();
-  for (const c of before.contributions) for (const s of sectionsOf(c)) if (!was.has(s.key)) was.set(s.key, s);
-  const is = new Map<string, Section>();
-  for (const c of now.contributions) for (const s of sectionsOf(c)) if (!is.has(s.key)) is.set(s.key, s);
-  const parts: string[] = [];
-  for (const [key, s] of is) {
-    const old = was.get(key);
-    if (old && old.heading === s.heading && old.body.join("\n") === s.body.join("\n")) continue;
-    const added = old && old.heading === s.heading ? addedLines(old.body, s.body) : null;
-    if (s.heading === null) parts.push(`New:\n${s.body.join("\n")}`);
-    else if (added) parts.push(`${s.heading} — added since you last saw it:\n${added.join("\n")}`);
-    else parts.push(`${s.heading} — now reads:${s.body.length ? `\n${s.body.join("\n")}` : " (empty)"}`);
-  }
-  for (const [key, s] of was) {
-    if (is.has(key)) continue;
-    parts.push(s.heading !== null ? `${s.heading} — no longer there.`
-      : `No longer applies: "${cutTo(s.body.join(" "), 160)}"`);
-  }
-  if (before.held.join("\n") !== now.held.join("\n")) {
-    parts.push(now.held.length ? `What you are holding now:\n${now.held.join("\n")}` : "You are no longer holding anything.");
-  }
-  if (!parts.length) return null;
-  return "Your instructions above show what was true when this conversation began. This has changed since you " +
-    "last saw it, and where the two differ, this is current:\n\n" + parts.join("\n\n");
+const fenced = (text: string) => { const f = fenceFor(text); return `${f}\n${text}\n${f}`; };
+
+/** One part's entry: who wrote it decides whether its text is fenced and said to be theirs. */
+function entry(p: PromptPart, how: "added" | "reads" | "empty", text: string): string {
+  const whose = p.by === "agent" ? `Your ${p.label}, written by you` : p.label;
+  if (how === "empty") return p.by === "plugin" ? `${whose} — no longer applies.` : `${whose} — is now empty.`;
+  const what = how === "added" ? "lines added since you last saw it" : "now reads";
+  return `${whose} — ${what}:\n${p.by === "plugin" ? text : fenced(text)}`;
 }
 
-const cutTo = (s: string, n: number) => s.length <= n ? s : `${s.slice(0, n - 1)}…`;
+/**
+ * What changed from `before` to `now`, as the body of a notice, with the keys it told; null when nothing a reader could
+ * see did. Each part in `owed` is told in full whatever it was compared against.
+ */
+export function contextNotice(before: PromptContext, now: PromptContext, owed: ReadonlySet<string> = new Set()): { text: string; keys: string[] } | null {
+  const was = new Map(before.parts.map((p) => [p.key, p]));
+  const is = new Map(now.parts.map((p) => [p.key, p]));
+  const out: string[] = [];
+  const keys: string[] = [];
+  for (const key of [...is.keys(), ...[...was.keys()].filter((k) => !is.has(k))]) {
+    const old = was.get(key), cur = is.get(key);
+    const oldText = old?.text ?? "", curText = cur?.text ?? "";
+    const owing = owed.has(key);
+    if (oldText === curText && !owing) continue;
+    const part = cur ?? old!;
+    if (!curText) {
+      if (!oldText && !owing) continue;
+      out.push(entry(part, "empty", ""));
+    } else {
+      const added = oldText && !owing ? addedLines(oldText.split("\n"), curText.split("\n")) : null;
+      out.push(added ? entry(part, "added", added.join("\n")) : entry(part, "reads", curText));
+    }
+    keys.push(key);
+  }
+  if (before.held.join("\n") !== now.held.join("\n") || owed.has(HELD)) {
+    out.push(now.held.length ? `What you are holding now:\n${now.held.join("\n")}` : "You are no longer holding anything.");
+    keys.push(HELD);
+  }
+  if (!out.length) return null;
+  return {
+    text: "Your instructions above show what was true when this conversation began. This has changed since you " +
+      "last saw it, and where the two differ, this is current:\n\n" + out.join("\n\n"),
+    keys,
+  };
+}

@@ -1,4 +1,4 @@
-import type { Plugin, PluginContext } from "./types.ts";
+import type { Plugin, PluginContext, PromptPart } from "./types.ts";
 import { READ_WHOLE_MAX } from "./artifacts.ts";
 import { toAgentRef } from "../store/refs.ts";
 import type { StorageAdapter } from "../core/store.ts";
@@ -148,6 +148,18 @@ export function statePlugin(
   /** The deployment's key for sealing secrets; resolves to null where none is configured. */
   kek: () => Promise<SealingKey | null> = async () => null,
 ): Plugin {
+  /**
+   * The seeded block, then the working set. A working-set document that is also a seeded path is shown once, in
+   * the seeded block: under "What you already know" it would be headed "written by you", which a file the setup
+   * gave is not.
+   */
+  const paragraph = async (ctx: { caller: { tenantId: string; agentId: string } }) => {
+    const { tenantId, agentId } = ctx.caller;
+    const seeds = await store.listSeedFiles(tenantId, agentId);
+    const seeded = await seededFilesParts(store, tenantId, agentId, seeds);
+    const set = await workingSetParts(store, tenantId, agentId, new Set(seeds.map((f) => f.path)));
+    return { text: seeded.text + set.text, parts: [...seeded.parts, ...set.parts] };
+  };
   const plugin: Plugin = {
     id: PLUGIN_ID,
 
@@ -172,14 +184,16 @@ export function statePlugin(
       const first = (await store.findMountsByPlugin(
         ctx.caller.tenantId, ctx.caller.agentId, PLUGIN_ID))[0]?.alias;
       if (first && first !== ctx.alias) return null;
-      const { tenantId, agentId } = ctx.caller;
-      const seeds = await store.listSeedFiles(tenantId, agentId);
-      // A working-set document that is also a seeded path is shown once, in
-      // the seeded block: under "What you already know" it would be headed
-      // "written by you", which a file the setup gave is not.
-      const text = await seededFiles(store, tenantId, agentId, seeds)
-        + await workingSet(store, tenantId, agentId, new Set(seeds.map((f) => f.path)));
+      const { text } = await paragraph(ctx);
       return text.trim() ? text : null;
+    },
+
+    /** The same paragraph's parts: the seeded block's two, the working set's heading and each document. */
+    async promptParts(ctx) {
+      const first = (await store.findMountsByPlugin(
+        ctx.caller.tenantId, ctx.caller.agentId, PLUGIN_ID))[0]?.alias;
+      if (first && first !== ctx.alias) return null;
+      return (await paragraph(ctx)).parts;
     },
 
     config: [
@@ -529,7 +543,18 @@ export async function workingSet(
   /** Keys left out: the seeded paths, which are not the agent's own writing. */
   skip: ReadonlySet<string> = new Set(),
 ): Promise<string> {
+  return (await workingSetParts(store, tenantId, agentId, skip)).text;
+}
+
+/**
+ * `workingSet`'s text and its parts (`Plugin.promptParts`): the heading paragraph, then one part per document, keyed
+ * by the document so that what the agent wrote is compared as a whole and never read for structure.
+ */
+export async function workingSetParts(
+  store: StorageAdapter, tenantId: string, agentId: string, skip: ReadonlySet<string> = new Set(),
+): Promise<{ text: string; parts: PromptPart[] }> {
   const parts: string[] = [];
+  const docs: PromptPart[] = [];
   for (const doc of WORKING_SET) {
     if (skip.has(doc.key)) continue;
     const got = await store.getState(tenantId, agentId, doc.key);
@@ -541,8 +566,16 @@ export async function workingSet(
         ? `…\n${text.slice(text.length - doc.budget)}`
         : `${text.slice(0, doc.budget)}\n…`;
     parts.push(`## ${doc.key} (${doc.what})\n${kept}`);
+    docs.push({ key: `doc:${doc.key}`, label: `\`${doc.key}\` (${doc.what})`, text: kept, by: "agent" });
   }
-  if (!parts.length) return "";
+  // Every document of the set is a part even when it is empty, so one emptied is told as emptied.
+  for (const doc of WORKING_SET) {
+    if (!skip.has(doc.key) && !docs.some((d) => d.key === `doc:${doc.key}`)) {
+      docs.push({ key: `doc:${doc.key}`, label: `\`${doc.key}\` (${doc.what})`, text: "", by: "agent" });
+    }
+  }
+  docs.sort((a, b) => WORKING_SET.findIndex((d) => `doc:${d.key}` === a.key) - WORKING_SET.findIndex((d) => `doc:${d.key}` === b.key));
+  if (!parts.length) return { text: "", parts: docs };
   // Which name the model can call these by is the operator's choice, not ours:
   // the harness dispatches on `<alias>.remember`, and an agent may hold this
   // plugin under any alias or under none. Naming a tool that is not mounted is
@@ -566,12 +599,11 @@ export async function workingSet(
     ? `They are kept by the \`${alias}\` mount: correct one with its \`remember\` tool when it ` +
       "turns out to be wrong, and drop one with `forget` when it stops being true."
     : "You have no tool mounted for changing it, so treat it as read-only and say so if it is wrong.";
-  return (
-    "\n\n# What you already know\n" +
-    "Written by you on earlier tasks, and shown here so you do not have to go and look. " +
-    correcting + "\n\n" +
-    parts.join("\n\n")
-  );
+  const intro = "Written by you on earlier tasks, and shown here so you do not have to go and look. " + correcting;
+  return {
+    text: "\n\n# What you already know\n" + intro + "\n\n" + parts.join("\n\n"),
+    parts: [{ key: "working-set", label: "What you already know (how your documents are kept)", text: intro, by: "plugin" }, ...docs],
+  };
 }
 
 /** The seeded file whose text is shown in the prompt, not only named. */
@@ -606,30 +638,17 @@ export function fenceFor(text: string): string {
  * like the prompt's own would otherwise be counted as the prompt saying it.
  */
 export function unfencedLines(text: string): string[] {
-  return fencedLines(text).filter((l) => !l.fenced).map((l) => l.line);
-}
-
-/**
- * Every line of `text`, each saying whether it is inside a code fence or is a
- * fence line itself (`fenced`), by the rule `unfencedLines` documents. For a
- * reader that needs the fenced lines kept in place: the runtime splits the
- * prompt's contributions into sections at their headings
- * (src/runtime/prompt-context.ts), and a heading-shaped line inside the fenced
- * `MEMORY.md` is the file's text, not a section.
- */
-export function fencedLines(text: string): Array<{ line: string; fenced: boolean }> {
-  const out: Array<{ line: string; fenced: boolean }> = [];
+  const out: string[] = [];
   const shortest = fenceFor("").length;
   let open = 0;
   for (const line of text.split(/\r\n|\r|\n/)) {
     if (open) {
       if (/^`+$/.test(line) && fenceFor(line).length > open) open = 0;
-      out.push({ line, fenced: true });
       continue;
     }
     const run = /^`+/.exec(line)?.[0].length ?? 0;
-    if (run >= shortest) { open = run; out.push({ line, fenced: true }); continue; }
-    out.push({ line, fenced: false });
+    if (run >= shortest) { open = run; continue; }
+    out.push(line);
   }
   return out;
 }
@@ -713,8 +732,18 @@ function utf8Bytes(value: Json | undefined): number | null {
 export async function seededFiles(
   store: StorageAdapter, tenantId: string, agentId: string, files?: readonly SeedFileMeta[],
 ): Promise<string> {
+  return (await seededFilesParts(store, tenantId, agentId, files)).text;
+}
+
+/**
+ * `seededFiles`' text and its parts (`Plugin.promptParts`): `MEMORY.md`'s section as the setup's file, and the rest
+ * of the block — its heading and the list of the other paths — as the plugin's own.
+ */
+export async function seededFilesParts(
+  store: StorageAdapter, tenantId: string, agentId: string, files?: readonly SeedFileMeta[],
+): Promise<{ text: string; parts: PromptPart[] }> {
   files ??= await store.listSeedFiles(tenantId, agentId);
-  if (!files.length) return "";
+  if (!files.length) return { text: "", parts: [] };
   const alias = (await store.findMountsByPlugin(tenantId, agentId, PLUGIN_ID))[0]?.alias;
   // Named the way the working set names its tools: the tool, on the mount.
   const getTool = alias ? `the \`get\` tool on the \`${alias}\` mount` : null;
@@ -765,6 +794,9 @@ export async function seededFiles(
     }
     parts.push(`${seedLine(memory.path, sizeOf(memory, got), mode)}\n${body}`);
   }
+  const memoryPart: PromptPart[] = memory
+    ? [{ key: `seed:${SEEDED_MEMORY}`, label: `\`${SEEDED_MEMORY}\`, the workspace file provided at setup`, text: parts[parts.length - 1]!, by: "setup" }]
+    : [];
   const others = shown.filter((f) => f !== memory);
   const lines: string[] = [];
   for (const f of others) {
@@ -782,5 +814,9 @@ export async function seededFiles(
   }
   if (hidden) lines.push(`- and ${hidden} more whose ${hidden === 1 ? "name" : "names"} cannot be shown here.`);
   if (lines.length) parts.push((memory ? "## Other files\n" : "") + lines.join("\n"));
-  return "\n\n" + parts.join("\n\n");
+  const rest = [parts[0]!, ...(lines.length ? [parts[parts.length - 1]!] : [])].join("\n\n");
+  return {
+    text: "\n\n" + parts.join("\n\n"),
+    parts: [{ key: "seeds", label: "Workspace files provided at setup", text: rest, by: "plugin" }, ...memoryPart],
+  };
 }

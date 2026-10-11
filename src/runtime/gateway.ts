@@ -4,7 +4,7 @@ import type { Json, MountPolicy, MountRecord, OperationStatus, PolicyDecision } 
 import { AGENT_REF, agentRef, isAgentRef, KEPT_NAME, KEPT_PREFIX, OWNER_PREFIX, secretRefKind } from "./secrets.ts";
 import type { ToolError, ToolResult } from "../core/tools.ts";
 import { parseToolRef } from "../core/tools.ts";
-import type { Plugin, PluginContext, MountActivity, MountUsage, InboundEvent, InboundHooks, InboundResult, HeldListing, HeldRead } from "../plugins/types.ts";
+import type { Plugin, PluginContext, PromptPart, MountActivity, MountUsage, InboundEvent, InboundHooks, InboundResult, HeldListing, HeldRead } from "../plugins/types.ts";
 import { type ActivityEvent, type SandboxForm, holdingOf, backgroundOf, isExclusive } from "../plugins/types.ts";
 import { Backgrounded, Interrupt, interruptsOf } from "../plugins/types.ts";
 import { answerSpecOf } from "./run-js-resume.ts";
@@ -433,30 +433,50 @@ export class ToolGateway {
    * a secret being present.
    */
   async promptContributions(ctx: CallContext): Promise<string[]> {
+    return (await this.promptParagraphs(ctx)).map((p) => p.text).filter(Boolean);
+  }
+
+  /**
+   * The same paragraphs with the parts each is told by when it changes (`Plugin.promptParts`): the plugin's own,
+   * keyed under its id, or the whole paragraph as one part keyed by its mount. A plugin whose parts cannot be read
+   * keeps its paragraph, as one part. Mounts that say nothing still give their parts, so a paragraph that goes
+   * quiet is told as gone.
+   */
+  async promptParagraphs(ctx: CallContext): Promise<Array<{ text: string; parts: PromptPart[] }>> {
     const mounts = await this.#store.listMounts(ctx.tenantId, ctx.agentId);
-    const out: string[] = [];
+    const out: Array<{ text: string; parts: PromptPart[] }> = [];
     for (const [id, plugin] of this.#plugins) {
       if (!plugin.promptContribution) continue;
       for (const mount of mounts.filter((m) => m.plugin === id)) {
+        const pctx = {
+          caller: { tenantId: ctx.tenantId, agentId: ctx.agentId, taskId: ctx.taskId },
+          alias: mount.alias,
+          credential: null,
+          publicConfig: mount.publicConfig,
+          db: this.#db(ctx, mount),
+          async sibling() { return null; },
+          async sandboxForms() { return []; },
+          async agentSecret() { return null; },
+        };
         let text: string | null = null;
         try {
-          text = await plugin.promptContribution({
-            caller: { tenantId: ctx.tenantId, agentId: ctx.agentId, taskId: ctx.taskId },
-            alias: mount.alias,
-            credential: null,
-            publicConfig: mount.publicConfig,
-            db: this.#db(ctx, mount),
-            async sibling() { return null; },
-            async sandboxForms() { return []; },
-            async agentSecret() { return null; },
-          });
+          text = await plugin.promptContribution(pctx);
         } catch (e: any) {
           // A plugin that cannot describe itself must not stop the agent from
           // opening: the paragraph is dropped and the run continues.
           console.warn(`promptContribution failed for ${mount.alias}: ${String(e?.message ?? e)}`);
           text = null;
         }
-        if (text?.trim()) out.push(text.trim());
+        let own: PromptPart[] | null = null;
+        if (plugin.promptParts) {
+          try { own = await plugin.promptParts(pctx); }
+          catch (e: any) { console.warn(`promptParts failed for ${mount.alias}: ${String(e?.message ?? e)}`); own = null; }
+        }
+        const trimmed = text?.trim() ?? "";
+        const parts = own
+          ? own.map((p) => ({ ...p, key: `${id}:${p.key}` }))
+          : [{ key: `mount:${mount.alias}`, label: `What the \`${mount.alias}\` mount told you`, text: trimmed, by: "plugin" as const }];
+        out.push({ text: trimmed, parts });
       }
     }
     return out;

@@ -15,7 +15,7 @@ type Sql = { exec(query: string, ...bindings: unknown[]): { toArray(): any[] } }
 export interface RequestPrefix {
   systemSha256: string;
   toolsSha256: string;
-  /** Messages in this request, and their characters (canonical JSON). */
+  /** Messages in this request, and their characters (as JSON). */
   messages: number;
   chars: number;
   /** Leading messages identical to the previous request's, and their characters; 0 when the system prompt or the tools moved. */
@@ -47,7 +47,9 @@ export function recordRequestPrefix(
   sql.exec(TABLE);
   const systemSha256 = sha(String(context.systemPrompt ?? ""));
   const toolsSha256 = sha(canonJson(context.tools ?? []));
-  const items = (context.messages ?? []).map((m) => { const j = canonJson(m); return [sha(j).slice(0, 16), j.length] as [string, number]; });
+  // Plain JSON, not canonical: a message is serialised by the same code on every call (pi's context, as the job row
+  // stores it), so its key order is the same each time, and canonicalising a long conversation costs three times as much.
+  const items = (context.messages ?? []).map((m) => { const j = JSON.stringify(m) ?? ""; return [sha(j).slice(0, 16), j.length] as [string, number]; });
   const prev = sql.exec("SELECT system, tools, messages FROM model_request_prefix WHERE conversation = ?", conversation).toArray()[0];
   let sharedMessages = 0, sharedChars = 0;
   let broken: RequestPrefix["broken"] = null;

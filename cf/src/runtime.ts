@@ -2932,8 +2932,15 @@ export class AgentRuntime {
     // and what moved since is told at the head of a later message (`#takeContextChange`). pd records a changed prompt
     // as an inline patch at its place (src/model/durable-offloaded.ts `jobContext`), so it is given them as they are.
     const now = await this.#promptContextNow(tenantId, agentId, records, nameOf);
-    const shown = engine === "pd" ? now : promptContextFor(this.#deps.ctx.storage.sql, `${tenantId}/${agentId}`,
-      this.#conversationOf(session), now, conversationStarted(this.#deps.ctx.storage.sql, session), Date.now());
+    let shown = now;
+    if (engine !== "pd") {
+      // A snapshot that cannot be read or written must not keep the agent from opening: it opens on what is true
+      // now, which is what it did before there were snapshots.
+      try {
+        shown = promptContextFor(this.#deps.ctx.storage.sql, `${tenantId}/${agentId}`,
+          this.#conversationOf(session), now, conversationStarted(this.#deps.ctx.storage.sql, session), Date.now());
+      } catch (e) { console.error(`the prompt snapshot of ${key}#${session} could not be used; opening on what is current:`, e); }
+    }
     // Read here rather than inside the harness, so the harness keeps holding
     // no I/O of its own.
     const prompt = systemPrompt({
@@ -2997,6 +3004,9 @@ export class AgentRuntime {
       host: this.#deps.ctx.storage,
       usageOwner: { tenantId, agentId },
       sessionId: session === MAIN_SESSION ? key : `${key}#${session}`,
+      // The conversation, not the session: a fresh context keeps the session's name and starts a new conversation,
+      // and its first call is compared with nothing rather than with the last call of the one it ended.
+      conversationKey: `${key}#${this.#conversationOf(session)}`,
       session,
       systemPrompt: prompt,
       model,
@@ -3020,8 +3030,10 @@ export class AgentRuntime {
     tenantId: string, agentId: string, records: Array<{ alias: string; plugin: string }>, nameOf: (alias: string, tool: string) => string | null,
   ): Promise<PromptContext> {
     const activityOf = (alias: string) => this.#gateway.mountActivities({ tenantId, agentId, taskId: LEGACY_TASK }, alias);
+    const paragraphs = await this.#gateway.promptParagraphs({ tenantId, agentId, taskId: LEGACY_TASK });
     return {
-      contributions: await this.#gateway.promptContributions({ tenantId, agentId, taskId: LEGACY_TASK }),
+      contributions: paragraphs.map((p) => p.text).filter(Boolean),
+      parts: paragraphs.flatMap((p) => p.parts),
       held: heldItems(await heldResources(records, this.#plugins, activityOf), nameOf),
     };
   }

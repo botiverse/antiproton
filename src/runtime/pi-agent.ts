@@ -159,6 +159,8 @@ export interface PiAgentOptions {
    */
   entryProjectors?: Record<string, (entry: { timestamp: number; data?: unknown }) => unknown[] | undefined>;
   sessionId: string;
+  /** What each model call's prefix reading is compared within (src/runtime/request-prefix.ts); `sessionId` when absent. */
+  conversationKey?: string;
   /** Whose usage this agent's model replies count as (the usage outbox). Absent: not counted. */
   usageOwner?: { tenantId: string; agentId: string };
   /** Which of the agent's transcripts this is. Absent means the first one,
@@ -341,7 +343,7 @@ export class PiAgent implements AgentEngine {
     // A reading about the request, never a reason to lose it: a failure leaves the column empty.
     let prefix: string | null = null;
     try {
-      prefix = JSON.stringify(recordRequestPrefix(this.#sql, this.#opts.sessionId, (request as { context?: any })?.context ?? {}));
+      prefix = JSON.stringify(recordRequestPrefix(this.#sql, this.#opts.conversationKey ?? this.#opts.sessionId, (request as { context?: any })?.context ?? {}));
     } catch (e) { console.error(`reading the request prefix of ${id} failed:`, e); }
     this.#sql.exec("INSERT INTO pi_model_jobs(id, request, created_at, session, prefix) VALUES (?,?,?,?,?)",
       id, JSON.stringify(request), (this.#opts.now ?? Date.now)(), this.#opts.session ?? MAIN_SESSION, prefix);
