@@ -129,6 +129,9 @@ export interface Env {
    *  tenant and agent. Never agent data, which stays in each agent's object. */
   CONTROL_DB: D1Database;
   ARTIFACTS: R2Bucket;
+  /** Which Worker version is running (wrangler `version_metadata`); a `harness.open` row compares it with the last
+   *  open's to tell a deploy from an eviction (src/runtime/harness-open.ts). Unset, it cannot. */
+  CF_VERSION_METADATA?: WorkerVersionMetadata;
   DEEPSEEK_API_KEY: string;
   /** The admin area's own origin (admin-host.ts), e.g. https://admin.antiproton.ai; unset, there is none. */
   ADMIN_ORIGIN?: string;
@@ -452,6 +455,7 @@ export class AgentDO extends DurableObject<Env> {
       runJsResumeMs: Number(this.env.RUN_JS_RESUME_MS) || undefined,
       keepAlive: (at) => this.#keepAlive(at),
       operatorModel: operatorModelOf(this.env),
+      versionId: this.env.CF_VERSION_METADATA?.id,
       ...operatorCredentials(this.env),
       reminderApp: { origin: this.env.REMINDER_APP_ORIGIN, credential: this.env.REMINDER_APP_CREDENTIAL },
       secretKek: this.env.SECRET_KEK,
@@ -892,6 +896,7 @@ export class AgentDO extends DurableObject<Env> {
       runJsResumeMs: Number(this.env.RUN_JS_RESUME_MS) || undefined,
       keepAlive: (at) => this.#keepAlive(at),
       operatorModel: operatorModelOf(this.env),
+      versionId: this.env.CF_VERSION_METADATA?.id,
       ...operatorCredentials(this.env),
       reminderApp: { origin: this.env.REMINDER_APP_ORIGIN, credential: this.env.REMINDER_APP_CREDENTIAL },
       secretKek: this.env.SECRET_KEK,
@@ -2039,7 +2044,7 @@ export class AgentDO extends DurableObject<Env> {
       const busy = rt.notIdle();
       if (busy) return { ok: false, status: 409, error: `${busy}; a restart happens only between turns` };
       const sessionId = currentMainId(this.sql as never);
-      await rt.dropHarnesses(tenantId, agentId);
+      await rt.dropHarnesses(tenantId, agentId, "restart");
       await this.simulateEviction();
       return { ok: true, sessionId, restartedAt: Date.now() };
     }));
