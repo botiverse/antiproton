@@ -271,11 +271,16 @@ export class PiSqliteStorage implements Storage {
               const job = hasJobs
                 ? this.#one("SELECT created_at, answered_at FROM pi_model_jobs WHERE id = ?", m.jobId) as any
                 : null;
+              // A table made before the column (or by a test without it) has no reading: the row goes without.
+              let prefix: unknown = null;
+              if (job) { try { prefix = this.#one("SELECT prefix FROM pi_model_jobs WHERE id = ?", m.jobId)?.prefix; } catch { /* no column */ } }
               appendTrace(this.#host.sql, [modelCallRow({
                 ...this.#usageOwner, jobId: m.jobId, stopReason: m.stopReason,
                 model: typeof m.model === "string" ? m.model : "unknown", at: this.#now(),
                 createdAt: job ? Number(job.created_at) : null,
-                answeredAt: job && job.answered_at !== null ? Number(job.answered_at) : null,
+                answeredAt: job && job.answered_at !== null && job.answered_at !== undefined ? Number(job.answered_at) : null,
+                prefix: parsedPrefix(prefix),
+                usage: m.usage,
               })]);
             }
           }
@@ -504,6 +509,15 @@ export class PiSqliteStorage implements Storage {
 }
 
 /** A limit of zero is a real answer — an empty page — not "no limit". */
+/** The stored prefix reading (src/runtime/request-prefix.ts), or null when there is none or it does not parse. */
+function parsedPrefix(text: unknown): Record<string, unknown> | null {
+  if (typeof text !== "string" || !text) return null;
+  try {
+    const v = JSON.parse(text);
+    return v && typeof v === "object" && !Array.isArray(v) ? v : null;
+  } catch { return null; }
+}
+
 function limitClause(limit: number | undefined): string {
   if (limit === undefined) return "";
   return `LIMIT ${Math.max(0, Math.trunc(limit))}`;

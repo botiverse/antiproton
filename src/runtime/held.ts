@@ -82,16 +82,34 @@ export type NameOf = (alias: string, tool: string) => string | null;
  * session inherits whatever the last one left alive — and nothing told it.
  *
  * **Only facts that do not move while the session is open.** This lands in the
- * system prompt, which the provider caches as a prefix and which is rebuilt on
- * every `open`, so a number that ticks would invalidate that prefix once per
- * open (@Rex found the boundary, @cody set the rule, 2026-09-22). Which mount,
+ * system prompt, which the provider caches as a prefix, so a number that ticks
+ * would invalidate that prefix whenever the prompt is built again. On pi085 the
+ * lines are taken once per conversation and a harness opened later is built from
+ * them (src/runtime/prompt-context.ts), with what was acquired or let go since
+ * told in a notice on a later message; pd builds the prompt on each open and
+ * patches it in place. Which mount,
  * which live id, since when, and what the tools are called: all fixed for as
  * long as the thing is held. How long it has been idle and how long is left
  * appear in the two message-side sentences below instead.
  */
 export function heldPrompt(held: readonly Held[], nameOf: NameOf): string | null {
-  if (!held.length) return null;
-  const lines = held.map((h) => {
+  return heldParagraph(heldItems(held, nameOf));
+}
+
+/** The paragraph `heldPrompt` writes, from its lines (`heldItems`); null when there are none. */
+export function heldParagraph(items: readonly string[]): string | null {
+  if (!items.length) return null;
+  return `You are already holding these, from before this session began:\n${items.join("\n")}`;
+}
+
+/**
+ * The paragraph's lines, one per held thing, and nothing else: what a pi085
+ * conversation keeps of it when it starts (src/runtime/prompt-context.ts), and
+ * what is compared on each later turn to say what changed. Session-stable for
+ * the same reason the paragraph is: a line moves only when the thing does.
+ */
+export function heldItems(held: readonly Held[], nameOf: NameOf): string[] {
+  return held.map((h) => {
     const release = nameOf(h.alias, h.tools.release);
     const postpone = h.tools.postpone ? nameOf(h.alias, h.tools.postpone) : null;
     const since = new Date(h.live.startedAt).toISOString().slice(11, 16);
@@ -102,7 +120,6 @@ export function heldPrompt(held: readonly Held[], nameOf: NameOf): string | null
     return `- \`${h.alias}\`: ${thingOf(h.live)}, held since ${since} UTC${h.billing ? ` — ${h.billing}` : ""}.`
       + (how ? ` ${how}.` : "");
   });
-  return `You are already holding these, from before this session began:\n${lines.join("\n")}`;
 }
 
 /**

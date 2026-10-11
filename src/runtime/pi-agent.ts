@@ -29,6 +29,7 @@ import type { AgentHarness as Harness, AgentLane, OpenOperation } from "@earendi
 import { StorageBackedSession } from "@earendil-works/pi-agent-core/harness/session";
 import { BACKGROUND_CONTEXT as CTX } from "@earendil-works/pi-agent-core/harness/context";
 import { PiSqliteStorage, ensurePiTables, piTables, type SqlHost, MAIN_SESSION } from "../store/pi-storage.ts";
+import { recordRequestPrefix } from "./request-prefix.ts";
 import { offloadedProvider, type OffloadPort, type Answered } from "../model/pi-offloaded.ts";
 import { bridgeTools, harnessTools, type InterruptKeeping, type MountedTool, type ToolHost } from "./pi-tools.ts";
 import { answerClientCall, dropClientCalls, pendingClientCalls, resumeClientCalls } from "./client-calls.ts";
@@ -77,6 +78,9 @@ export function ensureAgentTables(sql: SqlHost["sql"], session: string = MAIN_SE
   // the transcript that asked. Rows from before sessions existed are the main
   // session's, which is what the default says.
   try { sql.exec(`ALTER TABLE pi_model_jobs ADD COLUMN session TEXT NOT NULL DEFAULT '${MAIN_SESSION}'`); }
+  catch { /* already there */ }
+  // What the request shares with the one before it (src/runtime/request-prefix.ts), read onto the call's trace row.
+  try { sql.exec("ALTER TABLE pi_model_jobs ADD COLUMN prefix TEXT"); }
   catch { /* already there */ }
   // Which sessions this object has, so a wake can step the ones with work
   // without opening every transcript. `active` is the last step's verdict.
@@ -334,8 +338,13 @@ export class PiAgent implements AgentEngine {
     const id = `mj_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`;
     // Durable before it is dispatched: a dispatch that never happens can be
     // retried from the row, but a row that was never written cannot.
-    this.#sql.exec("INSERT INTO pi_model_jobs(id, request, created_at, session) VALUES (?,?,?,?)",
-      id, JSON.stringify(request), (this.#opts.now ?? Date.now)(), this.#opts.session ?? MAIN_SESSION);
+    // A reading about the request, never a reason to lose it: a failure leaves the column empty.
+    let prefix: string | null = null;
+    try {
+      prefix = JSON.stringify(recordRequestPrefix(this.#sql, this.#opts.sessionId, (request as { context?: any })?.context ?? {}));
+    } catch (e) { console.error(`reading the request prefix of ${id} failed:`, e); }
+    this.#sql.exec("INSERT INTO pi_model_jobs(id, request, created_at, session, prefix) VALUES (?,?,?,?,?)",
+      id, JSON.stringify(request), (this.#opts.now ?? Date.now)(), this.#opts.session ?? MAIN_SESSION, prefix);
     return id;
   }
 

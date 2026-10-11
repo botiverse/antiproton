@@ -606,17 +606,30 @@ export function fenceFor(text: string): string {
  * like the prompt's own would otherwise be counted as the prompt saying it.
  */
 export function unfencedLines(text: string): string[] {
-  const out: string[] = [];
+  return fencedLines(text).filter((l) => !l.fenced).map((l) => l.line);
+}
+
+/**
+ * Every line of `text`, each saying whether it is inside a code fence or is a
+ * fence line itself (`fenced`), by the rule `unfencedLines` documents. For a
+ * reader that needs the fenced lines kept in place: the runtime splits the
+ * prompt's contributions into sections at their headings
+ * (src/runtime/prompt-context.ts), and a heading-shaped line inside the fenced
+ * `MEMORY.md` is the file's text, not a section.
+ */
+export function fencedLines(text: string): Array<{ line: string; fenced: boolean }> {
+  const out: Array<{ line: string; fenced: boolean }> = [];
   const shortest = fenceFor("").length;
   let open = 0;
   for (const line of text.split(/\r\n|\r|\n/)) {
     if (open) {
       if (/^`+$/.test(line) && fenceFor(line).length > open) open = 0;
+      out.push({ line, fenced: true });
       continue;
     }
     const run = /^`+/.exec(line)?.[0].length ?? 0;
-    if (run >= shortest) { open = run; continue; }
-    out.push(line);
+    if (run >= shortest) { open = run; out.push({ line, fenced: true }); continue; }
+    out.push({ line, fenced: false });
   }
   return out;
 }
