@@ -37,7 +37,22 @@ export function usageCases(db: D1Database, sql: Sql): SpecCase[] {
       const got = at(resource, key, unit);
       assert(got !== null && Math.abs(got - want) < 1e-15, `${resource} ${key} ${unit}: ${got}, want ${want}`);
     }
-    assert(prices.every((p) => p.effectiveFrom === Date.parse("2026-10-09T00:00:00Z")), "a seed row with another date");
+    assert(prices.filter((p) => p.effectiveFrom !== Date.parse("2026-10-09T00:00:00Z")).every((p) => p.key === "openai/gpt-5.6-luna:cache_read"),
+      "a seed row with another date");
+  } });
+  // Also before the wipe. 0017 adds a later row for one key; the earlier price must still answer before it.
+  cases.push({ name: "luna's cached input (0017): priced as input until 2026-10-12T00:00Z, $0.02/1M from then", run: async () => {
+    const prices = await usagePrices(db);
+    for (const resource of ["model.tokens", "model.tokens.unaccepted"]) {
+      const at = (iso: string, kind: string) => priceFor(prices, { bucket: Date.parse(iso), resource, key: `openai/gpt-5.6-luna:${kind}`, unit: "tokens" });
+      const before = at("2026-10-11T23:00:00Z", "cache_read"), after = at("2026-10-12T00:00:00Z", "cache_read");
+      assert(before === 0, `${resource} before: ${before}`);
+      assert(after !== null && Math.abs(after - (0.02e-6 - 0.2e-6)) < 1e-15, `${resource} after: ${after}`);
+      // input × miss + cache_read × (hit − miss) = (input − cache_read) × miss + cache_read × hit, at OpenAI's rates.
+      const input = at("2026-10-12T00:00:00Z", "input")!;
+      const cost = 1_000_000 * input + 400_000 * after!;
+      assert(Math.abs(cost - (600_000 * 0.2e-6 + 400_000 * 0.02e-6)) < 1e-12, `${resource} cost of 1M input, 400k cached: ${cost}`);
+    }
   } });
   const row = (seq: number, over: Partial<OutboxRow> = {}): OutboxRow => ({
     seq, at: T0 + 10 * 60_000, tenantId: "t", agentId: "a", resource: "model.tokens", key: "m1:input", quantity: 10, unit: "tokens", ...over,

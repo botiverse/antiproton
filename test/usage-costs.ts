@@ -59,6 +59,7 @@ function d1() {
 const H = 3_600_000;
 const FROM = Date.parse("2026-10-09T00:00:00Z"); // the seed's effective_from
 const AT = FROM + 26 * H; // 2026-10-10T02:00Z, inside the priced era
+const LUNA_CACHE_FROM = Date.parse("2026-10-12T00:00:00Z"); // 0017's effective_from
 /** Usage rows into the hourly ledger, as sendUsage would sum them. */
 function put(db: D1Database & { raw: DatabaseSync }, rows: UsageRow[]) {
   for (const h of toHourly(rows)) {
@@ -88,7 +89,10 @@ const tenantRead = (db: D1Database, from = FROM, to = FROM + 3 * DAY_MS, bucket:
 await check("the seed: dollars per unit from 2026-10-09T00:00Z, at the rough table's values", async () => {
   const db = d1();
   const prices = await usagePrices(db);
-  must(prices.length > 0 && prices.every((p) => p.effectiveFrom === FROM), `every row takes effect at the migration's date: ${show(prices.filter((p) => p.effectiveFrom !== FROM))}`);
+  // 0017 is the only later row so far: luna's cached input, from 2026-10-12.
+  const later = prices.filter((p) => p.effectiveFrom !== FROM);
+  must(prices.length > 0 && later.every((p) => p.key === "openai/gpt-5.6-luna:cache_read" && p.effectiveFrom === LUNA_CACHE_FROM),
+    `every row takes effect at the seed's date, but for 0017's: ${show(later)}`);
   const at = (resource: string, key: string, unit: string) => priceFor(prices, { bucket: AT, resource, key, unit });
   const spot: Array<[string, string, string, number]> = [
     ["model.tokens", "deepseek-flash:input", "tokens", 0.30e-6],
@@ -119,6 +123,23 @@ await check("the seed: dollars per unit from 2026-10-09T00:00Z, at the rough tab
   }
   must(at("tool.call", "github.issue_list", "calls") === null && at("js.run", "run_js", "runs") === null, "another tool is left unpriced, not 0");
   must(priceFor(prices, { bucket: FROM - 1, resource: "model.tokens", key: "deepseek-flash:input", unit: "tokens" }) === null, "usage before the seed's date reads unpriced");
+});
+
+await check("luna's cached input (0017): priced as input before 2026-10-12T00:00Z, at OpenAI's $0.02/1M from then", async () => {
+  const db = d1();
+  const prices = await usagePrices(db);
+  for (const resource of ["model.tokens", UNACCEPTED_TOKENS]) {
+    const at = (bucket: number) => priceFor(prices, { bucket, resource, key: "openai/gpt-5.6-luna:cache_read", unit: "tokens" });
+    must(at(LUNA_CACHE_FROM - H) === 0, `${resource} the hour before: ${at(LUNA_CACHE_FROM - H)}`);
+    const after = at(LUNA_CACHE_FROM);
+    must(after !== null && Math.abs(after - (0.02e-6 - 0.20e-6)) < 1e-15, `${resource} from the date: ${after}`);
+  }
+  // A reply in the hour 0017 takes effect, read by the day: its cached half at the hit rate, the rest at input.
+  put(db, lunaReply(LUNA_CACHE_FROM + 2 * H));
+  const { rows } = await tenantRead(db, LUNA_CACHE_FROM, LUNA_CACHE_FROM + DAY_MS);
+  const cost = sumCost(rows.filter((r) => r.key.startsWith("openai/gpt-5.6-luna:")));
+  const want = 0.5 * 0.20 + 0.5 * 0.02 + 1.0 * 1.20;
+  must(near(cost, want), `luna cost ${cost}, by hand ${want}`);
 });
 
 // ---- no double charge -------------------------------------------------------------------------------

@@ -140,7 +140,8 @@ as an estimated dollar amount. This is accounting only: nothing is charged,
 limited or refused because of it.
 
 The first prices are seeded by `cf/migrations/0016_usage_prices_seed.sql`, all
-effective from 2026-10-09T00:00:00Z; usage before that reads as unpriced. Every
+effective from 2026-10-09T00:00:00Z; usage before that reads as unpriced. Later
+migrations add rows with later dates (`0017_luna_cache_read_price.sql`). Every
 row is **rough, to be refined**, and the migration names each one's source. A
 better number is a new row with a later `effective_from`, never an edit of an
 old one, because cost is worked out when read.
@@ -150,9 +151,9 @@ old one, because cost is worked out when read.
 | `model.tokens` | `deepseek-flash:input` | tokens | 0.30 / 1M | DeepSeek's pricing page, cache miss, peak rate (off-peak is half) |
 | | `deepseek-flash:cache_read` | tokens | (0.006 − 0.30) / 1M | cache hit $0.006/1M, as a difference (below) |
 | | `deepseek-flash:output` | tokens | 1.20 / 1M | DeepSeek, peak |
-| | `openai/gpt-5.6-luna:input` | tokens | 0.20 / 1M | third-party aggregators after OpenAI's August 2026 cut; to verify |
-| | `openai/gpt-5.6-luna:output` | tokens | 1.20 / 1M | the same; to verify |
-| | `openai/gpt-5.6-luna:cache_read` | tokens | 0 extra | unknown, priced as input |
+| | `openai/gpt-5.6-luna:input` | tokens | 0.20 / 1M | OpenAI's pricing page, Standard, ≤272K context (checked 2026-10-11, `0017`) |
+| | `openai/gpt-5.6-luna:output` | tokens | 1.20 / 1M | the same |
+| | `openai/gpt-5.6-luna:cache_read` | tokens | (0.02 − 0.20) / 1M from 2026-10-12T00:00Z; 0 extra before | OpenAI, cached input $0.02/1M (`cf/migrations/0017_luna_cache_read_price.sql`); before it, priced as input |
 | | `…:reasoning`, `…:cache_write`, `…:cache_write_1h` | tokens | 0 extra | already inside output / input / cache_write |
 | `model.tokens.unaccepted` | the same keys | tokens | the same | our cost; never in a tenant's view |
 | `object.active` | `*` | ms | 0.0000000015625 | Cloudflare Durable Objects, $12.50 per 1M GB-s at 128 MB |
