@@ -536,14 +536,18 @@ context over `minContextTokens` (8,000, the briefing's size), is rebuilt before 
 the same conversation whose first message is a briefing, the wake after it. The rule is per model, in
 `REBUILD_POLICY`'s `idle` section: `{ "default": {…}, "byModel": { "<model id, or a part of it>": {…} } }` (an exact
 id first, else the longest key the id contains; the defaults name `deepseek` and `gpt-5.6-luna`, both 60 minutes and
-8,000 tokens); `"idleMinutes": null` turns one model's off, `"idle": false` all of them. Its decision is that wake's
+8,000 tokens); `"idleMinutes": null` turns one model's off, `"idle": false` all of them. A partial policy is laid
+over the default (`{"idle": false}` alone is the kill switch), and a policy that is refused leaves the default shadow
+rules with idle rebuilds off. Its decision is that wake's
 only cold-wake row: `status` `ran`, `shadow: false`, `rule` `idle`, `idleEntry` (the entry applied: `default` or
 `byModel:<key>`), with the gap, the context before, the briefing's tokens, blocks and budget, `conversation` and `to`
 (the transcripts ended and started) and `logicalConversation`, and the prediction it can no longer be measured against
 (`predictedCold`, `shadowReason`, and the previous measured wake's `prevWakeHitRate` and `prevWakeGapMs`); a wake the
 rule passes by keeps its shadow row, whose `idleRebuild` and `idleEntry` say why (`gap-under-idle`,
 `context-below-briefing`, `needs-reset`, `idle-off`, …). The rebuilt transcript's first run, once it has ended, writes one `rebuild.behaviour` row
-(`parentId` the decision): `firstSendMs` (the wake to the first message sent), `toolCallsBeforeSend`,
+(`parentId` the decision), and so does, for comparison, the run of every wake past the idle time that was not rebuilt
+and of a tenth of the others (`rebuilt`, `group`: `rebuilt`, `idle-not-rebuilt`, `sample`; `idleReason`), with
+`inboxReads` counted apart from the rest: `firstSendMs` (the wake to the first message sent), `toolCallsBeforeSend`,
 `recapCallsBeforeSend` (memory, state and message-history reads), `firstAction` (`recap`, `send`, `act`),
 `repeatedCalls` and `repeatedBeforeSend` (calls with the same tool and arguments as one that succeeded among the
 replaced conversation's last 12), `toolCalls`, `modelCalls`, `runMs` and `endedWith`. Numbers and flags only.

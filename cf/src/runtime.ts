@@ -113,10 +113,13 @@ import type { InboundEvent, InboundHooks } from "../../src/plugins/types.ts";
 import { INBOUND_HOOKS_PER_MOUNT } from "../../src/plugins/types.ts";
 import { CONTEXT_BOUNDARY_WHERE, MAIN_SESSION, piTables } from "../../src/store/pi-storage.ts";
 import {
-  coldWakeRecord, idleRebuild, idleRebuildRecord, nearWindow, readWakeFacts, recordRebuildDecision, ruleFor, shouldRebuild, windowRecord,
+  DEFAULT_IDLE_RULE, coldWakeRecord, idleRebuild, idleRebuildRecord, nearWindow, readWakeFacts, recordRebuildDecision, ruleFor, shouldRebuild, windowRecord,
   type RebuildPolicy, type RebuildRequest,
 } from "../../src/runtime/rebuild.ts";
-import { priorCallKeys, readWatch, dropWatch, recordBehaviour, summariseBehaviour, watchRebuild } from "../../src/runtime/rebuild-behaviour.ts";
+import {
+  BEHAVIOUR_SAMPLE, dropWatch, mainLastSeq, mainMessagesAfter, priorCallKeys, readWatch, recordBehaviour, summariseBehaviour, watchRun,
+  type BehaviourGroup,
+} from "../../src/runtime/rebuild-behaviour.ts";
 import { contextIdOf } from "../../src/runtime/context-id.ts";
 import { UnknownJob } from "./model-queue.ts";
 
@@ -651,6 +654,8 @@ export interface RuntimeDeps {
    * nothing is recorded or rebuilt (the benchmark's runtime).
    */
   rebuildPolicy?: RebuildPolicy | null;
+  /** The share of ordinary wakes whose run gets a `rebuild.behaviour` row, for comparison (src/runtime/rebuild-behaviour.ts). */
+  behaviourSample?: number;
   /** Domain policy handed to the harness at task initialisation. */
   policy?: string;
   /**
@@ -1292,6 +1297,13 @@ export class AgentRuntime {
       const sql = this.#deps.ctx.storage.sql;
       const busy = mainBusy(sql);
       if (busy) { logEvent("rebuild.skip", { tenantId, agentId, trigger: "cold-wake", reason: busy }); return; }
+      // A briefing still owed to the main transcript: this is the retry of a wake whose post failed after its rebuild
+      // (or one queued behind it), and its decision is already written and awaits its outcome. Deciding again would
+      // read an empty transcript and replace that decision.
+      if (readBackstop(sql).pending !== null) {
+        logEvent("rebuild.skip", { tenantId, agentId, trigger: "cold-wake", reason: "briefing-pending" });
+        return;
+      }
       const binding = await this.store.getModelBinding(tenantId, agentId);
       if (!binding) { logEvent("rebuild.skip", { tenantId, agentId, trigger: "cold-wake", reason: "no-model-binding" }); return; }
       const now = Date.now();
@@ -1314,20 +1326,27 @@ export class AgentRuntime {
             tenantId, agentId, key: entries, from: built.from, to: built.to, logicalConversation: built.logicalConversation,
             facts, decision, idle, coldHitRate, briefing: built.briefing, rebuilds: built.rebuilds, at: now,
           }));
-          // A reading for later: a watch that cannot be written loses the behaviour row, never the wake.
-          try {
-            watchRebuild(sql, { decision: id, conversation: built.to, logical: built.logicalConversation, wakeAt: now, prior: built.prior });
-          } catch (e) { console.error(`watching ${tenantId}/${agentId}'s rebuilt conversation failed:`, e); }
+          this.#watchRun(tenantId, agentId, { decision: id, conversation: built.to, logical: built.logicalConversation, wakeAt: now,
+            prior: built.prior, startSeq: 0, group: "rebuilt", reason: idle.reason });
           return;
         } catch (e) {
           logEvent("rebuild.failed", { tenantId, agentId, trigger: "cold-wake", error: String((e as Error)?.message ?? e).slice(0, 200) });
           passed = { reason: "rebuild-failed", entry: idle.entry };
         }
       }
-      recordRebuildDecision(sql, transact, coldWakeRecord({
-        tenantId, agentId, key: entries, conversation: this.#conversationOf(MAIN_SESSION), logicalConversation: logicalMain(sql).conversation,
-        facts, decision, coldHitRate, at: now, idle: passed,
+      const conversation = this.#conversationOf(MAIN_SESSION), logical = logicalMain(sql).conversation;
+      const id = recordRebuildDecision(sql, transact, coldWakeRecord({
+        tenantId, agentId, key: entries, conversation, logicalConversation: logical, facts, decision, coldHitRate, at: now, idle: passed,
       }));
+      // The comparison group for the rebuilt runs' behaviour: every wake past the idle time that was not rebuilt (and
+      // will be answered: a conversation marked needs_reset is not), and a sample of the rest.
+      const idleGapMs = idle.idleMs ?? DEFAULT_IDLE_RULE.idleMinutes! * 60_000;
+      const group: BehaviourGroup | null = facts.gapMs !== null && facts.gapMs > idleGapMs && passed.reason !== "needs-reset" ? "idle-not-rebuilt"
+        : Math.random() < (this.#deps.behaviourSample ?? BEHAVIOUR_SAMPLE) ? "sample" : null;
+      if (group) {
+        this.#watchRun(tenantId, agentId, { decision: id, conversation, logical, wakeAt: now, prior: priorCallKeys(mainMessages(sql)),
+          startSeq: mainLastSeq(sql), group, reason: passed.reason });
+      }
       // pi085 never compacts: a context at the edge of its window is a window rebuild only this row will name.
       if (nearWindow(facts.contextTokens, facts.contextWindow, policy)) {
         recordRebuildDecision(sql, transact, windowRecord({
@@ -3845,13 +3864,16 @@ export class AgentRuntime {
    * rebuilt, since no briefing could make it fit.
    * Not while a push is being handed over: renaming the transcript under a post in flight could leave it on the closed
    * harness; that post's run ends the same way, and is judged then. A briefing whose post failed is posted again here,
-   * unless a push is being handed over, whose post carries it.
+   * unless a push is being handed over or is queued, whose post carries it.
    */
   async #overflowBackstop(tenantId: string, agentId: string): Promise<Awaited<ReturnType<AgentEngine["step"]>> | null> {
     const storage = this.#deps.ctx.storage, sql = storage.sql;
-    // A pass handing a push over carries a pending briefing ahead of the push (`postMessage`), and an idle rebuild
-    // (`#coldWake`) leaves one for exactly that pass: posted alone here, it would start a run without the wake.
-    if (readBackstop(sql).pending !== null) return this.#inboundPass !== null ? null : this.#postBriefing(tenantId, agentId);
+    // A push being handed over, or queued to be (a post that failed waits for its retry), carries a pending briefing
+    // ahead of it (`postMessage`), and an idle rebuild (`#coldWake`) leaves one for exactly that push: posted alone
+    // here, it would start a run without the wake, and the push's retry a second one.
+    if (readBackstop(sql).pending !== null) {
+      return this.#inboundPass !== null || hasPendingInbound(sql) ? null : this.#postBriefing(tenantId, agentId);
+    }
     const tip = mainTip(sql);
     const failedJob = tip?.message?.stopReason === "error" && typeof tip.message.jobId === "string" ? tip.message.jobId as string : null;
     const kind = tip ? overflowKind(tip.message, { fixedTokens: failedJob ? requestFixedTokens(sql, failedJob) : 0 }) : null;
@@ -3886,11 +3908,18 @@ export class AgentRuntime {
     return built.step;
   }
 
+  /** Watch a wake's run for its behaviour row. A reading for later: a watch that cannot be written loses the row, never the wake. */
+  #watchRun(tenantId: string, agentId: string, w: Parameters<typeof watchRun>[1]) {
+    try { watchRun(this.#deps.ctx.storage.sql, w); }
+    catch (e) { console.error(`watching ${tenantId}/${agentId}'s run failed:`, e); }
+  }
+
   /**
-   * The `rebuild.behaviour` row for the first run of a transcript an idle rebuild started (src/runtime/rebuild-behaviour.ts),
-   * once that run has ended (`step` asks only after a step of the main conversation that left nothing open); the
-   * watch is dropped with it. A watch whose transcript is no longer the main one (a
-   * fresh context, another rebuild) is dropped with no row. One table read when nothing is watched. A reading: a
+   * The `rebuild.behaviour` row for a watched wake's run (src/runtime/rebuild-behaviour.ts): an idle rebuild's, or one of
+   * the comparison group's. Once that run has ended (`step` asks only after a step of the main conversation that left
+   * nothing open), and not before the wake is in the transcript (no push being handed over or queued, no briefing
+   * owed); the watch is dropped with it. A watch whose transcript is no longer the main one (a fresh context, another
+   * rebuild) is dropped with no row. One table read when nothing is watched. A reading: a
    * failure is logged and never fails the step.
    */
   #settleBehaviour(tenantId: string, agentId: string) {
@@ -3898,12 +3927,14 @@ export class AgentRuntime {
       const sql = this.#deps.ctx.storage.sql;
       const watch = readWatch(sql);
       if (!watch) return;
+      // The wake is not in the transcript yet: its post is under way, or failed and waits for its retry.
+      if (this.#inboundPass !== null || hasPendingInbound(sql) || readBackstop(sql).pending !== null) return;
       if (watch.conversation !== currentMainId(sql)) {
         dropWatch(sql);
         logEvent("rebuild.behaviour.dropped", { tenantId, agentId, decision: watch.decision, why: "conversation-replaced" });
         return;
       }
-      const entries = mainMessages(sql);
+      const entries = mainMessagesAfter(sql, watch.startSeq);
       recordBehaviour(sql, this.#transact(), {
         tenantId, agentId, watch, behaviour: summariseBehaviour(entries, { wakeAt: watch.wakeAt, prior: watch.prior }), at: Date.now(),
       });

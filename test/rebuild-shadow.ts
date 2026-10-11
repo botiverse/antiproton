@@ -17,7 +17,7 @@ import { standInLoader } from "./spec/worker-stand-in.ts";
 import { operatorModelOf } from "../cf/src/model-request.ts";
 import { acceptInbound, ensureInboundTable } from "../src/runtime/inbound.ts";
 import {
-  DEFAULT_REBUILD_POLICY, agreementOf, rebuildPolicyOf, shouldRebuild, type RebuildFacts, type RebuildPolicy,
+  DEFAULT_REBUILD_POLICY, REFUSED_REBUILD_POLICY, agreementOf, rebuildPolicyOf, shouldRebuild, type RebuildFacts, type RebuildPolicy,
 } from "../src/runtime/rebuild.ts";
 import { DurableAgent, PdHost } from "../src/runtime/durable-agent.ts";
 import { UnknownJob } from "../cf/src/model-queue.ts";
@@ -77,17 +77,17 @@ await check("shouldRebuild — a window-relative threshold reads the model's win
   must(!small.rebuild && small.thresholdTokens === 100_000 && large.rebuild, `${show(small)} ${show(large)}`);
 });
 
-await check("rebuildPolicyOf — unset is the default, `off` is none, a whole policy is taken, a broken one is refused for the default", () => {
+await check("rebuildPolicyOf — unset is the default, `off` is none, a whole policy is taken, a broken one is refused for the default with no idle rebuild", () => {
   must(rebuildPolicyOf(undefined) === DEFAULT_REBUILD_POLICY && rebuildPolicyOf("") === DEFAULT_REBUILD_POLICY, "unset");
   must(rebuildPolicyOf("off") === null && rebuildPolicyOf(" OFF ") === null && rebuildPolicyOf("Off") === null, "off, any case");
   const mine = { rules: [{ ...DEFAULT_REBUILD_POLICY.rules[0]!, minContextTokens: 64_000 }], fallback: DEFAULT_REBUILD_POLICY.fallback };
   must(rebuildPolicyOf(JSON.stringify(mine))?.rules[0]?.minContextTokens === 64_000, "a policy");
-  must(rebuildPolicyOf('{"rules":[{"name":"x"}]}') === DEFAULT_REBUILD_POLICY, "half a policy");
-  must(rebuildPolicyOf("{") === DEFAULT_REBUILD_POLICY, "not json");
+  must(rebuildPolicyOf('{"rules":[{"name":"x"}]}') === REFUSED_REBUILD_POLICY, "half a policy");
+  must(rebuildPolicyOf("{") === REFUSED_REBUILD_POLICY, "not json");
   const bad = (r: object) => JSON.stringify({ rules: [], fallback: { ...DEFAULT_REBUILD_POLICY.fallback, ...r } });
-  must(rebuildPolicyOf(bad({ coldHitRate: 1.5 })) === DEFAULT_REBUILD_POLICY && rebuildPolicyOf(bad({ coldHitRate: -0.1 })) === DEFAULT_REBUILD_POLICY, "a hit rate outside [0, 1]");
+  must(rebuildPolicyOf(bad({ coldHitRate: 1.5 })) === REFUSED_REBUILD_POLICY && rebuildPolicyOf(bad({ coldHitRate: -0.1 })) === REFUSED_REBUILD_POLICY, "a hit rate outside [0, 1]");
   must(rebuildPolicyOf(bad({ coldHitRate: 1 }))?.fallback.coldHitRate === 1, "control: 1 is a hit rate");
-  must(rebuildPolicyOf(JSON.stringify({ ...DEFAULT_REBUILD_POLICY, windowShare: 2 })) === DEFAULT_REBUILD_POLICY, "a window share over 1");
+  must(rebuildPolicyOf(JSON.stringify({ ...DEFAULT_REBUILD_POLICY, windowShare: 2 })) === REFUSED_REBUILD_POLICY, "a window share over 1");
 });
 
 await check("agreementOf — false-cold, false-warm, expected-cold, and an unmeasured call never counted as 0", () => {

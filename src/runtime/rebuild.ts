@@ -153,21 +153,58 @@ const isIdle = (i: any): boolean => i === undefined || i === false || (!!i && ty
     && Object.values(i.byModel).every(isIdleRule))));
 
 /**
- * A deployment's policy from its `REBUILD_POLICY` variable: unset is the default, `off` (any case) is none (no
- * decision is recorded), and anything else must be a whole policy as JSON. One that does not parse is refused —
- * logged, and the default used — rather than half-applied: a shadow reading under rules nobody wrote is worse than
- * the default's.
+ * What a refused `REBUILD_POLICY` becomes: the default shadow rules, and no idle rebuild. A policy someone wrote and
+ * got wrong is most likely an attempt to change what acts, so what acts is turned off rather than defaulted on.
+ */
+export const REFUSED_REBUILD_POLICY: RebuildPolicy = { ...DEFAULT_REBUILD_POLICY, idle: false };
+
+const plain = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);
+
+/**
+ * The idle section as written, over the defaults: `false` stays off; an object's `default` is laid over
+ * `DEFAULT_IDLE_RULE`, and each `byModel` entry, the default ones (`DEFAULT_IDLE_POLICY`) included, over that merged
+ * default. So `{"byModel": {"deepseek": {"idleMinutes": null}}}` turns DeepSeek off and leaves the rest as they were,
+ * and `{"default": {"idleMinutes": 90}}` moves every model the defaults name. Anything else is returned as it is, for
+ * `isIdle` to refuse.
+ */
+function mergeIdle(idle: unknown): unknown {
+  if (idle === undefined || idle === false || !plain(idle)) return idle;
+  if (idle.default !== undefined && !plain(idle.default)) return idle;
+  if (idle.byModel !== undefined && !plain(idle.byModel)) return idle;
+  const def = { ...DEFAULT_IDLE_RULE, ...(idle.default as object | undefined) };
+  const mine = (idle.byModel ?? {}) as Record<string, unknown>;
+  const byModel: Record<string, unknown> = {};
+  for (const k of new Set([...Object.keys(DEFAULT_IDLE_POLICY.byModel ?? {}), ...Object.keys(mine)])) {
+    const entry = mine[k];
+    byModel[k] = entry === undefined ? def : plain(entry) ? { ...def, ...entry } : entry;
+  }
+  return { default: def, byModel };
+}
+
+/**
+ * A deployment's policy from its `REBUILD_POLICY` variable: unset is the default, `off` (any case) is none (nothing is
+ * recorded or rebuilt), and anything else is JSON laid over the default: a field it leaves out is the default's, so
+ * `{"idle": false}` alone turns idle rebuilds off and keeps the shadow rules (`mergeIdle` for the idle section). What
+ * does not parse, or does not make a whole policy once merged, is refused, logged, and becomes
+ * `REFUSED_REBUILD_POLICY`: the default's shadow rules, with nothing acted on.
  */
 export function rebuildPolicyOf(raw: string | undefined): RebuildPolicy | null {
   if (raw === undefined || raw.trim() === "") return DEFAULT_REBUILD_POLICY;
   if (raw.trim().toLowerCase() === "off") return null;
   try {
     const p = JSON.parse(raw);
-    if (Array.isArray(p?.rules) && p.rules.every(isRule) && isRule(p.fallback)
-      && (p.windowShare === undefined || isShare(p.windowShare)) && isIdle(p.idle)) return p as RebuildPolicy;
+    if (plain(p)) {
+      const merged = {
+        rules: p.rules ?? DEFAULT_REBUILD_POLICY.rules, fallback: p.fallback ?? DEFAULT_REBUILD_POLICY.fallback,
+        windowShare: p.windowShare ?? DEFAULT_REBUILD_POLICY.windowShare,
+        ...(p.idle !== undefined ? { idle: mergeIdle(p.idle) } : {}),
+      } as any;
+      if (Array.isArray(merged.rules) && merged.rules.every(isRule) && isRule(merged.fallback)
+        && isShare(merged.windowShare) && isIdle(merged.idle)) return merged as RebuildPolicy;
+    }
   } catch { /* refused below */ }
-  logEvent("rebuild.policy.refused", { why: "REBUILD_POLICY is not a policy; the default applies" });
-  return DEFAULT_REBUILD_POLICY;
+  logEvent("rebuild.policy.refused", { why: "REBUILD_POLICY is not a policy; the default shadow rules apply, and no idle rebuild" });
+  return REFUSED_REBUILD_POLICY;
 }
 
 // ---- the decision: a pure function of facts known before the wake's first call -----------------------------------
