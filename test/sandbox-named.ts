@@ -326,6 +326,26 @@ await check("save or keep on a named machine that does not exist is refused, and
   }
 });
 
+await check("a box records the kind of credential that created it, and keeps it through a swap of the mount's key and its release (#818)", async () => {
+  const f = fixture(null);
+  f.ctx.credentialRefKind = "operator";
+  await f.plugin.invoke("shell", { command: "ls" }, f.ctx);
+  must(f.mount().machines.main!.credentialRef === "operator", `not recorded at creation: ${JSON.stringify(f.raw())}`);
+  // The tenant's key goes on the mount: the box was made on the operator's account and says so still.
+  f.ctx.credentialRefKind = "agent";
+  await f.plugin.invoke("shell", { command: "ls" }, f.ctx);
+  must(f.creates().length === 1, "a second box");
+  const [act] = await f.plugin.holds!.activities!(f.ctx);
+  must(act!.live?.credentialRef === "operator", `activity reports ${act!.live?.credentialRef}`);
+  await f.plugin.holds!.release(f.ctx);
+  const used = await f.plugin.holds!.usage!(f.ctx);
+  must(used.length === 1 && used[0]!.credentialRef === "operator", `the finished record says ${JSON.stringify(used)}`);
+  // A context that does not report the kind records nothing, rather than a guess.
+  const g = fixture(null);
+  await g.plugin.invoke("shell", { command: "ls" }, g.ctx);
+  must(!("credentialRef" in g.mount().machines.main!), `a kind nobody reported: ${JSON.stringify(g.raw())}`);
+});
+
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.error ? `\n    ${r.error}` : ""}`);
 const failed = results.filter((r) => !r.ok).length;
 console.log(`${results.length - failed}/${results.length} passed`);

@@ -15,7 +15,7 @@ import { ToolGateway } from "../src/runtime/gateway.ts";
 import type { Plugin } from "../src/plugins/types.ts";
 import { countHeldTime, heldReports } from "../src/usage/container.ts";
 import { modelTokenRows, pendingUsage, toHourly, OWN_KEY_PREFIX, UNACCEPTED_TOKENS, type UsageRow } from "../src/usage/outbox.ts";
-import { KEEP_HOURLY_DAYS, priceFor, readAgentLedger, readUsage, readUsageCosts, usagePrices, DAY_MS } from "../cf/src/usage-d1.ts";
+import { KEEP_HOURLY_DAYS, priceFor, readAgentLedger, readUsage, readUsageCosts, retainUsage, usagePrices, DAY_MS } from "../cf/src/usage-d1.ts";
 import { parseCostsQuery } from "../cf/src/admin-usage-costs.ts";
 import { d1ApiKeys } from "../cf/src/control-plane.ts";
 import { hashApiKey, newApiKey } from "../cf/src/agents-api/keys.ts";
@@ -136,6 +136,18 @@ await check("a reply is charged once: reasoning inside output and cache hits ins
   // The two charges a full-rate subset would add, said directly.
   must(near(flash.find((r) => r.key.endsWith(":reasoning"))!.cost, 0), "reasoning was charged on top of output");
   must(near(flash.find((r) => r.key.endsWith(":cache_write_1h"))!.cost, 0), "cache_write_1h was charged on top of cache_write");
+});
+
+await check("each row costs what its own tokens cost: no cache_read row reads as a refund, and the sums do not move", async () => {
+  const db = d1();
+  put(db, [...flashReply(), ...flashReply(AT + DAY_MS, "b")]);
+  for (const by of ["total", "agent", "model"] as const) {
+    const { rows } = await readUsage(db, "t", { window: "custom", from: FROM, to: FROM + 3 * DAY_MS, bucket: "1d", by });
+    must(rows.every((r) => (r.cost ?? 0) >= 0), `by ${by}, a negative row: ${show(rows.filter((r) => (r.cost ?? 0) < 0))}`);
+    must(near(sumCost(rows), 2 * FLASH_COST), `by ${by}, the total moved: ${sumCost(rows)}`);
+    for (const r of rows.filter((x) => x.key === "deepseek-flash:input")) must(near(r.cost, 0.6 * 0.30), `the uncached part at the miss rate: ${r.cost}`);
+    for (const r of rows.filter((x) => x.key === "deepseek-flash:cache_read")) must(near(r.cost, 0.4 * 0.006), `the cached part at the hit rate: ${r.cost}`);
+  }
 });
 
 // ---- the worker: v1 usage, the admin view, the cron --------------------------------------------------
@@ -339,6 +351,34 @@ await check("the daily Cron Trigger folds old hours into days, twice changes not
   // The operator's totals agree across the boundary too.
   const costs = await readUsageCosts(db, FROM, now, "month");
   must(near(costs[0]!.total, 3 * FLASH_COST + 500 * 0.00004), `admin total after the fold: ${costs[0]!.total}`);
+});
+
+await check("the hours kept are 35 days back from the fold's day, to the hour", async () => {
+  // The views promise 35 days of hours (KEEP_HOURLY_DAYS' comment); the number is pinned here, not only used.
+  must(KEEP_HOURLY_DAYS === 35, `KEEP_HOURLY_DAYS is ${KEEP_HOURLY_DAYS}`);
+  const db = d1();
+  const now = AT + 60 * DAY_MS + 5 * H;
+  const cutoff = Math.floor(now / DAY_MS) * DAY_MS - 35 * DAY_MS;
+  put(db, [
+    row({ resource: "sandbox.container", key: "sandbox", unit: "seconds", quantity: 1, at: cutoff }),
+    row({ resource: "sandbox.container", key: "sandbox", unit: "seconds", quantity: 2, at: cutoff - H }),
+  ]);
+  const done = await retainUsage(db, now);
+  const hours = db.raw.prepare("SELECT hour, quantity FROM usage_hourly").all() as any[];
+  must(show(hours.map((h) => [h.hour - cutoff, h.quantity])) === show([[0, 1]]), `the first hour of the 35th day back stays: ${show(hours)}`);
+  must(show(done.days) === show([cutoff - DAY_MS]) && done.hours === 1, `the hour before it is folded into its day: ${show(done)}`);
+});
+
+await check("an impossible date is refused, not rolled over into the next month", async () => {
+  for (const v of ["2026-02-31", "2026-02-30T00:00:00Z", "2026-04-31T10:00Z", "2026-02-28T24:00:00Z", "2026-02-28T23:60Z"]) {
+    must(typeof parseCostsQuery(new URLSearchParams(`from=${v}&to=2026-06-01`), 0) === "string", `${v} was accepted`);
+  }
+  for (const [from, to] of [["2028-02-29", "2028-03-10"], ["2026-02-28T23:59:59Z", "2026-03-10"], ["2026-03-01T00:00+08:00", "2026-03-10"]]) {
+    must(typeof parseCostsQuery(new URLSearchParams(`from=${from}&to=${to}`), 0) === "object", `${from} was refused`);
+  }
+  const db = d1();
+  const b = await call(env(db), "GET", "/admin/usage-costs?from=2026-02-31&to=2026-03-10", { "x-harness-token": TOKEN });
+  must(b.status === 400 && /ISO 8601/.test(b.body?.error ?? ""), `${b.status} ${b.text}`);
 });
 
 await check("both Worker configs schedule the fold daily", () => {

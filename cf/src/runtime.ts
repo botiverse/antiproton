@@ -1367,6 +1367,9 @@ export class AgentRuntime {
     // way around a refusal the seed path would have made.
     const problems = validateMount(plugin, mount.publicConfig as any, agentRef(alias));
     if (problems.length) return { ok: false, error: problems.map((x) => x.message).join("; ") };
+    // What the mount holds goes now, under the credential that made it (`#releaseBeforeCredentialChange`).
+    const held = await this.#releaseBeforeCredentialChange(tenantId, agentId, alias);
+    if (held) return { ok: false, error: held };
     // The value a plugin reads: a bare token, or one JSON object of the fields.
     const value = plugin.credential.shape === "token"
       ? String(fields.token ?? "").trim()
@@ -1400,6 +1403,31 @@ export class AgentRuntime {
     // A refused key above changed nothing the tool list was taken under; a kept one did.
     await this.#toolsAfterCredentialChange(tenantId, agentId, alias);
     return { ok: true, verified: !!check?.ok, account: check?.ok ? (check.account ?? null) : null, error: unreachable };
+  }
+
+  /**
+   * Let go of what a mount holds before its credential is replaced or removed, while the credential that made it
+   * is still the mount's. Null when nothing is held any more; otherwise why the change has to wait.
+   *
+   * A held thing lives on the account of the credential that created it, and only that credential can delete it:
+   * a run9 box made on the operator's account answers the tenant's key with a refusal. Released after the swap, it
+   * would be released with the wrong key, fail, and stay alive and billed with nothing able to reach it (#818). So
+   * it goes first, by the operator's release (`releaseMount`), which refuses while a background job runs and
+   * reports a release that did not happen — and either refusal stops the change, because the credential being
+   * replaced is the only thing that could still delete the box. What it cost up to here is booked to the account
+   * it was on, whatever the mount names next: the box records the kind of credential it was created under
+   * (src/plugins/sandbox.ts `BoxState.credentialRef`, read by src/usage/container.ts `boxIsOwn`).
+   */
+  async #releaseBeforeCredentialChange(tenantId: string, agentId: string, alias: string): Promise<string | null> {
+    const live = (await this.#gateway.mountActivities({ tenantId, agentId, taskId: LEGACY_TASK }, alias))
+      .some((a) => a.live);
+    if (!live) return null;
+    const r = await this.releaseMount(tenantId, agentId, alias);
+    if (!r.ok) {
+      return `${alias} still holds something made with its current credential, which only that credential can ` +
+        `release, so the credential was not changed: ${r.error}`;
+    }
+    return null;
   }
 
   /**
@@ -1522,6 +1550,8 @@ export class AgentRuntime {
     await this.ready();
     const mount = await this.store.getMountByAlias(tenantId, agentId, alias);
     if (!mount || !isAgentRef(mount.secretRef)) return false;
+    // The key goes only once nothing it made is still held: after this, nothing could delete it.
+    if (await this.#releaseBeforeCredentialChange(tenantId, agentId, alias)) return false;
     await this.store.removeSecret(tenantId, agentId, alias);
     await this.store.setMountSecretRef(tenantId, agentId, alias, AgentRuntime.seededSecretRef(mount));
     await this.#toolsAfterCredentialChange(tenantId, agentId, alias);
@@ -1571,7 +1601,9 @@ export class AgentRuntime {
 
     // The warning row is keyed by the thing that is now gone. Left behind, the
     // next one under this alias inherits a release time it was never told.
-    for (const l of live) sql.exec("DELETE FROM held_warnings WHERE alias = ? AND live_id = ?", alias, l.id);
+    // The table is the idle pass's, made on its first run: an object it has not run on yet has no rows to clear.
+    const warned = sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='held_warnings'").toArray().length > 0;
+    if (warned) for (const l of live) sql.exec("DELETE FROM held_warnings WHERE alias = ? AND live_id = ?", alias, l.id);
     return { ok: true, released: r.released.includes(alias) };
   }
 

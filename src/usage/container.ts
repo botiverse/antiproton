@@ -54,6 +54,11 @@ export interface HeldBox {
   endedAt: number | null;
   /** How many times it was used, when the mount counts that. */
   uses?: number;
+  /**
+   * The kind of credential the box was created under (`MountUsage.credentialRef`), which decides who pays for it;
+   * absent when the mount did not record one, and then the mount's current credential decides.
+   */
+  credentialRef?: string;
 }
 
 /** How far one box has been counted: to when, and how many uses of it. */
@@ -121,15 +126,30 @@ export function heldRows(
  * record wins, because it has the end.
  */
 export function boxesOf(
-  report: { activity?: { live?: { id: string; startedAt: number } | null } | null; usage?: ReadonlyArray<{ id: string; startedAt: number; endedAt: number; uses?: number }> } | null | undefined,
+  report: {
+    activity?: { live?: { id: string; startedAt: number; credentialRef?: string } | null } | null;
+    usage?: ReadonlyArray<{ id: string; startedAt: number; endedAt: number; uses?: number; credentialRef?: string }>;
+  } | null | undefined,
 ): HeldBox[] {
   const out = new Map<string, HeldBox>();
+  const under = (v: { credentialRef?: unknown }) => typeof v.credentialRef === "string" ? { credentialRef: v.credentialRef } : {};
   const live = report?.activity?.live;
-  if (live) out.set(live.id, { id: live.id, startedAt: live.startedAt, endedAt: null });
+  if (live) out.set(live.id, { id: live.id, startedAt: live.startedAt, endedAt: null, ...under(live) });
   for (const s of report?.usage ?? []) {
-    out.set(s.id, { id: s.id, startedAt: s.startedAt, endedAt: s.endedAt, ...(s.uses === undefined ? {} : { uses: s.uses }) });
+    out.set(s.id, { id: s.id, startedAt: s.startedAt, endedAt: s.endedAt, ...(s.uses === undefined ? {} : { uses: s.uses }), ...under(s) });
   }
   return [...out.values()];
+}
+
+/**
+ * Whether a box spends the tenant's own account: the credential it was created under when the mount recorded that,
+ * and the mount's current one (`mountOwn`) only for a box recorded without it. Not the mount's alone: a tenant can
+ * put a key of their own over the operator's seeded reference while a box made on our account is still alive, and
+ * from then on the mount's reference names their account — every later pass would book our box as theirs, priced 0
+ * (#818).
+ */
+export function boxIsOwn(box: Pick<HeldBox, "credentialRef">, mountOwn: boolean): boolean {
+  return box.credentialRef === undefined ? mountOwn : box.credentialRef === "agent";
 }
 
 /**
@@ -167,10 +187,10 @@ export function heldUnreadableRows(
 }
 
 /**
- * The mount reports `countHeldTime` reads, named by mount and marked with whose account each box runs on: a mount
- * whose credential is the agent's own sealed one (secretRefKind "agent") spends the tenant's run9 account; the
- * operator's reference (`operator:run9`) or an environment one spends ours. A report for a mount no longer listed
- * is left out.
+ * The mount reports `countHeldTime` reads, named by mount and marked with whose account the mount's credential is
+ * on now: the agent's own sealed one (secretRefKind "agent") spends the tenant's run9 account; the operator's
+ * reference (`operator:run9`) or an environment one spends ours. That mark is the fallback: a box that records the
+ * credential it was created under is judged by that (`boxIsOwn`). A report for a mount no longer listed is left out.
  */
 export function heldReports(
   mounts: ReadonlyArray<{ alias: string; plugin: string; secretRef: string | null }>,
@@ -218,17 +238,28 @@ export function countHeldTime(
     const boxes = boxesOf(report as any);
     for (const b of boxes) seen.add(b.id);
     // A box on the tenant's own credential is theirs to pay for: kept, under a key that says so (`payerKey`).
-    const key = payerKey(plugin, own === true);
-    const { rows, marks } = heldRows(base, key, boxes, counted, now);
-    const marker = heldUnreadableRows(base, key, (report as any)?.activity ?? null, now);
-    if (rows.length || marker.length) appendUsage(sql, [...rows, ...marker]);
-    for (const { id, mark } of marks) {
-      sql.exec(
-        "INSERT INTO usage_held(box_id, through, uses) VALUES (?, ?, ?) " +
-        "ON CONFLICT(box_id) DO UPDATE SET through = excluded.through, uses = excluded.uses",
-        id, Math.round(mark.through), Math.round(mark.uses));
+    // Whose it is, box by box (`boxIsOwn`): one mount can hold a box on our account beside one on theirs.
+    const mountKey = payerKey(plugin, own === true);
+    const byKey = new Map<string, HeldBox[]>();
+    for (const b of boxes) {
+      const key = payerKey(plugin, boxIsOwn(b, own === true));
+      byKey.set(key, [...(byKey.get(key) ?? []), b]);
     }
-    if (rows.length || marker.length) out.push({ key, rows: rows.length + marker.length });
+    // The marker has no box, so it goes under the mount's key.
+    const marker = heldUnreadableRows(base, mountKey, (report as any)?.activity ?? null, now);
+    if (marker.length) byKey.set(mountKey, byKey.get(mountKey) ?? []);
+    for (const [key, group] of byKey) {
+      const { rows, marks } = heldRows(base, key, group, counted, now);
+      const flagged = key === mountKey ? marker : [];
+      if (rows.length || flagged.length) appendUsage(sql, [...rows, ...flagged]);
+      for (const { id, mark } of marks) {
+        sql.exec(
+          "INSERT INTO usage_held(box_id, through, uses) VALUES (?, ?, ?) " +
+          "ON CONFLICT(box_id) DO UPDATE SET through = excluded.through, uses = excluded.uses",
+          id, Math.round(mark.through), Math.round(mark.uses));
+      }
+      if (rows.length || flagged.length) out.push({ key, rows: rows.length + flagged.length });
+    }
   }
   for (const [id, mark] of counted) {
     if (!seen.has(id) && mark.through < now - KEEP_MARKS_MS) sql.exec("DELETE FROM usage_held WHERE box_id = ?", id);

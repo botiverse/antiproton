@@ -1,5 +1,5 @@
 import type { Json } from "../core/types.ts";
-import type { HeldFiles, Plugin, PluginContext, MountActivity, MountUsage, Released, SandboxForm } from "./types.ts";
+import type { CredentialRefKind, HeldFiles, Plugin, PluginContext, MountActivity, MountUsage, Released, SandboxForm } from "./types.ts";
 import { backgrounded, LEASE_KEY, markReleased } from "./types.ts";
 import type { R2Artifacts } from "../store/artifacts.ts";
 import { toAgentRef } from "../store/refs.ts";
@@ -123,6 +123,8 @@ interface Session {
   saved: string[];
   /** Which of the mount's machines it was, when not the default one ("main"). */
   machine?: string;
+  /** The kind of credential the box was created under, as on `BoxState`; absent for one recorded before. */
+  credentialRef?: CredentialRefKind;
 }
 
 /**
@@ -151,6 +153,14 @@ interface BoxState {
   image?: string;
   /** The mounts wired into this container (see `SandboxForm`); never a credential. */
   wired?: Wired[];
+  /**
+   * What kind of credential created this box (`ctx.credentialRefKind` at creation): whose run9 account it is on,
+   * so whose money it spends. The mount's reference can change while the box lives — a key of the tenant's own
+   * may go over the operator's seeded one (cf/src/runtime.ts `attachCredential`) — and the reference read later
+   * then names an account this box is not on. Usage reads this (src/usage/container.ts `countHeldTime`), so time
+   * on our account is not booked as the tenant's own. The kind only, never the reference or the value.
+   */
+  credentialRef?: CredentialRefKind;
   /** Mounts that declare a container form and hold a credential but were left out, and why. */
   leftOut?: LeftOut[];
   execs?: number;
@@ -715,7 +725,14 @@ function isSession(v: unknown): v is Session {
     && typeof s.endedAt === "number" && typeof s.lastUsedAt === "number"
     && typeof s.execs === "number"
     && Array.isArray(s.saved) && s.saved.every((x) => typeof x === "string")
-    && (s.machine === undefined || typeof s.machine === "string");
+    && (s.machine === undefined || typeof s.machine === "string")
+    && (s.credentialRef === undefined || refKindOf(s.credentialRef) !== undefined);
+}
+
+const REF_KINDS: readonly CredentialRefKind[] = ["none", "agent", "operator", "env", "other"];
+/** A stored credential kind, or undefined when it is not one: read leniently, like the rest of the record. */
+function refKindOf(v: unknown): CredentialRefKind | undefined {
+  return REF_KINDS.includes(v as CredentialRefKind) ? v as CredentialRefKind : undefined;
 }
 
 function isEnv(v: unknown): v is Env {
@@ -1002,6 +1019,7 @@ export function activityOf(
         id: state.boxId,
         startedAt: state.createdAt,
         lastUsedAt: Math.max(stopped, used),
+        ...createdUnder(state),
         lease: {
           maxMs,
           warnMs: stoppedWarnMs(days),
@@ -1022,6 +1040,7 @@ export function activityOf(
       id: state.boxId,
       startedAt: state.createdAt,
       lastUsedAt: used,
+      ...createdUnder(state),
       // Running: the idle step only switches it off and loses nothing on its
       // disk, so it is taken at the deployment's limit without a warning — a
       // warning is a model turn, and there is nothing to answer it with.
@@ -1075,6 +1094,12 @@ export function summaryActivity(
     : activityOf(viewOf(mount, pick), unreadable, keepStoppedDays, labelOf(pick, names.length > 1));
 }
 
+/** The kind of credential a box or session records it was created under, when it records one that reads. */
+function createdUnder(v: { credentialRef?: unknown }): { credentialRef?: CredentialRefKind } {
+  const kind = refKindOf(v.credentialRef);
+  return kind ? { credentialRef: kind } : {};
+}
+
 /** What this mount has finished with, newest first, from its own window. */
 export function usageOf(state: BoxState | null | undefined): MountUsage[] {
   return (state?.sessions ?? []).map((s) => ({
@@ -1084,6 +1109,7 @@ export function usageOf(state: BoxState | null | undefined): MountUsage[] {
     lastUsedAt: s.lastUsedAt,
     uses: s.execs,
     kept: s.saved,
+    ...createdUnder(s),
   }));
 }
 
@@ -1100,7 +1126,7 @@ export function keepSessions(prior: Session[] | undefined, next: Session): Sessi
 }
 
 export function sessionOf(
-  state: { boxId: string; createdAt: number; lastUsedAt?: number; execs?: number; saved?: string[] },
+  state: { boxId: string; createdAt: number; lastUsedAt?: number; execs?: number; saved?: string[]; credentialRef?: CredentialRefKind },
   endedAt: number,
   machine: string = MAIN_MACHINE,
 ): Session {
@@ -1114,6 +1140,7 @@ export function sessionOf(
     lastUsedAt: state.lastUsedAt || state.createdAt,
     execs: state.execs ?? 0,
     saved: state.saved ?? [],
+    ...createdUnder(state),
   };
 }
 
@@ -2383,6 +2410,8 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       // The record gains each placeholder only once run9 has accepted it.
       state = {
         boxId, createdAt: Date.now(), lastUsedAt: Date.now(), execs: 0, saved: [],
+        // Whose account this box is on, for as long as it lives (`BoxState.credentialRef`).
+        ...(ctx.credentialRefKind ? { credentialRef: ctx.credentialRefKind } : {}),
         sessions: history,
         ...(image ? { image } : {}),
         ...(kept.length ? { envs: kept } : {}),

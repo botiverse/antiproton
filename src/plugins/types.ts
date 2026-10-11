@@ -1173,6 +1173,8 @@ export interface MountActivity {
      * name. Absent: the tools act on this thing when called with no such argument.
      */
     args?: Record<string, Json>;
+    /** What kind of credential it was created under ({@link MountUsage.credentialRef}). */
+    credentialRef?: CredentialRefKind;
   } | null;
   /** Until when the agent asked not to be reminded about it, if it did. */
   quietUntil?: number | null;
@@ -1225,6 +1227,13 @@ export interface MountUsage {
   uses?: number;
   /** What was carried out of it, when anything was. */
   kept?: string[];
+  /**
+   * What kind of credential it was created under: whose account it runs on, which is who pays for it. Recorded at
+   * creation because the mount's credential can change while it lives, and the mount's reference after the change
+   * names somebody else's account (src/usage/container.ts reads this before the mount's). The kind, never the
+   * reference or the value. Absent for a thing recorded before this existed; a reader falls back to the mount's.
+   */
+  credentialRef?: CredentialRefKind;
 }
 
 /** Whether a mount can be renamed right now, and if not, what to say. */

@@ -8,6 +8,7 @@
 import { boxesOf, countHeldTime, heldRows, heldUnreadableRows, type HeldMark } from "../src/usage/container.ts";
 import { pendingUsage, HOUR_MS } from "../src/usage/outbox.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
+import { activityOf, sessionOf, usageOf } from "../src/plugins/sandbox.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 function check(name: string, fn: () => void) {
@@ -139,6 +140,59 @@ check("against a real table: the marker is written where the seconds are not, an
   eq(rows.filter((r) => r.unit === "seconds").map((r) => r.quantity), [120], "the live box is counted as usual");
   eq(rows.filter((r) => r.unit === "unreadable").map((r) => [r.at, r.quantity]),
     [[H0, 1], [H0, 1]], "one marker per pass, not per unreadable record");
+});
+
+// ---- whose account a box is on (#818) --------------------------------------------------------------------------
+
+/** One pass over one sandbox mount, as the agent object makes it: the plugin's own report, and whether the mount's
+ *  credential is the tenant's now (heldReports' `own`). */
+const pass = (host: ReturnType<typeof sqliteHost>, report: unknown, mountOwn: boolean, now: number) =>
+  countHeldTime(host.sql, { sandbox: { plugin: "sandbox", report, own: mountOwn } }, base, now);
+const keysOf = (host: ReturnType<typeof sqliteHost>) =>
+  [...new Set(pendingUsage(host.sql, 0).filter((r) => r.unit === "seconds").map((r) => r.key))].sort();
+
+check("a box made on the operator's account keeps the operator's label after the tenant's own key goes on the mount", () => {
+  const host = sqliteHost();
+  // The plugin's record of a box created under the seeded operator reference.
+  const box = { boxId: "b-ops", createdAt: H0, lastUsedAt: H0, execs: 1, saved: [], credentialRef: "operator" as const };
+  const report = (now: number, ended: boolean) => ({
+    activity: ended ? activityOf(null) : activityOf(box),
+    usage: ended ? usageOf({ ...box, boxId: "", sessions: [sessionOf(box, now)] }) : [],
+  });
+  pass(host, report(H0 + 60_000, false), false, H0 + 60_000);
+  // The key is swapped: the mount's reference is the tenant's from here on. The box is still on our account.
+  pass(host, report(H0 + 120_000, false), true, H0 + 120_000);
+  pass(host, report(H0 + 180_000, true), true, H0 + 240_000);
+  eq(keysOf(host), ["sandbox"], "every second of the operator's box is the operator's, before and after the swap");
+  eq(pendingUsage(host.sql, 0).filter((r) => r.unit === "seconds").reduce((a, r) => a + r.quantity, 0), 180, "all of its life, once");
+});
+
+check("a box made on the tenant's own key is own:, even if the mount has gone back to the operator's account", () => {
+  const host = sqliteHost();
+  const box = { boxId: "b-own", createdAt: H0, lastUsedAt: H0, credentialRef: "agent" as const };
+  pass(host, { activity: activityOf(box), usage: [] }, true, H0 + 60_000);
+  pass(host, { activity: activityOf(box), usage: [] }, false, H0 + 120_000);
+  eq(keysOf(host), ["own:sandbox"], "the tenant's box is the tenant's");
+});
+
+check("one mount can hold both, and each box is labelled by its own; a box recorded before the field follows the mount", () => {
+  const host = sqliteHost();
+  const ops = { id: "b-ops", startedAt: H0, endedAt: H0 + 60_000, credentialRef: "operator" };
+  const own = { id: "b-own", startedAt: H0, endedAt: H0 + 60_000, credentialRef: "agent" };
+  const old = { id: "b-old", startedAt: H0, endedAt: H0 + 60_000 };
+  pass(host, { activity: null, usage: [ops, own, old] }, true, H0 + 120_000);
+  const by = (key: string) => pendingUsage(host.sql, 0).filter((r) => r.unit === "seconds" && r.key === key).reduce((a, r) => a + r.quantity, 0);
+  eq([by("sandbox"), by("own:sandbox")], [60, 120], "the operator's box under sandbox; the tenant's and the unrecorded one under own:");
+});
+
+check("the plugin carries the creating credential through every shape it reports a box in", () => {
+  const box = { boxId: "b", createdAt: H0, lastUsedAt: H0, credentialRef: "operator" as const };
+  eq(activityOf(box).live?.credentialRef, "operator", "a running box");
+  eq(activityOf({ ...box, parkedAt: H0 + 1 } as any).live?.credentialRef, "operator", "a switched-off box");
+  eq(sessionOf(box, H0 + 1).credentialRef, "operator", "the session its release records");
+  eq(usageOf({ ...box, sessions: [sessionOf(box, H0 + 1)] })[0]?.credentialRef, "operator", "and the usage it is counted from");
+  eq(boxesOf({ activity: activityOf(box) })[0]?.credentialRef, "operator", "which the counter reads");
+  eq("credentialRef" in (activityOf({ ...box, credentialRef: "nonsense" } as any).live ?? {}), false, "a value that is not a kind is not passed on");
 });
 
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.error ? `\n    ${r.error}` : ""}`);
