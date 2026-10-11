@@ -40,6 +40,7 @@ import {
 import { readMeter } from "../../bench/meter.ts";
 import { BENCH_SWE_WITHHELD } from "../../bench/swebench/withheld.ts";
 import { contextWindowFor } from "../../src/model/context-windows.ts";
+import { rebuildPolicyOf } from "../../src/runtime/rebuild.ts";
 import { errorMessage } from "../../src/model/pi-bridge.ts";
 import { entriesToEvents } from "./pi-view.ts";
 import { recentBackgroundJobs, runningBackgroundJobs } from "../../src/runtime/background-jobs.ts";
@@ -167,6 +168,9 @@ export interface Env {
   HARNESS_MODE?: string;
   /** Context window of HARNESS_MODEL, in tokens. Compaction is a share of it. */
   HARNESS_CONTEXT_WINDOW?: string;
+  /** The context-rebuild rules, recorded in shadow (src/runtime/rebuild.ts `rebuildPolicyOf`): unset is the default
+   *  policy, `off` records nothing, anything else is a whole policy as JSON. */
+  REBUILD_POLICY?: string;
   /** How long a run_js program suspended at `await pause(...)` waits for `resume`, in ms (default 60000). */
   RUN_JS_RESUME_MS?: string;
   /** "1" opens the demo UI with no identity at all. Off by default. */
@@ -476,6 +480,8 @@ export class AgentDO extends DurableObject<Env> {
       // the table does not know.
       contextWindow: Number(this.env.HARNESS_CONTEXT_WINDOW)
         || contextWindowFor(this.env.HARNESS_MODEL),
+      // The agents' runtime only: a benchmark arm records no rebuilds.
+      rebuildPolicy: rebuildPolicyOf(this.env.REBUILD_POLICY),
       offloadModel: this.#offloadOn() ? (job) => this.#dispatch(job) : undefined,
       // Both numbers or neither: without them a container is handed back after
       // the pass that stops using it. With them it is leased — kept, its agent

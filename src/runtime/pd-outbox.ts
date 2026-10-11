@@ -37,6 +37,7 @@ import type { SqliteSyncExecutor } from "../vendor/pi/pi-durable/dist/storage/sq
 import { logEvent } from "../core/log.ts";
 import { appendTrace, type TraceRow } from "../trace/outbox.ts";
 import { answerEnded, modelCallRow } from "../trace/seams.ts";
+import { compactionRecord, recordRebuildDecision, settleRebuildOutcome } from "./rebuild.ts";
 import { modelTokenRows, UNACCEPTED_TOKENS, type UsageRow } from "../usage/outbox.ts";
 import type { ApStore } from "../store/ap-store.ts";
 import { prefixedNamespace } from "../store/sql-namespace.ts";
@@ -75,6 +76,8 @@ interface BookContext {
   staged: ReadonlyMap<string, { request: string }>;
   /** A test seam, called last inside the transaction: a throw rolls the whole commit back. */
   fault?: (writes: readonly StorageWrite[]) => void;
+  /** Whether compactions and the answers after them are recorded as rebuilds (src/runtime/rebuild.ts). */
+  rebuilds?: boolean;
 }
 
 /** pi-durable's compaction task's kind (`CompactionTask`, the vendored harness/compaction.js). */
@@ -239,6 +242,7 @@ export function bookCommit(exec: SqliteSyncExecutor, writes: readonly StorageWri
         }));
       }
       appendTrace(ctx.raw as Parameters<typeof appendTrace>[0], trace);
+      if (ctx.rebuilds) bookRebuilds(exec, writes, owner, ctx.now, ctx.raw);
     } catch (error) {
       const message = String((error as Error)?.message ?? error).slice(0, 200);
       logEvent("pd.commit.trace_error", { ...owner, error: message });
@@ -251,6 +255,40 @@ export function bookCommit(exec: SqliteSyncExecutor, writes: readonly StorageWri
 
   ctx.fault?.(writes);
   return recorded;
+}
+
+/**
+ * pi-durable's compactions as rebuilds, recorded and not changed (src/runtime/rebuild.ts): each summary placed in this
+ * batch is a `rebuild.decision` (trigger `window` for pi's `threshold` and `overflow`, `operator` for `manual`;
+ * strategy `summary`), and the next answer in its conversation settles its `rebuild.outcome`: the context the
+ * compaction left (that call's input) and its hit rate. pi-durable records no token count on the summary, so the size
+ * before is the input of the conversation's last answer before it. A summary imported by a migration is not a
+ * compaction that happened here, and is skipped.
+ */
+function bookRebuilds(exec: SqliteSyncExecutor, writes: readonly StorageWrite[], owner: { tenantId: string; agentId: string }, now: number, raw: Raw) {
+  const sql = raw as Parameters<typeof recordRebuildDecision>[0];
+  for (const w of writes) {
+    if (w.type !== "entry") continue;
+    const key = `pd:${w.value.conversationId}`;
+    if (w.value.kind === COMPACTION) {
+      const data = w.value.data;
+      if (!isObject(data) || typeof data.reason !== "string" || "importedFrom" in data) continue;
+      const before = exec.get<{ record: string }>("SELECT record FROM entries WHERE conversation_id = ? AND id < ? " +
+        "AND json_extract(record, '$.kind') = 'pi.assistant' ORDER BY id DESC LIMIT 1", w.value.conversationId, w.value.id);
+      const usage = before ? (JSON.parse(before.record) as { model?: Array<{ usage?: Tokens }> }).model?.[0]?.usage : undefined;
+      recordRebuildDecision(sql, (fn) => fn(), compactionRecord({
+        ...owner, key, reason: data.reason,
+        contextTokens: typeof usage?.input === "number" ? usage.input : null, at: now,
+      }));
+      continue;
+    }
+    if (w.value.kind !== "pi.assistant" || !Array.isArray(w.value.model)) continue;
+    for (const m of w.value.model as readonly MessageLike[]) {
+      if (!isObject(m) || m.role !== "assistant" || typeof m.jobId !== "string") continue;
+      if (!answerEnded(m.stopReason as Parameters<typeof answerEnded>[0])) continue;
+      settleRebuildOutcome(sql, { ...owner, entries: key, jobId: m.jobId, at: now, stopReason: m.stopReason, usage: m.usage ?? null });
+    }
+  }
 }
 
 /**

@@ -135,6 +135,22 @@ export function sessionsWithWork(sql: SqlHost["sql"]): string[] {
   return rows.map((r) => String(r.session));
 }
 
+/**
+ * Why the main session is not idle, or null when it is: a model call of it still unanswered, or its last step left it
+ * with work. A post to an idle session starts a wake; one to a busy session joins the turn that is running. A
+ * background tool call does not count: the turn that started it has ended, and its completion is a wake of its own.
+ */
+export function mainBusy(sql: SqlHost["sql"]): "model-call-in-flight" | "turn-running" | null {
+  const has = (name: string) => sql.exec("SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = ?", name).toArray().length > 0;
+  if (has("pi_model_jobs") && sql.exec("SELECT 1 AS x FROM pi_model_jobs WHERE session = ? AND answer IS NULL LIMIT 1", MAIN_SESSION).toArray().length) {
+    return "model-call-in-flight";
+  }
+  if (has("pi_sessions") && sql.exec("SELECT 1 AS x FROM pi_sessions WHERE session = ? AND active = 1", MAIN_SESSION).toArray().length) {
+    return "turn-running";
+  }
+  return null;
+}
+
 export function markSession(sql: SqlHost["sql"], session: string, active: boolean) {
   sql.exec("INSERT INTO pi_sessions(session, created_at, active) VALUES (?, ?, ?)" +
     " ON CONFLICT(session) DO UPDATE SET active = excluded.active", session, Date.now(), active ? 1 : 0);
@@ -185,6 +201,9 @@ export interface PiAgentOptions {
    * out (`transform_context`); the transcript keeps pi's result as written. Absent: pi's text is sent.
    */
   explainUnavailable?: (name: string) => string;
+  /** Read each answer for rebuild outcomes and context overflows (src/runtime/rebuild.ts): records, never a say in
+   *  what runs. Off when absent. */
+  rebuilds?: boolean;
   /** Wake whatever does the waiting. Failure here is not fatal: the job row is
    *  already durable, so a later pass can re-send it. */
   dispatch(jobId: string): Promise<void>;
@@ -225,6 +244,7 @@ export class PiAgent implements AgentEngine {
     ensureAgentTables(opts.host.sql, conversation);
     const storage = new PiSqliteStorage(opts.host, {
       session: conversation, ...(opts.now ? { now: opts.now } : {}), ...(opts.usageOwner ? { usageOwner: opts.usageOwner } : {}),
+      ...(opts.rebuilds ? { rebuilds: { contextWindow: opts.model.contextWindow } } : {}),
     });
     const session = new StorageBackedSession(
       { id: opts.sessionId, createdAt: (opts.now ?? Date.now)(), storageVersion: 1 },

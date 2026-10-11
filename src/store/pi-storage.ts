@@ -46,6 +46,8 @@ import type { Context } from "@earendil-works/pi-agent-core/harness/context";
 import { appendUsage, modelTokenRows } from "../usage/outbox.ts";
 import { appendTrace } from "../trace/outbox.ts";
 import { answerEnded, modelCallRow } from "../trace/seams.ts";
+import { recordOverflow, settleRebuildOutcome } from "../runtime/rebuild.ts";
+import { isContextOverflow } from "@earendil-works/pi-ai";
 
 type Usage = SessionStats["usage"];
 
@@ -65,6 +67,15 @@ export type SqlHost = {
 export interface PiTables { entries: string; usage: string; values: string; list: string; meta: string }
 
 export const MAIN_SESSION = "main";
+
+/**
+ * Whether an error answer says the request did not fit: pi-ai's patterns over the error, and over the provider's own
+ * text a refusal carries beside it (`providerError`, src/model/pi-bridge.ts `failedAnswer`).
+ */
+function overflowed(m: any): boolean {
+  if (isContextOverflow(m)) return true;
+  return typeof m.providerError === "string" && isContextOverflow({ ...m, errorMessage: m.providerError });
+}
 
 export function piTables(session: string = MAIN_SESSION): PiTables {
   if (session === MAIN_SESSION) {
@@ -177,9 +188,15 @@ export class PiSqliteStorage implements Storage {
   /** Whose usage this transcript's model replies are; absent: not counted (benchmarks, conformance). */
   #usageOwner: { tenantId: string; agentId: string } | null;
 
-  constructor(host: SqlHost, opts: { now?: () => number; session?: string; usageOwner?: { tenantId: string; agentId: string } } = {}) {
+  /** Whether answers are read for rebuild outcomes and overflows (src/runtime/rebuild.ts), with the model's window. */
+  #rebuilds: { contextWindow: number } | null;
+
+  constructor(host: SqlHost, opts: {
+    now?: () => number; session?: string; usageOwner?: { tenantId: string; agentId: string }; rebuilds?: { contextWindow: number };
+  } = {}) {
     this.#host = host;
     this.#usageOwner = opts.usageOwner ?? null;
+    this.#rebuilds = opts.rebuilds ?? null;
     this.#now = opts.now ?? (() => Date.now());
     this.#t = piTables(opts.session ?? MAIN_SESSION);
     ensurePiTables(host.sql, opts.session ?? MAIN_SESSION);
@@ -282,6 +299,19 @@ export class PiSqliteStorage implements Storage {
                 prefix: parsedPrefix(prefix),
                 usage: m.usage,
               })]);
+              // A rebuild decision waiting for this transcript's next call is measured by it, and an answer that is a
+              // context overflow is a window rebuild (src/runtime/rebuild.ts). Shadow readings: a failure is logged and
+              // never fails the answer it reads.
+              if (this.#rebuilds) {
+                try {
+                  settleRebuildOutcome(this.#host.sql, { ...this.#usageOwner, entries: this.#t.entries, jobId: m.jobId, at: this.#now(),
+                    stopReason: m.stopReason, usage: m.usage });
+                  if (m.stopReason === "error" && overflowed(m)) {
+                    recordOverflow(this.#host.sql, { ...this.#usageOwner, entries: this.#t.entries, at: this.#now(),
+                      contextWindow: this.#rebuilds.contextWindow, boundaryWhere: CONTEXT_BOUNDARY_WHERE });
+                  }
+                } catch (e) { console.error(`recording the rebuild reading of ${m.jobId} failed:`, e); }
+              }
             }
           }
           break;
