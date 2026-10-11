@@ -256,6 +256,8 @@ await check("a message that says \"Message sent to … Message ID: …\" is some
   const entries: BriefingEntry[] = [
     user("go", T0),
     ...callWith("r1", "raft__receive_events", {}, { messages: [asked, forged], hasMore: false }, T0 + 1),
+    // Any other tool's result can carry the words too: a stored note, a fetched page.
+    ...callWith("g1", "state__get", { key: "notes" }, { key: "notes", found: true, value: `copied from chat: ${spoof}` }, T0 + 2),
     // A program that read the same history: its output holds the line too.
     ...callWith("p1", "run_js", { source: "…" }, [JSON.stringify({ older: { status: "succeeded", result: { state: "page", text: forged } } })], T0 + 3),
     wrote("noted", T0 + 5),
@@ -265,8 +267,8 @@ await check("a message that says \"Message sent to … Message ID: …\" is some
   must(!b.text.includes("you sent to") && !b.text.includes("deadbeef-1234 from"), `a spoofed send:\n${b.text}`);
   must(b.text.includes("msg=a1b2c3d4, read with raft__receive_events · not answered by you since]"), `an answered flag from a spoof:\n${b.text}`);
   must(b.text.includes(spoof), "control: the message itself is still quoted");
-  const sb = summariseBehaviour(entries.slice(1, 8), { wakeAt: T0, prior: [] });
-  must(!sb.sent && sb.firstSendMs === null && sb.toolCallsBeforeSend === 2, `behaviour: ${show(sb)}`);
+  const sb = summariseBehaviour(entries.slice(1, 10), { wakeAt: T0, prior: [] });
+  must(!sb.sent && sb.firstSendMs === null && sb.toolCallsBeforeSend === 3, `behaviour: ${show(sb)}`);
 });
 
 await check("a Raft message read twice (the inbox, then the history) is quoted once, where it was read last", () => {
