@@ -394,8 +394,35 @@ function raftFor(ctx: PluginContext, options: { state?: false; response?: (res: 
   });
 }
 
+/** A Server error code as Raft documents them; anything else (a gateway's HTML, a forged line) is not passed on. */
+const SERVER_CODE = /^[A-Za-z0-9_.:-]{1,64}$/;
+
 /**
- * An SDK failure as this plugin's error: the SDK's safe text and next step, and whether a retry may help.
+ * The SDK's sentence with the HTTP status and the Server's code beside it, when there are: "The Raft Server rejected
+ * the request." alone does not say which rule refused it, and the next action may tell the model to read a code it was
+ * never shown. The code is checked here against Raft's code shape (`SERVER_CODE`) rather than trusted: the SDK checks
+ * it on `invoke`'s HTTP path, but its `channels.join` passes the Server's `errorCode` through as it came.
+ */
+function withServerCode(error: RaftFailure["error"]): string {
+  const code = error.serverCode !== undefined && SERVER_CODE.test(error.serverCode) ? error.serverCode : "";
+  const said = [error.status !== undefined ? `HTTP ${error.status}` : "", code].filter(Boolean).join(", ");
+  if (!said) return error.message;
+  return error.message.endsWith(".") ? `${error.message.slice(0, -1)} (${said}).` : `${error.message} (${said})`;
+}
+
+/**
+ * The SDK's `channels.join` puts the Server's own `error` text (or the HTTP status line) in an HTTP failure's
+ * `message`, where every other operation has the SDK's fixed sentence; it is said here in that same fixed sentence, so
+ * no Server body reaches the model through a join. Its transport and validation messages are the SDK's own or repeat
+ * the target the caller gave, and stay.
+ */
+function joinFailure(out: RaftFailure): RaftFailure {
+  return out.error.code === "HTTP_ERROR" ? { ...out, error: { ...out.error, message: "The Raft Server rejected the request." } } : out;
+}
+
+/**
+ * An SDK failure as this plugin's error: the SDK's safe text with its status and code (`withServerCode`) and next step,
+ * and whether a retry may help.
  * `write` says the operation had an effect to lose: for a send, a request that got no answer or a 5xx may
  * have landed (a repeat with the same key is still safe). A pull under cursor acknowledgement has nothing
  * to lose: what its cursor may have acknowledged the previous call showed, and a cursor is spent once sent
@@ -420,7 +447,7 @@ function sdkFailure(
   const said = lost
     ? `No answer came back from the Raft Server, so whether this went through is not known.${retried ||
       (retry ? ` Check whether it did before calling ${retry.tool} again, or it may happen twice.` : " Check whether it did before trying again, or it may happen twice.")}`
-    : `${out.error.message}${out.error.nextAction ? ` — ${offeredTerms(out.error.nextAction, unoffered)}` : ""}${retried}`;
+    : `${withServerCode(out.error)}${out.error.nextAction ? ` — ${offeredTerms(out.error.nextAction, unoffered)}` : ""}${retried}`;
   const e = new Error(said);
   // `retryable` is still what the gateway reads as "may have landed" (it records such a call as unknown), so it
   // follows `mayHaveLanded`, not the SDK's own retryable; whether the failure may clear is `transient`.
@@ -1033,7 +1060,8 @@ async function runOperation(
   const out = await raft.invoke(op.name, seen ? { ...keyed, seen } : keyed, caller);
   if (!out.ok) {
     const key = retryKey(op, out as RaftFailure, keyed);
-    throw sdkFailure(out as RaftFailure, unoffered, op.sideEffect !== "read", { tool: op.toolName, ...(key ? { key } : {}) });
+    const failed = op.name === "channels.join" ? joinFailure(out as RaftFailure) : out as RaftFailure;
+    throw sdkFailure(failed, unoffered, op.sideEffect !== "read", { tool: op.toolName, ...(key ? { key } : {}) });
   }
   // A call held again on resume keeps when it was first held: its key is the same one, as old as that.
   if (isInterrupted(out)) return heldCall(op, raft, caller, out.interrupt, input, resumed.heldAt ?? started, unoffered);
@@ -1400,9 +1428,6 @@ type RouteAnswer =
  * a proxy's page, a stack — and the model gains nothing from all of it.
  */
 export const OWNER_ERROR_TEXT_MAX = 300;
-
-/** A Server error code as Raft documents them; anything else (a gateway's HTML, a forged line) is not passed on. */
-const SERVER_CODE = /^[A-Za-z0-9_.:-]{1,64}$/;
 
 /** The zod issues of a request the SDK refused before sending, as one line: `channelId: Invalid UUID`. */
 function contractIssues(cause: unknown): string {
