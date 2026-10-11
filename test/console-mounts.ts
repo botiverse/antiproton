@@ -754,6 +754,28 @@ await check("POST /ui/credential/remove: a refusal comes back on the mount, esca
   } finally { AgentRuntime.prototype.removeCredentialOrWhy = real; }
 });
 
+await check("POST /ui/sandbox/release: a refused release offers forget, and forget reaches the runtime only when sent", async () => {
+  const real = AgentRuntime.prototype.releaseMount;
+  const asked: unknown[] = [];
+  AgentRuntime.prototype.releaseMount = async function (_t: string, _a: string, alias: string, opts?: { forget?: boolean }) {
+    asked.push(opts ?? null);
+    return opts?.forget ? { ok: true as const, released: true } : { ok: false as const, error: `${alias} was not released: delete returned 401` };
+  };
+  // The answer carries the runtime tab under the refusal; its panels read storage this harness does not
+  // offer as an iterable, and are not what this checks, so they are stood in for.
+  const o: any = home();
+  const storage = o.uiStorage;
+  o.uiStorage = async () => ({});
+  try {
+    const refused = await post("/ui/sandbox/release", { alias: "keyed" });
+    must(refused.status === 200 && /delete returned 401/.test(refused.text), `no refusal: ${refused.text.slice(0, 300)}`);
+    must(/name="forget" value="1"/.test(refused.text) && />forget it</.test(refused.text), "no way out offered");
+    const forgot = await post("/ui/sandbox/release", { alias: "keyed", forget: "1" });
+    must(forgot.status === 200 && !/forget it/.test(forgot.text), `forget: ${forgot.text.slice(0, 200)}`);
+    must(show(asked) === show([null, { forget: true }]), `asked: ${show(asked)}`);
+  } finally { AgentRuntime.prototype.releaseMount = real; o.uiStorage = storage; }
+});
+
 globalThis.fetch = realFetch;
 for (const h of hosts) h.dispose();
 

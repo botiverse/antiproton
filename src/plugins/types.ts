@@ -1695,7 +1695,15 @@ export interface Holding {
    * Letting go of several may report a fact for each (an array), and a failure among them throws with
    * every fact attached (`markReleased`).
    */
-  release(ctx: PluginContext, opts?: { reason?: "idle"; id?: string }): Promise<Released | Released[] | boolean | void>;
+  release(ctx: PluginContext, opts?: {
+    reason?: "idle"; id?: string;
+    /**
+     * An operator's explicit way out: a thing the far end refuses outright to release (a key that no longer
+     * works) is dropped from the mount's record anyway, and reported as an error fact naming it, since it may
+     * still be alive. Never set by the agent or the idle pass. A plugin without such a case ignores it.
+     */
+    forget?: boolean;
+  }): Promise<Released | Released[] | boolean | void>;
   /**
    * The files of the thing held, for a person looking at the agent's workspace (cf/src/agent-surface/
    * workspace.ts). Only while it is already running: **neither method may start it**, since starting is
@@ -1961,6 +1969,10 @@ export interface Plugin {
    * `#releaseBeforeCredentialChange`). A thing on the account the new key also acts on stays reachable, so it is
    * kept; anything else is released under the old key first. So a wrong "same" leaks a billed thing nothing can
    * delete, and a plugin answers null rather than guess.
+   *
+   * Null is "this key has no account to name" (refused, or a far end that cannot say); a throw is "nobody
+   * answered" (an outage). The two are acted on differently: a key change goes ahead over the first, releasing
+   * what is held, and waits over the second rather than delete what a working key might have kept.
    */
   credentialAccount?(ctx: PluginContext): Promise<string | null>;
   /**

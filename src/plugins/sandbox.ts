@@ -164,6 +164,11 @@ interface BoxState {
    * on our account is not booked as the tenant's own. The kind only, never the reference or the value.
    */
   credentialRef?: CredentialRefKind;
+  /**
+   * When run9 first refused to delete this box (`stopBox`). The box is still recorded, since it is still alive;
+   * this says its error lease has been reported, so later attempts that fail the same way do not report another.
+   */
+  deleteFailedAt?: number;
   /** Mounts that declare a container form and hold a credential but were left out, and why. */
   leftOut?: LeftOut[];
   execs?: number;
@@ -842,8 +847,8 @@ const DEFAULTS = {
  * live boxes and a release path that had been announcing success the whole time.
  */
 async function stopBox(
-  ctx: PluginContext, machine: string,
-): Promise<{ boxId: string; freed: boolean; error?: string; liveMs: number; lease: Released } | null> {
+  ctx: PluginContext, machine: string, opts?: { forget?: boolean },
+): Promise<{ boxId: string; freed: boolean; error?: string; forgotten?: true; liveMs: number; lease: Released | null } | null> {
   const state = await readView(ctx, machine);
   if (!state.boxId || !ctx.credential) return null;
   const cfg = { ...DEFAULTS, ...(ctx.publicConfig as SandboxConfig) };
@@ -852,6 +857,8 @@ async function stopBox(
   const auth = "Basic " + btoa(`${cred.ak}:${cred.sk}`);
   const base = `${cfg.endpoint}/projects/${cfg.project}/workspace/boxes/${state.boxId}`;
   let error: string | undefined;
+  // run9 answered, and with a refusal (4xx): a verdict on this key or this box, not an outage that a retry outlives.
+  let definitive = false;
   try {
     await fetch(`${base}/stop`, { method: "POST", headers: { authorization: auth },
       signal: AbortSignal.timeout(20_000) }).catch(() => {});
@@ -859,13 +866,19 @@ async function stopBox(
       signal: AbortSignal.timeout(30_000) });
     if (!res.ok) {
       const said = (await res.text()).slice(0, 120);
-      // Already gone is what a delete is for: run9 answers a box it does not have with 400 "box not found"
-      // (measured for the credential check, `checkCredential`), and a 404 says the same. Believed only from the
-      // kind of key that made the box: a key of another account is not shown the box, so its "not found" says
-      // nothing about whether the box is there.
+      // Already gone is what a delete is for. run9 answers a GET for a box it does not have with 400 "box not
+      // found" (measured for `checkCredential`, which relies on it); that a DELETE answers the same is assumed from
+      // that, not measured, and a 404 is read the same way. Believed only when the
+      // mount's credential is the same KIND as the one the box records it was made under (`credentialRef`) — a
+      // kind check, not an account check: a key of another account is not shown the box, so its "not found" says
+      // nothing, and a kind that differs is certainly another key; two keys of one kind may still be two
+      // accounts, which the kind cannot tell apart.
       const gone = res.status === 404 || /box not found/i.test(said);
       const maker = state.credentialRef === undefined || state.credentialRef === ctx.credentialRefKind;
-      if (!(gone && maker)) error = `delete returned ${res.status}: ${said}`;
+      if (!(gone && maker)) {
+        error = `delete returned ${res.status}: ${said}`;
+        definitive = res.status >= 400 && res.status < 500;
+      }
     }
   } catch (e) {
     error = String((e as Error)?.message ?? e).slice(0, 160);
@@ -875,15 +888,25 @@ async function stopBox(
   const session = sessionOf(state, stoppedAt ?? endedAt, machine);
   // A box run9 would not delete is still there, still billed, and still reachable by the key that made it — so
   // the record keeps naming it, and every later release (the agent's, the idle pass's, an operator's, the one a
-  // change of key makes first) tries again and is refused again until the delete succeeds. Forgetting it here
-  // made the refusal hold once: the next attempt found nothing held and let the key change, and the box was
-  // never reachable again (#818). Its session is not recorded either: it has not ended.
-  if (error) {
+  // change of key makes first) tries again until the delete succeeds. Forgetting it here made a refusal hold
+  // once: the next attempt found nothing held and let the key change, and the box was never reachable again
+  // (#818). Its session is not recorded either: it has not ended.
+  //
+  // The exception is an operator's explicit `forget`, after run9 refused the delete outright (a 4xx, not an
+  // outage): the way out when the key that made the box is gone for good. The record goes as on success, and the
+  // lease is reported as an error naming what was forgotten, so the box is on the record as possibly still alive.
+  if (error && !(opts?.forget && definitive)) {
+    // One error lease per box, not one per attempt: a box that keeps refusing is retried by every release, and
+    // its first failure already put it on the record as alive and billed (`deleteFailedAt`).
+    const now = await readView(ctx, machine);
+    const first = !now.deleteFailedAt;
+    if (first && now.boxId === state.boxId) await writeView(ctx, machine, { ...now, deleteFailedAt: endedAt });
     return {
       boxId: state.boxId, freed: false, error, liveMs: session.endedAt - session.startedAt,
-      lease: { id: state.boxId, startedAt: stoppedAt ?? session.startedAt, endedAt, status: "error", error },
+      lease: first ? { id: state.boxId, startedAt: stoppedAt ?? session.startedAt, endedAt, status: "error", error } : null,
     };
   }
+  const forgotten = error ? `forgotten on an operator's request; run9 refused the delete (${error}), so it may still be alive` : undefined;
   // The record goes once the box has, but the session survives it. A container is the one thing here
   // billed for merely existing, so how long it lived outlives the box.
   //
@@ -928,7 +951,10 @@ async function stopBox(
   // rest of its life, the disk.
   return {
     boxId: state.boxId, freed: true, liveMs: session.endedAt - session.startedAt,
-    lease: { id: state.boxId, startedAt: stoppedAt ?? session.startedAt, endedAt, status: "freed" },
+    ...(forgotten ? { forgotten: true as const, error: forgotten } : {}),
+    lease: forgotten
+      ? { id: state.boxId, startedAt: stoppedAt ?? session.startedAt, endedAt, status: "error", error: forgotten }
+      : { id: state.boxId, startedAt: stoppedAt ?? session.startedAt, endedAt, status: "freed" },
   };
 }
 
@@ -1432,18 +1458,19 @@ async function reconcileAccounts(
  * switches a running box off; an operator's or a benchmark's release means delete.
  */
 async function releaseMachine(
-  ctx: PluginContext, machine: string, reason: "idle" | undefined, lease: BoxLease | null,
+  ctx: PluginContext, machine: string, reason: "idle" | undefined, lease: BoxLease | null, forget = false,
 ): Promise<Released | false> {
   if (lease && reason === "idle") {
     const state = await readView(ctx, machine);
     if (state.boxId && parkedAt(state) === null) return parkBox(ctx, machine, state);
   }
-  const r = await stopBox(ctx, machine);
+  const r = await stopBox(ctx, machine, { forget });
   if (r === null) return false;
   if (!r.freed) {
-    throw markReleased(new Error(`run9 box ${r.boxId} not released: ${r.error ?? "unknown"}`), r.lease);
+    const e = new Error(`run9 box ${r.boxId} not released: ${r.error ?? "unknown"}`);
+    throw r.lease ? markReleased(e, r.lease) : e;
   }
-  return r.lease;
+  return r.lease ?? false;
 }
 
 /**
@@ -1779,7 +1806,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
      *  task.
      *
      *  What happens to each machine is `releaseMachine`'s. */
-    async release(ctx: PluginContext, opts?: { reason?: "idle"; id?: string }): Promise<Released | Released[] | false> {
+    async release(ctx: PluginContext, opts?: { reason?: "idle"; id?: string; forget?: boolean }): Promise<Released | Released[] | false> {
       // Which machines: the one whose box the framework named (the idle pass acts on one thing at a
       // time, each on its own clock), or every one the mount has (an operator releasing the mount, a
       // benchmark, a settled turn without a lease). An id that names no machine now names nothing to
@@ -1791,7 +1818,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       // One after another, each to the end: a machine that would not go must not keep the next from going.
       for (const machine of targets) {
         try {
-          const fact = await releaseMachine(ctx, machine, opts?.reason, lease);
+          const fact = await releaseMachine(ctx, machine, opts?.reason, lease, opts?.forget === true);
           if (fact) facts.push(fact);
         } catch (e) {
           const fact = (e as { released?: Released })?.released;
@@ -2258,10 +2285,12 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     let cred: Run9Credential;
     try { cred = JSON.parse(ctx.credential) as Run9Credential; } catch { return null; }
     if (!cred.ak || !cred.sk) return null;
+    // A network failure throws through: nobody answered, which is not "no account" (`Plugin.credentialAccount`).
     const res = await fetch(`${cfg.endpoint}/whoami`, {
       headers: { authorization: "Basic " + btoa(`${cred.ak}:${cred.sk}`) },
       signal: AbortSignal.timeout(cfg.timeoutMs),
     });
+    if (res.status >= 500) throw new Error(`run9 answered ${res.status} to /whoami`);
     if (!res.ok) return null;
     const org = (await res.json().catch(() => null) as { org?: { org_id?: unknown } } | null)?.org?.org_id;
     return typeof org === "string" && org ? `${org}/${cfg.project}` : null;
@@ -2310,7 +2339,8 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       // Not deleted, the old container is still the machine (`stopBox` keeps naming it), so the choice would not
       // apply to anything: refused, with the release fact the recorder needs for a box still billing.
       if (released && !released.freed) {
-        throw markReleased(new Error(`run9 box ${released.boxId} not released, so ${env.name} was not chosen: ${released.error ?? "unknown"}`), released.lease);
+        const e = new Error(`run9 box ${released.boxId} not released, so ${env.name} was not chosen: ${released.error ?? "unknown"}`);
+        throw released.lease ? markReleased(e, released.lease) : e;
       }
       const after = await readView(ctx, machine);
       await writeView(ctx, machine, { ...after, startFrom: env.snapId });
@@ -2322,7 +2352,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
         released: !!released,
         // The kernel reads this by name; `released` above is the model's
         // boolean and stays what it was.
-        ...(released ? { [LEASE_KEY]: released.lease } : {}),
+        ...(released?.lease ? { [LEASE_KEY]: released.lease } : {}),
         ...(released ? { releasedPrevious: released.boxId } : {}),
       };
     }
@@ -2578,7 +2608,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       return r.freed
         ? { released: true, box: r.boxId, ...named, liveMs: r.liveMs, saved: kept, [LEASE_KEY]: r.lease,
             note: "the container and its files are gone; anything saved above is not" }
-        : { released: false, box: r.boxId, ...named, error: r.error, saved: kept, [LEASE_KEY]: r.lease };
+        : { released: false, box: r.boxId, ...named, error: r.error, saved: kept, ...(r.lease ? { [LEASE_KEY]: r.lease } : {}) };
     }
 
     const wd = cfg.workdir;

@@ -36,7 +36,7 @@ import { secretRefKind } from "../../src/runtime/secrets.ts";
 import { DynamicWorkerExecutor, handleSandboxCall, handleSandboxSuspend, type SuspendRequest } from "../../src/runtime/dynamic-worker-executor.ts";
 import { executorSpec } from "../../test/spec/executor-spec.ts";
 import {
-  AgentRuntime, type FreshContextResult, type RestartResult, reconcileSeed, OPERATOR_RUN9_REF, isOperatorModelRef, parsePluginChoice, SEEDED_PLUGINS, installedRows, messageRefusal, consoleAdded, CONSOLE_MOUNTS_MAX, agentKind, seedInstallation } from "./runtime.ts";
+  AgentRuntime, type FreshContextResult, type RestartResult, reconcileSeed, OPERATOR_RUN9_REF, isOperatorModelRef, parsePluginChoice, SEEDED_PLUGINS, installedRows, messageRefusal, consoleAdded, CONSOLE_MOUNTS_MAX, agentKind, seedInstallation, recordReleaseError } from "./runtime.ts";
 import { readMeter } from "../../bench/meter.ts";
 import { BENCH_SWE_WITHHELD } from "../../bench/swebench/withheld.ts";
 import { contextWindowFor } from "../../src/model/context-windows.ts";
@@ -2244,9 +2244,9 @@ export class AgentDO extends DurableObject<Env> {
     return this.runtime().inboundLog();
   }
 
-  async uiReleaseSandbox(tenantId: string, agentId: string, alias: string) {
+  async uiReleaseSandbox(tenantId: string, agentId: string, alias: string, opts?: { forget?: boolean }) {
     this.#claim(tenantId, agentId);
-    return this.#busy("uiReleaseSandbox", () => this.runtime().releaseMount(tenantId, agentId, alias));
+    return this.#busy("uiReleaseSandbox", () => this.runtime().releaseMount(tenantId, agentId, alias, opts));
   }
 
   async uiCompact(tenantId: string, agentId: string, taskId: string) {
@@ -2572,10 +2572,7 @@ export class AgentDO extends DurableObject<Env> {
         // A container that could not be handed back is billed for merely
         // existing, so it is written down where diagnose can find it rather
         // than left to be noticed on an invoice.
-        for (const f of out.releaseFailed ?? []) {
-          this.sql.exec("CREATE TABLE IF NOT EXISTS release_errors(at INTEGER, alias TEXT, message TEXT)");
-          this.sql.exec("INSERT INTO release_errors VALUES (?,?,?)", Date.now(), f.alias, f.error);
-        }
+        for (const f of out.releaseFailed ?? []) recordReleaseError(this.sql as any, f.alias, f.error);
         await this.broadcast();
         // Where the drains stood before this pass sent anything: a pass that moved none of them is a retry.
         const drainedFrom = drainCursors(this.sql as any);
@@ -4403,7 +4400,10 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
           if (!form) return new Response("expected a form body", { status: 400 });
           const alias = String(form.get("alias") ?? "").trim();
           if (!alias) return new Response("expected an alias", { status: 400 });
-          const r = await stub.uiReleaseSandbox(gate.tenantId, agentId, alias);
+          // `forget`, only ever from the button a refusal below offers: drop a container run9 refuses outright to
+          // delete (its key revoked) from the record, reported as possibly still alive (`Holding.release`).
+          const forget = form.get("forget") === "1";
+          const r = await stub.uiReleaseSandbox(gate.tenantId, agentId, alias, forget ? { forget: true } : undefined);
           const taskId = url.searchParams.get("taskId") || `t_${agentId}`;
           // The button lives in the inspector's runtime tab, which shows the
           // panels stacked, so the answer is that same stack: a lone container
@@ -4415,7 +4415,16 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
           // `esc` is ui.ts's, and this file does not import a renderer.
           const reason = r.ok ? "" : String(r.error).replace(/[&<>"']/g, (c) =>
             ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c] as string);
-          return html(r.ok ? panel : `<div class="err">${reason}</div>${panel}`);
+          const aliasAttr = alias.replace(/[&<>"']/g, (c) =>
+            ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c] as string);
+          // The way out of a refusal that a retry cannot fix: a container whose delete run9 refuses (its key
+          // revoked or its project gone) would otherwise stay named here, and be retried, for ever.
+          const forgetForm = r.ok || forget || /background job/.test(String(r.error)) ? "" :
+            `<form hx-post="/ui/sandbox/release" hx-target="closest .body" hx-swap="innerHTML" style="padding:0;border:0"
+               hx-confirm="Forget this container? Only if run9 refused the delete outright. It may still be alive and billed on run9; it stops being named here and is recorded as forgotten.">
+               <input type="hidden" name="alias" value="${aliasAttr}"><input type="hidden" name="forget" value="1">
+               <button type="submit" class="ghost">forget it</button></form>`;
+          return html(r.ok ? panel : `<div class="err">${reason}</div>${forgetForm}${panel}`);
         }
         case "/ui/memory":
         case "/ui/runtime": {

@@ -2004,14 +2004,18 @@ function credentialRegion(m: any, spec: CredentialSpec | null | undefined): stri
   const deletes = m.plugin === "sandbox";
   const loses = "Its machines, running and switched off, are deleted first, with every file not saved or kept; " +
     "kept environments survive.";
-  const pasteWarning = deletes
-    ? `<div class="hint" style="padding:4px 0 0">${esc(loses.replace(/^Its/, `Unless the new key is on the same run9 account, ${m.alias}'s`))}</div>`
-    : "";
+  // "Unless the same account" only on a replace, the one form where the key being replaced and the new one can
+  // both be the tenant's, and so the one case the runtime keeps machines for in practice. Over the operator's
+  // shared key, or with no key at all, the machines simply go.
+  const pasteWarning = (sameAccountPossible: boolean) => !deletes ? "" :
+    `<div class="hint" style="padding:4px 0 0">${esc(sameAccountPossible
+      ? loses.replace(/^Its/, `Unless the new key is on the same run9 account, ${m.alias}'s`)
+      : loses.replace(/^Its/, `${m.alias}'s`))}</div>`;
   const refused = typeof c.refused === "string" && c.refused ? c.refused : null;
-  const paste = (verb: string, showError = true) => `
+  const paste = (verb: string, showError = true, sameAccountPossible = false) => `
     <form hx-post="/ui/credential" ${target}>
       <input type="hidden" name="alias" value="${esc(m.alias)}">${inputs}
-      ${pasteWarning}
+      ${pasteWarning(sameAccountPossible)}
       ${showError && error ? `<div class="err">${esc(error)}</div>` : ""}
       <div class="row"><button type="submit">${verb}</button></div>
     </form>`;
@@ -2087,7 +2091,7 @@ function credentialRegion(m: any, spec: CredentialSpec | null | undefined): stri
           <button type="submit" class="ghost">${shared ? "go back to the shared key" : "remove"}</button>
         </form></div>
       ${refused ? `<div class="err">${esc(refused)}</div>` : ""}
-      <details${error && verified ? " open" : ""}><summary>replace</summary>${paste("replace")}</details>
+      <details${error && verified ? " open" : ""}><summary>replace</summary>${paste("replace", true, true)}</details>
     </div>`;
 }
 

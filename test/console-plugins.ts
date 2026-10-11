@@ -184,7 +184,12 @@ check("a sandbox's attach, replace and remove each warn that its machines are de
   const own = flat(render(mount("sandbox", "sandbox", { connected: true,
     credential: { attached: true, verified: true, account: "default", revertsTo: "operator" } })));
   for (const [name, html] of [["attach", fresh], ["use your own key", operator], ["replace", own]] as const) {
-    must(deleted.test(html) && /Unless the new key is on the same run9 account, sandbox's machines/.test(html), `${name}: no warning, or no same-account exception`);
+    must(deleted.test(html), `${name}: no warning`);
+  }
+  // The same-account exception only where it can apply: replacing a key of the tenant's own.
+  must(/Unless the new key is on the same run9 account, sandbox's machines/.test(own), "replace: no same-account exception");
+  for (const [name, html] of [["attach", fresh], ["use your own key", operator]] as const) {
+    must(!/Unless/.test(html) && /sandbox's machines, running and switched off, are deleted first/.test(html), `${name}: offers an exception that cannot apply`);
   }
   const confirm = own.match(/hx-confirm="([^"]*)"/)?.[1] ?? "";
   must(/^Return sandbox to the deployment's shared account\?/.test(confirm) && deleted.test(confirm) && !/Unless/.test(confirm),

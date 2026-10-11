@@ -52,6 +52,35 @@ export { ASSUMED_CONTEXT_WINDOW } from "../../src/model/context-windows.ts";
  */
 const LEGACY_TASK = "main";
 
+type ExecSql = { exec(query: string, ...bindings: unknown[]): { toArray(): unknown[] } };
+
+/**
+ * Held things a key change left behind because the key that made them stopped working
+ * (`#releaseBeforeCredentialChange`). Still held and still retried; listed so they no longer hold up a change.
+ */
+const STRANDED_TABLE = "CREATE TABLE IF NOT EXISTS stranded_holds(alias TEXT NOT NULL, live_id TEXT NOT NULL, " +
+  "at INTEGER NOT NULL, reason TEXT NOT NULL, PRIMARY KEY (alias, live_id))";
+
+/** How many `release_errors` rows are kept: the newest, for diagnose (cf/src/diagnose-read.ts reads five). */
+const RELEASE_ERRORS_KEPT = 50;
+
+/**
+ * Write down a release that did not happen, where diagnose reads it. One row per alias and message, its time
+ * moved to the latest: a box that keeps refusing is retried on a schedule, and a row per attempt grew without
+ * bound. And only the newest `RELEASE_ERRORS_KEPT` rows stay.
+ */
+export function recordReleaseError(sql: ExecSql, alias: string, message: string, at: number = Date.now()) {
+  sql.exec("CREATE TABLE IF NOT EXISTS release_errors(at INTEGER, alias TEXT, message TEXT)");
+  sql.exec("DELETE FROM release_errors WHERE alias = ? AND message = ?", alias, message);
+  sql.exec("INSERT INTO release_errors VALUES (?,?,?)", at, alias, message);
+  sql.exec("DELETE FROM release_errors WHERE rowid NOT IN (SELECT rowid FROM release_errors ORDER BY at DESC LIMIT ?)", RELEASE_ERRORS_KEPT);
+}
+
+/** How long the idle pass waits before trying again to release a thing that refused: doubling, from 5 minutes to 6 hours. */
+export function releaseRetryMs(failures: number): number {
+  return Math.min(5 * 60_000 * 2 ** Math.max(0, failures - 1), 6 * 3_600_000);
+}
+
 /** The answer to a call made after the agent's task was ended (`RuntimeDeps.ended`). */
 function taskEndedRefusal(address: string): { status: "rejected"; error: { code: string; message: string } } {
   return {
@@ -1421,11 +1450,25 @@ export class AgentRuntime {
   async #releaseBeforeCredentialChange(tenantId: string, agentId: string, alias: string, next?: string): Promise<string | null> {
     const held = (await this.#gateway.mountActivities({ tenantId, agentId, taskId: LEGACY_TASK }, alias))
       .flatMap((a) => a.live ? [a.live] : []);
+    const sql = this.#deps.ctx.storage.sql;
+    sql.exec(STRANDED_TABLE);
+    // A stranded row for something no longer held says nothing any more.
+    const heldIds = new Set(held.map((l) => l.id));
+    for (const row of sql.exec("SELECT live_id FROM stranded_holds WHERE alias = ?", alias).toArray() as any[]) {
+      if (!heldIds.has(String(row.live_id))) sql.exec("DELETE FROM stranded_holds WHERE alias = ? AND live_id = ?", alias, row.live_id);
+    }
     if (!held.length) return null;
+    // A background job is using what is held: neither releasing it nor leaving it to a key that may not reach it.
+    if (mountsWithRunningJobs(sql, { tenantId, agentId }).has(alias)) {
+      return `${alias} is running a background job; the credential was not changed, since that would release ` +
+        `the machine under it`;
+    }
     // A new key of the same account reaches what the old one made, so nothing has to go: both answer the same
-    // account (`Plugin.credentialAccount`), and either not answering means not the same. Only when the mount's
-    // credential is the kind each held thing records it was made under: one made under another (a box from before
-    // this rule, on the operator's account under the tenant's key) has its account unasked, so it goes.
+    // account (`Plugin.credentialAccount`). Only when the mount's credential is the same KIND as the one each held
+    // thing records it was made under — a kind check, which rules out a box from before this rule (made on the
+    // operator's account under the tenant's key) but cannot tell two keys of one kind apart; the account lookup
+    // is what does that. An account either key cannot name is not the same one, so what is held goes. One nobody
+    // answered for is a wait: going ahead would delete machines a key of the same account would have kept.
     const mount = await this.store.getMountByAlias(tenantId, agentId, alias);
     const kind = secretRefKind(mount?.secretRef ?? null);
     if (next !== undefined && held.every((l) => l.credentialRef === undefined || l.credentialRef === kind)) {
@@ -1433,14 +1476,40 @@ export class AgentRuntime {
         this.#gateway.mountCredentialAccount(tenantId, agentId, alias),
         this.#gateway.mountCredentialAccount(tenantId, agentId, alias, next),
       ]);
-      if (was !== null && was === will) return null;
+      const silent = [was, will].find((a) => a.kind === "unreachable") as { reason: string } | undefined;
+      if (silent) {
+        return `couldn't confirm which account the current and the new key of ${alias} are on, so nothing was ` +
+          `changed and no machine was deleted; try again (${silent.reason})`;
+      }
+      if (was.kind === "account" && will.kind === "account" && was.id === will.id) return null;
     }
     const r = await this.releaseMount(tenantId, agentId, alias);
-    if (!r.ok) {
-      return `${alias} still holds something made with its current credential, which only that credential can ` +
-        `release, so the credential was not changed: ${r.error}`;
+    if (r.ok) return null;
+    // Not released. The refusal is worth something only while the current credential can still delete what is
+    // held. Things already stranded (left behind by an earlier key that stopped working) were never this key's to
+    // delete, so they hold nothing up.
+    const left = (await this.#gateway.mountActivities({ tenantId, agentId, taskId: LEGACY_TASK }, alias))
+      .flatMap((a) => a.live ? [a.live] : []);
+    const isStranded = (id: string) => sql.exec("SELECT 1 FROM stranded_holds WHERE alias = ? AND live_id = ?", alias, id).toArray().length > 0;
+    if (left.every((l) => isStranded(l.id))) return null;
+    // A credential the far end now refuses outright (revoked, its project gone) cannot delete anything either, so
+    // refusing the change protects nothing and would only wedge the mount: nothing could ever replace the dead
+    // key. The change goes ahead; what is held stays recorded — a later key of the same account can still delete
+    // it, and the idle pass keeps trying — and is written down as stranded where an operator looks
+    // (`release_errors`, read by diagnose), with the console's release offering `forget` as the last way out.
+    // An outage is not a verdict, so it still refuses.
+    const current = await this.#gateway.checkMount(tenantId, agentId, alias);
+    if (current && !current.ok && current.kind === "rejected") {
+      for (const l of left) {
+        if (isStranded(l.id)) continue;
+        const why = `${l.id} stranded: its credential is refused (${current.reason}) and it could not be released (${r.error})`;
+        sql.exec("INSERT OR REPLACE INTO stranded_holds(alias, live_id, at, reason) VALUES (?,?,?,?)", alias, l.id, Date.now(), why);
+        recordReleaseError(sql, alias, why);
+      }
+      return null;
     }
-    return null;
+    return `${alias} still holds something made with its current credential, which only that credential can ` +
+      `release, so the credential was not changed: ${r.error}`;
   }
 
   /**
@@ -1597,7 +1666,7 @@ export class AgentRuntime {
    * money, and the page must not say it is gone.
    */
   async releaseMount(
-    tenantId: string, agentId: string, alias: string,
+    tenantId: string, agentId: string, alias: string, opts?: { forget?: boolean },
   ): Promise<{ ok: true; released: boolean } | { ok: false; error: string }> {
     await this.ready();
     const mount = await this.store.getMountByAlias(tenantId, agentId, alias);
@@ -1615,7 +1684,9 @@ export class AgentRuntime {
     // Every thing the mount holds: this release has no id, so it lets go of all of them.
     const live = (await this.#gateway.mountActivities({ tenantId, agentId, taskId: LEGACY_TASK }, alias))
       .flatMap((a) => a.live ? [a.live] : []);
-    const r = await this.#gateway.releaseTask({ tenantId, agentId, taskId: LEGACY_TASK }, { alias });
+    // `forget` is the operator's way out for a thing the far end refuses outright to release
+    // (`Holding.release`): dropped from the record and reported, not deleted.
+    const r = await this.#gateway.releaseTask({ tenantId, agentId, taskId: LEGACY_TASK }, { alias, ...(opts?.forget ? { forget: true } : {}) });
     const failed = r.failed.find((f) => f.alias === alias);
     if (failed) return { ok: false, error: `${alias} was not released: ${failed.error}` };
 
@@ -3531,6 +3602,10 @@ export class AgentRuntime {
     // needed to be — and the alternative, a copy step, keeps a table nothing
     // reads for the sake of one duplicate message.
     sql.exec("DROP TABLE IF EXISTS box_warnings");
+    // When to try again to release a thing that refused, and how many times it has.
+    sql.exec(`CREATE TABLE IF NOT EXISTS release_retry(
+      alias TEXT NOT NULL, live_id TEXT NOT NULL, next_at INTEGER NOT NULL, failures INTEGER NOT NULL,
+      PRIMARY KEY (alias, live_id))`);
     let wakeInMs: number | null = null;
     let releaseFailed: Array<{ alias: string; error: string }> = [];
     const soon = (ms: number) => { wakeInMs = wakeInMs === null ? ms : Math.min(wakeInMs, ms); };
@@ -3549,6 +3624,11 @@ export class AgentRuntime {
     // released on its own (`Holding.activities`), and `held_warnings` is already keyed by the thing's id.
     const held = await heldResources(mounts, this.#plugins,
       (alias) => this.#gateway.mountActivities({ tenantId, agentId, taskId: LEGACY_TASK }, alias));
+    // A retry schedule for something no longer held is done with.
+    for (const row of sql.exec("SELECT alias, live_id FROM release_retry").toArray() as any[]) {
+      if (busy.has(String(row.alias)) || held.some((h) => h.alias === row.alias && h.live.id === row.live_id)) continue;
+      sql.exec("DELETE FROM release_retry WHERE alias = ? AND live_id = ?", row.alias, row.live_id);
+    }
     for (const h of held) {
       const row = sql.exec("SELECT release_at FROM held_warnings WHERE alias = ? AND live_id = ?", h.alias, h.live.id)
         .toArray()[0] as any;
@@ -3588,14 +3668,31 @@ export class AgentRuntime {
       // whole of an older task (#12); reopening it means first deciding what is
       // worth keeping, not adding a step here.
       // This thing only, by its id: another thing the same mount holds has its own clock.
+      // A thing that refused to go is tried again on a doubling schedule (`releaseRetryMs`), not on every pass:
+      // it stays held (the plugin keeps naming it), and every pass would otherwise ask the far end again and write
+      // another error.
+      const retry = sql.exec("SELECT next_at, failures FROM release_retry WHERE alias = ? AND live_id = ?", h.alias, h.live.id)
+        .toArray()[0] as any;
+      if (retry && Number(retry.next_at) > now) { soon(Number(retry.next_at) - now); continue; }
       const r = await this.#gateway.releaseTask({ tenantId, agentId, taskId: LEGACY_TASK }, { alias: h.alias, reason: "idle", id: h.live.id });
+      // Not after a failure: its warning was given, and the thing it warned about is still there. Dropped, the
+      // next pass would warn again about the same release, once per retry.
+      if (r.failed.some((f) => f.alias === h.alias)) {
+        releaseFailed = [...releaseFailed, ...r.failed];
+        const failures = (Number(retry?.failures) || 0) + 1;
+        const at = Date.now() + releaseRetryMs(failures);
+        sql.exec("INSERT INTO release_retry(alias, live_id, next_at, failures) VALUES (?,?,?,?) " +
+          "ON CONFLICT(alias, live_id) DO UPDATE SET next_at = excluded.next_at, failures = excluded.failures",
+          h.alias, h.live.id, at, failures);
+        soon(at - Date.now());
+        continue;
+      }
       releaseFailed = [...releaseFailed, ...r.failed];
       sql.exec("DELETE FROM held_warnings WHERE alias = ? AND live_id = ?", h.alias, h.live.id);
+      sql.exec("DELETE FROM release_retry WHERE alias = ? AND live_id = ?", h.alias, h.live.id);
       // A release may leave the thing held in another state with a schedule of its own (switched off, and
       // deleted much later), and nothing else would wake this object for that one. Asked again rather than
-      // assumed: whether anything is still held is the plugin's answer. Not after a failure, which would
-      // only come straight back here; that is reported instead, as it always was.
-      if (r.failed.some((f) => f.alias === h.alias)) continue;
+      // assumed: whether anything is still held is the plugin's answer.
       const after = (await this.#gateway.mountActivities({ tenantId, agentId, taskId: LEGACY_TASK }, h.alias))
         .find((a) => a.live?.id === h.live.id)?.live;
       if (!after) continue;

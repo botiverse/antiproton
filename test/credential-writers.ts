@@ -10,10 +10,11 @@
  * subject wherever a revert is under test.
  */
 import { sqliteHost } from "../src/store/sqlite-host.ts";
-import { AgentRuntime, OPERATOR_RUN9_REF } from "../cf/src/runtime.ts";
+import { AgentRuntime, OPERATOR_RUN9_REF, recordReleaseError, releaseRetryMs } from "../cf/src/runtime.ts";
 import { agentRef } from "../src/runtime/secrets.ts";
 import type { Plugin } from "../src/plugins/types.ts";
 import { recordBackgroundJob } from "../src/runtime/background-jobs.ts";
+import { operatorModelOf } from "../cf/src/model-request.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void>) {
@@ -21,6 +22,7 @@ async function check(name: string, fn: () => Promise<void>) {
   catch (e) { results.push({ name, ok: false, error: String((e as Error)?.message ?? e) }); }
 }
 function must(cond: unknown, msg: string): asserts cond { if (!cond) throw new Error(msg); }
+function eq3(a: unknown, b: unknown, msg: string) { if (a !== b) throw new Error(`${msg}: ${String(a)} !== ${String(b)}`); }
 
 const KEYED: Plugin = {
   id: "keyed", version: "1.0.0",
@@ -152,9 +154,17 @@ async function heldSandbox(deleteStatus: number | (() => number) = 200, opts: {
   orgs?: Record<string, string>;
   /** Access keys whose credential check run9 refuses. */
   rejects?: string[];
+  /** Access keys run9 no longer accepts for anything (revoked): every request with one answers 401. */
+  revoked?: string[];
+  /** Access keys whose `/whoami` gets a 503: nobody answered. */
+  whoamiDown?: string[];
+  /** What run9 answers a box's `stop` (switching it off); 200 by default. */
+  stopStatus?: number;
+  /** The mount's runtime takes these too (an idle lease, say). */
+  deps?: Record<string, unknown>;
 } = {}) {
   const OPS = { ak: "ops-ak", sk: "ops-sk" };
-  const w = await runtime(OPERATOR_RUN9_REF, SANDBOX, { operatorRun9: OPS });
+  const w = await runtime(OPERATOR_RUN9_REF, SANDBOX, { operatorRun9: OPS, ...opts.deps });
   w.store.pluginDb.put({ tenantId: "t", agentId: "a", alias: "sandbox", plugin: "sandbox" }, "box", "state",
     { machines: { main: { boxId: "b-ops", createdAt: 1, lastUsedAt: 1, credentialRef: "operator" } } }, null);
   const calls: Array<{ method: string; path: string; who: string; refAtCall: string | null }> = [];
@@ -165,6 +175,11 @@ async function heldSandbox(deleteStatus: number | (() => number) = 200, opts: {
     const path = new URL(String(url)).pathname;
     calls.push({ method, path, who: accountOf(String(init?.headers?.authorization ?? "")), refAtCall: await w.ref() });
     const who = accountOf(String(init?.headers?.authorization ?? ""));
+    if (opts.revoked?.includes(who)) return new Response("{\"error\":\"invalid api key\"}", { status: 401 });
+    if (path === "/whoami" && opts.whoamiDown?.includes(who)) return new Response("unavailable", { status: 503 });
+    if (method === "POST" && path.endsWith("/stop") && opts.stopStatus && opts.stopStatus !== 200) {
+      return new Response("{\"error\":\"no\"}", { status: opts.stopStatus });
+    }
     if (method === "DELETE") {
       const status = typeof deleteStatus === "function" ? deleteStatus() : deleteStatus;
       return new Response(status === 200 ? "{}" : "{\"error\":\"no\"}", { status });
@@ -193,7 +208,11 @@ async function heldSandbox(deleteStatus: number | (() => number) = 200, opts: {
     holds(id, "agent");
     calls.length = 0;
   };
-  return { ...w, calls, box, deletes, holds, ownKeyHolding, restore: () => { globalThis.fetch = real; } };
+  const releaseErrors = () => {
+    const t = w.host.sql.exec("SELECT name FROM sqlite_master WHERE name = 'release_errors'").toArray().length;
+    return t ? w.host.sql.exec("SELECT alias, message FROM release_errors").toArray() as Array<{ alias: string; message: string }> : [];
+  };
+  return { ...w, calls, box, deletes, holds, ownKeyHolding, releaseErrors, restore: () => { globalThis.fetch = real; } };
 }
 
 await check("a key of the tenant's own over the operator's: the operator's box is deleted first, with the operator's key", async () => {
@@ -332,6 +351,122 @@ await check("a refused remove says why", async () => {
     const none = await w.rt.removeCredentialOrWhy("t", "a", "nope");
     must(!none.ok && /no mount named nope/.test(none.error), `a missing mount: ${JSON.stringify(none)}`);
   } finally { w.restore(); }
+});
+
+// ---- a key that stopped working must not wedge the mount (#840 re-review) -----------------------------------------
+
+await check("the old key revoked: a new key goes on at the first attempt, the box stays recorded and is written down as stranded", async () => {
+  const revoked: string[] = [];
+  const v = await heldSandbox(200, { revoked });
+  try {
+    await v.ownKeyHolding("b-own");
+    // run9 revokes own-ak: every request with it is refused from here on — the credential check, /whoami, DELETE.
+    revoked.push("own-ak");
+    const r = await v.rt.attachCredential("t", "a", "sandbox", { ak: "own2-ak", sk: "own2-sk" });
+    must(r.ok, `wedged: ${JSON.stringify(r)}`);
+    must(v.deletes().length === 1 && v.deletes()[0]!.who === "own-ak", `the release was not tried first: ${JSON.stringify(v.calls)}`);
+    must(v.box() === "b-own", `the record let go of a box nothing deleted: ${v.box()}`);
+    must(v.releaseErrors().some((e) => e.alias === "sandbox" && /b-own stranded/.test(e.message)), `not written down: ${JSON.stringify(v.releaseErrors())}`);
+    // Stranded, it holds up no later change either, and a key that can delete it does so first.
+    v.calls.length = 0;
+    const again = await v.rt.attachCredential("t", "a", "sandbox", { ak: "own3-ak", sk: "own3-sk" });
+    must(again.ok && v.deletes().some((c) => c.who === "own2-ak") && !v.box(), `the next change: ${JSON.stringify(again)} ${JSON.stringify(v.calls)}`);
+  } finally { v.restore(); }
+});
+
+await check("the old key revoked: removing it works too, and keeps the box recorded", async () => {
+  const revoked: string[] = [];
+  const v = await heldSandbox(200, { revoked });
+  try {
+    await v.ownKeyHolding("b-own");
+    revoked.push("own-ak");
+    const r = await v.rt.removeCredentialOrWhy("t", "a", "sandbox");
+    must(r.ok, `wedged: ${JSON.stringify(r)}`);
+    must((await v.ref()) === OPERATOR_RUN9_REF && v.box() === "b-own", `ref ${await v.ref()}, box ${v.box()}`);
+  } finally { v.restore(); }
+});
+
+await check("a key that still works keeps refusing; an outage on its check is not a revocation", async () => {
+  const w = await heldSandbox(500);
+  try {
+    await w.ownKeyHolding("b-own");
+    const r = await w.rt.attachCredential("t", "a", "sandbox", { ak: "own2-ak", sk: "own2-sk" });
+    must(!r.ok && /not changed/.test(r.error) && w.box() === "b-own", `went ahead: ${JSON.stringify(r)}`);
+    must(!w.releaseErrors().some((e) => /stranded/.test(e.message)), "a working key's box was written down as stranded");
+  } finally { w.restore(); }
+  // The check of the old key unanswered (network down for it, DELETE refused): not a verdict, so still refused.
+  const down: string[] = [];
+  const v = await heldSandbox(500, { revoked: [] });
+  const inner = globalThis.fetch;
+  globalThis.fetch = (async (url: string, init?: any) => {
+    const who = atob(String(init?.headers?.authorization ?? "").replace(/^Basic /, "")).split(":")[0]!;
+    if (down.includes(who) && String(url).endsWith("/b_credential_check_only")) throw new Error("connect ECONNREFUSED");
+    return inner(url, init);
+  }) as any;
+  try {
+    await v.ownKeyHolding("b-own");
+    down.push("own-ak");
+    const r = await v.rt.attachCredential("t", "a", "sandbox", { ak: "own2-ak", sk: "own2-sk" });
+    must(!r.ok && v.box() === "b-own" && (await v.ref()) === agentRef("sandbox"), `an outage let it through: ${JSON.stringify(r)}`);
+  } finally { globalThis.fetch = inner; v.restore(); }
+});
+
+await check("the operator can forget a box run9 refuses outright to delete, and only then", async () => {
+  const w = await heldSandbox(401);
+  try {
+    const kept = await w.rt.releaseMount("t", "a", "sandbox");
+    must(!kept.ok && w.box() === "b-ops", `a plain release let it go: ${JSON.stringify(kept)}`);
+    const gone = await w.rt.releaseMount("t", "a", "sandbox", { forget: true });
+    must(gone.ok && !w.box(), `forget did not: ${JSON.stringify(gone)} ${w.box()}`);
+  } finally { w.restore(); }
+  const v = await heldSandbox(500);
+  try {
+    const r = await v.rt.releaseMount("t", "a", "sandbox", { forget: true });
+    must(!r.ok && v.box() === "b-ops", `an outage (500) was forgotten: ${JSON.stringify(r)}`);
+  } finally { v.restore(); }
+});
+
+await check("an account lookup nobody answered refuses the change instead of deleting machines (N1)", async () => {
+  const w = await heldSandbox(200, { orgs: { "own-ak": "org-1", "own2-ak": "org-1" }, whoamiDown: ["own2-ak"] });
+  try {
+    await w.ownKeyHolding("b-own");
+    const r = await w.rt.attachCredential("t", "a", "sandbox", { ak: "own2-ak", sk: "own2-sk" });
+    must(!r.ok && /couldn't confirm which account/.test(r.error), `not refused: ${JSON.stringify(r)}`);
+    must(w.deletes().length === 0 && w.box() === "b-own" && (await w.ref()) === agentRef("sandbox"), `changed: ${JSON.stringify(w.calls)}`);
+  } finally { w.restore(); }
+});
+
+await check("the idle pass retries a release that refused on a doubling schedule, not on every pass (N3)", async () => {
+  const w = await heldSandbox(200, { stopStatus: 500, deps: { idle: { warnMs: 60_000, maxMs: 600_000 },
+    operatorModel: operatorModelOf({ DEEPSEEK_BASE_URL: "https://model.example/v1", DEEPSEEK_API_KEY: "k", HARNESS_MODEL: "deepseek-flash" }) } });
+  try {
+    await w.rt.bindOperatorModel("t", "a");
+    const stops = () => w.calls.filter((c) => c.method === "POST" && c.path.endsWith("/b-ops/stop")).length;
+    const first = await w.rt.step("t", "a");
+    must(stops() === 1 && first.releaseFailed.length === 1, `the first pass: ${stops()} stops, ${JSON.stringify(first.releaseFailed)}`);
+    const second = await w.rt.step("t", "a");
+    must(stops() === 1 && second.releaseFailed.length === 0, `retried at once: ${stops()} stops`);
+    must(second.wakeInMs !== null && second.wakeInMs > 4 * 60_000 && second.wakeInMs <= 5 * 60_000, `no wake for the retry: ${second.wakeInMs}`);
+    const row = w.host.sql.exec("SELECT failures FROM release_retry WHERE alias = 'sandbox' AND live_id = 'b-ops'").toArray()[0] as any;
+    must(Number(row?.failures) === 1, `retry row: ${JSON.stringify(row)}`);
+    // Its time come, it is tried again, and the wait doubles.
+    w.host.sql.exec("UPDATE release_retry SET next_at = 0");
+    await w.rt.step("t", "a");
+    const again = w.host.sql.exec("SELECT failures, next_at FROM release_retry WHERE alias = 'sandbox'").toArray()[0] as any;
+    must(stops() === 2 && Number(again.failures) === 2 && Number(again.next_at) - Date.now() > 9 * 60_000, `second try: ${stops()} ${JSON.stringify(again)}`);
+  } finally { w.restore(); }
+});
+
+await check("release errors are one row per alias and message, newest kept, and capped (N3)", async () => {
+  const host = sqliteHost();
+  for (let i = 0; i < 5; i++) recordReleaseError(host.sql, "sandbox", "run9 box b1 not released: 500", 1000 + i);
+  const rows = host.sql.exec("SELECT at FROM release_errors").toArray() as any[];
+  must(rows.length === 1 && rows[0].at === 1004, `retries piled up: ${JSON.stringify(rows)}`);
+  for (let i = 0; i < 80; i++) recordReleaseError(host.sql, "sandbox", `m${i}`, 2000 + i);
+  const n = Number((host.sql.exec("SELECT COUNT(*) AS n FROM release_errors").toArray()[0] as any).n);
+  must(n === 50, `not capped: ${n}`);
+  must(host.sql.exec("SELECT 1 FROM release_errors WHERE message = 'm79'").toArray().length === 1, "the newest was dropped");
+  eq3(releaseRetryMs(1), 5 * 60_000, "first retry"); eq3(releaseRetryMs(2), 10 * 60_000, "doubles"); eq3(releaseRetryMs(30), 6 * 3_600_000, "capped");
 });
 
 for (const r of results) {

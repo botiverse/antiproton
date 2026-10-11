@@ -13,6 +13,7 @@ import {
   BOX_KEY, BOX_STORE, MAIN_MACHINE, asBoxState, asMountState, machineOf, sandboxPlugin, unreadableEntries, usageOf,
 } from "../src/plugins/sandbox.ts";
 import type { MountActivity, Released } from "../src/plugins/types.ts";
+import { LEASE_KEY } from "../src/plugins/types.ts";
 import { PluginDbTables } from "../src/store/plugin-db.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { openPluginDatabase } from "../src/runtime/plugin-db.ts";
@@ -423,6 +424,37 @@ await check("a session recorded with a kind this build does not know is kept, re
   const used = usageOf(asBoxState({ boxId: "", createdAt: 0, lastUsedAt: 0, sessions: [s, known] } as any));
   must(used.map((u) => u.id).join() === "b-old,b-ops", `a session was dropped: ${JSON.stringify(used)}`);
   must(!("credentialRef" in used[0]!) && used[1]!.credentialRef === "operator", `kinds: ${JSON.stringify(used)}`);
+});
+
+await check("a box that keeps refusing reports its error lease once, not once per attempt (N3)", async () => {
+  let refuse = 2;
+  const f = fixture({ machines: { main: box("b1") } }, {}, (c) => c.method === "DELETE" && refuse-- > 0);
+  const first: any = await f.plugin.invoke("release", {}, f.ctx);
+  const second: any = await f.plugin.invoke("release", {}, f.ctx);
+  must(first.released === false && first[LEASE_KEY]?.status === "error", `the first failure: ${JSON.stringify(first)}`);
+  must(second.released === false && !(LEASE_KEY in second), `a second error lease: ${JSON.stringify(second)}`);
+  const done: any = await f.plugin.invoke("release", {}, f.ctx);
+  must(done.released === true && done[LEASE_KEY]?.status === "freed", `the release that worked: ${JSON.stringify(done)}`);
+});
+
+await check("forget drops a box only after run9 refuses its delete outright (4xx), reporting it as forgotten", async () => {
+  const f = fixture({ machines: { main: box("b1") } });
+  globalThis.fetch = ((inner) => (async (url: string, init?: any) => String(init?.method) === "DELETE"
+    ? new Response(JSON.stringify({ error: "invalid api key" }), { status: 401 }) : inner(url, init)))(globalThis.fetch) as any;
+  const fact = await f.plugin.holds!.release(f.ctx, { forget: true }) as Released;
+  must(fact && fact.status === "error" && /forgotten/.test(String(fact.error)) && /401/.test(String(fact.error)), `the fact: ${JSON.stringify(fact)}`);
+  must(!f.mount().machines.main, `still recorded: ${JSON.stringify(f.raw())}`);
+  // An outage (5xx) is not a verdict: kept even when asked to forget.
+  const g = fixture({ machines: { main: box("b2") } }, {}, (c) => c.method === "DELETE");
+  let thrown: any = null;
+  try { await g.plugin.holds!.release(g.ctx, { forget: true }); } catch (e) { thrown = e; }
+  must(thrown && g.mount().machines.main?.boxId === "b2", `a 500 was forgotten: ${JSON.stringify(g.raw())}`);
+  // And without the flag a 4xx keeps it, as every failure does.
+  const h = fixture({ machines: { main: box("b3") } });
+  globalThis.fetch = ((inner) => (async (url: string, init?: any) => String(init?.method) === "DELETE"
+    ? new Response("{}", { status: 401 }) : inner(url, init)))(globalThis.fetch) as any;
+  try { await h.plugin.holds!.release(h.ctx); } catch { /* reported */ }
+  must(h.mount().machines.main?.boxId === "b3", "a 4xx without forget let it go");
 });
 
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.error ? `\n    ${r.error}` : ""}`);

@@ -607,6 +607,8 @@ export class ToolGateway {
       alias?: string; reason?: "idle";
       /** One held thing of that mount, by its `live.id` (`Holding.release`); absent, all it holds. */
       id?: string;
+      /** An operator's `Holding.release` `forget`. */
+      forget?: boolean;
     },
   ): Promise<{ released: string[]; failed: Array<{ alias: string; error: string }> }> {
     const released: string[] = [];
@@ -629,8 +631,8 @@ export class ToolGateway {
           async sibling() { return null; },
           async sandboxForms() { return []; },
           async agentSecret() { return null; },
-        }, opts?.reason || opts?.id
-          ? { ...(opts.reason ? { reason: opts.reason } : {}), ...(opts.id ? { id: opts.id } : {}) }
+        }, opts?.reason || opts?.id || opts?.forget
+          ? { ...(opts.reason ? { reason: opts.reason } : {}), ...(opts.id ? { id: opts.id } : {}), ...(opts.forget ? { forget: true } : {}) }
           : undefined);
         // Behind the same lock as a call on this mount, for an exclusive
         // plugin: a release reads the state, destroys the box and writes the
@@ -1491,19 +1493,21 @@ export class ToolGateway {
 
   /**
    * Operator-only: which billing account a credential acts on (`Plugin.credentialAccount`) — the mount's own, or
-   * `candidate`, a value not stored anywhere yet. Null whenever that cannot be said for certain: no such hook, no
-   * credential, a failed call. Only ever compared, never stored or shown.
+   * `candidate`, a value not stored anywhere yet. "unknown" when the key has none to name (no such hook, no
+   * credential, a refusal); "unreachable" when nobody answered. Only ever compared, never stored or shown.
    */
-  async mountCredentialAccount(tenantId: string, agentId: string, alias: string, candidate?: string): Promise<string | null> {
+  async mountCredentialAccount(tenantId: string, agentId: string, alias: string, candidate?: string):
+    Promise<{ kind: "account"; id: string } | { kind: "unknown" } | { kind: "unreachable"; reason: string }> {
     const mount = await this.#store.getMountByAlias(tenantId, agentId, alias);
-    if (!mount) return null;
+    if (!mount) return { kind: "unknown" };
     const plugin = this.#plugins.get(mount.plugin);
-    if (!plugin?.credentialAccount) return null;
+    if (!plugin?.credentialAccount) return { kind: "unknown" };
     try {
       const id = await plugin.credentialAccount(await this.#credentialContext(tenantId, agentId, mount, candidate));
-      return typeof id === "string" && id ? id : null;
-    } catch {
-      return null;
+      return typeof id === "string" && id ? { kind: "account", id } : { kind: "unknown" };
+    } catch (e) {
+      // A throw is the plugin saying nobody answered (`Plugin.credentialAccount`), not that the key has no account.
+      return { kind: "unreachable", reason: String((e as Error)?.message ?? e).slice(0, 200) };
     }
   }
 
