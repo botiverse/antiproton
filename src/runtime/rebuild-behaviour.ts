@@ -101,7 +101,8 @@ export function summariseBehaviour(entries: readonly BriefingEntry[], o: { wakeA
   const prior = new Set(o.prior);
   const send = calls.findIndex((c) => isSendTool(c.name));
   const before = send < 0 ? calls : calls.slice(0, send);
-  const repeated = (cs: readonly Call[]) => cs.filter((c) => !isInboxRead(c.name) && prior.has(callKey(c.name, c.args))).length;
+  // An inbox read is never among `prior` (`priorCallKeys`), so it never counts as a repeat.
+  const repeated = (cs: readonly Call[]) => cs.filter((c) => prior.has(callKey(c.name, c.args))).length;
   const first = calls.find((c) => !isInboxRead(c.name));
   // An offloaded call is written as a placeholder (`deferred`, `pending`) while it is out, beside its answer.
   const answers = entries.filter((e) => e.message?.role === "assistant" && !["deferred", "pending"].includes(e.message.stopReason));
