@@ -25,7 +25,7 @@ import { canonJson } from "../core/canon-json.ts";
 import { logEvent } from "../core/log.ts";
 import { appendTrace } from "../trace/outbox.ts";
 import { MAIN_SESSION, piTables, type SqlHost } from "../store/pi-storage.ts";
-import { isSendTool, sendsReported, type BriefingEntry } from "./overflow-backstop.ts";
+import { isProgramTool, isSendTool, sendsReported, type BriefingEntry } from "./overflow-backstop.ts";
 
 type Sql = SqlHost["sql"];
 
@@ -75,7 +75,7 @@ function callsOf(entries: readonly BriefingEntry[]): Call[] {
       const name = String(p.name ?? "");
       out.push({ name, args: p.arguments ?? {}, id: String(p.id ?? ""), at: Number(m.timestamp ?? e.timestamp),
         ok: r ? r.ok : null, endedAt: r ? r.at : null,
-        sends: isSendTool(name) || (!!r && r.ok && sendsReported(r.text).length > 0) });
+        sends: isSendTool(name) || (isProgramTool(name) && !!r && r.ok && sendsReported(r.text).length > 0) });
     }
   }
   return out;

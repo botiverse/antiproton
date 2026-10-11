@@ -396,7 +396,17 @@ function sendPlace(args: unknown): { target: string | null; replyTo: string | nu
  */
 const SENT_SAYS = /(?:Message sent to|posted to) (\S+?)\.? (?:Message ID: |as message )([0-9A-Za-z-]{6,64})/g;
 
-/** Every send a result reports (`SENT_SAYS`), in any string at any depth, a program's JSON-in-string outputs included. */
+/**
+ * A program: its result holds what the tools it called answered, so a send it made is known only by what that answer
+ * says (`sendsReported`). No other tool's result is read for sends: what a read tool returns is other people's text,
+ * which can say anything, "Message sent to …" included.
+ */
+export const isProgramTool = (name: string) => toolPart(name) === "run_js";
+
+/**
+ * Every send a program's result reports (`SENT_SAYS`), in any string at any depth, its JSON-in-string outputs included.
+ * A Raft message line inside it (a read the program made) is someone's text, not a report, and is never scanned.
+ */
 export function sendsReported(resultText: string): Array<{ target: string; id: string }> {
   const out: Array<{ target: string; id: string }> = [];
   const scan = (t: string) => { for (const m of t.matchAll(SENT_SAYS)) out.push({ target: m[1]!, id: m[2]! }); };
@@ -404,7 +414,7 @@ export function sendsReported(resultText: string): Array<{ target: string; id: s
     if (depth > 8) return;
     if (typeof v === "string") {
       if (/^\s*[[{]/.test(v)) { try { walk(JSON.parse(v), depth + 1); return; } catch { /* text */ } }
-      scan(v);
+      if (!RAFT_HEAD.test(v)) scan(v);
     } else if (Array.isArray(v)) for (const x of v) walk(x, depth + 1);
     else if (v && typeof v === "object") for (const x of Object.values(v)) walk(x, depth + 1);
   };
@@ -513,7 +523,7 @@ export function buildBriefing(entries: readonly BriefingEntry[], o: {
   // A send is a messaging tool's call, or one a program made (`run_js`), known by what its result reports.
   const nested = new Map<string, Array<{ target: string; id: string }>>();
   for (const c of calls) {
-    if (isSendTool(c.name)) continue;
+    if (!isProgramTool(c.name)) continue;
     const r = results.get(c.id);
     const said = r && !r.isError ? sendsReported(r.text) : [];
     if (said.length) nested.set(c.id, said);
