@@ -674,7 +674,7 @@ const ARGUMENT_CHECKS: Readonly<Record<string, { check(input: Record<string, unk
         : "action.type must be channel:create, channel:add_member or agent:create: the integration cards take ids you have no way to know, and are made by Raft's own integration commands";
     },
     described: " A card is the route for a change your role does not allow you to make yourself, or one you want a person to confirm;" +
-      " what Raft lets you do directly, do with its own tool (mentions_add, profile_update, tasks_delete and the rest), with no card." +
+      " what Raft lets you do directly, do with its own tool, with no card." +
       " Only channel:create, channel:add_member and agent:create cards can be prepared here: the integration cards take ids you have no way to know, and are made by Raft's own integration commands.",
   },
 };

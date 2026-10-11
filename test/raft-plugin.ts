@@ -305,6 +305,32 @@ await check("no tool description or parameter description, at any depth, names a
   }
 });
 
+/**
+ * A description is the same on every mount, but a mount is offered only the generated tools its credential's
+ * capabilities reach (`snapshotTools`). So a tool's description may name another generated tool only when every
+ * credential that gets the first gets the second: the named tool needs no capability the naming one lacks.
+ */
+function namedBeyondReach(tools: ReadonlyArray<{ name: string; summary: string; parameters: unknown }>): string[] {
+  const capabilityOf = new Map(GENERATED.map((op) => [op.toolName, op.capability]));
+  return tools.flatMap((t) => {
+    const own = capabilityOf.get(t.name);
+    if (!own) return [];
+    const texts = [t.summary, ...descriptionsIn(t.parameters, t.name).map(([, d]) => d)];
+    return GENERATED.filter((op) => op.toolName !== t.name && texts.some((d) => new RegExp(`(?<![\\w.])${op.toolName}(?![\\w])`).test(d)))
+      .filter((op) => op.capability.some((c) => !own.includes(c)))
+      .map((op) => `${t.name} names ${op.toolName} (needs ${op.capability.filter((c) => !own.includes(c)).join(", ")})`);
+  });
+}
+
+await check("no description names a generated tool a credential could lack while holding the described tool's capabilities", async () => {
+  const found = namedBeyondReach(raftPlugin.tools as any);
+  if (found.length) throw new Error(found.join("; "));
+  // Positive control: actions_prepare (tasks) naming mentions_add (mentions) is caught; naming tasks_delete (tasks) is not.
+  const card = toolNamed("actions_prepare")!;
+  const doctored = namedBeyondReach([{ ...card, summary: `${card.summary} Or call mentions_add, or tasks_delete.` }]);
+  if (JSON.stringify(doctored) !== JSON.stringify(["actions_prepare names mentions_add (needs mentions)"])) throw new Error(`control: ${JSON.stringify(doctored)}`);
+});
+
 await check("the manifest's declarations map onto the tool: side effect, model-only, idempotency, description and schema", async () => {
   for (const op of GENERATED) {
     const t = toolNamed(op.toolName)!;
@@ -3325,7 +3351,7 @@ await check("mentions_add, profile_update and tasks_delete are offered, describe
   }
   // actions_prepare names them as what needs no card.
   const card = toolNamed("actions_prepare")!.summary;
-  if (!/your role does not allow you to make yourself, or one you want a person to confirm/.test(card) || !/mentions_add, profile_update, tasks_delete/.test(card)) throw new Error(card);
+  if (!/your role does not allow you to make yourself, or one you want a person to confirm/.test(card) || !/do with its own tool, with no card/.test(card)) throw new Error(card);
   const calls: Array<{ url: string; method: string; body: any }> = [];
   globalThis.fetch = (async (url: any, init?: any) => {
     const u = new URL(String(url));
