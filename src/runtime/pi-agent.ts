@@ -201,9 +201,9 @@ export interface PiAgentOptions {
    * out (`transform_context`); the transcript keeps pi's result as written. Absent: pi's text is sent.
    */
   explainUnavailable?: (name: string) => string;
-  /** Told of each compaction pi asks for, which this engine declines (`open`), with pi's reason and its token
-   *  estimate of the context: a record (src/runtime/rebuild.ts), never a say in whether it runs. */
-  onCompaction?: (reason: string, tokensBefore: number) => void;
+  /** Read each answer for rebuild outcomes and context overflows (src/runtime/rebuild.ts): records, never a say in
+   *  what runs. Off when absent. */
+  rebuilds?: boolean;
   /** Wake whatever does the waiting. Failure here is not fatal: the job row is
    *  already durable, so a later pass can re-send it. */
   dispatch(jobId: string): Promise<void>;
@@ -244,6 +244,7 @@ export class PiAgent implements AgentEngine {
     ensureAgentTables(opts.host.sql, conversation);
     const storage = new PiSqliteStorage(opts.host, {
       session: conversation, ...(opts.now ? { now: opts.now } : {}), ...(opts.usageOwner ? { usageOwner: opts.usageOwner } : {}),
+      ...(opts.rebuilds ? { rebuilds: { contextWindow: opts.model.contextWindow } } : {}),
     });
     const session = new StorageBackedSession(
       { id: opts.sessionId, createdAt: (opts.now ?? Date.now)(), storageVersion: 1 },
@@ -300,15 +301,7 @@ export class PiAgent implements AgentEngine {
     // and `setCompactionSettings` can turn it back on. Every compaction passes
     // this hook before its model call, so declining here means none of them
     // writes an empty summary or dispatches a job.
-    // Each one declined is also told to `onCompaction`, which records it and decides nothing.
-    const told = opts.onCompaction;
-    harness.hooks.on("before_compaction", (event) => {
-      if (told) {
-        try { told(String(event.reason), Number(event.preparation?.tokensBefore)); }
-        catch (e) { console.error("recording a declined compaction failed:", e); }
-      }
-      return { decline: true };
-    });
+    harness.hooks.on("before_compaction", () => ({ decline: true }));
 
     // pi answers a call to a tool it does not have with its own line before any hook runs; the request
     // that carries that result to the model says why instead (src/runtime/unavailable-tool.ts). The

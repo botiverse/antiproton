@@ -277,7 +277,7 @@ function bookRebuilds(exec: SqliteSyncExecutor, writes: readonly StorageWrite[],
         "AND json_extract(record, '$.kind') = 'pi.assistant' ORDER BY id DESC LIMIT 1", w.value.conversationId, w.value.id);
       const usage = before ? (JSON.parse(before.record) as { model?: Array<{ usage?: Tokens }> }).model?.[0]?.usage : undefined;
       recordRebuildDecision(sql, (fn) => fn(), compactionRecord({
-        ...owner, key, reason: data.reason, ran: true,
+        ...owner, key, reason: data.reason,
         contextTokens: typeof usage?.input === "number" ? usage.input : null, at: now,
       }));
       continue;
@@ -286,7 +286,7 @@ function bookRebuilds(exec: SqliteSyncExecutor, writes: readonly StorageWrite[],
     for (const m of w.value.model as readonly MessageLike[]) {
       if (!isObject(m) || m.role !== "assistant" || typeof m.jobId !== "string") continue;
       if (!answerEnded(m.stopReason as Parameters<typeof answerEnded>[0])) continue;
-      settleRebuildOutcome(sql, { ...owner, entries: key, jobId: m.jobId, at: now, usage: m.usage ?? null });
+      settleRebuildOutcome(sql, { ...owner, entries: key, jobId: m.jobId, at: now, stopReason: m.stopReason, usage: m.usage ?? null });
     }
   }
 }

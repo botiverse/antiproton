@@ -105,7 +105,7 @@ import {
 import type { InboundEvent, InboundHooks } from "../../src/plugins/types.ts";
 import { INBOUND_HOOKS_PER_MOUNT } from "../../src/plugins/types.ts";
 import { CONTEXT_BOUNDARY_WHERE, MAIN_SESSION, piTables } from "../../src/store/pi-storage.ts";
-import { coldWakeRecord, compactionRecord, readWakeFacts, recordRebuildDecision, ruleFor, shouldRebuild, type RebuildPolicy } from "../../src/runtime/rebuild.ts";
+import { coldWakeRecord, nearWindow, readWakeFacts, recordRebuildDecision, ruleFor, shouldRebuild, windowRecord, type RebuildPolicy } from "../../src/runtime/rebuild.ts";
 import { contextIdOf } from "../../src/runtime/context-id.ts";
 import { UnknownJob } from "./model-queue.ts";
 
@@ -634,8 +634,8 @@ export interface RuntimeDeps {
   contextWindow?: number;
   /**
    * The rules a context rebuild is decided by (src/runtime/rebuild.ts), in shadow: each inbound wake of a pi085 main
-   * conversation records what they would decide and what the wake's first call then measured, and each compaction is
-   * recorded in the same terms; nothing is acted on. Absent: nothing is recorded (the benchmark's runtime).
+   * conversation records what they would decide and what the wake's first call then measured; a context near the
+   * window, an overflow, and a pd compaction are recorded in the same terms; nothing is acted on. Absent: nothing is recorded (the benchmark's runtime).
    */
   rebuildPolicy?: RebuildPolicy | null;
   /** Domain policy handed to the harness at task initialisation. */
@@ -1274,22 +1274,18 @@ export class AgentRuntime {
       };
       const decision = shouldRebuild(facts, policy);
       const storage = this.#deps.ctx.storage;
-      recordRebuildDecision(sql, <T>(fn: () => T): T => storage.transactionSync ? storage.transactionSync(fn) : fn(), coldWakeRecord({
+      const transact = <T>(fn: () => T): T => storage.transactionSync ? storage.transactionSync(fn) : fn();
+      recordRebuildDecision(sql, transact, coldWakeRecord({
         tenantId, agentId, key: entries, conversation: this.#conversationOf(MAIN_SESSION), facts, decision,
         coldHitRate: ruleFor(policy, binding.provider, binding.model).coldHitRate, at: now,
       }));
+      // pi085 never compacts: a context at the edge of its window is a window rebuild only this row will name.
+      if (nearWindow(facts.contextTokens, facts.contextWindow, policy)) {
+        recordRebuildDecision(sql, transact, windowRecord({
+          tenantId, agentId, key: entries, reason: "context-near-window", contextTokens: facts.contextTokens, contextWindow: facts.contextWindow, at: now,
+        }));
+      }
     } catch (e) { console.error(`the rebuild decision for ${tenantId}/${agentId}'s wake failed:`, e); }
-  }
-
-  /** pi085 declines every compaction (src/runtime/pi-agent.ts); each one pi asked for is recorded as a rebuild that did not run. */
-  #declinedCompaction(tenantId: string, agentId: string) {
-    return (reason: string, tokensBefore: number) => {
-      const storage = this.#deps.ctx.storage;
-      recordRebuildDecision(storage.sql, <T>(fn: () => T): T => storage.transactionSync ? storage.transactionSync(fn) : fn(), compactionRecord({
-        tenantId, agentId, key: piTables(MAIN_SESSION).entries, reason, ran: false,
-        contextTokens: Number.isFinite(tokensBefore) ? tokensBefore : null, at: Date.now(),
-      }));
-    };
   }
 
   /**
@@ -3069,7 +3065,7 @@ export class AgentRuntime {
       },
       host: this.#deps.ctx.storage,
       usageOwner: { tenantId, agentId },
-      ...(session === MAIN_SESSION && this.#recordsRebuilds(tenantId) ? { onCompaction: this.#declinedCompaction(tenantId, agentId) } : {}),
+      ...(session === MAIN_SESSION && this.#recordsRebuilds(tenantId) ? { rebuilds: true } : {}),
       sessionId: session === MAIN_SESSION ? key : `${key}#${session}`,
       // The conversation, not the session: a fresh context keeps the session's name and starts a new conversation,
       // and its first call is compared with nothing rather than with the last call of the one it ended.

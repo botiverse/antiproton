@@ -10,15 +10,14 @@
  * decision reads it from.
  */
 import { AgentRuntime, BENCH_TENANT } from "../cf/src/runtime.ts";
-import { fromResponse, toRequest, type AnsweredMessage } from "../src/model/pi-bridge.ts";
+import { errorMessage, fromResponse, toRequest, type AnsweredMessage } from "../src/model/pi-bridge.ts";
 import type { ModelResponse } from "../src/model/types.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { standInLoader } from "./spec/worker-stand-in.ts";
 import { operatorModelOf } from "../cf/src/model-request.ts";
 import { acceptInbound, ensureInboundTable } from "../src/runtime/inbound.ts";
 import {
-  DEFAULT_REBUILD_POLICY, agreementOf, rebuildPolicyOf, shouldRebuild, recordRebuildDecision, compactionRecord,
-  type RebuildFacts, type RebuildPolicy,
+  DEFAULT_REBUILD_POLICY, agreementOf, rebuildPolicyOf, shouldRebuild, type RebuildFacts, type RebuildPolicy,
 } from "../src/runtime/rebuild.ts";
 import { DurableAgent, PdHost } from "../src/runtime/durable-agent.ts";
 import { UnknownJob } from "../cf/src/model-queue.ts";
@@ -34,6 +33,7 @@ function must(cond: unknown, msg: string): asserts cond { if (!cond) throw new E
 const show = (v: unknown) => JSON.stringify(v);
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, Math.max(0, ms)));
 const MIN = 60_000;
+const REFUSED = "the model provider refused this request (400)";
 
 // ---- the decision, as a table -------------------------------------------------------------------------------------
 
@@ -43,27 +43,30 @@ const facts = (o: Partial<RebuildFacts>): RebuildFacts => ({
 });
 const LUNA = { provider: "cloudflare", model: "openai/gpt-5.6-luna" };
 
-const table: Array<[string, Partial<RebuildFacts>, boolean, string, string]> = [
-  // [case, facts, rebuild, reason, rule]
-  ["deepseek: long gap, large context", {}, true, "gap-over-limit", "deepseek"],
-  ["deepseek: short gap, previous wake warm", { gapMs: 3 * MIN }, false, "warm", "deepseek"],
-  ["deepseek: short gap, previous wake cold", { gapMs: 3 * MIN, prevWakeHitRate: 0.1 }, true, "previous-wake-cold", "deepseek"],
-  ["deepseek: short gap, previous wake never measured", { gapMs: 3 * MIN, prevWakeHitRate: null }, false, "warm", "deepseek"],
-  ["deepseek: previous wake cold but a small context", { gapMs: 3 * MIN, prevWakeHitRate: 0.1, contextTokens: 50_000 }, false, "context-below-threshold", "deepseek"],
-  ["deepseek: the threshold itself is not over it", { contextTokens: 128_000 }, false, "context-below-threshold", "deepseek"],
-  ["deepseek: reasoning alone decides nothing", { gapMs: 3 * MIN, prevReasoning: true }, false, "warm", "deepseek"],
-  ["luna: long gap, large context", { ...LUNA }, true, "gap-over-limit", "openai-ttl"],
-  ["luna: short gap, even after a cold wake (time is its only rule)", { ...LUNA, gapMs: 3 * MIN, prevWakeHitRate: 0.1 }, false, "warm", "openai-ttl"],
-  ["luna: exactly 60 minutes is not over it", { ...LUNA, gapMs: 60 * MIN }, false, "warm", "openai-ttl"],
-  ["luna: long gap, small context", { ...LUNA, contextTokens: 20_000 }, false, "context-below-threshold", "openai-ttl"],
-  ["unknown model: the fallback is the gap rule", { provider: "x", model: "m1", gapMs: 3 * MIN, prevWakeHitRate: 0.1 }, false, "warm", "gap"],
-  ["no call yet in the conversation", { gapMs: null, contextTokens: null }, false, "no-previous-call", "deepseek"],
-  ["a reset since the last call", { contextTokens: null }, false, "context-unknown", "deepseek"],
+// [case, facts, wouldRebuild, predictedCold, expectedCold, reason, rule]
+const table: Array<[string, Partial<RebuildFacts>, boolean, boolean, boolean, string, string]> = [
+  ["deepseek: long gap, large context", {}, true, true, false, "gap-over-limit", "deepseek"],
+  ["deepseek: short gap, previous wake warm", { gapMs: 3 * MIN }, false, false, false, "warm", "deepseek"],
+  ["deepseek: short gap, previous wake cold", { gapMs: 3 * MIN, prevWakeHitRate: 0.1 }, true, true, false, "previous-wake-cold", "deepseek"],
+  ["deepseek: short gap, previous wake never measured", { gapMs: 3 * MIN, prevWakeHitRate: null }, false, false, false, "warm", "deepseek"],
+  // The size gates the rebuild, never the coldness: the measurement is still compared with the prediction.
+  ["deepseek: previous wake cold but a small context", { gapMs: 3 * MIN, prevWakeHitRate: 0.1, contextTokens: 50_000 }, false, true, false, "context-below-threshold", "deepseek"],
+  ["deepseek: a small, warm context", { gapMs: 3 * MIN, contextTokens: 50_000 }, false, false, false, "context-below-threshold", "deepseek"],
+  ["deepseek: the threshold itself is not over it", { contextTokens: 128_000 }, false, true, false, "context-below-threshold", "deepseek"],
+  ["deepseek: reasoning alone decides nothing", { gapMs: 3 * MIN, prevReasoning: true }, false, false, false, "warm", "deepseek"],
+  ["luna: long gap, large context", { ...LUNA }, true, true, false, "gap-over-limit", "openai-ttl"],
+  ["luna: short gap, even after a cold wake (time is its only rule)", { ...LUNA, gapMs: 3 * MIN, prevWakeHitRate: 0.1 }, false, false, false, "warm", "openai-ttl"],
+  ["luna: exactly 60 minutes is not over it", { ...LUNA, gapMs: 60 * MIN }, false, false, false, "warm", "openai-ttl"],
+  ["luna: long gap, small context", { ...LUNA, contextTokens: 20_000 }, false, true, false, "context-below-threshold", "openai-ttl"],
+  ["unknown model: the fallback is the gap rule", { provider: "x", model: "m1", gapMs: 3 * MIN, prevWakeHitRate: 0.1 }, false, false, false, "warm", "gap"],
+  // Cold by construction: out of the disagreement rate.
+  ["no call yet in the conversation", { gapMs: null, contextTokens: null }, false, true, true, "no-previous-call", "deepseek"],
+  ["a reset since the last call", { contextTokens: null }, false, true, true, "context-unknown", "deepseek"],
 ];
-for (const [name, f, rebuild, reason, rule] of table) {
+for (const [name, f, rebuild, cold, expected, reason, rule] of table) {
   await check(`shouldRebuild — ${name}`, () => {
     const d = shouldRebuild(facts(f), DEFAULT_REBUILD_POLICY);
-    must(d.rebuild === rebuild && d.reason === reason && d.rule === rule, `got ${show(d)}`);
+    must(d.rebuild === rebuild && d.predictedCold === cold && d.expectedCold === expected && d.reason === reason && d.rule === rule, `got ${show(d)}`);
   });
 }
 
@@ -76,14 +79,19 @@ await check("shouldRebuild — a window-relative threshold reads the model's win
 
 await check("rebuildPolicyOf — unset is the default, `off` is none, a whole policy is taken, a broken one is refused for the default", () => {
   must(rebuildPolicyOf(undefined) === DEFAULT_REBUILD_POLICY && rebuildPolicyOf("") === DEFAULT_REBUILD_POLICY, "unset");
-  must(rebuildPolicyOf("off") === null, "off");
+  must(rebuildPolicyOf("off") === null && rebuildPolicyOf(" OFF ") === null && rebuildPolicyOf("Off") === null, "off, any case");
   const mine = { rules: [{ ...DEFAULT_REBUILD_POLICY.rules[0]!, minContextTokens: 64_000 }], fallback: DEFAULT_REBUILD_POLICY.fallback };
   must(rebuildPolicyOf(JSON.stringify(mine))?.rules[0]?.minContextTokens === 64_000, "a policy");
   must(rebuildPolicyOf('{"rules":[{"name":"x"}]}') === DEFAULT_REBUILD_POLICY, "half a policy");
   must(rebuildPolicyOf("{") === DEFAULT_REBUILD_POLICY, "not json");
+  const bad = (r: object) => JSON.stringify({ rules: [], fallback: { ...DEFAULT_REBUILD_POLICY.fallback, ...r } });
+  must(rebuildPolicyOf(bad({ coldHitRate: 1.5 })) === DEFAULT_REBUILD_POLICY && rebuildPolicyOf(bad({ coldHitRate: -0.1 })) === DEFAULT_REBUILD_POLICY, "a hit rate outside [0, 1]");
+  must(rebuildPolicyOf(bad({ coldHitRate: 1 }))?.fallback.coldHitRate === 1, "control: 1 is a hit rate");
+  must(rebuildPolicyOf(JSON.stringify({ ...DEFAULT_REBUILD_POLICY, windowShare: 2 })) === DEFAULT_REBUILD_POLICY, "a window share over 1");
 });
 
-await check("agreementOf — false-cold, false-warm, and an unmeasured call never counted as 0", () => {
+await check("agreementOf — false-cold, false-warm, expected-cold, and an unmeasured call never counted as 0", () => {
+  must(agreementOf(false, 0.02, 0.5, true) === "expected-cold" && agreementOf(true, null, 0.5, true) === "unmeasured", "expected");
   must(agreementOf(true, 0.02, 0.5) === "agree" && agreementOf(false, 0.97, 0.5) === "agree", "agree");
   must(agreementOf(true, 0.97, 0.5) === "false-cold" && agreementOf(false, 0.02, 0.5) === "false-warm", "disagree");
   must(agreementOf(true, null, 0.5) === "unmeasured", "unmeasured");
@@ -96,12 +104,14 @@ type Usage = { promptTokens: number; cachedPromptTokens: number };
 type World = {
   host: ReturnType<typeof sqliteHost>; rt: AgentRuntime; sent: string[]; answered: Set<string>; calls: Ctx[];
   tenant: string; usage: Usage;
+  /** The next answers are this error instead, one per job, while any are left. */
+  fail: Array<{ errorMessage: string; providerError?: string }>;
 };
 
 async function world(o: { policy?: RebuildPolicy | null; tenant?: string } = {}): Promise<World> {
   const host = sqliteHost();
   const w = { host, sent: [] as string[], answered: new Set<string>(), calls: [] as Ctx[], tenant: o.tenant ?? "t",
-    usage: { promptTokens: 1, cachedPromptTokens: 0 } } as World;
+    usage: { promptTokens: 1, cachedPromptTokens: 0 }, fail: [] as World["fail"] } as World;
   const standIn = standInLoader();
   w.rt = new AgentRuntime({
     ctx: { storage: { sql: host.sql, transactionSync: host.transactionSync } },
@@ -127,6 +137,13 @@ async function settle(w: World) {
       const job = await w.rt.takeJob(w.tenant, "a", id) as { model: { api: string; provider: string; id: string }; context: Ctx } | null;
       if (!job) continue;
       w.calls.push(JSON.parse(JSON.stringify(job.context)));
+      const failure = w.fail.shift();
+      if (failure) {
+        const identity = { api: job.model.api, provider: job.model.provider, id: job.model.id };
+        await w.rt.deliverAnswer(w.tenant, "a", id, { ...errorMessage(failure.errorMessage, identity),
+          ...(failure.providerError ? { providerError: failure.providerError } : {}), jobId: id }, undefined);
+        continue;
+      }
       const res: ModelResponse = { text: "noted", finishReason: "stop", truncated: false,
         usage: { promptTokens: w.usage.promptTokens, completionTokens: 1, reasoningTokens: 0, cachedPromptTokens: w.usage.cachedPromptTokens } };
       await w.rt.deliverAnswer(w.tenant, "a", id, fromResponse(res, { api: job.model.api, provider: job.model.provider, id: job.model.id }, id), undefined);
@@ -178,8 +195,9 @@ await check("a wake after a long gap on a large context: wouldRebuild with its f
   must(o, `no outcome linked to ${d.spanId}: ${show(outs)}`);
   must(o.spanId === jobIds(w).at(-1) && o.attrs.decision === d.spanId, `the outcome names the wake's first call: ${show(o)}`);
   must(o.attrs.hitRate === 0 && o.attrs.measuredCold === true && o.status === "agree" && o.attrs.input === 200_100, `outcome: ${show(o)}`);
-  // The first wake's outcome: measured warm (199k of 200k), and its decision had said keep.
-  must(outs[0]!.status === "agree" && Math.abs(outs[0]!.attrs.hitRate - 0.995) < 1e-9, `the first outcome: ${show(outs[0])}`);
+  // The first wake is cold by construction: measured (199k of 200k), and out of the disagreement rate.
+  must(outs[0]!.status === "expected-cold" && outs[0]!.attrs.expectedCold === true && Math.abs(outs[0]!.attrs.hitRate - 0.995) < 1e-9,
+    `the first outcome: ${show(outs[0])}`);
   w.host.dispose();
 });
 
@@ -188,11 +206,16 @@ await check("the previous wake's measured state is the next decision's fact: dee
   w.usage = { promptTokens: 200_000, cachedPromptTokens: 0 };
   await push(w, "first");
   await settle(w);
+  // The first wake is cold by construction and is not "the previous wake's state": the second one is measured cold.
   age(w, 2 * MIN);
-  w.usage = { promptTokens: 200_100, cachedPromptTokens: 200_000 };
   await push(w, "second");
   await settle(w);
-  const d = rows(w, "rebuild.decision")[1]!;
+  must(rows(w, "rebuild.decision")[1]!.attrs.prevWakeHitRate === null, `an expected-cold wake was read as the previous state: ${show(rows(w, "rebuild.decision")[1])}`);
+  age(w, 2 * MIN);
+  w.usage = { promptTokens: 200_100, cachedPromptTokens: 200_000 };
+  await push(w, "third");
+  await settle(w);
+  const d = rows(w, "rebuild.decision")[2]!;
   must(d.attrs.prevWakeHitRate === 0 && d.attrs.reason === "previous-wake-cold" && d.attrs.wouldRebuild === true, `decision: ${show(d)}`);
   const o = rows(w, "rebuild.outcome").find((r) => r.parentId === d.spanId);
   must(o?.status === "false-cold" && o.attrs.measuredCold === false, `outcome: ${show(o)}`);
@@ -209,11 +232,11 @@ await check("a small context: wouldRebuild false with its reason, and still meas
   await push(w, "second");
   await settle(w);
   const d = rows(w, "rebuild.decision")[1]!;
-  must(d.status === "would-keep" && d.attrs.wouldRebuild === false && d.attrs.reason === "context-below-threshold"
-    && d.attrs.contextTokens === 20_000, `decision: ${show(d)}`);
+  must(d.status === "would-keep" && d.attrs.wouldRebuild === false && d.attrs.predictedCold === true
+    && d.attrs.reason === "context-below-threshold" && d.attrs.contextTokens === 20_000, `decision: ${show(d)}`);
   const o = rows(w, "rebuild.outcome").find((r) => r.parentId === d.spanId);
-  // Cold, as predicted by the gap, but a small context is not worth a rebuild: the measurement reads it as false-warm.
-  must(o?.status === "false-warm", `outcome: ${show(o)}`);
+  // Predicted cold by the gap and measured cold: agreement, whatever the size gate said about rebuilding.
+  must(o?.status === "agree" && o.attrs.measuredCold === true, `outcome: ${show(o)}`);
   w.host.dispose();
 });
 
@@ -260,10 +283,12 @@ const normal = (c: Ctx) => JSON.stringify(c, (k, v) => (k === "timestamp" ? 0 : 
 await check("shadow mode alters no model input: every request is byte-identical with the decision recorded and without it", async () => {
   const run = async (policy: RebuildPolicy | null) => {
     const w = await world({ policy });
-    w.usage = { promptTokens: 200_000, cachedPromptTokens: 0 };
+    // Large enough that every later wake is also a window decision, and the second answer an overflow.
+    w.usage = { promptTokens: 850_000, cachedPromptTokens: 0 };
     await push(w, "first");
     await settle(w);
     age(w, 2 * 60 * MIN);
+    w.fail = [{ errorMessage: REFUSED, providerError: "400 maximum context length is 1000000 tokens" }];
     await push(w, "second");
     await settle(w);
     age(w, 2 * MIN);
@@ -275,24 +300,78 @@ await check("shadow mode alters no model input: every request is byte-identical 
   };
   const on = await run(DEFAULT_REBUILD_POLICY);
   const off = await run(null);
-  must(on.decided === 3 && off.decided === 0, `control: decisions ${on.decided} / ${off.decided}`);
+  must(on.decided === 6 && off.decided === 0, `control: decisions ${on.decided} / ${off.decided}`);
   must(on.calls.length === 3 && off.calls.length === 3, `calls: ${on.calls.length} / ${off.calls.length}`);
   for (let i = 0; i < on.calls.length; i++) must(on.calls[i] === off.calls[i], `request ${i} differs:\n${on.calls[i]!.slice(0, 600)}\n${off.calls[i]!.slice(0, 600)}`);
 });
 
-await check("a compaction pi085 declines is a window rebuild that did not run: a decision with its size, no outcome awaited", async () => {
+await check("an error answer is unmeasured, and a failed wake is passed over: the next decision reads the last answered call", async () => {
   const w = await world();
   w.usage = { promptTokens: 200_000, cachedPromptTokens: 0 };
   await push(w, "first");
   await settle(w);
-  const storage = { sql: w.host.sql, transactionSync: w.host.transactionSync };
-  recordRebuildDecision(storage.sql as never, (fn) => storage.transactionSync(fn), compactionRecord({
-    tenantId: w.tenant, agentId: "a", key: "pi_entries", reason: "overflow", ran: false, contextTokens: 900_000, at: Date.now() }));
-  const d = rows(w, "rebuild.decision").at(-1)!;
-  must(d.status === "declined" && d.attrs.trigger === "window" && d.attrs.strategy === "summary" && d.attrs.contextTokens === 900_000, `${show(d)}`);
-  // The pending cold-wake decision of the next wake is not disturbed by it, and a declined one leaves none of its own.
-  const pending = w.host.sql.exec("SELECT trigger FROM rebuild_shadow WHERE settled_at IS NULL").toArray();
-  must(pending.length === 0, `pending: ${show(pending)}`);
+  age(w, 2 * MIN);
+  w.usage = { promptTokens: 200_100, cachedPromptTokens: 199_000 };
+  await push(w, "second");
+  await settle(w);
+  age(w, 90 * MIN);
+  w.fail = [{ errorMessage: REFUSED, providerError: "400 upstream rejected the request" }];
+  await push(w, "third");
+  await settle(w);
+  must(w.fail.length === 0 && w.calls.length === 3, `control: the failed wake made one call and it failed (${w.calls.length} calls)`);
+  const [, warm, failed] = rows(w, "rebuild.decision");
+  const o = rows(w, "rebuild.outcome").find((r) => r.parentId === failed?.spanId);
+  must(o?.status === "unmeasured" && o.attrs.hitRate === null && o.attrs.input === 0, `the failed wake's outcome: ${show(o)}`);
+  // The wake after: its facts are the second wake's answer, not the failure's, and the unmeasured wake is not "the
+  // previous wake's state".
+  w.usage = { promptTokens: 200_300, cachedPromptTokens: 0 };
+  await push(w, "fourth");
+  await settle(w);
+  const next = rows(w, "rebuild.decision").at(-1)!;
+  must(next.attrs.contextTokens === 200_100 && next.attrs.gapMs >= 90 * MIN, `facts read past the failed wake: ${show(next.attrs)}`);
+  const second = rows(w, "rebuild.outcome").find((r) => r.parentId === warm?.spanId)!;
+  must(Math.abs(next.attrs.prevWakeHitRate - second.attrs.hitRate) < 1e-9, `prevWakeHitRate: ${show(next.attrs)} vs ${show(second.attrs)}`);
+  w.host.dispose();
+});
+
+await check("pi085 window: a wake whose context reaches 80% of the window is a `window` rebuild in shadow; below it, none", async () => {
+  for (const [tokens, expect] of [[850_000, true], [700_000, false]] as const) {
+    const w = await world();
+    w.usage = { promptTokens: tokens, cachedPromptTokens: 0 };
+    await push(w, "first");
+    await settle(w);
+    age(w, 2 * MIN);
+    await push(w, "second");
+    await settle(w);
+    const win = rows(w, "rebuild.decision").filter((r) => r.attrs.trigger === "window");
+    must(rows(w, "rebuild.decision").filter((r) => r.attrs.trigger === "cold-wake").length === 2, "control: two wakes decided");
+    if (!expect) { must(win.length === 0, `${tokens}: ${show(win)}`); w.host.dispose(); continue; }
+    must(win.length === 1 && win[0]!.status === "would-rebuild" && win[0]!.attrs.wouldRebuild === true && win[0]!.attrs.strategy === "summary"
+      && win[0]!.attrs.reason === "context-near-window" && win[0]!.attrs.contextTokens === 850_000 && win[0]!.attrs.contextWindow === 1_000_000,
+      `${tokens}: ${show(win)}`);
+    w.host.dispose();
+  }
+});
+
+await check("pi085 window: an answer that is a context-overflow error is a `window` rebuild in shadow, with the last answered context", async () => {
+  const w = await world();
+  w.usage = { promptTokens: 990_000, cachedPromptTokens: 0 };
+  await push(w, "first");
+  await settle(w);
+  must(!rows(w, "rebuild.decision").some((r) => r.attrs.reason === "overflow"), "control: no overflow before one");
+  age(w, 2 * MIN);
+  w.fail = [{ errorMessage: REFUSED, providerError: "400 This model's maximum context length is 1000000 tokens. However, your messages resulted in 1000400 tokens." }];
+  await push(w, "second");
+  await settle(w);
+  const ov = rows(w, "rebuild.decision").filter((r) => r.attrs.reason === "overflow");
+  must(ov.length === 1 && ov[0]!.attrs.trigger === "window" && ov[0]!.attrs.wouldRebuild === true && ov[0]!.attrs.contextTokens === 990_000,
+    `overflow: ${show(ov)}`);
+  // An error that is not an overflow is not one.
+  age(w, 2 * MIN);
+  w.fail = [{ errorMessage: REFUSED, providerError: "400 upstream rejected the request" }];
+  await push(w, "third");
+  await settle(w);
+  must(rows(w, "rebuild.decision").filter((r) => r.attrs.reason === "overflow").length === 1, "a plain refusal read as an overflow");
   w.host.dispose();
 });
 
@@ -341,7 +420,7 @@ await check("pd: a background compaction past the window threshold is a `window`
   await agent.say("third");
   await pdRun(storage, agent, () => ({ promptTokens: 400, cachedPromptTokens: 0 }));
   const o = pendingTrace(storage.sql as never, 0).rows.find((r) => r.kind === "rebuild.outcome" && r.parentId === d.spanId) as Row | undefined;
-  must(o && o.attrs.input === 400 && o.attrs.hitRate === 0 && o.status === "agree" && o.attrs.trigger === "window", `outcome: ${show(o)}`);
+  must(o && o.attrs.input === 400 && o.attrs.hitRate === 0 && o.status === "expected-cold" && o.attrs.trigger === "window", `outcome: ${show(o)}`);
   await agent.close();
 });
 
