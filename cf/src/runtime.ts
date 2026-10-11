@@ -1505,6 +1505,9 @@ export class AgentRuntime {
         const why = `${l.id} stranded: its credential is refused (${current.reason}) and it could not be released (${r.error})`;
         sql.exec("INSERT OR REPLACE INTO stranded_holds(alias, live_id, at, reason) VALUES (?,?,?,?)", alias, l.id, Date.now(), why);
         recordReleaseError(sql, alias, why);
+        // Out of the agent's slot (`Holding.strand`): the new credential starts afresh rather than inherit a box it
+        // may not reach, and the box stays held for the idle pass's later attempts, or an operator's `forget`.
+        await this.#gateway.strandHeld({ tenantId, agentId, taskId: LEGACY_TASK }, alias, l.id, why);
       }
       return null;
     }

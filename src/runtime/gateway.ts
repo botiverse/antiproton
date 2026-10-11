@@ -505,6 +505,20 @@ export class ToolGateway {
   }
 
   /**
+   * Set a held thing aside (`Holding.strand`): the credential that made it no longer works, so it leaves the slot
+   * the agent uses and is kept only for later attempts to delete it. Under the mount's lock, as a release is: both
+   * rewrite the plugin's record. False when the plugin cannot, or holds nothing by that id.
+   */
+  async strandHeld(ctx: { tenantId: string; agentId: string; taskId: string }, alias: string, id: string, reason: string): Promise<boolean> {
+    const mount = await this.#store.getMountByAlias(ctx.tenantId, ctx.agentId, alias);
+    const plugin = mount ? this.#plugins.get(mount.plugin) : null;
+    const holding = plugin ? holdingOf(plugin) : null;
+    if (!mount || !plugin || !holding?.strand) return false;
+    const strand = () => holding.strand!(this.#quietContext(ctx, mount), id, reason);
+    return isExclusive(plugin) ? this.#onMount(`${ctx.tenantId}/${ctx.agentId}/${mount.alias}`, strand) : strand();
+  }
+
+  /**
    * The files of what the agent's first file-showing mount holds (`Holding.files`), for a person
    * looking at its workspace. `{ running: false }` when no mount can show any.
    *

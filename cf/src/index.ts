@@ -4419,7 +4419,9 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
             ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c] as string);
           // The way out of a refusal that a retry cannot fix: a container whose delete run9 refuses (its key
           // revoked or its project gone) would otherwise stay named here, and be retried, for ever.
-          const forgetForm = r.ok || forget || /background job/.test(String(r.error)) ? "" :
+          // Offered only for a delete run9 answered with a refusal (`delete returned <status>`): not for a mount that
+          // does not exist, a background job, or an outage the next attempt may get past.
+          const forgetForm = r.ok || forget || !/delete returned 4\d\d/.test(String(r.error)) ? "" :
             `<form hx-post="/ui/sandbox/release" hx-target="closest .body" hx-swap="innerHTML" style="padding:0;border:0"
                hx-confirm="Forget this container? Only if run9 refused the delete outright. It may still be alive and billed on run9; it stops being named here and is recorded as forgotten.">
                <input type="hidden" name="alias" value="${aliasAttr}"><input type="hidden" name="forget" value="1">

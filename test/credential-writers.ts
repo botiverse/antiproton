@@ -198,6 +198,8 @@ async function heldSandbox(deleteStatus: number | ((who: string) => number) = 20
   }) as any;
   const box = () => (w.store.pluginDb.get({ tenantId: "t", agentId: "a", alias: "sandbox", plugin: "sandbox" }, "box", "state") as any)?.machines?.main?.boxId;
   const deletes = () => calls.filter((c) => c.method === "DELETE");
+  /** The boxes set aside (`stranded`): out of every machine slot, still held. */
+  const aside = () => Object.keys((w.store.pluginDb.get({ tenantId: "t", agentId: "a", alias: "sandbox", plugin: "sandbox" }, "box", "state") as any)?.stranded ?? {});
   /** The mount holding one box, made under `kind`. */
   const holds = (id: string, kind: string) => w.store.pluginDb.put({ tenantId: "t", agentId: "a", alias: "sandbox", plugin: "sandbox" }, "box", "state",
     { machines: { main: { boxId: id, createdAt: 1, lastUsedAt: 1, credentialRef: kind } } }, null);
@@ -212,7 +214,7 @@ async function heldSandbox(deleteStatus: number | ((who: string) => number) = 20
     const t = w.host.sql.exec("SELECT name FROM sqlite_master WHERE name = 'release_errors'").toArray().length;
     return t ? w.host.sql.exec("SELECT alias, message FROM release_errors").toArray() as Array<{ alias: string; message: string }> : [];
   };
-  return { ...w, calls, box, deletes, holds, ownKeyHolding, releaseErrors, restore: () => { globalThis.fetch = real; } };
+  return { ...w, calls, box, aside, deletes, holds, ownKeyHolding, releaseErrors, restore: () => { globalThis.fetch = real; } };
 }
 
 await check("a key of the tenant's own over the operator's: the operator's box is deleted first, with the operator's key", async () => {
@@ -365,12 +367,13 @@ await check("the old key revoked: a new key goes on at the first attempt, the bo
     const r = await v.rt.attachCredential("t", "a", "sandbox", { ak: "own2-ak", sk: "own2-sk" });
     must(r.ok, `wedged: ${JSON.stringify(r)}`);
     must(v.deletes().length === 1 && v.deletes()[0]!.who === "own-ak", `the release was not tried first: ${JSON.stringify(v.calls)}`);
-    must(v.box() === "b-own", `the record let go of a box nothing deleted: ${v.box()}`);
+    // Out of the agent's slot, so it starts afresh under the new key; still recorded, set aside.
+    must(!v.box() && v.aside().join() === "b-own", `main ${v.box()}, aside ${v.aside()}`);
     must(v.releaseErrors().some((e) => e.alias === "sandbox" && /b-own stranded/.test(e.message)), `not written down: ${JSON.stringify(v.releaseErrors())}`);
     // Stranded, it holds up no later change either, and a key that can delete it does so first.
     v.calls.length = 0;
     const again = await v.rt.attachCredential("t", "a", "sandbox", { ak: "own3-ak", sk: "own3-sk" });
-    must(again.ok && v.deletes().some((c) => c.who === "own2-ak") && !v.box(), `the next change: ${JSON.stringify(again)} ${JSON.stringify(v.calls)}`);
+    must(again.ok && v.deletes().some((c) => c.who === "own2-ak") && !v.aside().length, `the next change: ${JSON.stringify(again)} ${JSON.stringify(v.calls)}`);
   } finally { v.restore(); }
 });
 
@@ -385,7 +388,7 @@ await check("a stranded box another account's key cannot delete holds up no late
     v.calls.length = 0;
     const next = await v.rt.attachCredential("t", "a", "sandbox", { ak: "own3-ak", sk: "own3-sk" });
     must(next.ok, `wedged on a box the key never made: ${JSON.stringify(next)}`);
-    must(v.deletes().some((c) => c.who === "own2-ak") && v.box() === "b-own", `not tried, or forgotten: ${JSON.stringify(v.calls)}`);
+    must(v.deletes().some((c) => c.who === "own2-ak") && v.aside().join() === "b-own", `not tried, or forgotten: ${JSON.stringify(v.calls)}`);
   } finally { v.restore(); }
 });
 
@@ -397,7 +400,50 @@ await check("the old key revoked: removing it works too, and keeps the box recor
     revoked.push("own-ak");
     const r = await v.rt.removeCredentialOrWhy("t", "a", "sandbox");
     must(r.ok, `wedged: ${JSON.stringify(r)}`);
-    must((await v.ref()) === OPERATOR_RUN9_REF && v.box() === "b-own", `ref ${await v.ref()}, box ${v.box()}`);
+    must((await v.ref()) === OPERATOR_RUN9_REF && !v.box() && v.aside().join() === "b-own", `ref ${await v.ref()}, main ${v.box()}, aside ${v.aside()}`);
+  } finally { v.restore(); }
+});
+
+await check("a stranded box: another account's \"box not found\" is not believed, the agent gets a fresh machine, and only forget drops it (N-b)", async () => {
+  const revoked: string[] = [];
+  // The operator's key answers the tenant's box with 400 "box not found": it is not shown the box.
+  const v = await heldSandbox(200, { revoked });
+  const inner = globalThis.fetch;
+  globalThis.fetch = (async (url: string, init?: any) => {
+    const who = atob(String(init?.headers?.authorization ?? "").replace(/^Basic /, "")).split(":")[0]!;
+    if (String(init?.method) === "DELETE" && (who === "ops-ak" || who === "own2-ak")) return new Response("{\"error\":\"box not found\"}", { status: 400 });
+    return inner(url, init);
+  }) as any;
+  try {
+    await v.ownKeyHolding("b-own");
+    revoked.push("own-ak");
+    must((await v.rt.removeCredentialOrWhy("t", "a", "sandbox")).ok, "back to the shared key");
+    must(!v.box() && v.aside().join() === "b-own", `not set aside: main ${v.box()} aside ${v.aside()}`);
+    // The operator's release, the idle-style release by id: "not found" from another account is no deletion.
+    const rel = await v.rt.releaseMount("t", "a", "sandbox");
+    must(!rel.ok && v.aside().join() === "b-own", `a foreign "not found" freed it: ${JSON.stringify(rel)}`);
+    must((await v.rt.attachCredential("t", "a", "sandbox", { ak: "own2-ak", sk: "own2-sk" })).ok, "a same-kind key of another account");
+    const rel2 = await v.rt.releaseMount("t", "a", "sandbox");
+    must(!rel2.ok && v.aside().join() === "b-own", `a same-kind foreign "not found" freed it: ${JSON.stringify(rel2)}`);
+    // A 400 is a definitive refusal, so an operator's forget does drop it.
+    const f = await v.rt.releaseMount("t", "a", "sandbox", { forget: true });
+    must(f.ok && !v.aside().length, `forget: ${JSON.stringify(f)} ${v.aside()}`);
+  } finally { globalThis.fetch = inner; v.restore(); }
+});
+
+await check("with a box stranded, the agent starts a new machine under the new key (N-b)", async () => {
+  const revoked: string[] = [];
+  const v = await heldSandbox(200, { revoked });
+  try {
+    await v.ownKeyHolding("b-own");
+    revoked.push("own-ak");
+    must((await v.rt.attachCredential("t", "a", "sandbox", { ak: "own2-ak", sk: "own2-sk" })).ok, "change");
+    const acts = await v.rt.gateway().mountActivities({ tenantId: "t", agentId: "a", taskId: "main" }, "sandbox");
+    must(acts.some((a: any) => a.live?.id === "b-own"), `the stranded box is not reported as held: ${JSON.stringify(acts)}`);
+    // The machines tool sees no machine: the slot is free for a box made with the new key.
+    const listed: any = await v.rt.gateway().invoke({ tenantId: "t", agentId: "a", taskId: "main" }, "sandbox.machines", {});
+    const machines = (listed as any).result?.machines;
+    must(JSON.stringify(machines) === JSON.stringify([{ machine: "main", state: "none" }]), `main still names the stranded box: ${JSON.stringify(listed).slice(0, 300)}`);
   } finally { v.restore(); }
 });
 
@@ -470,6 +516,33 @@ await check("the idle pass retries a release that refused on a doubling schedule
     const again = w.host.sql.exec("SELECT failures, next_at FROM release_retry WHERE alias = 'sandbox'").toArray()[0] as any;
     must(stops() === 2 && Number(again.failures) === 2 && Number(again.next_at) - Date.now() > 9 * 60_000, `second try: ${stops()} ${JSON.stringify(again)}`);
   } finally { w.restore(); }
+});
+
+await check("a /whoami that is busy (429, 408) or failing (5xx) refuses a same-account rotation, deleting nothing (N-a)", async () => {
+  for (const status of [429, 408, 502]) {
+    const w = await heldSandbox(200, { orgs: { "own-ak": "org-1", "own2-ak": "org-1" } });
+    const inner = globalThis.fetch;
+    globalThis.fetch = (async (url: string, init?: any) => {
+      const who = atob(String(init?.headers?.authorization ?? "").replace(/^Basic /, "")).split(":")[0]!;
+      return String(url).endsWith("/whoami") && who === "own2-ak" ? new Response("slow down", { status }) : inner(url, init);
+    }) as any;
+    try {
+      await w.ownKeyHolding("b-own");
+      const r = await w.rt.attachCredential("t", "a", "sandbox", { ak: "own2-ak", sk: "own2-sk" });
+      must(!r.ok && /couldn't confirm which account/.test(r.error), `${status}: not refused: ${JSON.stringify(r)}`);
+      must(w.deletes().length === 0 && w.box() === "b-own", `${status}: deleted: ${JSON.stringify(w.deletes())}`);
+    } finally { globalThis.fetch = inner; w.restore(); }
+  }
+});
+
+await check("forget does not act on run9 being busy: 429, 408 and 409 keep the box (N-c)", async () => {
+  for (const status of [429, 408, 409]) {
+    const w = await heldSandbox(status);
+    try {
+      const f = await w.rt.releaseMount("t", "a", "sandbox", { forget: true });
+      must(!f.ok && w.box() === "b-ops", `${status} was forgotten: ${JSON.stringify(f)}`);
+    } finally { w.restore(); }
+  }
 });
 
 await check("release errors are one row per alias and message, newest kept, and capped (N3)", async () => {

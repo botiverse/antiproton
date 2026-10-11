@@ -437,6 +437,18 @@ await check("a box that keeps refusing reports its error lease once, not once pe
   must(done.released === true && done[LEASE_KEY]?.status === "freed", `the release that worked: ${JSON.stringify(done)}`);
 });
 
+await check("a box used again after a refused delete reports its next refusal afresh (N-d)", async () => {
+  let refuse = true;
+  const f = fixture({ machines: { main: box("b1") } }, {}, (c) => c.method === "DELETE" && refuse);
+  const first: any = await f.plugin.invoke("release", {}, f.ctx);
+  must(first[LEASE_KEY]?.status === "error" && typeof f.mount().machines.main?.deleteFailedAt === "number", `first: ${JSON.stringify(first)}`);
+  await f.plugin.invoke("shell", { command: "ls" }, f.ctx);
+  must(f.mount().machines.main?.deleteFailedAt === undefined, `still marked after use: ${JSON.stringify(f.raw())}`);
+  const again: any = await f.plugin.invoke("release", {}, f.ctx);
+  must(again[LEASE_KEY]?.status === "error", `the refusal after use was not reported: ${JSON.stringify(again)}`);
+  refuse = false;
+});
+
 await check("forget drops a box only after run9 refuses its delete outright (4xx), reporting it as forgotten", async () => {
   const f = fixture({ machines: { main: box("b1") } });
   globalThis.fetch = ((inner) => (async (url: string, init?: any) => String(init?.method) === "DELETE"

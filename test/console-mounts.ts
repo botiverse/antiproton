@@ -776,6 +776,29 @@ await check("POST /ui/sandbox/release: a refused release offers forget, and forg
   } finally { AgentRuntime.prototype.releaseMount = real; o.uiStorage = storage; }
 });
 
+await check("POST /ui/sandbox/release: forget is offered only after run9 refused a delete, and the alias in it is escaped", async () => {
+  const real = AgentRuntime.prototype.releaseMount;
+  let error = "";
+  AgentRuntime.prototype.releaseMount = async function () { return { ok: false as const, error }; };
+  const o: any = home();
+  const storage = o.uiStorage;
+  o.uiStorage = async () => ({});
+  try {
+    for (const e of ["no mount named nope", "x is running a background job; releasing it now would discard that work",
+      "x was not released: run9 box b1 not released: delete returned 503: busy", "x was not released: connect ECONNREFUSED"]) {
+      error = e;
+      const r = await post("/ui/sandbox/release", { alias: "x" });
+      must(!/forget it/.test(r.text), `forget offered for: ${e}`);
+    }
+    error = "was not released: run9 box b1 not released: delete returned 401: {}";
+    const hostile = `x"><script>alert(1)</script>`;
+    const r = await post("/ui/sandbox/release", { alias: hostile });
+    must(/forget it/.test(r.text), `not offered for a 401: ${r.text.slice(0, 300)}`);
+    must(!r.text.includes("<script>alert(1)</script>") && r.text.includes('value="x&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;"'),
+      `the alias is not escaped: ${r.text.slice(0, 400)}`);
+  } finally { AgentRuntime.prototype.releaseMount = real; o.uiStorage = storage; }
+});
+
 globalThis.fetch = realFetch;
 for (const h of hosts) h.dispose();
 

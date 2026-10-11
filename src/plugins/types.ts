@@ -1705,6 +1705,14 @@ export interface Holding {
     forget?: boolean;
   }): Promise<Released | Released[] | boolean | void>;
   /**
+   * Set one held thing aside, by its `live.id`: the credential that made it has stopped working (cf/src/runtime.ts
+   * `#releaseBeforeCredentialChange`), so nothing the mount holds now can be relied on to reach it. It leaves
+   * whatever slot the agent uses — so the agent can start afresh under the new credential — and stays held for
+   * later attempts to release it, in which the far end's "not found" is not believed (asked with another account's
+   * key, it proves nothing). `release` with `forget` is the way to drop it. True when something was set aside.
+   */
+  strand?(ctx: PluginContext, id: string, reason: string): Promise<boolean>;
+  /**
    * The files of the thing held, for a person looking at the agent's workspace (cf/src/agent-surface/
    * workspace.ts). Only while it is already running: **neither method may start it**, since starting is
    * what is billed. Not running answers `{ running: false }` and touches nothing at the far end.
