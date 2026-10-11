@@ -335,6 +335,25 @@ await check("parts are compared by key, never by what the agent wrote: two docum
   must(!n!.text.includes("`memory`"), `memory did not move: ${n!.text}`);
 });
 
+await check("no change is silent: over random renders, a notice exists exactly when some part's text or the held lines differ", () => {
+  // Whitespace alone is a change too: the model is shown the text, not a normalised form of it.
+  must(contextNotice(ctxOf([part("memory", "- a")]), ctxOf([part("memory", "- a ")])) !== null, "a trailing space was not told");
+  let seed = 7;
+  const rnd = (n: number) => { seed = (seed * 48271) % 2147483647; return seed % n; };
+  const pieces = ["", "- a", "- a ", "# Notes", "### update", "- a\n- b", "```", "…", "x"];
+  const render = () => ctxOf(["memory", "todo", "journal", "intro"].filter(() => rnd(5) > 0)
+    .map((k) => part(k, Array.from({ length: rnd(3) }, () => pieces[rnd(pieces.length)]).join("\n"), k === "intro" ? "plugin" : "agent")),
+    rnd(3) ? [] : ["- seat"]);
+  for (let i = 0; i < 2000; i++) {
+    const a = render(), b = render();
+    const text = (c: PromptContext, k: string) => c.parts.find((p) => p.key === k)?.text ?? "";
+    const keys = new Set([...a.parts, ...b.parts].map((p) => p.key));
+    const moved = [...keys].some((k) => text(a, k) !== text(b, k)) || a.held.join() !== b.held.join();
+    const n = contextNotice(a, b);
+    must(!!n === moved, `render ${i}: moved ${moved}, notice ${show(n)} for ${show(a.parts)} → ${show(b.parts)}`);
+  }
+});
+
 await check("taking a change is once; a message not written gives it back; a change taken in between is not undone, and the lost part is owed", () => {
   const host = sqliteHost();
   try {
