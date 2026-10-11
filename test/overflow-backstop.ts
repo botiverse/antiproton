@@ -215,6 +215,20 @@ await check("forty failed wakes, a new one and a reply sent for it: the newest i
   must(b.tokens <= b.budgetTokens, `over budget: ${b.tokens}`);
 });
 
+await check("thirty long sends for one input: the newest kept, each cut, the oldest counted, the input whole, within budget", () => {
+  const entries: BriefingEntry[] = [user("first", T0), wrote("ok", T0 + 1), user(`THE INPUT ${"i".repeat(2_000)}`, T0 + 1000)];
+  for (let i = 0; i < 30; i++) {
+    entries.push(wrote("", T0 + 2000 + i, [{ id: `s${i}`, name: "raft__send_message", arguments: { text: `send ${i} ${"s".repeat(3_000)}` } }]));
+    entries.push(result(`s${i}`, "raft__send_message", false, "sent", T0 + 2000 + i));
+  }
+  entries.push(entry({ role: "assistant", content: [], stopReason: "error", errorMessage: "x", timestamp: T0 + 9000 }, T0 + 9000));
+  const b = buildBriefing(entries, { conversation: "main", redact: ID });
+  must(b.tokens <= b.budgetTokens, `over budget: ${b.tokens} of ${b.budgetTokens}`);
+  must(b.text.includes(`THE INPUT ${"i".repeat(2_000)}\n`), "the input was cut");
+  must(b.text.includes("send 29 ") && !b.text.includes("send 0 ") && /\(\d+ earlier sends omitted\)/.test(b.text), "not the newest sends, or the oldest not counted");
+  must(/\(cut at 1000 characters\)/.test(b.text), "a send was not cut");
+});
+
 await check("a notice the wake carried at its head is left out when its text was recorded", () => {
   const head = `${HARNESS_NOTICE}Your instructions above show what was true when this conversation began.\n\nmore`;
   const b = buildBriefing([user(`${head}\n\nthe wake`, T0)], { conversation: "main", noticeHeads: [head], redact: ID });

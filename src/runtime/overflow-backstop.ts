@@ -294,6 +294,8 @@ const toolPart = (name: string) => { const i = name.lastIndexOf("__"); return i 
 export const isSendTool = (name: string) => SENDS.test(toolPart(name));
 /** The longest single message the briefing quotes, in characters; a longer one is cut with a mark. */
 const MESSAGE_CHARS = 4_000;
+/** The longest single thing already sent for the input that the briefing quotes, in characters. */
+const DONE_CHARS = 1_000;
 /** The longest tool line. */
 const ACTION_CHARS = 240;
 
@@ -405,14 +407,25 @@ export function buildBriefing(entries: readonly BriefingEntry[], o: {
   for (let i = from - 1; i >= 0; i--) for (const s of said(i).reverse()) if (s.text.trim()) quoted.push(quote(s.label, redactText(s.text)));
   // The input, oldest first and verbatim; then what the run had already done for it, in order.
   const inputs = msgs.slice(from).filter((e) => e.message.role === "user").map((e) => redactText(withoutHead(textOf(e.message.content), heads)));
-  const done: string[] = [];
-  for (let i = from; i < msgs.length; i++) if (msgs[i]!.message.role !== "user") for (const s of said(i)) if (s.text.trim()) done.push(quote(s.label, redactText(s.text)));
+  const done: Array<{ label: string; text: string }> = [];
+  for (let i = from; i < msgs.length; i++) if (msgs[i]!.message.role !== "user") for (const s of said(i)) if (s.text.trim()) done.push({ label: s.label, text: redactText(s.text) });
 
-  // The input and what was done for it take up to half the budget. What was already sent is kept whole, since leaving
-  // it out is what would have the agent send it again; then the inputs, newest first, and the oldest that do not fit
-  // are counted rather than quoted. The newest is always there, cut if it alone is too long.
+  // The input and what was done for it take up to half the budget. What was already sent goes first, since leaving
+  // it out is what would have the agent send it again: up to half of that half, newest first, each cut at
+  // `DONE_CHARS`, and the oldest that do not fit counted. Then the inputs, newest first, the oldest that do not fit
+  // counted; the newest is always there, whole unless it alone is longer than what is left.
   const budgetChars = budgetTokens * CHARS_PER_TOKEN;
-  const doneBlock = done.length ? `Already sent or written for the message${inputs.length > 1 ? "s" : ""} above, in order:\n\n${done.join("\n\n")}` : "";
+  const doneQuotes: string[] = [];
+  let doneRoom = Math.floor(budgetChars / 4) - 120;
+  for (let i = done.length - 1; i >= 0; i--) {
+    const q = quote(done[i]!.label, cut(done[i]!.text, DONE_CHARS));
+    if (q.length + 2 > doneRoom) break;
+    doneQuotes.unshift(q);
+    doneRoom -= q.length + 2;
+  }
+  const doneOmitted = done.length - doneQuotes.length;
+  const doneBlock = done.length ? `Already sent or written for the message${inputs.length > 1 ? "s" : ""} above, in order:\n\n` +
+    [...(doneOmitted ? [`(${doneOmitted} earlier send${doneOmitted > 1 ? "s" : ""} omitted)`] : []), ...doneQuotes].join("\n\n") : "";
   let room = Math.floor(budgetChars / 2) - doneBlock.length - (doneBlock ? 7 : 0) - 60;
   const keptInputs: string[] = [];
   for (let i = inputs.length - 1; i >= 0; i--) {
