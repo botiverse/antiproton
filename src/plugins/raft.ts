@@ -395,7 +395,20 @@ function raftFor(ctx: PluginContext, options: { state?: false; response?: (res: 
 }
 
 /**
- * An SDK failure as this plugin's error: the SDK's safe text and next step, and whether a retry may help.
+ * The SDK's safe sentence with the HTTP status and the Server's code beside it, when the SDK has them: "The Raft Server
+ * rejected the request." alone does not say which rule refused it, and the next action may tell the model to read a
+ * code it was never shown. The code is the one the SDK kept (`serverCode`, already checked against Raft's code shape),
+ * never the Server's body.
+ */
+function withServerCode(error: RaftFailure["error"]): string {
+  const said = [error.status !== undefined ? `HTTP ${error.status}` : "", error.serverCode ?? ""].filter(Boolean).join(", ");
+  if (!said) return error.message;
+  return error.message.endsWith(".") ? `${error.message.slice(0, -1)} (${said}).` : `${error.message} (${said})`;
+}
+
+/**
+ * An SDK failure as this plugin's error: the SDK's safe text with its status and code (`withServerCode`) and next step,
+ * and whether a retry may help.
  * `write` says the operation had an effect to lose: for a send, a request that got no answer or a 5xx may
  * have landed (a repeat with the same key is still safe). A pull under cursor acknowledgement has nothing
  * to lose: what its cursor may have acknowledged the previous call showed, and a cursor is spent once sent
@@ -420,7 +433,7 @@ function sdkFailure(
   const said = lost
     ? `No answer came back from the Raft Server, so whether this went through is not known.${retried ||
       (retry ? ` Check whether it did before calling ${retry.tool} again, or it may happen twice.` : " Check whether it did before trying again, or it may happen twice.")}`
-    : `${out.error.message}${out.error.nextAction ? ` — ${offeredTerms(out.error.nextAction, unoffered)}` : ""}${retried}`;
+    : `${withServerCode(out.error)}${out.error.nextAction ? ` — ${offeredTerms(out.error.nextAction, unoffered)}` : ""}${retried}`;
   const e = new Error(said);
   // `retryable` is still what the gateway reads as "may have landed" (it records such a call as unknown), so it
   // follows `mayHaveLanded`, not the SDK's own retryable; whether the failure may clear is `transient`.

@@ -639,6 +639,23 @@ await check("a Server conflict on a send is an ordinary refusal: not retryable, 
   }
 });
 
+await check("a Server rejection shows the model its HTTP status and error code beside the SDK's sentence and the Server's next action", async () => {
+  const next = "Creating channels needs the admin role on this Server; your role is member. Ask a Server admin to create it or to change your role.";
+  one(json(403, { errorCode: "server_role_required", suggestedNextAction: next, error: "raw body text that stays out" }));
+  const why = await failure(() => raftPlugin.invoke("messages_send", { target: "#general", content: "x", idempotencyKey: "k-role" }, inTurn(ctx())));
+  const want = `The Raft Server rejected the request (HTTP 403, server_role_required). — ${next}`;
+  if (why.message !== want) throw new Error(`said: ${why.message}`);
+  if (/raw body/.test(why.message) || why.retryable !== false || why.mayHaveLanded === true) throw new Error(`marks or body: ${JSON.stringify({ message: why.message, retryable: why.retryable })}`);
+  // A rejection with no code still says its status.
+  one(json(403, {}));
+  const bare = await failure(() => raftPlugin.invoke("messages_read", { target: "#general" }, inTurn(ctx())));
+  if (!bare.message.startsWith("The Raft Server rejected the request (HTTP 403). — ")) throw new Error(`no code: ${bare.message}`);
+  // Control: a failure with neither (no answer at all) keeps the SDK's sentence as it was.
+  globalThis.fetch = (async () => { throw new Error("socket closed"); }) as any;
+  const lost = await failure(() => raftPlugin.invoke("messages_read", { target: "#general" }, inTurn(ctx())));
+  if (lost.message !== "The request did not reach the Raft Server. — Check connectivity to the Raft Server and retry if the operation is safe to repeat.") throw new Error(`no status: ${lost.message}`);
+});
+
 await check("the same send again with the same key, outside resume, still attests the held messages and goes through", async () => {
   const m = mount();
   const calls = many(HELD(), SENT());
