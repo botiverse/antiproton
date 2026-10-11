@@ -3888,7 +3888,8 @@ export class AgentRuntime {
 
   /**
    * The `rebuild.behaviour` row for the first run of a transcript an idle rebuild started (src/runtime/rebuild-behaviour.ts),
-   * once that run has ended (`mainBusy` reads the step's own mark, set just before); the watch is dropped with it. A watch whose transcript is no longer the main one (a
+   * once that run has ended (`step` asks only after a step of the main conversation that left nothing open); the
+   * watch is dropped with it. A watch whose transcript is no longer the main one (a
    * fresh context, another rebuild) is dropped with no row. One table read when nothing is watched. A reading: a
    * failure is logged and never fails the step.
    */
@@ -3902,8 +3903,6 @@ export class AgentRuntime {
         logEvent("rebuild.behaviour.dropped", { tenantId, agentId, decision: watch.decision, why: "conversation-replaced" });
         return;
       }
-      // Ended: the step that just ran left nothing open and asked for no wake, and no call of it is out.
-      if (mainBusy(sql)) return;
       const entries = mainMessages(sql);
       recordBehaviour(sql, this.#transact(), {
         tenantId, agentId, watch, behaviour: summariseBehaviour(entries, { wakeAt: watch.wakeAt, prior: watch.prior }), at: Date.now(),
