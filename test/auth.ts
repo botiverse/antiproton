@@ -249,8 +249,8 @@ await check("programmatic routes: nobody, anonymous and QA are refused; automati
 });
 
 await check("operator routes: only the configured token, and no token configured refuses", async () => {
-  // /admin/transcript returns a person's whole conversation. The older /admin
-  // routes open when AUTOMATION_TOKEN is unset; this one must not.
+  // Every operator route checks through isOperator; the routes themselves are
+  // driven through the Worker in test/admin-fail-closed.ts.
   assert(isOperator("tok-123", "tok-123") === true, "the configured token was refused");
   assert(isOperator("tok-123", "tok-124") === false, "a different token was let in");
   assert(isOperator("tok-123", null) === false, "no header was let in");
