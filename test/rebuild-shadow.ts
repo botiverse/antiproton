@@ -105,7 +105,7 @@ type World = {
   host: ReturnType<typeof sqliteHost>; rt: AgentRuntime; sent: string[]; answered: Set<string>; calls: Ctx[];
   tenant: string; usage: Usage;
   /** The next answers are this error instead, one per job, while any are left. */
-  fail: Array<{ errorMessage: string; providerError?: string }>;
+  fail: Array<{ errorMessage: string; providerError?: string; input?: number; cacheRead?: number }>;
 };
 
 async function world(o: { policy?: RebuildPolicy | null; tenant?: string } = {}): Promise<World> {
@@ -141,7 +141,9 @@ async function settle(w: World) {
       if (failure) {
         const identity = { api: job.model.api, provider: job.model.provider, id: job.model.id };
         await w.rt.deliverAnswer(w.tenant, "a", id, { ...errorMessage(failure.errorMessage, identity),
-          ...(failure.providerError ? { providerError: failure.providerError } : {}), jobId: id }, undefined);
+          ...(failure.providerError ? { providerError: failure.providerError } : {}),
+          ...(failure.input ? { usage: { ...errorMessage("", identity).usage, input: failure.input, cacheRead: failure.cacheRead ?? 0 } } : {}),
+          jobId: id }, undefined);
         continue;
       }
       const res: ModelResponse = { text: "noted", finishReason: "stop", truncated: false,
@@ -315,13 +317,14 @@ await check("an error answer is unmeasured, and a failed wake is passed over: th
   await push(w, "second");
   await settle(w);
   age(w, 90 * MIN);
-  w.fail = [{ errorMessage: REFUSED, providerError: "400 upstream rejected the request" }];
+  // Counts on an error answer say nothing about the cache: it is unmeasured whatever they are.
+  w.fail = [{ errorMessage: REFUSED, providerError: "400 upstream rejected the request", input: 200_200, cacheRead: 200_000 }];
   await push(w, "third");
   await settle(w);
   must(w.fail.length === 0 && w.calls.length === 3, `control: the failed wake made one call and it failed (${w.calls.length} calls)`);
   const [, warm, failed] = rows(w, "rebuild.decision");
   const o = rows(w, "rebuild.outcome").find((r) => r.parentId === failed?.spanId);
-  must(o?.status === "unmeasured" && o.attrs.hitRate === null && o.attrs.input === 0, `the failed wake's outcome: ${show(o)}`);
+  must(o?.status === "unmeasured" && o.attrs.hitRate === null && o.attrs.input === 200_200, `the failed wake's outcome: ${show(o)}`);
   // The wake after: its facts are the second wake's answer, not the failure's, and the unmeasured wake is not "the
   // previous wake's state".
   w.usage = { promptTokens: 200_300, cachedPromptTokens: 0 };
