@@ -207,6 +207,16 @@ check("a box made under an environment reference is ours, never the tenant's own
   eq(heldReports([{ alias: "sandbox", plugin: "sandbox", secretRef: "env:RUN9_KEYS" }], { sandbox: {} }).sandbox?.own, false, "the mount's own mark");
 });
 
+check("a set-aside box keeps being counted as held, under the account it was made on, until it is gone (F2)", () => {
+  const host = sqliteHost();
+  // The agent's new machine is the tenant's; the set-aside box was made on the operator's account.
+  const report = (aside: unknown[]) => ({ activity: { live: null, aside }, usage: [] });
+  pass(host, report([{ id: "b-old", startedAt: H0, since: H0, credentialRef: "operator" }]), true, H0 + 60_000);
+  pass(host, report([{ id: "b-old", startedAt: H0, since: H0, credentialRef: "operator" }]), true, H0 + 120_000);
+  eq(keysOf(host), ["sandbox"], "the operator's box, under the operator's key, though the mount is the tenant's now");
+  eq(pendingUsage(host.sql, 0).filter((r) => r.unit === "seconds").reduce((a, r) => a + r.quantity, 0), 120, "every second, once");
+});
+
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.error ? `\n    ${r.error}` : ""}`);
 const failed = results.filter((r) => !r.ok).length;
 console.log(`${results.length - failed}/${results.length} passed`);

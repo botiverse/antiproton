@@ -1640,6 +1640,7 @@ export function sandboxPanel(d: any): string {
   const billing = rep?.activity.billing ?? null;
   const unreadable = rep?.activity.unreadable ?? 0;
   const sessions = rep?.usage ?? [];
+  const aside = rep?.activity.aside ?? [];
 
   // The third case is not "nothing": when part of the mount's own record would
   // not read, whether anything is still running — and still billing — is
@@ -1651,7 +1652,7 @@ export function sandboxPanel(d: any): string {
      record${n === 1 ? "" : "s"} would not read, so anything it was keeping alive may still be running —
      and still billing. Do not read this mount as idle.</div>`;
 
-  if (!live && !sessions.length) {
+  if (!live && !sessions.length && !aside.length) {
     if (unreadable > 0) return unknownNotice(unreadable);
     return `<div class="empty">no container has ever been started for this agent</div>
       <div class="hint" style="padding:8px 0">${aliases.size
@@ -1702,6 +1703,21 @@ ${live
     : unreadable > 0
       ? unknownNotice(unreadable)
       : `<div class="empty">nothing is running — this costs nothing until the next box starts</div>`}
+${aside.length ? `
+<h3>set aside — ${aside.length} box${aside.length === 1 ? "" : "es"} still billing</h3>
+<div class="hint" style="padding:0 0 6px">Made with a credential that no longer works, so the agent cannot reach
+  ${aside.length === 1 ? "it" : "them"} and the key now on the mount may not be able to delete ${aside.length === 1 ? "it" : "them"}.
+  Deletion is retried on its own; <b>forget</b> tries once more and, if run9 refuses outright, stops tracking the box
+  here — it may still be alive and billed on run9. The agent's own machine is not touched.</div>
+${aside.map((a) => `<div class="card"><div class="tool">box ${esc(a.id)} <span class="tag bad">still billing</span>
+     <form hx-post="/ui/sandbox/release" hx-target="closest .body" hx-swap="innerHTML" style="padding:0;border:0"
+           hx-confirm="Forget box ${esc(a.id)}? If run9 still refuses to delete it, it stops being tracked here and may stay alive on run9.">
+       <input type="hidden" name="alias" value="${esc(name)}"><input type="hidden" name="id" value="${esc(a.id)}">
+       <input type="hidden" name="forget" value="1">
+       <button type="submit" class="ghost">forget it</button>
+     </form></div>
+   <div class="kv" style="margin-top:6px"><div>set aside</div><div>${esc(ago(Number(a.since)))}</div>
+     <div>started</div><div>${esc(when(Number(a.startedAt)))}</div></div></div>`).join("")}` : ""}
 
 <h3>sessions — ${esc(secs(total))} of container time across ${sessions.length + (live ? 1 : 0)}</h3>
 ${live && unreadable > 0

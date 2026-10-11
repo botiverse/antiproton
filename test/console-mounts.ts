@@ -773,6 +773,9 @@ await check("POST /ui/sandbox/release: a refused release offers forget, and forg
     const forgot = await post("/ui/sandbox/release", { alias: "keyed", forget: "1" });
     must(forgot.status === 200 && !/forget it/.test(forgot.text), `forget: ${forgot.text.slice(0, 200)}`);
     must(show(asked) === show([null, { forget: true }]), `asked: ${show(asked)}`);
+    // The panel's forget for a set-aside box names it: only that one is asked for.
+    await post("/ui/sandbox/release", { alias: "keyed", id: "b-old", forget: "1" });
+    must(show(asked[2]) === show({ forget: true, id: "b-old" }), `by id: ${show(asked)}`);
   } finally { AgentRuntime.prototype.releaseMount = real; o.uiStorage = storage; }
 });
 
@@ -785,7 +788,10 @@ await check("POST /ui/sandbox/release: forget is offered only after run9 refused
   o.uiStorage = async () => ({});
   try {
     for (const e of ["no mount named nope", "x is running a background job; releasing it now would discard that work",
-      "x was not released: run9 box b1 not released: delete returned 503: busy", "x was not released: connect ECONNREFUSED"]) {
+      "x was not released: run9 box b1 not released: delete returned 503: busy", "x was not released: connect ECONNREFUSED",
+      "x was not released: run9 box b1 not released: delete returned 429: slow down",
+      "x was not released: run9 box b1 not released: delete returned 408: timeout",
+      "x was not released: run9 box b1 not released: delete returned 409: conflict"]) {
       error = e;
       const r = await post("/ui/sandbox/release", { alias: "x" });
       must(!/forget it/.test(r.text), `forget offered for: ${e}`);

@@ -183,6 +183,25 @@ check("a report that does not read draws less, never NaN or undefined", () => {
 });
 
 let failures = 0;
+check("set-aside boxes are listed with a forget aimed at each by id; the live machine keeps its own release (F1)", () => {
+  const aside = [{ id: "b-old", startedAt: Date.now() - 3_600_000, since: Date.now() - 60_000 }];
+  const only = sandboxPanel({
+    mounts: [{ alias: "box", plugin: "holder", provides: ["container"] }],
+    mountReports: { box: { activity: { live: null, aside }, usage: [] } },
+  });
+  must(/set aside — 1 box still billing/.test(only) && only.includes("b-old"), "a record with only a set-aside box shows nothing of it");
+  const forms = only.match(/<form[^>]*hx-post="\/ui\/sandbox\/release"[^>]*>[\s\S]*?<\/form>/g) ?? [];
+  must(forms.length === 1 && forms[0]!.includes('name="id" value="b-old"') && forms[0]!.includes('name="forget" value="1"')
+    && forms[0]!.includes('name="alias" value="box"'), `no forget aimed at the box: ${forms.join("\n")}`);
+  const both = sandboxPanel({
+    mounts: [{ alias: "box", plugin: "holder", provides: ["container"] }],
+    mountReports: { box: { activity: { ...report.activity, aside }, usage: [] } },
+  });
+  const f2 = both.match(/<form[^>]*hx-post="\/ui\/sandbox\/release"[^>]*>[\s\S]*?<\/form>/g) ?? [];
+  must(f2.length === 2 && f2.filter((f) => f.includes('name="id" value="b-old"')).length === 1
+    && f2.some((f) => !f.includes('name="id"') && !f.includes("forget")), `live + aside forms: ${f2.join("\n")}`);
+});
+
 for (const r of results) {
   if (r.ok) console.log(`✓ ${r.name}`);
   else { failures++; console.log(`✗ ${r.name} — ${r.error}`); }

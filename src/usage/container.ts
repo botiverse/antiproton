@@ -127,7 +127,11 @@ export function heldRows(
  */
 export function boxesOf(
   report: {
-    activity?: { live?: { id: string; startedAt: number; credentialRef?: string } | null } | null;
+    activity?: {
+      live?: { id: string; startedAt: number; credentialRef?: string } | null;
+      /** Held but set aside (`MountActivity.aside`): still alive and billed, so counted like `live`. */
+      aside?: ReadonlyArray<{ id: string; startedAt: number; credentialRef?: string }>;
+    } | null;
     usage?: ReadonlyArray<{ id: string; startedAt: number; endedAt: number; uses?: number; credentialRef?: string }>;
   } | null | undefined,
 ): HeldBox[] {
@@ -135,6 +139,7 @@ export function boxesOf(
   const under = (v: { credentialRef?: unknown }) => typeof v.credentialRef === "string" ? { credentialRef: v.credentialRef } : {};
   const live = report?.activity?.live;
   if (live) out.set(live.id, { id: live.id, startedAt: live.startedAt, endedAt: null, ...under(live) });
+  for (const a of report?.activity?.aside ?? []) out.set(a.id, { id: a.id, startedAt: a.startedAt, endedAt: null, ...under(a) });
   for (const s of report?.usage ?? []) {
     out.set(s.id, { id: s.id, startedAt: s.startedAt, endedAt: s.endedAt, ...(s.uses === undefined ? {} : { uses: s.uses }), ...under(s) });
   }

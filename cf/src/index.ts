@@ -2244,7 +2244,7 @@ export class AgentDO extends DurableObject<Env> {
     return this.runtime().inboundLog();
   }
 
-  async uiReleaseSandbox(tenantId: string, agentId: string, alias: string, opts?: { forget?: boolean }) {
+  async uiReleaseSandbox(tenantId: string, agentId: string, alias: string, opts?: { forget?: boolean; id?: string }) {
     this.#claim(tenantId, agentId);
     return this.#busy("uiReleaseSandbox", () => this.runtime().releaseMount(tenantId, agentId, alias, opts));
   }
@@ -4403,7 +4403,10 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
           // `forget`, only ever from the button a refusal below offers: drop a container run9 refuses outright to
           // delete (its key revoked) from the record, reported as possibly still alive (`Holding.release`).
           const forget = form.get("forget") === "1";
-          const r = await stub.uiReleaseSandbox(gate.tenantId, agentId, alias, forget ? { forget: true } : undefined);
+          // One box by its id: a set-aside box listed in the panel, released or forgotten without the live machine.
+          const id = String(form.get("id") ?? "").trim();
+          const opts = { ...(forget ? { forget: true } : {}), ...(id ? { id } : {}) };
+          const r = await stub.uiReleaseSandbox(gate.tenantId, agentId, alias, Object.keys(opts).length ? opts : undefined);
           const taskId = url.searchParams.get("taskId") || `t_${agentId}`;
           // The button lives in the inspector's runtime tab, which shows the
           // panels stacked, so the answer is that same stack: a lone container
@@ -4421,7 +4424,7 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
           // revoked or its project gone) would otherwise stay named here, and be retried, for ever.
           // Offered only for a delete run9 answered with a refusal (`delete returned <status>`): not for a mount that
           // does not exist, a background job, or an outage the next attempt may get past.
-          const forgetForm = r.ok || forget || !/delete returned 4\d\d/.test(String(r.error)) ? "" :
+          const forgetForm = r.ok || forget || !/delete returned 4(?!08|09|29)\d\d/.test(String(r.error)) ? "" :
             `<form hx-post="/ui/sandbox/release" hx-target="closest .body" hx-swap="innerHTML" style="padding:0;border:0"
                hx-confirm="Forget this container? Only if run9 refused the delete outright. It may still be alive and billed on run9; it stops being named here and is recorded as forgotten.">
                <input type="hidden" name="alias" value="${aliasAttr}"><input type="hidden" name="forget" value="1">

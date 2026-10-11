@@ -447,6 +447,78 @@ await check("with a box stranded, the agent starts a new machine under the new k
   } finally { v.restore(); }
 });
 
+const SCOPE = { tenantId: "t", agentId: "a", alias: "sandbox", plugin: "sandbox" };
+/** A live main machine made under `kind`, beside whatever the record holds (a set-aside box stays). */
+function addMain(w: { store: any }, id: string, kind: string) {
+  const cur = w.store.pluginDb.get(SCOPE, "box", "state") as any;
+  w.store.pluginDb.put(SCOPE, "box", "state", { ...cur, machines: { main: { boxId: id, createdAt: Date.now(), lastUsedAt: Date.now(), credentialRef: kind } } }, null);
+}
+
+await check("the console's forget by id drops only the set-aside box; the agent's live machine is untouched (F1)", async () => {
+  const revoked: string[] = [];
+  const v = await heldSandbox((who) => who === "own2-ak" ? 403 : 200, { revoked });
+  try {
+    await v.ownKeyHolding("b-own");
+    revoked.push("own-ak");
+    must((await v.rt.attachCredential("t", "a", "sandbox", { ak: "own2-ak", sk: "own2-sk" })).ok, "change");
+    addMain(v, "b-live", "agent");
+    // The console's report lists it beside the live machine.
+    const act: any = await v.rt.gateway().mountActivity({ tenantId: "t", agentId: "a", taskId: "main" }, "sandbox");
+    must(act.live?.id === "b-live" && act.aside?.map((a: any) => a.id).join() === "b-own" && act.aside[0].credentialRef === "agent",
+      `report: ${JSON.stringify(act)}`);
+    v.calls.length = 0;
+    const f = await v.rt.releaseMount("t", "a", "sandbox", { forget: true, id: "b-own" });
+    must(f.ok && !v.aside().length, `forget: ${JSON.stringify(f)} ${v.aside()}`);
+    must(v.box() === "b-live" && !v.calls.some((c) => c.path.includes("b-live")), `the live machine was touched: ${JSON.stringify(v.calls)}`);
+  } finally { v.restore(); }
+});
+
+await check("a set-aside box on a mount with no credential stays held and refuses, until forgotten (N2)", async () => {
+  const revoked: string[] = [];
+  const v = await heldSandbox(200, { revoked });
+  try {
+    await v.ownKeyHolding("b-own");
+    revoked.push("own-ak");
+    must((await v.rt.attachCredential("t", "a", "sandbox", { ak: "own2-ak", sk: "own2-sk" })).ok, "change");
+    await v.store.setMountSecretRef("t", "a", "sandbox", null);
+    const r = await v.rt.releaseMount("t", "a", "sandbox");
+    must(!r.ok && /no credential/.test(r.error) && v.aside().join() === "b-own", `released with nothing to release it: ${JSON.stringify(r)}`);
+    const f = await v.rt.releaseMount("t", "a", "sandbox", { forget: true, id: "b-own" });
+    must(f.ok && !v.aside().length, `forget: ${JSON.stringify(f)}`);
+  } finally { v.restore(); }
+});
+
+await check("a set-aside box is retried on the shared schedule whatever asks, not on every release (N4)", async () => {
+  const revoked: string[] = [];
+  const v = await heldSandbox((who) => who === "own2-ak" ? 500 : 200, { revoked });
+  try {
+    await v.ownKeyHolding("b-own");
+    revoked.push("own-ak");
+    must((await v.rt.attachCredential("t", "a", "sandbox", { ak: "own2-ak", sk: "own2-sk" })).ok, "change");
+    v.calls.length = 0;
+    for (let i = 0; i < 3; i++) await v.rt.gateway().releaseTask({ tenantId: "t", agentId: "a", taskId: "main" });
+    const tries = v.deletes().filter((c) => c.path.endsWith("/b-own")).length;
+    must(tries === 1, `retried every release: ${tries} DELETEs`);
+    const rec = (v.store.pluginDb.get(SCOPE, "box", "state") as any).stranded["b-own"];
+    must(rec.tries === 1 && rec.nextTryAt - Date.now() > 4 * 60_000, `schedule: ${JSON.stringify(rec)}`);
+  } finally { v.restore(); }
+});
+
+await check("a set-aside box of another kind does not force releasing live machines on a same-account rotation (N5)", async () => {
+  const revoked: string[] = [];
+  const v = await heldSandbox(200, { revoked: revoked, orgs: { "own-ak": "org-1", "own2-ak": "org-1" } });
+  try {
+    // The operator's key is revoked: the tenant's key goes on, the operator's box is set aside.
+    revoked.push("ops-ak");
+    must((await v.rt.attachCredential("t", "a", "sandbox", { ak: "own-ak", sk: "own-sk" })).ok, "first change");
+    must(v.aside().join() === "b-ops", `not set aside: ${v.aside()}`);
+    addMain(v, "b-new", "agent");
+    v.calls.length = 0;
+    const r = await v.rt.attachCredential("t", "a", "sandbox", { ak: "own2-ak", sk: "own2-sk" });
+    must(r.ok && !v.calls.some((c) => c.path.includes("b-new")) && v.box() === "b-new", `the live machine went: ${JSON.stringify(v.calls)}`);
+  } finally { v.restore(); }
+});
+
 await check("a key that still works keeps refusing; an outage on its check is not a revocation", async () => {
   const w = await heldSandbox(500);
   try {

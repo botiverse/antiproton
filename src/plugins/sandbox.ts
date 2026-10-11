@@ -1,6 +1,6 @@
 import type { Json } from "../core/types.ts";
 import type { CredentialRefKind, HeldFiles, Plugin, PluginContext, MountActivity, MountUsage, Released, SandboxForm } from "./types.ts";
-import { backgrounded, LEASE_KEY, markReleased } from "./types.ts";
+import { backgrounded, LEASE_KEY, markReleased, releaseRetryMs } from "./types.ts";
 import type { R2Artifacts } from "../store/artifacts.ts";
 import { toAgentRef } from "../store/refs.ts";
 import { spanText } from "../runtime/idle-lease.ts";
@@ -258,7 +258,11 @@ interface MountState {
   stranded?: Record<string, StrandedBox>;
 }
 
-type StrandedBox = MachineState & { strandedAt: number; strandReason?: string };
+type StrandedBox = MachineState & {
+  strandedAt: number; strandReason?: string;
+  /** Failed attempts to delete it, when the next may be made (`releaseRetryMs`), and what the last one said. */
+  tries?: number; nextTryAt?: number; lastError?: string;
+};
 
 /**
  * The alias every agent's container is mounted under: the catalogue's seed
@@ -1158,6 +1162,11 @@ export function activitiesOf(
 /**
  * A stranded box as held: no machine of the agent's, nothing to warn it about (it can neither use nor save from
  * it), so it is released at the deployment's limit without a warning, counted from when it was set aside.
+ *
+ * A trade-off, chosen: if the new key is on the same account as the dead one, that release succeeds — the box is
+ * deleted about `maxMs` (30 minutes by default) after it was set aside, with no warning to the agent, and any file
+ * in it that was not saved or kept is lost. Warning would mean a turn about a machine the agent cannot reach, and
+ * keeping it would leave it billed for nobody; the console showed the deletion would happen when the key changed.
  */
 function strandedActivity(b: StrandedBox): MountActivity {
   return {
@@ -1183,9 +1192,12 @@ export function summaryActivity(
   const used = (n: string) => { const b = mount!.machines[n]!; return b.lastUsedAt || b.createdAt; };
   const off = (n: string) => parkedAt(mount!.machines[n]) === null ? 0 : 1;
   const pick = [...names].sort((a, b) => off(a) - off(b) || used(b) - used(a))[0];
-  return pick === undefined
+  const one = pick === undefined
     ? activityOf(null, unreadable, keepStoppedDays)
     : activityOf(viewOf(mount, pick), unreadable, keepStoppedDays, labelOf(pick, names.length > 1));
+  // Set-aside boxes beside it: still held and billed, so the console lists them and usage counts them.
+  const aside = Object.values(mount?.stranded ?? {}).map((b) => ({ id: b.boxId, startedAt: b.createdAt, since: b.strandedAt, ...createdUnder(b) }));
+  return aside.length ? { ...one, aside } : one;
 }
 
 /** The kind of credential a box or session records it was created under, when it records one that reads. */
@@ -1529,20 +1541,43 @@ async function releaseMachine(
  */
 async function releaseStranded(ctx: PluginContext, id: string, forget: boolean): Promise<Released | false> {
   const b = (await readMount(ctx))?.stranded?.[id];
-  if (!b || !ctx.credential) return false;
-  const { error, definitive } = await deleteBox(ctx, id, false);
+  if (!b) return false;
+  const now = Date.now();
+  let error: string | undefined;
+  let definitive = false;
+  if (!ctx.credential) {
+    // Nothing to try with. Not "released": the box is still there, so it stays held and is retried once a
+    // credential is back — and an operator's forget, the only way out without one, drops it.
+    error = "the mount has no credential to delete it with";
+    definitive = true;
+  } else if (!forget && (b.nextTryAt ?? 0) > now) {
+    // Retried on the shared schedule (`releaseRetryMs`) whichever path asks — the idle pass, or a release after
+    // every settled turn where the deployment has no idle lease — not on every ask. Its error lease is reported.
+    throw new Error(`run9 box ${id} (stranded) not released: not retried before ${new Date(b.nextTryAt!).toISOString()}; last: ${b.lastError ?? "unknown"}`);
+  } else {
+    ({ error, definitive } = await deleteBox(ctx, id, false));
+  }
   const endedAt = Date.now();
   const after = (await readMount(ctx)) ?? { machines: {} };
   const rest = { ...(after.stranded ?? {}) };
   if (error && !(forget && definitive)) {
-    const first = !rest[id]?.deleteFailedAt;
-    if (first && rest[id]) await writeMount(ctx, { ...after, stranded: { ...rest, [id]: { ...rest[id]!, deleteFailedAt: endedAt } } });
+    const cur = rest[id];
+    const first = !cur?.deleteFailedAt;
+    if (cur) {
+      const tries = (cur.tries ?? 0) + 1;
+      rest[id] = { ...cur, deleteFailedAt: cur.deleteFailedAt ?? endedAt, tries, nextTryAt: endedAt + releaseRetryMs(tries), lastError: error.slice(0, 200) };
+      await writeMount(ctx, { ...after, stranded: rest });
+    }
     const e = new Error(`run9 box ${id} (stranded) not released: ${error}`);
     throw first ? markReleased(e, { id, startedAt: b.createdAt, endedAt, status: "error", error } as Released) : e;
   }
   delete rest[id];
-  await writeMount(ctx, { ...after, stranded: rest });
-  const forgotten = error ? `forgotten on an operator's request; run9 refused the delete (${error}), so it may still be alive` : undefined;
+  // Its time to the end goes on the record as a finished session, as `stopBox` does for a machine: usage counted
+  // it as held while it was set aside (`activity.aside`), and this closes it. A switched-off one already recorded
+  // its compute session when it was switched off.
+  const sessions = parkedAt(b) === null ? keepSessions(after.sessions, sessionOf(b, endedAt, `stranded`)) : after.sessions;
+  await writeMount(ctx, { ...after, stranded: rest, ...(sessions ? { sessions } : {}) });
+  const forgotten = error ? `forgotten on an operator's request; ${error.startsWith("the mount has no") ? error : `run9 refused the delete (${error})`}, so it may still be alive` : undefined;
   return forgotten
     ? { id, startedAt: b.createdAt, endedAt, status: "error", error: forgotten }
     : { id, startedAt: b.createdAt, endedAt, status: "freed" };

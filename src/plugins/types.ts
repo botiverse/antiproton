@@ -1189,6 +1189,13 @@ export interface MountActivity {
    */
   billing?: string;
   /**
+   * Things this mount still holds but set aside (`Holding.strand`): made with a credential that stopped working,
+   * out of the agent's reach, still billed until they are deleted. Not `live` — the agent's machine is — but held
+   * all the same, so usage counts their time (src/usage/container.ts `boxesOf`) and the console lists each with a
+   * way to drop it (`Holding.release` `forget`, by its id). Absent when none.
+   */
+  aside?: Array<{ id: string; startedAt: number; since: number; credentialRef?: CredentialRefKind }>;
+  /**
    * Entries of this mount's record it could not read and ignored, and the
    * record itself when that is what did not read; absent when none. A record is
    * read leniently so one bad entry cannot lose a running container, and this
@@ -1623,6 +1630,16 @@ export const LEASE_KEY = "__ap_lease__";
  * carries it instead, the way `markIdentity` carries the identity of a failed
  * call.
  */
+/**
+ * How long to wait before trying again to release a thing that refused: doubling with each failure, from 5 minutes
+ * to 6 hours. One schedule for every path that retries — the idle pass (cf/src/runtime.ts) and a plugin retrying
+ * a thing it holds on every release it is asked for (src/plugins/sandbox.ts stranded boxes) — so no path asks the
+ * far end once a turn.
+ */
+export function releaseRetryMs(failures: number): number {
+  return Math.min(5 * 60_000 * 2 ** Math.max(0, failures - 1), 6 * 3_600_000);
+}
+
 export function markReleased<E extends Error, F extends Released | Released[]>(error: E, fact: F): E & { released: F } {
   const marked = error as E & { released: F };
   marked.released = fact;

@@ -76,10 +76,9 @@ export function recordReleaseError(sql: ExecSql, alias: string, message: string,
   sql.exec("DELETE FROM release_errors WHERE rowid NOT IN (SELECT rowid FROM release_errors ORDER BY at DESC LIMIT ?)", RELEASE_ERRORS_KEPT);
 }
 
-/** How long the idle pass waits before trying again to release a thing that refused: doubling, from 5 minutes to 6 hours. */
-export function releaseRetryMs(failures: number): number {
-  return Math.min(5 * 60_000 * 2 ** Math.max(0, failures - 1), 6 * 3_600_000);
-}
+/** The retry schedule, shared with the plugins that retry on their own (src/plugins/types.ts `releaseRetryMs`). */
+export { releaseRetryMs } from "../../src/plugins/types.ts";
+import { releaseRetryMs } from "../../src/plugins/types.ts";
 
 /** The answer to a call made after the agent's task was ended (`RuntimeDeps.ended`). */
 function taskEndedRefusal(address: string): { status: "rejected"; error: { code: string; message: string } } {
@@ -1471,7 +1470,11 @@ export class AgentRuntime {
     // answered for is a wait: going ahead would delete machines a key of the same account would have kept.
     const mount = await this.store.getMountByAlias(tenantId, agentId, alias);
     const kind = secretRefKind(mount?.secretRef ?? null);
-    if (next !== undefined && held.every((l) => l.credentialRef === undefined || l.credentialRef === kind)) {
+    const strandedIds = new Set((sql.exec("SELECT live_id FROM stranded_holds WHERE alias = ?", alias).toArray() as any[]).map((r) => String(r.live_id)));
+    // A stranded box was made by a key that is gone; its kind says nothing about the key now on the mount, so it
+    // does not decide whether the live machines are this key's (and on a same-account rotation they stay).
+    const mine = held.filter((l) => !strandedIds.has(l.id));
+    if (next !== undefined && mine.every((l) => l.credentialRef === undefined || l.credentialRef === kind)) {
       const [was, will] = await Promise.all([
         this.#gateway.mountCredentialAccount(tenantId, agentId, alias),
         this.#gateway.mountCredentialAccount(tenantId, agentId, alias, next),
@@ -1669,7 +1672,7 @@ export class AgentRuntime {
    * money, and the page must not say it is gone.
    */
   async releaseMount(
-    tenantId: string, agentId: string, alias: string, opts?: { forget?: boolean },
+    tenantId: string, agentId: string, alias: string, opts?: { forget?: boolean; id?: string },
   ): Promise<{ ok: true; released: boolean } | { ok: false; error: string }> {
     await this.ready();
     const mount = await this.store.getMountByAlias(tenantId, agentId, alias);
@@ -1689,7 +1692,9 @@ export class AgentRuntime {
       .flatMap((a) => a.live ? [a.live] : []);
     // `forget` is the operator's way out for a thing the far end refuses outright to release
     // (`Holding.release`): dropped from the record and reported, not deleted.
-    const r = await this.#gateway.releaseTask({ tenantId, agentId, taskId: LEGACY_TASK }, { alias, ...(opts?.forget ? { forget: true } : {}) });
+    // `id`: one held thing only (a set-aside box the console lists), leaving the agent's machine alone.
+    const r = await this.#gateway.releaseTask({ tenantId, agentId, taskId: LEGACY_TASK },
+      { alias, ...(opts?.forget ? { forget: true } : {}), ...(opts?.id ? { id: opts.id } : {}) });
     const failed = r.failed.find((f) => f.alias === alias);
     if (failed) return { ok: false, error: `${alias} was not released: ${failed.error}` };
 

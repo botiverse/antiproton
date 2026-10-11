@@ -30,8 +30,14 @@ function asActivity(v: unknown): MountActivity | null {
   if (v.quietUntil !== undefined && v.quietUntil !== null && !isNum(v.quietUntil)) return null;
   if (v.billing !== undefined && typeof v.billing !== "string") return null;
   if (v.unreadable !== undefined && !isNum(v.unreadable)) return null;
+  // An entry that does not read is left out, the rest kept: each names a box still billing.
+  const aside = Array.isArray(v.aside)
+    ? v.aside.filter((a): a is Record<string, unknown> => isObj(a) && typeof a.id === "string" && isNum(a.startedAt) && isNum(a.since))
+      .map((a) => ({ id: a.id as string, startedAt: a.startedAt as number, since: a.since as number }))
+    : [];
   return {
     live,
+    ...(aside.length ? { aside } : {}),
     ...(v.quietUntil !== undefined ? { quietUntil: v.quietUntil as number | null } : {}),
     ...(v.billing !== undefined ? { billing: v.billing as string } : {}),
     ...(v.unreadable !== undefined ? { unreadable: v.unreadable as number } : {}),
@@ -69,8 +75,8 @@ export function asMountReports(d: unknown): MountReports | null {
 /**
  * Whether a mount's report says anything worth handing on. The three cases are
  * different questions with one shared property: each is a fact a reader can act
- * on — something is live, something finished, or part of the record would not
- * read. None of them is "nothing": a mount that reports only `unreadable` stays
+ * on — something is live (or held but set aside), something finished, or part
+ * of the record would not read. None of them is "nothing": a mount that reports only `unreadable` stays
  * in, because filtering it out would read "I could not tell" as "there is
  * nothing", and a page that reads an unknown mount as idle is guessing.
  * Shared by the console's dashboard and /admin/diagnose so the two surfaces
@@ -80,5 +86,5 @@ export function worthReporting(
   activity: MountActivity | null | undefined,
   usage: readonly unknown[] | null | undefined,
 ): boolean {
-  return !!activity?.live || !!activity?.unreadable || (usage?.length ?? 0) > 0;
+  return !!activity?.live || !!activity?.unreadable || !!activity?.aside?.length || (usage?.length ?? 0) > 0;
 }
