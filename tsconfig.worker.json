@@ -103,6 +103,7 @@
     "test/stable-prompt.ts",
     "test/harness-open.ts",
     "test/overflow-backstop.ts",
+    "test/idle-rebuild.ts",
     "test/tool-interrupts.ts",
     "test/mcp-plugin.ts",
     "test/raft-plugin.ts",

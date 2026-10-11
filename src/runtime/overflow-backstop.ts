@@ -30,7 +30,7 @@ import { logEvent } from "../core/log.ts";
 import { appendTrace } from "../trace/outbox.ts";
 import { MAIN_SESSION, piTables, type SqlHost } from "../store/pi-storage.ts";
 import { fenceFor } from "../plugins/state.ts";
-import { recordRebuildDecision, type RebuildTrigger } from "./rebuild.ts";
+import { BRIEFING_BUDGET_TOKENS, recordRebuildDecision, type RebuildTrigger } from "./rebuild.ts";
 
 type Sql = SqlHost["sql"];
 
@@ -38,8 +38,8 @@ type Sql = SqlHost["sql"];
 export const MAX_CONSECUTIVE_OVERFLOWS = 3;
 /** How long a `needs_reset` mark holds before the next wake is tried again: a cause that has gone away does not need an operator. */
 export const NEEDS_RESET_TTL_MS = 24 * 60 * 60_000;
-/** The briefing's size, in estimated tokens (`estimateTokens`). */
-export const BRIEFING_BUDGET_TOKENS = 8_000;
+/** The briefing's size, in estimated tokens (`estimateTokens`); kept in src/runtime/rebuild.ts, whose idle rule reads it too. */
+export { BRIEFING_BUDGET_TOKENS };
 /** How many of the most recent tool calls the briefing lists. */
 export const BRIEFING_ACTIONS = 12;
 
@@ -286,10 +286,11 @@ export interface Briefing {
 }
 
 /**
- * A tool whose call is a message the agent sent someone: its own name, after the mount's alias, says so. A raw
+ * A tool whose call is a message the agent sent someone: its own name, after the mount's alias, says so — verb first
+ * (`send_message`) or, as the Raft SDK names its operations, noun first (`messages_send`, `messages_reply`). A raw
  * transport (`http__send`, `sandbox__post`) is not one: its arguments are a request, not something a person read.
  */
-const SENDS = /^(?:(?:send|post|create)_(?:message|reply|comment|chat_message)s?|reply(?:_\w+)?|comment(?:_\w+)?|say|notify(?:_\w+)?)$/i;
+const SENDS = /^(?:(?:send|post|create)_(?:message|reply|comment|chat_message)s?|(?:message|comment)s?_(?:send|reply|post|create)|actions_prepare|reply(?:_\w+)?|comment(?:_\w+)?|say|notify(?:_\w+)?)$/i;
 const toolPart = (name: string) => { const i = name.lastIndexOf("__"); return i < 0 ? name : name.slice(i + 2); };
 export const isSendTool = (name: string) => SENDS.test(toolPart(name));
 /** The longest single message the briefing quotes, in characters; a longer one is cut with a mark. */
@@ -304,12 +305,21 @@ const textOf = (content: unknown): string => typeof content === "string" ? conte
 const when = (ms: number) => Number.isFinite(ms) && ms > 0 ? new Date(ms).toISOString().slice(0, 16).replace("T", " ") + "Z" : "unknown time";
 const cut = (s: string, n: number) => s.length > n ? `${s.slice(0, n)}… (cut at ${n} characters)` : s;
 const oneLine = (s: string) => s.replace(/\s+/g, " ").trim();
-/** The text of a send-like tool call: its first string argument that reads as a message. */
+/**
+ * The text of a send-like tool call: its first string argument that reads as a message. `content` before `message`:
+ * Raft's `messages_reply` names the message it answers `message` and its own text `content`.
+ */
 function sentText(args: unknown): string | null {
   if (!args || typeof args !== "object") return null;
-  for (const k of ["text", "message", "body", "content"]) {
+  for (const k of ["text", "content", "body", "message"]) {
     const v = (args as Record<string, unknown>)[k];
     if (typeof v === "string" && v.trim()) return v;
+  }
+  // Raft's `actions_prepare` posts an action card: what it asks the person to confirm.
+  const action = (args as Record<string, unknown>).action as Record<string, unknown> | undefined;
+  if (action && typeof action === "object") {
+    const hint = typeof action.draftHint === "string" ? action.draftHint : "";
+    return `(an action card${typeof action.type === "string" ? `: ${action.type}` : ""})${hint ? ` ${hint}` : ""}`;
   }
   return null;
 }
@@ -326,6 +336,113 @@ function withoutHead(text: string, heads: readonly string[]): string {
   return text;
 }
 
+// ---- Raft, read for the briefing --------------------------------------------------------------------------------------
+
+/**
+ * The text a Raft push wakes the agent with (src/plugins/raft.ts `receiveNotice`, inside src/runtime/inbound.ts
+ * `inboundMessage`): an instruction to read the inbox and Raft's own notice, never the messages. In the history it says
+ * nothing the messages read after it do not, so it is left out there.
+ */
+const RAFT_NOTICE = /^\[incoming event from the `[^`\n]+` mount\.[^\n]*\]\nRead your Raft inbox with the `receive_events` tool/;
+export const isRaftNotice = (text: string) => RAFT_NOTICE.test(text);
+
+/** A Raft message as its read tools show it: one line `[target=… msg=… time=… type=…] @sender: content` (the SDK's). */
+export interface RaftLine { target: string; msg: string | null; type: string | null; text: string }
+const RAFT_HEAD = /^\[target=([^\s\]]+)([^\]\n]*)\]/;
+
+function raftLineOf(s: string): RaftLine | null {
+  const h = RAFT_HEAD.exec(s);
+  if (!h) return null;
+  const field = (k: string) => new RegExp(`(?:^|\\s)${k}=([^\\s\\]]+)`).exec(h[2]!)?.[1] ?? null;
+  return { target: h[1]!, msg: field("msg"), type: field("type"), text: s };
+}
+
+/**
+ * The Raft message lines in a tool result's text (`receive_events`, `messages_read`, an inbox pull, a search): every
+ * string in its JSON that is one, or that holds several on lines of their own; a text that is not JSON is read the
+ * same way. In the order the result gives them.
+ */
+export function raftLines(text: string): RaftLine[] {
+  const out: RaftLine[] = [];
+  const take = (s: string) => { for (const part of s.split(/\n(?=\[target=)/)) { const l = raftLineOf(part); if (l) out.push(l); } };
+  const walk = (v: unknown, depth: number): void => {
+    if (depth > 8) return;
+    // A program's outputs (`run_js`) are strings that are themselves JSON: read inside them too.
+    if (typeof v === "string" && /^\s*[[{]/.test(v)) {
+      let inner: unknown;
+      try { inner = JSON.parse(v); } catch { inner = undefined; }
+      if (inner !== undefined) { walk(inner, depth + 1); return; }
+    }
+    if (typeof v === "string") take(v);
+    else if (Array.isArray(v)) for (const x of v) walk(x, depth + 1);
+    else if (v && typeof v === "object") for (const x of Object.values(v)) walk(x, depth + 1);
+  };
+  let parsed: unknown;
+  try { parsed = JSON.parse(text); } catch { parsed = undefined; }
+  if (parsed === undefined) take(text); else walk(parsed, 0);
+  return out;
+}
+
+/** Where a send went, as its arguments name it: a target (`messages_send`), or the message it answers (`messages_reply`). */
+function sendPlace(args: unknown): { target: string | null; replyTo: string | null } {
+  const a = (args && typeof args === "object" ? args : {}) as Record<string, unknown>;
+  const str = (...ks: string[]) => { for (const k of ks) if (typeof a[k] === "string" && (a[k] as string).trim()) return a[k] as string; return null; };
+  return { target: str("target", "channel", "thread", "to"), replyTo: str("replyTo", "messageId", "message_id") ?? (typeof a.content === "string" ? str("message") : null) };
+}
+
+/**
+ * What Raft says a send did, in its result's text: `Message sent to <target>. Message ID: <id>` (`messages_send`,
+ * `messages_reply`) or `Action card posted to <target> as message <id>` (`actions_prepare`).
+ */
+const SENT_SAYS = /(?:Message sent to|posted to) (\S+?)\.? (?:Message ID: |as message )([0-9A-Za-z-]{6,64})/g;
+
+/**
+ * A program: its result holds what the tools it called answered, so a send it made is known only by what that answer
+ * says (`sendsReported`). No other tool's result is read for sends: what a read tool returns is other people's text,
+ * which can say anything, "Message sent to …" included.
+ */
+export const isProgramTool = (name: string) => toolPart(name) === "run_js";
+
+/**
+ * Every send a program's result reports (`SENT_SAYS`), in any string at any depth, its JSON-in-string outputs included.
+ * A Raft message line inside it (a read the program made) is someone's text, not a report, and is never scanned.
+ */
+export function sendsReported(resultText: string): Array<{ target: string; id: string }> {
+  const out: Array<{ target: string; id: string }> = [];
+  const scan = (t: string) => { for (const m of t.matchAll(SENT_SAYS)) out.push({ target: m[1]!, id: m[2]! }); };
+  const walk = (v: unknown, depth: number): void => {
+    if (depth > 8) return;
+    if (typeof v === "string") {
+      if (/^\s*[[{]/.test(v)) { try { walk(JSON.parse(v), depth + 1); return; } catch { /* text */ } }
+      if (!RAFT_HEAD.test(v)) scan(v);
+    } else if (Array.isArray(v)) for (const x of v) walk(x, depth + 1);
+    else if (v && typeof v === "object") for (const x of Object.values(v)) walk(x, depth + 1);
+  };
+  let parsed: unknown;
+  try { parsed = JSON.parse(resultText); } catch { parsed = undefined; }
+  if (parsed === undefined) scan(resultText); else walk(parsed, 0);
+  return out;
+}
+
+/** The id of the message a send made, when its result names one: Raft's words (`sendsReported`), or a JSON field. */
+function sentId(resultText: string): string | null {
+  const said = sendsReported(resultText)[0];
+  if (said) return said.id;
+  let v: unknown;
+  try { v = JSON.parse(resultText); } catch { return null; }
+  for (const o of [v, (v as any)?.data, (v as any)?.message]) {
+    if (!o || typeof o !== "object") continue;
+    for (const k of ["msg", "messageId", "id"]) { const x = (o as any)[k]; if (typeof x === "string" && /^[\w.:-]{3,64}$/.test(x)) return x; }
+  }
+  return null;
+}
+
+/** Two Raft message ids for one message: a short id (`msg=c986f2d4`) is the head of the full one. */
+const sameMsg = (a: string, b: string) => a === b || (a.length >= 6 && b.length >= 6 && (a.startsWith(b) || b.startsWith(a)));
+
+/** A value from outside put in a label: only the characters a target or an id is made of, so it cannot end the label. */
+const tag = (s: string) => s.replace(/[^\w#:@.\/-]/g, "_").slice(0, 80);
+
 const endedWell = (m: any) => m?.role === "assistant" && (m.stopReason === "stop" || m.stopReason === "length");
 const answeredOk = (m: any) => m?.role === "assistant" && ["stop", "toolUse", "length"].includes(m.stopReason);
 
@@ -336,7 +453,10 @@ const answeredOk = (m: any) => m?.role === "assistant" && ["stop", "toolUse", "l
  *
  *   - the messages before that input, newest first, each cut at `MESSAGE_CHARS`: what the agent received, what it
  *     wrote, and what it sent through a messaging tool (`isSendTool`), each labelled outside a fence with its
- *     conversation, time and source;
+ *     conversation, time and source. On Raft what was received is the messages its read tools showed (`raftLines`),
+ *     each with its target and id and whether the agent answered there after it, not the push notice that woke it
+ *     (`isRaftNotice`, left out); a send says where it went (`target`, or the message it replied to) and the id Raft
+ *     gave it (`sendsReported`), a send a `run_js` program made included;
  *   - the last `maxActions` tool calls, newest first, each ok, failed, or with no result;
  *   - the input itself, verbatim, last but for:
  *   - what the failed run had already sent or written for that input, so it is not sent twice.
@@ -387,28 +507,99 @@ export function buildBriefing(entries: readonly BriefingEntry[], o: {
     return cut(`- ${when(c.at)} ${c.name} ${args.slice(0, 120)}${args.length > 120 ? "…" : ""} — ${verdict}`, ACTION_CHARS);
   });
 
-  /** What one message said, as labelled quotes: received, written, or sent through a messaging tool. */
-  const said = (i: number): Array<{ label: string; text: string }> => {
+  // Raft: the messages the agent read (from its read tools' results, already redacted), where each was, and where
+  // each of its own sends went, so a message answered since can be told from one that was not.
+  const read = new Map<number, RaftLine[]>();
+  const placeOf = new Map<string, string>();
+  for (const c of calls) {
+    const r = results.get(c.id);
+    if (!r || r.isError || isSendTool(c.name)) continue;
+    const at = msgs.findIndex((e, k) => k > c.index && e.message.role === "toolResult" && e.message.toolCallId === c.id);
+    const lines = raftLines(r.text);
+    if (at < 0 || !lines.length) continue;
+    read.set(at, lines);
+    for (const l of lines) if (l.msg) placeOf.set(l.msg, l.target);
+  }
+  // A send is a messaging tool's call, or one a program made (`run_js`), known by what its result reports.
+  const nested = new Map<string, Array<{ target: string; id: string }>>();
+  for (const c of calls) {
+    if (!isProgramTool(c.name)) continue;
+    const r = results.get(c.id);
+    const said = r && !r.isError ? sendsReported(r.text) : [];
+    if (said.length) nested.set(c.id, said);
+  }
+  const sends = [
+    ...calls.filter((c) => isSendTool(c.name)).map((c) => ({ index: c.index, ...sendPlace(c.args) })),
+    ...calls.flatMap((c) => (nested.get(c.id) ?? []).map((n) => ({ index: c.index, target: n.target as string | null, replyTo: null as string | null }))),
+  ];
+  // A reply names the message it answers, and answers that one alone; any other send answers its whole target.
+  const answered = (l: RaftLine, i: number) => sends.some((s) => s.index > i
+    && (s.replyTo !== null ? l.msg !== null && sameMsg(s.replyTo, l.msg) : s.target !== null && s.target === l.target));
+
+  type Said = { label: string; text: string; msg?: string; kind: "received" | "wrote" | "sent" };
+  /**
+   * What one message said, as labelled quotes: received (a message, or the Raft messages a read tool showed, each with
+   * where it was and whether the agent answered there after it), written, or sent through a messaging tool (with where
+   * it went, and the id it was given). A Raft push's own notice is left out of the history (`isRaftNotice`).
+   */
+  const said = (i: number, history: boolean): Said[] => {
     const e = msgs[i]!, m = e.message, at = when(Number(m.timestamp ?? e.timestamp));
-    if (m.role === "user") return [{ label: `[${o.conversation} · ${at} · received]`, text: withoutHead(textOf(m.content), heads) }];
+    if (m.role === "user") {
+      const t = withoutHead(textOf(m.content), heads);
+      return history && isRaftNotice(t) ? [] : [{ label: `[${o.conversation} · ${at} · received]`, text: t, kind: "received" }];
+    }
+    if (m.role === "toolResult") {
+      return (read.get(i) ?? []).map((l) => ({
+        label: `[${o.conversation} · ${at} · received in ${tag(l.target)}${l.msg ? ` msg=${tag(l.msg)}` : ""}, read with ${tag(String(m.toolName ?? ""))} · `
+          + `${answered(l, i) ? "you answered there after it" : "not answered by you since"}]`,
+        text: l.text, kind: "received" as const, ...(l.msg ? { msg: l.msg } : {}),
+      }));
+    }
     if (!answeredOk(m)) return [];
-    const out: Array<{ label: string; text: string }> = [];
+    const out: Said[] = [];
     const t = textOf(m.content);
-    if (t.trim()) out.push({ label: `[${o.conversation} · ${at} · you wrote]`, text: t });
+    if (t.trim()) out.push({ label: `[${o.conversation} · ${at} · you wrote]`, text: t, kind: "wrote" });
     for (const c of calls.filter((c) => c.index === i && isSendTool(c.name))) {
       const sent = sentText(c.args);
-      if (sent) out.push({ label: `[${o.conversation} · ${at} · you sent with ${c.name}]`, text: sent });
+      if (!sent) continue;
+      const { target, replyTo } = sendPlace(c.args);
+      const id = sentId(results.get(c.id)?.text ?? "");
+      const place = replyTo === null ? undefined : placeOf.get(replyTo) ?? [...placeOf].find(([m]) => sameMsg(m, replyTo))?.[1];
+      const where = replyTo !== null ? ` replied to msg=${tag(replyTo)}${place !== undefined ? ` in ${tag(place)}` : ""}`
+        : target !== null ? ` sent to ${tag(target)}` : " sent";
+      out.push({ label: `[${o.conversation} · ${at} · you${where}${id ? ` as msg=${tag(id)}` : ""} with ${c.name}]`, text: sent, kind: "sent" });
+    }
+    for (const c of calls.filter((c) => c.index === i && nested.has(c.id))) {
+      for (const n of nested.get(c.id)!) {
+        out.push({ label: `[${o.conversation} · ${at} · you sent to ${tag(n.target)} as msg=${tag(n.id)} from a ${tag(c.name)} program]`,
+          text: "(its text was put together inside the program)", kind: "sent" });
+      }
     }
     return out;
   };
 
-  // The history, newest first (and newest first within a message).
+  // The history, newest first (and newest first within a message); a Raft message read twice is quoted once, newest.
   const quoted: string[] = [];
-  for (let i = from - 1; i >= 0; i--) for (const s of said(i).reverse()) if (s.text.trim()) quoted.push(quote(s.label, redactText(s.text)));
-  // The input, oldest first and verbatim; then what the run had already done for it, in order.
-  const inputs = msgs.slice(from).filter((e) => e.message.role === "user").map((e) => redactText(withoutHead(textOf(e.message.content), heads)));
+  const seen = new Set<string>();
+  for (let i = from - 1; i >= 0; i--) {
+    for (const q of said(i, true).reverse()) {
+      if (!q.text.trim() || (q.msg !== undefined && seen.has(q.msg))) continue;
+      if (q.msg !== undefined) seen.add(q.msg);
+      quoted.push(quote(q.label, redactText(q.text)));
+    }
+  }
+  // The input, oldest first and verbatim, with the Raft messages the failed run read for it; then what that run had
+  // already sent or written, in order.
+  const inputs: string[] = [];
   const done: Array<{ label: string; text: string }> = [];
-  for (let i = from; i < msgs.length; i++) if (msgs[i]!.message.role !== "user") for (const s of said(i)) if (s.text.trim()) done.push({ label: s.label, text: redactText(s.text) });
+  for (let i = from; i < msgs.length; i++) {
+    for (const q of said(i, false)) {
+      if (!q.text.trim()) continue;
+      if (msgs[i]!.message.role === "user") inputs.push(redactText(q.text));
+      else if (q.kind === "received") inputs.push(quote(q.label, redactText(q.text)));
+      else done.push({ label: q.label, text: redactText(q.text) });
+    }
+  }
 
   // The input and what was done for it take up to half the budget. What was already sent goes first, since leaving
   // it out is what would have the agent send it again: up to half of that half, newest first, each cut at
