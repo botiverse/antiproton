@@ -17,6 +17,7 @@
  *   model.call aborted      → Stop                (cancelled: no longer working)
  *   model.call error        → BridgeFatal         (the turn died)
  *   model.call toolUse      → nothing             (still working)
+ *   session.needs_reset set → BridgeFatal         (the overflow backstop gave up: pushes are refused until a reset)
  *
  * The event id is the row's seq under the agent: unique for the agent's
  * lifetime because seq is AUTOINCREMENT and never reused, so a batch sent
@@ -115,9 +116,19 @@ function hookEvents(agentId: string, rows: readonly TraceOutboxRow[]): ActivityE
         if (row.status === "stop" || row.status === "length" || row.status === "aborted") out.push({ ...base, hookEventName: "Stop" });
         else if (row.status === "error") out.push({ ...base, hookEventName: "BridgeFatal", errorClass: "model_call_failed" });
         break;
+      case "session.needs_reset":
+        if (row.status === "set") out.push({ ...base, hookEventName: "BridgeFatal", errorClass: NEEDS_RESET_ERROR });
+        break;
       default:
         break;
     }
   }
   return out;
 }
+
+/**
+ * What the service shows for a conversation the overflow backstop gave up on (src/runtime/overflow-backstop.ts): the
+ * pushes it refuses were already answered "delivered" at the hook, so this, once per episode, is how the sender learns
+ * that nothing will answer them until an operator resets the session.
+ */
+export const NEEDS_RESET_ERROR = "context_overflow: conversation too long for the model; pushes are refused until an operator resets it";

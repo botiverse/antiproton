@@ -10,6 +10,7 @@
  *   tool.call, at its start       → working
  *   model.call stop|length|aborted → online    (the turn is over)
  *   model.call error              → error
+ *   session.needs_reset set       → error      (with why: pushes are refused until a reset)
  *
  * A row is one ENDED span, so a start is dated back by its measured `ms`. Events
  * are sorted by time and a change to the status already in force is dropped:
@@ -48,6 +49,9 @@ export function statusEvents(agentId: string, rows: readonly TraceOutboxRow[], b
         if (row.status === "toolUse") raw.push({ at: row.at, key: id, status: "working" });
         else if (row.status === "stop" || row.status === "length" || row.status === "aborted") raw.push({ at: row.at, key: id, status: "online" });
         else if (row.status === "error") raw.push({ at: row.at, key: id, status: "error" });
+        break;
+      case "session.needs_reset":
+        if (row.status === "set") raw.push({ at: row.at, key: id, status: "error", detail: "Conversation too long for the model; waiting for an operator reset" });
         break;
       default:
         break;

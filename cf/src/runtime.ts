@@ -21,7 +21,7 @@ import { DurableAgent, PdHost, recordedEngine } from "../../src/runtime/durable-
 import { busyReason, clientCallsWaiting, migrateToPd, revertToPi085, type MigrationResult, type RevertResult } from "../../src/runtime/pd-migrate.ts";
 import { sealSeedFiles, seedInline, sha256Hex, type SealHow, type SeedMode, type SeedWriteResult } from "../../src/store/seed-files.ts";
 import { logEvent } from "../../src/core/log.ts";
-import { markHarnessDrop, recordHarnessOpen } from "../../src/runtime/harness-open.ts";
+import { markHarnessDrop, recordHarnessOpen, type HarnessDropReason } from "../../src/runtime/harness-open.ts";
 import { currentMainId, mainSessions, modelInputCalls, readModelInput, recordModelInput, startFreshMain, type MainSessionRow, type ModelInputEvidence } from "./fresh-context.ts";
 import { heldDecision, warningText } from "../../src/runtime/idle-lease.ts";
 import { heldItems, heldLines, heldParagraph, heldResources, withHeldNote } from "../../src/runtime/held.ts";
@@ -37,6 +37,13 @@ import {
   refuseWithheld,
 } from "../../src/runtime/pi-tools.ts";
 import { explainUnavailableTool } from "../../src/runtime/unavailable-tool.ts";
+import {
+  bindingKey, buildBriefing, clearBackstop, conversationMessages, hasAnswer, judgeOverflow, mainCallOut, mainMessages, mainTip, needsReset, noteRebuilt,
+  noteRunEndedWell, noticeHeads, overflowKind, readBackstop, recordBackstop, recordNoticeHead, requestFixedTokens, requestTokens, returnPendingBriefing,
+  SessionNeedsReset, takePendingBriefing, type Briefing, type Judge,
+} from "../../src/runtime/overflow-backstop.ts";
+import { credentialRedactor, agentSecretValues } from "./eval-read.ts";
+import { logicalMain, physicalSession } from "./fresh-context.ts";
 import { systemPrompt } from "../../src/runtime/pi-prompt.ts";
 import { ASSUMED_CONTEXT_WINDOW } from "../../src/model/context-windows.ts";
 import { BACKGROUND_CONTEXT } from "@earendil-works/pi-agent-core/harness/context";
@@ -971,6 +978,12 @@ export function messageLanded(
   return { mode: landed, queued: landed !== "prompt" };
 }
 
+/** A post refused because the conversation needs a reset (`SessionNeedsReset`) is logged and dropped; anything else is thrown on. */
+function refusedForReset(e: unknown, tenantId: string, agentId: string, what: string): void {
+  if (!(e instanceof SessionNeedsReset)) throw e;
+  logEvent("session.needs_reset.refused", { tenantId, agentId, what });
+}
+
 /**
  * The audit line of a seal (src/store/seed-files.ts). A seal the first turn or push made on an agent given no files
  * is every agent's first turn, so it is not a seed event and says nothing; an explicit one always does.
@@ -1276,8 +1289,8 @@ export class AgentRuntime {
       const storage = this.#deps.ctx.storage;
       const transact = <T>(fn: () => T): T => storage.transactionSync ? storage.transactionSync(fn) : fn();
       recordRebuildDecision(sql, transact, coldWakeRecord({
-        tenantId, agentId, key: entries, conversation: this.#conversationOf(MAIN_SESSION), facts, decision,
-        coldHitRate: ruleFor(policy, binding.provider, binding.model).coldHitRate, at: now,
+        tenantId, agentId, key: entries, conversation: this.#conversationOf(MAIN_SESSION), logicalConversation: logicalMain(sql).conversation,
+        facts, decision, coldHitRate: ruleFor(policy, binding.provider, binding.model).coldHitRate, at: now,
       }));
       // pi085 never compacts: a context at the edge of its window is a window rebuild only this row will name.
       if (nearWindow(facts.contextTokens, facts.contextWindow, policy)) {
@@ -1356,6 +1369,14 @@ export class AgentRuntime {
           out.ignored++;
           continue;
         }
+      }
+      // A main conversation the overflow backstop gave up on is not posted to: the push would cost a model call that
+      // fails the same way (src/runtime/overflow-backstop.ts). Settled at once with the reason, for an operator to read.
+      const stuck = this.#isPd() ? null : needsReset(sql, await this.#judge(tenantId, agentId));
+      if (stuck) {
+        settle(head, "failed", new SessionNeedsReset(stuck.reason).message);
+        out.failed++;
+        continue;
       }
       // The head is the oldest row, so its expiry is the queue's first.
       if (head.nextAt > now) { out.retryInMs = Math.min(head.nextAt, head.receivedAt + INBOUND_MAX_AGE_MS) - now; break; }
@@ -3316,21 +3337,22 @@ export class AgentRuntime {
 
   /**
    * Close and forget the harnesses built for this agent, so the next turn builds its own from storage. `why` is what
-   * each conversation's next `harness.open` row says (src/runtime/harness-open.ts): `fresh-context`, or the caller's
-   * reason for an ordinary drop.
+   * each conversation's next `harness.open` row says (src/runtime/harness-open.ts): `fresh-context`, `rebuild` (the
+   * overflow backstop's, with `detail`), or the caller's reason for an ordinary drop.
    */
-  async dropHarnesses(tenantId: string, agentId: string, why: string) {
+  async dropHarnesses(tenantId: string, agentId: string, why: string, detail: string | null = null) {
     const prefix = `${tenantId}/${agentId}#`;
     const built = [...this.#agents].filter(([k]) => k.startsWith(prefix));
     for (const [k] of built) this.#agents.delete(k);
     // After the cache is cleared: the mark is a reading, and the drop it explains has already happened.
-    this.#markDrop(`${tenantId}/${agentId}`, why === "fresh-context" ? "fresh-context" : "dropped", why === "fresh-context" ? null : why);
+    if (why === "fresh-context" || why === "rebuild") this.#markDrop(`${tenantId}/${agentId}`, why, detail);
+    else this.#markDrop(`${tenantId}/${agentId}`, "dropped", why);
     for (const [, { agent }] of built) await agent.close().catch(() => {});
   }
 
   /** Why the next `harness.open` of `owner`'s conversations happens (src/runtime/harness-open.ts). A reading, like
    *  `#recordOpen`: a failure to write it is logged, and the drop it would explain goes ahead. */
-  #markDrop(owner: string, reason: "dropped" | "fresh-context", detail: string | null) {
+  #markDrop(owner: string, reason: HarnessDropReason, detail: string | null) {
     try { markHarnessDrop(this.#deps.ctx.storage.sql, owner, reason, detail); }
     catch (e) { console.error(`the harness drop of ${owner} could not be noted:`, e); }
   }
@@ -3460,11 +3482,16 @@ export class AgentRuntime {
     tenantId: string, agentId: string, text: string,
     mode: "prompt" | "steer" | "followUp" = "prompt",
     session: string = MAIN_SESSION,
-    opts: { retake?: "await" | "background"; beforeSay?: () => void } = {},
+    opts: { retake?: "await" | "background"; beforeSay?: () => void; pendingOnly?: true } = {},
   ) {
     // Before anything awaits a plugin or the model: the first turn closes the seeded workspace, whichever route it
     // came by (an inbound push already did, when it was accepted).
     await this.ready();
+    // A main conversation the overflow backstop gave up on takes nothing until an operator resets it, its model
+    // binding changes, or the mark expires (src/runtime/overflow-backstop.ts `needsReset`).
+    const backstop = session === MAIN_SESSION && !this.#isPd();
+    const stuck = backstop ? needsReset(this.#deps.ctx.storage.sql, await this.#judge(tenantId, agentId)) : null;
+    if (stuck) throw new SessionNeedsReset(stuck.reason);
     sealedBy(tenantId, agentId, await this.store.seal(tenantId, agentId, "first-turn"));
     // Every turn starts here, in every mode — a steer is how a console message arrives, and pushes, background
     // completions and lease warnings are prompts — so the catalogue is reconciled here, before the harness is
@@ -3509,18 +3536,40 @@ export class AgentRuntime {
       if (told) await this.store.returnSeedNotices(tenantId, agentId, told.rows).catch(() => {});
       if (moved) returnContextChange(this.#deps.ctx.storage.sql, moved.owner, moved.conversation, moved.change);
     };
+    // A rebuilt transcript's briefing not yet posted is the first thing it holds, whichever post comes first: taken
+    // here, in the synchronous step before the write, and put back if the write does not happen.
+    // A follow-up starts no run on an idle lane (as for the notices above), and a lane owed a briefing is idle: carried
+    // as a follow-up, the briefing would sit unread behind it. So a post that carries it is a prompt, whatever it asked.
+    const brief = backstop ? takePendingBriefing(this.#deps.ctx.storage.sql) : null;
+    if (brief !== null && mode === "followUp") mode = "prompt";
+    if (opts.pendingOnly && brief === null) {
+      // Another post carried it already: nothing is written.
+      await giveBack();
+      return { mode, queued: false, result: null };
+    }
+    const body = brief === null ? text : text ? `${brief}\n\n---\n\n${text}` : brief;
+    const giveAllBack = async () => {
+      await giveBack();
+      if (brief !== null) returnPendingBriefing(this.#deps.ctx.storage.sql, brief);
+    };
     // Synchronously before the engine's write, with the harness already open: what a caller retires here
     // (`deliverPendingInbound`'s queued row) is gone exactly when the message is about to be written.
     opts.beforeSay?.();
     let res: any;
     try {
-      res = await agent.say(lines.length ? `${lines.join("\n")}\n\n${text}` : text, mode);
+      res = await agent.say(lines.length ? `${lines.join("\n")}\n\n${body}` : body, mode);
     } catch (e) {
       // A post that throws wrote nothing (the rule `deliverPendingInbound` retries by), so the notices were not said.
-      await giveBack();
+      await giveAllBack();
       throw e;
     }
-    if (res?.ok === false) await giveBack();
+    if (res?.ok === false) await giveAllBack();
+    // The notices' exact text, so a rebuild's briefing can quote this message without them (src/runtime/overflow-backstop.ts
+    // `buildBriefing`). A reading for later: a failure is logged and never fails the message.
+    else if (backstop && lines.length) {
+      try { recordNoticeHead(this.#deps.ctx.storage.sql, lines.join("\n"), Date.now()); }
+      catch (e) { console.error(`recording the notices of ${tenantId}/${agentId}'s message failed:`, e); }
+    }
     return { ...messageLanded(res, mode), result: res };
   }
 
@@ -3677,7 +3726,7 @@ export class AgentRuntime {
     // before the pass: the pass awaits the plugin's poll, and the task can end during that await.
     const bg = await pass(async (session, text) => {
       if (this.#deps.ended?.(owner) === true) return;
-      await this.postMessage(tenantId, agentId, text, "prompt", session);
+      await this.postMessage(tenantId, agentId, text, "prompt", session).catch((e) => refusedForReset(e, tenantId, agentId, "background completion"));
     });
     // pd: one harness runs every conversation of the object, and one step drives it whole
     // (`DurableAgent.step`), so there is nothing to choose. pi085: the sessions its list says have work.
@@ -3703,6 +3752,12 @@ export class AgentRuntime {
         const before = out.settled;
         out = await agent.step();
         out = { ...out, settled: [...before, ...out.settled] };
+      }
+      // A run of pi085's main conversation that ended on a context overflow is rebuilt rather than left to fail again
+      // on every wake (`#overflowBackstop`); this pass then drives the rebuilt conversation's first call.
+      if (!pd && session === MAIN_SESSION && out.open === 0 && (out.settled.length || readBackstop(sql).pending !== null)) {
+        const rebuilt = await this.#overflowBackstop(tenantId, agentId);
+        if (rebuilt) out = { ...rebuilt, settled: [...out.settled, ...rebuilt.settled] };
       }
       open += out.open;
       settled.push(...out.settled);
@@ -3737,6 +3792,166 @@ export class AgentRuntime {
       }
     }
     return { open, wakeInMs, settled, releaseFailed };
+  }
+
+  /**
+   * The overflow backstop (src/runtime/overflow-backstop.ts), after a step that settled a run of pi085's main
+   * conversation. When that run ended because the history no longer fits the window, the conversation is rebuilt
+   * (`#rebuildMain`) and its first call sent; that step's outcome is returned. Null when nothing was rebuilt.
+   *
+   * Once per run that ended on an overflow, and bounded (`judgeOverflow`): when the rebuilt conversation's request
+   * overflows again, or overflows come `MAX_CONSECUTIVE_OVERFLOWS` in a row, the session is marked `needs_reset` instead
+   * and nothing is retried. A run that ended on anything else resets the count. A request refused only for its output
+   * budget (`overflowKind` `output-budget`: the completion budget alone leaves no room for a rebuilt request) is not
+   * rebuilt, since no briefing could make it fit.
+   * Not while a push is being handed over: renaming the transcript under a post in flight could leave it on the closed
+   * harness; that post's run ends the same way, and is judged then. A briefing whose post failed is posted again here.
+   */
+  async #overflowBackstop(tenantId: string, agentId: string): Promise<Awaited<ReturnType<AgentEngine["step"]>> | null> {
+    const storage = this.#deps.ctx.storage, sql = storage.sql;
+    if (readBackstop(sql).pending !== null) return this.#postBriefing(tenantId, agentId);
+    const tip = mainTip(sql);
+    const failedJob = tip?.message?.stopReason === "error" && typeof tip.message.jobId === "string" ? tip.message.jobId as string : null;
+    const kind = tip ? overflowKind(tip.message, { fixedTokens: failedJob ? requestFixedTokens(sql, failedJob) : 0 }) : null;
+    if (kind !== "history") {
+      if (kind === "output-budget") logEvent("overflow.output_budget", { tenantId, agentId, job: tip?.message?.jobId ?? null });
+      else if (tip?.message?.role === "assistant" && tip.message.stopReason !== "error") noteRunEndedWell(sql);
+      return null;
+    }
+    if (this.#inboundPass !== null) return null;
+    const now = Date.now();
+    const judge = await this.#judge(tenantId, agentId);
+    const from = currentMainId(sql);
+    const verdict = judgeOverflow(sql, from, hasAnswer(mainMessages(sql)), judge.binding, now);
+    if (verdict.act === "skip") return null;
+    const jobId = typeof tip!.message.jobId === "string" ? tip!.message.jobId : null;
+    const base = {
+      tenantId, agentId, from, logicalConversation: logicalMain(sql).conversation, consecutive: verdict.consecutive,
+      jobId, tokensBefore: jobId ? requestTokens(sql, jobId) : null, at: now, ...(await this.#windowFacts(tenantId, agentId, now)),
+    };
+    if (verdict.act === "stop") {
+      recordBackstop(sql, this.#transact(), {
+        ...base, trigger: "window", to: null, acted: false, reason: verdict.reason, rebuilds: readBackstop(sql).rebuilds,
+        tokensAfter: null, briefing: null, awaitOutcome: false,
+      });
+      return null;
+    }
+    const built = await this.#rebuildMain(tenantId, agentId, base.logicalConversation, `trigger=window strategy=briefing from=${from}`, now);
+    recordBackstop(sql, this.#transact(), {
+      ...base, trigger: "window", to: built.to, acted: true, reason: "overflow", rebuilds: built.rebuilds,
+      tokensAfter: built.tokensAfter, briefing: built.briefing, awaitOutcome: this.#recordsRebuilds(tenantId),
+    });
+    return built.step;
+  }
+
+  /** How long a briefing whose post failed waits before it is posted again. */
+  static readonly BRIEFING_RETRY_MS = 30_000;
+
+  /**
+   * End the main transcript and start a new one for the same conversation (`startFreshMain`, cause `rebuild`), whose
+   * first message is a briefing built from `messages` (`buildBriefing`), kept pending until a post writes it
+   * (`noteRebuilt`): the backstop's own, or any post that comes first, which carries it ahead of its own text. The
+   * harnesses are dropped, so the next one opens on the new transcript with a system-prompt snapshot taken now.
+   */
+  async #rebuildMain(tenantId: string, agentId: string, conversation: string, why: string, now: number):
+    Promise<{ to: string; briefing: Briefing; rebuilds: number; tokensAfter: number | null; step: Awaited<ReturnType<AgentEngine["step"]>> | null }> {
+    const sql = this.#deps.ctx.storage.sql;
+    const chain = logicalMain(sql).transcripts.map((id) => ({ id, session: physicalSession(sql, id) }));
+    const messages = conversationMessages(sql, chain);
+    const briefing = buildBriefing(messages, { conversation, noticeHeads: noticeHeads(sql), redact: await this.#briefingRedactor(tenantId, agentId) });
+    const { newSessionId } = startFreshMain(this.#deps.ctx.storage, now, "rebuild");
+    await this.dropHarnesses(tenantId, agentId, "rebuild", why);
+    const state = noteRebuilt(sql, newSessionId, briefing.text, now);
+    const step = await this.#postBriefing(tenantId, agentId);
+    const sent = mainCallOut(sql);
+    return { to: newSessionId, briefing, rebuilds: state.rebuilds, tokensAfter: sent ? requestTokens(sql, sent) : null, step };
+  }
+
+  /**
+   * Post the pending briefing and drive its first call. A post that fails keeps the briefing pending (`postMessage`
+   * gives it back) and the session marked, so a later pass posts it, and any post before that carries it.
+   */
+  async #postBriefing(tenantId: string, agentId: string): Promise<Awaited<ReturnType<AgentEngine["step"]>> | null> {
+    const sql = this.#deps.ctx.storage.sql;
+    try {
+      await this.postMessage(tenantId, agentId, "", "prompt", MAIN_SESSION, { pendingOnly: true });
+    } catch (e) {
+      logEvent("rebuild.briefing_failed", { tenantId, agentId, error: String((e as Error)?.message ?? e).slice(0, 200) });
+      markSession(sql, MAIN_SESSION, true);
+      return { open: 0, wakeInMs: AgentRuntime.BRIEFING_RETRY_MS, settled: [] };
+    }
+    if (readBackstop(sql).pending !== null) {
+      markSession(sql, MAIN_SESSION, true);
+      return { open: 0, wakeInMs: AgentRuntime.BRIEFING_RETRY_MS, settled: [] };
+    }
+    return (await this.agent(tenantId, agentId, MAIN_SESSION)).step();
+  }
+
+  /**
+   * The operator's reset of the main conversation (/admin/reset-session): the backstop's `needs_reset` mark and count
+   * are cleared, and, with `rebuild`, the conversation is rebuilt as the backstop rebuilds it (trigger `operator`), so
+   * the input its last run failed on is answered on a context that fits. The rebuild needs the agent idle (`notIdle`);
+   * the clear does not. pi085 only.
+   */
+  async resetSession(tenantId: string, agentId: string, opts: { rebuild: boolean }):
+    Promise<{ ok: true; cleared: { at: number; reason: string } | null; rebuilt: { from: string; to: string } | null } | { ok: false; status: number; error: string }> {
+    await this.ready();
+    if (!(await this.store.loadAgent(tenantId, agentId))) return { ok: false, status: 404, error: `no agent ${agentId}` };
+    if (this.#isPd()) return { ok: false, status: 409, error: "this agent runs on the pd engine, which has no overflow backstop" };
+    const sql = this.#deps.ctx.storage.sql;
+    const mark = readBackstop(sql).needsReset;
+    if (!opts.rebuild) {
+      clearBackstop(sql, { tenantId, agentId, why: "operator", now: Date.now() });
+      return { ok: true, cleared: mark ? { at: mark.at, reason: mark.reason } : null, rebuilt: null };
+    }
+    const busy = this.notIdle();
+    if (busy) return { ok: false, status: 409, error: `${busy}; a rebuild starts only between turns (rebuild=0 clears the mark alone)` };
+    clearBackstop(sql, { tenantId, agentId, why: "operator", now: Date.now() });
+    const now = Date.now();
+    const from = currentMainId(sql);
+    const conversation = logicalMain(sql).conversation;
+    const jobId = null;
+    const built = await this.#rebuildMain(tenantId, agentId, conversation, `trigger=operator strategy=briefing from=${from}`, now);
+    recordBackstop(sql, this.#transact(), {
+      tenantId, agentId, trigger: "operator", from, to: built.to, logicalConversation: conversation, acted: true, reason: "operator",
+      consecutive: 0, rebuilds: built.rebuilds, tokensBefore: null, tokensAfter: built.tokensAfter, briefing: built.briefing,
+      jobId, awaitOutcome: this.#recordsRebuilds(tenantId), at: now, ...(await this.#windowFacts(tenantId, agentId, now)),
+    });
+    return { ok: true, cleared: mark ? { at: mark.at, reason: mark.reason } : null, rebuilt: { from, to: built.to } };
+  }
+
+  #transact() {
+    const storage = this.#deps.ctx.storage;
+    return <T>(fn: () => T): T => storage.transactionSync ? storage.transactionSync(fn) : fn();
+  }
+
+  /** What a `needs_reset` mark is judged against (src/runtime/overflow-backstop.ts `needsReset`): the binding now, and the time. */
+  async #judge(tenantId: string, agentId: string): Promise<Judge> {
+    const b = await this.store.getModelBinding(tenantId, agentId);
+    return { tenantId, agentId, binding: b ? bindingKey(b, this.#modelOf(b).contextWindow) : "none", now: Date.now() };
+  }
+
+  /** The last answered call's context and the model's window, as #847's window rows carry them. */
+  async #windowFacts(tenantId: string, agentId: string, now: number) {
+    const b = await this.store.getModelBinding(tenantId, agentId);
+    const { contextTokens } = readWakeFacts(this.#deps.ctx.storage.sql, piTables(MAIN_SESSION).entries, now, CONTEXT_BOUNDARY_WHERE);
+    return { contextTokens, contextWindow: b ? this.#modelOf(b).contextWindow : null };
+  }
+
+  /**
+   * How a briefing redacts each tool call's arguments and result before flattening them (cf/src/eval-read.ts
+   * `redactCredentials`): credential-named keys and kept-secret tools masked by place, and the agent's sealed values by
+   * exact match. When those values cannot be opened, every argument and result is dropped instead: fail closed.
+   */
+  async #briefingRedactor(tenantId: string, agentId: string): Promise<(v: unknown) => unknown> {
+    const secrets = await agentSecretValues(this.#deps.ctx.storage.sql as never, tenantId, agentId, { SECRET_KEK: this.#deps.secretKek })
+      .catch(() => ({ ok: false as const, message: "unreadable" }));
+    if (!secrets.ok) {
+      return (v) => typeof v === "string" ? credentialRedactor()(v).value
+        : v && typeof v === "object" ? { ...(v as object), arguments: "<withheld>", text: "<withheld>" } : v;
+    }
+    const walk = credentialRedactor({ secrets: secrets.values });
+    return (v) => walk(v).value;
   }
 
   /**
@@ -3815,11 +4030,14 @@ export class AgentRuntime {
         // than a signal: the model has to be able to answer it with a call.
         const mount = mounts.find((m) => m.alias === h.alias);
         const limit = Number(h.live.lease?.maxPostponeMinutes) || Number((mount?.publicConfig as any)?.maxQuietMinutes) || null;
+        // Into a conversation that needs a reset the warning is not said, and it is recorded as given all the same: the
+        // release keeps its schedule rather than the pass asking again at once, for ever.
         await this.postMessage(tenantId, agentId,
           warningText(h.alias,
             { release: nameOf(h.alias, h.tools.release), postpone: h.tools.postpone ? nameOf(h.alias, h.tools.postpone) : null },
             h.billing, d.idleMs, d.untilReleaseMs, limit,
-            { consequence: h.live.lease?.consequence, advice: h.live.lease?.advice, name: h.live.name, args: h.live.args }), "prompt");
+            { consequence: h.live.lease?.consequence, advice: h.live.lease?.advice, name: h.live.name, args: h.live.args }), "prompt")
+          .catch((e) => refusedForReset(e, tenantId, agentId, "lease warning"));
         sql.exec("INSERT INTO held_warnings(alias, live_id, release_at) VALUES (?,?,?) " +
           "ON CONFLICT(alias, live_id) DO UPDATE SET release_at = excluded.release_at", h.alias, h.live.id, d.releaseAt);
         // 0: postMessage only marks the session, so this wake is what runs the warning's turn (idle-lease.ts).
