@@ -103,7 +103,9 @@ function deployment(extra: Record<string, unknown>) {
     return show({
       mounts: q("SELECT alias, plugin, installation_id FROM mounts ORDER BY alias"),
       state: q("SELECT * FROM seed_reconcile"), outcomes: q("SELECT * FROM seed_outcomes ORDER BY alias"),
-      trace: q("SELECT seq FROM trace_outbox WHERE kind = 'mount.seeded'"),
+      // No table and no row are the same footprint: opening a harness creates the table for its own
+      // `harness.open` row (src/runtime/harness-open.ts), which is not a reconcile's.
+      trace: ((r) => r === "absent" ? [] : r)(q("SELECT seq FROM trace_outbox WHERE kind = 'mount.seeded'")),
     });
   };
   return {

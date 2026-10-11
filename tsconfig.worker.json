@@ -101,6 +101,7 @@
     "test/caller-context.ts",
     "test/operation-id.ts",
     "test/stable-prompt.ts",
+    "test/harness-open.ts",
     "test/tool-interrupts.ts",
     "test/mcp-plugin.ts",
     "test/raft-plugin.ts",

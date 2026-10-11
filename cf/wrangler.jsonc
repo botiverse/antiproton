@@ -24,6 +24,9 @@
     { "binding": "CONTROL_DB", "database_name": "antiproton-control", "database_id": "726e14d9-261f-4712-a7a5-b011db179598", "migrations_dir": "migrations" }
   ],
   "worker_loaders": [{ "binding": "LOADER" }],
+  // Which version is running: a harness opened after a deploy is told from one opened after an eviction
+  // (src/runtime/harness-open.ts).
+  "version_metadata": { "binding": "CF_VERSION_METADATA" },
   "r2_buckets": [{ "binding": "ARTIFACTS", "bucket_name": "antiproton-artifacts" }],
   // The only construct on this platform that owns work across invocations.
   // `waitUntil` does not: it is a promise attached to an invocation that has

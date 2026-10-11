@@ -21,6 +21,7 @@ import { DurableAgent, PdHost, recordedEngine } from "../../src/runtime/durable-
 import { busyReason, clientCallsWaiting, migrateToPd, revertToPi085, type MigrationResult, type RevertResult } from "../../src/runtime/pd-migrate.ts";
 import { sealSeedFiles, seedInline, sha256Hex, type SealHow, type SeedMode, type SeedWriteResult } from "../../src/store/seed-files.ts";
 import { logEvent } from "../../src/core/log.ts";
+import { markHarnessDrop, recordHarnessOpen } from "../../src/runtime/harness-open.ts";
 import { currentMainId, mainSessions, modelInputCalls, readModelInput, recordModelInput, startFreshMain, type MainSessionRow, type ModelInputEvidence } from "./fresh-context.ts";
 import { heldDecision, warningText } from "../../src/runtime/idle-lease.ts";
 import { heldItems, heldLines, heldParagraph, heldResources, withHeldNote } from "../../src/runtime/held.ts";
@@ -587,6 +588,9 @@ export interface RuntimeDeps {
    * spending this key.
    */
   operatorModel?: OperatorModel;
+  /** The Worker version this runtime runs (the version metadata binding's id), which tells a `harness.open` after a
+   *  deploy from one after an eviction (src/runtime/harness-open.ts). Absent, a cold start's cause is `unknown`. */
+  versionId?: string;
   /** The operator's sandbox account, behind OPERATOR_RUN9_REF. Absent means the
    *  `node` mount resolves to no credential and its tools refuse to run, which
    *  is the right failure: a deployment without keys should not start boxes. */
@@ -2904,12 +2908,16 @@ export class AgentRuntime {
     const key = `${tenantId}/${agentId}`;
     const cacheKey = `${key}#${session}`;
     const cached = this.#agents.get(cacheKey);
+    // The key of the harness refused below, so its open says what moved (src/runtime/harness-open.ts).
+    let replaced: string | null = null;
     if (cached) {
       const now = await this.#harnessKeyFor(tenantId, agentId);
       const running = cached.builtFrom !== now && await cached.agent.running();
       if (reuseHarness(cached.builtFrom, now, running)) return cached.agent;
       this.#agents.delete(cacheKey);
+      replaced = cached.builtFrom;
     }
+    const startedAt = Date.now();
 
     const binding = await this.store.getModelBinding(tenantId, agentId);
     if (!binding) throw new Error(`no model binding for ${key}`);
@@ -2991,6 +2999,8 @@ export class AgentRuntime {
         cancelNote: CANCELLED_NOTE,
         explainUnavailable,
       });
+      this.#recordOpen({ tenantId, agentId, cacheKey, session, conversation: session, engine: "pd", builtFrom, replaced, prompt,
+        tools: [...offered as MountedTool[], ...extraTools as never[]], startedAt });
       this.#agents.set(cacheKey, { agent: pd, builtFrom });
       return pd;
     }
@@ -3018,8 +3028,29 @@ export class AgentRuntime {
       explainUnavailable,
     });
     agentRef.current = agent;
+    this.#recordOpen({ tenantId, agentId, cacheKey, session, conversation: this.#conversationOf(session), engine: "pi085", builtFrom, replaced,
+      prompt, tools: [...offered as MountedTool[], ...extraTools as never[]], startedAt });
     this.#agents.set(cacheKey, { agent, builtFrom });
     return agent;
+  }
+
+  /** The `harness.open` row for a harness just built (src/runtime/harness-open.ts). A reading: a failure to write it
+   *  is logged and the harness opens anyway. */
+  #recordOpen(o: {
+    tenantId: string; agentId: string; cacheKey: string; session: string; conversation: string; engine: string;
+    builtFrom: string; replaced: string | null; prompt: string; tools: Array<{ name: string; description?: string; parameters?: unknown }>;
+    startedAt: number;
+  }) {
+    const storage = this.#deps.ctx.storage;
+    const transact = <T>(fn: () => T): T => storage.transactionSync ? storage.transactionSync(fn) : fn();
+    const at = Date.now();
+    try {
+      recordHarnessOpen(storage.sql, transact, {
+        tenantId: o.tenantId, agentId: o.agentId, conversationKey: o.cacheKey, session: o.session, conversation: o.conversation,
+        engine: o.engine, builtFrom: o.builtFrom, replaced: o.replaced, systemPrompt: o.prompt, tools: o.tools,
+        version: this.#deps.versionId ?? null, at, ms: at - o.startedAt,
+      });
+    } catch (e) { console.error(`the harness.open row of ${o.cacheKey} could not be written:`, e); }
   }
 
   /**
@@ -3112,9 +3143,12 @@ export class AgentRuntime {
     host.bind({ tenantId, agentId, model: this.#modelOf(binding), dispatch: this.#dispatchFor(tenantId, agentId), unknownJob: (id) => new UnknownJob(id) });
     /** The engines built so far were opened on the engine that is about to stop being this agent's. */
     const forget = async () => {
-      const built = [...this.#agents.values()];
+      const built = [...this.#agents];
       this.#agents.clear();
-      for (const { agent } of built) await agent.close().catch(() => {});
+      // Every owner whose harness was cleared, and this agent's own conversations, which may have none open now.
+      const owners = new Set([`${tenantId}/${agentId}`, ...built.map(([k]) => k.slice(0, k.lastIndexOf("#")))]);
+      for (const owner of owners) this.#markDrop(owner, "dropped", `engine ${op}`);
+      for (const [, { agent }] of built) await agent.close().catch(() => {});
     };
     if (op === "revert") {
       const out = await revertToPi085({ storage, host, ...(opts.dryRun ? { dryRun: true } : {}) });
@@ -3201,7 +3235,7 @@ export class AgentRuntime {
     const busy = this.notIdle();
     if (busy) return { ok: false, status: 409, error: `${busy}; a fresh context starts only between turns` };
     const out = startFreshMain(this.#deps.ctx.storage, Date.now());
-    await this.dropHarnesses(tenantId, agentId);
+    await this.dropHarnesses(tenantId, agentId, "fresh-context");
     return { ok: true, ...out };
   }
 
@@ -3227,14 +3261,25 @@ export class AgentRuntime {
     return busy ? `${busy}; ${reasons.join("; ")}` : `the agent is not idle: ${reasons.join("; ")}`;
   }
 
-  /** Close and forget the harnesses built for this agent, so the next turn builds its own from storage. */
-  async dropHarnesses(tenantId: string, agentId: string) {
+  /**
+   * Close and forget the harnesses built for this agent, so the next turn builds its own from storage. `why` is what
+   * each conversation's next `harness.open` row says (src/runtime/harness-open.ts): `fresh-context`, or the caller's
+   * reason for an ordinary drop.
+   */
+  async dropHarnesses(tenantId: string, agentId: string, why: string) {
     const prefix = `${tenantId}/${agentId}#`;
-    for (const [k, built] of [...this.#agents]) {
-      if (!k.startsWith(prefix)) continue;
-      this.#agents.delete(k);
-      await built.agent.close().catch(() => {});
-    }
+    const built = [...this.#agents].filter(([k]) => k.startsWith(prefix));
+    for (const [k] of built) this.#agents.delete(k);
+    // After the cache is cleared: the mark is a reading, and the drop it explains has already happened.
+    this.#markDrop(`${tenantId}/${agentId}`, why === "fresh-context" ? "fresh-context" : "dropped", why === "fresh-context" ? null : why);
+    for (const [, { agent }] of built) await agent.close().catch(() => {});
+  }
+
+  /** Why the next `harness.open` of `owner`'s conversations happens (src/runtime/harness-open.ts). A reading, like
+   *  `#recordOpen`: a failure to write it is logged, and the drop it would explain goes ahead. */
+  #markDrop(owner: string, reason: "dropped" | "fresh-context", detail: string | null) {
+    try { markHarnessDrop(this.#deps.ctx.storage.sql, owner, reason, detail); }
+    catch (e) { console.error(`the harness drop of ${owner} could not be noted:`, e); }
   }
 
   /**

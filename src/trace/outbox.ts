@@ -48,7 +48,8 @@ const TABLE = "CREATE TABLE IF NOT EXISTS trace_outbox(" +
 
 // `mount.seeded` is one catalogue entry's outcome on one agent (src/store/seed-record.ts): written when the outcome
 // changes, in the transaction that adds the mount when there is one. Activity and status skip it (their `default`).
-export const TRACE_KINDS = ["model.call", "tool.call", "approval.wait", "container.lease", "inbound", "mount.seeded"] as const;
+// `harness.open` is one harness built for one conversation, with why (src/runtime/harness-open.ts); a reuse has none.
+export const TRACE_KINDS = ["model.call", "tool.call", "approval.wait", "container.lease", "inbound", "mount.seeded", "harness.open"] as const;
 export type TraceKind = (typeof TRACE_KINDS)[number];
 
 export const TRACE_VERDICTS = ["ok", "failed", "blocked", "cancelled"] as const;
