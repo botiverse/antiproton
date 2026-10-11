@@ -279,8 +279,10 @@ await check("a push into a running turn is not a wake: no decision", async () =>
   w.host.dispose();
 });
 
-/** A request with what differs between two runs by construction (clock, ids) folded. */
-const normal = (c: Ctx) => JSON.stringify(c, (k, v) => (k === "timestamp" ? 0 : k === "jobId" || k === "responseId" ? "id" : v));
+/** A request with what differs between two runs by construction (clock, ids) folded: the clock in an overflow
+ *  briefing's labels too (src/runtime/overflow-backstop.ts), which quotes message times. */
+const normal = (c: Ctx) => JSON.stringify(c, (k, v) => (k === "timestamp" ? 0 : k === "jobId" || k === "responseId" ? "id"
+  : typeof v === "string" ? v.replace(/\d{4}-\d\d-\d\d \d\d:\d\dZ/g, "T") : v));
 
 await check("shadow mode alters no model input: every request is byte-identical with the decision recorded and without it", async () => {
   const run = async (policy: RebuildPolicy | null) => {
@@ -296,14 +298,18 @@ await check("shadow mode alters no model input: every request is byte-identical 
     age(w, 2 * MIN);
     await push(w, "third");
     await settle(w);
-    const decided = rows(w, "rebuild.decision").length;
+    // Shadow rows only: the overflow below is acted on by the backstop in both runs, which is its own decision.
+    const decided = rows(w, "rebuild.decision").filter((r) => r.attrs.shadow === true).length;
     w.host.dispose();
     return { calls: w.calls.map(normal), decided };
   };
   const on = await run(DEFAULT_REBUILD_POLICY);
   const off = await run(null);
-  must(on.decided === 6 && off.decided === 0, `control: decisions ${on.decided} / ${off.decided}`);
-  must(on.calls.length === 3 && off.calls.length === 3, `calls: ${on.calls.length} / ${off.calls.length}`);
+  // Each wake's cold-wake decision, and a window one for the second and third (every answer says 850k); the overflow
+  // is the backstop's own decision (`shadow: false`), not one of these.
+  must(on.decided === 5 && off.decided === 0, `control: decisions ${on.decided} / ${off.decided}`);
+  // The overflow's run, the backstop's rebuilt call, and the third wake.
+  must(on.calls.length === 4 && off.calls.length === 4, `calls: ${on.calls.length} / ${off.calls.length}`);
   for (let i = 0; i < on.calls.length; i++) must(on.calls[i] === off.calls[i], `request ${i} differs:\n${on.calls[i]!.slice(0, 600)}\n${off.calls[i]!.slice(0, 600)}`);
 });
 

@@ -2036,6 +2036,20 @@ export class AgentDO extends DurableObject<Env> {
   }
 
   /**
+   * /admin/reset-session's object half (`AgentRuntime.resetSession`): clear the overflow backstop's `needs_reset` mark
+   * and, unless `rebuild` is false, rebuild the main conversation so its last input is answered. The wake after it
+   * drives the rebuilt conversation's first call.
+   */
+  async resetSession(tenantId: string, agentId: string, rebuild: boolean) {
+    if (!this.#isAgent(tenantId, agentId)) return { ok: false as const, status: 404, error: `no agent ${agentId}` };
+    return this.#busy("resetSession", async () => {
+      const r = await this.runtime().resetSession(tenantId, agentId, { rebuild });
+      if (r.ok) await this.#wake();
+      return r;
+    });
+  }
+
+  /**
    * The ordinary restart, as an eviction would do it (`simulateEviction`): every harness, cached tool list and
    * held program in this object's memory is dropped, and the next turn rebuilds from storage, on the same main
    * conversation with its whole transcript. Not a fresh context (`freshContext`), which starts a new conversation.
@@ -4144,6 +4158,20 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
           const s2 = env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a)));
           const r = await s2.uiCompact(t, a, k);
           return compactionRefusal(r, "json") ?? Response.json(r);
+        }
+        case "/admin/reset-session": {
+          // The operator's way out of an overflow backstop that gave up (src/runtime/overflow-backstop.ts): the mark is
+          // cleared and the conversation rebuilt, or with rebuild=0 only cleared, so the next push is tried again.
+          if (!isOperator(env.AUTOMATION_TOKEN, request.headers.get("x-harness-token"))) {
+            return Response.json({ error: "unauthorized" }, { status: 401 });
+          }
+          if (request.method !== "POST") return Response.json({ error: "POST" }, { status: 405 });
+          const t = url.searchParams.get("tenantId") ?? "demo";
+          const a = String(url.searchParams.get("agentId") ?? "");
+          if (!a) return Response.json({ error: "agentId is required" }, { status: 400 });
+          const s4 = env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a)));
+          const r = await s4.resetSession(t, a, url.searchParams.get("rebuild") !== "0");
+          return Response.json(r, { status: r.ok ? 200 : r.status });
         }
         case "/admin/migrate-engine":
           return await adminMigrateEngine(request, env.AUTOMATION_TOKEN,

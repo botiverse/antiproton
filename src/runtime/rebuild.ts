@@ -21,7 +21,8 @@
  *   - `rebuild.outcome`, written when that wake's first model answer lands (`settleRebuildOutcome`, called from
  *     src/store/pi-storage.ts in the transaction that writes the answer): the measured first-call hit rate
  *     (cacheRead / input) and `agree`, `false-cold`, `false-warm`, `expected-cold` or `unmeasured`.
- *   - a `window` decision for an answer that is a context-overflow error (`recordOverflow`).
+ *   - a `window` decision for an answer that is a context-overflow error: the pi085 overflow backstop's, which acts
+ *     on it (src/runtime/overflow-backstop.ts `recordBackstop`, status `ran` or `declined`, `shadow: false`).
  * Numbers and ids only: no text of the conversation is ever in a row.
  *
  * The thresholds come from the wake analysis on production transcripts (2026-09-28 to 10-11, 6 agents): Luna's
@@ -248,8 +249,11 @@ export function readWakeFacts(sql: Sql, entries: string, now: number, boundaryWh
 
 // ---- recording ----------------------------------------------------------------------------------------------------
 
-/** What a decision row says happened: a shadow prediction, or the engine's own compaction that ran. */
-export type DecisionStatus = "would-rebuild" | "would-keep" | "ran";
+/**
+ * What a decision row says happened: a shadow prediction, a rebuild that ran (pd's own compaction, or the pi085
+ * overflow backstop's, src/runtime/overflow-backstop.ts), or one the backstop's guard declined.
+ */
+export type DecisionStatus = "would-rebuild" | "would-keep" | "ran" | "declined";
 
 export interface DecisionRecord {
   tenantId: string; agentId: string;
@@ -274,6 +278,8 @@ export interface DecisionRecord {
   awaitOutcome: boolean;
   /** The facts, numbers and ids only. */
   facts: Record<string, string | number | boolean | null>;
+  /** A prediction (the default) or a decision that was acted on: the overflow backstop's is not a shadow. */
+  shadow?: boolean;
   at: number;
 }
 
@@ -286,7 +292,7 @@ export function recordRebuildDecision(sql: Sql, transact: <T>(fn: () => T) => T,
   const id = `rb_${crypto.randomUUID().replace(/-/g, "").slice(0, 20)}`;
   const attrs = {
     trigger: d.trigger, strategy: d.strategy, wouldRebuild: d.wouldRebuild, predictedCold: d.predictedCold,
-    expectedCold: d.expectedCold, reason: d.reason, rule: d.rule, ...d.facts, shadow: true,
+    expectedCold: d.expectedCold, reason: d.reason, rule: d.rule, ...d.facts, shadow: d.shadow ?? true,
   };
   transact(() => {
     if (d.awaitOutcome) {
@@ -308,6 +314,8 @@ export function recordRebuildDecision(sql: Sql, transact: <T>(fn: () => T) => T,
 /** A cold-wake decision as a row: what `shouldRebuild` said and the facts it said it from. */
 export function coldWakeRecord(o: {
   tenantId: string; agentId: string; key: string; conversation: string;
+  /** The conversation as its readers know it across overflow rebuilds (cf/src/fresh-context.ts `logicalMain`). */
+  logicalConversation?: string;
   facts: RebuildFacts; decision: RebuildDecision; coldHitRate: number; at: number;
 }): DecisionRecord {
   const f = o.facts, d = o.decision;
@@ -320,6 +328,7 @@ export function coldWakeRecord(o: {
       gapMs: f.gapMs, contextTokens: f.contextTokens, thresholdTokens: d.thresholdTokens,
       coldAfterGapMs: d.coldAfterGapMs, provider: f.provider, model: f.model,
       prevReasoning: f.prevReasoning, prevWakeHitRate: f.prevWakeHitRate, conversation: o.conversation,
+      logicalConversation: o.logicalConversation ?? o.conversation,
     },
     at: o.at,
   };
@@ -327,11 +336,11 @@ export function coldWakeRecord(o: {
 
 /**
  * A `window` rebuild in shadow on pi085, which never compacts (src/runtime/pi-agent.ts): `context-near-window` when a
- * wake's context reaches the policy's share of the window, `overflow` when an answer is a context-overflow error. An
- * agent there fails every wake until something rebuilds its context; this is the row that says how often.
+ * wake's context reaches the policy's share of the window. An overflow itself is the backstop's own decision
+ * (src/runtime/overflow-backstop.ts).
  */
 export function windowRecord(o: {
-  tenantId: string; agentId: string; key: string; reason: "context-near-window" | "overflow";
+  tenantId: string; agentId: string; key: string; reason: "context-near-window";
   contextTokens: number | null; contextWindow: number | null; at: number;
 }): DecisionRecord {
   return {
@@ -414,15 +423,3 @@ export function settleRebuildOutcome(sql: Sql, a: {
   }
 }
 
-/**
- * An answer that is a context-overflow error, as a `window` rebuild in shadow (`windowRecord`). `overflowed` is the
- * caller's reading of the answer (pi-ai's `isContextOverflow`); the context's size is the last answered call's.
- */
-export function recordOverflow(sql: Sql, a: {
-  tenantId: string; agentId: string; entries: string; at: number; contextWindow: number | null; boundaryWhere: string;
-}) {
-  const { contextTokens } = readWakeFacts(sql, a.entries, a.at, a.boundaryWhere);
-  recordRebuildDecision(sql, (fn) => fn(), windowRecord({
-    tenantId: a.tenantId, agentId: a.agentId, key: a.entries, reason: "overflow", contextTokens, contextWindow: a.contextWindow, at: a.at,
-  }));
-}
