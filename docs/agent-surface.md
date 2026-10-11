@@ -497,7 +497,7 @@ answer with `/admin/transcript`'s for the same agent).
 
 `GET …/trace` answers the agent's trace rows — the spans of its work, one row each when it ended
 (`model.call`, `tool.call`, `approval.wait`, `container.lease`, `inbound`, `mount.seeded`,
-`rebuild.decision`, `rebuild.outcome`; `src/trace/outbox.ts`) — with `from <= at < to`, in `seq` order.
+`rebuild.decision`, `rebuild.outcome`, `rebuild.behaviour`; `src/trace/outbox.ts`) — with `from <= at < to`, in `seq` order.
 
 - `from`, `to` — ISO 8601 or milliseconds since the epoch; the window is at most 24 hours. One alone
   puts the other 24 hours away; neither is the 24 hours up to now. `to` before or at `from`, a wider
@@ -521,7 +521,8 @@ on the pi085 engine also `prefix` (`src/runtime/request-prefix.ts`): the sha256 
 and of the tool list, the request's message count and characters, how many leading messages (and their
 characters) are the previous request's byte for byte, and `broken` — `system`, `tools`, `message`, or
 null when the previous request is all a prefix of this one. No content is recorded.
-A `rebuild.decision` row is a context rebuild decided (`src/runtime/rebuild.ts`), recorded and not acted on:
+A `rebuild.decision` row is a context rebuild decided (`src/runtime/rebuild.ts`), recorded and, unless it says
+`shadow: false`, not acted on:
 `trigger` `cold-wake` (each inbound wake of a pi085 agent's main conversation: whether the deployment's rules,
 `REBUILD_POLICY`, predict the cache cold, `predictedCold`, and would rebuild, `wouldRebuild` — cold and over the
 size threshold — with `reason` and the facts: gap, context tokens, model, the previous wake's first-call hit rate;
@@ -530,6 +531,18 @@ that is a context overflow, or a pd compaction that ran) or `operator` (a manual
 Its `rebuild.outcome` row (`parentId` the decision's `spanId`, `spanId` the model job) is the next call measured:
 `input`, `cacheRead`, `hitRate`, and `status` `agree`, `false-cold`, `false-warm` (`predictedCold` against the
 measurement), `expected-cold` (cold by construction, out of the rate) or `unmeasured` (an error, or no input).
+One cold-wake rule is acted on: a wake more than `idle.idleMinutes` (60) after the conversation's last answered call,
+on a context over `idle.minContextTokens` (8,000, the briefing's size), is rebuilt before it is answered — a new
+transcript of the same conversation whose first message is a briefing, the wake after it. Its decision is that wake's
+only cold-wake row: `status` `ran`, `shadow: false`, `rule` `idle`, with the gap, the context before, the briefing's
+tokens, blocks and budget, `conversation` and `to` (the transcripts ended and started) and `logicalConversation`; a
+wake the rule passes by keeps its shadow row, whose `idleRebuild` says why (`gap-under-idle`,
+`context-below-briefing`, `needs-reset`, `idle-off`, …). `REBUILD_POLICY`'s `idle` section sets the two numbers, and
+`"idle": false` turns it off. The rebuilt transcript's first run, once it has ended, writes one `rebuild.behaviour` row
+(`parentId` the decision): `firstSendMs` (the wake to the first message sent), `toolCallsBeforeSend`,
+`recapCallsBeforeSend` (memory, state and message-history reads), `firstAction` (`recap`, `send`, `act`),
+`repeatedCalls` and `repeatedBeforeSend` (calls with the same tool and arguments as one that succeeded among the
+replaced conversation's last 12), `toolCalls`, `modelCalls`, `runMs` and `endedWith`. Numbers and flags only.
 The answer adds `from`, `to` (ISO), `cursor`, `nextCursor` and `scanned: { local, objects }`. Nothing
 is written.
 

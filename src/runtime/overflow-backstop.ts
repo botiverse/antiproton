@@ -30,7 +30,7 @@ import { logEvent } from "../core/log.ts";
 import { appendTrace } from "../trace/outbox.ts";
 import { MAIN_SESSION, piTables, type SqlHost } from "../store/pi-storage.ts";
 import { fenceFor } from "../plugins/state.ts";
-import { recordRebuildDecision, type RebuildTrigger } from "./rebuild.ts";
+import { BRIEFING_BUDGET_TOKENS, recordRebuildDecision, type RebuildTrigger } from "./rebuild.ts";
 
 type Sql = SqlHost["sql"];
 
@@ -38,8 +38,8 @@ type Sql = SqlHost["sql"];
 export const MAX_CONSECUTIVE_OVERFLOWS = 3;
 /** How long a `needs_reset` mark holds before the next wake is tried again: a cause that has gone away does not need an operator. */
 export const NEEDS_RESET_TTL_MS = 24 * 60 * 60_000;
-/** The briefing's size, in estimated tokens (`estimateTokens`). */
-export const BRIEFING_BUDGET_TOKENS = 8_000;
+/** The briefing's size, in estimated tokens (`estimateTokens`); kept in src/runtime/rebuild.ts, whose idle rule reads it too. */
+export { BRIEFING_BUDGET_TOKENS };
 /** How many of the most recent tool calls the briefing lists. */
 export const BRIEFING_ACTIONS = 12;
 
@@ -286,10 +286,11 @@ export interface Briefing {
 }
 
 /**
- * A tool whose call is a message the agent sent someone: its own name, after the mount's alias, says so. A raw
+ * A tool whose call is a message the agent sent someone: its own name, after the mount's alias, says so — verb first
+ * (`send_message`) or, as the Raft SDK names its operations, noun first (`messages_send`, `messages_reply`). A raw
  * transport (`http__send`, `sandbox__post`) is not one: its arguments are a request, not something a person read.
  */
-const SENDS = /^(?:(?:send|post|create)_(?:message|reply|comment|chat_message)s?|reply(?:_\w+)?|comment(?:_\w+)?|say|notify(?:_\w+)?)$/i;
+const SENDS = /^(?:(?:send|post|create)_(?:message|reply|comment|chat_message)s?|(?:message|comment)s?_(?:send|reply|post|create)|reply(?:_\w+)?|comment(?:_\w+)?|say|notify(?:_\w+)?)$/i;
 const toolPart = (name: string) => { const i = name.lastIndexOf("__"); return i < 0 ? name : name.slice(i + 2); };
 export const isSendTool = (name: string) => SENDS.test(toolPart(name));
 /** The longest single message the briefing quotes, in characters; a longer one is cut with a mark. */
@@ -304,10 +305,13 @@ const textOf = (content: unknown): string => typeof content === "string" ? conte
 const when = (ms: number) => Number.isFinite(ms) && ms > 0 ? new Date(ms).toISOString().slice(0, 16).replace("T", " ") + "Z" : "unknown time";
 const cut = (s: string, n: number) => s.length > n ? `${s.slice(0, n)}… (cut at ${n} characters)` : s;
 const oneLine = (s: string) => s.replace(/\s+/g, " ").trim();
-/** The text of a send-like tool call: its first string argument that reads as a message. */
+/**
+ * The text of a send-like tool call: its first string argument that reads as a message. `content` before `message`:
+ * Raft's `messages_reply` names the message it answers `message` and its own text `content`.
+ */
 function sentText(args: unknown): string | null {
   if (!args || typeof args !== "object") return null;
-  for (const k of ["text", "message", "body", "content"]) {
+  for (const k of ["text", "content", "body", "message"]) {
     const v = (args as Record<string, unknown>)[k];
     if (typeof v === "string" && v.trim()) return v;
   }

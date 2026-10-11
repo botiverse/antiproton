@@ -1,5 +1,10 @@
 /**
- * Context rebuild, decided at wake time — in shadow: the decision is recorded and never acted on.
+ * Context rebuild, decided at wake time — in shadow: the decision is recorded and never acted on, but for one rule.
+ *
+ * The exception is the idle rule (`IdleRule`, `idleRebuild`): a wake after a long idle on a context larger than a
+ * briefing is rebuilt before it is answered (`#coldWake` in cf/src/runtime.ts, through `rebuildContext`). Its row is
+ * the wake's one cold-wake decision, `status: ran` and `shadow: false` (`idleRebuildRecord`); a wake it does not
+ * rebuild keeps its shadow row, which says why (`idleRebuild`).
  *
  * A rebuild is a kind of compaction, not a new session: the conversation keeps its id, and what the model is sent
  * is rebuilt (a summary, or a briefing) instead of resuming a prefix the provider has most likely evicted. A wake
@@ -37,14 +42,25 @@ import type { SqlHost } from "../store/pi-storage.ts";
 
 type Sql = SqlHost["sql"];
 
-// ---- the interface the acting step will have (not called yet) ------------------------------------------------------
+// ---- the acting step's interface ----------------------------------------------------------------------------------
 
 /** What asked for a rebuild: the window filling up, a wake after the cache went cold, or an operator. */
 export type RebuildTrigger = "window" | "cold-wake" | "operator";
 /** How the rebuilt context is made: a summary of the conversation, or a briefing assembled from state. */
 export type RebuildStrategy = "summary" | "briefing";
-/** `rebuildContext`'s argument once it exists; its event is `rebuild{trigger, strategy}`, apart from `compaction`. */
-export interface RebuildRequest { trigger: RebuildTrigger; keepTail: number; strategy: RebuildStrategy }
+/**
+ * The argument of `rebuildContext` (`AgentRuntime.#rebuildContext`, cf/src/runtime.ts), the one entry every acting
+ * rebuild goes through: the overflow backstop's (`window`), an operator's reset (`operator`) and a wake after a long
+ * idle (`cold-wake`). Its event is `rebuild{trigger, strategy}`, apart from `compaction`.
+ */
+export interface RebuildRequest { trigger: RebuildTrigger; strategy: RebuildStrategy }
+
+/**
+ * The size a briefing is built to, in estimated tokens (src/runtime/overflow-backstop.ts `buildBriefing`), and the
+ * default context an idle rebuild must exceed: a context no larger than the briefing that would replace it saves
+ * nothing.
+ */
+export const BRIEFING_BUDGET_TOKENS = 8_000;
 
 // ---- the policy: data, one rule per provider family ---------------------------------------------------------------
 
@@ -65,17 +81,31 @@ export interface RebuildRule {
   coldHitRate: number;
 }
 
+/**
+ * The rule a wake after a long idle is rebuilt by, before it is answered: the gap since the conversation's last
+ * answered call over `idleMinutes`, and that call's input over `minContextTokens`. Acted on, unlike the rules above.
+ */
+export interface IdleRule {
+  idleMinutes: number;
+  minContextTokens: number;
+}
+
 /** First match wins; `fallback` covers a binding no rule names. */
 export interface RebuildPolicy {
   rules: RebuildRule[];
   fallback: RebuildRule;
   /** A context at or over this share of the model's window is a `window` rebuild; 0.8 when absent. */
   windowShare?: number;
+  /** The idle rebuild's rule: `DEFAULT_IDLE_RULE` when absent, none when `false`. */
+  idle?: IdleRule | false;
 }
 
 const HOUR_MS = 60 * 60_000;
 export const DEFAULT_MIN_CONTEXT_TOKENS = 128_000;
 export const DEFAULT_WINDOW_SHARE = 0.8;
+
+/** Rebuild a wake after an hour idle when the context is larger than a briefing (tygg, 2026-10-11). */
+export const DEFAULT_IDLE_RULE: IdleRule = { idleMinutes: 60, minContextTokens: BRIEFING_BUDGET_TOKENS };
 
 export const DEFAULT_REBUILD_POLICY: RebuildPolicy = {
   rules: [
@@ -99,6 +129,8 @@ const isRule = (r: any): r is RebuildRule => !!r && typeof r === "object" && typ
   && Number.isFinite(r.coldAfterGapMs) && r.coldAfterGapMs >= 0
   && typeof r.previousColdCounts === "boolean"
   && Number.isFinite(r.coldHitRate) && r.coldHitRate >= 0 && r.coldHitRate <= 1;
+const isIdle = (i: any): boolean => i === undefined || i === false || (!!i && typeof i === "object"
+  && Number.isFinite(i.idleMinutes) && i.idleMinutes > 0 && Number.isFinite(i.minContextTokens) && i.minContextTokens >= 0);
 
 /**
  * A deployment's policy from its `REBUILD_POLICY` variable: unset is the default, `off` (any case) is none (no
@@ -112,7 +144,7 @@ export function rebuildPolicyOf(raw: string | undefined): RebuildPolicy | null {
   try {
     const p = JSON.parse(raw);
     if (Array.isArray(p?.rules) && p.rules.every(isRule) && isRule(p.fallback)
-      && (p.windowShare === undefined || isShare(p.windowShare))) return p as RebuildPolicy;
+      && (p.windowShare === undefined || isShare(p.windowShare)) && isIdle(p.idle)) return p as RebuildPolicy;
   } catch { /* refused below */ }
   logEvent("rebuild.policy.refused", { why: "REBUILD_POLICY is not a policy; the default applies" });
   return DEFAULT_REBUILD_POLICY;
@@ -173,6 +205,33 @@ export function shouldRebuild(facts: RebuildFacts, policy: RebuildPolicy): Rebui
     return out({ rebuild: false, predictedCold: cold !== null, expectedCold: false, reason: "context-below-threshold" });
   }
   return out({ rebuild: cold !== null, predictedCold: cold !== null, expectedCold: false, reason: cold ?? "warm" });
+}
+
+export type IdleReason =
+  | "idle-off" | "no-previous-call" | "context-unknown" | "gap-under-idle" | "context-below-briefing" | "idle-over-limit";
+
+export interface IdleDecision {
+  rebuild: boolean;
+  reason: IdleReason;
+  idleMs: number | null;
+  minContextTokens: number | null;
+}
+
+/**
+ * Whether a wake is rebuilt before it is answered (`IdleRule`): the gap strictly over the rule's idle time, and the
+ * last answered call's input strictly over its context floor. A conversation with no answered call, or reset since
+ * it, has nothing to rebuild from.
+ */
+export function idleRebuild(facts: Pick<RebuildFacts, "gapMs" | "contextTokens">, policy: RebuildPolicy): IdleDecision {
+  const rule = policy.idle === undefined ? DEFAULT_IDLE_RULE : policy.idle;
+  if (rule === false) return { rebuild: false, reason: "idle-off", idleMs: null, minContextTokens: null };
+  const idleMs = rule.idleMinutes * 60_000;
+  const out = (rebuild: boolean, reason: IdleReason): IdleDecision => ({ rebuild, reason, idleMs, minContextTokens: rule.minContextTokens });
+  if (facts.gapMs === null) return out(false, "no-previous-call");
+  if (facts.contextTokens === null) return out(false, "context-unknown");
+  if (facts.gapMs <= idleMs) return out(false, "gap-under-idle");
+  if (facts.contextTokens <= rule.minContextTokens) return out(false, "context-below-briefing");
+  return out(true, "idle-over-limit");
 }
 
 /** Whether a context this size is a `window` rebuild: at or over the policy's share of the model's window. */
@@ -317,6 +376,8 @@ export function coldWakeRecord(o: {
   /** The conversation as its readers know it across overflow rebuilds (cf/src/fresh-context.ts `logicalMain`). */
   logicalConversation?: string;
   facts: RebuildFacts; decision: RebuildDecision; coldHitRate: number; at: number;
+  /** Why the idle rule did not rebuild this wake (`idleRebuild`, or the runtime's own reason). */
+  idle?: string;
 }): DecisionRecord {
   const f = o.facts, d = o.decision;
   return {
@@ -329,6 +390,38 @@ export function coldWakeRecord(o: {
       coldAfterGapMs: d.coldAfterGapMs, provider: f.provider, model: f.model,
       prevReasoning: f.prevReasoning, prevWakeHitRate: f.prevWakeHitRate, conversation: o.conversation,
       logicalConversation: o.logicalConversation ?? o.conversation,
+      ...(o.idle !== undefined ? { idleRebuild: o.idle } : {}),
+    },
+    at: o.at,
+  };
+}
+
+/**
+ * A wake rebuilt before it was answered (`idleRebuild`): the one cold-wake decision for it, acted on, so not a shadow.
+ * The facts are the shadow row's, and what the rebuild made: the transcript it ended and the one it started, the
+ * briefing's size and blocks. Its first call is cold by construction (a new transcript), so its outcome is
+ * `expected-cold`, with the context it was sent and its hit rate; `predictedCold` is still the prediction about the
+ * context it replaced.
+ */
+export function idleRebuildRecord(o: {
+  tenantId: string; agentId: string; key: string;
+  from: string; to: string; logicalConversation: string;
+  facts: RebuildFacts; decision: RebuildDecision; idle: IdleDecision; coldHitRate: number;
+  briefing: { tokens: number; budgetTokens: number; messages: number; actions: number; inputs: number; done: number };
+  rebuilds: number; at: number;
+}): DecisionRecord {
+  const f = o.facts, d = o.decision, b = o.briefing;
+  return {
+    tenantId: o.tenantId, agentId: o.agentId, key: o.key, trigger: "cold-wake", strategy: "briefing",
+    wouldRebuild: true, predictedCold: d.predictedCold, expectedCold: true, status: "ran",
+    reason: o.idle.reason, rule: "idle", coldHitRate: o.coldHitRate, awaitOutcome: true, shadow: false,
+    facts: {
+      acted: true, gapMs: f.gapMs, contextTokens: f.contextTokens, idleMs: o.idle.idleMs, minContextTokens: o.idle.minContextTokens,
+      provider: f.provider, model: f.model, prevReasoning: f.prevReasoning, prevWakeHitRate: f.prevWakeHitRate,
+      shadowReason: d.reason, shadowRule: d.rule, thresholdTokens: d.thresholdTokens,
+      conversation: o.from, to: o.to, logicalConversation: o.logicalConversation,
+      budgetTokens: b.budgetTokens, briefingTokens: b.tokens, messages: b.messages, actions: b.actions, inputs: b.inputs, done: b.done,
+      rebuilds: o.rebuilds,
     },
     at: o.at,
   };

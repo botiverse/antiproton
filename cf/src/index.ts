@@ -168,8 +168,9 @@ export interface Env {
   HARNESS_MODE?: string;
   /** Context window of HARNESS_MODEL, in tokens. Compaction is a share of it. */
   HARNESS_CONTEXT_WINDOW?: string;
-  /** The context-rebuild rules, recorded in shadow (src/runtime/rebuild.ts `rebuildPolicyOf`): unset is the default
-   *  policy, `off` records nothing, anything else is a whole policy as JSON. */
+  /** The context-rebuild rules (src/runtime/rebuild.ts `rebuildPolicyOf`), recorded in shadow but for the `idle`
+   *  section, which rebuilds a wake after a long idle: unset is the default policy, `off` records and rebuilds nothing,
+   *  anything else is a whole policy as JSON. */
   REBUILD_POLICY?: string;
   /** How long a run_js program suspended at `await pause(...)` waits for `resume`, in ms (default 60000). */
   RUN_JS_RESUME_MS?: string;

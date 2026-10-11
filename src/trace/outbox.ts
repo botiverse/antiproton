@@ -51,10 +51,11 @@ const TABLE = "CREATE TABLE IF NOT EXISTS trace_outbox(" +
 // `harness.open` is one harness built for one conversation, with why (src/runtime/harness-open.ts); a reuse has none.
 // `rebuild.decision` is a context rebuild decided (a wake's shadow prediction, the engine's own compaction, or the
 // overflow backstop's rebuild) and `rebuild.outcome` the first call after it, measured (src/runtime/rebuild.ts);
+// `rebuild.behaviour` what the agent did on the run after an idle rebuild (src/runtime/rebuild-behaviour.ts);
 // `session.needs_reset` a conversation the overflow backstop gave up on (src/runtime/overflow-backstop.ts). Activity
-// and status skip all three.
+// and status skip all four.
 export const TRACE_KINDS = ["model.call", "tool.call", "approval.wait", "container.lease", "inbound", "mount.seeded", "harness.open",
-  "rebuild.decision", "rebuild.outcome", "session.needs_reset"] as const;
+  "rebuild.decision", "rebuild.outcome", "rebuild.behaviour", "session.needs_reset"] as const;
 export type TraceKind = (typeof TRACE_KINDS)[number];
 
 export const TRACE_VERDICTS = ["ok", "failed", "blocked", "cancelled"] as const;

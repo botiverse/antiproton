@@ -108,6 +108,12 @@ type World = {
   fail: Array<{ errorMessage: string; providerError?: string; input?: number; cacheRead?: number }>;
 };
 
+/**
+ * The default policy without its idle rule, which acts: a wake after an hour on a context over 8k is rebuilt before it
+ * is answered (test/idle-rebuild.ts). The wakes here are the shadow's subject, so they are decided and not rebuilt.
+ */
+const SHADOW_ONLY: RebuildPolicy = { ...DEFAULT_REBUILD_POLICY, idle: false };
+
 async function world(o: { policy?: RebuildPolicy | null; tenant?: string } = {}): Promise<World> {
   const host = sqliteHost();
   const w = { host, sent: [] as string[], answered: new Set<string>(), calls: [] as Ctx[], tenant: o.tenant ?? "t",
@@ -119,7 +125,7 @@ async function world(o: { policy?: RebuildPolicy | null; tenant?: string } = {})
     autoRelease: false, loader: standIn.loader, makeToolBinding: standIn.makeToolBinding,
     operatorModel: operatorModelOf({ DEEPSEEK_BASE_URL: "https://model.example/v1", DEEPSEEK_API_KEY: "operator-key", HARNESS_MODEL: "deepseek-flash" }),
     offloadModel: async (job: { commandId: string }) => { w.sent.push(job.commandId); },
-    ...(o.policy === undefined ? { rebuildPolicy: DEFAULT_REBUILD_POLICY } : { rebuildPolicy: o.policy }),
+    ...(o.policy === undefined ? { rebuildPolicy: SHADOW_ONLY } : { rebuildPolicy: o.policy }),
   } as never);
   await w.rt.ready();
   await w.rt.store.createAgent(w.tenant, "a");
@@ -305,7 +311,7 @@ await check("shadow mode alters no model input: every request is byte-identical 
     w.host.dispose();
     return { calls: w.calls.map(normal), decided };
   };
-  const on = await run(DEFAULT_REBUILD_POLICY);
+  const on = await run(SHADOW_ONLY);
   const off = await run(null);
   // Each wake's cold-wake decision, and a window one for the second and third (every answer says 850k); the overflow
   // is the backstop's own decision (`shadow: false`), not one of these.
