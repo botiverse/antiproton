@@ -445,7 +445,8 @@ const answeredOk = (m: any) => m?.role === "assistant" && ["stop", "toolUse", "l
  *     wrote, and what it sent through a messaging tool (`isSendTool`), each labelled outside a fence with its
  *     conversation, time and source. On Raft what was received is the messages its read tools showed (`raftLines`),
  *     each with its target and id and whether the agent answered there after it, not the push notice that woke it
- *     (`isRaftNotice`, left out); a send says where it went (`target`, or the message it replied to) and the id it got;
+ *     (`isRaftNotice`, left out); a send says where it went (`target`, or the message it replied to) and the id Raft
+ *     gave it (`sendsReported`), a send a `run_js` program made included;
  *   - the last `maxActions` tool calls, newest first, each ok, failed, or with no result;
  *   - the input itself, verbatim, last but for:
  *   - what the failed run had already sent or written for that input, so it is not sent twice.
