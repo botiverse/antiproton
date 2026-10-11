@@ -3143,10 +3143,12 @@ export class AgentRuntime {
     host.bind({ tenantId, agentId, model: this.#modelOf(binding), dispatch: this.#dispatchFor(tenantId, agentId), unknownJob: (id) => new UnknownJob(id) });
     /** The engines built so far were opened on the engine that is about to stop being this agent's. */
     const forget = async () => {
-      markHarnessDrop(storage.sql, `${tenantId}/${agentId}`, "dropped", `engine ${op}`);
-      const built = [...this.#agents.values()];
+      const built = [...this.#agents];
       this.#agents.clear();
-      for (const { agent } of built) await agent.close().catch(() => {});
+      // Every owner whose harness was cleared, and this agent's own conversations, which may have none open now.
+      const owners = new Set([`${tenantId}/${agentId}`, ...built.map(([k]) => k.slice(0, k.lastIndexOf("#")))]);
+      for (const owner of owners) this.#markDrop(owner, "dropped", `engine ${op}`);
+      for (const [, { agent }] of built) await agent.close().catch(() => {});
     };
     if (op === "revert") {
       const out = await revertToPi085({ storage, host, ...(opts.dryRun ? { dryRun: true } : {}) });
@@ -3265,14 +3267,19 @@ export class AgentRuntime {
    * reason for an ordinary drop.
    */
   async dropHarnesses(tenantId: string, agentId: string, why: string) {
-    markHarnessDrop(this.#deps.ctx.storage.sql, `${tenantId}/${agentId}`, why === "fresh-context" ? "fresh-context" : "dropped",
-      why === "fresh-context" ? null : why);
     const prefix = `${tenantId}/${agentId}#`;
-    for (const [k, built] of [...this.#agents]) {
-      if (!k.startsWith(prefix)) continue;
-      this.#agents.delete(k);
-      await built.agent.close().catch(() => {});
-    }
+    const built = [...this.#agents].filter(([k]) => k.startsWith(prefix));
+    for (const [k] of built) this.#agents.delete(k);
+    // After the cache is cleared: the mark is a reading, and the drop it explains has already happened.
+    this.#markDrop(`${tenantId}/${agentId}`, why === "fresh-context" ? "fresh-context" : "dropped", why === "fresh-context" ? null : why);
+    for (const [, { agent }] of built) await agent.close().catch(() => {});
+  }
+
+  /** Why the next `harness.open` of `owner`'s conversations happens (src/runtime/harness-open.ts). A reading, like
+   *  `#recordOpen`: a failure to write it is logged, and the drop it would explain goes ahead. */
+  #markDrop(owner: string, reason: "dropped" | "fresh-context", detail: string | null) {
+    try { markHarnessDrop(this.#deps.ctx.storage.sql, owner, reason, detail); }
+    catch (e) { console.error(`the harness drop of ${owner} could not be noted:`, e); }
   }
 
   /**

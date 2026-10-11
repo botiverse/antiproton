@@ -165,6 +165,26 @@ await check("a fresh context: the next open is `fresh-context`, on the new conve
   } finally { w.host.dispose(); }
 });
 
+await check("a harness_opens write that fails fails nothing: a fresh context and an engine migration go ahead, and the harness is rebuilt", async () => {
+  const w = await world();
+  const errors: unknown[] = [];
+  const quiet = console.error;
+  console.error = (...a: unknown[]) => { errors.push(a); };
+  try {
+    await turn(w, "hello");
+    const before = await w.rt.agent("t", "a");
+    w.host.sql.exec("CREATE TRIGGER refuse_opens BEFORE UPDATE ON harness_opens BEGIN SELECT RAISE(ABORT, 'harness_opens refused'); END");
+    const fresh = await w.rt.freshContext("t", "a");
+    must(fresh.ok, `the fresh context failed on the bookkeeping: ${show(fresh)}`);
+    const afterFresh = await w.rt.agent("t", "a");
+    must(afterFresh !== before, "the old harness is still cached after the fresh context");
+    const m = await w.rt.migrateEngine("t", "a", "migrate");
+    must(!!m && (m as any).ok, `the migration failed on the bookkeeping: ${show(m)}`);
+    must(await w.rt.agent("t", "a") !== afterFresh, "the pi085 harness is still cached after the migration");
+    must(errors.length > 0, "control: the trigger refused nothing");
+  } finally { console.error = quiet; w.host.dispose(); }
+});
+
 await check("the log line: each open is one `harness.open` line with the reason and the hashes", async () => {
   const lines: string[] = [];
   setLogSink((l) => lines.push(l));
