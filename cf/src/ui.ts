@@ -1997,9 +1997,21 @@ function credentialRegion(m: any, spec: CredentialSpec | null | undefined): stri
       <label><span>${esc(f.summary)}${f.required ? "" : " <i>(optional)</i>"}</span>
         <input type="${f.secret ? "password" : "text"}" name="${esc(f.name)}"${f.required ? " required" : ""}
                autocomplete="off" spellcheck="false"></label>`).join("");
+  // A sandbox's machines live on the account of the key that made them, and only that key can delete them: a
+  // change of key deletes them first (cf/src/runtime.ts `#releaseBeforeCredentialChange`), unless the new key is
+  // on the same run9 account, which reaches them as well. Said before the click, because what goes is a running
+  // program and every unsaved file.
+  const deletes = m.plugin === "sandbox";
+  const loses = "Its machines, running and switched off, are deleted first, with every file not saved or kept; " +
+    "kept environments survive.";
+  const pasteWarning = deletes
+    ? `<div class="hint" style="padding:4px 0 0">${esc(loses.replace(/^Its/, `Unless the new key is on the same run9 account, ${m.alias}'s`))}</div>`
+    : "";
+  const refused = typeof c.refused === "string" && c.refused ? c.refused : null;
   const paste = (verb: string, showError = true) => `
     <form hx-post="/ui/credential" ${target}>
       <input type="hidden" name="alias" value="${esc(m.alias)}">${inputs}
+      ${pasteWarning}
       ${showError && error ? `<div class="err">${esc(error)}</div>` : ""}
       <div class="row"><button type="submit">${verb}</button></div>
     </form>`;
@@ -2046,6 +2058,7 @@ function credentialRegion(m: any, spec: CredentialSpec | null | undefined): stri
     return `<div class="cred">
       <div class="state"><b>included</b><span class="tag">Limited Free</span><span class="when">configured at deploy time${times ? ` · ${times}` : ""}</span></div>
       ${error ? `<div class="err">${esc(error)}</div>` : ""}
+      ${refused ? `<div class="err">${esc(refused)}</div>` : ""}
       <details><summary>use your own key</summary>${paste("use your own key", false)}</details>
     </div>`;
   }
@@ -2069,11 +2082,12 @@ function credentialRegion(m: any, spec: CredentialSpec | null | undefined): stri
         <form class="inline" hx-post="/ui/credential/remove" ${target}
               hx-confirm="${shared
                 ? `Return ${esc(m.alias)} to the deployment's shared account? Your own key is dropped and the operator's comes back.`
-                : `Remove the credential from ${esc(m.alias)}? The agent keeps the mount but loses the account.`}">
+                : `Remove the credential from ${esc(m.alias)}? The agent keeps the mount but loses the account.`}${deletes ? ` ${loses}` : ""}">
           <input type="hidden" name="alias" value="${esc(m.alias)}">
           <button type="submit" class="ghost">${shared ? "go back to the shared key" : "remove"}</button>
         </form></div>
-      <details><summary>replace</summary>${paste("replace")}</details>
+      ${refused ? `<div class="err">${esc(refused)}</div>` : ""}
+      <details${error && verified ? " open" : ""}><summary>replace</summary>${paste("replace")}</details>
     </div>`;
 }
 

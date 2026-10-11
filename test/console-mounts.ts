@@ -733,6 +733,27 @@ await check("no secret value appears in any response or log line", async () => {
   must(logLeaks.length === 0, `${logLeaks.length} log line(s) carried the value`);
 });
 
+await check("POST /ui/credential/remove: a refusal comes back on the mount, escaped, rather than a page that did not change (#818)", async () => {
+  const real = AgentRuntime.prototype.removeCredentialOrWhy;
+  const asked: string[] = [];
+  AgentRuntime.prototype.removeCredentialOrWhy = async function (_t: string, _a: string, alias: string) {
+    asked.push(alias);
+    return { ok: false as const, error: `${alias} still holds <b>b-1</b>, so the credential was not changed: delete returned 500` };
+  };
+  try {
+    // A mount holding a key of this agent's, so the page has a remove to answer; the refusal is the runtime's
+    // (test/credential-writers.ts covers when it refuses).
+    const store = (home() as any).runtime().store;
+    await store.addMount({ tenantId: T, agentId: A, alias: "keyed", plugin: "github", installationId: "i-keyed", connectionId: null,
+      toolVersion: "1", publicConfig: {}, secretRef: "agent:keyed", policy: null });
+    await store.putSecret(T, A, "keyed", { ciphertext: "c", iv: "v" });
+    const r = await post("/ui/credential/remove", { alias: "keyed" });
+    must(r.status === 200 && asked.join() === "keyed", `status ${r.status}, asked ${show(asked)}: ${r.text.slice(0, 300)}`);
+    must(r.text.includes("keyed still holds &lt;b&gt;b-1&lt;/b&gt;, so the credential was not changed") && !r.text.includes("<b>b-1</b>"),
+      `the refusal is not on the page, or not escaped: ${r.text.slice(0, 400)}`);
+  } finally { AgentRuntime.prototype.removeCredentialOrWhy = real; }
+});
+
 globalThis.fetch = realFetch;
 for (const h of hosts) h.dispose();
 

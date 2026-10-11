@@ -1367,31 +1367,27 @@ export class AgentRuntime {
     // way around a refusal the seed path would have made.
     const problems = validateMount(plugin, mount.publicConfig as any, agentRef(alias));
     if (problems.length) return { ok: false, error: problems.map((x) => x.message).join("; ") };
-    // What the mount holds goes now, under the credential that made it (`#releaseBeforeCredentialChange`).
-    const held = await this.#releaseBeforeCredentialChange(tenantId, agentId, alias);
-    if (held) return { ok: false, error: held };
     // The value a plugin reads: a bare token, or one JSON object of the fields.
     const value = plugin.credential.shape === "token"
       ? String(fields.token ?? "").trim()
       : JSON.stringify(Object.fromEntries(form.fields.map((f) => [f.name, String(fields[f.name] ?? "").trim()])));
-    const sealed = await seal(kek, value);
-    const name = alias;
-    // Check before keeping, with the candidate in place: the check reads the
-    // credential through the same resolver a call would, so the mount points
-    // at the sealed candidate first and is pointed back if the plugin says no.
-    const previous = mount.secretRef;
-    await this.store.putSecret(tenantId, agentId, name, { ciphertext: sealed.ciphertext, iv: sealed.iv });
-    await this.store.setMountSecretRef(tenantId, agentId, alias, agentRef(name));
-    const check = await this.#gateway.checkMount(tenantId, agentId, alias);
+    // Check before anything else happens, with the candidate handed to the check rather than stored: the mount
+    // still holds the credential it had, which is the one that can release what it made (below). A key refused
+    // here has changed nothing — not the mount, not the stored key, not a machine.
+    const check = await this.#gateway.checkMount(tenantId, agentId, alias, value);
     // A refused key and an unanswered one are different news. Refused: the
     // provider looked and said no, so nothing is kept and the reason is shown.
     // Unreachable: nobody looked, so the key is kept unverified with the
     // reason beside it, rather than lost and blamed for an outage.
-    if (check && !check.ok && check.kind === "rejected") {
-      await this.store.removeSecret(tenantId, agentId, name);
-      await this.store.setMountSecretRef(tenantId, agentId, alias, previous && !isAgentRef(previous) ? previous : null);
-      return { ok: false, error: check.reason };
-    }
+    if (check && !check.ok && check.kind === "rejected") return { ok: false, error: check.reason };
+    // What the mount holds goes now, under the credential that made it — unless the new key acts on the same
+    // account and can reach it as well (`#releaseBeforeCredentialChange`).
+    const held = await this.#releaseBeforeCredentialChange(tenantId, agentId, alias, value);
+    if (held) return { ok: false, error: held };
+    const sealed = await seal(kek, value);
+    const name = alias;
+    await this.store.putSecret(tenantId, agentId, name, { ciphertext: sealed.ciphertext, iv: sealed.iv });
+    await this.store.setMountSecretRef(tenantId, agentId, alias, agentRef(name));
     if (check?.ok) {
       await this.store.putSecret(tenantId, agentId, name, {
         ciphertext: sealed.ciphertext, iv: sealed.iv, account: check.account ?? null, verified: true,
@@ -1417,11 +1413,28 @@ export class AgentRuntime {
    * replaced is the only thing that could still delete the box. What it cost up to here is booked to the account
    * it was on, whatever the mount names next: the box records the kind of credential it was created under
    * (src/plugins/sandbox.ts `BoxState.credentialRef`, read by src/usage/container.ts `boxIsOwn`).
+   *
+   * `next`, for a replacement, is the new credential, already checked. When it acts on the same account as the
+   * current one, what is held stays reachable and is not released: rotating a key must not delete machines. The
+   * page warns of the deletion in every other case (cf/src/ui.ts `credentialRegion`).
    */
-  async #releaseBeforeCredentialChange(tenantId: string, agentId: string, alias: string): Promise<string | null> {
-    const live = (await this.#gateway.mountActivities({ tenantId, agentId, taskId: LEGACY_TASK }, alias))
-      .some((a) => a.live);
-    if (!live) return null;
+  async #releaseBeforeCredentialChange(tenantId: string, agentId: string, alias: string, next?: string): Promise<string | null> {
+    const held = (await this.#gateway.mountActivities({ tenantId, agentId, taskId: LEGACY_TASK }, alias))
+      .flatMap((a) => a.live ? [a.live] : []);
+    if (!held.length) return null;
+    // A new key of the same account reaches what the old one made, so nothing has to go: both answer the same
+    // account (`Plugin.credentialAccount`), and either not answering means not the same. Only when the mount's
+    // credential is the kind each held thing records it was made under: one made under another (a box from before
+    // this rule, on the operator's account under the tenant's key) has its account unasked, so it goes.
+    const mount = await this.store.getMountByAlias(tenantId, agentId, alias);
+    const kind = secretRefKind(mount?.secretRef ?? null);
+    if (next !== undefined && held.every((l) => l.credentialRef === undefined || l.credentialRef === kind)) {
+      const [was, will] = await Promise.all([
+        this.#gateway.mountCredentialAccount(tenantId, agentId, alias),
+        this.#gateway.mountCredentialAccount(tenantId, agentId, alias, next),
+      ]);
+      if (was !== null && was === will) return null;
+    }
     const r = await this.releaseMount(tenantId, agentId, alias);
     if (!r.ok) {
       return `${alias} still holds something made with its current credential, which only that credential can ` +
@@ -1547,15 +1560,22 @@ export class AgentRuntime {
    * this agent's to take back and the answer is `false`.
    */
   async removeCredential(tenantId: string, agentId: string, alias: string): Promise<boolean> {
+    return (await this.removeCredentialOrWhy(tenantId, agentId, alias)).ok;
+  }
+
+  /** `removeCredential`, with why it was refused: the console shows that rather than a page that did not change. */
+  async removeCredentialOrWhy(tenantId: string, agentId: string, alias: string): Promise<{ ok: true } | { ok: false; error: string }> {
     await this.ready();
     const mount = await this.store.getMountByAlias(tenantId, agentId, alias);
-    if (!mount || !isAgentRef(mount.secretRef)) return false;
+    if (!mount) return { ok: false, error: `no mount named ${alias}` };
+    if (!isAgentRef(mount.secretRef)) return { ok: false, error: `${alias} has no key of this agent's to remove` };
     // The key goes only once nothing it made is still held: after this, nothing could delete it.
-    if (await this.#releaseBeforeCredentialChange(tenantId, agentId, alias)) return false;
+    const held = await this.#releaseBeforeCredentialChange(tenantId, agentId, alias);
+    if (held) return { ok: false, error: held };
     await this.store.removeSecret(tenantId, agentId, alias);
     await this.store.setMountSecretRef(tenantId, agentId, alias, AgentRuntime.seededSecretRef(mount));
     await this.#toolsAfterCredentialChange(tenantId, agentId, alias);
-    return true;
+    return { ok: true };
   }
 
   /**

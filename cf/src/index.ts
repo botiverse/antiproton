@@ -1931,7 +1931,7 @@ export class AgentDO extends DurableObject<Env> {
 
   async uiRemoveCredential(tenantId: string, agentId: string, alias: string) {
     this.#claim(tenantId, agentId);
-    return this.#busy("uiRemoveCredential", () => this.runtime().removeCredential(tenantId, agentId, alias));
+    return this.#busy("uiRemoveCredential", () => this.runtime().removeCredentialOrWhy(tenantId, agentId, alias));
   }
 
   /** Hand a container back now. Refused while a job is running on that mount;
@@ -3477,7 +3477,7 @@ function provisionDeps(env: Env): ProvisionDeps {
         const r = await stub(tenantId, agentId).uiAttachCredential(tenantId, agentId, PROVISION_MOUNT_ALIAS, { token: credential });
         return r.ok ? { ok: true, account: r.account } : { ok: false, error: r.error };
       },
-      removeCredential: (tenantId, agentId) => stub(tenantId, agentId).uiRemoveCredential(tenantId, agentId, PROVISION_MOUNT_ALIAS),
+      removeCredential: async (tenantId, agentId) => (await stub(tenantId, agentId).uiRemoveCredential(tenantId, agentId, PROVISION_MOUNT_ALIAS)).ok,
       tool: (tenantId, agentId, name) => stub(tenantId, agentId).provisionTool(tenantId, agentId, name),
       pushStatus: (tenantId, agentId) => stub(tenantId, agentId).provisionPushStatus(tenantId, agentId),
     },
@@ -4296,8 +4296,12 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
           const form = await formOf(request);
           if (!form) return new Response("expected a form body", { status: 400 });
           const alias = String(form.get("alias") ?? "").trim();
-          if (alias) await stub.uiRemoveCredential(gate.tenantId, agentId, alias);
-          return html(mountFragment(await stub.uiPlugins(gate.tenantId, agentId), alias));
+          const r = alias ? await stub.uiRemoveCredential(gate.tenantId, agentId, alias) : { ok: false as const, error: "no mount named" };
+          const d: any = await stub.uiPlugins(gate.tenantId, agentId);
+          // A refusal is shown on the mount, as a refused attach is: a page that comes back unchanged reads as a
+          // remove that silently did nothing, and the reason (a machine that would not delete) is the news.
+          if (!r.ok) for (const m of d.mounts ?? []) if (m.alias === alias && m.credential) m.credential.refused = r.error;
+          return html(mountFragment(d, alias));
         }
         // The console's mount and kept-secret writes. Each answers the whole plugins panel, as
         // `/ui/plugin/choice` does: the page swaps it into `.plugins-root`, and one write can move

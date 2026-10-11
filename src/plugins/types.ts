@@ -1953,6 +1953,17 @@ export interface Plugin {
    */
   checkCredential?(ctx: PluginContext): Promise<CredentialCheck>;
   /**
+   * Which billing account `ctx.credential` acts on, as an identifier two credentials can be compared by: two keys
+   * of one account answer the same, keys of different accounts never do. Null when that cannot be said for
+   * certain. Operator-only like `checkCredential`; compared and dropped, never stored or shown.
+   *
+   * What it decides: whether what a mount holds survives a change of key (cf/src/runtime.ts
+   * `#releaseBeforeCredentialChange`). A thing on the account the new key also acts on stays reachable, so it is
+   * kept; anything else is released under the old key first. So a wrong "same" leaks a billed thing nothing can
+   * delete, and a plugin answers null rather than guess.
+   */
+  credentialAccount?(ctx: PluginContext): Promise<string | null>;
+  /**
    * Do the thing. Returning {@link Backgrounded} means it has started and the
    * caller should be given a job rather than a result; returning
    * {@link Interrupt} means the model must decide before it goes on — every

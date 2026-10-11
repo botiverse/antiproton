@@ -13,6 +13,7 @@ import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { AgentRuntime, OPERATOR_RUN9_REF } from "../cf/src/runtime.ts";
 import { agentRef } from "../src/runtime/secrets.ts";
 import type { Plugin } from "../src/plugins/types.ts";
+import { recordBackgroundJob } from "../src/runtime/background-jobs.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void>) {
@@ -52,7 +53,7 @@ async function runtime(secretRef: string | null, at = { alias: "m", plugin: "key
   if (secretRef && secretRef.startsWith(agentRef(""))) await store.putSecret("t", "a", at.alias, { ciphertext: "c", iv: "v" });
   const ref = async () => (await store.getMountByAlias("t", "a", at.alias))?.secretRef ?? null;
   const meta = async () => rt.credentialMeta("t", "a", (await store.getMountByAlias("t", "a", at.alias))!);
-  return { store, rt, ref, meta, alias: at.alias };
+  return { store, rt, ref, meta, host, alias: at.alias };
 }
 
 await check("attaching a key to a mount that uses the operator's account is refused, and the reference is untouched", async () => {
@@ -146,7 +147,12 @@ await check("a shared account the catalogue does not name is still refused, even
  * and records which account each request came with. No request leaves the process. `deleteStatus` is what run9
  * says to the box's deletion.
  */
-async function heldSandbox(deleteStatus = 200) {
+async function heldSandbox(deleteStatus: number | (() => number) = 200, opts: {
+  /** run9's `/whoami` organisation for each access key; a key not named answers 401. */
+  orgs?: Record<string, string>;
+  /** Access keys whose credential check run9 refuses. */
+  rejects?: string[];
+} = {}) {
   const OPS = { ak: "ops-ak", sk: "ops-sk" };
   const w = await runtime(OPERATOR_RUN9_REF, SANDBOX, { operatorRun9: OPS });
   w.store.pluginDb.put({ tenantId: "t", agentId: "a", alias: "sandbox", plugin: "sandbox" }, "box", "state",
@@ -158,13 +164,36 @@ async function heldSandbox(deleteStatus = 200) {
     const method = String(init?.method ?? "GET");
     const path = new URL(String(url)).pathname;
     calls.push({ method, path, who: accountOf(String(init?.headers?.authorization ?? "")), refAtCall: await w.ref() });
-    if (method === "DELETE") return new Response(deleteStatus === 200 ? "{}" : "{\"error\":\"no\"}", { status: deleteStatus });
+    const who = accountOf(String(init?.headers?.authorization ?? ""));
+    if (method === "DELETE") {
+      const status = typeof deleteStatus === "function" ? deleteStatus() : deleteStatus;
+      return new Response(status === 200 ? "{}" : "{\"error\":\"no\"}", { status });
+    }
+    if (path === "/whoami") {
+      const org = opts.orgs?.[who];
+      return org ? new Response(JSON.stringify({ auth_kind: "api_key", org: { org_id: org } })) : new Response("{\"error\":\"invalid api key\"}", { status: 401 });
+    }
     // The credential check asks for a box that never exists: reached and authorised.
-    if (path.endsWith("/b_credential_check_only")) return new Response("{\"error\":\"box not found\"}", { status: 400 });
+    if (path.endsWith("/b_credential_check_only")) {
+      return opts.rejects?.includes(who)
+        ? new Response("{\"error\":\"invalid api key\"}", { status: 401 })
+        : new Response("{\"error\":\"box not found\"}", { status: 400 });
+    }
     return new Response("{}");
   }) as any;
   const box = () => (w.store.pluginDb.get({ tenantId: "t", agentId: "a", alias: "sandbox", plugin: "sandbox" }, "box", "state") as any)?.machines?.main?.boxId;
-  return { ...w, calls, box, restore: () => { globalThis.fetch = real; } };
+  const deletes = () => calls.filter((c) => c.method === "DELETE");
+  /** The mount holding one box, made under `kind`. */
+  const holds = (id: string, kind: string) => w.store.pluginDb.put({ tenantId: "t", agentId: "a", alias: "sandbox", plugin: "sandbox" }, "box", "state",
+    { machines: { main: { boxId: id, createdAt: 1, lastUsedAt: 1, credentialRef: kind } } }, null);
+  /** The tenant's key on the mount with nothing held, then a box made with it. */
+  const ownKeyHolding = async (id: string) => {
+    w.store.pluginDb.put({ tenantId: "t", agentId: "a", alias: "sandbox", plugin: "sandbox" }, "box", "state", { machines: {} }, null);
+    must((await w.rt.attachCredential("t", "a", "sandbox", { ak: "own-ak", sk: "own-sk" })).ok, "attach");
+    holds(id, "agent");
+    calls.length = 0;
+  };
+  return { ...w, calls, box, deletes, holds, ownKeyHolding, restore: () => { globalThis.fetch = real; } };
 }
 
 await check("a key of the tenant's own over the operator's: the operator's box is deleted first, with the operator's key", async () => {
@@ -187,7 +216,8 @@ await check("when run9 will not delete the operator's box, the key does not go o
     const r = await w.rt.attachCredential("t", "a", "sandbox", { ak: "own-ak", sk: "own-sk" });
     must(!r.ok && /not changed/.test(r.error) && /b-ops/.test(r.error), `the attach went ahead: ${JSON.stringify(r)}`);
     must((await w.ref()) === OPERATOR_RUN9_REF, `the mount moved to ${await w.ref()}`);
-    must(!w.calls.some((c) => c.who === "own-ak"), `the tenant's key was used: ${JSON.stringify(w.calls)}`);
+    // The tenant's key is only asked about (the check, before anything is released); it never touches the box.
+    must(!w.calls.some((c) => c.who === "own-ak" && c.method !== "GET"), `the tenant's key was used: ${JSON.stringify(w.calls)}`);
   } finally { w.restore(); }
 });
 
@@ -211,6 +241,97 @@ await check("removing the tenant's key deletes the box it made first, with that 
       }
     } finally { w.restore(); }
   }
+});
+
+await check("a key run9 rejects changes nothing: no box is deleted, the record and the mount stay as they were", async () => {
+  const w = await heldSandbox(200, { rejects: ["typo-ak"] });
+  try {
+    const r = await w.rt.attachCredential("t", "a", "sandbox", { ak: "typo-ak", sk: "x" });
+    must(!r.ok && /rejected/.test(r.error), `the rejected key was taken: ${JSON.stringify(r)}`);
+    must(w.deletes().length === 0 && !w.calls.some((c) => c.path.endsWith("/stop")), `a box was released for a rejected key: ${JSON.stringify(w.calls)}`);
+    must(w.box() === "b-ops", `the record lost its box: ${w.box()}`);
+    must((await w.ref()) === OPERATOR_RUN9_REF, `the mount moved to ${await w.ref()}`);
+  } finally { w.restore(); }
+  // Over a key of the tenant's own: that key, the only one that can delete its box, stays.
+  const v = await heldSandbox(200, { rejects: ["typo-ak"] });
+  try {
+    await v.ownKeyHolding("b-own");
+    const r = await v.rt.attachCredential("t", "a", "sandbox", { ak: "typo-ak", sk: "x" });
+    must(!r.ok && v.deletes().length === 0 && v.box() === "b-own", `released or forgotten: ${JSON.stringify(v.calls)}`);
+    must((await v.ref()) === agentRef("sandbox") && (await v.store.getSecret("t", "a", "sandbox")), "the tenant's key was dropped");
+    must((await v.rt.removeCredential("t", "a", "sandbox")) && v.deletes().some((c) => c.who === "own-ak"), "the kept key could not delete its box");
+  } finally { v.restore(); }
+});
+
+await check("a delete run9 keeps refusing keeps refusing the change, every time, until it succeeds", async () => {
+  let status = 500;
+  const w = await heldSandbox(() => status);
+  try {
+    for (const n of [1, 2]) {
+      const r = await w.rt.attachCredential("t", "a", "sandbox", { ak: "own-ak", sk: "own-sk" });
+      must(!r.ok && /not changed/.test(r.error), `attach ${n} went ahead: ${JSON.stringify(r)}`);
+      must(w.box() === "b-ops", `attach ${n}: the record let go of a box run9 did not delete`);
+      must((await w.ref()) === OPERATOR_RUN9_REF, `attach ${n}: the mount moved to ${await w.ref()}`);
+    }
+    must(w.deletes().length === 2 && w.deletes().every((c) => c.who === "ops-ak"), `deletes: ${JSON.stringify(w.deletes())}`);
+    status = 200;
+    const r = await w.rt.attachCredential("t", "a", "sandbox", { ak: "own-ak", sk: "own-sk" });
+    must(r.ok && !w.box() && (await w.ref()) === agentRef("sandbox"), `the attach after the delete: ${JSON.stringify(r)}`);
+  } finally { w.restore(); }
+});
+
+await check("a new key on the same run9 account deletes nothing: the box stays and the key goes on", async () => {
+  const w = await heldSandbox(200, { orgs: { "own-ak": "org-1", "own2-ak": "org-1", "ops-ak": "org-ops" } });
+  try {
+    await w.ownKeyHolding("b-own");
+    const r = await w.rt.attachCredential("t", "a", "sandbox", { ak: "own2-ak", sk: "own2-sk" });
+    must(r.ok, `refused: ${JSON.stringify(r)}`);
+    must(w.deletes().length === 0 && w.box() === "b-own", `the box was released: ${JSON.stringify(w.calls)}`);
+    must((await w.ref()) === agentRef("sandbox"), "the key did not go on");
+    // A key of another account: the box goes first, with the key that made it.
+    const s = await w.rt.attachCredential("t", "a", "sandbox", { ak: "ops-ak", sk: "ops-sk" });
+    must(s.ok && w.deletes().length === 1 && !w.box(), `another account's key kept the box: ${JSON.stringify(w.calls)}`);
+  } finally { w.restore(); }
+});
+
+await check("an account that cannot be told is not the same one: the box is released", async () => {
+  // own-ak answers /whoami, the new key does not.
+  const w = await heldSandbox(200, { orgs: { "own-ak": "org-1" } });
+  try {
+    await w.ownKeyHolding("b-own");
+    const r = await w.rt.attachCredential("t", "a", "sandbox", { ak: "own2-ak", sk: "own2-sk" });
+    must(r.ok && w.deletes().length === 1 && w.deletes()[0]!.who === "own-ak", `not released: ${JSON.stringify(w.calls)}`);
+  } finally { w.restore(); }
+  // Same organisation, but the box was made under another kind of credential than the mount's now.
+  const v = await heldSandbox(200, { orgs: { "own-ak": "org-1", "own2-ak": "org-1" } });
+  try {
+    await v.ownKeyHolding("b-legacy");
+    v.holds("b-legacy", "operator");
+    const r = await v.rt.attachCredential("t", "a", "sandbox", { ak: "own2-ak", sk: "own2-sk" });
+    must(r.ok && v.deletes().length === 1, `a box made under another credential was kept: ${JSON.stringify(v.calls)}`);
+  } finally { v.restore(); }
+});
+
+await check("a running background job refuses the change, with nothing deleted and the mount unchanged (S2)", async () => {
+  const w = await heldSandbox();
+  try {
+    recordBackgroundJob(w.host.sql, { tenantId: "t", agentId: "a" }, { id: "j1", session: "s", mount: "sandbox", tool: "shell", handle: null });
+    const r = await w.rt.attachCredential("t", "a", "sandbox", { ak: "own-ak", sk: "own-sk" });
+    must(!r.ok && /background job/.test(r.error) && /not changed/.test(r.error), `the attach went ahead: ${JSON.stringify(r)}`);
+    must(w.deletes().length === 0 && w.box() === "b-ops" && (await w.ref()) === OPERATOR_RUN9_REF, `changed: ${JSON.stringify(w.calls)}`);
+  } finally { w.restore(); }
+});
+
+await check("a refused remove says why", async () => {
+  const w = await heldSandbox(500);
+  try {
+    await w.ownKeyHolding("b-own");
+    const r = await w.rt.removeCredentialOrWhy("t", "a", "sandbox");
+    must(!r.ok && /b-own/.test(r.error) && /not changed/.test(r.error), `no reason: ${JSON.stringify(r)}`);
+    must(w.box() === "b-own" && (await w.ref()) === agentRef("sandbox"), "the remove went ahead");
+    const none = await w.rt.removeCredentialOrWhy("t", "a", "nope");
+    must(!none.ok && /no mount named nope/.test(none.error), `a missing mount: ${JSON.stringify(none)}`);
+  } finally { w.restore(); }
 });
 
 for (const r of results) {

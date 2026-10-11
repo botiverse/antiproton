@@ -346,6 +346,85 @@ await check("a box records the kind of credential that created it, and keeps it 
   must(!("credentialRef" in g.mount().machines.main!), `a kind nobody reported: ${JSON.stringify(g.raw())}`);
 });
 
+await check("a box run9 would not delete stays recorded, so every later release tries it again until one succeeds (#818)", async () => {
+  let refuse = 2;
+  const f = fixture({ machines: { main: box("b1", { credentialRef: "operator" }) } }, {},
+    (c) => c.method === "DELETE" && c.path.endsWith("/boxes/b1") && refuse-- > 0);
+  f.ctx.credentialRefKind = "operator";
+  // The agent's release, then an operator's (no id, no reason): both refused, the box still named after each.
+  const r: any = await f.plugin.invoke("release", {}, f.ctx);
+  must(r.released === false && r.box === "b1" && /500/.test(r.error), `the agent's release: ${JSON.stringify(r)}`);
+  must(f.mount().machines.main?.boxId === "b1", `forgotten after the first refusal: ${JSON.stringify(f.raw())}`);
+  let thrown: any = null;
+  try { await f.plugin.holds!.release(f.ctx); } catch (e) { thrown = e; }
+  must(thrown && /b1 not released/.test(String(thrown.message)), `the second refusal was not reported: ${thrown}`);
+  must(f.mount().machines.main?.boxId === "b1", `forgotten after the second refusal: ${JSON.stringify(f.raw())}`);
+  must(!f.raw().sessions?.length, `a session recorded for a box still alive: ${JSON.stringify(f.raw().sessions)}`);
+  const [act] = await f.plugin.holds!.activities!(f.ctx);
+  must(act?.live?.id === "b1", `not reported as held: ${JSON.stringify(act)}`);
+  // run9 deletes it now: the record lets go, and the session is the box's.
+  const done = await f.plugin.holds!.release(f.ctx) as Released;
+  must(done && done.status === "freed" && !f.mount().machines.main, `not let go once deleted: ${JSON.stringify(f.raw())}`);
+  must(f.deletes("b1").length === 3, `deletes sent: ${f.deletes("b1").length}`);
+  must(usageOf(asBoxState(f.raw())).map((u) => u.id).join() === "b1", `the session: ${JSON.stringify(f.raw().sessions)}`);
+});
+
+await check("an idle deletion run9 refuses keeps the switched-off box recorded", async () => {
+  const f = fixture({ machines: { main: box("b1", { parkedAt: T0 + 2 * MIN }) } }, {}, (c) => c.method === "DELETE");
+  let thrown: any = null;
+  try { await f.plugin.holds!.release(f.ctx, { reason: "idle", id: "b1" }); } catch (e) { thrown = e; }
+  must(thrown && /b1 not released/.test(String(thrown.message)), `not reported: ${thrown}`);
+  must(f.mount().machines.main?.boxId === "b1" && typeof f.mount().machines.main?.parkedAt === "number",
+    `the switched-off box was forgotten or changed: ${JSON.stringify(f.raw())}`);
+});
+
+await check("start_from refuses while the old box will not delete, and the old box stays the machine", async () => {
+  const f = fixture({ machines: { main: box("b1") }, envs: [{ name: "e", snapId: "s1", savedAt: 1 }] }, {}, (c) => c.method === "DELETE");
+  let thrown: any = null;
+  try { await f.plugin.invoke("start_from", { name: "e" }, f.ctx); } catch (e) { thrown = e; }
+  must(thrown && /b1 not released/.test(String(thrown.message)) && thrown.released, `not refused with its fact: ${thrown}`);
+  must(f.mount().machines.main?.boxId === "b1" && !f.mount().machines.main?.startFrom, `record: ${JSON.stringify(f.raw())}`);
+});
+
+await check("run9's \"box not found\" is gone only when the key is the kind that made the box", async () => {
+  const gone = (c: Call) => c.method === "DELETE";
+  const notFound = async (made: string | undefined, now: string) => {
+    const f = fixture({ machines: { main: box("b1", made ? { credentialRef: made } : {}) } });
+    f.ctx.credentialRefKind = now;
+    const real = globalThis.fetch;
+    globalThis.fetch = (async (url: string, init?: any) => gone({ method: String(init?.method ?? "GET"), path: String(url) })
+      ? new Response(JSON.stringify({ error: "box not found" }), { status: 400 }) : real(url, init)) as any;
+    const r: any = await f.plugin.invoke("release", {}, f.ctx);
+    return { released: r.released, held: !!f.mount().machines.main?.boxId };
+  };
+  const same = await notFound("agent", "agent");
+  must(same.released === true && !same.held, `the maker's "not found" kept it: ${JSON.stringify(same)}`);
+  const legacy = await notFound(undefined, "agent");
+  must(legacy.released === true && !legacy.held, `a box recorded before the field: ${JSON.stringify(legacy)}`);
+  const other = await notFound("operator", "agent");
+  must(other.released === false && other.held, `another account's "not found" let it go: ${JSON.stringify(other)}`);
+});
+
+await check("using a switched-off box again keeps the kind of credential it was made under (S3)", async () => {
+  const f = fixture({ machines: { main: box("b1", { parkedAt: T0 + 2 * MIN, credentialRef: "operator" }) } });
+  f.ctx.credentialRefKind = "agent";
+  await f.plugin.invoke("shell", { command: "ls" }, f.ctx);
+  must(f.creates().length === 0, "a new box was made");
+  const m = f.mount().machines.main!;
+  must(m.boxId === "b1" && m.parkedAt === undefined, `not running again: ${JSON.stringify(f.raw())}`);
+  must(m.credentialRef === "operator", `the unparked box now says ${m.credentialRef}`);
+  const [act] = await f.plugin.holds!.activities!(f.ctx);
+  must(act?.live?.credentialRef === "operator", `activity says ${act?.live?.credentialRef}`);
+});
+
+await check("a session recorded with a kind this build does not know is kept, read as one recorded before the field", async () => {
+  const s = { boxId: "b-old", startedAt: T0, endedAt: T0 + MIN, lastUsedAt: T0, execs: 1, saved: [], credentialRef: "a-later-kind" };
+  const known = { ...s, boxId: "b-ops", credentialRef: "operator" };
+  const used = usageOf(asBoxState({ boxId: "", createdAt: 0, lastUsedAt: 0, sessions: [s, known] } as any));
+  must(used.map((u) => u.id).join() === "b-old,b-ops", `a session was dropped: ${JSON.stringify(used)}`);
+  must(!("credentialRef" in used[0]!) && used[1]!.credentialRef === "operator", `kinds: ${JSON.stringify(used)}`);
+});
+
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.error ? `\n    ${r.error}` : ""}`);
 const failed = results.filter((r) => !r.ok).length;
 console.log(`${results.length - failed}/${results.length} passed`);

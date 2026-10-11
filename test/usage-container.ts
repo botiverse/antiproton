@@ -5,7 +5,7 @@
  * must not be charged twice), a box that ends between two passes (its tail is
  * the part after the watermark), and the hour a long-lived box crosses.
  */
-import { boxesOf, countHeldTime, heldRows, heldUnreadableRows, type HeldMark } from "../src/usage/container.ts";
+import { boxesOf, boxIsOwn, countHeldTime, heldReports, heldRows, heldUnreadableRows, type HeldMark } from "../src/usage/container.ts";
 import { pendingUsage, HOUR_MS } from "../src/usage/outbox.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { activityOf, sessionOf, usageOf } from "../src/plugins/sandbox.ts";
@@ -193,6 +193,18 @@ check("the plugin carries the creating credential through every shape it reports
   eq(usageOf({ ...box, sessions: [sessionOf(box, H0 + 1)] })[0]?.credentialRef, "operator", "and the usage it is counted from");
   eq(boxesOf({ activity: activityOf(box) })[0]?.credentialRef, "operator", "which the counter reads");
   eq("credentialRef" in (activityOf({ ...box, credentialRef: "nonsense" } as any).live ?? {}), false, "a value that is not a kind is not passed on");
+});
+
+check("a box made under an environment reference is ours, never the tenant's own, whatever the mount holds now (S7)", () => {
+  // An environment reference is the deployment's configuration, so its account is the deployment's: the same
+  // label as the operator's reference, "sandbox", and never "own:sandbox", which would price it 0 to the tenant.
+  const host = sqliteHost();
+  const box = { boxId: "b-env", createdAt: H0, lastUsedAt: H0, credentialRef: "env" as const };
+  pass(host, { activity: activityOf(box), usage: [] }, true, H0 + 60_000);
+  eq(keysOf(host), ["sandbox"], "an env box under a mount that now holds the tenant's key");
+  eq(boxIsOwn({ credentialRef: "env" }, true), false, "the judgement itself");
+  // And the mount-level fallback agrees: an env reference on the mount is not the tenant's (`heldReports`).
+  eq(heldReports([{ alias: "sandbox", plugin: "sandbox", secretRef: "env:RUN9_KEYS" }], { sandbox: {} }).sandbox?.own, false, "the mount's own mark");
 });
 
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.error ? `\n    ${r.error}` : ""}`);

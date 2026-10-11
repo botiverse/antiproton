@@ -123,7 +123,10 @@ interface Session {
   saved: string[];
   /** Which of the mount's machines it was, when not the default one ("main"). */
   machine?: string;
-  /** The kind of credential the box was created under, as on `BoxState`; absent for one recorded before. */
+  /**
+   * The kind of credential the box was created under, as on `BoxState`; absent for one recorded before. Read only
+   * through `createdUnder`, since a stored record may carry a kind this build does not know (`isSession`).
+   */
   credentialRef?: CredentialRefKind;
 }
 
@@ -725,8 +728,10 @@ function isSession(v: unknown): v is Session {
     && typeof s.endedAt === "number" && typeof s.lastUsedAt === "number"
     && typeof s.execs === "number"
     && Array.isArray(s.saved) && s.saved.every((x) => typeof x === "string")
-    && (s.machine === undefined || typeof s.machine === "string")
-    && (s.credentialRef === undefined || refKindOf(s.credentialRef) !== undefined);
+    && (s.machine === undefined || typeof s.machine === "string");
+  // `credentialRef` is not judged here: a kind this build does not know (one a later build added) costs the session
+  // nothing but that field, which every reader takes through `createdUnder` and reads as absent — a session from
+  // before the field existed. Refusing the whole session over it would drop time that was really spent.
 }
 
 const REF_KINDS: readonly CredentialRefKind[] = ["none", "agent", "operator", "env", "other"];
@@ -852,13 +857,34 @@ async function stopBox(
       signal: AbortSignal.timeout(20_000) }).catch(() => {});
     const res = await fetch(base, { method: "DELETE", headers: { authorization: auth },
       signal: AbortSignal.timeout(30_000) });
-    if (!res.ok) error = `delete returned ${res.status}: ${(await res.text()).slice(0, 120)}`;
+    if (!res.ok) {
+      const said = (await res.text()).slice(0, 120);
+      // Already gone is what a delete is for: run9 answers a box it does not have with 400 "box not found"
+      // (measured for the credential check, `checkCredential`), and a 404 says the same. Believed only from the
+      // kind of key that made the box: a key of another account is not shown the box, so its "not found" says
+      // nothing about whether the box is there.
+      const gone = res.status === 404 || /box not found/i.test(said);
+      const maker = state.credentialRef === undefined || state.credentialRef === ctx.credentialRefKind;
+      if (!(gone && maker)) error = `delete returned ${res.status}: ${said}`;
+    }
   } catch (e) {
     error = String((e as Error)?.message ?? e).slice(0, 160);
   }
-  // The box record goes either way — keeping a pointer to one we failed to
-  // delete only means the next call tries to reuse something that may not be
-  // there — but the session survives it. A container is the one thing here
+  const endedAt = Date.now();
+  const stoppedAt = parkedAt(state);
+  const session = sessionOf(state, stoppedAt ?? endedAt, machine);
+  // A box run9 would not delete is still there, still billed, and still reachable by the key that made it — so
+  // the record keeps naming it, and every later release (the agent's, the idle pass's, an operator's, the one a
+  // change of key makes first) tries again and is refused again until the delete succeeds. Forgetting it here
+  // made the refusal hold once: the next attempt found nothing held and let the key change, and the box was
+  // never reachable again (#818). Its session is not recorded either: it has not ended.
+  if (error) {
+    return {
+      boxId: state.boxId, freed: false, error, liveMs: session.endedAt - session.startedAt,
+      lease: { id: state.boxId, startedAt: stoppedAt ?? session.startedAt, endedAt, status: "error", error },
+    };
+  }
+  // The record goes once the box has, but the session survives it. A container is the one thing here
   // billed for merely existing, so how long it lived outlives the box.
   //
   // Built from the state this call read, not from whatever the record says now:
@@ -869,9 +895,6 @@ async function stopBox(
   // A box switched off for being idle already recorded its compute session
   // when it was switched off (parkBox), so deleting it adds none: a second
   // one from `createdAt` would count the days it sat stopped as compute.
-  const endedAt = Date.now();
-  const stoppedAt = parkedAt(state);
-  const session = sessionOf(state, stoppedAt ?? endedAt, machine);
   // Read again before overwriting. `releaseTask` does not take the per-mount
   // lock that `invoke` takes, so an operator release or the idle sweep can
   // interleave with a command on this mount: the command finds no container,
@@ -904,11 +927,8 @@ async function stopBox(
   // span was reported when it was switched off, and this release ended the
   // rest of its life, the disk.
   return {
-    boxId: state.boxId, freed: !error, error, liveMs: session.endedAt - session.startedAt,
-    lease: {
-      id: state.boxId, startedAt: stoppedAt ?? session.startedAt, endedAt,
-      status: error ? "error" : "freed", ...(error ? { error } : {}),
-    },
+    boxId: state.boxId, freed: true, liveMs: session.endedAt - session.startedAt,
+    lease: { id: state.boxId, startedAt: stoppedAt ?? session.startedAt, endedAt, status: "freed" },
   };
 }
 
@@ -2223,6 +2243,29 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     }
   },
 
+  /**
+   * The run9 organisation these keys act on, by run9's `GET /whoami` (`org.org_id`), with the project the mount
+   * names: a box lives in a project of an organisation, and keys of the same organisation reach the same project.
+   * The access key is not it — each key of one account has its own.
+   *
+   * Null for an endpoint that is not run9 itself (`verifyWith: "endpoint"`): what a service in front answers for
+   * `/whoami` is its own business, and could be one identity for every tenant — a "same" that is not.
+   */
+  async credentialAccount(ctx) {
+    if (!ctx.credential) return null;
+    const cfg = cfgOf(ctx);
+    if (cfg.verifyWith === "endpoint") return null;
+    let cred: Run9Credential;
+    try { cred = JSON.parse(ctx.credential) as Run9Credential; } catch { return null; }
+    if (!cred.ak || !cred.sk) return null;
+    const res = await fetch(`${cfg.endpoint}/whoami`, {
+      headers: { authorization: "Basic " + btoa(`${cred.ak}:${cred.sk}`) },
+      signal: AbortSignal.timeout(cfg.timeoutMs),
+    });
+    if (!res.ok) return null;
+    const org = (await res.json().catch(() => null) as { org?: { org_id?: unknown } } | null)?.org?.org_id;
+    return typeof org === "string" && org ? `${org}/${cfg.project}` : null;
+  },
 
 
   async invoke(tool: string, args: Json, ctx: PluginContext): Promise<Json> {
@@ -2264,6 +2307,11 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       // Releasing first, because the choice applies to the next container and
       // silently leaving the old one running is how a machine gets forgotten.
       const released = prior.boxId ? await stopBox(ctx, machine) : null;
+      // Not deleted, the old container is still the machine (`stopBox` keeps naming it), so the choice would not
+      // apply to anything: refused, with the release fact the recorder needs for a box still billing.
+      if (released && !released.freed) {
+        throw markReleased(new Error(`run9 box ${released.boxId} not released, so ${env.name} was not chosen: ${released.error ?? "unknown"}`), released.lease);
+      }
       const after = await readView(ctx, machine);
       await writeView(ctx, machine, { ...after, startFrom: env.snapId });
       return {

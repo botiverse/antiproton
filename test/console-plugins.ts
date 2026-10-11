@@ -176,6 +176,41 @@ check("your own key where the catalogue names nothing: remove is a plain remove"
   must(!/go back to the shared key/.test(html), "a revert is not offered where nothing is named");
 });
 
+check("a sandbox's attach, replace and remove each warn that its machines are deleted first; other mounts' do not (#818)", () => {
+  const flat = (h: string) => h.replace(/\n/g, " ").replace(/&#39;/g, "'");
+  const deleted = /machines, running and switched off, are deleted first, with every file not saved or kept; kept environments survive\./;
+  const fresh = flat(render(mount("sandbox", "sandbox", { credential: { attached: false } })));
+  const operator = flat(render(mount("sandbox", "sandbox", { connected: true, credential: { attached: true, operator: true } })));
+  const own = flat(render(mount("sandbox", "sandbox", { connected: true,
+    credential: { attached: true, verified: true, account: "default", revertsTo: "operator" } })));
+  for (const [name, html] of [["attach", fresh], ["use your own key", operator], ["replace", own]] as const) {
+    must(deleted.test(html) && /Unless the new key is on the same run9 account, sandbox's machines/.test(html), `${name}: no warning, or no same-account exception`);
+  }
+  const confirm = own.match(/hx-confirm="([^"]*)"/)?.[1] ?? "";
+  must(/^Return sandbox to the deployment's shared account\?/.test(confirm) && deleted.test(confirm) && !/Unless/.test(confirm),
+    `the remove confirm does not warn, or offers an exception a remove never has: ${confirm}`);
+  const gh = flat(render(mount("gh", "github", { connected: true, credential: { attached: true, verified: true, revertsTo: "none" } })));
+  must(!/deleted first/.test(gh), "a mount that holds no machines warns of deleting them");
+});
+
+check("a refused remove shows why on the mount, escaped, and outside the folded replace", () => {
+  const hostile = `sandbox still holds <b>b-1</b>, so the credential was not changed: delete returned 500`;
+  const html = render(mount("sandbox", "sandbox", { connected: true,
+    credential: { attached: true, verified: true, account: "default", revertsTo: "operator", refused: hostile } }));
+  const at = html.indexOf("&lt;b&gt;b-1&lt;/b&gt;");
+  must(at > 0 && !html.includes(hostile), "the reason must show, escaped");
+  must(/<div class="err">sandbox still holds/.test(html), "shown as an error");
+  must(at < html.indexOf("<summary>replace</summary>"), "hidden inside the replace fold");
+  const quiet = render(mount("sandbox", "sandbox", { connected: true, credential: { attached: true, verified: true, revertsTo: "operator" } }));
+  must(!/class="err"/.test(quiet), "an error shown with no refusal");
+});
+
+check("a refused replace on a verified key opens the replace fold, so its reason is seen", () => {
+  const html = render(mount("sandbox", "sandbox", { connected: true,
+    credential: { attached: true, verified: true, account: "default", revertsTo: "operator", error: "run9 rejected these keys" } }));
+  must(/<details open><summary>replace<\/summary>/.test(html) && /run9 rejected these keys/.test(html), "the reason is folded away");
+});
+
 check("the three states are disjoint: one block renders exactly one set of controls", () => {
   // Derived from operator and revertsTo, disjoint by the operator flag: if
   // state two were read from revertsTo alone, the override and the revert

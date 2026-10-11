@@ -1472,23 +1472,14 @@ export class ToolGateway {
    * Never a tool, so the model cannot ask; the value still never leaves the
    * plugin's call context.
    */
-  async checkMount(tenantId: string, agentId: string, alias: string):
+  async checkMount(tenantId: string, agentId: string, alias: string, candidate?: string):
     Promise<{ ok: true; account?: string } | { ok: false; kind: "rejected" | "unreachable"; reason: string } | null> {
     const mount = await this.#store.getMountByAlias(tenantId, agentId, alias);
     if (!mount) return null;
     const plugin = this.#plugins.get(mount.plugin);
     if (!plugin?.checkCredential) return null;
-    const credential = mount.secretRef
-      ? await this.#secrets.resolve(mount.secretRef, { tenantId, agentId }) : null;
     try {
-      return await plugin.checkCredential({
-        caller: { tenantId, agentId, taskId: "credential-check" },
-        alias,
-        credential, publicConfig: mount.publicConfig, db: this.#db({ tenantId, agentId }, mount),
-        async sibling() { return null; },
-        async sandboxForms() { return []; },
-        async agentSecret() { return null; },
-      });
+      return await plugin.checkCredential(await this.#credentialContext(tenantId, agentId, mount, candidate));
     } catch (e) {
       // A check that threw gave no verdict on the key: the provider was not
       // reached, or the plugin failed before asking it. Either way it is not
@@ -1496,6 +1487,42 @@ export class ToolGateway {
       // refusing it. Said explicitly, since the route reads `kind`.
       return { ok: false, kind: "unreachable", reason: String((e as Error).message ?? e).slice(0, 200) };
     }
+  }
+
+  /**
+   * Operator-only: which billing account a credential acts on (`Plugin.credentialAccount`) — the mount's own, or
+   * `candidate`, a value not stored anywhere yet. Null whenever that cannot be said for certain: no such hook, no
+   * credential, a failed call. Only ever compared, never stored or shown.
+   */
+  async mountCredentialAccount(tenantId: string, agentId: string, alias: string, candidate?: string): Promise<string | null> {
+    const mount = await this.#store.getMountByAlias(tenantId, agentId, alias);
+    if (!mount) return null;
+    const plugin = this.#plugins.get(mount.plugin);
+    if (!plugin?.credentialAccount) return null;
+    try {
+      const id = await plugin.credentialAccount(await this.#credentialContext(tenantId, agentId, mount, candidate));
+      return typeof id === "string" && id ? id : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * The context a credential is judged in: the one a call would get, minus a task. `candidate` stands in for the
+   * mount's stored credential, so a value can be judged before anything is written — and before anything that
+   * depends on the stored one, like releasing what it made, has happened.
+   */
+  async #credentialContext(tenantId: string, agentId: string, mount: MountRecord, candidate?: string): Promise<PluginContext> {
+    const credential = candidate !== undefined ? candidate
+      : mount.secretRef ? await this.#secrets.resolve(mount.secretRef, { tenantId, agentId }) : null;
+    return {
+      caller: { tenantId, agentId, taskId: "credential-check" },
+      alias: mount.alias,
+      credential, publicConfig: mount.publicConfig, db: this.#db({ tenantId, agentId }, mount),
+      async sibling() { return null; },
+      async sandboxForms() { return []; },
+      async agentSecret() { return null; },
+    };
   }
 }
 
