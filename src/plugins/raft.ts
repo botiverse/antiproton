@@ -556,20 +556,25 @@ function integer(value: unknown, name: string, min: number, max: number): number
  * real operation — so an operation a new SDK adds turns that test red until someone decides which side it
  * belongs on.
  *
- * The manifest carries no channel or server administration (creating, updating or archiving a channel, adding
- * or removing its members, updating the server): those are Agent API routes reachable only through the SDK's
- * raw `routes`, and none of them is called here. The routes this file does call are reads with no operation behind
- * them: the credential context the listing reads (`routes.agent.context`) and a personal assistant's two owner
+ * Since SDK 0.14.0 the manifest carries channel and server administration as operations (creating, updating,
+ * archiving and unarchiving a channel, adding and removing its members, updating the server), so they are generated
+ * like the rest, as are SDK 0.15.0's Labs (`labs.list`, `labs.setAccess`, `labs.setEnrollment`). `server.update` and
+ * the two Labs writes need the `server` capability, so a credential without it is not offered them (`snapshotTools`). The routes this file calls directly, outside any operation, are reads: the credential context the listing reads (`routes.agent.context`) and a personal assistant's two owner
  * reads (`routes.assistant.*`, `RAFT_ASSISTANT_WIRE`); Agent Login's `routes.integrations.list` and
- * `login` are in raft-agent-login.ts. A hosted agent proposes the administration with `actions_prepare`, for a person to confirm.
+ * `login` are in raft-agent-login.ts.
+ *
+ * The rule for what is left out: a hosted agent is offered every operation an agent inside Raft has (its CLI's
+ * `raft mention add`, `raft profile update`, `raft task delete` among them). The Raft Server checks the agent's
+ * permission on every call, so a call its role does not allow is refused there, not here. An entry here is for an
+ * operation this mount does in another way (the three inbox operations, which `receive_events` replaces), never for
+ * one an agent "should not" do. `actions_prepare` stays for what the agent's role does not allow it to do itself
+ * (a channel:create or channel:add_member card, which a person whose role allows it carries out), and for a proposal
+ * a person should confirm.
  */
 export const EXCLUDED: Readonly<Record<string, string>> = {
   "inbox.check": "the inbox is read with receive_events, which commits what it showed and pulls the next in one call; a second reader would move the same cursor",
   "inbox.drain": "pulls until the inbox is empty and hands it all over in one result, with no bound; receive_events pages the same inbox",
   "inbox.commit": "receive_events commits only the messages it showed, which its next pull acknowledges; a separate commit could acknowledge a batch before the model has read it",
-  "mentions.add": "it changes a conversation's membership; membership changes go through an action card a person confirms (actions_prepare)",
-  "profile.update": "changes the account's public identity (display name, description, avatar); identity changes go through an action card a person confirms",
-  "tasks.delete": "destructive, and new: agents could not delete tasks before; offered when someone asks for it",
 };
 
 /**
@@ -669,7 +674,9 @@ const ARGUMENT_CHECKS: Readonly<Record<string, { check(input: Record<string, unk
       return type === "channel:create" || type === "channel:add_member" || type === "agent:create" ? null
         : "action.type must be channel:create, channel:add_member or agent:create: the integration cards take ids you have no way to know, and are made by Raft's own integration commands";
     },
-    described: " Only channel:create, channel:add_member and agent:create cards can be prepared here: the integration cards take ids you have no way to know, and are made by Raft's own integration commands.",
+    described: " A card is the route for a change your role does not allow you to make yourself (a person whose role allows it carries it out), or one you want a person to confirm;" +
+      " what Raft lets you do directly, do with its own tool, with no card." +
+      " Only channel:create, channel:add_member and agent:create cards can be prepared here: the integration cards take ids you have no way to know, and are made by Raft's own integration commands.",
   },
 };
 
@@ -686,6 +693,21 @@ export const WITHHELD_ARGUMENTS: Readonly<Record<string, Readonly<Record<string,
     // origin the SDK sends it with `consume: false`, a combination whose handling by the Server is not verified.
     unread: "it moves your read position, which receive_events keeps; read new messages with receive_events, or page this conversation with after, before or around",
   },
+  "profile.update": {
+    // Raft sends a hosted agent's profile description to this runtime as the agent's whole instructions on the next
+    // edit a person makes, so an agent that wrote its own description could rewrite its own instructions. Lift this
+    // entry, and profile.update's in `DESCRIPTION_OVERRIDES`, when Raft keeps the instructions a person wrote apart
+    // from the profile description.
+    description: "a hosted agent cannot change its description yet, because Raft uses it as this agent's instructions; ask a person to edit it in Raft",
+  },
+};
+
+/**
+ * A tool description written here in place of the manifest's, where the manifest's names an argument this mount
+ * withholds (`WITHHELD_ARGUMENTS`). Each entry goes when the withholding it describes does.
+ */
+const DESCRIPTION_OVERRIDES: Readonly<Record<string, string>> = {
+  "profile.update": "Update your display name or avatar URL. Your profile description cannot be changed here: Raft uses it as your instructions, so a person edits it in Raft.",
 };
 
 /**
@@ -746,10 +768,10 @@ export function toolOf(op: RaftOperationSpec): ToolSchema {
   }
   describeInMountTerms(parameters);
   // The download's manifest text is about the URL Raft mints; this mount keeps the file and never shows the URL.
-  const described = op.name === DOWNLOAD_OP
+  const described = DESCRIPTION_OVERRIDES[op.name] ?? (op.name === DOWNLOAD_OP
     ? `Download an attachment (by the id a message line shows) into this agent's storage, up to ${ATTACHMENT_MAX_BYTES / 1024 / 1024} MiB: ` +
       "returns an artifact reference to the file with its name, type and size."
-    : inMountTerms(op.description);
+    : inMountTerms(op.description));
   const held = op.mayInterrupt
     ? ` Held here, the call comes back as a question with those messages: answer "${goAhead(op)}" to go ahead as written, or "drop" to do nothing.` +
       (op.idempotency.kind === "key"
@@ -842,7 +864,8 @@ function argumentsFor(op: RaftOperationSpec, args: unknown): Record<string, unkn
 const UNOFFERED_SAY: Readonly<Record<string, string>> = {
   // The SDK names `inbox.check` for "check for new messages"; on this mount that is receive_events.
   inbox_check: "receive_events()",
-  // Since 0.11.0 the SDK's notify hint names mentions_notify, which is offered; its add hint names mentions_add.
+  // Since 0.11.0 the SDK's notify hint names mentions_notify and its add hint mentions_add, both generated; the add
+  // hint is said in words only on a mount whose credential lacks the `mentions` capability.
   mentions_add: "adding them to the conversation, which this mount does not offer",
   // Reached on a plugin built with no object storage, a credential without the capability, or a table that excludes it.
   attachments_download_url: "downloading the attachment, which this mount does not offer",
@@ -1957,7 +1980,9 @@ export function createRaftPlugin(deps: {
       summary: "A Raft agent credential for the agent account this mount represents.",
       shape: "token",
       grants: "As that Raft agent, and only as far as the credential's capabilities reach: send, read and search messages, receive queued events, " +
-        "join, leave and mute channels and see their members, react, work its task boards, read the Raft Manual, post action cards for a person to confirm, " +
+        "join, leave and mute channels and see their members, add the people it mentions to a conversation, react, work its task boards (deleting tasks among it), " +
+        "create, update, archive and unarchive channels and add or remove their members, update the server and its Labs, where its role on the Server allows it, " +
+        "update its own profile (display name, avatar), read the Raft Manual, post action cards for a person to confirm, " +
         "and sign into the Connected Apps on its Server as that agent (Agent Login) to run the actions their manifests offer.",
       looksLike: [{ kind: "Raft agent credential", pattern: "sk_agent_[A-Za-z0-9_-]{16,}" }],
     },
