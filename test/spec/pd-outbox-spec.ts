@@ -148,10 +148,17 @@ const unacceptedPairs = (storage: DurableSqlHost) => outboxes(storage).usage.fil
 const allUsage = (storage: DurableSqlHost) => show(outboxes(storage).usage);
 /** A row without what names an instance or an instant. */
 const usageShape = (r: OutboxRow) => ({ tenantId: r.tenantId, agentId: r.agentId, resource: r.resource, key: r.key, quantity: r.quantity, unit: r.unit });
-const traceShape = (r: TraceOutboxRow) => ({
-  tenantId: r.tenantId, agentId: r.agentId, kind: r.kind, status: r.status, verdict: r.verdict,
-  parentId: r.parentId ?? null, hasMs: typeof r.ms === "number", attrs: r.attrs,
-});
+/**
+ * `prefix` is left out of the comparison: it is pi085's reading of its own request against the one before
+ * (src/runtime/request-prefix.ts, test/stable-prompt.ts), which pd does not take. Everything else is compared.
+ */
+const traceShape = (r: TraceOutboxRow) => {
+  const { prefix: _prefix, ...attrs } = r.attrs as Record<string, unknown>;
+  return {
+    tenantId: r.tenantId, agentId: r.agentId, kind: r.kind, status: r.status, verdict: r.verdict,
+    parentId: r.parentId ?? null, hasMs: typeof r.ms === "number", attrs,
+  };
+};
 const transitions = (rows: readonly TraceOutboxRow[]) => statusEvents(OWNER.agentId, rows).map((e) => e.detail ? `${e.status}|${e.detail}` : e.status);
 
 /** pi-durable's whole state, as a comparable value: what a rolled-back commit must leave exactly as it was. */

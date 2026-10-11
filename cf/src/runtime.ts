@@ -23,7 +23,10 @@ import { sealSeedFiles, seedInline, sha256Hex, type SealHow, type SeedMode, type
 import { logEvent } from "../../src/core/log.ts";
 import { currentMainId, mainSessions, modelInputCalls, readModelInput, recordModelInput, startFreshMain, type MainSessionRow, type ModelInputEvidence } from "./fresh-context.ts";
 import { heldDecision, warningText } from "../../src/runtime/idle-lease.ts";
-import { heldLines, heldPrompt, heldResources, withHeldNote } from "../../src/runtime/held.ts";
+import { heldItems, heldLines, heldParagraph, heldResources, withHeldNote } from "../../src/runtime/held.ts";
+import {
+  conversationStarted, promptContextFor, returnContextChange, takeContextChange, type ContextChange, type PromptContext,
+} from "../../src/runtime/prompt-context.ts";
 import {
   admitBackground, jobsTool, mountsWithRunningJobs, recordBackgroundJob, refuseOverCap, runBackgroundPass, runningBackgroundJobs, startedResult, stopSessionJobs,
 } from "../../src/runtime/background-jobs.ts";
@@ -2921,9 +2924,23 @@ export class AgentRuntime {
     await this.repinMounts(tenantId, agentId);
     const builtFrom = await this.#harnessKeyFor(tenantId, agentId);
     const agentRef: { current: PiAgent | null } = { current: null };
-    const { records, unoffered, offered, activityOf, nameOf, host, extras, callerDefs, keeping, extraTools } =
+    const { records, unoffered, offered, nameOf, host, extras, callerDefs, keeping, extraTools } =
       await this.#turnTools(tenantId, agentId, session, engine, agentRef);
 
+    // The parts that move between turns, as they are now. On pi085 the prompt shows them as they were when the
+    // conversation began (src/runtime/prompt-context.ts): every later open of a harness for it rebuilds the same bytes,
+    // and what moved since is told at the head of a later message (`#takeContextChange`). pd records a changed prompt
+    // as an inline patch at its place (src/model/durable-offloaded.ts `jobContext`), so it is given them as they are.
+    const now = await this.#promptContextNow(tenantId, agentId, records, nameOf);
+    let shown = now;
+    if (engine !== "pd") {
+      // A snapshot that cannot be read or written must not keep the agent from opening: it opens on what is true
+      // now, which is what it did before there were snapshots.
+      try {
+        shown = promptContextFor(this.#deps.ctx.storage.sql, `${tenantId}/${agentId}`,
+          this.#conversationOf(session), now, conversationStarted(this.#deps.ctx.storage.sql, session), Date.now());
+      } catch (e) { console.error(`the prompt snapshot of ${key}#${session} could not be used; opening on what is current:`, e); }
+    }
     // Read here rather than inside the harness, so the harness keeps holding
     // no I/O of its own.
     const prompt = systemPrompt({
@@ -2933,13 +2950,13 @@ export class AgentRuntime {
       // Whatever the mounted plugins have to say, in registry order. The
       // framework no longer reaches into any one plugin for this (Piper,
       // tygg, 2026-09-12).
-      contributions: await this.#gateway.promptContributions({ tenantId, agentId, taskId: LEGACY_TASK }),
+      contributions: shown.contributions,
       // `release` is scoped to the agent, not to a task, so a new session
       // inherits whatever the last one left alive — and until now nothing
       // told it, which is how a container billed overnight for a
       // conversation that had ended (tygg, 2026-09-22). Session-stable facts
       // only; the durations are in the two message-side sentences.
-      held: heldPrompt(await heldResources(records, this.#plugins, activityOf), nameOf),
+      held: heldParagraph(shown.held),
       policy: this.#deps.policy,
       // Each paragraph appears only where the thing it describes is really
       // there — telling an agent to read a result back with a tool it has not
@@ -2987,6 +3004,9 @@ export class AgentRuntime {
       host: this.#deps.ctx.storage,
       usageOwner: { tenantId, agentId },
       sessionId: session === MAIN_SESSION ? key : `${key}#${session}`,
+      // The conversation, not the session: a fresh context keeps the session's name and starts a new conversation,
+      // and its first call is compared with nothing rather than with the last call of the one it ended.
+      conversationKey: `${key}#${this.#conversationOf(session)}`,
       session,
       systemPrompt: prompt,
       model,
@@ -3000,6 +3020,42 @@ export class AgentRuntime {
     agentRef.current = agent;
     this.#agents.set(cacheKey, { agent, builtFrom });
     return agent;
+  }
+
+  /**
+   * The system prompt's moving parts as they are now (src/runtime/prompt-context.ts): the plugins' contributions and
+   * one line per held thing, named as `nameOf` resolves a tool against the list the model is offered.
+   */
+  async #promptContextNow(
+    tenantId: string, agentId: string, records: Array<{ alias: string; plugin: string }>, nameOf: (alias: string, tool: string) => string | null,
+  ): Promise<PromptContext> {
+    const activityOf = (alias: string) => this.#gateway.mountActivities({ tenantId, agentId, taskId: LEGACY_TASK }, alias);
+    const paragraphs = await this.#gateway.promptParagraphs({ tenantId, agentId, taskId: LEGACY_TASK });
+    return {
+      contributions: paragraphs.map((p) => p.text).filter(Boolean),
+      parts: paragraphs.flatMap((p) => p.parts),
+      held: heldItems(await heldResources(records, this.#plugins, activityOf), nameOf),
+    };
+  }
+
+  /** The conversation a pi085 session holds now: the main one's id (`currentMainId`), which a fresh context moves, or the session itself. */
+  #conversationOf(session: string): string {
+    return session === MAIN_SESSION ? currentMainId(this.#deps.ctx.storage.sql) : session;
+  }
+
+  /**
+   * The notice for what moved in the system prompt's moving parts since this conversation's model last saw them, taken
+   * (src/runtime/prompt-context.ts `takeContextChange`) as the message carrying it is about to be written. Null when
+   * nothing moved. Read from the catalogue the message's harness was built from, as `#takeNotices` reads it.
+   */
+  async #takeContextChange(tenantId: string, agentId: string, session: string): Promise<{ owner: string; conversation: string; change: ContextChange } | null> {
+    const { tools, records } = await this.#catalogueFor(tenantId, agentId);
+    const offered = withLimitNote(tools as MountedTool[], parkedReader(tools as MountedTool[]));
+    const nameOf = (alias: string, tool: string) => offeredToolName(offered as MountedTool[], alias, tool);
+    const now = await this.#promptContextNow(tenantId, agentId, records, nameOf);
+    const owner = `${tenantId}/${agentId}`, conversation = this.#conversationOf(session);
+    const change = takeContextChange(this.#deps.ctx.storage.sql, owner, conversation, now, HARNESS_NOTICE);
+    return change ? { owner, conversation, change } : null;
   }
 
   /** The model an engine registers for a binding. */
@@ -3344,18 +3400,29 @@ export class AgentRuntime {
     // text was in no transcript after the post and after an alarm), so a notice it carried could wait unread behind
     // a run that never comes, while the next prompt or steer, which does reach the model, would no longer carry it.
     const told = mode === "followUp" ? null : await this.#takeNotices(tenantId, agentId, agent);
+    // What moved in the system prompt's moving parts since the model last saw them (src/runtime/prompt-context.ts),
+    // after the capability lines, for the same reason they skip a follow-up. pi085 only: pd patches its prompt in place.
+    // A failure to read it is logged and never fails the message; what moved is still unseen, so the next one says it.
+    const moved = mode === "followUp" || this.#isPd() ? null
+      : await this.#takeContextChange(tenantId, agentId, session)
+        .catch((e) => { console.error(`reading what moved in ${tenantId}/${agentId}'s prompt failed:`, e); return null; });
+    const lines = [...(told?.lines ?? []), ...(moved ? [moved.change.notice] : [])];
+    const giveBack = async () => {
+      if (told) await this.store.returnSeedNotices(tenantId, agentId, told.rows).catch(() => {});
+      if (moved) returnContextChange(this.#deps.ctx.storage.sql, moved.owner, moved.conversation, moved.change);
+    };
     // Synchronously before the engine's write, with the harness already open: what a caller retires here
     // (`deliverPendingInbound`'s queued row) is gone exactly when the message is about to be written.
     opts.beforeSay?.();
     let res: any;
     try {
-      res = await agent.say(told ? `${told.lines.join("\n")}\n\n${text}` : text, mode);
+      res = await agent.say(lines.length ? `${lines.join("\n")}\n\n${text}` : text, mode);
     } catch (e) {
       // A post that throws wrote nothing (the rule `deliverPendingInbound` retries by), so the notices were not said.
-      if (told) await this.store.returnSeedNotices(tenantId, agentId, told.rows).catch(() => {});
+      await giveBack();
       throw e;
     }
-    if (told && res?.ok === false) await this.store.returnSeedNotices(tenantId, agentId, told.rows).catch(() => {});
+    if (res?.ok === false) await giveBack();
     return { ...messageLanded(res, mode), result: res };
   }
 

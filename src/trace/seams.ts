@@ -118,15 +118,24 @@ export function answerVerdict(stopReason: AssistantMessage["stopReason"]): Trace
 export function modelCallRow(m: {
   tenantId: string; agentId: string; jobId: string; stopReason: AssistantMessage["stopReason"];
   model: string; at: number; createdAt?: number | null; answeredAt?: number | null;
+  /** What the request shared with the previous one (src/runtime/request-prefix.ts), as the job row kept it. */
+  prefix?: Record<string, unknown> | null;
+  /** The answer's own token counts, so a cache miss can be read against the prefix on the same row. */
+  usage?: { input?: unknown; cacheRead?: unknown; cacheWrite?: unknown } | null;
 }): TraceRow {
   const ms = typeof m.createdAt === "number" && typeof m.answeredAt === "number"
     ? Math.max(0, m.answeredAt - m.createdAt) : undefined;
+  const num = (v: unknown) => typeof v === "number" && Number.isFinite(v) ? v : undefined;
+  const tokens = m.usage ? Object.fromEntries(
+    ([["input", m.usage.input], ["cacheRead", m.usage.cacheRead], ["cacheWrite", m.usage.cacheWrite]] as const)
+      .flatMap(([k, v]) => num(v) === undefined ? [] : [[k, num(v)]])) : {};
   return {
     at: m.at, tenantId: m.tenantId, agentId: m.agentId,
     kind: "model.call", spanId: m.jobId,
     status: m.stopReason, verdict: answerVerdict(m.stopReason),
     ...(ms === undefined ? {} : { ms }),
-    attrs: { model: m.model },
+    // The model first: keys drop from the end when attrs are too long (src/trace/outbox.ts `attrsOf`).
+    attrs: { model: m.model, ...tokens, ...(m.prefix ? { prefix: m.prefix } : {}) },
   };
 }
 

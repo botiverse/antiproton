@@ -235,6 +235,7 @@ export function bookCommit(exec: SqliteSyncExecutor, writes: readonly StorageWri
           model: typeof m.model === "string" ? m.model : "unknown", at: ctx.now,
           createdAt: Number(job.created_at),
           answeredAt: job.answered_at !== null ? Number(job.answered_at) : null,
+          usage: (m as { usage?: Parameters<typeof modelCallRow>[0]["usage"] }).usage ?? null,
         }));
       }
       appendTrace(ctx.raw as Parameters<typeof appendTrace>[0], trace);

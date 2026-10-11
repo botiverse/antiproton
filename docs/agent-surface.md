@@ -338,7 +338,10 @@ code fence longer than any run of backticks in it), then every other seeded path
 stored, with its working copy's size now in UTF-8 bytes (an unedited copy reads its manifest `bytes`;
 one kept in object storage is given its size at setup, said to be that) and its mode. A seeded path
 that is also a working-set document (`memory`, `todo`, `journal`) is left out of the working set. With
-nothing seeded the paragraph is absent and the prompt is as it was. Rules for `PUT …/seed`:
+nothing seeded the paragraph is absent and the prompt is as it was. On the pi085 engine the paragraph
+is the one taken when the conversation began (a fresh context takes it again); a working copy changed
+since is given to the model in a harness notice at the head of its next message, not by re-rendering
+the system prompt (`src/runtime/prompt-context.ts`). Rules for `PUT …/seed`:
 
 - `path` follows the state plugin's key rule (`^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$`), with no empty,
   `.` or `..` segment and never under `kept:`; else `422`, `param: "path"`. The working set's own
@@ -513,6 +516,11 @@ exported, and one exported between the two reads is found in its batch: no lag p
 What is never there: a span still open (a model call awaiting its answer, a tool still running), and
 anything the trace does not record (`src/trace/outbox.ts` names the documented silences). Each row is
 as exported: `{ seq, at, tenantId, agentId, kind, spanId, parentId?, status, verdict, ms?, attrs }`.
+A `model.call` row's `attrs` carry `model` and the answer's `input`, `cacheRead` and `cacheWrite` tokens;
+on the pi085 engine also `prefix` (`src/runtime/request-prefix.ts`): the sha256 of the system prompt
+and of the tool list, the request's message count and characters, how many leading messages (and their
+characters) are the previous request's byte for byte, and `broken` — `system`, `tools`, `message`, or
+null when the previous request is all a prefix of this one. No content is recorded.
 The answer adds `from`, `to` (ISO), `cursor`, `nextCursor` and `scanned: { local, objects }`. Nothing
 is written.
 

@@ -1,0 +1,438 @@
+/**
+ * A pi085 conversation's system prompt and tool list stay byte-identical for the conversation's life, and what moves
+ * between turns — the state mount's working set, what the agent is holding — reaches the model as a notice at the head
+ * of a later message (src/runtime/prompt-context.ts, `AgentRuntime.agent` and `postMessage` in cf/src/runtime.ts).
+ *
+ * The runtime rows drive the real `AgentRuntime` over node:sqlite with the model scripted through the queue, as
+ * test/operation-id.ts does, and read every request off the job rows. A harness reopen is a second runtime over the
+ * same storage: what an eviction leaves. The central property is the provider's: the request of call N+1 begins with
+ * the whole request of call N — system prompt, tools and every message — byte for byte, across a state write and a
+ * reopen; the per-call prefix reading on the `model.call` trace row (src/runtime/request-prefix.ts) says the same.
+ */
+import { AgentRuntime, HARNESS_NOTICE } from "../cf/src/runtime.ts";
+import { fromResponse } from "../src/model/pi-bridge.ts";
+import type { ModelResponse } from "../src/model/types.ts";
+import type { MountActivity, Plugin } from "../src/plugins/types.ts";
+import { sqliteHost } from "../src/store/sqlite-host.ts";
+import { standInLoader } from "./spec/worker-stand-in.ts";
+import { operatorModelOf } from "../cf/src/model-request.ts";
+import { canonJson } from "../src/core/canon-json.ts";
+import { addedLines, contextNotice, returnContextChange, takeContextChange, promptContextFor, type PromptContext } from "../src/runtime/prompt-context.ts";
+import { recordRequestPrefix } from "../src/runtime/request-prefix.ts";
+import { SqliteStore } from "../src/store/sqlite.ts";
+import { ToolGateway } from "../src/runtime/gateway.ts";
+import { statePlugin } from "../src/plugins/state.ts";
+
+const results: Array<{ name: string; ok: boolean; error?: string }> = [];
+async function check(name: string, fn: () => Promise<void> | void) {
+  try { await fn(); results.push({ name, ok: true }); }
+  catch (e) { results.push({ name, ok: false, error: String((e as Error)?.stack ?? e).split("\n").slice(0, 3).join("\n      ") }); }
+}
+function must(cond: unknown, msg: string): void { if (!cond) throw new Error(msg); }
+const show = (v: unknown) => JSON.stringify(v);
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, Math.max(0, ms)));
+
+// ---- a plugin that holds a seat, switched by the case ------------------------------------------------------------
+
+let seat: MountActivity["live"] = null;
+const seats: Plugin = {
+  id: "seats", version: "1.0.0",
+  tools: [{ name: "letgo", description: "Let the seat go.", parameters: { type: "object", properties: {} }, sideEffects: "write", idempotency: "none" }] as never,
+  async invoke() { return { ok: true }; },
+  holds: {
+    tools: { release: "letgo" },
+    async activity() { return { live: seat, quietUntil: null, billing: "billed while held" }; },
+    async release() { return true; },
+  },
+} as Plugin;
+
+// ---- the runtime, driven as the worker drives it ------------------------------------------------------------------
+
+type Ctx = { systemPrompt: string; messages: any[]; tools: unknown[] };
+type World = { host: ReturnType<typeof sqliteHost>; rt: AgentRuntime; sent: string[]; answered: Set<string>; calls: Ctx[] };
+
+function runtimeOver(w: Omit<World, "rt"> & { rt?: AgentRuntime }): AgentRuntime {
+  const standIn = standInLoader();
+  return new AgentRuntime({
+    ctx: { storage: { sql: w.host.sql, transactionSync: w.host.transactionSync } },
+    bucket: {} as never, bucketName: "b", models: { resolve: () => null },
+    autoRelease: false, extraPlugins: [seats],
+    loader: standIn.loader, makeToolBinding: standIn.makeToolBinding,
+    operatorModel: operatorModelOf({ DEEPSEEK_BASE_URL: "https://model.example/v1", DEEPSEEK_API_KEY: "operator-key", HARNESS_MODEL: "m1" }),
+    offloadModel: async (job: { commandId: string }) => { w.sent.push(job.commandId); },
+  } as never);
+}
+
+async function world(): Promise<World> {
+  seat = null;
+  const base = { host: sqliteHost(), sent: [] as string[], answered: new Set<string>(), calls: [] as Ctx[] };
+  const w = { ...base, rt: runtimeOver(base) } as World;
+  await w.rt.ready();
+  await w.rt.store.createAgent("t", "a");
+  for (const [alias, plugin] of [["state", "state"], ["seats", "seats"]] as const) {
+    await w.rt.store.setPluginChoice("t", "a", plugin, "enable");
+    const added = await w.rt.addMount("t", "a", { alias, plugin, config: { account: alias } });
+    must(added.ok, `the ${alias} mount was refused: ${show(added)}`);
+  }
+  await w.rt.bindOperatorModel("t", "a");
+  // The catalogue's own notices (test/capability-notice.ts) are said here, so the cases see only this file's.
+  await w.rt.reconcileSeeds("t", "a");
+  const pending = await w.rt.store.pendingSeedNotices("t", "a");
+  await w.rt.store.takeSeedNotices("t", "a", new Set(pending.map((n) => `${n.alias}@${n.since}`)));
+  return w;
+}
+
+/** What an eviction does: a new runtime over the same storage, so the next turn opens its harness again. */
+function reopen(w: World) {
+  w.rt = runtimeOver(w);
+}
+
+const remember = async (w: World, key: string, value: string) =>
+  w.rt.store.putState("t", "a", key, { value, ref: null, bytes: value.length });
+
+const usage = { promptTokens: 1, completionTokens: 1, reasoningTokens: 0, cachedPromptTokens: 0 };
+const say = (text: string): ModelResponse => ({ text, finishReason: "stop", truncated: false, usage });
+
+/** One user message, answered once; every request the model was sent is kept, as the job row holds it. */
+async function turn(w: World, text: string, mode: "prompt" | "steer" = "prompt") {
+  await w.rt.postMessage("t", "a", text, mode, "main");
+  for (let guard = 0; guard < 200; guard++) {
+    const out = await w.rt.step("t", "a") as { wakeInMs?: number | null };
+    const pending = w.sent.filter((id) => !w.answered.has(id));
+    for (const id of pending) {
+      w.answered.add(id);
+      const job = await w.rt.takeJob("t", "a", id) as { model: { api: string; provider: string; id: string }; context: Ctx } | null;
+      if (!job) continue;
+      w.calls.push(JSON.parse(JSON.stringify(job.context)));
+      await w.rt.deliverAnswer("t", "a", id, fromResponse(say("noted"), { api: job.model.api, provider: job.model.provider, id: job.model.id }, id), undefined);
+    }
+    if (pending.length) continue;
+    if (out?.wakeInMs === null || out?.wakeInMs === undefined) return;
+    await sleep(Math.min(out?.wakeInMs ?? 20, 50));
+  }
+  throw new Error("the turn did not settle");
+}
+
+const textOf = (m: any): string => typeof m?.content === "string" ? m.content
+  : Array.isArray(m?.content) ? m.content.map((p: any) => p?.text ?? "").join("") : "";
+const lastUser = (c: Ctx) => textOf([...c.messages].reverse().find((m) => m.role === "user"));
+
+/** The request of `next` begins with the whole request of `prev`: system, tools and every message, byte for byte. */
+function extendsRequest(prev: Ctx, next: Ctx) {
+  must(next.systemPrompt === prev.systemPrompt, `the system prompt moved:\n--- before\n${prev.systemPrompt.slice(-400)}\n--- after\n${next.systemPrompt.slice(-400)}`);
+  must(canonJson(next.tools) === canonJson(prev.tools), "the tool list moved");
+  must(next.messages.length > prev.messages.length, `no new message: ${prev.messages.length} then ${next.messages.length}`);
+  for (let i = 0; i < prev.messages.length; i++) {
+    must(JSON.stringify(next.messages[i]) === JSON.stringify(prev.messages[i]), `message ${i} was rewritten: ${show(prev.messages[i]).slice(0, 200)} → ${show(next.messages[i]).slice(0, 200)}`);
+  }
+}
+
+/** The prefix reading on each answered call's trace row, in order. */
+const prefixRows = (w: World) => w.host.sql.exec("SELECT attrs FROM trace_outbox WHERE kind = 'model.call' ORDER BY seq").toArray()
+  .map((r: any) => JSON.parse(String(r.attrs)).prefix as Record<string, unknown> | undefined);
+
+await check("a state write and a reopen: the next request extends the last one byte for byte, and its new message carries the change", async () => {
+  const w = await world();
+  try {
+    await remember(w, "memory", "- prefers tea");
+    await turn(w, "hello");
+    const first = w.calls[0]!;
+    must(first.systemPrompt.includes("- prefers tea"), "control: the working set is in the first prompt");
+    must(lastUser(first) === "hello", `nothing moved before the first message, so no notice: ${lastUser(first)}`);
+
+    await remember(w, "memory", "- prefers tea\n- lives in Lisbon");
+    await remember(w, "todo", "- book the flight");
+    reopen(w);
+    await turn(w, "again");
+    const second = w.calls[1]!;
+    extendsRequest(first, second);
+    must(!second.systemPrompt.includes("Lisbon") && !second.systemPrompt.includes("book the flight"),
+      "the reopened harness re-rendered the working set into the system prompt");
+    const said = lastUser(second);
+    must(said.startsWith(HARNESS_NOTICE), `the change is not at the head of the message: ${said.slice(0, 120)}`);
+    must(said.endsWith("\n\nagain"), `the person's text follows the notice: ${show(said.slice(-40))}`);
+    must(said.includes("Your `memory` (durable facts), written by you — lines added since you last saw it:\n```\n- lives in Lisbon\n```"),
+      `memory grew by one line, so one line is said, fenced and said to be the agent's: ${said}`);
+    must(!/- prefers tea/.test(said), `a line the model already has is not said again: ${said}`);
+    must(said.includes("Your `todo` (open items), written by you — now reads:\n```\n- book the flight\n```"), `a new document is said whole: ${said}`);
+
+    // The third call, with nothing moved: the second request is all a prefix of it, and no notice.
+    reopen(w);
+    await turn(w, "and again");
+    extendsRequest(second, w.calls[2]!);
+    must(lastUser(w.calls[2]!) === "and again", `nothing moved, nothing said: ${lastUser(w.calls[2]!).slice(0, 200)}`);
+
+    const rows = prefixRows(w);
+    must(rows.length === 3 && rows.every(Boolean), `a prefix reading on every call: ${show(rows)}`);
+    must(rows[0]!.first === true, `the first call has nothing before it: ${show(rows[0])}`);
+    for (const [i, r] of rows.slice(1).entries()) {
+      must(r!.broken === null && r!.sharedMessages === w.calls[i]!.messages.length && r!.systemSha256 === rows[0]!.systemSha256
+        && r!.toolsSha256 === rows[0]!.toolsSha256, `call ${i + 2} shares call ${i + 1} whole: ${show(r)}`);
+    }
+  } finally { w.host.dispose(); }
+});
+
+await check("unchanged state: a reopen tells the model nothing, and the prompt is the same", async () => {
+  const w = await world();
+  try {
+    await remember(w, "memory", "- prefers tea");
+    await remember(w, "journal", "2026-10-11 started");
+    await turn(w, "hello");
+    reopen(w);
+    await turn(w, "again");
+    reopen(w);
+    await turn(w, "once more");
+    extendsRequest(w.calls[0]!, w.calls[1]!);
+    extendsRequest(w.calls[1]!, w.calls[2]!);
+    for (const c of w.calls) must(!lastUser(c).includes(HARNESS_NOTICE.trim()), `a notice with nothing moved: ${lastUser(c).slice(0, 200)}`);
+  } finally { w.host.dispose(); }
+});
+
+await check("a seat acquired, then let go: the prompt holds still and each change is told once", async () => {
+  const w = await world();
+  try {
+    await turn(w, "hello");
+    seat = { id: "seat-9", startedAt: Date.UTC(2026, 9, 11, 9, 30), lastUsedAt: Date.UTC(2026, 9, 11, 9, 30) };
+    reopen(w);
+    await turn(w, "sit");
+    extendsRequest(w.calls[0]!, w.calls[1]!);
+    must(!w.calls[1]!.systemPrompt.includes("seat-9"), "the held seat was rendered into the reopened prompt");
+    const held = lastUser(w.calls[1]!);
+    must(held.startsWith(HARNESS_NOTICE) && /What you are holding now:\n- `seats`: seat-9, held since 09:30 UTC/.test(held), `the seat is told: ${held}`);
+    await turn(w, "still sitting");
+    must(lastUser(w.calls[2]!) === "still sitting", `told once, not again: ${lastUser(w.calls[2]!).slice(0, 200)}`);
+    seat = null;
+    reopen(w);
+    await turn(w, "stand");
+    extendsRequest(w.calls[2]!, w.calls[3]!);
+    must(/You are no longer holding anything\./.test(lastUser(w.calls[3]!)), `the release is told: ${lastUser(w.calls[3]!)}`);
+  } finally { w.host.dispose(); }
+});
+
+await check("a fresh context starts from what is true then: the new conversation's prompt has the working set, and no notice", async () => {
+  const w = await world();
+  try {
+    await remember(w, "memory", "- prefers tea");
+    await turn(w, "hello");
+    await remember(w, "memory", "- prefers tea\n- lives in Lisbon");
+    const fresh = await w.rt.freshContext("t", "a");
+    must(fresh.ok, `fresh context: ${show(fresh)}`);
+    await turn(w, "new start");
+    const c = w.calls[1]!;
+    must(c.systemPrompt.includes("- lives in Lisbon"), "the new conversation's prompt was not taken again");
+    must(c.messages.length === 1 && lastUser(c) === "new start", `the first message of a new conversation carries no notice: ${show(c.messages).slice(0, 300)}`);
+    const read = prefixRows(w)[1];
+    must(read?.first === true && read.broken === null, `the new conversation's first call is compared with nothing, not the old one's last: ${show(read)}`);
+    // And it is fixed from there.
+    await remember(w, "memory", "- prefers tea\n- lives in Lisbon\n- has a cat");
+    reopen(w);
+    await turn(w, "next");
+    extendsRequest(c, w.calls[2]!);
+    must(/- has a cat/.test(lastUser(w.calls[2]!)), `the change after the new start is told: ${lastUser(w.calls[2]!)}`);
+  } finally { w.host.dispose(); }
+});
+
+await check("two messages racing after a change: exactly one of them carries the notice", async () => {
+  const w = await world();
+  try {
+    await turn(w, "hello");
+    await remember(w, "memory", "- raced");
+    await Promise.all([w.rt.postMessage("t", "a", "one", "prompt", "main"), w.rt.postMessage("t", "a", "two", "prompt", "main")]);
+    await turn(w, "three");
+    const users = w.calls[w.calls.length - 1]!.messages.filter((m) => m.role === "user").map(textOf);
+    const carrying = users.filter((u) => u.includes("- raced"));
+    must(carrying.length === 1, `told ${carrying.length} times: ${show(users)}`);
+  } finally { w.host.dispose(); }
+});
+
+await check("through the runtime: an agent's own headings never hide a change (a repeated journal entry heading; memory and todo sharing one)", async () => {
+  const w = await world();
+  try {
+    await remember(w, "journal", "### update\nfirst");
+    await remember(w, "memory", "# Notes\n- m");
+    await remember(w, "todo", "# Notes\n- t");
+    await turn(w, "hello");
+    await remember(w, "journal", "### update\nfirst\n### update\nsecond");
+    reopen(w);
+    await turn(w, "one");
+    extendsRequest(w.calls[0]!, w.calls[1]!);
+    const j = lastUser(w.calls[1]!);
+    must(j.includes("Your `journal` (recent log), written by you — lines added since you last saw it:\n```\n### update\nsecond\n```"), `the journal entry: ${j}`);
+    await remember(w, "todo", "# Notes\n- t2");
+    await turn(w, "two");
+    const t = lastUser(w.calls[2]!);
+    must(t.includes("Your `todo` (open items), written by you — now reads:\n```\n# Notes\n- t2\n```") && !t.includes("`memory`"), `the todo's edit, as the todo's: ${t}`);
+  } finally { w.host.dispose(); }
+});
+
+await check("a journal over its budget, cut mid-line: one appended line is told as one line, not the whole tail", async () => {
+  const w = await world();
+  try {
+    // 50 lines of 71 characters: 3,550, over the journal's 3,000, and the cut lands inside a line.
+    const lines = Array.from({ length: 50 }, (_, i) => `2026-10-11 entry ${String(i).padStart(3, "0")} ${"x".repeat(48)}`);
+    must((lines.join("\n").length - 3000) % 71 !== 0, "control: the cut falls mid-line");
+    await remember(w, "journal", lines.join("\n"));
+    await turn(w, "hello");
+    must(w.calls[0]!.systemPrompt.includes("## journal (recent log)\n…\n"), "control: the journal is cut to its budget");
+    await remember(w, "journal", [...lines, "2026-10-11 the new one"].join("\n"));
+    await turn(w, "next");
+    const said = lastUser(w.calls[1]!);
+    must(said.includes("Your `journal` (recent log), written by you — lines added since you last saw it:\n```\n2026-10-11 the new one\n```"), `one line: ${said.slice(0, 400)}`);
+    must(said.length < 600, `the notice restated the tail: ${said.length} characters`);
+  } finally { w.host.dispose(); }
+});
+
+for (const how of ["refused", "threw"] as const) {
+  await check(`a message whose post ${how} gives its change back, and the next message tells it`, async () => {
+    const w = await world();
+    try {
+      await turn(w, "hello");
+      await remember(w, "memory", "- after the first turn");
+      const agent = await w.rt.agent("t", "a") as any;
+      const real = agent.say.bind(agent);
+      agent.say = async () => { agent.say = real; if (how === "threw") throw new Error("lane gone"); return { ok: false, error: { message: "refused" } }; };
+      // A refused post is reported by throwing too (`messageLanded`); what matters is that nothing was written.
+      await w.rt.postMessage("t", "a", "lost", "prompt", "main").then(() => { throw new Error("the post was not refused"); }, () => {});
+      await turn(w, "kept");
+      must(lastUser(w.calls[1]!).includes("- after the first turn"), `the change was lost with the failed post: ${lastUser(w.calls[1]!)}`);
+    } finally { w.host.dispose(); }
+  });
+}
+
+// ---- the pieces --------------------------------------------------------------------------------------------------
+
+await check("added lines: only growth reads as added; an edit, or a tail kept by its budget, reads correctly", () => {
+  must(show(addedLines(["a", "b"], ["a", "b", "c"])) === show(["c"]), "append");
+  must(addedLines(["a", "b"], ["a", "x", "c"]) === null, "an edit is not an append");
+  must(addedLines(["a", "b", "c"], ["c", "d"]) === null, "lines lost with no cut marker are an edit, not an append");
+  must(show(addedLines(["…", "b", "c"], ["…", "c", "d"])) === show(["d"]), "a tail-kept log that moved on");
+  // The cut is at a character: the first kept line is the end of one the earlier render had (whole or cut too).
+  must(show(addedLines(["…", "line one", "line two"], ["…", "ne two", "line three"])) === show(["line three"]), "a cut mid-line");
+  must(show(addedLines(["…", "ine one", "line two"], ["…", "two", "line three"])) === show(["line three"]), "cut mid-line twice");
+  must(addedLines(["…", "line one", "line two"], ["…", "ne twX", "line three"]) === null, "a first line that is no suffix is an edit");
+  must(addedLines(["a"], ["a"]) === null, "nothing added");
+});
+
+const part = (key: string, text: string, by: "agent" | "setup" | "plugin" = "agent") => ({ key, label: `\`${key}\``, text, by });
+const ctxOf = (parts: ReturnType<typeof part>[], held: string[] = []): PromptContext => ({ contributions: [parts.map((p) => p.text).join("\n")], parts, held });
+
+await check("the notice: per part, labelled, agent and setup text fenced; an emptied part and the held lines; nothing when nothing moved", () => {
+  const before = ctxOf([part("memory", "- a"), part("todo", "- t"), part("intro", "how they are kept", "plugin")]);
+  must(contextNotice(before, before) === null, "nothing moved");
+  const after = ctxOf([part("memory", "- b\n```\n# a heading of mine"), part("todo", ""), part("intro", "how they are kept", "plugin")], ["- x"]);
+  const n = contextNotice(before, after)!;
+  must(n.text.includes("Your `memory`, written by you — now reads:\n````\n- b\n```\n# a heading of mine\n````"), `fenced past the agent's own fence: ${n.text}`);
+  must(n.text.includes("Your `todo`, written by you — is now empty.") && n.text.includes("What you are holding now:\n- x") && !n.text.includes("how they are kept"), n.text);
+  must(show(n.keys) === show(["memory", "todo", "held"]), `keys told: ${show(n.keys)}`);
+  const plugin = contextNotice(ctxOf([part("p", "old words", "plugin")]), ctxOf([part("p", "new words", "plugin")]))!;
+  must(plugin.text.includes("`p` — now reads:\nnew words"), `the plugin's own words are not fenced: ${plugin.text}`);
+});
+
+await check("a document ending in a newline: an append is told as the lines added, not the whole document", () => {
+  must(show(addedLines(["- a", ""], ["- a", "- b", ""])) === show(["- b"]), "trailing newline on both");
+  must(show(addedLines(["- a"], ["- a", "- b", ""])) === show(["- b"]), "a newline that arrived with the append");
+  const n = contextNotice(ctxOf([part("memory", "- a\n")]), ctxOf([part("memory", "- a\n- b\n")]))!;
+  must(n.text.includes("Your `memory`, written by you — lines added since you last saw it:\n```\n- b\n```"), n.text);
+});
+
+await check("the paragraph and its parts come from one read: a write between two reads cannot leave them disagreeing", async () => {
+  const store = new SqliteStore(":memory:");
+  await store.init();
+  await store.createAgent("t", "a");
+  await store.addMount({ tenantId: "t", agentId: "a", alias: "state", installationId: "i-state", connectionId: null,
+    plugin: "state", toolVersion: "1.0.0", publicConfig: {}, secretRef: null, policy: null } as any);
+  // Every read of `memory` sees a newer write: what a write landing between two reads of it looks like.
+  let version = 0;
+  const read = store.getState.bind(store);
+  (store as any).getState = async (t: string, a: string, key: string) =>
+    key === "memory" ? { value: `- version ${++version}`, ref: null, bytes: 11 } : read(t, a, key);
+  const plugin = statePlugin(store, null, "b");
+  const gw = new ToolGateway(store, [plugin], new Set(["state"]), { async resolve() { return null; } } as any);
+  const [p] = await gw.promptParagraphs({ tenantId: "t", agentId: "a", taskId: "k" } as any);
+  const memory = p!.parts.find((x) => x.key === "state:doc:memory");
+  must(memory && memory.text && p!.text.includes(`## memory (durable facts)\n${memory.text}`),
+    `the prompt says ${show(p!.text.match(/version \d+/g))}, the stored part ${show(memory?.text)}`);
+  must(version === 1, `memory was read ${version} times for one paragraph`);
+});
+
+await check("parts are compared by key, never by what the agent wrote: two documents with the same heading inside, and a repeated entry heading", () => {
+  const before = ctxOf([part("memory", "# Notes\n- m"), part("todo", "# Notes\n- t"), part("journal", "### update\nfirst")]);
+  const after = ctxOf([part("memory", "# Notes\n- m"), part("todo", "# Notes\n- t2"), part("journal", "### update\nfirst\n### update\nsecond")]);
+  const n = contextNotice(before, after);
+  must(n, "a change was lost");
+  must(n!.text.includes("Your `todo`, written by you — now reads:\n```\n# Notes\n- t2\n```"), `the todo's edit is told as the todo's: ${n!.text}`);
+  must(n!.text.includes("Your `journal`, written by you — lines added since you last saw it:\n```\n### update\nsecond\n```"), `the journal's new entry: ${n!.text}`);
+  must(!n!.text.includes("`memory`"), `memory did not move: ${n!.text}`);
+});
+
+await check("no change is silent: over random renders, a notice exists exactly when some part's text or the held lines differ", () => {
+  // Whitespace alone is a change too: the model is shown the text, not a normalised form of it.
+  must(contextNotice(ctxOf([part("memory", "- a")]), ctxOf([part("memory", "- a ")])) !== null, "a trailing space was not told");
+  let seed = 7;
+  const rnd = (n: number) => { seed = (seed * 48271) % 2147483647; return seed % n; };
+  const pieces = ["", "- a", "- a ", "# Notes", "### update", "- a\n- b", "```", "…", "x"];
+  const render = () => ctxOf(["memory", "todo", "journal", "intro"].filter(() => rnd(5) > 0)
+    .map((k) => part(k, Array.from({ length: rnd(3) }, () => pieces[rnd(pieces.length)]).join("\n"), k === "intro" ? "plugin" : "agent")),
+    rnd(3) ? [] : ["- seat"]);
+  for (let i = 0; i < 2000; i++) {
+    const a = render(), b = render();
+    const text = (c: PromptContext, k: string) => c.parts.find((p) => p.key === k)?.text ?? "";
+    const keys = new Set([...a.parts, ...b.parts].map((p) => p.key));
+    const moved = [...keys].some((k) => text(a, k) !== text(b, k)) || a.held.join() !== b.held.join();
+    const n = contextNotice(a, b);
+    must(!!n === moved, `render ${i}: moved ${moved}, notice ${show(n)} for ${show(a.parts)} → ${show(b.parts)}`);
+  }
+});
+
+await check("taking a change is once; a message not written gives it back; a change taken in between is not undone, and the lost part is owed", () => {
+  const host = sqliteHost();
+  try {
+    const s0 = ctxOf([part("memory", "- a"), part("todo", "- t")]);
+    const s1 = ctxOf([part("memory", "- a\n- b"), part("todo", "- t")]);
+    const s2 = ctxOf([part("memory", "- a\n- b"), part("todo", "- t\n- u")]);
+    must(promptContextFor(host.sql, "t/a", "main", s0, false, 1) === s0, "a conversation not started takes what is now");
+    must(show(promptContextFor(host.sql, "t/a", "main", s1, true, 2)) === show(s0), "a started conversation keeps what it took");
+    const took = takeContextChange(host.sql, "t/a", "main", s1, "N: ");
+    must(took && took.notice.startsWith("N: ") && /- b/.test(took.notice), `taken: ${show(took)}`);
+    must(takeContextChange(host.sql, "t/a", "main", s1, "N: ") === null, "taken twice");
+    returnContextChange(host.sql, "t/a", "main", took!);
+    const again = takeContextChange(host.sql, "t/a", "main", s1, "N: ");
+    must(again && /- b/.test(again.notice), "given back, so taken again");
+    must(takeContextChange(host.sql, "other/agent", "main", s1, "N: ") === null, "no snapshot taken: nothing to compare");
+
+  } finally { host.dispose(); }
+  const host2 = sqliteHost();
+  try {
+    const s0 = ctxOf([part("memory", "- a"), part("todo", "- t")]);
+    const s1 = ctxOf([part("memory", "- a\n- b"), part("todo", "- t")]);
+    const s2 = ctxOf([part("memory", "- a\n- b"), part("todo", "- t\n- u")]);
+    promptContextFor(host2.sql, "t/a", "main", s0, false, 1);
+    const a = takeContextChange(host2.sql, "t/a", "main", s1, "N: ")!;
+    const b = takeContextChange(host2.sql, "t/a", "main", s2, "N: ")!;
+    must(b && !/- b/.test(b.notice), `B does not repeat A: ${b.notice}`);
+    returnContextChange(host2.sql, "t/a", "main", a);
+    const owed = takeContextChange(host2.sql, "t/a", "main", s2, "N: ");
+    must(owed && owed.notice.includes("Your `memory`, written by you — now reads:\n```\n- a\n- b\n```"), `A's part is owed and told in full: ${show(owed)}`);
+    must(!owed!.notice.includes("todo"), `B's part, told already, is not: ${owed!.notice}`);
+    must(takeContextChange(host2.sql, "t/a", "main", s2, "N: ") === null, "owed once");
+  } finally { host2.dispose(); }
+});
+
+await check("the prefix reading: whole, broken by an earlier message, by the system prompt, by the tools", () => {
+  const host = sqliteHost();
+  try {
+    const m1 = { role: "user", content: "a" }, m2 = { role: "assistant", content: "b" }, m3 = { role: "user", content: "c" };
+    const first = recordRequestPrefix(host.sql, "k", { systemPrompt: "S", messages: [m1], tools: [] });
+    must(first.first && first.broken === null && first.messages === 1, show(first));
+    const whole = recordRequestPrefix(host.sql, "k", { systemPrompt: "S", messages: [m1, m2, m3], tools: [] });
+    must(!whole.first && whole.broken === null && whole.sharedMessages === 1 && whole.sharedChars === JSON.stringify(m1).length, show(whole));
+    const edited = recordRequestPrefix(host.sql, "k", { systemPrompt: "S", messages: [m1, { ...m2, content: "x" }, m3], tools: [] });
+    must(edited.broken === "message" && edited.sharedMessages === 1, show(edited));
+    must(recordRequestPrefix(host.sql, "k", { systemPrompt: "S2", messages: [m1], tools: [] }).broken === "system", "system");
+    must(recordRequestPrefix(host.sql, "k", { systemPrompt: "S2", messages: [m1], tools: [{ name: "t" }] }).broken === "tools", "tools");
+  } finally { host.dispose(); }
+});
+
+for (const r of results) console.log(`  ${r.ok ? "\x1b[32m✓\x1b[0m" : "\x1b[31m✗\x1b[0m"} ${r.name}${r.error ? `\n      ${r.error}` : ""}`);
+console.log(`  ${"─".repeat(56)}\n  ${results.filter((r) => r.ok).length} passed, ${results.filter((r) => !r.ok).length} failed`);
+if (results.some((r) => !r.ok)) process.exit(1);

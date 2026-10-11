@@ -104,7 +104,7 @@ When context budgets approach thresholds:
 - Tool outputs are aggressively truncated in the summary to prevent transient HTML or large API payloads from crowding out reasoning.
 - When compaction runs a second time, it updates the previous handover rather than blindly appending, bounding token growth while preserving factual continuity.
 
-Simultaneously, an agent maintains persistent working documents across tasks (`memory` for durable facts, `todo` for open items, `journal` for event logs) stored in its private SQLite namespace. Rather than relying on the agent to remember to query memory, the active working set is pushed directly into the initial system prompt upon harness opening, preserving cached token economics.
+Simultaneously, an agent maintains persistent working documents across tasks (`memory` for durable facts, `todo` for open items, `journal` for event logs) stored in its private SQLite namespace. Rather than relying on the agent to remember to query memory, the active working set is pushed directly into the system prompt when a conversation begins and kept there unchanged for the conversation's life, with later changes appended as harness notices on the next message, preserving cached token economics.
 
 ---
 
