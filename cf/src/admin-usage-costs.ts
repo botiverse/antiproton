@@ -58,6 +58,10 @@ export function parseCostsQuery(q: URLSearchParams, now: number): { from: number
 export function closedCostsTo(q: URLSearchParams): URLSearchParams {
   const to = q.get("to");
   if (!to || !/^\d{4}-\d{2}-\d{2}$/.test(to)) return q;
+  // A date the calendar does not have is left for parseCostsQuery to refuse: Date.parse rolls
+  // 2026-02-31 over to 03-03 and turns 2026-13-01 into a throw, and a hand-edited URL should
+  // read as the refusal it is, not as a nearby date or a 500.
+  if (!onTheCalendar(`${to}T00:00:00Z`)) return q;
   const next = new Date(Date.parse(`${to}T00:00:00Z`) + DAY_MS);
   const out = new URLSearchParams(q);
   out.set("to", next.toISOString().slice(0, 10));
