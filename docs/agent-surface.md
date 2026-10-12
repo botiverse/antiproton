@@ -421,6 +421,52 @@ provided at setup" block; a mere mention does not count). Without `session`, the
 conversations: `{ current, sessions: [{ sessionId, generation, current, startedAt, endedAt, calls }] }`.
 Only calls of the `pi085` engine are recorded; `404` when there is no such record.
 
+A call's answer also carries `images`: what the queue consumer did with the image references of its
+conversation, one record per queue delivery attempt, first first. A retry adds a record and never changes
+an earlier one. Hashes and sizes only, never bytes, a URL or a storage key:
+
+```json
+"images": [{ "modelCallId": "mj_…", "sessionId": "main.1", "call": 3, "attempt": 1,
+  "policy": "image-window/v1", "budget": { "maxImages": 8, "maxBytes": 12582912, "step": 4 },
+  "windowStart": 0, "model": "deepseek-flash", "vision": true, "preparedAt": "2026-10-12T09:00:00.000Z",
+  "items": [{ "index": 0, "sha256": "…", "declaredBytes": 3172, "readBytes": 3172, "result": "included_in_request" }],
+  "provider": { "outcome": "http", "status": 200, "at": "2026-10-12T09:00:04.210Z" } }]
+```
+
+`modelCallId` is the call's `jobId`; `attempt` counts from 1 in the order the agent's object first heard of
+each attempt. `budget` is the image window the consumer applied (`MODEL_IMAGES_MAX`, `MODEL_IMAGES_MAX_BYTES`,
+and the step its start moves by) and `windowStart` the index of the first image it sent; for a model that
+cannot see images (`vision: false`) it is the number of references, since none is sent. `preparedAt` is when
+the provider request was built, before it was sent: it says the request was prepared, not that the provider
+received it.
+
+`items` has one entry per image reference in the conversation, oldest first, `index` its place among them.
+`declaredBytes` is the size the reference declares (`null` when it declares none) and `readBytes` the size of
+the bytes read (`null` when none were). `result` is one of:
+
+- `included_in_request`: the bytes are in the request;
+- `omitted`, sent as a line naming it and never read, with `reason` `over_budget` (the newer images already
+  fill the budget), `before_window` (it would fit, but the window's start, which moves a step at a time, is
+  past it) or `non_vision_model`;
+- `load_failed`, sent as a line saying it could not be loaded, with `reason` `missing` (nothing is stored
+  under its hash), `read_error` (the read failed, or the bytes no longer hash to the reference) or
+  `size_mismatch` (the bytes are not the size the reference declares; they are refused even when the hash
+  matches).
+
+At most 200 items are kept, the newest; `truncated`, present only then, counts the older ones dropped.
+
+`provider` is written once the provider call has ended: `{ "outcome": "http", "status", "at" }` for an
+answer (a success, a refusal, or a 5xx or 429 its retries did not get past), `{ "outcome": "timeout", "at" }`
+when the call's deadline passed, `{ "outcome": "transport_error", "errorClass", "at" }` otherwise
+(`errorClass` the JavaScript error's class, e.g. `TypeError` for a failed connection). An attempt that never
+ended, such as one whose invocation was stopped mid-call, has no `provider` key at all.
+
+The consumer runs in its own invocation, so it writes each attempt back to the agent's object, addressed by
+the queue message as its take of the job is (`cf/src/image-evidence.ts`): once when the request is built,
+beside the provider call, and once when the call has ended, waited on for at most 2 s. A write that fails
+or is slow is logged (`model_job.image_evidence_failed`) and the call goes on, so `images` can be missing an
+attempt, or an attempt's `provider`; it is empty for a call whose conversation held no image reference.
+
 ### Tools
 
 `GET …/tools` answers the tools the agent's next turn offers its model, in the order its model request

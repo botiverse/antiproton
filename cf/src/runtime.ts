@@ -23,6 +23,7 @@ import { sealSeedFiles, seedInline, sha256Hex, type SealHow, type SeedMode, type
 import { logEvent } from "../../src/core/log.ts";
 import { markHarnessDrop, recordHarnessOpen, type HarnessDropReason } from "../../src/runtime/harness-open.ts";
 import { currentMainId, mainSessions, modelInputCalls, readModelInput, recordModelInput, startFreshMain, type MainSessionRow, type ModelInputEvidence } from "./fresh-context.ts";
+import { recordImageAttempt } from "./image-evidence.ts";
 import { heldDecision, warningText } from "../../src/runtime/idle-lease.ts";
 import { heldItems, heldLines, heldParagraph, heldResources, withHeldNote } from "../../src/runtime/held.ts";
 import {
@@ -4263,7 +4264,21 @@ export class AgentRuntime {
     // at the deployment's default, which is also what an agent with its own credential got before.
     const b = await this.store.getModelBinding(tenantId, agentId);
     const provider = b ? providerOfRef(b.secretRef) : null;
-    return { ...job, operatorModel: provider ? b!.model : null, operatorProvider: provider };
+    // Marked where model-input evidence is on, so the consumer describes this call's images back to this object
+    // (`recordImageAttempt`); the flag is the object's, and the consumer has no other way to know it.
+    return { ...job, operatorModel: provider ? b!.model : null, operatorProvider: provider, ...(this.#deps.modelInputEvidence ? { imageEvidence: true } : {}) };
+  }
+
+  /**
+   * One queue delivery attempt's image evidence for the call `jobId`, from the consumer (cf/src/image-evidence.ts).
+   * Nothing where model-input evidence is off, or for a call whose input was not recorded. A failure is logged and
+   * answered false: evidence never fails the call it describes, nor the consumer that sent it.
+   */
+  async recordImageAttempt(jobId: string, attempt: unknown): Promise<boolean> {
+    if (!this.#deps.modelInputEvidence) return false;
+    await this.ready();
+    try { return recordImageAttempt(this.#deps.ctx.storage.sql, jobId, attempt); }
+    catch (e) { console.error(`recording the image evidence of ${jobId} failed:`, e); return false; }
   }
 
   /**

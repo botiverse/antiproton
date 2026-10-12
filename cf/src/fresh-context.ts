@@ -25,6 +25,7 @@ import { isSeedLine, unfencedLines, WORKING_SET } from "../../src/plugins/state.
 import { ensurePiTables, MAIN_SESSION, piTables } from "../../src/store/pi-storage.ts";
 import { clearBackstop } from "../../src/runtime/overflow-backstop.ts";
 import { sha256Hex } from "../../src/store/seed-files.ts";
+import { readImageAttempts, type ImageAttempt } from "./image-evidence.ts";
 
 type Sql = { exec(query: string, ...bindings: unknown[]): { toArray(): any[] } };
 type Host = { sql: Sql; transactionSync?<T>(fn: () => T): T };
@@ -171,6 +172,12 @@ export interface ModelInputEvidence {
   workingSetKeys: string[];
   /** The seeded paths the system prompt lists as seeded files (`seededPathsListed`). */
   seedPathsInSystemPrompt: string[];
+  /**
+   * What the queue consumer did with the call's image references, one record per delivery attempt, first first
+   * (cf/src/image-evidence.ts). Added when read; empty when the conversation held no image reference, or when no
+   * attempt's write reached the object.
+   */
+  images?: ImageAttempt[];
 }
 
 function textOf(content: unknown): string {
@@ -254,7 +261,9 @@ export function recordModelInput(sql: Sql, jobId: string, seedPaths: readonly st
 /** The recorded input of call `call` (1-based) of conversation `sessionId`; null when there is none. */
 export function readModelInput(sql: Sql, sessionId: string, call: number): ModelInputEvidence | null {
   const r = rows(sql, "SELECT digest FROM model_input_digests WHERE session_id = ? AND call = ?", sessionId, call)[0];
-  return r ? JSON.parse(String(r.digest)) as ModelInputEvidence : null;
+  if (!r) return null;
+  const evidence = JSON.parse(String(r.digest)) as ModelInputEvidence;
+  return { ...evidence, images: readImageAttempts(sql, evidence.jobId) };
 }
 
 /** How many calls of `sessionId` are recorded. */

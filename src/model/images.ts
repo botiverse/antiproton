@@ -68,6 +68,16 @@ export function imageRefBytes(data: unknown): number {
 }
 
 /**
+ * The size a reference declares, as written, or null when it declares none. Unlike `imageRefBytes` this is not
+ * clamped: it is what the bytes read back are held to (`resolveImages`), so an impossible size simply never matches.
+ */
+export function imageRefDeclaredBytes(data: unknown): number | null {
+  if (typeof data !== "string" || !data.startsWith(IMAGE_REF_PREFIX)) return null;
+  const raw = REF.exec(data.slice(IMAGE_REF_PREFIX.length))?.[2];
+  return raw === undefined ? null : Number(raw);
+}
+
+/**
  * Where the bytes an image reference names are kept: under the agent's own prefix, so the consumer reads them with
  * the queue message's tenant and agent and nothing a message carries can point at another agent's.
  */
@@ -168,6 +178,31 @@ export const omittedImageText = (mimeType: unknown, sha256: string) =>
   `\n\n[earlier image omitted: ${String(mimeType)} ${sha256.slice(0, 8)}; view it again if it is needed]`;
 
 /**
+ * What became of one image reference of a request (`resolveImagesReported`), in conversation order. Names and sizes
+ * only: never bytes, a URL or a storage key.
+ *
+ * - `included_in_request`: its bytes are in the request.
+ * - `omitted`: sent as a note instead, and never read. `over_budget`: the images after it already fill the window's
+ *   budget; `before_window`: it would fit, but the window's start moves a step at a time (`IMAGE_WINDOW_STEP`) and has
+ *   moved past it; `non_vision_model`: the model cannot see images, so none is read.
+ * - `load_failed`: in the window, but not sent: `missing` (nothing stored under its hash), `read_error` (the read
+ *   threw, no store was reachable, or the bytes no longer hash to the reference), `size_mismatch` (the bytes read are
+ *   not the size the reference declares).
+ */
+export type ImageItemResult = "included_in_request" | "omitted" | "load_failed";
+export type ImageItemReason = "before_window" | "over_budget" | "non_vision_model" | "missing" | "read_error" | "size_mismatch";
+export interface ImageItem {
+  index: number;
+  sha256: string;
+  /** The size the reference declares; null when it declares none. */
+  declaredBytes: number | null;
+  /** The size of the bytes read; null when nothing was read (omitted, missing, or the read failed). */
+  readBytes: number | null;
+  result: ImageItemResult;
+  reason?: ImageItemReason;
+}
+
+/**
  * `context` with image references replaced, for the provider call, decided here at the call so the stored history
  * stays as it was written. Which images are sent is decided from the references alone (each declares its size,
  * `imageRef`), so it is the same whatever a read returns:
@@ -182,61 +217,114 @@ export const omittedImageText = (mimeType: unknown, sha256: string) =>
  *   since the newest image is the one the model has just asked to see.
  * - Every image before the start becomes a short note naming it (`omittedImageText`), and is never read; the consumer
  *   holds at most the window.
- * - One in the window that cannot be read, or whose bytes no longer hash to the reference, becomes a text block saying
- *   so: the conversation goes on, rather than a job that fails on every retry for an image that will not come back.
+ * - One in the window that cannot be read, whose bytes are not the size its reference declares, or whose bytes no
+ *   longer hash to the reference, becomes a text block saying so: the conversation goes on, rather than a job that
+ *   fails on every retry for an image that will not come back. A size that differs is refused even when the hash
+ *   matches, because the window was sized from the declared sizes and must not carry more than it counted.
  *
  * A context with no reference is returned as it is.
  */
 export async function resolveImages<C extends { messages?: readonly unknown[] }>(
   context: C, load: ImageLoader | undefined, window: ImageWindow = DEFAULT_IMAGE_WINDOW,
 ): Promise<C> {
-  if (!hasImageRefs(context)) return context;
-  const messages = (context.messages ?? []).map((m: any) => Array.isArray(m?.content) ? { ...m, content: [...m.content] } : m);
-  const slots: Array<{ m: any; ci: number; sha: string; bytes: number; mimeType: unknown }> = [];
-  for (const m of messages) {
+  return (await resolveImagesReported(context, load, window)).context;
+}
+
+/** Every image reference of `context`, oldest first, where it sits and what it declares. */
+function imageSlots(messages: readonly unknown[]) {
+  const slots: Array<{ m: any; ci: number; sha: string; bytes: number; declared: number | null; mimeType: unknown }> = [];
+  for (const m of messages as any[]) {
     if (!Array.isArray(m?.content)) continue;
     m.content.forEach((c: any, ci: number) => {
       const sha = c?.type === "image" ? imageRefHash(c.data) : null;
-      if (sha !== null) slots.push({ m, ci, sha, bytes: imageRefBytes(c.data), mimeType: c.mimeType });
+      if (sha !== null) slots.push({ m, ci, sha, bytes: imageRefBytes(c.data), declared: imageRefDeclaredBytes(c.data), mimeType: c.mimeType });
     });
   }
-  const start = windowStart(slots.map((x) => x.bytes), window);
-  const read = new Map<string, Promise<{ data: string } | { problem: string }>>();
+  return slots;
+}
+
+/**
+ * What a model that cannot see images is sent in place of each reference is decided elsewhere (the serializers); this
+ * is what became of each one, for the evidence: every one omitted, nothing read. `windowStart` is the number of
+ * references, the index past the last, since no image is sent.
+ */
+export function nonVisionImageItems(context: { messages?: readonly unknown[] }): { items: ImageItem[]; windowStart: number } {
+  const slots = imageSlots(context.messages ?? []);
+  return {
+    items: slots.map((s, index) => ({ index, sha256: s.sha, declaredBytes: s.declared, readBytes: null, result: "omitted" as const, reason: "non_vision_model" as const })),
+    windowStart: slots.length,
+  };
+}
+
+/** `resolveImages`, and what became of each reference (`ImageItem`) and where the window started. */
+export async function resolveImagesReported<C extends { messages?: readonly unknown[] }>(
+  context: C, load: ImageLoader | undefined, window: ImageWindow = DEFAULT_IMAGE_WINDOW,
+): Promise<{ context: C; items: ImageItem[]; windowStart: number }> {
+  if (!hasImageRefs(context)) return { context, items: [], windowStart: 0 };
+  const messages = (context.messages ?? []).map((m: any) => Array.isArray(m?.content) ? { ...m, content: [...m.content] } : m);
+  const slots = imageSlots(messages);
+  const { fits, start } = windowBounds(slots.map((x) => x.bytes), window);
+  type Read = { data: string; length: number } | { problem: string; reason: ImageItemReason; length: number | null };
+  const read = new Map<string, Promise<Read>>();
   const fetchOne = (sha: string) => {
     let p = read.get(sha);
     if (!p) {
-      p = (async () => {
-        if (!load) return { problem: "no image store is reachable here" };
+      p = (async (): Promise<Read> => {
+        if (!load) return { problem: "no image store is reachable here", reason: "read_error", length: null };
         let bytes: Uint8Array | null;
-        try { bytes = await load(sha); } catch (e) { return { problem: `reading it failed (${String((e as Error)?.message ?? e).slice(0, 120)})` }; }
-        if (!bytes) return { problem: "it is no longer stored" };
-        if (sha256Hex(bytes) !== sha) return { problem: "the stored bytes no longer match it" };
-        return { data: Buffer.from(bytes).toString("base64") };
+        try { bytes = await load(sha); } catch (e) { return { problem: `reading it failed (${String((e as Error)?.message ?? e).slice(0, 120)})`, reason: "read_error", length: null }; }
+        if (!bytes) return { problem: "it is no longer stored", reason: "missing", length: null };
+        if (sha256Hex(bytes) !== sha) return { problem: "the stored bytes no longer match it", reason: "read_error", length: bytes.byteLength };
+        return { data: Buffer.from(bytes).toString("base64"), length: bytes.byteLength };
       })();
       read.set(sha, p);
     }
     return p;
   };
+  const items: ImageItem[] = [];
   for (const [k, slot] of slots.entries()) {
-    if (k < start) { slot.m.content[slot.ci] = { type: "text", text: omittedImageText(slot.mimeType, slot.sha) }; continue; }
-    const got = await fetchOne(slot.sha);
-    slot.m.content[slot.ci] = "problem" in got
-      ? { type: "text", text: `\n\n(an image could not be loaded: ${got.problem})` }
-      : { ...slot.m.content[slot.ci], data: got.data };
+    const item = { index: k, sha256: slot.sha, declaredBytes: slot.declared };
+    if (k < start) {
+      slot.m.content[slot.ci] = { type: "text", text: omittedImageText(slot.mimeType, slot.sha) };
+      items.push({ ...item, readBytes: null, result: "omitted", reason: k < fits ? "over_budget" : "before_window" });
+      continue;
+    }
+    let got = await fetchOne(slot.sha);
+    // Per reference, not per hash: two references to one hash may declare different sizes.
+    if ("data" in got && slot.declared !== null && got.length !== slot.declared) {
+      got = { problem: `it is ${got.length} bytes, not the ${slot.declared} its reference declares`, reason: "size_mismatch", length: got.length };
+    }
+    if ("problem" in got) {
+      slot.m.content[slot.ci] = { type: "text", text: `\n\n(an image could not be loaded: ${got.problem})` };
+      items.push({ ...item, readBytes: got.length, result: "load_failed", reason: got.reason });
+    } else {
+      slot.m.content[slot.ci] = { ...slot.m.content[slot.ci], data: got.data };
+      items.push({ ...item, readBytes: got.length, result: "included_in_request" });
+    }
   }
-  return { ...context, messages };
+  return { context: { ...context, messages }, items, windowStart: start };
 }
+
+/** The step the window's start moves by for `window`: `IMAGE_WINDOW_STEP`, or the whole window when that is smaller. */
+export const windowStep = (window: ImageWindow): number => Math.max(1, Math.min(IMAGE_WINDOW_STEP, window.maxImages));
 
 /**
  * The index of the first image sent, of images whose sizes are `sizes`, oldest first (see `resolveImages`). A function
  * of the sizes and the window alone.
  */
 export function windowStart(sizes: readonly number[], window: ImageWindow): number {
+  return windowBounds(sizes, window).start;
+}
+
+/**
+ * `start`, the index of the first image sent, and `fits`, the oldest from which the images to the end fit the budget:
+ * an image before `fits` is over the budget, one from `fits` up to `start` was passed over by the step.
+ */
+export function windowBounds(sizes: readonly number[], window: ImageWindow): { fits: number; start: number } {
   const n = sizes.length;
   let fits = n, bytes = 0;
   while (fits > 0 && n - (fits - 1) <= window.maxImages && bytes + sizes[fits - 1]! <= window.maxBytes) bytes += sizes[--fits]!;
-  const step = Math.max(1, Math.min(IMAGE_WINDOW_STEP, window.maxImages));
-  const snapped = Math.ceil(fits / step) * step;
+  const snapped = Math.ceil(fits / windowStep(window)) * windowStep(window);
   // The newest image, when it fits on its own, is always sent.
-  return fits < n ? Math.min(snapped, n - 1) : n;
+  return { fits, start: fits < n ? Math.min(snapped, n - 1) : n };
 }
