@@ -438,7 +438,7 @@ const env: Record<string, unknown> = {
   MODEL_QUEUE: { send: async () => {} },
   ARTIFACTS: { put: async () => ({}), get: async () => null, head: async () => null, list: async () => ({ objects: [] }) },
   ARTIFACT_BUCKET: "b", CONTROL_DB: d1(), HARNESS_MODEL: "m1", DEEPSEEK_BASE_URL: "https://model.example/v1",
-  AUTOMATION_TOKEN: "operator-token", SESSION_SECRET: SESSION, SECRET_KEK: KEK, UI_ALLOW_ANONYMOUS: "1", ADMIN_IDENTITIES: `gh-${A}`, DEEPSEEK_API_KEY: "sk-test",
+  AUTOMATION_TOKEN: "operator-token", SESSION_SECRET: SESSION, SECRET_KEK: KEK, UI_ALLOW_ANONYMOUS: "1", ADMIN_IDENTITIES: `gh-${A}`, DEEPSEEK_API_KEY: "test-deepseek-key",
   AGENT: { idFromName: (n: string) => n, get: (n: string) => objects.get(n) ?? fresh(n) },
 };
 function fresh(n: string) {

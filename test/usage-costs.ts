@@ -17,7 +17,17 @@ import { countHeldTime, heldReports } from "../src/usage/container.ts";
 import { modelTokenRows, pendingUsage, toHourly, OWN_KEY_PREFIX, UNACCEPTED_TOKENS, type UsageRow } from "../src/usage/outbox.ts";
 import { KEEP_HOURLY_DAYS, priceFor, readAgentLedger, readUsage, readUsageCosts, retainUsage, usagePrices, DAY_MS } from "../cf/src/usage-d1.ts";
 import { closedCostsTo, parseCostsQuery } from "../cf/src/admin-usage-costs.ts";
+import { usageCostsPanel } from "../cf/src/ui.ts";
 import { d1ApiKeys } from "../cf/src/control-plane.ts";
+
+// A hand-edited date the calendar does not have is refused, not rolled over (2026-02-31 would
+// become 03-03) and not a throw (2026-13-01 used to reach toISOString on NaN and 500): without
+// closedCostsTo's calendar check these regress silently, so the refusal is pinned here.
+for (const bad of ["2026-02-31", "2026-13-01", "2026-00-10"]) {
+  const q = parseCostsQuery(closedCostsTo(new URLSearchParams({ from: "2026-10-01", to: bad })), Date.parse("2026-10-12T12:00:00Z"));
+  if (typeof q !== "string") throw new Error(`${bad}: expected a refusal, got a window ${q.from}..${q.to}`);
+}
+console.log("ok  an impossible to is refused by parseCostsQuery, not rolled over or thrown on");
 
 // The admin page's window form names a closed day interval; applying it twice without touching the
 // fields must answer the same window both times (regression: the open boundary drifted a day per
@@ -26,9 +36,11 @@ const NOW = Date.parse("2026-10-12T12:00:00Z");
 for (const bucket of ["day", "month"] as const) {
   const once = parseCostsQuery(closedCostsTo(new URLSearchParams({ from: "2026-10-06", to: "2026-10-12", bucket })), NOW);
   if (typeof once === "string") throw new Error(once);
-  // the panel shows to - 1 day; a reader re-applies those very fields
-  const shown = new Date(once.to - 1).toISOString().slice(0, 10);
-  const fromShown = new Date(once.from).toISOString().slice(0, 10);
+  // a reader re-applies the very fields the panel renders
+  const html = usageCostsPanel({ ...once, tenants: [], unpriced: [] });
+  const shown = /name="to" value="(\d{4}-\d{2}-\d{2})"/.exec(html)?.[1];
+  const fromShown = /name="from" value="(\d{4}-\d{2}-\d{2})"/.exec(html)?.[1];
+  if (!shown || !fromShown) throw new Error("the panel did not render both date fields");
   const twice = parseCostsQuery(closedCostsTo(new URLSearchParams({ from: fromShown, to: shown, bucket })), NOW);
   if (typeof twice === "string") throw new Error(twice);
   const same = (a: typeof once, b: typeof once) => a.from === b.from && a.to === b.to && a.bucket === b.bucket;
