@@ -126,10 +126,6 @@ check("a refused write says why, above the forms, and the table shows nothing ne
   must(!/<div class="err">/.test(clean), "a panel without an error must not draw an error box");
 });
 
-for (const r of results) console.log(`${r.ok ? "ok " : "FAIL"} ${r.name}${r.error ? ` — ${r.error}` : ""}`);
-const failed = results.filter((r) => !r.ok).length;
-console.log(`${results.length - failed}/${results.length} passed`);
-if (failed) process.exit(1);
 
 // ---- the ops pages: spend limits and platform usage costs (admin.antiproton.ai) ----
 
@@ -203,3 +199,8 @@ check("adminPage links the three ops sections", () => {
   const html = adminPage();
   must(/hx-get="\/ui\/admin"/.test(html) && /hx-get="\/ui\/admin\/spend-limits"/.test(html) && /hx-get="\/ui\/admin\/usage-costs"/.test(html), "nav loads each fragment into #admin");
 });
+
+for (const r of results) console.log(`${r.ok ? "ok " : "FAIL"} ${r.name}${r.error ? ` — ${r.error}` : ""}`);
+const failed = results.filter((r) => !r.ok).length;
+console.log(`${results.length - failed}/${results.length} passed`);
+if (failed) process.exit(1);
