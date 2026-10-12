@@ -207,14 +207,16 @@ await check("a reading is kept for a while: 30 s far from a limit, 5 s within 80
   must(Number(close.seen.reads) === 3, `a second tenant shared the first one's reading`);
 });
 
-await check("day rollover: refused at 23:59:50 UTC, admitted at 00:00:05 without anyone acting, inside the cache window", async () => {
+await check("day rollover: refused at 23:59:58 UTC, admitted at 00:00:01 without anyone acting, though the reading is younger than its window", async () => {
   const db = d1();
   spend(db, "t", 6, TODAY + 23 * H);
   const { gate, clock, seen } = gateOver((t, now) => readDaySpend(db, t, now));
-  clock.now = TODAY + DAY - 10_000;
+  clock.now = TODAY + DAY - 2_000;
   const before = await gate.admit("t");
   must(!before.admit && before.limit === "tenant", show(before));
-  clock.now = TODAY + DAY + 5_000;
+  // 3 s later: inside even the near-limit window (SPEND_CACHE_NEAR_MS), so only the day can make it read again.
+  clock.now = TODAY + DAY + 1_000;
+  must(3_000 < SPEND_CACHE_NEAR_MS, "the window is shorter than the step");
   const after = await gate.admit("t");
   must(after.admit && seen.reads === 2, `${show(after)} after ${seen.reads} reads`);
 });
