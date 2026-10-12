@@ -103,7 +103,7 @@ await check("a view marker is read strictly: its five keys, an artifact:// refer
     [{ ...VIEW, bytes: 0 }, "bytes is not a positive whole number"],
     [{ ...VIEW, bytes: 1.5 }, "bytes is not a positive whole number"],
     [{ ...VIEW, bytes: "182" }, "bytes is not a positive whole number"],
-    [{ ...VIEW, bytes: MAX_IMAGE_BYTES + 1 }, "over the 1500000-byte limit"],
+    [{ ...VIEW, bytes: MAX_IMAGE_BYTES + 1 }, "over the 1572864-byte limit"],
     [{ ...VIEW, width: 0 }, "width is not a positive whole number"],
     [{ ...VIEW, height: 9000 }, "over the 8192-pixel limit"],
     [{ ref: VIEW.ref, mimeType: VIEW.mimeType }, "bytes is not"],
@@ -177,6 +177,98 @@ await check("viewContent: attached for a model that sees, the sentence for one t
 await check("the capability table: DeepSeek Flash and GPT-5.6 Luna see images, by name as windows are matched", () => {
   for (const m of ["deepseek-flash", "openai/gpt-5.6-luna", "deepseek/deepseek-flash", "gpt-5.6-luna-2026-10-01"]) must(acceptsImages(m), `${m} should see images`);
   for (const m of ["deepseek-v4-pro", "openai/gpt-5.6-terra", "m1", "", undefined]) must(!acceptsImages(m), `${m} should not`);
+});
+
+// ---- the Raft plugin's attachments_view, as it shapes a result -------------------------------------------------
+//
+// Builders and the result's shape copied from test/raft-attachments-view.ts (#856): its `view()` hands back
+// `{ attachmentId, ref, name, type, bytes, view: { ref, mimeType, width, height, bytes } }`, the file kept at
+// `t/<tenant>/<agent>/raft/attachments/<id>/<filename>` and shown as `artifact://raft/attachments/<id>/<filename>`.
+// Every result it can return must pass here, and its size cap (1.5 MiB, inclusive) must be this one.
+
+const ascii = (str: string) => [...str].map((c) => c.charCodeAt(0));
+const be32 = (v: number) => [(v >>> 24) & 255, (v >>> 16) & 255, (v >>> 8) & 255, v & 255];
+const le16 = (v: number) => [v & 255, (v >>> 8) & 255];
+const le24 = (v: number) => [v & 255, (v >>> 8) & 255, (v >>> 16) & 255];
+const le32 = (v: number) => [...le16(v & 0xffff), ...le16(v >>> 16)];
+const bytesOf = (...parts: number[][]) => new Uint8Array(parts.flat());
+function rpng(width: number, height: number, size?: number): Uint8Array {
+  const head = bytesOf([0x89, ...ascii("PNG\r\n\x1a\n")], be32(13), ascii("IHDR"), be32(width), be32(height), [8, 6, 0, 0, 0], [0, 0, 0, 0],
+    be32(0), ascii("IEND"), [0xae, 0x42, 0x60, 0x82]);
+  if (size === undefined) return head;
+  const out = new Uint8Array(size);
+  out.set(head);
+  return out;
+}
+function rjpeg(width: number, height: number, sof = 0xc0): Uint8Array {
+  return bytesOf([0xff, 0xd8], [0xff, 0xe0], [0, 16], ascii("JFIF\0"), [1, 1, 0, 0, 1, 0, 1, 0, 0],
+    [0xff, 0xc4], [0, 8], [0x00, 0x01, 0x01, 0x02, 0x02, 0x00],
+    [0xff, 0xff], [0xff, sof], [0, 17], [8], [height >> 8, height & 255], [width >> 8, width & 255], [3, 1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1],
+    [0xff, 0xd9]);
+}
+const riff = (chunk: number[]) => bytesOf(ascii("RIFF"), le32(4 + chunk.length), ascii("WEBP"), chunk);
+const webpLossy = (w: number, h: number) => riff([...ascii("VP8 "), ...le32(10), 0x30, 0x01, 0x00, 0x9d, 0x01, 0x2a, ...le16(w), ...le16(h)]);
+function webpLossless(w: number, h: number): Uint8Array {
+  const bits = (w - 1) | ((h - 1) << 14);
+  return riff([...ascii("VP8L"), ...le32(5), 0x2f, bits & 255, (bits >>> 8) & 255, (bits >>> 16) & 255, (bits >>> 24) & 255]);
+}
+const webpExtended = (w: number, h: number, flags = 0x10) => riff([...ascii("VP8X"), ...le32(10), flags, 0, 0, 0, ...le24(w - 1), ...le24(h - 1)]);
+function rgif(width: number, height: number): Uint8Array {
+  const image = [0x21, 0xf9, 4, 0, 10, 0, 0, 0, 0x2c, 0, 0, 0, 0, 1, 0, 1, 0, 0, 2, 2, 0x4c, 0x01, 0];
+  return bytesOf(ascii("GIF89a"), le16(width), le16(height), [0x80, 0, 0], [0, 0, 0, 255, 255, 255], image, [0x3b]);
+}
+/** What attachments_view returns for `body` named `filename`, and the store it kept it in. */
+function raftView(body: Uint8Array, mimeType: string, width: number, height: number, filename = "pic") {
+  const ref = `artifact://raft/attachments/att-1/${filename}`;
+  const result = { attachmentId: "att-1", ref, name: filename, type: "image/png", bytes: body.byteLength,
+    view: { ref, mimeType, width, height, bytes: body.byteLength } };
+  const objects = new Map([[`t/tenant/agent/raft/attachments/att-1/${filename}`, body]]);
+  const store = {
+    get: async (k: string) => { const b = objects.get(k); if (!b) throw new Error("no such artifact"); return b; },
+    put: async (k: string, b: Uint8Array) => { objects.set(k, b); return {}; },
+  };
+  return { result, store, objects };
+}
+const RAFT_OWNER = { tenantId: "tenant", agentId: "agent" };
+
+await check("every result attachments_view returns (#856's own cases) is a marker this harness attaches", async () => {
+  const cases: Array<[string, Uint8Array, string, number, number]> = [
+    ["png", rpng(640, 480), "image/png", 640, 480],
+    ["jpeg (baseline, a DHT before the SOF, fill bytes)", rjpeg(1024, 768), "image/jpeg", 1024, 768],
+    ["jpeg (progressive SOF2)", rjpeg(300, 200, 0xc2), "image/jpeg", 300, 200],
+    ["webp VP8", webpLossy(320, 240), "image/webp", 320, 240],
+    ["webp VP8L", webpLossless(1999, 17), "image/webp", 1999, 17],
+    ["webp VP8X (still, alpha)", webpExtended(800, 600), "image/webp", 800, 600],
+    ["gif (one frame)", rgif(64, 32), "image/gif", 64, 32],
+    ["png at its side limit", rpng(2000, 2000), "image/png", 2000, 2000],
+    ["a filename with a space", rpng(10, 10), "image/png", 10, 10],
+  ];
+  for (const [what, body, mimeType, width, height] of cases) {
+    const r = raftView(body, mimeType, width, height, what === "a filename with a space" ? "my photo.png" : "pic");
+    const { view, rest } = splitView(r.result);
+    const parsed = parseView(view);
+    must("view" in parsed, `${what}: ${show(parsed)}`);
+    must(show(rest) === show({ attachmentId: "att-1", ref: r.result.ref, name: r.result.name, type: "image/png", bytes: body.byteLength }), `${what}: rest ${show(rest)}`);
+    const seen = sniffImage(body);
+    must(seen?.mimeType === mimeType && seen.width === width && seen.height === height, `${what}: the harness reads ${show(seen)}`);
+    const ref = await attachViewImage((parsed as { view: ViewMarker }).view, RAFT_OWNER, r.store);
+    must(ref === imageRef(sha256Hex(body)) && r.objects.has(imageKey(RAFT_OWNER, sha256Hex(body))), `${what}: ${ref}`);
+  }
+});
+
+await check("the byte cap is attachments_view's, 1.5 MiB inclusive: 1,572,864 is attached, 1,572,865 is refused", async () => {
+  must(MAX_IMAGE_BYTES === 1_572_864, `cap ${MAX_IMAGE_BYTES}`);
+  const at = raftView(rpng(100, 100, 1_572_864), "image/png", 100, 100);
+  const parsed = parseView(at.result.view);
+  must("view" in parsed, show(parsed));
+  must((await attachViewImage((parsed as { view: ViewMarker }).view, RAFT_OWNER, at.store)).startsWith(IMAGE_REF_PREFIX), "not attached at the cap");
+  const over = raftView(rpng(100, 100, 1_572_865), "image/png", 100, 100);
+  const refused = parseView(over.result.view);
+  must("problem" in refused && refused.problem.includes("1572865 bytes, over the 1572864-byte limit"), show(refused));
+  // The bytes' own check says the same, for a marker that understates them.
+  let threw = "";
+  try { await attachViewImage({ ...(parsed as { view: ViewMarker }).view, bytes: 1_572_865 }, RAFT_OWNER, over.store); } catch (e) { threw = String((e as Error).message); }
+  must(threw.includes("over the 1572864-byte limit"), threw);
 });
 
 // ---- the requests ---------------------------------------------------------------------------------------------

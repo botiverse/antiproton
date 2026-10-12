@@ -388,7 +388,7 @@ instead of parked, and nothing says why.
 object may carry one reserved top-level field, `view: { ref, mimeType, width?,
 height?, bytes }`: `ref` an `artifact://` reference the calling agent can read,
 `mimeType` one of `image/png`, `image/jpeg`, `image/webp`, `image/gif`, `bytes`
-the stored size exactly (at most 1,500,000), and no other key. The harness
+the stored size exactly (at most 1.5 MiB, 1,572,864, inclusive), and no other key. The harness
 reads the artifact, checks its header against `mimeType` and its sides against
 8192 pixels, and attaches it to the result for a model that can see images; a
 model that cannot is told so in the result's text, and a marker that fails a

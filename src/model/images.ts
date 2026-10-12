@@ -25,8 +25,12 @@ export const IMAGE_REF_PREFIX = "apimg:sha256:";
 export const IMAGE_MIME_TYPES = ["image/png", "image/jpeg", "image/webp", "image/gif"] as const;
 export type ImageMimeType = typeof IMAGE_MIME_TYPES[number];
 
-/** The largest image attached, raw: 2 MB as base64 at most, and the provider's per-request budget is shared with the rest. */
-export const MAX_IMAGE_BYTES = 1_500_000;
+/**
+ * The largest image attached, raw, inclusive: 1.5 MiB, the cap the Raft plugin's `attachments_view` applies
+ * (`VIEW_MAX_BYTES`, src/plugins/raft.ts), so an image that tool shows is never refused here. About 2 MiB as base64,
+ * and the provider's per-request budget is shared with the rest.
+ */
+export const MAX_IMAGE_BYTES = 1.5 * 1024 * 1024;
 
 /**
  * The longest side a provider accepts: DeepSeek refuses an image over 8192 pixels on either side. A refused image
@@ -74,13 +78,14 @@ export function sniffImage(b: Uint8Array): { mimeType: ImageMimeType; width?: nu
   if (b.length >= 10 && (ascii(0, "GIF87a") || ascii(0, "GIF89a"))) {
     return { mimeType: "image/gif", width: le16(6), height: le16(8) };
   }
-  if (b.length >= 30 && ascii(0, "RIFF") && ascii(8, "WEBP")) {
-    if (ascii(12, "VP8X")) return { mimeType: "image/webp", width: 1 + (at(24) | (at(25) << 8) | (at(26) << 16)), height: 1 + (at(27) | (at(28) << 8) | (at(29) << 16)) };
-    if (ascii(12, "VP8L")) {
+  // Each chunk's own length decides: a lossless (VP8L) file can end at byte 25, before the others' size fields.
+  if (b.length >= 16 && ascii(0, "RIFF") && ascii(8, "WEBP")) {
+    if (b.length >= 30 && ascii(12, "VP8X")) return { mimeType: "image/webp", width: 1 + (at(24) | (at(25) << 8) | (at(26) << 16)), height: 1 + (at(27) | (at(28) << 8) | (at(29) << 16)) };
+    if (b.length >= 25 && ascii(12, "VP8L")) {
       const bits = at(21) | (at(22) << 8) | (at(23) << 16) | (at(24) << 24);
       return { mimeType: "image/webp", width: (bits & 0x3fff) + 1, height: ((bits >>> 14) & 0x3fff) + 1 };
     }
-    if (ascii(12, "VP8 ")) return { mimeType: "image/webp", width: le16(26) & 0x3fff, height: le16(28) & 0x3fff };
+    if (b.length >= 30 && ascii(12, "VP8 ")) return { mimeType: "image/webp", width: le16(26) & 0x3fff, height: le16(28) & 0x3fff };
     return { mimeType: "image/webp" };
   }
   if (b.length >= 4 && at(0) === 0xff && at(1) === 0xd8 && at(2) === 0xff) {
