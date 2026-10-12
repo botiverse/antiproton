@@ -75,7 +75,7 @@ export class AnthropicMessagesModel {
 
   async complete(
     request: { system?: Array<Record<string, unknown>>; messages: AnthropicMessage[]; tools?: Array<Record<string, unknown>> },
-    opts: { reasoning?: "off" | "low" | "high"; maxTokens?: number } = {},
+    opts: { reasoning?: "off" | "low" | "high"; maxTokens?: number; onStatus?: (status: number) => void } = {},
   ): Promise<ModelResponse> {
     const binds = BINDING_MODELS.has(this.#model) && opts.reasoning !== "off";
     const body = JSON.stringify({
@@ -90,7 +90,7 @@ export class AnthropicMessagesModel {
     });
     return postModelRequest(
       {
-        url: `${this.#baseUrl}/v1/messages`, apiKey: this.#apiKey, model: this.#model, deadlineMs: this.#deadlineMs,
+        url: `${this.#baseUrl}/v1/messages`, apiKey: this.#apiKey, model: this.#model, deadlineMs: this.#deadlineMs, onStatus: opts.onStatus,
         headers: { ...this.#headers, "anthropic-version": ANTHROPIC_VERSION, ...(binds ? { "anthropic-beta": BINDING_BETA } : {}) },
         // No vendor key is sent, so the gateway supplies its own; an id it does not know comes back 401 then. Measured
         // 2026-10-12: claude-haiku-5-5 and a made-up claude-nonexistent-9 both answered 401 "x-api-key header is

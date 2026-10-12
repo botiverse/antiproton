@@ -196,7 +196,7 @@ export async function callQueuedModel(env: ModelEnv, job: any, jobId: string, im
     // model's name, since the same Claude model is reachable through /compat as well, which does not cache for it.
     const model = new AnthropicMessagesModel(request);
     const req = toAnthropicRequest(context, called, { images: sees });
-    call = () => model.complete(req);
+    call = () => model.complete(req, observe);
   } else if (usesResponses(called)) {
     const toolImages = env.RESPONSES_TOOL_IMAGES === "user" ? "user" as const : "output" as const;
     const { input, tools } = toResponsesInput(context, called, { images: sees, toolImages });
