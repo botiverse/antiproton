@@ -153,11 +153,13 @@ check("spendLimitsPanel renders defaults, today against limits, and the audit tr
 check("spendLimitsPanel flags a tenant AT its limit, the way judge refuses", () => {
   const html = spendLimitsPanel({
     defaults: { tenantUsd: 5, platformUsd: 30, exempt: [] },
-    overrides: [], events: [],
+    overrides: [{ tenantId: "zero-limit", limitUsd: 0, setBy: "op@x.dev", setAt: 1 }],
+    events: [],
     today: [{ tenantId: "exact", usd: 5 }, { tenantId: "zero-limit", usd: 0 }],
     platformToday: 5,
   });
   must(/<tr class="usd-over">[\s\S]*?<code>exact<\/code>[\s\S]*?<span class="tag">over<\/span>/.test(html), "spent === limit is over, not near");
+  must(/<tr class="usd-over">[\s\S]*?<code>zero-limit<\/code>[\s\S]*?\$0\.00[\s\S]*?<span class="tag">over<\/span>/.test(html), "a $0 limit refuses every paid call, and the row says over at $0.00");
 });
 
 check("spendLimitsPanel shows unaccepted answers beside, not inside, the tenant's number", () => {

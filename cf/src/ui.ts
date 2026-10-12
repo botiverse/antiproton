@@ -2086,7 +2086,9 @@ export function usageCostsPanel(d: {
     `<tr><td><code>${esc(res)}</code></td><td>${usd(e.cost)}</td><td>${e.unpriced.size ? [...e.unpriced].map((u) => `<code>${esc(u)}</code>`).join(" ") : "—"}</td></tr>`).join("");
   const lastIncluded = d.to - 1;
   const from = day(d.from);
-  const toInput = d.bucket === "month" ? new Date(lastIncluded).toISOString().slice(0, 7) : day(lastIncluded);
+  // The form's fields are dates in both buckets; the month bucket widens the window to whole
+  // months in the route. A month ("2026-03") in a date input is not a value the input can hold.
+  const toInput = day(lastIncluded);
   const toLabel = toInput;
   return `
 <h3>platform usage costs</h3>

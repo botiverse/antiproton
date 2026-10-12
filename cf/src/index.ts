@@ -85,7 +85,7 @@ import { busySpans, countActiveTime, unionMs, type ActivitySpan } from "../../sr
 import { countHeldTime, heldReports } from "../../src/usage/container.ts";
 import { benchPollBody } from "../../src/bench/poll-body.ts";
 import { flushUsage, parseUsageQuery, readAgentLedger, readUsage, priceFor, readUsageCosts, retainUsage, usageBacklogSince, usagePrices } from "./usage-d1.ts";
-import { adminUsageCosts, parseCostsQuery } from "./admin-usage-costs.ts";
+import { adminUsageCosts, closedCostsTo, parseCostsQuery } from "./admin-usage-costs.ts";
 import { adminSpendLimits, d1SpendLimits, limitsOf, sharedSpendGate, spendAdmit } from "./spend-limit.ts";
 import { drainCursors, hasUnsent, standDownDelay, USAGE_WAKE_DELAY_MS } from "./usage-flush.ts";
 import type { SurfaceDeps } from "./agent-surface/surface.ts";
@@ -4691,14 +4691,15 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
         }
         case "/ui/admin/usage-costs": {
           // The operator's cost view as a page, same reader as /admin/usage-costs. Default window is
-          // the last 7 days by day; a plain GET form changes it. Unpriced keys are named, not hidden.
+          // COSTS_DEFAULT_DAYS back by day; a plain GET form changes it. Unpriced keys are named, not hidden.
           const v = await viewer(request, env);
           if (!isAdmin(v, env)) return Response.json({ error: { code: "not_found", message: "no such route" } }, { status: 404 });
           const now = Date.now();
-          // The window parser the JSON route uses: whole periods, a 400-day cap, from < to, and
-          // impossible dates refused rather than rolled over. The form shows to − 1 day (the last
-          // day inside the open-ended window), so applying it does not drift the window forward.
-          const parsed = parseCostsQuery(url.searchParams, now);
+          // The window parser the JSON route uses, over the form's closed interval: whole periods,
+          // a 400-day cap, from < to, impossible dates refused. The form names the first and last
+          // day counted; closedCostsTo turns its `to` into the open boundary parseCostsQuery wants,
+          // so applying an unchanged form leaves the window where it was.
+          const parsed = parseCostsQuery(closedCostsTo(url.searchParams), now);
           if (typeof parsed === "string") {
             const fallback = parseCostsQuery(new URLSearchParams(), now) as { from: number; to: number; bucket: "day" | "month" };
             return new Response(usageCostsPanel({ ...fallback, tenants: [], unpriced: [], error: parsed }), { headers: { "cache-control": "no-store", "content-type": "text/html; charset=utf-8" } });
