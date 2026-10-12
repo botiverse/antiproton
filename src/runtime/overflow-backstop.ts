@@ -403,30 +403,39 @@ const SENT_SAYS = /(?:Message sent to|posted to) (\S+?)\.? (?:Message ID: |as me
  */
 export const isProgramTool = (name: string) => toolPart(name) === "run_js";
 
+/** The states Raft's own result has for a send that went out: a message (`messages_send`, `messages_reply`) or an action card (`actions_prepare`). */
+const SENT_STATES = new Set(["sent", "prepared"]);
+
 /**
- * Every send a program's result reports (`SENT_SAYS`), in any string at any depth, its JSON-in-string outputs included.
- * A Raft message line inside it (a read the program made) is someone's text, not a report, and is never scanned.
+ * Every send a program's result reports, at any depth, its JSON-in-string outputs included. Only an object shaped like
+ * Raft's own send result is read: `{ state: "sent" | "prepared", text }`, and only its `text` (`SENT_SAYS`). Any other
+ * string in the output can be someone else's text with Raft's words in it: a message the program read, a stored note
+ * (`state__get`), a fetched page.
  */
 export function sendsReported(resultText: string): Array<{ target: string; id: string }> {
   const out: Array<{ target: string; id: string }> = [];
-  const scan = (t: string) => { for (const m of t.matchAll(SENT_SAYS)) out.push({ target: m[1]!, id: m[2]! }); };
   const walk = (v: unknown, depth: number): void => {
     if (depth > 8) return;
     if (typeof v === "string") {
-      if (/^\s*[[{]/.test(v)) { try { walk(JSON.parse(v), depth + 1); return; } catch { /* text */ } }
-      if (!RAFT_HEAD.test(v)) scan(v);
+      if (/^\s*[[{]/.test(v)) { try { walk(JSON.parse(v), depth + 1); } catch { /* text */ } }
     } else if (Array.isArray(v)) for (const x of v) walk(x, depth + 1);
-    else if (v && typeof v === "object") for (const x of Object.values(v)) walk(x, depth + 1);
+    else if (v && typeof v === "object") {
+      const o = v as { state?: unknown; text?: unknown };
+      if (typeof o.state === "string" && SENT_STATES.has(o.state) && typeof o.text === "string") {
+        if (!RAFT_HEAD.test(o.text)) for (const m of o.text.matchAll(SENT_SAYS)) out.push({ target: m[1]!, id: m[2]! });
+        return;
+      }
+      for (const x of Object.values(v)) walk(x, depth + 1);
+    }
   };
-  let parsed: unknown;
-  try { parsed = JSON.parse(resultText); } catch { parsed = undefined; }
-  if (parsed === undefined) scan(resultText); else walk(parsed, 0);
+  walk(resultText, 0);
   return out;
 }
 
 /** The id of the message a send made, when its result names one: Raft's words (`sendsReported`), or a JSON field. */
 function sentId(resultText: string): string | null {
-  const said = sendsReported(resultText)[0];
+  // A messaging tool's own result: its words are Raft's, in whatever shape they came.
+  const said = sendsReported(resultText)[0] ?? [...resultText.matchAll(SENT_SAYS)].map((m) => ({ id: m[2]! }))[0];
   if (said) return said.id;
   let v: unknown;
   try { v = JSON.parse(resultText); } catch { return null; }

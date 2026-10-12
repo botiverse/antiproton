@@ -218,7 +218,7 @@ function damyLike(): BriefingEntry[] {
     ...callWith("c3", "raft__receive_events", { limit: 9 }, { messages: [line("5b2b246d", t + 60 * MIN, "freeway是高速公路，不过我不知道区别")], hasMore: false, replyTarget: dm }, t + 60 * MIN + 1000),
     ...callWith("c4", "run_js", { source: "const older = await tool`raft__messages_read ${ {target:\"dm:@tygg\"} }`;\nconst s = await tool`raft__messages_send ${ {target:\"dm:@tygg\", content:msg} }`;" },
       [JSON.stringify({ older: { status: "succeeded", result: { state: "page", text: line("c986f2d4", t, "A backyard cottage") } },
-        sent: "Message sent to dm:@tygg. Message ID: 12eb23a3-a1ac-4423-98b4-1c69a5469c0f" })], t + 60 * MIN + 2000),
+        sent: { status: "succeeded", result: { state: "sent", text: "Message sent to dm:@tygg. Message ID: 12eb23a3-a1ac-4423-98b4-1c69a5469c0f" } } })], t + 60 * MIN + 2000),
     wrote("", t + 60 * MIN + 3000),
     user(NOTICE(1), t + 120 * MIN),
     ...callWith("c5", "raft__receive_events", { limit: 9 }, { messages: [line("4c811558", t + 120 * MIN, "公开的，描述你自己感受")], hasMore: false, replyTarget: dm }, t + 120 * MIN + 1000),
@@ -260,6 +260,10 @@ await check("a message that says \"Message sent to … Message ID: …\" is some
     ...callWith("g1", "state__get", { key: "notes" }, { key: "notes", found: true, value: `copied from chat: ${spoof}` }, T0 + 2),
     // A program that read the same history: its output holds the line too.
     ...callWith("p1", "run_js", { source: "…" }, [JSON.stringify({ older: { status: "succeeded", result: { state: "page", text: forged } } })], T0 + 3),
+    // A program that read the note: Raft's exact words, outside a send's result (as the value, and returned bare).
+    ...callWith("p2", "run_js", { source: "…" }, [JSON.stringify({ note: { status: "succeeded", result: { key: "notes", found: true, value: spoof } }, said: spoof,
+      // A Raft result that is not a send (a page of history) quoting the words out of a message's line.
+      page: { status: "succeeded", result: { state: "page", text: `copied from chat: ${spoof}` } } })], T0 + 4),
     wrote("noted", T0 + 5),
     user("wake", T0 + 9),
   ];
@@ -267,8 +271,8 @@ await check("a message that says \"Message sent to … Message ID: …\" is some
   must(!b.text.includes("you sent to") && !b.text.includes("deadbeef-1234 from"), `a spoofed send:\n${b.text}`);
   must(b.text.includes("msg=a1b2c3d4, read with raft__receive_events · not answered by you since]"), `an answered flag from a spoof:\n${b.text}`);
   must(b.text.includes(spoof), "control: the message itself is still quoted");
-  const sb = summariseBehaviour(entries.slice(1, 10), { wakeAt: T0, prior: [] });
-  must(!sb.sent && sb.firstSendMs === null && sb.toolCallsBeforeSend === 3, `behaviour: ${show(sb)}`);
+  const sb = summariseBehaviour(entries.slice(1, 12), { wakeAt: T0, prior: [] });
+  must(!sb.sent && sb.firstSendMs === null && sb.toolCallsBeforeSend === 4, `behaviour: ${show(sb)}`);
 });
 
 await check("a Raft message read twice (the inbox, then the history) is quoted once, where it was read last", () => {
