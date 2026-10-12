@@ -2,7 +2,8 @@
 
 What a model call costs, where that cost is recorded, and how the record is
 checked; and, for every resource the ledger counts, what it is priced at, who
-paid for it, and how long its hours are kept (the last three sections). This is the contract for the `pd` engine (pi-durable). pi 0.85
+paid for it, what a day of it may cost before model calls are refused, and how
+long its hours are kept (the last four sections). This is the contract for the `pd` engine (pi-durable). pi 0.85
 (`pi085`) still meters at commit, from its own `pi_usage` rows
 (`src/store/pi-storage.ts`); the one thing it shares is the model name the
 consumer stamps on an answer (below).
@@ -136,8 +137,8 @@ provider for. The pd engine does not meter it. pi085 still writes it as
 
 **One credit is one US dollar.** `usage_prices.credits_per_unit`
 (`cf/migrations/0005_usage.sql`) is dollars per unit, and every reader shows it
-as an estimated dollar amount. This is accounting only: nothing is charged,
-limited or refused because of it.
+as an estimated dollar amount. Nothing is charged because of it; what is
+refused because of it is said in "Daily limits" below.
 
 The first prices are seeded by `cf/migrations/0016_usage_prices_seed.sql`, all
 effective from 2026-10-09T00:00:00Z; usage before that reads as unpriced. Later
@@ -213,6 +214,103 @@ table holds, so a `*` meant for our account cannot reach it.
   credential of its own is called on the deployment's default model with the
   operator's key (`takeJob`, `cf/src/runtime.ts`). So all `model.tokens` are
   ours to pay and are priced.
+
+## Daily limits
+
+Two limits per UTC day, in US dollars at the prices above (`cf/src/spend-limit.ts`,
+`cf/migrations/0018_spend_limits.sql`):
+
+| limit | default | set by | counts |
+|---|---|---|---|
+| per tenant | $5 | `DAILY_LIMIT_USD`; an admin's override per tenant (`/admin/spend-limits`) wins | the tenant's priced usage today, `model.tokens.unaccepted` left out (it is ours, not theirs) |
+| platform | $30 | `PLATFORM_DAILY_LIMIT_USD` | every tenant's priced usage today, `model.tokens.unaccepted` and exempt tenants included |
+
+Either var set to `off` is no limit; a value that is not a number at or above 0
+is logged (`spend_limit.bad_config`) and read as the default, so a typo does not
+lift a cap. A tenant in `DAILY_LIMIT_EXEMPT_TENANTS` (comma-separated; unset is
+`bench`) is refused by neither limit but still counts toward the platform total.
+No tenant is exempt by being the operator's: the code has no such marker (the
+original `demo` tenant also holds invited people), so an operator's tenant is
+exempted by naming it in the var.
+
+**What is counted is what the ledger prices**, so what costs us money: model
+tokens on the operator's provider accounts, object time, operator-paid
+containers, and operator-paid tool calls (Exa). A key paid with the tenant's own
+credential (`own:`, "Who pays" above) is priced 0 and counts nothing toward
+either limit; an unpriced key counts nothing, as in every view. So spend on an
+unpriced key — a model with no price row, which an admin's model choice can
+name — is not limited at all; each unpriced key a reading meets is logged as
+`spend_limit.unpriced`, once per key per isolate per UTC day, so a missing price
+row is visible.
+
+**Where it is checked.** In the queue consumer (`runModelCall`,
+`cf/src/model-queue.ts`), after the job is taken and before the provider is
+called. Every model call of both engines — a main conversation's turn, a
+sub-session's or background job's, a retry, a compaction's summary — is a queued
+job answered there ("The unit" above), so this is the one place. A given-up job
+(the dead letter queue) calls no provider and is not asked.
+
+**A refused call** is answered, not thrown: the job's answer is a failed turn
+whose `errorMessage` is the fixed `usage limit reached (out of budget); see the
+turn's error` and whose `providerError` — what the transcript, the console and the
+Agents API show (`failureText`) — is:
+
+- `Daily usage limit reached ($X of $Y); resets at 00:00 UTC.`, or
+- `Platform daily usage limit reached; resets at 00:00 UTC.` (asked first: when
+  it is reached nobody's calls are made).
+
+An agent Raft runs tells Raft the same sentence: the failed call's `model.call`
+trace row carries it (`attrs.limit`, `modelCallRow` in `src/trace/seams.ts`), so
+the turn's `BridgeFatal` has the `errorClass` `usage_limit_reached: <sentence>`
+(Raft's activity log shows it, up to 120 characters) and the agent's `error`
+status has the sentence as its `detail` (Raft's dot shows it). Any other failed
+call is `model_call_failed` with no detail, as before. The model never reads the
+sentence: both engines leave a failed turn out of the next request.
+
+So the queue acks the message and does not retry it; neither engine's harness
+retries it (the fixed text matches none of pi-ai's retryable patterns, and "out of
+budget" is in its non-retryable ones); and neither pd's compaction nor pi085's
+overflow backstop reads it as an overflow, so no rebuild runs and `needs_reset`
+is not set. The run that asked ends there with that error. The answer carries no
+usage, so nothing is metered for it. At 00:00 UTC the next reading is of a new
+day and calls are made again; nobody acts.
+
+**How fresh the reading is.** The consumer's isolate keeps each tenant's last
+reading — one D1 round trip of three parallel reads: today's hours of every
+tenant, the prices, the tenant's override — for 30 s (`SPEND_CACHE_MS`), and for
+5 s once either total is within 80 % of its limit (`SPEND_CACHE_NEAR_MS`); a
+reading from an earlier UTC day is never used. An admin's override reaches a
+running isolate within those 30 s. The ledger itself lags: an object sends its
+usage at the end of the alarm pass that a delivered answer wakes, so a call's
+tokens are usually in D1 within seconds of the answer.
+
+**The overshoot is bounded by that lag, not by zero.** A call admitted under
+the limit is made and paid for even if it crosses it; so is a call admitted on a
+reading that does not yet show the crossing. So past the limit a tenant can spend,
+per agent, the call in flight when it was crossed, plus any call that agent
+starts within the reading's age (at most 5 s near the limit) and the ledger's
+flush lag after it. An agent's calls follow one another (each waits for the last
+answer and its tools), so that is one call per agent in the usual case, more only
+when a flush is slow. Time the tenant keeps using without a model call is not
+refused: a running container is not stopped and keeps counting, and so does the
+object's own time; a new operator-paid container is not refused either, though no
+new tool call reaches one without a model call first. Exempt tenants are never
+refused, so the platform total can pass its limit by what they spend.
+
+**A spend read that fails admits the call** and logs `spend_limit.read_failed`:
+availability is worth more than a cap of a few dollars, and the ledger is
+unchanged, so the next read that works refuses as it should. A failure is not
+kept, so the next call reads again.
+
+**Overrides**, for an admin (`isAdmin`, as `/admin/models`; on the admin host
+too):
+
+    GET    /admin/spend-limits                              → { defaults, overrides, events }
+    PUT    /admin/spend-limits { tenantId, limitUsd }       → the row; limitUsd null: no per-tenant limit
+    DELETE /admin/spend-limits { tenantId }                 → 204, or 404 when there was none
+
+Every set and clear is kept in `spend_limit_events` with who, when, and the value
+it replaced. A tenant with `limitUsd` null is still refused at the platform limit.
 
 ## Retention
 

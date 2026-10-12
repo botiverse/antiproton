@@ -9,7 +9,7 @@
  *   model.call toolUse, at its end → working   (tools run next)
  *   tool.call, at its start       → working
  *   model.call stop|length|aborted → online    (the turn is over)
- *   model.call error              → error
+ *   model.call error              → error      (with why, for a daily spend limit's refusal)
  *   session.needs_reset set       → error      (with why: pushes are refused until a reset)
  *
  * A row is one ENDED span, so a start is dated back by its measured `ms`. Events
@@ -48,7 +48,11 @@ export function statusEvents(agentId: string, rows: readonly TraceOutboxRow[], b
         if (ms > 0) raw.push({ at: row.at - ms, key: `${id}:start`, status: "thinking" });
         if (row.status === "toolUse") raw.push({ at: row.at, key: id, status: "working" });
         else if (row.status === "stop" || row.status === "length" || row.status === "aborted") raw.push({ at: row.at, key: id, status: "online" });
-        else if (row.status === "error") raw.push({ at: row.at, key: id, status: "error" });
+        // A call refused for a daily spend limit says why, as `detail`, which Raft's dot shows beside `error`.
+        else if (row.status === "error") {
+          const limit = typeof row.attrs.limit === "string" && row.attrs.limit ? row.attrs.limit.slice(0, 200) : null;
+          raw.push({ at: row.at, key: id, status: "error", ...(limit ? { detail: limit } : {}) });
+        }
         break;
       case "session.needs_reset":
         if (row.status === "set") raw.push({ at: row.at, key: id, status: "error", detail: "Conversation too long for the model; waiting for an operator reset" });

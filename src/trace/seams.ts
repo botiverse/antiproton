@@ -122,6 +122,8 @@ export function modelCallRow(m: {
   prefix?: Record<string, unknown> | null;
   /** The answer's own token counts, so a cache miss can be read against the prefix on the same row. */
   usage?: { input?: unknown; cacheRead?: unknown; cacheWrite?: unknown } | null;
+  /** The sentence of a call refused for a daily spend limit (`spendLimitRefusal`, src/model/pi-bridge.ts), for Raft. */
+  limit?: string;
 }): TraceRow {
   const ms = typeof m.createdAt === "number" && typeof m.answeredAt === "number"
     ? Math.max(0, m.answeredAt - m.createdAt) : undefined;
@@ -135,7 +137,8 @@ export function modelCallRow(m: {
     status: m.stopReason, verdict: answerVerdict(m.stopReason),
     ...(ms === undefined ? {} : { ms }),
     // The model first: keys drop from the end when attrs are too long (src/trace/outbox.ts `attrsOf`).
-    attrs: { model: m.model, ...tokens, ...(m.prefix ? { prefix: m.prefix } : {}) },
+    // The limit's sentence next: what the owner is shown (src/runtime/activity.ts), the last thing to be dropped.
+    attrs: { model: m.model, ...(m.limit ? { limit: m.limit } : {}), ...tokens, ...(m.prefix ? { prefix: m.prefix } : {}) },
   };
 }
 

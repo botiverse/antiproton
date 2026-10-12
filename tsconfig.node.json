@@ -108,6 +108,7 @@
     "test/mount-offered.ts",
     "test/model-queue.ts",
     "test/model-refusal.ts",
+    "test/spend-limit.ts",
     "test/model-request-snapshot.ts",
     "test/model-images.ts",
     "test/model-image-evidence.ts",

@@ -85,6 +85,7 @@ import { countHeldTime, heldReports } from "../../src/usage/container.ts";
 import { benchPollBody } from "../../src/bench/poll-body.ts";
 import { flushUsage, parseUsageQuery, readAgentLedger, readUsage, priceFor, readUsageCosts, retainUsage, usageBacklogSince, usagePrices } from "./usage-d1.ts";
 import { adminUsageCosts } from "./admin-usage-costs.ts";
+import { adminSpendLimits, d1SpendLimits, limitsOf, sharedSpendGate, spendAdmit } from "./spend-limit.ts";
 import { drainCursors, hasUnsent, standDownDelay, USAGE_WAKE_DELAY_MS } from "./usage-flush.ts";
 import type { SurfaceDeps } from "./agent-surface/surface.ts";
 import type { HeldListing, HeldRead } from "../../src/plugins/types.ts";
@@ -152,6 +153,12 @@ export interface Env {
   USER_MODELS?: unknown;
   DEEPSEEK_BASE_URL: string;
   HARNESS_MODEL: string;
+  /** A tenant's daily spend limit in US dollars (cf/src/spend-limit.ts): unset is $5, `off` none. An admin's override per tenant wins. */
+  DAILY_LIMIT_USD?: string;
+  /** Every tenant's spend together, per UTC day, in US dollars: unset is $30, `off` none. */
+  PLATFORM_DAILY_LIMIT_USD?: string;
+  /** Comma-separated tenants neither limit refuses (they still count toward the platform total); unset is `bench`. */
+  DAILY_LIMIT_EXEMPT_TENANTS?: string;
   ARTIFACT_BUCKET: string;
   /** JSON {"ak","sk"} for the operator's run9 account. Absent means the `node`
    *  mount exists but cannot start a container. */
@@ -320,6 +327,9 @@ function modelQueueDeps(env: Env): ModelQueueDeps {
         { api: "offloaded", provider: "openai-compatible", id: env.HARNESS_MODEL }),
       jobId: m.jobId,
     }),
+    // The daily spend limits, asked before every provider call (cf/src/spend-limit.ts): a refusal is delivered
+    // as the job's answer and the call is never made.
+    admit: spendAdmit(sharedSpendGate(env), env.HARNESS_MODEL),
   };
 }
 
@@ -3865,6 +3875,16 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
         overrides: d1ModelOverrides(env.CONTROL_DB), providers, defaults: { model: env.HARNESS_MODEL }, now: Date.now,
         userModelsError: userModels.error, options: userModels.offered,
       });
+    }
+    if (url.pathname === "/admin/spend-limits") {
+      // As /admin/models: a signed-in admin or the operator's token, and anyone else is told nothing.
+      const v = await viewer(request, env);
+      if (!isAdmin(v, env)) return Response.json({ error: { code: "not_found", message: "no such route" } }, { status: 404 });
+      let body: unknown;
+      if (request.method === "PUT" || request.method === "DELETE") {
+        try { body = JSON.parse((await request.text()) || "{}"); } catch { return Response.json({ error: { code: "invalid_json", message: "the body is not JSON" } }, { status: 400 }); }
+      }
+      return adminSpendLimits(request.method, body, v!.sub ?? v!.email, { store: d1SpendLimits(env.CONTROL_DB), limits: limitsOf(env), now: Date.now });
     }
     if (url.pathname.startsWith("/v1/")) return v1(request, env, url);
     // Conformance gets its own object: the P0 probe created an incompatible
