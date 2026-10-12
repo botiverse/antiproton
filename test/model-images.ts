@@ -19,7 +19,7 @@ import { AgentRuntime } from "../cf/src/runtime.ts";
 import { callQueuedModel, operatorModelOf, type ModelEnv } from "../cf/src/model-request.ts";
 import { fromResponse, toRequest, toResponsesInput } from "../src/model/pi-bridge.ts";
 import {
-  IMAGE_REF_PREFIX, MAX_IMAGE_BYTES, NO_VISION_SENTENCE, imageKey, imageRef, imageRefHash, resolveImages, sha256Hex, sniffImage,
+  IMAGE_REF_PREFIX, MAX_IMAGE_BYTES, MAX_IMAGE_SIDE, NO_VISION_SENTENCE, imageProblem, imageKey, imageRef, imageRefHash, resolveImages, sha256Hex, sniffImage,
 } from "../src/model/images.ts";
 import { acceptsImages } from "../src/model/context-windows.ts";
 import type { ModelResponse } from "../src/model/types.ts";
@@ -181,7 +181,7 @@ await check("the capability table: DeepSeek Flash and GPT-5.6 Luna see images, b
 
 // ---- the Raft plugin's attachments_view, as it shapes a result -------------------------------------------------
 //
-// Builders and the result's shape copied from test/raft-attachments-view.ts (#856): its `view()` hands back
+// Builders and the result's shape copied from #856's attachments_view tests: its `view()` hands back
 // `{ attachmentId, ref, name, type, bytes, view: { ref, mimeType, width, height, bytes } }`, the file kept at
 // `t/<tenant>/<agent>/raft/attachments/<id>/<filename>` and shown as `artifact://raft/attachments/<id>/<filename>`.
 // Every result it can return must pass here, and its size cap (1.5 MiB, inclusive) must be this one.
@@ -217,6 +217,114 @@ function rgif(width: number, height: number): Uint8Array {
   const image = [0x21, 0xf9, 4, 0, 10, 0, 0, 0, 0x2c, 0, 0, 0, 0, 1, 0, 1, 0, 0, 2, 2, 0x4c, 0x01, 0];
   return bytesOf(ascii("GIF89a"), le16(width), le16(height), [0x80, 0, 0], [0, 0, 0, 255, 255, 255], image, [0x3b]);
 }
+/**
+ * The Raft plugin's own header reader (`imageHeader` in #856, at 3bb71b2), copied verbatim as the oracle: every file
+ * it accepts must be one `sniffImage` accepts, as the same type with the same dimensions. Replace with an import of
+ * it once both have landed.
+ */
+type OracleHeader =
+  | { ok: true; mimeType: "image/png" | "image/jpeg" | "image/webp" | "image/gif"; width: number; height: number }
+  | { ok: false; what: string };
+function oracleHeader(b: Uint8Array): OracleHeader {
+  const n = b.byteLength;
+  const at = (i: number, s: string) => i + s.length <= n && [...s].every((c, k) => b[i + k] === c.charCodeAt(0));
+  const be16 = (i: number) => (b[i]! << 8) | b[i + 1]!;
+  const le16 = (i: number) => b[i]! | (b[i + 1]! << 8);
+  const le24 = (i: number) => b[i]! | (b[i + 1]! << 8) | (b[i + 2]! << 16);
+  const sized = (mimeType: Extract<OracleHeader, { ok: true }>["mimeType"], width: number, height: number, name: string): OracleHeader =>
+    width > 0 && height > 0 ? { ok: true, mimeType, width, height } : { ok: false, what: `${name} whose header gives no dimensions` };
+
+  if (at(0, "\x89PNG\r\n\x1a\n")) {
+    if (n < 24 || !at(12, "IHDR")) return { ok: false, what: "a PNG whose header is cut short or malformed" };
+    // Chunks to the image data: an APNG declares its animation (`acTL`) before the first IDAT, so a file cut before
+    // either cannot be told still from animated and is refused. Each step moves at least a chunk's 12 framing bytes.
+    for (let i = 8; ; i += 12 + b[i]! * 2 ** 24 + (b[i + 1]! << 16 | b[i + 2]! << 8 | b[i + 3]!)) {
+      if (i + 8 > n) return { ok: false, what: "a PNG cut short before its image data, so whether it is animated cannot be told" };
+      if (at(i + 4, "acTL")) return { ok: false, what: "an animated PNG" };
+      if (at(i + 4, "IDAT") || at(i + 4, "IEND")) break;
+    }
+    return sized("image/png", b[16]! * 2 ** 24 + (b[17]! << 16 | b[18]! << 8 | b[19]!), b[20]! * 2 ** 24 + (b[21]! << 16 | b[22]! << 8 | b[23]!), "a PNG");
+  }
+  if (n >= 3 && b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) {
+    // Segments from the first marker, fill bytes skipped, to the frame header: the first SOFn, C0–CF but for DHT (C4),
+    // JPG (C8) and DAC (CC), which share the range. Each step moves at least two bytes, and anything that is not a
+    // marker where one should be (where a length under 2 lands) ends the walk.
+    let i = 2;
+    while (i + 1 < n) {
+      if (b[i] !== 0xff) break;
+      const m = b[i + 1]!;
+      if (m === 0xff) { i++; continue; }
+      if (m === 0xd9 || m === 0xda) break;
+      // TEM and RST0–7 stand alone, with no length after them.
+      if (m === 0x01 || (m >= 0xd0 && m <= 0xd7)) { i += 2; continue; }
+      const length = be16(i + 2);
+      if (m >= 0xc0 && m <= 0xcf && m !== 0xc4 && m !== 0xc8 && m !== 0xcc) {
+        if (i + 8 >= n || length < 7) break;
+        return sized("image/jpeg", be16(i + 7), be16(i + 5), "a JPEG");
+      }
+      i += 2 + length;
+    }
+    return { ok: false, what: "a JPEG whose frame header (its dimensions) could not be found: cut short or malformed" };
+  }
+  if (at(0, "RIFF") && at(8, "WEBP")) {
+    if (at(12, "VP8 ")) {
+      if (n < 30 || !(b[23] === 0x9d && b[24] === 0x01 && b[25] === 0x2a)) return { ok: false, what: "a WebP whose header is cut short or malformed" };
+      return sized("image/webp", le16(26) & 0x3fff, le16(28) & 0x3fff, "a WebP");
+    }
+    if (at(12, "VP8L")) {
+      if (n < 25 || b[20] !== 0x2f) return { ok: false, what: "a WebP whose header is cut short or malformed" };
+      const bits = b[21]! | (b[22]! << 8) | (b[23]! << 16) | (b[24]! * 2 ** 24);
+      return sized("image/webp", (bits & 0x3fff) + 1, (Math.floor(bits / 2 ** 14) & 0x3fff) + 1, "a WebP");
+    }
+    if (at(12, "VP8X")) {
+      if (n < 30) return { ok: false, what: "a WebP whose header is cut short or malformed" };
+      if (b[20]! & 0x02) return { ok: false, what: "an animated WebP" };
+      return sized("image/webp", le24(24) + 1, le24(27) + 1, "a WebP");
+    }
+    return { ok: false, what: "a WebP of a kind whose header is not read here" };
+  }
+  if (at(0, "GIF87a") || at(0, "GIF89a")) {
+    const width = le16(6);
+    const height = le16(8);
+    // Every block to the trailer, counting image descriptors: a GIF that does not reach its trailer cannot be told
+    // still from animated, so it is refused rather than taken as still.
+    let i = 13 + (b[10]! & 0x80 ? 3 * 2 ** ((b[10]! & 7) + 1) : 0);
+    let frames = 0;
+    // A cut anywhere lands `i` at or past the end, which the loop's first line refuses.
+    const subBlocks = () => { while (i < n && b[i] !== 0) i += b[i]! + 1; i++; };
+    for (;;) {
+      if (i >= n) return { ok: false, what: "a GIF cut short before its end, so whether it is animated cannot be told" };
+      const block = b[i]!;
+      if (block === 0x3b) break;
+      if (block === 0x2c) {
+        if (++frames > 1) return { ok: false, what: "an animated GIF" };
+        const packed = b[i + 9] ?? 0;
+        i += 10 + (packed & 0x80 ? 3 * 2 ** ((packed & 7) + 1) : 0) + 1;
+        subBlocks();
+      } else if (block === 0x21) {
+        i += 2;
+        subBlocks();
+      } else return { ok: false, what: "a GIF whose blocks are malformed" };
+    }
+    if (frames === 0) return { ok: false, what: "a GIF with no image in it" };
+    return sized("image/gif", width, height, "a GIF");
+  }
+  if (at(0, "%PDF-")) return { ok: false, what: "a PDF document" };
+  if (at(0, "BM")) return { ok: false, what: "a BMP image" };
+  if (at(0, "II*\0") || at(0, "MM\0*")) return { ok: false, what: "a TIFF image" };
+  if (at(0, "\0\0\x01\0")) return { ok: false, what: "an ICO icon" };
+  if (at(4, "ftyp")) {
+    const brand = String.fromCharCode(...b.subarray(8, 12));
+    if (/^avi[fs]$/.test(brand)) return { ok: false, what: "an AVIF image" };
+    if (/^(?:hei[cx]|hev[cx]|mif1|msf1)$/.test(brand)) return { ok: false, what: "a HEIC image" };
+    return { ok: false, what: "a video or other ISO media file" };
+  }
+  if (at(0, "PK\x03\x04")) return { ok: false, what: "a ZIP archive (or a document built on one, such as .docx)" };
+  const head = new TextDecoder().decode(b.subarray(0, 1024));
+  if (/<svg[\s>]/i.test(head)) return { ok: false, what: "an SVG image" };
+  return { ok: false, what: "a file of a type this tool does not recognise" };
+}
+
 /** What attachments_view returns for `body` named `filename`, and the store it kept it in. */
 function raftView(body: Uint8Array, mimeType: string, width: number, height: number, filename = "pic") {
   const ref = `artifact://raft/attachments/att-1/${filename}`;
@@ -254,6 +362,30 @@ await check("every result attachments_view returns (#856's own cases) is a marke
     const ref = await attachViewImage((parsed as { view: ViewMarker }).view, RAFT_OWNER, r.store);
     must(ref === imageRef(sha256Hex(body)) && r.objects.has(imageKey(RAFT_OWNER, sha256Hex(body))), `${what}: ${ref}`);
   }
+});
+
+await check("whatever attachments_view's own header reader accepts, sniffImage accepts alike, at every length", () => {
+  const fixtures: Array<[string, Uint8Array]> = [
+    ["png", rpng(640, 480)], ["png padded", rpng(3, 4, 64)], ["jpeg", rjpeg(1024, 768)], ["jpeg SOF2", rjpeg(300, 200, 0xc2)],
+    ["webp VP8", webpLossy(320, 240)], ["webp VP8L", webpLossless(1999, 17)], ["webp VP8L 1x1", webpLossless(1, 1)],
+    ["webp VP8X", webpExtended(800, 600)], ["gif", rgif(64, 32)], ["generated png", IMG], ["gif (other builder)", GIF], ["jpeg (other builder)", JPEG], ["webp (other builder)", WEBP_VP8X],
+  ];
+  let accepted = 0;
+  for (const [what, body] of fixtures) {
+    // Every prefix too: the shortest file the plugin accepts is the one a length rule disagrees about.
+    for (let n = 1; n <= body.byteLength; n++) {
+      const cut = body.subarray(0, n);
+      const theirs = oracleHeader(cut);
+      if (!theirs.ok) continue;
+      accepted++;
+      const ours = sniffImage(cut);
+      must(ours?.mimeType === theirs.mimeType && ours.width === theirs.width && ours.height === theirs.height,
+        `${what} at ${n} bytes: the plugin reads ${show(theirs)}, the harness ${show(ours)}`);
+      must(imageProblem(cut, theirs.mimeType) === null || theirs.width > MAX_IMAGE_SIDE || theirs.height > MAX_IMAGE_SIDE,
+        `${what} at ${n} bytes: ${imageProblem(cut, theirs.mimeType)}`);
+    }
+  }
+  must(accepted >= fixtures.length, `control: the oracle accepted only ${accepted} files`);
 });
 
 await check("the byte cap is attachments_view's, 1.5 MiB inclusive: 1,572,864 is attached, 1,572,865 is refused", async () => {

@@ -27,7 +27,7 @@ export type ImageMimeType = typeof IMAGE_MIME_TYPES[number];
 
 /**
  * The largest image attached, raw, inclusive: 1.5 MiB, the cap the Raft plugin's `attachments_view` applies
- * (`VIEW_MAX_BYTES`, src/plugins/raft.ts), so an image that tool shows is never refused here. About 2 MiB as base64,
+ * (its `VIEW_MAX_BYTES`, #856), so an image that tool shows is never refused here. About 2 MiB as base64,
  * and the provider's per-request budget is shared with the rest.
  */
 export const MAX_IMAGE_BYTES = 1.5 * 1024 * 1024;
@@ -89,18 +89,23 @@ export function sniffImage(b: Uint8Array): { mimeType: ImageMimeType; width?: nu
     return { mimeType: "image/webp" };
   }
   if (b.length >= 4 && at(0) === 0xff && at(1) === 0xd8 && at(2) === 0xff) {
-    // The frame header (SOF0..SOF15 but DHT, JPG and DAC) carries the size; walk the segments to it.
+    // The frame header (SOF0..SOF15 but DHT, JPG and DAC) carries the size; walk the segments to it with the Raft
+    // plugin's bounds (its `imageHeader`, #856), so a frame header it reads at the end of a short file is read here too.
     let i = 2;
-    while (i + 9 < b.length) {
-      if (at(i) !== 0xff) { i++; continue; }
+    while (i + 1 < b.length) {
+      if (at(i) !== 0xff) break;
       const marker = at(i + 1);
       if (marker === 0xff) { i++; continue; }
-      if (marker === 0xd8 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) { i += 2; continue; }
+      if (marker === 0xd9 || marker === 0xda) break;
+      if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) { i += 2; continue; }
+      const length = be16(i + 2);
       if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) {
+        if (i + 8 >= b.length || length < 7) break;
         return { mimeType: "image/jpeg", height: be16(i + 5), width: be16(i + 7) };
       }
-      i += 2 + be16(i + 2);
+      i += 2 + length;
     }
+    // No frame header found: still a JPEG by its first bytes, with no size to check.
     return { mimeType: "image/jpeg" };
   }
   return null;
