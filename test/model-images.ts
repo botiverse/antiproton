@@ -666,6 +666,18 @@ await check("every window size 1..9 and byte budget: the newest image is always 
     }
   }
   must(cases === 9 * 6 * N, `cases ${cases}`);
+  // Where only the count binds, the start moves once per step, min(4, the window), and never more often.
+  for (let maxImages = 1; maxImages <= 9; maxImages++) {
+    let before = 0, moves = 0;
+    for (let k = 1; k <= N; k++) {
+      const kinds = imagesIn(await resolveImages(m.context(k), m.load, { maxImages, maxBytes: 100 * 1024 * KB }) as { messages: any[] }).map((p: any) => p.type);
+      const start = kinds.indexOf("image");
+      if (start !== before) moves++;
+      before = start;
+    }
+    const step = Math.min(IMAGE_WINDOW_STEP, maxImages);
+    must(moves <= Math.ceil(N / step), `${maxImages} images: the start moved ${moves} times over ${N} images (step ${step})`);
+  }
 });
 
 await check("a read that fails takes the room its reference declares: the window does not move back, and older images stay omitted", async () => {
