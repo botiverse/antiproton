@@ -6,6 +6,7 @@
  * throw, it just makes the agent behave oddly one turn later.
  */
 import { toRequest, fromResponse } from "../src/model/pi-bridge.ts";
+import { NO_VISION_SENTENCE } from "../src/model/images.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 function check(name: string, fn: () => void) {
@@ -52,22 +53,42 @@ check("没有工具调用的助手回合不带 tool_calls 键", () => {
 // The request a version 1 context builds, as master built it before version 2 existed (printed
 // by that commit's toRequest from this same context). The live runtime writes version 1, so
 // this string is what its provider calls must keep being, byte for byte.
-const V1_CONTEXT = {
+//
+// The tool result held an image block here, and the golden pinned it being dropped without a word. An image is now
+// shown to a model that can see it and replaced by a sentence for one that cannot (src/model/pi-bridge.ts), so the
+// golden is checked against the same context without that block — no image, the same bytes as ever — and the block
+// itself is checked below for what it now becomes.
+const IMAGE_BLOCK = { type: "image", data: "x", mimeType: "image/png" };
+const V1_WITH_IMAGE = {
   systemPrompt: "be brief",
   messages: [
     { role: "user", content: "hi", timestamp: 1 },
     { role: "assistant", content: [{ type: "thinking", thinking: "hmm" }, { type: "text", text: "looking" }, { type: "toolCall", id: "c1", name: "read", arguments: { url: "u" } }], jobId: "mj_1" },
-    { role: "toolResult", toolCallId: "c1", toolName: "read", content: [{ type: "text", text: "page" }, { type: "image", data: "x", mimeType: "image/png" }], isError: false },
+    { role: "toolResult", toolCallId: "c1", toolName: "read", content: [{ type: "text", text: "page" }, IMAGE_BLOCK], isError: false },
     { role: "user", content: [{ type: "text", text: "and " }, { type: "text", text: "then?" }], timestamp: 4 },
     { role: "assistant", content: [{ type: "text", text: "done" }] },
   ],
   tools: [{ name: "read", description: "d", parameters: { type: "object", properties: { url: { type: "string" } } } }],
+};
+const V1_CONTEXT = {
+  ...V1_WITH_IMAGE,
+  messages: V1_WITH_IMAGE.messages.map((m) => Array.isArray(m.content)
+    ? { ...m, content: (m.content as Array<{ type: string }>).filter((c) => c.type !== "image") } : m),
 };
 const V1_GOLDEN = '{"messages":[{"role":"system","content":"be brief"},{"role":"user","content":"hi"},{"role":"assistant","content":"looking","tool_calls":[{"id":"c1","type":"function","function":{"name":"read","arguments":"{\\"url\\":\\"u\\"}"}}]},{"role":"tool","tool_call_id":"c1","content":"page"},{"role":"user","content":"and then?"},{"role":"assistant","content":"done"}],"tools":[{"name":"read","description":"d","parameters":{"type":"object","properties":{"url":{"type":"string"}}}}]}';
 
 check("v1(无版本标记)的请求与引入 v2 之前逐字节相同", () => {
   const got = JSON.stringify(toRequest(V1_CONTEXT as any));
   if (got !== V1_GOLDEN) throw new Error(`v1 request changed\n  got  ${got}\n  want ${V1_GOLDEN}`);
+  // Whether the model can see images does not enter into a request that has none.
+  const seeing = JSON.stringify(toRequest(V1_CONTEXT as any, { images: true }));
+  if (seeing !== V1_GOLDEN) throw new Error(`v1 request changed for a vision model\n  got  ${seeing}\n  want ${V1_GOLDEN}`);
+});
+
+check("工具结果里的图片不会被悄悄丢掉:看不见图片的模型得到一句说明", () => {
+  const { messages } = toRequest(V1_WITH_IMAGE as any);
+  const tool = messages.find((m) => m.role === "tool");
+  if (tool?.content !== `page\n\n${NO_VISION_SENTENCE}`) throw new Error(`the tool result reads ${JSON.stringify(tool?.content)}`);
 });
 
 check("v2 的 system 消息留在原位,成为请求里同一位置的 system 消息", () => {

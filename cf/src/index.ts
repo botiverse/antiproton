@@ -40,6 +40,7 @@ import {
 import { readMeter } from "../../bench/meter.ts";
 import { BENCH_SWE_WITHHELD } from "../../bench/swebench/withheld.ts";
 import { contextWindowFor } from "../../src/model/context-windows.ts";
+import { imageKey } from "../../src/model/images.ts";
 import { rebuildPolicyOf } from "../../src/runtime/rebuild.ts";
 import { errorMessage } from "../../src/model/pi-bridge.ts";
 import { entriesToEvents } from "./pi-view.ts";
@@ -308,7 +309,12 @@ export class SandboxTools extends WorkerEntrypoint<Env> {
 function modelQueueDeps(env: Env): ModelQueueDeps {
   return {
     stub: (m) => env.AGENT.get(env.AGENT.idFromString(m.doId)),
-    call: (taken, m) => callQueuedModel(env, taken, m.jobId),
+    // An image the conversation holds is read from the agent's own prefix, named by the message's tenant and agent
+    // (src/model/images.ts `imageKey`), so a job can only ever reach its own agent's images.
+    call: (taken, m) => callQueuedModel(env, taken, m.jobId, async (sha) => {
+      const o = await env.ARTIFACTS.get(imageKey({ tenantId: m.tenantId, agentId: m.agentId }, sha));
+      return o ? new Uint8Array(await o.arrayBuffer()) : null;
+    }),
     // A given-up call is still this job's answer, so the entry it becomes names
     // the job like any other (see `jobId` on fromResponse).
     givenUp: (m) => ({

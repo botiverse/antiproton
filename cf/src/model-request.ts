@@ -5,6 +5,8 @@ import { ModelRequestRefused, OpenAiCompatibleModel } from "../../src/model/open
 import { OpenAiResponsesModel, usesResponses } from "../../src/model/openai-responses.ts";
 import { errorMessage, fromResponse, toRequest, toResponsesInput, type AnsweredMessage } from "../../src/model/pi-bridge.ts";
 import type { ModelResponse } from "../../src/model/types.ts";
+import { acceptsImages } from "../../src/model/context-windows.ts";
+import { resolveImages, type ImageLoader } from "../../src/model/images.ts";
 import { logEvent } from "../../src/core/log.ts";
 
 /**
@@ -12,7 +14,15 @@ import { logEvent } from "../../src/core/log.ts";
  * DeepSeek from DEEPSEEK_BASE_URL and DEEPSEEK_API_KEY), the secrets they name, and the default model.
  * The secrets are looked up by the names the declaration gives, so the type is open.
  */
-export type ModelEnv = { DEEPSEEK_BASE_URL?: string; DEEPSEEK_API_KEY?: string; HARNESS_MODEL: string; MODEL_PROVIDERS?: unknown; USER_MODELS?: unknown };
+export type ModelEnv = {
+  DEEPSEEK_BASE_URL?: string; DEEPSEEK_API_KEY?: string; HARNESS_MODEL: string; MODEL_PROVIDERS?: unknown; USER_MODELS?: unknown;
+  /**
+   * Where the Responses API path puts a tool result's images (`toResponsesInput`, src/model/pi-bridge.ts): `output`
+   * (the default, pi's way) or `user`, a user message after the results. Both were answered correctly through the
+   * gateway (2026-10-12); this is the switch if one of them stops being accepted.
+   */
+  RESPONSES_TOOL_IMAGES?: string;
+};
 
 /** The deployment's operator model, read from its environment (src/model/operator-request.ts says how it is called). */
 export function operatorModelOf(env: ModelEnv): OperatorModel {
@@ -112,19 +122,26 @@ export function planBinding(
  * reasoning on and its earlier reasoning replayed (src/model/openai-responses.ts); every other model through
  * chat/completions, whose request — DeepSeek's among them — test/model-request-snapshot.ts pins byte for byte.
  * The job's own options are not forwarded on either path: the reasoning level is each client's default.
+ *
+ * An image in the conversation is stored as a reference (src/model/images.ts); for a model that can see images
+ * (`acceptsImages`) each one is read through `images` — the agent's own R2 prefix, in the Worker — right before the
+ * call, and for any other model it is sent as the sentence saying it cannot see it, with nothing read.
  */
-export async function callQueuedModel(env: ModelEnv, job: any, jobId: string): Promise<AnsweredMessage> {
+export async function callQueuedModel(env: ModelEnv, job: any, jobId: string, images?: ImageLoader): Promise<AnsweredMessage> {
   const called = String(job.operatorModel ?? env.HARNESS_MODEL);
   const provider = job.operatorModel ? String(job.operatorProvider ?? DEFAULT_PROVIDER) : DEFAULT_PROVIDER;
   const request = operatorRequest(operatorModelOf(env), { provider, model: called });
+  const sees = acceptsImages(called);
+  const context = sees ? await resolveImages(job.context, images) : job.context;
   let call: () => Promise<ModelResponse>;
   if (usesResponses(called)) {
-    const { input, tools } = toResponsesInput(job.context, called);
+    const toolImages = env.RESPONSES_TOOL_IMAGES === "user" ? "user" as const : "output" as const;
+    const { input, tools } = toResponsesInput(context, called, { images: sees, toolImages });
     const model = new OpenAiResponsesModel(request);
     call = () => model.complete(input, tools ? { tools } : {});
   } else {
     const model = new OpenAiCompatibleModel(request);
-    const { messages, tools } = toRequest(job.context);
+    const { messages, tools } = toRequest(context, { images: sees });
     call = () => model.complete(messages, tools ? { tools } : {});
   }
   const identity = {

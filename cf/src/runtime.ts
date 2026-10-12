@@ -336,6 +336,8 @@ import { mcpPlugin } from "../../src/plugins/mcp.ts";
 import { createReminderPlugin } from "../../src/plugins/reminder.ts";
 import { PROVISION_MOUNT_ALIAS, PROVISIONED_BY } from "./provision/steps.ts";
 import { toAgentRef } from "../../src/store/refs.ts";
+import { attachViewImage, splitView, withView, type ViewMarker } from "../../src/runtime/tool-view.ts";
+import { acceptsImages } from "../../src/model/context-windows.ts";
 import type { Plugin, PluginChoice } from "../../src/plugins/types.ts";
 import type { SeedPassResult, SeedPlan } from "../../src/store/seed-record.ts";
 import type { ToolInterrupt, ToolResult } from "../../src/core/tools.ts";
@@ -2053,21 +2055,25 @@ export class AgentRuntime {
           };
         }
         if (res.status !== "succeeded") return res;
-        const body = JSON.stringify(res.result);
+        // A `view` field (src/runtime/tool-view.ts) is the harness's to act on, not part of the result's size: it is
+        // set aside before the decision and put back on whatever the model is shown, so an image is attached to a
+        // parked result as to a whole one. A result without the field is decided on exactly as before.
+        const { view, rest } = splitView(res.result);
+        const body = JSON.stringify(rest);
         const limit = limitForCall(call.tool, reader);
         if (body.length <= limit) return res;
         if (!readBack) {
           return {
             status: "succeeded",
             operationId: res.operationId,
-            result: tooLargeResult(res.result, body, null),
+            result: withView(tooLargeResult(rest, body, null), view) as Json,
           };
         }
         const key = `t/${ctx.tenantId}/${ctx.agentId}/${res.operationId}.json`;
         return {
           status: "succeeded",
           operationId: res.operationId,
-          result: await parkResult(res.result, body, key, readBack, {
+          result: withView(await parkResult(rest, body, key, readBack, {
             put: (k, b) => artifacts.put(k, b),
             complete: (ref) => store.completeOperation(ctx.tenantId, res.operationId, "succeeded", ref),
             // The operations row keeps the raw reference; the model is shown the
@@ -2075,7 +2081,7 @@ export class AgentRuntime {
             // 2026-09-14). The key is built from ctx above, so it is always under
             // this agent's scope.
             shownRef: (ref) => toAgentRef(ref, ctx)!,
-          }),
+          }), view) as Json,
         };
     };
     const held = async (address: string, out: ToolResult): Promise<ToolResult> => {
@@ -2085,6 +2091,13 @@ export class AgentRuntime {
       return { ...out, result: withHeldNote(out.result, line) as Json };
     };
     return {
+      // A result's `view` (src/runtime/tool-view.ts): asked of the binding when a result carries one, so a model
+      // switched mid-conversation is the one asked about, and stored under this agent's own prefix.
+      seesImages: async () => acceptsImages((await store.getModelBinding(ctx.tenantId, ctx.agentId))?.model),
+      attachImage: (v: ViewMarker) => attachViewImage(v, { tenantId: ctx.tenantId, agentId: ctx.agentId }, {
+        get: (k) => artifacts.get(k),
+        put: (k, b) => artifacts.put(k, b),
+      }),
       /**
        * A mounted call, plus the one sentence a call on a holding mount has to
        * carry: that the thing is still held, and what lets it go.

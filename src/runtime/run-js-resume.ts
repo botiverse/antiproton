@@ -18,6 +18,7 @@
  * session's run_js and resume tools; a token is only answered in the session
  * that was given it.
  */
+import type { ViewHost } from "./tool-view.ts";
 import type { AnswerSpec, Continuation } from "../core/execution.ts";
 import type { Json } from "../core/types.ts";
 import type { ToolInterrupt } from "../core/tools.ts";
@@ -55,6 +56,8 @@ export interface InterruptHost {
   resumeInterrupt(i: ToolInterrupt, answer: Json, callId: string): Promise<unknown>;
   /** Tells the tool nobody will answer. Returns why that failed, or null. */
   cancelInterrupt?(i: ToolInterrupt): Promise<string | null>;
+  /** The asking host's image handling (src/runtime/tool-view.ts), so a resumed result's `view` is shown as a call's is. */
+  view?: ViewHost;
 }
 
 /** A tool call that asked the model before acting. */

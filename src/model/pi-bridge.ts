@@ -8,15 +8,23 @@
  * has been answering DeepSeek for months, so the conversion happens here and the
  * client stays.
  *
- * Both directions are lossy in one place each, and deliberately. Images are
- * dropped on the way out because this provider has never accepted them. The
- * reasoning trace is kept on the way back but not replayed on the way out: the
- * next request carries the reply, not the thinking behind it. The exception is
- * an OpenAI reasoning model, called through the Responses API, whose reasoning
- * comes back as opaque items the next request must carry (`toResponsesInput`).
+ * The reasoning trace is kept on the way back but not replayed on the way out:
+ * the next request carries the reply, not the thinking behind it. The exception
+ * is an OpenAI reasoning model, called through the Responses API, whose
+ * reasoning comes back as opaque items the next request must carry
+ * (`toResponsesInput`).
+ *
+ * Images go out only to a model that can see them (`images: true`, which the
+ * consumer sets from src/model/context-windows.ts `acceptsImages`), and by then
+ * the consumer has replaced each stored reference with its bytes
+ * (src/model/images.ts). For any other model each image is replaced by a sentence
+ * saying the model cannot see it, never dropped without a word. A request with
+ * no image is built exactly as it was before images existed: every branch below
+ * that is new is taken only for a message that holds one.
  */
 import type { AssistantMessage, Context as PiContext, Message as PiMessage, Tool as PiTool, Usage } from "@earendil-works/pi-ai";
-import type { ModelMessage, ModelResponse, ToolDefinition } from "./types.ts";
+import type { ChatContentPart, ModelMessage, ModelResponse, ToolDefinition } from "./types.ts";
+import { imageRefHash, NO_VISION_SENTENCE } from "./images.ts";
 
 /**
  * The job wire format, version 2: a system message keeps its place in the conversation.
@@ -71,6 +79,36 @@ const textOf = (content: unknown): string => {
     .join("");
 };
 
+/** The image blocks of a message's content, in order; none for a string. */
+const imagesOf = (content: unknown): Array<{ data: string; mimeType: string }> =>
+  Array.isArray(content) ? content.filter((c: any) => c?.type === "image") as any[] : [];
+
+/**
+ * An image as a data URL. Its `data` must be bytes by now: a reference still in place is a consumer that did not
+ * resolve it (src/model/images.ts `resolveImages`), and sending it would be an image no provider can decode.
+ */
+function dataUrl(image: { data: string; mimeType: string }): string {
+  if (imageRefHash(image.data) !== null || typeof image.data !== "string" || !image.data) {
+    throw new Error("an image in a model request was never resolved to its bytes");
+  }
+  return `data:${image.mimeType};base64,${image.data}`;
+}
+
+/** Text with the no-vision sentence after it, once per message, in place of the message's images. */
+const withNoVision = (text: string) => (text ? `${text}\n\n${NO_VISION_SENTENCE}` : NO_VISION_SENTENCE);
+
+/** What the text of a tool result says when the result is only images: pi's own words for it. */
+const IMAGE_ONLY_TOOL_TEXT = "(see attached image)";
+
+/** The user message that carries a tool result's images, after the results: DeepSeek takes an image in a user message only. */
+const TOOL_IMAGES_LEAD = "Attached image(s) from tool result:";
+
+/** Options of both serializers. */
+export interface SerializeOptions {
+  /** Whether the model called can see images (src/model/context-windows.ts `acceptsImages`). Absent is no. */
+  images?: boolean;
+}
+
 /**
  * A stored job's context as our provider client's request. A version 1 context builds exactly
  * the request it always did. A version 2 context's inline system message becomes an inline
@@ -82,15 +120,25 @@ const textOf = (content: unknown): string => {
  * probed. One that refuses a mid-conversation system message needs these folded into the leading
  * message, as pi-ai's `collapseSystemMessages` does, for that provider only.
  */
-export function toRequest(context: JobContext): {
+export function toRequest(context: JobContext, opts: SerializeOptions = {}): {
   messages: ModelMessage[];
   tools?: ToolDefinition[];
 } {
   const inline = wireVersion(context) === 2;
   const messages: ModelMessage[] = [];
+  // Images from the tool results since the last other message: sent in one user message after the run of results,
+  // as pi sends them (pi-ai-1 dist/api/openai-completions.js), since a user message between the results of one
+  // turn's calls would split the run of tool messages the provider expects after the call.
+  let toolImages: ChatContentPart[] = [];
+  const flushToolImages = () => {
+    if (!toolImages.length) return;
+    messages.push({ role: "user", content: [{ type: "text", text: TOOL_IMAGES_LEAD }, ...toolImages] });
+    toolImages = [];
+  };
   if ("systemPrompt" in context && context.systemPrompt) messages.push({ role: "system", content: context.systemPrompt });
 
   for (const m of context.messages) {
+    if (m.role !== "toolResult") flushToolImages();
     if (m.role === "system") {
       // Only version 2 may carry one. In version 1 it was never written, and passing it on would
       // put an instruction into a request whose format says it has none.
@@ -99,15 +147,29 @@ export function toRequest(context: JobContext): {
       continue;
     }
     if (m.role === "user") {
-      messages.push({ role: "user", content: textOf(m.content) });
+      const images = imagesOf(m.content);
+      if (!images.length) messages.push({ role: "user", content: textOf(m.content) });
+      else if (!opts.images) messages.push({ role: "user", content: withNoVision(textOf(m.content)) });
+      else {
+        // In the order the user wrote them: text and images interleaved as they were.
+        const parts: ChatContentPart[] = [];
+        for (const c of m.content as any[]) {
+          if (c?.type === "text" && c.text) parts.push({ type: "text", text: String(c.text) });
+          else if (c?.type === "image") parts.push({ type: "image_url", image_url: { url: dataUrl(c) } });
+        }
+        messages.push({ role: "user", content: parts });
+      }
       continue;
     }
     if (m.role === "toolResult") {
+      const images = imagesOf(m.content);
+      const text = textOf(m.content);
       messages.push({
         role: "tool",
         tool_call_id: m.toolCallId,
-        content: textOf(m.content),
+        content: !images.length ? text : !opts.images ? withNoVision(text) : text || IMAGE_ONLY_TOOL_TEXT,
       });
+      if (images.length && opts.images) toolImages.push(...images.map((i) => ({ type: "image_url" as const, image_url: { url: dataUrl(i) } })));
       continue;
     }
     // assistant
@@ -126,6 +188,8 @@ export function toRequest(context: JobContext): {
     });
   }
 
+  flushToolImages();
+
   const tools = context.tools?.map((t) => ({
     name: t.name, description: t.description, parameters: t.parameters as unknown,
   })) as ToolDefinition[] | undefined;
@@ -140,7 +204,11 @@ export function toRequest(context: JobContext): {
  * The conversation is `toRequest`'s, item for item, in the Responses API's form (pi's own conversion is
  * `convertResponsesMessages`, pi-ai-1 dist/api/openai-responses-shared.js): a system message, the leading prompt
  * or a later one in place, is a `developer` message, as pi sends instructions to a reasoning model; a tool call is a
- * `function_call` item and its result a `function_call_output`. Images are dropped as there.
+ * `function_call` item and its result a `function_call_output`. Images, for a model that can see them, are
+ * `input_image` parts: in a user message, and in a tool result's `output` beside its text as pi sends them
+ * (`convertToolResultOutput` there), or, with `toolImages: "user"`, in a user message after the results, the way
+ * `toRequest` must send them to DeepSeek. Both were answered correctly by gpt-5.6-luna through Cloudflare AI
+ * Gateway's /compat/responses (measured 2026-10-12); `"output"` is the default because it is pi's.
  *
  * The one difference is reasoning. An assistant turn's thinking block that carries a `thinkingSignature` is
  * replayed as the reasoning item it holds, in its place before the text and calls it led to, so the model sees
@@ -150,26 +218,59 @@ export function toRequest(context: JobContext): {
  * (`transformMessages`, pi-ai-1 dist/api/transform-messages.js). A thinking block with no signature — DeepSeek's
  * trace, or one written before this existed — is dropped, as `toRequest` drops it.
  */
-export function toResponsesInput(context: JobContext, model: string): {
+export function toResponsesInput(context: JobContext, model: string, opts: SerializeOptions & {
+  /** Where a tool result's images go: in its `function_call_output` (pi's way, the default), or a user message after the results. */
+  toolImages?: "output" | "user";
+} = {}): {
   input: Array<Record<string, unknown>>;
   tools?: ToolDefinition[];
 } {
   const inline = wireVersion(context) === 2;
   const input: Array<Record<string, unknown>> = [];
+  const inputImage = (i: { data: string; mimeType: string }) => ({ type: "input_image", image_url: dataUrl(i), detail: "auto" });
+  let toolImages: Array<Record<string, unknown>> = [];
+  const flushToolImages = () => {
+    if (!toolImages.length) return;
+    input.push({ role: "user", content: [{ type: "input_text", text: TOOL_IMAGES_LEAD }, ...toolImages] });
+    toolImages = [];
+  };
   if ("systemPrompt" in context && context.systemPrompt) input.push({ role: "developer", content: context.systemPrompt });
 
   for (const m of context.messages) {
+    if (m.role !== "toolResult") flushToolImages();
     if (m.role === "system") {
       if (!inline) throw new Error("a version 1 model job carries a system message in its conversation");
       input.push({ role: "developer", content: m.content });
       continue;
     }
     if (m.role === "user") {
-      input.push({ role: "user", content: textOf(m.content) });
+      const images = imagesOf(m.content);
+      if (!images.length) input.push({ role: "user", content: textOf(m.content) });
+      else if (!opts.images) input.push({ role: "user", content: withNoVision(textOf(m.content)) });
+      else {
+        const parts: Array<Record<string, unknown>> = [];
+        for (const c of m.content as any[]) {
+          if (c?.type === "text" && c.text) parts.push({ type: "input_text", text: String(c.text) });
+          else if (c?.type === "image") parts.push(inputImage(c));
+        }
+        input.push({ role: "user", content: parts });
+      }
       continue;
     }
     if (m.role === "toolResult") {
-      input.push({ type: "function_call_output", call_id: m.toolCallId, output: textOf(m.content) });
+      const images = imagesOf(m.content);
+      const text = textOf(m.content);
+      if (!images.length) input.push({ type: "function_call_output", call_id: m.toolCallId, output: text });
+      else if (!opts.images) input.push({ type: "function_call_output", call_id: m.toolCallId, output: withNoVision(text) });
+      else if (opts.toolImages === "user") {
+        input.push({ type: "function_call_output", call_id: m.toolCallId, output: text || IMAGE_ONLY_TOOL_TEXT });
+        toolImages.push(...images.map(inputImage));
+      } else {
+        input.push({
+          type: "function_call_output", call_id: m.toolCallId,
+          output: [...(text ? [{ type: "input_text", text }] : []), ...images.map(inputImage)],
+        });
+      }
       continue;
     }
     // assistant: its blocks in order, as pi replays them
@@ -187,6 +288,8 @@ export function toResponsesInput(context: JobContext, model: string): {
       }
     }
   }
+
+  flushToolImages();
 
   const tools = context.tools?.map((t) => ({
     name: t.name, description: t.description, parameters: t.parameters as unknown,

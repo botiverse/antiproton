@@ -1,8 +1,17 @@
 import type { Json } from "../core/types.ts";
 
+/** One part of a chat/completions message's content, when it is not a plain string: text, or an image as a data URL. */
+export type ChatContentPart =
+  | { type: "text"; text: string }
+  | { type: "image_url"; image_url: { url: string } };
+
 export interface ModelMessage {
   role: "system" | "user" | "assistant" | "tool";
-  content: string;
+  /**
+   * A string, as every message without an image always was. Parts only for a user message that carries an image
+   * (DeepSeek takes an image in a user message only; src/model/pi-bridge.ts `toRequest`).
+   */
+  content: string | ChatContentPart[];
   /** Assistant turns that issued tool calls, replayed back to the provider. */
   tool_calls?: unknown;
   tool_call_id?: string;
