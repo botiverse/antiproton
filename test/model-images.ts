@@ -16,10 +16,10 @@
  */
 import { Buffer } from "node:buffer";
 import { AgentRuntime } from "../cf/src/runtime.ts";
-import { callQueuedModel, imageLoaderFor, imageWindowOf, operatorModelOf, type ModelEnv } from "../cf/src/model-request.ts";
+import { callQueuedModel, imageLoaderFor, imageWindowOf, operatorModelOf, queuedCall, type ModelEnv } from "../cf/src/model-request.ts";
 import { fromResponse, toRequest, toResponsesInput } from "../src/model/pi-bridge.ts";
 import {
-  DEFAULT_IMAGE_WINDOW, IMAGE_REF_PREFIX, MAX_IMAGE_BYTES, omittedImageText, MAX_IMAGE_SIDE, NO_VISION_SENTENCE, imageProblem, imageKey, imageRef, imageRefHash, resolveImages, sha256Hex, sniffImage,
+  DEFAULT_IMAGE_WINDOW, IMAGE_REF_PREFIX, IMAGE_WINDOW_STEP, MAX_IMAGE_BYTES, omittedImageText, MAX_IMAGE_SIDE, NO_VISION_SENTENCE, imageProblem, imageKey, imageRef, imageRefHash, resolveImages, sha256Hex, sniffImage,
 } from "../src/model/images.ts";
 import { acceptsImages } from "../src/model/context-windows.ts";
 import type { ModelResponse } from "../src/model/types.ts";
@@ -450,13 +450,16 @@ const CHAT_REPLY = JSON.stringify({ choices: [{ finish_reason: "stop", message: 
 const RESPONSES_REPLY = JSON.stringify({ status: "completed", output: [{ type: "message", content: [{ type: "output_text", text: "A chart." }] }], usage: { input_tokens: 1, output_tokens: 1 } });
 
 async function capture(env: ModelEnv, j: unknown, reply: string, images?: (sha: string) => Promise<Uint8Array | null>): Promise<string> {
+  return captureWith(() => callQueuedModel(env, j, "mj_2", images), reply);
+}
+async function captureWith(run: () => Promise<unknown>, reply: string): Promise<string> {
   const real = globalThis.fetch;
   const seen: string[] = [];
   globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
     seen.push(JSON.stringify({ url: String(input), body: init?.body }));
     return new Response(reply, { status: 200, headers: { "content-type": "application/json" } });
   }) as typeof fetch;
-  try { await callQueuedModel(env, j, "mj_2", images); } finally { globalThis.fetch = real; }
+  try { await run(); } finally { globalThis.fetch = real; }
   must(seen.length === 1, `expected one request, saw ${seen.length}`);
   return seen[0]!;
 }
@@ -504,7 +507,7 @@ await check("an image that cannot be read back becomes a sentence in its place, 
   const none = await resolveImages(V1, undefined);
   for (const [name, ctx, says] of [["missing", missing, "no longer stored"], ["changed", changed, "no longer match"], ["unreadable", unreadable, "reading it failed (r2 down)"], ["no loader", none, "no image store"]] as const) {
     const parts = (ctx.messages[0] as { content: Array<{ type: string; text?: string }> }).content;
-    must(parts[1]!.type === "text" && parts[1]!.text!.startsWith("(an image could not be loaded: ") && parts[1]!.text!.includes(says), `${name}: ${show(parts)}`);
+    must(parts[1]!.type === "text" && parts[1]!.text!.startsWith("\n\n(an image could not be loaded: ") && parts[1]!.text!.includes(says), `${name}: ${show(parts)}`);
     toRequest(ctx as never, { images: true });
   }
   const plain = { messages: [{ role: "user", content: "hi" }] };
@@ -531,7 +534,7 @@ function manyImages(n: number, size: number) {
   return { shas, reads, load, context };
 }
 const imagesIn = (ctx: { messages: readonly any[] }) => ctx.messages.flatMap((m) => Array.isArray(m.content) ? m.content : [])
-  .filter((c: any) => c.type === "image" || /^\[earlier image omitted|^\(an image could not/.test(c.text ?? ""));
+  .filter((c: any) => c.type === "image" || /^\n\n(\[earlier image omitted|\(an image could not)/.test(c.text ?? ""));
 
 await check("the window: the newest 8 images are sent, each older one is a note naming it, and only the 8 are read", async () => {
   const m = manyImages(12, 1000);
@@ -549,11 +552,12 @@ await check("the window: the newest 8 images are sent, each older one is a note 
   must(DEFAULT_IMAGE_WINDOW.maxImages === 8 && DEFAULT_IMAGE_WINDOW.maxBytes === 12 * 1024 * 1024, show(DEFAULT_IMAGE_WINDOW));
 });
 
-await check("the window's byte budget stops at the first image that does not fit, and nothing older is read", async () => {
+await check("the window's byte budget stops at the first image that does not fit, snapped to a step, and nothing older is read", async () => {
   const m = manyImages(10, 3 * 1024 * 1024);
   const out = await resolveImages(m.context(), m.load, { maxImages: 8, maxBytes: 12 * 1024 * 1024 }) as { messages: any[] };
   const sent = imagesIn(out).map((p: any) => p.type);
-  must(show(sent) === show([...Array(6).fill("text"), ...Array(4).fill("image")]), show(sent));
+  // Four fit (images 6 to 9), so the start is 6, snapped forward to 8: two are sent.
+  must(show(sent) === show([...Array(8).fill("text"), ...Array(2).fill("image")]), show(sent));
   // The four that fit and the fifth that did not; the five older ones are never read.
   must(m.reads.length === 5, `reads ${m.reads.length}`);
 });
@@ -569,8 +573,35 @@ await check("an image that leaves the window never comes back: each later image 
     const firstSent = kinds.indexOf("image");
     must(kinds.slice(firstSent).every((t) => t === "image") && kinds.slice(0, firstSent).every((t) => t === "text"), `${k}: ${show(kinds)}`);
     must(before.every((t, i) => t === "image" || kinds[i] === "text"), `${k}: an omitted image came back: ${show(before)} then ${show(kinds)}`);
-    must(kinds.filter((t) => t === "image").length === Math.min(k, 4), `${k}: ${show(kinds)}`);
+    const start = Math.ceil(Math.max(0, k - 4) / IMAGE_WINDOW_STEP) * IMAGE_WINDOW_STEP;
+    must(kinds.filter((t) => t === "image").length === k - start, `${k}: ${show(kinds)}`);
     before = kinds;
+  }
+});
+
+await check("over twenty image turns the request's prefix breaks at most once per 4 images, within the limits, and no image returns", async () => {
+  const N = 20;
+  for (const [name, size, w] of [
+    ["by count", 1000, { maxImages: 8, maxBytes: 12 * 1024 * 1024 }],
+    ["by bytes", 1000, { maxImages: 8, maxBytes: 4500 }],
+    ["by count, small", 1000, { maxImages: 5, maxBytes: 12 * 1024 * 1024 }],
+  ] as const) {
+    const m = manyImages(N, size);
+    let prev: string[] = [], breaks = 0, omittedBefore = 0;
+    for (let k = 1; k <= N; k++) {
+      const out = await resolveImages(m.context(k), m.load, w) as { messages: any[] };
+      const req = toRequest(out as never, { images: true }).messages.map((x) => JSON.stringify(x));
+      if (prev.some((x, i) => req[i] !== x)) breaks++;
+      prev = req;
+      const kinds = imagesIn(out).map((p: any) => p.type);
+      const sent = kinds.filter((t) => t === "image").length;
+      must(sent <= w.maxImages && sent * size <= w.maxBytes, `${name} ${k}: ${sent} images sent`);
+      const omitted = kinds.indexOf("image") === -1 ? kinds.length : kinds.indexOf("image");
+      must(omitted >= omittedBefore && kinds.slice(omitted).every((t) => t === "image"), `${name} ${k}: an image returned: ${show(kinds)}`);
+      omittedBefore = omitted;
+    }
+    must(breaks <= Math.ceil(N / IMAGE_WINDOW_STEP), `${name}: ${breaks} prefix breaks over ${N} image turns`);
+    must(breaks >= 1, `${name}: control: the window never moved`);
   }
 });
 
@@ -592,12 +623,13 @@ await check("forty 1.5 MiB images: one request carries the window, and the consu
   must(show(imageWindowOf({ HARNESS_MODEL: "x", MODEL_IMAGES_MAX: "0", MODEL_IMAGES_MAX_BYTES: "lots" })) === show(DEFAULT_IMAGE_WINDOW), "bad vars were taken");
 });
 
-await check("callQueuedModel applies the window from its environment: MODEL_IMAGES_MAX=3 sends the newest 3 of 10", async () => {
+await check("callQueuedModel applies the window from its environment: MODEL_IMAGES_MAX=3 of 10 starts at image 8", async () => {
   const m = manyImages(10, 100);
   const sent = await capture({ ...ENV, MODEL_IMAGES_MAX: "3" }, job(m.context(), { provider: "deepseek", model: "deepseek-flash" }), CHAT_REPLY, m.load);
   const urls = sent.split("data:image/png;base64,").length - 1;
-  must(urls === 3 && m.reads.length === 3, `data URLs ${urls}, reads ${m.reads.length}`);
-  must(sent.split("[earlier image omitted:").length - 1 === 7, "the seven older images are not named");
+  // Three fit (images 7 to 9); the start snaps forward to 8.
+  must(urls === 2 && m.reads.length === 3, `data URLs ${urls}, reads ${m.reads.length}`);
+  must(sent.split("[earlier image omitted:").length - 1 === 8, "the eight older images are not named");
 });
 
 await check("attachViewImage asks the stored size first, and refuses a mismatch or an oversize object without reading it", async () => {
@@ -756,6 +788,10 @@ for (const engine of ["pi085", "pd"] as const) {
         must(await imageLoaderFor(w.bucket, other)(IMG_SHA) === null, `${show(other)} read agent a's image`);
       }
       const sent = await capture(w.env, w.jobs[1]!.job, CHAT_REPLY, async (sha) => { reads.push(sha); return own(sha); });
+      // The consumer's `call` itself (`queuedCall`, what modelQueueDeps installs), given a message whose object id
+      // names nothing: the image comes from the tenant and agent it names.
+      const viaQueue = await captureWith(() => queuedCall(w.env, w.bucket)(w.jobs[1]!.job, { jobId: "mj_q", tenantId: "t", agentId: "a", doId: "do-elsewhere" } as never), CHAT_REPLY);
+      must(viaQueue.includes(`data:image/png;base64,${IMG_B64}`), `queuedCall did not read the agent's image: ${viaQueue.slice(0, 200)}`);
       const body = JSON.parse(JSON.parse(sent).body);
       const last = body.messages[body.messages.length - 1];
       must(last.role === "user" && show(last.content) === show([{ type: "text", text: "Attached image(s) from tool result:" }, { type: "image_url", image_url: { url: `data:image/png;base64,${IMG_B64}` } }]),

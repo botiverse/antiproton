@@ -109,7 +109,7 @@ import { hasPendingInbound, inboundStatus, lowerHeaders, newHookId, readCapped }
 import { forgetHookRoute, routeHook, type HookRoute, type RouteSource } from "./hook-route.ts";
 import { HTMX_SRC, staticAsset } from "./static.ts";
 import { clip, logEvent, routeOf, setLogSink } from "../../src/core/log.ts";
-import { callQueuedModel, imageLoaderFor, operatorModelOf, planBinding, resolveModel } from "./model-request.ts";
+import { operatorModelOf, queuedCall, planBinding, resolveModel } from "./model-request.ts";
 import { userModelsFrom } from "../../src/model/user-models.ts";
 import { DEFAULT_PROVIDER, providerStatus, type ModelChoice } from "../../src/model/providers.ts";
 import { consumeModelCalls, isUnknownJobReply, replyingUnknownJob, type ModelQueueDeps, type QueuedModelCall, type UnknownJobReply } from "./model-queue.ts";
@@ -308,9 +308,8 @@ export class SandboxTools extends WorkerEntrypoint<Env> {
 function modelQueueDeps(env: Env): ModelQueueDeps {
   return {
     stub: (m) => env.AGENT.get(env.AGENT.idFromString(m.doId)),
-    // An image the conversation holds is read from the agent's own prefix, named by the message's tenant and agent
-    // (src/model/images.ts `imageKey`), so a job can only ever reach its own agent's images.
-    call: (taken, m) => callQueuedModel(env, taken, m.jobId, imageLoaderFor(env.ARTIFACTS, { tenantId: m.tenantId, agentId: m.agentId })),
+    // Images are read from the agent the message names (`queuedCall`), so a job reaches only its own agent's.
+    call: queuedCall(env, env.ARTIFACTS),
     // A given-up call is still this job's answer, so the entry it becomes names
     // the job like any other (see `jobId` on fromResponse).
     givenUp: (m) => ({

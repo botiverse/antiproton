@@ -276,7 +276,8 @@ Antiproton is designed to run as a Cloudflare Worker backed by Durable Objects:
    `RESPONSES_TOOL_IMAGES` var set to `user`, in a user message after the results as well. An image stays in
    the conversation until compaction, whose summary is text, but one request carries only the newest 8, and at
    most 12 MiB of them (`MODEL_IMAGES_MAX`, `MODEL_IMAGES_MAX_BYTES`); each older one is sent as a line naming
-   it, and once an image is outside that window it stays outside.
+   it, and once an image is outside that window it stays outside. The window's start moves four images at a
+   time, so the provider's cached prefix breaks once per four new images rather than at every one.
 
 2. **Run locally with Wrangler:**
    ```bash

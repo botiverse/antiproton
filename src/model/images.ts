@@ -144,23 +144,33 @@ export function hasImageRefs(context: { messages?: readonly unknown[] }): boolea
   return (context.messages ?? []).some((m: any) => Array.isArray(m?.content) && m.content.some((c: any) => c?.type === "image" && imageRefHash(c.data) !== null));
 }
 
-/** What an image outside the window is sent as. */
+/**
+ * How far the window's start moves at a time, in images. The provider caches a request's prefix, and image bytes are
+ * part of it: a window that always held exactly the newest images would drop the oldest at every new one, changing
+ * the request near its start on every image turn. Its start is instead a multiple of this, so it moves once per
+ * `IMAGE_WINDOW_STEP` images and drops that many at once.
+ */
+export const IMAGE_WINDOW_STEP = 4;
+
+/** What an image outside the window is sent as: a line of its own, after whatever text came before it. */
 export const omittedImageText = (mimeType: unknown, sha256: string) =>
-  `[earlier image omitted: ${String(mimeType)} ${sha256.slice(0, 8)}; view it again if it is needed]`;
+  `\n\n[earlier image omitted: ${String(mimeType)} ${sha256.slice(0, 8)}; view it again if it is needed]`;
 
 /**
  * `context` with image references replaced, for the provider call, decided here at the call so the stored history
  * stays as it was written:
  *
- * - The newest images, within `window`, become their bytes as base64. They are taken newest first and the window
- *   stops at the first image that does not fit, so it is always a run of the latest images, and an image that has
- *   fallen out of it stays out: a later image only moves the window forward. The provider's cached prefix (which
- *   holds image bytes) therefore changes at most once for each image that leaves, at the image that leaves.
- * - Every older one becomes a short note naming it (`omittedImageText`); its bytes are never read, so the consumer
- *   holds at most the window and one image more.
+ * - The images from the window's start on become their bytes as base64. The start is the first multiple of
+ *   `IMAGE_WINDOW_STEP` (counting every image block of the conversation, oldest first) from which the images to the
+ *   end fit `window` — no more than `maxImages`, no more than `maxBytes`. As images are added it only moves forward,
+ *   so an image that has left never returns, and it moves once per step: the provider's cached prefix breaks once per
+ *   `IMAGE_WINDOW_STEP` new images rather than at every one. The window never holds more than `window` allows; just
+ *   after a move it holds fewer.
+ * - Every image before the start becomes a short note naming it (`omittedImageText`). Finding the start reads the
+ *   newest images back to the first that does not fit, so the consumer holds at most the window and one image more.
  * - One that cannot be read, or whose bytes no longer hash to the reference, becomes a text block saying so: the
- *   conversation goes on, rather than a job that fails on every retry for an image that will not come back. It takes
- *   no room in the window.
+ *   conversation goes on, rather than a job that fails on every retry for an image that will not come back. It keeps
+ *   its place in the count and takes no bytes.
  *
  * A context with no reference is returned as it is.
  */
@@ -169,11 +179,19 @@ export async function resolveImages<C extends { messages?: readonly unknown[] }>
 ): Promise<C> {
   if (!hasImageRefs(context)) return context;
   const messages = (context.messages ?? []).map((m: any) => Array.isArray(m?.content) ? { ...m, content: [...m.content] } : m);
+  const slots: Array<{ m: any; ci: number; sha: string; mimeType: unknown }> = [];
+  for (const m of messages) {
+    if (!Array.isArray(m?.content)) continue;
+    m.content.forEach((c: any, ci: number) => {
+      const sha = c?.type === "image" ? imageRefHash(c.data) : null;
+      if (sha !== null) slots.push({ m, ci, sha, mimeType: c.mimeType });
+    });
+  }
   const read = new Map<string, { bytes: Uint8Array } | { problem: string }>();
   const fetchOne = async (sha: string): Promise<{ bytes: Uint8Array } | { problem: string }> => {
     const known = read.get(sha);
     if (known) return known;
-    let got: { bytes: Uint8Array } | { problem: string };
+    let got: { bytes: Uint8Array } | { problem: string } | undefined;
     if (!load) got = { problem: "no image store is reachable here" };
     else {
       let bytes: Uint8Array | null = null;
@@ -184,30 +202,25 @@ export async function resolveImages<C extends { messages?: readonly unknown[] }>
     read.set(sha, got);
     return got;
   };
-  const encoded = new Map<string, string>();
-  let images = 0, bytes = 0, full = false;
-  for (let mi = messages.length - 1; mi >= 0; mi--) {
-    const m = messages[mi];
-    if (!Array.isArray(m?.content)) continue;
-    for (let ci = m.content.length - 1; ci >= 0; ci--) {
-      const c = m.content[ci];
-      const sha = c?.type === "image" ? imageRefHash(c.data) : null;
-      if (sha === null) continue;
-      if (!full && images >= window.maxImages) full = true;
-      if (full) { m.content[ci] = { type: "text", text: omittedImageText(c.mimeType, sha) }; continue; }
-      const got = await fetchOne(sha);
-      if ("problem" in got) { m.content[ci] = { type: "text", text: `(an image could not be loaded: ${got.problem})` }; continue; }
-      if (bytes + got.bytes.byteLength > window.maxBytes) {
-        full = true;
-        m.content[ci] = { type: "text", text: omittedImageText(c.mimeType, sha) };
-        continue;
-      }
-      images++;
-      bytes += got.bytes.byteLength;
-      let data = encoded.get(sha);
-      if (data === undefined) { data = Buffer.from(got.bytes).toString("base64"); encoded.set(sha, data); }
-      m.content[ci] = { ...c, data };
-    }
+  // The oldest image the window could hold: newest first, as far as the count and the bytes allow.
+  let fits = slots.length, bytes = 0;
+  while (fits > 0 && slots.length - (fits - 1) <= window.maxImages) {
+    const got = await fetchOne(slots[fits - 1]!.sha);
+    const size = "bytes" in got ? got.bytes.byteLength : 0;
+    if (bytes + size > window.maxBytes) break;
+    bytes += size;
+    fits--;
   }
+  // Snapped forward to a step, so the start moves rarely.
+  const start = Math.ceil(fits / IMAGE_WINDOW_STEP) * IMAGE_WINDOW_STEP;
+  const encoded = new Map<string, string>();
+  slots.forEach((slot, k) => {
+    if (k < start) { slot.m.content[slot.ci] = { type: "text", text: omittedImageText(slot.mimeType, slot.sha) }; return; }
+    const got = read.get(slot.sha)!;
+    if ("problem" in got) { slot.m.content[slot.ci] = { type: "text", text: `\n\n(an image could not be loaded: ${got.problem})` }; return; }
+    let data = encoded.get(slot.sha);
+    if (data === undefined) { data = Buffer.from(got.bytes).toString("base64"); encoded.set(slot.sha, data); }
+    slot.m.content[slot.ci] = { ...slot.m.content[slot.ci], data };
+  });
   return { ...context, messages };
 }

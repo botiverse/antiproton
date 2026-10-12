@@ -137,6 +137,16 @@ export function planBinding(
 }
 
 /**
+ * The queue consumer's `call` (`modelQueueDeps`, cf/src/index.ts): the provider call for a taken job, its images read
+ * from the agent the queue message names — its tenant and agent, never the object id it was addressed to — with the
+ * key the tool host stored them under.
+ */
+export function queuedCall(env: ModelEnv, bucket: Parameters<typeof imageLoaderFor>[0]) {
+  return (taken: unknown, m: { jobId: string; tenantId: string; agentId: string }) =>
+    callQueuedModel(env, taken, m.jobId, imageLoaderFor(bucket, { tenantId: m.tenantId, agentId: m.agentId }));
+}
+
+/**
  * The queue consumer's provider call for a taken job (`modelQueueDeps`, cf/src/index.ts): the operator's account, with
  * the binding's provider and model when it spends that account (`operatorProvider`, `operatorModel`) and the
  * deployment's otherwise. A job taken before providers existed carries no provider, which is the default one. The answer
