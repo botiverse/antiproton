@@ -219,7 +219,7 @@ await check("a refusal through the gateway is the turn's error, with the hint th
   const p = provider([{ status: 401, body: { type: "error", error: { type: "authentication_error", message: "x-api-key header is required" } } }]);
   const a = await withFetch(p.fetch, () => callQueuedModel(ENV, job({ systemPrompt: "S", messages: [{ role: "user", content: "hi", timestamp: 1 }] }), "mj_3"));
   must(p.seen.length === 1 && a.stopReason === "error", `sent ${p.seen.length} times: ${show(a)}`);
-  must(/HTTP 401/.test(a.providerError ?? "") && /x-api-key header is required/.test(a.providerError ?? "") && /check the model name/.test(a.providerError ?? ""), a.providerError);
+  must(/HTTP 401/.test(a.providerError ?? "") && /x-api-key header is required/.test(a.providerError ?? "") && /check the model name/.test(a.providerError ?? ""), String(a.providerError));
   must(!(a.providerError ?? "").includes("gateway-token-value"), "the token reached the turn");
 });
 
