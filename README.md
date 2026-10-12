@@ -279,7 +279,10 @@ Antiproton is designed to run as a Cloudflare Worker backed by Durable Objects:
    it, and until the next compaction (which renumbers what is left) an image outside that window stays
    outside. The window's start moves four images at a time (one at a time when `MODEL_IMAGES_MAX` is under
    four, and never past the newest image), so the provider's cached prefix breaks once per four new images
-   rather than at every one.
+   rather than at every one. An image in the window whose stored bytes cannot be read, no longer hash to
+   its reference, or are not the size its reference declares is not sent: the model is told it could not be
+   loaded. Where model-input evidence is on (the evaluation routes), each call's `model-input` record says
+   what became of every image reference, per queue delivery attempt (docs/agent-surface.md, "Model input").
 
 2. **Run locally with Wrangler:**
    ```bash

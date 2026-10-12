@@ -308,8 +308,10 @@ export class SandboxTools extends WorkerEntrypoint<Env> {
 function modelQueueDeps(env: Env): ModelQueueDeps {
   return {
     stub: (m) => env.AGENT.get(env.AGENT.idFromString(m.doId)),
-    // Images are read from the agent the message names (`queuedCall`), so a job reaches only its own agent's.
-    call: queuedCall(env, env.ARTIFACTS),
+    // Images are read from the agent the message names (`queuedCall`), so a job reaches only its own agent's; and
+    // their evidence, for a job its object marked, goes back to that object (cf/src/image-evidence.ts).
+    call: queuedCall(env, env.ARTIFACTS, (m) => (report) =>
+      env.AGENT.get(env.AGENT.idFromString(m.doId)).recordImageAttempt(m.tenantId, m.agentId, m.jobId, report)),
     // A given-up call is still this job's answer, so the entry it becomes names
     // the job like any other (see `jobId` on fromResponse).
     givenUp: (m) => ({
@@ -755,6 +757,16 @@ export class AgentDO extends DurableObject<Env> {
    */
   async takeJob(tenantId: string, agentId: string, jobId: string, taker?: string) {
     return replyingUnknownJob(() => this.#activeRuntime().takeJob(tenantId, agentId, jobId, taker));
+  }
+
+  /**
+   * One attempt's image evidence from the queue consumer (cf/src/image-evidence.ts), for this object's own agent only.
+   * Never throws: the consumer's call must not fail on its evidence.
+   */
+  async recordImageAttempt(tenantId: string, agentId: string, jobId: string, report: unknown): Promise<boolean> {
+    if (!this.#isAgent(tenantId, agentId)) return false;
+    try { return await this.#activeRuntime().recordImageAttempt(jobId, report); }
+    catch (e) { console.error(`recording the image evidence of ${jobId} failed:`, e); return false; }
   }
 
   /** A taker's failed call gives its take back, so the queue's retry can take the job (cf/src/model-queue.ts). */

@@ -101,6 +101,19 @@ function refusalDetail(body: string, secrets: string[]): string {
 }
 
 /**
+ * A provider's HTTP answer that was neither a success nor a refusal (a 5xx or 429 past its retries, or another
+ * status): the status rides on the error so a caller can say which answer ended the call without reading its text.
+ * The message is the one this error always had.
+ */
+export class ModelHttpError extends Error {
+  readonly status: number;
+  constructor(status: number, message: string) { super(message); this.status = status; }
+}
+
+/** The call's total deadline passed (`postModelRequest`); the message says which bound ended it. */
+export class ModelCallTimedOut extends Error {}
+
+/**
  * Normalises any OpenAI-compatible endpoint. Provider-specific extras
  * (reasoning_content, cache hit counters) are folded into usage rather than
  * leaking into the harness — that is what keeps §11's "provider is replaceable"
@@ -136,6 +149,8 @@ export class OpenAiCompatibleModel implements ModelAdapter {
       maxTokens?: number; temperature?: number;
       tools?: ToolDefinition[]; toolChoice?: "auto" | "required" | "none";
       reasoning?: "off" | "low" | "high";
+      /** Told the status of every HTTP answer, so a caller can name the one the call ended on. */
+      onStatus?: (status: number) => void;
     } = {},
   ): Promise<ModelResponse> {
     // Reasoning tokens are billed against max_tokens, so the cap is a budget for
@@ -182,7 +197,7 @@ export class OpenAiCompatibleModel implements ModelAdapter {
         : {}),
     });
     return postModelRequest(
-      { url: `${this.#baseUrl}/chat/completions`, apiKey: this.#apiKey, model: this.#model, headers: this.#headers, deadlineMs: this.#deadlineMs },
+      { url: `${this.#baseUrl}/chat/completions`, apiKey: this.#apiKey, model: this.#model, headers: this.#headers, deadlineMs: this.#deadlineMs, onStatus: opts.onStatus },
       body,
       (data) => {
         const choice = data.choices?.[0];
@@ -233,7 +248,7 @@ export function parseArguments(raw: unknown): unknown {
  * into the answer.
  */
 export async function postModelRequest(
-  cfg: { url: string; apiKey: string; model: string; headers: Record<string, string>; deadlineMs: number },
+  cfg: { url: string; apiKey: string; model: string; headers: Record<string, string>; deadlineMs: number; onStatus?: (status: number) => void },
   body: string,
   read: (data: any) => ModelResponse,
 ): Promise<ModelResponse> {
@@ -255,6 +270,8 @@ export async function postModelRequest(
         },
         body,
       });
+      // An observer that throws must not change the call it observes.
+      try { cfg.onStatus?.(res.status); } catch { /* ignored */ }
       if (!res.ok) {
         const text = await res.text();
         if (isPermanentRefusal(res.status, text)) {
@@ -262,7 +279,7 @@ export async function postModelRequest(
           throw new ModelRequestRefused(res.status, text, [cfg.apiKey, ...Object.values(cfg.headers)],
             gatewayKeyed ? GATEWAY_401_HINT : undefined);
         }
-        const err = new Error(`model ${res.status}: ${text.slice(0, 300)}`);
+        const err = new ModelHttpError(res.status, `model ${res.status}: ${text.slice(0, 300)}`);
         if (res.status >= 500 || res.status === 429) {
           lastErr = err;
           await new Promise((r) => setTimeout(r, 400 * (attempt + 1)));
@@ -276,7 +293,7 @@ export async function postModelRequest(
       // exhausted run of 5xx does, so the queue redelivers it, and the message says which bound
       // ended it — a bare AbortError would read as a cancel, which nothing on this path issues.
       if (deadline.aborted) {
-        throw new Error(
+        throw new ModelCallTimedOut(
           `model call timed out: no complete response within the ${cfg.deadlineMs / 1000} s total deadline` +
           (lastErr ? ` (last error before it: ${lastErr.message})` : ""));
       }

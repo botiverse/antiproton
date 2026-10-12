@@ -100,7 +100,7 @@ export class OpenAiResponsesModel {
 
   async complete(
     input: ResponsesInputItem[],
-    opts: { tools?: ToolDefinition[]; reasoning?: "off" | "low" | "high"; maxTokens?: number } = {},
+    opts: { tools?: ToolDefinition[]; reasoning?: "off" | "low" | "high"; maxTokens?: number; onStatus?: (status: number) => void } = {},
   ): Promise<ModelResponse> {
     const reasoning = responsesReasoningFor(this.#model, opts.reasoning);
     const body = JSON.stringify({
@@ -115,7 +115,7 @@ export class OpenAiResponsesModel {
         : {}),
     });
     return postModelRequest(
-      { url: `${this.#baseUrl}/responses`, apiKey: this.#apiKey, model: this.#model, headers: this.#headers, deadlineMs: this.#deadlineMs },
+      { url: `${this.#baseUrl}/responses`, apiKey: this.#apiKey, model: this.#model, headers: this.#headers, deadlineMs: this.#deadlineMs, onStatus: opts.onStatus },
       body,
       readResponse,
     );

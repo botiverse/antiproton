@@ -6,7 +6,9 @@ import { OpenAiResponsesModel, usesResponses } from "../../src/model/openai-resp
 import { errorMessage, fromResponse, toRequest, toResponsesInput, type AnsweredMessage } from "../../src/model/pi-bridge.ts";
 import type { ModelResponse } from "../../src/model/types.ts";
 import { acceptsImages } from "../../src/model/context-windows.ts";
-import { DEFAULT_IMAGE_WINDOW, imageKey, resolveImages, type ImageLoader, type ImageWindow } from "../../src/model/images.ts";
+import { DEFAULT_IMAGE_WINDOW, hasImageRefs, imageKey, nonVisionImageItems, resolveImagesReported, windowStep, type ImageItem, type ImageLoader, type ImageWindow } from "../../src/model/images.ts";
+import type { QueuedModelCall } from "./model-queue.ts";
+import { capItems, imageAttemptWriter, providerOutcome, type ImageEvidenceSink } from "./image-evidence.ts";
 import { logEvent } from "../../src/core/log.ts";
 
 /**
@@ -139,11 +141,12 @@ export function planBinding(
 /**
  * The queue consumer's `call` (`modelQueueDeps`, cf/src/index.ts): the provider call for a taken job, its images read
  * from the agent the queue message names — its tenant and agent, never the object id it was addressed to — with the
- * key the tool host stored them under.
+ * key the tool host stored them under. `evidence`, when given, is where an attempt's image evidence goes for that
+ * message (cf/src/image-evidence.ts); it is used only for a job its object marked (`imageEvidence`).
  */
-export function queuedCall(env: ModelEnv, bucket: Parameters<typeof imageLoaderFor>[0]) {
-  return (taken: unknown, m: { jobId: string; tenantId: string; agentId: string }) =>
-    callQueuedModel(env, taken, m.jobId, imageLoaderFor(bucket, { tenantId: m.tenantId, agentId: m.agentId }));
+export function queuedCall(env: ModelEnv, bucket: Parameters<typeof imageLoaderFor>[0], evidence?: (m: QueuedModelCall) => ImageEvidenceSink) {
+  return (taken: unknown, m: QueuedModelCall) =>
+    callQueuedModel(env, taken, m.jobId, imageLoaderFor(bucket, { tenantId: m.tenantId, agentId: m.agentId }), evidence?.(m));
 }
 
 /**
@@ -161,33 +164,60 @@ export function queuedCall(env: ModelEnv, bucket: Parameters<typeof imageLoaderF
  * (`acceptsImages`) the newest ones, within the image window (`imageWindowOf`), are read through `images` — the
  * agent's own R2 prefix, in the Worker (`imageLoaderFor`) — right before the call, and older ones are sent as a note;
  * for any other model each is sent as the sentence saying it cannot see it, with nothing read.
+ *
+ * With `evidence`, a job its object marked (`imageEvidence`, set by `AgentRuntime.takeJob` where model-input evidence
+ * is on) and a conversation holding an image reference, this attempt is described to it: what became of each
+ * reference once the request is built, and how the provider call ended (cf/src/image-evidence.ts). That write runs
+ * beside the call and is bounded, and its failure is only logged.
  */
-export async function callQueuedModel(env: ModelEnv, job: any, jobId: string, images?: ImageLoader): Promise<AnsweredMessage> {
+export async function callQueuedModel(env: ModelEnv, job: any, jobId: string, images?: ImageLoader, evidence?: ImageEvidenceSink): Promise<AnsweredMessage> {
   const called = String(job.operatorModel ?? env.HARNESS_MODEL);
   const provider = job.operatorModel ? String(job.operatorProvider ?? DEFAULT_PROVIDER) : DEFAULT_PROVIDER;
   const request = operatorRequest(operatorModelOf(env), { provider, model: called });
   const sees = acceptsImages(called);
-  const context = sees ? await resolveImages(job.context, images, imageWindowOf(env)) : job.context;
+  const window = imageWindowOf(env);
+  const recording = !!evidence && job?.imageEvidence === true && hasImageRefs(job.context ?? {});
+  let context = job.context;
+  let report: { items: ImageItem[]; windowStart: number } | null = null;
+  if (sees) {
+    const r = await resolveImagesReported(job.context, images, window);
+    context = r.context;
+    report = r;
+  } else if (recording) {
+    report = nonVisionImageItems(job.context);
+  }
+  // Told the status of each HTTP answer only when it is recorded, so a call that is not is the call it always was.
+  let lastStatus: number | undefined;
+  const observe = recording ? { onStatus: (s: number) => { lastStatus = s; } } : {};
   let call: () => Promise<ModelResponse>;
   if (usesResponses(called)) {
     const toolImages = env.RESPONSES_TOOL_IMAGES === "user" ? "user" as const : "output" as const;
     const { input, tools } = toResponsesInput(context, called, { images: sees, toolImages });
     const model = new OpenAiResponsesModel(request);
-    call = () => model.complete(input, tools ? { tools } : {});
+    call = () => model.complete(input, { ...(tools ? { tools } : {}), ...observe });
   } else {
     const model = new OpenAiCompatibleModel(request);
     const { messages, tools } = toRequest(context, { images: sees });
-    call = () => model.complete(messages, tools ? { tools } : {});
+    call = () => model.complete(messages, { ...(tools ? { tools } : {}), ...observe });
   }
   const identity = {
     api: String(job.model?.api ?? "offloaded"),
     provider: String(job.model?.provider ?? "openai-compatible"),
     id: called,
   };
+  const attempt = recording && report ? imageAttemptWriter(evidence!, {
+    attemptId: crypto.randomUUID(),
+    budget: { ...window, step: windowStep(window) },
+    windowStart: report.windowStart, model: called, vision: sees,
+    ...capItems(report.items),
+  }, jobId) : null;
+  // The request is built: what it carries is decided, and it has not been sent.
+  attempt?.prepared(new Date());
   let res;
   try {
     res = await call();
   } catch (e) {
+    await attempt?.ended(providerOutcome(e, lastStatus, new Date()));
     // A refusal of the request itself is this job's answer, not a failure to retry: the queue would send the
     // same request again and be refused again (src/model/openai-compatible.ts, `isPermanentRefusal`). Answered
     // as an error, it fails the turn once. `errorMessage` is the refusal's fixed text, the one string the
@@ -197,5 +227,6 @@ export async function callQueuedModel(env: ModelEnv, job: any, jobId: string, im
     logEvent("model_job.refused", { jobId, provider, model: called, status: e.status });
     return { ...errorMessage(e.message, identity), providerError: e.turnError, jobId };
   }
+  await attempt?.ended(providerOutcome(undefined, lastStatus, new Date()));
   return fromResponse(res, identity, jobId);
 }

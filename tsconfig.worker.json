@@ -113,6 +113,7 @@
     "test/model-refusal.ts",
     "test/model-request-snapshot.ts",
     "test/model-images.ts",
+    "test/model-image-evidence.ts",
     "test/openai-responses.ts",
     "test/durable-agent.ts",
     "test/spec/durable-agent-spec.ts",
