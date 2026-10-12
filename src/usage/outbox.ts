@@ -118,6 +118,23 @@ export function toHourly(rows: readonly UsageRow[]): HourlyRow[] {
   return [...out.values()];
 }
 
+/**
+ * Models billed at another rate for a whole call once its prompt passes a size: the call's rows are keyed
+ * `<model>:<tier>:<kind>` instead of `<model>:<kind>`, and priced by their own rows (cf/migrations). The prompt is the
+ * reply's `input`, the whole prompt with its cache reads and writes inside it, which is what the providers' tiers count.
+ * Claude Haiku 5.5: a prompt over 100,000 tokens is billed five times as much, input, cache and output alike
+ * (https://platform.claude.com/docs/en/about-claude/pricing, read 2026-10-12; 0018).
+ */
+export const PRICE_TIERS: Record<string, { overInputTokens: number; tier: string }> = {
+  "claude-haiku-5-5": { overInputTokens: 100_000, tier: "long" },
+};
+
+/** The name a reply is metered under: the model's, or its tier's when the prompt passed the tier's size (`PRICE_TIERS`). */
+export function meteredModel(model: string, input: number | undefined): string {
+  const t = Object.hasOwn(PRICE_TIERS, model) ? PRICE_TIERS[model]! : undefined;
+  return t && typeof input === "number" && input > t.overInputTokens ? `${model}:${t.tier}` : model;
+}
+
 /** A model reply's usage, one row per kind of token it counted.
  *
  * `cacheWrite1h` is a SUBSET of `cacheWrite`, not a sibling: pi-ai's own
@@ -134,6 +151,7 @@ export function modelTokenRows(
   model: string,
   usage: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; cacheWrite1h?: number; reasoning?: number },
 ): UsageRow[] {
+  model = meteredModel(model, usage.input);
   const kinds: Array<[string, number | undefined]> = [
     ["input", usage.input], ["output", usage.output], ["cache_read", usage.cacheRead],
     ["cache_write", usage.cacheWrite], ["cache_write_1h", usage.cacheWrite1h],

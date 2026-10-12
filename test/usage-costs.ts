@@ -156,14 +156,39 @@ await check("Claude Haiku 5.5 (0018): unpriced before 2026-10-13T00:00Z; from th
       must(got !== null && Math.abs(got - rate) < 1e-15, `${resource} ${kind}: ${got}, the page says ${rate}`);
     }
   }
-  // One reply as the Anthropic client reports it: a million-token prompt (summed over calls) of which 400k were read
-  // from the cache and 100k written to it, and a million out.
+  // One reply as the Anthropic client reports it, in the lower tier: a 100,000-token prompt of which 40,000 were read
+  // from the cache and 10,000 written to it, and 100,000 out.
   put(db, modelTokenRows({ at: HAIKU_FROM + 2 * H, tenantId: "t", agentId: "a" }, "claude-haiku-5-5",
-    { input: 1_000_000, cacheRead: 400_000, cacheWrite: 100_000, output: 1_000_000 }));
+    { input: 100_000, cacheRead: 40_000, cacheWrite: 10_000, output: 100_000 }));
   const { rows } = await tenantRead(db, HAIKU_FROM, HAIKU_FROM + DAY_MS);
   const cost = sumCost(rows.filter((r) => r.key.startsWith("claude-haiku-5-5:")));
-  const byHand = 0.5 * 0.10 + 0.4 * 0.01 + 0.1 * 0.125 + 1.0 * 0.50;
+  const byHand = (50_000 * 0.10 + 40_000 * 0.01 + 10_000 * 0.125 + 100_000 * 0.50) / 1e6;
   must(near(cost, byHand), `haiku cost ${cost}, by hand ${byHand}`);
+});
+
+await check("Claude Haiku 5.5 over 100,000 prompt tokens: the whole call at the long tier; at exactly 100,000 the lower one", async () => {
+  const db = d1();
+  const prices = await usagePrices(db);
+  const long: Record<string, number> = { input: 0.50e-6, cache_read: 0.05e-6 - 0.50e-6, cache_write: 0.625e-6 - 0.50e-6, cache_write_1h: 0, output: 2.50e-6, reasoning: 0 };
+  for (const resource of ["model.tokens", UNACCEPTED_TOKENS]) {
+    for (const [kind, rate] of Object.entries(long)) {
+      const got = priceFor(prices, { bucket: HAIKU_FROM, resource, key: `claude-haiku-5-5:long:${kind}`, unit: "tokens" });
+      must(got !== null && Math.abs(got - rate) < 1e-15, `${resource} long ${kind}: ${got}, the page says ${rate}`);
+    }
+  }
+  // The boundary is the whole prompt: 100,000 is the lower tier, 100,001 the long one, cache reads and writes inside it.
+  const call = (input: number) => modelTokenRows({ at: HAIKU_FROM + 2 * H, tenantId: "t", agentId: "a" }, "claude-haiku-5-5",
+    { input, cacheRead: 60_000, cacheWrite: 10_000, output: 1_000 });
+  must(call(100_000).every((r) => r.key.startsWith("claude-haiku-5-5:") && !r.key.includes(":long:")), show(call(100_000)));
+  must(call(100_001).every((r) => r.key.startsWith("claude-haiku-5-5:long:")), show(call(100_001)));
+  must(modelTokenRows({ at: 0, tenantId: "t", agentId: "a" }, "deepseek-flash", { input: 900_000 }).every((r) => r.key === "deepseek-flash:input"), "another model was tiered");
+  put(db, [...call(100_000), ...call(100_001)]);
+  const { rows } = await tenantRead(db, HAIKU_FROM, HAIKU_FROM + DAY_MS);
+  const low = sumCost(rows.filter((r) => /^claude-haiku-5-5:(?!long:)/.test(r.key)));
+  const high = sumCost(rows.filter((r) => r.key.startsWith("claude-haiku-5-5:long:")));
+  const lowByHand = (30_000 * 0.10 + 60_000 * 0.01 + 10_000 * 0.125 + 1_000 * 0.50) / 1e6;
+  const highByHand = (30_001 * 0.50 + 60_000 * 0.05 + 10_000 * 0.625 + 1_000 * 2.50) / 1e6;
+  must(near(low, lowByHand) && near(high, highByHand), `low ${low} (by hand ${lowByHand}), long ${high} (by hand ${highByHand})`);
 });
 
 // ---- no double charge -------------------------------------------------------------------------------

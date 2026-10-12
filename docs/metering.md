@@ -160,7 +160,8 @@ old one, because cost is worked out when read.
 | | `claude-haiku-5-5:cache_read` | tokens | (0.01 − 0.10) / 1M | cache hit $0.01/1M |
 | | `claude-haiku-5-5:cache_write` | tokens | (0.125 − 0.10) / 1M | 5-minute cache write $0.125/1M: this client reports writes, inside `input` |
 | | `claude-haiku-5-5:output` | tokens | 0.50 / 1M | the same page |
-| | `claude-haiku-5-5:reasoning`, `…:cache_write_1h` | tokens | 0 extra | inside output / cache_write (no 1-hour write is asked for). A prompt over 100K is billed at a higher tier a key cannot express; the soft window keeps calls under it |
+| | `claude-haiku-5-5:reasoning`, `…:cache_write_1h` | tokens | 0 extra | inside output / cache_write (no 1-hour write is asked for) |
+| | `claude-haiku-5-5:long:<kind>` | tokens | input 0.50, cache_read (0.05 − 0.50), cache_write (0.625 − 0.50), output 2.50 / 1M; reasoning, cache_write_1h 0 extra | the same page's tier for a prompt over 100K: a call whose whole prompt (`input`) is over 100,000 is keyed here (`PRICE_TIERS`, `src/usage/outbox.ts`) |
 | `model.tokens.unaccepted` | the same keys | tokens | the same | our cost; never in a tenant's view |
 | `object.active` | `*` | ms | 0.0000000015625 | Cloudflare Durable Objects, $12.50 per 1M GB-s at 128 MB |
 | `sandbox.container` | `*` | seconds | 0.00004 | an estimate: run9 publishes no prices |

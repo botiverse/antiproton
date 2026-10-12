@@ -7,7 +7,9 @@
  */
 import { callQueuedModel } from "../cf/src/model-request.ts";
 import { ANTHROPIC_VERSION, readMessage } from "../src/model/anthropic-messages.ts";
-import { CACHE_BREAKPOINT, fromResponse, toAnthropicRequest, toRequest } from "../src/model/pi-bridge.ts";
+import { CACHE_BREAKPOINT, EMPTY_INPUT, FAILED_ANSWER, fromResponse, toAnthropicRequest, toRequest } from "../src/model/pi-bridge.ts";
+import { overflowKind } from "../src/runtime/overflow-backstop.ts";
+import { isRetryableAssistantError } from "@earendil-works/pi-ai";
 import { parseProviders, providerRequest, providersFrom } from "../src/model/providers.ts";
 import { parseUserModels } from "../src/model/user-models.ts";
 import { contextWindowFor } from "../src/model/context-windows.ts";
@@ -15,6 +17,13 @@ import {
   DEFAULT_REBUILD_POLICY, DEFAULT_SOFT_WINDOW_POLICY, REFUSED_REBUILD_POLICY, rebuildPolicyOf, softWindowFor, softWindowReached,
 } from "../src/runtime/rebuild.ts";
 import { readFile } from "node:fs/promises";
+import { AgentRuntime } from "../cf/src/runtime.ts";
+import { operatorModelOf } from "../cf/src/model-request.ts";
+import type { Plugin } from "../src/plugins/types.ts";
+import { ApStore } from "../src/store/ap-store.ts";
+import { prefixedNamespace } from "../src/store/sql-namespace.ts";
+import { sqliteHost } from "../src/store/sqlite-host.ts";
+import { pendingUsage } from "../src/usage/outbox.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => void | Promise<void>) {
@@ -173,6 +182,77 @@ await check("an answer is read: text, tool calls, each thinking block kept whole
   must(u.input === 6903 && u.cacheRead === 6816 && u.cacheWrite === 78 && u.output === 20 && u.totalTokens === 6923, show(u));
 });
 
+// ---- verbatim replay, failed stops, empty inputs, results after text -----------------------------------------------
+
+/** An answer's blocks read, written to the transcript, and sent back: what the next request carries for that turn. */
+function replayed(content: unknown[], stop = "tool_use") {
+  const res = readMessage({ content, stop_reason: stop, usage: { input_tokens: 1, output_tokens: 1 } });
+  const answer = fromResponse(res, { api: "offloaded", provider: "p", id: HAIKU }, "mj_r");
+  const results = (content as any[]).filter((b) => b.type === "tool_use")
+    .map((b, i) => ({ role: "toolResult", toolCallId: b.id, toolName: b.name, content: [{ type: "text", text: `r${i}` }], isError: false, timestamp: 3 }));
+  const r = toAnthropicRequest({ systemPrompt: "S", messages: [{ role: "user", content: "go", timestamp: 1 }, answer, ...results] } as never, HAIKU);
+  return { answer, sent: r.messages[1]! };
+}
+
+await check("an interleaved answer [thinking, tool_use, thinking, tool_use] goes back byte for byte, in its order", () => {
+  const content = [
+    { type: "thinking", thinking: "First the note.", signature: "sig-a" },
+    { type: "tool_use", id: "toolu_1", name: "kv__get", input: { key: "a", nested: { z: 1, a: [2, 1] } }, caller: { type: "direct" } },
+    { type: "thinking", thinking: "Then the other.", signature: "sig-b" },
+    { type: "tool_use", id: "toolu_2", name: "kv__get", input: { key: "b" } },
+  ];
+  const { answer, sent } = replayed(content);
+  must(answer.content.map((c: any) => c.type).join() === "thinking,toolCall,thinking,toolCall", show(answer.content));
+  must(sent.role === "assistant" && JSON.stringify(sent.content) === JSON.stringify(content), `sent ${show(sent.content)}`);
+});
+
+await check("an answer [text, thinking, text] goes back byte for byte: the two texts are not joined, the thinking not moved", () => {
+  const content = [
+    { type: "text", text: "Looking.", citations: null },
+    { type: "thinking", thinking: "", signature: "sig-c" },
+    { type: "text", text: " Done." },
+  ];
+  const { answer, sent } = replayed(content, "end_turn");
+  must(answer.stopReason === "stop" && answer.content.map((c: any) => c.type).join() === "text,thinking,text", show(answer.content));
+  must(JSON.stringify(sent.content) === JSON.stringify(content), `sent ${show(sent.content)}`);
+});
+
+await check("a refusal or a window stop with nothing in it is a failed turn naming the stop; with content a window stop is a cut answer", () => {
+  const identity = { api: "offloaded", provider: "p", id: HAIKU };
+  const refusal = fromResponse(readMessage({ content: [], stop_reason: "refusal", stop_details: { type: "refusal", category: "cyber" }, usage: {} }), identity, "mj_f");
+  must(refusal.stopReason === "error" && refusal.errorMessage === FAILED_ANSWER && /refusal/.test(String(refusal.providerError)) && /cyber/.test(String(refusal.providerError)), show(refusal));
+  must(!isRetryableAssistantError(refusal as never), "pi would send the refused call again");
+  const window = fromResponse(readMessage({ content: [{ type: "thinking", thinking: "", signature: "s" }], stop_reason: "model_context_window_exceeded", usage: {} }), identity, "mj_w");
+  must(window.stopReason === "error" && /model_context_window_exceeded/.test(String(window.providerError)), show(window));
+  // The overflow backstop rebuilds for it, as for a provider's refusal of an oversized request.
+  must(overflowKind(window) === "history", `not an overflow: ${overflowKind(window)}`);
+  const cut = readMessage({ content: [{ type: "text", text: "partial" }], stop_reason: "model_context_window_exceeded", usage: {} });
+  must(cut.truncated && !cut.failure && fromResponse(cut, identity).stopReason === "length", show(cut));
+});
+
+await check("an input with no text (an image alone, or whitespace) is sent as a placeholder: the request never ends on an answer or empty", () => {
+  const ctx = { systemPrompt: "S", messages: [
+    { role: "user", content: "hi", timestamp: 1 },
+    assistant(HAIKU, [{ type: "text", text: "hello" }], "stop"),
+    { role: "user", content: [{ type: "image", data: "AAAA", mimeType: "image/png" }], timestamp: 3 },
+  ] };
+  const r = toAnthropicRequest(ctx as never, HAIKU);
+  must(r.messages.at(-1)!.role === "user" && r.messages.at(-1)!.content[0]!.text === EMPTY_INPUT, show(r.messages.at(-1)));
+  const blank = toAnthropicRequest({ systemPrompt: "S", messages: [{ role: "user", content: "   ", timestamp: 1 }] } as never, HAIKU);
+  must(blank.messages.length === 1 && blank.messages[0]!.content[0]!.text === EMPTY_INPUT, show(blank.messages));
+});
+
+await check("a tool result after an input in the same user turn is one message, the results first", () => {
+  const ctx = { systemPrompt: "S", messages: [
+    { role: "user", content: "start", timestamp: 1 },
+    assistant(HAIKU, [{ type: "toolCall", id: "t1", name: "kv__get", arguments: {} }]),
+    { role: "user", content: "also this", timestamp: 3 },
+    { role: "toolResult", toolCallId: "t1", toolName: "kv__get", content: [{ type: "text", text: "A" }], isError: false, timestamp: 4 },
+  ] };
+  const r = toAnthropicRequest(ctx as never, HAIKU);
+  must(r.messages.length === 3 && show(r.messages[2]!.content.map((b) => b.type === "tool_result" ? `result:${b.tool_use_id}` : `text:${b.text}`)) === show(["result:t1", "text:also this"]), show(r.messages));
+});
+
 // ---- the queue consumer's call ---------------------------------------------------------------------------------------
 
 function provider(replies: Array<{ status?: number; body: unknown }>) {
@@ -230,6 +310,75 @@ await check("the same model through the OpenAI-compatible provider is the chat r
   must(p.seen[0]!.url === `${GW}/compat/chat/completions` && show(p.seen[0]!.body.messages) === show(toRequest(ctx as never).messages)
     && !JSON.stringify(p.seen[0]!.body).includes("cache_control"), show(p.seen[0]));
 });
+
+// ---- through the agent: both engines -------------------------------------------------------------------------------
+
+const notes: Plugin = {
+  id: "kv", version: "1.0.0",
+  tools: [{ name: "get", summary: "Read a note.", parameters: { type: "object", properties: { key: { type: "string" } }, required: ["key"] }, sideEffects: "read", idempotency: "none" }] as never,
+  async invoke() { return { value: "the note" }; },
+};
+const INTERLEAVED = [
+  { type: "thinking", thinking: "Read x.", signature: "sig-1" },
+  { type: "tool_use", id: "toolu_1", name: "notes__get", input: { key: "x" } },
+  { type: "thinking", thinking: "And y.", signature: "sig-2" },
+  { type: "tool_use", id: "toolu_2", name: "notes__get", input: { key: "y" } },
+];
+
+/** One Haiku turn on `engine`: an interleaved answer of two calls, then a reply. The requests sent and the usage metered. */
+async function haikuTurn(engine: "pi085" | "pd") {
+  const host = sqliteHost();
+  const p = provider([
+    { body: { content: INTERLEAVED, stop_reason: "tool_use", usage: { input_tokens: 10, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 30 } } },
+    // Over 100,000 prompt tokens: metered at the long tier.
+    { body: { content: [{ type: "text", text: "Both say: the note." }], stop_reason: "end_turn", usage: { input_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 100_000, output_tokens: 8 } } },
+  ]);
+  try {
+    return await withFetch(p.fetch, async () => {
+      if (engine === "pd") { const ap = new ApStore(host, prefixedNamespace("ap")); ap.ensure(); ap.setEngineOnce("pd"); }
+      const sent: string[] = [];
+      const rt = new AgentRuntime({
+        ctx: { storage: { sql: host.sql, transactionSync: host.transactionSync } },
+        bucket: {} as never, bucketName: "b", models: { resolve: () => null },
+        autoRelease: false, extraPlugins: [notes], operatorModel: operatorModelOf(ENV),
+        offloadModel: async (job: { commandId: string }) => { sent.push(job.commandId); },
+      } as never);
+      await rt.ready();
+      await rt.store.createAgent("t", "a");
+      await rt.store.setPluginChoice("t", "a", "kv", "enable");
+      must((await rt.addMount("t", "a", { alias: "notes", plugin: "kv", config: {} })).ok, "the mount was refused");
+      await rt.bindOperatorModel("t", "a", { provider: "cloudflare-anthropic", model: HAIKU });
+      await rt.postMessage("t", "a", "What do notes x and y say?");
+      const answered = new Set<string>();
+      for (let guard = 0; ; guard++) {
+        must(guard < 300, `${engine}: the turn did not settle after ${p.seen.length} calls`);
+        const out = await rt.step("t", "a") as { wakeInMs?: number | null };
+        const pending = sent.filter((id) => !answered.has(id));
+        for (const id of pending) {
+          answered.add(id);
+          const taken = await rt.takeJob("t", "a", id);
+          if (taken) await rt.deliverAnswer("t", "a", id, await callQueuedModel(ENV, taken, id), undefined);
+        }
+        if (pending.length) continue;
+        if (out?.wakeInMs === null || out?.wakeInMs === undefined) break;
+        await new Promise((r) => setTimeout(r, Math.min(out.wakeInMs!, 20)));
+      }
+      const usage = pendingUsage(host.sql as never, 0).filter((r) => r.resource === "model.tokens").map((r) => `${r.key}=${r.quantity}`);
+      return { seen: p.seen, usage };
+    });
+  } finally { host.dispose(); }
+}
+
+for (const engine of ["pi085", "pd"] as const) {
+  await check(`${engine}: an interleaved answer reaches the next request byte for byte through the transcript; a call over 100,000 is metered at the long tier`, async () => {
+    const { seen, usage } = await haikuTurn(engine);
+    must(seen.length === 2, `${seen.length} calls`);
+    const turn = seen[1]!.body.messages.find((m: any) => m.role === "assistant");
+    must(JSON.stringify(turn?.content) === JSON.stringify(INTERLEAVED), `the turn sent back: ${show(turn?.content)}`);
+    must(usage.includes(`${HAIKU}:input=10`) && usage.includes(`${HAIKU}:output=30`)
+      && usage.includes(`${HAIKU}:long:input=100001`) && usage.includes(`${HAIKU}:long:cache_read=100000`) && usage.includes(`${HAIKU}:long:output=8`), `usage ${show(usage)}`);
+  });
+}
 
 // ---- the soft window's policy ---------------------------------------------------------------------------------------
 

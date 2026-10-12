@@ -300,6 +300,12 @@ export function toResponsesInput(context: JobContext, model: string, opts: Seria
 
 const NO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
 
+/**
+ * The `errorMessage` of an answer the provider ended with nothing in it (`ModelResponse.failure`): fixed text, since the
+ * harness's retry check scans it; the provider's reason travels in `providerError`.
+ */
+export const FAILED_ANSWER = "the model ended its answer with nothing in it: see the turn's error";
+
 /** Cost is left at zero: this deployment prices per tenant elsewhere, and a
  *  wrong number in the transcript is worse than an absent one. */
 function usageOf(res: ModelResponse): Usage {
@@ -338,17 +344,30 @@ export function fromResponse(
   jobId?: string,
 ): AnsweredMessage {
   const content: AssistantMessage["content"] = [];
-  // Reasoning to replay (the Responses API's items) is one thinking block per item, its item in
-  // `thinkingSignature`; a trace that is only text is one block with no signature, as it always was.
-  if (res.reasoningItems?.length) {
+  if (res.failure) {
+    return { ...errorMessage(FAILED_ANSWER, model), usage: usageOf(res), rawStopReason: res.finishReason, providerError: res.failure, ...(jobId ? { jobId } : {}) };
+  }
+  // Blocks in the provider's order (Anthropic's), each raw block in its signature field: thinking's
+  // `thinkingSignature`, text's `textSignature`, a call's `thoughtSignature`, which `toAnthropicRequest` replays.
+  if (res.blocks?.length) {
+    for (const b of res.blocks) {
+      if (b.type === "thinking") content.push({ type: "thinking", thinking: b.text, thinkingSignature: b.raw } as any);
+      else if (b.type === "text") content.push({ type: "text", text: b.text, textSignature: b.raw } as any);
+      else content.push({ type: "toolCall", id: b.call.id, name: b.call.name, arguments: (b.call.arguments ?? {}) as Record<string, unknown>, thoughtSignature: b.raw } as any);
+    }
+  } else if (res.reasoningItems?.length) {
+    // Reasoning to replay (the Responses API's items) is one thinking block per item, its item in
+    // `thinkingSignature`; a trace that is only text is one block with no signature, as it always was.
     for (const r of res.reasoningItems) content.push({ type: "thinking", thinking: r.text, thinkingSignature: r.signature } as any);
   } else if (res.reasoning) content.push({ type: "thinking", thinking: res.reasoning } as any);
-  if (res.text) content.push({ type: "text", text: res.text });
-  for (const c of res.toolCalls ?? []) {
-    content.push({
-      type: "toolCall", id: c.id, name: c.name,
-      arguments: (c.arguments ?? {}) as Record<string, unknown>,
-    } as any);
+  if (!res.blocks?.length) {
+    if (res.text) content.push({ type: "text", text: res.text });
+    for (const c of res.toolCalls ?? []) {
+      content.push({
+        type: "toolCall", id: c.id, name: c.name,
+        arguments: (c.arguments ?? {}) as Record<string, unknown>,
+      } as any);
+    }
   }
 
   // A truncated reply that still says something is usable, and `length` is how
@@ -423,6 +442,22 @@ export function errorMessage(
   };
 }
 
+/** What an input with no text is sent as (`toAnthropicRequest`). */
+export const EMPTY_INPUT = "(no text)";
+
+/**
+ * A block the model wrote, from the JSON it was kept as, when it is one of `types`; null otherwise (no signature, one
+ * from another provider, or not JSON). An empty text block is never sent back: the API refuses one in a request.
+ */
+function rawBlock(signature: unknown, types: string[]): AnthropicBlock | null {
+  if (typeof signature !== "string" || !signature) return null;
+  let b: unknown;
+  try { b = JSON.parse(signature); } catch { return null; }
+  if (!b || typeof b !== "object" || !types.includes(String((b as { type?: unknown }).type))) return null;
+  if ((b as { type: string }).type === "text" && !(b as { text?: unknown }).text) return null;
+  return b as AnthropicBlock;
+}
+
 /** An Anthropic Messages API content block or message, as sent. */
 type AnthropicBlock = Record<string, unknown>;
 export interface AnthropicMessage { role: "user" | "assistant"; content: AnthropicBlock[] }
@@ -489,35 +524,38 @@ export function toAnthropicRequest(context: JobContext, model: string): {
       continue;
     }
     if (m.role === "user") {
+      // An input with no text (an image alone, which this request does not carry, or only whitespace) still takes its
+      // turn: dropped, the request could end on an assistant turn, which is a prefill these models refuse, or be empty.
       const text = textOf(m.content);
-      if (text.trim()) userBlocks().push({ type: "text", text });
+      userBlocks().push({ type: "text", text: text.trim() ? text : EMPTY_INPUT });
       continue;
     }
     if (m.role === "toolResult") {
       const blocks = userBlocks();
-      // Results open their message: a text block (an earlier input) before them would be refused.
+      // Results open their message, before any text in it (an input that came in while the calls ran): one message,
+      // results first, since a user message after the one answering the calls would leave the calls unanswered.
       const at = blocks.findIndex((b) => b.type !== "tool_result");
       const result: AnthropicBlock = { type: "tool_result", tool_use_id: m.toolCallId, content: textOf(m.content) || "(no output)",
         ...(m.isError ? { is_error: true } : {}) };
       if (at < 0) blocks.push(result);
-      else messages.push({ role: "user", content: [result] });
+      else blocks.splice(at, 0, result);
       continue;
     }
-    // assistant
+    // assistant: this model's own answer exactly as it wrote it, every block raw and in order (`readMessage`,
+    // src/model/anthropic-messages.ts, keeps each one in its block's signature field); anything else rebuilt.
     flush();
     const own = m.model === model;
     const blocks: AnthropicBlock[] = [];
     for (const c of (m.content ?? []) as any[]) {
       if (c?.type === "thinking") {
-        if (!own || typeof c.thinkingSignature !== "string" || !c.thinkingSignature) continue;
-        let block: unknown;
-        try { block = JSON.parse(c.thinkingSignature); } catch { continue; }
-        const type = (block as { type?: unknown } | null)?.type;
-        if (type === "thinking" || type === "redacted_thinking") blocks.push(block as AnthropicBlock);
+        const raw = own ? rawBlock(c.thinkingSignature, ["thinking", "redacted_thinking"]) : null;
+        if (raw) blocks.push(raw);
       } else if (c?.type === "text") {
-        if (String(c.text ?? "").trim()) blocks.push({ type: "text", text: String(c.text) });
+        const raw = own ? rawBlock(c.textSignature, ["text"]) : null;
+        if (raw) blocks.push(raw);
+        else if (String(c.text ?? "").trim()) blocks.push({ type: "text", text: String(c.text) });
       } else if (c?.type === "toolCall") {
-        blocks.push({ type: "tool_use", id: c.id, name: c.name, input: c.arguments ?? {} });
+        blocks.push((own ? rawBlock(c.thoughtSignature, ["tool_use"]) : null) ?? { type: "tool_use", id: c.id, name: c.name, input: c.arguments ?? {} });
       }
     }
     if (blocks.length) messages.push({ role: "assistant", content: blocks });

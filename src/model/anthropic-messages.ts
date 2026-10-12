@@ -84,34 +84,56 @@ export class AnthropicMessagesModel {
 }
 
 /**
- * A Messages API answer as our ModelResponse. Each thinking block (or redacted one) is kept whole as a reasoning
- * item, its block as JSON in `signature`, so `toAnthropicRequest` can send it back unchanged; its readable text, when
- * the model returned one, is the trace. A `refusal` stop is an answer with no text, not an error to retry: sending the
- * same request again is refused the same way.
+ * A Messages API answer as our ModelResponse. The content is kept as `blocks`, in the model's order, each block's raw
+ * JSON beside it, so `toAnthropicRequest` sends the turn back exactly as it came: a model that binds its thinking to
+ * the blocks around it (preserved thinking, which Claude Haiku 5.5 enforces) refuses a turn whose blocks were
+ * reordered or merged, or drops its thinking and the cached prefix with it. `text`, `toolCalls` and `reasoning` are
+ * the same content read flat, for every other reader.
+ *
+ * A stop that is not a normal one with nothing in the content (`refusal`, `model_context_window_exceeded`) is a
+ * failed turn (`failure`), not a silent empty stop: sending the same request again is answered the same way. With
+ * content, a window stop is a cut answer (`truncated`), as `max_tokens` is.
  */
 export function readMessage(data: any): ModelResponse {
   const content: any[] = Array.isArray(data?.content) ? data.content : [];
   const text: string[] = [];
   const toolCalls: NonNullable<ModelResponse["toolCalls"]> = [];
   const reasoningItems: NonNullable<ModelResponse["reasoningItems"]> = [];
+  const blocks: NonNullable<ModelResponse["blocks"]> = [];
   for (const b of content) {
-    if (b?.type === "text") text.push(String(b.text ?? ""));
-    else if (b?.type === "tool_use") toolCalls.push({ id: String(b.id), name: String(b.name), arguments: b.input ?? {} });
-    else if (b?.type === "thinking" || b?.type === "redacted_thinking") {
-      reasoningItems.push({ text: b.type === "thinking" ? String(b.thinking ?? "") : "", signature: JSON.stringify(b) });
+    const raw = JSON.stringify(b);
+    if (b?.type === "text") {
+      text.push(String(b.text ?? ""));
+      blocks.push({ type: "text", text: String(b.text ?? ""), raw });
+    } else if (b?.type === "tool_use") {
+      const call = { id: String(b.id), name: String(b.name), arguments: b.input ?? {} };
+      toolCalls.push(call);
+      blocks.push({ type: "toolCall", call, raw });
+    } else if (b?.type === "thinking" || b?.type === "redacted_thinking") {
+      const t = b.type === "thinking" ? String(b.thinking ?? "") : "";
+      reasoningItems.push({ text: t, signature: raw });
+      blocks.push({ type: "thinking", text: t, raw });
     }
   }
   const stop = String(data?.stop_reason ?? "unknown");
   const reasoning = reasoningItems.map((r) => r.text).filter(Boolean).join("\n\n").slice(0, REASONING_CHARS);
   const u = data?.usage ?? {};
   const fresh = num(u.input_tokens), written = num(u.cache_creation_input_tokens), read = num(u.cache_read_input_tokens);
+  const empty = !text.join("").trim() && !toolCalls.length;
+  const failure = empty && FAILED_STOPS.has(stop)
+    ? `the model stopped with ${stop} and returned no content` +
+      (stop === "model_context_window_exceeded" ? ": the request exceeds the model's context window" : "") +
+      (data?.stop_details?.category ? ` (${String(data.stop_details.category)})` : "")
+    : undefined;
   return {
     text: text.join(""),
     ...(reasoning ? { reasoning } : {}),
     ...(reasoningItems.length ? { reasoningItems } : {}),
+    ...(blocks.length ? { blocks } : {}),
+    ...(failure ? { failure } : {}),
     toolCalls: toolCalls.length ? toolCalls : undefined,
     finishReason: stop === "tool_use" ? "tool_calls" : stop,
-    truncated: stop === "max_tokens",
+    truncated: stop === "max_tokens" || stop === "model_context_window_exceeded",
     usage: {
       promptTokens: fresh + written + read,
       completionTokens: num(u.output_tokens),
@@ -122,5 +144,8 @@ export function readMessage(data: any): ModelResponse {
     },
   };
 }
+
+/** Stops that, with nothing in the content, are a failed turn rather than an empty answer. */
+const FAILED_STOPS = new Set(["refusal", "model_context_window_exceeded"]);
 
 const num = (v: unknown) => typeof v === "number" && Number.isFinite(v) ? v : 0;
