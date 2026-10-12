@@ -20,6 +20,15 @@ import { closedCostsTo, parseCostsQuery } from "../cf/src/admin-usage-costs.ts";
 import { usageCostsPanel } from "../cf/src/ui.ts";
 import { d1ApiKeys } from "../cf/src/control-plane.ts";
 
+// A hand-edited date the calendar does not have is refused, not rolled over (2026-02-31 would
+// become 03-03) and not a throw (2026-13-01 used to reach toISOString on NaN and 500): without
+// closedCostsTo's calendar check these regress silently, so the refusal is pinned here.
+for (const bad of ["2026-02-31", "2026-13-01", "2026-00-10"]) {
+  const q = parseCostsQuery(closedCostsTo(new URLSearchParams({ from: "2026-10-01", to: bad })), Date.parse("2026-10-12T12:00:00Z"));
+  if (typeof q !== "string") throw new Error(`${bad}: expected a refusal, got a window ${q.from}..${q.to}`);
+}
+console.log("ok  an impossible to is refused by parseCostsQuery, not rolled over or thrown on");
+
 // The admin page's window form names a closed day interval; applying it twice without touching the
 // fields must answer the same window both times (regression: the open boundary drifted a day per
 // apply, forwards, then backwards). Day and month buckets.
