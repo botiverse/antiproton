@@ -154,6 +154,18 @@ check("spendLimitsPanel renders defaults, today against limits, and the audit tr
   must(/audit — last 1/.test(html) && /op@x\.dev/.test(html), "the audit row names who changed it");
 });
 
+check("spendLimitsPanel shows unaccepted answers beside, not inside, the tenant's number", () => {
+  const html = spendLimitsPanel({
+    defaults: { tenantUsd: 5, platformUsd: 30, exempt: [] },
+    overrides: [], events: [],
+    today: [{ tenantId: "acme", usd: 0.4, unaccepted: 1.1 }],
+    platformToday: 1.5,
+  });
+  must(/\$0\.40/.test(html), "the tenant row is the limit-counting number");
+  must(/\+\$1\.10 unaccepted/.test(html), "the excluded part is shown next to it, not silently dropped");
+  must(/today so far — \$1\.50 of \$30\.00/.test(html), "the platform total counts unaccepted, as enforcement does");
+});
+
 check("spendLimitsPanel prints small money without rounding it away", () => {
   const html = spendLimitsPanel({
     defaults: { tenantUsd: null, platformUsd: null, exempt: [] },

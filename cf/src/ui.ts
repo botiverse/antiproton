@@ -1977,7 +1977,7 @@ const usd = (v: number | null | undefined): string =>
   v === null || v === undefined ? "—" : `$${v === 0 ? "0.00" : Math.abs(v) < 0.01 ? v.toFixed(4) : v.toFixed(2)}`;
 
 /** One row of the spend-limits page: what a tenant spent today, against the limit that applies to it. */
-export interface SpendTodayRow { tenantId: string; usd: number }
+export interface SpendTodayRow { tenantId: string; usd: number; /** Unaccepted answers (our cost, not the tenant's): excluded from the tenant limit, shown so the subtraction is not silent. */ unaccepted?: number }
 
 export function spendLimitsPanel(d: {
   defaults: { tenantUsd: number | null; platformUsd: number | null; exempt: string[] };
@@ -2003,14 +2003,15 @@ export function spendLimitsPanel(d: {
       <input type="hidden" name="action" value="clear"><input type="hidden" name="tenantId" value="${esc(id)}">
       <button type="submit" class="ghost">clear</button></form>`;
   const rows = tenantIds.map((id) => {
-    const spent = spentOf.get(id) ?? 0;
+    const t = d.today.find((x) => x.tenantId === id);
+    const spent = t?.usd ?? 0;
     const limit = limitOf(id);
     const exempt = d.defaults.exempt.includes(id);
     const over = !exempt && limit.value !== null && spent > limit.value;
     const near = !exempt && limit.value !== null && !over && spent >= limit.value * 0.9;
     return `<tr${over ? ` class="usd-over"` : ""}>
       <td><code>${esc(id)}</code>${exempt ? ` <span class="tag">exempt</span>` : ""}</td>
-      <td>${usd(spent)}</td>
+      <td>${usd(spent)}${t && t.unaccepted ? ` <span class="hint-inline" title="unaccepted answers are our cost, not the tenant's — they count toward the platform total, not this tenant's limit">+${usd(t.unaccepted)} unaccepted</span>` : ""}</td>
       <td>${limit.value === null ? "no tenant limit" : usd(limit.value)}${limit.via === "default" ? ` <span class="hint-inline">default</span>` : ""}${over ? ` <span class="tag">over</span>` : near ? ` <span class="tag">near</span>` : ""}</td>
       <td>${overrideOf.has(id) ? clearForm(id) : ""}</td></tr>`;
   }).join("");

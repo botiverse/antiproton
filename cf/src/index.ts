@@ -4649,6 +4649,11 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
           const actor = v!.sub ?? v!.email;
           let error: string | null = null;
           if (request.method === "POST") {
+            // SameSite=Lax does not stop another host under this registrable domain posting
+            // with the admin's cookie (the forgedWrite comment's case), so a write here names
+            // its origin like the console's writes — same-origin, or refused.
+            const forged = await forgedWrite(request, url, env);
+            if (forged) return new Response(forged, { status: 403 });
             const form = await formOf(request);
             if (!form) return new Response("expected a form body", { status: 400 });
             const tenantId = String(form.get("tenantId") ?? "");
@@ -4667,8 +4672,15 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
           const data: Pick<Parameters<typeof spendLimitsPanel>[0], "defaults" | "overrides" | "events"> = await read.json();
           const day = Math.floor(Date.now() / 86_400_000) * 86_400_000;
           const costs = await readUsageCosts(env.CONTROL_DB, day, day + 86_400_000, "day");
-          const today = costs.map((c) => ({ tenantId: c.tenantId, usd: c.total }));
-          return new Response(spendLimitsPanel({ ...data, today, platformToday: today.reduce((sum, t) => sum + t.usd, 0), error }), { headers: { "cache-control": "no-store", "content-type": "text/html; charset=utf-8" } });
+          // What the tenant limit counts is priced usage minus unaccepted answers (ours, not
+          // theirs — spend-limit.ts); the platform total counts everything, exempt included.
+          const today = costs.map((c) => ({
+            tenantId: c.tenantId,
+            usd: c.total - c.periods.flatMap((p) => p.resources).filter((r) => r.resource === "model.tokens.unaccepted").reduce((sum, r) => sum + r.cost, 0),
+            unaccepted: c.periods.flatMap((p) => p.resources).filter((r) => r.resource === "model.tokens.unaccepted").reduce((sum, r) => sum + r.cost, 0),
+          }));
+          const platformToday = costs.reduce((sum, c) => sum + c.total, 0);
+          return new Response(spendLimitsPanel({ ...data, today, platformToday, error }), { headers: { "cache-control": "no-store", "content-type": "text/html; charset=utf-8" } });
         }
         case "/ui/admin/usage-costs": {
           // The operator's cost view as a page, same reader as /admin/usage-costs. Default window is
