@@ -24,7 +24,7 @@
  */
 import type { AssistantMessage, Context as PiContext, Message as PiMessage, Tool as PiTool, Usage } from "@earendil-works/pi-ai";
 import type { ChatContentPart, ModelMessage, ModelResponse, ToolDefinition } from "./types.ts";
-import { imageRefHash, NO_VISION_SENTENCE } from "./images.ts";
+import { IMAGE_REF_PREFIX, NO_VISION_SENTENCE } from "./images.ts";
 
 /**
  * The job wire format, version 2: a system message keeps its place in the conversation.
@@ -88,7 +88,7 @@ const imagesOf = (content: unknown): Array<{ data: string; mimeType: string }> =
  * resolve it (src/model/images.ts `resolveImages`), and sending it would be an image no provider can decode.
  */
 function dataUrl(image: { data: string; mimeType: string }): string {
-  if (imageRefHash(image.data) !== null || typeof image.data !== "string" || !image.data) {
+  if (typeof image.data !== "string" || !image.data || image.data.startsWith(IMAGE_REF_PREFIX)) {
     throw new Error("an image in a model request was never resolved to its bytes");
   }
   return `data:${image.mimeType};base64,${image.data}`;

@@ -4,7 +4,7 @@
  *
  * An image's bytes never enter a Durable Object row. A transcript entry, a `pi_model_jobs` / `ap_model_jobs` row,
  * the request-prefix reading and the model-input evidence all hold the image block pi defines
- * (`{ type: "image", mimeType, data }`) with `data` set to a reference, `apimg:sha256:<hex>`, never base64: a row
+ * (`{ type: "image", mimeType, data }`) with `data` set to a reference, `apimg:sha256:<hex>:<bytes>`, never base64: a row
  * is capped at 2 MB, an image may be 1.5 MB raw (2 MB as base64), and every later request in the conversation
  * carries every image again. The bytes live in R2 once, under the agent's own prefix and keyed by their hash
  * (`imageKey`), and the queue consumer swaps each reference for its bytes right before the provider call
@@ -46,14 +46,25 @@ const SHA = /^[0-9a-f]{64}$/;
 
 export const sha256Hex = (bytes: Uint8Array): string => createHash("sha256").update(bytes).digest("hex");
 
-/** The reference for an image whose bytes hash to `sha256`. */
-export const imageRef = (sha256: string): string => `${IMAGE_REF_PREFIX}${sha256}`;
+/**
+ * The reference for an image whose `bytes` bytes hash to `sha256`: `apimg:sha256:<hex>:<bytes>`. The size rides in the
+ * reference so the request's image window (`resolveImages`) is decided from the conversation alone, with nothing read
+ * and nothing a failed read could move.
+ */
+export const imageRef = (sha256: string, bytes: number): string => `${IMAGE_REF_PREFIX}${sha256}:${bytes}`;
+
+const REF = /^([0-9a-f]{64})(?::(\d{1,9}))?$/;
 
 /** The hash a reference names, or null when `data` is not a reference (base64 bytes, or anything else). */
 export function imageRefHash(data: unknown): string | null {
   if (typeof data !== "string" || !data.startsWith(IMAGE_REF_PREFIX)) return null;
-  const h = data.slice(IMAGE_REF_PREFIX.length);
-  return SHA.test(h) ? h : null;
+  return REF.exec(data.slice(IMAGE_REF_PREFIX.length))?.[1] ?? null;
+}
+
+/** The size a reference declares; MAX_IMAGE_BYTES, the most it can be, for one that declares none or an impossible one. */
+export function imageRefBytes(data: unknown): number {
+  const n = typeof data === "string" ? Number(REF.exec(data.slice(IMAGE_REF_PREFIX.length))?.[2]) : NaN;
+  return Number.isSafeInteger(n) && n > 0 && n <= MAX_IMAGE_BYTES ? n : MAX_IMAGE_BYTES;
 }
 
 /**
@@ -158,19 +169,21 @@ export const omittedImageText = (mimeType: unknown, sha256: string) =>
 
 /**
  * `context` with image references replaced, for the provider call, decided here at the call so the stored history
- * stays as it was written:
+ * stays as it was written. Which images are sent is decided from the references alone (each declares its size,
+ * `imageRef`), so it is the same whatever a read returns:
  *
- * - The images from the window's start on become their bytes as base64. The start is the first multiple of
- *   `IMAGE_WINDOW_STEP` (counting every image block of the conversation, oldest first) from which the images to the
- *   end fit `window` — no more than `maxImages`, no more than `maxBytes`. As images are added it only moves forward,
- *   so an image that has left never returns, and it moves once per step: the provider's cached prefix breaks once per
- *   `IMAGE_WINDOW_STEP` new images rather than at every one. The window never holds more than `window` allows; just
- *   after a move it holds fewer.
- * - Every image before the start becomes a short note naming it (`omittedImageText`). Finding the start reads the
- *   newest images back to the first that does not fit, so the consumer holds at most the window and one image more.
- * - One that cannot be read, or whose bytes no longer hash to the reference, becomes a text block saying so: the
- *   conversation goes on, rather than a job that fails on every retry for an image that will not come back. It keeps
- *   its place in the count and takes no bytes.
+ * - The images from the window's start on become their bytes as base64. Counting every image block of the
+ *   conversation oldest first, `fits` is the oldest from which the images to the end fit `window` (no more than
+ *   `maxImages`, no more than `maxBytes`). The start is `fits` snapped forward to a multiple of the step,
+ *   `min(IMAGE_WINDOW_STEP, maxImages)`, but never past the newest image when that one fits on its own. As images are
+ *   added it only moves forward, so between compactions an image that has left never returns; and it moves once per
+ *   step, so the provider's cached prefix (which holds image bytes) breaks once per step of new images rather than at
+ *   every one. A window too small for the step (a budget of fewer images than the step) moves with each image instead,
+ *   since the newest image is the one the model has just asked to see.
+ * - Every image before the start becomes a short note naming it (`omittedImageText`), and is never read; the consumer
+ *   holds at most the window.
+ * - One in the window that cannot be read, or whose bytes no longer hash to the reference, becomes a text block saying
+ *   so: the conversation goes on, rather than a job that fails on every retry for an image that will not come back.
  *
  * A context with no reference is returned as it is.
  */
@@ -179,48 +192,51 @@ export async function resolveImages<C extends { messages?: readonly unknown[] }>
 ): Promise<C> {
   if (!hasImageRefs(context)) return context;
   const messages = (context.messages ?? []).map((m: any) => Array.isArray(m?.content) ? { ...m, content: [...m.content] } : m);
-  const slots: Array<{ m: any; ci: number; sha: string; mimeType: unknown }> = [];
+  const slots: Array<{ m: any; ci: number; sha: string; bytes: number; mimeType: unknown }> = [];
   for (const m of messages) {
     if (!Array.isArray(m?.content)) continue;
     m.content.forEach((c: any, ci: number) => {
       const sha = c?.type === "image" ? imageRefHash(c.data) : null;
-      if (sha !== null) slots.push({ m, ci, sha, mimeType: c.mimeType });
+      if (sha !== null) slots.push({ m, ci, sha, bytes: imageRefBytes(c.data), mimeType: c.mimeType });
     });
   }
-  const read = new Map<string, { bytes: Uint8Array } | { problem: string }>();
-  const fetchOne = async (sha: string): Promise<{ bytes: Uint8Array } | { problem: string }> => {
-    const known = read.get(sha);
-    if (known) return known;
-    let got: { bytes: Uint8Array } | { problem: string } | undefined;
-    if (!load) got = { problem: "no image store is reachable here" };
-    else {
-      let bytes: Uint8Array | null = null;
-      try { bytes = await load(sha); } catch (e) { got = { problem: `reading it failed (${String((e as Error)?.message ?? e).slice(0, 120)})` }; }
-      got ??= !bytes ? { problem: "it is no longer stored" }
-        : sha256Hex(bytes) !== sha ? { problem: "the stored bytes no longer match it" } : { bytes };
+  const start = windowStart(slots.map((x) => x.bytes), window);
+  const read = new Map<string, Promise<{ data: string } | { problem: string }>>();
+  const fetchOne = (sha: string) => {
+    let p = read.get(sha);
+    if (!p) {
+      p = (async () => {
+        if (!load) return { problem: "no image store is reachable here" };
+        let bytes: Uint8Array | null;
+        try { bytes = await load(sha); } catch (e) { return { problem: `reading it failed (${String((e as Error)?.message ?? e).slice(0, 120)})` }; }
+        if (!bytes) return { problem: "it is no longer stored" };
+        if (sha256Hex(bytes) !== sha) return { problem: "the stored bytes no longer match it" };
+        return { data: Buffer.from(bytes).toString("base64") };
+      })();
+      read.set(sha, p);
     }
-    read.set(sha, got);
-    return got;
+    return p;
   };
-  // The oldest image the window could hold: newest first, as far as the count and the bytes allow.
-  let fits = slots.length, bytes = 0;
-  while (fits > 0 && slots.length - (fits - 1) <= window.maxImages) {
-    const got = await fetchOne(slots[fits - 1]!.sha);
-    const size = "bytes" in got ? got.bytes.byteLength : 0;
-    if (bytes + size > window.maxBytes) break;
-    bytes += size;
-    fits--;
+  for (const [k, slot] of slots.entries()) {
+    if (k < start) { slot.m.content[slot.ci] = { type: "text", text: omittedImageText(slot.mimeType, slot.sha) }; continue; }
+    const got = await fetchOne(slot.sha);
+    slot.m.content[slot.ci] = "problem" in got
+      ? { type: "text", text: `\n\n(an image could not be loaded: ${got.problem})` }
+      : { ...slot.m.content[slot.ci], data: got.data };
   }
-  // Snapped forward to a step, so the start moves rarely.
-  const start = Math.ceil(fits / IMAGE_WINDOW_STEP) * IMAGE_WINDOW_STEP;
-  const encoded = new Map<string, string>();
-  slots.forEach((slot, k) => {
-    if (k < start) { slot.m.content[slot.ci] = { type: "text", text: omittedImageText(slot.mimeType, slot.sha) }; return; }
-    const got = read.get(slot.sha)!;
-    if ("problem" in got) { slot.m.content[slot.ci] = { type: "text", text: `\n\n(an image could not be loaded: ${got.problem})` }; return; }
-    let data = encoded.get(slot.sha);
-    if (data === undefined) { data = Buffer.from(got.bytes).toString("base64"); encoded.set(slot.sha, data); }
-    slot.m.content[slot.ci] = { ...slot.m.content[slot.ci], data };
-  });
   return { ...context, messages };
+}
+
+/**
+ * The index of the first image sent, of images whose sizes are `sizes`, oldest first (see `resolveImages`). A function
+ * of the sizes and the window alone.
+ */
+export function windowStart(sizes: readonly number[], window: ImageWindow): number {
+  const n = sizes.length;
+  let fits = n, bytes = 0;
+  while (fits > 0 && n - (fits - 1) <= window.maxImages && bytes + sizes[fits - 1]! <= window.maxBytes) bytes += sizes[--fits]!;
+  const step = Math.max(1, Math.min(IMAGE_WINDOW_STEP, window.maxImages));
+  const snapped = Math.ceil(fits / step) * step;
+  // The newest image, when it fits on its own, is always sent.
+  return fits < n ? Math.min(snapped, n - 1) : n;
 }

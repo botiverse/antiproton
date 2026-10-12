@@ -145,6 +145,6 @@ export async function attachViewImage(view: ViewMarker, owner: RefOwner, store: 
   if (problem) throw new Error(problem);
   const sha = sha256Hex(bytes);
   await store.put(imageKey(owner, sha), bytes);
-  return imageRef(sha);
+  return imageRef(sha, bytes.byteLength);
 }
 

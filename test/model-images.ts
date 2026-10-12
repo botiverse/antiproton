@@ -144,7 +144,7 @@ await check("attachViewImage reads under the caller's scope, checks the bytes, a
     put: (k: string, b: Uint8Array) => bucket.put(k, b),
   };
   const ref = await attachViewImage(VIEW, OWNER, store);
-  must(ref === imageRef(IMG_SHA) && imageRefHash(ref) === IMG_SHA, `ref ${ref}`);
+  must(ref === imageRef(IMG_SHA, IMG.byteLength) && imageRefHash(ref) === IMG_SHA, `ref ${ref}`);
   must(show(bucket.puts) === show([`t/t/a/model-images/${IMG_SHA}`]) && Buffer.from(bucket.objects.get(imageKey(OWNER, IMG_SHA))!).equals(Buffer.from(IMG)), `stored ${show(bucket.puts)}`);
   const refusedWith = async (v: ViewMarker, owner: typeof OWNER, says: string) => {
     try { await attachViewImage(v, owner, store); } catch (e) { must(String((e as Error).message).includes(says), `${v.ref}: ${(e as Error).message}`); return; }
@@ -161,10 +161,10 @@ await check("attachViewImage reads under the caller's scope, checks the bytes, a
 });
 
 await check("viewContent: attached for a model that sees, the sentence for one that does not, the reason when it cannot be", async () => {
-  const sees = { seesImages: async () => true, attachImage: async () => imageRef(IMG_SHA) };
+  const sees = { seesImages: async () => true, attachImage: async () => imageRef(IMG_SHA, IMG.byteLength) };
   const shown = { name: "chart.png" };
   const ok = await viewContent(VIEW, shown, sees);
-  must(ok.length === 2 && ok[1]!.type === "image" && (ok[1] as any).data === imageRef(IMG_SHA) && (ok[1] as any).mimeType === "image/png", show(ok));
+  must(ok.length === 2 && ok[1]!.type === "image" && (ok[1] as any).data === imageRef(IMG_SHA, IMG.byteLength) && (ok[1] as any).mimeType === "image/png", show(ok));
   must(ok[0]!.type === "text" && (ok[0] as any).text === `{"name":"chart.png"}\n\nImage attached: artifact://uploads/chart.png (image/png, 64x64, ${IMG.byteLength} bytes).`, show(ok[0]));
 
   let attached = 0;
@@ -367,7 +367,7 @@ await check("every result attachments_view returns (#856's own cases) is a marke
     const seen = sniffImage(body);
     must(seen?.mimeType === mimeType && seen.width === width && seen.height === height, `${what}: the harness reads ${show(seen)}`);
     const ref = await attachViewImage((parsed as { view: ViewMarker }).view, RAFT_OWNER, r.store);
-    must(ref === imageRef(sha256Hex(body)) && r.objects.has(imageKey(RAFT_OWNER, sha256Hex(body))), `${what}: ${ref}`);
+    must(ref === imageRef(sha256Hex(body), body.byteLength) && r.objects.has(imageKey(RAFT_OWNER, sha256Hex(body))), `${what}: ${ref}`);
   }
 });
 
@@ -431,12 +431,12 @@ const loader = (store: Record<string, Uint8Array>, reads: string[] = []) => asyn
 
 /** A conversation with an image in the user's message and one in the first of two tool results, as pi085 writes it. */
 const CONVERSATION = [
-  { role: "user", content: [{ type: "text", text: "What is in this chart?" }, { type: "image", data: imageRef(B_SHA), mimeType: "image/png" }], timestamp: 1 },
+  { role: "user", content: [{ type: "text", text: "What is in this chart?" }, { type: "image", data: imageRef(B_SHA, BYTES.byteLength), mimeType: "image/png" }], timestamp: 1 },
   { role: "assistant", api: "offloaded", provider: "openai-compatible", model: "deepseek-flash",
     content: [{ type: "toolCall", id: "call_1", name: "view", arguments: { name: "a.png" } }, { type: "toolCall", id: "call_2", name: "read", arguments: {} }],
     stopReason: "toolUse", jobId: "mj_1", timestamp: 2 },
   { role: "toolResult", toolCallId: "call_1", toolName: "view",
-    content: [{ type: "text", text: "{\"name\":\"a.png\"}\n\nImage attached: artifact://a.png (image/png, 8 bytes)." }, { type: "image", data: imageRef(B_SHA), mimeType: "image/png" }], isError: false, timestamp: 3 },
+    content: [{ type: "text", text: "{\"name\":\"a.png\"}\n\nImage attached: artifact://a.png (image/png, 8 bytes)." }, { type: "image", data: imageRef(B_SHA, BYTES.byteLength), mimeType: "image/png" }], isError: false, timestamp: 3 },
   { role: "toolResult", toolCallId: "call_2", toolName: "read", content: [{ type: "text", text: "page" }], isError: false, timestamp: 4 },
 ];
 const V1 = { systemPrompt: "Look closely.", messages: CONVERSATION };
@@ -516,19 +516,28 @@ await check("an image that cannot be read back becomes a sentence in its place, 
 
 // ---- the image window -----------------------------------------------------------------------------------------
 
-/** `n` distinct images of `size` bytes, made on demand from their index, and a loader that counts its reads. */
-function manyImages(n: number, size: number) {
-  const make = (i: number) => { const b = new Uint8Array(size); b.fill(i & 255); b[0] = i >> 8; b[1] = i & 255; return b; };
+/**
+ * `n` distinct images, image `i` of `size(i)` bytes, made on demand from their index, and a loader that counts its
+ * reads and fails (throws) for the indices in `failing`.
+ */
+function manyImages(n: number, size: number | ((i: number) => number), failing: ReadonlySet<number> = new Set()) {
+  const sizeOf = typeof size === "number" ? () => size : size;
+  const make = (i: number) => { const b = new Uint8Array(sizeOf(i)); b.fill(i & 255); b[0] = i >> 8; b[1] = i & 255; return b; };
   const shas = Array.from({ length: n }, (_, i) => sha256Hex(make(i)));
   const index = new Map(shas.map((h, i) => [h, i]));
   const reads: string[] = [];
-  const load = async (sha: string) => { reads.push(sha); const i = index.get(sha); return i === undefined ? null : make(i); };
+  const load = async (sha: string) => {
+    reads.push(sha);
+    const i = index.get(sha);
+    if (i !== undefined && failing.has(i)) throw new Error("r2 unavailable");
+    return i === undefined ? null : make(i);
+  };
   // One image per tool result, oldest first, as a long conversation holds them.
   const context = (k = n) => ({
     version: 2,
     messages: shas.slice(0, k).flatMap((h, i) => [
       { role: "assistant", content: [{ type: "toolCall", id: `c${i}`, name: "show", arguments: {} }] },
-      { role: "toolResult", toolCallId: `c${i}`, toolName: "show", content: [{ type: "text", text: `image ${i}` }, { type: "image", data: imageRef(h), mimeType: "image/png" }], isError: false },
+      { role: "toolResult", toolCallId: `c${i}`, toolName: "show", content: [{ type: "text", text: `image ${i}` }, { type: "image", data: imageRef(h, sizeOf(i)), mimeType: "image/png" }], isError: false },
     ]),
   });
   return { shas, reads, load, context };
@@ -552,19 +561,19 @@ await check("the window: the newest 8 images are sent, each older one is a note 
   must(DEFAULT_IMAGE_WINDOW.maxImages === 8 && DEFAULT_IMAGE_WINDOW.maxBytes === 12 * 1024 * 1024, show(DEFAULT_IMAGE_WINDOW));
 });
 
-await check("the window's byte budget stops at the first image that does not fit, snapped to a step, and nothing older is read", async () => {
-  const m = manyImages(10, 3 * 1024 * 1024);
-  const out = await resolveImages(m.context(), m.load, { maxImages: 8, maxBytes: 12 * 1024 * 1024 }) as { messages: any[] };
+await check("the window's byte budget stops at the first image that does not fit, snapped to a step, and only the window is read", async () => {
+  const m = manyImages(10, MAX_IMAGE_BYTES);
+  const out = await resolveImages(m.context(), m.load, { maxImages: 8, maxBytes: 6 * 1024 * 1024 }) as { messages: any[] };
   const sent = imagesIn(out).map((p: any) => p.type);
   // Four fit (images 6 to 9), so the start is 6, snapped forward to 8: two are sent.
   must(show(sent) === show([...Array(8).fill("text"), ...Array(2).fill("image")]), show(sent));
-  // The four that fit and the fifth that did not; the five older ones are never read.
-  must(m.reads.length === 5, `reads ${m.reads.length}`);
+  // The sizes are in the references, so only what is sent is read.
+  must(m.reads.length === 2, `reads ${m.reads.length}`);
 });
 
 await check("an image that leaves the window never comes back: each later image moves the window forward only", async () => {
-  const m = manyImages(14, 2 * 1024 * 1024);
-  const w = { maxImages: 5, maxBytes: 9 * 1024 * 1024 };
+  const m = manyImages(14, 1024 * 1024);
+  const w = { maxImages: 5, maxBytes: 4.5 * 1024 * 1024 };
   let before: string[] = [];
   for (let k = 1; k <= 14; k++) {
     const out = await resolveImages(m.context(k), m.load, w) as { messages: any[] };
@@ -623,13 +632,52 @@ await check("forty 1.5 MiB images: one request carries the window, and the consu
   must(show(imageWindowOf({ HARNESS_MODEL: "x", MODEL_IMAGES_MAX: "0", MODEL_IMAGES_MAX_BYTES: "lots" })) === show(DEFAULT_IMAGE_WINDOW), "bad vars were taken");
 });
 
-await check("callQueuedModel applies the window from its environment: MODEL_IMAGES_MAX=3 of 10 starts at image 8", async () => {
+await check("callQueuedModel applies the window from its environment: MODEL_IMAGES_MAX=4 of 10 starts at image 8", async () => {
   const m = manyImages(10, 100);
-  const sent = await capture({ ...ENV, MODEL_IMAGES_MAX: "3" }, job(m.context(), { provider: "deepseek", model: "deepseek-flash" }), CHAT_REPLY, m.load);
+  const sent = await capture({ ...ENV, MODEL_IMAGES_MAX: "4" }, job(m.context(), { provider: "deepseek", model: "deepseek-flash" }), CHAT_REPLY, m.load);
   const urls = sent.split("data:image/png;base64,").length - 1;
-  // Three fit (images 7 to 9); the start snaps forward to 8.
-  must(urls === 2 && m.reads.length === 3, `data URLs ${urls}, reads ${m.reads.length}`);
+  // Four fit (images 6 to 9); the start snaps forward to 8.
+  must(urls === 2 && m.reads.length === 2, `data URLs ${urls}, reads ${m.reads.length}`);
   must(sent.split("[earlier image omitted:").length - 1 === 8, "the eight older images are not named");
+});
+
+await check("every window size 1..9 and byte budget: the newest image is always sent when it fits, limits hold, the start only moves forward", async () => {
+  const KB = 1024;
+  const sizes = (i: number) => [1500, 500, 1000, 1500, 300][i % 5]! * KB;
+  const N = 20;
+  const m = manyImages(N, sizes);
+  let cases = 0;
+  for (let maxImages = 1; maxImages <= 9; maxImages++) {
+    for (const maxBytes of [1000 * KB, 1500 * KB, 2000 * KB, 4000 * KB, 6144 * KB, 12288 * KB]) {
+      let before = 0;
+      for (let k = 1; k <= N; k++) {
+        const kinds = imagesIn(await resolveImages(m.context(k), m.load, { maxImages, maxBytes }) as { messages: any[] }).map((p: any) => p.type);
+        const start = kinds.indexOf("image") === -1 ? k : kinds.indexOf("image");
+        const at = `${maxImages} images, ${maxBytes / KB} KiB, ${k} in the conversation: ${show(kinds)}`;
+        must(kinds.slice(start).every((t) => t === "image"), `not a run of the newest: ${at}`);
+        if (sizes(k - 1) <= maxBytes) must(kinds[k - 1] === "image", `the newest image, which fits, was not sent: ${at}`);
+        let total = 0;
+        for (let i = start; i < k; i++) total += sizes(i);
+        must(k - start <= maxImages && total <= maxBytes, `over the window: ${at}`);
+        must(start >= before, `the start moved back from ${before}: ${at}`);
+        before = start;
+        cases++;
+      }
+    }
+  }
+  must(cases === 9 * 6 * N, `cases ${cases}`);
+});
+
+await check("a read that fails takes the room its reference declares: the window does not move back, and older images stay omitted", async () => {
+  const MiB = 1024 * 1024;
+  const healthy = manyImages(11, MiB);
+  const flaky = manyImages(11, MiB, new Set([9]));
+  const w = { maxImages: 8, maxBytes: 6 * MiB };
+  const ok = imagesIn(await resolveImages(healthy.context(), healthy.load, w) as { messages: any[] });
+  const failed = imagesIn(await resolveImages(flaky.context(), flaky.load, w) as { messages: any[] });
+  const kind = (p: any) => p.type === "image" ? "image" : p.text.includes("could not be loaded") ? "failed" : "omitted";
+  must(show(failed.map(kind)) === show(ok.map((p: any, i: number) => i === 9 ? "failed" : kind(p))), `healthy ${show(ok.map(kind))}, flaky ${show(failed.map(kind))}`);
+  must(failed.slice(0, 8).every((p: any) => kind(p) === "omitted"), `older images came back: ${show(failed.map(kind))}`);
 });
 
 await check("attachViewImage asks the stored size first, and refuses a mismatch or an oversize object without reading it", async () => {
@@ -773,11 +821,11 @@ for (const engine of ["pi085", "pd"] as const) {
       await turn(w, "show me", [call("c1", "pics__show", {}), say("a chart")]);
       must(w.jobs.length === 2, `jobs: ${w.jobs.length}`);
       const tr = toolResultOf(w.jobs[1]!.job);
-      must(tr.content.length === 2 && tr.content[1]!.type === "image" && tr.content[1]!.data === imageRef(IMG_SHA) && tr.content[1]!.mimeType === "image/png", show(tr.content));
+      must(tr.content.length === 2 && tr.content[1]!.type === "image" && tr.content[1]!.data === imageRef(IMG_SHA, IMG.byteLength) && tr.content[1]!.mimeType === "image/png", show(tr.content));
       must(tr.content[0]!.text === `{"name":"chart.png"}\n\nImage attached: artifact://uploads/chart.png (image/png, 64x64, ${IMG.byteLength} bytes).`, show(tr.content[0]));
       must(Buffer.from(w.bucket.objects.get(imageKey(OWNER, IMG_SHA)) ?? []).equals(Buffer.from(IMG)), `stored: ${show([...w.bucket.objects.keys()])}`);
       const rows = everyRow(w.host);
-      must(rows.some((v) => v.includes(imageRef(IMG_SHA))), "control: no row holds the reference, so the scan below proves nothing");
+      must(rows.some((v) => v.includes(imageRef(IMG_SHA, IMG.byteLength))), "control: no row holds the reference, so the scan below proves nothing");
       for (const piece of IMG_PIECES) must(!rows.some((v) => v.includes(piece)), `a row holds the image's bytes (${piece.slice(0, 12)}…)`);
       // The job as the queue consumer takes it, called with the bucket the Worker reads.
       const reads: string[] = [];
@@ -792,6 +840,12 @@ for (const engine of ["pi085", "pd"] as const) {
       // names nothing: the image comes from the tenant and agent it names.
       const viaQueue = await captureWith(() => queuedCall(w.env, w.bucket)(w.jobs[1]!.job, { jobId: "mj_q", tenantId: "t", agentId: "a", doId: "do-elsewhere" } as never), CHAT_REPLY);
       must(viaQueue.includes(`data:image/png;base64,${IMG_B64}`), `queuedCall did not read the agent's image: ${viaQueue.slice(0, 200)}`);
+      // And a message naming another agent, or another tenant, reads nothing of this one's.
+      for (const other of [{ tenantId: "t", agentId: "other" }, { tenantId: "other", agentId: "a" }]) {
+        const elsewhere = await captureWith(() => queuedCall(w.env, w.bucket)(w.jobs[1]!.job, { jobId: "mj_q", ...other, doId: "do-elsewhere" } as never), CHAT_REPLY);
+        must(!elsewhere.includes("data:image/") && elsewhere.includes("(an image could not be loaded: it is no longer stored)"),
+          `a message naming ${show(other)} was sent agent a's image: ${elsewhere.slice(0, 200)}`);
+      }
       const body = JSON.parse(JSON.parse(sent).body);
       const last = body.messages[body.messages.length - 1];
       must(last.role === "user" && show(last.content) === show([{ type: "text", text: "Attached image(s) from tool result:" }, { type: "image_url", image_url: { url: `data:image/png;base64,${IMG_B64}` } }]),
@@ -831,7 +885,7 @@ for (const engine of ["pi085", "pd"] as const) {
     try {
       await turn(w, "show me", [call("c1", "pics__show", {}), say("parked")]);
       const tr = toolResultOf(w.jobs[1]!.job);
-      must(tr.content.length === 2 && tr.content[1]!.data === imageRef(IMG_SHA), show(tr.content).slice(0, 400));
+      must(tr.content.length === 2 && tr.content[1]!.data === imageRef(IMG_SHA, IMG.byteLength), show(tr.content).slice(0, 400));
       const shown = JSON.parse(tr.content[0]!.text!.split("\n\nImage attached:")[0]!);
       must(typeof shown.ref === "string" && shown.ref.startsWith("artifact://") && !("view" in shown), `the parked wrapper: ${show(shown).slice(0, 300)}`);
       const parked = [...w.bucket.objects.entries()].find(([k]) => k.endsWith(".json"));
@@ -867,7 +921,7 @@ for (const engine of ["pi085", "pd"] as const) {
         say("seen"),
       ]);
       const tr = toolResultOf(w.jobs[2]!.job);
-      must(tr.content.length === 2 && tr.content[1]!.type === "image" && tr.content[1]!.data === imageRef(IMG_SHA), show(tr.content).slice(0, 300));
+      must(tr.content.length === 2 && tr.content[1]!.type === "image" && tr.content[1]!.data === imageRef(IMG_SHA, IMG.byteLength), show(tr.content).slice(0, 300));
     } finally { w.host.dispose(); }
   });
 }
