@@ -13,6 +13,7 @@
  */
 import { objectMoved } from "./do-retry.ts";
 import { HANDOFF_PATH, adminHostServes, adminShell, handoffTicket, redeemTicket, safeReturnTo } from "./admin-host.ts";
+import { UNACCEPTED_TOKENS } from "../../src/usage/outbox.ts";
 import { nextAlarm } from "./alarm-next.ts";
 import { adminModels } from "./admin-models.ts";
 import { agentModel } from "./agent-model.ts";
@@ -84,7 +85,7 @@ import { busySpans, countActiveTime, unionMs, type ActivitySpan } from "../../sr
 import { countHeldTime, heldReports } from "../../src/usage/container.ts";
 import { benchPollBody } from "../../src/bench/poll-body.ts";
 import { flushUsage, parseUsageQuery, readAgentLedger, readUsage, priceFor, readUsageCosts, retainUsage, usageBacklogSince, usagePrices } from "./usage-d1.ts";
-import { adminUsageCosts } from "./admin-usage-costs.ts";
+import { adminUsageCosts, closedCostsTo, parseCostsQuery } from "./admin-usage-costs.ts";
 import { adminSpendLimits, d1SpendLimits, limitsOf, sharedSpendGate, spendAdmit } from "./spend-limit.ts";
 import { drainCursors, hasUnsent, standDownDelay, USAGE_WAKE_DELAY_MS } from "./usage-flush.ts";
 import type { SurfaceDeps } from "./agent-surface/surface.ts";
@@ -115,7 +116,7 @@ import { userModelsFrom } from "../../src/model/user-models.ts";
 import { DEFAULT_PROVIDER, providerStatus, type ModelChoice } from "../../src/model/providers.ts";
 import { consumeModelCalls, isUnknownJobReply, replyingUnknownJob, type ModelQueueDeps, type QueuedModelCall, type UnknownJobReply } from "./model-queue.ts";
 import {
-  page, trajectory, approvals, conversation, eventList, storage, memoryPanel, sandboxPanel, adminPanel, agentModelBlock,
+  page, trajectory, approvals, conversation, eventList, storage, memoryPanel, sandboxPanel, adminPanel, adminPage, spendLimitsPanel, usageCostsPanel, agentModelBlock,
   runtimePanel, timeline, tokens, plugins, mountFragment, mountList, catalogue, agentList, apiKeysPanel } from "./ui.ts";
 
 /** The inspector's runtime tab: the object, then its containers. Storage is a
@@ -4620,6 +4621,12 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
           const actor = v!.sub ?? v!.email;
           let error: string | null = null;
           if (request.method === "POST") {
+            // SameSite=Lax leaves every host under this registrable domain able to post with the
+            // admin's cookie (forgedWrite's own comment), so a write here names its origin like
+            // the console's writes. Without this, a page on any *.antiproton.ai host could rebind
+            // any agent's model through a signed-in admin's browser.
+            const forged = await forgedWrite(request, url, env);
+            if (forged) return new Response(forged, { status: 403 });
             const form = await formOf(request);
             if (!form) return new Response("expected a form body", { status: 400 });
             const fields = Object.fromEntries(["tenantId", "agentId", "provider", "model"].map((k) => [k, String(form.get(k) ?? "")]));
@@ -4638,6 +4645,68 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
           const read = await adminModels("GET", null, actor, deps);
           const data: Parameters<typeof adminPanel>[0] = await read.json();
           return new Response(adminPanel({ ...data, error }), { headers: { "cache-control": "no-store", "content-type": "text/html; charset=utf-8" } });
+        }
+        case "/ui/admin/spend-limits": {
+          // The admin area's daily-limit page. Same gate as /ui/admin: a non-admin is told nothing.
+          // Writes are form posts applied through the same handler as the JSON route, then the panel
+          // re-reads limits and today's priced usage side by side.
+          const v = await viewer(request, env);
+          if (!isAdmin(v, env)) return Response.json({ error: { code: "not_found", message: "no such route" } }, { status: 404 });
+          const deps = { store: d1SpendLimits(env.CONTROL_DB), limits: limitsOf(env), now: Date.now };
+          const actor = v!.sub ?? v!.email;
+          let error: string | null = null;
+          if (request.method === "POST") {
+            // SameSite=Lax does not stop another host under this registrable domain posting
+            // with the admin's cookie (the forgedWrite comment's case), so a write here names
+            // its origin like the console's writes — same-origin, or refused.
+            const forged = await forgedWrite(request, url, env);
+            if (forged) return new Response(forged, { status: 403 });
+            const form = await formOf(request);
+            if (!form) return new Response("expected a form body", { status: 400 });
+            const tenantId = String(form.get("tenantId") ?? "");
+            // limitUsd null (the clear path leaves it out; the set form always sends a number) lifts
+            // the tenant cap while the platform cap still applies, per the handler's contract.
+            const body = form.get("action") === "clear"
+              ? { tenantId }
+              : { tenantId, limitUsd: Number(form.get("limitUsd")) };
+            const write = await adminSpendLimits(form.get("action") === "clear" ? "DELETE" : "PUT", body, actor, deps);
+            if (!write.ok) {
+              const why = await write.json().catch(() => null) as { error?: { message?: string } } | null;
+              error = why?.error?.message ?? "the change was not saved";
+            }
+          }
+          const read = await adminSpendLimits("GET", null, actor, deps);
+          const data: Pick<Parameters<typeof spendLimitsPanel>[0], "defaults" | "overrides" | "events"> = await read.json();
+          const day = Math.floor(Date.now() / 86_400_000) * 86_400_000;
+          const costs = await readUsageCosts(env.CONTROL_DB, day, day + 86_400_000, "day");
+          // What the tenant limit counts is priced usage minus unaccepted answers (ours, not
+          // theirs — spend-limit.ts); the platform total counts everything, exempt included.
+          const today = costs.map((c) => ({
+            tenantId: c.tenantId,
+            usd: c.total - c.periods.flatMap((p) => p.resources).filter((r) => r.resource === UNACCEPTED_TOKENS).reduce((sum, r) => sum + r.cost, 0),
+            unaccepted: c.periods.flatMap((p) => p.resources).filter((r) => r.resource === UNACCEPTED_TOKENS).reduce((sum, r) => sum + r.cost, 0),
+          }));
+          const platformToday = costs.reduce((sum, c) => sum + c.total, 0);
+          return new Response(spendLimitsPanel({ ...data, today, platformToday, error }), { headers: { "cache-control": "no-store", "content-type": "text/html; charset=utf-8" } });
+        }
+        case "/ui/admin/usage-costs": {
+          // The operator's cost view as a page, same reader as /admin/usage-costs. Default window is
+          // COSTS_DEFAULT_DAYS back by day; a plain GET form changes it. Unpriced keys are named, not hidden.
+          const v = await viewer(request, env);
+          if (!isAdmin(v, env)) return Response.json({ error: { code: "not_found", message: "no such route" } }, { status: 404 });
+          const now = Date.now();
+          // The window parser the JSON route uses, over the form's closed interval: whole periods,
+          // a 400-day cap, from < to, impossible dates refused. The form names the first and last
+          // day counted; closedCostsTo turns its `to` into the open boundary parseCostsQuery wants,
+          // so applying an unchanged form leaves the window where it was.
+          const parsed = parseCostsQuery(closedCostsTo(url.searchParams), now);
+          if (typeof parsed === "string") {
+            const fallback = parseCostsQuery(new URLSearchParams(), now) as { from: number; to: number; bucket: "day" | "month" };
+            return new Response(usageCostsPanel({ ...fallback, tenants: [], unpriced: [], error: parsed }), { headers: { "cache-control": "no-store", "content-type": "text/html; charset=utf-8" } });
+          }
+          const tenants = await readUsageCosts(env.CONTROL_DB, parsed.from, parsed.to, parsed.bucket);
+          const unpriced = [...new Set(tenants.flatMap((t) => t.periods.flatMap((p) => p.resources.flatMap((r) => r.unpriced))))].sort();
+          return new Response(usageCostsPanel({ ...parsed, tenants, unpriced }), { headers: { "cache-control": "no-store", "content-type": "text/html; charset=utf-8" } });
         }
         case "/ui/api-keys":
         case "/ui/api-keys/new":

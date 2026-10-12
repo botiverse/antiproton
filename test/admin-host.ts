@@ -51,7 +51,7 @@ await check("sign-in returns only to a path on this origin", () => {
 });
 
 await check("the admin host answers its own paths and nothing of the console's", () => {
-  for (const p of ["/", "/session", "/ui/admin", "/admin/models", "/admin/spend-limits", "/admin/usage-costs", "/logout"]) must(adminHostServes(p), p);
+  for (const p of ["/", "/session", "/ui/admin", "/ui/admin/spend-limits", "/ui/admin/usage-costs", "/admin/models", "/admin/spend-limits", "/admin/usage-costs", "/logout"]) must(adminHostServes(p), p);
   for (const p of ["/ui", "/ui/transcript", "/provision/agents", "/hooks/x", "/admin/diagnose", "/v1/models", "/login/github"]) must(!adminHostServes(p), p);
 });
 

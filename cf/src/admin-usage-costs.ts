@@ -49,6 +49,22 @@ export function parseCostsQuery(q: URLSearchParams, now: number): { from: number
 }
 
 /**
+ * The form names days a reader counts, closed interval. parseCostsQuery reads a bare date as that
+ * day's 00:00, so a `to` taken straight from the form would stand the last day outside the window
+ * (applying an unchanged form walks the window back a day each time). A date-only `to` is moved to
+ * the next day's 00:00, so the named day counts whole; a `to` with a time is a half-open boundary
+ * already and is left alone.
+ */
+export function closedCostsTo(q: URLSearchParams): URLSearchParams {
+  const to = q.get("to");
+  if (!to || !/^\d{4}-\d{2}-\d{2}$/.test(to)) return q;
+  const next = new Date(Date.parse(`${to}T00:00:00Z`) + DAY_MS);
+  const out = new URLSearchParams(q);
+  out.set("to", next.toISOString().slice(0, 10));
+  return out;
+}
+
+/**
  * Whether the date and time written are ones the calendar has. `Date.parse` rolls an impossible one over rather
  * than refusing it — 2026-02-31 reads as 2026-03-03, T24:00 as the next day's midnight — so a window asked for in
  * a typo would answer for days nobody asked about. The fields are checked as written, before any zone applies.

@@ -16,8 +16,25 @@ import type { Plugin } from "../src/plugins/types.ts";
 import { countHeldTime, heldReports } from "../src/usage/container.ts";
 import { modelTokenRows, pendingUsage, toHourly, OWN_KEY_PREFIX, UNACCEPTED_TOKENS, type UsageRow } from "../src/usage/outbox.ts";
 import { KEEP_HOURLY_DAYS, priceFor, readAgentLedger, readUsage, readUsageCosts, retainUsage, usagePrices, DAY_MS } from "../cf/src/usage-d1.ts";
-import { parseCostsQuery } from "../cf/src/admin-usage-costs.ts";
+import { closedCostsTo, parseCostsQuery } from "../cf/src/admin-usage-costs.ts";
 import { d1ApiKeys } from "../cf/src/control-plane.ts";
+
+// The admin page's window form names a closed day interval; applying it twice without touching the
+// fields must answer the same window both times (regression: the open boundary drifted a day per
+// apply, forwards, then backwards). Day and month buckets.
+const NOW = Date.parse("2026-10-12T12:00:00Z");
+for (const bucket of ["day", "month"] as const) {
+  const once = parseCostsQuery(closedCostsTo(new URLSearchParams({ from: "2026-10-06", to: "2026-10-12", bucket })), NOW);
+  if (typeof once === "string") throw new Error(once);
+  // the panel shows to - 1 day; a reader re-applies those very fields
+  const shown = new Date(once.to - 1).toISOString().slice(0, 10);
+  const fromShown = new Date(once.from).toISOString().slice(0, 10);
+  const twice = parseCostsQuery(closedCostsTo(new URLSearchParams({ from: fromShown, to: shown, bucket })), NOW);
+  if (typeof twice === "string") throw new Error(twice);
+  const same = (a: typeof once, b: typeof once) => a.from === b.from && a.to === b.to && a.bucket === b.bucket;
+  if (!same(once, twice)) throw new Error(`${bucket}: applying the shown fields moves the window (${once.from}..${once.to} -> ${twice.from}..${twice.to})`);
+  console.log(`ok  the ${bucket} window survives being applied twice (closed interval, no drift)`);
+}
 import { hashApiKey, newApiKey } from "../cf/src/agents-api/keys.ts";
 import { sessionCookieFor, type Viewer } from "../cf/src/auth.ts";
 

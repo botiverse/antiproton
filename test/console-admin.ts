@@ -8,7 +8,7 @@
  * is the AI Gateway, and the overrides with their scope spelled out — and its
  * forms post back to the fragment for the same handler to apply.
  */
-import { page, adminPanel, adminPage } from "../cf/src/ui.ts";
+import { page, adminPanel, adminPage, spendLimitsPanel, usageCostsPanel } from "../cf/src/ui.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 function check(name: string, fn: () => void) {
@@ -124,6 +124,92 @@ check("a refused write says why, above the forms, and the table shows nothing ne
   const clean = adminPanel({ default: DEFAULT, providers: PROVIDERS,
     overrides: [{ tenantId: "t9", agentId: "", provider: "cloudflare", model: "openai/gpt-5", setBy: "op@x.dev", setAt: 1_000 }] });
   must(!/<div class="err">/.test(clean), "a panel without an error must not draw an error box");
+});
+
+
+// ---- the ops pages: spend limits and platform usage costs (admin.antiproton.ai) ----
+
+check("spendLimitsPanel renders defaults, today against limits, and the audit trail", () => {
+  const html = spendLimitsPanel({
+    defaults: { tenantUsd: 5, platformUsd: 30, exempt: ["bench"] },
+    overrides: [{ tenantId: "acme", limitUsd: 1.5, setBy: "op@x.dev", setAt: 17533980e5 }],
+    events: [{ tenantId: "acme", action: "set", limitUsd: 1.5, previous: {}, by: "op@x.dev", at: 17533980e5 }],
+    today: [{ tenantId: "acme", usd: 1.62 }, { tenantId: "bench", usd: 4.1 }, { tenantId: "demo", usd: 0.4 }],
+    platformToday: 6.12,
+  });
+  must(/\$5\.00 \/ tenant \/ day/.test(html), "the tenant default is shown in dollars");
+  must(/\$30\.00 \/ platform \/ day/.test(html), "the platform default is shown");
+  must(/exempt: <code>bench<\/code>/.test(html), "exempt tenants are named");
+  must(html.includes('class="usd-over"'), "a tenant over its limit is marked");
+  must(/acme[\s\S]*?\$1\.62[\s\S]*?\$1\.50[\s\S]*?over/.test(html), "acme's spend is shown against its override, flagged over");
+  must(/bench[\s\S]*?<span class="tag">exempt<\/span>/.test(html), "an exempt tenant over the default limit is not flagged");
+  must(/demo[\s\S]*?\$0\.40[\s\S]*?\$5\.00 <span class="hint-inline">default<\/span>/.test(html), "a tenant on the default says so");
+  must(/today so far — \$6\.12 of \$30\.00/.test(html), "the platform total is shown against the platform limit");
+  must(/Clear the override for acme/.test(html), "clearing an override asks before it acts");
+  must(/hx-post="\/ui\/admin\/spend-limits"/.test(html), "writes post back to the fragment");
+  must(/audit — last 1/.test(html) && /op@x\.dev/.test(html), "the audit row names who changed it");
+});
+
+check("spendLimitsPanel flags a tenant AT its limit, the way judge refuses", () => {
+  const html = spendLimitsPanel({
+    defaults: { tenantUsd: 5, platformUsd: 30, exempt: [] },
+    overrides: [{ tenantId: "zero-limit", limitUsd: 0, setBy: "op@x.dev", setAt: 1 }],
+    events: [],
+    today: [{ tenantId: "exact", usd: 5 }, { tenantId: "zero-limit", usd: 0 }],
+    platformToday: 5,
+  });
+  must(/<tr class="usd-over">[\s\S]*?<code>exact<\/code>[\s\S]*?<span class="tag">over<\/span>/.test(html), "spent === limit is over, not near");
+  must(/<tr class="usd-over">[\s\S]*?<code>zero-limit<\/code>[\s\S]*?\$0\.00[\s\S]*?<span class="tag">over<\/span>/.test(html), "a $0 limit refuses every paid call, and the row says over at $0.00");
+});
+
+check("spendLimitsPanel shows unaccepted answers beside, not inside, the tenant's number", () => {
+  const html = spendLimitsPanel({
+    defaults: { tenantUsd: 5, platformUsd: 30, exempt: [] },
+    overrides: [], events: [],
+    today: [{ tenantId: "acme", usd: 0.4, unaccepted: 1.1 }],
+    platformToday: 1.5,
+  });
+  must(/\$0\.40/.test(html), "the tenant row is the limit-counting number");
+  must(/\+\$1\.10 unaccepted/.test(html), "the excluded part is shown next to it, not silently dropped");
+  must(/today so far — \$1\.50 of \$30\.00/.test(html), "the platform total counts unaccepted, as enforcement does");
+});
+
+check("spendLimitsPanel prints small money without rounding it away", () => {
+  const html = spendLimitsPanel({
+    defaults: { tenantUsd: null, platformUsd: null, exempt: [] },
+    overrides: [], events: [],
+    today: [{ tenantId: "t2", usd: 0.0012 }], platformToday: 0.0012,
+  });
+  must(/\$0\.0012/.test(html), "below a cent, four decimals");
+  must(/no per-tenant limit/.test(html) && /no platform limit/.test(html), "off is not $0");
+  must(/no tenant limit/.test(html), "a null override reads as no tenant limit, not $0");
+});
+
+check("usageCostsPanel renders the tenant-by-day table and names unpriced keys", () => {
+  const html = usageCostsPanel({
+    from: Date.parse("2026-10-06T00:00:00Z"), to: Date.parse("2026-10-13T00:00:00Z"), bucket: "day",
+    tenants: [
+      { tenantId: "acme", total: 2.14, periods: [
+        { start: Date.parse("2026-10-09T00:00:00Z"), total: 2.14, resources: [
+          { resource: "model.tokens", cost: 2.13, unpriced: [] },
+          { resource: "object.active", cost: 0.0012, unpriced: [] }] },
+        { start: Date.parse("2026-10-10T00:00:00Z"), total: 0, resources: [
+          { resource: "model.tokens", cost: 0, unpriced: ["mystery.tokens tokens"] }] },
+      ] },
+    ],
+    unpriced: ["mystery.tokens tokens"],
+  });
+  must(/unpriced usage in this window/.test(html), "unpriced keys get a banner");
+  must(/<code>mystery\.tokens tokens<\/code>/.test(html), "the unpriced key is named, not counted");
+  must(/2026-10-09/.test(html) && /2026-10-10/.test(html), "one column per day in the window");
+  must(/\$2\.14/.test(html) && /\$0\.0012/.test(html), "money keeps its magnitude");
+  must(/<code>model\.tokens<\/code>/.test(html) && /<code>object\.active<\/code>/.test(html), "the by-resource table lists both resources");
+  must(/hx-get="\/ui\/admin\/usage-costs"/.test(html), "the window form re-gets the fragment");
+});
+
+check("adminPage links the three ops sections", () => {
+  const html = adminPage();
+  must(/hx-get="\/ui\/admin"/.test(html) && /hx-get="\/ui\/admin\/spend-limits"/.test(html) && /hx-get="\/ui\/admin\/usage-costs"/.test(html), "nav loads each fragment into #admin");
 });
 
 for (const r of results) console.log(`${r.ok ? "ok " : "FAIL"} ${r.name}${r.error ? ` — ${r.error}` : ""}`);
