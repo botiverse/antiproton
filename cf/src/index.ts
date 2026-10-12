@@ -4624,7 +4624,7 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
             // SameSite=Lax leaves every host under this registrable domain able to post with the
             // admin's cookie (forgedWrite's own comment), so a write here names its origin like
             // the console's writes. Without this, a page on any *.antiproton.ai host could rebind
-            // any agent's model through a signed-in admin's browser (found in review of #864).
+            // any agent's model through a signed-in admin's browser.
             const forged = await forgedWrite(request, url, env);
             if (forged) return new Response(forged, { status: 403 });
             const form = await formOf(request);

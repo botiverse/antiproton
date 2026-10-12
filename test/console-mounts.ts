@@ -598,8 +598,8 @@ await check("route: a console write is accepted only from this origin, or from a
     }
   }
   must(show(await names()) === before && !(await store.getMountByAlias(T, A, "forged")), "a refused write wrote something");
-// The admin area's writes carry the same origin gate (issue found in review of #864: a same-site
-// page could rebind any agent's model through a signed-in admin's browser).
+// The admin area's writes carry the same origin gate: a same-site page could otherwise rebind
+// any agent's model through a signed-in admin's browser, the gap the gate below exists for.
 await check("route: an admin write is accepted only from the admin origin", async () => {
   const fields = { action: "set-override", tenantId: OTHER_T, agentId: "", provider: "deepseek", model: "deepseek-flash" };
   const before = dbSql.length;
