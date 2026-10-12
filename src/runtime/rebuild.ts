@@ -120,10 +120,13 @@ export const DEFAULT_WINDOW_SHARE = 0.8;
 export const DEFAULT_IDLE_RULE: IdleRule = { idleMinutes: 50 };
 /**
  * What the two model families in production change of `DEFAULT_IDLE_RULE`, each named so it can be tuned or turned
- * off apart. Luna at 30 minutes: on production wakes (Damy, 2026-10-12) one after 14.7 minutes idle read 99.4% of its
- * input from cache and one after 44 minutes none of it; earlier wakes were warm up to 13 minutes and cold from 85.
+ * off apart. Luna at 25 minutes: OpenAI documents that for gpt-5.6 and later a cached prefix stays eligible for reuse
+ * for 30 minutes after its most recent write or reuse (https://developers.openai.com/api/docs/guides/prompt-caching),
+ * and 25 leaves 5 minutes of margin because the idle clock here (the last answered call) is not the provider's cache
+ * clock. Production wakes agree (Damy, 2026-10-12): one after 14.7 minutes idle read 99.4% of its input from cache and
+ * one after 44 minutes none of it; earlier wakes were warm up to 13 minutes and cold from 85.
  */
-const DEFAULT_IDLE_OVERRIDES: Record<string, Partial<IdleRule>> = { deepseek: {}, "gpt-5.6-luna": { idleMinutes: 30 } };
+const DEFAULT_IDLE_OVERRIDES: Record<string, Partial<IdleRule>> = { deepseek: {}, "gpt-5.6-luna": { idleMinutes: 25 } };
 export const DEFAULT_IDLE_POLICY: IdlePolicy = {
   default: DEFAULT_IDLE_RULE,
   byModel: Object.fromEntries(Object.entries(DEFAULT_IDLE_OVERRIDES).map(([k, o]) => [k, { ...DEFAULT_IDLE_RULE, ...o }])),
@@ -133,10 +136,10 @@ export const DEFAULT_REBUILD_POLICY: RebuildPolicy = {
   rules: [
     { name: "deepseek", match: { modelIncludes: "deepseek" }, minContextTokens: DEFAULT_MIN_CONTEXT_TOKENS,
       coldAfterGapMs: HOUR_MS, previousColdCounts: true, coldHitRate: 0.5 },
-    // Ahead of `openai-ttl`, which covers every other `gpt-` model: Luna's cache is gone within 15 to 44 minutes
-    // (`DEFAULT_IDLE_OVERRIDES`), so an hour predicted warm wakes that were cold.
+    // Ahead of `openai-ttl`, which covers every other `gpt-` model: Luna's cache lasts 30 minutes from its last use,
+    // so an hour predicted warm wakes that were cold; 25, as in `DEFAULT_IDLE_OVERRIDES` and for the same margin.
     { name: "luna-ttl", match: { modelIncludes: "gpt-5.6-luna" }, minContextTokens: DEFAULT_MIN_CONTEXT_TOKENS,
-      coldAfterGapMs: 30 * MINUTE_MS, previousColdCounts: false, coldHitRate: 0.5 },
+      coldAfterGapMs: 25 * MINUTE_MS, previousColdCounts: false, coldHitRate: 0.5 },
     { name: "openai-ttl", match: { modelIncludes: "gpt-" }, minContextTokens: DEFAULT_MIN_CONTEXT_TOKENS,
       coldAfterGapMs: HOUR_MS, previousColdCounts: false, coldHitRate: 0.5 },
   ],
@@ -175,7 +178,7 @@ const plain = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 
  * `DEFAULT_IDLE_RULE`, and each `byModel` entry, the default ones (`DEFAULT_IDLE_POLICY`) included, over that merged
  * default with the entry's own default changes (`DEFAULT_IDLE_OVERRIDES`) on top. So `{"byModel": {"deepseek":
  * {"idleMinutes": null}}}` turns DeepSeek off and leaves the rest as they were, and `{"default": {"idleMinutes": 90}}`
- * moves every model the defaults name but for a field a model sets itself (Luna's 30 minutes). Anything else is
+ * moves every model the defaults name but for a field a model sets itself (Luna's 25 minutes). Anything else is
  * returned as it is, for `isIdle` to refuse.
  */
 function mergeIdle(idle: unknown): unknown {

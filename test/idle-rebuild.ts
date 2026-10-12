@@ -53,20 +53,20 @@ type IdleRow = { gapMs: number | null; contextTokens: number | null; model?: str
 const table: Array<[string, IdleRow, RebuildPolicy, boolean, string, string]> = [
   ["deepseek: 51 minutes on a large context", { gapMs: 51 * MIN, contextTokens: 200_000 }, DEFAULT_REBUILD_POLICY, true, "idle-over-limit", "byModel:deepseek"],
   ["luna: 51 minutes on a large context", { gapMs: 51 * MIN, contextTokens: 200_000, model: LUNA }, DEFAULT_REBUILD_POLICY, true, "idle-over-limit", "byModel:gpt-5.6-luna"],
-  // Luna's cache: warm after 14.7 minutes idle, cold after 44 (production, 2026-10-12).
-  ["luna: 31 minutes", { gapMs: 31 * MIN, contextTokens: 200_000, model: LUNA }, DEFAULT_REBUILD_POLICY, true, "idle-over-limit", "byModel:gpt-5.6-luna"],
-  ["luna: exactly 30 minutes is not over it", { gapMs: 30 * MIN, contextTokens: 200_000, model: LUNA }, DEFAULT_REBUILD_POLICY, false, "gap-under-idle", "byModel:gpt-5.6-luna"],
-  ["luna: 29 minutes", { gapMs: 29 * MIN, contextTokens: 200_000, model: LUNA }, DEFAULT_REBUILD_POLICY, false, "gap-under-idle", "byModel:gpt-5.6-luna"],
-  ["deepseek keeps 50 minutes: 31", { gapMs: 31 * MIN, contextTokens: 200_000 }, DEFAULT_REBUILD_POLICY, false, "gap-under-idle", "byModel:deepseek"],
+  // Luna's cache lasts 30 minutes from its last use (OpenAI, gpt-5.6 and later); 25 leaves a 5-minute margin.
+  ["luna: 26 minutes", { gapMs: 26 * MIN, contextTokens: 200_000, model: LUNA }, DEFAULT_REBUILD_POLICY, true, "idle-over-limit", "byModel:gpt-5.6-luna"],
+  ["luna: exactly 25 minutes is not over it", { gapMs: 25 * MIN, contextTokens: 200_000, model: LUNA }, DEFAULT_REBUILD_POLICY, false, "gap-under-idle", "byModel:gpt-5.6-luna"],
+  ["luna: 24 minutes", { gapMs: 24 * MIN, contextTokens: 200_000, model: LUNA }, DEFAULT_REBUILD_POLICY, false, "gap-under-idle", "byModel:gpt-5.6-luna"],
+  ["deepseek keeps 50 minutes: 26", { gapMs: 26 * MIN, contextTokens: 200_000 }, DEFAULT_REBUILD_POLICY, false, "gap-under-idle", "byModel:deepseek"],
   ["another model: the default entry", { gapMs: 51 * MIN, contextTokens: 200_000, model: "m1" }, DEFAULT_REBUILD_POLICY, true, "idle-over-limit", "default"],
-  ["another model keeps 50 minutes: 31", { gapMs: 31 * MIN, contextTokens: 200_000, model: "openai/gpt-4.1-mini" }, DEFAULT_REBUILD_POLICY, false, "gap-under-idle", "default"],
+  ["another model keeps 50 minutes: 26", { gapMs: 26 * MIN, contextTokens: 200_000, model: "openai/gpt-4.1-mini" }, DEFAULT_REBUILD_POLICY, false, "gap-under-idle", "default"],
   ["49 minutes", { gapMs: 49 * MIN, contextTokens: 200_000 }, DEFAULT_REBUILD_POLICY, false, "gap-under-idle", "byModel:deepseek"],
   ["exactly 50 minutes is not over it", { gapMs: 50 * MIN, contextTokens: 200_000 }, DEFAULT_REBUILD_POLICY, false, "gap-under-idle", "byModel:deepseek"],
   // The saving: C at least 2 × (fixed + briefing budget).
   ["Damy's rebuild at 51,096 would save a third: not rebuilt", { gapMs: 3 * 60 * MIN, contextTokens: 51_096 }, DEFAULT_REBUILD_POLICY, false, "savings-below-half", "byModel:deepseek"],
   ["one token under 2 × (fixed + budget)", { gapMs: 3 * 60 * MIN, contextTokens: 2 * (FIXED + 8_000) - 1 }, DEFAULT_REBUILD_POLICY, false, "savings-below-half", "byModel:deepseek"],
   ["exactly 2 × (fixed + budget)", { gapMs: 3 * 60 * MIN, contextTokens: 2 * (FIXED + 8_000) }, DEFAULT_REBUILD_POLICY, true, "idle-over-limit", "byModel:deepseek"],
-  ["luna: one token under, after 31 minutes", { gapMs: 31 * MIN, contextTokens: 67_999, model: LUNA }, DEFAULT_REBUILD_POLICY, false, "savings-below-half", "byModel:gpt-5.6-luna"],
+  ["luna: one token under, after 26 minutes", { gapMs: 26 * MIN, contextTokens: 67_999, model: LUNA }, DEFAULT_REBUILD_POLICY, false, "savings-below-half", "byModel:gpt-5.6-luna"],
   ["a small fixed part: the same context rebuilt", { gapMs: 3 * 60 * MIN, contextTokens: 51_096, fixedTokens: 2_000 }, DEFAULT_REBUILD_POLICY, true, "idle-over-limit", "byModel:deepseek"],
   ["no fixed part at all: still twice the briefing", { gapMs: 3 * 60 * MIN, contextTokens: 15_999, fixedTokens: 0 }, DEFAULT_REBUILD_POLICY, false, "savings-below-half", "byModel:deepseek"],
   ["a fixed part not known: not rebuilt", { gapMs: 3 * 60 * MIN, contextTokens: 200_000, fixedTokens: null }, DEFAULT_REBUILD_POLICY, false, "fixed-unknown", "byModel:deepseek"],
@@ -94,25 +94,25 @@ for (const [name, f, policy, rebuild, reason, entry] of table) {
 
 await check("rebuildPolicyOf — partial policies are laid over the default; a refused one turns idle rebuilds off", () => {
   must(DEFAULT_IDLE_RULE.idleMinutes === 50 && DEFAULT_IDLE_RULE.minContextTokens === undefined, `default: ${show(DEFAULT_IDLE_RULE)}`);
-  must(DEFAULT_IDLE_POLICY.byModel?.deepseek?.idleMinutes === 50 && DEFAULT_IDLE_POLICY.byModel["gpt-5.6-luna"]?.idleMinutes === 30, `by model: ${show(DEFAULT_IDLE_POLICY)}`);
+  must(DEFAULT_IDLE_POLICY.byModel?.deepseek?.idleMinutes === 50 && DEFAULT_IDLE_POLICY.byModel["gpt-5.6-luna"]?.idleMinutes === 25, `by model: ${show(DEFAULT_IDLE_POLICY)}`);
   // The kill switch alone: shadow rules as the default's, idle off.
   const kill = rebuildPolicyOf('{"idle":false}');
   must(kill?.idle === false && kill.rules === DEFAULT_REBUILD_POLICY.rules && kill.fallback === DEFAULT_REBUILD_POLICY.fallback, `{"idle":false}: ${show(kill)}`);
   must(!idleRebuild({ gapMs: 3 * 60 * MIN, contextTokens: 200_000, model: DS, fixedTokens: FIXED }, kill!).rebuild, "the kill switch did not stop a rebuild");
   // One model off, the rest as they were; the entry's missing field from the merged default.
   const dsOff = rebuildPolicyOf('{"idle":{"byModel":{"deepseek":{"idleMinutes":null}}}}');
-  must(dsOff && dsOff.idle && dsOff.idle.byModel?.deepseek?.idleMinutes === null && dsOff.idle.byModel["gpt-5.6-luna"]?.idleMinutes === 30, `deepseek off: ${show(dsOff?.idle)}`);
+  must(dsOff && dsOff.idle && dsOff.idle.byModel?.deepseek?.idleMinutes === null && dsOff.idle.byModel["gpt-5.6-luna"]?.idleMinutes === 25, `deepseek off: ${show(dsOff?.idle)}`);
   const facts = { gapMs: 3 * 60 * MIN, contextTokens: 200_000, fixedTokens: FIXED };
   must(!idleRebuild({ ...facts, model: DS }, dsOff).rebuild && idleRebuild({ ...facts, model: LUNA }, dsOff).rebuild
     && idleRebuild({ ...facts, model: "m1" }, dsOff).rebuild, "deepseek off must leave luna and the default on");
   // A default moved moves the models the defaults name with it.
   const slow = rebuildPolicyOf('{"idle":{"default":{"idleMinutes":90}}}');
   must(slow && slow.idle && slow.idle.byModel?.deepseek?.idleMinutes === 90 && slow.idle.default.minContextTokens === undefined
-    && slow.idle.byModel["gpt-5.6-luna"]?.idleMinutes === 30, `moved: ${show(slow?.idle)}`);
+    && slow.idle.byModel["gpt-5.6-luna"]?.idleMinutes === 25, `moved: ${show(slow?.idle)}`);
   must(!idleRebuild({ gapMs: 80 * MIN, contextTokens: 200_000, model: DS, fixedTokens: FIXED }, slow).rebuild, "80 minutes under a 90-minute default");
-  // Luna's own time is laid over too: an entry for it that sets only a floor keeps the 30 minutes.
+  // Luna's own time is laid over too: an entry for it that sets only a floor keeps the 25 minutes.
   const floored = rebuildPolicyOf('{"idle":{"byModel":{"gpt-5.6-luna":{"minContextTokens":100000}}}}');
-  must(floored && floored.idle && floored.idle.byModel?.["gpt-5.6-luna"]?.idleMinutes === 30 && floored.idle.byModel["gpt-5.6-luna"].minContextTokens === 100_000,
+  must(floored && floored.idle && floored.idle.byModel?.["gpt-5.6-luna"]?.idleMinutes === 25 && floored.idle.byModel["gpt-5.6-luna"].minContextTokens === 100_000,
     `luna floored: ${show(floored?.idle)}`);
   must(rebuildPolicyOf('{"windowShare":0.9}')?.windowShare === 0.9 && rebuildPolicyOf('{"windowShare":0.9}')?.idle === undefined, "a partial policy without idle keeps the default idle");
   const lines: string[] = [];

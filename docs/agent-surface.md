@@ -531,15 +531,16 @@ that is a context overflow, or a pd compaction that ran) or `operator` (a manual
 Its `rebuild.outcome` row (`parentId` the decision's `spanId`, `spanId` the model job) is the next call measured:
 `input`, `cacheRead`, `hitRate`, and `status` `agree`, `false-cold`, `false-warm` (`predictedCold` against the
 measurement), `expected-cold` (cold by construction, out of the rate) or `unmeasured` (an error, or no input).
-One cold-wake rule is acted on: a wake more than `idleMinutes` (50; 30 for `gpt-5.6-luna`) after the conversation's
+One cold-wake rule is acted on: a wake more than `idleMinutes` (50; 25 for `gpt-5.6-luna`, whose cached prefix OpenAI keeps 30 minutes after its last use, less a
+5-minute margin because this idle clock is not the provider's) after the conversation's
 last answered call, when that call's input C is at least `2 × (fixed + 8,000)` — `fixed` the agent's own system prompt
 and tools in that call's request, estimated at 4 characters a token, and 8,000 the briefing's budget, so the rebuilt
 request is at most half of C — is rebuilt before it is answered — a new transcript of
 the same conversation whose first message is a briefing, the wake after it (a wake whose push is never delivered
 leaves the briefing for the next post: it is never sent alone). The rule is per model, in
 `REBUILD_POLICY`'s `idle` section: `{ "default": {…}, "byModel": { "<model id, or a part of it>": {…} } }` (an exact
-id first, else the longest key the id contains; the defaults name `deepseek`, 50 minutes, and `gpt-5.6-luna`, 30, which
-a moved `default` leaves at 30); `"minContextTokens"` sets an extra floor C must exceed (none by default);
+id first, else the longest key the id contains; the defaults name `deepseek`, 50 minutes, and `gpt-5.6-luna`, 25, which
+a moved `default` leaves at 25); `"minContextTokens"` sets an extra floor C must exceed (none by default);
 `"idleMinutes": null` turns one model's off, `"idle": false` all of them. A partial policy is laid
 over the default (`{"idle": false}` alone is the kill switch), and a policy that is refused leaves the default shadow
 rules with idle rebuilds off. Its decision is that wake's
