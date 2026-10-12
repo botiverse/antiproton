@@ -115,7 +115,7 @@ import { userModelsFrom } from "../../src/model/user-models.ts";
 import { DEFAULT_PROVIDER, providerStatus, type ModelChoice } from "../../src/model/providers.ts";
 import { consumeModelCalls, isUnknownJobReply, replyingUnknownJob, type ModelQueueDeps, type QueuedModelCall, type UnknownJobReply } from "./model-queue.ts";
 import {
-  page, trajectory, approvals, conversation, eventList, storage, memoryPanel, sandboxPanel, adminPanel, agentModelBlock,
+  page, trajectory, approvals, conversation, eventList, storage, memoryPanel, sandboxPanel, adminPanel, adminPage, spendLimitsPanel, usageCostsPanel, agentModelBlock,
   runtimePanel, timeline, tokens, plugins, mountFragment, mountList, catalogue, agentList, apiKeysPanel } from "./ui.ts";
 
 /** The inspector's runtime tab: the object, then its containers. Storage is a
@@ -4638,6 +4638,55 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
           const read = await adminModels("GET", null, actor, deps);
           const data: Parameters<typeof adminPanel>[0] = await read.json();
           return new Response(adminPanel({ ...data, error }), { headers: { "cache-control": "no-store", "content-type": "text/html; charset=utf-8" } });
+        }
+        case "/ui/admin/spend-limits": {
+          // The admin area's daily-limit page. Same gate as /ui/admin: a non-admin is told nothing.
+          // Writes are form posts applied through the same handler as the JSON route, then the panel
+          // re-reads limits and today's priced usage side by side.
+          const v = await viewer(request, env);
+          if (!isAdmin(v, env)) return Response.json({ error: { code: "not_found", message: "no such route" } }, { status: 404 });
+          const deps = { store: d1SpendLimits(env.CONTROL_DB), limits: limitsOf(env), now: Date.now };
+          const actor = v!.sub ?? v!.email;
+          let error: string | null = null;
+          if (request.method === "POST") {
+            const form = await formOf(request);
+            if (!form) return new Response("expected a form body", { status: 400 });
+            const tenantId = String(form.get("tenantId") ?? "");
+            // limitUsd null (the clear path leaves it out; the set form always sends a number) lifts
+            // the tenant cap while the platform cap still applies, per the handler's contract.
+            const body = form.get("action") === "clear"
+              ? { tenantId }
+              : { tenantId, limitUsd: Number(form.get("limitUsd")) };
+            const write = await adminSpendLimits(form.get("action") === "clear" ? "DELETE" : "PUT", body, actor, deps);
+            if (!write.ok) {
+              const why = await write.json().catch(() => null) as { error?: { message?: string } } | null;
+              error = why?.error?.message ?? "the change was not saved";
+            }
+          }
+          const read = await adminSpendLimits("GET", null, actor, deps);
+          const data: Pick<Parameters<typeof spendLimitsPanel>[0], "defaults" | "overrides" | "events"> = await read.json();
+          const day = Math.floor(Date.now() / 86_400_000) * 86_400_000;
+          const costs = await readUsageCosts(env.CONTROL_DB, day, day + 86_400_000, "day");
+          const today = costs.map((c) => ({ tenantId: c.tenantId, usd: c.total }));
+          return new Response(spendLimitsPanel({ ...data, today, platformToday: today.reduce((sum, t) => sum + t.usd, 0), error }), { headers: { "cache-control": "no-store", "content-type": "text/html; charset=utf-8" } });
+        }
+        case "/ui/admin/usage-costs": {
+          // The operator's cost view as a page, same reader as /admin/usage-costs. Default window is
+          // the last 7 days by day; a plain GET form changes it. Unpriced keys are named, not hidden.
+          const v = await viewer(request, env);
+          if (!isAdmin(v, env)) return Response.json({ error: { code: "not_found", message: "no such route" } }, { status: 404 });
+          const parseDay = (s: string | null, fallback: number): number => {
+            if (!s) return fallback;
+            const t = Date.parse(`${s}T00:00:00Z`);
+            return Number.isNaN(t) ? fallback : t;
+          };
+          const now = Date.now();
+          const to = parseDay(url.searchParams.get("to"), now) + 86_400_000; // the named day counts whole
+          const from = parseDay(url.searchParams.get("from"), to - 7 * 86_400_000);
+          const bucket = url.searchParams.get("bucket") === "month" ? "month" : "day";
+          const tenants = await readUsageCosts(env.CONTROL_DB, from, to, bucket);
+          const unpriced = [...new Set(tenants.flatMap((t) => t.periods.flatMap((p) => p.resources.flatMap((r) => r.unpriced))))].sort();
+          return new Response(usageCostsPanel({ from, to, bucket, tenants, unpriced }), { headers: { "cache-control": "no-store", "content-type": "text/html; charset=utf-8" } });
         }
         case "/ui/api-keys":
         case "/ui/api-keys/new":
