@@ -189,8 +189,14 @@ Where cost is shown:
 - **`GET /admin/usage-costs?from=&to=&bucket=day|month`**
   (`cf/src/admin-usage-costs.ts`), the operator's: every tenant's cost by
   period and resource, `model.tokens.unaccepted` included, with the keys each
-  total leaves out unpriced. The `x-harness-token` header must equal
-  `AUTOMATION_TOKEN`, and with no token configured it refuses everyone.
+  total leaves out unpriced. Two callers may read it, as `/admin/spend-limits`:
+  a script whose `x-harness-token` header equals `AUTOMATION_TOKEN` (with no
+  token configured, no script passes), and a signed-in admin (`isAdmin`,
+  `ADMIN_IDENTITIES`), on the admin host (`ADMIN_ORIGIN`,
+  `cf/src/admin-host.ts`) or the console's. Someone signed in who is not an
+  admin gets 404, as there; with no identity at all the console's host answers
+  401 and the admin host sends the browser to sign in. Read-only: any other
+  method is 405.
 
 ## Who pays
 

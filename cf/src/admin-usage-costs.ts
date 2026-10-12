@@ -3,8 +3,9 @@
  * period and resource (docs/metering.md, "Prices"). The operator's view: it reads across tenants and keeps
  * the unaccepted model answers the tenant's views leave out (`readUsageCosts`, cf/src/usage-d1.ts).
  *
- * Operator header only, and closed when no token is configured, as /admin/identity is: a route that shows
- * every tenant's spending does not open for a local dev server that forgot to set one.
+ * The operator's header, closed when no token is configured, as /admin/identity is: a route that shows every
+ * tenant's spending does not open for a local dev server that forgot to set one. Or a signed-in admin, decided
+ * by the caller (cf/src/index.ts, auth.ts isAdmin), as /admin/spend-limits is, so the admin host's page can read it.
  */
 import { isOperator } from "./auth.ts";
 import { DAY_MS } from "./usage-windows.ts";
@@ -68,9 +69,9 @@ function nextMonth(t: number): number {
 
 export async function adminUsageCosts(
   request: Request, token: string | undefined, read: (from: number, to: number, bucket: "day" | "month") => Promise<TenantCosts[]>,
-  url: URL, now = Date.now(),
+  url: URL, now = Date.now(), admin = false,
 ): Promise<Response> {
-  if (!isOperator(token, request.headers.get("x-harness-token"))) return answer({ error: "unauthorized" }, 401);
+  if (!admin && !isOperator(token, request.headers.get("x-harness-token"))) return answer({ error: "unauthorized" }, 401);
   if (request.method !== "GET") return answer({ error: "GET only" }, 405, "GET");
   const q = parseCostsQuery(url.searchParams, now);
   if (typeof q === "string") return answer({ error: q }, 400);

@@ -3548,7 +3548,8 @@ function provisionDeps(env: Env): ProvisionDeps {
 
 /**
  * The admin host (admin-host.ts). A response ends the request; null lets the path through to the shared
- * routes (`/ui/admin`, `/admin/models`, `/logout`), which check isAdmin themselves.
+ * routes (`/ui/admin`, `/admin/models`, `/admin/spend-limits`, `/admin/usage-costs`, `/logout`), which check isAdmin
+ * themselves.
  */
 async function adminHost(request: Request, env: Env, url: URL): Promise<Response | null> {
   const nothing = () => Response.json({ error: { code: "not_found", message: "no such route" } }, { status: 404 });
@@ -3852,9 +3853,15 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
     if (url.pathname === "/admin/service-tokens") return adminServiceTokens(request, env.AUTOMATION_TOKEN, d1ServiceTokens(env.CONTROL_DB), url);
     // A Raft server's provider tokens, and the agents it provisions with them (raft-agent-provider.v1).
     if (url.pathname === "/admin/provider-tokens") return adminProviderTokens(request, env.AUTOMATION_TOKEN, d1ProviderTokens(env.CONTROL_DB), url);
-    // Every tenant's estimated cost (credits phase 1: accounting, nothing enforced). Operator header only.
+    // Every tenant's estimated cost (credits phase 1: accounting, nothing enforced). The operator's token, or a
+    // signed-in admin as /admin/spend-limits takes, so the admin host's page can read it. Someone signed in who
+    // is not an admin is told nothing, as there; no identity at all keeps the route's own 401.
     if (url.pathname === "/admin/usage-costs") {
-      return adminUsageCosts(request, env.AUTOMATION_TOKEN, (from, to, bucket) => readUsageCosts(env.CONTROL_DB, from, to, bucket), url);
+      const v = await viewer(request, env);
+      const operator = isOperator(env.AUTOMATION_TOKEN, request.headers.get("x-harness-token"));
+      if (v && !isAdmin(v, env) && !operator) return Response.json({ error: { code: "not_found", message: "no such route" } }, { status: 404 });
+      return adminUsageCosts(request, env.AUTOMATION_TOKEN, (from, to, bucket) => readUsageCosts(env.CONTROL_DB, from, to, bucket), url,
+        Date.now(), isAdmin(v, env));
     }
     if (url.pathname.startsWith("/provision/")) return provision(request, env, url);
     // A service's push: addressed by the hook id alone, before any sign-in.
