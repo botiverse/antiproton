@@ -191,7 +191,13 @@ export async function callQueuedModel(env: ModelEnv, job: any, jobId: string, im
   let lastStatus: number | undefined;
   const observe = recording ? { onStatus: (s: number) => { lastStatus = s; } } : {};
   let call: () => Promise<ModelResponse>;
-  if (usesResponses(called)) {
+  if (request.api === "anthropic-messages") {
+    // Anthropic's own protocol, when the provider speaks it (src/model/providers.ts `api`): the provider decides, not the
+    // model's name, since the same Claude model is reachable through /compat as well, which does not cache for it.
+    const model = new AnthropicMessagesModel(request);
+    const req = toAnthropicRequest(context, called, { images: sees });
+    call = () => model.complete(req);
+  } else if (usesResponses(called)) {
     const toolImages = env.RESPONSES_TOOL_IMAGES === "user" ? "user" as const : "output" as const;
     const { input, tools } = toResponsesInput(context, called, { images: sees, toolImages });
     const model = new OpenAiResponsesModel(request);
@@ -200,14 +206,6 @@ export async function callQueuedModel(env: ModelEnv, job: any, jobId: string, im
     const model = new OpenAiCompatibleModel(request);
     const { messages, tools } = toRequest(context, { images: sees });
     call = () => model.complete(messages, { ...(tools ? { tools } : {}), ...observe });
-  }
-  // Anthropic's own protocol, when the provider speaks it (src/model/providers.ts `api`): the provider decides, not the
-  // model's name, since the same Claude model is reachable through /compat as well, which does not cache for it. The
-  // OpenAI-shaped call chosen above is replaced unsent.
-  if (request.api === "anthropic-messages") {
-    const model = new AnthropicMessagesModel(request);
-    const req = toAnthropicRequest(job.context, called);
-    call = () => model.complete(req);
   }
   const identity = {
     api: String(job.model?.api ?? "offloaded"),

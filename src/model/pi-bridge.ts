@@ -442,6 +442,12 @@ export function errorMessage(
   };
 }
 
+/** An image as an Anthropic `image` block; its bytes must be resolved by now (`dataUrl` says why). */
+function imageBlock(image: { data: string; mimeType: string }): AnthropicBlock {
+  dataUrl(image);
+  return { type: "image", source: { type: "base64", media_type: image.mimeType, data: image.data } };
+}
+
 /** What an input with no text is sent as (`toAnthropicRequest`). */
 export const EMPTY_INPUT = "(no text)";
 
@@ -472,7 +478,9 @@ export const CACHE_BREAKPOINT = { type: "ephemeral" } as const;
  * The conversation is `toRequest`'s in Anthropic's form, as pi's own Anthropic provider converts it
  * (`convertMessages`, pi-ai-1 dist/api/anthropic-messages.js): the leading system prompt is the top-level `system`;
  * a tool call is a `tool_use` block of its assistant message and its result a `tool_result` block of the user
- * message after it, consecutive results in one message; images are dropped, as `toRequest` drops them.
+ * message after it, consecutive results in one message. Images, for a model that can see them (`opts.images`), are
+ * `image` blocks with a base64 source, in a user message where the user put them and inside a tool result beside its
+ * text; for any other model each message's images are the no-vision sentence, as in `toRequest`.
  *
  * Two differences from `toRequest`, each forced by the API:
  * - A later system message (version 2) cannot be a message of its own: Anthropic takes `role: "system"` mid-
@@ -489,7 +497,7 @@ export const CACHE_BREAKPOINT = { type: "ephemeral" } as const;
  * came after, so the previous request's last breakpoint is this one's second-to-last: an exact hit however many
  * blocks the turn added, where a single moving breakpoint relies on Anthropic's 20-block lookback.
  */
-export function toAnthropicRequest(context: JobContext, model: string): {
+export function toAnthropicRequest(context: JobContext, model: string, opts: SerializeOptions = {}): {
   system?: AnthropicBlock[];
   messages: AnthropicMessage[];
   tools?: AnthropicBlock[];
@@ -524,10 +532,21 @@ export function toAnthropicRequest(context: JobContext, model: string): {
       continue;
     }
     if (m.role === "user") {
-      // An input with no text (an image alone, which this request does not carry, or only whitespace) still takes its
-      // turn: dropped, the request could end on an assistant turn, which is a prefill these models refuse, or be empty.
+      const images = imagesOf(m.content);
       const text = textOf(m.content);
-      userBlocks().push({ type: "text", text: text.trim() ? text : EMPTY_INPUT });
+      if (images.length && opts.images) {
+        // In the order the user wrote them: text and images interleaved as they were.
+        for (const c of m.content as any[]) {
+          if (c?.type === "text" && String(c.text ?? "").trim()) userBlocks().push({ type: "text", text: String(c.text) });
+          else if (c?.type === "image") userBlocks().push(imageBlock(c));
+        }
+        continue;
+      }
+      // A model that cannot see is told so in place of the images. An input with no text at all (only whitespace)
+      // still takes its turn: dropped, the request could end on an assistant turn, which is a prefill these models
+      // refuse, or be empty.
+      const said = images.length ? withNoVision(text) : text;
+      userBlocks().push({ type: "text", text: said.trim() ? said : EMPTY_INPUT });
       continue;
     }
     if (m.role === "toolResult") {
@@ -535,7 +554,13 @@ export function toAnthropicRequest(context: JobContext, model: string): {
       // Results open their message, before any text in it (an input that came in while the calls ran): one message,
       // results first, since a user message after the one answering the calls would leave the calls unanswered.
       const at = blocks.findIndex((b) => b.type !== "tool_result");
-      const result: AnthropicBlock = { type: "tool_result", tool_use_id: m.toolCallId, content: textOf(m.content) || "(no output)",
+      const images = imagesOf(m.content);
+      const text = textOf(m.content);
+      // A result's images go inside it, beside its text, as Anthropic takes them (and as pi sends them).
+      const content: string | AnthropicBlock[] = !images.length ? text || "(no output)"
+        : !opts.images ? withNoVision(text)
+        : [...(text ? [{ type: "text", text }] : []), ...images.map(imageBlock)];
+      const result: AnthropicBlock = { type: "tool_result", tool_use_id: m.toolCallId, content,
         ...(m.isError ? { is_error: true } : {}) };
       if (at < 0) blocks.push(result);
       else blocks.splice(at, 0, result);

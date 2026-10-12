@@ -9,6 +9,9 @@ import { callQueuedModel } from "../cf/src/model-request.ts";
 import { ANTHROPIC_VERSION, readMessage } from "../src/model/anthropic-messages.ts";
 import { CACHE_BREAKPOINT, EMPTY_INPUT, FAILED_ANSWER, fromResponse, toAnthropicRequest, toRequest } from "../src/model/pi-bridge.ts";
 import { overflowKind } from "../src/runtime/overflow-backstop.ts";
+import { acceptsImages } from "../src/model/context-windows.ts";
+import { NO_VISION_SENTENCE, imageRef, sha256Hex } from "../src/model/images.ts";
+import { Buffer } from "node:buffer";
 import { isRetryableAssistantError } from "@earendil-works/pi-ai";
 import { parseProviders, providerRequest, providersFrom } from "../src/model/providers.ts";
 import { parseUserModels } from "../src/model/user-models.ts";
@@ -230,16 +233,64 @@ await check("a refusal or a window stop with nothing in it is a failed turn nami
   must(cut.truncated && !cut.failure && fromResponse(cut, identity).stopReason === "length", show(cut));
 });
 
-await check("an input with no text (an image alone, or whitespace) is sent as a placeholder: the request never ends on an answer or empty", () => {
+await check("an input with no text (only whitespace) is sent as a placeholder; an image alone to a model that cannot see is the no-vision sentence", () => {
   const ctx = { systemPrompt: "S", messages: [
     { role: "user", content: "hi", timestamp: 1 },
     assistant(HAIKU, [{ type: "text", text: "hello" }], "stop"),
     { role: "user", content: [{ type: "image", data: "AAAA", mimeType: "image/png" }], timestamp: 3 },
   ] };
   const r = toAnthropicRequest(ctx as never, HAIKU);
-  must(r.messages.at(-1)!.role === "user" && r.messages.at(-1)!.content[0]!.text === EMPTY_INPUT, show(r.messages.at(-1)));
+  must(r.messages.at(-1)!.role === "user" && r.messages.at(-1)!.content[0]!.text === NO_VISION_SENTENCE, show(r.messages.at(-1)));
   const blank = toAnthropicRequest({ systemPrompt: "S", messages: [{ role: "user", content: "   ", timestamp: 1 }] } as never, HAIKU);
   must(blank.messages.length === 1 && blank.messages[0]!.content[0]!.text === EMPTY_INPUT, show(blank.messages));
+});
+
+const PNG = Buffer.from("89504e470d0a1a0a0000000d49484452000000010000000108020000009077053e0000000c4944415408d763f8cfc000000301010018dd8db40000000049454e44ae426082", "hex");
+const B64 = PNG.toString("base64");
+const IMAGE = { type: "image", source: { type: "base64", media_type: "image/png", data: B64 } };
+/** A conversation with an image in the user's input and one in a tool result, as the consumer has resolved it. */
+const withImages = (data: string) => ({ systemPrompt: "S", messages: [
+  { role: "user", content: [{ type: "text", text: "Compare" }, { type: "image", data, mimeType: "image/png" }, { type: "text", text: "with the chart." }], timestamp: 1 },
+  assistant(HAIKU, [{ type: "toolCall", id: "t1", name: "view", arguments: { name: "chart.png" } }, { type: "toolCall", id: "t2", name: "view", arguments: { name: "b.png" } }]),
+  { role: "toolResult", toolCallId: "t1", toolName: "view", content: [{ type: "text", text: "chart.png" }, { type: "image", data, mimeType: "image/png" }], isError: false, timestamp: 3 },
+  { role: "toolResult", toolCallId: "t2", toolName: "view", content: [{ type: "image", data, mimeType: "image/png" }], isError: false, timestamp: 4 },
+] });
+
+await check("images to a model that can see: image blocks in the user's input where it put them, and inside each tool result beside its text", () => {
+  const r = toAnthropicRequest(withImages(B64) as never, HAIKU, { images: true });
+  const strip = (b: any) => { const { cache_control: _c, ...rest } = b; return rest; };
+  must(show(r.messages[0]!.content.map(strip)) === show([{ type: "text", text: "Compare" }, IMAGE, { type: "text", text: "with the chart." }]), show(r.messages[0]));
+  const [a, b] = r.messages[2]!.content.map(strip);
+  must(show(a) === show({ type: "tool_result", tool_use_id: "t1", content: [{ type: "text", text: "chart.png" }, IMAGE] }), show(a));
+  must(show(b) === show({ type: "tool_result", tool_use_id: "t2", content: [IMAGE] }), show(b));
+  let thrown = "";
+  try { toAnthropicRequest(withImages("apimg:sha256:" + "a".repeat(64) + ":8") as never, HAIKU, { images: true }); } catch (e) { thrown = String(e); }
+  must(/never resolved/.test(thrown), `an unresolved reference was sent: ${thrown}`);
+});
+
+await check("images to a model that cannot see: the no-vision sentence in their place, in the input and in each result", () => {
+  const r = toAnthropicRequest(withImages(B64) as never, HAIKU);
+  must(r.messages[0]!.content.length === 1 && r.messages[0]!.content[0]!.text === `Comparewith the chart.\n\n${NO_VISION_SENTENCE}`, show(r.messages[0]));
+  must(show(r.messages[2]!.content.map((b) => b.content)) === show([`chart.png\n\n${NO_VISION_SENTENCE}`, NO_VISION_SENTENCE]), show(r.messages[2]));
+  must(!JSON.stringify(r).includes(B64), "the bytes were sent to a model that cannot see");
+});
+
+await check("the queue consumer resolves Haiku's images from the agent's own store and sends them; another anthropic-messages model gets the sentence, nothing read", async () => {
+  const sha = sha256Hex(PNG);
+  const ref = imageRef(sha, PNG.byteLength);
+  const reads: string[] = [];
+  const loader = async (h: string) => { reads.push(h); return h === sha ? new Uint8Array(PNG) : null; };
+  const reply = { body: { content: [{ type: "text", text: "ok" }], stop_reason: "end_turn", usage: { input_tokens: 1, output_tokens: 1 } } };
+  const p = provider([reply, reply]);
+  await withFetch(p.fetch, () => callQueuedModel(ENV, job(withImages(ref)), "mj_i", loader));
+  const sent = p.seen[0]!.body;
+  must(acceptsImages(HAIKU) && reads.length > 0 && reads.every((h) => h === sha), `reads ${show(reads)}`);
+  must(sent.messages[0].content[1].type === "image" && sent.messages[0].content[1].source.data === B64
+    && sent.messages[2].content[0].content[1].source.data === B64 && sent.messages[2].content[1].content[0].source.data === B64, show(sent.messages));
+  reads.length = 0;
+  await withFetch(p.fetch, () => callQueuedModel(ENV, { ...job(withImages(ref)), operatorModel: "claude-sonnet-5-5" }, "mj_j", loader));
+  must(!acceptsImages("claude-sonnet-5-5") && reads.length === 0 && !JSON.stringify(p.seen[1]!.body).includes(B64)
+    && JSON.stringify(p.seen[1]!.body).includes(NO_VISION_SENTENCE), `another model: reads ${show(reads)} ${show(p.seen[1]!.body.messages[0])}`);
 });
 
 await check("a tool result after an input in the same user turn is one message, the results first", () => {
