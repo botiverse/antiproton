@@ -72,6 +72,12 @@ export interface ModelQueueDeps {
   call(job: unknown, m: QueuedModelCall): Promise<unknown>;
   /** The answer a given-up job is delivered. */
   givenUp(m: QueuedModelCall): unknown;
+  /**
+   * Asked after the take and before the provider call: null to call it, or the answer to deliver instead
+   * (a daily spend limit reached, cf/src/spend-limit.ts). An answer, not a throw, so the message is acked and
+   * neither the queue nor the harness sends the call again.
+   */
+  admit?(job: unknown, m: QueuedModelCall): Promise<unknown | null>;
 }
 
 export interface ModelQueueMessage {
@@ -120,6 +126,12 @@ async function withTake(
 export async function runModelCall(m: QueuedModelCall, deps: ModelQueueDeps): Promise<void> {
   const stub = deps.stub(m);
   await withTake(m, stub, "take", async (job, taker) => {
+    const refused = deps.admit ? await deps.admit(job, m) : null;
+    if (refused) {
+      const wrote = await stub.deliverAnswer(m.tenantId, m.agentId, m.jobId, refused, 0, taker);
+      if (isUnknownJobReply(wrote)) unknownJob(m, "deliver");
+      return;
+    }
     const t0 = Date.now();
     const answer = await deps.call(job, m);
     const wrote = await stub.deliverAnswer(m.tenantId, m.agentId, m.jobId, answer, Date.now() - t0, taker);

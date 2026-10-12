@@ -265,6 +265,18 @@ Antiproton is designed to run as a Cloudflare Worker backed by Durable Objects:
    check scans the error text for words like `timeout` that a provider's message can contain. 408, 409,
    429, 5xx and network errors are retried, and then dead-lettered, as before.
 
+   **Daily spend limits.** Model calls on the operator's accounts stop for the day once a tenant's priced
+   usage reaches its limit — `DAILY_LIMIT_USD`, $5 when unset, or an admin's per-tenant override through
+   `/admin/spend-limits` (audited; `null` for none) — or once every tenant's together reaches
+   `PLATFORM_DAILY_LIMIT_USD`, $30 when unset. Tenants in `DAILY_LIMIT_EXEMPT_TENANTS` (`bench` when
+   unset) are never refused but count toward the platform total. Usage paid with the tenant's own
+   credential counts nothing. The check is made in the queue consumer before each provider call, on a
+   reading of the ledger at most 30 s old (5 s near a limit); a refused call fails its turn once with
+   `Daily usage limit reached ($X of $Y); resets at 00:00 UTC.` (or the platform's sentence), is not
+   retried, and is not read as an overflow. A spend read that fails lets the call through, with a log
+   line. Running containers are not stopped. What is counted, how far a tenant can overshoot and why:
+   docs/metering.md, "Daily limits".
+
    **Images.** A tool result can ask for an image to be seen with a `view` field naming an artifact
    (docs/plugins.md). DeepSeek Flash and GPT-5.6 Luna see it (`VISION_MODELS`,
    `src/model/context-windows.ts`); any other model is told in its place that it cannot, and that an owner

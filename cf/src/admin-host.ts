@@ -43,7 +43,7 @@ export async function redeemTicket(
 
 /** The only paths the admin host answers; the rest of the console lives on its own origin. */
 export function adminHostServes(path: string): boolean {
-  return path === "/" || path === "/session" || path === "/ui/admin" || path === "/admin/models" || path === "/logout";
+  return path === "/" || path === "/session" || path === "/ui/admin" || path === "/admin/models" || path === "/admin/spend-limits" || path === "/logout";
 }
 
 /**
