@@ -265,6 +265,22 @@ Antiproton is designed to run as a Cloudflare Worker backed by Durable Objects:
    check scans the error text for words like `timeout` that a provider's message can contain. 408, 409,
    429, 5xx and network errors are retried, and then dead-lettered, as before.
 
+   **Images.** A tool result can ask for an image to be seen with a `view` field naming an artifact
+   (docs/plugins.md). DeepSeek Flash and GPT-5.6 Luna see it (`VISION_MODELS`,
+   `src/model/context-windows.ts`); any other model is told in its place that it cannot, and that an owner
+   can switch the agent to one of those two. The bytes are stored once in the artifacts bucket under the
+   agent's prefix (`model-images/<sha256>`), and the transcript, the job rows and the prefix and input
+   readings hold only that reference; the queue consumer reads the bytes back right before the call. At
+   DeepSeek a tool result's image is sent in a user message after the tool results, the only place it takes
+   one; through the Responses API it goes inside the tool result's output, or, with the
+   `RESPONSES_TOOL_IMAGES` var set to `user`, in a user message after the results as well. An image stays in
+   the conversation until compaction, whose summary is text, but one request carries only the newest 8, and at
+   most 12 MiB of them (`MODEL_IMAGES_MAX`, `MODEL_IMAGES_MAX_BYTES`); each older one is sent as a line naming
+   it, and until the next compaction (which renumbers what is left) an image outside that window stays
+   outside. The window's start moves four images at a time (one at a time when `MODEL_IMAGES_MAX` is under
+   four, and never past the newest image), so the provider's cached prefix breaks once per four new images
+   rather than at every one.
+
 2. **Run locally with Wrangler:**
    ```bash
    cd cf

@@ -43,3 +43,21 @@ export function contextWindowFor(
   const base = Object.keys(CONTEXT_WINDOWS).find((k) => model.startsWith(k));
   return base ? CONTEXT_WINDOWS[base]! : fallback;
 }
+
+/**
+ * The models that can see an image, by the same name the windows are matched by. A model not listed is sent text
+ * only: an image in its conversation is replaced by a sentence saying it cannot see it (src/model/images.ts
+ * `NO_VISION_SENTENCE`). Listed only after a live call with an image answered correctly through the path this
+ * deployment calls the model by: deepseek-flash at DeepSeek's /chat/completions as a user `image_url`, and
+ * gpt-5.6-luna through Cloudflare AI Gateway's /compat/responses as `input_image`, in a user message and in a
+ * `function_call_output` (measured 2026-10-12). deepseek-v4-pro was not probed.
+ */
+export const VISION_MODELS: ReadonlySet<string> = new Set(["deepseek-flash", "gpt-5.6-luna"]);
+
+/** Whether `model` can be shown images, matched as `contextWindowFor` matches a window. */
+export function acceptsImages(model: string | undefined): boolean {
+  if (!model) return false;
+  model = model.slice(model.indexOf("/") + 1);
+  if (VISION_MODELS.has(model)) return true;
+  return [...VISION_MODELS].some((k) => model!.startsWith(k));
+}

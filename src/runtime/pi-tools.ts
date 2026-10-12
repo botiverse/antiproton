@@ -20,6 +20,7 @@
 import type { AgentHarnessTool } from "@earendil-works/pi-agent-core";
 import { pluginUnavailableMessage, switchedOffMessage } from "./gateway.ts";
 import { programCallKey } from "./operation-id.ts";
+import { splitView, viewContent, type ViewHost, type ViewMarker } from "./tool-view.ts";
 import type { Json } from "../core/types.ts";
 import type { Continuation, HeldCall, Paused } from "../core/execution.ts";
 import type { ToolInterrupt } from "../core/tools.ts";
@@ -82,7 +83,7 @@ export interface ToolResult {
   interrupt?: ToolInterrupt;
 }
 
-export interface ToolHost {
+export interface ToolHost extends ViewHost {
   /** `callId` is the model's id for this tool call, passed to be RECORDED. It is
    *  not `opts.idempotencyKey`: one call can make several requests. */
   invoke(call: { tool: string; args: Json; opts?: unknown; callId?: string }): Promise<ToolResult>;
@@ -345,14 +346,19 @@ async function deliverToolResult(res: ToolResult, o: {
     // audit record want it.
     throw new Error(`${o.name}: ${message}`);
   }
+  // A result that asks for an image to be seen (src/runtime/tool-view.ts) is shown without its `view` field, and
+  // with the image or a sentence saying why there is none; one without the field is untouched.
+  const { view, rest } = splitView(res.result);
   // A question asked inside a program ended it; the answer's result comes
   // back here, not into the program, and the model has to know that.
   const shown = o.inProgram
-    ? { tool: o.name, result: res.result ?? null, note: AFTER_PROGRAM_NOTE }
-    : res.result ?? null;
+    ? { tool: o.name, result: rest ?? null, note: AFTER_PROGRAM_NOTE }
+    : rest ?? null;
+  const details = { ...(o.address ? { address: o.address } : {}), operationId: res.operationId };
+  if (view !== undefined) return { content: await viewContent(view, shown, o.host), details };
   return {
     content: [{ type: "text" as const, text: JSON.stringify(shown) }],
-    details: { ...(o.address ? { address: o.address } : {}), operationId: res.operationId },
+    details,
   };
 }
 
@@ -382,9 +388,13 @@ async function toolQuestion(i: ToolInterrupt, o: {
     };
     return { content: [{ type: "text" as const, text: JSON.stringify(answer) }], details: { interrupted: true, resumable: false, operationId: o.operationId } };
   }
+  const viewHost = o.host;
   const interruptHost: InterruptHost = {
     resumeInterrupt: (x, a, callId) => resumeInterrupt.call(o.host, x, a, callId),
     cancelInterrupt: (x) => cancelQuietly(o.host, x),
+    ...(viewHost.seesImages && viewHost.attachImage ? {
+      view: { seesImages: () => viewHost.seesImages!(), attachImage: (v: ViewMarker) => viewHost.attachImage!(v) },
+    } : {}),
   };
   const h = o.keeping.continuations.hold({
     kind: "tool", scope: o.keeping.scope, callId: o.callId, tool: o.name, question: i.question, answer: asked.spec,
@@ -878,6 +888,7 @@ export function resumeTool(
       invoke: () => Promise.reject(new Error("not a call")),
       resumeInterrupt: (i, a, c) => s.host.resumeInterrupt(i, a, c) as Promise<ToolResult>,
       ...(s.host.cancelInterrupt ? { cancelInterrupt: s.host.cancelInterrupt } : {}),
+      ...(s.host.view ?? {}),
     };
     return deliverToolResult(res, {
       name: s.tool, callId, host, keeping: { continuations, scope }, ...(s.inProgram ? { inProgram: true } : {}),

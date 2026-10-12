@@ -160,7 +160,7 @@ export function durableAgentCases(withHost: WithDriveHost, activeTimers: TimerPr
     check(o.polls.length === 0, `polled before the park ended: ${show(o.polls)}`);
     const id = rows[0]!.id;
     const asked = await consume(a, id, "Paris");
-    check(asked.some((m) => m.role === "user" && m.content === "Capital of France?") && asked.some((m) => m.role === "system" && m.content.includes("terse test assistant")),
+    check(asked.some((m) => m.role === "user" && m.content === "Capital of France?") && asked.some((m) => m.role === "system" && typeof m.content === "string" && m.content.includes("terse test assistant")),
       `the model was asked ${show(asked)}`);
     check(await a.takeJob(id) === null, "an answered job was handed out again");
     check(await a.deliver(id, fromResponse(reply("again"), { api: "x", provider: "queue", id: "m1" }, id)) === false, "a second answer was accepted");

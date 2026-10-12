@@ -384,6 +384,22 @@ reference, and the runtime finds the tool that opens one by this declaration —
 not by the plugin id plus a tool name. Without it, a large result is truncated
 instead of parked, and nothing says why.
 
+**Show the model an image with a `view` field, never with its bytes.** A result
+object may carry one reserved top-level field, `view: { ref, mimeType, width?,
+height?, bytes }`: `ref` an `artifact://` reference the calling agent can read,
+`mimeType` one of `image/png`, `image/jpeg`, `image/webp`, `image/gif`, `bytes`
+the stored size exactly (at most 1.5 MiB, 1,572,864, inclusive), and no other key. The harness
+reads the artifact, checks its header against `mimeType` and its sides against
+8192 pixels, and attaches it to the result for a model that can see images; a
+model that cannot is told so in the result's text, and a marker that fails a
+check is a sentence saying which. It is the harness's field: it is taken off
+before the size decision, so it never makes a result parked, and the model
+reads the rest of the result as JSON with a line about the image after it
+(`src/runtime/tool-view.ts`). Base64 in a result is a megabyte in the
+operations row and in every later request of the conversation. Only a call's
+result (or a resumed question's) is read for `view`: a backgrounded job's result
+reaches the model as a message, and a `view` in it is shown as plain JSON.
+
 **Work that outlives one call is backgrounded.** Return
 `backgrounded(handle, note)` from `invoke`, and declare `background: { poll,
 cancel }`. The handle is stored as given, so it must never carry a credential.

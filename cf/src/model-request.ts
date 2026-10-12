@@ -5,6 +5,8 @@ import { ModelRequestRefused, OpenAiCompatibleModel } from "../../src/model/open
 import { OpenAiResponsesModel, usesResponses } from "../../src/model/openai-responses.ts";
 import { errorMessage, fromResponse, toRequest, toResponsesInput, type AnsweredMessage } from "../../src/model/pi-bridge.ts";
 import type { ModelResponse } from "../../src/model/types.ts";
+import { acceptsImages } from "../../src/model/context-windows.ts";
+import { DEFAULT_IMAGE_WINDOW, imageKey, resolveImages, type ImageLoader, type ImageWindow } from "../../src/model/images.ts";
 import { logEvent } from "../../src/core/log.ts";
 
 /**
@@ -12,7 +14,39 @@ import { logEvent } from "../../src/core/log.ts";
  * DeepSeek from DEEPSEEK_BASE_URL and DEEPSEEK_API_KEY), the secrets they name, and the default model.
  * The secrets are looked up by the names the declaration gives, so the type is open.
  */
-export type ModelEnv = { DEEPSEEK_BASE_URL?: string; DEEPSEEK_API_KEY?: string; HARNESS_MODEL: string; MODEL_PROVIDERS?: unknown; USER_MODELS?: unknown };
+export type ModelEnv = {
+  DEEPSEEK_BASE_URL?: string; DEEPSEEK_API_KEY?: string; HARNESS_MODEL: string; MODEL_PROVIDERS?: unknown; USER_MODELS?: unknown;
+  /**
+   * Where the Responses API path puts a tool result's images (`toResponsesInput`, src/model/pi-bridge.ts): `output`
+   * (the default, pi's way) or `user`, a user message after the results. Both were answered correctly through the
+   * gateway (2026-10-12); this is the switch if one of them stops being accepted.
+   */
+  RESPONSES_TOOL_IMAGES?: string;
+  /** How many images, and how many bytes of them, one request carries, newest first (`ImageWindow`, src/model/images.ts). */
+  MODEL_IMAGES_MAX?: string;
+  MODEL_IMAGES_MAX_BYTES?: string;
+};
+
+/** The image window from the environment: each var a positive whole number, else the default. */
+export function imageWindowOf(env: ModelEnv): ImageWindow {
+  const n = (v: unknown, d: number) => { const x = Number(v); return Number.isSafeInteger(x) && x > 0 ? x : d; };
+  return { maxImages: n(env.MODEL_IMAGES_MAX, DEFAULT_IMAGE_WINDOW.maxImages), maxBytes: n(env.MODEL_IMAGES_MAX_BYTES, DEFAULT_IMAGE_WINDOW.maxBytes) };
+}
+
+/**
+ * The queue consumer's image loader for one queued call: the bucket read under the queue message's own tenant and
+ * agent, with the same key the tool host stored it under (`imageKey`, through `attachViewImage` in
+ * src/runtime/tool-view.ts), so a job can only ever reach its own agent's images.
+ */
+export function imageLoaderFor(
+  bucket: { get(key: string): Promise<{ arrayBuffer(): Promise<ArrayBuffer> } | null> },
+  owner: { tenantId: string; agentId: string },
+): ImageLoader {
+  return async (sha) => {
+    const o = await bucket.get(imageKey(owner, sha));
+    return o ? new Uint8Array(await o.arrayBuffer()) : null;
+  };
+}
 
 /** The deployment's operator model, read from its environment (src/model/operator-request.ts says how it is called). */
 export function operatorModelOf(env: ModelEnv): OperatorModel {
@@ -103,6 +137,16 @@ export function planBinding(
 }
 
 /**
+ * The queue consumer's `call` (`modelQueueDeps`, cf/src/index.ts): the provider call for a taken job, its images read
+ * from the agent the queue message names — its tenant and agent, never the object id it was addressed to — with the
+ * key the tool host stored them under.
+ */
+export function queuedCall(env: ModelEnv, bucket: Parameters<typeof imageLoaderFor>[0]) {
+  return (taken: unknown, m: { jobId: string; tenantId: string; agentId: string }) =>
+    callQueuedModel(env, taken, m.jobId, imageLoaderFor(bucket, { tenantId: m.tenantId, agentId: m.agentId }));
+}
+
+/**
  * The queue consumer's provider call for a taken job (`modelQueueDeps`, cf/src/index.ts): the operator's account, with
  * the binding's provider and model when it spends that account (`operatorProvider`, `operatorModel`) and the
  * deployment's otherwise. A job taken before providers existed carries no provider, which is the default one. The answer
@@ -112,19 +156,27 @@ export function planBinding(
  * reasoning on and its earlier reasoning replayed (src/model/openai-responses.ts); every other model through
  * chat/completions, whose request — DeepSeek's among them — test/model-request-snapshot.ts pins byte for byte.
  * The job's own options are not forwarded on either path: the reasoning level is each client's default.
+ *
+ * An image in the conversation is stored as a reference (src/model/images.ts); for a model that can see images
+ * (`acceptsImages`) the newest ones, within the image window (`imageWindowOf`), are read through `images` — the
+ * agent's own R2 prefix, in the Worker (`imageLoaderFor`) — right before the call, and older ones are sent as a note;
+ * for any other model each is sent as the sentence saying it cannot see it, with nothing read.
  */
-export async function callQueuedModel(env: ModelEnv, job: any, jobId: string): Promise<AnsweredMessage> {
+export async function callQueuedModel(env: ModelEnv, job: any, jobId: string, images?: ImageLoader): Promise<AnsweredMessage> {
   const called = String(job.operatorModel ?? env.HARNESS_MODEL);
   const provider = job.operatorModel ? String(job.operatorProvider ?? DEFAULT_PROVIDER) : DEFAULT_PROVIDER;
   const request = operatorRequest(operatorModelOf(env), { provider, model: called });
+  const sees = acceptsImages(called);
+  const context = sees ? await resolveImages(job.context, images, imageWindowOf(env)) : job.context;
   let call: () => Promise<ModelResponse>;
   if (usesResponses(called)) {
-    const { input, tools } = toResponsesInput(job.context, called);
+    const toolImages = env.RESPONSES_TOOL_IMAGES === "user" ? "user" as const : "output" as const;
+    const { input, tools } = toResponsesInput(context, called, { images: sees, toolImages });
     const model = new OpenAiResponsesModel(request);
     call = () => model.complete(input, tools ? { tools } : {});
   } else {
     const model = new OpenAiCompatibleModel(request);
-    const { messages, tools } = toRequest(job.context);
+    const { messages, tools } = toRequest(context, { images: sees });
     call = () => model.complete(messages, tools ? { tools } : {});
   }
   const identity = {

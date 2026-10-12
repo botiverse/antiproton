@@ -33,6 +33,7 @@ import { createProvider, type Provider } from "pi-ai-1/models";
 import { createAssistantMessageEventStream, type AssistantMessageEventStream } from "pi-ai-1/utils/event-stream";
 import { getSystemMessageText, renderSystemMessageUpdate } from "pi-ai-1/utils/text";
 import { getCurrentTools } from "pi-ai-1/utils/transcript";
+import { acceptsImages } from "./context-windows.ts";
 import { JOB_WIRE_V2, type InlineSystemMessage, type JobContextV2 } from "./pi-bridge.ts";
 
 /**
@@ -187,7 +188,8 @@ export function durableOffloadedProvider(opts: {
     provider: opts.id,
     baseUrl,
     reasoning: d.reasoning ?? false,
-    input: ["text"],
+    // As in src/model/pi-offloaded.ts: what pi is told, while the consumer decides what the provider is shown.
+    input: acceptsImages(d.id) ? ["text", "image"] : ["text"],
     cost: d.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: d.contextWindow,
     maxTokens: d.maxTokens ?? 8192,

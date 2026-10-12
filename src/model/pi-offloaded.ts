@@ -19,6 +19,7 @@
  * with the same handle again while it is still out.
  */
 import { createProvider, createAssistantMessageEventStream } from "@earendil-works/pi-ai";
+import { acceptsImages } from "./context-windows.ts";
 import type {
   AssistantMessage, AssistantMessageEventStream, Context, DeferredHandle, Model, Provider,
   SimpleStreamOptions, StreamOptions, Usage,
@@ -138,7 +139,9 @@ export function offloadedProvider(opts: {
     provider: opts.id,
     baseUrl: opts.baseUrl ?? "https://offloaded.invalid",
     reasoning: d.reasoning ?? false,
-    input: ["text"] as ("text" | "image")[],
+    // What pi is told the model takes; the request itself is built by the consumer for the model it calls
+    // (src/model/pi-bridge.ts), which shows an image only to a model that can see one.
+    input: (acceptsImages(d.id) ? ["text", "image"] : ["text"]) as ("text" | "image")[],
     cost: d.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: d.contextWindow,
     maxTokens: d.maxTokens ?? 8192,
