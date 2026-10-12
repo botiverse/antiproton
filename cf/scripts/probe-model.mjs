@@ -8,21 +8,26 @@
 //   AI_GATEWAY_TOKEN=… node cf/scripts/probe-model.mjs claude-haiku-5-5 --binding    # also preserved thinking (below)
 //   options: --route anthropic (the default: <gateway>/anthropic/v1/messages, Anthropic's protocol)
 //            --route compat    (<gateway>/compat/chat/completions; give the model as vendor/model)
-//            --config cf/wrangler.preview.jsonc   (whose gateway; cf/wrangler.jsonc by default)
+//            --config cf/wrangler.jsonc   (whose gateway; the preview deployment's, cf/wrangler.preview.jsonc, by default)
 //
-// `--binding` (anthropic route): a turn whose answer has thinking between its tool calls is sent back as it came, with
-// the `thinking-binding-controls-2026-08-01` beta header, to check that preserved thinking accepts the verbatim replay
-// (src/model/pi-bridge.ts `toAnthropicRequest`). It passes when the second call is a 200; the model may not think on a
-// call this small, which the line says (`thinking` blocks returned).
+// `--binding` (anthropic route; a model with adaptive thinking): a turn whose answer has thinking blocks is written to a
+// transcript and sent back through this branch's own `fromResponse` and `toAnthropicRequest`, with
+// `thinking.block_binding.prefix_mismatch_behavior: "error"` and the `thinking-binding-controls-2026-08-01` beta, which
+// opts the request into preserved thinking's check whatever the account's default. It passes when that replay is a 200
+// with nothing transformed AND the same replay with an earlier message edited is refused (400, "bound to a different
+// conversation"): the edit is the control that shows the check ran. A model that wrote no thinking block has nothing to
+// bind, and the line says `inconclusive`.
 //
 // This spends a few cents on the gateway's account. It calls no agent and touches no object.
 import { readFileSync } from "node:fs";
 import { deflateSync } from "node:zlib";
+import { fromResponse, toAnthropicRequest } from "../../src/model/pi-bridge.ts";
+import { readMessage } from "../../src/model/anthropic-messages.ts";
 
 const args = process.argv.slice(2);
 const flag = (name) => { const i = args.indexOf(name); return i < 0 ? undefined : args.splice(i, 2)[1]; };
 const route = flag("--route") ?? "anthropic";
-const config = flag("--config") ?? "cf/wrangler.jsonc";
+const config = flag("--config") ?? "cf/wrangler.preview.jsonc";
 const binding = args.includes("--binding");
 const model = args.find((a) => !a.startsWith("--"));
 const token = process.env.AI_GATEWAY_TOKEN;
@@ -121,16 +126,43 @@ if (route === "anthropic") {
   report("cache read", c2, c2.status === 200 && (c2.usage?.cacheRead ?? 0) > 0);
 
   if (binding) {
+    // Through this branch's own path: the request `toAnthropicRequest` builds from a transcript, and the transcript
+    // `readMessage` and `fromResponse` write from each answer (src/model/pi-bridge.ts, src/model/anthropic-messages.ts),
+    // so what is proven is that path's replay, not a hand-built one. `prefix_mismatch_behavior: "error"` opts the
+    // request into the check whatever the account's default (an account created before 2026-08-31 is not enforced, and
+    // an edited replay without the field is a 200 that lists `thinking_mismatch_allowed`).
     const beta = { "anthropic-beta": "thinking-binding-controls-2026-08-01" };
-    const q = { role: "user", content: "First decide which of Oslo and Copenhagen has the longer name, then call the tool for each city, one call at a time." };
-    // The answer exactly as it came, every block in order, then a result for each call.
-    const res = await fetch(url, { method: "POST", headers: { ...headers, ...beta }, body: JSON.stringify(A.body({ max_tokens: 4096, tools: [A.tool], messages: [q] })) });
-    const raw = res.ok ? await res.json() : { content: [] };
-    const calls = (raw.content ?? []).filter((c) => c.type === "tool_use");
-    const b2 = calls.length ? await call(A.body({ max_tokens: 4096, tools: [A.tool], messages: [q, { role: "assistant", content: raw.content },
-      { role: "user", content: calls.map((c) => ({ type: "tool_result", tool_use_id: c.id, content: "{\"tempC\":11}" })) }] }), beta) : { status: res.status, usage: null };
-    report("preserved thinking: verbatim replay", b2, res.status === 200 && b2.status === 200,
-      { thinking: (raw.content ?? []).filter((c) => c.type === "thinking" || c.type === "redacted_thinking").length, blocks: (raw.content ?? []).map((c) => c.type) });
+    const thinking = { type: "adaptive", block_binding: { prefix_mismatch_behavior: "error" } };
+    const send = async (context) => {
+      const req = toAnthropicRequest(context, model);
+      const res = await fetch(url, { method: "POST", headers: { ...headers, ...beta },
+        body: JSON.stringify(A.body({ max_tokens: 8192, thinking, output_config: { effort: "high" }, ...req })) });
+      let j = {};
+      try { j = await res.json(); } catch { /* status says enough */ }
+      return { status: res.status, j };
+    };
+    const tool = { name: "get_weather", description: A.tool.description, parameters: A.tool.input_schema };
+    const question = "Work out, step by step, which of Oslo, Copenhagen and Reykjavik has the most letters and which the fewest; " +
+      "then call get_weather for those two cities, one call at a time.";
+    const context = { systemPrompt: "You are careful.", tools: [tool], messages: [{ role: "user", content: question, timestamp: 1 }] };
+    const first = await send(context);
+    const answer = first.status === 200 ? fromResponse(readMessage(first.j), { api: "offloaded", provider: "probe", id: model }, "probe") : null;
+    const calls = (answer?.content ?? []).filter((c) => c.type === "toolCall");
+    const thought = (answer?.content ?? []).filter((c) => c.type === "thinking" && c.thinkingSignature).length;
+    const replay = { ...context, messages: [...context.messages, answer, ...calls.map((c) => ({
+      role: "toolResult", toolCallId: c.id, toolName: c.name, content: [{ type: "text", text: "{\"tempC\":11}" }], isError: false, timestamp: 3 }))] };
+    const honest = calls.length ? await send(replay) : { status: 0, j: {} };
+    // The negative control: the same replay with an earlier message edited. The check must refuse it, or it proved nothing.
+    const edited = { ...replay, messages: [{ ...replay.messages[0], content: `${question} (edited)` }, ...replay.messages.slice(1)] };
+    const refused = calls.length ? await send(edited) : { status: 0, j: {} };
+    const boundElsewhere = /bound to a different conversation/.test(String(refused.j?.error?.message ?? ""));
+    const transformed = honest.j?.input_transformations ?? null;
+    report("preserved thinking: honest replay accepted, edited replay refused", { status: honest.status, usage: honest.j?.usage ?? null },
+      first.status === 200 && thought > 0 && calls.length > 0 && honest.status === 200 && Array.isArray(transformed) && transformed.length === 0
+        && refused.status === 400 && boundElsewhere,
+      { first: first.status, ...(first.status !== 200 ? { firstError: String(first.j?.error?.message ?? "").slice(0, 120) } : {}), thinkingBlocks: thought, calls: calls.length, blocks: (answer?.content ?? []).map((c) => c.type),
+        inputTransformations: transformed, editedStatus: refused.status, editedBoundElsewhere: boundElsewhere,
+        ...(thought === 0 ? { inconclusive: "the model wrote no thinking block, so there was nothing to bind" } : {}) });
   }
 } else {
   const t = await call(C.body({ messages: [{ role: "user", content: "Say hello in three words." }] }));

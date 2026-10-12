@@ -6,7 +6,7 @@
  * Claude Haiku 5.5 in its lower price tier.
  */
 import { callQueuedModel } from "../cf/src/model-request.ts";
-import { ANTHROPIC_VERSION, readMessage } from "../src/model/anthropic-messages.ts";
+import { ANTHROPIC_VERSION, AnthropicMessagesModel, BINDING_BETA, BINDING_MODELS, readMessage } from "../src/model/anthropic-messages.ts";
 import { CACHE_BREAKPOINT, EMPTY_INPUT, FAILED_ANSWER, fromResponse, toAnthropicRequest, toRequest } from "../src/model/pi-bridge.ts";
 import { overflowKind } from "../src/runtime/overflow-backstop.ts";
 import { acceptsImages } from "../src/model/context-windows.ts";
@@ -341,9 +341,23 @@ await check("the queue consumer calls <baseUrl>/v1/messages with the gateway tok
   must(a!.url === `${GW}/anthropic/v1/messages` && b!.url === a!.url, a!.url);
   must(a!.headers["cf-aig-authorization"] === "Bearer gateway-token-value" && a!.headers["anthropic-version"] === ANTHROPIC_VERSION
     && !("authorization" in a!.headers) && !("x-api-key" in a!.headers), `headers: ${show(Object.keys(a!.headers))}`);
-  must(a!.body.model === HAIKU && a!.body.max_tokens === 32768 && !("temperature" in a!.body) && !("thinking" in a!.body) && !("stream" in a!.body), show(a!.body));
+  must(a!.body.model === HAIKU && a!.body.max_tokens === 32768 && !("temperature" in a!.body) && !("stream" in a!.body), show(a!.body));
+  // Preserved thinking: a block whose earlier conversation changed is dropped, never a 400, with the beta that allows it.
+  must(show(a!.body.thinking) === show({ type: "adaptive", block_binding: { prefix_mismatch_behavior: "drop_block" } })
+    && a!.headers["anthropic-beta"] === BINDING_BETA, `binding: ${show(a!.body.thinking)} ${a!.headers["anthropic-beta"]}`);
   must(show(b!.body.messages[1].content) === show([THINKING, { type: "tool_use", id: "toolu_1", name: "kv__get", input: { key: "x" } }]), show(b!.body.messages[1]));
   must(show(b!.body.messages.slice(0, 1)) === show(a!.body.messages.slice(0, 1).map((m: any) => m)), "the first message moved between calls");
+});
+
+await check("a model without adaptive thinking is sent no binding and no beta; reasoning off sends thinking disabled, never a binding", async () => {
+  const reply = { body: { content: [{ type: "text", text: "ok" }], stop_reason: "end_turn", usage: { input_tokens: 1, output_tokens: 1 } } };
+  const p = provider([reply, reply]);
+  const ctx = { systemPrompt: "S", messages: [{ role: "user", content: "hi", timestamp: 1 }] };
+  await withFetch(p.fetch, () => callQueuedModel(ENV, { ...job(ctx), operatorModel: "claude-haiku-4-5" }, "mj_b"));
+  must(!("thinking" in p.seen[0]!.body) && !("anthropic-beta" in p.seen[0]!.headers), show(p.seen[0]));
+  must(BINDING_MODELS.has(HAIKU) && !BINDING_MODELS.has("claude-haiku-4-5"), "the list");
+  await withFetch(p.fetch, () => new AnthropicMessagesModel({ baseUrl: `${GW}/anthropic`, apiKey: "", model: HAIKU }).complete({ messages: [] }, { reasoning: "off" }));
+  must(show(p.seen[1]!.body.thinking) === show({ type: "disabled" }) && !("anthropic-beta" in p.seen[1]!.headers), show(p.seen[1]));
 });
 
 await check("a refusal through the gateway is the turn's error, with the hint that an unknown model also answers 401", async () => {

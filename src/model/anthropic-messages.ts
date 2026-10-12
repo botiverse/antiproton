@@ -15,9 +15,19 @@
  * client's where it already decided (src/model/openai-compatible.ts):
  * - the conversation and its cache breakpoints are `toAnthropicRequest`'s (src/model/pi-bridge.ts);
  * - the output cap is the chat client's 32768 (`max_tokens` is required here);
- * - no `thinking` and no `temperature` unless asked: the model thinks at its own default, as DeepSeek and the
- *   Responses client's models do. `reasoning: "off"` sends `thinking: { type: "disabled" }`, a level sends it as
- *   `output_config.effort`; a model that refuses either says so in its 400, which reaches the turn;
+ * - no `temperature`, and thinking at the model's own default, as DeepSeek and the Responses client's models think:
+ *   `reasoning: "off"` sends `thinking: { type: "disabled" }`, a level sends it as `output_config.effort`; a model
+ *   that refuses either says so in its 400, which reaches the turn;
+ * - for a model with preserved thinking (`BINDING_MODELS`), `thinking: { type: "adaptive", block_binding:
+ *   { prefix_mismatch_behavior: "drop_block" } }` and the `thinking-binding-controls-2026-08-01` beta header: should
+ *   the account ever enforce the check, a thinking block whose earlier conversation changed is dropped rather than
+ *   failing the call with a 400 on every later request. This conversation's earlier messages do change on purpose:
+ *   the image window moves (#857, src/model/images.ts `resolveImages`) and an image that cannot be read becomes a
+ *   note. Adaptive is these models' default thinking, so naming it changes nothing else. Through the gateway the
+ *   header and the field reach Anthropic: without the header the field was refused ("Extra inputs are not
+ *   permitted"), with it claude-sonnet-5-5 and claude-opus-5-5 answered 200 with `input_transformations` (measured
+ *   2026-10-12); a model with no adaptive thinking refuses it (claude-haiku-4-5: "adaptive thinking is not supported
+ *   on this model"), so the field is sent only for the models listed;
  * - not streamed, as no client here streams; the whole call stays under MODEL_CALL_DEADLINE_MS.
  *
  * Usage is read into the fields the other clients fill, with their meaning: `promptTokens` is the WHOLE prompt.
@@ -31,6 +41,14 @@ import type { ModelResponse } from "./types.ts";
 
 /** The Messages API version header every request carries. */
 export const ANTHROPIC_VERSION = "2023-06-01";
+
+/**
+ * Models with preserved thinking and adaptive thinking, sent `block_binding: drop_block` (above). claude-haiku-5-5 is
+ * listed from Anthropic's models overview (adaptive thinking); the gateway does not route it yet, so its own call is a
+ * merge condition (cf/scripts/probe-model.mjs --binding).
+ */
+export const BINDING_MODELS: ReadonlySet<string> = new Set(["claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5"]);
+export const BINDING_BETA = "thinking-binding-controls-2026-08-01";
 
 /** The output cap, the chat client's (src/model/openai-compatible.ts says why that number). */
 const MAX_OUTPUT_TOKENS = 32_768;
@@ -59,6 +77,7 @@ export class AnthropicMessagesModel {
     request: { system?: Array<Record<string, unknown>>; messages: AnthropicMessage[]; tools?: Array<Record<string, unknown>> },
     opts: { reasoning?: "off" | "low" | "high"; maxTokens?: number } = {},
   ): Promise<ModelResponse> {
+    const binds = BINDING_MODELS.has(this.#model) && opts.reasoning !== "off";
     const body = JSON.stringify({
       model: this.#model,
       max_tokens: opts.maxTokens ?? MAX_OUTPUT_TOKENS,
@@ -66,12 +85,13 @@ export class AnthropicMessagesModel {
       messages: request.messages,
       ...(request.tools?.length ? { tools: request.tools } : {}),
       ...(opts.reasoning === "off" ? { thinking: { type: "disabled" } }
-        : opts.reasoning ? { output_config: { effort: opts.reasoning } } : {}),
+        : binds ? { thinking: { type: "adaptive", block_binding: { prefix_mismatch_behavior: "drop_block" } } } : {}),
+      ...(opts.reasoning && opts.reasoning !== "off" ? { output_config: { effort: opts.reasoning } } : {}),
     });
     return postModelRequest(
       {
         url: `${this.#baseUrl}/v1/messages`, apiKey: this.#apiKey, model: this.#model, deadlineMs: this.#deadlineMs,
-        headers: { ...this.#headers, "anthropic-version": ANTHROPIC_VERSION },
+        headers: { ...this.#headers, "anthropic-version": ANTHROPIC_VERSION, ...(binds ? { "anthropic-beta": BINDING_BETA } : {}) },
         // No vendor key is sent, so the gateway supplies its own; an id it does not know comes back 401 then. Measured
         // 2026-10-12: claude-haiku-5-5 and a made-up claude-nonexistent-9 both answered 401 "x-api-key header is
         // required" through /anthropic while claude-sonnet-5-5 answered 200, so the hint says to check the name.
