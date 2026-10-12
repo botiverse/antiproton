@@ -396,7 +396,9 @@ check is a sentence saying which. It is the harness's field: it is taken off
 before the size decision, so it never makes a result parked, and the model
 reads the rest of the result as JSON with a line about the image after it
 (`src/runtime/tool-view.ts`). Base64 in a result is a megabyte in the
-operations row and in every later request of the conversation.
+operations row and in every later request of the conversation. Only a call's
+result (or a resumed question's) is read for `view`: a backgrounded job's result
+reaches the model as a message, and a `view` in it is shown as plain JSON.
 
 **Work that outlives one call is backgrounded.** Return
 `backgrounded(handle, note)` from `invoke`, and declare `background: { poll,

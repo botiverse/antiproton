@@ -2093,8 +2093,9 @@ export class AgentRuntime {
     return {
       // A result's `view` (src/runtime/tool-view.ts): asked of the binding when a result carries one, so a model
       // switched mid-conversation is the one asked about, and stored under this agent's own prefix.
-      seesImages: async () => acceptsImages((await store.getModelBinding(ctx.tenantId, ctx.agentId))?.model),
+      seesImages: async () => acceptsImages(this.#calledModel(await store.getModelBinding(ctx.tenantId, ctx.agentId))),
       attachImage: (v: ViewMarker) => attachViewImage(v, { tenantId: ctx.tenantId, agentId: ctx.agentId }, {
+        size: async (k) => (await this.#deps.bucket.head(k))?.size ?? null,
         get: (k) => artifacts.get(k),
         put: (k, b) => artifacts.put(k, b),
       }),
@@ -4263,6 +4264,15 @@ export class AgentRuntime {
     const b = await this.store.getModelBinding(tenantId, agentId);
     const provider = b ? providerOfRef(b.secretRef) : null;
     return { ...job, operatorModel: provider ? b!.model : null, operatorProvider: provider };
+  }
+
+  /**
+   * The model a queued call for this binding runs on, as `takeJob` above hands it to `callQueuedModel`: the binding's
+   * own when it spends the operator's account, else the deployment's default (HARNESS_MODEL), which is what an agent
+   * with its own credential runs on. Asked, rather than the binding's model, by whatever must agree with the call.
+   */
+  #calledModel(b: { model: string; secretRef: string } | null): string | undefined {
+    return b && providerOfRef(b.secretRef) !== null ? b.model : this.#deps.operatorModel?.model;
   }
 
   /** A taker's failed call gives its take back (`AgentEngine.releaseJob`); false where nothing was held. */

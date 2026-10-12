@@ -6,7 +6,7 @@ import { OpenAiResponsesModel, usesResponses } from "../../src/model/openai-resp
 import { errorMessage, fromResponse, toRequest, toResponsesInput, type AnsweredMessage } from "../../src/model/pi-bridge.ts";
 import type { ModelResponse } from "../../src/model/types.ts";
 import { acceptsImages } from "../../src/model/context-windows.ts";
-import { resolveImages, type ImageLoader } from "../../src/model/images.ts";
+import { DEFAULT_IMAGE_WINDOW, imageKey, resolveImages, type ImageLoader, type ImageWindow } from "../../src/model/images.ts";
 import { logEvent } from "../../src/core/log.ts";
 
 /**
@@ -22,7 +22,31 @@ export type ModelEnv = {
    * gateway (2026-10-12); this is the switch if one of them stops being accepted.
    */
   RESPONSES_TOOL_IMAGES?: string;
+  /** How many images, and how many bytes of them, one request carries, newest first (`ImageWindow`, src/model/images.ts). */
+  MODEL_IMAGES_MAX?: string;
+  MODEL_IMAGES_MAX_BYTES?: string;
 };
+
+/** The image window from the environment: each var a positive whole number, else the default. */
+export function imageWindowOf(env: ModelEnv): ImageWindow {
+  const n = (v: unknown, d: number) => { const x = Number(v); return Number.isSafeInteger(x) && x > 0 ? x : d; };
+  return { maxImages: n(env.MODEL_IMAGES_MAX, DEFAULT_IMAGE_WINDOW.maxImages), maxBytes: n(env.MODEL_IMAGES_MAX_BYTES, DEFAULT_IMAGE_WINDOW.maxBytes) };
+}
+
+/**
+ * The queue consumer's image loader for one queued call: the bucket read under the queue message's own tenant and
+ * agent, with the same key the tool host stored it under (`imageKey`, through `attachViewImage` in
+ * src/runtime/tool-view.ts), so a job can only ever reach its own agent's images.
+ */
+export function imageLoaderFor(
+  bucket: { get(key: string): Promise<{ arrayBuffer(): Promise<ArrayBuffer> } | null> },
+  owner: { tenantId: string; agentId: string },
+): ImageLoader {
+  return async (sha) => {
+    const o = await bucket.get(imageKey(owner, sha));
+    return o ? new Uint8Array(await o.arrayBuffer()) : null;
+  };
+}
 
 /** The deployment's operator model, read from its environment (src/model/operator-request.ts says how it is called). */
 export function operatorModelOf(env: ModelEnv): OperatorModel {
@@ -124,15 +148,16 @@ export function planBinding(
  * The job's own options are not forwarded on either path: the reasoning level is each client's default.
  *
  * An image in the conversation is stored as a reference (src/model/images.ts); for a model that can see images
- * (`acceptsImages`) each one is read through `images` — the agent's own R2 prefix, in the Worker — right before the
- * call, and for any other model it is sent as the sentence saying it cannot see it, with nothing read.
+ * (`acceptsImages`) the newest ones, within the image window (`imageWindowOf`), are read through `images` — the
+ * agent's own R2 prefix, in the Worker (`imageLoaderFor`) — right before the call, and older ones are sent as a note;
+ * for any other model each is sent as the sentence saying it cannot see it, with nothing read.
  */
 export async function callQueuedModel(env: ModelEnv, job: any, jobId: string, images?: ImageLoader): Promise<AnsweredMessage> {
   const called = String(job.operatorModel ?? env.HARNESS_MODEL);
   const provider = job.operatorModel ? String(job.operatorProvider ?? DEFAULT_PROVIDER) : DEFAULT_PROVIDER;
   const request = operatorRequest(operatorModelOf(env), { provider, model: called });
   const sees = acceptsImages(called);
-  const context = sees ? await resolveImages(job.context, images) : job.context;
+  const context = sees ? await resolveImages(job.context, images, imageWindowOf(env)) : job.context;
   let call: () => Promise<ModelResponse>;
   if (usesResponses(called)) {
     const toolImages = env.RESPONSES_TOOL_IMAGES === "user" ? "user" as const : "output" as const;

@@ -40,7 +40,6 @@ import {
 import { readMeter } from "../../bench/meter.ts";
 import { BENCH_SWE_WITHHELD } from "../../bench/swebench/withheld.ts";
 import { contextWindowFor } from "../../src/model/context-windows.ts";
-import { imageKey } from "../../src/model/images.ts";
 import { rebuildPolicyOf } from "../../src/runtime/rebuild.ts";
 import { errorMessage } from "../../src/model/pi-bridge.ts";
 import { entriesToEvents } from "./pi-view.ts";
@@ -110,7 +109,7 @@ import { hasPendingInbound, inboundStatus, lowerHeaders, newHookId, readCapped }
 import { forgetHookRoute, routeHook, type HookRoute, type RouteSource } from "./hook-route.ts";
 import { HTMX_SRC, staticAsset } from "./static.ts";
 import { clip, logEvent, routeOf, setLogSink } from "../../src/core/log.ts";
-import { callQueuedModel, operatorModelOf, planBinding, resolveModel } from "./model-request.ts";
+import { callQueuedModel, imageLoaderFor, operatorModelOf, planBinding, resolveModel } from "./model-request.ts";
 import { userModelsFrom } from "../../src/model/user-models.ts";
 import { DEFAULT_PROVIDER, providerStatus, type ModelChoice } from "../../src/model/providers.ts";
 import { consumeModelCalls, isUnknownJobReply, replyingUnknownJob, type ModelQueueDeps, type QueuedModelCall, type UnknownJobReply } from "./model-queue.ts";
@@ -311,10 +310,7 @@ function modelQueueDeps(env: Env): ModelQueueDeps {
     stub: (m) => env.AGENT.get(env.AGENT.idFromString(m.doId)),
     // An image the conversation holds is read from the agent's own prefix, named by the message's tenant and agent
     // (src/model/images.ts `imageKey`), so a job can only ever reach its own agent's images.
-    call: (taken, m) => callQueuedModel(env, taken, m.jobId, async (sha) => {
-      const o = await env.ARTIFACTS.get(imageKey({ tenantId: m.tenantId, agentId: m.agentId }, sha));
-      return o ? new Uint8Array(await o.arrayBuffer()) : null;
-    }),
+    call: (taken, m) => callQueuedModel(env, taken, m.jobId, imageLoaderFor(env.ARTIFACTS, { tenantId: m.tenantId, agentId: m.agentId })),
     // A given-up call is still this job's answer, so the entry it becomes names
     // the job like any other (see `jobId` on fromResponse).
     givenUp: (m) => ({

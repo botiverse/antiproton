@@ -130,44 +130,84 @@ export function imageProblem(bytes: Uint8Array, mimeType: string): string | null
 /** Reads the bytes stored for an image hash, or null when there are none. */
 export type ImageLoader = (sha256: string) => Promise<Uint8Array | null>;
 
+/**
+ * How many images one request carries, newest first: at most `maxImages`, and at most `maxBytes` of them raw. Every
+ * image in the conversation is sent again on every later call, so without a bound the request and the consumer's heap
+ * grow with each one: ten 1.5 MiB images are a 20 MB request and about 40 MB of heap, and some twenty-five of them
+ * would exhaust a Worker's 128 MB on every later call, retries included, long before a million-token window compacts.
+ */
+export interface ImageWindow { maxImages: number; maxBytes: number }
+export const DEFAULT_IMAGE_WINDOW: ImageWindow = { maxImages: 8, maxBytes: 12 * 1024 * 1024 };
+
 /** Whether any user or tool-result message of `context` holds an image reference. */
 export function hasImageRefs(context: { messages?: readonly unknown[] }): boolean {
   return (context.messages ?? []).some((m: any) => Array.isArray(m?.content) && m.content.some((c: any) => c?.type === "image" && imageRefHash(c.data) !== null));
 }
 
+/** What an image outside the window is sent as. */
+export const omittedImageText = (mimeType: unknown, sha256: string) =>
+  `[earlier image omitted: ${String(mimeType)} ${sha256.slice(0, 8)}; view it again if it is needed]`;
+
 /**
- * `context` with each image reference replaced by its bytes as base64, for the provider call. Each distinct image is
- * read once. One that cannot be read, or whose bytes no longer hash to the reference, becomes a text block saying so:
- * the conversation goes on, rather than a job that fails on every retry for an image that will not come back. A
- * context with no reference is returned as it is.
+ * `context` with image references replaced, for the provider call, decided here at the call so the stored history
+ * stays as it was written:
+ *
+ * - The newest images, within `window`, become their bytes as base64. They are taken newest first and the window
+ *   stops at the first image that does not fit, so it is always a run of the latest images, and an image that has
+ *   fallen out of it stays out: a later image only moves the window forward. The provider's cached prefix (which
+ *   holds image bytes) therefore changes at most once for each image that leaves, at the image that leaves.
+ * - Every older one becomes a short note naming it (`omittedImageText`); its bytes are never read, so the consumer
+ *   holds at most the window and one image more.
+ * - One that cannot be read, or whose bytes no longer hash to the reference, becomes a text block saying so: the
+ *   conversation goes on, rather than a job that fails on every retry for an image that will not come back. It takes
+ *   no room in the window.
+ *
+ * A context with no reference is returned as it is.
  */
-export async function resolveImages<C extends { messages?: readonly unknown[] }>(context: C, load: ImageLoader | undefined): Promise<C> {
+export async function resolveImages<C extends { messages?: readonly unknown[] }>(
+  context: C, load: ImageLoader | undefined, window: ImageWindow = DEFAULT_IMAGE_WINDOW,
+): Promise<C> {
   if (!hasImageRefs(context)) return context;
-  const cache = new Map<string, Promise<{ data: string } | { problem: string }>>();
-  const fetchOne = (sha: string) => {
-    let p = cache.get(sha);
-    if (!p) {
-      p = (async () => {
-        if (!load) return { problem: "no image store is reachable here" };
-        let bytes: Uint8Array | null;
-        try { bytes = await load(sha); } catch (e) { return { problem: `reading it failed (${String((e as Error)?.message ?? e).slice(0, 120)})` }; }
-        if (!bytes) return { problem: "it is no longer stored" };
-        if (sha256Hex(bytes) !== sha) return { problem: "the stored bytes no longer match it" };
-        return { data: Buffer.from(bytes).toString("base64") };
-      })();
-      cache.set(sha, p);
+  const messages = (context.messages ?? []).map((m: any) => Array.isArray(m?.content) ? { ...m, content: [...m.content] } : m);
+  const read = new Map<string, { bytes: Uint8Array } | { problem: string }>();
+  const fetchOne = async (sha: string): Promise<{ bytes: Uint8Array } | { problem: string }> => {
+    const known = read.get(sha);
+    if (known) return known;
+    let got: { bytes: Uint8Array } | { problem: string };
+    if (!load) got = { problem: "no image store is reachable here" };
+    else {
+      let bytes: Uint8Array | null = null;
+      try { bytes = await load(sha); } catch (e) { got = { problem: `reading it failed (${String((e as Error)?.message ?? e).slice(0, 120)})` }; }
+      got ??= !bytes ? { problem: "it is no longer stored" }
+        : sha256Hex(bytes) !== sha ? { problem: "the stored bytes no longer match it" } : { bytes };
     }
-    return p;
+    read.set(sha, got);
+    return got;
   };
-  const messages = await Promise.all((context.messages ?? []).map(async (m: any) => {
-    if (!Array.isArray(m?.content) || !m.content.some((c: any) => c?.type === "image" && imageRefHash(c.data) !== null)) return m;
-    const content = await Promise.all(m.content.map(async (c: any) => {
+  const encoded = new Map<string, string>();
+  let images = 0, bytes = 0, full = false;
+  for (let mi = messages.length - 1; mi >= 0; mi--) {
+    const m = messages[mi];
+    if (!Array.isArray(m?.content)) continue;
+    for (let ci = m.content.length - 1; ci >= 0; ci--) {
+      const c = m.content[ci];
       const sha = c?.type === "image" ? imageRefHash(c.data) : null;
-      if (sha === null) return c;
+      if (sha === null) continue;
+      if (!full && images >= window.maxImages) full = true;
+      if (full) { m.content[ci] = { type: "text", text: omittedImageText(c.mimeType, sha) }; continue; }
       const got = await fetchOne(sha);
-      return "data" in got ? { ...c, data: got.data } : { type: "text", text: `(an image could not be loaded: ${got.problem})` };
-    }));
-    return { ...m, content };
-  }));
+      if ("problem" in got) { m.content[ci] = { type: "text", text: `(an image could not be loaded: ${got.problem})` }; continue; }
+      if (bytes + got.bytes.byteLength > window.maxBytes) {
+        full = true;
+        m.content[ci] = { type: "text", text: omittedImageText(c.mimeType, sha) };
+        continue;
+      }
+      images++;
+      bytes += got.bytes.byteLength;
+      let data = encoded.get(sha);
+      if (data === undefined) { data = Buffer.from(got.bytes).toString("base64"); encoded.set(sha, data); }
+      m.content[ci] = { ...c, data };
+    }
+  }
   return { ...context, messages };
 }

@@ -120,6 +120,8 @@ export async function viewContent(view: unknown, shown: unknown, host: ViewHost)
 
 /** Where an image's bytes are read from and stored to: the agent's artifacts (`R2Artifacts`' surface). */
 export interface ImageStore {
+  /** The stored size without reading the object (R2's `head`), or null when there is none. Asked before `get`. */
+  size(key: string): Promise<number | null>;
   get(key: string): Promise<Uint8Array>;
   put(key: string, body: Uint8Array): Promise<unknown>;
 }
@@ -132,6 +134,11 @@ export interface ImageStore {
 export async function attachViewImage(view: ViewMarker, owner: RefOwner, store: ImageStore): Promise<string> {
   const key = keyForRef(view.ref, owner);
   if (key === null) throw new Error("the reference is not readable by this agent");
+  // The size first, from the object's metadata: the marker's `bytes` is within the cap (`parseView`), so a stored
+  // object that is larger is refused before a byte of it is read.
+  const size = await store.size(key);
+  if (size === null) throw new Error("no such artifact");
+  if (size !== view.bytes) throw new Error(`the artifact is ${size} bytes, not ${view.bytes} as the result says`);
   const bytes = await store.get(key);
   if (bytes.byteLength !== view.bytes) throw new Error(`the artifact is ${bytes.byteLength} bytes, not ${view.bytes} as the result says`);
   const problem = imageProblem(bytes, view.mimeType);

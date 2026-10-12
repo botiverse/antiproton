@@ -16,14 +16,14 @@
  */
 import { Buffer } from "node:buffer";
 import { AgentRuntime } from "../cf/src/runtime.ts";
-import { callQueuedModel, operatorModelOf, type ModelEnv } from "../cf/src/model-request.ts";
+import { callQueuedModel, imageLoaderFor, imageWindowOf, operatorModelOf, type ModelEnv } from "../cf/src/model-request.ts";
 import { fromResponse, toRequest, toResponsesInput } from "../src/model/pi-bridge.ts";
 import {
-  IMAGE_REF_PREFIX, MAX_IMAGE_BYTES, MAX_IMAGE_SIDE, NO_VISION_SENTENCE, imageProblem, imageKey, imageRef, imageRefHash, resolveImages, sha256Hex, sniffImage,
+  DEFAULT_IMAGE_WINDOW, IMAGE_REF_PREFIX, MAX_IMAGE_BYTES, omittedImageText, MAX_IMAGE_SIDE, NO_VISION_SENTENCE, imageProblem, imageKey, imageRef, imageRefHash, resolveImages, sha256Hex, sniffImage,
 } from "../src/model/images.ts";
 import { acceptsImages } from "../src/model/context-windows.ts";
 import type { ModelResponse } from "../src/model/types.ts";
-import type { Plugin } from "../src/plugins/types.ts";
+import { interrupt, type Plugin } from "../src/plugins/types.ts";
 import { attachViewImage, parseView, splitView, viewContent, withView, type ViewMarker } from "../src/runtime/tool-view.ts";
 import { ApStore } from "../src/store/ap-store.ts";
 import { prefixedNamespace } from "../src/store/sql-namespace.ts";
@@ -78,10 +78,12 @@ function memoryBucket() {
       return {};
     },
     async get(key: string) {
+      this.gets.push(key);
       const b = objects.get(key);
       return b ? { arrayBuffer: async () => b.slice().buffer } : null;
     },
-    async head(key: string) { return objects.has(key) ? {} : null; },
+    heads: [] as string[], gets: [] as string[],
+    async head(key: string) { this.heads.push(key); const b = objects.get(key); return b ? { size: b.byteLength } : null; },
     async list() { return { objects: [], truncated: false }; },
     async delete(key: string) { objects.delete(key); },
   };
@@ -136,7 +138,11 @@ await check("sniffImage reads type and size from the bytes themselves", () => {
 await check("attachViewImage reads under the caller's scope, checks the bytes, and stores them once under their hash", async () => {
   const bucket = memoryBucket();
   bucket.objects.set("t/t/a/uploads/chart.png", IMG);
-  const store = { get: async (k: string) => { const o = await bucket.get(k); if (!o) throw new Error("no such artifact"); return new Uint8Array(await o.arrayBuffer()); }, put: (k: string, b: Uint8Array) => bucket.put(k, b) };
+  const store = {
+    size: async (k: string) => (await bucket.head(k))?.size ?? null,
+    get: async (k: string) => { const o = await bucket.get(k); if (!o) throw new Error("no such artifact"); return new Uint8Array(await o.arrayBuffer()); },
+    put: (k: string, b: Uint8Array) => bucket.put(k, b),
+  };
   const ref = await attachViewImage(VIEW, OWNER, store);
   must(ref === imageRef(IMG_SHA) && imageRefHash(ref) === IMG_SHA, `ref ${ref}`);
   must(show(bucket.puts) === show([`t/t/a/model-images/${IMG_SHA}`]) && Buffer.from(bucket.objects.get(imageKey(OWNER, IMG_SHA))!).equals(Buffer.from(IMG)), `stored ${show(bucket.puts)}`);
@@ -332,6 +338,7 @@ function raftView(body: Uint8Array, mimeType: string, width: number, height: num
     view: { ref, mimeType, width, height, bytes: body.byteLength } };
   const objects = new Map([[`t/tenant/agent/raft/attachments/att-1/${filename}`, body]]);
   const store = {
+    size: async (k: string) => objects.get(k)?.byteLength ?? null,
     get: async (k: string) => { const b = objects.get(k); if (!b) throw new Error("no such artifact"); return b; },
     put: async (k: string, b: Uint8Array) => { objects.set(k, b); return {}; },
   };
@@ -504,6 +511,110 @@ await check("an image that cannot be read back becomes a sentence in its place, 
   must(await resolveImages(plain, loader({})) === plain, "a context without references was copied");
 });
 
+// ---- the image window -----------------------------------------------------------------------------------------
+
+/** `n` distinct images of `size` bytes, made on demand from their index, and a loader that counts its reads. */
+function manyImages(n: number, size: number) {
+  const make = (i: number) => { const b = new Uint8Array(size); b.fill(i & 255); b[0] = i >> 8; b[1] = i & 255; return b; };
+  const shas = Array.from({ length: n }, (_, i) => sha256Hex(make(i)));
+  const index = new Map(shas.map((h, i) => [h, i]));
+  const reads: string[] = [];
+  const load = async (sha: string) => { reads.push(sha); const i = index.get(sha); return i === undefined ? null : make(i); };
+  // One image per tool result, oldest first, as a long conversation holds them.
+  const context = (k = n) => ({
+    version: 2,
+    messages: shas.slice(0, k).flatMap((h, i) => [
+      { role: "assistant", content: [{ type: "toolCall", id: `c${i}`, name: "show", arguments: {} }] },
+      { role: "toolResult", toolCallId: `c${i}`, toolName: "show", content: [{ type: "text", text: `image ${i}` }, { type: "image", data: imageRef(h), mimeType: "image/png" }], isError: false },
+    ]),
+  });
+  return { shas, reads, load, context };
+}
+const imagesIn = (ctx: { messages: readonly any[] }) => ctx.messages.flatMap((m) => Array.isArray(m.content) ? m.content : [])
+  .filter((c: any) => c.type === "image" || /^\[earlier image omitted|^\(an image could not/.test(c.text ?? ""));
+
+await check("the window: the newest 8 images are sent, each older one is a note naming it, and only the 8 are read", async () => {
+  const m = manyImages(12, 1000);
+  const stored = JSON.stringify(m.context());
+  const out = await resolveImages(m.context(), m.load) as { messages: any[] };
+  const parts = imagesIn(out);
+  must(parts.length === 12, `parts: ${parts.length}`);
+  for (let i = 0; i < 12; i++) {
+    const p = parts[i];
+    if (i < 4) must(p.type === "text" && p.text === omittedImageText("image/png", m.shas[i]!), `image ${i}: ${show(p).slice(0, 120)}`);
+    else must(p.type === "image" && !p.data.startsWith(IMAGE_REF_PREFIX), `image ${i} not sent: ${show(p).slice(0, 120)}`);
+  }
+  must(m.reads.length === 8 && m.reads.every((h) => m.shas.indexOf(h) >= 4), `reads ${m.reads.length}: ${show(m.reads.map((h) => m.shas.indexOf(h)))}`);
+  must(JSON.stringify(m.context()) === stored, "control: the builder is not deterministic");
+  must(DEFAULT_IMAGE_WINDOW.maxImages === 8 && DEFAULT_IMAGE_WINDOW.maxBytes === 12 * 1024 * 1024, show(DEFAULT_IMAGE_WINDOW));
+});
+
+await check("the window's byte budget stops at the first image that does not fit, and nothing older is read", async () => {
+  const m = manyImages(10, 3 * 1024 * 1024);
+  const out = await resolveImages(m.context(), m.load, { maxImages: 8, maxBytes: 12 * 1024 * 1024 }) as { messages: any[] };
+  const sent = imagesIn(out).map((p: any) => p.type);
+  must(show(sent) === show([...Array(6).fill("text"), ...Array(4).fill("image")]), show(sent));
+  // The four that fit and the fifth that did not; the five older ones are never read.
+  must(m.reads.length === 5, `reads ${m.reads.length}`);
+});
+
+await check("an image that leaves the window never comes back: each later image moves the window forward only", async () => {
+  const m = manyImages(14, 2 * 1024 * 1024);
+  const w = { maxImages: 5, maxBytes: 9 * 1024 * 1024 };
+  let before: string[] = [];
+  for (let k = 1; k <= 14; k++) {
+    const out = await resolveImages(m.context(k), m.load, w) as { messages: any[] };
+    const kinds = imagesIn(out).map((p: any) => p.type);
+    // The images sent are the newest run, and every image omitted before is omitted still.
+    const firstSent = kinds.indexOf("image");
+    must(kinds.slice(firstSent).every((t) => t === "image") && kinds.slice(0, firstSent).every((t) => t === "text"), `${k}: ${show(kinds)}`);
+    must(before.every((t, i) => t === "image" || kinds[i] === "text"), `${k}: an omitted image came back: ${show(before)} then ${show(kinds)}`);
+    must(kinds.filter((t) => t === "image").length === Math.min(k, 4), `${k}: ${show(kinds)}`);
+    before = kinds;
+  }
+});
+
+await check("forty 1.5 MiB images: one request carries the window, and the consumer reads only the window", async () => {
+  const m = manyImages(40, MAX_IMAGE_BYTES);
+  const heap = process.memoryUsage().heapUsed + process.memoryUsage().arrayBuffers;
+  const out = await resolveImages(m.context(), m.load, imageWindowOf({ HARNESS_MODEL: "deepseek-flash" }));
+  const body = JSON.stringify(toRequest(out as never, { images: true }));
+  const grew = process.memoryUsage().heapUsed + process.memoryUsage().arrayBuffers - heap;
+  // The count fills (8 × 1.5 MiB is the byte budget exactly) before a ninth is read.
+  must(m.reads.length === 8, `reads ${m.reads.length}`);
+  const sent = imagesIn(out as { messages: any[] }).filter((p: any) => p.type === "image").length;
+  must(sent === 8, `images sent ${sent}`);
+  // 8 × 1.5 MiB is the byte budget exactly: about 16 MB as base64, never the 80 MB forty would be.
+  must(body.length < 17 * 1024 * 1024, `request ${body.length} chars`);
+  must(grew < 80 * 1024 * 1024, `heap grew ${Math.round(grew / 1048576)} MiB`);
+  const env = imageWindowOf({ HARNESS_MODEL: "x", MODEL_IMAGES_MAX: "3", MODEL_IMAGES_MAX_BYTES: "1000" });
+  must(env.maxImages === 3 && env.maxBytes === 1000, show(env));
+  must(show(imageWindowOf({ HARNESS_MODEL: "x", MODEL_IMAGES_MAX: "0", MODEL_IMAGES_MAX_BYTES: "lots" })) === show(DEFAULT_IMAGE_WINDOW), "bad vars were taken");
+});
+
+await check("attachViewImage asks the stored size first, and refuses a mismatch or an oversize object without reading it", async () => {
+  const objects = new Map<string, Uint8Array>([["t/t/a/uploads/chart.png", IMG], ["t/t/a/uploads/big.png", png(10, 10, 2)]]);
+  const gets: string[] = [];
+  const sizes = new Map<string, number>([["t/t/a/uploads/big.png", 50 * 1024 * 1024]]);
+  const store = {
+    size: async (k: string) => sizes.get(k) ?? objects.get(k)?.byteLength ?? null,
+    get: async (k: string) => { gets.push(k); const b = objects.get(k); if (!b) throw new Error("no such artifact"); return b; },
+    put: async () => ({}),
+  };
+  for (const [v, says] of [
+    [{ ...VIEW, ref: "artifact://uploads/big.png" }, "is 52428800 bytes, not"],
+    [{ ...VIEW, bytes: IMG.byteLength - 1 }, `is ${IMG.byteLength} bytes, not`],
+    [{ ...VIEW, ref: "artifact://uploads/none.png" }, "no such artifact"],
+  ] as const) {
+    let threw = "";
+    try { await attachViewImage(v, OWNER, store); } catch (e) { threw = String((e as Error).message); }
+    must(threw.includes(says), `${v.ref}: ${threw}`);
+  }
+  must(gets.length === 0, `read before the size was checked: ${show(gets)}`);
+  await attachViewImage(VIEW, OWNER, store);
+  must(show(gets) === show(["t/t/a/uploads/chart.png"]), show(gets));
+});
+
 // ---- the runtime ----------------------------------------------------------------------------------------------
 
 const usage = { promptTokens: 1, completionTokens: 1, reasoningTokens: 0, cachedPromptTokens: 0 };
@@ -553,7 +664,8 @@ async function world(engine: "pi085" | "pd", model: string, plugin: Plugin, extr
 type World = Awaited<ReturnType<typeof world>>;
 
 /** One user message, answered by `script` in order; every job taken is kept, as the consumer would read it. */
-async function turn(w: World, text: string, script: ModelResponse[]) {
+type Step = ModelResponse | ((job: any) => ModelResponse);
+async function turn(w: World, text: string, script: Step[]) {
   let at = 0;
   const answered = new Set<string>();
   await w.rt.postMessage("t", "a", text, "prompt", "main");
@@ -565,8 +677,9 @@ async function turn(w: World, text: string, script: ModelResponse[]) {
       const job = await w.rt.takeJob("t", "a", id) as any;
       if (!job) continue;
       w.jobs.push({ id, job });
-      const next = script[at++];
-      must(next, `the model was called more often than scripted (${at})`);
+      const step = script[at++];
+      must(step, `the model was called more often than scripted (${at})`);
+      const next = typeof step === "function" ? step(job) : step;
       await w.rt.deliverAnswer("t", "a", id, fromResponse(next!, { api: job.model.api, provider: job.model.provider, id: job.model.id }, id), undefined);
     }
     if (pending.length) continue;
@@ -628,11 +741,13 @@ for (const engine of ["pi085", "pd"] as const) {
       for (const piece of IMG_PIECES) must(!rows.some((v) => v.includes(piece)), `a row holds the image's bytes (${piece.slice(0, 12)}…)`);
       // The job as the queue consumer takes it, called with the bucket the Worker reads.
       const reads: string[] = [];
-      const sent = await capture(w.env, w.jobs[1]!.job, CHAT_REPLY, async (sha) => {
-        reads.push(sha);
-        const o = await w.bucket.get(imageKey(OWNER, sha));
-        return o ? new Uint8Array(await o.arrayBuffer()) : null;
-      });
+      // The consumer's own loader (`imageLoaderFor`, what modelQueueDeps hands callQueuedModel), keyed by the queue
+      // message's tenant and agent, reads what the tool host stored for that agent, and nothing for another.
+      const own = imageLoaderFor(w.bucket, OWNER);
+      for (const other of [{ tenantId: "t", agentId: "other" }, { tenantId: "other", agentId: "a" }]) {
+        must(await imageLoaderFor(w.bucket, other)(IMG_SHA) === null, `${show(other)} read agent a's image`);
+      }
+      const sent = await capture(w.env, w.jobs[1]!.job, CHAT_REPLY, async (sha) => { reads.push(sha); return own(sha); });
       const body = JSON.parse(JSON.parse(sent).body);
       const last = body.messages[body.messages.length - 1];
       must(last.role === "user" && show(last.content) === show([{ type: "text", text: "Attached image(s) from tool result:" }, { type: "image_url", image_url: { url: `data:image/png;base64,${IMG_B64}` } }]),
@@ -680,6 +795,52 @@ for (const engine of ["pi085", "pd"] as const) {
     } finally { w.host.dispose(); }
   });
 }
+
+/** A plugin whose `ask` asks first, and whose answer carries a `view`. */
+function askingPictures(): Plugin {
+  return {
+    id: "pics", version: "1.0.0",
+    tools: [{ name: "ask", description: "Asks, then shows.", parameters: { type: "object", properties: {} }, sideEffects: "read", idempotency: "native" }] as never,
+    async invoke() { return interrupt({ question: "show it?", answer: { choices: ["yes", "no"] }, state: {} }); },
+    interrupts: {
+      async resume() { return { name: "chart.png", view: VIEW } as never; },
+      async cancel() {},
+    },
+  };
+}
+const lastToolText = (job: any) => {
+  const m = [...job.context.messages].reverse().find((x: any) => x.role === "toolResult");
+  return String(m?.content?.find((c: any) => c.type === "text")?.text ?? "");
+};
+
+for (const engine of ["pi085", "pd"] as const) {
+  await check(`${engine}: a tool's question, answered with resume, comes back with its view attached as a call's would`, async () => {
+    const w = await world(engine, "deepseek-flash", askingPictures());
+    try {
+      await turn(w, "ask me", [
+        call("c1", "pics__ask", {}),
+        (job) => call("c2", "resume", { token: JSON.parse(lastToolText(job)).token, answer: "yes" }),
+        say("seen"),
+      ]);
+      const tr = toolResultOf(w.jobs[2]!.job);
+      must(tr.content.length === 2 && tr.content[1]!.type === "image" && tr.content[1]!.data === imageRef(IMG_SHA), show(tr.content).slice(0, 300));
+    } finally { w.host.dispose(); }
+  });
+}
+
+await check("an agent on its own credential is asked about the model its calls run on (HARNESS_MODEL), not its binding's", async () => {
+  for (const [harness, bound, sees] of [["deepseek-v4-pro", "deepseek-flash", false], ["deepseek-flash", "deepseek-v4-pro", true]] as const) {
+    const w = await world("pi085", harness, pictures(VIEW));
+    try {
+      await w.rt.store.setModelBinding({ tenantId: "t", agentId: "a", provider: "own", model: bound, baseUrl: "https://own.example/v1", secretRef: "secret:own-model" });
+      await turn(w, "show me", [call("c1", "pics__show", {}), say("done")]);
+      must(w.jobs[1]!.job.operatorModel === null, `control: the job runs on ${w.jobs[1]!.job.operatorModel}, not the default`);
+      const tr = toolResultOf(w.jobs[1]!.job);
+      must(sees ? tr.content[1]?.type === "image" : tr.content.length === 1 && tr.content[0]!.text!.endsWith(NO_VISION_SENTENCE),
+        `HARNESS_MODEL ${harness}, bound ${bound}: ${show(tr.content).slice(0, 300)}`);
+    } finally { w.host.dispose(); }
+  }
+});
 
 for (const r of results) console.log(`  ${r.ok ? "\x1b[32m✓\x1b[0m" : "\x1b[31m✗\x1b[0m"} ${r.name}${r.error ? `\n      ${r.error}` : ""}`);
 console.log(`  ${"─".repeat(56)}\n  ${results.filter((r) => r.ok).length} passed, ${results.filter((r) => !r.ok).length} failed`);
