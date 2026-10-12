@@ -14,7 +14,8 @@
  * place of the vendored one, a manual compaction starts no job and fails "Summarization produced no text".
  */
 import { setLogSink } from "../../src/core/log.ts";
-import { fromResponse, toRequest, type AnsweredMessage } from "../../src/model/pi-bridge.ts";
+import { errorMessage, fromResponse, toRequest, type AnsweredMessage } from "../../src/model/pi-bridge.ts";
+import { ModelRequestRefused } from "../../src/model/openai-compatible.ts";
 import type { ModelResponse } from "../../src/model/types.ts";
 import { DurableAgent, PdHost } from "../../src/runtime/durable-agent.ts";
 import { pdUsageDrift } from "../../src/runtime/pd-outbox.ts";
@@ -60,11 +61,11 @@ const compactionTasks = (storage: DurableSqlHost) =>
   storage.sql.exec("SELECT record FROM pd_tasks WHERE json_extract(record, '$.kind') = 'pi.compaction'").toArray().map((r) => JSON.parse(String(r.record)).state);
 
 type Fault = (writes: readonly StorageWrite[]) => void;
-function pdObject(storage: DurableSqlHost, compaction: typeof MANUAL, extra: { commitFault?: Fault; host?: Partial<ConstructorParameters<typeof PdHost>[0]> } = {}) {
+function pdObject(storage: DurableSqlHost, compaction: typeof MANUAL, extra: { commitFault?: Fault; host?: Partial<ConstructorParameters<typeof PdHost>[0]>; systemPrompt?: string } = {}) {
   const dispatched: string[] = [];
   const host = new PdHost({ storage, pollAfterMs: POLL_MS, minParkMs: 1, compaction, ...(extra.commitFault ? { commitFault: extra.commitFault } : {}), ...extra.host });
   const agent = DurableAgent.open({
-    host, ...OWNER, model: MODEL, systemPrompt: PROMPT,
+    host, ...OWNER, model: MODEL, systemPrompt: extra.systemPrompt ?? PROMPT,
     dispatch: async (id) => { dispatched.push(id); },
     unknownJob: (id) => new UnknownJob(id),
   });
@@ -130,6 +131,62 @@ function dying(trigger: (writes: readonly StorageWrite[]) => boolean) {
 }
 const isSummaryPoll = (writes: readonly StorageWrite[]) => writes.some((w) => w.type === "task" && w.value.kind === "pi.compaction"
   && (w.value.state as { checkpoint?: { phase?: unknown } }).checkpoint?.phase === "poll");
+
+/**
+ * What the queue consumer answers for a refused request (cf/src/model-request.ts `callQueuedModel`): `errorMessage`
+ * is the refusal's fixed text, the provider's own in `providerError`.
+ */
+function refusal(status: number, body: string, job: { model: { api: string; provider: string; id: string } }, id: string): AnsweredMessage {
+  const e = new ModelRequestRefused(status, body);
+  return { ...errorMessage(e.message, { api: job.model.api, provider: job.model.provider, id: job.model.id }), providerError: e.turnError, jobId: id };
+}
+const OVERFLOW_BODY = JSON.stringify({ error: {
+  message: "This model's maximum context length is 131072 tokens. However, you requested 140211 tokens (139211 in the messages, 1000 in the completion). Please reduce the length of the messages or completion.",
+  type: "invalid_request_error", param: null, code: "invalid_request_error" } });
+/** The same refusal with a completion budget that leaves no room in the window whatever the history: compaction cannot help. */
+const BUDGET_BODY = JSON.stringify({ error: {
+  message: "This model's maximum context length is 32768 tokens. However, you requested 34768 tokens (2000 in the messages, 32768 in the completion). Please reduce the length of the messages or completion.",
+  type: "invalid_request_error" } });
+/**
+ * A request of 100,000 message tokens and a 32,768-token completion budget in a 131,072-token window. With a small
+ * system prompt and tools the history is what does not fit (a compaction leaves room for the budget); with one of
+ * ~95,000 tokens the budget alone leaves no room for a compacted request, which is the output budget's overflow.
+ */
+const SPLIT_BODY = JSON.stringify({ error: {
+  message: "This model's maximum context length is 131072 tokens. However, you requested 132768 tokens (100000 in the messages, 32768 in the completion). Please reduce the length of the messages or completion.",
+  type: "invalid_request_error" } });
+const HUGE_PROMPT = `${PROMPT} ${"policy ".repeat(54_300)}`;
+/** A rate limit naming tokens, in the shape that reaches the queue as a refusal (`isPermanentRefusal`: a 4xx saying invalid_request_error). */
+const RATE_LIMIT_BODY = JSON.stringify({ error: { message: "Rate limit reached: too many tokens per min (TPM)", type: "invalid_request_error" } });
+const SCHEMA_BODY = JSON.stringify({ error: { message: "Invalid schema for function 'x': In context=('properties', 'timeout')", type: "invalid_request_error" } });
+
+/**
+ * A long conversation whose next turn's generation is refused with `body` (HTTP `status`); every later job is
+ * answered (a summary with a summary, a generation with "three"). What it returns says whether pi-durable compacted.
+ */
+async function refusedTurn(storage: DurableSqlHost, status: number, body: string, systemPrompt?: string) {
+  const o = pdObject(storage, MANUAL, systemPrompt === undefined ? {} : { systemPrompt });
+  await longConversation(storage, o.agent);
+  await o.agent.say("third");
+  await o.agent.step();
+  const gen = open(storage).find((j) => !isSummary(j));
+  check(gen, `no generation job for the third turn: ${show(jobs(storage).map((j) => [j.id, j.state]))}`);
+  const job = await o.agent.takeJob(gen.id) as { model: { api: string; provider: string; id: string } };
+  check(job, `job ${gen.id} was not handed out`);
+  check(await o.agent.deliver(gen.id, refusal(status, body, job, gen.id)) === true, `deliver of ${gen.id} was refused`);
+  const end = await run(storage, o.agent, (j) => isSummary(j) ? reply("## Goal\nthe overflow summary", 300, 40) : reply("three", 120, 30));
+  const entries = await o.agent.entries({});
+  const r = {
+    end,
+    summaries: jobs(storage).filter(isSummary).length,
+    generations: jobs(storage).filter((j) => !isSummary(j)).length,
+    compactions: entries.filter((e) => e.type === "compaction").length,
+    overflowTasks: compactionTasks(storage).length,
+    answered: show(entries).includes("\"three\""),
+  };
+  await o.agent.close();
+  return r;
+}
 
 export function pdCompactionCases(withHost: WithDriveHost): DriveCase[] {
   const cases: DriveCase[] = [];
@@ -417,6 +474,31 @@ export function pdCompactionCases(withHost: WithDriveHost): DriveCase[] {
     check((await o.agent.entries({})).some((e) => e.type === "compaction" && show(e).includes("woken live")), "the summary was not placed");
     await o.agent.close();
   });
+
+  add("overflow", "a real overflow refused through the queue (fixed errorMessage, the provider's text in providerError): pi-durable compacts with one summary job and asks again, and the turn is answered", async (storage) => {
+    const r = await refusedTurn(storage, 400, OVERFLOW_BODY);
+    check(r.summaries === 1 && r.compactions === 1 && r.generations === 4 && r.answered && r.end.wakeInMs === null, `the overflow was not compacted: ${show(r)}`);
+  });
+
+  add("overflow", "the control for the system prompt: under a small one the 100,000 + 32,768 refusal is the history's, and is compacted", async (storage) => {
+    const small = await refusedTurn(storage, 400, SPLIT_BODY);
+    check(small.summaries === 1 && small.compactions === 1 && small.answered, `control: under the small prompt it was not compacted: ${show(small)}`);
+  });
+  add("overflow", "the system prompt counts: under a ~95,000-token system prompt the 100,000 + 32,768 refusal is the output budget's, so no compaction is started", async (storage) => {
+    const huge = await refusedTurn(storage, 400, SPLIT_BODY, HUGE_PROMPT);
+    check(huge.summaries === 0 && huge.compactions === 0 && huge.generations === 3 && !huge.answered, `compacted although the budget alone does not fit: ${show(huge)}`);
+  });
+
+  for (const [what, status, body] of [
+    ["a rate limit that names tokens", 400, RATE_LIMIT_BODY],
+    ["another 400 (an invalid tool schema)", 400, SCHEMA_BODY],
+    ["an overflow of the output budget alone, which no compaction can make fit", 400, BUDGET_BODY],
+  ] as const) {
+    add("overflow", `the control: ${what} refused through the queue starts no compaction and is not asked again`, async (storage) => {
+      const r = await refusedTurn(storage, status, body);
+      check(r.summaries === 0 && r.compactions === 0 && r.generations === 3 && !r.answered && r.end.wakeInMs === null, `compacted or retried: ${show(r)}`);
+    });
+  }
 
   return cases;
 }

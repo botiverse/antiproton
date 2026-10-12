@@ -30,6 +30,7 @@ import { logEvent } from "../core/log.ts";
 import { appendTrace } from "../trace/outbox.ts";
 import { MAIN_SESSION, piTables, type SqlHost } from "../store/pi-storage.ts";
 import { fenceFor } from "../plugins/state.ts";
+import { keyedOperationId, programCallKey } from "./operation-id.ts";
 import { BRIEFING_BUDGET_TOKENS, recordRebuildDecision, type RebuildTrigger } from "./rebuild.ts";
 
 type Sql = SqlHost["sql"];
@@ -403,30 +404,77 @@ const SENT_SAYS = /(?:Message sent to|posted to) (\S+?)\.? (?:Message ID: |as me
  */
 export const isProgramTool = (name: string) => toolPart(name) === "run_js";
 
+/** The states Raft's own result has for a send that went out: a message (`messages_send`, `messages_reply`) or an action card (`actions_prepare`). */
+const SENT_STATES = new Set(["sent", "prepared"]);
+
 /**
- * Every send a program's result reports (`SENT_SAYS`), in any string at any depth, its JSON-in-string outputs included.
- * A Raft message line inside it (a read the program made) is someone's text, not a report, and is never scanned.
+ * The sends a program's result reports (`SENT_SAYS`), in any string at any depth, its JSON-in-string outputs included,
+ * at most `made` of them: the sends the program is recorded to have made (`programSendCounter`). The words alone prove
+ * nothing, since a stored note (`state__get`), a page of history or a fetched page can quote them; a program that made
+ * no send reports none, whatever its output says. A program's own output names its send in whatever shape it chose
+ * (`sent: s.result.text`, a bare string, is what a real one returned), so the shape is not required, only ranked: the
+ * text of an object shaped like Raft's send result (`{ state: "sent" | "prepared", text }`) first, then the shallowest,
+ * then in order. A Raft message line inside it (a read the program made) is someone's text, not a report, and is never
+ * scanned.
  */
-export function sendsReported(resultText: string): Array<{ target: string; id: string }> {
-  const out: Array<{ target: string; id: string }> = [];
-  const scan = (t: string) => { for (const m of t.matchAll(SENT_SAYS)) out.push({ target: m[1]!, id: m[2]! }); };
+export function sendsReported(resultText: string, made: number): Array<{ target: string; id: string }> {
+  if (!(made > 0)) return [];
+  const found: Array<{ target: string; id: string; rank: number; order: number }> = [];
+  const scan = (t: string, rank: number) => {
+    if (RAFT_HEAD.test(t)) return;
+    for (const m of t.matchAll(SENT_SAYS)) found.push({ target: m[1]!, id: m[2]!, rank, order: found.length });
+  };
   const walk = (v: unknown, depth: number): void => {
     if (depth > 8) return;
     if (typeof v === "string") {
       if (/^\s*[[{]/.test(v)) { try { walk(JSON.parse(v), depth + 1); return; } catch { /* text */ } }
-      if (!RAFT_HEAD.test(v)) scan(v);
+      scan(v, depth + 1);
     } else if (Array.isArray(v)) for (const x of v) walk(x, depth + 1);
-    else if (v && typeof v === "object") for (const x of Object.values(v)) walk(x, depth + 1);
+    else if (v && typeof v === "object") {
+      const o = v as { state?: unknown; text?: unknown };
+      if (typeof o.state === "string" && SENT_STATES.has(o.state) && typeof o.text === "string") { scan(o.text, 0); return; }
+      for (const x of Object.values(v)) walk(x, depth + 1);
+    }
   };
-  let parsed: unknown;
-  try { parsed = JSON.parse(resultText); } catch { parsed = undefined; }
-  if (parsed === undefined) scan(resultText); else walk(parsed, 0);
-  return out;
+  walk(resultText, 0);
+  found.sort((x, y) => x.rank - y.rank || x.order - y.order);
+  return found.slice(0, made).sort((x, y) => x.order - y.order).map(({ target, id }) => ({ target, id }));
+}
+
+/** How many sends a program made, given its `run_js` call's id; the transcript does not say (`programSendCounter`). */
+export type ProgramSends = (toolCallId: string) => number;
+
+/** How many host calls of one program are looked for: three statements of `IDS_PER_QUERY`. A program past it is undercounted. */
+export const PROGRAM_CALLS_LOOKED_AT = 270;
+const IDS_PER_QUERY = 90;
+
+/**
+ * The sends each program of a conversation made, from the operations its calls started: the transcript keeps only a
+ * program's output, never its calls. A program's `n`th host call is keyed `programCallKey(toolCallId, n)`, so its
+ * operation id is recomputed (`keyedOperationId`, src/runtime/operation-id.ts) and looked up; a call refused before
+ * an operation existed (an unknown tool) leaves a gap, so a fixed range is read rather than stopping at the first
+ * miss. A send is an operation of a messaging tool (`isSendTool`) that succeeded. `taskId`: the main conversation's
+ * calls are made under task `main` (cf/src/runtime.ts `LEGACY_TASK`), the same in every transcript it has had.
+ */
+export function programSendCounter(sql: Sql, tenantId: string, taskId: string = MAIN_SESSION): ProgramSends {
+  const has = sql.exec("SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = 'operations'").toArray().length > 0;
+  return (toolCallId) => {
+    if (!has) return 0;
+    let sends = 0;
+    for (let from = 0; from < PROGRAM_CALLS_LOOKED_AT; from += IDS_PER_QUERY) {
+      const ids = Array.from({ length: IDS_PER_QUERY }, (_, k) => keyedOperationId(tenantId, taskId, programCallKey(toolCallId, from + k)));
+      const rows = sql.exec(`SELECT mount_alias, tool FROM operations WHERE tenant_id = ? AND status = 'succeeded' AND operation_id IN (${ids.map(() => "?").join(", ")})`,
+        tenantId, ...ids).toArray() as Array<{ mount_alias: unknown; tool: unknown }>;
+      sends += rows.filter((r) => isSendTool(`${String(r.mount_alias)}__${String(r.tool)}`)).length;
+    }
+    return sends;
+  };
 }
 
 /** The id of the message a send made, when its result names one: Raft's words (`sendsReported`), or a JSON field. */
 function sentId(resultText: string): string | null {
-  const said = sendsReported(resultText)[0];
+  // A messaging tool's own result: its one send is the one it reports.
+  const said = sendsReported(resultText, 1)[0];
   if (said) return said.id;
   let v: unknown;
   try { v = JSON.parse(resultText); } catch { return null; }
@@ -456,7 +504,7 @@ const answeredOk = (m: any) => m?.role === "assistant" && ["stop", "toolUse", "l
  *     conversation, time and source. On Raft what was received is the messages its read tools showed (`raftLines`),
  *     each with its target and id and whether the agent answered there after it, not the push notice that woke it
  *     (`isRaftNotice`, left out); a send says where it went (`target`, or the message it replied to) and the id Raft
- *     gave it (`sendsReported`), a send a `run_js` program made included;
+ *     gave it (`sendsReported`), a send a `run_js` program made included (as many as it is recorded to have made);
  *   - the last `maxActions` tool calls, newest first, each ok, failed, or with no result;
  *   - the input itself, verbatim, last but for:
  *   - what the failed run had already sent or written for that input, so it is not sent twice.
@@ -469,6 +517,8 @@ const answeredOk = (m: any) => m?.role === "assistant" && ["stop", "toolUse", "l
  */
 export function buildBriefing(entries: readonly BriefingEntry[], o: {
   conversation: string; redact: (v: unknown) => unknown; budgetTokens?: number; maxActions?: number; noticeHeads?: readonly string[];
+  /** The sends each program made (`programSendCounter`): a program's output is believed for no more than these. */
+  programSends: ProgramSends;
 }): Briefing {
   const budgetTokens = o.budgetTokens ?? BRIEFING_BUDGET_TOKENS;
   const heads = o.noticeHeads ?? [];
@@ -525,7 +575,7 @@ export function buildBriefing(entries: readonly BriefingEntry[], o: {
   for (const c of calls) {
     if (!isProgramTool(c.name)) continue;
     const r = results.get(c.id);
-    const said = r && !r.isError ? sendsReported(r.text) : [];
+    const said = r && !r.isError ? sendsReported(r.text, o.programSends(c.id)) : [];
     if (said.length) nested.set(c.id, said);
   }
   const sends = [

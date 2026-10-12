@@ -38,7 +38,7 @@ import {
 } from "../../src/runtime/pi-tools.ts";
 import { explainUnavailableTool } from "../../src/runtime/unavailable-tool.ts";
 import {
-  bindingKey, buildBriefing, clearBackstop, conversationMessages, hasAnswer, judgeOverflow, mainCallOut, mainMessages, mainTip, needsReset, noteRebuilt,
+  bindingKey, buildBriefing, programSendCounter, clearBackstop, conversationMessages, hasAnswer, judgeOverflow, mainCallOut, mainMessages, mainTip, needsReset, noteRebuilt,
   noteRunEndedWell, noticeHeads, overflowKind, readBackstop, recordBackstop, recordNoticeHead, requestFixedTokens, requestTokens, returnPendingBriefing,
   SessionNeedsReset, takePendingBriefing, type Briefing, type Judge,
 } from "../../src/runtime/overflow-backstop.ts";
@@ -3945,7 +3945,7 @@ export class AgentRuntime {
       }
       const entries = mainMessagesAfter(sql, watch.startSeq);
       recordBehaviour(sql, this.#transact(), {
-        tenantId, agentId, watch, behaviour: summariseBehaviour(entries, { wakeAt: watch.wakeAt, prior: watch.prior }), at: Date.now(),
+        tenantId, agentId, watch, behaviour: summariseBehaviour(entries, { wakeAt: watch.wakeAt, prior: watch.prior, programSends: programSendCounter(sql, tenantId) }), at: Date.now(),
       });
     } catch (e) { console.error(`the rebuild behaviour of ${tenantId}/${agentId} could not be recorded:`, e); }
   }
@@ -3981,6 +3981,7 @@ export class AgentRuntime {
     const messages = conversationMessages(sql, chain);
     const briefing = buildBriefing(messages, {
       conversation: logical.conversation, noticeHeads: noticeHeads(sql), redact: await this.#briefingRedactor(tenantId, agentId),
+      programSends: programSendCounter(sql, tenantId),
     });
     const prior = req.trigger === "cold-wake" ? priorCallKeys(messages) : [];
     const { newSessionId } = startFreshMain(this.#deps.ctx.storage, now, "rebuild");

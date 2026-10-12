@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import type { StorageAdapter } from "../core/store.ts";
 import type { Json, MountPolicy, MountRecord, OperationStatus, PolicyDecision } from "../core/types.ts";
 import { AGENT_REF, agentRef, isAgentRef, KEPT_NAME, KEPT_PREFIX, OWNER_PREFIX, secretRefKind } from "./secrets.ts";
@@ -8,6 +8,7 @@ import type { Plugin, PluginContext, PromptPart, MountActivity, MountUsage, Inbo
 import { type ActivityEvent, type SandboxForm, holdingOf, backgroundOf, isExclusive } from "../plugins/types.ts";
 import { Backgrounded, Interrupt, interruptsOf } from "../plugins/types.ts";
 import { answerSpecOf } from "./run-js-resume.ts";
+import { keyedOperationId } from "./operation-id.ts";
 import type { PluginErrorFields, ToolSnapshot } from "../plugins/types.ts";
 import { callSideEffects, pluginEnabled, LEASE_KEY, toolsOf } from "../plugins/types.ts";
 import { admitTools } from "./mount-tools.ts";
@@ -830,7 +831,7 @@ export class ToolGateway {
     }
 
     const operationId = opts.operationId ?? (opts.idempotencyKey
-      ? `op_${createHash("sha256").update(`${ctx.tenantId}|${ctx.taskId}|${opts.idempotencyKey}`).digest("hex").slice(0, 20)}`
+      ? keyedOperationId(ctx.tenantId, ctx.taskId, opts.idempotencyKey)
       : `op_${randomUUID().replace(/-/g, "").slice(0, 20)}`);
 
     if (opts.idempotencyKey) {

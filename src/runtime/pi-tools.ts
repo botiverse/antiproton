@@ -19,6 +19,7 @@
  */
 import type { AgentHarnessTool } from "@earendil-works/pi-agent-core";
 import { pluginUnavailableMessage, switchedOffMessage } from "./gateway.ts";
+import { programCallKey } from "./operation-id.ts";
 import type { Json } from "../core/types.ts";
 import type { Continuation, HeldCall, Paused } from "../core/execution.ts";
 import type { ToolInterrupt } from "../core/tools.ts";
@@ -1060,7 +1061,7 @@ export function runJsTool(
             // name the program used (`InvokeOpts.fromProgram`).
             opts: {
               ...(lifted.confirm || (call.opts as { confirm?: unknown } | undefined)?.confirm === true ? { confirm: true } : {}),
-              idempotencyKey: `${toolCallId}:${n++}`,
+              idempotencyKey: programCallKey(toolCallId, n++),
               fromProgram: true,
             },
           }).then((res) => {

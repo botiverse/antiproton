@@ -75,6 +75,7 @@ import { settle, type ExternalWaits, type SettleResult } from "./durable-drive.t
 import { ClientCallsDoc, toolsExtension, waitingCalls, type ClientToolDef } from "./durable-tools.ts";
 import { bridgeTools, harnessTools, type InterruptKeeping, type MountedTool, type ToolHost } from "./pi-tools.ts";
 import { isPdUnavailableEntry, pdUnavailableText } from "./unavailable-tool.ts";
+import { estimateTokens, overflowKind } from "./overflow-backstop.ts";
 import { projectEntries } from "./pd-transcript.ts";
 import { type AgentEngine, type EngineEntry, type EngineEntryScan, type EngineStatus, type StepOutcome } from "./engine.ts";
 
@@ -118,6 +119,40 @@ const TAKE_HOLD_MS = MODEL_CALL_DEADLINE_MS + 60_000;
  * comes back at its redelivery instead when that is sooner (`PdHost.redeliveryDue`).
  */
 export const POLL_BACKSTOP_MS = 300_000;
+
+/**
+ * The `errorMessage` a refusal for a history that no longer fits is handed to pi-durable with. pi-durable compacts
+ * on an overflow only when its generation's `classify` (pi-durable dist/harness/generation.js) reads one through
+ * `isContextOverflow` of the pi-ai 1.0.0 pi-durable resolves (node_modules/@earendil-works/pi-durable/node_modules/
+ * @earendil-works/pi-ai/dist/utils/overflow.js, not the root's 0.85), which scans `errorMessage` alone. A refusal answered
+ * through the queue has fixed text there and the provider's own text in `providerError` (cf/src/model-request.ts
+ * `callQueuedModel`), so a real overflow failed the turn and compaction never ran. `context_length_exceeded` is in
+ * that pi-ai's overflow patterns; nothing here is in its retryable ones, and an overflow is never retried anyway.
+ * Readers still show the provider's text: `failureText` (src/model/pi-bridge.ts) prefers `providerError`.
+ */
+export const PD_OVERFLOW_ERROR = "model refused: the request does not fit the model's context window (context_length_exceeded); see the turn's error";
+
+/**
+ * A stored answer as pi-durable should read it: a refusal whose history did not fit (`overflowKind` is `history`,
+ * the same reading as pi085's backstop, src/runtime/overflow-backstop.ts) carries `PD_OVERFLOW_ERROR`, so pi-durable
+ * compacts and asks again. Every other answer is returned as stored. An output-budget refusal is left as it is: the
+ * completion budget alone leaves no room, and no compaction of the history can make that request fit. The fixed part
+ * of the request (its system messages and tools, from the job's own stored request) is counted as the backstop counts
+ * it (`requestFixedTokens`).
+ */
+function markOverflow(answer: Answered, request: string): Answered {
+  if (answer.stopReason !== "error") return answer;
+  if (overflowKind(answer, { fixedTokens: fixedTokensOf(request) }) !== "history") return answer;
+  return { ...answer, errorMessage: PD_OVERFLOW_ERROR };
+}
+
+function fixedTokensOf(request: string): number {
+  try {
+    const c = (JSON.parse(request) as { context?: { messages?: Array<{ role?: unknown; content?: unknown }>; tools?: unknown } })?.context ?? {};
+    const system = (c.messages ?? []).filter((m) => m?.role === "system").map((m) => typeof m.content === "string" ? m.content : JSON.stringify(m.content ?? "")).join("");
+    return estimateTokens(system + JSON.stringify(c.tools ?? []));
+  } catch { return 0; }
+}
 
 /**
  * How long a metered delivery attempt is remembered (`ap_deliveries`, `PdHost.deliver`): a replay of the same attempt's
@@ -579,11 +614,13 @@ export class PdHost {
   }
 
   async #pollJob(id: string): Promise<Answered | null> {
-    const [row] = (await this.#store()).query("SELECT answer FROM model_jobs WHERE id = ?", id);
+    // The request is read only for a failed answer, the one `markOverflow` may need it for: it can be large.
+    const [row] = (await this.#store()).query(
+      "SELECT answer, CASE WHEN json_extract(answer, '$.stopReason') = 'error' THEN request END AS request FROM model_jobs WHERE id = ?", id);
     const answer = row?.answer;
     this.#opts.onPoll?.(id, typeof answer === "string");
     // `readAnswer` refuses what nothing that writes this row can produce (a stored `aborted`, a non-assistant).
-    return typeof answer === "string" ? readAnswer(answer) : null;
+    return typeof answer === "string" ? markOverflow(readAnswer(answer), String(row?.request ?? "")) : null;
   }
 
   /**
