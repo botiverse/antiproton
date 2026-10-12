@@ -592,6 +592,14 @@ await check("forty 1.5 MiB images: one request carries the window, and the consu
   must(show(imageWindowOf({ HARNESS_MODEL: "x", MODEL_IMAGES_MAX: "0", MODEL_IMAGES_MAX_BYTES: "lots" })) === show(DEFAULT_IMAGE_WINDOW), "bad vars were taken");
 });
 
+await check("callQueuedModel applies the window from its environment: MODEL_IMAGES_MAX=3 sends the newest 3 of 10", async () => {
+  const m = manyImages(10, 100);
+  const sent = await capture({ ...ENV, MODEL_IMAGES_MAX: "3" }, job(m.context(), { provider: "deepseek", model: "deepseek-flash" }), CHAT_REPLY, m.load);
+  const urls = sent.split("data:image/png;base64,").length - 1;
+  must(urls === 3 && m.reads.length === 3, `data URLs ${urls}, reads ${m.reads.length}`);
+  must(sent.split("[earlier image omitted:").length - 1 === 7, "the seven older images are not named");
+});
+
 await check("attachViewImage asks the stored size first, and refuses a mismatch or an oversize object without reading it", async () => {
   const objects = new Map<string, Uint8Array>([["t/t/a/uploads/chart.png", IMG], ["t/t/a/uploads/big.png", png(10, 10, 2)]]);
   const gets: string[] = [];
