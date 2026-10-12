@@ -61,11 +61,11 @@ const compactionTasks = (storage: DurableSqlHost) =>
   storage.sql.exec("SELECT record FROM pd_tasks WHERE json_extract(record, '$.kind') = 'pi.compaction'").toArray().map((r) => JSON.parse(String(r.record)).state);
 
 type Fault = (writes: readonly StorageWrite[]) => void;
-function pdObject(storage: DurableSqlHost, compaction: typeof MANUAL, extra: { commitFault?: Fault; host?: Partial<ConstructorParameters<typeof PdHost>[0]> } = {}) {
+function pdObject(storage: DurableSqlHost, compaction: typeof MANUAL, extra: { commitFault?: Fault; host?: Partial<ConstructorParameters<typeof PdHost>[0]>; systemPrompt?: string } = {}) {
   const dispatched: string[] = [];
   const host = new PdHost({ storage, pollAfterMs: POLL_MS, minParkMs: 1, compaction, ...(extra.commitFault ? { commitFault: extra.commitFault } : {}), ...extra.host });
   const agent = DurableAgent.open({
-    host, ...OWNER, model: MODEL, systemPrompt: PROMPT,
+    host, ...OWNER, model: MODEL, systemPrompt: extra.systemPrompt ?? PROMPT,
     dispatch: async (id) => { dispatched.push(id); },
     unknownJob: (id) => new UnknownJob(id),
   });
@@ -147,6 +147,15 @@ const OVERFLOW_BODY = JSON.stringify({ error: {
 const BUDGET_BODY = JSON.stringify({ error: {
   message: "This model's maximum context length is 32768 tokens. However, you requested 34768 tokens (2000 in the messages, 32768 in the completion). Please reduce the length of the messages or completion.",
   type: "invalid_request_error" } });
+/**
+ * A request of 100,000 message tokens and a 32,768-token completion budget in a 131,072-token window. With a small
+ * system prompt and tools the history is what does not fit (a compaction leaves room for the budget); with one of
+ * ~95,000 tokens the budget alone leaves no room for a compacted request, which is the output budget's overflow.
+ */
+const SPLIT_BODY = JSON.stringify({ error: {
+  message: "This model's maximum context length is 131072 tokens. However, you requested 132768 tokens (100000 in the messages, 32768 in the completion). Please reduce the length of the messages or completion.",
+  type: "invalid_request_error" } });
+const HUGE_PROMPT = `${PROMPT} ${"policy ".repeat(54_300)}`;
 /** A rate limit naming tokens, in the shape that reaches the queue as a refusal (`isPermanentRefusal`: a 4xx saying invalid_request_error). */
 const RATE_LIMIT_BODY = JSON.stringify({ error: { message: "Rate limit reached: too many tokens per min (TPM)", type: "invalid_request_error" } });
 const SCHEMA_BODY = JSON.stringify({ error: { message: "Invalid schema for function 'x': In context=('properties', 'timeout')", type: "invalid_request_error" } });
@@ -155,8 +164,8 @@ const SCHEMA_BODY = JSON.stringify({ error: { message: "Invalid schema for funct
  * A long conversation whose next turn's generation is refused with `body` (HTTP `status`); every later job is
  * answered (a summary with a summary, a generation with "three"). What it returns says whether pi-durable compacted.
  */
-async function refusedTurn(storage: DurableSqlHost, status: number, body: string) {
-  const o = pdObject(storage, MANUAL);
+async function refusedTurn(storage: DurableSqlHost, status: number, body: string, systemPrompt?: string) {
+  const o = pdObject(storage, MANUAL, systemPrompt === undefined ? {} : { systemPrompt });
   await longConversation(storage, o.agent);
   await o.agent.say("third");
   await o.agent.step();
@@ -469,6 +478,15 @@ export function pdCompactionCases(withHost: WithDriveHost): DriveCase[] {
   add("overflow", "a real overflow refused through the queue (fixed errorMessage, the provider's text in providerError): pi-durable compacts with one summary job and asks again, and the turn is answered", async (storage) => {
     const r = await refusedTurn(storage, 400, OVERFLOW_BODY);
     check(r.summaries === 1 && r.compactions === 1 && r.generations === 4 && r.answered && r.end.wakeInMs === null, `the overflow was not compacted: ${show(r)}`);
+  });
+
+  add("overflow", "the control for the system prompt: under a small one the 100,000 + 32,768 refusal is the history's, and is compacted", async (storage) => {
+    const small = await refusedTurn(storage, 400, SPLIT_BODY);
+    check(small.summaries === 1 && small.compactions === 1 && small.answered, `control: under the small prompt it was not compacted: ${show(small)}`);
+  });
+  add("overflow", "the system prompt counts: under a ~95,000-token system prompt the 100,000 + 32,768 refusal is the output budget's, so no compaction is started", async (storage) => {
+    const huge = await refusedTurn(storage, 400, SPLIT_BODY, HUGE_PROMPT);
+    check(huge.summaries === 0 && huge.compactions === 0 && huge.generations === 3 && !huge.answered, `compacted although the budget alone does not fit: ${show(huge)}`);
   });
 
   for (const [what, status, body] of [

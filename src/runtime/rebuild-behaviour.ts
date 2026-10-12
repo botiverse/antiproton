@@ -25,7 +25,7 @@ import { canonJson } from "../core/canon-json.ts";
 import { logEvent } from "../core/log.ts";
 import { appendTrace } from "../trace/outbox.ts";
 import { MAIN_SESSION, piTables, type SqlHost } from "../store/pi-storage.ts";
-import { isProgramTool, isSendTool, sendsReported, type BriefingEntry } from "./overflow-backstop.ts";
+import { isProgramTool, isSendTool, sendsReported, type BriefingEntry, type ProgramSends } from "./overflow-backstop.ts";
 
 type Sql = SqlHost["sql"];
 
@@ -52,12 +52,12 @@ export const callKey = (name: string, args: unknown) =>
 
 interface Call {
   name: string; args: unknown; id: string; at: number; ok: boolean | null; endedAt: number | null;
-  /** A message went out: a messaging tool, or a program (`run_js`) whose result reports a send (`sendsReported`). */
+  /** A message went out: a messaging tool, or a program (`run_js`) whose result reports a send it made (`sendsReported`). */
   sends: boolean;
 }
 
 /** Every tool call in `entries`, in order, with whether it succeeded and when its result came. */
-function callsOf(entries: readonly BriefingEntry[]): Call[] {
+function callsOf(entries: readonly BriefingEntry[], programSends: ProgramSends = () => 0): Call[] {
   const results = new Map<string, { ok: boolean; at: number; text: string }>();
   for (const e of entries) {
     const m = e.message;
@@ -75,7 +75,7 @@ function callsOf(entries: readonly BriefingEntry[]): Call[] {
       const name = String(p.name ?? "");
       out.push({ name, args: p.arguments ?? {}, id: String(p.id ?? ""), at: Number(m.timestamp ?? e.timestamp),
         ok: r ? r.ok : null, endedAt: r ? r.at : null,
-        sends: isSendTool(name) || (isProgramTool(name) && !!r && r.ok && sendsReported(r.text).length > 0) });
+        sends: isSendTool(name) || (isProgramTool(name) && !!r && r.ok && sendsReported(r.text, programSends(String(p.id ?? ""))).length > 0) });
     }
   }
   return out;
@@ -104,8 +104,8 @@ export interface Behaviour {
 }
 
 /** The run's behaviour, from the rebuilt transcript's messages (oldest first), the wake's time and the prior keys. */
-export function summariseBehaviour(entries: readonly BriefingEntry[], o: { wakeAt: number; prior: readonly string[] }): Behaviour {
-  const calls = callsOf(entries);
+export function summariseBehaviour(entries: readonly BriefingEntry[], o: { wakeAt: number; prior: readonly string[]; programSends: ProgramSends }): Behaviour {
+  const calls = callsOf(entries, o.programSends);
   const prior = new Set(o.prior);
   const send = calls.findIndex((c) => c.sends);
   const before = send < 0 ? calls : calls.slice(0, send);

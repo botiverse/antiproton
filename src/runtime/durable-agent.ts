@@ -123,10 +123,11 @@ export const POLL_BACKSTOP_MS = 300_000;
 /**
  * The `errorMessage` a refusal for a history that no longer fits is handed to pi-durable with. pi-durable compacts
  * on an overflow only when its generation's `classify` (pi-durable dist/harness/generation.js) reads one through
- * pi-ai's `isContextOverflow` (pi-ai dist/utils/overflow.js), which scans `errorMessage` alone. A refusal answered
+ * `isContextOverflow` of the pi-ai 1.0.0 pi-durable resolves (node_modules/@earendil-works/pi-durable/node_modules/
+ * @earendil-works/pi-ai/dist/utils/overflow.js, not the root's 0.85), which scans `errorMessage` alone. A refusal answered
  * through the queue has fixed text there and the provider's own text in `providerError` (cf/src/model-request.ts
  * `callQueuedModel`), so a real overflow failed the turn and compaction never ran. `context_length_exceeded` is in
- * pi-ai's overflow patterns; nothing here is in its retryable ones, and an overflow is never retried anyway.
+ * that pi-ai's overflow patterns; nothing here is in its retryable ones, and an overflow is never retried anyway.
  * Readers still show the provider's text: `failureText` (src/model/pi-bridge.ts) prefers `providerError`.
  */
 export const PD_OVERFLOW_ERROR = "model refused: the request does not fit the model's context window (context_length_exceeded); see the turn's error";
@@ -613,7 +614,9 @@ export class PdHost {
   }
 
   async #pollJob(id: string): Promise<Answered | null> {
-    const [row] = (await this.#store()).query("SELECT answer, request FROM model_jobs WHERE id = ?", id);
+    // The request is read only for a failed answer, the one `markOverflow` may need it for: it can be large.
+    const [row] = (await this.#store()).query(
+      "SELECT answer, CASE WHEN json_extract(answer, '$.stopReason') = 'error' THEN request END AS request FROM model_jobs WHERE id = ?", id);
     const answer = row?.answer;
     this.#opts.onPoll?.(id, typeof answer === "string");
     // `readAnswer` refuses what nothing that writes this row can produce (a stored `aborted`, a non-assistant).
