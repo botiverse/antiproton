@@ -22,6 +22,8 @@ import type { ModelResponse } from "../src/model/types.ts";
 import type { Plugin } from "../src/plugins/types.ts";
 import { fromResponse } from "../src/model/pi-bridge.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
+import { ApStore } from "../src/store/ap-store.ts";
+import { prefixedNamespace } from "../src/store/sql-namespace.ts";
 import { standInLoader } from "./spec/worker-stand-in.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
@@ -79,7 +81,12 @@ const pictures: Plugin = {
 };
 
 /** An agent on `model`, its tool's image stored, with model-input evidence on unless `evidence` is false. */
-async function world(model: string, evidence = true, host = sqliteHost()) {
+async function world(model: string, evidence = true, host = sqliteHost(), engine: "pi085" | "pd" = "pi085") {
+  if (engine === "pd") {
+    const ap = new ApStore(host, prefixedNamespace("ap"));
+    ap.ensure();
+    ap.setEngineOnce("pd");
+  }
   const bucket = memoryBucket();
   bucket.objects.set("t/t/a/uploads/chart.png", IMG);
   const sent: string[] = [];
@@ -375,6 +382,16 @@ await check("an attempt is only ever added to: a prepared report arriving after 
     must(await w.rt.recordImageAttempt(jobId, { ...base, provider: { outcome: "http", status: 200, at: new Date(2).toISOString() } }) === false, "an ended attempt was changed");
     const images = (await modelInputOf(w, jobId)).images;
     must(images.length === 1 && images[0].provider.outcome === "timeout", show(images));
+  } finally { w.host.dispose(); }
+});
+
+await check("pd: a job of the pd engine is not marked, since its calls have no input record to join", async () => {
+  const w = await world("deepseek-flash", true, sqliteHost(), "pd");
+  try {
+    const jobId = await pendingImageCall(w);
+    const taken = await w.rt.takeJob("t", "a", jobId) as any;
+    must(taken && taken.context, "control: the job was not taken");
+    must(!("imageEvidence" in taken), "a pd job was marked for image evidence");
   } finally { w.host.dispose(); }
 });
 

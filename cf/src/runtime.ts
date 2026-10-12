@@ -4265,8 +4265,10 @@ export class AgentRuntime {
     const b = await this.store.getModelBinding(tenantId, agentId);
     const provider = b ? providerOfRef(b.secretRef) : null;
     // Marked where model-input evidence is on, so the consumer describes this call's images back to this object
-    // (`recordImageAttempt`); the flag is the object's, and the consumer has no other way to know it.
-    return { ...job, operatorModel: provider ? b!.model : null, operatorProvider: provider, ...(this.#deps.modelInputEvidence ? { imageEvidence: true } : {}) };
+    // (`recordImageAttempt`); the flag is the object's, and the consumer has no other way to know it. Not on pd,
+    // whose calls have no input record for the evidence to join.
+    const mark = this.#deps.modelInputEvidence && !this.#isPd();
+    return { ...job, operatorModel: provider ? b!.model : null, operatorProvider: provider, ...(mark ? { imageEvidence: true } : {}) };
   }
 
   /**
