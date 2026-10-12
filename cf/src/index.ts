@@ -84,9 +84,9 @@ import { loginPage, refusedPage, keyPage } from "./login.ts";
 import { busySpans, countActiveTime, unionMs, type ActivitySpan } from "../../src/usage/active.ts";
 import { countHeldTime, heldReports } from "../../src/usage/container.ts";
 import { benchPollBody } from "../../src/bench/poll-body.ts";
-import { flushUsage, parseUsageQuery, readAgentLedger, readUsage, priceFor, readUsageCosts, retainUsage, usageBacklogSince, usagePrices } from "./usage-d1.ts";
+import { flushUsage, parseUsageQuery, readAgentLedger, readUsage, priceFor, readTenantCosts, readUsageCosts, retainUsage, usageBacklogSince, usagePrices } from "./usage-d1.ts";
 import { adminUsageCosts, closedCostsTo, parseCostsQuery } from "./admin-usage-costs.ts";
-import { adminSpendLimits, d1SpendLimits, limitsOf, sharedSpendGate, spendAdmit } from "./spend-limit.ts";
+import { adminSpendLimits, d1SpendLimits, limitsOf, readDaySpend, sharedSpendGate, spendAdmit } from "./spend-limit.ts";
 import { drainCursors, hasUnsent, standDownDelay, USAGE_WAKE_DELAY_MS } from "./usage-flush.ts";
 import type { SurfaceDeps } from "./agent-surface/surface.ts";
 import type { HeldListing, HeldRead } from "../../src/plugins/types.ts";
@@ -3474,6 +3474,12 @@ function provisionDeps(env: Env): ProvisionDeps {
     now: () => Date.now(),
     registry: d1ProvisionedAgents(env.CONTROL_DB),
     surface: surfaceDeps(env),
+    // The enforcer's own limits and reading (cf/src/spend-limit.ts), so the panel and the queue consumer agree.
+    usage: {
+      limits: limitsOf(env),
+      today: (tenantId, now) => readDaySpend(env.CONTROL_DB, tenantId, now),
+      costs: (tenantId, from, to, bucket) => readTenantCosts(env.CONTROL_DB, tenantId, from, to, bucket),
+    },
     // The same sources as the console's picker (`/ui/agent/model`) and the Agents API's `model`, so all three agree.
     models: {
       userModels: userModelsFrom(env as unknown as Record<string, unknown>, operatorModelOf(env).providers),

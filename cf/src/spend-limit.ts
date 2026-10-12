@@ -124,16 +124,50 @@ export type Admission =
   | { admit: true; why: "exempt" | "under" | "read_failed" }
   | { admit: false; limit: "platform" | "tenant"; text: string };
 
+/** The tenant's limit today: an admin's override when there is one (null there is none), else the deployment's. */
+export function tenantLimitOf(spend: DaySpend, limits: SpendLimits): number | null {
+  return spend.override ? spend.override.limitUsd : limits.tenantUsd;
+}
+
+/** Whether the platform's limit is reached: then nobody but an exempt tenant works. */
+export function platformReached(spend: DaySpend, limits: SpendLimits): boolean {
+  return limits.platformUsd !== null && spend.platformUsd >= limits.platformUsd;
+}
+
+export const isExempt = (tenantId: string, limits: SpendLimits) => limits.exempt.has(tenantId);
+
 /** What today's spend says for a tenant that is not exempt. The platform limit is asked first: when it is reached nobody works. */
 export function judge(spend: DaySpend, limits: SpendLimits): Admission {
-  if (limits.platformUsd !== null && spend.platformUsd >= limits.platformUsd) return { admit: false, limit: "platform", text: PLATFORM_LIMIT_TEXT };
-  const tenantLimit = spend.override ? spend.override.limitUsd : limits.tenantUsd;
+  if (platformReached(spend, limits)) return { admit: false, limit: "platform", text: PLATFORM_LIMIT_TEXT };
+  const tenantLimit = tenantLimitOf(spend, limits);
   if (tenantLimit !== null && spend.tenantUsd >= tenantLimit) return { admit: false, limit: "tenant", text: tenantLimitText(spend.tenantUsd, tenantLimit) };
   return { admit: true, why: "under" };
 }
 
+/**
+ * Where a tenant stands today, for the tenant to see (`GET /provision/usage`, cf/src/provision/usage.ts): the
+ * figures `judge` decides on and its verdict, so what a panel shows and what the queue consumer does are one
+ * rule. The platform's own figures are not in it, only whether its limit is reached: they are every tenant's
+ * spend added up, and another tenant's numbers are not this tenant's to read.
+ *
+ * `refusing` is the verdict on this reading; the consumer may be acting on a reading up to `SPEND_CACHE_MS` old
+ * (`SpendGate`), and admits a call when its own read fails.
+ */
+export interface Standing { spentUsd: number; limitUsd: number | null; exempt: boolean; platformLimitReached: boolean; refusing: boolean }
+export function standing(tenantId: string, spend: DaySpend, limits: SpendLimits): Standing {
+  const exempt = isExempt(tenantId, limits);
+  return {
+    spentUsd: spend.tenantUsd,
+    limitUsd: exempt ? null : tenantLimitOf(spend, limits),
+    exempt,
+    platformLimitReached: platformReached(spend, limits),
+    // As `SpendGate.admit`: an exempt tenant is admitted before anything is judged.
+    refusing: exempt ? false : !judge(spend, limits).admit,
+  };
+}
+
 function near(spend: DaySpend, limits: SpendLimits): boolean {
-  const tenantLimit = spend.override ? spend.override.limitUsd : limits.tenantUsd;
+  const tenantLimit = tenantLimitOf(spend, limits);
   return (limits.platformUsd !== null && spend.platformUsd >= limits.platformUsd * NEAR_FRACTION)
     || (tenantLimit !== null && spend.tenantUsd >= tenantLimit * NEAR_FRACTION);
 }
@@ -160,7 +194,7 @@ export class SpendGate {
   }
 
   async admit(tenantId: string): Promise<Admission> {
-    if (this.#limits.exempt.has(tenantId)) return { admit: true, why: "exempt" };
+    if (isExempt(tenantId, this.#limits)) return { admit: true, why: "exempt" };
     const now = this.#now();
     let hit = this.#cache.get(tenantId);
     const fresh = hit && hit.spend.day === dayOf(now)

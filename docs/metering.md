@@ -197,6 +197,13 @@ Where cost is shown:
   admin gets 404, as there; with no identity at all the console's host answers
   401 and the admin host sends the browser to sign in. Read-only: any other
   method is 405.
+- **`GET /provision/usage?from=&to=&bucket=day|month`**
+  (`cf/src/provision/usage.ts`), the tenant's own, for Raft's panel: the same
+  periods and resources for the provider token's tenant only, without
+  `model.tokens.unaccepted` (`readTenantCosts`, `cf/src/usage-d1.ts`, which
+  prices through the one fold `readUsageCosts` uses), each agent's total, and
+  today against the daily limit below (docs/agent-surface.md, "The tenant's
+  spend").
 
 ## Who pays
 
@@ -317,6 +324,14 @@ too):
 
 Every set and clear is kept in `spend_limit_events` with who, when, and the value
 it replaced. A tenant with `limitUsd` null is still refused at the platform limit.
+
+**What a tenant is shown.** `GET /provision/usage` gives a Raft tenant its
+`today`: its spend, its limit (`null` when it has none or is exempt), whether it
+is exempt, whether the platform limit is reached, and whether a call would be
+refused now — `standing` in `cf/src/spend-limit.ts`, over a fresh `readDaySpend`
+and the same `judge` the consumer applies, so the two cannot disagree on the rule,
+only on the reading's age (above). The platform's total and limit are never shown
+to a tenant, only the boolean.
 
 ## Retention
 
