@@ -5,6 +5,7 @@
  * the real queue consumer and both engines' real runtime over node:sqlite for what a refused call does to a turn
  * (as test/model-refusal.ts drives them), with only `fetch` replaced.
  */
+import { register } from "node:module";
 import { DatabaseSync } from "node:sqlite";
 import { readdirSync, readFileSync } from "node:fs";
 import { AgentRuntime } from "../cf/src/runtime.ts";
@@ -192,7 +193,7 @@ await check("a reading is kept for a while: 30 s far from a limit, 5 s within 80
   must(far.seen.reads === 1, `far: ${far.seen.reads} reads inside the window`);
   far.clock.now += 1;
   await far.gate.admit("t");
-  must(far.seen.reads === 2, `far: ${far.seen.reads} reads after the window`);
+  must(Number(far.seen.reads) === 2, `far: ${far.seen.reads} reads after the window`);
   const close = gateOver(async () => reading(4.2));
   await close.gate.admit("t");
   close.clock.now += SPEND_CACHE_NEAR_MS - 1;
@@ -200,10 +201,10 @@ await check("a reading is kept for a while: 30 s far from a limit, 5 s within 80
   must(close.seen.reads === 1, `near: ${close.seen.reads} reads inside its window`);
   close.clock.now += 1;
   await close.gate.admit("t");
-  must(close.seen.reads === 2, `near: ${close.seen.reads} reads after its window`);
+  must(Number(close.seen.reads) === 2, `near: ${close.seen.reads} reads after its window`);
   // Kept per tenant: another tenant is its own reading.
   await close.gate.admit("u");
-  must(close.seen.reads === 3, `a second tenant shared the first one's reading`);
+  must(Number(close.seen.reads) === 3, `a second tenant shared the first one's reading`);
 });
 
 await check("day rollover: refused at 23:59:50 UTC, admitted at 00:00:05 without anyone acting, inside the cache window", async () => {
@@ -221,9 +222,9 @@ await check("day rollover: refused at 23:59:50 UTC, admitted at 00:00:05 without
 await check("a spend read that fails admits the call, says so in the log, and is read again next time", async () => {
   let fail = true;
   const { gate, seen } = gateOver(async () => { if (fail) throw new Error("D1_ERROR: storage unavailable"); return reading(6); });
-  let v: Awaited<ReturnType<SpendGate["admit"]>> | null = null;
-  const lines = await logged(async () => { v = await gate.admit("t"); });
-  must(v!.admit && (v as { why: string }).why === "read_failed", show(v));
+  const got: { v?: Awaited<ReturnType<SpendGate["admit"]>> } = {};
+  const lines = await logged(async () => { got.v = await gate.admit("t"); });
+  must(got.v?.admit === true && got.v.why === "read_failed", show(got.v));
   must(lines.some((l) => l.includes("spend_limit.read_failed") && l.includes("storage unavailable")), show(lines));
   fail = false;
   const next = await gate.admit("t");
@@ -390,7 +391,7 @@ await check("/admin/spend-limits: set, set to unlimited, clear; each audited; th
   let now = NOON;
   const call = (method: string, body?: unknown) => adminSpendLimits(method, body, "github:1", { store, limits: LIMITS, now: () => now });
   let r = await call("PUT", { tenantId: "t", limitUsd: 12.5 });
-  must(r.status === 200 && (await r.json()).limitUsd === 12.5, `set: ${r.status}`);
+  must(r.status === 200 && (await r.json() as { limitUsd?: unknown }).limitUsd === 12.5, `set: ${r.status}`);
   must((await readDaySpend(db, "t", NOON)).override?.limitUsd === 12.5, "the override was not read");
   now += 1;
   r = await call("PUT", { tenantId: "t", limitUsd: null });
@@ -413,6 +414,45 @@ await check("/admin/spend-limits: set, set to unlimited, clear; each audited; th
     ["set", null, { limitUsd: 12.5 }, "github:1", NOON + 1],
     ["set", 12.5, {}, "github:1", NOON],
   ]), show(events));
+});
+
+// ---- the Worker's own consumer ---------------------------------------------------------------------------------
+
+await check("the Worker's queue handler asks the limit: over it the job is answered with the refusal and the provider is not called; bench is", async () => {
+  const STAND_IN = "export class DurableObject { constructor(ctx, env) { this.ctx = ctx; this.env = env; } }" +
+    " export class WorkerEntrypoint { constructor(ctx, env) { this.ctx = ctx; this.env = env; } }" +
+    " export class RpcTarget {} export const env = {};";
+  register("data:text/javascript," + encodeURIComponent(
+    `export async function resolve(s, c, next) { if (s.startsWith("cloudflare:")) return { url: ${JSON.stringify("data:text/javascript," + encodeURIComponent(STAND_IN))}, shortCircuit: true }; return next(s, c); }`));
+  const { default: worker } = await import("../cf/src/index.ts");
+  const db = d1();
+  spend(db, "t", 6, Math.floor(Date.now() / H) * H);
+  const delivered: Array<{ tenantId: string; answer: any }> = [];
+  const stub = {
+    takeJob: async () => ({ context: { messages: [{ role: "user", content: "hi", timestamp: 0 }] }, model: { api: "offloaded", provider: "openai-compatible" } }),
+    releaseJob: async () => true,
+    deliverAnswer: async (tenantId: string, _a: string, _j: string, answer: unknown) => { delivered.push({ tenantId, answer }); return true; },
+    recordImageAttempt: async () => true,
+  };
+  const env = {
+    AGENT: { idFromString: (s: string) => s, get: () => stub }, CONTROL_DB: db, ARTIFACTS: {},
+    HARNESS_MODEL: "deepseek-flash", DEEPSEEK_BASE_URL: "https://model.example/v1", DEEPSEEK_API_KEY: "operator-key",
+  };
+  const q = { acked: 0, retried: 0 };
+  const batch = (tenantId: string) => ({
+    queue: "model-calls",
+    messages: [{ body: { doId: "do-1", tenantId, agentId: "a", jobId: `j-${tenantId}` }, ack() { q.acked++; }, retry() { q.retried++; } }],
+  });
+  const f = answering(200, OK_BODY);
+  try {
+    await worker.queue(batch("t") as never, env as never);
+    must(f.seen.calls === 0 && q.acked === 1 && q.retried === 0, `over: provider ${f.seen.calls}, queue ${show(q)}`);
+    must(delivered.length === 1 && delivered[0]!.answer.errorMessage === SPEND_LIMIT_ERROR
+      && /^Daily usage limit reached \(\$6\.00 of \$5\.00\); resets at 00:00 UTC\.$/.test(delivered[0]!.answer.providerError), show(delivered));
+    // The control: an exempt tenant on the same deployment is called.
+    await worker.queue(batch("bench") as never, env as never);
+    must(Number(f.seen.calls) === 1 && Number(delivered.length) === 2 && delivered[1]!.answer.stopReason === "stop", `bench: provider ${f.seen.calls}, ${show(delivered[1])}`);
+  } finally { f.restore(); }
 });
 
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.error ? `\n    ${r.error}` : ""}`);
