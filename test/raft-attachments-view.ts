@@ -35,10 +35,10 @@ const le24 = (v: number) => [v & 255, (v >>> 8) & 255, (v >>> 16) & 255];
 const le32 = (v: number) => [...le16(v & 0xffff), ...le16(v >>> 16)];
 const bytes = (...parts: number[][]) => new Uint8Array(parts.flat());
 
-/** A PNG's signature and IHDR (8-bit RGBA), padded to `size` bytes when asked. */
-function png(width: number, height: number, size?: number): Uint8Array {
+/** A PNG's signature and IHDR (8-bit RGBA), the chunks in `before` ahead of IEND, padded to `size` bytes when asked. */
+function png(width: number, height: number, size?: number, before: number[][] = []): Uint8Array {
   const head = bytes([0x89, ...ascii("PNG\r\n\x1a\n")], be32(13), ascii("IHDR"), be32(width), be32(height), [8, 6, 0, 0, 0], [0, 0, 0, 0],
-    be32(0), ascii("IEND"), [0xae, 0x42, 0x60, 0x82]);
+    ...before, be32(0), ascii("IEND"), [0xae, 0x42, 0x60, 0x82]);
   if (size === undefined) return head;
   const out = new Uint8Array(size);
   out.set(head);
@@ -148,7 +148,7 @@ await check("the type is read from the bytes, never taken from Raft: a JPEG Raft
   must(out.type === "image/png" && out.view.mimeType === "image/jpeg" && out.view.width === 10 && out.view.height === 20, JSON.stringify(out));
   const store = fakeArtifacts();
   const why = await failure(() => view(PDF, "photo.png", "image/png", store));
-  must(/is a PDF document, by its first bytes \(Raft calls it image\/png\)/.test(why.message), why.message);
+  must(/is a PDF document, by its first bytes \(Raft calls it "image\/png"\)/.test(why.message), why.message);
   must(why.message.includes("use attachments_download_url"), `no pointer at the download: ${why.message}`);
   // Kept anyway, and the refusal hands over the reference.
   must(store.puts.length === 1 && why.message.includes("It was kept as artifact://raft/attachments/att-1/photo.png."), `kept: ${store.puts.length}: ${why.message}`);
@@ -179,6 +179,29 @@ await check("an animated GIF (two image descriptors) is refused; the same GIF wi
   must(/is an animated GIF, by its first bytes/.test(why.message) && why.message.includes("It was kept as artifact://"), why.message);
   const still = await view(gif(50, 40, 1), "still.gif", "image/gif");
   must(still.view.mimeType === "image/gif" && still.view.width === 50 && still.view.height === 40, JSON.stringify(still));
+});
+
+/** A PNG chunk: length, type, data, and a CRC the header reader never checks. */
+const chunk = (type: string, data: number[]) => [...be32(data.length), ...ascii(type), ...data, 0, 0, 0, 0];
+
+await check("an animated PNG (acTL before the image data) is refused; acTL after it, a tEXt before it, and IDAT ending the walk are shown", async () => {
+  const actl = chunk("acTL", [...be32(2), ...be32(0)]);
+  const idat = chunk("IDAT", [0x78, 0x9c]);
+  const why = await failure(() => view(png(64, 48, undefined, [chunk("tEXt", ascii("a\0b")), actl, idat])));
+  must(/is an animated PNG, by its first bytes/.test(why.message) && why.message.includes("It was kept as artifact://"), why.message);
+  for (const before of [[idat, actl], [chunk("tEXt", ascii("a\0b")), idat]]) {
+    const out = await view(png(64, 48, undefined, before));
+    must(out.view.mimeType === "image/png" && out.view.width === 64 && out.view.height === 48, JSON.stringify(out));
+  }
+});
+
+await check("a JPEG with stand-alone markers (TEM, RST0, RST7) before its frame header is read through them", async () => {
+  for (const m of [0x01, 0xd0, 0xd7]) {
+    const j = jpeg(30, 40);
+    const withMarker = bytes([...j.subarray(0, 2)], [0xff, m], [...j.subarray(2)]);
+    const got = imageHeader(withMarker);
+    must(got.ok && got.width === 30 && got.height === 40, `marker ${m.toString(16)}: ${JSON.stringify(got)}`);
+  }
 });
 
 await check("an animated WebP (the VP8X animation flag) is refused; the same header without the flag is shown", async () => {
@@ -234,7 +257,11 @@ await check("a cut-short header is refused, never read past its end, never answe
     }
   }
   // The minimum lengths at which each is answered, so "refused while cut" above is about the dimensions, not luck.
-  must(!imageHeader(png(0x1a3, 0x1b5).subarray(0, 23)).ok && imageHeader(png(0x1a3, 0x1b5).subarray(0, 24)).ok, "png at 23/24");
+  // A PNG is read to its first IDAT or IEND (an APNG's acTL comes before either), so a cut before that is refused.
+  const whole = png(0x1a3, 0x1b5);
+  must(!imageHeader(whole.subarray(0, whole.byteLength - 5)).ok && imageHeader(whole.subarray(0, whole.byteLength - 4)).ok, "png at IEND's type");
+  const cutBeforeData = imageHeader(whole.subarray(0, 37));
+  must(!cutBeforeData.ok && cutBeforeData.what === "a PNG cut short before its image data, so whether it is animated cannot be told", JSON.stringify(cutBeforeData));
   must(!imageHeader(webpLossy(320, 240).subarray(0, 29)).ok && imageHeader(webpLossy(320, 240).subarray(0, 30)).ok, "VP8 at 29/30");
   // Through the tool: a cut PNG is a refusal saying so, an Error and not a RangeError.
   const why = await failure(() => view(png(640, 480).subarray(0, 20)));

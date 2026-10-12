@@ -1895,7 +1895,7 @@ export type ImageHeader =
 /**
  * The type and dimensions of an image, read from its first bytes and never from a declared type: PNG (IHDR), JPEG
  * (the first SOF marker), WebP (`VP8 `, `VP8L` or `VP8X`) and GIF (the logical screen). An animated GIF (more than
- * one image descriptor) or WebP (the VP8X animation flag) is refused: a model is handed one picture, and the first
+ * one image descriptor), WebP (the VP8X animation flag) or PNG (an `acTL` chunk before the image data) is refused: a model is handed one picture, and the first
  * frame of an animation can say something other than the whole. A header that is cut short or gives no dimensions
  * is refused rather than guessed at. A read past the end is `undefined` (a typed array does not throw), so each
  * format checks its length wherever such a read could make a wrong answer rather than a refusal; and every walk
@@ -1912,6 +1912,13 @@ export function imageHeader(b: Uint8Array): ImageHeader {
 
   if (at(0, "\x89PNG\r\n\x1a\n")) {
     if (n < 24 || !at(12, "IHDR")) return { ok: false, what: "a PNG whose header is cut short or malformed" };
+    // Chunks to the image data: an APNG declares its animation (`acTL`) before the first IDAT, so a file cut before
+    // either cannot be told still from animated and is refused. Each step moves at least a chunk's 12 framing bytes.
+    for (let i = 8; ; i += 12 + b[i]! * 2 ** 24 + (b[i + 1]! << 16 | b[i + 2]! << 8 | b[i + 3]!)) {
+      if (i + 8 > n) return { ok: false, what: "a PNG cut short before its image data, so whether it is animated cannot be told" };
+      if (at(i + 4, "acTL")) return { ok: false, what: "an animated PNG" };
+      if (at(i + 4, "IDAT") || at(i + 4, "IEND")) break;
+    }
     return sized("image/png", b[16]! * 2 ** 24 + (b[17]! << 16 | b[18]! << 8 | b[19]!), b[20]! * 2 ** 24 + (b[21]! << 16 | b[22]! << 8 | b[23]!), "a PNG");
   }
   if (n >= 3 && b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) {
@@ -1924,6 +1931,8 @@ export function imageHeader(b: Uint8Array): ImageHeader {
       const m = b[i + 1]!;
       if (m === 0xff) { i++; continue; }
       if (m === 0xd9 || m === 0xda) break;
+      // TEM and RST0–7 stand alone, with no length after them.
+      if (m === 0x01 || (m >= 0xd0 && m <= 0xd7)) { i += 2; continue; }
       const length = be16(i + 2);
       if (m >= 0xc0 && m <= 0xcf && m !== 0xc4 && m !== 0xc8 && m !== 0xcc) {
         if (i + 8 >= n || length < 7) break;
@@ -1999,7 +2008,7 @@ function sizeOf(bytes: number): string {
 
 /**
  * `attachments_view`, end to end. The file is fetched and kept first, as the download keeps it, so a refusal can hand
- * the agent the reference to what was kept (and a second call costs nothing new); then its first bytes decide what it
+ * the agent the reference to what was kept (a second call fetches and writes it again, under the same key, so storage does not grow); then its first bytes decide what it
  * is (`imageHeader`) and the limits are applied. A refusal is a thrown error, like every other here.
  */
 export async function viewAttachment(
@@ -2016,7 +2025,7 @@ export async function viewAttachment(
   const header = imageHeader(file.bytes);
   if (!header.ok) {
     throw new Error(`${VIEW_TOOL} shows only PNG, JPEG, WebP and still GIF images; ${which} is ${header.what}, by its first bytes ` +
-      `(Raft calls it ${file.type}). ${kept} For a file that is not an image, use ${DOWNLOAD_TOOL}.`);
+      `(Raft calls it ${JSON.stringify(file.type)}). ${kept} For a file that is not an image, use ${DOWNLOAD_TOOL}.`);
   }
   const over = [
     ...(bytes > VIEW_MAX_BYTES ? [`${sizeOf(bytes)}, over the ${sizeOf(VIEW_MAX_BYTES)} limit`] : []),

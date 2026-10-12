@@ -512,7 +512,7 @@ at all without, falling back to `attachments.download` when the Server cannot mi
 are a PNG, JPEG, WebP or still GIF of at most `VIEW_MAX_BYTES` (1.5 MiB) and
 `VIEW_MAX_SIDE` (2000 px a side), returns the same fields plus a `view` (the
 reference, the type read from the bytes, width, height and size) that the gateway
-can hand the model as an image; anything else, an animated GIF or WebP, or an
+can hand the model as an image; anything else, an animated GIF, WebP or PNG, or an
 image over a limit is refused with what it is and the reference to the copy
 kept, since nothing resizes. It is listed by a snapshot exactly where the
 download is and offered only beside it. A tool's description and every parameter description in its
