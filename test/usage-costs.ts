@@ -19,6 +19,7 @@ import { KEEP_HOURLY_DAYS, priceFor, readAgentLedger, readUsage, readUsageCosts,
 import { parseCostsQuery } from "../cf/src/admin-usage-costs.ts";
 import { d1ApiKeys } from "../cf/src/control-plane.ts";
 import { hashApiKey, newApiKey } from "../cf/src/agents-api/keys.ts";
+import { sessionCookieFor, type Viewer } from "../cf/src/auth.ts";
 
 const STAND_IN = "export class DurableObject { constructor(ctx, env) { this.ctx = ctx; this.env = env; } }" +
   " export class WorkerEntrypoint { constructor(ctx, env) { this.ctx = ctx; this.env = env; } }" +
@@ -256,6 +257,48 @@ await check("/admin/usage-costs: refused without the operator's token, with a wr
   }
   const ok = await call(env(db), "GET", path, { "x-harness-token": TOKEN });
   must(ok.status === 200 && ok.body.currency === "USD" && ok.body.estimated === true, `${ok.status} ${ok.text}`);
+});
+
+await check("/admin/usage-costs: a signed-in admin reads it on the admin host and the console's, as /admin/spend-limits; anyone else is refused", async () => {
+  const db = d1();
+  put(db, flashReply());
+  const SECRET = "s".repeat(48), ADMIN = "https://admin.api.test", UI = "https://api.test";
+  const e = env(db, { SESSION_SECRET: SECRET, ADMIN_ORIGIN: ADMIN, UI_ORIGIN: UI, ADMIN_IDENTITIES: "github:1" });
+  const session = async (sub: string) => {
+    const v: Viewer = { email: `${sub}@x`, name: null, username: null, picture: null, source: "github", agentId: "a", tenantId: "t", sub };
+    return { cookie: (await sessionCookieFor(SECRET, v, sub)).split(";")[0]! };
+  };
+  const admin = await session("github:1"), other = await session("github:2");
+  const path = "/admin/usage-costs?bucket=day&from=2026-10-09&to=2026-10-12";
+  const at = async (origin: string, method: string, p: string, headers: Record<string, string> = {}) => {
+    const r = await worker.fetch(new Request(`${origin}${p}`, { method, headers, redirect: "manual" }), e as never);
+    return { status: r.status, text: await r.text(), location: r.headers.get("location") };
+  };
+  for (const origin of [ADMIN, UI]) {
+    const ok = await at(origin, "GET", path, admin);
+    must(ok.status === 200 && JSON.parse(ok.text).tenants.some((t: any) => t.tenantId === "t"), `${origin}, admin: ${ok.status} ${ok.text}`);
+    // The refusals /admin/spend-limits gives on the same host, for the same callers: the same answer, no figure.
+    // Nobody at all on the console's host is the exception, kept at the 401 it was before (below).
+    const callers: Array<[string, Record<string, string>]> = origin === ADMIN ? [["non-admin", other], ["nobody", {}]] : [["non-admin", other]];
+    for (const [who, h] of callers) {
+      const r = await at(origin, "GET", path, h), limits = await at(origin, "GET", "/admin/spend-limits", h);
+      must(r.status === limits.status && r.location === limits.location && !/tenants|total/.test(r.text),
+        `${origin}, ${who}: usage-costs ${r.status} ${r.location}, spend-limits ${limits.status} ${limits.location}`);
+    }
+    // Read-only: a write is refused for an admin too.
+    must((await at(origin, "POST", path, admin)).status === 405, `${origin}: POST by an admin`);
+  }
+  // On the admin host nobody signed in is sent to sign in; a non-admin is told there is no such route.
+  const none = await at(ADMIN, "GET", path);
+  must(none.status === 302 && none.location === `${UI}/admin/handoff`, `admin host, no session: ${none.status} ${none.location}`);
+  must((await at(ADMIN, "GET", path, other)).status === 404, "admin host, non-admin");
+  // On the console's host: a non-admin is told nothing, as on /admin/spend-limits; no identity keeps its 401.
+  must((await at(UI, "GET", path, other)).status === 404, "console host, non-admin");
+  must((await at(UI, "GET", path)).status === 401, "console host, nobody");
+  // The operator's token is unchanged, with or without a non-admin's cookie beside it.
+  must((await at(UI, "GET", path, { "x-harness-token": TOKEN })).status === 200, "console host, token");
+  must((await at(UI, "GET", path, { "x-harness-token": TOKEN, ...other })).status === 200, "console host, token and a non-admin's cookie");
+  must((await at(UI, "GET", path, { "x-harness-token": "nope" })).status === 401, "console host, wrong token");
 });
 
 await check("/admin/usage-costs: per tenant, period and resource, with the unaccepted answers the tenant never sees", async () => {
