@@ -863,12 +863,20 @@ export function requestTokens(sql: Sql, jobId: string): number | null {
  * prompt and tool list, which a rebuilt request carries too. Zero when the job is not found.
  */
 export function requestFixedTokens(sql: Sql, jobId: string): number {
+  return jobFixedTokens(sql, jobId) ?? 0;
+}
+
+/**
+ * `requestFixedTokens`, null when the job is not found or its request does not parse: the idle rule
+ * (src/runtime/rebuild.ts `idleRebuild`) reads it per agent, as its system prompt and tool count differ.
+ */
+export function jobFixedTokens(sql: Sql, jobId: string): number | null {
   const r = sql.exec("SELECT request FROM pi_model_jobs WHERE id = ?", jobId).toArray()[0] as any;
-  if (!r) return 0;
+  if (!r) return null;
   try {
     const c = JSON.parse(String(r.request))?.context ?? {};
     return estimateTokens(String(c.systemPrompt ?? "") + JSON.stringify(c.tools ?? []));
-  } catch { return 0; }
+  } catch { return null; }
 }
 
 /** The main conversation's newest model call still out, if any: its id. */

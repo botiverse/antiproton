@@ -42,6 +42,7 @@ const facts = (o: Partial<RebuildFacts>): RebuildFacts => ({
   prevReasoning: false, prevWakeHitRate: 0.99, ...o,
 });
 const LUNA = { provider: "cloudflare", model: "openai/gpt-5.6-luna" };
+const GPT = { provider: "cloudflare", model: "openai/gpt-4.1-mini" };
 
 // [case, facts, wouldRebuild, predictedCold, expectedCold, reason, rule]
 const table: Array<[string, Partial<RebuildFacts>, boolean, boolean, boolean, string, string]> = [
@@ -54,10 +55,18 @@ const table: Array<[string, Partial<RebuildFacts>, boolean, boolean, boolean, st
   ["deepseek: a small, warm context", { gapMs: 3 * MIN, contextTokens: 50_000 }, false, false, false, "context-below-threshold", "deepseek"],
   ["deepseek: the threshold itself is not over it", { contextTokens: 128_000 }, false, true, false, "context-below-threshold", "deepseek"],
   ["deepseek: reasoning alone decides nothing", { gapMs: 3 * MIN, prevReasoning: true }, false, false, false, "warm", "deepseek"],
-  ["luna: long gap, large context", { ...LUNA }, true, true, false, "gap-over-limit", "openai-ttl"],
-  ["luna: short gap, even after a cold wake (time is its only rule)", { ...LUNA, gapMs: 3 * MIN, prevWakeHitRate: 0.1 }, false, false, false, "warm", "openai-ttl"],
-  ["luna: exactly 60 minutes is not over it", { ...LUNA, gapMs: 60 * MIN }, false, false, false, "warm", "openai-ttl"],
-  ["luna: long gap, small context", { ...LUNA, contextTokens: 20_000 }, false, true, false, "context-below-threshold", "openai-ttl"],
+  ["luna: long gap, large context", { ...LUNA }, true, true, false, "gap-over-limit", "luna-ttl"],
+  ["luna: short gap, even after a cold wake (time is its only rule)", { ...LUNA, gapMs: 3 * MIN, prevWakeHitRate: 0.1 }, false, false, false, "warm", "luna-ttl"],
+  // Production, 2026-10-12: warm after 14.7 minutes idle, cold after 44.
+  ["luna: 29 minutes is warm", { ...LUNA, gapMs: 29 * MIN }, false, false, false, "warm", "luna-ttl"],
+  ["luna: exactly 30 minutes is not over it", { ...LUNA, gapMs: 30 * MIN }, false, false, false, "warm", "luna-ttl"],
+  ["luna: 31 minutes is cold", { ...LUNA, gapMs: 31 * MIN }, true, true, false, "gap-over-limit", "luna-ttl"],
+  ["luna: 44 minutes is cold", { ...LUNA, gapMs: 44 * MIN }, true, true, false, "gap-over-limit", "luna-ttl"],
+  ["luna: long gap, small context", { ...LUNA, contextTokens: 20_000 }, false, true, false, "context-below-threshold", "luna-ttl"],
+  // Luna's 30 minutes is its own: another OpenAI model keeps the hour.
+  ["another gpt- model: 44 minutes is warm", { ...GPT, gapMs: 44 * MIN }, false, false, false, "warm", "openai-ttl"],
+  ["another gpt- model: exactly 60 minutes is not over it", { ...GPT, gapMs: 60 * MIN }, false, false, false, "warm", "openai-ttl"],
+  ["another gpt- model: 61 minutes is cold", { ...GPT, gapMs: 61 * MIN }, true, true, false, "gap-over-limit", "openai-ttl"],
   ["unknown model: the fallback is the gap rule", { provider: "x", model: "m1", gapMs: 3 * MIN, prevWakeHitRate: 0.1 }, false, false, false, "warm", "gap"],
   // Cold by construction: out of the disagreement rate.
   ["no call yet in the conversation", { gapMs: null, contextTokens: null }, false, true, true, "no-previous-call", "deepseek"],

@@ -39,7 +39,7 @@ import {
 import { explainUnavailableTool } from "../../src/runtime/unavailable-tool.ts";
 import {
   bindingKey, buildBriefing, programSendCounter, clearBackstop, conversationMessages, hasAnswer, judgeOverflow, mainCallOut, mainMessages, mainTip, needsReset, noteRebuilt,
-  noteRunEndedWell, noticeHeads, overflowKind, readBackstop, recordBackstop, recordNoticeHead, requestFixedTokens, requestTokens, returnPendingBriefing,
+  jobFixedTokens, noteRunEndedWell, noticeHeads, overflowKind, readBackstop, recordBackstop, recordNoticeHead, requestFixedTokens, requestTokens, returnPendingBriefing,
   SessionNeedsReset, takePendingBriefing, type Briefing, type Judge,
 } from "../../src/runtime/overflow-backstop.ts";
 import { credentialRedactor, agentSecretValues } from "./eval-read.ts";
@@ -650,7 +650,7 @@ export interface RuntimeDeps {
    * The rules a context rebuild is decided by (src/runtime/rebuild.ts), in shadow: each inbound wake of a pi085 main
    * conversation records what they would decide and what the wake's first call then measured; a context near the
    * window, an overflow, and a pd compaction are recorded in the same terms. Only the idle rule is acted on: a wake
-   * after a long idle on a context larger than a briefing is rebuilt before it is answered (`#coldWake`). Absent:
+   * after a long idle on a context a rebuild at least halves is rebuilt before it is answered (`#coldWake`). Absent:
    * nothing is recorded or rebuilt (the benchmark's runtime).
    */
   rebuildPolicy?: RebuildPolicy | null;
@@ -1279,7 +1279,7 @@ export class AgentRuntime {
    * conversation only, and only when it is idle: a post into a running turn is a steer, not a wake, and is logged as
    * such; pd is logged as not applicable (its conversations are not pi085's transcript).
    *
-   * A wake the idle rule names (`idleRebuild`: a long gap on a context larger than a briefing) is rebuilt here, before
+   * A wake the idle rule names (`idleRebuild`: a long gap on a context a rebuild at least halves) is rebuilt here, before
    * it is answered (`#rebuildContext`, trigger `cold-wake`): the post that follows carries the briefing ahead of the
    * wake, so the first request starts with the briefing and ends with the wake. Its one decision row says so
    * (`idleRebuildRecord`), and the run that follows is watched for its `rebuild.behaviour` row (`#settleBehaviour`).
@@ -1315,10 +1315,11 @@ export class AgentRuntime {
       const decision = shouldRebuild(facts, policy);
       const coldHitRate = ruleFor(policy, binding.provider, binding.model).coldHitRate;
       const transact = this.#transact();
-      const idle = idleRebuild(facts, policy);
-      let passed: { reason: string; entry: string } = { reason: idle.reason, entry: idle.entry };
+      const idle = idleRebuild({ ...facts, fixedTokens: facts.lastJobId ? jobFixedTokens(sql, facts.lastJobId) : null }, policy);
+      const sized = { entry: idle.entry, fixedTokens: idle.fixedTokens, thresholdTokens: idle.thresholdTokens };
+      let passed: { reason: string; entry: string; fixedTokens: number | null; thresholdTokens: number | null } = { reason: idle.reason, ...sized };
       // Judged as the post will judge it (`needsReset`): a mark a binding change or its age has cleared does not hold.
-      if (idle.rebuild && needsReset(sql, await this.#judge(tenantId, agentId))) passed = { reason: "needs-reset", entry: idle.entry };
+      if (idle.rebuild && needsReset(sql, await this.#judge(tenantId, agentId))) passed = { reason: "needs-reset", ...sized };
       else if (idle.rebuild) {
         try {
           const built = await this.#rebuildContext(tenantId, agentId, { trigger: "cold-wake", strategy: "briefing" }, now);
@@ -1331,7 +1332,7 @@ export class AgentRuntime {
           return;
         } catch (e) {
           logEvent("rebuild.failed", { tenantId, agentId, trigger: "cold-wake", error: String((e as Error)?.message ?? e).slice(0, 200) });
-          passed = { reason: "rebuild-failed", entry: idle.entry };
+          passed = { reason: "rebuild-failed", ...sized };
         }
       }
       const conversation = this.#conversationOf(MAIN_SESSION), logical = logicalMain(sql).conversation;

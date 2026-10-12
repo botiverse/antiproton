@@ -1,8 +1,8 @@
 /**
  * Context rebuild, decided at wake time — in shadow: the decision is recorded and never acted on, but for one rule.
  *
- * The exception is the idle rule (`IdleRule`, `idleRebuild`): a wake after a long idle on a context larger than a
- * briefing is rebuilt before it is answered (`#coldWake` in cf/src/runtime.ts, through `rebuildContext`). Its row is
+ * The exception is the idle rule (`IdleRule`, `idleRebuild`): a wake after a long idle on a context at least twice what
+ * the rebuilt request would carry is rebuilt before it is answered (`#coldWake` in cf/src/runtime.ts, through `rebuildContext`). Its row is
  * the wake's one cold-wake decision, `status: ran` and `shadow: false` (`idleRebuildRecord`); a wake it does not
  * rebuild keeps its shadow row, which says why (`idleRebuild`).
  *
@@ -56,9 +56,8 @@ export type RebuildStrategy = "summary" | "briefing";
 export interface RebuildRequest { trigger: RebuildTrigger; strategy: RebuildStrategy }
 
 /**
- * The size a briefing is built to, in estimated tokens (src/runtime/overflow-backstop.ts `buildBriefing`), and the
- * default context an idle rebuild must exceed: a context no larger than the briefing that would replace it saves
- * nothing.
+ * The size a briefing is built to, in estimated tokens (src/runtime/overflow-backstop.ts `buildBriefing`): with the
+ * request's system prompt and tools, what the first request after an idle rebuild carries (`idleRebuild`).
  */
 export const BRIEFING_BUDGET_TOKENS = 8_000;
 
@@ -83,12 +82,13 @@ export interface RebuildRule {
 
 /**
  * The rule a wake after a long idle is rebuilt by, before it is answered: the gap since the conversation's last
- * answered call over `idleMinutes`, and that call's input over `minContextTokens`. Acted on, unlike the rules above.
- * `idleMinutes: null` turns it off for the models it covers.
+ * answered call over `idleMinutes`, and that call's input at least twice what the rebuilt request would carry
+ * (`idleRebuild`). Acted on, unlike the rules above. `idleMinutes: null` turns it off for the models it covers.
  */
 export interface IdleRule {
   idleMinutes: number | null;
-  minContextTokens: number;
+  /** An extra floor: a context of at most this many tokens is never rebuilt, whatever the saving. None when absent. */
+  minContextTokens?: number;
 }
 
 /**
@@ -112,21 +112,31 @@ export interface RebuildPolicy {
 }
 
 const HOUR_MS = 60 * 60_000;
+const MINUTE_MS = 60_000;
 export const DEFAULT_MIN_CONTEXT_TOKENS = 128_000;
 export const DEFAULT_WINDOW_SHARE = 0.8;
 
-/** Rebuild a wake after 50 minutes idle when the context is larger than a briefing (tygg, 2026-10-11). */
-export const DEFAULT_IDLE_RULE: IdleRule = { idleMinutes: 50, minContextTokens: BRIEFING_BUDGET_TOKENS };
-/** The two model families in production named on their own, so each can be tuned or turned off apart. */
+/** Rebuild a wake after 50 minutes idle (tygg, 2026-10-11), when the rebuild at least halves the request (`idleRebuild`). */
+export const DEFAULT_IDLE_RULE: IdleRule = { idleMinutes: 50 };
+/**
+ * What the two model families in production change of `DEFAULT_IDLE_RULE`, each named so it can be tuned or turned
+ * off apart. Luna at 30 minutes: on production wakes (Damy, 2026-10-12) one after 14.7 minutes idle read 99.4% of its
+ * input from cache and one after 44 minutes none of it; earlier wakes were warm up to 13 minutes and cold from 85.
+ */
+const DEFAULT_IDLE_OVERRIDES: Record<string, Partial<IdleRule>> = { deepseek: {}, "gpt-5.6-luna": { idleMinutes: 30 } };
 export const DEFAULT_IDLE_POLICY: IdlePolicy = {
   default: DEFAULT_IDLE_RULE,
-  byModel: { deepseek: DEFAULT_IDLE_RULE, "gpt-5.6-luna": DEFAULT_IDLE_RULE },
+  byModel: Object.fromEntries(Object.entries(DEFAULT_IDLE_OVERRIDES).map(([k, o]) => [k, { ...DEFAULT_IDLE_RULE, ...o }])),
 };
 
 export const DEFAULT_REBUILD_POLICY: RebuildPolicy = {
   rules: [
     { name: "deepseek", match: { modelIncludes: "deepseek" }, minContextTokens: DEFAULT_MIN_CONTEXT_TOKENS,
       coldAfterGapMs: HOUR_MS, previousColdCounts: true, coldHitRate: 0.5 },
+    // Ahead of `openai-ttl`, which covers every other `gpt-` model: Luna's cache is gone within 15 to 44 minutes
+    // (`DEFAULT_IDLE_OVERRIDES`), so an hour predicted warm wakes that were cold.
+    { name: "luna-ttl", match: { modelIncludes: "gpt-5.6-luna" }, minContextTokens: DEFAULT_MIN_CONTEXT_TOKENS,
+      coldAfterGapMs: 30 * MINUTE_MS, previousColdCounts: false, coldHitRate: 0.5 },
     { name: "openai-ttl", match: { modelIncludes: "gpt-" }, minContextTokens: DEFAULT_MIN_CONTEXT_TOKENS,
       coldAfterGapMs: HOUR_MS, previousColdCounts: false, coldHitRate: 0.5 },
   ],
@@ -147,7 +157,7 @@ const isRule = (r: any): r is RebuildRule => !!r && typeof r === "object" && typ
   && Number.isFinite(r.coldHitRate) && r.coldHitRate >= 0 && r.coldHitRate <= 1;
 const isIdleRule = (r: any): boolean => !!r && typeof r === "object"
   && (r.idleMinutes === null || (Number.isFinite(r.idleMinutes) && r.idleMinutes > 0))
-  && Number.isFinite(r.minContextTokens) && r.minContextTokens >= 0;
+  && (r.minContextTokens === undefined || (Number.isFinite(r.minContextTokens) && r.minContextTokens >= 0));
 const isIdle = (i: any): boolean => i === undefined || i === false || (!!i && typeof i === "object" && isIdleRule(i.default)
   && (i.byModel === undefined || (!!i.byModel && typeof i.byModel === "object" && !Array.isArray(i.byModel)
     && Object.values(i.byModel).every(isIdleRule))));
@@ -163,9 +173,10 @@ const plain = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 
 /**
  * The idle section as written, over the defaults: `false` stays off; an object's `default` is laid over
  * `DEFAULT_IDLE_RULE`, and each `byModel` entry, the default ones (`DEFAULT_IDLE_POLICY`) included, over that merged
- * default. So `{"byModel": {"deepseek": {"idleMinutes": null}}}` turns DeepSeek off and leaves the rest as they were,
- * and `{"default": {"idleMinutes": 90}}` moves every model the defaults name. Anything else is returned as it is, for
- * `isIdle` to refuse.
+ * default with the entry's own default changes (`DEFAULT_IDLE_OVERRIDES`) on top. So `{"byModel": {"deepseek":
+ * {"idleMinutes": null}}}` turns DeepSeek off and leaves the rest as they were, and `{"default": {"idleMinutes": 90}}`
+ * moves every model the defaults name but for a field a model sets itself (Luna's 30 minutes). Anything else is
+ * returned as it is, for `isIdle` to refuse.
  */
 function mergeIdle(idle: unknown): unknown {
   if (idle === undefined || idle === false || !plain(idle)) return idle;
@@ -176,7 +187,8 @@ function mergeIdle(idle: unknown): unknown {
   const byModel: Record<string, unknown> = {};
   for (const k of new Set([...Object.keys(DEFAULT_IDLE_POLICY.byModel ?? {}), ...Object.keys(mine)])) {
     const entry = mine[k];
-    byModel[k] = entry === undefined ? def : plain(entry) ? { ...def, ...entry } : entry;
+    const base = { ...def, ...(Object.hasOwn(DEFAULT_IDLE_OVERRIDES, k) ? DEFAULT_IDLE_OVERRIDES[k] : {}) };
+    byModel[k] = entry === undefined ? base : plain(entry) ? { ...base, ...entry } : entry;
   }
   return { default: def, byModel };
 }
@@ -224,6 +236,8 @@ export interface RebuildFacts {
   prevWakeHitRate: number | null;
   /** That wake's gap, as its decision read it; null when none was measured or it predates the column. */
   prevWakeGapMs?: number | null;
+  /** The model job of the last answered call (its entry's `jobId`), whose request the idle rule reads; null when none. */
+  lastJobId?: string | null;
 }
 
 export type RebuildReason =
@@ -267,7 +281,8 @@ export function shouldRebuild(facts: RebuildFacts, policy: RebuildPolicy): Rebui
 }
 
 export type IdleReason =
-  | "idle-off" | "no-previous-call" | "context-unknown" | "gap-under-idle" | "context-below-briefing" | "idle-over-limit";
+  | "idle-off" | "no-previous-call" | "context-unknown" | "gap-under-idle" | "fixed-unknown" | "savings-below-half"
+  | "context-below-floor" | "idle-over-limit";
 
 export interface IdleDecision {
   rebuild: boolean;
@@ -275,8 +290,22 @@ export interface IdleDecision {
   /** The config entry that applied: `default`, `byModel:<key>`, or `off` when the policy has no idle rules. */
   entry: string;
   idleMs: number | null;
+  /** The rule's extra floor; null when it sets none. */
   minContextTokens: number | null;
+  /** The last request's system prompt and tools, in estimated tokens; null when unknown. */
+  fixedTokens: number | null;
+  /** The context a rebuild needs, `2 × (fixedTokens + BRIEFING_BUDGET_TOKENS)`; null when `fixedTokens` is unknown. */
+  thresholdTokens: number | null;
 }
+
+/** The facts the idle rule reads: `RebuildFacts`', and the fixed part of the last answered call's request. */
+export type IdleFacts = Pick<RebuildFacts, "gapMs" | "contextTokens" | "model"> & {
+  /**
+   * The last answered call's system prompt and tools, in estimated tokens (src/runtime/overflow-backstop.ts
+   * `jobFixedTokens`), which the rebuilt request carries too; null when that call's request is not found.
+   */
+  fixedTokens: number | null;
+};
 
 /** The idle rule for a model, and the entry it came from (`IdlePolicy`). */
 export function idleRuleFor(policy: RebuildPolicy, model: string): { entry: string; rule: IdleRule | null } {
@@ -290,20 +319,28 @@ export function idleRuleFor(policy: RebuildPolicy, model: string): { entry: stri
 
 /**
  * Whether a wake is rebuilt before it is answered (`IdleRule`, the model's own by `idleRuleFor`): the gap strictly
- * over the rule's idle time, and the last answered call's input strictly over its context floor. A conversation with
- * no answered call, or reset since it, has nothing to rebuild from.
+ * over the rule's idle time, and the last answered call's input C at least `2 × (fixed + briefing budget)`, so the
+ * rebuilt request (the same system prompt and tools, and a briefing) is at most half of it; a smaller saving does not
+ * pay for the re-orientation a rebuild costs. A production rebuild at C = 51,096 (Damy, 2026-10-12, 110 tools, about
+ * 26k fixed) sent 33,788 next: a third saved. The rule's `minContextTokens`, when set, is a floor on top. A
+ * conversation with no answered call, or reset since it, has nothing to rebuild from; a request whose fixed part is
+ * unknown is not rebuilt, as its saving cannot be judged.
  */
-export function idleRebuild(facts: Pick<RebuildFacts, "gapMs" | "contextTokens" | "model">, policy: RebuildPolicy): IdleDecision {
+export function idleRebuild(facts: IdleFacts, policy: RebuildPolicy): IdleDecision {
   const { entry, rule } = idleRuleFor(policy, facts.model);
-  if (rule === null || rule.idleMinutes === null) {
-    return { rebuild: false, reason: "idle-off", entry, idleMs: null, minContextTokens: rule?.minContextTokens ?? null };
-  }
-  const idleMs = rule.idleMinutes * 60_000;
-  const out = (rebuild: boolean, reason: IdleReason): IdleDecision => ({ rebuild, reason, entry, idleMs, minContextTokens: rule.minContextTokens });
+  const minContextTokens = rule?.minContextTokens ?? null;
+  const fixedTokens = facts.fixedTokens;
+  const thresholdTokens = fixedTokens === null ? null : 2 * (fixedTokens + BRIEFING_BUDGET_TOKENS);
+  const idleMs = rule === null || rule.idleMinutes === null ? null : rule.idleMinutes * 60_000;
+  const out = (rebuild: boolean, reason: IdleReason): IdleDecision =>
+    ({ rebuild, reason, entry, idleMs, minContextTokens, fixedTokens, thresholdTokens });
+  if (idleMs === null) return out(false, "idle-off");
   if (facts.gapMs === null) return out(false, "no-previous-call");
   if (facts.contextTokens === null) return out(false, "context-unknown");
   if (facts.gapMs <= idleMs) return out(false, "gap-under-idle");
-  if (facts.contextTokens <= rule.minContextTokens) return out(false, "context-below-briefing");
+  if (thresholdTokens === null) return out(false, "fixed-unknown");
+  if (facts.contextTokens < thresholdTokens) return out(false, "savings-below-half");
+  if (minContextTokens !== null && facts.contextTokens <= minContextTokens) return out(false, "context-below-floor");
   return out(true, "idle-over-limit");
 }
 
@@ -352,22 +389,23 @@ const answered = (stopReason: unknown) => stopReason === "stop" || stopReason ==
 /**
  * The transcript's side of the facts, read from the conversation's entries table (`piTables(session).entries`): when
  * its last answered model call ended, how large that request was, whether its turn reasoned, and the previous
- * measured wake's hit rate from this module's own table. Failed wakes since (a user message with only error answers
+ * measured wake's hit rate from this module's own table, and that call's model job. Failed wakes since (a user message with only error answers
  * after it) are passed over: the cache is as warm as the last call that was answered. Only the fields read are
  * selected, never the bodies.
  */
 export function readWakeFacts(sql: Sql, entries: string, now: number, boundaryWhere: string):
-  Pick<RebuildFacts, "gapMs" | "contextTokens" | "prevReasoning" | "prevWakeHitRate" | "prevWakeGapMs"> {
+  Pick<RebuildFacts, "gapMs" | "contextTokens" | "prevReasoning" | "prevWakeHitRate" | "prevWakeGapMs" | "lastJobId"> {
   const rows = hasTable(sql, entries) ? sql.exec(
     `SELECT seq, timestamp, json_extract(body, '$.message.role') AS role, json_extract(body, '$.message.stopReason') AS stop, ` +
     `json_extract(body, '$.message.usage.input') AS input, json_extract(body, '$.message.usage.reasoning') AS reasoning, ` +
+    `json_extract(body, '$.message.jobId') AS job, ` +
     `EXISTS (SELECT 1 FROM json_each(body, '$.message.content') WHERE json_extract(value, '$.type') = 'thinking') AS thought ` +
     `FROM ${entries} WHERE type = 'message' ORDER BY seq DESC LIMIT ?`, TURN_SCAN).toArray() : [];
-  let last: { seq: number; at: number; input: number | null } | null = null;
+  let last: { seq: number; at: number; input: number | null; job: string | null } | null = null;
   let reasoned: boolean | null = null;
   for (const r of rows as any[]) {
     if (!last) {
-      if (r.role === "assistant" && answered(r.stop)) last = { seq: Number(r.seq), at: Number(r.timestamp), input: num(r.input) };
+      if (r.role === "assistant" && answered(r.stop)) last = { seq: Number(r.seq), at: Number(r.timestamp), input: num(r.input), job: typeof r.job === "string" ? r.job : null };
       else continue;
     }
     if (r.role === "user") { reasoned ??= false; break; }
@@ -390,6 +428,7 @@ export function readWakeFacts(sql: Sql, entries: string, now: number, boundaryWh
     prevReasoning: last ? reasoned : null,
     prevWakeHitRate,
     prevWakeGapMs,
+    lastJobId: last?.job ?? null,
   };
 }
 
@@ -464,8 +503,11 @@ export function coldWakeRecord(o: {
   /** The conversation as its readers know it across overflow rebuilds (cf/src/fresh-context.ts `logicalMain`). */
   logicalConversation?: string;
   facts: RebuildFacts; decision: RebuildDecision; coldHitRate: number; at: number;
-  /** Why the idle rule did not rebuild this wake (`idleRebuild`, or the runtime's own reason), and the entry it applied. */
-  idle?: { reason: string; entry: string };
+  /**
+   * Why the idle rule did not rebuild this wake (`idleRebuild`, or the runtime's own reason), the entry it applied,
+   * and the request's fixed part and the context a rebuild would have needed.
+   */
+  idle?: { reason: string; entry: string; fixedTokens?: number | null; thresholdTokens?: number | null };
 }): DecisionRecord {
   const f = o.facts, d = o.decision;
   return {
@@ -479,7 +521,10 @@ export function coldWakeRecord(o: {
       prevReasoning: f.prevReasoning, prevWakeHitRate: f.prevWakeHitRate, conversation: o.conversation,
       logicalConversation: o.logicalConversation ?? o.conversation,
       ...(f.prevWakeGapMs !== undefined ? { prevWakeGapMs: f.prevWakeGapMs } : {}),
-      ...(o.idle !== undefined ? { idleRebuild: o.idle.reason, idleEntry: o.idle.entry } : {}),
+      ...(o.idle !== undefined ? {
+        idleRebuild: o.idle.reason, idleEntry: o.idle.entry,
+        fixedTokens: o.idle.fixedTokens ?? null, idleThresholdTokens: o.idle.thresholdTokens ?? null,
+      } : {}),
     },
     at: o.at,
   };
@@ -507,6 +552,7 @@ export function idleRebuildRecord(o: {
     facts: {
       acted: true, gapMs: f.gapMs, contextTokens: f.contextTokens,
       idleEntry: o.idle.entry, idleMs: o.idle.idleMs, minContextTokens: o.idle.minContextTokens,
+      fixedTokens: o.idle.fixedTokens, idleThresholdTokens: o.idle.thresholdTokens,
       provider: f.provider, model: f.model, prevReasoning: f.prevReasoning,
       // What the wake's own first call can no longer measure (it is sent a new transcript): the prediction, and the
       // previous measured wake's hit rate and gap, so whether a warm cache was thrown away can be judged per model.
