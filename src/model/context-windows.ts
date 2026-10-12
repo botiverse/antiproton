@@ -29,6 +29,9 @@ export const CONTEXT_WINDOWS: Record<string, number> = {
   // magnitude if guessed.
   "deepseek-flash": 1_000_000,
   "deepseek-v4-pro": 1_000_000,
+  // Read off Anthropic's models overview (https://platform.claude.com/docs/en/about-claude/models/overview, 2026-10-12),
+  // not measured. Its requests are kept far under it by a soft window (src/runtime/rebuild.ts `DEFAULT_SOFT_WINDOW_POLICY`).
+  "claude-haiku-5-5": 1_000_000,
 };
 
 export function contextWindowFor(

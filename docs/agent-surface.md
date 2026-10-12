@@ -573,7 +573,15 @@ A `rebuild.decision` row is a context rebuild decided (`src/runtime/rebuild.ts`)
 `REBUILD_POLICY`, predict the cache cold, `predictedCold`, and would rebuild, `wouldRebuild` — cold and over the
 size threshold — with `reason` and the facts: gap, context tokens, model, the previous wake's first-call hit rate;
 `expectedCold` for a first call or one after a reset), `window` (a pi085 context at 80% of its window, an answer
-that is a context overflow, or a pd compaction that ran) or `operator` (a manual pd compaction), with `strategy`.
+that is a context overflow, a call held back at its soft window, or a pd compaction that ran) or `operator` (a manual
+pd compaction), with `strategy`. A soft window is a request size a model's calls are kept under for its price
+(`REBUILD_POLICY`'s `softWindow`: `{ "share": 0.9, "byModel": { "<model id, or a part of it>": tokens | null } }`, laid
+over the default, which names only `claude-haiku-5-5` at 100,000; `"softWindow": false` turns it off): on pi085's main
+conversation a call is not sent once the conversation's last answered call measured `share` of it or more, and the
+conversation is rebuilt from a briefing first. Its row is the backstop's, `reason` `soft-window`, `rule` the entry
+(`byModel:<key>`), with `softWindow`, `softThresholdTokens`, `measuredTokens` and `softHoldsInRow`; a conversation that
+starts over its soft window is never held back, and after three such rebuilds with no run ending well
+(`softWindowSuspended: true`) calls are sent over it until one does.
 Its `rebuild.outcome` row (`parentId` the decision's `spanId`, `spanId` the model job) is the next call measured:
 `input`, `cacheRead`, `hitRate`, and `status` `agree`, `false-cold`, `false-warm` (`predictedCold` against the
 measurement), `expected-cold` (cold by construction, out of the rate) or `unmeasured` (an error, or no input).

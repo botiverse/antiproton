@@ -228,8 +228,9 @@ Antiproton is designed to run as a Cloudflare Worker backed by Durable Objects:
    ```
 
    **Model providers.** The operator's model account reaches the providers the `MODEL_PROVIDERS` var
-   declares: a JSON array of `{ id, baseUrl, auth: { secret, header }, modelFormat?, passKeys? }`, where
-   `baseUrl` is an https OpenAI-compatible endpoint and `auth.secret` is the *name* of the Worker secret
+   declares: a JSON array of `{ id, baseUrl, auth: { secret, header }, modelFormat?, passKeys?, api? }`, where
+   `baseUrl` is an https OpenAI-compatible endpoint (or, with `"api": "anthropic-messages"`, one that speaks
+   Anthropic's Messages API at `<baseUrl>/v1/messages`) and `auth.secret` is the *name* of the Worker secret
    holding the credential, never its value (`src/model/providers.ts` validates it). Unset, the deployment
    has one provider, `deepseek`, at `DEEPSEEK_BASE_URL` with `DEEPSEEK_API_KEY`. A model choice is a
    provider and a model under it; one stored with no provider is `deepseek`'s, which is also where
@@ -259,7 +260,12 @@ Antiproton is designed to run as a Cloudflare Worker backed by Durable Objects:
    chat/completions such a model accepts function tools only with its reasoning off, so it reasoned on no
    call. Any other `openai/…` model is sent the fields pi-ai's OpenAI-compatible provider would send it
    (`max_completion_tokens`; `src/model/chat-request-shape.ts`); every other model's request, DeepSeek's
-   included, is unchanged (`test/model-request-snapshot.ts` pins it). A provider's refusal of the request itself
+   included, is unchanged (`test/model-request-snapshot.ts` pins it). Claude Haiku 5.5 (`claude-haiku-5-5`) is
+   offered through the gateway's Anthropic route (provider `cloudflare-anthropic`), the one route that caches for
+   Claude: each request marks the tools, the system prompt and its last two user messages as cache breakpoints
+   (`toAnthropicRequest`, `src/model/pi-bridge.ts`), and its cache reads and writes reach the ledger. A soft window
+   (`REBUILD_POLICY`'s `softWindow`, `src/runtime/rebuild.ts`) keeps its requests under the 100,000 tokens past
+   which its price is five times higher. A provider's refusal of the request itself
    (HTTP 400, 401, 403, 404, 422) is not retried: the turn fails at once with the provider's status and
    message. That message travels beside the harness's error text rather than in it, since pi's retry
    check scans the error text for words like `timeout` that a provider's message can contain. 408, 409,

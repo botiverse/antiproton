@@ -21,11 +21,12 @@ import { currentMainId, logicalMain, mainSessions, physicalSession } from "../cf
 import { readDiagnosis } from "../cf/src/diagnose-read.ts";
 import { DurableObjectStore } from "../src/store/durable-object.ts";
 import { piTables } from "../src/store/pi-storage.ts";
-import { DEFAULT_REBUILD_POLICY } from "../src/runtime/rebuild.ts";
+import { DEFAULT_REBUILD_POLICY, type RebuildPolicy } from "../src/runtime/rebuild.ts";
 import {
   buildBriefing, isContextOverflowAnswer, isSendTool, MAX_CONSECUTIVE_OVERFLOWS, NEEDS_RESET_TTL_MS, overflowKind, readBackstop,
-  SessionNeedsReset, type BriefingEntry,
+  MAX_SOFT_HOLDS_IN_ROW, SessionNeedsReset, SOFT_WINDOW_ERROR, softHoldsInRow, softWindowAnswer, type BriefingEntry,
 } from "../src/runtime/overflow-backstop.ts";
+import { isRetryableAssistantError } from "@earendil-works/pi-ai";
 import { fenceFor } from "../src/plugins/state.ts";
 import { credentialRedactor } from "../cf/src/eval-read.ts";
 import { activityEvents, NEEDS_RESET_ERROR } from "../src/runtime/activity.ts";
@@ -268,14 +269,14 @@ const seats: Plugin = {
   },
 } as Plugin;
 
-type Opts = { policy?: boolean; idle?: { warnMs: number; maxMs: number } };
+type Opts = { policy?: boolean | RebuildPolicy; idle?: { warnMs: number; maxMs: number } };
 function runtimeOver(w: { host: ReturnType<typeof sqliteHost>; sent: string[] }, o: Opts = {}): AgentRuntime {
   const standIn = standInLoader();
   return new AgentRuntime({
     ctx: { storage: { sql: w.host.sql, transactionSync: w.host.transactionSync } },
     bucket: {} as never, bucketName: "b", models: { resolve: () => null },
     autoRelease: !!o.idle, ...(o.idle ? { idle: o.idle } : {}), extraPlugins: [chat, seats],
-    ...(o.policy ? { rebuildPolicy: DEFAULT_REBUILD_POLICY } : {}),
+    ...(o.policy ? { rebuildPolicy: o.policy === true ? DEFAULT_REBUILD_POLICY : o.policy } : {}),
     loader: standIn.loader, makeToolBinding: standIn.makeToolBinding,
     operatorModel: operatorModelOf({ DEEPSEEK_BASE_URL: "https://model.example/v1", DEEPSEEK_API_KEY: "operator-key", HARNESS_MODEL: "m1" }),
     offloadModel: async (job: { commandId: string }) => { w.sent.push(job.commandId); },
@@ -638,6 +639,97 @@ await check("a failure that is not an overflow is left as it was", async () => {
   must(currentMainId(w.host.sql as never) === "main" && !traceRows(w, "rebuild.decision").length && !hasTable(w, "overflow_backstop"), "a non-overflow failure was rebuilt");
   w.answer = say("ok again");
   must(await turn(w, "third") === 1, "the next wake did not run");
+});
+
+// ---- the soft window -------------------------------------------------------------------------------------------------
+
+/** The deployment's default policy with a soft window for the test model `m1`: 1,000 tokens, held back at 900. */
+const SOFT: RebuildPolicy = { ...DEFAULT_REBUILD_POLICY, softWindow: { share: 0.9, byModel: { m1: 1000 } } };
+/** An answer that measured `input` tokens of prompt, as a provider reports it. */
+const sayAt = (text: string, input: number) => (_c: Ctx, id: string) =>
+  fromResponse({ text, finishReason: "stop", truncated: false, usage: { ...usage, promptTokens: input } } as ModelResponse, identity, id);
+const heldJobs = (w: World) => (w.host.sql.exec("SELECT id, answer, dispatched_at FROM pi_model_jobs WHERE answer LIKE '%softWindow%'").toArray() as any[]);
+
+await check("a soft-window answer is a history overflow, and its errorMessage is not one pi's harness would retry", () => {
+  const a = softWindowAnswer(identity, { softWindow: 100_000, thresholdTokens: 90_000, contextTokens: 91_234, entry: "byModel:claude-haiku-5-5" }, "mj_1", 1);
+  must(overflowKind(a) === "history" && isContextOverflowAnswer(a), `not read as an overflow: ${show(a)}`);
+  must(a.errorMessage === SOFT_WINDOW_ERROR && !/\d/.test(SOFT_WINDOW_ERROR), "the fixed text carries a figure");
+  must(!isRetryableAssistantError(a as never), "pi would send the held-back call again");
+  must(a.providerError.includes("91234") && a.providerError.includes("90000"), `the turn's error does not say why: ${a.providerError}`);
+});
+
+await check("the soft window: a call after one that measured 90% of it is not sent; the conversation is rebuilt and answered, one decision", async () => {
+  const w = await world({ policy: SOFT });
+  w.answer = script(callTool("chat__send_message", { text: "hi" }), sayAt("done", 950));
+  must(await turn(w, "hello") === 2, "control: the first turn made its two calls, under the soft window");
+  const sentBefore = w.sent.length;
+  w.answer = sayAt("answered after", 300);
+  const made = await turn(w, "second");
+  // The held-back call never reached the queue: the one call made is the rebuilt conversation's.
+  must(made === 1 && w.sent.length === sentBefore + 1, `calls this wake: ${made}, dispatched ${w.sent.length - sentBefore}`);
+  const held = heldJobs(w);
+  must(held.length === 1 && held[0].dispatched_at === null && !w.sent.includes(String(held[0].id)), `held jobs: ${show(held)}`);
+  const sessions = mainSessions(w.host.sql as never);
+  must(sessions.length === 2 && sessions[1]!.cause === "rebuild", `transcripts: ${show(sessions)}`);
+  const rebuilt = w.calls.at(-1)!;
+  must(rebuilt.messages.length === 1 && textOf(rebuilt.messages[0]).endsWith("\n\nsecond"), `the rebuilt request: ${show(rebuilt.messages)}`);
+  const rows = traceRows(w, "rebuild.decision").filter((r) => r.attrs.trigger === "window");
+  must(rows.length === 1, `window rows: ${show(rows)}`);
+  const a = rows[0]!.attrs;
+  must(rows[0]!.status === "ran" && a.reason === "soft-window" && a.strategy === "briefing" && a.rule === "byModel:m1" && a.shadow === false
+    && a.softWindow === 1000 && a.softThresholdTokens === 900 && a.measuredTokens === 950, `attrs: ${show(a)}`);
+  must(readBackstop(w.host.sql as never).consecutive === 0 && readBackstop(w.host.sql as never).needsReset === null, "a soft-window hold was counted as a failure");
+});
+
+await check("the soft window: a conversation that starts over it is sent as it is, never held back (a rebuild would start the same way)", async () => {
+  const w = await world({ policy: SOFT });
+  w.answer = sayAt("big from the start", 950);
+  await turn(w, "hello");
+  w.answer = sayAt("still big", 990);
+  must(await turn(w, "second") === 1 && await turn(w, "third") === 1, "a call was held back");
+  must(!heldJobs(w).length && mainSessions(w.host.sql as never).length === 1 && !traceRows(w, "rebuild.decision").some((r) => r.attrs.reason === "soft-window"), "rebuilt");
+});
+
+await check("the soft window: a long conversation is rebuilt each time it grows past it, and never marked needs_reset", async () => {
+  const w = await world({ policy: SOFT });
+  // A transcript's first call measures 500, every later one 950: each second wake after a rebuild is held back.
+  w.answer = (c, id) => sayAt("ok", c.messages.some((m: any) => m.role === "assistant") ? 950 : 500)(c, id);
+  for (let i = 0; i < 2 + 2 * MAX_CONSECUTIVE_OVERFLOWS; i++) await turn(w, `wake ${i}`);
+  const soft = traceRows(w, "rebuild.decision").filter((r) => r.attrs.reason === "soft-window");
+  must(soft.length === MAX_CONSECUTIVE_OVERFLOWS && soft.every((r) => r.status === "ran"), `soft rebuilds: ${show(soft.map((r) => r.status))}`);
+  must(readBackstop(w.host.sql as never).needsReset === null, "marked needs_reset");
+});
+
+await check(`the soft window: a run that reaches it again after each rebuild is rebuilt ${MAX_SOFT_HOLDS_IN_ROW} times, then sent over it until a run ends well`, async () => {
+  const w = await world({ policy: SOFT });
+  // Every rebuilt run calls a tool at 500, then at 950: it reaches the soft window before it can end, for ever.
+  let calls = 0;
+  w.answer = (c, id) => {
+    calls++;
+    const big = c.messages.some((m: any) => m.role === "assistant");
+    if (calls > 40) return sayAt("finally", 100)(c, id);
+    return fromResponse({ text: "", finishReason: "tool_calls", truncated: false, usage: { ...usage, promptTokens: big ? 950 : 500 },
+      toolCalls: [{ id: `call_${id}`, name: "chat__send_message", arguments: { text: "x" } }] } as ModelResponse, identity, id);
+  };
+  await turn(w, "a long task");
+  const soft = traceRows(w, "rebuild.decision").filter((r) => r.attrs.reason === "soft-window");
+  must(soft.length === MAX_SOFT_HOLDS_IN_ROW, `soft rebuilds: ${soft.length}`);
+  must(soft.at(-1)!.attrs.softHoldsInRow === MAX_SOFT_HOLDS_IN_ROW && soft.at(-1)!.attrs.softWindowSuspended === true, `last row: ${show(soft.at(-1)!.attrs)}`);
+  must(readBackstop(w.host.sql as never).needsReset === null, "marked needs_reset");
+  must(softHoldsInRow(w.host.sql as never) === 0, "the run that ended well did not clear the count");
+  // Once a run has ended well the soft window applies again.
+  w.answer = (c, id) => sayAt("ok", c.messages.some((m: any) => m.role === "assistant") ? 950 : 500)(c, id);
+  await turn(w, "next"); await turn(w, "and next");
+  must(traceRows(w, "rebuild.decision").filter((r) => r.attrs.reason === "soft-window").length === MAX_SOFT_HOLDS_IN_ROW + 1, "the soft window did not come back");
+});
+
+await check("no soft window without a policy, or for a model it does not name: the same transcript is sent at any size", async () => {
+  for (const policy of [false, true] as const) {
+    const w = await world({ policy });
+    w.answer = script(say("small"), sayAt("big", 5_000_000));
+    await turn(w, "hello"); await turn(w, "second");
+    must(await turn(w, "third") === 1 && !heldJobs(w).length && mainSessions(w.host.sql as never).length === 1, `policy ${policy}: held back or rebuilt`);
+  }
 });
 
 const failed = results.filter((r) => !r.ok);

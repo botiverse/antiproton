@@ -141,7 +141,8 @@ limited or refused because of it.
 
 The first prices are seeded by `cf/migrations/0016_usage_prices_seed.sql`, all
 effective from 2026-10-09T00:00:00Z; usage before that reads as unpriced. Later
-migrations add rows with later dates (`0017_luna_cache_read_price.sql`). Every
+migrations add rows with later dates (`0017_luna_cache_read_price.sql`,
+`0018_claude_haiku_5_5_prices.sql`). Every
 row is **rough, to be refined**, and the migration names each one's source. A
 better number is a new row with a later `effective_from`, never an edit of an
 old one, because cost is worked out when read.
@@ -155,6 +156,11 @@ old one, because cost is worked out when read.
 | | `openai/gpt-5.6-luna:output` | tokens | 1.20 / 1M | the same |
 | | `openai/gpt-5.6-luna:cache_read` | tokens | (0.02 − 0.20) / 1M from 2026-10-12T00:00Z; 0 extra before | OpenAI, cached input $0.02/1M (`cf/migrations/0017_luna_cache_read_price.sql`); before it, priced as input |
 | | `…:reasoning`, `…:cache_write`, `…:cache_write_1h` | tokens | 0 extra | already inside output / input / cache_write |
+| | `claude-haiku-5-5:input` | tokens | 0.10 / 1M from 2026-10-13T00:00Z | Anthropic's pricing page, prompts ≤100K tokens (checked 2026-10-12, `0018`) |
+| | `claude-haiku-5-5:cache_read` | tokens | (0.01 − 0.10) / 1M | cache hit $0.01/1M |
+| | `claude-haiku-5-5:cache_write` | tokens | (0.125 − 0.10) / 1M | 5-minute cache write $0.125/1M: this client reports writes, inside `input` |
+| | `claude-haiku-5-5:output` | tokens | 0.50 / 1M | the same page |
+| | `claude-haiku-5-5:reasoning`, `…:cache_write_1h` | tokens | 0 extra | inside output / cache_write (no 1-hour write is asked for). A prompt over 100K is billed at a higher tier a key cannot express; the soft window keeps calls under it |
 | `model.tokens.unaccepted` | the same keys | tokens | the same | our cost; never in a tenant's view |
 | `object.active` | `*` | ms | 0.0000000015625 | Cloudflare Durable Objects, $12.50 per 1M GB-s at 128 MB |
 | `sandbox.container` | `*` | seconds | 0.00004 | an estimate: run9 publishes no prices |

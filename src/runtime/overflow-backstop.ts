@@ -84,6 +84,8 @@ export type OverflowKind = "history" | "output-budget";
 export function overflowKind(m: unknown, o: { fixedTokens?: number; budgetTokens?: number } = {}): OverflowKind | null {
   const a = m as { stopReason?: unknown; errorMessage?: unknown; providerError?: unknown } | null;
   if (a?.stopReason !== "error") return null;
+  // Held back before it was sent (`softWindowAnswer`): the history reached the model's soft window, not its window.
+  if (softWindowOf(m) !== null) return "history";
   const texts = [a.providerError, a.errorMessage].filter((t): t is string => typeof t === "string" && t.length > 0);
   const over = texts.filter((t) => !NOT_OVERFLOW.some((p) => p.test(t))
     && (isContextOverflow({ stopReason: "error", errorMessage: t } as never) || MORE_OVERFLOW.some((p) => p.test(t))));
@@ -94,6 +96,38 @@ export function overflowKind(m: unknown, o: { fixedTokens?: number; budgetTokens
     if (split && n(split[3]!) >= n(split[1]!) - (o.fixedTokens ?? 0) - (o.budgetTokens ?? BRIEFING_BUDGET_TOKENS)) return "output-budget";
   }
   return "history";
+}
+
+// ---- the soft window ------------------------------------------------------------------------------------------------
+
+/**
+ * The answer for a call held back at its model's soft window (src/runtime/rebuild.ts `SoftWindowPolicy`), written by
+ * pi085 in place of a model call it does not send (src/runtime/pi-agent.ts `#startJob`). It is a failed answer the
+ * way a provider's refusal of an oversized request is one, so the run ends on it and the overflow backstop rebuilds
+ * the conversation (cf/src/runtime.ts `#overflowBackstop`); `softWindow` is what tells it apart, and the backstop's
+ * row says `soft-window`. `errorMessage` is fixed text with no figure in it: the harness's retry check scans it, and
+ * a number such as 500 or 429 would read as a reason to send the call again.
+ */
+export const SOFT_WINDOW_ERROR = "held back before it was sent: the conversation reached this model's soft window, and is rebuilt from a briefing";
+
+export interface SoftWindowFacts { softWindow: number; thresholdTokens: number; contextTokens: number; entry: string }
+
+export function softWindowAnswer(model: { api: string; provider: string; id: string }, facts: SoftWindowFacts, jobId: string, now: number) {
+  return {
+    role: "assistant" as const, content: [], api: model.api, provider: model.provider, model: model.id,
+    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+    stopReason: "error" as const, errorMessage: SOFT_WINDOW_ERROR,
+    providerError: `not sent: the last answered call measured ${facts.contextTokens} input tokens, at or over ${facts.thresholdTokens} ` +
+      `of this model's ${facts.softWindow}-token soft window (${facts.entry}); the conversation is rebuilt before the next call`,
+    softWindow: facts, jobId, timestamp: now,
+  };
+}
+
+/** The soft-window facts of an answer `softWindowAnswer` wrote, or null for any other message. */
+export function softWindowOf(m: unknown): SoftWindowFacts | null {
+  const w = (m as { softWindow?: unknown } | null)?.softWindow as Partial<SoftWindowFacts> | undefined;
+  return w && typeof w === "object" && typeof w.softWindow === "number" && typeof w.contextTokens === "number"
+    ? w as SoftWindowFacts : null;
 }
 
 /** The history no longer fits the window: what the backstop rebuilds for. */
@@ -192,9 +226,39 @@ export function needsReset(sql: Sql, judge?: Judge): NeedsReset | null {
 
 /** A run of the main conversation ended well: the overflows before it were not in a row. Writes only when there is something to clear. */
 export function noteRunEndedWell(sql: Sql) {
+  clearSoftHolds(sql);
   const s = readBackstop(sql);
   if (s.consecutive === 0 && s.awaiting === null) return;
   write(sql, { ...s, consecutive: 0, awaiting: null });
+}
+
+/**
+ * Soft-window rebuilds in a row with no run between them that ended well, after which the soft window is not applied
+ * until one does (`softHoldsInRow`). A held call is not a failure, so these are not the backstop's `consecutive`
+ * (three of those mark the session `needs_reset`); but a task whose rebuilt run reaches its soft window again before
+ * it ends would otherwise be rebuilt for ever. Past the bound its calls are sent over the soft window, still inside
+ * the model's window and still under the overflow backstop.
+ */
+export const MAX_SOFT_HOLDS_IN_ROW = 3;
+const SOFT_HOLDS = "CREATE TABLE IF NOT EXISTS soft_window_holds (id INTEGER PRIMARY KEY CHECK (id = 1), in_row INTEGER NOT NULL)";
+const hasSoftTable = (sql: Sql) =>
+  sql.exec("SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = 'soft_window_holds'").toArray().length > 0;
+
+/** Soft-window rebuilds since the last run of the main conversation that ended well. */
+export function softHoldsInRow(sql: Sql): number {
+  if (!hasSoftTable(sql)) return 0;
+  return Number((sql.exec("SELECT in_row FROM soft_window_holds WHERE id = 1").toArray()[0] as any)?.in_row ?? 0);
+}
+
+/** One more soft-window rebuild in a row; the count after it. */
+export function noteSoftHold(sql: Sql): number {
+  sql.exec(SOFT_HOLDS);
+  sql.exec("INSERT INTO soft_window_holds(id, in_row) VALUES (1, 1) ON CONFLICT(id) DO UPDATE SET in_row = in_row + 1");
+  return softHoldsInRow(sql);
+}
+
+function clearSoftHolds(sql: Sql) {
+  if (hasSoftTable(sql)) sql.exec("DELETE FROM soft_window_holds");
 }
 
 /**
@@ -202,6 +266,7 @@ export function noteRunEndedWell(sql: Sql) {
  * an operator's reset). With `who`, a mark that was set says it was cleared.
  */
 export function clearBackstop(sql: Sql, who?: { tenantId: string; agentId: string; why: ClearReason; now: number }) {
+  clearSoftHolds(sql);
   if (!hasTable(sql)) return;
   const mark = readBackstop(sql).needsReset;
   sql.exec("DELETE FROM overflow_backstop");
@@ -728,6 +793,11 @@ export interface BackstopRecord {
   logicalConversation: string;
   acted: boolean;
   reason: string;
+  /** What ended the run: a request the provider refused for its size (the default), or one held back at a soft window. */
+  cause?: "overflow" | "soft-window";
+  /** The soft window's facts, for a `soft-window` cause, and its rebuilds in a row counting this one (`noteSoftHold`). */
+  softWindow?: SoftWindowFacts | null;
+  softHoldsInRow?: number;
   consecutive: number;
   rebuilds: number;
   /** The last answered call's input (src/runtime/rebuild.ts `readWakeFacts`), as #847's overflow row had it. */
@@ -752,7 +822,8 @@ export function recordBackstop(sql: Sql, transact: <T>(fn: () => T) => T, r: Bac
   const id = recordRebuildDecision(sql, transact, {
     tenantId: r.tenantId, agentId: r.agentId, key: piTables(MAIN_SESSION).entries,
     trigger: r.trigger, strategy: "briefing", wouldRebuild: true, predictedCold: true, expectedCold: true,
-    status: r.acted ? "ran" : "declined", reason: r.trigger === "window" ? "overflow" : "operator", rule: null, coldHitRate: 0.5,
+    status: r.acted ? "ran" : "declined", reason: r.trigger === "window" ? (r.cause ?? "overflow") : "operator",
+    rule: r.cause === "soft-window" ? r.softWindow?.entry ?? null : null, coldHitRate: 0.5,
     awaitOutcome: r.acted && r.awaitOutcome, shadow: false,
     facts: {
       acted: r.acted, ...(r.acted ? {} : { stopped: r.reason }),
@@ -761,6 +832,10 @@ export function recordBackstop(sql: Sql, transact: <T>(fn: () => T) => T, r: Bac
       budgetTokens: r.briefing?.budgetTokens ?? BRIEFING_BUDGET_TOKENS, briefingTokens: r.briefing?.tokens ?? null,
       messages: r.briefing?.messages ?? null, actions: r.briefing?.actions ?? null, inputs: r.briefing?.inputs ?? null,
       done: r.briefing?.done ?? null, consecutive: r.consecutive, rebuilds: r.rebuilds, job: r.jobId,
+      ...(r.softWindow ? {
+        softWindow: r.softWindow.softWindow, softThresholdTokens: r.softWindow.thresholdTokens, measuredTokens: r.softWindow.contextTokens,
+        softHoldsInRow: r.softHoldsInRow ?? null, softWindowSuspended: (r.softHoldsInRow ?? 0) >= MAX_SOFT_HOLDS_IN_ROW,
+      } : {}),
     },
     at: r.at,
   });

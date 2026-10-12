@@ -60,6 +60,7 @@ const H = 3_600_000;
 const FROM = Date.parse("2026-10-09T00:00:00Z"); // the seed's effective_from
 const AT = FROM + 26 * H; // 2026-10-10T02:00Z, inside the priced era
 const LUNA_CACHE_FROM = Date.parse("2026-10-12T00:00:00Z"); // 0017's effective_from
+const HAIKU_FROM = Date.parse("2026-10-13T00:00:00Z"); // 0018's effective_from
 /** Usage rows into the hourly ledger, as sendUsage would sum them. */
 function put(db: D1Database & { raw: DatabaseSync }, rows: UsageRow[]) {
   for (const h of toHourly(rows)) {
@@ -89,10 +90,11 @@ const tenantRead = (db: D1Database, from = FROM, to = FROM + 3 * DAY_MS, bucket:
 await check("the seed: dollars per unit from 2026-10-09T00:00Z, at the rough table's values", async () => {
   const db = d1();
   const prices = await usagePrices(db);
-  // 0017 is the only later row so far: luna's cached input, from 2026-10-12.
+  // The later rows so far: luna's cached input (0017, from 2026-10-12), and Claude Haiku 5.5 (0018, from 2026-10-13).
   const later = prices.filter((p) => p.effectiveFrom !== FROM);
-  must(prices.length > 0 && later.every((p) => p.key === "openai/gpt-5.6-luna:cache_read" && p.effectiveFrom === LUNA_CACHE_FROM),
-    `every row takes effect at the seed's date, but for 0017's: ${show(later)}`);
+  must(prices.length > 0 && later.every((p) => (p.key === "openai/gpt-5.6-luna:cache_read" && p.effectiveFrom === LUNA_CACHE_FROM)
+    || (p.key.startsWith("claude-haiku-5-5:") && p.effectiveFrom === HAIKU_FROM)),
+    `every row takes effect at the seed's date, but for 0017's and 0018's: ${show(later)}`);
   const at = (resource: string, key: string, unit: string) => priceFor(prices, { bucket: AT, resource, key, unit });
   const spot: Array<[string, string, string, number]> = [
     ["model.tokens", "deepseek-flash:input", "tokens", 0.30e-6],
@@ -140,6 +142,28 @@ await check("luna's cached input (0017): priced as input before 2026-10-12T00:00
   const cost = sumCost(rows.filter((r) => r.key.startsWith("openai/gpt-5.6-luna:")));
   const want = 0.5 * 0.20 + 0.5 * 0.02 + 1.0 * 1.20;
   must(near(cost, want), `luna cost ${cost}, by hand ${want}`);
+});
+
+await check("Claude Haiku 5.5 (0018): unpriced before 2026-10-13T00:00Z; from then input, hits, 5-minute writes and output at Anthropic's lower tier", async () => {
+  const db = d1();
+  const prices = await usagePrices(db);
+  const want: Record<string, number> = { input: 0.10e-6, cache_read: 0.01e-6 - 0.10e-6, cache_write: 0.125e-6 - 0.10e-6, cache_write_1h: 0, output: 0.50e-6, reasoning: 0 };
+  for (const resource of ["model.tokens", UNACCEPTED_TOKENS]) {
+    for (const [kind, rate] of Object.entries(want)) {
+      const at = (bucket: number) => priceFor(prices, { bucket, resource, key: `claude-haiku-5-5:${kind}`, unit: "tokens" });
+      must(at(HAIKU_FROM - H) === null, `${resource} ${kind} priced before the date: ${at(HAIKU_FROM - H)}`);
+      const got = at(HAIKU_FROM);
+      must(got !== null && Math.abs(got - rate) < 1e-15, `${resource} ${kind}: ${got}, the page says ${rate}`);
+    }
+  }
+  // One reply as the Anthropic client reports it: a million-token prompt (summed over calls) of which 400k were read
+  // from the cache and 100k written to it, and a million out.
+  put(db, modelTokenRows({ at: HAIKU_FROM + 2 * H, tenantId: "t", agentId: "a" }, "claude-haiku-5-5",
+    { input: 1_000_000, cacheRead: 400_000, cacheWrite: 100_000, output: 1_000_000 }));
+  const { rows } = await tenantRead(db, HAIKU_FROM, HAIKU_FROM + DAY_MS);
+  const cost = sumCost(rows.filter((r) => r.key.startsWith("claude-haiku-5-5:")));
+  const byHand = 0.5 * 0.10 + 0.4 * 0.01 + 0.1 * 0.125 + 1.0 * 0.50;
+  must(near(cost, byHand), `haiku cost ${cost}, by hand ${byHand}`);
 });
 
 // ---- no double charge -------------------------------------------------------------------------------

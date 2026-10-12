@@ -65,14 +65,21 @@
         "auth": { "secret": "DEEPSEEK_API_KEY", "header": "authorization" } },
       { "id": "cloudflare", "baseUrl": "https://gateway.ai.cloudflare.com/v1/a084c4564dfdce5a7775b08ece638a79/antiproton/compat",
         "auth": { "secret": "AI_GATEWAY_TOKEN", "header": "cf-aig-authorization" },
-        "modelFormat": "vendor/model", "passKeys": { "deepseek/": "DEEPSEEK_API_KEY" } }
+        "modelFormat": "vendor/model", "passKeys": { "deepseek/": "DEEPSEEK_API_KEY" } },
+      // Claude through the same gateway, on its Anthropic route rather than /compat: only this route caches for
+      // Claude (src/model/anthropic-messages.ts says what was measured). The gateway bills the call; no vendor key is
+      // sent. Models are Anthropic's own bare names.
+      { "id": "cloudflare-anthropic", "baseUrl": "https://gateway.ai.cloudflare.com/v1/a084c4564dfdce5a7775b08ece638a79/antiproton/anthropic",
+        "auth": { "secret": "AI_GATEWAY_TOKEN", "header": "cf-aig-authorization" }, "api": "anthropic-messages" }
     ],
     // What an owner may pick for their own agent (src/model/user-models.ts): an id and a label over a provider
     // above and its model. DeepSeek Flash is the default as well as an option, so an owner can return to it by
-    // name; GPT-5.6 Luna is offered only while the cloudflare provider is available (AI_GATEWAY_TOKEN set).
+    // name; GPT-5.6 Luna and Claude Haiku 5.5 are offered only while their gateway provider is available (AI_GATEWAY_TOKEN
+    // set). Claude Haiku 5.5 is kept under its 100,000-token price tier by a soft window (src/runtime/rebuild.ts).
     "USER_MODELS": [
       { "id": "deepseek-flash", "label": "DeepSeek Flash", "provider": "deepseek", "model": "deepseek-flash" },
-      { "id": "gpt-5.6-luna", "label": "GPT-5.6 Luna", "provider": "cloudflare", "model": "openai/gpt-5.6-luna" }
+      { "id": "gpt-5.6-luna", "label": "GPT-5.6 Luna", "provider": "cloudflare", "model": "openai/gpt-5.6-luna" },
+      { "id": "claude-haiku-5-5", "label": "Claude Haiku 5.5", "provider": "cloudflare-anthropic", "model": "claude-haiku-5-5" }
     ],
     "ARTIFACT_BUCKET": "antiproton-artifacts",
     // Access now sits in front of antiproton.botiverse.dev; the UI fails closed

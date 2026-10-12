@@ -23,6 +23,12 @@ export interface ModelUsage {
   /** Counted inside completionTokens by DeepSeek-style providers. */
   reasoningTokens: number;
   cachedPromptTokens: number;
+  /**
+   * Prompt tokens the provider wrote to its cache on this call, inside `promptTokens` like the cached ones.
+   * Only a provider that reports writes sets it (Anthropic's Messages API, src/model/anthropic-messages.ts);
+   * absent is none, which is what every other client has always recorded.
+   */
+  cacheWriteTokens?: number;
 }
 
 export interface ToolCall {

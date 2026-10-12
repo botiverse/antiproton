@@ -1,4 +1,4 @@
-import { DEFAULT_PROVIDER, providerRequest, type ModelChoice, type ModelProviders } from "./providers.ts";
+import { DEFAULT_PROVIDER, providerRequest, type ModelChoice, type ModelProviders, type ProviderApi } from "./providers.ts";
 
 /**
  * The operator's model call: where it goes, with which key and headers. Every model call an agent makes
@@ -15,7 +15,7 @@ export interface OperatorModel {
 
 /** The call for `choice`; the deployment's default when none is given, and DEFAULT_PROVIDER when a choice names no provider. */
 export function operatorRequest(op: OperatorModel, choice?: Partial<ModelChoice> | null):
-  { baseUrl: string; apiKey: string; model: string; headers: Record<string, string> } {
+  { baseUrl: string; apiKey: string; model: string; headers: Record<string, string>; api: ProviderApi } {
   return providerRequest(op.providers, { provider: choice?.provider || DEFAULT_PROVIDER, model: choice?.model || op.model });
 }
 

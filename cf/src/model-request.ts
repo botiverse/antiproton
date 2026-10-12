@@ -3,7 +3,8 @@ import { DEFAULT_PROVIDER, modelProblem, providersFrom, type ModelChoice, type M
 import type { UserModel, UserModels } from "../../src/model/user-models.ts";
 import { ModelRequestRefused, OpenAiCompatibleModel } from "../../src/model/openai-compatible.ts";
 import { OpenAiResponsesModel, usesResponses } from "../../src/model/openai-responses.ts";
-import { errorMessage, fromResponse, toRequest, toResponsesInput, type AnsweredMessage } from "../../src/model/pi-bridge.ts";
+import { AnthropicMessagesModel } from "../../src/model/anthropic-messages.ts";
+import { errorMessage, fromResponse, toAnthropicRequest, toRequest, toResponsesInput, type AnsweredMessage } from "../../src/model/pi-bridge.ts";
 import type { ModelResponse } from "../../src/model/types.ts";
 import { acceptsImages } from "../../src/model/context-windows.ts";
 import { DEFAULT_IMAGE_WINDOW, hasImageRefs, imageKey, nonVisionImageItems, resolveImagesReported, windowStep, type ImageItem, type ImageLoader, type ImageWindow } from "../../src/model/images.ts";
@@ -199,6 +200,14 @@ export async function callQueuedModel(env: ModelEnv, job: any, jobId: string, im
     const model = new OpenAiCompatibleModel(request);
     const { messages, tools } = toRequest(context, { images: sees });
     call = () => model.complete(messages, { ...(tools ? { tools } : {}), ...observe });
+  }
+  // Anthropic's own protocol, when the provider speaks it (src/model/providers.ts `api`): the provider decides, not the
+  // model's name, since the same Claude model is reachable through /compat as well, which does not cache for it. The
+  // OpenAI-shaped call chosen above is replaced unsent.
+  if (request.api === "anthropic-messages") {
+    const model = new AnthropicMessagesModel(request);
+    const req = toAnthropicRequest(job.context, called);
+    call = () => model.complete(req);
   }
   const identity = {
     api: String(job.model?.api ?? "offloaded"),

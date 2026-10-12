@@ -37,7 +37,9 @@ export function usageCases(db: D1Database, sql: Sql): SpecCase[] {
       const got = at(resource, key, unit);
       assert(got !== null && Math.abs(got - want) < 1e-15, `${resource} ${key} ${unit}: ${got}, want ${want}`);
     }
-    assert(prices.filter((p) => p.effectiveFrom !== Date.parse("2026-10-09T00:00:00Z")).every((p) => p.key === "openai/gpt-5.6-luna:cache_read"),
+    // The later rows: luna's cached input (0017) and Claude Haiku 5.5 (0018, from 2026-10-13).
+    assert(prices.filter((p) => p.effectiveFrom !== Date.parse("2026-10-09T00:00:00Z")).every((p) => p.key === "openai/gpt-5.6-luna:cache_read"
+      || (p.key.startsWith("claude-haiku-5-5:") && p.effectiveFrom === Date.parse("2026-10-13T00:00:00Z"))),
       "a seed row with another date");
   } });
   // Also before the wipe. 0017 adds a later row for one key; the earlier price must still answer before it.

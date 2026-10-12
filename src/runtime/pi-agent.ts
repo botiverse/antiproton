@@ -30,6 +30,8 @@ import { StorageBackedSession } from "@earendil-works/pi-agent-core/harness/sess
 import { BACKGROUND_CONTEXT as CTX } from "@earendil-works/pi-agent-core/harness/context";
 import { PiSqliteStorage, ensurePiTables, piTables, type SqlHost, MAIN_SESSION } from "../store/pi-storage.ts";
 import { recordRequestPrefix } from "./request-prefix.ts";
+import { softWindowReached, type SoftWindow } from "./rebuild.ts";
+import { softWindowAnswer } from "./overflow-backstop.ts";
 import { offloadedProvider, type OffloadPort, type Answered } from "../model/pi-offloaded.ts";
 import { bridgeTools, harnessTools, type InterruptKeeping, type MountedTool, type ToolHost } from "./pi-tools.ts";
 import { answerClientCall, dropClientCalls, pendingClientCalls, resumeClientCalls } from "./client-calls.ts";
@@ -204,6 +206,13 @@ export interface PiAgentOptions {
   /** Read each answer for rebuild outcomes and context overflows (src/runtime/rebuild.ts): records, never a say in
    *  what runs. Off when absent. */
   rebuilds?: boolean;
+  /**
+   * The model's soft window (src/runtime/rebuild.ts `softWindowFor`), for the main conversation only, asked as each
+   * call is about to be written, since whether it applies can change while the harness is open
+   * (src/runtime/overflow-backstop.ts `MAX_SOFT_HOLDS_IN_ROW`): a call whose conversation's last answered call measured
+   * at or over its threshold is not sent (`#startJob`). Absent, or null: none.
+   */
+  softWindow?: () => SoftWindow | null;
   /** Wake whatever does the waiting. Failure here is not fatal: the job row is
    *  already durable, so a later pass can re-send it. */
   dispatch(jobId: string): Promise<void>;
@@ -358,6 +367,8 @@ export class PiAgent implements AgentEngine {
 
   #startJob(request: unknown): string {
     const id = `mj_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`;
+    const held = this.#softWindowHeld(request, id);
+    if (held) return held;
     // Durable before it is dispatched: a dispatch that never happens can be
     // retried from the row, but a row that was never written cannot.
     // A reading about the request, never a reason to lose it: a failure leaves the column empty.
@@ -367,6 +378,38 @@ export class PiAgent implements AgentEngine {
     } catch (e) { console.error(`reading the request prefix of ${id} failed:`, e); }
     this.#sql.exec("INSERT INTO pi_model_jobs(id, request, created_at, session, prefix) VALUES (?,?,?,?,?)",
       id, JSON.stringify(request), (this.#opts.now ?? Date.now)(), this.#opts.session ?? MAIN_SESSION, prefix);
+    return id;
+  }
+
+  /** Set by a call held back at its soft window, whose answer is already written: `step` drives once more to collect it. */
+  #answeredAtStart = false;
+
+  /**
+   * A call held back at the model's soft window (`softWindow`; src/runtime/rebuild.ts `softWindowReached`): its job row
+   * is written already answered, with `softWindowAnswer` (src/runtime/overflow-backstop.ts), so it is never dispatched
+   * and no provider is asked. The run ends on that answer, and the overflow backstop rebuilds the conversation from a
+   * briefing before anything more is sent (cf/src/runtime.ts `#overflowBackstop`). The measure is what the provider
+   * said: each answered call's input in the request's own conversation, the whole prompt. Null, and nothing written,
+   * for a call that is sent.
+   */
+  #softWindowHeld(request: unknown, id: string): string | null {
+    if ((this.#opts.session ?? MAIN_SESSION) !== MAIN_SESSION) return null;
+    const w = this.#opts.softWindow?.() ?? null;
+    if (!w) return null;
+    const r = request as { model?: { api?: unknown; provider?: unknown; id?: unknown }; context?: { messages?: unknown } } | null;
+    const messages = Array.isArray(r?.context?.messages) ? r!.context!.messages as any[] : [];
+    const measured = messages
+      .filter((m) => m?.role === "assistant" && ["stop", "length", "toolUse"].includes(m.stopReason))
+      .map((m) => m.usage?.input)
+      .filter((n): n is number => typeof n === "number" && Number.isFinite(n) && n > 0);
+    if (!softWindowReached(measured, w)) return null;
+    const now = (this.#opts.now ?? Date.now)();
+    const answer = softWindowAnswer(
+      { api: String(r?.model?.api ?? "offloaded"), provider: String(r?.model?.provider ?? this.#opts.model.provider), id: String(r?.model?.id ?? this.#opts.model.id) },
+      { softWindow: w.tokens, thresholdTokens: w.thresholdTokens, contextTokens: measured[measured.length - 1]!, entry: w.entry }, id, now);
+    this.#sql.exec("INSERT INTO pi_model_jobs(id, request, created_at, session, answer, answered_at) VALUES (?,?,?,?,?,?)",
+      id, JSON.stringify(request), now, MAIN_SESSION, JSON.stringify(answer), now);
+    this.#answeredAtStart = true;
     return id;
   }
 
@@ -531,6 +574,17 @@ export class PiAgent implements AgentEngine {
    * active.
    */
   async step(): Promise<StepOutcome> {
+    this.#answeredAtStart = false;
+    const out = await this.#stepOnce();
+    // A call held back at its soft window was answered as it was written, in this pass: collected now, so the run ends
+    // and the step's caller sees it settled, rather than an alarm later.
+    if (!this.#answeredAtStart) return out;
+    this.#answeredAtStart = false;
+    const again = await this.#stepOnce();
+    return { ...again, settled: [...out.settled, ...again.settled] };
+  }
+
+  async #stepOnce(): Promise<StepOutcome> {
     const info = await this.#lane.inspectExecution(CTX);
     const ids = new Set<string>(this.#open.map((o) => o.operationId));
     if (info.current) ids.add(info.current.id);
