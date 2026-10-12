@@ -107,6 +107,7 @@
     "test/tool-interrupts.ts",
     "test/mcp-plugin.ts",
     "test/raft-plugin.ts",
+    "test/raft-attachments-view.ts",
     "test/mount-offered.ts",
     "test/model-queue.ts",
     "test/model-refusal.ts",
