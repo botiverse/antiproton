@@ -504,15 +504,7 @@ export function page(_taskId: string, who: string, agentId: string, viewer?: Vie
 <link rel="icon" type="image/svg+xml" href="${FAVICON_DATA_URI}">
 <script>(function(){var t='brutal';try{t=localStorage.getItem('ap-theme')||'brutal'}catch(e){}var h=document.documentElement;if(t==='elegant'){h.setAttribute('data-theme','elegant');h.classList.add('light')}else if(t==='elegant-dark'){h.setAttribute('data-theme','elegant');h.classList.add('dark')}else{h.setAttribute('data-theme','brutal')}})()</script>
 ${HEAD_ASSETS}
-<style>${FONT_CSS}${RUI_TOKENS}${CSS}${USAGE_CSS}
-.admin-nav{display:flex;gap:4px;margin:0 0 12px}
-.admin-nav a{font-family:var(--font-mono);font-size:12px;padding:6px 12px;border:2px solid var(--fg);cursor:pointer;text-decoration:none;color:var(--fg);background:var(--canvas)}
-.admin-nav a:hover{background:var(--accent);color:var(--canvas)}
-.usd-over td{color:var(--danger,#b3261e)}
-.usd-over td:first-child{font-weight:700}
-.unpriced-banner{border:2px solid var(--danger,#b3261e);padding:8px 12px;margin:0 0 12px;font-size:13px}
-.hint-inline{font-size:11px;color:var(--fg-3)}
-</style></head><body class="shell" data-view="agents" data-agent="${esc(agentId)}">
+<style>${FONT_CSS}${RUI_TOKENS}${CSS}${USAGE_CSS}</style></head><body class="shell" data-view="agents" data-agent="${esc(agentId)}">
 <nav class="rail" aria-label="sections">
   <a class="rail-brand" href="/ui" title="antiproton">${MARK_OUTLINED_SVG}</a>
   ${rail("agents", "agents")}
@@ -1955,7 +1947,18 @@ export function adminPage(): string {
 <link rel="icon" type="image/svg+xml" href="${FAVICON_DATA_URI}">
 <script>(function(){var t='brutal';try{t=localStorage.getItem('ap-theme')||'brutal'}catch(e){}var h=document.documentElement;if(t==='elegant'){h.setAttribute('data-theme','elegant');h.classList.add('light')}else if(t==='elegant-dark'){h.setAttribute('data-theme','elegant');h.classList.add('dark')}else{h.setAttribute('data-theme','brutal')}})()</script>
 ${HEAD_ASSETS}
-<style>${FONT_CSS}${RUI_TOKENS}${CSS}${USAGE_CSS}</style></head>
+<style>${FONT_CSS}${RUI_TOKENS}${CSS}${USAGE_CSS}
+.admin-nav{display:flex;gap:4px;margin:0 0 12px}
+.admin-nav a{font-family:var(--font-mono);font-size:12px;padding:6px 12px;border:2px solid var(--fg);cursor:pointer;text-decoration:none;color:var(--fg);background:var(--canvas)}
+.admin-nav a:hover{background:var(--accent);color:var(--canvas)}
+.usd-over td{color:var(--danger,#b3261e)}
+.usd-over td:first-child{font-weight:700}
+.unpriced-banner{border:2px solid var(--danger,#b3261e);padding:8px 12px;margin:0 0 12px;font-size:13px}
+.hint-inline{font-size:11px;color:var(--fg-3)}
+
+.usd-near td{color:#8a6d00}
+.usd-near td:first-child{font-weight:700}
+</style></head>
 <body class="shell" data-view="admin">
 <main>
   <section class="view on" data-view="admin">
@@ -1991,15 +1994,17 @@ export function spendLimitsPanel(d: {
 }): string {
   const target = `hx-target="#admin" hx-swap="innerHTML"`;
   const overrideOf = new Map(d.overrides.map((o) => [o.tenantId, o]));
-  const spentOf = new Map(d.today.map((t) => [t.tenantId, t.usd]));
   const tenantIds = [...new Set([...d.today.map((t) => t.tenantId), ...d.overrides.map((o) => o.tenantId)])].sort();
   const limitOf = (id: string): { value: number | null; via: "override" | "default" | "none" } => {
     const o = overrideOf.get(id);
     if (o) return { value: o.limitUsd, via: "override" };
     return { value: d.defaults.tenantUsd, via: d.defaults.tenantUsd === null ? "none" : "default" };
   };
+  // What an override's removal restores: the default's dollar amount, or the plain fact of no
+  // tenant limit when the default is off — "The — default applies again" would read as a bug.
+  const backTo = d.defaults.tenantUsd === null ? "no per-tenant limit applies" : `the ${usd(d.defaults.tenantUsd)} default applies again`;
   const clearForm = (id: string) => `<form hx-post="/ui/admin/spend-limits" ${target}
-        hx-confirm="Clear the override for ${esc(id)}? The ${usd(d.defaults.tenantUsd)} default applies again.">
+        hx-confirm="Clear the override for ${esc(id)}? ${backTo}.">
       <input type="hidden" name="action" value="clear"><input type="hidden" name="tenantId" value="${esc(id)}">
       <button type="submit" class="ghost">clear</button></form>`;
   const rows = tenantIds.map((id) => {
@@ -2007,9 +2012,11 @@ export function spendLimitsPanel(d: {
     const spent = t?.usd ?? 0;
     const limit = limitOf(id);
     const exempt = d.defaults.exempt.includes(id);
-    const over = !exempt && limit.value !== null && spent > limit.value;
+    // `>=`, not `>`: judge refuses at exactly the limit, and a $0 limit refuses every paid call,
+    // so a page that waits for `>` shows a refused tenant as under.
+    const over = !exempt && limit.value !== null && spent >= limit.value;
     const near = !exempt && limit.value !== null && !over && spent >= limit.value * 0.9;
-    return `<tr${over ? ` class="usd-over"` : ""}>
+    return `<tr class="${over ? "usd-over" : near ? "usd-near" : ""}">
       <td><code>${esc(id)}</code>${exempt ? ` <span class="tag">exempt</span>` : ""}</td>
       <td>${usd(spent)}${t && t.unaccepted ? ` <span class="hint-inline" title="unaccepted answers are our cost, not the tenant's — they count toward the platform total, not this tenant's limit">+${usd(t.unaccepted)} unaccepted</span>` : ""}</td>
       <td>${limit.value === null ? "no tenant limit" : usd(limit.value)}${limit.via === "default" ? ` <span class="hint-inline">default</span>` : ""}${over ? ` <span class="tag">over</span>` : near ? ` <span class="tag">near</span>` : ""}</td>
@@ -2019,7 +2026,7 @@ export function spendLimitsPanel(d: {
     <td>${e.limitUsd === null ? "no tenant limit" : usd(e.limitUsd)}</td>
     <td>${e.previous.limitUsd === undefined ? "—" : e.previous.limitUsd === null ? "no tenant limit" : usd(e.previous.limitUsd)}</td>
     <td>${esc(e.by)}</td><td>${when(e.at) ?? ""}</td></tr>`).join("");
-  const platformOver = d.defaults.platformUsd !== null && d.platformToday > d.defaults.platformUsd;
+  const platformOver = d.defaults.platformUsd !== null && d.platformToday >= d.defaults.platformUsd;
   return `
 <h3>daily spend limits</h3>
 ${d.error ? `<div class="err">${esc(d.error)}</div>` : ""}
@@ -2056,6 +2063,8 @@ ${d.events.length ? `<table class="overrides"><thead><tr><th>tenant</th><th>acti
 
 export function usageCostsPanel(d: {
   from: number; to: number; bucket: "day" | "month";
+  /** Why the window was refused, when it was. Absent means from..to is whole periods. */
+  error?: string | null;
   tenants: Array<{ tenantId: string; total: number; periods: Array<{ start: number; total: number; resources: Array<{ resource: string; cost: number; unpriced: string[] }> }> }>;
   /** Every `key unit` no price covers, across the window, so an unpriced total says what it leaves out. */
   unpriced: string[];
@@ -2075,17 +2084,21 @@ export function usageCostsPanel(d: {
     `<tr><td><code>${esc(t.tenantId)}</code></td>${cells(t)}<td><b>${usd(t.total)}</b></td></tr>`).join("");
   const resourceRows = [...byResource.entries()].sort((a, b) => b[1].cost - a[1].cost).map(([res, e]) =>
     `<tr><td><code>${esc(res)}</code></td><td>${usd(e.cost)}</td><td>${e.unpriced.size ? [...e.unpriced].map((u) => `<code>${esc(u)}</code>`).join(" ") : "—"}</td></tr>`).join("");
-  const from = day(d.from), to = day(d.to);
+  const lastIncluded = d.to - 1;
+  const from = day(d.from);
+  const toInput = d.bucket === "month" ? new Date(lastIncluded).toISOString().slice(0, 7) : day(lastIncluded);
+  const toLabel = toInput;
   return `
 <h3>platform usage costs</h3>
+${d.error ? `<div class="err">${esc(d.error)}</div>` : ""}
 ${d.unpriced.length ? `<div class="unpriced-banner"><b>unpriced usage in this window</b> — these keys have no price and are missing from every total:<br>${d.unpriced.map((u) => `<code>${esc(u)}</code>`).join(" ")}</div>` : ""}
 <form class="admin-set" hx-get="/ui/admin/usage-costs" hx-target="#admin" hx-swap="innerHTML">
   <label><span>from</span><input type="date" name="from" value="${from}"></label>
-  <label><span>to</span><input type="date" name="to" value="${to}"></label>
+  <label><span>to</span><input type="date" name="to" value="${toInput}"></label>
   <label><span>bucket</span><select name="bucket"><option value="day"${d.bucket === "day" ? " selected" : ""}>day</option><option value="month"${d.bucket === "month" ? " selected" : ""}>month</option></select></label>
   <div class="row"><button type="submit">apply</button></div>
 </form>
-<h3>${usd(d.tenants.reduce((sum, t) => sum + t.total, 0))} — ${from} → ${to}, by ${d.bucket}</h3>
+<h3>${usd(d.tenants.reduce((sum, t) => sum + t.total, 0))} — ${from} → ${toLabel}, by ${d.bucket}</h3>
 ${d.tenants.length ? `<table class="overrides"><thead><tr><th>tenant</th>${starts.map((s) => `<th>${d.bucket === "month" ? new Date(s).toISOString().slice(0, 7) : day(s)}</th>`).join("")}<th>total</th></tr></thead><tbody>${tenantRows}</tbody></table>`
     : `<div class="empty">nothing priced in this window</div>`}
 <h3>by resource</h3>

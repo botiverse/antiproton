@@ -13,6 +13,7 @@
  */
 import { objectMoved } from "./do-retry.ts";
 import { HANDOFF_PATH, adminHostServes, adminShell, handoffTicket, redeemTicket, safeReturnTo } from "./admin-host.ts";
+import { UNACCEPTED_TOKENS } from "../../src/usage/outbox.ts";
 import { nextAlarm } from "./alarm-next.ts";
 import { adminModels } from "./admin-models.ts";
 import { agentModel } from "./agent-model.ts";
@@ -84,7 +85,7 @@ import { busySpans, countActiveTime, unionMs, type ActivitySpan } from "../../sr
 import { countHeldTime, heldReports } from "../../src/usage/container.ts";
 import { benchPollBody } from "../../src/bench/poll-body.ts";
 import { flushUsage, parseUsageQuery, readAgentLedger, readUsage, priceFor, readUsageCosts, retainUsage, usageBacklogSince, usagePrices } from "./usage-d1.ts";
-import { adminUsageCosts } from "./admin-usage-costs.ts";
+import { adminUsageCosts, parseCostsQuery } from "./admin-usage-costs.ts";
 import { adminSpendLimits, d1SpendLimits, limitsOf, sharedSpendGate, spendAdmit } from "./spend-limit.ts";
 import { drainCursors, hasUnsent, standDownDelay, USAGE_WAKE_DELAY_MS } from "./usage-flush.ts";
 import type { SurfaceDeps } from "./agent-surface/surface.ts";
@@ -4620,6 +4621,12 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
           const actor = v!.sub ?? v!.email;
           let error: string | null = null;
           if (request.method === "POST") {
+            // SameSite=Lax leaves every host under this registrable domain able to post with the
+            // admin's cookie (forgedWrite's own comment), so a write here names its origin like
+            // the console's writes. Without this, a page on any *.antiproton.ai host could rebind
+            // any agent's model through a signed-in admin's browser (found in review of #864).
+            const forged = await forgedWrite(request, url, env);
+            if (forged) return new Response(forged, { status: 403 });
             const form = await formOf(request);
             if (!form) return new Response("expected a form body", { status: 400 });
             const fields = Object.fromEntries(["tenantId", "agentId", "provider", "model"].map((k) => [k, String(form.get(k) ?? "")]));
@@ -4676,8 +4683,8 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
           // theirs — spend-limit.ts); the platform total counts everything, exempt included.
           const today = costs.map((c) => ({
             tenantId: c.tenantId,
-            usd: c.total - c.periods.flatMap((p) => p.resources).filter((r) => r.resource === "model.tokens.unaccepted").reduce((sum, r) => sum + r.cost, 0),
-            unaccepted: c.periods.flatMap((p) => p.resources).filter((r) => r.resource === "model.tokens.unaccepted").reduce((sum, r) => sum + r.cost, 0),
+            usd: c.total - c.periods.flatMap((p) => p.resources).filter((r) => r.resource === UNACCEPTED_TOKENS).reduce((sum, r) => sum + r.cost, 0),
+            unaccepted: c.periods.flatMap((p) => p.resources).filter((r) => r.resource === UNACCEPTED_TOKENS).reduce((sum, r) => sum + r.cost, 0),
           }));
           const platformToday = costs.reduce((sum, c) => sum + c.total, 0);
           return new Response(spendLimitsPanel({ ...data, today, platformToday, error }), { headers: { "cache-control": "no-store", "content-type": "text/html; charset=utf-8" } });
@@ -4687,18 +4694,18 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
           // the last 7 days by day; a plain GET form changes it. Unpriced keys are named, not hidden.
           const v = await viewer(request, env);
           if (!isAdmin(v, env)) return Response.json({ error: { code: "not_found", message: "no such route" } }, { status: 404 });
-          const parseDay = (s: string | null, fallback: number): number => {
-            if (!s) return fallback;
-            const t = Date.parse(`${s}T00:00:00Z`);
-            return Number.isNaN(t) ? fallback : t;
-          };
           const now = Date.now();
-          const to = parseDay(url.searchParams.get("to"), now) + 86_400_000; // the named day counts whole
-          const from = parseDay(url.searchParams.get("from"), to - 7 * 86_400_000);
-          const bucket = url.searchParams.get("bucket") === "month" ? "month" : "day";
-          const tenants = await readUsageCosts(env.CONTROL_DB, from, to, bucket);
+          // The window parser the JSON route uses: whole periods, a 400-day cap, from < to, and
+          // impossible dates refused rather than rolled over. The form shows to − 1 day (the last
+          // day inside the open-ended window), so applying it does not drift the window forward.
+          const parsed = parseCostsQuery(url.searchParams, now);
+          if (typeof parsed === "string") {
+            const fallback = parseCostsQuery(new URLSearchParams(), now) as { from: number; to: number; bucket: "day" | "month" };
+            return new Response(usageCostsPanel({ ...fallback, tenants: [], unpriced: [], error: parsed }), { headers: { "cache-control": "no-store", "content-type": "text/html; charset=utf-8" } });
+          }
+          const tenants = await readUsageCosts(env.CONTROL_DB, parsed.from, parsed.to, parsed.bucket);
           const unpriced = [...new Set(tenants.flatMap((t) => t.periods.flatMap((p) => p.resources.flatMap((r) => r.unpriced))))].sort();
-          return new Response(usageCostsPanel({ from, to, bucket, tenants, unpriced }), { headers: { "cache-control": "no-store", "content-type": "text/html; charset=utf-8" } });
+          return new Response(usageCostsPanel({ ...parsed, tenants, unpriced }), { headers: { "cache-control": "no-store", "content-type": "text/html; charset=utf-8" } });
         }
         case "/ui/api-keys":
         case "/ui/api-keys/new":

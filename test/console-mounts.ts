@@ -415,8 +415,10 @@ globalThis.fetch = (async (input: unknown, init: RequestInit = {}) => {
 let liveHooks: Array<Record<string, unknown>> = [];
 /** Every hook id the route's index was asked to revoke. */
 const revokedHooks: unknown[] = [];
+const dbSql: string[] = [];
 const d1 = () => {
   const stmt = (sql: string) => {
+    dbSql.push(sql);
     const s: any = {
       bind: (...b: unknown[]) => {
         // A revoke marks the row, as D1's does, so the removal's second pass finds nothing left.
@@ -436,7 +438,7 @@ const env: Record<string, unknown> = {
   MODEL_QUEUE: { send: async () => {} },
   ARTIFACTS: { put: async () => ({}), get: async () => null, head: async () => null, list: async () => ({ objects: [] }) },
   ARTIFACT_BUCKET: "b", CONTROL_DB: d1(), HARNESS_MODEL: "m1", DEEPSEEK_BASE_URL: "https://model.example/v1",
-  AUTOMATION_TOKEN: "operator-token", SESSION_SECRET: SESSION, SECRET_KEK: KEK, UI_ALLOW_ANONYMOUS: "1",
+  AUTOMATION_TOKEN: "operator-token", SESSION_SECRET: SESSION, SECRET_KEK: KEK, UI_ALLOW_ANONYMOUS: "1", ADMIN_IDENTITIES: `gh-${A}`,
   AGENT: { idFromName: (n: string) => n, get: (n: string) => objects.get(n) ?? fresh(n) },
 };
 function fresh(n: string) {
@@ -596,6 +598,19 @@ await check("route: a console write is accepted only from this origin, or from a
     }
   }
   must(show(await names()) === before && !(await store.getMountByAlias(T, A, "forged")), "a refused write wrote something");
+// The admin area's writes carry the same origin gate (issue found in review of #864: a same-site
+// page could rebind any agent's model through a signed-in admin's browser).
+await check("route: an admin write is accepted only from the admin origin", async () => {
+  const fields = { action: "set-override", tenantId: OTHER_T, agentId: "", provider: "deepseek", model: "deepseek-flash" };
+  const before = dbSql.length;
+  const forged = await post("/ui/admin", fields, { headers: { "sec-fetch-site": "same-site", origin: "https://preview.console.test" } });
+  must(forged.status === 403 && /refused/.test(forged.text), `same-site admin write: ${forged.status} ${forged.text.slice(0, 120)}`);
+  must(dbSql.length === before, "a refused admin write issued no SQL");
+  const okWrite = await post("/ui/admin", fields);
+  must(okWrite.status === 200, `the admin's own page writes: ${okWrite.status}`);
+  must(dbSql.length > before, "the accepted admin write reached the store");
+});
+
   // Accepted: the console's own page (Sec-Fetch-Site), an older browser on this origin (Origin only), and a script with the token.
   const same = await post("/ui/secret", { name: "ok-sfs", value: VALUE });
   must(same.status === 200, `same-origin: ${same.status} ${same.text.slice(0, 120)}`);
