@@ -145,6 +145,8 @@ const OWN = ["receive_events", "enable_push", "disable_push", "push_status", "in
  * them, never by the no-snapshot fallback (test/raft-assistant.ts holds them).
  */
 const ASSISTANT = ["assistant_owner_inbox", "assistant_owner_messages"];
+/** The image view: hand-written, and offered exactly where the download is (test/raft-attachments-view.ts holds it). */
+const VIEW = "attachments_view";
 /** What a mount with no snapshot is offered: every tool of the plugin but the assistant's. */
 const fallbackNames = () => raftPlugin.tools.map((t) => t.name).filter((n) => !ASSISTANT.includes(n));
 const toolNamed = (name: string) => raftPlugin.tools.find((t) => t.name === name);
@@ -217,7 +219,7 @@ await check("every manifest operation is a generated tool or in the exclusion ta
   const generated = GENERATED.map((op) => op.name);
   if (JSON.stringify(generated) !== JSON.stringify(names.filter((n) => EXPECTED_GENERATED.includes(n)))) throw new Error(`generated: ${generated.join(", ")}`);
   const offered = raftPlugin.tools.map((t) => t.name);
-  const want = [...OWN, ...RAFT_OPERATIONS.filter((op) => EXPECTED_GENERATED.includes(op.name)).map((op) => op.toolName), ...ASSISTANT];
+  const want = [...OWN, ...RAFT_OPERATIONS.filter((op) => EXPECTED_GENERATED.includes(op.name)).map((op) => op.toolName), VIEW, ...ASSISTANT];
   if (JSON.stringify(offered) !== JSON.stringify(want)) throw new Error(`offered: ${offered.join(", ")}`);
   if (new Set(offered).size !== offered.length) throw new Error("two tools share a name");
 });
@@ -1658,7 +1660,11 @@ function context(capabilities: string[]) {
     server: { id: "server-1", slug: "s", name: "S" }, credential: { capabilities }, prompt: null,
   });
 }
-const allowedBy = (caps: string[]) => GENERATED.filter((op) => op.capability.every((c) => caps.includes(c))).map((op) => op.toolName);
+/** What a snapshot lists under `caps`: the generated tools they reach, and attachments_view after them wherever the download is. */
+const allowedBy = (caps: string[]) => {
+  const generated = GENERATED.filter((op) => op.capability.every((c) => caps.includes(c))).map((op) => op.toolName);
+  return generated.includes("attachments_download_url") ? [...generated, VIEW] : generated;
+};
 
 await check("a mount's snapshot lists only the operations whose every capability its credential holds", async () => {
   const calls = one(context(["read", "send"]));
@@ -3572,7 +3578,9 @@ await check("a turn's re-take that Raft refuses, or that lists nothing, keeps th
 await check("the basis covers each tool's name and the capability it needs, in any order", async () => {
   const tools = GENERATED.map((op) => ({ name: op.toolName, capability: op.capability }));
   const base = toolsBasisOf(tools);
-  must(toolsBasisOf([...OWN.map((name) => ({ name })), ...ASSISTANT.map((name) => ({ name })), ...tools]) === raftPlugin.toolsBasis, `control: the plugin's basis is made this way: ${raftPlugin.toolsBasis}`);
+  // attachments_view counts with the download's capability, since a snapshot lists it exactly where it lists the download.
+  const view = { name: VIEW, capability: opNamed("attachments.downloadUrl").capability };
+  must(toolsBasisOf([...OWN.map((name) => ({ name })), ...ASSISTANT.map((name) => ({ name })), ...tools, view]) === raftPlugin.toolsBasis, `control: the plugin's basis is made this way: ${raftPlugin.toolsBasis}`);
   // Same names and capabilities, other orders (the tools reversed, a capability list reversed): the same basis.
   const reordered = [...tools].reverse().map((t) => ({ ...t, capability: [...t.capability].reverse() }));
   must(toolsBasisOf(reordered) === base, "the order moved the basis");

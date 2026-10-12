@@ -1829,6 +1829,20 @@ export async function downloadAttachment(
   const input = argumentsFor(op, args);
   const attachmentId = typeof input.attachmentId === "string" ? input.attachmentId.trim() : "";
   if (!attachmentId) throw new Error("attachmentId is required: the id a message line shows as (id:…)");
+  const { file, ref } = await keepAttachment(attachmentId, ctx, artifacts, unoffered);
+  return { attachmentId, ref, name: file.filename, type: file.type, bytes: file.bytes.byteLength };
+}
+
+/** An attachment as kept: its bytes, the name and type Raft gave it, and the agent's reference to the stored copy. */
+interface KeptAttachment { file: { bytes: Uint8Array; filename: string; type: string }; ref: string }
+
+/**
+ * The download's fetch and keep, shared by `attachments_download_url` and `attachments_view`, so both store the same
+ * object under the same key and refuse the same things (no storage, over `ATTACHMENT_MAX_BYTES`, Raft's refusals).
+ */
+async function keepAttachment(
+  attachmentId: string, ctx: PluginContext, artifacts: RaftArtifacts | null, unoffered: ReadonlySet<string>,
+): Promise<KeptAttachment> {
   if (!artifacts) throw new Error("this deployment has no object storage to keep an attachment in; nothing was downloaded");
   let file: { bytes: Uint8Array; filename: string; type: string };
   const minted = await raftFor(ctx, { state: false }).attachments.downloadUrl({ attachmentId });
@@ -1857,8 +1871,188 @@ export async function downloadAttachment(
   const stored = await artifacts.put(key, file.bytes, file.type);
   const ref = toAgentRef(stored.ref, ctx.caller);
   if (!ref) throw new Error("the attachment was stored where this agent cannot read it back");
-  return { attachmentId, ref, name: file.filename, type: file.type, bytes: file.bytes.byteLength };
+  return { file, ref };
 }
+
+/**
+ * `attachments_view`: an image attachment, kept as the download keeps it (`keepAttachment`), with a `view` the
+ * gateway hands the model as image content. Offered exactly where the download is (`createRaftPlugin` says how).
+ */
+export const VIEW_TOOL = "attachments_view";
+/**
+ * The largest image `attachments_view` shows: 1.5 MiB of file and 2000 px a side. Nothing here resizes or re-encodes
+ * (the Worker has no image library), so an image over either is refused with its size and the limit, and the agent is
+ * left the stored file.
+ */
+export const VIEW_MAX_BYTES = 1.5 * 1024 * 1024;
+export const VIEW_MAX_SIDE = 2000;
+
+/** What `imageHeader` read: a still image of a type `attachments_view` shows, or what the bytes are instead. */
+export type ImageHeader =
+  | { ok: true; mimeType: "image/png" | "image/jpeg" | "image/webp" | "image/gif"; width: number; height: number }
+  | { ok: false; what: string };
+
+/**
+ * The type and dimensions of an image, read from its first bytes and never from a declared type: PNG (IHDR), JPEG
+ * (the first SOF marker), WebP (`VP8 `, `VP8L` or `VP8X`) and GIF (the logical screen). An animated GIF (more than
+ * one image descriptor), WebP (the VP8X animation flag) or PNG (an `acTL` chunk before the image data) is refused: a model is handed one picture, and the first
+ * frame of an animation can say something other than the whole. A header that is cut short or gives no dimensions
+ * is refused rather than guessed at. A read past the end is `undefined` (a typed array does not throw), so each
+ * format checks its length wherever such a read could make a wrong answer rather than a refusal; and every walk
+ * advances, so no input loops.
+ */
+export function imageHeader(b: Uint8Array): ImageHeader {
+  const n = b.byteLength;
+  const at = (i: number, s: string) => i + s.length <= n && [...s].every((c, k) => b[i + k] === c.charCodeAt(0));
+  const be16 = (i: number) => (b[i]! << 8) | b[i + 1]!;
+  const le16 = (i: number) => b[i]! | (b[i + 1]! << 8);
+  const le24 = (i: number) => b[i]! | (b[i + 1]! << 8) | (b[i + 2]! << 16);
+  const sized = (mimeType: Extract<ImageHeader, { ok: true }>["mimeType"], width: number, height: number, name: string): ImageHeader =>
+    width > 0 && height > 0 ? { ok: true, mimeType, width, height } : { ok: false, what: `${name} whose header gives no dimensions` };
+
+  if (at(0, "\x89PNG\r\n\x1a\n")) {
+    if (n < 24 || !at(12, "IHDR")) return { ok: false, what: "a PNG whose header is cut short or malformed" };
+    // Chunks to the image data: an APNG declares its animation (`acTL`) before the first IDAT, so a file cut before
+    // either cannot be told still from animated and is refused. Each step moves at least a chunk's 12 framing bytes.
+    for (let i = 8; ; i += 12 + b[i]! * 2 ** 24 + (b[i + 1]! << 16 | b[i + 2]! << 8 | b[i + 3]!)) {
+      if (i + 8 > n) return { ok: false, what: "a PNG cut short before its image data, so whether it is animated cannot be told" };
+      if (at(i + 4, "acTL")) return { ok: false, what: "an animated PNG" };
+      if (at(i + 4, "IDAT") || at(i + 4, "IEND")) break;
+    }
+    return sized("image/png", b[16]! * 2 ** 24 + (b[17]! << 16 | b[18]! << 8 | b[19]!), b[20]! * 2 ** 24 + (b[21]! << 16 | b[22]! << 8 | b[23]!), "a PNG");
+  }
+  if (n >= 3 && b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) {
+    // Segments from the first marker, fill bytes skipped, to the frame header: the first SOFn, C0–CF but for DHT (C4),
+    // JPG (C8) and DAC (CC), which share the range. Each step moves at least two bytes, and anything that is not a
+    // marker where one should be (where a length under 2 lands) ends the walk.
+    let i = 2;
+    while (i + 1 < n) {
+      if (b[i] !== 0xff) break;
+      const m = b[i + 1]!;
+      if (m === 0xff) { i++; continue; }
+      if (m === 0xd9 || m === 0xda) break;
+      // TEM and RST0–7 stand alone, with no length after them.
+      if (m === 0x01 || (m >= 0xd0 && m <= 0xd7)) { i += 2; continue; }
+      const length = be16(i + 2);
+      if (m >= 0xc0 && m <= 0xcf && m !== 0xc4 && m !== 0xc8 && m !== 0xcc) {
+        if (i + 8 >= n || length < 7) break;
+        return sized("image/jpeg", be16(i + 7), be16(i + 5), "a JPEG");
+      }
+      i += 2 + length;
+    }
+    return { ok: false, what: "a JPEG whose frame header (its dimensions) could not be found: cut short or malformed" };
+  }
+  if (at(0, "RIFF") && at(8, "WEBP")) {
+    if (at(12, "VP8 ")) {
+      if (n < 30 || !(b[23] === 0x9d && b[24] === 0x01 && b[25] === 0x2a)) return { ok: false, what: "a WebP whose header is cut short or malformed" };
+      return sized("image/webp", le16(26) & 0x3fff, le16(28) & 0x3fff, "a WebP");
+    }
+    if (at(12, "VP8L")) {
+      if (n < 25 || b[20] !== 0x2f) return { ok: false, what: "a WebP whose header is cut short or malformed" };
+      const bits = b[21]! | (b[22]! << 8) | (b[23]! << 16) | (b[24]! * 2 ** 24);
+      return sized("image/webp", (bits & 0x3fff) + 1, (Math.floor(bits / 2 ** 14) & 0x3fff) + 1, "a WebP");
+    }
+    if (at(12, "VP8X")) {
+      if (n < 30) return { ok: false, what: "a WebP whose header is cut short or malformed" };
+      if (b[20]! & 0x02) return { ok: false, what: "an animated WebP" };
+      return sized("image/webp", le24(24) + 1, le24(27) + 1, "a WebP");
+    }
+    return { ok: false, what: "a WebP of a kind whose header is not read here" };
+  }
+  if (at(0, "GIF87a") || at(0, "GIF89a")) {
+    const width = le16(6);
+    const height = le16(8);
+    // Every block to the trailer, counting image descriptors: a GIF that does not reach its trailer cannot be told
+    // still from animated, so it is refused rather than taken as still.
+    let i = 13 + (b[10]! & 0x80 ? 3 * 2 ** ((b[10]! & 7) + 1) : 0);
+    let frames = 0;
+    // A cut anywhere lands `i` at or past the end, which the loop's first line refuses.
+    const subBlocks = () => { while (i < n && b[i] !== 0) i += b[i]! + 1; i++; };
+    for (;;) {
+      if (i >= n) return { ok: false, what: "a GIF cut short before its end, so whether it is animated cannot be told" };
+      const block = b[i]!;
+      if (block === 0x3b) break;
+      if (block === 0x2c) {
+        if (++frames > 1) return { ok: false, what: "an animated GIF" };
+        const packed = b[i + 9] ?? 0;
+        i += 10 + (packed & 0x80 ? 3 * 2 ** ((packed & 7) + 1) : 0) + 1;
+        subBlocks();
+      } else if (block === 0x21) {
+        i += 2;
+        subBlocks();
+      } else return { ok: false, what: "a GIF whose blocks are malformed" };
+    }
+    if (frames === 0) return { ok: false, what: "a GIF with no image in it" };
+    return sized("image/gif", width, height, "a GIF");
+  }
+  if (at(0, "%PDF-")) return { ok: false, what: "a PDF document" };
+  if (at(0, "BM")) return { ok: false, what: "a BMP image" };
+  if (at(0, "II*\0") || at(0, "MM\0*")) return { ok: false, what: "a TIFF image" };
+  if (at(0, "\0\0\x01\0")) return { ok: false, what: "an ICO icon" };
+  if (at(4, "ftyp")) {
+    const brand = String.fromCharCode(...b.subarray(8, 12));
+    if (/^avi[fs]$/.test(brand)) return { ok: false, what: "an AVIF image" };
+    if (/^(?:hei[cx]|hev[cx]|mif1|msf1)$/.test(brand)) return { ok: false, what: "a HEIC image" };
+    return { ok: false, what: "a video or other ISO media file" };
+  }
+  if (at(0, "PK\x03\x04")) return { ok: false, what: "a ZIP archive (or a document built on one, such as .docx)" };
+  const head = new TextDecoder().decode(b.subarray(0, 1024));
+  if (/<svg[\s>]/i.test(head)) return { ok: false, what: "an SVG image" };
+  return { ok: false, what: "a file of a type this tool does not recognise" };
+}
+
+/** A byte count as the refusals say it: MiB to one place, and the exact count. */
+function sizeOf(bytes: number): string {
+  return `${(bytes / 1024 / 1024).toFixed(1)} MiB (${bytes} bytes)`;
+}
+
+/**
+ * `attachments_view`, end to end. The file is fetched and kept first, as the download keeps it, so a refusal can hand
+ * the agent the reference to what was kept (a second call fetches and writes it again, under the same key, so storage does not grow); then its first bytes decide what it
+ * is (`imageHeader`) and the limits are applied. A refusal is a thrown error, like every other here.
+ */
+export async function viewAttachment(
+  args: unknown, ctx: PluginContext, artifacts: RaftArtifacts | null, unoffered: ReadonlySet<string> = DEFAULT_UNOFFERED,
+): Promise<Json> {
+  if (args !== undefined && args !== null && (typeof args !== "object" || Array.isArray(args))) throw new Error(`${VIEW_TOOL} takes an object of arguments`);
+  const given = (args as { attachmentId?: unknown } | null | undefined)?.attachmentId;
+  const attachmentId = typeof given === "string" ? given.trim() : "";
+  if (!attachmentId) throw new Error("attachmentId is required: the id a message line shows as (id:…)");
+  const { file, ref } = await keepAttachment(attachmentId, ctx, artifacts, unoffered);
+  const bytes = file.bytes.byteLength;
+  const which = `attachment ${attachmentId} (${JSON.stringify(file.filename)})`;
+  const kept = `It was kept as ${ref}.`;
+  const header = imageHeader(file.bytes);
+  if (!header.ok) {
+    throw new Error(`${VIEW_TOOL} shows only PNG, JPEG, WebP and still GIF images; ${which} is ${header.what}, by its first bytes ` +
+      `(Raft calls it ${JSON.stringify(file.type)}). ${kept} For a file that is not an image, use ${DOWNLOAD_TOOL}.`);
+  }
+  const over = [
+    ...(bytes > VIEW_MAX_BYTES ? [`${sizeOf(bytes)}, over the ${sizeOf(VIEW_MAX_BYTES)} limit`] : []),
+    ...(header.width > VIEW_MAX_SIDE || header.height > VIEW_MAX_SIDE
+      ? [`${header.width}×${header.height} px, over the ${VIEW_MAX_SIDE} px limit on a side`] : []),
+  ];
+  if (over.length) {
+    throw new Error(`${which} is too large to view: ${over.join("; and ")}. Images are not resized here. ${kept}`);
+  }
+  return {
+    attachmentId, ref, name: file.filename, type: file.type, bytes,
+    view: { ref, mimeType: header.mimeType, width: header.width, height: header.height, bytes },
+  };
+}
+
+/** `attachments_view` as the model is offered it: the download's arguments and declarations, in its own words. */
+const DOWNLOAD_SCHEMA = toolOf(RAFT_OPERATIONS.find((o) => o.name === DOWNLOAD_OP)!);
+const VIEW_SCHEMA: ToolSchema = {
+  name: VIEW_TOOL,
+  summary: "Show an image attachment (by the id a message line shows) so you can look at it: PNG, JPEG, WebP or a still GIF, " +
+    `at most ${VIEW_MAX_BYTES / 1024 / 1024} MiB and ${VIEW_MAX_SIDE} px on each side. The type is read from the file itself. ` +
+    "Returns the image with its name, type, size and dimensions, and an artifact reference to the file. Anything else " +
+    `(a document, an animated or larger image) is refused, saying what it is; nothing is resized. For a file that is not an image, use ${DOWNLOAD_TOOL}.`,
+  parameters: DOWNLOAD_SCHEMA.parameters,
+  sideEffects: DOWNLOAD_SCHEMA.sideEffects,
+  idempotency: DOWNLOAD_SCHEMA.idempotency,
+};
 
 /**
  * The basis of a raft snapshot (`Plugin.toolsBasis`): a digest of every tool this build can offer, each as its name and
@@ -1887,8 +2081,8 @@ export interface RaftArtifacts {
 }
 
 /**
- * The plugin, built for a runtime. `artifacts` is where `attachments_download_url` keeps what it fetches (none: the
- * tool is not offered, and every pointer at it is said in words). `excluded` is the exclusion table, `EXCLUDED` unless
+ * The plugin, built for a runtime. `artifacts` is where `attachments_download_url` and `attachments_view` keep what
+ * they fetch (none: neither is offered, and every pointer at the download is said in words). `excluded` is the exclusion table, `EXCLUDED` unless
  * a test builds it otherwise: every list below derives from it — which tools are generated and offered, how each is dispatched, which hints are
  * put in words (`offeredTerms`), and a message line's attachment suffix (`modelLine`) — so taking an operation out of
  * the table is the whole change that offers it. `assistant` is the wire a personal assistant's owner reads go
@@ -1909,9 +2103,16 @@ export function createRaftPlugin(deps: {
   const notGenerated = excluded === EXCLUDED ? DEFAULT_UNOFFERED : unofferedNames(excluded);
   const unoffered: ReadonlySet<string> = artifacts ? notGenerated : new Set([...notGenerated, DOWNLOAD_TOOL]);
   const generatedTools: readonly ToolSchema[] = offerable.map(toolOf);
+  /**
+   * `attachments_view` goes wherever the download goes, since it is the download plus a look at the bytes: built
+   * only when the download is offerable (storage, and not excluded), listed by a snapshot exactly when it lists the
+   * download (`snapshotTools`), and offered by `mountTools` only when its snapshot lists both. A snapshot taken before
+   * the view existed lists the download alone, and is re-taken at the next turn because the view moved `toolsBasis`.
+   */
+  const viewTools: readonly ToolSchema[] = offerable.some((op) => op.name === DOWNLOAD_OP) ? [VIEW_SCHEMA] : [];
   const operationOf = new Map(generated.map((op) => [op.toolName, op]));
   /** What a mount with no snapshot is offered: every tool but a personal assistant's (`ASSISTANT_TOOLS`). */
-  const allTools: ToolSchema[] = [...OWN_TOOLS, ...generatedTools];
+  const allTools: ToolSchema[] = [...OWN_TOOLS, ...generatedTools, ...viewTools];
   /**
    * What this call's mount does not offer, for the hints and the attachment suffix: `unoffered`, plus every generated
    * tool the kernel says this mount is not offered right now (`PluginContext.offered`) — one its credential lacks the
@@ -1944,6 +2145,7 @@ export function createRaftPlugin(deps: {
     toolsBasis: toolsBasisOf([
       ...OWN_TOOLS.map((t) => ({ name: t.name })), ...ASSISTANT_TOOLS.map((t) => ({ name: t.name })),
       ...offerable.map((op) => ({ name: op.toolName, capability: op.capability })),
+      ...viewTools.map((t) => ({ name: t.name, capability: RAFT_OPERATIONS.find((o) => o.name === DOWNLOAD_OP)!.capability })),
     ]),
     /** The push registration this mount holds: whether it exists is listable, what it holds is not. */
     database: {
@@ -2009,7 +2211,10 @@ export function createRaftPlugin(deps: {
       const snapshot = mount.toolSnapshot;
       if (!snapshot) return allTools;
       const allowed = new Set(snapshot.tools.map((t) => t.name));
-      return [...OWN_TOOLS, ...generatedTools.filter((t) => allowed.has(t.name)), ...ASSISTANT_TOOLS.filter((t) => allowed.has(t.name))];
+      const generatedHere = generatedTools.filter((t) => allowed.has(t.name));
+      // The view needs the download's capability and storage, so it goes only with the download offered beside it.
+      const view = generatedHere.some((t) => t.name === DOWNLOAD_TOOL) ? viewTools.filter((t) => allowed.has(t.name)) : [];
+      return [...OWN_TOOLS, ...generatedHere, ...view, ...ASSISTANT_TOOLS.filter((t) => allowed.has(t.name))];
     },
 
     /**
@@ -2050,9 +2255,11 @@ export function createRaftPlugin(deps: {
       const skipped: Array<{ name: string; reason: string }> = [];
       for (const op of offerable) {
         const missing = op.capability.filter((c) => !capabilities.has(c));
-        if (missing.length) skipped.push({ name: op.toolName, reason: `the credential lacks the Raft capability ${missing.join(", ")}` });
+        const named = op.name === DOWNLOAD_OP ? [op.toolName, ...viewTools.map((t) => t.name)] : [op.toolName];
+        if (missing.length) for (const name of named) skipped.push({ name, reason: `the credential lacks the Raft capability ${missing.join(", ")}` });
         else tools.push(toolOf(op));
       }
+      if (tools.some((t) => t.name === DOWNLOAD_TOOL)) tools.push(...viewTools);
       if (isAssistantOf(me.data.agent.assistantOf)) tools.push(...ASSISTANT_TOOLS);
       return { tools, skipped };
     },
@@ -2139,6 +2346,8 @@ export function createRaftPlugin(deps: {
     async invoke(name, args, ctx): Promise<Json> {
       const op = operationOf.get(name);
       if (op) return operate(op, args, ctx) as Promise<Json>;
+      // Answered wherever the download is generated, as the download is: with no storage it says why nothing was kept.
+      if (name === VIEW_TOOL && operationOf.has(DOWNLOAD_TOOL)) return viewAttachment(args, ctx, artifacts, unofferedFor(ctx));
       const a = object(args);
       if (name === LIST_TOOL) return integrationsList(ctx, agentLogin(ctx));
       if (name === LOGIN_TOOL) return integrationsLogin(args, ctx, agentLogin(ctx));

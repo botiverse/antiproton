@@ -523,7 +523,15 @@ filename) have line breaks and other control characters replaced with a space
 object storage (at most `ATTACHMENT_MAX_BYTES`) and returns its `artifact://`
 reference, never the URL; it is offered when the plugin is built with object
 storage (`createRaftPlugin({ artifacts })`, as the runtime builds it) and not
-at all without, falling back to `attachments.download` when the Server cannot mint a URL. A tool's description and every parameter description in its
+at all without, falling back to `attachments.download` when the Server cannot mint a URL.
+`attachments_view` keeps an attachment the same way and, when its first bytes
+are a PNG, JPEG, WebP or still GIF of at most `VIEW_MAX_BYTES` (1.5 MiB) and
+`VIEW_MAX_SIDE` (2000 px a side), returns the same fields plus a `view` (the
+reference, the type read from the bytes, width, height and size) that the gateway
+can hand the model as an image; anything else, an animated GIF, WebP or PNG, or an
+image over a limit is refused with what it is and the reference to the copy
+kept, since nothing resizes. It is listed by a snapshot exactly where the
+download is and offered only beside it. A tool's description and every parameter description in its
 schema name operations by their tool names, never by the manifest's dotted
 names, SDK field paths or CLI flags (`inMountTerms`). Its
 `snapshotTools` asks Raft what the mount's credential may do
