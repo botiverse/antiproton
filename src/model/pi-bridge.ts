@@ -388,6 +388,21 @@ export function fromResponse(
 }
 
 /**
+ * The `errorMessage` of a model call refused for a daily spend limit (cf/src/spend-limit.ts `refusalAnswer`): fixed
+ * text, because both engines' harnesses decide whether to retry a failed turn by scanning that string (pi-ai
+ * `isRetryableAssistantError`) and both read it for an overflow (src/runtime/overflow-backstop.ts `overflowKind`,
+ * pi-ai `isContextOverflow`). It matches none of their retryable or overflow patterns, and "out of budget" is in
+ * pi-ai's non-retryable list. Kept here, beside the answer's shape, so the trace (src/trace/seams.ts `modelCallRow`)
+ * can recognise such an answer without importing the Worker's code.
+ */
+export const SPEND_LIMIT_ERROR = "usage limit reached (out of budget); see the turn's error";
+
+/** The sentence a spend-limit refusal carries for its owner (`providerError`), or undefined for any other answer. */
+export function spendLimitRefusal(m: { errorMessage?: unknown; providerError?: unknown } | null | undefined): string | undefined {
+  return m?.errorMessage === SPEND_LIMIT_ERROR && typeof m.providerError === "string" && m.providerError ? m.providerError : undefined;
+}
+
+/**
  * The text a failed answer shows a reader: the provider's own refusal when it carries one (`providerError`,
  * set for a refused request by `callQueuedModel`, cf/src/model-request.ts), else its `errorMessage`. The two
  * are apart because the harness's retry check scans `errorMessage` and must never see provider text

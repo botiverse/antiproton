@@ -272,8 +272,9 @@ Antiproton is designed to run as a Cloudflare Worker backed by Durable Objects:
    unset) are never refused but count toward the platform total. Usage paid with the tenant's own
    credential counts nothing. The check is made in the queue consumer before each provider call, on a
    reading of the ledger at most 30 s old (5 s near a limit); a refused call fails its turn once with
-   `Daily usage limit reached ($X of $Y); resets at 00:00 UTC.` (or the platform's sentence), is not
-   retried, and is not read as an overflow. A spend read that fails lets the call through, with a log
+   `Daily usage limit reached ($X of $Y); resets at 00:00 UTC.` (or the platform's sentence), which Raft
+   is told too (`BridgeFatal` `usage_limit_reached`, and the sentence as the error status's detail), is not
+   retried, and is not read as an overflow. A key with no price counts nothing and is logged. A spend read that fails lets the call through, with a log
    line. Running containers are not stopped. What is counted, how far a tenant can overshoot and why:
    docs/metering.md, "Daily limits".
 

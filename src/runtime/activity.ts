@@ -15,7 +15,7 @@
  *   tool.call               → PreToolUse + PostToolUse / PostToolUseFailure
  *   model.call stop|length  → Stop                (the turn is answered)
  *   model.call aborted      → Stop                (cancelled: no longer working)
- *   model.call error        → BridgeFatal         (the turn died)
+ *   model.call error        → BridgeFatal         (the turn died; a daily spend limit's refusal says so and why)
  *   model.call toolUse      → nothing             (still working)
  *   session.needs_reset set → BridgeFatal         (the overflow backstop gave up: pushes are refused until a reset)
  *
@@ -114,7 +114,7 @@ function hookEvents(agentId: string, rows: readonly TraceOutboxRow[]): ActivityE
       }
       case "model.call":
         if (row.status === "stop" || row.status === "length" || row.status === "aborted") out.push({ ...base, hookEventName: "Stop" });
-        else if (row.status === "error") out.push({ ...base, hookEventName: "BridgeFatal", errorClass: "model_call_failed" });
+        else if (row.status === "error") out.push({ ...base, hookEventName: "BridgeFatal", errorClass: modelCallErrorClass(row) });
         break;
       case "session.needs_reset":
         if (row.status === "set") out.push({ ...base, hookEventName: "BridgeFatal", errorClass: NEEDS_RESET_ERROR });
@@ -132,3 +132,15 @@ function hookEvents(agentId: string, rows: readonly TraceOutboxRow[]): ActivityE
  * that nothing will answer them until an operator resets the session.
  */
 export const NEEDS_RESET_ERROR = "context_overflow: conversation too long for the model; pushes are refused until an operator resets it";
+
+/**
+ * The `errorClass` a failed model call is sent with. Raft shows it as the text of the activity log's "Bridge fatal"
+ * entry, at most 120 characters (slock agentOrchestrator.ts, the BridgeFatal mapping), so a call refused for a daily
+ * spend limit (`attrs.limit`, src/trace/seams.ts `modelCallRow`) names itself and carries its sentence, as
+ * `NEEDS_RESET_ERROR` does; anything else is `model_call_failed`.
+ */
+export const USAGE_LIMIT_ERROR_CLASS = "usage_limit_reached";
+function modelCallErrorClass(row: TraceOutboxRow): string {
+  const limit = typeof row.attrs.limit === "string" && row.attrs.limit ? row.attrs.limit : null;
+  return limit ? `${USAGE_LIMIT_ERROR_CLASS}: ${limit}`.slice(0, 120) : "model_call_failed";
+}

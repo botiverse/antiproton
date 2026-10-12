@@ -237,7 +237,11 @@ exempted by naming it in the var.
 tokens on the operator's provider accounts, object time, operator-paid
 containers, and operator-paid tool calls (Exa). A key paid with the tenant's own
 credential (`own:`, "Who pays" above) is priced 0 and counts nothing toward
-either limit; an unpriced key counts nothing, as in every view.
+either limit; an unpriced key counts nothing, as in every view. So spend on an
+unpriced key — a model with no price row, which an admin's model choice can
+name — is not limited at all; each unpriced key a reading meets is logged as
+`spend_limit.unpriced`, once per key per isolate per UTC day, so a missing price
+row is visible.
 
 **Where it is checked.** In the queue consumer (`runModelCall`,
 `cf/src/model-queue.ts`), after the job is taken and before the provider is
@@ -254,6 +258,14 @@ Agents API show (`failureText`) — is:
 - `Daily usage limit reached ($X of $Y); resets at 00:00 UTC.`, or
 - `Platform daily usage limit reached; resets at 00:00 UTC.` (asked first: when
   it is reached nobody's calls are made).
+
+An agent Raft runs tells Raft the same sentence: the failed call's `model.call`
+trace row carries it (`attrs.limit`, `modelCallRow` in `src/trace/seams.ts`), so
+the turn's `BridgeFatal` has the `errorClass` `usage_limit_reached: <sentence>`
+(Raft's activity log shows it, up to 120 characters) and the agent's `error`
+status has the sentence as its `detail` (Raft's dot shows it). Any other failed
+call is `model_call_failed` with no detail, as before. The model never reads the
+sentence: both engines leave a failed turn out of the next request.
 
 So the queue acks the message and does not retry it; neither engine's harness
 retries it (the fixed text matches none of pi-ai's retryable patterns, and "out of

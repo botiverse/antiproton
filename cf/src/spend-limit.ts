@@ -19,7 +19,7 @@
  * A refused call is answered, not thrown, so the queue acks it and nothing retries it (`refusalAnswer`).
  */
 import { UNACCEPTED_TOKENS } from "../../src/usage/outbox.ts";
-import { errorMessage, type AnsweredMessage } from "../../src/model/pi-bridge.ts";
+import { errorMessage, SPEND_LIMIT_ERROR, type AnsweredMessage } from "../../src/model/pi-bridge.ts";
 import { logEvent } from "../../src/core/log.ts";
 import { DAY_MS, priceFor, usagePrices } from "./usage-d1.ts";
 
@@ -37,14 +37,8 @@ export const SPEND_CACHE_MS = 30_000;
 export const SPEND_CACHE_NEAR_MS = 5_000;
 export const NEAR_FRACTION = 0.8;
 
-/**
- * The refused answer's `errorMessage`: fixed text, because both engines' harnesses decide whether to retry a
- * failed turn by scanning that string (pi-ai `isRetryableAssistantError`), and both read it for an overflow
- * (src/runtime/overflow-backstop.ts `overflowKind`, pi-ai `isContextOverflow`). It matches none of their retryable
- * or overflow patterns, and "out of budget" is in pi-ai's non-retryable list. The sentence an owner reads, with
- * the figures, travels in `providerError`, which `failureText` (src/model/pi-bridge.ts) shows.
- */
-export const SPEND_LIMIT_ERROR = "usage limit reached (out of budget); see the turn's error";
+/** The refused answer's `errorMessage` (src/model/pi-bridge.ts says why it is fixed text, and why it lives there). */
+export { SPEND_LIMIT_ERROR };
 export const PLATFORM_LIMIT_TEXT = "Platform daily usage limit reached; resets at 00:00 UTC.";
 export const tenantLimitText = (spentUsd: number, limitUsd: number) =>
   `Daily usage limit reached ($${spentUsd.toFixed(2)} of $${limitUsd.toFixed(2)}); resets at 00:00 UTC.`;
@@ -101,7 +95,7 @@ export async function readDaySpend(db: D1Database, tenantId: string, now: number
   for (const r of (rows.results ?? []) as any[]) {
     const row = { bucket: Number(r.hour), resource: String(r.resource), key: String(r.key), unit: String(r.unit) };
     const p = priceFor(prices, row);
-    if (p === null) continue;
+    if (p === null) { noteUnpriced(day, row, String(r.mine) === "1" ? tenantId : null); continue; }
     const cost = p * Number(r.quantity);
     platformUsd += cost;
     if (Number(r.mine) === 1 && row.resource !== UNACCEPTED_TOKENS) tenantUsd += cost;
@@ -110,6 +104,20 @@ export async function readDaySpend(db: D1Database, tenantId: string, now: number
     day, tenantUsd, platformUsd,
     override: override ? { limitUsd: override.limit_usd === null || override.limit_usd === undefined ? null : Number(override.limit_usd) } : null,
   };
+}
+
+/**
+ * An unpriced key counts nothing toward either limit, as in every view, so spend on it is not limited at all: an
+ * admin's choice of a model with no price row, say. Said once per key per isolate per UTC day (`spend_limit.unpriced`),
+ * so it is seen where an operator looks, without a line per call.
+ */
+const unpricedSeen = { day: 0, keys: new Set<string>() };
+function noteUnpriced(day: number, row: { resource: string; key: string; unit: string }, tenantId: string | null) {
+  if (unpricedSeen.day !== day) { unpricedSeen.day = day; unpricedSeen.keys.clear(); }
+  const k = `${row.resource}\u0000${row.key}\u0000${row.unit}`;
+  if (unpricedSeen.keys.has(k)) return;
+  unpricedSeen.keys.add(k);
+  logEvent("spend_limit.unpriced", { resource: row.resource, key: row.key, unit: row.unit, day: new Date(day).toISOString().slice(0, 10), tenantId });
 }
 
 export type Admission =
@@ -182,8 +190,10 @@ const round = (n: number) => Math.round(n * 1e6) / 1e6;
 
 /**
  * The answer a refused call is delivered: a failed turn, with no usage (so the ledger writes nothing for it,
- * docs/metering.md "Verdicts"), the fixed `SPEND_LIMIT_ERROR`, and the sentence for the owner and the agent's
- * transcript in `providerError`. Named for the model the job would have called, like any answer to it.
+ * docs/metering.md "Verdicts"), the fixed `SPEND_LIMIT_ERROR`, and the sentence in `providerError`. The sentence is in
+ * the stored transcript, which the console and the Agents API show, and goes to Raft as the turn's `BridgeFatal` and
+ * the agent's status detail (src/runtime/activity.ts, src/runtime/status.ts). It never reaches the model: both engines
+ * leave a failed turn out of the next request. Named for the model the job would have called, like any answer to it.
  */
 export function refusalAnswer(text: string, jobId: string, model: { api: string; provider: string; id: string }): AnsweredMessage {
   return { ...errorMessage(SPEND_LIMIT_ERROR, model), providerError: text, jobId };

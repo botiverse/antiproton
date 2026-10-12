@@ -20,6 +20,11 @@ import {
 } from "../cf/src/spend-limit.ts";
 import { overflowKind, readBackstop } from "../src/runtime/overflow-backstop.ts";
 import { pendingUsage } from "../src/usage/outbox.ts";
+import { pendingTrace } from "../src/trace/outbox.ts";
+import { modelCallRow } from "../src/trace/seams.ts";
+import { activityEvents, USAGE_LIMIT_ERROR_CLASS } from "../src/runtime/activity.ts";
+import { statusEvents } from "../src/runtime/status.ts";
+import { spendLimitRefusal } from "../src/model/pi-bridge.ts";
 import { setLogSink } from "../src/core/log.ts";
 import { ApStore } from "../src/store/ap-store.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
@@ -144,6 +149,23 @@ await check("day rollover in the ledger: yesterday's spend is not today's", asyn
   must(near(y.tenantUsd, 9) && y.day === TODAY - DAY, show(y));
 });
 
+await check("an unpriced key counts nothing and is logged once per key per isolate per UTC day", async () => {
+  const db = d1();
+  row(db, { tenant: "t", hour: TODAY + H, key: "mystery-model:output", quantity: 1e9 });
+  row(db, { tenant: "t", hour: TODAY - H, key: "mystery-model:output", quantity: 1e9 });
+  const lines = await logged(async () => {
+    const s = await readDaySpend(db, "t", NOON);
+    must(near(s.tenantUsd, 0) && near(s.platformUsd, 0), show(s));
+    await readDaySpend(db, "t", NOON + H);
+    await readDaySpend(db, "u", NOON + 2 * H);
+  });
+  const unpriced = lines.filter((l) => l.includes("spend_limit.unpriced") && l.includes("mystery-model:output"));
+  must(unpriced.length === 1 && unpriced[0]!.includes('"tenantId":"t"') && unpriced[0]!.includes('"day":"2026-10-12"'), show(lines));
+  // The day before is its own day: said again there.
+  const yesterday = await logged(async () => { await readDaySpend(db, "t", TODAY - 30 * 60_000); });
+  must(yesterday.filter((l) => l.includes("spend_limit.unpriced") && l.includes("mystery-model:output")).length === 1, show(yesterday));
+});
+
 // ---- the verdict -----------------------------------------------------------------------------------------------
 
 await check("under, at and over the tenant limit: admitted, refused, refused, with the sentence", async () => {
@@ -255,6 +277,23 @@ await check("the refusal is fixed text the harness does not retry and nobody rea
   }
 });
 
+await check("what Raft is told: a limit's refusal is BridgeFatal usage_limit_reached with its sentence, and error with it as detail; any other failure is as before", async () => {
+  // The row each engine writes for a failed answer (pi-storage.ts, pd-outbox.ts), as the outbox gives it back.
+  const row = (m: { errorMessage?: string; providerError?: string }, seq: number) => ({
+    ...modelCallRow({ tenantId: "t", agentId: "a", jobId: `j${seq}`, stopReason: "error", model: "deepseek-flash", at: NOON + seq, limit: spendLimitRefusal(m) }),
+    seq,
+  });
+  const limited = await answerFor(PLATFORM_LIMIT_TEXT);
+  const rows = [row({ errorMessage: "model refused (HTTP 400, permanent): see the turn's error", providerError: "HTTP 400: bad" }, 1), row(limited, 2)];
+  const fatal = activityEvents("a", rows as never).filter((e) => e.hookEventName === "BridgeFatal").map((e) => e.errorClass);
+  must(show(fatal) === show(["model_call_failed", `usage_limit_reached: ${PLATFORM_LIMIT_TEXT}`]), show(fatal));
+  const status = statusEvents("a", rows as never).map((e) => [e.status, e.detail ?? null]);
+  must(show(status) === show([["error", null], ["error", PLATFORM_LIMIT_TEXT]]), show(status));
+  // Raft refuses a detail over 200 characters and cuts an errorClass at 120: both are kept inside.
+  const long = row({ errorMessage: SPEND_LIMIT_ERROR, providerError: "x".repeat(300) }, 3);
+  must(activityEvents("a", [long] as never)[0]!.errorClass!.length === 120 && statusEvents("a", [long] as never)[0]!.detail!.length === 200, "not cut");
+});
+
 // ---- both engines, through the real consumer -------------------------------------------------------------------
 
 const ENV = { DEEPSEEK_BASE_URL: "https://model.example/v1", DEEPSEEK_API_KEY: "operator-key", HARNESS_MODEL: "deepseek-flash" };
@@ -340,6 +379,15 @@ for (const engine of ["pi085", "pd"] as const) {
       must(failed.length === 1 && (failed[0]!.payload as { error?: string }).error === sentence, `${engine}: console events ${show(failed)}`);
       const backstop = readBackstop(host.sql as never);
       must(backstop.needsReset === null && backstop.consecutive === 0 && backstop.rebuilds === 0, `${engine}: backstop ${show(backstop)}`);
+      // What Raft is told: the turn's BridgeFatal names the limit and carries the sentence, and the agent's error
+      // status carries it as the detail Raft's dot shows.
+      const trace = pendingTrace(host.sql as never, 0).rows.filter((r) => r.kind === "model.call" && r.status === "error");
+      must(trace.length === 1 && trace[0]!.attrs.limit === sentence, `${engine}: model.call rows ${show(trace)}`);
+      const events = activityEvents("a", pendingTrace(host.sql as never, 0).rows);
+      const fatal = events.filter((e) => e.hookEventName === "BridgeFatal");
+      must(fatal.length === 1 && fatal[0]!.errorClass === `${USAGE_LIMIT_ERROR_CLASS}: ${sentence}`, `${engine}: BridgeFatal ${show(fatal)}`);
+      const errored = events.filter((e) => e.status === "error");
+      must(errored.length === 1 && errored[0]!.detail === sentence, `${engine}: error status ${show(errored)}`);
       const metered = pendingUsage(host.sql as never, 0).filter((r) => r.resource.startsWith("model.tokens"));
       must(metered.length === 0, `${engine}: the refusal was metered: ${show(metered)}`);
       // A redelivery of the same message takes nothing and calls nothing.

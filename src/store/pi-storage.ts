@@ -46,6 +46,7 @@ import type { Context } from "@earendil-works/pi-agent-core/harness/context";
 import { appendUsage, modelTokenRows } from "../usage/outbox.ts";
 import { appendTrace } from "../trace/outbox.ts";
 import { answerEnded, modelCallRow } from "../trace/seams.ts";
+import { spendLimitRefusal } from "../model/pi-bridge.ts";
 import { settleRebuildOutcome } from "../runtime/rebuild.ts";
 
 type Usage = SessionStats["usage"];
@@ -288,6 +289,7 @@ export class PiSqliteStorage implements Storage {
                 answeredAt: job && job.answered_at !== null && job.answered_at !== undefined ? Number(job.answered_at) : null,
                 prefix: parsedPrefix(prefix),
                 usage: m.usage,
+                limit: spendLimitRefusal(m),
               })]);
               // A rebuild decision waiting for this transcript's next call is measured by it (src/runtime/rebuild.ts). A
               // shadow reading: a failure is logged and never fails the answer it reads. An answer that is a context
