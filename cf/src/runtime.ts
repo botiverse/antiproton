@@ -20,7 +20,12 @@ import { PiAgent, ensureAgentTables, jobSession, sessionsWithWork, markSession, 
 import { DurableAgent, PdHost, recordedEngine } from "../../src/runtime/durable-agent.ts";
 import { busyReason, clientCallsWaiting, migrateToPd, revertToPi085, type MigrationResult, type RevertResult } from "../../src/runtime/pd-migrate.ts";
 import { sealSeedFiles, seedInline, sha256Hex, type SealHow, type SeedMode, type SeedWriteResult } from "../../src/store/seed-files.ts";
+import {
+  commitImport, importDecided, importInline, IMPORT_HOLD_MAX_MS, liftHold, markInstructionsApplied, placeHold, readHold, spillKey,
+  type CommitResult, type ImportHold, type ImportRow,
+} from "../../src/store/workspace-import.ts";
 import { logEvent } from "../../src/core/log.ts";
+import { appendTrace } from "../../src/trace/outbox.ts";
 import { markHarnessDrop, recordHarnessOpen, type HarnessDropReason } from "../../src/runtime/harness-open.ts";
 import { currentMainId, mainSessions, modelInputCalls, readModelInput, recordModelInput, startFreshMain, type MainSessionRow, type ModelInputEvidence } from "./fresh-context.ts";
 import { recordImageAttempt } from "./image-evidence.ts";
@@ -569,6 +574,27 @@ function summarise(value: unknown, budget = 1200): Json {
 }
 
 /** Same surface the SigV4 client exposes, backed by the R2 binding instead. */
+/** A message refused because the agent waits for its workspace import (`awaitImport`); the hold's end is in it. */
+export class AwaitingImport extends Error {
+  readonly until: number;
+  constructor(until: number) {
+    super(`the agent is waiting for its workspace import and starts no turn before it; it runs without one from ${new Date(until).toISOString()}`);
+    this.until = until;
+  }
+}
+
+/** The trace row of a hold that ended: by its import, or by the valve, saying why (src/store/workspace-import.ts). */
+function holdEnded(sql: any, tenantId: string, agentId: string, h: ImportHold) {
+  const at = h.liftedAt ?? Date.now();
+  appendTrace(sql, [{
+    at, tenantId, agentId, kind: "import.hold", spanId: `hold_${agentId}`, status: h.how ?? "import",
+    verdict: h.how === "valve" ? "failed" : "ok", ms: at - h.since,
+    attrs: h.how === "valve"
+      ? { reason: `no workspace import arrived within ${IMPORT_HOLD_MAX_MS / 3_600_000} hours of the create; the agent runs without one` }
+      : { reason: "the workspace import landed" },
+  }]);
+}
+
 class BoundArtifacts {
   #bucket: R2Bucket;
   #name: string;
@@ -580,6 +606,10 @@ class BoundArtifacts {
     const bytes = typeof body === "string" ? new TextEncoder().encode(body) : body;
     await this.#bucket.put(key, bytes);
     return { ref: `r2://${this.#name}/${key}`, etag: "", bytes: bytes.byteLength };
+  }
+  /** Remove objects nothing names any more (a workspace import that did not land, `importWorkspace`). */
+  async delete(keys: string[]) {
+    if (keys.length) await this.#bucket.delete(keys);
   }
   async get(key: string): Promise<Uint8Array> {
     const obj = await this.#bucket.get(key);
@@ -1391,8 +1421,19 @@ export class AgentRuntime {
     const settle = (row: PendingInbound, outcome: "delivered" | "failed" | "ignored", reason?: string) =>
       settleInbound(sql, transact, { ...row, tenantId, agentId, outcome, reason });
     const out: InboundPass = { posted: 0, failed: 0, ignored: 0, left: 0, retryInMs: null, waitedMs: null, error: null };
+    // Waiting for its workspace import (`awaitImport`): every push stays queued, none expires, and the pass comes
+    // back when the hold would lift on its own. The import lifts it sooner and wakes the object (AgentDO).
+    const heldUntil = this.importHeldUntil(tenantId, agentId);
+    if (heldUntil !== null) {
+      out.left = pendingInboundCount(sql);
+      out.retryInMs = Math.max(0, heldUntil - Date.now());
+      return out;
+    }
+    // A push queued while the agent was held is given its full age from the hold's end, not from its arrival.
+    const lifted = readHold(sql, tenantId, agentId)?.liftedAt ?? null;
+    const sinceLift = lifted === null ? Infinity : Date.now() - lifted;
     // Too old to be worth reading, wherever they stand: a long outage must not end in notices hours late.
-    for (const seq of expiredPendingInbound(sql, Date.now())) {
+    for (const seq of sinceLift < INBOUND_MAX_AGE_MS ? [] : expiredPendingInbound(sql, Date.now())) {
       const row = pendingInboundRow(sql, seq);
       if (!row) continue;
       settle(row, "failed", `queued for more than ${INBOUND_MAX_AGE_MS / 60_000} minutes without being posted` +
@@ -3352,6 +3393,92 @@ export class AgentRuntime {
     throw new Error(`seed write of ${file.path}: the store refused a spilled write as too large`);
   }
 
+  // ---- a workspace import (src/store/workspace-import.ts): a migrating agent's files, once.
+
+  /**
+   * Write every file of an import, or none (src/store/workspace-import.ts). The request was checked by the route
+   * (cf/src/provision/handlers.ts). A file too large for its row is put in object storage first, under a name of
+   * this attempt alone, so nothing a row names, or another attempt's, is ever replaced; then all the rows and the
+   * import's own row in one transaction, which decides there and then whether this is a retry, a second import, or
+   * an agent that has started. A throw before or inside it, or a refusal or retry found in it, leaves the attempt's
+   * objects named by nothing, and they are deleted; a failed delete is logged, never the import's answer.
+   */
+  async importWorkspace(
+    tenantId: string, agentId: string,
+    imp: { migrationId: string; digest: string; instructions: boolean; files: Array<{ path: string; text: string; bytes: number; sha256: string }> },
+  ): Promise<CommitResult | { ok: false; code: "not_found"; message: string }> {
+    await this.ready();
+    if (!(await this.store.loadAgent(tenantId, agentId))) return { ok: false, code: "not_found", message: `no agent ${agentId}` };
+    const sql = this.#deps.ctx.storage.sql;
+    // Asked first so a refusal or a retry uploads nothing; only a guess, decided again inside the transaction.
+    const early = importDecided(sql, tenantId, agentId, imp.digest, imp.files.map((f) => f.path));
+    if (early) return early;
+    const attempt = crypto.randomUUID();
+    const uploaded: string[] = [];
+    const drop = async () => {
+      try { await this.#artifacts.delete(uploaded); }
+      catch (e) { logEvent("provision.import.orphans", { tenantId, agentId, attempt, objects: uploaded.length, error: String((e as Error)?.message ?? e) }); }
+    };
+    try {
+      const rows: ImportRow[] = [];
+      for (const f of imp.files) {
+        const json = JSON.stringify(f.text);
+        if (importInline(f.text)) { rows.push({ path: f.path, value: json, ref: null, bytes: json.length }); continue; }
+        const key = spillKey(tenantId, agentId, attempt, f.sha256);
+        if (!uploaded.includes(key)) uploaded.push(key);
+        const ref = (await this.#artifacts.put(key, json)).ref;
+        rows.push({ path: f.path, value: null, ref, bytes: json.length });
+      }
+      const files = imp.files.map((f) => ({ path: f.path, bytes: f.bytes, sha256: f.sha256 }));
+      const r = this.#transact()(() => {
+        const c = commitImport(sql, tenantId, agentId, { ...imp, files, rows }, Date.now());
+        if (c.ok && c.lifted) holdEnded(sql, tenantId, agentId, c.lifted);
+        return c;
+      });
+      if (!r.ok || !r.created) await drop();
+      return r;
+    } catch (e) {
+      await drop();
+      throw e;
+    }
+  }
+
+  /** The import's instructions reached the agent: a retry stops applying them, and the hold, if any, lifts. */
+  async importInstructionsApplied(tenantId: string, agentId: string, migrationId: string): Promise<ImportHold | null> {
+    await this.ready();
+    const sql = this.#deps.ctx.storage.sql;
+    return this.#transact()(() => {
+      const lifted = markInstructionsApplied(sql, tenantId, agentId, migrationId, Date.now());
+      if (lifted) holdEnded(sql, tenantId, agentId, lifted);
+      return lifted;
+    });
+  }
+
+  /** Hold a new agent until its import (`awaitImport`, src/store/workspace-import.ts); once per agent. */
+  async placeImportHold(tenantId: string, agentId: string): Promise<boolean> {
+    await this.ready();
+    const sql = this.#deps.ctx.storage.sql;
+    return this.#transact()(() => placeHold(sql, tenantId, agentId, Date.now()));
+  }
+
+  /**
+   * When the hold ends, or null when the agent is not held. A hold past `IMPORT_HOLD_MAX_MS` is lifted here, as
+   * `valve`, with its trace row: asked wherever input would start a turn, and the alarm comes back at the deadline
+   * while pushes wait (`#deliverInbound`), so a held agent with input runs by then at the latest.
+   */
+  importHeldUntil(tenantId: string, agentId: string): number | null {
+    const sql = this.#deps.ctx.storage.sql;
+    const h = readHold(sql, tenantId, agentId);
+    if (!h || h.liftedAt !== null) return null;
+    const now = Date.now(), until = h.since + IMPORT_HOLD_MAX_MS;
+    if (now < until) return until;
+    this.#transact()(() => {
+      const lifted = liftHold(sql, tenantId, agentId, "valve", now);
+      if (lifted) holdEnded(sql, tenantId, agentId, lifted);
+    });
+    return null;
+  }
+
   /** Close the seeded workspace now; idempotent. Null when there is no such agent. */
   async sealSeed(tenantId: string, agentId: string, credentialId: string | null) {
     await this.ready();
@@ -3565,6 +3692,10 @@ export class AgentRuntime {
     // Before anything awaits a plugin or the model: the first turn closes the seeded workspace, whichever route it
     // came by (an inbound push already did, when it was accepted).
     await this.ready();
+    // No turn while the agent waits for its workspace import: pushes wait in their queue (`#deliverInbound`); a
+    // message by any other route has no queue to wait in and is refused, saying why.
+    const heldUntil = this.importHeldUntil(tenantId, agentId);
+    if (heldUntil !== null) throw new AwaitingImport(heldUntil);
     // A main conversation the overflow backstop gave up on takes nothing until an operator resets it, its model
     // binding changes, or the mark expires (src/runtime/overflow-backstop.ts `needsReset`).
     const backstop = session === MAIN_SESSION && !this.#isPd();

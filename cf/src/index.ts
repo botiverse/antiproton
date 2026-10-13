@@ -101,7 +101,7 @@ import { adminProviderTokens } from "./admin-provider-tokens.ts";
 import { d1Connections, d1Connectors, d1ModelChoices, d1ModelOverrides, d1ProviderTokens, d1ProvisionedAgents } from "./control-plane.ts";
 import { CONNECT_START_PATH, CONNECTION_PLUGIN, connectCallback, connectLink, connectStart, isConnectCallback, type ConnectDeps } from "./provision/connect.ts";
 import { hashProviderToken, looksLikeProviderToken } from "./provider-token.ts";
-import { handleProvision, type ProvisionDeps, type ProvisionTool } from "./provision/handlers.ts";
+import { handleProvision, IMPORT_REQUEST_MAX_BYTES, IMPORT_ROUTE, type ProvisionDeps, type ProvisionTool } from "./provision/handlers.ts";
 import { sharedUsageCache } from "./provision/usage.ts";
 import type { ToolConfig } from "../../src/core/tool-config.ts";
 import type { SeedMode } from "../../src/store/seed-files.ts";
@@ -2026,7 +2026,7 @@ export class AgentDO extends DurableObject<Env> {
   /** Provisioning's record + model + mount, in this agent's object (cf/src/provision/steps.ts). */
   async provisionAdopt(tenantId: string, agentId: string, specJson: string) {
     this.#claim(tenantId, agentId);
-    const spec = JSON.parse(specJson) as { name: string; instructions: string; raftOrigin: string; toolConfig?: ToolConfig | null };
+    const spec = JSON.parse(specJson) as { name: string; instructions: string; raftOrigin: string; toolConfig?: ToolConfig | null; awaitImport?: boolean };
     return this.#busy("provisionAdopt", async () =>
       adoptProvisionedAgent(this.runtime(), tenantId, agentId, { ...spec, avatar: mintAvatar() }, await this.#modelFor(tenantId, agentId)));
   }
@@ -2045,6 +2045,28 @@ export class AgentDO extends DurableObject<Env> {
   async seedWrite(tenantId: string, agentId: string, path: string, mode: SeedMode, text: string) {
     if (!this.#isAgent(tenantId, agentId)) return { ok: false as const, code: "not_found" as const, message: `no agent ${agentId}` };
     return this.#busy("seedWrite", () => this.runtime().seedWrite(tenantId, agentId, { path, mode, text }));
+  }
+
+  /**
+   * A migrating agent's workspace, once (`POST /provision/agents/{agentId}/import`, cf/src/provision/handlers.ts).
+   * Production, not behind EVAL_SEED_ROUTES. Its decision and its rows are one transaction in this object, so it and
+   * the first turn or push, which make the agent active, are ordered: whichever is second sees the other.
+   */
+  async importWorkspace(tenantId: string, agentId: string, imp: Parameters<AgentRuntime["importWorkspace"]>[2]) {
+    if (!this.#isAgent(tenantId, agentId)) return { ok: false as const, code: "not_found" as const, message: `no agent ${agentId}` };
+    return this.#busy("importWorkspace", async () => {
+      const r = await this.runtime().importWorkspace(tenantId, agentId, imp);
+      // The hold it lifted (`awaitImport`): the pushes it kept queued are posted now, and the first turn starts.
+      if (r.ok && r.lifted) await this.#wake();
+      return r;
+    });
+  }
+
+  async importInstructionsApplied(tenantId: string, agentId: string, migrationId: string) {
+    if (!this.#isAgent(tenantId, agentId)) return;
+    await this.#busy("importInstructionsApplied", async () => {
+      if (await this.runtime().importInstructionsApplied(tenantId, agentId, migrationId)) await this.#wake();
+    });
   }
 
   async seedSeal(tenantId: string, agentId: string, credentialId: string | null) {
@@ -3384,7 +3406,17 @@ async function provision(request: Request, env: Env, url: URL): Promise<Response
   if (request.method === "PUT" && /^\/provision\/agents\/(?:by-raft-agent\/)?[^/]+\/seed$/.test(url.pathname)) {
     raw = new Uint8Array(await request.arrayBuffer());
   } else if (request.method === "POST" || request.method === "PATCH" || request.method === "PUT" || request.method === "DELETE") {
-    const text = await request.text();
+    // A workspace import is the one large JSON body: bounded as sent, before it is read whole or parsed.
+    const importing = request.method === "POST" && IMPORT_ROUTE.test(url.pathname);
+    const tooLarge = () => Response.json({ error: { code: "too_large", param: "body",
+      message: `an import request is at most ${IMPORT_REQUEST_MAX_BYTES} bytes as sent` } }, { status: 413, headers: { "cache-control": "no-store" } });
+    if (importing && Number(request.headers.get("content-length") ?? 0) > IMPORT_REQUEST_MAX_BYTES) return tooLarge();
+    let text: string;
+    if (importing) {
+      const bytes = await request.arrayBuffer();
+      if (bytes.byteLength > IMPORT_REQUEST_MAX_BYTES) return tooLarge();
+      text = new TextDecoder().decode(bytes);
+    } else text = await request.text();
     // A DELETE may carry who is acting (a connector's disconnect); without a body it stays undefined.
     try { body = text ? JSON.parse(text) : request.method === "DELETE" ? undefined : {}; }
     catch { return refuse(400, "invalid_json", "the body is not JSON"); }
@@ -3521,6 +3553,11 @@ function provisionDeps(env: Env): ProvisionDeps {
         mountable: AgentRuntime.DEFAULT_MOUNTS.filter((m) => m.for.includes("raft")).map((m) => m.alias),
       },
     } : {}),
+    // Production, unlike `seed`: a migrating agent's workspace, written in its own object.
+    imports: {
+      commit: (tenantId, agentId, imp) => stub(tenantId, agentId).importWorkspace(tenantId, agentId, imp),
+      instructionsApplied: (tenantId, agentId, migrationId) => stub(tenantId, agentId).importInstructionsApplied(tenantId, agentId, migrationId),
+    },
     agent: {
       adopt: async (tenantId, agentId, spec) => {
         const r = await stub(tenantId, agentId).provisionAdopt(tenantId, agentId, JSON.stringify(spec));

@@ -67,7 +67,7 @@ function toolConfigProblem(rt: AgentRuntime, t: ToolConfig): string | null {
  */
 export async function adoptProvisionedAgent(
   rt: AgentRuntime, tenantId: string, agentId: string,
-  spec: { name: string; instructions: string; raftOrigin: string; avatar: string; toolConfig?: ToolConfig | null },
+  spec: { name: string; instructions: string; raftOrigin: string; avatar: string; toolConfig?: ToolConfig | null; awaitImport?: boolean },
   model?: ModelChoice | null,
 ): Promise<{ ok: true; avatar: string; modelRefused?: string } | { ok: false; error: string; refused?: Fail }> {
   await rt.ready();
@@ -91,6 +91,9 @@ export async function adoptProvisionedAgent(
   };
   if (!existing) await rt.store.createAgent(tenantId, agentId, persona as Json);
   else await rt.store.updateAgentConfig(tenantId, agentId, persona as Json);
+  // Before the raft mount and its push registration, so no push can start a turn ahead of the import. Once per
+  // agent (src/store/workspace-import.ts `placeHold`): a replay after the import never holds it again.
+  if (spec.awaitImport === true) await rt.placeImportHold(tenantId, agentId);
   // The model resolved now (resolveModel, cf/src/model-request.ts): the admin's rows (model_overrides), then the pick
   // Raft made with `model` on POST or PUT …/model (model_choices, stored before this runs), then the default. The same decision as every other bind (planBinding): a choice that
   // could not be read, or one the providers refuse, leaves an existing binding as it is — the refusal is
