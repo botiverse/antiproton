@@ -197,6 +197,24 @@ built from (`harnessKey`, `cf/src/runtime.ts`), never under a turn that is runni
 changed section reaches the model as a newer system message after the conversation's first one, as
 pi-durable sends any prompt change; on `pi085` the prompt is rebuilt whole.
 
+**An agent's `model`** (`POST /provision/agents`, optional) creates it on a chosen model in the same call: an
+offered option's id ([below](#the-agents-model)), or `null` or absent for the default, which is the create as it
+was. A value neither a string nor `null` is `422 invalid`. On a first create, before anything is made, an id not
+offered is `422 unknown_model` and a model while an administrator's agent or tenant row applies is
+`409 model_locked` (all with `param: "model"`) — the agent is not made and its Raft id is not taken, so the same
+POST without `model` is then a first create (`201`). A deployment that offers no options takes only `null`. The
+answer's body is the same as without it; `GET …/model` reads the pick as `source: "chosen"`.
+
+`model` is part of the request a replay is compared with, `null` and absent being one value: the same `model`
+answers the same, and another (or one where the create had none, or none where it had one) is
+`409 idempotency_conflict` naming `model`. A replay is compared, not checked again: an option withdrawn, or a lock
+set, since the create does not refuse the identical replay of an agent that exists. It is compared with what the
+create asked, not with what runs: a delayed replay after a `PUT …/model` (`null` included) answers as the create
+did and leaves the newer pick alone. One exception: a create that named a model and failed before storing its pick
+(still `provisioning`) has not chosen yet, so its replay may name another model or none, checked as a first create
+— the way out when the option was withdrawn or a lock set in between — and answers `201`, the create completing.
+A `PUT …/model` in between is a choice made, so after it that replay is an ordinary one and leaves the PUT's pick.
+
 ### The agent's model
 
 Raft's Agent Panel lets a person pick the model of an agent Raft hosts. Production routes, not part of
@@ -241,6 +259,13 @@ GET or PUT /provision/agents/{agentId}/model
   `model` that is neither a string nor `null` is `422 invalid`; any other field is `400 unknown_field`.
   The same body twice answers the same. Each accepted `PUT` leaves one `provision.model` log line naming
   the token by its hash.
+- **At creation**, `model` on `POST /provision/agents` ([above](#the-raft-provider-binding)) is a pick made
+  the same way — the same offered ids, the same `409` under a lock, the same row, `set_by` and log line —
+  stored before the agent's model is first bound, so its first model request already goes to it. The row
+  and the pick are two writes: a create that fails between them fails, and its replay stores the pick and
+  finishes. The row records whether the create's pick is settled yet (`model_pending`; a `PUT` settles it
+  too), so once it is, no replay writes it again. Settling makes the stored pick the create's, `null`
+  included: a reopened create without `model` removes one an earlier attempt stored.
 - **An agent never given a pick** is unchanged by these routes: reading them stores nothing and rebuilds
   nothing, and it runs on the default as before (`test/provision-model.ts`).
 

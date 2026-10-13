@@ -382,6 +382,17 @@ export interface ProvisionedAgent {
   instructions: string;
   /** SHA-256 hex of the credential the agent was last given; null on rows from before it was kept. */
   credentialHash: string | null;
+  /**
+   * The offered option's id the creating POST asked for, null when it asked for none (and on rows from before 0019).
+   * What a replay is compared with; what runs is model_choices, which a PUT …/model changes and this never does.
+   * Optional so a row built elsewhere without it (a test's, a fake registry's) reads as none asked.
+   */
+  model?: string | null;
+  /**
+   * The create named a model and its pick is not stored yet. Only then may a replay still change `model` (a create
+   * that died half-way, retried under a lock or after an option was withdrawn), and only then does it store the pick.
+   */
+  modelPending?: boolean;
   status: ProvisionStatus;
   pushRegistered: boolean;
   pushError: string | null;
@@ -390,7 +401,7 @@ export interface ProvisionedAgent {
   deletedAt: number | null;
 }
 
-export type ProvisionedAgentPatch = Partial<Pick<ProvisionedAgent, "name" | "instructions" | "credentialHash" | "status" | "pushRegistered" | "pushError" | "deletedAt">>;
+export type ProvisionedAgentPatch = Partial<Pick<ProvisionedAgent, "name" | "instructions" | "credentialHash" | "model" | "modelPending" | "status" | "pushRegistered" | "pushError" | "deletedAt">>;
 
 export interface ProvisionRegistry {
   /** A new row. Throws when the Raft id, or the agent id, is already taken in this tenant. */
@@ -407,6 +418,8 @@ export function d1ProvisionedAgents(db: D1Database, now: () => number = Date.now
     raftServerId: String(r.raft_server_id), raftOrigin: String(r.raft_origin),
     name: String(r.name), instructions: String(r.instructions),
     credentialHash: r.credential_hash === null || r.credential_hash === undefined ? null : String(r.credential_hash),
+    model: r.model === null || r.model === undefined ? null : String(r.model),
+    modelPending: Number(r.model_pending ?? 0) === 1,
     status: String(r.status) as ProvisionStatus,
     pushRegistered: Number(r.push_registered) === 1, pushError: r.push_error === null ? null : String(r.push_error),
     createdAt: Number(r.created_at), updatedAt: Number(r.updated_at),
@@ -414,16 +427,16 @@ export function d1ProvisionedAgents(db: D1Database, now: () => number = Date.now
   });
   // The column a patch key writes. Listed, so a key this table does not have is a failed lookup, not SQL.
   const COLUMNS: Record<keyof ProvisionedAgentPatch, string> = {
-    name: "name", instructions: "instructions", credentialHash: "credential_hash", status: "status",
+    name: "name", instructions: "instructions", credentialHash: "credential_hash", model: "model", modelPending: "model_pending", status: "status",
     pushRegistered: "push_registered", pushError: "push_error", deletedAt: "deleted_at",
   };
   return {
     async create(r) {
       const t = now();
       await db.prepare(
-        "INSERT INTO provisioned_agents(tenant_id, raft_agent_id, agent_id, raft_server_id, raft_origin, name, instructions, credential_hash, status, push_registered, push_error, created_at, updated_at) " +
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-      ).bind(r.tenantId, r.raftAgentId, r.agentId, r.raftServerId, r.raftOrigin, r.name, r.instructions, r.credentialHash, r.status,
+        "INSERT INTO provisioned_agents(tenant_id, raft_agent_id, agent_id, raft_server_id, raft_origin, name, instructions, credential_hash, model, model_pending, status, push_registered, push_error, created_at, updated_at) " +
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      ).bind(r.tenantId, r.raftAgentId, r.agentId, r.raftServerId, r.raftOrigin, r.name, r.instructions, r.credentialHash, r.model ?? null, r.modelPending ? 1 : 0, r.status,
         r.pushRegistered ? 1 : 0, r.pushError, t, t).run();
     },
     async get(tenantId, raftAgentId) {
