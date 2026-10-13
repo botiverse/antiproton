@@ -382,6 +382,11 @@ export interface ProvisionedAgent {
   instructions: string;
   /** SHA-256 hex of the credential the agent was last given; null on rows from before it was kept. */
   credentialHash: string | null;
+  /**
+   * The offered option's id the creating POST asked for, null when it asked for none (and on rows from before 0019).
+   * What a replay is compared with; what runs is model_choices, which a PUT …/model changes and this never does.
+   */
+  model: string | null;
   status: ProvisionStatus;
   pushRegistered: boolean;
   pushError: string | null;
@@ -407,6 +412,7 @@ export function d1ProvisionedAgents(db: D1Database, now: () => number = Date.now
     raftServerId: String(r.raft_server_id), raftOrigin: String(r.raft_origin),
     name: String(r.name), instructions: String(r.instructions),
     credentialHash: r.credential_hash === null || r.credential_hash === undefined ? null : String(r.credential_hash),
+    model: r.model === null || r.model === undefined ? null : String(r.model),
     status: String(r.status) as ProvisionStatus,
     pushRegistered: Number(r.push_registered) === 1, pushError: r.push_error === null ? null : String(r.push_error),
     createdAt: Number(r.created_at), updatedAt: Number(r.updated_at),
@@ -421,9 +427,9 @@ export function d1ProvisionedAgents(db: D1Database, now: () => number = Date.now
     async create(r) {
       const t = now();
       await db.prepare(
-        "INSERT INTO provisioned_agents(tenant_id, raft_agent_id, agent_id, raft_server_id, raft_origin, name, instructions, credential_hash, status, push_registered, push_error, created_at, updated_at) " +
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-      ).bind(r.tenantId, r.raftAgentId, r.agentId, r.raftServerId, r.raftOrigin, r.name, r.instructions, r.credentialHash, r.status,
+        "INSERT INTO provisioned_agents(tenant_id, raft_agent_id, agent_id, raft_server_id, raft_origin, name, instructions, credential_hash, model, status, push_registered, push_error, created_at, updated_at) " +
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      ).bind(r.tenantId, r.raftAgentId, r.agentId, r.raftServerId, r.raftOrigin, r.name, r.instructions, r.credentialHash, r.model, r.status,
         r.pushRegistered ? 1 : 0, r.pushError, t, t).run();
     },
     async get(tenantId, raftAgentId) {

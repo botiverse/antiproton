@@ -14,8 +14,8 @@
  * to the token directory, the registry (both D1) and the agent's object.
  *
  * Idempotency is strict: `Idempotency-Key` is the Raft agent id, and a replay must carry the same
- * body. Same key with any field different is 409, never a quiet update — Raft edits through PATCH,
- * and a delayed POST retry must not overwrite an edit that landed after it (Tenny's race).
+ * body. Same key with any field different is 409, never a quiet update — Raft edits through PATCH (and the
+ * model through PUT …/model), and a delayed POST retry must not overwrite an edit that landed after it (Tenny's race).
  */
 import type { Json } from "../../../src/core/types.ts";
 import { originProblem } from "../../../src/plugins/types.ts";
@@ -365,9 +365,12 @@ export async function handleProvision(
     if (isFail(credential)) return fail(credential);
     const toolConfig = toolConfigField(body, deps.seed);
     if (isFail(toolConfig)) return fail(toolConfig);
+    const model = createModelField(body, deps.models);
+    if (isFail(model)) return fail(model);
 
     const agentId = providerAgentId(raftAgentId);
-    const asked = { raftServerId: raftServerId!, raftOrigin, name: name!, instructions };
+    // `model` is part of the request a replay must repeat: absent and null are one value (null), as on a create.
+    const asked = { raftServerId: raftServerId!, raftOrigin, name: name!, instructions, model };
     const credentialHash = await sha256Hex(credential);
     let row = await deps.registry.get(tenantId, raftAgentId);
     let created = false;
@@ -381,10 +384,23 @@ export async function handleProvision(
       // before the hash existed accepts the first replay and records it.
       if (row.credentialHash !== null && row.credentialHash !== credentialHash) differs.push("credential" as keyof typeof asked);
       if (differs.length) {
-        return fail({ status: 409, code: "idempotency_conflict", message: `a different request was already made under this key (${differs.join(", ")}); edits go through PATCH` });
+        return fail({ status: 409, code: "idempotency_conflict", message: `a different request was already made under this key (${differs.join(", ")}); edits go through PATCH${differs.includes("model") ? ", and the model through PUT …/model" : ""}` });
       }
       if (row.credentialHash === null) { await deps.registry.update(tenantId, raftAgentId, { credentialHash }); row = { ...row, credentialHash }; }
+      // A create that died between making the row and storing its pick (still `provisioning`, no pick) is finished by
+      // its replay. Only then: once the create has finished, a replay leaves the pick alone, so a delayed retry cannot
+      // undo a PUT …/model that landed after it.
+      if (model !== null && row.status === "provisioning" && (await deps.models!.choices.layers(tenantId, agentId)).owner === null) {
+        const locked = await lockedProblem(deps.models!, tenantId, agentId);
+        if (locked) return fail(locked);
+        await storePick(deps.models!, tenantId, agentId, model, headers.credentialId ?? null, deps.now);
+      }
     } else {
+      // Refused before the row exists, so a locked model leaves nothing made — as a PUT under the lock stores nothing.
+      if (model !== null) {
+        const locked = await lockedProblem(deps.models!, tenantId, agentId);
+        if (locked) return fail(locked);
+      }
       const t = deps.now();
       row = { tenantId, raftAgentId, agentId, ...asked, credentialHash, status: "provisioning", pushRegistered: false, pushError: null, createdAt: t, updatedAt: t, deletedAt: null };
       try { await deps.registry.create(row); }
@@ -396,6 +412,9 @@ export async function handleProvision(
         return fail({ status: 409, code: "agent_id_taken", message: `${agentId} already belongs to another Raft agent in this tenant` });
       }
       created = true;
+      // Stored before `adopt`, which binds the model it resolves (steps.ts), so the agent's first turn already runs on
+      // the pick. Not one statement with the row: if this fails the POST fails, and its replay stores it (above).
+      if (model !== null) await storePick(deps.models!, tenantId, agentId, model, headers.credentialId ?? null, deps.now);
     }
     // From here every step is idempotent, so a replay of a request that died half-way finishes it. The tool choice is
     // compared by the agent's object, where it is recorded: a replay asking for other tools is 409, as for any field.
@@ -733,25 +752,56 @@ async function modelRoute(
   if (asked !== null && typeof asked !== "string") {
     return fail({ status: 422, code: "invalid", message: "model is an offered option's id, or null for the default", param: "model" });
   }
-  const current = resolveModel(await m.choices.layers(tenantId, agentId), m.userModels, m.defaultModel);
-  if (current.locked) {
-    return fail({ status: 409, code: "model_locked", param: "model",
-      message: `an administrator has set this agent's model to ${JSON.stringify(modelView(current.choice, m.userModels).model)}, so it cannot be chosen here` });
+  const locked = await lockedProblem(m, tenantId, agentId);
+  if (locked) return fail(locked);
+  if (asked !== null) {
+    const unknownModel = notOffered(m.userModels, asked);
+    if (unknownModel) return fail(unknownModel);
   }
-  if (asked === null) await m.choices.remove(tenantId, agentId);
-  else {
-    // Only an id offered now: one listed once, or whose provider has no secret, would be stored and passed over at every run.
-    if (!m.userModels.offered.some((o) => o.id === asked)) {
-      const ids = m.userModels.offered.map((o) => JSON.stringify(o.id)).join(", ");
-      return fail({ status: 422, code: "unknown_model", param: "model",
-        message: `no model option ${JSON.stringify(asked.slice(0, 64))} is offered here; ${ids ? `one of ${ids}, ` : ""}or null for the default` });
-    }
-    await m.choices.put({ tenantId, agentId, choiceId: asked, setBy: `provider:${credentialId ?? "unknown"}`, setAt: now() });
-  }
+  await storePick(m, tenantId, agentId, asked, credentialId, now);
   // Not the request's failure: the pick is stored, and the next path that binds (a message, a page open) binds it anyway.
   await m.rebind(tenantId, agentId).catch((e: unknown) => console.warn(`rebinding ${agentId} after a provider pick failed: ${String((e as Error)?.message ?? e).slice(0, 200)}`));
-  logEvent("provision.model", { tenant: tenantId, agent: agentId, model: asked, credentialId });
   return ok(await state());
+}
+
+/** Only an id offered now: one listed once, or whose provider has no secret, would be stored and passed over at every run. */
+function notOffered(um: UserModels, asked: string): Fail | null {
+  if (um.offered.some((o) => o.id === asked)) return null;
+  const ids = um.offered.map((o) => JSON.stringify(o.id)).join(", ");
+  return { status: 422, code: "unknown_model", param: "model",
+    message: `no model option ${JSON.stringify(asked.slice(0, 64))} is offered here; ${ids ? `one of ${ids}, ` : ""}or null for the default` };
+}
+
+/** An admin's agent or tenant row decides this agent's model, so a pick would be stored and never run. */
+async function lockedProblem(m: ProvisionModels, tenantId: string, agentId: string): Promise<Fail | null> {
+  const current = resolveModel(await m.choices.layers(tenantId, agentId), m.userModels, m.defaultModel);
+  if (!current.locked) return null;
+  return { status: 409, code: "model_locked", param: "model",
+    message: `an administrator has set this agent's model to ${JSON.stringify(modelView(current.choice, m.userModels).model)}, so it cannot be chosen here` };
+}
+
+/**
+ * The one way a provider's pick is written, by `PUT …/model` and by `POST /agents` with `model`: the owner's row with
+ * the provider token's hash as who set it, and one `provision.model` line naming the token by that hash.
+ */
+async function storePick(m: ProvisionModels, tenantId: string, agentId: string, asked: string | null, credentialId: string | null, now: () => number) {
+  if (asked === null) await m.choices.remove(tenantId, agentId);
+  else await m.choices.put({ tenantId, agentId, choiceId: asked, setBy: `provider:${credentialId ?? "unknown"}`, setAt: now() });
+  logEvent("provision.model", { tenant: tenantId, agent: agentId, model: asked, credentialId });
+}
+
+/**
+ * `model` of a POST: an offered option's id to create the agent on, or null / absent for the default, which is today's
+ * create exactly (null here: nothing to store). Checked before anything is made. A deployment without the model routes
+ * offers nothing, so any id is unknown there — refused, never ignored, since an agent quietly made on the default would
+ * run on a model nobody chose.
+ */
+function createModelField(body: unknown, m: ProvisionModels | undefined): string | null | Fail {
+  const v = field(body, "model");
+  if (v === undefined || v === null) return null;
+  if (typeof v !== "string") return { status: 422, code: "invalid", message: "model is an offered option's id, or null for the default", param: "model" };
+  if (!m) return { status: 422, code: "unknown_model", param: "model", message: "this deployment offers no choice of model; omit model, or send null, for the default" };
+  return notOffered(m.userModels, v) ?? v;
 }
 
 /** The setup routes, after the agent's id. */

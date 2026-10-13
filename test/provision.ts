@@ -262,9 +262,14 @@ await check("a DELETE whose disable_push fails still deletes, and says what coul
   assert(f.calls.some((c) => c.startsWith("remove ")), "the credential stayed");
 });
 
-await check("GET reads the row and asks the plugin for live push status; there is no model anywhere; other paths are not ours", async () => {
+await check("GET reads the row and asks the plugin for live push status; no model in the answer, and none taken without the model routes; other paths are not ours", async () => {
   const f = fakeDeps();
-  const made = await call(f.deps, "POST", "/agents", body({ model: "deepseek-flash" }));
+  // A deployment without the model routes offers no model: a POST naming one is refused before anything is made,
+  // never made on the default as if it had been taken (test/provision-model.ts has the deployment that offers some).
+  const named = await call(f.deps, "POST", "/agents", body({ model: "deepseek-flash" }));
+  assert(named.status === 422 && named.body.error.code === "unknown_model" && named.body.error.param === "model", `a model without the routes: ${named.status} ${named.text}`);
+  assert(f.calls.length === 0 && f.rows.size === 0, `a refused model made something: ${f.calls.join(";")} rows ${f.rows.size}`);
+  const made = await call(f.deps, "POST", "/agents", body({ model: null }));
   assert(made.status === 201 && !("model" in made.body), `a model field came back: ${made.text}`);
   f.calls.length = 0;
   const got = await call(f.deps, "GET", "/agents/raft_01JAGENT");

@@ -75,7 +75,7 @@ const RAFT_CRED = "sk_agent_" + "R".repeat(32);
  * tenant, and one agent Raft provisioned through `POST /provision/agents` (Raft stood in for, as test/eval-seed-object.ts
  * does). `USER_MODELS` unset gives a deployment that offers nothing.
  */
-async function world(opts: { userModels?: unknown[] | null } = {}) {
+async function world(opts: { userModels?: unknown[] | null; post?: false | Record<string, unknown> } = {}) {
   const DB = d1();
   const raw = sqliteHost();
   const jobs: string[] = [];
@@ -111,14 +111,17 @@ async function world(opts: { userModels?: unknown[] | null } = {}) {
   await d1ProviderTokens(DB).issue({ hash: await hashProviderToken(token), label: "raft-test", raftOrigin: "https://raft.example", scope: "tenant", tenantId: T });
   await d1ProviderTokens(DB).issue({ hash: await hashProviderToken(other), label: "raft-other", raftOrigin: "https://raft.example", scope: "tenant", tenantId: "t-other" });
   const w = { D, rt: D.runtime(), raw, DB, env, jobs, token, other, tokenHash: await hashProviderToken(token), alarmAt: () => alarmAt };
-  const posted = await provisionPost(w);
-  must(posted.status === 201, `POST /provision/agents: ${posted.status} ${posted.text}`);
+  if (opts.post !== false) {
+    const posted = await provisionPost(w, opts.post ?? {});
+    must(posted.status === 201, `POST /provision/agents: ${posted.status} ${posted.text}`);
+  }
   await w.rt.ready();
   return w;
 }
 type World = Awaited<ReturnType<typeof world>>;
 
-async function provisionPost(w: Pick<World, "env" | "token">) {
+/** `extra` is merged into the body: `model`, or anything else a test adds to an otherwise ordinary create. */
+async function provisionPost(w: Pick<World, "env" | "token">, extra: Record<string, unknown> = {}) {
   const real = globalThis.fetch;
   globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
     const headers = new Headers(init?.headers ?? {});
@@ -130,9 +133,12 @@ async function provisionPost(w: Pick<World, "env" | "token">) {
   try {
     const res = await worker.fetch(new Request("https://x/provision/agents", {
       method: "POST", headers: { authorization: `Bearer ${w.token}`, "content-type": "application/json" },
-      body: JSON.stringify({ raftAgentId: RAFT_ID, raftServerId: "srv-1", raftOrigin: "https://raft.example", name: "n", instructions: "FIRST-PERSONA-7c1", credential: RAFT_CRED }),
+      body: JSON.stringify({ raftAgentId: RAFT_ID, raftServerId: "srv-1", raftOrigin: "https://raft.example", name: "n", instructions: "FIRST-PERSONA-7c1", credential: RAFT_CRED, ...extra }),
     }), w.env as never);
-    return { status: res.status, text: await res.text() };
+    const text = await res.text();
+    let body: any = null;
+    try { body = JSON.parse(text); } catch { body = text; }
+    return { status: res.status, text, body };
   } finally { globalThis.fetch = real; }
 }
 
@@ -360,6 +366,151 @@ await check("the route leaves one log line naming the token by its hash, never t
   const ours = lines.map((l) => JSON.parse(l)).filter((l) => l.evt === "provision.model");
   must(ours.length === 1 && ours[0].credentialId === w.tokenHash && ours[0].model === "deepseek-pro" && ours[0].agent === A, `lines: ${show(ours)}`);
   must(!lines.join("\n").includes(w.token), "a log line carries the token");
+});
+
+// ---- choosing the model at creation (POST /provision/agents `model`) ---------
+
+/** Nothing of the agent exists: no registry row, no stored pick, no model binding in its object. */
+async function nothingMade(w: World, label: string) {
+  const row = w.DB.raw.prepare("SELECT * FROM provisioned_agents WHERE tenant_id = ? AND raft_agent_id = ?").get(T, RAFT_ID);
+  must(!row, `${label}: a registry row was made: ${show(row)}`);
+  must(!w.DB.raw.prepare("SELECT * FROM model_choices WHERE tenant_id = ? AND agent_id = ?").get(T, A), `${label}: a pick was stored`);
+  must((await w.rt.store.getModelBinding(T, A)) === null, `${label}: the agent's object was given a binding`);
+}
+
+for (const engine of ["pi085", "pd"] as const) {
+  await check(`${engine}: POST with model creates the agent on it: GET reads it as chosen, and the first model request goes to it`, async () => {
+    lines.length = 0;
+    const w = await world({ post: { model: "gpt-5.6-luna" } });
+    const g = await call(w, "GET", `agents/${A}/model`);
+    must(show(g.body) === show({ model: "gpt-5.6-luna", label: "GPT-5.6 Luna", source: "chosen", locked: false }), `GET after create: ${g.text}`);
+    // Stored as a PUT stores it, and logged as a PUT logs it.
+    const row: any = w.DB.raw.prepare("SELECT * FROM model_choices WHERE tenant_id = ? AND agent_id = ?").get(T, A);
+    must(row?.choice_id === "gpt-5.6-luna" && row.set_by === `provider:${w.tokenHash}`, `stored: ${show(row)}`);
+    const ours = lines.map((l) => JSON.parse(l)).filter((l) => l.evt === "provision.model");
+    must(ours.length === 1 && ours[0].credentialId === w.tokenHash && ours[0].model === "gpt-5.6-luna" && ours[0].agent === A, `lines: ${show(ours)}`);
+    must(!lines.join("\n").includes(w.token), "a log line carries the token");
+    // Bound by the create itself, with no PUT and no rebind after it.
+    const b = await w.rt.store.getModelBinding(T, A);
+    must(b?.model === "openai/gpt-5.6-luna" && b.secretRef === "operator:model:cloudflare", `binding after create: ${show(b)}`);
+    if (engine === "pd") await toPd(w);
+    const first = await turn(w, "turn one");
+    must(first.model === "openai/gpt-5.6-luna" && first.harnessModel === "openai/gpt-5.6-luna" && first.url.startsWith("https://gateway.ai.cloudflare.com"),
+      `the first request: ${first.model} ${first.harnessModel} at ${first.url}`);
+  });
+}
+
+await check("POST with model null is today's create: default, nothing stored, no provision.model line", async () => {
+  lines.length = 0;
+  const w = await world({ post: { model: null } });
+  const g = await call(w, "GET", `agents/${A}/model`);
+  must(show(g.body) === show({ model: "deepseek-flash", label: "DeepSeek Flash", source: "default", locked: false }), `null create: ${g.text}`);
+  must(!w.DB.raw.prepare("SELECT * FROM model_choices").get(), "null stored a row");
+  must(!lines.some((l) => l.includes("provision.model")), "null logged a pick");
+});
+
+await check("POST refuses an unknown or unoffered model with 422 unknown_model, and a non-string with 422 invalid, making nothing", async () => {
+  for (const [model, code] of [
+    ["gpt-9", "unknown_model"], ["default", "unknown_model"], ["cloudflare/openai/gpt-5.6-luna", "unknown_model"],
+    [7, "invalid"], [true, "invalid"], [{ id: "gpt-5.6-luna" }, "invalid"], [["gpt-5.6-luna"], "invalid"],
+  ] as const) {
+    const w = await world({ post: false });
+    const r = await provisionPost(w, { model });
+    must(r.status === 422 && r.body?.error?.code === code && r.body.error.param === "model", `${show(model)}: ${r.status} ${r.text}`);
+    await nothingMade(w, show(model));
+  }
+  // Offered by USER_MODELS but its provider's secret is unset: not offered, so not taken.
+  const noGateway = await world({ post: false });
+  delete noGateway.env.AI_GATEWAY_TOKEN;
+  const r = await provisionPost(noGateway, { model: "gpt-5.6-luna" });
+  must(r.status === 422 && r.body.error.code === "unknown_model", `unavailable option: ${r.status} ${r.text}`);
+  await nothingMade(noGateway, "unavailable option");
+  // A deployment that offers nothing takes only null.
+  const none = await world({ userModels: null, post: false });
+  const n = await provisionPost(none, { model: "deepseek-flash" });
+  must(n.status === 422 && n.body.error.code === "unknown_model", `nothing offered: ${n.status} ${n.text}`);
+  await nothingMade(none, "nothing offered");
+});
+
+await check("POST with model under an admin's agent or tenant row is 409 model_locked and makes nothing; without model it still creates", async () => {
+  for (const agentId of [A, ""]) {
+    const w = await world({ post: false });
+    await d1ModelOverrides(w.DB).put({ tenantId: T, agentId, provider: "deepseek", model: "deepseek-v4-pro", setBy: "adm", setAt: 1 });
+    const r = await provisionPost(w, { model: "gpt-5.6-luna" });
+    must(r.status === 409 && r.body?.error?.code === "model_locked" && r.body.error.param === "model", `${agentId ? "agent" : "tenant"} row: ${r.status} ${r.text}`);
+    await nothingMade(w, `${agentId ? "agent" : "tenant"} row`);
+    const plain = await provisionPost(w, {});
+    must(plain.status === 201, `a create without model under the lock: ${plain.status} ${plain.text}`);
+    must((await call(w, "GET", `agents/${A}/model`)).body.model === "deepseek-pro", "the admin's row does not decide");
+  }
+  // A deployment row does not lock: the pick is taken and outranks it.
+  const w = await world({ post: false });
+  await d1ModelOverrides(w.DB).put({ tenantId: "", agentId: "", provider: "deepseek", model: "deepseek-v4-pro", setBy: "adm", setAt: 1 });
+  const r = await provisionPost(w, { model: "gpt-5.6-luna" });
+  must(r.status === 201, `deployment row: ${r.status} ${r.text}`);
+  must((await call(w, "GET", `agents/${A}/model`)).body.source === "chosen", "the pick under a deployment row");
+});
+
+await check("POST replay compares model as part of the request: same answers the same, other or absent is 409; absent and null are one", async () => {
+  const w = await world({ post: { model: "gpt-5.6-luna" } });
+  const same = await provisionPost(w, { model: "gpt-5.6-luna" });
+  must(same.status === 200 && same.body.providerAgentId === A, `same model: ${same.status} ${same.text}`);
+  for (const extra of [{ model: "deepseek-pro" }, {}, { model: null }]) {
+    const r = await provisionPost(w, extra);
+    must(r.status === 409 && r.body.error.code === "idempotency_conflict" && /\(model\)/.test(r.body.error.message), `${show(extra)}: ${r.status} ${r.text}`);
+  }
+  must((await d1ModelChoices(w.DB).layers(T, A)).owner === "gpt-5.6-luna", "a refused replay moved the pick");
+  // Compared with the request, not with what runs: a delayed retry after a PUT answers as the create did and leaves the PUT.
+  must((await putModel(w, "deepseek-pro")).status === 200, "PUT");
+  const late = await provisionPost(w, { model: "gpt-5.6-luna" });
+  must(late.status === 200, `a delayed retry after a PUT: ${late.status} ${late.text}`);
+  must((await d1ModelChoices(w.DB).layers(T, A)).owner === "deepseek-pro", "a delayed retry undid the PUT");
+  // An unknown model on a replay is refused as on a create, before the comparison.
+  const unknown = await provisionPost(w, { model: "gpt-9" });
+  must(unknown.status === 422 && unknown.body.error.code === "unknown_model", `unknown on replay: ${unknown.status} ${unknown.text}`);
+
+  // Created with none: absent and null both answer the same, a model is 409, and a PUT since does not change that.
+  const plain = await world();
+  for (const extra of [{}, { model: null }]) {
+    const r = await provisionPost(plain, extra);
+    must(r.status === 200, `no model, replayed with ${show(extra)}: ${r.status} ${r.text}`);
+  }
+  const named = await provisionPost(plain, { model: "gpt-5.6-luna" });
+  must(named.status === 409 && named.body.error.code === "idempotency_conflict", `a model on a create made without one: ${named.status} ${named.text}`);
+  must((await d1ModelChoices(plain.DB).layers(T, A)).owner === null, "the refused replay stored a pick");
+  must((await putModel(plain, "deepseek-pro")).status === 200, "PUT on the plain agent");
+  must((await provisionPost(plain, {})).status === 200, "an absent-model retry after a PUT was refused");
+  must((await d1ModelChoices(plain.DB).layers(T, A)).owner === "deepseek-pro", "an absent-model retry undid the PUT");
+});
+
+await check("a create refused for its model reserves nothing: the same raftAgentId without model is then a first create (201)", async () => {
+  for (const [label, setup, model, status, code] of [
+    ["unknown", async (_w: World) => {}, "gpt-9", 422, "unknown_model"],
+    ["non-string", async (_w: World) => {}, 7, 422, "invalid"],
+    ["locked", async (w: World) => { await d1ModelOverrides(w.DB).put({ tenantId: T, agentId: "", provider: "deepseek", model: "deepseek-v4-pro", setBy: "adm", setAt: 1 }); }, "gpt-5.6-luna", 409, "model_locked"],
+  ] as const) {
+    const w = await world({ post: false });
+    await setup(w);
+    const r = await provisionPost(w, { model });
+    must(r.status === status && r.body?.error?.code === code, `${label}: ${r.status} ${r.text}`);
+    await nothingMade(w, label);
+    const again = await provisionPost(w, {});
+    must(again.status === 201, `${label}, then without model: ${again.status} ${again.text}`);
+  }
+});
+
+await check("POST replay of a create that died before its pick was stored finishes it, and binds it", async () => {
+  // The row is made, naming the model, and the pick is not stored: what a failure between the two leaves.
+  const w = await world();
+  w.DB.raw.prepare("UPDATE provisioned_agents SET status = 'provisioning', model = 'gpt-5.6-luna' WHERE tenant_id = ? AND raft_agent_id = ?").run(T, RAFT_ID);
+  const r = await provisionPost(w, { model: "gpt-5.6-luna" });
+  must(r.status === 200, `replay: ${r.status} ${r.text}`);
+  must((await d1ModelChoices(w.DB).layers(T, A)).owner === "gpt-5.6-luna", "the replay did not store the pick");
+  const b = await w.rt.store.getModelBinding(T, A);
+  must(b?.model === "openai/gpt-5.6-luna", `the replay did not bind it: ${show(b)}`);
+  // Once finished (active), the same replay of another model is a conflict, not a second finish.
+  const again = await provisionPost(w, { model: "deepseek-pro" });
+  must(again.status === 409 && again.body.error.code === "idempotency_conflict", `after the finish: ${again.status} ${again.text}`);
 });
 
 // ---- the next turn, with the harness open (#826) ------------------------------

@@ -197,6 +197,18 @@ built from (`harnessKey`, `cf/src/runtime.ts`), never under a turn that is runni
 changed section reaches the model as a newer system message after the conversation's first one, as
 pi-durable sends any prompt change; on `pi085` the prompt is rebuilt whole.
 
+**An agent's `model`** (`POST /provision/agents`, optional) creates it on a chosen model in the same call: an
+offered option's id ([below](#the-agents-model)), or `null` or absent for the default, which is the create as it
+was. It is checked before anything is made: an id not offered is `422 unknown_model`, a value neither a string
+nor `null` is `422 invalid`, and a model while an administrator's agent or tenant row applies is
+`409 model_locked` (all with `param: "model"`) — the agent is not made and its Raft id is not taken, so the same
+POST without `model` is then a first create (`201`). A deployment that offers no options takes only `null`. The
+answer's body is the same as without it; `GET …/model` reads the pick as `source: "chosen"`. `model` is part of
+the request a replay is compared with, `null` and absent being one value: the same `model` answers the same, and
+another (or one where the create had none, or none where it had one) is `409 idempotency_conflict` naming
+`model`. It is compared with what the create asked, not with what runs: a delayed replay after a `PUT …/model`
+answers as the create did and leaves the newer pick alone.
+
 ### The agent's model
 
 Raft's Agent Panel lets a person pick the model of an agent Raft hosts. Production routes, not part of
@@ -241,6 +253,11 @@ GET or PUT /provision/agents/{agentId}/model
   `model` that is neither a string nor `null` is `422 invalid`; any other field is `400 unknown_field`.
   The same body twice answers the same. Each accepted `PUT` leaves one `provision.model` log line naming
   the token by its hash.
+- **At creation**, `model` on `POST /provision/agents` ([above](#the-raft-provider-binding)) is a pick made
+  the same way — the same offered ids, the same `409` under a lock, the same row, `set_by` and log line —
+  stored before the agent's model is first bound, so its first model request already goes to it. The row
+  and the pick are two writes: a create that fails between them fails, and its replay (still
+  `provisioning`, no pick stored) stores the pick and finishes.
 - **An agent never given a pick** is unchanged by these routes: reading them stores nothing and rebuilds
   nothing, and it runs on the default as before (`test/provision-model.ts`).
 

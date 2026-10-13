@@ -91,8 +91,8 @@ export async function adoptProvisionedAgent(
   };
   if (!existing) await rt.store.createAgent(tenantId, agentId, persona as Json);
   else await rt.store.updateAgentConfig(tenantId, agentId, persona as Json);
-  // The operator's model, as the deployment's admin chose it for this agent (model_overrides); Raft's
-  // contract offers no choice of its own. The same decision as every other bind (planBinding): a choice that
+  // The model resolved now (resolveModel, cf/src/model-request.ts): the admin's rows (model_overrides), then the pick
+  // Raft made with `model` on POST or PUT …/model (model_choices, stored before this runs), then the default. The same decision as every other bind (planBinding): a choice that
   // could not be read, or one the providers refuse, leaves an existing binding as it is — the refusal is
   // recorded rather than failing the adopt — and a new agent gets the default. An agent's own credential is not touched.
   const plan = planBinding(await rt.store.getModelBinding(tenantId, agentId), model, rt.operatorProviders() ?? { configs: [], secrets: {} });
