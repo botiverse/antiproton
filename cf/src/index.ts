@@ -102,6 +102,7 @@ import { d1Connections, d1Connectors, d1ModelChoices, d1ModelOverrides, d1Provid
 import { CONNECT_START_PATH, CONNECTION_PLUGIN, connectCallback, connectLink, connectStart, isConnectCallback, type ConnectDeps } from "./provision/connect.ts";
 import { hashProviderToken, looksLikeProviderToken } from "./provider-token.ts";
 import { handleProvision, type ProvisionDeps, type ProvisionTool } from "./provision/handlers.ts";
+import { sharedUsageCache } from "./provision/usage.ts";
 import type { ToolConfig } from "../../src/core/tool-config.ts";
 import type { SeedMode } from "../../src/store/seed-files.ts";
 import { currentMainId } from "./fresh-context.ts";
@@ -3479,6 +3480,7 @@ function provisionDeps(env: Env): ProvisionDeps {
       limits: limitsOf(env),
       today: (tenantId, now) => readDaySpend(env.CONTROL_DB, tenantId, now),
       costs: (tenantId, from, to, bucket) => readTenantCosts(env.CONTROL_DB, tenantId, from, to, bucket),
+      cache: sharedUsageCache,
     },
     // The same sources as the console's picker (`/ui/agent/model`) and the Agents API's `model`, so all three agree.
     models: {

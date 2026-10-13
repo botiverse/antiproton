@@ -13,7 +13,8 @@ import { readdirSync, readFileSync } from "node:fs";
 import { d1ProviderTokens } from "../cf/src/control-plane.ts";
 import { hashProviderToken, newProviderToken } from "../cf/src/provider-token.ts";
 import { dayOf, judge, limitsOf, readDaySpend, type SpendLimitEnv } from "../cf/src/spend-limit.ts";
-import { readTenantCosts } from "../cf/src/usage-d1.ts";
+import { readTenantCosts, type OwnCosts } from "../cf/src/usage-d1.ts";
+import { sharedUsageCache, tenantUsage, USAGE_CACHE_MS, UsageCache, type ProvisionUsage } from "../cf/src/provision/usage.ts";
 import { UNACCEPTED_TOKENS } from "../src/usage/outbox.ts";
 
 const STAND_IN = "export class DurableObject { constructor(ctx, env) { this.ctx = ctx; this.env = env; } }" +
@@ -82,7 +83,9 @@ async function token(db: Db, who: { scope: "tenant"; tenantId: string } | { scop
 function env(db: Db, extra: SpendLimitEnv = {}) {
   return { CONTROL_DB: db, AGENT: { idFromName: (s: string) => s, get: () => ({}) }, ARTIFACTS: {}, HARNESS_MODEL: "deepseek-flash", ...extra };
 }
-async function get(e: object, path: string, auth: string | null) {
+/** One request through the Worker. The isolate's answer cache is emptied first unless `keep`: each check has its own ledger. */
+async function get(e: object, path: string, auth: string | null, keep = false) {
+  if (!keep) sharedUsageCache.clear();
   const r = await worker.fetch(new Request(`https://antiproton.test${path}`, auth === null ? {} : { headers: { authorization: auth } }), e as never);
   const text = await r.text();
   let body: any = null;
@@ -106,8 +109,8 @@ await check("a token sees its own tenant only: another tenant's spend, agents an
   const rb = await get(e, "/provision/usage", `Bearer ${b}`);
   must(ra.status === 200 && rb.status === 200, `${ra.status} ${ra.text} / ${rb.status} ${rb.text}`);
   must(ra.body.tenantId === "t-a" && rb.body.tenantId === "t-b", `${ra.body.tenantId} / ${rb.body.tenantId}`);
-  must(show(ra.body.agents.map((x: any) => x.agentId)) === show(["raft_alpha", "raft_beta"]), show(ra.body.agents));
-  must(show(rb.body.agents.map((x: any) => x.agentId)) === show(["raft_delta", "raft_gamma"]), show(rb.body.agents));
+  must(show(ra.body.agents.map((x: any) => x.providerAgentId)) === show(["raft_alpha", "raft_beta"]), show(ra.body.agents));
+  must(show(rb.body.agents.map((x: any) => x.providerAgentId)) === show(["raft_delta", "raft_gamma"]), show(rb.body.agents));
   must(Math.abs(ra.body.today.spentUsd - 1.25) < 1e-5 && Math.abs(ra.body.totalUsd - 1.75) < 1e-5, show(ra.body));
   must(Math.abs(rb.body.today.spentUsd - 2.75) < 1e-5 && Math.abs(rb.body.totalUsd - 6.75) < 1e-5, show(rb.body));
   for (const other of ["t-b", "raft_gamma", "raft_delta", "2.75", "6.75"]) must(!ra.text.includes(other), `A's answer carries ${other}: ${ra.text}`);
@@ -122,10 +125,26 @@ await check("a platform token is the tenant its ?raftServerId= names, and withou
   const p = await token(db, { scope: "platform" });
   const e = env(db);
   const r1 = await get(e, "/provision/usage?raftServerId=srv-1", `Bearer ${p}`);
-  must(r1.status === 200 && r1.body.tenantId === "raft_srv-1" && show(r1.body.agents.map((x: any) => x.agentId)) === show(["raft_one"]), r1.text);
+  must(r1.status === 200 && r1.body.tenantId === "raft_srv-1" && show(r1.body.agents.map((x: any) => x.providerAgentId)) === show(["raft_one"]), r1.text);
   must(!r1.text.includes("raft_two") && !r1.text.includes("srv-2"), r1.text);
   const none = await get(e, "/provision/usage", `Bearer ${p}`);
   must(none.status === 422 && none.body.error.param === "raftServerId", `${none.status} ${none.text}`);
+});
+
+await check("a tenant token naming another server or tenant in the query still gets its own tenant, and nothing of theirs", async () => {
+  const db = d1();
+  const day = today();
+  spend(db, "t-a", 0.25, day, "raft_mine");
+  spend(db, "raft_srv-2", 2.5, day, "raft_srv2agent");
+  spend(db, "t-b", 3.5, day, "raft_tbagent");
+  const a = await token(db, { scope: "tenant", tenantId: "t-a" });
+  const e = env(db);
+  for (const q of ["?raftServerId=srv-2", "?tenantId=t-b", "?raftServerId=srv-2&tenantId=t-b", "?tenantId=t-b&raftServerId=srv-2&bucket=day"]) {
+    const r = await get(e, `/provision/usage${q}`, `Bearer ${a}`);
+    must(r.status === 200 && r.body.tenantId === "t-a" && show(r.body.agents.map((x: any) => x.providerAgentId)) === show(["raft_mine"]), `${q}: ${r.status} ${r.text}`);
+    must(Math.abs(r.body.today.spentUsd - 0.25) < 1e-5 && Math.abs(r.body.totalUsd - 0.25) < 1e-5, `${q}: ${show(r.body)}`);
+    for (const other of ["raft_srv2agent", "raft_tbagent", "srv-2", "t-b", "2.5", "3.5"]) must(!r.text.includes(other), `${q}: carries ${other}: ${r.text}`);
+  }
 });
 
 await check("no token, a malformed one, an unknown one and a revoked one: the same refusal as every /provision route", async () => {
@@ -222,6 +241,62 @@ await check("the platform limit reached: refusing and platformLimitReached, and 
   must(r3.body.today.platformLimitReached === true && r3.body.today.refusing === false && r3.body.today.exempt === true, show(r3.body.today));
 });
 
+// ---- the answer cache ----------------------------------------------------------------------------------------
+
+await check("an answer is kept 15 s per tenant and normalised query, never across a UTC day, never across limits", async () => {
+  const reads: string[] = [];
+  // Read through a function: the compiler narrows a property it has just seen compared and calls the next comparison impossible.
+  const count = () => reads.length;
+  let usd = 1;
+  const costs: OwnCosts = { total: 0, periods: [], agents: [] };
+  const deps = (limits = limitsOf({}), cache = new UsageCache()): ProvisionUsage => ({
+    limits, cache,
+    today: async (tenantId, now) => { reads.push(`today ${tenantId}`); return { day: dayOf(now), tenantUsd: usd, platformUsd: usd, override: null }; },
+    costs: async (tenantId, from, to, bucket) => { reads.push(`costs ${tenantId} ${from} ${to} ${bucket}`); return costs; },
+  });
+  const d = deps();
+  const NOON = Date.parse("2026-10-12T12:00:00Z");
+  const ask = async (q: string, now: number, dd = d, tenant = "t-a") => (await tenantUsage(tenant, new URLSearchParams(q), dd, now)) as any;
+  must((await ask("", NOON)).today.spentUsd === 1 && count() === 2, show(reads));
+  usd = 2;
+  // The same window asked another way is the same entry; within 15 s nothing is read.
+  must((await ask("bucket=day", NOON + USAGE_CACHE_MS - 1)).today.spentUsd === 1 && count() === 2, show(reads));
+  // Another tenant, another window: their own entries.
+  must((await ask("", NOON + 1, d, "t-b")).today.spentUsd === 2 && count() === 4, show(reads));
+  must((await ask("bucket=month", NOON + 1)).today.spentUsd === 2 && count() === 6, show(reads));
+  // At 15 s the entry is read again.
+  must((await ask("", NOON + USAGE_CACHE_MS)).today.spentUsd === 2 && count() === 8, show(reads));
+  // Across 00:00 UTC: an answer from 23:59:55 is not served at 00:00:01, though it is 6 s old.
+  const LATE = Date.parse("2026-10-12T23:59:55Z");
+  const late = deps();
+  usd = 4.5;
+  const before = await ask("from=2026-10-01&to=2026-10-20", LATE, late);
+  must(before.today.day === "2026-10-12" && count() === 10, show(reads));
+  usd = 0;
+  const after = await ask("from=2026-10-01&to=2026-10-20", LATE + 6_000, late);
+  must(after.today.day === "2026-10-13" && after.today.spentUsd === 0 && count() === 12, `${show(after.today)} ${show(reads)}`);
+  // New limits (a new deployment's) are not answered from the old ones' entry.
+  const shared = new UsageCache();
+  const r1 = await ask("", NOON, deps(limitsOf({}), shared));
+  const r2 = await ask("", NOON + 1, deps(limitsOf({ DAILY_LIMIT_USD: "9" }), shared));
+  must(r1.today.limitUsd === 5 && r2.today.limitUsd === 9, `${show(r1.today)} ${show(r2.today)}`);
+});
+
+await check("the Worker keeps the answer: a second request within 15 s is the first one's, spend since notwithstanding", async () => {
+  const db = d1();
+  const day = today();
+  spend(db, "t-a", 1, day);
+  const a = await token(db, { scope: "tenant", tenantId: "t-a" });
+  const e = env(db);
+  const first = await get(e, "/provision/usage", `Bearer ${a}`);
+  spend(db, "t-a", 2, day, "b");
+  const second = await get(e, "/provision/usage", `Bearer ${a}`, true);
+  must(first.status === 200 && second.text === first.text && Math.abs(second.body.today.spentUsd - 1) < 1e-5, `${first.text} / ${second.text}`);
+  // The control: emptied, the same request reads the new spend.
+  const fresh = await get(e, "/provision/usage", `Bearer ${a}`);
+  must(Math.abs(fresh.body.today.spentUsd - 3) < 1e-5, fresh.text);
+});
+
 // ---- the window ----------------------------------------------------------------------------------------------
 
 await check("the window: 30 days by day unless asked; month buckets; the answer names it, and is no-store", async () => {
@@ -237,7 +312,7 @@ await check("the window: 30 days by day unless asked; month buckets; the answer 
   must(r.status === 200 && r.cache === "no-store", `${r.status} ${r.cache}`);
   must(r.body.currency === "USD" && r.body.estimated === true && r.body.bucket === "day", show(r.body));
   must(r.body.to === new Date(day + DAY).toISOString() && Date.parse(r.body.from) <= day - 29 * DAY && Date.parse(r.body.from) > day - 31 * DAY, `${r.body.from}..${r.body.to}`);
-  must(Math.abs(r.body.totalUsd - 3) < 1e-5 && r.body.periods.length === 2 && show(r.body.agents.map((x: any) => x.agentId)) === show(["raft_y", "raft_x"]), show(r.body));
+  must(Math.abs(r.body.totalUsd - 3) < 1e-5 && r.body.periods.length === 2 && show(r.body.agents.map((x: any) => x.providerAgentId)) === show(["raft_y", "raft_x"]), show(r.body));
   const todays = r.body.periods.at(-1);
   must(show(todays.unpriced) === show(["tool.call js.unpriced calls"]) && todays.resources.some((x: any) => x.resource === "tool.call" && x.costUsd === 0), show(todays));
   // The same figures as the reader under it, so the shape, not the arithmetic, is all this route adds.
@@ -245,7 +320,7 @@ await check("the window: 30 days by day unless asked; month buckets; the answer 
   must(own.total === r.body.totalUsd && show(own.agents.map((x) => x.total)) === show(r.body.agents.map((x: any) => x.totalUsd)), `${show(own)} vs ${r.text}`);
   // `today` is today whatever the window: a window that ends before it still reports today's spend and limit.
   const past = await get(e, `/provision/usage?from=${new Date(day - 20 * DAY).toISOString().slice(0, 10)}&to=${new Date(day - 5 * DAY).toISOString().slice(0, 10)}`, `Bearer ${a}`);
-  must(past.status === 200 && Math.abs(past.body.totalUsd - 2) < 1e-5 && show(past.body.agents.map((x: any) => x.agentId)) === show(["raft_y"]), past.text);
+  must(past.status === 200 && Math.abs(past.body.totalUsd - 2) < 1e-5 && show(past.body.agents.map((x: any) => x.providerAgentId)) === show(["raft_y"]), past.text);
   must(past.body.today.spentUsd === r.body.today.spentUsd && Math.abs(past.body.today.spentUsd - 1) < 1e-5 && past.body.today.day === r.body.today.day, show(past.body.today));
   const from = new Date(day - 60 * DAY).toISOString().slice(0, 10);
   const m = await get(e, `/provision/usage?bucket=month&from=${from}`, `Bearer ${a}`);

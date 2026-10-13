@@ -261,20 +261,25 @@ is `404`. `cf/src/provision/usage.ts`; tests in `test/provision-usage.ts`.
   `message`.
 - **`today`** is always today (UTC), whatever the window. It is the daily limit's own reading and rule
   (`readDaySpend` and `standing` in `cf/src/spend-limit.ts`, the `judge` the queue consumer applies),
-  read fresh: `spentUsd` is the tenant's priced usage today, `model.tokens.unaccepted` left out;
+  read afresh for each answer (kept 15 s, below): `spentUsd` is the tenant's priced usage today, `model.tokens.unaccepted` left out;
   `limitUsd` the admin's override if there is one, else `DAILY_LIMIT_USD`, `null` when there is no
   per-tenant limit or the tenant is exempt (`exempt: true`, `DAILY_LIMIT_EXEMPT_TENANTS`);
   `platformLimitReached` whether the platform's limit is reached; `refusing` whether a model call would
   be refused now (platform first, then the tenant's limit; never for an exempt tenant). The consumer
-  may act on a reading up to 30 s old (docs/metering.md, "How fresh the reading is"), so `refusing`
-  can lead it by that long. The platform's own total and limit are not given: they are every tenant's
+  may act on a reading up to 30 s old (docs/metering.md, "How fresh the reading is"). The platform's own total and limit are not given: they are every tenant's
   spend summed.
 - **`periods`** are the window's periods that have usage, oldest first, priced as everywhere else
   (docs/metering.md, "Prices"), `model.tokens.unaccepted` left out. `resources` gives each resource's
   cost; `unpriced` lists `resource key unit` for usage nothing prices, which counts nothing in a total
   (not the same as free). `totalUsd` at the top is the window's sum.
-- **`agents`** is each agent's total over the window, highest first, by the ledger's agent id — for a
-  provisioned agent its `providerAgentId`.
+- **`agents`** is each agent's total over the window, highest first, named by `providerAgentId` as the
+  provider's agent view names it (the ledger's agent id, which for a provisioned agent is that).
+- **Tenant from the token only.** A tenant-scoped token sending `?raftServerId=` or `?tenantId=` still
+  gets its own tenant; those parameters do not choose one.
+- **Kept 15 s.** Each isolate keeps the whole answer for 15 s (`USAGE_CACHE_MS`), per tenant and
+  window as widened (so no query and `?bucket=day` share one), never past the UTC day it was made in.
+  So a figure can be 15 s old, and with the consumer's own 30 s reading `refusing` can differ from what
+  the consumer does for under a minute.
 
 ```json
 GET /provision/usage?from=2026-10-10&bucket=day
@@ -292,7 +297,7 @@ GET /provision/usage?from=2026-10-10&bucket=day
       "resources": [{ "resource": "model.tokens", "costUsd": 1.84 }, { "resource": "tool.call", "costUsd": 0 }],
       "unpriced": ["tool.call js.run calls"] }
   ],
-  "agents": [{ "agentId": "raft_01JAGENT", "totalUsd": 3.9 }, { "agentId": "raft_01JOTHER", "totalUsd": 0.41 }]
+  "agents": [{ "providerAgentId": "raft_01JAGENT", "totalUsd": 3.9 }, { "providerAgentId": "raft_01JOTHER", "totalUsd": 0.41 }]
 }
 ```
 
