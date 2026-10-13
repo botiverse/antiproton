@@ -14,7 +14,7 @@ import { d1ProviderTokens } from "../cf/src/control-plane.ts";
 import { hashProviderToken, newProviderToken } from "../cf/src/provider-token.ts";
 import { dayOf, judge, limitsOf, readDaySpend, type SpendLimitEnv } from "../cf/src/spend-limit.ts";
 import { readTenantCosts, type OwnCosts } from "../cf/src/usage-d1.ts";
-import { sharedUsageCache, tenantUsage, USAGE_CACHE_MS, UsageCache, type ProvisionUsage } from "../cf/src/provision/usage.ts";
+import { sharedUsageCache, tenantUsage, USAGE_CACHE_ENTRIES, USAGE_CACHE_MS, UsageCache, type ProvisionUsage } from "../cf/src/provision/usage.ts";
 import { UNACCEPTED_TOKENS } from "../src/usage/outbox.ts";
 
 const STAND_IN = "export class DurableObject { constructor(ctx, env) { this.ctx = ctx; this.env = env; } }" +
@@ -280,6 +280,43 @@ await check("an answer is kept 15 s per tenant and normalised query, never acros
   const r1 = await ask("", NOON, deps(limitsOf({}), shared));
   const r2 = await ask("", NOON + 1, deps(limitsOf({ DAILY_LIMIT_USD: "9" }), shared));
   must(r1.today.limitUsd === 5 && r2.today.limitUsd === 9, `${show(r1.today)} ${show(r2.today)}`);
+});
+
+await check("the cache is bounded: expired entries are removed, the cap holds over 1000 keys, a 400-day window is not kept", async () => {
+  const T = Date.parse("2026-10-12T12:00:00Z");
+  // Read through functions: the compiler narrows a property it has just compared and calls the next comparison impossible.
+  const size = (x: UsageCache) => x.size;
+  const c = new UsageCache();
+  for (let i = 0; i < 10; i++) c.set(`k${i}`, T, { i });
+  must(size(c) === 10, `size ${c.size}`);
+  // One set after they expire leaves only itself.
+  c.set("late", T + USAGE_CACHE_MS, { late: true });
+  must(size(c) === 1 && c.get("late", T + USAGE_CACHE_MS) !== null, `after expiry: size ${c.size}`);
+  // 1000 distinct keys, all live: never more than the cap, and the oldest are the ones gone.
+  const big = new UsageCache();
+  let most = 0;
+  for (let i = 0; i < 1000; i++) { big.set(`k${i}`, T + i, { i }); most = Math.max(most, big.size); }
+  must(USAGE_CACHE_ENTRIES === 256 && most === 256 && big.size === 256, `most ${most}, size ${big.size}`);
+  must(big.get("k999", T + 1000) !== null && big.get("k744", T + 1000) !== null && big.get("k743", T + 1000) === null && big.get("k0", T + 1000) === null, "not the oldest evicted");
+  // A key set again moves to the end: it outlives keys set after its first set.
+  const order = new UsageCache(3);
+  order.set("a", T, {}); order.set("b", T, {}); order.set("a", T + 1, {}); order.set("c", T + 2, {}); order.set("d", T + 3, {});
+  must(order.get("a", T + 3) !== null && order.get("b", T + 3) === null && order.size === 3, `size ${order.size}`);
+  // Through tenantUsage: a 400-day window is read and not stored; a 30-day one is stored.
+  const cache = new UsageCache();
+  let reads = 0;
+  const count = () => reads;
+  const deps: ProvisionUsage = {
+    limits: limitsOf({}), cache,
+    today: async (_t, now) => { reads++; return { day: dayOf(now), tenantUsd: 0, platformUsd: 0, override: null }; },
+    costs: async () => ({ total: 0, periods: [], agents: [] }),
+  };
+  await tenantUsage("t-a", new URLSearchParams("from=2025-09-08&to=2026-10-12"), deps, T);
+  await tenantUsage("t-a", new URLSearchParams("from=2025-09-08&to=2026-10-12"), deps, T + 1);
+  must(size(cache) === 0 && count() === 2, `400 days: size ${cache.size}, reads ${reads}`);
+  await tenantUsage("t-a", new URLSearchParams("from=2026-08-11&to=2026-10-12"), deps, T);
+  await tenantUsage("t-a", new URLSearchParams("from=2026-08-11&to=2026-10-12"), deps, T + 1);
+  must(size(cache) === 1 && count() === 3, `62 days: size ${cache.size}, reads ${reads}`);
 });
 
 await check("the Worker keeps the answer: a second request within 15 s is the first one's, spend since notwithstanding", async () => {

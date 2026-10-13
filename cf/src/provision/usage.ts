@@ -30,23 +30,40 @@ export interface ProvisionUsage {
 export const USAGE_CACHE_MS = 15_000;
 
 /**
+ * The most answers one isolate keeps, and the longest window it keeps one for. An answer is about 236 KB at a
+ * 400-day window (measured in review), and an isolate has about 128 MB: an answer is kept only for a window of at
+ * most `USAGE_CACHE_WINDOW_MAX_MS` (what a panel polls; a longer history is asked for rarely, and read afresh), and
+ * at most `USAGE_CACHE_ENTRIES` of them, so the cache stays a few MB however many windows a caller steps through.
+ */
+export const USAGE_CACHE_ENTRIES = 256;
+export const USAGE_CACHE_WINDOW_MAX_MS = 62 * DAY_MS;
+
+/**
  * The whole answer per tenant and normalised query (the window as `parseCostsQuery` widened it, so `?bucket=day`
  * and no query share one entry), in this isolate's memory. An answer computed on an earlier UTC day is never
  * served: its `today` is yesterday, and at 00:00 UTC the limit resets for everyone.
+ *
+ * Every `set` first drops what has expired, then, if still full, the oldest entries (a Map iterates in insertion
+ * order, and a key set again is moved to the end): memory is bounded by the cap, not by how long an isolate lives.
  */
 export class UsageCache {
   readonly #entries = new Map<string, { at: number; day: number; answer: object }>();
+  readonly #max: number;
+  constructor(max = USAGE_CACHE_ENTRIES) { this.#max = max; }
+  get size(): number { return this.#entries.size; }
   get(key: string, now: number): object | null {
     const hit = this.#entries.get(key);
-    return hit && hit.day === dayOf(now) && now - hit.at < USAGE_CACHE_MS ? hit.answer : null;
+    return hit && live(hit, now) ? hit.answer : null;
   }
   set(key: string, now: number, answer: object): void {
-    // Tenants come and go; an isolate that has seen many starts over rather than keeping them all.
-    if (this.#entries.size >= 10_000) this.#entries.clear();
+    for (const [k, e] of this.#entries) if (!live(e, now)) this.#entries.delete(k);
+    this.#entries.delete(key);
+    while (this.#entries.size >= this.#max) this.#entries.delete(this.#entries.keys().next().value!);
     this.#entries.set(key, { at: now, day: dayOf(now), answer });
   }
   clear(): void { this.#entries.clear(); }
 }
+const live = (e: { at: number; day: number }, now: number) => e.day === dayOf(now) && now - e.at < USAGE_CACHE_MS;
 
 /** The one cache of this isolate, which cf/src/index.ts gives every request's deps. */
 export const sharedUsageCache = new UsageCache();
@@ -57,10 +74,12 @@ export async function tenantUsage(tenantId: string, query: URLSearchParams, deps
   if (typeof q === "string") return q;
   // The limits are in the key, so a deployment's new limits are never answered with the old ones.
   const key = JSON.stringify([tenantId, q.from, q.to, q.bucket, deps.limits.tenantUsd, deps.limits.platformUsd, isExempt(tenantId, deps.limits)]);
-  const kept = deps.cache?.get(key, now);
+  // A window longer than a panel polls is read afresh and not kept (`USAGE_CACHE_WINDOW_MAX_MS`).
+  const cache = q.to - q.from <= USAGE_CACHE_WINDOW_MAX_MS ? deps.cache : undefined;
+  const kept = cache?.get(key, now);
   if (kept) return kept;
   const answer = await read(tenantId, q, deps, now);
-  deps.cache?.set(key, now, answer);
+  cache?.set(key, now, answer);
   return answer;
 }
 
