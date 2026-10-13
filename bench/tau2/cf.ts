@@ -164,7 +164,7 @@ async function runTask(task: any) {
   ];
 
   let agentSaid = OPENING;
-  let turns = 0, simCalls = 0, ended = "max_turns";
+  let turns = 0, simCalls = 0, simMs = 0, ended = "max_turns";
   let simLast = "";
   let stall: string | undefined;
   // The values that cause was decided from, so a record can be re-decided rather than believed.
@@ -173,7 +173,10 @@ async function runTask(task: any) {
   while (turns++ < MAX_TURNS) {
     sim.push({ role: "user", content: agentSaid });
     // Why the simulator thinks a little under a large cap: SIM in bench/tau2/episode.ts.
+    // The sim generates in this process, so only the runner can time it.
+    const simT0 = Date.now();
     const u = await model.complete(sim, SIM);
+    simMs += Date.now() - simT0;
     simCalls += 1;
     sim.push({ role: "assistant", content: u.text });
     // Verbatim, including a stop tag when the turn carried one (a STOP turn's text
@@ -215,7 +218,7 @@ async function runTask(task: any) {
     reward: dbMatch && actionMatch ? 1 : 0, dbMatch, actionMatch, ended, stall, stallWhy,
     simLast: simLast.slice(0, SIM_LAST_MAX),
     delivered: delivered.get(taskId) ?? { push: 0, poll: 0, pollAnswered: 0, pollFailed: 0, dropped: 0 },
-    turns: turns - 1, simCalls,
+    turns: turns - 1, simCalls, simMs,
     usage: res.usage ?? {}, kinds: res.kinds ?? {}, byTool: res.byTool ?? {}, toolErrors: res.toolErrors ?? null,
     seconds: Math.round((Date.now() - t0) / 1000),
     expectedWrites: expected.map((e) => e.name),

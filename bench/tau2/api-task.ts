@@ -157,7 +157,7 @@ async function converse(task: any, d: ApiTaskDeps, t0: number, agentId: string, 
 
   const sim: SimMessage[] = [{ role: "system", content: simSystem(task, d.guidelines) }];
   let agentSaid = OPENING;
-  let turns = 0, simCalls = 0, ended = "max_turns";
+  let turns = 0, simCalls = 0, simMs = 0, ended = "max_turns";
   let simLast = "";
   let stall: string | undefined;
   let stallWhy: StallEvidence | undefined;
@@ -166,7 +166,10 @@ async function converse(task: any, d: ApiTaskDeps, t0: number, agentId: string, 
 
   while (turns++ < MAX_TURNS) {
     sim.push({ role: "user", content: agentSaid });
+    // The sim generates in this process (bench/tau2/api.ts d.sim), so only the driver can time it.
+    const simT0 = Date.now();
     const u = await d.sim(sim, SIM);
+    simMs += Date.now() - simT0;
     simCalls += 1;
     sim.push({ role: "assistant", content: u.text });
     // Verbatim, stop tag included, as the `/bench` row keeps it.
@@ -235,7 +238,7 @@ async function converse(task: any, d: ApiTaskDeps, t0: number, agentId: string, 
     reward: dbMatch && actionMatch ? 1 : 0, dbMatch, actionMatch, ended, stall, stallWhy,
     simLast: simLast.slice(0, SIM_LAST_MAX),
     ...(dropInfo.length ? { dropInfo } : {}),
-    delivered, turns: turns - 1, simCalls,
+    delivered, turns: turns - 1, simCalls, simMs,
     usage: figures.usage, kinds, byTool: figures.byTool, toolErrors: figures.toolErrors,
     seconds: Math.round((Date.now() - t0) / 1000),
     expectedWrites: expected.map((e) => e.name),
