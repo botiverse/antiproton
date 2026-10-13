@@ -140,6 +140,7 @@
     "test/bench-swe.ts",
     "test/bench-swe-grade.ts",
     "test/client-tool-alarms.ts",
+    "test/turn-timing.ts",
     "test/eval-seed.ts",
     "test/eval-seed-object.ts",
     "test/provision-model.ts",

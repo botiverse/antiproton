@@ -341,7 +341,7 @@ await check("a timed tool is the same tool to the model: every field but execute
   must(show(out) === show({ n: 3, self: "a" }) && ran.length === 1, show([out, ran]));
   const thrower = timedTools([{ name: "t", async execute() { throw new Error("no"); } }], { skip: () => false, ran: (ms) => ran.push(ms), now: Date.now })[0]!;
   const err = await thrower.execute!().then(() => null, (e: Error) => e.message);
-  must(err === "no" && ran.length === 2, `a throwing tool: ${err}, timed ${ran.length}`);
+  must(err === "no" && (ran.length as number) === 2, `a throwing tool: ${err}, timed ${ran.length}`);
 });
 
 for (const r of results) console.log(`${r.ok ? "PASS" : "FAIL"}  ${r.name}${r.ok ? "" : `\n${r.error}`}`);
