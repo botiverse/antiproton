@@ -363,6 +363,15 @@ await check("paths: traversal, absolute, backslash, control characters, a direct
   }
   const dup = await imp(w, body(uuid(), [{ path: "a/b.md", bytes: "1" }, { path: "./a//b.md", bytes: "2" }]));
   must(dup.status === 422 && dup.body.error.code === "duplicate_path" && dup.body.error.param === "files[1].path", `duplicate: ${dup.text}`);
+  // Said as what they are, not as a key-rule miss: the reader is told which character to drop.
+  for (const path of ["a\\b", "a\u0001b"]) {
+    const r = await imp(w, body(uuid(), [{ path, bytes: "x" }]));
+    must(/backslash or a control character/.test(r.body?.error?.message ?? ""), `${show(path)}: ${r.text}`);
+  }
+  for (const [path, says] of [["../x", "`..` segment"], ["/x", "relative"], ["x/", "directory"]] as const) {
+    const r = await imp(w, body(uuid(), [{ path, bytes: "x" }]));
+    must(String(r.body?.error?.message ?? "").includes(says), `${path}: ${r.text}`);
+  }
   await nothingWritten(w, "paths");
 });
 
@@ -553,6 +562,8 @@ await check("awaitImport: a push before the import is accepted and queued and st
   must(/waiting for its workspace import/.test(threw), `postMessage while held: ${threw || "no error"}`);
   const r = await imp(w, body(uuid(), [{ path: "MEMORY.md", bytes: "imported memory" }], { instructions: "IMPORTED-PERSONA-77" }));
   must(r.status === 201, `import: ${r.status} ${r.text}`);
+  // Woken now, not at the hold's deadline: the queued push is posted by the pass the import armed.
+  must((w.alarmAt() ?? Infinity) <= Date.now() + 1_000, `the import armed no wake: ${w.alarmAt()}`);
   await settle(w, 1);
   must(jobCount(w) === 1, `no turn after the import: ${jobCount(w)}`);
   const req = await asked(w, 0);
@@ -569,6 +580,20 @@ await check("awaitImport: an import without instructions lifts the hold in its o
   must((await imp(w, body(uuid(), [{ path: "a.md", bytes: "x" }]))).status === 201, "import");
   await settle(w, 1);
   must(jobCount(w) === 1, `after: ${jobCount(w)}`);
+});
+
+await check("awaitImport: an import whose instructions did not apply keeps the hold, so no turn runs on the old persona; the retry lifts it", async () => {
+  const w = await world({ post: { awaitImport: true }, pushy: true });
+  await push(w, "e1", "QUEUED-PUSH");
+  await settle(w, 1);
+  (w.DB as any).fault.failOn = /UPDATE provisioned_agents SET instructions/;
+  const b = body(uuid(), [{ path: "a.md", bytes: "x" }], { instructions: "PERSONA-AFTER-RETRY" });
+  must((await imp(w, b)).status === 500, "the first import did not fail");
+  await settle(w, 1);
+  must(jobCount(w) === 0, `a turn ran with the instructions not applied: ${jobCount(w)}`);
+  must((await imp(w, b)).status === 200, "retry");
+  await settle(w, 1);
+  must(jobCount(w) === 1 && (await asked(w, 0)).includes("PERSONA-AFTER-RETRY"), `after the retry: ${jobCount(w)} jobs`);
 });
 
 await check("awaitImport: with no import for 24 hours the hold lifts on its own, a trace row says why, and the queued push runs", async () => {
