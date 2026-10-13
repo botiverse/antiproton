@@ -3616,9 +3616,9 @@ export class AgentRuntime {
     };
     // The turn this message opens or joins (src/runtime/turn-timing.ts), pi085 only. With the lane idle, the record
     // there is a turn that is over when it made no call of the caller's (`turnClientCalls`), and is replaced; one paused
-    // with a call the caller never answered is abandoned — closed, and a new turn opened — when this is new input; one
-    // whose calls are all answered is about to resume, and is joined. A follow-up opens none: on an idle lane it starts
-    // no run (as for the notices above). Read before the briefing is taken below, so no await falls between that and the
+    // with a call the caller never answered is abandoned — closed, and a new turn opened — when this is the caller's new
+    // input (below); one whose calls are all answered is about to resume, and is joined. A follow-up opens none: on an
+    // idle lane it starts no run (as for the notices above). Read before the briefing is taken below, so no await falls between that and the
     // write. A reading: a failure is logged and the message is written all the same.
     const timing = this.#isPd() ? null : this.#deps.ctx.storage.sql;
     let prior = false, stale = false, abandoned = false;
@@ -3629,7 +3629,9 @@ export class AgentRuntime {
         if (t && !(await agent.running())) {
           const calls = turnClientCalls(timing, session, t.inboundAt);
           stale = calls.named === 0;
-          abandoned = calls.waiting > 0 && mode !== "followUp";
+          // Only the caller's own input abandons: the API handler is the one route that passes `receivedAt`. A
+          // background completion, a push or a lease warning arriving during the pause joins the turn instead.
+          abandoned = calls.waiting > 0 && mode !== "followUp" && opts.receivedAt !== undefined;
         }
       } catch (e) { console.error(`reading ${tenantId}/${agentId}#${session}'s turn timing failed:`, e); }
     }

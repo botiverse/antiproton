@@ -166,6 +166,8 @@ async function apiTurns(label: string, messages: Array<{ text: string; script: R
   abandon?: boolean;
   /** The caller's results land inside the step that paused, after its resume looked and found a call waiting. */
   answerInWindow?: boolean;
+  /** At the first pause, a background job's completion is posted to the session (no `receivedAt`, as `step` posts it). */
+  jobAtPause?: string;
   /** A steer into the first turn while its first model call is out. */
   steer?: string;
   /** Done to the object before the first message. */
@@ -180,7 +182,7 @@ async function apiTurns(label: string, messages: Array<{ text: string; script: R
   const turnOf = async (callId: string) => (await status()).pending.find((p: any) => p.call_id === callId)?.turn_id;
   const marks: Array<{ sent: number; read: number }> = [];
   let submissions = 0;
-  let lastBatch: any[] = [], inWindow = 0;
+  let lastBatch: any[] = [], inWindow = 0, jobPosted = false;
   const answerAll = async () => {
     const s = await status();
     const batch = await Promise.all(s.pending.map(async (p: any) => ({ turnId: await turnOf(p.call_id) ?? "", callId: p.call_id, output: outputFor(p), isError: false })));
@@ -207,8 +209,10 @@ async function apiTurns(label: string, messages: Array<{ text: string; script: R
       await o.settle(TENANT, agentId, m.script);
       const s = await status();
       if (opts.answerInWindow && s.status !== "requires_action" && m.script.length && lastBatch.length) {
-        // Results kept inside a step are not stepped by the next wake: that step ends by marking its session idle
-        // (`AgentRuntime.step` markSession), over the mark the results set. The caller sending them again marks it.
+        // The test opens a gap that the API path does not have: results land inside the step, between its resume read
+        // and the end of the step, and that step then marks its session idle (`AgentRuntime.step` markSession) over the
+        // mark the results set, so no wake steps it. In the runtime the gap needs real I/O at that point, which only the
+        // main session's overflow backstop has, when it rebuilds or posts a briefing. Sending the results again marks it.
         const again = await o.D.apiToolResults(TENANT, agentId, session, lastBatch);
         must(again.unknown.length === 0, show(again));
         lastBatch = [];
@@ -217,6 +221,13 @@ async function apiTurns(label: string, messages: Array<{ text: string; script: R
       if (s.status !== "requires_action") break;
       if (opts.cancelWhilePaused) { clock += CALLER_MS; await o.D.apiCancelSession(TENANT, agentId, session); await o.settle(TENANT, agentId, m.script); break; }
       if (opts.abandon) { clock += CALLER_MS; break; }
+      if (opts.jobAtPause && !jobPosted) {
+        jobPosted = true;
+        clock += 1_000;
+        await o.D.runtime().postMessage(TENANT, agentId, opts.jobAtPause, "prompt", session);
+        await o.D.alarm();
+        continue;
+      }
       await answerAll();
     }
     marks.push({ sent, read: Date.now() });
@@ -355,6 +366,14 @@ await check("new input while a turn's calls are all answered but not yet resumed
   await r.o.D.runtime().postMessage(TENANT, r.agentId, "And W2?", "prompt", r.session);
   const rec = sql.exec("SELECT inbound_at, messages FROM turn_timing WHERE session = ?", r.session).toArray()[0];
   must(rec && Number(rec.inbound_at) === inboundAt && Number(rec.messages) === 2, `the turn was replaced: ${show(rec)}`);
+});
+
+await check("a background job's completion during an unanswered pause joins the turn: nothing is abandoned", async () => {
+  const r = await apiTurns("job", [{ text: "Please cancel order W1.", script: [SEQ[0]!, { text: "The job is done." }, { text: "Order W1: pending." }] }],
+    { jobAtPause: "[background job finished]" });
+  const rows = r.timing;
+  must(!rows.some((t) => t.status === "abandoned"), `abandoned by a job completion: ${show(rows)}`);
+  must(rows.length === 1 && rows[0]!.status === "completed" && rows[0]!.attrs.messages === 2 && rows[0]!.attrs.modelJobs === 3, show(rows));
 });
 
 await check("a steer into a turn in flight joins it: one row, two messages", async () => {

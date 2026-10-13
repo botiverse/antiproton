@@ -6,9 +6,11 @@
  * a turn that asks for the caller's functions pauses (src/runtime/client-calls.ts) and goes on when their results
  * arrive; pi ends one run at the pause and starts another at the resume, so a turn here can span several runs, and
  * ends only when a run ends with none of its calls left to resume (`turnClientCalls`: made in this turn, answered or
- * not). A steer or a follow-up joins the turn in flight (`messages`). New input to a turn paused on the caller, with
- * a call still unanswered, ends that turn as `abandoned` (verdict failed, its pause counted up to the input) and opens
- * a new one: the caller chose not to answer, and nothing else would ever end it.
+ * not). A steer or a follow-up joins the turn in flight (`messages`). The caller's new input (through the Agents API
+ * handler, the one route that passes `receivedAt`) to a turn paused on the caller, with a call still unanswered, ends
+ * that turn as `abandoned` (verdict failed, its pause counted up to the input) and opens a new one: the caller chose not
+ * to answer, and nothing else would ever end it. Anything else arriving then — a background completion, a push, a
+ * lease warning — joins the paused turn.
  *
  * The points, each a millisecond timestamp from the object's clock:
  *   inboundAt      the message entered the object (`AgentRuntime.postMessage`, or the Agents API handler before it)
