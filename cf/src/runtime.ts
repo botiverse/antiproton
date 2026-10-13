@@ -52,9 +52,9 @@ import { callTurns, CANCELLED_NOTE, TURN_CANCELLED } from "./agents-api/transcri
 import { apiAgentSeeds, harnessExtras } from "./agents-api/provisioning.ts";
 import { toolConfigOf, type ToolConfig } from "../../src/core/tool-config.ts";
 import {
-  answerClientCall, clientTools, pendingClientCalls,
+  answerClientCall, clientTools, pendingClientCalls, turnClientCalls,
 } from "../../src/runtime/client-calls.ts";
-import { closeTurn, openTurn, turnInbound, turnNotSaid, turnPaused, turnResumed, turnSaid, turnStepStart } from "../../src/runtime/turn-timing.ts";
+import { closeTurn, discardTurn, openTurn, turnInbound, turnNotSaid, turnPaused, turnResumed, turnSaid, turnStepStart } from "../../src/runtime/turn-timing.ts";
 
 export { ASSUMED_CONTEXT_WINDOW } from "../../src/model/context-windows.ts";
 
@@ -3614,16 +3614,23 @@ export class AgentRuntime {
       if (told) await this.store.returnSeedNotices(tenantId, agentId, told.rows).catch(() => {});
       if (moved) returnContextChange(this.#deps.ctx.storage.sql, moved.owner, moved.conversation, moved.change);
     };
-    // The turn this message opens or joins (src/runtime/turn-timing.ts), pi085 only. A record left by a turn that is
-    // over — its lane idle, nothing waiting on the caller — is replaced rather than joined. A follow-up opens none: on
-    // an idle lane it starts no run (as for the notices above). Read before the briefing is taken below, so no await
-    // falls between that and the write. A reading: a failure is logged and the message is written all the same.
+    // The turn this message opens or joins (src/runtime/turn-timing.ts), pi085 only. With the lane idle, the record
+    // there is a turn that is over when it made no call of the caller's (`turnClientCalls`), and is replaced; one paused
+    // with a call the caller never answered is abandoned — closed, and a new turn opened — when this is new input; one
+    // whose calls are all answered is about to resume, and is joined. A follow-up opens none: on an idle lane it starts
+    // no run (as for the notices above). Read before the briefing is taken below, so no await falls between that and the
+    // write. A reading: a failure is logged and the message is written all the same.
     const timing = this.#isPd() ? null : this.#deps.ctx.storage.sql;
-    let prior = false, stale = false;
+    let prior = false, stale = false, abandoned = false;
     if (timing) {
       try {
-        prior = openTurn(timing, session) !== null;
-        stale = prior && !(await agent.running()) && pendingClientCalls(timing, session).length === 0;
+        const t = openTurn(timing, session);
+        prior = t !== null;
+        if (t && !(await agent.running())) {
+          const calls = turnClientCalls(timing, session, t.inboundAt);
+          stale = calls.named === 0;
+          abandoned = calls.waiting > 0 && mode !== "followUp";
+        }
       } catch (e) { console.error(`reading ${tenantId}/${agentId}#${session}'s turn timing failed:`, e); }
     }
     // A rebuilt transcript's briefing not yet posted is the first thing it holds, whichever post comes first: taken
@@ -3647,8 +3654,12 @@ export class AgentRuntime {
     const timingSafe = (what: string, fn: () => void) => {
       try { fn(); } catch (e) { console.error(`${what} ${tenantId}/${agentId}#${session}'s turn timing failed:`, e); }
     };
+    if (timing && abandoned) {
+      // Closed at this input whether or not the write below lands: the caller left the turn either way.
+      timingSafe("abandoning", () => { closeTurn(timing, { tenantId, agentId, session, replyAt: inboundAt, status: "abandoned" }); });
+    }
     if (timing && (mode !== "followUp" || (prior && !stale))) {
-      timingSafe("opening", () => { opened = turnInbound(timing, session, inboundAt, { stale }); timed = true; });
+      timingSafe("opening", () => { opened = turnInbound(timing, session, inboundAt, { stale: stale || abandoned }); timed = true; });
     }
     // Synchronously before the engine's write, with the harness already open: what a caller retires here
     // (`deliverPendingInbound`'s queued row) is gone exactly when the message is about to be written.
@@ -3742,13 +3753,16 @@ export class AgentRuntime {
     if (!this.#isPd()) ensureAgentTables(sql);
     // A turn waiting for the caller has no run to abort on pi085; it still ends, and says so. On pd the waiting
     // tool is the run, so `cancel` already wrote the marker and forgot the calls.
-    if ((await agent.dropClientCalls()) > 0 && !cancelledTurn) {
+    const dropped = await agent.dropClientCalls();
+    if (dropped > 0 && !cancelledTurn) {
       await agent.markCancelled(TURN_CANCELLED);
     }
-    // The turn ends here, whether a run was aborted or it was waiting on the caller: no later step sees it end.
+    // The turn ends here when a run was aborted or it was waiting on the caller: no later step sees it end. With
+    // neither, nothing was running, and a record there is no turn's: it is forgotten without a row.
     if (!this.#isPd()) {
       this.#turnTiming(tenantId, agentId, "cancelling", () => {
-        closeTurn(sql, { tenantId, agentId, session, replyAt: Date.now(), status: "cancelled" });
+        if (cancelledTurn || dropped > 0) closeTurn(sql, { tenantId, agentId, session, replyAt: Date.now(), status: "cancelled" });
+        else discardTurn(sql, session);
       });
     }
     const jobs = await stopSessionJobs({
@@ -3920,7 +3934,16 @@ export class AgentRuntime {
   #turnStepEnd(tenantId: string, agentId: string, session: string, out: StepOutcome) {
     const sql = this.#deps.ctx.storage.sql;
     if (out.open > 0) return;
-    if (pendingClientCalls(sql, session).length) { turnPaused(sql, session, Date.now()); return; }
+    const t = openTurn(sql, session);
+    if (!t) return;
+    // Every call of this turn, answered or not: results that landed after this step's resume looked (and found one
+    // still waiting) are resumed by the next step, so the turn is not over. A pause starts only while a call waits;
+    // one answered before the step that made it ended is not counted, having had no wait this step could see.
+    const calls = turnClientCalls(sql, session, t.inboundAt);
+    if (calls.named) {
+      if (calls.waiting) turnPaused(sql, session, Date.now());
+      return;
+    }
     if (!out.settled.length) return;
     closeTurn(sql, { tenantId, agentId, session, replyAt: Date.now(), status: out.settled[out.settled.length - 1]!.status });
   }

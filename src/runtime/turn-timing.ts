@@ -5,7 +5,10 @@
  * A turn is what a caller waits on: from a message accepted by the object to the reply it can read. On the Agents API
  * a turn that asks for the caller's functions pauses (src/runtime/client-calls.ts) and goes on when their results
  * arrive; pi ends one run at the pause and starts another at the resume, so a turn here can span several runs, and
- * ends only when a run ends with no call left waiting. A steer or a follow-up joins the turn in flight (`messages`).
+ * ends only when a run ends with none of its calls left to resume (`turnClientCalls`: made in this turn, answered or
+ * not). A steer or a follow-up joins the turn in flight (`messages`). New input to a turn paused on the caller, with
+ * a call still unanswered, ends that turn as `abandoned` (verdict failed, its pause counted up to the input) and opens
+ * a new one: the caller chose not to answer, and nothing else would ever end it.
  *
  * The points, each a millisecond timestamp from the object's clock:
  *   inboundAt      the message entered the object (`AgentRuntime.postMessage`, or the Agents API handler before it)
@@ -74,6 +77,12 @@ export function turnSaid(sql: Sql, session: string, at: number) {
   sql.exec("UPDATE turn_timing SET said_at = ? WHERE session = ? AND said_at IS NULL", Math.floor(at), session);
 }
 
+/** A record that is no turn's (a cancel found nothing running and nothing waiting): forgotten, with no row. */
+export function discardTurn(sql: Sql, session: string) {
+  ensureTurnTiming(sql);
+  sql.exec("DELETE FROM turn_timing WHERE session = ?", session);
+}
+
 /** The message was not written: the turn it opened is not one. A message that joined a turn takes nothing back. */
 export function turnNotSaid(sql: Sql, session: string, opened: boolean) {
   ensureTurnTiming(sql);
@@ -106,7 +115,8 @@ export function turnResumed(sql: Sql, session: string, at: number) {
     "paused_at = NULL WHERE session = ? AND paused_at IS NOT NULL", Math.floor(at), session);
 }
 
-/** pi's run outcome as the trace reads it: `completed` ok, `aborted` a cancel, anything else a failure. */
+/** pi's run outcome as the trace reads it: `completed` ok, `aborted` a cancel, anything else a failure — `abandoned`
+ *  included, a turn the caller left waiting on its functions and sent new input instead (`AgentRuntime.postMessage`). */
 export function turnVerdict(status: string): TraceVerdict {
   if (status === "completed") return "ok";
   if (status === "aborted" || status === "cancelled") return "cancelled";

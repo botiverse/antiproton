@@ -15,7 +15,9 @@ import { readdirSync, readFileSync } from "node:fs";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { BenchState } from "../cf/src/bench.ts";
 import { AgentRuntime } from "../cf/src/runtime.ts";
-import { timedTools } from "../src/runtime/turn-timing.ts";
+import { timedTools, turnInbound } from "../src/runtime/turn-timing.ts";
+import { PiAgent } from "../src/runtime/pi-agent.ts";
+import { pendingClientCalls } from "../src/runtime/client-calls.ts";
 
 const STAND_IN = "export class DurableObject { constructor(ctx, env) { this.ctx = ctx; this.env = env; } }" +
   " export class WorkerEntrypoint { constructor(ctx, env) { this.ctx = ctx; this.env = env; } }" +
@@ -110,6 +112,8 @@ function object(name: string) {
   };
   const D: any = new AgentDO(ctx as never, env as never);
   /** Run until quiet: each queued model call answered after MODEL_MS, each alarm fired when due. */
+  /** Run once, before the next model answer is delivered: something else arriving while a call is out. */
+  const hooks: { beforeAnswer?: () => Promise<void> } = {};
   const settle = async (tenantId: string, agentId: string, script: Reply[], max = 40) => {
     for (;;) {
       if (jobs.length) {
@@ -118,6 +122,7 @@ function object(name: string) {
         if (!job || job.unknownJob) continue;
         const next = script.shift();
         must(next, "a model call the script has no reply for");
+        if (hooks.beforeAnswer) { const h = hooks.beforeAnswer; hooks.beforeAnswer = undefined; await h(); }
         clock += MODEL_MS;
         await D.deliverAnswer(tenantId, agentId, id, answer(next, id), MODEL_MS);
         continue;
@@ -140,7 +145,7 @@ function object(name: string) {
     return [...all.values()].sort((a, b) => a.seq - b.seq).filter((r) => r.kind === kind)
       .map((r) => ({ spanId: String(r.spanId), status: String(r.status), verdict: String(r.verdict), ms: r.ms === undefined ? null : Number(r.ms), attrs: r.attrs as Record<string, any> }));
   };
-  return { D, raw, state, jobs, settle, rows };
+  return { D, raw, state, jobs, settle, rows, hooks };
 }
 
 const TENANT = "t-api";
@@ -155,36 +160,73 @@ const outputFor = (p: any) => (p.name === "lookup" ? "W1: pending" : "W1: cancel
  * Customer messages over the API, each a turn: the message, the model's replies from `script`, and whenever the
  * session waits on the caller, the caller's results after CALLER_MS. `cancelWhilePaused` cancels at the first pause.
  */
-async function apiTurns(label: string, messages: Array<{ text: string; script: Reply[] }>, opts: { cancelWhilePaused?: boolean } = {}) {
+async function apiTurns(label: string, messages: Array<{ text: string; script: Reply[] }>, opts: {
+  cancelWhilePaused?: boolean;
+  /** At a pause the caller answers nothing and goes on to the next message. */
+  abandon?: boolean;
+  /** The caller's results land inside the step that paused, after its resume looked and found a call waiting. */
+  answerInWindow?: boolean;
+  /** A steer into the first turn while its first model call is out. */
+  steer?: string;
+  /** Done to the object before the first message. */
+  prepare?(o: ReturnType<typeof object>): void;
+} = {}) {
   const agentId = `a-${label}`, session = `sess_${label}`;
   const o = object(`api:${TENANT}/${agentId}`);
   const agentJson = JSON.stringify(AGENT);
   await o.D.apiOpenSession(TENANT, agentId, agentJson, session);
+  opts.prepare?.(o);
   const status = () => o.D.apiSessionStatus(TENANT, agentId, session);
   const turnOf = async (callId: string) => (await status()).pending.find((p: any) => p.call_id === callId)?.turn_id;
   const marks: Array<{ sent: number; read: number }> = [];
   let submissions = 0;
+  let lastBatch: any[] = [], inWindow = 0;
+  const answerAll = async () => {
+    const s = await status();
+    const batch = await Promise.all(s.pending.map(async (p: any) => ({ turnId: await turnOf(p.call_id) ?? "", callId: p.call_id, output: outputFor(p), isError: false })));
+    lastBatch = batch;
+    clock += CALLER_MS;
+    const out = await o.D.apiToolResults(TENANT, agentId, session, batch);
+    must(out.unknown.length === 0, `results refused: ${show(out)}`);
+    submissions++;
+  };
+  const proto = PiAgent.prototype as any, resume = proto.resumeClientCalls;
+  if (opts.answerInWindow) {
+    proto.resumeClientCalls = async function (this: unknown) {
+      const r = await resume.call(this);
+      if (!r && pendingClientCalls(o.raw.sql as never, session).length) { inWindow++; await answerAll(); }
+      return r;
+    };
+  }
+  if (opts.steer) o.hooks.beforeAnswer = async () => { await o.D.runtime().postMessage(TENANT, agentId, opts.steer, "steer", session); };
+  try {
   for (const m of messages) {
     const sent = Date.now();
     await o.D.apiPostInput(TENANT, agentId, agentJson, session, m.text);
     for (let round = 0; round < 10; round++) {
       await o.settle(TENANT, agentId, m.script);
       const s = await status();
+      if (opts.answerInWindow && s.status !== "requires_action" && m.script.length && lastBatch.length) {
+        // Results kept inside a step are not stepped by the next wake: that step ends by marking its session idle
+        // (`AgentRuntime.step` markSession), over the mark the results set. The caller sending them again marks it.
+        const again = await o.D.apiToolResults(TENANT, agentId, session, lastBatch);
+        must(again.unknown.length === 0, show(again));
+        lastBatch = [];
+        continue;
+      }
       if (s.status !== "requires_action") break;
       if (opts.cancelWhilePaused) { clock += CALLER_MS; await o.D.apiCancelSession(TENANT, agentId, session); await o.settle(TENANT, agentId, m.script); break; }
-      const batch = await Promise.all(s.pending.map(async (p: any) => ({ turnId: await turnOf(p.call_id) ?? "", callId: p.call_id, output: outputFor(p), isError: false })));
-      clock += CALLER_MS;
-      const out = await o.D.apiToolResults(TENANT, agentId, session, batch);
-      must(out.unknown.length === 0, `results refused: ${show(out)}`);
-      submissions++;
+      if (opts.abandon) { clock += CALLER_MS; break; }
+      await answerAll();
     }
     marks.push({ sent, read: Date.now() });
     must(m.script.length === 0, `the script was not used up: ${show(m.script)}`);
   }
+  } finally { proto.resumeClientCalls = resume; }
   // A turn that ended leaves no record behind: the next message opens its own.
-  const left = o.raw.sql.exec("SELECT session FROM turn_timing").toArray();
+  const left = o.raw.sql.exec("SELECT * FROM turn_timing").toArray();
   must(left.length === 0, `a turn record outlived its turn: ${show(left)}`);
-  return { o, agentId, session, marks, submissions, timing: o.rows("turn.timing") };
+  return { o, agentId, session, marks, submissions, inWindow, timing: o.rows("turn.timing") };
 }
 
 type Row = ReturnType<ReturnType<typeof object>["rows"]>[number];
@@ -267,6 +309,62 @@ await check("a turn cancelled while it waits on the caller: one row, cancelled, 
   must(t.status === "cancelled" && t.verdict === "cancelled", show(t));
   must(t.attrs.clientPauses === 1 && near(t.attrs.clientWaitMs, CALLER_MS), show(t.attrs));
   must(t.attrs.modelJobs === 1 && t.ms === t.attrs.replyAt - t.attrs.inboundAt, show(t));
+});
+
+await check("results that land after the pausing step's resume looked: the turn is not closed early, and stays one row", async () => {
+  const r = await apiTurns("window", [{ text: "Please cancel order W1.", script: [...SEQ] }], { answerInWindow: true });
+  must(r.inWindow === 2, `control: both submissions landed in the window, not ${r.inWindow}`);
+  must(r.timing.length === 1, `rows: ${show(r.timing)}`);
+  const t = r.timing[0]!;
+  must(t.status === "completed" && t.attrs.modelJobs === 3, `closed early: ${show(t)}`);
+  wellFormed(t, r.marks[0]);
+});
+
+await check("a cancel with nothing running and nothing waiting writes no row, and forgets a record left there", async () => {
+  const r = await apiTurns("idlecancel", [{ text: "Hello.", script: [{ text: "Hi." }] }]);
+  must(r.timing.length === 1, show(r.timing));
+  // A record no turn owns, as one left by a message whose run was never seen ending.
+  turnInbound(r.o.raw.sql as never, r.session, Date.now(), { stale: false });
+  await r.o.D.apiCancelSession(TENANT, r.agentId, r.session);
+  await r.o.settle(TENANT, r.agentId, []);
+  must(r.o.rows("turn.timing").length === 1, `the cancel wrote a row: ${show(r.o.rows("turn.timing"))}`);
+  must(r.o.raw.sql.exec("SELECT * FROM turn_timing").toArray().length === 0, "the record was kept");
+});
+
+await check("new input to a turn the caller left waiting: that turn closes abandoned at the input, and the new one is its own", async () => {
+  const r = await apiTurns("abandon", [
+    { text: "Please cancel order W1.", script: [SEQ[0]!] },
+    { text: "Never mind.", script: [{ text: "OK." }] },
+  ], { abandon: true });
+  must(r.timing.length === 2, `rows: ${show(r.timing)}`);
+  const [old, next] = r.timing as [Row, Row];
+  must(old.status === "abandoned" && old.verdict === "failed", show(old));
+  must(old.attrs.clientPauses === 1 && near(old.attrs.clientWaitMs, CALLER_MS) && old.attrs.replyAt === next.attrs.inboundAt, show([old, next]));
+  must(next.status === "completed" && next.attrs.modelJobs === 1 && next.attrs.clientPauses === 0 && next.attrs.messages === 1, show(next));
+  wellFormed(next, r.marks[1]);
+});
+
+await check("a steer into a turn in flight joins it: one row, two messages", async () => {
+  const r = await apiTurns("steer", [{ text: "Hello.", script: [{ text: "Hi." }, { text: "Noted." }] }], { steer: "Also, order W2." });
+  must(r.timing.length === 1, `rows: ${show(r.timing)}`);
+  const t = r.timing[0]!;
+  must(t.attrs.messages === 2 && t.status === "completed", show(t));
+  wellFormed(t, r.marks[0]);
+});
+
+await check("a timing store that throws on every write fails nothing: the turn runs as it would, and writes no row", async () => {
+  // A table of the name with none of the columns: every read and write of the timing throws (and is logged).
+  const r = await apiTurns("broken", [{ text: "Please cancel order W1.", script: [...SEQ] }],
+    { prepare: (o) => o.raw.sql.exec("CREATE TABLE turn_timing(x)") });
+  must(r.submissions === 2 && r.timing.length === 0, show(r.timing));
+  const s = await r.o.D.apiSessionStatus(TENANT, r.agentId, r.session);
+  must(s.status === "idle", show(s));
+  const t = JSON.parse(await r.o.D.apiTranscript(TENANT, r.agentId, r.session));
+  const last = t.entries.filter((e: any) => e.type === "message").at(-1)?.message;
+  must(last?.role === "assistant" && JSON.stringify(last.content).includes("Order W1 is cancelled."), show(last));
+  const errs = r.o.raw.sql.exec("SELECT name FROM sqlite_master WHERE name = 'alarm_errors'").toArray().length
+    ? r.o.raw.sql.exec("SELECT message FROM alarm_errors").toArray() : [];
+  must(errs.length === 0, show(errs));
 });
 
 /** A τ² turn on the `/bench` object, whose tool runs in the object, with that tool taking TOOL_MS when `slow`. */

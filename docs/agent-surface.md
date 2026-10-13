@@ -666,8 +666,10 @@ and of a tenth of the others (`rebuilt`, `group`: `rebuilt`, `idle-not-rebuilt`,
 replaced conversation's last 12), `toolCalls`, `modelCalls`, `runMs` and `endedWith`. Numbers and flags only.
 A `turn.timing` row is one turn of a pi085 conversation (`src/runtime/turn-timing.ts`), written when it ends: from a
 message accepted by the agent to the reply it can read, across every pause for the caller's functions. `spanId` is
-`tt_<session>@<inboundAt>`, `ms` the turn's wall time, `status` pi's last run outcome (`completed`, `failed`, `aborted`)
-or `cancelled`. Its `attrs` hold the points — `inboundAt` (the message entered the agent), `saidAt` (durable in the
+`tt_<session>@<inboundAt>`, `ms` the turn's wall time, `status` pi's last run outcome (`completed`, `failed`, `aborted`),
+`cancelled` (a cancel that aborted a run or dropped waiting calls; one with neither writes no row), or `abandoned`
+(verdict `failed`: new input arrived while the turn waited on a call the caller never answered; the turn ends at that
+input, `replyAt`, and the input opens a new turn). Its `attrs` hold the points — `inboundAt` (the message entered the agent), `saidAt` (durable in the
 transcript), `turnStartAt` (the first step that drove it), `firstJobAt` (the first model job written), `lastAnswerAt`
 (the last answer delivered), `replyAt` (the step that saw the turn end returned) — and the split, whose first five
 add up to `ms` when every job was answered: `inboundToStartMs`, `startToFirstJobMs`, `modelMs` (each job, written to
