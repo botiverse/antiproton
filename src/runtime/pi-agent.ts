@@ -32,7 +32,8 @@ import { PiSqliteStorage, ensurePiTables, piTables, type SqlHost, MAIN_SESSION }
 import { recordRequestPrefix } from "./request-prefix.ts";
 import { offloadedProvider, type OffloadPort, type Answered } from "../model/pi-offloaded.ts";
 import { bridgeTools, harnessTools, type InterruptKeeping, type MountedTool, type ToolHost } from "./pi-tools.ts";
-import { answerClientCall, dropClientCalls, pendingClientCalls, resumeClientCalls } from "./client-calls.ts";
+import { answerClientCall, dropClientCalls, isClientTool, pendingClientCalls, resumeClientCalls } from "./client-calls.ts";
+import { timedTools, turnToolRan } from "./turn-timing.ts";
 import { CompactionUnavailable, type AgentEngine, type EngineEntry, type EngineEntryScan, type EngineStatus, type StepOutcome } from "./engine.ts";
 
 export type { StepOutcome } from "./engine.ts";
@@ -274,7 +275,13 @@ export class PiAgent implements AgentEngine {
       }],
     }));
 
-    const bridged = harnessTools(opts.tools, opts.toolHost, opts.interrupts, opts.extraTools);
+    // Each tool's time goes to the conversation's turn in flight (src/runtime/turn-timing.ts); the caller's functions
+    // are the turn's pause and are counted there instead.
+    const now = opts.now ?? Date.now;
+    const bridged = timedTools(harnessTools(opts.tools, opts.toolHost, opts.interrupts, opts.extraTools), {
+      skip: (t) => isClientTool(t), now,
+      ran: (ms) => turnToolRan(opts.host.sql, conversation, ms),
+    });
     const { harness, open } = await AgentHarness.create({
       session: session as any,
       models,

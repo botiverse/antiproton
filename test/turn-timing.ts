@@ -1,0 +1,332 @@
+/**
+ * One `turn.timing` trace row per turn of a pi085 conversation (src/runtime/turn-timing.ts): its points in order, its
+ * parts adding up to its wall time, and each summed part moved by what it claims to measure — a model that takes
+ * longer moves `modelMs`, a caller that takes longer moves `clientWaitMs`, a tool that takes longer moves `toolMs`,
+ * and nothing else.
+ *
+ * The whole `AgentDO` under node, as test/client-tool-alarms.ts runs it: a `cloudflare:workers` stand-in, a virtual
+ * clock that jumps to the armed alarm, D1 as node:sqlite with every migration, and the model answered at the queue
+ * (`takeJob` / `deliverAnswer`) from a script. The clock is the test's: the model's, the caller's and a tool's time are
+ * jumps of it, so each part has a known size.
+ */
+import { register } from "node:module";
+import { DatabaseSync } from "node:sqlite";
+import { readdirSync, readFileSync } from "node:fs";
+import { sqliteHost } from "../src/store/sqlite-host.ts";
+import { BenchState } from "../cf/src/bench.ts";
+import { timedTools } from "../src/runtime/turn-timing.ts";
+
+const STAND_IN = "export class DurableObject { constructor(ctx, env) { this.ctx = ctx; this.env = env; } }" +
+  " export class WorkerEntrypoint { constructor(ctx, env) { this.ctx = ctx; this.env = env; } }" +
+  " export class RpcTarget {} export const env = {};";
+register("data:text/javascript," + encodeURIComponent(
+  `export async function resolve(s, c, next) { if (s.startsWith("cloudflare:")) return { url: ${JSON.stringify("data:text/javascript," + encodeURIComponent(STAND_IN))}, shortCircuit: true }; return next(s, c); }`));
+const { AgentDO } = await import("../cf/src/index.ts");
+
+const results: Array<{ name: string; ok: boolean; error?: string }> = [];
+async function check(name: string, fn: () => Promise<void> | void) {
+  try { await fn(); results.push({ name, ok: true }); }
+  catch (e) { results.push({ name, ok: false, error: String((e as Error)?.stack ?? e) }); }
+}
+function must(cond: unknown, msg: string): asserts cond { if (!cond) throw new Error(msg); }
+const show = (v: unknown) => JSON.stringify(v);
+
+// Every read of the clock moves it a millisecond, so two reads are never equal and order is strict; the jumps below
+// are what a part is meant to measure, and SLACK bounds what the reads themselves add over a turn.
+let clock = Date.now();
+Date.now = () => ++clock;
+const SLACK = 400;
+/** How long the model takes to answer each call, the caller each submission, the slow tool each call. */
+const MODEL_MS = 3_000, CALLER_MS = 20_000, TOOL_MS = 7_000;
+
+function d1() {
+  const db = new DatabaseSync(":memory:");
+  const dir = new URL("../cf/migrations/", import.meta.url);
+  for (const f of readdirSync(dir).filter((n) => n.endsWith(".sql")).sort()) db.exec(readFileSync(new URL(f, dir), "utf8"));
+  const stmt = (q: string, b: unknown[] = []): any => ({
+    q, b,
+    bind: (...v: unknown[]) => stmt(q, v),
+    first: async () => (db.prepare(q).get(...(b as any[])) as any) ?? null,
+    all: async () => ({ results: db.prepare(q).all(...(b as any[])) }),
+    run: async () => ({ meta: { changes: Number(db.prepare(q).run(...(b as any[])).changes) } }),
+  });
+  return {
+    prepare: (q: string) => stmt(q),
+    batch: async (s: any[]) => s.map((x) => {
+      const read = x.q.trim().toUpperCase().startsWith("SELECT");
+      return { results: read ? db.prepare(x.q).all(...(x.b as any[])) : [], meta: { changes: read ? 0 : Number(db.prepare(x.q).run(...(x.b as any[])).changes) } };
+    }),
+  };
+}
+const control = d1();
+
+const BASE_DB = JSON.stringify({
+  users: {}, products: {},
+  orders: { "#W1": { order_id: "#W1", user_id: "u", address: {}, status: "pending", fulfillments: [], items: [], payment_history: [] } },
+});
+
+const USAGE = { input: 7, output: 3, cacheRead: 0, cacheWrite: 0, totalTokens: 10, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+type Reply = { calls: Array<{ id: string; name: string; arguments: Record<string, unknown> }> } | { text: string };
+/** An answer as the queue consumer delivers it, carrying its job id (src/model/pi-bridge.ts), which its model.call row joins by. */
+const answer = (r: Reply, jobId: string) => ({ jobId,
+  role: "assistant",
+  content: "text" in r ? [{ type: "text", text: r.text }] : r.calls.map((c) => ({ type: "toolCall", ...c })),
+  api: "openai-completions", provider: "deepseek", model: "deepseek-flash", usage: USAGE,
+  stopReason: "text" in r ? "stop" : "toolUse", timestamp: 0,
+});
+
+function object(name: string) {
+  const raw = sqliteHost();
+  const jobs: string[] = [];
+  const state = { alarmAt: null as number | null, alarms: 0 };
+  /** Trace rows the alarm passes exported (cf/src/trace-r2.ts), which the outbox then forgets. */
+  const exported = new Map<number, any>();
+  const ctx = {
+    storage: {
+      sql: raw.sql, transactionSync: raw.transactionSync,
+      getAlarm: async () => state.alarmAt,
+      setAlarm: async (at: number) => { state.alarmAt = at; },
+      deleteAlarm: async () => { state.alarmAt = null; },
+    },
+    blockConcurrencyWhile: async <R>(fn: () => Promise<R>) => fn(),
+    id: { toString: () => name }, getWebSockets: () => [], exports: {},
+  };
+  const env = {
+    MODEL_QUEUE: { send: async (m: { jobId: string }) => { jobs.push(m.jobId); } },
+    ARTIFACTS: {
+      put: async (key: string, body: Uint8Array) => {
+        if (key.startsWith("trace/")) {
+          for (const line of new TextDecoder().decode(body).split("\n").filter(Boolean)) { const r = JSON.parse(line); exported.set(r.seq, r); }
+        }
+        return {};
+      },
+      head: async () => null, list: async () => ({ objects: [] }),
+      get: async (key: string) => (key === "bench/tau2-db.json" ? { text: async () => BASE_DB } : null),
+    },
+    ARTIFACT_BUCKET: "b", CONTROL_DB: control, HARNESS_MODEL: "deepseek-flash",
+    DEEPSEEK_BASE_URL: "https://api.deepseek.com", DEEPSEEK_API_KEY: "dk-test",
+    SECRET_KEK: Buffer.alloc(32, 7).toString("base64"),
+  };
+  const D: any = new AgentDO(ctx as never, env as never);
+  /** Run until quiet: each queued model call answered after MODEL_MS, each alarm fired when due. */
+  const settle = async (tenantId: string, agentId: string, script: Reply[], max = 40) => {
+    for (;;) {
+      if (jobs.length) {
+        const id = jobs.shift()!;
+        const job = await D.takeJob(tenantId, agentId, id) as any;
+        if (!job || job.unknownJob) continue;
+        const next = script.shift();
+        must(next, "a model call the script has no reply for");
+        clock += MODEL_MS;
+        await D.deliverAnswer(tenantId, agentId, id, answer(next, id), MODEL_MS);
+        continue;
+      }
+      if (state.alarmAt === null) return;
+      must(state.alarms < max, `the object did not settle in ${max} alarms`);
+      clock = Math.max(clock, state.alarmAt);
+      state.alarmAt = null;
+      state.alarms++;
+      await D.alarm();
+      clock += 5;
+    }
+  };
+  /** Every trace row of `kind` written so far, exported or still in the outbox, in seq order. */
+  const rows = (kind: string) => {
+    const all = new Map(exported);
+    for (const r of raw.sql.exec("SELECT seq, kind, span_id, status, verdict, ms, attrs FROM trace_outbox ORDER BY seq").toArray() as any[]) {
+      all.set(Number(r.seq), { seq: Number(r.seq), kind: String(r.kind), spanId: String(r.span_id), status: String(r.status), verdict: String(r.verdict), ms: r.ms === null ? undefined : Number(r.ms), attrs: JSON.parse(String(r.attrs)) });
+    }
+    return [...all.values()].sort((a, b) => a.seq - b.seq).filter((r) => r.kind === kind)
+      .map((r) => ({ spanId: String(r.spanId), status: String(r.status), verdict: String(r.verdict), ms: r.ms === undefined ? null : Number(r.ms), attrs: r.attrs as Record<string, any> }));
+  };
+  return { D, raw, state, jobs, settle, rows };
+}
+
+const TENANT = "t-api";
+const FUNCS = [
+  { name: "lookup", description: "Look an order up.", parameters: { type: "object", properties: { id: { type: "string" } } } },
+  { name: "cancel", description: "Cancel an order.", parameters: { type: "object", properties: { id: { type: "string" } } } },
+];
+const AGENT = { name: "Clerk", instructions: "Help.", model: "default", metadata: {}, tools: FUNCS, createdAt: 1, updatedAt: 1 };
+const outputFor = (p: any) => (p.name === "lookup" ? "W1: pending" : "W1: cancelled");
+
+/**
+ * Customer messages over the API, each a turn: the message, the model's replies from `script`, and whenever the
+ * session waits on the caller, the caller's results after CALLER_MS. `cancelWhilePaused` cancels at the first pause.
+ */
+async function apiTurns(label: string, messages: Array<{ text: string; script: Reply[] }>, opts: { cancelWhilePaused?: boolean } = {}) {
+  const agentId = `a-${label}`, session = `sess_${label}`;
+  const o = object(`api:${TENANT}/${agentId}`);
+  const agentJson = JSON.stringify(AGENT);
+  await o.D.apiOpenSession(TENANT, agentId, agentJson, session);
+  const status = () => o.D.apiSessionStatus(TENANT, agentId, session);
+  const turnOf = async (callId: string) => (await status()).pending.find((p: any) => p.call_id === callId)?.turn_id;
+  const marks: Array<{ sent: number; read: number }> = [];
+  let submissions = 0;
+  for (const m of messages) {
+    const sent = Date.now();
+    await o.D.apiPostInput(TENANT, agentId, agentJson, session, m.text);
+    for (let round = 0; round < 10; round++) {
+      await o.settle(TENANT, agentId, m.script);
+      const s = await status();
+      if (s.status !== "requires_action") break;
+      if (opts.cancelWhilePaused) { clock += CALLER_MS; await o.D.apiCancelSession(TENANT, agentId, session); await o.settle(TENANT, agentId, m.script); break; }
+      const batch = await Promise.all(s.pending.map(async (p: any) => ({ turnId: await turnOf(p.call_id) ?? "", callId: p.call_id, output: outputFor(p), isError: false })));
+      clock += CALLER_MS;
+      const out = await o.D.apiToolResults(TENANT, agentId, session, batch);
+      must(out.unknown.length === 0, `results refused: ${show(out)}`);
+      submissions++;
+    }
+    marks.push({ sent, read: Date.now() });
+    must(m.script.length === 0, `the script was not used up: ${show(m.script)}`);
+  }
+  return { o, agentId, session, marks, submissions, timing: o.rows("turn.timing") };
+}
+
+type Row = ReturnType<ReturnType<typeof object>["rows"]>[number];
+const POINTS = ["inboundAt", "saidAt", "turnStartAt", "firstJobAt", "lastAnswerAt", "replyAt"] as const;
+const PARTS = ["inboundToStartMs", "startToFirstJobMs", "modelMs", "betweenJobsMs", "lastAnswerToReplyMs"] as const;
+
+/** The checks every row with a model call answers: points in order, the parts adding up to `ms`, the gaps from the points. */
+function wellFormed(r: Row, within?: { sent: number; read: number }) {
+  const a = r.attrs;
+  for (const p of POINTS) must(typeof a[p] === "number", `${p} missing: ${show(a)}`);
+  for (let i = 1; i < POINTS.length; i++) {
+    must(a[POINTS[i - 1]!] <= a[POINTS[i]!], `${POINTS[i - 1]} ${a[POINTS[i - 1]!]} after ${POINTS[i]} ${a[POINTS[i]!]}: ${show(a)}`);
+  }
+  if (within) must(within.sent <= a.inboundAt && a.replyAt <= within.read, `the turn's points are outside the caller's own: ${show(within)} ${show(a)}`);
+  must(r.ms === a.replyAt - a.inboundAt, `ms ${r.ms} is not reply − inbound: ${show(a)}`);
+  const sum = PARTS.reduce((s, k) => s + a[k], 0);
+  must(sum === r.ms, `the parts add to ${sum}, not ${r.ms}: ${show(a)}`);
+  must(a.inboundToStartMs === a.turnStartAt - a.inboundAt && a.startToFirstJobMs === a.firstJobAt - a.turnStartAt
+    && a.lastAnswerToReplyMs === a.replyAt - a.lastAnswerAt && a.prepMs === a.saidAt - a.inboundAt, `a gap is not its points' difference: ${show(a)}`);
+  must(a.betweenJobsMs >= a.toolMs + a.clientWaitMs, `the tools and the caller's waits are inside the time between jobs: ${show(a)}`);
+  must(a.engine === "pi085" && r.spanId === `tt_${a.session}@${a.inboundAt}`, show(r));
+  must(JSON.stringify(a).length < 1000, `attrs ${JSON.stringify(a).length} chars`);
+}
+const near = (v: number, want: number) => v >= want && v <= want + SLACK;
+
+const SEQ: Reply[] = [
+  { calls: [{ id: "c_lookup", name: "lookup", arguments: { id: "W1" } }] },
+  { calls: [{ id: "c_cancel", name: "cancel", arguments: { id: "W1" } }] },
+  { text: "Order W1 is cancelled." },
+];
+
+let seq: Awaited<ReturnType<typeof apiTurns>>;
+await check("an API turn with two caller functions in sequence: one row, ok, 3 jobs, 2 pauses, and the parts add up", async () => {
+  seq = await apiTurns("seq", [{ text: "Please cancel order W1.", script: [...SEQ] }]);
+  must(seq.submissions === 2, `submissions ${seq.submissions}`);
+  must(seq.timing.length === 1, `rows: ${show(seq.timing)}`);
+  const r = seq.timing[0]!;
+  must(r.status === "completed" && r.verdict === "ok", show(r));
+  wellFormed(r, seq.marks[0]);
+  const a = r.attrs;
+  must(a.session === "sess_seq" && a.modelJobs === 3 && a.clientPauses === 2 && a.messages === 1, show(a));
+});
+
+await check("…each part holds what moved it: the model's time in modelMs, the caller's in clientWaitMs, no tool time", () => {
+  const a = seq.timing[0]!.attrs;
+  must(near(a.modelMs, 3 * MODEL_MS), `modelMs ${a.modelMs}, want 3 × ${MODEL_MS}: ${show(a)}`);
+  must(near(a.clientWaitMs, 2 * CALLER_MS), `clientWaitMs ${a.clientWaitMs}, want 2 × ${CALLER_MS}: ${show(a)}`);
+  // The caller's functions are the pause, not tools that ran here.
+  must(a.toolMs === 0 && a.tools === 0, `the caller's functions were timed as tools: ${show(a)}`);
+  // Between the jobs is the caller's time and the passes around it, nothing the size of a model call.
+  must(near(a.betweenJobsMs, 2 * CALLER_MS), `betweenJobsMs ${a.betweenJobsMs}: ${show(a)}`);
+  for (const k of ["inboundToStartMs", "startToFirstJobMs", "lastAnswerToReplyMs", "prepMs"] as const) {
+    must(a[k] >= 0 && a[k] < SLACK, `${k} ${a[k]} holds a jump: ${show(a)}`);
+  }
+});
+
+await check("…and the model.call rows are as they were: one per job, their ms the job's own", () => {
+  const calls = seq.o.rows("model.call");
+  must(calls.length === 3 && calls.every((c) => near(c.ms ?? -1, MODEL_MS)), show(calls));
+  must(calls.reduce((s, c) => s + (c.ms ?? 0), 0) === seq.timing[0]!.attrs.modelMs, "modelMs is not the model.call rows' sum");
+});
+
+await check("two customer messages: two turns, two rows with their own span ids, each well formed", async () => {
+  const r = await apiTurns("two", [
+    { text: "Hello.", script: [{ text: "Hi." }] },
+    { text: "Please cancel order W1.", script: [...SEQ] },
+  ]);
+  must(r.timing.length === 2, `rows: ${show(r.timing)}`);
+  must(r.timing[0]!.spanId !== r.timing[1]!.spanId, show(r.timing));
+  wellFormed(r.timing[0]!, r.marks[0]); wellFormed(r.timing[1]!, r.marks[1]);
+  must(r.timing[0]!.attrs.modelJobs === 1 && r.timing[0]!.attrs.betweenJobsMs === 0 && r.timing[0]!.attrs.clientPauses === 0, show(r.timing[0]));
+  must(r.timing[1]!.attrs.modelJobs === 3 && r.timing[1]!.attrs.clientPauses === 2, show(r.timing[1]));
+  must(r.timing[0]!.attrs.replyAt < r.timing[1]!.attrs.inboundAt, "the second turn began before the first ended");
+});
+
+await check("a turn cancelled while it waits on the caller: one row, cancelled, its pause counted up to the cancel", async () => {
+  const r = await apiTurns("cancel", [{ text: "Please cancel order W1.", script: [SEQ[0]!] }], { cancelWhilePaused: true });
+  must(r.timing.length === 1, `rows: ${show(r.timing)}`);
+  const t = r.timing[0]!;
+  must(t.status === "cancelled" && t.verdict === "cancelled", show(t));
+  must(t.attrs.clientPauses === 1 && near(t.attrs.clientWaitMs, CALLER_MS), show(t.attrs));
+  must(t.attrs.modelJobs === 1 && t.ms === t.attrs.replyAt - t.attrs.inboundAt, show(t));
+});
+
+/** A τ² turn on the `/bench` object, whose tool runs in the object, with that tool taking TOOL_MS when `slow`. */
+async function benchTurn(engine: "pi085" | "pd", slow: boolean) {
+  const taskId = `t_${engine}_${slow ? "slow" : "fast"}`;
+  const o = object(`bench-${taskId}`);
+  const started = await o.D.benchStart(taskId, "policy", true, engine === "pd" ? "pd" : undefined);
+  must((started.engine ?? "pi085") === engine, show(started));
+  // The retail tool reads its task's state first: the slow tool's time is spent there, inside the call.
+  const proto = BenchState.prototype as any, state = proto.state;
+  if (slow) proto.state = async function (this: unknown, id: string) { clock += TOOL_MS; return state.call(this, id); };
+  try {
+    await o.D.benchSay(taskId, "hello");
+    await o.settle("bench", `b_${taskId}`, [
+      { calls: [{ id: "c_get", name: "retail__get_order_details", arguments: { order_id: "#W1" } }] },
+      { text: "It is pending." },
+    ]);
+  } finally { proto.state = state; }
+  const poll = await o.D.benchPoll(taskId);
+  must(poll.status === "idle" && poll.answer === "It is pending.", show(poll));
+  return o.rows("turn.timing");
+}
+
+let fast: Row[];
+await check("a /bench turn whose tool runs in the object: one row, 2 jobs, 1 tool, no pause", async () => {
+  fast = await benchTurn("pi085", false);
+  must(fast.length === 1, `rows: ${show(fast)}`);
+  wellFormed(fast[0]!);
+  const a = fast[0]!.attrs;
+  must(a.modelJobs === 2 && a.tools === 1 && a.clientPauses === 0 && a.clientWaitMs === 0 && a.toolMs < SLACK, show(a));
+});
+
+await check("…the same turn with the tool taking 7 s: toolMs moves by 7 s, and betweenJobsMs with it; modelMs does not", async () => {
+  const slow = await benchTurn("pi085", true);
+  must(slow.length === 1, `rows: ${show(slow)}`);
+  wellFormed(slow[0]!);
+  const a = slow[0]!.attrs, b = fast[0]!.attrs;
+  must(near(a.toolMs, TOOL_MS) && a.tools === 1, `toolMs ${a.toolMs}, want ${TOOL_MS}: ${show(a)}`);
+  must(b.betweenJobsMs < SLACK && near(a.betweenJobsMs, TOOL_MS), `betweenJobsMs ${a.betweenJobsMs}, without the delay ${b.betweenJobsMs}`);
+  must(Math.abs(a.modelMs - b.modelMs) < SLACK, `modelMs moved: ${a.modelMs} vs ${b.modelMs}`);
+});
+
+await check("pd writes no turn.timing row: its turn ends inside the harness, where no step sees it", async () => {
+  const rows = await benchTurn("pd", false);
+  must(rows.length === 0, show(rows));
+});
+
+await check("a timed tool is the same tool to the model: every field but execute is the original's, and a skipped one is untouched", async () => {
+  class Tool { name: string; constructor(name: string) { this.name = name; } label = "L"; description = "D"; parameters = { type: "object" }; async execute(x: number) { return { n: x, self: this.name }; } }
+  const a = new Tool("a"), b = new Tool("b");
+  const ran: number[] = [];
+  const [ta, tb] = timedTools([a, b], { skip: (t) => t === b, ran: (ms) => ran.push(ms), now: Date.now });
+  must(tb === b && ta !== a && Object.getPrototypeOf(ta) === Tool.prototype, "the copy or the skip");
+  for (const k of ["name", "label", "description", "parameters"] as const) must(ta![k] === a[k], `${k} differs`);
+  // A class's execute is on its prototype; the copy carries its own, and nothing else is added or lost.
+  must(show(Object.keys(ta!).filter((k) => k !== "execute")) === show(Object.keys(a)), show(Object.keys(ta!)));
+  const out = await ta!.execute(3);
+  must(show(out) === show({ n: 3, self: "a" }) && ran.length === 1, show([out, ran]));
+  const thrower = timedTools([{ name: "t", async execute() { throw new Error("no"); } }], { skip: () => false, ran: (ms) => ran.push(ms), now: Date.now })[0]!;
+  const err = await thrower.execute!().then(() => null, (e: Error) => e.message);
+  must(err === "no" && ran.length === 2, `a throwing tool: ${err}, timed ${ran.length}`);
+});
+
+for (const r of results) console.log(`${r.ok ? "PASS" : "FAIL"}  ${r.name}${r.ok ? "" : `\n${r.error}`}`);
+const passed = results.filter((r) => r.ok).length;
+console.log(`\n${passed}/${results.length} passed`);
+process.exit(passed === results.length ? 0 : 1);

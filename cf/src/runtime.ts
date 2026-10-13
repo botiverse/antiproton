@@ -15,7 +15,7 @@ import { operatorRefFor, providerOfRef, type OperatorModel } from "../../src/mod
 import { DEFAULT_PROVIDER, providerFor, type ModelChoice, type ModelProviders } from "../../src/model/providers.ts";
 import { DurableObjectStore } from "../../src/store/durable-object.ts";
 import { DynamicWorkerExecutor } from "../../src/runtime/dynamic-worker-executor.ts";
-import type { AgentEngine } from "../../src/runtime/engine.ts";
+import type { AgentEngine, StepOutcome } from "../../src/runtime/engine.ts";
 import { PiAgent, ensureAgentTables, jobSession, sessionsWithWork, markSession, mainBusy } from "../../src/runtime/pi-agent.ts";
 import { DurableAgent, PdHost, recordedEngine } from "../../src/runtime/durable-agent.ts";
 import { busyReason, clientCallsWaiting, migrateToPd, revertToPi085, type MigrationResult, type RevertResult } from "../../src/runtime/pd-migrate.ts";
@@ -54,6 +54,7 @@ import { toolConfigOf, type ToolConfig } from "../../src/core/tool-config.ts";
 import {
   answerClientCall, clientTools, pendingClientCalls,
 } from "../../src/runtime/client-calls.ts";
+import { closeTurn, openTurn, turnInbound, turnNotSaid, turnPaused, turnResumed, turnSaid, turnStepStart } from "../../src/runtime/turn-timing.ts";
 
 export { ASSUMED_CONTEXT_WINDOW } from "../../src/model/context-windows.ts";
 
@@ -3554,8 +3555,13 @@ export class AgentRuntime {
     tenantId: string, agentId: string, text: string,
     mode: "prompt" | "steer" | "followUp" = "prompt",
     session: string = MAIN_SESSION,
-    opts: { retake?: "await" | "background"; beforeSay?: () => void; pendingOnly?: true } = {},
+    opts: {
+      retake?: "await" | "background"; beforeSay?: () => void; pendingOnly?: true;
+      /** When the object took the message in, for the turn's timing (src/runtime/turn-timing.ts); now when absent. */
+      receivedAt?: number;
+    } = {},
   ) {
+    const inboundAt = opts.receivedAt ?? Date.now();
     // Before anything awaits a plugin or the model: the first turn closes the seeded workspace, whichever route it
     // came by (an inbound push already did, when it was accepted).
     await this.ready();
@@ -3608,6 +3614,18 @@ export class AgentRuntime {
       if (told) await this.store.returnSeedNotices(tenantId, agentId, told.rows).catch(() => {});
       if (moved) returnContextChange(this.#deps.ctx.storage.sql, moved.owner, moved.conversation, moved.change);
     };
+    // The turn this message opens or joins (src/runtime/turn-timing.ts), pi085 only. A record left by a turn that is
+    // over — its lane idle, nothing waiting on the caller — is replaced rather than joined. A follow-up opens none: on
+    // an idle lane it starts no run (as for the notices above). Read before the briefing is taken below, so no await
+    // falls between that and the write. A reading: a failure is logged and the message is written all the same.
+    const timing = this.#isPd() ? null : this.#deps.ctx.storage.sql;
+    let prior = false, stale = false;
+    if (timing) {
+      try {
+        prior = openTurn(timing, session) !== null;
+        stale = prior && !(await agent.running()) && pendingClientCalls(timing, session).length === 0;
+      } catch (e) { console.error(`reading ${tenantId}/${agentId}#${session}'s turn timing failed:`, e); }
+    }
     // A rebuilt transcript's briefing not yet posted is the first thing it holds, whichever post comes first: taken
     // here, in the synchronous step before the write, and put back if the write does not happen.
     // A follow-up starts no run on an idle lane (as for the notices above), and a lane owed a briefing is idle: carried
@@ -3624,6 +3642,14 @@ export class AgentRuntime {
       await giveBack();
       if (brief !== null) returnPendingBriefing(this.#deps.ctx.storage.sql, brief);
     };
+    // Written synchronously before the engine's write, like the queued row below, and taken back if it does not happen.
+    let opened = false, timed = false;
+    const timingSafe = (what: string, fn: () => void) => {
+      try { fn(); } catch (e) { console.error(`${what} ${tenantId}/${agentId}#${session}'s turn timing failed:`, e); }
+    };
+    if (timing && (mode !== "followUp" || (prior && !stale))) {
+      timingSafe("opening", () => { opened = turnInbound(timing, session, inboundAt, { stale }); timed = true; });
+    }
     // Synchronously before the engine's write, with the harness already open: what a caller retires here
     // (`deliverPendingInbound`'s queued row) is gone exactly when the message is about to be written.
     opts.beforeSay?.();
@@ -3632,8 +3658,12 @@ export class AgentRuntime {
       res = await agent.say(lines.length ? `${lines.join("\n")}\n\n${body}` : body, mode);
     } catch (e) {
       // A post that throws wrote nothing (the rule `deliverPendingInbound` retries by), so the notices were not said.
+      if (timing && timed) timingSafe("taking back", () => turnNotSaid(timing, session, opened));
       await giveAllBack();
       throw e;
+    }
+    if (timing && timed) {
+      timingSafe("recording", () => (res?.ok === false ? turnNotSaid(timing, session, opened) : turnSaid(timing, session, Date.now())));
     }
     if (res?.ok === false) await giveAllBack();
     // The notices' exact text, so a rebuild's briefing can quote this message without them (src/runtime/overflow-backstop.ts
@@ -3715,6 +3745,12 @@ export class AgentRuntime {
     if ((await agent.dropClientCalls()) > 0 && !cancelledTurn) {
       await agent.markCancelled(TURN_CANCELLED);
     }
+    // The turn ends here, whether a run was aborted or it was waiting on the caller: no later step sees it end.
+    if (!this.#isPd()) {
+      this.#turnTiming(tenantId, agentId, "cancelling", () => {
+        closeTurn(sql, { tenantId, agentId, session, replyAt: Date.now(), status: "cancelled" });
+      });
+    }
     const jobs = await stopSessionJobs({
       sql, owner: { tenantId, agentId }, session,
       cancel: (job) => this.#gateway.cancelBackground(
@@ -3764,6 +3800,10 @@ export class AgentRuntime {
     ensureAgentTables(sql);
     for (const r of results) answerClientCall(sql, session, r.callId, { output: r.output, isError: r.isError });
     markSession(sql, session, true);
+    // The caller's part of the turn ends when nothing is left waiting on it (src/runtime/turn-timing.ts).
+    this.#turnTiming(tenantId, agentId, "resuming", () => {
+      if (!pendingClientCalls(sql, session).length) turnResumed(sql, session, Date.now());
+    });
     return { unknown: [] };
   }
 
@@ -3807,6 +3847,8 @@ export class AgentRuntime {
     let open = 0, wakeInMs: number | null = bg.wakeInMs;
     const settled: Array<{ operationId: string; status: string }> = [];
     for (const session of sessions) {
+      // The first step after a message is its turn's start (src/runtime/turn-timing.ts), opening the harness included.
+      if (!pd) this.#turnTiming(tenantId, agentId, "starting", () => turnStepStart(sql, session, Date.now()));
       const agent = await this.agent(tenantId, agentId, session);
       let out = await agent.step();
       // A turn paused for an API caller's function results continues once they
@@ -3831,6 +3873,7 @@ export class AgentRuntime {
         const rebuilt = await this.#overflowBackstop(tenantId, agentId);
         if (rebuilt) out = { ...rebuilt, settled: [...out.settled, ...rebuilt.settled] };
       }
+      if (!pd) this.#turnTiming(tenantId, agentId, "ending", () => this.#turnStepEnd(tenantId, agentId, session, out));
       open += out.open;
       settled.push(...out.settled);
       if (out.wakeInMs !== null) wakeInMs = wakeInMs === null ? out.wakeInMs : Math.min(wakeInMs, out.wakeInMs);
@@ -3866,6 +3909,25 @@ export class AgentRuntime {
       }
     }
     return { open, wakeInMs, settled, releaseFailed };
+  }
+
+  /**
+   * Where a pi085 step left the conversation's turn (src/runtime/turn-timing.ts): still running, paused for the caller's
+   * functions, or over, when a run ended in this step with nothing left waiting — then its `turn.timing` row is written.
+   * A step that ended no run and left none open closes nothing: the run it would close was not seen ending here, and a
+   * record left that way is replaced by the next message (`postMessage`).
+   */
+  #turnStepEnd(tenantId: string, agentId: string, session: string, out: StepOutcome) {
+    const sql = this.#deps.ctx.storage.sql;
+    if (out.open > 0) return;
+    if (pendingClientCalls(sql, session).length) { turnPaused(sql, session, Date.now()); return; }
+    if (!out.settled.length) return;
+    closeTurn(sql, { tenantId, agentId, session, replyAt: Date.now(), status: out.settled[out.settled.length - 1]!.status });
+  }
+
+  /** A turn timing write: a reading, so a failure is logged and never fails what it measures. */
+  #turnTiming(tenantId: string, agentId: string, what: string, fn: () => void) {
+    try { fn(); } catch (e) { console.error(`${what} the turn timing of ${tenantId}/${agentId} failed:`, e); }
   }
 
   /**
