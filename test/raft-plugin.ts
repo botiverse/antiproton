@@ -2323,7 +2323,7 @@ await check("an inbox notice reaches the agent as Raft wrote it, with the one in
   if (!longWide.deliver || longWide.text.length > 4000 || !longWide.text.startsWith(wakeInstruction("r".repeat(24)))) throw new Error(`length ${longWide.deliver ? longWide.text.length : "-"}`);
 });
 
-await check("the wake says messages to the agent are requests, names the read and send tools as the model sees them, and says plain closing text goes nowhere", () => {
+await check("the wake says messages to the agent are requests, names the read and send tools as the model sees them, and says plain closing text goes nowhere", async () => {
   const w = wakeInstruction("raft");
   if (!/^Messages addressed to you \(DMs, @mentions, threads you are in\) are requests to you\./.test(w)) throw new Error(`who is talking is not said first: ${w}`);
   if (!w.includes("`raft__receive_events`") || !w.includes("`raft__messages_send`") || !w.includes("`replyTarget`")) throw new Error(w);
