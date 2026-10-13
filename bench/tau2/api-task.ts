@@ -157,7 +157,9 @@ async function converse(task: any, d: ApiTaskDeps, t0: number, agentId: string, 
 
   const sim: SimMessage[] = [{ role: "system", content: simSystem(task, d.guidelines) }];
   let agentSaid = OPENING;
-  let turns = 0, simCalls = 0, simMs = 0, ended = "max_turns";
+  let turns = 0, simCalls = 0, simMs = 0, toolExecMs = 0, ended = "max_turns";
+  // When each turn's answer reached this process (epoch ms), to align with the server's replyAt.
+  const replyAts: number[] = [];
   let simLast = "";
   let stall: string | undefined;
   let stallWhy: StallEvidence | undefined;
@@ -185,7 +187,9 @@ async function converse(task: any, d: ApiTaskDeps, t0: number, agentId: string, 
     while (outcome?.kind === "actions") {
       const results: Array<Record<string, unknown>> = [];
       for (const call of outcome.calls) {
+        const toolT0 = Date.now();
         const r = await runRetailCall(call, db, performed);
+        toolExecMs += Date.now() - toolT0;
         answered.add(call.call_id);
         results.push({ type: "agent.session.input.tool_result", turn_id: call.turn_id, call_id: call.call_id, ...r });
       }
@@ -193,6 +197,7 @@ async function converse(task: any, d: ApiTaskDeps, t0: number, agentId: string, 
       outcome = await waitForTurn(seen, deadline, start, waitDeps, answered);
     }
     if (outcome?.kind === "answer") {
+      replyAts.push(Date.now());
       seen = outcome.seen;
       if (d.deafSetting === "socket") d.deafness.spend();
       agentSaid = outcome.text;
@@ -238,7 +243,7 @@ async function converse(task: any, d: ApiTaskDeps, t0: number, agentId: string, 
     reward: dbMatch && actionMatch ? 1 : 0, dbMatch, actionMatch, ended, stall, stallWhy,
     simLast: simLast.slice(0, SIM_LAST_MAX),
     ...(dropInfo.length ? { dropInfo } : {}),
-    delivered, turns: turns - 1, simCalls, simMs,
+    delivered, turns: turns - 1, simCalls, simMs, replyAts, toolExecMs,
     usage: figures.usage, kinds, byTool: figures.byTool, toolErrors: figures.toolErrors,
     seconds: Math.round((Date.now() - t0) / 1000),
     expectedWrites: expected.map((e) => e.name),

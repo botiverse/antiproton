@@ -358,14 +358,14 @@ const BENCH_FIELDS = ["bench", "base", "build", "driver", "object", "engine", "o
   "tasks", "trials", "order", "startedAt", "results", "passAllKTrials", "passFirstKTrials", "tools", "endingsAllRows",
   "failingRowsByEndingAndCause", "activity", "written"];
 const BENCH_ROW = ["id", "taskId", "engine", "object", "activity", "reward", "dbMatch", "actionMatch", "ended", "stall", "stallWhy",
-  "simLast", "delivered", "turns", "simCalls", "simMs", "usage", "kinds", "byTool", "toolErrors", "seconds", "expectedWrites", "performedWrites",
+  "simLast", "delivered", "turns", "simCalls", "simMs", "replyAts", "toolExecMs", "usage", "kinds", "byTool", "toolErrors", "seconds", "expectedWrites", "performedWrites",
   "expectedArgs", "performedArgs", "trial"];
 const act = (ms: number) => ({ activeMs: ms, summedMs: ms, pollMs: 0, invocations: 1, spanMs: ms, byKind: [{ kind: "step", n: 1, ms }] });
 const row = (id: number, trial: number, reward: number, provider: unknown) => ({
   id, taskId: `sess_${id}`, agentId: `agent_${id}`, sessionId: `sess_${id}`, engine: "pi085", object: `api:bench/agent_${id}`,
   activity: act(100), provider, reward, dbMatch: !!reward, actionMatch: !!reward, ended: reward ? "stop" : "transfer",
   stall: undefined, stallWhy: undefined, simLast: "Thanks ###STOP###", delivered: { push: 1, poll: 0, pollAnswered: 0, pollFailed: 0, dropped: 0 },
-  turns: 2, simCalls: 3, simMs: 4500, usage: { prompt: 1, completion: 1, calls: 1 }, kinds: { message: 1 }, byTool: { retail__x: 1 }, toolErrors: 0,
+  turns: 2, simCalls: 3, simMs: 4500, replyAts: [1790000000000], toolExecMs: 120, usage: { prompt: 1, completion: 1, calls: 1 }, kinds: { message: 1 }, byTool: { retail__x: 1 }, toolErrors: 0,
   seconds: 5, expectedWrites: [], performedWrites: [], expectedArgs: [], performedArgs: [], trial,
 });
 const LUNA = { name: "openai/gpt-5.6-luna", endpoint: "gateway.ai.cloudflare.com" };

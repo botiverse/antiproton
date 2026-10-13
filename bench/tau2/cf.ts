@@ -165,6 +165,8 @@ async function runTask(task: any) {
 
   let agentSaid = OPENING;
   let turns = 0, simCalls = 0, simMs = 0, ended = "max_turns";
+  // When each turn's answer reached this process (epoch ms), to align with the server's replyAt.
+  const replyAts: number[] = [];
   let simLast = "";
   let stall: string | undefined;
   // The values that cause was decided from, so a record can be re-decided rather than believed.
@@ -201,6 +203,7 @@ async function runTask(task: any) {
       break;
     }
     if (DEAFNESS === "socket") deafness.spend();
+    replyAts.push(Date.now());
     agentSaid = answered;
     if (VERBOSE) console.log(`    agent > ${answered.replace(/\s+/g, " ").slice(0, 130)}`);
   }
@@ -218,7 +221,7 @@ async function runTask(task: any) {
     reward: dbMatch && actionMatch ? 1 : 0, dbMatch, actionMatch, ended, stall, stallWhy,
     simLast: simLast.slice(0, SIM_LAST_MAX),
     delivered: delivered.get(taskId) ?? { push: 0, poll: 0, pollAnswered: 0, pollFailed: 0, dropped: 0 },
-    turns: turns - 1, simCalls, simMs,
+    turns: turns - 1, simCalls, simMs, replyAts, toolExecMs: 0, // this runner's tools run in the object, not here
     usage: res.usage ?? {}, kinds: res.kinds ?? {}, byTool: res.byTool ?? {}, toolErrors: res.toolErrors ?? null,
     seconds: Math.round((Date.now() - t0) / 1000),
     expectedWrites: expected.map((e) => e.name),
