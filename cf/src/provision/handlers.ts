@@ -36,6 +36,7 @@ import type { ModelChoices } from "../control-plane.ts";
 import { resolveModel } from "../model-request.ts";
 import { optionFor, type UserModels } from "../../../src/model/user-models.ts";
 import type { ModelChoice } from "../../../src/model/providers.ts";
+import { tenantUsage, type ProvisionUsage } from "./usage.ts";
 
 export type ProvisionTool = "enable_push" | "disable_push";
 
@@ -123,6 +124,8 @@ export interface ProvisionDeps {
   surface?: SurfaceDeps;
   /** The model routes (`modelRoute`). Absent: they answer 404, as on a deployment that never had them. */
   models?: ProvisionModels;
+  /** The tenant's spend and daily limit (`GET /usage`, ./usage.ts). Absent: it answers 404. */
+  usage?: ProvisionUsage;
   /**
    * An evaluation's setup, in the agent's own object (cf/src/index.ts, behind EVAL_SEED_ROUTES). Absent: every
    * route of it answers 404, as on a deployment that never had them.
@@ -318,6 +321,13 @@ export async function handleProvision(
     const tenant = tenantFor(who, headers.raftServerId);
     if (isFail(tenant)) return fail(tenant);
     return ok(await modelList(tenant, deps.models));
+  }
+  if (seg[0] === "usage" && seg.length === 1 && method === "GET") {
+    if (!deps.usage) return null;
+    const tenant = tenantFor(who, headers.raftServerId);
+    if (isFail(tenant)) return fail(tenant);
+    const answer = await tenantUsage(tenant, query, deps.usage, deps.now());
+    return typeof answer === "string" ? fail({ status: 400, code: "invalid", message: answer }) : ok(answer);
   }
   if (seg[0] !== "agents") return null;
   // On POST the body names the server; elsewhere the URL does.

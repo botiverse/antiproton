@@ -146,6 +146,7 @@
     "test/eval-seed.ts",
     "test/eval-seed-object.ts",
     "test/provision-model.ts",
+    "test/provision-usage.ts",
     "test/admin-fail-closed.ts",
     "test/eval-read.ts",
     "test/rebuild-shadow.ts"

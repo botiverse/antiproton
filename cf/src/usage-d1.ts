@@ -352,30 +352,84 @@ export async function readUsageCosts(db: D1Database, from: number, to: number, b
      ) GROUP BY tenant_id, at, resource, key, unit ORDER BY tenant_id, at, resource, key, unit`,
   ).bind(from, to, from, to).all();
   const prices = await usagePrices(db);
-  const tenants = new Map<string, Map<number, Map<string, { cost: number; unpriced: Set<string> }>>>();
+  const tenants = new Map<string, LedgerRow[]>();
   for (const r of results as any[]) {
-    const row = { bucket: Number(r.at), resource: String(r.resource), key: String(r.key), unit: String(r.unit) };
+    const list = tenants.get(String(r.tenant_id)) ?? [];
+    tenants.set(String(r.tenant_id), list);
+    list.push(ledgerRow(r));
+  }
+  return [...tenants.entries()].map(([tenantId, rows]) => ({ tenantId, ...costsByPeriod(rows, prices, bucket) }));
+}
+
+/** One tenant's costs as its own views count them (`readTenantCosts`): by period, and by agent over the whole window. */
+export interface OwnCosts {
+  total: number;
+  periods: TenantCosts["periods"];
+  agents: Array<{ agentId: string; total: number }>;
+}
+
+/**
+ * One tenant's estimated cost over `from <= t < to`, by day or UTC month and resource, and by agent: the tenant's
+ * own view (`GET /provision/usage`, cf/src/provision/usage.ts). Priced exactly as `readUsageCosts` prices, so the
+ * two agree row for row, but scoped to the tenant in the query itself and without `UNACCEPTED_TOKENS`: an answer
+ * no job accepted is our cost, never the tenant's, as in every tenant view and in the tenant's daily limit
+ * (cf/src/spend-limit.ts `readDaySpend`).
+ */
+export async function readTenantCosts(db: D1Database, tenantId: string, from: number, to: number, bucket: "day" | "month"): Promise<OwnCosts> {
+  const { results } = await db.prepare(
+    `SELECT agent_id, at, resource, key, unit, SUM(quantity) AS quantity FROM (
+       SELECT agent_id, hour AS at, resource, key, unit, quantity FROM usage_hourly WHERE tenant_id = ? AND hour >= ? AND hour < ?
+       UNION ALL
+       SELECT agent_id, day AS at, resource, key, unit, quantity FROM usage_daily WHERE tenant_id = ? AND day >= ? AND day < ?
+     ) WHERE resource <> ? GROUP BY agent_id, at, resource, key, unit ORDER BY at, resource, key, unit, agent_id`,
+  ).bind(tenantId, from, to, tenantId, from, to, UNACCEPTED_TOKENS).all();
+  const prices = await usagePrices(db);
+  const rows = (results as any[]).map(ledgerRow);
+  const agents = new Map<string, number>();
+  for (const r of rows) {
+    const p = priceFor(prices, { bucket: r.at, resource: r.resource, key: r.key, unit: r.unit });
+    agents.set(r.agentId, (agents.get(r.agentId) ?? 0) + (p === null ? 0 : p * r.quantity));
+  }
+  return {
+    ...costsByPeriod(rows, prices, bucket),
+    agents: [...agents.entries()].map(([agentId, total]) => ({ agentId, total: tidy(total) }))
+      .sort((a, b) => b.total - a.total || (a.agentId < b.agentId ? -1 : a.agentId > b.agentId ? 1 : 0)),
+  };
+}
+
+interface LedgerRow { agentId: string; at: number; resource: string; key: string; unit: string; quantity: number }
+const ledgerRow = (r: any): LedgerRow => ({
+  agentId: r.agent_id === undefined ? "" : String(r.agent_id), at: Number(r.at),
+  resource: String(r.resource), key: String(r.key), unit: String(r.unit), quantity: Number(r.quantity),
+});
+
+/** Float sums of per-row products carry noise past the tenth decimal; a dollar figure does not need it. */
+const tidy = (n: number) => Math.round(n * 1e10) / 1e10;
+
+/**
+ * Ledger rows priced each at its own `at` — an hourly row at its hour, a folded day at its day — and only then
+ * summed into periods, so a price change inside a day prices this as the tenant's hourly view prices it, and a
+ * fold does not move a total. The one fold both the operator's and the tenant's cost views go through.
+ */
+function costsByPeriod(rows: readonly LedgerRow[], prices: readonly UsagePrice[], bucket: "day" | "month"): Omit<TenantCosts, "tenantId"> {
+  const periods = new Map<number, Map<string, { cost: number; unpriced: Set<string> }>>();
+  for (const r of rows) {
+    const row = { bucket: r.at, resource: r.resource, key: r.key, unit: r.unit };
     const p = priceFor(prices, row);
-    const periods = tenants.get(String(r.tenant_id)) ?? new Map();
-    tenants.set(String(r.tenant_id), periods);
     const start = periodStart(row.bucket, bucket);
     const resources = periods.get(start) ?? new Map();
     periods.set(start, resources);
     const c = resources.get(row.resource) ?? { cost: 0, unpriced: new Set<string>() };
     resources.set(row.resource, c);
     if (p === null) c.unpriced.add(`${row.key} ${row.unit}`);
-    else c.cost += p * Number(r.quantity);
+    else c.cost += p * r.quantity;
   }
-  // Float sums of per-row products carry noise past the tenth decimal; a dollar figure does not need it.
-  const tidy = (n: number) => Math.round(n * 1e10) / 1e10;
-  return [...tenants.entries()].map(([tenantId, periods]) => {
-    const list = [...periods.entries()].sort(([a], [b]) => a - b).map(([start, resources]) => {
-      const rs = [...resources.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
-        .map(([resource, c]) => ({ resource, cost: tidy(c.cost), unpriced: [...c.unpriced].sort() }));
-      return { start, total: tidy(rs.reduce((a, r) => a + r.cost, 0)), resources: rs };
-    });
-    return { tenantId, total: tidy(list.reduce((a, p) => a + p.total, 0)), periods: list };
+  const list = [...periods.entries()].sort(([a], [b]) => a - b).map(([start, resources]) => {
+    const rs = [...resources.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+      .map(([resource, c]) => ({ resource, cost: tidy(c.cost), unpriced: [...c.unpriced].sort() }));
+    return { start, total: tidy(rs.reduce((a, r) => a + r.cost, 0)), resources: rs };
   });
+  return { total: tidy(list.reduce((a, p) => a + p.total, 0)), periods: list };
 }
 
 const LOCAL = "CREATE TABLE IF NOT EXISTS usage_sent (id INTEGER PRIMARY KEY CHECK (id = 1), through_seq INTEGER NOT NULL)";

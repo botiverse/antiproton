@@ -161,13 +161,15 @@ resolved against anything outside the agent's own three roots.
 ## The Raft provider binding
 
 The same three reads for an agent a Raft server provisioned, with the provider token
-(`Authorization: Bearer <provider token>`), addressed the way every other provider route is:
+(`Authorization: Bearer <provider token>`), addressed the way every other provider route is, and one
+read of the tenant as a whole:
 
 | Method | Path |
 |---|---|
 | `GET` | `/provision/agents/{agentId}/usage?from=&to=&bucket=` |
 | `GET` | `/provision/agents/{agentId}/workspace-files?dirPath=&includeHidden=` |
 | `GET` | `/provision/agents/{agentId}/workspace-files/read?path=` |
+| `GET` | `/provision/usage?from=&to=&bucket=day\|month` — the tenant's spend and daily limit ([below](#the-tenants-spend)) |
 
 `{agentId}` is the `providerAgentId` the provisioning call returned. As on every provider route,
 `/provision/agents/by-raft-agent/{raftAgentId}/...` reaches the same agent by the Raft agent's id.
@@ -241,6 +243,65 @@ GET or PUT /provision/agents/{agentId}/model
   the token by its hash.
 - **An agent never given a pick** is unchanged by these routes: reading them stores nothing and rebuilds
   nothing, and it runs on the default as before (`test/provision-model.ts`).
+
+### The tenant's spend
+
+`GET /provision/usage?from=&to=&bucket=day|month` is what Raft's panel shows as "today $x of $5" and
+a daily cost history: the token's tenant's estimated spend, its daily limit, and whether its next model
+call would be refused. A production route, not part of the evaluation set. Read-only; any other method
+is `404`. `cf/src/provision/usage.ts`; tests in `test/provision-usage.ts`.
+
+- **Tenant.** As above: a tenant-scoped token is its tenant, a platform-scoped token the tenant
+  `?raftServerId=` names (`422`, `param: "raftServerId"`, without it). Every read is scoped to that
+  tenant in its own query. A missing, unknown or revoked token is the `401` every provider route gives.
+- **Window.** `from`, `to` and `bucket` are read as `/admin/usage-costs` reads them (`parseCostsQuery`,
+  `cf/src/admin-usage-costs.ts`): ISO 8601 dates or times with a zone, a bare date its 00:00 UTC;
+  `bucket` `day` (default) or `month` (UTC); no `from` is 30 days before `to`, no `to` is now; at most
+  400 days; widened to whole periods. Anything else is `400`, `code: "invalid"`, with the problem in
+  `message`.
+- **`today`** is always today (UTC), whatever the window. It is the daily limit's own reading and rule
+  (`readDaySpend` and `standing` in `cf/src/spend-limit.ts`, the `judge` the queue consumer applies),
+  read afresh for each answer (kept 15 s, below): `spentUsd` is the tenant's priced usage today, `model.tokens.unaccepted` left out;
+  `limitUsd` the admin's override if there is one, else `DAILY_LIMIT_USD`, `null` when there is no
+  per-tenant limit or the tenant is exempt (`exempt: true`, `DAILY_LIMIT_EXEMPT_TENANTS`);
+  `platformLimitReached` whether the platform's limit is reached; `refusing` whether a model call would
+  be refused now (platform first, then the tenant's limit; never for an exempt tenant). The consumer
+  may act on a reading up to 30 s old (docs/metering.md, "How fresh the reading is"). The platform's own total and limit are not given: they are every tenant's
+  spend summed.
+- **`periods`** are the window's periods that have usage, oldest first, priced as everywhere else
+  (docs/metering.md, "Prices"), `model.tokens.unaccepted` left out. `resources` gives each resource's
+  cost; `unpriced` lists `resource key unit` for usage nothing prices, which counts nothing in a total
+  (not the same as free). `totalUsd` at the top is the window's sum.
+- **`agents`** is each agent's total over the window, highest first, named by `providerAgentId` as the
+  provider's agent view names it (the ledger's agent id, which for a provisioned agent is that).
+- **Tenant from the token only.** A tenant-scoped token sending `?raftServerId=` or `?tenantId=` still
+  gets its own tenant; those parameters do not choose one.
+- **Kept 15 s.** Each isolate keeps the whole answer for 15 s (`USAGE_CACHE_MS`), per tenant and
+  window as widened (so no query and `?bucket=day` share one), never past the UTC day it was made in.
+  Only a window of at most 62 days is kept (a longer one is read afresh every time), and at most 256
+  answers per isolate, the oldest dropped first.
+  So a figure can be 15 s old, and with the consumer's own 30 s reading `refusing` can differ from what
+  the consumer does for under a minute.
+
+```json
+GET /provision/usage?from=2026-10-10&bucket=day
+{
+  "currency": "USD", "estimated": true, "tenantId": "raft_srv-1",
+  "today": { "day": "2026-10-12", "spentUsd": 1.84, "limitUsd": 5, "exempt": false,
+             "platformLimitReached": false, "refusing": false, "resetsAt": "2026-10-13T00:00:00.000Z" },
+  "from": "2026-10-10T00:00:00.000Z", "to": "2026-10-13T00:00:00.000Z", "bucket": "day",
+  "totalUsd": 4.31,
+  "periods": [
+    { "start": "2026-10-10T00:00:00.000Z", "totalUsd": 2.47,
+      "resources": [{ "resource": "model.tokens", "costUsd": 2.4 }, { "resource": "sandbox.container", "costUsd": 0.07 }],
+      "unpriced": [] },
+    { "start": "2026-10-12T00:00:00.000Z", "totalUsd": 1.84,
+      "resources": [{ "resource": "model.tokens", "costUsd": 1.84 }, { "resource": "tool.call", "costUsd": 0 }],
+      "unpriced": ["tool.call js.run calls"] }
+  ],
+  "agents": [{ "providerAgentId": "raft_01JAGENT", "totalUsd": 3.9 }, { "providerAgentId": "raft_01JOTHER", "totalUsd": 0.41 }]
+}
+```
 
 ## Evaluation setup (preview only)
 
