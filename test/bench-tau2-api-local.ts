@@ -187,8 +187,11 @@ const TASK = { id: "fx", user_scenario: { instructions: { reason_for_call: "canc
   { name: "cancel_pending_order", arguments: { order_id: "#W1", reason: "no longer needed" } },
 ] } };
 const POLICY = "# Retail agent policy\n\nOnly cancel pending orders.\n";
-/** The customer: asks once, then ends. */
-const sim: ApiTaskDeps["sim"] = async (messages) => ({ text: messages.length <= 2 ? "Please cancel my order #W1, I no longer need it." : "Thanks! ###STOP###", finishReason: "stop" });
+/** The customer: asks once, then ends. Each reply sleeps, so the row's simMs is pinned against a known floor. */
+const sim: ApiTaskDeps["sim"] = async (messages) => {
+  await new Promise((r) => setTimeout(r, 30));
+  return { text: messages.length <= 2 ? "Please cancel my order #W1, I no longer need it." : "Thanks! ###STOP###", finishReason: "stop" };
+};
 
 const client = apiClient({ base: "https://w.test", harnessToken: OPERATOR, fetch: workerFetch });
 await client.issueKey("bench", "tau2-api", "tau2-test");
@@ -211,6 +214,8 @@ await check("a task over the API runs to dbMatch: the customer's message, two ca
   flashWindow.to = Date.now();
   must(flash.dbMatch && flash.actionMatch && flash.reward === 1, show(flash));
   must(flash.ended === "stop" && flash.turns === 1 && flash.simCalls === 2, show([flash.ended, flash.turns, flash.simCalls]));
+  // The runner times the sim (30ms a call, twice here): without simMs in the row this reds.
+  must(flash.simMs >= 60, show(flash.simMs));
   must(flash.simLast === "Thanks! ###STOP###", show(flash.simLast));
   must(show(flash.performedWrites) === '["cancel_pending_order"]', show(flash.performedWrites));
   must(BASE_DB.orders["#W1"].status === "pending", "the runner wrote the base database");

@@ -112,7 +112,7 @@ export async function runApiBench(o: ApiRunOptions): Promise<{ code: number; rec
       catch (e) {
         if (e instanceof RunRefusal) { refused = e.message; break; }
         r = { id: task.id, engine: null, reward: 0, dbMatch: false, actionMatch: false,
-              ended: `error: ${(e as Error).message.slice(0, 80)}`, turns: 0, simCalls: 0,
+              ended: `error: ${(e as Error).message.slice(0, 80)}`, turns: 0, simCalls: 0, simMs: 0,
               usage: {}, kinds: {}, byTool: {}, seconds: 0, expectedWrites: [], performedWrites: [] };
       }
       results.push({ ...r, trial });
