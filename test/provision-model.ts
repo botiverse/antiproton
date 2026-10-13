@@ -465,9 +465,11 @@ await check("POST replay compares model as part of the request: same answers the
   const late = await provisionPost(w, { model: "gpt-5.6-luna" });
   must(late.status === 200, `a delayed retry after a PUT: ${late.status} ${late.text}`);
   must((await d1ModelChoices(w.DB).layers(T, A)).owner === "deepseek-pro", "a delayed retry undid the PUT");
-  // An unknown model on a replay is refused as on a create, before the comparison.
+  // A replay is compared, not checked as a create: an id nobody offers is simply a different body.
   const unknown = await provisionPost(w, { model: "gpt-9" });
-  must(unknown.status === 422 && unknown.body.error.code === "unknown_model", `unknown on replay: ${unknown.status} ${unknown.text}`);
+  must(unknown.status === 409 && unknown.body.error.code === "idempotency_conflict", `unknown on replay: ${unknown.status} ${unknown.text}`);
+  const badType = await provisionPost(w, { model: 7 });
+  must(badType.status === 422 && badType.body.error.code === "invalid", `a non-string on replay: ${badType.status} ${badType.text}`);
 
   // Created with none: absent and null both answer the same, a model is 409, and a PUT since does not change that.
   const plain = await world();
@@ -499,18 +501,73 @@ await check("a create refused for its model reserves nothing: the same raftAgent
   }
 });
 
+/** What a create that named `model` and died between making its row and storing its pick leaves. */
+function interrupted(w: World, model: string) {
+  w.DB.raw.prepare("UPDATE provisioned_agents SET status = 'provisioning', model = ?, model_pending = 1 WHERE tenant_id = ? AND raft_agent_id = ?").run(model, T, RAFT_ID);
+}
+
 await check("POST replay of a create that died before its pick was stored finishes it, and binds it", async () => {
-  // The row is made, naming the model, and the pick is not stored: what a failure between the two leaves.
   const w = await world();
-  w.DB.raw.prepare("UPDATE provisioned_agents SET status = 'provisioning', model = 'gpt-5.6-luna' WHERE tenant_id = ? AND raft_agent_id = ?").run(T, RAFT_ID);
+  interrupted(w, "gpt-5.6-luna");
   const r = await provisionPost(w, { model: "gpt-5.6-luna" });
   must(r.status === 200, `replay: ${r.status} ${r.text}`);
   must((await d1ModelChoices(w.DB).layers(T, A)).owner === "gpt-5.6-luna", "the replay did not store the pick");
   const b = await w.rt.store.getModelBinding(T, A);
   must(b?.model === "openai/gpt-5.6-luna", `the replay did not bind it: ${show(b)}`);
-  // Once finished (active), the same replay of another model is a conflict, not a second finish.
+  // Once finished, the same replay of another model is a conflict, not a second finish.
   const again = await provisionPost(w, { model: "deepseek-pro" });
   must(again.status === 409 && again.body.error.code === "idempotency_conflict", `after the finish: ${again.status} ${again.text}`);
+});
+
+await check("an identical replay after the option was withdrawn answers 200 with the same agent, not 422", async () => {
+  const w = await world({ post: { model: "gpt-5.6-luna" } });
+  // The operator withdraws luna: its provider's secret goes, so it is no longer offered.
+  delete w.env.AI_GATEWAY_TOKEN;
+  must((await call(w, "GET", "models")).body.models.every((o: any) => o.id !== "gpt-5.6-luna"), "luna still offered");
+  const r = await provisionPost(w, { model: "gpt-5.6-luna" });
+  must(r.status === 200 && r.body.providerAgentId === A && r.body.status === "active", `identical replay: ${r.status} ${r.text}`);
+  // And it is still a comparison: no model is another body.
+  const none = await provisionPost(w, { model: null });
+  must(none.status === 409 && none.body.error.code === "idempotency_conflict", `null after the create: ${none.status} ${none.text}`);
+});
+
+await check("an interrupted create is not stuck: under a new lock its same-body replay is 409 model_locked, and one without model finishes it", async () => {
+  const w = await world();
+  interrupted(w, "gpt-5.6-luna");
+  await d1ModelOverrides(w.DB).put({ tenantId: T, agentId: "", provider: "deepseek", model: "deepseek-v4-pro", setBy: "adm", setAt: 1 });
+  const same = await provisionPost(w, { model: "gpt-5.6-luna" });
+  must(same.status === 409 && same.body.error.code === "model_locked", `same body under the lock: ${same.status} ${same.text}`);
+  must((await d1ModelChoices(w.DB).layers(T, A)).owner === null, "a locked replay stored a pick");
+  const none = await provisionPost(w, {});
+  must(none.status === 200 && none.body.providerAgentId === A && none.body.status === "active", `without model: ${none.status} ${none.text}`);
+  must((await d1ModelChoices(w.DB).layers(T, A)).owner === null, "a replay without model stored a pick");
+  const row: any = w.DB.raw.prepare("SELECT model, model_pending FROM provisioned_agents WHERE tenant_id = ? AND raft_agent_id = ?").get(T, RAFT_ID);
+  must(row.model === null && row.model_pending === 0, `the row: ${show(row)}`);
+  // Settled now: the first body is a different request.
+  const late = await provisionPost(w, { model: "gpt-5.6-luna" });
+  must(late.status === 409 && late.body.error.code === "idempotency_conflict", `after the finish: ${late.status} ${late.text}`);
+});
+
+await check("an interrupted create whose option was withdrawn: the same body is 422, another offered model finishes it on that model", async () => {
+  const w = await world();
+  interrupted(w, "gpt-5.6-luna");
+  delete w.env.AI_GATEWAY_TOKEN;
+  const same = await provisionPost(w, { model: "gpt-5.6-luna" });
+  must(same.status === 422 && same.body.error.code === "unknown_model", `same body, withdrawn: ${same.status} ${same.text}`);
+  const pro = await provisionPost(w, { model: "deepseek-pro" });
+  must(pro.status === 200, `another model: ${pro.status} ${pro.text}`);
+  must((await d1ModelChoices(w.DB).layers(T, A)).owner === "deepseek-pro", "the new model was not stored");
+  must((await w.rt.store.getModelBinding(T, A))?.model === "deepseek-v4-pro", "the new model was not bound");
+});
+
+await check("once the create's pick is stored, a replay never writes it again: a PUT null since stays", async () => {
+  const w = await world({ post: { model: "gpt-5.6-luna" } });
+  // Still provisioning (as after a refused credential), and the owner cleared the pick in between.
+  w.DB.raw.prepare("UPDATE provisioned_agents SET status = 'provisioning' WHERE tenant_id = ? AND raft_agent_id = ?").run(T, RAFT_ID);
+  must((await putModel(w, null)).status === 200, "PUT null");
+  const r = await provisionPost(w, { model: "gpt-5.6-luna" });
+  must(r.status === 200, `replay: ${r.status} ${r.text}`);
+  must((await d1ModelChoices(w.DB).layers(T, A)).owner === null, "the replay undid the PUT null");
 });
 
 // ---- the next turn, with the harness open (#826) ------------------------------

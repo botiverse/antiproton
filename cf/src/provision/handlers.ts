@@ -365,7 +365,9 @@ export async function handleProvision(
     if (isFail(credential)) return fail(credential);
     const toolConfig = toolConfigField(body, deps.seed);
     if (isFail(toolConfig)) return fail(toolConfig);
-    const model = createModelField(body, deps.models);
+    // Only its type here: whether it is offered, and not locked, is a first create's question (`modelProblem`). A replay
+    // is compared with the create it repeats, so an option withdrawn since does not refuse the agent that exists.
+    const model = createModelField(body);
     if (isFail(model)) return fail(model);
 
     const agentId = providerAgentId(raftAgentId);
@@ -383,26 +385,33 @@ export async function handleProvision(
       // overwrite a newer PUT /credential. Compared by hash; a row from
       // before the hash existed accepts the first replay and records it.
       if (row.credentialHash !== null && row.credentialHash !== credentialHash) differs.push("credential" as keyof typeof asked);
-      if (differs.length) {
+      // A create that named a model and died before storing its pick (`modelPending`, set only while `provisioning`)
+      // has not chosen yet: its replay may name another model, or none — the way out of a lock or a withdrawn option
+      // that refuses the first — and is checked as a first create. Any other difference is a conflict, as ever.
+      const reopen = row.status === "provisioning" && row.modelPending === true;
+      if (differs.length && !(reopen && differs.length === 1 && differs[0] === "model")) {
         return fail({ status: 409, code: "idempotency_conflict", message: `a different request was already made under this key (${differs.join(", ")}); edits go through PATCH${differs.includes("model") ? ", and the model through PUT …/model" : ""}` });
       }
       if (row.credentialHash === null) { await deps.registry.update(tenantId, raftAgentId, { credentialHash }); row = { ...row, credentialHash }; }
-      // A create that died between making the row and storing its pick (still `provisioning`, no pick) is finished by
-      // its replay. Only then: once the create has finished, a replay leaves the pick alone, so a delayed retry cannot
-      // undo a PUT …/model that landed after it.
-      if (model !== null && row.status === "provisioning" && (await deps.models!.choices.layers(tenantId, agentId)).owner === null) {
-        const locked = await lockedProblem(deps.models!, tenantId, agentId);
-        if (locked) return fail(locked);
-        await storePick(deps.models!, tenantId, agentId, model, headers.credentialId ?? null, deps.now);
+      // Once the pick is stored (`modelPending` cleared) a replay never writes it again, so a delayed retry cannot undo a
+      // PUT …/model, null included, that landed after it.
+      if (reopen) {
+        if (model !== null) {
+          const refused = await modelProblem(deps.models, tenantId, agentId, model);
+          if (refused) return fail(refused);
+        }
+        if ((row.model ?? null) !== model) { await deps.registry.update(tenantId, raftAgentId, { model }); row = { ...row, model }; }
+        row = await settlePick(deps, row, headers.credentialId ?? null);
       }
     } else {
-      // Refused before the row exists, so a locked model leaves nothing made — as a PUT under the lock stores nothing.
+      // Refused before the row exists, so an unoffered or locked model leaves nothing made and the id free — as a PUT
+      // under the lock stores nothing.
       if (model !== null) {
-        const locked = await lockedProblem(deps.models!, tenantId, agentId);
-        if (locked) return fail(locked);
+        const refused = await modelProblem(deps.models, tenantId, agentId, model);
+        if (refused) return fail(refused);
       }
       const t = deps.now();
-      row = { tenantId, raftAgentId, agentId, ...asked, credentialHash, status: "provisioning", pushRegistered: false, pushError: null, createdAt: t, updatedAt: t, deletedAt: null };
+      row = { tenantId, raftAgentId, agentId, ...asked, modelPending: model !== null, credentialHash, status: "provisioning", pushRegistered: false, pushError: null, createdAt: t, updatedAt: t, deletedAt: null };
       try { await deps.registry.create(row); }
       catch (e) {
         // Only the unique index says 409 (two Raft ids that sanitise alike). Anything else — D1 away, a
@@ -414,7 +423,7 @@ export async function handleProvision(
       created = true;
       // Stored before `adopt`, which binds the model it resolves (steps.ts), so the agent's first turn already runs on
       // the pick. Not one statement with the row: if this fails the POST fails, and its replay stores it (above).
-      if (model !== null) await storePick(deps.models!, tenantId, agentId, model, headers.credentialId ?? null, deps.now);
+      row = await settlePick(deps, row, headers.credentialId ?? null);
     }
     // From here every step is idempotent, so a replay of a request that died half-way finishes it. The tool choice is
     // compared by the agent's object, where it is recorded: a replay asking for other tools is 409, as for any field.
@@ -791,17 +800,32 @@ async function storePick(m: ProvisionModels, tenantId: string, agentId: string, 
 }
 
 /**
- * `model` of a POST: an offered option's id to create the agent on, or null / absent for the default, which is today's
- * create exactly (null here: nothing to store). Checked before anything is made. A deployment without the model routes
- * offers nothing, so any id is unknown there — refused, never ignored, since an agent quietly made on the default would
- * run on a model nobody chose.
+ * `model` of a POST, by type only: an id, or null when it is null or absent, which is today's create exactly (nothing to
+ * store). Whether the id may be taken is `modelProblem`'s, asked of a first create only.
  */
-function createModelField(body: unknown, m: ProvisionModels | undefined): string | null | Fail {
+function createModelField(body: unknown): string | null | Fail {
   const v = field(body, "model");
   if (v === undefined || v === null) return null;
   if (typeof v !== "string") return { status: 422, code: "invalid", message: "model is an offered option's id, or null for the default", param: "model" };
+  return v;
+}
+
+/**
+ * Whether a first create may be made on `model`: offered here now, and no admin's agent or tenant row deciding the
+ * agent's model. A deployment without the model routes offers nothing, so any id is unknown there — refused, never
+ * ignored, since an agent quietly made on the default would run on a model nobody chose.
+ */
+async function modelProblem(m: ProvisionModels | undefined, tenantId: string, agentId: string, model: string): Promise<Fail | null> {
   if (!m) return { status: 422, code: "unknown_model", param: "model", message: "this deployment offers no choice of model; omit model, or send null, for the default" };
-  return notOffered(m.userModels, v) ?? v;
+  return notOffered(m.userModels, model) ?? await lockedProblem(m, tenantId, agentId);
+}
+
+/** Store the create's pick, if it named one and it is not stored yet, then mark it stored. */
+async function settlePick(deps: ProvisionDeps, row: ProvisionedAgent, credentialId: string | null): Promise<ProvisionedAgent> {
+  if (!row.modelPending) return row;
+  if (row.model) await storePick(deps.models!, row.tenantId, row.agentId, row.model, credentialId, deps.now);
+  await deps.registry.update(row.tenantId, row.raftAgentId, { modelPending: false });
+  return { ...row, modelPending: false };
 }
 
 /** The setup routes, after the agent's id. */
