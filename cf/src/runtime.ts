@@ -1266,7 +1266,7 @@ export class AgentRuntime {
     // is a statement in this object too, so it either came first or finds the seal, even while this push is queued
     // and its turn has not begun (src/store/seed-files.ts).
     sealedBy(tenantId, agentId, sealSeedFiles(sql, tenantId, agentId, "first-inbound", now));
-    acceptInbound(sql, { hookId, alias, dedupeKey: key, message: inboundMessage(alias, String(result.text)), now, installationId });
+    acceptInbound(sql, { hookId, alias, dedupeKey: key, message: inboundMessage(alias, String(result.text), result.kind === "inbox" ? "inbox" : "event"), now, installationId });
     // The answer the service has always had for a push the agent will be given.
     return { outcome: "delivered" };
   }

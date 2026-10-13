@@ -1533,6 +1533,14 @@ export interface ActivityEvent {
  * 401 reads as "not you" — and a service that stops pushing after a few 401s
  * would otherwise stop over one field. A plugin sets one of `rejected` and
  * `malformed`, not both.
+ *
+ * `kind` picks the label (src/runtime/inbound.ts `inboundMessage`). Omitted is
+ * `"event"`: outside content, information and not an instruction. `"inbox"`
+ * is for a notice that messages were written to this agent — its own inbox,
+ * said by the service that keeps it, after the signature checked out — and
+ * its label says they are requests from teammates, followed within the agent's
+ * rules. Both labels are the runtime's words; the plugin only chooses, and
+ * omitting the field lands on the stricter one.
  */
 export type InboundResult =
   // One of `rejected` and `malformed`, and the type says so: two booleans left "set at most one" to a
@@ -1540,7 +1548,7 @@ export type InboundResult =
   // side `malformed` exists to avoid.
   | { deliver: false; reason: string; rejected?: true; malformed?: never }
   | { deliver: false; reason: string; malformed?: true; rejected?: never }
-  | { deliver: true; text: string; dedupeKey?: string };
+  | { deliver: true; text: string; dedupeKey?: string; kind?: "event" | "inbox" };
 
 /** `return backgrounded({ boxId, execId }, "…")` — see {@link Backgrounded}. */
 export function backgrounded(handle: Json, note?: string): Backgrounded {

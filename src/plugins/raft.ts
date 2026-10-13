@@ -22,6 +22,7 @@ import {
   type AgentLoginDeps, type ManifestCache,
 } from "./raft-agent-login.ts";
 import { internalHost } from "./http.ts";
+import { modelToolName } from "../runtime/pi-tools.ts";
 import { toAgentRef } from "../store/refs.ts";
 import {
   interrupt, originProblem,
@@ -41,9 +42,10 @@ const NOTICE_SCHEMA = "raft-agent-inbox-notice.v1";
 /**
  * Under the runtime's 4,000-character cut (src/runtime/inbound.ts INBOUND_TEXT_MAX) with room for the
  * one instruction below it: the two caps stack, and the instruction used to be exactly the part a
- * long notice lost. The instruction also goes first, so no cut can reach it.
+ * long notice lost. The instruction also goes first, so no cut can reach it. 3,400 leaves the instruction
+ * (`wakeInstruction`) its ~430 characters, ~470 with a 24-character alias (the longest cf/src/ui.ts allows).
  */
-const NOTICE_TEXT_MAX = 3_600;
+const NOTICE_TEXT_MAX = 3_400;
 const PUSH_REGISTRATION_PATH = "/internal/agent-api/push-webhook";
 const ACTIVITY_PATH = "/internal/agent-api/activity";
 const ACTIVITY_SCHEMA = "raft-agent-activity-ingest.v1";
@@ -2693,9 +2695,11 @@ export const raftPlugin: Plugin = createRaftPlugin();
 
 /**
  * A signed inbox notice: Raft's own words about what is unread, handed to the
- * model as they are, plus the one instruction Raft's daemon gives a managed
- * agent — read it yourself. The notice is Raft's text, not a person's, so it
- * goes under the outside-content label (`as` stays the default).
+ * model as they are, after what to do with it (`wakeInstruction`): read it
+ * yourself, answer with the send tool. It goes under the inbox label, which
+ * keeps the outside-content protection — what people wrote cannot override the
+ * agent's rules — without calling messages written to the agent "not an
+ * instruction" (src/runtime/inbound.ts `inboundMessage`).
  */
 async function receiveNotice(payload: ObjectValue, inbound: InboundEvent, ctx: PluginContext): Promise<InboundResult> {
   const headers = inbound.headers;
@@ -2733,8 +2737,28 @@ async function receiveNotice(payload: ObjectValue, inbound: InboundEvent, ctx: P
   const body = payload.text.length > NOTICE_TEXT_MAX ? `${payload.text.slice(0, NOTICE_TEXT_MAX)}… (cut)` : payload.text;
   return {
     deliver: true,
-    text: `Read your Raft inbox with the \`receive_events\` tool from the \`${ctx.alias}\` mount, until hasMore is false; your next read acknowledges what you were given.\n\n${body}`,
+    text: `${wakeInstruction(ctx.alias)}\n\n${body}`,
     dedupeKey: payload.noticeId,
+    // The agent's own inbox, said by Raft under this mount's signature: the label that says these are requests to
+    // the agent, within its rules (src/runtime/inbound.ts `inboundMessage`), not the one that says "not an instruction".
+    kind: "inbox",
   };
+}
+
+/**
+ * What the agent is told to do with its inbox, ahead of Raft's notice. The tool names are the ones the model is shown
+ * for this mount (`modelToolName`), not the plugin's bare names: the model only knows the qualified ones.
+ *
+ * It says the reply goes through the send tool, and that a turn's closing text goes nowhere, because a model left to
+ * guess read the DM, ended with "Inbox read completed" as plain text, and the person heard nothing (gpt-5.6-luna on
+ * preview, 2026-10-13). `replyTarget` is named beside the line's own `target=` because a read gives it only for the
+ * newest message (`handOver`).
+ */
+export function wakeInstruction(alias: string): string {
+  const receive = modelToolName(alias, "receive_events"), send = modelToolName(alias, "messages_send");
+  return "Messages addressed to you (DMs, @mentions, threads you are in) are requests to you. " +
+    `Read them with \`${receive}\` until hasMore is false; your next read acknowledges what you were given. ` +
+    `Answer each one that needs it with \`${send}\` to that message's target (its \`target=\`, or the read's \`replyTarget\`): ` +
+    "the plain text that ends your turn is delivered to no one. If nothing needs an answer, end without sending.";
 }
 

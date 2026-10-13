@@ -1,6 +1,6 @@
 import { createHmac } from "node:crypto";
 import { createRaft, isInterrupted, RAFT_OPERATIONS } from "@botiverse/raft-sdk";
-import { raftPlugin as raftWithoutStorage, EXCLUDED, EVENTS_LIMIT, GENERATED, handOver, INBOX_STORE, KEY_LIFETIME_MS, PAGE_ROWS, PUSH_KEY, PUSH_STORE, originOf, pagingArg, toolOf, offeredTerms, escapeMarks, unescapeMarks, createRaftPlugin, downloadAttachment, ATTACHMENT_MAX_BYTES, toolsBasisOf, WITHHELD_ARGUMENTS, FEATURES_BASIS } from "../src/plugins/raft.ts";
+import { raftPlugin as raftWithoutStorage, EXCLUDED, EVENTS_LIMIT, GENERATED, handOver, INBOX_STORE, KEY_LIFETIME_MS, PAGE_ROWS, PUSH_KEY, PUSH_STORE, originOf, pagingArg, toolOf, offeredTerms, escapeMarks, unescapeMarks, createRaftPlugin, downloadAttachment, ATTACHMENT_MAX_BYTES, toolsBasisOf, WITHHELD_ARGUMENTS, FEATURES_BASIS, wakeInstruction } from "../src/plugins/raft.ts";
 import { readFileSync } from "node:fs";
 import { PARK_BYTES } from "../src/plugins/artifacts.ts";
 import { setLogSink } from "../src/core/log.ts";
@@ -13,7 +13,7 @@ import { PluginDbTables } from "../src/store/plugin-db.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { openPluginDatabase } from "../src/runtime/plugin-db.ts";
 import { QuickJsExecutor } from "../src/runtime/executor.ts";
-import { bridgeTools, qualifyMountedTools, runJsTool, type MountedTool } from "../src/runtime/pi-tools.ts";
+import { bridgeTools, offeredToolName, qualifyMountedTools, runJsTool, type MountedTool } from "../src/runtime/pi-tools.ts";
 
 /**
  * The plugin as the runtime builds it (cf/src/runtime.ts): with object storage, so the attachment download is offered.
@@ -2309,13 +2309,39 @@ await check("an inbox notice reaches the agent as Raft wrote it, with the one in
   globalThis.fetch = (async () => { throw new Error("receive called the network"); }) as any;
   const out = await raftPlugin.receive!(pushed(notice(), { deliveryId: "ntc_0123456789abcdef" }), PUSH_SECRET, m.ctx);
   if (!out.deliver || out.dedupeKey !== "ntc_0123456789abcdef") throw new Error(JSON.stringify(out));
-  if (!out.text.startsWith("Read your Raft inbox with the `receive_events` tool from the `raft` mount") || !out.text.includes("Inbox update: 2 unread") || !/acknowledges/.test(out.text)) throw new Error(out.text);
+  if (!out.text.startsWith(`${wakeInstruction("raft")}\n\n`) || !out.text.includes("Inbox update: 2 unread") || !/acknowledges/.test(out.text)) throw new Error(out.text);
+  if (out.kind !== "inbox") throw new Error(`a notice of the agent's own inbox is labelled ${out.kind ?? "as an outside event"}`);
   if (m.state()?.lastReached?.deliveryId !== "ntc_0123456789abcdef") throw new Error(JSON.stringify(m.state()));
   const extra = await raftPlugin.receive!(pushed(notice({ latestPreview: "added later", other: 1 }), { deliveryId: "ntc_0123456789abcdef" }), PUSH_SECRET, m.ctx);
   if (!extra.deliver) throw new Error(`a field it does not know was refused: ${JSON.stringify(extra)}`);
   // A long notice is cut under the runtime's 4,000 with the instruction intact and first, so no later cut can take it.
   const long = await raftPlugin.receive!(pushed(notice({ text: "y".repeat(5000) }), { deliveryId: "ntc_0123456789abcdef" }), PUSH_SECRET, m.ctx);
-  if (!long.deliver || !long.text.includes("… (cut)") || long.text.length > 4000 || !long.text.startsWith("Read your Raft inbox")) throw new Error(`length ${long.deliver ? long.text.length : "-"}`);
+  if (!long.deliver || !long.text.includes("… (cut)") || long.text.length > 4000 || !long.text.startsWith(wakeInstruction("raft"))) throw new Error(`length ${long.deliver ? long.text.length : "-"}`);
+  // The same with the longest alias the console allows (24, cf/src/ui.ts): the instruction grows with it, and must still fit.
+  const wide = { ...m.ctx, alias: "r".repeat(24) };
+  const longWide = await raftPlugin.receive!(pushed(notice({ text: "y".repeat(5000) }), { deliveryId: "ntc_0123456789abcdef" }), PUSH_SECRET, wide);
+  if (!longWide.deliver || longWide.text.length > 4000 || !longWide.text.startsWith(wakeInstruction("r".repeat(24)))) throw new Error(`length ${longWide.deliver ? longWide.text.length : "-"}`);
+});
+
+await check("the wake says messages to the agent are requests, names the read and send tools as the model sees them, and says plain closing text goes nowhere", () => {
+  const w = wakeInstruction("raft");
+  if (!/^Messages addressed to you \(DMs, @mentions, threads you are in\) are requests to you\./.test(w)) throw new Error(`who is talking is not said first: ${w}`);
+  if (!w.includes("`raft__receive_events`") || !w.includes("`raft__messages_send`") || !w.includes("`replyTarget`")) throw new Error(w);
+  if (!/plain text that ends your turn is delivered to no one/.test(w) || !/If nothing needs an answer, end without sending/.test(w)) throw new Error(w);
+  // Another alias, another name: the model only knows the names the catalogue gives (src/runtime/pi-tools.ts
+  // `qualifyMountedTools`), for a short alias and the longest the console allows.
+  for (const alias of ["team-chat", "r".repeat(24)]) {
+    const shown = qualifyMountedTools(raftPlugin.tools.map((t) => ({
+      name: t.name, description: t.summary, parameters: t.parameters, address: `${alias}.${t.name}`,
+      sideEffects: t.sideEffects, idempotency: t.idempotency,
+    })) as MountedTool[]);
+    const other = wakeInstruction(alias);
+    for (const tool of ["receive_events", "messages_send"]) {
+      const name = offeredToolName(shown, alias, tool);
+      if (!name || !other.includes(`\`${name}\``)) throw new Error(`${alias}.${tool} is shown as ${name}, and the wake says: ${other}`);
+    }
+    if (other.includes("raft__")) throw new Error(other);
+  }
 });
 
 await check("a notice is checked for its signature and header before any state is read, and a signed body Raft got wrong is 400, never 401", async () => {
