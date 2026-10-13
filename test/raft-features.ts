@@ -7,7 +7,7 @@
  * (src/runtime/prompt-context.ts). Also the 0.16.0 tool-schema change the generated `actions_prepare` picks up.
  */
 import {
-  CONTEXT_STORE, FEATURES_KEY, FEATURES_REFRESH_MS, VAULT_LINE, createRaftPlugin, featuresOf, featuresParagraph, raftPlugin as raftWithoutStorage,
+  CONTEXT_STORE, FEATURES_KEY, FEATURES_REFRESH_MS, FEATURES_TIMEOUT_MS, VAULT_LINE, createRaftPlugin, featuresOf, featuresParagraph, raftPlugin as raftWithoutStorage,
 } from "../src/plugins/raft.ts";
 import { PluginDbTables } from "../src/store/plugin-db.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
@@ -39,9 +39,9 @@ function context(features?: unknown) {
   });
 }
 /** Answers every request from `route`, and records the paths asked. */
-function serve(route: (path: string) => Response) {
+function serve(route: (path: string, init?: any) => Response | Promise<Response>) {
   const asked: string[] = [];
-  globalThis.fetch = (async (url: any) => { const p = new URL(String(url)).pathname; asked.push(p); return route(p); }) as any;
+  globalThis.fetch = (async (url: any, init?: any) => { const p = new URL(String(url)).pathname; asked.push(p); return route(p, init); }) as any;
   return asked;
 }
 const EMPTY_PULL = () => json(200, { events: [], last_seen_msgId: null, last_seen_seq: null, reply_target: null, has_more: false, ack_mode: "cursor" });
@@ -96,25 +96,83 @@ await check("the listing keeps the flags from the context it already reads, and 
   }
 });
 
-await check("a pull reads the flags again once they are older than the refresh age, beside the pull, and never fails for it", async () => {
+const tick = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+async function until(cond: () => unknown | Promise<unknown>, why: string, ms = 3_000) {
+  const end = Date.now() + ms;
+  while (!(await cond())) { if (Date.now() > end) throw new Error(`timed out: ${why}`); await tick(5); }
+}
+const kept = (tables: any, scope: any) => tables.get(scope, CONTEXT_STORE, FEATURES_KEY) as { reminderApp: boolean; vaultApp: boolean; at: number };
+const OLD = () => Date.now() - FEATURES_REFRESH_MS - 1;
+const contextAsked = (asked: string[]) => asked.filter((p) => p.endsWith("/context")).length;
+
+await check("a pull reads the flags again in the background once they are older than the refresh age, and fresh ones not at all", async () => {
   const { tables, scope, db } = mountDb();
-  // Fresh flags: the pull asks Raft for the inbox and nothing else.
   tables.put(scope, CONTEXT_STORE, FEATURES_KEY, { reminderApp: false, vaultApp: false, at: Date.now() }, null);
   let asked = serve((p) => (p.endsWith("/context") ? context({ reminderApp: true, vaultApp: false }) : EMPTY_PULL()));
   await raftPlugin.invoke("receive_events", {}, ctx(db));
-  must(!asked.some((p) => p.endsWith("/context")), `fresh flags were read again: ${asked.join(", ")}`);
-  // Old flags: read again, kept, and the paragraph follows.
-  tables.put(scope, CONTEXT_STORE, FEATURES_KEY, { reminderApp: false, vaultApp: false, at: Date.now() - FEATURES_REFRESH_MS - 1 }, null);
+  await tick(30);
+  must(contextAsked(asked) === 0, `fresh flags were read again: ${asked.join(", ")}`);
+  tables.put(scope, CONTEXT_STORE, FEATURES_KEY, { reminderApp: false, vaultApp: false, at: OLD() }, null);
   asked = serve((p) => (p.endsWith("/context") ? context({ reminderApp: true, vaultApp: false }) : EMPTY_PULL()));
   await raftPlugin.invoke("receive_events", {}, ctx(db));
-  must(asked.filter((p) => p.endsWith("/context")).length === 1, `old flags were not read again: ${asked.join(", ")}`);
-  must(REMINDERS.test(await raftPlugin.promptContribution!(ctx(db)) ?? ""), "the flipped flag did not reach the paragraph");
-  // Raft failing the context read keeps what was kept, and the pull still answers.
-  tables.put(scope, CONTEXT_STORE, FEATURES_KEY, { reminderApp: true, vaultApp: false, at: Date.now() - FEATURES_REFRESH_MS - 1 }, null);
-  serve((p) => (p.endsWith("/context") ? json(503, { error: "down" }) : EMPTY_PULL()));
+  await until(async () => REMINDERS.test(await raftPlugin.promptContribution!(ctx(db)) ?? ""), "the flipped flag never reached the paragraph");
+  must(contextAsked(asked) === 1, `old flags were not read once: ${asked.join(", ")}`);
+});
+
+await check("a refresh that fails keeps the flags and backs off for the same hour: the next pull does not ask again", async () => {
+  const { tables, scope, db } = mountDb();
+  tables.put(scope, CONTEXT_STORE, FEATURES_KEY, { reminderApp: true, vaultApp: false, at: OLD() }, null);
+  const asked = serve((p) => (p.endsWith("/context") ? json(503, { error: "down" }) : EMPTY_PULL()));
+  const started = Date.now();
   const out: any = await raftPlugin.invoke("receive_events", {}, ctx(db));
   must(out && typeof out === "object", `the pull failed: ${JSON.stringify(out)}`);
-  must(REMINDERS.test(await raftPlugin.promptContribution!(ctx(db)) ?? ""), "a failed read dropped the kept flags");
+  await until(() => contextAsked(asked) === 1 && kept(tables, scope).at >= started, "the failed attempt was not recorded");
+  await tick(30);
+  must(kept(tables, scope).reminderApp === true && REMINDERS.test(await raftPlugin.promptContribution!(ctx(db)) ?? ""), "a failed read dropped the kept flags");
+  for (let i = 0; i < 3; i++) await raftPlugin.invoke("receive_events", {}, ctx(db));
+  await tick(30);
+  must(contextAsked(asked) === 1, `a failed refresh was retried within the hour: ${contextAsked(asked)} requests`);
+  // Control: once the hour has passed it is asked again.
+  tables.put(scope, CONTEXT_STORE, FEATURES_KEY, { ...kept(tables, scope), at: OLD() }, null);
+  await raftPlugin.invoke("receive_events", {}, ctx(db));
+  await until(() => contextAsked(asked) === 2, "not asked again after the hour");
+});
+
+await check("concurrent pulls on one mount send one refresh request", async () => {
+  const { tables, scope, db } = mountDb();
+  tables.put(scope, CONTEXT_STORE, FEATURES_KEY, { reminderApp: false, vaultApp: false, at: OLD() }, null);
+  const asked = serve(async (p) => {
+    if (!p.endsWith("/context")) return EMPTY_PULL();
+    await tick(100);
+    return context({ reminderApp: false, vaultApp: true });
+  });
+  await Promise.all([0, 1, 2, 3].map(() => raftPlugin.invoke("receive_events", {}, ctx(db))));
+  await until(async () => (await raftPlugin.promptContribution!(ctx(db))) === VAULT_LINE, "the refresh never landed");
+  await tick(30);
+  must(contextAsked(asked) === 1, `${contextAsked(asked)} refresh requests for 4 concurrent pulls`);
+});
+
+await check("a hanging /context does not delay the pull, and the refresh gives up at its own short timeout, not the mount's", async () => {
+  const { tables, scope, db } = mountDb();
+  tables.put(scope, CONTEXT_STORE, FEATURES_KEY, { reminderApp: true, vaultApp: false, at: OLD() }, null);
+  let aborted = 0;
+  const asked = serve((p, init) => {
+    if (!p.endsWith("/context")) return EMPTY_PULL();
+    // Never answers; gives up only when the request's own signal does.
+    return new Promise<Response>((_, reject) => init?.signal?.addEventListener("abort", () => { aborted = Date.now(); reject(init.signal.reason); }));
+  });
+  const started = Date.now();
+  // Node does not stay up for an AbortSignal.timeout alone: a pull that waited on the refresh would end the process
+  // rather than this case, so something keeps it up while the pull runs.
+  const awake = setInterval(() => {}, 100);
+  try { await raftPlugin.invoke("receive_events", {}, ctx(db)); } finally { clearInterval(awake); }
+  const took = Date.now() - started;
+  await until(() => contextAsked(asked) === 1, "the refresh never asked");
+  must(took < 1_000, `the pull waited ${took} ms on a hanging /context`);
+  await until(() => aborted > 0, "the refresh never gave up", 6_000);
+  must(aborted - started >= FEATURES_TIMEOUT_MS - 100 && aborted - started < FEATURES_TIMEOUT_MS + 1_000, `gave up after ${aborted - started} ms`);
+  await tick(30);
+  must(kept(tables, scope).reminderApp === true && kept(tables, scope).at >= started, `after the timeout: ${JSON.stringify(kept(tables, scope))}`);
 });
 
 /** A gateway over one agent with a state mount, and a raft mount when `withRaft`, as the runtime registers them. */

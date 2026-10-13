@@ -365,19 +365,43 @@ async function keepFeatures(ctx: PluginContext, raw: unknown): Promise<void> {
 }
 
 /**
- * Read the flags again when the kept ones are older than `FEATURES_REFRESH_MS`. Never throws: Raft not answering
- * leaves the kept flags as they were. A mount with none kept is left to the listing, which records them, and which the
- * runtime re-takes for every mount listed before this build (`FEATURES_BASIS`).
+ * How long a refresh may wait for Raft, apart from the mount's own timeout (up to 60 s): it runs beside a pull, and a
+ * slow `/context` must hold a refresh, not a request slot, for long.
  */
-async function refreshFeatures(ctx: PluginContext): Promise<void> {
-  try {
-    const kept = object(await ctx.db.get(CONTEXT_STORE, FEATURES_KEY));
-    if (typeof kept.at !== "number" || Date.now() - kept.at < FEATURES_REFRESH_MS) return;
-    const me = await raftFor(ctx, { state: false }).routes.agent.context();
-    if (me.ok) await keepFeatures(ctx, me.data.features);
-  } catch (e) {
-    console.warn(`raft features could not be read again for mount ${ctx.alias}: ${String((e as Error)?.message ?? e)}`);
-  }
+export const FEATURES_TIMEOUT_MS = 2_000;
+
+/** The mounts with a refresh in flight in this isolate, by tenant, agent and alias: one request per mount at a time. */
+const refreshing = new Set<string>();
+
+/**
+ * Read the flags again when the kept ones are older than `FEATURES_REFRESH_MS`, in the background: the caller does
+ * not wait, and nothing it starts can reject. The attempt's time is written before Raft is asked, with the flags kept
+ * as they were, so a Raft that is slow, down or refusing is asked again an hour later rather than on every pull, and
+ * a second pull in another isolate sees a fresh record and does not ask too. Within the isolate `refreshing` keeps it
+ * to one in flight per mount, since two pulls may both read the old record before either writes.
+ *
+ * Not awaited by the call and not handed to a `waitUntil` (a plugin has none): the object outlives the call, and a
+ * refresh the object's eviction cuts short only waits for the next hour, its attempt already written. A mount with
+ * none kept is left to the listing, which records them and which the runtime re-takes for every mount listed before
+ * this build (`FEATURES_BASIS`).
+ */
+function refreshFeatures(ctx: PluginContext): void {
+  const key = `${ctx.caller.tenantId}/${ctx.caller.agentId}/${ctx.alias}`;
+  if (refreshing.has(key)) return;
+  refreshing.add(key);
+  void (async () => {
+    try {
+      const kept = object(await ctx.db.get(CONTEXT_STORE, FEATURES_KEY));
+      if (typeof kept.at !== "number" || Date.now() - kept.at < FEATURES_REFRESH_MS) return;
+      await ctx.db.put(CONTEXT_STORE, { ...featuresOf(kept), at: Date.now() }, FEATURES_KEY);
+      const me = await raftFor(ctx, { state: false, timeoutMs: FEATURES_TIMEOUT_MS }).routes.agent.context();
+      if (me.ok) await keepFeatures(ctx, me.data.features);
+    } catch (e) {
+      console.warn(`raft features could not be read again for mount ${ctx.alias}: ${String((e as Error)?.message ?? e)}`);
+    } finally {
+      refreshing.delete(key);
+    }
+  })();
 }
 
 /**
@@ -440,9 +464,10 @@ function stateStore(ctx: PluginContext): RaftStateStore {
  *
  * Every client writes its hints as tool calls (`hints: "tool"`, SDK 0.10.0), never as `raft …` CLI commands;
  * `offeredTerms` puts in words the few that name a tool this mount does not offer. `response` sees each answer
- * before the SDK reads it (the attachment download's size cap).
+ * before the SDK reads it (the attachment download's size cap). `timeoutMs` replaces the mount's timeout for a request
+ * that has a shorter bound of its own (`FEATURES_TIMEOUT_MS`).
  */
-function raftFor(ctx: PluginContext, options: { state?: false; response?: (res: Response) => Response } = {}): Raft {
+function raftFor(ctx: PluginContext, options: { state?: false; response?: (res: Response) => Response; timeoutMs?: number } = {}): Raft {
   return createRaft({
     serverUrl: baseUrl(ctx).origin, credential: requireCredential(ctx), hints: "tool",
     // Redirects stay manual, as on every other request here, so a 3xx never carries the credential elsewhere.
@@ -452,7 +477,7 @@ function raftFor(ctx: PluginContext, options: { state?: false; response?: (res: 
       const line = { tenantId: ctx.caller.tenantId, agentId: ctx.caller.agentId, mount: ctx.alias, method: init?.method ?? "GET", route: routeOf(u.pathname) };
       let res: Response;
       try {
-        res = await fetch(input, { ...init, redirect: "manual", signal: AbortSignal.timeout(timeout(ctx)) });
+        res = await fetch(input, { ...init, redirect: "manual", signal: AbortSignal.timeout(options.timeoutMs ?? timeout(ctx)) });
       } catch (e) {
         logEvent("raft.call", { ...line, status: null, ms: Date.now() - started, error: clip(String((e as { message?: unknown })?.message ?? e)) });
         throw e;
@@ -2469,11 +2494,10 @@ export function createRaftPlugin(deps: {
         // The pull runs on a client whose state is not saved: the SDK books every message a pull returns as seen,
         // and only those `handOver` shows may be. As the model's own: receive_events is model-only, so the gateway
         // has already refused it from a program and from an approved call's replay.
-        // Beside the pull, not before it: kept flags past their age are read again, which never fails the pull.
-        const features = refreshFeatures(ctx);
+        // Kept flags past their age are read again in the background: the pull neither waits for it nor fails with it.
+        refreshFeatures(ctx);
         const out = await raftFor(ctx, { state: false }).invoke("inbox.check",
           { ack: "cursor", limit, ...(since !== null ? { since } : {}) }, { origin: "model" });
-        await features;
         if (!out.ok) throw sdkFailure(out as RaftFailure, unofferedFor(ctx));
         const batch = (out as { data: RaftInboxBatch }).data;
         const given = handOver(batch, unofferedFor(ctx));
