@@ -75,6 +75,20 @@ export function answerClientCall(
   return true;
 }
 
+/**
+ * The caller's functions of a turn that began at `since`: how many were made (a row with a name, whatever its state,
+ * which is what `resumeClientCalls` reads as "this turn paused") and how many of those still wait for the caller. A
+ * call answered but not yet resumed is still the turn's: its next step resumes it. Calls made before `since` belong to
+ * an earlier turn the caller left without answering, and are not this one's.
+ */
+export function turnClientCalls(sql: Sql, session: string, since: number): { named: number; waiting: number } {
+  ensureClientCalls(sql);
+  const r = sql.exec(
+    `SELECT COUNT(*) AS named, COALESCE(SUM(CASE WHEN state = 'pending' THEN 1 ELSE 0 END), 0) AS waiting
+       FROM ${TABLE} WHERE session = ? AND name != '' AND created_at >= ?`, session, since).toArray()[0];
+  return { named: Number(r?.named ?? 0), waiting: Number(r?.waiting ?? 0) };
+}
+
 /** Forget a session's calls, when its turn is cancelled. How many were still waiting. */
 export function dropClientCalls(sql: Sql, session: string): number {
   const waiting = pendingClientCalls(sql, session).length;
@@ -116,12 +130,20 @@ type PausingLane = {
   requestAbort(operationId: string, context: typeof CTX): Promise<any>;
 };
 
+/**
+ * The tools `clientTools` made, by identity rather than by a field on them: a field would be one more thing in what
+ * the harness is handed. Asked by the turn timing (src/runtime/turn-timing.ts), which counts a caller's function as
+ * the pause it is, not as a tool that ran here.
+ */
+const CLIENT_TOOLS = new WeakSet<object>();
+export const isClientTool = (tool: object): boolean => CLIENT_TOOLS.has(tool);
+
 /** The harness tools for an agent's client functions, in one session. */
 export function clientTools(defs: ClientToolDef[], d: {
   sql: Sql; session: string; lane(): PausingLane; branch(tipId: string): Promise<any[]>; now?: () => number;
 }) {
   const names = new Set(defs.map((def) => def.name));
-  return defs.map((def) => ({
+  const made = defs.map((def) => ({
     name: def.name,
     label: def.name,
     description: def.description,
@@ -156,6 +178,8 @@ export function clientTools(defs: ClientToolDef[], d: {
       throw new Error(CLIENT_PENDING);
     },
   }));
+  for (const t of made) CLIENT_TOOLS.add(t);
+  return made;
 }
 
 type ResumingLane = {

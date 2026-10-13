@@ -604,7 +604,7 @@ answer with `/admin/transcript`'s for the same agent).
 
 `GET …/trace` answers the agent's trace rows — the spans of its work, one row each when it ended
 (`model.call`, `tool.call`, `approval.wait`, `container.lease`, `inbound`, `mount.seeded`,
-`rebuild.decision`, `rebuild.outcome`, `rebuild.behaviour`; `src/trace/outbox.ts`) — with `from <= at < to`, in `seq` order.
+`rebuild.decision`, `rebuild.outcome`, `rebuild.behaviour`, `turn.timing`; `src/trace/outbox.ts`) — with `from <= at < to`, in `seq` order.
 
 - `from`, `to` — ISO 8601 or milliseconds since the epoch; the window is at most 24 hours. One alone
   puts the other 24 hours away; neither is the 24 hours up to now. `to` before or at `from`, a wider
@@ -664,6 +664,20 @@ and of a tenth of the others (`rebuilt`, `group`: `rebuilt`, `idle-not-rebuilt`,
 `recapCallsBeforeSend` (memory, state and message-history reads), `firstAction` (`recap`, `send`, `act`),
 `repeatedCalls` and `repeatedBeforeSend` (calls with the same tool and arguments as one that succeeded among the
 replaced conversation's last 12), `toolCalls`, `modelCalls`, `runMs` and `endedWith`. Numbers and flags only.
+A `turn.timing` row is one turn of a pi085 conversation (`src/runtime/turn-timing.ts`), written when it ends: from a
+message accepted by the agent to the reply it can read, across every pause for the caller's functions. `spanId` is
+`tt_<session>@<inboundAt>`, `ms` the turn's wall time, `status` pi's last run outcome (`completed`, `failed`, `aborted`),
+`cancelled` (a cancel that aborted a run or dropped waiting calls; one with neither writes no row), or `abandoned`
+(verdict `failed`: the caller's new input through the Agents API arrived while the turn waited on a call the caller
+never answered; the turn ends at that input, `replyAt`, and the input opens a new turn — a background completion, a
+push or a lease warning arriving then joins the turn instead). Its `attrs` hold the points — `inboundAt` (the message entered the agent), `saidAt` (durable in the
+transcript), `turnStartAt` (the first step that drove it), `firstJobAt` (the first model job written), `lastAnswerAt`
+(the last answer delivered), `replyAt` (the step that saw the turn end returned) — and the split, whose first five
+add up to `ms` when every job was answered: `inboundToStartMs`, `startToFirstJobMs`, `modelMs` (each job, written to
+answered, as `model.call` measures it), `betweenJobsMs` (each answer to the next job), `lastAnswerToReplyMs`; then,
+inside `betweenJobsMs`, `toolMs` (tools run by the agent, summed per call) and `clientWaitMs` (each pause, from the
+step that paused to the results that completed it), and `prepMs` (`inboundAt` to `saidAt`), with the counts
+`modelJobs`, `tools`, `clientPauses` and `messages` (a steer joins the turn in flight). pd agents write none.
 The answer adds `from`, `to` (ISO), `cursor`, `nextCursor` and `scanned: { local, objects }`. Nothing
 is written.
 

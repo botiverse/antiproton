@@ -1510,6 +1510,8 @@ export class AgentDO extends DurableObject<Env> {
    * session are opened first, so input repairs an object a failed create or update left behind.
    */
   async apiPostInput(tenantId: string, agentId: string, agentJson: string, sessionId: string, text: string, environment: "none" | "container" = "none") {
+    // The turn's inbound point (src/runtime/turn-timing.ts): the adopt, provisioning and binding below are its to count.
+    const receivedAt = Date.now();
     this.#claim(tenantId, agentId);
     return this.#busy("apiPostInput", async () => {
       const rt = this.runtime();
@@ -1522,7 +1524,7 @@ export class AgentDO extends DurableObject<Env> {
       const provides = (id: string) => rt.plugins().find((pl) => pl.id === id)?.provides;
       await rt.provision(tenantId, agentId, apiAgentSeeds(AgentRuntime.DEFAULT_MOUNTS, environment, provides), { chosen: true });
       await this.#bindModel(rt, tenantId, agentId);
-      await rt.postMessage(tenantId, agentId, text, "prompt", sessionId);
+      await rt.postMessage(tenantId, agentId, text, "prompt", sessionId, { receivedAt });
       await this.#wake();
       // The turn is on record now: say so, rather than leaving it for the step that follows.
       await this.broadcast();
