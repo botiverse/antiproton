@@ -14,6 +14,7 @@ import { DatabaseSync } from "node:sqlite";
 import { readdirSync, readFileSync } from "node:fs";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { BenchState } from "../cf/src/bench.ts";
+import { AgentRuntime } from "../cf/src/runtime.ts";
 import { timedTools } from "../src/runtime/turn-timing.ts";
 
 const STAND_IN = "export class DurableObject { constructor(ctx, env) { this.ctx = ctx; this.env = env; } }" +
@@ -180,6 +181,9 @@ async function apiTurns(label: string, messages: Array<{ text: string; script: R
     marks.push({ sent, read: Date.now() });
     must(m.script.length === 0, `the script was not used up: ${show(m.script)}`);
   }
+  // A turn that ended leaves no record behind: the next message opens its own.
+  const left = o.raw.sql.exec("SELECT session FROM turn_timing").toArray();
+  must(left.length === 0, `a turn record outlived its turn: ${show(left)}`);
   return { o, agentId, session, marks, submissions, timing: o.rows("turn.timing") };
 }
 
@@ -283,12 +287,12 @@ async function benchTurn(engine: "pi085" | "pd", slow: boolean) {
   } finally { proto.state = state; }
   const poll = await o.D.benchPoll(taskId);
   must(poll.status === "idle" && poll.answer === "It is pending.", show(poll));
-  return o.rows("turn.timing");
+  return { rows: o.rows("turn.timing"), tables: o.raw.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table'").toArray().map((r: any) => String(r.name)) };
 }
 
 let fast: Row[];
 await check("a /bench turn whose tool runs in the object: one row, 2 jobs, 1 tool, no pause", async () => {
-  fast = await benchTurn("pi085", false);
+  fast = (await benchTurn("pi085", false)).rows;
   must(fast.length === 1, `rows: ${show(fast)}`);
   wellFormed(fast[0]!);
   const a = fast[0]!.attrs;
@@ -296,7 +300,7 @@ await check("a /bench turn whose tool runs in the object: one row, 2 jobs, 1 too
 });
 
 await check("…the same turn with the tool taking 7 s: toolMs moves by 7 s, and betweenJobsMs with it; modelMs does not", async () => {
-  const slow = await benchTurn("pi085", true);
+  const slow = (await benchTurn("pi085", true)).rows;
   must(slow.length === 1, `rows: ${show(slow)}`);
   wellFormed(slow[0]!);
   const a = slow[0]!.attrs, b = fast[0]!.attrs;
@@ -305,9 +309,23 @@ await check("…the same turn with the tool taking 7 s: toolMs moves by 7 s, and
   must(Math.abs(a.modelMs - b.modelMs) < SLACK, `modelMs moved: ${a.modelMs} vs ${b.modelMs}`);
 });
 
-await check("pd writes no turn.timing row: its turn ends inside the harness, where no step sees it", async () => {
-  const rows = await benchTurn("pd", false);
+await check("pd writes no turn.timing row, and is not given pi085's tables for it: its turn ends inside the harness", async () => {
+  const { rows, tables } = await benchTurn("pd", false);
   must(rows.length === 0, show(rows));
+  must(!tables.includes("turn_timing") && !tables.includes("api_client_calls"), `pd object tables: ${show(tables)}`);
+});
+
+await check("inboundAt is when the API handler took the message: the agent's provisioning before the write is in prepMs", async () => {
+  // Provisioning is the API path's own work between taking the message and writing it (AgentDO.apiPostInput).
+  const proto = AgentRuntime.prototype as any, provision = proto.provision;
+  proto.provision = async function (this: unknown, ...args: unknown[]) { clock += 5_000; return provision.apply(this, args); };
+  let r: Awaited<ReturnType<typeof apiTurns>>;
+  try { r = await apiTurns("prep", [{ text: "Hello.", script: [{ text: "Hi." }] }]); }
+  finally { proto.provision = provision; }
+  must(r.timing.length === 1, show(r.timing));
+  wellFormed(r.timing[0]!, r.marks[0]);
+  const a = r.timing[0]!.attrs;
+  must(near(a.prepMs, 5_000) && near(a.inboundToStartMs, 5_000), `prepMs ${a.prepMs}, inboundToStartMs ${a.inboundToStartMs}: ${show(a)}`);
 });
 
 await check("a timed tool is the same tool to the model: every field but execute is the original's, and a skipped one is untouched", async () => {
