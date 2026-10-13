@@ -578,6 +578,7 @@ await check("awaitImport: an import without instructions lifts the hold in its o
   await settle(w, 1);
   must(jobCount(w) === 0, "held");
   must((await imp(w, body(uuid(), [{ path: "a.md", bytes: "x" }]))).status === 201, "import");
+  must((w.alarmAt() ?? Infinity) <= Date.now() + 1_000, `the import armed no wake: ${w.alarmAt()}`);
   await settle(w, 1);
   must(jobCount(w) === 1, `after: ${jobCount(w)}`);
 });
