@@ -344,6 +344,19 @@ await check("new input to a turn the caller left waiting: that turn closes aband
   wellFormed(next, r.marks[1]);
 });
 
+await check("new input while a turn's calls are all answered but not yet resumed joins that turn rather than replacing it", async () => {
+  const r = await apiTurns("answered", [{ text: "Hello.", script: [{ text: "Hi." }] }]);
+  // The state results leave between landing and the step that resumes them: the lane idle, the turn open, its call
+  // answered and not yet used.
+  const sql = r.o.raw.sql as never as { exec(q: string, ...b: unknown[]): { toArray(): any[] } };
+  const inboundAt = Date.now();
+  turnInbound(sql as never, r.session, inboundAt, { stale: false });
+  sql.exec("INSERT INTO api_client_calls(session, call_id, name, arguments, state, output, created_at) VALUES (?, 'c_x', 'lookup', '{}', 'answered', 'W1: pending', ?)", r.session, Date.now());
+  await r.o.D.runtime().postMessage(TENANT, r.agentId, "And W2?", "prompt", r.session);
+  const rec = sql.exec("SELECT inbound_at, messages FROM turn_timing WHERE session = ?", r.session).toArray()[0];
+  must(rec && Number(rec.inbound_at) === inboundAt && Number(rec.messages) === 2, `the turn was replaced: ${show(rec)}`);
+});
+
 await check("a steer into a turn in flight joins it: one row, two messages", async () => {
   const r = await apiTurns("steer", [{ text: "Hello.", script: [{ text: "Hi." }, { text: "Noted." }] }], { steer: "Also, order W2." });
   must(r.timing.length === 1, `rows: ${show(r.timing)}`);
