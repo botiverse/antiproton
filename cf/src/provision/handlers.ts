@@ -402,6 +402,8 @@ export async function handleProvision(
         }
         if ((row.model ?? null) !== model) { await deps.registry.update(tenantId, raftAgentId, { model }); row = { ...row, model }; }
         row = await settlePick(deps, row, headers.credentialId ?? null);
+        // The create completing, not a replay of one that completed: answered as the first create would have been.
+        created = true;
       }
     } else {
       // Refused before the row exists, so an unoffered or locked model leaves nothing made and the id free — as a PUT
@@ -469,7 +471,7 @@ export async function handleProvision(
     if (!found || found.status === "deleted") {
       return fail({ status: 404, code: "not_found", message: `no provisioned agent ${byRaft ? "made from Raft agent " : ""}${rest[0]}` });
     }
-    return modelRoute(method, body, tenantId, found.agentId, headers.credentialId ?? null, deps.models, deps.now);
+    return modelRoute(method, body, tenantId, found, headers.credentialId ?? null, deps.models, deps.registry, deps.now);
   }
   if (rest.length < 1 || rest.length > 2 || (rest.length === 2 && rest[1] !== "credential")) return null;
   const row = byRaft ? await deps.registry.get(tenantId, rest[0]!) : await deps.registry.getByAgentId(tenantId, rest[0]!);
@@ -745,8 +747,10 @@ async function modelList(tenantId: string, m: ProvisionModels) {
  * admin's deployment row is below the pick, so it reads as source "admin" without locking.
  */
 async function modelRoute(
-  method: string, body: unknown, tenantId: string, agentId: string, credentialId: string | null, m: ProvisionModels, now: () => number,
+  method: string, body: unknown, tenantId: string, found: ProvisionedAgent, credentialId: string | null, m: ProvisionModels,
+  registry: Pick<ProvisionRegistry, "update">, now: () => number,
 ): Promise<Response | null> {
+  const agentId = found.agentId;
   const state = async () => {
     const r = resolveModel(await m.choices.layers(tenantId, agentId), m.userModels, m.defaultModel);
     return { ...modelView(r.choice, m.userModels), source: r.source === "owner" ? "chosen" : r.source, locked: r.locked };
@@ -767,6 +771,10 @@ async function modelRoute(
     const unknownModel = notOffered(m.userModels, asked);
     if (unknownModel) return fail(unknownModel);
   }
+  // The owner has chosen, so an interrupted create's pick is settled: its delayed replay must not store the create's
+  // model over this one (`settlePick`). Cleared first: a PUT that fails after it is retried, and the replay then stores
+  // nothing rather than the older value.
+  if (found.modelPending) await registry.update(tenantId, found.raftAgentId, { modelPending: false });
   await storePick(m, tenantId, agentId, asked, credentialId, now);
   // Not the request's failure: the pick is stored, and the next path that binds (a message, a page open) binds it anyway.
   await m.rebind(tenantId, agentId).catch((e: unknown) => console.warn(`rebinding ${agentId} after a provider pick failed: ${String((e as Error)?.message ?? e).slice(0, 200)}`));
@@ -820,10 +828,14 @@ async function modelProblem(m: ProvisionModels | undefined, tenantId: string, ag
   return notOffered(m.userModels, model) ?? await lockedProblem(m, tenantId, agentId);
 }
 
-/** Store the create's pick, if it named one and it is not stored yet, then mark it stored. */
+/**
+ * Make the stored pick the create's, while it is not settled yet, then mark it settled. Unconditional on the value: a
+ * create that stored one model and died before settling, reopened with none, must not leave the first one stored to
+ * run once a lock lifts — null removes it.
+ */
 async function settlePick(deps: ProvisionDeps, row: ProvisionedAgent, credentialId: string | null): Promise<ProvisionedAgent> {
   if (!row.modelPending) return row;
-  if (row.model) await storePick(deps.models!, row.tenantId, row.agentId, row.model, credentialId, deps.now);
+  await storePick(deps.models!, row.tenantId, row.agentId, row.model ?? null, credentialId, deps.now);
   await deps.registry.update(row.tenantId, row.raftAgentId, { modelPending: false });
   return { ...row, modelPending: false };
 }

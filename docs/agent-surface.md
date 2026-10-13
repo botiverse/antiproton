@@ -212,7 +212,8 @@ set, since the create does not refuse the identical replay of an agent that exis
 create asked, not with what runs: a delayed replay after a `PUT …/model` (`null` included) answers as the create
 did and leaves the newer pick alone. One exception: a create that named a model and failed before storing its pick
 (still `provisioning`) has not chosen yet, so its replay may name another model or none, checked as a first create
-— the way out when the option was withdrawn or a lock set in between.
+— the way out when the option was withdrawn or a lock set in between — and answers `201`, the create completing.
+A `PUT …/model` in between is a choice made, so after it that replay is an ordinary one and leaves the PUT's pick.
 
 ### The agent's model
 
@@ -262,8 +263,9 @@ GET or PUT /provision/agents/{agentId}/model
   the same way — the same offered ids, the same `409` under a lock, the same row, `set_by` and log line —
   stored before the agent's model is first bound, so its first model request already goes to it. The row
   and the pick are two writes: a create that fails between them fails, and its replay stores the pick and
-  finishes. The row records whether the create's pick is stored yet (`model_pending`), so once it is, no
-  replay writes it again.
+  finishes. The row records whether the create's pick is settled yet (`model_pending`; a `PUT` settles it
+  too), so once it is, no replay writes it again. Settling makes the stored pick the create's, `null`
+  included: a reopened create without `model` removes one an earlier attempt stored.
 - **An agent never given a pick** is unchanged by these routes: reading them stores nothing and rebuilds
   nothing, and it runs on the default as before (`test/provision-model.ts`).
 

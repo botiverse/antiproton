@@ -510,7 +510,8 @@ await check("POST replay of a create that died before its pick was stored finish
   const w = await world();
   interrupted(w, "gpt-5.6-luna");
   const r = await provisionPost(w, { model: "gpt-5.6-luna" });
-  must(r.status === 200, `replay: ${r.status} ${r.text}`);
+  // The create completing: 201, as the first create would have answered.
+  must(r.status === 201, `replay: ${r.status} ${r.text}`);
   must((await d1ModelChoices(w.DB).layers(T, A)).owner === "gpt-5.6-luna", "the replay did not store the pick");
   const b = await w.rt.store.getModelBinding(T, A);
   must(b?.model === "openai/gpt-5.6-luna", `the replay did not bind it: ${show(b)}`);
@@ -539,7 +540,7 @@ await check("an interrupted create is not stuck: under a new lock its same-body 
   must(same.status === 409 && same.body.error.code === "model_locked", `same body under the lock: ${same.status} ${same.text}`);
   must((await d1ModelChoices(w.DB).layers(T, A)).owner === null, "a locked replay stored a pick");
   const none = await provisionPost(w, {});
-  must(none.status === 200 && none.body.providerAgentId === A && none.body.status === "active", `without model: ${none.status} ${none.text}`);
+  must(none.status === 201 && none.body.providerAgentId === A && none.body.status === "active", `without model: ${none.status} ${none.text}`);
   must((await d1ModelChoices(w.DB).layers(T, A)).owner === null, "a replay without model stored a pick");
   const row: any = w.DB.raw.prepare("SELECT model, model_pending FROM provisioned_agents WHERE tenant_id = ? AND raft_agent_id = ?").get(T, RAFT_ID);
   must(row.model === null && row.model_pending === 0, `the row: ${show(row)}`);
@@ -555,7 +556,7 @@ await check("an interrupted create whose option was withdrawn: the same body is 
   const same = await provisionPost(w, { model: "gpt-5.6-luna" });
   must(same.status === 422 && same.body.error.code === "unknown_model", `same body, withdrawn: ${same.status} ${same.text}`);
   const pro = await provisionPost(w, { model: "deepseek-pro" });
-  must(pro.status === 200, `another model: ${pro.status} ${pro.text}`);
+  must(pro.status === 201, `another model: ${pro.status} ${pro.text}`);
   must((await d1ModelChoices(w.DB).layers(T, A)).owner === "deepseek-pro", "the new model was not stored");
   must((await w.rt.store.getModelBinding(T, A))?.model === "deepseek-v4-pro", "the new model was not bound");
 });
@@ -568,6 +569,35 @@ await check("once the create's pick is stored, a replay never writes it again: a
   const r = await provisionPost(w, { model: "gpt-5.6-luna" });
   must(r.status === 200, `replay: ${r.status} ${r.text}`);
   must((await d1ModelChoices(w.DB).layers(T, A)).owner === null, "the replay undid the PUT null");
+});
+
+await check("a PUT after an interrupted create settles it: the delayed retry of the create is a 200 replay and leaves the PUT", async () => {
+  for (const put of [null, "deepseek-pro"] as const) {
+    const w = await world();
+    interrupted(w, "gpt-5.6-luna");
+    must((await putModel(w, put)).status === 200, `PUT ${put}`);
+    const row: any = w.DB.raw.prepare("SELECT model_pending FROM provisioned_agents WHERE tenant_id = ? AND raft_agent_id = ?").get(T, RAFT_ID);
+    must(row.model_pending === 0, `PUT ${put} left the create unsettled`);
+    const r = await provisionPost(w, { model: "gpt-5.6-luna" });
+    must(r.status === 200 && r.body.providerAgentId === A, `the delayed retry after PUT ${put}: ${r.status} ${r.text}`);
+    must((await d1ModelChoices(w.DB).layers(T, A)).owner === put, `the retry overwrote PUT ${put}: ${(await d1ModelChoices(w.DB).layers(T, A)).owner}`);
+    const g = await call(w, "GET", `agents/${A}/model`);
+    must(g.body.model === (put ?? "deepseek-flash"), `what runs after PUT ${put}: ${g.text}`);
+  }
+});
+
+await check("a create that stored its pick and died unsettled, reopened without model under a lock, leaves no pick to run once the lock lifts", async () => {
+  const w = await world({ post: { model: "gpt-5.6-luna" } });
+  must((await d1ModelChoices(w.DB).layers(T, A)).owner === "gpt-5.6-luna", "the create did not store its pick");
+  // The pick was stored and the flag never cleared.
+  interrupted(w, "gpt-5.6-luna");
+  await d1ModelOverrides(w.DB).put({ tenantId: T, agentId: "", provider: "deepseek", model: "deepseek-v4-pro", setBy: "adm", setAt: 1 });
+  const r = await provisionPost(w, {});
+  must(r.status === 201, `reopened without model: ${r.status} ${r.text}`);
+  must((await d1ModelChoices(w.DB).layers(T, A)).owner === null, "the first pick is still stored");
+  await d1ModelOverrides(w.DB).remove(T, "");
+  const g = await call(w, "GET", `agents/${A}/model`);
+  must(g.body.model === "deepseek-flash" && g.body.source === "default", `after the lock lifts: ${g.text}`);
 });
 
 // ---- the next turn, with the harness open (#826) ------------------------------
