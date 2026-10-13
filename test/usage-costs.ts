@@ -20,9 +20,10 @@ import { closedCostsTo, parseCostsQuery } from "../cf/src/admin-usage-costs.ts";
 import { usageCostsPanel } from "../cf/src/ui.ts";
 import { d1ApiKeys } from "../cf/src/control-plane.ts";
 
-// A hand-edited date the calendar does not have is refused, not rolled over (2026-02-31 would
-// become 03-03) and not a throw (2026-13-01 used to reach toISOString on NaN and 500): without
-// closedCostsTo's calendar check these regress silently, so the refusal is pinned here.
+// closedCostsTo's calendar check guards the +1 day it does to a bare `to`, not the refusal:
+// parseCostsQuery refuses an impossible date on its own. Without the check, 2026-02-31 would be
+// shifted into 2026-03-04 — a real day, accepted — and 2026-13-01 used to reach toISOString on
+// NaN and 500. A bare impossible `to` in this position is what pins the shift down.
 for (const bad of ["2026-02-31", "2026-13-01", "2026-00-10"]) {
   const q = parseCostsQuery(closedCostsTo(new URLSearchParams({ from: "2026-10-01", to: bad })), Date.parse("2026-10-12T12:00:00Z"));
   if (typeof q !== "string") throw new Error(`${bad}: expected a refusal, got a window ${q.from}..${q.to}`);
