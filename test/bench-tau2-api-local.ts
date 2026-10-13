@@ -216,6 +216,9 @@ await check("a task over the API runs to dbMatch: the customer's message, two ca
   must(flash.ended === "stop" && flash.turns === 1 && flash.simCalls === 2, show([flash.ended, flash.turns, flash.simCalls]));
   // The runner times the sim (30ms a call, twice here): without simMs in the row this reds.
   must(flash.simMs >= 60, show(flash.simMs));
+  // One agent answer this row, received in-process; two tool runs (get_order_details, cancel_pending_order).
+  must(Array.isArray(flash.replyAts) && flash.replyAts.length === 1 && flash.replyAts[0] >= flashWindow.from, show(flash.replyAts));
+  must(typeof flash.toolExecMs === "number", show(flash.toolExecMs));
   must(flash.simLast === "Thanks! ###STOP###", show(flash.simLast));
   must(show(flash.performedWrites) === '["cancel_pending_order"]', show(flash.performedWrites));
   must(BASE_DB.orders["#W1"].status === "pending", "the runner wrote the base database");
