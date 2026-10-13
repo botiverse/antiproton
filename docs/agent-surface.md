@@ -278,6 +278,8 @@ is `404`. `cf/src/provision/usage.ts`; tests in `test/provision-usage.ts`.
   gets its own tenant; those parameters do not choose one.
 - **Kept 15 s.** Each isolate keeps the whole answer for 15 s (`USAGE_CACHE_MS`), per tenant and
   window as widened (so no query and `?bucket=day` share one), never past the UTC day it was made in.
+  Only a window of at most 62 days is kept (a longer one is read afresh every time), and at most 256
+  answers per isolate, the oldest dropped first.
   So a figure can be 15 s old, and with the consumer's own 30 s reading `refusing` can differ from what
   the consumer does for under a minute.
 

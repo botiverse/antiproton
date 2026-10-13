@@ -331,7 +331,7 @@ is exempt, whether the platform limit is reached, and whether a call would be
 refused now — `standing` in `cf/src/spend-limit.ts`, over a fresh `readDaySpend`
 and the same `judge` the consumer applies, so the two cannot disagree on the rule,
 only on the reading's age: the answer is kept 15 s per isolate (`USAGE_CACHE_MS`,
-never past its UTC day), the consumer's reading up to 30 s (above), so they can
+never past its UTC day; windows of at most 62 days, at most 256 answers), the consumer's reading up to 30 s (above), so they can
 differ for under a minute. The platform's total and limit are never shown to a
 tenant, only the boolean.
 
