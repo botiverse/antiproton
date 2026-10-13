@@ -385,8 +385,9 @@ export interface ProvisionedAgent {
   /**
    * The offered option's id the creating POST asked for, null when it asked for none (and on rows from before 0019).
    * What a replay is compared with; what runs is model_choices, which a PUT …/model changes and this never does.
+   * Optional so a row built elsewhere without it (a test's, a fake registry's) reads as none asked.
    */
-  model: string | null;
+  model?: string | null;
   status: ProvisionStatus;
   pushRegistered: boolean;
   pushError: string | null;
@@ -429,7 +430,7 @@ export function d1ProvisionedAgents(db: D1Database, now: () => number = Date.now
       await db.prepare(
         "INSERT INTO provisioned_agents(tenant_id, raft_agent_id, agent_id, raft_server_id, raft_origin, name, instructions, credential_hash, model, status, push_registered, push_error, created_at, updated_at) " +
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-      ).bind(r.tenantId, r.raftAgentId, r.agentId, r.raftServerId, r.raftOrigin, r.name, r.instructions, r.credentialHash, r.model, r.status,
+      ).bind(r.tenantId, r.raftAgentId, r.agentId, r.raftServerId, r.raftOrigin, r.name, r.instructions, r.credentialHash, r.model ?? null, r.status,
         r.pushRegistered ? 1 : 0, r.pushError, t, t).run();
     },
     async get(tenantId, raftAgentId) {

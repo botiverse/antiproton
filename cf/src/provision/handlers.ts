@@ -378,7 +378,7 @@ export async function handleProvision(
       if (row.status === "deleted") {
         return fail({ status: 409, code: "deleted", message: "this Raft agent was deleted here; a new agent needs a new id" });
       }
-      const differs = (Object.keys(asked) as Array<keyof typeof asked>).filter((k) => row![k] !== asked[k]);
+      const differs = (Object.keys(asked) as Array<keyof typeof asked>).filter((k) => (k === "model" ? row!.model ?? null : row![k]) !== asked[k]);
       // The credential is the one field that matters most: a delayed retry with an old one must not
       // overwrite a newer PUT /credential. Compared by hash; a row from
       // before the hash existed accepts the first replay and records it.
