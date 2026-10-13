@@ -333,6 +333,79 @@ const STATE_KEY = "state";
  */
 const SINCE_KEY = "since";
 
+/**
+ * What Raft last said about this mount's Server's rollout flags (the credential context's `features`, SDK 0.16.0),
+ * as `{ reminderApp, vaultApp, at }`. The prompt paragraph is built from it (`featuresParagraph`), and that paragraph
+ * is read with no credential (`ToolGateway.promptParagraphs`), so it can only read what a credentialed call kept here.
+ * Two calls keep it: the listing, from the same `GET /context` it already makes (`snapshotTools`), and a
+ * `receive_events` pull once the record is older than `FEATURES_REFRESH_MS`, so a flag Raft flips reaches the agent
+ * without anyone refreshing the mount. A change then reaches a conversation already under way as a notice, never by
+ * rewriting its prompt (src/runtime/prompt-context.ts). Listed: flags, not a credential.
+ */
+export const CONTEXT_STORE = "context";
+export const FEATURES_KEY = "features";
+/**
+ * How old the kept flags may grow before a pull reads them again. They are rollout flags, flipped rarely; an hour
+ * bounds how long a flipped one goes unseen, at one small extra request per mount per hour of pulling.
+ */
+export const FEATURES_REFRESH_MS = 60 * 60_000;
+
+export interface RaftFeatures { reminderApp: boolean; vaultApp: boolean }
+
+/** The flags as Raft gives them: each on only when Raft says `true`. Absent (a Server older than the field) is both off. */
+export function featuresOf(raw: unknown): RaftFeatures {
+  const f = object(raw);
+  return { reminderApp: f.reminderApp === true, vaultApp: f.vaultApp === true };
+}
+
+async function keepFeatures(ctx: PluginContext, raw: unknown): Promise<void> {
+  try { await ctx.db.put(CONTEXT_STORE, { ...featuresOf(raw), at: Date.now() }, FEATURES_KEY); }
+  // A flag kept late costs a prompt paragraph a while; it must not fail the call that read it.
+  catch (e) { console.warn(`raft features could not be kept for mount ${ctx.alias}: ${String((e as Error)?.message ?? e)}`); }
+}
+
+/**
+ * Read the flags again when the kept ones are older than `FEATURES_REFRESH_MS`. Never throws: Raft not answering
+ * leaves the kept flags as they were. A mount with none kept is left to the listing, which records them, and which the
+ * runtime re-takes for every mount listed before this build (`FEATURES_BASIS`).
+ */
+async function refreshFeatures(ctx: PluginContext): Promise<void> {
+  try {
+    const kept = object(await ctx.db.get(CONTEXT_STORE, FEATURES_KEY));
+    if (typeof kept.at !== "number" || Date.now() - kept.at < FEATURES_REFRESH_MS) return;
+    const me = await raftFor(ctx, { state: false }).routes.agent.context();
+    if (me.ok) await keepFeatures(ctx, me.data.features);
+  } catch (e) {
+    console.warn(`raft features could not be read again for mount ${ctx.alias}: ${String((e as Error)?.message ?? e)}`);
+  }
+}
+
+/**
+ * The Vault sentence in Raft's own wording (the daemon-managed agent's prompt), so a hosted agent and a daemon-managed
+ * one are told the same thing.
+ */
+export const VAULT_LINE = "When a new secret needs storing, keep it out of chat: if you choose the value (e.g. a signing secret), " +
+  "create it in the Vault yourself (`create-vault`, then `generate`); if a human holds it (e.g. a third-party API key), " +
+  "ask them to add it in the Vault web page and share access with you.";
+
+/**
+ * This mount's prompt paragraph: what the Server's flags change about how the agent works, or null when none is on,
+ * so a mount on a Server with both off (or older than the flags) adds nothing and the prompt is as it was. The Reminder
+ * app's service id differs from Server to Server and a Server may not have it, so the paragraph names none: the agent
+ * finds it in the installed list.
+ */
+export function featuresParagraph(features: RaftFeatures, alias: string): string | null {
+  const lines: string[] = [];
+  if (features.reminderApp) {
+    lines.push("Reminders: on this Raft Server reminders are set with the Reminder app, a Connected App; the old `raft reminder` " +
+      `command is not available to you. To set one, find the Reminder app in \`${LIST_TOOL}\` on \`${alias}\` and use the service ` +
+      `that list shows for it, never an id from memory; \`${ACTIONS_TOOL}\` shows its actions and \`${INVOKE_TOOL}\` runs one. ` +
+      "If the list has no Reminder app, ask an admin to install the Reminder app.");
+  }
+  if (features.vaultApp) lines.push(VAULT_LINE);
+  return lines.length ? lines.join("\n\n") : null;
+}
+
 function isRaftState(value: unknown): value is RaftState {
   const v = object(value);
   return v.schema === RAFT_STATE_SCHEMA && typeof v.version === "number" && typeof v.frontier === "object" && v.frontier !== null;
@@ -2068,6 +2141,14 @@ export function toolsBasisOf(tools: ReadonlyArray<{ name: string; capability?: r
   return `raft-tools:${createHash("sha256").update(JSON.stringify(canonical)).digest("hex").slice(0, 16)}`;
 }
 
+/**
+ * An entry in the basis for what a listing records beside the list rather than for a tool: the Server's flags
+ * (`CONTEXT_STORE`), first recorded by the build that added it. A mount listed before then has none recorded, and
+ * nothing else would list it again, so the entry moves every such mount's basis and the runtime re-takes its list at
+ * the next turn, which records them. Changed only when a listing starts recording something new.
+ */
+export const FEATURES_BASIS = "(listing records the Server's features: 1)";
+
 /** What a mount whose credential has no capability at all is told, in its snapshot's `skipped`. */
 const EVERY_OPERATION = "(every Raft operation)";
 
@@ -2143,6 +2224,7 @@ export function createRaftPlugin(deps: {
      * turn (`Plugin.toolsBasis`), so a tool a deploy added reaches a mount without anyone refreshing it.
      */
     toolsBasis: toolsBasisOf([
+      { name: FEATURES_BASIS },
       ...OWN_TOOLS.map((t) => ({ name: t.name })), ...ASSISTANT_TOOLS.map((t) => ({ name: t.name })),
       ...offerable.map((op) => ({ name: op.toolName, capability: op.capability })),
       ...viewTools.map((t) => ({ name: t.name, capability: RAFT_OPERATIONS.find((o) => o.name === DOWNLOAD_OP)!.capability })),
@@ -2150,7 +2232,11 @@ export function createRaftPlugin(deps: {
     /** The push registration this mount holds: whether it exists is listable, what it holds is not. */
     database: {
       // Version 4 added the Agent Login sessions: one sealed row per Connected App, none listed, since each is a credential.
-      version: 4, stores: { [PUSH_STORE]: { listed: [PUSH_KEY] }, [INBOX_STORE]: { listed: [STATE_KEY, SINCE_KEY] }, [SESSION_STORE]: {} },
+      // Version 5 added the Server's flags as the listing last read them (`CONTEXT_STORE`); nothing to carry over.
+      version: 5, stores: {
+        [PUSH_STORE]: { listed: [PUSH_KEY] }, [INBOX_STORE]: { listed: [STATE_KEY, SINCE_KEY] }, [SESSION_STORE]: {},
+        [CONTEXT_STORE]: { listed: [FEATURES_KEY] },
+      },
       /**
        * Version 2 kept the cursor and the frontier under their own keys; version 3 keeps the SDK's state record.
        * The version-2 cursor was the last batch handed to the model, not yet acknowledged, which is exactly the
@@ -2190,6 +2276,14 @@ export function createRaftPlugin(deps: {
     },
     /** Every tool any mount can be offered; one mount's own list is `mountTools`. */
     tools: [...allTools, ...ASSISTANT_TOOLS],
+
+    /**
+     * What the Server's flags change about how the agent works (`featuresParagraph`), from the flags a credentialed
+     * call last kept (`CONTEXT_STORE`); null with none kept or none on, which leaves the prompt as it was.
+     */
+    async promptContribution(ctx) {
+      return featuresParagraph(featuresOf(await ctx.db.get(CONTEXT_STORE, FEATURES_KEY)), ctx.alias);
+    },
     retired: RETIRED,
 
     /**
@@ -2250,6 +2344,8 @@ export function createRaftPlugin(deps: {
           : "Raft's answer did not match the Raft SDK's contract";
         throw new Error(`could not ask Raft what this mount's credential may do: ${why}`);
       }
+      // The same answer carries the Server's flags; kept for the prompt paragraph, which has no credential to ask with.
+      await keepFeatures(ctx, me.data.features);
       const capabilities = new Set(me.data.credential.capabilities);
       const tools: ToolSchema[] = [];
       const skipped: Array<{ name: string; reason: string }> = [];
@@ -2373,8 +2469,11 @@ export function createRaftPlugin(deps: {
         // The pull runs on a client whose state is not saved: the SDK books every message a pull returns as seen,
         // and only those `handOver` shows may be. As the model's own: receive_events is model-only, so the gateway
         // has already refused it from a program and from an approved call's replay.
+        // Beside the pull, not before it: kept flags past their age are read again, which never fails the pull.
+        const features = refreshFeatures(ctx);
         const out = await raftFor(ctx, { state: false }).invoke("inbox.check",
           { ack: "cursor", limit, ...(since !== null ? { since } : {}) }, { origin: "model" });
+        await features;
         if (!out.ok) throw sdkFailure(out as RaftFailure, unofferedFor(ctx));
         const batch = (out as { data: RaftInboxBatch }).data;
         const given = handOver(batch, unofferedFor(ctx));

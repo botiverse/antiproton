@@ -6,7 +6,7 @@
  */
 import { RAFT_OPERATIONS } from "@botiverse/raft-sdk";
 import {
-  raftPlugin as raftWithoutStorage, createRaftPlugin, downloadAttachment, viewAttachment, imageHeader, toolsBasisOf, EXCLUDED,
+  raftPlugin as raftWithoutStorage, createRaftPlugin, downloadAttachment, viewAttachment, imageHeader, toolsBasisOf, EXCLUDED, FEATURES_BASIS,
   GENERATED, VIEW_TOOL, VIEW_MAX_BYTES, VIEW_MAX_SIDE,
 } from "../src/plugins/raft.ts";
 import { admitTools } from "../src/runtime/mount-tools.ts";
@@ -370,7 +370,8 @@ await check("toolsBasis moved with the view, so a snapshot taken without it is r
   const ASSISTANT = ["assistant_owner_inbox", "assistant_owner_messages"];
   const generated = GENERATED.map((op) => ({ name: op.toolName, capability: op.capability }));
   const download = RAFT_OPERATIONS.find((op) => op.name === "attachments.downloadUrl")!;
-  const named = [...OWN, ...ASSISTANT].map((name) => ({ name }));
+  // FEATURES_BASIS stands for what a listing records beside the list (the Server's flags), not a tool.
+  const named = [FEATURES_BASIS, ...OWN, ...ASSISTANT].map((name) => ({ name }));
   const without = toolsBasisOf([...named, ...generated]);
   // Control: the formula is the plugin's — with the view it gives the plugin's basis.
   must(toolsBasisOf([...named, ...generated, { name: VIEW_TOOL, capability: download.capability }]) === withStorage.toolsBasis, `control: ${withStorage.toolsBasis}`);

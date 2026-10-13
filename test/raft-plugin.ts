@@ -1,6 +1,6 @@
 import { createHmac } from "node:crypto";
 import { createRaft, isInterrupted, RAFT_OPERATIONS } from "@botiverse/raft-sdk";
-import { raftPlugin as raftWithoutStorage, EXCLUDED, EVENTS_LIMIT, GENERATED, handOver, INBOX_STORE, KEY_LIFETIME_MS, PAGE_ROWS, PUSH_KEY, PUSH_STORE, originOf, pagingArg, toolOf, offeredTerms, escapeMarks, unescapeMarks, createRaftPlugin, downloadAttachment, ATTACHMENT_MAX_BYTES, toolsBasisOf, WITHHELD_ARGUMENTS } from "../src/plugins/raft.ts";
+import { raftPlugin as raftWithoutStorage, EXCLUDED, EVENTS_LIMIT, GENERATED, handOver, INBOX_STORE, KEY_LIFETIME_MS, PAGE_ROWS, PUSH_KEY, PUSH_STORE, originOf, pagingArg, toolOf, offeredTerms, escapeMarks, unescapeMarks, createRaftPlugin, downloadAttachment, ATTACHMENT_MAX_BYTES, toolsBasisOf, WITHHELD_ARGUMENTS, FEATURES_BASIS } from "../src/plugins/raft.ts";
 import { readFileSync } from "node:fs";
 import { PARK_BYTES } from "../src/plugins/artifacts.ts";
 import { setLogSink } from "../src/core/log.ts";
@@ -858,7 +858,7 @@ await check("a version-2 mount's cursor and frontier become the SDK's state: the
   const since = new URL(calls[0]!.url).searchParams.get("since");
   if (since !== "41") throw new Error(`the carried-over batch was not the one acknowledged: since=${since}`);
   const st = tables.get(scope, "inbox", "state") as any;
-  if (tables.version(scope) !== 4 || st?.schema !== "raft-sdk-state.v1" || st.frontier?.targets?.["#general"]?.upTo !== 30) {
+  if (tables.version(scope) !== 5 || st?.schema !== "raft-sdk-state.v1" || st.frontier?.targets?.["#general"]?.upTo !== 30) {
     throw new Error(`upgrade: version ${tables.version(scope)}, state ${JSON.stringify(st)}`);
   }
   if (tables.get(scope, "inbox", "cursor") !== undefined || tables.get(scope, "inbox", "frontier") !== undefined) throw new Error("version-2 keys survived");
@@ -3580,7 +3580,8 @@ await check("the basis covers each tool's name and the capability it needs, in a
   const base = toolsBasisOf(tools);
   // attachments_view counts with the download's capability, since a snapshot lists it exactly where it lists the download.
   const view = { name: VIEW, capability: opNamed("attachments.downloadUrl").capability };
-  must(toolsBasisOf([...OWN.map((name) => ({ name })), ...ASSISTANT.map((name) => ({ name })), ...tools, view]) === raftPlugin.toolsBasis, `control: the plugin's basis is made this way: ${raftPlugin.toolsBasis}`);
+  // FEATURES_BASIS stands for what a listing records beside the list (the Server's flags), not a tool.
+  must(toolsBasisOf([{ name: FEATURES_BASIS }, ...OWN.map((name) => ({ name })), ...ASSISTANT.map((name) => ({ name })), ...tools, view]) === raftPlugin.toolsBasis, `control: the plugin's basis is made this way: ${raftPlugin.toolsBasis}`);
   // Same names and capabilities, other orders (the tools reversed, a capability list reversed): the same basis.
   const reordered = [...tools].reverse().map((t) => ({ ...t, capability: [...t.capability].reverse() }));
   must(toolsBasisOf(reordered) === base, "the order moved the basis");
