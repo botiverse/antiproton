@@ -16,6 +16,7 @@ import {
 import {
   listSeedFiles, readSeal, SEED_FILES_ALTERS, SEED_FILES_SCHEMA, seedManifestOf, sealSeedFiles, writeSeedFile, type SealHow, type SeedWrite,
 } from "./seed-files.ts";
+import { readImport } from "./workspace-import.ts";
 
 /**
  * Durable Object SQLite backend. Same schema and same guards as the sqlite
@@ -835,6 +836,10 @@ export class DurableObjectStore implements StorageAdapter {
 
   async listSeedFiles(tenantId: string, agentId: string) {
     return listSeedFiles(this.#sql, tenantId, agentId);
+  }
+
+  async listImportedFiles(tenantId: string, agentId: string) {
+    return readImport(this.#sql, tenantId, agentId)?.record.files ?? null;
   }
 
   async setPluginChoice(tenantId: string, agentId: string, plugin: string, choice: PluginChoice) {

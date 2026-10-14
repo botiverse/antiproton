@@ -149,16 +149,19 @@ export function statePlugin(
   kek: () => Promise<SealingKey | null> = async () => null,
 ): Plugin {
   /**
-   * The seeded block, then the working set. A working-set document that is also a seeded path is shown once, in
-   * the seeded block: under "What you already know" it would be headed "written by you", which a file the setup
-   * gave is not.
+   * The seeded block, the imported block, then the working set. A working-set document that is also a seeded path is
+   * shown once, in the seeded block: under "What you already know" it would be headed "written by you", which a file
+   * the setup gave is not. A seeded path is not repeated among the imported ones either (an import refuses one, so
+   * only a seed written after an import could be both).
    */
   const paragraph = async (ctx: { caller: { tenantId: string; agentId: string } }) => {
     const { tenantId, agentId } = ctx.caller;
     const seeds = await store.listSeedFiles(tenantId, agentId);
+    const seededPaths = new Set(seeds.map((f) => f.path));
     const seeded = await seededFilesParts(store, tenantId, agentId, seeds);
-    const set = await workingSetParts(store, tenantId, agentId, new Set(seeds.map((f) => f.path)));
-    return { text: seeded.text + set.text, parts: [...seeded.parts, ...set.parts] };
+    const imported = await importedFilesParts(store, tenantId, agentId, seededPaths);
+    const set = await workingSetParts(store, tenantId, agentId, seededPaths);
+    return { text: seeded.text + imported.text + set.text, parts: [...seeded.parts, ...imported.parts, ...set.parts] };
   };
   const plugin: Plugin = {
     id: PLUGIN_ID,
@@ -704,6 +707,26 @@ function utf8Bytes(value: Json | undefined): number | null {
 }
 
 /**
+ * `MEMORY.md`'s text as the prompt shows it, seeded or imported: fenced, and cut at `SEEDED_MEMORY_BUDGET` with a line
+ * after the fence saying where the rest is. The cut line is outside the fence: it is the prompt speaking, not the file.
+ */
+function fencedMemory(value: Json, getTool: string | null): string {
+  const text = typeof value === "string" ? value : JSON.stringify(value);
+  let kept = text;
+  let cut = "";
+  if (text.length > SEEDED_MEMORY_BUDGET) {
+    // Not between the two halves of a surrogate pair.
+    const end = /[\uD800-\uDBFF]/.test(text[SEEDED_MEMORY_BUDGET - 1]!) ? SEEDED_MEMORY_BUDGET - 1 : SEEDED_MEMORY_BUDGET;
+    kept = text.slice(0, end);
+    cut = `\n… cut at ${end} of ${text.length} characters; ` +
+      (getTool ? `get \`${SEEDED_MEMORY}\` with ${getTool} for the rest.` : "the rest is not shown.");
+  }
+  kept = kept.trimEnd();
+  const fence = fenceFor(kept);
+  return `${fence}\n${kept}\n${fence}${cut}`;
+}
+
+/**
  * The files an evaluation's setup put in the workspace (src/store/seed-files.ts),
  * as the agent is shown them when the harness opens: `MEMORY.md`'s working copy
  * in full up to a budget, fenced, then every other seeded path with its working
@@ -777,21 +800,7 @@ export async function seededFilesParts(
       body = `${what} It is too large to show here and is kept in object storage; ` +
         (getTool ? `read it with ${getTool}.` : "you have no tool mounted for reading it.");
     } else {
-      const text = typeof got.value === "string" ? got.value : JSON.stringify(got.value);
-      let kept = text;
-      let cut = "";
-      if (text.length > SEEDED_MEMORY_BUDGET) {
-        // Not between the two halves of a surrogate pair.
-        const end = /[\uD800-\uDBFF]/.test(text[SEEDED_MEMORY_BUDGET - 1]!) ? SEEDED_MEMORY_BUDGET - 1 : SEEDED_MEMORY_BUDGET;
-        kept = text.slice(0, end);
-        cut = `\n… cut at ${end} of ${text.length} characters; ` +
-          (getTool ? `get \`${SEEDED_MEMORY}\` with ${getTool} for the rest.` : "the rest is not shown.");
-      }
-      kept = kept.trimEnd();
-      const fence = fenceFor(kept);
-      // The cut line is outside the fence: it is the prompt speaking, not the file.
-      body = `${what} Its current content is the text inside the fence below:\n\n` +
-        `${fence}\n${kept}\n${fence}${cut}`;
+      body = `${what} Its current content is the text inside the fence below:\n\n` + fencedMemory(got.value, getTool);
     }
     parts.push(`${seedLine(memory.path, sizeOf(memory, got), mode)}\n${body}`);
   }
@@ -819,5 +828,74 @@ export async function seededFilesParts(
   return {
     text: "\n\n" + parts.join("\n\n"),
     parts: [{ key: "seeds", label: "Workspace files provided at setup", text: rest, by: "plugin" }, ...memoryPart],
+  };
+}
+
+/** How many of an import's other paths the prompt names; the rest are counted, and the `list` tool finds them. */
+export const IMPORTED_PATHS_SHOWN = 40;
+
+/**
+ * The files a workspace import brought (src/store/workspace-import.ts), as the agent is shown them when the harness
+ * opens: `MEMORY.md`'s working copy fenced up to `SEEDED_MEMORY_BUDGET`, by `fencedMemory` as a seeded one is, then
+ * up to `IMPORTED_PATHS_SHOWN` of the other paths, and the `get` that opens them. Empty when nothing was imported, so
+ * every other agent's prompt is the one it had. `exclude` is the seeded paths, which the seeded block shows already.
+ *
+ * Read from the working copy, as `seededFilesParts` reads its own, never from what the import carried: the agent may
+ * have edited `MEMORY.md` since, and what it is shown is what its `get` would answer. One kept in object storage is
+ * not fetched (opening the harness does not wait on a bucket); the agent is told to `get` it. The other paths are
+ * named from the import's manifest, without sizes: reading each row to size it would cost a read per path on every
+ * open, and a path the agent removed since is answered as missing by `get`, which the heading says may happen.
+ *
+ * Worded "brought from your previous workspace", never "written by you", which heads the working set, nor "provided
+ * at setup", which heads the seeded block: the evaluation's record counts seeded paths by the lines `seedLine`
+ * writes (cf/src/fresh-context.ts `seededPathsListed`), and no line here has that shape. In the parts the file is
+ * `by: "setup"`, the one kind whose text a change notice shows fenced and under its own label rather than as the
+ * agent's (src/runtime/prompt-context.ts).
+ *
+ * Part of the same paragraph as the seeded block, so it is taken when the seeded block is: once per conversation for
+ * pi085, whose prompt is snapshotted at its start, with an edit since told as a change to the `import:MEMORY.md`
+ * part; patched in place by pd. An import lands before the first turn (an agent made with `awaitImport` runs none
+ * until it does), so the first prompt already carries it.
+ */
+export async function importedFilesParts(
+  store: StorageAdapter, tenantId: string, agentId: string, exclude: ReadonlySet<string>,
+): Promise<{ text: string; parts: PromptPart[] }> {
+  const files = (await store.listImportedFiles(tenantId, agentId))?.filter((f) => !exclude.has(f.path)) ?? [];
+  if (!files.length) return { text: "", parts: [] };
+  const alias = (await store.findMountsByPlugin(tenantId, agentId, PLUGIN_ID))[0]?.alias;
+  const getTool = alias ? `the \`get\` tool on the \`${alias}\` mount` : null;
+  // A path the key rule refuses never reached a row (the import route checks it), and is never operator text in the prompt.
+  const shown = files.filter((f) => STATE_KEY.test(f.path)).map((f) => f.path);
+  const parts: string[] = [
+    "# Files brought from your previous workspace\n" +
+    "These files were brought from your previous workspace when you moved here, before your first task here. Each " +
+    "is a key in your state store, named by its path; you may have changed or removed some since. " +
+    (getTool ? `Open one with ${getTool}, its path as the \`key\`.` : "You have no tool mounted for opening them."),
+  ];
+  const memory = shown.includes(SEEDED_MEMORY);
+  if (memory) {
+    const got = await store.getState(tenantId, agentId, SEEDED_MEMORY);
+    const body = !got
+      ? "It has since been removed from your workspace."
+      : got.ref && got.value == null
+        ? "It is too large to show here and is kept in object storage; " +
+          (getTool ? `read it with ${getTool}.` : "you have no tool mounted for reading it.")
+        : "Its current content is the text inside the fence below:\n\n" + fencedMemory(got.value, getTool);
+    parts.push(`## \`${SEEDED_MEMORY}\`, brought from your previous workspace\n${body}`);
+  }
+  const memoryPart: PromptPart[] = memory
+    ? [{ key: `import:${SEEDED_MEMORY}`, label: `\`${SEEDED_MEMORY}\`, brought from your previous workspace`, text: parts[parts.length - 1]!, by: "setup" }]
+    : [];
+  const others = shown.filter((p) => p !== SEEDED_MEMORY);
+  const lines = others.slice(0, IMPORTED_PATHS_SHOWN).map((p) => `- \`${p}\``);
+  const unnamed = files.length - (memory ? 1 : 0) - lines.length;
+  if (unnamed > 0) {
+    lines.push(`- and ${unnamed} more` + (alias ? `, which the \`list\` tool on the \`${alias}\` mount shows.` : "."));
+  }
+  if (lines.length) parts.push((memory ? "## Other files\n" : "") + lines.join("\n"));
+  const rest = [parts[0]!, ...(lines.length ? [parts[parts.length - 1]!] : [])].join("\n\n");
+  return {
+    text: "\n\n" + parts.join("\n\n"),
+    parts: [{ key: "imports", label: "Files brought from your previous workspace", text: rest, by: "plugin" }, ...memoryPart],
   };
 }

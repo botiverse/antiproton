@@ -1654,7 +1654,10 @@ export interface PromptPart {
   label: string;
   /** The part's text as the paragraph shows it; empty when the part is absent. */
   text: string;
-  /** Who wrote the text: the agent, the evaluation's setup (seeded files), or the plugin itself. */
+  /**
+   * Who wrote the text: the agent, the evaluation's setup (seeded files) or a workspace import (files from where the
+   * agent ran before; never told as written by it here), or the plugin itself.
+   */
   by: "agent" | "setup" | "plugin";
 }
 

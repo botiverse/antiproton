@@ -560,7 +560,10 @@ await check("awaitImport: a push before the import is accepted and queued and st
   let threw = "";
   try { await w.rt.postMessage(T, A, "console", "prompt"); } catch (e) { threw = String((e as Error).message); }
   must(/waiting for its workspace import/.test(threw), `postMessage while held: ${threw || "no error"}`);
-  const r = await imp(w, body(uuid(), [{ path: "MEMORY.md", bytes: "imported memory" }], { instructions: "IMPORTED-PERSONA-77" }));
+  const r = await imp(w, body(uuid(), [
+    { path: "MEMORY.md", bytes: "# Memory\nIMPORTED-MEMORY-41: the user prefers short answers\n" },
+    { path: "notes/carried-plan.md", bytes: "plan" }, { path: "notes/2026/people.md", bytes: "people" },
+  ], { instructions: "IMPORTED-PERSONA-77" }));
   must(r.status === 201, `import: ${r.status} ${r.text}`);
   // Woken now, not at the hold's deadline: the queued push is posted by the pass the import armed.
   must((w.alarmAt() ?? Infinity) <= Date.now() + 1_000, `the import armed no wake: ${w.alarmAt()}`);
@@ -568,6 +571,12 @@ await check("awaitImport: a push before the import is accepted and queued and st
   must(jobCount(w) === 1, `no turn after the import: ${jobCount(w)}`);
   const req = await asked(w, 0);
   must(req.includes("PUSHED-BEFORE-IMPORT") && req.includes("IMPORTED-PERSONA-77"), `the first turn: push ${req.includes("PUSHED-BEFORE-IMPORT")} persona ${req.includes("IMPORTED-PERSONA-77")}`);
+  // The imported files reach the model in the first request: MEMORY.md's text, the other paths by name, under the
+  // import's own heading and never the seeded block's (src/plugins/state.ts `importedFilesParts`).
+  for (const want of ["IMPORTED-MEMORY-41", "notes/carried-plan.md", "notes/2026/people.md", "brought from your previous workspace"]) {
+    must(req.includes(want), `the first request does not carry ${want}`);
+  }
+  must(!req.includes("provided at setup") && !req.includes("Workspace files provided"), "the import was shown as seeded files");
   const rows = holdRows(w);
   must(rows.length === 1 && rows[0].status === "import" && rows[0].verdict === "ok", `trace: ${show(rows)}`);
 });
