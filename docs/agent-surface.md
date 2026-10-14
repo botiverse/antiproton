@@ -298,16 +298,17 @@ PUT /provision/servers/{raftServerId}/model-picker
   `409 model_locked` under an operator's agent or tenant row as before. No wrangler config sets it
   (`test/provision-model.ts` fails if `cf/wrangler.jsonc` or `cf/wrangler.preview.jsonc` does), because a server
   with no row reads as off: enforced before Raft has sent the switch for every server, it would refuse picks Raft
-  allows. To turn it on, once Raft has backfilled every server: add `"MODEL_PICKER_ENFORCE": "1"` to the `vars` of
-  `cf/wrangler.jsonc` (and `cf/wrangler.preview.jsonc` for preview), drop the wrangler check in
-  `test/provision-model.ts` for that file, and deploy. Everything below "Default: off" describes the enforced
-  behaviour.
+  allows. To turn it on, once Raft has backfilled every server and syncs the switch before each create: add
+  `"MODEL_PICKER_ENFORCE": "1"` to the `vars` of `cf/wrangler.jsonc` (and `cf/wrangler.preview.jsonc` for
+  preview), drop the wrangler check in `test/provision-model.ts` for that file, and deploy. Everything below
+  "Default: off" describes the enforced behaviour.
 - **Default: off.** A server Raft has never sent this for is off. Raft sends it whenever its flag for the server
   changes; the latest write wins.
 - **Rollout order.** When enforcement is first turned on, **every server is off**, including servers whose Raft flag
-  is already on, until Raft sends `{ "enabled": true }` for each of them. So Raft backfills the switch for every
-  server with the flag on, either before it shows those servers a picker or straight after the deploy. Until then,
-  their picks of another model are `403 model_picker_disabled`. Agents that already picked keep their model
+  is already on, until Raft sends `{ "enabled": true }` for each of them. So Raft must have backfilled the switch
+  for every server, and its sync of the switch before each create must be live, **before** `MODEL_PICKER_ENFORCE`
+  is turned on; until then the stored switch has no effect. A server not yet synced when enforcement starts has its
+  picks of another model refused with `403 model_picker_disabled`. Agents that already picked keep their model
   (grandfathered, below).
 - **Tenant and auth.** Exactly as the plan's ([above](#the-servers-plan-plan)): a platform token's tenant is the one
   `{raftServerId}` names; a tenant-scoped token may only name a server its tenant's agents were provisioned for, else
@@ -339,7 +340,9 @@ PUT /provision/servers/{raftServerId}/model-picker
 - **Operators are not gated.** The administrator's rows (`/admin/models`, deployment, tenant or agent scope) decide
   as before, above any pick, whatever the switch: the way the operator sets which model a server or an agent runs.
 - `GET /provision/models` answers `pickerEnabled` (`false` while off) and still lists every offered option, so a
-  reader written before the switch keeps working; Raft hides its picker when it is off.
+  reader written before the switch keeps working. `pickerEnabled` is the stored switch, not whether it is
+  enforced: it reads `false` for a server Raft has not synced yet even though, while enforcement is off, that
+  server's picks are accepted. So Raft drives its picker UI from its own flag, not from this field.
 
 ### The tenant's spend
 
