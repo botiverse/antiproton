@@ -17,6 +17,10 @@ import { d1ProviderTokens, d1ProvisionedAgents } from "../cf/src/control-plane.t
 import { hashProviderToken, newProviderToken } from "../cf/src/provider-token.ts";
 import { sha256Hex } from "../src/store/seed-files.ts";
 import { IMPORT_HOLD_MAX_MS } from "../src/store/workspace-import.ts";
+import { ApStore } from "../src/store/ap-store.ts";
+import { prefixedNamespace } from "../src/store/sql-namespace.ts";
+import { d1ServiceTokens } from "../cf/src/control-plane.ts";
+import { hashServiceToken, newServiceToken } from "../cf/src/service-token.ts";
 
 const STAND_IN = "export class DurableObject { constructor(ctx, env) { this.ctx = ctx; this.env = env; } }" +
   " export class WorkerEntrypoint { constructor(ctx, env) { this.ctx = ctx; this.env = env; } }" +
@@ -456,6 +460,35 @@ await check("agent_active: an agent whose main conversation has a turn is 409 an
   must((await d1ProvisionedAgents(w.DB).get(T, RAFT_ID))?.instructions === "", "instructions were applied");
 });
 
+await check("agent_active: a pd agent whose first input was a push has started once that push is posted, though its seal says first-inbound and pi_entries is empty", async () => {
+  const w = await world({ pushy: true });
+  // pd keeps its conversation outside pi_entries, and a push seals as `first-inbound`: only the started mark says it ran.
+  const ap = new ApStore(w.raw, prefixedNamespace("ap"));
+  ap.ensure();
+  must(ap.setEngineOnce("pd") === "pd", "the engine was recorded already");
+  must((await push(w, "e1", "PD-FIRST-PUSH")).status === 202, "push");
+  await settle(w, 1);
+  must(jobCount(w) === 1, `the turn did not run: ${jobCount(w)}`);
+  const seal = w.raw.sql.exec("SELECT how FROM seed_seal").toArray()[0] as any;
+  must(seal?.how === "first-inbound", `seal: ${show(seal)}`);
+  must(!tables(w).includes("pi_entries") || w.raw.sql.exec("SELECT COUNT(*) AS n FROM pi_entries WHERE type = 'message'").toArray()[0]!.n === 0, "pi_entries has messages: not a pd turn");
+  must(w.raw.sql.exec("SELECT COUNT(*) AS n FROM agent_started").toArray()[0]!.n === 1, "no started mark");
+  // The mark alone decides: what an agent from before it left (a delivered push) is taken away.
+  w.raw.sql.exec("DELETE FROM inbound_events");
+  const r = await imp(w, body(uuid(), [{ path: "a.md", bytes: "x" }]));
+  must(r.status === 409 && r.body.error.code === "agent_active" && /started a turn/.test(r.body.error.message), `${r.status} ${r.text}`);
+  must(imported(w) === 0, "an import was recorded");
+});
+
+await check("a refused message while held marks nothing: the import after it lands", async () => {
+  const w = await world({ post: { awaitImport: true } });
+  let threw = "";
+  try { await w.rt.postMessage(T, A, "console", "prompt"); } catch (e) { threw = String((e as Error).message); }
+  must(/waiting for its workspace import/.test(threw), `postMessage while held: ${threw || "no error"}`);
+  must(!tables(w).includes("agent_started"), "a refused message marked the agent started");
+  must((await imp(w, body(uuid(), [{ path: "a.md", bytes: "x" }]))).status === 201, "the import after a refused message");
+});
+
 await check("tenant isolation: another tenant's token is 404 on both paths; no token is 401; nothing is written", async () => {
   const w = await world();
   const b = body(uuid(), [{ path: "a.md", bytes: "x" }]);
@@ -579,6 +612,19 @@ await check("awaitImport: a push before the import is accepted and queued and st
   must(!req.includes("provided at setup") && !req.includes("Workspace files provided"), "the import was shown as seeded files");
   const rows = holdRows(w);
   must(rows.length === 1 && rows[0].status === "import" && rows[0].verdict === "ok", `trace: ${show(rows)}`);
+});
+
+await check("awaitImport: the console's message route answers a held agent 409 with the hold's end, not 500", async () => {
+  const w = await world({ post: { awaitImport: true } });
+  const svc = newServiceToken();
+  await d1ServiceTokens(w.DB).issue({ hash: await hashServiceToken(svc), label: "console-test", tenantId: T, agentId: A });
+  const res = await worker.fetch(new Request("https://x/ui/message", {
+    method: "POST", headers: { "x-harness-token": svc }, body: new URLSearchParams({ text: "hello while held" }),
+  }), w.env as never);
+  const text = await res.text();
+  const until = new Date(Number(w.raw.sql.exec("SELECT since FROM import_hold").toArray()[0]!.since) + IMPORT_HOLD_MAX_MS).toISOString();
+  must(res.status === 409 && /waiting for its workspace import/.test(text) && text.includes(until), `${res.status} ${text.slice(0, 300)}`);
+  must(jobCount(w) === 0, "a turn started");
 });
 
 await check("awaitImport: an import without instructions lifts the hold in its own transaction", async () => {

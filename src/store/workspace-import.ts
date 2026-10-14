@@ -83,16 +83,34 @@ export function readImport(sql: Sql, tenantId: string, agentId: string): { recor
 }
 
 /**
- * Why the agent has started, or null: a message in its main conversation or a fresh context (`priorActivity`'s
- * first two), or the seal every turn writes before it runs (cf/src/runtime.ts `postMessage`), which covers an
- * engine that keeps its conversation outside `pi_entries`. A push that is accepted and still queued is not a
- * start: an agent held for its import (`awaitImport`) takes pushes and runs none of them until the import.
+ * Why the agent has started, or null. First the mark every turn writes before it runs (`markStarted`, cf/src/runtime.ts
+ * `postMessage`), whatever the route and the engine: the seal's `first-turn` could not be it, being written once, and
+ * for an agent whose first input was a push it is `first-inbound`, written when the push was accepted; nor could the
+ * main conversation's rows, which pd keeps outside `pi_entries`. Then what an agent that ran before the mark existed
+ * left: a message in its main conversation or a fresh context (`priorActivity`'s first two), the `first-turn` seal, a
+ * push delivered (posted, so a turn started). A push that is accepted and still queued is not a start: an agent held
+ * for its import (`awaitImport`) takes pushes and runs none of them until the import.
  */
 export function agentStarted(sql: Sql, tenantId: string, agentId: string): string | null {
+  if (rowsIfAny(sql, "SELECT 1 FROM agent_started WHERE tenant_id=? AND agent_id=?", tenantId, agentId).length) return "it has started a turn";
   if (rowsIfAny(sql, "SELECT 1 FROM pi_entries WHERE type = 'message' LIMIT 1").length) return "its main conversation has messages";
   if (rowsIfAny(sql, "SELECT 1 FROM main_sessions WHERE ended_at IS NOT NULL LIMIT 1").length) return "it has had a fresh context";
   if (readSeal(sql, tenantId, agentId)?.how === "first-turn") return "it has started a turn";
+  if (rowsIfAny(sql, "SELECT 1 FROM inbound_events WHERE outcome = 'delivered' LIMIT 1").length) return "a push was posted to it";
   return null;
+}
+
+const STARTED_SCHEMA = `CREATE TABLE IF NOT EXISTS agent_started (
+  tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY (tenant_id, agent_id))`;
+
+/**
+ * A turn is starting: the first one's time is kept, every later one changes nothing. Written synchronously in the
+ * same step as the hold's check (cf/src/runtime.ts `postMessage`), so an import, decided in one transaction, sees
+ * either no mark and no turn yet, or the mark.
+ */
+export function markStarted(sql: Sql, tenantId: string, agentId: string, now: number): void {
+  sql.exec(STARTED_SCHEMA);
+  sql.exec("INSERT OR IGNORE INTO agent_started(tenant_id, agent_id, at) VALUES (?,?,?)", tenantId, agentId, now);
 }
 
 // ---- the hold: an agent made to wait for its import (`awaitImport` on POST /provision/agents).

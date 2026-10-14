@@ -21,7 +21,7 @@ import { DurableAgent, PdHost, recordedEngine } from "../../src/runtime/durable-
 import { busyReason, clientCallsWaiting, migrateToPd, revertToPi085, type MigrationResult, type RevertResult } from "../../src/runtime/pd-migrate.ts";
 import { sealSeedFiles, seedInline, sha256Hex, type SealHow, type SeedMode, type SeedWriteResult } from "../../src/store/seed-files.ts";
 import {
-  commitImport, importDecided, importInline, IMPORT_HOLD_MAX_MS, liftHold, markInstructionsApplied, placeHold, readHold, spillKey,
+  commitImport, importDecided, importInline, IMPORT_HOLD_MAX_MS, liftHold, markInstructionsApplied, markStarted, placeHold, readHold, spillKey,
   type CommitResult, type ImportHold, type ImportRow,
 } from "../../src/store/workspace-import.ts";
 import { logEvent } from "../../src/core/log.ts";
@@ -573,12 +573,16 @@ function summarise(value: unknown, budget = 1200): Json {
   return value as Json;
 }
 
-/** Same surface the SigV4 client exposes, backed by the R2 binding instead. */
-/** A message refused because the agent waits for its workspace import (`awaitImport`); the hold's end is in it. */
+/**
+ * A message refused because the agent waits for its workspace import (`awaitImport`); the hold's end is in it. Its
+ * text starts as a lane's refusal does (`MESSAGE_REFUSED`), since the class is lost crossing a Durable Object stub:
+ * the console's message route answers 409 with this text (`messageRefusal`), not 500.
+ */
 export class AwaitingImport extends Error {
   readonly until: number;
   constructor(until: number) {
-    super(`the agent is waiting for its workspace import and starts no turn before it; it runs without one from ${new Date(until).toISOString()}`);
+    super(`${MESSAGE_REFUSED} (awaiting_import): the agent is waiting for its workspace import and starts no turn before it; ` +
+      `it runs without one from ${new Date(until).toISOString()}`);
     this.until = until;
   }
 }
@@ -595,6 +599,7 @@ function holdEnded(sql: any, tenantId: string, agentId: string, h: ImportHold) {
   }]);
 }
 
+/** Same surface the SigV4 client exposes, backed by the R2 binding instead. */
 class BoundArtifacts {
   #bucket: R2Bucket;
   #name: string;
@@ -3696,6 +3701,11 @@ export class AgentRuntime {
     // message by any other route has no queue to wait in and is refused, saying why.
     const heldUntil = this.importHeldUntil(tenantId, agentId);
     if (heldUntil !== null) throw new AwaitingImport(heldUntil);
+    // From here the agent is live, and an import is refused (src/store/workspace-import.ts `agentStarted`): marked in
+    // the same synchronous step as the check above, with no await between, so an import cannot land in the gap. Asked
+    // of the table every turn rather than remembered in memory, which a wiped and remade agent would outlive; a turn
+    // after the first finds the row and writes nothing.
+    markStarted(this.#deps.ctx.storage.sql, tenantId, agentId, Date.now());
     // A main conversation the overflow backstop gave up on takes nothing until an operator resets it, its model
     // binding changes, or the mark expires (src/runtime/overflow-backstop.ts `needsReset`).
     const backstop = session === MAIN_SESSION && !this.#isPd();
