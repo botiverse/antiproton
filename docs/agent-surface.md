@@ -170,6 +170,7 @@ read of the tenant as a whole:
 | `GET` | `/provision/agents/{agentId}/workspace-files?dirPath=&includeHidden=` |
 | `GET` | `/provision/agents/{agentId}/workspace-files/read?path=` |
 | `GET` | `/provision/usage?from=&to=&bucket=day\|month` — the tenant's spend and daily limit ([below](#the-tenants-spend)) |
+| `PUT` | `/provision/servers/{raftServerId}/plan` — the server's plan, which picks its daily limit ([below](#the-servers-plan-plan)) |
 | `POST` | `/provision/agents/{agentId}/import` — the agent's workspace, once ([below](#workspace-import)) |
 | `GET` | `/provision/import-limits` — the bounds an import is held to ([below](#workspace-import)) |
 
@@ -288,9 +289,17 @@ is `404`. `cf/src/provision/usage.ts`; tests in `test/provision-usage.ts`.
   `message`.
 - **`today`** is always today (UTC), whatever the window. It is the daily limit's own reading and rule
   (`readDaySpend` and `standing` in `cf/src/spend-limit.ts`, the `judge` the queue consumer applies),
-  read afresh for each answer (kept 15 s, below): `spentUsd` is the tenant's priced usage today, `model.tokens.unaccepted` left out;
-  `limitUsd` the admin's override if there is one, else `DAILY_LIMIT_USD`, `null` when there is no
+  read afresh for each answer (kept 15 s, below): `spentUsd` is the priced usage today of the tenant's own
+  agents (every agent but its onboarding ones, [below](#which-budget-pays-budget)), `model.tokens.unaccepted` left out;
+  `limitUsd` the admin's override if there is one, else the plan's default (`$3` free, `FREE_DAILY_LIMIT_USD`;
+  `$10` pro, `PRO_DAILY_LIMIT_USD`; `$5`, `DAILY_LIMIT_USD`, while Raft has sent no plan), `null` when there is no
   per-tenant limit or the tenant is exempt (`exempt: true`, `DAILY_LIMIT_EXEMPT_TENANTS`);
+  `plan` the plan Raft last sent (`null` when it never did); `onboardingUsd` the tenant's onboarding agents'
+  spend today, which the platform pays and which is in neither `spentUsd` nor `limitUsd` (so today's period in
+  `periods`, which counts every agent, can be larger than `spentUsd` by it); `onboardingLimitUsd` the tenant's share
+  of the onboarding pool (`$1` unless an admin set another; `null` for none or an exempt tenant), and
+  `onboardingRefusing` whether its onboarding agents' next call would be refused, by that share or by the pool as a
+  whole being spent (the pool's own figures are not given);
   `platformLimitReached` whether the platform's limit is reached; `refusing` whether a model call would
   be refused now (platform first, then the tenant's limit; never for an exempt tenant). The consumer
   may act on a reading up to 30 s old (docs/metering.md, "How fresh the reading is"). The platform's own total and limit are not given: they are every tenant's
@@ -314,7 +323,8 @@ is `404`. `cf/src/provision/usage.ts`; tests in `test/provision-usage.ts`.
 GET /provision/usage?from=2026-10-10&bucket=day
 {
   "currency": "USD", "estimated": true, "tenantId": "raft_srv-1",
-  "today": { "day": "2026-10-12", "spentUsd": 1.84, "limitUsd": 5, "exempt": false,
+  "today": { "day": "2026-10-12", "spentUsd": 1.84, "limitUsd": 10, "plan": "pro", "onboardingUsd": 0.42,
+             "onboardingLimitUsd": 1, "onboardingRefusing": false, "exempt": false,
              "platformLimitReached": false, "refusing": false, "resetsAt": "2026-10-13T00:00:00.000Z" },
   "from": "2026-10-10T00:00:00.000Z", "to": "2026-10-13T00:00:00.000Z", "bucket": "day",
   "totalUsd": 4.31,
@@ -329,6 +339,39 @@ GET /provision/usage?from=2026-10-10&bucket=day
   "agents": [{ "providerAgentId": "raft_01JAGENT", "totalUsd": 3.9 }, { "providerAgentId": "raft_01JOTHER", "totalUsd": 0.41 }]
 }
 ```
+
+#### The server's plan (`plan`)
+
+A Raft server is on a plan, which only Raft knows; its tenant's default daily limit follows it (`free`: $3, `pro`:
+$10; a server Raft has sent no plan for keeps $5, the limit before plans; docs/metering.md, "Daily limits"). Raft
+says it, and antiproton never asks:
+
+```
+PUT /provision/servers/{raftServerId}/plan
+{ "plan": "pro" }
+→ 200 { "raftServerId": "srv-1", "plan": "pro", "updatedAt": "2026-10-14T09:12:00.000Z" }
+```
+
+- **When.** On every change of the server's plan (upgrade, downgrade, a lapsed subscription), and once for each
+  server that exists before this route does. The latest write wins; a repeat of the same plan changes nothing.
+- **Tenant.** As every provider route: a platform-scoped token's tenant is the one `{raftServerId}` names. A
+  tenant-scoped token names no server, so `{raftServerId}` must be one its tenant's agents were provisioned for
+  (`raftServerId` on their create); any other, or any before the tenant has an agent, is `403`,
+  `code: "server_mismatch"`, `param: "raftServerId"`, and nothing is written — never a plan written to the token's
+  tenant under another server's id. `{raftServerId}` must match the Raft id pattern (`422`, `param: "raftServerId"`).
+  The answer's `raftServerId` is therefore always the server whose plan was written.
+- **Body.** Exactly `{ "plan": "free" | "pro" }`: a missing or other `plan` is `422` (`code` `missing` or `invalid`,
+  `param: "plan"`); any other field is `422` naming it. Nothing is written when it is refused.
+- **On a create too.** `POST /provision/agents` takes the same `plan` (optional; absent or `null` says nothing),
+  validated the same way (`422`, `param: "plan"`, nothing made). A create that makes the agent writes it, before the
+  agent's row. It is the server's, not the agent's, so it is **not** part of what a replay is compared with (a replay
+  with another plan, or none, is still the same create), and **a replay never writes it**: a create retried late
+  carries the plan of its first send and must not undo a `PUT` that landed since. So the PUT is the route that keeps
+  the plan current; the create's field saves a call when a server's first agent is made.
+- **Takes effect** within the consumer's reading (30 s at most, docs/metering.md, "How fresh the reading is"); the
+  next `GET /provision/usage` shows it as `today.plan` and `today.limitUsd` (kept 15 s).
+- **No plan said** keeps the $5 every tenant had before plans, until Raft sends one. An admin's per-tenant override
+  beats any of the three.
 
 ### Workspace import
 
@@ -494,6 +537,43 @@ right after signing up:
   value), another is `409 idempotency_conflict`. A `PATCH` and an import never change it.
 - **Nothing else changes**: the import contract is as it was, and an agent made without the field runs every
   turn with the provider's default reasoning.
+
+#### Which budget pays (`budget`)
+
+`POST /provision/agents` takes `budget: "onboarding"` (optional; absent or `null` is the tenant's own budget, today's
+create) for a hosted onboarding agent, whose spend the platform pays:
+
+- **What it does.** The agent's priced usage goes to the onboarding pool (docs/metering.md, "Daily limits"): in
+  neither its tenant's daily figure (`today.spentUsd`) nor the platform total, so it never uses up the server's
+  daily limit. Its model calls are refused only when every onboarding agent's spend today, in any tenant, reaches the
+  onboarding limit ($30 a day unless an admin sets another), or its own tenant's onboarding agents' spend reaches the
+  tenant's share of it ($1 a day unless an admin sets another for that tenant), so one server's users cannot spend
+  the pool for every other server. The refusal is any limit's (a failed turn, `usage limit reached (out of budget)`,
+  `BridgeFatal` `usage_limit_reached` with the sentence, `Onboarding daily usage limit reached; resets at 00:00 UTC.`
+  for the pool and `This server's onboarding daily usage limit reached ($X of $Y); resets at 00:00 UTC.` for the
+  share). Its tenant being over its own limit, or the platform over its, does not refuse it.
+- **An identity, not a behaviour.** It says who pays and nothing else: the model (`model`) and the first turn
+  (`firstTurn`) are their own fields, and an onboarding agent without either runs as any agent does.
+- **Values.** Exactly `"onboarding"`; anything else (another string, a different case, a non-string) is `422`,
+  `code: "invalid"`, `param: "budget"`, and nothing is made.
+- **Fixed at creation.** Stored on the agent's row (`provisioned_agents.budget`) and given back as `budget` in the
+  agent's view (absent for an agent on its tenant's budget). A replay must repeat it (absent and `null` being one
+  value): another, or none where the create had it, is `409 idempotency_conflict` naming `budget`. No route changes it
+  later; an agent that should stop being platform-paid is a new agent.
+- **Seen by the operator** as its own line: `onboarding` in `/admin/usage-costs` and on the admin host's usage-costs
+  and spend-limits pages. The tenant's own history (`GET /provision/usage` `periods`, `agents`) still lists the
+  agent's spend, and `today.onboardingUsd` says how much of today's is the platform's.
+
+**What Raft sends for a hosted onboarding agent:**
+
+```json
+POST /provision/agents
+{ "raftAgentId": "…", "raftServerId": "…", "raftOrigin": "…", "name": "Cindy", "instructions": "…", "credential": "sk_agent_…",
+  "model": "deepseek-flash", "firstTurn": { "reasoning": "off" }, "budget": "onboarding", "plan": "free" }
+```
+
+— `budget` on the onboarding agent only (every other agent leaves it out), and `plan` whenever Raft knows the
+server's plan ([above](#the-servers-plan-plan)); a retry repeats the same body, as for every field.
 
 ## Evaluation setup (preview only)
 

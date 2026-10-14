@@ -1980,29 +1980,54 @@ const usd = (v: number | null | undefined): string =>
   v === null || v === undefined ? "—" : `$${v === 0 ? "0.00" : Math.abs(v) < 0.01 ? v.toFixed(4) : v.toFixed(2)}`;
 
 /** One row of the spend-limits page: what a tenant spent today, against the limit that applies to it. */
-export interface SpendTodayRow { tenantId: string; usd: number; /** Unaccepted answers (our cost, not the tenant's): excluded from the tenant limit, shown so the subtraction is not silent. */ unaccepted?: number }
+export interface SpendTodayRow {
+  tenantId: string; usd: number;
+  /** Unaccepted answers (our cost, not the tenant's): excluded from the tenant limit, shown so the subtraction is not silent. */
+  unaccepted?: number;
+  /** The tenant's onboarding agents' spend, unaccepted left out: judged by its onboarding share, in neither the tenant's figure nor the platform's. */
+  onboarding?: number;
+}
 
 export function spendLimitsPanel(d: {
-  defaults: { tenantUsd: number | null; platformUsd: number | null; exempt: string[] };
+  defaults: {
+    tenantUsd: number | null; freeUsd: number | null; proUsd: number | null; platformUsd: number | null; onboardingUsd: number | null;
+    onboardingTenantUsd: number | null; exempt: string[];
+  };
   overrides: Array<{ tenantId: string; limitUsd: number | null; setBy: string; setAt: number }>;
   events: Array<{ tenantId: string; action: "set" | "clear"; limitUsd: number | null; previous: { limitUsd?: number | null }; by: string; at: number }>;
+  pools: Array<{ pool: string; tenantId: string | null; limitUsd: number | null; setBy: string; setAt: number }>;
+  poolEvents: Array<{ pool: string; tenantId: string | null; action: "set" | "clear"; limitUsd: number | null; previous: { limitUsd?: number | null }; by: string; at: number }>;
+  plans: Array<{ tenantId: string; plan: "free" | "pro" }>;
   /** What each tenant has spent so far today (priced usage, from readUsageCosts over today). */
   today: SpendTodayRow[];
   platformToday: number;
+  onboardingToday: number;
   /** Why the last write did not land, straight from the handler. Absent means it landed. */
   error?: string | null;
 }): string {
   const target = `hx-target="#admin" hx-swap="innerHTML"`;
   const overrideOf = new Map(d.overrides.map((o) => [o.tenantId, o]));
+  const planOf = new Map(d.plans.map((p) => [p.tenantId, p.plan]));
   const tenantIds = [...new Set([...d.today.map((t) => t.tenantId), ...d.overrides.map((o) => o.tenantId)])].sort();
+  // As tenantLimitOf (cf/src/spend-limit.ts): the override, else the plan's default, else (no plan ever said) the unset one.
   const limitOf = (id: string): { value: number | null; via: "override" | "default" | "none" } => {
     const o = overrideOf.get(id);
     if (o) return { value: o.limitUsd, via: "override" };
-    return { value: d.defaults.tenantUsd, via: d.defaults.tenantUsd === null ? "none" : "default" };
+    const plan = planOf.get(id);
+    const value = plan === "pro" ? d.defaults.proUsd : plan === "free" ? d.defaults.freeUsd : d.defaults.tenantUsd;
+    return { value, via: value === null ? "none" : "default" };
   };
+  // As onboardingTenantLimitOf: the admin's override of the tenant's share, else the default share.
+  const shareOf = (id: string): number | null => {
+    const o = d.pools.find((p) => p.pool === "onboarding" && p.tenantId === id);
+    return o ? o.limitUsd : d.defaults.onboardingTenantUsd;
+  };
+  const onboardingOverride = d.pools.find((p) => p.pool === "onboarding" && p.tenantId === null);
+  const onboardingLimit = onboardingOverride ? onboardingOverride.limitUsd : d.defaults.onboardingUsd;
+  const onboardingOver = onboardingLimit !== null && d.onboardingToday >= onboardingLimit;
   // What an override's removal restores: the default's dollar amount, or the plain fact of no
   // tenant limit when the default is off — "The — default applies again" would read as a bug.
-  const backTo = d.defaults.tenantUsd === null ? "no per-tenant limit applies" : `the ${usd(d.defaults.tenantUsd)} default applies again`;
+  const backTo = "the plan's default applies again";
   const clearForm = (id: string) => `<form hx-post="/ui/admin/spend-limits" ${target}
         hx-confirm="Clear the override for ${esc(id)}? ${backTo}.">
       <input type="hidden" name="action" value="clear"><input type="hidden" name="tenantId" value="${esc(id)}">
@@ -2017,8 +2042,8 @@ export function spendLimitsPanel(d: {
     const over = !exempt && limit.value !== null && spent >= limit.value;
     const near = !exempt && limit.value !== null && !over && spent >= limit.value * 0.9;
     return `<tr class="${over ? "usd-over" : near ? "usd-near" : ""}">
-      <td><code>${esc(id)}</code>${exempt ? ` <span class="tag">exempt</span>` : ""}</td>
-      <td>${usd(spent)}${t && t.unaccepted ? ` <span class="hint-inline" title="unaccepted answers are our cost, not the tenant's — they count toward the platform total, not this tenant's limit">+${usd(t.unaccepted)} unaccepted</span>` : ""}</td>
+      <td><code>${esc(id)}</code>${exempt ? ` <span class="tag">exempt</span>` : ""}${planOf.get(id) === "pro" ? ` <span class="tag">pro</span>` : ""}</td>
+      <td>${usd(spent)}${t && t.unaccepted ? ` <span class="hint-inline" title="unaccepted answers are our cost, not the tenant's — they count toward the platform total, not this tenant's limit">+${usd(t.unaccepted)} unaccepted</span>` : ""}${t && t.onboarding ? ` <span class="hint-inline${shareOf(id) !== null && t.onboarding >= shareOf(id)! ? " usd-over" : ""}" title="onboarding agents are paid from the onboarding pool — in neither this tenant's limit nor the platform total; judged by the tenant's onboarding share">+${usd(t.onboarding)} onboarding of ${shareOf(id) === null ? "no share limit" : usd(shareOf(id))}</span>` : ""}</td>
       <td>${limit.value === null ? "no tenant limit" : usd(limit.value)}${limit.via === "default" ? ` <span class="hint-inline">default</span>` : ""}${over ? ` <span class="tag">over</span>` : near ? ` <span class="tag">near</span>` : ""}</td>
       <td>${overrideOf.has(id) ? clearForm(id) : ""}</td></tr>`;
   }).join("");
@@ -2027,16 +2052,51 @@ export function spendLimitsPanel(d: {
     <td>${e.previous.limitUsd === undefined ? "—" : e.previous.limitUsd === null ? "no tenant limit" : usd(e.previous.limitUsd)}</td>
     <td>${esc(e.by)}</td><td>${when(e.at) ?? ""}</td></tr>`).join("");
   const platformOver = d.defaults.platformUsd !== null && d.platformToday >= d.defaults.platformUsd;
+  const poolEvents = d.poolEvents.map((e) => `<tr><td><code>${esc(e.pool)}</code>${e.tenantId ? ` · <code>${esc(e.tenantId)}</code>` : ""}</td><td>${e.action}</td>
+    <td>${e.limitUsd === null ? "no limit" : usd(e.limitUsd)}</td>
+    <td>${e.previous.limitUsd === undefined ? "—" : e.previous.limitUsd === null ? "no limit" : usd(e.previous.limitUsd)}</td>
+    <td>${esc(e.by)}</td><td>${when(e.at) ?? ""}</td></tr>`).join("");
+  const perTenant = (v: number | null, plan: string) => v === null ? `no ${plan} limit` : `${usd(v)} / ${plan} tenant / day`;
   return `
 <h3>daily spend limits</h3>
 ${d.error ? `<div class="err">${esc(d.error)}</div>` : ""}
 <div class="card"><div class="state">
-    <b>${d.defaults.tenantUsd === null ? "no per-tenant limit" : `${usd(d.defaults.tenantUsd)} / tenant / day`}</b>
+    <b>${perTenant(d.defaults.freeUsd, "free")}</b>
+    <b>${perTenant(d.defaults.proUsd, "pro")}</b>
+    <b>${perTenant(d.defaults.tenantUsd, "plan-less")}</b>
     <b>${d.defaults.platformUsd === null ? "no platform limit" : `${usd(d.defaults.platformUsd)} / platform / day`}</b>
     <span>exempt: ${d.defaults.exempt.length ? d.defaults.exempt.map((t) => `<code>${esc(t)}</code>`).join(" ") : "none"}</span>
   </div>
-  <div class="hint" style="padding:8px 0 0">Set by DAILY_LIMIT_USD, PLATFORM_DAILY_LIMIT_USD and DAILY_LIMIT_EXEMPT_TENANTS;
-    a per-tenant override below wins over the tenant default. A tenant with no tenant limit is still refused at the platform limit.</div>
+  <div class="hint" style="padding:8px 0 0">Set by FREE_DAILY_LIMIT_USD, PRO_DAILY_LIMIT_USD, DAILY_LIMIT_USD (a tenant Raft has never
+    given a plan), PLATFORM_DAILY_LIMIT_USD and DAILY_LIMIT_EXEMPT_TENANTS; a tenant's plan is what Raft last said. A per-tenant override below wins over the plan's default.
+    A tenant with no tenant limit is still refused at the platform limit.</div>
+</div>
+<h3>onboarding pool — ${usd(d.onboardingToday)} today${onboardingLimit !== null ? ` of ${usd(onboardingLimit)}${onboardingOver ? ` <span class="tag">over</span>` : ""}` : " (no limit)"}</h3>
+<div class="card"><div class="state">
+    <b>${onboardingLimit === null ? "no onboarding limit" : `${usd(onboardingLimit)} / onboarding / day`}</b>
+    <b>${d.defaults.onboardingTenantUsd === null ? "no per-tenant onboarding share" : `${usd(d.defaults.onboardingTenantUsd)} / tenant's onboarding / day`}</b>
+    <span>${onboardingOverride ? `override by ${esc(onboardingOverride.setBy)}, ${when(onboardingOverride.setAt) ?? ""}` : "default"}</span>
+  </div>
+  <div class="hint" style="padding:8px 0 0">Agents Raft creates with <code>budget: "onboarding"</code>, in every tenant, paid by the platform:
+    in neither their tenant's limit nor the platform total, and refused only by this limit or by their tenant's share of it.
+    ONBOARDING_DAILY_LIMIT_USD (${d.defaults.onboardingUsd === null ? "off" : usd(d.defaults.onboardingUsd)}) and
+    ONBOARDING_TENANT_DAILY_LIMIT_USD (${d.defaults.onboardingTenantUsd === null ? "off" : usd(d.defaults.onboardingTenantUsd)}) unless overridden here;
+    with a tenant named, the form sets that tenant's share.</div>
+  <form class="admin-set" hx-post="/ui/admin/spend-limits" ${target}>
+    <input type="hidden" name="action" value="set"><input type="hidden" name="pool" value="onboarding">
+    <label><span>tenant (empty: the pool)</span><input type="text" name="tenantId" autocomplete="off" spellcheck="false"></label>
+    <label><span>limit (USD/day)</span><input type="number" name="limitUsd" min="0" step="0.01" required></label>
+    <div class="row"><button type="submit">set onboarding limit</button></div>
+  </form>
+  ${d.pools.filter((p) => p.pool === "onboarding" && p.tenantId !== null).map((p) => `<div class="state"><span><code>${esc(p.tenantId!)}</code>'s share:
+    ${p.limitUsd === null ? "no limit" : usd(p.limitUsd)} (override by ${esc(p.setBy)})</span>
+    <form hx-post="/ui/admin/spend-limits" ${target} hx-confirm="Clear ${esc(p.tenantId!)}'s onboarding share override?">
+      <input type="hidden" name="action" value="clear"><input type="hidden" name="pool" value="onboarding"><input type="hidden" name="tenantId" value="${esc(p.tenantId!)}">
+      <button type="submit" class="ghost">clear</button></form></div>`).join("")}
+  ${onboardingOverride ? `<form hx-post="/ui/admin/spend-limits" ${target}
+        hx-confirm="Clear the onboarding override? ${d.defaults.onboardingUsd === null ? "No onboarding limit applies" : `The ${usd(d.defaults.onboardingUsd)} default applies again`}.">
+      <input type="hidden" name="action" value="clear"><input type="hidden" name="pool" value="onboarding">
+      <button type="submit" class="ghost">clear onboarding override</button></form>` : ""}
 </div>
 <h3>today so far — ${usd(d.platformToday)}${d.defaults.platformUsd !== null ? ` of ${usd(d.defaults.platformUsd)}${platformOver ? ` <span class="tag">over</span>` : ""}` : ""}</h3>
 ${tenantIds.length ? `<table class="overrides"><thead><tr><th>tenant</th><th>spent today</th><th>limit</th><th></th></tr></thead><tbody>${rows}</tbody></table>`
@@ -2058,14 +2118,20 @@ ${d.overrides.length ? `<table class="overrides"><thead><tr><th>tenant</th><th>l
     : `<div class="empty">no overrides — every tenant has the default limit</div>`}
 <h3>audit — last ${d.events.length}</h3>
 ${d.events.length ? `<table class="overrides"><thead><tr><th>tenant</th><th>action</th><th>limit</th><th>was</th><th>by</th><th>at</th></tr></thead><tbody>${events}</tbody></table>`
-    : `<div class="empty">no changes yet</div>`}`;
+    : `<div class="empty">no changes yet</div>`}
+${d.poolEvents.length ? `<h3>pool audit — last ${d.poolEvents.length}</h3>
+<table class="overrides"><thead><tr><th>pool</th><th>action</th><th>limit</th><th>was</th><th>by</th><th>at</th></tr></thead><tbody>${poolEvents}</tbody></table>` : ""}`;
 }
 
 export function usageCostsPanel(d: {
   from: number; to: number; bucket: "day" | "month";
   /** Why the window was refused, when it was. Absent means from..to is whole periods. */
   error?: string | null;
-  tenants: Array<{ tenantId: string; total: number; periods: Array<{ start: number; total: number; resources: Array<{ resource: string; cost: number; unpriced: string[] }> }> }>;
+  tenants: Array<{
+    tenantId: string; total: number; periods: Array<{ start: number; total: number; resources: Array<{ resource: string; cost: number; unpriced: string[] }> }>;
+    /** The onboarding agents' part of the tenant's figures (cf/src/usage-d1.ts readUsageCosts). */
+    onboarding?: { total: number; periods: Array<{ start: number; total: number }> };
+  }>;
   /** Every `key unit` no price covers, across the window, so an unpriced total says what it leaves out. */
   unpriced: string[];
 }): string {
@@ -2081,7 +2147,13 @@ export function usageCostsPanel(d: {
     return `<td>${p ? usd(p.total) : "—"}</td>`;
   }).join("");
   const tenantRows = d.tenants.map((t) =>
-    `<tr><td><code>${esc(t.tenantId)}</code></td>${cells(t)}<td><b>${usd(t.total)}</b></td></tr>`).join("");
+    `<tr><td><code>${esc(t.tenantId)}</code>${t.onboarding ? ` <span class="hint-inline">incl. ${usd(t.onboarding.total)} onboarding</span>` : ""}</td>${cells(t)}<td><b>${usd(t.total)}</b></td></tr>`).join("");
+  // The onboarding pool as a line of its own: every tenant's onboarding agents, which the platform pays.
+  const onboarding = d.tenants.filter((t) => t.onboarding);
+  const onboardingRow = onboarding.length ? `<tr><td><b>onboarding pool</b> <span class="hint-inline">platform-paid, included above</span></td>${starts.map((s) => {
+    const sum = onboarding.reduce((a, t) => a + (t.onboarding!.periods.find((p) => p.start === s)?.total ?? 0), 0);
+    return `<td>${sum ? usd(sum) : "—"}</td>`;
+  }).join("")}<td><b>${usd(onboarding.reduce((a, t) => a + t.onboarding!.total, 0))}</b></td></tr>` : "";
   const resourceRows = [...byResource.entries()].sort((a, b) => b[1].cost - a[1].cost).map(([res, e]) =>
     `<tr><td><code>${esc(res)}</code></td><td>${usd(e.cost)}</td><td>${e.unpriced.size ? [...e.unpriced].map((u) => `<code>${esc(u)}</code>`).join(" ") : "—"}</td></tr>`).join("");
   const lastIncluded = d.to - 1;
@@ -2101,7 +2173,7 @@ ${d.unpriced.length ? `<div class="unpriced-banner"><b>unpriced usage in this wi
   <div class="row"><button type="submit">apply</button></div>
 </form>
 <h3>${usd(d.tenants.reduce((sum, t) => sum + t.total, 0))} — ${from} → ${toLabel}, by ${d.bucket}</h3>
-${d.tenants.length ? `<table class="overrides"><thead><tr><th>tenant</th>${starts.map((s) => `<th>${d.bucket === "month" ? new Date(s).toISOString().slice(0, 7) : day(s)}</th>`).join("")}<th>total</th></tr></thead><tbody>${tenantRows}</tbody></table>`
+${d.tenants.length ? `<table class="overrides"><thead><tr><th>tenant</th>${starts.map((s) => `<th>${d.bucket === "month" ? new Date(s).toISOString().slice(0, 7) : day(s)}</th>`).join("")}<th>total</th></tr></thead><tbody>${tenantRows}${onboardingRow}</tbody></table>`
     : `<div class="empty">nothing priced in this window</div>`}
 <h3>by resource</h3>
 ${byResource.size ? `<table class="overrides"><thead><tr><th>resource</th><th>cost</th><th>unpriced</th></tr></thead><tbody>${resourceRows}</tbody></table>` : ""}`;

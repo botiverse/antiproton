@@ -5,6 +5,7 @@
  */
 import { d1ApiKeys, d1Connections, d1Connectors, d1ModelChoices, d1ModelOverrides, d1Identities, d1InboundHooks, d1ProviderTokens, d1ProvisionedAgents, d1ServiceTokens } from "../../cf/src/control-plane.ts";
 import { resolveModel } from "../../cf/src/model-request.ts";
+import { d1SpendLimits, d1TenantPlans, limitsOf, readAgentPool, readDaySpend } from "../../cf/src/spend-limit.ts";
 
 export interface SpecCase { name: string; run(): Promise<void> }
 
@@ -311,7 +312,7 @@ export function controlPlaneCases(db: D1Database): SpecCase[] {
   add("provider_tokens and provisioned_agents have exactly the columns their queries read", async () => {
     const cols = async (table: string) => ((await db.prepare(`PRAGMA table_info(${table})`).all()).results as any[]).map((r) => String(r.name)).sort().join(",");
     assert((await cols("provider_tokens")) === "created_at,hash,label,last_used_at,raft_origin,revoked_at,scope,tenant_id", `provider_tokens ${await cols("provider_tokens")}`);
-    assert((await cols("provisioned_agents")) === "agent_id,await_import,created_at,credential_hash,deleted_at,instructions,model,model_pending,name,push_error,push_registered,raft_agent_id,raft_origin,raft_server_id,status,tenant_id,updated_at",
+    assert((await cols("provisioned_agents")) === "agent_id,await_import,budget,created_at,credential_hash,deleted_at,instructions,model,model_pending,name,push_error,push_registered,raft_agent_id,raft_origin,raft_server_id,status,tenant_id,updated_at",
       `provisioned_agents ${await cols("provisioned_agents")}`);
   });
 
@@ -363,6 +364,10 @@ export function controlPlaneCases(db: D1Database): SpecCase[] {
     assert(byRaft!.awaitImport === false, `a create without awaitImport: ${JSON.stringify(byRaft!.awaitImport)}`);
     await registry.create({ ...base, raftAgentId: "01M", agentId: "raft_01M", awaitImport: true });
     assert((await registry.get("t-raft", "01M"))!.awaitImport === true, "awaitImport did not round-trip");
+    // `budget` likewise (0021): absent reads null, and "onboarding" comes back as written.
+    assert(byRaft!.budget === null, `a create without budget: ${JSON.stringify(byRaft!.budget)}`);
+    await registry.create({ ...base, raftAgentId: "01N", agentId: "raft_01N", budget: "onboarding" });
+    assert((await registry.get("t-raft", "01N"))!.budget === "onboarding", "budget did not round-trip");
     let threw = false;
     try { await registry.create({ ...base, raftAgentId: "01J/x" }); } catch { threw = true; }
     assert(threw, "a second Raft id claimed the same agent id");
@@ -375,6 +380,39 @@ export function controlPlaneCases(db: D1Database): SpecCase[] {
     const gone = await registry.get("t-raft", "01J");
     assert(gone!.status === "deleted" && gone!.deletedAt === clock && gone!.pushError === "disable_push: gone" && gone!.pushRegistered === true, JSON.stringify(gone));
     assert((await registry.update("t-raft", "nope", { name: "x" })) === false, "an absent row reported a change");
+  });
+
+  add("the daily limit's reading on real D1: an onboarding agent's spend is its pool's, the plan and both overrides are read", async () => {
+    const day = Math.floor(clock / 86_400_000) * 86_400_000;
+    await db.batch([db.prepare("DELETE FROM usage_hourly"), db.prepare("DELETE FROM tenant_plans"), db.prepare("DELETE FROM spend_pool_limits"),
+      db.prepare("DELETE FROM spend_limits")]);
+    const cols = async (t: string) => ((await db.prepare(`PRAGMA table_info(${t})`).all()).results as any[]).map((r) => String(r.name)).sort().join(",");
+    assert((await cols("tenant_plans")) === "plan,set_at,set_by,tenant_id", `tenant_plans ${await cols("tenant_plans")}`);
+    assert((await cols("spend_pool_limits")) === "limit_usd,pool,set_at,set_by,tenant_id", `spend_pool_limits ${await cols("spend_pool_limits")}`);
+    assert((await cols("spend_pool_limit_events")) === "action,at,by,id,limit_usd,pool,previous,tenant_id", `spend_pool_limit_events ${await cols("spend_pool_limit_events")}`);
+    const base = { tenantId: "t-a", raftServerId: "srv", raftOrigin: "https://raft.example", name: "C", instructions: "", credentialHash: null,
+      status: "active" as const, pushRegistered: true, pushError: null };
+    await registry.create({ ...base, raftAgentId: "cindy", agentId: "raft_cindy", budget: "onboarding" });
+    await registry.create({ ...base, raftAgentId: "own", agentId: "raft_own" });
+    // deepseek-flash output: $1.20 per 1M tokens (0016).
+    const put = (tenant: string, agent: string, usd: number) => db.prepare(
+      "INSERT INTO usage_hourly(tenant_id, hour, agent_id, resource, key, unit, quantity) VALUES (?, ?, ?, 'model.tokens', 'deepseek-flash:output', 'tokens', ?)")
+      .bind(tenant, day + 3_600_000, agent, Math.round(usd / 0.0000012)).run();
+    await put("t-a", "raft_cindy", 4);
+    await put("t-a", "raft_own", 1);
+    await put("t-a", "console-agent", 0.5);
+    await put("t-b", "x", 2);
+    await d1TenantPlans(db).set("t-a", "pro", "h", clock);
+    await d1SpendLimits(db).setPool("onboarding", null, 45, "op", clock);
+    await d1SpendLimits(db).setPool("onboarding", "t-a", 2.5, "op", clock);
+    await d1SpendLimits(db).setPool("onboarding", "t-b", 9, "op", clock);
+    const s = await readDaySpend(db, "t-a", day + 7_200_000);
+    const near = (a: number, b: number) => Math.abs(a - b) < 1e-5;
+    assert(near(s.tenantUsd, 1.5) && near(s.platformUsd, 3.5) && near(s.onboardingUsd, 4) && near(s.tenantOnboardingUsd, 4), JSON.stringify(s));
+    assert(s.plan === "pro" && s.onboardingOverride?.limitUsd === 45 && s.onboardingTenantOverride?.limitUsd === 2.5 && s.override === null, JSON.stringify(s));
+    assert((await readAgentPool(db, "t-a", "raft_cindy")) === "onboarding" && (await readAgentPool(db, "t-a", "raft_own")) === "tenant"
+      && (await readAgentPool(db, "t-a", "console-agent")) === "tenant", "pools");
+    assert(limitsOf({}).proUsd === 10, "the pro default");
   });
 
   return cases;

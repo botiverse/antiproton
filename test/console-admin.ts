@@ -129,15 +129,18 @@ check("a refused write says why, above the forms, and the table shows nothing ne
 
 // ---- the ops pages: spend limits and platform usage costs (admin.antiproton.ai) ----
 
+/** The onboarding pool and plans, untouched by the checks that predate them. */
+const NO_POOLS = { pools: [], poolEvents: [], plans: [], onboardingToday: 0 };
+
 check("spendLimitsPanel renders defaults, today against limits, and the audit trail", () => {
   const html = spendLimitsPanel({
-    defaults: { tenantUsd: 5, platformUsd: 30, exempt: ["bench"] },
+    defaults: { tenantUsd: 5, freeUsd: 3, proUsd: 10, platformUsd: 30, onboardingUsd: 30, onboardingTenantUsd: 1, exempt: ["bench"] }, ...NO_POOLS,
     overrides: [{ tenantId: "acme", limitUsd: 1.5, setBy: "op@x.dev", setAt: 17533980e5 }],
     events: [{ tenantId: "acme", action: "set", limitUsd: 1.5, previous: {}, by: "op@x.dev", at: 17533980e5 }],
     today: [{ tenantId: "acme", usd: 1.62 }, { tenantId: "bench", usd: 4.1 }, { tenantId: "demo", usd: 0.4 }],
     platformToday: 6.12,
   });
-  must(/\$5\.00 \/ tenant \/ day/.test(html), "the tenant default is shown in dollars");
+  must(/\$3\.00 \/ free tenant \/ day/.test(html) && /\$10\.00 \/ pro tenant \/ day/.test(html) && /\$5\.00 \/ plan-less tenant \/ day/.test(html), "each plan's tenant default is shown in dollars");
   must(/\$30\.00 \/ platform \/ day/.test(html), "the platform default is shown");
   must(/exempt: <code>bench<\/code>/.test(html), "exempt tenants are named");
   must(html.includes('class="usd-over"'), "a tenant over its limit is marked");
@@ -152,7 +155,7 @@ check("spendLimitsPanel renders defaults, today against limits, and the audit tr
 
 check("spendLimitsPanel flags a tenant AT its limit, the way judge refuses", () => {
   const html = spendLimitsPanel({
-    defaults: { tenantUsd: 5, platformUsd: 30, exempt: [] },
+    defaults: { tenantUsd: 5, freeUsd: 3, proUsd: 10, platformUsd: 30, onboardingUsd: 30, onboardingTenantUsd: 1, exempt: [] }, ...NO_POOLS,
     overrides: [{ tenantId: "zero-limit", limitUsd: 0, setBy: "op@x.dev", setAt: 1 }],
     events: [],
     today: [{ tenantId: "exact", usd: 5 }, { tenantId: "zero-limit", usd: 0 }],
@@ -164,7 +167,7 @@ check("spendLimitsPanel flags a tenant AT its limit, the way judge refuses", () 
 
 check("spendLimitsPanel shows unaccepted answers beside, not inside, the tenant's number", () => {
   const html = spendLimitsPanel({
-    defaults: { tenantUsd: 5, platformUsd: 30, exempt: [] },
+    defaults: { tenantUsd: 5, freeUsd: 3, proUsd: 10, platformUsd: 30, onboardingUsd: 30, onboardingTenantUsd: 1, exempt: [] }, ...NO_POOLS,
     overrides: [], events: [],
     today: [{ tenantId: "acme", usd: 0.4, unaccepted: 1.1 }],
     platformToday: 1.5,
@@ -176,12 +179,12 @@ check("spendLimitsPanel shows unaccepted answers beside, not inside, the tenant'
 
 check("spendLimitsPanel prints small money without rounding it away", () => {
   const html = spendLimitsPanel({
-    defaults: { tenantUsd: null, platformUsd: null, exempt: [] },
+    defaults: { tenantUsd: null, freeUsd: null, proUsd: null, platformUsd: null, onboardingUsd: null, onboardingTenantUsd: null, exempt: [] }, ...NO_POOLS,
     overrides: [], events: [],
     today: [{ tenantId: "t2", usd: 0.0012 }], platformToday: 0.0012,
   });
   must(/\$0\.0012/.test(html), "below a cent, four decimals");
-  must(/no per-tenant limit/.test(html) && /no platform limit/.test(html), "off is not $0");
+  must(/no free limit/.test(html) && /no pro limit/.test(html) && /no plan-less limit/.test(html) && /no per-tenant onboarding share/.test(html) && /no platform limit/.test(html) && /no onboarding limit/.test(html), "off is not $0");
   must(/no tenant limit/.test(html), "a null override reads as no tenant limit, not $0");
 });
 
