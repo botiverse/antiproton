@@ -193,8 +193,12 @@ check("the deploy gate refuses a TIMEOUT: it says so and exits non-zero", () => 
 
 // Whatever a failing case left, by the pids the fake suites wrote down, so a
 // red run (or a sabotaged helper) does not leave sleepers behind.
+// The first pid of each is the fake suite itself, which leads its own group, so
+// the group is killed too: it holds the children that wrote nothing down.
 for (let i = 1; i <= n; i++) {
-  for (const p of pidsOf(join(dir, `pids-${i}`))) if (alive(p)) try { process.kill(p, "SIGKILL"); } catch { /* gone */ }
+  const pids = pidsOf(join(dir, `pids-${i}`));
+  if (pids[0]) try { process.kill(-pids[0], "SIGKILL"); } catch { /* no such group */ }
+  for (const p of pids) if (alive(p)) try { process.kill(p, "SIGKILL"); } catch { /* gone */ }
 }
 
 console.log(`\n  Suite time limit\n  ${"─".repeat(56)}`);

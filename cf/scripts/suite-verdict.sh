@@ -98,12 +98,16 @@ suite_name() { printf "%-22s " "$1"; }
 #    all the same.
 #
 #    The limit is a backstop against a hang, not a performance budget, so it
-#    is a generous multiple of the slowest suite's normal time: the DO suites
-#    take 10-60 s each and the slowest node suite under 10 s (measured
-#    2026-10-14, serially, on a 12-core host at load ~7), and 600 s is ten times
-#    the slowest. GATE_SUITE_LIMIT changes it for every suite;
-#    GATE_SUITE_LIMIT_<name> (dashes as underscores) for one, for a suite that
-#    legitimately needs longer.
+#    is a generous multiple of the slowest suite's normal time. Measured
+#    2026-10-14, one suite at a time as the gate runs them, on a 12-core host
+#    at load ~7: the slowest suite was control-plane-d1 at 31 s, the other DO
+#    suites 7-17 s, the slowest node suite 20 s, the typecheck 8 s. 600 s is
+#    about twenty times the slowest, and above the 360 s a DO suite allows its
+#    worker to answer (test/local-worker.sh, await_answer), so a hung worker
+#    is reported by the suite's own message and log before the gate's limit.
+#    GATE_SUITE_LIMIT changes it for every suite; GATE_SUITE_LIMIT_<name>
+#    (dashes as underscores) for one, for a suite that legitimately needs
+#    longer.
 
 # suite_limit NAME: the seconds NAME may run before it is a TIMEOUT.
 suite_limit() {
@@ -150,8 +154,7 @@ suite_stop() {
 # something in it moved to a session of its own.
 #
 # The limit is kept by a watchdog in its own group rather than by polling, so a
-# suite that ends costs no wait; the watchdog's group is killed once the suite
-# has ended.
+# suite that ends costs no wait.
 suite_run_bounded() {
   local limit="$1" out="$2"; shift 2
   local pid watchdog status=0 dir
