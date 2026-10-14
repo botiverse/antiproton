@@ -6,17 +6,25 @@
  * is scoped to it in its own query: nothing is read across tenants and then filtered. `today` is the enforcer's
  * own reading and rule (`readDaySpend` and `standing`, cf/src/spend-limit.ts), so the panel cannot say "under"
  * while the queue consumer refuses; of the platform's total only whether its limit is reached is given.
+ * `?byAgent=1` adds each provisioned agent's spend per UTC day (`agentDays`), for Raft's daily telemetry.
+ *
+ * `GET /provision/budgets/onboarding` (`onboardingPool`) is the shared onboarding pool on one day, for a platform token.
  */
 import { DAY_MS, type OwnCosts } from "../usage-d1.ts";
-import { parseCostsQuery } from "../admin-usage-costs.ts";
-import { dayOf, isExempt, standing, type DaySpend, type SpendLimits } from "../spend-limit.ts";
+import { onTheCalendar, parseCostsQuery } from "../admin-usage-costs.ts";
+import { dayOf, isExempt, judge, onboardingLimitOf, standing, type DaySpend, type SpendLimits } from "../spend-limit.ts";
 
 export interface ProvisionUsage {
   limits: SpendLimits;
   /** `readDaySpend` over the control database. */
   today(tenantId: string, now: number): Promise<DaySpend>;
-  /** `readTenantCosts` over the control database. */
-  costs(tenantId: string, from: number, to: number, bucket: "day" | "month"): Promise<OwnCosts>;
+  /** `readTenantCosts` over the control database; `byAgent` adds its `agentDays`. */
+  costs(tenantId: string, from: number, to: number, bucket: "day" | "month", byAgent: boolean): Promise<OwnCosts>;
+  /**
+   * `readDaySpend` of the UTC day `day` starts, for no tenant (only its pool-wide figures are used), `folded` for a
+   * past day so a day already folded into usage_daily is still counted. Absent: `/provision/budgets/onboarding` is 404.
+   */
+  pool?(day: number, folded: boolean): Promise<DaySpend>;
   /** Answers kept for a while (`UsageCache`); absent, every request reads. */
   cache?: UsageCache;
 }
@@ -72,23 +80,30 @@ export const sharedUsageCache = new UsageCache();
 export async function tenantUsage(tenantId: string, query: URLSearchParams, deps: ProvisionUsage, now: number): Promise<object | string> {
   const q = parseCostsQuery(query, now);
   if (typeof q === "string") return q;
-  // The limits are in the key, so a deployment's new limits are never answered with the old ones.
-  const key = JSON.stringify([tenantId, q.from, q.to, q.bucket, deps.limits.tenantUsd, deps.limits.freeUsd, deps.limits.proUsd, deps.limits.platformUsd,
+  const by = query.get("byAgent");
+  if (by !== null && by !== "" && by !== "0" && by !== "1") return "byAgent is 1 or 0";
+  const byAgent = by === "1";
+  // Its days are UTC days whatever the periods are, and a month bucket beside them would read as a monthly breakdown.
+  if (byAgent && q.bucket !== "day") return "byAgent=1 is per UTC day: use bucket=day";
+  // The limits are in the key, so a deployment's new limits are never answered with the old ones; `byAgent` too, so
+  // an answer without the breakdown is never served to a caller that asked for it, nor the other way.
+  const key = JSON.stringify([tenantId, q.from, q.to, q.bucket, byAgent, deps.limits.tenantUsd, deps.limits.freeUsd, deps.limits.proUsd, deps.limits.platformUsd,
     deps.limits.onboardingUsd, deps.limits.onboardingTenantUsd,
     isExempt(tenantId, deps.limits)]);
   // A window longer than a panel polls is read afresh and not kept (`USAGE_CACHE_WINDOW_MAX_MS`).
   const cache = q.to - q.from <= USAGE_CACHE_WINDOW_MAX_MS ? deps.cache : undefined;
   const kept = cache?.get(key, now);
   if (kept) return kept;
-  const answer = await read(tenantId, q, deps, now);
+  const answer = await read(tenantId, q, byAgent, deps, now);
   cache?.set(key, now, answer);
   return answer;
 }
 
-async function read(tenantId: string, q: { from: number; to: number; bucket: "day" | "month" }, deps: ProvisionUsage, now: number): Promise<object> {
-  const [spend, costs] = await Promise.all([deps.today(tenantId, now), deps.costs(tenantId, q.from, q.to, q.bucket)]);
+async function read(
+  tenantId: string, q: { from: number; to: number; bucket: "day" | "month" }, byAgent: boolean, deps: ProvisionUsage, now: number,
+): Promise<object> {
+  const [spend, costs] = await Promise.all([deps.today(tenantId, now), deps.costs(tenantId, q.from, q.to, q.bucket, byAgent)]);
   const s = standing(tenantId, spend, deps.limits);
-  const iso = (t: number) => new Date(t).toISOString();
   return {
     // Every figure is an estimate from rough prices (docs/metering.md, "Prices"); said in the body so a figure
     // copied out of it keeps that.
@@ -120,7 +135,46 @@ async function read(tenantId: string, q: { from: number; to: number; bucket: "da
     })),
     // Named as the provider's agent view names it (`view` in ./handlers.ts): the ledger's agent id is the providerAgentId.
     agents: costs.agents.map((a) => ({ providerAgentId: a.agentId, totalUsd: a.total })),
+    // A key of its own rather than a second shape of `agents`, which a reader of the plain answer already relies on.
+    ...(byAgent ? {
+      agentDays: (costs.agentDays ?? []).map((a) => ({
+        raftAgentId: a.raftAgentId, budget: a.budget, days: a.days.map((d) => ({ day: iso(d.start).slice(0, 10), usd: d.total })),
+      })),
+    } : {}),
   };
 }
+
+/**
+ * `GET /provision/budgets/onboarding?date=YYYY-MM-DD`: the shared onboarding pool on one UTC day (default today), for
+ * a platform-scoped token only; a figure summed over every tenant is not one tenant's to read (the caller refuses a
+ * tenant-scoped token). The reading is the enforcer's (`readDaySpend`) and so is the verdict (`judge`): `capped` is
+ * exactly "an onboarding agent's next call is refused by the pool", so it cannot say "under" while calls are refused.
+ *
+ * A past day is read from the ledger, folded days included; its `limitUsd` is the limit as it stands now, since an
+ * admin's override is kept as its current value only. A day after today has no spend to read and is refused.
+ */
+export async function onboardingPool(query: URLSearchParams, deps: ProvisionUsage & { pool(day: number, folded: boolean): Promise<DaySpend> }, now: number): Promise<object | string> {
+  const extra = [...query.keys()].find((k) => k !== "date" && k !== "raftServerId");
+  if (extra) return `unknown parameter ${extra}; the query is ?date=YYYY-MM-DD`;
+  const given = query.get("date");
+  const today = dayOf(now);
+  let day = today;
+  if (given !== null && given !== "") {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(given) || !onTheCalendar(given)) return "date is a UTC day, YYYY-MM-DD";
+    day = Date.parse(`${given}T00:00:00Z`);
+    if (day > today) return `date is today (${iso(today).slice(0, 10)}) or earlier`;
+  }
+  const spend = await deps.pool(day, day < today);
+  const verdict = judge(spend, deps.limits, "onboarding");
+  return {
+    date: iso(day).slice(0, 10),
+    limitUsd: onboardingLimitOf(spend, deps.limits),
+    spentUsd: tidy(spend.onboardingUsd),
+    // The pool's refusal only: `judge` then asks a tenant's share, which is no tenant's here.
+    capped: !verdict.admit && verdict.limit === "onboarding",
+  };
+}
+
+const iso = (t: number) => new Date(t).toISOString();
 
 const tidy = (n: number) => Math.round(n * 1e10) / 1e10;

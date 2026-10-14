@@ -310,6 +310,16 @@ is `404`. `cf/src/provision/usage.ts`; tests in `test/provision-usage.ts`.
   (not the same as free). `totalUsd` at the top is the window's sum.
 - **`agents`** is each agent's total over the window, highest first, named by `providerAgentId` as the
   provider's agent view names it (the ledger's agent id, which for a provisioned agent is that).
+- **`agentDays`**, only with `?byAgent=1` (absent otherwise): each agent provisioned in the tenant
+  (`provisioned_agents`, deleted ones included) that has usage in the window, ordered by `raftAgentId`, as
+  `{ "raftAgentId": string, "budget": "onboarding" | null, "days": [{ "day": "YYYY-MM-DD", "usd": number }] }`.
+  `budget` is the one it was created with ([below](#which-budget-pays-budget)); `days` are UTC days with
+  usage, oldest first (a day with none is absent, not `0`), priced as `agents` is and with
+  `model.tokens.unaccepted` left out, so an agent's `usd` add up to its `totalUsd` in `agents`. An agent
+  Raft did not provision (the console's, the Agents API's) is in `agents` only. Read in the same query
+  scoped to the tenant, the agents' rows too. `byAgent` is `1` or `0` (or absent); anything else, or
+  `byAgent=1` with `bucket=month`, is `400`. Windows, limits and the 15 s cache are as without it (the
+  cache keeps the two answers apart).
 - **Tenant from the token only.** A tenant-scoped token sending `?raftServerId=` or `?tenantId=` still
   gets its own tenant; those parameters do not choose one.
 - **Kept 15 s.** Each isolate keeps the whole answer for 15 s (`USAGE_CACHE_MS`), per tenant and
@@ -339,6 +349,42 @@ GET /provision/usage?from=2026-10-10&bucket=day
   "agents": [{ "providerAgentId": "raft_01JAGENT", "totalUsd": 3.9 }, { "providerAgentId": "raft_01JOTHER", "totalUsd": 0.41 }]
 }
 ```
+
+With `&byAgent=1` the same answer also carries:
+
+```json
+  "agentDays": [
+    { "raftAgentId": "01JAGENT", "budget": null,
+      "days": [{ "day": "2026-10-10", "usd": 2.47 }, { "day": "2026-10-12", "usd": 1.43 }] },
+    { "raftAgentId": "01JOTHER", "budget": "onboarding", "days": [{ "day": "2026-10-12", "usd": 0.41 }] }
+  ]
+```
+
+#### The onboarding pool (`/provision/budgets/onboarding`)
+
+`GET /provision/budgets/onboarding?date=YYYY-MM-DD` is the shared onboarding pool on one UTC day (`date`
+defaults to today): every tenant's onboarding agents together. `onboardingPool` in
+`cf/src/provision/usage.ts`; tests in `test/provision-usage.ts`.
+
+```json
+GET /provision/budgets/onboarding?date=2026-10-13
+{ "date": "2026-10-13", "limitUsd": 30, "spentUsd": 12.84, "capped": false }
+```
+
+- **Platform tokens only.** It is a figure over every tenant, so a tenant-scoped token is `403`,
+  `code: "platform_only"`, whatever it names. A platform token needs no `raftServerId` (one sent is
+  ignored). No token, or an unknown or revoked one, is the usual `401`; any method but GET is `404`.
+- **The enforcer's reading.** `spentUsd` is `readDaySpend`'s `onboardingUsd` (`cf/src/spend-limit.ts`):
+  every agent created with `budget: "onboarding"`, in any tenant, `model.tokens.unaccepted` included,
+  as the pool is judged. `limitUsd` is the pool's limit (an admin's override, else
+  `ONBOARDING_DAILY_LIMIT_USD`, `$30`; `null` when there is none). `capped` is `judge`'s verdict:
+  `true` exactly when an onboarding agent's next call is refused by the pool (`spentUsd >= limitUsd`). A
+  tenant's own share of the pool is not judged here; `today.onboardingRefusing` in `/provision/usage`
+  says it. Read afresh each time; the consumer may act on a reading up to 30 s old.
+- **A past day** is read from the ledger, a day already folded into whole days included. Its `limitUsd`
+  is the limit as it stands now: an admin's override is kept as its current value, not per day.
+- **`date`** is exactly `YYYY-MM-DD`, a calendar day, today or earlier; anything else, a later day, or any
+  other parameter is `400`, `code: "invalid"`.
 
 #### The server's plan (`plan`)
 
