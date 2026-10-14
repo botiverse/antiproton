@@ -1538,8 +1538,8 @@ export interface ActivityEvent {
  * `"event"`: outside content, information and not an instruction. `"inbox"`
  * is for a notice that messages were written to this agent — its own inbox,
  * said by the service that keeps it, after the signature checked out — and
- * its label says they are requests from teammates, followed within the agent's
- * rules. Both labels are the runtime's words; the plugin only chooses, and
+ * its label says they are requests from whoever sent them, weighed within the
+ * agent's rules and its owner's instructions. Both labels are the runtime's words; the plugin only chooses, and
  * omitting the field lands on the stricter one.
  */
 export type InboundResult =
