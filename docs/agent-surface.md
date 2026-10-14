@@ -479,10 +479,10 @@ right after signing up:
 - **What it does.** Every model call of the agent's first turn — from its first input until a reply that ends
   without a tool call — runs with reasoning off (DeepSeek `thinking: { type: "disabled" }`, OpenAI effort
   `none`). Every later turn runs as any agent's does.
-- **Once per agent.** The first turn ends for good, recorded in the agent's object, at the first of: an answer that
-  ends a turn (a reply, a failure, a cut-off), a cancel (so a first turn cancelled mid tool loop does not carry
-  into the next), or the end of the agent's first main conversation (a fresh context, or a rebuild, before or
-  after it). A new conversation after any of these runs with reasoning on.
+- **Once per agent.** The first turn ends for good at the first of: an answer that ends a turn (a reply, a failure,
+  a cut-off), a cancel (recorded in the agent's object, so a first turn cancelled mid tool loop does not carry into
+  the next), or the end of the agent's first main conversation (a fresh context, or a rebuild, before or after
+  it). A new conversation after any of these runs with reasoning on.
 - **Models.** Applied only where the model has a known off field: DeepSeek's models, and OpenAI's (their catalog's
   off level; one without reasoning is unchanged). Any other model's first turn runs with its default, and is sent
   no field it might refuse. Not refused at the create, since the model can change after it (`PUT …/model`, an

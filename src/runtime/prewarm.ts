@@ -128,7 +128,7 @@ const DONE_TABLE = `CREATE TABLE IF NOT EXISTS first_turn_done (
   tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL, at INTEGER NOT NULL, how TEXT NOT NULL, PRIMARY KEY (tenant_id, agent_id))`;
 
 /**
- * Whether the agent's first turn is over for good: its durable mark (`markFirstTurnDone`), or a main conversation
+ * Whether the agent's first turn is over for good: its durable mark (`markFirstTurnDone`, a cancel), or a main conversation
  * that has ended (a fresh context or a rebuild, `startFreshMain`), whose successor is not where the agent began. Either
  * way no later call runs with the first turn's reasoning, whatever its own conversation looks like.
  */
@@ -142,18 +142,12 @@ export function firstTurnDone(sql: Sql, tenantId: string, agentId: string): bool
 }
 
 /**
- * The first turn is over: `replied` (an answer that ends a turn was delivered), `cancelled`, or `seen` (a call's
- * conversation already holds such an answer). Once; a later mark changes nothing.
+ * The first turn is over without an answer that would say so in its conversation: `cancelled`. Once; a later mark
+ * changes nothing.
  */
 export function markFirstTurnDone(sql: Sql, tenantId: string, agentId: string, how: string, now: number): void {
   sql.exec(DONE_TABLE);
   sql.exec("INSERT OR IGNORE INTO first_turn_done(tenant_id, agent_id, at, how) VALUES (?,?,?,?)", tenantId, agentId, now, how);
-}
-
-/** Whether a delivered answer ends the turn it belongs to: an assistant message that did not stop to call tools. */
-export function endsTurn(answer: unknown): boolean {
-  const a = answer as { role?: unknown; stopReason?: unknown } | null | undefined;
-  return a?.role === "assistant" && a.stopReason !== "toolUse";
 }
 
 /**

@@ -163,7 +163,7 @@ import type { MountPolicy, MountRecord } from "../../src/core/types.ts";
 import type { HookDirectory, HookRow } from "./control-plane.ts";
 import { appendUsage, jsRunRows, modelTokenRows } from "../../src/usage/outbox.ts";
 import {
-  endsTurn, finishPrewarm, firstTurnDone, firstTurnOf, inFirstTurn, markFirstTurnDone, PREWARM_USER_TEXT, prewarmable, prewarmJobId,
+  finishPrewarm, firstTurnDone, firstTurnOf, inFirstTurn, markFirstTurnDone, PREWARM_USER_TEXT, prewarmable, prewarmJobId,
   queuePrewarm, readPrewarm, reasoningOffSupported, takePrewarm,
 } from "../../src/runtime/prewarm.ts";
 import { RunJsContinuations } from "../../src/runtime/run-js-resume.ts";
@@ -3547,11 +3547,12 @@ export class AgentRuntime {
   /**
    * The reasoning a model call of this agent runs with, when it is not the provider's default: `off` for a call of
    * the agent's first turn on an agent made with `firstTurn: { reasoning: "off" }` (POST /provision/agents;
-   * src/runtime/prewarm.ts). Undefined otherwise, which sends the request it always was. The first turn is bounded
-   * three ways, so it is had once per agent and never again: the durable mark (`firstTurnDone`: a turn-ending answer
-   * delivered, a cancel, or a main conversation that ended, as a fresh context or a rebuild ends it), and this call's
-   * own conversation holding no turn-ending answer (`inFirstTurn`), which also marks it when it does. `model` is the
-   * one the call reaches: one with no known off field (`reasoningOffSupported`) runs with its default.
+   * src/runtime/prewarm.ts). Undefined otherwise, which sends the request it always was. Had once per agent: this
+   * call's conversation holds no turn-ending answer (`inFirstTurn`), it is the agent's first main conversation, and no
+   * cancel ended a turn of it (`firstTurnDone`). A reply ends it within its conversation, and every later conversation
+   * is a new one after an ended first, so no other mark is needed (pi085 does not compact in place; a fresh context, a
+   * rebuild and the overflow backstop all start a new main conversation, `startFreshMain`). `model` is the one the
+   * call reaches: one with no known off field (`reasoningOffSupported`) runs with its default.
    */
   async #reasoningFor(tenantId: string, agentId: string, session: string, context: unknown, model: string | undefined): Promise<"off" | undefined> {
     if (session !== MAIN_SESSION) return undefined;
@@ -3559,11 +3560,10 @@ export class AgentRuntime {
     if (!first || !model || !reasoningOffSupported(model)) return undefined;
     const sql = this.#deps.ctx.storage.sql;
     if (firstTurnDone(sql, tenantId, agentId)) return undefined;
-    if (!inFirstTurn(context)) { markFirstTurnDone(sql, tenantId, agentId, "seen", Date.now()); return undefined; }
-    return first.reasoning;
+    return inFirstTurn(context) ? first.reasoning : undefined;
   }
 
-  /** A turn of the main conversation ended (an answer, a cancel): an agent made with `firstTurn` has had its first. */
+  /** A turn of the main conversation was cancelled: an agent made with `firstTurn` has had its first. */
   async #firstTurnEnded(tenantId: string, agentId: string, session: string, how: string) {
     if (session !== MAIN_SESSION) return;
     if (!firstTurnOf((await this.store.loadAgent(tenantId, agentId))?.config)) return;
@@ -4654,13 +4654,7 @@ export class AgentRuntime {
   async deliverAnswer(tenantId: string, agentId: string, jobId: string, answer: unknown, taker: string | undefined) {
     await this.ready();
     const session = this.#jobSessionFor(jobId);
-    const wrote = await (await this.agent(tenantId, agentId, session)).deliver(jobId, answer as any, taker);
-    // An answer that ends a turn ends the first one too (`#reasoningFor`); a reading, so it never fails the delivery.
-    if (wrote && endsTurn(answer)) {
-      try { await this.#firstTurnEnded(tenantId, agentId, session, "replied"); }
-      catch (e) { console.error(`marking the first turn of ${tenantId}/${agentId} done failed:`, e); }
-    }
-    return wrote;
+    return (await this.agent(tenantId, agentId, session)).deliver(jobId, answer as any, taker);
   }
 
   /**
