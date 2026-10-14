@@ -348,6 +348,8 @@ await check("ready: a provisioned agent says online once enable_push succeeds, a
   // Once per agent: push enabled again (a new credential re-registers it) says nothing new.
   must((await provisionTool(rt, "t", "raft_r1", "enable_push")).ok, "enable_push again");
   must(readyRows(host).length === 1 && (await drained(host, "raft_r1")).length === 0, `ready twice: ${JSON.stringify(readyRows(host))}`);
+  // Asked again it answers "not written" rather than failing on the key.
+  must((await rt.provisionedReady("t", "raft_r1", "push enabled")) === false, "asked again, it wrote or threw");
   host.dispose();
 });
 
@@ -376,6 +378,21 @@ await check("ready: an agent made with awaitImport says online when its import l
   must(r.ok && "lifted" in r && r.lifted, `import: ${JSON.stringify(r)}`);
   const sent = await drained(host, "raft_r3");
   must(sent.length === 1 && sent[0]!.status === "online" && readyRows(host)[0]?.attrs.reason === "the workspace import landed", JSON.stringify(sent));
+  host.dispose();
+});
+
+await check("ready: an import that lands before push is on says nothing; push enabled afterwards is the agent ready", async () => {
+  const { rt, host } = await runtime();
+  raft();
+  must((await adoptProvisionedAgent(rt, "t", "raft_r4", { ...SPEC, awaitImport: true })).ok, "adopt");
+  const text = "notes";
+  const r = await rt.importWorkspace("t", "raft_r4", { migrationId: "m1", digest: "d1", instructions: false,
+    files: [{ path: "a.md", text, bytes: text.length, sha256: await sha256Hex(text) }] });
+  must(r.ok && "lifted" in r && r.lifted, `import: ${JSON.stringify(r)}`);
+  must(readyRows(host).length === 0, `ready with push off: ${JSON.stringify(readyRows(host))}`);
+  must((await rt.attachCredential("t", "raft_r4", PROVISION_MOUNT_ALIAS, { token: CRED })).ok, "credential");
+  must((await provisionTool(rt, "t", "raft_r4", "enable_push")).ok, "enable_push");
+  must(readyRows(host).length === 1 && readyRows(host)[0]!.attrs.reason === "push enabled", JSON.stringify(readyRows(host)));
   host.dispose();
 });
 

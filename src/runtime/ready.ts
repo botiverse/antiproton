@@ -31,8 +31,10 @@ export function markReady(sql: Sql, tenantId: string, agentId: string, reason: s
   if (readHold(sql, tenantId, agentId)?.liftedAt === null) return false;
   if (agentStarted(sql, tenantId, agentId)) return false;
   sql.exec(READY_SCHEMA);
-  if (sql.exec("SELECT 1 FROM agent_ready WHERE tenant_id=? AND agent_id=?", tenantId, agentId).toArray().length) return false;
-  sql.exec("INSERT INTO agent_ready(tenant_id, agent_id, at) VALUES (?,?,?)", tenantId, agentId, now);
+  // The key is the once: a second asking inserts nothing and writes no row.
+  const first = sql.exec("INSERT INTO agent_ready(tenant_id, agent_id, at) VALUES (?,?,?) ON CONFLICT DO NOTHING RETURNING at",
+    tenantId, agentId, now).toArray();
+  if (!first.length) return false;
   appendTrace(sql, [{
     at: now, tenantId, agentId, kind: "agent.ready", spanId: `ready_${agentId}`, status: "ready", verdict: "ok", attrs: { reason },
   }]);
