@@ -13,7 +13,7 @@ async function check(name: string, fn: () => Promise<void>) {
 function assert(cond: unknown, msg: string) { if (!cond) throw new Error(msg); }
 
 /** The body of the one request the client made under a stubbed fetch. */
-async function requestFor(opts: Parameters<OpenAiCompatibleModel["complete"]>[1]): Promise<Record<string, unknown>> {
+async function requestFor(opts: Parameters<OpenAiCompatibleModel["complete"]>[1], model = "deepseek-flash"): Promise<Record<string, unknown>> {
   const bodies: Record<string, unknown>[] = [];
   const original = globalThis.fetch;
   globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
@@ -21,7 +21,7 @@ async function requestFor(opts: Parameters<OpenAiCompatibleModel["complete"]>[1]
     return new Response(JSON.stringify({ choices: [{ message: { content: "ok" }, finish_reason: "stop" }], usage: { completion_tokens: 1 } }), { status: 200 });
   }) as typeof fetch;
   try {
-    const m = new OpenAiCompatibleModel({ baseUrl: "https://provider.example/v1", apiKey: "k", model: "m" });
+    const m = new OpenAiCompatibleModel({ baseUrl: "https://provider.example/v1", apiKey: "k", model });
     const r = await m.complete([{ role: "user", content: "hi" }], opts);
     assert(r.text === "ok" && bodies.length === 1, `one request, one answer (got ${bodies.length})`);
     return bodies[0]!;
@@ -39,6 +39,9 @@ await check("reasoning off is DeepSeek's thinking.type=disabled, and no effort b
   assert(JSON.stringify(b.thinking) === JSON.stringify({ type: "disabled" }), `thinking ${JSON.stringify(b.thinking)}`);
   assert(!("reasoning_effort" in b), "an effort was sent with thinking off");
   assert(b.max_tokens === 2000, "the cap did not pass");
+  // DeepSeek's field, for DeepSeek's models only: another vendor's model is sent nothing it might refuse.
+  const other = await requestFor({ maxTokens: 2000, reasoning: "off" }, "m");
+  assert(!("thinking" in other) && !("reasoning_effort" in other), `a non-DeepSeek model was sent ${JSON.stringify({ t: other.thinking, e: other.reasoning_effort })}`);
 });
 
 await check("low and high are reasoning_effort, with thinking left to the provider", async () => {
