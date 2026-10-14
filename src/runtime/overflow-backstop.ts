@@ -342,10 +342,12 @@ function withoutHead(text: string, heads: readonly string[]): string {
 /**
  * The text a Raft push wakes the agent with (src/plugins/raft.ts `receiveNotice`, inside src/runtime/inbound.ts
  * `inboundMessage`): an instruction to read the inbox and Raft's own notice, never the messages. In the history it says
- * nothing the messages read after it do not, so it is left out there.
+ * nothing the messages read after it do not, so it is left out there. Two forms: the one written since
+ * `wakeInstruction` (under `inboxLabel`), and the one histories written before it still hold.
  */
-const RAFT_NOTICE = /^\[incoming event from the `[^`\n]+` mount\.[^\n]*\]\nRead your Raft inbox with the `receive_events` tool/;
-export const isRaftNotice = (text: string) => RAFT_NOTICE.test(text);
+const RAFT_NOTICE = /^\[inbox notice from the `[^`\n]+` mount:[^\n]*\]\nMessages addressed to you \(DMs, @mentions/;
+const OLD_RAFT_NOTICE = /^\[incoming event from the `[^`\n]+` mount\.[^\n]*\]\nRead your Raft inbox with the `receive_events` tool/;
+export const isRaftNotice = (text: string) => RAFT_NOTICE.test(text) || OLD_RAFT_NOTICE.test(text);
 
 /** A Raft message as its read tools show it: one line `[target=… msg=… time=… type=…] @sender: content` (the SDK's). */
 export interface RaftLine { target: string; msg: string | null; type: string | null; text: string }

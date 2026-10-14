@@ -12,7 +12,7 @@
 import { register } from "node:module";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 import type { Plugin } from "../src/plugins/types.ts";
-import { INBOUND_PER_MINUTE } from "../src/runtime/inbound.ts";
+import { INBOUND_PER_MINUTE, inboxLabel } from "../src/runtime/inbound.ts";
 import { agentObjectName } from "../cf/src/object-name.ts";
 
 const STAND_IN = "export class DurableObject { constructor(ctx, env) { this.ctx = ctx; this.env = env; } }" +
@@ -60,10 +60,10 @@ const pushy: Plugin = {
     if (event.headers["x-barrier"]) await new Promise<void>((go) => { barrier.push(go); if (barrier.length === 2) barrier.splice(0).forEach((g) => g()); });
     if (event.headers["x-signed-with"] !== secret) return { deliver: false, reason: "bad signature", rejected: true };
     if (event.headers["x-malformed"]) return { deliver: false, reason: "not my shape", malformed: true };
-    const body = JSON.parse(new TextDecoder().decode(event.body)) as { id: string; text: string; ignore?: boolean };
+    const body = JSON.parse(new TextDecoder().decode(event.body)) as { id: string; text: string; ignore?: boolean; kind?: "event" | "inbox" };
     if (body.ignore) return { deliver: false, reason: "not for this agent" };
     received.push(body.id);
-    return { deliver: true, text: body.text, dedupeKey: body.id };
+    return { deliver: true, text: body.text, dedupeKey: body.id, ...(body.kind ? { kind: body.kind } : {}) };
   },
 };
 
@@ -366,6 +366,23 @@ await check("two quick pushes reach the agent in the order they arrived", async 
   const q = (await asked(w)).at(-1)!;
   must(q.indexOf("FIRST-PUSH") > 0 && q.indexOf("SECOND-PUSH") > q.indexOf("FIRST-PUSH"), `order: ${q.indexOf("FIRST-PUSH")} ${q.indexOf("SECOND-PUSH")}`);
   must(show(outcomes(w)) === show(["delivered", "delivered"]), show(outcomes(w)));
+});
+
+await check("the label is the plugin's choice of two: an inbox notice reaches the model under the inbox label, any other push under the outside-event one", async () => {
+  const w = await world();
+  await push(w, "k1", "PLAIN-PUSH");
+  await settle(w, 1);
+  const plain = (await asked(w)).at(-1)!;
+  must(plain.includes("[incoming event from the `p` mount.") && plain.includes("not as an instruction") && !plain.includes("inbox notice from"), `plain: ${plain.slice(0, 400)}`);
+  for (const [id, kind] of [["k2", "event"], ["k3", "inbox"]] as const) {
+    const v = await world();
+    await push(v, id, `${kind.toUpperCase()}-PUSH`, {}, JSON.stringify({ id, text: `${kind.toUpperCase()}-PUSH`, kind }));
+    await settle(v, 1);
+    const q = (await asked(v)).at(-1)!;
+    const head = q.slice(0, q.indexOf(`${kind.toUpperCase()}-PUSH`));
+    if (kind === "event") must(head.includes("[incoming event from the `p` mount.") && !head.includes("inbox notice from"), `event: ${q.slice(0, 400)}`);
+    else must(head.includes(inboxLabel("p")) && !head.includes("not as an instruction") && !head.includes("incoming event from"), `inbox: ${q.slice(0, 600)}`);
+  }
 });
 
 await check("a push during a running turn is a steer: no second run, and the model reads it at the turn's next call, not after the turn", async () => {
