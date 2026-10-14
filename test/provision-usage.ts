@@ -75,13 +75,20 @@ function row(db: Db, r: { tenant: string; hour: number; agent?: string; resource
 const spend = (db: Db, tenant: string, usd: number, hour: number, agent = "a") => row(db, { tenant, hour, agent, quantity: tokensFor(usd) });
 
 const ORIGIN = "https://api.raft.build";
+/** A reading's figures this suite does not test (test/onboarding-budget.ts does): no onboarding spend, no plan. */
+const NO_ONBOARDING = { onboardingUsd: 0, tenantOnboardingUsd: 0, plan: null, onboardingOverride: null } as const;
 async function token(db: Db, who: { scope: "tenant"; tenantId: string } | { scope: "platform" }): Promise<string> {
   const t = newProviderToken();
   await d1ProviderTokens(db).issue({ hash: await hashProviderToken(t), label: "raft-test", raftOrigin: ORIGIN, ...who } as never);
   return t;
 }
+/**
+ * The figures these checks were written at ($5 a tenant, $30 the platform), named rather than taken from the defaults
+ * (test/spend-limit.ts checks those), so a change of default does not move every figure here.
+ */
+const AT: SpendLimitEnv = { DAILY_LIMIT_USD: "5", PLATFORM_DAILY_LIMIT_USD: "30" };
 function env(db: Db, extra: SpendLimitEnv = {}) {
-  return { CONTROL_DB: db, AGENT: { idFromName: (s: string) => s, get: () => ({}) }, ARTIFACTS: {}, HARNESS_MODEL: "deepseek-flash", ...extra };
+  return { CONTROL_DB: db, AGENT: { idFromName: (s: string) => s, get: () => ({}) }, ARTIFACTS: {}, HARNESS_MODEL: "deepseek-flash", ...AT, ...extra };
 }
 /** One request through the Worker. The isolate's answer cache is emptied first unless `keep`: each check has its own ledger. */
 async function get(e: object, path: string, auth: string | null, keep = false) {
@@ -175,7 +182,7 @@ await check("today under, at and over the limit: spentUsd, limitUsd and refusing
     const r = await get(env(db), "/provision/usage", `Bearer ${a}`);
     must(r.status === 200, `${usd}: ${r.status} ${r.text}`);
     const enforced = await readDaySpend(db, "t-a", Date.now());
-    const verdict = judge(enforced, limitsOf({}));
+    const verdict = judge(enforced, limitsOf(AT));
     must(r.body.today.spentUsd === tidy(enforced.tenantUsd) && r.body.today.limitUsd === (at ? enforced.tenantUsd : 5), `${usd}: ${show(r.body.today)} vs ${show(enforced)}`);
     must(r.body.today.refusing === !verdict.admit && r.body.today.refusing === refused, `${usd}: refusing ${r.body.today.refusing}, judge ${show(verdict)}`);
     must(r.body.today.exempt === false && r.body.today.platformLimitReached === false, show(r.body.today));
@@ -222,7 +229,7 @@ await check("the platform limit reached: refusing and platformLimitReached, and 
   const a = await token(db, { scope: "tenant", tenantId: "t-a" });
   const r = await get(env(db), "/provision/usage", `Bearer ${a}`);
   const enforced = await readDaySpend(db, "t-a", Date.now());
-  must(enforced.platformUsd > 30 && !judge(enforced, limitsOf({})).admit, show(enforced));
+  must(enforced.platformUsd > 30 && !judge(enforced, limitsOf(AT)).admit, show(enforced));
   must(r.body.today.platformLimitReached === true && r.body.today.refusing === true && r.body.today.limitUsd === 5 && r.body.today.spentUsd < 5, show(r.body.today));
   for (const leak of ["31.23", "32.23", "t-other", "\"30\"", ":30,", ":30}"]) must(!r.text.includes(leak), `the answer carries ${leak}: ${r.text}`);
   const keys = new Set<string>();
@@ -249,9 +256,9 @@ await check("an answer is kept 15 s per tenant and normalised query, never acros
   const count = () => reads.length;
   let usd = 1;
   const costs: OwnCosts = { total: 0, periods: [], agents: [] };
-  const deps = (limits = limitsOf({}), cache = new UsageCache()): ProvisionUsage => ({
+  const deps = (limits = limitsOf(AT), cache = new UsageCache()): ProvisionUsage => ({
     limits, cache,
-    today: async (tenantId, now) => { reads.push(`today ${tenantId}`); return { day: dayOf(now), tenantUsd: usd, platformUsd: usd, override: null }; },
+    today: async (tenantId, now) => { reads.push(`today ${tenantId}`); return { day: dayOf(now), tenantUsd: usd, platformUsd: usd, override: null, ...NO_ONBOARDING }; },
     costs: async (tenantId, from, to, bucket) => { reads.push(`costs ${tenantId} ${from} ${to} ${bucket}`); return costs; },
   });
   const d = deps();
@@ -277,7 +284,7 @@ await check("an answer is kept 15 s per tenant and normalised query, never acros
   must(after.today.day === "2026-10-13" && after.today.spentUsd === 0 && count() === 12, `${show(after.today)} ${show(reads)}`);
   // New limits (a new deployment's) are not answered from the old ones' entry.
   const shared = new UsageCache();
-  const r1 = await ask("", NOON, deps(limitsOf({}), shared));
+  const r1 = await ask("", NOON, deps(limitsOf(AT), shared));
   const r2 = await ask("", NOON + 1, deps(limitsOf({ DAILY_LIMIT_USD: "9" }), shared));
   must(r1.today.limitUsd === 5 && r2.today.limitUsd === 9, `${show(r1.today)} ${show(r2.today)}`);
 });
@@ -307,8 +314,8 @@ await check("the cache is bounded: expired entries are removed, the cap holds ov
   let reads = 0;
   const count = () => reads;
   const deps: ProvisionUsage = {
-    limits: limitsOf({}), cache,
-    today: async (_t, now) => { reads++; return { day: dayOf(now), tenantUsd: 0, platformUsd: 0, override: null }; },
+    limits: limitsOf(AT), cache,
+    today: async (_t, now) => { reads++; return { day: dayOf(now), tenantUsd: 0, platformUsd: 0, override: null, ...NO_ONBOARDING }; },
     costs: async () => ({ total: 0, periods: [], agents: [] }),
   };
   await tenantUsage("t-a", new URLSearchParams("from=2025-09-08&to=2026-10-12"), deps, T);

@@ -230,17 +230,37 @@ table holds, so a `*` meant for our account cannot reach it.
 
 ## Daily limits
 
-Two limits per UTC day, in US dollars at the prices above (`cf/src/spend-limit.ts`,
-`cf/migrations/0018_spend_limits.sql`):
+Three limits per UTC day, in US dollars at the prices above (`cf/src/spend-limit.ts`,
+`cf/migrations/0018_spend_limits.sql`, `cf/migrations/0021_onboarding_budget_and_plans.sql`):
 
 | limit | default | set by | counts |
 |---|---|---|---|
-| per tenant | $5 | `DAILY_LIMIT_USD`; an admin's override per tenant (`/admin/spend-limits`) wins | the tenant's priced usage today, `model.tokens.unaccepted` left out (it is ours, not theirs) |
-| platform | $30 | `PLATFORM_DAILY_LIMIT_USD` | every tenant's priced usage today, `model.tokens.unaccepted` and exempt tenants included |
+| per tenant, `free` plan or none | $3 | `DAILY_LIMIT_USD`; an admin's override per tenant (`/admin/spend-limits`) wins | the tenant's own agents' priced usage today, `model.tokens.unaccepted` left out (it is ours, not theirs) |
+| per tenant, `pro` plan | $10 | `PRO_DAILY_LIMIT_USD`; an admin's override per tenant wins | as above |
+| platform | $2000 | `PLATFORM_DAILY_LIMIT_USD` | every tenant's own agents' priced usage today, `model.tokens.unaccepted` and exempt tenants included |
+| onboarding | $30 | `ONBOARDING_DAILY_LIMIT_USD`; an admin's override (`/admin/spend-limits`, `pool: "onboarding"`) wins | the priced usage today of every agent created with `budget: "onboarding"`, in any tenant, `model.tokens.unaccepted` included |
 
-Either var set to `off` is no limit; a value that is not a number at or above 0
+**A tenant's plan** is what Raft last said of its server (`plan` on `POST
+/provision/agents`, `PUT /provision/servers/{raftServerId}/plan`; docs/agent-surface.md),
+kept in `tenant_plans`; a tenant Raft never gave a plan is `free`. An admin's
+override of the tenant beats either plan's default. Antiproton never asks Raft.
+
+**The onboarding pool is separate from both others.** An agent created with
+`budget: "onboarding"` (the hosted onboarding agent; `provisioned_agents.budget`,
+fixed at creation) is paid by the platform: its spend is in neither its tenant's
+figure nor the platform total, and its calls are judged by the onboarding limit
+alone — not refused because its tenant or the platform is out of money, and
+unable to spend the platform's budget either way. Every other agent (no
+provisioned row, or `budget` absent) is its tenant's. There is no ceiling over
+both pools: the most the operator pays in a day is the platform limit plus the
+onboarding limit (plus the overshoot below, and exempt tenants). An onboarding
+agent in an exempt tenant is not refused either; its spend still counts toward
+the onboarding total.
+
+Each var set to `off` is no limit; a value that is not a number at or above 0
 is logged (`spend_limit.bad_config`) and read as the default, so a typo does not
-lift a cap. A tenant in `DAILY_LIMIT_EXEMPT_TENANTS` (comma-separated; unset is
+lift a cap. No deployment sets any of them (`cf/wrangler.jsonc` has none, and
+production has no such secret), so the defaults above are the live figures. A tenant in `DAILY_LIMIT_EXEMPT_TENANTS` (comma-separated; unset is
 `bench`) is refused by neither limit but still counts toward the platform total.
 No tenant is exempt by being the operator's: the code has no such marker (the
 original `demo` tenant also holds invited people), so an operator's tenant is
@@ -270,7 +290,9 @@ Agents API show (`failureText`) — is:
 
 - `Daily usage limit reached ($X of $Y); resets at 00:00 UTC.`, or
 - `Platform daily usage limit reached; resets at 00:00 UTC.` (asked first: when
-  it is reached nobody's calls are made).
+  it is reached no call of a tenant's own agents is made), or
+- `Onboarding daily usage limit reached; resets at 00:00 UTC.`, for an
+  onboarding agent, which is asked nothing else.
 
 An agent Raft runs tells Raft the same sentence: the failed call's `model.call`
 trace row carries it (`attrs.limit`, `modelCallRow` in `src/trace/seams.ts`), so
@@ -289,11 +311,14 @@ usage, so nothing is metered for it. At 00:00 UTC the next reading is of a new
 day and calls are made again; nobody acts.
 
 **How fresh the reading is.** The consumer's isolate keeps each tenant's last
-reading — one D1 round trip of three parallel reads: today's hours of every
-tenant, the prices, the tenant's override — for 30 s (`SPEND_CACHE_MS`), and for
-5 s once either total is within 80 % of its limit (`SPEND_CACHE_NEAR_MS`); a
-reading from an earlier UTC day is never used. An admin's override reaches a
-running isolate within those 30 s. The ledger itself lags: an object sends its
+reading — one D1 round trip of five parallel reads: today's hours of every
+tenant with each row's agent's budget, the prices, the tenant's override, the
+tenant's plan, the onboarding override — for 30 s (`SPEND_CACHE_MS`), and for
+5 s once a total that judges the calling agent is within 80 % of its limit
+(`SPEND_CACHE_NEAR_MS`); a reading from an earlier UTC day is never used. An
+admin's override, or a plan Raft sends, reaches a running isolate within those
+30 s. Which pool an agent is in is read once per agent per isolate (it never
+changes), beside the first reading. The ledger itself lags: an object sends its
 usage at the end of the alarm pass that a delivered answer wakes, so a call's
 tokens are usually in D1 within seconds of the answer.
 
@@ -310,7 +335,8 @@ object's own time; a new operator-paid container is not refused either, though n
 new tool call reaches one without a model call first. Exempt tenants are never
 refused, so the platform total can pass its limit by what they spend.
 
-**A spend read that fails admits the call** and logs `spend_limit.read_failed`:
+**A spend read that fails admits the call** (so does a failed read of the
+agent's pool) and logs `spend_limit.read_failed`:
 availability is worth more than a cap of a few dollars, and the ledger is
 unchanged, so the next read that works refuses as it should. A failure is not
 kept, so the next call reads again.
@@ -318,17 +344,31 @@ kept, so the next call reads again.
 **Overrides**, for an admin (`isAdmin`, as `/admin/models`; on the admin host
 too):
 
-    GET    /admin/spend-limits                              → { defaults, overrides, events }
+    GET    /admin/spend-limits                              → { defaults, overrides, events, pools, poolEvents, plans }
     PUT    /admin/spend-limits { tenantId, limitUsd }       → the row; limitUsd null: no per-tenant limit
     DELETE /admin/spend-limits { tenantId }                 → 204, or 404 when there was none
+    PUT    /admin/spend-limits { pool: "onboarding", limitUsd } → the pool's row; limitUsd null: no onboarding limit
+    DELETE /admin/spend-limits { pool: "onboarding" }       → 204, or 404 when there was none
 
-Every set and clear is kept in `spend_limit_events` with who, when, and the value
-it replaced. A tenant with `limitUsd` null is still refused at the platform limit.
+Every set and clear is kept in `spend_limit_events` (a tenant's) or
+`spend_pool_limit_events` (a pool's) with who, when, and the value it replaced.
+A tenant with `limitUsd` null is still refused at the platform limit. `plans` is
+each tenant's plan as Raft last said it, read only. The admin host's spend-limits
+page shows each tenant against its plan's limit with its onboarding agents' spend
+beside it, and the onboarding pool against its limit with a form to set or clear
+it; `/admin/usage-costs` gives `onboarding.total` and each tenant's `onboarding`
+part (already inside its figures), and its page has an "onboarding pool" line.
+
+**Changing the platform and tenant defaults.** They are code defaults, so a
+deploy changes them; nothing stored holds the old $30 / $5 (no row in
+`spend_limits` or `spend_limit_events` in production, read 2026-10-14). An
+admin's per-tenant override, where there is one, is left as it is.
 
 **What a tenant is shown.** `GET /provision/usage` gives a Raft tenant its
-`today`: its spend, its limit (`null` when it has none or is exempt), whether it
-is exempt, whether the platform limit is reached, and whether a call would be
-refused now — `standing` in `cf/src/spend-limit.ts`, over a fresh `readDaySpend`
+`today`: its spend, its limit (`null` when it has none or is exempt), its plan,
+its onboarding agents' spend (beside its own, counted against nothing of its
+own), whether it is exempt, whether the platform limit is reached, and whether a
+call of its own agents would be refused now — `standing` in `cf/src/spend-limit.ts`, over a fresh `readDaySpend`
 and the same `judge` the consumer applies, so the two cannot disagree on the rule,
 only on the reading's age: the answer is kept 15 s per isolate (`USAGE_CACHE_MS`,
 never past its UTC day; windows of at most 62 days, at most 256 answers), the consumer's reading up to 30 s (above), so they can

@@ -15,7 +15,8 @@ import { readEntries } from "../cf/src/transcript-read.ts";
 import { sessionTranscript } from "../cf/src/agents-api/transcript.ts";
 import { entriesToEvents } from "../cf/src/pi-view.ts";
 import {
-  adminSpendLimits, d1SpendLimits, DEFAULT_DAILY_LIMIT_USD, DEFAULT_PLATFORM_DAILY_LIMIT_USD, limitsOf, PLATFORM_LIMIT_TEXT,
+  adminSpendLimits, d1SpendLimits, DEFAULT_DAILY_LIMIT_USD, DEFAULT_ONBOARDING_DAILY_LIMIT_USD, DEFAULT_PLATFORM_DAILY_LIMIT_USD,
+  DEFAULT_PRO_DAILY_LIMIT_USD, limitsOf, PLATFORM_LIMIT_TEXT,
   readDaySpend, SPEND_CACHE_MS, SPEND_CACHE_NEAR_MS, SPEND_LIMIT_ERROR, SpendGate, spendAdmit, tenantLimitText, type DaySpend,
 } from "../cf/src/spend-limit.ts";
 import { overflowKind, readBackstop } from "../src/runtime/overflow-backstop.ts";
@@ -75,9 +76,13 @@ function row(db: D1Database & { raw: DatabaseSync }, r: { tenant: string; hour: 
 const spend = (db: D1Database & { raw: DatabaseSync }, tenant: string, usd: number, hour = TODAY + 3 * H) =>
   row(db, { tenant, hour, quantity: tokensFor(usd) });
 
-const LIMITS = limitsOf({});
+/**
+ * The figures these checks were written at ($5 a tenant, $30 the platform), named rather than taken from the defaults,
+ * so a change of default is checked once, in its own check, and not by moving every figure below.
+ */
+const LIMITS = limitsOf({ DAILY_LIMIT_USD: "5", PLATFORM_DAILY_LIMIT_USD: "30" });
 const reading = (tenantUsd: number, platformUsd = tenantUsd, override: DaySpend["override"] = null, day = TODAY): DaySpend =>
-  ({ day, tenantUsd, platformUsd, override });
+  ({ day, tenantUsd, platformUsd, override, onboardingUsd: 0, tenantOnboardingUsd: 0, plan: null, onboardingOverride: null });
 /** A gate over fixed readings, counting reads, on a clock the test moves. */
 function gateOver(read: (tenantId: string, now: number) => Promise<DaySpend>, limits = LIMITS) {
   const clock = { now: NOON };
@@ -95,15 +100,22 @@ async function logged(fn: () => Promise<void>): Promise<string[]> {
 
 // ---- configuration ---------------------------------------------------------------------------------------------
 
-await check("defaults: $5 per tenant, $30 for the platform, bench exempt; `off` lifts a limit; a typo keeps the default", async () => {
-  must(LIMITS.tenantUsd === 5 && DEFAULT_DAILY_LIMIT_USD === 5 && LIMITS.platformUsd === 30 && DEFAULT_PLATFORM_DAILY_LIMIT_USD === 30, show(LIMITS));
-  must(show([...LIMITS.exempt]) === show(["bench"]), show([...LIMITS.exempt]));
+await check("defaults: $3 a free tenant, $10 a pro one, $2000 for the platform, $30 for onboarding, bench exempt; `off` lifts a limit; a typo keeps the default", async () => {
+  const d = limitsOf({});
+  must(d.tenantUsd === 3 && DEFAULT_DAILY_LIMIT_USD === 3 && d.proUsd === 10 && DEFAULT_PRO_DAILY_LIMIT_USD === 10
+    && d.platformUsd === 2000 && DEFAULT_PLATFORM_DAILY_LIMIT_USD === 2000 && d.onboardingUsd === 30 && DEFAULT_ONBOARDING_DAILY_LIMIT_USD === 30,
+  show({ ...d, exempt: [...d.exempt] }));
+  must(show([...d.exempt]) === show(["bench"]), show([...d.exempt]));
+  const more = limitsOf({ PRO_DAILY_LIMIT_USD: "off", ONBOARDING_DAILY_LIMIT_USD: "12.5" });
+  must(more.proUsd === null && more.onboardingUsd === 12.5 && more.tenantUsd === 3, show({ ...more, exempt: [...more.exempt] }));
   const set = limitsOf({ DAILY_LIMIT_USD: "2.5", PLATFORM_DAILY_LIMIT_USD: "off", DAILY_LIMIT_EXEMPT_TENANTS: " bench, demo ,," });
   must(set.tenantUsd === 2.5 && set.platformUsd === null && show([...set.exempt]) === show(["bench", "demo"]), show({ ...set, exempt: [...set.exempt] }));
   let bad: ReturnType<typeof limitsOf> | null = null;
-  const lines = await logged(async () => { bad = limitsOf({ DAILY_LIMIT_USD: "5 dollars", PLATFORM_DAILY_LIMIT_USD: "-1" }); });
-  must(bad!.tenantUsd === 5 && bad!.platformUsd === 30, show(bad));
-  must(lines.filter((l) => l.includes("spend_limit.bad_config")).length === 2, show(lines));
+  const lines = await logged(async () => {
+    bad = limitsOf({ DAILY_LIMIT_USD: "5 dollars", PLATFORM_DAILY_LIMIT_USD: "-1", PRO_DAILY_LIMIT_USD: "ten", ONBOARDING_DAILY_LIMIT_USD: "-3" });
+  });
+  must(bad!.tenantUsd === 3 && bad!.platformUsd === 2000 && bad!.proUsd === 10 && bad!.onboardingUsd === 30, show(bad));
+  must(lines.filter((l) => l.includes("spend_limit.bad_config")).length === 4, show(lines));
 });
 
 // ---- what is counted -------------------------------------------------------------------------------------------
@@ -259,7 +271,7 @@ await check("a spend read that fails admits the call, says so in the log, and is
 
 const answerFor = async (text: string) => {
   const admit = spendAdmit({ admit: async () => ({ admit: false, limit: "tenant", text }) as const }, "deepseek-flash");
-  return (await admit({ model: { api: "offloaded", provider: "openai-compatible" } }, { tenantId: "t", jobId: "j1" }))!;
+  return (await admit({ model: { api: "offloaded", provider: "openai-compatible" } }, { tenantId: "t", agentId: "a", jobId: "j1" }))!;
 };
 
 await check("the refusal is fixed text the harness does not retry and nobody reads as an overflow, at any figure", async () => {
@@ -498,7 +510,7 @@ await check("the Worker's queue handler asks the limit: over it the job is answe
     await worker.queue(batch("t") as never, env as never);
     must(f.seen.calls === 0 && q.acked === 1 && q.retried === 0, `over: provider ${f.seen.calls}, queue ${show(q)}`);
     must(delivered.length === 1 && delivered[0]!.answer.errorMessage === SPEND_LIMIT_ERROR
-      && /^Daily usage limit reached \(\$6\.00 of \$5\.00\); resets at 00:00 UTC\.$/.test(delivered[0]!.answer.providerError), show(delivered));
+      && /^Daily usage limit reached \(\$6\.00 of \$3\.00\); resets at 00:00 UTC\.$/.test(delivered[0]!.answer.providerError), show(delivered));
     // The control: an exempt tenant on the same deployment is called.
     await worker.queue(batch("bench") as never, env as never);
     must(Number(f.seen.calls) === 1 && Number(delivered.length) === 2 && delivered[1]!.answer.stopReason === "stop", `bench: provider ${f.seen.calls}, ${show(delivered[1])}`);

@@ -24,7 +24,8 @@ import {
   MAIN_SESSION_ID, redactCredentials, TRACE_LIMIT_DEFAULT, TRACE_LIMIT_MAX, TRACE_WINDOW_MAX_MS, TRANSCRIPT_LIMIT_DEFAULT, TRANSCRIPT_LIMIT_MAX,
   type EvalTranscript, type TraceQuery, type TraceWindow,
 } from "../eval-read.ts";
-import type { ConnectionRegistry, ConnectorStore, ProviderTokenIdentity, ProvisionRegistry, ProvisionedAgent } from "../control-plane.ts";
+import { AGENT_BUDGETS, type AgentBudget, type ConnectionRegistry, type ConnectorStore, type ProviderTokenIdentity, type ProvisionRegistry, type ProvisionedAgent } from "../control-plane.ts";
+import { PLANS, type Plan, type TenantPlanStore } from "../spend-limit.ts";
 import { CONNECTION_PROVIDERS, returnUrlProblem, scopesFor, type ConnectionProvider } from "./connect.ts";
 import { surface, surfaceReadOf, type SurfaceDeps } from "../agent-surface/surface.ts";
 import { logEvent } from "../../../src/core/log.ts";
@@ -141,6 +142,12 @@ export interface ProvisionDeps {
    * EVAL_SEED_ROUTES. Absent: the route answers 404, as on a deployment that never had it.
    */
   imports?: ImportOps;
+  /**
+   * The Raft server's plan (`plan` on POST, `PUT /servers/:raftServerId/plan`), which picks the tenant's default daily
+   * limit (cf/src/spend-limit.ts). Absent: the route answers 404, and a POST naming a plan is refused (503) rather
+   * than made without storing it.
+   */
+  plans?: Pick<TenantPlanStore, "set">;
 }
 
 /** What the import route asks of the agent's object; each is one RPC (cf/src/index.ts AgentDO). */
@@ -285,6 +292,30 @@ export function firstTurnField(body: unknown): FirstTurn | null | Fail {
   return { reasoning: "off" };
 }
 
+/**
+ * `budget` of a POST: absent or null is the tenant's own; otherwise one of `AGENT_BUDGETS` ("onboarding": the
+ * platform-paid onboarding pool, cf/src/spend-limit.ts). An identity for billing, fixed at creation, so anything
+ * else is refused naming the field rather than read as the tenant's.
+ */
+export function budgetField(body: unknown): AgentBudget | null | Fail {
+  const v = field(body, "budget");
+  if (v === undefined || v === null) return null;
+  if (typeof v !== "string" || !(AGENT_BUDGETS as readonly string[]).includes(v)) {
+    return { status: 422, code: "invalid", param: "budget", message: `budget is ${AGENT_BUDGETS.map((b) => `"${b}"`).join(" or ")}, or absent` };
+  }
+  return v as AgentBudget;
+}
+
+/** `plan` of a POST or a plan PUT: one of `PLANS`, exactly; absent (null on POST) is none said. */
+export function planField(body: unknown, required: boolean): Plan | null | Fail {
+  const v = field(body, "plan");
+  if (!required && (v === undefined || v === null)) return null;
+  if (typeof v !== "string" || !(PLANS as readonly string[]).includes(v)) {
+    return { status: 422, code: v === undefined ? "missing" : "invalid", param: "plan", message: `plan is ${PLANS.map((p) => `"${p}"`).join(" or ")}` };
+  }
+  return v as Plan;
+}
+
 function credentialField(body: unknown): string | Fail {
   const v = field(body, "credential");
   if (typeof v !== "string" || !v) return { status: 422, code: "missing", message: "credential is required", param: "credential" };
@@ -306,6 +337,7 @@ function view(row: ProvisionedAgent, live?: Json) {
     createdAt: new Date(row.createdAt).toISOString(),
     updatedAt: new Date(row.updatedAt).toISOString(),
     deletedAt: row.deletedAt === null ? null : new Date(row.deletedAt).toISOString(),
+    ...(row.budget ? { budget: row.budget } : {}),
     /** The services Raft may offer a Connect button for (connections/:provider). */
     connections: [...CONNECTION_PROVIDERS],
   };
@@ -366,6 +398,22 @@ export async function handleProvision(
     if (!deps.imports) return null;
     return ok(IMPORT_LIMITS);
   }
+  // The Raft server's plan, which Raft sends whenever it changes: the tenant's default daily limit follows it.
+  if (seg[0] === "servers" && seg.length === 3 && seg[2] === "plan" && method === "PUT") {
+    if (!deps.plans) return null;
+    if (!RAFT_ID.test(seg[1]!)) return fail({ status: 422, code: "invalid", param: "raftServerId", message: `the Raft server id must match ${RAFT_ID}` });
+    const tenant = tenantFor(who, seg[1]!);
+    if (isFail(tenant)) return fail(tenant);
+    const b = typeof body === "object" && body !== null && !Array.isArray(body) ? body as Record<string, unknown> : {};
+    const extra = Object.keys(b).find((k) => k !== "plan");
+    if (extra) return fail({ status: 422, code: "invalid", param: extra, message: `unknown field ${extra}; the body is { "plan": "free" | "pro" }` });
+    const plan = planField(b, true);
+    if (isFail(plan)) return fail(plan);
+    const at = deps.now();
+    await deps.plans.set(tenant, plan!, headers.credentialId ?? "provider", at);
+    logEvent("provision.plan", { tenantId: tenant, raftServerId: seg[1], plan, via: "put" });
+    return ok({ raftServerId: seg[1], plan, updatedAt: new Date(at).toISOString() });
+  }
   if (seg[0] !== "agents") return null;
   // On POST the body names the server; elsewhere the URL does.
   const serverForTenant = method === "POST" && seg.length === 1
@@ -416,11 +464,20 @@ export async function handleProvision(
     // without reasoning, for an agent whose first reply someone is waiting on. Absent: as every other turn.
     const firstTurn = firstTurnField(body);
     if (isFail(firstTurn)) return fail(firstTurn);
+    // Which daily budget pays for the agent (cf/src/spend-limit.ts): "onboarding" is the platform's onboarding pool,
+    // outside the tenant's limit. Fixed at creation like `model`, so a replay must repeat it.
+    const budget = budgetField(body);
+    if (isFail(budget)) return fail(budget);
+    // The server's plan as Raft says it now. Not part of the agent, so not compared on a replay (below).
+    const plan = planField(body, false);
+    if (isFail(plan)) return fail(plan);
+    if (plan !== null && !deps.plans) return fail({ status: 503, code: "unavailable", param: "plan", message: "this deployment cannot record a plan" });
 
     const agentId = providerAgentId(raftAgentId);
     // `model` is part of the request a replay must repeat: absent and null are one value (null), as on a create.
     // `awaitImport` likewise: absent and false are one value.
-    const asked = { raftServerId: raftServerId!, raftOrigin, name: name!, instructions, model, awaitImport };
+    // `budget` likewise: absent and null are one value (the tenant's own).
+    const asked = { raftServerId: raftServerId!, raftOrigin, name: name!, instructions, model, awaitImport, budget };
     const credentialHash = await sha256Hex(credential);
     let row = await deps.registry.get(tenantId, raftAgentId);
     let created = false;
@@ -429,7 +486,7 @@ export async function handleProvision(
         return fail({ status: 409, code: "deleted", message: "this Raft agent was deleted here; a new agent needs a new id" });
       }
       const differs = (Object.keys(asked) as Array<keyof typeof asked>).filter((k) =>
-        (k === "model" ? row!.model ?? null : k === "awaitImport" ? row!.awaitImport ?? false : row![k]) !== asked[k]);
+        (k === "model" ? row!.model ?? null : k === "awaitImport" ? row!.awaitImport ?? false : k === "budget" ? row!.budget ?? null : row![k]) !== asked[k]);
       // The credential is the one field that matters most: a delayed retry with an old one must not
       // overwrite a newer PUT /credential. Compared by hash; a row from
       // before the hash existed accepts the first replay and records it.
@@ -460,6 +517,13 @@ export async function handleProvision(
       if (model !== null) {
         const refused = await modelProblem(deps.models, tenantId, agentId, model);
         if (refused) return fail(refused);
+      }
+      // The plan is written by a create and never by a replay of one: a POST retried late carries the plan of its
+      // first send, and must not undo a `PUT /servers/:id/plan` that landed since. Before the row, so a create that
+      // dies after this has still said it, and its replay (which writes no plan) loses nothing.
+      if (plan !== null) {
+        await deps.plans!.set(tenantId, plan, headers.credentialId ?? "provider", deps.now());
+        logEvent("provision.plan", { tenantId, raftServerId, plan, via: "create" });
       }
       const t = deps.now();
       row = { tenantId, raftAgentId, agentId, ...asked, modelPending: model !== null, credentialHash, status: "provisioning", pushRegistered: false, pushError: null, createdAt: t, updatedAt: t, deletedAt: null };

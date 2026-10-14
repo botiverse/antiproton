@@ -86,7 +86,7 @@ import { countHeldTime, heldReports } from "../../src/usage/container.ts";
 import { benchPollBody } from "../../src/bench/poll-body.ts";
 import { flushUsage, parseUsageQuery, readAgentLedger, readUsage, priceFor, readTenantCosts, readUsageCosts, retainUsage, usageBacklogSince, usagePrices } from "./usage-d1.ts";
 import { adminUsageCosts, closedCostsTo, parseCostsQuery } from "./admin-usage-costs.ts";
-import { adminSpendLimits, d1SpendLimits, limitsOf, readDaySpend, sharedSpendGate, spendAdmit } from "./spend-limit.ts";
+import { adminSpendLimits, d1SpendLimits, d1TenantPlans, limitsOf, readDaySpend, sharedSpendGate, spendAdmit } from "./spend-limit.ts";
 import { drainCursors, hasUnsent, standDownDelay, USAGE_WAKE_DELAY_MS } from "./usage-flush.ts";
 import type { SurfaceDeps } from "./agent-surface/surface.ts";
 import type { HeldListing, HeldRead } from "../../src/plugins/types.ts";
@@ -156,11 +156,18 @@ export interface Env {
   USER_MODELS?: unknown;
   DEEPSEEK_BASE_URL: string;
   HARNESS_MODEL: string;
-  /** A tenant's daily spend limit in US dollars (cf/src/spend-limit.ts): unset is $5, `off` none. An admin's override per tenant wins. */
+  /**
+   * A free (or plan-less) tenant's daily spend limit in US dollars (cf/src/spend-limit.ts): unset is $3, `off` none. An
+   * admin's override per tenant wins.
+   */
   DAILY_LIMIT_USD?: string;
-  /** Every tenant's spend together, per UTC day, in US dollars: unset is $30, `off` none. */
+  /** A pro tenant's (`plan`, as Raft says it): unset is $10, `off` none. An admin's override per tenant wins. */
+  PRO_DAILY_LIMIT_USD?: string;
+  /** Every tenant's spend together, onboarding agents' left out, per UTC day, in US dollars: unset is $2000, `off` none. */
   PLATFORM_DAILY_LIMIT_USD?: string;
-  /** Comma-separated tenants neither limit refuses (they still count toward the platform total); unset is `bench`. */
+  /** The onboarding agents' spend together (`budget: "onboarding"`): unset is $30, `off` none. An admin's override wins. */
+  ONBOARDING_DAILY_LIMIT_USD?: string;
+  /** Comma-separated tenants no limit refuses (they still count toward the platform total); unset is `bench`. */
   DAILY_LIMIT_EXEMPT_TENANTS?: string;
   ARTIFACT_BUCKET: string;
   /** JSON {"ak","sk"} for the operator's run9 account. Absent means the `node`
@@ -3537,6 +3544,8 @@ function provisionDeps(env: Env): ProvisionDeps {
   return {
     now: () => Date.now(),
     registry: d1ProvisionedAgents(env.CONTROL_DB),
+    // The Raft server's plan, which the daily limit's reading picks up (cf/src/spend-limit.ts readDaySpend).
+    plans: d1TenantPlans(env.CONTROL_DB),
     surface: surfaceDeps(env),
     // The enforcer's own limits and reading (cf/src/spend-limit.ts), so the panel and the queue consumer agree.
     usage: {
@@ -3968,7 +3977,7 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
       if (request.method === "PUT" || request.method === "DELETE") {
         try { body = JSON.parse((await request.text()) || "{}"); } catch { return Response.json({ error: { code: "invalid_json", message: "the body is not JSON" } }, { status: 400 }); }
       }
-      return adminSpendLimits(request.method, body, v!.sub ?? v!.email, { store: d1SpendLimits(env.CONTROL_DB), limits: limitsOf(env), now: Date.now });
+      return adminSpendLimits(request.method, body, v!.sub ?? v!.email, { store: d1SpendLimits(env.CONTROL_DB), limits: limitsOf(env), now: Date.now, plans: d1TenantPlans(env.CONTROL_DB) });
     }
     if (url.pathname.startsWith("/v1/")) return v1(request, env, url);
     // Conformance gets its own object: the P0 probe created an incompatible
@@ -4728,7 +4737,7 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
           // re-reads limits and today's priced usage side by side.
           const v = await viewer(request, env);
           if (!isAdmin(v, env)) return Response.json({ error: { code: "not_found", message: "no such route" } }, { status: 404 });
-          const deps = { store: d1SpendLimits(env.CONTROL_DB), limits: limitsOf(env), now: Date.now };
+          const deps = { store: d1SpendLimits(env.CONTROL_DB), limits: limitsOf(env), now: Date.now, plans: d1TenantPlans(env.CONTROL_DB) };
           const actor = v!.sub ?? v!.email;
           let error: string | null = null;
           if (request.method === "POST") {
@@ -4739,12 +4748,13 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
             if (forged) return new Response(forged, { status: 403 });
             const form = await formOf(request);
             if (!form) return new Response("expected a form body", { status: 400 });
-            const tenantId = String(form.get("tenantId") ?? "");
+            // A pool's form (the onboarding pool's limit) names `pool`; a tenant's names `tenantId`.
+            const subject = form.get("pool") !== null ? { pool: String(form.get("pool")) } : { tenantId: String(form.get("tenantId") ?? "") };
             // limitUsd null (the clear path leaves it out; the set form always sends a number) lifts
             // the tenant cap while the platform cap still applies, per the handler's contract.
             const body = form.get("action") === "clear"
-              ? { tenantId }
-              : { tenantId, limitUsd: Number(form.get("limitUsd")) };
+              ? subject
+              : { ...subject, limitUsd: Number(form.get("limitUsd")) };
             const write = await adminSpendLimits(form.get("action") === "clear" ? "DELETE" : "PUT", body, actor, deps);
             if (!write.ok) {
               const why = await write.json().catch(() => null) as { error?: { message?: string } } | null;
@@ -4752,18 +4762,22 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
             }
           }
           const read = await adminSpendLimits("GET", null, actor, deps);
-          const data: Pick<Parameters<typeof spendLimitsPanel>[0], "defaults" | "overrides" | "events"> = await read.json();
+          const data: Pick<Parameters<typeof spendLimitsPanel>[0], "defaults" | "overrides" | "events" | "pools" | "poolEvents" | "plans"> = await read.json();
           const day = Math.floor(Date.now() / 86_400_000) * 86_400_000;
           const costs = await readUsageCosts(env.CONTROL_DB, day, day + 86_400_000, "day");
-          // What the tenant limit counts is priced usage minus unaccepted answers (ours, not
-          // theirs — spend-limit.ts); the platform total counts everything, exempt included.
-          const today = costs.map((c) => ({
-            tenantId: c.tenantId,
-            usd: c.total - c.periods.flatMap((p) => p.resources).filter((r) => r.resource === UNACCEPTED_TOKENS).reduce((sum, r) => sum + r.cost, 0),
-            unaccepted: c.periods.flatMap((p) => p.resources).filter((r) => r.resource === UNACCEPTED_TOKENS).reduce((sum, r) => sum + r.cost, 0),
-          }));
-          const platformToday = costs.reduce((sum, c) => sum + c.total, 0);
-          return new Response(spendLimitsPanel({ ...data, today, platformToday, error }), { headers: { "cache-control": "no-store", "content-type": "text/html; charset=utf-8" } });
+          // As readDaySpend counts (spend-limit.ts): the tenant limit counts the tenant's own agents' priced usage minus
+          // unaccepted answers (ours, not theirs); the platform total counts every tenant's own agents, unaccepted and
+          // exempt included; the onboarding agents' spend is a pool of its own, in neither.
+          const unacceptedOf = (p: Array<{ resources: Array<{ resource: string; cost: number }> }>) =>
+            p.flatMap((x) => x.resources).filter((r) => r.resource === UNACCEPTED_TOKENS).reduce((sum, r) => sum + r.cost, 0);
+          const today = costs.map((c) => {
+            const own = c.total - (c.onboarding?.total ?? 0);
+            const unaccepted = unacceptedOf(c.periods) - unacceptedOf(c.onboarding?.periods ?? []);
+            return { tenantId: c.tenantId, usd: own - unaccepted, unaccepted, onboarding: c.onboarding?.total ?? 0 };
+          });
+          const platformToday = costs.reduce((sum, c) => sum + c.total - (c.onboarding?.total ?? 0), 0);
+          const onboardingToday = costs.reduce((sum, c) => sum + (c.onboarding?.total ?? 0), 0);
+          return new Response(spendLimitsPanel({ ...data, today, platformToday, onboardingToday, error }), { headers: { "cache-control": "no-store", "content-type": "text/html; charset=utf-8" } });
         }
         case "/ui/admin/usage-costs": {
           // The operator's cost view as a page, same reader as /admin/usage-costs. Default window is

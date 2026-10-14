@@ -267,10 +267,13 @@ Antiproton is designed to run as a Cloudflare Worker backed by Durable Objects:
    429, 5xx and network errors are retried, and then dead-lettered, as before.
 
    **Daily spend limits.** Model calls on the operator's accounts stop for the day once a tenant's priced
-   usage reaches its limit — `DAILY_LIMIT_USD`, $5 when unset, or an admin's per-tenant override through
+   usage reaches its limit — by the plan Raft says its server is on, `DAILY_LIMIT_USD` ($3 when unset) for
+   `free` or none and `PRO_DAILY_LIMIT_USD` ($10) for `pro`, or an admin's per-tenant override through
    `/admin/spend-limits` (audited; `null` for none) — or once every tenant's together reaches
-   `PLATFORM_DAILY_LIMIT_USD`, $30 when unset. Tenants in `DAILY_LIMIT_EXEMPT_TENANTS` (`bench` when
-   unset) are never refused but count toward the platform total. Usage paid with the tenant's own
+   `PLATFORM_DAILY_LIMIT_USD`, $2000 when unset. Agents Raft creates with `budget: "onboarding"` are a pool of
+   their own, in neither figure, refused only at `ONBOARDING_DAILY_LIMIT_USD` ($30, an admin's override wins).
+   Tenants in `DAILY_LIMIT_EXEMPT_TENANTS` (`bench` when unset) are never refused but count toward the
+   platform total. Usage paid with the tenant's own
    credential counts nothing. The check is made in the queue consumer before each provider call, on a
    reading of the ledger at most 30 s old (5 s near a limit); a refused call fails its turn once with
    `Daily usage limit reached ($X of $Y); resets at 00:00 UTC.` (or the platform's sentence), which Raft

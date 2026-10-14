@@ -73,7 +73,8 @@ export async function tenantUsage(tenantId: string, query: URLSearchParams, deps
   const q = parseCostsQuery(query, now);
   if (typeof q === "string") return q;
   // The limits are in the key, so a deployment's new limits are never answered with the old ones.
-  const key = JSON.stringify([tenantId, q.from, q.to, q.bucket, deps.limits.tenantUsd, deps.limits.platformUsd, isExempt(tenantId, deps.limits)]);
+  const key = JSON.stringify([tenantId, q.from, q.to, q.bucket, deps.limits.tenantUsd, deps.limits.proUsd, deps.limits.platformUsd,
+    isExempt(tenantId, deps.limits)]);
   // A window longer than a panel polls is read afresh and not kept (`USAGE_CACHE_WINDOW_MAX_MS`).
   const cache = q.to - q.from <= USAGE_CACHE_WINDOW_MAX_MS ? deps.cache : undefined;
   const kept = cache?.get(key, now);
@@ -95,6 +96,10 @@ async function read(tenantId: string, q: { from: number; to: number; bucket: "da
       day: iso(spend.day).slice(0, 10),
       spentUsd: tidy(s.spentUsd),
       limitUsd: s.limitUsd,
+      plan: s.plan,
+      // Paid by the platform (`budget: "onboarding"`), so in neither figure above; given so the panel can say why the
+      // history's total for today is larger than `spentUsd`.
+      onboardingUsd: tidy(s.onboardingUsd),
       exempt: s.exempt,
       platformLimitReached: s.platformLimitReached,
       refusing: s.refusing,

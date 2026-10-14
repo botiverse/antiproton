@@ -325,7 +325,15 @@ export interface ResourceCost {
   /** `key unit` of every row with no price, so a total that leaves something out says what. */
   unpriced: string[];
 }
-export interface TenantCosts { tenantId: string; total: number; periods: Array<{ start: number; total: number; resources: ResourceCost[] }> }
+export interface TenantCosts {
+  tenantId: string; total: number; periods: Array<{ start: number; total: number; resources: ResourceCost[] }>;
+  /**
+   * The part of the above spent by the tenant's agents on the onboarding budget (`provisioned_agents.budget`), which the
+   * platform pays and no limit of the tenant's counts (cf/src/spend-limit.ts). Already in `total` and `periods`;
+   * absent when the tenant has no such spend in the window.
+   */
+  onboarding?: { total: number; periods: Array<{ start: number; total: number; resources: ResourceCost[] }> };
+}
 
 /** The start of the UTC day or month `t` falls in. */
 export function periodStart(t: number, bucket: "day" | "month"): number {
@@ -344,21 +352,28 @@ export function periodStart(t: number, bucket: "day" | "month"): number {
  * tenant's hourly view prices it, and a fold does not move a total.
  */
 export async function readUsageCosts(db: D1Database, from: number, to: number, bucket: "day" | "month"): Promise<TenantCosts[]> {
+  // Each row's agent's budget joined on provisioned_agents' unique (tenant_id, agent_id), so no row is counted twice.
   const { results } = await db.prepare(
-    `SELECT tenant_id, at, resource, key, unit, SUM(quantity) AS quantity FROM (
-       SELECT tenant_id, hour AS at, resource, key, unit, quantity FROM usage_hourly WHERE hour >= ? AND hour < ?
+    `SELECT u.tenant_id, u.at, u.resource, u.key, u.unit, COALESCE(p.budget = 'onboarding', 0) AS onboarding, SUM(u.quantity) AS quantity FROM (
+       SELECT tenant_id, agent_id, hour AS at, resource, key, unit, quantity FROM usage_hourly WHERE hour >= ? AND hour < ?
        UNION ALL
-       SELECT tenant_id, day AS at, resource, key, unit, quantity FROM usage_daily WHERE day >= ? AND day < ?
-     ) GROUP BY tenant_id, at, resource, key, unit ORDER BY tenant_id, at, resource, key, unit`,
+       SELECT tenant_id, agent_id, day AS at, resource, key, unit, quantity FROM usage_daily WHERE day >= ? AND day < ?
+     ) u LEFT JOIN provisioned_agents p ON p.tenant_id = u.tenant_id AND p.agent_id = u.agent_id
+     GROUP BY u.tenant_id, u.at, u.resource, u.key, u.unit, onboarding ORDER BY u.tenant_id, u.at, u.resource, u.key, u.unit`,
   ).bind(from, to, from, to).all();
   const prices = await usagePrices(db);
-  const tenants = new Map<string, LedgerRow[]>();
+  const tenants = new Map<string, { all: LedgerRow[]; onboarding: LedgerRow[] }>();
   for (const r of results as any[]) {
-    const list = tenants.get(String(r.tenant_id)) ?? [];
-    tenants.set(String(r.tenant_id), list);
-    list.push(ledgerRow(r));
+    const t = tenants.get(String(r.tenant_id)) ?? { all: [], onboarding: [] };
+    tenants.set(String(r.tenant_id), t);
+    const row = ledgerRow(r);
+    t.all.push(row);
+    if (Number(r.onboarding) === 1) t.onboarding.push(row);
   }
-  return [...tenants.entries()].map(([tenantId, rows]) => ({ tenantId, ...costsByPeriod(rows, prices, bucket) }));
+  return [...tenants.entries()].map(([tenantId, t]) => ({
+    tenantId, ...costsByPeriod(t.all, prices, bucket),
+    ...(t.onboarding.length ? { onboarding: costsByPeriod(t.onboarding, prices, bucket) } : {}),
+  }));
 }
 
 /** One tenant's costs as its own views count them (`readTenantCosts`): by period, and by agent over the whole window. */

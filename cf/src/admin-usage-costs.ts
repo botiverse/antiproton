@@ -102,6 +102,12 @@ export async function adminUsageCosts(
     currency: "USD", estimated: true,
     from: iso(q.from), to: iso(q.to), bucket: q.bucket,
     total: Math.round(tenants.reduce((a, t) => a + t.total, 0) * 1e10) / 1e10,
-    tenants: tenants.map((t) => ({ ...t, periods: t.periods.map((p) => ({ ...p, start: iso(p.start) })) })),
+    // The onboarding agents' part of `total` (cf/src/spend-limit.ts, its own daily pool, paid by the platform), so
+    // their spend is a line of its own rather than lost inside each tenant's.
+    onboarding: { total: Math.round(tenants.reduce((a, t) => a + (t.onboarding?.total ?? 0), 0) * 1e10) / 1e10 },
+    tenants: tenants.map((t) => ({
+      ...t, periods: t.periods.map((p) => ({ ...p, start: iso(p.start) })),
+      ...(t.onboarding ? { onboarding: { ...t.onboarding, periods: t.onboarding.periods.map((p) => ({ ...p, start: iso(p.start) })) } } : {}),
+    })),
   });
 }
