@@ -12,6 +12,9 @@
  * does, on the activity drain (cf/src/activity-raft.ts), so it is retried, ordered and deduped like the others,
  * and sent only while push is on. Never once a turn has started: the turn's own statuses say what the agent is,
  * and an `online` written after them would, by its later occurredAt, override the one in force.
+ *
+ * A hold lifted by the 24-hour valve (cf/src/runtime.ts `importHeldUntil`) asks nothing: it lifts only when input is
+ * about to start a turn, whose own statuses follow at once.
  */
 import { appendTrace } from "../trace/outbox.ts";
 import { agentStarted, readHold } from "../store/workspace-import.ts";
