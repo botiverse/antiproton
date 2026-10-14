@@ -381,6 +381,18 @@ export interface OwnCosts {
   total: number;
   periods: TenantCosts["periods"];
   agents: Array<{ agentId: string; total: number }>;
+  /**
+   * Asked for only (`byAgent`): each provisioned agent's cost per UTC day, from the same priced rows as `agents`, so an
+   * agent's days add up to its total there. An agent with no `provisioned_agents` row of the tenant is not in it.
+   */
+  agentDays?: AgentDays[];
+}
+export interface AgentDays {
+  raftAgentId: string;
+  /** `provisioned_agents.budget`: "onboarding" for the platform-paid pool, null for the tenant's own. */
+  budget: "onboarding" | null;
+  /** Days with usage only, oldest first; `start` is the day's 00:00 UTC. */
+  days: Array<{ start: number; total: number }>;
 }
 
 /**
@@ -390,7 +402,14 @@ export interface OwnCosts {
  * no job accepted is our cost, never the tenant's, as in every tenant view and in the tenant's daily limit
  * (cf/src/spend-limit.ts `readDaySpend`).
  */
-export async function readTenantCosts(db: D1Database, tenantId: string, from: number, to: number, bucket: "day" | "month"): Promise<OwnCosts> {
+export async function readTenantCosts(
+  db: D1Database, tenantId: string, from: number, to: number, bucket: "day" | "month", byAgent = false,
+): Promise<OwnCosts> {
+  // The tenant's provisioned agents, scoped to it in the query as the ledger read is: an agent id another tenant also
+  // uses is never named from that tenant's row.
+  const provisioned = byAgent
+    ? db.prepare("SELECT agent_id, raft_agent_id, budget FROM provisioned_agents WHERE tenant_id = ?").bind(tenantId).all()
+    : null;
   const { results } = await db.prepare(
     `SELECT agent_id, at, resource, key, unit, SUM(quantity) AS quantity FROM (
        SELECT agent_id, hour AS at, resource, key, unit, quantity FROM usage_hourly WHERE tenant_id = ? AND hour >= ? AND hour < ?
@@ -400,15 +419,32 @@ export async function readTenantCosts(db: D1Database, tenantId: string, from: nu
   ).bind(tenantId, from, to, tenantId, from, to, UNACCEPTED_TOKENS).all();
   const prices = await usagePrices(db);
   const rows = (results as any[]).map(ledgerRow);
+  const named = new Map<string, { raftAgentId: string; budget: "onboarding" | null }>();
+  for (const r of ((await provisioned)?.results ?? []) as any[]) {
+    named.set(String(r.agent_id), { raftAgentId: String(r.raft_agent_id), budget: r.budget === "onboarding" ? "onboarding" : null });
+  }
   const agents = new Map<string, number>();
+  const days = new Map<string, Map<number, number>>();
   for (const r of rows) {
     const p = priceFor(prices, { bucket: r.at, resource: r.resource, key: r.key, unit: r.unit });
-    agents.set(r.agentId, (agents.get(r.agentId) ?? 0) + (p === null ? 0 : p * r.quantity));
+    const cost = p === null ? 0 : p * r.quantity;
+    agents.set(r.agentId, (agents.get(r.agentId) ?? 0) + cost);
+    if (!named.has(r.agentId)) continue;
+    const d = days.get(r.agentId) ?? new Map<number, number>();
+    days.set(r.agentId, d);
+    const start = periodStart(r.at, "day");
+    d.set(start, (d.get(start) ?? 0) + cost);
   }
   return {
     ...costsByPeriod(rows, prices, bucket),
     agents: [...agents.entries()].map(([agentId, total]) => ({ agentId, total: tidy(total) }))
       .sort((a, b) => b.total - a.total || (a.agentId < b.agentId ? -1 : a.agentId > b.agentId ? 1 : 0)),
+    ...(byAgent ? {
+      agentDays: [...days.entries()].map(([agentId, d]) => ({
+        ...named.get(agentId)!,
+        days: [...d.entries()].sort(([a], [b]) => a - b).map(([start, total]) => ({ start, total: tidy(total) })),
+      })).sort((a, b) => (a.raftAgentId < b.raftAgentId ? -1 : a.raftAgentId > b.raftAgentId ? 1 : 0)),
+    } : {}),
   };
 }
 

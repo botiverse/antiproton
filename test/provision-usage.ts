@@ -391,6 +391,203 @@ await check("only GET: another method is not part of the binding", async () => {
   must(r.status === 404, `POST: ${r.status}`);
 });
 
+// ---- byAgent: each provisioned agent's days --------------------------------------------------------------
+
+/** A provisioned agent's row, as a create writes it (only the columns these checks read matter). */
+function provisioned(db: Db, tenant: string, raftAgentId: string, agentId: string, budget: "onboarding" | null = null) {
+  db.raw.prepare(`INSERT INTO provisioned_agents (tenant_id, raft_agent_id, agent_id, raft_server_id, raft_origin, name, instructions, status, created_at, updated_at, budget)
+    VALUES (?, ?, ?, 'srv', ?, 'n', 'i', 'active', 0, 0, ?)`).run(tenant, raftAgentId, agentId, ORIGIN, budget);
+}
+/** A day already folded out of usage_hourly (foldUsage), as the ledger keeps one past KEEP_HOURLY_DAYS. */
+function folded(db: Db, tenant: string, usd: number, day: number, agent: string) {
+  db.raw.prepare("INSERT INTO usage_daily(tenant_id, day, agent_id, resource, key, unit, quantity) VALUES (?,?,?,?,?,?,?)")
+    .run(tenant, day, agent, "model.tokens", "deepseek-flash:output", "tokens", tokensFor(usd));
+}
+const ymd = (t: number) => new Date(t).toISOString().slice(0, 10);
+
+await check("byAgent=1: the token's tenant's provisioned agents by day, and nothing of another tenant's, even under the same agent id", async () => {
+  const db = d1();
+  const day = today();
+  // The same ledger agent id in both tenants, provisioned in each under another Raft id and budget: a join not scoped
+  // to the tenant would name B's row from A's spend, or add B's spend to A's agent.
+  provisioned(db, "t-a", "01JAONB", "raft_shared", "onboarding");
+  provisioned(db, "t-a", "01JAOWN", "raft_own");
+  provisioned(db, "t-b", "01JBSHARED", "raft_shared");
+  provisioned(db, "t-b", "01JBONLY", "raft_bonly", "onboarding");
+  spend(db, "t-a", 0.125, day, "raft_shared");
+  spend(db, "t-a", 0.25, day - 2 * DAY, "raft_shared");
+  folded(db, "t-a", 0.375, day - 40 * DAY, "raft_own");
+  spend(db, "t-a", 0.0625, day, "raft_own");
+  // Not provisioned (the console's, the Agents API's): in `agents`, not in `agentDays`.
+  spend(db, "t-a", 0.5, day, "console_agent");
+  // An answer no job accepted is ours, as in `agents`.
+  row(db, { tenant: "t-a", hour: day, agent: "raft_shared", resource: UNACCEPTED_TOKENS, quantity: tokensFor(9) });
+  spend(db, "t-b", 2.75, day, "raft_shared");
+  spend(db, "t-b", 4.5, day - 2 * DAY, "raft_bonly");
+  const a = await token(db, { scope: "tenant", tenantId: "t-a" });
+  const b = await token(db, { scope: "tenant", tenantId: "t-b" });
+  const e = env(db);
+  const from = ymd(day - 45 * DAY);
+  const ra = await get(e, `/provision/usage?from=${from}&bucket=day&byAgent=1`, `Bearer ${a}`);
+  const rb = await get(e, `/provision/usage?from=${from}&bucket=day&byAgent=1`, `Bearer ${b}`);
+  must(ra.status === 200 && rb.status === 200, `${ra.status} ${ra.text} / ${rb.status} ${rb.text}`);
+  const near = (x: number, y: number) => Math.abs(x - y) < 1e-5;
+  const ad = ra.body.agentDays;
+  must(Array.isArray(ad) && show(ad.map((x: any) => [x.raftAgentId, x.budget])) === show([["01JAONB", "onboarding"], ["01JAOWN", null]]), show(ad));
+  must(show(ad[0].days.map((d: any) => d.day)) === show([ymd(day - 2 * DAY), ymd(day)]) && near(ad[0].days[0].usd, 0.25) && near(ad[0].days[1].usd, 0.125), show(ad[0]));
+  must(show(ad[1].days.map((d: any) => d.day)) === show([ymd(day - 40 * DAY), ymd(day)]) && near(ad[1].days[0].usd, 0.375) && near(ad[1].days[1].usd, 0.0625), show(ad[1]));
+  // Each agent's days add up to its total in `agents`, the same priced rows.
+  for (const [raft, ledger] of [["01JAONB", "raft_shared"], ["01JAOWN", "raft_own"]]) {
+    const days = ad.find((x: any) => x.raftAgentId === raft).days.reduce((s: number, d: any) => s + d.usd, 0);
+    must(near(days, ra.body.agents.find((x: any) => x.providerAgentId === ledger).totalUsd), `${raft}: ${days} vs ${show(ra.body.agents)}`);
+  }
+  must(ra.body.agents.some((x: any) => x.providerAgentId === "console_agent") && !ra.text.includes("console_agent\",\"budget"), show(ra.body.agents));
+  for (const other of ["t-b", "01JBSHARED", "01JBONLY", "raft_bonly", "2.75", "4.5"]) must(!ra.text.includes(other), `A's answer carries ${other}: ${ra.text}`);
+  must(show(rb.body.agentDays.map((x: any) => [x.raftAgentId, x.budget])) === show([["01JBONLY", "onboarding"], ["01JBSHARED", null]]), show(rb.body.agentDays));
+  must(near(rb.body.agentDays[1].days[0].usd, 2.75) && rb.body.agentDays[1].days.length === 1, show(rb.body.agentDays));
+  for (const other of ["t-a", "01JAONB", "01JAOWN", "raft_own", "console_agent", "0.125", "0.375"]) must(!rb.text.includes(other), `B's answer carries ${other}: ${rb.text}`);
+  // A platform token reads the tenant its ?raftServerId= names, and only it.
+  provisioned(db, "raft_srv-1", "01JSRV", "raft_srvagent");
+  spend(db, "raft_srv-1", 0.5, day, "raft_srvagent");
+  const p = await token(db, { scope: "platform" });
+  const rp = await get(e, "/provision/usage?raftServerId=srv-1&byAgent=1", `Bearer ${p}`);
+  must(rp.status === 200 && show(rp.body.agentDays.map((x: any) => x.raftAgentId)) === show(["01JSRV"]), rp.text);
+  // The control: without byAgent the answer has no agentDays at all.
+  const plain = await get(e, `/provision/usage?from=${from}`, `Bearer ${a}`);
+  must(plain.status === 200 && !("agentDays" in plain.body) && show(plain.body.agents) === show(ra.body.agents), plain.text);
+});
+
+await check("byAgent is in the cache key: an answer without the breakdown is never served to a request for it, nor the reverse", async () => {
+  const db = d1();
+  const day = today();
+  provisioned(db, "t-a", "01JAONE", "raft_one");
+  spend(db, "t-a", 1, day, "raft_one");
+  const a = await token(db, { scope: "tenant", tenantId: "t-a" });
+  const e = env(db);
+  const plain = await get(e, "/provision/usage", `Bearer ${a}`);
+  const by = await get(e, "/provision/usage?byAgent=1", `Bearer ${a}`, true);
+  const plainAgain = await get(e, "/provision/usage?bucket=day", `Bearer ${a}`, true);
+  must(plain.status === 200 && !("agentDays" in plain.body), plain.text);
+  must(by.status === 200 && Array.isArray(by.body.agentDays) && by.body.agentDays[0]?.raftAgentId === "01JAONE", by.text);
+  must(plainAgain.status === 200 && !("agentDays" in plainAgain.body), plainAgain.text);
+});
+
+await check("byAgent: anything but 1 or 0 is 400, and so is byAgent=1 with bucket=month", async () => {
+  const db = d1();
+  const a = await token(db, { scope: "tenant", tenantId: "t-a" });
+  const e = env(db);
+  for (const q of ["byAgent=yes", "byAgent=true", "byAgent=2", "byAgent=1&bucket=month"]) {
+    const r = await get(e, `/provision/usage?${q}`, `Bearer ${a}`);
+    must(r.status === 400 && r.body?.error?.code === "invalid", `${q}: ${r.status} ${r.text}`);
+  }
+  for (const q of ["byAgent=0", "byAgent=", "byAgent=1&bucket=day"]) {
+    const r = await get(e, `/provision/usage?${q}`, `Bearer ${a}`);
+    must(r.status === 200 && ("agentDays" in r.body) === q.startsWith("byAgent=1"), `${q}: ${r.status} ${r.text}`);
+  }
+});
+
+// ---- the onboarding pool -------------------------------------------------------------------------------------
+
+/** Pool $2 (the tenant's share $50, so only the pool decides), as the env var sets it. */
+const POOL: SpendLimitEnv = { ONBOARDING_DAILY_LIMIT_USD: "2", ONBOARDING_TENANT_DAILY_LIMIT_USD: "50" };
+
+await check("the onboarding pool under, at and over its cap: spentUsd, limitUsd and capped are readDaySpend's and judge's", async () => {
+  for (const [usd, capped, at] of [[1.5, false, false], [1.75, true, true], [2.5, true, false]] as const) {
+    const db = d1();
+    const day = today();
+    // Onboarding agents in two tenants: the pool is every tenant's, unaccepted answers included.
+    provisioned(db, "t-a", "01JAONB", "raft_aonb", "onboarding");
+    provisioned(db, "t-b", "01JBONB", "raft_bonb", "onboarding");
+    provisioned(db, "t-a", "01JAOWN", "raft_aown");
+    spend(db, "t-a", usd * 0.5, day, "raft_aonb");
+    spend(db, "t-b", usd * 0.25, day, "raft_bonb");
+    row(db, { tenant: "t-b", hour: day, agent: "raft_bonb", resource: UNACCEPTED_TOKENS, quantity: tokensFor(usd * 0.25) });
+    // The tenants' own agents are not the pool's.
+    spend(db, "t-a", 3, day, "raft_aown");
+    // "At" exactly: the pool's override set to the very figure the enforcer reads, so no rounding stands either side of it.
+    if (at) db.raw.prepare("INSERT INTO spend_pool_limits (pool, tenant_id, limit_usd, set_by, set_at) VALUES ('onboarding', '', ?, 'github:1', 0)")
+      .run((await readDaySpend(db, "t-a", Date.now())).onboardingUsd);
+    const p = await token(db, { scope: "platform" });
+    const r = await get(env(db, POOL), "/provision/budgets/onboarding", `Bearer ${p}`);
+    must(r.status === 200 && r.cache === "no-store", `${usd}: ${r.status} ${r.text}`);
+    must(show(Object.keys(r.body).sort()) === show(["capped", "date", "limitUsd", "spentUsd"]), r.text);
+    // The enforcer's reading for an onboarding agent of either tenant, and its verdict.
+    for (const t of ["t-a", "t-b"]) {
+      const enforced = await readDaySpend(db, t, Date.now());
+      const verdict = judge(enforced, limitsOf({ ...AT, ...POOL }), "onboarding");
+      must(r.body.spentUsd === tidy(enforced.onboardingUsd) && r.body.limitUsd === (at ? enforced.onboardingUsd : 2), `${usd} ${t}: ${r.text} vs ${show(enforced)}`);
+      must(r.body.capped === !verdict.admit && r.body.capped === capped, `${usd} ${t}: capped ${r.body.capped}, judge ${show(verdict)}`);
+    }
+    must(Math.abs(r.body.spentUsd - usd) < 1e-5 && r.body.date === ymd(day), `${usd}: ${r.text}`);
+  }
+});
+
+await check("a tenant share of $0 refuses onboarding calls but does not cap the pool: capped is the pool's limit alone", async () => {
+  const db = d1();
+  const day = today();
+  provisioned(db, "t-a", "01JAONB", "raft_aonb", "onboarding");
+  spend(db, "t-a", 0.5, day, "raft_aonb");
+  const p = await token(db, { scope: "platform" });
+  const zeroShare: SpendLimitEnv = { ONBOARDING_DAILY_LIMIT_USD: "2", ONBOARDING_TENANT_DAILY_LIMIT_USD: "0" };
+  // The enforcer does refuse t-a's onboarding agent, by the share, while the pool is under its $2.
+  const verdict = judge(await readDaySpend(db, "t-a", Date.now()), limitsOf({ ...AT, ...zeroShare }), "onboarding");
+  must(!verdict.admit && verdict.limit === "onboarding_tenant", show(verdict));
+  const r = await get(env(db, zeroShare), "/provision/budgets/onboarding", `Bearer ${p}`);
+  must(r.status === 200 && r.body.capped === false && r.body.limitUsd === 2 && Math.abs(r.body.spentUsd - 0.5) < 1e-5, r.text);
+  // So does an admin's $0 share for t-a, with the pool's own override row present (the row a "" tenant also matches).
+  db.raw.prepare("INSERT INTO spend_pool_limits (pool, tenant_id, limit_usd, set_by, set_at) VALUES ('onboarding', '', 2, 'github:1', 0), ('onboarding', 't-a', 0, 'github:1', 0)").run();
+  const r2 = await get(env(db, POOL), "/provision/budgets/onboarding", `Bearer ${p}`);
+  must(r2.status === 200 && r2.body.capped === false && r2.body.limitUsd === 2, r2.text);
+});
+
+await check("the onboarding pool on a past day is read from the ledger, a folded day included; a later day or a bad date is 400", async () => {
+  const db = d1();
+  const day = today();
+  provisioned(db, "t-a", "01JAONB", "raft_aonb", "onboarding");
+  provisioned(db, "t-b", "01JBONB", "raft_bonb", "onboarding");
+  // Three days back, still hourly; fifty days back, folded; today, a different figure, so a date read as today shows.
+  spend(db, "t-a", 0.75, day - 3 * DAY + 5 * H, "raft_aonb");
+  spend(db, "t-b", 1.5, day - 3 * DAY + 9 * H, "raft_bonb");
+  folded(db, "t-a", 2.25, day - 50 * DAY, "raft_aonb");
+  folded(db, "t-b", 0.5, day - 50 * DAY, "raft_bonb");
+  spend(db, "t-a", 0.125, day, "raft_aonb");
+  const p = await token(db, { scope: "platform" });
+  const e = env(db, POOL);
+  const near = (x: number, y: number) => Math.abs(x - y) < 1e-5;
+  const r3 = await get(e, `/provision/budgets/onboarding?date=${ymd(day - 3 * DAY)}`, `Bearer ${p}`);
+  must(r3.status === 200 && r3.body.date === ymd(day - 3 * DAY) && near(r3.body.spentUsd, 2.25) && r3.body.capped === true && r3.body.limitUsd === 2, r3.text);
+  const r50 = await get(e, `/provision/budgets/onboarding?date=${ymd(day - 50 * DAY)}`, `Bearer ${p}`);
+  must(r50.status === 200 && near(r50.body.spentUsd, 2.75) && r50.body.capped === true, r50.text);
+  const now = await get(e, `/provision/budgets/onboarding?date=${ymd(day)}`, `Bearer ${p}`);
+  const dflt = await get(e, "/provision/budgets/onboarding", `Bearer ${p}`);
+  must(now.status === 200 && near(now.body.spentUsd, 0.125) && now.body.capped === false && dflt.text === now.text, `${now.text} / ${dflt.text}`);
+  for (const q of [`date=${ymd(day + DAY)}`, "date=", "date=2026-02-31", "date=yesterday", "date=2026-10-01T00:00Z", "from=2026-10-01"]) {
+    const r = await get(e, `/provision/budgets/onboarding?${q}`, `Bearer ${p}`);
+    must(r.status === 400 && r.body?.error?.code === "invalid", `${q}: ${r.status} ${r.text}`);
+  }
+});
+
+await check("the onboarding pool refuses a tenant-scoped token (403), whatever it names; a platform token needs no server", async () => {
+  const db = d1();
+  const day = today();
+  provisioned(db, "t-a", "01JAONB", "raft_aonb", "onboarding");
+  spend(db, "t-a", 0.5, day, "raft_aonb");
+  const a = await token(db, { scope: "tenant", tenantId: "t-a" });
+  const e = env(db, POOL);
+  for (const q of ["", "?raftServerId=srv-1", `?date=${ymd(day)}`]) {
+    const r = await get(e, `/provision/budgets/onboarding${q}`, `Bearer ${a}`);
+    must(r.status === 403 && r.body?.error?.code === "platform_only" && !r.text.includes("0.5") && r.cache === "no-store", `${q}: ${r.status} ${r.text}`);
+  }
+  // The control: the same request with a platform token is answered.
+  const p = await token(db, { scope: "platform" });
+  const ok = await get(e, "/provision/budgets/onboarding", `Bearer ${p}`);
+  must(ok.status === 200 && Math.abs(ok.body.spentUsd - 0.5) < 1e-5, `${ok.status} ${ok.text}`);
+  // No token, or a revoked one: the 401 every provider route gives; and only GET.
+  must((await get(e, "/provision/budgets/onboarding", null)).status === 401, "no token");
+  const post = await worker.fetch(new Request("https://antiproton.test/provision/budgets/onboarding", { method: "POST", headers: { authorization: `Bearer ${p}` }, body: "{}" }), e as never);
+  must(post.status === 404, `POST: ${post.status}`);
+});
+
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.error ? `\n    ${r.error}` : ""}`);
 const failed = results.filter((r) => !r.ok).length;
 console.log(`${results.length - failed}/${results.length} passed`);

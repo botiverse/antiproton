@@ -41,7 +41,7 @@ import type { ModelChoices } from "../control-plane.ts";
 import { resolveModel } from "../model-request.ts";
 import { optionFor, type UserModels } from "../../../src/model/user-models.ts";
 import type { ModelChoice } from "../../../src/model/providers.ts";
-import { tenantUsage, type ProvisionUsage } from "./usage.ts";
+import { onboardingPool, tenantUsage, type ProvisionUsage } from "./usage.ts";
 import type { FirstTurn } from "../../../src/runtime/prewarm.ts";
 
 export type ProvisionTool = "enable_push" | "disable_push";
@@ -391,6 +391,16 @@ export async function handleProvision(
     const tenant = tenantFor(who, headers.raftServerId);
     if (isFail(tenant)) return fail(tenant);
     const answer = await tenantUsage(tenant, query, deps.usage, deps.now());
+    return typeof answer === "string" ? fail({ status: 400, code: "invalid", message: answer }) : ok(answer);
+  }
+  if (seg[0] === "budgets" && seg[1] === "onboarding" && seg.length === 2 && method === "GET") {
+    const usage = deps.usage;
+    if (!usage?.pool) return null;
+    // Every tenant's onboarding spend summed: a platform figure, which a token that is one tenant does not read.
+    if (who.scope !== "platform") {
+      return fail({ status: 403, code: "platform_only", message: "the onboarding pool is every tenant's spend together; it is read with a platform-scoped token" });
+    }
+    const answer = await onboardingPool(query, { ...usage, pool: usage.pool }, deps.now());
     return typeof answer === "string" ? fail({ status: 400, code: "invalid", message: answer }) : ok(answer);
   }
   // Read by Raft's exporter, which refuses a workspace over them before sending it.

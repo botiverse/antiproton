@@ -144,16 +144,24 @@ const limitRow = (r: any) => r ? { limitUsd: r.limit_usd === null || r.limit_usd
  * KEEP_HOURLY_DAYS), split by the budget each row's agent was created on (`provisioned_agents.budget`; an agent with no
  * row there — the console's, the Agents API's — is on its tenant's), with the tenant's override and plan and the
  * onboarding pool's overrides (its own, and this tenant's share). Five reads in parallel, one round trip's wait.
+ * `folded` reads a past day that may already be in usage_daily (`GET /provision/budgets/onboarding?date=`).
  */
-export async function readDaySpend(db: D1Database, tenantId: string, now: number): Promise<DaySpend> {
+export async function readDaySpend(db: D1Database, tenantId: string, now: number, folded = false): Promise<DaySpend> {
   const day = dayOf(now);
+  // A past day may have been folded into usage_daily (foldUsage, cf/src/usage-d1.ts), and is read from both tables:
+  // the fold moves a day in one batch, so no row is in both. Today never is (KEEP_HOURLY_DAYS), and usage_daily has
+  // no index on `day` alone, so the enforcer's reading of today leaves it out rather than scan it every 30 s.
+  const ledger = folded
+    ? `(SELECT tenant_id, agent_id, hour, resource, key, unit, quantity FROM usage_hourly WHERE hour >= ?2 AND hour < ?3
+        UNION ALL SELECT tenant_id, agent_id, day AS hour, resource, key, unit, quantity FROM usage_daily WHERE day >= ?2 AND day < ?3)`
+    : "usage_hourly";
   const [rows, prices, override, plan, poolRows] = await Promise.all([
     // The join is on provisioned_agents' unique (tenant_id, agent_id), so it never multiplies a ledger row.
     db.prepare(
-      `SELECT u.tenant_id = ? AS mine, COALESCE(p.budget = 'onboarding', 0) AS onboarding, u.hour, u.resource, u.key, u.unit,
+      `SELECT u.tenant_id = ?1 AS mine, COALESCE(p.budget = 'onboarding', 0) AS onboarding, u.hour, u.resource, u.key, u.unit,
               SUM(u.quantity) AS quantity
-       FROM usage_hourly u LEFT JOIN provisioned_agents p ON p.tenant_id = u.tenant_id AND p.agent_id = u.agent_id
-       WHERE u.hour >= ? AND u.hour < ? GROUP BY mine, onboarding, u.hour, u.resource, u.key, u.unit`,
+       FROM ${ledger} u LEFT JOIN provisioned_agents p ON p.tenant_id = u.tenant_id AND p.agent_id = u.agent_id
+       WHERE u.hour >= ?2 AND u.hour < ?3 GROUP BY mine, onboarding, u.hour, u.resource, u.key, u.unit`,
     ).bind(tenantId, day, day + DAY_MS).all(),
     usagePrices(db),
     db.prepare("SELECT limit_usd FROM spend_limits WHERE tenant_id = ?").bind(tenantId).first() as Promise<any>,
