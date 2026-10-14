@@ -71,6 +71,9 @@ export interface AgentEngine {
   branch(): Promise<EngineEntry[]>;
   /** The tools the model is offered. */
   tools(): Promise<Array<{ name: string }>>;
+  /** The system prompt and tools the next model call carries, as its request builds them. Absent where an engine
+   *  cannot say without a call (pd, whose prompt is placed in the conversation). */
+  requestPrefix?(): Promise<{ systemPrompt: string; tools: Array<{ name: string; description: string; parameters: unknown }> }>;
   /**
    * The worker's side of an offloaded model call: the request (null once answered), then the answer. A value or a promise of one.
    * `taker` names the attempt that will call the model with it; pd refuses a job under another taker's live take (`PdHost.takeJob`).

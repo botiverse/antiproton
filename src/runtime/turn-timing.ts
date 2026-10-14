@@ -151,6 +151,7 @@ export function closeTurn(sql: Sql, o: {
       .map((j) => ({ created: Number(j.created_at), answered: j.answered_at === null ? null : Number(j.answered_at) }))
     : [];
   const firstJobAt = jobs.length ? jobs[0]!.created : null;
+  const first = hasJobs && jobs.length ? firstCallTokens(sql, o.session, inboundAt, replyAt) : null;
   const answered = jobs.filter((j) => j.answered !== null) as Array<{ created: number; answered: number }>;
   const lastAnswerAt = answered.length ? Math.max(...answered.map((j) => j.answered)) : null;
   const modelMs = answered.reduce((s, j) => s + Math.max(0, j.answered - j.created), 0);
@@ -172,12 +173,29 @@ export function closeTurn(sql: Sql, o: {
       inboundToStartMs: gap(inboundAt, startAt), startToFirstJobMs: gap(startAt, firstJobAt), modelMs, betweenJobsMs,
       lastAnswerToReplyMs: gap(lastAnswerAt, replyAt), toolMs: Number(t.tool_ms), clientWaitMs,
       prepMs: gap(inboundAt, saidAt), modelJobs: jobs.length, tools: Number(t.tools), clientPauses, messages: Number(t.messages),
+      firstCallPromptTokens: first?.prompt ?? null, firstCallCachedTokens: first?.cached ?? null,
       inboundAt, saidAt, turnStartAt: startAt, firstJobAt, lastAnswerAt, replyAt,
     },
   };
   appendTrace(sql as never, [row]);
   sql.exec("DELETE FROM turn_timing WHERE session = ?", o.session);
   return row;
+}
+
+/**
+ * The turn's first model call's prompt, and how much of it the provider read from its cache: pi's `usage.input` and
+ * `usage.cacheRead` on the answer (src/model/pi-bridge.ts `usageOf`: the provider's `prompt_tokens` /
+ * `input_tokens`, and DeepSeek's `prompt_cache_hit_tokens` or OpenAI's `cached_tokens`). What tells a first reply
+ * slowed by a cold cache from one slowed by the model. Null when that call has no answer yet or its answer says no usage.
+ */
+function firstCallTokens(sql: Sql, session: string, from: number, to: number): { prompt: number; cached: number } | null {
+  const r = sql.exec("SELECT answer FROM pi_model_jobs WHERE session = ? AND created_at >= ? AND created_at <= ? ORDER BY created_at, rowid LIMIT 1",
+    session, from, to).toArray()[0];
+  if (!r || r.answer === null || r.answer === undefined) return null;
+  let u: any;
+  try { u = JSON.parse(String(r.answer))?.usage; } catch { return null; }
+  if (!u || typeof u.input !== "number") return null;
+  return { prompt: u.input, cached: typeof u.cacheRead === "number" ? u.cacheRead : 0 };
 }
 
 /**

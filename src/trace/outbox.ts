@@ -58,8 +58,10 @@ const TABLE = "CREATE TABLE IF NOT EXISTS trace_outbox(" +
 // written when the turn ends. Activity and status skip it.
 // `import.hold` is an agent's wait for its workspace import ending (src/store/workspace-import.ts): `import` when the
 // import lifted it, `valve` when no import came in time and it lifted on its own. Activity and status skip it.
+// `model.prewarm` is the prompt-cache prewarm after an import (src/runtime/prewarm.ts): `warmed`, `skipped` or
+// `failed`, with its tokens. Activity and status skip it.
 export const TRACE_KINDS = ["model.call", "tool.call", "approval.wait", "container.lease", "inbound", "mount.seeded", "harness.open",
-  "rebuild.decision", "rebuild.outcome", "rebuild.behaviour", "session.needs_reset", "turn.timing", "import.hold"] as const;
+  "rebuild.decision", "rebuild.outcome", "rebuild.behaviour", "session.needs_reset", "turn.timing", "import.hold", "model.prewarm"] as const;
 export type TraceKind = (typeof TRACE_KINDS)[number];
 
 export const TRACE_VERDICTS = ["ok", "failed", "blocked", "cancelled"] as const;

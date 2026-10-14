@@ -158,7 +158,8 @@ export function queuedCall(env: ModelEnv, bucket: Parameters<typeof imageLoaderF
  * An OpenAI reasoning model (`usesResponses`) is called through the Responses API at the same provider, with its
  * reasoning on and its earlier reasoning replayed (src/model/openai-responses.ts); every other model through
  * chat/completions, whose request — DeepSeek's among them — test/model-request-snapshot.ts pins byte for byte.
- * The job's own options are not forwarded on either path: the reasoning level is each client's default.
+ * The job's own options are not forwarded on either path: the reasoning level is each client's default, except where
+ * the object marked the job `reasoning: "off"` (an agent's first turn made to run without, src/runtime/prewarm.ts).
  *
  * An image in the conversation is stored as a reference (src/model/images.ts); for a model that can see images
  * (`acceptsImages`) the newest ones, within the image window (`imageWindowOf`), are read through `images` — the
@@ -189,16 +190,19 @@ export async function callQueuedModel(env: ModelEnv, job: any, jobId: string, im
   // Told the status of each HTTP answer only when it is recorded, so a call that is not is the call it always was.
   let lastStatus: number | undefined;
   const observe = recording ? { onStatus: (s: number) => { lastStatus = s; } } : {};
+  // The one option a job may carry: reasoning off for a first turn its object marked (`AgentRuntime.takeJob`). A job
+  // without it is sent exactly the request it always was.
+  const reasoning = jobReasoning(job);
   let call: () => Promise<ModelResponse>;
   if (usesResponses(called)) {
     const toolImages = env.RESPONSES_TOOL_IMAGES === "user" ? "user" as const : "output" as const;
     const { input, tools } = toResponsesInput(context, called, { images: sees, toolImages });
     const model = new OpenAiResponsesModel(request);
-    call = () => model.complete(input, { ...(tools ? { tools } : {}), ...observe });
+    call = () => model.complete(input, { ...(tools ? { tools } : {}), ...observe, ...reasoning });
   } else {
     const model = new OpenAiCompatibleModel(request);
     const { messages, tools } = toRequest(context, { images: sees });
-    call = () => model.complete(messages, { ...(tools ? { tools } : {}), ...observe });
+    call = () => model.complete(messages, { ...(tools ? { tools } : {}), ...observe, ...reasoning });
   }
   const identity = {
     api: String(job.model?.api ?? "offloaded"),
@@ -229,4 +233,48 @@ export async function callQueuedModel(env: ModelEnv, job: any, jobId: string, im
   }
   await attempt?.ended(providerOutcome(undefined, lastStatus, new Date()));
   return fromResponse(res, identity, jobId);
+}
+
+/** `reasoning` as a taken job carries it: only "off" is ever set (`AgentRuntime.takeJob`); anything else is no option. */
+function jobReasoning(job: any): { reasoning: "off" } | Record<string, never> {
+  return job?.reasoning === "off" ? { reasoning: "off" } : {};
+}
+
+/** What a prewarm reports back to its object (`AgentRuntime.prewarmDone`). */
+export interface PrewarmResult {
+  model: string;
+  /** `warmed`, or `failed: …` with the reason. */
+  outcome: string;
+  ms: number;
+  usage: { input: number; output: number; cacheRead: number; cacheWrite: number; reasoning?: number } | null;
+}
+
+/**
+ * A prompt-cache prewarm (src/runtime/prewarm.ts), the queue consumer's half: the first turn's prefix sent the way
+ * `callQueuedModel` would send that turn — the same provider and model, the same serializer, the same reasoning — with
+ * nothing to generate: through the Responses API the developer message and tools with `prewarm`, through
+ * chat/completions the system prompt, one user message and the tools with a one-token cap. Never thrown: a failure is
+ * its outcome, so the queue does not send it again.
+ */
+export async function callPrewarm(env: ModelEnv, job: any): Promise<PrewarmResult> {
+  const called = String(job?.operatorModel ?? env.HARNESS_MODEL);
+  const provider = job?.operatorModel ? String(job.operatorProvider ?? DEFAULT_PROVIDER) : DEFAULT_PROVIDER;
+  const t0 = Date.now();
+  try {
+    const request = operatorRequest(operatorModelOf(env), { provider, model: called });
+    const reasoning = jobReasoning(job);
+    let res: ModelResponse;
+    if (usesResponses(called)) {
+      const { input, tools } = toResponsesInput({ ...job.context, messages: [] }, called, {});
+      res = await new OpenAiResponsesModel(request).complete(input, { ...(tools ? { tools } : {}), ...reasoning, prewarm: true });
+    } else {
+      const { messages, tools } = toRequest(job.context, {});
+      res = await new OpenAiCompatibleModel(request).complete(messages, { ...(tools ? { tools } : {}), ...reasoning, maxTokens: 1 });
+    }
+    const u = fromResponse(res, { api: "offloaded", provider: "openai-compatible", id: called }).usage;
+    return { model: called, outcome: "warmed", ms: Date.now() - t0,
+      usage: { input: u.input, output: u.output, cacheRead: u.cacheRead, cacheWrite: u.cacheWrite, ...(u.reasoning ? { reasoning: u.reasoning } : {}) } };
+  } catch (e) {
+    return { model: called, outcome: `failed: ${String((e as Error)?.message ?? e).slice(0, 160)}`, ms: Date.now() - t0, usage: null };
+  }
 }

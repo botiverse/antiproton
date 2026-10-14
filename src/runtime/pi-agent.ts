@@ -636,5 +636,26 @@ export class PiAgent implements AgentEngine {
     return this.#harness.getTools(CTX);
   }
 
+  /**
+   * The system prompt and tools this session's next model call carries, as pi builds them for the request
+   * (pi-agent-core dist/harness/runtime/drive/generation.js `prepareGeneration`): the configured prompt, and each
+   * active tool's name, description and parameters in the active order, or the configured order when the session
+   * has none recorded yet (its first run records them). What a prompt-cache prewarm sends (src/runtime/prewarm.ts);
+   * test/prewarm.ts holds it to the first job's own context.
+   */
+  async requestPrefix(): Promise<{ systemPrompt: string; tools: Array<{ name: string; description: string; parameters: unknown }> }> {
+    const tools = await this.#harness.getTools(CTX) as Array<{ name: string; description: string; parameters: unknown; constrainedSampling?: unknown }>;
+    const active = await this.#lane.getActiveTools(CTX);
+    const byName = new Map(tools.map((t) => [t.name, t]));
+    const order = active.length ? active : tools.map((t) => t.name);
+    return {
+      systemPrompt: this.#opts.systemPrompt,
+      tools: order.flatMap((n) => {
+        const t = byName.get(n);
+        return t ? [{ name: t.name, description: t.description, parameters: t.parameters }] : [];
+      }),
+    };
+  }
+
   async close() { await this.#harness.close(CTX); }
 }
