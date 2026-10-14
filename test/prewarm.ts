@@ -210,6 +210,8 @@ function consumer(w: World, prewarm: (job: any) => Promise<any> = async (job) =>
   };
   return { asked, run };
 }
+/** Read through a call, so an assertion on the count does not narrow it for the next (TS2367). */
+const jobCount = (w: World) => w.jobs.length;
 const prewarms = (w: World) => w.sent.filter((m) => m.kind === "prewarm");
 
 /** Alarm passes until the model has been asked `n` things, or nothing is due soon. */
@@ -265,7 +267,7 @@ await check("an import queues one prewarm; its request is the first turn's syste
   // The first turn: its own first job carries the same prefix.
   must(await push(w, "e1", "Hi Cindy") === 202, "push");
   await settle(w, 1);
-  must(w.jobs.length === 1, `jobs: ${w.jobs.length}`);
+  must(jobCount(w) === 1, `jobs: ${jobCount(w)}`);
   const job = await w.D.takeJob(T, A, w.jobs[0]!) as any;
   firstJobContext = job.context;
   must(job.context.systemPrompt === ctx.systemPrompt, "the first turn's system prompt is not the prewarm's");
@@ -426,7 +428,7 @@ await check("firstTurn off: every call of the first turn is taken with reasoning
   await settle(w, 2);
   must(await push(w, "e2", "Thanks") === 202, "second push");
   await settle(w, 3);
-  must(w.jobs.length === 3, `no second turn: ${w.jobs.length}`);
+  must(jobCount(w) === 3, `no second turn: ${jobCount(w)}`);
   const j3 = await w.D.takeJob(T, A, w.jobs[2]!) as any;
   must(!("reasoning" in j3), `the second turn ran with ${show(j3.reasoning)}`);
   // A redelivered first-turn job is decided as it was: from its own context.
