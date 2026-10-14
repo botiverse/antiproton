@@ -522,6 +522,24 @@ await check("the onboarding pool under, at and over its cap: spentUsd, limitUsd 
   }
 });
 
+await check("a tenant share of $0 refuses onboarding calls but does not cap the pool: capped is the pool's limit alone", async () => {
+  const db = d1();
+  const day = today();
+  provisioned(db, "t-a", "01JAONB", "raft_aonb", "onboarding");
+  spend(db, "t-a", 0.5, day, "raft_aonb");
+  const p = await token(db, { scope: "platform" });
+  const zeroShare: SpendLimitEnv = { ONBOARDING_DAILY_LIMIT_USD: "2", ONBOARDING_TENANT_DAILY_LIMIT_USD: "0" };
+  // The enforcer does refuse t-a's onboarding agent, by the share, while the pool is under its $2.
+  const verdict = judge(await readDaySpend(db, "t-a", Date.now()), limitsOf({ ...AT, ...zeroShare }), "onboarding");
+  must(!verdict.admit && verdict.limit === "onboarding_tenant", show(verdict));
+  const r = await get(env(db, zeroShare), "/provision/budgets/onboarding", `Bearer ${p}`);
+  must(r.status === 200 && r.body.capped === false && r.body.limitUsd === 2 && Math.abs(r.body.spentUsd - 0.5) < 1e-5, r.text);
+  // So does an admin's $0 share for t-a, with the pool's own override row present (the row a "" tenant also matches).
+  db.raw.prepare("INSERT INTO spend_pool_limits (pool, tenant_id, limit_usd, set_by, set_at) VALUES ('onboarding', '', 2, 'github:1', 0), ('onboarding', 't-a', 0, 'github:1', 0)").run();
+  const r2 = await get(env(db, POOL), "/provision/budgets/onboarding", `Bearer ${p}`);
+  must(r2.status === 200 && r2.body.capped === false && r2.body.limitUsd === 2, r2.text);
+});
+
 await check("the onboarding pool on a past day is read from the ledger, a folded day included; a later day or a bad date is 400", async () => {
   const db = d1();
   const day = today();
@@ -543,7 +561,7 @@ await check("the onboarding pool on a past day is read from the ledger, a folded
   const now = await get(e, `/provision/budgets/onboarding?date=${ymd(day)}`, `Bearer ${p}`);
   const dflt = await get(e, "/provision/budgets/onboarding", `Bearer ${p}`);
   must(now.status === 200 && near(now.body.spentUsd, 0.125) && now.body.capped === false && dflt.text === now.text, `${now.text} / ${dflt.text}`);
-  for (const q of [`date=${ymd(day + DAY)}`, "date=2026-02-31", "date=yesterday", "date=2026-10-01T00:00Z", "from=2026-10-01"]) {
+  for (const q of [`date=${ymd(day + DAY)}`, "date=", "date=2026-02-31", "date=yesterday", "date=2026-10-01T00:00Z", "from=2026-10-01"]) {
     const r = await get(e, `/provision/budgets/onboarding?${q}`, `Bearer ${p}`);
     must(r.status === 400 && r.body?.error?.code === "invalid", `${q}: ${r.status} ${r.text}`);
   }

@@ -379,12 +379,15 @@ GET /provision/budgets/onboarding?date=2026-10-13
   as the pool is judged. `limitUsd` is the pool's limit (an admin's override, else
   `ONBOARDING_DAILY_LIMIT_USD`, `$30`; `null` when there is none). `capped` is `judge`'s verdict:
   `true` exactly when an onboarding agent's next call is refused by the pool (`spentUsd >= limitUsd`). A
-  tenant's own share of the pool is not judged here; `today.onboardingRefusing` in `/provision/usage`
-  says it. Read afresh each time; the consumer may act on a reading up to 30 s old.
+  tenant's own share of the pool is not judged here (a share of `$0` does not make `capped` true);
+  `today.onboardingRefusing` in `/provision/usage` says it. `capped` describes the pool, not any one
+  call: an exempt tenant (`DAILY_LIMIT_EXEMPT_TENANTS`, default `bench`) is admitted before anything is
+  judged, so its onboarding agents still work while `capped` is `true`. Read afresh each time; the
+  consumer may act on a reading up to 30 s old.
 - **A past day** is read from the ledger, a day already folded into whole days included. Its `limitUsd`
   is the limit as it stands now: an admin's override is kept as its current value, not per day.
-- **`date`** is exactly `YYYY-MM-DD`, a calendar day, today or earlier; anything else, a later day, or any
-  other parameter is `400`, `code: "invalid"`.
+- **`date`** is exactly `YYYY-MM-DD`, a calendar day, today or earlier, or absent for today; anything else
+  (an empty `date=` included), a later day, or any other parameter is `400`, `code: "invalid"`.
 
 #### The server's plan (`plan`)
 

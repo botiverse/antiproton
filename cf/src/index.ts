@@ -3557,7 +3557,8 @@ function provisionDeps(env: Env): ProvisionDeps {
       today: (tenantId, now) => readDaySpend(env.CONTROL_DB, tenantId, now),
       costs: (tenantId, from, to, bucket, byAgent) => readTenantCosts(env.CONTROL_DB, tenantId, from, to, bucket, byAgent),
       // No tenant is named ("" is none: `tenantFor` never gives it), so only the pool-wide figures of the reading are used.
-      pool: (day, folded) => readDaySpend(env.CONTROL_DB, "", day, folded),
+      // Its tenant-share fields are cleared: with "" the share lookup (`tenant_id IN ('', ?)`) finds the pool's own row.
+      pool: async (day, folded) => ({ ...(await readDaySpend(env.CONTROL_DB, "", day, folded)), tenantOnboardingUsd: 0, onboardingTenantOverride: null }),
       cache: sharedUsageCache,
     },
     // The same sources as the console's picker (`/ui/agent/model`) and the Agents API's `model`, so all three agree.

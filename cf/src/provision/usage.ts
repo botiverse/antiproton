@@ -159,7 +159,8 @@ export async function onboardingPool(query: URLSearchParams, deps: ProvisionUsag
   const given = query.get("date");
   const today = dayOf(now);
   let day = today;
-  if (given !== null && given !== "") {
+  if (given !== null) {
+    // An empty `date=` is refused rather than read as today: a caller that meant a day and sent none should hear so.
     if (!/^\d{4}-\d{2}-\d{2}$/.test(given) || !onTheCalendar(given)) return "date is a UTC day, YYYY-MM-DD";
     day = Date.parse(`${given}T00:00:00Z`);
     if (day > today) return `date is today (${iso(today).slice(0, 10)}) or earlier`;
@@ -170,7 +171,8 @@ export async function onboardingPool(query: URLSearchParams, deps: ProvisionUsag
     date: iso(day).slice(0, 10),
     limitUsd: onboardingLimitOf(spend, deps.limits),
     spentUsd: tidy(spend.onboardingUsd),
-    // The pool's refusal only: `judge` then asks a tenant's share, which is no tenant's here.
+    // The pool's refusal only. `judge` asks the pool first and then a tenant's share, and this reading is no tenant's:
+    // a share of $0 (ONBOARDING_TENANT_DAILY_LIMIT_USD=0) refuses with "onboarding_tenant" while the pool is under.
     capped: !verdict.admit && verdict.limit === "onboarding",
   };
 }
