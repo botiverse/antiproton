@@ -370,6 +370,12 @@ and `state/{path}` in the workspace reads above — so it reads back through
 32 KiB as JSON is kept in object storage, as the state plugin keeps one, and reads back the same). An
 imported file is the agent's own: it may change or remove it.
 
+**What the agent is shown.** From its first turn the agent's system prompt carries a block headed "Files
+brought from your previous workspace": `MEMORY.md`'s current text (what its `get` answers now, not the copy
+imported) fenced, up to 4,000 characters with a line saying where the rest is, or a note that it is kept in
+object storage or was removed; then up to 40 of the other imported paths by name, with the count of the rest;
+and the state mount's `get` to open them (`importedFilesParts`, `src/plugins/state.ts`).
+
 **What a file may be.** UTF-8 text with no NUL byte: a state value is text, and a file that is not could not
 read back as the bytes it was (`422 not_text`). Nothing shaped like a credential (`422 credential_in_text`,
 the kind named and none of the text). Paths are normalised, then checked: empty and `.` segments drop out
@@ -430,7 +436,7 @@ agent that must not run before its import:
   starts and no model call is made. A queued push is not given up for its age while held, and gets its
   full 30 minutes from the hold's end. The queue's own bound still applies: past 30 pushes waiting, a
   push is `429`, as when posting is failing. A message by any other route (the console) has no queue to
-  wait in and is refused while held, with the time the hold ends.
+  wait in and is refused while held, with the time the hold ends (the console's message route: `409`).
 - **Lifted by the import.** The import that lands lifts the hold — in its own transaction, or, when it
   carries `instructions`, once they are applied, so the first turn runs on the imported persona — and
   wakes the agent: the queued pushes are posted and the first turn starts. A trace row `import.hold`,
