@@ -98,7 +98,7 @@ import { d1ServiceTokens } from "./control-plane.ts";
 import { adminServiceTokens } from "./admin-service-tokens.ts";
 import { hashServiceToken, looksLikeServiceToken } from "./service-token.ts";
 import { adminProviderTokens } from "./admin-provider-tokens.ts";
-import { d1Connections, d1Connectors, d1ModelChoices, d1ModelOverrides, d1ProviderTokens, d1ProvisionedAgents } from "./control-plane.ts";
+import { d1Connections, d1Connectors, d1ModelChoices, d1ModelOverrides, d1ProviderTokens, d1ProvisionedAgents, d1TenantModelPicker } from "./control-plane.ts";
 import { CONNECT_START_PATH, CONNECTION_PLUGIN, connectCallback, connectLink, connectStart, isConnectCallback, type ConnectDeps } from "./provision/connect.ts";
 import { hashProviderToken, looksLikeProviderToken } from "./provider-token.ts";
 import { handleProvision, IMPORT_REQUEST_MAX_BYTES, IMPORT_ROUTE, type ProvisionDeps, type ProvisionTool } from "./provision/handlers.ts";
@@ -3567,6 +3567,7 @@ function provisionDeps(env: Env): ProvisionDeps {
       defaultModel: env.HARNESS_MODEL,
       choices: d1ModelChoices(env.CONTROL_DB),
       rebind: (tenantId, agentId) => stub(tenantId, agentId).rebindModel(tenantId, agentId),
+      picker: d1TenantModelPicker(env.CONTROL_DB),
     },
     ...(evalSeedRoutes(env) ? {
       seed: {

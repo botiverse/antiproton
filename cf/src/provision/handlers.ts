@@ -37,8 +37,8 @@ import {
 import { STATE_KEY } from "../../../src/plugins/state-key.ts";
 import type { FreshContextResult, RestartResult } from "../runtime.ts";
 import { canonicalToolConfig, type ToolConfig } from "../../../src/core/tool-config.ts";
-import type { ModelChoices } from "../control-plane.ts";
-import { resolveModel } from "../model-request.ts";
+import type { ModelChoices, TenantModelPicker } from "../control-plane.ts";
+import { choiceOf, resolveModel } from "../model-request.ts";
 import { optionFor, type UserModels } from "../../../src/model/user-models.ts";
 import type { ModelChoice } from "../../../src/model/providers.ts";
 import { onboardingPool, tenantUsage, type ProvisionUsage } from "./usage.ts";
@@ -97,6 +97,12 @@ export interface ProvisionModels {
   defaultModel: string;
   choices: ModelChoices;
   rebind(tenantId: string, agentId: string): Promise<void>;
+  /**
+   * Whether the tenant may pick a model other than the default here (`PUT /servers/:raftServerId/model-picker`). Off
+   * unless Raft turned it on: a provider pick of another model is then refused (`pickerProblem`), and the default is
+   * taken without storing a pick. Required, so a deployment wiring the model routes cannot leave the gate out.
+   */
+  picker: TenantModelPicker;
 }
 
 export interface ProvisionDeps {
@@ -323,6 +329,22 @@ function credentialField(body: unknown): string | Fail {
   return v;
 }
 
+/**
+ * The tenant a route addressed by a Raft server acts in (`PUT /servers/:raftServerId/…`). A tenant-scoped token names
+ * no server, so the path's is taken only when the tenant's own agents were made for it: a setting is said of one
+ * server, and must not land on a tenant that is another server's (or answer as if it had).
+ */
+async function serverTenant(who: ProviderTokenIdentity, raftServerId: string, registry: ProvisionRegistry, what: string): Promise<string | Fail> {
+  if (!RAFT_ID.test(raftServerId)) return { status: 422, code: "invalid", param: "raftServerId", message: `the Raft server id must match ${RAFT_ID}` };
+  const tenant = tenantFor(who, raftServerId);
+  if (isFail(tenant)) return tenant;
+  if (who.scope === "tenant" && !(await registry.hasServer?.(tenant, raftServerId))) {
+    return { status: 403, code: "server_mismatch", param: "raftServerId",
+      message: `this token's tenant has no agent provisioned for Raft server ${raftServerId}; ${what} is set for the server the token belongs to` };
+  }
+  return tenant;
+}
+
 /** What Raft sees of a row. The credential has no field here to be in. */
 function view(row: ProvisionedAgent, live?: Json) {
   return {
@@ -411,15 +433,8 @@ export async function handleProvision(
   // The Raft server's plan, which Raft sends whenever it changes: the tenant's default daily limit follows it.
   if (seg[0] === "servers" && seg.length === 3 && seg[2] === "plan" && method === "PUT") {
     if (!deps.plans) return null;
-    if (!RAFT_ID.test(seg[1]!)) return fail({ status: 422, code: "invalid", param: "raftServerId", message: `the Raft server id must match ${RAFT_ID}` });
-    const tenant = tenantFor(who, seg[1]!);
+    const tenant = await serverTenant(who, seg[1]!, deps.registry, "a plan");
     if (isFail(tenant)) return fail(tenant);
-    // A tenant-scoped token names no server, so the path's is taken only when the tenant's own agents were made for it:
-    // a plan is said of one server, and must not land on a tenant that is another server's (or answer as if it had).
-    if (who.scope === "tenant" && !(await deps.registry.hasServer?.(tenant, seg[1]!))) {
-      return fail({ status: 403, code: "server_mismatch", param: "raftServerId",
-        message: `this token's tenant has no agent provisioned for Raft server ${seg[1]}; a plan is set for the server the token belongs to` });
-    }
     const b = typeof body === "object" && body !== null && !Array.isArray(body) ? body as Record<string, unknown> : {};
     const extra = Object.keys(b).find((k) => k !== "plan");
     if (extra) return fail({ status: 422, code: "invalid", param: extra, message: `unknown field ${extra}; the body is { "plan": "free" | "pro" }` });
@@ -429,6 +444,23 @@ export async function handleProvision(
     await deps.plans.set(tenant, plan!, headers.credentialId ?? "provider", at);
     logEvent("provision.plan", { tenantId: tenant, raftServerId: seg[1], plan, via: "put" });
     return ok({ raftServerId: seg[1], plan, updatedAt: new Date(at).toISOString() });
+  }
+  // Whether the server's agents may be given another model than the default (`pickerProblem`), which Raft sends whenever
+  // its own switch for the server changes. The same tenant rules as the plan's.
+  if (seg[0] === "servers" && seg.length === 3 && seg[2] === "model-picker" && method === "PUT") {
+    if (!deps.models) return null;
+    const tenant = await serverTenant(who, seg[1]!, deps.registry, "the model picker");
+    if (isFail(tenant)) return fail(tenant);
+    const b = typeof body === "object" && body !== null && !Array.isArray(body) ? body as Record<string, unknown> : {};
+    const extra = Object.keys(b).find((k) => k !== "enabled");
+    if (extra) return fail({ status: 422, code: "invalid", param: extra, message: `unknown field ${extra}; the body is { "enabled": true | false }` });
+    if (typeof b.enabled !== "boolean") {
+      return fail({ status: 422, code: b.enabled === undefined ? "missing" : "invalid", param: "enabled", message: 'the body is { "enabled": true | false }' });
+    }
+    const at = deps.now();
+    await deps.models.picker.set(tenant, b.enabled, headers.credentialId ?? "provider", at);
+    logEvent("provision.model_picker", { tenantId: tenant, raftServerId: seg[1], enabled: b.enabled });
+    return ok({ raftServerId: seg[1], modelPicker: b.enabled, updatedAt: new Date(at).toISOString() });
   }
   if (seg[0] !== "agents") return null;
   // On POST the body names the server; elsewhere the URL does.
@@ -466,10 +498,16 @@ export async function handleProvision(
     if (isFail(credential)) return fail(credential);
     const toolConfig = toolConfigField(body, deps.seed);
     if (isFail(toolConfig)) return fail(toolConfig);
-    // Only its type here: whether it is offered, and not locked, is a first create's question (`modelProblem`). A replay
+    // Only its type here: whether it is offered, and not locked, is a first create's question (`createPick`). A replay
     // is compared with the create it repeats, so an option withdrawn since does not refuse the agent that exists.
     const model = createModelField(body);
     if (isFail(model)) return fail(model);
+    // The switch is the server's, set by its own route only: taken here, a create retried late could turn back a switch
+    // flipped since, and ignored, a caller sending it would believe a pick allowed that is then refused.
+    if (field(body, "modelPicker") !== undefined) {
+      return fail({ status: 422, code: "invalid", param: "modelPicker",
+        message: "modelPicker is the server's, not the agent's: set it with PUT /provision/servers/{raftServerId}/model-picker" });
+    }
     // Hold the agent until its workspace import (`POST …/import`): no turn before it, pushes queued meanwhile.
     const awaitField = field(body, "awaitImport");
     if (awaitField !== undefined && typeof awaitField !== "boolean") {
@@ -518,22 +556,18 @@ export async function handleProvision(
       // Once the pick is stored (`modelPending` cleared) a replay never writes it again, so a delayed retry cannot undo a
       // PUT …/model, null included, that landed after it.
       if (reopen) {
-        if (model !== null) {
-          const refused = await modelProblem(deps.models, tenantId, agentId, model);
-          if (refused) return fail(refused);
-        }
+        const pick = model === null ? { pick: null } : await createPick(deps.models, tenantId, agentId, model);
+        if (isFail(pick)) return fail(pick);
         if ((row.model ?? null) !== model) { await deps.registry.update(tenantId, raftAgentId, { model }); row = { ...row, model }; }
-        row = await settlePick(deps, row, headers.credentialId ?? null);
+        row = await settlePick(deps, row, pick.pick, headers.credentialId ?? null);
         // The create completing, not a replay of one that completed: answered as the first create would have been.
         created = true;
       }
     } else {
       // Refused before the row exists, so an unoffered or locked model leaves nothing made and the id free — as a PUT
       // under the lock stores nothing.
-      if (model !== null) {
-        const refused = await modelProblem(deps.models, tenantId, agentId, model);
-        if (refused) return fail(refused);
-      }
+      const pick = model === null ? { pick: null } : await createPick(deps.models, tenantId, agentId, model);
+      if (isFail(pick)) return fail(pick);
       // The plan is written by a create and never by a replay of one: a POST retried late carries the plan of its
       // first send, and must not undo a `PUT /servers/:id/plan` that landed since. Before the row, so a create that
       // dies after this has still said it, and its replay (which writes no plan) loses nothing.
@@ -542,7 +576,8 @@ export async function handleProvision(
         logEvent("provision.plan", { tenantId, raftServerId, plan, via: "create" });
       }
       const t = deps.now();
-      row = { tenantId, raftAgentId, agentId, ...asked, modelPending: model !== null, credentialHash, status: "provisioning", pushRegistered: false, pushError: null, createdAt: t, updatedAt: t, deletedAt: null };
+      // Pending only while there is a pick to store: the default taken with the picker off stores none.
+      row = { tenantId, raftAgentId, agentId, ...asked, modelPending: pick.pick !== null, credentialHash, status: "provisioning", pushRegistered: false, pushError: null, createdAt: t, updatedAt: t, deletedAt: null };
       try { await deps.registry.create(row); }
       catch (e) {
         // Only the unique index says 409 (two Raft ids that sanitise alike). Anything else — D1 away, a
@@ -554,7 +589,7 @@ export async function handleProvision(
       created = true;
       // Stored before `adopt`, which binds the model it resolves (steps.ts), so the agent's first turn already runs on
       // the pick. Not one statement with the row: if this fails the POST fails, and its replay stores it (above).
-      row = await settlePick(deps, row, headers.credentialId ?? null);
+      row = await settlePick(deps, row, pick.pick, headers.credentialId ?? null);
     }
     // From here every step is idempotent, so a replay of a request that died half-way finishes it. The tool choice is
     // compared by the agent's object, where it is recorded: a replay asking for other tools is 409, as for any field.
@@ -1034,7 +1069,8 @@ function modelView(choice: ModelChoice, um: UserModels): { model: string; label:
  * one by one, so a field added to UserModel later does not reach Raft by default — and never a model's address, a
  * gateway or a secret. `default` is what an agent that follows the default runs on in this tenant (the admin's tenant
  * or deployment row, else HARNESS_MODEL), named as `modelView` names it; `locked` says a tenant row decides every agent
- * of the tenant, so no pick would run.
+ * of the tenant, so no pick would run. `pickerEnabled` says whether a pick other than the deployment's default is
+ * taken (`pickerProblem`); the options are listed either way, so a reader written before the switch keeps working.
  */
 async function modelList(tenantId: string, m: ProvisionModels) {
   // `layers` with no agent reads the tenant's and the deployment's rows: the agent clause names agent_id '', which is
@@ -1043,7 +1079,7 @@ async function modelList(tenantId: string, m: ProvisionModels) {
   const d = modelView(r.choice, m.userModels);
   return {
     models: m.userModels.offered.map((o) => ({ id: o.id, label: o.label, provider: o.provider })),
-    default: d.model, defaultLabel: d.label, locked: r.locked,
+    default: d.model, defaultLabel: d.label, locked: r.locked, pickerEnabled: await m.picker.enabled(tenantId),
   };
 }
 
@@ -1079,15 +1115,23 @@ async function modelRoute(
   }
   const locked = await lockedProblem(m, tenantId, agentId);
   if (locked) return fail(locked);
+  let pick = asked;
   if (asked !== null) {
     const unknownModel = notOffered(m.userModels, asked);
     if (unknownModel) return fail(unknownModel);
+    if (!(await m.picker.enabled(tenantId))) {
+      // The default is always taken, as following the default (null): a stored pick of it would outrank an operator's
+      // deployment row. The pick the agent already has is taken too, a repeat that changes nothing: an agent that chose
+      // while the picker was on keeps its model, and a retried PUT of it is not a new choice.
+      if (asked === defaultOption(m)) pick = null;
+      else if (asked !== (await m.choices.layers(tenantId, agentId)).owner) return fail(pickerProblem(asked));
+    }
   }
   // The owner has chosen, so an interrupted create's pick is settled: its delayed replay must not store the create's
   // model over this one (`settlePick`). Cleared first: a PUT that fails after it is retried, and the replay then stores
   // nothing rather than the older value.
   if (found.modelPending) await registry.update(tenantId, found.raftAgentId, { modelPending: false });
-  await storePick(m, tenantId, agentId, asked, credentialId, now);
+  await storePick(m, tenantId, agentId, pick, credentialId, now);
   // Not the request's failure: the pick is stored, and the next path that binds (a message, a page open) binds it anyway.
   await m.rebind(tenantId, agentId).catch((e: unknown) => console.warn(`rebinding ${agentId} after a provider pick failed: ${String((e as Error)?.message ?? e).slice(0, 200)}`));
   return ok(await state());
@@ -1099,6 +1143,21 @@ function notOffered(um: UserModels, asked: string): Fail | null {
   const ids = um.offered.map((o) => JSON.stringify(o.id)).join(", ");
   return { status: 422, code: "unknown_model", param: "model",
     message: `no model option ${JSON.stringify(asked.slice(0, 64))} is offered here; ${ids ? `one of ${ids}, ` : ""}or null for the default` };
+}
+
+/** The offered option that names the deployment's default (HARNESS_MODEL under DEFAULT_PROVIDER); null when none does. */
+function defaultOption(m: ProvisionModels): string | null {
+  return optionFor(m.userModels, choiceOf(null, m.defaultModel))?.id ?? null;
+}
+
+/**
+ * A provider pick of another model than the default while the tenant's picker is off. 403, not 409: no change of state
+ * here makes it acceptable, only the server's switch (`PUT /servers/:raftServerId/model-picker`). An operator's rows
+ * (model_overrides, /admin/models) are not provider picks and are never refused by it.
+ */
+function pickerProblem(asked: string): Fail {
+  return { status: 403, code: "model_picker_disabled", param: "model",
+    message: `choosing a model is not enabled for this Raft server, so ${JSON.stringify(asked.slice(0, 64))} cannot be picked; omit model, or send null or the default, and the deployment's model runs` };
 }
 
 /** An admin's agent or tenant row decides this agent's model, so a pick would be stored and never run. */
@@ -1121,7 +1180,7 @@ async function storePick(m: ProvisionModels, tenantId: string, agentId: string, 
 
 /**
  * `model` of a POST, by type only: an id, or null when it is null or absent, which is today's create exactly (nothing to
- * store). Whether the id may be taken is `modelProblem`'s, asked of a first create only.
+ * store). Whether the id may be taken is `createPick`'s, asked of a first create only.
  */
 function createModelField(body: unknown): string | null | Fail {
   const v = field(body, "model");
@@ -1131,23 +1190,28 @@ function createModelField(body: unknown): string | null | Fail {
 }
 
 /**
- * Whether a first create may be made on `model`: offered here now, and no admin's agent or tenant row deciding the
- * agent's model. A deployment without the model routes offers nothing, so any id is unknown there — refused, never
- * ignored, since an agent quietly made on the default would run on a model nobody chose.
+ * Whether a first create may be made on `model`, and the pick it stores: offered here now; while the tenant's picker is
+ * off, only the default, stored as no pick at all (so an admin's rows decide, and no lock refuses it — hosted agents
+ * send the default by name); otherwise no admin's agent or tenant row deciding the agent's model. A deployment without
+ * the model routes offers nothing, so any id is unknown there — refused, never ignored, since an agent quietly made on
+ * the default would run on a model nobody chose.
  */
-async function modelProblem(m: ProvisionModels | undefined, tenantId: string, agentId: string, model: string): Promise<Fail | null> {
+async function createPick(m: ProvisionModels | undefined, tenantId: string, agentId: string, model: string): Promise<{ pick: string | null } | Fail> {
   if (!m) return { status: 422, code: "unknown_model", param: "model", message: "this deployment offers no choice of model; omit model, or send null, for the default" };
-  return notOffered(m.userModels, model) ?? await lockedProblem(m, tenantId, agentId);
+  const unknownModel = notOffered(m.userModels, model);
+  if (unknownModel) return unknownModel;
+  if (!(await m.picker.enabled(tenantId))) return model === defaultOption(m) ? { pick: null } : pickerProblem(model);
+  return await lockedProblem(m, tenantId, agentId) ?? { pick: model };
 }
 
 /**
- * Make the stored pick the create's, while it is not settled yet, then mark it settled. Unconditional on the value: a
- * create that stored one model and died before settling, reopened with none, must not leave the first one stored to
- * run once a lock lifts — null removes it.
+ * Make the stored pick the create's (`pick`, from `createPick`), while it is not settled yet, then mark it settled.
+ * Unconditional on the value: a create that stored one model and died before settling, reopened with none, must not
+ * leave the first one stored to run once a lock lifts — null removes it.
  */
-async function settlePick(deps: ProvisionDeps, row: ProvisionedAgent, credentialId: string | null): Promise<ProvisionedAgent> {
+async function settlePick(deps: ProvisionDeps, row: ProvisionedAgent, pick: string | null, credentialId: string | null): Promise<ProvisionedAgent> {
   if (!row.modelPending) return row;
-  await storePick(deps.models!, row.tenantId, row.agentId, row.model ?? null, credentialId, deps.now);
+  await storePick(deps.models!, row.tenantId, row.agentId, pick, credentialId, deps.now);
   await deps.registry.update(row.tenantId, row.raftAgentId, { modelPending: false });
   return { ...row, modelPending: false };
 }

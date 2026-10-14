@@ -12,7 +12,7 @@ import { DatabaseSync } from "node:sqlite";
 import { readdirSync, readFileSync } from "node:fs";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { agentObjectName } from "../cf/src/object-name.ts";
-import { d1ModelChoices, d1ModelOverrides, d1ProviderTokens } from "../cf/src/control-plane.ts";
+import { d1ModelChoices, d1ModelOverrides, d1ProviderTokens, d1TenantModelPicker } from "../cf/src/control-plane.ts";
 import { hashProviderToken, newProviderToken } from "../cf/src/provider-token.ts";
 import { callQueuedModel } from "../cf/src/model-request.ts";
 import { harnessKey } from "../cf/src/runtime.ts";
@@ -73,9 +73,10 @@ const RAFT_CRED = "sk_agent_" + "R".repeat(32);
 /**
  * A deployment with two providers and three owner options, a tenant-scoped provider token for T and one for another
  * tenant, and one agent Raft provisioned through `POST /provision/agents` (Raft stood in for, as test/eval-seed-object.ts
- * does). `USER_MODELS` unset gives a deployment that offers nothing.
+ * does). `USER_MODELS` unset gives a deployment that offers nothing. `picker` is T's model-picker switch before the
+ * POST: on unless a check says otherwise, since every check before the switch existed is about a tenant that may pick.
  */
-async function world(opts: { userModels?: unknown[] | null; post?: false | Record<string, unknown> } = {}) {
+async function world(opts: { userModels?: unknown[] | null; post?: false | Record<string, unknown>; picker?: boolean } = {}) {
   const DB = d1();
   const raw = sqliteHost();
   const jobs: string[] = [];
@@ -107,10 +108,12 @@ async function world(opts: { userModels?: unknown[] | null; post?: false | Recor
   };
   const D = new AgentDO(ctx as never, env as never);
   objects.set(agentObjectName(T, A), D);
-  const token = newProviderToken(), other = newProviderToken();
+  const token = newProviderToken(), other = newProviderToken(), platform = newProviderToken();
   await d1ProviderTokens(DB).issue({ hash: await hashProviderToken(token), label: "raft-test", raftOrigin: "https://raft.example", scope: "tenant", tenantId: T });
   await d1ProviderTokens(DB).issue({ hash: await hashProviderToken(other), label: "raft-other", raftOrigin: "https://raft.example", scope: "tenant", tenantId: "t-other" });
-  const w = { D, rt: D.runtime(), raw, DB, env, jobs, token, other, tokenHash: await hashProviderToken(token), alarmAt: () => alarmAt };
+  await d1ProviderTokens(DB).issue({ hash: await hashProviderToken(platform), label: "raft-platform", raftOrigin: "https://raft.example", scope: "platform" } as never);
+  if (opts.picker !== false) await d1TenantModelPicker(DB).set(T, true, "test", 1);
+  const w = { D, rt: D.runtime(), raw, DB, env, jobs, token, other, platform, tokenHash: await hashProviderToken(token), alarmAt: () => alarmAt };
   if (opts.post !== false) {
     const posted = await provisionPost(w, opts.post ?? {});
     must(posted.status === 201, `POST /provision/agents: ${posted.status} ${posted.text}`);
@@ -652,6 +655,153 @@ for (const engine of ["pi085", "pd"] as const) {
     const second = await turn(w, "same words");
     must(first.model === "deepseek-flash" && second.model === first.model && second.system === first.system, "the request moved");
     must(show(second.body.tools) === show(first.body.tools), "the tool list moved");
+  });
+}
+
+// ---- the server's model-picker switch (PUT /provision/servers/{raftServerId}/model-picker) ----------------------
+
+const picker = (w: World, tenantId = T) =>
+  (w.DB.raw.prepare("SELECT enabled, set_by FROM tenant_model_picker WHERE tenant_id = ?").get(tenantId) as any) ?? null;
+const setPicker = (w: World, enabled: unknown, opts: { server?: string; auth?: string | null; body?: unknown } = {}) =>
+  call(w, "PUT", `servers/${opts.server ?? "srv-1"}/model-picker`, { body: opts.body ?? { enabled }, auth: opts.auth });
+const storedPick = (w: World) => (w.DB.raw.prepare("SELECT choice_id FROM model_choices WHERE tenant_id = ? AND agent_id = ?").get(T, A) as any)?.choice_id ?? null;
+
+await check("model-picker PUT: a body of exactly { enabled: boolean }, the tenant the token gives, server_mismatch for a tenant token's other server; nothing written when refused", async () => {
+  const w = await world({ picker: false });
+  // A tenant token for the server its agents were made for (srv-1): written, the latest write wins.
+  let r = await setPicker(w, true);
+  must(r.status === 200 && r.body.raftServerId === "srv-1" && r.body.modelPicker === true && typeof r.body.updatedAt === "string", `on: ${r.status} ${r.text}`);
+  must(picker(w)?.enabled === 1 && picker(w)?.set_by === w.tokenHash, `stored: ${show(picker(w))}`);
+  r = await setPicker(w, false);
+  must(r.status === 200 && r.body.modelPicker === false && picker(w)?.enabled === 0, `off: ${r.status} ${r.text}`);
+  // A tenant token naming a server none of its agents were made for: 403, nothing written to its tenant.
+  r = await setPicker(w, true, { server: "srv-2" });
+  must(r.status === 403 && r.body.error.code === "server_mismatch" && r.body.error.param === "raftServerId", `another server: ${r.status} ${r.text}`);
+  must(picker(w)?.enabled === 0, "a server_mismatch wrote");
+  // Another tenant's token, which has no agent for srv-1: 403 too, and its own tenant is not written.
+  r = await setPicker(w, true, { auth: w.other });
+  must(r.status === 403 && r.body.error.code === "server_mismatch" && picker(w, "t-other") === null && picker(w)?.enabled === 0, `other tenant: ${r.status} ${r.text}`);
+  // A platform token names the tenant by the path's server, and only that one.
+  r = await setPicker(w, true, { server: "srv-9", auth: w.platform });
+  must(r.status === 200 && picker(w, "raft_srv-9")?.enabled === 1 && picker(w)?.enabled === 0, `platform: ${r.status} ${r.text}`);
+  // No token: 401.
+  must((await setPicker(w, true, { auth: null })).status === 401, "no token");
+  // Bodies: exactly { enabled: true | false }.
+  for (const [bad, param, code] of [[{}, "enabled", "missing"], [{ enabled: "true" }, "enabled", "invalid"], [{ enabled: 1 }, "enabled", "invalid"],
+    [{ enabled: null }, "enabled", "invalid"], [{ enabled: true, plan: "pro" }, "plan", "invalid"]] as const) {
+    const b = await setPicker(w, undefined, { body: bad });
+    must(b.status === 422 && b.body.error.code === code && b.body.error.param === param, `${show(bad)}: ${b.status} ${b.text}`);
+  }
+  must(picker(w)?.enabled === 0, "a refused body wrote");
+  const badId = await setPicker(w, true, { server: "bad id!", auth: w.platform });
+  must(badId.status === 422 && badId.body.error.param === "raftServerId", `bad server id: ${badId.status} ${badId.text}`);
+});
+
+await check("GET /provision/models says pickerEnabled (false until Raft turns it on) and lists the options either way", async () => {
+  const w = await world({ picker: false });
+  const off = await call(w, "GET", "models");
+  must(off.status === 200 && off.body.pickerEnabled === false && off.body.models.length === 3 && off.body.default === "deepseek-flash", `off: ${off.text}`);
+  must((await setPicker(w, true)).status === 200, "on");
+  const on = await call(w, "GET", "models");
+  must(on.body.pickerEnabled === true && on.body.models.length === 3, `on: ${on.text}`);
+});
+
+await check("picker off, create: the default by name is made (no pick stored); another model is 403 model_picker_disabled and makes nothing; on, it is taken", async () => {
+  // Hosted agents send the default by name: made, on the default, with no pick stored to outrank an operator's rows.
+  lines.length = 0;
+  const w = await world({ picker: false, post: { model: "deepseek-flash" } });
+  const g = await call(w, "GET", `agents/${A}/model`);
+  must(show(g.body) === show({ model: "deepseek-flash", label: "DeepSeek Flash", source: "default", locked: false }), `default create: ${g.text}`);
+  must(storedPick(w) === null && !lines.some((l) => l.includes("provision.model\"")), "the default was stored as a pick");
+  // Its replay is the same request: 200.
+  must((await provisionPost(w, { model: "deepseek-flash" })).status === 200, "replay of the default create");
+  for (const model of ["gpt-5.6-luna", "deepseek-pro"]) {
+    const x = await world({ picker: false, post: false });
+    const r = await provisionPost(x, { model });
+    must(r.status === 403 && r.body?.error?.code === "model_picker_disabled" && r.body.error.param === "model", `${model}: ${r.status} ${r.text}`);
+    await nothingMade(x, model);
+  }
+  // Turned on (T's token, once an agent exists for srv-1), the same create is taken.
+  const y = await world({ picker: false, post: { raftAgentId: "01JFIRST" } });
+  must((await provisionPost(y, { model: "gpt-5.6-luna" })).status === 403, "still off");
+  must((await setPicker(y, true)).status === 200, "on through the tenant token");
+  const made = await provisionPost(y, { model: "gpt-5.6-luna" });
+  must(made.status === 201 && storedPick(y) === "gpt-5.6-luna", `on: ${made.status} ${made.text}`);
+  // An id not offered is still 422 unknown_model with the picker off, and modelPicker on the create is refused.
+  const z = await world({ picker: false, post: false });
+  const unknown = await provisionPost(z, { model: "gpt-9" });
+  must(unknown.status === 422 && unknown.body.error.code === "unknown_model", `unknown: ${unknown.status} ${unknown.text}`);
+  const flag = await provisionPost(z, { modelPicker: true, model: "gpt-5.6-luna" });
+  must(flag.status === 422 && flag.body.error.param === "modelPicker", `modelPicker on POST: ${flag.status} ${flag.text}`);
+  await nothingMade(z, "modelPicker on POST");
+});
+
+await check("picker off, PUT …/model: another model is 403 and stores nothing; the default and null are taken; on, a pick is taken", async () => {
+  const w = await world({ picker: false });
+  const before = await w.rt.store.getModelBinding(T, A);
+  for (const model of ["gpt-5.6-luna", "deepseek-pro"]) {
+    const r = await putModel(w, model);
+    must(r.status === 403 && r.body.error.code === "model_picker_disabled" && r.body.error.param === "model", `${model}: ${r.status} ${r.text}`);
+  }
+  must(storedPick(w) === null && show(await w.rt.store.getModelBinding(T, A)) === show(before), "a refused PUT stored or bound");
+  for (const model of ["deepseek-flash", null]) {
+    const r = await putModel(w, model);
+    must(r.status === 200 && r.body.model === "deepseek-flash" && r.body.source === "default", `${show(model)}: ${r.status} ${r.text}`);
+    must(storedPick(w) === null, `${show(model)} stored a pick`);
+  }
+  must((await setPicker(w, true)).status === 200, "on");
+  const on = await putModel(w, "gpt-5.6-luna");
+  must(on.status === 200 && on.body.source === "chosen" && storedPick(w) === "gpt-5.6-luna", `on: ${on.status} ${on.text}`);
+});
+
+await check("grandfathered: an agent that picked while the picker was on keeps running its model once it is off, may repeat it or return to the default, and may not pick another", async () => {
+  const w = await world({ post: { model: "gpt-5.6-luna" } });
+  must((await setPicker(w, false)).status === 200, "off");
+  // Nothing migrated: the pick reads, binds and runs as before.
+  const g = await call(w, "GET", `agents/${A}/model`);
+  must(g.body.model === "gpt-5.6-luna" && g.body.source === "chosen", `after off: ${g.text}`);
+  const t = await turn(w, "still luna");
+  must(t.model === "openai/gpt-5.6-luna" && t.url.startsWith("https://gateway.ai.cloudflare.com"), `the request after off: ${t.model} at ${t.url}`);
+  // Another model: refused, the pick stays.
+  const other = await putModel(w, "deepseek-pro");
+  must(other.status === 403 && other.body.error.code === "model_picker_disabled" && storedPick(w) === "gpt-5.6-luna", `another: ${other.status} ${other.text}`);
+  // Its own pick again, and its create's replay: the same request, not a new choice.
+  must((await putModel(w, "gpt-5.6-luna")).status === 200 && storedPick(w) === "gpt-5.6-luna", "a repeat of its own pick");
+  must((await provisionPost(w, { model: "gpt-5.6-luna" })).status === 200, "the create's replay");
+  // Back to the default, which then is all it may have.
+  const back = await putModel(w, "deepseek-flash");
+  must(back.status === 200 && back.body.source === "default" && storedPick(w) === null, `back to default: ${back.status} ${back.text}`);
+  must((await putModel(w, "gpt-5.6-luna")).status === 403, "its old pick again after leaving it");
+});
+
+for (const scope of ["tenant", "agent"] as const) {
+  await check(`picker off: an operator's ${scope} row set through /admin/models still decides, and the agent runs on it (Luna); Raft's create naming the default is made, not 409`, async () => {
+    const w = await world({ picker: false, post: false });
+    const admin = await worker.fetch(new Request("https://x/admin/models", {
+      method: "PUT", headers: { "x-harness-token": AUTOMATION, "content-type": "application/json" },
+      body: JSON.stringify({ scope, tenantId: T, ...(scope === "agent" ? { agentId: A } : {}), provider: "cloudflare", model: "openai/gpt-5.6-luna" }),
+    }), w.env as never);
+    must(admin.status === 200, `admin PUT: ${admin.status} ${await admin.text()}`);
+    // The hosted create sends the default by name: with the picker off that is no pick, so the operator's row is not
+    // a lock it runs into.
+    const made = await provisionPost(w, { model: "deepseek-flash" });
+    must(made.status === 201, `create naming the default: ${made.status} ${made.text}`);
+    await w.rt.ready();
+    const g = await call(w, "GET", `agents/${A}/model`);
+    must(show(g.body) === show({ model: "gpt-5.6-luna", label: "GPT-5.6 Luna", source: "admin", locked: true }), `GET: ${g.text}`);
+    must(storedPick(w) === null, "a pick was stored");
+    const t = await turn(w, "on the operator's model");
+    must(t.model === "openai/gpt-5.6-luna" && t.url.startsWith("https://gateway.ai.cloudflare.com"), `the request: ${t.model} at ${t.url}`);
+    // A provider pick is still refused (the operator's row locks first, as with the picker on); the operator can still
+    // move the agent.
+    const pick = await putModel(w, "deepseek-pro");
+    must(pick.status === 409 && pick.body.error.code === "model_locked" && storedPick(w) === null, `a provider pick under the operator's row: ${pick.status} ${pick.text}`);
+    const again = await worker.fetch(new Request("https://x/admin/models", {
+      method: "PUT", headers: { "x-harness-token": AUTOMATION, "content-type": "application/json" },
+      body: JSON.stringify({ scope, tenantId: T, ...(scope === "agent" ? { agentId: A } : {}), provider: "deepseek", model: "deepseek-v4-pro" }),
+    }), w.env as never);
+    must(again.status === 200, `admin PUT again: ${again.status}`);
+    must((await call(w, "GET", `agents/${A}/model`)).body.model === "deepseek-pro", "the operator's second row did not decide");
   });
 }
 

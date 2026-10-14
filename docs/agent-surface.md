@@ -171,6 +171,7 @@ read of the tenant as a whole:
 | `GET` | `/provision/agents/{agentId}/workspace-files/read?path=` |
 | `GET` | `/provision/usage?from=&to=&bucket=day\|month` — the tenant's spend and daily limit ([below](#the-tenants-spend)) |
 | `PUT` | `/provision/servers/{raftServerId}/plan` — the server's plan, which picks its daily limit ([below](#the-servers-plan-plan)) |
+| `PUT` | `/provision/servers/{raftServerId}/model-picker` — whether the server's agents may pick another model than the default ([below](#the-servers-model-picker-model-picker)) |
 | `POST` | `/provision/agents/{agentId}/import` — the agent's workspace, once ([below](#workspace-import)) |
 | `GET` | `/provision/import-limits` — the bounds an import is held to ([below](#workspace-import)) |
 
@@ -203,7 +204,9 @@ pi-durable sends any prompt change; on `pi085` the prompt is rebuilt whole.
 **An agent's `model`** (`POST /provision/agents`, optional) creates it on a chosen model in the same call: an
 offered option's id ([below](#the-agents-model)), or `null` or absent for the default, which is the create as it
 was. A value neither a string nor `null` is `422 invalid`. On a first create, before anything is made, an id not
-offered is `422 unknown_model` and a model while an administrator's agent or tenant row applies is
+offered is `422 unknown_model`; while the server's model picker is off
+([below](#the-servers-model-picker-model-picker)) any model but the default is `403 model_picker_disabled`, and the
+default is taken without storing a pick; otherwise a model while an administrator's agent or tenant row applies is
 `409 model_locked` (all with `param: "model"`) — the agent is not made and its Raft id is not taken, so the same
 POST without `model` is then a first create (`201`). A deployment that offers no options takes only `null`. The
 answer's body is the same as without it; `GET …/model` reads the pick as `source: "chosen"`.
@@ -233,7 +236,7 @@ the evaluation set; authentication and tenant as above (`?raftServerId=` for a p
 ```json
 GET /provision/models
 { "models": [{ "id": "deepseek-flash", "label": "DeepSeek Flash", "provider": "deepseek" }],
-  "default": "deepseek-flash", "defaultLabel": "DeepSeek Flash", "locked": false }
+  "default": "deepseek-flash", "defaultLabel": "DeepSeek Flash", "locked": false, "pickerEnabled": false }
 
 GET or PUT /provision/agents/{agentId}/model
 { "model": "deepseek-flash", "label": "DeepSeek Flash", "source": "default", "locked": false }
@@ -269,8 +272,48 @@ GET or PUT /provision/agents/{agentId}/model
   finishes. The row records whether the create's pick is settled yet (`model_pending`; a `PUT` settles it
   too), so once it is, no replay writes it again. Settling makes the stored pick the create's, `null`
   included: a reopened create without `model` removes one an earlier attempt stored.
+- **Off by default.** A server may pick a model other than the deployment's default only once Raft has turned its
+  model picker on ([below](#the-servers-model-picker-model-picker)); until then a `PUT` of another model is `403`.
+  `GET /provision/models` says which as `pickerEnabled`.
 - **An agent never given a pick** is unchanged by these routes: reading them stores nothing and rebuilds
   nothing, and it runs on the default as before (`test/provision-model.ts`).
+
+#### The server's model picker (`model-picker`)
+
+Which model a Raft server's agents run is the deployment's to decide unless Raft has allowed the server to choose
+(Raft's `antiproton_model_picker` flag). Raft says so per server, as it says the plan:
+
+```
+PUT /provision/servers/{raftServerId}/model-picker
+{ "enabled": true }
+→ 200 { "raftServerId": "srv-1", "modelPicker": true, "updatedAt": "2026-10-14T09:12:00.000Z" }
+```
+
+- **Default: off.** A server Raft has never sent this for is off. Raft sends it whenever its flag for the server
+  changes, and once for each server that already has the flag on; the latest write wins.
+- **Tenant and auth.** Exactly as the plan's ([above](#the-servers-plan-plan)): a platform token's tenant is the one
+  `{raftServerId}` names; a tenant-scoped token may only name a server its tenant's agents were provisioned for, else
+  `403 server_mismatch` (`param: "raftServerId"`) and nothing is written; a malformed `{raftServerId}` is `422`.
+- **Body.** Exactly `{ "enabled": true | false }`: missing is `422 missing`, a non-boolean `422 invalid` (both
+  `param: "enabled"`), any other field `422` naming it. Nothing is written when it is refused. It is not accepted on
+  `POST /provision/agents`: `modelPicker` there is `422 invalid`, `param: "modelPicker"`, and nothing is made — a
+  create retried late must not turn back a switch flipped since, and a field silently ignored would read as allowed.
+- **While off**, for the provider routes only:
+  - `POST /provision/agents` with `model` other than the default is `403`, `code: "model_picker_disabled"`,
+    `param: "model"`, and nothing is made. `model` absent, `null`, or the default's id (`deepseek-flash`, the
+    option naming `HARNESS_MODEL`) is made; the default by name is stored as **no pick**, so the agent follows the
+    default and any operator row, exactly as one created without `model` — and is therefore never `409 model_locked`.
+  - `PUT …/model` with another model than the default is `403 model_picker_disabled` and stores nothing. `null` and
+    the default's id are taken, both as "follow the default" (the pick is removed), so an agent can always return to
+    the default; an administrator's agent or tenant row still answers `409 model_locked` first, as with the picker on.
+  - An id not offered is still `422 unknown_model`.
+- **Grandfathered.** Turning the picker off migrates nothing: an agent that picked a model while it was on keeps
+  that pick and keeps running on it. It may `PUT` the same pick again (a repeat, not a choice) and its create's replay
+  answers as before; it may return to the default; it may not pick another model, nor its old one once it has left it.
+- **Operators are not gated.** The administrator's rows (`/admin/models`, deployment, tenant or agent scope) decide
+  as before, above any pick, whatever the switch: the way the operator sets which model a server or an agent runs.
+- `GET /provision/models` answers `pickerEnabled` (`false` while off) and still lists every offered option, so a
+  reader written before the switch keeps working; Raft hides its picker when it is off.
 
 ### The tenant's spend
 
