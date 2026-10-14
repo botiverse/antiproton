@@ -805,6 +805,56 @@ for (const scope of ["tenant", "agent"] as const) {
   });
 }
 
+await check("picker off: the id the routes report as the default is taken as no pick even when an operator's row makes it another model; the 403 names the accepted ids", async () => {
+  // An operator's deployment row moves everyone's default to Luna: GET /models reports it, and echoing it back is taken.
+  const w = await world({ picker: false, post: false });
+  await d1ModelOverrides(w.DB).put({ tenantId: "", agentId: "", provider: "cloudflare", model: "openai/gpt-5.6-luna", setBy: "adm", setAt: 1 });
+  const list = await call(w, "GET", "models");
+  must(list.body.default === "gpt-5.6-luna" && list.body.pickerEnabled === false, `list: ${list.text}`);
+  const made = await provisionPost(w, { model: list.body.default });
+  must(made.status === 201 && storedPick(w) === null, `create echoing default: ${made.status} ${made.text}`);
+  await w.rt.ready();
+  must((await call(w, "GET", `agents/${A}/model`)).body.model === "gpt-5.6-luna", "not on the operator's default");
+  for (const model of ["gpt-5.6-luna", "deepseek-flash"]) {
+    const r = await putModel(w, model);
+    must(r.status === 200 && r.body.model === "gpt-5.6-luna" && r.body.source === "admin" && storedPick(w) === null, `PUT ${model}: ${r.status} ${r.text}`);
+  }
+  const no = await putModel(w, "deepseek-pro");
+  must(no.status === 403 && no.body.error.code === "model_picker_disabled" && no.body.error.message.includes('"deepseek-flash"') && no.body.error.message.includes('"gpt-5.6-luna"'),
+    `refusal names the accepted ids: ${no.text}`);
+  // An operator's tenant row: the create echoing its model is made, not 409 model_locked.
+  const t = await world({ picker: false, post: false });
+  await d1ModelOverrides(t.DB).put({ tenantId: T, agentId: "", provider: "cloudflare", model: "openai/gpt-5.6-luna", setBy: "adm", setAt: 1 });
+  const echoed = await provisionPost(t, { model: (await call(t, "GET", "models")).body.default });
+  must(echoed.status === 201 && storedPick(t) === null, `tenant row, create echoing default: ${echoed.status} ${echoed.text}`);
+});
+
+await check("picker off: an agent that chose the default's id by name keeps that choice when it PUTs it again (not reset to none under an operator's deployment row)", async () => {
+  const w = await world({ post: { model: "deepseek-flash" } });
+  must(storedPick(w) === "deepseek-flash", "the create's pick of the default was not stored with the picker on");
+  await d1ModelOverrides(w.DB).put({ tenantId: "", agentId: "", provider: "cloudflare", model: "openai/gpt-5.6-luna", setBy: "adm", setAt: 1 });
+  must((await setPicker(w, false)).status === 200, "off");
+  const g = await call(w, "GET", `agents/${A}/model`);
+  must(g.body.model === "deepseek-flash" && g.body.source === "chosen", `before: ${g.text}`);
+  const before = await w.rt.store.getModelBinding(T, A);
+  const r = await putModel(w, "deepseek-flash");
+  must(r.status === 200 && r.body.model === "deepseek-flash" && r.body.source === "chosen" && storedPick(w) === "deepseek-flash", `repeat: ${r.status} ${r.text}`);
+  must(show(await w.rt.store.getModelBinding(T, A)) === show(before), `the binding moved: ${show(await w.rt.store.getModelBinding(T, A))}`);
+  const t = await turn(w, "still flash");
+  must(t.model === "deepseek-flash", `the request after the repeat: ${t.model}`);
+});
+
+await check("picker off: a create interrupted while it was on finishes on its replay with the model it asked for; another model is still 403", async () => {
+  const w = await world();
+  interrupted(w, "gpt-5.6-luna");
+  must((await setPicker(w, false)).status === 200, "off");
+  const other = await provisionPost(w, { model: "deepseek-pro" });
+  must(other.status === 403 && other.body.error.code === "model_picker_disabled", `another model on the reopen: ${other.status} ${other.text}`);
+  const r = await provisionPost(w, { model: "gpt-5.6-luna" });
+  must(r.status === 201 && storedPick(w) === "gpt-5.6-luna", `replay: ${r.status} ${r.text}`);
+  must((await w.rt.store.getModelBinding(T, A))?.model === "openai/gpt-5.6-luna", "the replay did not bind it");
+});
+
 await check("harnessKey: moves with the persona and the binding, and only with them", () => {
   const b = { provider: "openai-compatible", model: "deepseek-flash", baseUrl: "https://api.deepseek.com", secretRef: "operator:model" };
   const k = harnessKey("cat", { name: "n", description: "d" }, b);

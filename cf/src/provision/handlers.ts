@@ -37,7 +37,7 @@ import {
 import { STATE_KEY } from "../../../src/plugins/state-key.ts";
 import type { FreshContextResult, RestartResult } from "../runtime.ts";
 import { canonicalToolConfig, type ToolConfig } from "../../../src/core/tool-config.ts";
-import type { ModelChoices, TenantModelPicker } from "../control-plane.ts";
+import type { ModelChoices, ModelLayers, TenantModelPicker } from "../control-plane.ts";
 import { choiceOf, resolveModel } from "../model-request.ts";
 import { optionFor, type UserModels } from "../../../src/model/user-models.ts";
 import type { ModelChoice } from "../../../src/model/providers.ts";
@@ -556,7 +556,8 @@ export async function handleProvision(
       // Once the pick is stored (`modelPending` cleared) a replay never writes it again, so a delayed retry cannot undo a
       // PUT …/model, null included, that landed after it.
       if (reopen) {
-        const pick = model === null ? { pick: null } : await createPick(deps.models, tenantId, agentId, model);
+        // The model the interrupted create asked for was let through then: repeating it is not a new choice.
+        const pick = model === null ? { pick: null } : await createPick(deps.models, tenantId, agentId, model, row.model ?? null);
         if (isFail(pick)) return fail(pick);
         if ((row.model ?? null) !== model) { await deps.registry.update(tenantId, raftAgentId, { model }); row = { ...row, model }; }
         row = await settlePick(deps, row, pick.pick, headers.credentialId ?? null);
@@ -1116,16 +1117,22 @@ async function modelRoute(
   const locked = await lockedProblem(m, tenantId, agentId);
   if (locked) return fail(locked);
   let pick = asked;
-  if (asked !== null) {
-    const unknownModel = notOffered(m.userModels, asked);
-    if (unknownModel) return fail(unknownModel);
-    if (!(await m.picker.enabled(tenantId))) {
-      // The default is always taken, as following the default (null): a stored pick of it would outrank an operator's
-      // deployment row. The pick the agent already has is taken too, a repeat that changes nothing: an agent that chose
-      // while the picker was on keeps its model, and a retried PUT of it is not a new choice.
-      if (asked === defaultOption(m)) pick = null;
-      else if (asked !== (await m.choices.layers(tenantId, agentId)).owner) return fail(pickerProblem(asked));
+  if (asked !== null && !(await m.picker.enabled(tenantId))) {
+    const layers = await m.choices.layers(tenantId, agentId);
+    // The pick the agent already has is asked first, and taken as it is: an agent that chose while the picker was on
+    // keeps its model, a retried PUT of it is not a new choice, and — even when that pick is the default's id — a
+    // repeat must not turn a stored choice into none, which would hand the agent to an operator's deployment row.
+    if (asked !== layers.owner) {
+      // Otherwise the default is taken, as following the default (null): a stored pick of it would outrank an operator's
+      // deployment row. Anything else is refused.
+      const ids = defaultIds(m, layers);
+      if (ids.includes(asked)) pick = null;
+      else return fail(notOffered(m.userModels, asked) ?? pickerProblem(asked, ids));
     }
+  }
+  if (pick !== null) {
+    const unknownModel = notOffered(m.userModels, pick);
+    if (unknownModel) return fail(unknownModel);
   }
   // The owner has chosen, so an interrupted create's pick is settled: its delayed replay must not store the create's
   // model over this one (`settlePick`). Cleared first: a PUT that fails after it is retried, and the replay then stores
@@ -1155,9 +1162,21 @@ function defaultOption(m: ProvisionModels): string | null {
  * here makes it acceptable, only the server's switch (`PUT /servers/:raftServerId/model-picker`). An operator's rows
  * (model_overrides, /admin/models) are not provider picks and are never refused by it.
  */
-function pickerProblem(asked: string): Fail {
+function pickerProblem(asked: string, accepted: string[]): Fail {
+  const ids = accepted.map((id) => JSON.stringify(id)).join(" or ");
   return { status: 403, code: "model_picker_disabled", param: "model",
-    message: `choosing a model is not enabled for this Raft server, so ${JSON.stringify(asked.slice(0, 64))} cannot be picked; omit model, or send null or the default, and the deployment's model runs` };
+    message: `choosing a model is not enabled for this Raft server, so ${JSON.stringify(asked.slice(0, 64))} cannot be picked; omit model, or send null${ids ? ` or ${ids}` : ""}, and the default runs` };
+}
+
+/**
+ * The ids taken as "follow the default" while the picker is off: the option naming HARNESS_MODEL, and the id the routes
+ * report as what the default is for this agent now (`default` of GET /provision/models, `model` of GET …/model before a
+ * pick) — which an operator's deployment, tenant or agent row may make another model, so a client echoing it back is
+ * not refused. Taken as no pick, so the operator's rows go on deciding.
+ */
+function defaultIds(m: ProvisionModels, layers: ModelLayers): string[] {
+  const now = modelView(resolveModel({ ...layers, owner: null }, m.userModels, m.defaultModel).choice, m.userModels).model;
+  return [...new Set([defaultOption(m), now].filter((id): id is string => id !== null))];
 }
 
 /** An admin's agent or tenant row decides this agent's model, so a pick would be stored and never run. */
@@ -1191,17 +1210,23 @@ function createModelField(body: unknown): string | null | Fail {
 
 /**
  * Whether a first create may be made on `model`, and the pick it stores: offered here now; while the tenant's picker is
- * off, only the default, stored as no pick at all (so an admin's rows decide, and no lock refuses it — hosted agents
- * send the default by name); otherwise no admin's agent or tenant row deciding the agent's model. A deployment without
+ * off, only a default's id (`defaultIds`), stored as no pick at all (so an admin's rows decide, and no lock refuses it —
+ * hosted agents send the default by name); otherwise no admin's agent or tenant row deciding the agent's model. A deployment without
  * the model routes offers nothing, so any id is unknown there — refused, never ignored, since an agent quietly made on
  * the default would run on a model nobody chose.
  */
-async function createPick(m: ProvisionModels | undefined, tenantId: string, agentId: string, model: string): Promise<{ pick: string | null } | Fail> {
+async function createPick(
+  m: ProvisionModels | undefined, tenantId: string, agentId: string, model: string, kept: string | null = null,
+): Promise<{ pick: string | null } | Fail> {
   if (!m) return { status: 422, code: "unknown_model", param: "model", message: "this deployment offers no choice of model; omit model, or send null, for the default" };
-  const unknownModel = notOffered(m.userModels, model);
-  if (unknownModel) return unknownModel;
-  if (!(await m.picker.enabled(tenantId))) return model === defaultOption(m) ? { pick: null } : pickerProblem(model);
-  return await lockedProblem(m, tenantId, agentId) ?? { pick: model };
+  // `kept`: the model a create already asked for and was let through on (a reopened create, below). Its replay repeats a
+  // choice made while it was allowed, as a grandfathered agent's PUT of its own pick does, so the switch does not apply.
+  if (model !== kept && !(await m.picker.enabled(tenantId))) {
+    const ids = defaultIds(m, await m.choices.layers(tenantId, agentId));
+    if (ids.includes(model)) return { pick: null };
+    return notOffered(m.userModels, model) ?? pickerProblem(model, ids);
+  }
+  return notOffered(m.userModels, model) ?? await lockedProblem(m, tenantId, agentId) ?? { pick: model };
 }
 
 /**

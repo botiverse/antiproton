@@ -290,7 +290,12 @@ PUT /provision/servers/{raftServerId}/model-picker
 ```
 
 - **Default: off.** A server Raft has never sent this for is off. Raft sends it whenever its flag for the server
-  changes, and once for each server that already has the flag on; the latest write wins.
+  changes; the latest write wins.
+- **Rollout order.** When this route is first deployed, **every server is off**, including servers whose Raft flag
+  is already on, until Raft sends `{ "enabled": true }` for each of them. So Raft backfills the switch for every
+  server with the flag on, either before it shows those servers a picker or straight after the deploy. Until then,
+  their picks of another model are `403 model_picker_disabled`. Agents that already picked keep their model
+  (grandfathered, below).
 - **Tenant and auth.** Exactly as the plan's ([above](#the-servers-plan-plan)): a platform token's tenant is the one
   `{raftServerId}` names; a tenant-scoped token may only name a server its tenant's agents were provisioned for, else
   `403 server_mismatch` (`param: "raftServerId"`) and nothing is written; a malformed `{raftServerId}` is `422`.
@@ -299,17 +304,25 @@ PUT /provision/servers/{raftServerId}/model-picker
   `POST /provision/agents`: `modelPicker` there is `422 invalid`, `param: "modelPicker"`, and nothing is made — a
   create retried late must not turn back a switch flipped since, and a field silently ignored would read as allowed.
 - **While off**, for the provider routes only:
-  - `POST /provision/agents` with `model` other than the default is `403`, `code: "model_picker_disabled"`,
-    `param: "model"`, and nothing is made. `model` absent, `null`, or the default's id (`deepseek-flash`, the
-    option naming `HARNESS_MODEL`) is made; the default by name is stored as **no pick**, so the agent follows the
-    default and any operator row, exactly as one created without `model` — and is therefore never `409 model_locked`.
-  - `PUT …/model` with another model than the default is `403 model_picker_disabled` and stores nothing. `null` and
-    the default's id are taken, both as "follow the default" (the pick is removed), so an agent can always return to
-    the default; an administrator's agent or tenant row still answers `409 model_locked` first, as with the picker on.
-  - An id not offered is still `422 unknown_model`.
+  - **The accepted ids** are a default's: the option naming `HARNESS_MODEL` (`deepseek-flash`), and the id these
+    routes report as the default for the agent now — `default` of `GET /provision/models`, `model` of `GET …/model`
+    before a pick. An operator's deployment, tenant or agent row may make that second id another model (e.g.
+    `gpt-5.6-luna`), so a client echoing back what it was told is not refused. Either id is taken as **no pick**: the
+    agent follows the default and any operator row, exactly as one created without `model`.
+  - `POST /provision/agents` with `model` absent, `null` or an accepted id is made, and so is never `409
+    model_locked`. Any other model is `403`, `code: "model_picker_disabled"`, `param: "model"`, with the accepted ids
+    in the message, and nothing is made.
+  - `PUT …/model` with `null` or an accepted id is taken as "follow the default" (the pick is removed), so an agent
+    can always return to the default. Any other model is `403 model_picker_disabled` and stores nothing. An
+    administrator's agent or tenant row still answers `409 model_locked` first, as with the picker on.
+  - An id that is neither offered nor accepted is still `422 unknown_model`.
 - **Grandfathered.** Turning the picker off migrates nothing: an agent that picked a model while it was on keeps
-  that pick and keeps running on it. It may `PUT` the same pick again (a repeat, not a choice) and its create's replay
-  answers as before; it may return to the default; it may not pick another model, nor its old one once it has left it.
+  that pick and keeps running on it.
+  - It may `PUT` the same pick again. That is a repeat, checked before the accepted-ids rule, so a stored pick of
+    `deepseek-flash` stays a pick and keeps outranking an operator's deployment row.
+  - Its create's replay answers as before. A create interrupted before its pick was stored (still `provisioning`)
+    finishes on its replay with the model it asked for.
+  - It may return to the default (`null`), but may not pick another model, nor its old one once it has left it.
 - **Operators are not gated.** The administrator's rows (`/admin/models`, deployment, tenant or agent scope) decide
   as before, above any pick, whatever the switch: the way the operator sets which model a server or an agent runs.
 - `GET /provision/models` answers `pickerEnabled` (`false` while off) and still lists every offered option, so a
