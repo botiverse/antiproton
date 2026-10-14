@@ -606,9 +606,11 @@ await check("awaitImport: a push before the import is accepted and queued and st
   must(req.includes("PUSHED-BEFORE-IMPORT") && req.includes("IMPORTED-PERSONA-77"), `the first turn: push ${req.includes("PUSHED-BEFORE-IMPORT")} persona ${req.includes("IMPORTED-PERSONA-77")}`);
   // The imported files reach the model in the first request: MEMORY.md's text, the other paths by name, under the
   // import's own heading and never the seeded block's (src/plugins/state.ts `importedFilesParts`).
-  for (const want of ["IMPORTED-MEMORY-41", "notes/carried-plan.md", "notes/2026/people.md", "brought from your previous workspace"]) {
+  for (const want of ["IMPORTED-MEMORY-41", "notes/carried-plan.md", "notes/2026/people.md", "# Files that were in your workspace when you were created"]) {
     must(req.includes(want), `the first request does not carry ${want}`);
   }
+  // Neutral: an import is also how a hosted agent gets its first files, which came from no earlier workspace.
+  must(!req.includes("previous workspace"), "the import was worded as a migration");
   must(!req.includes("provided at setup") && !req.includes("Workspace files provided"), "the import was shown as seeded files");
   const rows = holdRows(w);
   must(rows.length === 1 && rows[0].status === "import" && rows[0].verdict === "ok", `trace: ${show(rows)}`);

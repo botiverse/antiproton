@@ -846,8 +846,9 @@ export const IMPORTED_PATHS_SHOWN = 40;
  * named from the import's manifest, without sizes: reading each row to size it would cost a read per path on every
  * open, and a path the agent removed since is answered as missing by `get`, which the heading says may happen.
  *
- * Worded "brought from your previous workspace", never "written by you", which heads the working set, nor "provided
- * at setup", which heads the seeded block: the evaluation's record counts seeded paths by the lines `seedLine`
+ * Worded "in your workspace when you were created", true both of a migrating agent's workspace and of the first
+ * files a hosted agent is given, which came from no earlier workspace. Never "written by you", which heads the
+ * working set, nor "provided at setup", which heads the seeded block: the evaluation's record counts seeded paths by the lines `seedLine`
  * writes (cf/src/fresh-context.ts `seededPathsListed`), and no line here has that shape. In the parts the file is
  * `by: "setup"`, the one kind whose text a change notice shows fenced and under its own label rather than as the
  * agent's (src/runtime/prompt-context.ts).
@@ -867,8 +868,8 @@ export async function importedFilesParts(
   // A path the key rule refuses never reached a row (the import route checks it), and is never operator text in the prompt.
   const shown = files.filter((f) => STATE_KEY.test(f.path)).map((f) => f.path);
   const parts: string[] = [
-    "# Files brought from your previous workspace\n" +
-    "These files were brought from your previous workspace when you moved here, before your first task here. Each " +
+    "# Files that were in your workspace when you were created\n" +
+    "These files were in your workspace when you were created, before your first task here. Each " +
     "is a key in your state store, named by its path; you may have changed or removed some since. " +
     (getTool ? `Open one with ${getTool}, its path as the \`key\`.` : "You have no tool mounted for opening them."),
   ];
@@ -881,10 +882,10 @@ export async function importedFilesParts(
         ? "It is too large to show here and is kept in object storage; " +
           (getTool ? `read it with ${getTool}.` : "you have no tool mounted for reading it.")
         : "Its current content is the text inside the fence below:\n\n" + fencedMemory(got.value, getTool);
-    parts.push(`## \`${SEEDED_MEMORY}\`, brought from your previous workspace\n${body}`);
+    parts.push(`## \`${SEEDED_MEMORY}\`, in your workspace when you were created\n${body}`);
   }
   const memoryPart: PromptPart[] = memory
-    ? [{ key: `import:${SEEDED_MEMORY}`, label: `\`${SEEDED_MEMORY}\`, brought from your previous workspace`, text: parts[parts.length - 1]!, by: "setup" }]
+    ? [{ key: `import:${SEEDED_MEMORY}`, label: `\`${SEEDED_MEMORY}\`, in your workspace when you were created`, text: parts[parts.length - 1]!, by: "setup" }]
     : [];
   const others = shown.filter((p) => p !== SEEDED_MEMORY);
   const lines = others.slice(0, IMPORTED_PATHS_SHOWN).map((p) => `- \`${p}\``);
@@ -896,6 +897,6 @@ export async function importedFilesParts(
   const rest = [parts[0]!, ...(lines.length ? [parts[parts.length - 1]!] : [])].join("\n\n");
   return {
     text: "\n\n" + parts.join("\n\n"),
-    parts: [{ key: "imports", label: "Files brought from your previous workspace", text: rest, by: "plugin" }, ...memoryPart],
+    parts: [{ key: "imports", label: "Files that were in your workspace when you were created", text: rest, by: "plugin" }, ...memoryPart],
   };
 }

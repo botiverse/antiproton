@@ -371,7 +371,7 @@ and `state/{path}` in the workspace reads above — so it reads back through
 imported file is the agent's own: it may change or remove it.
 
 **What the agent is shown.** From its first turn the agent's system prompt carries a block headed "Files
-brought from your previous workspace": `MEMORY.md`'s current text (what its `get` answers now, not the copy
+that were in your workspace when you were created": `MEMORY.md`'s current text (what its `get` answers now, not the copy
 imported) fenced, up to 4,000 characters with a line saying where the rest is, or a note that it is kept in
 object storage or was removed; then up to 40 of the other imported paths by name, with the count of the rest;
 and the state mount's `get` to open them (`importedFilesParts`, `src/plugins/state.ts`).
