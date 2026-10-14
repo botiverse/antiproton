@@ -3,7 +3,7 @@
  * its own trace rows: which rows mean which status, starts dated back by the
  * span's measured time, and only transitions sent.
  */
-import { statusEvents } from "../src/runtime/status.ts";
+import { PROVISION_TASK, statusEvents } from "../src/runtime/status.ts";
 import type { TraceOutboxRow } from "../src/trace/outbox.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
@@ -50,6 +50,13 @@ check("event ids are unique per row and per start, so a resend is deduped and ne
   const evs = statusEvents("a", [row(7, 1_000, "model.call", "toolUse", 500), row(8, 2_000, "model.call", "stop", 500)]);
   const ids = evs.map((e) => e.eventId);
   must(new Set(ids).size === ids.length && ids.every((id) => id.startsWith("a:")), JSON.stringify(ids));
+});
+
+check("a tool call the provider ran is no status of the agent's; the agent's own is working; agent.ready is online", () => {
+  const call = (task: string) => ({ ...row(1, 1_000, "tool.call", "succeeded", 400), attrs: { tool: "enable_push", mount: "raft", task } }) as TraceOutboxRow;
+  must(statusEvents("a", [call(PROVISION_TASK)]).length === 0, seq(statusEvents("a", [call(PROVISION_TASK)])));
+  must(seq(statusEvents("a", [call("main")])) === "working@600", seq(statusEvents("a", [call("main")])));
+  must(seq(statusEvents("a", [call(PROVISION_TASK), row(2, 2_000, "agent.ready", "ready")])) === "online@2000", "ready");
 });
 
 for (const r of results) {

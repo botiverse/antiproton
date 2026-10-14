@@ -346,7 +346,8 @@ import { artifactsPlugin, PARK_BYTES, READ_WHOLE_MAX } from "../../src/plugins/a
 import { createRaftPlugin } from "../../src/plugins/raft.ts";
 import { mcpPlugin } from "../../src/plugins/mcp.ts";
 import { createReminderPlugin } from "../../src/plugins/reminder.ts";
-import { PROVISION_MOUNT_ALIAS, PROVISIONED_BY } from "./provision/steps.ts";
+import { PROVISION_MOUNT_ALIAS, PROVISIONED_BY, provisionPushStatus } from "./provision/steps.ts";
+import { markReady } from "../../src/runtime/ready.ts";
 import { toAgentRef } from "../../src/store/refs.ts";
 import { attachViewImage, splitView, withView, type ViewMarker } from "../../src/runtime/tool-view.ts";
 import { acceptsImages } from "../../src/model/context-windows.ts";
@@ -3449,6 +3450,7 @@ export class AgentRuntime {
         return c;
       });
       if (!r.ok || !r.created) await drop();
+      else if (r.lifted) await this.#readyAfterLift(tenantId, agentId);
       return r;
     } catch (e) {
       await drop();
@@ -3460,13 +3462,33 @@ export class AgentRuntime {
   async importInstructionsApplied(tenantId: string, agentId: string, migrationId: string): Promise<ImportHold | null> {
     await this.ready();
     const sql = this.#deps.ctx.storage.sql;
-    return this.#transact()(() => {
+    const lifted = this.#transact()(() => {
       const lifted = markInstructionsApplied(sql, tenantId, agentId, migrationId, Date.now());
       if (lifted) holdEnded(sql, tenantId, agentId, lifted);
       const rec = readImport(sql, tenantId, agentId)?.record;
       if (rec && rec.migrationId === migrationId && rec.instructions === "applied") queuePrewarm(sql, tenantId, agentId, migrationId, Date.now());
       return lifted;
     });
+    if (lifted) await this.#readyAfterLift(tenantId, agentId);
+    return lifted;
+  }
+
+  /** The import lifted the hold: a provisioned agent whose push is on is ready now. Never fails the import that lifted it. */
+  async #readyAfterLift(tenantId: string, agentId: string): Promise<void> {
+    try { await this.provisionedReady(tenantId, agentId, "the workspace import landed"); }
+    catch (e) { logEvent("provision.ready_failed", { tenantId, agentId, error: String((e as Error)?.message ?? e).slice(0, 200) }); }
+  }
+
+  /**
+   * Say a provisioned agent is ready (src/runtime/ready.ts): its `online`, once, while push is on and before any
+   * turn. Asked when enable_push succeeds (cf/src/provision/steps.ts `provisionTool`) and when an import lifts the
+   * hold; the second of the two to find the agent ready writes it. Whether it was written.
+   */
+  async provisionedReady(tenantId: string, agentId: string, reason: string): Promise<boolean> {
+    await this.ready();
+    if (!(await provisionPushStatus(this, tenantId, agentId))?.enabled) return false;
+    const sql = this.#deps.ctx.storage.sql;
+    return this.#transact()(() => markReady(sql, tenantId, agentId, reason, Date.now()));
   }
 
   // ---- the prompt-cache prewarm after an import (src/runtime/prewarm.ts) ------------------------------------------

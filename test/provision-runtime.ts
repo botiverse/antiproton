@@ -11,6 +11,11 @@ import { toolsOf } from "../src/plugins/types.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 import type { HookRow } from "../cf/src/control-plane.ts";
 import { operatorModelOf } from "../cf/src/model-request.ts";
+import { flushActivity } from "../cf/src/activity-raft.ts";
+import { pendingTrace } from "../src/trace/outbox.ts";
+import { markStarted } from "../src/store/workspace-import.ts";
+import { sha256Hex } from "../src/store/seed-files.ts";
+import type { ActivityEvent } from "../src/plugins/types.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void>) {
@@ -317,6 +322,60 @@ await check("a held connection becomes the GitHub mount's credential once, only 
     must(!(await rt.confirmConnection("t", "raft_c1", "github", "pend_cccccccc", "u_owner")).ok, "an expired hold was confirmed");
     must((await rt.store.listSecretNames("t", "raft_c1", "pending:")).length === 0, "held rows were left behind");
   } finally { globalThis.fetch = real; }
+  host.dispose();
+});
+
+// ---- ready: the provisioned agent's own `online` before its first turn (src/runtime/ready.ts) --------------------
+
+/** What the activity drain (cf/src/activity-raft.ts) sends for the agent's outbox, through a gateway that records it. */
+async function drained(host: ReturnType<typeof sqliteHost>, agentId: string) {
+  const sent: ActivityEvent[] = [];
+  await flushActivity({ async reportActivity(_t, _a, events) { sent.push(...events); return [{ alias: "raft", sent: events.length }]; } },
+    host.sql as any, "t", agentId);
+  return sent;
+}
+const readyRows = (host: ReturnType<typeof sqliteHost>) => pendingTrace(host.sql as any, 0).rows.filter((r) => r.kind === "agent.ready");
+
+await check("ready: a provisioned agent says online once enable_push succeeds, and the provider's call is not reported as the agent working", async () => {
+  const { rt, host } = await runtime();
+  raft();
+  must((await adoptProvisionedAgent(rt, "t", "raft_r1", SPEC)).ok, "adopt");
+  must((await rt.attachCredential("t", "raft_r1", PROVISION_MOUNT_ALIAS, { token: CRED })).ok, "credential");
+  must((await provisionTool(rt, "t", "raft_r1", "enable_push")).ok, "enable_push");
+  const sent = await drained(host, "raft_r1");
+  must(sent.length === 1 && sent[0]!.status === "online" && sent[0]!.hookEventName === undefined, JSON.stringify(sent));
+  must(pendingTrace(host.sql as any, 0).rows.some((r) => r.kind === "tool.call" && r.attrs.task === "provision"), "no provider tool.call row: the case did not run");
+  // Once per agent: push enabled again (a new credential re-registers it) says nothing new.
+  must((await provisionTool(rt, "t", "raft_r1", "enable_push")).ok, "enable_push again");
+  must(readyRows(host).length === 1 && (await drained(host, "raft_r1")).length === 0, `ready twice: ${JSON.stringify(readyRows(host))}`);
+  host.dispose();
+});
+
+await check("ready: not once a turn has started, whose own statuses say what the agent is", async () => {
+  const { rt, host } = await runtime();
+  raft();
+  must((await adoptProvisionedAgent(rt, "t", "raft_r2", SPEC)).ok, "adopt");
+  must((await rt.attachCredential("t", "raft_r2", PROVISION_MOUNT_ALIAS, { token: CRED })).ok, "credential");
+  markStarted(host.sql as any, "t", "raft_r2", Date.now());
+  must((await provisionTool(rt, "t", "raft_r2", "enable_push")).ok, "enable_push");
+  must(readyRows(host).length === 0, `ready after a turn: ${JSON.stringify(readyRows(host))}`);
+  must((await drained(host, "raft_r2")).every((e) => e.status !== "online" && e.status !== "working"), "a status was sent");
+  host.dispose();
+});
+
+await check("ready: an agent made with awaitImport says online when its import lands, not when push is enabled", async () => {
+  const { rt, host } = await runtime();
+  raft();
+  must((await adoptProvisionedAgent(rt, "t", "raft_r3", { ...SPEC, awaitImport: true })).ok, "adopt");
+  must((await rt.attachCredential("t", "raft_r3", PROVISION_MOUNT_ALIAS, { token: CRED })).ok, "credential");
+  must((await provisionTool(rt, "t", "raft_r3", "enable_push")).ok, "enable_push");
+  must(readyRows(host).length === 0 && (await drained(host, "raft_r3")).length === 0, `ready while held: ${JSON.stringify(readyRows(host))}`);
+  const text = "notes";
+  const r = await rt.importWorkspace("t", "raft_r3", { migrationId: "m1", digest: "d1", instructions: false,
+    files: [{ path: "a.md", text, bytes: text.length, sha256: await sha256Hex(text) }] });
+  must(r.ok && "lifted" in r && r.lifted, `import: ${JSON.stringify(r)}`);
+  const sent = await drained(host, "raft_r3");
+  must(sent.length === 1 && sent[0]!.status === "online" && readyRows(host)[0]?.attrs.reason === "the workspace import landed", JSON.stringify(sent));
   host.dispose();
 });
 

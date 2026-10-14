@@ -12,12 +12,13 @@
  * back on the model's final answer:
  *
  *   inbound, delivered      → UserPromptSubmit   (a message entered the model)
- *   tool.call               → PreToolUse + PostToolUse / PostToolUseFailure
+ *   tool.call               → PreToolUse + PostToolUse / PostToolUseFailure  (not one the provider ran: `operatorCall`)
  *   model.call stop|length  → Stop                (the turn is answered)
  *   model.call aborted      → Stop                (cancelled: no longer working)
  *   model.call error        → BridgeFatal         (the turn died; a daily spend limit's refusal says so and why)
  *   model.call toolUse      → nothing             (still working)
  *   session.needs_reset set → BridgeFatal         (the overflow backstop gave up: pushes are refused until a reset)
+ *   agent.ready             → nothing             (its `online` is a status-only event, src/runtime/status.ts)
  *
  * The event id is the row's seq under the agent: unique for the agent's
  * lifetime because seq is AUTOINCREMENT and never reused, so a batch sent
@@ -27,7 +28,7 @@
  */
 import type { TraceOutboxRow } from "../trace/outbox.ts";
 import type { ActivityEvent } from "../plugins/types.ts";
-import { statusEvents } from "./status.ts";
+import { operatorCall, statusEvents } from "./status.ts";
 
 export const ACTIVITY_SCHEMA = "raft-agent-activity-ingest.v1";
 /**
@@ -96,6 +97,7 @@ function hookEvents(agentId: string, rows: readonly TraceOutboxRow[]): ActivityE
         if (row.status === "delivered") out.push({ ...base, hookEventName: "UserPromptSubmit" });
         break;
       case "tool.call": {
+        if (operatorCall(row)) break;
         const tool = typeof row.attrs.tool === "string" ? row.attrs.tool : "tool";
         const mount = typeof row.attrs.mount === "string" ? row.attrs.mount : null;
         // Named as the model names it, so the service's trajectory reads like the transcript.
