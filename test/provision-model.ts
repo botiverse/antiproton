@@ -22,7 +22,7 @@ const STAND_IN = "export class DurableObject { constructor(ctx, env) { this.ctx 
   " export class RpcTarget {} export const env = {};";
 register("data:text/javascript," + encodeURIComponent(
   `export async function resolve(s, c, next) { if (s.startsWith("cloudflare:")) return { url: ${JSON.stringify("data:text/javascript," + encodeURIComponent(STAND_IN))}, shortCircuit: true }; return next(s, c); }`));
-const { AgentDO, default: worker } = await import("../cf/src/index.ts");
+const { AgentDO, default: worker, modelPickerEnforced } = await import("../cf/src/index.ts");
 const { setLogSink } = await import("../src/core/log.ts");
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
@@ -75,8 +75,10 @@ const RAFT_CRED = "sk_agent_" + "R".repeat(32);
  * tenant, and one agent Raft provisioned through `POST /provision/agents` (Raft stood in for, as test/eval-seed-object.ts
  * does). `USER_MODELS` unset gives a deployment that offers nothing. `picker` is T's model-picker switch before the
  * POST: on unless a check says otherwise, since every check before the switch existed is about a tenant that may pick.
+ * `enforce` is the deployment's MODEL_PICKER_ENFORCE: "1" unless a check says otherwise, so the switch's checks test
+ * it applied; `enforce: false` leaves the variable unset, as production and preview have it.
  */
-async function world(opts: { userModels?: unknown[] | null; post?: false | Record<string, unknown>; picker?: boolean } = {}) {
+async function world(opts: { userModels?: unknown[] | null; post?: false | Record<string, unknown>; picker?: boolean; enforce?: boolean } = {}) {
   const DB = d1();
   const raw = sqliteHost();
   const jobs: string[] = [];
@@ -103,6 +105,7 @@ async function world(opts: { userModels?: unknown[] | null; post?: false | Recor
     ARTIFACT_BUCKET: "b", CONTROL_DB: DB, HARNESS_MODEL: "deepseek-flash", DEEPSEEK_BASE_URL: "https://api.deepseek.com",
     MODEL_PROVIDERS: PROVIDERS, DEEPSEEK_API_KEY: DK, AI_GATEWAY_TOKEN: GT, AUTOMATION_TOKEN: AUTOMATION,
     ...(userModels === null ? {} : { USER_MODELS: userModels }),
+    ...(opts.enforce === false ? {} : { MODEL_PICKER_ENFORCE: "1" }),
     SECRET_KEK: Buffer.from(new Uint8Array(32).fill(3)).toString("base64"),
     AGENT: { idFromName: (n: string) => n, get: (n: string) => objects.get(n) ?? another(n) },
   };
@@ -853,6 +856,69 @@ await check("picker off: a create interrupted while it was on finishes on its re
   const r = await provisionPost(w, { model: "gpt-5.6-luna" });
   must(r.status === 201 && storedPick(w) === "gpt-5.6-luna", `replay: ${r.status} ${r.text}`);
   must((await w.rt.store.getModelBinding(T, A))?.model === "openai/gpt-5.6-luna", "the replay did not bind it");
+});
+
+// ---- the switch not enforced (MODEL_PICKER_ENFORCE unset, as deployed until Raft sets every server's switch) -------
+
+await check("MODEL_PICKER_ENFORCE: only exactly \"1\" enforces; no wrangler config sets it", () => {
+  for (const [v, on] of [["1", true], [undefined, false], ["", false], ["0", false], ["true", false], [" 1", false], ["1 ", false]] as const) {
+    must(modelPickerEnforced({ MODEL_PICKER_ENFORCE: v }) === on, `${show(v)} read as ${!on ? "on" : "off"}`);
+  }
+  // Comment lines dropped (test/eval-seed.ts `varsOf` reads the configs the same way); the name anywhere else is set.
+  for (const file of ["wrangler.jsonc", "wrangler.preview.jsonc"]) {
+    const code = readFileSync(new URL(`../cf/${file}`, import.meta.url), "utf8").split("\n").filter((l) => !l.trim().startsWith("//")).join("\n");
+    must(!code.includes("MODEL_PICKER_ENFORCE"), `cf/${file} sets MODEL_PICKER_ENFORCE: Raft does not set every server's switch yet`);
+  }
+});
+
+await check("not enforced: with the switch stored off, POST and PUT …/model take every offered pick as before the switch (stored, bound, run); unknown is still 422", async () => {
+  // A create naming another model: made on it and stored as the pick, exactly as with the picker on.
+  // The switch stored off before the create (a tenant token may set it only once an agent exists for the server).
+  const w = await world({ enforce: false, picker: false, post: false });
+  await d1TenantModelPicker(w.DB).set(T, false, "test", 1);
+  must(picker(w)?.enabled === 0, "switch not stored off");
+  const made = await provisionPost(w, { model: "gpt-5.6-luna" });
+  must(made.status === 201 && storedPick(w) === "gpt-5.6-luna", `create on luna: ${made.status} ${made.text}`);
+  await w.rt.ready();
+  must((await w.rt.store.getModelBinding(T, A))?.model === "openai/gpt-5.6-luna", "the create did not bind luna");
+  // Stored off again through the route, then PUT another model: taken and stored.
+  const pro = await putModel(w, "deepseek-pro");
+  must(pro.status === 200 && pro.body.source === "chosen" && pro.body.model === "deepseek-pro" && storedPick(w) === "deepseek-pro", `PUT pro: ${pro.status} ${pro.text}`);
+  // PUT the default by name: stored as a pick of it, as before the switch (not turned into "no pick").
+  const flash = await putModel(w, "deepseek-flash");
+  must(flash.status === 200 && flash.body.source === "chosen" && storedPick(w) === "deepseek-flash", `PUT flash: ${flash.status} ${flash.text}`);
+  const t = await turn(w, "on flash, chosen");
+  must(t.model === "deepseek-flash", `the request: ${t.model}`);
+  must((await putModel(w, null)).status === 200 && storedPick(w) === null, "null");
+  must((await putModel(w, "gpt-9")).status === 422, "unknown on PUT");
+  // A create naming the default by name stores it as a pick, as before the switch.
+  const d = await world({ enforce: false, picker: false, post: { model: "deepseek-flash" } });
+  must(storedPick(d) === "deepseek-flash", `default create: ${storedPick(d)}`);
+  const unknown = await provisionPost(await world({ enforce: false, picker: false, post: false }), { model: "gpt-9" });
+  must(unknown.status === 422 && unknown.body.error.code === "unknown_model", `unknown: ${unknown.status} ${unknown.text}`);
+});
+
+await check("not enforced: an operator's tenant row still locks a provider pick with 409 model_locked, the default by name included, as before the switch", async () => {
+  const w = await world({ enforce: false, picker: false, post: false });
+  await d1ModelOverrides(w.DB).put({ tenantId: T, agentId: "", provider: "cloudflare", model: "openai/gpt-5.6-luna", setBy: "adm", setAt: 1 });
+  const r = await provisionPost(w, { model: "deepseek-flash" });
+  must(r.status === 409 && r.body.error.code === "model_locked", `create naming the default under a tenant row: ${r.status} ${r.text}`);
+  await nothingMade(w, "locked create");
+});
+
+await check("not enforced: the switch PUT still validates, stores and answers, and GET /provision/models reports it as stored", async () => {
+  const w = await world({ enforce: false, picker: false });
+  const off = await call(w, "GET", "models");
+  must(off.body.pickerEnabled === false && off.body.models.length === 3, `before: ${off.text}`);
+  let r = await setPicker(w, true);
+  must(r.status === 200 && r.body.modelPicker === true && picker(w)?.enabled === 1 && picker(w)?.set_by === w.tokenHash, `on: ${r.status} ${r.text}`);
+  must((await call(w, "GET", "models")).body.pickerEnabled === true, "GET after on");
+  r = await setPicker(w, false);
+  must(r.status === 200 && r.body.modelPicker === false && picker(w)?.enabled === 0, `off: ${r.status} ${r.text}`);
+  must((await call(w, "GET", "models")).body.pickerEnabled === false, "GET after off");
+  const bad = await setPicker(w, undefined, { body: { enabled: "yes" } });
+  must(bad.status === 422 && bad.body.error.param === "enabled" && picker(w)?.enabled === 0, `bad body: ${bad.status} ${bad.text}`);
+  must((await setPicker(w, true, { server: "srv-2" })).status === 403, "server_mismatch");
 });
 
 await check("harnessKey: moves with the persona and the binding, and only with them", () => {

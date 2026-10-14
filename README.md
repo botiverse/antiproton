@@ -245,7 +245,10 @@ Antiproton is designed to run as a Cloudflare Worker backed by Durable Objects:
    locks the owner's pick), then the owner's pick, then the admin's deployment row, then `HARNESS_MODEL`.
    A pick whose option is no longer offered is passed over. For an agent Raft hosts, Raft's
    `PUT /provision/agents/{id}/model`, or `model` on the `POST /provision/agents` that creates it, makes the same
-   pick (docs/agent-surface.md, "The agent's model").
+   pick (docs/agent-surface.md, "The agent's model"). Raft also sets, per server, whether its agents may pick
+   another model than the default (`PUT /provision/servers/{id}/model-picker`); that switch refuses a pick only
+   where the `MODEL_PICKER_ENFORCE` var is `"1"`, which no wrangler config sets yet: unset, it is stored and
+   reported and refuses nothing (docs/agent-surface.md, "The server's model picker").
    An owner's pick is bound when it is made (the
    console's POST, Raft's PUT, or the Agents API's create or update of an agent already bound), so the agent's next model
    call runs on it, on a harness rebuilt for it if one was open. An admin's change is bound when something next checks the agent's binding: its console

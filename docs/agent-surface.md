@@ -204,9 +204,9 @@ pi-durable sends any prompt change; on `pi085` the prompt is rebuilt whole.
 **An agent's `model`** (`POST /provision/agents`, optional) creates it on a chosen model in the same call: an
 offered option's id ([below](#the-agents-model)), or `null` or absent for the default, which is the create as it
 was. A value neither a string nor `null` is `422 invalid`. On a first create, before anything is made, an id not
-offered is `422 unknown_model`; while the server's model picker is off
-([below](#the-servers-model-picker-model-picker)) any model but the default is `403 model_picker_disabled`, and the
-default is taken without storing a pick; otherwise a model while an administrator's agent or tenant row applies is
+offered is `422 unknown_model`; where the deployment enforces the server's model picker (`MODEL_PICKER_ENFORCE`)
+and it is off ([below](#the-servers-model-picker-model-picker)), any model but the default is
+`403 model_picker_disabled`, and the default is taken without storing a pick; otherwise a model while an administrator's agent or tenant row applies is
 `409 model_locked` (all with `param: "model"`) — the agent is not made and its Raft id is not taken, so the same
 POST without `model` is then a first create (`201`). A deployment that offers no options takes only `null`. The
 answer's body is the same as without it; `GET …/model` reads the pick as `source: "chosen"`.
@@ -272,9 +272,11 @@ GET or PUT /provision/agents/{agentId}/model
   finishes. The row records whether the create's pick is settled yet (`model_pending`; a `PUT` settles it
   too), so once it is, no replay writes it again. Settling makes the stored pick the create's, `null`
   included: a reopened create without `model` removes one an earlier attempt stored.
-- **Off by default.** A server may pick a model other than the deployment's default only once Raft has turned its
-  model picker on ([below](#the-servers-model-picker-model-picker)); until then a `PUT` of another model is `403`.
-  `GET /provision/models` says which as `pickerEnabled`.
+- **Off by default, where enforced.** On a deployment that enforces the switch (`MODEL_PICKER_ENFORCE` `"1"`), a
+  server may pick a model other than the deployment's default only once Raft has turned its model picker on
+  ([below](#the-servers-model-picker-model-picker)); until then a `PUT` of another model is `403`. Where it is not
+  enforced (production and preview today) every offered pick is taken as above. `GET /provision/models` reports
+  the stored switch as `pickerEnabled`.
 - **An agent never given a pick** is unchanged by these routes: reading them stores nothing and rebuilds
   nothing, and it runs on the default as before (`test/provision-model.ts`).
 
@@ -289,9 +291,20 @@ PUT /provision/servers/{raftServerId}/model-picker
 → 200 { "raftServerId": "srv-1", "modelPicker": true, "updatedAt": "2026-10-14T09:12:00.000Z" }
 ```
 
+- **Enforced only where `MODEL_PICKER_ENFORCE` is `"1"`.** A deployment variable, read in `cf/src/index.ts`
+  (`modelPickerEnforced`): exactly `"1"` applies the switch as this section describes; anything else, or unset,
+  stores and reports it (this route, `pickerEnabled`) but refuses and rewrites no pick, so model choice is what it
+  was before the switch existed — every offered id taken and stored as a pick, the default by name included, and
+  `409 model_locked` under an operator's agent or tenant row as before. No wrangler config sets it
+  (`test/provision-model.ts` fails if `cf/wrangler.jsonc` or `cf/wrangler.preview.jsonc` does), because a server
+  with no row reads as off: enforced before Raft has sent the switch for every server, it would refuse picks Raft
+  allows. To turn it on, once Raft has backfilled every server: add `"MODEL_PICKER_ENFORCE": "1"` to the `vars` of
+  `cf/wrangler.jsonc` (and `cf/wrangler.preview.jsonc` for preview), drop the wrangler check in
+  `test/provision-model.ts` for that file, and deploy. Everything below "Default: off" describes the enforced
+  behaviour.
 - **Default: off.** A server Raft has never sent this for is off. Raft sends it whenever its flag for the server
   changes; the latest write wins.
-- **Rollout order.** When this route is first deployed, **every server is off**, including servers whose Raft flag
+- **Rollout order.** When enforcement is first turned on, **every server is off**, including servers whose Raft flag
   is already on, until Raft sends `{ "enabled": true }` for each of them. So Raft backfills the switch for every
   server with the flag on, either before it shows those servers a picker or straight after the deploy. Until then,
   their picks of another model are `403 model_picker_disabled`. Agents that already picked keep their model
@@ -303,7 +316,7 @@ PUT /provision/servers/{raftServerId}/model-picker
   `param: "enabled"`), any other field `422` naming it. Nothing is written when it is refused. It is not accepted on
   `POST /provision/agents`: `modelPicker` there is `422 invalid`, `param: "modelPicker"`, and nothing is made — a
   create retried late must not turn back a switch flipped since, and a field silently ignored would read as allowed.
-- **While off**, for the provider routes only:
+- **While off** (and enforced), for the provider routes only:
   - **The accepted ids** are a default's: the option naming `HARNESS_MODEL` (`deepseek-flash`), and the id these
     routes report as the default for the agent now — `default` of `GET /provision/models`, `model` of `GET …/model`
     before a pick. An operator's deployment, tenant or agent row may make that second id another model (e.g.

@@ -103,6 +103,13 @@ export interface ProvisionModels {
    * taken without storing a pick. Required, so a deployment wiring the model routes cannot leave the gate out.
    */
   picker: TenantModelPicker;
+  /**
+   * Whether the switch above is applied (MODEL_PICKER_ENFORCE "1"; cf/src/index.ts `modelPickerEnforced`). False: the
+   * switch is still stored and read back, but no pick is refused or rewritten for it, so model choice is what it was
+   * before the switch existed. Off until Raft sets every server's switch: until then a server with no row reads as
+   * off, and enforcing would refuse picks Raft allows today.
+   */
+  enforcePicker: boolean;
 }
 
 export interface ProvisionDeps {
@@ -1070,8 +1077,10 @@ function modelView(choice: ModelChoice, um: UserModels): { model: string; label:
  * one by one, so a field added to UserModel later does not reach Raft by default — and never a model's address, a
  * gateway or a secret. `default` is what an agent that follows the default runs on in this tenant (the admin's tenant
  * or deployment row, else HARNESS_MODEL), named as `modelView` names it; `locked` says a tenant row decides every agent
- * of the tenant, so no pick would run. `pickerEnabled` says whether a pick other than the deployment's default is
- * taken (`pickerProblem`); the options are listed either way, so a reader written before the switch keeps working.
+ * of the tenant, so no pick would run. `pickerEnabled` is the server's switch as stored: where the deployment enforces it
+ * (`enforcePicker`), whether a pick other than the deployment's default is taken (`pickerProblem`); elsewhere every
+ * offered pick is taken whatever it says. The options are listed either way, so a reader written before the switch
+ * keeps working.
  */
 async function modelList(tenantId: string, m: ProvisionModels) {
   // `layers` with no agent reads the tenant's and the deployment's rows: the agent clause names agent_id '', which is
@@ -1117,7 +1126,7 @@ async function modelRoute(
   const locked = await lockedProblem(m, tenantId, agentId);
   if (locked) return fail(locked);
   let pick = asked;
-  if (asked !== null && !(await m.picker.enabled(tenantId))) {
+  if (asked !== null && await pickerOff(m, tenantId)) {
     const layers = await m.choices.layers(tenantId, agentId);
     // The pick the agent already has is asked first, and taken as it is: an agent that chose while the picker was on
     // keeps its model, a retried PUT of it is not a new choice, and — even when that pick is the default's id — a
@@ -1150,6 +1159,15 @@ function notOffered(um: UserModels, asked: string): Fail | null {
   const ids = um.offered.map((o) => JSON.stringify(o.id)).join(", ");
   return { status: 422, code: "unknown_model", param: "model",
     message: `no model option ${JSON.stringify(asked.slice(0, 64))} is offered here; ${ids ? `one of ${ids}, ` : ""}or null for the default` };
+}
+
+/**
+ * Whether a provider pick other than the default is held to the tenant's switch: only where the deployment enforces it
+ * (`enforcePicker`), and the switch is off. Not enforced, the switch is not even read, and every pick is judged as it
+ * was before the switch existed.
+ */
+async function pickerOff(m: ProvisionModels, tenantId: string): Promise<boolean> {
+  return m.enforcePicker && !(await m.picker.enabled(tenantId));
 }
 
 /** The offered option that names the deployment's default (HARNESS_MODEL under DEFAULT_PROVIDER); null when none does. */
@@ -1221,7 +1239,7 @@ async function createPick(
   if (!m) return { status: 422, code: "unknown_model", param: "model", message: "this deployment offers no choice of model; omit model, or send null, for the default" };
   // `kept`: the model a create already asked for and was let through on (a reopened create, below). Its replay repeats a
   // choice made while it was allowed, as a grandfathered agent's PUT of its own pick does, so the switch does not apply.
-  if (model !== kept && !(await m.picker.enabled(tenantId))) {
+  if (model !== kept && await pickerOff(m, tenantId)) {
     const ids = defaultIds(m, await m.choices.layers(tenantId, agentId));
     if (ids.includes(model)) return { pick: null };
     return notOffered(m.userModels, model) ?? pickerProblem(model, ids);
