@@ -57,7 +57,7 @@ function bounded(limit: number, script: string) {
   const r = spawnSync("bash", ["-c",
     '. cf/scripts/suite-verdict.sh; status=0; suite_run_bounded "$1" "$2" bash "$3" || status=$?; ' +
     'echo "status=$status timed_out=${SUITE_TIMED_OUT:-0} leftover=${SUITE_LEFTOVER:-0}"', "t", String(limit), out, script],
-    { encoding: "utf8", timeout: 60_000 });
+    { encoding: "utf8", timeout: 20_000 });
   const seconds = (Date.now() - started) / 1000;
   return { said: r.stdout.trim(), out: existsSync(out) ? readFileSync(out, "utf8") : "", seconds };
 }
@@ -77,6 +77,16 @@ check("what the suite started is ended with it, even if it would outlive it", ()
   if (!/timed_out=1/.test(r.said)) throw new Error(`not timed out: ${r.said}`);
   if (pidsOf(f.pids).length < 2) throw new Error("the fake suite did not record its child");
   noneLeft(f.pids, "the suite and its child");
+});
+
+check("a grandchild whose parent has already exited is ended too", () => {
+  // Re-parented, so no walk from the suite finds it; only its process group
+  // still says where it came from. npx -> wrangler -> workerd can leave this.
+  const f = fake('( sleep 300 & echo $! >> "$PIDS" )\nsleep 300');
+  const r = bounded(1, f.script);
+  if (!/timed_out=1/.test(r.said)) throw new Error(`not timed out: ${r.said}`);
+  if (pidsOf(f.pids).length < 2) throw new Error("the fake suite did not record its grandchild");
+  noneLeft(f.pids, "the suite and its orphaned grandchild");
 });
 
 check("a child that moved to a session of its own is ended too", () => {
@@ -142,7 +152,7 @@ function gateRunSuite(script: string, prelude: string, suite: string, env: Recor
   const fn = lines.slice(start, end + 1).join("\n");
   return spawnSync("bash", ["-c",
     `${prelude}\n. cf/scripts/suite-verdict.sh\n${fn}\nrun_suite fake-suite bash "$1"\necho "fails=\${fails:-} timeouts=\${timeouts:-}"`,
-    "gate", suite], { encoding: "utf8", timeout: 60_000, env: { ...process.env, ...env } });
+    "gate", suite], { encoding: "utf8", timeout: 20_000, env: { ...process.env, ...env } });
 }
 
 check("the branch gate prints TIMEOUT, apart from FAIL, and counts it as a refusal", () => {
@@ -180,6 +190,12 @@ check("the deploy gate refuses a TIMEOUT: it says so and exits non-zero", () => 
   const bad = gateRunSuite("cf/scripts/verify-and-deploy.sh", "set -euo pipefail", fake("exit 1").script);
   if (bad.status === 0 || !/^fake-suite +FAIL$/m.test(bad.stdout)) throw new Error(`a fail read as ${JSON.stringify(bad.stdout)}`);
 });
+
+// Whatever a failing case left, by the pids the fake suites wrote down, so a
+// red run (or a sabotaged helper) does not leave sleepers behind.
+for (let i = 1; i <= n; i++) {
+  for (const p of pidsOf(join(dir, `pids-${i}`))) if (alive(p)) try { process.kill(p, "SIGKILL"); } catch { /* gone */ }
+}
 
 console.log(`\n  Suite time limit\n  ${"─".repeat(56)}`);
 for (const r of results) {
