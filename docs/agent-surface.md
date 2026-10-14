@@ -459,14 +459,16 @@ that prefix cached when the first message comes (`src/runtime/prewarm.ts`). Noth
 - **Metered** like any model call (usage, `model.tokens`), with a trace row `model.prewarm`: `status` `warmed`,
   `skipped` or `failed`, `attrs` the outcome, the model and its tokens (`inputTokens`, `cacheReadTokens`,
   `outputTokens`).
-- **At most once per import**, sent through the model queue, never retried, and never a reason for the import to
-  fail. Admitted against the daily spend limits like any call.
+- **At most once per agent** (an agent is imported once), sent through the model queue, never retried, and never a
+  reason for the import to fail. Admitted against the daily spend limits like any call.
 - **Skipped** when the agent has already started a turn (a push held for the import runs as the import lands),
-  runs on its own model credential or the `pd` engine, or its model is neither DeepSeek's nor OpenAI's.
+  runs on its own model credential or the `pd` engine, or its model is neither DeepSeek's nor OpenAI's GPT-5.6 or
+  later (the models that take `prompt_cache_options.prewarm`).
 - **Same reasoning as the first turn**: both providers key their cache on it (a prewarm with thinking off did not
   warm a turn with thinking on, measured 2026-10-14), so an agent made with `firstTurn` (below) is warmed with
   reasoning off. Through the Responses API (GPT-5.6 Luna) it is a `prompt_cache_options.prewarm` request, which
-  generates nothing; OpenAI keeps that cache 30 minutes, DeepSeek hours.
+  generates nothing (capped at `max_output_tokens: 16`, the least the API takes); through chat/completions a
+  one-token call. OpenAI keeps that cache 30 minutes, DeepSeek hours.
 
 #### The first turn without reasoning (`firstTurn`)
 
@@ -476,8 +478,15 @@ right after signing up:
 
 - **What it does.** Every model call of the agent's first turn — from its first input until a reply that ends
   without a tool call — runs with reasoning off (DeepSeek `thinking: { type: "disabled" }`, OpenAI effort
-  `none`). Every later turn runs as any agent's does. Decided from each call's own conversation, so a call sent
-  again is decided the same way.
+  `none`). Every later turn runs as any agent's does.
+- **Once per agent.** The first turn ends for good, recorded in the agent's object, at the first of: an answer that
+  ends a turn (a reply, a failure, a cut-off), a cancel (so a first turn cancelled mid tool loop does not carry
+  into the next), or the end of the agent's first main conversation (a fresh context, or a rebuild, before or
+  after it). A new conversation after any of these runs with reasoning on.
+- **Models.** Applied only where the model has a known off field: DeepSeek's models, and OpenAI's (their catalog's
+  off level; one without reasoning is unchanged). Any other model's first turn runs with its default, and is sent
+  no field it might refuse. Not refused at the create, since the model can change after it (`PUT …/model`, an
+  admin's choice).
 - **The cost.** The cache is keyed on the reasoning setting, so the second turn reads nothing of the first's
   prefix from cache and writes it anew; from the third turn on the cache is shared as usual.
 - **Values.** Exactly `{ "reasoning": "off" }`; anything else is `422`, `code: "invalid"`, `param: "firstTurn"`.

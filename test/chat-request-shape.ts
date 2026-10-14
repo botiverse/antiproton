@@ -64,6 +64,8 @@ await check("DeepSeek: the body is byte-identical to the one built before per-mo
 await check("Anthropic and Google through the gateway: today's body (max_tokens, temperature 0, nothing added)", async () => {
   for (const model of ["anthropic/claude-haiku-4-5", "google-ai-studio/gemini-2.5-flash"]) {
     must(show(fields(await bodyFor(model, { tools: TOOLS }))) === show({ model, max_tokens: 32768, temperature: 0, tools: 1 }), `${model}: ${show(fields(await bodyFor(model, { tools: TOOLS })))}`);
+    // DeepSeek's `thinking` field is DeepSeek's: "off" sends another vendor's model nothing it might refuse.
+    must(show(fields(await bodyFor(model, { reasoning: "off" }))) === show({ model, max_tokens: 32768, temperature: 0, tools: 0 }), `${model} reasoning off: ${show(fields(await bodyFor(model, { reasoning: "off" })))}`);
   }
 });
 

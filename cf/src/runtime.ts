@@ -163,7 +163,8 @@ import type { MountPolicy, MountRecord } from "../../src/core/types.ts";
 import type { HookDirectory, HookRow } from "./control-plane.ts";
 import { appendUsage, jsRunRows, modelTokenRows } from "../../src/usage/outbox.ts";
 import {
-  finishPrewarm, firstTurnOf, inFirstTurn, PREWARM_USER_TEXT, prewarmable, prewarmJobId, queuePrewarm, readPrewarm, takePrewarm,
+  endsTurn, finishPrewarm, firstTurnDone, firstTurnOf, inFirstTurn, markFirstTurnDone, PREWARM_USER_TEXT, prewarmable, prewarmJobId,
+  queuePrewarm, readPrewarm, reasoningOffSupported, takePrewarm,
 } from "../../src/runtime/prewarm.ts";
 import { RunJsContinuations } from "../../src/runtime/run-js-resume.ts";
 
@@ -3496,13 +3497,20 @@ export class AgentRuntime {
     const provider = b ? providerOfRef(b.secretRef) : null;
     if (!b || !provider) return skip("the agent's model is on its own credential");
     if (!prewarmable(b.model)) return skip(`${b.model} is not a model whose prompt cache a prewarm is known to fill`);
-    const agent = await this.agent(tenantId, agentId);
-    if (!agent.requestPrefix) return skip("the engine cannot say its request prefix");
-    const prefix = await agent.requestPrefix();
-    const context = { systemPrompt: prefix.systemPrompt, tools: prefix.tools,
-      messages: [{ role: "user", content: [{ type: "text", text: PREWARM_USER_TEXT }], timestamp: Date.now() }] };
-    const reasoning = await this.#reasoningFor(tenantId, agentId, MAIN_SESSION, context);
-    return { context, operatorModel: b.model, operatorProvider: provider, ...(reasoning ? { reasoning } : {}) };
+    // Taken already: a throw from here (opening the harness, repinning its mounts, reading its prefix) ends the
+    // prewarm as failed, with its trace row, rather than leaving it taken and unsaid.
+    try {
+      const agent = await this.agent(tenantId, agentId);
+      if (!agent.requestPrefix) return skip("the engine cannot say its request prefix");
+      const prefix = await agent.requestPrefix();
+      const context = { systemPrompt: prefix.systemPrompt, tools: prefix.tools,
+        messages: [{ role: "user", content: [{ type: "text", text: PREWARM_USER_TEXT }], timestamp: Date.now() }] };
+      const reasoning = await this.#reasoningFor(tenantId, agentId, MAIN_SESSION, context, b.model);
+      return { context, operatorModel: b.model, operatorProvider: provider, ...(reasoning ? { reasoning } : {}) };
+    } catch (e) {
+      this.#prewarmEnded(tenantId, agentId, row.migrationId, `failed: ${String((e as Error)?.message ?? e).slice(0, 160)}`, { model: b.model });
+      return null;
+    }
   }
 
   /**
@@ -3538,13 +3546,28 @@ export class AgentRuntime {
 
   /**
    * The reasoning a model call of this agent runs with, when it is not the provider's default: `off` for a call of
-   * the main conversation's first turn on an agent made with `firstTurn: { reasoning: "off" }` (POST
-   * /provision/agents; src/runtime/prewarm.ts `inFirstTurn`). Undefined otherwise, which sends the request it always was.
+   * the agent's first turn on an agent made with `firstTurn: { reasoning: "off" }` (POST /provision/agents;
+   * src/runtime/prewarm.ts). Undefined otherwise, which sends the request it always was. The first turn is bounded
+   * three ways, so it is had once per agent and never again: the durable mark (`firstTurnDone`: a turn-ending answer
+   * delivered, a cancel, or a main conversation that ended, as a fresh context or a rebuild ends it), and this call's
+   * own conversation holding no turn-ending answer (`inFirstTurn`), which also marks it when it does. `model` is the
+   * one the call reaches: one with no known off field (`reasoningOffSupported`) runs with its default.
    */
-  async #reasoningFor(tenantId: string, agentId: string, session: string, context: unknown): Promise<"off" | undefined> {
+  async #reasoningFor(tenantId: string, agentId: string, session: string, context: unknown, model: string | undefined): Promise<"off" | undefined> {
     if (session !== MAIN_SESSION) return undefined;
     const first = firstTurnOf((await this.store.loadAgent(tenantId, agentId))?.config);
-    return first && inFirstTurn(context) ? first.reasoning : undefined;
+    if (!first || !model || !reasoningOffSupported(model)) return undefined;
+    const sql = this.#deps.ctx.storage.sql;
+    if (firstTurnDone(sql, tenantId, agentId)) return undefined;
+    if (!inFirstTurn(context)) { markFirstTurnDone(sql, tenantId, agentId, "seen", Date.now()); return undefined; }
+    return first.reasoning;
+  }
+
+  /** A turn of the main conversation ended (an answer, a cancel): an agent made with `firstTurn` has had its first. */
+  async #firstTurnEnded(tenantId: string, agentId: string, session: string, how: string) {
+    if (session !== MAIN_SESSION) return;
+    if (!firstTurnOf((await this.store.loadAgent(tenantId, agentId))?.config)) return;
+    markFirstTurnDone(this.#deps.ctx.storage.sql, tenantId, agentId, how, Date.now());
   }
 
   /** Hold a new agent until its import (`awaitImport`, src/store/workspace-import.ts); once per agent. */
@@ -3987,6 +4010,12 @@ export class AgentRuntime {
     const dropped = await agent.dropClientCalls();
     if (dropped > 0 && !cancelledTurn) {
       await agent.markCancelled(TURN_CANCELLED);
+    }
+    // A first turn cancelled mid tool loop leaves no turn-ending answer; without this mark the next turn would still
+    // read as the first (`#reasoningFor`).
+    if (cancelledTurn || dropped > 0) {
+      try { await this.#firstTurnEnded(tenantId, agentId, session, "cancelled"); }
+      catch (e) { console.error(`marking the first turn of ${tenantId}/${agentId} done failed:`, e); }
     }
     // The turn ends here when a run was aborted or it was waiting on the caller: no later step sees it end. With
     // neither, nothing was running, and a record there is no turn's: it is forgotten without a row.
@@ -4585,7 +4614,7 @@ export class AgentRuntime {
     // whose calls have no input record for the evidence to join.
     const mark = this.#deps.modelInputEvidence && !this.#isPd();
     // The first turn's reasoning, for an agent made to answer its first message without (`#reasoningFor`).
-    const reasoning = await this.#reasoningFor(tenantId, agentId, session, (job as { context?: unknown }).context);
+    const reasoning = await this.#reasoningFor(tenantId, agentId, session, (job as { context?: unknown }).context, this.#calledModel(b));
     return { ...job, operatorModel: provider ? b!.model : null, operatorProvider: provider, ...(mark ? { imageEvidence: true } : {}),
       ...(reasoning ? { reasoning } : {}) };
   }
@@ -4625,7 +4654,13 @@ export class AgentRuntime {
   async deliverAnswer(tenantId: string, agentId: string, jobId: string, answer: unknown, taker: string | undefined) {
     await this.ready();
     const session = this.#jobSessionFor(jobId);
-    return (await this.agent(tenantId, agentId, session)).deliver(jobId, answer as any, taker);
+    const wrote = await (await this.agent(tenantId, agentId, session)).deliver(jobId, answer as any, taker);
+    // An answer that ends a turn ends the first one too (`#reasoningFor`); a reading, so it never fails the delivery.
+    if (wrote && endsTurn(answer)) {
+      try { await this.#firstTurnEnded(tenantId, agentId, session, "replied"); }
+      catch (e) { console.error(`marking the first turn of ${tenantId}/${agentId} done failed:`, e); }
+    }
+    return wrote;
   }
 
   /**

@@ -22,12 +22,15 @@
  *   developer message's end is a lookup boundary of the first turn's request. Its cache lives 30 minutes after the
  *   last write or read, so a first message later than that finds it cold again.
  *
- * At most once per import: the row below is made in the import's own transaction, and taken once; a queue redelivery
- * of the same message finds it taken and calls nothing. Skipped, with the reason recorded, when it cannot help: the
+ * At most once per agent (an agent is imported once, and the row below is one per agent): the row is made in the
+ * import's own transaction and taken once; a queue redelivery of the same message finds it taken and calls nothing. Skipped, with the reason recorded, when it cannot help: the
  * agent has already started a turn (its own call warms the cache), runs on its own credential or the pd engine, or
  * its model is not one whose provider caches prefixes for us (`prewarmable`). Never retried and never a reason for the
  * import to fail: every step here is a reading made after the import has answered.
  */
+
+import { responsesReasoningFor, usesResponses } from "../model/openai-responses.ts";
+import { chatShapeFor, isDeepSeekModel } from "../model/chat-request-shape.ts";
 
 type Sql = { exec(query: string, ...bindings: unknown[]): { toArray(): any[] } };
 
@@ -73,14 +76,25 @@ export function finishPrewarm(sql: Sql, tenantId: string, agentId: string, migra
   return true;
 }
 
+
 /**
- * Whether a call to `model` can be warmed: a provider whose cache we measured a prewarm filling (above). DeepSeek's
- * own names are bare (`deepseek-flash`) at its API and `deepseek/…` through a gateway; OpenAI's are `openai/…`. Any
- * other vendor is skipped rather than paid for on a guess.
+ * GPT-5.6 or later, the OpenAI models whose prompt cache takes `prompt_cache_options.prewarm`
+ * (https://developers.openai.com/api/docs/guides/prompt-caching, "GPT-5.6 and later"). Read from the name
+ * (`openai/gpt-<major>.<minor>…`); a name in another form is not assumed to be one.
+ */
+export function isGpt56OrLater(model: string): boolean {
+  const m = /^openai\/gpt-(\d+)(?:\.(\d+))?(?![\d.])/.exec(model);
+  if (!m) return false;
+  const major = Number(m[1]), minor = Number(m[2] ?? 0);
+  return major > 5 || (major === 5 && minor >= 6);
+}
+
+/**
+ * Whether a call to `model` can be warmed: a provider whose cache we measured a prewarm filling (above), DeepSeek's
+ * models and OpenAI's from GPT-5.6 on. Any other model is skipped rather than paid for on a guess.
  */
 export function prewarmable(model: string): boolean {
-  if (model.startsWith("openai/") || model.startsWith("deepseek/")) return true;
-  return !model.includes("/") && model.startsWith("deepseek");
+  return isDeepSeekModel(model) || isGpt56OrLater(model);
 }
 
 /** The user message a chat/completions prewarm ends with: one character, so the shared prefix is all but the whole request. */
@@ -98,11 +112,57 @@ export function firstTurnOf(config: unknown): FirstTurn | null {
 }
 
 /**
+ * Whether reasoning can be switched off for `model` by a field the provider is known to take: DeepSeek's `thinking:
+ * { type: "disabled" }`, or an OpenAI model's own "off" level (pi's catalog: `none` for gpt-5.6-luna), on either API.
+ * An OpenAI model with no reasoning has nothing to switch off, and its request is unchanged. Any other model is not
+ * sent a field it may refuse: its first turn runs with the provider's default.
+ */
+export function reasoningOffSupported(model: string): boolean {
+  if (isDeepSeekModel(model)) return true;
+  if (!model.startsWith("openai/")) return false;
+  if (usesResponses(model)) return responsesReasoningFor(model, "off").field !== undefined;
+  return chatShapeFor(model, "off") !== null;
+}
+
+const DONE_TABLE = `CREATE TABLE IF NOT EXISTS first_turn_done (
+  tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL, at INTEGER NOT NULL, how TEXT NOT NULL, PRIMARY KEY (tenant_id, agent_id))`;
+
+/**
+ * Whether the agent's first turn is over for good: its durable mark (`markFirstTurnDone`), or a main conversation
+ * that has ended (a fresh context or a rebuild, `startFreshMain`), whose successor is not where the agent began. Either
+ * way no later call runs with the first turn's reasoning, whatever its own conversation looks like.
+ */
+export function firstTurnDone(sql: Sql, tenantId: string, agentId: string): boolean {
+  const q = (query: string, ...b: unknown[]) => {
+    try { return sql.exec(query, ...b).toArray().length > 0; }
+    catch (e) { if (/no such table/i.test(String((e as Error)?.message ?? e))) return false; throw e; }
+  };
+  return q("SELECT 1 FROM first_turn_done WHERE tenant_id=? AND agent_id=?", tenantId, agentId)
+    || q("SELECT 1 FROM main_sessions WHERE ended_at IS NOT NULL LIMIT 1");
+}
+
+/**
+ * The first turn is over: `replied` (an answer that ends a turn was delivered), `cancelled`, or `seen` (a call's
+ * conversation already holds such an answer). Once; a later mark changes nothing.
+ */
+export function markFirstTurnDone(sql: Sql, tenantId: string, agentId: string, how: string, now: number): void {
+  sql.exec(DONE_TABLE);
+  sql.exec("INSERT OR IGNORE INTO first_turn_done(tenant_id, agent_id, at, how) VALUES (?,?,?,?)", tenantId, agentId, now, how);
+}
+
+/** Whether a delivered answer ends the turn it belongs to: an assistant message that did not stop to call tools. */
+export function endsTurn(answer: unknown): boolean {
+  const a = answer as { role?: unknown; stopReason?: unknown } | null | undefined;
+  return a?.role === "assistant" && a.stopReason !== "toolUse";
+}
+
+/**
  * Whether a model call's conversation is still in the agent's first turn: no assistant message in it ended other than
  * by calling tools. The first reply that ends without a tool call (or fails, or is cut off) ends the turn, and every
  * call after it is a later turn's. Read from the call's own context, so it needs no state of its own and a redelivered
- * call is decided as the first delivery was. A turn cancelled before the model answered leaves no such message, so the
- * next turn is still the first; that turn's reply is then the first one the user sees.
+ * call is decided as the first delivery was. This reading alone would start over in every new main conversation, and
+ * would carry into the next turn after a cancel mid tool loop; the durable mark (`firstTurnDone`) bounds both, and the
+ * runtime asks it first (cf/src/runtime.ts `#reasoningFor`).
  */
 export function inFirstTurn(context: unknown): boolean {
   const messages = (context as { messages?: unknown } | null | undefined)?.messages;

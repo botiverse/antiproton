@@ -46,6 +46,11 @@ const OPENAI_VENDOR = "openai/";
 
 type Effort = "off" | "low" | "high";
 
+/** DeepSeek's own model: a bare name at its API (`deepseek-flash`), `deepseek/…` through a gateway. */
+export function isDeepSeekModel(model: string): boolean {
+  return model.startsWith("deepseek/") || (!model.includes("/") && model.startsWith("deepseek"));
+}
+
 export interface ChatShape {
   /** pi's `maxTokensField` for the model. */
   tokensField: "max_tokens" | "max_completion_tokens";

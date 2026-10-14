@@ -240,6 +240,8 @@ function jobReasoning(job: any): { reasoning: "off" } | Record<string, never> {
   return job?.reasoning === "off" ? { reasoning: "off" } : {};
 }
 
+const RESPONSES_MIN_OUTPUT_TOKENS = 16;
+
 /** What a prewarm reports back to its object (`AgentRuntime.prewarmDone`). */
 export interface PrewarmResult {
   model: string;
@@ -266,7 +268,9 @@ export async function callPrewarm(env: ModelEnv, job: any): Promise<PrewarmResul
     let res: ModelResponse;
     if (usesResponses(called)) {
       const { input, tools } = toResponsesInput({ ...job.context, messages: [] }, called, {});
-      res = await new OpenAiResponsesModel(request).complete(input, { ...(tools ? { tools } : {}), ...reasoning, prewarm: true });
+      // 16 is the least `max_output_tokens` the Responses API takes (15 was refused with a 400 through the gateway,
+      // 2026-10-14); a prewarm generates nothing, and this bounds it if it ever did.
+      res = await new OpenAiResponsesModel(request).complete(input, { ...(tools ? { tools } : {}), ...reasoning, prewarm: true, maxTokens: RESPONSES_MIN_OUTPUT_TOKENS });
     } else {
       const { messages, tools } = toRequest(job.context, {});
       res = await new OpenAiCompatibleModel(request).complete(messages, { ...(tools ? { tools } : {}), ...reasoning, maxTokens: 1 });

@@ -322,14 +322,16 @@ await check("skipped when the first turn has already started (a push held for th
   must(traceRows(w, "model.prewarm")[0]?.status === "skipped", show(traceRows(w, "model.prewarm")));
 });
 
-await check("skipped for a model it is not known to help; prewarmable names DeepSeek's and OpenAI's models only", async () => {
+await check("skipped for a model it is not known to help; prewarmable names DeepSeek's models and OpenAI's from GPT-5.6 only", async () => {
   const w = await world({ model: "m1" });
   must((await imp(w, importBody(uuid(), [{ path: "a.md", text: "x" }]))).status === 201, "import");
   const c = consumer(w);
   await c.run(prewarms(w));
   must(c.asked.length === 0, "called for m1");
   must(/^skipped: m1 is not a model/.test(String((w.raw.sql.exec("SELECT outcome FROM model_prewarm").toArray()[0] as any).outcome)), "reason");
-  for (const [m, want] of [["deepseek-flash", true], ["deepseek/deepseek-v4", true], ["openai/gpt-5.6-luna", true], ["anthropic/claude", false], ["m1", false], ["deepseekish/x", false]] as const) {
+  for (const [m, want] of [["deepseek-flash", true], ["deepseek/deepseek-v4", true], ["openai/gpt-5.6-luna", true], ["openai/gpt-5.7", true],
+    ["openai/gpt-6", true], ["openai/gpt-5.5", false], ["openai/gpt-5", false], ["openai/gpt-4.1-mini", false], ["openai/gpt-5.10-x", true],
+    ["anthropic/claude", false], ["m1", false], ["deepseekish/x", false]] as const) {
     must(prewarmable(m) === want, `prewarmable(${m}) is ${!want}`);
   }
 });
@@ -398,6 +400,7 @@ await check("Responses (an OpenAI reasoning model): the developer message and to
   must(sent[0]!.url === "https://gw.example/compat/responses" && out.outcome === "warmed" && out.usage?.input === 8049, show({ url: sent[0]!.url, out }));
   must(show(b.prompt_cache_options) === show({ prewarm: true }) && b.input.length === 1 && b.input[0].role === "developer", show({ ...b, tools: undefined, input: b.input.map((i: any) => i.role) }));
   must(b.reasoning?.effort === "medium", `effort ${show(b.reasoning)}: not the first turn's default`);
+  must(b.max_output_tokens === 16, `max_output_tokens ${b.max_output_tokens}: a prewarm is capped at the API's least`);
   const turn = await capture(() => callQueuedModel(ENV, { context: firstJobContext, operatorModel: "openai/gpt-5.6-luna", operatorProvider: "cloudflare" }, "j1"));
   const tb = turn.sent[0]!.body;
   must(!("prompt_cache_options" in tb) && show(tb.input[0]) === show(b.input[0]) && canonJson(tb.tools) === canonJson(b.tools) && show(tb.reasoning) === show(b.reasoning),
@@ -437,6 +440,99 @@ await check("firstTurn off: every call of the first turn is taken with reasoning
   const sent1 = await capture(() => callQueuedModel(ENV, j1, w.jobs[0]!));
   const sent3 = await capture(() => callQueuedModel(ENV, j3, w.jobs[2]!));
   must(show(sent1.sent[0]!.body.thinking) === show({ type: "disabled" }) && !("thinking" in sent3.sent[0]!.body), "the request's reasoning field");
+});
+
+/** An agent made with firstTurn off, imported, its prewarm taken: ready for its first push. */
+async function firstTurnAgent(model?: string) {
+  const w = await world({ pushy: true, post: { firstTurn: { reasoning: "off" } }, ...(model ? { model } : {}) });
+  must((await imp(w, importBody(uuid(), [{ path: "a.md", text: "x" }]))).status === 201, "import");
+  await consumer(w).run(prewarms(w));
+  return w;
+}
+/** Push `text`, wait for the next model job, take it. */
+async function nextJob(w: World, id: string, text: string) {
+  const before = jobCount(w);
+  must(await push(w, id, text) === 202, `push ${id}`);
+  await settle(w, before + 1);
+  must(jobCount(w) === before + 1, `no job after ${id}: ${jobCount(w)}`);
+  return { id: w.jobs[before]!, job: await w.D.takeJob(T, A, w.jobs[before]!) as any };
+}
+const answerWith = async (w: World, j: { id: string }, r: { text: string } | { call: string }) => { await w.D.deliverAnswer(T, A, j.id, reply(j.id, r), 5); };
+/** Alarm passes until the agent is idle between turns, as a fresh context and a rebuild need it. */
+async function quiet(w: World) {
+  for (let i = 0; i < 40 && w.rt.notIdle(); i++) { await w.D.alarm(); await sleep(10); }
+  must(!w.rt.notIdle(), `not idle: ${w.rt.notIdle()}`);
+}
+
+await check("firstTurn off is had once per agent: turn 1 off, turn 2 on, a fresh context, turn 3 still on", async () => {
+  const w = await firstTurnAgent();
+  const t1 = await nextJob(w, "e1", "Hi");
+  must(t1.job.reasoning === "off", `turn 1: ${show(t1.job.reasoning)}`);
+  await answerWith(w, t1, { text: "Hello." });
+  const t2 = await nextJob(w, "e2", "Thanks");
+  must(!("reasoning" in t2.job), `turn 2: ${show(t2.job.reasoning)}`);
+  await answerWith(w, t2, { text: "Sure." });
+  await quiet(w);
+  const fresh = await w.D.freshContext(T, A);
+  must(fresh.ok, `fresh context: ${show(fresh)}`);
+  const t3 = await nextJob(w, "e3", "Start over");
+  must(!t3.job.context.messages.some((m: any) => m.role === "assistant"), "turn 3 is not in a new conversation");
+  must(!("reasoning" in t3.job), `turn 3, after a fresh context: ${show(t3.job.reasoning)}`);
+});
+
+await check("…and after an operator rebuild (reset-session with rebuild): the new conversation's first call runs with reasoning", async () => {
+  const w = await firstTurnAgent();
+  const t1 = await nextJob(w, "e1", "Hi");
+  must(t1.job.reasoning === "off", "turn 1");
+  await answerWith(w, t1, { text: "Hello." });
+  await quiet(w);
+  const before = jobCount(w);
+  const r = await w.D.resetSession(T, A, true);
+  must(r.ok && r.rebuilt, `rebuild: ${show(r)}`);
+  await settle(w, before + 1);
+  must(jobCount(w) === before + 1, `the rebuild drove no call: ${jobCount(w)}`);
+  const job = await w.D.takeJob(T, A, w.jobs[before]!) as any;
+  must(!("reasoning" in job), `the rebuilt conversation's call: ${show(job.reasoning)}`);
+});
+
+await check("a fresh context before the first turn ends the first turn too: the agent began elsewhere", async () => {
+  const w = await firstTurnAgent();
+  must((await w.D.freshContext(T, A)).ok, "fresh context");
+  const t1 = await nextJob(w, "e1", "Hi");
+  must(!("reasoning" in t1.job), `after a fresh context: ${show(t1.job.reasoning)}`);
+});
+
+await check("a first turn cancelled mid tool loop does not carry reasoning off into the next turn", async () => {
+  const w = await firstTurnAgent();
+  const t1 = await nextJob(w, "e1", "Hi");
+  must(t1.job.reasoning === "off", "turn 1");
+  await answerWith(w, t1, { call: "p__noop" });
+  await settle(w, jobCount(w) + 1);
+  await w.rt.cancelSession(T, A);
+  const t2 = await nextJob(w, "e2", "Never mind, something else");
+  must(t2.job.context.messages.filter((m: any) => m.role === "assistant").every((m: any) => m.stopReason === "toolUse"),
+    "the case does not test what it says: the next turn's conversation holds a turn-ending answer");
+  must(!("reasoning" in t2.job), `the turn after a cancel: ${show(t2.job.reasoning)}`);
+});
+
+await check("a model with no known off field is not sent one: its first turn runs with its default", async () => {
+  const w = await firstTurnAgent("m1");
+  const t1 = await nextJob(w, "e1", "Hi");
+  must(!("reasoning" in t1.job), `m1 first turn: ${show(t1.job.reasoning)}`);
+});
+
+await check("a prewarm whose harness or prefix throws after the take ends failed, with its trace row", async () => {
+  const w = await world();
+  must((await imp(w, importBody(uuid(), [{ path: "a.md", text: "x" }]))).status === 201, "import");
+  const { PiAgent } = await import("../src/runtime/pi-agent.ts");
+  const real = PiAgent.prototype.requestPrefix;
+  PiAgent.prototype.requestPrefix = async () => { throw new Error("prefix unreadable"); };
+  const c = consumer(w);
+  try { must(show(await c.run(prewarms(w))) === show(["ack"]), "acked"); }
+  finally { PiAgent.prototype.requestPrefix = real; }
+  must(c.asked.length === 0, "the provider was called");
+  const rows = traceRows(w, "model.prewarm");
+  must(rows.length === 1 && rows[0].status === "failed" && rows[0].verdict === "failed" && /prefix unreadable/.test(rows[0].attrs.outcome), `trace: ${show(rows)}`);
 });
 
 await check("firstTurn on POST: only { reasoning: \"off\" } or absent/null; a replay must repeat it (409 otherwise); absent records nothing", async () => {
