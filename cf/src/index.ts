@@ -98,7 +98,7 @@ import { d1ServiceTokens } from "./control-plane.ts";
 import { adminServiceTokens } from "./admin-service-tokens.ts";
 import { hashServiceToken, looksLikeServiceToken } from "./service-token.ts";
 import { adminProviderTokens } from "./admin-provider-tokens.ts";
-import { d1Connections, d1Connectors, d1ModelChoices, d1ModelOverrides, d1ProviderTokens, d1ProvisionedAgents } from "./control-plane.ts";
+import { d1Connections, d1Connectors, d1ModelChoices, d1ModelOverrides, d1ProviderTokens, d1ProvisionedAgents, d1TenantModelPicker } from "./control-plane.ts";
 import { CONNECT_START_PATH, CONNECTION_PLUGIN, connectCallback, connectLink, connectStart, isConnectCallback, type ConnectDeps } from "./provision/connect.ts";
 import { hashProviderToken, looksLikeProviderToken } from "./provider-token.ts";
 import { handleProvision, IMPORT_REQUEST_MAX_BYTES, IMPORT_ROUTE, type ProvisionDeps, type ProvisionTool } from "./provision/handlers.ts";
@@ -203,6 +203,14 @@ export interface Env {
    * test/eval-seed.ts fails if cf/wrangler.jsonc sets it. Anything else: the routes answer 404.
    */
   EVAL_SEED_ROUTES?: string;
+  /**
+   * "1" applies each Raft server's model-picker switch (PUT /provision/servers/:id/model-picker): with it off, a provider
+   * pick of another model than the default is 403 model_picker_disabled (cf/src/provision/handlers.ts `pickerProblem`).
+   * Anything else, or unset: the switch is stored and reported but refuses nothing. Set in no wrangler config until Raft
+   * sets every server's switch (docs/agent-surface.md, "The server's model picker"); test/provision-model.ts fails if
+   * cf/wrangler.jsonc or cf/wrangler.preview.jsonc sets it.
+   */
+  MODEL_PICKER_ENFORCE?: string;
   /** The canonical origin, so the registered callback URL is built from a
    *  constant and never from an inbound Host header. */
   /** Login with GitHub: the OAuth App tygg owns, callback /login/github/callback. */
@@ -3537,6 +3545,11 @@ export function evalSeedRoutes(env: Pick<Env, "EVAL_SEED_ROUTES">): boolean {
   return env.EVAL_SEED_ROUTES === "1";
 }
 
+/** Whether a server's model-picker switch refuses provider picks here: exactly "1", nothing looser; unset is off. */
+export function modelPickerEnforced(env: Pick<Env, "MODEL_PICKER_ENFORCE">): boolean {
+  return env.MODEL_PICKER_ENFORCE === "1";
+}
+
 /**
  * What the provisioning rules act through: D1 for the registry, the agents' objects for everything
  * else. Shared by the provider route and the operator's push repair, so both reach an agent the same way.
@@ -3567,6 +3580,8 @@ function provisionDeps(env: Env): ProvisionDeps {
       defaultModel: env.HARNESS_MODEL,
       choices: d1ModelChoices(env.CONTROL_DB),
       rebind: (tenantId, agentId) => stub(tenantId, agentId).rebindModel(tenantId, agentId),
+      picker: d1TenantModelPicker(env.CONTROL_DB),
+      enforcePicker: modelPickerEnforced(env),
     },
     ...(evalSeedRoutes(env) ? {
       seed: {

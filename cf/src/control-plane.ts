@@ -703,3 +703,28 @@ export function d1ModelChoices(db: D1Database): ModelChoices {
     },
   };
 }
+
+/**
+ * Whether a tenant (a Raft server) may pick a model other than the default through the provider routes (0022). Off
+ * unless Raft has said otherwise: the deployment decides, and an operator's rows decide per tenant or agent.
+ */
+export interface TenantModelPicker {
+  enabled(tenantId: string): Promise<boolean>;
+  set(tenantId: string, enabled: boolean, setBy: string, at: number): Promise<void>;
+}
+
+export function d1TenantModelPicker(db: D1Database): TenantModelPicker {
+  return {
+    async enabled(tenantId) {
+      const r = await db.prepare("SELECT enabled FROM tenant_model_picker WHERE tenant_id = ?").bind(tenantId).first<any>();
+      // Only an explicit 1 is on: no row, or anything else, is the default (off).
+      return Number(r?.enabled) === 1;
+    },
+    async set(tenantId, enabled, setBy, at) {
+      await db.prepare(
+        `INSERT INTO tenant_model_picker (tenant_id, enabled, set_by, set_at) VALUES (?, ?, ?, ?)
+         ON CONFLICT (tenant_id) DO UPDATE SET enabled = excluded.enabled, set_by = excluded.set_by, set_at = excluded.set_at`,
+      ).bind(tenantId, enabled ? 1 : 0, setBy, at).run();
+    },
+  };
+}
