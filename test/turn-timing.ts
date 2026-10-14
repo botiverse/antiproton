@@ -69,12 +69,12 @@ const BASE_DB = JSON.stringify({
 });
 
 const USAGE = { input: 7, output: 3, cacheRead: 0, cacheWrite: 0, totalTokens: 10, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
-type Reply = { calls: Array<{ id: string; name: string; arguments: Record<string, unknown> }> } | { text: string };
+type Reply = ({ calls: Array<{ id: string; name: string; arguments: Record<string, unknown> }> } | { text: string }) & { usage?: typeof USAGE };
 /** An answer as the queue consumer delivers it, carrying its job id (src/model/pi-bridge.ts), which its model.call row joins by. */
 const answer = (r: Reply, jobId: string) => ({ jobId,
   role: "assistant",
   content: "text" in r ? [{ type: "text", text: r.text }] : r.calls.map((c) => ({ type: "toolCall", ...c })),
-  api: "openai-completions", provider: "deepseek", model: "deepseek-flash", usage: USAGE,
+  api: "openai-completions", provider: "deepseek", model: "deepseek-flash", usage: r.usage ?? USAGE,
   stopReason: "text" in r ? "stop" : "toolUse", timestamp: 0,
 });
 
@@ -298,6 +298,20 @@ await check("…and the model.call rows are as they were: one per job, their ms 
   const calls = seq.o.rows("model.call");
   must(calls.length === 3 && calls.every((c) => near(c.ms ?? -1, MODEL_MS)), show(calls));
   must(calls.reduce((s, c) => s + (c.ms ?? 0), 0) === seq.timing[0]!.attrs.modelMs, "modelMs is not the model.call rows' sum");
+});
+
+await check("the first model call's prompt and cache-hit tokens are on the row, the first call's and not a later one's", async () => {
+  const tokens = (input: number, cacheRead: number) => ({ ...USAGE, input, cacheRead, totalTokens: input + 3 });
+  const r = await apiTurns("tokens", [{ text: "Please cancel order W1.", script: [
+    { ...SEQ[0]!, usage: tokens(9340, 9088) }, { ...SEQ[1]!, usage: tokens(9500, 9400) }, { ...SEQ[2]!, usage: tokens(9600, 9500) },
+  ] }]);
+  const a = r.timing[0]!.attrs;
+  must(a.firstCallPromptTokens === 9340 && a.firstCallCachedTokens === 9088, `first call tokens: ${show(a)}`);
+  wellFormed(r.timing[0]!, r.marks[0]);
+  // A cold first call says so: 0 read from cache, not null.
+  const cold = await apiTurns("cold", [{ text: "Hello.", script: [{ text: "Hi.", usage: tokens(9247, 0) }] }]);
+  const c = cold.timing[0]!.attrs;
+  must(c.firstCallPromptTokens === 9247 && c.firstCallCachedTokens === 0, `cold first call: ${show(c)}`);
 });
 
 await check("two customer messages: two turns, two rows with their own span ids, each well formed", async () => {

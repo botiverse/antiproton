@@ -21,7 +21,8 @@ import { DurableAgent, PdHost, recordedEngine } from "../../src/runtime/durable-
 import { busyReason, clientCallsWaiting, migrateToPd, revertToPi085, type MigrationResult, type RevertResult } from "../../src/runtime/pd-migrate.ts";
 import { sealSeedFiles, seedInline, sha256Hex, type SealHow, type SeedMode, type SeedWriteResult } from "../../src/store/seed-files.ts";
 import {
-  commitImport, importDecided, importInline, IMPORT_HOLD_MAX_MS, liftHold, markInstructionsApplied, markStarted, placeHold, readHold, spillKey,
+  agentStarted, commitImport, importDecided, importInline, IMPORT_HOLD_MAX_MS, liftHold, markInstructionsApplied, markStarted, placeHold, readHold,
+  readImport, spillKey,
   type CommitResult, type ImportHold, type ImportRow,
 } from "../../src/store/workspace-import.ts";
 import { logEvent } from "../../src/core/log.ts";
@@ -160,7 +161,11 @@ export function hostCallOpts(call: { opts?: unknown; callId?: string }): InvokeO
 }
 import type { MountPolicy, MountRecord } from "../../src/core/types.ts";
 import type { HookDirectory, HookRow } from "./control-plane.ts";
-import { jsRunRows } from "../../src/usage/outbox.ts";
+import { appendUsage, jsRunRows, modelTokenRows } from "../../src/usage/outbox.ts";
+import {
+  finishPrewarm, firstTurnDone, firstTurnOf, inFirstTurn, markFirstTurnDone, PREWARM_USER_TEXT, prewarmable, prewarmJobId,
+  queuePrewarm, readPrewarm, reasoningOffSupported, takePrewarm,
+} from "../../src/runtime/prewarm.ts";
 import { RunJsContinuations } from "../../src/runtime/run-js-resume.ts";
 
 /** What an operator may call a mount: it becomes the `<alias>__` prefix of every tool name. */
@@ -3438,6 +3443,9 @@ export class AgentRuntime {
       const r = this.#transact()(() => {
         const c = commitImport(sql, tenantId, agentId, { ...imp, files, rows }, Date.now());
         if (c.ok && c.lifted) holdEnded(sql, tenantId, agentId, c.lifted);
+        // Whole without instructions: the first turn's prompt is final now, so its prefix can be warmed
+        // (src/runtime/prewarm.ts). With instructions it is owed when they are applied (`importInstructionsApplied`).
+        if (c.ok && c.created && c.record.instructions === "none") queuePrewarm(sql, tenantId, agentId, c.record.migrationId, Date.now());
         return c;
       });
       if (!r.ok || !r.created) await drop();
@@ -3455,8 +3463,111 @@ export class AgentRuntime {
     return this.#transact()(() => {
       const lifted = markInstructionsApplied(sql, tenantId, agentId, migrationId, Date.now());
       if (lifted) holdEnded(sql, tenantId, agentId, lifted);
+      const rec = readImport(sql, tenantId, agentId)?.record;
+      if (rec && rec.migrationId === migrationId && rec.instructions === "applied") queuePrewarm(sql, tenantId, agentId, migrationId, Date.now());
       return lifted;
     });
+  }
+
+  // ---- the prompt-cache prewarm after an import (src/runtime/prewarm.ts) ------------------------------------------
+
+  /** The prewarm's queue job id while one is queued and not yet taken, else null: what the object sends after an import. */
+  prewarmToSend(tenantId: string, agentId: string): string | null {
+    const r = readPrewarm(this.#deps.ctx.storage.sql, tenantId, agentId);
+    return r && r.state === "queued" ? prewarmJobId(r.migrationId) : null;
+  }
+
+  /**
+   * The queue consumer's take of a prewarm: the request to send, once, or null — taken already, or skipped, with the
+   * reason recorded and a trace row. The request is the first turn's own prefix (`requestPrefix`, from the harness the
+   * turn will run on) with a one-character user message, the model and provider `takeJob` would name, and the
+   * reasoning the first turn will run with (`#reasoningFor`), since the cache is keyed on it.
+   */
+  async takePrewarm(tenantId: string, agentId: string, jobId: string) {
+    await this.ready();
+    const sql = this.#deps.ctx.storage.sql;
+    const row = readPrewarm(sql, tenantId, agentId);
+    if (!row || prewarmJobId(row.migrationId) !== jobId) return null;
+    if (!this.#transact()(() => takePrewarm(sql, tenantId, agentId, row.migrationId, Date.now()))) return null;
+    const skip = (why: string) => { this.#prewarmEnded(tenantId, agentId, row.migrationId, `skipped: ${why}`, null); return null; };
+    const started = agentStarted(sql, tenantId, agentId);
+    if (started) return skip(`the agent has started (${started}); its own call warms the cache`);
+    if (this.#isPd()) return skip("the pd engine places its prompt in the conversation");
+    const b = await this.store.getModelBinding(tenantId, agentId);
+    const provider = b ? providerOfRef(b.secretRef) : null;
+    if (!b || !provider) return skip("the agent's model is on its own credential");
+    if (!prewarmable(b.model)) return skip(`${b.model} is not a model whose prompt cache a prewarm is known to fill`);
+    // Taken already: a throw from here (opening the harness, repinning its mounts, reading its prefix) ends the
+    // prewarm as failed, with its trace row, rather than leaving it taken and unsaid.
+    try {
+      const agent = await this.agent(tenantId, agentId);
+      if (!agent.requestPrefix) return skip("the engine cannot say its request prefix");
+      const prefix = await agent.requestPrefix();
+      const context = { systemPrompt: prefix.systemPrompt, tools: prefix.tools,
+        messages: [{ role: "user", content: [{ type: "text", text: PREWARM_USER_TEXT }], timestamp: Date.now() }] };
+      const reasoning = await this.#reasoningFor(tenantId, agentId, MAIN_SESSION, context, b.model);
+      return { context, operatorModel: b.model, operatorProvider: provider, ...(reasoning ? { reasoning } : {}) };
+    } catch (e) {
+      this.#prewarmEnded(tenantId, agentId, row.migrationId, `failed: ${String((e as Error)?.message ?? e).slice(0, 160)}`, { model: b.model });
+      return null;
+    }
+  }
+
+  /**
+   * The consumer's report of a prewarm it took: its tokens metered like any call's (the usage outbox, in the same
+   * transaction as the row that says it ended), and a `model.prewarm` trace row. A second report changes nothing.
+   */
+  async prewarmDone(tenantId: string, agentId: string, jobId: string,
+    result: { model: string; outcome: string; ms?: number; usage?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; reasoning?: number } | null }) {
+    await this.ready();
+    const row = readPrewarm(this.#deps.ctx.storage.sql, tenantId, agentId);
+    if (!row || prewarmJobId(row.migrationId) !== jobId) return false;
+    return this.#prewarmEnded(tenantId, agentId, row.migrationId, String(result.outcome ?? "warmed"), result);
+  }
+
+  #prewarmEnded(tenantId: string, agentId: string, migrationId: string, outcome: string,
+    result: { model: string; ms?: number; usage?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; reasoning?: number } | null } | null): boolean {
+    const sql = this.#deps.ctx.storage.sql;
+    const now = Date.now();
+    return this.#transact()(() => {
+      if (!finishPrewarm(sql, tenantId, agentId, migrationId, outcome, now)) return false;
+      const u = result?.usage ?? null;
+      if (u) appendUsage(sql as never, modelTokenRows({ at: now, tenantId, agentId }, result!.model, u));
+      appendTrace(sql, [{
+        at: now, tenantId, agentId, kind: "model.prewarm", spanId: `prewarm_${migrationId}`,
+        status: outcome.split(":")[0]!, verdict: outcome.startsWith("failed") ? "failed" : "ok",
+        ...(result?.ms !== undefined ? { ms: result.ms } : {}),
+        attrs: { outcome, ...(result ? { model: result.model } : {}),
+          ...(u ? { inputTokens: u.input ?? 0, cacheReadTokens: u.cacheRead ?? 0, outputTokens: u.output ?? 0 } : {}) },
+      }]);
+      return true;
+    });
+  }
+
+  /**
+   * The reasoning a model call of this agent runs with, when it is not the provider's default: `off` for a call of
+   * the agent's first turn on an agent made with `firstTurn: { reasoning: "off" }` (POST /provision/agents;
+   * src/runtime/prewarm.ts). Undefined otherwise, which sends the request it always was. Had once per agent: this
+   * call's conversation holds no turn-ending answer (`inFirstTurn`), it is the agent's first main conversation, and no
+   * cancel ended a turn of it (`firstTurnDone`). A reply ends it within its conversation, and every later conversation
+   * is a new one after an ended first, so no other mark is needed (pi085 does not compact in place; a fresh context, a
+   * rebuild and the overflow backstop all start a new main conversation, `startFreshMain`). `model` is the one the
+   * call reaches: one with no known off field (`reasoningOffSupported`) runs with its default.
+   */
+  async #reasoningFor(tenantId: string, agentId: string, session: string, context: unknown, model: string | undefined): Promise<"off" | undefined> {
+    if (session !== MAIN_SESSION) return undefined;
+    const first = firstTurnOf((await this.store.loadAgent(tenantId, agentId))?.config);
+    if (!first || !model || !reasoningOffSupported(model)) return undefined;
+    const sql = this.#deps.ctx.storage.sql;
+    if (firstTurnDone(sql, tenantId, agentId)) return undefined;
+    return inFirstTurn(context) ? first.reasoning : undefined;
+  }
+
+  /** A turn of the main conversation was cancelled: an agent made with `firstTurn` has had its first. */
+  async #firstTurnEnded(tenantId: string, agentId: string, session: string, how: string) {
+    if (session !== MAIN_SESSION) return;
+    if (!firstTurnOf((await this.store.loadAgent(tenantId, agentId))?.config)) return;
+    markFirstTurnDone(this.#deps.ctx.storage.sql, tenantId, agentId, how, Date.now());
   }
 
   /** Hold a new agent until its import (`awaitImport`, src/store/workspace-import.ts); once per agent. */
@@ -3899,6 +4010,12 @@ export class AgentRuntime {
     const dropped = await agent.dropClientCalls();
     if (dropped > 0 && !cancelledTurn) {
       await agent.markCancelled(TURN_CANCELLED);
+    }
+    // A first turn cancelled mid tool loop leaves no turn-ending answer; without this mark the next turn would still
+    // read as the first (`#reasoningFor`).
+    if (cancelledTurn || dropped > 0) {
+      try { await this.#firstTurnEnded(tenantId, agentId, session, "cancelled"); }
+      catch (e) { console.error(`marking the first turn of ${tenantId}/${agentId} done failed:`, e); }
     }
     // The turn ends here when a run was aborted or it was waiting on the caller: no later step sees it end. With
     // neither, nothing was running, and a record there is no turn's: it is forgotten without a row.
@@ -4496,7 +4613,10 @@ export class AgentRuntime {
     // (`recordImageAttempt`); the flag is the object's, and the consumer has no other way to know it. Not on pd,
     // whose calls have no input record for the evidence to join.
     const mark = this.#deps.modelInputEvidence && !this.#isPd();
-    return { ...job, operatorModel: provider ? b!.model : null, operatorProvider: provider, ...(mark ? { imageEvidence: true } : {}) };
+    // The first turn's reasoning, for an agent made to answer its first message without (`#reasoningFor`).
+    const reasoning = await this.#reasoningFor(tenantId, agentId, session, (job as { context?: unknown }).context, this.#calledModel(b));
+    return { ...job, operatorModel: provider ? b!.model : null, operatorProvider: provider, ...(mark ? { imageEvidence: true } : {}),
+      ...(reasoning ? { reasoning } : {}) };
   }
 
   /**

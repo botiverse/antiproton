@@ -147,7 +147,8 @@ async function world(opts: { flag?: string | null; post?: Record<string, unknown
   };
   const R2 = bucket();
   const env: Record<string, unknown> = {
-    MODEL_QUEUE: { send: async (m: { jobId: string }) => { jobs.push(m.jobId); } },
+    // A prewarm (src/runtime/prewarm.ts, test/prewarm.ts) is not a model job of the conversation: only jobs are counted.
+    MODEL_QUEUE: { send: async (m: { jobId: string; kind?: string }) => { if (m.kind !== "prewarm") jobs.push(m.jobId); } },
     ARTIFACTS: R2, ARTIFACT_BUCKET: "b", CONTROL_DB: DB, HARNESS_MODEL: "m1",
     DEEPSEEK_BASE_URL: "https://model.example/v1", DEEPSEEK_API_KEY: "k", AUTOMATION_TOKEN: AUTOMATION,
     SECRET_KEK: Buffer.from(new Uint8Array(32).fill(3)).toString("base64"),

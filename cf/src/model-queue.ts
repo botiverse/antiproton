@@ -13,6 +13,11 @@ export interface QueuedModelCall {
   tenantId: string;
   agentId: string;
   jobId: string;
+  /**
+   * `prewarm`: not a job of the conversation but a prompt-cache prewarm (src/runtime/prewarm.ts), taken and reported
+   * through its own two methods and never retried. Absent: a model job, as every message was before.
+   */
+  kind?: "prewarm";
 }
 
 /**
@@ -64,6 +69,10 @@ export interface ModelJobStub {
   releaseJob(tenantId: string, agentId: string, jobId: string, taker: string): Promise<unknown>;
   /** `taker`: the attempt whose call this answers, so a replay of this RPC is metered once (`PdHost.deliver`). */
   deliverAnswer(tenantId: string, agentId: string, jobId: string, answer: unknown, modelMs: number, taker?: string): Promise<unknown>;
+  /** A prewarm's request, once; null when it was taken already or is skipped (`AgentRuntime.takePrewarm`). */
+  takePrewarm?(tenantId: string, agentId: string, jobId: string): Promise<unknown>;
+  /** How the prewarm ended, and its usage to meter (`AgentRuntime.prewarmDone`). */
+  prewarmDone?(tenantId: string, agentId: string, jobId: string, result: unknown): Promise<unknown>;
 }
 
 export interface ModelQueueDeps {
@@ -78,6 +87,8 @@ export interface ModelQueueDeps {
    * neither the queue nor the harness sends the call again.
    */
   admit?(job: unknown, m: QueuedModelCall): Promise<unknown | null>;
+  /** A prewarm's provider call (cf/src/model-request.ts `callPrewarm`): never throws, its failure is its outcome. */
+  prewarm?(job: unknown, m: QueuedModelCall): Promise<{ model: string; outcome: string } & Record<string, unknown>>;
 }
 
 export interface ModelQueueMessage {
@@ -157,11 +168,41 @@ export async function failLoudly(m: QueuedModelCall, deps: ModelQueueDeps): Prom
  * so it is acked like a success: retrying cannot create the row, and a retry
  * would only walk it to the dead letter queue and back here.
  */
+/**
+ * A prompt-cache prewarm (src/runtime/prewarm.ts): taken once from the object, called, reported back. Admitted like a
+ * model call (the daily spend limits): a refusal skips it. Nothing here throws to the queue: a prewarm is at most once,
+ * so a failure is reported as its outcome and the message acked, never sent again.
+ */
+export async function runPrewarm(m: QueuedModelCall, deps: ModelQueueDeps): Promise<void> {
+  const stub = deps.stub(m);
+  if (!stub.takePrewarm || !stub.prewarmDone || !deps.prewarm) return;
+  let job: unknown;
+  try { job = await stub.takePrewarm(m.tenantId, m.agentId, m.jobId); }
+  catch (e) { logEvent("model_prewarm.take_failed", { tenantId: m.tenantId, agentId: m.agentId, jobId: m.jobId, error: String((e as Error)?.message ?? e).slice(0, 200) }); return; }
+  if (!job) return;
+  const model = String((job as { operatorModel?: unknown }).operatorModel ?? "unknown");
+  let result: { model: string; outcome: string } & Record<string, unknown>;
+  try {
+    const refused = deps.admit ? await deps.admit(job, m) : null;
+    result = refused ? { model, outcome: "skipped: a daily spend limit is reached" } : await deps.prewarm(job, m);
+  } catch (e) {
+    result = { model, outcome: `failed: ${String((e as Error)?.message ?? e).slice(0, 160)}` };
+  }
+  try { await stub.prewarmDone(m.tenantId, m.agentId, m.jobId, result); }
+  catch (e) { logEvent("model_prewarm.report_failed", { tenantId: m.tenantId, agentId: m.agentId, jobId: m.jobId, error: String((e as Error)?.message ?? e).slice(0, 200) }); }
+}
+
 export async function consumeModelCalls(
   batch: { readonly queue: string; readonly messages: readonly ModelQueueMessage[] },
   deps: ModelQueueDeps,
 ): Promise<void> {
   for (const message of batch.messages) {
+    if (message.body.kind === "prewarm") {
+      // Never retried, and no answer is owed to anyone: on the dead letter queue there is nothing to give up on.
+      if (!batch.queue.endsWith("-dlq")) await runPrewarm(message.body, deps);
+      message.ack();
+      continue;
+    }
     if (batch.queue.endsWith("-dlq")) {
       await failLoudly(message.body, deps);
       message.ack();

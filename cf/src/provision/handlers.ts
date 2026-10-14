@@ -41,6 +41,7 @@ import { resolveModel } from "../model-request.ts";
 import { optionFor, type UserModels } from "../../../src/model/user-models.ts";
 import type { ModelChoice } from "../../../src/model/providers.ts";
 import { tenantUsage, type ProvisionUsage } from "./usage.ts";
+import type { FirstTurn } from "../../../src/runtime/prewarm.ts";
 
 export type ProvisionTool = "enable_push" | "disable_push";
 
@@ -55,7 +56,7 @@ export interface ProvisionAgentOps {
    * says nothing about them. A Fail is the agent's refusal of it (cf/src/provision/steps.ts): another one recorded
    * already (409), or one this deployment cannot give (400). Nothing is written when it refuses.
    */
-  adopt(tenantId: string, agentId: string, spec: { name: string; instructions: string; raftOrigin: string; toolConfig?: ToolConfig | null; awaitImport?: boolean }): Promise<void | Fail>;
+  adopt(tenantId: string, agentId: string, spec: { name: string; instructions: string; raftOrigin: string; toolConfig?: ToolConfig | null; awaitImport?: boolean; firstTurn?: FirstTurn | null }): Promise<void | Fail>;
   /** Seal the credential onto the `raft` mount; the plugin checks it against Raft. */
   attachCredential(tenantId: string, agentId: string, credential: string): Promise<{ ok: true; account: string | null } | { ok: false; error: string }>;
   removeCredential(tenantId: string, agentId: string): Promise<boolean>;
@@ -269,6 +270,21 @@ export async function sha256Hex(value: string): Promise<string> {
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+/**
+ * `firstTurn` of a POST: absent or null is none; otherwise exactly `{ "reasoning": "off" }`, the one value there is.
+ * Anything else is refused naming the field, never read as the nearest value, so a caller asking for something this
+ * deployment does not do learns so.
+ */
+export function firstTurnField(body: unknown): FirstTurn | null | Fail {
+  const v = field(body, "firstTurn");
+  if (v === undefined || v === null) return null;
+  const keys = typeof v === "object" && !Array.isArray(v) ? Object.keys(v as object) : null;
+  if (!keys || keys.length !== 1 || (v as Record<string, unknown>).reasoning !== "off") {
+    return { status: 422, code: "invalid", param: "firstTurn", message: 'firstTurn is { "reasoning": "off" } or absent' };
+  }
+  return { reasoning: "off" };
+}
+
 function credentialField(body: unknown): string | Fail {
   const v = field(body, "credential");
   if (typeof v !== "string" || !v) return { status: 422, code: "missing", message: "credential is required", param: "credential" };
@@ -396,6 +412,10 @@ export async function handleProvision(
       return fail({ status: 422, code: "invalid", param: "awaitImport", message: "awaitImport is true or false" });
     }
     const awaitImport = awaitField === true;
+    // How the agent's first turn runs (src/runtime/prewarm.ts): `{ "reasoning": "off" }` answers its first message
+    // without reasoning, for an agent whose first reply someone is waiting on. Absent: as every other turn.
+    const firstTurn = firstTurnField(body);
+    if (isFail(firstTurn)) return fail(firstTurn);
 
     const agentId = providerAgentId(raftAgentId);
     // `model` is part of the request a replay must repeat: absent and null are one value (null), as on a create.
@@ -459,7 +479,7 @@ export async function handleProvision(
     // From here every step is idempotent, so a replay of a request that died half-way finishes it. The tool choice is
     // compared by the agent's object, where it is recorded: a replay asking for other tools is 409, as for any field.
     const adopted = await deps.agent.adopt(tenantId, agentId, { name: row.name, instructions: row.instructions, raftOrigin: row.raftOrigin, toolConfig,
-      ...(row.awaitImport ? { awaitImport: true } : {}) });
+      firstTurn, ...(row.awaitImport ? { awaitImport: true } : {}) });
     if (adopted) return fail(adopted);
     const attached = await deps.agent.attachCredential(tenantId, agentId, credential);
     if (!attached.ok) return fail({ status: 422, code: "credential_refused", message: attached.error, param: "credential" });

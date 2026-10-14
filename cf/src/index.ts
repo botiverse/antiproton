@@ -112,7 +112,8 @@ import { hasPendingInbound, inboundStatus, lowerHeaders, newHookId, readCapped }
 import { forgetHookRoute, routeHook, type HookRoute, type RouteSource } from "./hook-route.ts";
 import { HTMX_SRC, staticAsset } from "./static.ts";
 import { clip, logEvent, routeOf, setLogSink } from "../../src/core/log.ts";
-import { operatorModelOf, queuedCall, planBinding, resolveModel } from "./model-request.ts";
+import type { FirstTurn } from "../../src/runtime/prewarm.ts";
+import { callPrewarm, operatorModelOf, queuedCall, planBinding, resolveModel } from "./model-request.ts";
 import { userModelsFrom } from "../../src/model/user-models.ts";
 import { DEFAULT_PROVIDER, providerStatus, type ModelChoice } from "../../src/model/providers.ts";
 import { consumeModelCalls, isUnknownJobReply, replyingUnknownJob, type ModelQueueDeps, type QueuedModelCall, type UnknownJobReply } from "./model-queue.ts";
@@ -332,6 +333,7 @@ function modelQueueDeps(env: Env): ModelQueueDeps {
     // The daily spend limits, asked before every provider call (cf/src/spend-limit.ts): a refusal is delivered
     // as the job's answer and the call is never made.
     admit: spendAdmit(sharedSpendGate(env), env.HARNESS_MODEL),
+    prewarm: (job) => callPrewarm(env, job) as never,
   };
 }
 
@@ -2026,7 +2028,7 @@ export class AgentDO extends DurableObject<Env> {
   /** Provisioning's record + model + mount, in this agent's object (cf/src/provision/steps.ts). */
   async provisionAdopt(tenantId: string, agentId: string, specJson: string) {
     this.#claim(tenantId, agentId);
-    const spec = JSON.parse(specJson) as { name: string; instructions: string; raftOrigin: string; toolConfig?: ToolConfig | null; awaitImport?: boolean };
+    const spec = JSON.parse(specJson) as { name: string; instructions: string; raftOrigin: string; toolConfig?: ToolConfig | null; awaitImport?: boolean; firstTurn?: FirstTurn | null };
     return this.#busy("provisionAdopt", async () =>
       adoptProvisionedAgent(this.runtime(), tenantId, agentId, { ...spec, avatar: mintAvatar() }, await this.#modelFor(tenantId, agentId)));
   }
@@ -2056,6 +2058,7 @@ export class AgentDO extends DurableObject<Env> {
     if (!this.#isAgent(tenantId, agentId)) return { ok: false as const, code: "not_found" as const, message: `no agent ${agentId}` };
     return this.#busy("importWorkspace", async () => {
       const r = await this.runtime().importWorkspace(tenantId, agentId, imp);
+      if (r.ok) await this.#sendPrewarm(tenantId, agentId);
       // The hold it lifted (`awaitImport`): the pushes it kept queued are posted now, and the first turn starts.
       if (r.ok && r.lifted) await this.#wake();
       return r;
@@ -2065,8 +2068,34 @@ export class AgentDO extends DurableObject<Env> {
   async importInstructionsApplied(tenantId: string, agentId: string, migrationId: string) {
     if (!this.#isAgent(tenantId, agentId)) return;
     await this.#busy("importInstructionsApplied", async () => {
-      if (await this.runtime().importInstructionsApplied(tenantId, agentId, migrationId)) await this.#wake();
+      const lifted = await this.runtime().importInstructionsApplied(tenantId, agentId, migrationId);
+      await this.#sendPrewarm(tenantId, agentId);
+      if (lifted) await this.#wake();
     });
+  }
+
+  /**
+   * The prompt-cache prewarm an import made owed (src/runtime/prewarm.ts), handed to the model queue like a model call,
+   * so the provider call is waited on in the consumer, not here. Sent again by an import's retry while it is untaken,
+   * which the take makes harmless. A failure is logged and never the import's: the prewarm only saves time.
+   */
+  async #sendPrewarm(tenantId: string, agentId: string): Promise<void> {
+    try {
+      const jobId = this.runtime().prewarmToSend(tenantId, agentId);
+      if (jobId) await this.env.MODEL_QUEUE.send({ doId: this.ctx.id.toString(), tenantId, agentId, jobId, kind: "prewarm" });
+    } catch (e) { logEvent("model_prewarm.send_failed", { tenantId, agentId, error: String((e as Error)?.message ?? e).slice(0, 200) }); }
+  }
+
+  /** A prewarm's request for the queue consumer, once (`AgentRuntime.takePrewarm`); null for any other agent. */
+  async takePrewarm(tenantId: string, agentId: string, jobId: string) {
+    if (!this.#isAgent(tenantId, agentId)) return null;
+    return this.#busy("takePrewarm", () => this.runtime().takePrewarm(tenantId, agentId, jobId));
+  }
+
+  /** The consumer's report of a prewarm, metered here (`AgentRuntime.prewarmDone`). */
+  async prewarmDone(tenantId: string, agentId: string, jobId: string, result: unknown) {
+    if (!this.#isAgent(tenantId, agentId)) return false;
+    return this.#busy("prewarmDone", () => this.runtime().prewarmDone(tenantId, agentId, jobId, result as never));
   }
 
   async seedSeal(tenantId: string, agentId: string, credentialId: string | null) {

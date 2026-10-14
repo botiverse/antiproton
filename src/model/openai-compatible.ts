@@ -1,5 +1,5 @@
 import type { ModelAdapter, ModelMessage, ModelResponse, ToolDefinition } from "./types.ts";
-import { chatShapeFor } from "./chat-request-shape.ts";
+import { chatShapeFor, isDeepSeekModel } from "./chat-request-shape.ts";
 
 /**
  * How long one `complete` may take, every attempt and backoff included, before it is abandoned.
@@ -170,7 +170,9 @@ export class OpenAiCompatibleModel implements ModelAdapter {
     // DeepSeek's dialect: `thinking.type` switches the trace off, and
     // `reasoning_effort` sizes it. Nothing is sent when the caller did not ask,
     // so a request without the option is the request it always was.
-    const reasoningDial = opts.reasoning === "off" ? { thinking: { type: "disabled" } }
+    // `thinking` is DeepSeek's own field, sent only to a DeepSeek model: another provider behind the same
+    // endpoint may refuse a field it does not know, so "off" sends such a model nothing and it runs as it would.
+    const reasoningDial = opts.reasoning === "off" ? (isDeepSeekModel(this.#model) ? { thinking: { type: "disabled" } } : {})
       : opts.reasoning ? { reasoning_effort: opts.reasoning } : {};
     // An OpenAI model's fields (src/model/chat-request-shape.ts); null for every other model, whose
     // body below is exactly the one it always was.

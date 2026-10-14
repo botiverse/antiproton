@@ -100,7 +100,15 @@ export class OpenAiResponsesModel {
 
   async complete(
     input: ResponsesInputItem[],
-    opts: { tools?: ToolDefinition[]; reasoning?: "off" | "low" | "high"; maxTokens?: number; onStatus?: (status: number) => void } = {},
+    opts: {
+      tools?: ToolDefinition[]; reasoning?: "off" | "low" | "high"; maxTokens?: number; onStatus?: (status: number) => void;
+      /**
+       * Write the prompt cache for this input and generate nothing (`prompt_cache_options.prewarm`, GPT-5.6 and later:
+       * https://developers.openai.com/api/docs/guides/prompt-caching). Sent through Cloudflare AI Gateway's /compat, it
+       * answered `completed` with 0 output tokens, and the next request with the same prefix read it (2026-10-14).
+       */
+      prewarm?: boolean;
+    } = {},
   ): Promise<ModelResponse> {
     const reasoning = responsesReasoningFor(this.#model, opts.reasoning);
     const body = JSON.stringify({
@@ -113,6 +121,7 @@ export class OpenAiResponsesModel {
       ...(opts.tools?.length
         ? { tools: opts.tools.map((t) => ({ type: "function", name: t.name, description: t.description, parameters: t.parameters, strict: false })) }
         : {}),
+      ...(opts.prewarm ? { prompt_cache_options: { prewarm: true } } : {}),
     });
     return postModelRequest(
       { url: `${this.#baseUrl}/responses`, apiKey: this.#apiKey, model: this.#model, headers: this.#headers, deadlineMs: this.#deadlineMs, onStatus: opts.onStatus },

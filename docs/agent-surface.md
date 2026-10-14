@@ -449,6 +449,52 @@ agent that must not run before its import:
   value): the same answers the same, another is `409 idempotency_conflict` naming `awaitImport`. A hold is
   placed once per agent: a replay after the import (or the valve) never holds it again.
 
+#### The prompt-cache prewarm
+
+Once an import is whole (in its own transaction, or once its `instructions` are applied), the agent makes one
+cheap model call that carries exactly the system prompt and tools its first turn will send, so the provider has
+that prefix cached when the first message comes (`src/runtime/prewarm.ts`). Nothing for Raft to send or do:
+
+- **Not a turn.** No transcript entry, message or model job is written; the agent and its owner see nothing.
+- **Metered** like any model call (usage, `model.tokens`), with a trace row `model.prewarm`: `status` `warmed`,
+  `skipped` or `failed`, `attrs` the outcome, the model and its tokens (`inputTokens`, `cacheReadTokens`,
+  `outputTokens`).
+- **At most once per agent** (an agent is imported once), sent through the model queue, never retried, and never a
+  reason for the import to fail. Admitted against the daily spend limits like any call.
+- **Skipped** when the agent has already started a turn (a push held for the import runs as the import lands),
+  runs on its own model credential or the `pd` engine, or its model is neither DeepSeek's nor OpenAI's GPT-5.6 or
+  later (the models that take `prompt_cache_options.prewarm`).
+- **Same reasoning as the first turn**: both providers key their cache on it (a prewarm with thinking off did not
+  warm a turn with thinking on, measured 2026-10-14), so an agent made with `firstTurn` (below) is warmed with
+  reasoning off. Through the Responses API (GPT-5.6 Luna) it is a `prompt_cache_options.prewarm` request, which
+  generates nothing (capped at `max_output_tokens: 16`, the least the API takes); through chat/completions a
+  one-token call. OpenAI keeps that cache 30 minutes, DeepSeek hours.
+
+#### The first turn without reasoning (`firstTurn`)
+
+`POST /provision/agents` takes `firstTurn: { "reasoning": "off" }` (optional; absent or `null` is today's
+create) for an agent whose first reply someone is waiting on, such as an onboarding agent the owner talks to
+right after signing up:
+
+- **What it does.** Every model call of the agent's first turn — from its first input until a reply that ends
+  without a tool call — runs with reasoning off (DeepSeek `thinking: { type: "disabled" }`, OpenAI effort
+  `none`). Every later turn runs as any agent's does.
+- **Once per agent.** The first turn ends for good at the first of: an answer that ends a turn (a reply, a failure,
+  a cut-off), a cancel (recorded in the agent's object, so a first turn cancelled mid tool loop does not carry into
+  the next), or the end of the agent's first main conversation (a fresh context, or a rebuild, before or after
+  it). A new conversation after any of these runs with reasoning on.
+- **Models.** Applied only where the model has a known off field: DeepSeek's models, and OpenAI's (their catalog's
+  off level; one without reasoning is unchanged). Any other model's first turn runs with its default, and is sent
+  no field it might refuse. Not refused at the create, since the model can change after it (`PUT …/model`, an
+  admin's choice).
+- **The cost.** The cache is keyed on the reasoning setting, so the second turn reads nothing of the first's
+  prefix from cache and writes it anew; from the third turn on the cache is shared as usual.
+- **Values.** Exactly `{ "reasoning": "off" }`; anything else is `422`, `code: "invalid"`, `param: "firstTurn"`.
+- **Fixed at creation.** Recorded on the agent's record; a replay must repeat it (absent and `null` being one
+  value), another is `409 idempotency_conflict`. A `PATCH` and an import never change it.
+- **Nothing else changes**: the import contract is as it was, and an agent made without the field runs every
+  turn with the provider's default reasoning.
+
 ## Evaluation setup (preview only)
 
 Routes for an evaluator to give an agent its workspace before the agent first runs, start it on a
@@ -750,7 +796,7 @@ answer with `/admin/transcript`'s for the same agent).
 
 `GET …/trace` answers the agent's trace rows — the spans of its work, one row each when it ended
 (`model.call`, `tool.call`, `approval.wait`, `container.lease`, `inbound`, `mount.seeded`,
-`rebuild.decision`, `rebuild.outcome`, `rebuild.behaviour`, `turn.timing`, `import.hold`; `src/trace/outbox.ts`) — with `from <= at < to`, in `seq` order.
+`rebuild.decision`, `rebuild.outcome`, `rebuild.behaviour`, `turn.timing`, `import.hold`, `model.prewarm`; `src/trace/outbox.ts`) — with `from <= at < to`, in `seq` order.
 
 - `from`, `to` — ISO 8601 or milliseconds since the epoch; the window is at most 24 hours. One alone
   puts the other 24 hours away; neither is the 24 hours up to now. `to` before or at `from`, a wider
@@ -823,7 +869,10 @@ add up to `ms` when every job was answered: `inboundToStartMs`, `startToFirstJob
 answered, as `model.call` measures it), `betweenJobsMs` (each answer to the next job), `lastAnswerToReplyMs`; then,
 inside `betweenJobsMs`, `toolMs` (tools run by the agent, summed per call) and `clientWaitMs` (each pause, from the
 step that paused to the results that completed it), and `prepMs` (`inboundAt` to `saidAt`), with the counts
-`modelJobs`, `tools`, `clientPauses` and `messages` (a steer joins the turn in flight). pd agents write none.
+`modelJobs`, `tools`, `clientPauses` and `messages` (a steer joins the turn in flight), and the turn's first model
+call's `firstCallPromptTokens` and `firstCallCachedTokens` (how much of its prompt the provider read from cache:
+DeepSeek's `prompt_cache_hit_tokens`, OpenAI's `cached_tokens`; null while that call has no answer), which tell a
+first reply slowed by a cold cache from one slowed by the model. pd agents write none.
 The answer adds `from`, `to` (ISO), `cursor`, `nextCursor` and `scanned: { local, objects }`. Nothing
 is written.
 

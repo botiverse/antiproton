@@ -144,6 +144,7 @@
     "test/eval-seed.ts",
     "test/eval-seed-object.ts",
     "test/workspace-import.ts",
+    "test/prewarm.ts",
     "test/provision-model.ts",
     "test/provision-usage.ts",
     "test/admin-fail-closed.ts",

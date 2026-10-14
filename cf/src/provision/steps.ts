@@ -11,6 +11,7 @@ import { PUSH_KEY, PUSH_STORE, raftPlugin } from "../../../src/plugins/raft.ts";
 import type { Fail, ProvisionTool, PushStatus } from "./handlers.ts";
 import { canonicalToolConfig, sameToolConfig, toolConfigOf, type ToolConfig } from "../../../src/core/tool-config.ts";
 import { interruptsOf } from "../../../src/plugins/types.ts";
+import { firstTurnOf, type FirstTurn } from "../../../src/runtime/prewarm.ts";
 
 /** The alias the provisioned mount carries: the plugin's own name, as a person would pick. */
 export const PROVISION_MOUNT_ALIAS = "raft";
@@ -67,7 +68,7 @@ function toolConfigProblem(rt: AgentRuntime, t: ToolConfig): string | null {
  */
 export async function adoptProvisionedAgent(
   rt: AgentRuntime, tenantId: string, agentId: string,
-  spec: { name: string; instructions: string; raftOrigin: string; avatar: string; toolConfig?: ToolConfig | null; awaitImport?: boolean },
+  spec: { name: string; instructions: string; raftOrigin: string; avatar: string; toolConfig?: ToolConfig | null; awaitImport?: boolean; firstTurn?: FirstTurn | null },
   model?: ModelChoice | null,
 ): Promise<{ ok: true; avatar: string; modelRefused?: string } | { ok: false; error: string; refused?: Fail }> {
   await rt.ready();
@@ -80,6 +81,15 @@ export async function adoptProvisionedAgent(
       "an agent's tools are fixed when it is made, so a different set needs a new agent";
     return { ok: false, error, refused: { status: 409, code: "tool_config_conflict", message: error } };
   }
+  // `firstTurn` (src/runtime/prewarm.ts) is fixed at creation the same way: a POST asking for another, or none where
+  // one is recorded, is refused; absent (a PATCH, an import's instructions) keeps it.
+  const recordedFirst = firstTurnOf(config);
+  if (spec.firstTurn !== undefined && existing && JSON.stringify(recordedFirst) !== JSON.stringify(spec.firstTurn)) {
+    const error = `this agent was provisioned with firstTurn ${JSON.stringify(recordedFirst)}, and this request asks for ${JSON.stringify(spec.firstTurn)}; ` +
+      "it is fixed when the agent is made";
+    return { ok: false, error, refused: { status: 409, code: "idempotency_conflict", message: error } };
+  }
+  const firstTurn = spec.firstTurn === undefined ? recordedFirst : spec.firstTurn;
   // Written canonical whoever called (src/core/tool-config.ts), so the stored form is the compared and hashed one.
   const toolConfig = spec.toolConfig === undefined ? recorded : spec.toolConfig && canonicalToolConfig(spec.toolConfig);
   const problem = toolConfig ? toolConfigProblem(rt, toolConfig) : null;
@@ -88,6 +98,7 @@ export async function adoptProvisionedAgent(
   const persona = {
     ...config, name: spec.name, description: spec.instructions, avatar, provisionedBy: PROVISIONED_BY,
     ...(toolConfig ? { toolConfig } : {}),
+    ...(firstTurn ? { firstTurn } : {}),
   };
   if (!existing) await rt.store.createAgent(tenantId, agentId, persona as Json);
   else await rt.store.updateAgentConfig(tenantId, agentId, persona as Json);
