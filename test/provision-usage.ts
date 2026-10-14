@@ -76,7 +76,7 @@ const spend = (db: Db, tenant: string, usd: number, hour: number, agent = "a") =
 
 const ORIGIN = "https://api.raft.build";
 /** A reading's figures this suite does not test (test/onboarding-budget.ts does): no onboarding spend, no plan. */
-const NO_ONBOARDING = { onboardingUsd: 0, tenantOnboardingUsd: 0, plan: null, onboardingOverride: null } as const;
+const NO_ONBOARDING = { onboardingUsd: 0, tenantOnboardingUsd: 0, plan: null, onboardingOverride: null, onboardingTenantOverride: null } as const;
 async function token(db: Db, who: { scope: "tenant"; tenantId: string } | { scope: "platform" }): Promise<string> {
   const t = newProviderToken();
   await d1ProviderTokens(db).issue({ hash: await hashProviderToken(t), label: "raft-test", raftOrigin: ORIGIN, ...who } as never);

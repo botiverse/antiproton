@@ -388,7 +388,8 @@ export function controlPlaneCases(db: D1Database): SpecCase[] {
       db.prepare("DELETE FROM spend_limits")]);
     const cols = async (t: string) => ((await db.prepare(`PRAGMA table_info(${t})`).all()).results as any[]).map((r) => String(r.name)).sort().join(",");
     assert((await cols("tenant_plans")) === "plan,set_at,set_by,tenant_id", `tenant_plans ${await cols("tenant_plans")}`);
-    assert((await cols("spend_pool_limits")) === "limit_usd,pool,set_at,set_by", `spend_pool_limits ${await cols("spend_pool_limits")}`);
+    assert((await cols("spend_pool_limits")) === "limit_usd,pool,set_at,set_by,tenant_id", `spend_pool_limits ${await cols("spend_pool_limits")}`);
+    assert((await cols("spend_pool_limit_events")) === "action,at,by,id,limit_usd,pool,previous,tenant_id", `spend_pool_limit_events ${await cols("spend_pool_limit_events")}`);
     const base = { tenantId: "t-a", raftServerId: "srv", raftOrigin: "https://raft.example", name: "C", instructions: "", credentialHash: null,
       status: "active" as const, pushRegistered: true, pushError: null };
     await registry.create({ ...base, raftAgentId: "cindy", agentId: "raft_cindy", budget: "onboarding" });
@@ -402,11 +403,13 @@ export function controlPlaneCases(db: D1Database): SpecCase[] {
     await put("t-a", "console-agent", 0.5);
     await put("t-b", "x", 2);
     await d1TenantPlans(db).set("t-a", "pro", "h", clock);
-    await d1SpendLimits(db).setPool("onboarding", 45, "op", clock);
+    await d1SpendLimits(db).setPool("onboarding", null, 45, "op", clock);
+    await d1SpendLimits(db).setPool("onboarding", "t-a", 2.5, "op", clock);
+    await d1SpendLimits(db).setPool("onboarding", "t-b", 9, "op", clock);
     const s = await readDaySpend(db, "t-a", day + 7_200_000);
     const near = (a: number, b: number) => Math.abs(a - b) < 1e-5;
     assert(near(s.tenantUsd, 1.5) && near(s.platformUsd, 3.5) && near(s.onboardingUsd, 4) && near(s.tenantOnboardingUsd, 4), JSON.stringify(s));
-    assert(s.plan === "pro" && s.onboardingOverride?.limitUsd === 45 && s.override === null, JSON.stringify(s));
+    assert(s.plan === "pro" && s.onboardingOverride?.limitUsd === 45 && s.onboardingTenantOverride?.limitUsd === 2.5 && s.override === null, JSON.stringify(s));
     assert((await readAgentPool(db, "t-a", "raft_cindy")) === "onboarding" && (await readAgentPool(db, "t-a", "raft_own")) === "tenant"
       && (await readAgentPool(db, "t-a", "console-agent")) === "tenant", "pools");
     assert(limitsOf({}).proUsd === 10, "the pro default");

@@ -425,6 +425,11 @@ export interface ProvisionRegistry {
   getByAgentId(tenantId: string, agentId: string): Promise<ProvisionedAgent | null>;
   /** Whether a row was changed. `updated_at` moves with every change. */
   update(tenantId: string, raftAgentId: string, patch: ProvisionedAgentPatch): Promise<boolean>;
+  /**
+   * Whether any agent of the tenant was provisioned for this Raft server: how a route addressed by server learns that a
+   * tenant-scoped token (which names no server) is that server's. Optional: a registry without it proves nothing.
+   */
+  hasServer?(tenantId: string, raftServerId: string): Promise<boolean>;
 }
 
 export function d1ProvisionedAgents(db: D1Database, now: () => number = Date.now): ProvisionRegistry {
@@ -463,6 +468,9 @@ export function d1ProvisionedAgents(db: D1Database, now: () => number = Date.now
     async getByAgentId(tenantId, agentId) {
       const r = await db.prepare("SELECT * FROM provisioned_agents WHERE tenant_id = ? AND agent_id = ?").bind(tenantId, agentId).first();
       return r ? row(r) : null;
+    },
+    async hasServer(tenantId, raftServerId) {
+      return (await db.prepare("SELECT 1 AS one FROM provisioned_agents WHERE tenant_id = ? AND raft_server_id = ? LIMIT 1").bind(tenantId, raftServerId).first()) !== null;
     },
     async update(tenantId, raftAgentId, patch) {
       const sets: string[] = [];

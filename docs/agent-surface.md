@@ -274,7 +274,7 @@ GET or PUT /provision/agents/{agentId}/model
 
 ### The tenant's spend
 
-`GET /provision/usage?from=&to=&bucket=day|month` is what Raft's panel shows as "today $x of $3" and
+`GET /provision/usage?from=&to=&bucket=day|month` is what Raft's panel shows as "today $x of $5" and
 a daily cost history: the token's tenant's estimated spend, its daily limit, and whether its next model
 call would be refused. A production route, not part of the evaluation set. Read-only; any other method
 is `404`. `cf/src/provision/usage.ts`; tests in `test/provision-usage.ts`.
@@ -291,12 +291,15 @@ is `404`. `cf/src/provision/usage.ts`; tests in `test/provision-usage.ts`.
   (`readDaySpend` and `standing` in `cf/src/spend-limit.ts`, the `judge` the queue consumer applies),
   read afresh for each answer (kept 15 s, below): `spentUsd` is the priced usage today of the tenant's own
   agents (every agent but its onboarding ones, [below](#which-budget-pays-budget)), `model.tokens.unaccepted` left out;
-  `limitUsd` the admin's override if there is one, else the plan's default (`$3` free or no plan,
-  `DAILY_LIMIT_USD`; `$10` pro, `PRO_DAILY_LIMIT_USD`), `null` when there is no
+  `limitUsd` the admin's override if there is one, else the plan's default (`$3` free, `FREE_DAILY_LIMIT_USD`;
+  `$10` pro, `PRO_DAILY_LIMIT_USD`; `$5`, `DAILY_LIMIT_USD`, while Raft has sent no plan), `null` when there is no
   per-tenant limit or the tenant is exempt (`exempt: true`, `DAILY_LIMIT_EXEMPT_TENANTS`);
-  `plan` the plan Raft last sent (`"free"` when it never did); `onboardingUsd` the tenant's onboarding agents'
-  spend today, which the platform pays and which is in neither `spentUsd` nor any limit of the tenant's (so
-  today's period in `periods`, which counts every agent, can be larger than `spentUsd` by it);
+  `plan` the plan Raft last sent (`null` when it never did); `onboardingUsd` the tenant's onboarding agents'
+  spend today, which the platform pays and which is in neither `spentUsd` nor `limitUsd` (so today's period in
+  `periods`, which counts every agent, can be larger than `spentUsd` by it); `onboardingLimitUsd` the tenant's share
+  of the onboarding pool (`$1` unless an admin set another; `null` for none or an exempt tenant), and
+  `onboardingRefusing` whether its onboarding agents' next call would be refused, by that share or by the pool as a
+  whole being spent (the pool's own figures are not given);
   `platformLimitReached` whether the platform's limit is reached; `refusing` whether a model call would
   be refused now (platform first, then the tenant's limit; never for an exempt tenant). The consumer
   may act on a reading up to 30 s old (docs/metering.md, "How fresh the reading is"). The platform's own total and limit are not given: they are every tenant's
@@ -320,7 +323,8 @@ is `404`. `cf/src/provision/usage.ts`; tests in `test/provision-usage.ts`.
 GET /provision/usage?from=2026-10-10&bucket=day
 {
   "currency": "USD", "estimated": true, "tenantId": "raft_srv-1",
-  "today": { "day": "2026-10-12", "spentUsd": 1.84, "limitUsd": 10, "plan": "pro", "onboardingUsd": 0, "exempt": false,
+  "today": { "day": "2026-10-12", "spentUsd": 1.84, "limitUsd": 10, "plan": "pro", "onboardingUsd": 0.42,
+             "onboardingLimitUsd": 1, "onboardingRefusing": false, "exempt": false,
              "platformLimitReached": false, "refusing": false, "resetsAt": "2026-10-13T00:00:00.000Z" },
   "from": "2026-10-10T00:00:00.000Z", "to": "2026-10-13T00:00:00.000Z", "bucket": "day",
   "totalUsd": 4.31,
@@ -339,7 +343,8 @@ GET /provision/usage?from=2026-10-10&bucket=day
 #### The server's plan (`plan`)
 
 A Raft server is on a plan, which only Raft knows; its tenant's default daily limit follows it (`free`: $3, `pro`:
-$10; docs/metering.md, "Daily limits"). Raft says it, and antiproton never asks:
+$10; a server Raft has sent no plan for keeps $5, the limit before plans; docs/metering.md, "Daily limits"). Raft
+says it, and antiproton never asks:
 
 ```
 PUT /provision/servers/{raftServerId}/plan
@@ -349,9 +354,12 @@ PUT /provision/servers/{raftServerId}/plan
 
 - **When.** On every change of the server's plan (upgrade, downgrade, a lapsed subscription), and once for each
   server that exists before this route does. The latest write wins; a repeat of the same plan changes nothing.
-- **Tenant.** As every provider route: a platform-scoped token's tenant is the one `{raftServerId}` names; a
-  tenant-scoped token's is its own, whatever the path says. `{raftServerId}` must match the Raft id pattern (`422`,
-  `param: "raftServerId"`).
+- **Tenant.** As every provider route: a platform-scoped token's tenant is the one `{raftServerId}` names. A
+  tenant-scoped token names no server, so `{raftServerId}` must be one its tenant's agents were provisioned for
+  (`raftServerId` on their create); any other, or any before the tenant has an agent, is `403`,
+  `code: "server_mismatch"`, `param: "raftServerId"`, and nothing is written — never a plan written to the token's
+  tenant under another server's id. `{raftServerId}` must match the Raft id pattern (`422`, `param: "raftServerId"`).
+  The answer's `raftServerId` is therefore always the server whose plan was written.
 - **Body.** Exactly `{ "plan": "free" | "pro" }`: a missing or other `plan` is `422` (`code` `missing` or `invalid`,
   `param: "plan"`); any other field is `422` naming it. Nothing is written when it is refused.
 - **On a create too.** `POST /provision/agents` takes the same `plan` (optional; absent or `null` says nothing),
@@ -362,7 +370,8 @@ PUT /provision/servers/{raftServerId}/plan
   the plan current; the create's field saves a call when a server's first agent is made.
 - **Takes effect** within the consumer's reading (30 s at most, docs/metering.md, "How fresh the reading is"); the
   next `GET /provision/usage` shows it as `today.plan` and `today.limitUsd` (kept 15 s).
-- **No plan said** is `free`. An admin's per-tenant override beats either plan's default.
+- **No plan said** keeps the $5 every tenant had before plans, until Raft sends one. An admin's per-tenant override
+  beats any of the three.
 
 ### Workspace import
 
@@ -537,10 +546,12 @@ create) for a hosted onboarding agent, whose spend the platform pays:
 - **What it does.** The agent's priced usage goes to the onboarding pool (docs/metering.md, "Daily limits"): in
   neither its tenant's daily figure (`today.spentUsd`) nor the platform total, so it never uses up the server's
   daily limit. Its model calls are refused only when every onboarding agent's spend today, in any tenant, reaches the
-  onboarding limit ($30 a day unless an admin sets another): the same refusal as any limit's (a failed turn,
-  `usage limit reached (out of budget)`, `BridgeFatal` `usage_limit_reached` with the sentence
-  `Onboarding daily usage limit reached; resets at 00:00 UTC.`). Its tenant being over its own limit, or the platform
-  over its, does not refuse it.
+  onboarding limit ($30 a day unless an admin sets another), or its own tenant's onboarding agents' spend reaches the
+  tenant's share of it ($1 a day unless an admin sets another for that tenant), so one server's users cannot spend
+  the pool for every other server. The refusal is any limit's (a failed turn, `usage limit reached (out of budget)`,
+  `BridgeFatal` `usage_limit_reached` with the sentence, `Onboarding daily usage limit reached; resets at 00:00 UTC.`
+  for the pool and `This server's onboarding daily usage limit reached ($X of $Y); resets at 00:00 UTC.` for the
+  share). Its tenant being over its own limit, or the platform over its, does not refuse it.
 - **An identity, not a behaviour.** It says who pays and nothing else: the model (`model`) and the first turn
   (`firstTurn`) are their own fields, and an onboarding agent without either runs as any agent does.
 - **Values.** Exactly `"onboarding"`; anything else (another string, a different case, a non-string) is `422`,

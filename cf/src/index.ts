@@ -157,16 +157,20 @@ export interface Env {
   DEEPSEEK_BASE_URL: string;
   HARNESS_MODEL: string;
   /**
-   * A free (or plan-less) tenant's daily spend limit in US dollars (cf/src/spend-limit.ts): unset is $3, `off` none. An
-   * admin's override per tenant wins.
+   * The daily spend limit in US dollars of a tenant Raft has never given a plan (cf/src/spend-limit.ts): unset is $5,
+   * `off` none. An admin's override per tenant wins, as for the two below.
    */
   DAILY_LIMIT_USD?: string;
-  /** A pro tenant's (`plan`, as Raft says it): unset is $10, `off` none. An admin's override per tenant wins. */
+  /** A free tenant's (`plan`, as Raft says it): unset is $3, `off` none. */
+  FREE_DAILY_LIMIT_USD?: string;
+  /** A pro tenant's: unset is $10, `off` none. */
   PRO_DAILY_LIMIT_USD?: string;
   /** Every tenant's spend together, onboarding agents' left out, per UTC day, in US dollars: unset is $2000, `off` none. */
   PLATFORM_DAILY_LIMIT_USD?: string;
   /** The onboarding agents' spend together (`budget: "onboarding"`): unset is $30, `off` none. An admin's override wins. */
   ONBOARDING_DAILY_LIMIT_USD?: string;
+  /** One tenant's onboarding agents' spend: unset is $1, `off` none. An admin's override for the tenant wins. */
+  ONBOARDING_TENANT_DAILY_LIMIT_USD?: string;
   /** Comma-separated tenants no limit refuses (they still count toward the platform total); unset is `bench`. */
   DAILY_LIMIT_EXEMPT_TENANTS?: string;
   ARTIFACT_BUCKET: string;
@@ -4748,8 +4752,11 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
             if (forged) return new Response(forged, { status: 403 });
             const form = await formOf(request);
             if (!form) return new Response("expected a form body", { status: 400 });
-            // A pool's form (the onboarding pool's limit) names `pool`; a tenant's names `tenantId`.
-            const subject = form.get("pool") !== null ? { pool: String(form.get("pool")) } : { tenantId: String(form.get("tenantId") ?? "") };
+            // A form names what it sets as the JSON route does: `pool` (the onboarding pool's limit), `tenantId` (a
+            // tenant's), or both (that tenant's share of the pool). An empty tenant field on a pool form is the pool's own.
+            const pool = form.get("pool");
+            const tenant = String(form.get("tenantId") ?? "");
+            const subject = { ...(pool !== null ? { pool: String(pool) } : {}), ...(pool === null || tenant !== "" ? { tenantId: tenant } : {}) };
             // limitUsd null (the clear path leaves it out; the set form always sends a number) lifts
             // the tenant cap while the platform cap still applies, per the handler's contract.
             const body = form.get("action") === "clear"
@@ -4773,7 +4780,8 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
           const today = costs.map((c) => {
             const own = c.total - (c.onboarding?.total ?? 0);
             const unaccepted = unacceptedOf(c.periods) - unacceptedOf(c.onboarding?.periods ?? []);
-            return { tenantId: c.tenantId, usd: own - unaccepted, unaccepted, onboarding: c.onboarding?.total ?? 0 };
+            // The tenant's onboarding share is judged without unaccepted answers too (tenantOnboardingUsd).
+            return { tenantId: c.tenantId, usd: own - unaccepted, unaccepted, onboarding: (c.onboarding?.total ?? 0) - unacceptedOf(c.onboarding?.periods ?? []) };
           });
           const platformToday = costs.reduce((sum, c) => sum + c.total - (c.onboarding?.total ?? 0), 0);
           const onboardingToday = costs.reduce((sum, c) => sum + (c.onboarding?.total ?? 0), 0);

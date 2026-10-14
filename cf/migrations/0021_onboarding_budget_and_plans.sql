@@ -5,19 +5,23 @@
 -- own, as for every row made before this column existed. Fixed at creation: a replay must repeat it, nothing updates it.
 ALTER TABLE provisioned_agents ADD COLUMN budget TEXT;
 
--- An admin's override of a pool's daily limit (today only 'onboarding'), as spend_limits is for a tenant's. No row: the
--- deployment's var (ONBOARDING_DAILY_LIMIT_USD). `limit_usd` NULL: no limit for the pool.
+-- An admin's override of a pool's daily limit (today only 'onboarding'), as spend_limits is for a tenant's. `tenant_id`
+-- '' is the pool's own limit (every tenant's spend in it together; no row: ONBOARDING_DAILY_LIMIT_USD); a tenant's id is
+-- that tenant's share of the pool (no row: ONBOARDING_TENANT_DAILY_LIMIT_USD). `limit_usd` NULL: no limit.
 CREATE TABLE IF NOT EXISTS spend_pool_limits (
-  pool      TEXT PRIMARY KEY,
+  pool      TEXT NOT NULL,
+  tenant_id TEXT NOT NULL DEFAULT '',
   limit_usd REAL,
   set_by    TEXT NOT NULL,
-  set_at    INTEGER NOT NULL   -- ms since the epoch
+  set_at    INTEGER NOT NULL,  -- ms since the epoch
+  PRIMARY KEY (pool, tenant_id)
 );
 
 -- Every set and clear of a pool's override, kept, as spend_limit_events keeps a tenant's. Never updated or deleted.
 CREATE TABLE IF NOT EXISTS spend_pool_limit_events (
   id        INTEGER PRIMARY KEY AUTOINCREMENT,
   pool      TEXT NOT NULL,
+  tenant_id TEXT NOT NULL DEFAULT '',  -- '' for the pool's own limit, else the tenant whose share it is
   action    TEXT NOT NULL,     -- 'set' or 'clear'
   limit_usd REAL,              -- the new limit for 'set' (NULL: unlimited); NULL for 'clear'
   previous  TEXT NOT NULL,     -- JSON: {"limitUsd": number|null} when a row was replaced or cleared, {} when there was none

@@ -20,7 +20,7 @@ import { handleProvision, type ProvisionDeps } from "../cf/src/provision/handler
 import { d1ProvisionedAgents, d1ProviderTokens } from "../cf/src/control-plane.ts";
 import { hashProviderToken, newProviderToken } from "../cf/src/provider-token.ts";
 import {
-  adminSpendLimits, d1SpendLimits, d1TenantPlans, judge, limitsOf, ONBOARDING_LIMIT_TEXT, readAgentPool, readDaySpend,
+  adminSpendLimits, d1SpendLimits, d1TenantPlans, judge, limitsOf, ONBOARDING_LIMIT_TEXT, onboardingTenantLimitText, readAgentPool, readDaySpend,
   SPEND_LIMIT_ERROR, SpendGate, tenantLimitText,
 } from "../cf/src/spend-limit.ts";
 import { readUsageCosts } from "../cf/src/usage-d1.ts";
@@ -165,7 +165,7 @@ await check("plan on POST: only free or pro; written by a create, never by a rep
   must(w.rows() === 0 && w.plan("t-raft") === null, "a refused create wrote something");
   must((await w.call("POST", "/agents", body({ plan: "pro" }))).status === 201, "create");
   must(w.plan("t-raft")?.plan === "pro" && w.plan("t-raft")?.set_by === "tokhash", show(w.plan("t-raft")));
-  // An upgrade's opposite, said through the route: then the create's late retry, still saying pro, must not undo it.
+  // An upgrade's opposite, said through the route (the token's tenant has an agent for srv-1 now): then the create's late retry, still saying pro, must not undo it.
   must((await w.call("PUT", "/servers/srv-1/plan", { plan: "free" })).status === 200, "PUT");
   const replay = await w.call("POST", "/agents", body({ plan: "pro" }));
   must(replay.status === 200 && w.plan("t-raft")?.plan === "free", `replay ${replay.status}, plan ${show(w.plan("t-raft"))}`);
@@ -185,8 +185,15 @@ await check("PUT /servers/:raftServerId/plan: the tenant the token gives, a body
   must(w.plan("raft_srv-9")?.plan === "pro" && w.plan("t-raft") === null, "another tenant was written");
   r = await w.call("PUT", "/servers/srv-9/plan", { plan: "free" }, PLATFORM);
   must(r.status === 200 && w.plan("raft_srv-9")?.plan === "free", "a downgrade did not land");
-  // A tenant token: its own tenant, whatever the path says.
-  must((await w.call("PUT", "/servers/srv-1/plan", { plan: "pro" })).status === 200 && w.plan("t-raft")?.plan === "pro", "tenant token");
+  // A tenant token names no server: the path's is taken only once the tenant has an agent made for it, else 403 and
+  // nothing written; then the answer's raftServerId is that server's.
+  let t = await w.call("PUT", "/servers/srv-1/plan", { plan: "pro" });
+  must(t.status === 403 && t.body.error.code === "server_mismatch" && w.plan("t-raft") === null, `no agent yet: ${t.status} ${t.text}`);
+  must((await w.call("POST", "/agents", body())).status === 201, "create");
+  t = await w.call("PUT", "/servers/srv-2/plan", { plan: "pro" });
+  must(t.status === 403 && w.plan("t-raft") === null, `another server's id: ${t.status} ${t.text}`);
+  t = await w.call("PUT", "/servers/srv-1/plan", { plan: "pro" });
+  must(t.status === 200 && t.body.raftServerId === "srv-1" && w.plan("t-raft")?.plan === "pro", `its own server: ${t.status} ${t.text}`);
   for (const [bad, param] of [[{}, "plan"], [{ plan: "gold" }, "plan"], [{ plan: null }, "plan"], [{ plan: "pro", tier: 1 }, "tier"]] as const) {
     const b = await w.call("PUT", "/servers/srv-9/plan", bad, PLATFORM);
     must(b.status === 422 && b.body.error.param === param, `${show(bad)}: ${b.status} ${b.text}`);
@@ -272,27 +279,38 @@ await check("the tenant's limit is not charged with its onboarding agent's spend
   const control = d1();
   spend(control, "t", "cindy", 25);                      // no onboarding row: the same agent is the tenant's
   const c = await gateOn(control).gate.admit("t", "own");
-  must(!c.admit && c.limit === "tenant" && c.text === tenantLimitText(25, 3), show(c));
+  must(!c.admit && c.limit === "tenant" && c.text === tenantLimitText(25, 5), show(c));
 });
 
-await check("the plan picks the tenant's default: none and free $3, pro $10; an admin's override wins over either", async () => {
+await check("the plan picks the tenant's default: never said $5 (as before plans), free $3, pro $10; an admin's override wins over each", async () => {
   const db = d1();
-  spend(db, "t", "a", 5);
+  spend(db, "t", "a", 4);
   const plans = d1TenantPlans(db);
   let v = judge(await readDaySpend(db, "t", NOON), AT);
-  must(!v.admit && v.limit === "tenant" && v.text === tenantLimitText(5, 3), `no plan: ${show(v)}`);
+  must(v.admit, `no plan at $4: ${show(v)}`);
+  spend(db, "t", "a", 1.01, TODAY + 2 * H);
+  const s0 = await readDaySpend(db, "t", NOON);
+  v = judge(s0, AT);
+  must(!v.admit && v.limit === "tenant" && v.text === tenantLimitText(s0.tenantUsd, 5) && s0.plan === null, `no plan at $5.01: ${show(v)}`);
   await plans.set("t", "free", "h", 1);
   v = judge(await readDaySpend(db, "t", NOON), AT);
-  must(!v.admit && v.text === tenantLimitText(5, 3), `free: ${show(v)}`);
+  must(!v.admit && v.text === tenantLimitText(s0.tenantUsd, 3), `free: ${show(v)}`);
   await plans.set("t", "pro", "h", 2);
   v = judge(await readDaySpend(db, "t", NOON), AT);
   must(v.admit, `pro at $5: ${show(v)}`);
-  spend(db, "t", "a", 5.5, TODAY + 4 * H);
+  spend(db, "t", "a", 5.49, TODAY + 4 * H);
   const s = await readDaySpend(db, "t", NOON);
+  void s0;
   v = judge(s, AT);
   must(!v.admit && v.text === tenantLimitText(s.tenantUsd, 10) && near(s.tenantUsd, 10.5), `pro at $10.50: ${show(v)}`);
   await d1SpendLimits(db).set("t", 20, "op", 3);
   must(judge(await readDaySpend(db, "t", NOON), AT).admit, "the override did not win over the plan");
+  await d1SpendLimits(db).set("t", 1, "op", 4);
+  must(!judge(await readDaySpend(db, "t", NOON), AT).admit, "a lower override did not win over pro");
+  for (const plan of ["free", null] as const) {
+    if (plan) await plans.set("t", plan, "h", 5); else db.raw.prepare("DELETE FROM tenant_plans").run();
+    must(judge(await readDaySpend(db, "t", NOON), limitsOf({})).admit === false, `override with ${plan}`);
+  }
   // A plan stored as something this code does not know reads as none.
   db.raw.prepare("UPDATE tenant_plans SET plan = 'gold' WHERE tenant_id = 't'").run();
   must((await readDaySpend(db, "t", NOON)).plan === null && (await plans.list()).length === 0, "an unknown plan was read");
@@ -322,6 +340,64 @@ await check("an agent's pool is read once per isolate; a pool read that fails ad
   must(!v.admit && v.limit === "onboarding", `the next read: ${show(v)}`);
 });
 
+await check("a tenant's onboarding share: one server's Cindy at its $1 is refused, with the share's sentence, while another server's is admitted", async () => {
+  const db = d1();
+  await agentRow(db, "a", "cindy-a", "onboarding");
+  await agentRow(db, "b", "cindy-b", "onboarding");
+  spend(db, "a", "cindy-a", 0.9);
+  spend(db, "b", "cindy-b", 0.5);
+  const { gate, clock } = gateOn(db);
+  must((await gate.admit("a", "cindy-a")).admit && (await gate.admit("b", "cindy-b")).admit, "refused under $1");
+  spend(db, "a", "cindy-a", 0.15, TODAY + 4 * H);
+  clock.now += 60_000;
+  const s = await readDaySpend(db, "a", clock.now);
+  const va = await gate.admit("a", "cindy-a");
+  must(!va.admit && va.limit === "onboarding_tenant" && va.text === onboardingTenantLimitText(s.tenantOnboardingUsd, 1), show(va));
+  must(va.text.startsWith("This server's onboarding daily usage limit reached ($1.05 of $1.00)"), va.text);
+  must((await gate.admit("b", "cindy-b")).admit, "another server's onboarding agent was refused");
+  // The pool is far from its $30, so it is the share alone; and the share is not the tenant's own limit: a's own agents work.
+  must(near(s.onboardingUsd, 1.55) && (await gate.admit("a", "own")).admit, show(s));
+  // Unaccepted answers are ours, not the share's, as for the tenant's own limit.
+  const u = d1();
+  await agentRow(u, "a", "cindy-a", "onboarding");
+  spend(u, "a", "cindy-a", 5, TODAY + H, "model.tokens.unaccepted");
+  must((await gateOn(u).gate.admit("a", "cindy-a")).admit, "unaccepted spend counted against the share");
+  // The pool still asked first: spent, its own sentence, whatever the share says.
+  const p = d1();
+  await agentRow(p, "a", "cindy-a", "onboarding");
+  spend(p, "z", "cindy-z", 30);
+  await agentRow(p, "z", "cindy-z", "onboarding");
+  const vp = await gateOn(p).gate.admit("a", "cindy-a");
+  must(!vp.admit && vp.limit === "onboarding" && vp.text === ONBOARDING_LIMIT_TEXT, show(vp));
+});
+
+await check("/admin/spend-limits with pool and tenantId: one tenant's share is set, lifted and cleared, audited, and touches no other tenant", async () => {
+  const db = d1();
+  await agentRow(db, "a", "cindy-a", "onboarding");
+  await agentRow(db, "b", "cindy-b", "onboarding");
+  spend(db, "a", "cindy-a", 2);
+  spend(db, "b", "cindy-b", 2);
+  const store = d1SpendLimits(db);
+  let now = NOON;
+  const call = (method: string, b?: unknown) => adminSpendLimits(method, b, "github:1", { store, limits: AT, now: () => now });
+  const admitted = async (t: string) => (await gateOn(db).gate.admit(t, `cindy-${t}`)).admit;
+  must(!(await admitted("a")) && !(await admitted("b")), "the $1 default did not refuse $2");
+  const r = await call("PUT", { pool: "onboarding", tenantId: "a", limitUsd: 3 });
+  must(r.status === 200 && show(await r.json()) === show({ pool: "onboarding", tenantId: "a", limitUsd: 3, setBy: "github:1", setAt: NOON }), "set");
+  must(await admitted("a") && !(await admitted("b")), "the share applied to the wrong tenant");
+  must((await readDaySpend(db, "a", NOON)).onboardingOverride === null, "the share read as the pool's override");
+  now += 1;
+  must((await call("PUT", { pool: "onboarding", tenantId: "b", limitUsd: null })).status === 200 && await admitted("b"), "null: no share limit");
+  now += 1;
+  must((await call("DELETE", { pool: "onboarding", tenantId: "a" })).status === 204 && !(await admitted("a")) && await admitted("b"), "clear");
+  must((await call("DELETE", { pool: "onboarding", tenantId: "a" })).status === 404, "a second clear");
+  must((await call("DELETE", { pool: "onboarding" })).status === 404, "the pool's own row was made by a share");
+  const got = await (await call("GET")).json() as any;
+  must(show(got.pools.map((p: any) => [p.pool, p.tenantId, p.limitUsd])) === show([["onboarding", "b", null]]), show(got.pools));
+  must(show(got.poolEvents.map((e: any) => [e.tenantId, e.action, e.limitUsd])) === show([["a", "clear", null], ["b", "set", null], ["a", "set", 3]]), show(got.poolEvents));
+  must(got.overrides.length === 0 && got.events.length === 0, "the tenant's own limit was written");
+});
+
 // ---- the admin's onboarding limit ---------------------------------------------------------------------------------
 
 await check("/admin/spend-limits with pool: set, set to none, clear; audited apart from tenants; the gate's reading picks it up; bad input refused", async () => {
@@ -331,7 +407,8 @@ await check("/admin/spend-limits with pool: set, set to none, clear; audited apa
   const store = d1SpendLimits(db);
   let now = NOON;
   const call = (method: string, b?: unknown) => adminSpendLimits(method, b, "github:1", { store, limits: AT, now: () => now, plans: d1TenantPlans(db) });
-  const admitted = async () => (await gateOn(db).gate.admit("t", "cindy")).admit;
+  // The pool's own limit alone: the tenant's share is off here, and has its own check below.
+  const admitted = async () => (await gateOn(db, limitsOf({ ONBOARDING_TENANT_DAILY_LIMIT_USD: "off" })).gate.admit("t", "cindy")).admit;
   must(!(await admitted()), "the $30 default did not refuse $31");
   let r = await call("PUT", { pool: "onboarding", limitUsd: 50 });
   must(r.status === 200 && show(await r.json()) === show({ pool: "onboarding", limitUsd: 50, setBy: "github:1", setAt: NOON }), "set");
@@ -343,20 +420,22 @@ await check("/admin/spend-limits with pool: set, set to none, clear; audited apa
   must((await call("DELETE", { pool: "onboarding" })).status === 404, "a second clear");
   for (const [bad, status] of [
     [{ pool: "tenant", limitUsd: 1 }, 422], [{ pool: "Onboarding", limitUsd: 1 }, 422], [{ pool: "onboarding", limitUsd: -1 }, 422],
-    [{ pool: "onboarding", limitUsd: "5" }, 422], [{ pool: "onboarding" }, 422], [{ pool: "onboarding", tenantId: "t", limitUsd: 1 }, 400],
+    [{ pool: "onboarding", limitUsd: "5" }, 422], [{ pool: "onboarding" }, 422], [{ pool: "onboarding", tenantId: "", limitUsd: 1 }, 422],
+    [{ pool: "onboarding", scope: "tenant", limitUsd: 1 }, 400],
   ] as const) {
     const b = await call("PUT", bad);
     must(b.status === status, `${show(bad)}: ${b.status}`);
   }
   await d1TenantPlans(db).set("t", "pro", "h", 7);
   const got = await (await call("GET")).json() as any;
-  must(got.defaults.onboardingUsd === 30 && got.defaults.proUsd === 10 && got.defaults.tenantUsd === 3 && got.defaults.platformUsd === 2000, show(got.defaults));
+  must(got.defaults.onboardingUsd === 30 && got.defaults.onboardingTenantUsd === 1 && got.defaults.proUsd === 10 && got.defaults.freeUsd === 3
+    && got.defaults.tenantUsd === 5 && got.defaults.platformUsd === 2000, show(got.defaults));
   must(got.pools.length === 0 && got.overrides.length === 0 && got.events.length === 0, `tenant audit touched: ${show(got)}`);
   must(show(got.plans) === show([{ tenantId: "t", plan: "pro", setBy: "h", setAt: 7 }]), show(got.plans));
-  must(show(got.poolEvents.map((e: any) => [e.pool, e.action, e.limitUsd, e.previous, e.at])) === show([
-    ["onboarding", "clear", null, { limitUsd: null }, NOON + 2],
-    ["onboarding", "set", null, { limitUsd: 50 }, NOON + 1],
-    ["onboarding", "set", 50, {}, NOON],
+  must(show(got.poolEvents.map((e: any) => [e.pool, e.tenantId, e.action, e.limitUsd, e.previous, e.at])) === show([
+    ["onboarding", null, "clear", null, { limitUsd: null }, NOON + 2],
+    ["onboarding", null, "set", null, { limitUsd: 50 }, NOON + 1],
+    ["onboarding", null, "set", 50, {}, NOON],
   ]), show(got.poolEvents));
   // The tenant form of the same route still works beside it.
   must((await call("PUT", { tenantId: "t", limitUsd: 9 })).status === 200, "the tenant override");
@@ -379,13 +458,15 @@ await check("the cost views: onboarding spend is its own line (API, usage-costs 
   const page = usageCostsPanel({ from: TODAY, to: TODAY + DAY, bucket: "day", tenants: costs, unpriced: [] });
   must(/<b>onboarding pool<\/b>[\s\S]*?\$2\.00/.test(page) && /incl\. \$2\.00 onboarding/.test(page), "the usage-costs page has no onboarding line");
   const limits = spendLimitsPanel({
-    defaults: { tenantUsd: 3, proUsd: 10, platformUsd: 2000, onboardingUsd: 30, exempt: [] }, overrides: [], events: [],
-    pools: [{ pool: "onboarding", limitUsd: 40, setBy: "op", setAt: NOON }], poolEvents: [], plans: [{ tenantId: "t", plan: "pro" }],
+    defaults: { tenantUsd: 5, freeUsd: 3, proUsd: 10, platformUsd: 2000, onboardingUsd: 30, onboardingTenantUsd: 1, exempt: [] }, overrides: [], events: [],
+    pools: [{ pool: "onboarding", tenantId: null, limitUsd: 40, setBy: "op", setAt: NOON }, { pool: "onboarding", tenantId: "t", limitUsd: 2.5, setBy: "op", setAt: NOON }],
+    poolEvents: [], plans: [{ tenantId: "t", plan: "pro" }],
     today: [{ tenantId: "t", usd: 1, onboarding: 2 }], platformToday: 5, onboardingToday: 2,
   });
   must(/onboarding pool — \$2\.00 today of \$40\.00/.test(limits), "the pool's line against its override");
-  must(/<code>t<\/code> <span class="tag">pro<\/span>[\s\S]*?\$1\.00[\s\S]*?\+\$2\.00 onboarding[\s\S]*?\$10\.00 <span class="hint-inline">default/.test(limits), "the tenant row: own spend, onboarding beside it, the pro default");
+  must(/<code>t<\/code> <span class="tag">pro<\/span>[\s\S]*?\$1\.00[\s\S]*?\+\$2\.00 onboarding of \$2\.50[\s\S]*?\$10\.00 <span class="hint-inline">default/.test(limits), "the tenant row: own spend, onboarding beside it, the pro default");
   must(/name="pool" value="onboarding"/.test(limits), "no form to set the onboarding limit");
+  must(/<code>t<\/code>'s share:\s*\$2\.50/.test(limits) && /name="tenantId" value="t"/.test(limits), "the tenant's share override and its clear form");
 });
 
 // ---- the real Worker: the queue consumer, the routes ----------------------------------------------------------------
@@ -424,12 +505,14 @@ await check("the Worker's queue handler: an onboarding agent is called while its
   globalThis.fetch = (async () => { calls++; return new Response(JSON.stringify({ choices: [{ message: { content: "Hi!" }, finish_reason: "stop" }], usage: { prompt_tokens: 3, completion_tokens: 1 } }), { status: 200 }); }) as typeof fetch;
   try {
     await worker.queue(batch("q-t", "q-own") as never, env as never);
-    must(calls === 0 && delivered[0]!.answer.errorMessage === SPEND_LIMIT_ERROR && delivered[0]!.answer.providerError === tenantLimitText(6, 3), `own: ${show(delivered[0])}`);
+    must(calls === 0 && delivered[0]!.answer.errorMessage === SPEND_LIMIT_ERROR && delivered[0]!.answer.providerError === tenantLimitText(6, 5), `own: ${show(delivered[0])}`);
     await worker.queue(batch("q-t", "q-cindy") as never, env as never);
     must(Number(calls) === 1 && delivered[1]!.answer.stopReason === "stop", `onboarding: provider ${calls}, ${show(delivered[1])}`);
     // Its pool spent, in a tenant of its own, so the isolate's readings of q-t do not stand in the way.
     await agentRow(db, "q-u", "q-cindy2", "onboarding");
     spend(db, "q-u", "q-cindy2", 30, hour);
+    // q-u's share is lifted, so it is the pool that refuses (the share's own sentence has its own check).
+    await d1SpendLimits(db).setPool("onboarding", "q-u", null, "op", 0);
     await worker.queue(batch("q-u", "q-cindy2") as never, env as never);
     must(Number(calls) === 1 && delivered[2]!.answer.errorMessage === SPEND_LIMIT_ERROR && delivered[2]!.answer.providerError === ONBOARDING_LIMIT_TEXT
       && delivered[2]!.answer.stopReason === "error", `pool spent: ${show(delivered[2])}`);
@@ -442,7 +525,7 @@ await check("GET /provision/usage and PUT /provision/servers/:id/plan through th
   if (Math.floor((Date.now() + 5_000) / DAY) !== Math.floor(Date.now() / DAY)) throw new Error("too close to 00:00 UTC; run again");
   await agentRow(db, "raft_srv-7", "raft_cindy", "onboarding");
   spend(db, "raft_srv-7", "raft_cindy", 2, day);
-  spend(db, "raft_srv-7", "raft_own", 4, day);
+  spend(db, "raft_srv-7", "raft_own", 6, day);
   const tok = newProviderToken();
   await d1ProviderTokens(db).issue({ hash: await hashProviderToken(tok), label: "raft-test", raftOrigin: "https://raft.example", scope: "platform" } as never);
   const env = { CONTROL_DB: db, AGENT: { idFromName: (s: string) => s, get: () => ({}) }, ARTIFACTS: {}, HARNESS_MODEL: "deepseek-flash" };
@@ -455,12 +538,19 @@ await check("GET /provision/usage and PUT /provision/servers/:id/plan through th
     return { status: r.status, body: text ? JSON.parse(text) : null, text };
   };
   let u = await req("GET", "/provision/usage?raftServerId=srv-7");
-  must(u.status === 200 && u.body.today.plan === "free" && u.body.today.limitUsd === 3 && near(u.body.today.spentUsd, 4) && near(u.body.today.onboardingUsd, 2)
-    && u.body.today.refusing === true, show(u.body.today));
+  must(u.status === 200 && u.body.today.plan === null && u.body.today.limitUsd === 5 && near(u.body.today.spentUsd, 6) && near(u.body.today.onboardingUsd, 2)
+    && u.body.today.refusing === true && u.body.today.onboardingLimitUsd === 1 && u.body.today.onboardingRefusing === true, show(u.body.today));
   const p = await req("PUT", "/provision/servers/srv-7/plan", { plan: "pro" });
   must(p.status === 200 && p.body.plan === "pro", `${p.status} ${p.text}`);
   u = await req("GET", "/provision/usage?raftServerId=srv-7");
   must(u.body.today.plan === "pro" && u.body.today.limitUsd === 10 && u.body.today.refusing === false, show(u.body.today));
+  must((await req("PUT", "/provision/servers/srv-7/plan", { plan: "free" })).status === 200, "downgrade");
+  u = await req("GET", "/provision/usage?raftServerId=srv-7");
+  must(u.body.today.plan === "free" && u.body.today.limitUsd === 3 && u.body.today.refusing === true, show(u.body.today));
+  // The tenant's share raised by an admin: its onboarding agents are no longer refused, and the panel says so.
+  await d1SpendLimits(db).setPool("onboarding", "raft_srv-7", 5, "op", 0);
+  u = await req("GET", "/provision/usage?raftServerId=srv-7");
+  must(u.body.today.onboardingLimitUsd === 5 && u.body.today.onboardingRefusing === false, show(u.body.today));
   const bad = await req("PUT", "/provision/servers/srv-7/plan", { plan: "gold" });
   must(bad.status === 422 && bad.body.error.param === "plan", bad.text);
 });

@@ -230,27 +230,35 @@ table holds, so a `*` meant for our account cannot reach it.
 
 ## Daily limits
 
-Three limits per UTC day, in US dollars at the prices above (`cf/src/spend-limit.ts`,
+Four limits per UTC day, in US dollars at the prices above (`cf/src/spend-limit.ts`,
 `cf/migrations/0018_spend_limits.sql`, `cf/migrations/0021_onboarding_budget_and_plans.sql`):
 
 | limit | default | set by | counts |
 |---|---|---|---|
-| per tenant, `free` plan or none | $3 | `DAILY_LIMIT_USD`; an admin's override per tenant (`/admin/spend-limits`) wins | the tenant's own agents' priced usage today, `model.tokens.unaccepted` left out (it is ours, not theirs) |
+| per tenant, no plan ever said | $5 | `DAILY_LIMIT_USD`; an admin's override per tenant (`/admin/spend-limits`) wins | the tenant's own agents' priced usage today, `model.tokens.unaccepted` left out (it is ours, not theirs) |
+| per tenant, `free` plan | $3 | `FREE_DAILY_LIMIT_USD`; an admin's override per tenant wins | as above |
 | per tenant, `pro` plan | $10 | `PRO_DAILY_LIMIT_USD`; an admin's override per tenant wins | as above |
 | platform | $2000 | `PLATFORM_DAILY_LIMIT_USD` | every tenant's own agents' priced usage today, `model.tokens.unaccepted` and exempt tenants included |
 | onboarding | $30 | `ONBOARDING_DAILY_LIMIT_USD`; an admin's override (`/admin/spend-limits`, `pool: "onboarding"`) wins | the priced usage today of every agent created with `budget: "onboarding"`, in any tenant, `model.tokens.unaccepted` included |
+| a tenant's onboarding share | $1 | `ONBOARDING_TENANT_DAILY_LIMIT_USD`; an admin's override for the tenant (`pool: "onboarding"`, `tenantId`) wins | the priced usage today of that tenant's onboarding agents, `model.tokens.unaccepted` left out |
 
-**A tenant's plan** is what Raft last said of its server (`plan` on `POST
-/provision/agents`, `PUT /provision/servers/{raftServerId}/plan`; docs/agent-surface.md),
-kept in `tenant_plans`; a tenant Raft never gave a plan is `free`. An admin's
-override of the tenant beats either plan's default. Antiproton never asks Raft.
+**Which limit applies to a tenant.** An admin's override for the tenant, when
+there is one; else the default of the plan Raft last said of its server (`plan`
+on `POST /provision/agents`, `PUT /provision/servers/{raftServerId}/plan`;
+docs/agent-surface.md, kept in `tenant_plans`): `free` $3, `pro` $10; else, for
+a tenant Raft has never given a plan, $5 — the limit every tenant had before
+plans, so that no server's limit drops on the deploy, before Raft has sent the
+plans of the servers that exist. Antiproton never asks Raft.
 
 **The onboarding pool is separate from both others.** An agent created with
 `budget: "onboarding"` (the hosted onboarding agent; `provisioned_agents.budget`,
 fixed at creation) is paid by the platform: its spend is in neither its tenant's
-figure nor the platform total, and its calls are judged by the onboarding limit
-alone — not refused because its tenant or the platform is out of money, and
-unable to spend the platform's budget either way. Every other agent (no
+figure nor the platform total, and its calls are judged by the onboarding limits
+alone — the pool's first, then its tenant's share — not refused because its
+tenant or the platform is out of money, and unable to spend the platform's budget
+either way. The share is what keeps one server's users, talking on with their
+onboarding agent, from spending the whole pool and stopping onboarding on every
+other server: at $1 one server takes at most a thirtieth of it. Every other agent (no
 provisioned row, or `budget` absent) is its tenant's. There is no ceiling over
 both pools: the most the operator pays in a day is the platform limit plus the
 onboarding limit (plus the overshoot below, and exempt tenants). An onboarding
@@ -292,7 +300,9 @@ Agents API show (`failureText`) — is:
 - `Platform daily usage limit reached; resets at 00:00 UTC.` (asked first: when
   it is reached no call of a tenant's own agents is made), or
 - `Onboarding daily usage limit reached; resets at 00:00 UTC.`, for an
-  onboarding agent, which is asked nothing else.
+  onboarding agent when the pool is spent (asked first), or
+- `This server's onboarding daily usage limit reached ($X of $Y); resets at 00:00 UTC.`,
+  when its tenant's share is; an onboarding agent is asked nothing else.
 
 An agent Raft runs tells Raft the same sentence: the failed call's `model.call`
 trace row carries it (`attrs.limit`, `modelCallRow` in `src/trace/seams.ts`), so
@@ -313,7 +323,7 @@ day and calls are made again; nobody acts.
 **How fresh the reading is.** The consumer's isolate keeps each tenant's last
 reading — one D1 round trip of five parallel reads: today's hours of every
 tenant with each row's agent's budget, the prices, the tenant's override, the
-tenant's plan, the onboarding override — for 30 s (`SPEND_CACHE_MS`), and for
+tenant's plan, the onboarding overrides (the pool's and the tenant's share) — for 30 s (`SPEND_CACHE_MS`), and for
 5 s once a total that judges the calling agent is within 80 % of its limit
 (`SPEND_CACHE_NEAR_MS`); a reading from an earlier UTC day is never used. An
 admin's override, or a plan Raft sends, reaches a running isolate within those
@@ -349,25 +359,29 @@ too):
     DELETE /admin/spend-limits { tenantId }                 → 204, or 404 when there was none
     PUT    /admin/spend-limits { pool: "onboarding", limitUsd } → the pool's row; limitUsd null: no onboarding limit
     DELETE /admin/spend-limits { pool: "onboarding" }       → 204, or 404 when there was none
+    PUT    /admin/spend-limits { pool: "onboarding", tenantId, limitUsd } → that tenant's share; null: no share limit
+    DELETE /admin/spend-limits { pool: "onboarding", tenantId } → 204, or 404 when there was none
 
-Every set and clear is kept in `spend_limit_events` (a tenant's) or
+The body's keys name what is set: `tenantId` alone a tenant's own limit, `pool`
+alone the pool's, both the tenant's share of the pool. Every set and clear is kept in `spend_limit_events` (a tenant's) or
 `spend_pool_limit_events` (a pool's) with who, when, and the value it replaced.
 A tenant with `limitUsd` null is still refused at the platform limit. `plans` is
 each tenant's plan as Raft last said it, read only. The admin host's spend-limits
 page shows each tenant against its plan's limit with its onboarding agents' spend
-beside it, and the onboarding pool against its limit with a form to set or clear
-it; `/admin/usage-costs` gives `onboarding.total` and each tenant's `onboarding`
+against its share beside it, and the onboarding pool against its limit with a form
+to set or clear it or a tenant's share; `/admin/usage-costs` gives `onboarding.total` and each tenant's `onboarding`
 part (already inside its figures), and its page has an "onboarding pool" line.
 
 **Changing the platform and tenant defaults.** They are code defaults, so a
 deploy changes them; nothing stored holds the old $30 / $5 (no row in
 `spend_limits` or `spend_limit_events` in production, read 2026-10-14). An
-admin's per-tenant override, where there is one, is left as it is.
+admin's per-tenant override, where there is one, is left as it is. A tenant's
+limit stays $5 until Raft sends its plan.
 
 **What a tenant is shown.** `GET /provision/usage` gives a Raft tenant its
 `today`: its spend, its limit (`null` when it has none or is exempt), its plan,
-its onboarding agents' spend (beside its own, counted against nothing of its
-own), whether it is exempt, whether the platform limit is reached, and whether a
+its onboarding agents' spend against its onboarding share (and whether they
+would be refused now, by the share or by the pool being spent), whether it is exempt, whether the platform limit is reached, and whether a
 call of its own agents would be refused now — `standing` in `cf/src/spend-limit.ts`, over a fresh `readDaySpend`
 and the same `judge` the consumer applies, so the two cannot disagree on the rule,
 only on the reading's age: the answer is kept 15 s per isolate (`USAGE_CACHE_MS`,

@@ -5,13 +5,18 @@
  *
  * - **per tenant**: an admin's override for that tenant (`spend_limits`, cf/migrations/0018_spend_limits.sql; NULL
  *   there is "no per-tenant limit"), else by the tenant's plan as Raft last said it (`tenant_plans`, 0021):
- *   PRO_DAILY_LIMIT_USD (default $10) for `pro`, DAILY_LIMIT_USD (default $3) for `free` or no plan at all;
+ *   FREE_DAILY_LIMIT_USD (default $3) for `free`, PRO_DAILY_LIMIT_USD (default $10) for `pro`, and DAILY_LIMIT_USD
+ *   (default $5, the limit every tenant had before plans) for a tenant Raft has never given a plan, so no tenant's
+ *   limit drops before Raft has said what its server is on;
  * - **platform**: PLATFORM_DAILY_LIMIT_USD (default $2000) over every tenant's spend, `bench` included;
  * - **onboarding**: ONBOARDING_DAILY_LIMIT_USD (default $30), or an admin's override (`spend_pool_limits`, 0021), over
- *   the spend of every agent created with `budget: "onboarding"` (`provisioned_agents.budget`), in any tenant.
+ *   the spend of every agent created with `budget: "onboarding"` (`provisioned_agents.budget`), in any tenant;
+ * - **a tenant's onboarding share**: ONBOARDING_TENANT_DAILY_LIMIT_USD (default $1), or an admin's override for that
+ *   tenant (`spend_pool_limits` with its tenant id), over that tenant's onboarding agents alone. Without it one server's
+ *   users could spend the whole pool and stop onboarding on every other server.
  *
  * The onboarding pool is a pool of its own: its agents' spend is in neither the tenant's figure nor the platform's,
- * and their calls are judged by the onboarding limit alone. So an onboarding agent is not refused because its tenant or
+ * and their calls are judged by the onboarding limits alone (the pool's, then the tenant's share). So an onboarding agent is not refused because its tenant or
  * the platform is out of money, and a run of onboardings cannot spend the platform's budget either. What the two pools
  * can spend together is the sum of their limits; there is no ceiling over both.
  *
@@ -32,12 +37,16 @@ import { errorMessage, SPEND_LIMIT_ERROR, type AnsweredMessage } from "../../src
 import { logEvent } from "../../src/core/log.ts";
 import { DAY_MS, priceFor, usagePrices } from "./usage-d1.ts";
 
-/** A tenant on the `free` plan, or with no plan recorded. */
-export const DEFAULT_DAILY_LIMIT_USD = 3;
+/** A tenant Raft has never given a plan: the limit every tenant had before plans. */
+export const DEFAULT_DAILY_LIMIT_USD = 5;
+/** A tenant on the `free` plan. */
+export const DEFAULT_FREE_DAILY_LIMIT_USD = 3;
 /** A tenant on the `pro` plan. */
 export const DEFAULT_PRO_DAILY_LIMIT_USD = 10;
 export const DEFAULT_PLATFORM_DAILY_LIMIT_USD = 2000;
 export const DEFAULT_ONBOARDING_DAILY_LIMIT_USD = 30;
+/** One tenant's share of the onboarding pool. */
+export const DEFAULT_ONBOARDING_TENANT_DAILY_LIMIT_USD = 1;
 export const DEFAULT_EXEMPT_TENANTS: readonly string[] = ["bench"];
 
 /**
@@ -54,17 +63,25 @@ export const NEAR_FRACTION = 0.8;
 export { SPEND_LIMIT_ERROR };
 export const PLATFORM_LIMIT_TEXT = "Platform daily usage limit reached; resets at 00:00 UTC.";
 export const ONBOARDING_LIMIT_TEXT = "Onboarding daily usage limit reached; resets at 00:00 UTC.";
+export const onboardingTenantLimitText = (spentUsd: number, limitUsd: number) =>
+  `This server's onboarding daily usage limit reached ($${spentUsd.toFixed(2)} of $${limitUsd.toFixed(2)}); resets at 00:00 UTC.`;
 export const tenantLimitText = (spentUsd: number, limitUsd: number) =>
   `Daily usage limit reached ($${spentUsd.toFixed(2)} of $${limitUsd.toFixed(2)}); resets at 00:00 UTC.`;
 
 export interface SpendLimitEnv {
-  DAILY_LIMIT_USD?: string; PRO_DAILY_LIMIT_USD?: string; PLATFORM_DAILY_LIMIT_USD?: string; ONBOARDING_DAILY_LIMIT_USD?: string;
-  DAILY_LIMIT_EXEMPT_TENANTS?: string;
+  DAILY_LIMIT_USD?: string; FREE_DAILY_LIMIT_USD?: string; PRO_DAILY_LIMIT_USD?: string; PLATFORM_DAILY_LIMIT_USD?: string; ONBOARDING_DAILY_LIMIT_USD?: string;
+  ONBOARDING_TENANT_DAILY_LIMIT_USD?: string; DAILY_LIMIT_EXEMPT_TENANTS?: string;
 }
-/** `tenantUsd` is a free (or plan-less) tenant's default, `proUsd` a pro tenant's; `onboardingUsd` the pool's, before an admin's override. */
-export interface SpendLimits { tenantUsd: number | null; proUsd: number | null; platformUsd: number | null; onboardingUsd: number | null; exempt: ReadonlySet<string> }
+/**
+ * `tenantUsd` is the default of a tenant with no plan, `freeUsd` a free tenant's, `proUsd` a pro tenant's; `onboardingUsd` the pool's and
+ * `onboardingTenantUsd` one tenant's share of it, each before an admin's override.
+ */
+export interface SpendLimits {
+  tenantUsd: number | null; freeUsd: number | null; proUsd: number | null; platformUsd: number | null; onboardingUsd: number | null; onboardingTenantUsd: number | null;
+  exempt: ReadonlySet<string>;
+}
 
-/** A Raft server's plan (`plan` on POST /provision/agents, PUT /provision/servers/:id/plan). No plan reads as `free`. */
+/** A Raft server's plan (`plan` on POST /provision/agents, PUT /provision/servers/:id/plan). No plan is its own case. */
 export const PLANS = ["free", "pro"] as const;
 export type Plan = (typeof PLANS)[number];
 /** Which limit judges an agent's calls: its tenant's (with the platform's), or the onboarding pool's. */
@@ -92,9 +109,11 @@ export function limitsOf(env: SpendLimitEnv): SpendLimits {
     : String(env.DAILY_LIMIT_EXEMPT_TENANTS).split(",").map((t) => t.trim()).filter(Boolean);
   return {
     tenantUsd: usdVar("DAILY_LIMIT_USD", env.DAILY_LIMIT_USD, DEFAULT_DAILY_LIMIT_USD),
+    freeUsd: usdVar("FREE_DAILY_LIMIT_USD", env.FREE_DAILY_LIMIT_USD, DEFAULT_FREE_DAILY_LIMIT_USD),
     proUsd: usdVar("PRO_DAILY_LIMIT_USD", env.PRO_DAILY_LIMIT_USD, DEFAULT_PRO_DAILY_LIMIT_USD),
     platformUsd: usdVar("PLATFORM_DAILY_LIMIT_USD", env.PLATFORM_DAILY_LIMIT_USD, DEFAULT_PLATFORM_DAILY_LIMIT_USD),
     onboardingUsd: usdVar("ONBOARDING_DAILY_LIMIT_USD", env.ONBOARDING_DAILY_LIMIT_USD, DEFAULT_ONBOARDING_DAILY_LIMIT_USD),
+    onboardingTenantUsd: usdVar("ONBOARDING_TENANT_DAILY_LIMIT_USD", env.ONBOARDING_TENANT_DAILY_LIMIT_USD, DEFAULT_ONBOARDING_TENANT_DAILY_LIMIT_USD),
     exempt: new Set(exempt),
   };
 }
@@ -107,12 +126,15 @@ export const dayOf = (t: number) => Math.floor(t / DAY_MS) * DAY_MS;
  * - `tenantUsd`: the tenant's agents on its own budget, `model.tokens.unaccepted` left out;
  * - `platformUsd`: every tenant's agents on their own budget, unaccepted included;
  * - `onboardingUsd`: every agent on the onboarding budget, in any tenant, unaccepted included;
- * - `tenantOnboardingUsd`: this tenant's share of that, unaccepted left out — said to the tenant, counted nowhere;
- * - `plan`: the tenant's plan as Raft last said it, null when it never did.
+ * - `tenantOnboardingUsd`: this tenant's share of that, unaccepted left out (as in `tenantUsd`) — what the tenant's
+ *   onboarding share is judged on, and in neither of the tenant's other figures;
+ * - `plan`: the tenant's plan as Raft last said it, null when it never did;
+ * - `onboardingOverride` the pool's override, `onboardingTenantOverride` the admin's override of this tenant's share.
  */
 export interface DaySpend {
   day: number; tenantUsd: number; platformUsd: number; onboardingUsd: number; tenantOnboardingUsd: number;
   override: { limitUsd: number | null } | null; plan: Plan | null; onboardingOverride: { limitUsd: number | null } | null;
+  onboardingTenantOverride: { limitUsd: number | null } | null;
 }
 
 const limitRow = (r: any) => r ? { limitUsd: r.limit_usd === null || r.limit_usd === undefined ? null : Number(r.limit_usd) } : null;
@@ -121,11 +143,11 @@ const limitRow = (r: any) => r ? { limitUsd: r.limit_usd === null || r.limit_usd
  * Today's (UTC) priced spend for `tenantId` and for every tenant, from `usage_hourly` (today is never folded:
  * KEEP_HOURLY_DAYS), split by the budget each row's agent was created on (`provisioned_agents.budget`; an agent with no
  * row there — the console's, the Agents API's — is on its tenant's), with the tenant's override and plan and the
- * onboarding pool's override. Five reads in parallel, one round trip's wait.
+ * onboarding pool's overrides (its own, and this tenant's share). Five reads in parallel, one round trip's wait.
  */
 export async function readDaySpend(db: D1Database, tenantId: string, now: number): Promise<DaySpend> {
   const day = dayOf(now);
-  const [rows, prices, override, plan, onboardingOverride] = await Promise.all([
+  const [rows, prices, override, plan, poolRows] = await Promise.all([
     // The join is on provisioned_agents' unique (tenant_id, agent_id), so it never multiplies a ledger row.
     db.prepare(
       `SELECT u.tenant_id = ? AS mine, COALESCE(p.budget = 'onboarding', 0) AS onboarding, u.hour, u.resource, u.key, u.unit,
@@ -136,7 +158,7 @@ export async function readDaySpend(db: D1Database, tenantId: string, now: number
     usagePrices(db),
     db.prepare("SELECT limit_usd FROM spend_limits WHERE tenant_id = ?").bind(tenantId).first() as Promise<any>,
     db.prepare("SELECT plan FROM tenant_plans WHERE tenant_id = ?").bind(tenantId).first() as Promise<any>,
-    db.prepare("SELECT limit_usd FROM spend_pool_limits WHERE pool = 'onboarding'").first() as Promise<any>,
+    db.prepare("SELECT tenant_id, limit_usd FROM spend_pool_limits WHERE pool = 'onboarding' AND tenant_id IN ('', ?)").bind(tenantId).all(),
   ]);
   let tenantUsd = 0;
   let platformUsd = 0;
@@ -161,7 +183,8 @@ export async function readDaySpend(db: D1Database, tenantId: string, now: number
     day, tenantUsd, platformUsd, onboardingUsd, tenantOnboardingUsd,
     override: limitRow(override),
     plan: plan && (PLANS as readonly string[]).includes(String(plan.plan)) ? String(plan.plan) as Plan : null,
-    onboardingOverride: limitRow(onboardingOverride),
+    onboardingOverride: limitRow(((poolRows.results ?? []) as any[]).find((r) => r.tenant_id === "")),
+    onboardingTenantOverride: limitRow(((poolRows.results ?? []) as any[]).find((r) => r.tenant_id === tenantId)),
   };
 }
 
@@ -187,17 +210,25 @@ function noteUnpriced(day: number, row: { resource: string; key: string; unit: s
 
 export type Admission =
   | { admit: true; why: "exempt" | "under" | "read_failed" }
-  | { admit: false; limit: "platform" | "tenant" | "onboarding"; text: string };
+  | { admit: false; limit: "platform" | "tenant" | "onboarding" | "onboarding_tenant"; text: string };
 
-/** The tenant's limit today: an admin's override when there is one (null there is none), else its plan's default. */
+/**
+ * The tenant's limit today: an admin's override when there is one (null there is none), else its plan's default, and
+ * with no plan ever said the default every tenant had before plans.
+ */
 export function tenantLimitOf(spend: DaySpend, limits: SpendLimits): number | null {
   if (spend.override) return spend.override.limitUsd;
-  return spend.plan === "pro" ? limits.proUsd : limits.tenantUsd;
+  return spend.plan === "pro" ? limits.proUsd : spend.plan === "free" ? limits.freeUsd : limits.tenantUsd;
 }
 
 /** The onboarding pool's limit today: an admin's override when there is one (null there is none), else the deployment's. */
 export function onboardingLimitOf(spend: DaySpend, limits: SpendLimits): number | null {
   return spend.onboardingOverride ? spend.onboardingOverride.limitUsd : limits.onboardingUsd;
+}
+
+/** The tenant's share of the onboarding pool today: an admin's override for it (null there is none), else the deployment's. */
+export function onboardingTenantLimitOf(spend: DaySpend, limits: SpendLimits): number | null {
+  return spend.onboardingTenantOverride ? spend.onboardingTenantOverride.limitUsd : limits.onboardingTenantUsd;
 }
 
 /** Whether the platform's limit is reached: then nobody but an exempt tenant works. */
@@ -209,12 +240,17 @@ export const isExempt = (tenantId: string, limits: SpendLimits) => limits.exempt
 
 /**
  * What today's spend says for an agent of a tenant that is not exempt. An onboarding agent is judged by the onboarding
- * limit alone. Any other: the platform limit first, since when it is reached nobody works, then the tenant's.
+ * limits alone: the pool's first (when it is reached no onboarding agent works), then its tenant's share. Any other:
+ * the platform limit first, since when it is reached nobody works, then the tenant's.
  */
 export function judge(spend: DaySpend, limits: SpendLimits, pool: Pool = "tenant"): Admission {
   if (pool === "onboarding") {
     const limit = onboardingLimitOf(spend, limits);
     if (limit !== null && spend.onboardingUsd >= limit) return { admit: false, limit: "onboarding", text: ONBOARDING_LIMIT_TEXT };
+    const share = onboardingTenantLimitOf(spend, limits);
+    if (share !== null && spend.tenantOnboardingUsd >= share) {
+      return { admit: false, limit: "onboarding_tenant", text: onboardingTenantLimitText(spend.tenantOnboardingUsd, share) };
+    }
     return { admit: true, why: "under" };
   }
   if (platformReached(spend, limits)) return { admit: false, limit: "platform", text: PLATFORM_LIMIT_TEXT };
@@ -233,17 +269,22 @@ export function judge(spend: DaySpend, limits: SpendLimits, pool: Pool = "tenant
  * (`SpendGate`), and admits a call when its own read fails.
  */
 export interface Standing {
-  spentUsd: number; limitUsd: number | null; plan: Plan; exempt: boolean; platformLimitReached: boolean; refusing: boolean;
-  /** The tenant's onboarding agents' spend today: paid by the platform, in neither `spentUsd` nor any limit of the tenant's. */
+  spentUsd: number; limitUsd: number | null; /** null: Raft has never said. */ plan: Plan | null; exempt: boolean; platformLimitReached: boolean; refusing: boolean;
+  /** The tenant's onboarding agents' spend today: paid by the platform, in neither `spentUsd` nor `limitUsd`. */
   onboardingUsd: number;
+  /** The tenant's share of the onboarding pool (null: none, or exempt), and whether its onboarding agents' next call would be refused. */
+  onboardingLimitUsd: number | null;
+  onboardingRefusing: boolean;
 }
 export function standing(tenantId: string, spend: DaySpend, limits: SpendLimits): Standing {
   const exempt = isExempt(tenantId, limits);
   return {
     spentUsd: spend.tenantUsd,
     limitUsd: exempt ? null : tenantLimitOf(spend, limits),
-    plan: spend.plan ?? "free",
+    plan: spend.plan,
     onboardingUsd: spend.tenantOnboardingUsd,
+    onboardingLimitUsd: exempt ? null : onboardingTenantLimitOf(spend, limits),
+    onboardingRefusing: exempt ? false : !judge(spend, limits, "onboarding").admit,
     exempt,
     platformLimitReached: platformReached(spend, limits),
     // As `SpendGate.admit`: an exempt tenant is admitted before anything is judged.
@@ -256,7 +297,9 @@ function near(spend: DaySpend, limits: SpendLimits, pool: Pool | undefined): boo
   if (pool === undefined) return near(spend, limits, "tenant") || near(spend, limits, "onboarding");
   if (pool === "onboarding") {
     const limit = onboardingLimitOf(spend, limits);
-    return limit !== null && spend.onboardingUsd >= limit * NEAR_FRACTION;
+    const share = onboardingTenantLimitOf(spend, limits);
+    return (limit !== null && spend.onboardingUsd >= limit * NEAR_FRACTION)
+      || (share !== null && spend.tenantOnboardingUsd >= share * NEAR_FRACTION);
   }
   const tenantLimit = tenantLimitOf(spend, limits);
   return (limits.platformUsd !== null && spend.platformUsd >= limits.platformUsd * NEAR_FRACTION)
@@ -324,7 +367,7 @@ export class SpendGate {
     if (!verdict.admit) {
       logEvent("spend_limit.refused", {
         tenantId, agentId, limit: verdict.limit, tenantUsd: round(hit!.spend.tenantUsd), platformUsd: round(hit!.spend.platformUsd),
-        onboardingUsd: round(hit!.spend.onboardingUsd),
+        onboardingUsd: round(hit!.spend.onboardingUsd), tenantOnboardingUsd: round(hit!.spend.tenantOnboardingUsd),
       });
     }
     return verdict;
@@ -349,8 +392,11 @@ export function refusalAnswer(text: string, jobId: string, model: { api: string;
 export interface SpendLimitRow { tenantId: string; limitUsd: number | null; setBy: string; setAt: number }
 export interface SpendLimitEvent { tenantId: string; action: "set" | "clear"; limitUsd: number | null; previous: { limitUsd?: number | null }; by: string; at: number }
 
-export interface SpendPoolRow { pool: string; limitUsd: number | null; setBy: string; setAt: number }
-export interface SpendPoolEvent { pool: string; action: "set" | "clear"; limitUsd: number | null; previous: { limitUsd?: number | null }; by: string; at: number }
+/** A pool's override: `tenantId` null is the pool's own limit, a tenant's id that tenant's share of it. */
+export interface SpendPoolRow { pool: string; tenantId: string | null; limitUsd: number | null; setBy: string; setAt: number }
+export interface SpendPoolEvent {
+  pool: string; tenantId: string | null; action: "set" | "clear"; limitUsd: number | null; previous: { limitUsd?: number | null }; by: string; at: number;
+}
 
 export interface SpendLimitStore {
   list(): Promise<SpendLimitRow[]>;
@@ -362,8 +408,9 @@ export interface SpendLimitStore {
   /** A pool's override (`spend_pool_limits`, 0021), kept and audited as a tenant's is. */
   listPools(): Promise<SpendPoolRow[]>;
   poolEvents(limit: number): Promise<SpendPoolEvent[]>;
-  setPool(pool: string, limitUsd: number | null, by: string, at: number): Promise<void>;
-  clearPool(pool: string, by: string, at: number): Promise<boolean>;
+  /** `tenantId` null: the pool's own limit; a tenant's id: that tenant's share. */
+  setPool(pool: string, tenantId: string | null, limitUsd: number | null, by: string, at: number): Promise<void>;
+  clearPool(pool: string, tenantId: string | null, by: string, at: number): Promise<boolean>;
 }
 
 export function d1SpendLimits(db: D1Database): SpendLimitStore {
@@ -374,41 +421,45 @@ export function d1SpendLimits(db: D1Database): SpendLimitStore {
   const event = (tenantId: string, action: "set" | "clear", limitUsd: number | null, previous: object, by: string, at: number) =>
     db.prepare("INSERT INTO spend_limit_events (tenant_id, action, limit_usd, previous, by, at) VALUES (?, ?, ?, ?, ?, ?)")
       .bind(tenantId, action, limitUsd, JSON.stringify(previous), by, at);
-  const currentPool = async (pool: string) => limitRow(await db.prepare("SELECT limit_usd FROM spend_pool_limits WHERE pool = ?").bind(pool).first());
-  const poolEvent = (pool: string, action: "set" | "clear", limitUsd: number | null, previous: object, by: string, at: number) =>
-    db.prepare("INSERT INTO spend_pool_limit_events (pool, action, limit_usd, previous, by, at) VALUES (?, ?, ?, ?, ?, ?)")
-      .bind(pool, action, limitUsd, JSON.stringify(previous), by, at);
+  // '' in the table is the pool's own row (a primary key column cannot be NULL); null everywhere else.
+  const key = (tenantId: string | null) => tenantId ?? "";
+  const tenantOf = (v: unknown) => v === "" || v === null || v === undefined ? null : String(v);
+  const currentPool = async (pool: string, tenantId: string | null) =>
+    limitRow(await db.prepare("SELECT limit_usd FROM spend_pool_limits WHERE pool = ? AND tenant_id = ?").bind(pool, key(tenantId)).first());
+  const poolEvent = (pool: string, tenantId: string | null, action: "set" | "clear", limitUsd: number | null, previous: object, by: string, at: number) =>
+    db.prepare("INSERT INTO spend_pool_limit_events (pool, tenant_id, action, limit_usd, previous, by, at) VALUES (?, ?, ?, ?, ?, ?, ?)")
+      .bind(pool, key(tenantId), action, limitUsd, JSON.stringify(previous), by, at);
   return {
     async listPools() {
-      const { results } = await db.prepare("SELECT pool, limit_usd, set_by, set_at FROM spend_pool_limits ORDER BY pool").all();
+      const { results } = await db.prepare("SELECT pool, tenant_id, limit_usd, set_by, set_at FROM spend_pool_limits ORDER BY pool, tenant_id").all();
       return ((results ?? []) as any[]).map((r) => ({
-        pool: String(r.pool), limitUsd: r.limit_usd === null ? null : Number(r.limit_usd), setBy: String(r.set_by), setAt: Number(r.set_at),
+        pool: String(r.pool), tenantId: tenantOf(r.tenant_id), limitUsd: r.limit_usd === null ? null : Number(r.limit_usd), setBy: String(r.set_by), setAt: Number(r.set_at),
       }));
     },
     async poolEvents(limit) {
       const { results } = await db.prepare(
-        "SELECT pool, action, limit_usd, previous, by, at FROM spend_pool_limit_events ORDER BY id DESC LIMIT ?").bind(limit).all();
+        "SELECT pool, tenant_id, action, limit_usd, previous, by, at FROM spend_pool_limit_events ORDER BY id DESC LIMIT ?").bind(limit).all();
       return ((results ?? []) as any[]).map((r) => ({
-        pool: String(r.pool), action: r.action === "clear" ? "clear" as const : "set" as const,
+        pool: String(r.pool), tenantId: tenantOf(r.tenant_id), action: r.action === "clear" ? "clear" as const : "set" as const,
         limitUsd: r.limit_usd === null ? null : Number(r.limit_usd), previous: JSON.parse(String(r.previous || "{}")), by: String(r.by), at: Number(r.at),
       }));
     },
-    async setPool(pool, limitUsd, by, at) {
-      const previous = await currentPool(pool);
+    async setPool(pool, tenantId, limitUsd, by, at) {
+      const previous = await currentPool(pool, tenantId);
       await db.batch([
         db.prepare(
-          `INSERT INTO spend_pool_limits (pool, limit_usd, set_by, set_at) VALUES (?, ?, ?, ?)
-           ON CONFLICT(pool) DO UPDATE SET limit_usd = excluded.limit_usd, set_by = excluded.set_by, set_at = excluded.set_at`,
-        ).bind(pool, limitUsd, by, at),
-        poolEvent(pool, "set", limitUsd, previous ?? {}, by, at),
+          `INSERT INTO spend_pool_limits (pool, tenant_id, limit_usd, set_by, set_at) VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT(pool, tenant_id) DO UPDATE SET limit_usd = excluded.limit_usd, set_by = excluded.set_by, set_at = excluded.set_at`,
+        ).bind(pool, key(tenantId), limitUsd, by, at),
+        poolEvent(pool, tenantId, "set", limitUsd, previous ?? {}, by, at),
       ]);
     },
-    async clearPool(pool, by, at) {
-      const previous = await currentPool(pool);
+    async clearPool(pool, tenantId, by, at) {
+      const previous = await currentPool(pool, tenantId);
       if (!previous) return false;
       await db.batch([
-        db.prepare("DELETE FROM spend_pool_limits WHERE pool = ?").bind(pool),
-        poolEvent(pool, "clear", null, previous, by, at),
+        db.prepare("DELETE FROM spend_pool_limits WHERE pool = ? AND tenant_id = ?").bind(pool, key(tenantId)),
+        poolEvent(pool, tenantId, "clear", null, previous, by, at),
       ]);
       return true;
     },
@@ -479,12 +530,17 @@ const TENANT = /^[A-Za-z0-9_.:-]{1,128}$/;
 /**
  * `/admin/spend-limits`, for an admin (auth.ts isAdmin, checked by the caller, as for /admin/models):
  *
- *   GET                                        → { defaults: { tenantUsd, proUsd, platformUsd, onboardingUsd, exempt },
- *                                                  overrides, events, pools, poolEvents, plans }
+ *   GET                                        → { defaults: { tenantUsd, freeUsd, proUsd, platformUsd, onboardingUsd,
+ *                                                  onboardingTenantUsd, exempt }, overrides, events, pools, poolEvents, plans }
  *   PUT    { tenantId, limitUsd: number|null } → the row as kept; null is "no per-tenant limit"
  *   DELETE { tenantId }                        → 204, or 404 when the tenant had no override
- *   PUT    { pool, limitUsd: number|null }     → a pool's override (`pool`: "onboarding"); null is "no limit for it"
+ *   PUT    { pool, limitUsd: number|null }     → a pool's own override (`pool`: "onboarding"); null is "no limit for it"
  *   DELETE { pool }                            → 204, or 404 when the pool had no override
+ *   PUT    { pool, tenantId, limitUsd }        → one tenant's share of the pool; null is "no share limit for it"
+ *   DELETE { pool, tenantId }                  → 204, or 404 when that tenant's share had no override
+ *
+ * The body's keys say what is set: `pool` a pool's limit, `tenantId` a tenant's, both together the tenant's share of
+ * the pool.
  *
  * Every PUT and DELETE writes an audit row (`spend_limit_events`, `spend_pool_limit_events`). A change reaches a
  * running isolate within `SPEND_CACHE_MS`, the life of its last reading. `plans` is what Raft said, read only here.
@@ -497,7 +553,10 @@ export async function adminSpendLimits(
     const l = deps.limits;
     return json({
       currency: "USD",
-      defaults: { tenantUsd: l.tenantUsd, proUsd: l.proUsd, platformUsd: l.platformUsd, onboardingUsd: l.onboardingUsd, exempt: [...l.exempt].sort() },
+      defaults: {
+        tenantUsd: l.tenantUsd, freeUsd: l.freeUsd, proUsd: l.proUsd, platformUsd: l.platformUsd, onboardingUsd: l.onboardingUsd,
+        onboardingTenantUsd: l.onboardingTenantUsd, exempt: [...l.exempt].sort(),
+      },
       overrides: await deps.store.list(),
       events: await deps.store.events(50),
       pools: await deps.store.listPools(),
@@ -507,32 +566,34 @@ export async function adminSpendLimits(
   }
   if (method !== "PUT" && method !== "DELETE") return refuse(405, "method", "GET, PUT or DELETE");
   const b = (body && typeof body === "object" && !Array.isArray(body) ? body : {}) as Record<string, unknown>;
-  // A pool's override or a tenant's: named by which key the body has, never both.
-  const subject = "pool" in b ? "pool" : "tenantId";
-  const allowed = method === "PUT" ? [subject, "limitUsd"] : [subject];
+  // What is set is named by the keys the body has: `pool` alone, `tenantId` alone, or both (the tenant's share of the pool).
+  const isPool = "pool" in b;
+  const allowed = [...(isPool ? ["pool"] : []), "tenantId", ...(method === "PUT" ? ["limitUsd"] : [])];
   const unknown = Object.keys(b).find((k) => !allowed.includes(k));
   if (unknown) return refuse(400, "unknown_field", `unknown field ${unknown}`);
   const at = deps.now();
-  const noLimit = subject === "pool" ? "no limit for the pool" : "no per-tenant limit";
-  if (subject === "pool") {
-    if (typeof b.pool !== "string" || !(POOLS as readonly string[]).includes(b.pool)) return refuse(422, "invalid", `pool is one of ${POOLS.join(", ")}`);
-  } else if (typeof b.tenantId !== "string" || !TENANT.test(b.tenantId)) return refuse(422, "invalid", "tenantId is a tenant's id");
-  const id = String(b[subject]);
+  if (isPool && (typeof b.pool !== "string" || !(POOLS as readonly string[]).includes(b.pool))) return refuse(422, "invalid", `pool is one of ${POOLS.join(", ")}`);
+  const hasTenant = "tenantId" in b;
+  if ((hasTenant || !isPool) && (typeof b.tenantId !== "string" || !TENANT.test(b.tenantId))) return refuse(422, "invalid", "tenantId is a tenant's id");
+  const pool = isPool ? String(b.pool) : null;
+  const tenantId = hasTenant ? String(b.tenantId) : null;
+  const what = pool === null ? "tenant" : tenantId === null ? "pool" : "tenant's share of the pool";
+  const noLimit = pool === null ? "no per-tenant limit" : tenantId === null ? "no limit for the pool" : "no limit on the tenant's share";
   if (method === "DELETE") {
-    const cleared = subject === "pool" ? await deps.store.clearPool(id, actor, at) : await deps.store.clear(id, actor, at);
-    return cleared ? new Response(null, { status: 204 }) : refuse(404, "not_found", `that ${subject === "pool" ? "pool" : "tenant"} has no override`);
+    const cleared = pool === null ? await deps.store.clear(tenantId!, actor, at) : await deps.store.clearPool(pool, tenantId, actor, at);
+    return cleared ? new Response(null, { status: 204 }) : refuse(404, "not_found", `that ${what} has no override`);
   }
   if (!("limitUsd" in b)) return refuse(422, "invalid", `limitUsd is a number of dollars at or above 0, or null for ${noLimit}`);
   const limitUsd = b.limitUsd;
   if (limitUsd !== null && !(typeof limitUsd === "number" && Number.isFinite(limitUsd) && limitUsd >= 0)) {
     return refuse(422, "invalid", `limitUsd is a number of dollars at or above 0, or null for ${noLimit}`);
   }
-  if (subject === "pool") {
-    await deps.store.setPool(id, limitUsd as number | null, actor, at);
-    return json({ pool: id, limitUsd, setBy: actor, setAt: at });
+  if (pool !== null) {
+    await deps.store.setPool(pool, tenantId, limitUsd as number | null, actor, at);
+    return json({ pool, ...(tenantId !== null ? { tenantId } : {}), limitUsd, setBy: actor, setAt: at });
   }
-  await deps.store.set(id, limitUsd as number | null, actor, at);
-  return json({ tenantId: id, limitUsd, setBy: actor, setAt: at });
+  await deps.store.set(tenantId!, limitUsd as number | null, actor, at);
+  return json({ tenantId, limitUsd, setBy: actor, setAt: at });
 }
 
 const json = (v: unknown) => Response.json(v, { headers: { "cache-control": "no-store" } });
@@ -561,8 +622,8 @@ export function spendAdmit(gate: Pick<SpendGate, "admit">, defaultModel: string)
  */
 let shared: { key: string; gate: SpendGate; db: { current: D1Database | undefined } } | null = null;
 export function sharedSpendGate(env: SpendLimitEnv & { CONTROL_DB?: D1Database }): SpendGate {
-  const key = JSON.stringify([env.DAILY_LIMIT_USD, env.PRO_DAILY_LIMIT_USD, env.PLATFORM_DAILY_LIMIT_USD, env.ONBOARDING_DAILY_LIMIT_USD,
-    env.DAILY_LIMIT_EXEMPT_TENANTS]);
+  const key = JSON.stringify([env.DAILY_LIMIT_USD, env.FREE_DAILY_LIMIT_USD, env.PRO_DAILY_LIMIT_USD, env.PLATFORM_DAILY_LIMIT_USD, env.ONBOARDING_DAILY_LIMIT_USD,
+    env.ONBOARDING_TENANT_DAILY_LIMIT_USD, env.DAILY_LIMIT_EXEMPT_TENANTS]);
   if (!shared || shared.key !== key) {
     const db = { current: env.CONTROL_DB };
     const bound = () => { if (!db.current) throw new Error("no CONTROL_DB binding"); return db.current; };

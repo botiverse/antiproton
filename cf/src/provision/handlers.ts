@@ -404,6 +404,12 @@ export async function handleProvision(
     if (!RAFT_ID.test(seg[1]!)) return fail({ status: 422, code: "invalid", param: "raftServerId", message: `the Raft server id must match ${RAFT_ID}` });
     const tenant = tenantFor(who, seg[1]!);
     if (isFail(tenant)) return fail(tenant);
+    // A tenant-scoped token names no server, so the path's is taken only when the tenant's own agents were made for it:
+    // a plan is said of one server, and must not land on a tenant that is another server's (or answer as if it had).
+    if (who.scope === "tenant" && !(await deps.registry.hasServer?.(tenant, seg[1]!))) {
+      return fail({ status: 403, code: "server_mismatch", param: "raftServerId",
+        message: `this token's tenant has no agent provisioned for Raft server ${seg[1]}; a plan is set for the server the token belongs to` });
+    }
     const b = typeof body === "object" && body !== null && !Array.isArray(body) ? body as Record<string, unknown> : {};
     const extra = Object.keys(b).find((k) => k !== "plan");
     if (extra) return fail({ status: 422, code: "invalid", param: extra, message: `unknown field ${extra}; the body is { "plan": "free" | "pro" }` });
