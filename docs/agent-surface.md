@@ -533,6 +533,11 @@ agent that must not run before its import:
   carries `instructions`, once they are applied, so the first turn runs on the imported persona — and
   wakes the agent: the queued pushes are posted and the first turn starts. A trace row `import.hold`,
   `status: "import"`, records it.
+- **Ready.** A provisioned agent tells Raft it is `online` once it is ready and before any turn: when
+  `enable_push` succeeds, or, for an agent made with `awaitImport`, when the import lifts the hold. One
+  trace row `agent.ready`, once per agent, sent as a status-only activity event while push is on
+  (`src/runtime/ready.ts`). The provider's own `enable_push`/`disable_push` calls are not the agent's
+  activity and are not reported as it working.
 - **The valve.** With no import within **24 hours** of the create (`IMPORT_HOLD_MAX_MS`), the hold lifts
   on its own the next time input is to be delivered (the alarm comes back at that time while pushes are
   waiting), with a trace row `import.hold`, `status: "valve"`, `verdict: "failed"`, saying why. The agent
@@ -925,7 +930,7 @@ answer with `/admin/transcript`'s for the same agent).
 
 `GET …/trace` answers the agent's trace rows — the spans of its work, one row each when it ended
 (`model.call`, `tool.call`, `approval.wait`, `container.lease`, `inbound`, `mount.seeded`,
-`rebuild.decision`, `rebuild.outcome`, `rebuild.behaviour`, `turn.timing`, `import.hold`, `model.prewarm`; `src/trace/outbox.ts`) — with `from <= at < to`, in `seq` order.
+`rebuild.decision`, `rebuild.outcome`, `rebuild.behaviour`, `turn.timing`, `import.hold`, `model.prewarm`, `agent.ready`; `src/trace/outbox.ts`) — with `from <= at < to`, in `seq` order.
 
 - `from`, `to` — ISO 8601 or milliseconds since the epoch; the window is at most 24 hours. One alone
   puts the other 24 hours away; neither is the 24 hours up to now. `to` before or at `from`, a wider

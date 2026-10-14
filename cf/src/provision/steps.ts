@@ -12,6 +12,7 @@ import type { Fail, ProvisionTool, PushStatus } from "./handlers.ts";
 import { canonicalToolConfig, sameToolConfig, toolConfigOf, type ToolConfig } from "../../../src/core/tool-config.ts";
 import { interruptsOf } from "../../../src/plugins/types.ts";
 import { firstTurnOf, type FirstTurn } from "../../../src/runtime/prewarm.ts";
+import { PROVISION_TASK } from "../../../src/runtime/status.ts";
 
 /** The alias the provisioned mount carries: the plugin's own name, as a person would pick. */
 export const PROVISION_MOUNT_ALIAS = "raft";
@@ -21,8 +22,6 @@ export const PROVISION_MOUNT_ALIAS = "raft";
  * (`agentKind` and a catalogue row's `for`, cf/src/runtime.ts).
  */
 export const PROVISIONED_BY = "raft";
-/** The task the push tools run under when the provider, not the model, calls them. */
-export const PROVISION_TASK = "provision";
 /** The home the provisioned agents are listed under, so the console can find them. */
 export const PROVIDER_HOME = "u-raft-provider";
 
@@ -134,7 +133,14 @@ export async function provisionTool(
 ): Promise<{ ok: true; result: Json } | { ok: false; error: string }> {
   await rt.ready();
   const r = await rt.gateway().invoke({ tenantId, agentId, taskId: PROVISION_TASK }, `${PROVISION_MOUNT_ALIAS}.${name}`, {});
-  if (r.status === "succeeded") return { ok: true, result: r.result };
+  if (r.status === "succeeded") {
+    // Push on is the agent ready, unless it waits for its import (src/runtime/ready.ts). Never fails the push it follows.
+    if (name === "enable_push") {
+      try { await rt.provisionedReady(tenantId, agentId, "push enabled"); }
+      catch (e) { console.warn(`ready for ${agentId} not recorded: ${String((e as Error)?.message ?? e).slice(0, 200)}`); }
+    }
+    return { ok: true, result: r.result };
+  }
   const err = "error" in r ? r.error : undefined;
   const message = err === undefined ? r.status
     : typeof err === "string" ? err

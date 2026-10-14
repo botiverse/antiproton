@@ -1,6 +1,7 @@
 /** The trace-row → activity-event mapping (src/runtime/activity.ts): what each row kind becomes, and nothing the service does not know. */
 import { activityEvents, ACTIVITY_BATCH_MAX, orderStatuses } from "../src/runtime/activity.ts";
 import type { TraceOutboxRow } from "../src/trace/outbox.ts";
+import { PROVISION_TASK } from "../src/runtime/status.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 function check(name: string, fn: () => void) {
@@ -86,6 +87,48 @@ check("a status earlier than the last one sent keeps its date and does not move 
 });
 
 console.log(`\n  activity mapping\n  ${"─".repeat(56)}`);
+/**
+ * The trace of a hosted agent Raft made with `awaitImport` (staging, 2026-10-13), as its outbox held it: the seeded
+ * mounts, the provider's enable_push, the harness opened for the prewarm, the import lifting the hold, the prewarm.
+ * Raft showed it "working" from the enable_push on, and since it was never woken it stayed so.
+ */
+const CINDY: TraceOutboxRow[] = [
+  {"seq":1,"at":1791998439624,"tenantId":"raft_ac44861c-3d98-48c2-85e8-002f9c006602","agentId":"raft_a58cbdb2-d7ea-4b94-b869-1ae51e255f07","kind":"mount.seeded","spanId":"tools@1","status":"added","verdict":"ok","attrs":{"alias":"tools","plugin":"tools","since":1,"outcome":"added","reason":null,"notice":"first tools"}},
+  {"seq":2,"at":1791998439624,"tenantId":"raft_ac44861c-3d98-48c2-85e8-002f9c006602","agentId":"raft_a58cbdb2-d7ea-4b94-b869-1ae51e255f07","kind":"mount.seeded","spanId":"artifacts@1","status":"added","verdict":"ok","attrs":{"alias":"artifacts","plugin":"artifacts","since":1,"outcome":"added","reason":null,"notice":"first tools"}},
+  {"seq":3,"at":1791998439624,"tenantId":"raft_ac44861c-3d98-48c2-85e8-002f9c006602","agentId":"raft_a58cbdb2-d7ea-4b94-b869-1ae51e255f07","kind":"mount.seeded","spanId":"web@1","status":"added","verdict":"ok","attrs":{"alias":"web","plugin":"http","since":1,"outcome":"added","reason":null,"notice":"first tools"}},
+  {"seq":4,"at":1791998439624,"tenantId":"raft_ac44861c-3d98-48c2-85e8-002f9c006602","agentId":"raft_a58cbdb2-d7ea-4b94-b869-1ae51e255f07","kind":"mount.seeded","spanId":"search@1","status":"added","verdict":"ok","attrs":{"alias":"search","plugin":"exa","since":1,"outcome":"added","reason":null,"notice":"first tools"}},
+  {"seq":5,"at":1791998439624,"tenantId":"raft_ac44861c-3d98-48c2-85e8-002f9c006602","agentId":"raft_a58cbdb2-d7ea-4b94-b869-1ae51e255f07","kind":"mount.seeded","spanId":"gh@1","status":"added","verdict":"ok","attrs":{"alias":"gh","plugin":"github","since":1,"outcome":"added","reason":null,"notice":"first tools"}},
+  {"seq":6,"at":1791998439624,"tenantId":"raft_ac44861c-3d98-48c2-85e8-002f9c006602","agentId":"raft_a58cbdb2-d7ea-4b94-b869-1ae51e255f07","kind":"mount.seeded","spanId":"sandbox@1","status":"added","verdict":"ok","attrs":{"alias":"sandbox","plugin":"sandbox","since":1,"outcome":"added","reason":null,"notice":"first tools"}},
+  {"seq":7,"at":1791998439624,"tenantId":"raft_ac44861c-3d98-48c2-85e8-002f9c006602","agentId":"raft_a58cbdb2-d7ea-4b94-b869-1ae51e255f07","kind":"mount.seeded","spanId":"state@1","status":"added","verdict":"ok","attrs":{"alias":"state","plugin":"state","since":1,"outcome":"added","reason":null,"notice":"first tools"}},
+  {"seq":8,"at":1791998439624,"tenantId":"raft_ac44861c-3d98-48c2-85e8-002f9c006602","agentId":"raft_a58cbdb2-d7ea-4b94-b869-1ae51e255f07","kind":"mount.seeded","spanId":"reminder@2","status":"not-for","verdict":"ok","attrs":{"alias":"reminder","plugin":"reminder","since":2,"outcome":"not-for","reason":"for console agents; this one is raft"}},
+  {"seq":9,"at":1791998443791,"tenantId":"raft_ac44861c-3d98-48c2-85e8-002f9c006602","agentId":"raft_a58cbdb2-d7ea-4b94-b869-1ae51e255f07","kind":"tool.call","spanId":"op_467345f4bef14202943f","status":"succeeded","verdict":"ok","ms":1801,"attrs":{"tool":"raft.enable_push","mount":"raft","task":"provision"}},
+  {"seq":10,"at":1791998444624,"tenantId":"raft_ac44861c-3d98-48c2-85e8-002f9c006602","agentId":"raft_a58cbdb2-d7ea-4b94-b869-1ae51e255f07","kind":"harness.open","spanId":"[redacted]#main@1791998444624","status":"cold-start","verdict":"ok","ms":0,"attrs":{"reason":"cold-start","cause":"first","changed":[],"engine":"pi085","session":"main","conversation":"main","systemSha256":"6b6f049f51286f47021283edb62fe7111dc8fd5187c1469fc783c38e073128b2","toolsSha256":"57a601c46061e4326350b27745fe1085c7cad3b607db632b59938f9e0bb78e18","tools":111,"prevAgeMs":null,"version":"a33a71d3-7049-4ac6-b330-50ccc98e80f1"}},
+  {"seq":11,"at":1791998444962,"tenantId":"raft_ac44861c-3d98-48c2-85e8-002f9c006602","agentId":"raft_a58cbdb2-d7ea-4b94-b869-1ae51e255f07","kind":"import.hold","spanId":"[redacted]","status":"import","verdict":"ok","ms":5338,"attrs":{"reason":"the workspace import landed"}},
+  {"seq":12,"at":1791998449541,"tenantId":"raft_ac44861c-3d98-48c2-85e8-002f9c006602","agentId":"raft_a58cbdb2-d7ea-4b94-b869-1ae51e255f07","kind":"model.prewarm","spanId":"[redacted]","status":"warmed","verdict":"ok","ms":1439,"attrs":{"outcome":"warmed","model":"deepseek-flash","inputTokens":23290,"cacheReadTokens":0,"outputTokens":1}},
+];
+const CINDY_AGENT = CINDY[0]!.agentId;
+
+check("a provisioned agent's own trace before any turn (real rows) says nothing: the provider's enable_push is not the agent working", () => {
+  const ev = activityEvents(CINDY_AGENT, CINDY);
+  must(ev.length === 0, JSON.stringify(ev));
+});
+
+check("the same rows with the ready row the runtime writes when the import lands: one event, a status-only online", () => {
+  const lifted = CINDY.find((r) => r.kind === "import.hold")!;
+  const ready: TraceOutboxRow = { seq: 13, at: lifted.at, tenantId: lifted.tenantId, agentId: CINDY_AGENT, kind: "agent.ready",
+    spanId: `ready_${CINDY_AGENT}`, status: "ready", verdict: "ok", attrs: { reason: "the workspace import landed" } };
+  const ev = activityEvents(CINDY_AGENT, [...CINDY, ready]);
+  must(ev.length === 1 && ev[0]!.status === "online" && ev[0]!.hookEventName === undefined && ev[0]!.eventId === `${CINDY_AGENT}:13:status`
+    && ev[0]!.occurredAt === new Date(lifted.at).toISOString(), JSON.stringify(ev));
+});
+
+check("the agent's own tool call is still working, and the same call run under the provider's task is not", () => {
+  const own = row(5, "tool.call", "succeeded", "ok", { ms: 100, attrs: { tool: "enable_push", mount: "raft", task: "main" } });
+  const ev = activityEvents("raft_a", [own]);
+  must(ev.length === 2 && ev[0]!.hookEventName === "PreToolUse" && ev[0]!.status === "working", JSON.stringify(ev));
+  must(activityEvents("raft_a", [{ ...own, attrs: { ...own.attrs, task: PROVISION_TASK } }]).length === 0, "the provider's call was reported");
+});
+
 for (const r of results) console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);
 const passed = results.filter((r) => r.ok).length;
 console.log(`  ${"─".repeat(56)}\n  ${passed} passed, ${results.length - passed} failed\n`);
