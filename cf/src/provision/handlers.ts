@@ -29,7 +29,11 @@ import { CONNECTION_PROVIDERS, returnUrlProblem, scopesFor, type ConnectionProvi
 import { surface, surfaceReadOf, type SurfaceDeps } from "../agent-surface/surface.ts";
 import { logEvent } from "../../../src/core/log.ts";
 import { WORKING_SET } from "../../../src/plugins/state.ts";
-import { SEED_MODES, seedPathProblem, seedText, type SeedFileMeta, type SeedMode, type SeedSeal, type SeedWriteResult } from "../../../src/store/seed-files.ts";
+import { SEED_MODES, seedPathProblem, seedText, sha256Hex as sha256Sync, type SeedFileMeta, type SeedMode, type SeedSeal, type SeedWriteResult } from "../../../src/store/seed-files.ts";
+import {
+  IMPORT_FILE_MAX_BYTES, IMPORT_FILES_MAX, IMPORT_TOTAL_MAX_BYTES, importDigest, type CommitResult, type ImportRecord,
+} from "../../../src/store/workspace-import.ts";
+import { STATE_KEY } from "../../../src/plugins/state-key.ts";
 import type { FreshContextResult, RestartResult } from "../runtime.ts";
 import { canonicalToolConfig, type ToolConfig } from "../../../src/core/tool-config.ts";
 import type { ModelChoices } from "../control-plane.ts";
@@ -51,7 +55,7 @@ export interface ProvisionAgentOps {
    * says nothing about them. A Fail is the agent's refusal of it (cf/src/provision/steps.ts): another one recorded
    * already (409), or one this deployment cannot give (400). Nothing is written when it refuses.
    */
-  adopt(tenantId: string, agentId: string, spec: { name: string; instructions: string; raftOrigin: string; toolConfig?: ToolConfig | null }): Promise<void | Fail>;
+  adopt(tenantId: string, agentId: string, spec: { name: string; instructions: string; raftOrigin: string; toolConfig?: ToolConfig | null; awaitImport?: boolean }): Promise<void | Fail>;
   /** Seal the credential onto the `raft` mount; the plugin checks it against Raft. */
   attachCredential(tenantId: string, agentId: string, credential: string): Promise<{ ok: true; account: string | null } | { ok: false; error: string }>;
   removeCredential(tenantId: string, agentId: string): Promise<boolean>;
@@ -131,6 +135,18 @@ export interface ProvisionDeps {
    * route of it answers 404, as on a deployment that never had them.
    */
   seed?: SeedOps;
+  /**
+   * A migrating agent's workspace, written once in the agent's own object (`POST …/import`). Production: not behind
+   * EVAL_SEED_ROUTES. Absent: the route answers 404, as on a deployment that never had it.
+   */
+  imports?: ImportOps;
+}
+
+/** What the import route asks of the agent's object; each is one RPC (cf/src/index.ts AgentDO). */
+export interface ImportOps {
+  commit(tenantId: string, agentId: string, imp: { migrationId: string; digest: string; instructions: boolean; files: ImportFile[] }):
+    Promise<CommitResult | { ok: false; code: "not_found"; message: string }>;
+  instructionsApplied(tenantId: string, agentId: string, migrationId: string): Promise<void>;
 }
 
 /** What the setup routes ask of the agent's object; each is one RPC (cf/src/index.ts AgentDO). */
@@ -329,6 +345,11 @@ export async function handleProvision(
     const answer = await tenantUsage(tenant, query, deps.usage, deps.now());
     return typeof answer === "string" ? fail({ status: 400, code: "invalid", message: answer }) : ok(answer);
   }
+  // Read by Raft's exporter, which refuses a workspace over them before sending it.
+  if (seg[0] === "import-limits" && seg.length === 1 && method === "GET") {
+    if (!deps.imports) return null;
+    return ok(IMPORT_LIMITS);
+  }
   if (seg[0] !== "agents") return null;
   // On POST the body names the server; elsewhere the URL does.
   const serverForTenant = method === "POST" && seg.length === 1
@@ -369,10 +390,17 @@ export async function handleProvision(
     // is compared with the create it repeats, so an option withdrawn since does not refuse the agent that exists.
     const model = createModelField(body);
     if (isFail(model)) return fail(model);
+    // Hold the agent until its workspace import (`POST …/import`): no turn before it, pushes queued meanwhile.
+    const awaitField = field(body, "awaitImport");
+    if (awaitField !== undefined && typeof awaitField !== "boolean") {
+      return fail({ status: 422, code: "invalid", param: "awaitImport", message: "awaitImport is true or false" });
+    }
+    const awaitImport = awaitField === true;
 
     const agentId = providerAgentId(raftAgentId);
     // `model` is part of the request a replay must repeat: absent and null are one value (null), as on a create.
-    const asked = { raftServerId: raftServerId!, raftOrigin, name: name!, instructions, model };
+    // `awaitImport` likewise: absent and false are one value.
+    const asked = { raftServerId: raftServerId!, raftOrigin, name: name!, instructions, model, awaitImport };
     const credentialHash = await sha256Hex(credential);
     let row = await deps.registry.get(tenantId, raftAgentId);
     let created = false;
@@ -380,7 +408,8 @@ export async function handleProvision(
       if (row.status === "deleted") {
         return fail({ status: 409, code: "deleted", message: "this Raft agent was deleted here; a new agent needs a new id" });
       }
-      const differs = (Object.keys(asked) as Array<keyof typeof asked>).filter((k) => (k === "model" ? row!.model ?? null : row![k]) !== asked[k]);
+      const differs = (Object.keys(asked) as Array<keyof typeof asked>).filter((k) =>
+        (k === "model" ? row!.model ?? null : k === "awaitImport" ? row!.awaitImport ?? false : row![k]) !== asked[k]);
       // The credential is the one field that matters most: a delayed retry with an old one must not
       // overwrite a newer PUT /credential. Compared by hash; a row from
       // before the hash existed accepts the first replay and records it.
@@ -429,7 +458,8 @@ export async function handleProvision(
     }
     // From here every step is idempotent, so a replay of a request that died half-way finishes it. The tool choice is
     // compared by the agent's object, where it is recorded: a replay asking for other tools is 409, as for any field.
-    const adopted = await deps.agent.adopt(tenantId, agentId, { name: row.name, instructions: row.instructions, raftOrigin: row.raftOrigin, toolConfig });
+    const adopted = await deps.agent.adopt(tenantId, agentId, { name: row.name, instructions: row.instructions, raftOrigin: row.raftOrigin, toolConfig,
+      ...(row.awaitImport ? { awaitImport: true } : {}) });
     if (adopted) return fail(adopted);
     const attached = await deps.agent.attachCredential(tenantId, agentId, credential);
     if (!attached.ok) return fail({ status: 422, code: "credential_refused", message: attached.error, param: "credential" });
@@ -447,6 +477,14 @@ export async function handleProvision(
   }
   // `…/usage`, `…/workspace-files`, `…/workspace-files/read`: the agent's own surface, read through
   // the core the public API uses; only how the agent is found, and the envelope, are this binding's.
+  if (rest.length === 2 && rest[1] === "import" && method === "POST") {
+    if (!deps.imports) return null;
+    const found = byRaft ? await deps.registry.get(tenantId, rest[0]!) : await deps.registry.getByAgentId(tenantId, rest[0]!);
+    if (!found || found.status === "deleted") {
+      return fail({ status: 404, code: "not_found", message: `no provisioned agent ${byRaft ? "made from Raft agent " : ""}${rest[0]}` });
+    }
+    return workspaceImport(body, tenantId, found, headers.credentialId ?? null, deps, deps.imports);
+  }
   if (EVAL_ROUTES.has(rest.slice(1).join("/"))) {
     if (!deps.seed) return null;
     const found = byRaft ? await deps.registry.get(tenantId, rest[0]!) : await deps.registry.getByAgentId(tenantId, rest[0]!);
@@ -529,6 +567,180 @@ export async function handleProvision(
   return null;
 }
 
+
+/** What `GET /provision/import-limits` answers: the bounds `POST …/import` refuses past, for Raft's exporter to apply first. */
+export const IMPORT_LIMITS = { maxTotalBytes: IMPORT_TOTAL_MAX_BYTES, maxFiles: IMPORT_FILES_MAX, maxFileBytes: IMPORT_FILE_MAX_BYTES } as const;
+/**
+ * The most an import's request may be, as sent: 10 MiB of files in base64 is 13.4 MiB, and paths, hashes and
+ * instructions fit in what is left. Refused before the body is parsed (cf/src/index.ts `provision`).
+ */
+export const IMPORT_REQUEST_MAX_BYTES = 16 * 1024 * 1024;
+export const IMPORT_ROUTE = /^\/provision\/agents\/(?:by-raft-agent\/)?[^/]+\/import$/;
+const MIGRATION_ID = /^[A-Za-z0-9._:-]{1,128}$/;
+const SHA256_HEX = /^[0-9a-f]{64}$/;
+const BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+const IMPORT_FIELDS = new Set(["migrationId", "instructions", "files", "totalBytes"]);
+const IMPORT_FILE_FIELDS = new Set(["path", "contentBase64", "sha256"]);
+
+/** One file of an import, checked and decoded: what its row will read back as. */
+export interface ImportFile { path: string; text: string; bytes: number; sha256: string }
+
+/** The bytes as text, or null when they are not UTF-8 or carry a NUL. A BOM is kept, so the text re-encodes to them. */
+function utf8Text(bytes: Uint8Array): string | null {
+  if (bytes.includes(0)) return null;
+  try { return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes); } catch { return null; }
+}
+
+/**
+ * An imported file's path as the key it becomes, or why it cannot be one. Empty and `.` segments drop out
+ * (`./notes//a.md` is `notes/a.md`); refused rather than resolved: a leading `/`, a `..` segment, a trailing `/`
+ * (a directory), a backslash or a control character. Then the state plugin's key rule (src/plugins/state-key.ts),
+ * since the file is a state key; and never a name the runtime owns: `kept:` (the agent's sealed secrets,
+ * src/runtime/secrets.ts) or a working-set document (`memory`, `todo`, `journal`, src/plugins/state.ts
+ * `WORKING_SET`), which the runtime puts in the system prompt as the agent's own running notes.
+ */
+export function importPath(raw: unknown): { path: string } | { problem: string; reserved?: true } {
+  if (typeof raw !== "string" || !raw) return { problem: "path is required" };
+  // eslint-disable-next-line no-control-regex
+  if (/[\u0000-\u001f\u007f\\]/.test(raw)) return { problem: "path may not contain a backslash or a control character" };
+  if (raw.startsWith("/")) return { problem: "path must be relative, not absolute" };
+  if (raw.endsWith("/")) return { problem: "path names a directory; give a file" };
+  const segs = raw.split("/").filter((p) => p !== "" && p !== ".");
+  if (segs.includes("..")) return { problem: "path must not have a `..` segment" };
+  const path = segs.join("/");
+  if (path.toLowerCase().startsWith("kept:")) return { problem: "kept: names a secret, not a file", reserved: true };
+  if (!STATE_KEY.test(path)) return { problem: `path must match ${STATE_KEY} once normalised (a state key)` };
+  if (WORKING_SET.some((d) => d.key === path)) {
+    return { problem: `${path} is one of the agent's working-set documents (${WORKING_SET.map((d) => d.key).join(", ")}), which the runtime keeps; import under another path`, reserved: true };
+  }
+  return { path };
+}
+
+/**
+ * The body of `POST …/import`, checked whole before anything is written: shape, bounds, paths, each file's bytes
+ * against its `sha256`, and `totalBytes` against their sum. Over a bound is 413, anything else 422 (400 for a field
+ * this route does not know), each naming the field.
+ */
+export function importRequest(body: unknown, instructionsMax: Limit):
+  { migrationId: string; instructions: string | undefined; files: ImportFile[]; totalBytes: number } | Fail {
+  if (typeof body !== "object" || body === null || Array.isArray(body)) return { status: 422, code: "invalid", message: "the body is a JSON object" };
+  const unknownField = Object.keys(body).find((k) => !IMPORT_FIELDS.has(k));
+  if (unknownField) return { status: 400, code: "unknown_field", param: unknownField, message: `unknown field ${unknownField}` };
+  const migrationId = field(body, "migrationId");
+  if (typeof migrationId !== "string" || !MIGRATION_ID.test(migrationId)) {
+    return { status: 422, code: "invalid", param: "migrationId", message: `migrationId is required and must match ${MIGRATION_ID}` };
+  }
+  const instructions = textField(body, "instructions", instructionsMax, false);
+  if (isFail(instructions)) return instructions;
+  const totalBytes = field(body, "totalBytes");
+  if (typeof totalBytes !== "number" || !Number.isSafeInteger(totalBytes) || totalBytes < 0) {
+    return { status: 422, code: "invalid", param: "totalBytes", message: "totalBytes is required: the sum of the files' decoded sizes, in bytes" };
+  }
+  // Refused before a byte is decoded: the request says itself that it is too large.
+  if (totalBytes > IMPORT_TOTAL_MAX_BYTES) {
+    return { status: 413, code: "too_large", param: "totalBytes", message: `an import is at most ${IMPORT_TOTAL_MAX_BYTES} bytes together; this one says ${totalBytes}` };
+  }
+  const list = field(body, "files");
+  if (!Array.isArray(list)) return { status: 422, code: "invalid", param: "files", message: "files is an array of { path, contentBase64, sha256 }" };
+  if (list.length > IMPORT_FILES_MAX) {
+    return { status: 413, code: "too_many_files", param: "files", message: `an import is at most ${IMPORT_FILES_MAX} files; this one has ${list.length}` };
+  }
+  const files: ImportFile[] = [];
+  const seen = new Set<string>();
+  let sum = 0;
+  for (let i = 0; i < list.length; i++) {
+    const at = `files[${i}]`, f = list[i] as unknown;
+    if (typeof f !== "object" || f === null || Array.isArray(f)) return { status: 422, code: "invalid", param: at, message: `${at} is an object { path, contentBase64, sha256 }` };
+    const extra = Object.keys(f).find((k) => !IMPORT_FILE_FIELDS.has(k));
+    if (extra) return { status: 400, code: "unknown_field", param: `${at}.${extra}`, message: `unknown field ${at}.${extra}${extra === "content" ? "; a file is sent as contentBase64" : ""}` };
+    const p = importPath(field(f, "path"));
+    if ("problem" in p) return { status: 422, code: p.reserved ? "reserved" : "invalid", param: `${at}.path`, message: `${at}.path: ${p.problem}` };
+    if (seen.has(p.path)) return { status: 422, code: "duplicate_path", param: `${at}.path`, message: `${at}.path is ${p.path}, which an earlier file already is` };
+    seen.add(p.path);
+    const sha = field(f, "sha256");
+    if (typeof sha !== "string" || !SHA256_HEX.test(sha.toLowerCase())) {
+      return { status: 422, code: "invalid", param: `${at}.sha256`, message: `${at}.sha256 is the hex SHA-256 of the file's bytes` };
+    }
+    const b64 = field(f, "contentBase64");
+    if (typeof b64 !== "string" || !BASE64.test(b64)) {
+      return { status: 422, code: "invalid", param: `${at}.contentBase64`, message: `${at}.contentBase64 is the file's bytes in standard, padded base64` };
+    }
+    // The decoded size, known from the length: a file over the bound is refused without decoding it.
+    const size = (b64.length / 4) * 3 - (b64.endsWith("==") ? 2 : b64.endsWith("=") ? 1 : 0);
+    if (size > IMPORT_FILE_MAX_BYTES) {
+      return { status: 413, code: "file_too_large", param: `${at}.contentBase64`, message: `a file is at most ${IMPORT_FILE_MAX_BYTES} bytes; ${at} is ${size}` };
+    }
+    sum += size;
+    if (sum > IMPORT_TOTAL_MAX_BYTES) {
+      return { status: 413, code: "too_large", param: "files", message: `an import is at most ${IMPORT_TOTAL_MAX_BYTES} bytes together; the files through ${at} are ${sum}` };
+    }
+    const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+    const hash = sha256Sync(bytes);
+    if (hash !== sha.toLowerCase()) return { status: 422, code: "sha256_mismatch", param: `${at}.sha256`, message: `${at}.sha256 is not the SHA-256 of its decoded bytes` };
+    // A state value is text: a file that is not UTF-8, or carries a NUL, could not read back as the bytes it was. The
+    // size was bounded above, by this route's own bound (not `seedText`'s, which is a seeded file's).
+    const text = utf8Text(bytes);
+    if (text === null) return { status: 422, code: "not_text", param: `${at}.contentBase64`, message: `${at} is not UTF-8 text with no NUL byte; an imported file is a text document` };
+    const shape = secretShape(text);
+    if (shape) return { status: 422, code: "credential_in_text", param: `${at}.contentBase64`, message: `${at} carries what looks like a ${shape}; credentials are never imported` };
+    files.push({ path: p.path, text, bytes: bytes.byteLength, sha256: hash });
+  }
+  if (sum !== totalBytes) {
+    return { status: 422, code: "total_mismatch", param: "totalBytes", message: `totalBytes is ${totalBytes}, and the files decode to ${sum}` };
+  }
+  return { migrationId, instructions, files, totalBytes: sum };
+}
+
+/**
+ * `POST …/import` (docs/agent-surface.md "Workspace import"): a migrating agent's workspace, written once, all or
+ * nothing, in the agent's object (src/store/workspace-import.ts). `instructions`, when sent, are applied after the
+ * files land, as a PATCH applies them; the object records whether they were, so a retry of an import whose
+ * instructions did not reach the agent finishes it, and a retry after they did never applies them over a later
+ * PATCH. One audit line per request that names a live agent: the token's hash, the counts, never a file's content.
+ */
+async function workspaceImport(
+  body: unknown, tenantId: string, row: ProvisionedAgent, credentialId: string | null, deps: ProvisionDeps, imports: ImportOps,
+): Promise<Response> {
+  const audit = (outcome: string, extra: Record<string, unknown>) =>
+    logEvent("provision.import", { tenant: tenantId, agent: row.agentId, raftAgentId: row.raftAgentId, credentialId, outcome, ...extra });
+  const req = importRequest(body, instructionsLimit(deps.seed));
+  if (isFail(req)) {
+    audit("refused", { code: req.code, ...(req.param ? { param: req.param } : {}) });
+    return fail(req);
+  }
+  const { migrationId, instructions, files } = req;
+  const digest = importDigest(migrationId, instructions ?? null, files.map((f) => ({ path: f.path, bytes: f.bytes, sha256: f.sha256 })));
+  let r: Awaited<ReturnType<ImportOps["commit"]>>;
+  try { r = await imports.commit(tenantId, row.agentId, { migrationId, digest, instructions: instructions !== undefined, files }); }
+  catch (e) {
+    audit("failed", { files: files.length, bytes: req.totalBytes });
+    throw e;
+  }
+  if (!r.ok) {
+    audit("refused", { code: r.code, files: files.length, bytes: req.totalBytes });
+    return fail({ status: r.code === "not_found" ? 404 : r.code === "reserved" ? 422 : 409, code: r.code, message: r.message });
+  }
+  if (r.record.instructions === "pending" && instructions !== undefined) {
+    await deps.registry.update(tenantId, row.raftAgentId, { instructions });
+    const adopted = await deps.agent.adopt(tenantId, row.agentId, { name: row.name, instructions, raftOrigin: row.raftOrigin });
+    if (adopted) {
+      audit("instructions_refused", { code: adopted.code, files: r.record.fileCount, bytes: r.record.bytes });
+      return fail(adopted);
+    }
+    await imports.instructionsApplied(tenantId, row.agentId, migrationId);
+  }
+  audit(r.created ? "imported" : "replayed", { migrationId, files: r.record.fileCount, bytes: r.record.bytes });
+  return ok(importView(r.record, row), r.created ? 201 : 200);
+}
+
+/** The same body the first time and on every identical retry: nothing in it changes after the import. */
+function importView(rec: ImportRecord, row: ProvisionedAgent) {
+  return {
+    migrationId: rec.migrationId, providerAgentId: row.agentId, raftAgentId: row.raftAgentId,
+    importedAt: new Date(rec.importedAt).toISOString(), fileCount: rec.fileCount, totalBytes: rec.bytes,
+    instructions: rec.instructions !== "none", files: rec.files,
+  };
+}
 
 /**
  * `…/connections/:provider` (raft-agent-provider.v1, optional): POST a one-time link the browser

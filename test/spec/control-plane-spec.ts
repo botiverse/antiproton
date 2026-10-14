@@ -311,7 +311,7 @@ export function controlPlaneCases(db: D1Database): SpecCase[] {
   add("provider_tokens and provisioned_agents have exactly the columns their queries read", async () => {
     const cols = async (table: string) => ((await db.prepare(`PRAGMA table_info(${table})`).all()).results as any[]).map((r) => String(r.name)).sort().join(",");
     assert((await cols("provider_tokens")) === "created_at,hash,label,last_used_at,raft_origin,revoked_at,scope,tenant_id", `provider_tokens ${await cols("provider_tokens")}`);
-    assert((await cols("provisioned_agents")) === "agent_id,created_at,credential_hash,deleted_at,instructions,model,model_pending,name,push_error,push_registered,raft_agent_id,raft_origin,raft_server_id,status,tenant_id,updated_at",
+    assert((await cols("provisioned_agents")) === "agent_id,await_import,created_at,credential_hash,deleted_at,instructions,model,model_pending,name,push_error,push_registered,raft_agent_id,raft_origin,raft_server_id,status,tenant_id,updated_at",
       `provisioned_agents ${await cols("provisioned_agents")}`);
   });
 
@@ -359,6 +359,10 @@ export function controlPlaneCases(db: D1Database): SpecCase[] {
     await registry.update("t-raft", "01L", { model: null, modelPending: false });
     const settled = await registry.get("t-raft", "01L");
     assert(settled!.model === null && settled!.modelPending === false, `the patch: ${JSON.stringify(settled)}`);
+    // `awaitImport` likewise (0020): absent reads false, and true comes back as written.
+    assert(byRaft!.awaitImport === false, `a create without awaitImport: ${JSON.stringify(byRaft!.awaitImport)}`);
+    await registry.create({ ...base, raftAgentId: "01M", agentId: "raft_01M", awaitImport: true });
+    assert((await registry.get("t-raft", "01M"))!.awaitImport === true, "awaitImport did not round-trip");
     let threw = false;
     try { await registry.create({ ...base, raftAgentId: "01J/x" }); } catch { threw = true; }
     assert(threw, "a second Raft id claimed the same agent id");

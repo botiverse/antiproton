@@ -170,6 +170,8 @@ read of the tenant as a whole:
 | `GET` | `/provision/agents/{agentId}/workspace-files?dirPath=&includeHidden=` |
 | `GET` | `/provision/agents/{agentId}/workspace-files/read?path=` |
 | `GET` | `/provision/usage?from=&to=&bucket=day\|month` — the tenant's spend and daily limit ([below](#the-tenants-spend)) |
+| `POST` | `/provision/agents/{agentId}/import` — the agent's workspace, once ([below](#workspace-import)) |
+| `GET` | `/provision/import-limits` — the bounds an import is held to ([below](#workspace-import)) |
 
 `{agentId}` is the `providerAgentId` the provisioning call returned. As on every provider route,
 `/provision/agents/by-raft-agent/{raftAgentId}/...` reaches the same agent by the Raft agent's id.
@@ -327,6 +329,125 @@ GET /provision/usage?from=2026-10-10&bucket=day
   "agents": [{ "providerAgentId": "raft_01JAGENT", "totalUsd": 3.9 }, { "providerAgentId": "raft_01JOTHER", "totalUsd": 0.41 }]
 }
 ```
+
+### Workspace import
+
+A Raft agent that moves from a local computer to hosting here keeps its identity (the same Raft agent)
+and brings its workspace with it: Raft creates the agent (`POST /provision/agents`, with
+`awaitImport: true`, [below](#waiting-for-the-import-awaitimport)), imports its files, then cuts over.
+The same route gives a newly provisioned agent its first files (a playbook, a memory file). A
+production route: served on every deployment, not behind `EVAL_SEED_ROUTES`. `cf/src/provision/handlers.ts`
+(`workspaceImport`), `src/store/workspace-import.ts`; tests in `test/workspace-import.ts`.
+
+```
+POST /provision/agents/{agentId}/import
+POST /provision/agents/by-raft-agent/{raftAgentId}/import?raftServerId=…
+{ "migrationId": "mig_01JX…", "instructions": "…",
+  "files": [{ "path": "notes/plan.md", "contentBase64": "cGxhbiAuLi4K", "sha256": "…" }],
+  "totalBytes": 9 }
+```
+
+Authentication, tenant and which agents are as for the reads above: another tenant's agent, a deleted
+agent and an unknown id are `404 not_found`.
+
+- **`migrationId`** — required; the idempotency key, 1–128 of `A–Z a–z 0–9 . _ : -`.
+- **`files`** — required, at most **2,000**. Each is exactly `{ path, contentBase64, sha256 }`; any other
+  field (a utf-8 `content` included) is `400 unknown_field` naming it. `contentBase64` is the file's
+  bytes in standard padded base64, at most **2 MiB** (2,097,152 bytes) decoded; `sha256` the hex SHA-256
+  of those bytes, checked (`422 sha256_mismatch`, `param: "files[i].sha256"`).
+- **`totalBytes`** — required: the sum of the files' decoded sizes, at most **10 MiB** (10,485,760 bytes).
+  Over it is `413` before anything is decoded; a value that is not the sum is `422 total_mismatch`.
+- **`instructions`** — optional; the agent's persona, under the same rule as `PATCH`'s (8000
+  characters; [above](#the-raft-provider-binding)). Applied as a `PATCH` applies them, after the files land.
+- The request as sent is at most 16 MiB (`413`, `param: "body"`).
+
+`GET /provision/import-limits` answers `{ "maxTotalBytes": 10485760, "maxFiles": 2000, "maxFileBytes": 2097152 }`
+(`IMPORT_LIMITS`), for Raft's exporter to refuse a workspace over them before sending it.
+
+**Where the files go.** Each file is the agent's state key `path` — what its state tools `get` and `put`,
+and `state/{path}` in the workspace reads above — so it reads back through
+`GET …/workspace-files/read?path=state/{path}` with the same bytes and `sha256` as imported (a value over
+32 KiB as JSON is kept in object storage, as the state plugin keeps one, and reads back the same). An
+imported file is the agent's own: it may change or remove it.
+
+**What the agent is shown.** From its first turn the agent's system prompt carries a block headed "Files
+brought from your previous workspace": `MEMORY.md`'s current text (what its `get` answers now, not the copy
+imported) fenced, up to 4,000 characters with a line saying where the rest is, or a note that it is kept in
+object storage or was removed; then up to 40 of the other imported paths by name, with the count of the rest;
+and the state mount's `get` to open them (`importedFilesParts`, `src/plugins/state.ts`).
+
+**What a file may be.** UTF-8 text with no NUL byte: a state value is text, and a file that is not could not
+read back as the bytes it was (`422 not_text`). Nothing shaped like a credential (`422 credential_in_text`,
+the kind named and none of the text). Paths are normalised, then checked: empty and `.` segments drop out
+(`./notes//a.md` is `notes/a.md`); refused with `422`, `param: "files[i].path"`: a leading `/`, a `..`
+segment, a trailing `/`, a backslash, a control character, anything the state key rule
+(`^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$`) refuses once normalised, and a path two files share
+(`duplicate_path`). Names the runtime owns are `422 reserved`: `kept:…` (the agent's sealed secrets) and the
+working-set documents `memory`, `todo` and `journal`, which the runtime puts in the system prompt as the
+agent's own running notes; and, on a deployment serving the evaluation routes, a path already seeded.
+Over a bound is `413` (`too_many_files` with `param: "files"`, `file_too_large` with
+`param: "files[i].contentBase64"`, `too_large` with `param: "files"` or `"totalBytes"`).
+
+**Once per agent.** The first import that lands is the agent's import for good. The same `migrationId`
+with the same `instructions` and the same files (by path and `sha256`, in any order) answers what the
+first answered, `200` instead of `201`, and writes nothing. Anything else afterwards — another
+`migrationId`, or the same one with any difference — is `409 already_imported`.
+
+**Only before the agent runs.** An agent that has taken a turn (a message in its main conversation, a
+fresh context, or a turn started by any route) is `409 agent_active`, and nothing is written: an import
+never overwrites a live agent's workspace. A push accepted and still queued is not a turn.
+
+**All or nothing.** Every rule above is checked for the whole request before anything is written. Then,
+in the agent's own object: a file too large for its row is put in object storage under a name of this
+attempt alone (`t/{tenant}/{agent}/import/{attempt}/{sha256}.json`), which nothing names yet; then every
+file's row and the import's own record are written in **one SQLite transaction**, which also decides
+whether this is a retry, a second import or an agent that has started. A failure before or inside it
+writes no row (the transaction rolls back), and the attempt's objects are deleted; the retry is a first
+import. A file is its row, so no imported path is readable unless all of them are. (Between upload and
+commit the attempt's objects are listed under `artifacts/import/` like any spilled value, and if their
+deletion itself fails they stay there, logged as `provision.import.orphans`; no row ever names them.)
+`instructions` are the one part outside that transaction, since they live in the registry too: they are
+applied after the files land, and the import records whether they were, so an identical retry of an
+import whose instructions did not apply applies them, and one after they did never applies them over a
+later `PATCH`.
+
+```json
+201
+{ "migrationId": "mig_01JX…", "providerAgentId": "raft_01JAGENT", "raftAgentId": "01JAGENT",
+  "importedAt": "2026-10-13T09:00:00.000Z", "fileCount": 1, "totalBytes": 9, "instructions": true,
+  "files": [{ "path": "notes/plan.md", "bytes": 9, "sha256": "…" }] }
+```
+
+`files` is sorted by path. Errors use the provider envelope, `param` naming the field: `400`
+(`invalid_json`, `unknown_field`), `401`, `404 not_found`, `409` (`already_imported`, `agent_active`),
+`413`, `422` (`invalid`, `reserved`, `duplicate_path`, `sha256_mismatch`, `total_mismatch`, `not_text`,
+`credential_in_text`); a failure underneath is `500`, after which the same request is safe to retry.
+
+**Audit.** One `provision.import` log line per request that names a live agent: the token's hash
+(`credentialId`), the tenant and agent, the outcome (`imported`, `replayed`, `refused` with its `code`,
+`failed`), the file count and bytes, and the `migrationId`. Never a path's content or the token.
+
+#### Waiting for the import (`awaitImport`)
+
+`POST /provision/agents` takes `awaitImport: true` (optional; `false` or absent is today's create) for an
+agent that must not run before its import:
+
+- **Held.** From the create on, pushes to the agent are accepted (`202`) and queued as usual, but no turn
+  starts and no model call is made. A queued push is not given up for its age while held, and gets its
+  full 30 minutes from the hold's end. The queue's own bound still applies: past 30 pushes waiting, a
+  push is `429`, as when posting is failing. A message by any other route (the console) has no queue to
+  wait in and is refused while held, with the time the hold ends (the console's message route: `409`).
+- **Lifted by the import.** The import that lands lifts the hold — in its own transaction, or, when it
+  carries `instructions`, once they are applied, so the first turn runs on the imported persona — and
+  wakes the agent: the queued pushes are posted and the first turn starts. A trace row `import.hold`,
+  `status: "import"`, records it.
+- **The valve.** With no import within **24 hours** of the create (`IMPORT_HOLD_MAX_MS`), the hold lifts
+  on its own the next time input is to be delivered (the alarm comes back at that time while pushes are
+  waiting), with a trace row `import.hold`, `status: "valve"`, `verdict: "failed"`, saying why. The agent
+  then runs without an import, and a later import is `409 agent_active`.
+- **Replay.** `awaitImport` is part of the request a replay is compared with (`false` and absent being one
+  value): the same answers the same, another is `409 idempotency_conflict` naming `awaitImport`. A hold is
+  placed once per agent: a replay after the import (or the valve) never holds it again.
 
 ## Evaluation setup (preview only)
 
@@ -629,7 +750,7 @@ answer with `/admin/transcript`'s for the same agent).
 
 `GET …/trace` answers the agent's trace rows — the spans of its work, one row each when it ended
 (`model.call`, `tool.call`, `approval.wait`, `container.lease`, `inbound`, `mount.seeded`,
-`rebuild.decision`, `rebuild.outcome`, `rebuild.behaviour`, `turn.timing`; `src/trace/outbox.ts`) — with `from <= at < to`, in `seq` order.
+`rebuild.decision`, `rebuild.outcome`, `rebuild.behaviour`, `turn.timing`, `import.hold`; `src/trace/outbox.ts`) — with `from <= at < to`, in `seq` order.
 
 - `from`, `to` — ISO 8601 or milliseconds since the epoch; the window is at most 24 hours. One alone
   puts the other 24 hours away; neither is the 24 hours up to now. `to` before or at `from`, a wider

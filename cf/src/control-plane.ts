@@ -393,6 +393,11 @@ export interface ProvisionedAgent {
    * that died half-way, retried under a lock or after an option was withdrawn), and only then does it store the pick.
    */
   modelPending?: boolean;
+  /**
+   * The create asked the agent to start no turn before its workspace import (0020). What a replay is compared with;
+   * the hold itself is the agent's object's (src/store/workspace-import.ts). Optional: absent reads as false.
+   */
+  awaitImport?: boolean;
   status: ProvisionStatus;
   pushRegistered: boolean;
   pushError: string | null;
@@ -420,6 +425,7 @@ export function d1ProvisionedAgents(db: D1Database, now: () => number = Date.now
     credentialHash: r.credential_hash === null || r.credential_hash === undefined ? null : String(r.credential_hash),
     model: r.model === null || r.model === undefined ? null : String(r.model),
     modelPending: Number(r.model_pending ?? 0) === 1,
+    awaitImport: Number(r.await_import ?? 0) === 1,
     status: String(r.status) as ProvisionStatus,
     pushRegistered: Number(r.push_registered) === 1, pushError: r.push_error === null ? null : String(r.push_error),
     createdAt: Number(r.created_at), updatedAt: Number(r.updated_at),
@@ -434,9 +440,9 @@ export function d1ProvisionedAgents(db: D1Database, now: () => number = Date.now
     async create(r) {
       const t = now();
       await db.prepare(
-        "INSERT INTO provisioned_agents(tenant_id, raft_agent_id, agent_id, raft_server_id, raft_origin, name, instructions, credential_hash, model, model_pending, status, push_registered, push_error, created_at, updated_at) " +
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-      ).bind(r.tenantId, r.raftAgentId, r.agentId, r.raftServerId, r.raftOrigin, r.name, r.instructions, r.credentialHash, r.model ?? null, r.modelPending ? 1 : 0, r.status,
+        "INSERT INTO provisioned_agents(tenant_id, raft_agent_id, agent_id, raft_server_id, raft_origin, name, instructions, credential_hash, model, model_pending, await_import, status, push_registered, push_error, created_at, updated_at) " +
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      ).bind(r.tenantId, r.raftAgentId, r.agentId, r.raftServerId, r.raftOrigin, r.name, r.instructions, r.credentialHash, r.model ?? null, r.modelPending ? 1 : 0, r.awaitImport ? 1 : 0, r.status,
         r.pushRegistered ? 1 : 0, r.pushError, t, t).run();
     },
     async get(tenantId, raftAgentId) {
