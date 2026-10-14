@@ -9,10 +9,7 @@ state=$(mktemp -d)
 trap 'stop_worker; rm -rf "$state"' EXIT
 start_worker "$state/dev.log"
 answered=""
-for _ in $(seq 1 60); do
-  sleep 1
-  if curl -sf -m 300 "http://127.0.0.1:$PORT/" -o "$state/result.json"; then answered=1; break; fi
-done
+if await_answer / "$state/result.json" 300; then answered=1; fi
 stop_worker
 if [ -z "$answered" ]; then
   echo "the conformance worker did not answer on :$PORT"

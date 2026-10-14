@@ -22,6 +22,12 @@
 #      it is a claim whose subject the reader has to supply from memory.
 #   5. The result leaves through the EXIT CODE. A gate that prints FAILS=2 and
 #      exits 0 is, to anything that calls it, a gate that passed.
+#   6. A suite that never ENDS is refused too. An exit code is only read once
+#      there is one, so a hung suite used to fail open: nothing turned red, the
+#      gate just never finished (#766). Each suite runs under a limit
+#      (`suite_limit`), and one that reaches it is killed with everything it
+#      started and reported as TIMEOUT — counted on a line of its own and in
+#      FAILS as well, so "FAILS=0" still means everything passed.
 #
 # ONE DIFFERENCE from the deploy gate, and it is deliberate: that one compares
 # against the commit PRODUCTION IS RUNNING, because what it must not drop is a
@@ -57,9 +63,19 @@ removed=$(suite_removals "$in_base" test/removed-suites.txt "the base $base ($ba
 rm -f "$in_base"
 if [ -n "$removed" ]; then echo "$removed"; fails=$((fails+1)); fi
 
+# (6) The limit and the kill are cf/scripts/suite-verdict.sh's, question 3.
+timeouts=0
 run_suite() {
-  local name="$1"; shift; suite_name "$name"; local out n
-  if ! out=$("$@" 2>&1); then echo FAIL; printf '%s\n' "$out" | tail -15; fails=$((fails+1)); return; fi
+  local name="$1"; shift; suite_name "$name"; local out n limit status=0 file
+  limit=$(suite_limit "$name"); file=$(mktemp)
+  suite_run_bounded "$limit" "$file" "$@" || status=$?
+  out=$(cat "$file"); rm -f "$file"
+  if [ -n "$SUITE_TIMED_OUT" ]; then
+    echo "TIMEOUT (still running after ${limit}s; killed)"; printf '%s\n' "$out" | tail -15
+    timeouts=$((timeouts+1)); fails=$((fails+1)); return
+  fi
+  if [ -n "$SUITE_LEFTOVER" ]; then echo "FAIL (left processes running that could not be killed)"; fails=$((fails+1)); return; fi
+  if [ "$status" -ne 0 ]; then echo FAIL; printf '%s\n' "$out" | tail -15; fails=$((fails+1)); return; fi
   n=$(printf '%s\n' "$out" | suite_passed_count)
   if [ -z "$n" ] || [ "$n" -eq 0 ]; then echo "FAIL (asserted nothing)"; fails=$((fails+1)); return; fi
   echo "ok ($n)"
@@ -85,10 +101,15 @@ run_suite control-plane-d1 bash test/control-plane-d1.sh
 
 # `|| true`: see (2). Under `set -e` a failing assignment would stop the script
 # before the line is printed, and the line is what a reader needs.
-tc=$(npm run typecheck 2>&1 | tail -1) || true
+# Under the same limit as a suite, and for the same reason.
+limit=$(suite_limit typecheck); file=$(mktemp)
+suite_run_bounded "$limit" "$file" npm run typecheck || true
+tc=$(tail -1 "$file") || true; rm -f "$file"
+if [ -n "$SUITE_TIMED_OUT" ]; then tc="TIMEOUT (still running after ${limit}s; killed)"; timeouts=$((timeouts+1)); fi
 echo "typecheck: $tc"
 case "$tc" in *", 0 new"*) ;; *) echo "typecheck: NOT CLEAN"; fails=$((fails+1));; esac
 
 gate_provenance
+echo "TIMEOUTS=$timeouts"
 echo "FAILS=$fails"
 [ "$fails" -eq 0 ]

@@ -19,10 +19,7 @@ if ! CI=1 npx wrangler d1 migrations apply CONTROL_DB --local --persist-to "$sta
 fi
 start_worker "$state/dev.log" --persist-to "$state/d1"
 answered=""
-for _ in $(seq 1 60); do
-  sleep 1
-  if curl -sf -m 120 "http://127.0.0.1:$PORT/control-plane" -o "$state/result.json"; then answered=1; break; fi
-done
+if await_answer /control-plane "$state/result.json" 120; then answered=1; fi
 if [ -z "$answered" ]; then
   echo "the conformance worker did not answer on :$PORT"
   tail -20 "$state/dev.log"

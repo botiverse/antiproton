@@ -29,5 +29,19 @@ stop_worker() {
   if [ -n "${WORKER_PID:-}" ]; then kill_tree "$WORKER_PID"; WORKER_PID=""; fi
 }
 
+# await_answer PATH OUT RUN_LIMIT: GET PATH from the worker into OUT, retrying while it starts, within one
+# overall deadline. It used to be 60 tries of `curl -m RUN_LIMIT`, which bounds each try and not the
+# total: a worker that accepted every connection and never answered held a suite for 60 x 300 s, five
+# hours (#766). The deadline keeps the old envelope instead — a minute to start, then RUN_LIMIT for the
+# run — so a slow but healthy worker passes exactly as it did, and a hung one fails in minutes.
+# Returns non-zero if no answer arrived in time.
+await_answer() {
+  local path="$1" out="$2" left deadline=$((SECONDS + 60 + $3))
+  while sleep 1; left=$((deadline - SECONDS)); [ "$left" -gt 0 ]; do
+    if curl -sf -m "$left" "http://127.0.0.1:$PORT$path" -o "$out"; then return 0; fi
+  done
+  return 1
+}
+
 PORT="${PORT:-$(free_port)}"
 WORKER_PID=""
