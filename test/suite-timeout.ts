@@ -367,9 +367,11 @@ check("await_answer: one deadline for start and run, and an HTTP error is an ans
         { encoding: "utf8", timeout: 20_000, env: { ...process.env, PORT: port } });
       return { out: r.stdout, seconds: (Date.now() - t) / 1000 };
     };
-    // Deadline 1 + 2 = 3 s. Per-try timeouts summed without a deadline would be far longer.
-    const hang = ask("/hang", 2, 1);
-    if (!/^rc=1$/m.test(hang.out) || hang.seconds > 8) throw new Error(`a hung worker: ${JSON.stringify(hang.out)} after ${hang.seconds}s`);
+    // The deadline is START + RUN_LIMIT, 4 + 4 = 8 s: bounded on both sides, so
+    // it is the sum (not 60 x RUN_LIMIT, not START x RUN_LIMIT = 16 s, not one
+    // try's RUN_LIMIT alone) that a hung worker gets.
+    const hang = ask("/hang", 4, 4);
+    if (!/^rc=1$/m.test(hang.out) || hang.seconds < 6.5 || hang.seconds > 12) throw new Error(`a hung worker: ${JSON.stringify(hang.out)} after ${hang.seconds}s, not about 8`);
     // A 500 stops at once although the deadline is 21 s away.
     const fail = ask("/fail", 20, 1);
     if (!/^rc=1$/m.test(fail.out) || !fail.out.includes("HTTP 500") || !fail.out.includes("the spec threw") || fail.seconds > 6) {
