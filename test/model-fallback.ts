@@ -35,6 +35,7 @@ import { activityEvents } from "../src/runtime/activity.ts";
 import { statusEvents } from "../src/runtime/status.ts";
 import { inFirstTurn } from "../src/runtime/prewarm.ts";
 import { errorMessage } from "../src/model/pi-bridge.ts";
+import { noticeMessageKey } from "../src/plugins/raft.ts";
 
 const STAND_IN = "export class DurableObject { constructor(ctx, env) { this.ctx = ctx; this.env = env; } }" +
   " export class WorkerEntrypoint { constructor(ctx, env) { this.ctx = ctx; this.env = env; } }" +
@@ -264,7 +265,9 @@ const pushy: Plugin = {
   async invoke() { noopRuns += 1; return {} as never; },
   async receive(event, secret) {
     if (event.headers["x-signed-with"] !== secret) return { deliver: false, reason: "bad signature", rejected: true };
-    const body = JSON.parse(new TextDecoder().decode(event.body)) as { id: string; text: string };
+    const body = JSON.parse(new TextDecoder().decode(event.body)) as { id: string; text: string; notice?: { noticeId: string; text: string; targets: unknown } };
+    // A Raft inbox notice in its own shape (raft-agent-inbox-notice.v1), keyed as the raft plugin keys it.
+    if (body.notice) return { deliver: true, text: body.notice.text, dedupeKey: body.notice.noticeId, ...(noticeMessageKey(body.notice.targets) ? { messageKey: noticeMessageKey(body.notice.targets)! } : {}) };
     return { deliver: true, text: body.text, dedupeKey: body.id };
   },
 };
@@ -376,6 +379,21 @@ async function push(w: World, id: string, text: string) {
   }), w.env as never);
   return res.status;
 }
+/** A Raft inbox notice as Raft sends it, original or the sweep's remind: a notice id, and the unread messages it is about. */
+const raftNotice = (noticeId: string, latestMsgId = "m2") => ({
+  schema: "raft-agent-inbox-notice.v1", noticeId, recipientAgentId: "agent-1", occurredAt: "2026-10-15T06:43:48.900Z",
+  text: "Inbox update: 1 unread message total; 1 changed target\n@tygg  pending: 1 message · latest sender @tygg",
+  targets: [{ target: "@tygg", channelId: "dm-1", channelType: "dm", pendingCount: 1, firstPendingMsgId: "m1", latestMsgId, latestSenderName: "tygg", latestSenderType: "human", flags: [] }],
+});
+async function pushNotice(w: World, notice: ReturnType<typeof raftNotice>) {
+  const res = await worker.fetch(new Request(`https://x/hooks/${w.hook.hookId}`, {
+    method: "POST", headers: { "x-signed-with": w.hook.secret, "content-type": "application/json" }, body: JSON.stringify({ id: notice.noticeId, text: "", notice }),
+  }), w.env as never);
+  return res.status;
+}
+/** The outcome the agent recorded for each push, in order. */
+const inboundOutcomes = (w: World) => (w.raw.sql.exec("SELECT outcome, reason FROM inbound_events ORDER BY received_at, rowid").toArray() as any[]).map((r) => r.outcome);
+
 /** Alarm passes until `n` model jobs exist (0: until nothing is due soon). */
 async function settle(w: World, n = 0) {
   const deadline = realNow() + 15_000;
@@ -742,6 +760,73 @@ await check("a re-dispatch the engine refuses is given up, and Raft is told mode
     must(show(fatal(w)) === show(["model_busy: primary and fallback model both unavailable; retrying in 2 min",
       "model_unavailable: primary and fallback model unavailable on 1 attempt; giving up"]), `activity: ${show(fatal(w))}`);
   } finally { PiAgent.prototype.retryTurn = real; }
+});
+
+// ---- the same messages pushed again (Raft's remind) ------------------------------------------------------------------
+
+await check("Raft's remind about the same unread message, between the +2 and +5 min retries: no new turn, the count goes on, +5 min busy is model_unavailable", async () => {
+  const w = await world({ post: { firstTurn: { reasoning: "off" } }, fallback: ON });
+  must(await pushNotice(w, raftNotice("ntc_first")) === 202, "first notice");
+  await settle(w, 1);
+  await consume(w, 0, "503", "503");
+  await settle(w);
+  await reachRetry(w);
+  await consume(w, 1, "503", "503");
+  await settle(w);
+  must(busyRow(w).attempts === 2 && busyRow(w).state === "scheduled", `before the remind: ${show(busyRow(w))}`);
+  // The sweep's remind, 5.5 minutes after the first: a new notice id, the same unread message.
+  must(await pushNotice(w, raftNotice("ntc_remind")) === 202, "remind");
+  await settle(w);
+  must(jobCount(w) === 2, `the remind started a turn: ${jobCount(w)} jobs`);
+  must(busyRow(w).attempts === 2 && busyRow(w).state === "scheduled", `the remind reset the series: ${show(busyRow(w))}`);
+  must(show(inboundOutcomes(w)) === show(["delivered", "duplicate"]), `outcomes: ${show(inboundOutcomes(w))}`);
+  await reachRetry(w);
+  must(jobCount(w) === 3, `no +5 min retry: ${jobCount(w)}`);
+  await consume(w, 2, "503", "503");
+  await settle(w);
+  must(show(fatal(w)) === show([busyRetrying(120_000), busyRetrying(300_000), busyGivenUp(3)]), `activity: ${show(fatal(w))}`);
+  // Given up, a remind about the same message is still known: nothing starts again.
+  must(await pushNotice(w, raftNotice("ntc_remind_2")) === 202, "remind after giving up");
+  await settle(w);
+  must(jobCount(w) === 3 && inboundOutcomes(w).at(-1) === "duplicate", `after giving up: ${jobCount(w)} jobs, ${show(inboundOutcomes(w))}`);
+});
+
+await check("a remind with the very same notice id is the duplicate it always was; a new message is a new series", async () => {
+  const w = await world({ post: { firstTurn: { reasoning: "off" } }, fallback: ON });
+  must(await pushNotice(w, raftNotice("ntc_a")) === 202, "first");
+  await settle(w, 1);
+  await consume(w, 0, "503", "503");
+  await settle(w);
+  must(await pushNotice(w, raftNotice("ntc_a")) === 202, "same id again");
+  // A new message in the same conversation: its latest id moves, so it is not the series' messages.
+  must(await pushNotice(w, raftNotice("ntc_b", "m3")) === 202, "a new message");
+  await settle(w, 2);
+  must(show(inboundOutcomes(w)) === show(["delivered", "duplicate", "delivered"]), `outcomes: ${show(inboundOutcomes(w))}`);
+  must(jobCount(w) === 2 && busyRow(w).state === "superseded", `the new message did not carry the turn: ${show({ jobs: jobCount(w), row: busyRow(w) })}`);
+  await consume(w, 1, "503", "503");
+  await settle(w);
+  must(busyRow(w).attempts === 1 && fatal(w).at(-1) === busyRetrying(120_000), `not a new series: ${show(busyRow(w))} ${show(fatal(w))}`);
+});
+
+await check("once the turn is answered, or with the feature off, a remind is delivered as any push is", async () => {
+  const w = await world({ post: { firstTurn: { reasoning: "off" } }, fallback: ON });
+  must(await pushNotice(w, raftNotice("ntc_1")) === 202, "first");
+  await settle(w, 1);
+  await consume(w, 0, "503", "503");
+  await settle(w);
+  await reachRetry(w);
+  await consume(w, 1, "ok", "ok");
+  await settle(w);
+  must(busyRow(w).state === "answered", `not answered: ${show(busyRow(w))}`);
+  must(await pushNotice(w, raftNotice("ntc_2")) === 202, "remind after the answer");
+  await settle(w, 3);
+  must(inboundOutcomes(w).at(-1) === "delivered" && jobCount(w) === 3, `held back after an answer: ${show(inboundOutcomes(w))} ${jobCount(w)}`);
+  for (const fallback of [undefined]) {
+    const off = await world({ post: { firstTurn: { reasoning: "off" } }, fallback });
+    must(await pushNotice(off, raftNotice("ntc_1")) === 202 && await pushNotice(off, raftNotice("ntc_2")) === 202, "pushes");
+    await settle(off, 1);
+    must(show(inboundOutcomes(off)) === show(["delivered", "delivered"]), `feature off: ${show(inboundOutcomes(off))}`);
+  }
 });
 
 await check("/admin/models shows the fallback in force, or why it was refused", async () => {

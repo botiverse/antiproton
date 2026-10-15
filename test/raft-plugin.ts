@@ -1,6 +1,6 @@
 import { createHmac } from "node:crypto";
 import { createRaft, isInterrupted, RAFT_OPERATIONS } from "@botiverse/raft-sdk";
-import { raftPlugin as raftWithoutStorage, EXCLUDED, EVENTS_LIMIT, GENERATED, handOver, INBOX_STORE, KEY_LIFETIME_MS, PAGE_ROWS, PUSH_KEY, PUSH_STORE, originOf, pagingArg, toolOf, offeredTerms, escapeMarks, unescapeMarks, createRaftPlugin, downloadAttachment, ATTACHMENT_MAX_BYTES, toolsBasisOf, WITHHELD_ARGUMENTS, FEATURES_BASIS, wakeInstruction } from "../src/plugins/raft.ts";
+import { raftPlugin as raftWithoutStorage, EXCLUDED, EVENTS_LIMIT, GENERATED, handOver, INBOX_STORE, KEY_LIFETIME_MS, PAGE_ROWS, PUSH_KEY, PUSH_STORE, originOf, pagingArg, toolOf, offeredTerms, escapeMarks, unescapeMarks, createRaftPlugin, downloadAttachment, ATTACHMENT_MAX_BYTES, toolsBasisOf, WITHHELD_ARGUMENTS, FEATURES_BASIS, wakeInstruction, noticeMessageKey } from "../src/plugins/raft.ts";
 import { readFileSync } from "node:fs";
 import { PARK_BYTES } from "../src/plugins/artifacts.ts";
 import { setLogSink } from "../src/core/log.ts";
@@ -2302,6 +2302,24 @@ await check("a bare 200 on push registration is a registration, not a malformed 
   const calls = many(json(200, { agentId: "agent-1", agentName: "raft-bot", serverId: "srv" }), new Response("", { status: 200 }));
   const out = await raftPlugin.invoke("enable_push", {}, m.ctx) as any;
   if (out.enabled !== true || out.registration !== "active" || calls[1]!.init.method !== "PUT") throw new Error(JSON.stringify({ out, calls: calls.map((c) => c.init.method) }));
+});
+
+await check("a notice names the unread messages it is about: the sweep's remind (new notice id, same messages) gives the same messageKey, a new message another", async () => {
+  const m = mount({ enabled: true, agentId: "agent-1", agentName: "raft-bot", lastReached: null });
+  globalThis.fetch = (async () => { throw new Error("receive called the network"); }) as any;
+  const first = await raftPlugin.receive!(pushed(notice(), { deliveryId: "ntc_0123456789abcdef" }), PUSH_SECRET, m.ctx);
+  const remind = await raftPlugin.receive!(pushed(notice({ noticeId: "ntc_remind_000001", occurredAt: "2026-09-28T08:55:31.000Z" }), { deliveryId: "ntc_remind_000001" }), PUSH_SECRET, m.ctx);
+  if (!first.deliver || !remind.deliver || !first.messageKey || first.messageKey !== remind.messageKey || first.dedupeKey === remind.dedupeKey) {
+    throw new Error(JSON.stringify({ first, remind }));
+  }
+  if (first.messageKey !== "raft-inbox:c1:m1..m2") throw new Error(first.messageKey);
+  const t = (o: Record<string, unknown>) => ({ target: "#a", channelId: "c1", firstPendingMsgId: "m1", latestMsgId: "m2", ...o });
+  // Order does not matter; a new latest message, another channel, or a target without a latest id do.
+  if (noticeMessageKey([t({}), t({ channelId: "c2" })]) !== noticeMessageKey([t({ channelId: "c2" }), t({})])) throw new Error("order");
+  if (noticeMessageKey([t({ latestMsgId: "m3" })]) === noticeMessageKey([t({})])) throw new Error("a new message has the old key");
+  if (noticeMessageKey([t({ latestMsgId: undefined })]) !== undefined || noticeMessageKey([]) !== undefined || noticeMessageKey("x") !== undefined) throw new Error("a key without a latest id");
+  // The pending count is not part of it: a remind may count the same messages differently.
+  if (noticeMessageKey([t({ pendingCount: 1 })]) !== noticeMessageKey([t({ pendingCount: 2 })])) throw new Error("pendingCount");
 });
 
 await check("an inbox notice reaches the agent as Raft wrote it, with the one instruction to read, and is deduped on its notice id", async () => {
