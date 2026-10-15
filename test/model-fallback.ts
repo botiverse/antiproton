@@ -27,7 +27,7 @@ import { hashProviderToken, newProviderToken } from "../cf/src/provider-token.ts
 import { consumeModelCalls, type QueuedModelCall } from "../cf/src/model-queue.ts";
 import { callQueuedModel } from "../cf/src/model-request.ts";
 import {
-  BUSY_UNDECIDED, busyGivenUp, busyRetrying, MODEL_BUSY_ERROR, modelFallbackFrom, parseModelFallback,
+  BUSY_UNDECIDED, busyGivenUp, busyRetrying, FALLBACK_TOTAL_MAX_S, MODEL_BUSY_ERROR, modelFallbackFrom, parseModelFallback,
 } from "../src/model/model-fallback.ts";
 import { providersFrom } from "../src/model/providers.ts";
 import { overflowKind } from "../src/runtime/overflow-backstop.ts";
@@ -329,7 +329,8 @@ async function world(opts: { post?: Record<string, unknown>; fallback?: unknown 
     AGENT: { idFromName: (n: string) => n, idFromString: (n: string) => n, get: (n: string) => objects.get(n) ?? another(n) },
   };
   const w = {
-    D: new TestDO(ctx as never, env as never), raw, env, jobs, R2, DB, token: newProviderToken(), alarmAt: () => alarmAt, hook: { hookId: "", secret: "" },
+    D: new TestDO(ctx as never, env as never), raw, env, jobs, R2, DB,
+    rt: () => w.D.runtime(), token: newProviderToken(), alarmAt: () => alarmAt, hook: { hookId: "", secret: "" },
     /** A new instance on the same storage, as after an eviction. */
     evict() { w.D = new TestDO(ctx as never, env as never); objects.set(agentObjectName(T, A), w.D); objects.set("do-1", w.D); },
   };
@@ -581,6 +582,110 @@ await check("a busy call mid tool loop: the retry carries the tool's result and 
   must(await push(w, "e2", "Thanks") === 202, "push 2");
   await settle(w, 4);
   must(!("fallback" in (await w.D.takeJob(T, A, w.jobs[3]!) as any)), "the turn after a recovered first turn is marked");
+});
+
+/** An agent made with firstTurn whose first call came back busy: a re-dispatch is scheduled at +2 min. */
+async function busyAgent(fallback = ON) {
+  const w = await world({ post: { firstTurn: { reasoning: "off" } }, fallback });
+  must(await push(w, "e1", "Hi") === 202, "push");
+  await settle(w, 1);
+  await consume(w, 0, "503", "503");
+  await settle(w);
+  must(busyRow(w)?.state === "scheduled", `not scheduled: ${show(busyRow(w))}`);
+  return w;
+}
+/** Move the clock past the scheduled retry's time (read before anything stopped it) and run the passes. */
+async function pastDue(w: World, dueAt: number) {
+  skew += dueAt - Date.now() + 10;
+  await settle(w);
+  skew += 3_600_000;
+  await settle(w);
+}
+/** Raft's provisioning call, with Raft's side stood in for. */
+async function provisionCall(w: World, method: string, path: string) {
+  const prev = globalThis.fetch;
+  globalThis.fetch = (async (url: unknown, init?: RequestInit) => String(url).startsWith("https://raft.example/")
+    ? Response.json({ ok: true }) : prev(url as never, init)) as typeof fetch;
+  try {
+    const res = await worker.fetch(new Request(`https://x/provision${path}`, { method, headers: { authorization: `Bearer ${w.token}` } }), w.env as never);
+    return { status: res.status, text: await res.text() };
+  } finally { globalThis.fetch = prev; }
+}
+const activity = (w: World) => activityEvents(A, traceRows(w)).filter((e) => e.hookEventName).map((e) => `${e.hookEventName}${e.errorClass ? `:${e.errorClass}` : ""}`);
+
+await check("a cancel stops a scheduled re-dispatch: nothing is re-sent at +2 min, and Raft is told the turn stopped", async () => {
+  const w = await busyAgent();
+  const due = Number(busyRow(w).due_at);
+  await w.rt().cancelSession(T, A);
+  must(busyRow(w).state === "cancelled" && busyRow(w).due_at === null, show(busyRow(w)));
+  await pastDue(w, due);
+  must(jobCount(w) === 1, `the cancelled turn was re-sent: ${jobCount(w)} jobs`);
+  const tail = activity(w).slice(-2);
+  must(show(tail) === show(["BridgeFatal:model_busy: primary and fallback model both unavailable; retrying in 2 min", "Stop"]), `activity: ${show(activity(w))}`);
+});
+
+await check("a deleted agent is never re-dispatched: DELETE drops the schedule, and the object asks the registry too", async () => {
+  const w = await busyAgent();
+  const due = Number(busyRow(w).due_at);
+  const del = await provisionCall(w, "DELETE", `/agents/by-raft-agent/${RAFT_ID}`);
+  must(del.status === 200 && /"deleted"/.test(del.text), `DELETE: ${del.status} ${del.text}`);
+  must(busyRow(w) === undefined, `the schedule outlived the delete: ${show(busyRow(w))}`);
+  await pastDue(w, due);
+  must(jobCount(w) === 1, `a deleted agent was called again: ${jobCount(w)} jobs`);
+  // Belt and braces: the registry says deleted but the drop never reached the object (that RPC failed).
+  const w2 = await busyAgent();
+  const due2 = Number(busyRow(w2).due_at);
+  await w2.DB.prepare("UPDATE provisioned_agents SET status = 'deleted' WHERE agent_id = ?").bind(A).run();
+  await pastDue(w2, due2);
+  must(jobCount(w2) === 1, `re-dispatched for an agent the registry says is deleted: ${jobCount(w2)} jobs`);
+  must(busyRow(w2) === undefined && logged.some((e) => e.event === "model_job.busy_retry" && e.outcome === "deleted"), show(busyRow(w2)));
+});
+
+await check("the largest budget the config accepts ends before pi085 sends the job again; a call longer than that would be sent twice", async () => {
+  const cfg = parseModelFallback({ to: "gpt-5.6-luna", scope: "firstTurn", primaryS: 60, retryAfterS: [120] }, USER_MODELS);
+  must(cfg.primaryMs + cfg.fallbackMs === FALLBACK_TOTAL_MAX_S * 1000, `not the largest: ${cfg.primaryMs + cfg.fallbackMs}`);
+  const w = await world({ post: { firstTurn: { reasoning: "off" } }, fallback: JSON.stringify({ to: "gpt-5.6-luna", scope: "firstTurn", primaryS: 60, retryAfterS: [120] }) });
+  must(await push(w, "e1", "Hi") === 202, "push");
+  await settle(w, 1);
+  must(jobCount(w) === 1, `jobs: ${jobCount(w)}`);
+  const id = w.jobs[0]!;
+  must((await w.D.takeJob(T, A, id) as any)?.fallback?.fallbackMs === 50_000, "not the default fallbackS");
+  // A consumer is calling it, for the whole of both limits: passes run meanwhile, and none sends it again.
+  skew += FALLBACK_TOTAL_MAX_S * 1000;
+  await w.D.alarm();
+  must(jobCount(w) === 1, `the job was sent again inside the fallback's budget: ${show(w.jobs)}`);
+  // The control: past pi085's redelivery the same job is sent again, which is what the bound keeps the call inside.
+  skew += 11_000;
+  await w.D.alarm();
+  must(jobCount(w) === 2 && w.jobs[1] === id, `the control did not redeliver: ${show(w.jobs)}`);
+});
+
+await check("a person's message starts the retry count afresh: a busy answer after it is retried in 2 min, not 5", async () => {
+  const w = await busyAgent();
+  await reachRetry(w);
+  must(jobCount(w) === 2 && busyRow(w).state === "redispatched", show(busyRow(w)));
+  // The person writes while the re-dispatched call is out; it joins the run, and that call comes back busy.
+  must(await push(w, "e2", "Still there?") === 202, "push 2");
+  await w.D.alarm();
+  await consume(w, 1, "503", "503");
+  await settle(w);
+  must(show(fatal(w)) === show(["model_busy: primary and fallback model both unavailable; retrying in 2 min",
+    "model_busy: primary and fallback model both unavailable; retrying in 2 min"]), `activity: ${show(fatal(w))}`);
+  must(busyRow(w).attempts === 1, show(busyRow(w)));
+});
+
+await check("a re-dispatch the engine refuses is given up, and Raft is told model_unavailable rather than left on 'retrying'", async () => {
+  const { PiAgent } = await import("../src/runtime/pi-agent.ts");
+  const real = PiAgent.prototype.retryTurn;
+  PiAgent.prototype.retryTurn = async () => "refused";
+  try {
+    const w = await busyAgent();
+    const due = Number(busyRow(w).due_at);
+    await pastDue(w, due);
+    must(jobCount(w) === 1 && busyRow(w).state === "gave_up", show({ jobs: jobCount(w), row: busyRow(w) }));
+    must(show(fatal(w)) === show(["model_busy: primary and fallback model both unavailable; retrying in 2 min",
+      "model_unavailable: primary and fallback model unavailable on 1 attempt; giving up"]), `activity: ${show(fatal(w))}`);
+  } finally { PiAgent.prototype.retryTurn = real; }
 });
 
 await check("/admin/models shows the fallback in force, or why it was refused", async () => {
