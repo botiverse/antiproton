@@ -939,24 +939,38 @@ await check("conversation cards a history read showed are booked for the next ca
   if (!(heldAgain instanceof Interrupt) || after[0]?.seenCards?.channel !== null) throw new Error(`a parked read booked its card: ${JSON.stringify(after)}`);
 });
 
-await check("a state save that fails is a raft.state_save_failed trace row, with its phase, the error and the record's size, and a console line; the call still answers", async () => {
+await check("a state save that fails is a raft.state_save_failed trace row, with its phase, the error and the record's size in UTF-8 bytes, and a console line; the call still answers", async () => {
   const m = cardsMount({});
   const db = Object.create(m.ctx.db);
-  db.transaction = async () => { throw new Error("storage full"); };
+  // The record the save tried to write, taken from inside the transaction before it fails.
+  const attempted: unknown[] = [];
+  db.transaction = async (_store: string, _mode: string, fn: (tx: any) => void) => {
+    fn({ get: () => undefined, put: (_s: string, value: unknown) => { attempted.push(value); } });
+    throw new Error("storage full");
+  };
   const c = { ...m.ctx, db };
   const warned: string[] = [];
   const warn = console.warn;
   console.warn = (...a: unknown[]) => { warned.push(a.join(" ")); };
   try {
-    one(HELD());
-    const held = await raftPlugin.invoke("messages_send", { target: "#general", content: "done", idempotencyKey: "k-save" }, c);
+    // A channel named in CJK, so the record holds text whose UTF-8 bytes outnumber its UTF-16 code units.
+    globalThis.fetch = (async () => json(200, { ok: true, state: "held", newMessageCount: 1, seenUpToSeq: 20, omittedMessageCount: 0, freshnessContextMode: "inline",
+      heldMessages: [{ seq: 20, id: "abcdef12-0000", content: "等一下", sender_type: "human", sender_name: "tygg", channel_name: "日本語の部屋", channel_type: "channel", timestamp: "2026-09-28T10:00:00Z" }] })) as any;
+    const held = await raftPlugin.invoke("messages_send", { target: "#日本語の部屋", content: "done", idempotencyKey: "k-save" }, c);
     if (!(held instanceof Interrupt)) throw new Error(`the call did not answer: ${JSON.stringify(held)}`);
   } finally { console.warn = warn; }
-  const row = m.rows.find((r) => r.kind === "raft.state_save_failed");
-  if (!row || row.status !== "save" || row.verdict !== "failed" || row.attrs.phase !== "save" || row.attrs.error !== "storage full" ||
-      typeof row.attrs.stateBytes !== "number" || row.attrs.stateBytes <= 0) {
-    throw new Error(`the row: ${JSON.stringify(m.rows)}`);
-  }
+  // One row per failed save, each sized as the record that save tried to write.
+  const failed = m.rows.filter((r) => r.kind === "raft.state_save_failed");
+  if (attempted.length === 0 || failed.length !== attempted.length) throw new Error(`control: ${attempted.length} saves, ${failed.length} rows`);
+  attempted.forEach((record, i) => {
+    const text = JSON.stringify(record);
+    const bytes = new TextEncoder().encode(text).length;
+    if (!text.includes("日本語の部屋") || bytes === text.length) throw new Error(`control: the record's bytes and code units do not differ: ${text}`);
+    const row = failed[i];
+    if (row.status !== "save" || row.verdict !== "failed" || row.attrs.phase !== "save" || row.attrs.error !== "storage full" || row.attrs.stateBytes !== bytes) {
+      throw new Error(`row ${i} (want stateBytes ${bytes}, code units ${text.length}): ${JSON.stringify(m.rows)}`);
+    }
+  });
   if (!warned.some((w) => w.includes("raft state save failed for mount raft: storage full"))) throw new Error(`the console line: ${JSON.stringify(warned)}`);
 });
 
