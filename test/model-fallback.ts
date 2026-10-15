@@ -392,6 +392,8 @@ async function consume(w: World, i: number, primary: Behaviour, fallback: Behavi
   });
   must(show(acks) === show(["ack"]), `job ${i}: ${show(acks)}`);
 }
+/** Read through a call, so an assertion on the count does not narrow it for the next (TS2367). */
+const jobCount = (w: World) => w.jobs.length;
 /** What the queue consumer would be handed for job `i`, read without taking it. */
 const peek = (w: World, i: number) => {
   const r = w.raw.sql.exec("SELECT request FROM pi_model_jobs WHERE id = ?", w.jobs[i]!).toArray()[0] as any;
@@ -429,7 +431,7 @@ await check("only a first-turn call of a firstTurn agent on the operator's DeepS
   await settle(w);
   must(await push(w, "e2", "Thanks") === 202, "push 2");
   await settle(w, 2);
-  must(!("fallback" in peek(w, 1)) && !("fallback" in await w.D.takeJob(T, A, w.jobs[1]!) as any), "the second turn was marked");
+  must(!("fallback" in peek(w, 1)) && !("fallback" in (await w.D.takeJob(T, A, w.jobs[1]!) as any)), "the second turn was marked");
   // The primary answered: the call's row records how long it took, and nothing about a fallback.
   const row = traceRows(w).find((r) => r.kind === "model.call");
   must(row && row.attrs.primaryOutcome === "ok" && typeof row.attrs.primaryMs === "number" && !("fallbackFrom" in row.attrs), show(row));
@@ -472,10 +474,10 @@ await check("a busy first turn: model_busy at +2 min, re-dispatched as the same 
   must(row.status === "error" && row.attrs.fallbackFrom === "deepseek-flash" && row.attrs.primaryOutcome === "http_5xx" && typeof row.attrs.primaryMs === "number"
     && row.attrs.fallbackOutcome === "http_5xx", show(row.attrs));
   must(busyRow(w).state === "scheduled" && busyRow(w).attempts === 1 && Math.abs(Number(busyRow(w).due_at) - Date.now() - 120_000) < 5_000, show(busyRow(w)));
-  must(w.jobs.length === 1, `something ran before the retry was due: ${w.jobs.length}`);
+  must(jobCount(w) === 1, `something ran before the retry was due: ${w.jobs.length}`);
   // +2 min: the same turn again, the busy answer not in it, still the first turn (marked).
   await reachRetry(w);
-  must(w.jobs.length === 2, `no re-dispatch at +2 min: ${w.jobs.length}`);
+  must(jobCount(w) === 2, `no re-dispatch at +2 min: ${w.jobs.length}`);
   const second = peek(w, 1);
   must(show(userTexts(second.context)) === show(userTexts(first.context)) && second.context.messages.length === first.context.messages.length,
     `not the same turn: ${show(userTexts(second.context))} vs ${show(userTexts(first.context))}`);
@@ -484,18 +486,18 @@ await check("a busy first turn: model_busy at +2 min, re-dispatched as the same 
   await settle(w);
   must(show(fatal(w).slice(1)) === show(["model_busy: primary and fallback model both unavailable; retrying in 5 min"]), `activity: ${show(fatal(w))}`);
   await reachRetry(w);
-  must(w.jobs.length === 3, `no re-dispatch at +5 min: ${w.jobs.length}`);
+  must(jobCount(w) === 3, `no re-dispatch at +5 min: ${w.jobs.length}`);
   await consume(w, 2, "503", "400");
   await settle(w);
   must(show(fatal(w).slice(2)) === show(["model_unavailable: primary and fallback model unavailable on 3 attempts; giving up"]), `activity: ${show(fatal(w))}`);
   must(busyRow(w).state === "gave_up" && busyRow(w).due_at === null, show(busyRow(w)));
   skew += 3_600_000;
   await settle(w);
-  must(w.jobs.length === 3, `a call after giving up: ${w.jobs.length}`);
+  must(jobCount(w) === 3, `a call after giving up: ${w.jobs.length}`);
   // Given up is not the end of the first turn either: the person's next message is still it, and marked.
   must(await push(w, "e2", "Hello?") === 202, "push 2");
   await settle(w, 4);
-  must(w.jobs.length === 4 && "fallback" in (await w.D.takeJob(T, A, w.jobs[3]!) as any), "the message after giving up is not the first turn");
+  must(jobCount(w) === 4 && "fallback" in (await w.D.takeJob(T, A, w.jobs[3]!) as any), "the message after giving up is not the first turn");
 });
 
 await check("the retry survives an eviction, and a redelivered or replayed busy answer decides nothing twice", async () => {
@@ -510,11 +512,11 @@ await check("the retry survives an eviction, and a redelivered or replayed busy 
   await settle(w);
   w.evict();
   await reachRetry(w);
-  must(w.jobs.length === 2, `the retry did not survive the eviction: ${w.jobs.length}`);
+  must(jobCount(w) === 2, `the retry did not survive the eviction: ${w.jobs.length}`);
   must(busyRow(w).state === "redispatched", show(busyRow(w)));
   // Another pass, another alarm: nothing more.
   await w.D.alarm();
-  must(w.jobs.length === 2, `a retry ran twice: ${w.jobs.length}`);
+  must(jobCount(w) === 2, `a retry ran twice: ${w.jobs.length}`);
 });
 
 await check("a newer message before the retry is due carries the turn: no duplicate turn at +2 min", async () => {
@@ -525,14 +527,14 @@ await check("a newer message before the retry is due carries the turn: no duplic
   await settle(w);
   must(await push(w, "e2", "Are you there?") === 202, "push 2");
   await settle(w, 2);
-  must(w.jobs.length === 2, `the newer message ran no call: ${w.jobs.length}`);
+  must(jobCount(w) === 2, `the newer message ran no call: ${w.jobs.length}`);
   const job = await w.D.takeJob(T, A, w.jobs[1]!) as any;
   must("fallback" in job && show(userTexts(job.context)).includes("Are you there?") && show(userTexts(job.context)).includes("Hi"), "the newer run is not the first turn carried on");
   await consume(w, 1, "ok", "ok");
   await settle(w);
   skew += 130_000;
   await settle(w);
-  must(w.jobs.length === 2, `the old turn was re-dispatched after the newer one: ${w.jobs.length}`);
+  must(jobCount(w) === 2, `the old turn was re-dispatched after the newer one: ${w.jobs.length}`);
   must(busyRow(w).state === "superseded", show(busyRow(w)));
 });
 
@@ -548,13 +550,13 @@ await check("a busy call mid tool loop: the retry carries the tool's result and 
     content: [{ type: "toolCall", id: "c_1", name: "p__noop", arguments: {} }], stopReason: "toolUse",
   }, 5);
   await settle(w, 2);
-  must(w.jobs.length === 2 && noopRuns > 0, `no second call: ${w.jobs.length}, tool runs ${noopRuns}`);
+  must(jobCount(w) === 2 && noopRuns > 0, `no second call: ${w.jobs.length}, tool runs ${noopRuns}`);
   const runs = noopRuns;
   const busyCtx = peek(w, 1).context;
   await consume(w, 1, "503", "503");
   await settle(w);
   await reachRetry(w);
-  must(w.jobs.length === 3, `no retry: ${w.jobs.length}`);
+  must(jobCount(w) === 3, `no retry: ${w.jobs.length}`);
   const again = peek(w, 2).context;
   must(show(again.messages.map((m: any) => [m.role, m.toolCallId ?? null])) === show(busyCtx.messages.map((m: any) => [m.role, m.toolCallId ?? null])),
     `not the busy call's conversation: ${show(again.messages.map((m: any) => m.role))} vs ${show(busyCtx.messages.map((m: any) => m.role))}`);
