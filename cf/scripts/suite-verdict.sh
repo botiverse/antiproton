@@ -87,3 +87,169 @@ gate_provenance() {
 # long name: every line has at least one space between the two, whatever
 # anybody names a suite next.
 suite_name() { printf "%-22s " "$1"; }
+
+# 3. Did a suite FINISH? Both gates read only an exit status, so a suite that
+#    never exits produced no verdict at all: nothing went red, the gate simply
+#    did not end, and the deploy window passed. test/*-do.sh waited up to 60
+#    times on a `curl -m 300`, so one hung worker could hold a gate for five
+#    hours (#766). Every suite now runs under a limit, and running out of it is
+#    its own verdict, TIMEOUT: not a FAIL, because nothing was asserted false
+#    and the remedy differs (find what hangs, not what broke), but a refusal
+#    all the same.
+#
+#    The limit is a backstop against a hang, not a performance budget, so it
+#    is a generous multiple of the slowest suite's normal time. Measured
+#    2026-10-14, one suite at a time as the gate runs them, on a 12-core host
+#    at load ~7: the slowest suite was control-plane-d1 at 31 s, the other DO
+#    suites 7-17 s, the slowest node suite 20 s, the typecheck 8 s. 600 s is
+#    about twenty times the slowest, and above the 360 s a DO suite allows its
+#    worker to answer (test/local-worker.sh, await_answer), so a hung worker
+#    is reported by the suite's own message and log before the gate's limit.
+#    GATE_SUITE_LIMIT changes it for every suite; GATE_SUITE_LIMIT_<name>
+#    (dashes as underscores) for one, for a suite that legitimately needs
+#    longer.
+
+# suite_limit NAME: the seconds NAME may run before it is a TIMEOUT.
+suite_limit() {
+  local var="GATE_SUITE_LIMIT_$(printf '%s' "$1" | tr -c 'A-Za-z0-9_' '_')"
+  printf '%s\n' "${!var:-${GATE_SUITE_LIMIT:-600}}"
+}
+
+# suite_limits_problem: prints a line for every GATE_SUITE_LIMIT* setting that
+# is not a whole number of seconds above zero, and returns non-zero if there was
+# one. A limit `sleep` cannot read used to end the watchdog at once, which left
+# the suite running with no limit at all — the one failure this exists to
+# prevent, produced by a typo. Both gates ask before running anything, and
+# suite_run_bounded refuses such a limit again, for any caller that did not.
+suite_limits_problem() {
+  local v bad=0
+  for v in $(compgen -v GATE_SUITE_LIMIT); do
+    if ! suite_limit_valid "${!v}"; then
+      echo "refusing: $v=${!v} is not a whole number of seconds above zero, so it would not limit anything."
+      bad=1
+    fi
+  done
+  return "$bad"
+}
+suite_limit_valid() { [[ "$1" =~ ^[1-9][0-9]{0,6}$ ]]; }
+
+# suite_descendants PID: every live descendant of PID, deepest last.
+suite_descendants() {
+  local child
+  for child in $(pgrep -P "$1" 2>/dev/null || true); do echo "$child"; suite_descendants "$child"; done
+}
+
+# suite_stop PGID: ends the process group PGID — TERM, a grace period, then
+# KILL — and returns non-zero if anything in it survived even that.
+#
+# A GROUP, not the suite's pid: by the time anyone asks, the suite's shell may
+# be gone, and what it started (`npx wrangler dev`, then workerd) has been
+# re-parented and can no longer be found by walking children. Left running,
+# that server keeps its port, and a later run can read its answer.
+suite_stop() {
+  local pgid="$1" grace
+  pgrep -g "$pgid" >/dev/null 2>&1 || return 0
+  kill -TERM -- "-$pgid" 2>/dev/null || true
+  grace=$((SECONDS + 5))
+  while [ "$SECONDS" -lt "$grace" ]; do pgrep -g "$pgid" >/dev/null 2>&1 || return 0; sleep 0.1; done
+  kill -KILL -- "-$pgid" 2>/dev/null || true
+  grace=$((SECONDS + 2))
+  while [ "$SECONDS" -lt "$grace" ]; do pgrep -g "$pgid" >/dev/null 2>&1 || return 0; sleep 0.1; done
+  ! pgrep -g "$pgid" >/dev/null 2>&1
+}
+
+# The watchdog: `suite_watchdog LIMIT MARKER PGID`, run as a script of its own
+# (below). It sleeps out the limit, writes MARKER, then ends the suite: its tree
+# by pid, walked while it is still whole, and its group; TERM, up to 5 s, KILL.
+SUITE_WATCHDOG='
+  sleep "$1" || exit 1
+  : >"$2"
+  tree=$(suite_descendants "$3")
+  kill -TERM $tree 2>/dev/null; kill -TERM -- "-$3" 2>/dev/null
+  grace=$((SECONDS + 5))
+  while [ "$SECONDS" -lt "$grace" ]; do
+    left=$(pgrep -g "$3"; for p in $tree; do kill -0 "$p" 2>/dev/null && echo "$p"; done)
+    [ -n "$left" ] || exit 0
+    sleep 0.1
+  done
+  kill -KILL $tree 2>/dev/null; kill -KILL -- "-$3" 2>/dev/null
+  exit 0'
+
+# suite_run_bounded LIMIT OUT COMMAND...: runs COMMAND with stdout and stderr
+# in the file OUT and returns its status. Afterwards:
+#   SUITE_TIMED_OUT=1  it was still running after LIMIT seconds, and was killed;
+#   SUITE_ERROR=<why>  no verdict can be trusted: the limit was not a number,
+#                      the watchdog was lost while the suite ran, or the suite's
+#                      processes could not be ended. A caller refuses on it.
+#
+# COMMAND gets a session, and so a process group, of its own (`setsid`). That
+# needs it NOT to lead a group already, or setsid forks, returns at once, and
+# what is waited for is not the suite: so job control is turned off for the
+# length of this function (`local -`), whatever the caller inherited — under
+# `set -m` every background job leads its own group. Afterwards the group is
+# ended whatever the verdict, so a suite that passed but left its server
+# behind does not leave it to the next run either.
+#
+# What this cannot end: a process that left the session AND was not in the
+# suite's tree when the limit came — a double fork into a new session, or a
+# setsid'd child of a suite that then passed. No suite in test/ detaches.
+#
+# The limit is kept by a watchdog in its own group, so a suite that ends costs
+# no wait. A watchdog that ends without having fired, while the suite still
+# runs, is a lost limit, and the suite is ended and refused rather than left
+# to run unbounded.
+suite_run_bounded() {
+  local -
+  set +m
+  local limit="$1" out="$2"; shift 2
+  local pid watchdog status=0 dir done_pid
+  SUITE_TIMED_OUT="" SUITE_ERROR=""
+  if ! suite_limit_valid "$limit"; then
+    SUITE_ERROR="limit '$limit' is not a whole number of seconds above zero; not run"
+    : >"$out"; return 2
+  fi
+  dir=$(mktemp -d)
+  setsid "$@" >"$out" 2>&1 </dev/null &
+  pid=$!
+  setsid bash -c "$(declare -f suite_descendants)$SUITE_WATCHDOG" watchdog "$limit" "$dir/timed-out" "$pid" \
+    </dev/null >/dev/null 2>&1 &
+  watchdog=$!
+  # Interrupting the gate must not leave the suite running: in a session of its
+  # own it no longer receives the terminal's ^C, nor the hangup.
+  trap 'suite_interrupted 130' INT
+  trap 'suite_interrupted 143' TERM
+  trap 'suite_interrupted 129' HUP
+  wait -n -p done_pid "$pid" "$watchdog" || true
+  if [ "${done_pid:-}" = "$watchdog" ] && [ ! -e "$dir/timed-out" ]; then
+    SUITE_ERROR="its time limit was lost (the watchdog ended without firing); stopped"
+    kill -KILL $(suite_descendants "$pid") 2>/dev/null || true
+    suite_stop "$pid" || true
+  fi
+  wait "$pid" 2>/dev/null || status=$?
+  # A watchdog that has fired is left to finish its KILL round, which covers the
+  # pids it found while the tree was whole; one that has not is cancelled — by
+  # pid as well as by group, since one that has not yet reached setsid has no
+  # group of its own and `wait` would sleep out its whole limit.
+  if [ -e "$dir/timed-out" ]; then SUITE_TIMED_OUT=1; else
+    kill -KILL -- "-$watchdog" 2>/dev/null || true; kill -KILL "$watchdog" 2>/dev/null || true
+  fi
+  # Reaped here, with stderr closed: reaped later, bash reports the KILL by
+  # printing the watchdog's whole script into the gate's output.
+  wait "$watchdog" 2>/dev/null || true
+  trap - INT TERM HUP
+  rm -rf "$dir"
+  if ! suite_stop "$pid" && [ -z "$SUITE_ERROR" ]; then SUITE_ERROR="left processes running that could not be killed"; fi
+  if [ -n "$SUITE_ERROR" ] && [ "$status" -eq 0 ]; then status=1; fi
+  return "$status"
+}
+
+# The INT/TERM/HUP trap of suite_run_bounded, which runs in its scope: ends the
+# watchdog and the suite, and exits with the signal's status.
+suite_interrupted() {
+  kill -KILL -- "-$watchdog" "$watchdog" 2>/dev/null
+  wait "$watchdog" 2>/dev/null
+  kill -KILL $(suite_descendants "$pid") 2>/dev/null
+  suite_stop "$pid"
+  rm -rf "$dir"
+  exit "$1"
+}

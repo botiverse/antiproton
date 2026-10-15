@@ -29,5 +29,27 @@ stop_worker() {
   if [ -n "${WORKER_PID:-}" ]; then kill_tree "$WORKER_PID"; WORKER_PID=""; fi
 }
 
+# await_answer PATH OUT RUN_LIMIT [START]: GET PATH from the worker into OUT, retrying while it starts,
+# within one overall deadline of START (60) + RUN_LIMIT seconds. It used to be 60 tries of
+# `curl -m RUN_LIMIT`, which bounds each try and not the total: a worker that accepted every connection
+# and never answered held a suite for 60 x 300 s, five hours (#766). The deadline keeps the old envelope
+# instead — a minute to start, then RUN_LIMIT for the run — so a slow but healthy worker passes exactly as
+# it did, and a hung one fails in minutes.
+#
+# Only a refused connection is retried. An HTTP error is an answer — the spec threw — and retrying it ran
+# the whole spec again, on the same Durable Object, until the deadline; it is printed and returned.
+# Returns non-zero if no successful answer arrived.
+await_answer() {
+  local path="$1" out="$2" left code deadline=$((SECONDS + ${4:-60} + $3))
+  while sleep 1; left=$((deadline - SECONDS)); [ "$left" -gt 0 ]; do
+    code=$(curl -s -m "$left" -o "$out" -w '%{http_code}' "http://127.0.0.1:$PORT$path") || continue
+    case "$code" in 2??) return 0;; esac
+    echo "the conformance worker answered $path with HTTP $code:"
+    head -c 2000 "$out"; echo
+    return 1
+  done
+  return 1
+}
+
 PORT="${PORT:-$(free_port)}"
 WORKER_PID=""
