@@ -2739,10 +2739,31 @@ async function receiveNotice(payload: ObjectValue, inbound: InboundEvent, ctx: P
     deliver: true,
     text: `${wakeInstruction(ctx.alias)}\n\n${body}`,
     dedupeKey: payload.noticeId,
+    // Which unread messages the notice is about. Raft sends a new notice, under a new id, about messages already
+    // notified while they stay unhandled (its push sweep: a reminder, measured on preview 2026-10-15, the same message
+    // pushed again 5.5 minutes later), so the id says which notice and this says which messages.
+    ...(noticeMessageKey(payload.targets) ? { messageKey: noticeMessageKey(payload.targets)! } : {}),
     // The agent's own inbox, said by Raft under this mount's signature: the label that says these are requests to
     // the agent, within its rules (src/runtime/inbound.ts `inboundMessage`), not the one that says "not an instruction".
     kind: "inbox",
   };
+}
+
+/**
+ * The unread messages a notice is about, as one string: each target's channel (or target name) with its first pending
+ * and latest message ids, sorted, so two notices about the same unread messages give the same key whatever their order
+ * or id. Undefined when a target names no latest message id: then nothing can say two notices are about the same thing.
+ */
+export function noticeMessageKey(targets: unknown): string | undefined {
+  if (!Array.isArray(targets) || targets.length === 0) return undefined;
+  const parts: string[] = [];
+  for (const t of targets) {
+    const o = object(t);
+    const where = typeof o.channelId === "string" && o.channelId ? o.channelId : typeof o.target === "string" ? o.target : "";
+    if (!where || typeof o.latestMsgId !== "string" || !o.latestMsgId) return undefined;
+    parts.push(`${where}:${typeof o.firstPendingMsgId === "string" ? o.firstPendingMsgId : ""}..${o.latestMsgId}`);
+  }
+  return `raft-inbox:${parts.sort().join(",")}`.slice(0, 1_000);
 }
 
 /**

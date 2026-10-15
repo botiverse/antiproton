@@ -22,6 +22,15 @@
  * (`AgentRuntime.postMessage`; not a follow-up, not a post that wrote nothing), or a cancel of it, ends the series
  * (`endBusyRetry`), whether a re-dispatch was still scheduled or had already run. After `retryAfterMs.length`
  * re-dispatches the next busy answer gives up (`gave_up`), and the turn stays failed until the person writes again.
+ *
+ * Which messages a series is about: the `messageKey` of the last push delivered when it started (`noteBusy`), kept
+ * for the series' life. A service may push again about the same messages while they stay unanswered — Raft sends a
+ * new notice, under a new id, while an inbox stays unread — and such a push is not a new message: posted, it would
+ * end the series and start it again at one, so a turn could be retried for as long as the service keeps pushing and
+ * never be given up. So while a series is open (`scheduled`, `redispatched`) or given up (`gave_up`), a push with its
+ * key is answered as a duplicate and posts nothing (`seriesDuplicate`, asked by `AgentRuntime.receiveHook`); a push
+ * about anything else is a new message and starts a new series as before. A series whose run then answered is
+ * `answered` (`seriesAnswered`), and holds nothing back.
  */
 import { busyGivenUp, busyRetrying } from "../model/model-fallback.ts";
 import type { TraceRow } from "../trace/outbox.ts";
@@ -30,9 +39,14 @@ type Sql = { exec(query: string, ...bindings: unknown[]): { toArray(): any[] } }
 
 const TABLE = `CREATE TABLE IF NOT EXISTS model_busy_retry (
   tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL, job_id TEXT NOT NULL, attempts INTEGER NOT NULL, state TEXT NOT NULL,
-  due_at INTEGER, updated_at INTEGER NOT NULL, PRIMARY KEY (tenant_id, agent_id))`;
+  due_at INTEGER, updated_at INTEGER NOT NULL, message_key TEXT, PRIMARY KEY (tenant_id, agent_id))`;
+/** A table made before the column (a series opened before this was deployed) gets it, nullable: such a series holds nothing back. */
+function ensureTable(sql: Sql) {
+  sql.exec(TABLE);
+  try { sql.exec("SELECT message_key FROM model_busy_retry WHERE 0"); } catch { sql.exec("ALTER TABLE model_busy_retry ADD COLUMN message_key TEXT"); }
+}
 
-export type BusyState = "scheduled" | "redispatched" | "superseded" | "cancelled" | "gave_up";
+export type BusyState = "scheduled" | "redispatched" | "superseded" | "cancelled" | "gave_up" | "answered";
 export interface BusyRetryRow { jobId: string; attempts: number; state: BusyState; dueAt: number | null }
 
 export function readBusyRetry(sql: Sql, tenantId: string, agentId: string): BusyRetryRow | null {
@@ -47,17 +61,20 @@ export function readBusyRetry(sql: Sql, tenantId: string, agentId: string): Busy
  * carries for its readers and Raft (`model_busy: …retrying in N` or `model_unavailable: …giving up`). `retryAfterMs`
  * empty (no fallback configured any more, or a call outside the scope) gives up at once.
  */
-export function noteBusy(sql: Sql, tenantId: string, agentId: string, jobId: string, retryAfterMs: readonly number[], now: number):
-  { sentence: string; attempts: number; dueAt: number | null } {
-  sql.exec(TABLE);
+export function noteBusy(sql: Sql, tenantId: string, agentId: string, jobId: string, retryAfterMs: readonly number[], now: number,
+  messageKey: string | null = null): { sentence: string; attempts: number; dueAt: number | null } {
+  ensureTable(sql);
   const prev = readBusyRetry(sql, tenantId, agentId);
-  const attempts = prev?.state === "redispatched" ? prev.attempts + 1 : 1;
+  const continues = prev?.state === "redispatched";
+  const attempts = continues ? prev.attempts + 1 : 1;
   const wait = retryAfterMs[attempts - 1];
   const dueAt = wait === undefined ? null : now + wait;
-  sql.exec(`INSERT INTO model_busy_retry(tenant_id, agent_id, job_id, attempts, state, due_at, updated_at) VALUES (?,?,?,?,?,?,?)
+  // A series keeps the messages it started with; a new one takes those of the last push delivered.
+  const key = continues ? seriesMessageKey(sql, tenantId, agentId) : messageKey;
+  sql.exec(`INSERT INTO model_busy_retry(tenant_id, agent_id, job_id, attempts, state, due_at, updated_at, message_key) VALUES (?,?,?,?,?,?,?,?)
     ON CONFLICT(tenant_id, agent_id) DO UPDATE SET job_id=excluded.job_id, attempts=excluded.attempts, state=excluded.state,
-    due_at=excluded.due_at, updated_at=excluded.updated_at`,
-    tenantId, agentId, jobId, attempts, dueAt === null ? "gave_up" : "scheduled", dueAt, now);
+    due_at=excluded.due_at, updated_at=excluded.updated_at, message_key=excluded.message_key`,
+    tenantId, agentId, jobId, attempts, dueAt === null ? "gave_up" : "scheduled", dueAt, now, key);
   return { sentence: dueAt === null ? busyGivenUp(attempts) : busyRetrying(wait!), attempts, dueAt };
 }
 
@@ -113,4 +130,36 @@ export function busyRetryRow(r: {
     attrs: { attempt: r.attempt, ...(r.sentence ? { busy: r.sentence } : {}), ...(r.reason ? { reason: r.reason } : {}),
       ...(r.lateMs !== undefined ? { lateMs: r.lateMs } : {}) },
   };
+}
+
+/** The messages the agent's series is about (`noteBusy`), or null. */
+export function seriesMessageKey(sql: Sql, tenantId: string, agentId: string): string | null {
+  try {
+    const r = sql.exec("SELECT message_key FROM model_busy_retry WHERE tenant_id=? AND agent_id=?", tenantId, agentId).toArray()[0] as any;
+    return r && r.message_key !== null && r.message_key !== undefined ? String(r.message_key) : null;
+  } catch { return null; }
+}
+
+/**
+ * Whether a push about `messageKey` repeats the messages of the agent's open or given-up series: then it is a
+ * duplicate delivery, and posting it would only end the series and count again from one. Only within `windowMs` of the
+ * series' last change, so a series nobody has touched for a day holds nothing back.
+ */
+export function seriesDuplicate(sql: Sql, tenantId: string, agentId: string, messageKey: string | null | undefined, now: number, windowMs: number): boolean {
+  if (!messageKey) return false;
+  let r: any;
+  try { r = sql.exec("SELECT state, updated_at, message_key FROM model_busy_retry WHERE tenant_id=? AND agent_id=?", tenantId, agentId).toArray()[0]; }
+  catch { return false; }
+  return !!r && r.message_key === messageKey && ["scheduled", "redispatched", "gave_up"].includes(String(r.state))
+    && now - Number(r.updated_at) < windowMs;
+}
+
+/** A model call of the main conversation was answered (not busy): a re-dispatched series is over, and holds nothing back. */
+export function seriesAnswered(sql: Sql, tenantId: string, agentId: string, now: number): boolean {
+  try {
+    const r = readBusyRetry(sql, tenantId, agentId);
+    if (r?.state !== "redispatched") return false;
+    sql.exec("UPDATE model_busy_retry SET state='answered', updated_at=? WHERE tenant_id=? AND agent_id=? AND state='redispatched'", now, tenantId, agentId);
+    return true;
+  } catch { return false; }
 }

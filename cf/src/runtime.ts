@@ -28,7 +28,9 @@ import {
 import { logEvent } from "../../src/core/log.ts";
 import { busyGivenUp, fallbackPrimary, isModelBusy, type JobFallback, type ModelFallback } from "../../src/model/model-fallback.ts";
 import type { AnsweredMessage } from "../../src/model/pi-bridge.ts";
-import { busyRetryRow, busyRetryScheduled, clearBusyRetry, endBusyRetry, noteBusy, readBusyRetry, settleBusyRetry } from "../../src/runtime/busy-retry.ts";
+import {
+  busyRetryRow, busyRetryScheduled, clearBusyRetry, endBusyRetry, noteBusy, readBusyRetry, seriesAnswered, seriesDuplicate, settleBusyRetry,
+} from "../../src/runtime/busy-retry.ts";
 import { appendTrace } from "../../src/trace/outbox.ts";
 import { markHarnessDrop, recordHarnessOpen, type HarnessDropReason } from "../../src/runtime/harness-open.ts";
 import { currentMainId, mainSessions, modelInputCalls, readModelInput, recordModelInput, startFreshMain, type MainSessionRow, type ModelInputEvidence } from "./fresh-context.ts";
@@ -117,6 +119,7 @@ import { agentSecrets, agentRef, importKek, isAgentRef, open, OWNER_PREFIX, seal
 import {
   acceptInbound, claimPendingInbound, ensureInboundTable, hasPendingInbound, hookSecretName, inboundMessage, markPostingInbound, newHookId, newHookSecret,
   nextPendingInbound, pendingInboundCount, recentInbound, recordInbound, requeueInbound, seenBefore, settleInbound, underRate,
+  lastDeliveredMessageKey, INBOUND_DEDUPE_MS,
   expiredPendingInbound, pendingInboundRow, queueFull, queueRetryAfterS, rateRetryAfterS, INBOUND_QUEUE_RETRY_AFTER_S,
   INBOUND_MAX_AGE_MS, INBOUND_MAX_BYTES, INBOUND_PER_MINUTE, INBOUND_POST_ATTEMPTS, INBOUND_QUEUE_MAX, type InboundOutcome, type PendingInbound,
 } from "../../src/runtime/inbound.ts";
@@ -1308,6 +1311,12 @@ export class AgentRuntime {
     const installationId = accepting.installationId;
     const key = result.dedupeKey ?? null;
     if (key && seenBefore(sql, hookId, key, now)) return done("duplicate", null, key);
+    // Another push about the messages a busy first turn is waiting to retry (src/runtime/busy-retry.ts): posted, it
+    // would end that turn's retry series and count it again from one, for as long as the service keeps pushing. The
+    // turn already holds those messages, and its retry answers them.
+    if (seriesDuplicate(sql, tenantId, agentId, result.messageKey, now, INBOUND_DEDUPE_MS)) {
+      return done("duplicate", "the same messages as the first turn waiting for its model retry", key);
+    }
     // Each 429 says when to come back (`Retry-After`): the rate's from the rows it counts, the queue's from its
     // head's next try, so a sender that honours it is not refused, and recorded, every few seconds meanwhile.
     if (!underRate(sql, hookId, now)) {
@@ -1324,7 +1333,8 @@ export class AgentRuntime {
     // is a statement in this object too, so it either came first or finds the seal, even while this push is queued
     // and its turn has not begun (src/store/seed-files.ts).
     sealedBy(tenantId, agentId, sealSeedFiles(sql, tenantId, agentId, "first-inbound", now));
-    acceptInbound(sql, { hookId, alias, dedupeKey: key, message: inboundMessage(alias, String(result.text), result.kind === "inbox" ? "inbox" : "event"), now, installationId });
+    acceptInbound(sql, { hookId, alias, dedupeKey: key, message: inboundMessage(alias, String(result.text), result.kind === "inbox" ? "inbox" : "event"), now, installationId,
+      messageKey: result.messageKey ?? null });
     // The answer the service has always had for a push the agent will be given.
     return { outcome: "delivered" };
   }
@@ -4806,7 +4816,15 @@ export class AgentRuntime {
     await this.ready();
     const session = this.#jobSessionFor(jobId);
     const agent = await this.agent(tenantId, agentId, session);
-    if (!isModelBusy(answer as AnsweredMessage)) return agent.deliver(jobId, answer as any, taker);
+    if (!isModelBusy(answer as AnsweredMessage)) {
+      const wrote = await agent.deliver(jobId, answer as any, taker);
+      // A re-dispatched busy turn that is answered is over (src/runtime/busy-retry.ts `seriesAnswered`): a later push
+      // about the same messages is delivered again as any push is. A tool call is not an answer to the person.
+      if (wrote === true && !this.#isPd() && session === MAIN_SESSION && (answer as AnsweredMessage)?.stopReason !== "toolUse") {
+        seriesAnswered(this.#deps.ctx.storage.sql, tenantId, agentId, Date.now());
+      }
+      return wrote;
+    }
     // A call neither model answered (src/model/model-fallback.ts): what happens next is decided here and written in the
     // same transaction as the answer, whose sentence says it (src/runtime/busy-retry.ts). Outside the scope a call is
     // marked in (pd, another session: never marked), or with the fallback since switched off, there is no schedule,
@@ -4819,7 +4837,7 @@ export class AgentRuntime {
       // Answered already (a replayed delivery): nothing is decided twice.
       const row = sql.exec("SELECT answer FROM pi_model_jobs WHERE id = ?", jobId).toArray()[0] as { answer?: unknown } | undefined;
       if (!row || row.answer) return false;
-      const next = noteBusy(sql, tenantId, agentId, jobId, retry, now);
+      const next = noteBusy(sql, tenantId, agentId, jobId, retry, now, lastDeliveredMessageKey(sql));
       const wrote = agent.deliver(jobId, { ...(answer as AnsweredMessage), providerError: next.sentence }, taker);
       if (typeof wrote !== "boolean") throw new Error("a busy answer reached an engine whose delivery is not synchronous");
       if (wrote) logEvent("model_job.busy", { tenantId, agentId, jobId, attempts: next.attempts, retryAt: next.dueAt ?? undefined, sentence: next.sentence });
