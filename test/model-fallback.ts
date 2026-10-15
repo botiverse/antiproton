@@ -882,6 +882,46 @@ await check("the series' messages are its turn's posts: a turn's messages are cl
   must(inboundOutcomes(w2).at(-1) === "delivered", `a leftover series held a push back with the fallback off: ${show(inboundOutcomes(w2))}`);
 });
 
+await check("a series that is over is not inherited: after an answered episode a new busy series holds only its own turn's messages", async () => {
+  const w = await world({ post: { firstTurn: { reasoning: "off" } }, fallback: ON });
+  must(await pushNotice(w, raftNotice("ntc_a", "a1", [], { channelId: "dm-a", latestMsgId: "a1" })) === 202, "first message");
+  await settle(w, 1);
+  await consume(w, 0, "503", "503");
+  await settle(w);
+  await reachRetry(w);
+  // The re-dispatched call is answered (a refusal: an answer, not busy), so that episode is over.
+  await consume(w, 1, "400", "ok");
+  await settle(w);
+  must(busyRow(w).state === "answered", `not answered: ${show(busyRow(w))}`);
+  // A new message, and a new busy episode: the first turn is not over on pi085 after a failed answer (#896).
+  must(await pushNotice(w, raftNotice("ntc_b", "b1", [], { channelId: "dm-b", latestMsgId: "b1" })) === 202, "second message");
+  await settle(w, 3);
+  must(jobCount(w) === 3 && "fallback" in (await w.D.takeJob(T, A, w.jobs[2]!) as any), `no marked call for the new message: ${jobCount(w)}`);
+  await consume(w, 2, "503", "503");
+  await settle(w);
+  const held = JSON.parse((w.raw.sql.exec("SELECT message_ids FROM model_busy_retry").toArray()[0] as any).message_ids) as string[];
+  const bIds = (await noticeMessageIds(raftNotice("x", "b1", [], { channelId: "dm-b", latestMsgId: "b1" }).targets))!;
+  must(show(held) === show(bIds), `the new series inherited an answered episode's messages: ${held.length} ids`);
+  // A remind of the answered message is new to this series: delivered.
+  must(await pushNotice(w, raftNotice("ntc_a2", "a1", [], { channelId: "dm-a", latestMsgId: "a1" })) === 202, "remind of the answered message");
+  await settle(w, 4);
+  must(inboundOutcomes(w).at(-1) === "delivered", `a remind of an answered message was held back: ${show(inboundOutcomes(w))}`);
+});
+
+await check("with MODEL_FALLBACK off nothing is stored for a turn: no turn-messages row after a push, and none deleted on an answer", async () => {
+  const w = await world({ post: { firstTurn: { reasoning: "off" } } });
+  const rows = () => { try { return w.raw.sql.exec("SELECT message_ids FROM busy_turn_messages").toArray().length; } catch { return -1; } };
+  must(await pushNotice(w, raftNotice("ntc_off")) === 202, "push");
+  await settle(w, 1);
+  must(rows() <= 0, `a turn-messages row was written with the fallback off: ${rows()}`);
+  // A row already there (written while it was on) is left alone by an answer too.
+  w.raw.sql.exec("CREATE TABLE IF NOT EXISTS busy_turn_messages (id INTEGER PRIMARY KEY CHECK (id = 1), message_ids TEXT, at INTEGER NOT NULL)");
+  w.raw.sql.exec("INSERT INTO busy_turn_messages(id, message_ids, at) VALUES (1, '[\"x\"]', 1)");
+  await consume(w, 0, "ok", "ok");
+  await settle(w);
+  must(rows() === 1, `an answer deleted the turn's messages with the fallback off: ${rows()}`);
+});
+
 await check("once the turn is answered, or with the feature off, a remind is delivered as any push is", async () => {
   const w = await world({ post: { firstTurn: { reasoning: "off" } }, fallback: ON });
   must(await pushNotice(w, raftNotice("ntc_1")) === 202, "first");
