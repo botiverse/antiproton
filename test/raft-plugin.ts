@@ -889,6 +889,19 @@ await check("an unseen_card hold raised inside a program books nothing; the mode
   }
 });
 
+await check("with cards on, a send made in no session's turn has no context: never held for a card, and one more history read after it", async () => {
+  // An approved call's replay carries no contextId (`originOf`), so the SDK has no context to hold a card for and
+  // shows the conversation after the receipt instead, which costs a history read. Pinned so the cost is a known one.
+  const m = cardsMount();
+  const noTurn = { ...m.ctx, caller: { tenantId: "tenant", agentId: "agent", taskId: "task" } };
+  const calls = many(SENT(), history([historyMessage(20, "earlier", { channel_name: "general" })], { target: "#general" }));
+  const out = await raftPlugin.invoke("messages_send", { target: "#general", content: "x", idempotencyKey: "k-nocontext" }, noTurn) as any;
+  const routes = calls.map((c) => new URL(c.url).pathname);
+  if (out instanceof Interrupt || "seenCards" in JSON.parse(String(calls[0]!.init.body)) || routes.length !== 2 || !routes[1]!.endsWith("/history")) {
+    throw new Error(`the send: ${JSON.stringify({ out, routes })}`);
+  }
+});
+
 await check("conversationCards is the mount's setting, off unless true: off, a send names no cards and is never held for one; on, it does", async () => {
   const setting = raftPlugin.config?.find((f) => f.name === "conversationCards");
   if (!setting || setting.type !== "boolean" || setting.default !== false) throw new Error(`the setting: ${JSON.stringify(setting)}`);
