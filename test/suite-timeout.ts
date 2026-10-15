@@ -143,25 +143,42 @@ check("the limit: 600 s by default, GATE_SUITE_LIMIT for all, GATE_SUITE_LIMIT_<
  * Each gate's own `run_suite`, cut out of the script and run on a fake suite,
  * so this asks what the gate prints and does rather than what the helper
  * returns. Cut from `run_suite() {` to the first line that is only `}`.
+ *
+ * The harness never runs under `set -e`, though verify-and-deploy.sh does: under
+ * it, a run_suite that merely returned non-zero would stop the harness too, and
+ * a refusal the gate no longer makes would still read as one. Without it, the
+ * only way the lines after the call go missing is the gate's own `exit`. Those
+ * lines are `after run_suite: rc=...`, which reports what it returned, and
+ * `WOULD DEPLOY`, which stands for everything the deploy gate does after its
+ * suites.
  */
 function gateRunSuite(script: string, prelude: string, suite: string, env: Record<string, string> = {}) {
   const lines = readFileSync(script, "utf8").split("\n");
   const start = lines.findIndex((l) => l.startsWith("run_suite() {"));
   const end = lines.findIndex((l, i) => i > start && l === "}");
   if (start < 0 || end < 0) throw new Error(`${script}: no run_suite() { ... } to test`);
+  if (/set -[a-z]*e/.test(prelude)) throw new Error("the harness must not run under set -e: it would supply the refusal itself");
   const fn = lines.slice(start, end + 1).join("\n");
-  return spawnSync("bash", ["-c",
-    `${prelude}\n. cf/scripts/suite-verdict.sh\n${fn}\nrun_suite fake-suite bash "$1"\necho "fails=\${fails:-} timeouts=\${timeouts:-}"`,
+  const r = spawnSync("bash", ["-c",
+    `${prelude}\n. cf/scripts/suite-verdict.sh\n${fn}\nrun_suite fake-suite bash "$1"\nrc=$?\n` +
+    `echo "after run_suite: rc=$rc fails=\${fails:-} timeouts=\${timeouts:-}"\necho "WOULD DEPLOY"`,
     "gate", suite], { encoding: "utf8", timeout: 20_000, env: { ...process.env, ...env } });
+  // An unbound variable or a syntax error also ends a shell with status 1, which would look like a refusal.
+  if (r.stderr.trim()) throw new Error(`the harness itself complained: ${JSON.stringify(r.stderr)}`);
+  return r;
 }
+const BRANCH = "set -u; fails=0; timeouts=0";
+const DEPLOY = "set -uo pipefail";  // verify-and-deploy.sh's own, minus -e (see above)
 
 check("the branch gate prints TIMEOUT, apart from FAIL, and counts it as a refusal", () => {
   const f = fake('echo "the last line before it hung"\nsleep 300');
-  const r = gateRunSuite("cf/scripts/gate.sh", "set -u; fails=0; timeouts=0", f.script, { GATE_SUITE_LIMIT_fake_suite: "1" });
+  const r = gateRunSuite("cf/scripts/gate.sh", BRANCH, f.script, { GATE_SUITE_LIMIT_fake_suite: "1" });
   if (!/^fake-suite +TIMEOUT \(still running after 1s; killed\)$/m.test(r.stdout)) throw new Error(`no TIMEOUT line: ${JSON.stringify(r.stdout)}`);
   if (/\bFAIL\b/.test(r.stdout)) throw new Error(`a timeout was also called FAIL: ${JSON.stringify(r.stdout)}`);
   if (!r.stdout.includes("the last line before it hung")) throw new Error("the suite's own last lines were not shown");
-  if (!/fails=1 timeouts=1/.test(r.stdout)) throw new Error(`not counted as a refusal: ${JSON.stringify(r.stdout)}`);
+  // The branch gate goes on to the next suite and refuses at the end, so the
+  // line after the call must be there, and must carry the count.
+  if (!/^after run_suite: rc=\d+ fails=1 timeouts=1$/m.test(r.stdout)) throw new Error(`not counted as a refusal: ${JSON.stringify(r.stdout)}`);
   noneLeft(f.pids, "the branch gate's timed-out suite");
   // And `fails` is what the exit code is made of.
   if (!/\n\[ "\$fails" -eq 0 \]\n?$/.test(readFileSync("cf/scripts/gate.sh", "utf8"))) {
@@ -170,25 +187,42 @@ check("the branch gate prints TIMEOUT, apart from FAIL, and counts it as a refus
 });
 
 check("the branch gate's pass and fail are what they were", () => {
-  const ok = gateRunSuite("cf/scripts/gate.sh", "set -u; fails=0; timeouts=0", fake('echo "  4 passed, 0 failed"').script);
-  if (!/^fake-suite +ok \(4\)$/m.test(ok.stdout) || !/fails=0 timeouts=0/.test(ok.stdout)) throw new Error(`a pass read as ${JSON.stringify(ok.stdout)}`);
-  const bad = gateRunSuite("cf/scripts/gate.sh", "set -u; fails=0; timeouts=0", fake('echo "  1 passed, 1 failed"\nexit 1').script);
-  if (!/^fake-suite +FAIL$/m.test(bad.stdout) || !/fails=1 timeouts=0/.test(bad.stdout)) throw new Error(`a fail read as ${JSON.stringify(bad.stdout)}`);
-  const empty = gateRunSuite("cf/scripts/gate.sh", "set -u; fails=0; timeouts=0", fake('echo "  0 passed, 0 failed"').script);
-  if (!/FAIL \(asserted nothing\)/.test(empty.stdout)) throw new Error(`an empty suite read as ${JSON.stringify(empty.stdout)}`);
+  const ok = gateRunSuite("cf/scripts/gate.sh", BRANCH, fake('echo "  4 passed, 0 failed"').script);
+  if (!/^fake-suite +ok \(4\)$/m.test(ok.stdout) || !/^after run_suite: rc=\d+ fails=0 timeouts=0$/m.test(ok.stdout)) throw new Error(`a pass read as ${JSON.stringify(ok.stdout)}`);
+  const bad = gateRunSuite("cf/scripts/gate.sh", BRANCH, fake('echo "  1 passed, 1 failed"\nexit 1').script);
+  if (!/^fake-suite +FAIL$/m.test(bad.stdout) || !/^after run_suite: rc=\d+ fails=1 timeouts=0$/m.test(bad.stdout)) throw new Error(`a fail read as ${JSON.stringify(bad.stdout)}`);
+  const empty = gateRunSuite("cf/scripts/gate.sh", BRANCH, fake('echo "  0 passed, 0 failed"').script);
+  if (!/FAIL \(asserted nothing\)/.test(empty.stdout) || !/fails=1 timeouts=0$/m.test(empty.stdout)) throw new Error(`an empty suite read as ${JSON.stringify(empty.stdout)}`);
 });
 
-check("the deploy gate refuses a TIMEOUT: it says so and exits non-zero", () => {
+/** The deploy gate refused: it exited 1 from inside run_suite, so nothing after the call ran. */
+function refused(r: ReturnType<typeof gateRunSuite>, what: string) {
+  if (r.status !== 1) throw new Error(`${what}: the deploy gate's status was ${r.status}, not its own exit 1: ${JSON.stringify(r.stdout)}`);
+  if (r.stdout.includes("after run_suite")) throw new Error(`${what}: run_suite returned instead of exiting: ${JSON.stringify(r.stdout)}`);
+  if (r.stdout.includes("WOULD DEPLOY")) throw new Error(`${what}: the deploy step was reached`);
+}
+
+check("the deploy gate refuses a TIMEOUT: it says so, as TIMEOUT alone, and exits before deploying", () => {
   const f = fake("sleep 300");
-  const r = gateRunSuite("cf/scripts/verify-and-deploy.sh", "set -euo pipefail", f.script, { GATE_SUITE_LIMIT_fake_suite: "1" });
-  if (r.status === 0) throw new Error(`the deploy gate went on after a TIMEOUT: ${JSON.stringify(r.stdout)}`);
+  const r = gateRunSuite("cf/scripts/verify-and-deploy.sh", DEPLOY, f.script, { GATE_SUITE_LIMIT_fake_suite: "1" });
   if (!/^fake-suite +TIMEOUT \(still running after 1s; killed\)$/m.test(r.stdout)) throw new Error(`no TIMEOUT line: ${JSON.stringify(r.stdout)}`);
-  if (r.stdout.includes("fails=")) throw new Error("the deploy gate continued past the refusal");
+  // A TIMEOUT that does not exit falls through to the FAIL of a non-zero
+  // status, which refuses too, but under the wrong name.
+  if (/\bFAIL\b/.test(r.stdout)) throw new Error(`the TIMEOUT did not refuse by itself; FAIL did: ${JSON.stringify(r.stdout)}`);
+  refused(r, "a TIMEOUT");
   noneLeft(f.pids, "the deploy gate's timed-out suite");
-  const ok = gateRunSuite("cf/scripts/verify-and-deploy.sh", "set -euo pipefail", fake('echo "  2 passed, 0 failed"').script);
+});
+
+check("the deploy gate's pass and fail are what they were", () => {
+  const ok = gateRunSuite("cf/scripts/verify-and-deploy.sh", DEPLOY, fake('echo "  2 passed, 0 failed"').script);
   if (ok.status !== 0 || !/^fake-suite +ok \(2\)$/m.test(ok.stdout)) throw new Error(`a pass read as ${JSON.stringify(ok.stdout)}`);
-  const bad = gateRunSuite("cf/scripts/verify-and-deploy.sh", "set -euo pipefail", fake("exit 1").script);
-  if (bad.status === 0 || !/^fake-suite +FAIL$/m.test(bad.stdout)) throw new Error(`a fail read as ${JSON.stringify(bad.stdout)}`);
+  if (!/^after run_suite: rc=0 /m.test(ok.stdout) || !ok.stdout.includes("WOULD DEPLOY")) throw new Error(`a pass did not go on to deploy: ${JSON.stringify(ok.stdout)}`);
+  const bad = gateRunSuite("cf/scripts/verify-and-deploy.sh", DEPLOY, fake("exit 1").script);
+  if (!/^fake-suite +FAIL$/m.test(bad.stdout)) throw new Error(`a fail read as ${JSON.stringify(bad.stdout)}`);
+  refused(bad, "a FAIL");
+  const empty = gateRunSuite("cf/scripts/verify-and-deploy.sh", DEPLOY, fake('echo "  0 passed, 0 failed"').script);
+  if (!/FAIL \(asserted nothing/.test(empty.stdout)) throw new Error(`an empty suite read as ${JSON.stringify(empty.stdout)}`);
+  refused(empty, "an empty suite");
 });
 
 // Whatever a failing case left, by the pids the fake suites wrote down, so a
