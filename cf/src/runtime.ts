@@ -4050,17 +4050,17 @@ export class AgentRuntime {
       timingSafe("recording", () => (res?.ok === false ? turnNotSaid(timing, session, opened) : turnSaid(timing, session, Date.now())));
     }
     if (res?.ok === false) await giveAllBack();
-    // A prompt or a steer the engine took starts or joins a run, which carries a busy first turn on itself: no
-    // scheduled re-dispatch of it is made, and a busy answer to that run counts from one again
-    // (src/runtime/busy-retry.ts). Only then: a post that wrote nothing, a follow-up (on an idle lane it starts no run)
-    // and a `pendingOnly` post with nothing pending leave the schedule as it was, or the turn would wait for nothing.
-    if (backstop && res?.ok !== false && mode !== "followUp") this.#endBusyRetry(tenantId, agentId, "superseded");
     // The notices' exact text, so a rebuild's briefing can quote this message without them (src/runtime/overflow-backstop.ts
     // `buildBriefing`). A reading for later: a failure is logged and never fails the message.
     else if (backstop && lines.length) {
       try { recordNoticeHead(this.#deps.ctx.storage.sql, lines.join("\n"), Date.now()); }
       catch (e) { console.error(`recording the notices of ${tenantId}/${agentId}'s message failed:`, e); }
     }
+    // A prompt or a steer the engine took starts or joins a run, which carries a busy first turn on itself: no
+    // scheduled re-dispatch of it is made, and a busy answer to that run counts from one again
+    // (src/runtime/busy-retry.ts). Only then: a post that wrote nothing, a follow-up (on an idle lane it starts no run)
+    // and a `pendingOnly` post with nothing pending leave the schedule as it was, or the turn would wait for nothing.
+    if (backstop && res?.ok !== false && mode !== "followUp") this.#endBusyRetry(tenantId, agentId, "superseded");
     return { ...messageLanded(res, mode), result: res };
   }
 
