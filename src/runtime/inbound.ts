@@ -194,10 +194,9 @@ export const INBOUND_QUEUE_MAX = 30;
  */
 const ADDED_COLUMNS = [
   { table: "inbound_pending", column: "installation_id", sql: "ALTER TABLE inbound_pending ADD COLUMN installation_id TEXT" },
-  // What a push is about (`InboundResult.messageKey`), carried from the queue to its final record, where a busy first
-  // turn's retry series reads which messages started it (src/runtime/busy-retry.ts `seriesMessageKey`).
-  { table: "inbound_pending", column: "message_key", sql: "ALTER TABLE inbound_pending ADD COLUMN message_key TEXT" },
-  { table: "inbound_events", column: "message_key", sql: "ALTER TABLE inbound_events ADD COLUMN message_key TEXT" },
+  // The messages a push is about (`InboundResult.messageIds`, a JSON array), carried to the post, which tells a busy
+  // first turn's retry series which messages its turn holds (`AgentRuntime.postMessage`, src/runtime/busy-retry.ts).
+  { table: "inbound_pending", column: "message_ids", sql: "ALTER TABLE inbound_pending ADD COLUMN message_ids TEXT" },
 ];
 
 /** Storage handles already brought up to `ADDED_COLUMNS`: this runs on every push, the probe once per handle. */
@@ -250,8 +249,8 @@ export interface PendingInbound {
    * existed, which is posted as it would have been.
    */
   installationId: string | null;
-  /** What the push is about (`InboundResult.messageKey`); null when its plugin said nothing, or on an older row. */
-  messageKey?: string | null;
+  /** The messages the push is about (`InboundResult.messageIds`); null when its plugin said nothing, or on an older row. */
+  messageIds?: string[] | null;
 }
 
 /**
@@ -261,10 +260,11 @@ export interface PendingInbound {
  */
 export function acceptInbound(sql: SqlHost["sql"], row: {
   hookId: string; alias: string; dedupeKey: string | null; message: string; now: number; installationId?: string | null;
-  messageKey?: string | null;
+  messageIds?: readonly string[] | null;
 }) {
-  sql.exec("INSERT INTO inbound_pending(hook_id, alias, dedupe_key, message, received_at, installation_id, message_key) VALUES (?, ?, ?, ?, ?, ?, ?)",
-    row.hookId, row.alias, row.dedupeKey ?? `${LOCAL_KEY}${crypto.randomUUID()}`, row.message, row.now, row.installationId ?? null, row.messageKey ?? null);
+  sql.exec("INSERT INTO inbound_pending(hook_id, alias, dedupe_key, message, received_at, installation_id, message_ids) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    row.hookId, row.alias, row.dedupeKey ?? `${LOCAL_KEY}${crypto.randomUUID()}`, row.message, row.now, row.installationId ?? null,
+    row.messageIds?.length ? JSON.stringify(row.messageIds) : null);
 }
 
 /** The prefix of a key made here for a push its plugin named none for; such a key is never a duplicate of anything. */
@@ -273,7 +273,7 @@ export const LOCAL_KEY = "local:";
 /** The oldest push not yet settled; arrival order is delivery order. */
 export function nextPendingInbound(sql: SqlHost["sql"]): PendingInbound | null {
   return readPending(sql.exec(
-    "SELECT seq, hook_id, alias, dedupe_key, message, received_at, state, attempts, next_at, last_error, installation_id, message_key FROM inbound_pending ORDER BY seq LIMIT 1",
+    "SELECT seq, hook_id, alias, dedupe_key, message, received_at, state, attempts, next_at, last_error, installation_id, message_ids FROM inbound_pending ORDER BY seq LIMIT 1",
   ).toArray()[0]);
 }
 
@@ -283,7 +283,7 @@ function readPending(r: any): PendingInbound | null {
     message: String(r.message), receivedAt: Number(r.received_at), state: r.state === "posting" ? "posting" : "queued",
     attempts: Number(r.attempts), nextAt: Number(r.next_at), lastError: r.last_error === null ? null : String(r.last_error),
     installationId: r.installation_id === null || r.installation_id === undefined ? null : String(r.installation_id),
-    messageKey: r.message_key === null || r.message_key === undefined ? null : String(r.message_key),
+    messageIds: idsOf(r.message_ids),
   } : null;
 }
 
@@ -307,7 +307,7 @@ export function expiredPendingInbound(sql: SqlHost["sql"], now: number): number[
 /** One queued row by its seq, or null when it is gone. */
 export function pendingInboundRow(sql: SqlHost["sql"], seq: number): PendingInbound | null {
   return readPending(sql.exec(
-    "SELECT seq, hook_id, alias, dedupe_key, message, received_at, state, attempts, next_at, last_error, installation_id, message_key FROM inbound_pending WHERE seq = ?", seq,
+    "SELECT seq, hook_id, alias, dedupe_key, message, received_at, state, attempts, next_at, last_error, installation_id, message_ids FROM inbound_pending WHERE seq = ?", seq,
   ).toArray()[0]);
 }
 
@@ -346,7 +346,7 @@ export function settleInbound(sql: SqlHost["sql"], transact: <T>(fn: () => T) =>
     sql.exec("DELETE FROM inbound_pending WHERE seq = ?", row.seq);
     recordInbound(sql, {
       tenantId: row.tenantId, agentId: row.agentId, hookId: row.hookId, alias: row.alias,
-      outcome: row.outcome, reason: row.reason ?? null, dedupeKey: row.dedupeKey, now: row.receivedAt, messageKey: row.messageKey,
+      outcome: row.outcome, reason: row.reason ?? null, dedupeKey: row.dedupeKey, now: row.receivedAt,
     });
   });
 }
@@ -430,13 +430,12 @@ export function inboundVerdict(outcome: InboundOutcome): TraceVerdict {
 export function recordInbound(sql: SqlHost["sql"], row: {
   tenantId: string; agentId: string;
   hookId: string; alias: string; outcome: InboundOutcome; reason?: string | null; dedupeKey?: string | null; now: number;
-  messageKey?: string | null;
 }) {
   sql.exec("DELETE FROM inbound_events WHERE received_at < ?", row.now - INBOUND_KEEP_MS);
   const reason = (row.reason ?? "").slice(0, 500) || null;
   sql.exec(
-    "INSERT INTO inbound_events(hook_id, received_at, alias, outcome, reason, dedupe_key, message_key) VALUES (?, ?, ?, ?, ?, ?, ?)",
-    row.hookId, row.now, row.alias, row.outcome, reason, row.dedupeKey ?? null, row.messageKey ?? null,
+    "INSERT INTO inbound_events(hook_id, received_at, alias, outcome, reason, dedupe_key) VALUES (?, ?, ?, ?, ?, ?)",
+    row.hookId, row.now, row.alias, row.outcome, reason, row.dedupeKey ?? null,
   );
   appendTrace(sql, [{
     at: row.now, tenantId: row.tenantId, agentId: row.agentId,
@@ -480,13 +479,9 @@ function base64url(bytes: Uint8Array): string {
 }
 
 
-/**
- * What the last push delivered to the agent was about (`InboundResult.messageKey`), and when it arrived: the
- * messages a turn started then is answering. Null when nothing has been delivered or its plugin named nothing.
- */
-export function lastDeliveredMessageKey(sql: SqlHost["sql"]): string | null {
-  try {
-    const r = sql.exec("SELECT message_key FROM inbound_events WHERE outcome = 'delivered' ORDER BY received_at DESC, rowid DESC LIMIT 1").toArray()[0] as any;
-    return r && r.message_key !== null && r.message_key !== undefined ? String(r.message_key) : null;
-  } catch { return null; }
+/** A stored JSON array of message ids, or null for anything else. */
+function idsOf(v: unknown): string[] | null {
+  if (typeof v !== "string") return null;
+  try { const a = JSON.parse(v); return Array.isArray(a) && a.every((x) => typeof x === "string") && a.length ? a : null; }
+  catch { return null; }
 }

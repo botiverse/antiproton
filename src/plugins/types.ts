@@ -1551,12 +1551,13 @@ export type InboundResult =
   | {
     deliver: true; text: string; dedupeKey?: string; kind?: "event" | "inbox";
     /**
-     * What the push is about, when a service sends more than one push about the same thing (Raft notifies again while
-     * an inbox stays unread, each notice under its own `dedupeKey`): two pushes with one `messageKey` say the same
-     * thing. Read only where a turn is waiting on those messages already (a busy first turn's retry,
-     * src/runtime/busy-retry.ts), where the later push is a duplicate; anywhere else it is delivered as before.
+     * The messages the push is about, one opaque id each, when a service sends more than one push about the same
+     * messages (Raft notifies again while an inbox stays unread, each notice under its own `dedupeKey`). A push whose
+     * every id was already delivered brings nothing new. Read only where a turn is waiting on those messages already
+     * (a busy first turn's retry, src/runtime/busy-retry.ts), where such a push is a duplicate; anywhere else it is
+     * delivered as before.
      */
-    messageKey?: string;
+    messageIds?: string[];
   };
 
 /** `return backgrounded({ boxId, execId }, "…")` — see {@link Backgrounded}. */
