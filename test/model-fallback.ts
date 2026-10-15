@@ -35,7 +35,7 @@ import { activityEvents } from "../src/runtime/activity.ts";
 import { statusEvents } from "../src/runtime/status.ts";
 import { inFirstTurn } from "../src/runtime/prewarm.ts";
 import { errorMessage } from "../src/model/pi-bridge.ts";
-import { noticeMessageKey } from "../src/plugins/raft.ts";
+import { noticeMessageIds } from "../src/plugins/raft.ts";
 
 const STAND_IN = "export class DurableObject { constructor(ctx, env) { this.ctx = ctx; this.env = env; } }" +
   " export class WorkerEntrypoint { constructor(ctx, env) { this.ctx = ctx; this.env = env; } }" +
@@ -267,7 +267,10 @@ const pushy: Plugin = {
     if (event.headers["x-signed-with"] !== secret) return { deliver: false, reason: "bad signature", rejected: true };
     const body = JSON.parse(new TextDecoder().decode(event.body)) as { id: string; text: string; notice?: { noticeId: string; text: string; targets: unknown } };
     // A Raft inbox notice in its own shape (raft-agent-inbox-notice.v1), keyed as the raft plugin keys it.
-    if (body.notice) return { deliver: true, text: body.notice.text, dedupeKey: body.notice.noticeId, ...(noticeMessageKey(body.notice.targets) ? { messageKey: noticeMessageKey(body.notice.targets)! } : {}) };
+    if (body.notice) {
+      const ids = await noticeMessageIds(body.notice.targets);
+      return { deliver: true, text: body.notice.text, dedupeKey: body.notice.noticeId, ...(ids ? { messageIds: ids } : {}) };
+    }
     return { deliver: true, text: body.text, dedupeKey: body.id };
   },
 };
@@ -380,10 +383,12 @@ async function push(w: World, id: string, text: string) {
   return res.status;
 }
 /** A Raft inbox notice as Raft sends it, original or the sweep's remind: a notice id, and the unread messages it is about. */
-const raftNotice = (noticeId: string, latestMsgId = "m2") => ({
+type Target = { channelId: string; latestMsgId: string; firstPendingMsgId?: string; target?: string; pendingCount?: number };
+const raftNotice = (noticeId: string, latestMsgId = "m2", more: Target[] = [], first?: Target) => ({
   schema: "raft-agent-inbox-notice.v1", noticeId, recipientAgentId: "agent-1", occurredAt: "2026-10-15T06:43:48.900Z",
   text: "Inbox update: 1 unread message total; 1 changed target\n@tygg  pending: 1 message · latest sender @tygg",
-  targets: [{ target: "@tygg", channelId: "dm-1", channelType: "dm", pendingCount: 1, firstPendingMsgId: "m1", latestMsgId, latestSenderName: "tygg", latestSenderType: "human", flags: [] }],
+  targets: [first ?? { target: "@tygg", channelId: "dm-1", channelType: "dm", pendingCount: 1, firstPendingMsgId: "m1", latestMsgId, latestSenderName: "tygg", latestSenderType: "human", flags: [] },
+    ...more.map((t) => ({ target: t.target ?? `#${t.channelId}`, channelType: "channel", pendingCount: t.pendingCount ?? 1, firstPendingMsgId: t.firstPendingMsgId ?? t.latestMsgId, ...t }))],
 });
 async function pushNotice(w: World, notice: ReturnType<typeof raftNotice>) {
   const res = await worker.fetch(new Request(`https://x/hooks/${w.hook.hookId}`, {
@@ -806,6 +811,71 @@ await check("a remind with the very same notice id is the duplicate it always wa
   await consume(w, 1, "503", "503");
   await settle(w);
   must(busyRow(w).attempts === 1 && fatal(w).at(-1) === busyRetrying(120_000), `not a new series: ${show(busyRow(w))} ${show(fatal(w))}`);
+});
+
+await check("a remind that carries the whole unread inbox, where each push carried one conversation, brings nothing new: duplicate; a newer message anywhere is not", async () => {
+  const w = await world({ post: { firstTurn: { reasoning: "off" } }, fallback: ON });
+  // The first push names one conversation; the person then writes in another, which is a new message, a new series.
+  must(await pushNotice(w, raftNotice("ntc_d", "x1", [], { channelId: "dm-2", latestMsgId: "x1", firstPendingMsgId: "x1" })) === 202, "first");
+  await settle(w, 1);
+  await consume(w, 0, "503", "503");
+  await settle(w);
+  must(await pushNotice(w, raftNotice("ntc_c", "m2", [], { channelId: "dm-1", latestMsgId: "m2", firstPendingMsgId: "m2" })) === 202, "second conversation");
+  await settle(w, 2);
+  await consume(w, 1, "503", "503");
+  await settle(w);
+  must(busyRow(w).state === "scheduled" && jobCount(w) === 2, show(busyRow(w)));
+  // The sweep's remind: the whole unread inbox, both conversations, counted from their first pending message.
+  must(await pushNotice(w, raftNotice("ntc_r", "m2", [{ channelId: "dm-2", latestMsgId: "x1", firstPendingMsgId: "x0", pendingCount: 2 }],
+    { channelId: "dm-1", latestMsgId: "m2", firstPendingMsgId: "m1" })) === 202, "remind");
+  await settle(w);
+  must(inboundOutcomes(w).at(-1) === "duplicate" && jobCount(w) === 2, `the whole-inbox remind was new: ${show(inboundOutcomes(w))} ${jobCount(w)}`);
+  // The same inbox with one newer message in either conversation is new.
+  must(await pushNotice(w, raftNotice("ntc_n", "m2", [{ channelId: "dm-2", latestMsgId: "x2" }], { channelId: "dm-1", latestMsgId: "m2" })) === 202, "newer");
+  await settle(w, 3);
+  must(inboundOutcomes(w).at(-1) === "delivered" && jobCount(w) === 3, `a newer message was held back: ${show(inboundOutcomes(w))}`);
+});
+
+await check("many conversations: two notices that differ only in their last conversation's latest message are different messages", async () => {
+  // Long channel ids, a dozen of them: a key cut to a fixed length would make these two equal.
+  const many = Array.from({ length: 12 }, (_, i) => ({ channelId: `channel-${String(i).padStart(2, "0")}-${"x".repeat(100)}`, latestMsgId: `msg-${i}` }));
+  const w = await world({ post: { firstTurn: { reasoning: "off" } }, fallback: ON });
+  must(await pushNotice(w, raftNotice("ntc_m1", "m2", many)) === 202, "first");
+  await settle(w, 1);
+  await consume(w, 0, "503", "503");
+  await settle(w);
+  const changed = many.map((t, i) => i === 11 ? { ...t, latestMsgId: "msg-11b" } : t);
+  must(await pushNotice(w, raftNotice("ntc_m2", "m2", changed)) === 202, "second");
+  await settle(w, 2);
+  must(inboundOutcomes(w).at(-1) === "delivered" && jobCount(w) === 2, `a new message was dropped as a duplicate: ${show(inboundOutcomes(w))}`);
+});
+
+await check("the series' messages are its turn's posts: a turn's messages are cleared once it is answered, and a series left after the fallback is switched off holds nothing back", async () => {
+  const w = await world({ post: { firstTurn: { reasoning: "off" } }, fallback: ON });
+  must(await pushNotice(w, raftNotice("ntc_x")) === 202, "first");
+  await settle(w, 1);
+  const turn = () => { try { return (w.raw.sql.exec("SELECT message_ids FROM busy_turn_messages").toArray()[0] as any)?.message_ids ?? null; } catch { return null; } };
+  must(turn() !== null, "the push's messages were not recorded with its turn");
+  await consume(w, 0, "503", "503");
+  await settle(w);
+  const held = (w.raw.sql.exec("SELECT message_ids FROM model_busy_retry").toArray()[0] as any)?.message_ids;
+  must(held === turn(), `the series does not hold its turn's messages: ${held} vs ${turn()}`);
+  await reachRetry(w);
+  await consume(w, 1, "ok", "ok");
+  await settle(w);
+  must(turn() === null, `an answered turn's messages are kept: ${turn()}`);
+  // Switched off with a series still scheduled: the row is left, and holds nothing back.
+  const w2 = await world({ post: { firstTurn: { reasoning: "off" } }, fallback: ON });
+  must(await pushNotice(w2, raftNotice("ntc_y")) === 202, "first");
+  await settle(w2, 1);
+  await consume(w2, 0, "503", "503");
+  await settle(w2);
+  must(busyRow(w2).state === "scheduled", show(busyRow(w2)));
+  delete w2.env.MODEL_FALLBACK;
+  w2.evict();
+  must(await pushNotice(w2, raftNotice("ntc_y2")) === 202, "remind with the fallback off");
+  await settle(w2, 2);
+  must(inboundOutcomes(w2).at(-1) === "delivered", `a leftover series held a push back with the fallback off: ${show(inboundOutcomes(w2))}`);
 });
 
 await check("once the turn is answered, or with the feature off, a remind is delivered as any push is", async () => {
