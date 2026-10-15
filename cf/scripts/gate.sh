@@ -48,6 +48,9 @@ fails=0
 # in a long run, and the tail is what gets copied.
 gate_provenance
 
+# (6) A limit that is not a number would limit nothing: refused before anything runs.
+if ! problem=$(suite_limits_problem); then echo "$problem"; exit 1; fi
+
 # (2) The removal guard. A base that cannot be resolved is refused rather than
 # skipped: a guard that quietly does not run is the thing this whole script is
 # about. `origin/master` is a local ref — no network, and no production read.
@@ -74,7 +77,7 @@ run_suite() {
     echo "TIMEOUT (still running after ${limit}s; killed)"; printf '%s\n' "$out" | tail -15
     timeouts=$((timeouts+1)); fails=$((fails+1)); return
   fi
-  if [ -n "$SUITE_LEFTOVER" ]; then echo "FAIL (left processes running that could not be killed)"; fails=$((fails+1)); return; fi
+  if [ -n "$SUITE_ERROR" ]; then echo "FAIL ($SUITE_ERROR)"; printf '%s\n' "$out" | tail -15; fails=$((fails+1)); return; fi
   if [ "$status" -ne 0 ]; then echo FAIL; printf '%s\n' "$out" | tail -15; fails=$((fails+1)); return; fi
   n=$(printf '%s\n' "$out" | suite_passed_count)
   if [ -z "$n" ] || [ "$n" -eq 0 ]; then echo "FAIL (asserted nothing)"; fails=$((fails+1)); return; fi
@@ -105,7 +108,8 @@ run_suite control-plane-d1 bash test/control-plane-d1.sh
 limit=$(suite_limit typecheck); file=$(mktemp)
 suite_run_bounded "$limit" "$file" npm run typecheck || true
 tc=$(tail -1 "$file") || true; rm -f "$file"
-if [ -n "$SUITE_TIMED_OUT" ]; then tc="TIMEOUT (still running after ${limit}s; killed)"; timeouts=$((timeouts+1)); fi
+if [ -n "$SUITE_TIMED_OUT" ]; then tc="TIMEOUT (still running after ${limit}s; killed)"; timeouts=$((timeouts+1));
+elif [ -n "$SUITE_ERROR" ]; then tc="FAIL ($SUITE_ERROR)"; fi
 echo "typecheck: $tc"
 case "$tc" in *", 0 new"*) ;; *) echo "typecheck: NOT CLEAN"; fails=$((fails+1));; esac
 

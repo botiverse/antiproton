@@ -28,6 +28,8 @@ if [ -n "$refusal" ]; then echo "$refusal"; exit 1; fi
 # here, unless test/removed-suites.txt names it, so a deleted one is refused
 # instead of skipped (Piper, Rex, 2026-09-13; cf/scripts/suite-verdict.sh).
 . cf/scripts/suite-verdict.sh
+# A suite time limit that is not a number would limit nothing (question 3 there).
+if ! problem=$(suite_limits_problem); then echo "$problem"; exit 1; fi
 # Which commit production runs is asked of production — so, left alone, a
 # production that is down could not be redeployed, including by the fix for
 # it (Rex). ANTIPROTON_LIVE_BUILD=<sha> states it instead: one explicit line,
@@ -68,7 +70,7 @@ run_suite() {  # name, command...
   suite_run_bounded "$limit" "$file" "$@" || status=$?
   out=$(cat "$file"); rm -f "$file"
   if [ -n "$SUITE_TIMED_OUT" ]; then echo "TIMEOUT (still running after ${limit}s; killed)"; printf '%s\n' "$out" | tail -40; exit 1; fi
-  if [ -n "$SUITE_LEFTOVER" ]; then echo "FAIL (left processes running that could not be killed)"; exit 1; fi
+  if [ -n "$SUITE_ERROR" ]; then echo "FAIL ($SUITE_ERROR)"; printf '%s\n' "$out" | tail -40; exit 1; fi
   if [ "$status" -ne 0 ]; then echo FAIL; printf '%s\n' "$out" | tail -40; exit 1; fi
   n=$(printf '%s\n' "$out" | suite_passed_count)
   if [ -z "$n" ] || [ "$n" -eq 0 ]; then echo "FAIL (asserted nothing: ${n:-no pass count})"; exit 1; fi
@@ -113,6 +115,7 @@ limit=$(suite_limit typecheck); file=$(mktemp)
 suite_run_bounded "$limit" "$file" npm run typecheck || true
 tc=$(tail -1 "$file") || true; rm -f "$file"
 if [ -n "$SUITE_TIMED_OUT" ]; then echo "typecheck: TIMEOUT (still running after ${limit}s; killed)"; exit 1; fi
+if [ -n "$SUITE_ERROR" ]; then echo "typecheck: FAIL ($SUITE_ERROR)"; exit 1; fi
 echo "$tc"
 case "$tc" in *", 0 new"*) ;; *) echo "typecheck: new errors"; exit 1;; esac
 # Which tree is about to become production, in the log that records the deploy.
