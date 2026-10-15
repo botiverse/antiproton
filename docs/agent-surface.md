@@ -798,7 +798,8 @@ a real turn's request, and measured its request identical to the base commit's, 
 be answered. With none offered, the harness's existing no-resume path applies: the question is
 dropped, nothing is done, and the model is shown the question with a note to call the tool again if
 it still applies (`toolQuestion`, `src/runtime/pi-tools.ts`). `raft`'s only question is a held send or
-task write when newer messages arrived; the model's own call records those messages as seen before
+task write when newer messages arrived, or, on a mount with conversation cards on, when the context has
+not seen the conversation's card; the model's own call records what the question showed as seen before
 asking, so calling again goes ahead (`heldCall`, `src/plugins/raft.ts`; `test/raft-plugin.ts`, "the
 same send again … goes through"). Any other mount whose plugin asks questions is refused under
 `minimal` with `400`, rather than given that changed flow; a default mount that comes to ask questions
@@ -1032,7 +1033,9 @@ answer with `/admin/transcript`'s for the same agent).
 
 `GET …/trace` answers the agent's trace rows — the spans of its work, one row each when it ended
 (`model.call`, `tool.call`, `approval.wait`, `container.lease`, `inbound`, `mount.seeded`,
-`rebuild.decision`, `rebuild.outcome`, `rebuild.behaviour`, `turn.timing`, `import.hold`, `model.prewarm`, `agent.ready`; `src/trace/outbox.ts`) — with `from <= at < to`, in `seq` order.
+`rebuild.decision`, `rebuild.outcome`, `rebuild.behaviour`, `turn.timing`, `import.hold`, `model.prewarm`, `agent.ready`,
+and the rows a plugin writes of its own, `raft.held`, `raft.held_answer` and `raft.state_save_failed`
+([docs/plugins.md](plugins.md)); `src/trace/outbox.ts`) — with `from <= at < to`, in `seq` order.
 
 - `from`, `to` — ISO 8601 or milliseconds since the epoch; the window is at most 24 hours. One alone
   puts the other 24 hours away; neither is the 24 hours up to now. `to` before or at `from`, a wider

@@ -26,7 +26,7 @@ import { modelToolName } from "../runtime/pi-tools.ts";
 import { toAgentRef } from "../store/refs.ts";
 import {
   interrupt, originProblem,
-  type ActivityEvent, type InboundEvent, type InboundResult, type Interrupt, type ListedTools, type Plugin, type PluginContext,
+  type ActivityEvent, type InboundEvent, type InboundResult, Interrupt, type ListedTools, type Plugin, type PluginContext,
   type PluginErrorFields, type ToolSchema,
 } from "./types.ts";
 
@@ -437,14 +437,18 @@ function isRaftState(value: unknown): value is RaftState {
   return v.schema === RAFT_STATE_SCHEMA && typeof v.version === "number" && typeof v.frontier === "object" && v.frontier !== null;
 }
 
-/** The mount's database as the SDK's state store: a read, and a compare-and-set write in one transaction. */
-function stateStore(ctx: PluginContext): RaftStateStore {
+/**
+ * The mount's database as the SDK's state store: a read, and a compare-and-set write in one transaction. `last` is
+ * told the size of the record each save is about to write, so a save that then fails can say how large it was.
+ */
+function stateStore(ctx: PluginContext, last: { stateBytes?: number } = {}): RaftStateStore {
   return {
     async load() {
       const v = await ctx.db.get(INBOX_STORE, STATE_KEY);
       return isRaftState(v) ? v : null;
     },
     async save(state, { expectedVersion }) {
+      try { last.stateBytes = JSON.stringify(state).length; } catch { delete last.stateBytes; }
       await ctx.db.transaction(INBOX_STORE, "readwrite", (tx) => {
         const cur = tx.get(INBOX_STORE, STATE_KEY);
         const stored = isRaftState(cur) ? cur.version : undefined;
@@ -468,10 +472,21 @@ function stateStore(ctx: PluginContext): RaftStateStore {
  * `offeredTerms` puts in words the few that name a tool this mount does not offer. `response` sees each answer
  * before the SDK reads it (the attachment download's size cap). `timeoutMs` replaces the mount's timeout for a request
  * that has a shorter bound of its own (`FEATURES_TIMEOUT_MS`).
+ *
+ * Conversation cards (`conversationCards`, SDK 0.18.0) are the mount's `conversationCards` setting, off unless it is
+ * true (`cardsOn`). No call here sets the frontier's own context (`frontier.setContext`): each one names its context
+ * itself — `invoke`'s `contextId`, which the SDK turns into a view bound to it (`frontier.inContext`), and
+ * `inContext(contextId)` wherever this plugin books by hand. The SDK reads the card rules (a hold for an unseen card,
+ * a card shown once per context, the conversation read after a send with no context) from the view it is handed,
+ * so every call made in a session's turn has its context, and two sessions' calls never share one. A call with no
+ * `contextId` (an approved call's replay) has none: it is never held for a card, and a send makes one extra history
+ * read for the conversation it shows after the receipt.
  */
 function raftFor(ctx: PluginContext, options: { state?: false; response?: (res: Response) => Response; timeoutMs?: number } = {}): Raft {
+  const last: { stateBytes?: number } = {};
   return createRaft({
     serverUrl: baseUrl(ctx).origin, credential: requireCredential(ctx), hints: "tool",
+    ...(cardsOn(ctx) ? { conversationCards: true } : {}),
     // Redirects stay manual, as on every other request here, so a 3xx never carries the credential elsewhere.
     fetch: async (input, init) => {
       const started = Date.now();
@@ -487,10 +502,27 @@ function raftFor(ctx: PluginContext, options: { state?: false; response?: (res: 
       logEvent("raft.call", { ...line, status: res.status, ms: Date.now() - started });
       return options.response ? options.response(res) : res;
     },
-    ...(options.state === false ? {} : { state: stateStore(ctx) }),
+    ...(options.state === false ? {} : { state: stateStore(ctx, last) }),
     // A save that failed or lost a race costs at most one repeated batch or one extra hold; it never fails
-    // the call, and the SDK does not retry it. Said in the Worker's log, where an operator would look.
-    onStateSaveError: (error, { phase }) => console.warn(`raft state ${phase} failed for mount ${ctx.alias}: ${String((error as Error)?.message ?? error)}`),
+    // the call, and the SDK does not retry it. Kept as a trace row, which is stored with the agent's spans and read
+    // through its trace (`raft.state_save_failed`), since the object's console lines may be dropped; and said on
+    // the console too, where an operator watching the log would look.
+    onStateSaveError: (error, { phase }) => stateSaveFailed(ctx, phase, error, phase === "save" ? last.stateBytes : undefined),
+  });
+}
+
+/** Whether this mount asked for conversation cards (`conversationCards`, off by default): only `true` turns them on. */
+function cardsOn(ctx: PluginContext): boolean {
+  return ctx.publicConfig.conversationCards === true;
+}
+
+/** One failed load or save of the SDK's state: a trace row (`PluginContext.trace`) and a console line. */
+export function stateSaveFailed(ctx: PluginContext, phase: "load" | "save", error: unknown, stateBytes?: number): void {
+  const message = clip(String((error as Error)?.message ?? error), 200) ?? "";
+  console.warn(`raft state ${phase} failed for mount ${ctx.alias}: ${message}`);
+  ctx.trace?.({
+    kind: "raft.state_save_failed", status: phase, verdict: "failed",
+    attrs: { phase, error: message, ...(stateBytes !== undefined ? { stateBytes } : {}) },
   });
 }
 
@@ -1149,8 +1181,8 @@ async function continuesHeldSend(op: RaftOperationSpec, input: Record<string, un
  * SDK names it on a create's or a card's failure it says to retry (`next.kind: "retry_same_key"`). A send's or a
  * reply's failure names no next step (0.10.0), so for those it is the key passed here, on a failure the SDK marks
  * `retryable` — the same condition the SDK uses for the other two. A dedupe token, not a secret, whether the model's
- * or the operation id. A held call's key is never shown: its question is answered, not retried. Unknown, and so not
- * shown, when the SDK made the key for a send with no operation behind it.
+ * or the operation id. Not for a held call, which is not a failure: its question (the SDK's held text, `heldCall`)
+ * names the key itself. Unknown, and so not shown, when the SDK made the key for a send with no operation behind it.
  */
 function retryKey(op: RaftOperationSpec, out: RaftFailure, sent: Record<string, unknown>): string | undefined {
   if (op.idempotency.kind !== "key") return undefined;
@@ -1187,7 +1219,7 @@ async function runOperation(
     throw sdkFailure(failed, unoffered, op.sideEffect !== "read", { tool: op.toolName, ...(key ? { key } : {}) });
   }
   // A call held again on resume keeps when it was first held: its key is the same one, as old as that.
-  if (isInterrupted(out)) return heldCall(op, raft, caller, out.interrupt, input, resumed.heldAt ?? started, unoffered);
+  if (isInterrupted(out)) return heldCall(op, raft, caller, out.interrupt, input, resumed.heldAt ?? started, ctx);
   // The SDK's text is the outcome as the model reads it (the CLI's output for the same operation, its hints written as
   // tool calls, and a call at a tool this mount lacks put in words by `offeredTerms`); `data` is the Server's
   // projection and stays out, so a new server field cannot silently enter the model's context.
@@ -1197,65 +1229,132 @@ async function runOperation(
   const messages = [...(Array.isArray(data?.messages) ? data.messages : []), data?.message].filter(isMessage);
   let text = out.text.trim();
   for (const m of messages) text = text.replace(m.text, modelLine(m, unoffered));
-  return { state: out.state, text: offeredTerms(text, unoffered, quotedCalls(data, unofferedPattern(unoffered))) };
+  const result = { state: out.state, text: offeredTerms(text, unoffered, quotedCalls(data, unofferedPattern(unoffered))) };
+  if (op.consumes.model.includes("seen")) await keepCardsShown(raft, ctx, result);
+  return result;
 }
 
 /**
- * A held call, as a question for the model: the conversation has messages this agent has not seen, and they are in
- * the question. They count as seen only once the model has been shown them, and when that is depends on who called:
+ * The cards a history read showed (`conversationCards`), booked where the next call reads them. The read ran on a
+ * client whose state is not saved (`runOperation` says why), so without this its cards would be shown on every read
+ * and the first send after it held for a card the model had just read. Only the cards are carried over, never the
+ * messages, and only when the model reads the result whole: a result over PARK_BYTES is parked and the model reads a
+ * preview, which may not reach them. Each is booked under the context it was shown in, which is the call's.
+ */
+async function keepCardsShown(read: Raft, ctx: PluginContext, result: Record<string, Json>): Promise<void> {
+  const shown = read.frontier.snapshot().observations ?? [];
+  if (!cardsOn(ctx) || !shown.length || JSON.stringify(result).length > PARK_BYTES) return;
+  const kept = raftFor(ctx);
+  await kept.state.load();
+  for (const o of shown) kept.frontier.inContext(o.contextId).recordCard(o.type, o.id, o.rev);
+  await kept.state.save();
+}
+
+/**
+ * A held call, as a question for the model. Raft held it because the conversation moved since this context last
+ * looked (`unread_messages`: newer messages, and with conversation cards any card it has not seen ride along), or,
+ * with conversation cards on, because this context has not seen the conversation's card (`unseen_card`: no new
+ * messages, only the card). The question is the SDK's own held text, `interrupt.context`, passed on as it came: the
+ * opening "Held — …" line, the cards, the conversation's window and the `messages_read` call that reads it in full,
+ * all in tool form (`hints: "tool"`). It is the text the CLI prints for the same hold, and it names the call's
+ * `idempotencyKey`, which is the key a resume goes ahead under, so a model that sends again with it lands once.
+ * Nothing in it is rebuilt here, so no reason this plugin does not know is worded as one it does.
+ *
+ * What it shows counts as seen only once the model has been shown it, and when that is depends on who called:
  * - the model's own call (`originOf` → "model"): the question is that call's result, handed straight back and never
  *   parked (only a succeeded result is), so the model sees it now. It is recorded before asking (in the caller's
- *   context), so the answer "send"/"proceed" — or the model making the same call again — attests them instead of
- *   being held again.
+ *   context, or the interrupt's own `contextId`, which is the same one), so the answer "send"/"proceed" — or the
+ *   model making the same call again — attests the messages and the cards instead of being held again.
  * - any other caller: a run_js program's call ends the program there, and its question reaches the model only if it
  *   is the first one that run asked and the run stopped cleanly (`deliverRun`, src/runtime/pi-tools.ts); otherwise it
  *   is dropped unseen. An approved call's replay has nobody to show it to at all. So nothing is recorded now; the
  *   state carries what the question would attest (`attest`), and the model's answer records it (`interrupts.resume`),
  *   since only the model can answer.
- * The SDK attests nothing when the context was withheld, does not account for every new message, or came without
- * a boundary (`SeenFrontier.recordHeld`); then nothing is attested and the model reads the conversation first.
+ * The SDK attests no messages when the context was withheld, does not account for every new message, or came without
+ * a boundary (`SeenFrontier.recordHeld`; an `unseen_card` hold never has one); its cards are booked whenever they were
+ * shown, which is every time they were not withheld.
  *
  * The state is the call itself: the operation, its arguments with the interrupt's `resume.idempotencyKey` under
  * the operation's key argument when it has one, for a message the `seen` boundary when the question showed
- * every new message, `attest` when it showed them all, and `heldAt`, when the call was first held
- * (`KEY_LIFETIME_MS`). Plain data, no credential, and never shown: the question, its context and its answers carry
- * none of it, and the interrupt's `resume.argv`/`cancel`, which belong to the CLI, are not used at all.
+ * every new message, `attest` when it showed them all or showed a card, the hold's `reason`, and `heldAt`, when the
+ * call was first held (`KEY_LIFETIME_MS`). Plain data, no credential, and never shown. The interrupt's
+ * `resume.argv`/`cancel`, which belong to the CLI, are not used at all.
+ *
+ * Each hold is a trace row (`raft.held`), and so is the answer to it (`raft.held_answer`, `interrupts.resume`).
  */
 async function heldCall(
   op: RaftOperationSpec, raft: Raft, caller: { origin: "model" | "code"; contextId?: string }, held: RaftInterrupt,
-  input: Record<string, unknown>, heldAt: number, unoffered: ReadonlySet<string>,
+  input: Record<string, unknown>, heldAt: number, ctx: PluginContext,
 ): Promise<Interrupt> {
-  const n = held.newMessageCount;
   // Whether the question shows every new message up to a boundary: asked of a frontier nothing reads, so asking
   // records nothing.
   const attested = new SeenFrontier().recordHeld(held);
-  if (attested && caller.origin === "model") {
+  const cards = shownCards(held);
+  if ((attested || cards) && caller.origin === "model") {
     raft.frontier.inContext(caller.contextId).recordHeld(held);
     await raft.state.save();
   }
-  const unshown = held.withheld ? n : Math.max(0, n - held.heldMessages.length - held.omittedMessageCount);
   const go = goAhead(op);
   const key = op.idempotency.kind === "key" && held.resume.idempotencyKey ? { [op.idempotency.arg]: held.resume.idempotencyKey } : {};
-  return interrupt({
-    question: `${n === 1 ? "A newer message" : `${n} newer messages`} arrived in ${held.target} since you last read it; ` +
-      (attested
-        ? (go === "send" ? "send your message anyway?" : `go ahead with ${op.toolName} anyway?`)
-        : `${unshown && unshown < n ? `${unshown} of them are not shown here, so ` : unshown ? "they are not shown here, so " : ""}` +
-          `read ${held.target} with messages_read first, then answer "${go}" to go ahead or "drop".`),
-    context: {
-      target: held.target, newMessages: n,
-      messages: held.heldMessages.map((m) => modelLine(m, unoffered)),
-      ...(held.omittedMessageCount ? { omitted: held.omittedMessageCount } : {}),
-      ...(held.withheld ? { withheld: true } : {}),
-      ...(unshown ? { unshown } : {}),
-    },
-    answer: { choices: [go, "drop"] },
-    state: {
-      op: op.name, args: { ...input, ...key } as Json, heldAt,
-      ...(go === "send" && attested && held.seenUpToSeq !== null ? { seen: { upToSeq: held.seenUpToSeq } } : {}),
-      ...(attested && held.seenUpToSeq !== null ? { attest: { target: held.target, upToSeq: held.seenUpToSeq } } : {}),
+  const reason = reasonOf(held);
+  ctx.trace?.({
+    kind: "raft.held", status: reason, verdict: "blocked",
+    attrs: {
+      tool: op.toolName, reason, target: held.target, newMessageCount: held.newMessageCount,
+      cards: Object.keys(cards ?? {}).sort().join(","), contextBytes: held.context.length, origin: caller.origin,
+      contextComplete: held.contextComplete, ...(held.withheld ? { withheld: true } : {}),
     },
   });
+  return interrupt({
+    question: held.context,
+    context: { reason, target: held.target },
+    answer: { choices: [go, "drop"] },
+    state: {
+      op: op.name, args: { ...input, ...key } as Json, heldAt, reason,
+      ...(go === "send" && attested && held.seenUpToSeq !== null ? { seen: { upToSeq: held.seenUpToSeq } } : {}),
+      ...(attested || cards ? {
+        attest: {
+          target: held.target,
+          ...(attested && held.seenUpToSeq !== null ? { upToSeq: held.seenUpToSeq } : {}),
+          ...(cards ? { cards: cards as unknown as Json } : {}),
+        },
+      } : {}),
+    },
+  });
+}
+
+/** The cards a hold showed the model (`conversationCards`): none when it showed none, or withheld its context. */
+function shownCards(held: RaftInterrupt): NonNullable<RaftInterrupt["cards"]> | undefined {
+  if (held.withheld || !held.cards) return undefined;
+  const { channel, peer } = held.cards;
+  return channel || peer ? { ...(channel ? { channel } : {}), ...(peer ? { peer } : {}) } : undefined;
+}
+
+/**
+ * Why Raft held a call, as the trace and the state name it. Only the SDK words it for the model (`heldCall`), so a
+ * reason a later SDK adds is passed on by name rather than read as one of these.
+ */
+function reasonOf(held: RaftInterrupt): string {
+  const reason: string = held.reason;
+  switch (reason) {
+    case "unread_messages":
+    case "unseen_card":
+      return reason;
+    default:
+      return typeof reason === "string" && reason ? clip(reason, 40)! : "unknown";
+  }
+}
+
+/** The cards a held call's state kept (`heldCall`'s `attest.cards`), as the SDK books them; anything else is none. */
+function keptCards(value: unknown): NonNullable<RaftInterrupt["cards"]> | undefined {
+  const v = object(value);
+  const channel = object(v.channel);
+  const peer = object(v.peer);
+  const out = {
+    ...(typeof channel.name === "string" && typeof channel.id === "string" ? { channel: channel as unknown as NonNullable<RaftInterrupt["cards"]>["channel"] } : {}),
+    ...(typeof peer.name === "string" && (peer.kind === "human" || peer.kind === "agent") ? { peer: peer as unknown as NonNullable<RaftInterrupt["cards"]>["peer"] } : {}),
+  };
+  return out.channel || out.peer ? out : undefined;
 }
 
 /**
@@ -1291,24 +1390,13 @@ async function legacySend(
   const out = await raft.messages.send(send);
   if (!out.ok) throw sdkFailure(out, unoffered, true);
   if (isInterrupted(out)) {
+    // Asked as `heldCall` asks: the SDK's held text as it came.
     const held = out.interrupt;
-    const n = held.newMessageCount;
     const attested = raft.frontier.recordHeld(held);
-    if (attested) await raft.state.save();
-    const unshown = held.withheld ? n : Math.max(0, n - held.heldMessages.length - held.omittedMessageCount);
+    if (attested || shownCards(held)) await raft.state.save();
     return interrupt({
-      question: `${n === 1 ? "A newer message" : `${n} newer messages`} arrived in ${held.target} since you last read it; ` +
-        (attested
-          ? "send your message anyway?"
-          : `${unshown && unshown < n ? `${unshown} of them are not shown here, so ` : unshown ? "they are not shown here, so " : ""}` +
-            `read ${held.target} with messages_read first, then answer "send" to send your message or "drop".`),
-      context: {
-        target: held.target, newMessages: n,
-        messages: held.heldMessages.map((m) => modelLine(m, unoffered)),
-        ...(held.omittedMessageCount ? { omitted: held.omittedMessageCount } : {}),
-        ...(held.withheld ? { withheld: true } : {}),
-        ...(unshown ? { unshown } : {}),
-      },
+      question: held.context,
+      context: { reason: reasonOf(held), target: held.target },
       answer: { choices: ["send", "drop"] },
       state: {
         target: send.target, content: send.content, idempotencyKey: held.resume.idempotencyKey ?? send.idempotencyKey,
@@ -2289,6 +2377,11 @@ export function createRaftPlugin(deps: {
     config: [
       { name: "serverUrl", type: "string", required: true, format: "origin", summary: "Raft server origin, for example https://api.raft.build." },
       { name: "timeoutMs", type: "number", default: DEFAULT_TIMEOUT_MS, summary: "Request timeout in milliseconds, clamped to 1000–60000." },
+      {
+        name: "conversationCards", type: "boolean", default: false,
+        summary: "Show the model a conversation's card (a channel's description, a DM peer's profile) once per context, " +
+          "and hold a send into a conversation whose card its context has not seen. Off unless true.",
+      },
     ],
     credential: {
       required: true,
@@ -2406,7 +2499,20 @@ export function createRaftPlugin(deps: {
         }
         const go = goAhead(op);
         const target = typeof s.args.target === "string" ? { target: s.args.target } : {};
+        const heldAt = typeof s.heldAt === "number" && Number.isFinite(s.heldAt) ? s.heldAt : undefined;
+        // The answer as a trace row (`raft.held_answer`): which hold it answers, what it chose, what came of it, and how
+        // long the question waited, from when the call was first held.
+        const answered = (status: string, outcome: string) => ctx.trace?.({
+          kind: "raft.held_answer", status, verdict: status === go ? (outcome === "failed" ? "failed" : "ok") : "cancelled",
+          ...(heldAt !== undefined ? { ms: Math.max(0, Date.now() - heldAt) } : {}),
+          attrs: {
+            tool: op.toolName, reason: typeof s.reason === "string" ? s.reason : "unknown", outcome,
+            ...(typeof s.args.target === "string" ? { target: s.args.target }
+              : typeof object(s.args.message).target === "string" ? { target: object(s.args.message).target as string } : {}),
+          },
+        });
         if (answer === "drop") {
+          answered("drop", "dropped");
           return {
             state: "dropped", ...target,
             note: go === "send"
@@ -2419,8 +2525,8 @@ export function createRaftPlugin(deps: {
         // live only in the object's memory (src/plugins/types.ts `Interrupt`) for about a minute (RUN_JS_RESUME_MS), and a
         // deploy restarts the object, so none outlives the change that added it. It goes ahead as it always did, rather
         // than refusing an answer for a reason that cannot apply to it.
-        const heldAt = typeof s.heldAt === "number" && Number.isFinite(s.heldAt) ? s.heldAt : undefined;
         if (op.idempotency.kind === "key" && heldAt !== undefined && Date.now() - heldAt >= KEY_LIFETIME_MS) {
+          answered("expired", "expired");
           const where = typeof s.args.target === "string" ? s.args.target
             : typeof object(s.args.message).target === "string" ? object(s.args.message).target as string : null;
           const hours = KEY_LIFETIME_MS / 3_600_000;
@@ -2433,20 +2539,33 @@ export function createRaftPlugin(deps: {
           };
         }
         // The answer is the model's (only the model can resume), and the question it answers showed the held
-        // messages: they are seen now, in the context answering, so a later send there attests them. Recorded before
-        // the call goes ahead, as the model's own hold records before asking; a save that fails costs one more hold.
+        // messages and cards: they are seen now, in the context answering, so a later send there attests them and is
+        // not held for the card again. Recorded before the call goes ahead, as the model's own hold records before
+        // asking; a save that fails costs one more hold.
         const attest = object(s.attest);
-        if (typeof attest.target === "string" && typeof attest.upToSeq === "number" && Number.isSafeInteger(attest.upToSeq) && attest.upToSeq > 0) {
+        const upTo = typeof attest.upToSeq === "number" && Number.isSafeInteger(attest.upToSeq) && attest.upToSeq > 0 ? attest.upToSeq : undefined;
+        const cards = keptCards(attest.cards);
+        if (typeof attest.target === "string" && (upTo !== undefined || cards)) {
           const raft = raftFor(ctx);
           await raft.state.load();
-          raft.frontier.inContext(typeof ctx.caller.contextId === "string" ? ctx.caller.contextId : undefined).recordUpTo(attest.target, attest.upToSeq);
+          const seen = raft.frontier.inContext(typeof ctx.caller.contextId === "string" ? ctx.caller.contextId : undefined);
+          if (upTo !== undefined) seen.recordUpTo(attest.target, upTo);
+          if (cards) seen.recordCardsShown(attest.target, cards);
           await raft.state.save();
         }
         const seen = object(s.seen);
-        return operate(op, s.args, ctx, {
-          ...(typeof seen.upToSeq === "number" ? { seen: { upToSeq: seen.upToSeq } } : {}),
-          ...(heldAt !== undefined ? { heldAt } : {}),
-        });
+        let result: Json | Interrupt;
+        try {
+          result = await operate(op, s.args, ctx, {
+            ...(typeof seen.upToSeq === "number" ? { seen: { upToSeq: seen.upToSeq } } : {}),
+            ...(heldAt !== undefined ? { heldAt } : {}),
+          });
+        } catch (e) {
+          answered(go, "failed");
+          throw e;
+        }
+        answered(go, result instanceof Interrupt ? "held" : String(object(result).state ?? "done"));
+        return result;
       },
     },
 

@@ -66,11 +66,22 @@ const TABLE = "CREATE TABLE IF NOT EXISTS trace_outbox(" +
 // `failed`, with its tokens. Activity and status skip it.
 // `agent.ready` is a provisioned agent ready before its first turn, once per agent (src/runtime/ready.ts): its status
 // is `online`, a status-only activity event.
+// The rest are the kinds a plugin may write itself, through `PluginContext.trace` (`PLUGIN_TRACE_KINDS`). Activity and
+// status skip them.
 export const TRACE_KINDS = ["model.call", "tool.call", "approval.wait", "container.lease", "inbound", "mount.seeded", "harness.open",
   "turn.stop", "js.run",
   "rebuild.decision", "rebuild.outcome", "rebuild.behaviour", "session.needs_reset", "turn.timing", "import.hold", "model.prewarm",
-  "agent.ready"] as const;
+  "agent.ready", "raft.held", "raft.held_answer", "raft.state_save_failed"] as const;
 export type TraceKind = (typeof TRACE_KINDS)[number];
+
+/**
+ * The kinds a plugin may write (`PluginContext.trace`): its own facts, never a kind a seam of the kernel writes, so a
+ * plugin cannot add a `tool.call` or a `model.call` the drain would count. The gateway refuses any other kind.
+ * `raft.held` is a Raft call held for the model's decision, `raft.held_answer` the model's answer to one, and
+ * `raft.state_save_failed` the Raft SDK's state that did not load or save (src/plugins/raft.ts says what each holds).
+ */
+export const PLUGIN_TRACE_KINDS = ["raft.held", "raft.held_answer", "raft.state_save_failed"] as const satisfies readonly TraceKind[];
+export type PluginTraceKind = (typeof PLUGIN_TRACE_KINDS)[number];
 
 export const TRACE_VERDICTS = ["ok", "failed", "blocked", "cancelled"] as const;
 export type TraceVerdict = (typeof TRACE_VERDICTS)[number];

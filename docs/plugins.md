@@ -479,6 +479,17 @@ checks the name is in it: a mount's list can be narrower than `tools`, because
 its credential lacks a capability or its snapshot predates the build that added
 the tool.
 
+**Write what only the plugin sees as a trace row, through `context.trace`.**
+The gateway hands it to every call's context when the agent's store keeps a
+trace, and writes the row into the same outbox as the kernel's spans
+(`src/trace/outbox.ts`), where it is exported and read through the agent's
+trace; a console line from the object is not, and can be dropped. The kind must
+be one of `PLUGIN_TRACE_KINDS` (anything else is not written, so a plugin cannot
+add a span the kernel counts); the gateway sets the time, the agent, the span
+(the call's operation id, or `mount:<alias>` outside one) and `attrs.mount`. It
+never throws and never fails the call. Add a kind to that list, with what it
+holds, when a plugin needs one.
+
 **A plugin whose tools depend on the credential lists them per mount too.**
 `raft` is the one that does: its tools are generated from the Raft SDK's
 operation manifest (`RAFT_OPERATIONS`), one per operation, named by the
@@ -559,6 +570,47 @@ tool's schema and refused at call time before anything is sent, since nothing
 else checks a call against the schema. `messages_read` does not offer the SDK's
 `unread` (0.13.0), which moves the agent's own read position beside
 `receive_events`.
+
+A send, a reply, a task claim or a task write that Raft holds for the model's
+decision comes back as a question (`heldCall`) whose text is the SDK's own held
+text, `interrupt.context`, passed on unchanged: its opening "Held — …" line, any
+conversation card, the conversation's window, and the `messages_read` call that
+reads it in full, in tool form; it names the call's `idempotencyKey`, which is
+the key the answer goes ahead under. The plugin words nothing of it, so a hold
+for a reason this build does not know reaches the model in the SDK's words, and
+a hold for an unseen card (`interrupt.reason: "unseen_card"`, no new messages)
+never reads as a count of messages. The answer is `send`/`proceed` or `drop`;
+what the question showed — the messages it accounts for, and its cards — is
+booked as seen in the asking context when it is the model's own call, and in
+the answering context when the model answers one raised elsewhere (a run_js
+program), so the answer is not held again.
+
+Conversation cards (the SDK's `conversationCards`, 0.18.0) are the mount's
+`conversationCards` setting, a boolean that is off unless set to `true`; every
+client the plugin makes for that mount is then created with the option, and no
+other is. On, a history read starts with the channel's card (or a DM peer's)
+the first time in a context, and a send into a conversation whose card the
+context has not seen is held once with that card. A context is the one the
+call is made in (`PluginContext.caller.contextId`): the SDK applies its card
+rules to the frontier view `invoke` builds from that id, so the plugin never
+sets a context on the frontier itself and two sessions never share one. A call
+made in no session's turn (an approved call's replay) has no context: it is not
+held for a card, and a send makes one extra history read to show the
+conversation's cards after its receipt. A history read's cards are carried into
+the mount's saved state, its messages are not (a read never counts as seen), and
+only when the result is not parked, since a parked page's preview may not reach
+them.
+
+The plugin writes three trace rows of its own (`context.trace`): `raft.held`
+for each held call (`status` its reason; `attrs` the tool, reason, target,
+`newMessageCount`, the kinds of card it showed, `contextBytes`, the origin), and
+`raft.held_answer` for each answer (`status` `send`, `proceed`, `drop` or
+`expired`; `ms` from when the call was first held; `attrs.outcome` what came of
+it), both under the call's operation; and `raft.state_save_failed` when the
+SDK's saved state did not load or save (`status` the phase; `attrs` the error
+and, for a save, `stateBytes`, the size of the record it tried to write), which
+it also says on the console. A failed save never fails the call: it costs at
+most a batch delivered again or one more hold.
 
 Four of `raft`'s hand-written tools are Raft Agent Login for Connected Apps
 (`src/plugins/raft-agent-login.ts`, the steps of Raft's CLI `integration list`,

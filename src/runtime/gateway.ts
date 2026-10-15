@@ -13,6 +13,7 @@ import type { PluginErrorFields, ToolSnapshot } from "../plugins/types.ts";
 import { callSideEffects, pluginEnabled, LEASE_KEY, toolsOf } from "../plugins/types.ts";
 import { admitTools } from "./mount-tools.ts";
 import { isReleased, leaseRow, releasedFacts } from "../trace/seams.ts";
+import { PLUGIN_TRACE_KINDS } from "../trace/outbox.ts";
 import { openPluginDatabase } from "./plugin-db.ts";
 import { payerKey, toolCallRows } from "../usage/outbox.ts";
 
@@ -1237,6 +1238,22 @@ export class ToolGateway {
         async ownerSecret(name: string) {
           if (!KEPT_NAME.test(name)) return null;
           return secrets.resolve(agentRef(OWNER_PREFIX + name), { tenantId: ctx.tenantId, agentId: ctx.agentId });
+        },
+      } : {}),
+      // A plugin's own facts, beside the spans the kernel writes (`PluginContext.trace`). Its span is the operation
+      // this context serves, so the row joins the call's `tool.call` row; the mount's name stands in when it serves
+      // none. Only the kinds a plugin may write, and the time, the agent and the mount are the gateway's, not the
+      // plugin's; the mount goes first, since a row over its size drops keys from the end.
+      ...(store.recordTrace ? {
+        trace(row: Parameters<NonNullable<PluginContext["trace"]>>[0]) {
+          if (!(PLUGIN_TRACE_KINDS as readonly string[]).includes(row.kind)) return;
+          try {
+            void store.recordTrace!([{
+              at: Date.now(), tenantId: ctx.tenantId, agentId: ctx.agentId, kind: row.kind,
+              spanId: operationId ?? `mount:${mount.alias}`, status: row.status, verdict: row.verdict,
+              ...(row.ms !== undefined ? { ms: row.ms } : {}), attrs: { mount: mount.alias, ...Object.fromEntries(Object.entries(row.attrs).filter(([k]) => k !== "mount")) },
+            }]).catch(() => { /* a row is never worth a failed call */ });
+          } catch { /* the same, for a store that throws before it returns a promise */ }
         },
       } : {}),
     };
