@@ -74,6 +74,11 @@
       { "id": "deepseek-flash", "label": "DeepSeek Flash", "provider": "deepseek", "model": "deepseek-flash" },
       { "id": "gpt-5.6-luna", "label": "GPT-5.6 Luna", "provider": "cloudflare", "model": "openai/gpt-5.6-luna" }
     ],
+    // Applies each Raft server's model-picker switch (docs/agent-surface.md, "The server's model picker"): a server
+    // whose switch is off may not pick a model other than the default. Set only once Raft had stored the switch for
+    // every hosted server and syncs it before each create, since a server with no stored switch reads as off.
+    // Preview leaves it unset.
+    "MODEL_PICKER_ENFORCE": "1",
     "ARTIFACT_BUCKET": "antiproton-artifacts",
     // Access now sits in front of antiproton.botiverse.dev; the UI fails closed
     // anywhere without an identity, including the workers.dev address.

@@ -247,8 +247,9 @@ Antiproton is designed to run as a Cloudflare Worker backed by Durable Objects:
    `PUT /provision/agents/{id}/model`, or `model` on the `POST /provision/agents` that creates it, makes the same
    pick (docs/agent-surface.md, "The agent's model"). Raft also sets, per server, whether its agents may pick
    another model than the default (`PUT /provision/servers/{id}/model-picker`); that switch refuses a pick only
-   where the `MODEL_PICKER_ENFORCE` var is `"1"`, which no wrangler config sets yet: unset, it is stored and
-   reported and refuses nothing (docs/agent-surface.md, "The server's model picker").
+   where the `MODEL_PICKER_ENFORCE` var is `"1"`, which `cf/wrangler.jsonc` sets (production enforces it as of
+   2026-10-15) and `cf/wrangler.preview.jsonc` does not: unset, it is stored and reported and refuses nothing
+   (docs/agent-surface.md, "The server's model picker").
    The `MODEL_FALLBACK` var, unset in every wrangler config, sends a first-turn call whose DeepSeek model does not
    answer in time to a `USER_MODELS` option once, and retries a turn neither answered on the agent's own schedule
    (docs/agent-surface.md, "A second model for the first turn").
