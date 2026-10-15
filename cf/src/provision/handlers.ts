@@ -29,7 +29,7 @@ import { PLANS, type Plan, type TenantPlanStore } from "../spend-limit.ts";
 import { CONNECTION_PROVIDERS, returnUrlProblem, scopesFor, type ConnectionProvider } from "./connect.ts";
 import { surface, surfaceReadOf, type SurfaceDeps } from "../agent-surface/surface.ts";
 import { logEvent } from "../../../src/core/log.ts";
-import type { StopTurnOutcome } from "../../../src/runtime/turn-stop.ts";
+import { logTurnStop, type StopTurnOutcome } from "../../../src/runtime/turn-stop.ts";
 import { WORKING_SET } from "../../../src/plugins/state.ts";
 import { SEED_MODES, seedPathProblem, seedText, sha256Hex as sha256Sync, type SeedFileMeta, type SeedMode, type SeedSeal, type SeedWriteResult } from "../../../src/store/seed-files.ts";
 import {
@@ -406,14 +406,18 @@ async function registerPush(deps: ProvisionDeps, row: ProvisionedAgent): Promise
   return { ...row, ...patch, updatedAt: deps.now() };
 }
 
-/** A stop as the object answered it, or `failed` when the object could not be asked; the failure is logged here. */
+/**
+ * A stop as the object answered it, or `failed` when the object could not be asked; either way it is logged here, as
+ * well as by the object. The platform can drop all of a Durable Object invocation's logs when it overlaps another
+ * invocation of the same object, which a stop does whenever it waits on a tool call in flight, so the object's own
+ * `turn.stop` line is not enough: the stop is recorded here, where the request is answered.
+ */
 async function stopTurnOf(stop: NonNullable<ProvisionAgentOps["stopTurn"]>, tenantId: string, agentId: string, trigger: "provider_stop" | "delete"): Promise<StopTurnResult> {
-  try { return await stop(tenantId, agentId, trigger); }
-  catch (e) {
-    const error = String((e as Error)?.message ?? e).slice(0, 200);
-    logEvent("turn.stop", { tenantId, agentId, trigger, result: "failed", error });
-    return { result: "failed", error };
-  }
+  let out: StopTurnResult;
+  try { out = await stop(tenantId, agentId, trigger); }
+  catch (e) { out = { result: "failed", error: String((e as Error)?.message ?? e).slice(0, 200) }; }
+  logTurnStop({ tenantId, agentId, trigger, side: "worker" }, out);
+  return out;
 }
 
 export async function handleProvision(

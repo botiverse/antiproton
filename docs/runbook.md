@@ -3,6 +3,15 @@
 Operating the deployment. Every route here takes the operator's token as `x-harness-token: $AUTOMATION_TOKEN`;
 `$HOST` is the deployment (`https://antiproton.ai`, or the preview Worker's host).
 
+## Logs and what an object did
+
+A Durable Object's console lines can be dropped from Workers Logs when its invocations overlap: the whole
+invocation's logs go missing, not one line. So an event an alert depends on is logged from the Worker request that
+answers the call, and the object's own line is kept as a supplement (`side` = `worker` or `do`). A missing `do` line
+says nothing about what the object did; to confirm that, read its trace export in R2, in the deployment's artifacts
+bucket (`antiproton-artifacts`, or `antiproton-preview-artifacts` on preview) under `trace/<tenantId>/<agentId>/`
+(cf/src/trace-r2.ts).
+
 ## Stopping a runaway agent
 
 A runaway agent is one whose turn keeps calling its model: the same failing tool call again and again, or a turn
@@ -28,8 +37,10 @@ curl -s -H "x-harness-token: $AUTOMATION_TOKEN" "$HOST/admin/transcript?tenantId
 ```
 
 Every stop, cancel or delete of a turn writes a `turn.stop` line to the Workers logs: `trigger` (`admin_cancel`,
-`provider_stop`, `delete`), `result` (`aborted`, `nothing_running`, `failed`) and `error` when it failed; filter on
-`evt` = `turn.stop` in the Workers Observability query builder.
+`provider_stop`, `delete`), `result` (`aborted`, `nothing_running`, `failed`), `turn` when one was aborted, `error` when
+it failed, and `side`. The Worker that answered the stop writes one (`side` = `worker`) for every attempt; the agent's
+object writes another (`side` = `do`) when it was reached, and that one can be missing ([above](#logs-and-what-an-object-did)).
+Filter on `evt` = `turn.stop` and `side` = `worker` in the Workers Observability query builder.
 
 For one agent's lines: `node cf/scripts/logs.mjs [--preview] --agent <agentId> --since 30m`.
 

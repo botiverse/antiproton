@@ -6,6 +6,7 @@
  */
 import type { SqlHost } from "../store/pi-storage.ts";
 import type { TraceRow } from "../trace/outbox.ts";
+import { logEvent } from "../core/log.ts";
 
 type Sql = SqlHost["sql"];
 
@@ -47,4 +48,15 @@ export function turnStopRow(o: { tenantId: string; agentId: string; operationId:
     status: "stopped", verdict: "cancelled",
     attrs: { errorClass: STOP_ERROR_CLASS[o.trigger], trigger: o.trigger },
   };
+}
+
+/**
+ * The `turn.stop` log line for one stop attempt: `side` is where it was written, the agent's object (`do`) or the
+ * Worker that answered the stop request (`worker`). Both write one, so a stop that reached the object has two lines.
+ */
+export function logTurnStop(o: { tenantId: string; agentId: string; trigger: StopTrigger; side: "do" | "worker" }, out: StopTurnOutcome): void {
+  logEvent("turn.stop", { tenantId: o.tenantId, agentId: o.agentId, trigger: o.trigger,
+    result: out.result === "interrupted" ? "aborted" : out.result === "failed" ? "failed" : "nothing_running",
+    ...(out.result === "interrupted" ? { turn: out.cancelledTurn } : {}), ...(out.result === "failed" ? { error: out.error } : {}),
+    side: o.side });
 }
