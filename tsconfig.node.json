@@ -99,6 +99,8 @@
     "test/operation-id.ts",
     "test/stable-prompt.ts",
     "test/harness-open.ts",
+    "test/run-js-trace.ts",
+    "test/turn-stop.ts",
     "test/overflow-backstop.ts",
     "test/idle-rebuild.ts",
     "test/tool-interrupts.ts",

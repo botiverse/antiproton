@@ -39,6 +39,12 @@ export function operatorCall(row: TraceOutboxRow): boolean {
   return row.kind === "tool.call" && row.attrs.task === PROVISION_TASK;
 }
 
+/** The errorClass of a turn that was ended from outside: the row's own, else its kind. Raft cuts it at 120. */
+export function turnEndClass(row: TraceOutboxRow): string {
+  const c = typeof row.attrs.errorClass === "string" && row.attrs.errorClass ? row.attrs.errorClass : row.kind;
+  return c.slice(0, 120);
+}
+
 /** The status changes a run of trace rows means, oldest first, with no two consecutive alike. */
 export function statusEvents(agentId: string, rows: readonly TraceOutboxRow[], before: AgentStatus | null = null): Array<ActivityEvent & { status: AgentStatus }> {
   const raw: Array<{ at: number; key: string; status: AgentStatus; detail?: string }> = [];
@@ -58,6 +64,10 @@ export function statusEvents(agentId: string, rows: readonly TraceOutboxRow[], b
         raw.push({ at: row.at - ms, key: `${id}:start`, status: "working", ...(name ? { detail: `Using ${name}`.slice(0, 200) } : {}) });
         break;
       }
+      // A turn that was ended from outside is an error, saying who ended it.
+      case "turn.stop":
+        if (row.status === "stopped") raw.push({ at: row.at, key: id, status: "error", detail: turnEndClass(row) });
+        break;
       case "model.call":
         // A start is only known when the span measured itself; without `ms` it would sit on the end's
         // own instant and say nothing the end does not.

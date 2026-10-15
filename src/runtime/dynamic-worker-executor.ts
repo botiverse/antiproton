@@ -320,7 +320,44 @@ export default {
 export function isCompileError(err: unknown): boolean {
   const e = err as { name?: unknown; message?: unknown } | null | undefined;
   if (e?.name === "SyntaxError") return true;
-  return /^(Uncaught )?SyntaxError\b/.test(String(e?.message ?? err));
+  // workerd's loader wraps the engine's error in its own first line, then the engine's sentence, then where in the
+  // module it stopped (measured with wrangler dev, 2026-10-15; the verbatim reading is test/run-js-errors.ts `ENGINE`).
+  return /^(Failed to start Worker:\n)?(Uncaught )?SyntaxError\b/.test(String(e?.message ?? err));
+}
+
+/** The line of the generated module (`main.js`, 1-based) on which the program's first line sits. */
+const PROGRAM_LINE = (() => {
+  const mark = "\u0000program\u0000";
+  const module = RUNNER(mark, 0, 0);
+  return module.slice(0, module.indexOf(mark)).split("\n").length;
+})();
+
+/**
+ * The engine's own error for a program that does not parse, as the model is to read it. The engine reports where in
+ * the generated module it stopped (`at main.js:<line>[:<column>]`, the column 0-based and left out when 0, in the
+ * message or in the stack), and the model never saw that module, so that place is given in the program's own lines,
+ * with the program's line and a caret under the column. Nothing else is added: the engine's sentence is what the
+ * model gets, and where the engine names no place, or one outside the program, the sentence goes alone. The loader's
+ * own first line ("Failed to start Worker:") says nothing about the program and is dropped.
+ */
+export function compileErrorMessage(err: unknown, source: string): string {
+  const e = err as { message?: unknown; stack?: unknown } | null | undefined;
+  const lines = String(e?.message ?? err).split("\n").filter((l, i) => !(i === 0 && /^Failed to start Worker:?\s*$/.test(l)));
+  const where = /at main\.js:(\d+)(?::(\d+))?/;
+  const found = where.exec(lines.join("\n")) ?? where.exec(typeof e?.stack === "string" ? e.stack : "");
+  const kept = lines.filter((l) => !/^\s*at main\.js:\d+(:\d+)?\s*$/.test(l));
+  if (!found) return kept.join("\n");
+  const programLines = source.split("\n");
+  const line = Number(found[1]) - PROGRAM_LINE + 1;
+  const column = Number(found[2] ?? 0);
+  if (line < 1 || line > programLines.length) return kept.join("\n");
+  const text = programLines[line - 1]!.replace(/\t/g, " ");
+  // A long line is shown around the column, so the caret stays on screen.
+  const from = Math.max(0, column - 60), to = Math.min(text.length, column + 60);
+  const shown = `${from > 0 ? "…" : ""}${text.slice(from, to)}${to < text.length ? "…" : ""}`;
+  const gutter = `${line} | `;
+  return [...kept, `  at line ${line}, column ${column + 1} of the program`,
+    `${gutter}${shown}`, `${" ".repeat(gutter.length + (from > 0 ? 1 : 0) + column - from)}^`].join("\n");
 }
 
 /**
@@ -430,7 +467,7 @@ export class DynamicWorkerExecutor implements JsExecutor {
           // parse is rejected here. Reading the answer below is ours, and a
           // SyntaxError from parsing it is not the script's (Vera, #341).
           if (first && isCompileError(err)) {
-            return finish({ status: "failed", outputs: [], error: { code: "eval_error", message: String((err as Error)?.message ?? err) } });
+            return finish({ status: "failed", outputs: [], error: { code: "eval_error", message: compileErrorMessage(err, source) } });
           }
           throw err;
         } finally {

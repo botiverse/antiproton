@@ -555,6 +555,11 @@ export function pausedNote(p: Paused, held: readonly HeldCall[], resumable = fal
 }
 
 type RunResult = Awaited<ReturnType<Sandbox["execute"]>>;
+/** The code of the error a stretch ended on, when it carries one (the sandbox's result type does not declare it). */
+const errorCode = (r: RunResult): string | undefined => {
+  const code = (r as { error?: { code?: unknown } }).error?.code;
+  return typeof code === "string" && code ? code : undefined;
+};
 
 /** A question one of a program's tool calls was asked, with where its answer goes. */
 interface Asked {
@@ -582,7 +587,18 @@ interface RunCounting {
   onCalls?: (n: number) => void | Promise<void>;
   /** Every stretch of a program, however it ended: for the usage count. `resumed` is a
    *  stretch after a resume, which is not a new run. A failure here does not fail the run. */
-  onRun?: (run: { ok: boolean; ms: number; hostCalls: number; resumed?: boolean }) => void | Promise<void>;
+  onRun?: (run: RunEnd) => void | Promise<void>;
+}
+
+/** One stretch of a program as it ended: for the usage count (`ok`, `ms`, `hostCalls`) and its `js.run` trace row. */
+export interface RunEnd {
+  ok: boolean; ms: number; hostCalls: number; resumed?: boolean;
+  /** The model's call this stretch answers. */
+  callId?: string;
+  /** The executor's status (`completed`, `failed`, `paused`, `interrupted`), or `threw` when it gave none. */
+  status?: string;
+  /** The error's code (`eval_error`, `runtime_error`, …) when it ended on one. */
+  code?: string;
 }
 
 /**
@@ -610,7 +626,8 @@ async function deliverRun(r: RunResult, o: {
   try {
     // A paused or cancelled run did what it was asked, so it counts as one that went well.
     const ok = r.status === "completed" || r.status === "paused" || (o.cancelling === true && r.status === "interrupted");
-    await o.counting.onRun?.({ ok, ms: Date.now() - o.started, hostCalls: newCalls, ...(resumed ? { resumed } : {}) });
+    await o.counting.onRun?.({ ok, ms: Date.now() - o.started, hostCalls: newCalls, ...(resumed ? { resumed } : {}),
+      callId: o.callId, status: r.status, ...(errorCode(r) ? { code: errorCode(r)! } : {}) });
   } catch { /* the count is lost, the run is not */ }
   await o.counting.onCalls?.(newCalls);
   const details = {
@@ -835,7 +852,7 @@ export function resumeTool(
       try {
         r = cancelling ? await s.continuation.cancel() : await s.continuation.resume(params.answer ?? null);
       } catch (e) {
-        try { await opts.onRun?.({ ok: false, ms: Date.now() - started, hostCalls: 0, resumed: true }); } catch { /* lost count */ }
+        try { await opts.onRun?.({ ok: false, ms: Date.now() - started, hostCalls: 0, resumed: true, callId: s.callId, status: "threw" }); } catch { /* lost count */ }
         throw e;
       }
       return deliverRun(r, {
@@ -975,7 +992,7 @@ export function runJsTool(
       const asked: AskedList = { items: [], closed: false };
       const started = Date.now();
       // Counting is never the run's problem: a failure here is dropped.
-      const countRun = async (run: { ok: boolean; ms: number; hostCalls: number }) => {
+      const countRun = async (run: RunEnd) => {
         try { await opts.onRun?.(run); } catch { /* the count is lost, the run is not */ }
       };
       let r: Awaited<ReturnType<Sandbox["execute"]>>;
@@ -1094,7 +1111,7 @@ export function runJsTool(
         },
       }, opts.limits);
       } catch (e) {
-        await countRun({ ok: false, ms: Date.now() - started, hostCalls: n });
+        await countRun({ ok: false, ms: Date.now() - started, hostCalls: n, callId: toolCallId, status: "threw" });
         throw e;
       }
       return deliverRun(r, {

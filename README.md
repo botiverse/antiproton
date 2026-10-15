@@ -142,6 +142,13 @@ lease or a fencing token, because a Durable Object is single-threaded and pi's
 mutation line serialises the writes — there was never a second writer for them
 to protect against.
 
+A running turn can be ended from outside: the provider's
+`POST /provision/agents/{id}/stop`, the operator's `/admin/cancel-turn`, and a
+delete, after which the agent's object takes no further step. The ended turn
+reaches Raft as a "Bridge fatal" activity event saying who ended it
+(`stopped: by owner`, `stopped: by operator`, `stopped: agent deleted`). How to
+find and stop a runaway agent is [`docs/runbook.md`](docs/runbook.md).
+
 Effects the object cannot re-run safely are marked. A tool declares
 `sideEffects` and `idempotency`, which becomes pi's `replay: "never" | "safe"`:
 a read repeats freely, a write repeats only if the plugin can make it

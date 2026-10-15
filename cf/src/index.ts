@@ -58,6 +58,7 @@ import { worthReporting } from "./mount-reports.ts";
 export type { MountReports };
 import { qualifyMountedTools } from "../../src/runtime/pi-tools.ts";
 import { BenchState, chooseBenchEngine, type BenchEngine } from "./bench.ts";
+import type { StopTrigger, StopTurnOutcome } from "../../src/runtime/turn-stop.ts";
 import {
   resolveViewer,
   programmaticAccess,
@@ -956,7 +957,6 @@ export class AgentDO extends DurableObject<Env> {
       // τ² mounts its domain as a plugin; SWE-bench mounts a machine, which
       // the runtime already has.
       extraPlugins: swe ? [] : [this.#benchState().plugin()],
-      maxTurns: swe ? 120 : 40,
       policy,
       // What the Node runner offers, and nothing else. The deployed console has
       // a sandbox; the Node τ² arm never did, and running the object arm with
@@ -1550,6 +1550,21 @@ export class AgentDO extends DurableObject<Env> {
       // The turn is on record now: say so, rather than leaving it for the step that follows.
       await this.broadcast();
       return { ok: true as const, made };
+    });
+  }
+
+  /**
+   * End the agent's running turn from outside (`AgentRuntime.stopTurn`): the provider's stop route, a delete, or the
+   * operator's /admin/cancel-turn. What was cancelled, `not_running`, or `failed` with why; never a throw.
+   */
+  async stopTurn(tenantId: string, agentId: string, trigger: StopTrigger): Promise<StopTurnOutcome> {
+    this.#claim(tenantId, agentId);
+    return this.#busy("stopTurn", async () => {
+      const out = await this.runtime().stopTurn(tenantId, agentId, trigger);
+      // The pass that follows sends the stop's activity and trace rows; the page hears it now.
+      await this.#wake();
+      await this.broadcast();
+      return out;
     });
   }
 
@@ -3634,6 +3649,7 @@ function provisionDeps(env: Env): ProvisionDeps {
       removeCredential: async (tenantId, agentId) => (await stub(tenantId, agentId).uiRemoveCredential(tenantId, agentId, PROVISION_MOUNT_ALIAS)).ok,
       tool: (tenantId, agentId, name) => stub(tenantId, agentId).provisionTool(tenantId, agentId, name),
       pushStatus: (tenantId, agentId) => stub(tenantId, agentId).provisionPushStatus(tenantId, agentId),
+      stopTurn: (tenantId, agentId, trigger) => stub(tenantId, agentId).stopTurn(tenantId, agentId, trigger),
     },
     // Only where this deployment can run the flow: an OAuth App, a session secret and its own origin.
     ...(connectDeps(env) ? {
@@ -4321,6 +4337,26 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
           const s4 = env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a)));
           const r = await s4.resetSession(t, a, url.searchParams.get("rebuild") !== "0");
           return Response.json(r, { status: r.ok ? 200 : r.status });
+        }
+        case "/admin/cancel-turn": {
+          // The operator's stop for a runaway turn (docs/runbook.md, "Stopping a runaway agent"): the running turn
+          // is aborted, as the Agents API's cancel aborts one, and nothing is deleted. /admin/reset-session does not do
+          // this: it clears the overflow backstop's mark, and its rebuild refuses while a turn runs.
+          if (!isOperator(env.AUTOMATION_TOKEN, request.headers.get("x-harness-token"))) {
+            return Response.json({ error: "unauthorized" }, { status: 401 });
+          }
+          if (request.method !== "POST") return Response.json({ error: "POST" }, { status: 405 });
+          const t = url.searchParams.get("tenantId") ?? "";
+          const a = url.searchParams.get("agentId") ?? "";
+          if (!t || !a) return Response.json({ error: "tenantId and agentId are required" }, { status: 400 });
+          let r: StopTurnOutcome;
+          try { r = await env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a))).stopTurn(t, a, "admin_cancel"); }
+          catch (e) {
+            const error = String((e as Error)?.message ?? e).slice(0, 200);
+            logEvent("turn.stop", { tenantId: t, agentId: a, trigger: "admin_cancel", result: "failed", error });
+            r = { result: "failed", error };
+          }
+          return Response.json({ tenantId: t, agentId: a, ...r }, { status: r.result === "failed" ? 503 : 200 });
         }
         case "/admin/migrate-engine":
           return await adminMigrateEngine(request, env.AUTOMATION_TOKEN,

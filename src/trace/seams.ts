@@ -209,3 +209,21 @@ export function seededRow(s: {
     attrs: { alias: s.alias, plugin: s.plugin, since: s.since, outcome: s.outcome, reason: s.reason, ...(s.notice ? { notice: s.notice } : {}) },
   };
 }
+
+/**
+ * The js.run row for one stretch of a run_js program (src/runtime/pi-tools.ts `RunEnd`): how it ended and its error's
+ * code. Its span is the model's call, which a stretch after a `resume` shares with the run it continues.
+ */
+export function jsRunRow(o: {
+  tenantId: string; agentId: string; session: string; at: number;
+  run: { ok: boolean; ms: number; hostCalls: number; resumed?: boolean; callId?: string; status?: string; code?: string };
+}): TraceRow {
+  const status = o.run.status ?? (o.run.ok ? "completed" : "failed");
+  return {
+    at: o.at, tenantId: o.tenantId, agentId: o.agentId, kind: "js.run",
+    spanId: o.run.callId || `js_${o.at}`,
+    status, verdict: o.run.code === "cancelled" ? "cancelled" : o.run.ok ? "ok" : "failed",
+    ms: Math.max(0, o.run.ms),
+    attrs: { ...(o.run.code ? { code: o.run.code } : {}), hostCalls: o.run.hostCalls, session: o.session, ...(o.run.resumed ? { resumed: true } : {}) },
+  };
+}
