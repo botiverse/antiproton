@@ -103,7 +103,29 @@ await check("POST …/stop: a turn that could not be ended is 503 stop_failed, r
   const t = await call(threw.deps, "POST", "/agents/by-raft-agent/LIVE/stop");
   must(t.status === 503 && t.body.error.code === "stop_failed", `${t.status} ${show(t.body)}`);
   const line = logs.find((l) => l.evt === "turn.stop");
-  must(line && line.trigger === "provider_stop" && line.result === "failed" && line.agentId === "raft_LIVE" && /reset/.test(line.error), `log: ${show(logs)}`);
+  must(line && line.trigger === "provider_stop" && line.result === "failed" && line.agentId === "raft_LIVE" && /reset/.test(line.error) && line.side === "worker", `log: ${show(logs)}`);
+});
+
+await check("the Worker logs its own turn.stop line, side worker, for interrupted, not_running and failed", async () => {
+  // The object's own line can be lost with the rest of its invocation's logs; this one is written where the stop is answered.
+  const answers: StopTurnResult[] = [
+    { result: "interrupted", cancelledTurn: "op_7" }, { result: "not_running" }, { result: "failed", error: "the harness did not open" },
+  ];
+  const f = fakeDeps(async () => answers.shift()!);
+  logs.length = 0;
+  for (let i = 0; i < 3; i++) await call(f.deps, "POST", "/agents/by-raft-agent/LIVE/stop");
+  const threw = fakeDeps(async () => { throw new Error("Durable Object reset"); });
+  await call(threw.deps, "POST", "/agents/by-raft-agent/LIVE/stop");
+  const d = fakeDeps(async () => ({ result: "interrupted", cancelledTurn: "op_8" }));
+  await call(d.deps, "DELETE", "/agents/by-raft-agent/LIVE");
+  const lines = logs.filter((l) => l.evt === "turn.stop").map((l) => [l.side, l.trigger, l.result, l.turn ?? null, l.error ?? null, l.agentId]);
+  must(show(lines) === show([
+    ["worker", "provider_stop", "aborted", "op_7", null, "raft_LIVE"],
+    ["worker", "provider_stop", "nothing_running", null, null, "raft_LIVE"],
+    ["worker", "provider_stop", "failed", null, "the harness did not open", "raft_LIVE"],
+    ["worker", "provider_stop", "failed", null, "Durable Object reset", "raft_LIVE"],
+    ["worker", "delete", "aborted", "op_8", null, "raft_LIVE"],
+  ]), `turn.stop lines: ${show(lines)}`);
 });
 
 await check("DELETE ends the running turn first, and again on a repeated delete; a failed stop does not fail the delete", async () => {
@@ -182,8 +204,8 @@ await check("a looping turn stopped by its owner: aborted with its call out, no 
   must(st[st.length - 1]!.status === "error" && st[st.length - 1]!.detail === "stopped: by owner", `status: ${show(st[st.length - 1])}`);
   const again = await w.rt.stopTurn("t", "a", "provider_stop");
   must(show(again) === show({ result: "not_running" }), show(again));
-  const lines = logs.filter((l) => l.evt === "turn.stop").map((l) => [l.tenantId, l.agentId, l.trigger, l.result]);
-  must(show(lines) === show([["t", "a", "provider_stop", "aborted"], ["t", "a", "provider_stop", "nothing_running"]]), `turn.stop lines: ${show(lines)}`);
+  const lines = logs.filter((l) => l.evt === "turn.stop").map((l) => [l.tenantId, l.agentId, l.trigger, l.result, l.side]);
+  must(show(lines) === show([["t", "a", "provider_stop", "aborted", "do"], ["t", "a", "provider_stop", "nothing_running", "do"]]), `turn.stop lines: ${show(lines)}`);
   // Stopped, not deleted: the next message is a turn.
   await w.rt.postMessage("t", "a", "now this", "prompt", "main");
   await w.rt.step("t", "a");

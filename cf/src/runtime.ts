@@ -44,7 +44,7 @@ import {
   refuseWithheld, type RunEnd,
 } from "../../src/runtime/pi-tools.ts";
 import { jsRunRow } from "../../src/trace/seams.ts";
-import { agentDeletedAt, markAgentDeleted, turnStopRow, type StopTrigger, type StopTurnOutcome } from "../../src/runtime/turn-stop.ts";
+import { agentDeletedAt, logTurnStop, markAgentDeleted, turnStopRow, type StopTrigger, type StopTurnOutcome } from "../../src/runtime/turn-stop.ts";
 import { explainUnavailableTool } from "../../src/runtime/unavailable-tool.ts";
 import {
   bindingKey, buildBriefing, programSendCounter, clearBackstop, conversationMessages, hasAnswer, judgeOverflow, mainCallOut, mainMessages, mainTip, needsReset, noteRebuilt,
@@ -4074,9 +4074,7 @@ export class AgentRuntime {
   async stopTurn(tenantId: string, agentId: string, trigger: StopTrigger): Promise<StopTurnOutcome> {
     const sql = this.#deps.ctx.storage.sql;
     const done = (out: StopTurnOutcome): StopTurnOutcome => {
-      logEvent("turn.stop", { tenantId, agentId, trigger,
-        result: out.result === "interrupted" ? "aborted" : out.result === "failed" ? "failed" : "nothing_running",
-        ...(out.result === "interrupted" ? { turn: out.cancelledTurn } : {}), ...(out.result === "failed" ? { error: out.error } : {}) });
+      logTurnStop({ tenantId, agentId, trigger, side: "do" }, out);
       return out;
     };
     try {

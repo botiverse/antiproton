@@ -58,7 +58,7 @@ import { worthReporting } from "./mount-reports.ts";
 export type { MountReports };
 import { qualifyMountedTools } from "../../src/runtime/pi-tools.ts";
 import { BenchState, chooseBenchEngine, type BenchEngine } from "./bench.ts";
-import type { StopTrigger, StopTurnOutcome } from "../../src/runtime/turn-stop.ts";
+import { logTurnStop, type StopTrigger, type StopTurnOutcome } from "../../src/runtime/turn-stop.ts";
 import {
   resolveViewer,
   programmaticAccess,
@@ -4351,11 +4351,10 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
           if (!t || !a) return Response.json({ error: "tenantId and agentId are required" }, { status: 400 });
           let r: StopTurnOutcome;
           try { r = await env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a))).stopTurn(t, a, "admin_cancel"); }
-          catch (e) {
-            const error = String((e as Error)?.message ?? e).slice(0, 200);
-            logEvent("turn.stop", { tenantId: t, agentId: a, trigger: "admin_cancel", result: "failed", error });
-            r = { result: "failed", error };
-          }
+          catch (e) { r = { result: "failed", error: String((e as Error)?.message ?? e).slice(0, 200) }; }
+          // Logged here as well as in the object: the object's logs can be dropped when its invocation overlaps
+          // another, as a stop waiting on a tool call does (cf/src/provision/handlers.ts `stopTurnOf`).
+          logTurnStop({ tenantId: t, agentId: a, trigger: "admin_cancel", side: "worker" }, r);
           return Response.json({ tenantId: t, agentId: a, ...r }, { status: r.result === "failed" ? 503 : 200 });
         }
         case "/admin/migrate-engine":

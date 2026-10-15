@@ -723,7 +723,8 @@ that most needs it.
 | `404 {"error":{"code":"not_found",…}}` | no agent by that id in the tenant |
 
 The ended turn reports itself to Raft: a "Bridge fatal" activity event with `errorClass` `stopped: by owner`, and
-status `error` with that detail. Every attempt is a `turn.stop` line in the Workers logs, whatever came of it.
+status `error` with that detail. Every attempt is a `turn.stop` line in the Workers logs, whatever came of it, written
+by the Worker that answered it (`side` = `worker`; [`runbook.md`](runbook.md#logs-and-what-an-object-did)).
 
 **A delete ends the turn too.** `DELETE /provision/agents/{agentId}` first stops the running turn (`errorClass`
 `stopped: agent deleted`), and from then on the agent's object takes no step for it, whatever arrives; a repeated
