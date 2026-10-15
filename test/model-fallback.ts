@@ -830,6 +830,10 @@ await check("a remind that carries the whole unread inbox, where each push carri
     { channelId: "dm-1", latestMsgId: "m2", firstPendingMsgId: "m1" })) === 202, "remind");
   await settle(w);
   must(inboundOutcomes(w).at(-1) === "duplicate" && jobCount(w) === 2, `the whole-inbox remind was new: ${show(inboundOutcomes(w))} ${jobCount(w)}`);
+  // A remind about part of what the turn holds (one conversation read meanwhile) brings nothing new either.
+  must(await pushNotice(w, raftNotice("ntc_r2", "m2", [], { channelId: "dm-1", latestMsgId: "m2", firstPendingMsgId: "m1" })) === 202, "partial remind");
+  await settle(w);
+  must(inboundOutcomes(w).at(-1) === "duplicate" && jobCount(w) === 2, `a remind of part of the turn's messages was new: ${show(inboundOutcomes(w))} ${jobCount(w)}`);
   // The same inbox with one newer message in either conversation is new.
   must(await pushNotice(w, raftNotice("ntc_n", "m2", [{ channelId: "dm-2", latestMsgId: "x2" }], { channelId: "dm-1", latestMsgId: "m2" })) === 202, "newer");
   await settle(w, 3);
