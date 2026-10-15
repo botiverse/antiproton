@@ -649,13 +649,14 @@ await check("the largest budget the config accepts ends before pi085 sends the j
   await settle(w, 1);
   must(jobCount(w) === 1, `jobs: ${jobCount(w)}`);
   const id = w.jobs[0]!;
-  must((await w.D.takeJob(T, A, id) as any)?.fallback?.fallbackMs === 50_000, "not the default fallbackS");
+  const mark = (await w.D.takeJob(T, A, id) as any)?.fallback;
+  must(mark?.primaryMs === cfg.primaryMs && mark?.fallbackMs === cfg.fallbackMs, `the job's mark: ${show(mark)}`);
   // A consumer is calling it, for the whole of both limits: passes run meanwhile, and none sends it again.
-  skew += FALLBACK_TOTAL_MAX_S * 1000;
+  skew += mark.primaryMs + mark.fallbackMs;
   await w.D.alarm();
   must(jobCount(w) === 1, `the job was sent again inside the fallback's budget: ${show(w.jobs)}`);
   // The control: past pi085's redelivery the same job is sent again, which is what the bound keeps the call inside.
-  skew += 11_000;
+  skew += 120_000 - (mark.primaryMs + mark.fallbackMs) + 1_000;
   await w.D.alarm();
   must(jobCount(w) === 2 && w.jobs[1] === id, `the control did not redeliver: ${show(w.jobs)}`);
 });
