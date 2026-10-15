@@ -684,10 +684,13 @@ Deployment configuration, off unless the `MODEL_FALLBACK` var is set; nothing in
   end the first turn. Raft is told through the failed call's `BridgeFatal` `errorClass` (at most 120 characters):
   `model_busy: primary and fallback model both unavailable; retrying in 2 min` (then `…in 5 min`) while a retry is
   scheduled, and `model_unavailable: primary and fallback model unavailable on 3 attempts; giving up` after the last.
-  A recovery sends nothing special: the agent's next activity says so. A message from the person ends the series
-  (a busy answer after it counts from one again); a cancel stops a scheduled retry, which Raft sees as the turn's
+  A recovery sends nothing special: the agent's next activity says so. The series ends when a prompt or a steer
+  is posted to the main conversation and the engine takes it (it starts or joins a run, which carries the turn; a busy
+  answer after it counts from one again). A follow-up, which starts no run on an idle conversation, and a post that
+  wrote nothing leave the schedule as it was; a cancel stops a scheduled retry, which Raft sees as the turn's
   `Stop`; a deleted agent is never called again (the delete drops the schedule, and the object asks the registry
-  before any retry). A retry the engine cannot start is given up, with the `model_unavailable` sentence. These ends
+  before any retry). A retry the engine cannot start, or one whose registry check stays unreadable for 10 minutes past its time, is
+  given up, with the `model_unavailable` sentence. These ends
   are recorded as `model.retry` trace rows.
 - **Trace.** The call's `model.call` row carries `primaryMs` on every marked call (the first turn's latency, whichever
   model answered), and `fallbackFrom`, `primaryOutcome` (`http_5xx`, `http_429`, `timeout`, `network`, or

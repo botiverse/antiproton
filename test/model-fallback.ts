@@ -32,6 +32,7 @@ import {
 import { providersFrom } from "../src/model/providers.ts";
 import { overflowKind } from "../src/runtime/overflow-backstop.ts";
 import { activityEvents } from "../src/runtime/activity.ts";
+import { statusEvents } from "../src/runtime/status.ts";
 import { inFirstTurn } from "../src/runtime/prewarm.ts";
 import { errorMessage } from "../src/model/pi-bridge.ts";
 
@@ -682,6 +683,51 @@ await check("a person's message starts the retry count afresh: a busy answer aft
   must(show(fatal(w)) === show(["model_busy: primary and fallback model both unavailable; retrying in 2 min",
     "model_busy: primary and fallback model both unavailable; retrying in 2 min"]), `activity: ${show(fatal(w))}`);
   must(busyRow(w).attempts === 1, show(busyRow(w)));
+});
+
+await check("only a prompt or steer the engine took ends the series: a follow-up on the idle conversation, or a pendingOnly post with nothing pending, leaves the retry to fire", async () => {
+  const w = await busyAgent();
+  const due = Number(busyRow(w).due_at);
+  await w.rt().postMessage(T, A, "a note for later", "followUp");
+  const nothing = await w.rt().postMessage(T, A, "", "prompt", "main", { pendingOnly: true });
+  must(nothing.queued === false, `pendingOnly wrote: ${show(nothing)}`);
+  must(busyRow(w).state === "scheduled", `a post that started no run ended the series: ${show(busyRow(w))}`);
+  skew += due - Date.now() + 10;
+  await settle(w, 2);
+  must(jobCount(w) === 2 && busyRow(w).state === "redispatched", `the retry did not fire: ${show({ jobs: jobCount(w), row: busyRow(w) })}`);
+  // The control: a prompt the engine takes does end it, and starts its own run.
+  const w2 = await busyAgent();
+  await w2.rt().postMessage(T, A, "Hello again", "prompt");
+  must(busyRow(w2).state === "superseded", `a prompt did not end the series: ${show(busyRow(w2))}`);
+});
+
+await check("an unreadable registry is asked again for 10 minutes past the retry's time, then the turn is given up with model_unavailable", async () => {
+  const w = await busyAgent();
+  const due = Number(busyRow(w).due_at);
+  const prepare = w.DB.prepare.bind(w.DB);
+  (w.DB as any).prepare = (q: string) => { if (/FROM provisioned_agents WHERE tenant_id = \? AND agent_id = \?/.test(q)) throw new Error("D1 unavailable"); return prepare(q); };
+  try {
+    skew += due - Date.now() + 10;
+    await w.D.alarm();
+    must(busyRow(w).state === "scheduled" && jobCount(w) === 1, `not waiting for the registry: ${show(busyRow(w))}`);
+    skew += 9 * 60_000;
+    await w.D.alarm();
+    must(busyRow(w).state === "scheduled", `gave up inside the patience: ${show(busyRow(w))}`);
+    skew += 2 * 60_000;
+    await w.D.alarm();
+    must(busyRow(w).state === "gave_up" && jobCount(w) === 1, `not given up after 10 minutes: ${show(busyRow(w))}`);
+  } finally { (w.DB as any).prepare = prepare; }
+  must(show(fatal(w).slice(-1)) === show(["model_unavailable: primary and fallback model unavailable on 1 attempt; giving up"]), `activity: ${show(fatal(w))}`);
+  must(logged.some((e) => e.event === "model_job.busy_retry" && e.outcome === "registry_unreadable_gave_up"), "not logged");
+});
+
+await check("model.retry rows as status: refused is error with its sentence, cancelled is online, started and moved say nothing", () => {
+  const row = (seq: number, status: string, attrs: Record<string, unknown> = {}) =>
+    ({ seq, at: 1_000 + seq, tenantId: T, agentId: A, kind: "model.retry", spanId: "mj_x", status, verdict: "ok", attrs }) as any;
+  const sentence = busyGivenUp(2);
+  const got = statusEvents(A, [row(1, "started"), row(2, "moved"), row(3, "refused", { busy: sentence }), row(4, "cancelled")], "thinking")
+    .map((e) => [e.status, e.detail ?? null]);
+  must(show(got) === show([["error", sentence], ["online", null]]), show(got));
 });
 
 await check("a re-dispatch the engine refuses is given up, and Raft is told model_unavailable rather than left on 'retrying'", async () => {

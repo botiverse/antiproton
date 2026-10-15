@@ -634,6 +634,9 @@ class BoundArtifacts {
   }
 }
 
+/** How long past its due time a busy first turn's re-dispatch waits for an unreadable registry before it is given up. */
+export const REGISTRY_PATIENCE_MS = 10 * 60_000;
+
 /** Whether a binding spends the operator's model account, through any provider. */
 export const isOperatorModelRef = (ref: string) => providerOfRef(ref) !== null;
 export { OPERATOR_RUN9_REF, OPERATOR_EXA_REF } from "./operator-ref.ts";
@@ -3621,8 +3624,20 @@ export class AgentRuntime {
       let gone: boolean;
       try { gone = await this.#deps.agentGone({ tenantId, agentId }); }
       catch (e) {
-        logEvent("model_job.busy_retry", { tenantId, agentId, jobId: due.jobId, attempt: due.attempts, outcome: "registry_unreadable", error: String((e as Error)?.message ?? e).slice(0, 200) });
-        return { wakeInMs: 60_000 };
+        const error = String((e as Error)?.message ?? e).slice(0, 200);
+        // Not guessed either way, and not for ever: past REGISTRY_PATIENCE_MS after the retry was due, it is given up,
+        // as a re-dispatch the engine refused is, so Raft is not left on "retrying in N min".
+        if (now - due.dueAt < REGISTRY_PATIENCE_MS) {
+          logEvent("model_job.busy_retry", { tenantId, agentId, jobId: due.jobId, attempt: due.attempts, outcome: "registry_unreadable", error });
+          return { wakeInMs: 60_000 };
+        }
+        this.#transact()(() => {
+          if (!settleBusyRetry(sql, tenantId, agentId, due.jobId, "gave_up", now)) return;
+          appendTrace(sql, [busyRetryRow({ tenantId, agentId, jobId: due.jobId, outcome: "refused", attempt: due.attempts, at: now,
+            lateMs: now - due.dueAt, sentence: busyGivenUp(due.attempts), reason: "registry_unreadable" })]);
+        });
+        logEvent("model_job.busy_retry", { tenantId, agentId, jobId: due.jobId, attempt: due.attempts, outcome: "registry_unreadable_gave_up", error });
+        return { wakeInMs: null };
       }
       if (gone) {
         this.#transact()(() => clearBusyRetry(sql, tenantId, agentId));
@@ -3926,9 +3941,6 @@ export class AgentRuntime {
     const backstop = session === MAIN_SESSION && !this.#isPd();
     const stuck = backstop ? needsReset(this.#deps.ctx.storage.sql, await this.#judge(tenantId, agentId)) : null;
     if (stuck) throw new SessionNeedsReset(stuck.reason);
-    // A message in the main conversation carries a busy first turn on itself: no scheduled re-dispatch of it is made,
-    // and a busy answer to the run it joins or starts counts from one again (src/runtime/busy-retry.ts).
-    if (backstop) this.#endBusyRetry(tenantId, agentId, "superseded");
     sealedBy(tenantId, agentId, await this.store.seal(tenantId, agentId, "first-turn"));
     // Every turn starts here, in every mode — a steer is how a console message arrives, and pushes, background
     // completions and lease warnings are prompts — so the catalogue is reconciled here, before the harness is
@@ -4038,6 +4050,11 @@ export class AgentRuntime {
       timingSafe("recording", () => (res?.ok === false ? turnNotSaid(timing, session, opened) : turnSaid(timing, session, Date.now())));
     }
     if (res?.ok === false) await giveAllBack();
+    // A prompt or a steer the engine took starts or joins a run, which carries a busy first turn on itself: no
+    // scheduled re-dispatch of it is made, and a busy answer to that run counts from one again
+    // (src/runtime/busy-retry.ts). Only then: a post that wrote nothing, a follow-up (on an idle lane it starts no run)
+    // and a `pendingOnly` post with nothing pending leave the schedule as it was, or the turn would wait for nothing.
+    if (backstop && res?.ok !== false && mode !== "followUp") this.#endBusyRetry(tenantId, agentId, "superseded");
     // The notices' exact text, so a rebuild's briefing can quote this message without them (src/runtime/overflow-backstop.ts
     // `buildBriefing`). A reading for later: a failure is logged and never fails the message.
     else if (backstop && lines.length) {

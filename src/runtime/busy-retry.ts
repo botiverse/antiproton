@@ -18,8 +18,9 @@
  * acted on — so a turn is never run twice. Once re-dispatched, the row says so, and a second pass finds nothing due.
  *
  * Counting: a busy answer to a run this module started continues the count (`redispatched`); any other — the
- * first, or one after a person's message — starts it at one: a message posted to the main conversation, or a cancel
- * of it, ends the series (`endBusyRetry`), whether a re-dispatch was still scheduled or had already run. After `retryAfterMs.length`
+ * first, or one after a new post — starts it at one: a prompt or steer the engine took on the main conversation
+ * (`AgentRuntime.postMessage`; not a follow-up, not a post that wrote nothing), or a cancel of it, ends the series
+ * (`endBusyRetry`), whether a re-dispatch was still scheduled or had already run. After `retryAfterMs.length`
  * re-dispatches the next busy answer gives up (`gave_up`), and the turn stays failed until the person writes again.
  */
 import { busyGivenUp, busyRetrying } from "../model/model-fallback.ts";
@@ -95,17 +96,21 @@ export function settleBusyRetry(sql: Sql, tenantId: string, agentId: string, job
 
 /**
  * The `model.retry` trace row for a scheduled re-dispatch that has ended, spanned by the busy job it retried:
- * `started` (re-dispatched), `moved` (a newer run carried the turn), `refused` (given up: `busy` carries the
+ * `started` (re-dispatched), `moved` (a newer run carried the turn), `refused` (given up — the engine would not
+ * start it, or the registry stayed unreadable, `reason` — and `busy` carries the
  * `model_unavailable` sentence, which Raft is shown, src/runtime/activity.ts) or `cancelled` (Raft is shown the turn's
  * stop). `ms` is how late the pass was against the schedule.
  */
 export function busyRetryRow(r: {
   tenantId: string; agentId: string; jobId: string; outcome: "started" | "moved" | "refused" | "cancelled"; attempt: number; at: number;
   lateMs?: number; sentence?: string | null;
+  /** Why a `refused` was given up when it is not the engine's refusal: `registry_unreadable`. */
+  reason?: string;
 }): TraceRow {
   return {
     at: r.at, tenantId: r.tenantId, agentId: r.agentId, kind: "model.retry", spanId: r.jobId, status: r.outcome,
     verdict: r.outcome === "refused" ? "failed" : r.outcome === "cancelled" ? "cancelled" : "ok",
-    attrs: { attempt: r.attempt, ...(r.sentence ? { busy: r.sentence } : {}), ...(r.lateMs !== undefined ? { lateMs: r.lateMs } : {}) },
+    attrs: { attempt: r.attempt, ...(r.sentence ? { busy: r.sentence } : {}), ...(r.reason ? { reason: r.reason } : {}),
+      ...(r.lateMs !== undefined ? { lateMs: r.lateMs } : {}) },
   };
 }
