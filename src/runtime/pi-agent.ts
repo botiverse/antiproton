@@ -617,6 +617,11 @@ export class PiAgent implements AgentEngine {
     const last = path[path.length - 1];
     if (last?.type !== "message" || last.message?.role !== "assistant" || last.message?.jobId !== jobId) return "moved";
     let i = path.length - 2;
+    // The busy call's own placeholders (a deferred handle, a pending poll: src/trace/seams.ts `answerEnded`) sit
+    // between it and the messages that led to it; they belong to the call being replaced.
+    const placeholder = (e: any) => e?.type === "message" && e.message?.role === "assistant"
+      && (e.message?.stopReason === "deferred" || e.message?.stopReason === "pending");
+    while (i >= 0 && placeholder(path[i])) i -= 1;
     const again: any[] = [];
     while (i >= 0 && path[i]?.type === "message" && (path[i].message?.role === "user" || path[i].message?.role === "toolResult")) {
       again.unshift(path[i].message);

@@ -7,6 +7,8 @@
  * body stream, errors with the signal's reason — and otherwise never settles.
  */
 import { MODEL_CALL_DEADLINE_MS, OpenAiCompatibleModel } from "../src/model/openai-compatible.ts";
+import { MODEL_BUSY_ERROR } from "../src/model/model-fallback.ts";
+import { callQueuedModel } from "../cf/src/model-request.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void>) {
@@ -123,6 +125,30 @@ await check("an answer inside the deadline is the answer it always was", async (
 await check("the default deadline is under the queue consumer's 15-minute wall-time limit, with room to spare", async () => {
   assert(MODEL_CALL_DEADLINE_MS > 0 && MODEL_CALL_DEADLINE_MS <= 15 * 60_000 - 3 * 60_000,
     `MODEL_CALL_DEADLINE_MS is ${MODEL_CALL_DEADLINE_MS}`);
+});
+
+await check("a first-turn call marked to fall back: each model under its own limit, the two together far inside the call deadline", async () => {
+  const original = globalThis.fetch;
+  const hosts: string[] = [];
+  globalThis.fetch = (async (url: unknown, init?: RequestInit) => { hosts.push(new URL(String(url)).host); return untilAborted(init?.signal); }) as typeof fetch;
+  const t0 = Date.now();
+  let watchdog: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const env = { DEEPSEEK_BASE_URL: "https://provider.example/v1", DEEPSEEK_API_KEY: "k", HARNESS_MODEL: "deepseek-flash", GW: "g",
+      MODEL_PROVIDERS: [{ id: "deepseek", baseUrl: "https://provider.example/v1", auth: { secret: "DEEPSEEK_API_KEY", header: "authorization" } },
+        { id: "cloudflare", baseUrl: "https://gw.example/compat", auth: { secret: "GW", header: "cf-aig-authorization" }, modelFormat: "vendor/model" }] } as any;
+    const job = { context: { systemPrompt: "s", messages: [{ role: "user", content: "hi", timestamp: 0 }] }, operatorModel: "deepseek-flash", operatorProvider: "deepseek",
+      fallback: { provider: "cloudflare", model: "openai/gpt-5.6-luna", primaryMs: DEADLINE_MS, fallbackMs: DEADLINE_MS } };
+    const a = await Promise.race([
+      callQueuedModel(env, job, "mj_t") as Promise<any>,
+      new Promise<null>((r) => { watchdog = setTimeout(() => r(null), WATCHDOG_MS); }),
+    ]);
+    const ms = Date.now() - t0;
+    assert(a !== null, `the call was still out after ${WATCHDOG_MS} ms`);
+    assert(a.errorMessage === MODEL_BUSY_ERROR && a.fallback?.primaryOutcome === "timeout" && a.fallback?.fallbackOutcome === "timeout", JSON.stringify(a));
+    assert(ms >= 2 * DEADLINE_MS && ms < 2 * DEADLINE_MS + 1000, `took ${ms} ms against two ${DEADLINE_MS} ms limits`);
+    assert(JSON.stringify(hosts) === JSON.stringify(["provider.example", "gw.example"]), JSON.stringify(hosts));
+  } finally { clearTimeout(watchdog); globalThis.fetch = original; }
 });
 
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.error ? `\n    ${r.error}` : ""}`);
