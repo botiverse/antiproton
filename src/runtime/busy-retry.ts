@@ -106,10 +106,13 @@ export function noteBusy(sql: Sql, tenantId: string, agentId: string, jobId: str
   const attempts = continues ? prev.attempts + 1 : 1;
   const wait = retryAfterMs[attempts - 1];
   const dueAt = wait === undefined ? null : now + wait;
-  // A series keeps the messages it started with; a new one takes those of the last push delivered.
-  // The messages the series holds: its turn's (`addTurnMessages`), and those an earlier series of this agent held,
-  // within `windowMs` of its last change: already given to the agent, they are not new when a service pushes them again.
-  const before = prev && now - prev.updatedAt < windowMs ? seriesMessageIds(sql, tenantId, agentId) : [];
+  // The messages the series holds: its turn's (`addTurnMessages`), and those of the series it continues — the same turn
+  // re-dispatched, or one a new post carried on (`superseded`) — within `windowMs` of its last change: given to the agent
+  // and still unanswered, they are not new when a service pushes them again. Never those of a series that is over
+  // (`answered`, `gave_up`, `cancelled`): its messages were answered or let go, and a set carried from episode to episode
+  // would only grow.
+  const inherits = prev && (prev.state === "redispatched" || prev.state === "superseded") && now - prev.updatedAt < windowMs;
+  const before = inherits ? seriesMessageIds(sql, tenantId, agentId) : [];
   const ids = [...new Set([...before, ...turnIds])].sort();
   sql.exec(`INSERT INTO model_busy_retry(tenant_id, agent_id, job_id, attempts, state, due_at, updated_at, message_ids) VALUES (?,?,?,?,?,?,?,?)
     ON CONFLICT(tenant_id, agent_id) DO UPDATE SET job_id=excluded.job_id, attempts=excluded.attempts, state=excluded.state,

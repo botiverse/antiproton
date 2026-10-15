@@ -4076,7 +4076,8 @@ export class AgentRuntime {
     // The turn holds this post's messages from now: a push's (src/runtime/busy-retry.ts `addTurnMessages`).
     if (backstop && res?.ok !== false && mode !== "followUp") {
       this.#endBusyRetry(tenantId, agentId, "superseded");
-      try { addTurnMessages(this.#deps.ctx.storage.sql, opts.messageIds, Date.now()); }
+      // Only where MODEL_FALLBACK is on: off, nothing reads them, and nothing is written.
+      try { if (this.#deps.modelFallback) addTurnMessages(this.#deps.ctx.storage.sql, opts.messageIds, Date.now()); }
       catch (e) { console.error(`recording the messages of ${tenantId}/${agentId}'s post failed:`, e); }
     }
     return { ...messageLanded(res, mode), result: res };
@@ -4830,7 +4831,7 @@ export class AgentRuntime {
       // about the same messages is delivered again as any push is. A tool call is not an answer to the person.
       if (wrote === true && !this.#isPd() && session === MAIN_SESSION && (answer as AnsweredMessage)?.stopReason !== "toolUse") {
         seriesAnswered(this.#deps.ctx.storage.sql, tenantId, agentId, Date.now());
-        clearTurnMessages(this.#deps.ctx.storage.sql);
+        if (this.#deps.modelFallback) clearTurnMessages(this.#deps.ctx.storage.sql);
       }
       return wrote;
     }
