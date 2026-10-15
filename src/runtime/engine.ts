@@ -62,6 +62,13 @@ export interface AgentEngine {
   answerClientCalls(results: ReadonlyArray<{ callId: string; output: string; isError: boolean }>): Promise<void>;
   /** Forget this session's client calls, when its turn is cancelled. How many were still waiting. */
   dropClientCalls(): Promise<number>;
+  /**
+   * Run again the turn whose last model call was answered `jobId` with a busy answer (src/runtime/busy-retry.ts): the
+   * same conversation up to that call, with nothing new in it. `started` when a run began; `moved` when the
+   * conversation's last entry is no longer that answer or a run is in flight (a newer message carried the turn on);
+   * `refused` when the engine would not start it. Absent where an engine cannot (pd: no call there is marked to fall back).
+   */
+  retryTurn?(jobId: string): Promise<"started" | "moved" | "refused">;
   /** Whether a run is in flight. */
   running(): Promise<boolean>;
   status(): Promise<EngineStatus>;

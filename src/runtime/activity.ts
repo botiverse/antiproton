@@ -15,7 +15,8 @@
  *   tool.call               → PreToolUse + PostToolUse / PostToolUseFailure  (not one the provider ran: `operatorCall`)
  *   model.call stop|length  → Stop                (the turn is answered)
  *   model.call aborted      → Stop                (cancelled: no longer working)
- *   model.call error        → BridgeFatal         (the turn died; a daily spend limit's refusal says so and why)
+ *   model.call error        → BridgeFatal         (the turn died; a daily spend limit's refusal, or a first turn no
+ *                                                  model answered, says so and why)
  *   model.call toolUse      → nothing             (still working)
  *   session.needs_reset set → BridgeFatal         (the overflow backstop gave up: pushes are refused until a reset)
  *   agent.ready             → nothing             (its `online` is a status-only event, src/runtime/status.ts)
@@ -140,9 +141,16 @@ export const NEEDS_RESET_ERROR = "context_overflow: conversation too long for th
  * entry, at most 120 characters (slock agentOrchestrator.ts, the BridgeFatal mapping), so a call refused for a daily
  * spend limit (`attrs.limit`, src/trace/seams.ts `modelCallRow`) names itself and carries its sentence, as
  * `NEEDS_RESET_ERROR` does; anything else is `model_call_failed`.
+ *
+ * A first-turn call neither the primary nor the fallback model answered (`attrs.busy`, src/model/model-fallback.ts)
+ * carries its sentence the same way, and Raft matches only its prefix, a closed set agreed with Raft's engineer:
+ * `model_busy: …` while the agent's object has a re-dispatch of the turn scheduled, `model_unavailable: …` once it has
+ * given up (src/runtime/busy-retry.ts). Nothing is sent when the agent recovers: its next activity says so.
  */
 export const USAGE_LIMIT_ERROR_CLASS = "usage_limit_reached";
 function modelCallErrorClass(row: TraceOutboxRow): string {
   const limit = typeof row.attrs.limit === "string" && row.attrs.limit ? row.attrs.limit : null;
-  return limit ? `${USAGE_LIMIT_ERROR_CLASS}: ${limit}`.slice(0, 120) : "model_call_failed";
+  if (limit) return `${USAGE_LIMIT_ERROR_CLASS}: ${limit}`.slice(0, 120);
+  const busy = typeof row.attrs.busy === "string" && row.attrs.busy ? row.attrs.busy : null;
+  return busy ? busy.slice(0, 120) : "model_call_failed";
 }

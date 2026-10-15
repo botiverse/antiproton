@@ -115,6 +115,7 @@ import { clip, logEvent, routeOf, setLogSink } from "../../src/core/log.ts";
 import type { FirstTurn } from "../../src/runtime/prewarm.ts";
 import { callPrewarm, operatorModelOf, queuedCall, planBinding, resolveModel } from "./model-request.ts";
 import { userModelsFrom } from "../../src/model/user-models.ts";
+import { modelFallbackFrom } from "../../src/model/model-fallback.ts";
 import { DEFAULT_PROVIDER, providerStatus, type ModelChoice } from "../../src/model/providers.ts";
 import { consumeModelCalls, isUnknownJobReply, replyingUnknownJob, type ModelQueueDeps, type QueuedModelCall, type UnknownJobReply } from "./model-queue.ts";
 import {
@@ -154,6 +155,12 @@ export interface Env {
    * lists no options.
    */
   USER_MODELS?: unknown;
+  /**
+   * A second model for an agent's first turn when its DeepSeek model does not answer in time
+   * (src/model/model-fallback.ts): a JSON object naming a USER_MODELS id. Unset is off; a value that is refused is off
+   * too, with the reason on /admin/models (`modelFallbackError`).
+   */
+  MODEL_FALLBACK?: unknown;
   DEEPSEEK_BASE_URL: string;
   HARNESS_MODEL: string;
   /**
@@ -496,6 +503,8 @@ export class AgentDO extends DurableObject<Env> {
       runJsResumeMs: Number(this.env.RUN_JS_RESUME_MS) || undefined,
       keepAlive: (at) => this.#keepAlive(at),
       operatorModel: operatorModelOf(this.env),
+      // The agents' runtime only: a benchmark arm's agents have no first turn of the kind it serves.
+      modelFallback: modelFallbackFrom(this.env as unknown as Record<string, unknown>, operatorModelOf(this.env).providers).config,
       versionId: this.env.CF_VERSION_METADATA?.id,
       ...operatorCredentials(this.env),
       reminderApp: { origin: this.env.REMINDER_APP_ORIGIN, credential: this.env.REMINDER_APP_CREDENTIAL },
@@ -3986,9 +3995,11 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
       }
       const providers = operatorModelOf(env).providers;
       const userModels = userModelsFrom(env as unknown as Record<string, unknown>, providers);
+      const fallback = modelFallbackFrom(env as unknown as Record<string, unknown>, providers);
       return adminModels(request.method, body, v!.sub ?? v!.email, {
         overrides: d1ModelOverrides(env.CONTROL_DB), providers, defaults: { model: env.HARNESS_MODEL }, now: Date.now,
         userModelsError: userModels.error, options: userModels.offered,
+        modelFallback: fallback.config, modelFallbackError: fallback.error,
       });
     }
     if (url.pathname === "/admin/spend-limits") {
