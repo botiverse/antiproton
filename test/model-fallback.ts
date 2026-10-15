@@ -624,6 +624,15 @@ await check("a cancel stops a scheduled re-dispatch: nothing is re-sent at +2 mi
   must(show(tail) === show(["BridgeFatal:model_busy: primary and fallback model both unavailable; retrying in 2 min", "Stop"]), `activity: ${show(activity(w))}`);
 });
 
+await check("retryTurn re-runs only the busy answer at the tip: any other job id is 'moved', and nothing is sent", async () => {
+  const w = await busyAgent();
+  const agent = await w.rt().agent(T, A);
+  must(await agent.retryTurn!("mj_not_the_busy_one") === "moved" && jobCount(w) === 1, `jobs: ${jobCount(w)}`);
+  // The control: the busy job's own id starts the turn again.
+  const busyJob = w.jobs[0]!;
+  must(await agent.retryTurn!(busyJob) === "started", "the busy job's id did not start a run");
+});
+
 await check("a deleted agent is never re-dispatched: DELETE drops the schedule, and the object asks the registry too", async () => {
   const w = await busyAgent();
   const due = Number(busyRow(w).due_at);
