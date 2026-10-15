@@ -11,7 +11,7 @@
  * (POST /provision/agents, src/runtime/prewarm.ts) whose binding is the operator's DeepSeek model is marked by its
  * object (`AgentRuntime.takeJob`, cf/src/runtime.ts). The queue consumer calls the primary under `primaryS`; on a
  * 5xx or 429 (after the client's own in-call retries, which the same limit bounds), a transport failure, or the
- * limit, it calls the fallback once with what is left of the budget, capped at `fallbackS` (`callQueuedModel`,
+ * limit, it calls the fallback once, for at most `fallbackS` (`callQueuedModel`,
  * cf/src/model-request.ts). A refusal of the request itself (400, 401, 403, 404, 422: `ModelRequestRefused`) is the
  * same request on any model and is never sent to the fallback. The agent's binding, its lock and the owner's picker
  * are untouched: the next call starts at the primary again.
@@ -24,10 +24,11 @@
  *
  * Configuration is MODEL_FALLBACK, a JSON object; absent or empty is off:
  *
- *   {"to":"gpt-5.6-luna","scope":"firstTurn","primaryS":60,"retryAfterS":[120,300]}
+ *   {"to":"gpt-5.6-luna","scope":"firstTurn","primaryS":60,"fallbackS":50,"retryAfterS":[120,300]}
  *
  * `to` is an id of USER_MODELS (src/model/user-models.ts) that is offered now, so the fallback names a provider and a
- * model the deployment already declares and can call; `fallbackS` (default 300) caps the fallback's own call. A
+ * model the deployment already declares and can call; `fallbackS` (default 50) caps the fallback's own call, and the two
+ * together are at most FALLBACK_TOTAL_MAX_S, 110 s. A
  * declaration that is refused is off, and the reason is kept for the admin (`/admin/models`, `modelFallbackError`), as
  * USER_MODELS keeps its own: a wrong value must not stop the Worker opening, and must not half-enable the path. It is
  * deployment configuration and never part of the provision payload, which a re-POST must repeat exactly.
@@ -35,7 +36,7 @@
 import { isDeepSeekModel } from "./chat-request-shape.ts";
 import type { ModelProviders } from "./providers.ts";
 import { userModelsFrom } from "./user-models.ts";
-import { ModelCallTimedOut, ModelHttpError, ModelRequestRefused } from "./openai-compatible.ts";
+import { MODEL_CALL_DEADLINE_MS, ModelCallTimedOut, ModelHttpError, ModelRequestRefused } from "./openai-compatible.ts";
 
 /** The one scope there is. Named in the config so a later scope is a new value, not a changed meaning. */
 export type FallbackScope = "firstTurn";
@@ -54,12 +55,20 @@ export interface ModelFallback {
   retryAfterMs: number[];
 }
 
-/** Defaults for the optional fields. */
-export const FALLBACK_DEFAULT_S = 300;
+/**
+ * The most the primary and the fallback may take together, in seconds. Below pi085's REDELIVERY_MS (120 s,
+ * src/runtime/pi-agent.ts): a job dispatched longer ago than that with no answer is sent to the queue again
+ * (`PiAgent.dispatchPending`), and its take does not refuse a second consumer, so a call still running past it is
+ * made a second time, at both providers, and paid twice. Ten seconds are left for the take, the delivery and a
+ * pass's lateness. test/model-fallback.ts holds the two numbers together.
+ */
+export const FALLBACK_TOTAL_MAX_S = 110;
+/** The fallback's own limit when the config names none: what is left of FALLBACK_TOTAL_MAX_S after a 60 s primary. */
+export const FALLBACK_DEFAULT_S = 50;
 
 const FIELDS = ["to", "scope", "primaryS", "fallbackS", "retryAfterS"];
-/** Whole seconds, at least 1, at most the queue consumer's 15-minute wall time: anything longer could never run. */
-const seconds = (v: unknown) => Number.isSafeInteger(v) && (v as number) >= 1 && (v as number) <= 900;
+/** Whole seconds, at least 1, at most the two limits' joint bound. */
+const seconds = (v: unknown) => Number.isSafeInteger(v) && (v as number) >= 1 && (v as number) <= FALLBACK_TOTAL_MAX_S;
 
 /**
  * Check a MODEL_FALLBACK value (JSON text, or the object wrangler hands over) against the deployment's offered owner
@@ -81,11 +90,15 @@ export function parseModelFallback(raw: unknown, offered: ReadonlyArray<{ id: st
   if (!option) throw new Error(`MODEL_FALLBACK.to ${o.to} is not a USER_MODELS option offered now (declared, with its provider's secret set)`);
   // The primary is a DeepSeek model (the scope's binding); a fallback that is one too would fail with it.
   if (isDeepSeekModel(option.model)) throw new Error(`MODEL_FALLBACK.to ${o.to} is a DeepSeek model, the primary it is meant to stand in for`);
-  if (!seconds(o.primaryS)) throw new Error("MODEL_FALLBACK.primaryS is whole seconds from 1 to 900");
-  if (o.fallbackS !== undefined && !seconds(o.fallbackS)) throw new Error("MODEL_FALLBACK.fallbackS is whole seconds from 1 to 900");
+  if (!seconds(o.primaryS)) throw new Error(`MODEL_FALLBACK.primaryS is whole seconds from 1 to ${FALLBACK_TOTAL_MAX_S}`);
+  if (o.fallbackS !== undefined && !seconds(o.fallbackS)) throw new Error(`MODEL_FALLBACK.fallbackS is whole seconds from 1 to ${FALLBACK_TOTAL_MAX_S}`);
   const fallbackS = (o.fallbackS as number | undefined) ?? FALLBACK_DEFAULT_S;
-  // Both calls run in one queue invocation, under its 15-minute wall time, with the take and the delivery around them.
-  if ((o.primaryS as number) + fallbackS > 840) throw new Error("MODEL_FALLBACK.primaryS and fallbackS add up to more than 840 s, past what one queue invocation may take");
+  // Both calls run in one queue invocation, and must end before the job is sent again (FALLBACK_TOTAL_MAX_S) and
+  // inside the call's own deadline.
+  const total = (o.primaryS as number) + fallbackS;
+  if (total > FALLBACK_TOTAL_MAX_S || total * 1000 > MODEL_CALL_DEADLINE_MS) {
+    throw new Error(`MODEL_FALLBACK.primaryS and fallbackS (default ${FALLBACK_DEFAULT_S}) add up to ${total} s, more than ${FALLBACK_TOTAL_MAX_S} s: past it the job is sent to the queue again while it is still being called`);
+  }
   if (!Array.isArray(o.retryAfterS) || o.retryAfterS.length > 10 || !o.retryAfterS.every((s) => Number.isSafeInteger(s) && s >= 1 && s <= 86_400)) {
     throw new Error("MODEL_FALLBACK.retryAfterS is a list of at most 10 delays, whole seconds from 1 to 86400");
   }

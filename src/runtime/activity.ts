@@ -19,6 +19,8 @@
  *                                                  model answered, says so and why)
  *   model.call toolUse      → nothing             (still working)
  *   session.needs_reset set → BridgeFatal         (the overflow backstop gave up: pushes are refused until a reset)
+ *   model.retry refused     → BridgeFatal         (a busy first turn's re-dispatch could not start: model_unavailable)
+ *   model.retry cancelled   → Stop                (a busy first turn's scheduled re-dispatch was cancelled)
  *   agent.ready             → nothing             (its `online` is a status-only event, src/runtime/status.ts)
  *
  * The event id is the row's seq under the agent: unique for the agent's
@@ -121,6 +123,13 @@ function hookEvents(agentId: string, rows: readonly TraceOutboxRow[]): ActivityE
         break;
       case "session.needs_reset":
         if (row.status === "set") out.push({ ...base, hookEventName: "BridgeFatal", errorClass: NEEDS_RESET_ERROR });
+        break;
+      // A busy first turn's re-dispatch that will never come (src/runtime/busy-retry.ts): given up, with its
+      // `model_unavailable` sentence, or cancelled, which ends the turn like a cancelled call does.
+      case "model.retry":
+        if (row.status === "refused" && typeof row.attrs.busy === "string" && row.attrs.busy) {
+          out.push({ ...base, hookEventName: "BridgeFatal", errorClass: row.attrs.busy.slice(0, 120) });
+        } else if (row.status === "cancelled") out.push({ ...base, hookEventName: "Stop" });
         break;
       default:
         break;

@@ -18,10 +18,12 @@
  * acted on — so a turn is never run twice. Once re-dispatched, the row says so, and a second pass finds nothing due.
  *
  * Counting: a busy answer to a run this module started continues the count (`redispatched`); any other — the
- * first, or one after a person's message started a new run — starts it at one. After `retryAfterMs.length`
+ * first, or one after a person's message — starts it at one: a message posted to the main conversation, or a cancel
+ * of it, ends the series (`endBusyRetry`), whether a re-dispatch was still scheduled or had already run. After `retryAfterMs.length`
  * re-dispatches the next busy answer gives up (`gave_up`), and the turn stays failed until the person writes again.
  */
 import { busyGivenUp, busyRetrying } from "../model/model-fallback.ts";
+import type { TraceRow } from "../trace/outbox.ts";
 
 type Sql = { exec(query: string, ...bindings: unknown[]): { toArray(): any[] } };
 
@@ -29,7 +31,7 @@ const TABLE = `CREATE TABLE IF NOT EXISTS model_busy_retry (
   tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL, job_id TEXT NOT NULL, attempts INTEGER NOT NULL, state TEXT NOT NULL,
   due_at INTEGER, updated_at INTEGER NOT NULL, PRIMARY KEY (tenant_id, agent_id))`;
 
-export type BusyState = "scheduled" | "redispatched" | "superseded" | "gave_up";
+export type BusyState = "scheduled" | "redispatched" | "superseded" | "cancelled" | "gave_up";
 export interface BusyRetryRow { jobId: string; attempts: number; state: BusyState; dueAt: number | null }
 
 export function readBusyRetry(sql: Sql, tenantId: string, agentId: string): BusyRetryRow | null {
@@ -64,10 +66,46 @@ export function busyRetryScheduled(sql: Sql, tenantId: string, agentId: string):
   return r && r.state === "scheduled" && r.dueAt !== null ? { jobId: r.jobId, dueAt: r.dueAt, attempts: r.attempts } : null;
 }
 
+/**
+ * The series ends without a re-dispatch of its own: a person's message carries the turn (`superseded`), or a cancel
+ * stops it (`cancelled`). A scheduled re-dispatch is not made, and a run this module started no longer continues the
+ * count. Returns the row's state before, so the caller knows whether a scheduled retry was stopped.
+ */
+export function endBusyRetry(sql: Sql, tenantId: string, agentId: string, state: "superseded" | "cancelled", now: number): BusyState | null {
+  const r = readBusyRetry(sql, tenantId, agentId);
+  if (!r || (r.state !== "scheduled" && r.state !== "redispatched")) return r?.state ?? null;
+  sql.exec("UPDATE model_busy_retry SET state=?, due_at=NULL, updated_at=? WHERE tenant_id=? AND agent_id=?", state, now, tenantId, agentId);
+  return r.state;
+}
+
+/** The agent is deleted: nothing of the schedule is kept, and nothing can re-dispatch. */
+export function clearBusyRetry(sql: Sql, tenantId: string, agentId: string): boolean {
+  if (!readBusyRetry(sql, tenantId, agentId)) return false;
+  sql.exec("DELETE FROM model_busy_retry WHERE tenant_id=? AND agent_id=?", tenantId, agentId);
+  return true;
+}
+
 /** The scheduled retry of `jobId` ended: re-dispatched, or superseded by a newer run. Only from `scheduled`, once. */
-export function settleBusyRetry(sql: Sql, tenantId: string, agentId: string, jobId: string, state: "redispatched" | "superseded", now: number): boolean {
+export function settleBusyRetry(sql: Sql, tenantId: string, agentId: string, jobId: string, state: "redispatched" | "superseded" | "gave_up", now: number): boolean {
   if (busyRetryScheduled(sql, tenantId, agentId)?.jobId !== jobId) return false;
   sql.exec("UPDATE model_busy_retry SET state=?, due_at=NULL, updated_at=? WHERE tenant_id=? AND agent_id=? AND state='scheduled' AND job_id=?",
     state, now, tenantId, agentId, jobId);
   return true;
+}
+
+/**
+ * The `model.retry` trace row for a scheduled re-dispatch that has ended, spanned by the busy job it retried:
+ * `started` (re-dispatched), `moved` (a newer run carried the turn), `refused` (given up: `busy` carries the
+ * `model_unavailable` sentence, which Raft is shown, src/runtime/activity.ts) or `cancelled` (Raft is shown the turn's
+ * stop). `ms` is how late the pass was against the schedule.
+ */
+export function busyRetryRow(r: {
+  tenantId: string; agentId: string; jobId: string; outcome: "started" | "moved" | "refused" | "cancelled"; attempt: number; at: number;
+  lateMs?: number; sentence?: string | null;
+}): TraceRow {
+  return {
+    at: r.at, tenantId: r.tenantId, agentId: r.agentId, kind: "model.retry", spanId: r.jobId, status: r.outcome,
+    verdict: r.outcome === "refused" ? "failed" : r.outcome === "cancelled" ? "cancelled" : "ok",
+    attrs: { attempt: r.attempt, ...(r.sentence ? { busy: r.sentence } : {}), ...(r.lateMs !== undefined ? { lateMs: r.lateMs } : {}) },
+  };
 }

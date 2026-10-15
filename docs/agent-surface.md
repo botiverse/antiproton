@@ -1034,7 +1034,7 @@ answer with `/admin/transcript`'s for the same agent).
 
 `GET …/trace` answers the agent's trace rows — the spans of its work, one row each when it ended
 (`model.call`, `tool.call`, `approval.wait`, `container.lease`, `inbound`, `mount.seeded`,
-`rebuild.decision`, `rebuild.outcome`, `rebuild.behaviour`, `turn.timing`, `import.hold`, `model.prewarm`, `agent.ready`; `src/trace/outbox.ts`) — with `from <= at < to`, in `seq` order.
+`rebuild.decision`, `rebuild.outcome`, `rebuild.behaviour`, `turn.timing`, `import.hold`, `model.prewarm`, `agent.ready`, `model.retry`; `src/trace/outbox.ts`) — with `from <= at < to`, in `seq` order.
 
 - `from`, `to` — ISO 8601 or milliseconds since the epoch; the window is at most 24 hours. One alone
   puts the other 24 hours away; neither is the 24 hours up to now. `to` before or at `from`, a wider

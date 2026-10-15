@@ -28,7 +28,7 @@ import {
 import { logEvent } from "../../src/core/log.ts";
 import { busyGivenUp, fallbackPrimary, isModelBusy, type JobFallback, type ModelFallback } from "../../src/model/model-fallback.ts";
 import type { AnsweredMessage } from "../../src/model/pi-bridge.ts";
-import { busyRetryScheduled, noteBusy, settleBusyRetry } from "../../src/runtime/busy-retry.ts";
+import { busyRetryRow, busyRetryScheduled, clearBusyRetry, endBusyRetry, noteBusy, readBusyRetry, settleBusyRetry } from "../../src/runtime/busy-retry.ts";
 import { appendTrace } from "../../src/trace/outbox.ts";
 import { markHarnessDrop, recordHarnessOpen, type HarnessDropReason } from "../../src/runtime/harness-open.ts";
 import { currentMainId, mainSessions, modelInputCalls, readModelInput, recordModelInput, startFreshMain, type MainSessionRow, type ModelInputEvidence } from "./fresh-context.ts";
@@ -657,6 +657,11 @@ export interface RuntimeDeps {
    * (`step`, src/runtime/busy-retry.ts).
    */
   modelFallback?: ModelFallback | null;
+  /**
+   * Whether the agent's provider has deleted it (the provisioning registry, `provisioned_agents.status`), asked before a
+   * busy first turn is re-dispatched (`#busyRetry`). Absent: nothing is asked, as for an agent no provider made.
+   */
+  agentGone?: (owner: { tenantId: string; agentId: string }) => Promise<boolean>;
   /** The Worker version this runtime runs (the version metadata binding's id), which tells a `harness.open` after a
    *  deploy from one after an eviction (src/runtime/harness-open.ts). Absent, a cold start's cause is `unknown`. */
   versionId?: string;
@@ -3596,9 +3601,15 @@ export class AgentRuntime {
 
   /**
    * The scheduled re-dispatch of a busy first turn (src/runtime/busy-retry.ts), asked on an idle main conversation:
-   * not due yet is a wake; due, the engine runs the turn again (`AgentEngine.retryTurn`) and this steps it, unless a
-   * newer run has carried the turn on, which supersedes it. Either way the row leaves `scheduled`, so a second pass, or
-   * a second alarm after an eviction, finds nothing to do.
+   * not due yet is a wake; due, the engine runs the turn again (`AgentEngine.retryTurn`) and this steps it. The row
+   * leaves `scheduled` whatever happens, so a second pass, or a second alarm after an eviction, finds nothing to do.
+   *
+   * - An agent its provider has deleted is never re-dispatched (its calls would be paid for nobody): the row is cleared.
+   *   The registry is asked here as well as the delete clearing the row (`stopBusyRetry`), since that RPC can fail
+   *   after the registry row is written. A registry that cannot be read is asked again in a minute, not guessed.
+   * - `moved`: a newer run carried the turn on, and its own activity follows; nothing is said.
+   * - `refused`: the engine would not start it. Nothing will ever retry it, so it is given up, and a `model.retry` row
+   *   says so with the `model_unavailable` sentence, or Raft would be left on "retrying in N min" for ever.
    */
   async #busyRetry(tenantId: string, agentId: string, agent: AgentEngine): Promise<{ out?: StepOutcome; wakeInMs: number | null }> {
     const sql = this.#deps.ctx.storage.sql;
@@ -3606,11 +3617,54 @@ export class AgentRuntime {
     if (!due) return { wakeInMs: null };
     const now = Date.now();
     if (due.dueAt > now) return { wakeInMs: due.dueAt - now };
+    if (this.#deps.agentGone) {
+      let gone: boolean;
+      try { gone = await this.#deps.agentGone({ tenantId, agentId }); }
+      catch (e) {
+        logEvent("model_job.busy_retry", { tenantId, agentId, jobId: due.jobId, attempt: due.attempts, outcome: "registry_unreadable", error: String((e as Error)?.message ?? e).slice(0, 200) });
+        return { wakeInMs: 60_000 };
+      }
+      if (gone) {
+        this.#transact()(() => clearBusyRetry(sql, tenantId, agentId));
+        logEvent("model_job.busy_retry", { tenantId, agentId, jobId: due.jobId, attempt: due.attempts, outcome: "deleted" });
+        return { wakeInMs: null };
+      }
+    }
     const outcome = agent.retryTurn ? await agent.retryTurn(due.jobId) : "refused";
-    this.#transact()(() => settleBusyRetry(sql, tenantId, agentId, due.jobId, outcome === "started" ? "redispatched" : "superseded", Date.now()));
+    const at = Date.now();
+    const state = outcome === "started" ? "redispatched" : outcome === "moved" ? "superseded" : "gave_up";
+    const sentence = outcome === "refused" ? busyGivenUp(due.attempts) : null;
+    this.#transact()(() => {
+      if (!settleBusyRetry(sql, tenantId, agentId, due.jobId, state, at)) return;
+      appendTrace(sql, [busyRetryRow({ tenantId, agentId, jobId: due.jobId, outcome, attempt: due.attempts, at, lateMs: now - due.dueAt, sentence })]);
+    });
     logEvent("model_job.busy_retry", { tenantId, agentId, jobId: due.jobId, attempt: due.attempts, outcome, lateMs: now - due.dueAt });
     if (outcome !== "started") return { wakeInMs: null };
     return { out: await agent.step(), wakeInMs: null };
+  }
+
+  /**
+   * End a busy first turn's retry series without a re-dispatch (src/runtime/busy-retry.ts `endBusyRetry`): a message
+   * carried the turn on, or a cancel stopped it. A cancel that stops a scheduled re-dispatch says so in a `model.retry`
+   * row, which Raft sees as the turn's stop, so it is not left on "retrying in N min".
+   */
+  #endBusyRetry(tenantId: string, agentId: string, how: "superseded" | "cancelled") {
+    const sql = this.#deps.ctx.storage.sql;
+    const at = Date.now();
+    this.#transact()(() => {
+      const r = readBusyRetry(sql, tenantId, agentId);
+      const was = endBusyRetry(sql, tenantId, agentId, how, at);
+      if (how === "cancelled" && was === "scheduled" && r) {
+        appendTrace(sql, [busyRetryRow({ tenantId, agentId, jobId: r.jobId, outcome: "cancelled", attempt: r.attempts, at })]);
+      }
+    });
+  }
+
+  /** The agent's provider deleted it (DELETE /provision/agents/…): its busy first turn is not re-dispatched. */
+  async stopBusyRetry(tenantId: string, agentId: string): Promise<boolean> {
+    await this.ready();
+    const sql = this.#deps.ctx.storage.sql;
+    return this.#transact()(() => clearBusyRetry(sql, tenantId, agentId));
   }
 
   /** A turn of the main conversation was cancelled: an agent made with `firstTurn` has had its first. */
@@ -3872,6 +3926,9 @@ export class AgentRuntime {
     const backstop = session === MAIN_SESSION && !this.#isPd();
     const stuck = backstop ? needsReset(this.#deps.ctx.storage.sql, await this.#judge(tenantId, agentId)) : null;
     if (stuck) throw new SessionNeedsReset(stuck.reason);
+    // A message in the main conversation carries a busy first turn on itself: no scheduled re-dispatch of it is made,
+    // and a busy answer to the run it joins or starts counts from one again (src/runtime/busy-retry.ts).
+    if (backstop) this.#endBusyRetry(tenantId, agentId, "superseded");
     sealedBy(tenantId, agentId, await this.store.seal(tenantId, agentId, "first-turn"));
     // Every turn starts here, in every mode — a steer is how a console message arrives, and pushes, background
     // completions and lease warnings are prompts — so the catalogue is reconciled here, before the harness is
@@ -4075,6 +4132,8 @@ export class AgentRuntime {
         else discardTurn(sql, session);
       });
     }
+    // A busy first turn waiting for its re-dispatch is the turn being cancelled: the re-dispatch is not made.
+    if (!this.#isPd() && session === MAIN_SESSION) this.#endBusyRetry(tenantId, agentId, "cancelled");
     const jobs = await stopSessionJobs({
       sql, owner: { tenantId, agentId }, session,
       cancel: (job) => this.#gateway.cancelBackground(

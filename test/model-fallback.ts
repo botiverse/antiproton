@@ -111,12 +111,12 @@ const using = (primary: Behaviour, fallback: Behaviour) => { plan.primary = prim
 
 // ---- configuration --------------------------------------------------------------------------------------------------
 
-await check("MODEL_FALLBACK: absent or empty is off; a valid value resolves its USER_MODELS id; fallbackS defaults to 300", () => {
+await check("MODEL_FALLBACK: absent or empty is off; a valid value resolves its USER_MODELS id; fallbackS defaults to 50", () => {
   const providers = providersFrom(BASE_ENV);
   must(show(modelFallbackFrom({ ...BASE_ENV }, providers)) === show({ config: null }), "absent");
   must(show(modelFallbackFrom({ ...BASE_ENV, MODEL_FALLBACK: "" }, providers)) === show({ config: null }), "empty");
   const on = modelFallbackFrom({ ...BASE_ENV, MODEL_FALLBACK: JSON.stringify({ to: "gpt-5.6-luna", scope: "firstTurn", primaryS: 60, retryAfterS: [120, 300] }) }, providers);
-  must(show(on) === show({ config: { to: "gpt-5.6-luna", provider: "cloudflare", model: LUNA, scope: "firstTurn", primaryMs: 60_000, fallbackMs: 300_000, retryAfterMs: [120_000, 300_000] } }), show(on));
+  must(show(on) === show({ config: { to: "gpt-5.6-luna", provider: "cloudflare", model: LUNA, scope: "firstTurn", primaryMs: 60_000, fallbackMs: 50_000, retryAfterMs: [120_000, 300_000] } }), show(on));
 });
 
 await check("MODEL_FALLBACK: every malformed value is refused with its reason, and is off", () => {
@@ -133,8 +133,12 @@ await check("MODEL_FALLBACK: every malformed value is refused with its reason, a
     [{ ...FALLBACK, primaryS: 0 }, /primaryS is whole seconds/],
     [{ ...FALLBACK, primaryS: 1.5 }, /primaryS is whole seconds/],
     [{ ...FALLBACK, primaryS: "60" }, /primaryS is whole seconds/],
-    [{ ...FALLBACK, fallbackS: 901 }, /fallbackS is whole seconds/],
-    [{ ...FALLBACK, primaryS: 600, fallbackS: 300 }, /more than 840 s/],
+    [{ ...FALLBACK, fallbackS: 111 }, /fallbackS is whole seconds from 1 to 110/],
+    [{ ...FALLBACK, primaryS: 111 }, /primaryS is whole seconds from 1 to 110/],
+    // Together past the redelivery bound (FALLBACK_TOTAL_MAX_S): the brief's first example, and one second over.
+    [{ ...FALLBACK, primaryS: 60, fallbackS: 300 }, /fallbackS is whole seconds from 1 to 110/],
+    [{ ...FALLBACK, primaryS: 60, fallbackS: 51 }, /add up to 111 s, more than 110 s/],
+    [{ ...FALLBACK, primaryS: 61, fallbackS: undefined }, /\(default 50\) add up to 111 s/],
     [{ ...FALLBACK, retryAfterS: 120 }, /retryAfterS is a list/],
     [{ ...FALLBACK, retryAfterS: [120, -1] }, /retryAfterS is a list/],
   ];

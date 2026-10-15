@@ -505,6 +505,8 @@ export class AgentDO extends DurableObject<Env> {
       operatorModel: operatorModelOf(this.env),
       // The agents' runtime only: a benchmark arm's agents have no first turn of the kind it serves.
       modelFallback: modelFallbackFrom(this.env as unknown as Record<string, unknown>, operatorModelOf(this.env).providers).config,
+      // Asked before a busy first turn is re-dispatched: an agent its provider deleted is not called for again.
+      agentGone: async ({ tenantId, agentId }) => (await d1ProvisionedAgents(this.env.CONTROL_DB).getByAgentId(tenantId, agentId))?.status === "deleted",
       versionId: this.env.CF_VERSION_METADATA?.id,
       ...operatorCredentials(this.env),
       reminderApp: { origin: this.env.REMINDER_APP_ORIGIN, credential: this.env.REMINDER_APP_CREDENTIAL },
@@ -1996,6 +1998,12 @@ export class AgentDO extends DurableObject<Env> {
   async connectionDetach(tenantId: string, agentId: string, plugin: string) {
     this.#claim(tenantId, agentId);
     return this.#busy("connectionDetach", () => this.runtime().detachConnection(tenantId, agentId, plugin));
+  }
+
+  /** The provider deleted this agent: a busy first turn's scheduled re-dispatch is dropped (src/runtime/busy-retry.ts). */
+  async stopBusyRetry(tenantId: string, agentId: string): Promise<boolean> {
+    this.#claim(tenantId, agentId);
+    return this.#busy("stopBusyRetry", () => this.runtime().stopBusyRetry(tenantId, agentId));
   }
 
   async uiRemoveCredential(tenantId: string, agentId: string, alias: string) {
@@ -3641,6 +3649,7 @@ function provisionDeps(env: Env): ProvisionDeps {
         return r.ok ? { ok: true, account: r.account } : { ok: false, error: r.error };
       },
       removeCredential: async (tenantId, agentId) => (await stub(tenantId, agentId).uiRemoveCredential(tenantId, agentId, PROVISION_MOUNT_ALIAS)).ok,
+      stopBusyRetry: (tenantId, agentId) => stub(tenantId, agentId).stopBusyRetry(tenantId, agentId),
       tool: (tenantId, agentId, name) => stub(tenantId, agentId).provisionTool(tenantId, agentId, name),
       pushStatus: (tenantId, agentId) => stub(tenantId, agentId).provisionPushStatus(tenantId, agentId),
     },

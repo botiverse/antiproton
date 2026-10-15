@@ -11,6 +11,7 @@
  *   model.call stop|length|aborted → online    (the turn is over)
  *   model.call error              → error      (with why, for a daily spend limit's refusal or a busy first turn)
  *   session.needs_reset set       → error      (with why: pushes are refused until a reset)
+ *   model.retry refused|cancelled → error|online (a busy first turn given up, or its re-dispatch cancelled)
  *   agent.ready                   → online     (a provisioned agent ready before its first turn, src/runtime/ready.ts)
  *
  * A row is one ENDED span, so a start is dated back by its measured `ms`. Events
@@ -72,6 +73,10 @@ export function statusEvents(agentId: string, rows: readonly TraceOutboxRow[], b
           const limit = why ? why.slice(0, 200) : null;
           raw.push({ at: row.at, key: id, status: "error", ...(limit ? { detail: limit } : {}) });
         }
+        break;
+      case "model.retry":
+        if (row.status === "refused") raw.push({ at: row.at, key: id, status: "error", ...(typeof row.attrs.busy === "string" && row.attrs.busy ? { detail: row.attrs.busy.slice(0, 200) } : {}) });
+        else if (row.status === "cancelled") raw.push({ at: row.at, key: id, status: "online" });
         break;
       case "session.needs_reset":
         if (row.status === "set") raw.push({ at: row.at, key: id, status: "error", detail: "Conversation too long for the model; waiting for an operator reset" });
