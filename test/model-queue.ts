@@ -6,7 +6,6 @@
  * before. The runtime is the real one over sqlite; the stub stands in for the object's RPC methods
  * with the same translation the object uses (`replyingUnknownJob`).
  */
-import { MODEL_BUSY_ERROR } from "../src/model/model-fallback.ts";
 import { AgentRuntime } from "../cf/src/runtime.ts";
 import { adoptProvisionedAgent } from "../cf/src/provision/steps.ts";
 import {
@@ -294,31 +293,6 @@ await check("consumer: any other failure is still retried, not acked", async () 
 await check("the reply shape is recognised and nothing else is", async () => {
   must(isUnknownJobReply({ unknownJob: "j" }), "reply not recognised");
   for (const v of [null, false, true, {}, { unknownJob: 1 }, REQUEST]) must(!isUnknownJobReply(v), `misread ${JSON.stringify(v)}`);
-});
-
-await check("a first-turn call neither model answered is delivered as the busy answer and acked, never sent back to the queue", async () => {
-  // Both providers fail: the consumer's own call, with a job its object marked (src/model/model-fallback.ts).
-  const real = globalThis.fetch;
-  let requests = 0;
-  globalThis.fetch = (async () => { requests++; return new Response("{}", { status: 503 }); }) as typeof fetch;
-  const env = { DEEPSEEK_BASE_URL: "https://model.example/v1", DEEPSEEK_API_KEY: "k", HARNESS_MODEL: "deepseek-flash", GW: "g",
-    MODEL_PROVIDERS: [{ id: "deepseek", baseUrl: "https://model.example/v1", auth: { secret: "DEEPSEEK_API_KEY", header: "authorization" } },
-      { id: "cloudflare", baseUrl: "https://gw.example/compat", auth: { secret: "GW", header: "cf-aig-authorization" }, modelFormat: "vendor/model" }] } as any;
-  const delivered: any[] = [];
-  const stub: ModelJobStub = {
-    async takeJob() { return { ...REQUEST, operatorModel: "deepseek-flash", operatorProvider: "deepseek",
-      fallback: { provider: "cloudflare", model: "openai/gpt-5.6-luna", primaryMs: 5_000, fallbackMs: 5_000 } }; },
-    async releaseJob() { return true; },
-    async deliverAnswer(_t, _a, _j, answer) { delivered.push(answer); return true; },
-  };
-  const { msg, m } = message("job-busy");
-  try {
-    await consumeModelCalls({ queue: "model-calls", messages: [msg] }, { ...deps(stub, []), call: (job, q) => callQueuedModel(env, job, q.jobId) });
-  } finally { globalThis.fetch = real; }
-  must(m.acked === 1 && m.retried === 0, JSON.stringify(m));
-  must(delivered.length === 1 && delivered[0].errorMessage === MODEL_BUSY_ERROR && delivered[0].jobId === "job-busy", JSON.stringify(delivered));
-  // Three attempts at each: each client's own in-call retries, and the fallback once.
-  must(requests === 6, `${requests} provider requests`);
 });
 
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.error ? `\n    ${r.error}` : ""}`);

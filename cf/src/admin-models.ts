@@ -12,7 +12,6 @@
  * provider's name for it. No key is involved here, and none is listed: a provider says only whether its
  * secrets are set.
  */
-import type { ModelFallback } from "../../src/model/model-fallback.ts";
 import type { ModelOverrides } from "./control-plane.ts";
 import { DEFAULT_PROVIDER, modelProblem, providerStatus, type ModelProviders } from "../../src/model/providers.ts";
 import type { UserModel } from "../../src/model/user-models.ts";
@@ -35,10 +34,6 @@ export interface AdminModelsDeps {
    * against the one its usage was counted under this way.
    */
   options?: UserModel[];
-  /** MODEL_FALLBACK as it is in force (src/model/model-fallback.ts): null when off. */
-  modelFallback?: ModelFallback | null;
-  /** Why MODEL_FALLBACK was refused, when it was: a refused declaration is off, which nothing else would show. */
-  modelFallbackError?: string;
   now(): number;
 }
 
@@ -53,8 +48,6 @@ export async function adminModels(method: string, body: unknown, actor: string, 
       options: (deps.options ?? []).map(({ id, label, provider, model }) => ({ id, label, provider, model })),
       ...(deps.providers.error ? { providersError: deps.providers.error } : {}),
       ...(deps.userModelsError ? { userModelsError: deps.userModelsError } : {}),
-      ...(deps.modelFallback ? { modelFallback: deps.modelFallback } : {}),
-      ...(deps.modelFallbackError ? { modelFallbackError: deps.modelFallbackError } : {}),
       // A row from before providers existed is shown as what serves it.
       overrides: (await deps.overrides.list()).map((o) => ({ ...o, provider: o.provider ?? DEFAULT_PROVIDER })),
     }, { headers: { "cache-control": "no-store" } });

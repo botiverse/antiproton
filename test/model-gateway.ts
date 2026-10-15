@@ -201,25 +201,6 @@ await check("a `provider/model` name is sized by the model's own window", () => 
   must(contextWindowFor("deepseek/deepseek-flash") === contextWindowFor("deepseek-flash") && contextWindowFor("deepseek-flash") === 1_000_000, "prefix");
 });
 
-await check("a first-turn fallback goes through the gateway's Responses endpoint with its token, and DeepSeek's key never leaves for it", async () => {
-  const seen: Array<{ url: string; headers: Record<string, string>; body: any }> = [];
-  const real = globalThis.fetch;
-  globalThis.fetch = (async (url: any, init?: any) => {
-    seen.push({ url: String(url), headers: Object.fromEntries(new Headers(init?.headers ?? {}).entries()), body: JSON.parse(init.body) });
-    if (String(url).startsWith("https://api.deepseek.com/")) return new Response("{}", { status: 503 });
-    return Response.json({ status: "completed", output: [{ type: "message", content: [{ type: "output_text", text: "ok" }] }], usage: { input_tokens: 5, output_tokens: 1 } });
-  }) as any;
-  try {
-    const a: any = await callQueuedModel(ENV as any, { context: { systemPrompt: "s", messages: [{ role: "user", content: "hi", timestamp: 0 }] },
-      operatorModel: "deepseek-flash", operatorProvider: "deepseek",
-      fallback: { provider: "cloudflare", model: "openai/gpt-5.6-luna", primaryMs: 5_000, fallbackMs: 5_000 } }, "mj_g");
-    must(a.model === "openai/gpt-5.6-luna" && a.stopReason === "stop", JSON.stringify(a));
-  } finally { globalThis.fetch = real; }
-  const gw = seen.filter((s) => s.url.startsWith(GW));
-  must(gw.length === 1 && gw[0]!.url === `${GW}/responses` && gw[0]!.body.model === "openai/gpt-5.6-luna", JSON.stringify(gw.map((s) => s.url)));
-  must(gw[0]!.headers["cf-aig-authorization"] === "Bearer gt" && !("authorization" in gw[0]!.headers), `headers: ${JSON.stringify(gw[0]!.headers)}`);
-});
-
 for (const r of results) console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);
 const passed = results.filter((r) => r.ok).length;
 console.log(`  ${"─".repeat(56)}\n  ${passed} passed, ${results.length - passed} failed\n`);

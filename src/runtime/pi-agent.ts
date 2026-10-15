@@ -601,41 +601,6 @@ export class PiAgent implements AgentEngine {
     });
   }
 
-  /**
-   * The busy turn again (`AgentEngine.retryTurn`). pi starts a run only with a message to append (an empty prompt is
-   * refused, "Acceptance must append at least one message"), so the run is made the way a paused turn is resumed
-   * (src/runtime/client-calls.ts `resumeClientCalls`): the branch moves back to the entry before the messages that led
-   * to the busy call — the person's message, or the tool results of the turn's previous call — and those same messages
-   * are accepted again from there. The new run's first request is the busy call's own conversation, without the busy
-   * answer, which stays in the transcript on the branch left behind. Nothing that already ran is run again: tool
-   * results are carried, not re-executed.
-   */
-  async retryTurn(jobId: string): Promise<"started" | "moved" | "refused"> {
-    const info = await this.#lane.inspectExecution(CTX);
-    if (info.current || !info.tipId) return "moved";
-    const path = await this.#storage.scanBranch({ start: info.tipId, order: "oldestFirst" }, CTX) as any[];
-    const last = path[path.length - 1];
-    if (last?.type !== "message" || last.message?.role !== "assistant" || last.message?.jobId !== jobId) return "moved";
-    let i = path.length - 2;
-    // The busy call's own placeholders (a deferred handle, a pending poll: src/trace/seams.ts `answerEnded`) sit
-    // between it and the messages that led to it; they belong to the call being replaced.
-    const placeholder = (e: any) => e?.type === "message" && e.message?.role === "assistant"
-      && (e.message?.stopReason === "deferred" || e.message?.stopReason === "pending");
-    while (i >= 0 && placeholder(path[i])) i -= 1;
-    const again: any[] = [];
-    while (i >= 0 && path[i]?.type === "message" && (path[i].message?.role === "user" || path[i].message?.role === "toolResult")) {
-      again.unshift(path[i].message);
-      i -= 1;
-    }
-    if (!again.length) return "refused";
-    const moved: any = await this.#lane.navigateTree(i >= 0 ? String(path[i].id) : null, { summarize: false }, CTX);
-    if (moved?.ok === false) return "refused";
-    const started: any = await this.#lane.accept({ kind: "prompt", prompt: again }, CTX);
-    if (started?.ok !== false) return "started";
-    // A message queued for the lane is accepted by the navigation's own continuation, and that run is the turn again.
-    return (await this.#lane.inspectExecution(CTX)).current ? "started" : "refused";
-  }
-
   async waitingClientCalls() {
     return pendingClientCalls(this.#sql, this.#opts.session ?? MAIN_SESSION);
   }

@@ -25,7 +25,6 @@
 import type { AssistantMessage, Context as PiContext, Message as PiMessage, Tool as PiTool, Usage } from "@earendil-works/pi-ai";
 import type { ChatContentPart, ModelMessage, ModelResponse, ToolDefinition } from "./types.ts";
 import { IMAGE_REF_PREFIX, NO_VISION_SENTENCE } from "./images.ts";
-import type { FallbackFacts } from "./model-fallback.ts";
 
 /**
  * The job wire format, version 2: a system message keeps its place in the conversation.
@@ -322,11 +321,7 @@ function usageOf(res: ModelResponse): Usage {
  * "the field is still there when it is read back" is said by the type, not
  * only by the test that reads the stored entry.
  */
-export type AnsweredMessage = AssistantMessage & {
-  jobId?: string; providerError?: string;
-  /** How a call that could fall back went (src/model/model-fallback.ts), for its trace row; never sent to a model. */
-  fallback?: FallbackFacts;
-};
+export type AnsweredMessage = AssistantMessage & { jobId?: string; providerError?: string };
 
 /**
  * `jobId` is the trace spine's one durable link from an answer back to the

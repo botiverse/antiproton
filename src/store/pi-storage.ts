@@ -47,7 +47,6 @@ import { appendUsage, modelTokenRows } from "../usage/outbox.ts";
 import { appendTrace } from "../trace/outbox.ts";
 import { answerEnded, modelCallRow } from "../trace/seams.ts";
 import { spendLimitRefusal } from "../model/pi-bridge.ts";
-import { busySentence, fallbackFacts } from "../model/model-fallback.ts";
 import { settleRebuildOutcome } from "../runtime/rebuild.ts";
 
 type Usage = SessionStats["usage"];
@@ -291,8 +290,6 @@ export class PiSqliteStorage implements Storage {
                 prefix: parsedPrefix(prefix),
                 usage: m.usage,
                 limit: spendLimitRefusal(m),
-                busy: busySentence(m),
-                fallback: fallbackFacts(m),
               })]);
               // A rebuild decision waiting for this transcript's next call is measured by it (src/runtime/rebuild.ts). A
               // shadow reading: a failure is logged and never fails the answer it reads. An answer that is a context

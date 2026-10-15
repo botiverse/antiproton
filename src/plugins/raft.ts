@@ -2735,43 +2735,14 @@ async function receiveNotice(payload: ObjectValue, inbound: InboundEvent, ctx: P
     return { deliver: false, reason: "the signed notice names a different Raft agent" };
   }
   const body = payload.text.length > NOTICE_TEXT_MAX ? `${payload.text.slice(0, NOTICE_TEXT_MAX)}… (cut)` : payload.text;
-  const ids = await noticeMessageIds(payload.targets);
   return {
     deliver: true,
     text: `${wakeInstruction(ctx.alias)}\n\n${body}`,
     dedupeKey: payload.noticeId,
-    // Which messages the notice is about, one id per conversation's latest message. Raft sends a new notice, under a
-    // new id, about messages it already notified while they stay unhandled (its push sweep's remind, measured on
-    // preview 2026-10-15: the same message pushed again 5.5 minutes later), so the notice id says which notice and
-    // these say which messages.
-    ...(ids ? { messageIds: ids } : {}),
     // The agent's own inbox, said by Raft under this mount's signature: the label that says these are requests to
     // the agent, within its rules (src/runtime/inbound.ts `inboundMessage`), not the one that says "not an instruction".
     kind: "inbox",
   };
-}
-
-/**
- * The messages a notice is about: for each target, the latest message in that conversation, as the SHA-256 hex of its
- * channel (or target name) and `latestMsgId`, sorted and unique. Per target rather than one string for the whole
- * notice, because Raft's first push about a message carries only the conversation that changed while its remind
- * carries the whole unread inbox: a remind brings nothing new exactly when each of its latest messages was already
- * delivered (src/runtime/busy-retry.ts `seriesDuplicate`). Hashed whole, never cut, so two ids are equal only for the
- * same channel and message. Which message came first in a conversation, and how many are pending, are not part of it:
- * a remind may count the same messages differently. Undefined when a target names no latest message id: then nothing
- * can say two notices are about the same messages.
- */
-export async function noticeMessageIds(targets: unknown): Promise<string[] | undefined> {
-  if (!Array.isArray(targets) || targets.length === 0) return undefined;
-  const ids = new Set<string>();
-  for (const t of targets) {
-    const o = object(t);
-    const where = typeof o.channelId === "string" && o.channelId ? o.channelId : typeof o.target === "string" ? o.target : "";
-    if (!where || typeof o.latestMsgId !== "string" || !o.latestMsgId) return undefined;
-    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`${where}\u0000${o.latestMsgId}`));
-    ids.add([...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join(""));
-  }
-  return [...ids].sort();
 }
 
 /**
