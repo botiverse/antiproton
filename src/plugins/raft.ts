@@ -439,16 +439,16 @@ function isRaftState(value: unknown): value is RaftState {
 
 /**
  * The mount's database as the SDK's state store: a read, and a compare-and-set write in one transaction. `last` is
- * told the size of the record each save is about to write, so a save that then fails can say how large it was.
+ * handed the record each save is about to write, so a save that then fails can say how large it was (`stateBytes`).
  */
-function stateStore(ctx: PluginContext, last: { stateBytes?: number } = {}): RaftStateStore {
+function stateStore(ctx: PluginContext, last: { state?: RaftState } = {}): RaftStateStore {
   return {
     async load() {
       const v = await ctx.db.get(INBOX_STORE, STATE_KEY);
       return isRaftState(v) ? v : null;
     },
     async save(state, { expectedVersion }) {
-      try { last.stateBytes = JSON.stringify(state).length; } catch { delete last.stateBytes; }
+      last.state = state;
       await ctx.db.transaction(INBOX_STORE, "readwrite", (tx) => {
         const cur = tx.get(INBOX_STORE, STATE_KEY);
         const stored = isRaftState(cur) ? cur.version : undefined;
@@ -483,7 +483,7 @@ function stateStore(ctx: PluginContext, last: { stateBytes?: number } = {}): Raf
  * read for the conversation it shows after the receipt.
  */
 function raftFor(ctx: PluginContext, options: { state?: false; response?: (res: Response) => Response; timeoutMs?: number } = {}): Raft {
-  const last: { stateBytes?: number } = {};
+  const last: { state?: RaftState } = {};
   return createRaft({
     serverUrl: baseUrl(ctx).origin, credential: requireCredential(ctx), hints: "tool",
     ...(cardsOn(ctx) ? { conversationCards: true } : {}),
@@ -507,13 +507,23 @@ function raftFor(ctx: PluginContext, options: { state?: false; response?: (res: 
     // the call, and the SDK does not retry it. Kept as a trace row, which is stored with the agent's spans and read
     // through its trace (`raft.state_save_failed`), since the object's console lines may be dropped; and said on
     // the console too, where an operator watching the log would look.
-    onStateSaveError: (error, { phase }) => stateSaveFailed(ctx, phase, error, phase === "save" ? last.stateBytes : undefined),
+    onStateSaveError: (error, { phase }) => stateSaveFailed(ctx, phase, error, phase === "save" ? stateBytes(last.state) : undefined),
   });
 }
 
 /** Whether this mount asked for conversation cards (`conversationCards`, off by default): only `true` turns them on. */
 function cardsOn(ctx: PluginContext): boolean {
   return ctx.publicConfig.conversationCards === true;
+}
+
+/**
+ * The size of a state record in UTF-8 bytes, the unit of the Durable Object's 2 MB row limit; `JSON.stringify(…).length`
+ * counts UTF-16 code units, which is fewer for any non-ASCII text (a channel name, a card). Measured only when a save
+ * has failed, so a large state costs nothing on the saves that succeed.
+ */
+function stateBytes(state: RaftState | undefined): number | undefined {
+  if (state === undefined) return undefined;
+  try { return new TextEncoder().encode(JSON.stringify(state)).length; } catch { return undefined; }
 }
 
 /** One failed load or save of the SDK's state: a trace row (`PluginContext.trace`) and a console line. */
