@@ -490,20 +490,64 @@ async function raftFixture() {
   const tools = bridgeTools(qualifyMountedTools(raftPlugin.tools.map((t) => ({
     name: t.name, address: `raft.${t.name}`, description: t.summary, parameters: t.parameters, sideEffects: t.sideEffects, idempotency: t.idempotency,
   }))), host, { continuations: reg, scope: "s" }) as any[];
-  return { send: tools.find((t) => t.name === "raft__messages_send"), resume: resumeTool(reg, { scope: "s" }) as any, reg };
+  // Every trace row the store is asked to keep, as written (src/trace/outbox.ts), read here rather than from its table.
+  const traced: any[] = [];
+  const record = store.recordTrace.bind(store);
+  store.recordTrace = async (rows) => { traced.push(...rows); return record(rows); };
+  return { send: tools.find((t) => t.name === "raft__messages_send"), resume: resumeTool(reg, { scope: "s" }) as any, reg, traced, store };
 }
 
-await check("raft: a held send yields send/drop with the newer messages; resume \"send\" sends it once, attesting what was shown", async () => {
+await check("raft: a held send yields send/drop with the SDK's held text; resume \"send\" sends it once, attesting what was shown", async () => {
   const f = await raftFixture();
   const calls = many(HELD(), json(200, { ok: true, state: "sent", messageId: "m-2", messageSeq: 21 }));
   const out = await f.send.execute("c1", { target: "#general", content: "done", idempotencyKey: "k1" });
   const y = body(out);
-  must(y.state === "yielded" && /arrived in #general/.test(y.question) && JSON.stringify(y.answer) === '{"choices":["send","drop"]}', `held: ${JSON.stringify(y)}`);
-  must(y.context?.messages?.[0]?.includes("@tygg: wait, one more thing") && !out.content[0].text.includes('"content":"done"'), `context, and the state kept back: ${out.content[0].text}`);
+  must(y.state === "yielded" && y.question.startsWith("Held — 1 unread message in #general.") && JSON.stringify(y.answer) === '{"choices":["send","drop"]}', `held: ${JSON.stringify(y)}`);
+  must(y.question.includes("@tygg 10:00  wait, one more thing") && y.context?.reason === "unread_messages" && !out.content[0].text.includes('"content":"done"'), `the held text, and the state kept back: ${out.content[0].text}`);
   must(calls.length === 1, "one attempt so far");
   const sent = body(await f.resume.execute("r1", { token: y.token, answer: "send" }));
   const second = JSON.parse(String(calls[1]!.init.body));
   must(sent.state === "sent" && second.seenUpToSeq === 20 && second.idempotencyKey === "k1" && second.content === "done", `sent: ${JSON.stringify({ sent, second })}`);
+});
+
+await check("raft: through the gateway, a hold and its answer are trace rows joined to the call's operation, under the mount's name", async () => {
+  const f = await raftFixture();
+  many(HELD(), json(200, { ok: true, state: "sent", messageId: "m-2", messageSeq: 21 }));
+  const y = body(await f.send.execute("c1", { target: "#general", content: "done", idempotencyKey: "k1" }));
+  await f.resume.execute("r1", { token: y.token, answer: "send" });
+  const held = f.traced.find((r) => r.kind === "raft.held");
+  const answer = f.traced.find((r) => r.kind === "raft.held_answer");
+  // A resume runs under the operation it continues (`PluginContext.operationId`), so both rows join that one operation.
+  const op = held ? await f.store.getOperation("t", held.spanId) : null;
+  must(held && held.tenantId === "t" && held.agentId === "a" && Object.keys(held.attrs)[0] === "mount" && held.attrs.mount === "raft" &&
+    held.attrs.reason === "unread_messages" && op?.tool === "raft.messages_send" && op?.mountAlias === "raft", `the held row: ${JSON.stringify({ traced: f.traced, op })}`);
+  must(answer && answer.status === "send" && answer.attrs.outcome === "sent" && answer.spanId === held.spanId && typeof answer.ms === "number",
+    `the answer row: ${JSON.stringify(f.traced)}`);
+});
+
+await check("a plugin writes only its own trace kinds: a kernel kind through PluginContext.trace is not written", async () => {
+  const store = new SqliteStore(":memory:");
+  await store.init();
+  await store.createAgent("t", "a");
+  await store.addMount({ tenantId: "t", agentId: "a", alias: "p", plugin: "tracer", installationId: "i", connectionId: null, toolVersion: "1.0.0", publicConfig: {}, secretRef: null, policy: null });
+  const tracer: Plugin = {
+    id: "tracer", version: "1.0.0",
+    tools: [{ name: "go", summary: "Write two rows.", parameters: { type: "object", properties: {} }, sideEffects: "read", idempotency: "native" }],
+    async invoke(_t, _a, ctx) {
+      ctx.trace?.({ kind: "tool.call" as any, status: "succeeded", verdict: "ok", attrs: { forged: true } });
+      ctx.trace?.({ kind: "raft.state_save_failed", status: "save", verdict: "failed", attrs: { mount: "not-the-mount", phase: "save" } });
+      return { ok: true };
+    },
+  };
+  const traced: any[] = [];
+  const record = store.recordTrace.bind(store);
+  store.recordTrace = async (rows) => { traced.push(...rows); return record(rows); };
+  const gw = new ToolGateway(store, [tracer], new Set([tracer.id]), { async resolve() { return null; } });
+  const out = await gw.invoke(CTX, "p.go", {}, {}) as any;
+  must(out.status === "succeeded", `the call: ${JSON.stringify(out)}`);
+  const own = traced.filter((r) => r.kind !== "tool.call" || r.attrs?.forged);
+  must(own.length === 1 && own[0].kind === "raft.state_save_failed" && own[0].attrs.mount === "p" && own[0].spanId === out.operationId,
+    `the plugin's rows: ${JSON.stringify(traced)}`);
 });
 
 await check("raft: resume \"drop\" sends nothing, and an answer outside send/drop is refused with the same token", async () => {

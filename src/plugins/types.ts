@@ -1,5 +1,6 @@
 import type { Json, MountPolicy, MountRecord } from "../core/types.ts";
 import type { AnswerSpec } from "../core/execution.ts";
+import type { PluginTraceKind, TraceVerdict } from "../trace/outbox.ts";
 
 export interface ToolSchema {
   name: string;
@@ -522,6 +523,29 @@ export interface PluginContext {
    * {@link Plugin.readsOwnerSecrets}; a plugin reads its absence as "none".
    */
   ownerSecret?(name: string): Promise<string | null>;
+  /**
+   * Write one trace row of this plugin's own (src/trace/outbox.ts, `PLUGIN_TRACE_KINDS`): a fact only the plugin
+   * sees, kept with the agent's other spans and exported with them, where a console line from the object can be
+   * dropped. The gateway fills in the time, the agent, the span (this context's operation id, or the mount when it
+   * serves none) and `attrs.mount`; a kind outside the list is not written. Never throws and never fails the call: a
+   * row that cannot be written is lost, as a log line would be.
+   *
+   * Set by the gateway on the contexts it builds for one of the agent's mounts (`#contextFor`), when its store
+   * keeps a trace; absent otherwise (a test double, a context built by hand), which a plugin reads as "not kept".
+   */
+  trace?(row: PluginTraceRow): void;
+}
+
+/** One row a plugin writes through {@link PluginContext.trace}. */
+export interface PluginTraceRow {
+  kind: PluginTraceKind;
+  /** What happened, verbatim, as the row's `status`. */
+  status: string;
+  verdict: TraceVerdict;
+  /** What the row measured, when it measured something. */
+  ms?: number;
+  /** Small JSON-able facts; never a credential, a key or a message body. */
+  attrs: Record<string, unknown>;
 }
 
 /**
