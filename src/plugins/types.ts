@@ -892,6 +892,16 @@ export interface ConfigField {
    * `headerLinesProblem`, which the plugin reads the value through too.
    */
   format?: "origin" | "header-lines";
+  /**
+   * An operator may change this on a mount that already exists
+   * (`PATCH /admin/mounts`), which keeps the mount's credential, installation
+   * and stored state. For a setting that changes how the mount behaves, never
+   * for one that says what it is connected to (raft's `serverUrl`): moving
+   * that in place would carry the credential and the state to another server.
+   * A setting so marked is also not a conflict when the mount is asked for
+   * again without it (`repeatsMount` in src/runtime/mount-config.ts).
+   */
+  changeable?: true;
 }
 
 /**

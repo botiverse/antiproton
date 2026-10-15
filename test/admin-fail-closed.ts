@@ -62,6 +62,8 @@ const ROUTES: Route[] = [
   { path: "/admin/api-keys", method: "GET", refused: 401, passed: (s) => s === 405 },
   { path: "/admin/hooks", method: "PUT", refused: 401, passed: (s) => s === 405 },
   { path: "/admin/mounts", method: "GET", refused: 401, passed: (s) => s === 405 },
+  // An in-place settings change; with no body its agent is not named, a 400 only a caller past the gate is given.
+  { path: "/admin/mounts", method: "PATCH", refused: 401, passed: (s) => s === 400 },
   { path: "/admin/service-tokens", method: "PATCH", refused: 401, passed: (s) => s === 405 },
   { path: "/admin/provider-tokens", method: "PATCH", refused: 401, passed: (s) => s === 405 },
   { path: "/admin/usage-costs", method: "GET", refused: 401, passed: (s, c) => s === 200 && c.includes("db.all") },
@@ -81,7 +83,7 @@ async function hit(r: Route, token: string | undefined, presented: string | null
 }
 
 for (const r of ROUTES) {
-  const name = r.path.split("?")[0];
+  const name = `${r.method} ${r.path.split("?")[0]}`;
   await check(`${name}: AUTOMATION_TOKEN unset refuses every caller`, async () => {
     for (const presented of [null, "", "anything", "undefined"]) {
       const out = await hit(r, undefined, presented);

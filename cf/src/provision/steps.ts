@@ -122,6 +122,9 @@ export async function adoptProvisionedAgent(
   } else await rt.provision(tenantId, agentId);
   // The raft plugin is not seeded for every agent; this agent has chosen it, the way a person would in the console.
   await rt.store.setPluginChoice(tenantId, agentId, "raft", "enable");
+  // Every PATCH and import re-adopts with `serverUrl` alone. A mount at that origin whose other settings an operator
+  // changed (`conversationCards`, through `PATCH /admin/mounts`) is a repeat and keeps them (`repeatsMount`); only
+  // another origin is a different mount.
   const mount = await rt.addMount(tenantId, agentId, { alias: PROVISION_MOUNT_ALIAS, plugin: "raft", config: { serverUrl: spec.raftOrigin } });
   if (!mount.ok) return mount;
   return { ok: true, avatar, ...(plan.refused ? { modelRefused: plan.refused } : {}) };

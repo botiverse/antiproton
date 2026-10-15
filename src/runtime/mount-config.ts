@@ -19,6 +19,13 @@
 import { headerLinesProblem, originProblem, type ConfigField, type Plugin } from "../plugins/types.ts";
 import type { Json } from "../core/types.ts";
 
+/**
+ * One setting's value, of a declared `ConfigField["type"]`. Narrower than `Json` on purpose: a result that carries
+ * settings across a Durable Object stub (`PATCH /admin/mounts`) has to be a type the RPC layer can serialize, and the
+ * recursive `Json` is not one to it, which drops that variant of the result from the stub's type.
+ */
+export type SettingValue = string | number | boolean | string[] | null;
+
 export interface MountProblem {
   key?: string;
   message: string;
@@ -208,4 +215,66 @@ export function configFromForm(
     }
   }
   return { ok: true, config };
+}
+
+/**
+ * Whether adding `asked` repeats the mount stored as `have`: every setting it
+ * names is stored with that value, and every stored setting it does not name
+ * is one an operator may change in place (`ConfigField.changeable`). So a
+ * setting changed through `PATCH /admin/mounts` is kept when the mount is
+ * asked for again without it — provisioning re-adopts the raft mount with
+ * `serverUrl` alone on every PATCH of an agent — while a request that names a
+ * different value, or a stored setting that is the mount's identity, is still
+ * another mount.
+ */
+export function repeatsMount(
+  plugin: Pick<Plugin, "config"> | undefined,
+  have: Record<string, Json> | null | undefined,
+  asked: Record<string, Json> | null | undefined,
+): boolean {
+  const stored = have ?? {}, wanted = asked ?? {};
+  const changeable = new Set((plugin?.config ?? []).filter((f) => f.changeable).map((f) => f.name));
+  for (const [key, value] of Object.entries(wanted)) {
+    if (!(key in stored) || JSON.stringify(stored[key]) !== JSON.stringify(value)) return false;
+  }
+  return Object.keys(stored).every((key) => key in wanted || changeable.has(key));
+}
+
+/**
+ * A mount's settings with `settings` merged in, for an operator changing them
+ * on a mount that exists (`PATCH /admin/mounts`): only keys the plugin
+ * declares `changeable`, each of its declared type, and the merged whole judged
+ * by `validateMount` as any other write is. `changed` is the keys whose value
+ * moved. A mount with no credential yet is judged without the account rule,
+ * as `addMount` judges one, since attaching it re-judges the settings.
+ */
+export function mergeMountSettings(
+  plugin: Pick<Plugin, "id" | "config" | "credential" | "configProblem">,
+  have: { publicConfig: Json | null; secretRef: string | null },
+  settings: unknown,
+): { ok: true; config: Record<string, Json>; changed: string[] } | { ok: false; error: string } {
+  if (typeof settings !== "object" || settings === null || Array.isArray(settings) || !Object.keys(settings).length) {
+    return { ok: false, error: "settings is an object naming at least one setting" };
+  }
+  const fields = plugin.config ?? [];
+  const changeable = fields.filter((f) => f.changeable).map((f) => f.name);
+  const canSay = changeable.length ? `only ${changeable.join(", ")} can` : "none can";
+  for (const [key, value] of Object.entries(settings)) {
+    const field = fields.find((f) => f.name === key);
+    if (!field) return { ok: false, error: `${plugin.id} has no setting "${key}"; ${canSay} be changed on an existing mount` };
+    if (!field.changeable) {
+      return { ok: false, error: `"${key}" cannot be changed on an existing ${plugin.id} mount (${canSay}): ` +
+        "a mount with another value of it is another mount" };
+    }
+    const actual = typeOf(value);
+    if (actual !== field.type) return { ok: false, error: `"${key}" must be a ${field.type}, got ${value === null ? "null" : actual}` };
+  }
+  const stored = (have.publicConfig && typeof have.publicConfig === "object" && !Array.isArray(have.publicConfig)
+    ? have.publicConfig : {}) as Record<string, Json>;
+  const config = { ...stored, ...(settings as Record<string, Json>) };
+  const accountLater = plugin.credential && !have.secretRef ? { ...plugin, credential: { ...plugin.credential, required: false } } : plugin;
+  const problems = validateMount(accountLater, config, have.secretRef);
+  if (problems.length) return { ok: false, error: `cannot change ${plugin.id}'s settings: ${problems.map((p) => p.message).join("; ")}` };
+  const changed = Object.keys(settings).filter((k) => JSON.stringify(stored[k]) !== JSON.stringify(config[k]));
+  return { ok: true, config, changed };
 }

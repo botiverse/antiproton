@@ -158,6 +158,26 @@ setting whose name sounds like a credential must carry
 `references: "credential"`; the check for that runs over the `everyPlugin`
 list in `test/mount-config.ts`, so it only covers a plugin that list names.
 
+**Say which settings an operator may change in place.** A setting marked
+`changeable: true` can be changed on a mount that already exists, through
+`PATCH /admin/mounts {tenantId, agentId, alias, settings}` (operator token):
+the keys given are merged into the mount's settings, each must be declared,
+marked and of its declared type, and the merged whole is judged by
+`validateMount` like any other write. Only the settings are written, so the
+mount's credential, installation id, tool snapshot and plugin database are
+kept, and the next call runs with the new values, since every call's context
+is built from the mount row read for that call. The answer is
+`{alias, plugin, config, changed}`: the mount's settings after the change and
+the keys whose value moved. A setting not marked is refused with 400, and
+should not be marked when it says what the mount is connected to (raft's
+`serverUrl`): moving that in place would carry the credential and the state to
+another server. A marked setting is also kept when the mount is asked for
+again without it: an add that names only the other settings, with the same
+values, is a repeat (`repeatsMount` in `src/runtime/mount-config.ts`), which is
+what keeps it across provisioning's re-adopt of the `raft` mount. Each change
+is logged by the Worker as `mount.settings` (tenant, agent, alias, plugin, the
+changed keys) and written as a `mount.settings` trace row.
+
 **Declare the credential; never pass it on.** If the plugin uses a credential,
 declare it in `credential` (`CredentialSpec`). The console builds its form from
 that declaration, and a mount that needs an account but has none is refused
@@ -588,7 +608,9 @@ program), so the answer is not held again.
 Conversation cards (the SDK's `conversationCards`, 0.18.0) are the mount's
 `conversationCards` setting, a boolean that is off unless set to `true`; every
 client the plugin makes for that mount is then created with the option, and no
-other is. On, a history read starts with the channel's card (or a DM peer's)
+other is. It and `timeoutMs` are `changeable`, so an operator turns cards on or
+off for one agent with `PATCH /admin/mounts` (docs/runbook.md, "Trying
+conversation cards on an agent"); `serverUrl` is not. On, a history read starts with the channel's card (or a DM peer's)
 the first time in a context, and a send into a conversation whose card the
 context has not seen is held once with that card. A context is the one the
 call is made in (`PluginContext.caller.contextId`): the SDK applies its card

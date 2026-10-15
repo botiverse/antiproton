@@ -93,3 +93,24 @@ curl -s -X DELETE -H "x-harness-token: $AUTOMATION_TOKEN" -H "content-type: appl
 ```
 
 `GET /admin/spend-limits` lists what is set.
+
+## Trying conversation cards on an agent
+
+Conversation cards are the `raft` mount's `conversationCards` setting, off unless `true` (docs/plugins.md). Turn them on
+for one agent in place; the mount's credential, push registration and saved state are kept, and the agent's next Raft
+call uses them:
+
+```
+curl -s -X PATCH -H "x-harness-token: $AUTOMATION_TOKEN" -H "content-type: application/json" \
+  "$HOST/admin/mounts" -d '{"tenantId":"<tenantId>","agentId":"<agentId>","alias":"raft","settings":{"conversationCards":true}}'
+```
+
+For an agent Raft made, `agentId` is `raft_<raftAgentId>` and `tenantId` is its provider token's tenant (both on its
+`provisioned_agents` row). The answer is the mount's settings after the change and the keys that moved:
+`{"alias":"raft","plugin":"raft","config":{"serverUrl":"…","conversationCards":true},"changed":["conversationCards"]}`.
+Off again is the same call with `"conversationCards":false`. A name or instructions PATCH from Raft keeps the setting.
+
+Only settings the plugin marks `changeable` are accepted (`conversationCards` and `timeoutMs` for raft); `serverUrl` or
+an undeclared key is `400`, a value of the wrong type is `400`, and an agent or alias that is not there is `404`. Each
+change writes a `mount.settings` line to the Workers logs (filter on `evt` = `mount.settings`) and a `mount.settings`
+row to the agent's trace.
