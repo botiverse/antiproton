@@ -861,6 +861,19 @@ await check("an unseen_card hold: the SDK's card text verbatim, no message count
   }
 });
 
+await check("after the model's own unseen_card hold, the same send again outside resume goes through under the key the held text names", async () => {
+  // The question is the model's own call's result, so the card is booked before asking: a model that follows the
+  // SDK's text ("send it again with idempotencyKey …") instead of answering is not held a second time.
+  const m = cardsMount();
+  const bodies = cardServer();
+  const held = await raftPlugin.invoke("messages_send", { target: "#general", content: "done", idempotencyKey: "k-again" }, m.ctx) as any;
+  if (!(held instanceof Interrupt) || !held.question.includes('idempotencyKey "k-again"')) throw new Error(`the question: ${JSON.stringify(held)}`);
+  const again = await raftPlugin.invoke("messages_send", { target: "#general", content: "done", idempotencyKey: "k-again" }, m.ctx) as any;
+  if (again instanceof Interrupt || again.state !== "sent" || bodies[1]?.idempotencyKey !== "k-again" || !/^v1:/.test(String(bodies[1]?.seenCards?.channel))) {
+    throw new Error(`the same send again: ${JSON.stringify({ again, bodies })}`);
+  }
+});
+
 await check("an unseen_card hold raised inside a program books nothing; the model's answer books the card in the context answering, so the resend is not held again", async () => {
   const m = cardsMount();
   const fromProgram = { ...m.ctx, caller: { ...m.ctx.caller, fromProgram: true } };
