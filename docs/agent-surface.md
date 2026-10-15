@@ -174,6 +174,7 @@ read of the tenant as a whole:
 | `PUT` | `/provision/servers/{raftServerId}/model-picker` — whether the server's agents may pick another model than the default ([below](#the-servers-model-picker-model-picker)) |
 | `POST` | `/provision/agents/{agentId}/import` — the agent's workspace, once ([below](#workspace-import)) |
 | `GET` | `/provision/import-limits` — the bounds an import is held to ([below](#workspace-import)) |
+| `POST` | `/provision/agents/{agentId}/stop` — end the agent's running turn without deleting it ([below](#stopping-a-turn-stop)) |
 
 `{agentId}` is the `providerAgentId` the provisioning call returned. As on every provider route,
 `/provision/agents/by-raft-agent/{raftAgentId}/...` reaches the same agent by the Raft agent's id.
@@ -700,6 +701,34 @@ POST /provision/agents
 
 — `budget` on the onboarding agent only (every other agent leaves it out), and `plan` whenever Raft knows the
 server's plan ([above](#the-servers-plan-plan)); a retry repeats the same body, as for every field.
+
+### Stopping a turn (`stop`)
+
+```
+POST /provision/agents/{agentId}/stop
+POST /provision/agents/by-raft-agent/{raftAgentId}/stop?raftServerId=…
+```
+
+Ends the agent's running turn the way the Agents API's cancel does: the turn is aborted, a model call it had out is
+dropped (its answer, if one still comes, starts nothing), and the background work it started is stopped. The agent is
+not deleted; its next message starts a new turn. No body. Same token, tenant and `raftServerId` rules as every route
+above, with one difference: **a deleted agent can still be stopped**, since a turn that outlived its delete is the one
+that most needs it.
+
+| Answer | When |
+|---|---|
+| `200 {"result":"interrupted","cancelledTurn":"<turn id>"}` | a turn was running and is now ended |
+| `200 {"result":"not_running"}` | nothing was running — including a repeat of a stop that already ended it |
+| `503 {"error":{"code":"stop_failed","message":…}}` | the turn could not be ended; retry |
+| `404 {"error":{"code":"not_found",…}}` | no agent by that id in the tenant |
+
+The ended turn reports itself to Raft: a "Bridge fatal" activity event with `errorClass` `stopped: by owner`, and
+status `error` with that detail. Every attempt is a `turn.stop` line in the Workers logs, whatever came of it.
+
+**A delete ends the turn too.** `DELETE /provision/agents/{agentId}` first stops the running turn (`errorClass`
+`stopped: agent deleted`), and from then on the agent's object takes no step for it, whatever arrives; a repeated
+delete stops again. A stop that fails does not fail the delete: it is logged as a `turn.stop` line with `result`
+`failed` ([`runbook.md`](runbook.md)).
 
 ## Evaluation setup (preview only)
 

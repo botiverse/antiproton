@@ -46,6 +46,10 @@ const TABLE = "CREATE TABLE IF NOT EXISTS trace_outbox(" +
   "ms INTEGER, " +
   "attrs TEXT NOT NULL)";
 
+// `turn.stop` is a turn ended from outside (an operator, the provider, a delete: cf/src/runtime.ts `stopTurn`); activity
+// reads it as the turn's BridgeFatal, with who stopped it in its errorClass, and status as `error`. `js.run` is one
+// run_js program's stretch, how it ended and its error code (cf/src/runtime.ts `#turnTools`); activity and status skip
+// it, as a mount call inside it has its own row.
 // `mount.seeded` is one catalogue entry's outcome on one agent (src/store/seed-record.ts): written when the outcome
 // changes, in the transaction that adds the mount when there is one. Activity and status skip it (their `default`).
 // `harness.open` is one harness built for one conversation, with why (src/runtime/harness-open.ts); a reuse has none.
@@ -63,6 +67,7 @@ const TABLE = "CREATE TABLE IF NOT EXISTS trace_outbox(" +
 // `agent.ready` is a provisioned agent ready before its first turn, once per agent (src/runtime/ready.ts): its status
 // is `online`, a status-only activity event.
 export const TRACE_KINDS = ["model.call", "tool.call", "approval.wait", "container.lease", "inbound", "mount.seeded", "harness.open",
+  "turn.stop", "js.run",
   "rebuild.decision", "rebuild.outcome", "rebuild.behaviour", "session.needs_reset", "turn.timing", "import.hold", "model.prewarm",
   "agent.ready"] as const;
 export type TraceKind = (typeof TRACE_KINDS)[number];

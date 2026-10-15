@@ -13,6 +13,7 @@
  *
  *   inbound, delivered      → UserPromptSubmit   (a message entered the model)
  *   tool.call               → PreToolUse + PostToolUse / PostToolUseFailure  (not one the provider ran: `operatorCall`)
+ *   turn.stop stopped       → BridgeFatal         (the turn was ended from outside: `stopped: by owner`, `stopped: agent deleted`, …)
  *   model.call stop|length  → Stop                (the turn is answered)
  *   model.call aborted      → Stop                (cancelled: no longer working)
  *   model.call error        → BridgeFatal         (the turn died; a daily spend limit's refusal says so and why)
@@ -28,7 +29,7 @@
  */
 import type { TraceOutboxRow } from "../trace/outbox.ts";
 import type { ActivityEvent } from "../plugins/types.ts";
-import { operatorCall, statusEvents } from "./status.ts";
+import { operatorCall, statusEvents, turnEndClass } from "./status.ts";
 
 export const ACTIVITY_SCHEMA = "raft-agent-activity-ingest.v1";
 /**
@@ -114,6 +115,11 @@ function hookEvents(agentId: string, rows: readonly TraceOutboxRow[]): ActivityE
         });
         break;
       }
+      // A turn that was ended from outside: who ended it is the row's errorClass (cf/src/runtime.ts `stopTurn`,
+      // `turnEndClass` in src/runtime/status.ts), so the activity log says why the agent stopped instead of going quiet.
+      case "turn.stop":
+        if (row.status === "stopped") out.push({ ...base, hookEventName: "BridgeFatal", errorClass: turnEndClass(row) });
+        break;
       case "model.call":
         if (row.status === "stop" || row.status === "length" || row.status === "aborted") out.push({ ...base, hookEventName: "Stop" });
         else if (row.status === "error") out.push({ ...base, hookEventName: "BridgeFatal", errorClass: modelCallErrorClass(row) });

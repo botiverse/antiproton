@@ -29,6 +29,7 @@ import { PLANS, type Plan, type TenantPlanStore } from "../spend-limit.ts";
 import { CONNECTION_PROVIDERS, returnUrlProblem, scopesFor, type ConnectionProvider } from "./connect.ts";
 import { surface, surfaceReadOf, type SurfaceDeps } from "../agent-surface/surface.ts";
 import { logEvent } from "../../../src/core/log.ts";
+import type { StopTurnOutcome } from "../../../src/runtime/turn-stop.ts";
 import { WORKING_SET } from "../../../src/plugins/state.ts";
 import { SEED_MODES, seedPathProblem, seedText, sha256Hex as sha256Sync, type SeedFileMeta, type SeedMode, type SeedSeal, type SeedWriteResult } from "../../../src/store/seed-files.ts";
 import {
@@ -69,7 +70,16 @@ export interface ProvisionAgentOps {
    * never caused.
    */
   pushStatus(tenantId: string, agentId: string): Promise<PushStatus | null>;
+  /**
+   * End the agent's running turn (cf/src/runtime.ts `stopTurn`): `provider_stop` for the stop route, `delete` for a
+   * delete, which also keeps the agent from taking another step. Never throws for a turn it could not end: that is
+   * `failed`, with why. Optional: a deployment without it answers the stop route 404 and deletes without a stop.
+   */
+  stopTurn?(tenantId: string, agentId: string, trigger: "provider_stop" | "delete"): Promise<StopTurnResult>;
 }
+
+/** What ending an agent's turn did (src/runtime/turn-stop.ts). */
+export type StopTurnResult = StopTurnOutcome;
 
 /**
  * The tenant a request acts in. A tenant-scoped token is one tenant. A platform-scoped token (one key
@@ -396,6 +406,16 @@ async function registerPush(deps: ProvisionDeps, row: ProvisionedAgent): Promise
   return { ...row, ...patch, updatedAt: deps.now() };
 }
 
+/** A stop as the object answered it, or `failed` when the object could not be asked; the failure is logged here. */
+async function stopTurnOf(stop: NonNullable<ProvisionAgentOps["stopTurn"]>, tenantId: string, agentId: string, trigger: "provider_stop" | "delete"): Promise<StopTurnResult> {
+  try { return await stop(tenantId, agentId, trigger); }
+  catch (e) {
+    const error = String((e as Error)?.message ?? e).slice(0, 200);
+    logEvent("turn.stop", { tenantId, agentId, trigger, result: "failed", error });
+    return { result: "failed", error };
+  }
+}
+
 export async function handleProvision(
   method: string, path: string,
   headers: { idempotencyKey: string | null; raftServerId: string | null; credentialId?: string | null }, body: unknown,
@@ -654,6 +674,16 @@ export async function handleProvision(
     }
     return modelRoute(method, body, tenantId, found, headers.credentialId ?? null, deps.models, deps.registry, deps.now);
   }
+  // `…/stop`: end the agent's running turn without deleting it (StopTurnResult). A deleted agent can still be stopped:
+  // a turn that outlived its delete is exactly the one that needs it. Repeating it answers `not_running`.
+  if (rest.length === 2 && rest[1] === "stop" && method === "POST") {
+    if (!deps.agent.stopTurn) return null;
+    const found = byRaft ? await deps.registry.get(tenantId, rest[0]!) : await deps.registry.getByAgentId(tenantId, rest[0]!);
+    if (!found) return fail({ status: 404, code: "not_found", message: `no provisioned agent ${byRaft ? "made from Raft agent " : ""}${rest[0]}` });
+    const r = await stopTurnOf(deps.agent.stopTurn, tenantId, found.agentId, "provider_stop");
+    if (r.result === "failed") return fail({ status: 503, code: "stop_failed", message: `the agent's turn could not be stopped; try again: ${r.error}` });
+    return ok(r.result === "interrupted" ? { result: "interrupted", cancelledTurn: r.cancelledTurn } : { result: "not_running" });
+  }
   if (rest.length < 1 || rest.length > 2 || (rest.length === 2 && rest[1] !== "credential")) return null;
   const row = byRaft ? await deps.registry.get(tenantId, rest[0]!) : await deps.registry.getByAgentId(tenantId, rest[0]!);
   const gone = () => fail({ status: 404, code: "not_found", message: `no provisioned agent ${byRaft ? "made from Raft agent " : ""}${rest[0]}` });
@@ -695,6 +725,10 @@ export async function handleProvision(
 
   if (rest.length === 1 && method === "DELETE") {
     if (!row) return gone();
+    // First, and on a repeated delete too: a delete that does not end the running turn leaves the agent calling its
+    // model with nobody able to see it (Raft stops taking a deleted agent's activity), which is what happened on
+    // preview before deletes did this. A stop that fails does not fail the delete; it is logged (`turn.stop`).
+    if (deps.agent.stopTurn) await stopTurnOf(deps.agent.stopTurn, tenantId, row.agentId, "delete");
     if (row.status === "deleted") return ok(view(row));
     // Raft revokes the credential itself, so pushes stop even if this fails half-way; what is
     // reported is what could not be undone here. The object and its transcript stay: data is

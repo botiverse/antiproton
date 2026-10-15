@@ -41,8 +41,10 @@ import {
 import {
   bridgeTools, harnessTools, offeredToolName, offersPlugin, replayPolicy, offersCapability, qualifyMountedTools, resumeTool, runJsTools, type MountedTool,
   withholdTools,
-  refuseWithheld,
+  refuseWithheld, type RunEnd,
 } from "../../src/runtime/pi-tools.ts";
+import { jsRunRow } from "../../src/trace/seams.ts";
+import { agentDeletedAt, markAgentDeleted, turnStopRow, type StopTrigger, type StopTurnOutcome } from "../../src/runtime/turn-stop.ts";
 import { explainUnavailableTool } from "../../src/runtime/unavailable-tool.ts";
 import {
   bindingKey, buildBriefing, programSendCounter, clearBackstop, conversationMessages, hasAnswer, judgeOverflow, mainCallOut, mainMessages, mainTip, needsReset, noteRebuilt,
@@ -3060,9 +3062,15 @@ export class AgentRuntime {
       : [];
     const counting = {
       onCalls: (n: number) => { void store.consumeQuota(tenantId, "tool_calls", n); },
-      onRun: (run: { ok: boolean; ms: number; hostCalls: number; resumed?: boolean }) => store.recordUsage?.(jsRunRows(
-        { at: Date.now() - run.ms, tenantId, agentId }, run.ok ? "ok" : "failed", run.ms, run.hostCalls, run.resumed === true,
-      )),
+      onRun: (run: RunEnd) => {
+        // A program that never parsed calls no mount, so without this row nothing in the trace said it ran: a loop of
+        // failing programs was invisible there (preview, 2026-10-15). A reading: a failure to write it is logged only.
+        try { appendTrace(this.#deps.ctx.storage.sql, [jsRunRow({ tenantId, agentId, session, at: Date.now(), run })]); }
+        catch (e) { console.error(`the js.run row of ${tenantId}/${agentId} could not be written:`, e); }
+        return store.recordUsage?.(jsRunRows(
+          { at: Date.now() - run.ms, tenantId, agentId }, run.ok ? "ok" : "failed", run.ms, run.hostCalls, run.resumed === true,
+        ));
+      },
     };
     // A tool that can ask the model a question needs `resume` to be answered,
     // with run_js or without it (an Agents API agent has no run_js). Asked as
@@ -4056,6 +4064,46 @@ export class AgentRuntime {
     return { cancelledTurn, stoppedJobs: jobs.stopped, stillRunning: jobs.stillRunning };
   }
 
+  /**
+   * End the agent's running turn from outside: the provider's stop route (`provider_stop`), the operator's
+   * /admin/cancel-turn (`admin_cancel`), or a delete (`delete`), which also marks the agent so that no later pass takes
+   * another step for it (`step`). Every session with a turn is cancelled as `cancelSession` cancels one. A turn that
+   * was running leaves a `turn.stop` row, which Raft is shown as a Bridge fatal saying who stopped it
+   * (src/runtime/activity.ts); every attempt, whatever came of it, is a `turn.stop` log line. Never throws: a turn
+   * that could not be ended is `failed`, with why.
+   */
+  async stopTurn(tenantId: string, agentId: string, trigger: StopTrigger): Promise<StopTurnOutcome> {
+    const sql = this.#deps.ctx.storage.sql;
+    const done = (out: StopTurnOutcome): StopTurnOutcome => {
+      logEvent("turn.stop", { tenantId, agentId, trigger,
+        result: out.result === "interrupted" ? "aborted" : out.result === "failed" ? "failed" : "nothing_running",
+        ...(out.result === "interrupted" ? { turn: out.cancelledTurn } : {}), ...(out.result === "failed" ? { error: out.error } : {}) });
+      return out;
+    };
+    try {
+      await this.ready();
+      if (trigger === "delete") markAgentDeleted(sql, Date.now());
+      if (!(await this.store.loadAgent(tenantId, agentId)) || !(await this.store.getModelBinding(tenantId, agentId))) {
+        return done({ result: "not_running" });
+      }
+      const pd = this.#isPd();
+      if (!pd) ensureAgentTables(sql);
+      const sessions = pd ? [MAIN_SESSION] : [...new Set([MAIN_SESSION, ...sessionsWithWork(sql)])];
+      let cancelled: string | null = null;
+      for (const session of sessions) {
+        const r = await this.cancelSession(tenantId, agentId, session);
+        if (r.cancelledTurn && cancelled === null) cancelled = r.cancelledTurn;
+        if (!pd) markSession(sql, session, false);
+      }
+      if (cancelled === null) return done({ result: "not_running" });
+      try { appendTrace(sql, [turnStopRow({ tenantId, agentId, operationId: cancelled, trigger, at: Date.now() })]); }
+      catch (e) { console.error(`the turn.stop row of ${tenantId}/${agentId} could not be written:`, e); }
+      return done({ result: "interrupted", cancelledTurn: cancelled });
+    } catch (e) {
+      return done({ result: "failed", error: String((e as Error)?.message ?? e).slice(0, 200) });
+    }
+  }
+
   /** The session's branch, oldest first: what the model's context is built from. */
   async branchEntries(tenantId: string, agentId: string, session: string) {
     return (await this.agent(tenantId, agentId, session)).branch();
@@ -4114,6 +4162,13 @@ export class AgentRuntime {
     const sql = this.#deps.ctx.storage.sql;
     const pd = this.#isPd();
     if (!pd) ensureAgentTables(sql);
+    // A deleted agent takes no step: its delete ended the turn (`stopTurn`), and anything that started a run since
+    // is ended here rather than driven. Nothing is asked to wake it again.
+    if (agentDeletedAt(sql) !== null) {
+      const busy = pd ? await (await this.agent(tenantId, agentId, MAIN_SESSION)).running().catch(() => false) : mainBusy(sql) !== null || sessionsWithWork(sql).length > 0;
+      if (busy) await this.stopTurn(tenantId, agentId, "delete");
+      return { open: 0, wakeInMs: null, settled: [] as Array<{ operationId: string; status: string }>, releaseFailed: [] as Array<{ alias: string; error: string }> };
+    }
     // Background work first (task #16). A job that ended is delivered as a
     // message, which marks its session as having work, so the loop below steps
     // it in this same pass; the rest say when they want checking again.
