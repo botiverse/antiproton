@@ -1,3 +1,5 @@
 # Suites deliberately deleted. The deploy gate refuses a suite that production
 # is currently guarded by and that has disappeared, unless it is named here.
 # One name per line (file name without .ts), with a line saying why.
+# model-fallback: tested the first-turn model fallback (MODEL_FALLBACK), removed with the feature (reverts of #900, #894).
+model-fallback

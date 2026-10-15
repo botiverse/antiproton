@@ -26,11 +26,6 @@ import {
   type CommitResult, type ImportHold, type ImportRow,
 } from "../../src/store/workspace-import.ts";
 import { logEvent } from "../../src/core/log.ts";
-import { busyGivenUp, fallbackPrimary, isModelBusy, type JobFallback, type ModelFallback } from "../../src/model/model-fallback.ts";
-import type { AnsweredMessage } from "../../src/model/pi-bridge.ts";
-import {
-  busyRetryRow, busyRetryScheduled, clearBusyRetry, endBusyRetry, noteBusy, readBusyRetry, seriesAnswered, seriesDuplicate, settleBusyRetry, addTurnMessages, clearTurnMessages, turnMessages,
-} from "../../src/runtime/busy-retry.ts";
 import { appendTrace } from "../../src/trace/outbox.ts";
 import { markHarnessDrop, recordHarnessOpen, type HarnessDropReason } from "../../src/runtime/harness-open.ts";
 import { currentMainId, mainSessions, modelInputCalls, readModelInput, recordModelInput, startFreshMain, type MainSessionRow, type ModelInputEvidence } from "./fresh-context.ts";
@@ -119,7 +114,6 @@ import { agentSecrets, agentRef, importKek, isAgentRef, open, OWNER_PREFIX, seal
 import {
   acceptInbound, claimPendingInbound, ensureInboundTable, hasPendingInbound, hookSecretName, inboundMessage, markPostingInbound, newHookId, newHookSecret,
   nextPendingInbound, pendingInboundCount, recentInbound, recordInbound, requeueInbound, seenBefore, settleInbound, underRate,
-  INBOUND_DEDUPE_MS,
   expiredPendingInbound, pendingInboundRow, queueFull, queueRetryAfterS, rateRetryAfterS, INBOUND_QUEUE_RETRY_AFTER_S,
   INBOUND_MAX_AGE_MS, INBOUND_MAX_BYTES, INBOUND_PER_MINUTE, INBOUND_POST_ATTEMPTS, INBOUND_QUEUE_MAX, type InboundOutcome, type PendingInbound,
 } from "../../src/runtime/inbound.ts";
@@ -637,9 +631,6 @@ class BoundArtifacts {
   }
 }
 
-/** How long past its due time a busy first turn's re-dispatch waits for an unreadable registry before it is given up. */
-export const REGISTRY_PATIENCE_MS = 10 * 60_000;
-
 /** Whether a binding spends the operator's model account, through any provider. */
 export const isOperatorModelRef = (ref: string) => providerOfRef(ref) !== null;
 export { OPERATOR_RUN9_REF, OPERATOR_EXA_REF } from "./operator-ref.ts";
@@ -657,17 +648,6 @@ export interface RuntimeDeps {
    * spending this key.
    */
   operatorModel?: OperatorModel;
-  /**
-   * MODEL_FALLBACK as the deployment declares it (src/model/model-fallback.ts), or null/absent when it is off or was
-   * refused: which first-turn calls are marked to fall back (`takeJob`), and when a busy turn is re-dispatched
-   * (`step`, src/runtime/busy-retry.ts).
-   */
-  modelFallback?: ModelFallback | null;
-  /**
-   * Whether the agent's provider has deleted it (the provisioning registry, `provisioned_agents.status`), asked before a
-   * busy first turn is re-dispatched (`#busyRetry`). Absent: nothing is asked, as for an agent no provider made.
-   */
-  agentGone?: (owner: { tenantId: string; agentId: string }) => Promise<boolean>;
   /** The Worker version this runtime runs (the version metadata binding's id), which tells a `harness.open` after a
    *  deploy from one after an eviction (src/runtime/harness-open.ts). Absent, a cold start's cause is `unknown`. */
   versionId?: string;
@@ -1311,13 +1291,6 @@ export class AgentRuntime {
     const installationId = accepting.installationId;
     const key = result.dedupeKey ?? null;
     if (key && seenBefore(sql, hookId, key, now)) return done("duplicate", null, key);
-    // A push bringing nothing new to a busy first turn waiting for its retry (src/runtime/busy-retry.ts): posted, it
-    // would end that turn's retry series and count it again from one, for as long as the service keeps pushing. The
-    // turn already holds those messages, and its retry answers them. Only where MODEL_FALLBACK is on: a series left
-    // over from before it was switched off holds nothing back.
-    if (this.#deps.modelFallback && seriesDuplicate(sql, tenantId, agentId, result.messageIds, now, INBOUND_DEDUPE_MS)) {
-      return done("duplicate", "the same messages as the first turn waiting for its model retry", key);
-    }
     // Each 429 says when to come back (`Retry-After`): the rate's from the rows it counts, the queue's from its
     // head's next try, so a sender that honours it is not refused, and recorded, every few seconds meanwhile.
     if (!underRate(sql, hookId, now)) {
@@ -1334,8 +1307,7 @@ export class AgentRuntime {
     // is a statement in this object too, so it either came first or finds the seal, even while this push is queued
     // and its turn has not begun (src/store/seed-files.ts).
     sealedBy(tenantId, agentId, sealSeedFiles(sql, tenantId, agentId, "first-inbound", now));
-    acceptInbound(sql, { hookId, alias, dedupeKey: key, message: inboundMessage(alias, String(result.text), result.kind === "inbox" ? "inbox" : "event"), now, installationId,
-      messageIds: result.messageIds ?? null });
+    acceptInbound(sql, { hookId, alias, dedupeKey: key, message: inboundMessage(alias, String(result.text), result.kind === "inbox" ? "inbox" : "event"), now, installationId });
     // The answer the service has always had for a push the agent will be given.
     return { outcome: "delivered" };
   }
@@ -1531,7 +1503,7 @@ export class AgentRuntime {
       const row = claimPendingInbound(sql, head, Date.now());
       try {
         await this.postMessage(tenantId, agentId, row.message, "prompt", MAIN_SESSION,
-          { retake: "background", beforeSay: () => markPostingInbound(sql, row.seq), messageIds: row.messageIds ?? null });
+          { retake: "background", beforeSay: () => markPostingInbound(sql, row.seq) });
       } catch (e: any) {
         const error = String(e?.message ?? e).slice(0, 300);
         out.error = error;
@@ -3613,86 +3585,6 @@ export class AgentRuntime {
     return inFirstTurn(context) ? first.reasoning : undefined;
   }
 
-  /**
-   * The scheduled re-dispatch of a busy first turn (src/runtime/busy-retry.ts), asked on an idle main conversation:
-   * not due yet is a wake; due, the engine runs the turn again (`AgentEngine.retryTurn`) and this steps it. The row
-   * leaves `scheduled` whatever happens, so a second pass, or a second alarm after an eviction, finds nothing to do.
-   *
-   * - An agent its provider has deleted is never re-dispatched (its calls would be paid for nobody): the row is cleared.
-   *   The registry is asked here as well as the delete clearing the row (`stopBusyRetry`), since that RPC can fail
-   *   after the registry row is written. A registry that cannot be read is asked again in a minute, not guessed.
-   * - `moved`: a newer run carried the turn on, and its own activity follows; nothing is said.
-   * - `refused`: the engine would not start it. Nothing will ever retry it, so it is given up, and a `model.retry` row
-   *   says so with the `model_unavailable` sentence, or Raft would be left on "retrying in N min" for ever.
-   */
-  async #busyRetry(tenantId: string, agentId: string, agent: AgentEngine): Promise<{ out?: StepOutcome; wakeInMs: number | null }> {
-    const sql = this.#deps.ctx.storage.sql;
-    const due = busyRetryScheduled(sql, tenantId, agentId);
-    if (!due) return { wakeInMs: null };
-    const now = Date.now();
-    if (due.dueAt > now) return { wakeInMs: due.dueAt - now };
-    if (this.#deps.agentGone) {
-      let gone: boolean;
-      try { gone = await this.#deps.agentGone({ tenantId, agentId }); }
-      catch (e) {
-        const error = String((e as Error)?.message ?? e).slice(0, 200);
-        // Not guessed either way, and not for ever: past REGISTRY_PATIENCE_MS after the retry was due, it is given up,
-        // as a re-dispatch the engine refused is, so Raft is not left on "retrying in N min".
-        if (now - due.dueAt < REGISTRY_PATIENCE_MS) {
-          logEvent("model_job.busy_retry", { tenantId, agentId, jobId: due.jobId, attempt: due.attempts, outcome: "registry_unreadable", error });
-          return { wakeInMs: 60_000 };
-        }
-        this.#transact()(() => {
-          if (!settleBusyRetry(sql, tenantId, agentId, due.jobId, "gave_up", now)) return;
-          appendTrace(sql, [busyRetryRow({ tenantId, agentId, jobId: due.jobId, outcome: "refused", attempt: due.attempts, at: now,
-            lateMs: now - due.dueAt, sentence: busyGivenUp(due.attempts), reason: "registry_unreadable" })]);
-        });
-        logEvent("model_job.busy_retry", { tenantId, agentId, jobId: due.jobId, attempt: due.attempts, outcome: "registry_unreadable_gave_up", error });
-        return { wakeInMs: null };
-      }
-      if (gone) {
-        this.#transact()(() => clearBusyRetry(sql, tenantId, agentId));
-        logEvent("model_job.busy_retry", { tenantId, agentId, jobId: due.jobId, attempt: due.attempts, outcome: "deleted" });
-        return { wakeInMs: null };
-      }
-    }
-    const outcome = agent.retryTurn ? await agent.retryTurn(due.jobId) : "refused";
-    const at = Date.now();
-    const state = outcome === "started" ? "redispatched" : outcome === "moved" ? "superseded" : "gave_up";
-    const sentence = outcome === "refused" ? busyGivenUp(due.attempts) : null;
-    this.#transact()(() => {
-      if (!settleBusyRetry(sql, tenantId, agentId, due.jobId, state, at)) return;
-      appendTrace(sql, [busyRetryRow({ tenantId, agentId, jobId: due.jobId, outcome, attempt: due.attempts, at, lateMs: now - due.dueAt, sentence })]);
-    });
-    logEvent("model_job.busy_retry", { tenantId, agentId, jobId: due.jobId, attempt: due.attempts, outcome, lateMs: now - due.dueAt });
-    if (outcome !== "started") return { wakeInMs: null };
-    return { out: await agent.step(), wakeInMs: null };
-  }
-
-  /**
-   * End a busy first turn's retry series without a re-dispatch (src/runtime/busy-retry.ts `endBusyRetry`): a message
-   * carried the turn on, or a cancel stopped it. A cancel that stops a scheduled re-dispatch says so in a `model.retry`
-   * row, which Raft sees as the turn's stop, so it is not left on "retrying in N min".
-   */
-  #endBusyRetry(tenantId: string, agentId: string, how: "superseded" | "cancelled") {
-    const sql = this.#deps.ctx.storage.sql;
-    const at = Date.now();
-    this.#transact()(() => {
-      const r = readBusyRetry(sql, tenantId, agentId);
-      const was = endBusyRetry(sql, tenantId, agentId, how, at);
-      if (how === "cancelled" && was === "scheduled" && r) {
-        appendTrace(sql, [busyRetryRow({ tenantId, agentId, jobId: r.jobId, outcome: "cancelled", attempt: r.attempts, at })]);
-      }
-    });
-  }
-
-  /** The agent's provider deleted it (DELETE /provision/agents/…): its busy first turn is not re-dispatched. */
-  async stopBusyRetry(tenantId: string, agentId: string): Promise<boolean> {
-    await this.ready();
-    const sql = this.#deps.ctx.storage.sql;
-    return this.#transact()(() => clearBusyRetry(sql, tenantId, agentId));
-  }
-
   /** A turn of the main conversation was cancelled: an agent made with `firstTurn` has had its first. */
   async #firstTurnEnded(tenantId: string, agentId: string, session: string, how: string) {
     if (session !== MAIN_SESSION) return;
@@ -3932,8 +3824,6 @@ export class AgentRuntime {
       retake?: "await" | "background"; beforeSay?: () => void; pendingOnly?: true;
       /** When the object took the message in, for the turn's timing (src/runtime/turn-timing.ts); now when absent. */
       receivedAt?: number;
-      /** The messages a push is about (`InboundResult.messageIds`), for a busy first turn's retry series (src/runtime/busy-retry.ts). */
-      messageIds?: readonly string[] | null;
     } = {},
   ) {
     const inboundAt = opts.receivedAt ?? Date.now();
@@ -4069,17 +3959,6 @@ export class AgentRuntime {
       try { recordNoticeHead(this.#deps.ctx.storage.sql, lines.join("\n"), Date.now()); }
       catch (e) { console.error(`recording the notices of ${tenantId}/${agentId}'s message failed:`, e); }
     }
-    // A prompt or a steer the engine took starts or joins a run, which carries a busy first turn on itself: no
-    // scheduled re-dispatch of it is made, and a busy answer to that run counts from one again
-    // (src/runtime/busy-retry.ts). Only then: a post that wrote nothing, a follow-up (on an idle lane it starts no run)
-    // and a `pendingOnly` post with nothing pending leave the schedule as it was, or the turn would wait for nothing.
-    // The turn holds this post's messages from now: a push's (src/runtime/busy-retry.ts `addTurnMessages`).
-    if (backstop && res?.ok !== false && mode !== "followUp") {
-      this.#endBusyRetry(tenantId, agentId, "superseded");
-      // Only where MODEL_FALLBACK is on: off, nothing reads them, and nothing is written.
-      try { if (this.#deps.modelFallback) addTurnMessages(this.#deps.ctx.storage.sql, opts.messageIds, Date.now()); }
-      catch (e) { console.error(`recording the messages of ${tenantId}/${agentId}'s post failed:`, e); }
-    }
     return { ...messageLanded(res, mode), result: res };
   }
 
@@ -4168,8 +4047,6 @@ export class AgentRuntime {
         else discardTurn(sql, session);
       });
     }
-    // A busy first turn waiting for its re-dispatch is the turn being cancelled: the re-dispatch is not made.
-    if (!this.#isPd() && session === MAIN_SESSION) this.#endBusyRetry(tenantId, agentId, "cancelled");
     const jobs = await stopSessionJobs({
       sql, owner: { tenantId, agentId }, session,
       cancel: (job) => this.#gateway.cancelBackground(
@@ -4291,13 +4168,6 @@ export class AgentRuntime {
       if (!pd && session === MAIN_SESSION && out.open === 0 && (out.settled.length || readBackstop(sql).pending !== null)) {
         const rebuilt = await this.#overflowBackstop(tenantId, agentId);
         if (rebuilt) out = { ...rebuilt, settled: [...out.settled, ...rebuilt.settled] };
-      }
-      // A first turn no model answered is run again on its schedule (src/runtime/busy-retry.ts): this pass drives the
-      // re-dispatched run's first call when it is due, and otherwise asks to come back when it will be.
-      if (!pd && session === MAIN_SESSION && out.open === 0) {
-        const retry = await this.#busyRetry(tenantId, agentId, agent);
-        if (retry.out) out = { ...retry.out, settled: [...out.settled, ...retry.out.settled] };
-        else if (retry.wakeInMs !== null) out = { ...out, wakeInMs: out.wakeInMs === null ? retry.wakeInMs : Math.min(out.wakeInMs, retry.wakeInMs) };
       }
       if (!pd) this.#turnTiming(tenantId, agentId, "ending", () => this.#turnStepEnd(tenantId, agentId, session, out));
       open += out.open;
@@ -4767,26 +4637,8 @@ export class AgentRuntime {
     const mark = this.#deps.modelInputEvidence && !this.#isPd();
     // The first turn's reasoning, for an agent made to answer its first message without (`#reasoningFor`).
     const reasoning = await this.#reasoningFor(tenantId, agentId, session, (job as { context?: unknown }).context, this.#calledModel(b));
-    // A first-turn call that may go to a second model (`#fallbackFor`); a job without the mark is called as it always was.
-    const fallback = await this.#fallbackFor(tenantId, agentId, session, (job as { context?: unknown }).context, b);
     return { ...job, operatorModel: provider ? b!.model : null, operatorProvider: provider, ...(mark ? { imageEvidence: true } : {}),
-      ...(reasoning ? { reasoning } : {}), ...(fallback ? { fallback } : {}) };
-  }
-
-  /**
-   * The fallback mark for a call (src/model/model-fallback.ts), or null. Only where MODEL_FALLBACK is on, and only for
-   * a call of the first turn as `#reasoningFor` decides it — the main conversation of a pi085 agent made with
-   * `firstTurn`, no turn of it ended (`inFirstTurn`, `firstTurnDone`) — whose binding spends the operator's account on
-   * a DeepSeek model. Everything else, an owner's pick of another model or an agent's own key among it, is not marked.
-   */
-  async #fallbackFor(tenantId: string, agentId: string, session: string, context: unknown,
-    b: { model: string; secretRef: string } | null): Promise<JobFallback | null> {
-    const f = this.#deps.modelFallback;
-    if (!f || session !== MAIN_SESSION || this.#isPd()) return null;
-    if (!b || providerOfRef(b.secretRef) === null || !fallbackPrimary(b.model)) return null;
-    if (!firstTurnOf((await this.store.loadAgent(tenantId, agentId))?.config)) return null;
-    if (firstTurnDone(this.#deps.ctx.storage.sql, tenantId, agentId) || !inFirstTurn(context)) return null;
-    return { provider: f.provider, model: f.model, primaryMs: f.primaryMs, fallbackMs: f.fallbackMs };
+      ...(reasoning ? { reasoning } : {}) };
   }
 
   /**
@@ -4824,35 +4676,7 @@ export class AgentRuntime {
   async deliverAnswer(tenantId: string, agentId: string, jobId: string, answer: unknown, taker: string | undefined) {
     await this.ready();
     const session = this.#jobSessionFor(jobId);
-    const agent = await this.agent(tenantId, agentId, session);
-    if (!isModelBusy(answer as AnsweredMessage)) {
-      const wrote = await agent.deliver(jobId, answer as any, taker);
-      // A re-dispatched busy turn that is answered is over (src/runtime/busy-retry.ts `seriesAnswered`): a later push
-      // about the same messages is delivered again as any push is. A tool call is not an answer to the person.
-      if (wrote === true && !this.#isPd() && session === MAIN_SESSION && (answer as AnsweredMessage)?.stopReason !== "toolUse") {
-        seriesAnswered(this.#deps.ctx.storage.sql, tenantId, agentId, Date.now());
-        if (this.#deps.modelFallback) clearTurnMessages(this.#deps.ctx.storage.sql);
-      }
-      return wrote;
-    }
-    // A call neither model answered (src/model/model-fallback.ts): what happens next is decided here and written in the
-    // same transaction as the answer, whose sentence says it (src/runtime/busy-retry.ts). Outside the scope a call is
-    // marked in (pd, another session: never marked), or with the fallback since switched off, there is no schedule,
-    // and it gives up at once.
-    if (this.#isPd() || session !== MAIN_SESSION) return agent.deliver(jobId, { ...(answer as AnsweredMessage), providerError: busyGivenUp(1) }, taker);
-    const sql = this.#deps.ctx.storage.sql;
-    const retry = this.#deps.modelFallback?.retryAfterMs ?? [];
-    const now = Date.now();
-    return this.#transact()(() => {
-      // Answered already (a replayed delivery): nothing is decided twice.
-      const row = sql.exec("SELECT answer FROM pi_model_jobs WHERE id = ?", jobId).toArray()[0] as { answer?: unknown } | undefined;
-      if (!row || row.answer) return false;
-      const next = noteBusy(sql, tenantId, agentId, jobId, retry, now, turnMessages(sql), INBOUND_DEDUPE_MS);
-      const wrote = agent.deliver(jobId, { ...(answer as AnsweredMessage), providerError: next.sentence }, taker);
-      if (typeof wrote !== "boolean") throw new Error("a busy answer reached an engine whose delivery is not synchronous");
-      if (wrote) logEvent("model_job.busy", { tenantId, agentId, jobId, attempts: next.attempts, retryAt: next.dueAt ?? undefined, sentence: next.sentence });
-      return wrote;
-    });
+    return (await this.agent(tenantId, agentId, session)).deliver(jobId, answer as any, taker);
   }
 
   /**

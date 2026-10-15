@@ -1548,17 +1548,7 @@ export type InboundResult =
   // side `malformed` exists to avoid.
   | { deliver: false; reason: string; rejected?: true; malformed?: never }
   | { deliver: false; reason: string; malformed?: true; rejected?: never }
-  | {
-    deliver: true; text: string; dedupeKey?: string; kind?: "event" | "inbox";
-    /**
-     * The messages the push is about, one opaque id each, when a service sends more than one push about the same
-     * messages (Raft notifies again while an inbox stays unread, each notice under its own `dedupeKey`). A push whose
-     * every id was already delivered brings nothing new. Read only where a turn is waiting on those messages already
-     * (a busy first turn's retry, src/runtime/busy-retry.ts), where such a push is a duplicate; anywhere else it is
-     * delivered as before.
-     */
-    messageIds?: string[];
-  };
+  | { deliver: true; text: string; dedupeKey?: string; kind?: "event" | "inbox" };
 
 /** `return backgrounded({ boxId, execId }, "…")` — see {@link Backgrounded}. */
 export function backgrounded(handle: Json, note?: string): Backgrounded {

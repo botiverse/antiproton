@@ -1,13 +1,12 @@
 import { operatorRequest, providerOfRef, type OperatorModel } from "../../src/model/operator-request.ts";
 import { DEFAULT_PROVIDER, modelProblem, providersFrom, type ModelChoice, type ModelProviders } from "../../src/model/providers.ts";
 import type { UserModel, UserModels } from "../../src/model/user-models.ts";
-import { MODEL_CALL_DEADLINE_MS, ModelRequestRefused, OpenAiCompatibleModel } from "../../src/model/openai-compatible.ts";
-import { BUSY_UNDECIDED, fallbackOutcomeOf, jobFallback, MODEL_BUSY_ERROR, primaryOutcomeOf, type FallbackFacts, type JobFallback } from "../../src/model/model-fallback.ts";
+import { ModelRequestRefused, OpenAiCompatibleModel } from "../../src/model/openai-compatible.ts";
 import { OpenAiResponsesModel, usesResponses } from "../../src/model/openai-responses.ts";
 import { errorMessage, fromResponse, toRequest, toResponsesInput, type AnsweredMessage } from "../../src/model/pi-bridge.ts";
 import type { ModelResponse } from "../../src/model/types.ts";
 import { acceptsImages } from "../../src/model/context-windows.ts";
-import { DEFAULT_IMAGE_WINDOW, hasImageRefs, imageKey, nonVisionImageItems, resolveImages, resolveImagesReported, windowStep, type ImageItem, type ImageLoader, type ImageWindow } from "../../src/model/images.ts";
+import { DEFAULT_IMAGE_WINDOW, hasImageRefs, imageKey, nonVisionImageItems, resolveImagesReported, windowStep, type ImageItem, type ImageLoader, type ImageWindow } from "../../src/model/images.ts";
 import type { QueuedModelCall } from "./model-queue.ts";
 import { capItems, imageAttemptWriter, providerOutcome, type ImageEvidenceSink } from "./image-evidence.ts";
 import { logEvent } from "../../src/core/log.ts";
@@ -175,10 +174,7 @@ export function queuedCall(env: ModelEnv, bucket: Parameters<typeof imageLoaderF
 export async function callQueuedModel(env: ModelEnv, job: any, jobId: string, images?: ImageLoader, evidence?: ImageEvidenceSink): Promise<AnsweredMessage> {
   const called = String(job.operatorModel ?? env.HARNESS_MODEL);
   const provider = job.operatorModel ? String(job.operatorProvider ?? DEFAULT_PROVIDER) : DEFAULT_PROVIDER;
-  // A call its object marked may go to a second model (src/model/model-fallback.ts); then the primary runs under the
-  // mark's own time limit. A job without the mark is sent exactly the request it always was.
-  const fallback = jobFallback(job);
-  const request = { ...operatorRequest(operatorModelOf(env), { provider, model: called }), ...(fallback ? { deadlineMs: fallback.primaryMs } : {}) };
+  const request = operatorRequest(operatorModelOf(env), { provider, model: called });
   const sees = acceptsImages(called);
   const window = imageWindowOf(env);
   const recording = !!evidence && job?.imageEvidence === true && hasImageRefs(job.context ?? {});
@@ -197,7 +193,17 @@ export async function callQueuedModel(env: ModelEnv, job: any, jobId: string, im
   // The one option a job may carry: reasoning off for a first turn its object marked (`AgentRuntime.takeJob`). A job
   // without it is sent exactly the request it always was.
   const reasoning = jobReasoning(job);
-  const call = providerCall(env, called, request, context, sees, { ...observe, ...reasoning });
+  let call: () => Promise<ModelResponse>;
+  if (usesResponses(called)) {
+    const toolImages = env.RESPONSES_TOOL_IMAGES === "user" ? "user" as const : "output" as const;
+    const { input, tools } = toResponsesInput(context, called, { images: sees, toolImages });
+    const model = new OpenAiResponsesModel(request);
+    call = () => model.complete(input, { ...(tools ? { tools } : {}), ...observe, ...reasoning });
+  } else {
+    const model = new OpenAiCompatibleModel(request);
+    const { messages, tools } = toRequest(context, { images: sees });
+    call = () => model.complete(messages, { ...(tools ? { tools } : {}), ...observe, ...reasoning });
+  }
   const identity = {
     api: String(job.model?.api ?? "offloaded"),
     provider: String(job.model?.provider ?? "openai-compatible"),
@@ -211,18 +217,11 @@ export async function callQueuedModel(env: ModelEnv, job: any, jobId: string, im
   }, jobId) : null;
   // The request is built: what it carries is decided, and it has not been sent.
   attempt?.prepared(new Date());
-  const t0 = Date.now();
   let res;
   try {
     res = await call();
   } catch (e) {
     await attempt?.ended(providerOutcome(e, lastStatus, new Date()));
-    // A primary that did not answer in time, or answered "not now", hands the call to the fallback once. A refusal
-    // is not such an ending (`primaryOutcomeOf`): the same request would be refused there too.
-    const outcome = fallback ? primaryOutcomeOf(e) : null;
-    if (fallback && outcome) {
-      return callFallback(env, fallback, { job, jobId, called, provider, identity, images, reasoning, primaryOutcome: outcome, primaryMs: Date.now() - t0 });
-    }
     // A refusal of the request itself is this job's answer, not a failure to retry: the queue would send the
     // same request again and be refused again (src/model/openai-compatible.ts, `isPermanentRefusal`). Answered
     // as an error, it fails the turn once. `errorMessage` is the refusal's fixed text, the one string the
@@ -230,67 +229,10 @@ export async function callQueuedModel(env: ModelEnv, job: any, jobId: string, im
     // readers show (`failureText`, src/model/pi-bridge.ts). Anything else is thrown, so the queue retries it.
     if (!(e instanceof ModelRequestRefused)) throw e;
     logEvent("model_job.refused", { jobId, provider, model: called, status: e.status });
-    return { ...errorMessage(e.message, identity), providerError: e.turnError, jobId,
-      ...(fallback ? { fallback: { primaryOutcome: `refused_${e.status}`, primaryMs: Date.now() - t0 } satisfies FallbackFacts } : {}) };
+    return { ...errorMessage(e.message, identity), providerError: e.turnError, jobId };
   }
   await attempt?.ended(providerOutcome(undefined, lastStatus, new Date()));
-  const answer = fromResponse(res, identity, jobId);
-  // A marked call answered by its primary still records how long that took: the first turn's latency, whichever way it went.
-  return fallback ? { ...answer, fallback: { primaryOutcome: "ok", primaryMs: Date.now() - t0 } satisfies FallbackFacts } : answer;
-}
-
-/**
- * The provider call for `model` at `request`: the Responses API for an OpenAI reasoning model (`usesResponses`),
- * chat/completions for every other, from the job's context in each one's form.
- */
-function providerCall(
-  env: ModelEnv, model: string, request: ConstructorParameters<typeof OpenAiCompatibleModel>[0], context: any, sees: boolean,
-  opts: { onStatus?: (s: number) => void; reasoning?: "off" },
-): () => Promise<ModelResponse> {
-  if (usesResponses(model)) {
-    const toolImages = env.RESPONSES_TOOL_IMAGES === "user" ? "user" as const : "output" as const;
-    const { input, tools } = toResponsesInput(context, model, { images: sees, toolImages });
-    const client = new OpenAiResponsesModel(request);
-    return () => client.complete(input, { ...(tools ? { tools } : {}), ...opts });
-  }
-  const client = new OpenAiCompatibleModel(request);
-  const { messages, tools } = toRequest(context, { images: sees });
-  return () => client.complete(messages, { ...(tools ? { tools } : {}), ...opts });
-}
-
-/**
- * The fallback's one call, after a primary that did not answer (`primaryOutcomeOf`): the same conversation, with the
- * same reasoning setting, built for the fallback's model (its own serializer, and images only if it can see them),
- * under what is left of the call's whole budget (MODEL_CALL_DEADLINE_MS) and at most the mark's `fallbackMs`.
- *
- * Never thrown: an answer names the fallback's model, which is the model the ledger meters (docs/metering.md); any
- * failure, a refusal included, is the busy answer (`MODEL_BUSY_ERROR`), which the queue acks and the agent's object
- * re-dispatches on its own schedule (src/runtime/busy-retry.ts). A refusal there is not the request's fault the way a
- * primary's is — the primary was not answering either — so the turn is tried again from the primary.
- */
-async function callFallback(env: ModelEnv, fallback: JobFallback, c: {
-  job: any; jobId: string; called: string; provider: string; identity: { api: string; provider: string; id: string };
-  images?: ImageLoader; reasoning: { reasoning: "off" } | Record<string, never>; primaryOutcome: string; primaryMs: number;
-}): Promise<AnsweredMessage> {
-  const budgetMs = Math.max(1_000, Math.min(fallback.fallbackMs, MODEL_CALL_DEADLINE_MS - c.primaryMs));
-  const facts: FallbackFacts = { fallbackFrom: c.called, primaryOutcome: c.primaryOutcome, primaryMs: c.primaryMs };
-  const log = { jobId: c.jobId, from: c.called, fromProvider: c.provider, to: fallback.model, toProvider: fallback.provider,
-    primaryOutcome: c.primaryOutcome, primaryMs: c.primaryMs, budgetMs };
-  const t0 = Date.now();
-  try {
-    const sees = acceptsImages(fallback.model);
-    const context = sees ? await resolveImages(c.job.context, c.images, imageWindowOf(env)) : c.job.context;
-    const request = { ...operatorRequest(operatorModelOf(env), { provider: fallback.provider, model: fallback.model }), deadlineMs: budgetMs };
-    const res = await providerCall(env, fallback.model, request, context, sees, c.reasoning)();
-    logEvent("model_job.fallback", { ...log, outcome: "answered", fallbackMs: Date.now() - t0 });
-    return { ...fromResponse(res, { ...c.identity, id: fallback.model }, c.jobId), fallback: facts };
-  } catch (e) {
-    const fallbackOutcome = fallbackOutcomeOf(e);
-    logEvent("model_job.fallback", { ...log, outcome: fallbackOutcome, fallbackMs: Date.now() - t0,
-      error: String((e as Error)?.message ?? e).slice(0, 200) });
-    return { ...errorMessage(MODEL_BUSY_ERROR, c.identity), providerError: BUSY_UNDECIDED, jobId: c.jobId,
-      fallback: { ...facts, fallbackOutcome } };
-  }
+  return fromResponse(res, identity, jobId);
 }
 
 /** `reasoning` as a taken job carries it: only "off" is ever set (`AgentRuntime.takeJob`); anything else is no option. */

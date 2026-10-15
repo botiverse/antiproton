@@ -15,12 +15,9 @@
  *   tool.call               → PreToolUse + PostToolUse / PostToolUseFailure  (not one the provider ran: `operatorCall`)
  *   model.call stop|length  → Stop                (the turn is answered)
  *   model.call aborted      → Stop                (cancelled: no longer working)
- *   model.call error        → BridgeFatal         (the turn died; a daily spend limit's refusal, or a first turn no
- *                                                  model answered, says so and why)
+ *   model.call error        → BridgeFatal         (the turn died; a daily spend limit's refusal says so and why)
  *   model.call toolUse      → nothing             (still working)
  *   session.needs_reset set → BridgeFatal         (the overflow backstop gave up: pushes are refused until a reset)
- *   model.retry refused     → BridgeFatal         (a busy first turn's re-dispatch could not start: model_unavailable)
- *   model.retry cancelled   → Stop                (a busy first turn's scheduled re-dispatch was cancelled)
  *   agent.ready             → nothing             (its `online` is a status-only event, src/runtime/status.ts)
  *
  * The event id is the row's seq under the agent: unique for the agent's
@@ -124,13 +121,6 @@ function hookEvents(agentId: string, rows: readonly TraceOutboxRow[]): ActivityE
       case "session.needs_reset":
         if (row.status === "set") out.push({ ...base, hookEventName: "BridgeFatal", errorClass: NEEDS_RESET_ERROR });
         break;
-      // A busy first turn's re-dispatch that will never come (src/runtime/busy-retry.ts): given up, with its
-      // `model_unavailable` sentence, or cancelled, which ends the turn like a cancelled call does.
-      case "model.retry":
-        if (row.status === "refused" && typeof row.attrs.busy === "string" && row.attrs.busy) {
-          out.push({ ...base, hookEventName: "BridgeFatal", errorClass: row.attrs.busy.slice(0, 120) });
-        } else if (row.status === "cancelled") out.push({ ...base, hookEventName: "Stop" });
-        break;
       default:
         break;
     }
@@ -150,16 +140,9 @@ export const NEEDS_RESET_ERROR = "context_overflow: conversation too long for th
  * entry, at most 120 characters (slock agentOrchestrator.ts, the BridgeFatal mapping), so a call refused for a daily
  * spend limit (`attrs.limit`, src/trace/seams.ts `modelCallRow`) names itself and carries its sentence, as
  * `NEEDS_RESET_ERROR` does; anything else is `model_call_failed`.
- *
- * A first-turn call neither the primary nor the fallback model answered (`attrs.busy`, src/model/model-fallback.ts)
- * carries its sentence the same way, and Raft matches only its prefix, a closed set agreed with Raft's engineer:
- * `model_busy: …` while the agent's object has a re-dispatch of the turn scheduled, `model_unavailable: …` once it has
- * given up (src/runtime/busy-retry.ts). Nothing is sent when the agent recovers: its next activity says so.
  */
 export const USAGE_LIMIT_ERROR_CLASS = "usage_limit_reached";
 function modelCallErrorClass(row: TraceOutboxRow): string {
   const limit = typeof row.attrs.limit === "string" && row.attrs.limit ? row.attrs.limit : null;
-  if (limit) return `${USAGE_LIMIT_ERROR_CLASS}: ${limit}`.slice(0, 120);
-  const busy = typeof row.attrs.busy === "string" && row.attrs.busy ? row.attrs.busy : null;
-  return busy ? busy.slice(0, 120) : "model_call_failed";
+  return limit ? `${USAGE_LIMIT_ERROR_CLASS}: ${limit}`.slice(0, 120) : "model_call_failed";
 }
