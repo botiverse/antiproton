@@ -675,7 +675,7 @@ Deployment configuration, off unless the `MODEL_FALLBACK` var is set; nothing in
   bound model, a lock on it and the server's model picker are untouched: it is per call.
 - **What happens.** The primary runs under `primaryS`, its own in-call retries of a 5xx or 429 included. A 5xx or 429
   past those, a provider that cannot be reached, or the limit sends the same call, once, to the `to` model with what is
-  left of the budget (at most `fallbackS`, default 300). A refusal of the request itself (400, 401, 403, 404, 422) is
+  left of the budget (at most `fallbackS`, default 50). A refusal of the request itself (400, 401, 403, 404, 422) is
   never sent to the fallback. An answer from the fallback is the turn's answer, metered under the fallback's model.
 - **Neither answers.** The call is answered with a fixed busy error instead of being sent back to the model queue
   (which used to hold such a turn for up to four deliveries), and the agent's object runs the same turn again after
@@ -684,15 +684,21 @@ Deployment configuration, off unless the `MODEL_FALLBACK` var is set; nothing in
   end the first turn. Raft is told through the failed call's `BridgeFatal` `errorClass` (at most 120 characters):
   `model_busy: primary and fallback model both unavailable; retrying in 2 min` (then `…in 5 min`) while a retry is
   scheduled, and `model_unavailable: primary and fallback model unavailable on 3 attempts; giving up` after the last.
-  A recovery sends nothing special: the agent's next activity says so.
+  A recovery sends nothing special: the agent's next activity says so. A message from the person ends the series
+  (a busy answer after it counts from one again); a cancel stops a scheduled retry, which Raft sees as the turn's
+  `Stop`; a deleted agent is never called again (the delete drops the schedule, and the object asks the registry
+  before any retry). A retry the engine cannot start is given up, with the `model_unavailable` sentence. These ends
+  are recorded as `model.retry` trace rows.
 - **Trace.** The call's `model.call` row carries `primaryMs` on every marked call (the first turn's latency, whichever
   model answered), and `fallbackFrom`, `primaryOutcome` (`http_5xx`, `http_429`, `timeout`, `network`, or
   `refused_<status>`) and `fallbackOutcome` when they apply; the consumer logs `model_job.fallback`, the object
   `model_job.busy` and `model_job.busy_retry`.
 - **Turning it on.** Set the var, for example in `cf/wrangler.jsonc` `vars`:
-  `"MODEL_FALLBACK": { "to": "gpt-5.6-luna", "scope": "firstTurn", "primaryS": 60, "retryAfterS": [120, 300] }`.
+  `"MODEL_FALLBACK": { "to": "gpt-5.6-luna", "scope": "firstTurn", "primaryS": 60, "fallbackS": 50, "retryAfterS": [120, 300] }`.
   `to` is a `USER_MODELS` id that is offered (its provider's secret set); `scope` is `"firstTurn"`, the only one;
-  `primaryS` and `fallbackS` are whole seconds from 1 to 900, together at most 840; `retryAfterS` at most 10 delays.
+  `primaryS` and `fallbackS` (default 50) are whole seconds, **together at most 110**: a job with no answer 120 s
+  after it was sent is sent to the queue again (pi085's `REDELIVERY_MS`), and a call still running then would be made
+  a second time at both providers; `retryAfterS` at most 10 delays.
   A value that is refused is off, and `GET /admin/models` says why (`modelFallbackError`; `modelFallback` when on).
   Removing the var turns it off for every call after; a retry already scheduled still runs, as an ordinary call.
 
