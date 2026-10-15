@@ -664,6 +664,38 @@ right after signing up:
 - **Nothing else changes**: the import contract is as it was, and an agent made without the field runs every
   turn with the provider's default reasoning.
 
+#### A second model for the first turn (`MODEL_FALLBACK`)
+
+Deployment configuration, off unless the `MODEL_FALLBACK` var is set; nothing in the provision payload asks for it
+(src/model/model-fallback.ts):
+
+- **Which calls.** A call of the first turn (as `firstTurn` above decides it: the agent was made with `firstTurn`,
+  and no turn of its first main conversation has ended) of an agent whose binding spends the operator's account on a
+  DeepSeek model. Every other call, and every agent made without `firstTurn`, is called as it always was. The agent's
+  bound model, a lock on it and the server's model picker are untouched: it is per call.
+- **What happens.** The primary runs under `primaryS`, its own in-call retries of a 5xx or 429 included. A 5xx or 429
+  past those, a provider that cannot be reached, or the limit sends the same call, once, to the `to` model with what is
+  left of the budget (at most `fallbackS`, default 300). A refusal of the request itself (400, 401, 403, 404, 422) is
+  never sent to the fallback. An answer from the fallback is the turn's answer, metered under the fallback's model.
+- **Neither answers.** The call is answered with a fixed busy error instead of being sent back to the model queue
+  (which used to hold such a turn for up to four deliveries), and the agent's object runs the same turn again after
+  each of `retryAfterS` in turn (the conversation up to the busy call, tool results carried, nothing re-run); a
+  message from the person before then carries the turn on instead, and no turn is run twice. A busy answer does not
+  end the first turn. Raft is told through the failed call's `BridgeFatal` `errorClass` (at most 120 characters):
+  `model_busy: primary and fallback model both unavailable; retrying in 2 min` (then `…in 5 min`) while a retry is
+  scheduled, and `model_unavailable: primary and fallback model unavailable on 3 attempts; giving up` after the last.
+  A recovery sends nothing special: the agent's next activity says so.
+- **Trace.** The call's `model.call` row carries `primaryMs` on every marked call (the first turn's latency, whichever
+  model answered), and `fallbackFrom`, `primaryOutcome` (`http_5xx`, `http_429`, `timeout`, `network`, or
+  `refused_<status>`) and `fallbackOutcome` when they apply; the consumer logs `model_job.fallback`, the object
+  `model_job.busy` and `model_job.busy_retry`.
+- **Turning it on.** Set the var, for example in `cf/wrangler.jsonc` `vars`:
+  `"MODEL_FALLBACK": { "to": "gpt-5.6-luna", "scope": "firstTurn", "primaryS": 60, "retryAfterS": [120, 300] }`.
+  `to` is a `USER_MODELS` id that is offered (its provider's secret set); `scope` is `"firstTurn"`, the only one;
+  `primaryS` and `fallbackS` are whole seconds from 1 to 900, together at most 840; `retryAfterS` at most 10 delays.
+  A value that is refused is off, and `GET /admin/models` says why (`modelFallbackError`; `modelFallback` when on).
+  Removing the var turns it off for every call after; a retry already scheduled still runs, as an ordinary call.
+
 #### Which budget pays (`budget`)
 
 `POST /provision/agents` takes `budget: "onboarding"` (optional; absent or `null` is the tenant's own budget, today's
