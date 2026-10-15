@@ -110,7 +110,7 @@ function provisionDeps(rt: InstanceType<typeof AgentRuntime>): ProvisionDeps {
         const r = await rt.attachCredential(tenantId, agentId, PROVISION_MOUNT_ALIAS, { token: credential });
         return r.ok ? { ok: true, account: r.account } : { ok: false, error: r.error };
       },
-      removeCredential: async (tenantId, agentId) => (await rt.removeCredential(tenantId, agentId, PROVISION_MOUNT_ALIAS)).ok,
+      removeCredential: (tenantId, agentId) => rt.removeCredential(tenantId, agentId, PROVISION_MOUNT_ALIAS),
       tool: (tenantId, agentId, name) => provisionTool(rt, tenantId, agentId, name),
       pushStatus: (tenantId, agentId) => provisionPushStatus(rt, tenantId, agentId),
     },
