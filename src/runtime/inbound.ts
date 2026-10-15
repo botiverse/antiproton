@@ -194,6 +194,9 @@ export const INBOUND_QUEUE_MAX = 30;
  */
 const ADDED_COLUMNS = [
   { table: "inbound_pending", column: "installation_id", sql: "ALTER TABLE inbound_pending ADD COLUMN installation_id TEXT" },
+  // The messages a push is about (`InboundResult.messageIds`, a JSON array), carried to the post, which tells a busy
+  // first turn's retry series which messages its turn holds (`AgentRuntime.postMessage`, src/runtime/busy-retry.ts).
+  { table: "inbound_pending", column: "message_ids", sql: "ALTER TABLE inbound_pending ADD COLUMN message_ids TEXT" },
 ];
 
 /** Storage handles already brought up to `ADDED_COLUMNS`: this runs on every push, the probe once per handle. */
@@ -246,6 +249,8 @@ export interface PendingInbound {
    * existed, which is posted as it would have been.
    */
   installationId: string | null;
+  /** The messages the push is about (`InboundResult.messageIds`); null when its plugin said nothing, or on an older row. */
+  messageIds?: string[] | null;
 }
 
 /**
@@ -255,9 +260,11 @@ export interface PendingInbound {
  */
 export function acceptInbound(sql: SqlHost["sql"], row: {
   hookId: string; alias: string; dedupeKey: string | null; message: string; now: number; installationId?: string | null;
+  messageIds?: readonly string[] | null;
 }) {
-  sql.exec("INSERT INTO inbound_pending(hook_id, alias, dedupe_key, message, received_at, installation_id) VALUES (?, ?, ?, ?, ?, ?)",
-    row.hookId, row.alias, row.dedupeKey ?? `${LOCAL_KEY}${crypto.randomUUID()}`, row.message, row.now, row.installationId ?? null);
+  sql.exec("INSERT INTO inbound_pending(hook_id, alias, dedupe_key, message, received_at, installation_id, message_ids) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    row.hookId, row.alias, row.dedupeKey ?? `${LOCAL_KEY}${crypto.randomUUID()}`, row.message, row.now, row.installationId ?? null,
+    row.messageIds?.length ? JSON.stringify(row.messageIds) : null);
 }
 
 /** The prefix of a key made here for a push its plugin named none for; such a key is never a duplicate of anything. */
@@ -266,7 +273,7 @@ export const LOCAL_KEY = "local:";
 /** The oldest push not yet settled; arrival order is delivery order. */
 export function nextPendingInbound(sql: SqlHost["sql"]): PendingInbound | null {
   return readPending(sql.exec(
-    "SELECT seq, hook_id, alias, dedupe_key, message, received_at, state, attempts, next_at, last_error, installation_id FROM inbound_pending ORDER BY seq LIMIT 1",
+    "SELECT seq, hook_id, alias, dedupe_key, message, received_at, state, attempts, next_at, last_error, installation_id, message_ids FROM inbound_pending ORDER BY seq LIMIT 1",
   ).toArray()[0]);
 }
 
@@ -276,6 +283,7 @@ function readPending(r: any): PendingInbound | null {
     message: String(r.message), receivedAt: Number(r.received_at), state: r.state === "posting" ? "posting" : "queued",
     attempts: Number(r.attempts), nextAt: Number(r.next_at), lastError: r.last_error === null ? null : String(r.last_error),
     installationId: r.installation_id === null || r.installation_id === undefined ? null : String(r.installation_id),
+    messageIds: idsOf(r.message_ids),
   } : null;
 }
 
@@ -299,7 +307,7 @@ export function expiredPendingInbound(sql: SqlHost["sql"], now: number): number[
 /** One queued row by its seq, or null when it is gone. */
 export function pendingInboundRow(sql: SqlHost["sql"], seq: number): PendingInbound | null {
   return readPending(sql.exec(
-    "SELECT seq, hook_id, alias, dedupe_key, message, received_at, state, attempts, next_at, last_error, installation_id FROM inbound_pending WHERE seq = ?", seq,
+    "SELECT seq, hook_id, alias, dedupe_key, message, received_at, state, attempts, next_at, last_error, installation_id, message_ids FROM inbound_pending WHERE seq = ?", seq,
   ).toArray()[0]);
 }
 
@@ -470,3 +478,10 @@ function base64url(bytes: Uint8Array): string {
   return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
+
+/** A stored JSON array of message ids, or null for anything else. */
+function idsOf(v: unknown): string[] | null {
+  if (typeof v !== "string") return null;
+  try { const a = JSON.parse(v); return Array.isArray(a) && a.every((x) => typeof x === "string") && a.length ? a : null; }
+  catch { return null; }
+}

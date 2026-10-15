@@ -691,7 +691,11 @@ Deployment configuration, off unless the `MODEL_FALLBACK` var is set; nothing in
   `Stop`; a deleted agent is never called again (the delete drops the schedule, and the object asks the registry
   before any retry). A retry the engine cannot start, or one whose registry check stays unreadable for 10 minutes past its time, is
   given up, with the `model_unavailable` sentence. These ends
-  are recorded as `model.retry` trace rows.
+  are recorded as `model.retry` trace rows. A push that brings the series nothing new — Raft's remind, under a new
+  notice id, whose every conversation's latest message was already pushed to the turn — is not a new message: while
+  the series is scheduled, re-dispatched or given up (and `MODEL_FALLBACK` is on) it is recorded as `duplicate` and
+  posts nothing, so it neither starts a second turn nor resets the count. A push with any newer latest message starts
+  a new series as before, and once the turn is answered nothing is held back.
 - **Trace.** The call's `model.call` row carries `primaryMs` on every marked call (the first turn's latency, whichever
   model answered), and `fallbackFrom`, `primaryOutcome` (`http_5xx`, `http_429`, `timeout`, `network`, or
   `refused_<status>`) and `fallbackOutcome` when they apply; the consumer logs `model_job.fallback`, the object
