@@ -111,8 +111,9 @@ export interface ProvisionModels {
   /**
    * Whether the switch above is applied (MODEL_PICKER_ENFORCE "1"; cf/src/index.ts `modelPickerEnforced`). False: the
    * switch is still stored and read back, but no pick is refused or rewritten for it, so model choice is what it was
-   * before the switch existed. Off until Raft sets every server's switch: until then a server with no row reads as
-   * off, and enforcing would refuse picks Raft allows today.
+   * before the switch existed. On only where Raft stores every server's switch before its creates (production; see
+   * docs/agent-surface.md, "The server's model picker"): a server with no row reads as off, so enforcing anywhere else
+   * would refuse picks Raft allows.
    */
   enforcePicker: boolean;
 }

@@ -76,7 +76,7 @@ const RAFT_CRED = "sk_agent_" + "R".repeat(32);
  * does). `USER_MODELS` unset gives a deployment that offers nothing. `picker` is T's model-picker switch before the
  * POST: on unless a check says otherwise, since every check before the switch existed is about a tenant that may pick.
  * `enforce` is the deployment's MODEL_PICKER_ENFORCE: "1" unless a check says otherwise, so the switch's checks test
- * it applied; `enforce: false` leaves the variable unset, as production and preview have it.
+ * it applied, as production has it; `enforce: false` leaves the variable unset, as preview has it.
  */
 async function world(opts: { userModels?: unknown[] | null; post?: false | Record<string, unknown>; picker?: boolean; enforce?: boolean } = {}) {
   const DB = d1();
@@ -858,17 +858,24 @@ await check("picker off: a create interrupted while it was on finishes on its re
   must((await w.rt.store.getModelBinding(T, A))?.model === "openai/gpt-5.6-luna", "the replay did not bind it");
 });
 
-// ---- the switch not enforced (MODEL_PICKER_ENFORCE unset, as deployed until Raft sets every server's switch) -------
+// ---- the switch not enforced (MODEL_PICKER_ENFORCE unset, as preview has it) ----------------------------------------
 
-await check("MODEL_PICKER_ENFORCE: only exactly \"1\" enforces; no wrangler config sets it", () => {
+await check("MODEL_PICKER_ENFORCE: only exactly \"1\" enforces; production sets exactly \"1\", preview does not set it", () => {
   for (const [v, on] of [["1", true], [undefined, false], ["", false], ["0", false], ["true", false], [" 1", false], ["1 ", false]] as const) {
     must(modelPickerEnforced({ MODEL_PICKER_ENFORCE: v }) === on, `${show(v)} read as ${!on ? "on" : "off"}`);
   }
-  // Comment lines dropped (test/eval-seed.ts `varsOf` reads the configs the same way); the name anywhere else is set.
-  for (const file of ["wrangler.jsonc", "wrangler.preview.jsonc"]) {
+  // Comment lines dropped and the rest parsed (test/eval-seed.ts `varsOf` reads the configs the same way); every
+  // environment's vars count, since a nested environment deploys as much as the top.
+  const varsOf = (file: string): Record<string, unknown> => {
     const code = readFileSync(new URL(`../cf/${file}`, import.meta.url), "utf8").split("\n").filter((l) => !l.trim().startsWith("//")).join("\n");
-    must(!code.includes("MODEL_PICKER_ENFORCE"), `cf/${file} sets MODEL_PICKER_ENFORCE: Raft does not set every server's switch yet`);
-  }
+    const parsed = JSON.parse(code) as { vars?: Record<string, unknown>; env?: Record<string, { vars?: Record<string, unknown> }> };
+    must(parsed.vars && typeof parsed.vars === "object", `cf/${file} has no vars`);
+    return Object.assign({}, parsed.vars, ...Object.values(parsed.env ?? {}).map((e) => e.vars ?? {}));
+  };
+  const prod = varsOf("wrangler.jsonc");
+  must(prod.MODEL_PICKER_ENFORCE === "1", `cf/wrangler.jsonc sets MODEL_PICKER_ENFORCE = ${show(prod.MODEL_PICKER_ENFORCE)}: production enforces the switch`);
+  const preview = varsOf("wrangler.preview.jsonc");
+  must(!("MODEL_PICKER_ENFORCE" in preview), `cf/wrangler.preview.jsonc sets MODEL_PICKER_ENFORCE = ${show(preview.MODEL_PICKER_ENFORCE)}: preview leaves it unset`);
 });
 
 await check("not enforced: with the switch stored off, POST and PUT …/model take every offered pick as before the switch (stored, bound, run); unknown is still 422", async () => {

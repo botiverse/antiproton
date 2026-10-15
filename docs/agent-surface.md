@@ -275,7 +275,7 @@ GET or PUT /provision/agents/{agentId}/model
 - **Off by default, where enforced.** On a deployment that enforces the switch (`MODEL_PICKER_ENFORCE` `"1"`), a
   server may pick a model other than the deployment's default only once Raft has turned its model picker on
   ([below](#the-servers-model-picker-model-picker)); until then a `PUT` of another model is `403`. Where it is not
-  enforced (production and preview today) every offered pick is taken as above. `GET /provision/models` reports
+  enforced (preview today; production enforces it) every offered pick is taken as above. `GET /provision/models` reports
   the stored switch as `pickerEnabled`.
 - **An agent never given a pick** is unchanged by these routes: reading them stores nothing and rebuilds
   nothing, and it runs on the default as before (`test/provision-model.ts`).
@@ -295,12 +295,13 @@ PUT /provision/servers/{raftServerId}/model-picker
   (`modelPickerEnforced`): exactly `"1"` applies the switch as this section describes; anything else, or unset,
   stores and reports it (this route, `pickerEnabled`) but refuses and rewrites no pick, so model choice is what it
   was before the switch existed — every offered id taken and stored as a pick, the default by name included, and
-  `409 model_locked` under an operator's agent or tenant row as before. No wrangler config sets it
-  (`test/provision-model.ts` fails if `cf/wrangler.jsonc` or `cf/wrangler.preview.jsonc` does), because a server
-  with no row reads as off: enforced before Raft has sent the switch for every server, it would refuse picks Raft
-  allows. To turn it on, once Raft has backfilled every server and syncs the switch before each create: add
-  `"MODEL_PICKER_ENFORCE": "1"` to the `vars` of `cf/wrangler.jsonc` (and `cf/wrangler.preview.jsonc` for
-  preview), drop the wrangler check in `test/provision-model.ts` for that file, and deploy. Everything below
+  `409 model_locked` under an operator's agent or tenant row as before. **Production enforces it** as of
+  2026-10-15: `cf/wrangler.jsonc` sets `"MODEL_PICKER_ENFORCE": "1"`; `cf/wrangler.preview.jsonc` leaves it unset
+  (`test/provision-model.ts` fails if production sets anything but `"1"` or preview sets it at all). It was turned
+  on only once the rollout order below held, because a server with no row reads as off: Raft v1.21.16, with
+  #9867, #9876 and #9877, is live and syncs the switch before each create; all 5 hosted servers were synced
+  (`enabled: false`) with 0 failures. To turn it on for preview too, add the same var to the `vars` of
+  `cf/wrangler.preview.jsonc`, change that check in `test/provision-model.ts`, and deploy. Everything below
   "Default: off" describes the enforced behaviour.
 - **Default: off.** A server Raft has never sent this for is off. Raft sends it whenever its flag for the server
   changes; the latest write wins.
