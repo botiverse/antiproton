@@ -124,6 +124,10 @@ export function modelCallRow(m: {
   usage?: { input?: unknown; cacheRead?: unknown; cacheWrite?: unknown } | null;
   /** The sentence of a call refused for a daily spend limit (`spendLimitRefusal`, src/model/pi-bridge.ts), for Raft. */
   limit?: string;
+  /** The sentence of a call neither model answered (`busySentence`, src/model/model-fallback.ts), for Raft. */
+  busy?: string;
+  /** How a call that could fall back went (`fallbackFacts`, src/model/model-fallback.ts). */
+  fallback?: { fallbackFrom?: string; primaryOutcome: string; primaryMs: number; fallbackOutcome?: string };
 }): TraceRow {
   const ms = typeof m.createdAt === "number" && typeof m.answeredAt === "number"
     ? Math.max(0, m.answeredAt - m.createdAt) : undefined;
@@ -137,8 +141,10 @@ export function modelCallRow(m: {
     status: m.stopReason, verdict: answerVerdict(m.stopReason),
     ...(ms === undefined ? {} : { ms }),
     // The model first: keys drop from the end when attrs are too long (src/trace/outbox.ts `attrsOf`).
-    // The limit's sentence next: what the owner is shown (src/runtime/activity.ts), the last thing to be dropped.
-    attrs: { model: m.model, ...(m.limit ? { limit: m.limit } : {}), ...tokens, ...(m.prefix ? { prefix: m.prefix } : {}) },
+    // The limit's or the busy sentence next: what the owner is shown (src/runtime/activity.ts), the last thing to be
+    // dropped. Then the fallback's facts, which are short.
+    attrs: { model: m.model, ...(m.limit ? { limit: m.limit } : {}), ...(m.busy ? { busy: m.busy } : {}),
+      ...(m.fallback ? m.fallback : {}), ...tokens, ...(m.prefix ? { prefix: m.prefix } : {}) },
   };
 }
 

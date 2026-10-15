@@ -664,6 +664,47 @@ right after signing up:
 - **Nothing else changes**: the import contract is as it was, and an agent made without the field runs every
   turn with the provider's default reasoning.
 
+#### A second model for the first turn (`MODEL_FALLBACK`)
+
+Deployment configuration, off unless the `MODEL_FALLBACK` var is set; nothing in the provision payload asks for it
+(src/model/model-fallback.ts):
+
+- **Which calls.** A call of the first turn (as `firstTurn` above decides it: the agent was made with `firstTurn`,
+  and no turn of its first main conversation has ended) of an agent whose binding spends the operator's account on a
+  DeepSeek model. Every other call, and every agent made without `firstTurn`, is called as it always was. The agent's
+  bound model, a lock on it and the server's model picker are untouched: it is per call.
+- **What happens.** The primary runs under `primaryS`, its own in-call retries of a 5xx or 429 included. A 5xx or 429
+  past those, a provider that cannot be reached, or the limit sends the same call, once, to the `to` model with what is
+  left of the budget (at most `fallbackS`, default 50). A refusal of the request itself (400, 401, 403, 404, 422) is
+  never sent to the fallback. An answer from the fallback is the turn's answer, metered under the fallback's model.
+- **Neither answers.** The call is answered with a fixed busy error instead of being sent back to the model queue
+  (which used to hold such a turn for up to four deliveries), and the agent's object runs the same turn again after
+  each of `retryAfterS` in turn (the conversation up to the busy call, tool results carried, nothing re-run); a
+  message from the person before then carries the turn on instead, and no turn is run twice. A busy answer does not
+  end the first turn. Raft is told through the failed call's `BridgeFatal` `errorClass` (at most 120 characters):
+  `model_busy: primary and fallback model both unavailable; retrying in 2 min` (then `…in 5 min`) while a retry is
+  scheduled, and `model_unavailable: primary and fallback model unavailable on 3 attempts; giving up` after the last.
+  A recovery sends nothing special: the agent's next activity says so. The series ends when a prompt or a steer
+  is posted to the main conversation and the engine takes it (it starts or joins a run, which carries the turn; a busy
+  answer after it counts from one again). A follow-up, which starts no run on an idle conversation, and a post that
+  wrote nothing leave the schedule as it was; a cancel stops a scheduled retry, which Raft sees as the turn's
+  `Stop`; a deleted agent is never called again (the delete drops the schedule, and the object asks the registry
+  before any retry). A retry the engine cannot start, or one whose registry check stays unreadable for 10 minutes past its time, is
+  given up, with the `model_unavailable` sentence. These ends
+  are recorded as `model.retry` trace rows.
+- **Trace.** The call's `model.call` row carries `primaryMs` on every marked call (the first turn's latency, whichever
+  model answered), and `fallbackFrom`, `primaryOutcome` (`http_5xx`, `http_429`, `timeout`, `network`, or
+  `refused_<status>`) and `fallbackOutcome` when they apply; the consumer logs `model_job.fallback`, the object
+  `model_job.busy` and `model_job.busy_retry`.
+- **Turning it on.** Set the var, for example in `cf/wrangler.jsonc` `vars`:
+  `"MODEL_FALLBACK": { "to": "gpt-5.6-luna", "scope": "firstTurn", "primaryS": 60, "fallbackS": 50, "retryAfterS": [120, 300] }`.
+  `to` is a `USER_MODELS` id that is offered (its provider's secret set); `scope` is `"firstTurn"`, the only one;
+  `primaryS` and `fallbackS` (default 50) are whole seconds, **together at most 110**: a job with no answer 120 s
+  after it was sent is sent to the queue again (pi085's `REDELIVERY_MS`), and a call still running then would be made
+  a second time at both providers; `retryAfterS` at most 10 delays.
+  A value that is refused is off, and `GET /admin/models` says why (`modelFallbackError`; `modelFallback` when on).
+  Removing the var turns it off for every call after; a retry already scheduled still runs, as an ordinary call.
+
 #### Which budget pays (`budget`)
 
 `POST /provision/agents` takes `budget: "onboarding"` (optional; absent or `null` is the tenant's own budget, today's
@@ -1002,7 +1043,7 @@ answer with `/admin/transcript`'s for the same agent).
 
 `GET …/trace` answers the agent's trace rows — the spans of its work, one row each when it ended
 (`model.call`, `tool.call`, `approval.wait`, `container.lease`, `inbound`, `mount.seeded`,
-`rebuild.decision`, `rebuild.outcome`, `rebuild.behaviour`, `turn.timing`, `import.hold`, `model.prewarm`, `agent.ready`; `src/trace/outbox.ts`) — with `from <= at < to`, in `seq` order.
+`rebuild.decision`, `rebuild.outcome`, `rebuild.behaviour`, `turn.timing`, `import.hold`, `model.prewarm`, `agent.ready`, `model.retry`; `src/trace/outbox.ts`) — with `from <= at < to`, in `seq` order.
 
 - `from`, `to` — ISO 8601 or milliseconds since the epoch; the window is at most 24 hours. One alone
   puts the other 24 hours away; neither is the 24 hours up to now. `to` before or at `from`, a wider

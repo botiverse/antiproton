@@ -61,6 +61,11 @@ export interface ProvisionAgentOps {
   /** Seal the credential onto the `raft` mount; the plugin checks it against Raft. */
   attachCredential(tenantId: string, agentId: string, credential: string): Promise<{ ok: true; account: string | null } | { ok: false; error: string }>;
   removeCredential(tenantId: string, agentId: string): Promise<boolean>;
+  /**
+   * Drop a busy first turn's scheduled re-dispatch (src/runtime/busy-retry.ts), when the agent is deleted. Optional: a
+   * deployment without it is covered by the object asking the registry before it re-dispatches (`agentGone`).
+   */
+  stopBusyRetry?(tenantId: string, agentId: string): Promise<boolean>;
   /** Run one of the raft plugin's push tools through the gateway, as the model would. */
   tool(tenantId: string, agentId: string, name: ProvisionTool): Promise<{ ok: true; result: Json } | { ok: false; error: string }>;
   /**
@@ -701,6 +706,10 @@ export async function handleProvision(
     // never destroyed by a delete, here as for every agent.
     const off = await deps.agent.tool(tenantId, row.agentId, "disable_push");
     await deps.agent.removeCredential(tenantId, row.agentId);
+    // No model call is made again for a deleted agent. A failure here is not the delete's: the object also asks the
+    // registry before any re-dispatch, and the row below is what it reads.
+    try { await deps.agent.stopBusyRetry?.(tenantId, row.agentId); }
+    catch (e) { console.error(`dropping the busy retry of ${tenantId}/${row.agentId} failed:`, String((e as Error)?.message ?? e).slice(0, 200)); }
     const t = deps.now();
     const patch = { status: "deleted" as const, pushRegistered: false, pushError: off.ok ? null : off.error, deletedAt: t };
     await deps.registry.update(tenantId, row.raftAgentId, patch);

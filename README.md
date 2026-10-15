@@ -249,6 +249,9 @@ Antiproton is designed to run as a Cloudflare Worker backed by Durable Objects:
    another model than the default (`PUT /provision/servers/{id}/model-picker`); that switch refuses a pick only
    where the `MODEL_PICKER_ENFORCE` var is `"1"`, which no wrangler config sets yet: unset, it is stored and
    reported and refuses nothing (docs/agent-surface.md, "The server's model picker").
+   The `MODEL_FALLBACK` var, unset in every wrangler config, sends a first-turn call whose DeepSeek model does not
+   answer in time to a `USER_MODELS` option once, and retries a turn neither answered on the agent's own schedule
+   (docs/agent-surface.md, "A second model for the first turn").
    An owner's pick is bound when it is made (the
    console's POST, Raft's PUT, or the Agents API's create or update of an agent already bound), so the agent's next model
    call runs on it, on a harness rebuilt for it if one was open. An admin's change is bound when something next checks the agent's binding: its console

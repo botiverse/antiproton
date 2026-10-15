@@ -31,6 +31,7 @@
 
 import { responsesReasoningFor, usesResponses } from "../model/openai-responses.ts";
 import { chatShapeFor, isDeepSeekModel } from "../model/chat-request-shape.ts";
+import { isModelBusy } from "../model/model-fallback.ts";
 
 type Sql = { exec(query: string, ...bindings: unknown[]): { toArray(): any[] } };
 
@@ -152,7 +153,7 @@ export function markFirstTurnDone(sql: Sql, tenantId: string, agentId: string, h
 
 /**
  * Whether a model call's conversation is still in the agent's first turn: no assistant message in it ended other than
- * by calling tools. The first reply that ends without a tool call (or fails, or is cut off) ends the turn, and every
+ * by calling tools, or as a busy answer. The first reply that ends without a tool call (or fails, or is cut off) ends the turn, and every
  * call after it is a later turn's. Read from the call's own context, so it needs no state of its own and a redelivered
  * call is decided as the first delivery was. This reading alone would start over in every new main conversation, and
  * would carry into the next turn after a cancel mid tool loop; the durable mark (`firstTurnDone`) bounds both, and the
@@ -161,5 +162,8 @@ export function markFirstTurnDone(sql: Sql, tenantId: string, agentId: string, h
 export function inFirstTurn(context: unknown): boolean {
   const messages = (context as { messages?: unknown } | null | undefined)?.messages;
   if (!Array.isArray(messages)) return false;
-  return messages.every((m) => (m as { role?: unknown })?.role !== "assistant" || (m as { stopReason?: unknown }).stopReason === "toolUse");
+  // A busy answer (src/model/model-fallback.ts) is no turn's end: no model answered, the person is still waiting for
+  // the agent's first reply, and the turn's re-dispatch or their next message is still that first turn.
+  return messages.every((m) => (m as { role?: unknown })?.role !== "assistant" || (m as { stopReason?: unknown }).stopReason === "toolUse"
+    || isModelBusy(m as { stopReason?: unknown; errorMessage?: unknown }));
 }

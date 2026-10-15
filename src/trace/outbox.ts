@@ -62,9 +62,12 @@ const TABLE = "CREATE TABLE IF NOT EXISTS trace_outbox(" +
 // `failed`, with its tokens. Activity and status skip it.
 // `agent.ready` is a provisioned agent ready before its first turn, once per agent (src/runtime/ready.ts): its status
 // is `online`, a status-only activity event.
+// `model.retry` is the end of a busy first turn's scheduled re-dispatch (src/runtime/busy-retry.ts `busyRetryRow`):
+// `started`, `moved`, `refused` or `cancelled`. Activity reads `refused` as the turn's BridgeFatal, with the
+// `model_unavailable` sentence, and `cancelled` as its Stop; status `error` and `online` for them; the rest neither.
 export const TRACE_KINDS = ["model.call", "tool.call", "approval.wait", "container.lease", "inbound", "mount.seeded", "harness.open",
   "rebuild.decision", "rebuild.outcome", "rebuild.behaviour", "session.needs_reset", "turn.timing", "import.hold", "model.prewarm",
-  "agent.ready"] as const;
+  "agent.ready", "model.retry"] as const;
 export type TraceKind = (typeof TRACE_KINDS)[number];
 
 export const TRACE_VERDICTS = ["ok", "failed", "blocked", "cancelled"] as const;
