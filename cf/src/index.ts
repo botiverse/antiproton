@@ -957,7 +957,6 @@ export class AgentDO extends DurableObject<Env> {
       // τ² mounts its domain as a plugin; SWE-bench mounts a machine, which
       // the runtime already has.
       extraPlugins: swe ? [] : [this.#benchState().plugin()],
-      maxTurns: swe ? 120 : 40,
       policy,
       // What the Node runner offers, and nothing else. The deployed console has
       // a sandbox; the Node τ² arm never did, and running the object arm with

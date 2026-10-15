@@ -682,7 +682,6 @@ export interface RuntimeDeps {
   hooks?: { origin: string; directory: Pick<HookDirectory, "create" | "lookup" | "revoke" | "list"> };
   /** How long `removeMount` waits on a plugin's `unmount`; {@link UNMOUNT_TIMEOUT_MS} when unset. A test's knob. */
   unmountTimeoutMs?: number;
-  maxTurns?: number;
   /**
    * What the bound model can hold, in tokens.
    *
