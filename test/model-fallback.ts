@@ -165,6 +165,15 @@ await check("the busy answer's fixed text and its sentences match no retry or ov
   must(busyRetrying(300_000).endsWith("retrying in 5 min") && /^model_unavailable: .*giving up$/.test(busyGivenUp(3)), busyGivenUp(3));
 });
 
+await check("inFirstTurn: a busy answer does not end the first turn; any other failed answer still does", () => {
+  const user = { role: "user", content: "Hi", timestamp: 1 };
+  const busy = { ...errorMessage(MODEL_BUSY_ERROR, { api: "offloaded", provider: "openai-compatible", id: "deepseek-flash" }), providerError: busyGivenUp(3) };
+  const other = errorMessage("model refused (HTTP 400, permanent): see the turn's error", { api: "offloaded", provider: "openai-compatible", id: "deepseek-flash" });
+  must(inFirstTurn({ messages: [user, busy, user] }), "a busy answer ended the first turn");
+  // The control: the same position with another failure is the turn's end, so the assertion above can redden.
+  must(!inFirstTurn({ messages: [user, other, user] }), "another failure no longer ends the first turn");
+});
+
 // ---- the consumer ---------------------------------------------------------------------------------------------------
 
 const CONTEXT = { systemPrompt: "You are Cindy.", messages: [{ role: "user", content: [{ type: "text", text: "Hi" }], timestamp: 1 }], tools: [] };
