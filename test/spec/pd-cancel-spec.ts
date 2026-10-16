@@ -90,9 +90,11 @@ type Job = { model: { api: string; provider: string; id: string }; context: Para
 
 /**
  * Drive until nothing is open and nothing is due, as `AgentRuntime.step` does, answering each model call from
- * `script` in turn (`at` counts the turns used so far, across calls). Returns the last outcome.
+ * `script` in turn (`at` counts the turns used so far, across calls). Returns the last outcome. Every `wakeInMs` it
+ * slept for, the alarms the object would have set, is added to `alarms` for the engine.
  */
 const taken = new WeakMap<Eng, Set<string>>();
+const alarms = new WeakMap<Eng, number[]>();
 async function drive(e: Eng, script: Turn[], at: { n: number }, requests: Request[], onPass?: () => Promise<void>) {
   const answered = taken.get(e) ?? new Set<string>();
   taken.set(e, answered);
@@ -125,6 +127,7 @@ async function drive(e: Eng, script: Turn[], at: { n: number }, requests: Reques
       return out;
     }
     check(out.wakeInMs !== null && out.wakeInMs <= 5_000, `${e.name}: stuck: ${show(out)}`);
+    alarms.set(e, [...(alarms.get(e) ?? []), out.wakeInMs]);
     await sleep(out.wakeInMs);
   }
   throw new Error(`${e.name}: did not settle`);
@@ -308,9 +311,10 @@ export function pdCancelCases(withHost: WithDriveHost): DriveCase[] {
       const at = { n: 0 };
       const script = [calls(["call_1", "get_weather", { city: "Paris" }]), say("21 degrees")];
       await e.agent.say("weather in Paris?");
-      const t0 = Date.now();
       const paused = await drive(e, script, at, requests);
-      check(Date.now() - t0 < 2_500, `${e.name}: pausing for the caller took ${Date.now() - t0} ms`);
+      // Pausing for the caller waits on nothing: no alarm, and on pd no deadline (`drive` checks that each step). Asked
+      // of what the steps returned rather than of the elapsed time, which a loaded host stretches with nothing wrong.
+      check(!alarms.get(e)?.length, `${e.name}: pausing for the caller waited on alarms ${show(alarms.get(e))}`);
       check(paused.open === 0 && paused.wakeInMs === null, `${e.name}: the paused step said ${show(paused)}`);
       if (e.name === "pd") check(!e.pd!.open, "pd: the harness is still open while only the caller is awaited");
       const waiting = await apiView(e);
