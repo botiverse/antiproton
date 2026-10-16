@@ -78,6 +78,8 @@ for (const backend of Object.keys(BACKENDS) as Array<keyof typeof BACKENDS>) {
     const { store, sql } = await BACKENDS[backend]();
     await store.recordOperation(OP);
     await store.completeOperation("t", "op_1", "running", null);
+    // Asked for, then begun only after a wait (a person's approval): the wait is in `ms` and not in `runMs`.
+    await new Promise((r) => setTimeout(r, 40));
     const startedAt = Date.now();
     await store.completeOperation("t", "op_1", "succeeded", null, undefined, { callId: "toolu_9", exitCode: 2, startedAt });
     // An approved call's second completion (src/runtime/gateway.ts `applyApproval`), a parked result's reference.
@@ -87,7 +89,7 @@ for (const backend of Object.keys(BACKENDS) as Array<keyof typeof BACKENDS>) {
     must(fact.result_ref === "r2://parked", `the record was not updated by the later completion: ${JSON.stringify(fact)}`);
     const rows = pendingTrace(sql, 0).rows.filter((x) => x.kind === "tool.call");
     must(rows.length === 1, `${rows.length} tool.call rows for one operation`);
-    must(rows[0]!.attrs.exitCode === 2 && typeof rows[0]!.attrs.runMs === "number" && rows[0]!.attrs.runMs <= rows[0]!.ms!,
+    must(rows[0]!.attrs.exitCode === 2 && typeof rows[0]!.attrs.runMs === "number" && rows[0]!.attrs.runMs < 40 && rows[0]!.ms! >= 40,
       `attrs ${JSON.stringify(rows[0]!.attrs)} ms ${rows[0]!.ms}`);
     // An operation with no exit status and no start: neither key.
     await store.recordOperation({ ...OP, operationId: "op_2" });

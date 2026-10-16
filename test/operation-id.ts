@@ -27,6 +27,7 @@ import { SqliteStore } from "../src/store/sqlite.ts";
 import { standInLoader } from "./spec/worker-stand-in.ts";
 import { createHash } from "node:crypto";
 import { operatorModelOf } from "../cf/src/model-request.ts";
+import { pendingTrace } from "../src/trace/outbox.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void>) {
@@ -38,6 +39,8 @@ const show = (v: unknown) => JSON.stringify(v);
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, Math.max(0, ms)));
 
 type Seen = { step: string; op: string | undefined; args?: unknown };
+/** What the next background poll answers: still running when null, otherwise finished with this result. */
+let pollFinishes: unknown = null;
 
 /** A plugin that records the operation id every step of it was handed. */
 function probe(seen: Seen[]): Plugin {
@@ -71,7 +74,10 @@ function probe(seen: Seen[]): Plugin {
       async cancel(tool, _state, context) { at(`${tool}:cancel`, context); },
     },
     background: {
-      async poll(_handle, context) { at("long:poll", context); return { done: false as const }; },
+      async poll(_handle, context) {
+        at("long:poll", context);
+        return pollFinishes === null ? { done: false as const } : { done: true as const, result: pollFinishes as never };
+      },
       async cancel(_handle, context) { at("long:cancel", context); },
     },
   };
@@ -253,6 +259,22 @@ for (const engine of ["pi085", "pd"] as const) {
       const all = stepsOf(w.seen, "long:cancel").map((s) => s.op);
       must(all.length === 2 && all[1] === second, `session cancel ${show(all)}, second ${second}`);
     } finally { w.host.dispose(); }
+  });
+
+  await check(`${engine}: a background command's end records the model's call id and the exit status the poll found`, async () => {
+    const w = await world(engine);
+    try {
+      await turn(w.r, "start", [call("c_bg", "probe__long", {}), say("started")], { leaveHeld: true });
+      const started = stepsOf(w.seen, "long")[0]?.op;
+      must(isOpId(started), `started: ${show(w.seen)}`);
+      must(!pendingTrace(w.host.sql as never, 0).rows.some((r) => r.kind === "tool.call" && r.spanId === started), "a running job already wrote its end");
+      pollFinishes = { state: "exited", exitCode: 7 };
+      w.host.sql.exec("UPDATE background_jobs SET next_poll_at = 0");
+      await w.r.rt.step("t", "a");
+      const ends = pendingTrace(w.host.sql as never, 0).rows.filter((r) => r.kind === "tool.call" && r.spanId === started);
+      must(ends.length === 1 && ends[0]!.status === "succeeded" && ends[0]!.attrs.callId === "c_bg" && ends[0]!.attrs.exitCode === 7,
+        `the job's end: ${show(ends)}`);
+    } finally { pollFinishes = null; w.host.dispose(); }
   });
 
   await check(`${engine}: a job refused over the cap is cancelled under its own call's id`, async () => {
