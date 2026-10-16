@@ -2386,9 +2386,9 @@ export function createRaftPlugin(deps: {
     },
     config: [
       { name: "serverUrl", type: "string", required: true, format: "origin", summary: "Raft server origin, for example https://api.raft.build." },
-      { name: "timeoutMs", type: "number", default: DEFAULT_TIMEOUT_MS, summary: "Request timeout in milliseconds, clamped to 1000–60000." },
+      { name: "timeoutMs", type: "number", default: DEFAULT_TIMEOUT_MS, changeable: true, summary: "Request timeout in milliseconds, clamped to 1000–60000." },
       {
-        name: "conversationCards", type: "boolean", default: false,
+        name: "conversationCards", type: "boolean", default: false, changeable: true,
         summary: "Show the model a conversation's card (a channel's description, a DM peer's profile) once per context, " +
           "and hold a send into a conversation whose card its context has not seen. Off unless true.",
       },

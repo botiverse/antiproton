@@ -2023,6 +2023,11 @@ export class AgentDO extends DurableObject<Env> {
     return this.#busy("adminAddMount", () => this.runtime().addMount(tenantId, agentId, seed));
   }
 
+  async adminMountSettings(tenantId: string, agentId: string, alias: string, settings: Json) {
+    this.#claim(tenantId, agentId);
+    return this.#busy("adminMountSettings", () => this.runtime().updateMountSettings(tenantId, agentId, alias, settings));
+  }
+
   async adminRefreshMountTools(tenantId: string, agentId: string, alias: string) {
     this.#claim(tenantId, agentId);
     return this.#busy("adminRefreshMountTools", () => this.runtime().refreshMountTools(tenantId, agentId, alias));
@@ -3424,16 +3429,32 @@ async function adminHooks(request: Request, env: Env, url: URL): Promise<Respons
  * answers `{changed, hash, tools, skipped}`; the mount's list is replaced only
  * when it changed. Here rather than a tool on the mount, because what a mount
  * offers the agent is the operator's to change, not the agent's.
+ *
+ * `PATCH {tenantId, agentId, alias, settings}` merges `settings` into an
+ * existing mount's, in place, and answers `{alias, plugin, config, changed}`:
+ * only settings its plugin declares `changeable` (runtime
+ * `updateMountSettings`), so never what the mount is connected to. 404 for an
+ * agent or alias that is not there. Logged from here, the Worker, as
+ * `mount.settings`, since the object's own lines can be dropped.
  */
 async function adminMounts(request: Request, env: Env): Promise<Response> {
   if (!isOperator(env.AUTOMATION_TOKEN, request.headers.get("x-harness-token"))) {
     return Response.json({ error: "unauthorized" }, { status: 401 });
   }
-  if (request.method !== "POST") return Response.json({ error: "POST" }, { status: 405 });
+  if (request.method !== "POST" && request.method !== "PATCH") return Response.json({ error: "POST or PATCH" }, { status: 405 });
   const b = (await request.json().catch(() => null)) as any;
   const tenantId = String(b?.tenantId ?? ""), agentId = String(b?.agentId ?? "");
   try { agentObjectName(tenantId, agentId); } catch (e: any) { return Response.json({ error: String(e?.message ?? e) }, { status: 400 }); }
   const stub = env.AGENT.get(env.AGENT.idFromName(agentObjectName(tenantId, agentId)));
+  if (request.method === "PATCH") {
+    const alias = String(b?.alias ?? "");
+    if (!alias) return Response.json({ error: "expected an alias" }, { status: 400 });
+    const r = await stub.adminMountSettings(tenantId, agentId, alias, b?.settings);
+    if (r.ok) logEvent("mount.settings", { tenantId, agentId, alias, plugin: r.plugin, keys: r.changed.join(",") });
+    return r.ok
+      ? Response.json({ alias: r.alias, plugin: r.plugin, config: r.config, changed: r.changed })
+      : Response.json({ error: r.error }, { status: r.status });
+  }
   if (b?.refreshTools !== undefined) {
     const r = await stub.adminRefreshMountTools(tenantId, agentId, String(b.refreshTools));
     return r.ok

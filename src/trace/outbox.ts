@@ -66,12 +66,14 @@ const TABLE = "CREATE TABLE IF NOT EXISTS trace_outbox(" +
 // `failed`, with its tokens. Activity and status skip it.
 // `agent.ready` is a provisioned agent ready before its first turn, once per agent (src/runtime/ready.ts): its status
 // is `online`, a status-only activity event.
+// `mount.settings` is an operator's in-place change of a mount's settings (`PATCH /admin/mounts`, cf/src/runtime.ts
+// `updateMountSettings`): `attrs` the alias, the plugin and the keys that changed. Activity and status skip it.
 // The rest are the kinds a plugin may write itself, through `PluginContext.trace` (`PLUGIN_TRACE_KINDS`). Activity and
 // status skip them.
 export const TRACE_KINDS = ["model.call", "tool.call", "approval.wait", "container.lease", "inbound", "mount.seeded", "harness.open",
   "turn.stop", "js.run",
   "rebuild.decision", "rebuild.outcome", "rebuild.behaviour", "session.needs_reset", "turn.timing", "import.hold", "model.prewarm",
-  "agent.ready", "raft.held", "raft.held_answer", "raft.state_save_failed"] as const;
+  "agent.ready", "mount.settings", "raft.held", "raft.held_answer", "raft.state_save_failed"] as const;
 export type TraceKind = (typeof TRACE_KINDS)[number];
 
 /**

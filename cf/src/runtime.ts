@@ -109,7 +109,7 @@ function taskEndedRefusal(address: string): { status: "rejected"; error: { code:
   };
 }
 import { ToolGateway, type InvokeOpts } from "../../src/runtime/gateway.ts";
-import { assertMountConfig, configFromForm, validateMount } from "../../src/runtime/mount-config.ts";
+import { assertMountConfig, configFromForm, mergeMountSettings, repeatsMount, validateMount, type SettingValue } from "../../src/runtime/mount-config.ts";
 import { envSecrets } from "../../src/runtime/gateway.ts";
 import { OPERATOR_EXA_REF, OPERATOR_RUN9_REF, resolveOperatorRef } from "./operator-ref.ts";
 import { agentSecrets, agentRef, importKek, isAgentRef, open, OWNER_PREFIX, seal, secretRefKind, type Sealed } from "../../src/runtime/secrets.ts";
@@ -2470,7 +2470,9 @@ export class AgentRuntime {
    * answers. An alias that is already there is left alone: the same plugin and
    * settings is a repeat, anything else is refused rather than overwritten,
    * because a mount carries a credential and a database that a replace
-   * would orphan. It is always added without a credential.
+   * would orphan. "The same settings" counts a setting changed in place
+   * (`updateMountSettings`) that the add does not name as the same
+   * (`repeatsMount`), and keeps it. It is always added without a credential.
    */
   async addMount(
     tenantId: string, agentId: string, seed: { alias: string; plugin: string; config: Record<string, Json> },
@@ -2496,7 +2498,7 @@ export class AgentRuntime {
     }
     const have = await this.store.getMountByAlias(tenantId, agentId, seed.alias);
     if (have) {
-      if (have.plugin === seed.plugin && JSON.stringify(have.publicConfig) === JSON.stringify(seed.config)) {
+      if (have.plugin === seed.plugin && repeatsMount(plugin, have.publicConfig as Record<string, Json> | null, seed.config)) {
         return { ok: true, added: false };
       }
       return { ok: false, error: `${seed.alias} is already a different mount` };
@@ -2539,6 +2541,38 @@ export class AgentRuntime {
       return { ok: true, added: true, tools: await this.#snapshot(tenantId, agentId, seed.alias) };
     }
     return { ok: true, added: true };
+  }
+
+  /**
+   * Change settings of a mount that exists, in place (`PATCH /admin/mounts`): the keys given are merged into its
+   * settings (`mergeMountSettings`), and only those its plugin declares `changeable`. Nothing else of the mount is
+   * written, so its credential reference, installation id, tool snapshot and plugin database stay as they were. Each
+   * call builds its plugin context from the mount row read for that call (the gateway's `resolve`), so the next call
+   * runs with the new settings; for raft that is the client `raftFor` makes per call.
+   */
+  async updateMountSettings(
+    tenantId: string, agentId: string, alias: string, settings: unknown,
+  ): Promise<{ ok: true; alias: string; plugin: string; config: Record<string, SettingValue>; changed: string[] } | { ok: false; status: 400 | 404; error: string }> {
+    await this.ready();
+    if (!await this.store.loadAgent(tenantId, agentId)) return { ok: false, status: 404, error: `no agent ${agentId}` };
+    const have = await this.store.getMountByAlias(tenantId, agentId, alias);
+    if (!have) return { ok: false, status: 404, error: `no mount named ${alias}` };
+    const plugin = this.#plugins.find((p) => p.id === have.plugin);
+    if (!plugin) return { ok: false, status: 400, error: `${alias} is a ${have.plugin} mount, and no plugin of that name is installed` };
+    const merged = mergeMountSettings(plugin, have, settings);
+    if (!merged.ok) return { ok: false, status: 400, error: merged.error };
+    if (merged.changed.length) {
+      await this.store.updateMountConfig(tenantId, agentId, alias, merged.config);
+      const sql = this.#deps.ctx.storage?.sql;
+      const at = Date.now();
+      if (sql) {
+        appendTrace(sql, [{
+          at, tenantId, agentId, kind: "mount.settings", spanId: `settings_${alias}_${at}`, status: "changed", verdict: "ok",
+          attrs: { alias, plugin: plugin.id, keys: merged.changed },
+        }]);
+      }
+    }
+    return { ok: true, alias, plugin: plugin.id, config: merged.config as Record<string, SettingValue>, changed: merged.changed };
   }
 
   /**
