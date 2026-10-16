@@ -47,18 +47,41 @@ export function operationVerdict(status: OperationStatus): TraceVerdict {
   }
 }
 
+/**
+ * Whether a completion is the one that ends the operation: a terminal status reached from one that was not. An
+ * operation can be completed again after it ended — `applyApproval` (src/runtime/gateway.ts) completes the approved
+ * run that `#run` already completed, and a parked result (cf/src/runtime.ts `parkResult`) completes it again with its
+ * reference — and each of those updates the record but is not a second end. A `tool.call` row is the span's one row
+ * (src/runtime/activity.ts pairs a start and an end per row under the operation id), so only this transition writes it.
+ * `prior` is null when the record was not found, which writes no row either way.
+ */
+export function operationEnds(prior: OperationStatus | null, status: OperationStatus): boolean {
+  return operationEnded(status) && prior !== null && !operationEnded(prior);
+}
+
 /** The tool.call row for an operation that just ended. */
 export function toolCallRow(op: {
   tenantId: string; agentId: string; taskId: string; operationId: string;
   mountAlias: string; tool: string; status: OperationStatus;
   createdAt: number; endedAt: number; callId?: string | null;
+  /** The command's exit status, when the tool ran one (`CompletedFacts.exitCode`). */
+  exitCode?: number | null;
+  /** When the attempt began, after any approval wait (`CompletedFacts.startedAt`). */
+  startedAt?: number | null;
 }): TraceRow {
+  const num = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v);
   return {
     at: op.endedAt, tenantId: op.tenantId, agentId: op.agentId,
     kind: "tool.call", spanId: op.operationId,
     status: op.status, verdict: operationVerdict(op.status),
+    // The whole operation, from the request: a held call's wait for a person is inside it (and has its own
+    // approval.wait row). `runMs` is the part after the attempt began, which is what the activity log reports.
     ms: Math.max(0, op.endedAt - op.createdAt),
-    attrs: { tool: op.tool, mount: op.mountAlias, task: op.taskId, ...(op.callId ? { callId: op.callId } : {}) },
+    attrs: {
+      tool: op.tool, mount: op.mountAlias, task: op.taskId, ...(op.callId ? { callId: op.callId } : {}),
+      ...(num(op.exitCode) ? { exitCode: op.exitCode } : {}),
+      ...(num(op.startedAt) ? { runMs: Math.max(0, op.endedAt - Math.max(op.startedAt, op.createdAt)) } : {}),
+    },
   };
 }
 

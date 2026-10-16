@@ -1529,7 +1529,23 @@ export interface ActivityEvent {
   /** ISO 8601. */
   occurredAt: string;
   toolName?: string;
+  /**
+   * On both events of a tool call: the operation's id, the same on its PreToolUse and its PostToolUse(Failure) and
+   * different for every call, so the service pairs a start with its end.
+   */
+  toolUseId?: string;
+  /**
+   * On a tool's end: how long the tool ran, in ms. A call held for a person's approval starts counting when it was
+   * approved and began, not when it was asked for.
+   */
   durationMs?: number;
+  /** On a tool's end, when the tool ran a command (sandbox `shell` / `run`): its exit status. Absent otherwise. */
+  exitCode?: number;
+  /**
+   * On a tool's end: true when it succeeded (a command that exited non-zero included), false when it failed or was
+   * refused, null when the outcome is not known (lost, or the call was cancelled). Always present on a tool's end.
+   */
+  ok?: boolean | null;
   errorClass?: string;
   /**
    * The agent's status after this event (raft-agent-status.v1), said by the

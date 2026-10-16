@@ -21,7 +21,7 @@ import type {
   WaitSpec,
 } from "../core/types.ts";
 import { appendTrace, type TraceRow } from "../trace/outbox.ts";
-import { approvalRow, operationEnded, toolCallRow } from "../trace/seams.ts";
+import { approvalRow, operationEnds, toolCallRow } from "../trace/seams.ts";
 import {
   applySeedPass, markSeedsChosen, pendingSeedNotices, readSeedRecord, returnSeedNotices, SEED_RECORD_SCHEMA, takeSeedNotices, voidSeedNotices,
   type SeedNoticeRow, type SeedPlan,
@@ -702,6 +702,10 @@ export class SqliteStore implements StorageAdapter {
   ) {
     this.#tx(() => {
       const endedAt = now();
+      // Read before the write, in the same transaction: whether this completion is the operation's end (operationEnds).
+      const prior = this.#db
+        .prepare("SELECT status FROM operations WHERE tenant_id=? AND operation_id=?")
+        .get(tenantId, operationId) as any;
       this.#db
         .prepare(
           "UPDATE operations SET status=?, result_ref=?, updated_at=? WHERE tenant_id=? AND operation_id=?",
@@ -726,12 +730,14 @@ export class SqliteStore implements StorageAdapter {
           dedupKey: `op:${operationId}:completed`,
         });
         // The trace row, in the same transaction as the fact it joins back to
-        // (src/trace/seams.ts). "running" is not an end and writes none.
-        if (operationEnded(status)) {
+        // (src/trace/seams.ts). "running" is not an end and writes none, and
+        // neither does completing an operation that had already ended.
+        if (operationEnds(prior ? prior.status : null, status)) {
           appendTrace(this.#usageSql() as any, [toolCallRow({
             tenantId, agentId: op.agent_id, taskId: op.task_id, operationId,
             mountAlias: op.mount_alias, tool: op.tool, status,
             createdAt: Number(op.created_at), endedAt, callId: facts?.callId ?? null,
+            exitCode: facts?.exitCode ?? null, startedAt: facts?.startedAt ?? null,
           })]);
         }
       }

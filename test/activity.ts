@@ -26,6 +26,41 @@ check("a tool row is two events: the call dated its start and the result dated i
   must(post!.hookEventName === "PostToolUse" && post!.eventId === "raft_a:5" && post!.durationMs === 2500 && post!.errorClass === undefined && post!.occurredAt === new Date(T0 + 5000).toISOString(), JSON.stringify(post));
 });
 
+check("both events of a tool call carry the operation id as toolUseId, and two calls never share one, even under one model call id", () => {
+  const ev = activityEvents("raft_a", [
+    row(40, "tool.call", "succeeded", "ok", { spanId: "op_a", ms: 5, attrs: { tool: "go", mount: "m", callId: "toolu_1" } }),
+    row(41, "tool.call", "succeeded", "ok", { spanId: "op_b", ms: 5, attrs: { tool: "go", mount: "m", callId: "toolu_1" } }),
+  ]);
+  must(ev.map((e) => e.toolUseId).join(",") === "op_a,op_a,op_b,op_b", JSON.stringify(ev));
+  must(ev[0]!.hookEventName === "PreToolUse" && ev[1]!.hookEventName === "PostToolUse", JSON.stringify(ev));
+});
+
+check("a command's exit status rides its end, a non-zero exit with ok true; a tool with no command has no exitCode key", () => {
+  const [, shell] = activityEvents("raft_a", [row(42, "tool.call", "succeeded", "ok", { ms: 30, attrs: { tool: "shell", mount: "sandbox", exitCode: 2 } })]);
+  must(shell!.hookEventName === "PostToolUse" && shell!.ok === true && shell!.exitCode === 2, JSON.stringify(shell));
+  const [pre, other] = activityEvents("raft_a", [row(43, "tool.call", "succeeded", "ok", { ms: 30, attrs: { tool: "messages_send", mount: "raft" } })]);
+  must(!("exitCode" in other!) && !("exitCode" in pre!) && !("ok" in pre!), `${JSON.stringify(pre)} ${JSON.stringify(other)}`);
+});
+
+check("ok is true for succeeded, false for failed and rejected, and an explicit null for unknown and cancelled", () => {
+  const want = { succeeded: "true", failed: "false", rejected: "false", unknown: "null", cancelled: "null" } as const;
+  const verdicts = { succeeded: "ok", failed: "failed", rejected: "blocked", unknown: "failed", cancelled: "cancelled" } as const;
+  for (const status of Object.keys(want) as Array<keyof typeof want>) {
+    const [, end] = activityEvents("raft_a", [row(44, "tool.call", status, verdicts[status], { ms: 1, attrs: { tool: "t", mount: "m" } })]);
+    must(JSON.stringify(end!.ok) === want[status] && "ok" in end!, `${status}: ${JSON.stringify(end)}`);
+    // On the wire: a null is sent, not dropped.
+    must(JSON.stringify(end).includes(`"ok":${want[status]}`), `${status} on the wire: ${JSON.stringify(end)}`);
+  }
+});
+
+check("durationMs is how long the tool ran (runMs) when the row says it, so an approval wait is not in it; the start stays at the request", () => {
+  const [pre, post] = activityEvents("raft_a", [row(45, "tool.call", "succeeded", "ok", { ms: 60_000, attrs: { tool: "zap", mount: "m", runMs: 1_200 } })]);
+  must(post!.durationMs === 1_200, `durationMs ${post!.durationMs}`);
+  must(pre!.occurredAt === new Date(T0 + 45_000 - 60_000).toISOString(), `the start moved: ${pre!.occurredAt}`);
+  const [, old] = activityEvents("raft_a", [row(46, "tool.call", "succeeded", "ok", { ms: 700, attrs: { tool: "zap", mount: "m" } })]);
+  must(old!.durationMs === 700, `without runMs: ${old!.durationMs}`);
+});
+
 check("a tool row that did not succeed is a failure carrying the status as its class", () => {
   for (const [status, verdict] of [["failed", "failed"], ["rejected", "blocked"], ["cancelled", "cancelled"]] as const) {
     const ev = activityEvents("raft_a", [row(7, "tool.call", status, verdict, { ms: 10, attrs: { tool: "run", mount: "sandbox" } })]);
@@ -56,7 +91,7 @@ check("every event carries only fields the service knows, ids are unique, and tw
   const ev = activityEvents("raft_a", rows);
   must(ev.length === 2 * ACTIVITY_BATCH_MAX && ev.length <= 200, `events ${ev.length}`);
   must(new Set(ev.map((e) => e.eventId)).size === ev.length, "duplicate event ids");
-  const allowed = new Set(["eventId", "hookEventName", "occurredAt", "toolName", "durationMs", "errorClass", "status", "detail"]);
+  const allowed = new Set(["eventId", "hookEventName", "occurredAt", "toolName", "toolUseId", "durationMs", "exitCode", "ok", "errorClass", "status", "detail"]);
   for (const e of ev) for (const k of Object.keys(e)) must(allowed.has(k), `unknown field ${k}`);
   // The worst case for status-only events: every row a measured model call that asked for tools, each a
   // thinking start and a working end with no activity event to ride on.

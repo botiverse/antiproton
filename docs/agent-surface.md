@@ -731,6 +731,25 @@ by the Worker that answered it (`side` = `worker`; [`runbook.md`](runbook.md#log
 delete stops again. A stop that fails does not fail the delete: it is logged as a `turn.stop` line with `result`
 `failed` ([`runbook.md`](runbook.md)).
 
+### Tool calls in Raft's activity log
+
+While push is on, each tool call the agent makes is reported to Raft (`raft-agent-activity-ingest.v1`) as two
+events, built from the call's `tool.call` trace row when it ends (`src/runtime/activity.ts`): `PreToolUse`, dated
+when the call was asked for, and `PostToolUse` (it succeeded) or `PostToolUseFailure` (anything else, with the
+operation's status as `errorClass`), dated when it ended. Calls the provider makes on the agent's behalf are not
+reported.
+
+| Field | On | Value |
+|---|---|---|
+| `toolName` | both | the tool as the model names it, `<mount>__<tool>` |
+| `toolUseId` | both | the call's operation id: the same on the two events of a call, different for every call (two calls to one tool, the host calls of one `run_js` program, the step that continues a tool's question, a call run after approval) |
+| `ok` | the end | `true` succeeded (including a command that exited non-zero), `false` failed or refused, `null` the outcome is not known (lost, or cancelled — a denied approval is a cancel) |
+| `durationMs` | the end | how long the tool ran; a call held for approval counts from when it began after the approval, not from the request |
+| `exitCode` | the end | only for a command (sandbox `shell` / `run`, backgrounded or not): its exit status |
+
+An operation has exactly one `tool.call` row, at its first end; completing it again (an approved call, a result
+too large to inline) updates the record and writes no second row, so a call is never reported twice.
+
 ## Evaluation setup (preview only)
 
 Routes for an evaluator to give an agent its workspace before the agent first runs, start it on a

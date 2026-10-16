@@ -74,6 +74,28 @@ for (const backend of Object.keys(BACKENDS) as Array<keyof typeof BACKENDS>) {
       && row.attrs.callId === "toolu_9", `attrs ${JSON.stringify(row.attrs)}`);
   });
 
+  await check(`an operation ends once: a second completion writes no second row; the end carries exitCode and runMs (${backend})`, async () => {
+    const { store, sql } = await BACKENDS[backend]();
+    await store.recordOperation(OP);
+    await store.completeOperation("t", "op_1", "running", null);
+    const startedAt = Date.now();
+    await store.completeOperation("t", "op_1", "succeeded", null, undefined, { callId: "toolu_9", exitCode: 2, startedAt });
+    // An approved call's second completion (src/runtime/gateway.ts `applyApproval`), a parked result's reference.
+    await store.completeOperation("t", "op_1", "succeeded", null);
+    await store.completeOperation("t", "op_1", "succeeded", "r2://parked");
+    const fact = sql.exec("SELECT status, result_ref FROM operations").toArray()[0];
+    must(fact.result_ref === "r2://parked", `the record was not updated by the later completion: ${JSON.stringify(fact)}`);
+    const rows = pendingTrace(sql, 0).rows.filter((x) => x.kind === "tool.call");
+    must(rows.length === 1, `${rows.length} tool.call rows for one operation`);
+    must(rows[0]!.attrs.exitCode === 2 && typeof rows[0]!.attrs.runMs === "number" && rows[0]!.attrs.runMs <= rows[0]!.ms!,
+      `attrs ${JSON.stringify(rows[0]!.attrs)} ms ${rows[0]!.ms}`);
+    // An operation with no exit status and no start: neither key.
+    await store.recordOperation({ ...OP, operationId: "op_2" });
+    await store.completeOperation("t", "op_2", "failed", null);
+    const second = pendingTrace(sql, 0).rows.find((x) => x.spanId === "op_2")!;
+    must(!("exitCode" in second.attrs) && !("runMs" in second.attrs), `attrs ${JSON.stringify(second.attrs)}`);
+  });
+
   await check(`a denied approval leaves an approval.wait row that joins back to it (${backend})`, async () => {
     const { store, sql } = await BACKENDS[backend]();
     await store.recordOperation(OP);

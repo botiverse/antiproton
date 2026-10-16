@@ -44,6 +44,18 @@ export interface CompletedFacts {
   /** Who the call was made as, when the plugin said. */
   identity?: CredentialState;
   credentialRef?: CredentialRefKind;
+  /**
+   * The exit status of a command the tool ran (sandbox `shell` / `run`), when the result said one. A non-zero exit is
+   * still a succeeded operation: the tool did what it was asked and reported how the command ended. It goes onto the
+   * `tool.call` trace row (src/trace/seams.ts), not the event payload.
+   */
+  exitCode?: number;
+  /**
+   * When the attempt actually began (ms since the epoch): the gateway's `#run`, after any wait for a person's approval.
+   * The record's `created_at` is when the call was asked for, so for a held call the two differ by the wait. Trace row
+   * only, like `exitCode`.
+   */
+  startedAt?: number;
 }
 
 /** A stored value: inline when small, a reference to object storage when not. */

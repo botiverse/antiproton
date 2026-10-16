@@ -141,6 +141,40 @@ await check("a pass finishes a done job: operation succeeded, result delivered t
   } finally { host.dispose(); }
 });
 
+await check("a job's end records the call that started it and, for a command that finished, its exit status", async () => {
+  const host = sqliteHost(); const sql = host.sql as any;
+  try {
+    const facts: Record<string, unknown> = {};
+    const completeOperation = async (id: string, status: string, f: unknown) => { facts[`${id}:${status}`] = f; };
+    recordBackgroundJob(sql, me, { id: "op1", session: "main", mount: "node", tool: "node__shell", handle: {}, callId: "toolu_1" }, now);
+    recordBackgroundJob(sql, me, { id: "op2", session: "main", mount: "node", tool: "node__shell", handle: {}, callId: "toolu_2" }, now);
+    recordBackgroundJob(sql, me, { id: "op3", session: "main", mount: "node", tool: "node__shell", handle: {} }, now);
+    await runBackgroundPass({ sql, owner: me, now: now + 2_000, completeOperation, deliver: async () => {}, cancel: async () => {},
+      poll: async (j) => ({ done: true as const, result: j.id === "op1" ? { exitCode: 3, output: "" } : { exitCode: null, state: "error" } }) });
+    assert(JSON.stringify(facts["op1:succeeded"]) === JSON.stringify({ callId: "toolu_1", exitCode: 3 }), `op1: ${JSON.stringify(facts)}`);
+    // No numeric exit status, no key; no call id recorded, no key.
+    assert(JSON.stringify(facts["op2:succeeded"]) === JSON.stringify({ callId: "toolu_2" }), `op2: ${JSON.stringify(facts)}`);
+    assert(JSON.stringify(facts["op3:succeeded"]) === JSON.stringify({}), `op3: ${JSON.stringify(facts)}`);
+  } finally { host.dispose(); }
+});
+
+await check("a job table made before call_id existed gains the column and keeps its rows", async () => {
+  const host = sqliteHost(); const sql = host.sql as any;
+  try {
+    sql.exec(`CREATE TABLE background_jobs (
+      id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL,
+      session TEXT NOT NULL, mount TEXT NOT NULL, tool TEXT NOT NULL,
+      handle TEXT NOT NULL, state TEXT NOT NULL, created_at INTEGER NOT NULL,
+      finished_at INTEGER, polls INTEGER NOT NULL DEFAULT 0, next_poll_at INTEGER NOT NULL,
+      outcome TEXT)`);
+    sql.exec("INSERT INTO background_jobs(id, tenant_id, agent_id, session, mount, tool, handle, state, created_at, polls, next_poll_at) VALUES ('old', ?, ?, 'main', 'node', 'node__shell', '{}', 'running', ?, 0, ?)",
+      me.tenantId, me.agentId, now, now);
+    recordBackgroundJob(sql, me, { id: "new", session: "main", mount: "node", tool: "node__shell", handle: {}, callId: "toolu_9" }, now);
+    const jobs = runningBackgroundJobs(sql, me);
+    assert(jobs.map((j) => `${j.id}=${j.callId}`).join() === "old=null,new=toolu_9", JSON.stringify(jobs));
+  } finally { host.dispose(); }
+});
+
 await check("a pass leaves an unfinished or unreachable job running and checks it later", async () => {
   const host = sqliteHost(); const sql = host.sql as any; const f = fakes();
   try {

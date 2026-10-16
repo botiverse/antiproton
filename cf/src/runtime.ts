@@ -2098,12 +2098,12 @@ export class AgentRuntime {
             // unseen (refuseOverCap). The operation stays running until then.
             const refused = await refuseOverCap({
               sql, owner, running,
-              job: { id: res.operationId, session, mount: bg.alias, tool: shown, handle: bg.handle },
+              job: { id: res.operationId, session, mount: bg.alias, tool: shown, handle: bg.handle, callId: call.callId ?? null },
               cancel: () => gw.cancelBackground(ctx, bg.alias, bg.handle, res.operationId),
             });
             return { status: "rejected", error: { code: "background_limit", message: refused.message } };
           }
-          recordBackgroundJob(sql, owner, { id: res.operationId, session, mount: bg.alias, tool: shown, handle: bg.handle });
+          recordBackgroundJob(sql, owner, { id: res.operationId, session, mount: bg.alias, tool: shown, handle: bg.handle, callId: call.callId ?? null });
           return {
             status: "succeeded", operationId: res.operationId,
             result: startedResult({ id: res.operationId, mount: bg.alias, tool: shown }, bg.note) as unknown as Json,
@@ -3062,7 +3062,7 @@ export class AgentRuntime {
       cancel: (job) => this.#gateway.cancelBackground(
         { tenantId, agentId, taskId: job.session === MAIN_SESSION ? LEGACY_TASK : job.session },
         job.mount, job.handle as Json, job.id),
-      completeOperation: async (id, status) => { await this.store.completeOperation(tenantId, id, status, null); },
+      completeOperation: async (id, status, facts) => { await this.store.completeOperation(tenantId, id, status, null, undefined, facts); },
     });
     // Function tools an API caller runs itself (Agents API, task #17): offered to
     // the model like any tool; calling one pauses the turn for the caller's
@@ -4092,7 +4092,7 @@ export class AgentRuntime {
       sql, owner: { tenantId, agentId }, session,
       cancel: (job) => this.#gateway.cancelBackground(
         { tenantId, agentId, taskId: session === MAIN_SESSION ? LEGACY_TASK : session }, job.mount, job.handle as Json, job.id),
-      completeOperation: async (id, status) => { await this.store.completeOperation(tenantId, id, status, null); },
+      completeOperation: async (id, status, facts) => { await this.store.completeOperation(tenantId, id, status, null, undefined, facts); },
     });
     return { cancelledTurn, stoppedJobs: jobs.stopped, stillRunning: jobs.stillRunning };
   }
@@ -4211,7 +4211,7 @@ export class AgentRuntime {
       // A job is kept under the id of the operation that started it, so the plugin is told that operation.
       poll: (job) => this.#gateway.pollBackground(jobCtx(job), job.mount, job.handle as Json, job.id),
       cancel: (job) => this.#gateway.cancelBackground(jobCtx(job), job.mount, job.handle as Json, job.id),
-      completeOperation: async (id, status) => { await this.store.completeOperation(tenantId, id, status, null); },
+      completeOperation: async (id, status, facts) => { await this.store.completeOperation(tenantId, id, status, null, undefined, facts); },
       deliver,
     });
     // A task that is over (`ended`) keeps its jobs polled — the row records how each one ended, and a job

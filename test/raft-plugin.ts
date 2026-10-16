@@ -2656,6 +2656,23 @@ await check("activity posts the events as given to Raft's ingest while push is o
   if (!("sent" in none) || none.sent !== 0 || quiet.length !== 0) throw new Error(JSON.stringify(none));
 });
 
+await check("a tool call's toolUseId, exitCode and ok go to Raft as given, an unknown outcome as an explicit null", async () => {
+  const on = mount({ enabled: true, agentId: "agent-1", agentName: "raft-bot", lastReached: null });
+  const calls = one(json(200, { accepted: 4 }));
+  const events = [
+    { eventId: "raft_x:1:pre", hookEventName: "PreToolUse" as const, occurredAt: "2026-10-15T08:00:00.000Z", toolName: "sandbox__shell", toolUseId: "op_a" },
+    { eventId: "raft_x:1", hookEventName: "PostToolUse" as const, occurredAt: "2026-10-15T08:00:01.000Z", toolName: "sandbox__shell", toolUseId: "op_a", ok: true, durationMs: 1000, exitCode: 2 },
+    { eventId: "raft_x:2:pre", hookEventName: "PreToolUse" as const, occurredAt: "2026-10-15T08:00:02.000Z", toolName: "web__fetch", toolUseId: "op_b" },
+    { eventId: "raft_x:2", hookEventName: "PostToolUseFailure" as const, occurredAt: "2026-10-15T08:00:03.000Z", toolName: "web__fetch", toolUseId: "op_b", ok: null, durationMs: 1000, errorClass: "unknown" },
+  ];
+  await raftPlugin.reportActivity!(events, on.ctx);
+  const sent = JSON.parse(calls[0]!.init.body).events;
+  if (JSON.stringify(sent) !== JSON.stringify(events)) throw new Error(JSON.stringify(sent));
+  if (!("ok" in sent[3]) || sent[3].ok !== null || sent[1].exitCode !== 2 || sent[0].toolUseId !== sent[1].toolUseId) {
+    throw new Error(`fields lost on the way: ${JSON.stringify(sent)}`);
+  }
+});
+
 await check("activity for a mount with no account is skipped, not an error: a deleted agent must not re-arm the alarm for ever", async () => {
   const m = mount({ enabled: true, agentId: "agent-1", agentName: "raft-bot", lastReached: null });
   m.ctx.credential = null;
