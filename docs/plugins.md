@@ -550,6 +550,12 @@ description, a title, a preview) is passed on as written, except that the names
 in a message's header line (sender, channel, thread, task assignee, attachment
 filename) have line breaks and other control characters replaced with a space
 (`namesOnOneLine`), so a name cannot start a line that reads as another message.
+A generated tool's outcome reaches the model as the SDK's own `state` and
+`text`, with no state rewritten: a `messages_search` that Raft stopped at its scan budget is
+`incomplete` (nothing found in what it searched) or `results` with a page
+marked incomplete, and its text says older messages were not searched and gives
+the continuing `messages_search({ …, cursor })` call; the tool offers `cursor`
+as the manifest does.
 `attachments_download_url` fetches the file Raft points at into the agent's
 object storage (at most `ATTACHMENT_MAX_BYTES`) and returns its `artifact://`
 reference, never the URL; it is offered when the plugin is built with object
@@ -628,11 +634,13 @@ for each held call (`status` its reason; `attrs` the tool, reason, target,
 `newMessageCount`, the kinds of card it showed, `contextBytes`, the origin), and
 `raft.held_answer` for each answer (`status` `send`, `proceed`, `drop` or
 `expired`; `ms` from when the call was first held; `attrs.outcome` what came of
-it), both under the call's operation; and `raft.state_save_failed` when the
-SDK's saved state did not load or save (`status` the phase; `attrs` the error
-and, for a save, `stateBytes`, the size of the record it tried to write), which
-it also says on the console. A failed save never fails the call: it costs at
-most a batch delivered again or one more hold.
+it), both under the call's operation; and `raft.state_failed` when the
+SDK's saved state did not load or save (the SDK's `onStateError`; `status` and
+`attrs.phase` the phase, `load` or `save`; `attrs` the error and, for a save,
+`stateBytes`, the size of the record it tried to write), which it also says on
+the console. Before Raft SDK 0.19.0 this row was `raft.state_save_failed`. A
+failed load or save never fails the call: it costs at most a batch delivered
+again or one more hold.
 
 Four of `raft`'s hand-written tools are Raft Agent Login for Connected Apps
 (`src/plugins/raft-agent-login.ts`, the steps of Raft's CLI `integration list`,

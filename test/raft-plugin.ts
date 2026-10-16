@@ -939,7 +939,7 @@ await check("conversation cards a history read showed are booked for the next ca
   if (!(heldAgain instanceof Interrupt) || after[0]?.seenCards?.channel !== null) throw new Error(`a parked read booked its card: ${JSON.stringify(after)}`);
 });
 
-await check("a state save that fails is a raft.state_save_failed trace row, with its phase, the error and the record's size in UTF-8 bytes, and a console line; the call still answers", async () => {
+await check("a state save that fails is a raft.state_failed trace row, with its phase, the error and the record's size in UTF-8 bytes, and a console line; the call still answers", async () => {
   const m = cardsMount({});
   const db = Object.create(m.ctx.db);
   // The record the save tried to write, taken from inside the transaction before it fails.
@@ -960,7 +960,7 @@ await check("a state save that fails is a raft.state_save_failed trace row, with
     if (!(held instanceof Interrupt)) throw new Error(`the call did not answer: ${JSON.stringify(held)}`);
   } finally { console.warn = warn; }
   // One row per failed save, each sized as the record that save tried to write.
-  const failed = m.rows.filter((r) => r.kind === "raft.state_save_failed");
+  const failed = m.rows.filter((r) => r.kind === "raft.state_failed");
   if (attempted.length === 0 || failed.length !== attempted.length) throw new Error(`control: ${attempted.length} saves, ${failed.length} rows`);
   attempted.forEach((record, i) => {
     const text = JSON.stringify(record);
@@ -972,6 +972,32 @@ await check("a state save that fails is a raft.state_save_failed trace row, with
     }
   });
   if (!warned.some((w) => w.includes("raft state save failed for mount raft: storage full"))) throw new Error(`the console line: ${JSON.stringify(warned)}`);
+});
+
+await check("a state load that fails is a raft.state_failed trace row with phase load and no stateBytes, and a console line; the call still answers", async () => {
+  const m = cardsMount({});
+  const db = Object.create(m.ctx.db);
+  // Only the SDK's state record fails to read; every other read of the mount's database answers as before.
+  db.get = async (store: string, key: string) => {
+    if (store === INBOX_STORE && key === "state") throw new Error("disk unreadable");
+    return m.ctx.db.get(store, key);
+  };
+  const c = { ...m.ctx, db };
+  const warned: string[] = [];
+  const warn = console.warn;
+  console.warn = (...a: unknown[]) => { warned.push(a.join(" ")); };
+  let out: any;
+  try {
+    // A send attests the seen frontier, so it loads the state first.
+    one(SENT());
+    out = await raftPlugin.invoke("messages_send", { target: "#general", content: "x", idempotencyKey: "k-load" }, c);
+  } finally { console.warn = warn; }
+  must(out?.state === "sent", `the call did not answer: ${JSON.stringify(out)}`);
+  const failed = m.rows.filter((r) => r.kind === "raft.state_failed");
+  must(failed.length === 1 && failed[0].status === "load" && failed[0].verdict === "failed" && failed[0].attrs.phase === "load" &&
+    failed[0].attrs.error === "disk unreadable" && !("stateBytes" in failed[0].attrs), `rows: ${JSON.stringify(m.rows)}`);
+  must(!m.rows.some((r) => r.kind === "raft.state_save_failed"), `the retired kind was written: ${JSON.stringify(m.rows)}`);
+  must(warned.some((w) => w.includes("raft state load failed for mount raft: disk unreadable")), `the console line: ${JSON.stringify(warned)}`);
 });
 
 /** A /events answer in the shape the Raft SDK validates. */
@@ -1579,6 +1605,57 @@ await check("messages_search passes its parameters through and answers with the 
     throw new Error(`request: ${calls[0]!.url}`);
   }
   if (out.text !== "No search results. (truncated=false)") throw new Error(JSON.stringify(out));
+});
+
+/** One search hit as Raft's `/search` returns it. */
+function searchHit(id: string, content: string) {
+  return { id, seq: 1, channelId: "c", threadId: null, parentMessageId: null, parentMessageContent: null, parentChannelId: "c",
+    parentChannelName: "ops", parentChannelType: "channel", parentChannelArchivedAt: null, senderId: "s", senderType: "human", senderName: "tygg",
+    channelName: "ops", channelType: "channel", channelArchivedAt: null, content, snippet: content, createdAt: "2026-09-21T10:00:00.000Z" };
+}
+/** A recent-sort text search Raft stopped at its scan budget (SDK 0.19.0): `results` are what it found before it stopped. */
+const stoppedSearch = (results: unknown[]) => json(200, { results, hasMore: false, incomplete: true, nextCursor: "cur-9f3a",
+  searchedThrough: "2026-09-01T00:00:00.000Z", searchedMessages: 10000 });
+/** The continuing call the SDK's text names, `messages_search({ … cursor: "…" … })`, and the cursor in it. */
+const CONTINUE = /Next \(search older messages\): messages_search\(\{[^\n]*\bcursor: "([^"]+)"[^\n]*\}\)/;
+
+await check("a search Raft stopped with nothing found reaches the model as the SDK's incomplete state and text, with the call that continues it, not as no results", async () => {
+  const calls = one(stoppedSearch([]));
+  const out = await raftPlugin.invoke("messages_search", { query: "launch plan", sort: "recent" }, inTurn(ctx())) as any;
+  must(calls.length === 1 && new URL(calls[0]!.url).pathname.endsWith("/search"), `request: ${JSON.stringify(calls.map((c) => c.url))}`);
+  must(out.state === "incomplete", `state: ${JSON.stringify(out)}`);
+  must(/^Search incomplete: no matches in the messages searched so far \(stopped after reading 10,000 messages, back to [^)]+\)\. Older messages were not searched, so this does NOT mean no message matches\./.test(out.text),
+    `the SDK's sentence: ${out.text}`);
+  must(!/No search results/.test(out.text) && !/"empty"/.test(JSON.stringify(out)), `read as no results: ${JSON.stringify(out)}`);
+  const next = CONTINUE.exec(out.text);
+  must(next && next[1] === "cur-9f3a" && /query: "launch plan"/.test(next[0]), `the continuing call: ${out.text}`);
+  must(/\nOr narrow the search: add target or sender\.$/.test(out.text), `the narrowing line: ${out.text}`);
+});
+
+await check("a search Raft stopped after finding some is the SDK's results state, its text saying these are not all the matches, with the call that continues it", async () => {
+  one(stoppedSearch([searchHit("r-1", "the launch plan is in the doc")]));
+  const out = await raftPlugin.invoke("messages_search", { query: "launch plan", sort: "recent" }, inTurn(ctx())) as any;
+  must(out.state === "results", `state: ${JSON.stringify(out)}`);
+  must(/msg:r-1/.test(out.text) && /incomplete=true · stopped after reading 10,000 messages, back to [^;]+; older messages were not searched, so these are NOT all the matches/.test(out.text),
+    `the SDK's incomplete line: ${out.text}`);
+  must(!/truncated=false/.test(out.text), `read as complete: ${out.text}`);
+  must(CONTINUE.exec(out.text)?.[1] === "cur-9f3a", `the continuing call: ${out.text}`);
+});
+
+await check("messages_search offers cursor, and the cursor the SDK's text hands back is sent to Raft as given, with no offset", async () => {
+  const offered = (toolNamed("messages_search")!.parameters as any).properties.cursor;
+  must(offered?.type === "string" && /nextCursor/.test(offered.description ?? ""), `the schema: ${JSON.stringify(toolNamed("messages_search")!.parameters)}`);
+  const snapshotted = toolsOf(raftPlugin, { toolSnapshot: { tools: [{ name: "messages_search" }] } } as any).find((t) => t.name === "messages_search");
+  must((snapshotted?.parameters as any)?.properties?.cursor?.type === "string", `a snapshotted mount's schema: ${JSON.stringify(snapshotted?.parameters)}`);
+  one(stoppedSearch([]));
+  const first = await raftPlugin.invoke("messages_search", { query: "launch plan", sort: "recent" }, inTurn(ctx())) as any;
+  const cursor = CONTINUE.exec(first.text)?.[1];
+  must(cursor === "cur-9f3a", `control: no cursor in ${first.text}`);
+  const calls = one(json(200, { results: [searchHit("r-2", "found it: launch plan")], hasMore: false }));
+  const second = await raftPlugin.invoke("messages_search", { query: "launch plan", sort: "recent", cursor }, inTurn(ctx())) as any;
+  const p = new URL(calls[0]!.url).searchParams;
+  must(p.get("cursor") === "cur-9f3a" && p.get("q") === "launch plan" && !p.has("offset"), `request: ${calls[0]!.url}`);
+  must(second.state === "results" && /msg:r-2/.test(second.text), `the next page: ${JSON.stringify(second)}`);
 });
 
 /** The operations whose result the manifest says may be large and that page by `limit`: the ones capped here. */
