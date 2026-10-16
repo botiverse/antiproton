@@ -525,7 +525,7 @@ await check("raft: through the gateway, a hold and its answer are trace rows joi
     `the answer row: ${JSON.stringify(f.traced)}`);
 });
 
-await check("a plugin writes only its own trace kinds: a kernel kind through PluginContext.trace is not written", async () => {
+await check("a plugin writes only its own trace kinds: a kernel kind, or the retired raft.state_save_failed, through PluginContext.trace is not written", async () => {
   const store = new SqliteStore(":memory:");
   await store.init();
   await store.createAgent("t", "a");
@@ -535,7 +535,8 @@ await check("a plugin writes only its own trace kinds: a kernel kind through Plu
     tools: [{ name: "go", summary: "Write two rows.", parameters: { type: "object", properties: {} }, sideEffects: "read", idempotency: "native" }],
     async invoke(_t, _a, ctx) {
       ctx.trace?.({ kind: "tool.call" as any, status: "succeeded", verdict: "ok", attrs: { forged: true } });
-      ctx.trace?.({ kind: "raft.state_save_failed", status: "save", verdict: "failed", attrs: { mount: "not-the-mount", phase: "save" } });
+      ctx.trace?.({ kind: "raft.state_save_failed" as any, status: "save", verdict: "failed", attrs: { phase: "save" } });
+      ctx.trace?.({ kind: "raft.state_failed", status: "load", verdict: "failed", attrs: { mount: "not-the-mount", phase: "load" } });
       return { ok: true };
     },
   };
@@ -546,7 +547,7 @@ await check("a plugin writes only its own trace kinds: a kernel kind through Plu
   const out = await gw.invoke(CTX, "p.go", {}, {}) as any;
   must(out.status === "succeeded", `the call: ${JSON.stringify(out)}`);
   const own = traced.filter((r) => r.kind !== "tool.call" || r.attrs?.forged);
-  must(own.length === 1 && own[0].kind === "raft.state_save_failed" && own[0].attrs.mount === "p" && own[0].spanId === out.operationId,
+  must(own.length === 1 && own[0].kind === "raft.state_failed" && own[0].attrs.mount === "p" && own[0].attrs.phase === "load" && own[0].spanId === out.operationId,
     `the plugin's rows: ${JSON.stringify(traced)}`);
 });
 

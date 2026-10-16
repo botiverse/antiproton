@@ -69,20 +69,21 @@ const TABLE = "CREATE TABLE IF NOT EXISTS trace_outbox(" +
 // `mount.settings` is an operator's in-place change of a mount's settings (`PATCH /admin/mounts`, cf/src/runtime.ts
 // `updateMountSettings`): `attrs` the alias, the plugin and the keys that changed. Activity and status skip it.
 // The rest are the kinds a plugin may write itself, through `PluginContext.trace` (`PLUGIN_TRACE_KINDS`). Activity and
-// status skip them.
+// status skip them. `raft.state_save_failed` is no longer written (it is `raft.state_failed` now) and stays here only so
+// a row of that kind still in an outbox is drained and read as a row, not dropped as damage.
 export const TRACE_KINDS = ["model.call", "tool.call", "approval.wait", "container.lease", "inbound", "mount.seeded", "harness.open",
   "turn.stop", "js.run",
   "rebuild.decision", "rebuild.outcome", "rebuild.behaviour", "session.needs_reset", "turn.timing", "import.hold", "model.prewarm",
-  "agent.ready", "mount.settings", "raft.held", "raft.held_answer", "raft.state_save_failed"] as const;
+  "agent.ready", "mount.settings", "raft.held", "raft.held_answer", "raft.state_failed", "raft.state_save_failed"] as const;
 export type TraceKind = (typeof TRACE_KINDS)[number];
 
 /**
  * The kinds a plugin may write (`PluginContext.trace`): its own facts, never a kind a seam of the kernel writes, so a
  * plugin cannot add a `tool.call` or a `model.call` the drain would count. The gateway refuses any other kind.
  * `raft.held` is a Raft call held for the model's decision, `raft.held_answer` the model's answer to one, and
- * `raft.state_save_failed` the Raft SDK's state that did not load or save (src/plugins/raft.ts says what each holds).
+ * `raft.state_failed` the Raft SDK's state that did not load or save (src/plugins/raft.ts says what each holds).
  */
-export const PLUGIN_TRACE_KINDS = ["raft.held", "raft.held_answer", "raft.state_save_failed"] as const satisfies readonly TraceKind[];
+export const PLUGIN_TRACE_KINDS = ["raft.held", "raft.held_answer", "raft.state_failed"] as const satisfies readonly TraceKind[];
 export type PluginTraceKind = (typeof PLUGIN_TRACE_KINDS)[number];
 
 export const TRACE_VERDICTS = ["ok", "failed", "blocked", "cancelled"] as const;

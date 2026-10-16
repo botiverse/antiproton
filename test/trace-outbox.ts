@@ -115,6 +115,17 @@ check("and at read: a corrupted row is counted, not passed through as a valid ty
   eq(pending.rows[0].attrs, { unparseable: true }, "and a parseable-but-wrong-shaped attrs is the same one shape of damage");
 });
 
+check("a raft.state_save_failed row stored before the rename to raft.state_failed is still drained as a row, not counted as damage", () => {
+  const host = sqliteHost();
+  ensureTraceOutbox(host.sql);
+  appendTrace(host.sql, [row({ spanId: "mount:raft", kind: "raft.state_failed", status: "save", verdict: "failed", attrs: { phase: "save" } })]);
+  // The kind as a build before Raft SDK 0.19.0 wrote it, already in the outbox when this build starts draining.
+  host.sql.exec("INSERT INTO trace_outbox (at, tenant_id, agent_id, kind, span_id, parent_id, status, verdict, ms, attrs) VALUES (?, 't', 'a', 'raft.state_save_failed', 'mount:raft', NULL, 'load', 'failed', NULL, '{\"phase\":\"load\"}')", T0);
+  const pending = pendingTrace(host.sql, 0);
+  eq(pending.dropped, 0, "nothing dropped");
+  eq(pending.rows.map((r) => [r.kind, r.status]), [["raft.state_failed", "save"], ["raft.state_save_failed", "load"]], "both rows, in write order");
+});
+
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.error ? `\n    ${r.error}` : ""}`);
 const failed = results.filter((r) => !r.ok).length;
 console.log(`${results.length - failed}/${results.length} passed`);

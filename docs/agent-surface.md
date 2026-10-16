@@ -1034,7 +1034,7 @@ answer with `/admin/transcript`'s for the same agent).
 `GET …/trace` answers the agent's trace rows — the spans of its work, one row each when it ended
 (`model.call`, `tool.call`, `approval.wait`, `container.lease`, `inbound`, `mount.seeded`,
 `rebuild.decision`, `rebuild.outcome`, `rebuild.behaviour`, `turn.timing`, `import.hold`, `model.prewarm`, `agent.ready`,
-`mount.settings` (an operator's in-place change of a mount's settings, [docs/plugins.md](plugins.md)), and the rows a plugin writes of its own, `raft.held`, `raft.held_answer` and `raft.state_save_failed`
+`mount.settings` (an operator's in-place change of a mount's settings, [docs/plugins.md](plugins.md)), and the rows a plugin writes of its own, `raft.held`, `raft.held_answer` and `raft.state_failed` (written as `raft.state_save_failed` before Raft SDK 0.19.0)
 ([docs/plugins.md](plugins.md)); `src/trace/outbox.ts`) — with `from <= at < to`, in `seq` order.
 
 - `from`, `to` — ISO 8601 or milliseconds since the epoch; the window is at most 24 hours. One alone

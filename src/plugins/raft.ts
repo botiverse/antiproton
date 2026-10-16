@@ -504,10 +504,11 @@ function raftFor(ctx: PluginContext, options: { state?: false; response?: (res: 
     },
     ...(options.state === false ? {} : { state: stateStore(ctx, last) }),
     // A save that failed or lost a race costs at most one repeated batch or one extra hold; it never fails
-    // the call, and the SDK does not retry it. Kept as a trace row, which is stored with the agent's spans and read
-    // through its trace (`raft.state_save_failed`), since the object's console lines may be dropped; and said on
-    // the console too, where an operator watching the log would look.
-    onStateSaveError: (error, { phase }) => stateSaveFailed(ctx, phase, error, phase === "save" ? stateBytes(last.state) : undefined),
+    // the call, and the SDK does not retry it; a load that failed is read as no state, with the same cost. Kept as a
+    // trace row, which is stored with the agent's spans and read through its trace (`raft.state_failed`, its phase in
+    // `status` and `attrs`), since the object's console lines may be dropped; and said on the console too, where an
+    // operator watching the log would look.
+    onStateError: (error, { phase }) => stateFailed(ctx, phase, error, phase === "save" ? stateBytes(last.state) : undefined),
   });
 }
 
@@ -527,11 +528,11 @@ function stateBytes(state: RaftState | undefined): number | undefined {
 }
 
 /** One failed load or save of the SDK's state: a trace row (`PluginContext.trace`) and a console line. */
-export function stateSaveFailed(ctx: PluginContext, phase: "load" | "save", error: unknown, stateBytes?: number): void {
+export function stateFailed(ctx: PluginContext, phase: "load" | "save", error: unknown, stateBytes?: number): void {
   const message = clip(String((error as Error)?.message ?? error), 200) ?? "";
   console.warn(`raft state ${phase} failed for mount ${ctx.alias}: ${message}`);
   ctx.trace?.({
-    kind: "raft.state_save_failed", status: phase, verdict: "failed",
+    kind: "raft.state_failed", status: phase, verdict: "failed",
     attrs: { phase, error: message, ...(stateBytes !== undefined ? { stateBytes } : {}) },
   });
 }
@@ -1235,6 +1236,10 @@ async function runOperation(
   // projection and stays out, so a new server field cannot silently enter the model's context.
   // A message's line is rebuilt by `modelLine` from the message itself (its attachment suffix is the SDK's, not the
   // author's); everything else a person wrote is set aside by `quotedCalls`.
+  // No state is singled out here, so none is said in other words: a search Raft stopped at its scan budget (SDK 0.19.0)
+  // comes back as `incomplete` with nothing found, or `results` with the page marked incomplete, and its text says that
+  // older messages were not searched and gives the continuing `messages_search` call with its `cursor`, an argument
+  // the tool offers since the manifest does. Read as `empty`, it would tell the model nothing matches.
   const data = (out as { data?: unknown }).data as Record<string, unknown> | undefined;
   const messages = [...(Array.isArray(data?.messages) ? data.messages : []), data?.message].filter(isMessage);
   let text = out.text.trim();
