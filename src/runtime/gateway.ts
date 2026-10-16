@@ -358,7 +358,7 @@ export class ToolGateway {
     if (decision === "denied") {
       await this.#store.completeOperation(tenantId, operationId, "cancelled", null, {
         denied: true, approver,
-      });
+      }, { denied: true });
       return { ok: true, executed: false };
     }
 

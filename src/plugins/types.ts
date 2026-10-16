@@ -1543,7 +1543,8 @@ export interface ActivityEvent {
   exitCode?: number;
   /**
    * On a tool's end: true when it succeeded (a command that exited non-zero included), false when it failed or was
-   * refused, null when the outcome is not known (lost, or the call was cancelled). Always present on a tool's end.
+   * refused (by policy, or by a person denying its approval), null when the outcome is not known (lost, or the call
+   * was cancelled). Always present on a tool's end.
    */
   ok?: boolean | null;
   errorClass?: string;

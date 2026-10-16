@@ -68,6 +68,8 @@ export function toolCallRow(op: {
   exitCode?: number | null;
   /** When the attempt began, after any approval wait (`CompletedFacts.startedAt`). */
   startedAt?: number | null;
+  /** A person refused the held call (`CompletedFacts.denied`). */
+  denied?: boolean;
 }): TraceRow {
   const num = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v);
   return {
@@ -81,6 +83,7 @@ export function toolCallRow(op: {
       tool: op.tool, mount: op.mountAlias, task: op.taskId, ...(op.callId ? { callId: op.callId } : {}),
       ...(num(op.exitCode) ? { exitCode: op.exitCode } : {}),
       ...(num(op.startedAt) ? { runMs: Math.max(0, op.endedAt - Math.max(op.startedAt, op.createdAt)) } : {}),
+      ...(op.denied === true ? { denied: true } : {}),
     },
   };
 }

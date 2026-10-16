@@ -95,7 +95,15 @@ for (const backend of Object.keys(BACKENDS) as Array<keyof typeof BACKENDS>) {
     await store.recordOperation({ ...OP, operationId: "op_2" });
     await store.completeOperation("t", "op_2", "failed", null);
     const second = pendingTrace(sql, 0).rows.find((x) => x.spanId === "op_2")!;
-    must(!("exitCode" in second.attrs) && !("runMs" in second.attrs), `attrs ${JSON.stringify(second.attrs)}`);
+    must(!("exitCode" in second.attrs) && !("runMs" in second.attrs) && !("denied" in second.attrs), `attrs ${JSON.stringify(second.attrs)}`);
+    // A person's refusal of a held call is said on the row; a plain cancel is not.
+    await store.recordOperation({ ...OP, operationId: "op_3" });
+    await store.completeOperation("t", "op_3", "cancelled", null, { denied: true, approver: "alice" }, { denied: true });
+    await store.recordOperation({ ...OP, operationId: "op_4" });
+    await store.completeOperation("t", "op_4", "cancelled", null);
+    const after = pendingTrace(sql, 0).rows;
+    must(after.find((x) => x.spanId === "op_3")!.attrs.denied === true, `denied row ${JSON.stringify(after.find((x) => x.spanId === "op_3"))}`);
+    must(!("denied" in after.find((x) => x.spanId === "op_4")!.attrs), "a plain cancel says denied");
   });
 
   await check(`a denied approval leaves an approval.wait row that joins back to it (${backend})`, async () => {

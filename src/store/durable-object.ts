@@ -493,7 +493,7 @@ export class DurableObjectStore implements StorageAdapter {
             tenantId, agentId: op.agent_id, taskId: op.task_id, operationId,
             mountAlias: op.mount_alias, tool: op.tool, status,
             createdAt: Number(op.created_at), endedAt, callId: facts?.callId ?? null,
-            exitCode: facts?.exitCode ?? null, startedAt: facts?.startedAt ?? null,
+            exitCode: facts?.exitCode ?? null, startedAt: facts?.startedAt ?? null, denied: facts?.denied === true,
           })]);
         }
       }

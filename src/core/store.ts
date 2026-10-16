@@ -56,6 +56,11 @@ export interface CompletedFacts {
    * only, like `exitCode`.
    */
   startedAt?: number;
+  /**
+   * A held call a person refused (`applyApproval`, src/runtime/gateway.ts). It ends `cancelled`, as other ends of a
+   * call that never ran do, and this is what tells a refusal apart from those. Trace row only, like `exitCode`.
+   */
+  denied?: boolean;
 }
 
 /** A stored value: inline when small, a reference to object storage when not. */

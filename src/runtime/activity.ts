@@ -122,7 +122,7 @@ function hookEvents(agentId: string, rows: readonly TraceOutboxRow[]): ActivityE
           hookEventName: ok ? "PostToolUse" : "PostToolUseFailure",
           toolName,
           toolUseId,
-          ok: toolOutcome(row.status),
+          ok: toolOutcome(row.status, row.attrs.denied === true),
           ...(durationMs === null ? {} : { durationMs }),
           ...(exitCode === null ? {} : { exitCode }),
           ...(ok ? {} : { errorClass: row.status }),
@@ -152,9 +152,11 @@ function hookEvents(agentId: string, rows: readonly TraceOutboxRow[]): ActivityE
  * `ok` on a tool's end, from the operation's status (`row.status`, written verbatim): whether the call did what it
  * was asked. `succeeded` is true even for a command that exited non-zero (`exitCode` says that); `failed` and
  * `rejected` are false; `unknown` (the outcome was lost) and `cancelled` are null, which the service reads as "not
- * known" — sent as an explicit null, not left out.
+ * known" — sent as an explicit null, not left out. A held call a person refused ends `cancelled` too, but is false
+ * (`attrs.denied`, src/trace/seams.ts): the call was refused, as a policy refusal is, which is not an unknown outcome.
  */
-export function toolOutcome(status: string): boolean | null {
+export function toolOutcome(status: string, denied = false): boolean | null {
+  if (denied) return false;
   switch (status) {
     case "succeeded": return true;
     case "failed": case "rejected": return false;

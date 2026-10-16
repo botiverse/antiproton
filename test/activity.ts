@@ -53,6 +53,13 @@ check("ok is true for succeeded, false for failed and rejected, and an explicit 
   }
 });
 
+check("a held call a person denied is ok false; a cancel with no denial on the row stays null", () => {
+  const [, denied] = activityEvents("raft_a", [row(47, "tool.call", "cancelled", "cancelled", { ms: 1, attrs: { tool: "zap", mount: "m", denied: true } })]);
+  must(denied!.hookEventName === "PostToolUseFailure" && denied!.ok === false, `denied: ${JSON.stringify(denied)}`);
+  const [, cancelled] = activityEvents("raft_a", [row(48, "tool.call", "cancelled", "cancelled", { ms: 1, attrs: { tool: "zap", mount: "m" } })]);
+  must("ok" in cancelled! && cancelled!.ok === null, `plain cancel: ${JSON.stringify(cancelled)}`);
+});
+
 check("durationMs is how long the tool ran (runMs) when the row says it, so an approval wait is not in it; the start stays at the request", () => {
   const [pre, post] = activityEvents("raft_a", [row(45, "tool.call", "succeeded", "ok", { ms: 60_000, attrs: { tool: "zap", mount: "m", runMs: 1_200 } })]);
   must(post!.durationMs === 1_200, `durationMs ${post!.durationMs}`);

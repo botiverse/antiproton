@@ -743,7 +743,7 @@ reported.
 |---|---|---|
 | `toolName` | both | the tool as the model names it, `<mount>__<tool>` |
 | `toolUseId` | both | the call's operation id: the same on the two events of a call, different for every call (two calls to one tool, the host calls of one `run_js` program, the step that continues a tool's question, a call run after approval) |
-| `ok` | the end | `true` succeeded (including a command that exited non-zero), `false` failed or refused, `null` the outcome is not known (lost, or cancelled — a denied approval is a cancel) |
+| `ok` | the end | `true` succeeded (including a command that exited non-zero), `false` failed or refused (by the mount's policy, or by a person denying the approval), `null` the outcome is not known (lost, or cancelled) |
 | `durationMs` | the end | how long the tool ran; a call held for approval counts from when it began after the approval, not from the request |
 | `exitCode` | the end | only for a command (sandbox `shell` / `run`, backgrounded or not): its exit status |
 

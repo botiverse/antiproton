@@ -260,7 +260,8 @@ await check("a turn's tool calls are each one start and one end under an id no o
     js0: { hook: "PostToolUse", ok: true }, js1: { hook: "PostToolUse", ok: true },
     failed: { hook: "PostToolUseFailure", ok: false }, unknown: { hook: "PostToolUseFailure", ok: null },
     rejected: { hook: "PostToolUseFailure", ok: false }, asked: { hook: "PostToolUse", ok: true }, resumed: { hook: "PostToolUse", ok: true },
-    approved: { hook: "PostToolUse", ok: true }, denied: { hook: "PostToolUseFailure", ok: null },
+    // Refused by a person is false, as a policy refusal is; a job cancelled (bgCancelled) is a plain cancel and null.
+    approved: { hook: "PostToolUse", ok: true }, denied: { hook: "PostToolUseFailure", ok: false },
     background: { hook: "PostToolUse", ok: true, exitCode: 7 }, bgCancelled: { hook: "PostToolUseFailure", ok: null },
   };
   for (const label of labels) must(outcome(label) === JSON.stringify(want[label]), `${label}: ${outcome(label)}, want ${JSON.stringify(want[label])}`);
