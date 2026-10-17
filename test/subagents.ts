@@ -371,29 +371,34 @@ for (const engine of (process.env.ENGINES ?? "pi085,pd").split(",").filter((e) =
   });
 
 
-  await check(`${engine}: a stop landing while a task is being posted leaves no run: the spawn cancels it itself`, async () => {
+  await check(`${engine}: a stop landing while a task is being posted leaves no run: the spawn cancels it itself, and says so`, async () => {
     const w = await world(engine);
     let parentCalls = 0;
     w.reply = (session) => {
       if (session === "main") { parentCalls++; return parentCalls === 1 ? calls({ id: "c1", args: { task: "late child" } }) : say("ok"); }
       return say("the child ran");
     };
-    let stop: Promise<unknown> | null = null;
+    // What a stop does to a spawn whose post is in flight, landing in that window: the row marked stopped
+    // (`stopRunningSubagents`) and the child's session cancelled, which has nothing to cancel yet. The stop's abort of
+    // the parent's own turn is left out: in one isolate it would take the spawn's detached post down with it, which a
+    // stop arriving from another request does not.
+    let stopped = false;
     w.fault.at = async (p, id) => {
-      if (p !== "task-posting" || stop) return;
-      // The stop arrives now, before the task lands: it marks the row and cancels a session that has nothing yet.
-      stop = w.rt.stopTurn("t", "a", "provider_stop");
-      for (let i = 0; i < 300 && (rowsOf(w).find((r) => r.id === id)?.outcome !== "stopped"); i++) await sleep(10);
+      if (p !== "task-posting" || stopped) return;
+      stopped = true;
+      w.raw.sql.exec("UPDATE subagents SET state = 'idle', outcome = 'stopped' WHERE id = ?", id);
+      await w.rt.cancelSession("t", "a", id);
     };
     logs.length = 0;
     await w.rt.postMessage("t", "a", "go", "prompt", "main");
-    for (let i = 0; i < 8 && !stop; i++) await Promise.race([pass(w), sleep(2_000)]);
-    must(stop, "the stop never landed");
-    await stop;
-    // Before any later pass: the spawn's own check cancelled the run its post started.
+    for (let i = 0; i < 8 && !stopped; i++) await pass(w);
+    must(stopped, "the stop never landed");
     const child = rowsOf(w)[0]!.id as string;
-    must(!(await (await w.rt.agent("t", "a", child)).running()), "the child's run survived the stop");
-    must(!logs.some((l) => l.evt === "subagent.stray"), "the stray sweep caught it, not the spawn");
+    // The spawn's own check cancelled the run its post started: nothing was left for the sweep.
+    must(!logs.some((l) => l.evt === "subagent.stray"), "the stray sweep caught the run, not the spawn");
+    const results = w.requests.filter((r) => r.session === "main").flatMap((r) => r.req.messages.filter((m: any) => m.role === "tool"))
+      .map((m: any) => typeof m.content === "string" ? m.content : JSON.stringify(m.content));
+    must(results.some((t) => /was stopped while .* was being started/.test(t)), `the parent was not told: ${show(results)}`);
     for (let i = 0; i < 6; i++) { await pass(w); await sleep(10); }
     must(!w.requests.some((r) => r.session === child), `the stopped child called the model: ${w.requests.filter((r) => r.session === child).length}`);
     must(rowsOf(w)[0]!.outcome === "stopped" && (await reports(w)).length === 0, show(rowsOf(w)));
