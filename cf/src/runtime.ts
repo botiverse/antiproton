@@ -64,7 +64,7 @@ import {
 } from "../../src/runtime/client-calls.ts";
 import { closeTurn, discardTurn, openTurn, turnInbound, turnNotSaid, turnPaused, turnResumed, turnSaid, turnStepStart } from "../../src/runtime/turn-timing.ts";
 import {
-  admitSubagent, finishSubagentTurn, runningSubagentCount, subagentCeilingMs, SUBAGENT_CAP, SUBAGENT_MAX_MS, isSubagentSession, listSubagents, overdueSubagent, recordSubagent, reportMessage,
+  admitSubagent, finishSubagentTurn, runningSubagentCount, subagentCeilingMs, SUBAGENT_CAP, SUBAGENT_MAX_MS, SUBAGENT_LIFETIME_MS, isSubagentSession, listSubagents, overdueSubagent, recordSubagent, reportMessage,
   runningSubagents, setSubagentTurnOp, startedResult as subagentStarted, startSubagentTurn, stopRunningSubagents, subagentOf, subagentTool,
   SUBAGENT_TOOL, childMayCall, childRefusal, childWithheld, taskMessage, turnEnd, type Subagent, type TurnEnd,
   markReported, reportingSubagents, reportKey, subagentIdFor, taskKey, turnKeyOf,
@@ -4615,7 +4615,12 @@ export class AgentRuntime {
     const sql = this.#deps.ctx.storage.sql;
     const owner = { tenantId, agentId };
     const pd = this.#isPd();
-    const busy = pd ? this.#pdSubagentSessions({ live: true }) : sessionsWithWork(sql).filter((x) => isSubagentSession(x));
+    // pi085 lists a session with work only while it is marked or has a call out; a run left in a lane that nothing marks
+    // (a ceiling's cancel that failed) is in no list and would resume on the session's next post, so the lanes of the
+    // children that ended within a lifetime are read too.
+    const recent = pd ? [] : listSubagents(sql, owner, 200).filter((r) => r.state !== "running" && (r.finishedAt ?? 0) > Date.now() - SUBAGENT_LIFETIME_MS)
+      .map((r) => r.id).filter((x) => this.#piSessionRuns(x));
+    const busy = pd ? this.#pdSubagentSessions({ live: true }) : [...new Set([...sessionsWithWork(sql).filter((x) => isSubagentSession(x)), ...recent])];
     // Any work of a subagent whose row says no turn of it runs is stray — a run that landed as a stop did, one a
     // ceiling's cancel failed to end, anything else — with one exception: a finished child's own background job, which
     // pi085 lists as its session's work, and whose completion wakes the child under its limits (`#subagentWakeGate`).

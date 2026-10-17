@@ -578,6 +578,8 @@ for (const engine of (process.env.ENGINES ?? "pi085,pd").split(",").filter((e) =
     const after = w.requests.filter((r) => r.session === child).length;
     for (let i = 0; i < 5; i++) { await pass(w); await sleep(10); }
     must(w.requests.filter((r) => r.session === child).length === after, `the child kept calling the model: ${w.requests.filter((r) => r.session === child).length - after} more`);
+    // Ended, not only left unstepped: a run left in its lane would resume on the session's next post.
+    must(!(await (await w.rt.agent("t", "a", child)).running()), "the child's run is still in its lane");
   });
 
   await check(`${engine}: an Agents API session's cancel opens no finished child of it: twenty of them, none opened`, async () => {
