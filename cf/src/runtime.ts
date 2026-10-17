@@ -4335,6 +4335,16 @@ export class AgentRuntime {
     });
   }
 
+  /** A subagent's idle session given a run by something other than its parent (a background completion): tracked again. */
+  #subagentWoken(tenantId: string, agentId: string, session: string, res: unknown) {
+    const sql = this.#deps.ctx.storage.sql;
+    const owner = { tenantId, agentId };
+    const s = subagentOf(sql, owner, session);
+    const value = (res as { value?: { operationId?: unknown } } | undefined)?.value;
+    if (!s || s.state !== "idle" || s.outcome === "stopped" || value?.operationId === undefined) return;
+    startSubagentTurn(sql, owner, session, { callId: s.callId, turnOp: String(value.operationId), now: Date.now() });
+  }
+
   /** The subagent a model job belongs to, or null: its session, which on pd is the job's conversation's. */
   #subagentOfJob(tenantId: string, agentId: string, jobId: string, session: string): Subagent | null {
     const sql = this.#deps.ctx.storage.sql;
@@ -4407,7 +4417,11 @@ export class AgentRuntime {
     // before the pass: the pass awaits the plugin's poll, and the task can end during that await.
     const bg = await pass(async (session, text) => {
       if (this.#deps.ended?.(owner) === true) return;
-      await this.postMessage(tenantId, agentId, text, "prompt", session).catch((e) => refusedForReset(e, tenantId, agentId, "background completion"));
+      const posted = await this.postMessage(tenantId, agentId, text, "prompt", session).catch((e) => refusedForReset(e, tenantId, agentId, "background completion"));
+      // A subagent's job ending starts another turn of the subagent once its last was reported: that turn is tracked
+      // like one its parent sent, so its answer is reported too (`#reportSubagents`). One that joined a turn still
+      // running is already tracked.
+      if (isSubagentSession(session)) this.#subagentWoken(tenantId, agentId, session, posted?.result);
     });
     // pd: one harness runs every conversation of the object, and one step drives it whole
     // (`DurableAgent.step`), so there is nothing to choose. pi085: the sessions its list says have work.

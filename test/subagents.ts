@@ -19,6 +19,16 @@ import { activityEvents } from "../src/runtime/activity.ts";
 import { statusEvents } from "../src/runtime/status.ts";
 import { SUBAGENT_CAP, SUBAGENT_TOOL, admitSubagent, turnEnd } from "../src/runtime/subagents.ts";
 import { updateAgentSettings, agentSettings } from "../src/runtime/agent-settings.ts";
+import { recordBackgroundJob } from "../src/runtime/background-jobs.ts";
+import type { Plugin } from "../src/plugins/types.ts";
+
+/** A mount whose work goes to the background and is done at the first poll (test/overflow-backstop.ts has the same). */
+const builder: Plugin = {
+  id: "builder", version: "1.0.0",
+  tools: [{ name: "build", description: "Build.", parameters: { type: "object", properties: {} }, sideEffects: "write", idempotency: "none" }] as never,
+  async invoke() { return { ok: true }; },
+  background: { async poll() { return { done: true, result: "built" }; }, async cancel() {} },
+} as Plugin;
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void> | void) {
@@ -42,7 +52,7 @@ type Job = { model: { api: string; provider: string; id: string }; context: Para
 const USER_MODELS = { offered: [{ id: "cheap", label: "Cheap", provider: "deepseek", model: "m-cheap" }] };
 
 /** One agent on an AgentRuntime over node:sqlite, its object recording `engine`, its `subagents` setting as given. */
-async function world(engine: "pi085" | "pd", opts: { on?: boolean } = {}) {
+async function world(engine: "pi085" | "pd", opts: { on?: boolean; builder?: boolean } = {}) {
   const raw = sqliteHost();
   if (engine === "pd") {
     const ap = new ApStore(raw, prefixedNamespace("ap"));
@@ -54,7 +64,7 @@ async function world(engine: "pi085" | "pd", opts: { on?: boolean } = {}) {
   const isolate = () => new AgentRuntime({
     ctx: { storage: { sql: raw.sql, transactionSync: raw.transactionSync } },
     bucket: {} as never, bucketName: "b", models: { resolve: () => null },
-    sandbox: false, autoRelease: false, userModels: USER_MODELS,
+    sandbox: false, autoRelease: false, userModels: USER_MODELS, ...(opts.builder ? { extraPlugins: [builder] } : {}),
     operatorModel: operatorModelOf({ DEEPSEEK_BASE_URL: "https://model.example/v1", DEEPSEEK_API_KEY: "operator-key", HARNESS_MODEL: "m1" }),
     offloadModel: async (job: { commandId: string }) => { sent.push(job.commandId); },
   } as never);
@@ -70,6 +80,10 @@ async function world(engine: "pi085" | "pd", opts: { on?: boolean } = {}) {
   };
   await w.rt.ready();
   await w.rt.store.createAgent("t", "a", { name: "Ada", description: "d" } as never);
+  if (opts.builder) {
+    await w.rt.store.setPluginChoice("t", "a", "builder", "enable");
+    must((await w.rt.addMount("t", "a", { alias: "builder", plugin: "builder", config: {} })).ok, "the builder mount was refused");
+  }
   await w.rt.bindOperatorModel("t", "a");
   if (opts.on !== false) must(updateAgentSettings(raw.sql as never, { subagents: true }, "test").ok, "setting refused");
   return w;
@@ -224,6 +238,25 @@ for (const engine of (process.env.ENGINES ?? "pi085,pd").split(",") as Array<"pi
     must(rs.length === 2 && rs[1]!.includes("the word was BLUE"), `reports: ${show(rs)}`);
     const rows = rowsOf(w);
     must(rows.length === 1 && rows[0].turns === 2 && rows[0].id === child, show(rows));
+  });
+
+  await check(`${engine}: a background job a subagent left ends after its report: the turn it starts is reported too`, async () => {
+    const w = await world(engine, { builder: true });
+    let parentCalls = 0;
+    w.reply = (session, req) => {
+      if (session === "main") { parentCalls++; return parentCalls === 1 ? calls({ id: "c1", args: { task: "start the build" } }) : say("ok"); }
+      return say(JSON.stringify(req.messages).includes("[background job op_bg") ? "the build finished: built" : "the build is running");
+    };
+    await w.rt.postMessage("t", "a", "go", "prompt", "main");
+    await settle(w);
+    const child = rowsOf(w)[0]!.id as string;
+    must((await reports(w)).length === 1, show(await reports(w)));
+    recordBackgroundJob(w.raw.sql as never, { tenantId: "t", agentId: "a" }, { id: "op_bg", session: child, mount: "builder", tool: "builder__build", handle: {} }, Date.now());
+    w.raw.sql.exec("UPDATE background_jobs SET next_poll_at = 0 WHERE id = 'op_bg'");
+    await settle(w);
+    const rs = await reports(w);
+    must(rs.length === 2 && rs[1]!.includes("the build finished: built"), show(rs));
+    must(rowsOf(w)[0]!.turns === 2 && rowsOf(w)[0]!.state === "idle", show(rowsOf(w)));
   });
 
   await check(`${engine}: a follow-up to a subagent still running, or to an id this conversation never started, is refused`, async () => {
