@@ -169,3 +169,56 @@ row kept with state `archived`; a `subagent.archived` log line each), at most 5 
 to 10 minutes), each failure a `subagent.turn` row with status `report_failed`; after 8 attempts it is dropped
 (`report_dropped`) and the subagent is idle with outcome `report_failed`. A subagent whose model option a pin or the
 picker switch overrides after its spawn writes a `subagent.model_changed` row, and its next report says so.
+
+## Moving a Raft server's agents to a new tenant
+
+A platform token acts in the tenant its request's server id derives (`derivedTenant`, cf/src/provision/handlers.ts).
+A server id that is not a legal tenant id as it stands derives `raft_<readable>_<12 hex>`, not the substituted or cut
+`raft_<id>` it used to. That means ids with a character outside letters, digits, `.`, `_` and `-`, ids longer than 59
+characters, and ids ending in `_` plus twelve hex digits. A server like that that provisioned agents before the change
+finds none of them afterwards: its requests now address a tenant that holds nothing. On 2026-10-17 neither the
+production nor the preview `provisioned_agents` had such a server; every derived tenant there is `raft_<UUID>`. To
+check again, read `raft_server_id` and `tenant_id` from `provisioned_agents` and look for an id that fails
+`/^[A-Za-z0-9._-]{1,59}$/` or matches `/_[0-9a-f]{12}$/`.
+
+Rewriting `tenant_id` in D1 does not move them. The tenant is part of where the agent lives, not only a column:
+
+- **The agent's Durable Object.** Its name is `a/<tenantId>/<agentId>` (`agentObjectName`, cf/src/object-name.ts), and
+  an object's id comes from its name, so the new tenant's name addresses a new, empty object. The old object's SQLite
+  (tasks, transcript, mounts and their credentials, seed files) also keys its rows on `tenant_id`
+  (src/store/ap-store.ts, src/store/plugin-db.ts, src/store/seed-files.ts, src/store/seed-record.ts).
+- **D1.** `tenant_id` is a column of `provisioned_agents`, `tenant_plans`, `tenant_model_picker`, `spend_limits`,
+  `spend_limit_events`, `spend_pool_limits`, `spend_pool_limit_events`, `usage_daily`, `usage_hourly`,
+  `usage_cursor`, `model_choices`, `model_overrides`, `connectors`, `provisioned_connections`, `inbound_hooks`,
+  `connector_events`, `provider_tokens`, `api_keys`, `identities` and `service_tokens`.
+
+So a migration is one of these two:
+
+1. **Move the objects.** For each agent, create the object under the new name, copy the old object's rows into it
+   with `tenant_id` rewritten, then update the D1 rows above in one batch. Retire the old object only after the new
+   one has answered for the agent. Usage rows can stay under the old tenant as history, or be re-keyed so a spend
+   limit counts them.
+2. **Fall back to the old tenant.** Keep the objects where they are, and let the provisioning routes look an agent
+   up under the server's old derivation when the new tenant has no row for it. This needs code: the old spelling
+   (`raft_` + the id with every character outside `[A-Za-z0-9._-]` replaced by `_`, cut to 64) is no longer computed
+   anywhere. It also brings back the shared namespace the derivation exists to prevent, for any server that still
+   derives that old name.
+
+### Which issuance paths accept a `raft_` tenant
+
+`raft_` is the prefix of every tenant a Raft server id derives. A credential that brings a new principal into a tenant
+under it would act in whichever server's tenant that is. The check is `reservedTenantProblem`
+(cf/src/admin-provider-tokens.ts), and it refuses at issuance only, so a row issued earlier still resolves and can
+still be listed and revoked.
+
+| Path | Under `raft_` | Why |
+|---|---|---|
+| `POST /admin/provider-tokens`, `scope: "tenant"` | `400` | The token is a whole tenant, and its agents, quota and billing are that tenant's. |
+| `POST /admin/provider-tokens`, `scope: "platform"` | n/a | It names no tenant; each request derives `raft_<raftServerId>`, the one source of these names. |
+| `POST /admin/api-keys` | `400` | The key's owner agent, and every agent it makes, are created in the named tenant and spend its limit. |
+| `/ui/api-keys/new` | n/a | The tenant is the signed-in person's own, never a value from the request. |
+| `POST /admin/service-tokens` | only for an existing provisioned agent: an explicit `agentId` with a live `provisioned_agents` row in that tenant, otherwise `400` | An operator may need a token that reaches a provisioned agent in a Raft server's tenant. Without `agentId` the route would make a new agent named after the label, which is a new principal there. |
+| `POST /admin/hooks`, `POST`/`PATCH /admin/mounts` | accepted | They act on the object of the agent named by `(tenantId, agentId)` and issue no credential for the tenant. Neither checks that the agent exists. |
+
+All of these are operator-only. Preview has one tenant-scoped provider token under `raft_`, `raft_pu-verify-1013`. The
+admin route issued it before the refusal existed, and it is revoked.

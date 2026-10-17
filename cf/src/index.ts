@@ -98,7 +98,7 @@ import { d1ApiKeys, admit, d1Identities, d1InboundHooks, type IdentityDirectory 
 import { d1ServiceTokens } from "./control-plane.ts";
 import { adminServiceTokens } from "./admin-service-tokens.ts";
 import { hashServiceToken, looksLikeServiceToken } from "./service-token.ts";
-import { adminProviderTokens } from "./admin-provider-tokens.ts";
+import { adminProviderTokens, reservedTenantProblem } from "./admin-provider-tokens.ts";
 import { d1Connections, d1Connectors, d1ModelChoices, d1ModelOverrides, d1ProviderTokens, d1ProvisionedAgents, d1TenantModelPicker } from "./control-plane.ts";
 import { CONNECT_START_PATH, CONNECTION_PLUGIN, connectCallback, connectLink, connectStart, isConnectCallback, type ConnectDeps } from "./provision/connect.ts";
 import { hashProviderToken, looksLikeProviderToken } from "./provider-token.ts";
@@ -3296,6 +3296,10 @@ async function adminApiKeys(request: Request, env: Env): Promise<Response> {
   }
   const tenantId = String(b?.tenantId ?? ""), ownerAgentId = String(b?.ownerAgentId ?? ""), label = String(b?.label ?? "");
   try { agentObjectName(tenantId, ownerAgentId); } catch (e: any) { return Response.json({ error: String(e?.message ?? e) }, { status: 400 }); }
+  // The key's owner agent, and every agent it makes, live in this tenant and spend its limit, so it may not be a
+  // tenant a Raft server derives (cf/src/admin-provider-tokens.ts reservedTenantProblem).
+  const reserved = reservedTenantProblem(tenantId);
+  if (reserved) return Response.json({ error: "tenantId", hint: `${reserved}; pick another tenant id` }, { status: 400 });
   const key = newApiKey();
   await d1ApiKeys(env.CONTROL_DB).issue({ hash: await hashApiKey(key), tenantId, ownerAgentId, label });
   return Response.json({ key, tenantId, ownerAgentId, label });
@@ -4114,7 +4118,7 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
     // object is chosen: they authenticate differently and address by key.
     if (url.pathname === "/admin/api-keys") return adminApiKeys(request, env);
     // The operator's service tokens (task #7): identities, so before any object as well.
-    if (url.pathname === "/admin/service-tokens") return adminServiceTokens(request, env.AUTOMATION_TOKEN, d1ServiceTokens(env.CONTROL_DB), url);
+    if (url.pathname === "/admin/service-tokens") return adminServiceTokens(request, env.AUTOMATION_TOKEN, d1ServiceTokens(env.CONTROL_DB), url, d1ProvisionedAgents(env.CONTROL_DB));
     // A Raft server's provider tokens, and the agents it provisions with them (raft-agent-provider.v1).
     if (url.pathname === "/admin/provider-tokens") return adminProviderTokens(request, env.AUTOMATION_TOKEN, d1ProviderTokens(env.CONTROL_DB), url);
     // Every tenant's estimated cost (credits phase 1: accounting, nothing enforced). The operator's token, or a

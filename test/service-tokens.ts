@@ -35,7 +35,9 @@ const request = (method: string, body?: unknown, headers: Record<string, string>
     ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
   });
 // No default for the token: `undefined` is a case here (nothing configured), not an omission.
-const call = (req: Request, token: string | undefined, dir: ServiceTokenDirectory) => adminServiceTokens(req, token, dir, new URL(req.url));
+// No provisioned agent anywhere: these cases name no `raft_` tenant, which is the only one that asks (test/provider-tokens.ts).
+const noAgents = { async getByAgentId() { return null; } };
+const call = (req: Request, token: string | undefined, dir: ServiceTokenDirectory) => adminServiceTokens(req, token, dir, new URL(req.url), noAgents);
 
 await check("a new token carries the prefix and 32 random bytes, differs every time, and is recognised by shape alone", async () => {
   const a = newServiceToken(); const b = newServiceToken();
