@@ -3973,15 +3973,19 @@ export default {
 /**
  * The probe routes: an operator's tools, never the internet's.
  *
- * Every path here reaches an object without an identity check of its own, and three of them do real work on
- * arriving: `/isolation`, `/eviction` and `/model-binding` call `startTask`, which provisions the agent, wakes
- * it, and spends the operator's model account on a turn — and leaves a task behind on the shared probe object.
- * The rest burn CPU, subrequests or alarms on that object: `/sandbox` runs a whole dynamic-Worker battery
- * including outbound fetches, `/sandbox/cpu` spins a `while (true) {}` for as long as it is asked to, and
- * `/alarm/arm` arms an alarm at whatever delay it is given. None of them is answerable to a caller with no
- * credential, so they all ask for the operator's token — the door `/agent/message` has always had
- * (`guardSpending`). What is left in the `p0` branch ungated is `/`, the 404 index, and the `/admin` routes,
- * which check for themselves.
+ * Every path here reaches an object or a binding without an identity check of its own, and three of them do
+ * real work on arriving: `/isolation`, `/eviction` and `/model-binding` call `startTask`, which provisions the
+ * agent, wakes it, and spends the operator's model account on a turn — and leaves a task behind on the shared
+ * probe object. The rest spend too: `/conformance/executor` starts Dynamic Workers on the account, `/sandbox`
+ * runs a whole dynamic-Worker battery including outbound fetches, `/sandbox/cpu` spins a `while (true) {}` for
+ * as long as it is asked to, `/alarm/arm` arms an alarm at whatever delay it is given, and `/latency` writes and
+ * reads a 1 MB object in R2 and makes outbound fetches from the Worker. None of them is answerable to a caller
+ * with no credential, so they all ask for the operator's token — the door `/agent/message` has always had
+ * (`guardSpending`).
+ *
+ * The check runs in `route` before any path prefix chooses an object, not in the branch that picks `p0`:
+ * `/conformance/executor` is routed by its `/conformance` prefix to its own object and never reaches that
+ * branch, and a probe added under any other prefix would not either.
  */
 const PROBE_ROUTES = new Set([
   "/storage", "/conformance/executor", "/model-binding", "/eviction", "/isolation",
@@ -4076,6 +4080,11 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
       return adminSpendLimits(request.method, body, v!.sub ?? v!.email, { store: d1SpendLimits(env.CONTROL_DB), limits: limitsOf(env), now: Date.now, plans: d1TenantPlans(env.CONTROL_DB) });
     }
     if (url.pathname.startsWith("/v1/")) return v1(request, env, url);
+    // The probes ask for the operator's token before any prefix below picks their object (PROBE_ROUTES above),
+    // so the gate holds whichever object a probe is routed to, for every method.
+    if (PROBE_ROUTES.has(url.pathname) && !isOperator(env.AUTOMATION_TOKEN, request.headers.get("x-harness-token"))) {
+      return Response.json({ error: "unauthorized", hint: "the probe routes need x-harness-token" }, { status: 401 });
+    }
     // Conformance gets its own object: the P0 probe created an incompatible
     // `tasks` table in "p0", and CREATE TABLE IF NOT EXISTS silently accepted it.
     // Each benchmark arm gets its own object. Sharing one meant asynchronous
@@ -4162,15 +4171,7 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
       if (access === "not-found") {
         return Response.json({ error: `no such agent: ${agentId} (not this viewer's, or never created)` }, { status: 404 });
       }
-    } else {
-      name = "p0";
-      // The probes are the operator's, and the ones that spend are why (PROBE_ROUTES above). Asked once here
-      // rather than in each case below, so a diagnostic added to that switch inherits the gate instead of
-      // having to remember it.
-      if (PROBE_ROUTES.has(url.pathname) && !isOperator(env.AUTOMATION_TOKEN, request.headers.get("x-harness-token"))) {
-        return Response.json({ error: "unauthorized", hint: "the probe routes need x-harness-token" }, { status: 401 });
-      }
-    }
+    } else name = "p0";
     const stub = env.AGENT.get(env.AGENT.idFromName(name));
     try {
       switch (url.pathname) {
