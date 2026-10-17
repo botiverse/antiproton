@@ -268,16 +268,6 @@ type WorkerCode = {
 };
 type WorkerStub = { getEntrypoint(name?: string | null, opts?: unknown): { fetch(req: Request): Promise<Response> } };
 
-/** The P0 probe binding (kept for the substrate checks). */
-export class ToolBinding extends WorkerEntrypoint {
-  async invoke(name: string, args: unknown) {
-    const caller = (this.ctx as any).props ?? {};
-    if (name === "echo") return { status: "succeeded", result: { args, tenant: caller.tenantId } };
-    if (name === "slow") { await new Promise((r) => setTimeout(r, 20)); return { status: "succeeded", result: {} }; }
-    return { status: "rejected", error: { code: "not_mounted", message: name } };
-  }
-}
-
 /**
  * What the sandbox sees as `env.TOOLS`. It holds no authority of its own: the
  * execution id in ctx.props is the only thing it can say, and the supervisor
@@ -359,50 +349,10 @@ function modelQueueDeps(env: Env): ModelQueueDeps {
 
 export { agentObjectName };
 
-const RUNNER = (body: string) => `
-export default {
-  async fetch(request, env) {
-    const out = [];
-    const output = (v) => out.push(v);
-    try {
-      const result = await (async () => { ${body} })();
-      return Response.json({ ok: true, out, result: result ?? null });
-    } catch (e) {
-      return Response.json({ ok: false, out, error: String(e && e.message || e) });
-    }
-  }
-};`;
-
-async function runSandbox(
-  env: Env,
-  body: string,
-  opts: { limits?: { cpuMs?: number; subRequests?: number }; outbound?: unknown; tools?: unknown } = {},
-) {
-  const stub = env.LOADER.load({
-    compatibilityDate: "2026-09-05",
-    mainModule: "main.js",
-    modules: { "main.js": RUNNER(body) },
-    globalOutbound: opts.outbound === undefined ? null : opts.outbound,
-    env: opts.tools ? { TOOLS: opts.tools } : {},
-    limits: opts.limits,
-  });
-  // A CPU/subrequest kill is NOT catchable inside the sandbox: it surfaces as a
-  // rejection here, in the caller. Every invocation must therefore be wrapped —
-  // otherwise one runaway script takes down the supervisor's whole request.
-  try {
-    const res = await stub.getEntrypoint().fetch(new Request("https://sandbox/"));
-    return await res.json();
-  } catch (e: any) {
-    return { ok: false, terminatedByHost: true, error: String(e?.message ?? e).slice(0, 120) };
-  }
-}
-
 export class AgentDO extends DurableObject<Env> {
   sql: SqlStorage;
   #store: DurableObjectStore | null = null;
   #runtime: AgentRuntime | null = null;
-  alarmFiredAt: number | null = null;
-  alarmSetAt: number | null = null;
   /** One variable, flipped at runtime, so the A/B is the same code path. */
   // NOT instance state. A Durable Object is evicted and rebuilt freely, and an
   // in-memory flag silently reverts to its default when that happens — which is
@@ -423,9 +373,6 @@ export class AgentDO extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
-    this.sql.exec(`CREATE TABLE IF NOT EXISTS probe_tasks(
-      task_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, generation INTEGER NOT NULL,
-      checkpoint_version INTEGER NOT NULL, fencing_token INTEGER NOT NULL, checkpoint TEXT NOT NULL)`);
     // What Cloudflare bills this object for: wall clock while it is active.
     this.sql.exec("CREATE TABLE IF NOT EXISTS do_activity(at INTEGER, ms INTEGER, kind TEXT)");
     // Created here rather than on first claim: the alarm reads it, and an alarm
@@ -439,44 +386,6 @@ export class AgentDO extends DurableObject<Env> {
     // The bench runtime has to survive eviction: an alarm on a fresh instance
     // must rebuild the same harness, not fall back to the default one.
     this.sql.exec("CREATE TABLE IF NOT EXISTS bench_config(k TEXT PRIMARY KEY, v TEXT)");
-    this.sql.exec(`CREATE TABLE IF NOT EXISTS probe_outbox(
-      command_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, state TEXT NOT NULL)`);
-  }
-
-  /** The three-gate advance from §7.3, on DO SQLite, timed. */
-  async verifyStorage() {
-    const t0 = Date.now();
-    this.sql.exec("DELETE FROM probe_tasks");
-    this.sql.exec("DELETE FROM probe_outbox");
-    this.sql.exec(
-      "INSERT INTO probe_tasks VALUES ('t1','tenant-a',0,0,0,?)", JSON.stringify({ log: [] }));
-
-    const commit = (gen: number, token: number, version: number, cmd: string) =>
-      this.ctx.storage.transactionSync(() => {
-        const row = [...this.sql.exec("SELECT * FROM probe_tasks WHERE task_id='t1'")][0] as any;
-        if (token < row.fencing_token) return "fenced";
-        if (gen !== row.generation) return "stale_generation";
-        if (version !== row.checkpoint_version) return "version_conflict";
-        this.sql.exec(
-          "UPDATE probe_tasks SET checkpoint_version=?, fencing_token=?, checkpoint=? WHERE task_id='t1'",
-          row.checkpoint_version + 1, token, JSON.stringify({ log: [cmd] }));
-        this.sql.exec("INSERT INTO probe_outbox VALUES (?, 't1', 'pending') ON CONFLICT DO NOTHING", cmd);
-        return "ok";
-      });
-
-    const results = {
-      happyPath: commit(0, 5, 0, "cmd-1"),
-      staleVersion: commit(0, 5, 0, "cmd-dup"),
-      fenced: commit(0, 1, 1, "cmd-zombie"),
-      staleGeneration: commit(9, 6, 1, "cmd-oldgen"),
-      replayIsIdempotent: (() => {
-        commit(0, 6, 1, "cmd-1");
-        return [...this.sql.exec("SELECT count(*) AS n FROM probe_outbox WHERE command_id='cmd-1'")][0];
-      })(),
-      rowsAfter: [...this.sql.exec("SELECT * FROM probe_tasks")][0],
-      ms: Date.now() - t0,
-    };
-    return results;
   }
 
   /**
@@ -573,7 +482,7 @@ export class AgentDO extends DurableObject<Env> {
    * never a decision. That rule has already been broken once: the offload flag
    * lived only in memory, silently reverted to its default after an eviction,
    * and turned the control arm of an A/B into a half-offloaded run that looked
-   * completely plausible. Exercised by /eviction so the rule is checked rather
+   * completely plausible. `restart` uses it, so the rule is exercised rather
    * than remembered.
    */
   async simulateEviction() {
@@ -586,15 +495,6 @@ export class AgentDO extends DurableObject<Env> {
     this.#benchOffload = true;
     this.#offloadDefault = true;
     return { evicted: true };
-  }
-
-  /** Which tenants have rows in THIS object's database. Structural isolation
-   *  means this can only ever be the one tenant the object belongs to. */
-  async listTenants(): Promise<string[]> {
-    try {
-      return (this.sql.exec("SELECT DISTINCT tenant_id FROM tasks").toArray() as any[])
-        .map((r) => String(r.tenant_id)).sort();
-    } catch { return []; }
   }
 
   /** Who this object serves, once claimed. Absent until something claims it —
@@ -873,18 +773,6 @@ export class AgentDO extends DurableObject<Env> {
     // Nothing else runs in the object while it moves: a message taken by pi085 after its transcript was read would be
     // in no pd conversation. A dry-run writes nothing and need not hold anything up.
     return this.#busy("migrateEngine", () => (dryRun ? run() : this.ctx.blockConcurrencyWhile(run)));
-  }
-
-  /** The binding, credential-free, so an operator can see whose key is in use. */
-  async modelBinding(tenantId: string, agentId: string) {
-    const rt = this.#activeRuntime();
-    await rt.ready();
-    return rt.store.getModelBinding(tenantId, agentId);
-  }
-
-  /** Exposed so the eviction check can read the persisted decision. */
-  async readOffload(): Promise<boolean> {
-    return this.#offloadOn();
   }
 
   #offloadOn(): boolean {
@@ -2704,12 +2592,6 @@ export class AgentDO extends DurableObject<Env> {
     return { implementation: "cloudflare-dynamic-workers", ms: Date.now() - t0, results };
   }
 
-  async armAlarm(delayMs: number) {
-    this.alarmSetAt = Date.now();
-    this.alarmFiredAt = null;
-    await this.#wake(Date.now() + delayMs);
-    return { armedAt: this.alarmSetAt, delayMs };
-  }
   /**
    * Arm the next alarm *before* doing the work, not after.
    *
@@ -2731,9 +2613,6 @@ export class AgentDO extends DurableObject<Env> {
     if (failures < 20) await this.ctx.storage.setAlarm(Date.now() + 30_000);
     try {
       await this.#busy("alarm", async (span) => {
-        this.alarmFiredAt = Date.now();
-        this.sql.exec("CREATE TABLE IF NOT EXISTS alarms(at INTEGER)");
-        this.sql.exec("INSERT INTO alarms VALUES (?)", this.alarmFiredAt);
         // The object may have been evicted since the alarm was armed, so this
         // instance can be brand new: build the runtime rather than assuming it.
         const rt = this.#activeRuntime();
@@ -2829,102 +2708,6 @@ export class AgentDO extends DurableObject<Env> {
     }
     const r = this.sql.exec("SELECT v FROM counters2 WHERE k='alarmFailures'").toArray()[0] as any;
     return Number(r?.v ?? 0);
-  }
-  async alarmStatus() {
-    this.sql.exec("CREATE TABLE IF NOT EXISTS alarms(at INTEGER)");
-    const rows = [...this.sql.exec("SELECT at FROM alarms ORDER BY at DESC LIMIT 1")] as any[];
-    return {
-      armedAt: this.alarmSetAt, firedAt: rows[0]?.at ?? null,
-      latencyMs: rows[0]?.at && this.alarmSetAt ? rows[0].at - this.alarmSetAt : null,
-    };
-  }
-
-  /** Isolated: does a runaway child kill the supervisor, or only itself? */
-  async verifyCpuLimit(cpuMs: number) {
-    const t0 = Date.now();
-    const killed = await runSandbox(this.env, `while (true) {}`, { limits: { cpuMs } });
-    const afterMs = Date.now() - t0;
-    // If the supervisor is still executing here, it survived the runaway child.
-    const survivor = await runSandbox(this.env, `output("still alive"); return "alive";`);
-    return { killed, killTookMs: afterMs, hostSurvived: survivor };
-  }
-
-  /** Dynamic Workers get a higher concurrency budget inside a DO (10 vs 4). */
-  async verifySandbox() {
-    const checks: Record<string, unknown> = {};
-    const timed = async (name: string, fn: () => Promise<unknown>) => {
-      const t = Date.now();
-      try { checks[name] = { ...(await fn() as object), ms: Date.now() - t }; }
-      catch (e: any) { checks[name] = { threw: String(e?.message ?? e).slice(0, 120), ms: Date.now() - t }; }
-    };
-    const t0 = Date.now();
-
-    await timed("freshIsolateA", () => runSandbox(this.env, `globalThis.leaked = 42; output(typeof globalThis.leaked); return "a";`));
-    await timed("freshIsolateB", () => runSandbox(this.env, `output(typeof globalThis.leaked); return "b";`));
-    checks.twoLoadsMs = Date.now() - t0;
-
-    await timed("networkBlocked", () => runSandbox(this.env, `
-      const probe = {};
-      try { await fetch("https://example.com"); probe.fetch = "ALLOWED"; }
-      catch (e) { probe.fetch = "blocked"; }
-      probe.hasConnect = typeof connect;
-      output(probe); return probe;`));
-
-    await timed("capabilityBinding", () => runSandbox(this.env, `
-      const r = await env.TOOLS.invoke("echo", { repo: "example/project" });
-      const bad = await env.TOOLS.invoke("slack.post", {});
-      return { ok: r, rejected: bad };`,
-      { tools: this.ctx.exports.ToolBinding({ props: { tenantId: "tenant-a" } }) }));
-
-    await timed("subRequestLimit", () => runSandbox(this.env, `
-      let n = 0;
-      try { for (let i = 0; i < 10; i++) { await env.TOOLS.invoke("slow", {}); n++; } }
-      catch (e) { return { completed: n, stopped: String(e.message || e).slice(0, 60) }; }
-      return { completed: n, stopped: null };`,
-      { tools: this.ctx.exports.ToolBinding({ props: {} }), limits: { subRequests: 3 } }));
-
-    await timed("noBindingsMeansNoTools", () => runSandbox(this.env, `
-      return { envKeys: Object.keys(env ?? {}), hasTools: typeof (env ?? {}).TOOLS };`));
-
-    await timed("nodeCompatSurface", () => runSandbox(this.env, `
-      const probe = { hasProcess: typeof process };
-      try {
-        const fs = await import("node:fs");
-        probe.importedFs = Object.keys(fs).slice(0, 6);
-        try { probe.readEtcPasswd = String(fs.readFileSync("/etc/passwd")).slice(0, 20); }
-        catch (e) { probe.readEtcPasswd = "threw: " + String(e.message || e).slice(0, 60); }
-        try { probe.readdirRoot = fs.readdirSync("/"); }
-        catch (e) { probe.readdirRoot = "threw: " + String(e.message || e).slice(0, 60); }
-      } catch (e) { probe.importedFs = "import refused: " + String(e.message || e).slice(0, 60); }
-      try { const cp = await import("node:child_process"); probe.childProcess = Object.keys(cp).slice(0, 4); }
-      catch (e) { probe.childProcess = "refused"; }
-      try {
-        const net = await import("node:net");
-        probe.net = typeof net.Socket;
-        // The real question: globalOutbound is documented to intercept connect()
-        // as well as fetch(). Does the node:net path honour it?
-        probe.socketConnect = await new Promise((resolve) => {
-          try {
-            const sock = net.connect({ host: "example.com", port: 443 });
-            const done = (v) => { try { sock.destroy(); } catch {} resolve(v); };
-            sock.on("connect", () => done("CONNECTED — ESCAPE"));
-            sock.on("error", (e) => done("refused: " + String(e && e.message).slice(0, 50)));
-            setTimeout(() => done("timeout (no connection)"), 3000);
-          } catch (e) { resolve("threw: " + String(e.message || e).slice(0, 50)); }
-        });
-      } catch (e) { probe.net = "refused"; }
-      try {
-        const cp2 = await import("node:child_process");
-        probe.execWorks = await new Promise((resolve) => {
-          try { cp2.exec("id", (err, out) => resolve(err ? "threw: " + String(err.message).slice(0, 50) : "RAN: " + out)); }
-          catch (e) { resolve("threw: " + String(e.message || e).slice(0, 50)); }
-        });
-      } catch (e) { probe.execWorks = "refused"; }
-      try { const fs2 = await import("node:fs"); probe.bundleListing = fs2.readdirSync("/bundle").slice(0, 5); }
-      catch (e) { probe.bundleListing = "refused"; }
-      return probe;`));
-
-    return checks;
   }
 }
 
@@ -3985,10 +3768,9 @@ async function requireViewer(request: Request, env: Env): Promise<{ who: string;
  *
  * Every hostname reaches this Worker, and several routes start a real agent.
  * A signed-in identity or the automation secret is required; anything else is
- * refused, and the anonymous switch does not open this door. The diagnostics are
+ * refused, and the anonymous switch does not open this door. The probe routes are
  * not reached from here at all: they ask for the operator's token themselves
- * (`PROBE_ROUTES`), because `/isolation`, `/eviction` and `/model-binding` start
- * a real turn and do call a provider.
+ * (`PROBE_ROUTES`).
  */
 async function guardSpending(request: Request, env: Env): Promise<Response | null> {
   // Never anonymous here, whatever the deployment says: this path spends.
@@ -4002,29 +3784,6 @@ async function guardSpending(request: Request, env: Env): Promise<Response | nul
 async function sha256(s: string): Promise<string> {
   const d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
   return [...new Uint8Array(d)].map((b) => b.toString(16).padStart(2, "0")).join("");
-}
-
-/** Where does the wall clock actually go, measured from the edge? */
-async function latency(env: Env) {
-  const time = async (label: string, fn: () => Promise<unknown>) => {
-    const t = Date.now();
-    try { await fn(); return [label, Date.now() - t] as const; }
-    catch (e: any) { return [label, `error: ${String(e?.message ?? e).slice(0, 60)}`] as const; }
-  };
-  const small = new Uint8Array(200).fill(65);
-  const big = new Uint8Array(1024 * 1024).fill(66);
-  const results = await Promise.all([]);
-  void results;
-  const out: Record<string, unknown> = {};
-  for (const r of [
-    await time("r2.put 200B", () => env.ARTIFACTS.put("bench/small.bin", small)),
-    await time("r2.get 200B", () => env.ARTIFACTS.get("bench/small.bin").then((o) => o?.arrayBuffer())),
-    await time("r2.put 1MB", () => env.ARTIFACTS.put("bench/big.bin", big)),
-    await time("r2.get 1MB", () => env.ARTIFACTS.get("bench/big.bin").then((o) => o?.arrayBuffer())),
-    await time("fetch api.github.com", () => fetch("https://api.github.com/repos/nodejs/node", { headers: { "user-agent": "antiproton/0.1" } }).then((r) => r.text())),
-    await time("fetch api.deepseek.com (unauth RTT)", () => fetch("https://api.deepseek.com/models").then((r) => r.text())),
-  ]) out[r[0]] = r[1];
-  return out;
 }
 
 export default {
@@ -4052,42 +3811,15 @@ export default {
 /**
  * The probe routes: an operator's tools, never the internet's.
  *
- * Every path here reaches an object or a binding without an identity check of its own, and three of them do
- * real work on arriving: `/isolation`, `/eviction` and `/model-binding` call `startTask`, which provisions the
- * agent, wakes it, and spends the operator's model account on a turn — and leaves a task behind on the shared
- * probe object. The rest spend too: `/conformance/executor` starts Dynamic Workers on the account, `/sandbox`
- * runs a whole dynamic-Worker battery including outbound fetches, `/sandbox/cpu` spins a `while (true) {}` for
- * as long as it is asked to, `/alarm/arm` arms an alarm at whatever delay it is given, and `/latency` writes and
- * reads a 1 MB object in R2 and makes outbound fetches from the Worker. None of them is answerable to a caller
- * with no credential, so they all ask for the operator's token — the door `/agent/message` has always had
- * (`guardSpending`).
+ * A path here reaches an object without an identity check of its own and spends on arriving:
+ * `/conformance/executor` starts Dynamic Workers on the deployment's account (bench/cf-conformance.mjs runs it).
+ * It is not answerable to a caller with no credential, so it asks for the operator's token — the door
+ * `/agent/message` has always had (`guardSpending`).
  *
- * The check runs in `route` before any path prefix chooses an object, not in the branch that picks `p0`:
- * `/conformance/executor` is routed by its `/conformance` prefix to its own object and never reaches that
- * branch, and a probe added under any other prefix would not either.
+ * The check runs in `route` before any path prefix chooses an object, so it holds whichever object a probe is
+ * routed to: `/conformance/executor` is routed by its `/conformance` prefix to its own object.
  */
-const PROBE_ROUTES = new Set([
-  "/storage", "/conformance/executor", "/model-binding", "/eviction", "/isolation",
-  "/latency", "/sandbox", "/sandbox/cpu", "/alarm/arm", "/alarm/status",
-]);
-
-/** How much CPU a probe may ask the object for, and how long an alarm it may arm. */
-const CPU_PROBE_MAX_MS = 1_000;
-const ALARM_PROBE_MAX_MS = 60_000;
-
-/**
- * A probe's `ms`, or a refusal: the number decides how much CPU or how long an alarm the caller may ask the
- * object for, so it is judged here rather than passed on. `Number("")` is 0 and `Number("abc")` is NaN, and
- * `setAlarm(NaN)` and an unbounded `cpuMs` are not a caller's to choose.
- */
-function probeMs(raw: string | null, fallback: number, min: number, max: number): number | Response {
-  if (raw === null || raw === "") return fallback;
-  const n = Number(raw);
-  if (!Number.isFinite(n) || n < min || n > max) {
-    return Response.json({ error: "BAD_MS", hint: `ms is a number from ${min} to ${max}` }, { status: 400 });
-  }
-  return Math.floor(n);
-}
+const PROBE_ROUTES = new Set(["/conformance/executor"]);
 
 async function route(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
@@ -4171,8 +3903,8 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
     // stragglers from an earlier run — dispatcher callbacks, re-armed alarms —
     // landed in the next arm's measurement window. A fresh object per arm makes
     // cross-talk impossible instead of merely unlikely.
-    // Agent traffic is addressed by identity; probes and the benchmark keep
-    // their own fixed objects.
+    // Agent traffic is addressed by identity; the conformance probe and the
+    // benchmark keep their own fixed objects.
     let name: string;
     let uiSelected: { who: string; home: string; agentId: string; tenantId: string } | null = null;
     if (url.pathname.startsWith("/conformance")) name = "conformance-v2";
@@ -4251,11 +3983,14 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
       if (access === "not-found") {
         return Response.json({ error: `no such agent: ${agentId} (not this viewer's, or never created)` }, { status: 404 });
       }
-    } else name = "p0";
+    }
+    // Everything else (`/admin/*`, `/` and the 404 index) addresses the objects it needs itself, or none. The
+    // switch below still wants a stub, and `get` contacts no object until a method is called on it, so this
+    // name is never reached by any route that remains.
+    else name = "p0";
     const stub = env.AGENT.get(env.AGENT.idFromName(name));
     try {
       switch (url.pathname) {
-        case "/storage": return Response.json(await stub.verifyStorage());
         case "/conformance/executor": return Response.json(await stub.runExecutorSpec());
         case "/agent/message": {
           const g = await guardSpending(request, env);
@@ -4364,44 +4099,6 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
         case "/agent/activity":
           return Response.json(await stub.activity(Number(url.searchParams.get("since") ?? 0)));
         case "/agent/activity/reset": return Response.json(await stub.resetActivity());
-        case "/model-binding": {
-          // Whether an agent can run at all now depends on a binding existing.
-          const stub3 = env.AGENT.get(env.AGENT.idFromName(agentObjectName("tenant-nokey", "agent-1")));
-          const out: Record<string, unknown> = {};
-          try {
-            await stub3.startTask("tenant-nokey", "agent-1", `nk_${Date.now()}`, "hello");
-            // startTask binds explicitly, so clear it and try to advance.
-            out.provisionedWithBinding = true;
-          } catch (e: any) {
-            out.provisionedWithBinding = false;
-            out.error = String(e?.message ?? e).slice(0, 160);
-          }
-          out.binding = await stub3.modelBinding("tenant-nokey", "agent-1");
-          out.unboundTenant = await stub3.modelBinding("tenant-never-configured", "agent-1");
-          return Response.json(out);
-        }
-        case "/eviction": {
-          // Configuration set before an eviction must still be in force after
-          // it, without the caller restating anything.
-          const stub2 = env.AGENT.get(env.AGENT.idFromName(agentObjectName("tenant-evict", "agent-1")));
-          const out: Record<string, unknown> = {};
-          await stub2.startTask("tenant-evict", "agent-1", `ev_${Date.now()}`, "hello");
-          await stub2.setOffload(false);
-          out.before = { offload: (await stub2.setOffload(false)).offload, owner: await stub2.owner() };
-
-          await stub2.simulateEviction();
-
-          out.after = { offload: (await stub2.readOffload()), owner: await stub2.owner() };
-          out.offloadSurvived = (out.after as any).offload === false;
-          out.ownerSurvived =
-            JSON.stringify((out.before as any).owner) === JSON.stringify((out.after as any).owner);
-          // And the object still refuses a foreign identity after being rebuilt.
-          try {
-            await stub2.startTask("tenant-other", "agent-1", "ev_x", "wrong tenant");
-            out.guardSurvived = false;
-          } catch { out.guardSurvived = true; }
-          return Response.json(out);
-        }
         // What identity a request actually resolves to is /ui/whoami's
         // business; here only the automation token opens the door, and a
         // client-supplied header never does.
@@ -5116,50 +4813,6 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
           // with a name the caller chose would be worth nothing.
           return html(approvals(await stub.uiDecide(gate.tenantId, agentId, taskId, String(form.get("operationId")), decision, who)));
         }
-        case "/isolation": {
-          // Proves the property rather than asserting it: two tenants, two
-          // objects, and an object that refuses an identity that is not its own.
-          const out: Record<string, unknown> = {};
-          const nameA = agentObjectName("tenant-a", "agent-1");
-          const nameB = agentObjectName("tenant-b", "agent-1");
-          out.distinctNames = nameA !== nameB;
-          const idA = env.AGENT.idFromName(nameA);
-          const idB = env.AGENT.idFromName(nameB);
-          out.distinctObjects = idA.toString() !== idB.toString();
-
-          const a = env.AGENT.get(idA);
-          const b = env.AGENT.get(idB);
-          await a.startTask("tenant-a", "agent-1", `iso_a_${Date.now()}`, "hello from a");
-          await b.startTask("tenant-b", "agent-1", `iso_b_${Date.now()}`, "hello from b");
-          out.ownerA = await a.owner();
-          out.ownerB = await b.owner();
-
-          // Same agent id, different tenant: the object must refuse.
-          try {
-            await a.startTask("tenant-b", "agent-1", "iso_x", "wrong tenant");
-            out.crossTenantRefused = false;
-          } catch (e: any) {
-            out.crossTenantRefused = true;
-            out.refusal = String(e?.message ?? e).slice(0, 160);
-          }
-          // Each object's storage holds only its own tenant's rows.
-          out.tasksA = (await a.listTenants());
-          out.tasksB = (await b.listTenants());
-          return Response.json(out);
-        }
-        case "/latency": return Response.json({ colo: request.cf?.colo ?? null, ...(await latency(env)) });
-        case "/sandbox": return Response.json(await stub.verifySandbox());
-        case "/sandbox/cpu": {
-          const ms = probeMs(url.searchParams.get("ms"), 50, 1, CPU_PROBE_MAX_MS);
-          if (ms instanceof Response) return ms;
-          return Response.json(await stub.verifyCpuLimit(ms));
-        }
-        case "/alarm/arm": {
-          const ms = probeMs(url.searchParams.get("ms"), 2000, 0, ALARM_PROBE_MAX_MS);
-          if (ms instanceof Response) return ms;
-          return Response.json(await stub.armAlarm(ms));
-        }
-        case "/alarm/status": return Response.json(await stub.alarmStatus());
         case "/":
           // The demo is the point of this deployment; making people know to
           // type /ui is a papercut with no upside.
@@ -5167,9 +4820,7 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
         default:
           return Response.json({
             demo: "/ui",
-            diagnostics: ["/conformance/executor", "/isolation",
-                          "/eviction", "/model-binding", "/ui/whoami"],
-            probes: ["/storage", "/sandbox", "/latency", "/alarm/status"],
+            diagnostics: ["/conformance/executor", "/ui/whoami"],
           }, { status: 404 });
       }
     } catch (e: any) {
