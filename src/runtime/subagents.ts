@@ -41,6 +41,20 @@ export const SUBAGENT_CAP = 3;
  */
 export const SUBAGENT_MAX_MS = 30 * 60_000;
 
+/**
+ * How long one child may live, from its creation, across every turn: follow-ups and background wakes start turns but
+ * never move this, so a child cannot be kept billing by being woken. Four turns' ceilings.
+ */
+export const SUBAGENT_LIFETIME_MS = 2 * 60 * 60_000;
+
+/** The most turns one child may have, its parent's follow-ups and its background wakes together. */
+export const SUBAGENT_MAX_TURNS = 10;
+
+/** How long an owed report waits after a failed post before it is tried again: doubling from 5 s, at most 10 minutes. */
+export function reportRetryDelay(attempts: number): number {
+  return Math.min(10 * 60_000, 5_000 * 2 ** Math.max(0, attempts - 1));
+}
+
 /** The most of a child's answer a report carries; the rest is in the child's transcript. */
 export const REPORT_MAX_CHARS = 20_000;
 
@@ -85,7 +99,7 @@ export function ensureSubagentTable(sql: Sql) {
     parent_session TEXT NOT NULL, call_id TEXT, model_option TEXT, provider TEXT, model TEXT,
     state TEXT NOT NULL, turn_op TEXT, turns INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL, turn_started_at INTEGER NOT NULL, finished_at INTEGER, outcome TEXT,
-    turn_key TEXT, report TEXT)`);
+    turn_key TEXT, report TEXT, report_attempts INTEGER NOT NULL DEFAULT 0, report_retry_at INTEGER)`);
 }
 
 /** Whether the object has the table at all, asked without making it: most objects never had a child. */
@@ -139,10 +153,33 @@ export function subagentOf(sql: Sql, owner: SubagentOwner, id: string): Subagent
 }
 
 /** Children whose report is decided and not yet posted. */
-export function reportingSubagents(sql: Sql, owner: SubagentOwner): Subagent[] {
+export function reportingSubagents(sql: Sql, owner: SubagentOwner, now = Date.now()): Subagent[] {
   if (!hasSubagentTable(sql)) return [];
-  return sql.exec("SELECT * FROM subagents WHERE tenant_id = ? AND agent_id = ? AND state = 'reporting' ORDER BY finished_at ASC, id ASC",
-    owner.tenantId, owner.agentId).toArray().map(rowTo);
+  return sql.exec("SELECT * FROM subagents WHERE tenant_id = ? AND agent_id = ? AND state = 'reporting' AND (report_retry_at IS NULL OR report_retry_at <= ?) ORDER BY finished_at ASC, id ASC",
+    owner.tenantId, owner.agentId, now).toArray().map(rowTo);
+}
+
+/** A post of the report failed: it stays owed, and is tried again after `reportRetryDelay`. Returns the attempts so far. */
+export function reportFailed(sql: Sql, owner: SubagentOwner, id: string, now = Date.now()): number {
+  const r = sql.exec("UPDATE subagents SET report_attempts = report_attempts + 1 WHERE id = ? AND tenant_id = ? AND agent_id = ? AND state = 'reporting' RETURNING report_attempts",
+    id, owner.tenantId, owner.agentId).toArray()[0] as any;
+  const attempts = Number(r?.report_attempts ?? 1);
+  sql.exec("UPDATE subagents SET report_retry_at = ? WHERE id = ? AND tenant_id = ? AND agent_id = ?", now + reportRetryDelay(attempts), id, owner.tenantId, owner.agentId);
+  return attempts;
+}
+
+/** Milliseconds until the soonest owed report may be tried again, or null when none waits. */
+export function reportRetryMs(sql: Sql, owner: SubagentOwner, now = Date.now()): number | null {
+  if (!hasSubagentTable(sql)) return null;
+  const r = sql.exec("SELECT MIN(COALESCE(report_retry_at, 0)) AS at FROM subagents WHERE tenant_id = ? AND agent_id = ? AND state = 'reporting'",
+    owner.tenantId, owner.agentId).toArray()[0] as any;
+  return r?.at === null || r?.at === undefined ? null : Math.max(0, Number(r.at) - now);
+}
+
+/** Every child session this agent ever had, whatever its row says: what a stop cancels. */
+export function allSubagentIds(sql: Sql, owner: SubagentOwner): string[] {
+  if (!hasSubagentTable(sql)) return [];
+  return (sql.exec("SELECT id FROM subagents WHERE tenant_id = ? AND agent_id = ?", owner.tenantId, owner.agentId).toArray() as any[]).map((r) => String(r.id));
 }
 
 export function runningSubagents(sql: Sql, owner: SubagentOwner): Subagent[] {
@@ -191,7 +228,7 @@ export function startSubagentTurn(sql: Sql, owner: SubagentOwner, id: string, t:
   turnKey?: string | null;
 }) {
   sql.exec(
-    "UPDATE subagents SET state = 'running', turn_op = ?, call_id = ?, turn_key = ?, turns = turns + 1, turn_started_at = ?, finished_at = NULL, outcome = NULL, report = NULL" +
+    "UPDATE subagents SET state = 'running', turn_op = ?, call_id = ?, turn_key = ?, turns = turns + 1, turn_started_at = ?, finished_at = NULL, outcome = NULL, report = NULL, report_attempts = 0, report_retry_at = NULL" +
     (t.model ? ", model_option = ?, provider = ?, model = ?" : "") +
     " WHERE id = ? AND tenant_id = ? AND agent_id = ?",
     t.turnOp, t.callId, t.turnKey ?? null, t.now, ...(t.model ? [t.model.option, t.model.provider, t.model.model] : []), id, owner.tenantId, owner.agentId);
@@ -216,23 +253,25 @@ export function finishSubagentTurn(sql: Sql, owner: SubagentOwner, id: string, o
 
 /** The report was posted to the parent (or is not to be): the child is idle. */
 export function markReported(sql: Sql, owner: SubagentOwner, id: string) {
-  sql.exec("UPDATE subagents SET state = 'idle', report = NULL WHERE id = ? AND tenant_id = ? AND agent_id = ? AND state = 'reporting'",
+  sql.exec("UPDATE subagents SET state = 'idle', report = NULL, report_retry_at = NULL WHERE id = ? AND tenant_id = ? AND agent_id = ? AND state = 'reporting'",
     id, owner.tenantId, owner.agentId);
 }
 
 /**
- * Every running child marked stopped, before its turn is cancelled (cf/src/runtime.ts `stopTurn`). First, so no pass
- * that reads the cancelled turn's end reports it: a report would wake the parent whose turn the stop just ended.
+ * Every running child marked stopped, before its turn is cancelled (cf/src/runtime.ts `stopTurn`), and every report
+ * owed dropped. First, so no pass that reads a cancelled child's end reports it: a report would wake the parent whose
+ * turn the stop just ended. `parentSession`: only that conversation's children (an Agents API session cancelled or
+ * deleted). Returns the ids of every child it covers, stopped now or not, so the caller cancels each one's session: a
+ * child whose row was already idle can still have a run in flight (a task posted while a stop was landing).
  */
-export function stopRunningSubagents(sql: Sql, owner: SubagentOwner, now = Date.now()): string[] {
-  const ids = runningSubagents(sql, owner).map((s) => s.id);
-  for (const id of ids) finishSubagentTurn(sql, owner, id, "stopped", now);
-  // A report decided and not yet posted is dropped too, for the same reason.
-  if (hasSubagentTable(sql)) {
-    sql.exec("UPDATE subagents SET state = 'idle', outcome = 'stopped', report = NULL WHERE tenant_id = ? AND agent_id = ? AND state = 'reporting'",
-      owner.tenantId, owner.agentId);
-  }
-  return ids;
+export function stopRunningSubagents(sql: Sql, owner: SubagentOwner, now = Date.now(), parentSession?: string): string[] {
+  if (!hasSubagentTable(sql)) return [];
+  const only = parentSession === undefined ? "" : " AND parent_session = ?";
+  const scope = parentSession === undefined ? [] : [parentSession];
+  sql.exec(`UPDATE subagents SET state = 'idle', finished_at = ?, outcome = 'stopped', report = NULL, report_retry_at = NULL
+    WHERE tenant_id = ? AND agent_id = ? AND state != 'idle'${only}`, now, owner.tenantId, owner.agentId, ...scope);
+  return (sql.exec(`SELECT id FROM subagents WHERE tenant_id = ? AND agent_id = ?${only}`, owner.tenantId, owner.agentId, ...scope).toArray() as any[])
+    .map((r) => String(r.id));
 }
 
 /** How many children of this object have a turn running; none when it never had one. One object is one agent. */
@@ -245,12 +284,19 @@ export function runningSubagentCount(sql: Sql): number {
 export function subagentCeilingMs(sql: Sql, owner: SubagentOwner, now = Date.now(), maxMs = SUBAGENT_MAX_MS): number | null {
   const running = runningSubagents(sql, owner);
   if (!running.length) return null;
-  return Math.max(0, Math.min(...running.map((s) => s.turnStartedAt + maxMs + 1 - now)));
+  return Math.max(0, Math.min(...running.map((s) => Math.min(s.turnStartedAt + maxMs, s.createdAt + SUBAGENT_LIFETIME_MS) + 1 - now)));
 }
 
 /** Past the ceiling: the pass cancels the child's turn and reports it cancelled. */
-export function overdueSubagent(s: Pick<Subagent, "turnStartedAt">, now = Date.now(), maxMs = SUBAGENT_MAX_MS): boolean {
-  return now - s.turnStartedAt > maxMs;
+export function overdueSubagent(s: Pick<Subagent, "turnStartedAt" | "createdAt">, now = Date.now(), maxMs = SUBAGENT_MAX_MS): boolean {
+  return now - s.turnStartedAt > maxMs || now - s.createdAt > SUBAGENT_LIFETIME_MS;
+}
+
+/** Why a child may take no more turns, or null when it may: its lifetime is over, or it had its turns. */
+export function subagentSpent(s: Pick<Subagent, "turns" | "createdAt">, now = Date.now()): string | null {
+  if (s.turns >= SUBAGENT_MAX_TURNS) return `it has had ${SUBAGENT_MAX_TURNS} turns, the most one subagent may have; start a new one`;
+  if (now - s.createdAt > SUBAGENT_LIFETIME_MS) return `it is older than ${SUBAGENT_LIFETIME_MS / 3_600_000} hours, the most one subagent may live; start a new one`;
+  return null;
 }
 
 /** What the parent's model is told the moment a child starts (or a follow-up is sent). */

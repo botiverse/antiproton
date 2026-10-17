@@ -68,7 +68,10 @@ import {
   runningSubagents, setSubagentTurnOp, startedResult as subagentStarted, startSubagentTurn, stopRunningSubagents, subagentOf, subagentTool,
   SUBAGENT_TOOL, speakingRefusal, speakingTools, taskMessage, turnEnd, type Subagent, type TurnEnd,
   markReported, reportingSubagents, reportKey, subagentIdFor, taskKey, turnKeyOf,
+  reportFailed, reportRetryMs, subagentSpent,
 } from "../../src/runtime/subagents.ts";
+import { subagentModelChoice } from "./model-request.ts";
+import type { ModelLayers } from "./control-plane.ts";
 import { agentSettings, updateAgentSettings } from "../../src/runtime/agent-settings.ts";
 import type { UserModels } from "../../src/model/user-models.ts";
 import { pdConversationId, pdSubmissionStatus, readPdEntries } from "../../src/runtime/pd-transcript.ts";
@@ -799,7 +802,13 @@ export interface RuntimeDeps {
    * A test's knob: called at the points of a subagent's send and report where a crash must lose nothing. A throw is the
    * crash; a promise that never settles is an isolate that died there.
    */
-  subagentFault?: (phase: "task-posted" | "report-decided" | "report-posted", subagent: string) => void | Promise<void>;
+  subagentFault?: (phase: "task-posting" | "task-posted" | "report-decided" | "report-posting" | "report-posted", subagent: string) => void | Promise<void>;
+  /**
+   * What decides over a subagent's model option besides USER_MODELS, read from the control plane for the agent: the
+   * administrator's rows and the owner's pick (`ModelLayers`), and whether the server's picker switch refuses another
+   * model than the default (MODEL_PICKER_ENFORCE and the switch). Absent: no pins and no switch.
+   */
+  subagentModelRules?: (tenantId: string, agentId: string) => Promise<{ layers: ModelLayers; pickerOff: boolean }>;
 }
 
 /**
@@ -2083,8 +2092,19 @@ export class AgentRuntime {
     const readBack = reader?.name ?? null;
     const withheld = new Set(this.#deps.withholdTools ?? []);
     const subagent = isSubagentSession(ctx.taskId);
-    // Asked of the catalogue as it is at the call, as the gateway asks of the mount: a mount added since the harness was built counts.
-    const speaking = async () => this.#speakingIn(await this.#catalogueFor(ctx.tenantId, ctx.agentId));
+    // Whether a subagent's call acts as the agent, decided on what the gateway resolves the name to — `alias.tool` or
+    // `plugin.tool` alike (`ToolGateway.resolve`) — never on the string: the resolved mount's plugin speaks as the agent
+    // (`speaksAs`) and the tool is not one the catalogue declares a read. Asked of the catalogue as it is at the call, so
+    // a mount added since the harness was built counts; a tool the catalogue does not list is refused, not let through.
+    const speaks = async (raw: string): Promise<string | null> => {
+      const r = await gw.resolve(ctx, raw);
+      if (!("mount" in r) || !r.mount) return null;
+      const plugin = this.#plugins.find((p) => p.id === r.mount!.plugin);
+      if (plugin?.speaksAs !== "agent") return null;
+      const address = `${r.mount.alias}.${r.tool}`;
+      const declared = (await this.#catalogueFor(ctx.tenantId, ctx.agentId)).tools.find((t) => t.address === address);
+      return declared?.sideEffects === "read" ? null : address;
+    };
     const ended = this.#deps.ended;
     const gw = this.#gateway;
     const store = this.store;
@@ -2197,13 +2217,16 @@ export class AgentRuntime {
         const refused = refuseWithheld(call.tool, withheld);
         if (refused) return refused;
         // A subagent's session is never offered a tool that acts as the agent; a program of its could still name one.
-        if (subagent && (await speaking()).has(call.tool)) return speakingRefusal(call.tool);
+        const speaking = subagent ? await speaks(call.tool) : null;
+        if (speaking) return speakingRefusal(speaking);
         if (ended?.({ tenantId: ctx.tenantId, agentId: ctx.agentId })) return taskEndedRefusal(call.tool);
         return held(call.tool, await dispatch(call));
       },
       /** The model's answer to a tool's question (pi-tools.ts `resume`), finished as a call's result is. */
       async resumeInterrupt(i: ToolInterrupt, answer: Json, callId: string): Promise<ToolResult> {
         const call = { tool: `${i.alias}.${i.tool}`, args: null, callId };
+        const speaking = subagent ? await speaks(call.tool) : null;
+        if (speaking) return speakingRefusal(speaking);
         if (ended?.({ tenantId: ctx.tenantId, agentId: ctx.agentId })) return taskEndedRefusal(call.tool);
         return held(call.tool, await dispatch(call, () => gw.resumeInterrupt(inTurn(), i, answer, { callId })));
       },
@@ -3917,6 +3940,8 @@ export class AgentRuntime {
       retake?: "await" | "background"; beforeSay?: () => void; pendingOnly?: true;
       /** When the object took the message in, for the turn's timing (src/runtime/turn-timing.ts); now when absent. */
       receivedAt?: number;
+      /** The message's own id, where the engine keeps one (`AgentEngine.say`): what a post that must land once is checked by. */
+      requestId?: string;
     } = {},
   ) {
     const inboundAt = opts.receivedAt ?? Date.now();
@@ -4035,7 +4060,7 @@ export class AgentRuntime {
     opts.beforeSay?.();
     let res: any;
     try {
-      res = await agent.say(lines.length ? `${lines.join("\n")}\n\n${body}` : body, mode);
+      res = await agent.say(lines.length ? `${lines.join("\n")}\n\n${body}` : body, mode, opts.requestId ? { requestId: opts.requestId } : undefined);
     } catch (e) {
       // A post that throws wrote nothing (the rule `deliverPendingInbound` retries by), so the notices were not said.
       if (timing && timed) timingSafe("taking back", () => turnNotSaid(timing, session, opened));
@@ -4115,6 +4140,25 @@ export class AgentRuntime {
    * was cancelled. A background job whose stop cannot be confirmed stays
    * tracked, and the ceiling asks again. Nothing running is not an error.
    */
+  /**
+   * `cancelSession` for a conversation and the subagents it started (an Agents API session's cancel, or its delete with
+   * `drop`): each child marked stopped and its owed report dropped first, as `stopTurn` does for the agent, then each
+   * child's session cancelled, then the conversation's own turn — unless `drop` alone was asked, for a delete, which
+   * leaves the conversation's turn to the caller.
+   */
+  async cancelSessionTree(tenantId: string, agentId: string, session: string, o: { childrenOnly?: boolean } = {}) {
+    await this.ready();
+    const sql = this.#deps.ctx.storage.sql;
+    const children = stopRunningSubagents(sql, { tenantId, agentId }, Date.now(), session);
+    for (const child of children) {
+      try { await this.cancelSession(tenantId, agentId, child); }
+      catch (e) { console.error(`cancelling ${tenantId}/${agentId}'s subagent ${child} of ${session} failed:`, e); }
+      if (!this.#isPd()) markSession(sql, child, false);
+    }
+    const own = o.childrenOnly ? null : await this.cancelSession(tenantId, agentId, session);
+    return { ...(own ?? { cancelledTurn: null as string | null, stoppedJobs: [] as string[], stillRunning: [] as string[] }), stoppedSubagents: children };
+  }
+
   async cancelSession(tenantId: string, agentId: string, session: string = MAIN_SESSION) {
     const agent = await this.agent(tenantId, agentId, session);
     const cancelledTurn = await agent.cancel(TURN_CANCELLED);
@@ -4171,11 +4215,14 @@ export class AgentRuntime {
       }
       const pd = this.#isPd();
       if (!pd) ensureAgentTables(sql);
-      // Every running subagent is marked stopped before any turn is cancelled, so no pass reads a cancelled child's end
-      // as a report: that report would wake the parent this stop is ending (src/runtime/subagents.ts). Its sessions are
-      // cancelled below with the rest; on pd they are conversations the main one's cancel does not reach (ownerless).
+      // Every running subagent is marked stopped, and every owed report dropped, before any turn is cancelled, so no
+      // pass reads a cancelled child's end as a report: it would wake the parent this stop is ending
+      // (src/runtime/subagents.ts). Then every child session is cancelled, whatever its row says — a task posted while
+      // this stop was landing can have started a run on a row already marked stopped. On pd they are conversations
+      // the main one's cancel does not reach (ownerless); on pi085 every session with work is cancelled anyway.
       const children = stopRunningSubagents(sql, { tenantId, agentId }, Date.now());
-      const sessions = pd ? [MAIN_SESSION, ...children] : [...new Set([MAIN_SESSION, ...children, ...sessionsWithWork(sql)])];
+      const sessions = pd ? [MAIN_SESSION, ...new Set([...children, ...this.#pdSubagentSessions()])]
+        : [...new Set([MAIN_SESSION, ...sessionsWithWork(sql)])];
       let cancelled: string | null = null;
       for (const session of sessions) {
         const r = await this.cancelSession(tenantId, agentId, session);
@@ -4257,14 +4304,10 @@ export class AgentRuntime {
     const turnKey = turnKeyOf(parentSession, run, callId);
     let model: { option: string; provider: string; model: string } | null = null;
     if (p.model !== null) {
-      const offered = this.#deps.userModels?.offered ?? [];
-      const o = offered.find((x) => x.id === p.model);
-      if (!o) {
-        throw new Error(`${SUBAGENT_TOOL}: no model option ${JSON.stringify(p.model.slice(0, 64))}; ` +
-          (offered.length ? `the options are ${offered.map((x) => x.id).join(", ")}` : "this deployment offers none, so leave model out") +
-          ". Nothing was started.");
-      }
-      model = { option: o.id, provider: o.provider, model: o.model };
+      // The same rules as the agent's own model (`resolveModel`): an administrator's pin, the server's picker switch.
+      const r = await this.#subagentModel(tenantId, agentId, p.model);
+      if (!r.ok) throw new Error(`${SUBAGENT_TOOL}: ${r.error}. Nothing was started.`);
+      model = { option: p.model, ...r.choice };
     }
     let id: string;
     let existing: Subagent | null;
@@ -4283,6 +4326,8 @@ export class AgentRuntime {
       if (existing && existing.state !== "idle") {
         throw new Error(`${SUBAGENT_TOOL}: ${existing.id} is still working on its last task. Its report arrives as a message; send the follow-up after that.`);
       }
+      const spent = existing ? subagentSpent(existing, now) : null;
+      if (spent) throw new Error(`${SUBAGENT_TOOL}: ${existing!.id} takes no more tasks: ${spent}.`);
       const admit = admitSubagent(runningSubagents(sql, owner), SUBAGENT_CAP, now);
       if (!admit.ok) throw new Error(admit.message);
       if (existing) startSubagentTurn(sql, owner, id, { callId, turnOp: null, now, model, turnKey });
@@ -4293,10 +4338,20 @@ export class AgentRuntime {
     if (s.state === "running" && s.turnOp === null) {
       let op: string | null;
       try {
+        await this.#deps.subagentFault?.("task-posting", id);
         op = await this.#postOnce(tenantId, agentId, id, taskMessage(id, p.task, followUp, taskKey(id, s.turns)), taskKey(id, s.turns));
       } catch (e) {
         finishSubagentTurn(sql, owner, id, "failed", Date.now());
         throw new Error(`${SUBAGENT_TOOL}: the subagent could not be given its task: ${String((e as Error)?.message ?? e).slice(0, 300)}`);
+      }
+      // A stop can land while the task is being posted: it marks the row stopped and cancels the child's session, which
+      // has nothing to cancel yet; the task then lands and starts a run nothing tracks. So the row is read again, and a
+      // turn that is no longer this one running is cancelled here, before anything records it.
+      const after = subagentOf(sql, owner, id);
+      if (!after || after.state !== "running" || after.turnKey !== turnKey) {
+        await this.cancelSession(tenantId, agentId, id).catch((e) => console.error(`cancelling ${tenantId}/${agentId}'s stopped subagent ${id} failed:`, e));
+        if (!this.#isPd()) markSession(sql, id, false);
+        throw new Error(`${SUBAGENT_TOOL}: the agent was stopped while ${id} was being started, so it was stopped too.`);
       }
       // The engine's id for the turn, which its end is read by (`#subagentTurnEnd`): pi085's operation, pd's submission.
       setSubagentTurnOp(sql, owner, id, op);
@@ -4312,10 +4367,15 @@ export class AgentRuntime {
    * it is part of. What makes a retried post — a report after a crash, a replayed spawn — land once: the check reads
    * the conversation itself (`#postedOp`), which the post writes, so there is no second record to fall out of step.
    */
-  async #postOnce(tenantId: string, agentId: string, session: string, text: string, key: string): Promise<string | null> {
+  async #postOnce(tenantId: string, agentId: string, session: string, text: string, key: string, via: "say" | "postMessage" = "say"): Promise<string | null> {
     const posted = this.#postedOp(session, key);
     if (posted) return posted.op;
-    const res: any = await (await this.agent(tenantId, agentId, session)).say(text, "prompt", { requestId: key });
+    // A report goes the way a background completion does (`postMessage`): the import hold, the overflow backstop's
+    // refusal, a rebuild's pending briefing, the notices. A child's task is said to its own session directly: those are
+    // the agent's conversation's, and a notice taken by a child would never reach the agent.
+    const res: any = via === "postMessage"
+      ? (await this.postMessage(tenantId, agentId, text, "prompt", session, { requestId: key })).result
+      : await (await this.agent(tenantId, agentId, session)).say(text, "prompt", { requestId: key });
     if (res?.ok === false) throw new Error(res.error?.message ?? res.error?._tag ?? "the message was refused");
     const op = res?.value?.operationId ?? res?.value?.submissionId ?? null;
     return op === null ? null : String(op);
@@ -4389,11 +4449,38 @@ export class AgentRuntime {
     for (const s of reportingSubagents(sql, owner)) {
       await this.#deps.subagentFault?.("report-decided", s.id);
       // A task that is over takes no report, as it takes no background completion (`step`).
-      if (this.#deps.ended?.(owner) !== true) {
-        try { await this.#postOnce(tenantId, agentId, s.parentSession, s.report ?? "", reportKey(s)); }
-        catch (e) { refusedForReset(e, tenantId, agentId, "subagent report"); }
-        reported += 1;
+      if (this.#deps.ended?.(owner) === true) { markReported(sql, owner, s.id); continue; }
+      try {
+        // Read again at the post: a stop since the list was read dropped it (`stopRunningSubagents`).
+        if (subagentOf(sql, owner, s.id)?.state !== "reporting") continue;
+        await this.#deps.subagentFault?.("report-posting", s.id);
+        await this.#postOnce(tenantId, agentId, s.parentSession, s.report ?? "", reportKey(s), "postMessage");
+      } catch (e) {
+        if (e instanceof SessionNeedsReset) {
+          // Dropped, as a background completion is (`refusedForReset`): the conversation takes nothing until it is reset.
+          refusedForReset(e, tenantId, agentId, "subagent report");
+          markReported(sql, owner, s.id);
+          continue;
+        }
+        // Owed still, and tried again later; this pass goes on to the other reports and the rest of the step.
+        const attempts = reportFailed(sql, owner, s.id, Date.now());
+        const error = String((e as Error)?.message ?? e).slice(0, 200);
+        console.error(`posting ${tenantId}/${agentId}'s subagent ${s.id} report failed (attempt ${attempts}):`, e);
+        try {
+          appendTrace(sql, [{ at: Date.now(), tenantId, agentId, kind: "subagent.turn", spanId: s.id, ...(s.callId ? { parentId: s.callId } : {}),
+            status: "report_failed", verdict: "failed", attrs: { parentSession: s.parentSession, turn: s.turns, attempts, error } }]);
+        } catch (t) { console.error(`the subagent.turn row of ${tenantId}/${agentId} could not be written:`, t); }
+        continue;
       }
+      // A stop that landed while the report was being posted dropped it, and the report then started a turn of the
+      // parent the stop had just ended: that turn is cancelled.
+      if (subagentOf(sql, owner, s.id)?.state !== "reporting") {
+        await this.cancelSession(tenantId, agentId, s.parentSession)
+          .catch((e) => console.error(`cancelling ${tenantId}/${agentId}#${s.parentSession} after a stop failed:`, e));
+        if (!this.#isPd()) markSession(sql, s.parentSession, false);
+        continue;
+      }
+      reported += 1;
       await this.#deps.subagentFault?.("report-posted", s.id);
       markReported(sql, owner, s.id);
     }
@@ -4426,14 +4513,77 @@ export class AgentRuntime {
     });
   }
 
-  /** A subagent's idle session given a run by something other than its parent (a background completion): tracked again. */
-  #subagentWoken(tenantId: string, agentId: string, session: string, res: unknown) {
+  /**
+   * Cancel every subagent session that has work while its row says no turn of it runs (stopped, idle, owed a report,
+   * or no row at all): a run that landed after a stop, or any other run nothing tracks. Each would call the model
+   * unbounded, since the ceiling reads running rows. pi085: the sessions its list says have work. pd: a conversation of a
+   * subagent with a live task, read from pi-durable's tasks with a SELECT. Returns the sessions it cancelled.
+   */
+  async #cancelStraySubagents(tenantId: string, agentId: string): Promise<string[]> {
+    const sql = this.#deps.ctx.storage.sql;
+    const owner = { tenantId, agentId };
+    const pd = this.#isPd();
+    const busy = pd ? this.#pdSubagentSessions({ live: true }) : sessionsWithWork(sql).filter((x) => isSubagentSession(x));
+    const stray = busy.filter((x) => subagentOf(sql, owner, x)?.state !== "running");
+    for (const session of stray) {
+      try { await this.cancelSession(tenantId, agentId, session); }
+      catch (e) { console.error(`cancelling ${tenantId}/${agentId}'s untracked subagent run ${session} failed:`, e); }
+      if (!pd) markSession(sql, session, false);
+      logEvent("subagent.stray", { tenantId, agentId, subagent: session });
+    }
+    return stray;
+  }
+
+  /** pd: the subagent sessions with a conversation (`ap_conversations`); with `live`, only those with a live task. */
+  #pdSubagentSessions(o: { live?: boolean } = {}): string[] {
+    const sql = this.#deps.ctx.storage.sql;
+    const has = (name: string) => sql.exec("SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = ?", name).toArray().length > 0;
+    if (!has("ap_conversations")) return [];
+    const rows = o.live
+      ? (has("pd_tasks") ? sql.exec(
+          "SELECT DISTINCT c.task_id AS s FROM pd_tasks t JOIN ap_conversations c ON c.conversation_id = t.conversation_id " +
+          "WHERE t.status != 'terminal' AND t.background = 0").toArray() : [])
+      : sql.exec("SELECT task_id AS s FROM ap_conversations").toArray();
+    return (rows as Array<{ s: unknown }>).map((r) => String(r.s)).filter((x) => isSubagentSession(x));
+  }
+
+  /**
+   * The provider and model a subagent started on the owner's option `option` runs on, decided by the rules the agent's
+   * own model is (`resolveModel`, cf/src/model-request.ts): refused while an administrator's agent or tenant row decides
+   * the agent's model, while the server's picker switch is enforced and off for another model than the default, and for
+   * an option the deployment does not offer. Asked at the spawn and again at each of the subagent's model calls, so a pin
+   * or a switch set since applies at once. The control plane's answer comes through `subagentModelRules`; a deployment
+   * without it (a test, the bench) has neither pins nor a switch.
+   */
+  async #subagentModel(tenantId: string, agentId: string, option: string): Promise<{ ok: true; choice: { provider: string; model: string } } | { ok: false; error: string }> {
+    const none = { layers: { agent: null, tenant: null, deployment: null, owner: null }, pickerOff: false };
+    const rules = this.#deps.subagentModelRules ? await this.#deps.subagentModelRules(tenantId, agentId) : none;
+    return subagentModelChoice(rules.layers, this.#deps.userModels ?? { offered: [] }, this.#deps.operatorModel?.model ?? "", option, rules.pickerOff);
+  }
+
+  /**
+   * Whether a background completion may be delivered to a subagent's session: `join` its turn running, `start` a turn
+   * of an idle subagent (under the cap, its lifetime and its turn count), or why not.
+   */
+  #subagentWakeGate(tenantId: string, agentId: string, session: string): "join" | "start" | string {
     const sql = this.#deps.ctx.storage.sql;
     const owner = { tenantId, agentId };
     const s = subagentOf(sql, owner, session);
+    if (!s) return "no such subagent";
+    if (s.state === "running") return "join";
+    if (s.state === "reporting") return "its report is owed";
+    if (s.outcome === "stopped") return "stopped";
+    const spent = subagentSpent(s, Date.now());
+    if (spent) return spent;
+    const admit = admitSubagent(runningSubagents(sql, owner), SUBAGENT_CAP, Date.now());
+    return admit.ok ? "start" : "the cap is full";
+  }
+
+  /** The woken turn's engine id, once the completion was posted: what its end is read by. */
+  #subagentWoken(tenantId: string, agentId: string, session: string, res: unknown) {
+    const sql = this.#deps.ctx.storage.sql;
     const value = (res as { value?: { operationId?: unknown } } | undefined)?.value;
-    if (!s || s.state !== "idle" || s.outcome === "stopped" || value?.operationId === undefined) return;
-    startSubagentTurn(sql, owner, session, { callId: s.callId, turnOp: String(value.operationId), now: Date.now() });
+    if (value?.operationId !== undefined) setSubagentTurnOp(sql, { tenantId, agentId }, session, String(value.operationId));
   }
 
   /** The subagent a model job belongs to, or null: its session, which on pd is the job's conversation's. */
@@ -4508,11 +4658,22 @@ export class AgentRuntime {
     // before the pass: the pass awaits the plugin's poll, and the task can end during that await.
     const bg = await pass(async (session, text) => {
       if (this.#deps.ended?.(owner) === true) return;
-      const posted = await this.postMessage(tenantId, agentId, text, "prompt", session).catch((e) => refusedForReset(e, tenantId, agentId, "background completion"));
-      // A subagent's job ending starts another turn of the subagent once its last was reported: that turn is tracked
-      // like one its parent sent, so its answer is reported too (`#reportSubagents`). One that joined a turn still
-      // running is already tracked.
-      if (isSubagentSession(session)) this.#subagentWoken(tenantId, agentId, session, posted?.result);
+      // A subagent's job ending starts another turn of the subagent, tracked like one its parent sent, so its answer
+      // is reported too (`#reportSubagents`), and held to the same cap, lifetime and turn count; one that joins a turn
+      // still running is tracked already. One the subagent may not take (stopped, owed a report, past its limits, the
+      // cap full) is not delivered: an untracked run would call the model with nothing to bound it.
+      if (isSubagentSession(session)) {
+        const gate = this.#subagentWakeGate(tenantId, agentId, session);
+        if (gate !== "join" && gate !== "start") {
+          logEvent("subagent.wake_dropped", { tenantId, agentId, subagent: session, why: gate });
+          return;
+        }
+        if (gate === "start") startSubagentTurn(sql, owner, session, { callId: subagentOf(sql, owner, session)?.callId ?? null, turnOp: null, now: Date.now() });
+        const posted = await this.postMessage(tenantId, agentId, text, "prompt", session).catch((e) => refusedForReset(e, tenantId, agentId, "background completion"));
+        if (gate === "start") this.#subagentWoken(tenantId, agentId, session, posted?.result);
+        return;
+      }
+      await this.postMessage(tenantId, agentId, text, "prompt", session).catch((e) => refusedForReset(e, tenantId, agentId, "background completion"));
     });
     // pd: one harness runs every conversation of the object, and one step drives it whole
     // (`DurableAgent.step`), so there is nothing to choose. pi085: the sessions its list says have work.
@@ -4566,7 +4727,10 @@ export class AgentRuntime {
     // A subagent whose turn ended is reported to the session that started it (src/runtime/subagents.ts). Read from
     // the engines' records, not from this pass's `settled`, so an end that a pass before an eviction saw is still
     // reported. A report starts a turn of the parent, which the next pass, at once, drives.
+    await this.#cancelStraySubagents(tenantId, agentId);
     if (await this.#reportSubagents(tenantId, agentId) > 0) wakeInMs = 0;
+    const retry = reportRetryMs(sql, { tenantId, agentId }, Date.now());
+    if (retry !== null) wakeInMs = wakeInMs === null ? retry : Math.min(wakeInMs, retry);
     // A running subagent past its ceiling is cancelled by a pass; the pass comes back for the ceiling's moment.
     const ceiling = subagentCeilingMs(sql, { tenantId, agentId }, Date.now());
     if (ceiling !== null) wakeInMs = wakeInMs === null ? ceiling : Math.min(wakeInMs, ceiling);
@@ -5033,7 +5197,18 @@ export class AgentRuntime {
     // A subagent started on one of the owner's model options runs on it (`send_to_agent`'s `model`): the option was
     // checked against USER_MODELS when the subagent was started, and is the operator's account, as an owner's pick is.
     const child = this.#subagentOfJob(tenantId, agentId, jobId, session);
-    const chosen = child?.provider && child.model ? { model: child.model, provider: child.provider } : null;
+    // Decided again at each call, by the rules the spawn was (`#subagentModel`): a pin or a switch set since applies now.
+    // Refused, or the rules unreadable, the call runs on the agent's own model, never on the option.
+    let chosen: { model: string; provider: string } | null = null;
+    if (child?.modelOption) {
+      try {
+        const r = await this.#subagentModel(tenantId, agentId, child.modelOption);
+        if (r.ok) chosen = r.choice;
+        else logEvent("subagent.model_refused", { tenantId, agentId, subagent: child.id, option: child.modelOption, error: r.error.slice(0, 200) });
+      } catch (e) {
+        logEvent("subagent.model_unread", { tenantId, agentId, subagent: child.id, error: String((e as Error)?.message ?? e).slice(0, 200) });
+      }
+    }
     return { ...job, operatorModel: chosen?.model ?? (provider ? b!.model : null), operatorProvider: chosen?.provider ?? provider,
       ...(mark ? { imageEvidence: true } : {}), ...(reasoning ? { reasoning } : {}) };
   }

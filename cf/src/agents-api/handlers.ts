@@ -61,8 +61,10 @@ export interface AgentsApiDeps {
      * session never made in that turn comes back in `unknown` and nothing is kept.
      */
     toolResults(agentId: string, sessionId: string, results: Array<{ turnId: string; callId: string; output: string; isError: boolean }>): Promise<{ unknown: string[] }>;
-    /** Cancel the session's running turn and its background work. Nothing running is not an error. */
+    /** Cancel the session's running turn, its background work and its subagents. Nothing running is not an error. */
     cancel(agentId: string, sessionId: string): Promise<void>;
+    /** Stop the subagents the session started and drop their owed reports, before the session is deleted. */
+    stopSubagents(agentId: string, sessionId: string): Promise<void>;
     /** The session's pi entries, oldest first, and whether its lane is running now. */
     transcript(agentId: string, sessionId: string): Promise<{ entries: unknown[]; running: boolean; pending: PendingCall[] }>;
   };
@@ -343,7 +345,8 @@ export async function handleAgentsApi(
       const s = await deps.index.getSession(id);
       if (!s) return notFound("session", id);
       if (method === "GET") return ok(await sessionObject(deps, s));
-      if (method === "DELETE") { await deps.index.deleteSession(id); return ok(sessionDeleted(id)); }
+      // Its subagents first: once the row is gone nothing could name the session to stop them.
+      if (method === "DELETE") { await deps.agents.stopSubagents(s.agentId, id); await deps.index.deleteSession(id); return ok(sessionDeleted(id)); }
       if (method === "POST") {
         if (!isObj(body)) return openAIError(400, "the request body must be a JSON object", { param: "body", code: "invalid_value" });
         const unknown = Object.keys(body).find((k) => k !== "metadata");

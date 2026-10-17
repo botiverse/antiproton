@@ -104,6 +104,31 @@ export function resolveModel(
 }
 type Chosen = { provider: string | null; model: string };
 
+/**
+ * The provider and model a subagent runs on when its parent asks for the owner's option `option` (src/runtime/subagents.ts),
+ * or why it may not. The same rules as the agent's own pick: an administrator's agent or tenant row decides the agent's
+ * model (`resolveModel`'s `locked`), and a subagent may not run on another; where the server's picker switch is enforced
+ * and off (`pickerOff`), only the deployment's default may be picked; and only an option the deployment offers now.
+ */
+export function subagentModelChoice(
+  layers: { agent: Chosen | null; tenant: Chosen | null; deployment: Chosen | null; owner: string | null },
+  userModels: UserModels, defaultModel: string, option: string, pickerOff: boolean,
+): { ok: true; choice: ModelChoice } | { ok: false; error: string } {
+  if (resolveModel(layers, userModels, defaultModel).locked) {
+    return { ok: false, error: "an administrator has set this agent's model, so a subagent cannot run on another one; leave model out" };
+  }
+  const o = userModels.offered.find((x) => x.id === option);
+  if (!o) {
+    const ids = userModels.offered.map((x) => x.id).join(", ");
+    return { ok: false, error: `no model option ${JSON.stringify(option.slice(0, 64))}; ${ids ? `the options are ${ids}` : "this deployment offers none, so leave model out"}` };
+  }
+  const fallback = choiceOf(null, defaultModel);
+  if (pickerOff && (o.provider !== fallback.provider || o.model !== fallback.model)) {
+    return { ok: false, error: "choosing a model is not enabled for this Raft server, so a subagent runs on the default; leave model out" };
+  }
+  return { ok: true, choice: { provider: o.provider, model: o.model } };
+}
+
 /** Whether an operator binding already names `choice`: the same provider, the same model, and the provider's endpoint as declared now. */
 export function bindingIsCurrent(b: { model: string; baseUrl: string; secretRef: string }, choice: ModelChoice, providers: ModelProviders): boolean {
   return providerOfRef(b.secretRef) === choice.provider && b.model === choice.model

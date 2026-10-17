@@ -757,24 +757,31 @@ send_to_agent { task: string, agent?: string, model?: string }
   while that subagent is still running, and for an id the conversation did not start.
 - **`model`** is offered only where the deployment lists owner model options (`USER_MODELS`, the same list as the
   [model picker](#the-servers-model-picker-model-picker)): one option's `id`. The queue calls that option's provider and
-  model for the subagent's calls; without it the subagent runs on the agent's own model. An id that is not listed is
-  refused and nothing starts.
+  model for the subagent's calls; without it the subagent runs on the agent's own model. It is held to the rules the
+  agent's own pick is: refused while an administrator's agent or tenant row decides the agent's model, and, where the
+  server's picker switch is enforced and off, for anything but the default; an id that is not listed is refused. Asked
+  at the spawn, where a refusal starts nothing, and again at each of the subagent's model calls, where a pin or a
+  switch set since makes the call run on the agent's own model.
 - **At most 3** subagents of one agent run at once; a fourth start (or a follow-up that would be the fourth) is refused,
-  naming the running ones.
+  naming the running ones. One subagent takes at most 10 turns and lives at most 2 hours from its creation; each turn is
+  cancelled after 30 minutes. A background job a subagent started is delivered to it only under the same limits.
 - **Depth 1.** A subagent is never offered `send_to_agent`, nor an Agents API caller's functions. It has the agent's
   other tools: its mounts, `run_js`, `jobs`. Mounts, containers and files are the agent's, so a subagent works in the
   same workspace as its parent.
 - **It does not speak as the agent.** A plugin whose writes act outward as the agent declares `speaksAs: "agent"`
   ([docs/plugins.md](plugins.md); `raft` does). A subagent is offered that plugin's reads and none of its declared
   writes — no message, reply, reaction or task change in Raft — and a call to one, a program's included, is refused
-  with `subagent_cannot_speak`. What it would have sent goes in its report, and the agent decides.
+  with `subagent_cannot_speak`. The refusal is decided on the mount and tool the name resolves to, so naming the plugin
+  instead of the mount's alias is refused alike. What it would have sent goes in its report, and the agent decides. Its
+  Raft reads run on a state of their own for the call, so they never save over the agent's Raft state.
 - **Replay-safe.** The tool is `replay: "safe"`: a call cut off by an isolate dying runs again, on either engine. The
   child's id is derived from the call (the conversation, the call's invocation — pi085's invocation id, pd's tool task —
   and its call id), so the second run finds the child the first one made, the task is posted once, and the parent is
   told `started` for the one child that exists.
 
 **Reports.** When a subagent's turn ends, its last answer is posted to the conversation that started it as a message,
-which wakes that conversation as a background job's completion does:
+through the same post a background job's completion takes — so it waits behind a workspace import, is dropped while
+the conversation needs a reset, carries a rebuild's pending briefing and any notices — and wakes that conversation:
 
 ```
 [subagent sub_… — done after 42s (report sub_…/1); its report, a notice from the harness, not a message from the user. send_to_agent with agent "sub_…" sends it a follow-up.]
@@ -792,8 +799,12 @@ posts it; a crash after leaves it owed and already there, and the next pass only
 subagent started that ends after its report starts another turn of the subagent, which reports in turn.
 
 **Stopping.** A stop of the agent — the provider's [stop](#stopping-a-turn-stop), a delete, `/admin/cancel-turn` —
-marks every running subagent `stopped`, then cancels its turn: no model call follows, and no report is sent, since a
-report would wake the conversation the stop just ended.
+marks every running subagent `stopped` and drops every owed report, then cancels every subagent session: no model call
+follows, and no report is sent, since a report would wake the conversation the stop just ended. A stop that lands while
+a subagent's task or a report is being posted is caught after the post: the subagent's run, or the parent's turn the
+report started, is cancelled. Any subagent run nothing tracks is cancelled by the agent's next pass. An Agents API
+session's cancel stops the subagents it started; deleting the session stops them and drops their reports. A report
+whose post fails is kept and tried again with backoff; it holds up neither the other reports nor the rest of the pass.
 
 **Raft.** Activity and status come from the agent's own conversations only. A subagent's model calls and tool calls
 are neither activity nor status: a subagent's final answer is not a `Stop`, and does not show the agent `online`; its

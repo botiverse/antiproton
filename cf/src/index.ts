@@ -502,8 +502,13 @@ export class AgentDO extends DurableObject<Env> {
       reminderApp: { origin: this.env.REMINDER_APP_ORIGIN, credential: this.env.REMINDER_APP_CREDENTIAL },
       secretKek: this.env.SECRET_KEK,
       modelInputEvidence: evalSeedRoutes(this.env),
-      // The owner's model options: what a subagent may be started on (src/runtime/subagents.ts).
+      // The owner's model options: what a subagent may be started on (src/runtime/subagents.ts), under the same pins and
+      // switch as the agent's own pick.
       userModels: userModelsFrom(this.env as unknown as Record<string, unknown>, operatorModelOf(this.env).providers),
+      subagentModelRules: async (tenantId, agentId) => ({
+        layers: await d1ModelChoices(this.env.CONTROL_DB).layers(tenantId, agentId),
+        pickerOff: modelPickerEnforced(this.env) && !(await d1TenantModelPicker(this.env.CONTROL_DB).enabled(tenantId)),
+      }),
       // Plugins may make their own mount's hooks (Raft push); the URL must be
       // one a service can reach, which the console's own origin may not be.
       hooks: this.env.HOOK_ORIGIN
@@ -1580,10 +1585,27 @@ export class AgentDO extends DurableObject<Env> {
       if (!(await rt.store.getModelBinding(tenantId, agentId))) {
         return { cancelledTurn: null as string | null, stoppedJobs: [] as string[], stillRunning: [] as string[] };
       }
-      const out = await rt.cancelSession(tenantId, agentId, sessionId);
+      // The session's subagents with it: they are its work (src/runtime/subagents.ts).
+      const { stoppedSubagents: _children, ...out } = await rt.cancelSessionTree(tenantId, agentId, sessionId);
       await this.#wake();
       await this.broadcast();
       return out;
+    });
+  }
+
+  /**
+   * Before a session is deleted (Agents API DELETE /sessions/:id): the subagents it started are stopped, and their owed
+   * reports dropped, so nothing it began keeps calling the model or wakes a conversation nobody can read any more.
+   */
+  async apiStopSessionSubagents(tenantId: string, agentId: string, sessionId: string) {
+    this.#claim(tenantId, agentId);
+    return this.#busy("apiStopSessionSubagents", async () => {
+      const rt = this.runtime();
+      await rt.ready();
+      if (!(await rt.store.getModelBinding(tenantId, agentId))) return { stoppedSubagents: [] as string[] };
+      const { stoppedSubagents } = await rt.cancelSessionTree(tenantId, agentId, sessionId, { childrenOnly: true });
+      await this.broadcast();
+      return { stoppedSubagents };
     });
   }
 
@@ -3842,6 +3864,7 @@ async function v1(request: Request, env: Env, url: URL): Promise<Response> {
       },
       status: (agentId, sessionId) => agentStub(agentId).apiSessionStatus(tenantId, agentId, sessionId),
       cancel: async (agentId, sessionId) => { await agentStub(agentId).apiCancelSession(tenantId, agentId, sessionId); },
+      stopSubagents: async (agentId, sessionId) => { await agentStub(agentId).apiStopSessionSubagents(tenantId, agentId, sessionId); },
       toolResults: (agentId, sessionId, results) => agentStub(agentId).apiToolResults(tenantId, agentId, sessionId, results),
       transcript: async (agentId, sessionId) =>
         JSON.parse(await agentStub(agentId).apiTranscript(tenantId, agentId, sessionId)) as {

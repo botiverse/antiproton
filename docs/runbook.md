@@ -127,7 +127,9 @@ curl -s -X PATCH -H "x-harness-token: $AUTOMATION_TOKEN" -H "content-type: appli
 
 The answer is the settings in force and what moved: `{"settings":{"subagents":true},"changed":["subagents"]}`. The
 agent's next turn is offered `send_to_agent`; a turn already running keeps the tools it started with. Off again is the
-same call with `false`; subagents already running finish and report. An unknown setting or a value that is not a
+same call with `false`. **Turning it off does not stop subagents already running**: they finish and report. To stop
+them, stop the agent's turn with `/admin/cancel-turn` ([Stopping a runaway agent](#stopping-a-runaway-agent)), which
+stops every subagent with it. An unknown setting or a value that is not a
 boolean is `400` and nothing is written; an agent that is not there is `404`. Each change is an `agent.settings` line in
 the Workers logs.
 
@@ -146,4 +148,10 @@ session (`model.call` `attrs.session`, `tool.call` `attrs.task`) and one `subage
 ([Stopping a runaway agent](#stopping-a-runaway-agent)) mark every running subagent `stopped` and cancel its turn, on
 both engines, and no report is sent (a report would wake the turn the stop ended). `/admin/cancel-turn` answers
 `interrupted` when only subagents were running, too. There is no route that stops one subagent alone. While any
-subagent runs, a fresh context and a reset refuse, as they do for a running turn.
+subagent runs, a fresh context and a reset refuse, as they do for a running turn. An Agents API session's cancel stops
+the subagents that session started, and deleting the session stops them first and drops their owed reports.
+
+Each pass also cancels any subagent session that has work while its row says no turn of it runs (a run that landed as
+a stop did), logged as `subagent.stray`. A subagent lives at most 2 hours from its creation and takes at most 10 turns;
+each turn is cancelled after 30 minutes. A report whose post fails stays owed and is retried with backoff (5 s doubling
+to 10 minutes), each failure a `subagent.turn` row with status `report_failed`.
