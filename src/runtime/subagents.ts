@@ -176,6 +176,17 @@ export function reportRetryMs(sql: Sql, owner: SubagentOwner, now = Date.now()):
   return r?.at === null || r?.at === undefined ? null : Math.max(0, Number(r.at) - now);
 }
 
+/** The `subagent.turn` trace row for one child turn's end (cf/src/runtime.ts): its span the child, its parent the call that sent the turn. */
+export function subagentTurnRow(owner: SubagentOwner, s: Pick<Subagent, "id" | "callId" | "parentSession" | "turns" | "turnStartedAt" | "modelOption">,
+  status: SubagentOutcome | "report_failed", now: number, extra: Record<string, unknown> = {}) {
+  return {
+    at: now, tenantId: owner.tenantId, agentId: owner.agentId, kind: "subagent.turn" as const, spanId: s.id, ...(s.callId ? { parentId: s.callId } : {}),
+    status, verdict: (status === "done" ? "ok" : status === "cancelled" || status === "stopped" ? "cancelled" : "failed") as "ok" | "cancelled" | "failed",
+    ms: Math.max(0, now - s.turnStartedAt),
+    attrs: { parentSession: s.parentSession, turn: s.turns, ...(s.modelOption ? { model: s.modelOption } : {}), ...extra },
+  };
+}
+
 /** Every child session this agent ever had, whatever its row says: what a stop cancels. */
 export function allSubagentIds(sql: Sql, owner: SubagentOwner): string[] {
   if (!hasSubagentTable(sql)) return [];
@@ -264,14 +275,15 @@ export function markReported(sql: Sql, owner: SubagentOwner, id: string) {
  * deleted). Returns the ids of every child it covers, stopped now or not, so the caller cancels each one's session: a
  * child whose row was already idle can still have a run in flight (a task posted while a stop was landing).
  */
-export function stopRunningSubagents(sql: Sql, owner: SubagentOwner, now = Date.now(), parentSession?: string): string[] {
-  if (!hasSubagentTable(sql)) return [];
+export function stopRunningSubagents(sql: Sql, owner: SubagentOwner, now = Date.now(), parentSession?: string): { ids: string[]; stopped: Subagent[] } {
+  if (!hasSubagentTable(sql)) return { ids: [], stopped: [] };
   const only = parentSession === undefined ? "" : " AND parent_session = ?";
   const scope = parentSession === undefined ? [] : [parentSession];
-  sql.exec(`UPDATE subagents SET state = 'idle', finished_at = ?, outcome = 'stopped', report = NULL, report_retry_at = NULL
-    WHERE tenant_id = ? AND agent_id = ? AND state != 'idle'${only}`, now, owner.tenantId, owner.agentId, ...scope);
-  return (sql.exec(`SELECT id FROM subagents WHERE tenant_id = ? AND agent_id = ?${only}`, owner.tenantId, owner.agentId, ...scope).toArray() as any[])
+  const stopped = sql.exec(`UPDATE subagents SET state = 'idle', finished_at = ?, outcome = 'stopped', report = NULL, report_retry_at = NULL
+    WHERE tenant_id = ? AND agent_id = ? AND state != 'idle'${only} RETURNING *`, now, owner.tenantId, owner.agentId, ...scope).toArray().map(rowTo);
+  const ids = (sql.exec(`SELECT id FROM subagents WHERE tenant_id = ? AND agent_id = ?${only}`, owner.tenantId, owner.agentId, ...scope).toArray() as any[])
     .map((r) => String(r.id));
+  return { ids, stopped };
 }
 
 /** How many children of this object have a turn running; none when it never had one. One object is one agent. */

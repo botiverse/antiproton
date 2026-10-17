@@ -25,6 +25,8 @@ import { raftPlugin } from "../src/plugins/raft.ts";
 import { speakingTools } from "../src/runtime/subagents.ts";
 import { standInLoader } from "./spec/worker-stand-in.ts";
 import { setLogSink } from "../src/core/log.ts";
+import { sessionFor } from "../cf/src/transcript-read.ts";
+import { sessionsWithWork } from "../src/runtime/pi-agent.ts";
 import { returnPendingBriefing, takePendingBriefing, readBackstop } from "../src/runtime/overflow-backstop.ts";
 import { subagentModelChoice } from "../cf/src/model-request.ts";
 import { savesState } from "../src/plugins/raft.ts";
@@ -166,15 +168,15 @@ async function settle(w: World, max = 120) {
   throw new Error(`${w.engine}: did not settle`);
 }
 
-/** The text of every message of the main conversation, oldest first. */
-async function mainTexts(w: World, role: "user" | "assistant" = "user"): Promise<string[]> {
-  const entries = await w.rt.branchEntries("t", "a", "main") as any[];
+/** The text of every message of a conversation (the main one unless named), oldest first. */
+async function mainTexts(w: World, role: "user" | "assistant" = "user", session = "main"): Promise<string[]> {
+  const entries = await w.rt.branchEntries("t", "a", session) as any[];
   return entries.filter((e) => e.type === "message" && e.message?.role === role).map((e) => {
     const c = e.message.content;
     return typeof c === "string" ? c : (c ?? []).filter((p: any) => p.type === "text").map((p: any) => p.text).join("");
   });
 }
-const reports = async (w: World) => (await mainTexts(w)).filter((t) => t.startsWith("[subagent "));
+const reports = async (w: World, session = "main") => (await mainTexts(w, "user", session)).filter((t) => t.startsWith("[subagent "));
 const rowsOf = (w: World) => w.raw.sql.exec("SELECT * FROM subagents ORDER BY created_at, id").toArray() as any[];
 const toolNames = (req: Req) => (req.tools ?? []).map((t: any) => t.name ?? t.function?.name);
 const taskOf = (req: Req) => {
@@ -543,6 +545,56 @@ for (const engine of (process.env.ENGINES ?? "pi085,pd").split(",").filter((e) =
     }
   });
 
+
+  await check(`${engine}: a parent in a non-main conversation is woken by each of three reports, arriving across passes, with no other input`, async () => {
+    const w = await world(engine);
+    const P = "sess_api1";
+    let parentCalls = 0;
+    const released = new Set<string>();
+    w.reply = (session, req) => {
+      if (session === P) {
+        parentCalls++;
+        return parentCalls === 1 ? calls(...[1, 2, 3].map((i) => ({ id: `c${i}`, args: { task: `part ${i}` } }))) : say(`noted ${parentCalls}`);
+      }
+      const n = /part (\d)/.exec(taskOf(req))?.[1] ?? "?";
+      return released.has(n) ? say(`report of part ${n}`) : null;
+    };
+    await w.rt.postMessage("t", "a", "start", "prompt", P);
+    for (let i = 0; i < 6; i++) await pass(w);
+    must(rowsOf(w).length === 3 && rowsOf(w).every((r) => r.parent_session === P && r.state === "running"), show(rowsOf(w)));
+    for (const n of ["1", "2", "3"]) {
+      released.add(n);
+      const callsBefore = w.requests.filter((r) => r.session === P).length;
+      let landed = false;
+      for (let i = 0; i < 10 && !landed; i++) {
+        await pass(w);
+        landed = (await reports(w, P)).some((t) => t.includes(`report of part ${n}`));
+      }
+      must(landed, `report ${n} never became visible in ${P}: ${show(await reports(w, P))}`);
+      // pi085 steps only the sessions its list says have work: the report put the parent on it.
+      if (engine === "pi085") must(sessionsWithWork(w.raw.sql as never).includes(P), `${P} was not marked to be stepped`);
+      for (let i = 0; i < 4 && w.requests.filter((r) => r.session === P).length === callsBefore; i++) await pass(w);
+      const after = w.requests.filter((r) => r.session === P);
+      must(after.length > callsBefore, `report ${n}: the parent made no model call`);
+      must(JSON.stringify(after.at(-1)!.req.messages).includes(`report of part ${n}`), `report ${n}: the parent's call did not carry it`);
+    }
+    must((await reports(w, P)).length === 3 && (await reports(w, "main")).length === 0, `reports went elsewhere: ${show(await reports(w, "main"))}`);
+  });
+
+  await check(`${engine}: an operator can read a subagent's transcript by its session; another sub_ id is not one`, async () => {
+    const w = await world(engine);
+    let parentCalls = 0;
+    w.reply = (session) => session === "main" ? (++parentCalls === 1 ? calls({ id: "c1", args: { task: "t" } }) : say("ok")) : say("child answer");
+    await w.rt.postMessage("t", "a", "go", "prompt", "main");
+    await settle(w);
+    w.raw.sql.exec("CREATE TABLE IF NOT EXISTS owner(k TEXT PRIMARY KEY, tenant_id TEXT, agent_id TEXT)");
+    w.raw.sql.exec("INSERT OR IGNORE INTO owner VALUES ('self', 't', 'a')");
+    const child = rowsOf(w)[0]!.id as string;
+    must(sessionFor(w.raw.sql as never, "t", "a", child) === child, "a child's session is not readable by its id");
+    must(sessionFor(w.raw.sql as never, "t", "a", "sub_0000000000000000") === null, "an unknown sub_ id was read as a conversation");
+    must(sessionFor(w.raw.sql as never, "t", "other", child) === null, "another agent's id reads this agent's child");
+  });
+
   await check(`${engine}: a follow-up to a subagent still running, or to an id this conversation never started, is refused`, async () => {
     const w = await world(engine);
     let parentCalls = 0, child: string | null = null;
@@ -584,6 +636,9 @@ for (const engine of (process.env.ENGINES ?? "pi085,pd").split(",").filter((e) =
     const stop = await w.rt.stopTurn("t", "a", "provider_stop");
     must(stop.result === "interrupted", show(stop));
     must(rowsOf(w).every((r) => r.state === "idle" && r.outcome === "stopped"), show(rowsOf(w)));
+    // Each stopped turn has its end in the trace.
+    const stoppedRows = trace(w).filter((r) => r.kind === "subagent.turn" && r.status === "stopped");
+    must(stoppedRows.length === 3 && rowsOf(w).every((c) => stoppedRows.some((t) => t.spanId === c.id && t.verdict === "cancelled")), show(stoppedRows));
     const sentAtStop = w.sent.length;
     // The answers to the calls that were out arrive and start nothing.
     w.reply = (session) => say(`late answer from ${session}`);
@@ -609,6 +664,10 @@ for (const engine of (process.env.ENGINES ?? "pi085,pd").split(",").filter((e) =
     w.reply = () => say("late");
     for (let i = 0; i < 6; i++) { await pass(w); await sleep(10); }
     must(w.sent.length === sentAtStop && (await reports(w)).length === 0, `after delete: ${w.sent.length - sentAtStop} calls, ${(await reports(w)).length} reports`);
+    // A deleted agent's settings are not there to read or change, though its rows stay as a record.
+    must(await w.rt.agentSettingsOf("t", "a") === null, "the deleted agent's settings still answer");
+    const patch = await w.rt.updateAgentSettings("t", "a", { subagents: false }, "test");
+    must(!patch.ok && (patch as any).status === 404, show(patch));
   });
 
   await check(`${engine}: a restart while a child waits on the model still delivers its report`, async () => {

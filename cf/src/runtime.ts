@@ -68,7 +68,7 @@ import {
   runningSubagents, setSubagentTurnOp, startedResult as subagentStarted, startSubagentTurn, stopRunningSubagents, subagentOf, subagentTool,
   SUBAGENT_TOOL, speakingRefusal, speakingTools, taskMessage, turnEnd, type Subagent, type TurnEnd,
   markReported, reportingSubagents, reportKey, subagentIdFor, taskKey, turnKeyOf,
-  reportFailed, reportRetryMs, subagentSpent,
+  reportFailed, reportRetryMs, subagentSpent, subagentTurnRow,
 } from "../../src/runtime/subagents.ts";
 import { subagentModelChoice } from "./model-request.ts";
 import type { ModelLayers } from "./control-plane.ts";
@@ -4149,7 +4149,7 @@ export class AgentRuntime {
   async cancelSessionTree(tenantId: string, agentId: string, session: string, o: { childrenOnly?: boolean } = {}) {
     await this.ready();
     const sql = this.#deps.ctx.storage.sql;
-    const children = stopRunningSubagents(sql, { tenantId, agentId }, Date.now(), session);
+    const children = this.#stopSubagents(tenantId, agentId, session);
     for (const child of children) {
       try { await this.cancelSession(tenantId, agentId, child); }
       catch (e) { console.error(`cancelling ${tenantId}/${agentId}'s subagent ${child} of ${session} failed:`, e); }
@@ -4220,7 +4220,7 @@ export class AgentRuntime {
       // (src/runtime/subagents.ts). Then every child session is cancelled, whatever its row says — a task posted while
       // this stop was landing can have started a run on a row already marked stopped. On pd they are conversations
       // the main one's cancel does not reach (ownerless); on pi085 every session with work is cancelled anyway.
-      const children = stopRunningSubagents(sql, { tenantId, agentId }, Date.now());
+      const children = this.#stopSubagents(tenantId, agentId);
       const sessions = pd ? [MAIN_SESSION, ...new Set([...children, ...this.#pdSubagentSessions()])]
         : [...new Set([MAIN_SESSION, ...sessionsWithWork(sql)])];
       let cancelled: string | null = null;
@@ -4437,12 +4437,7 @@ export class AgentRuntime {
       }
       if (!end || !finishSubagentTurn(sql, owner, s.id, end.outcome, now, reportMessage(s, end, now))) continue;
       try {
-        appendTrace(sql, [{
-          at: now, tenantId, agentId, kind: "subagent.turn", spanId: s.id, ...(s.callId ? { parentId: s.callId } : {}),
-          status: end.outcome, verdict: end.outcome === "done" ? "ok" : end.outcome === "cancelled" ? "cancelled" : "failed",
-          ms: Math.max(0, now - s.turnStartedAt),
-          attrs: { parentSession: s.parentSession, turn: s.turns, ...(s.modelOption ? { model: s.modelOption } : {}) },
-        }]);
+        appendTrace(sql, [subagentTurnRow(owner, s, end.outcome, now)]);
       } catch (e) { console.error(`the subagent.turn row of ${tenantId}/${agentId} could not be written:`, e); }
     }
     let reported = 0;
@@ -4467,8 +4462,7 @@ export class AgentRuntime {
         const error = String((e as Error)?.message ?? e).slice(0, 200);
         console.error(`posting ${tenantId}/${agentId}'s subagent ${s.id} report failed (attempt ${attempts}):`, e);
         try {
-          appendTrace(sql, [{ at: Date.now(), tenantId, agentId, kind: "subagent.turn", spanId: s.id, ...(s.callId ? { parentId: s.callId } : {}),
-            status: "report_failed", verdict: "failed", attrs: { parentSession: s.parentSession, turn: s.turns, attempts, error } }]);
+          appendTrace(sql, [subagentTurnRow(owner, s, "report_failed", Date.now(), { attempts, error })]);
         } catch (t) { console.error(`the subagent.turn row of ${tenantId}/${agentId} could not be written:`, t); }
         continue;
       }
@@ -4511,6 +4505,22 @@ export class AgentRuntime {
       status: String(result.status ?? "unknown"),
       error: typeof result.error?.message === "string" ? result.error.message : null,
     });
+  }
+
+  /**
+   * `stopRunningSubagents` with a `subagent.turn` row, status `stopped`, for each turn it ended, so the trace has every
+   * turn's end. A reading: a row that cannot be written is logged and the stop goes on. Returns every child it covers.
+   */
+  #stopSubagents(tenantId: string, agentId: string, parentSession?: string): string[] {
+    const sql = this.#deps.ctx.storage.sql;
+    const owner = { tenantId, agentId };
+    const now = Date.now();
+    const r = stopRunningSubagents(sql, owner, now, parentSession);
+    if (r.stopped.length) {
+      try { appendTrace(sql, r.stopped.map((s) => subagentTurnRow(owner, s, "stopped", now))); }
+      catch (e) { console.error(`the subagent.turn rows of ${tenantId}/${agentId}'s stop could not be written:`, e); }
+    }
+    return r.ids;
   }
 
   /**
@@ -4605,6 +4615,8 @@ export class AgentRuntime {
     await this.ready();
     if (!(await this.store.loadAgent(tenantId, agentId))) return null;
     const sql = this.#deps.ctx.storage.sql;
+    // A deleted agent has no settings to read: its delete stopped every subagent (`stopTurn`), and the rows stay only as a record.
+    if (agentDeletedAt(sql) !== null) return null;
     return { settings: agentSettings(sql), subagents: listSubagents(sql, { tenantId, agentId }) };
   }
 
@@ -4615,6 +4627,7 @@ export class AgentRuntime {
   async updateAgentSettings(tenantId: string, agentId: string, patch: unknown, who: string) {
     await this.ready();
     if (!(await this.store.loadAgent(tenantId, agentId))) return { ok: false as const, status: 404, error: "no such agent" };
+    if (agentDeletedAt(this.#deps.ctx.storage.sql) !== null) return { ok: false as const, status: 404, error: "the agent was deleted" };
     const r = updateAgentSettings(this.#deps.ctx.storage.sql, patch, who, Date.now());
     return r.ok ? r : { ok: false as const, status: 400, error: r.error };
   }

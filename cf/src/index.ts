@@ -3475,7 +3475,7 @@ async function adminAgentSettings(request: Request, env: Env, url: URL): Promise
   const stub = env.AGENT.get(env.AGENT.idFromName(agentObjectName(tenantId, agentId)));
   if (request.method === "GET") {
     const r = await stub.adminAgentSettings(tenantId, agentId);
-    return r ? Response.json(r) : Response.json({ error: "no such agent" }, { status: 404 });
+    return r ? Response.json(r) : Response.json({ error: "no such agent, or it was deleted" }, { status: 404 });
   }
   const r = await stub.adminUpdateAgentSettings(tenantId, agentId, b?.settings);
   if (!r.ok) return Response.json({ error: r.error }, { status: r.status });
