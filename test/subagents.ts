@@ -30,7 +30,7 @@ import { sessionsWithWork } from "../src/runtime/pi-agent.ts";
 import { returnPendingBriefing, takePendingBriefing, readBackstop } from "../src/runtime/overflow-backstop.ts";
 import { subagentModelChoice } from "../cf/src/model-request.ts";
 import { savesState } from "../src/plugins/raft.ts";
-import { SUBAGENT_MAX_TURNS, SUBAGENT_LIFETIME_MS } from "../src/runtime/subagents.ts";
+import { SUBAGENT_MAX_TURNS, SUBAGENT_LIFETIME_MS, REPORT_MAX_ATTEMPTS, recordSubagent } from "../src/runtime/subagents.ts";
 
 const logs: any[] = [];
 setLogSink((line) => { try { logs.push(JSON.parse(line)); } catch { /* not ours */ } });
@@ -77,8 +77,8 @@ const USER_MODELS = { offered: [{ id: "cheap", label: "Cheap", provider: "deepse
 
 /** One agent on an AgentRuntime over node:sqlite, its object recording `engine`, its `subagents` setting as given. */
 type Rules = { layers: { agent: any; tenant: any; deployment: any; owner: string | null }; pickerOff: boolean };
-async function world(engine: "pi085" | "pd", opts: { on?: boolean; builder?: boolean; chatter?: boolean; sandbox?: boolean } = {}) {
-  const rules: { now: Rules | null } = { now: null };
+async function world(engine: "pi085" | "pd", opts: { on?: boolean; builder?: boolean; chatter?: boolean; sandbox?: boolean; rulesTtlMs?: number; slowBuilder?: number } = {}) {
+  const rules: { now: Rules | null; reads: number; fail: boolean } = { now: null, reads: 0, fail: false };
   const raw = sqliteHost();
   if (engine === "pd") {
     const ap = new ApStore(raw, prefixedNamespace("ap"));
@@ -88,11 +88,27 @@ async function world(engine: "pi085" | "pd", opts: { on?: boolean; builder?: boo
   const sent: string[] = [];
   const fault = { at: null as null | ((phase: string, id: string) => void | Promise<void>) };
   const standIn = standInLoader();
-  const plugins = [...(opts.builder || opts.chatter ? [builder] : []), ...(opts.chatter ? [chatter] : [])];
+  // A mount whose background work ends only at the `slowBuilder`-th poll; `slow.polls` and `slow.cancelled` say what it saw.
+  const slow = { polls: 0, cancelled: 0 };
+  const slowPlugin = {
+    id: "slow", version: "1.0.0",
+    tools: [{ name: "build", description: "Build slowly.", parameters: { type: "object", properties: {} }, sideEffects: "write", idempotency: "none" }],
+    async invoke() { return { ok: true }; },
+    background: {
+      async poll() { slow.polls++; return slow.polls >= (opts.slowBuilder ?? 1) ? { done: true, result: "built slowly" } : { done: false }; },
+      async cancel() { slow.cancelled++; },
+    },
+  } as unknown as Plugin;
+  const plugins = [...(opts.builder || opts.chatter ? [builder] : []), ...(opts.chatter ? [chatter] : []), ...(opts.slowBuilder ? [slowPlugin] : [])];
   /** A runtime over this object, as a fresh isolate makes one: nothing opened, nothing remembered. */
   const isolate = () => new AgentRuntime({
     subagentFault: (phase: string, id: string) => fault.at?.(phase, id),
-    subagentModelRules: async () => rules.now ?? { layers: { agent: null, tenant: null, deployment: null, owner: null }, pickerOff: false },
+    subagentModelRules: async () => {
+      rules.reads++;
+      if (rules.fail) throw new Error("D1 did not answer");
+      return rules.now ?? { layers: { agent: null, tenant: null, deployment: null, owner: null }, pickerOff: false };
+    },
+    subagentRulesTtlMs: opts.rulesTtlMs ?? 0,
     ...(opts.sandbox ? { loader: standIn.loader, makeToolBinding: standIn.makeToolBinding } : {}),
     ctx: { storage: { sql: raw.sql, transactionSync: raw.transactionSync } },
     bucket: {} as never, bucketName: "b", models: { resolve: () => null },
@@ -101,7 +117,7 @@ async function world(engine: "pi085" | "pd", opts: { on?: boolean; builder?: boo
     offloadModel: async (job: { commandId: string }) => { sent.push(job.commandId); },
   } as never);
   const w = {
-    raw, sent, engine, rt: isolate(), isolate, fault, rules,
+    raw, sent, engine, rt: isolate(), isolate, fault, rules, slow,
     answered: new Set<string>(),
     /** Jobs `reply` chose to leave out, for now. */
     held: new Set<string>(),
@@ -112,7 +128,7 @@ async function world(engine: "pi085" | "pd", opts: { on?: boolean; builder?: boo
   };
   await w.rt.ready();
   await w.rt.store.createAgent("t", "a", { name: "Ada", description: "d" } as never);
-  for (const [on, id, alias] of [[opts.builder || opts.chatter, "builder", "builder"], [opts.chatter, "chatter", "chat"]] as const) {
+  for (const [on, id, alias] of [[opts.builder || opts.chatter, "builder", "builder"], [opts.chatter, "chatter", "chat"], [!!opts.slowBuilder, "slow", "slow"]] as const) {
     if (!on) continue;
     await w.rt.store.setPluginChoice("t", "a", id, "enable");
     must((await w.rt.addMount("t", "a", { alias, plugin: id, config: {} })).ok, `the ${id} mount was refused`);
@@ -595,6 +611,119 @@ for (const engine of (process.env.ENGINES ?? "pi085,pd").split(",").filter((e) =
     must(sessionFor(w.raw.sql as never, "t", "other", child) === null, "another agent's id reads this agent's child");
   });
 
+
+  await check(`${engine}: a finished child's background job that needs five polls completes and is reported: the sweep leaves it alone`, async () => {
+    const w = await world(engine, { slowBuilder: 5 });
+    let parentCalls = 0;
+    w.reply = (session, req) => session === "main" ? (++parentCalls === 1 ? calls({ id: "c1", args: { task: "start the slow build" } }) : say("ok"))
+      : say(JSON.stringify(req.messages).includes("[background job op_slow") ? "the slow build finished" : "the build is running");
+    await w.rt.postMessage("t", "a", "go", "prompt", "main");
+    await settle(w);
+    const child = rowsOf(w)[0]!.id as string;
+    must((await reports(w)).length === 1 && rowsOf(w)[0]!.state === "idle", show(rowsOf(w)));
+    recordBackgroundJob(w.raw.sql as never, { tenantId: "t", agentId: "a" }, { id: "op_slow", session: child, mount: "slow", tool: "slow__build", handle: {} }, Date.now());
+    logs.length = 0;
+    for (let i = 0; i < 12 && w.slow.polls < 5; i++) {
+      w.raw.sql.exec("UPDATE background_jobs SET next_poll_at = 0 WHERE id = 'op_slow' AND state = 'running'");
+      await pass(w);
+    }
+    await settle(w);
+    must(w.slow.cancelled === 0 && !logs.some((l) => l.evt === "subagent.stray"), `the idle child's job was taken for a stray run: cancelled ${w.slow.cancelled}`);
+    must(w.slow.polls >= 5, `polled ${w.slow.polls} times`);
+    const rs = await reports(w);
+    must(rs.length === 2 && rs[1]!.includes("the slow build finished"), show(rs));
+  });
+
+  await check(`${engine}: a stop and the person's next message while a report is being posted: the message is answered, no report lands`, async () => {
+    const w = await world(engine);
+    let parentCalls = 0, stopped = false;
+    w.reply = (session, req) => {
+      if (session === "main") {
+        parentCalls++;
+        if (parentCalls === 1) return calls({ id: "c1", args: { task: "t" } });
+        return say(JSON.stringify(req.messages).includes("a new question") ? "the answer to the new question" : "ok");
+      }
+      return say("report text");
+    };
+    w.fault.at = async (p) => {
+      if (p !== "report-posting" || stopped) return;
+      stopped = true;
+      await w.rt.stopTurn("t", "a", "provider_stop");
+      await w.rt.postMessage("t", "a", "a new question", "prompt", "main");
+    };
+    await w.rt.postMessage("t", "a", "go", "prompt", "main");
+    for (let i = 0; i < 12 && !stopped; i++) { await pass(w); await sleep(5); }
+    must(stopped, "the stop never landed");
+    await settle(w);
+    must((await reports(w)).length === 0, `a report landed after the stop: ${show(await reports(w))}`);
+    const answers = await mainTexts(w, "assistant");
+    must(answers.includes("the answer to the new question"), `the person's message after the stop was not answered: ${show(answers)}`);
+  });
+
+  await check(`${engine}: a report that never posts is dropped after its attempts: report_dropped, and the child no longer counts as busy`, async () => {
+    const w = await world(engine);
+    let parentCalls = 0;
+    w.reply = (session) => session === "main" ? (++parentCalls === 1 ? calls({ id: "c1", args: { task: "t" } }) : say("ok")) : say("unpostable report");
+    w.fault.at = (p) => { if (p === "report-posting") throw new Error("the parent's lane said no"); };
+    await w.rt.postMessage("t", "a", "go", "prompt", "main");
+    const has = () => w.raw.sql.exec("SELECT 1 FROM sqlite_master WHERE name = 'subagents'").toArray().length > 0;
+    for (let i = 0; i < 30 && !(has() && rowsOf(w)[0]?.state === "idle"); i++) {
+      await pass(w);
+      if (has()) w.raw.sql.exec("UPDATE subagents SET report_retry_at = 0 WHERE state = 'reporting'");
+    }
+    const row = rowsOf(w)[0]!;
+    must(row.state === "idle" && row.outcome === "report_failed" && row.report_attempts === REPORT_MAX_ATTEMPTS, show(row));
+    must(trace(w).filter((r) => r.kind === "subagent.turn" && r.status === "report_dropped").length === 1, "no report_dropped row");
+    must(!/subagent/.test(w.rt.notIdle() ?? ""), `still counted as busy: ${w.rt.notIdle()}`);
+  });
+
+  await check(`${engine}: the model rules: a change is traced and told in the next report; an unreadable read keeps the decision; reads are shared`, async () => {
+    for (const how of ["pinned", "unreadable", "cached"] as const) {
+      const w = await world(engine, how === "cached" ? { rulesTtlMs: 60_000 } : {});
+      let parentCalls = 0, childCalls = 0;
+      w.reply = (session) => {
+        if (session === "main") return ++parentCalls === 1 ? calls({ id: "c1", args: { task: "work", model: "cheap" } }) : say("ok");
+        childCalls++;
+        if (childCalls === 1) {
+          if (how === "pinned") w.rules.now = { layers: { agent: { provider: null, model: "m1" }, tenant: null, deployment: null, owner: null }, pickerOff: false };
+          if (how === "unreadable") w.rules.fail = true;
+        }
+        return childCalls < 4 ? calls({ id: `x${childCalls}`, args: { task: "loop" } }) : say("done");
+      };
+      await w.rt.postMessage("t", "a", "go", "prompt", "main");
+      await settle(w);
+      const models = w.requests.filter((r) => r.session.startsWith("sub_")).map((r) => r.operatorModel);
+      const changed = trace(w).filter((r) => r.kind === "subagent.model_changed");
+      const report = (await reports(w))[0] ?? "";
+      if (how === "pinned") {
+        must(models[0] === "m-cheap" && models.slice(1).every((m) => m === "m1"), show(models));
+        must(changed.length === 1 && changed[0]!.attrs.from === "m-cheap" && changed[0]!.attrs.to === "agent", show(changed));
+        must(/it ran on the agent's own model, not m-cheap: an administrator has set this agent's model/.test(report), `the report does not say: ${report}`);
+      } else if (how === "unreadable") {
+        must(models.length >= 4 && models.every((m) => m === "m-cheap"), `a failed read moved the subagent: ${show(models)}`);
+        must(changed.length === 0 && !/it ran on/.test(report), show(changed));
+      } else {
+        must(models.length >= 4 && w.rules.reads === 1, `${w.rules.reads} reads for ${models.length} calls and a spawn`);
+      }
+    }
+  });
+
+  await check(`${engine}: a stop opens no finished child: twenty of them, none opened`, async () => {
+    const w = await world(engine);
+    for (let i = 0; i < 20; i++) {
+      const id = `sub_${String(i).padStart(16, "0")}`;
+      recordSubagent(w.raw.sql as never, { tenantId: "t", agentId: "a" }, { id, parentSession: "main", callId: `c${i}`, modelOption: null, provider: null, model: null, turnOp: null, turnKey: null, now: Date.now() });
+      w.raw.sql.exec("UPDATE subagents SET state = 'idle', outcome = 'done' WHERE id = ?", id);
+    }
+    w.rt = w.isolate();
+    await w.rt.ready();
+    const opens = () => trace(w).filter((r) => r.kind === "harness.open" && String(r.spanId).includes("#sub_")).length;
+    const before = opens();
+    const t0 = Date.now();
+    await w.rt.stopTurn("t", "a", "provider_stop");
+    must(opens() === before, `the stop opened ${opens() - before} finished children in ${Date.now() - t0} ms`);
+  });
+
   await check(`${engine}: a follow-up to a subagent still running, or to an id this conversation never started, is refused`, async () => {
     const w = await world(engine);
     let parentCalls = 0, child: string | null = null;
@@ -809,6 +938,18 @@ await check("pi085: a report goes through the agent's post: dropped like a backg
       must(/BRIEFING: what the conversation was about/.test(text) && /\[subagent /.test(text), `the report did not carry the briefing: ${text.slice(-400)}`);
     }
   }
+});
+
+await check("rules: every raft operation that can hold a call for a question is a write, so a subagent never reaches one", async () => {
+  // A subagent's raft calls run on a state of their own (`savesState`). A held question is resumed with the state the
+  // hold wrote; a subagent would resume one with none. It cannot get one: only these operations ask, and each is a
+  // write of a plugin that speaks as the agent, which a subagent is neither offered nor let call, resumed included.
+  const { RAFT_OPERATIONS } = await import("@botiverse/raft-sdk") as any;
+  const asking = (RAFT_OPERATIONS as any[]).filter((o) => o.mayInterrupt);
+  must(asking.length > 0, "control: the manifest names no operation that asks");
+  const tools = raftPlugin.tools.map((t: any) => ({ address: `raft.${t.name}`, sideEffects: t.sideEffects }));
+  const withheld = speakingTools(tools, (alias) => alias === "raft" ? raftPlugin.speaksAs : undefined);
+  for (const op of asking) must(withheld.has(`raft.${op.toolName}`), `${op.toolName} asks questions and a subagent may call it`);
 });
 
 await check("rules: a subagent's model option under pins and the picker switch; raft saves no state for a subagent", () => {

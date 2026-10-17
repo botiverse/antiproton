@@ -760,8 +760,10 @@ send_to_agent { task: string, agent?: string, model?: string }
   model for the subagent's calls; without it the subagent runs on the agent's own model. It is held to the rules the
   agent's own pick is: refused while an administrator's agent or tenant row decides the agent's model, and, where the
   server's picker switch is enforced and off, for anything but the default; an id that is not listed is refused. Asked
-  at the spawn, where a refusal starts nothing, and again at each of the subagent's model calls, where a pin or a
-  switch set since makes the call run on the agent's own model.
+  at the spawn, where a refusal starts nothing, and again at each of the subagent's model calls (from an answer kept for
+  30 s), where a pin or a switch set since makes the call run on the agent's own model: a `subagent.model_changed`
+  trace row, and the subagent's next report says which model it ran on and why. Rules that cannot be read leave the
+  decision as it was.
 - **At most 3** subagents of one agent run at once; a fourth start (or a follow-up that would be the fourth) is refused,
   naming the running ones. One subagent takes at most 10 turns and lives at most 2 hours from its creation; each turn is
   cancelled after 30 minutes. A background job a subagent started is delivered to it only under the same limits.
@@ -800,11 +802,15 @@ subagent started that ends after its report starts another turn of the subagent,
 
 **Stopping.** A stop of the agent — the provider's [stop](#stopping-a-turn-stop), a delete, `/admin/cancel-turn` —
 marks every running subagent `stopped` and drops every owed report, then cancels every subagent session: no model call
-follows, and no report is sent, since a report would wake the conversation the stop just ended. A stop that lands while
-a subagent's task or a report is being posted is caught after the post: the subagent's run, or the parent's turn the
-report started, is cancelled. Any subagent run nothing tracks is cancelled by the agent's next pass. An Agents API
+follows, and no report is sent, since a report would wake the conversation the stop just ended. A stop that lands while a subagent's task is being posted is
+caught after the post, and the subagent's run is cancelled. One that lands while a report is being posted is caught at
+the last moment before the report is written, and nothing is written: a message the person sends after the stop is
+answered as theirs. Only a stop inside the write itself is caught after it, and then only the run the report started
+is cancelled, never the conversation. On pd a stop cancels the subagent conversations pi-durable says have live work,
+not every one the agent ever had. Any subagent run nothing tracks is cancelled by the agent's next pass. An Agents API
 session's cancel stops the subagents it started; deleting the session stops them and drops their reports. A report
-whose post fails is kept and tried again with backoff; it holds up neither the other reports nor the rest of the pass.
+whose post fails is kept and tried again with backoff, at most 8 times; it holds up neither the other reports nor the
+rest of the pass.
 
 **Raft.** Activity and status come from the agent's own conversations only. A subagent's model calls and tool calls
 are neither activity nor status: a subagent's final answer is not a `Stop`, and does not show the agent `online`; its

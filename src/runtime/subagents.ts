@@ -62,7 +62,11 @@ type Sql = { exec(query: string, ...bindings: unknown[]): { toArray(): unknown[]
 
 export interface SubagentOwner { tenantId: string; agentId: string }
 
-export type SubagentOutcome = "done" | "failed" | "cancelled" | "stopped";
+/** `report_failed`: the turn ended, and its report could not be posted in `REPORT_MAX_ATTEMPTS` tries and was dropped. */
+export type SubagentOutcome = "done" | "failed" | "cancelled" | "stopped" | "report_failed";
+
+/** How many times an owed report is posted before it is dropped (`reportFailed`): at the backoff below, about 21 minutes. */
+export const REPORT_MAX_ATTEMPTS = 8;
 
 export interface Subagent {
   /** The child's session id. */
@@ -84,6 +88,13 @@ export interface Subagent {
   turnKey: string | null;
   /** The report owed while `reporting`: decided once, so a retry posts the same text under the same key. */
   report: string | null;
+  /**
+   * The model the child's calls run on now (the option's, or null for the agent's own), as the last call decided it
+   * (cf/src/runtime.ts `takeJob`): what a change is told against.
+   */
+  modelNow: string | null;
+  /** What the next report says beside the answer: a change of the child's model since the turn began. */
+  reportNote: string | null;
   /** The engine's id for the turn in flight: pi085's operation id, pd's submission id. What its end is read by. */
   turnOp: string | null;
   turns: number;
@@ -99,7 +110,8 @@ export function ensureSubagentTable(sql: Sql) {
     parent_session TEXT NOT NULL, call_id TEXT, model_option TEXT, provider TEXT, model TEXT,
     state TEXT NOT NULL, turn_op TEXT, turns INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL, turn_started_at INTEGER NOT NULL, finished_at INTEGER, outcome TEXT,
-    turn_key TEXT, report TEXT, report_attempts INTEGER NOT NULL DEFAULT 0, report_retry_at INTEGER)`);
+    turn_key TEXT, report TEXT, report_attempts INTEGER NOT NULL DEFAULT 0, report_retry_at INTEGER,
+    model_now TEXT, report_note TEXT)`);
 }
 
 /** Whether the object has the table at all, asked without making it: most objects never had a child. */
@@ -114,6 +126,8 @@ const rowTo = (r: any): Subagent => ({
   state: r.state === "running" || r.state === "reporting" ? r.state : "idle", turnOp: r.turn_op === null ? null : String(r.turn_op),
   turnKey: r.turn_key === null || r.turn_key === undefined ? null : String(r.turn_key),
   report: r.report === null || r.report === undefined ? null : String(r.report),
+  modelNow: r.model_now === null || r.model_now === undefined ? null : String(r.model_now),
+  reportNote: r.report_note === null || r.report_note === undefined ? null : String(r.report_note),
   turns: Number(r.turns), createdAt: Number(r.created_at), turnStartedAt: Number(r.turn_started_at),
   finishedAt: r.finished_at === null || r.finished_at === undefined ? null : Number(r.finished_at),
   outcome: (r.outcome ?? null) as SubagentOutcome | null,
@@ -159,13 +173,33 @@ export function reportingSubagents(sql: Sql, owner: SubagentOwner, now = Date.no
     owner.tenantId, owner.agentId, now).toArray().map(rowTo);
 }
 
-/** A post of the report failed: it stays owed, and is tried again after `reportRetryDelay`. Returns the attempts so far. */
-export function reportFailed(sql: Sql, owner: SubagentOwner, id: string, now = Date.now()): number {
+/**
+ * A post of the report failed: it stays owed, and is tried again after `reportRetryDelay` — until `REPORT_MAX_ATTEMPTS`,
+ * when it is dropped and the child is idle with outcome `report_failed`, so it no longer counts as busy (`notIdle`).
+ */
+export function reportFailed(sql: Sql, owner: SubagentOwner, id: string, now = Date.now()): { attempts: number; dropped: boolean } {
   const r = sql.exec("UPDATE subagents SET report_attempts = report_attempts + 1 WHERE id = ? AND tenant_id = ? AND agent_id = ? AND state = 'reporting' RETURNING report_attempts",
     id, owner.tenantId, owner.agentId).toArray()[0] as any;
   const attempts = Number(r?.report_attempts ?? 1);
+  if (attempts >= REPORT_MAX_ATTEMPTS) {
+    sql.exec("UPDATE subagents SET state = 'idle', outcome = 'report_failed', report = NULL, report_retry_at = NULL WHERE id = ? AND tenant_id = ? AND agent_id = ? AND state = 'reporting'",
+      id, owner.tenantId, owner.agentId);
+    return { attempts, dropped: true };
+  }
   sql.exec("UPDATE subagents SET report_retry_at = ? WHERE id = ? AND tenant_id = ? AND agent_id = ?", now + reportRetryDelay(attempts), id, owner.tenantId, owner.agentId);
-  return attempts;
+  return { attempts, dropped: false };
+}
+
+/**
+ * The model a child's call runs on, as decided at that call, recorded when it moved: the note its next report carries.
+ * Returns whether it moved (and what from), or null when it did not.
+ */
+export function noteSubagentModel(sql: Sql, owner: SubagentOwner, s: Pick<Subagent, "id" | "modelNow" | "turns">, now: string | null, why: string): { from: string | null } | null {
+  if (s.modelNow === now) return null;
+  const said = (m: string | null) => m ?? "the agent's own model";
+  sql.exec("UPDATE subagents SET model_now = ?, report_note = ? WHERE id = ? AND tenant_id = ? AND agent_id = ?",
+    now, `From turn ${s.turns} it ran on ${said(now)}, not ${said(s.modelNow)}: ${why}.`, s.id, owner.tenantId, owner.agentId);
+  return { from: s.modelNow };
 }
 
 /** Milliseconds until the soonest owed report may be tried again, or null when none waits. */
@@ -178,7 +212,7 @@ export function reportRetryMs(sql: Sql, owner: SubagentOwner, now = Date.now()):
 
 /** The `subagent.turn` trace row for one child turn's end (cf/src/runtime.ts): its span the child, its parent the call that sent the turn. */
 export function subagentTurnRow(owner: SubagentOwner, s: Pick<Subagent, "id" | "callId" | "parentSession" | "turns" | "turnStartedAt" | "modelOption">,
-  status: SubagentOutcome | "report_failed", now: number, extra: Record<string, unknown> = {}) {
+  status: SubagentOutcome | "report_dropped", now: number, extra: Record<string, unknown> = {}) {
   return {
     at: now, tenantId: owner.tenantId, agentId: owner.agentId, kind: "subagent.turn" as const, spanId: s.id, ...(s.callId ? { parentId: s.callId } : {}),
     status, verdict: (status === "done" ? "ok" : status === "cancelled" || status === "stopped" ? "cancelled" : "failed") as "ok" | "cancelled" | "failed",
@@ -228,9 +262,9 @@ export function recordSubagent(sql: Sql, owner: SubagentOwner, s: {
 }) {
   ensureSubagentTable(sql);
   sql.exec(
-    "INSERT INTO subagents(id, tenant_id, agent_id, parent_session, call_id, model_option, provider, model, state, turn_op, turns, created_at, turn_started_at, turn_key) " +
-    "VALUES (?,?,?,?,?,?,?,?, 'running', ?, 1, ?, ?, ?)",
-    s.id, owner.tenantId, owner.agentId, s.parentSession, s.callId, s.modelOption, s.provider, s.model, s.turnOp, s.now, s.now, s.turnKey);
+    "INSERT INTO subagents(id, tenant_id, agent_id, parent_session, call_id, model_option, provider, model, state, turn_op, turns, created_at, turn_started_at, turn_key, model_now) " +
+    "VALUES (?,?,?,?,?,?,?,?, 'running', ?, 1, ?, ?, ?, ?)",
+    s.id, owner.tenantId, owner.agentId, s.parentSession, s.callId, s.modelOption, s.provider, s.model, s.turnOp, s.now, s.now, s.turnKey, s.model);
 }
 
 /** A follow-up's turn: running again, with its own operation and the call that sent it. */
@@ -240,9 +274,9 @@ export function startSubagentTurn(sql: Sql, owner: SubagentOwner, id: string, t:
 }) {
   sql.exec(
     "UPDATE subagents SET state = 'running', turn_op = ?, call_id = ?, turn_key = ?, turns = turns + 1, turn_started_at = ?, finished_at = NULL, outcome = NULL, report = NULL, report_attempts = 0, report_retry_at = NULL" +
-    (t.model ? ", model_option = ?, provider = ?, model = ?" : "") +
+    (t.model ? ", model_option = ?, provider = ?, model = ?, model_now = ?" : "") +
     " WHERE id = ? AND tenant_id = ? AND agent_id = ?",
-    t.turnOp, t.callId, t.turnKey ?? null, t.now, ...(t.model ? [t.model.option, t.model.provider, t.model.model] : []), id, owner.tenantId, owner.agentId);
+    t.turnOp, t.callId, t.turnKey ?? null, t.now, ...(t.model ? [t.model.option, t.model.provider, t.model.model, t.model.model] : []), id, owner.tenantId, owner.agentId);
 }
 
 /** The engine's id for the turn just started, once `say` has answered with it. */
@@ -257,7 +291,7 @@ export function setSubagentTurnOp(sql: Sql, owner: SubagentOwner, id: string, tu
 export function finishSubagentTurn(sql: Sql, owner: SubagentOwner, id: string, outcome: SubagentOutcome, now = Date.now(), report: string | null = null): boolean {
   const before = sql.exec("SELECT state FROM subagents WHERE id = ? AND tenant_id = ? AND agent_id = ?", id, owner.tenantId, owner.agentId).toArray()[0] as any;
   if (!before || before.state !== "running") return false;
-  sql.exec("UPDATE subagents SET state = ?, finished_at = ?, outcome = ?, report = ? WHERE id = ? AND tenant_id = ? AND agent_id = ? AND state = 'running'",
+  sql.exec("UPDATE subagents SET state = ?, finished_at = ?, outcome = ?, report = ?, report_note = NULL WHERE id = ? AND tenant_id = ? AND agent_id = ? AND state = 'running'",
     report === null ? "idle" : "reporting", now, outcome, report, id, owner.tenantId, owner.agentId);
   return true;
 }
@@ -376,10 +410,10 @@ function textOf(message: { content?: unknown }): string {
  * The message that wakes the parent when a child's turn ends. Plain text, so every lane mode accepts it; the head says
  * whose it is, as a background completion's does, so a report is not taken for the person asking for something.
  */
-export function reportMessage(s: Pick<Subagent, "id" | "turnStartedAt" | "turns">, end: TurnEnd, now = Date.now()): string {
+export function reportMessage(s: Pick<Subagent, "id" | "turnStartedAt" | "turns"> & { reportNote?: string | null }, end: TurnEnd, now = Date.now()): string {
   const secs = Math.round((now - s.turnStartedAt) / 1000);
   const head = `[subagent ${s.id} — ${end.outcome} after ${secs}s (${reportKey(s)}); its report, a notice from the harness, not a message from the user. ` +
-    `${SUBAGENT_TOOL} with agent "${s.id}" sends it a follow-up.]`;
+    `${SUBAGENT_TOOL} with agent "${s.id}" sends it a follow-up.${s.reportNote ? ` ${s.reportNote}` : ""}]`;
   if (end.outcome === "done") {
     const text = end.text.length > REPORT_MAX_CHARS
       ? `${end.text.slice(0, REPORT_MAX_CHARS)}\n[cut at ${REPORT_MAX_CHARS} of ${end.text.length} characters]` : end.text;
