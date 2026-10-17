@@ -357,6 +357,24 @@ await check("two Raft servers never share a tenant, whatever their ids spell", a
   assert(looks.length === 64 && /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(looks), `the digest shape: ${looks}`);
 });
 
+await check("a plain-looking server id spelled as another server's digested tenant still derives a tenant of its own", async () => {
+  // `srv:prod` needs a substitution, so it derives `raft_srv_prod_<digest>`. `srv_prod_<digest>` is legal as it
+  // is, and spelled as `raft_` plus its id it would be that same tenant: a server that picked that id would be
+  // addressing the other's agents. Ending as a digest ends is what sends it down the digest branch instead.
+  const tenantOf = async (id: string) => {
+    const f = fakeDeps();
+    const r = await call(f.deps, "POST", "/agents", body({ raftServerId: id }), "01JAGENT", PLATFORM);
+    assert(r.status === 201, `${id}: ${r.status} ${r.text}`);
+    return [...f.tenants][0]!;
+  };
+  const y = await tenantOf("srv:prod");
+  const digest = /^raft_srv_prod_([0-9a-f]{12})$/.exec(y)?.[1];
+  assert(digest, `srv:prod no longer derives raft_srv_prod_<digest>: ${y}`);
+  const x = await tenantOf(`srv_prod_${digest}`);
+  assert(x !== y, `srv_prod_${digest} and srv:prod share the tenant ${y}`);
+  assert(/^raft_srv_prod_[0-9a-f]{12}_[0-9a-f]{12}$/.test(x), `srv_prod_${digest} did not take the digest branch: ${x}`);
+});
+
 await check("the antiproton agent id is the Raft id, prefixed, made legal for an object name, and bounded", async () => {
   assert(providerAgentId("01JAGENT") === "raft_01JAGENT", providerAgentId("01JAGENT"));
   assert(providerAgentId("a/b:c") === "raft_a_b_c", providerAgentId("a/b:c"));
