@@ -764,19 +764,31 @@ send_to_agent { task: string, agent?: string, model?: string }
 - **Depth 1.** A subagent is never offered `send_to_agent`, nor an Agents API caller's functions. It has the agent's
   other tools: its mounts, `run_js`, `jobs`. Mounts, containers and files are the agent's, so a subagent works in the
   same workspace as its parent.
+- **It does not speak as the agent.** A plugin whose writes act outward as the agent declares `speaksAs: "agent"`
+  ([docs/plugins.md](plugins.md); `raft` does). A subagent is offered that plugin's reads and none of its declared
+  writes — no message, reply, reaction or task change in Raft — and a call to one, a program's included, is refused
+  with `subagent_cannot_speak`. What it would have sent goes in its report, and the agent decides.
+- **Replay-safe.** The tool is `replay: "safe"`: a call cut off by an isolate dying runs again, on either engine. The
+  child's id is derived from the call (the conversation, the call's invocation — pi085's invocation id, pd's tool task —
+  and its call id), so the second run finds the child the first one made, the task is posted once, and the parent is
+  told `started` for the one child that exists.
 
 **Reports.** When a subagent's turn ends, its last answer is posted to the conversation that started it as a message,
 which wakes that conversation as a background job's completion does:
 
 ```
-[subagent sub_… — done after 42s; its report, a notice from the harness, not a message from the user. send_to_agent with agent "sub_…" sends it a follow-up.]
+[subagent sub_… — done after 42s (report sub_…/1); its report, a notice from the harness, not a message from the user. send_to_agent with agent "sub_…" sends it a follow-up.]
 <the subagent's final answer>
 ```
 
 `failed` carries the error (a model call that failed, a run that ended without an answer); `cancelled` is a turn
 past the 30-minute ceiling, cancelled by the agent's next pass. A report is cut at 20,000 characters. A turn's end is
 read from what the engine committed when the run ended (pi085's run result, pd's settled submission), so a report is
-delivered by the first pass after it, whether or not the object was evicted or restarted meanwhile. A background job a
+delivered by the first pass after it, whether or not the object was evicted or restarted meanwhile. It is delivered
+exactly once: the report is decided and kept on the subagent's row, posted unless the parent's conversation already
+holds its key (`report sub_…/<turn>`: on pd a submission under that request id, on pi085 an entry or queued input
+carrying it), and the row is marked delivered after the post. A crash before the post leaves it owed and the next pass
+posts it; a crash after leaves it owed and already there, and the next pass only marks it. A background job a
 subagent started that ends after its report starts another turn of the subagent, which reports in turn.
 
 **Stopping.** A stop of the agent — the provider's [stop](#stopping-a-turn-stop), a delete, `/admin/cancel-turn` —
@@ -794,8 +806,9 @@ spend limits like any other. Its share is visible in the trace: its `model.call`
 **Known limits.** On pi085 a subagent's conversation has no compaction and no overflow backstop (both are the main
 conversation's), so a subagent's task must fit one context window. On pd every conversation's tools are opened when a
 cold isolate first drives the harness, so an agent with many past subagents pays for opening each of them then. A
-subagent has the agent's messaging tools; it is told that its final answer goes to the agent and not to message anyone
-unless the task says to, and nothing more enforces it.
+plugin that writes as the agent and does not declare `speaksAs` is not withheld; only `raft` declares it today. There is
+no route or tool that stops one subagent alone. On pd the context window a subagent runs in is the agent's model's, not
+its model option's.
 
 ## Evaluation setup (preview only)
 

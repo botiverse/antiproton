@@ -366,6 +366,16 @@ each one offers rather than by looking for the id `sandbox`, so a second
 plugin that can run a container is chosen without the kernel learning its
 name.
 
+**Declare `speaksAs: "agent"` when the plugin's writes act as the agent.** A
+write of such a plugin is the agent itself acting where other people see it — a
+message, a reply, a reaction, a task change. Only the agent's own conversations
+may do that: a subagent's (docs/agent-surface.md, "Subagents") is offered the
+plugin's reads only, and its call to a tool the plugin declares
+`sideEffects: "write"`, a program's included, is refused at dispatch. The tool's
+declared `sideEffects` decides, never a list of names, so a write the plugin adds
+later is covered. `raft` declares it. A plugin whose writes act on things rather
+than as anyone (a container, a store) leaves it out, and a subagent has its writes.
+
 **Declare `sandboxForm` when the service has a command-line tool.** It says
 what a mount of the plugin becomes inside the agent's container: the environment
 variables the tool reads, the headers it sends the credential in, and the hosts
