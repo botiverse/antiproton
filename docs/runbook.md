@@ -117,22 +117,54 @@ row to the agent's trace.
 
 ## Subagents
 
-An agent can delegate work to subagents (docs/agent-surface.md, "Subagents") only where its `subagents` setting is on.
-It is off for every agent unless set. Subagents can read and research but cannot change anything or act as this agent: no writes, no messages, no shell. Give them reading tasks and do the changes yourself. Turn it on for one agent:
+Every hosted agent can delegate work to subagents (docs/agent-surface.md, "Subagents"), its Agents API sessions
+included. Subagents can read and research but cannot change anything or act as this agent: no writes, no messages, no
+shell. Give them reading tasks and do the changes yourself. The bench tenant's agents and evaluation agents provisioned
+with an explicit tool choice have them only where their setting turns them on (`harness: "minimal"` never), so a deploy
+changes no measurement.
+
+**Kill switches.** For one agent, turn its setting off:
 
 ```
 curl -s -X PATCH -H "x-harness-token: $AUTOMATION_TOKEN" -H "content-type: application/json" \
-  "$HOST/admin/agent-settings" -d '{"tenantId":"<tenantId>","agentId":"<agentId>","settings":{"subagents":true}}'
+  "$HOST/admin/agent-settings" -d '{"tenantId":"<tenantId>","agentId":"<agentId>","settings":{"subagents":false}}'
 ```
 
-The answer is the settings in force, what moved, and what each setting does: `{"settings":{"subagents":true},
-"changed":["subagents"],"about":{"subagents":"…"}}`. The
-agent's next turn is offered `send_to_agent`; a turn already running keeps the tools it started with. Off again is the
-same call with `false`. **Turning it off does not stop subagents already running**: they finish and report. To stop
+For every agent of the deployment at once, set the Worker var `SUBAGENTS_DISABLED` to `1` (a var, not a code change:
+`wrangler deploy --var SUBAGENTS_DISABLED:1`, or the dashboard's variables); unset it to undo. The var beats any agent's
+setting. The answer is the settings in force, what moved, and what each setting does: `{"settings":{"subagents":false},
+"changed":["subagents"],"disabledEverywhere":false,"about":{"subagents":"…"}}`; the GET also says `stored` and
+`defaults`. Either switch stops **new** children at once: a turn already running is refused at its next `send_to_agent`
+call (a start or a follow-up), and a finished child's background completion no longer starts a turn of it. It also stops
+the children **already running**: each is marked stopped and its run cancelled, and its parent gets one notice for all of
+them ("subagents were switched off for this agent; N running children were stopped: …"). The parent's own turn goes on.
+The setting does this when it is written (the answer then says `stoppedSubagents`); the var, at each agent's next pass,
+which comes at least every 5 minutes while a child runs. A report already owed when the switch is set is still
+delivered. On again is the same call with `true`.
+
+An Agents API caller that declares its own function named `send_to_agent` keeps it: the agent is then not offered its
+own `send_to_agent` (a `subagent.tool_shadowed` log line says so). **Turning it off does not stop subagents already running**: they finish and report. To stop
 them, stop the agent's turn with `/admin/cancel-turn` ([Stopping a runaway agent](#stopping-a-runaway-agent)), which
 stops every subagent with it. An unknown setting or a value that is not a
 boolean is `400` and nothing is written; an agent that is not there is `404`. Each change is an `agent.settings` line in
 the Workers logs.
+
+**Measuring a trial.** `cf/scripts/subagent-trial.mjs` reads an agent's trace export from R2 and prints, per UTC day and
+in total, the model calls and tokens of its own conversations and of its subagents, the main conversation's input
+tokens per call (median and p90: its context's growth), rebuilds that ran, delegations (spawns, follow-ups, wakes),
+child turns by outcome, and report sizes. Read-only; needs `CF_API_TOKEN` (R2 read) and `R2_ACCOUNT_ID`, as
+`~/.secrets/antiproton.env` has them:
+
+```
+node cf/scripts/subagent-trial.mjs [--preview] --tenant <tenantId> --agent <agentId> --from 2026-10-20 --to 2026-10-27 [--json]
+```
+
+Rows still in the agent's outbox (the last pass's) are not exported yet. `--file rows.ndjson` reads rows saved
+elsewhere (the preview trace route's page works too). Compare a window before the agent had subagents with one after.
+
+**Raft activity.** A subagent's work reaches Raft's activity log only where the Worker var `SUBAGENT_ACTIVITY` is `1`
+(docs/agent-surface.md, "Subagents", Raft). Leave it unset until Raft's ingest accepts the subagent fields: it strips
+fields it does not know, and a child's step would then read as the agent's own.
 
 To see an agent's subagents and the setting:
 
@@ -163,7 +195,9 @@ the subagents that session started, and deleting the session stops them first an
 Each pass also cancels any subagent session that has work while nothing tracks it — no row, or a row a stop ended (a
 run that landed as the stop did) — logged as `subagent.stray`. A finished subagent's own background job is not that:
 it runs to its end, and its completion wakes the subagent under its limits. A subagent lives at most 2 hours from its creation and takes at most 10 turns;
-each turn is cancelled after 30 minutes. A report whose post fails stays owed and is retried with backoff (5 s doubling
+each turn is cancelled after 30 minutes. A finished subagent is archived after 7 days idle (its transcript deleted, its
+row kept with state `archived`; a `subagent.archived` log line each), at most 5 a pass. A bench task's end
+(`benchSweFinish`) stops its subagents as a stop does. A report whose post fails stays owed and is retried with backoff (5 s doubling
 to 10 minutes), each failure a `subagent.turn` row with status `report_failed`; after 8 attempts it is dropped
 (`report_dropped`) and the subagent is idle with outcome `report_failed`. A subagent whose model option a pin or the
 picker switch overrides after its spawn writes a `subagent.model_changed` row, and its next report says so.

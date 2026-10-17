@@ -71,6 +71,9 @@ const TABLE = "CREATE TABLE IF NOT EXISTS trace_outbox(" +
 // `subagent.turn` is one turn of a subagent ending (src/runtime/subagents.ts, cf/src/runtime.ts `#reportSubagents`): its
 // span the child's session, its parent the tool call that sent the turn, `status` done, failed, cancelled; `attrs` the
 // session that started it. The child's own `model.call` and `tool.call` rows name its session. Activity and status skip it.
+// `subagent.start` is a child's turn beginning (cf/src/runtime.ts `#sendToAgent`, a background wake): span the child,
+// parent the tool call that sent it (none for a wake), `attrs` the session that started it, the turn, and `how` (`spawn`,
+// `follow_up`, `wake`). Ids and counts only, never the task. Activity and status skip it unless SUBAGENT_ACTIVITY is on.
 // `subagent.model_changed` is a child's calls moving to another model since its spawn (a pin or a picker switch set
 // since, cf/src/runtime.ts `takeJob`): span the child, `attrs` from, to and why. Activity and status skip it.
 // The rest are the kinds a plugin may write itself, through `PluginContext.trace` (`PLUGIN_TRACE_KINDS`). Activity and
@@ -79,7 +82,7 @@ const TABLE = "CREATE TABLE IF NOT EXISTS trace_outbox(" +
 export const TRACE_KINDS = ["model.call", "tool.call", "approval.wait", "container.lease", "inbound", "mount.seeded", "harness.open",
   "turn.stop", "js.run",
   "rebuild.decision", "rebuild.outcome", "rebuild.behaviour", "session.needs_reset", "turn.timing", "import.hold", "model.prewarm",
-  "agent.ready", "mount.settings", "subagent.turn", "subagent.model_changed", "raft.held", "raft.held_answer", "raft.state_failed", "raft.state_save_failed"] as const;
+  "agent.ready", "mount.settings", "subagent.start", "subagent.turn", "subagent.model_changed", "raft.held", "raft.held_answer", "raft.state_failed", "raft.state_save_failed"] as const;
 export type TraceKind = (typeof TRACE_KINDS)[number];
 
 /**

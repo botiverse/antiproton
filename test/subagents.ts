@@ -18,7 +18,9 @@ import { pendingTrace } from "../src/trace/outbox.ts";
 import { activityEvents } from "../src/runtime/activity.ts";
 import { statusEvents } from "../src/runtime/status.ts";
 import { SUBAGENT_CAP, SUBAGENT_TOOL, admitSubagent, turnEnd } from "../src/runtime/subagents.ts";
-import { updateAgentSettings, agentSettings } from "../src/runtime/agent-settings.ts";
+import { updateAgentSettings, agentSettings, subagentsDisabledBy } from "../src/runtime/agent-settings.ts";
+import { subagentActivityFor } from "../cf/src/activity-raft.ts";
+import { DELEGATE_GUIDANCE, subagentTool } from "../src/runtime/subagents.ts";
 import { recordBackgroundJob } from "../src/runtime/background-jobs.ts";
 import type { Plugin } from "../src/plugins/types.ts";
 import { raftPlugin } from "../src/plugins/raft.ts";
@@ -31,6 +33,7 @@ import { returnPendingBriefing, takePendingBriefing, readBackstop } from "../src
 import { subagentModelChoice } from "../cf/src/model-request.ts";
 import { savesState } from "../src/plugins/raft.ts";
 import { SUBAGENT_MAX_TURNS, SUBAGENT_LIFETIME_MS, REPORT_MAX_ATTEMPTS, recordSubagent } from "../src/runtime/subagents.ts";
+import { REPORT_MAX_CHARS, reportBodyChars, reportMessage } from "../src/runtime/subagents.ts";
 
 const logs: any[] = [];
 setLogSink((line) => { try { logs.push(JSON.parse(line)); } catch { /* not ours */ } });
@@ -85,7 +88,7 @@ const USER_MODELS = { offered: [{ id: "cheap", label: "Cheap", provider: "deepse
 
 /** One agent on an AgentRuntime over node:sqlite, its object recording `engine`, its `subagents` setting as given. */
 type Rules = { layers: { agent: any; tenant: any; deployment: any; owner: string | null }; pickerOff: boolean };
-async function world(engine: "pi085" | "pd", opts: { on?: boolean; builder?: boolean; chatter?: boolean; sandbox?: boolean; rulesTtlMs?: number; slowBuilder?: number } = {}) {
+async function world(engine: "pi085" | "pd", opts: { on?: boolean; builder?: boolean; chatter?: boolean; sandbox?: boolean; rulesTtlMs?: number; slowBuilder?: number; retentionMs?: number; defaultOn?: boolean; disabled?: boolean } = {}) {
   const rules: { now: Rules | null; reads: number; fail: boolean } = { now: null, reads: 0, fail: false };
   const raw = sqliteHost();
   if (engine === "pd") {
@@ -95,6 +98,7 @@ async function world(engine: "pi085" | "pd", opts: { on?: boolean; builder?: boo
   }
   const sent: string[] = [];
   const fault = { at: null as null | ((phase: string, id: string) => void | Promise<void>) };
+  const killAll = { on: false };
   const standIn = standInLoader();
   // A mount whose background work ends only at the `slowBuilder`-th poll; `slow.polls` and `slow.cancelled` say what it saw.
   const slow = { polls: 0, cancelled: 0 };
@@ -117,6 +121,10 @@ async function world(engine: "pi085" | "pd", opts: { on?: boolean; builder?: boo
       return rules.now ?? { layers: { agent: null, tenant: null, deployment: null, owner: null }, pickerOff: false };
     },
     subagentRulesTtlMs: opts.rulesTtlMs ?? 0,
+    ...(opts.retentionMs !== undefined ? { subagentRetentionMs: opts.retentionMs } : {}),
+    ...(opts.defaultOn ? { subagentsDefault: true } : {}),
+    // Read at each use, so a case can set the deployment's kill switch while a turn runs.
+    get subagentsDisabled() { return opts.disabled === true || killAll.on; },
     ...(opts.sandbox ? { loader: standIn.loader, makeToolBinding: standIn.makeToolBinding } : {}),
     ctx: { storage: { sql: raw.sql, transactionSync: raw.transactionSync } },
     bucket: {} as never, bucketName: "b", models: { resolve: () => null },
@@ -125,7 +133,7 @@ async function world(engine: "pi085" | "pd", opts: { on?: boolean; builder?: boo
     offloadModel: async (job: { commandId: string }) => { sent.push(job.commandId); },
   } as never);
   const w = {
-    raw, sent, engine, rt: isolate(), isolate, fault, rules, slow,
+    raw, sent, engine, rt: isolate(), isolate, fault, rules, slow, killAll,
     answered: new Set<string>(),
     /** Jobs `reply` chose to leave out, for now. */
     held: new Set<string>(),
@@ -142,7 +150,10 @@ async function world(engine: "pi085" | "pd", opts: { on?: boolean; builder?: boo
     must((await w.rt.addMount("t", "a", { alias, plugin: id, config: {} })).ok, `the ${id} mount was refused`);
   }
   await w.rt.bindOperatorModel("t", "a");
-  if (opts.on !== false) must(updateAgentSettings(raw.sql as never, { subagents: true }, "test").ok, "setting refused");
+  // `on`: true stores the setting (the default for these cases), false stores the per-agent kill switch, and with
+  // `defaultOn` nothing is stored, so the runtime's default decides.
+  if (!opts.defaultOn && opts.on !== false) must(updateAgentSettings(raw.sql as never, { subagents: true }, "test").ok, "setting refused");
+  if (opts.defaultOn && opts.on === false) must(updateAgentSettings(raw.sql as never, { subagents: false }, "test").ok, "setting refused");
   return w;
 }
 type World = Awaited<ReturnType<typeof world>>;
@@ -206,7 +217,9 @@ const reports = async (w: World, session = "main") => (await mainTexts(w, "user"
   .flatMap((t) => t.split(/(?=\[subagent sub_)/).filter((b) => b.startsWith("[subagent ")));
 /** The messages that carried reports. */
 const reportMessages = async (w: World, session = "main") => (await mainTexts(w, "user", session)).filter((t) => /^\[(subagent |\d+ subagent reports)/.test(t));
-const rowsOf = (w: World) => w.raw.sql.exec("SELECT * FROM subagents ORDER BY created_at, id").toArray() as any[];
+/** The subagents table, oldest first; none before the first child made it. */
+const rowsOf = (w: World) => w.raw.sql.exec("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'subagents'").toArray().length === 0 ? []
+  : w.raw.sql.exec("SELECT * FROM subagents ORDER BY created_at, id").toArray() as any[];
 const toolNames = (req: Req) => (req.tools ?? []).map((t: any) => t.name ?? t.function?.name);
 const taskOf = (req: Req) => {
   const u = req.messages.filter((m: any) => m.role === "user").map((m: any) => typeof m.content === "string" ? m.content : m.content.map((p: any) => p.text ?? "").join(""));
@@ -1012,6 +1025,504 @@ for (const engine of (process.env.ENGINES ?? "pi085,pd").split(",").filter((e) =
     must(await w.rt.agentSettingsOf("t", "a") === null, "the deleted agent's settings still answer");
   });
 
+  await check(`${engine}: a turn whose engine id was never recorded (a queued post) is read from the session: reported done, not held to the ceiling`, async () => {
+    const w = await world(engine);
+    let parentCalls = 0, release = false;
+    w.reply = (session) => session === "main" ? (++parentCalls === 1 ? calls({ id: "c1", args: { task: "t" } }) : say("ok")) : release ? say("answered all the same") : null;
+    await w.rt.postMessage("t", "a", "go", "prompt", "main");
+    for (let i = 0; i < 6; i++) await pass(w);
+    // What a post that was queued rather than started leaves: a running row with no engine id for its turn.
+    w.raw.sql.exec("UPDATE subagents SET turn_op = NULL");
+    release = true;
+    await settle(w);
+    const row = rowsOf(w)[0]!;
+    must(row.state === "idle" && row.outcome === "done", `the turn was not read from the session: ${show(row)}`);
+    const rs = await reports(w);
+    must(rs.length === 1 && rs[0]!.includes("answered all the same") && / done after /.test(rs[0]!), show(rs));
+  });
+
+  await check(`${engine}: a background completion that cannot be posted frees the child's slot at once: no turn, no report, no false cancel`, async () => {
+    const w = await world(engine, { builder: true });
+    let parentCalls = 0;
+    w.reply = (session) => session === "main" ? (++parentCalls === 1 ? calls({ id: "c1", args: { task: "t" } }) : say("ok")) : say("first answer");
+    await w.rt.postMessage("t", "a", "go", "prompt", "main");
+    await settle(w);
+    const child = rowsOf(w)[0]!.id as string;
+    recordBackgroundJob(w.raw.sql as never, { tenantId: "t", agentId: "a" }, { id: "op_bgw", session: child, mount: "builder", tool: "builder__build", handle: {} }, Date.now());
+    w.raw.sql.exec("UPDATE background_jobs SET next_poll_at = 0 WHERE id = 'op_bgw'");
+    w.fault.at = (p) => { if (p === "wake-posting") throw new Error("the child's lane said no"); };
+    await w.rt.step("t", "a");
+    const row = rowsOf(w)[0]!;
+    must(row.state === "idle" && row.outcome === "failed" && row.turns === 2, `the slot is still held: ${show(row)}`);
+    must(trace(w).some((r) => r.kind === "subagent.turn" && r.status === "wake_failed" && r.attrs.why === "its background completion could not be delivered"), "no trace row");
+    // A turn that never started has no end: Raft gets as many SubagentStops as SubagentStarts.
+    const ev = activityEvents("a", trace(w), subagentActivityFor(w.raw.sql as never, { SUBAGENT_ACTIVITY: "1" }));
+    const n = (name: string) => ev.filter((e) => e.hookEventName === name).length;
+    must(n("SubagentStart") === 1 && n("SubagentStop") === 1, `starts ${n("SubagentStart")}, stops ${n("SubagentStop")}`);
+    w.fault.at = null;
+    await settle(w);
+    must((await reports(w)).length === 1, `a report for a turn that never ran: ${show(await reports(w))}`);
+  });
+
+  await check(`${engine}: retention archives a finished child after its time: its transcript goes, its row stays, a follow-up is refused`, async () => {
+    const w = await world(engine, { retentionMs: 60_000 });
+    let parentCalls = 0, child: string | null = null;
+    w.reply = (session, req) => {
+      if (session === "main") {
+        parentCalls++;
+        if (parentCalls === 1) return calls({ id: "c1", args: { task: "t" } });
+        const last = req.messages.at(-1) as any;
+        if (child && last?.role === "user" && JSON.stringify(last.content).includes("and now")) return calls({ id: "c2", args: { task: "more", agent: child } });
+        return say("ok");
+      }
+      return say("done");
+    };
+    await w.rt.postMessage("t", "a", "go", "prompt", "main");
+    await settle(w);
+    child = rowsOf(w)[0]!.id as string;
+    const tablesOf = () => w.raw.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'pi_s_%'").toArray().map((r: any) => String(r.name)).filter((n) => n.includes(child!.slice(4).toLowerCase()));
+    const listed = () => engine === "pd" ? w.raw.sql.exec("SELECT 1 FROM ap_conversations WHERE task_id = ?", child).toArray().length : tablesOf().length;
+    must(listed() > 0, "control: the child has nothing to delete");
+    const lineageRows = () => w.raw.sql.exec("SELECT 1 FROM subagent_turns WHERE id = ?", child).toArray().length;
+    must(lineageRows() > 0, "control: the child has no lineage rows");
+    // Not yet: finished just now.
+    await w.rt.step("t", "a");
+    must(rowsOf(w)[0]!.state === "idle", "archived before its time");
+    w.raw.sql.exec("UPDATE subagents SET finished_at = ? WHERE id = ?", Date.now() - 120_000, child);
+    await w.rt.step("t", "a");
+    must(rowsOf(w)[0]!.state === "archived" && listed() === 0, `not archived: ${show(rowsOf(w)[0])}, ${listed()} left`);
+    must(lineageRows() === 0, `its lineage stayed: ${lineageRows()} rows`);
+    if (engine === "pi085") must(w.raw.sql.exec("SELECT 1 FROM pi_sessions WHERE session = ?", child).toArray().length === 0, "its session row stayed");
+    await w.rt.postMessage("t", "a", "and now", "prompt", "main");
+    await settle(w);
+    const results = w.requests.filter((r) => r.session === "main").flatMap((r) => r.req.messages.filter((m: any) => m.role === "tool")).map((m: any) => typeof m.content === "string" ? m.content : JSON.stringify(m.content));
+    must(results.some((t) => /finished long ago and its transcript is gone/.test(t)), `the follow-up to an archived child: ${show(results.slice(-1))}`);
+  });
+
+  await check(`${engine}: retention keeps a child that owes a report or has a job running, and archives at most five a pass`, async () => {
+    const w = await world(engine, { retentionMs: 60_000 });
+    const old = Date.now() - 3_600_000;
+    for (let i = 0; i < 9; i++) {
+      const id = `sub_${String(i).padStart(16, "0")}`;
+      recordSubagent(w.raw.sql as never, { tenantId: "t", agentId: "a" }, { id, parentSession: "main", callId: `c${i}`, modelOption: null, provider: null, model: null, turnOp: "1", turnKey: null, now: old });
+      w.raw.sql.exec("UPDATE subagents SET state = 'idle', outcome = 'done', finished_at = ? WHERE id = ?", old, id);
+    }
+    // One owes a report, one has its own background job still running.
+    w.raw.sql.exec("UPDATE subagents SET state = 'reporting', report = 'r' WHERE id = 'sub_0000000000000000'");
+    recordBackgroundJob(w.raw.sql as never, { tenantId: "t", agentId: "a" }, { id: "op_keep", session: "sub_0000000000000001", mount: "x", tool: "x__y", handle: {} }, Date.now());
+    w.raw.sql.exec("UPDATE background_jobs SET next_poll_at = ? WHERE id = 'op_keep'", Date.now() + 3_600_000);
+    w.raw.sql.exec("UPDATE subagents SET report_retry_at = ? WHERE state = 'reporting'", Date.now() + 3_600_000);
+    const archived = () => rowsOf(w).filter((r) => r.state === "archived").map((r) => r.id);
+    await w.rt.step("t", "a");
+    must(archived().length === 5, `one pass archived ${archived().length}`);
+    await w.rt.step("t", "a");
+    must(archived().length === 7 && !archived().includes("sub_0000000000000000") && !archived().includes("sub_0000000000000001"), show(archived()));
+  });
+
+  await check(`${engine}: a finished child's harness is not kept in the isolate`, async () => {
+    const w = await world(engine);
+    let parentCalls = 0;
+    w.reply = (session) => session === "main" ? (++parentCalls === 1 ? calls({ id: "c1", args: { task: "t" } }) : say("ok")) : say("done");
+    await w.rt.postMessage("t", "a", "go", "prompt", "main");
+    await settle(w);
+    const child = rowsOf(w)[0]!.id as string;
+    const opens = () => trace(w).filter((r) => r.kind === "harness.open" && String(r.spanId).includes(`#${child}@`)).length;
+    const before = opens();
+    await w.rt.agent("t", "a", child);
+    must(opens() === before + 1, `the finished child's harness was still cached (${opens() - before} new opens)`);
+  });
+
+  await check(`${engine}: follow-ups cannot carry a child past its lifetime or its turns`, async () => {
+    const w = await world(engine);
+    let parentCalls = 0, child: string | null = null;
+    w.reply = (session, req) => {
+      if (session === "main") {
+        parentCalls++;
+        if (parentCalls === 1) return calls({ id: "c1", args: { task: "t" } });
+        const last = req.messages.at(-1) as any;
+        if (child && last?.role === "user" && JSON.stringify(last.content).includes("again")) return calls({ id: `f${parentCalls}`, args: { task: "more", agent: child } });
+        return say("ok");
+      }
+      return say("done");
+    };
+    await w.rt.postMessage("t", "a", "go", "prompt", "main");
+    await settle(w);
+    child = rowsOf(w)[0]!.id as string;
+    const results = () => w.requests.filter((r) => r.session === "main").flatMap((r) => r.req.messages.filter((m: any) => m.role === "tool")).map((m: any) => typeof m.content === "string" ? m.content : JSON.stringify(m.content));
+    w.raw.sql.exec("UPDATE subagents SET created_at = ? WHERE id = ?", Date.now() - SUBAGENT_LIFETIME_MS - 1, child);
+    await w.rt.postMessage("t", "a", "again", "prompt", "main");
+    await settle(w);
+    must(results().some((t) => /takes no more tasks: it is older than 2 hours/.test(t)), `past its lifetime: ${show(results().slice(-1))}`);
+    w.raw.sql.exec("UPDATE subagents SET created_at = ?, turns = ? WHERE id = ?", Date.now(), SUBAGENT_MAX_TURNS, child);
+    await w.rt.postMessage("t", "a", "again", "prompt", "main");
+    await settle(w);
+    must(results().some((t) => /takes no more tasks: it has had 10 turns/.test(t)), `past its turns: ${show(results().slice(-1))}`);
+    must(rowsOf(w)[0]!.turns === SUBAGENT_MAX_TURNS, show(rowsOf(w)[0]));
+  });
+
+  await check(`${engine}: on by default for a hosted agent and its Agents API sessions; a stored false turns it off; the deployment's kill switch beats a stored true`, async () => {
+    const offered = async (w: World, session = "main") => (await (await w.rt.agent("t", "a", session)).tools()).some((t) => t.name === SUBAGENT_TOOL);
+    const on = await world(engine, { defaultOn: true });
+    must(await offered(on) && await offered(on, "sess_api") && !await offered(on, "sub_0000000000000000"), "not on by default (or a child got it)");
+    must((await on.rt.agentSettingsOf("t", "a"))!.settings.subagents === true, "the admin read does not say on");
+    const killed = await world(engine, { defaultOn: true, on: false });
+    must(!await offered(killed), "a stored false did not turn it off");
+    const everywhere = await world(engine, { disabled: true });
+    must(agentSettings(everywhere.raw.sql as never).subagents === true, "control: this agent's own setting is on");
+    must(!await offered(everywhere) && (await everywhere.rt.agentSettingsOf("t", "a"))!.disabledEverywhere === true, "the kill switch did not win");
+    must(subagentsDisabledBy({ SUBAGENTS_DISABLED: "1" }) && !subagentsDisabledBy({}) && !subagentsDisabledBy({ SUBAGENTS_DISABLED: "0" }) && !subagentsDisabledBy({ SUBAGENTS_DISABLED: "true" }), "the env switch");
+  });
+
+  await check(`${engine}: the trace carries what a trial compares: main context per call, tokens per session, delegations, child turns and report sizes`, async () => {
+    const w = await world(engine);
+    let parentCalls = 0, child: string | null = null;
+    w.reply = (session, req) => {
+      if (session === "main") {
+        parentCalls++;
+        if (parentCalls === 1) return calls({ id: "c_trial", args: { task: "read it" } });
+        const last = req.messages.at(-1) as any;
+        if (child && last?.role === "user" && JSON.stringify(last.content).includes("again")) return calls({ id: "c_trial2", args: { task: "more", agent: child } });
+        return say("ok");
+      }
+      return say("a short report");
+    };
+    await w.rt.postMessage("t", "a", "go", "prompt", "main");
+    await settle(w);
+    child = rowsOf(w)[0]!.id as string;
+    await w.rt.postMessage("t", "a", "again", "prompt", "main");
+    await settle(w);
+    const rows = trace(w);
+    const calls_ = rows.filter((r) => r.kind === "model.call");
+    must(calls_.every((r) => typeof r.attrs.session === "string" && typeof r.attrs.input === "number" && typeof r.attrs.output === "number"), `a model.call row without session or tokens: ${show(calls_.map((r) => r.attrs))}`);
+    const starts = rows.filter((r) => r.kind === "subagent.start");
+    must(starts.length === 2 && starts[0]!.status === "spawn" && starts[0]!.parentId === "c_trial" && starts[1]!.status === "follow_up" && starts[1]!.parentId === "c_trial2"
+      && starts.every((r) => r.spanId === child && r.attrs.parentSession === "main"), show(starts));
+    const ends = rows.filter((r) => r.kind === "subagent.turn" && r.status === "done");
+    const reportsNow = await reports(w);
+    // The body's length, not the head's: the report is its head line, then the child's answer.
+    must(reportsNow.length === 2 && reportsNow.every((t) => t.endsWith("\na short report")), `control: the reports: ${show(reportsNow)}`);
+    must(ends.length === 2 && ends.every((r) => r.attrs.reportChars === "a short report".length), `reportChars: ${show(ends.map((r) => r.attrs.reportChars))}`);
+    // Ids and counts only: neither the task nor the answer is in any of these rows.
+    must(!JSON.stringify([...starts, ...ends]).includes("read it") && !JSON.stringify(ends).includes("a short report"), "a row carries text");
+  });
+
+  await check(`${engine}: Raft subagent events: off, a child makes none at all; on, exactly SubagentStart, its steps, SubagentStop, and no text`, async () => {
+    const w = await world(engine, { chatter: true });
+    let parentCalls = 0, childCalls = 0;
+    w.reply = (session) => {
+      if (session === "main") return ++parentCalls === 1 ? calls({ id: "c_ev", args: { task: "SECRET TASK TEXT" } }) : say("ok");
+      return ++childCalls === 1 ? ({ text: "", finishReason: "tool_calls", truncated: false, usage: USAGE, toolCalls: [{ id: "k1", name: "chat__peek", arguments: {} }] } as ModelResponse) : say("SECRET REPORT TEXT");
+    };
+    await w.rt.postMessage("t", "a", "go", "prompt", "main");
+    await settle(w);
+    const child = rowsOf(w)[0]!.id as string;
+    const rows = trace(w);
+    must(rows.some((r) => r.kind === "tool.call" && r.attrs.task === child), "control: the child made no tool call");
+    // Off (the default): the events are what they were, none from or about the child.
+    must(subagentActivityFor(w.raw.sql as never, {}) === undefined && subagentActivityFor(w.raw.sql as never, { SUBAGENT_ACTIVITY: "0" }) === undefined, "the flag is not off by default");
+    const off = activityEvents("a", rows);
+    const parentOnly = activityEvents("a", rows.filter((r) => !(r.kind === "subagent.start" || r.kind === "subagent.turn" || r.attrs.session === child || r.attrs.task === child)));
+    must(show(off) === show(parentOnly) && !off.some((e) => e.subagent || e.hookEventName === "SubagentStart" || e.hookEventName === "SubagentStop"), `off, a child made events: ${show(off.filter((e) => !parentOnly.some((p) => p.eventId === e.eventId)))}`);
+    // On: the marker, the shape, the parent's own step for send_to_agent with no marker.
+    const on = activityEvents("a", rows, subagentActivityFor(w.raw.sql as never, { SUBAGENT_ACTIVITY: "1" }));
+    const marked = on.filter((e) => e.subagent);
+    const lin = { parentToolUseId: "c_ev", taskId: child };
+    const start = marked.filter((e) => e.hookEventName === "SubagentStart");
+    must(start.length === 1 && show(start[0]!.subagent) === show({ ...lin, phase: "started" }), `SubagentStart: ${show(start)}`);
+    const steps = marked.filter((e) => e.hookEventName === "PreToolUse" || e.hookEventName === "PostToolUse");
+    // Named as the agent's own steps are named (`hookEvents`: `<mount>__<tool>` from the row).
+    must(steps.length === 2 && steps.every((e) => /^chat__.*peek$/.test(String(e.toolName)) && show(e.subagent) === show({ ...lin, phase: "active" })), `child steps: ${show(steps)}`);
+    const stop = marked.filter((e) => e.hookEventName === "SubagentStop");
+    // Outcome and size inside the marker, nothing of them beside it (Raft drops unknown top-level fields).
+    const ended = stop[0]?.subagent as any;
+    must(stop.length === 1 && ended?.taskId === child && ended?.parentToolUseId === "c_ev" && ended?.phase === "ended" && ended?.outcome === "done"
+      && typeof ended?.reportChars === "number" && ended.reportChars > 0, `SubagentStop: ${show(stop)}`);
+    must(!("outcome" in stop[0]!) && !("reportChars" in stop[0]!), `outcome or reportChars at the top level: ${show(stop[0])}`);
+    must(show(Object.keys(ended).sort()) === show(["outcome", "parentToolUseId", "phase", "reportChars", "taskId"]), `the marker's keys: ${show(Object.keys(ended))}`);
+    must(!marked.some((e) => e.hookEventName === "Stop" || e.hookEventName === "UserPromptSubmit"), "a child's Stop or prompt");
+    const parentSend = on.filter((e) => !e.subagent && e.toolName === SUBAGENT_TOOL);
+    must(parentSend.length === 2 && parentSend.map((e) => e.hookEventName).join() === "PreToolUse,PostToolUse", `the parent's own send_to_agent step: ${show(parentSend)}`);
+    must(!JSON.stringify(on).includes("SECRET"), "an event carries task or report text");
+    must(marked.every((e) => e.status === undefined), "a child's event carries the agent's status");
+    must(show(on.filter((e) => !e.subagent && e.toolName !== SUBAGENT_TOOL)) === show(off), "turning it on changed the agent's own events");
+  });
+
+  for (const how of ["the agent's setting", "the deployment's kill switch"] as const) {
+    await check(`${engine}: ${how} set while a turn runs stops that turn starting children, and a completion waking one`, async () => {
+      const w = await world(engine, { builder: true });
+      const off = () => how === "the agent's setting" ? void updateAgentSettings(w.raw.sql as never, { subagents: false }, "test") : void (w.killAll.on = true);
+      let parentCalls = 0;
+      w.reply = (session) => {
+        if (session === "main") {
+          parentCalls++;
+          if (parentCalls === 1) return calls({ id: "c1", args: { task: "first" } });
+          // The switch is set now, between this turn's two spawns.
+          if (parentCalls === 2) { off(); return calls({ id: "c2", args: { task: "second" } }); }
+          return say("ok");
+        }
+        return say("done");
+      };
+      await w.rt.postMessage("t", "a", "go", "prompt", "main");
+      await settle(w);
+      must(rowsOf(w).length === 1, `a child was started after the switch: ${show(rowsOf(w))}`);
+      const results = w.requests.filter((r) => r.session === "main").flatMap((r) => r.req.messages.filter((m: any) => m.role === "tool"))
+        .map((m: any) => typeof m.content === "string" ? m.content : JSON.stringify(m.content));
+      must(results.some((t) => /subagents are switched off for this agent, so nothing was started/.test(t)), `not refused: ${show(results.slice(-1))}`);
+      // A background completion of the child that finished is not delivered: it would start a turn.
+      const child = rowsOf(w)[0]!.id as string;
+      const turns = rowsOf(w)[0]!.turns;
+      recordBackgroundJob(w.raw.sql as never, { tenantId: "t", agentId: "a" }, { id: "op_off", session: child, mount: "builder", tool: "builder__build", handle: {} }, Date.now());
+      w.raw.sql.exec("UPDATE background_jobs SET next_poll_at = 0 WHERE id = 'op_off'");
+      const sent = w.sent.length;
+      await w.rt.step("t", "a");
+      must(rowsOf(w)[0]!.turns === turns && w.sent.slice(sent).every((id) => sessionOfJob(w, id) !== child), "a completion started a turn while switched off");
+    });
+  }
+
+  await check(`${engine}: an Agents API caller's own function named send_to_agent is offered as theirs, and the agent's is not`, async () => {
+    const w = await world(engine);
+    await w.rt.store.updateAgentConfig("t", "a", { openai: { tools: [{ name: SUBAGENT_TOOL, description: "THE CALLER'S OWN", parameters: { type: "object", properties: {} } }] } } as never);
+    logs.length = 0;
+    const tools = await (await w.rt.agent("t", "a", "sess_api")).tools() as Array<{ name: string; description?: string }>;
+    const named = tools.filter((t) => t.name === SUBAGENT_TOOL);
+    must(named.length === 1, `${named.length} tools named ${SUBAGENT_TOOL}`);
+    const exported = await w.rt.offeredTools("t", "a");
+    const mine = exported!.tools.filter((t) => t.name === SUBAGENT_TOOL);
+    must(mine.length === 1 && mine[0]!.source === "caller" && mine[0]!.description === "THE CALLER'S OWN", `not the caller's: ${show(mine)}`);
+    must(logs.some((l) => l.evt === "subagent.tool_shadowed"), "the shadowing is not said");
+  });
+
+  await check(`${engine}: a flush behind a follow-up gives each child step the parent call of its own turn`, async () => {
+    const w = await world(engine, { chatter: true });
+    let parentCalls = 0, child: string | null = null, childCalls = 0;
+    w.reply = (session, req) => {
+      if (session === "main") {
+        parentCalls++;
+        if (parentCalls === 1) return calls({ id: "c_turn1", args: { task: "one" } });
+        const last = req.messages.at(-1) as any;
+        if (child && last?.role === "user" && JSON.stringify(last.content).includes("again")) return calls({ id: "c_turn2", args: { task: "two", agent: child } });
+        return say("ok");
+      }
+      // Each child turn makes one tool step, then answers.
+      return ++childCalls % 2 === 1 ? ({ text: "", finishReason: "tool_calls", truncated: false, usage: USAGE, toolCalls: [{ id: `k${childCalls}`, name: "chat__peek", arguments: {} }] } as ModelResponse) : say("done");
+    };
+    await w.rt.postMessage("t", "a", "go", "prompt", "main");
+    await settle(w);
+    child = rowsOf(w)[0]!.id as string;
+    await w.rt.postMessage("t", "a", "again", "prompt", "main");
+    await settle(w);
+    // Every row read at once, after both turns: the lag at its worst.
+    const events = activityEvents("a", trace(w), subagentActivityFor(w.raw.sql as never, { SUBAGENT_ACTIVITY: "1" }));
+    const steps = events.filter((e) => e.subagent?.phase === "active" && e.hookEventName === "PostToolUse");
+    must(steps.length === 2, `child steps: ${show(steps)}`);
+    must(steps[0]!.subagent!.parentToolUseId === "c_turn1" && steps[1]!.subagent!.parentToolUseId === "c_turn2", `lineage: ${show(steps.map((e) => e.subagent))}`);
+  });
+
+  await check(`${engine}: a report that starts a parent turn is that turn's UserPromptSubmit, once, a combined report and a dropped-report notice too; one that joins a running turn is none`, async () => {
+    const reportRows = (w: World) => trace(w).filter((r) => r.kind === "inbound" && r.attrs.alias === "subagent_report");
+    // An idle parent, three children finishing in one pass: one message, one start, before the wake turn's Stop.
+    {
+      const w = await world(engine);
+      let parentCalls = 0, release = false;
+      w.reply = (session, req) => session === "main"
+        ? (++parentCalls === 1 ? calls(...[1, 2, 3].map((i) => ({ id: `c${i}`, args: { task: `part ${i}` } }))) : say(`parent ${parentCalls}`))
+        : release ? say(`report of ${taskOf(req).slice(-6)}`) : null;
+      await w.rt.postMessage("t", "a", "go", "prompt", "main");
+      for (let i = 0; i < 6; i++) await pass(w);
+      release = true;
+      for (const id of w.sent.filter((x) => !w.answered.has(x))) {
+        const job = await w.rt.takeJob("t", "a", id).catch(() => null) as Job | null;
+        if (!job) continue;
+        w.answered.add(id); w.held.delete(id);
+        const req = toRequest(job.context);
+        w.requests.push({ session: sessionOfJob(w, id), req, operatorModel: job.operatorModel ?? null });
+        await w.rt.deliverAnswer("t", "a", id, fromResponse(w.reply(sessionOfJob(w, id), req) as ModelResponse, job.model, id), undefined);
+      }
+      await settle(w);
+      must((await reportMessages(w)).length === 1, "control: the reports did not arrive as one message");
+      const rows = reportRows(w);
+      must(rows.length === 1 && rows[0]!.status === "delivered", `idle parent: ${rows.length} rows`);
+      must(!JSON.stringify(rows).includes("report of") && !JSON.stringify(rows).includes("sub_"), `the row carries text or a child id: ${show(rows)}`);
+      // The start comes before the Stop of the turn it began.
+      const all = trace(w);
+      const at = all.findIndex((r) => r.kind === "inbound" && r.attrs.alias === "subagent_report");
+      const stopAfter = all.slice(at).find((r) => r.kind === "model.call" && r.attrs.session === "main" && r.status === "stop");
+      must(at >= 0 && stopAfter, "no Stop after the report's start");
+      const names = activityEvents("a", all.slice(at)).map((e) => e.hookEventName).filter(Boolean);
+      must(names[0] === "UserPromptSubmit" && names.includes("Stop"), `events from the report on: ${show(names)}`);
+    }
+    // A busy parent (its model call held): the report joins its run, and makes no start.
+    {
+      const w = await world(engine);
+      let parentCalls = 0, parentBusy = false, release = false;
+      w.reply = (session, req) => {
+        if (session === "main") {
+          parentCalls++;
+          if (parentCalls === 1) return calls({ id: "c1", args: { task: "part A" } });
+          return parentBusy ? null : say(`parent ${parentCalls}`);
+        }
+        return release ? say("report of A") : null;
+      };
+      await w.rt.postMessage("t", "a", "go", "prompt", "main");
+      for (let i = 0; i < 6; i++) await pass(w);
+      parentBusy = true;
+      await w.rt.postMessage("t", "a", "keep working", "prompt", "main");
+      for (let i = 0; i < 3; i++) await pass(w);
+      release = true;
+      for (let i = 0; i < 6; i++) { await pass(w); await sleep(5); }
+      parentBusy = false;
+      await settle(w);
+      must((await reports(w)).length === 1, `control: the report: ${(await reports(w)).length}`);
+      must(reportRows(w).length === 0, `a report that joined a running turn made a start: ${reportRows(w).length}`);
+    }
+    // A dropped report's notice that wakes the parent: one start.
+    {
+      const w = await world(engine);
+      let parentCalls = 0;
+      w.reply = (session) => session === "main" ? (++parentCalls === 1 ? calls({ id: "c1", args: { task: "t" } }) : say("ok")) : say("lost");
+      w.fault.at = (p) => { if (p === "report-posting") throw new Error("the parent's lane said no"); };
+      await w.rt.postMessage("t", "a", "go", "prompt", "main");
+      const has = () => w.raw.sql.exec("SELECT 1 FROM sqlite_master WHERE name = 'subagents'").toArray().length > 0;
+      for (let i = 0; i < 30 && !(has() && rowsOf(w)[0]?.state === "idle"); i++) {
+        await pass(w);
+        if (has()) w.raw.sql.exec("UPDATE subagents SET report_retry_at = 0 WHERE state = 'reporting'");
+      }
+      await settle(w);
+      must((await mainTexts(w)).some((t) => t.includes("could not be delivered")), "control: no notice");
+      must(reportRows(w).length === 1, `the notice's start: ${reportRows(w).length}`);
+    }
+  });
+
+  for (const how of ["the agent's setting", "the deployment's kill switch"] as const) {
+    await check(`${engine}: ${how} switched off stops the children already running: each stopped once, one notice to the parent, the parent's turn untouched`, async () => {
+      const w = await world(engine);
+      let parentCalls = 0, parentHeld = true, childOut = 0;
+      w.reply = (session, req) => {
+        if (session === "main") {
+          parentCalls++;
+          if (parentCalls === 1) return calls({ id: "c1", args: { task: "read A" } }, { id: "c2", args: { task: "read B" } });
+          if (parentHeld) return null;
+          return say(JSON.stringify(req.messages).includes("were switched off") ? "noted the switch" : `parent ${parentCalls}`);
+        }
+        childOut++;
+        return null;
+      };
+      await w.rt.postMessage("t", "a", "go", "prompt", "main");
+      for (let i = 0; i < 10 && !(rowsOf(w).length === 2 && w.held.size === 3); i++) await pass(w);
+      must(rowsOf(w).length === 2 && rowsOf(w).every((r) => r.state === "running"), `control: two children running: ${show(rowsOf(w))}`);
+      const parentJob = [...w.held].find((id) => sessionOfJob(w, id) === "main");
+      must(parentJob, `control: the parent's own call is out: ${show([...w.held].map((id) => sessionOfJob(w, id)))}`);
+      const sentAtSwitch = w.sent.length;
+      if (how === "the agent's setting") {
+        // At the write itself: no pass in between.
+        const patch = await w.rt.updateAgentSettings("t", "a", { subagents: false }, "test") as any;
+        must(patch.ok && patch.stoppedSubagents === 2, `the write: ${show(patch)}`);
+        must(rowsOf(w).every((r) => r.state !== "running" && r.outcome === "stopped"), `not stopped at the write: ${show(rowsOf(w))}`);
+      } else {
+        w.killAll.on = true;
+        // A pass with children running asks to come back within the check interval, so it is read promptly.
+        await pass(w);
+        must(rowsOf(w).every((r) => r.state !== "running" && r.outcome === "stopped"), `not stopped by the pass: ${show(rowsOf(w))}`);
+      }
+      // The parent's own call is still out, not cancelled with the children.
+      must(await w.rt.takeJob("t", "a", parentJob!), "the parent's own call was cancelled");
+      // The children's late answers lead nowhere; the parent's own call, still out, is answered and its turn goes on.
+      w.reply = (session, req) => session === "main"
+        ? say(JSON.stringify(req.messages).includes("were switched off") ? "noted the switch" : `parent ${++parentCalls}`) : say("late child");
+      parentHeld = false;
+      await settle(w);
+      must(w.answered.has(parentJob!), "the parent's own call was dropped");
+      must(w.sent.slice(sentAtSwitch).every((id) => sessionOfJob(w, id) === "main"), `a child called the model after the switch: ${show(w.sent.slice(sentAtSwitch).map((id) => sessionOfJob(w, id)))}`);
+      must(rowsOf(w).every((r) => r.state === "idle" && r.outcome === "stopped"), show(rowsOf(w)));
+      const notices = (await mainTexts(w)).filter((t) => t.includes("subagents were switched off for this agent; 2 running children were stopped"));
+      must(notices.length === 1, `notices: ${notices.length}`);
+      must(!(await mainTexts(w)).some((t) => t.includes("late child")), "a child's late answer reached the parent");
+      // One end a child: a stopped row with its cause, and one SubagentStop, outcome stopped.
+      const ends = trace(w).filter((r) => r.kind === "subagent.turn" && ["done", "failed", "stopped", "cancelled"].includes(String(r.status)));
+      must(ends.length === 2 && ends.every((r) => r.status === "stopped" && r.attrs.cause === "switched_off"), `ends: ${show(ends.map((r) => [r.spanId, r.status, r.attrs.cause]))}`);
+      const stops = activityEvents("a", trace(w), subagentActivityFor(w.raw.sql as never, { SUBAGENT_ACTIVITY: "1" })).filter((e) => e.hookEventName === "SubagentStop");
+      must(stops.length === 2 && stops.every((e) => (e.subagent as any).outcome === "stopped"), `SubagentStops: ${show(stops)}`);
+      // The parent's turn ran to its own end: its last answer read the notice.
+      must(w.requests.some((r) => r.session === "main" && JSON.stringify(r.req.messages).includes("were switched off")), "the parent never read the notice");
+    });
+  }
+
+  await check(`${engine}: with a child running, a pass comes back within five minutes, so a deployment's switch is read promptly`, async () => {
+    const w = await world(engine);
+    let parentCalls = 0;
+    w.reply = (session) => session === "main" ? (++parentCalls === 1 ? calls({ id: "c1", args: { task: "long" } }) : say("ok")) : null;
+    await w.rt.postMessage("t", "a", "go", "prompt", "main");
+    for (let i = 0; i < 6; i++) await pass(w);
+    must(rowsOf(w)[0]?.state === "running", show(rowsOf(w)));
+    const out = await w.rt.step("t", "a");
+    // The child's model call out keeps the engine's poll backstop armed; the ceiling alone would be 30 minutes.
+    must(out.wakeInMs !== null && out.wakeInMs <= 5 * 60_000 && out.wakeInMs > 60_000, `wake: ${out.wakeInMs}`);
+  });
+
+  await check(`${engine}: a turn whose end is decided gets no second end: a stop while its report is owed drops the report and writes no stopped row`, async () => {
+    const w = await world(engine);
+    let parentCalls = 0;
+    w.reply = (session) => session === "main" ? (++parentCalls === 1 ? calls({ id: "c1", args: { task: "t" } }) : say("ok")) : say("the answer");
+    // The report's post fails, so the child stays owing it.
+    w.fault.at = (p) => { if (p === "report-posting") throw new Error("the parent's lane said no"); };
+    await w.rt.postMessage("t", "a", "go", "prompt", "main");
+    for (let i = 0; i < 12 && rowsOf(w)[0]?.state !== "reporting"; i++) await pass(w);
+    must(rowsOf(w)[0]?.state === "reporting", `control: owing its report: ${show(rowsOf(w))}`);
+    w.fault.at = null;
+    await w.rt.stopTurn("t", "a", "provider_stop");
+    await settle(w);
+    must(rowsOf(w)[0]!.state === "idle" && (await reports(w)).length === 0, `after the stop: ${show(rowsOf(w))}`);
+    const ends = trace(w).filter((r) => r.kind === "subagent.turn" && ["done", "failed", "stopped", "cancelled"].includes(String(r.status)));
+    must(ends.length === 1 && ends[0]!.status === "done", `ends: ${show(ends.map((r) => r.status))}`);
+    const stops = activityEvents("a", trace(w), subagentActivityFor(w.raw.sql as never, { SUBAGENT_ACTIVITY: "1" })).filter((e) => e.hookEventName === "SubagentStop");
+    must(stops.length === 1 && (stops[0]!.subagent as any).outcome === "done", `SubagentStops: ${show(stops)}`);
+  });
+
+  await check(`${engine}: an isolate dying mid-spawn, then the switch landing as the replay runs: the replayed send answers the child it started, which the switch stops and reports`, async () => {
+    const w = await world(engine);
+    let parentCalls = 0;
+    w.reply = (session) => session === "main" ? (++parentCalls === 1 ? calls({ id: "c1", args: { task: "the only child" } }) : say("ok")) : null;
+    let hung = false;
+    w.fault.at = (p) => { if (p === "task-posted" && !hung) { hung = true; return new Promise<void>(() => {}); } };
+    await w.rt.postMessage("t", "a", "go", "prompt", "main");
+    for (let i = 0; i < 12 && !hung; i++) { await Promise.race([pass(w), sleep(1_000)]); }
+    must(hung && rowsOf(w).length === 1, "the spawn never reached its task being posted");
+    // A fresh isolate recovers the interrupted call and runs it again; the agent's setting is written as it does (a
+    // PATCH landing during the pass, after the harness offered the tool).
+    let flipped = false;
+    w.fault.at = (p) => { if (p === "send-start" && !flipped) { flipped = true; must(updateAgentSettings(w.raw.sql as never, { subagents: false }, "test").ok, "refused"); } };
+    w.rt = w.isolate();
+    await w.rt.ready();
+    await settle(w);
+    must(flipped, "control: the replay never ran");
+    const results = w.requests.filter((r) => r.session === "main").flatMap((r) => r.req.messages.filter((m: any) => m.role === "tool"))
+      .map((m: any) => typeof m.content === "string" ? m.content : JSON.stringify(m.content));
+    must(results.length > 0 && results.every((t) => /"status":"started"/.test(t) && !t.includes("switched off")), `the replay was refused: ${show(results)}`);
+    must(rowsOf(w).length === 1 && rowsOf(w)[0]!.outcome === "stopped", show(rowsOf(w)));
+    must((await mainTexts(w)).filter((t) => t.includes("subagents were switched off for this agent; 1 running child was stopped")).length === 1, "no notice");
+  });
+
+  await check(`${engine}: an isolate dying mid-spawn, then the deployment's switch: the call is reported interrupted, and the child it started is stopped and reported`, async () => {
+    const w = await world(engine);
+    let parentCalls = 0;
+    w.reply = (session) => session === "main" ? (++parentCalls === 1 ? calls({ id: "c1", args: { task: "the only child" } }) : say("ok")) : null;
+    let hung = false;
+    w.fault.at = (p) => { if (p === "task-posted" && !hung) { hung = true; return new Promise<void>(() => {}); } };
+    await w.rt.postMessage("t", "a", "go", "prompt", "main");
+    for (let i = 0; i < 12 && !hung; i++) { await Promise.race([pass(w), sleep(1_000)]); }
+    must(hung && rowsOf(w).length === 1, "the spawn never reached its task being posted");
+    // Set while the isolate is gone: the rebuilt harness no longer offers the tool, so the engine does not run the call
+    // again, and says it was interrupted.
+    w.fault.at = null;
+    w.killAll.on = true;
+    w.rt = w.isolate();
+    await w.rt.ready();
+    await settle(w);
+    must(rowsOf(w).length === 1 && rowsOf(w)[0]!.outcome === "stopped" && rowsOf(w)[0]!.state === "idle", show(rowsOf(w)));
+    must(!w.requests.some((r) => r.session.startsWith("sub_")), "the child called the model");
+    must((await mainTexts(w)).filter((t) => t.includes("subagents were switched off for this agent; 1 running child was stopped")).length === 1, "no notice");
+  });
+
   await check(`${engine}: a follow-up to a subagent still running, or to an id this conversation never started, is refused`, async () => {
     const w = await world(engine);
     let parentCalls = 0, child: string | null = null;
@@ -1127,6 +1638,9 @@ for (const engine of (process.env.ENGINES ?? "pi085,pd").split(",").filter((e) =
     const cancelled = (await reports(w)).filter((r) => / cancelled after /.test(r));
     must(cancelled.length === 1 && /longer than 30 minutes/.test(cancelled[0]!), show(await reports(w)));
     must(rowsOf(w).map((r) => r.outcome).sort().join() === "cancelled,failed", show(rowsOf(w)));
+    // The end row says it was the ceiling, which Raft's outcome is read from.
+    const end = trace(w).filter((r) => r.kind === "subagent.turn" && r.status === "cancelled");
+    must(end.length === 1 && end[0]!.attrs.cause === "ceiling", `the ceiling's row: ${show(end.map((r) => r.attrs))}`);
     const sent = w.sent.length;
     for (let i = 0; i < 4; i++) { await pass(w); await sleep(5); }
     must(w.sent.filter((id, i) => i >= sent && sessionOfJob(w, id).startsWith("sub_")).length === 0, "the cancelled child called the model again");
@@ -1187,6 +1701,70 @@ for (const engine of (process.env.ENGINES ?? "pi085,pd").split(",").filter((e) =
     must(online.length === parent.filter((r) => r.status === "stop").length, `online ${online.length}: ${show(statusEvents("a", rows))}`);
   });
 }
+
+await check("the default reaches no measurement: the bench tenant and an evaluation's tool choice get it only by their own setting, and harness minimal never", async () => {
+  const runtime = (raw: ReturnType<typeof sqliteHost>) => new AgentRuntime({
+    ctx: { storage: { sql: raw.sql, transactionSync: raw.transactionSync } }, bucket: {} as never, bucketName: "b", models: { resolve: () => null },
+    sandbox: false, autoRelease: false, subagentsDefault: true,
+    operatorModel: operatorModelOf({ DEEPSEEK_BASE_URL: "https://model.example/v1", DEEPSEEK_API_KEY: "operator-key", HARNESS_MODEL: "m1" }),
+    offloadModel: async () => {},
+  } as never);
+  const offered = async (tenant: string, config: Record<string, unknown>, stored?: boolean) => {
+    const raw = sqliteHost();
+    const rt = runtime(raw);
+    await rt.ready();
+    await rt.store.createAgent(tenant, "a", config as never);
+    await rt.bindOperatorModel(tenant, "a");
+    if (stored !== undefined) updateAgentSettings(raw.sql as never, { subagents: stored }, "test");
+    return (await (await rt.agent(tenant, "a")).tools()).some((t) => t.name === SUBAGENT_TOOL);
+  };
+  must(await offered("t", { name: "Ada" }), "control: a hosted agent has it by default");
+  must(!await offered("bench", { name: "Ada" }) && await offered("bench", { name: "Ada" }, true), "the bench tenant");
+  const chosen = { name: "Ada", toolConfig: { mounts: null, harness: "default" } };
+  must(!await offered("t", chosen) && await offered("t", chosen, true), "an evaluation's tool choice");
+  const minimal = { name: "Ada", toolConfig: { mounts: null, harness: "minimal" } };
+  must(!await offered("t", minimal) && !await offered("t", minimal, true), "harness minimal");
+});
+
+await check("rules: a report's size is its body's: the answer as kept, without its head or the cut marker", () => {
+  const s = { id: "sub_x", turnStartedAt: 0, turns: 1 };
+  const long = "x".repeat(REPORT_MAX_CHARS + 500);
+  const msg = reportMessage(s, { outcome: "done", text: long }, 1000);
+  must(msg.includes(`[cut at ${REPORT_MAX_CHARS} of`) && reportBodyChars({ outcome: "done", text: long }) === REPORT_MAX_CHARS, `cut: ${reportBodyChars({ outcome: "done", text: long })}`);
+  must(reportBodyChars({ outcome: "done", text: "abc" }) === 3 && reportBodyChars({ outcome: "failed", text: "boom" }) === 4, "short bodies");
+});
+
+await check("rules: Raft subagent events: only a turn the harness took at its ceiling is outcome ceiling, any other cancel is stopped; the agent's status never rides a child's event", () => {
+  const T = Date.parse("2026-10-20T10:00:00Z");
+  const row = (seq: number, at: number, kind: string, status: string, attrs: Record<string, unknown>, extra: Record<string, unknown> = {}) =>
+    ({ seq, at, tenantId: "t", agentId: "a", kind, spanId: `s${seq}`, status, verdict: "ok", attrs, ...extra }) as never;
+  const lineage = { lineage: (x: string, _at: number) => (x === "sub_x" ? "c_x" : null) };
+  const rows = [
+    // The agent's own model call ends at T (status online), and a child's tool call ends at the same instant.
+    row(1, T, "model.call", "stop", { model: "m1", session: "main" }),
+    row(2, T, "tool.call", "succeeded", { tool: "peek", mount: "chat", task: "sub_x" }, { ms: 0 }),
+    row(3, T + 10, "subagent.turn", "cancelled", { parentSession: "main", turn: 1, reportChars: 120, cause: "ceiling" }, { spanId: "sub_x", parentId: "c_x" }),
+    row(4, T + 20, "subagent.turn", "report_failed", { parentSession: "main", attempts: 1 }, { spanId: "sub_x", parentId: "c_x" }),
+  ];
+  const on = activityEvents("a", rows, lineage);
+  const stop = on.filter((e) => e.hookEventName === "SubagentStop");
+  must(stop.length === 1 && (stop[0]!.subagent as any)?.outcome === "ceiling" && (stop[0]!.subagent as any)?.reportChars === 120 && !("outcome" in stop[0]!), `the ceiling: ${show(stop)}`);
+  // A cancel of any other cause (its run aborted, or no cause written) is a stop, not the ceiling.
+  for (const attrs of [{ cause: "aborted" }, {}]) {
+    const other = activityEvents("a", [row(5, T, "subagent.turn", "cancelled", { parentSession: "main", turn: 1, reportChars: 0, ...attrs }, { spanId: "sub_x", parentId: "c_x" })], lineage);
+    must(other.length === 1 && (other[0]!.subagent as any)?.outcome === "stopped", `a cancel ${show(attrs)}: ${show(other)}`);
+  }
+  must(on.filter((e) => e.subagent).every((e) => e.status === undefined), `the agent's status rode a child's event: ${show(on.filter((e) => e.subagent && e.status))}`);
+  must(on.some((e) => !e.subagent && e.status === "online"), `the agent's own status is gone: ${show(on)}`);
+});
+
+await check("rules: the tool tells the model to delegate big reads for a short report, and to do changes itself", () => {
+  const t = subagentTool({ models: [], send: async () => ({}) });
+  for (const words of ["any read that would bring a lot of raw content into your context", "short, structured report", "Do changes, messages and decisions yourself",
+    "subagents are read-only", "Don't delegate a single small lookup"]) must(t.description.includes(words), `the description lacks: ${words}`);
+  must(!/[Dd]elegate rarely|Delegate only \(a\)/.test(t.description), "the old rarely-delegate wording is still there");
+  must(t.description.includes(DELEGATE_GUIDANCE), "not the shared guidance");
+});
 
 await check("rules: a subagent may call only declared reads and a self-acting plugin's writes; every built-in write is withheld", async () => {
   const rt = new AgentRuntime({ ctx: { storage: { sql: sqliteHost().sql } }, bucket: {} as never, bucketName: "b", models: { resolve: () => null }, loader: {} as never, makeToolBinding: () => null } as never);

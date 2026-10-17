@@ -19,7 +19,8 @@
  */
 import { pendingTrace } from "../../src/trace/outbox.ts";
 import { flushTrace, type TraceSink } from "./trace-r2.ts";
-import { ACTIVITY_BATCH_MAX, activityEvents, orderStatuses } from "../../src/runtime/activity.ts";
+import { ACTIVITY_BATCH_MAX, activityEvents, orderStatuses, type SubagentActivity } from "../../src/runtime/activity.ts";
+import { turnLineage } from "../../src/runtime/subagents.ts";
 import type { ActivityEvent } from "../../src/plugins/types.ts";
 
 type Sql = { exec(query: string, ...bindings: unknown[]): { toArray(): any[] } };
@@ -54,12 +55,26 @@ function setStatusClock(sql: Sql, lastAt: number) {
   sql.exec("INSERT INTO activity_status_clock(id, last_at) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET last_at = excluded.last_at", lastAt);
 }
 
+/**
+ * Subagent events as Raft's `SubagentLineage` (src/runtime/activity.ts `subagentEvents`), on only where the deployment
+ * sets SUBAGENT_ACTIVITY=1: off — the default — a child's rows make no event. Its lineage is the parent's
+ * `send_to_agent` call id of the child turn the row belongs to (`turnLineage`), read from the object's own table.
+ */
+export function subagentActivityFor(sql: Sql, env: { SUBAGENT_ACTIVITY?: unknown }): SubagentActivity | undefined {
+  if (env.SUBAGENT_ACTIVITY !== "1") return undefined;
+  return {
+    lineage(session: string, at: number) {
+      try { return turnLineage(sql as never, session, at); } catch { return null; }
+    },
+  };
+}
+
 export async function flushActivity(
-  gateway: ActivityGateway, sql: Sql, tenantId: string, agentId: string, limit = ACTIVITY_BATCH_MAX,
+  gateway: ActivityGateway, sql: Sql, tenantId: string, agentId: string, limit = ACTIVITY_BATCH_MAX, subagents?: SubagentActivity,
 ): Promise<{ events: number; sent: number; through: number; skipped: string[] }> {
   const sent0 = activityCursor(sql);
   const { rows, through } = pendingTrace(sql, sent0, limit);
-  const events = activityEvents(agentId, rows);
+  const events = activityEvents(agentId, rows, subagents);
   const clock0 = statusClock(sql);
   const clock = orderStatuses(events, clock0);
   let sent = 0;
@@ -84,12 +99,12 @@ export async function flushActivity(
  * pass goes on and asks for another pass.
  */
 export async function flushActivityThenTrace(
-  gateway: ActivityGateway, sink: TraceSink, sql: Sql, tenantId: string, agentId: string,
+  gateway: ActivityGateway, sink: TraceSink, sql: Sql, tenantId: string, agentId: string, subagents?: SubagentActivity,
 ): Promise<{ activityError: string | null; traceError: string | null }> {
   let holdThrough: number;
   let activityError: string | null = null;
   try {
-    holdThrough = (await flushActivity(gateway, sql, tenantId, agentId)).through;
+    holdThrough = (await flushActivity(gateway, sql, tenantId, agentId, ACTIVITY_BATCH_MAX, subagents)).through;
   } catch (e) {
     activityError = String((e as { message?: unknown })?.message ?? e).slice(0, 200);
     holdThrough = activityCursor(sql);

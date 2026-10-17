@@ -22,6 +22,7 @@ import { handleSandboxCall } from "../src/runtime/dynamic-worker-executor.ts";
 import { settleShell, type ShellAnswer } from "../bench/swebench/grade.ts";
 import { decideFromPoll } from "../bench/poll-fallback.ts";
 import { BACKGROUND_MAX_MS, BACKGROUND_STOP_GRACE_MS } from "../src/runtime/background-jobs.ts";
+import { updateAgentSettings } from "../src/runtime/agent-settings.ts";
 
 const STAND_IN = "export class DurableObject { constructor(ctx, env) { this.ctx = ctx; this.env = env; } }" +
   " export class WorkerEntrypoint { constructor(ctx, env) { this.ctx = ctx; this.env = env; } }" +
@@ -376,6 +377,41 @@ for (const engine of ["pd", "pi085"] as const) {
     must(run9.execs.size === execsBefore && run9.creates().length === createsBefore, `the agent reached the machine after finish: ${show(run9.ops.slice(-4))}`);
     const graded: ShellAnswer = await o.D.benchSweShell(taskId, "git diff --stat");
     must(graded.status === "succeeded", `the grader's shell was refused after finish: ${show(graded)}`);
+    o.raw.dispose();
+  });
+
+  await check(`${engine}: finish stops the task's subagents: none reports, and none calls the model after`, async () => {
+    const taskId = `swe_sub_${engine}`;
+    const agentId = `b_${taskId}`;
+    const o = object();
+    run9.reset();
+    await o.D.benchSweStart(taskId, { policy: "fix it", image: IMAGE, engine });
+    updateAgentSettings(o.raw.sql as never, { subagents: true }, "test");
+    await o.D.benchSay(taskId, "fix the bug");
+    const first = await o.nextJob(agentId);
+    must((first.job?.context?.tools ?? []).some((t: any) => t.name === "send_to_agent"), "control: send_to_agent is not offered");
+    // The job's session, from the engine's own table.
+    const sessionOf = (id: string): string => {
+      const row: any = engine === "pi085"
+        ? o.raw.sql.exec("SELECT session AS s FROM pi_model_jobs WHERE id = ?", id).toArray()[0]
+        : o.raw.sql.exec("SELECT c.task_id AS s FROM ap_model_jobs j JOIN ap_conversations c ON c.conversation_id = j.conversation_id WHERE j.id = ?", id).toArray()[0];
+      return String(row?.s);
+    };
+    await o.D.deliverAnswer("bench", agentId, first.id, calls({ id: "c_sub", name: "send_to_agent", arguments: { task: "read the repository and summarise it" } }), 5);
+    for (let i = 0; i < 10 && !o.jobs.some((j) => sessionOf(j).startsWith("sub_")); i++) await o.passAlarms(1);
+    const childJob = o.jobs.find((j) => sessionOf(j).startsWith("sub_"));
+    must(childJob, `the child never called the model: ${show(o.jobs.map(sessionOf))}`);
+    await o.D.benchSweFinish(taskId);
+    const rows = o.raw.sql.exec("SELECT state, outcome FROM subagents").toArray() as any[];
+    must(rows.length === 1 && rows[0].state === "idle" && rows[0].outcome === "stopped", `the child was not stopped: ${show(rows)}`);
+    // Its answer arrives after the end and starts nothing; no later pass calls the model for it.
+    const taken = await o.D.takeJob("bench", agentId, childJob).catch(() => null);
+    if (taken) await o.D.deliverAnswer("bench", agentId, childJob, say("the summary"), 5).catch(() => false);
+    o.jobs.length = 0;
+    await o.passAlarms(5);
+    must(!o.jobs.some((j) => sessionOf(j).startsWith("sub_")), `the stopped child called the model after finish: ${show(o.jobs.map(sessionOf))}`);
+    const main = o.raw.sql.exec(engine === "pi085" ? "SELECT body FROM pi_entries" : "SELECT record AS body FROM pd_entries").toArray().map((r: any) => String(r.body));
+    must(!main.some((b) => b.includes("[subagent sub_")), "a report reached the ended task");
     o.raw.dispose();
   });
 

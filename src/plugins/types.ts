@@ -1517,7 +1517,8 @@ export type AgentStatus = "online" | "thinking" | "working" | "error" | "offline
  * (src/runtime/activity.ts). Only the fields listed exist: the service refuses
  * an unknown field with 400, so a plugin passes these through and adds none.
  */
-export type ActivityEventName = "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "PostToolUseFailure" | "Stop" | "BridgeFatal" | "SessionEnd";
+export type ActivityEventName = "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "PostToolUseFailure" | "Stop" | "BridgeFatal" | "SessionEnd"
+  | "SubagentStart" | "SubagentStop";
 export interface ActivityEvent {
   /** Unique per agent for all time; the service dedupes on it. */
   eventId: string;
@@ -1540,6 +1541,19 @@ export interface ActivityEvent {
   status?: AgentStatus;
   /** A short phrase shown with the status (at most 200 characters): what the agent is working on. */
   detail?: string;
+  /**
+   * Which subagent an event belongs to (Raft's `SubagentLineage`: slock's @botiverse/raft-shared 0.1.0, packages/shared/src/index.ts): the parent's
+   * `send_to_agent` call it came from, the child, and where in its life it is. Ids and bounded enums only — activity is
+   * seen by more people than the conversation, so never the task, a prompt or what anyone said. Sent only where the
+   * deployment turns it on (SUBAGENT_ACTIVITY, src/runtime/activity.ts).
+   */
+  subagent?: {
+    parentToolUseId?: string; taskId: string; phase: "started" | "active" | "ended";
+    /** On `phase: "ended"` only: how the child's turn ended. `ceiling` is a turn cancelled at its time limit. */
+    outcome?: "done" | "failed" | "stopped" | "ceiling";
+    /** On `phase: "ended"` only: the length of the child's report in characters, never the report. */
+    reportChars?: number;
+  };
 }
 
 /**

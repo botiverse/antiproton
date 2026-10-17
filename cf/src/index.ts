@@ -77,7 +77,7 @@ import { agentObjectName } from "./object-name.ts";
 import { readTranscript, transcriptEvents, approvalsByOp, isPd, type TranscriptEvents } from "./transcript-read.ts";
 import { operatorCredentials } from "./operator-ref.ts";
 import { agentSecretValues, credentialRedactor, evalTranscript, localTrace, readTraceWindow, redactCredentials, type EvalTranscript } from "./eval-read.ts";
-import type { TraceOutboxRow } from "../../src/trace/outbox.ts";
+import { appendTrace, type TraceOutboxRow } from "../../src/trace/outbox.ts";
 import { readEngineStorage } from "./engine-read.ts";
 import { pdVersion } from "../../src/runtime/pd-transcript.ts";
 import { compactionRefusal, refusingCompaction } from "./compact-refusal.ts";
@@ -92,7 +92,7 @@ import { drainCursors, hasUnsent, standDownDelay, USAGE_WAKE_DELAY_MS } from "./
 import type { SurfaceDeps } from "./agent-surface/surface.ts";
 import type { HeldListing, HeldRead } from "../../src/plugins/types.ts";
 import { heldFiles as surfaceHeldFiles, stateGet as surfaceStateGet, stateList as surfaceStateList } from "./agent-surface/in-agent.ts";
-import { flushActivityThenTrace } from "./activity-raft.ts";
+import { flushActivityThenTrace, subagentActivityFor } from "./activity-raft.ts";
 import { usagePanel } from "./usage.ts";
 import { d1ApiKeys, admit, d1Identities, d1InboundHooks, type IdentityDirectory } from "./control-plane.ts";
 import { d1ServiceTokens } from "./control-plane.ts";
@@ -116,6 +116,7 @@ import { clip, logEvent, routeOf, setLogSink } from "../../src/core/log.ts";
 import type { FirstTurn } from "../../src/runtime/prewarm.ts";
 import { callPrewarm, operatorModelOf, queuedCall, planBinding, resolveModel } from "./model-request.ts";
 import { userModelsFrom } from "../../src/model/user-models.ts";
+import { subagentsDisabledBy } from "../../src/runtime/agent-settings.ts";
 import { DEFAULT_PROVIDER, providerStatus, type ModelChoice } from "../../src/model/providers.ts";
 import { consumeModelCalls, isUnknownJobReply, replyingUnknownJob, type ModelQueueDeps, type QueuedModelCall, type UnknownJobReply } from "./model-queue.ts";
 import {
@@ -212,6 +213,17 @@ export interface Env {
    * cf/wrangler.jsonc or cf/wrangler.preview.jsonc sets it.
    */
   MODEL_PICKER_ENFORCE?: string;
+  /**
+   * "1" turns subagents (src/runtime/subagents.ts) off for every agent of the deployment, whatever an agent's own setting
+   * says: the kill switch, a var rather than a code change (docs/runbook.md, "Subagents"). Unset: on for every hosted agent.
+   */
+  SUBAGENTS_DISABLED?: string;
+  /**
+   * "1" sends subagents' activity to Raft as its `SubagentLineage` events (src/runtime/activity.ts `subagentEvents`):
+   * SubagentStart, the child's tool steps, SubagentStop. Off until Raft's ingest accepts the marker: unknown fields are
+   * stripped there, and a child's step without its marker would read as the agent's own.
+   */
+  SUBAGENT_ACTIVITY?: string;
   /** The canonical origin, so the registered callback URL is built from a
    *  constant and never from an inbound Host header. */
   /** Login with GitHub: the OAuth App tygg owns, callback /login/github/callback. */
@@ -411,6 +423,9 @@ export class AgentDO extends DurableObject<Env> {
       reminderApp: { origin: this.env.REMINDER_APP_ORIGIN, credential: this.env.REMINDER_APP_CREDENTIAL },
       secretKek: this.env.SECRET_KEK,
       modelInputEvidence: evalSeedRoutes(this.env),
+      // Subagents for every hosted agent, unless the agent's setting says no or the deployment's kill switch is set.
+      subagentsDefault: true,
+      subagentsDisabled: subagentsDisabledBy(this.env as unknown as Record<string, unknown>),
       // The owner's model options: what a subagent may be started on (src/runtime/subagents.ts), under the same pins and
       // switch as the agent's own pick.
       userModels: userModelsFrom(this.env as unknown as Record<string, unknown>, operatorModelOf(this.env).providers),
@@ -836,6 +851,8 @@ export class AgentDO extends DurableObject<Env> {
     this.#benchModeCached = mode;
     const swe = mode === "swe";
     this.#benchRuntime = new AgentRuntime({
+      // Off unless a task's agent is given the setting: a bench arm must not change under a measurement.
+      subagentsDisabled: subagentsDisabledBy(this.env as unknown as Record<string, unknown>),
       ctx: this.ctx,
       bucket: this.env.ARTIFACTS,
       bucketName: this.env.ARTIFACT_BUCKET,
@@ -1000,7 +1017,8 @@ export class AgentDO extends DurableObject<Env> {
    * through the agent's dispatch, which is where an ended task is refused. Without this, the runner graded
    * and released while a stalled agent kept running: its next shell command provisioned a new box that
    * nobody released or counted, and a job left on the released box failed about forty minutes later and woke
-   * the idle agent into doing the same. Idempotent, and release calls it too.
+   * the idle agent into doing the same. Idempotent, and release calls it too. The agent's subagents, if it has any,
+   * end with it.
    */
   async benchSweFinish(taskId: string) {
     return this.#busy("benchSweFinish", () => this.#benchSweFinish(taskId));
@@ -1011,7 +1029,9 @@ export class AgentDO extends DurableObject<Env> {
     this.#setBenchConfig(`ended:${agentId}`, String(Date.now()));
     const rt = this.#activeRuntime();
     await rt.ready();
-    return rt.cancelSession("bench", agentId, MAIN_SESSION);
+    // The task's subagents with it, as a stop ends them: marked stopped first, so none reports into the ended task,
+    // then each one with work cancelled (`cancelSessionTree`); then the agent's own turn.
+    return rt.cancelSessionTree("bench", agentId, MAIN_SESSION);
   }
 
   /** Hands the machine back, after ending the agent's part (benchSweFinish) so nothing can make another. */
@@ -1948,7 +1968,12 @@ export class AgentDO extends DurableObject<Env> {
 
   async adminUpdateAgentSettings(tenantId: string, agentId: string, settings: unknown) {
     this.#claim(tenantId, agentId);
-    return this.#busy("adminUpdateAgentSettings", () => this.runtime().updateAgentSettings(tenantId, agentId, settings, "operator"));
+    return this.#busy("adminUpdateAgentSettings", async () => {
+      const r = await this.runtime().updateAgentSettings(tenantId, agentId, settings, "operator");
+      // Subagents switched off stop at the write (`updateAgentSettings`); the pass asked for now posts their notice.
+      if (r.ok && (r as { stoppedSubagents?: number }).stoppedSubagents) await this.#wake();
+      return r;
+    });
   }
 
   async adminRefreshMountTools(tenantId: string, agentId: string, alias: string) {
@@ -2464,6 +2489,17 @@ export class AgentDO extends DurableObject<Env> {
       await rt.provision(tenantId, agentId);
       await this.#bindModel(rt, tenantId, agentId);
       const r = await rt.postMessage(tenantId, agentId, text);
+      // The operator's message is one the agent was given, as a push is: the same `inbound` row, `delivered`, so activity
+      // reads it as the turn's UserPromptSubmit. Alias `operator`: no hook carried it. Only for a message the engine
+      // took: a refusal throws above, and a post that wrote nothing answers no result. The span id is capped, as the
+      // task id is the caller's. A reading: a failure is logged.
+      const took = r.result !== null && r.result !== undefined && (r.result as { ok?: unknown }).ok !== false && !(r as { skipped?: true }).skipped;
+      if (took) {
+        try {
+          appendTrace(this.sql as never, [{ at: Date.now(), tenantId, agentId, kind: "inbound", spanId: `operator:${String(taskId).slice(0, 64)}`,
+            status: "delivered", verdict: "ok", attrs: { alias: "operator", source: "operator" } }]);
+        } catch (e) { console.error(`the inbound row of ${tenantId}/${agentId}'s operator message could not be written:`, e); }
+      }
       // Wakeup is an alarm, not a poll: nothing spins while the agent has no work.
       await this.#wake();
       return r;
@@ -2647,7 +2683,8 @@ export class AgentDO extends DurableObject<Env> {
         // This pass's activity to the service that runs this agent, then this pass's trace rows
         // to R2, with the export holding whatever activity did not consume (cf/src/activity-raft.ts).
         // Same terms as usage: a failure keeps the rows and asks for another pass.
-        const flushed = await flushActivityThenTrace(rt.gateway(), this.env.ARTIFACTS, this.sql as any, who.tenantId, who.agentId);
+        const flushed = await flushActivityThenTrace(rt.gateway(), this.env.ARTIFACTS, this.sql as any, who.tenantId, who.agentId,
+          subagentActivityFor(this.sql as any, this.env as unknown as Record<string, unknown>));
         if (flushed.activityError) { usagePending = true; console.warn(`activity flush failed for ${who.agentId}: ${flushed.activityError}`); }
         if (flushed.traceError) { usagePending = true; console.warn(`trace flush failed for ${who.agentId}: ${flushed.traceError}`); }
         // The pass says when to come back — a retry has a time, a model call has a poll interval,

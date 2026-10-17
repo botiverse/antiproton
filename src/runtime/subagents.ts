@@ -65,6 +65,50 @@ export interface SubagentOwner { tenantId: string; agentId: string }
 /** `report_failed`: the turn ended, and its report could not be posted in `REPORT_MAX_ATTEMPTS` tries and was dropped. */
 export type SubagentOutcome = "done" | "failed" | "cancelled" | "stopped" | "report_failed";
 
+/**
+ * How long a finished child's transcript is kept: after this long idle, the pass deletes its session's tables (pi085)
+ * or its directory entry (pd) and marks its row `archived` (`archivableSubagents`). A row stays, as the record of it.
+ */
+export const SUBAGENT_RETENTION_MS = 7 * 24 * 60 * 60_000;
+
+/** How many children one pass archives at most: the rest wait for later passes, so no pass is long for it. */
+export const SUBAGENT_ARCHIVE_PER_PASS = 5;
+
+/**
+ * Children a pass may archive, oldest first, at most `limit`: idle (not running, owing no report, not archived),
+ * finished longer ago than `retentionMs`, and with no background job of theirs still running.
+ */
+export function archivableSubagents(sql: Sql, owner: SubagentOwner, now: number, retentionMs: number, limit: number): Subagent[] {
+  if (!hasSubagentTable(sql)) return [];
+  const jobs = sql.exec("SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = 'background_jobs'").toArray().length > 0;
+  return sql.exec(
+    "SELECT * FROM subagents WHERE tenant_id = ? AND agent_id = ? AND state = 'idle' AND finished_at IS NOT NULL AND finished_at < ?" +
+    (jobs ? " AND id NOT IN (SELECT session FROM background_jobs WHERE state = 'running')" : "") +
+    " ORDER BY finished_at ASC LIMIT ?",
+    owner.tenantId, owner.agentId, now - retentionMs, limit).toArray().map(rowTo);
+}
+
+export function markArchived(sql: Sql, owner: SubagentOwner, id: string) {
+  const r = sql.exec("UPDATE subagents SET state = 'archived', report = NULL, report_note = NULL WHERE id = ? AND tenant_id = ? AND agent_id = ? AND state = 'idle' RETURNING id",
+    id, owner.tenantId, owner.agentId).toArray();
+  // Its turns' lineage goes with it. A trace row of the child still unsent after its retention (activity down for a
+  // week) is then mapped without its parent call (`turnLineage` answers null), never with another child's.
+  if (r.length && sql.exec("SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = 'subagent_turns'").toArray().length > 0) {
+    sql.exec("DELETE FROM subagent_turns WHERE id = ?", id);
+  }
+}
+
+/**
+ * A turn that never started: its task or its background completion was not posted. The slot is freed at once — the
+ * row idle, outcome `failed` — rather than held until the ceiling and then reported as cancelled. Only a running turn
+ * with no engine id recorded, so a turn that did start is never released by this.
+ */
+export function releaseUnstartedTurn(sql: Sql, owner: SubagentOwner, id: string, now = Date.now()): boolean {
+  const r = sql.exec("UPDATE subagents SET state = 'idle', finished_at = ?, outcome = 'failed' WHERE id = ? AND tenant_id = ? AND agent_id = ? AND state = 'running' AND turn_op IS NULL RETURNING id",
+    now, id, owner.tenantId, owner.agentId).toArray();
+  return r.length > 0;
+}
+
 /** How many times an owed report is posted before it is dropped (`reportFailed`): at the backoff below, about 21 minutes. */
 export const REPORT_MAX_ATTEMPTS = 8;
 
@@ -83,7 +127,7 @@ export interface Subagent {
    * `running` while a turn is in flight; `reporting` once its end is decided and its report (`report`) is owed to the
    * parent; `idle` once the report was posted (or the child was stopped with its parent, which drops it).
    */
-  state: "running" | "reporting" | "idle";
+  state: "running" | "reporting" | "idle" | "archived";
   /** What sent the current turn, as `turnKeyOf` makes it: what a replayed send of the same call is recognised by. */
   turnKey: string | null;
   /** The report owed while `reporting`: decided once, so a retry posts the same text under the same key. */
@@ -123,7 +167,7 @@ const rowTo = (r: any): Subagent => ({
   id: String(r.id), parentSession: String(r.parent_session), callId: r.call_id === null ? null : String(r.call_id),
   modelOption: r.model_option === null ? null : String(r.model_option),
   provider: r.provider === null ? null : String(r.provider), model: r.model === null ? null : String(r.model),
-  state: r.state === "running" || r.state === "reporting" ? r.state : "idle", turnOp: r.turn_op === null ? null : String(r.turn_op),
+  state: r.state === "running" || r.state === "reporting" || r.state === "archived" ? r.state : "idle", turnOp: r.turn_op === null ? null : String(r.turn_op),
   turnKey: r.turn_key === null || r.turn_key === undefined ? null : String(r.turn_key),
   report: r.report === null || r.report === undefined ? null : String(r.report),
   modelNow: r.model_now === null || r.model_now === undefined ? null : String(r.model_now),
@@ -236,12 +280,25 @@ export function reportRetryMs(sql: Sql, owner: SubagentOwner, now = Date.now()):
 
 /** The `subagent.turn` trace row for one child turn's end (cf/src/runtime.ts): its span the child, its parent the call that sent the turn. */
 export function subagentTurnRow(owner: SubagentOwner, s: Pick<Subagent, "id" | "callId" | "parentSession" | "turns" | "turnStartedAt" | "modelOption">,
-  status: SubagentOutcome | "report_dropped", now: number, extra: Record<string, unknown> = {}) {
+  status: SubagentOutcome | "report_dropped" | "wake_failed", now: number, extra: Record<string, unknown> = {}) {
   return {
     at: now, tenantId: owner.tenantId, agentId: owner.agentId, kind: "subagent.turn" as const, spanId: s.id, ...(s.callId ? { parentId: s.callId } : {}),
     status, verdict: (status === "done" ? "ok" : status === "cancelled" || status === "stopped" ? "cancelled" : "failed") as "ok" | "cancelled" | "failed",
     ms: Math.max(0, now - s.turnStartedAt),
     attrs: { parentSession: s.parentSession, turn: s.turns, ...(s.modelOption ? { model: s.modelOption } : {}), ...extra },
+  };
+}
+
+/**
+ * The `subagent.start` trace row for one child turn beginning: its span the child, its parent the call that sent it
+ * (the parent's `send_to_agent` tool call; none for a background wake). Ids and counts only, never the task.
+ */
+export function subagentStartRow(owner: SubagentOwner, s: Pick<Subagent, "id" | "parentSession" | "turns">,
+  how: "spawn" | "follow_up" | "wake", callId: string | null, now: number) {
+  return {
+    at: now, tenantId: owner.tenantId, agentId: owner.agentId, kind: "subagent.start" as const, spanId: s.id,
+    ...(callId ? { parentId: callId } : {}), status: how, verdict: "ok" as const,
+    attrs: { parentSession: s.parentSession, turn: s.turns, how },
   };
 }
 
@@ -289,6 +346,24 @@ export function recordSubagent(sql: Sql, owner: SubagentOwner, s: {
     "INSERT INTO subagents(id, tenant_id, agent_id, parent_session, call_id, model_option, provider, model, state, turn_op, turns, created_at, turn_started_at, turn_key, model_now) " +
     "VALUES (?,?,?,?,?,?,?,?, 'running', ?, 1, ?, ?, ?, ?)",
     s.id, owner.tenantId, owner.agentId, s.parentSession, s.callId, s.modelOption, s.provider, s.model, s.turnOp, s.now, s.now, s.turnKey, s.model);
+  recordTurnLineage(sql, s.id, s.callId, s.now);
+}
+
+/**
+ * Each child turn's start and the parent's call that sent it, kept per turn: what an event of that turn names as its
+ * parent (`turnLineage`), whenever it is read. The row's own `call_id` is the latest turn's, so an event read after a
+ * follow-up must not take it from there.
+ */
+function recordTurnLineage(sql: Sql, id: string, callId: string | null, at: number) {
+  sql.exec("CREATE TABLE IF NOT EXISTS subagent_turns (id TEXT NOT NULL, started_at INTEGER NOT NULL, call_id TEXT)");
+  sql.exec("INSERT INTO subagent_turns(id, started_at, call_id) VALUES (?, ?, ?)", id, at, callId);
+}
+
+/** The parent's call that sent the child turn running at `at` (the latest that had started by then), or null. */
+export function turnLineage(sql: Sql, id: string, at: number): string | null {
+  if (sql.exec("SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = 'subagent_turns'").toArray().length === 0) return null;
+  const row = sql.exec("SELECT call_id FROM subagent_turns WHERE id = ? AND started_at <= ? ORDER BY started_at DESC, rowid DESC LIMIT 1", id, at).toArray()[0] as { call_id?: unknown } | undefined;
+  return typeof row?.call_id === "string" ? row.call_id : null;
 }
 
 /** A follow-up's turn: running again, with its own operation and the call that sent it. */
@@ -301,6 +376,7 @@ export function startSubagentTurn(sql: Sql, owner: SubagentOwner, id: string, t:
     (t.model ? ", model_option = ?, provider = ?, model = ?, model_now = ?" : "") +
     " WHERE id = ? AND tenant_id = ? AND agent_id = ?",
     t.turnOp, t.callId, t.turnKey ?? null, t.now, ...(t.model ? [t.model.option, t.model.provider, t.model.model, t.model.model] : []), id, owner.tenantId, owner.agentId);
+  recordTurnLineage(sql, id, t.callId, t.now);
 }
 
 /** The engine's id for the turn just started, once `say` has answered with it. */
@@ -330,24 +406,57 @@ export function markReported(sql: Sql, owner: SubagentOwner, id: string) {
  * Every running child marked stopped, before its turn is cancelled (cf/src/runtime.ts `stopTurn`), and every report
  * owed dropped. First, so no pass that reads a cancelled child's end reports it: a report would wake the parent whose
  * turn the stop just ended. `parentSession`: only that conversation's children (an Agents API session cancelled or
- * deleted). Returns the ids of every child it covers, stopped now or not, so the caller cancels each one's session: a
- * child whose row was already idle can still have a run in flight (a task posted while a stop was landing).
+ * deleted). `stopped` is the turns this stop ended, the running ones only: a child owing a report already had its end
+ * decided (and its `subagent.turn` row written), so the stop drops its report but gives that turn no second end.
+ * `ids`: every child it covers, stopped now or not, so the caller cancels each one's session: a child whose row was
+ * already idle can still have a run in flight (a task posted while a stop was landing).
  */
 export function stopRunningSubagents(sql: Sql, owner: SubagentOwner, now = Date.now(), parentSession?: string): { ids: string[]; stopped: Subagent[] } {
   if (!hasSubagentTable(sql)) return { ids: [], stopped: [] };
   const only = parentSession === undefined ? "" : " AND parent_session = ?";
   const scope = parentSession === undefined ? [] : [parentSession];
   const stopped = sql.exec(`UPDATE subagents SET state = 'idle', finished_at = ?, outcome = 'stopped', report = NULL, report_retry_at = NULL
-    WHERE tenant_id = ? AND agent_id = ? AND state != 'idle'${only} RETURNING *`, now, owner.tenantId, owner.agentId, ...scope).toArray().map(rowTo);
-  const ids = (sql.exec(`SELECT id FROM subagents WHERE tenant_id = ? AND agent_id = ?${only}`, owner.tenantId, owner.agentId, ...scope).toArray() as any[])
+    WHERE tenant_id = ? AND agent_id = ? AND state = 'running'${only} RETURNING *`, now, owner.tenantId, owner.agentId, ...scope).toArray().map(rowTo);
+  // Outcome `stopped` here too: what the parent was told (nothing), and what keeps a late background completion from
+  // waking the child (`#subagentWakeGate`) and its work from being spared as its own (`#cancelStraySubagents`).
+  sql.exec(`UPDATE subagents SET state = 'idle', outcome = 'stopped', report = NULL, report_retry_at = NULL
+    WHERE tenant_id = ? AND agent_id = ? AND state = 'reporting'${only}`, owner.tenantId, owner.agentId, ...scope);
+  const ids = (sql.exec(`SELECT id FROM subagents WHERE tenant_id = ? AND agent_id = ? AND state != 'archived'${only}`, owner.tenantId, owner.agentId, ...scope).toArray() as any[])
     .map((r) => String(r.id));
   return { ids, stopped };
+}
+
+/**
+ * A kill switch turned off (the agent's setting, or SUBAGENTS_DISABLED): every running child marked stopped and owing
+ * its parent a notice, in one write, before its run is cancelled (cf/src/runtime.ts `#switchOffSubagents`). The notice
+ * is posted as a report is (`#reportSubagents`): once, across a crash, every child of one parent in one message
+ * (`switchedOffNotice`). The parent's own turn is not touched. Only this sets a row `reporting` with outcome `stopped`.
+ */
+export function switchOffSubagents(sql: Sql, owner: SubagentOwner, now = Date.now()): Subagent[] {
+  if (!hasSubagentTable(sql)) return [];
+  const off = runningSubagents(sql, owner);
+  for (const s of off) {
+    sql.exec(`UPDATE subagents SET state = 'reporting', finished_at = ?, outcome = 'stopped', report = ?, report_note = NULL, report_attempts = 0, report_retry_at = NULL
+      WHERE id = ? AND tenant_id = ? AND agent_id = ? AND state = 'running'`, now, switchedOffNotice([s]), s.id, owner.tenantId, owner.agentId);
+  }
+  return off.filter((s) => subagentOf(sql, owner, s.id)?.state === "reporting");
+}
+
+/**
+ * One notice for every child of one parent a kill switch stopped. It names each one's report key, which is what
+ * "already posted" is read by on pi085 (`#postedOp` reads the conversation's text).
+ */
+export function switchedOffNotice(off: ReadonlyArray<Pick<Subagent, "id" | "turns">>): string {
+  const n = off.length;
+  return `[subagents were switched off for this agent; ${n} running ${n === 1 ? "child was" : "children were"} stopped: ` +
+    `${off.map((s) => `${s.id} (${reportKey(s)})`).join(", ")}. A notice from the harness, not a message from the user. ` +
+    "Nothing they found was kept, and no subagent can be started now: do the reading yourself.]";
 }
 
 /** How many children of this object have a turn running; none when it never had one. One object is one agent. */
 export function runningSubagentCount(sql: Sql): number {
   if (!hasSubagentTable(sql)) return 0;
-  return Number((sql.exec("SELECT COUNT(*) AS n FROM subagents WHERE state != 'idle'").toArray()[0] as any)?.n ?? 0);
+  return Number((sql.exec("SELECT COUNT(*) AS n FROM subagents WHERE state IN ('running', 'reporting')").toArray()[0] as any)?.n ?? 0);
 }
 
 /** Milliseconds until the soonest running child reaches its ceiling, or null when none runs: what a pass wakes for. */
@@ -391,7 +500,14 @@ export function taskMessage(id: string, task: string, followUp: boolean, key: st
 }
 
 /** How a child turn ended, as the report says it. */
-export interface TurnEnd { outcome: "done" | "failed" | "cancelled"; text: string }
+export interface TurnEnd {
+  outcome: "done" | "failed" | "cancelled"; text: string;
+  /**
+   * Why a cancelled turn was: `ceiling`, the harness took it at its time or its lifetime (`overdueSubagent`); `aborted`,
+   * its run was cancelled by anything else. Kept on the turn's end row, which Raft's outcome is read from.
+   */
+  cause?: "ceiling" | "aborted";
+}
 
 /**
  * The child turn's end, from the engine's record of it and the child's transcript: the last assistant message written
@@ -410,11 +526,11 @@ export function turnEnd(entries: readonly EngineEntry[], since: number, result: 
     last = e.message;
     break;
   }
-  if (result.status === "aborted") return { outcome: "cancelled", text: "" };
+  if (result.status === "aborted") return { outcome: "cancelled", text: "", cause: "aborted" };
   if (last?.stopReason === "error") {
     return { outcome: "failed", text: String(last.providerError ?? last.errorMessage ?? "the model call failed") };
   }
-  if (last?.stopReason === "aborted") return { outcome: "cancelled", text: "" };
+  if (last?.stopReason === "aborted") return { outcome: "cancelled", text: "", cause: "aborted" };
   const text = last ? textOf(last) : "";
   if (result.status === "failed" || result.status === "unanswered") {
     return { outcome: "failed", text: result.error || text || "the turn ended without an answer" };
@@ -428,6 +544,14 @@ function textOf(message: { content?: unknown }): string {
   if (typeof c === "string") return c;
   if (!Array.isArray(c)) return "";
   return c.filter((p: any) => p?.type === "text" && typeof p.text === "string").map((p: any) => p.text).join("\n").trim();
+}
+
+/**
+ * The length of a report's body: what follows its head, as the parent reads it — a done turn's answer as far as it is
+ * kept, without the cut marker; a failure's or a cancel's reason. Never the head.
+ */
+export function reportBodyChars(end: TurnEnd): number {
+  return end.outcome === "done" ? Math.min(end.text.length, REPORT_MAX_CHARS) : end.text.length;
 }
 
 /**
@@ -479,6 +603,15 @@ export function childRefusal(address: string): { status: "rejected"; error: { co
   };
 }
 
+/**
+ * When to delegate, as the model is told it (`send_to_agent`'s description): the reads that would fill the agent's own
+ * context with raw content, for a short report instead; never the changes, which a subagent cannot make.
+ */
+export const DELEGATE_GUIDANCE = "prefer it for any read that would bring a lot of raw content into your context — long message " +
+  "histories, reading a repository or documents, broad searches, browsing many pages — and ask for a short, structured report " +
+  "with exactly what you need. Do changes, messages and decisions yourself: subagents are read-only (no writes, no messages, " +
+  "no shell). Don't delegate a single small lookup.";
+
 /** What a subagent can and cannot do, in the words the owner's setting and the model's tool both use. */
 export const SUBAGENTS_READ_ONLY = "Subagents can read and research but cannot change anything or act as this agent: no writes, " +
   "no messages, no shell. Give them reading tasks and do the changes yourself.";
@@ -508,15 +641,12 @@ export function subagentTool(d: {
     // and posts nothing twice, so the parent is told about every child that exists.
     replay: "safe" as const,
     description:
-      "Delegate a self-contained piece of work to a subagent: a fresh copy of you with its own context, your read tools, " +
-      `and no view of this conversation. ${SUBAGENTS_READ_ONLY} ` +
-      "Returns at once with the subagent's id; its final answer arrives later " +
-      "as a message in this conversation and wakes you. Do not wait or poll for it.\n" +
-      "Delegate only (a) independent pieces that can run in parallel, or (b) work too big for one context — reading many " +
-      "files or pages — where only a summary matters to you. Do not delegate a simple question, anything a few tool calls " +
-      "finish, or steps that depend tightly on each other: each subagent costs a whole conversation of model calls.\n" +
+      `Delegate reading to a subagent: ${DELEGATE_GUIDANCE}\n` +
+      "A subagent is a fresh copy of you with its own context, your read tools, and no view of this conversation. It " +
+      "returns at once with the subagent's id; the report arrives later as a message in this conversation and wakes you. " +
+      "Do not wait or poll for it.\n" +
       "task is all the subagent sees, so write a complete instruction: the goal, the exact paths, URLs and ids, the " +
-      "constraints, and the format of the report you want back. agent: a subagent's id, to send it a follow-up; it keeps " +
+      "constraints, and the report you want back. agent: a subagent's id, to send it a follow-up; it keeps " +
       `its history. At most ${SUBAGENT_CAP} run at once.${modelLine}`,
     parameters: {
       type: "object",
