@@ -28,6 +28,14 @@ function must(cond: unknown, msg: string): asserts cond { if (!cond) throw new E
 
 const TOKEN = "operator-token-814";
 
+// /latency fetches from the Worker; in a test those fetches are recorded and answered here, never sent. Whichever
+// world is current records them, so a refused probe shows an outbound fetch as plainly as an object call.
+let outbound: string[] = [];
+globalThis.fetch = (async (input: RequestInfo | URL) => {
+  outbound.push(`fetch.${typeof input === "string" ? input : input instanceof URL ? input.href : input.url}`);
+  return new Response("{}");
+}) as typeof fetch;
+
 /** An env whose object and database record every call and answer harmlessly. */
 function world(token: string | undefined) {
   const calls: string[] = [];
@@ -43,9 +51,15 @@ function world(token: string | undefined) {
     all: async () => { calls.push("db.all"); return { results: [] }; },
     run: async () => { calls.push("db.run"); return { meta: { changes: 0 } }; },
   };
+  const bucket = {
+    put: async (key: string) => { calls.push(`r2.put ${key}`); return {}; },
+    get: async (key: string) => { calls.push(`r2.get ${key}`); return { arrayBuffer: async () => new ArrayBuffer(0) }; },
+  };
+  outbound = calls;
   const env: Record<string, unknown> = {
     AGENT: { idFromName: (n: string) => n, get: () => objectStub },
     CONTROL_DB: { prepare: () => stmt, batch: async () => [] },
+    ARTIFACTS: bucket,
     ...(token === undefined ? {} : { AUTOMATION_TOKEN: token }),
   };
   return { env, calls };
@@ -72,6 +86,30 @@ const ROUTES: Route[] = [
   { path: "/admin/transcript", method: "GET", refused: 401, passed: (s) => s === 400 },
   // A signed-in admin or the operator's token (auth.ts isAdmin); its refusal is "no such route".
   { path: "/admin/models", method: "PATCH", refused: 404, passed: (s) => s === 405 },
+  // The probes (PROBE_ROUTES): no identity of their own, and three of them start a real turn — a task, a wake, a
+  // model call on the deployment's account — so an unauthenticated caller must not reach the object at all (the
+  // loop below checks that no object method was called). "Passed" is the object answering: the stub turns every
+  // method into { ok: true }.
+  { path: "/isolation", method: "GET", refused: 401, passed: (s) => s === 200 },
+  { path: "/eviction", method: "GET", refused: 401, passed: (s) => s === 200 },
+  { path: "/model-binding", method: "GET", refused: 401, passed: (s) => s === 200 },
+  { path: "/sandbox", method: "GET", refused: 401, passed: (s) => s === 200 },
+  { path: "/sandbox/cpu?ms=50", method: "GET", refused: 401, passed: (s) => s === 200 },
+  { path: "/alarm/arm?ms=1000", method: "GET", refused: 401, passed: (s) => s === 200 },
+  { path: "/storage", method: "GET", refused: 401, passed: (s) => s === 200 },
+  { path: "/alarm/status", method: "GET", refused: 401, passed: (s, c) => s === 200 && c.includes("object.alarmStatus") },
+  // /latency touches no object: its work is a 1 MB put and get in R2 and two outbound fetches, so "passed" is that
+  // work, and the refusals below hold that none of it starts without the token.
+  { path: "/latency", method: "GET", refused: 401, passed: (s, c) => s === 200 && c.includes("r2.put bench/big.bin") && c.some((x) => x.startsWith("fetch.")) },
+  // /conformance/executor is routed by its prefix to its own object (conformance-v2), not to p0, and starts
+  // Dynamic Workers there; every method is held to the token, since the switch below answers it whatever the method.
+  ...["GET", "HEAD", "OPTIONS", "POST"].map((method): Route => (
+    { path: "/conformance/executor", method, refused: 401, passed: (s, c) => s === 200 && c.includes("object.runExecutorSpec") })),
+  // A number a probe cannot use is refused, not handed to the object: an unbounded cpuMs and an alarm at an
+  // arbitrary delay are the caller's to ask for only within the caps.
+  { path: "/sandbox/cpu?ms=abc", method: "GET", refused: 401, passed: (s) => s === 400 },
+  { path: "/sandbox/cpu?ms=999999", method: "GET", refused: 401, passed: (s) => s === 400 },
+  { path: "/alarm/arm?ms=999999999", method: "GET", refused: 401, passed: (s) => s === 400 },
 ];
 
 async function hit(r: Route, token: string | undefined, presented: string | null) {
@@ -88,14 +126,14 @@ for (const r of ROUTES) {
     for (const presented of [null, "", "anything", "undefined"]) {
       const out = await hit(r, undefined, presented);
       must(out.status === r.refused, `header ${JSON.stringify(presented)}: ${out.status} ${out.text.slice(0, 200)}`);
-      must(!out.calls.some((c) => c.startsWith("object.")), `header ${JSON.stringify(presented)} reached the object: ${out.calls}`);
+      must(!out.calls.some((c) => /^(object|r2|fetch)\./.test(c)), `header ${JSON.stringify(presented)} reached the object, R2 or the network: ${out.calls}`);
     }
   });
   await check(`${name}: a wrong or missing token is refused`, async () => {
     for (const presented of [null, "", "operator-token-81", TOKEN + "x"]) {
       const out = await hit(r, TOKEN, presented);
       must(out.status === r.refused, `header ${JSON.stringify(presented)}: ${out.status} ${out.text.slice(0, 200)}`);
-      must(!out.calls.some((c) => c.startsWith("object.")), `header ${JSON.stringify(presented)} reached the object: ${out.calls}`);
+      must(!out.calls.some((c) => /^(object|r2|fetch)\./.test(c)), `header ${JSON.stringify(presented)} reached the object, R2 or the network: ${out.calls}`);
     }
   });
   await check(`${name}: the configured token gets past the gate`, async () => {
