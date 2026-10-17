@@ -22,7 +22,7 @@ import { updateAgentSettings, agentSettings } from "../src/runtime/agent-setting
 import { recordBackgroundJob } from "../src/runtime/background-jobs.ts";
 import type { Plugin } from "../src/plugins/types.ts";
 import { raftPlugin } from "../src/plugins/raft.ts";
-import { speakingTools } from "../src/runtime/subagents.ts";
+import { childWithheld, childMayCall, SUBAGENTS_READ_ONLY } from "../src/runtime/subagents.ts";
 import { standInLoader } from "./spec/worker-stand-in.ts";
 import { setLogSink } from "../src/core/log.ts";
 import { sessionFor } from "../cf/src/transcript-read.ts";
@@ -35,10 +35,10 @@ import { SUBAGENT_MAX_TURNS, SUBAGENT_LIFETIME_MS, REPORT_MAX_ATTEMPTS, recordSu
 const logs: any[] = [];
 setLogSink((line) => { try { logs.push(JSON.parse(line)); } catch { /* not ours */ } });
 
-/** A plugin whose writes are the agent speaking, as raft's are (`speaksAs`), and how often its write ran. */
+/** A plugin whose writes act as the agent and that declares nothing, as every built-in one; how often its write ran. */
 let posts = 0;
 const chatter: Plugin = {
-  id: "chatter", version: "1.0.0", speaksAs: "agent",
+  id: "chatter", version: "1.0.0",
   tools: [
     { name: "post", description: "Post a message as the agent.", parameters: { type: "object", properties: { text: { type: "string" } } }, sideEffects: "write", idempotency: "none" },
     { name: "peek", description: "Read messages.", parameters: { type: "object", properties: {} }, sideEffects: "read", idempotency: "native" },
@@ -47,6 +47,14 @@ const chatter: Plugin = {
 } as Plugin;
 
 /** A mount whose work goes to the background and is done at the first poll (test/overflow-backstop.ts has the same). */
+/** A plugin whose writes act on the caller's own scratch and which says so (`actsAs: "self"`): its writes are a subagent's too. */
+let scratched = 0;
+const scratch: Plugin = {
+  id: "scratch", version: "1.0.0", actsAs: "self",
+  tools: [{ name: "note", description: "Keep a note for yourself.", parameters: { type: "object", properties: {} }, sideEffects: "write", idempotency: "none" }] as never,
+  async invoke() { scratched++; return { ok: true }; },
+} as Plugin;
+
 const builder: Plugin = {
   id: "builder", version: "1.0.0",
   tools: [{ name: "build", description: "Build.", parameters: { type: "object", properties: {} }, sideEffects: "write", idempotency: "none" }] as never,
@@ -99,7 +107,7 @@ async function world(engine: "pi085" | "pd", opts: { on?: boolean; builder?: boo
       async cancel() { slow.cancelled++; },
     },
   } as unknown as Plugin;
-  const plugins = [...(opts.builder || opts.chatter ? [builder] : []), ...(opts.chatter ? [chatter] : []), ...(opts.slowBuilder ? [slowPlugin] : [])];
+  const plugins = [...(opts.builder || opts.chatter ? [builder] : []), ...(opts.chatter ? [chatter, scratch] : []), ...(opts.slowBuilder ? [slowPlugin] : [])];
   /** A runtime over this object, as a fresh isolate makes one: nothing opened, nothing remembered. */
   const isolate = () => new AgentRuntime({
     subagentFault: (phase: string, id: string) => fault.at?.(phase, id),
@@ -128,7 +136,7 @@ async function world(engine: "pi085" | "pd", opts: { on?: boolean; builder?: boo
   };
   await w.rt.ready();
   await w.rt.store.createAgent("t", "a", { name: "Ada", description: "d" } as never);
-  for (const [on, id, alias] of [[opts.builder || opts.chatter, "builder", "builder"], [opts.chatter, "chatter", "chat"], [!!opts.slowBuilder, "slow", "slow"]] as const) {
+  for (const [on, id, alias] of [[opts.builder || opts.chatter, "builder", "builder"], [opts.chatter, "chatter", "chat"], [opts.chatter, "scratch", "scratch"], [!!opts.slowBuilder, "slow", "slow"]] as const) {
     if (!on) continue;
     await w.rt.store.setPluginChoice("t", "a", id, "enable");
     must((await w.rt.addMount("t", "a", { alias, plugin: id, config: {} })).ok, `the ${id} mount was refused`);
@@ -487,7 +495,7 @@ for (const engine of (process.env.ENGINES ?? "pi085,pd").split(",").filter((e) =
     }
     await settle(w);
     const child = rowsOf(w)[0]!.id as string;
-    const notices = (await mainTexts(w)).filter((t) => t.includes(`the report of subagent ${child} could not be delivered`));
+    const notices = (await mainTexts(w)).filter((t) => t.includes(`the report of subagent ${child} (undelivered ${child}/1) could not be delivered`));
     must(notices.length === 1, `notices: ${show(await mainTexts(w))}`);
     must(!(await mainTexts(w)).some((t) => t.includes("the lost report")), "the dropped report itself landed");
   });
@@ -523,31 +531,88 @@ for (const engine of (process.env.ENGINES ?? "pi085,pd").split(",").filter((e) =
     must((await reports(w)).length === 1, show(await reports(w)));
   });
 
-  await check(`${engine}: a subagent is offered no tool that speaks as the agent, and its program's call to one is refused`, async () => {
+  await check(`${engine}: a subagent is read-only: offered only reads and a self-acting plugin's writes; any other call, a program's by alias or plugin id, is refused`, async () => {
     const w = await world(engine, { chatter: true, sandbox: true });
-    posts = 0;
+    posts = 0; scratched = 0;
     let parentCalls = 0, childCalls = 0;
     w.reply = (session) => {
       if (session === "main") { parentCalls++; return parentCalls === 1 ? calls({ id: "c1", args: { task: "tell everyone hi" } }) : say("ok"); }
       childCalls++;
       return childCalls === 1
         ? ({ text: "", finishReason: "tool_calls", truncated: false, usage: USAGE, toolCalls: [{ id: "j1", name: "run_js", arguments: { source:
-            // By the mount's alias, and by the plugin's id, which the gateway resolves to the same mount.
-            "for (const t of ['chat.post', 'chatter.post']) { try { output(await tool([t + ' ', ''], { text: 'hi' })); } catch (e) { output(t + ': ' + String(e?.message ?? e)); } }" } }] } as ModelResponse)
-        : say("could not post");
+            // A write of an undeclared plugin by alias and by plugin id; a write of a new plugin that declares nothing; and
+            // a self-acting plugin's write, which goes through.
+            "for (const t of ['chat.post', 'chatter.post', 'builder.build', 'scratch.note']) { try { output(t + ': ' + JSON.stringify(await tool([t + ' ', ''], { text: 'hi' }))); } catch (e) { output(t + ': ' + String(e?.message ?? e)); } }" } }] } as ModelResponse)
+        : say("done reading");
     };
     await w.rt.postMessage("t", "a", "go", "prompt", "main");
     await settle(w);
     const parentTools = toolNames(w.requests.find((r) => r.session === "main")!.req);
     const childTools = toolNames(w.requests.find((r) => r.session.startsWith("sub_"))!.req);
-    must(parentTools.includes("chat__post") && parentTools.includes("chat__peek"), `the agent lost its own tools: ${show(parentTools)}`);
-    must(!childTools.includes("chat__post"), `the child was offered a write that speaks as the agent: ${show(childTools)}`);
-    must(childTools.includes("chat__peek") && childTools.includes("builder__build") && childTools.includes("run_js"), `the child lost tools it may have: ${show(childTools)}`);
-    must(posts === 0, `the child's program posted ${posts} time(s)`);
+    for (const t of ["chat__post", "chat__peek", "builder__build", "scratch__note", "jobs"]) must(parentTools.includes(t), `the agent lost ${t}: ${show(parentTools)}`);
+    for (const t of ["chat__post", "builder__build", "jobs", SUBAGENT_TOOL]) must(!childTools.includes(t), `the child was offered ${t}: ${show(childTools)}`);
+    for (const t of ["chat__peek", "scratch__note", "run_js"]) must(childTools.includes(t), `the child lost ${t}, which it may have: ${show(childTools)}`);
+    must(posts === 0 && scratched === 1, `the child's program wrote: posts ${posts}, scratch ${scratched}`);
     const result = JSON.stringify(w.requests.filter((r) => r.session.startsWith("sub_"))[1]!.req.messages.filter((m: any) => m.role === "tool"));
-    must((result.match(/chat\.post acts as the agent, and a subagent does not speak for it/g) ?? []).length === 2, `not both refused: ${result.slice(0, 600)}`);
+    must((result.match(/chat\.post is not a read, and a subagent only reads/g) ?? []).length === 2, `chat.post not refused by alias and by plugin id: ${result.slice(0, 700)}`);
+    must(/builder\.build is not a read, and a subagent only reads/.test(result) && !/scratch\.note[^"]*not a read/.test(result), `the undeclared plugin or the self plugin: ${result.slice(0, 700)}`);
   });
 
+  await check(`${engine}: a ceiling cancel that throws still leaves no model call after the next pass`, async () => {
+    const w = await world(engine);
+    let parentCalls = 0;
+    // A child that never ends on its own: every answer asks for a tool it is not offered.
+    w.reply = (session) => session === "main" ? (++parentCalls === 1 ? calls({ id: "c1", args: { task: "loop" } }) : say("ok"))
+      : ({ text: "", finishReason: "tool_calls", truncated: false, usage: USAGE, toolCalls: [{ id: `l${w.requests.length}`, name: "nonexistent_tool", arguments: {} }] } as ModelResponse);
+    await w.rt.postMessage("t", "a", "go", "prompt", "main");
+    for (let i = 0; i < 6; i++) await pass(w);
+    const child = rowsOf(w)[0]!.id as string;
+    must(w.requests.filter((r) => r.session === child).length > 0, "control: the child never called the model");
+    w.raw.sql.exec("UPDATE subagents SET turn_started_at = turn_started_at - ? WHERE id = ?", 31 * 60_000, child);
+    let threw = 0;
+    w.fault.at = (p) => { if (p === "ceiling-cancel" && threw === 0) { threw++; throw new Error("the cancel did not get through"); } };
+    await pass(w);
+    must(threw === 1 && rowsOf(w)[0]!.outcome === "cancelled", `control: ${threw} ${show(rowsOf(w))}`);
+    w.fault.at = null;
+    await pass(w);
+    const after = w.requests.filter((r) => r.session === child).length;
+    for (let i = 0; i < 5; i++) { await pass(w); await sleep(10); }
+    must(w.requests.filter((r) => r.session === child).length === after, `the child kept calling the model: ${w.requests.filter((r) => r.session === child).length - after} more`);
+  });
+
+  await check(`${engine}: an Agents API session's cancel opens no finished child of it: twenty of them, none opened`, async () => {
+    const w = await world(engine);
+    for (let i = 0; i < 20; i++) {
+      const id = `sub_${String(i).padStart(16, "0")}`;
+      recordSubagent(w.raw.sql as never, { tenantId: "t", agentId: "a" }, { id, parentSession: "sess_x", callId: `c${i}`, modelOption: null, provider: null, model: null, turnOp: null, turnKey: null, now: Date.now() });
+      w.raw.sql.exec("UPDATE subagents SET state = 'idle', outcome = 'done' WHERE id = ?", id);
+    }
+    w.rt = w.isolate();
+    await w.rt.ready();
+    const opens = () => trace(w).filter((r) => r.kind === "harness.open" && String(r.spanId).includes("#sub_")).length;
+    const before = opens();
+    await w.rt.cancelSessionTree("t", "a", "sess_x");
+    must(opens() === before, `the cancel opened ${opens() - before} finished children`);
+  });
+
+  await check(`${engine}: two reports dropped together leave the parent one notice naming both`, async () => {
+    const w = await world(engine);
+    let parentCalls = 0, release = false;
+    w.reply = (session, req) => session === "main" ? (++parentCalls === 1 ? calls({ id: "c1", args: { task: "A" } }, { id: "c2", args: { task: "B" } }) : say("ok"))
+      : release ? say(`lost ${taskOf(req).slice(-1)}`) : null;
+    await w.rt.postMessage("t", "a", "go", "prompt", "main");
+    for (let i = 0; i < 6; i++) await pass(w);
+    w.fault.at = (p) => { if (p === "report-posting") throw new Error("the parent's lane said no"); };
+    release = true;
+    const has = () => w.raw.sql.exec("SELECT 1 FROM sqlite_master WHERE name = 'subagents'").toArray().length > 0;
+    for (let i = 0; i < 40 && !(has() && rowsOf(w).every((r) => r.state === "idle")); i++) {
+      await pass(w);
+      w.raw.sql.exec("UPDATE subagents SET report_retry_at = 0 WHERE state = 'reporting'");
+    }
+    await settle(w);
+    const notices = (await mainTexts(w)).filter((t) => t.includes("could not be delivered"));
+    must(notices.length === 1 && rowsOf(w).every((r) => notices[0]!.includes(r.id)), `notices: ${show(notices)}`);
+  });
 
   await check(`${engine}: a stop landing while a task is being posted leaves no run: the spawn cancels it itself, and says so`, async () => {
     const w = await world(engine);
@@ -1121,16 +1186,25 @@ for (const engine of (process.env.ENGINES ?? "pi085,pd").split(",").filter((e) =
   });
 }
 
-await check("rules: raft speaks as the agent; its writes are what a subagent may not call, its reads are not", () => {
-  must(raftPlugin.speaksAs === "agent", "raft does not declare it");
-  const tools = raftPlugin.tools.map((t: any) => ({ address: `raft.${t.name}`, sideEffects: t.sideEffects }));
-  const speaking = speakingTools(tools, () => "agent");
-  for (const n of ["messages_send", "messages_reply", "messages_react", "tasks_create", "tasks_update_status", "channels_join"]) {
-    must(speaking.has(`raft.${n}`), `raft.${n} is not withheld`);
+await check("rules: a subagent may call only declared reads and a self-acting plugin's writes; every built-in write is withheld", async () => {
+  const rt = new AgentRuntime({ ctx: { storage: { sql: sqliteHost().sql } }, bucket: {} as never, bucketName: "b", models: { resolve: () => null }, loader: {} as never, makeToolBinding: () => null } as never);
+  for (const p of rt.plugins()) {
+    must((p as any).actsAs === undefined, `${p.id} declares actsAs, and every built-in plugin's writes may act as the agent`);
+    const tools = (p.tools ?? []).map((t: any) => ({ address: `${p.id}.${t.name}`, sideEffects: t.sideEffects }));
+    const withheld = childWithheld(tools, () => p.actsAs);
+    for (const t of tools) must(withheld.has(t.address) === (t.sideEffects !== "read"), `${t.address} (${t.sideEffects}) ${withheld.has(t.address) ? "withheld" : "offered"}`);
   }
-  for (const n of ["messages_read", "inbox_list", "tasks_list", "messages_search"]) must(!speaking.has(`raft.${n}`), `raft.${n} is withheld`);
-  must(speaking.size === tools.filter((t) => t.sideEffects === "write").length, "not every raft write is withheld");
-  must(speakingTools(tools, () => undefined).size === 0, "a plugin that does not speak as the agent lost its writes");
+  // The ones that act as the agent by name, as the review listed them: GitHub writes, an HTTP send, the sandbox shell, raft.
+  const by = (id: string) => rt.plugins().find((p) => p.id === id)!;
+  for (const [plugin, tool] of [["github", "api"], ["github", "issue_comment"], ["http", "send"], ["sandbox", "shell"], ["sandbox", "run"], ["raft", "messages_send"], ["state", "secret_put"]] as const) {
+    const t = (by(plugin).tools as any[]).find((x) => x.name === tool);
+    must(t && !childMayCall(t, by(plugin).actsAs), `${plugin}.${tool} is callable by a subagent`);
+  }
+  // MCP lists its tools from the server; one not marked read-only is a write (src/plugins/mcp.ts), and withheld.
+  must(!childMayCall({ sideEffects: "write" }, by("mcp").actsAs) && childMayCall({ sideEffects: "read" }, by("mcp").actsAs), "MCP");
+  // A tool that declares no side effect, and a plugin that declares nothing: withheld; `self` lets a write through.
+  must(!childMayCall({}, undefined) && !childMayCall(undefined, undefined) && childMayCall({ sideEffects: "write" }, "self"), "the defaults");
+  must(SUBAGENTS_READ_ONLY.includes("cannot change anything"), "the words");
 });
 
 await check("pi085: a report goes through the agent's post: dropped like a background completion while main needs a reset, and carries a pending briefing", async () => {
@@ -1169,7 +1243,7 @@ await check("rules: every raft operation that can hold a call for a question is 
   const asking = (RAFT_OPERATIONS as any[]).filter((o) => o.mayInterrupt);
   must(asking.length > 0, "control: the manifest names no operation that asks");
   const tools = raftPlugin.tools.map((t: any) => ({ address: `raft.${t.name}`, sideEffects: t.sideEffects }));
-  const withheld = speakingTools(tools, (alias) => alias === "raft" ? raftPlugin.speaksAs : undefined);
+  const withheld = childWithheld(tools, () => raftPlugin.actsAs);
   for (const op of asking) must(withheld.has(`raft.${op.toolName}`), `${op.toolName} asks questions and a subagent may call it`);
 });
 

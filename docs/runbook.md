@@ -118,14 +118,15 @@ row to the agent's trace.
 ## Subagents
 
 An agent can delegate work to subagents (docs/agent-surface.md, "Subagents") only where its `subagents` setting is on.
-It is off for every agent unless set. Turn it on for one agent:
+It is off for every agent unless set. Subagents can read and research but cannot change anything or act as this agent: no writes, no messages, no shell. Give them reading tasks and do the changes yourself. Turn it on for one agent:
 
 ```
 curl -s -X PATCH -H "x-harness-token: $AUTOMATION_TOKEN" -H "content-type: application/json" \
   "$HOST/admin/agent-settings" -d '{"tenantId":"<tenantId>","agentId":"<agentId>","settings":{"subagents":true}}'
 ```
 
-The answer is the settings in force and what moved: `{"settings":{"subagents":true},"changed":["subagents"]}`. The
+The answer is the settings in force, what moved, and what each setting does: `{"settings":{"subagents":true},
+"changed":["subagents"],"about":{"subagents":"…"}}`. The
 agent's next turn is offered `send_to_agent`; a turn already running keeps the tools it started with. Off again is the
 same call with `false`. **Turning it off does not stop subagents already running**: they finish and report. To stop
 them, stop the agent's turn with `/admin/cancel-turn` ([Stopping a runaway agent](#stopping-a-runaway-agent)), which

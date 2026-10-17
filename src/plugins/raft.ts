@@ -1213,7 +1213,7 @@ function retryKey(op: RaftOperationSpec, out: RaftFailure, sent: Record<string, 
 
 /**
  * Whether an operation runs on the mount's saved state. Not one that books "seen" (below, in `runOperation`), and not
- * any call of a subagent (src/runtime/subagents.ts): a subagent only reads here (`speaksAs`), and what it read is its
+ * any call of a subagent (src/runtime/subagents.ts): a subagent only reads (`childMayCall`), and what it read is its
  * own context's, which nothing it does later attests. Its calls also run beside the agent's: the store saves with a
  * compare-and-set (`stateStore`), a lost race is not retried and costs the loser's bookings, so a subagent that saved
  * could cost the agent what it had booked. On a state of its own for the call, it saves nothing and loses the agent nothing.
@@ -2395,9 +2395,6 @@ export function createRaftPlugin(deps: {
   return {
     id: "raft",
     version: "1.0.0",
-    // Every write is the agent posting into Raft under its own identity (a message, a reaction, a task), so a
-    // subagent, whose final answer goes to the agent and to no one else, is offered the reads only.
-    speaksAs: "agent",
     /**
      * Which tools this build can offer, and what each needs, as one string: it moves when the SDK's manifest
      * (an operation or its capability), `EXCLUDED` or the presence of object storage changes the generated set, and a snapshot taken under another basis is re-taken at the next

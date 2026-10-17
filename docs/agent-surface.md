@@ -741,6 +741,8 @@ delegates a self-contained piece of work to a **subagent**: a child conversation
 context. The design is issue #926; the code is `src/runtime/subagents.ts` and `cf/src/runtime.ts` (`#sendToAgent`,
 `#reportSubagents`).
 
+**Subagents are read-only.** Subagents can read and research but cannot change anything or act as this agent: no writes, no messages, no shell. Give them reading tasks and do the changes yourself.
+
 ```
 send_to_agent { task: string, agent?: string, model?: string }
   → { "agent": "sub_…", "status": "started", "note": "…" }
@@ -767,15 +769,16 @@ send_to_agent { task: string, agent?: string, model?: string }
 - **At most 3** subagents of one agent run at once; a fourth start (or a follow-up that would be the fourth) is refused,
   naming the running ones. One subagent takes at most 10 turns and lives at most 2 hours from its creation; each turn is
   cancelled after 30 minutes. A background job a subagent started is delivered to it only under the same limits.
-- **Depth 1.** A subagent is never offered `send_to_agent`, nor an Agents API caller's functions. It has the agent's
-  other tools: its mounts, `run_js`, `jobs`. Mounts, containers and files are the agent's, so a subagent works in the
-  same workspace as its parent.
-- **It does not speak as the agent.** A plugin whose writes act outward as the agent declares `speaksAs: "agent"`
-  ([docs/plugins.md](plugins.md); `raft` does). A subagent is offered that plugin's reads and none of its declared
-  writes — no message, reply, reaction or task change in Raft — and a call to one, a program's included, is refused
-  with `subagent_cannot_speak`. The refusal is decided on the mount and tool the name resolves to, so naming the plugin
-  instead of the mount's alias is refused alike. What it would have sent goes in its report, and the agent decides. Its
-  Raft reads run on a state of their own for the call, so they never save over the agent's Raft state.
+- **Depth 1.** A subagent is never offered `send_to_agent`, nor an Agents API caller's functions, nor `jobs`.
+- **Read-only.** A subagent is offered a mount's tool only when the tool declares `sideEffects: "read"`, or its plugin
+  declares `actsAs: "self"` ([docs/plugins.md](plugins.md); no built-in plugin does). Everything else is withheld:
+  GitHub writes with the agent's token, an MCP tool not marked read-only, `http.send` with a stored secret, the sandbox's
+  shell and commands (its environment carries credentials), Raft messages and task changes, the agent's own memory
+  writes. A tool that declares no side effect, and any plugin that declares nothing, is withheld too, so a new plugin is
+  safe by default. A call to a withheld tool — by the model, by a `run_js` program, in an answer to a held question,
+  by the mount's alias or by the plugin's id — is refused at dispatch with `subagent_read_only`, decided on the mount
+  and tool the name resolves to. A subagent keeps `run_js` and `resume`, which reach only what it may call. Its Raft
+  reads run on a state of their own and never save over the agent's Raft state.
 - **Replay-safe.** The tool is `replay: "safe"`: a call cut off by an isolate dying runs again, on either engine. The
   child's id is derived from the call (the conversation, the call's invocation — pi085's invocation id, pd's tool task —
   and its call id), so the second run finds the child the first one made, the task is posted once, and the parent is
@@ -826,9 +829,9 @@ spend limits like any other. Its share is visible in the trace: its `model.call`
 
 **Known limits.** On pi085 a subagent's conversation has no compaction and no overflow backstop (both are the main
 conversation's), so a subagent's task must fit one context window. On pd every conversation's tools are opened when a
-cold isolate first drives the harness, so an agent with many past subagents pays for opening each of them then. A
-plugin that writes as the agent and does not declare `speaksAs` is not withheld; only `raft` declares it today. There is
-no route or tool that stops one subagent alone. On pd the context window a subagent runs in is the agent's model's, not
+cold isolate first drives the harness, so an agent with many past subagents pays for opening each of them then.
+Subagents cannot run commands: a sandbox without the agent's credentials, which a subagent could have, is a future
+change. There is no route or tool that stops one subagent alone. On pd the context window a subagent runs in is the agent's model's, not
 its model option's.
 
 ## Evaluation setup (preview only)

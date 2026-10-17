@@ -3456,8 +3456,10 @@ async function adminHooks(request: Request, env: Env, url: URL): Promise<Respons
  * `/admin/agent-settings`, automation token only: an agent's own switches (src/runtime/agent-settings.ts), kept in its
  * object. docs/runbook.md, "Subagents".
  *
- *   GET   ?tenantId=&agentId=                      → { settings, subagents }
- *   PATCH { tenantId, agentId, settings: { subagents: true } } → { settings, changed }
+ *   GET   ?tenantId=&agentId=                      → { settings, about, subagents }
+ *   PATCH { tenantId, agentId, settings: { subagents: true } } → { settings, changed, about }
+ *
+ * `about` says what each setting does (src/runtime/agent-settings.ts): for `subagents`, that they only read.
  *
  * `subagents` lists the agent's subagents, newest first, with each one's state and last outcome: what an operator reads
  * to see what a stop stopped. 404 for an agent that is not there; a setting this does not know, or a value that is not
@@ -3480,7 +3482,7 @@ async function adminAgentSettings(request: Request, env: Env, url: URL): Promise
   const r = await stub.adminUpdateAgentSettings(tenantId, agentId, b?.settings);
   if (!r.ok) return Response.json({ error: r.error }, { status: r.status });
   logEvent("agent.settings", { tenantId, agentId, changed: r.changed.join(","), settings: JSON.stringify(r.settings) });
-  return Response.json({ settings: r.settings, changed: r.changed });
+  return Response.json({ settings: r.settings, changed: r.changed, about: r.about });
 }
 
 /**

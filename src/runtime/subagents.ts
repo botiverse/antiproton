@@ -172,10 +172,16 @@ export function combinedRequestId(keys: readonly string[]): string {
 /** The key of the notice a dropped report leaves its parent (`undeliveredNotice`): posted once. */
 export const undeliveredKey = (s: Pick<Subagent, "id" | "turns">) => `undelivered ${s.id}/${s.turns}`;
 
-/** What the parent is told when a report could not be posted in `REPORT_MAX_ATTEMPTS` tries and was dropped. */
-export function undeliveredNotice(s: Pick<Subagent, "id" | "turns">, attempts: number): string {
-  return `[subagent ${s.id} (${undeliveredKey(s)}) — the report of subagent ${s.id} could not be delivered after ${attempts} attempts; ` +
-    "a notice from the harness, not a message from the user. Its answer is lost: you may delegate the task again, to a new subagent or with a follow-up.]";
+/**
+ * What the parent is told when reports could not be posted in `REPORT_MAX_ATTEMPTS` tries and were dropped: one notice
+ * for all the reports one failed post carried, each named with its key.
+ */
+export function undeliveredNotice(lost: ReadonlyArray<Pick<Subagent, "id" | "turns">>, attempts: number): string {
+  const one = lost.length === 1;
+  const names = lost.map((s) => `${s.id} (${undeliveredKey(s)})`).join(", ");
+  return `[the report${one ? "" : "s"} of subagent${one ? "" : "s"} ${names} could not be delivered after ${attempts} attempts; ` +
+    `a notice from the harness, not a message from the user. ${one ? "Its answer is" : "Their answers are"} lost: you may ` +
+    "delegate the task again, to a new subagent or with a follow-up.]";
 }
 
 export function subagentOf(sql: Sql, owner: SubagentOwner, id: string): Subagent | null {
@@ -380,8 +386,8 @@ export function startedResult(s: { id: string; followUp: boolean; model: string 
  */
 export function taskMessage(id: string, task: string, followUp: boolean, key: string): string {
   return `[${followUp ? "a follow-up" : "a task"} (${key}) from the agent that started you, sent with ${SUBAGENT_TOOL}; you are its subagent ${id}. ` +
-    "Your final message is your report: it is all the agent receives, so make it complete. Nobody else reads this conversation, " +
-    "so do not message people or channels unless the task says to.]\n\n" + task;
+    "Your final message is your report: it is all the agent receives, so make it complete. Nobody else reads this conversation. " +
+    "You can only read: you cannot change anything or act as the agent, so put what you would have done in your report.]\n\n" + task;
 }
 
 /** How a child turn ended, as the report says it. */
@@ -442,34 +448,40 @@ export function reportMessage(s: Pick<Subagent, "id" | "turnStartedAt" | "turns"
 }
 
 /**
- * The addresses (`alias.tool`) a subagent may not call: each write of a plugin that `speaksAs` the agent
- * (src/plugins/types.ts). Decided by the plugin's declaration and the tool's declared side effect, never by a list of
- * names, so a tool such a plugin adds later is covered without anyone coming back here. The declared `sideEffects` is
- * the ceiling (a mount's per-call classification can only lower it), so a tool declared a write is a write here.
+ * Whether a subagent may call a tool. Subagents are read-only: a tool whose declared `sideEffects` is `read`, or one of a
+ * plugin that declares its writes act on nothing but the caller's own scratch (`actsAs: "self"`, src/plugins/types.ts).
+ * Everything else — a write, a tool that declares no side effect, a plugin that declares nothing — is withheld: a git
+ * push, a message, an HTTP send with a stored secret, a shell with a credential in its environment all act as the
+ * agent, and a new plugin is withheld until it says otherwise. Decided by declarations, never by a list of names. The
+ * declared `sideEffects` is the ceiling (a mount's per-call classification can only lower it).
  */
-export function speakingTools(
-  tools: ReadonlyArray<{ address: string; sideEffects?: "read" | "write" }>,
-  speaksAs: (alias: string) => "agent" | undefined,
-): Set<string> {
-  const out = new Set<string>();
-  for (const t of tools) {
-    const alias = t.address.slice(0, t.address.indexOf("."));
-    if (t.sideEffects !== "read" && speaksAs(alias) === "agent") out.add(t.address);
-  }
-  return out;
+export function childMayCall(tool: { sideEffects?: "read" | "write" } | undefined, actsAs: "self" | undefined): boolean {
+  return tool?.sideEffects === "read" || actsAs === "self";
 }
 
-/** What a subagent's call to one of `speakingTools` is answered, by the dispatch that refuses it. */
-export function speakingRefusal(address: string): { status: "rejected"; error: { code: string; message: string } } {
+/** The addresses (`alias.tool`) of `tools` a subagent may not call (`childMayCall`). */
+export function childWithheld(
+  tools: ReadonlyArray<{ address: string; sideEffects?: "read" | "write" }>,
+  actsAs: (alias: string) => "self" | undefined,
+): Set<string> {
+  return new Set(tools.filter((t) => !childMayCall(t, actsAs(t.address.slice(0, t.address.indexOf("."))))).map((t) => t.address));
+}
+
+/** What a subagent's call to a tool it may not call is answered, by the dispatch that refuses it. */
+export function childRefusal(address: string): { status: "rejected"; error: { code: string; message: string } } {
   return {
     status: "rejected",
     error: {
-      code: "subagent_cannot_speak",
-      message: `${address} acts as the agent, and a subagent does not speak for it. Put what you would have sent in your final ` +
-        "message: that is your report, and the agent decides what to send.",
+      code: "subagent_read_only",
+      message: `${address} is not a read, and a subagent only reads: it cannot change anything or act as the agent. Put what ` +
+        "you would have done in your final message: that is your report, and the agent decides what to do.",
     },
   };
 }
+
+/** What a subagent can and cannot do, in the words the owner's setting and the model's tool both use. */
+export const SUBAGENTS_READ_ONLY = "Subagents can read and research but cannot change anything or act as this agent: no writes, " +
+  "no messages, no shell. Give them reading tasks and do the changes yourself.";
 
 /** The parameters the model sends. */
 export interface SendParams { task?: unknown; agent?: unknown; model?: unknown }
@@ -496,8 +508,9 @@ export function subagentTool(d: {
     // and posts nothing twice, so the parent is told about every child that exists.
     replay: "safe" as const,
     description:
-      "Delegate a self-contained piece of work to a subagent: a fresh copy of you with its own context, the same tools, files " +
-      "and containers, and no view of this conversation. Returns at once with the subagent's id; its final answer arrives later " +
+      "Delegate a self-contained piece of work to a subagent: a fresh copy of you with its own context, your read tools, " +
+      `and no view of this conversation. ${SUBAGENTS_READ_ONLY} ` +
+      "Returns at once with the subagent's id; its final answer arrives later " +
       "as a message in this conversation and wakes you. Do not wait or poll for it.\n" +
       "Delegate only (a) independent pieces that can run in parallel, or (b) work too big for one context — reading many " +
       "files or pages — where only a summary matters to you. Do not delegate a simple question, anything a few tool calls " +

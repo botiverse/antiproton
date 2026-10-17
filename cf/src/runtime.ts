@@ -66,13 +66,13 @@ import { closeTurn, discardTurn, openTurn, turnInbound, turnNotSaid, turnPaused,
 import {
   admitSubagent, finishSubagentTurn, runningSubagentCount, subagentCeilingMs, SUBAGENT_CAP, SUBAGENT_MAX_MS, isSubagentSession, listSubagents, overdueSubagent, recordSubagent, reportMessage,
   runningSubagents, setSubagentTurnOp, startedResult as subagentStarted, startSubagentTurn, stopRunningSubagents, subagentOf, subagentTool,
-  SUBAGENT_TOOL, speakingRefusal, speakingTools, taskMessage, turnEnd, type Subagent, type TurnEnd,
+  SUBAGENT_TOOL, childMayCall, childRefusal, childWithheld, taskMessage, turnEnd, type Subagent, type TurnEnd,
   markReported, reportingSubagents, reportKey, subagentIdFor, taskKey, turnKeyOf,
   reportFailed, reportRetryMs, subagentSpent, subagentTurnRow, noteSubagentModel, combinedRequestId, undeliveredKey, undeliveredNotice,
 } from "../../src/runtime/subagents.ts";
 import { subagentModelChoice } from "./model-request.ts";
 import type { ModelLayers } from "./control-plane.ts";
-import { agentSettings, updateAgentSettings } from "../../src/runtime/agent-settings.ts";
+import { AGENT_SETTING_ABOUT, agentSettings, updateAgentSettings } from "../../src/runtime/agent-settings.ts";
 import type { UserModels } from "../../src/model/user-models.ts";
 import { pdConversationId, pdSubmissionStatus, readPdEntries } from "../../src/runtime/pd-transcript.ts";
 
@@ -802,7 +802,7 @@ export interface RuntimeDeps {
    * A test's knob: called at the points of a subagent's send and report where a crash must lose nothing. A throw is the
    * crash; a promise that never settles is an isolate that died there.
    */
-  subagentFault?: (phase: "task-posting" | "task-posted" | "report-decided" | "report-posting" | "report-written" | "report-posted", subagent: string) => void | Promise<void>;
+  subagentFault?: (phase: "task-posting" | "task-posted" | "report-decided" | "report-posting" | "report-written" | "report-posted" | "ceiling-cancel", subagent: string) => void | Promise<void>;
   /**
    * What decides over a subagent's model option besides USER_MODELS, read from the control plane for the agent: the
    * administrator's rows and the owner's pick (`ModelLayers`), and whether the server's picker switch refuses another
@@ -2094,18 +2094,18 @@ export class AgentRuntime {
     const readBack = reader?.name ?? null;
     const withheld = new Set(this.#deps.withholdTools ?? []);
     const subagent = isSubagentSession(ctx.taskId);
-    // Whether a subagent's call acts as the agent, decided on what the gateway resolves the name to — `alias.tool` or
-    // `plugin.tool` alike (`ToolGateway.resolve`) — never on the string: the resolved mount's plugin speaks as the agent
-    // (`speaksAs`) and the tool is not one the catalogue declares a read. Asked of the catalogue as it is at the call, so
-    // a mount added since the harness was built counts; a tool the catalogue does not list is refused, not let through.
+    // Whether a subagent may make this call (`childMayCall`: reads, and a `self` plugin's writes), decided on what the
+    // gateway resolves the name to — `alias.tool` or `plugin.tool` alike (`ToolGateway.resolve`) — never on the string.
+    // Asked of the catalogue as it is at the call, so a mount added since the harness was built counts; a tool the
+    // catalogue does not list declares no side effect, and is refused. A name that resolves to no mount is the
+    // gateway's to refuse. Answers the address refused, or null.
     const speaks = async (raw: string): Promise<string | null> => {
       const r = await gw.resolve(ctx, raw);
       if (!("mount" in r) || !r.mount) return null;
       const plugin = this.#plugins.find((p) => p.id === r.mount!.plugin);
-      if (plugin?.speaksAs !== "agent") return null;
       const address = `${r.mount.alias}.${r.tool}`;
       const declared = (await this.#catalogueFor(ctx.tenantId, ctx.agentId)).tools.find((t) => t.address === address);
-      return declared?.sideEffects === "read" ? null : address;
+      return childMayCall(declared, plugin?.actsAs) ? null : address;
     };
     const ended = this.#deps.ended;
     const gw = this.#gateway;
@@ -2220,7 +2220,7 @@ export class AgentRuntime {
         if (refused) return refused;
         // A subagent's session is never offered a tool that acts as the agent; a program of its could still name one.
         const speaking = subagent ? await speaks(call.tool) : null;
-        if (speaking) return speakingRefusal(speaking);
+        if (speaking) return childRefusal(speaking);
         if (ended?.({ tenantId: ctx.tenantId, agentId: ctx.agentId })) return taskEndedRefusal(call.tool);
         return held(call.tool, await dispatch(call));
       },
@@ -2228,7 +2228,7 @@ export class AgentRuntime {
       async resumeInterrupt(i: ToolInterrupt, answer: Json, callId: string): Promise<ToolResult> {
         const call = { tool: `${i.alias}.${i.tool}`, args: null, callId };
         const speaking = subagent ? await speaks(call.tool) : null;
-        if (speaking) return speakingRefusal(speaking);
+        if (speaking) return childRefusal(speaking);
         if (ended?.({ tenantId: ctx.tenantId, agentId: ctx.agentId })) return taskEndedRefusal(call.tool);
         return held(call.tool, await dispatch(call, () => gw.resumeInterrupt(inTurn(), i, answer, { callId })));
       },
@@ -3052,10 +3052,10 @@ export class AgentRuntime {
     return Object.values(settings).some(Boolean) ? `${key}|${JSON.stringify(settings)}` : key;
   }
 
-  /** The catalogue's tools that act as the agent (`speakingTools`, src/runtime/subagents.ts), by address. */
-  #speakingIn(c: { records: Array<{ alias: string; plugin: string }>; tools: Array<{ address: string; sideEffects?: "read" | "write" }> }): Set<string> {
+  /** The catalogue's tools a subagent may not call (`childWithheld`, src/runtime/subagents.ts), by address. */
+  #childWithheldIn(c: { records: Array<{ alias: string; plugin: string }>; tools: Array<{ address: string; sideEffects?: "read" | "write" }> }): Set<string> {
     const pluginOf = new Map(c.records.map((m) => [m.alias, m.plugin]));
-    return speakingTools(c.tools, (alias) => this.#plugins.find((p) => p.id === pluginOf.get(alias))?.speaksAs);
+    return childWithheld(c.tools, (alias) => this.#plugins.find((p) => p.id === pluginOf.get(alias))?.actsAs);
   }
 
   async #catalogueFor(tenantId: string, agentId: string) {
@@ -3086,9 +3086,9 @@ export class AgentRuntime {
   ) {
     const catalogue = await this.#catalogueFor(tenantId, agentId);
     const { records, unoffered } = catalogue;
-    // A subagent is not offered a tool that acts as the agent (`speakingTools`); its dispatch refuses one as well (`#host`).
+    // A subagent is read-only: it is offered only what it may call (`childWithheld`); its dispatch refuses the rest as well (`#host`).
     const tools = isSubagentSession(session)
-      ? (() => { const speaking = this.#speakingIn(catalogue); return catalogue.tools.filter((t) => !speaking.has(t.address)); })()
+      ? (() => { const withheld = this.#childWithheldIn(catalogue); return catalogue.tools.filter((t) => !withheld.has(t.address)); })()
       : catalogue.tools;
     const sandbox = this.#deps.sandbox ?? true;
     const store = this.store;
@@ -3196,7 +3196,8 @@ export class AgentRuntime {
             scope: session,
           })
         : asks ? [resumeTool(this.#continuations, { ...counting, scope: session })] : []),
-      ...(extras.jobs ? [jobs] : []),
+      // Not a child's: `jobs` cancels the agent's background work, and a subagent starts none (it cannot write).
+      ...(extras.jobs && !child ? [jobs] : []),
       // Only where the agent's setting is on, and never in a child (above). Its body is this object's (`#sendToAgent`).
       ...(!child && agentSettings(this.#deps.ctx.storage.sql).subagents
         ? [subagentTool({
@@ -4162,14 +4163,22 @@ export class AgentRuntime {
   async cancelSessionTree(tenantId: string, agentId: string, session: string, o: { childrenOnly?: boolean } = {}) {
     await this.ready();
     const sql = this.#deps.ctx.storage.sql;
-    const children = this.#stopSubagents(tenantId, agentId, session).ids;
+    if (!this.#isPd()) ensureAgentTables(sql);
+    const r = this.#stopSubagents(tenantId, agentId, session);
+    // Only the children this stop ended and those with work, as `stopTurn` does: a cancel opens the child's harness,
+    // and a session's finished children are many and idle. If pd's tasks cannot be read, every child of the session.
+    const ids = new Set(r.ids);
+    let live: string[];
+    try { live = this.#isPd() ? this.#pdSubagentSessions({ live: true, strict: true }) : sessionsWithWork(sql); }
+    catch (e) { console.error(`reading ${tenantId}/${agentId}'s live subagent conversations failed; cancelling every child of ${session}:`, e); live = r.ids; }
+    const children = [...new Set([...r.stopped, ...live.filter((x) => ids.has(x))])];
     for (const child of children) {
       try { await this.cancelSession(tenantId, agentId, child); }
       catch (e) { console.error(`cancelling ${tenantId}/${agentId}'s subagent ${child} of ${session} failed:`, e); }
       if (!this.#isPd()) markSession(sql, child, false);
     }
     const own = o.childrenOnly ? null : await this.cancelSession(tenantId, agentId, session);
-    return { ...(own ?? { cancelledTurn: null as string | null, stoppedJobs: [] as string[], stillRunning: [] as string[] }), stoppedSubagents: children };
+    return { ...(own ?? { cancelledTurn: null as string | null, stoppedJobs: [] as string[], stillRunning: [] as string[] }), stoppedSubagents: r.stopped };
   }
 
   async cancelSession(tenantId: string, agentId: string, session: string = MAIN_SESSION) {
@@ -4462,8 +4471,12 @@ export class AgentRuntime {
       const now = Date.now();
       let end: TurnEnd | null;
       if (overdueSubagent(s, now)) {
-        try { await this.cancelSession(tenantId, agentId, s.id); }
-        catch (e) { console.error(`cancelling ${tenantId}/${agentId}'s subagent ${s.id} at its ceiling failed:`, e); }
+        // A cancel that fails leaves the run going; the row is ended and reported all the same, and the next pass's
+        // sweep (`#cancelStraySubagents`) cancels the run again, since its row no longer says it runs.
+        try {
+          await this.#deps.subagentFault?.("ceiling-cancel", s.id);
+          await this.cancelSession(tenantId, agentId, s.id);
+        } catch (e) { console.error(`cancelling ${tenantId}/${agentId}'s subagent ${s.id} at its ceiling failed; the next pass tries again:`, e); }
         if (!this.#isPd()) markSession(sql, s.id, false);
         end = { outcome: "cancelled", text: `it ran longer than ${Math.round(SUBAGENT_MAX_MS / 60_000)} minutes` };
       } else {
@@ -4522,6 +4535,7 @@ export class AgentRuntime {
         // Owed still, and tried again later, until `REPORT_MAX_ATTEMPTS`, when each is dropped; this pass goes on to the
         // other conversations' reports and the rest of the step.
         const error = String((e as Error)?.message ?? e).slice(0, 200);
+        const lost: Array<{ s: Subagent; attempts: number }> = [];
         for (const s of owed) {
           const { attempts, dropped } = reportFailed(sql, owner, s.id, Date.now());
           console.error(`posting ${tenantId}/${agentId}'s subagent ${s.id} report failed (attempt ${attempts}${dropped ? ", dropped" : ""}):`, e);
@@ -4529,12 +4543,14 @@ export class AgentRuntime {
             appendTrace(sql, [subagentTurnRow(owner, s, "report_failed", Date.now(), { attempts, error }),
               ...(dropped ? [subagentTurnRow(owner, s, "report_dropped", Date.now(), { attempts, error })] : [])]);
           } catch (t) { console.error(`the subagent.turn row of ${tenantId}/${agentId} could not be written:`, t); }
-          // A dropped report leaves its parent a short notice, so it can delegate again: once (keyed), best effort — if
-          // this fails too, the trace row is what is left.
-          if (dropped) {
-            await this.#postOnce(tenantId, agentId, parent, undeliveredNotice(s, attempts), undeliveredKey(s), "postMessage")
-              .catch((n) => console.error(`the undelivered-report notice of ${tenantId}/${agentId}'s subagent ${s.id} failed too:`, n));
-          }
+          if (dropped) lost.push({ s, attempts });
+        }
+        // Reports dropped leave their parent one short notice naming them all, so it can delegate again: once (keyed),
+        // best effort — if this fails too, the trace rows are what is left.
+        if (lost.length) {
+          const keys = lost.map((x) => undeliveredKey(x.s));
+          await this.#postOnce(tenantId, agentId, parent, undeliveredNotice(lost.map((x) => x.s), lost[0]!.attempts), keys[0]!, "postMessage", undefined, combinedRequestId(keys))
+            .catch((n) => console.error(`the undelivered-report notice of ${tenantId}/${agentId} failed too:`, n));
         }
         continue;
       }
@@ -4600,12 +4616,17 @@ export class AgentRuntime {
     const owner = { tenantId, agentId };
     const pd = this.#isPd();
     const busy = pd ? this.#pdSubagentSessions({ live: true }) : sessionsWithWork(sql).filter((x) => isSubagentSession(x));
-    // Only what nothing tracks: a session with no row, or one whose row a stop ended. A child that finished its turn
-    // and left a background job running has work too (pi085 lists the job's session), and that work is its own: the
-    // job's completion wakes it under its limits (`#subagentWakeGate`).
+    // Any work of a subagent whose row says no turn of it runs is stray — a run that landed as a stop did, one a
+    // ceiling's cancel failed to end, anything else — with one exception: a finished child's own background job, which
+    // pi085 lists as its session's work, and whose completion wakes the child under its limits (`#subagentWakeGate`).
+    // That exception is only the job: a run or a model call beside it is stray all the same, and a stop's row is never
+    // spared (the stop already ended its jobs). pd lists only live pi-durable tasks, which a background job is not.
     const stray = busy.filter((x) => {
       const row = subagentOf(sql, owner, x);
-      return !row || (row.state !== "running" && row.outcome === "stopped");
+      if (!row) return true;
+      if (row.state === "running") return false;
+      if (row.outcome === "stopped" || pd) return true;
+      return this.#piSessionRuns(x);
     });
     for (const session of stray) {
       try { await this.cancelSession(tenantId, agentId, session); }
@@ -4639,6 +4660,20 @@ export class AgentRuntime {
     await this.cancelSession(tenantId, agentId, session);
     if (!this.#isPd()) markSession(sql, session, false);
     return true;
+  }
+
+  /**
+   * pi085: whether a session has a run of its own under way — a model call unanswered, a run in flight, or input queued
+   * for one — as opposed to only a background job, which `sessionsWithWork` also counts. Read with SELECTs.
+   */
+  #piSessionRuns(session: string): boolean {
+    const sql = this.#deps.ctx.storage.sql;
+    if (sql.exec("SELECT 1 AS x FROM pi_model_jobs WHERE session = ? AND answer IS NULL LIMIT 1", session).toArray().length) return true;
+    const t = piTables(session);
+    if (sql.exec("SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = ?", t.values).toArray().length === 0) return false;
+    const row = sql.exec(`SELECT body FROM ${t.values} WHERE namespace = 'pi.lane.state' AND key = 'main'`).toArray()[0] as { body?: unknown } | undefined;
+    const state = row ? JSON.parse(String(row.body)) as { currentOperationId?: unknown; inbox?: unknown } : {};
+    return typeof state.currentOperationId === "string" || (Array.isArray(state.inbox) && state.inbox.length > 0);
   }
 
   /** pd: the subagent sessions with a conversation (`ap_conversations`); with `live`, only those with a live task. */
@@ -4738,7 +4773,7 @@ export class AgentRuntime {
     const sql = this.#deps.ctx.storage.sql;
     // A deleted agent has no settings to read: its delete stopped every subagent (`stopTurn`), and the rows stay only as a record.
     if (agentDeletedAt(sql) !== null) return null;
-    return { settings: agentSettings(sql), subagents: listSubagents(sql, { tenantId, agentId }) };
+    return { settings: agentSettings(sql), about: AGENT_SETTING_ABOUT, subagents: listSubagents(sql, { tenantId, agentId }) };
   }
 
   /**
@@ -4750,7 +4785,7 @@ export class AgentRuntime {
     if (!(await this.store.loadAgent(tenantId, agentId))) return { ok: false as const, status: 404, error: "no such agent" };
     if (agentDeletedAt(this.#deps.ctx.storage.sql) !== null) return { ok: false as const, status: 404, error: "the agent was deleted" };
     const r = updateAgentSettings(this.#deps.ctx.storage.sql, patch, who, Date.now());
-    return r.ok ? r : { ok: false as const, status: 400, error: r.error };
+    return r.ok ? { ...r, about: AGENT_SETTING_ABOUT } : { ok: false as const, status: 400, error: r.error };
   }
 
   /**

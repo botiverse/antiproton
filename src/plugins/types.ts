@@ -1969,13 +1969,14 @@ export interface Plugin {
   provides?: readonly ("container")[];
 
   /**
-   * Whose voice this plugin's writes are. `agent`: a tool this plugin declares `sideEffects: "write"` acts outward as
-   * the agent itself — a message, a reply, a reaction, a task change, anything other people see as the agent's. Only
-   * the agent's own conversations may do that: a subagent's (src/runtime/subagents.ts) is not offered such a tool, and
-   * its call to one, a program's included, is refused at dispatch. Its read tools are offered as to the agent. Absent:
-   * the plugin's writes act on things, not as anyone (a container, a store), and a subagent has them.
+   * `self`: this plugin's writes act on nothing but the caller's own scratch — no message, no change anyone else sees,
+   * no credential used, nothing the agent's own memory or workspace keeps. Only such a plugin's writes are offered to a
+   * subagent (src/runtime/subagents.ts), which is read-only otherwise: a subagent is offered a tool only when its
+   * `sideEffects` is `read` or its plugin declares this, and its call to anything else, a program's included, is refused
+   * at dispatch. Absent — every plugin today — is "its writes may act as the agent": withheld from subagents. A new
+   * plugin is safe by default; declare this only for a plugin whose every write is the caller's own business.
    */
-  speaksAs?: "agent";
+  actsAs?: "self";
   /** What a mount of this plugin may be configured with. */
   config?: ConfigField[];
   /**

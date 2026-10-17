@@ -16,6 +16,12 @@ export const AGENT_SETTINGS = {
   subagents: false,
 } as const;
 
+/** What each setting does, as whoever reads or changes it is told (`/admin/agent-settings`, `about`). */
+export const AGENT_SETTING_ABOUT: { [K in keyof typeof AGENT_SETTINGS]: string } = {
+  subagents: "The agent may delegate work to subagents (send_to_agent). Subagents can read and research but cannot change " +
+    "anything or act as this agent: no writes, no messages, no shell. Give them reading tasks and do the changes yourself.",
+};
+
 export type AgentSettingName = keyof typeof AGENT_SETTINGS;
 export type AgentSettings = { [K in AgentSettingName]: boolean };
 
