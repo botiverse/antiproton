@@ -15,7 +15,7 @@ import { operatorRefFor, providerOfRef, type OperatorModel } from "../../src/mod
 import { DEFAULT_PROVIDER, providerFor, type ModelChoice, type ModelProviders } from "../../src/model/providers.ts";
 import { DurableObjectStore } from "../../src/store/durable-object.ts";
 import { DynamicWorkerExecutor } from "../../src/runtime/dynamic-worker-executor.ts";
-import type { AgentEngine, StepOutcome } from "../../src/runtime/engine.ts";
+import type { AgentEngine, EngineEntry, StepOutcome } from "../../src/runtime/engine.ts";
 import { PiAgent, ensureAgentTables, jobSession, sessionsWithWork, markSession, mainBusy } from "../../src/runtime/pi-agent.ts";
 import { DurableAgent, PdHost, recordedEngine } from "../../src/runtime/durable-agent.ts";
 import { busyReason, clientCallsWaiting, migrateToPd, revertToPi085, type MigrationResult, type RevertResult } from "../../src/runtime/pd-migrate.ts";
@@ -69,6 +69,7 @@ import {
   SUBAGENT_TOOL, childMayCall, childRefusal, childWithheld, taskMessage, turnEnd, type Subagent, type TurnEnd,
   markReported, reportingSubagents, reportKey, subagentIdFor, taskKey, turnKeyOf,
   reportFailed, reportRetryMs, subagentSpent, subagentTurnRow, noteSubagentModel, combinedRequestId, undeliveredKey, undeliveredNotice,
+  archivableSubagents, markArchived, releaseUnstartedTurn, SUBAGENT_ARCHIVE_PER_PASS, SUBAGENT_RETENTION_MS,
 } from "../../src/runtime/subagents.ts";
 import { subagentModelChoice } from "./model-request.ts";
 import type { ModelLayers } from "./control-plane.ts";
@@ -802,7 +803,9 @@ export interface RuntimeDeps {
    * A test's knob: called at the points of a subagent's send and report where a crash must lose nothing. A throw is the
    * crash; a promise that never settles is an isolate that died there.
    */
-  subagentFault?: (phase: "task-posting" | "task-posted" | "report-decided" | "report-posting" | "report-written" | "report-posted" | "ceiling-cancel", subagent: string) => void | Promise<void>;
+  subagentFault?: (phase: "task-posting" | "task-posted" | "report-decided" | "report-posting" | "report-written" | "report-posted" | "ceiling-cancel" | "wake-posting", subagent: string) => void | Promise<void>;
+  /** How long a finished child's transcript is kept (`SUBAGENT_RETENTION_MS` when unset). A test's knob. */
+  subagentRetentionMs?: number;
   /**
    * What decides over a subagent's model option besides USER_MODELS, read from the control plane for the agent: the
    * administrator's rows and the owner's pick (`ModelLayers`), and whether the server's picker switch refuses another
@@ -4355,6 +4358,9 @@ export class AgentRuntime {
     }
     const replay = existing !== null && existing.turnKey === turnKey;
     if (!replay) {
+      if (existing?.state === "archived") {
+        throw new Error(`${SUBAGENT_TOOL}: ${existing.id} finished long ago and its transcript is gone; start a new subagent with the whole task.`);
+      }
       if (existing && existing.state !== "idle") {
         throw new Error(`${SUBAGENT_TOOL}: ${existing.id} is still working on its last task. Its report arrives as a message; send the follow-up after that.`);
       }
@@ -4480,10 +4486,12 @@ export class AgentRuntime {
         if (!this.#isPd()) markSession(sql, s.id, false);
         end = { outcome: "cancelled", text: `it ran longer than ${Math.round(SUBAGENT_MAX_MS / 60_000)} minutes` };
       } else {
-        try { end = this.#subagentTurnEnd(s); }
+        try { end = this.#subagentTurnEnd(s, owner); }
         catch (e) { console.error(`reading the end of ${tenantId}/${agentId}'s subagent ${s.id} failed:`, e); continue; }
       }
       if (!end || !finishSubagentTurn(sql, owner, s.id, end.outcome, now, reportMessage(s, end, now))) continue;
+      // Its turn is over: the harness built for it is not kept in this isolate (a follow-up builds another).
+      this.#evictAgent(tenantId, agentId, s.id);
       try {
         appendTrace(sql, [subagentTurnRow(owner, s, end.outcome, now)]);
       } catch (e) { console.error(`the subagent.turn row of ${tenantId}/${agentId} could not be written:`, e); }
@@ -4568,9 +4576,19 @@ export class AgentRuntime {
    * pi085's `pi.result` value for the operation, keyed by its id; pd's submission, settled `done` or `unanswered` —
    * and the child's transcript for its answer. Opens no harness.
    */
-  #subagentTurnEnd(s: Subagent): TurnEnd | null {
-    if (s.turnOp === null) return null;
+  #subagentTurnEnd(s: Subagent, owner: { tenantId: string; agentId: string }): TurnEnd | null {
     const sql = this.#deps.ctx.storage.sql;
+    // No engine id was recorded for the turn: the task, or a background completion, was queued behind a run rather
+    // than starting one (pi085 answers a steer with an entry, not an operation). The turn is then read from the session
+    // itself: a run it started is adopted as the turn's; with nothing running, queued or out, it is over, and its end is
+    // its transcript's — rather than holding the slot until the ceiling and reporting a cancel that did not happen.
+    if (s.turnOp === null) {
+      const now = this.#sessionActivity(s.id);
+      if (now.op) { setSubagentTurnOp(sql, owner, s.id, now.op); return null; }
+      if (now.busy) return null;
+      const entries = this.#isPd() ? readPdEntries(sql as never, s.id) : this.#piMessages(s.id);
+      return turnEnd(entries, s.turnStartedAt, { status: "completed" });
+    }
     if (this.#isPd()) {
       const status = pdSubmissionStatus(sql as never, s.turnOp);
       if (status !== "done" && status !== "unanswered") return null;
@@ -4581,12 +4599,80 @@ export class AgentRuntime {
     const row = sql.exec(`SELECT body FROM ${t.values} WHERE namespace = 'pi.result' AND key = ?`, s.turnOp).toArray()[0] as { body?: unknown } | undefined;
     if (!row) return null;
     const result = JSON.parse(String(row.body)) as { status?: unknown; error?: { message?: unknown } };
-    const entries = (sql.exec(`SELECT body FROM ${t.entries} WHERE type = 'message' ORDER BY seq DESC LIMIT 20`).toArray() as Array<{ body: string }>)
-      .map((r) => JSON.parse(String(r.body))).reverse();
+    const entries = this.#piMessages(s.id);
     return turnEnd(entries, s.turnStartedAt, {
       status: String(result.status ?? "unknown"),
       error: typeof result.error?.message === "string" ? result.error.message : null,
     });
+  }
+
+  /** Forget the harness this isolate built for `session` (`agent`'s cache): a finished child's is not kept for nothing. */
+  #evictAgent(tenantId: string, agentId: string, session: string) {
+    this.#agents.delete(`${tenantId}/${agentId}#${session}`);
+  }
+
+  /**
+   * Retention: children idle and finished longer than `subagentRetentionMs` (7 days) are archived, at most
+   * `SUBAGENT_ARCHIVE_PER_PASS` a pass, oldest first. A child owing a report, running, or with a background job of its
+   * own still running is not one (`archivableSubagents`). On pi085 its session's tables, its session row and its model
+   * jobs are dropped; on pd its directory entry (`ap_conversations`) is, so nothing lists or opens it again —
+   * pi-durable 1.0.0 has no way to delete a conversation, so its records stay in pi-durable's tables. The row stays,
+   * `archived`, as the record that the child existed; a follow-up to it is refused. Returns the children archived.
+   */
+  async #archiveSubagents(tenantId: string, agentId: string): Promise<string[]> {
+    const sql = this.#deps.ctx.storage.sql;
+    const owner = { tenantId, agentId };
+    const retention = this.#deps.subagentRetentionMs ?? SUBAGENT_RETENTION_MS;
+    const done: string[] = [];
+    for (const s of archivableSubagents(sql, owner, Date.now(), retention, SUBAGENT_ARCHIVE_PER_PASS)) {
+      try {
+        this.#evictAgent(tenantId, agentId, s.id);
+        if (this.#isPd()) {
+          sql.exec("DELETE FROM ap_conversations WHERE task_id = ?", s.id);
+        } else {
+          const t = piTables(s.id);
+          for (const table of [t.entries, t.usage, t.values, t.list, t.meta]) sql.exec(`DROP TABLE IF EXISTS ${table}`);
+          sql.exec("DELETE FROM pi_sessions WHERE session = ?", s.id);
+          sql.exec("DELETE FROM pi_model_jobs WHERE session = ?", s.id);
+        }
+        markArchived(sql, owner, s.id);
+        logEvent("subagent.archived", { tenantId, agentId, subagent: s.id, finishedAt: s.finishedAt });
+        done.push(s.id);
+      } catch (e) { console.error(`archiving ${tenantId}/${agentId}'s subagent ${s.id} failed:`, e); }
+    }
+    return done;
+  }
+
+  /** pi085: a session's last 20 message entries, oldest first, read with a SELECT. */
+  #piMessages(session: string): EngineEntry[] {
+    const t = piTables(session);
+    const sql = this.#deps.ctx.storage.sql;
+    if (sql.exec("SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = ?", t.entries).toArray().length === 0) return [];
+    return (sql.exec(`SELECT body FROM ${t.entries} WHERE type = 'message' ORDER BY seq DESC LIMIT 20`).toArray() as Array<{ body: string }>)
+      .map((r) => JSON.parse(String(r.body))).reverse();
+  }
+
+  /**
+   * What a session is doing now, read with SELECTs: `op`, the run in flight (pi085's lane operation; on pd the newest
+   * placed submission of its conversation that has not settled); `busy`, whether anything of it is under way — a run, a
+   * model call out, input queued (pi085), a live task or a queued submission (pd).
+   */
+  #sessionActivity(session: string): { op: string | null; busy: boolean } {
+    const sql = this.#deps.ctx.storage.sql;
+    const has = (name: string) => sql.exec("SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = ?", name).toArray().length > 0;
+    if (this.#isPd()) {
+      const conversation = pdConversationId(sql as never, session);
+      if (conversation === null || !has("pd_submissions")) return { op: null, busy: false };
+      const sub = sql.exec("SELECT id, status FROM pd_submissions WHERE conversation_id = ? AND status IN ('queued', 'placed') ORDER BY id DESC LIMIT 1", conversation).toArray()[0] as { id?: unknown; status?: unknown } | undefined;
+      const live = has("pd_tasks") && sql.exec("SELECT 1 AS x FROM pd_tasks WHERE conversation_id = ? AND status != 'terminal' AND background = 0 LIMIT 1", conversation).toArray().length > 0;
+      return { op: sub?.status === "placed" ? String(sub.id) : null, busy: live || sub !== undefined };
+    }
+    const out = has("pi_model_jobs") && sql.exec("SELECT 1 AS x FROM pi_model_jobs WHERE session = ? AND answer IS NULL LIMIT 1", session).toArray().length > 0;
+    const t = piTables(session);
+    const row = has(t.values) ? sql.exec(`SELECT body FROM ${t.values} WHERE namespace = 'pi.lane.state' AND key = 'main'`).toArray()[0] as { body?: unknown } | undefined : undefined;
+    const state = row ? JSON.parse(String(row.body)) as { currentOperationId?: unknown; inbox?: unknown } : {};
+    const op = typeof state.currentOperationId === "string" ? state.currentOperationId : null;
+    return { op, busy: op !== null || out || (Array.isArray(state.inbox) && state.inbox.length > 0) };
   }
 
   /**
@@ -4753,8 +4839,11 @@ export class AgentRuntime {
   /** The woken turn's engine id, once the completion was posted: what its end is read by. */
   #subagentWoken(tenantId: string, agentId: string, session: string, res: unknown) {
     const sql = this.#deps.ctx.storage.sql;
-    const value = (res as { value?: { operationId?: unknown } } | undefined)?.value;
-    if (value?.operationId !== undefined) setSubagentTurnOp(sql, { tenantId, agentId }, session, String(value.operationId));
+    // pd answers an input queued behind a run with its submission, which its end is read by as well (`#subagentTurnEnd`);
+    // pi085's steer answers with neither, and the turn is then read from the session.
+    const value = (res as { value?: { operationId?: unknown; submissionId?: unknown } } | undefined)?.value;
+    const op = value?.operationId ?? value?.submissionId;
+    if (op !== undefined && op !== null) setSubagentTurnOp(sql, { tenantId, agentId }, session, String(op));
   }
 
   /** The subagent a model job belongs to, or null: its session, which on pd is the job's conversation's. */
@@ -4843,7 +4932,22 @@ export class AgentRuntime {
           return;
         }
         if (gate === "start") startSubagentTurn(sql, owner, session, { callId: subagentOf(sql, owner, session)?.callId ?? null, turnOp: null, now: Date.now() });
-        const posted = await this.postMessage(tenantId, agentId, text, "prompt", session).catch((e) => refusedForReset(e, tenantId, agentId, "background completion"));
+        let posted: Awaited<ReturnType<AgentRuntime["postMessage"]>> | undefined;
+        try {
+          await this.#deps.subagentFault?.("wake-posting", session);
+          posted = await this.postMessage(tenantId, agentId, text, "prompt", session);
+        } catch (e) {
+          // Not posted, so no turn started: the slot is freed at once, not held to the ceiling (`releaseUnstartedTurn`).
+          if (gate === "start" && releaseUnstartedTurn(sql, owner, session, Date.now())) {
+            const row = subagentOf(sql, owner, session);
+            if (row) {
+              try { appendTrace(sql, [subagentTurnRow(owner, row, "failed", Date.now(), { why: "its background completion could not be delivered", error: String((e as Error)?.message ?? e).slice(0, 160) })]); }
+              catch (t) { console.error(`the subagent.turn row of ${tenantId}/${agentId} could not be written:`, t); }
+            }
+          }
+          console.error(`delivering a background completion to ${tenantId}/${agentId}'s subagent ${session} failed:`, e);
+          return;
+        }
         if (gate === "start") this.#subagentWoken(tenantId, agentId, session, posted?.result);
         return;
       }
@@ -4903,6 +5007,7 @@ export class AgentRuntime {
     // reported. A report starts a turn of the parent, which the next pass, at once, drives.
     await this.#cancelStraySubagents(tenantId, agentId);
     if (await this.#reportSubagents(tenantId, agentId) > 0) wakeInMs = 0;
+    await this.#archiveSubagents(tenantId, agentId);
     const retry = reportRetryMs(sql, { tenantId, agentId }, Date.now());
     if (retry !== null) wakeInMs = wakeInMs === null ? retry : Math.min(wakeInMs, retry);
     // A running subagent past its ceiling is cancelled by a pass; the pass comes back for the ceiling's moment.

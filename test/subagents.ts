@@ -85,7 +85,7 @@ const USER_MODELS = { offered: [{ id: "cheap", label: "Cheap", provider: "deepse
 
 /** One agent on an AgentRuntime over node:sqlite, its object recording `engine`, its `subagents` setting as given. */
 type Rules = { layers: { agent: any; tenant: any; deployment: any; owner: string | null }; pickerOff: boolean };
-async function world(engine: "pi085" | "pd", opts: { on?: boolean; builder?: boolean; chatter?: boolean; sandbox?: boolean; rulesTtlMs?: number; slowBuilder?: number } = {}) {
+async function world(engine: "pi085" | "pd", opts: { on?: boolean; builder?: boolean; chatter?: boolean; sandbox?: boolean; rulesTtlMs?: number; slowBuilder?: number; retentionMs?: number } = {}) {
   const rules: { now: Rules | null; reads: number; fail: boolean } = { now: null, reads: 0, fail: false };
   const raw = sqliteHost();
   if (engine === "pd") {
@@ -117,6 +117,7 @@ async function world(engine: "pi085" | "pd", opts: { on?: boolean; builder?: boo
       return rules.now ?? { layers: { agent: null, tenant: null, deployment: null, owner: null }, pickerOff: false };
     },
     subagentRulesTtlMs: opts.rulesTtlMs ?? 0,
+    ...(opts.retentionMs !== undefined ? { subagentRetentionMs: opts.retentionMs } : {}),
     ...(opts.sandbox ? { loader: standIn.loader, makeToolBinding: standIn.makeToolBinding } : {}),
     ctx: { storage: { sql: raw.sql, transactionSync: raw.transactionSync } },
     bucket: {} as never, bucketName: "b", models: { resolve: () => null },
@@ -1010,6 +1011,134 @@ for (const engine of (process.env.ENGINES ?? "pi085,pd").split(",").filter((e) =
     for (let i = 0; i < 6; i++) { await pass(w); await sleep(10); }
     must(w.sent.length === sent, `${w.sent.length - sent} model calls after the delete`);
     must(await w.rt.agentSettingsOf("t", "a") === null, "the deleted agent's settings still answer");
+  });
+
+  await check(`${engine}: a turn whose engine id was never recorded (a queued post) is read from the session: reported done, not held to the ceiling`, async () => {
+    const w = await world(engine);
+    let parentCalls = 0, release = false;
+    w.reply = (session) => session === "main" ? (++parentCalls === 1 ? calls({ id: "c1", args: { task: "t" } }) : say("ok")) : release ? say("answered all the same") : null;
+    await w.rt.postMessage("t", "a", "go", "prompt", "main");
+    for (let i = 0; i < 6; i++) await pass(w);
+    // What a post that was queued rather than started leaves: a running row with no engine id for its turn.
+    w.raw.sql.exec("UPDATE subagents SET turn_op = NULL");
+    release = true;
+    await settle(w);
+    const row = rowsOf(w)[0]!;
+    must(row.state === "idle" && row.outcome === "done", `the turn was not read from the session: ${show(row)}`);
+    const rs = await reports(w);
+    must(rs.length === 1 && rs[0]!.includes("answered all the same") && / done after /.test(rs[0]!), show(rs));
+  });
+
+  await check(`${engine}: a background completion that cannot be posted frees the child's slot at once: no turn, no report, no false cancel`, async () => {
+    const w = await world(engine, { builder: true });
+    let parentCalls = 0;
+    w.reply = (session) => session === "main" ? (++parentCalls === 1 ? calls({ id: "c1", args: { task: "t" } }) : say("ok")) : say("first answer");
+    await w.rt.postMessage("t", "a", "go", "prompt", "main");
+    await settle(w);
+    const child = rowsOf(w)[0]!.id as string;
+    recordBackgroundJob(w.raw.sql as never, { tenantId: "t", agentId: "a" }, { id: "op_bgw", session: child, mount: "builder", tool: "builder__build", handle: {} }, Date.now());
+    w.raw.sql.exec("UPDATE background_jobs SET next_poll_at = 0 WHERE id = 'op_bgw'");
+    w.fault.at = (p) => { if (p === "wake-posting") throw new Error("the child's lane said no"); };
+    await w.rt.step("t", "a");
+    const row = rowsOf(w)[0]!;
+    must(row.state === "idle" && row.outcome === "failed" && row.turns === 2, `the slot is still held: ${show(row)}`);
+    must(trace(w).some((r) => r.kind === "subagent.turn" && r.status === "failed" && r.attrs.why === "its background completion could not be delivered"), "no trace row");
+    w.fault.at = null;
+    await settle(w);
+    must((await reports(w)).length === 1, `a report for a turn that never ran: ${show(await reports(w))}`);
+  });
+
+  await check(`${engine}: retention archives a finished child after its time: its transcript goes, its row stays, a follow-up is refused`, async () => {
+    const w = await world(engine, { retentionMs: 60_000 });
+    let parentCalls = 0, child: string | null = null;
+    w.reply = (session, req) => {
+      if (session === "main") {
+        parentCalls++;
+        if (parentCalls === 1) return calls({ id: "c1", args: { task: "t" } });
+        const last = req.messages.at(-1) as any;
+        if (child && last?.role === "user" && JSON.stringify(last.content).includes("and now")) return calls({ id: "c2", args: { task: "more", agent: child } });
+        return say("ok");
+      }
+      return say("done");
+    };
+    await w.rt.postMessage("t", "a", "go", "prompt", "main");
+    await settle(w);
+    child = rowsOf(w)[0]!.id as string;
+    const tablesOf = () => w.raw.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'pi_s_%'").toArray().map((r: any) => String(r.name)).filter((n) => n.includes(child!.slice(4).toLowerCase()));
+    const listed = () => engine === "pd" ? w.raw.sql.exec("SELECT 1 FROM ap_conversations WHERE task_id = ?", child).toArray().length : tablesOf().length;
+    must(listed() > 0, "control: the child has nothing to delete");
+    // Not yet: finished just now.
+    await w.rt.step("t", "a");
+    must(rowsOf(w)[0]!.state === "idle", "archived before its time");
+    w.raw.sql.exec("UPDATE subagents SET finished_at = ? WHERE id = ?", Date.now() - 120_000, child);
+    await w.rt.step("t", "a");
+    must(rowsOf(w)[0]!.state === "archived" && listed() === 0, `not archived: ${show(rowsOf(w)[0])}, ${listed()} left`);
+    if (engine === "pi085") must(w.raw.sql.exec("SELECT 1 FROM pi_sessions WHERE session = ?", child).toArray().length === 0, "its session row stayed");
+    await w.rt.postMessage("t", "a", "and now", "prompt", "main");
+    await settle(w);
+    const results = w.requests.filter((r) => r.session === "main").flatMap((r) => r.req.messages.filter((m: any) => m.role === "tool")).map((m: any) => typeof m.content === "string" ? m.content : JSON.stringify(m.content));
+    must(results.some((t) => /finished long ago and its transcript is gone/.test(t)), `the follow-up to an archived child: ${show(results.slice(-1))}`);
+  });
+
+  await check(`${engine}: retention keeps a child that owes a report or has a job running, and archives at most five a pass`, async () => {
+    const w = await world(engine, { retentionMs: 60_000 });
+    const old = Date.now() - 3_600_000;
+    for (let i = 0; i < 9; i++) {
+      const id = `sub_${String(i).padStart(16, "0")}`;
+      recordSubagent(w.raw.sql as never, { tenantId: "t", agentId: "a" }, { id, parentSession: "main", callId: `c${i}`, modelOption: null, provider: null, model: null, turnOp: "1", turnKey: null, now: old });
+      w.raw.sql.exec("UPDATE subagents SET state = 'idle', outcome = 'done', finished_at = ? WHERE id = ?", old, id);
+    }
+    // One owes a report, one has its own background job still running.
+    w.raw.sql.exec("UPDATE subagents SET state = 'reporting', report = 'r' WHERE id = 'sub_0000000000000000'");
+    recordBackgroundJob(w.raw.sql as never, { tenantId: "t", agentId: "a" }, { id: "op_keep", session: "sub_0000000000000001", mount: "x", tool: "x__y", handle: {} }, Date.now());
+    w.raw.sql.exec("UPDATE background_jobs SET next_poll_at = ? WHERE id = 'op_keep'", Date.now() + 3_600_000);
+    w.raw.sql.exec("UPDATE subagents SET report_retry_at = ? WHERE state = 'reporting'", Date.now() + 3_600_000);
+    const archived = () => rowsOf(w).filter((r) => r.state === "archived").map((r) => r.id);
+    await w.rt.step("t", "a");
+    must(archived().length === 5, `one pass archived ${archived().length}`);
+    await w.rt.step("t", "a");
+    must(archived().length === 7 && !archived().includes("sub_0000000000000000") && !archived().includes("sub_0000000000000001"), show(archived()));
+  });
+
+  await check(`${engine}: a finished child's harness is not kept in the isolate`, async () => {
+    const w = await world(engine);
+    let parentCalls = 0;
+    w.reply = (session) => session === "main" ? (++parentCalls === 1 ? calls({ id: "c1", args: { task: "t" } }) : say("ok")) : say("done");
+    await w.rt.postMessage("t", "a", "go", "prompt", "main");
+    await settle(w);
+    const child = rowsOf(w)[0]!.id as string;
+    const opens = () => trace(w).filter((r) => r.kind === "harness.open" && String(r.spanId).includes(`#${child}@`)).length;
+    const before = opens();
+    await w.rt.agent("t", "a", child);
+    must(opens() === before + 1, `the finished child's harness was still cached (${opens() - before} new opens)`);
+  });
+
+  await check(`${engine}: follow-ups cannot carry a child past its lifetime or its turns`, async () => {
+    const w = await world(engine);
+    let parentCalls = 0, child: string | null = null;
+    w.reply = (session, req) => {
+      if (session === "main") {
+        parentCalls++;
+        if (parentCalls === 1) return calls({ id: "c1", args: { task: "t" } });
+        const last = req.messages.at(-1) as any;
+        if (child && last?.role === "user" && JSON.stringify(last.content).includes("again")) return calls({ id: `f${parentCalls}`, args: { task: "more", agent: child } });
+        return say("ok");
+      }
+      return say("done");
+    };
+    await w.rt.postMessage("t", "a", "go", "prompt", "main");
+    await settle(w);
+    child = rowsOf(w)[0]!.id as string;
+    const results = () => w.requests.filter((r) => r.session === "main").flatMap((r) => r.req.messages.filter((m: any) => m.role === "tool")).map((m: any) => typeof m.content === "string" ? m.content : JSON.stringify(m.content));
+    w.raw.sql.exec("UPDATE subagents SET created_at = ? WHERE id = ?", Date.now() - SUBAGENT_LIFETIME_MS - 1, child);
+    await w.rt.postMessage("t", "a", "again", "prompt", "main");
+    await settle(w);
+    must(results().some((t) => /takes no more tasks: it is older than 2 hours/.test(t)), `past its lifetime: ${show(results().slice(-1))}`);
+    w.raw.sql.exec("UPDATE subagents SET created_at = ?, turns = ? WHERE id = ?", Date.now(), SUBAGENT_MAX_TURNS, child);
+    await w.rt.postMessage("t", "a", "again", "prompt", "main");
+    await settle(w);
+    must(results().some((t) => /takes no more tasks: it has had 10 turns/.test(t)), `past its turns: ${show(results().slice(-1))}`);
+    must(rowsOf(w)[0]!.turns === SUBAGENT_MAX_TURNS, show(rowsOf(w)[0]));
   });
 
   await check(`${engine}: a follow-up to a subagent still running, or to an id this conversation never started, is refused`, async () => {

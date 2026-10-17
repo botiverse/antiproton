@@ -163,7 +163,9 @@ the subagents that session started, and deleting the session stops them first an
 Each pass also cancels any subagent session that has work while nothing tracks it — no row, or a row a stop ended (a
 run that landed as the stop did) — logged as `subagent.stray`. A finished subagent's own background job is not that:
 it runs to its end, and its completion wakes the subagent under its limits. A subagent lives at most 2 hours from its creation and takes at most 10 turns;
-each turn is cancelled after 30 minutes. A report whose post fails stays owed and is retried with backoff (5 s doubling
+each turn is cancelled after 30 minutes. A finished subagent is archived after 7 days idle (its transcript deleted, its
+row kept with state `archived`; a `subagent.archived` log line each), at most 5 a pass. A bench task's end
+(`benchSweFinish`) stops its subagents as a stop does. A report whose post fails stays owed and is retried with backoff (5 s doubling
 to 10 minutes), each failure a `subagent.turn` row with status `report_failed`; after 8 attempts it is dropped
 (`report_dropped`) and the subagent is idle with outcome `report_failed`. A subagent whose model option a pin or the
 picker switch overrides after its spawn writes a `subagent.model_changed` row, and its next report says so.

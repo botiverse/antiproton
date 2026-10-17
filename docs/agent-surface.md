@@ -773,7 +773,14 @@ send_to_agent { task: string, agent?: string, model?: string }
   decision as it was.
 - **At most 3** subagents of one agent run at once; a fourth start (or a follow-up that would be the fourth) is refused,
   naming the running ones. One subagent takes at most 10 turns and lives at most 2 hours from its creation; each turn is
-  cancelled after 30 minutes. A background job a subagent started is delivered to it only under the same limits.
+  cancelled after 30 minutes. A background job a subagent started is delivered to it only under the same limits; one
+  that cannot be posted frees the slot at once (outcome `failed`). The lifetime is counted from creation: follow-ups
+  and wakes never move it, so no subagent runs past 2 hours or 10 turns, whatever it is sent.
+- **Kept for 7 days.** A subagent idle and finished for 7 days is archived by a later pass (at most 5 a pass): its
+  transcript is deleted (pi085: its session's tables; pd: its directory entry, so it is never opened again —
+  pi-durable keeps its own records, having no way to delete a conversation) and its row stays as `archived`. A
+  subagent owing a report or with a background job still running is kept. A follow-up to an archived subagent is
+  refused; start a new one. A finished subagent's harness is not kept in memory.
 - **Depth 1.** A subagent is never offered `send_to_agent`, nor an Agents API caller's functions, nor `jobs`.
 - **Read-only.** A subagent is offered a mount's tool only when the tool declares `sideEffects: "read"`, or its plugin
   declares `actsAs: "self"` ([docs/plugins.md](plugins.md); no built-in plugin does). Everything else is withheld:

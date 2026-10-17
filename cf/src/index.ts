@@ -1112,7 +1112,8 @@ export class AgentDO extends DurableObject<Env> {
    * through the agent's dispatch, which is where an ended task is refused. Without this, the runner graded
    * and released while a stalled agent kept running: its next shell command provisioned a new box that
    * nobody released or counted, and a job left on the released box failed about forty minutes later and woke
-   * the idle agent into doing the same. Idempotent, and release calls it too.
+   * the idle agent into doing the same. Idempotent, and release calls it too. The agent's subagents, if it has any,
+   * end with it.
    */
   async benchSweFinish(taskId: string) {
     return this.#busy("benchSweFinish", () => this.#benchSweFinish(taskId));
@@ -1123,7 +1124,9 @@ export class AgentDO extends DurableObject<Env> {
     this.#setBenchConfig(`ended:${agentId}`, String(Date.now()));
     const rt = this.#activeRuntime();
     await rt.ready();
-    return rt.cancelSession("bench", agentId, MAIN_SESSION);
+    // The task's subagents with it, as a stop ends them: marked stopped first, so none reports into the ended task,
+    // then each one with work cancelled (`cancelSessionTree`); then the agent's own turn.
+    return rt.cancelSessionTree("bench", agentId, MAIN_SESSION);
   }
 
   /** Hands the machine back, after ending the agent's part (benchSweFinish) so nothing can make another. */

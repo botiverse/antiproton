@@ -65,6 +65,45 @@ export interface SubagentOwner { tenantId: string; agentId: string }
 /** `report_failed`: the turn ended, and its report could not be posted in `REPORT_MAX_ATTEMPTS` tries and was dropped. */
 export type SubagentOutcome = "done" | "failed" | "cancelled" | "stopped" | "report_failed";
 
+/**
+ * How long a finished child's transcript is kept: after this long idle, the pass deletes its session's tables (pi085)
+ * or its directory entry (pd) and marks its row `archived` (`archivableSubagents`). A row stays, as the record of it.
+ */
+export const SUBAGENT_RETENTION_MS = 7 * 24 * 60 * 60_000;
+
+/** How many children one pass archives at most: the rest wait for later passes, so no pass is long for it. */
+export const SUBAGENT_ARCHIVE_PER_PASS = 5;
+
+/**
+ * Children a pass may archive, oldest first, at most `limit`: idle (not running, owing no report, not archived),
+ * finished longer ago than `retentionMs`, and with no background job of theirs still running.
+ */
+export function archivableSubagents(sql: Sql, owner: SubagentOwner, now: number, retentionMs: number, limit: number): Subagent[] {
+  if (!hasSubagentTable(sql)) return [];
+  const jobs = sql.exec("SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = 'background_jobs'").toArray().length > 0;
+  return sql.exec(
+    "SELECT * FROM subagents WHERE tenant_id = ? AND agent_id = ? AND state = 'idle' AND finished_at IS NOT NULL AND finished_at < ?" +
+    (jobs ? " AND id NOT IN (SELECT session FROM background_jobs WHERE state = 'running')" : "") +
+    " ORDER BY finished_at ASC LIMIT ?",
+    owner.tenantId, owner.agentId, now - retentionMs, limit).toArray().map(rowTo);
+}
+
+export function markArchived(sql: Sql, owner: SubagentOwner, id: string) {
+  sql.exec("UPDATE subagents SET state = 'archived', report = NULL, report_note = NULL WHERE id = ? AND tenant_id = ? AND agent_id = ? AND state = 'idle'",
+    id, owner.tenantId, owner.agentId);
+}
+
+/**
+ * A turn that never started: its task or its background completion was not posted. The slot is freed at once — the
+ * row idle, outcome `failed` — rather than held until the ceiling and then reported as cancelled. Only a running turn
+ * with no engine id recorded, so a turn that did start is never released by this.
+ */
+export function releaseUnstartedTurn(sql: Sql, owner: SubagentOwner, id: string, now = Date.now()): boolean {
+  const r = sql.exec("UPDATE subagents SET state = 'idle', finished_at = ?, outcome = 'failed' WHERE id = ? AND tenant_id = ? AND agent_id = ? AND state = 'running' AND turn_op IS NULL RETURNING id",
+    now, id, owner.tenantId, owner.agentId).toArray();
+  return r.length > 0;
+}
+
 /** How many times an owed report is posted before it is dropped (`reportFailed`): at the backoff below, about 21 minutes. */
 export const REPORT_MAX_ATTEMPTS = 8;
 
@@ -83,7 +122,7 @@ export interface Subagent {
    * `running` while a turn is in flight; `reporting` once its end is decided and its report (`report`) is owed to the
    * parent; `idle` once the report was posted (or the child was stopped with its parent, which drops it).
    */
-  state: "running" | "reporting" | "idle";
+  state: "running" | "reporting" | "idle" | "archived";
   /** What sent the current turn, as `turnKeyOf` makes it: what a replayed send of the same call is recognised by. */
   turnKey: string | null;
   /** The report owed while `reporting`: decided once, so a retry posts the same text under the same key. */
@@ -123,7 +162,7 @@ const rowTo = (r: any): Subagent => ({
   id: String(r.id), parentSession: String(r.parent_session), callId: r.call_id === null ? null : String(r.call_id),
   modelOption: r.model_option === null ? null : String(r.model_option),
   provider: r.provider === null ? null : String(r.provider), model: r.model === null ? null : String(r.model),
-  state: r.state === "running" || r.state === "reporting" ? r.state : "idle", turnOp: r.turn_op === null ? null : String(r.turn_op),
+  state: r.state === "running" || r.state === "reporting" || r.state === "archived" ? r.state : "idle", turnOp: r.turn_op === null ? null : String(r.turn_op),
   turnKey: r.turn_key === null || r.turn_key === undefined ? null : String(r.turn_key),
   report: r.report === null || r.report === undefined ? null : String(r.report),
   modelNow: r.model_now === null || r.model_now === undefined ? null : String(r.model_now),
@@ -338,8 +377,8 @@ export function stopRunningSubagents(sql: Sql, owner: SubagentOwner, now = Date.
   const only = parentSession === undefined ? "" : " AND parent_session = ?";
   const scope = parentSession === undefined ? [] : [parentSession];
   const stopped = sql.exec(`UPDATE subagents SET state = 'idle', finished_at = ?, outcome = 'stopped', report = NULL, report_retry_at = NULL
-    WHERE tenant_id = ? AND agent_id = ? AND state != 'idle'${only} RETURNING *`, now, owner.tenantId, owner.agentId, ...scope).toArray().map(rowTo);
-  const ids = (sql.exec(`SELECT id FROM subagents WHERE tenant_id = ? AND agent_id = ?${only}`, owner.tenantId, owner.agentId, ...scope).toArray() as any[])
+    WHERE tenant_id = ? AND agent_id = ? AND state IN ('running', 'reporting')${only} RETURNING *`, now, owner.tenantId, owner.agentId, ...scope).toArray().map(rowTo);
+  const ids = (sql.exec(`SELECT id FROM subagents WHERE tenant_id = ? AND agent_id = ? AND state != 'archived'${only}`, owner.tenantId, owner.agentId, ...scope).toArray() as any[])
     .map((r) => String(r.id));
   return { ids, stopped };
 }
@@ -347,7 +386,7 @@ export function stopRunningSubagents(sql: Sql, owner: SubagentOwner, now = Date.
 /** How many children of this object have a turn running; none when it never had one. One object is one agent. */
 export function runningSubagentCount(sql: Sql): number {
   if (!hasSubagentTable(sql)) return 0;
-  return Number((sql.exec("SELECT COUNT(*) AS n FROM subagents WHERE state != 'idle'").toArray()[0] as any)?.n ?? 0);
+  return Number((sql.exec("SELECT COUNT(*) AS n FROM subagents WHERE state IN ('running', 'reporting')").toArray()[0] as any)?.n ?? 0);
 }
 
 /** Milliseconds until the soonest running child reaches its ceiling, or null when none runs: what a pass wakes for. */
