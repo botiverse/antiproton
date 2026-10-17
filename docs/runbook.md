@@ -135,9 +135,12 @@ For every agent of the deployment at once, set the Worker var `SUBAGENTS_DISABLE
 setting. The answer is the settings in force, what moved, and what each setting does: `{"settings":{"subagents":false},
 "changed":["subagents"],"disabledEverywhere":false,"about":{"subagents":"…"}}`; the GET also says `stored` and
 `defaults`. Either switch stops **new** children at once: a turn already running is refused at its next `send_to_agent`
-call (a start or a follow-up), and a finished child's background completion no longer starts a turn of it. Children
-already running are not stopped by it: stop them with `/admin/cancel-turn` ([Stopping a runaway agent](#stopping-a-runaway-agent)),
-which stops every subagent with the agent's turn. On again is the same call with `true`.
+call (a start or a follow-up), and a finished child's background completion no longer starts a turn of it. It also stops
+the children **already running**: each is marked stopped and its run cancelled, and its parent gets one notice for all of
+them ("subagents were switched off for this agent; N running children were stopped: …"). The parent's own turn goes on.
+The setting does this when it is written (the answer then says `stoppedSubagents`); the var, at each agent's next pass,
+which comes at least every 5 minutes while a child runs. A report already owed when the switch is set is still
+delivered. On again is the same call with `true`.
 
 An Agents API caller that declares its own function named `send_to_agent` keeps it: the agent is then not offered its
 own `send_to_agent` (a `subagent.tool_shadowed` log line says so). **Turning it off does not stop subagents already running**: they finish and report. To stop

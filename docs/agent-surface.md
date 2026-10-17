@@ -811,7 +811,9 @@ the conversation needs a reset, carries a rebuild's pending briefing and any not
 
 Reports owed to one conversation in the same pass go as one message, so the parent runs once for all of them: a head
 line (`[3 subagent reports, …]`) and then each report as above, its own head and key included, separated by `---`.
-Reports that arrive while the conversation is already running join that run.
+Reports that arrive while the conversation is already running join that run. A kill switch set while children run
+([`runbook.md`](runbook.md#subagents)) stops them, and the conversation gets one notice naming them all in place of
+their reports (`[subagents were switched off for this agent; 2 running children were stopped: …]`); its own turn goes on.
 
 `failed` carries the error (a model call that failed, a run that ended without an answer); `cancelled` is a turn
 past the 30-minute ceiling, cancelled by the agent's next pass. A report is cut at 20,000 characters. A turn's end is
@@ -844,8 +846,10 @@ Where the deployment sets `SUBAGENT_ACTIVITY=1` (off by default, until Raft's in
 work is sent as Raft's `SubagentLineage` events, `subagent: { parentToolUseId, taskId, phase }` with `parentToolUseId` the
 parent's `send_to_agent` tool call id and `taskId` the child's session: `SubagentStart` (`phase: "started"`) when a turn
 of it starts, the child's tool steps as `PreToolUse`/`PostToolUse` (`phase: "active"`), and `SubagentStop`
-(`phase: "ended"`, and in the marker `outcome` — `done`, `failed`, `stopped`, `ceiling` — and `reportChars`; nothing of
-them beside it). The parent's own
+(`phase: "ended"`, and in the marker `outcome` — `done`, `failed`, `stopped`, `ceiling` — and `reportChars`, the report
+body's length without its head; nothing of them beside it). `ceiling` is only a turn the harness took at its time or its
+lifetime; any other cancel, a kill switch's included, is `stopped`. A turn has one end: a stop while its report is owed
+drops the report and gives it no second `SubagentStop`. The parent's own
 `send_to_agent` is then a plain `PreToolUse`/`PostToolUse` of the agent, with no marker. Never a `Stop` or a prompt for a
 child, never the agent's status on a child's event, and never a task, a prompt or a report: ids and enums only. Off, a
 child's rows make no event at all.
@@ -1166,8 +1170,9 @@ answer with `/admin/transcript`'s for the same agent).
 `rebuild.decision`, `rebuild.outcome`, `rebuild.behaviour`, `turn.timing`, `import.hold`, `model.prewarm`, `agent.ready`,
 `mount.settings` (an operator's in-place change of a mount's settings, [docs/plugins.md](plugins.md)), `subagent.turn`
 (one turn of a [subagent](#subagents-send_to_agent) ending: `spanId` its session, `parentId` the tool call that sent the
-turn, `status` `done`, `failed`, `cancelled`, `stopped`, `report_failed` or `report_dropped`, `attrs.parentSession` and,
-on an end, `reportChars`, the report's length), `subagent.start` (a child's turn beginning: `spanId` its session,
+turn, `status` `done`, `failed`, `cancelled`, `stopped`, `report_failed`, `report_dropped` or `wake_failed` (a background
+completion that could not be posted, so no turn started), `attrs.parentSession` and, on an end, `reportChars`, the report
+body's length; a `cancelled` end's `attrs.cause` is `ceiling` or `aborted`, a kill switch's `stopped` end's is `switched_off`), `subagent.start` (a child's turn beginning: `spanId` its session,
 `parentId` the parent's `send_to_agent` call, `status` `spawn`, `follow_up` or `wake`), and the rows a plugin writes of its own, `raft.held`, `raft.held_answer` and `raft.state_failed` (written as `raft.state_save_failed` before Raft SDK 0.19.0)
 ([docs/plugins.md](plugins.md)); `src/trace/outbox.ts`) — with `from <= at < to`, in `seq` order.
 

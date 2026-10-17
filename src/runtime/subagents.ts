@@ -50,13 +50,6 @@ export const SUBAGENT_LIFETIME_MS = 2 * 60 * 60_000;
 /** The most turns one child may have, its parent's follow-ups and its background wakes together. */
 export const SUBAGENT_MAX_TURNS = 10;
 
-/**
- * While a child runs, a pass comes back at least this often, so a kill switch set where no input reaches the agent
- * (SUBAGENTS_DISABLED, a deploy) is read by its next pass (cf/src/runtime.ts `#switchOffSubagents`) within this long,
- * not only at the child's ceiling. The agent's own setting acts when it is written.
- */
-export const SUBAGENT_SWITCH_CHECK_MS = 5 * 60_000;
-
 /** How long an owed report waits after a failed post before it is tried again: doubling from 5 s, at most 10 minutes. */
 export function reportRetryDelay(attempts: number): number {
   return Math.min(10 * 60_000, 5_000 * 2 ** Math.max(0, attempts - 1));

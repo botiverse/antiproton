@@ -66,7 +66,7 @@ import { closeTurn, discardTurn, openTurn, turnInbound, turnNotSaid, turnPaused,
 import {
   admitSubagent, hasSubagentTable, finishSubagentTurn, runningSubagentCount, subagentCeilingMs, SUBAGENT_CAP, SUBAGENT_MAX_MS, SUBAGENT_LIFETIME_MS, isSubagentSession, listSubagents, overdueSubagent, recordSubagent, reportMessage,
   runningSubagents, setSubagentTurnOp, startedResult as subagentStarted, startSubagentTurn, stopRunningSubagents, subagentOf, subagentTool,
-  switchOffSubagents, switchedOffNotice, reportBodyChars, SUBAGENT_SWITCH_CHECK_MS,
+  switchOffSubagents, switchedOffNotice, reportBodyChars,
   SUBAGENT_TOOL, childMayCall, childRefusal, childWithheld, taskMessage, turnEnd, type Subagent, type TurnEnd,
   markReported, reportingSubagents, reportKey, subagentIdFor, taskKey, turnKeyOf,
   reportFailed, reportRetryMs, subagentSpent, subagentTurnRow, noteSubagentModel, combinedRequestId, undeliveredKey, undeliveredNotice,
@@ -4756,8 +4756,8 @@ export class AgentRuntime {
    * A kill switch turned off stops the children already running, not only new ones: each is marked stopped and owing its
    * parent one notice (`switchOffSubagents`), its end written, and its run cancelled. The parent's own turn is left as it
    * is; the notice is posted by `#reportSubagents`, one message a parent. Asked at the start of every pass (the
-   * deployment's switch, read by the pass after it is set: `SUBAGENT_SWITCH_CHECK_MS`) and when the agent's setting is
-   * written. A cancel that fails leaves the run to the stray sweep (`#cancelStraySubagents`), as its row no longer
+   * deployment's switch is read by the first pass after it is set, and a running child's model call out has a pass come
+   * back within the engine's poll backstop, 5 minutes) and when the agent's setting is written. A cancel that fails leaves the run to the stray sweep (`#cancelStraySubagents`), as its row no longer
    * runs. Returns the children it stopped.
    */
   async #switchOffSubagents(tenantId: string, agentId: string): Promise<string[]> {
@@ -5150,12 +5150,8 @@ export class AgentRuntime {
     const retry = reportRetryMs(sql, { tenantId, agentId }, Date.now());
     if (retry !== null) wakeInMs = wakeInMs === null ? retry : Math.min(wakeInMs, retry);
     // A running subagent past its ceiling is cancelled by a pass; the pass comes back for the ceiling's moment.
-    // And at least every `SUBAGENT_SWITCH_CHECK_MS`, so a kill switch set meanwhile is read by a pass.
     const ceiling = subagentCeilingMs(sql, { tenantId, agentId }, Date.now());
-    if (ceiling !== null) {
-      const check = Math.min(ceiling, SUBAGENT_SWITCH_CHECK_MS);
-      wakeInMs = wakeInMs === null ? check : Math.min(wakeInMs, check);
-    }
+    if (ceiling !== null) wakeInMs = wakeInMs === null ? ceiling : Math.min(wakeInMs, ceiling);
     // A finished run should not still be holding a metered container — either
     // by handing it back at once, or, where the deployment leases them, by
     // asking the agent first and taking it at the ceiling.

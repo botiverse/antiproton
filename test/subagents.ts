@@ -33,7 +33,7 @@ import { returnPendingBriefing, takePendingBriefing, readBackstop } from "../src
 import { subagentModelChoice } from "../cf/src/model-request.ts";
 import { savesState } from "../src/plugins/raft.ts";
 import { SUBAGENT_MAX_TURNS, SUBAGENT_LIFETIME_MS, REPORT_MAX_ATTEMPTS, recordSubagent } from "../src/runtime/subagents.ts";
-import { SUBAGENT_SWITCH_CHECK_MS, REPORT_MAX_CHARS, reportBodyChars, reportMessage } from "../src/runtime/subagents.ts";
+import { REPORT_MAX_CHARS, reportBodyChars, reportMessage } from "../src/runtime/subagents.ts";
 
 const logs: any[] = [];
 setLogSink((line) => { try { logs.push(JSON.parse(line)); } catch { /* not ours */ } });
@@ -1424,6 +1424,8 @@ for (const engine of (process.env.ENGINES ?? "pi085,pd").split(",").filter((e) =
         await pass(w);
         must(rowsOf(w).every((r) => r.state !== "running" && r.outcome === "stopped"), `not stopped by the pass: ${show(rowsOf(w))}`);
       }
+      // The parent's own call is still out, not cancelled with the children.
+      must(await w.rt.takeJob("t", "a", parentJob!), "the parent's own call was cancelled");
       // The children's late answers lead nowhere; the parent's own call, still out, is answered and its turn goes on.
       w.reply = (session, req) => session === "main"
         ? say(JSON.stringify(req.messages).includes("were switched off") ? "noted the switch" : `parent ${++parentCalls}`) : say("late child");
@@ -1445,7 +1447,7 @@ for (const engine of (process.env.ENGINES ?? "pi085,pd").split(",").filter((e) =
     });
   }
 
-  await check(`${engine}: with children running, a pass comes back within the switch check, so a deployment's switch is read promptly`, async () => {
+  await check(`${engine}: with a child running, a pass comes back within five minutes, so a deployment's switch is read promptly`, async () => {
     const w = await world(engine);
     let parentCalls = 0;
     w.reply = (session) => session === "main" ? (++parentCalls === 1 ? calls({ id: "c1", args: { task: "long" } }) : say("ok")) : null;
@@ -1453,7 +1455,8 @@ for (const engine of (process.env.ENGINES ?? "pi085,pd").split(",").filter((e) =
     for (let i = 0; i < 6; i++) await pass(w);
     must(rowsOf(w)[0]?.state === "running", show(rowsOf(w)));
     const out = await w.rt.step("t", "a");
-    must(out.wakeInMs !== null && out.wakeInMs <= SUBAGENT_SWITCH_CHECK_MS && out.wakeInMs > 60_000, `wake: ${out.wakeInMs}`);
+    // The child's model call out keeps the engine's poll backstop armed; the ceiling alone would be 30 minutes.
+    must(out.wakeInMs !== null && out.wakeInMs <= 5 * 60_000 && out.wakeInMs > 60_000, `wake: ${out.wakeInMs}`);
   });
 
   await check(`${engine}: a turn whose end is decided gets no second end: a stop while its report is owed drops the report and writes no stopped row`, async () => {
