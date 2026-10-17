@@ -4213,7 +4213,18 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
           return Response.json(await stub.benchResult(String(url.searchParams.get("taskId"))));
         case "/agent/activity":
           return Response.json(await stub.activity(Number(url.searchParams.get("since") ?? 0)));
-        case "/agent/activity/reset": return Response.json(await stub.resetActivity());
+        // A GET that empties `do_activity`: the rows the object's billed time is counted from, against an
+        // hourly watermark that never runs backwards (src/usage/active.ts), so clearing them before a flush
+        // loses the part of that hour not yet charged. It is a diagnostic, so it is the operator's, on the
+        // same door `/bench/activity/reset` comes through — not a viewer's. A viewer's session would reach it
+        // with a plain GET, which another site can make a browser send (`SameSite=Lax` sends the cookie on a
+        // top-level navigation), and this route answers one.
+        case "/agent/activity/reset": {
+          if (!isOperator(env.AUTOMATION_TOKEN, request.headers.get("x-harness-token"))) {
+            return Response.json({ error: "unauthorized" }, { status: 401 });
+          }
+          return Response.json(await stub.resetActivity());
+        }
         // What identity a request actually resolves to is /ui/whoami's
         // business; here only the automation token opens the door, and a
         // client-supplied header never does.

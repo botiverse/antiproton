@@ -16,6 +16,8 @@ const STAND_IN = "export class DurableObject { constructor(ctx, env) { this.ctx 
 register("data:text/javascript," + encodeURIComponent(
   `export async function resolve(s, c, next) { if (s.startsWith("cloudflare:")) return { url: ${JSON.stringify("data:text/javascript," + encodeURIComponent(STAND_IN))}, shortCircuit: true }; return next(s, c); }`));
 const { default: worker } = await import("../cf/src/index.ts");
+const { sessionCookieFor } = await import("../cf/src/auth.ts");
+const { readFileSync } = await import("node:fs");
 const { setLogSink } = await import("../src/core/log.ts");
 setLogSink(() => {});
 
@@ -28,6 +30,8 @@ function must(cond: unknown, msg: string): asserts cond { if (!cond) throw new E
 const show = (v: unknown) => JSON.stringify(v);
 
 const TOKEN = "operator-token-814";
+/** The session sealing key: a cookie minted with it is the same thing a browser presents. */
+const SESSION = "s".repeat(32);
 
 // No route here should fetch from the Worker; in a test any fetch is recorded and answered here, never sent. Whichever
 // world is current records it, so a refused route shows an outbound fetch as plainly as an object call.
@@ -61,6 +65,8 @@ function world(token: string | undefined) {
     AGENT: { idFromName: (n: string) => n, get: () => objectStub },
     CONTROL_DB: { prepare: () => stmt, batch: async () => [] },
     ARTIFACTS: bucket,
+    // A viewer's own session is minted here (below): one route must refuse it whatever it owns.
+    SESSION_SECRET: SESSION,
     ...(token === undefined ? {} : { AUTOMATION_TOKEN: token }),
   };
   return { env, calls };
@@ -167,6 +173,63 @@ for (const path of DELETED) {
     }
   });
 }
+
+// `/agent/activity/reset` empties the object's `do_activity` — the rows its billed time is counted from, with an
+// hourly watermark that never runs backwards (src/usage/active.ts) — so it is a write that loses the part of an hour
+// not yet charged. It answers a GET, and the session cookie is SameSite=Lax, so a viewer who owns the agent would
+// reach it from another site's plain link. It is the operator's: the same door `/bench/activity/reset` uses.
+const RESET = "/agent/activity/reset?tenantId=demo&agentId=u-a";
+const cookie = (await sessionCookieFor(SESSION,
+  { email: "owner@x.test", name: null, username: null, picture: null, source: "github", agentId: "u-a", tenantId: "demo" },
+  "gh-u-a")).split(";")[0]!;
+
+await check("GET /agent/activity/reset: the agent's own signed-in owner cannot clear it", async () => {
+  for (const [label, presented] of [["a session cookie", null], ["a session cookie and a wrong token", "nope"]] as const) {
+    const w = world(TOKEN);
+    const headers: Record<string, string> = { cookie };
+    if (presented !== null) headers["x-harness-token"] = presented;
+    const res = await worker.fetch(new Request(`https://x${RESET}`, { method: "GET", headers }), w.env as never,
+      { waitUntil() {}, passThroughOnException() {} } as never);
+    must(res.status === 401, `${label}: ${res.status} ${(await res.text()).slice(0, 200)}`);
+    must(!w.calls.some((c) => /^(object|r2|fetch)\./.test(c)), `${label} reached the object: ${w.calls}`);
+  }
+});
+
+await check("GET /agent/activity/reset: the operator's token clears it", async () => {
+  const w = world(TOKEN);
+  const res = await worker.fetch(new Request(`https://x${RESET}`, { method: "GET", headers: { "x-harness-token": TOKEN } }),
+    w.env as never, { waitUntil() {}, passThroughOnException() {} } as never);
+  must(res.status === 200, `${res.status} ${(await res.text()).slice(0, 200)}`);
+  must(w.calls.includes("object.resetActivity"), `the object was not asked: ${w.calls}`);
+});
+
+// The mechanism behind #924: the object is chosen from the path's PREFIX, and everything else lands on one shared
+// object with no identity. #932 deleted the probes that were reachable that way and left a comment saying no route
+// reaches the fallback — a comment cannot fail. This is the rule a new `case` has to keep, read from the source, so
+// a diagnostic added next year without a prefix fails here instead of being born anonymous.
+await check("every case that calls the shared stub is under a prefix that picks its object by identity", () => {
+  const source = readFileSync(new URL("../cf/src/index.ts", import.meta.url), "utf8").split("\n");
+  const start = source.findIndex((l) => /switch \(url\.pathname\)/.test(l));
+  must(start > 0, "the switch over url.pathname is not in cf/src/index.ts");
+  const cases = new Map<string, { line: number; stub: boolean }>();
+  let current: string | null = null;
+  for (let i = start; i < source.length; i++) {
+    const line = source[i]!;
+    const opened = /^\s*case "([^"]*)":(.*)$/.exec(line);
+    if (opened) {
+      current = opened[1]!;
+      if (!cases.has(current)) cases.set(current, { line: i + 1, stub: false });
+      if (opened[2]!.includes("stub.")) cases.get(current)!.stub = true;
+      continue;
+    }
+    if (/^\s*default:/.test(line)) { current = null; continue; }
+    if (current && line.includes("stub.")) cases.get(current)!.stub = true;
+  }
+  must(cases.size > 40, `only ${cases.size} cases read: the parse, not the tree, is wrong`);
+  const gated = /^\/(conformance|bench|agent|ui)/;
+  const past = [...cases].filter(([path, v]) => v.stub && !gated.test(path)).map(([path, v]) => `${path} (line ${v.line})`);
+  must(past.length === 0, `these cases call the shared \`stub\` without a prefix that chose its object: ${past.join(", ")}`);
+});
 
 const failed = results.filter((r) => !r.ok);
 for (const r of results) console.log(`${r.ok ? "PASS" : "FAIL"}  ${r.name}${r.ok ? "" : `\n      ${r.error}`}`);
