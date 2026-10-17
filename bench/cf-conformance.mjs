@@ -1,4 +1,7 @@
 const BASE = process.env.CF_BASE ?? "https://antiproton.botiverse.workers.dev";
+// /conformance/executor is one of the probes (cf/src/index.ts PROBE_ROUTES): it starts Dynamic Workers on the
+// deployment's account, so it answers only the operator's token.
+const TOKEN = process.env.AUTOMATION_TOKEN ?? process.env.HARNESS_TOKEN ?? null;
 const show = (title, d) => {
   console.log(`\n  ${title}\n  ${"─".repeat(66)}`);
   if (!d.results) { console.log("  " + JSON.stringify(d).slice(0, 400)); return; }
@@ -12,6 +15,6 @@ const show = (title, d) => {
 for (const [path, title] of [
   ["/conformance/executor", "Executor contract — Cloudflare Dynamic Workers"],
 ]) {
-  const res = await fetch(BASE + path);
+  const res = await fetch(BASE + path, TOKEN ? { headers: { "x-harness-token": TOKEN } } : {});
   show(title, await res.json());
 }

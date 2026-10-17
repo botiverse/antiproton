@@ -72,6 +72,22 @@ const ROUTES: Route[] = [
   { path: "/admin/transcript", method: "GET", refused: 401, passed: (s) => s === 400 },
   // A signed-in admin or the operator's token (auth.ts isAdmin); its refusal is "no such route".
   { path: "/admin/models", method: "PATCH", refused: 404, passed: (s) => s === 405 },
+  // The probes (PROBE_ROUTES): no identity of their own, and three of them start a real turn — a task, a wake, a
+  // model call on the deployment's account — so an unauthenticated caller must not reach the object at all (the
+  // loop below checks that no object method was called). "Passed" is the object answering: the stub turns every
+  // method into { ok: true }.
+  { path: "/isolation", method: "GET", refused: 401, passed: (s) => s === 200 },
+  { path: "/eviction", method: "GET", refused: 401, passed: (s) => s === 200 },
+  { path: "/model-binding", method: "GET", refused: 401, passed: (s) => s === 200 },
+  { path: "/sandbox", method: "GET", refused: 401, passed: (s) => s === 200 },
+  { path: "/sandbox/cpu?ms=50", method: "GET", refused: 401, passed: (s) => s === 200 },
+  { path: "/alarm/arm?ms=1000", method: "GET", refused: 401, passed: (s) => s === 200 },
+  { path: "/storage", method: "GET", refused: 401, passed: (s) => s === 200 },
+  // A number a probe cannot use is refused, not handed to the object: an unbounded cpuMs and an alarm at an
+  // arbitrary delay are the caller's to ask for only within the caps.
+  { path: "/sandbox/cpu?ms=abc", method: "GET", refused: 401, passed: (s) => s === 400 },
+  { path: "/sandbox/cpu?ms=999999", method: "GET", refused: 401, passed: (s) => s === 400 },
+  { path: "/alarm/arm?ms=999999999", method: "GET", refused: 401, passed: (s) => s === 400 },
 ];
 
 async function hit(r: Route, token: string | undefined, presented: string | null) {

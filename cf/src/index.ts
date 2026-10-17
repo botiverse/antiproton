@@ -3906,9 +3906,10 @@ async function requireViewer(request: Request, env: Env): Promise<{ who: string;
  *
  * Every hostname reaches this Worker, and several routes start a real agent.
  * A signed-in identity or the automation secret is required; anything else is
- * refused, and the anonymous switch does not open this door. The
- * diagnostics (conformance, isolation, eviction) stay open because they call no
- * provider and cost nothing.
+ * refused, and the anonymous switch does not open this door. The diagnostics are
+ * not reached from here at all: they ask for the operator's token themselves
+ * (`PROBE_ROUTES`), because `/isolation`, `/eviction` and `/model-binding` start
+ * a real turn and do call a provider.
  */
 async function guardSpending(request: Request, env: Env): Promise<Response | null> {
   // Never anonymous here, whatever the deployment says: this path spends.
@@ -3968,6 +3969,42 @@ export default {
     await retainUsage(env.CONTROL_DB, controller.scheduledTime);
   },
 };
+
+/**
+ * The probe routes: an operator's tools, never the internet's.
+ *
+ * Every path here reaches an object without an identity check of its own, and three of them do real work on
+ * arriving: `/isolation`, `/eviction` and `/model-binding` call `startTask`, which provisions the agent, wakes
+ * it, and spends the operator's model account on a turn — and leaves a task behind on the shared probe object.
+ * The rest burn CPU, subrequests or alarms on that object: `/sandbox` runs a whole dynamic-Worker battery
+ * including outbound fetches, `/sandbox/cpu` spins a `while (true) {}` for as long as it is asked to, and
+ * `/alarm/arm` arms an alarm at whatever delay it is given. None of them is answerable to a caller with no
+ * credential, so they all ask for the operator's token — the door `/agent/message` has always had
+ * (`guardSpending`). What is left in the `p0` branch ungated is `/`, the 404 index, and the `/admin` routes,
+ * which check for themselves.
+ */
+const PROBE_ROUTES = new Set([
+  "/storage", "/conformance/executor", "/model-binding", "/eviction", "/isolation",
+  "/latency", "/sandbox", "/sandbox/cpu", "/alarm/arm", "/alarm/status",
+]);
+
+/** How much CPU a probe may ask the object for, and how long an alarm it may arm. */
+const CPU_PROBE_MAX_MS = 1_000;
+const ALARM_PROBE_MAX_MS = 60_000;
+
+/**
+ * A probe's `ms`, or a refusal: the number decides how much CPU or how long an alarm the caller may ask the
+ * object for, so it is judged here rather than passed on. `Number("")` is 0 and `Number("abc")` is NaN, and
+ * `setAlarm(NaN)` and an unbounded `cpuMs` are not a caller's to choose.
+ */
+function probeMs(raw: string | null, fallback: number, min: number, max: number): number | Response {
+  if (raw === null || raw === "") return fallback;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < min || n > max) {
+    return Response.json({ error: "BAD_MS", hint: `ms is a number from ${min} to ${max}` }, { status: 400 });
+  }
+  return Math.floor(n);
+}
 
 async function route(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
@@ -4125,7 +4162,15 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
       if (access === "not-found") {
         return Response.json({ error: `no such agent: ${agentId} (not this viewer's, or never created)` }, { status: 404 });
       }
-    } else name = "p0";
+    } else {
+      name = "p0";
+      // The probes are the operator's, and the ones that spend are why (PROBE_ROUTES above). Asked once here
+      // rather than in each case below, so a diagnostic added to that switch inherits the gate instead of
+      // having to remember it.
+      if (PROBE_ROUTES.has(url.pathname) && !isOperator(env.AUTOMATION_TOKEN, request.headers.get("x-harness-token"))) {
+        return Response.json({ error: "unauthorized", hint: "the probe routes need x-harness-token" }, { status: 401 });
+      }
+    }
     const stub = env.AGENT.get(env.AGENT.idFromName(name));
     try {
       switch (url.pathname) {
@@ -5023,8 +5068,16 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
         }
         case "/latency": return Response.json({ colo: request.cf?.colo ?? null, ...(await latency(env)) });
         case "/sandbox": return Response.json(await stub.verifySandbox());
-        case "/sandbox/cpu": return Response.json(await stub.verifyCpuLimit(Number(url.searchParams.get("ms") ?? 50)));
-        case "/alarm/arm": return Response.json(await stub.armAlarm(Number(url.searchParams.get("ms") ?? 2000)));
+        case "/sandbox/cpu": {
+          const ms = probeMs(url.searchParams.get("ms"), 50, 1, CPU_PROBE_MAX_MS);
+          if (ms instanceof Response) return ms;
+          return Response.json(await stub.verifyCpuLimit(ms));
+        }
+        case "/alarm/arm": {
+          const ms = probeMs(url.searchParams.get("ms"), 2000, 0, ALARM_PROBE_MAX_MS);
+          if (ms instanceof Response) return ms;
+          return Response.json(await stub.armAlarm(ms));
+        }
         case "/alarm/status": return Response.json(await stub.alarmStatus());
         case "/":
           // The demo is the point of this deployment; making people know to
