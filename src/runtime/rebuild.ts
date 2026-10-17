@@ -109,7 +109,31 @@ export interface RebuildPolicy {
   windowShare?: number;
   /** The idle rebuild's rules: `DEFAULT_IDLE_POLICY` when absent, none at all when `false`. */
   idle?: IdlePolicy | false;
+  /** The soft windows: `DEFAULT_SOFT_WINDOW_POLICY` when absent, none at all when `false`. */
+  softWindow?: SoftWindowPolicy | false;
 }
+
+/**
+ * A soft window: a request size a model's calls are kept under, well inside its real window, because a request over
+ * it costs more per token. Acted on: on pi085's main conversation a call is not sent once the last answered call
+ * measured `share × tokens` or more; the conversation is rebuilt from a briefing first (src/runtime/pi-agent.ts
+ * `#startJob`, then the overflow backstop's rebuild, cf/src/runtime.ts), and its decision row says `reason`
+ * `soft-window`. Per model, keyed as the idle rule is (`softWindowFor`): an exact id, else the longest key the id
+ * contains. `null` turns one model's off. A model no entry names has none.
+ */
+export interface SoftWindowPolicy {
+  /** The share of the soft window at which a call is held back, in (0, 1]: the room left is for what the next request adds. */
+  share: number;
+  byModel: Record<string, number | null>;
+}
+
+/**
+ * Claude Haiku 5.5 is billed five times as much for a whole call once its prompt is over 100,000 tokens: $0.10 per
+ * million input tokens and $0.50 output at most 100,000, $0.50 and $2.50 over it, cache reads and writes alike
+ * (https://platform.claude.com/docs/en/about-claude/pricing, read 2026-10-12). Held back at 90%, so what one more
+ * request adds (a turn's tool results) has 10,000 tokens to land in.
+ */
+export const DEFAULT_SOFT_WINDOW_POLICY: SoftWindowPolicy = { share: 0.9, byModel: { "claude-haiku-5-5": 100_000 } };
 
 const HOUR_MS = 60 * 60_000;
 const MINUTE_MS = 60_000;
@@ -146,6 +170,7 @@ export const DEFAULT_REBUILD_POLICY: RebuildPolicy = {
   fallback: { name: "gap", match: {}, minContextTokens: DEFAULT_MIN_CONTEXT_TOKENS,
     coldAfterGapMs: HOUR_MS, previousColdCounts: false, coldHitRate: 0.5 },
   windowShare: DEFAULT_WINDOW_SHARE,
+  softWindow: DEFAULT_SOFT_WINDOW_POLICY,
 };
 
 const isShare = (v: unknown) => typeof v === "number" && Number.isFinite(v) && v > 0 && v <= 1;
@@ -165,11 +190,15 @@ const isIdle = (i: any): boolean => i === undefined || i === false || (!!i && ty
   && (i.byModel === undefined || (!!i.byModel && typeof i.byModel === "object" && !Array.isArray(i.byModel)
     && Object.values(i.byModel).every(isIdleRule))));
 
+const isSoft = (w: any): boolean => w === undefined || w === false || (!!w && typeof w === "object" && isShare(w.share)
+  && !!w.byModel && typeof w.byModel === "object" && !Array.isArray(w.byModel)
+  && Object.values(w.byModel).every((v) => v === null || (typeof v === "number" && Number.isFinite(v) && v > 0)));
+
 /**
  * What a refused `REBUILD_POLICY` becomes: the default shadow rules, and no idle rebuild. A policy someone wrote and
  * got wrong is most likely an attempt to change what acts, so what acts is turned off rather than defaulted on.
  */
-export const REFUSED_REBUILD_POLICY: RebuildPolicy = { ...DEFAULT_REBUILD_POLICY, idle: false };
+export const REFUSED_REBUILD_POLICY: RebuildPolicy = { ...DEFAULT_REBUILD_POLICY, idle: false, softWindow: false };
 
 const plain = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);
 
@@ -197,6 +226,17 @@ function mergeIdle(idle: unknown): unknown {
 }
 
 /**
+ * The soft-window section as written, over the defaults: `false` stays off; an object's `share` replaces the default's,
+ * and its `byModel` entries are laid over the default ones, so `{"byModel": {"claude-haiku-5-5": null}}` turns Haiku's
+ * off and `{"byModel": {"deepseek": 200000}}` adds one. Anything else is returned as it is, for `isSoft` to refuse.
+ */
+function mergeSoft(w: unknown): unknown {
+  if (w === undefined || w === false || !plain(w)) return w;
+  if (w.byModel !== undefined && !plain(w.byModel)) return w;
+  return { share: w.share ?? DEFAULT_SOFT_WINDOW_POLICY.share, byModel: { ...DEFAULT_SOFT_WINDOW_POLICY.byModel, ...(w.byModel as object | undefined) } };
+}
+
+/**
  * A deployment's policy from its `REBUILD_POLICY` variable: unset is the default, `off` (any case) is none (nothing is
  * recorded or rebuilt), and anything else is JSON laid over the default: a field it leaves out is the default's, so
  * `{"idle": false}` alone turns idle rebuilds off and keeps the shadow rules (`mergeIdle` for the idle section). What
@@ -213,9 +253,10 @@ export function rebuildPolicyOf(raw: string | undefined): RebuildPolicy | null {
         rules: p.rules ?? DEFAULT_REBUILD_POLICY.rules, fallback: p.fallback ?? DEFAULT_REBUILD_POLICY.fallback,
         windowShare: p.windowShare ?? DEFAULT_REBUILD_POLICY.windowShare,
         ...(p.idle !== undefined ? { idle: mergeIdle(p.idle) } : {}),
+        softWindow: p.softWindow !== undefined ? mergeSoft(p.softWindow) : DEFAULT_REBUILD_POLICY.softWindow,
       } as any;
       if (Array.isArray(merged.rules) && merged.rules.every(isRule) && isRule(merged.fallback)
-        && isShare(merged.windowShare) && isIdle(merged.idle)) return merged as RebuildPolicy;
+        && isShare(merged.windowShare) && isIdle(merged.idle) && isSoft(merged.softWindow)) return merged as RebuildPolicy;
     }
   } catch { /* refused below */ }
   logEvent("rebuild.policy.refused", { why: "REBUILD_POLICY is not a policy; the default shadow rules apply, and no idle rebuild" });
@@ -345,6 +386,33 @@ export function idleRebuild(facts: IdleFacts, policy: RebuildPolicy): IdleDecisi
   if (facts.contextTokens < thresholdTokens) return out(false, "savings-below-half");
   if (minContextTokens !== null && facts.contextTokens <= minContextTokens) return out(false, "context-below-floor");
   return out(true, "idle-over-limit");
+}
+
+/** A model's soft window under a policy: the entry that names it, its size and the input at which a call is held back. */
+export interface SoftWindow { entry: string; tokens: number; thresholdTokens: number }
+
+/** The soft window for `model` (`SoftWindowPolicy`), or null when it has none: no policy, the section off, no entry, or a `null` one. */
+export function softWindowFor(policy: RebuildPolicy | null, model: string): SoftWindow | null {
+  const soft = policy ? (policy.softWindow === undefined ? DEFAULT_SOFT_WINDOW_POLICY : policy.softWindow) : false;
+  if (soft === false) return null;
+  const by = soft.byModel;
+  const key = Object.hasOwn(by, model) ? model
+    : Object.keys(by).filter((k) => k !== "" && model.includes(k)).sort((a, b) => b.length - a.length)[0];
+  const tokens = key === undefined ? null : by[key];
+  if (key === undefined || tokens === null || tokens === undefined) return null;
+  return { entry: `byModel:${key}`, tokens, thresholdTokens: Math.floor(soft.share * tokens) };
+}
+
+/**
+ * Whether a call is held back for its soft window (`SoftWindowPolicy`), from the inputs the conversation's answered calls
+ * measured, oldest first: the last at or over the threshold, and the first under it. A conversation that STARTED at or
+ * over the threshold (its system prompt, tools and briefing alone reach it) is not held back: a rebuild would start
+ * the same way, and holding it back would only rebuild it again. It is sent, over its soft window and still inside its
+ * window, as it would have been without one.
+ */
+export function softWindowReached(measured: readonly number[], w: SoftWindow): boolean {
+  if (measured.length === 0) return false;
+  return measured[measured.length - 1]! >= w.thresholdTokens && measured[0]! < w.thresholdTokens;
 }
 
 /** Whether a context this size is a `window` rebuild: at or over the policy's share of the model's window. */

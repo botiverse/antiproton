@@ -29,6 +29,9 @@ export const CONTEXT_WINDOWS: Record<string, number> = {
   // magnitude if guessed.
   "deepseek-flash": 1_000_000,
   "deepseek-v4-pro": 1_000_000,
+  // Read off Anthropic's models overview (https://platform.claude.com/docs/en/about-claude/models/overview, 2026-10-12),
+  // not measured. Its requests are kept far under it by a soft window (src/runtime/rebuild.ts `DEFAULT_SOFT_WINDOW_POLICY`).
+  "claude-haiku-5-5": 1_000_000,
 };
 
 export function contextWindowFor(
@@ -50,9 +53,13 @@ export function contextWindowFor(
  * `NO_VISION_SENTENCE`). Listed only after a live call with an image answered correctly through the path this
  * deployment calls the model by: deepseek-flash at DeepSeek's /chat/completions as a user `image_url`, and
  * gpt-5.6-luna through Cloudflare AI Gateway's /compat/responses as `input_image`, in a user message and in a
- * `function_call_output` (measured 2026-10-12). deepseek-v4-pro was not probed.
+ * `function_call_output` (measured 2026-10-12). deepseek-v4-pro was not probed. claude-haiku-5-5 is the one exception
+ * to that rule, and only while its PR is a draft: Anthropic documents it with vision, and the shapes it is sent through
+ * the gateway's /anthropic route (an `image` block in a user message and inside a `tool_result`) were answered
+ * correctly by claude-haiku-4-5 (2026-10-12), but the gateway does not route claude-haiku-5-5 yet; its own image call
+ * is a merge condition (cf/scripts/probe-model.mjs).
  */
-export const VISION_MODELS: ReadonlySet<string> = new Set(["deepseek-flash", "gpt-5.6-luna"]);
+export const VISION_MODELS: ReadonlySet<string> = new Set(["deepseek-flash", "gpt-5.6-luna", "claude-haiku-5-5"]);
 
 /** Whether `model` can be shown images, matched as `contextWindowFor` matches a window. */
 export function acceptsImages(model: string | undefined): boolean {

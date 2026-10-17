@@ -250,7 +250,11 @@ export function parseArguments(raw: unknown): unknown {
  * into the answer.
  */
 export async function postModelRequest(
-  cfg: { url: string; apiKey: string; model: string; headers: Record<string, string>; deadlineMs: number; onStatus?: (status: number) => void },
+  cfg: {
+    url: string; apiKey: string; model: string; headers: Record<string, string>; deadlineMs: number; onStatus?: (status: number) => void;
+    /** The gateway supplies the vendor's key for this model even though its name is bare (an `anthropic-messages` provider). */
+    gatewayKeyed?: boolean;
+  },
   body: string,
   read: (data: any) => ModelResponse,
 ): Promise<ModelResponse> {
@@ -277,7 +281,7 @@ export async function postModelRequest(
       if (!res.ok) {
         const text = await res.text();
         if (isPermanentRefusal(res.status, text)) {
-          const gatewayKeyed = res.status === 401 && !cfg.apiKey && cfg.model.includes("/");
+          const gatewayKeyed = res.status === 401 && !cfg.apiKey && (cfg.model.includes("/") || cfg.gatewayKeyed === true);
           throw new ModelRequestRefused(res.status, text, [cfg.apiKey, ...Object.values(cfg.headers)],
             gatewayKeyed ? GATEWAY_401_HINT : undefined);
         }

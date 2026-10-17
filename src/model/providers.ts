@@ -44,7 +44,19 @@ export interface ProviderConfig {
    * request would take precedence over the stored one and reach the other vendor.
    */
   passKeys?: Record<string, string>;
+  /**
+   * The wire protocol at `baseUrl`. `openai` (the default): OpenAI-compatible, `<baseUrl>/chat/completions`
+   * (or `/responses` for an OpenAI reasoning model, src/model/openai-responses.ts). `anthropic-messages`:
+   * Anthropic's Messages API, `<baseUrl>/v1/messages` (src/model/anthropic-messages.ts), which is the only
+   * route through Cloudflare AI Gateway that takes `cache_control` and reports cache reads and writes: the
+   * gateway's /compat accepted `cache_control` for an anthropic/ model and billed every repeat in full
+   * (measured 2026-10-12, gateway logs), while its /anthropic route wrote then read the same prefix.
+   */
+  api?: ProviderApi;
 }
+
+export type ProviderApi = "openai" | "anthropic-messages";
+const APIS: readonly ProviderApi[] = ["openai", "anthropic-messages"];
 
 export type ModelFormat = "model" | "vendor/model";
 const FORMATS: readonly ModelFormat[] = ["model", "vendor/model"];
@@ -100,7 +112,7 @@ export function parseProviders(raw: unknown): ProviderConfig[] {
     const at = `MODEL_PROVIDERS[${i}]`;
     if (!e || typeof e !== "object" || Array.isArray(e)) throw new Error(`${at} is not an object`);
     const o = e as Record<string, unknown>;
-    const extra = Object.keys(o).find((k) => !["id", "baseUrl", "auth", "modelFormat", "passKeys"].includes(k));
+    const extra = Object.keys(o).find((k) => !["id", "baseUrl", "auth", "modelFormat", "passKeys", "api"].includes(k));
     if (extra) throw new Error(`${at} has an unknown field ${extra}`);
     if (typeof o.id !== "string" || !PROVIDER_ID.test(o.id)) throw new Error(`${at}.id is a lower-case name`);
     if (seen.has(o.id)) throw new Error(`${at}.id ${o.id} is declared twice`);
@@ -116,6 +128,10 @@ export function parseProviders(raw: unknown): ProviderConfig[] {
     if (o.modelFormat !== undefined) {
       if (!FORMATS.includes(o.modelFormat as ModelFormat)) throw new Error(`${o.id}.modelFormat is one of ${FORMATS.join(", ")}`);
       p.modelFormat = o.modelFormat as ModelFormat;
+    }
+    if (o.api !== undefined) {
+      if (!APIS.includes(o.api as ProviderApi)) throw new Error(`${o.id}.api is one of ${APIS.join(", ")}`);
+      p.api = o.api as ProviderApi;
     }
     if (o.passKeys !== undefined) {
       const k = o.passKeys as Record<string, unknown>;
@@ -202,9 +218,9 @@ export function providerFor(ps: ModelProviders, choice: ModelChoice): ProviderCo
   return ps.configs.find((c) => c.id === choice.provider)!;
 }
 
-/** The request a call to `choice` makes: its URL, the key sent as `Authorization` ("" sends none), and any other header. */
+/** The request a call to `choice` makes: its URL, the key sent as `Authorization` ("" sends none), any other header, and the protocol it speaks. */
 export function providerRequest(ps: ModelProviders, choice: ModelChoice):
-  { baseUrl: string; apiKey: string; model: string; headers: Record<string, string> } {
+  { baseUrl: string; apiKey: string; model: string; headers: Record<string, string>; api: ProviderApi } {
   const p = providerFor(ps, choice);
   const missing = secretsOf(p).filter((n) => !ps.secrets[n]);
   if (missing.length) throw new Error(`provider ${p.id} is not available: ${missing.join(", ")} not set`);
@@ -219,7 +235,7 @@ export function providerRequest(ps: ModelProviders, choice: ModelChoice):
   const vendor = `${choice.model.split("/")[0]}/`;
   const pass = Object.prototype.hasOwnProperty.call(p.passKeys ?? {}, vendor) ? p.passKeys![vendor] : undefined;
   if (pass !== undefined) apiKey = ps.secrets[pass]!;
-  return { baseUrl: p.baseUrl, apiKey, model: choice.model, headers };
+  return { baseUrl: p.baseUrl, apiKey, model: choice.model, headers, api: p.api ?? "openai" };
 }
 
 function httpsUrl(v: unknown, what: string): string {

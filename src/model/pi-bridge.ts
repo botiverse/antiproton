@@ -300,6 +300,12 @@ export function toResponsesInput(context: JobContext, model: string, opts: Seria
 
 const NO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
 
+/**
+ * The `errorMessage` of an answer the provider ended with nothing in it (`ModelResponse.failure`): fixed text, since the
+ * harness's retry check scans it; the provider's reason travels in `providerError`.
+ */
+export const FAILED_ANSWER = "the model ended its answer with nothing in it: see the turn's error";
+
 /** Cost is left at zero: this deployment prices per tenant elsewhere, and a
  *  wrong number in the transcript is worse than an absent one. */
 function usageOf(res: ModelResponse): Usage {
@@ -308,7 +314,7 @@ function usageOf(res: ModelResponse): Usage {
     input: u.promptTokens ?? 0,
     output: u.completionTokens ?? 0,
     cacheRead: u.cachedPromptTokens ?? 0,
-    cacheWrite: 0,
+    cacheWrite: u.cacheWriteTokens ?? 0,
     ...(u.reasoningTokens ? { reasoning: u.reasoningTokens } : {}),
     totalTokens: (u.promptTokens ?? 0) + (u.completionTokens ?? 0),
     cost: { ...NO_COST },
@@ -338,17 +344,30 @@ export function fromResponse(
   jobId?: string,
 ): AnsweredMessage {
   const content: AssistantMessage["content"] = [];
-  // Reasoning to replay (the Responses API's items) is one thinking block per item, its item in
-  // `thinkingSignature`; a trace that is only text is one block with no signature, as it always was.
-  if (res.reasoningItems?.length) {
+  if (res.failure) {
+    return { ...errorMessage(FAILED_ANSWER, model), usage: usageOf(res), rawStopReason: res.finishReason, providerError: res.failure, ...(jobId ? { jobId } : {}) };
+  }
+  // Blocks in the provider's order (Anthropic's), each raw block in its signature field: thinking's
+  // `thinkingSignature`, text's `textSignature`, a call's `thoughtSignature`, which `toAnthropicRequest` replays.
+  if (res.blocks?.length) {
+    for (const b of res.blocks) {
+      if (b.type === "thinking") content.push({ type: "thinking", thinking: b.text, thinkingSignature: b.raw } as any);
+      else if (b.type === "text") content.push({ type: "text", text: b.text, textSignature: b.raw } as any);
+      else content.push({ type: "toolCall", id: b.call.id, name: b.call.name, arguments: (b.call.arguments ?? {}) as Record<string, unknown>, thoughtSignature: b.raw } as any);
+    }
+  } else if (res.reasoningItems?.length) {
+    // Reasoning to replay (the Responses API's items) is one thinking block per item, its item in
+    // `thinkingSignature`; a trace that is only text is one block with no signature, as it always was.
     for (const r of res.reasoningItems) content.push({ type: "thinking", thinking: r.text, thinkingSignature: r.signature } as any);
   } else if (res.reasoning) content.push({ type: "thinking", thinking: res.reasoning } as any);
-  if (res.text) content.push({ type: "text", text: res.text });
-  for (const c of res.toolCalls ?? []) {
-    content.push({
-      type: "toolCall", id: c.id, name: c.name,
-      arguments: (c.arguments ?? {}) as Record<string, unknown>,
-    } as any);
+  if (!res.blocks?.length) {
+    if (res.text) content.push({ type: "text", text: res.text });
+    for (const c of res.toolCalls ?? []) {
+      content.push({
+        type: "toolCall", id: c.id, name: c.name,
+        arguments: (c.arguments ?? {}) as Record<string, unknown>,
+      } as any);
+    }
   }
 
   // A truncated reply that still says something is usable, and `length` is how
@@ -435,5 +454,172 @@ export function errorMessage(
     role: "assistant", content: [], api: model.api as any, provider: model.provider,
     model: model.id, usage: usageOf({} as ModelResponse), stopReason: "error",
     errorMessage: error, timestamp: Date.now(),
+  };
+}
+
+/** An image as an Anthropic `image` block; its bytes must be resolved by now (`dataUrl` says why). */
+function imageBlock(image: { data: string; mimeType: string }): AnthropicBlock {
+  dataUrl(image);
+  return { type: "image", source: { type: "base64", media_type: image.mimeType, data: image.data } };
+}
+
+/** What an input with no text is sent as (`toAnthropicRequest`). */
+export const EMPTY_INPUT = "(no text)";
+
+/**
+ * A block the model wrote, from the JSON it was kept as, when it is one of `types`; null otherwise (no signature, one
+ * from another provider, or not JSON). An empty text block is never sent back: the API refuses one in a request.
+ */
+function rawBlock(signature: unknown, types: string[]): AnthropicBlock | null {
+  if (typeof signature !== "string" || !signature) return null;
+  let b: unknown;
+  try { b = JSON.parse(signature); } catch { return null; }
+  if (!b || typeof b !== "object" || !types.includes(String((b as { type?: unknown }).type))) return null;
+  if ((b as { type: string }).type === "text" && !(b as { text?: unknown }).text) return null;
+  return b as AnthropicBlock;
+}
+
+/** An Anthropic Messages API content block or message, as sent. */
+type AnthropicBlock = Record<string, unknown>;
+export interface AnthropicMessage { role: "user" | "assistant"; content: AnthropicBlock[] }
+
+/** A cache breakpoint: Anthropic's 5-minute cache, the default and the cheaper write (1.25x input, against 2x for an hour). */
+export const CACHE_BREAKPOINT = { type: "ephemeral" } as const;
+
+/**
+ * A stored job's context as an Anthropic Messages API request (src/model/anthropic-messages.ts), for `model`, the model
+ * the call reaches, with its prompt-cache breakpoints placed.
+ *
+ * The conversation is `toRequest`'s in Anthropic's form, as pi's own Anthropic provider converts it
+ * (`convertMessages`, pi-ai-1 dist/api/anthropic-messages.js): the leading system prompt is the top-level `system`;
+ * a tool call is a `tool_use` block of its assistant message and its result a `tool_result` block of the user
+ * message after it, consecutive results in one message. Images, for a model that can see them (`opts.images`), are
+ * `image` blocks with a base64 source, in a user message where the user put them and inside a tool result beside its
+ * text; for any other model each message's images are the no-vision sentence, as in `toRequest`.
+ *
+ * Two differences from `toRequest`, each forced by the API:
+ * - A later system message (version 2) cannot be a message of its own: Anthropic takes `role: "system"` mid-
+ *   conversation only for some models, and Haiku is not documented among them. It is sent as a text block,
+ *   framed `<system-update>`, at the end of the user message before the next assistant turn (after any tool
+ *   results there, which must open their message), which is where pi holds a later system message back to.
+ *   The top-level `system` therefore never changes in a conversation, and neither does the cached prefix.
+ * - Thinking. An answer from `model` itself carries its thinking blocks back, each whole as `fromResponse`
+ *   stored it in `thinkingSignature`, in their place: a tool-use turn with thinking on must send them back.
+ *   Another model's thinking, or a block with no signature, is dropped, as pi drops it.
+ *
+ * Breakpoints (at most four, Anthropic's limit): the last tool, the system prompt, the end of the last user message,
+ * and the end of the user message before it. A request is the previous one plus what that call answered and what
+ * came after, so the previous request's last breakpoint is this one's second-to-last: an exact hit however many
+ * blocks the turn added, where a single moving breakpoint relies on Anthropic's 20-block lookback.
+ */
+export function toAnthropicRequest(context: JobContext, model: string, opts: SerializeOptions = {}): {
+  system?: AnthropicBlock[];
+  messages: AnthropicMessage[];
+  tools?: AnthropicBlock[];
+} {
+  const inline = wireVersion(context) === 2;
+  const all = context.messages as any[];
+  let system: string | undefined = "systemPrompt" in context && context.systemPrompt ? context.systemPrompt : undefined;
+  let start = 0;
+  // Version 2 writes the prompt as its first message (`jobContext`, src/model/durable-offloaded.ts).
+  if (system === undefined && inline && all[0]?.role === "system") { system = String(all[0].content ?? ""); start = 1; }
+
+  const messages: AnthropicMessage[] = [];
+  const pending: string[] = [];
+  const userBlocks = (): AnthropicBlock[] => {
+    const last = messages[messages.length - 1];
+    if (last?.role === "user") return last.content;
+    const m: AnthropicMessage = { role: "user", content: [] };
+    messages.push(m);
+    return m.content;
+  };
+  const flush = () => {
+    if (!pending.length) return;
+    const blocks = userBlocks();
+    for (const t of pending) blocks.push({ type: "text", text: `<system-update>\n${t}\n</system-update>` });
+    pending.length = 0;
+  };
+
+  for (const m of all.slice(start)) {
+    if (m.role === "system") {
+      if (!inline) throw new Error("a version 1 model job carries a system message in its conversation");
+      if (m.content) pending.push(String(m.content));
+      continue;
+    }
+    if (m.role === "user") {
+      const images = imagesOf(m.content);
+      const text = textOf(m.content);
+      if (images.length && opts.images) {
+        // In the order the user wrote them: text and images interleaved as they were.
+        for (const c of m.content as any[]) {
+          if (c?.type === "text" && String(c.text ?? "").trim()) userBlocks().push({ type: "text", text: String(c.text) });
+          else if (c?.type === "image") userBlocks().push(imageBlock(c));
+        }
+        continue;
+      }
+      // A model that cannot see is told so in place of the images. An input with no text at all (only whitespace)
+      // still takes its turn: dropped, the request could end on an assistant turn, which is a prefill these models
+      // refuse, or be empty.
+      const said = images.length ? withNoVision(text) : text;
+      userBlocks().push({ type: "text", text: said.trim() ? said : EMPTY_INPUT });
+      continue;
+    }
+    if (m.role === "toolResult") {
+      const blocks = userBlocks();
+      // Results open their message, before any text in it (an input that came in while the calls ran): one message,
+      // results first, since a user message after the one answering the calls would leave the calls unanswered.
+      const at = blocks.findIndex((b) => b.type !== "tool_result");
+      const images = imagesOf(m.content);
+      const text = textOf(m.content);
+      // A result's images go inside it, beside its text, as Anthropic takes them (and as pi sends them).
+      const content: string | AnthropicBlock[] = !images.length ? text || "(no output)"
+        : !opts.images ? withNoVision(text)
+        : [...(text ? [{ type: "text", text }] : []), ...images.map(imageBlock)];
+      const result: AnthropicBlock = { type: "tool_result", tool_use_id: m.toolCallId, content,
+        ...(m.isError ? { is_error: true } : {}) };
+      if (at < 0) blocks.push(result);
+      else blocks.splice(at, 0, result);
+      continue;
+    }
+    // assistant: this model's own answer exactly as it wrote it, every block raw and in order (`readMessage`,
+    // src/model/anthropic-messages.ts, keeps each one in its block's signature field); anything else rebuilt.
+    flush();
+    const own = m.model === model;
+    const blocks: AnthropicBlock[] = [];
+    for (const c of (m.content ?? []) as any[]) {
+      if (c?.type === "thinking") {
+        const raw = own ? rawBlock(c.thinkingSignature, ["thinking", "redacted_thinking"]) : null;
+        if (raw) blocks.push(raw);
+      } else if (c?.type === "text") {
+        const raw = own ? rawBlock(c.textSignature, ["text"]) : null;
+        if (raw) blocks.push(raw);
+        else if (String(c.text ?? "").trim()) blocks.push({ type: "text", text: String(c.text) });
+      } else if (c?.type === "toolCall") {
+        blocks.push((own ? rawBlock(c.thoughtSignature, ["tool_use"]) : null) ?? { type: "tool_use", id: c.id, name: c.name, input: c.arguments ?? {} });
+      }
+    }
+    if (blocks.length) messages.push({ role: "assistant", content: blocks });
+  }
+  flush();
+
+  const tools = (context.tools ?? []).map((t: any) => ({
+    name: t.name, description: t.description, input_schema: t.parameters ?? { type: "object", properties: {} },
+  })) as AnthropicBlock[];
+  if (tools.length) tools[tools.length - 1] = { ...tools[tools.length - 1], cache_control: CACHE_BREAKPOINT };
+
+  // The last two user messages' last blocks. A user message always has one: every path above that makes one adds a block.
+  let marked = 0;
+  for (let i = messages.length - 1; i >= 0 && marked < 2; i--) {
+    const msg = messages[i]!;
+    if (msg.role !== "user") continue;
+    const last = msg.content.length - 1;
+    msg.content[last] = { ...msg.content[last], cache_control: CACHE_BREAKPOINT };
+    marked++;
+  }
+
+  return {
+    ...(system ? { system: [{ type: "text", text: system, cache_control: CACHE_BREAKPOINT }] } : {}),
+    messages,
+    ...(tools.length ? { tools } : {}),
   };
 }

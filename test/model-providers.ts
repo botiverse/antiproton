@@ -119,7 +119,7 @@ await check("each deployment's declaration is accepted, offers cloudflare under 
   for (const [file, gateway] of [["wrangler.preview.jsonc", "antiproton-preview"], ["wrangler.jsonc", "antiproton"]] as const) {
     const vars = await varsOf(file);
     const configs = parseProviders(vars.MODEL_PROVIDERS);
-    must(configs.map((p) => p.id).join() === `${DEFAULT_PROVIDER},cloudflare`, `${file}: ${JSON.stringify(configs)}`);
+    must(configs.map((p) => p.id).join() === `${DEFAULT_PROVIDER},cloudflare,cloudflare-anthropic`, `${file}: ${JSON.stringify(configs)}`);
     const cf = configs.find((p) => p.id === "cloudflare")!;
     // Each deployment through its own gateway: production's calls must not land in preview's logs or billing.
     must(new RegExp(`^https://gateway\\.ai\\.cloudflare\\.com/v1/[0-9a-f]{32}/${gateway}/compat$`).test(cf.baseUrl), `${file}: ${cf.baseUrl}`);

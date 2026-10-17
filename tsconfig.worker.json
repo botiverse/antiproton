@@ -125,6 +125,7 @@
     "test/spec/pd-tools-spec.ts",
     "test/unavailable-tool.ts",
     "test/pd-cancel.ts",
+    "test/anthropic-messages.ts",
     "test/spec/pd-cancel-spec.ts",
     "test/pd-transcript.ts",
     "test/spec/pd-conversation.ts",
