@@ -1428,6 +1428,25 @@ await check("the default reaches no measurement: the bench tenant and an evaluat
   must(!await offered("t", minimal) && !await offered("t", minimal, true), "harness minimal");
 });
 
+await check("rules: Raft subagent events: a turn ended at its ceiling is outcome ceiling; the agent's status never rides a child's event", () => {
+  const T = Date.parse("2026-10-20T10:00:00Z");
+  const row = (seq: number, at: number, kind: string, status: string, attrs: Record<string, unknown>, extra: Record<string, unknown> = {}) =>
+    ({ seq, at, tenantId: "t", agentId: "a", kind, spanId: `s${seq}`, status, verdict: "ok", attrs, ...extra }) as never;
+  const lineage = { lineage: (x: string) => (x === "sub_x" ? "c_x" : null) };
+  const rows = [
+    // The agent's own model call ends at T (status online), and a child's tool call ends at the same instant.
+    row(1, T, "model.call", "stop", { model: "m1", session: "main" }),
+    row(2, T, "tool.call", "succeeded", { tool: "peek", mount: "chat", task: "sub_x" }, { ms: 0 }),
+    row(3, T + 10, "subagent.turn", "cancelled", { parentSession: "main", turn: 1, reportChars: 120 }, { spanId: "sub_x", parentId: "c_x" }),
+    row(4, T + 20, "subagent.turn", "report_failed", { parentSession: "main", attempts: 1 }, { spanId: "sub_x", parentId: "c_x" }),
+  ];
+  const on = activityEvents("a", rows, lineage);
+  const stop = on.filter((e) => e.hookEventName === "SubagentStop");
+  must(stop.length === 1 && stop[0]!.outcome === "ceiling" && stop[0]!.reportChars === 120, `the ceiling: ${show(stop)}`);
+  must(on.filter((e) => e.subagent).every((e) => e.status === undefined), `the agent's status rode a child's event: ${show(on.filter((e) => e.subagent && e.status))}`);
+  must(on.some((e) => !e.subagent && e.status === "online"), `the agent's own status is gone: ${show(on)}`);
+});
+
 await check("rules: the tool tells the model to delegate big reads for a short report, and to do changes itself", () => {
   const t = subagentTool({ models: [], send: async () => ({}) });
   for (const words of ["any read that would bring a lot of raw content into your context", "short, structured report", "Do changes, messages and decisions yourself",
