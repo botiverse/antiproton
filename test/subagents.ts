@@ -1306,6 +1306,81 @@ for (const engine of (process.env.ENGINES ?? "pi085,pd").split(",").filter((e) =
     must(steps[0]!.subagent!.parentToolUseId === "c_turn1" && steps[1]!.subagent!.parentToolUseId === "c_turn2", `lineage: ${show(steps.map((e) => e.subagent))}`);
   });
 
+  await check(`${engine}: a report that starts a parent turn is that turn's UserPromptSubmit, once, a combined report and a dropped-report notice too; one that joins a running turn is none`, async () => {
+    const reportRows = (w: World) => trace(w).filter((r) => r.kind === "inbound" && r.attrs.alias === "subagent_report");
+    // An idle parent, three children finishing in one pass: one message, one start, before the wake turn's Stop.
+    {
+      const w = await world(engine);
+      let parentCalls = 0, release = false;
+      w.reply = (session, req) => session === "main"
+        ? (++parentCalls === 1 ? calls(...[1, 2, 3].map((i) => ({ id: `c${i}`, args: { task: `part ${i}` } }))) : say(`parent ${parentCalls}`))
+        : release ? say(`report of ${taskOf(req).slice(-6)}`) : null;
+      await w.rt.postMessage("t", "a", "go", "prompt", "main");
+      for (let i = 0; i < 6; i++) await pass(w);
+      release = true;
+      for (const id of w.sent.filter((x) => !w.answered.has(x))) {
+        const job = await w.rt.takeJob("t", "a", id).catch(() => null) as Job | null;
+        if (!job) continue;
+        w.answered.add(id); w.held.delete(id);
+        const req = toRequest(job.context);
+        w.requests.push({ session: sessionOfJob(w, id), req, operatorModel: job.operatorModel ?? null });
+        await w.rt.deliverAnswer("t", "a", id, fromResponse(w.reply(sessionOfJob(w, id), req) as ModelResponse, job.model, id), undefined);
+      }
+      await settle(w);
+      must((await reportMessages(w)).length === 1, "control: the reports did not arrive as one message");
+      const rows = reportRows(w);
+      must(rows.length === 1 && rows[0]!.status === "delivered", `idle parent: ${rows.length} rows`);
+      must(!JSON.stringify(rows).includes("report of") && !JSON.stringify(rows).includes("sub_"), `the row carries text or a child id: ${show(rows)}`);
+      // The start comes before the Stop of the turn it began.
+      const all = trace(w);
+      const at = all.findIndex((r) => r.kind === "inbound" && r.attrs.alias === "subagent_report");
+      const stopAfter = all.slice(at).find((r) => r.kind === "model.call" && r.attrs.session === "main" && r.status === "stop");
+      must(at >= 0 && stopAfter, "no Stop after the report's start");
+      const names = activityEvents("a", all.slice(at)).map((e) => e.hookEventName).filter(Boolean);
+      must(names[0] === "UserPromptSubmit" && names.includes("Stop"), `events from the report on: ${show(names)}`);
+    }
+    // A busy parent (its model call held): the report joins its run, and makes no start.
+    {
+      const w = await world(engine);
+      let parentCalls = 0, parentBusy = false, release = false;
+      w.reply = (session, req) => {
+        if (session === "main") {
+          parentCalls++;
+          if (parentCalls === 1) return calls({ id: "c1", args: { task: "part A" } });
+          return parentBusy ? null : say(`parent ${parentCalls}`);
+        }
+        return release ? say("report of A") : null;
+      };
+      await w.rt.postMessage("t", "a", "go", "prompt", "main");
+      for (let i = 0; i < 6; i++) await pass(w);
+      parentBusy = true;
+      await w.rt.postMessage("t", "a", "keep working", "prompt", "main");
+      for (let i = 0; i < 3; i++) await pass(w);
+      release = true;
+      for (let i = 0; i < 6; i++) { await pass(w); await sleep(5); }
+      parentBusy = false;
+      await settle(w);
+      must((await reports(w)).length === 1, `control: the report: ${(await reports(w)).length}`);
+      must(reportRows(w).length === 0, `a report that joined a running turn made a start: ${reportRows(w).length}`);
+    }
+    // A dropped report's notice that wakes the parent: one start.
+    {
+      const w = await world(engine);
+      let parentCalls = 0;
+      w.reply = (session) => session === "main" ? (++parentCalls === 1 ? calls({ id: "c1", args: { task: "t" } }) : say("ok")) : say("lost");
+      w.fault.at = (p) => { if (p === "report-posting") throw new Error("the parent's lane said no"); };
+      await w.rt.postMessage("t", "a", "go", "prompt", "main");
+      const has = () => w.raw.sql.exec("SELECT 1 FROM sqlite_master WHERE name = 'subagents'").toArray().length > 0;
+      for (let i = 0; i < 30 && !(has() && rowsOf(w)[0]?.state === "idle"); i++) {
+        await pass(w);
+        if (has()) w.raw.sql.exec("UPDATE subagents SET report_retry_at = 0 WHERE state = 'reporting'");
+      }
+      await settle(w);
+      must((await mainTexts(w)).some((t) => t.includes("could not be delivered")), "control: no notice");
+      must(reportRows(w).length === 1, `the notice's start: ${reportRows(w).length}`);
+    }
+  });
+
   await check(`${engine}: a follow-up to a subagent still running, or to an id this conversation never started, is refused`, async () => {
     const w = await world(engine);
     let parentCalls = 0, child: string | null = null;

@@ -4436,23 +4436,25 @@ export class AgentRuntime {
   async #postOnce(
     tenantId: string, agentId: string, session: string, text: string, key: string, via: "say" | "postMessage" = "say",
     unless?: () => boolean, requestId: string = key,
-  ): Promise<{ op: string | null; skipped: boolean }> {
+  ): Promise<{ op: string | null; skipped: boolean; started: boolean }> {
     const posted = this.#postedOp(session, key);
-    if (posted) return { op: posted.op, skipped: false };
+    if (posted) return { op: posted.op, skipped: false, started: false };
     // A report goes the way a background completion does (`postMessage`): the import hold, the overflow backstop's
     // refusal, a rebuild's pending briefing, the notices. A child's task is said to its own session directly: those are
     // the agent's conversation's, and a notice taken by a child would never reach the agent.
     let res: any;
     if (via === "postMessage") {
       const out = await this.postMessage(tenantId, agentId, text, "prompt", session, { requestId, ...(unless ? { unless } : {}) });
-      if ((out as { skipped?: true }).skipped) return { op: null, skipped: true };
+      if ((out as { skipped?: true }).skipped) return { op: null, skipped: true, started: false };
       res = out.result;
     } else {
       res = await (await this.agent(tenantId, agentId, session)).say(text, "prompt", { requestId });
     }
     if (res?.ok === false) throw new Error(res.error?.message ?? res.error?._tag ?? "the message was refused");
     const op = res?.value?.operationId ?? res?.value?.submissionId ?? null;
-    return { op: op === null ? null : String(op), skipped: false };
+    // `started`: the post began a run of its own (both engines answer that with an operation id); one that joined a run
+    // under way, or was queued behind it, did not.
+    return { op: op === null ? null : String(op), skipped: false, started: res?.value?.operationId !== undefined && res?.value?.operationId !== null };
   }
 
   /**
@@ -4561,6 +4563,7 @@ export class AgentRuntime {
               .catch((e) => console.error(`cancelling the run ${tenantId}/${agentId}'s report started after a stop failed:`, e));
             continue;
           }
+          if (posted.started) this.#reportInbound(tenantId, agentId, "subagent_report");
         }
       } catch (e) {
         if (e instanceof SessionNeedsReset) {
@@ -4587,6 +4590,7 @@ export class AgentRuntime {
         if (lost.length) {
           const keys = lost.map((x) => undeliveredKey(x.s));
           await this.#postOnce(tenantId, agentId, parent, undeliveredNotice(lost.map((x) => x.s), lost[0]!.attempts), keys[0]!, "postMessage", undefined, combinedRequestId(keys))
+            .then((n) => { if (n.started) this.#reportInbound(tenantId, agentId, "subagent_report"); })
             .catch((n) => console.error(`the undelivered-report notice of ${tenantId}/${agentId} failed too:`, n));
         }
         continue;
@@ -4633,6 +4637,20 @@ export class AgentRuntime {
       status: String(result.status ?? "unknown"),
       error: typeof result.error?.message === "string" ? result.error.message : null,
     });
+  }
+
+  /**
+   * A delivered report (or a combined one, or a dropped-report notice) that started a turn of its parent is that turn's
+   * prompt, as a push is: the same `inbound` row, `delivered`, which activity reads as the turn's UserPromptSubmit. Only
+   * when the post began a run (`#postOnce`'s `started`): one that joined a run under way is part of that run's turn, and
+   * a second start mid-turn would be false. No text and no child id: alias `subagent_report`. A reading: a failure is logged.
+   */
+  #reportInbound(tenantId: string, agentId: string, alias: string) {
+    const at = Date.now();
+    try {
+      appendTrace(this.#deps.ctx.storage.sql, [{ at, tenantId, agentId, kind: "inbound", spanId: `${alias}:${at}`,
+        status: "delivered", verdict: "ok", attrs: { alias, source: alias } }]);
+    } catch (e) { console.error(`the inbound row of ${tenantId}/${agentId}'s report could not be written:`, e); }
   }
 
   /** Forget the harness this isolate built for `session` (`agent`'s cache): a finished child's is not kept for nothing. */
