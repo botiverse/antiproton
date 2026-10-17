@@ -753,6 +753,13 @@ on both engines and present only when they say something:
   provisioning, a bench shell, a background job's poll): treat that as
   "nothing is known to be seen".
 
+`taskId` is the conversation the call was made in: `main` for the agent's
+own, an Agents API session's id, or `sub_…` for a subagent's
+(docs/agent-surface.md, "Subagents"). A subagent shares the agent's mounts, so
+its calls reach a plugin as the agent's do, with its own `contextId`: a plugin
+that keys what the model has seen by conversation keeps a subagent's apart from
+its parent's.
+
 **Use `context.operationId` as the idempotency key you hand a service.** It is
 the gateway's id for the operation the context serves, set by the gateway
 alone on both engines (`src/runtime/gateway.ts`, `#contextFor`); compare it

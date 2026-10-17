@@ -726,10 +726,76 @@ The ended turn reports itself to Raft: a "Bridge fatal" activity event with `err
 status `error` with that detail. Every attempt is a `turn.stop` line in the Workers logs, whatever came of it, written
 by the Worker that answered it (`side` = `worker`; [`runbook.md`](runbook.md#logs-and-what-an-object-did)).
 
+A stop ends the agent's subagents' turns as well ([Subagents](#subagents-send_to_agent)): none of them reports.
+
 **A delete ends the turn too.** `DELETE /provision/agents/{agentId}` first stops the running turn (`errorClass`
 `stopped: agent deleted`), and from then on the agent's object takes no step for it, whatever arrives; a repeated
 delete stops again. A stop that fails does not fail the delete: it is logged as a `turn.stop` line with `result`
 `failed` ([`runbook.md`](runbook.md)).
+
+## Subagents (`send_to_agent`)
+
+An agent whose `subagents` setting is on (off by default; an operator turns it on per agent,
+[`runbook.md`](runbook.md#subagents)) is offered one more harness tool, `send_to_agent`, in its own conversations. It
+delegates a self-contained piece of work to a **subagent**: a child conversation in the same agent object, with its own
+context. The design is issue #926; the code is `src/runtime/subagents.ts` and `cf/src/runtime.ts` (`#sendToAgent`,
+`#reportSubagents`).
+
+```
+send_to_agent { task: string, agent?: string, model?: string }
+  → { "agent": "sub_…", "status": "started", "note": "…" }
+```
+
+- **`task`** is the whole instruction. The subagent sees none of the parent's conversation, so the task must carry the
+  paths, ids, constraints and the format of the report wanted back. The tool's description tells the model when to
+  delegate: independent pieces that can run in parallel, or work too big for one context where only a summary matters;
+  never a simple question, a few tool calls' worth, or tightly coupled steps.
+- **Without `agent`** a new subagent starts: a session `sub_<hex>` in the same object (on pi085 a transcript of its
+  own; on pd an ownerless pi-durable conversation), the task its first message. The tool answers at once; the parent's
+  turn goes on, and usually ends. Nothing in the object waits for the child.
+- **With `agent`** (an id this conversation started) the task is a follow-up: the subagent keeps its history. Refused
+  while that subagent is still running, and for an id the conversation did not start.
+- **`model`** is offered only where the deployment lists owner model options (`USER_MODELS`, the same list as the
+  [model picker](#the-servers-model-picker-model-picker)): one option's `id`. The queue calls that option's provider and
+  model for the subagent's calls; without it the subagent runs on the agent's own model. An id that is not listed is
+  refused and nothing starts.
+- **At most 3** subagents of one agent run at once; a fourth start (or a follow-up that would be the fourth) is refused,
+  naming the running ones.
+- **Depth 1.** A subagent is never offered `send_to_agent`, nor an Agents API caller's functions. It has the agent's
+  other tools: its mounts, `run_js`, `jobs`. Mounts, containers and files are the agent's, so a subagent works in the
+  same workspace as its parent.
+
+**Reports.** When a subagent's turn ends, its last answer is posted to the conversation that started it as a message,
+which wakes that conversation as a background job's completion does:
+
+```
+[subagent sub_… — done after 42s; its report, a notice from the harness, not a message from the user. send_to_agent with agent "sub_…" sends it a follow-up.]
+<the subagent's final answer>
+```
+
+`failed` carries the error (a model call that failed, a run that ended without an answer); `cancelled` is a turn
+past the 30-minute ceiling, cancelled by the agent's next pass. A report is cut at 20,000 characters. A turn's end is
+read from what the engine committed when the run ended (pi085's run result, pd's settled submission), so a report is
+delivered by the first pass after it, whether or not the object was evicted or restarted meanwhile. A background job a
+subagent started that ends after its report starts another turn of the subagent, which reports in turn.
+
+**Stopping.** A stop of the agent — the provider's [stop](#stopping-a-turn-stop), a delete, `/admin/cancel-turn` —
+marks every running subagent `stopped`, then cancels its turn: no model call follows, and no report is sent, since a
+report would wake the conversation the stop just ended.
+
+**Raft.** Activity and status come from the agent's own conversations only. A subagent's model calls and tool calls
+are neither activity nor status: a subagent's final answer is not a `Stop`, and does not show the agent `online`; its
+tools do not show as the agent's. The agent's own turn ends with its own `Stop` after it starts subagents, and it shows
+working again when a report wakes it and it calls the model. A subagent's work is in the [trace](#trace) only.
+
+**Cost.** A subagent's calls are the agent's: metered under its `agent_id`, and each call is admitted against the daily
+spend limits like any other. Its share is visible in the trace: its `model.call` rows name its session.
+
+**Known limits.** On pi085 a subagent's conversation has no compaction and no overflow backstop (both are the main
+conversation's), so a subagent's task must fit one context window. On pd every conversation's tools are opened when a
+cold isolate first drives the harness, so an agent with many past subagents pays for opening each of them then. A
+subagent has the agent's messaging tools; it is told that its final answer goes to the agent and not to message anyone
+unless the task says to, and nothing more enforces it.
 
 ## Evaluation setup (preview only)
 
@@ -982,7 +1048,8 @@ carries.
 Each tool's `name`, `description` and `parameters` are exactly what the model is sent: the name as
 offered (`<alias>__<tool>`, as the harness names it, `offeredToolName`), the description with
 whatever the harness appends. `source` is `mount` for a mount's tool, `harness` for the harness's own
-(`run_js`, `resume`, `jobs`) and `caller` for an Agents API caller's function; a mount's tool also
+(`run_js`, `resume`, `jobs`, and `send_to_agent` where the agent's `subagents` setting is on) and `caller` for an Agents
+API caller's function; a mount's tool also
 carries `alias`, `plugin`, `tool` (its name in the plugin), `sideEffects`, `idempotency`, `replay`
 (whether the harness may run it again after an interruption: `safe` or `never`), and `modelOnly`,
 `reads` and `exclusive` where they are set.
@@ -1034,7 +1101,9 @@ answer with `/admin/transcript`'s for the same agent).
 `GET …/trace` answers the agent's trace rows — the spans of its work, one row each when it ended
 (`model.call`, `tool.call`, `approval.wait`, `container.lease`, `inbound`, `mount.seeded`,
 `rebuild.decision`, `rebuild.outcome`, `rebuild.behaviour`, `turn.timing`, `import.hold`, `model.prewarm`, `agent.ready`,
-`mount.settings` (an operator's in-place change of a mount's settings, [docs/plugins.md](plugins.md)), and the rows a plugin writes of its own, `raft.held`, `raft.held_answer` and `raft.state_failed` (written as `raft.state_save_failed` before Raft SDK 0.19.0)
+`mount.settings` (an operator's in-place change of a mount's settings, [docs/plugins.md](plugins.md)), `subagent.turn`
+(one turn of a [subagent](#subagents-send_to_agent) ending: `spanId` its session, `parentId` the tool call that sent the
+turn, `status` `done`, `failed` or `cancelled`, `attrs.parentSession`), and the rows a plugin writes of its own, `raft.held`, `raft.held_answer` and `raft.state_failed` (written as `raft.state_save_failed` before Raft SDK 0.19.0)
 ([docs/plugins.md](plugins.md)); `src/trace/outbox.ts`) — with `from <= at < to`, in `seq` order.
 
 - `from`, `to` — ISO 8601 or milliseconds since the epoch; the window is at most 24 hours. One alone
@@ -1054,7 +1123,8 @@ exported, and one exported between the two reads is found in its batch: no lag p
 What is never there: a span still open (a model call awaiting its answer, a tool still running), and
 anything the trace does not record (`src/trace/outbox.ts` names the documented silences). Each row is
 as exported: `{ seq, at, tenantId, agentId, kind, spanId, parentId?, status, verdict, ms?, attrs }`.
-A `model.call` row's `attrs` carry `model` and the answer's `input`, `cacheRead` and `cacheWrite` tokens;
+A `model.call` row's `attrs` carry `model`, `session` (the conversation that made the call: `main`, an Agents API
+session, or a subagent's `sub_…`) and the answer's `input`, `cacheRead` and `cacheWrite` tokens;
 on the pi085 engine also `prefix` (`src/runtime/request-prefix.ts`): the sha256 of the system prompt
 and of the tool list, the request's message count and characters, how many leading messages (and their
 characters) are the previous request's byte for byte, and `broken` — `system`, `tools`, `message`, or

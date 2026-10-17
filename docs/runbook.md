@@ -114,3 +114,36 @@ Only settings the plugin marks `changeable` are accepted (`conversationCards` an
 an undeclared key is `400`, a value of the wrong type is `400`, and an agent or alias that is not there is `404`. Each
 change writes a `mount.settings` line to the Workers logs (filter on `evt` = `mount.settings`) and a `mount.settings`
 row to the agent's trace.
+
+## Subagents
+
+An agent can delegate work to subagents (docs/agent-surface.md, "Subagents") only where its `subagents` setting is on.
+It is off for every agent unless set. Turn it on for one agent:
+
+```
+curl -s -X PATCH -H "x-harness-token: $AUTOMATION_TOKEN" -H "content-type: application/json" \
+  "$HOST/admin/agent-settings" -d '{"tenantId":"<tenantId>","agentId":"<agentId>","settings":{"subagents":true}}'
+```
+
+The answer is the settings in force and what moved: `{"settings":{"subagents":true},"changed":["subagents"]}`. The
+agent's next turn is offered `send_to_agent`; a turn already running keeps the tools it started with. Off again is the
+same call with `false`; subagents already running finish and report. An unknown setting or a value that is not a
+boolean is `400` and nothing is written; an agent that is not there is `404`. Each change is an `agent.settings` line in
+the Workers logs.
+
+To see an agent's subagents and the setting:
+
+```
+curl -s -H "x-harness-token: $AUTOMATION_TOKEN" "$HOST/admin/agent-settings?tenantId=<tenantId>&agentId=<agentId>"
+```
+
+`subagents` lists them, newest first: `id` (the child's session, `sub_…`), `parentSession`, `state` (`running` while a
+turn is in flight, else `idle`), `turns`, `outcome` of the last turn (`done`, `failed`, `cancelled` at the 30-minute
+ceiling, `stopped` with its parent), and `modelOption`. A child's work is in the agent's trace, its rows naming its
+session (`model.call` `attrs.session`, `tool.call` `attrs.task`) and one `subagent.turn` row per turn.
+
+**Stopping.** A stop of the agent stops its subagents with it: `/admin/cancel-turn`, the provider's stop and a delete
+([Stopping a runaway agent](#stopping-a-runaway-agent)) mark every running subagent `stopped` and cancel its turn, on
+both engines, and no report is sent (a report would wake the turn the stop ended). `/admin/cancel-turn` answers
+`interrupted` when only subagents were running, too. There is no route that stops one subagent alone. While any
+subagent runs, a fresh context and a reset refuse, as they do for a running turn.
