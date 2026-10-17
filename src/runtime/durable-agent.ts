@@ -865,12 +865,12 @@ export class DurableAgent implements AgentEngine {
    * and is placed after them, so the session keeps reading `requires_action` with the same turn waiting
    * until the caller answers, and a cancel withdraws the input with the run.
    */
-  async say(text: string, mode: "prompt" | "steer" | "followUp" = "prompt") {
+  async say(text: string, mode: "prompt" | "steer" | "followUp" = "prompt", opts: { requestId?: string } = {}) {
     // One id for this message, kept across `withHarness`'s retry. A harness that closes while the input
     // is being admitted still completes the admitted commit, so the input can be durable when the call
     // fails ("Session is closed" from `status`); the retry then finds it by this id (pi-durable dedupes
     // a submission per conversation and request id) instead of submitting it a second time.
-    const requestId = `say:${crypto.randomUUID()}`;
+    const requestId = opts.requestId ?? `say:${crypto.randomUUID()}`;
     // Submitting starts the scheduler, which runs every session's tasks.
     await this.#host.ensureSessions();
     return this.#host.withHarness(async (h) => {

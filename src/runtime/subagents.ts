@@ -61,8 +61,15 @@ export interface Subagent {
   modelOption: string | null;
   provider: string | null;
   model: string | null;
-  /** `running` while a turn is in flight; `idle` once its end was reported (or it was stopped with its parent). */
-  state: "running" | "idle";
+  /**
+   * `running` while a turn is in flight; `reporting` once its end is decided and its report (`report`) is owed to the
+   * parent; `idle` once the report was posted (or the child was stopped with its parent, which drops it).
+   */
+  state: "running" | "reporting" | "idle";
+  /** What sent the current turn, as `turnKeyOf` makes it: what a replayed send of the same call is recognised by. */
+  turnKey: string | null;
+  /** The report owed while `reporting`: decided once, so a retry posts the same text under the same key. */
+  report: string | null;
   /** The engine's id for the turn in flight: pi085's operation id, pd's submission id. What its end is read by. */
   turnOp: string | null;
   turns: number;
@@ -77,7 +84,8 @@ export function ensureSubagentTable(sql: Sql) {
     id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL,
     parent_session TEXT NOT NULL, call_id TEXT, model_option TEXT, provider TEXT, model TEXT,
     state TEXT NOT NULL, turn_op TEXT, turns INTEGER NOT NULL DEFAULT 0,
-    created_at INTEGER NOT NULL, turn_started_at INTEGER NOT NULL, finished_at INTEGER, outcome TEXT)`);
+    created_at INTEGER NOT NULL, turn_started_at INTEGER NOT NULL, finished_at INTEGER, outcome TEXT,
+    turn_key TEXT, report TEXT)`);
 }
 
 /** Whether the object has the table at all, asked without making it: most objects never had a child. */
@@ -89,21 +97,52 @@ const rowTo = (r: any): Subagent => ({
   id: String(r.id), parentSession: String(r.parent_session), callId: r.call_id === null ? null : String(r.call_id),
   modelOption: r.model_option === null ? null : String(r.model_option),
   provider: r.provider === null ? null : String(r.provider), model: r.model === null ? null : String(r.model),
-  state: r.state === "running" ? "running" : "idle", turnOp: r.turn_op === null ? null : String(r.turn_op),
+  state: r.state === "running" || r.state === "reporting" ? r.state : "idle", turnOp: r.turn_op === null ? null : String(r.turn_op),
+  turnKey: r.turn_key === null || r.turn_key === undefined ? null : String(r.turn_key),
+  report: r.report === null || r.report === undefined ? null : String(r.report),
   turns: Number(r.turns), createdAt: Number(r.created_at), turnStartedAt: Number(r.turn_started_at),
   finishedAt: r.finished_at === null || r.finished_at === undefined ? null : Number(r.finished_at),
   outcome: (r.outcome ?? null) as SubagentOutcome | null,
 });
 
-/** A fresh child session id. Minted here only, so the prefix names a subagent and nothing else (src/runtime/subagent-session.ts). */
-export function newSubagentId(): string {
-  return `${SUBAGENT_SESSION_PREFIX}${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
+/**
+ * What one send is recognised by when it runs again: the conversation, the call's invocation (pi085's invocation id,
+ * session-unique and the call's result entry; pd's tool task) and the model's call id. Both engines run a
+ * `replay: "safe"` tool again after an interruption under the same invocation, and only then; a later call that
+ * reuses a call id is another invocation.
+ */
+export function turnKeyOf(parentSession: string, run: string, callId: string): string {
+  return `${parentSession}|${run}|${callId}`;
 }
+
+/**
+ * The child session a send starts, derived from its turn key, so a replayed spawn finds the child the first run made
+ * instead of making a second one nobody knows about. Minted here only, so the prefix names a subagent and nothing else
+ * (src/runtime/subagent-session.ts).
+ */
+export async function subagentIdFor(turnKey: string): Promise<string> {
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(turnKey)));
+  return `${SUBAGENT_SESSION_PREFIX}${[...digest.slice(0, 8)].map((b) => b.toString(16).padStart(2, "0")).join("")}`;
+}
+
+/**
+ * The marks a posted message carries, so whether it was posted can be read back from the conversation it went to
+ * (cf/src/runtime.ts `#postedOp`) and a retry does not post it twice: `task` for a child's turn, `report` for its report.
+ */
+export const taskKey = (id: string, turn: number) => `task ${id}/${turn}`;
+export const reportKey = (s: Pick<Subagent, "id" | "turns">) => `report ${s.id}/${s.turns}`;
 
 export function subagentOf(sql: Sql, owner: SubagentOwner, id: string): Subagent | null {
   if (!hasSubagentTable(sql)) return null;
   const r = sql.exec("SELECT * FROM subagents WHERE id = ? AND tenant_id = ? AND agent_id = ?", id, owner.tenantId, owner.agentId).toArray()[0];
   return r ? rowTo(r) : null;
+}
+
+/** Children whose report is decided and not yet posted. */
+export function reportingSubagents(sql: Sql, owner: SubagentOwner): Subagent[] {
+  if (!hasSubagentTable(sql)) return [];
+  return sql.exec("SELECT * FROM subagents WHERE tenant_id = ? AND agent_id = ? AND state = 'reporting' ORDER BY finished_at ASC, id ASC",
+    owner.tenantId, owner.agentId).toArray().map(rowTo);
 }
 
 export function runningSubagents(sql: Sql, owner: SubagentOwner): Subagent[] {
@@ -137,24 +176,25 @@ export function admitSubagent(running: ReadonlyArray<Pick<Subagent, "id" | "turn
 /** A new child, with its first turn in flight. */
 export function recordSubagent(sql: Sql, owner: SubagentOwner, s: {
   id: string; parentSession: string; callId: string | null; modelOption: string | null; provider: string | null; model: string | null;
-  turnOp: string | null; now: number;
+  turnOp: string | null; turnKey: string | null; now: number;
 }) {
   ensureSubagentTable(sql);
   sql.exec(
-    "INSERT INTO subagents(id, tenant_id, agent_id, parent_session, call_id, model_option, provider, model, state, turn_op, turns, created_at, turn_started_at) " +
-    "VALUES (?,?,?,?,?,?,?,?, 'running', ?, 1, ?, ?)",
-    s.id, owner.tenantId, owner.agentId, s.parentSession, s.callId, s.modelOption, s.provider, s.model, s.turnOp, s.now, s.now);
+    "INSERT INTO subagents(id, tenant_id, agent_id, parent_session, call_id, model_option, provider, model, state, turn_op, turns, created_at, turn_started_at, turn_key) " +
+    "VALUES (?,?,?,?,?,?,?,?, 'running', ?, 1, ?, ?, ?)",
+    s.id, owner.tenantId, owner.agentId, s.parentSession, s.callId, s.modelOption, s.provider, s.model, s.turnOp, s.now, s.now, s.turnKey);
 }
 
 /** A follow-up's turn: running again, with its own operation and the call that sent it. */
 export function startSubagentTurn(sql: Sql, owner: SubagentOwner, id: string, t: {
   callId: string | null; turnOp: string | null; now: number; model?: { option: string; provider: string; model: string } | null;
+  turnKey?: string | null;
 }) {
   sql.exec(
-    "UPDATE subagents SET state = 'running', turn_op = ?, call_id = ?, turns = turns + 1, turn_started_at = ?, finished_at = NULL, outcome = NULL" +
+    "UPDATE subagents SET state = 'running', turn_op = ?, call_id = ?, turn_key = ?, turns = turns + 1, turn_started_at = ?, finished_at = NULL, outcome = NULL, report = NULL" +
     (t.model ? ", model_option = ?, provider = ?, model = ?" : "") +
     " WHERE id = ? AND tenant_id = ? AND agent_id = ?",
-    t.turnOp, t.callId, t.now, ...(t.model ? [t.model.option, t.model.provider, t.model.model] : []), id, owner.tenantId, owner.agentId);
+    t.turnOp, t.callId, t.turnKey ?? null, t.now, ...(t.model ? [t.model.option, t.model.provider, t.model.model] : []), id, owner.tenantId, owner.agentId);
 }
 
 /** The engine's id for the turn just started, once `say` has answered with it. */
@@ -162,13 +202,22 @@ export function setSubagentTurnOp(sql: Sql, owner: SubagentOwner, id: string, tu
   sql.exec("UPDATE subagents SET turn_op = ? WHERE id = ? AND tenant_id = ? AND agent_id = ?", turnOp, id, owner.tenantId, owner.agentId);
 }
 
-/** Only a running turn finishes, so two passes that both read its end report it once. Returns whether this one did. */
-export function finishSubagentTurn(sql: Sql, owner: SubagentOwner, id: string, outcome: SubagentOutcome, now = Date.now()): boolean {
+/**
+ * Only a running turn finishes, so two passes that both read its end decide it once. Returns whether this one did.
+ * With a `report`, the child owes it to its parent (`reporting`) until `markReported`; without, it is idle at once.
+ */
+export function finishSubagentTurn(sql: Sql, owner: SubagentOwner, id: string, outcome: SubagentOutcome, now = Date.now(), report: string | null = null): boolean {
   const before = sql.exec("SELECT state FROM subagents WHERE id = ? AND tenant_id = ? AND agent_id = ?", id, owner.tenantId, owner.agentId).toArray()[0] as any;
   if (!before || before.state !== "running") return false;
-  sql.exec("UPDATE subagents SET state = 'idle', finished_at = ?, outcome = ? WHERE id = ? AND tenant_id = ? AND agent_id = ? AND state = 'running'",
-    now, outcome, id, owner.tenantId, owner.agentId);
+  sql.exec("UPDATE subagents SET state = ?, finished_at = ?, outcome = ?, report = ? WHERE id = ? AND tenant_id = ? AND agent_id = ? AND state = 'running'",
+    report === null ? "idle" : "reporting", now, outcome, report, id, owner.tenantId, owner.agentId);
   return true;
+}
+
+/** The report was posted to the parent (or is not to be): the child is idle. */
+export function markReported(sql: Sql, owner: SubagentOwner, id: string) {
+  sql.exec("UPDATE subagents SET state = 'idle', report = NULL WHERE id = ? AND tenant_id = ? AND agent_id = ? AND state = 'reporting'",
+    id, owner.tenantId, owner.agentId);
 }
 
 /**
@@ -178,13 +227,18 @@ export function finishSubagentTurn(sql: Sql, owner: SubagentOwner, id: string, o
 export function stopRunningSubagents(sql: Sql, owner: SubagentOwner, now = Date.now()): string[] {
   const ids = runningSubagents(sql, owner).map((s) => s.id);
   for (const id of ids) finishSubagentTurn(sql, owner, id, "stopped", now);
+  // A report decided and not yet posted is dropped too, for the same reason.
+  if (hasSubagentTable(sql)) {
+    sql.exec("UPDATE subagents SET state = 'idle', outcome = 'stopped', report = NULL WHERE tenant_id = ? AND agent_id = ? AND state = 'reporting'",
+      owner.tenantId, owner.agentId);
+  }
   return ids;
 }
 
 /** How many children of this object have a turn running; none when it never had one. One object is one agent. */
 export function runningSubagentCount(sql: Sql): number {
   if (!hasSubagentTable(sql)) return 0;
-  return Number((sql.exec("SELECT COUNT(*) AS n FROM subagents WHERE state = 'running'").toArray()[0] as any)?.n ?? 0);
+  return Number((sql.exec("SELECT COUNT(*) AS n FROM subagents WHERE state != 'idle'").toArray()[0] as any)?.n ?? 0);
 }
 
 /** Milliseconds until the soonest running child reaches its ceiling, or null when none runs: what a pass wakes for. */
@@ -214,8 +268,8 @@ export function startedResult(s: { id: string; followUp: boolean; model: string 
  * The first line of every message a child is sent: whose message it is and where its answer goes. The child's system
  * prompt is the agent's own, so without this it would take the task for a person's and answer them.
  */
-export function taskMessage(id: string, task: string, followUp: boolean): string {
-  return `[${followUp ? "a follow-up" : "a task"} from the agent that started you, sent with ${SUBAGENT_TOOL}; you are its subagent ${id}. ` +
+export function taskMessage(id: string, task: string, followUp: boolean, key: string): string {
+  return `[${followUp ? "a follow-up" : "a task"} (${key}) from the agent that started you, sent with ${SUBAGENT_TOOL}; you are its subagent ${id}. ` +
     "Your final message is your report: it is all the agent receives, so make it complete. Nobody else reads this conversation, " +
     "so do not message people or channels unless the task says to.]\n\n" + task;
 }
@@ -264,9 +318,9 @@ function textOf(message: { content?: unknown }): string {
  * The message that wakes the parent when a child's turn ends. Plain text, so every lane mode accepts it; the head says
  * whose it is, as a background completion's does, so a report is not taken for the person asking for something.
  */
-export function reportMessage(s: Pick<Subagent, "id" | "turnStartedAt">, end: TurnEnd, now = Date.now()): string {
+export function reportMessage(s: Pick<Subagent, "id" | "turnStartedAt" | "turns">, end: TurnEnd, now = Date.now()): string {
   const secs = Math.round((now - s.turnStartedAt) / 1000);
-  const head = `[subagent ${s.id} — ${end.outcome} after ${secs}s; its report, a notice from the harness, not a message from the user. ` +
+  const head = `[subagent ${s.id} — ${end.outcome} after ${secs}s (${reportKey(s)}); its report, a notice from the harness, not a message from the user. ` +
     `${SUBAGENT_TOOL} with agent "${s.id}" sends it a follow-up.]`;
   if (end.outcome === "done") {
     const text = end.text.length > REPORT_MAX_CHARS
@@ -275,6 +329,36 @@ export function reportMessage(s: Pick<Subagent, "id" | "turnStartedAt">, end: Tu
   }
   if (end.outcome === "failed") return `${head}\nIt failed: ${end.text}`;
   return `${head}\nIt was cancelled${end.text ? `: ${end.text}` : ""}. Nothing it said after that was kept as a report.`;
+}
+
+/**
+ * The addresses (`alias.tool`) a subagent may not call: each write of a plugin that `speaksAs` the agent
+ * (src/plugins/types.ts). Decided by the plugin's declaration and the tool's declared side effect, never by a list of
+ * names, so a tool such a plugin adds later is covered without anyone coming back here. The declared `sideEffects` is
+ * the ceiling (a mount's per-call classification can only lower it), so a tool declared a write is a write here.
+ */
+export function speakingTools(
+  tools: ReadonlyArray<{ address: string; sideEffects?: "read" | "write" }>,
+  speaksAs: (alias: string) => "agent" | undefined,
+): Set<string> {
+  const out = new Set<string>();
+  for (const t of tools) {
+    const alias = t.address.slice(0, t.address.indexOf("."));
+    if (t.sideEffects !== "read" && speaksAs(alias) === "agent") out.add(t.address);
+  }
+  return out;
+}
+
+/** What a subagent's call to one of `speakingTools` is answered, by the dispatch that refuses it. */
+export function speakingRefusal(address: string): { status: "rejected"; error: { code: string; message: string } } {
+  return {
+    status: "rejected",
+    error: {
+      code: "subagent_cannot_speak",
+      message: `${address} acts as the agent, and a subagent does not speak for it. Put what you would have sent in your final ` +
+        "message: that is your report, and the agent decides what to send.",
+    },
+  };
 }
 
 /** The parameters the model sends. */
@@ -288,7 +372,8 @@ export interface SendParams { task?: unknown; agent?: unknown; model?: unknown }
  */
 export function subagentTool(d: {
   models: ReadonlyArray<{ id: string; label: string }>;
-  send(p: { task: string; agent: string | null; model: string | null }, callId: string): Promise<unknown>;
+  /** `invocation`: the call's id that is the same when it runs again after an interruption (pi085's invocation, pd's tool task). */
+  send(p: { task: string; agent: string | null; model: string | null }, callId: string, invocation: string): Promise<unknown>;
 }) {
   const text = (v: unknown) => ({ content: [{ type: "text" as const, text: JSON.stringify(v) }], details: {} });
   const modelLine = d.models.length
@@ -297,6 +382,9 @@ export function subagentTool(d: {
   return {
     name: SUBAGENT_TOOL,
     label: SUBAGENT_TOOL,
+    // Run again after an interruption, on both engines: a replay finds the child its first run made (`subagentIdFor`)
+    // and posts nothing twice, so the parent is told about every child that exists.
+    replay: "safe" as const,
     description:
       "Delegate a self-contained piece of work to a subagent: a fresh copy of you with its own context, the same tools, files " +
       "and containers, and no view of this conversation. Returns at once with the subagent's id; its final answer arrives later " +
@@ -316,12 +404,14 @@ export function subagentTool(d: {
       },
       required: ["task"],
     },
-    async execute(toolCallId: string, params: SendParams) {
+    // pi085 calls (callId, params, onUpdate, toolContext, invocation); pd's wrapper passes its tool task in the same place (src/runtime/durable-tools.ts).
+    async execute(toolCallId: string, params: SendParams, _onUpdate?: unknown, _toolContext?: unknown, invocation?: { invocationId?: unknown }) {
       const task = typeof params?.task === "string" ? params.task.trim() : "";
       if (!task) throw new Error(`${SUBAGENT_TOOL}: task is required, and is the whole instruction the subagent gets`);
       const agent = params?.agent === undefined || params.agent === null || params.agent === "" ? null : String(params.agent);
       const model = params?.model === undefined || params.model === null || params.model === "" ? null : String(params.model);
-      return text(await d.send({ task, agent, model }, toolCallId));
+      const run = typeof invocation?.invocationId === "string" ? invocation.invocationId : toolCallId;
+      return text(await d.send({ task, agent, model }, toolCallId, run));
     },
   };
 }

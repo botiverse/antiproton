@@ -2348,6 +2348,9 @@ export function createRaftPlugin(deps: {
   return {
     id: "raft",
     version: "1.0.0",
+    // Every write is the agent posting into Raft under its own identity (a message, a reaction, a task), so a
+    // subagent, whose final answer goes to the agent and to no one else, is offered the reads only.
+    speaksAs: "agent",
     /**
      * Which tools this build can offer, and what each needs, as one string: it moves when the SDK's manifest
      * (an operation or its capability), `EXCLUDED` or the presence of object storage changes the generated set, and a snapshot taken under another basis is re-taken at the next

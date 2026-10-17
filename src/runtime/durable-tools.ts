@@ -62,7 +62,11 @@ export function durableTool(t: AgentHarnessTool<undefined>): ToolRegistration {
       try {
         // The model's id for the call, which pi085 hands every tool first: the gateway records it, run_js
         // numbers its idempotency keys from it, and a question is held under it.
-        const running = (tool.execute as (id: string, params: unknown) => Promise<{ content: ToolResultMessage["content"]; details?: unknown }>)(api.callId, args);
+        // The fifth argument is where pi085 hands a tool its invocation (pi-agent-core `AgentHarnessToolInvocation`), whose
+        // `invocationId` is the same when the call runs again after an interruption. pi-durable's tool task is that here,
+        // for a tool that must recognise its own replay (`send_to_agent`, src/runtime/subagents.ts); others read two.
+        const running = (tool.execute as unknown as (id: string, params: unknown, onUpdate: undefined, toolContext: undefined, invocation: { invocationId: string }) => Promise<{ content: ToolResultMessage["content"]; details?: unknown }>)(
+          api.callId, args, undefined, undefined, { invocationId: `pd:${String(api.taskId)}` });
         const r = await untilAborted(running, context.abortSignal);
         return {
           content: r.content,

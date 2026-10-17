@@ -1968,6 +1968,14 @@ export interface Plugin {
    */
   provides?: readonly ("container")[];
 
+  /**
+   * Whose voice this plugin's writes are. `agent`: a tool this plugin declares `sideEffects: "write"` acts outward as
+   * the agent itself — a message, a reply, a reaction, a task change, anything other people see as the agent's. Only
+   * the agent's own conversations may do that: a subagent's (src/runtime/subagents.ts) is not offered such a tool, and
+   * its call to one, a program's included, is refused at dispatch. Its read tools are offered as to the agent. Absent:
+   * the plugin's writes act on things, not as anyone (a container, a store), and a subagent has them.
+   */
+  speaksAs?: "agent";
   /** What a mount of this plugin may be configured with. */
   config?: ConfigField[];
   /**

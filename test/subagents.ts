@@ -21,6 +21,20 @@ import { SUBAGENT_CAP, SUBAGENT_TOOL, admitSubagent, turnEnd } from "../src/runt
 import { updateAgentSettings, agentSettings } from "../src/runtime/agent-settings.ts";
 import { recordBackgroundJob } from "../src/runtime/background-jobs.ts";
 import type { Plugin } from "../src/plugins/types.ts";
+import { raftPlugin } from "../src/plugins/raft.ts";
+import { speakingTools } from "../src/runtime/subagents.ts";
+import { standInLoader } from "./spec/worker-stand-in.ts";
+
+/** A plugin whose writes are the agent speaking, as raft's are (`speaksAs`), and how often its write ran. */
+let posts = 0;
+const chatter: Plugin = {
+  id: "chatter", version: "1.0.0", speaksAs: "agent",
+  tools: [
+    { name: "post", description: "Post a message as the agent.", parameters: { type: "object", properties: { text: { type: "string" } } }, sideEffects: "write", idempotency: "none" },
+    { name: "peek", description: "Read messages.", parameters: { type: "object", properties: {} }, sideEffects: "read", idempotency: "native" },
+  ] as never,
+  async invoke(tool: string) { if (tool === "post") posts++; return { ok: true, tool }; },
+} as Plugin;
 
 /** A mount whose work goes to the background and is done at the first poll (test/overflow-backstop.ts has the same). */
 const builder: Plugin = {
@@ -52,7 +66,7 @@ type Job = { model: { api: string; provider: string; id: string }; context: Para
 const USER_MODELS = { offered: [{ id: "cheap", label: "Cheap", provider: "deepseek", model: "m-cheap" }] };
 
 /** One agent on an AgentRuntime over node:sqlite, its object recording `engine`, its `subagents` setting as given. */
-async function world(engine: "pi085" | "pd", opts: { on?: boolean; builder?: boolean } = {}) {
+async function world(engine: "pi085" | "pd", opts: { on?: boolean; builder?: boolean; chatter?: boolean; sandbox?: boolean } = {}) {
   const raw = sqliteHost();
   if (engine === "pd") {
     const ap = new ApStore(raw, prefixedNamespace("ap"));
@@ -60,16 +74,21 @@ async function world(engine: "pi085" | "pd", opts: { on?: boolean; builder?: boo
     ap.setEngineOnce("pd");
   }
   const sent: string[] = [];
+  const fault = { at: null as null | ((phase: string, id: string) => void | Promise<void>) };
+  const standIn = standInLoader();
+  const plugins = [...(opts.builder || opts.chatter ? [builder] : []), ...(opts.chatter ? [chatter] : [])];
   /** A runtime over this object, as a fresh isolate makes one: nothing opened, nothing remembered. */
   const isolate = () => new AgentRuntime({
+    subagentFault: (phase: string, id: string) => fault.at?.(phase, id),
+    ...(opts.sandbox ? { loader: standIn.loader, makeToolBinding: standIn.makeToolBinding } : {}),
     ctx: { storage: { sql: raw.sql, transactionSync: raw.transactionSync } },
     bucket: {} as never, bucketName: "b", models: { resolve: () => null },
-    sandbox: false, autoRelease: false, userModels: USER_MODELS, ...(opts.builder ? { extraPlugins: [builder] } : {}),
+    sandbox: opts.sandbox === true, autoRelease: false, userModels: USER_MODELS, ...(plugins.length ? { extraPlugins: plugins } : {}),
     operatorModel: operatorModelOf({ DEEPSEEK_BASE_URL: "https://model.example/v1", DEEPSEEK_API_KEY: "operator-key", HARNESS_MODEL: "m1" }),
     offloadModel: async (job: { commandId: string }) => { sent.push(job.commandId); },
   } as never);
   const w = {
-    raw, sent, engine, rt: isolate(), isolate,
+    raw, sent, engine, rt: isolate(), isolate, fault,
     answered: new Set<string>(),
     /** Jobs `reply` chose to leave out, for now. */
     held: new Set<string>(),
@@ -80,9 +99,10 @@ async function world(engine: "pi085" | "pd", opts: { on?: boolean; builder?: boo
   };
   await w.rt.ready();
   await w.rt.store.createAgent("t", "a", { name: "Ada", description: "d" } as never);
-  if (opts.builder) {
-    await w.rt.store.setPluginChoice("t", "a", "builder", "enable");
-    must((await w.rt.addMount("t", "a", { alias: "builder", plugin: "builder", config: {} })).ok, "the builder mount was refused");
+  for (const [on, id, alias] of [[opts.builder || opts.chatter, "builder", "builder"], [opts.chatter, "chatter", "chat"]] as const) {
+    if (!on) continue;
+    await w.rt.store.setPluginChoice("t", "a", id, "enable");
+    must((await w.rt.addMount("t", "a", { alias, plugin: id, config: {} })).ok, `the ${id} mount was refused`);
   }
   await w.rt.bindOperatorModel("t", "a");
   if (opts.on !== false) must(updateAgentSettings(raw.sql as never, { subagents: true }, "test").ok, "setting refused");
@@ -259,6 +279,84 @@ for (const engine of (process.env.ENGINES ?? "pi085,pd").split(",") as Array<"pi
     must(rowsOf(w)[0]!.turns === 2 && rowsOf(w)[0]!.state === "idle", show(rowsOf(w)));
   });
 
+  for (const phase of ["report-decided", "report-posted"] as const) {
+    await check(`${engine}: a crash at ${phase} delivers the report exactly once`, async () => {
+      const w = await world(engine);
+      let parentCalls = 0;
+      w.reply = (session) => {
+        if (session === "main") { parentCalls++; return parentCalls === 1 ? calls({ id: "c1", args: { task: "t" } }) : say("ok"); }
+        return say("the one report");
+      };
+      let crashed = 0;
+      w.fault.at = (p) => { if (p === phase && crashed === 0) { crashed++; throw new Error(`crash at ${p}`); } };
+      await w.rt.postMessage("t", "a", "go", "prompt", "main");
+      for (let i = 0; i < 12 && !crashed; i++) { await pass(w).catch((e) => { if (!/crash at/.test(String(e))) throw e; }); await sleep(5); }
+      must(crashed === 1, "the crash never happened");
+      must(rowsOf(w)[0]?.state === "reporting", `not owed after the crash: ${show(rowsOf(w))}`);
+      // The isolate is gone; a fresh one finds the report owed.
+      w.rt = w.isolate();
+      await w.rt.ready();
+      await settle(w);
+      const rs = await reports(w);
+      must(rs.length === 1 && rs[0]!.includes("the one report"), `reports: ${show(rs)}`);
+      must(rowsOf(w)[0]?.state === "idle" && rowsOf(w)[0]?.outcome === "done", show(rowsOf(w)));
+    });
+  }
+
+  await check(`${engine}: an isolate dying mid-spawn: the replayed send finds the child it made, and the parent is told about it`, async () => {
+    const w = await world(engine);
+    let parentCalls = 0;
+    w.reply = (session, req) => {
+      if (session === "main") {
+        parentCalls++;
+        if (parentCalls === 1) return calls({ id: "c1", args: { task: "the only child" } });
+        return say(JSON.stringify(req.messages).includes("[subagent ") ? "thanks" : "started it");
+      }
+      return say("child answer");
+    };
+    let hung = false;
+    w.fault.at = (p) => { if (p === "task-posted" && !hung) { hung = true; return new Promise<void>(() => {}); } };
+    await w.rt.postMessage("t", "a", "go", "prompt", "main");
+    for (let i = 0; i < 12 && !hung; i++) { await Promise.race([pass(w), sleep(1_000)]); }
+    must(hung, "the spawn never reached its task being posted");
+    must(rowsOf(w).length === 1, show(rowsOf(w)));
+    // The isolate died there: its pass never returns. A fresh one recovers the interrupted call and runs it again.
+    w.fault.at = null;
+    w.rt = w.isolate();
+    await w.rt.ready();
+    await settle(w);
+    must(rowsOf(w).length === 1, `a second child: ${show(rowsOf(w))}`);
+    const children = new Set(w.requests.filter((r) => r.session.startsWith("sub_")).map((r) => r.session));
+    must(children.size === 1 && children.has(rowsOf(w)[0].id), show([...children]));
+    const results = w.requests.filter((r) => r.session === "main").flatMap((r) => r.req.messages.filter((m: any) => m.role === "tool"))
+      .map((m: any) => typeof m.content === "string" ? m.content : JSON.stringify(m.content));
+    must(results.length > 0 && results.every((t) => t.includes(`"agent":"${rowsOf(w)[0].id}"`) && /"status":"started"/.test(t)), `the parent was not told: ${show(results)}`);
+    must((await reports(w)).length === 1, show(await reports(w)));
+  });
+
+  await check(`${engine}: a subagent is offered no tool that speaks as the agent, and its program's call to one is refused`, async () => {
+    const w = await world(engine, { chatter: true, sandbox: true });
+    posts = 0;
+    let parentCalls = 0, childCalls = 0;
+    w.reply = (session) => {
+      if (session === "main") { parentCalls++; return parentCalls === 1 ? calls({ id: "c1", args: { task: "tell everyone hi" } }) : say("ok"); }
+      childCalls++;
+      return childCalls === 1
+        ? ({ text: "", finishReason: "tool_calls", truncated: false, usage: USAGE, toolCalls: [{ id: "j1", name: "run_js", arguments: { source: "try { output(await tool`chat.post ${{ text: 'hi' }}`); } catch (e) { output(String(e?.message ?? e)); }" } }] } as ModelResponse)
+        : say("could not post");
+    };
+    await w.rt.postMessage("t", "a", "go", "prompt", "main");
+    await settle(w);
+    const parentTools = toolNames(w.requests.find((r) => r.session === "main")!.req);
+    const childTools = toolNames(w.requests.find((r) => r.session.startsWith("sub_"))!.req);
+    must(parentTools.includes("chat__post") && parentTools.includes("chat__peek"), `the agent lost its own tools: ${show(parentTools)}`);
+    must(!childTools.includes("chat__post"), `the child was offered a write that speaks as the agent: ${show(childTools)}`);
+    must(childTools.includes("chat__peek") && childTools.includes("builder__build") && childTools.includes("run_js"), `the child lost tools it may have: ${show(childTools)}`);
+    must(posts === 0, `the child's program posted ${posts} time(s)`);
+    const result = JSON.stringify(w.requests.filter((r) => r.session.startsWith("sub_"))[1]!.req.messages.filter((m: any) => m.role === "tool"));
+    must(/acts as the agent, and a subagent does not speak for it/.test(result), `not refused as such: ${result.slice(0, 400)}`);
+  });
+
   await check(`${engine}: a follow-up to a subagent still running, or to an id this conversation never started, is refused`, async () => {
     const w = await world(engine);
     let parentCalls = 0, child: string | null = null;
@@ -427,6 +525,18 @@ for (const engine of (process.env.ENGINES ?? "pi085,pd").split(",") as Array<"pi
     must(online.length === parent.filter((r) => r.status === "stop").length, `online ${online.length}: ${show(statusEvents("a", rows))}`);
   });
 }
+
+await check("rules: raft speaks as the agent; its writes are what a subagent may not call, its reads are not", () => {
+  must(raftPlugin.speaksAs === "agent", "raft does not declare it");
+  const tools = raftPlugin.tools.map((t: any) => ({ address: `raft.${t.name}`, sideEffects: t.sideEffects }));
+  const speaking = speakingTools(tools, () => "agent");
+  for (const n of ["messages_send", "messages_reply", "messages_react", "tasks_create", "tasks_update_status", "channels_join"]) {
+    must(speaking.has(`raft.${n}`), `raft.${n} is not withheld`);
+  }
+  for (const n of ["messages_read", "inbox_list", "tasks_list", "messages_search"]) must(!speaking.has(`raft.${n}`), `raft.${n} is withheld`);
+  must(speaking.size === tools.filter((t) => t.sideEffects === "write").length, "not every raft write is withheld");
+  must(speakingTools(tools, () => undefined).size === 0, "a plugin that does not speak as the agent lost its writes");
+});
 
 await check("rules: the cap's refusal names what runs; a turn's end reads failed, cancelled and done", () => {
   must(admitSubagent([{ id: "sub_1", turnStartedAt: 0 }, { id: "sub_2", turnStartedAt: 0 }]).ok, "two refused");
