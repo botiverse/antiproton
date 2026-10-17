@@ -36,10 +36,11 @@ export const RESERVED_TENANT_PREFIX = "raft_";
  * principal: a tenant-scoped provider token (below), and an Agents API key (`/admin/api-keys`, cf/src/index.ts),
  * whose owner agent and the agents it makes live in the named tenant and count against its spend limit.
  *
- * Not asked where the credential addresses one agent that already has a tenant: a service token
- * (cf/src/admin-service-tokens.ts) is how an operator reaches an existing provisioned agent in a `raft_` tenant,
- * and `/admin/hooks` and `/admin/mounts` act on a named agent's object. Refused at issuance only, so a row issued
- * before this still resolves, and can still be listed and revoked.
+ * Not asked by a service token (cf/src/admin-service-tokens.ts): an operator may need one to reach an existing
+ * provisioned agent in a `raft_` tenant, so there the agent must be named and be a live provisioned_agents row
+ * instead. Not asked by `/admin/hooks` and `/admin/mounts` either: they are operator-only and act on the object of
+ * the agent the request names, though neither checks that the agent exists. Refused at issuance only, so a row
+ * issued before this still resolves, and can still be listed and revoked.
  */
 export function reservedTenantProblem(tenantId: string): string | null {
   if (!tenantId.startsWith(RESERVED_TENANT_PREFIX)) return null;

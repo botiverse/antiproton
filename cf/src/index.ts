@@ -4115,7 +4115,7 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
     // object is chosen: they authenticate differently and address by key.
     if (url.pathname === "/admin/api-keys") return adminApiKeys(request, env);
     // The operator's service tokens (task #7): identities, so before any object as well.
-    if (url.pathname === "/admin/service-tokens") return adminServiceTokens(request, env.AUTOMATION_TOKEN, d1ServiceTokens(env.CONTROL_DB), url);
+    if (url.pathname === "/admin/service-tokens") return adminServiceTokens(request, env.AUTOMATION_TOKEN, d1ServiceTokens(env.CONTROL_DB), url, d1ProvisionedAgents(env.CONTROL_DB));
     // A Raft server's provider tokens, and the agents it provisions with them (raft-agent-provider.v1).
     if (url.pathname === "/admin/provider-tokens") return adminProviderTokens(request, env.AUTOMATION_TOKEN, d1ProviderTokens(env.CONTROL_DB), url);
     // Every tenant's estimated cost (credits phase 1: accounting, nothing enforced). The operator's token, or a

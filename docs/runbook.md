@@ -215,8 +215,8 @@ still be listed and revoked.
 | `POST /admin/provider-tokens`, `scope: "platform"` | n/a | It names no tenant; each request derives `raft_<raftServerId>`, the one source of these names. |
 | `POST /admin/api-keys` | `400` | The key's owner agent, and every agent it makes, are created in the named tenant and spend its limit. |
 | `/ui/api-keys/new` | n/a | The tenant is the signed-in person's own, never a value from the request. |
-| `POST /admin/service-tokens` | accepted | The token speaks for one named agent. An operator may need one to reach an existing provisioned agent in a Raft server's tenant. |
-| `POST /admin/hooks`, `POST`/`PATCH /admin/mounts` | accepted | They change an agent named by `(tenantId, agentId)`, and mint no principal for the tenant. |
+| `POST /admin/service-tokens` | only for an existing provisioned agent: an explicit `agentId` with a live `provisioned_agents` row in that tenant, otherwise `400` | An operator may need a token that reaches a provisioned agent in a Raft server's tenant. Without `agentId` the route would make a new agent named after the label, which is a new principal there. |
+| `POST /admin/hooks`, `POST`/`PATCH /admin/mounts` | accepted | They act on the object of the agent named by `(tenantId, agentId)` and issue no credential for the tenant. Neither checks that the agent exists. |
 
 All of these are operator-only. Preview has one tenant-scoped provider token under `raft_`, `raft_pu-verify-1013`. The
 admin route issued it before the refusal existed, and it is revoked.

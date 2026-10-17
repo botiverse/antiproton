@@ -8,7 +8,8 @@
  */
 import { isOperator, uiAgent } from "./auth.ts";
 import { agentObjectName } from "./object-name.ts";
-import type { ServiceTokenDirectory } from "./control-plane.ts";
+import type { ProvisionRegistry, ServiceTokenDirectory } from "./control-plane.ts";
+import { RESERVED_TENANT_PREFIX } from "./admin-provider-tokens.ts";
 import { hashServiceToken, newServiceToken } from "./service-token.ts";
 
 const answer = (body: unknown, status = 200, allow?: string) =>
@@ -23,7 +24,12 @@ function field(body: unknown, key: string): string | undefined {
 
 export const LABEL_MAX = 64;
 
-export async function adminServiceTokens(request: Request, token: string | undefined, dir: ServiceTokenDirectory, url: URL): Promise<Response> {
+/**
+ * `provisioned` answers whether an agent of a `raft_` tenant exists (below). Required, so a deployment wiring this
+ * route cannot leave that check out.
+ */
+export async function adminServiceTokens(request: Request, token: string | undefined, dir: ServiceTokenDirectory, url: URL,
+  provisioned: Pick<ProvisionRegistry, "getByAgentId">): Promise<Response> {
   if (!isOperator(token, request.headers.get("x-harness-token"))) return answer({ error: "unauthorized" }, 401);
   switch (request.method) {
     case "GET":
@@ -41,8 +47,19 @@ export async function adminServiceTokens(request: Request, token: string | undef
         return answer({ error: String(message) }, 400);
       }
       // A `raft_` tenant is allowed here, unlike a provider token or an API key (reservedTenantProblem,
-      // cf/src/admin-provider-tokens.ts): a service token speaks for one named agent, and reaching an existing
-      // provisioned agent in a Raft server's tenant is what an operator may need one for.
+      // cf/src/admin-provider-tokens.ts), for one reason: an operator may need to reach an existing provisioned
+      // agent in a Raft server's tenant. So that is all it is allowed for. The agent is named, never the label's
+      // default (which would be a new agent in that server's tenant), and it is a live provisioned_agents row.
+      if (tenantId.startsWith(RESERVED_TENANT_PREFIX)) {
+        const hint = `a service token for a "${RESERVED_TENANT_PREFIX}" tenant (a Raft server's) only reaches an agent provisioned there:`;
+        if (field(body, "agentId") === undefined) {
+          return answer({ error: "agentId", hint: `${hint} name it with agentId (its provisioned_agents agent_id)` }, 400);
+        }
+        const row = await provisioned.getByAgentId(tenantId, agentId);
+        if (!row || row.status === "deleted" || row.deletedAt !== null) {
+          return answer({ error: "agentId", hint: `${hint} ${agentId} is not a live provisioned agent of ${tenantId}` }, 400);
+        }
+      }
       const t = newServiceToken();
       const hash = await hashServiceToken(t);
       await dir.issue({ hash, label, tenantId, agentId });

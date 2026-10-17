@@ -1,8 +1,8 @@
 /**
  * The operator's provider-token route (cf/src/admin-provider-tokens.ts), without a network or a database: which
  * tenant a tenant-scoped token may be issued for, and that refusing a name at issuance leaves a row issued earlier
- * resolving, listed and revocable. The same reservation on `/admin/api-keys`, through the Worker's own `fetch`, and
- * the one route that keeps a `raft_` tenant open on purpose, `/admin/service-tokens`.
+ * resolving, listed and revocable. The same reservation on `/admin/api-keys`, through the Worker's own `fetch`; and
+ * `/admin/service-tokens`, which accepts a `raft_` tenant only for a named, live provisioned agent there.
  */
 import { register } from "node:module";
 import { adminProviderTokens, RESERVED_TENANT_PREFIX } from "../cf/src/admin-provider-tokens.ts";
@@ -141,18 +141,58 @@ await check("an API key for any other tenant is issued as before", async () => {
   }
 });
 
-await check("a service token may still name a raft_ tenant: it reaches one existing agent there, which an operator may need", async () => {
+/** POST /admin/service-tokens against a directory and a provisioned-agents registry, both in memory. */
+async function issueServiceToken(body: Record<string, unknown>, agents: Array<{ tenantId: string; agentId: string; status: string; deletedAt: number | null }>) {
   const rows: unknown[] = [];
+  const lookups: string[] = [];
   const dir = {
     async issue(r: unknown) { rows.push(r); }, async lookup() { return null; }, async revoke() { return false; },
     async list() { return []; }, async touch() {},
   };
+  const provisioned = {
+    async getByAgentId(tenantId: string, agentId: string) {
+      lookups.push(`${tenantId}/${agentId}`);
+      return (agents.find((a) => a.tenantId === tenantId && a.agentId === agentId) ?? null) as never;
+    },
+  };
   const req = new Request("https://x/admin/service-tokens", {
-    method: "POST", headers: { "x-harness-token": TOKEN, "content-type": "application/json" },
-    body: JSON.stringify({ label: "operator", tenantId: "raft_d21383ee-df0a-4ed0-8f4c-ef263f2adb68", agentId: "raft_01JAGENT" }),
+    method: "POST", headers: { "x-harness-token": TOKEN, "content-type": "application/json" }, body: JSON.stringify(body),
   });
-  const res = await adminServiceTokens(req, TOKEN, dir as never, new URL(req.url));
-  assert(res.status === 201 && rows.length === 1, `${res.status} ${await res.text()}`);
+  const res = await adminServiceTokens(req, TOKEN, dir as never, new URL(req.url), provisioned);
+  return { status: res.status, body: await res.json() as { error?: string; hint?: string; token?: string; agentId?: string }, rows, lookups };
+}
+const SERVER_TENANT = "raft_d21383ee-df0a-4ed0-8f4c-ef263f2adb68";
+const LIVE: { tenantId: string; agentId: string; status: string; deletedAt: number | null } = { tenantId: SERVER_TENANT, agentId: "raft_01JAGENT", status: "active", deletedAt: null };
+
+await check("a service token for a raft_ tenant is issued for a live provisioned agent named by agentId", async () => {
+  const out = await issueServiceToken({ label: "operator", tenantId: SERVER_TENANT, agentId: "raft_01JAGENT" }, [LIVE]);
+  assert(out.status === 201 && out.rows.length === 1 && out.body.agentId === "raft_01JAGENT", `${out.status} ${JSON.stringify(out.body)}`);
+  assert(out.lookups.join(",") === `${SERVER_TENANT}/raft_01JAGENT`, `looked up ${out.lookups}`);
+});
+
+await check("a service token for a raft_ tenant is refused with a 400 without agentId, or for an agent that is not live there", async () => {
+  const cases: Array<[string, Record<string, unknown>, typeof LIVE[]]> = [
+    // The label's default agent would be a new principal in the server's tenant. Refused even when a row happens to
+    // carry the default's name (u-operator): the agent must be named, not inferred from a label.
+    ["no agentId", { label: "operator", tenantId: SERVER_TENANT }, [LIVE, { ...LIVE, agentId: "u-operator" }]],
+    ["never provisioned", { label: "operator", tenantId: SERVER_TENANT, agentId: "raft_01JOTHER" }, [LIVE]],
+    ["another tenant's agent", { label: "operator", tenantId: SERVER_TENANT, agentId: "raft_01JAGENT" }, [{ ...LIVE, tenantId: "raft_other" }]],
+    ["deleted", { label: "operator", tenantId: SERVER_TENANT, agentId: "raft_01JAGENT" }, [{ ...LIVE, status: "deleted", deletedAt: 5 }]],
+    ["marked deleted only", { label: "operator", tenantId: SERVER_TENANT, agentId: "raft_01JAGENT" }, [{ ...LIVE, status: "deleted" }]],
+  ];
+  for (const [name, body, agents] of cases) {
+    const out = await issueServiceToken(body, agents);
+    assert(out.status === 400 && out.body.error === "agentId" && out.body.hint!.includes(RESERVED_TENANT_PREFIX) && /provisioned/.test(out.body.hint ?? ""),
+      `${name}: ${out.status} ${JSON.stringify(out.body)}`);
+    assert(out.body.token === undefined && out.rows.length === 0, `${name}: a token was issued`);
+  }
+});
+
+await check("a service token for any other tenant is issued as before, with or without agentId, and nothing is looked up", async () => {
+  for (const body of [{ label: "a@b.c" }, { label: "x", tenantId: "demo" }, { label: "x", tenantId: "raft-staging", agentId: "new-agent" }, { label: "x", tenantId: "Raft_x" }]) {
+    const out = await issueServiceToken(body, []);
+    assert(out.status === 201 && out.rows.length === 1 && out.lookups.length === 0, `${JSON.stringify(body)}: ${out.status} ${JSON.stringify(out.body)} lookups=${out.lookups}`);
+  }
 });
 
 console.log(`\n  provider tokens (admin route)\n  ${"─".repeat(56)}`);
