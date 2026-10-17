@@ -23,6 +23,13 @@ export function md(src: string): string {
   const fences: string[] = [];
   // Escaped before anything else, so every branch below works on inert text.
   let t = esc(src ?? "");
+  // The fence placeholders below are delimited by U+0001, so that character is taken out
+  // of the text first: without that, anything the agent quotes — a page it read — can write
+  // the delimiter itself and forge a placeholder. A forged one is no way to a tag (the
+  // fences' bodies are escaped too), but it is a way to print another block's text where
+  // the model never wrote it, or the word "undefined". U+0001 renders as nothing, so
+  // dropping it costs nothing that was visible.
+  t = t.replace(/\u0001/g, "");
   t = t.replace(/```([a-zA-Z0-9_-]*)\n([\s\S]*?)```/g, (_m, _lang, body) => {
     fences.push(`<pre>${String(body).replace(/\n$/, "")}</pre>`);
     return ` F${fences.length - 1} `;
@@ -97,5 +104,5 @@ export function md(src: string): string {
   }
   closeList();
 
-  return out.join("\n").replace(/F(\d+)/g, (_m, n) => fences[Number(n)]!);
+  return out.join("\n").replace(/F(\d+)/g, (_m, n) => fences[Number(n)] ?? "");
 }

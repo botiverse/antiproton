@@ -71,6 +71,22 @@ check("围栏占位符不会被正文里的 F 数字撞坏", () => {
   has(out, "F1 是个变量名");
 });
 
+check("围栏占位符不能由正文伪造", () => {
+  // The placeholders are delimited by U+0001. A page the agent read can make it
+  // quote that character, and before the fix that text was restored as if it
+  // were a fence: the block below appeared twice, and an out-of-range index
+  // rendered the word "undefined" where the model wrote nothing.
+  const out = md("para\n\u0001F0\u0001\n```\nreal\n```");
+  const pres = out.match(/<pre>/g) ?? [];
+  if (pres.length !== 1) throw new Error(`the block was printed ${pres.length} times: ${out.slice(0, 200)}`);
+  hasNot(out, "undefined");
+  hasNot(out, "\u0001");
+  // A forge with no block to point at must not resolve to anything at all.
+  const oob = md("x \u0001F3\u0001 y");
+  hasNot(oob, "undefined");
+  hasNot(oob, "\u0001");
+});
+
 console.log(`\n  Markdown rendering\n  ${"─".repeat(56)}`);
 for (const r of results) {
   console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);
