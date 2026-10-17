@@ -433,6 +433,47 @@ for (const engine of (process.env.ENGINES ?? "pi085,pd").split(",").filter((e) =
       `A ${blocks.filter((b) => b.includes("report of A")).length}, B ${blocks.filter((b) => b.includes("report of B")).length}`);
   });
 
+  await check(`${engine}: A and B posted together, a crash, then C owed beside them: only C is posted`, async () => {
+    const w = await world(engine);
+    let parentCalls = 0;
+    const released = new Set<string>();
+    w.reply = (session, req) => {
+      if (session === "main") return ++parentCalls === 1 ? calls(...["A", "B", "C"].map((n, i) => ({ id: `c${i}`, args: { task: `part ${n}` } }))) : say("ok");
+      const n = /part (\w)/.exec(taskOf(req))?.[1] ?? "?";
+      return released.has(n) ? say(`report of ${n}`) : null;
+    };
+    await w.rt.postMessage("t", "a", "go", "prompt", "main");
+    for (let i = 0; i < 6; i++) await pass(w);
+    const answerHeld = async () => {
+      for (const id of w.sent.filter((x) => !w.answered.has(x))) {
+        const job = await w.rt.takeJob("t", "a", id).catch(() => null) as Job | null;
+        if (!job) continue;
+        const req = toRequest(job.context), r = w.reply(sessionOfJob(w, id), req);
+        if (r === null) continue;
+        w.answered.add(id); w.held.delete(id);
+        w.requests.push({ session: sessionOfJob(w, id), req, operatorModel: job.operatorModel ?? null });
+        await w.rt.deliverAnswer("t", "a", id, fromResponse(r as ModelResponse, job.model, id), undefined);
+      }
+    };
+    let crashed = 0;
+    w.fault.at = (p) => { if (p === "report-posted" && crashed === 0) { crashed++; throw new Error("crash at report-posted"); } };
+    released.add("A"); released.add("B");
+    await answerHeld();
+    for (let i = 0; i < 6 && !crashed; i++) { await pass(w).catch((e) => { if (!/crash at/.test(String(e))) throw e; }); await sleep(5); }
+    must(crashed === 1 && (await reportMessages(w)).length === 1 && (await reports(w)).length === 2, "control: A and B were not posted together");
+    w.fault.at = null;
+    w.rt = w.isolate();
+    await w.rt.ready();
+    released.add("C");
+    await answerHeld();
+    await settle(w);
+    const blocks = await reports(w);
+    for (const n of ["A", "B", "C"]) {
+      const seen = blocks.filter((b) => b.includes(`report of ${n}`)).length;
+      must(seen === 1, `the report of ${n} landed ${seen} times`);
+    }
+  });
+
   await check(`${engine}: a report dropped after its attempts leaves the parent a notice that it could not be delivered`, async () => {
     const w = await world(engine);
     let parentCalls = 0;
