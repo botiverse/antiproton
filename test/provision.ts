@@ -327,6 +327,36 @@ await check("a platform token acts in the tenant named by the Raft server: raft_
   assert(badServer.status === 422 && badServer.body.error.param === "raftServerId", badServer.text);
 });
 
+await check("two Raft servers never share a tenant, whatever their ids spell", async () => {
+  // The tenant is the per-server namespace every row is keyed in, so two ids that derive one tenant are two
+  // servers sharing agents, quota and billing. Both spellings that used to collide are here: `:` is legal in a
+  // Raft id and was substituted away, and an id longer than the 59 an object name leaves was cut.
+  const made = async (id: string) => {
+    const f = fakeDeps();
+    const r = await call(f.deps, "POST", "/agents", body({ raftServerId: id }), "01JAGENT", PLATFORM);
+    assert(r.status === 201, `${id.slice(0, 24)}: ${r.status} ${r.text}`);
+    const tenant = [...f.tenants][0]!;
+    assert(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(tenant), `${id.slice(0, 24)} derives a tenant that is not an object name: ${tenant}`);
+    return tenant;
+  };
+  // Already safe: spelled as it always was, so rows written before this read back under the same tenant.
+  assert((await made("srv-1")) === "raft_srv-1", "a plain server id no longer derives raft_<id>");
+  assert((await made("d21383ee-df0a-4ed0-8f4c-ef263f2adb68")) === "raft_d21383ee-df0a-4ed0-8f4c-ef263f2adb68", "a UUID server id no longer derives raft_<id>");
+  // Substitution is not the name: `srv:prod` and `srv_prod` are two servers.
+  const colon = await made("srv:prod");
+  const plain = await made("srv_prod");
+  assert(colon !== plain, `srv:prod and srv_prod share the tenant ${colon}`);
+  // Cutting is not the name either: the same first 59 characters, then two different ones.
+  const long = "x".repeat(59);
+  const longA = await made(`${long}a`);
+  const longB = await made(`${long}b`);
+  assert(longA !== longB, `two 60-character ids share the tenant ${longA.slice(0, 32)}…`);
+  // And a safe id cannot spell the other shape, so neither branch can be read as the other's tenant: one that
+  // ends as a digest does takes the digest, and the name is still an object name's 64 at most.
+  const looks = await made(`${"y".repeat(46)}_0123456789ab`);
+  assert(looks.length === 64 && /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(looks), `the digest shape: ${looks}`);
+});
+
 await check("the antiproton agent id is the Raft id, prefixed, made legal for an object name, and bounded", async () => {
   assert(providerAgentId("01JAGENT") === "raft_01JAGENT", providerAgentId("01JAGENT"));
   assert(providerAgentId("a/b:c") === "raft_a_b_c", providerAgentId("a/b:c"));
