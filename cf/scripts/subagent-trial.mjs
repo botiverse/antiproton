@@ -79,7 +79,18 @@ export function summarize(rows, window = {}) {
 
 const when = (v) => v === undefined ? undefined : /^\d+$/.test(v) ? Number(v) : Date.parse(v);
 
-async function fromR2({ tenant, agent, preview }) {
+/** The fetch the R2 reads use; a test replaces it (`setFetch`). */
+let fetchR2 = (url, headers) => fetch(url, { headers });
+export function setFetch(f) { fetchR2 = f; }
+
+/** A response's body, or a throw naming the step and the status: an error page is never read as rows. */
+async function okText(res, what) {
+  if (!res.ok) throw new Error(`${what} failed: HTTP ${res.status} ${(await res.text().catch(() => "")).slice(0, 200)}`);
+  return res.text();
+}
+async function okJson(res, what) { return JSON.parse(await okText(res, what)); }
+
+export async function fromR2({ tenant, agent, preview }) {
   const { CF_API_TOKEN: token, R2_ACCOUNT_ID: account } = process.env;
   if (!token || !account) throw new Error("CF_API_TOKEN and R2_ACCOUNT_ID are required (or give --file)");
   const bucketName = preview ? "antiproton-preview-artifacts" : "antiproton-artifacts";
@@ -89,10 +100,10 @@ async function fromR2({ tenant, agent, preview }) {
   let cursor;
   do {
     const q = new URLSearchParams({ prefix: `trace/${tenant}/${agent}/`, per_page: "1000", ...(cursor ? { cursor } : {}) });
-    const listed = await (await fetch(`${base}?${q}`, { headers })).json();
+    const listed = await okJson(await fetchR2(`${base}?${q}`, headers), "listing the trace export");
     if (!listed.success) throw new Error(`listing the trace export failed: ${JSON.stringify(listed.errors ?? listed).slice(0, 300)}`);
     for (const o of listed.result ?? []) {
-      const text = await (await fetch(`${base}/${encodeURIComponent(o.key)}`, { headers })).text();
+      const text = await okText(await fetchR2(`${base}/${encodeURIComponent(o.key)}`, headers), `reading ${o.key}`);
       for (const line of text.split("\n")) if (line.trim()) rows.push(JSON.parse(line));
     }
     cursor = listed.result_info?.is_truncated ? listed.result_info.cursor : undefined;

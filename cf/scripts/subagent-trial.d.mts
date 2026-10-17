@@ -12,3 +12,5 @@ export interface TrialSummary {
 }
 export function quantile(values: readonly number[], q: number): number | null;
 export function summarize(rows: readonly TrialRow[], window?: { from?: number; to?: number }): { days: Array<{ day: string } & TrialSummary>; total: TrialSummary };
+export function setFetch(f: (url: string, headers: Record<string, string>) => Promise<Response>): void;
+export function fromR2(o: { tenant: string; agent: string; preview?: boolean }): Promise<TrialRow[]>;

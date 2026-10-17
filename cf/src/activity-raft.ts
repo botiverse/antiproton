@@ -20,6 +20,7 @@
 import { pendingTrace } from "../../src/trace/outbox.ts";
 import { flushTrace, type TraceSink } from "./trace-r2.ts";
 import { ACTIVITY_BATCH_MAX, activityEvents, orderStatuses, type SubagentActivity } from "../../src/runtime/activity.ts";
+import { turnLineage } from "../../src/runtime/subagents.ts";
 import type { ActivityEvent } from "../../src/plugins/types.ts";
 
 type Sql = { exec(query: string, ...bindings: unknown[]): { toArray(): any[] } };
@@ -57,16 +58,13 @@ function setStatusClock(sql: Sql, lastAt: number) {
 /**
  * Subagent events as Raft's `SubagentLineage` (src/runtime/activity.ts `subagentEvents`), on only where the deployment
  * sets SUBAGENT_ACTIVITY=1: off — the default — a child's rows make no event. Its lineage is the parent's
- * `send_to_agent` call id that started the child (`subagents.call_id`), read from the object's own table.
+ * `send_to_agent` call id of the child turn the row belongs to (`turnLineage`), read from the object's own table.
  */
 export function subagentActivityFor(sql: Sql, env: { SUBAGENT_ACTIVITY?: unknown }): SubagentActivity | undefined {
   if (env.SUBAGENT_ACTIVITY !== "1") return undefined;
   return {
-    lineage(session: string) {
-      try {
-        const row = sql.exec("SELECT call_id FROM subagents WHERE id = ?", session).toArray()[0] as { call_id?: unknown } | undefined;
-        return typeof row?.call_id === "string" ? row.call_id : null;
-      } catch { return null; }
+    lineage(session: string, at: number) {
+      try { return turnLineage(sql as never, session, at); } catch { return null; }
     },
   };
 }

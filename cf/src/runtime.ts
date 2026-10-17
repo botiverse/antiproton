@@ -1101,6 +1101,17 @@ export type RestartResult =
   | { ok: true; sessionId: string; restartedAt: number }
   | { ok: false; status: 404 | 409; error: string };
 
+/**
+ * Whether an Agents API caller declared a function named `send_to_agent`: then the caller's function is offered under
+ * its name, and the agent's own `send_to_agent` is not, in that session. Said once as a log line (`subagent.tool_shadowed`)
+ * when it decides, so an operator who expected subagents there can see why there are none.
+ */
+function callerShadows(tenantId: string, agentId: string, session: string, callerDefs: ReadonlyArray<{ name: string }>): boolean {
+  const shadows = callerDefs.some((d) => d.name === SUBAGENT_TOOL);
+  if (shadows) logEvent("subagent.tool_shadowed", { tenantId, agentId, session });
+  return shadows;
+}
+
 export class AgentRuntime {
   readonly store: DurableObjectStore;
   #deps: RuntimeDeps;
@@ -3157,7 +3168,9 @@ export class AgentRuntime {
         (id) => !!backgroundOf(this.#plugins.find((pl) => pl.id === id) ?? {}),
       ),
     });
-    const taken = new Set([...offered.map((t) => t.name), "run_js", "resume", "jobs", SUBAGENT_TOOL]);
+    // `send_to_agent` is not taken from the caller: an Agents API caller that declares a function by that name keeps it,
+    // and the agent is then not offered ours (below). The caller's API is theirs; delegation is a feature on top of it.
+    const taken = new Set([...offered.map((t) => t.name), "run_js", "resume", "jobs"]);
     // A subagent's session (src/runtime/subagents.ts) is offered neither the caller's functions, which only the caller's
     // own session can answer, nor `send_to_agent`: delegation is one level deep.
     const child = isSubagentSession(session);
@@ -3208,8 +3221,9 @@ export class AgentRuntime {
         : asks ? [resumeTool(this.#continuations, { ...counting, scope: session })] : []),
       // Not a child's: `jobs` cancels the agent's background work, and a subagent starts none (it cannot write).
       ...(extras.jobs && !child ? [jobs] : []),
-      // Only where the agent's setting is on, and never in a child (above). Its body is this object's (`#sendToAgent`).
-      ...(!child && this.#settingsNow(tenantId, agentConfig).subagents
+      // Only where the agent's setting is on, never in a child (above), and not where the caller's own function has the
+      // name (`callerShadows`). Its body is this object's (`#sendToAgent`).
+      ...(!child && this.#settingsNow(tenantId, agentConfig).subagents && !callerShadows(tenantId, agentId, session, callerDefs)
         ? [subagentTool({
             models: (this.#deps.userModels?.offered ?? []).map((o) => ({ id: o.id, label: o.label })),
             send: (p, callId, invocation) => this.#sendToAgent(tenantId, agentId, session, p, callId, invocation),
@@ -4343,6 +4357,11 @@ export class AgentRuntime {
     const sql = this.#deps.ctx.storage.sql;
     const owner = { tenantId, agentId };
     const now = Date.now();
+    // Asked at the call, not only when the tool was offered: a kill switch set while this turn runs (the agent's setting,
+    // or SUBAGENTS_DISABLED) stops it starting any child, or sending one a follow-up, from here on.
+    if (!(await this.#subagentsOn(tenantId, agentId))) {
+      throw new Error(`${SUBAGENT_TOOL}: subagents are switched off for this agent, so nothing was started. Do the reading yourself.`);
+    }
     const turnKey = turnKeyOf(parentSession, run, callId);
     let model: { option: string; provider: string; model: string } | null = null;
     if (p.model !== null) {
@@ -4832,12 +4851,14 @@ export class AgentRuntime {
    * Whether a background completion may be delivered to a subagent's session: `join` its turn running, `start` a turn
    * of an idle subagent (under the cap, its lifetime and its turn count), or why not.
    */
-  #subagentWakeGate(tenantId: string, agentId: string, session: string): "join" | "start" | string {
+  #subagentWakeGate(tenantId: string, agentId: string, session: string, on: boolean): "join" | "start" | string {
     const sql = this.#deps.ctx.storage.sql;
     const owner = { tenantId, agentId };
     const s = subagentOf(sql, owner, session);
     if (!s) return "no such subagent";
     if (s.state === "running") return "join";
+    // A kill switch stops new turns, a completion's included; a turn already running is the stop's to end.
+    if (!on) return "subagents are switched off";
     if (s.state === "reporting") return "its report is owed";
     if (s.outcome === "stopped") return "stopped";
     const spent = subagentSpent(s, Date.now());
@@ -4889,6 +4910,11 @@ export class AgentRuntime {
   #settingsNow(tenantId: string, config: unknown) {
     const s = agentSettings(this.#deps.ctx.storage.sql, this.#settingDefaults(tenantId, config));
     return this.#deps.subagentsDisabled || toolConfigOf(config)?.harness === "minimal" ? { ...s, subagents: false } : s;
+  }
+
+  /** Whether subagents are on for this agent now: its setting in force, under the deployment's kill switch. */
+  async #subagentsOn(tenantId: string, agentId: string): Promise<boolean> {
+    return this.#settingsNow(tenantId, (await this.store.loadAgent(tenantId, agentId))?.config).subagents;
   }
 
   /** The agent's settings as in force, and its subagents, newest first (`/admin/agent-settings`). */
@@ -4964,7 +4990,7 @@ export class AgentRuntime {
       // still running is tracked already. One the subagent may not take (stopped, owed a report, past its limits, the
       // cap full) is not delivered: an untracked run would call the model with nothing to bound it.
       if (isSubagentSession(session)) {
-        const gate = this.#subagentWakeGate(tenantId, agentId, session);
+        const gate = this.#subagentWakeGate(tenantId, agentId, session, await this.#subagentsOn(tenantId, agentId));
         if (gate !== "join" && gate !== "start") {
           logEvent("subagent.wake_dropped", { tenantId, agentId, subagent: session, why: gate });
           return;

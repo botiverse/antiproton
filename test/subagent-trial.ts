@@ -3,7 +3,7 @@
  * subagents — per UTC day and in total, the model calls and tokens of the main conversation and of the subagents, the
  * main context per call (median, p90), rebuilds, delegations by kind, child turns by outcome, and report sizes.
  */
-import { quantile, summarize } from "../cf/scripts/subagent-trial.mjs";
+import { fromR2, quantile, setFetch, summarize } from "../cf/scripts/subagent-trial.mjs";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 function check(name: string, fn: () => void) {
@@ -52,6 +52,25 @@ check("the window: from <= at < to", () => {
   must(t.modelCalls.main === 2 && t.delegations.follow_up === 1 && t.childTurns.cancelled === 0, show(t));
   must(quantile([], 0.5) === null && quantile([5, 1, 3], 0.5) === 3 && quantile([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 0.9) === 9, "quantile");
 });
+
+await (async () => {
+  // An error page from R2 is a failure, never rows: a 403 listing, and a 404 object after a good listing.
+  process.env.CF_API_TOKEN = "t"; process.env.R2_ACCOUNT_ID = "acct";
+  const tried: string[] = [];
+  for (const [status, at] of [[403, "list"], [404, "object"]] as const) {
+    setFetch(async (url) => {
+      const listing = url.includes("?");
+      if (listing && at === "list") return new Response('{"success":false,"errors":[{"message":"no"}]}', { status });
+      if (listing) return new Response(JSON.stringify({ success: true, result: [{ key: "trace/t/a/1-2.ndjson" }], result_info: { is_truncated: false } }), { status: 200 });
+      return new Response("<html>Not Found</html>", { status });
+    });
+    try { await fromR2({ tenant: "t", agent: "a" }); tried.push(`${status}: no throw`); }
+    catch (e) { tried.push(`${status}: ${String((e as Error).message).slice(0, 80)}`); }
+  }
+  check("a non-2xx answer from R2 is an error naming the step and the status, never parsed as rows", () => {
+    must(/^403: listing the trace export failed: HTTP 403/.test(tried[0]!) && /^404: reading trace\/t\/a\/1-2\.ndjson failed: HTTP 404/.test(tried[1]!), show(tried));
+  });
+})();
 
 let failed = 0;
 for (const r of results) {

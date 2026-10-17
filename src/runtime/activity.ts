@@ -54,7 +54,7 @@ export function activityEventId(agentId: string, seq: number): string {
  * Absent — the default — a child's rows make no event at all, as before: Raft's ingest strips fields it does not know,
  * so a child's tool call sent with its marker stripped would read as the agent's own.
  */
-export interface SubagentActivity { lineage(session: string): string | null }
+export interface SubagentActivity { lineage(session: string, at: number): string | null }
 
 export function activityEvents(agentId: string, rows: readonly TraceOutboxRow[], subagents?: SubagentActivity): ActivityEvent[] {
   const events = hookEvents(agentId, rows, subagents);
@@ -166,7 +166,7 @@ function subagentEvents(agentId: string, row: TraceOutboxRow, subagents: Subagen
     ({ ...(parent ? { parentToolUseId: parent } : {}), taskId, phase });
   if (row.kind === "subagent.start") {
     const taskId = row.spanId;
-    const parent = row.parentId ?? subagents.lineage(taskId);
+    const parent = row.parentId ?? subagents.lineage(taskId, row.at);
     const own = row.status !== "wake" && row.parentId
       ? [{ eventId: `${base.eventId}:pre`, occurredAt: base.occurredAt, hookEventName: "PreToolUse" as const, toolName: SEND_TOOL },
          { ...base, eventId: `${base.eventId}:post`, hookEventName: "PostToolUse" as const, toolName: SEND_TOOL }]
@@ -178,7 +178,7 @@ function subagentEvents(agentId: string, row: TraceOutboxRow, subagents: Subagen
       : row.status === "cancelled" ? "ceiling" : null;
     if (!outcome) return [];
     const chars = typeof row.attrs.reportChars === "number" ? row.attrs.reportChars : 0;
-    return [{ ...base, hookEventName: "SubagentStop", subagent: lineage(row.spanId, row.parentId ?? subagents.lineage(row.spanId), "ended"),
+    return [{ ...base, hookEventName: "SubagentStop", subagent: lineage(row.spanId, row.parentId ?? subagents.lineage(row.spanId, row.at), "ended"),
       outcome, reportChars: chars }];
   }
   if (row.kind === "tool.call" && typeof row.attrs.task === "string") {
@@ -188,7 +188,9 @@ function subagentEvents(agentId: string, row: TraceOutboxRow, subagents: Subagen
     const toolName = mount ? `${mount}__${tool}` : tool;
     const ok = row.verdict === "ok";
     const ms = typeof row.ms === "number" ? row.ms : 0;
-    const marker = lineage(taskId, subagents.lineage(taskId), "active");
+    // The turn the step was part of: the one that had started when the step began, whatever turn runs by the time this
+    // is read (a flush behind a follow-up must not give a turn-1 step turn 2's parent).
+    const marker = lineage(taskId, subagents.lineage(taskId, row.at - ms), "active");
     return [
       { eventId: `${base.eventId}:pre`, occurredAt: new Date(row.at - ms).toISOString(), hookEventName: "PreToolUse", toolName, subagent: marker },
       { ...base, hookEventName: ok ? "PostToolUse" : "PostToolUseFailure", toolName, subagent: marker,

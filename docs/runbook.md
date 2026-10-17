@@ -134,8 +134,13 @@ For every agent of the deployment at once, set the Worker var `SUBAGENTS_DISABLE
 `wrangler deploy --var SUBAGENTS_DISABLED:1`, or the dashboard's variables); unset it to undo. The var beats any agent's
 setting. The answer is the settings in force, what moved, and what each setting does: `{"settings":{"subagents":false},
 "changed":["subagents"],"disabledEverywhere":false,"about":{"subagents":"…"}}`; the GET also says `stored` and
-`defaults`. The agent's next turn is or is not offered `send_to_agent`; a turn already running keeps the tools it started
-with. On again is the same call with `true`. **Turning it off does not stop subagents already running**: they finish and report. To stop
+`defaults`. Either switch stops **new** children at once: a turn already running is refused at its next `send_to_agent`
+call (a start or a follow-up), and a finished child's background completion no longer starts a turn of it. Children
+already running are not stopped by it: stop them with `/admin/cancel-turn` ([Stopping a runaway agent](#stopping-a-runaway-agent)),
+which stops every subagent with the agent's turn. On again is the same call with `true`.
+
+An Agents API caller that declares its own function named `send_to_agent` keeps it: the agent is then not offered its
+own `send_to_agent` (a `subagent.tool_shadowed` log line says so). **Turning it off does not stop subagents already running**: they finish and report. To stop
 them, stop the agent's turn with `/admin/cancel-turn` ([Stopping a runaway agent](#stopping-a-runaway-agent)), which
 stops every subagent with it. An unknown setting or a value that is not a
 boolean is `400` and nothing is written; an agent that is not there is `404`. Each change is an `agent.settings` line in

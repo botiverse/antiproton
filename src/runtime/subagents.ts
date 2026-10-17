@@ -341,6 +341,24 @@ export function recordSubagent(sql: Sql, owner: SubagentOwner, s: {
     "INSERT INTO subagents(id, tenant_id, agent_id, parent_session, call_id, model_option, provider, model, state, turn_op, turns, created_at, turn_started_at, turn_key, model_now) " +
     "VALUES (?,?,?,?,?,?,?,?, 'running', ?, 1, ?, ?, ?, ?)",
     s.id, owner.tenantId, owner.agentId, s.parentSession, s.callId, s.modelOption, s.provider, s.model, s.turnOp, s.now, s.now, s.turnKey, s.model);
+  recordTurnLineage(sql, s.id, s.callId, s.now);
+}
+
+/**
+ * Each child turn's start and the parent's call that sent it, kept per turn: what an event of that turn names as its
+ * parent (`turnLineage`), whenever it is read. The row's own `call_id` is the latest turn's, so an event read after a
+ * follow-up must not take it from there.
+ */
+function recordTurnLineage(sql: Sql, id: string, callId: string | null, at: number) {
+  sql.exec("CREATE TABLE IF NOT EXISTS subagent_turns (id TEXT NOT NULL, started_at INTEGER NOT NULL, call_id TEXT)");
+  sql.exec("INSERT INTO subagent_turns(id, started_at, call_id) VALUES (?, ?, ?)", id, at, callId);
+}
+
+/** The parent's call that sent the child turn running at `at` (the latest that had started by then), or null. */
+export function turnLineage(sql: Sql, id: string, at: number): string | null {
+  if (sql.exec("SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = 'subagent_turns'").toArray().length === 0) return null;
+  const row = sql.exec("SELECT call_id FROM subagent_turns WHERE id = ? AND started_at <= ? ORDER BY started_at DESC, rowid DESC LIMIT 1", id, at).toArray()[0] as { call_id?: unknown } | undefined;
+  return typeof row?.call_id === "string" ? row.call_id : null;
 }
 
 /** A follow-up's turn: running again, with its own operation and the call that sent it. */
@@ -353,6 +371,7 @@ export function startSubagentTurn(sql: Sql, owner: SubagentOwner, id: string, t:
     (t.model ? ", model_option = ?, provider = ?, model = ?, model_now = ?" : "") +
     " WHERE id = ? AND tenant_id = ? AND agent_id = ?",
     t.turnOp, t.callId, t.turnKey ?? null, t.now, ...(t.model ? [t.model.option, t.model.provider, t.model.model, t.model.model] : []), id, owner.tenantId, owner.agentId);
+  recordTurnLineage(sql, id, t.callId, t.now);
 }
 
 /** The engine's id for the turn just started, once `say` has answered with it. */
