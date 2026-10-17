@@ -4929,13 +4929,6 @@ export class AgentRuntime {
     const session = this.#jobSessionFor(jobId);
     const job = await (await this.agent(tenantId, agentId, session)).takeJob(jobId, taker);
     if (!job) return job;
-    // A subagent started on one of the owner's model options runs on it (`send_to_agent`'s `model`): the option was
-    // checked against USER_MODELS when the subagent was started, and is the operator's account, as an owner's pick is.
-    const child = this.#subagentOfJob(tenantId, agentId, jobId, session);
-    if (child?.provider && child.model) {
-      const reasoning = await this.#reasoningFor(tenantId, agentId, child.id, (job as { context?: unknown }).context, child.model);
-      return { ...job, operatorModel: child.model, operatorProvider: child.provider, ...(reasoning ? { reasoning } : {}) };
-    }
     // The provider and model the queued call asks for, when it spends the operator's account; null leaves it
     // at the deployment's default, which is also what an agent with its own credential got before.
     const b = await this.store.getModelBinding(tenantId, agentId);
@@ -4946,8 +4939,12 @@ export class AgentRuntime {
     const mark = this.#deps.modelInputEvidence && !this.#isPd();
     // The first turn's reasoning, for an agent made to answer its first message without (`#reasoningFor`).
     const reasoning = await this.#reasoningFor(tenantId, agentId, session, (job as { context?: unknown }).context, this.#calledModel(b));
-    return { ...job, operatorModel: provider ? b!.model : null, operatorProvider: provider, ...(mark ? { imageEvidence: true } : {}),
-      ...(reasoning ? { reasoning } : {}) };
+    // A subagent started on one of the owner's model options runs on it (`send_to_agent`'s `model`): the option was
+    // checked against USER_MODELS when the subagent was started, and is the operator's account, as an owner's pick is.
+    const child = this.#subagentOfJob(tenantId, agentId, jobId, session);
+    const chosen = child?.provider && child.model ? { model: child.model, provider: child.provider } : null;
+    return { ...job, operatorModel: chosen?.model ?? (provider ? b!.model : null), operatorProvider: chosen?.provider ?? provider,
+      ...(mark ? { imageEvidence: true } : {}), ...(reasoning ? { reasoning } : {}) };
   }
 
   /**
