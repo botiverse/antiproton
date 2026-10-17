@@ -4424,11 +4424,16 @@ export class AgentRuntime {
     if (this.#isPd()) {
       const conversation = pdConversationId(sql as never, session);
       if (conversation === null || !has("pd_submissions")) return null;
-      // Under its request id, or carried in a submission's text: reports posted together share one message, whose
-      // request id is the first one's key.
-      const row = sql.exec("SELECT id FROM pd_submissions WHERE conversation_id = ? AND (request_id = ? OR instr(record, ?) > 0) ORDER BY id LIMIT 1",
-        conversation, key, key).toArray()[0] as { id?: unknown } | undefined;
-      return row ? { op: String(row.id) } : null;
+      const row = sql.exec("SELECT id FROM pd_submissions WHERE conversation_id = ? AND request_id = ? ORDER BY id LIMIT 1", conversation, key).toArray()[0] as { id?: unknown } | undefined;
+      if (row) return { op: String(row.id) };
+      // Reports posted together share one message, whose request id is only the first one's key; the others are found
+      // by its text, which pi-durable keeps in the conversation's entry once placed, or in its inbox while queued
+      // (dist/harness/submissions.js), not in the submission.
+      const inEntry = has("pd_entries") && sql.exec("SELECT 1 AS x FROM pd_entries WHERE conversation_id = ? AND instr(record, ?) > 0 LIMIT 1", conversation, key).toArray().length > 0;
+      const queued = !inEntry && has("pd_documents") && sql.exec(
+        "SELECT 1 AS x FROM pd_documents WHERE scope_kind = 'conversation' AND owner_id = ? AND retired_at IS NULL AND instr(record, ?) > 0 LIMIT 1",
+        conversation, key).toArray().length > 0;
+      return inEntry || queued ? { op: null } : null;
     }
     const t = piTables(session);
     if (!has(t.entries)) return null;

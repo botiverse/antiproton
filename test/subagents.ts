@@ -337,6 +337,28 @@ for (const engine of (process.env.ENGINES ?? "pi085,pd").split(",").filter((e) =
     });
   }
 
+  await check(`${engine}: a crash after two reports were posted together: after the restart neither is posted again`, async () => {
+    const w = await world(engine);
+    let parentCalls = 0, release = false;
+    w.reply = (session, req) => {
+      if (session === "main") return ++parentCalls === 1 ? calls({ id: "c1", args: { task: "part A" } }, { id: "c2", args: { task: "part B" } }) : say("ok");
+      return release ? say(`report of ${/part (\w)/.exec(taskOf(req))?.[1]}`) : null;
+    };
+    await w.rt.postMessage("t", "a", "go", "prompt", "main");
+    for (let i = 0; i < 6; i++) await pass(w);
+    let crashed = 0;
+    w.fault.at = (p) => { if (p === "report-posted" && crashed === 0) { crashed++; throw new Error("crash at report-posted"); } };
+    release = true;
+    for (let i = 0; i < 12 && !crashed; i++) { await pass(w).catch((e) => { if (!/crash at/.test(String(e))) throw e; }); await sleep(5); }
+    must(crashed === 1 && (await reportMessages(w)).length === 1, `control: ${crashed} crashes, ${(await reportMessages(w)).length} messages`);
+    w.fault.at = null;
+    w.rt = w.isolate();
+    await w.rt.ready();
+    await settle(w);
+    must((await reportMessages(w)).length === 1 && (await reports(w)).length === 2, `posted again: ${(await reportMessages(w)).length} messages, ${(await reports(w)).length} reports`);
+    must(rowsOf(w).every((r) => r.state === "idle"), show(rowsOf(w)));
+  });
+
   await check(`${engine}: an isolate dying mid-spawn: the replayed send finds the child it made, and the parent is told about it`, async () => {
     const w = await world(engine);
     let parentCalls = 0;
