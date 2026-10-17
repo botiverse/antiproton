@@ -202,6 +202,21 @@ So a migration is one of these two:
    anywhere. It also brings back the shared namespace the derivation exists to prevent, for any server that still
    derives that old name.
 
-The admin route refuses to issue a tenant-scoped provider token under `raft_` (cf/src/admin-provider-tokens.ts), so a
-tenant made by the operator never shares a namespace with a Raft server. Rows issued before that refusal still resolve.
-Preview has one such row, `raft_pu-verify-1013`, issued by the admin route and already revoked.
+### Which issuance paths accept a `raft_` tenant
+
+`raft_` is the prefix of every tenant a Raft server id derives. A credential that brings a new principal into a tenant
+under it would act in whichever server's tenant that is. The check is `reservedTenantProblem`
+(cf/src/admin-provider-tokens.ts), and it refuses at issuance only, so a row issued earlier still resolves and can
+still be listed and revoked.
+
+| Path | Under `raft_` | Why |
+|---|---|---|
+| `POST /admin/provider-tokens`, `scope: "tenant"` | `400` | The token is a whole tenant, and its agents, quota and billing are that tenant's. |
+| `POST /admin/provider-tokens`, `scope: "platform"` | n/a | It names no tenant; each request derives `raft_<raftServerId>`, the one source of these names. |
+| `POST /admin/api-keys` | `400` | The key's owner agent, and every agent it makes, are created in the named tenant and spend its limit. |
+| `/ui/api-keys/new` | n/a | The tenant is the signed-in person's own, never a value from the request. |
+| `POST /admin/service-tokens` | accepted | The token speaks for one named agent. An operator may need one to reach an existing provisioned agent in a Raft server's tenant. |
+| `POST /admin/hooks`, `POST`/`PATCH /admin/mounts` | accepted | They change an agent named by `(tenantId, agentId)`, and mint no principal for the tenant. |
+
+All of these are operator-only. Preview has one tenant-scoped provider token under `raft_`, `raft_pu-verify-1013`. The
+admin route issued it before the refusal existed, and it is revoked.

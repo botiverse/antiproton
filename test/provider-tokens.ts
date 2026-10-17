@@ -1,9 +1,12 @@
 /**
  * The operator's provider-token route (cf/src/admin-provider-tokens.ts), without a network or a database: which
  * tenant a tenant-scoped token may be issued for, and that refusing a name at issuance leaves a row issued earlier
- * resolving, listed and revocable.
+ * resolving, listed and revocable. The same reservation on `/admin/api-keys`, through the Worker's own `fetch`, and
+ * the one route that keeps a `raft_` tenant open on purpose, `/admin/service-tokens`.
  */
+import { register } from "node:module";
 import { adminProviderTokens, RESERVED_TENANT_PREFIX } from "../cf/src/admin-provider-tokens.ts";
+import { adminServiceTokens } from "../cf/src/admin-service-tokens.ts";
 import { derivedTenant } from "../cf/src/provision/handlers.ts";
 import type { ProviderTokenDirectory, ProviderTokenIdentity } from "../cf/src/control-plane.ts";
 import { hashProviderToken } from "../cf/src/provider-token.ts";
@@ -89,6 +92,67 @@ await check("a row issued under raft_ before the refusal still resolves, is list
   assert(listed.status === 200 && tokens.some((t) => t.hash === hash && t.scope === "tenant" && t.tenantId === "raft_pu-verify-1013"), `list: ${JSON.stringify(tokens)}`);
   const revoked = await call(request("DELETE", undefined, `?hash=${hash}`), dir);
   assert(revoked.status === 200 && (await revoked.json() as { revoked: boolean }).revoked === true && await dir.lookup(hash) === null, "revoke");
+});
+
+// The Worker itself, for /admin/api-keys: its `cloudflare:` imports answered by stand-ins, as in test/admin-fail-closed.ts.
+const STAND_IN = "export class DurableObject { constructor(ctx, env) { this.ctx = ctx; this.env = env; } }" +
+  " export class WorkerEntrypoint { constructor(ctx, env) { this.ctx = ctx; this.env = env; } }" +
+  " export class RpcTarget {} export const env = {};";
+register("data:text/javascript," + encodeURIComponent(
+  `export async function resolve(s, c, next) { if (s.startsWith("cloudflare:")) return { url: ${JSON.stringify("data:text/javascript," + encodeURIComponent(STAND_IN))}, shortCircuit: true }; return next(s, c); }`));
+const { default: worker } = await import("../cf/src/index.ts");
+const { setLogSink } = await import("../src/core/log.ts");
+setLogSink(() => {});
+
+/** POST /admin/api-keys against a database that records every statement it runs. */
+async function issueApiKey(tenantId: string) {
+  const writes: string[] = [];
+  const stmt = (sql: string): any => ({
+    bind: () => stmt(sql),
+    run: async () => { writes.push(sql); return { meta: { changes: 1 } }; },
+    first: async () => null,
+    all: async () => ({ results: [] }),
+  });
+  const env = {
+    AUTOMATION_TOKEN: TOKEN,
+    CONTROL_DB: { prepare: stmt, batch: async () => [] },
+    AGENT: { idFromName: (n: string) => n, get: () => { throw new Error("no object is reached issuing a key"); } },
+  };
+  const res = await worker.fetch(new Request("https://x/admin/api-keys", {
+    method: "POST", headers: { "x-harness-token": TOKEN, "content-type": "application/json" },
+    body: JSON.stringify({ tenantId, ownerAgentId: "owner-1", label: "a label" }),
+  }), env as never, { waitUntil() {}, passThroughOnException() {} } as never);
+  return { status: res.status, body: await res.json() as { error?: string; hint?: string; key?: string; tenantId?: string }, inserted: writes.filter((w) => /INSERT INTO api_keys/.test(w)).length };
+}
+
+await check("an API key is refused for a tenant under raft_: its owner agent and the agents it makes would live there", async () => {
+  for (const tenantId of ["raft_pu-verify-1013", derivedTenant("srv:prod"), "raft_x"]) {
+    const out = await issueApiKey(tenantId);
+    assert(out.status === 400 && out.body.error === "tenantId" && /reserved/.test(out.body.hint ?? "") && out.body.hint!.includes(RESERVED_TENANT_PREFIX),
+      `${tenantId}: ${out.status} ${JSON.stringify(out.body)}`);
+    assert(out.body.key === undefined && out.inserted === 0, `${tenantId}: a key was issued`);
+  }
+});
+
+await check("an API key for any other tenant is issued as before", async () => {
+  for (const tenantId of ["bench", "raft-staging", "Raft_x", "demo"]) {
+    const out = await issueApiKey(tenantId);
+    assert(out.status === 200 && typeof out.body.key === "string" && out.body.tenantId === tenantId && out.inserted === 1, `${tenantId}: ${out.status} ${JSON.stringify(out.body)}`);
+  }
+});
+
+await check("a service token may still name a raft_ tenant: it reaches one existing agent there, which an operator may need", async () => {
+  const rows: unknown[] = [];
+  const dir = {
+    async issue(r: unknown) { rows.push(r); }, async lookup() { return null; }, async revoke() { return false; },
+    async list() { return []; }, async touch() {},
+  };
+  const req = new Request("https://x/admin/service-tokens", {
+    method: "POST", headers: { "x-harness-token": TOKEN, "content-type": "application/json" },
+    body: JSON.stringify({ label: "operator", tenantId: "raft_d21383ee-df0a-4ed0-8f4c-ef263f2adb68", agentId: "raft_01JAGENT" }),
+  });
+  const res = await adminServiceTokens(req, TOKEN, dir as never, new URL(req.url));
+  assert(res.status === 201 && rows.length === 1, `${res.status} ${await res.text()}`);
 });
 
 console.log(`\n  provider tokens (admin route)\n  ${"─".repeat(56)}`);

@@ -40,6 +40,9 @@ export async function adminServiceTokens(request: Request, token: string | undef
         const message = typeof e === "object" && e !== null && "message" in e ? (e as { message?: unknown }).message : e;
         return answer({ error: String(message) }, 400);
       }
+      // A `raft_` tenant is allowed here, unlike a provider token or an API key (reservedTenantProblem,
+      // cf/src/admin-provider-tokens.ts): a service token speaks for one named agent, and reaching an existing
+      // provisioned agent in a Raft server's tenant is what an operator may need one for.
       const t = newServiceToken();
       const hash = await hashServiceToken(t);
       await dir.issue({ hash, label, tenantId, agentId });

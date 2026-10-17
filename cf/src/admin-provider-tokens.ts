@@ -27,6 +27,25 @@ export const LABEL_MAX = 64;
 /** The prefix every tenant derived from a Raft server id starts with (derivedTenant, cf/src/provision/handlers.ts). */
 export const RESERVED_TENANT_PREFIX = "raft_";
 
+/**
+ * Why a credential that brings a new principal into a tenant may not name this one, or null when it may.
+ *
+ * `raft_` is the namespace of the tenants derived from Raft server ids: a platform token's request for server S
+ * acts in `raft_<S>`. A credential issued under that prefix acts in the same tenant as whichever server derives
+ * it — its agents, quota and billing — so only the derivation may name one. Asked by the routes that mint such a
+ * principal: a tenant-scoped provider token (below), and an Agents API key (`/admin/api-keys`, cf/src/index.ts),
+ * whose owner agent and the agents it makes live in the named tenant and count against its spend limit.
+ *
+ * Not asked where the credential addresses one agent that already has a tenant: a service token
+ * (cf/src/admin-service-tokens.ts) is how an operator reaches an existing provisioned agent in a `raft_` tenant,
+ * and `/admin/hooks` and `/admin/mounts` act on a named agent's object. Refused at issuance only, so a row issued
+ * before this still resolves, and can still be listed and revoked.
+ */
+export function reservedTenantProblem(tenantId: string): string | null {
+  if (!tenantId.startsWith(RESERVED_TENANT_PREFIX)) return null;
+  return `a tenant id starting with "${RESERVED_TENANT_PREFIX}" is reserved for the tenants derived from Raft server ids`;
+}
+
 export async function adminProviderTokens(request: Request, token: string | undefined, dir: ProviderTokenDirectory, url: URL): Promise<Response> {
   if (!isOperator(token, request.headers.get("x-harness-token"))) return answer({ error: "unauthorized" }, 401);
   switch (request.method) {
@@ -55,16 +74,10 @@ export async function adminProviderTokens(request: Request, token: string | unde
         const message = typeof e === "object" && e !== null && "message" in e ? (e as { message?: unknown }).message : e;
         return answer({ error: String(message) }, 400);
       }
-      // `raft_` is the namespace of the tenants derived from Raft server ids (derivedTenant in
-      // cf/src/provision/handlers.ts): a platform token's request for server S acts in `raft_<S>`. A tenant token
-      // issued under that prefix would act in the same tenant as whichever server derives it — its agents, quota
-      // and billing — so only the derivation may name one. Refused at issuance only: a row issued before this
-      // still resolves, and can still be listed and revoked.
-      if (tenantId.startsWith(RESERVED_TENANT_PREFIX)) {
-        return answer({
-          error: "tenantId",
-          hint: `a tenant id starting with "${RESERVED_TENANT_PREFIX}" is reserved for the tenants derived from Raft server ids; issue a platform token for a Raft server, or pick another tenant id`,
-        }, 400);
+      // Not a tenant the operator may name (reservedTenantProblem above).
+      const reserved = reservedTenantProblem(tenantId);
+      if (reserved) {
+        return answer({ error: "tenantId", hint: `${reserved}; issue a platform token for a Raft server, or pick another tenant id` }, 400);
       }
       await dir.issue({ hash, label, scope, tenantId, raftOrigin });
       return answer({ token: t, hash, label, scope, tenantId, raftOrigin }, 201);
