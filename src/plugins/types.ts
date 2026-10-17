@@ -1547,11 +1547,13 @@ export interface ActivityEvent {
    * seen by more people than the conversation, so never the task, a prompt or what anyone said. Sent only where the
    * deployment turns it on (SUBAGENT_ACTIVITY, src/runtime/activity.ts).
    */
-  subagent?: { parentToolUseId?: string; taskId: string; phase: "started" | "active" | "ended" };
-  /** On a `SubagentStop`: how the child's turn ended. `ceiling` is a turn cancelled at its time limit. */
-  outcome?: "done" | "failed" | "stopped" | "ceiling";
-  /** On a `SubagentStop`: the length of the child's report in characters, never the report. */
-  reportChars?: number;
+  subagent?: {
+    parentToolUseId?: string; taskId: string; phase: "started" | "active" | "ended";
+    /** On `phase: "ended"` only: how the child's turn ended. `ceiling` is a turn cancelled at its time limit. */
+    outcome?: "done" | "failed" | "stopped" | "ceiling";
+    /** On `phase: "ended"` only: the length of the child's report in characters, never the report. */
+    reportChars?: number;
+  };
 }
 
 /**

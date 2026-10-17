@@ -157,7 +157,7 @@ function hookEvents(agentId: string, rows: readonly TraceOutboxRow[], subagents?
  *                                       SubagentStart { phase: "started" }
  *   subagent.start (wake)             → SubagentStart { phase: "started" }
  *   a child's tool.call               → PreToolUse + PostToolUse / PostToolUseFailure { phase: "active" }
- *   subagent.turn done|failed|stopped|cancelled → SubagentStop { phase: "ended" }, `outcome` (cancelled is `ceiling`), `reportChars`
+ *   subagent.turn done|failed|stopped|cancelled → SubagentStop { phase: "ended", outcome (cancelled is `ceiling`), reportChars }
  *   a child's model.call, js.run, a report's retry or drop → nothing (never a Stop, never a prompt)
  */
 function subagentEvents(agentId: string, row: TraceOutboxRow, subagents: SubagentActivity): ActivityEvent[] {
@@ -178,8 +178,9 @@ function subagentEvents(agentId: string, row: TraceOutboxRow, subagents: Subagen
       : row.status === "cancelled" ? "ceiling" : null;
     if (!outcome) return [];
     const chars = typeof row.attrs.reportChars === "number" ? row.attrs.reportChars : 0;
-    return [{ ...base, hookEventName: "SubagentStop", subagent: lineage(row.spanId, row.parentId ?? subagents.lineage(row.spanId, row.at), "ended"),
-      outcome, reportChars: chars }];
+    // Inside the marker, where Raft reads them: its ingest keeps the marker and drops unknown top-level fields.
+    return [{ ...base, hookEventName: "SubagentStop",
+      subagent: { ...lineage(row.spanId, row.parentId ?? subagents.lineage(row.spanId, row.at), "ended"), outcome, reportChars: chars } }];
   }
   if (row.kind === "tool.call" && typeof row.attrs.task === "string") {
     const taskId = row.attrs.task;

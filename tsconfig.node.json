@@ -80,6 +80,7 @@
     "test/user-models.ts",
     "test/reminder-default.ts",
     "test/capability-reconcile.ts",
+    "test/operator-message.ts",
     "test/capability-notice.ts",
     "test/agents-api-model.ts",
     "test/usage-costs.ts",

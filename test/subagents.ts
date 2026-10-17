@@ -1221,7 +1221,12 @@ for (const engine of (process.env.ENGINES ?? "pi085,pd").split(",").filter((e) =
     // Named as the agent's own steps are named (`hookEvents`: `<mount>__<tool>` from the row).
     must(steps.length === 2 && steps.every((e) => /^chat__.*peek$/.test(String(e.toolName)) && show(e.subagent) === show({ ...lin, phase: "active" })), `child steps: ${show(steps)}`);
     const stop = marked.filter((e) => e.hookEventName === "SubagentStop");
-    must(stop.length === 1 && show(stop[0]!.subagent) === show({ ...lin, phase: "ended" }) && stop[0]!.outcome === "done" && typeof stop[0]!.reportChars === "number" && stop[0]!.reportChars! > 0, `SubagentStop: ${show(stop)}`);
+    // Outcome and size inside the marker, nothing of them beside it (Raft drops unknown top-level fields).
+    const ended = stop[0]?.subagent as any;
+    must(stop.length === 1 && ended?.taskId === child && ended?.parentToolUseId === "c_ev" && ended?.phase === "ended" && ended?.outcome === "done"
+      && typeof ended?.reportChars === "number" && ended.reportChars > 0, `SubagentStop: ${show(stop)}`);
+    must(!("outcome" in stop[0]!) && !("reportChars" in stop[0]!), `outcome or reportChars at the top level: ${show(stop[0])}`);
+    must(show(Object.keys(ended).sort()) === show(["outcome", "parentToolUseId", "phase", "reportChars", "taskId"]), `the marker's keys: ${show(Object.keys(ended))}`);
     must(!marked.some((e) => e.hookEventName === "Stop" || e.hookEventName === "UserPromptSubmit"), "a child's Stop or prompt");
     const parentSend = on.filter((e) => !e.subagent && e.toolName === SUBAGENT_TOOL);
     must(parentSend.length === 2 && parentSend.map((e) => e.hookEventName).join() === "PreToolUse,PostToolUse", `the parent's own send_to_agent step: ${show(parentSend)}`);
@@ -1515,7 +1520,7 @@ await check("rules: Raft subagent events: a turn ended at its ceiling is outcome
   ];
   const on = activityEvents("a", rows, lineage);
   const stop = on.filter((e) => e.hookEventName === "SubagentStop");
-  must(stop.length === 1 && stop[0]!.outcome === "ceiling" && stop[0]!.reportChars === 120, `the ceiling: ${show(stop)}`);
+  must(stop.length === 1 && (stop[0]!.subagent as any)?.outcome === "ceiling" && (stop[0]!.subagent as any)?.reportChars === 120 && !("outcome" in stop[0]!), `the ceiling: ${show(stop)}`);
   must(on.filter((e) => e.subagent).every((e) => e.status === undefined), `the agent's status rode a child's event: ${show(on.filter((e) => e.subagent && e.status))}`);
   must(on.some((e) => !e.subagent && e.status === "online"), `the agent's own status is gone: ${show(on)}`);
 });

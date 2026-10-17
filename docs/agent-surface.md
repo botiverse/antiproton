@@ -844,7 +844,8 @@ Where the deployment sets `SUBAGENT_ACTIVITY=1` (off by default, until Raft's in
 work is sent as Raft's `SubagentLineage` events, `subagent: { parentToolUseId, taskId, phase }` with `parentToolUseId` the
 parent's `send_to_agent` tool call id and `taskId` the child's session: `SubagentStart` (`phase: "started"`) when a turn
 of it starts, the child's tool steps as `PreToolUse`/`PostToolUse` (`phase: "active"`), and `SubagentStop`
-(`phase: "ended"`) with `outcome` (`done`, `failed`, `stopped`, `ceiling`) and `reportChars`. The parent's own
+(`phase: "ended"`, and in the marker `outcome` — `done`, `failed`, `stopped`, `ceiling` — and `reportChars`; nothing of
+them beside it). The parent's own
 `send_to_agent` is then a plain `PreToolUse`/`PostToolUse` of the agent, with no marker. Never a `Stop` or a prompt for a
 child, never the agent's status on a child's event, and never a task, a prompt or a report: ids and enums only. Off, a
 child's rows make no event at all.

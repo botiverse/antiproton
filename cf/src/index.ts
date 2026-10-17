@@ -77,7 +77,7 @@ import { agentObjectName } from "./object-name.ts";
 import { readTranscript, transcriptEvents, approvalsByOp, isPd, type TranscriptEvents } from "./transcript-read.ts";
 import { operatorCredentials } from "./operator-ref.ts";
 import { agentSecretValues, credentialRedactor, evalTranscript, localTrace, readTraceWindow, redactCredentials, type EvalTranscript } from "./eval-read.ts";
-import type { TraceOutboxRow } from "../../src/trace/outbox.ts";
+import { appendTrace, type TraceOutboxRow } from "../../src/trace/outbox.ts";
 import { readEngineStorage } from "./engine-read.ts";
 import { pdVersion } from "../../src/runtime/pd-transcript.ts";
 import { compactionRefusal, refusingCompaction } from "./compact-refusal.ts";
@@ -2484,6 +2484,12 @@ export class AgentDO extends DurableObject<Env> {
       await rt.provision(tenantId, agentId);
       await this.#bindModel(rt, tenantId, agentId);
       const r = await rt.postMessage(tenantId, agentId, text);
+      // The operator's message is one the agent was given, as a push is: the same `inbound` row, `delivered`, so activity
+      // reads it as the turn's UserPromptSubmit. Alias `operator`: no hook carried it. A reading: a failure is logged.
+      try {
+        appendTrace(this.sql as never, [{ at: Date.now(), tenantId, agentId, kind: "inbound", spanId: `operator:${taskId}`,
+          status: "delivered", verdict: "ok", attrs: { alias: "operator", source: "operator" } }]);
+      } catch (e) { console.error(`the inbound row of ${tenantId}/${agentId}'s operator message could not be written:`, e); }
       // Wakeup is an alarm, not a poll: nothing spins while the agent has no work.
       await this.#wake();
       return r;
