@@ -124,6 +124,12 @@ export function modelCallRow(m: {
   usage?: { input?: unknown; cacheRead?: unknown; cacheWrite?: unknown } | null;
   /** The sentence of a call refused for a daily spend limit (`spendLimitRefusal`, src/model/pi-bridge.ts), for Raft. */
   limit?: string;
+  /**
+   * The conversation that made the call: `main`, an Agents API session, or a subagent (src/runtime/subagents.ts). A
+   * subagent's calls are the agent's spend but not its turn, so activity and status skip them by this (src/runtime/status.ts
+   * `subagentRow`), and a child's share of the cost is read by it. Absent where the writer could not tell.
+   */
+  session?: string | null;
 }): TraceRow {
   const ms = typeof m.createdAt === "number" && typeof m.answeredAt === "number"
     ? Math.max(0, m.answeredAt - m.createdAt) : undefined;
@@ -138,7 +144,8 @@ export function modelCallRow(m: {
     ...(ms === undefined ? {} : { ms }),
     // The model first: keys drop from the end when attrs are too long (src/trace/outbox.ts `attrsOf`).
     // The limit's sentence next: what the owner is shown (src/runtime/activity.ts), the last thing to be dropped.
-    attrs: { model: m.model, ...(m.limit ? { limit: m.limit } : {}), ...tokens, ...(m.prefix ? { prefix: m.prefix } : {}) },
+    // The session right after it: activity reads it to tell a subagent's call from the agent's own, so it is kept over the readings.
+    attrs: { model: m.model, ...(m.session ? { session: m.session } : {}), ...(m.limit ? { limit: m.limit } : {}), ...tokens, ...(m.prefix ? { prefix: m.prefix } : {}) },
   };
 }
 

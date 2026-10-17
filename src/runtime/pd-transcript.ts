@@ -134,6 +134,17 @@ export function pdConversationId(sql: ReadSql, session: string): number | null {
   return row ? Number(row.conversation_id) : null;
 }
 
+/**
+ * A submission's status as pi-durable keeps it (`queued`, `placed`, `done`, `unanswered`), read with a SELECT: no
+ * harness is opened. What a subagent's turn end is read from (cf/src/runtime.ts `#reportSubagents`), since the
+ * submission settles in the commit that ends its run. Null for an id that is not a submission, or no pd tables.
+ */
+export function pdSubmissionStatus(sql: ReadSql, id: string): string | null {
+  if (!/^\d+$/.test(id) || !tableExists(sql, prefixedNamespace("pd").qualify("submissions", "table"))) return null;
+  const row = sql.exec(PD.rewrite("SELECT status FROM submissions WHERE id = ?"), Number(id)).toArray()[0];
+  return row ? String(row.status) : null;
+}
+
 /** `readPdRecords`, projected. */
 export function readPdEntries(sql: ReadSql, session: string): EngineEntry[] {
   return projectEntries(readPdRecords(sql, session));

@@ -20,6 +20,7 @@
  *   model.call toolUse      → nothing             (still working)
  *   session.needs_reset set → BridgeFatal         (the overflow backstop gave up: pushes are refused until a reset)
  *   agent.ready             → nothing             (its `online` is a status-only event, src/runtime/status.ts)
+ *   a subagent's row        → nothing             (a child session's work: trace only, `subagentRow`)
  *
  * The event id is the row's seq under the agent: unique for the agent's
  * lifetime because seq is AUTOINCREMENT and never reused, so a batch sent
@@ -29,7 +30,7 @@
  */
 import type { TraceOutboxRow } from "../trace/outbox.ts";
 import type { ActivityEvent } from "../plugins/types.ts";
-import { operatorCall, statusEvents, turnEndClass } from "./status.ts";
+import { operatorCall, statusEvents, subagentRow, turnEndClass } from "./status.ts";
 
 export const ACTIVITY_SCHEMA = "raft-agent-activity-ingest.v1";
 /**
@@ -92,6 +93,8 @@ export function orderStatuses(events: readonly ActivityEvent[], after: number): 
 function hookEvents(agentId: string, rows: readonly TraceOutboxRow[]): ActivityEvent[] {
   const out: ActivityEvent[] = [];
   for (const row of rows) {
+    // A subagent's model calls and tools are its own, not the agent's (`subagentRow`, src/runtime/status.ts).
+    if (subagentRow(row)) continue;
     const base = { eventId: activityEventId(agentId, row.seq), occurredAt: new Date(row.at).toISOString() };
     switch (row.kind) {
       case "inbound":

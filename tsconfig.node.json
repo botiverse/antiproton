@@ -101,6 +101,7 @@
     "test/harness-open.ts",
     "test/run-js-trace.ts",
     "test/turn-stop.ts",
+    "test/subagents.ts",
     "test/overflow-backstop.ts",
     "test/idle-rebuild.ts",
     "test/tool-interrupts.ts",
