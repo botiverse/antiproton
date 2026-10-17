@@ -28,8 +28,8 @@ function must(cond: unknown, msg: string): asserts cond { if (!cond) throw new E
 
 const TOKEN = "operator-token-814";
 
-// /latency fetches from the Worker; in a test those fetches are recorded and answered here, never sent. Whichever
-// world is current records them, so a refused probe shows an outbound fetch as plainly as an object call.
+// No route here should fetch from the Worker; in a test any fetch is recorded and answered here, never sent. Whichever
+// world is current records it, so a refused route shows an outbound fetch as plainly as an object call.
 let outbound: string[] = [];
 globalThis.fetch = (async (input: RequestInfo | URL) => {
   outbound.push(`fetch.${typeof input === "string" ? input : input instanceof URL ? input.href : input.url}`);
@@ -89,30 +89,12 @@ const ROUTES: Route[] = [
   { path: "/admin/transcript", method: "GET", refused: 401, passed: (s) => s === 400 },
   // A signed-in admin or the operator's token (auth.ts isAdmin); its refusal is "no such route".
   { path: "/admin/models", method: "PATCH", refused: 404, passed: (s) => s === 405 },
-  // The probes (PROBE_ROUTES): no identity of their own, and three of them start a real turn — a task, a wake, a
-  // model call on the deployment's account — so an unauthenticated caller must not reach the object at all (the
-  // loop below checks that no object method was called). "Passed" is the object answering: the stub turns every
-  // method into { ok: true }.
-  { path: "/isolation", method: "GET", refused: 401, passed: (s) => s === 200 },
-  { path: "/eviction", method: "GET", refused: 401, passed: (s) => s === 200 },
-  { path: "/model-binding", method: "GET", refused: 401, passed: (s) => s === 200 },
-  { path: "/sandbox", method: "GET", refused: 401, passed: (s) => s === 200 },
-  { path: "/sandbox/cpu?ms=50", method: "GET", refused: 401, passed: (s) => s === 200 },
-  { path: "/alarm/arm?ms=1000", method: "GET", refused: 401, passed: (s) => s === 200 },
-  { path: "/storage", method: "GET", refused: 401, passed: (s) => s === 200 },
-  { path: "/alarm/status", method: "GET", refused: 401, passed: (s, c) => s === 200 && c.includes("object.alarmStatus") },
-  // /latency touches no object: its work is a 1 MB put and get in R2 and two outbound fetches, so "passed" is that
-  // work, and the refusals below hold that none of it starts without the token.
-  { path: "/latency", method: "GET", refused: 401, passed: (s, c) => s === 200 && c.includes("r2.put bench/big.bin") && c.some((x) => x.startsWith("fetch.")) },
-  // /conformance/executor is routed by its prefix to its own object (conformance-v2), not to p0, and starts
-  // Dynamic Workers there; every method is held to the token, since the switch below answers it whatever the method.
+  // The probe (PROBE_ROUTES): no identity of its own, and it starts Dynamic Workers on the deployment's account, so an
+  // unauthenticated caller must not reach the object at all (the loop below checks that no object method was called).
+  // It is routed by its prefix to its own object (conformance-v2); every method is held to the token, since the
+  // switch answers it whatever the method.
   ...["GET", "HEAD", "OPTIONS", "POST"].map((method): Route => (
     { path: "/conformance/executor", method, refused: 401, passed: (s, c) => s === 200 && c.includes("object.runExecutorSpec") })),
-  // A number a probe cannot use is refused, not handed to the object: an unbounded cpuMs and an alarm at an
-  // arbitrary delay are the caller's to ask for only within the caps.
-  { path: "/sandbox/cpu?ms=abc", method: "GET", refused: 401, passed: (s) => s === 400 },
-  { path: "/sandbox/cpu?ms=999999", method: "GET", refused: 401, passed: (s) => s === 400 },
-  { path: "/alarm/arm?ms=999999999", method: "GET", refused: 401, passed: (s) => s === 400 },
 ];
 
 async function hit(r: Route, token: string | undefined, presented: string | null) {
@@ -142,6 +124,27 @@ for (const r of ROUTES) {
   await check(`${name}: the configured token gets past the gate`, async () => {
     const out = await hit(r, TOKEN, TOKEN);
     must(r.passed(out.status, out.calls), `${out.status} ${out.text.slice(0, 200)} calls=${out.calls}`);
+  });
+}
+
+// The diagnostic routes that had no caller are gone. Each is now an unknown path: the 404 index, whoever asks and
+// whatever the method, and nothing behind it runs — no object, no R2, no outbound fetch.
+const DELETED = [
+  "/isolation", "/eviction", "/model-binding", "/sandbox", "/sandbox/cpu?ms=50", "/alarm/arm?ms=1000",
+  "/alarm/status", "/storage", "/latency",
+];
+for (const path of DELETED) {
+  await check(`${path.split("?")[0]}: deleted, so the 404 index with no object, R2 or network touched`, async () => {
+    for (const method of ["GET", "POST"]) {
+      for (const [token, presented] of [[undefined, null], [TOKEN, null], [TOKEN, TOKEN]] as const) {
+        const out = await hit({ path, method, refused: 0, passed: () => false }, token, presented);
+        must(out.status === 404, `${method} token=${token ?? "unset"} presented=${presented ?? "none"}: ${out.status} ${out.text.slice(0, 200)}`);
+        const index = JSON.parse(out.text) as { demo?: string; diagnostics?: string[] };
+        must(index.demo === "/ui" && Array.isArray(index.diagnostics), `not the index: ${out.text.slice(0, 200)}`);
+        must(!index.diagnostics.includes(path.split("?")[0]), `the index still offers ${path}: ${out.text}`);
+        must(!out.calls.some((c) => /^(object|r2|fetch)\./.test(c)), `${method} ${path} reached the object, R2 or the network: ${out.calls}`);
+      }
+    }
   });
 }
 
