@@ -4429,7 +4429,7 @@ export class AgentRuntime {
       if (row) return { op: String(row.id) };
       // Reports posted together share one message, whose request id is only the first one's key; the others are found
       // by its text, which pi-durable keeps in the conversation's entry once placed, or in its inbox while queued
-      // (dist/harness/submissions.js), not in the submission.
+      // (@earendil-works/pi-durable 1.0.0, dist/harness/submissions.js), not in the submission.
       const inEntry = has("pd_entries") && sql.exec("SELECT 1 AS x FROM pd_entries WHERE conversation_id = ? AND instr(record, ?) > 0 LIMIT 1", conversation, key).toArray().length > 0;
       const queued = !inEntry && has("pd_documents") && sql.exec(
         "SELECT 1 AS x FROM pd_documents WHERE scope_kind = 'conversation' AND owner_id = ? AND retired_at IS NULL AND instr(record, ?) > 0 LIMIT 1",
