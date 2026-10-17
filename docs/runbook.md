@@ -119,7 +119,9 @@ row to the agent's trace.
 
 Every hosted agent can delegate work to subagents (docs/agent-surface.md, "Subagents"), its Agents API sessions
 included. Subagents can read and research but cannot change anything or act as this agent: no writes, no messages, no
-shell. Give them reading tasks and do the changes yourself. Bench agents have them only where their setting turns them on.
+shell. Give them reading tasks and do the changes yourself. The bench tenant's agents and evaluation agents provisioned
+with an explicit tool choice have them only where their setting turns them on (`harness: "minimal"` never), so a deploy
+changes no measurement.
 
 **Kill switches.** For one agent, turn its setting off:
 

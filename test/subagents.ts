@@ -1404,6 +1404,30 @@ for (const engine of (process.env.ENGINES ?? "pi085,pd").split(",").filter((e) =
   });
 }
 
+await check("the default reaches no measurement: the bench tenant and an evaluation's tool choice get it only by their own setting, and harness minimal never", async () => {
+  const runtime = (raw: ReturnType<typeof sqliteHost>) => new AgentRuntime({
+    ctx: { storage: { sql: raw.sql, transactionSync: raw.transactionSync } }, bucket: {} as never, bucketName: "b", models: { resolve: () => null },
+    sandbox: false, autoRelease: false, subagentsDefault: true,
+    operatorModel: operatorModelOf({ DEEPSEEK_BASE_URL: "https://model.example/v1", DEEPSEEK_API_KEY: "operator-key", HARNESS_MODEL: "m1" }),
+    offloadModel: async () => {},
+  } as never);
+  const offered = async (tenant: string, config: Record<string, unknown>, stored?: boolean) => {
+    const raw = sqliteHost();
+    const rt = runtime(raw);
+    await rt.ready();
+    await rt.store.createAgent(tenant, "a", config as never);
+    await rt.bindOperatorModel(tenant, "a");
+    if (stored !== undefined) updateAgentSettings(raw.sql as never, { subagents: stored }, "test");
+    return (await (await rt.agent(tenant, "a")).tools()).some((t) => t.name === SUBAGENT_TOOL);
+  };
+  must(await offered("t", { name: "Ada" }), "control: a hosted agent has it by default");
+  must(!await offered("bench", { name: "Ada" }) && await offered("bench", { name: "Ada" }, true), "the bench tenant");
+  const chosen = { name: "Ada", toolConfig: { mounts: null, harness: "default" } };
+  must(!await offered("t", chosen) && await offered("t", chosen, true), "an evaluation's tool choice");
+  const minimal = { name: "Ada", toolConfig: { mounts: null, harness: "minimal" } };
+  must(!await offered("t", minimal) && !await offered("t", minimal, true), "harness minimal");
+});
+
 await check("rules: the tool tells the model to delegate big reads for a short report, and to do changes itself", () => {
   const t = subagentTool({ models: [], send: async () => ({}) });
   for (const words of ["any read that would bring a lot of raw content into your context", "short, structured report", "Do changes, messages and decisions yourself",

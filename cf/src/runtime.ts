@@ -3054,11 +3054,11 @@ export class AgentRuntime {
 
   /** The key a cached harness is checked against (`harnessKey`): its catalogue, its persona and its model binding, as stored now. */
   async #harnessKeyFor(tenantId: string, agentId: string): Promise<string> {
-    const key = harnessKey(await this.#catalogueKeyFor(tenantId, agentId),
-      personaOf((await this.store.loadAgent(tenantId, agentId))?.config), await this.store.getModelBinding(tenantId, agentId));
+    const config = (await this.store.loadAgent(tenantId, agentId))?.config;
+    const key = harnessKey(await this.#catalogueKeyFor(tenantId, agentId), personaOf(config), await this.store.getModelBinding(tenantId, agentId));
     // The agent's settings decide a tool (`send_to_agent`), so a harness built before one moved offers the wrong list.
     // Appended only when one is on, so an agent with none keeps the key it had.
-    const settings = this.#settingsNow();
+    const settings = this.#settingsNow(tenantId, config);
     return Object.values(settings).some(Boolean) ? `${key}|${JSON.stringify(settings)}` : key;
   }
 
@@ -3209,7 +3209,7 @@ export class AgentRuntime {
       // Not a child's: `jobs` cancels the agent's background work, and a subagent starts none (it cannot write).
       ...(extras.jobs && !child ? [jobs] : []),
       // Only where the agent's setting is on, and never in a child (above). Its body is this object's (`#sendToAgent`).
-      ...(!child && this.#settingsNow().subagents
+      ...(!child && this.#settingsNow(tenantId, agentConfig).subagents
         ? [subagentTool({
             models: (this.#deps.userModels?.offered ?? []).map((o) => ({ id: o.id, label: o.label })),
             send: (p, callId, invocation) => this.#sendToAgent(tenantId, agentId, session, p, callId, invocation),
@@ -4870,29 +4870,38 @@ export class AgentRuntime {
     return isSubagentSession(real) ? subagentOf(sql, { tenantId, agentId }, real) : null;
   }
 
-  /** What a setting is where the agent stored none: this runtime's (`subagentsDefault`). */
-  #settingDefaults() {
-    return { subagents: this.#deps.subagentsDefault === true };
+  /**
+   * What a setting is where the agent stored none: this runtime's (`subagentsDefault`), except where a measurement must
+   * get exactly what it set up — the bench tenant (`BENCH_TENANT`: the τ² Agents API arm runs there, and its agents are
+   * offered exactly their catalogue) and an agent provisioned with an explicit tool choice (`toolConfig`, an evaluation's).
+   * A stored setting still decides for those.
+   */
+  #settingDefaults(tenantId: string, config: unknown) {
+    const measured = tenantId === BENCH_TENANT || toolConfigOf(config) !== null;
+    return { subagents: this.#deps.subagentsDefault === true && !measured };
   }
 
   /**
-   * The settings in force: the stored value, else this runtime's default, under the deployment's kill switch
-   * (`subagentsDisabled`, SUBAGENTS_DISABLED), which turns subagents off whatever is stored.
+   * The settings in force: the stored value, else the default (`#settingDefaults`), under the deployment's kill switch
+   * (`subagentsDisabled`, SUBAGENTS_DISABLED) and an evaluation's `harness: "minimal"`, either of which turns subagents
+   * off whatever is stored.
    */
-  #settingsNow() {
-    const s = agentSettings(this.#deps.ctx.storage.sql, this.#settingDefaults());
-    return this.#deps.subagentsDisabled ? { ...s, subagents: false } : s;
+  #settingsNow(tenantId: string, config: unknown) {
+    const s = agentSettings(this.#deps.ctx.storage.sql, this.#settingDefaults(tenantId, config));
+    return this.#deps.subagentsDisabled || toolConfigOf(config)?.harness === "minimal" ? { ...s, subagents: false } : s;
   }
 
   /** The agent's settings as in force, and its subagents, newest first (`/admin/agent-settings`). */
   async agentSettingsOf(tenantId: string, agentId: string) {
     await this.ready();
-    if (!(await this.store.loadAgent(tenantId, agentId))) return null;
+    const record = await this.store.loadAgent(tenantId, agentId);
+    if (!record) return null;
     const sql = this.#deps.ctx.storage.sql;
     // A deleted agent has no settings to read: its delete stopped every subagent (`stopTurn`), and the rows stay only as a record.
     if (agentDeletedAt(sql) !== null) return null;
     return {
-      settings: this.#settingsNow(), stored: agentSettings(sql, this.#settingDefaults()), defaults: this.#settingDefaults(),
+      settings: this.#settingsNow(tenantId, record.config), stored: agentSettings(sql, this.#settingDefaults(tenantId, record.config)),
+      defaults: this.#settingDefaults(tenantId, record.config),
       disabledEverywhere: this.#deps.subagentsDisabled === true, about: AGENT_SETTING_ABOUT, subagents: listSubagents(sql, { tenantId, agentId }),
     };
   }
@@ -4903,10 +4912,11 @@ export class AgentRuntime {
    */
   async updateAgentSettings(tenantId: string, agentId: string, patch: unknown, who: string) {
     await this.ready();
-    if (!(await this.store.loadAgent(tenantId, agentId))) return { ok: false as const, status: 404, error: "no such agent" };
+    const record = await this.store.loadAgent(tenantId, agentId);
+    if (!record) return { ok: false as const, status: 404, error: "no such agent" };
     if (agentDeletedAt(this.#deps.ctx.storage.sql) !== null) return { ok: false as const, status: 404, error: "the agent was deleted" };
-    const r = updateAgentSettings(this.#deps.ctx.storage.sql, patch, who, Date.now(), this.#settingDefaults());
-    return r.ok ? { ...r, settings: this.#settingsNow(), disabledEverywhere: this.#deps.subagentsDisabled === true, about: AGENT_SETTING_ABOUT }
+    const r = updateAgentSettings(this.#deps.ctx.storage.sql, patch, who, Date.now(), this.#settingDefaults(tenantId, record.config));
+    return r.ok ? { ...r, settings: this.#settingsNow(tenantId, record.config), disabledEverywhere: this.#deps.subagentsDisabled === true, about: AGENT_SETTING_ABOUT }
       : { ok: false as const, status: 400, error: r.error };
   }
 

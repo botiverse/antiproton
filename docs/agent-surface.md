@@ -742,7 +742,10 @@ delete stops again. A stop that fails does not fail the delete: it is logged as 
 
 Every hosted agent is offered one more harness tool, `send_to_agent`, in its own conversations, its Agents API sessions
 included — unless an operator turned its `subagents` setting off, or the deployment's `SUBAGENTS_DISABLED=1` kill switch
-is set ([`runbook.md`](runbook.md#subagents)); bench agents have it only where their setting turns it on. It
+is set ([`runbook.md`](runbook.md#subagents)). Measurements are exempt from the default, so a deploy changes no arm: the
+bench tenant's agents (the τ² Agents API arm included) and an agent provisioned with an explicit tool choice
+([Choosing the agent's tools](#choosing-the-agents-tools)) have it only where their setting turns it on, and
+`harness: "minimal"` never does. It
 delegates a self-contained piece of work to a **subagent**: a child conversation in the same agent object, with its own
 context. The design is issue #926; the code is `src/runtime/subagents.ts` and `cf/src/runtime.ts` (`#sendToAgent`,
 `#reportSubagents`).
