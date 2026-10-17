@@ -1968,7 +1968,12 @@ export class AgentDO extends DurableObject<Env> {
 
   async adminUpdateAgentSettings(tenantId: string, agentId: string, settings: unknown) {
     this.#claim(tenantId, agentId);
-    return this.#busy("adminUpdateAgentSettings", () => this.runtime().updateAgentSettings(tenantId, agentId, settings, "operator"));
+    return this.#busy("adminUpdateAgentSettings", async () => {
+      const r = await this.runtime().updateAgentSettings(tenantId, agentId, settings, "operator");
+      // Subagents switched off stop at the write (`updateAgentSettings`); the pass asked for now posts their notice.
+      if (r.ok && (r as { stoppedSubagents?: number }).stoppedSubagents) await this.#wake();
+      return r;
+    });
   }
 
   async adminRefreshMountTools(tenantId: string, agentId: string, alias: string) {
@@ -2485,11 +2490,16 @@ export class AgentDO extends DurableObject<Env> {
       await this.#bindModel(rt, tenantId, agentId);
       const r = await rt.postMessage(tenantId, agentId, text);
       // The operator's message is one the agent was given, as a push is: the same `inbound` row, `delivered`, so activity
-      // reads it as the turn's UserPromptSubmit. Alias `operator`: no hook carried it. A reading: a failure is logged.
-      try {
-        appendTrace(this.sql as never, [{ at: Date.now(), tenantId, agentId, kind: "inbound", spanId: `operator:${taskId}`,
-          status: "delivered", verdict: "ok", attrs: { alias: "operator", source: "operator" } }]);
-      } catch (e) { console.error(`the inbound row of ${tenantId}/${agentId}'s operator message could not be written:`, e); }
+      // reads it as the turn's UserPromptSubmit. Alias `operator`: no hook carried it. Only for a message the engine
+      // took: a refusal throws above, and a post that wrote nothing answers no result. The span id is capped, as the
+      // task id is the caller's. A reading: a failure is logged.
+      const took = r.result !== null && r.result !== undefined && (r.result as { ok?: unknown }).ok !== false && !(r as { skipped?: true }).skipped;
+      if (took) {
+        try {
+          appendTrace(this.sql as never, [{ at: Date.now(), tenantId, agentId, kind: "inbound", spanId: `operator:${String(taskId).slice(0, 64)}`,
+            status: "delivered", verdict: "ok", attrs: { alias: "operator", source: "operator" } }]);
+        } catch (e) { console.error(`the inbound row of ${tenantId}/${agentId}'s operator message could not be written:`, e); }
+      }
       // Wakeup is an alarm, not a poll: nothing spins while the agent has no work.
       await this.#wake();
       return r;

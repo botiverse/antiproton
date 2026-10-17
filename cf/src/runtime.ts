@@ -64,8 +64,9 @@ import {
 } from "../../src/runtime/client-calls.ts";
 import { closeTurn, discardTurn, openTurn, turnInbound, turnNotSaid, turnPaused, turnResumed, turnSaid, turnStepStart } from "../../src/runtime/turn-timing.ts";
 import {
-  admitSubagent, finishSubagentTurn, runningSubagentCount, subagentCeilingMs, SUBAGENT_CAP, SUBAGENT_MAX_MS, SUBAGENT_LIFETIME_MS, isSubagentSession, listSubagents, overdueSubagent, recordSubagent, reportMessage,
+  admitSubagent, hasSubagentTable, finishSubagentTurn, runningSubagentCount, subagentCeilingMs, SUBAGENT_CAP, SUBAGENT_MAX_MS, SUBAGENT_LIFETIME_MS, isSubagentSession, listSubagents, overdueSubagent, recordSubagent, reportMessage,
   runningSubagents, setSubagentTurnOp, startedResult as subagentStarted, startSubagentTurn, stopRunningSubagents, subagentOf, subagentTool,
+  switchOffSubagents, switchedOffNotice, reportBodyChars, SUBAGENT_SWITCH_CHECK_MS,
   SUBAGENT_TOOL, childMayCall, childRefusal, childWithheld, taskMessage, turnEnd, type Subagent, type TurnEnd,
   markReported, reportingSubagents, reportKey, subagentIdFor, taskKey, turnKeyOf,
   reportFailed, reportRetryMs, subagentSpent, subagentTurnRow, noteSubagentModel, combinedRequestId, undeliveredKey, undeliveredNotice,
@@ -803,7 +804,7 @@ export interface RuntimeDeps {
    * A test's knob: called at the points of a subagent's send and report where a crash must lose nothing. A throw is the
    * crash; a promise that never settles is an isolate that died there.
    */
-  subagentFault?: (phase: "task-posting" | "task-posted" | "report-decided" | "report-posting" | "report-written" | "report-posted" | "ceiling-cancel" | "wake-posting", subagent: string) => void | Promise<void>;
+  subagentFault?: (phase: "send-start" | "task-posting" | "task-posted" | "report-decided" | "report-posting" | "report-written" | "report-posted" | "ceiling-cancel" | "wake-posting", subagent: string) => void | Promise<void>;
   /**
    * Whether an agent with no `subagents` setting of its own is offered `send_to_agent`: on for the hosted agents
    * (cf/src/index.ts), absent — off — for the bench and for a runtime built without saying. A stored setting wins.
@@ -4357,11 +4358,7 @@ export class AgentRuntime {
     const sql = this.#deps.ctx.storage.sql;
     const owner = { tenantId, agentId };
     const now = Date.now();
-    // Asked at the call, not only when the tool was offered: a kill switch set while this turn runs (the agent's setting,
-    // or SUBAGENTS_DISABLED) stops it starting any child, or sending one a follow-up, from here on.
-    if (!(await this.#subagentsOn(tenantId, agentId))) {
-      throw new Error(`${SUBAGENT_TOOL}: subagents are switched off for this agent, so nothing was started. Do the reading yourself.`);
-    }
+    await this.#deps.subagentFault?.("send-start", parentSession);
     const turnKey = turnKeyOf(parentSession, run, callId);
     let model: { option: string; provider: string; model: string } | null = null;
     if (p.model !== null) {
@@ -4383,6 +4380,13 @@ export class AgentRuntime {
       id = existing.id;
     }
     const replay = existing !== null && existing.turnKey === turnKey;
+    // Asked at the call, not only when the tool was offered: a kill switch set while this turn runs (the agent's setting,
+    // or SUBAGENTS_DISABLED) stops it starting any child, or sending one a follow-up, from here on. After the replay is
+    // known: a call that already started its child (a crash, then the switch, then the call ran again) answers what it
+    // did, and the switch's sweep has stopped that child and owes the parent its notice.
+    if (!replay && !(await this.#subagentsOn(tenantId, agentId))) {
+      throw new Error(`${SUBAGENT_TOOL}: subagents are switched off for this agent, so nothing was started. Do the reading yourself.`);
+    }
     if (!replay) {
       if (existing?.state === "archived") {
         throw new Error(`${SUBAGENT_TOOL}: ${existing.id} finished long ago and its transcript is gone; start a new subagent with the whole task.`);
@@ -4499,6 +4503,11 @@ export class AgentRuntime {
    * posted only if the parent's conversation does not already hold it (`#postOnce`), and the row marked idle after the
    * post. A crash before the post leaves it owed, and the next pass posts it; one after the post leaves it owed and
    * already there, and the next pass finds it and only marks it.
+   *
+   * Called once a pass, after its step loop (`step`) and the stray sweep, never from inside the loop: a child whose
+   * turn a step in this pass ended is reported in this same pass, rather than one pass later, and the reports of every
+   * child that ended in the pass go to their parent as one message. The kill switch's sweep runs before the loop
+   * (`#switchOffSubagents`), so the children it stopped are reported here too.
    */
   async #reportSubagents(tenantId: string, agentId: string): Promise<number> {
     const sql = this.#deps.ctx.storage.sql;
@@ -4514,7 +4523,7 @@ export class AgentRuntime {
           await this.cancelSession(tenantId, agentId, s.id);
         } catch (e) { console.error(`cancelling ${tenantId}/${agentId}'s subagent ${s.id} at its ceiling failed; the next pass tries again:`, e); }
         if (!this.#isPd()) markSession(sql, s.id, false);
-        end = { outcome: "cancelled", text: `it ran longer than ${Math.round(SUBAGENT_MAX_MS / 60_000)} minutes` };
+        end = { outcome: "cancelled", text: `it ran longer than ${Math.round(SUBAGENT_MAX_MS / 60_000)} minutes`, cause: "ceiling" };
       } else {
         try { end = this.#subagentTurnEnd(s, owner); }
         catch (e) { console.error(`reading the end of ${tenantId}/${agentId}'s subagent ${s.id} failed:`, e); continue; }
@@ -4523,8 +4532,9 @@ export class AgentRuntime {
       // Its turn is over: the harness built for it is not kept in this isolate (a follow-up builds another).
       this.#evictAgent(tenantId, agentId, s.id);
       try {
-        // The report's length, not its text: what a reader may count without reading what the child said.
-        appendTrace(sql, [subagentTurnRow(owner, s, end.outcome, now, { reportChars: reportMessage(s, end, now).length })]);
+        // The report body's length, not its text, and not the head the harness wraps it in: what a reader may count
+        // without reading what the child said. A cancel says why (`TurnEnd.cause`), which Raft's outcome is read from.
+        appendTrace(sql, [subagentTurnRow(owner, s, end.outcome, now, { reportChars: reportBodyChars(end), ...(end.cause ? { cause: end.cause } : {}) })]);
       } catch (e) { console.error(`the subagent.turn row of ${tenantId}/${agentId} could not be written:`, e); }
     }
     // Every report owed to one conversation in this pass goes as one message, so the parent runs once for all of them;
@@ -4547,9 +4557,13 @@ export class AgentRuntime {
       try {
         if (fresh.length) {
           for (const s of fresh) await this.#deps.subagentFault?.("report-posting", s.id);
-          const text = fresh.length === 1 ? fresh[0]!.report ?? ""
-            : `[${fresh.length} subagent reports, each below with its own head; notices from the harness, not messages from the user.]\n\n` +
-              fresh.map((s) => s.report ?? "").join("\n\n---\n\n");
+          // Children a kill switch stopped (`switchOffSubagents`, the only rows owing a report with outcome `stopped`)
+          // share one notice; every other report keeps its own block.
+          const off = fresh.filter((s) => s.outcome === "stopped");
+          const blocks = [...fresh.filter((s) => s.outcome !== "stopped").map((s) => s.report ?? ""), ...(off.length ? [switchedOffNotice(off)] : [])];
+          const text = blocks.length === 1 ? blocks[0]!
+            : `[${blocks.length} subagent reports, each below with its own head; notices from the harness, not messages from the user.]\n\n` +
+              blocks.join("\n\n---\n\n");
           // Checked again at the last synchronous point before the write (`postMessage`'s `unless`): the post awaits the
           // catalogue and the tool lists first, and a stop, or a stop and the person's next message, can land meanwhile.
           const posted = await this.#postOnce(tenantId, agentId, parent, text, reportKey(fresh[0]!), "postMessage", () => !stillOwed(),
@@ -4736,6 +4750,34 @@ export class AgentRuntime {
       catch (e) { console.error(`the subagent.turn rows of ${tenantId}/${agentId}'s stop could not be written:`, e); }
     }
     return { ids: r.ids, stopped: r.stopped.map((x) => x.id) };
+  }
+
+  /**
+   * A kill switch turned off stops the children already running, not only new ones: each is marked stopped and owing its
+   * parent one notice (`switchOffSubagents`), its end written, and its run cancelled. The parent's own turn is left as it
+   * is; the notice is posted by `#reportSubagents`, one message a parent. Asked at the start of every pass (the
+   * deployment's switch, read by the pass after it is set: `SUBAGENT_SWITCH_CHECK_MS`) and when the agent's setting is
+   * written. A cancel that fails leaves the run to the stray sweep (`#cancelStraySubagents`), as its row no longer
+   * runs. Returns the children it stopped.
+   */
+  async #switchOffSubagents(tenantId: string, agentId: string): Promise<string[]> {
+    const sql = this.#deps.ctx.storage.sql;
+    const owner = { tenantId, agentId };
+    if (!hasSubagentTable(sql) || runningSubagents(sql, owner).length === 0) return [];
+    if (await this.#subagentsOn(tenantId, agentId)) return [];
+    const now = Date.now();
+    const off = switchOffSubagents(sql, owner, now);
+    if (!off.length) return [];
+    try { appendTrace(sql, off.map((s) => subagentTurnRow(owner, s, "stopped", now, { reportChars: 0, cause: "switched_off" }))); }
+    catch (e) { console.error(`the subagent.turn rows of ${tenantId}/${agentId}'s switch-off could not be written:`, e); }
+    for (const s of off) {
+      try { await this.cancelSession(tenantId, agentId, s.id); }
+      catch (e) { console.error(`cancelling ${tenantId}/${agentId}'s subagent ${s.id} at the switch-off failed; the stray sweep tries again:`, e); }
+      if (!this.#isPd()) markSession(sql, s.id, false);
+      this.#evictAgent(tenantId, agentId, s.id);
+    }
+    logEvent("subagent.switched_off", { tenantId, agentId, stopped: off.length, disabledEverywhere: this.#deps.subagentsDisabled === true });
+    return off.map((s) => s.id);
   }
 
   /**
@@ -4960,8 +5002,12 @@ export class AgentRuntime {
     if (!record) return { ok: false as const, status: 404, error: "no such agent" };
     if (agentDeletedAt(this.#deps.ctx.storage.sql) !== null) return { ok: false as const, status: 404, error: "the agent was deleted" };
     const r = updateAgentSettings(this.#deps.ctx.storage.sql, patch, who, Date.now(), this.#settingDefaults(tenantId, record.config));
-    return r.ok ? { ...r, settings: this.#settingsNow(tenantId, record.config), disabledEverywhere: this.#deps.subagentsDisabled === true, about: AGENT_SETTING_ABOUT }
-      : { ok: false as const, status: 400, error: r.error };
+    if (!r.ok) return { ok: false as const, status: 400, error: r.error };
+    // Switched off: the children running stop now, at the write; their notice goes on the next pass, which the
+    // object asks for at once (cf/src/index.ts `adminUpdateAgentSettings`).
+    const stopped = await this.#switchOffSubagents(tenantId, agentId);
+    return { ...r, settings: this.#settingsNow(tenantId, record.config), disabledEverywhere: this.#deps.subagentsDisabled === true, about: AGENT_SETTING_ABOUT,
+      ...(stopped.length ? { stoppedSubagents: stopped.length } : {}) };
   }
 
   /**
@@ -4983,6 +5029,8 @@ export class AgentRuntime {
       if (busy) await this.stopTurn(tenantId, agentId, "delete");
       return { open: 0, wakeInMs: null, settled: [] as Array<{ operationId: string; status: string }>, releaseFailed: [] as Array<{ alias: string; error: string }> };
     }
+    // A kill switch set since the last pass ends the children still running before anything drives them.
+    await this.#switchOffSubagents(tenantId, agentId);
     // Background work first (task #16). A job that ended is delivered as a
     // message, which marks its session as having work, so the loop below steps
     // it in this same pass; the rest say when they want checking again.
@@ -5023,7 +5071,9 @@ export class AgentRuntime {
           if (gate === "start" && releaseUnstartedTurn(sql, owner, session, Date.now())) {
             const row = subagentOf(sql, owner, session);
             if (row) {
-              try { appendTrace(sql, [subagentTurnRow(owner, row, "failed", Date.now(), { why: "its background completion could not be delivered", error: String((e as Error)?.message ?? e).slice(0, 160) })]); }
+              // `wake_failed`, not a turn's end: the turn never started (no `subagent.start` was written), so Raft is given
+              // no SubagentStop for it (src/runtime/activity.ts); the row stays the trace's record of the attempt.
+              try { appendTrace(sql, [subagentTurnRow(owner, row, "wake_failed", Date.now(), { why: "its background completion could not be delivered", error: String((e as Error)?.message ?? e).slice(0, 160) })]); }
               catch (t) { console.error(`the subagent.turn row of ${tenantId}/${agentId} could not be written:`, t); }
             }
           }
@@ -5100,8 +5150,12 @@ export class AgentRuntime {
     const retry = reportRetryMs(sql, { tenantId, agentId }, Date.now());
     if (retry !== null) wakeInMs = wakeInMs === null ? retry : Math.min(wakeInMs, retry);
     // A running subagent past its ceiling is cancelled by a pass; the pass comes back for the ceiling's moment.
+    // And at least every `SUBAGENT_SWITCH_CHECK_MS`, so a kill switch set meanwhile is read by a pass.
     const ceiling = subagentCeilingMs(sql, { tenantId, agentId }, Date.now());
-    if (ceiling !== null) wakeInMs = wakeInMs === null ? ceiling : Math.min(wakeInMs, ceiling);
+    if (ceiling !== null) {
+      const check = Math.min(ceiling, SUBAGENT_SWITCH_CHECK_MS);
+      wakeInMs = wakeInMs === null ? check : Math.min(wakeInMs, check);
+    }
     // A finished run should not still be holding a metered container — either
     // by handing it back at once, or, where the deployment leases them, by
     // asking the agent first and taking it at the ceiling.

@@ -157,8 +157,11 @@ function hookEvents(agentId: string, rows: readonly TraceOutboxRow[], subagents?
  *                                       SubagentStart { phase: "started" }
  *   subagent.start (wake)             → SubagentStart { phase: "started" }
  *   a child's tool.call               → PreToolUse + PostToolUse / PostToolUseFailure { phase: "active" }
- *   subagent.turn done|failed|stopped|cancelled → SubagentStop { phase: "ended", outcome (cancelled is `ceiling`), reportChars }
- *   a child's model.call, js.run, a report's retry or drop → nothing (never a Stop, never a prompt)
+ *   subagent.turn done|failed|stopped|cancelled → SubagentStop { phase: "ended", outcome, reportChars }: a cancel is
+ *                                       `ceiling` only when its row's `cause` says the harness took it at its time or
+ *                                       lifetime; any other cancel is `stopped`
+ *   a child's model.call, js.run, a report's retry or drop, a wake that was never posted → nothing (never a Stop,
+ *                                       never a prompt)
  */
 function subagentEvents(agentId: string, row: TraceOutboxRow, subagents: SubagentActivity): ActivityEvent[] {
   const base = { eventId: activityEventId(agentId, row.seq), occurredAt: new Date(row.at).toISOString() };
@@ -175,7 +178,7 @@ function subagentEvents(agentId: string, row: TraceOutboxRow, subagents: Subagen
   }
   if (row.kind === "subagent.turn") {
     const outcome = row.status === "done" || row.status === "failed" || row.status === "stopped" ? row.status
-      : row.status === "cancelled" ? "ceiling" : null;
+      : row.status === "cancelled" ? (row.attrs.cause === "ceiling" ? "ceiling" : "stopped") : null;
     if (!outcome) return [];
     const chars = typeof row.attrs.reportChars === "number" ? row.attrs.reportChars : 0;
     // Inside the marker, where Raft reads them: its ingest keeps the marker and drops unknown top-level fields.
