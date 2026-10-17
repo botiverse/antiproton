@@ -92,8 +92,45 @@ export function tenantFor(who: ProviderTokenIdentity, raftServerId: string | nul
   if (!raftServerId || !RAFT_ID.test(raftServerId)) {
     return { status: 422, code: "missing", message: "a platform token needs the Raft server: raftServerId in the body, or ?raftServerId= on the URL", param: "raftServerId" };
   }
-  return `raft_${raftServerId.replace(/[^A-Za-z0-9._-]/g, "_")}`.slice(0, 64);
+  return derivedTenant(raftServerId);
 }
+
+/**
+ * A server id as the tenant it names: `raft_<id>` where the id needs no help, and `raft_<readable>_<digest>`
+ * where it does.
+ *
+ * The tenant is a per-server namespace — `provisioned_agents` is keyed on `(tenant_id, raft_agent_id)`, and
+ * the routes reach a row by the tenant the request's server derives — so two servers that derive one tenant
+ * share agents, quota and billing. Two spellings used to collide:
+ *
+ *  - ``:`` is legal in a Raft id (`RAFT_ID`) and not in an object name, and the substitution that made it legal
+ *    sent `srv:prod` and `srv_prod` to one tenant;
+ *  - `raft_` plus a 64-character id is 69 characters, and cutting it to an object name's 64 kept only the id's
+ *    first 59, so every server with those 59 in common derived one tenant.
+ *
+ * So a substitution or a cut is never the whole name: an id that needs one carries a digest of its exact
+ * spelling, which is what makes the tenant that server's alone. The readable part is for whoever reads a log or
+ * a D1 row. An id that is already safe is spelled exactly as before, so rows written earlier read back
+ * unchanged. (`providerAgentId` below has the same two spellings, and a clash there is refused as
+ * `agent_id_taken` at create; here a clash is silent cross-tenant addressing, which is why only this one
+ * changes.)
+ */
+export function derivedTenant(raftServerId: string): string {
+  if (TENANT_SAFE.test(raftServerId) && !DIGEST_TAIL.test(raftServerId)) return `raft_${raftServerId}`;
+  // 5 + 46 + 1 + 12 = an object name's 64. The digest is of the id as sent, before any substitution.
+  const readable = raftServerId.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 46);
+  return `raft_${readable}_${sha256Sync(raftServerId).slice(0, 12)}`;
+}
+
+/** A server id a tenant can be named after as it is: `raft_` and an object name's 64 characters leave 59. */
+const TENANT_SAFE = /^[A-Za-z0-9._-]{1,59}$/;
+
+/**
+ * How a derived-with-digest name ends. Such an id takes the digest branch, so the two shapes stay apart: a
+ * plain `raft_<id>` never reads as another server's `raft_<readable>_<digest>`, whichever ids the two servers
+ * were given.
+ */
+const DIGEST_TAIL = /_[0-9a-f]{12}$/;
 
 /**
  * The model routes' sources (`/provision/models`, `…/model`): the deployment's options (USER_MODELS), its default

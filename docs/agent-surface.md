@@ -182,7 +182,12 @@ read of the tenant as a whole:
 - **Tenant.** A tenant-scoped token is its tenant. A platform-scoped token needs `?raftServerId=` on
   every one of these requests, beside the read's own parameters; without it the answer is `422` with
   `param: "raftServerId"`. The agent is looked up in the tenant that server names, so an agent of
-  another server is `404`.
+  another server is `404`. The tenant is `raft_<raftServerId>` when that is a legal tenant id as it
+  stands (letters, digits, `.`, `_`, `-`, at most 59 — `raft_`, a tenant id and an object name's 64
+  characters leave 59), and `raft_<the id made legal>_<12 hex of its sha256>` when it is not, so two
+  server ids that spell alike (`srv:prod` and `srv_prod`) or share their first 59 characters name two
+  tenants and never one. (An id already ending in `_` and twelve hex digits takes the second form as
+  well, so a plain name can never be read as another server's digested one.)
 - **Which agents.** Only a provisioned agent of the token's tenant that has not been deleted. Another
   tenant's agent, a deleted agent, and an id that never existed are all `404`, `code: "not_found"`.
 - **Bodies.** Identical to the public API's, except that the usage answer names the agent as
