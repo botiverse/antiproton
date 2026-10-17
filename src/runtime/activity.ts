@@ -48,14 +48,23 @@ export function activityEventId(agentId: string, seq: number): string {
  * The events a run of trace rows means, with the agent's status changes on them: each change goes on
  * the activity event of the same instant when there is one, otherwise it is a status-only event.
  */
-export function activityEvents(agentId: string, rows: readonly TraceOutboxRow[]): ActivityEvent[] {
-  const events = hookEvents(agentId, rows);
+/**
+ * What maps a subagent's rows to events (`activityEvents`), present only where the deployment turns it on
+ * (SUBAGENT_ACTIVITY=1, cf/src/index.ts): `lineage` answers the parent's `send_to_agent` call id for a child session.
+ * Absent — the default — a child's rows make no event at all, as before: Raft's ingest strips fields it does not know,
+ * so a child's tool call sent with its marker stripped would read as the agent's own.
+ */
+export interface SubagentActivity { lineage(session: string): string | null }
+
+export function activityEvents(agentId: string, rows: readonly TraceOutboxRow[], subagents?: SubagentActivity): ActivityEvent[] {
+  const events = hookEvents(agentId, rows, subagents);
   // The status after an instant is the last change at that instant; earlier ones at the same instant
   // were superseded before anyone could see them.
   const after = new Map<string, ReturnType<typeof statusEvents>[number]>();
   for (const s of statusEvents(agentId, rows)) after.set(s.occurredAt, s);
   const hosts = new Map<string, ActivityEvent>();
-  for (const e of events) hosts.set(e.occurredAt, e);   // the last activity event at an instant carries it
+  // The last of the agent's own events at an instant carries it; never a subagent's, which is not the agent's state.
+  for (const e of events) if (!e.subagent) hosts.set(e.occurredAt, e);
   for (const [instant, s] of after) {
     const host = hosts.get(instant);
     if (host) {
@@ -90,11 +99,15 @@ export function orderStatuses(events: readonly ActivityEvent[], after: number): 
 }
 
 /** The activity events a run of trace rows means, in row order; rows that mean nothing to the service yield none. */
-function hookEvents(agentId: string, rows: readonly TraceOutboxRow[]): ActivityEvent[] {
+function hookEvents(agentId: string, rows: readonly TraceOutboxRow[], subagents?: SubagentActivity): ActivityEvent[] {
   const out: ActivityEvent[] = [];
   for (const row of rows) {
-    // A subagent's model calls and tools are its own, not the agent's (`subagentRow`, src/runtime/status.ts).
-    if (subagentRow(row)) continue;
+    // A subagent's model calls and tools are its own, not the agent's (`subagentRow`, src/runtime/status.ts): no event,
+    // unless the deployment maps them (`subagentEvents`), and even then never a Stop or a prompt.
+    if (subagentRow(row) || row.kind === "subagent.start" || row.kind === "subagent.turn") {
+      if (subagents) out.push(...subagentEvents(agentId, row, subagents));
+      continue;
+    }
     const base = { eventId: activityEventId(agentId, row.seq), occurredAt: new Date(row.at).toISOString() };
     switch (row.kind) {
       case "inbound":
@@ -136,6 +149,57 @@ function hookEvents(agentId: string, rows: readonly TraceOutboxRow[]): ActivityE
   }
   return out;
 }
+
+/**
+ * A subagent's rows as Raft's subagent events (`SubagentLineage`): its start, its tool calls, its end. Ids and enums only.
+ *
+ *   subagent.start (spawn, follow_up) → the parent's own PreToolUse + PostToolUse for send_to_agent (no marker), then
+ *                                       SubagentStart { phase: "started" }
+ *   subagent.start (wake)             → SubagentStart { phase: "started" }
+ *   a child's tool.call               → PreToolUse + PostToolUse / PostToolUseFailure { phase: "active" }
+ *   subagent.turn done|failed|stopped|cancelled → SubagentStop { phase: "ended" }, `outcome` (cancelled is `ceiling`), `reportChars`
+ *   a child's model.call, js.run, a report's retry or drop → nothing (never a Stop, never a prompt)
+ */
+function subagentEvents(agentId: string, row: TraceOutboxRow, subagents: SubagentActivity): ActivityEvent[] {
+  const base = { eventId: activityEventId(agentId, row.seq), occurredAt: new Date(row.at).toISOString() };
+  const lineage = (taskId: string, parent: string | null | undefined, phase: "started" | "active" | "ended") =>
+    ({ ...(parent ? { parentToolUseId: parent } : {}), taskId, phase });
+  if (row.kind === "subagent.start") {
+    const taskId = row.spanId;
+    const parent = row.parentId ?? subagents.lineage(taskId);
+    const own = row.status !== "wake" && row.parentId
+      ? [{ eventId: `${base.eventId}:pre`, occurredAt: base.occurredAt, hookEventName: "PreToolUse" as const, toolName: SEND_TOOL },
+         { ...base, eventId: `${base.eventId}:post`, hookEventName: "PostToolUse" as const, toolName: SEND_TOOL }]
+      : [];
+    return [...own, { ...base, hookEventName: "SubagentStart", subagent: lineage(taskId, parent, "started") }];
+  }
+  if (row.kind === "subagent.turn") {
+    const outcome = row.status === "done" || row.status === "failed" || row.status === "stopped" ? row.status
+      : row.status === "cancelled" ? "ceiling" : null;
+    if (!outcome) return [];
+    const chars = typeof row.attrs.reportChars === "number" ? row.attrs.reportChars : 0;
+    return [{ ...base, hookEventName: "SubagentStop", subagent: lineage(row.spanId, row.parentId ?? subagents.lineage(row.spanId), "ended"),
+      outcome, reportChars: chars }];
+  }
+  if (row.kind === "tool.call" && typeof row.attrs.task === "string") {
+    const taskId = row.attrs.task;
+    const tool = typeof row.attrs.tool === "string" ? row.attrs.tool : "tool";
+    const mount = typeof row.attrs.mount === "string" ? row.attrs.mount : null;
+    const toolName = mount ? `${mount}__${tool}` : tool;
+    const ok = row.verdict === "ok";
+    const ms = typeof row.ms === "number" ? row.ms : 0;
+    const marker = lineage(taskId, subagents.lineage(taskId), "active");
+    return [
+      { eventId: `${base.eventId}:pre`, occurredAt: new Date(row.at - ms).toISOString(), hookEventName: "PreToolUse", toolName, subagent: marker },
+      { ...base, hookEventName: ok ? "PostToolUse" : "PostToolUseFailure", toolName, subagent: marker,
+        ...(typeof row.ms === "number" ? { durationMs: row.ms } : {}), ...(ok ? {} : { errorClass: row.status }) },
+    ];
+  }
+  return [];
+}
+
+/** The parent's tool, as the model names it. */
+const SEND_TOOL = "send_to_agent";
 
 /**
  * What the service shows for a conversation the overflow backstop gave up on (src/runtime/overflow-backstop.ts): the

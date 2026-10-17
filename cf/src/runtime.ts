@@ -69,7 +69,7 @@ import {
   SUBAGENT_TOOL, childMayCall, childRefusal, childWithheld, taskMessage, turnEnd, type Subagent, type TurnEnd,
   markReported, reportingSubagents, reportKey, subagentIdFor, taskKey, turnKeyOf,
   reportFailed, reportRetryMs, subagentSpent, subagentTurnRow, noteSubagentModel, combinedRequestId, undeliveredKey, undeliveredNotice,
-  archivableSubagents, markArchived, releaseUnstartedTurn, SUBAGENT_ARCHIVE_PER_PASS, SUBAGENT_RETENTION_MS,
+  archivableSubagents, markArchived, releaseUnstartedTurn, SUBAGENT_ARCHIVE_PER_PASS, SUBAGENT_RETENTION_MS, subagentStartRow,
 } from "../../src/runtime/subagents.ts";
 import { subagentModelChoice } from "./model-request.ts";
 import type { ModelLayers } from "./control-plane.ts";
@@ -804,6 +804,13 @@ export interface RuntimeDeps {
    * crash; a promise that never settles is an isolate that died there.
    */
   subagentFault?: (phase: "task-posting" | "task-posted" | "report-decided" | "report-posting" | "report-written" | "report-posted" | "ceiling-cancel" | "wake-posting", subagent: string) => void | Promise<void>;
+  /**
+   * Whether an agent with no `subagents` setting of its own is offered `send_to_agent`: on for the hosted agents
+   * (cf/src/index.ts), absent — off — for the bench and for a runtime built without saying. A stored setting wins.
+   */
+  subagentsDefault?: boolean;
+  /** The deployment's kill switch (SUBAGENTS_DISABLED=1, `subagentsDisabledBy`): no agent is offered `send_to_agent`. */
+  subagentsDisabled?: boolean;
   /** How long a finished child's transcript is kept (`SUBAGENT_RETENTION_MS` when unset). A test's knob. */
   subagentRetentionMs?: number;
   /**
@@ -3051,7 +3058,7 @@ export class AgentRuntime {
       personaOf((await this.store.loadAgent(tenantId, agentId))?.config), await this.store.getModelBinding(tenantId, agentId));
     // The agent's settings decide a tool (`send_to_agent`), so a harness built before one moved offers the wrong list.
     // Appended only when one is on, so an agent with none keeps the key it had.
-    const settings = agentSettings(this.#deps.ctx.storage.sql);
+    const settings = this.#settingsNow();
     return Object.values(settings).some(Boolean) ? `${key}|${JSON.stringify(settings)}` : key;
   }
 
@@ -3202,7 +3209,7 @@ export class AgentRuntime {
       // Not a child's: `jobs` cancels the agent's background work, and a subagent starts none (it cannot write).
       ...(extras.jobs && !child ? [jobs] : []),
       // Only where the agent's setting is on, and never in a child (above). Its body is this object's (`#sendToAgent`).
-      ...(!child && agentSettings(this.#deps.ctx.storage.sql).subagents
+      ...(!child && this.#settingsNow().subagents
         ? [subagentTool({
             models: (this.#deps.userModels?.offered ?? []).map((o) => ({ id: o.id, label: o.label })),
             send: (p, callId, invocation) => this.#sendToAgent(tenantId, agentId, session, p, callId, invocation),
@@ -4395,6 +4402,8 @@ export class AgentRuntime {
       setSubagentTurnOp(sql, owner, id, op);
       if (!this.#isPd()) markSession(sql, id, true);
       logEvent("subagent.start", { tenantId, agentId, subagent: id, parentSession, callId, followUp, model: s.modelOption });
+      try { appendTrace(sql, [subagentStartRow(owner, s, followUp ? "follow_up" : "spawn", callId, Date.now())]); }
+      catch (e) { console.error(`the subagent.start row of ${tenantId}/${agentId} could not be written:`, e); }
     }
     await this.#deps.subagentFault?.("task-posted", id);
     return subagentStarted({ id, followUp, model: s.modelOption });
@@ -4493,7 +4502,8 @@ export class AgentRuntime {
       // Its turn is over: the harness built for it is not kept in this isolate (a follow-up builds another).
       this.#evictAgent(tenantId, agentId, s.id);
       try {
-        appendTrace(sql, [subagentTurnRow(owner, s, end.outcome, now)]);
+        // The report's length, not its text: what a reader may count without reading what the child said.
+        appendTrace(sql, [subagentTurnRow(owner, s, end.outcome, now, { reportChars: reportMessage(s, end, now).length })]);
       } catch (e) { console.error(`the subagent.turn row of ${tenantId}/${agentId} could not be written:`, e); }
     }
     // Every report owed to one conversation in this pass goes as one message, so the parent runs once for all of them;
@@ -4685,7 +4695,7 @@ export class AgentRuntime {
     const now = Date.now();
     const r = stopRunningSubagents(sql, owner, now, parentSession);
     if (r.stopped.length) {
-      try { appendTrace(sql, r.stopped.map((s) => subagentTurnRow(owner, s, "stopped", now))); }
+      try { appendTrace(sql, r.stopped.map((s) => subagentTurnRow(owner, s, "stopped", now, { reportChars: 0 }))); }
       catch (e) { console.error(`the subagent.turn rows of ${tenantId}/${agentId}'s stop could not be written:`, e); }
     }
     return { ids: r.ids, stopped: r.stopped.map((x) => x.id) };
@@ -4860,6 +4870,20 @@ export class AgentRuntime {
     return isSubagentSession(real) ? subagentOf(sql, { tenantId, agentId }, real) : null;
   }
 
+  /** What a setting is where the agent stored none: this runtime's (`subagentsDefault`). */
+  #settingDefaults() {
+    return { subagents: this.#deps.subagentsDefault === true };
+  }
+
+  /**
+   * The settings in force: the stored value, else this runtime's default, under the deployment's kill switch
+   * (`subagentsDisabled`, SUBAGENTS_DISABLED), which turns subagents off whatever is stored.
+   */
+  #settingsNow() {
+    const s = agentSettings(this.#deps.ctx.storage.sql, this.#settingDefaults());
+    return this.#deps.subagentsDisabled ? { ...s, subagents: false } : s;
+  }
+
   /** The agent's settings as in force, and its subagents, newest first (`/admin/agent-settings`). */
   async agentSettingsOf(tenantId: string, agentId: string) {
     await this.ready();
@@ -4867,7 +4891,10 @@ export class AgentRuntime {
     const sql = this.#deps.ctx.storage.sql;
     // A deleted agent has no settings to read: its delete stopped every subagent (`stopTurn`), and the rows stay only as a record.
     if (agentDeletedAt(sql) !== null) return null;
-    return { settings: agentSettings(sql), about: AGENT_SETTING_ABOUT, subagents: listSubagents(sql, { tenantId, agentId }) };
+    return {
+      settings: this.#settingsNow(), stored: agentSettings(sql, this.#settingDefaults()), defaults: this.#settingDefaults(),
+      disabledEverywhere: this.#deps.subagentsDisabled === true, about: AGENT_SETTING_ABOUT, subagents: listSubagents(sql, { tenantId, agentId }),
+    };
   }
 
   /**
@@ -4878,8 +4905,9 @@ export class AgentRuntime {
     await this.ready();
     if (!(await this.store.loadAgent(tenantId, agentId))) return { ok: false as const, status: 404, error: "no such agent" };
     if (agentDeletedAt(this.#deps.ctx.storage.sql) !== null) return { ok: false as const, status: 404, error: "the agent was deleted" };
-    const r = updateAgentSettings(this.#deps.ctx.storage.sql, patch, who, Date.now());
-    return r.ok ? { ...r, about: AGENT_SETTING_ABOUT } : { ok: false as const, status: 400, error: r.error };
+    const r = updateAgentSettings(this.#deps.ctx.storage.sql, patch, who, Date.now(), this.#settingDefaults());
+    return r.ok ? { ...r, settings: this.#settingsNow(), disabledEverywhere: this.#deps.subagentsDisabled === true, about: AGENT_SETTING_ABOUT }
+      : { ok: false as const, status: 400, error: r.error };
   }
 
   /**
@@ -4948,7 +4976,14 @@ export class AgentRuntime {
           console.error(`delivering a background completion to ${tenantId}/${agentId}'s subagent ${session} failed:`, e);
           return;
         }
-        if (gate === "start") this.#subagentWoken(tenantId, agentId, session, posted?.result);
+        if (gate === "start") {
+          this.#subagentWoken(tenantId, agentId, session, posted?.result);
+          const row = subagentOf(sql, owner, session);
+          if (row) {
+            try { appendTrace(sql, [subagentStartRow(owner, row, "wake", null, Date.now())]); }
+            catch (e) { console.error(`the subagent.start row of ${tenantId}/${agentId} could not be written:`, e); }
+          }
+        }
         return;
       }
       await this.postMessage(tenantId, agentId, text, "prompt", session).catch((e) => refusedForReset(e, tenantId, agentId, "background completion"));

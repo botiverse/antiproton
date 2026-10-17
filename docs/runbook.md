@@ -117,22 +117,44 @@ row to the agent's trace.
 
 ## Subagents
 
-An agent can delegate work to subagents (docs/agent-surface.md, "Subagents") only where its `subagents` setting is on.
-It is off for every agent unless set. Subagents can read and research but cannot change anything or act as this agent: no writes, no messages, no shell. Give them reading tasks and do the changes yourself. Turn it on for one agent:
+Every hosted agent can delegate work to subagents (docs/agent-surface.md, "Subagents"), its Agents API sessions
+included. Subagents can read and research but cannot change anything or act as this agent: no writes, no messages, no
+shell. Give them reading tasks and do the changes yourself. Bench agents have them only where their setting turns them on.
+
+**Kill switches.** For one agent, turn its setting off:
 
 ```
 curl -s -X PATCH -H "x-harness-token: $AUTOMATION_TOKEN" -H "content-type: application/json" \
-  "$HOST/admin/agent-settings" -d '{"tenantId":"<tenantId>","agentId":"<agentId>","settings":{"subagents":true}}'
+  "$HOST/admin/agent-settings" -d '{"tenantId":"<tenantId>","agentId":"<agentId>","settings":{"subagents":false}}'
 ```
 
-The answer is the settings in force, what moved, and what each setting does: `{"settings":{"subagents":true},
-"changed":["subagents"],"about":{"subagents":"…"}}`. The
-agent's next turn is offered `send_to_agent`; a turn already running keeps the tools it started with. Off again is the
-same call with `false`. **Turning it off does not stop subagents already running**: they finish and report. To stop
+For every agent of the deployment at once, set the Worker var `SUBAGENTS_DISABLED` to `1` (a var, not a code change:
+`wrangler deploy --var SUBAGENTS_DISABLED:1`, or the dashboard's variables); unset it to undo. The var beats any agent's
+setting. The answer is the settings in force, what moved, and what each setting does: `{"settings":{"subagents":false},
+"changed":["subagents"],"disabledEverywhere":false,"about":{"subagents":"…"}}`; the GET also says `stored` and
+`defaults`. The agent's next turn is or is not offered `send_to_agent`; a turn already running keeps the tools it started
+with. On again is the same call with `true`. **Turning it off does not stop subagents already running**: they finish and report. To stop
 them, stop the agent's turn with `/admin/cancel-turn` ([Stopping a runaway agent](#stopping-a-runaway-agent)), which
 stops every subagent with it. An unknown setting or a value that is not a
 boolean is `400` and nothing is written; an agent that is not there is `404`. Each change is an `agent.settings` line in
 the Workers logs.
+
+**Measuring a trial.** `cf/scripts/subagent-trial.mjs` reads an agent's trace export from R2 and prints, per UTC day and
+in total, the model calls and tokens of its own conversations and of its subagents, the main conversation's input
+tokens per call (median and p90: its context's growth), rebuilds that ran, delegations (spawns, follow-ups, wakes),
+child turns by outcome, and report sizes. Read-only; needs `CF_API_TOKEN` (R2 read) and `R2_ACCOUNT_ID`, as
+`~/.secrets/antiproton.env` has them:
+
+```
+node cf/scripts/subagent-trial.mjs [--preview] --tenant <tenantId> --agent <agentId> --from 2026-10-20 --to 2026-10-27 [--json]
+```
+
+Rows still in the agent's outbox (the last pass's) are not exported yet. `--file rows.ndjson` reads rows saved
+elsewhere (the preview trace route's page works too). Compare a window before the agent had subagents with one after.
+
+**Raft activity.** A subagent's work reaches Raft's activity log only where the Worker var `SUBAGENT_ACTIVITY` is `1`
+(docs/agent-surface.md, "Subagents", Raft). Leave it unset until Raft's ingest accepts the subagent fields: it strips
+fields it does not know, and a child's step would then read as the agent's own.
 
 To see an agent's subagents and the setting:
 

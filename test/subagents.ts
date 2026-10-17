@@ -18,7 +18,9 @@ import { pendingTrace } from "../src/trace/outbox.ts";
 import { activityEvents } from "../src/runtime/activity.ts";
 import { statusEvents } from "../src/runtime/status.ts";
 import { SUBAGENT_CAP, SUBAGENT_TOOL, admitSubagent, turnEnd } from "../src/runtime/subagents.ts";
-import { updateAgentSettings, agentSettings } from "../src/runtime/agent-settings.ts";
+import { updateAgentSettings, agentSettings, subagentsDisabledBy } from "../src/runtime/agent-settings.ts";
+import { subagentActivityFor } from "../cf/src/activity-raft.ts";
+import { DELEGATE_GUIDANCE, subagentTool } from "../src/runtime/subagents.ts";
 import { recordBackgroundJob } from "../src/runtime/background-jobs.ts";
 import type { Plugin } from "../src/plugins/types.ts";
 import { raftPlugin } from "../src/plugins/raft.ts";
@@ -85,7 +87,7 @@ const USER_MODELS = { offered: [{ id: "cheap", label: "Cheap", provider: "deepse
 
 /** One agent on an AgentRuntime over node:sqlite, its object recording `engine`, its `subagents` setting as given. */
 type Rules = { layers: { agent: any; tenant: any; deployment: any; owner: string | null }; pickerOff: boolean };
-async function world(engine: "pi085" | "pd", opts: { on?: boolean; builder?: boolean; chatter?: boolean; sandbox?: boolean; rulesTtlMs?: number; slowBuilder?: number; retentionMs?: number } = {}) {
+async function world(engine: "pi085" | "pd", opts: { on?: boolean; builder?: boolean; chatter?: boolean; sandbox?: boolean; rulesTtlMs?: number; slowBuilder?: number; retentionMs?: number; defaultOn?: boolean; disabled?: boolean } = {}) {
   const rules: { now: Rules | null; reads: number; fail: boolean } = { now: null, reads: 0, fail: false };
   const raw = sqliteHost();
   if (engine === "pd") {
@@ -118,6 +120,8 @@ async function world(engine: "pi085" | "pd", opts: { on?: boolean; builder?: boo
     },
     subagentRulesTtlMs: opts.rulesTtlMs ?? 0,
     ...(opts.retentionMs !== undefined ? { subagentRetentionMs: opts.retentionMs } : {}),
+    ...(opts.defaultOn ? { subagentsDefault: true } : {}),
+    ...(opts.disabled ? { subagentsDisabled: true } : {}),
     ...(opts.sandbox ? { loader: standIn.loader, makeToolBinding: standIn.makeToolBinding } : {}),
     ctx: { storage: { sql: raw.sql, transactionSync: raw.transactionSync } },
     bucket: {} as never, bucketName: "b", models: { resolve: () => null },
@@ -143,7 +147,10 @@ async function world(engine: "pi085" | "pd", opts: { on?: boolean; builder?: boo
     must((await w.rt.addMount("t", "a", { alias, plugin: id, config: {} })).ok, `the ${id} mount was refused`);
   }
   await w.rt.bindOperatorModel("t", "a");
-  if (opts.on !== false) must(updateAgentSettings(raw.sql as never, { subagents: true }, "test").ok, "setting refused");
+  // `on`: true stores the setting (the default for these cases), false stores the per-agent kill switch, and with
+  // `defaultOn` nothing is stored, so the runtime's default decides.
+  if (!opts.defaultOn && opts.on !== false) must(updateAgentSettings(raw.sql as never, { subagents: true }, "test").ok, "setting refused");
+  if (opts.defaultOn && opts.on === false) must(updateAgentSettings(raw.sql as never, { subagents: false }, "test").ok, "setting refused");
   return w;
 }
 type World = Awaited<ReturnType<typeof world>>;
@@ -1141,6 +1148,86 @@ for (const engine of (process.env.ENGINES ?? "pi085,pd").split(",").filter((e) =
     must(rowsOf(w)[0]!.turns === SUBAGENT_MAX_TURNS, show(rowsOf(w)[0]));
   });
 
+  await check(`${engine}: on by default for a hosted agent and its Agents API sessions; a stored false turns it off; the deployment's kill switch beats a stored true`, async () => {
+    const offered = async (w: World, session = "main") => (await (await w.rt.agent("t", "a", session)).tools()).some((t) => t.name === SUBAGENT_TOOL);
+    const on = await world(engine, { defaultOn: true });
+    must(await offered(on) && await offered(on, "sess_api") && !await offered(on, "sub_0000000000000000"), "not on by default (or a child got it)");
+    must((await on.rt.agentSettingsOf("t", "a"))!.settings.subagents === true, "the admin read does not say on");
+    const killed = await world(engine, { defaultOn: true, on: false });
+    must(!await offered(killed), "a stored false did not turn it off");
+    const everywhere = await world(engine, { disabled: true });
+    must(agentSettings(everywhere.raw.sql as never).subagents === true, "control: this agent's own setting is on");
+    must(!await offered(everywhere) && (await everywhere.rt.agentSettingsOf("t", "a"))!.disabledEverywhere === true, "the kill switch did not win");
+    must(subagentsDisabledBy({ SUBAGENTS_DISABLED: "1" }) && !subagentsDisabledBy({}) && !subagentsDisabledBy({ SUBAGENTS_DISABLED: "0" }) && !subagentsDisabledBy({ SUBAGENTS_DISABLED: "true" }), "the env switch");
+  });
+
+  await check(`${engine}: the trace carries what a trial compares: main context per call, tokens per session, delegations, child turns and report sizes`, async () => {
+    const w = await world(engine);
+    let parentCalls = 0, child: string | null = null;
+    w.reply = (session, req) => {
+      if (session === "main") {
+        parentCalls++;
+        if (parentCalls === 1) return calls({ id: "c_trial", args: { task: "read it" } });
+        const last = req.messages.at(-1) as any;
+        if (child && last?.role === "user" && JSON.stringify(last.content).includes("again")) return calls({ id: "c_trial2", args: { task: "more", agent: child } });
+        return say("ok");
+      }
+      return say("a short report");
+    };
+    await w.rt.postMessage("t", "a", "go", "prompt", "main");
+    await settle(w);
+    child = rowsOf(w)[0]!.id as string;
+    await w.rt.postMessage("t", "a", "again", "prompt", "main");
+    await settle(w);
+    const rows = trace(w);
+    const calls_ = rows.filter((r) => r.kind === "model.call");
+    must(calls_.every((r) => typeof r.attrs.session === "string" && typeof r.attrs.input === "number" && typeof r.attrs.output === "number"), `a model.call row without session or tokens: ${show(calls_.map((r) => r.attrs))}`);
+    const starts = rows.filter((r) => r.kind === "subagent.start");
+    must(starts.length === 2 && starts[0]!.status === "spawn" && starts[0]!.parentId === "c_trial" && starts[1]!.status === "follow_up" && starts[1]!.parentId === "c_trial2"
+      && starts.every((r) => r.spanId === child && r.attrs.parentSession === "main"), show(starts));
+    const ends = rows.filter((r) => r.kind === "subagent.turn" && r.status === "done");
+    const reportsNow = await reports(w);
+    must(ends.length === 2 && ends.every((r, i) => r.attrs.reportChars === reportsNow[i]!.length), `reportChars: ${show(ends.map((r) => r.attrs.reportChars))} vs ${show(reportsNow.map((t) => t.length))}`);
+    // Ids and counts only: neither the task nor the answer is in any of these rows.
+    must(!JSON.stringify([...starts, ...ends]).includes("read it") && !JSON.stringify(ends).includes("a short report"), "a row carries text");
+  });
+
+  await check(`${engine}: Raft subagent events: off, a child makes none at all; on, exactly SubagentStart, its steps, SubagentStop, and no text`, async () => {
+    const w = await world(engine, { chatter: true });
+    let parentCalls = 0, childCalls = 0;
+    w.reply = (session) => {
+      if (session === "main") return ++parentCalls === 1 ? calls({ id: "c_ev", args: { task: "SECRET TASK TEXT" } }) : say("ok");
+      return ++childCalls === 1 ? ({ text: "", finishReason: "tool_calls", truncated: false, usage: USAGE, toolCalls: [{ id: "k1", name: "chat__peek", arguments: {} }] } as ModelResponse) : say("SECRET REPORT TEXT");
+    };
+    await w.rt.postMessage("t", "a", "go", "prompt", "main");
+    await settle(w);
+    const child = rowsOf(w)[0]!.id as string;
+    const rows = trace(w);
+    must(rows.some((r) => r.kind === "tool.call" && r.attrs.task === child), "control: the child made no tool call");
+    // Off (the default): the events are what they were, none from or about the child.
+    must(subagentActivityFor(w.raw.sql as never, {}) === undefined && subagentActivityFor(w.raw.sql as never, { SUBAGENT_ACTIVITY: "0" }) === undefined, "the flag is not off by default");
+    const off = activityEvents("a", rows);
+    const parentOnly = activityEvents("a", rows.filter((r) => !(r.kind === "subagent.start" || r.kind === "subagent.turn" || r.attrs.session === child || r.attrs.task === child)));
+    must(show(off) === show(parentOnly) && !off.some((e) => e.subagent || e.hookEventName === "SubagentStart" || e.hookEventName === "SubagentStop"), `off, a child made events: ${show(off.filter((e) => !parentOnly.some((p) => p.eventId === e.eventId)))}`);
+    // On: the marker, the shape, the parent's own step for send_to_agent with no marker.
+    const on = activityEvents("a", rows, subagentActivityFor(w.raw.sql as never, { SUBAGENT_ACTIVITY: "1" }));
+    const marked = on.filter((e) => e.subagent);
+    const lin = { parentToolUseId: "c_ev", taskId: child };
+    const start = marked.filter((e) => e.hookEventName === "SubagentStart");
+    must(start.length === 1 && show(start[0]!.subagent) === show({ ...lin, phase: "started" }), `SubagentStart: ${show(start)}`);
+    const steps = marked.filter((e) => e.hookEventName === "PreToolUse" || e.hookEventName === "PostToolUse");
+    // Named as the agent's own steps are named (`hookEvents`: `<mount>__<tool>` from the row).
+    must(steps.length === 2 && steps.every((e) => /^chat__.*peek$/.test(String(e.toolName)) && show(e.subagent) === show({ ...lin, phase: "active" })), `child steps: ${show(steps)}`);
+    const stop = marked.filter((e) => e.hookEventName === "SubagentStop");
+    must(stop.length === 1 && show(stop[0]!.subagent) === show({ ...lin, phase: "ended" }) && stop[0]!.outcome === "done" && typeof stop[0]!.reportChars === "number" && stop[0]!.reportChars! > 0, `SubagentStop: ${show(stop)}`);
+    must(!marked.some((e) => e.hookEventName === "Stop" || e.hookEventName === "UserPromptSubmit"), "a child's Stop or prompt");
+    const parentSend = on.filter((e) => !e.subagent && e.toolName === SUBAGENT_TOOL);
+    must(parentSend.length === 2 && parentSend.map((e) => e.hookEventName).join() === "PreToolUse,PostToolUse", `the parent's own send_to_agent step: ${show(parentSend)}`);
+    must(!JSON.stringify(on).includes("SECRET"), "an event carries task or report text");
+    must(marked.every((e) => e.status === undefined), "a child's event carries the agent's status");
+    must(show(on.filter((e) => !e.subagent && e.toolName !== SUBAGENT_TOOL)) === show(off), "turning it on changed the agent's own events");
+  });
+
   await check(`${engine}: a follow-up to a subagent still running, or to an id this conversation never started, is refused`, async () => {
     const w = await world(engine);
     let parentCalls = 0, child: string | null = null;
@@ -1316,6 +1403,14 @@ for (const engine of (process.env.ENGINES ?? "pi085,pd").split(",").filter((e) =
     must(online.length === parent.filter((r) => r.status === "stop").length, `online ${online.length}: ${show(statusEvents("a", rows))}`);
   });
 }
+
+await check("rules: the tool tells the model to delegate big reads for a short report, and to do changes itself", () => {
+  const t = subagentTool({ models: [], send: async () => ({}) });
+  for (const words of ["any read that would bring a lot of raw content into your context", "short, structured report", "Do changes, messages and decisions yourself",
+    "subagents are read-only", "Don't delegate a single small lookup"]) must(t.description.includes(words), `the description lacks: ${words}`);
+  must(!/[Dd]elegate rarely|Delegate only \(a\)/.test(t.description), "the old rarely-delegate wording is still there");
+  must(t.description.includes(DELEGATE_GUIDANCE), "not the shared guidance");
+});
 
 await check("rules: a subagent may call only declared reads and a self-acting plugin's writes; every built-in write is withheld", async () => {
   const rt = new AgentRuntime({ ctx: { storage: { sql: sqliteHost().sql } }, bucket: {} as never, bucketName: "b", models: { resolve: () => null }, loader: {} as never, makeToolBinding: () => null } as never);

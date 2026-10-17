@@ -740,8 +740,9 @@ delete stops again. A stop that fails does not fail the delete: it is logged as 
 
 ## Subagents (`send_to_agent`)
 
-An agent whose `subagents` setting is on (off by default; an operator turns it on per agent,
-[`runbook.md`](runbook.md#subagents)) is offered one more harness tool, `send_to_agent`, in its own conversations. It
+Every hosted agent is offered one more harness tool, `send_to_agent`, in its own conversations, its Agents API sessions
+included — unless an operator turned its `subagents` setting off, or the deployment's `SUBAGENTS_DISABLED=1` kill switch
+is set ([`runbook.md`](runbook.md#subagents)); bench agents have it only where their setting turns it on. It
 delegates a self-contained piece of work to a **subagent**: a child conversation in the same agent object, with its own
 context. The design is issue #926; the code is `src/runtime/subagents.ts` and `cf/src/runtime.ts` (`#sendToAgent`,
 `#reportSubagents`).
@@ -835,6 +836,15 @@ rest of the pass.
 are neither activity nor status: a subagent's final answer is not a `Stop`, and does not show the agent `online`; its
 tools do not show as the agent's. The agent's own turn ends with its own `Stop` after it starts subagents, and it shows
 working again when a report wakes it and it calls the model. A subagent's work is in the [trace](#trace) only.
+
+Where the deployment sets `SUBAGENT_ACTIVITY=1` (off by default, until Raft's ingest accepts the fields), a subagent's
+work is sent as Raft's `SubagentLineage` events, `subagent: { parentToolUseId, taskId, phase }` with `parentToolUseId` the
+parent's `send_to_agent` tool call id and `taskId` the child's session: `SubagentStart` (`phase: "started"`) when a turn
+of it starts, the child's tool steps as `PreToolUse`/`PostToolUse` (`phase: "active"`), and `SubagentStop`
+(`phase: "ended"`) with `outcome` (`done`, `failed`, `stopped`, `ceiling`) and `reportChars`. The parent's own
+`send_to_agent` is then a plain `PreToolUse`/`PostToolUse` of the agent, with no marker. Never a `Stop` or a prompt for a
+child, never the agent's status on a child's event, and never a task, a prompt or a report: ids and enums only. Off, a
+child's rows make no event at all.
 
 **Cost.** A subagent's calls are the agent's: metered under its `agent_id`, and each call is admitted against the daily
 spend limits like any other. Its share is visible in the trace: its `model.call` rows name its session.
@@ -1152,7 +1162,9 @@ answer with `/admin/transcript`'s for the same agent).
 `rebuild.decision`, `rebuild.outcome`, `rebuild.behaviour`, `turn.timing`, `import.hold`, `model.prewarm`, `agent.ready`,
 `mount.settings` (an operator's in-place change of a mount's settings, [docs/plugins.md](plugins.md)), `subagent.turn`
 (one turn of a [subagent](#subagents-send_to_agent) ending: `spanId` its session, `parentId` the tool call that sent the
-turn, `status` `done`, `failed` or `cancelled`, `attrs.parentSession`), and the rows a plugin writes of its own, `raft.held`, `raft.held_answer` and `raft.state_failed` (written as `raft.state_save_failed` before Raft SDK 0.19.0)
+turn, `status` `done`, `failed`, `cancelled`, `stopped`, `report_failed` or `report_dropped`, `attrs.parentSession` and,
+on an end, `reportChars`, the report's length), `subagent.start` (a child's turn beginning: `spanId` its session,
+`parentId` the parent's `send_to_agent` call, `status` `spawn`, `follow_up` or `wake`), and the rows a plugin writes of its own, `raft.held`, `raft.held_answer` and `raft.state_failed` (written as `raft.state_save_failed` before Raft SDK 0.19.0)
 ([docs/plugins.md](plugins.md)); `src/trace/outbox.ts`) — with `from <= at < to`, in `seq` order.
 
 - `from`, `to` — ISO 8601 or milliseconds since the epoch; the window is at most 24 hours. One alone
@@ -1173,7 +1185,7 @@ What is never there: a span still open (a model call awaiting its answer, a tool
 anything the trace does not record (`src/trace/outbox.ts` names the documented silences). Each row is
 as exported: `{ seq, at, tenantId, agentId, kind, spanId, parentId?, status, verdict, ms?, attrs }`.
 A `model.call` row's `attrs` carry `model`, `session` (the conversation that made the call: `main`, an Agents API
-session, or a subagent's `sub_…`) and the answer's `input`, `cacheRead` and `cacheWrite` tokens;
+session, or a subagent's `sub_…`) and the answer's `input`, `output`, `cacheRead` and `cacheWrite` tokens;
 on the pi085 engine also `prefix` (`src/runtime/request-prefix.ts`): the sha256 of the system prompt
 and of the tool list, the request's message count and characters, how many leading messages (and their
 characters) are the previous request's byte for byte, and `broken` — `system`, `tools`, `message`, or

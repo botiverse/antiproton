@@ -284,6 +284,19 @@ export function subagentTurnRow(owner: SubagentOwner, s: Pick<Subagent, "id" | "
   };
 }
 
+/**
+ * The `subagent.start` trace row for one child turn beginning: its span the child, its parent the call that sent it
+ * (the parent's `send_to_agent` tool call; none for a background wake). Ids and counts only, never the task.
+ */
+export function subagentStartRow(owner: SubagentOwner, s: Pick<Subagent, "id" | "parentSession" | "turns">,
+  how: "spawn" | "follow_up" | "wake", callId: string | null, now: number) {
+  return {
+    at: now, tenantId: owner.tenantId, agentId: owner.agentId, kind: "subagent.start" as const, spanId: s.id,
+    ...(callId ? { parentId: callId } : {}), status: how, verdict: "ok" as const,
+    attrs: { parentSession: s.parentSession, turn: s.turns, how },
+  };
+}
+
 /** Every child session this agent ever had, whatever its row says: what a stop cancels. */
 export function allSubagentIds(sql: Sql, owner: SubagentOwner): string[] {
   if (!hasSubagentTable(sql)) return [];
@@ -518,6 +531,15 @@ export function childRefusal(address: string): { status: "rejected"; error: { co
   };
 }
 
+/**
+ * When to delegate, as the model is told it (`send_to_agent`'s description): the reads that would fill the agent's own
+ * context with raw content, for a short report instead; never the changes, which a subagent cannot make.
+ */
+export const DELEGATE_GUIDANCE = "prefer it for any read that would bring a lot of raw content into your context — long message " +
+  "histories, reading a repository or documents, broad searches, browsing many pages — and ask for a short, structured report " +
+  "with exactly what you need. Do changes, messages and decisions yourself: subagents are read-only (no writes, no messages, " +
+  "no shell). Don't delegate a single small lookup.";
+
 /** What a subagent can and cannot do, in the words the owner's setting and the model's tool both use. */
 export const SUBAGENTS_READ_ONLY = "Subagents can read and research but cannot change anything or act as this agent: no writes, " +
   "no messages, no shell. Give them reading tasks and do the changes yourself.";
@@ -547,15 +569,12 @@ export function subagentTool(d: {
     // and posts nothing twice, so the parent is told about every child that exists.
     replay: "safe" as const,
     description:
-      "Delegate a self-contained piece of work to a subagent: a fresh copy of you with its own context, your read tools, " +
-      `and no view of this conversation. ${SUBAGENTS_READ_ONLY} ` +
-      "Returns at once with the subagent's id; its final answer arrives later " +
-      "as a message in this conversation and wakes you. Do not wait or poll for it.\n" +
-      "Delegate only (a) independent pieces that can run in parallel, or (b) work too big for one context — reading many " +
-      "files or pages — where only a summary matters to you. Do not delegate a simple question, anything a few tool calls " +
-      "finish, or steps that depend tightly on each other: each subagent costs a whole conversation of model calls.\n" +
+      `Delegate reading to a subagent: ${DELEGATE_GUIDANCE}\n` +
+      "A subagent is a fresh copy of you with its own context, your read tools, and no view of this conversation. It " +
+      "returns at once with the subagent's id; the report arrives later as a message in this conversation and wakes you. " +
+      "Do not wait or poll for it.\n" +
       "task is all the subagent sees, so write a complete instruction: the goal, the exact paths, URLs and ids, the " +
-      "constraints, and the format of the report you want back. agent: a subagent's id, to send it a follow-up; it keeps " +
+      "constraints, and the report you want back. agent: a subagent's id, to send it a follow-up; it keeps " +
       `its history. At most ${SUBAGENT_CAP} run at once.${modelLine}`,
     parameters: {
       type: "object",
