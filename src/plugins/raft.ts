@@ -1241,11 +1241,11 @@ async function runOperation(
   // Taken before the request, so it is never later than when Raft first saw the key.
   const started = Date.now();
   const { seen } = resumed;
-  // A task write (claim, status, amend) attests what this context has seen (SDK 0.20.0), as a send does, but unlike
-  // a send the SDK does not load the saved state for it (`invoke`'s tasks.* entries read `call.seen` as it stands), so
-  // on a client made for this call it would attest nothing: Raft would never hold it, and the answer to a hold would
-  // not carry what the question showed, so it would be held again. Loaded here for every call that may be held; a send
-  // loads it anyway, once.
+  // A task write (claim, status, amend) attests what this context has seen (SDK 0.20.0), as a send does. In 0.20.0 the
+  // SDK did not load the saved state for it, so on a client made for this call it attested nothing: Raft would never
+  // hold it, and the answer to a hold would not carry what the question showed, so it would be held again. 0.20.1 loads
+  // it too (`invoke`'s tasks.* entries run in `withState`); this stays as belt-and-braces, since the load happens once
+  // per client and costs nothing when the SDK has already done it. Loaded for every call that may be held.
   if (op.mayInterrupt) await raft.state.load();
   const out = await raft.invoke(op.name, seen ? { ...keyed, seen } : keyed, caller);
   if (!out.ok) {
