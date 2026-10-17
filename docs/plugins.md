@@ -621,6 +621,18 @@ booked as seen in the asking context when it is the model's own call, and in
 the answering context when the model answers one raised elsewhere (a run_js
 program), so the answer is not held again.
 
+Since Raft SDK 0.20.0 a task claim, status change or amend attests what the
+context has seen, as a send does, and Raft may hold it for newer messages; the
+SDK does not load the saved state for those, so the plugin loads it before any
+call that may be held. A send the model makes itself (origin `"model"`, never a
+run_js program's) to a channel or DM right after its context read one of that
+conversation's threads is stopped before sending (`interrupt.reason:
+"thread_target"`, nothing sent, nothing to book as seen). `send` posts it
+top-level as written, under the same key, with the interrupt's `resume.with`
+(`targetConfirmed: true`); `drop` sends nothing; sending to the thread instead is
+a new call. The check compares reads, so each history read's target and order
+are carried into the mount's saved state (never as seen).
+
 Conversation cards (the SDK's `conversationCards`, 0.18.0) are the mount's
 `conversationCards` setting, a boolean that is off unless set to `true`; every
 client the plugin makes for that mount is then created with the option, and no
@@ -641,10 +653,11 @@ them.
 
 The plugin writes three trace rows of its own (`context.trace`): `raft.held`
 for each held call (`status` its reason; `attrs` the tool, reason, target,
-`newMessageCount`, the kinds of card it showed, `contextBytes`, the origin), and
+`newMessageCount`, the kinds of card it showed, `contextBytes`, the origin, and
+for `thread_target` the `threadTarget`), and
 `raft.held_answer` for each answer (`status` `send`, `proceed`, `drop` or
-`expired`; `ms` from when the call was first held; `attrs.outcome` what came of
-it), both under the call's operation; and `raft.state_failed` when the
+`expired`; `ms` from when the call was first held; `attrs.reason` the hold's
+reason; `attrs.outcome` what came of it), both under the call's operation; and `raft.state_failed` when the
 SDK's saved state did not load or save (the SDK's `onStateError`; `status` and
 `attrs.phase` the phase, `load` or `save`; `attrs` the error and, for a save,
 `stateBytes`, the size of the record it tried to write), which it also says on

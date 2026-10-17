@@ -424,7 +424,7 @@ const SENT = (n = 21) => json(200, { ok: true, state: "sent", messageId: `m-${n}
  * what a held call's question must be, verbatim. Asked of the SDK rather than written out here, so the assertion is
  * "passed on unchanged" and not a copy of the SDK's wording.
  */
-async function sdkHeld(answer: Response, op: "messages.send" | "tasks.claim", args: Record<string, unknown>, options: { contextId?: string; cards?: boolean } = {}) {
+async function sdkHeld(answer: Response, op: "messages.send" | "tasks.claim" | "tasks.updateStatus" | "tasks.amend", args: Record<string, unknown>, options: { contextId?: string; cards?: boolean } = {}) {
   one(answer);
   const out = await createRaft({ serverUrl: "https://raft.example", credential: "sk_agent_test_1234567890", hints: "tool", ...(options.cards ? { conversationCards: true } : {}) })
     .invoke(op, args, { origin: "model", ...(options.contextId ? { contextId: options.contextId } : {}) });
@@ -663,9 +663,167 @@ await check("a held task claim asks proceed or drop, and proceed makes the ident
   }
   if ("idempotencyKey" in ((held.state as any).args ?? {}) || "seen" in (held.state as any)) throw new Error(`a claim carries a send's continuation: ${JSON.stringify(held.state)}`);
   const out = await raftPlugin.interrupts!.resume("tasks_claim", held.state, "proceed", inTurn(m.ctx)) as any;
-  if (calls.length !== 2 || calls[1]!.init.body !== calls[0]!.init.body || out.state !== "claimed") throw new Error(`resume: ${JSON.stringify({ out, bodies: calls.map((c) => c.init.body) })}`);
+  // The identical claim, now attesting the message the question showed (task writes attest since SDK 0.20.0).
+  const { seenUpToSeq, ...again } = JSON.parse(String(calls[1]?.init.body));
+  if (calls.length !== 2 || JSON.stringify(again) !== calls[0]!.init.body || seenUpToSeq !== 20 || out.state !== "claimed") throw new Error(`resume: ${JSON.stringify({ out, bodies: calls.map((c) => c.init.body) })}`);
   const dropped = await raftPlugin.interrupts!.resume("tasks_claim", held.state, "drop", inTurn(m.ctx)) as any;
   if (dropped.state !== "dropped" || !/Nothing was done/.test(dropped.note)) throw new Error(JSON.stringify(dropped));
+});
+
+/**
+ * A Server for one task write: it holds the write unless it attests seq 20, the newest message on #general's board
+ * (task writes attest what the context has seen since SDK 0.20.0, as a send does), and otherwise applies it. `applied`
+ * counts the writes it applied; `bodies` is every body the route received, in order. Both are read through functions,
+ * since a call between two checks changes them.
+ */
+function boardServer(path: string, applied: () => Response) {
+  let applied_ = 0;
+  const bodies: any[] = [];
+  globalThis.fetch = (async (url: any, init?: any) => {
+    const at = new URL(String(url)).pathname.replace("/internal/agent-api", "");
+    if (at !== path) return json(404, { error: "not found", code: "NOT_FOUND" });
+    const body = JSON.parse(String(init?.body ?? "{}"));
+    bodies.push(body);
+    if ((body.seenUpToSeq ?? 0) < 20) return HELD();
+    applied_++;
+    return applied();
+  }) as any;
+  return { applied: () => applied_, bodies, sent: () => bodies.length };
+}
+const TASK_WRITES = [
+  ["tasks_claim", "tasks.claim", { target: "#general", taskNumbers: [7] }, "/tasks/claim", () => json(200, { results: [{ taskNumber: 7, success: true }] }), "claimed"],
+  ["tasks_update_status", "tasks.updateStatus", { target: "#general", taskNumber: 7, status: "in_review" }, "/tasks/update-status", () => json(200, { ok: true }), "updated"],
+  ["tasks_amend", "tasks.amend", { target: "#general", taskNumber: 7, title: "rotate the keys" }, "/tasks/amend",
+    () => json(200, { task: { taskNumber: 7, title: "rotate the keys", description: null, revision: 3 },
+      event: { id: "0b7c3a1e-1111-4222-8333-944455556667", seq: 3, eventType: "amended", actorType: "agent", actorName: "cody", payload: { title: "rotate the keys" }, createdAt: "2026-10-17T10:00:00.000Z" } }), "amended"],
+] as const;
+
+await check("a held task write (unread_messages) is a question, never a success: the SDK's held text, nothing applied, and proceed applies it once, attesting what the question showed", async () => {
+  for (const [tool, op, args, path, ok, state] of TASK_WRITES) {
+    const sdk = await sdkHeld(HELD(), op, args, { contextId: "ctx_turn" });
+    const m = cardsMount({});
+    const server = boardServer(path, ok);
+    const held = await raftPlugin.invoke(tool, args, m.ctx) as any;
+    if (!(held instanceof Interrupt)) throw new Error(`${tool}: a held write came back as a result: ${JSON.stringify(held)}`);
+    if (held.question !== sdk.context || JSON.stringify(held.answer) !== '{"choices":["proceed","drop"]}' ||
+        JSON.stringify(held.context) !== JSON.stringify({ reason: "unread_messages", target: "#general" })) {
+      throw new Error(`${tool}: the question: ${JSON.stringify({ question: held.question, answer: held.answer, context: held.context })}`);
+    }
+    if (server.applied() !== 0 || server.sent() !== 1) throw new Error(`${tool}: applied at the hold: ${JSON.stringify({ applied: server.applied(), bodies: server.bodies })}`);
+    if (JSON.stringify((held.state as any).args) !== JSON.stringify(args)) throw new Error(`${tool}: the held call is not the identical call: ${JSON.stringify(held.state)}`);
+    const row = m.rows.find((r) => r.kind === "raft.held");
+    if (row?.status !== "unread_messages" || row.attrs?.reason !== "unread_messages" || row.attrs?.tool !== tool || row.verdict !== "blocked") {
+      throw new Error(`${tool}: raft.held: ${JSON.stringify(row)}`);
+    }
+    const out = await raftPlugin.interrupts!.resume(tool, held.state, "proceed", m.ctx) as any;
+    if (out instanceof Interrupt || out.state !== state || server.applied() !== 1 || server.sent() !== 2) {
+      throw new Error(`${tool}: resume: ${JSON.stringify({ out, applied: server.applied(), bodies: server.bodies })}`);
+    }
+    // The identical call, now attesting the held message it showed.
+    const { seenUpToSeq, seenExactSeqs: _x, ...second } = server.bodies[1];
+    const { seenUpToSeq: _s, seenExactSeqs: _y, ...first } = server.bodies[0];
+    if (seenUpToSeq !== 20 || JSON.stringify(second) !== JSON.stringify(first)) throw new Error(`${tool}: the resumed write: ${JSON.stringify(server.bodies)}`);
+    const answer = m.rows.find((r) => r.kind === "raft.held_answer");
+    if (answer?.status !== "proceed" || answer.attrs?.reason !== "unread_messages" || answer.attrs?.outcome !== state) throw new Error(`${tool}: raft.held_answer: ${JSON.stringify(answer)}`);
+    // The model calling again instead of answering: the identical call, attesting what it was shown, applied once.
+    const again = cardsMount({});
+    const twice = boardServer(path, ok);
+    const first2 = await raftPlugin.invoke(tool, args, again.ctx);
+    const out2 = await raftPlugin.invoke(tool, args, again.ctx) as any;
+    if (!(first2 instanceof Interrupt) || out2 instanceof Interrupt || out2.state !== state || twice.applied() !== 1 || twice.bodies[1]?.seenUpToSeq !== 20) {
+      throw new Error(`${tool}: called again: ${JSON.stringify({ out2, applied: twice.applied(), bodies: twice.bodies })}`);
+    }
+  }
+});
+
+/** The thread `#general:abcdef12`, with seq 5 in it, and #general: what a read of each, and a send, answer. */
+const THREAD = "#general:abcdef12";
+function threadServer(): any[] {
+  const sends: any[] = [];
+  globalThis.fetch = (async (url: any, init?: any) => {
+    const u = new URL(String(url));
+    const path = u.pathname.replace("/internal/agent-api", "");
+    if (path === "/history") {
+      const target = u.searchParams.get("channel") ?? u.searchParams.get("target") ?? "";
+      return target === THREAD
+        ? history([historyMessage(5, "the thread's last word", { channel_name: "general" })], { target: THREAD })
+        : history([historyMessage(4, "the channel's last word", { channel_name: "general" })], { target: "#general" });
+    }
+    if (path === "/v2/send") { sends.push(JSON.parse(String(init?.body ?? "{}"))); return SENT(30 + sends.length); }
+    return json(404, { error: "not found", code: "NOT_FOUND" });
+  }) as any;
+  return sends;
+}
+
+await check("a thread_target hold: a top-level send right after reading one of its threads asks first; send confirms under the same key, drop sends nothing, and sending to the thread just works", async () => {
+  // Control: the SDK's own text for this hold, from a client made as the plugin makes its clients.
+  const raw = createRaft({ serverUrl: "https://raft.example", credential: "sk_agent_test_1234567890", hints: "tool" });
+  raw.frontier.inContext("ctx_turn").recordRead(THREAD, 5);
+  const sdk = await raw.invoke("messages.send", { target: "#general", content: "wrap-up", idempotencyKey: "k-tt" }, { origin: "model", contextId: "ctx_turn" });
+  if (!isInterrupted(sdk) || sdk.interrupt.reason !== "thread_target" || sdk.interrupt.threadTarget !== THREAD || sdk.interrupt.resume.with?.targetConfirmed !== true) {
+    throw new Error(`control: the SDK did not hold for the thread: ${JSON.stringify(sdk)}`);
+  }
+  const m = cardsMount({});
+  const sends = threadServer();
+  const read = await raftPlugin.invoke("messages_read", { target: THREAD }, m.ctx) as any;
+  if (!/the thread's last word/.test(read.text)) throw new Error(`the thread read: ${JSON.stringify(read)}`);
+  const held = await raftPlugin.invoke("messages_send", { target: "#general", content: "wrap-up", idempotencyKey: "k-tt" }, m.ctx) as any;
+  if (!(held instanceof Interrupt)) throw new Error(`not held after reading a thread: ${JSON.stringify(held)}`);
+  if (held.question !== sdk.interrupt.context || JSON.stringify(held.answer) !== '{"choices":["send","drop"]}' ||
+      JSON.stringify(held.context) !== JSON.stringify({ reason: "thread_target", target: "#general" }) ||
+      !held.question.includes(`messages_send({ target: "${THREAD}", content: … })`) || !held.question.includes('messages_send({ target: "#general", targetConfirmed: true, content: … })')) {
+    throw new Error(`the question: ${JSON.stringify({ question: held.question, answer: held.answer, context: held.context })}`);
+  }
+  const st = held.state as any;
+  if (sends.length !== 0 || st.reason !== "thread_target" || st.args?.targetConfirmed !== true || st.args?.idempotencyKey !== "k-tt" || st.seen !== undefined || st.attest !== undefined) {
+    throw new Error(`held: ${JSON.stringify({ sends, state: st })}`);
+  }
+  const row = m.rows.find((r) => r.kind === "raft.held");
+  if (row?.status !== "thread_target" || row.attrs?.reason !== "thread_target" || row.attrs?.threadTarget !== THREAD) throw new Error(`raft.held: ${JSON.stringify(row)}`);
+  // Drop: nothing is sent.
+  const dropped = await raftPlugin.interrupts!.resume("messages_send", held.state, "drop", m.ctx) as any;
+  if (dropped.state !== "dropped" || sends.length !== 0) throw new Error(`drop: ${JSON.stringify({ dropped, sends })}`);
+  const dropRow = m.rows.find((r) => r.kind === "raft.held_answer");
+  if (dropRow?.status !== "drop" || dropRow.attrs?.reason !== "thread_target") throw new Error(`raft.held_answer on drop: ${JSON.stringify(dropRow)}`);
+  // Send: top-level as written, under the same key, once.
+  const sent = await raftPlugin.interrupts!.resume("messages_send", held.state, "send", m.ctx) as any;
+  if (sent instanceof Interrupt || sent.state !== "sent" || sends.length as number !== 1 || sends[0].target !== "#general" || sends[0].idempotencyKey !== "k-tt" || sends[0].content !== "wrap-up") {
+    throw new Error(`send: ${JSON.stringify({ sent, sends })}`);
+  }
+  const sendRow = m.rows.filter((r) => r.kind === "raft.held_answer").at(-1);
+  if (sendRow?.status !== "send" || sendRow.attrs?.reason !== "thread_target" || sendRow.attrs?.outcome !== "sent") throw new Error(`raft.held_answer on send: ${JSON.stringify(sendRow)}`);
+
+  // Redirect: the model sends to the thread instead, a call of its own, and it goes.
+  const r = cardsMount({});
+  const redirected = threadServer();
+  await raftPlugin.invoke("messages_read", { target: THREAD }, r.ctx);
+  if (!(await raftPlugin.invoke("messages_send", { target: "#general", content: "wrap-up" }, r.ctx) instanceof Interrupt)) throw new Error("control: not held");
+  const toThread = await raftPlugin.invoke("messages_send", { target: THREAD, content: "wrap-up" }, r.ctx) as any;
+  if (toThread instanceof Interrupt || toThread.state !== "sent" || redirected.length !== 1 || redirected[0].target !== THREAD) {
+    throw new Error(`to the thread: ${JSON.stringify({ toThread, redirected })}`);
+  }
+  // The text's other way on: the same send again with targetConfirmed: true, which the tool offers.
+  const confirmed = await raftPlugin.invoke("messages_send", { target: "#general", content: "wrap-up", targetConfirmed: true }, r.ctx) as any;
+  if (confirmed instanceof Interrupt || redirected.length as number !== 2 || redirected[1].target !== "#general") throw new Error(`confirmed: ${JSON.stringify({ confirmed, redirected })}`);
+  // Reading the channel itself after the thread clears it: the latest read under #general is #general.
+  const c = cardsMount({});
+  const cleared = threadServer();
+  await raftPlugin.invoke("messages_read", { target: THREAD }, c.ctx);
+  await raftPlugin.invoke("messages_read", { target: "#general" }, c.ctx);
+  const after = await raftPlugin.invoke("messages_send", { target: "#general", content: "wrap-up" }, c.ctx) as any;
+  if (after instanceof Interrupt || cleared.length !== 1) throw new Error(`after reading the channel: ${JSON.stringify({ after, cleared })}`);
+});
+
+await check("the thread-target check is the model's only: a program's top-level send after the model read a thread is not checked", async () => {
+  const m = cardsMount({});
+  const sends = threadServer();
+  await raftPlugin.invoke("messages_read", { target: THREAD }, m.ctx);
+  const program = { ...m.ctx, caller: { ...m.ctx.caller, fromProgram: true } };
+  const out = await raftPlugin.invoke("messages_send", { target: "#general", content: "from code", idempotencyKey: "k-code" }, program) as any;
+  if (out instanceof Interrupt || out.state !== "sent" || sends.length !== 1 || sends[0].target !== "#general") throw new Error(`a program's send was checked: ${JSON.stringify({ out, sends })}`);
+  // Control: the same send from the model, in the same context, is held.
+  const model = await raftPlugin.invoke("messages_send", { target: "#general", content: "from the model", idempotencyKey: "k-model" }, m.ctx) as any;
+  if (!(model instanceof Interrupt) || (model.context as any)?.reason !== "thread_target" || sends.length !== 1) throw new Error(`control: ${JSON.stringify(model)}`);
 });
 
 await check("a send held under the old send_message tool, still waiting across the change, resumes and drops as before", async () => {
@@ -1867,7 +2025,7 @@ function freshnessServer(answers: { history?: Response; events?: Response }) {
 const SEEN_PAGE = { target: "#wg-raft-sdk", messages: [historyMessage(41, "one"), historyMessage(42, "wait, one more thing")],
   has_more: false, has_older: false, has_newer: false, last_read_seq: 42, model_seen_up_to_seq: 42 };
 
-await check("a history read does not count as seen, even the model's own in its turn: a send after it is still held, and nothing is saved", async () => {
+await check("a history read does not count as seen, even the model's own in its turn: a send after it is still held, and only where it read is saved", async () => {
   // The SDK would book the page as seen inside invoke, before the runtime parks a result over PARK_BYTES: the model
   // would then have read a preview while the record says it saw the page. Only receive_events attests.
   const fresh = freshDb();
@@ -1879,7 +2037,11 @@ await check("a history read does not count as seen, even the model's own in its 
   await raftPlugin.invoke("messages_read", { target: "#wg-raft-sdk" }, m);
   // The model's own read still consumes on the Server's side (no consume=false): only the seen record is withheld.
   if (reads.length !== 1 || new URL(reads[0]!).searchParams.has("consume")) throw new Error(`request: ${reads[0]}`);
-  if (fresh.tables.get(fresh.scope, INBOX_STORE, "state") !== undefined) throw new Error("the read saved the mount's Raft state");
+  // What is saved is that it read there, and when (the thread-target check compares reads, `keepShown`), never a seen boundary.
+  const saved = (fresh.tables.get(fresh.scope, INBOX_STORE, "state") as any)?.frontier;
+  if (Object.keys(saved?.targets ?? {}).length !== 0 || JSON.stringify((saved?.reads ?? []).map((r: any) => [r.target, r.seq, r.contextId])) !== '[["#wg-raft-sdk",42,"ctx_a"]]') {
+    throw new Error(`the read saved more than where it read: ${JSON.stringify(saved)}`);
+  }
   const held = await raftPlugin.invoke("messages_send", { target: "#wg-raft-sdk", content: "y", idempotencyKey: "k-a" }, m);
   if (!(held instanceof Interrupt)) throw new Error(`the read let the send through: ${JSON.stringify(held)}`);
   // Positive control: the same conversation handed over by receive_events, in the same context, does attest.

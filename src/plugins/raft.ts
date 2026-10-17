@@ -923,6 +923,9 @@ export function toolOf(op: RaftOperationSpec): ToolSchema {
     ? ` Held here, the call comes back as a question with those messages: answer "${goAhead(op)}" to go ahead as written, or "drop" to do nothing.` +
       (op.idempotency.kind === "key"
         ? ` An answer given ${KEY_LIFETIME_MS / 3_600_000} hours or more after the question does nothing: read the conversation, then call again if it is still wanted.`
+        : "") +
+      (op.inputSchema.properties?.targetConfirmed
+        ? ` A send to a channel or DM right after you read one of its threads is also asked first: answer "send" to post it there as written, or "drop" and send it to the thread instead.`
         : "")
     : "";
   return {
@@ -1238,6 +1241,12 @@ async function runOperation(
   // Taken before the request, so it is never later than when Raft first saw the key.
   const started = Date.now();
   const { seen } = resumed;
+  // A task write (claim, status, amend) attests what this context has seen (SDK 0.20.0), as a send does, but unlike
+  // a send the SDK does not load the saved state for it (`invoke`'s tasks.* entries read `call.seen` as it stands), so
+  // on a client made for this call it would attest nothing: Raft would never hold it, and the answer to a hold would
+  // not carry what the question showed, so it would be held again. Loaded here for every call that may be held; a send
+  // loads it anyway, once.
+  if (op.mayInterrupt) await raft.state.load();
   const out = await raft.invoke(op.name, seen ? { ...keyed, seen } : keyed, caller);
   if (!out.ok) {
     const key = retryKey(op, out as RaftFailure, keyed);
@@ -1260,23 +1269,36 @@ async function runOperation(
   let text = out.text.trim();
   for (const m of messages) text = text.replace(m.text, modelLine(m, unoffered));
   const result = { state: out.state, text: offeredTerms(text, unoffered, quotedCalls(data, unofferedPattern(unoffered))) };
-  if (op.consumes.model.includes("seen")) await keepCardsShown(raft, ctx, result);
+  if (op.consumes.model.includes("seen")) await keepShown(raft, ctx, result);
   return result;
 }
 
 /**
- * The cards a history read showed (`conversationCards`), booked where the next call reads them. The read ran on a
- * client whose state is not saved (`runOperation` says why), so without this its cards would be shown on every read
- * and the first send after it held for a card the model had just read. Only the cards are carried over, never the
- * messages, and only when the model reads the result whole: a result over PARK_BYTES is parked and the model reads a
- * preview, which may not reach them. Each is booked under the context it was shown in, which is the call's.
+ * What a history read showed besides its messages, booked where the next call reads it. The read ran on a client
+ * whose state is not saved (`runOperation` says why), so without this the next call would know nothing of it:
+ * - which conversation it read, and when (`SeenFrontier.recordRead`, SDK 0.20.0): the thread-target check compares
+ *   when a thread and its parent were last read in a context, so a top-level send right after the model read one of
+ *   its threads asks first (`heldCall`, `thread_target`). Booked whatever the page's size: a parked page is still
+ *   where the model's attention went, and booking it costs at most one question. The aliases the Server resolved go
+ *   with it, so a read and a send spelled differently still name the same conversation. None of this is "seen":
+ *   no message counts as read by it, and a send attests nothing more for it.
+ * - the cards it showed (`conversationCards`), only when the model reads the result whole: a result over PARK_BYTES
+ *   is parked and the model reads a preview, which may not reach them. Without this its cards would be shown on
+ *   every read and the first send after it held for a card the model had just read.
+ * Each is booked under the context it was made in, which is the call's. A program's read books nothing (the SDK
+ * records nothing for origin "code"), so this has nothing to carry for it.
  */
-async function keepCardsShown(read: Raft, ctx: PluginContext, result: Record<string, Json>): Promise<void> {
-  const shown = read.frontier.snapshot().observations ?? [];
-  if (!cardsOn(ctx) || !shown.length || JSON.stringify(result).length > PARK_BYTES) return;
+async function keepShown(read: Raft, ctx: PluginContext, result: Record<string, Json>): Promise<void> {
+  const shown = read.frontier.snapshot();
+  const reads = shown.reads ?? [];
+  const cards = cardsOn(ctx) && JSON.stringify(result).length <= PARK_BYTES ? shown.observations ?? [] : [];
+  if (!reads.length && !cards.length) return;
   const kept = raftFor(ctx);
   await kept.state.load();
-  for (const o of shown) kept.frontier.inContext(o.contextId).recordCard(o.type, o.id, o.rev);
+  for (const [alias, canonical] of Object.entries(shown.aliases ?? {})) kept.frontier.recordAlias(alias, canonical);
+  // Oldest first, as the snapshot keeps them, so the order between them survives the copy.
+  for (const r of [...reads].sort((a, b) => a.order - b.order)) kept.frontier.inContext(r.contextId ?? null).recordRead(r.target, r.seq);
+  for (const o of cards) kept.frontier.inContext(o.contextId).recordCard(o.type, o.id, o.rev);
   await kept.state.save();
 }
 
@@ -1284,7 +1306,11 @@ async function keepCardsShown(read: Raft, ctx: PluginContext, result: Record<str
  * A held call, as a question for the model. Raft held it because the conversation moved since this context last
  * looked (`unread_messages`: newer messages, and with conversation cards any card it has not seen ride along), or,
  * with conversation cards on, because this context has not seen the conversation's card (`unseen_card`: no new
- * messages, only the card). The question is the SDK's own held text, `interrupt.context`, passed on as it came: the
+ * messages, only the card), or, for a send the model made itself, because this context last read one of the
+ * target's threads and the send is to the target top-level (`thread_target`, SDK 0.20.0: nothing was sent, nothing to
+ * attest; `keepShown` books the reads it compares). A task write (claim, status, amend) is held for newer messages as a
+ * send is, and asked the same way: since SDK 0.20.0 it attests what the context has seen, and its resume is the
+ * identical call. The question is the SDK's own held text, `interrupt.context`, passed on as it came: the
  * opening "Held — …" line, the cards, the conversation's window and the `messages_read` call that reads it in full,
  * all in tool form (`hints: "tool"`). It is the text the CLI prints for the same hold, and it names the call's
  * `idempotencyKey`, which is the key a resume goes ahead under, so a model that sends again with it lands once.
@@ -1305,7 +1331,9 @@ async function keepCardsShown(read: Raft, ctx: PluginContext, result: Record<str
  * shown, which is every time they were not withheld.
  *
  * The state is the call itself: the operation, its arguments with the interrupt's `resume.idempotencyKey` under
- * the operation's key argument when it has one, for a message the `seen` boundary when the question showed
+ * the operation's key argument when it has one and with what the interrupt's `resume.with` adds (a `thread_target`
+ * hold's `targetConfirmed: true`, so "send" posts it top-level as written, under the same key; sending it to the thread
+ * instead is a new call the model makes, and "drop" sends nothing), for a message the `seen` boundary when the question showed
  * every new message, `attest` when it showed them all or showed a card, the hold's `reason`, and `heldAt`, when the
  * call was first held (`KEY_LIFETIME_MS`). Plain data, no credential, and never shown. The interrupt's
  * `resume.argv`/`cancel`, which belong to the CLI, are not used at all.
@@ -1326,6 +1354,8 @@ async function heldCall(
   }
   const go = goAhead(op);
   const key = op.idempotency.kind === "key" && held.resume.idempotencyKey ? { [op.idempotency.arg]: held.resume.idempotencyKey } : {};
+  // What going ahead adds to the call (`thread_target`: `targetConfirmed: true`), kept with its arguments as the key is.
+  const confirmed = held.resume.with ?? {};
   const reason = reasonOf(held);
   ctx.trace?.({
     kind: "raft.held", status: reason, verdict: "blocked",
@@ -1333,6 +1363,7 @@ async function heldCall(
       tool: op.toolName, reason, target: held.target, newMessageCount: held.newMessageCount,
       cards: Object.keys(cards ?? {}).sort().join(","), contextBytes: held.context.length, origin: caller.origin,
       contextComplete: held.contextComplete, ...(held.withheld ? { withheld: true } : {}),
+      ...(typeof held.threadTarget === "string" ? { threadTarget: held.threadTarget } : {}),
     },
   });
   return interrupt({
@@ -1340,7 +1371,7 @@ async function heldCall(
     context: { reason, target: held.target },
     answer: { choices: [go, "drop"] },
     state: {
-      op: op.name, args: { ...input, ...key } as Json, heldAt, reason,
+      op: op.name, args: { ...input, ...key, ...confirmed } as Json, heldAt, reason,
       ...(go === "send" && attested && held.seenUpToSeq !== null ? { seen: { upToSeq: held.seenUpToSeq } } : {}),
       ...(attested || cards ? {
         attest: {
@@ -1369,6 +1400,7 @@ function reasonOf(held: RaftInterrupt): string {
   switch (reason) {
     case "unread_messages":
     case "unseen_card":
+    case "thread_target":
       return reason;
     default:
       return typeof reason === "string" && reason ? clip(reason, 40)! : "unknown";
@@ -2515,7 +2547,8 @@ export function createRaftPlugin(deps: {
 
     /**
      * A held call's question, answered. "send" (a message) or "proceed" (a task write) makes the same call again
-     * with the same arguments — under the interrupt's `resume.idempotencyKey` for a send — attesting what the
+     * with the same arguments — under the interrupt's `resume.idempotencyKey` for a send, and with its `resume.with`
+     * (`targetConfirmed: true` for a `thread_target` hold), both kept in the state by `heldCall` — attesting what the
      * question showed, so it goes through unless the conversation moved again since, which asks again with the
      * newer messages. "drop" does nothing. Expiry and cancel do nothing either, so no `cancel` is declared: an
      * in-process held call leaves nothing on the Server, and cancelling is not making the call. Going ahead with a
