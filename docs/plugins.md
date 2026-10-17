@@ -366,6 +366,16 @@ each one offers rather than by looking for the id `sandbox`, so a second
 plugin that can run a container is chosen without the kernel learning its
 name.
 
+**Declare `sideEffects` honestly, and `actsAs: "self"` only for scratch.** A
+subagent (docs/agent-surface.md, "Subagents") is read-only: it is offered a tool
+only when the tool declares `sideEffects: "read"`, or the plugin declares
+`actsAs: "self"`, and its call to anything else, a program's included, is refused
+at dispatch. A tool with no `sideEffects` counts as a write. `actsAs: "self"` says
+every write of the plugin acts on nothing but the caller's own scratch: no
+message, no change anyone else sees, no credential used, nothing the agent's
+memory or workspace keeps. No built-in plugin declares it; leave it out unless
+that is true of every write, and the plugin is withheld from subagents by default.
+
 **Declare `sandboxForm` when the service has a command-line tool.** It says
 what a mount of the plugin becomes inside the agent's container: the environment
 variables the tool reads, the headers it sends the credential in, and the hosts
@@ -765,6 +775,13 @@ on both engines and present only when they say something:
   when the call is not made in a session's turn (an approved call's replay,
   provisioning, a bench shell, a background job's poll): treat that as
   "nothing is known to be seen".
+
+`taskId` is the conversation the call was made in: `main` for the agent's
+own, an Agents API session's id, or `sub_…` for a subagent's
+(docs/agent-surface.md, "Subagents"). A subagent shares the agent's mounts, so
+its calls reach a plugin as the agent's do, with its own `contextId`: a plugin
+that keys what the model has seen by conversation keeps a subagent's apart from
+its parent's.
 
 **Use `context.operationId` as the idempotency key you hand a service.** It is
 the gateway's id for the operation the context serves, set by the gateway

@@ -731,10 +731,113 @@ The ended turn reports itself to Raft: a "Bridge fatal" activity event with `err
 status `error` with that detail. Every attempt is a `turn.stop` line in the Workers logs, whatever came of it, written
 by the Worker that answered it (`side` = `worker`; [`runbook.md`](runbook.md#logs-and-what-an-object-did)).
 
+A stop ends the agent's subagents' turns as well ([Subagents](#subagents-send_to_agent)): none of them reports.
+
 **A delete ends the turn too.** `DELETE /provision/agents/{agentId}` first stops the running turn (`errorClass`
 `stopped: agent deleted`), and from then on the agent's object takes no step for it, whatever arrives; a repeated
 delete stops again. A stop that fails does not fail the delete: it is logged as a `turn.stop` line with `result`
 `failed` ([`runbook.md`](runbook.md)).
+
+## Subagents (`send_to_agent`)
+
+An agent whose `subagents` setting is on (off by default; an operator turns it on per agent,
+[`runbook.md`](runbook.md#subagents)) is offered one more harness tool, `send_to_agent`, in its own conversations. It
+delegates a self-contained piece of work to a **subagent**: a child conversation in the same agent object, with its own
+context. The design is issue #926; the code is `src/runtime/subagents.ts` and `cf/src/runtime.ts` (`#sendToAgent`,
+`#reportSubagents`).
+
+**Subagents are read-only.** Subagents can read and research but cannot change anything or act as this agent: no writes, no messages, no shell. Give them reading tasks and do the changes yourself.
+
+```
+send_to_agent { task: string, agent?: string, model?: string }
+  → { "agent": "sub_…", "status": "started", "note": "…" }
+```
+
+- **`task`** is the whole instruction. The subagent sees none of the parent's conversation, so the task must carry the
+  paths, ids, constraints and the format of the report wanted back. The tool's description tells the model when to
+  delegate: independent pieces that can run in parallel, or work too big for one context where only a summary matters;
+  never a simple question, a few tool calls' worth, or tightly coupled steps.
+- **Without `agent`** a new subagent starts: a session `sub_<hex>` in the same object (on pi085 a transcript of its
+  own; on pd an ownerless pi-durable conversation), the task its first message. The tool answers at once; the parent's
+  turn goes on, and usually ends. Nothing in the object waits for the child.
+- **With `agent`** (an id this conversation started) the task is a follow-up: the subagent keeps its history. Refused
+  while that subagent is still running, and for an id the conversation did not start.
+- **`model`** is offered only where the deployment lists owner model options (`USER_MODELS`, the same list as the
+  [model picker](#the-servers-model-picker-model-picker)): one option's `id`. The queue calls that option's provider and
+  model for the subagent's calls; without it the subagent runs on the agent's own model. It is held to the rules the
+  agent's own pick is: refused while an administrator's agent or tenant row decides the agent's model, and, where the
+  server's picker switch is enforced and off, for anything but the default; an id that is not listed is refused. Asked
+  at the spawn, where a refusal starts nothing, and again at each of the subagent's model calls (from an answer kept for
+  30 s), where a pin or a switch set since makes the call run on the agent's own model: a `subagent.model_changed`
+  trace row, and the subagent's next report says which model it ran on and why. Rules that cannot be read leave the
+  decision as it was.
+- **At most 3** subagents of one agent run at once; a fourth start (or a follow-up that would be the fourth) is refused,
+  naming the running ones. One subagent takes at most 10 turns and lives at most 2 hours from its creation; each turn is
+  cancelled after 30 minutes. A background job a subagent started is delivered to it only under the same limits.
+- **Depth 1.** A subagent is never offered `send_to_agent`, nor an Agents API caller's functions, nor `jobs`.
+- **Read-only.** A subagent is offered a mount's tool only when the tool declares `sideEffects: "read"`, or its plugin
+  declares `actsAs: "self"` ([docs/plugins.md](plugins.md); no built-in plugin does). Everything else is withheld:
+  GitHub writes with the agent's token, an MCP tool not marked read-only, `http.send` with a stored secret, the sandbox's
+  shell and commands (its environment carries credentials), Raft messages and task changes, the agent's own memory
+  writes. A tool that declares no side effect, and any plugin that declares nothing, is withheld too, so a new plugin is
+  safe by default. A call to a withheld tool — by the model, by a `run_js` program, in an answer to a held question,
+  by the mount's alias or by the plugin's id — is refused at dispatch with `subagent_read_only`, decided on the mount
+  and tool the name resolves to. A subagent keeps `run_js` and `resume`, which reach only what it may call. Its Raft
+  reads run on a state of their own and never save over the agent's Raft state.
+- **Replay-safe.** The tool is `replay: "safe"`: a call cut off by an isolate dying runs again, on either engine. The
+  child's id is derived from the call (the conversation, the call's invocation — pi085's invocation id, pd's tool task —
+  and its call id), so the second run finds the child the first one made, the task is posted once, and the parent is
+  told `started` for the one child that exists.
+
+**Reports.** When a subagent's turn ends, its last answer is posted to the conversation that started it as a message,
+through the same post a background job's completion takes — so it waits behind a workspace import, is dropped while
+the conversation needs a reset, carries a rebuild's pending briefing and any notices — and wakes that conversation:
+
+```
+[subagent sub_… — done after 42s (report sub_…/1); its report, a notice from the harness, not a message from the user. send_to_agent with agent "sub_…" sends it a follow-up.]
+<the subagent's final answer>
+```
+
+Reports owed to one conversation in the same pass go as one message, so the parent runs once for all of them: a head
+line (`[3 subagent reports, …]`) and then each report as above, its own head and key included, separated by `---`.
+Reports that arrive while the conversation is already running join that run.
+
+`failed` carries the error (a model call that failed, a run that ended without an answer); `cancelled` is a turn
+past the 30-minute ceiling, cancelled by the agent's next pass. A report is cut at 20,000 characters. A turn's end is
+read from what the engine committed when the run ended (pi085's run result, pd's settled submission), so a report is
+delivered by the first pass after it, whether or not the object was evicted or restarted meanwhile. It is delivered
+exactly once: the report is decided and kept on the subagent's row, posted unless the parent's conversation already
+holds its key (`report sub_…/<turn>`: on pd a submission under that request id, on pi085 an entry or queued input
+carrying it), and the row is marked delivered after the post. A crash before the post leaves it owed and the next pass
+posts it; a crash after leaves it owed and already there, and the next pass only marks it. A background job a
+subagent started that ends after its report starts another turn of the subagent, which reports in turn.
+
+**Stopping.** A stop of the agent — the provider's [stop](#stopping-a-turn-stop), a delete, `/admin/cancel-turn` —
+marks every running subagent `stopped` and drops every owed report, then cancels every subagent session: no model call
+follows, and no report is sent, since a report would wake the conversation the stop just ended. A stop that lands while a subagent's task is being posted is
+caught after the post, and the subagent's run is cancelled. One that lands while a report is being posted is caught at
+the last moment before the report is written, and nothing is written: a message the person sends after the stop is
+answered as theirs. Only a stop inside the write itself is caught after it, and then only the run the report started
+is cancelled, never the conversation. On pd a stop cancels the subagent conversations pi-durable says have live work,
+not every one the agent ever had. Any subagent run nothing tracks is cancelled by the agent's next pass. An Agents API
+session's cancel stops the subagents it started; deleting the session stops them and drops their reports. A report
+whose post fails is kept and tried again with backoff, at most 8 times; it holds up neither the other reports nor the
+rest of the pass.
+
+**Raft.** Activity and status come from the agent's own conversations only. A subagent's model calls and tool calls
+are neither activity nor status: a subagent's final answer is not a `Stop`, and does not show the agent `online`; its
+tools do not show as the agent's. The agent's own turn ends with its own `Stop` after it starts subagents, and it shows
+working again when a report wakes it and it calls the model. A subagent's work is in the [trace](#trace) only.
+
+**Cost.** A subagent's calls are the agent's: metered under its `agent_id`, and each call is admitted against the daily
+spend limits like any other. Its share is visible in the trace: its `model.call` rows name its session.
+
+**Known limits.** On pi085 a subagent's conversation has no compaction and no overflow backstop (both are the main
+conversation's), so a subagent's task must fit one context window. On pd every conversation's tools are opened when a
+cold isolate first drives the harness, so an agent with many past subagents pays for opening each of them then.
+Subagents cannot run commands: a sandbox without the agent's credentials, which a subagent could have, is a future
+change. There is no route or tool that stops one subagent alone. On pd the context window a subagent runs in is the agent's model's, not
+its model option's.
 
 ## Evaluation setup (preview only)
 
@@ -987,7 +1090,8 @@ carries.
 Each tool's `name`, `description` and `parameters` are exactly what the model is sent: the name as
 offered (`<alias>__<tool>`, as the harness names it, `offeredToolName`), the description with
 whatever the harness appends. `source` is `mount` for a mount's tool, `harness` for the harness's own
-(`run_js`, `resume`, `jobs`) and `caller` for an Agents API caller's function; a mount's tool also
+(`run_js`, `resume`, `jobs`, and `send_to_agent` where the agent's `subagents` setting is on) and `caller` for an Agents
+API caller's function; a mount's tool also
 carries `alias`, `plugin`, `tool` (its name in the plugin), `sideEffects`, `idempotency`, `replay`
 (whether the harness may run it again after an interruption: `safe` or `never`), and `modelOnly`,
 `reads` and `exclusive` where they are set.
@@ -1039,7 +1143,9 @@ answer with `/admin/transcript`'s for the same agent).
 `GET …/trace` answers the agent's trace rows — the spans of its work, one row each when it ended
 (`model.call`, `tool.call`, `approval.wait`, `container.lease`, `inbound`, `mount.seeded`,
 `rebuild.decision`, `rebuild.outcome`, `rebuild.behaviour`, `turn.timing`, `import.hold`, `model.prewarm`, `agent.ready`,
-`mount.settings` (an operator's in-place change of a mount's settings, [docs/plugins.md](plugins.md)), and the rows a plugin writes of its own, `raft.held`, `raft.held_answer` and `raft.state_failed` (written as `raft.state_save_failed` before Raft SDK 0.19.0)
+`mount.settings` (an operator's in-place change of a mount's settings, [docs/plugins.md](plugins.md)), `subagent.turn`
+(one turn of a [subagent](#subagents-send_to_agent) ending: `spanId` its session, `parentId` the tool call that sent the
+turn, `status` `done`, `failed` or `cancelled`, `attrs.parentSession`), and the rows a plugin writes of its own, `raft.held`, `raft.held_answer` and `raft.state_failed` (written as `raft.state_save_failed` before Raft SDK 0.19.0)
 ([docs/plugins.md](plugins.md)); `src/trace/outbox.ts`) — with `from <= at < to`, in `seq` order.
 
 - `from`, `to` — ISO 8601 or milliseconds since the epoch; the window is at most 24 hours. One alone
@@ -1059,7 +1165,8 @@ exported, and one exported between the two reads is found in its batch: no lag p
 What is never there: a span still open (a model call awaiting its answer, a tool still running), and
 anything the trace does not record (`src/trace/outbox.ts` names the documented silences). Each row is
 as exported: `{ seq, at, tenantId, agentId, kind, spanId, parentId?, status, verdict, ms?, attrs }`.
-A `model.call` row's `attrs` carry `model` and the answer's `input`, `cacheRead` and `cacheWrite` tokens;
+A `model.call` row's `attrs` carry `model`, `session` (the conversation that made the call: `main`, an Agents API
+session, or a subagent's `sub_…`) and the answer's `input`, `cacheRead` and `cacheWrite` tokens;
 on the pi085 engine also `prefix` (`src/runtime/request-prefix.ts`): the sha256 of the system prompt
 and of the tool list, the request's message count and characters, how many leading messages (and their
 characters) are the previous request's byte for byte, and `broken` — `system`, `tools`, `message`, or

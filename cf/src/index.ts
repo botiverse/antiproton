@@ -502,6 +502,13 @@ export class AgentDO extends DurableObject<Env> {
       reminderApp: { origin: this.env.REMINDER_APP_ORIGIN, credential: this.env.REMINDER_APP_CREDENTIAL },
       secretKek: this.env.SECRET_KEK,
       modelInputEvidence: evalSeedRoutes(this.env),
+      // The owner's model options: what a subagent may be started on (src/runtime/subagents.ts), under the same pins and
+      // switch as the agent's own pick.
+      userModels: userModelsFrom(this.env as unknown as Record<string, unknown>, operatorModelOf(this.env).providers),
+      subagentModelRules: async (tenantId, agentId) => ({
+        layers: await d1ModelChoices(this.env.CONTROL_DB).layers(tenantId, agentId),
+        pickerOff: modelPickerEnforced(this.env) && !(await d1TenantModelPicker(this.env.CONTROL_DB).enabled(tenantId)),
+      }),
       // Plugins may make their own mount's hooks (Raft push); the URL must be
       // one a service can reach, which the console's own origin may not be.
       hooks: this.env.HOOK_ORIGIN
@@ -1578,10 +1585,27 @@ export class AgentDO extends DurableObject<Env> {
       if (!(await rt.store.getModelBinding(tenantId, agentId))) {
         return { cancelledTurn: null as string | null, stoppedJobs: [] as string[], stillRunning: [] as string[] };
       }
-      const out = await rt.cancelSession(tenantId, agentId, sessionId);
+      // The session's subagents with it: they are its work (src/runtime/subagents.ts).
+      const { stoppedSubagents: _children, ...out } = await rt.cancelSessionTree(tenantId, agentId, sessionId);
       await this.#wake();
       await this.broadcast();
       return out;
+    });
+  }
+
+  /**
+   * Before a session is deleted (Agents API DELETE /sessions/:id): the subagents it started are stopped, and their owed
+   * reports dropped, so nothing it began keeps calling the model or wakes a conversation nobody can read any more.
+   */
+  async apiStopSessionSubagents(tenantId: string, agentId: string, sessionId: string) {
+    this.#claim(tenantId, agentId);
+    return this.#busy("apiStopSessionSubagents", async () => {
+      const rt = this.runtime();
+      await rt.ready();
+      if (!(await rt.store.getModelBinding(tenantId, agentId))) return { stoppedSubagents: [] as string[] };
+      const { stoppedSubagents } = await rt.cancelSessionTree(tenantId, agentId, sessionId, { childrenOnly: true });
+      await this.broadcast();
+      return { stoppedSubagents };
     });
   }
 
@@ -2026,6 +2050,17 @@ export class AgentDO extends DurableObject<Env> {
   async adminMountSettings(tenantId: string, agentId: string, alias: string, settings: Json) {
     this.#claim(tenantId, agentId);
     return this.#busy("adminMountSettings", () => this.runtime().updateMountSettings(tenantId, agentId, alias, settings));
+  }
+
+  /** The agent's settings and subagents (`/admin/agent-settings`); null for an agent that is not here. */
+  async adminAgentSettings(tenantId: string, agentId: string) {
+    this.#claim(tenantId, agentId);
+    return this.#busy("adminAgentSettings", () => this.runtime().agentSettingsOf(tenantId, agentId));
+  }
+
+  async adminUpdateAgentSettings(tenantId: string, agentId: string, settings: unknown) {
+    this.#claim(tenantId, agentId);
+    return this.#busy("adminUpdateAgentSettings", () => this.runtime().updateAgentSettings(tenantId, agentId, settings, "operator"));
   }
 
   async adminRefreshMountTools(tenantId: string, agentId: string, alias: string) {
@@ -3418,6 +3453,39 @@ async function adminHooks(request: Request, env: Env, url: URL): Promise<Respons
 }
 
 /**
+ * `/admin/agent-settings`, automation token only: an agent's own switches (src/runtime/agent-settings.ts), kept in its
+ * object. docs/runbook.md, "Subagents".
+ *
+ *   GET   ?tenantId=&agentId=                      → { settings, about, subagents }
+ *   PATCH { tenantId, agentId, settings: { subagents: true } } → { settings, changed, about }
+ *
+ * `about` says what each setting does (src/runtime/agent-settings.ts): for `subagents`, that they only read.
+ *
+ * `subagents` lists the agent's subagents, newest first, with each one's state and last outcome: what an operator reads
+ * to see what a stop stopped. 404 for an agent that is not there; a setting this does not know, or a value that is not
+ * a boolean, is 400 and nothing is written. A change is logged by the Worker as `agent.settings`.
+ */
+async function adminAgentSettings(request: Request, env: Env, url: URL): Promise<Response> {
+  if (!isOperator(env.AUTOMATION_TOKEN, request.headers.get("x-harness-token"))) {
+    return Response.json({ error: "unauthorized" }, { status: 401 });
+  }
+  if (request.method !== "GET" && request.method !== "PATCH") return Response.json({ error: "GET or PATCH" }, { status: 405 });
+  const b = request.method === "PATCH" ? (await request.json().catch(() => null)) as any : null;
+  const tenantId = String((b ? b.tenantId : url.searchParams.get("tenantId")) ?? "");
+  const agentId = String((b ? b.agentId : url.searchParams.get("agentId")) ?? "");
+  try { agentObjectName(tenantId, agentId); } catch (e: any) { return Response.json({ error: String(e?.message ?? e) }, { status: 400 }); }
+  const stub = env.AGENT.get(env.AGENT.idFromName(agentObjectName(tenantId, agentId)));
+  if (request.method === "GET") {
+    const r = await stub.adminAgentSettings(tenantId, agentId);
+    return r ? Response.json(r) : Response.json({ error: "no such agent, or it was deleted" }, { status: 404 });
+  }
+  const r = await stub.adminUpdateAgentSettings(tenantId, agentId, b?.settings);
+  if (!r.ok) return Response.json({ error: r.error }, { status: r.status });
+  logEvent("agent.settings", { tenantId, agentId, changed: r.changed.join(","), settings: JSON.stringify(r.settings) });
+  return Response.json({ settings: r.settings, changed: r.changed, about: r.about });
+}
+
+/**
  * `/admin/mounts`, automation token only: add one mount the defaults do not
  * give, for a test or an operator's setup. `POST {tenantId, agentId, alias,
  * plugin, config}` -> `{added}` (false when the same mount was already there).
@@ -3798,6 +3866,13 @@ async function v1(request: Request, env: Env, url: URL): Promise<Response> {
       },
       status: (agentId, sessionId) => agentStub(agentId).apiSessionStatus(tenantId, agentId, sessionId),
       cancel: async (agentId, sessionId) => { await agentStub(agentId).apiCancelSession(tenantId, agentId, sessionId); },
+      stopSubagents: async (agentId, sessionId) => { await agentStub(agentId).apiStopSessionSubagents(tenantId, agentId, sessionId); },
+      remove: async (agentId) => {
+        // The path a provider's delete takes (cf/src/provision/handlers.ts): the object's stopTurn with `delete`.
+        const r = await agentStub(agentId).stopTurn(tenantId, agentId, "delete").catch((e: unknown) => ({ result: "failed", error: String((e as Error)?.message ?? e).slice(0, 200) }));
+        // Logged here as the provider's delete logs its stop: the object's own line can be lost (cf/src/provision/handlers.ts).
+        logTurnStop({ tenantId, agentId, trigger: "delete", side: "worker" }, r as StopTurnOutcome);
+      },
       toolResults: (agentId, sessionId, results) => agentStub(agentId).apiToolResults(tenantId, agentId, sessionId, results),
       transcript: async (agentId, sessionId) =>
         JSON.parse(await agentStub(agentId).apiTranscript(tenantId, agentId, sessionId)) as {
@@ -4054,6 +4129,7 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
     if (url.pathname.startsWith("/hooks/")) return inboundHook(request, env, url, ctx);
     if (url.pathname === "/admin/hooks") return adminHooks(request, env, url);
     if (url.pathname === "/admin/mounts") return adminMounts(request, env);
+    if (url.pathname === "/admin/agent-settings") return adminAgentSettings(request, env, url);
     if (url.pathname === "/admin/models") {
       // A signed-in admin or the operator's token (auth.ts isAdmin); anyone else is told nothing.
       const v = await viewer(request, env);

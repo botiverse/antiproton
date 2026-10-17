@@ -1968,6 +1968,15 @@ export interface Plugin {
    */
   provides?: readonly ("container")[];
 
+  /**
+   * `self`: this plugin's writes act on nothing but the caller's own scratch — no message, no change anyone else sees,
+   * no credential used, nothing the agent's own memory or workspace keeps. Only such a plugin's writes are offered to a
+   * subagent (src/runtime/subagents.ts), which is read-only otherwise: a subagent is offered a tool only when its
+   * `sideEffects` is `read` or its plugin declares this, and its call to anything else, a program's included, is refused
+   * at dispatch. Absent — every plugin today — is "its writes may act as the agent": withheld from subagents. A new
+   * plugin is safe by default; declare this only for a plugin whose every write is the caller's own business.
+   */
+  actsAs?: "self";
   /** What a mount of this plugin may be configured with. */
   config?: ConfigField[];
   /**

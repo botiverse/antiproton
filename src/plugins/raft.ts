@@ -23,6 +23,7 @@ import {
 } from "./raft-agent-login.ts";
 import { internalHost } from "./http.ts";
 import { modelToolName } from "../runtime/pi-tools.ts";
+import { isSubagentSession } from "../runtime/subagent-session.ts";
 import { toAgentRef } from "../store/refs.ts";
 import {
   interrupt, originProblem,
@@ -502,7 +503,10 @@ function raftFor(ctx: PluginContext, options: { state?: false; response?: (res: 
       logEvent("raft.call", { ...line, status: res.status, ms: Date.now() - started });
       return options.response ? options.response(res) : res;
     },
-    ...(options.state === false ? {} : { state: stateStore(ctx, last) }),
+    // A subagent's client never has the saved state, whatever the caller asked for: everything that carries a call's
+    // bookings into it — a history read's cards and reads (`keepCardsShown`), a hold, an answer — builds its client
+    // here, so this one line keeps a subagent from writing what the agent's next call reads (`savesState` says why).
+    ...(options.state === false || isSubagentSession(ctx.caller.taskId) ? {} : { state: stateStore(ctx, last) }),
     // A save that failed or lost a race costs at most one repeated batch or one extra hold; it never fails
     // the call, and the SDK does not retry it; a load that failed is read as no state, with the same cost. Kept as a
     // trace row, which is stored with the agent's spans and read through its trace (`raft.state_failed`, its phase in
@@ -1207,6 +1211,17 @@ function retryKey(op: RaftOperationSpec, out: RaftFailure, sent: Record<string, 
   return out.error.retryable && typeof passed === "string" && passed.trim() ? passed.trim() : undefined;
 }
 
+/**
+ * Whether an operation runs on the mount's saved state. Not one that books "seen" (below, in `runOperation`), and not
+ * any call of a subagent (src/runtime/subagents.ts): a subagent only reads (`childMayCall`), and what it read is its
+ * own context's, which nothing it does later attests. Its calls also run beside the agent's: the store saves with a
+ * compare-and-set (`stateStore`), a lost race is not retried and costs the loser's bookings, so a subagent that saved
+ * could cost the agent what it had booked. On a state of its own for the call, it saves nothing and loses the agent nothing.
+ */
+export function savesState(op: Pick<RaftOperationSpec, "consumes">, ctx: Pick<PluginContext, "caller">): boolean {
+  return !op.consumes.model.includes("seen") && !isSubagentSession(ctx.caller.taskId);
+}
+
 /** One operation, run through the SDK's `invoke` under the caller's origin and context. */
 async function runOperation(
   op: RaftOperationSpec, args: unknown, ctx: PluginContext, unoffered: ReadonlySet<string>,
@@ -1221,7 +1236,7 @@ async function runOperation(
   // extra hold on a send after reading history, which asks the model with the newer messages: the safe side.
   // Only `messages.read` books it among the generated tools (the manifest's `consumes.model`; the inbox pulls,
   // which also do, are excluded and stay with receive_events).
-  const raft = raftFor(ctx, op.consumes.model.includes("seen") ? { state: false } : {});
+  const raft = raftFor(ctx, savesState(op, ctx) ? {} : { state: false });
   const keyed = await keyedInput(op, input, ctx, raft);
   // Taken before the request, so it is never later than when Raft first saw the key.
   const started = Date.now();

@@ -78,6 +78,9 @@ const ROUTES: Route[] = [
   { path: "/admin/mounts", method: "GET", refused: 401, passed: (s) => s === 405 },
   // An in-place settings change; with no body its agent is not named, a 400 only a caller past the gate is given.
   { path: "/admin/mounts", method: "PATCH", refused: 401, passed: (s) => s === 400 },
+  // An agent's settings (src/runtime/agent-settings.ts): the read is a call on the object; a PATCH with no body names no agent.
+  { path: "/admin/agent-settings?tenantId=demo&agentId=u-a", method: "GET", refused: 401, passed: (s, c) => s === 200 && c.includes("object.adminAgentSettings") },
+  { path: "/admin/agent-settings", method: "PATCH", refused: 401, passed: (s, c) => s === 400 && !c.some((x) => x.startsWith("object.")) },
   { path: "/admin/service-tokens", method: "PATCH", refused: 401, passed: (s) => s === 405 },
   { path: "/admin/provider-tokens", method: "PATCH", refused: 401, passed: (s) => s === 405 },
   { path: "/admin/usage-costs", method: "GET", refused: 401, passed: (s, c) => s === 200 && c.includes("db.all") },

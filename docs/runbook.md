@@ -114,3 +114,56 @@ Only settings the plugin marks `changeable` are accepted (`conversationCards` an
 an undeclared key is `400`, a value of the wrong type is `400`, and an agent or alias that is not there is `404`. Each
 change writes a `mount.settings` line to the Workers logs (filter on `evt` = `mount.settings`) and a `mount.settings`
 row to the agent's trace.
+
+## Subagents
+
+An agent can delegate work to subagents (docs/agent-surface.md, "Subagents") only where its `subagents` setting is on.
+It is off for every agent unless set. Subagents can read and research but cannot change anything or act as this agent: no writes, no messages, no shell. Give them reading tasks and do the changes yourself. Turn it on for one agent:
+
+```
+curl -s -X PATCH -H "x-harness-token: $AUTOMATION_TOKEN" -H "content-type: application/json" \
+  "$HOST/admin/agent-settings" -d '{"tenantId":"<tenantId>","agentId":"<agentId>","settings":{"subagents":true}}'
+```
+
+The answer is the settings in force, what moved, and what each setting does: `{"settings":{"subagents":true},
+"changed":["subagents"],"about":{"subagents":"…"}}`. The
+agent's next turn is offered `send_to_agent`; a turn already running keeps the tools it started with. Off again is the
+same call with `false`. **Turning it off does not stop subagents already running**: they finish and report. To stop
+them, stop the agent's turn with `/admin/cancel-turn` ([Stopping a runaway agent](#stopping-a-runaway-agent)), which
+stops every subagent with it. An unknown setting or a value that is not a
+boolean is `400` and nothing is written; an agent that is not there is `404`. Each change is an `agent.settings` line in
+the Workers logs.
+
+To see an agent's subagents and the setting:
+
+```
+curl -s -H "x-harness-token: $AUTOMATION_TOKEN" "$HOST/admin/agent-settings?tenantId=<tenantId>&agentId=<agentId>"
+```
+
+`subagents` lists them, newest first: `id` (the child's session, `sub_…`), `parentSession`, `state` (`running` while a
+turn is in flight, else `idle`), `turns`, `outcome` of the last turn (`done`, `failed`, `cancelled` at the 30-minute
+ceiling, `stopped` with its parent), and `modelOption`. A child's work is in the agent's trace, its rows naming its
+session (`model.call` `attrs.session`, `tool.call` `attrs.task`) and one `subagent.turn` row per turn (`done`, `failed`,
+`cancelled`, `stopped`, or `report_failed` for a post that will be retried). A child's transcript is read like the
+agent's: `/admin/transcript?tenantId=<tenantId>&agentId=<agentId>&taskId=sub_…`.
+
+A delete — the provider's (`DELETE /provision/agents/…`) or an Agents API agent's (`DELETE /v1/agents/{id}`, which
+until now only removed the owner's index row) — stops the agent's turn and every subagent in the agent's own object and
+marks it deleted, so nothing it began calls the model again. After it, `/admin/agent-settings` answers `404` for read
+and change. `/admin/transcript` still reads the deleted agent's conversations and its subagents', for what happened:
+a delete keeps the object's data.
+
+**Stopping.** A stop of the agent stops its subagents with it: `/admin/cancel-turn`, the provider's stop and a delete
+([Stopping a runaway agent](#stopping-a-runaway-agent)) mark every running subagent `stopped` and cancel its turn, on
+both engines, and no report is sent (a report would wake the turn the stop ended). `/admin/cancel-turn` answers
+`interrupted` when only subagents were running, too. There is no route that stops one subagent alone. While any
+subagent runs, a fresh context and a reset refuse, as they do for a running turn. An Agents API session's cancel stops
+the subagents that session started, and deleting the session stops them first and drops their owed reports.
+
+Each pass also cancels any subagent session that has work while nothing tracks it — no row, or a row a stop ended (a
+run that landed as the stop did) — logged as `subagent.stray`. A finished subagent's own background job is not that:
+it runs to its end, and its completion wakes the subagent under its limits. A subagent lives at most 2 hours from its creation and takes at most 10 turns;
+each turn is cancelled after 30 minutes. A report whose post fails stays owed and is retried with backoff (5 s doubling
+to 10 minutes), each failure a `subagent.turn` row with status `report_failed`; after 8 attempts it is dropped
+(`report_dropped`) and the subagent is idle with outcome `report_failed`. A subagent whose model option a pin or the
+picker switch overrides after its spawn writes a `subagent.model_changed` row, and its next report says so.

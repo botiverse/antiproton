@@ -1097,6 +1097,30 @@ await check("conversation cards a history read showed are booked for the next ca
   if (!(heldAgain instanceof Interrupt) || after[0]?.seenCards?.channel !== null) throw new Error(`a parked read booked its card: ${JSON.stringify(after)}`);
 });
 
+await check("a subagent's history read leaves the agent's saved Raft state byte-identical, cards and reads alike", async () => {
+  // A subagent (src/runtime/subagents.ts) speaks for no one, so what it read is booked nowhere the agent's next call reads:
+  // whatever a history read carries into the saved state (its cards here, and with SDK 0.20.0 the read itself) is the
+  // agent's only when the agent read it.
+  const read = () => json(200, {
+    target: "#general", messages: [historyMessage(5, "hello", { channel_name: "general" })], has_more: false, has_older: false, has_newer: false,
+    channel_card: CARD,
+  });
+  const m = cardsMount();
+  const saved = () => JSON.stringify(m.fresh.tables.get(m.fresh.scope, INBOX_STORE, "state") ?? null);
+  // The agent's own read first, so there is a state to keep, and to show the same read does write it (the control).
+  const empty = saved();
+  many(read());
+  await raftPlugin.invoke("messages_read", { target: "#general" }, m.ctx);
+  const before = saved();
+  if (before === empty) throw new Error("control: the agent's own read booked nothing");
+  // The subagent's read, in its own context: same mount, same database.
+  const child = { ...m.ctx, caller: { ...m.ctx.caller, taskId: "sub_0123456789abcdef", contextId: "ctx_sub_child" } };
+  many(read());
+  const out = await raftPlugin.invoke("messages_read", { target: "#general" }, child) as any;
+  if (!out.text.startsWith("Channel #general (public): Where the team talks.")) throw new Error(`control: the subagent's read: ${out.text}`);
+  if (saved() !== before) throw new Error(`a subagent's read wrote the agent's state: ${saved()}`);
+});
+
 await check("a state save that fails is a raft.state_failed trace row, with its phase, the error and the record's size in UTF-8 bytes, and a console line; the call still answers", async () => {
   const m = cardsMount({});
   const db = Object.create(m.ctx.db);
