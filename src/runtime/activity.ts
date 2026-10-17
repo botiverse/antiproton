@@ -13,6 +13,7 @@
  *
  *   inbound, delivered      → UserPromptSubmit   (a message entered the model)
  *   tool.call               → PreToolUse + PostToolUse / PostToolUseFailure  (not one the provider ran: `operatorCall`)
+ *                             both with `toolUseId`; the end with `ok`, `durationMs`, and `exitCode` when there is one
  *   turn.stop stopped       → BridgeFatal         (the turn was ended from outside: `stopped: by owner`, `stopped: agent deleted`, …)
  *   model.call stop|length  → Stop                (the turn is answered)
  *   model.call aborted      → Stop                (cancelled: no longer working)
@@ -105,12 +106,25 @@ function hookEvents(agentId: string, rows: readonly TraceOutboxRow[]): ActivityE
         const toolName = mount ? `${mount}__${tool}` : tool;
         const ok = row.verdict === "ok";
         const ms = typeof row.ms === "number" ? row.ms : 0;
-        out.push({ eventId: `${base.eventId}:pre`, occurredAt: new Date(row.at - ms).toISOString(), hookEventName: "PreToolUse", toolName });
+        // The operation id, on both events, is what pairs them: one per call and one row per operation
+        // (src/trace/seams.ts `operationEnds`). Not the model's call id, which a run_js program's host calls
+        // share and a resumed question reuses.
+        const toolUseId = row.spanId;
+        // How long the tool ran: from the attempt's start when the row says it (`attrs.runMs`), so a call held
+        // for a person's approval does not count the wait; otherwise the whole span. The call itself stays dated
+        // at the request, when the model asked for it.
+        const runMs = typeof row.attrs.runMs === "number" ? row.attrs.runMs : null;
+        const durationMs = runMs ?? (typeof row.ms === "number" ? row.ms : null);
+        const exitCode = typeof row.attrs.exitCode === "number" ? row.attrs.exitCode : null;
+        out.push({ eventId: `${base.eventId}:pre`, occurredAt: new Date(row.at - ms).toISOString(), hookEventName: "PreToolUse", toolName, toolUseId });
         out.push({
           ...base,
           hookEventName: ok ? "PostToolUse" : "PostToolUseFailure",
           toolName,
-          ...(typeof row.ms === "number" ? { durationMs: row.ms } : {}),
+          toolUseId,
+          ok: toolOutcome(row.status, row.attrs.denied === true),
+          ...(durationMs === null ? {} : { durationMs }),
+          ...(exitCode === null ? {} : { exitCode }),
           ...(ok ? {} : { errorClass: row.status }),
         });
         break;
@@ -132,6 +146,22 @@ function hookEvents(agentId: string, rows: readonly TraceOutboxRow[]): ActivityE
     }
   }
   return out;
+}
+
+/**
+ * `ok` on a tool's end, from the operation's status (`row.status`, written verbatim): whether the call did what it
+ * was asked. `succeeded` is true even for a command that exited non-zero (`exitCode` says that); `failed` and
+ * `rejected` are false; `unknown` (the outcome was lost) and `cancelled` are null, which the service reads as "not
+ * known" — sent as an explicit null, not left out. A held call a person refused ends `cancelled` too, but is false
+ * (`attrs.denied`, src/trace/seams.ts): the call was refused, as a policy refusal is, which is not an unknown outcome.
+ */
+export function toolOutcome(status: string, denied = false): boolean | null {
+  if (denied) return false;
+  switch (status) {
+    case "succeeded": return true;
+    case "failed": case "rejected": return false;
+    default: return null;
+  }
 }
 
 /**

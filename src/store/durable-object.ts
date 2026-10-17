@@ -8,7 +8,7 @@ import type {
   OperationRecord, OperationStatus, RuntimeEvent, TaskRecord, WaitSpec,
 } from "../core/types.ts";
 import { appendTrace, type TraceRow } from "../trace/outbox.ts";
-import { approvalRow, operationEnded, toolCallRow } from "../trace/seams.ts";
+import { approvalRow, operationEnds, toolCallRow } from "../trace/seams.ts";
 import {
   applySeedPass, markSeedsChosen, pendingSeedNotices, readSeedRecord, returnSeedNotices, SEED_RECORD_SCHEMA, takeSeedNotices, voidSeedNotices,
   type SeedNoticeRow, type SeedPlan,
@@ -470,6 +470,8 @@ export class DurableObjectStore implements StorageAdapter {
   ) {
     this.#tx(() => {
       const endedAt = this.#now();
+      // Read before the write, in the same transaction: whether this completion is the operation's end (operationEnds).
+      const prior = this.#one("SELECT status FROM operations WHERE tenant_id=? AND operation_id=?", tenantId, operationId);
       this.#sql.exec(
         "UPDATE operations SET status=?, result_ref=?, updated_at=? WHERE tenant_id=? AND operation_id=?",
         status, resultRef, endedAt, tenantId, operationId);
@@ -484,12 +486,14 @@ export class DurableObjectStore implements StorageAdapter {
           payload: completedPayload(operationId, status, resultRef, result, facts), dedupKey: `op:${operationId}:completed`,
         });
         // The trace row, in the same transaction as the fact it joins back to
-        // (src/trace/seams.ts). "running" is not an end and writes none.
-        if (operationEnded(status)) {
+        // (src/trace/seams.ts). "running" is not an end and writes none, and
+        // neither does completing an operation that had already ended.
+        if (operationEnds(prior ? prior.status : null, status)) {
           appendTrace(this.#sql, [toolCallRow({
             tenantId, agentId: op.agent_id, taskId: op.task_id, operationId,
             mountAlias: op.mount_alias, tool: op.tool, status,
             createdAt: Number(op.created_at), endedAt, callId: facts?.callId ?? null,
+            exitCode: facts?.exitCode ?? null, startedAt: facts?.startedAt ?? null, denied: facts?.denied === true,
           })]);
         }
       }
