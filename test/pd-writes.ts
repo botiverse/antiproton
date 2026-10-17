@@ -177,7 +177,6 @@ const wholeObject: DriveCase = {
 
       const kinds = new Set(raw.sql.exec("SELECT kind FROM do_activity").toArray().map((r) => String((r as { kind: unknown }).kind)));
       for (const k of ["uiSay", "uiDecide", "apiPostInput", "apiToolResults", "apiCancelSession", "alarm", "deliver", "offload_dispatch", "offload_provider"]) check(kinds.has(k), `no do_activity row of kind ${k}: ${show([...kinds])}`);
-      check(raw.sql.exec("SELECT COUNT(*) AS n FROM alarms").toArray()[0] as { n: number }, "no alarm rows");
       // The object was pd from its first wake, so nothing above — the constructor, the console, the API, the alarms,
       // the queue — made a pi085 table: the engine keeps its own records.
       const pi = raw.sql.exec("SELECT name FROM sqlite_master").toArray().map((r) => String(r.name)).filter((n) => n.startsWith("pi_"));
