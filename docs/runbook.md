@@ -142,7 +142,10 @@ curl -s -H "x-harness-token: $AUTOMATION_TOKEN" "$HOST/admin/agent-settings?tena
 `subagents` lists them, newest first: `id` (the child's session, `sub_…`), `parentSession`, `state` (`running` while a
 turn is in flight, else `idle`), `turns`, `outcome` of the last turn (`done`, `failed`, `cancelled` at the 30-minute
 ceiling, `stopped` with its parent), and `modelOption`. A child's work is in the agent's trace, its rows naming its
-session (`model.call` `attrs.session`, `tool.call` `attrs.task`) and one `subagent.turn` row per turn.
+session (`model.call` `attrs.session`, `tool.call` `attrs.task`) and one `subagent.turn` row per turn (`done`, `failed`,
+`cancelled`, `stopped`, or `report_failed` for a post that will be retried). A child's transcript is read like the
+agent's: `/admin/transcript?tenantId=<tenantId>&agentId=<agentId>&taskId=sub_…`. For a deleted agent the route answers
+`404`; its subagents were stopped by the delete.
 
 **Stopping.** A stop of the agent stops its subagents with it: `/admin/cancel-turn`, the provider's stop and a delete
 ([Stopping a runaway agent](#stopping-a-runaway-agent)) mark every running subagent `stopped` and cancel its turn, on
