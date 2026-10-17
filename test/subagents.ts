@@ -192,7 +192,12 @@ async function mainTexts(w: World, role: "user" | "assistant" = "user", session 
     return typeof c === "string" ? c : (c ?? []).filter((p: any) => p.type === "text").map((p: any) => p.text).join("");
   });
 }
-const reports = async (w: World, session = "main") => (await mainTexts(w, "user", session)).filter((t) => t.startsWith("[subagent "));
+/** Each subagent report the conversation received, one per block: reports owed together arrive as one message. */
+const reports = async (w: World, session = "main") => (await mainTexts(w, "user", session))
+  .filter((t) => /^\[(subagent |\d+ subagent reports)/.test(t))
+  .flatMap((t) => t.split(/(?=\[subagent sub_)/).filter((b) => b.startsWith("[subagent ")));
+/** The messages that carried reports. */
+const reportMessages = async (w: World, session = "main") => (await mainTexts(w, "user", session)).filter((t) => /^\[(subagent |\d+ subagent reports)/.test(t));
 const rowsOf = (w: World) => w.raw.sql.exec("SELECT * FROM subagents ORDER BY created_at, id").toArray() as any[];
 const toolNames = (req: Req) => (req.tools ?? []).map((t: any) => t.name ?? t.function?.name);
 const taskOf = (req: Req) => {
@@ -514,19 +519,28 @@ for (const engine of (process.env.ENGINES ?? "pi085,pd").split(",").filter((e) =
       `a pin set after the spawn was not applied: ${show(childCalls.map((c) => c.operatorModel))}`);
   });
 
-  await check(`${engine}: one report that fails to post does not hold up the others or the rest of the pass`, async () => {
+  await check(`${engine}: one report that fails to post does not hold up another conversation's, or the rest of the pass`, async () => {
     const w = await world(engine);
-    let parentCalls = 0;
+    const calls_ = new Map<string, number>();
+    let release = false;
     w.reply = (session, req) => {
-      if (session === "main") { parentCalls++; return parentCalls === 1 ? calls({ id: "c1", args: { task: "A" } }, { id: "c2", args: { task: "B" } }) : say("ok"); }
-      return say(`answer ${/task \(task (sub_[0-9a-f]+)/.exec(JSON.stringify(req.messages))?.[1]}`);
+      if (!session.startsWith("sub_")) {
+        const n = (calls_.get(session) ?? 0) + 1;
+        calls_.set(session, n);
+        return n === 1 ? calls({ id: `c_${session}`, args: { task: `from ${session}` } }) : say("ok");
+      }
+      return release ? say(`answer to ${/from (\w+)/.exec(taskOf(req))?.[1]}`) : null;
     };
     let failing: string | null = null;
-    w.fault.at = (p, id) => { if (p === "report-posting") { failing ??= id; if (id === failing) throw new Error("the parent's lane said no"); } };
     await w.rt.postMessage("t", "a", "go", "prompt", "main");
-    for (let i = 0; i < 12; i++) { const out = await pass(w); void out; await sleep(5); }
-    const rs = await reports(w);
-    must(failing && rs.length === 1 && !rs[0]!.includes(failing), `the other report did not arrive: ${show(rs)}`);
+    await w.rt.postMessage("t", "a", "go", "prompt", "sess_b");
+    for (let i = 0; i < 6; i++) await pass(w);
+    failing = rowsOf(w).find((r) => r.parent_session === "main")?.id ?? null;
+    must(failing && rowsOf(w).length === 2, show(rowsOf(w)));
+    w.fault.at = (p, id) => { if (p === "report-posting" && id === failing) throw new Error("the parent's lane said no"); };
+    release = true;
+    for (let i = 0; i < 12; i++) { await pass(w); await sleep(5); }
+    must((await reports(w, "sess_b")).length === 1 && (await reports(w, "main")).length === 0, `the other conversation's report did not arrive`);
     const owed = rowsOf(w).find((r) => r.id === failing)!;
     must(owed.state === "reporting" && owed.report_attempts >= 1 && owed.report_retry_at > Date.now() - 1_000, show(owed));
     must(trace(w).some((r) => r.kind === "subagent.turn" && r.status === "report_failed" && r.spanId === failing), "no trace row for the failed post");
@@ -534,7 +548,7 @@ for (const engine of (process.env.ENGINES ?? "pi085,pd").split(",").filter((e) =
     w.fault.at = null;
     w.raw.sql.exec("UPDATE subagents SET report_retry_at = 0 WHERE id = ?", failing);
     await settle(w);
-    must((await reports(w)).length === 2 && rowsOf(w).every((r) => r.state === "idle"), show(rowsOf(w)));
+    must((await reports(w, "main")).length === 1 && rowsOf(w).every((r) => r.state === "idle"), show(rowsOf(w)));
   });
 
   await check(`${engine}: a background wake respects the owed report, the turn cap and the lifetime`, async () => {
@@ -722,6 +736,58 @@ for (const engine of (process.env.ENGINES ?? "pi085,pd").split(",").filter((e) =
     const t0 = Date.now();
     await w.rt.stopTurn("t", "a", "provider_stop");
     must(opens() === before, `the stop opened ${opens() - before} finished children in ${Date.now() - t0} ms`);
+  });
+
+
+  await check(`${engine}: three children finishing in the same pass report in one message, and the parent runs once`, async () => {
+    const w = await world(engine);
+    let parentCalls = 0;
+    let release = false;
+    w.reply = (session, req) => {
+      if (session === "main") {
+        parentCalls++;
+        return parentCalls === 1 ? calls(...[1, 2, 3].map((i) => ({ id: `c${i}`, args: { task: `part ${i}` } }))) : say(`noted ${parentCalls}`);
+      }
+      return release ? say(`report of part ${/part (\d)/.exec(taskOf(req))?.[1]}`) : null;
+    };
+    await w.rt.postMessage("t", "a", "go", "prompt", "main");
+    for (let i = 0; i < 6; i++) await pass(w);
+    must(rowsOf(w).length === 3 && rowsOf(w).every((r) => r.state === "running"), show(rowsOf(w)));
+    const before = w.requests.filter((r) => r.session === "main").length;
+    // All three answers land before the next pass, so it finds every turn ended together.
+    release = true;
+    for (const id of w.sent.filter((x) => !w.answered.has(x))) {
+      const job = await w.rt.takeJob("t", "a", id).catch(() => null) as Job | null;
+      if (!job) continue;
+      w.answered.add(id); w.held.delete(id);
+      const req = toRequest(job.context);
+      w.requests.push({ session: sessionOfJob(w, id), req, operatorModel: job.operatorModel ?? null });
+      await w.rt.deliverAnswer("t", "a", id, fromResponse(w.reply(sessionOfJob(w, id), req) as ModelResponse, job.model, id), undefined);
+    }
+    await settle(w);
+    const msgs = await reportMessages(w);
+    must(msgs.length === 1 && (await reports(w)).length === 3, `${msgs.length} messages for ${(await reports(w)).length} reports`);
+    for (const n of [1, 2, 3]) must(msgs[0]!.includes(`report of part ${n}`) && /\(report sub_[0-9a-f]+\/1\)/.test(msgs[0]!), `part ${n} missing`);
+    const after = w.requests.filter((r) => r.session === "main").length - before;
+    must(after === 1, `the parent ran ${after} times for three reports`);
+  });
+
+  await check(`${engine}: an Agents API agent's delete stops its turn and its subagents in its object; its settings answer 404`, async () => {
+    const w = await world(engine);
+    await w.rt.store.updateAgentConfig("t", "a", { openai: { tools: [] } } as never);
+    let parentCalls = 0;
+    w.reply = (session) => session === "sess_api" ? (++parentCalls === 1 ? calls({ id: "c1", args: { task: "long" } }) : say("ok")) : null;
+    await w.rt.postMessage("t", "a", "go", "prompt", "sess_api");
+    for (let i = 0; i < 6; i++) await pass(w);
+    must(rowsOf(w)[0]?.state === "running", show(rowsOf(w)));
+    // `agents.remove`, as cf/src/index.ts wires it: the object's stopTurn with `delete`.
+    await w.rt.stopTurn("t", "a", "delete");
+    must(rowsOf(w)[0]!.outcome === "stopped", show(rowsOf(w)));
+    w.reply = () => say("late");
+    const sent = w.sent.length;
+    for (let i = 0; i < 6; i++) { await pass(w); await sleep(10); }
+    must(w.sent.length === sent, `${w.sent.length - sent} model calls after the delete`);
+    must(await w.rt.agentSettingsOf("t", "a") === null, "the deleted agent's settings still answer");
   });
 
   await check(`${engine}: a follow-up to a subagent still running, or to an id this conversation never started, is refused`, async () => {

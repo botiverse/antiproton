@@ -65,6 +65,12 @@ export interface AgentsApiDeps {
     cancel(agentId: string, sessionId: string): Promise<void>;
     /** Stop the subagents the session started and drop their owed reports, before the session is deleted. */
     stopSubagents(agentId: string, sessionId: string): Promise<void>;
+    /**
+     * End the agent in its own object, before its index row goes: its running turn and every subagent stopped, and the
+     * object marked deleted, as a provider's delete does (`stopTurn` with `delete`), so nothing it began goes on calling
+     * the model and nothing new runs. A stop that fails does not fail the delete.
+     */
+    remove(agentId: string): Promise<void>;
     /** The session's pi entries, oldest first, and whether its lane is running now. */
     transcript(agentId: string, sessionId: string): Promise<{ entries: unknown[]; running: boolean; pending: PendingCall[] }>;
   };
@@ -401,6 +407,7 @@ export async function handleAgentsApi(
     if (!a) return notFound("agent", id);
     if (method === "GET") return ok(toOpenAIAgent(id, await shown(deps, id, a)));
     if (method === "DELETE") {
+      await deps.agents.remove(id);
       await deps.index.deleteAgent(id);
       // Its pick too: model_choices is keyed by the agent, and no agent is left to read it.
       await deps.models.remove(id);

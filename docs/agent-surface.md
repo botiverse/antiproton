@@ -790,6 +790,10 @@ the conversation needs a reset, carries a rebuild's pending briefing and any not
 <the subagent's final answer>
 ```
 
+Reports owed to one conversation in the same pass go as one message, so the parent runs once for all of them: a head
+line (`[3 subagent reports, …]`) and then each report as above, its own head and key included, separated by `---`.
+Reports that arrive while the conversation is already running join that run.
+
 `failed` carries the error (a model call that failed, a run that ended without an answer); `cancelled` is a turn
 past the 30-minute ceiling, cancelled by the agent's next pass. A report is cut at 20,000 characters. A turn's end is
 read from what the engine committed when the run ended (pi085's run result, pd's settled submission), so a report is

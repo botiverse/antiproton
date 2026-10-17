@@ -3865,6 +3865,12 @@ async function v1(request: Request, env: Env, url: URL): Promise<Response> {
       status: (agentId, sessionId) => agentStub(agentId).apiSessionStatus(tenantId, agentId, sessionId),
       cancel: async (agentId, sessionId) => { await agentStub(agentId).apiCancelSession(tenantId, agentId, sessionId); },
       stopSubagents: async (agentId, sessionId) => { await agentStub(agentId).apiStopSessionSubagents(tenantId, agentId, sessionId); },
+      remove: async (agentId) => {
+        // The path a provider's delete takes (cf/src/provision/handlers.ts): the object's stopTurn with `delete`.
+        const r = await agentStub(agentId).stopTurn(tenantId, agentId, "delete").catch((e: unknown) => ({ result: "failed", error: String((e as Error)?.message ?? e).slice(0, 200) }));
+        // Logged here as the provider's delete logs its stop: the object's own line can be lost (cf/src/provision/handlers.ts).
+        logTurnStop({ tenantId, agentId, trigger: "delete", side: "worker" }, r as StopTurnOutcome);
+      },
       toolResults: (agentId, sessionId, results) => agentStub(agentId).apiToolResults(tenantId, agentId, sessionId, results),
       transcript: async (agentId, sessionId) =>
         JSON.parse(await agentStub(agentId).apiTranscript(tenantId, agentId, sessionId)) as {

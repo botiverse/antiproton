@@ -144,8 +144,13 @@ turn is in flight, else `idle`), `turns`, `outcome` of the last turn (`done`, `f
 ceiling, `stopped` with its parent), and `modelOption`. A child's work is in the agent's trace, its rows naming its
 session (`model.call` `attrs.session`, `tool.call` `attrs.task`) and one `subagent.turn` row per turn (`done`, `failed`,
 `cancelled`, `stopped`, or `report_failed` for a post that will be retried). A child's transcript is read like the
-agent's: `/admin/transcript?tenantId=<tenantId>&agentId=<agentId>&taskId=sub_…`. For a deleted agent the route answers
-`404`; its subagents were stopped by the delete.
+agent's: `/admin/transcript?tenantId=<tenantId>&agentId=<agentId>&taskId=sub_…`.
+
+A delete — the provider's (`DELETE /provision/agents/…`) or an Agents API agent's (`DELETE /v1/agents/{id}`, which
+until now only removed the owner's index row) — stops the agent's turn and every subagent in the agent's own object and
+marks it deleted, so nothing it began calls the model again. After it, `/admin/agent-settings` answers `404` for read
+and change. `/admin/transcript` still reads the deleted agent's conversations and its subagents', for what happened:
+a delete keeps the object's data.
 
 **Stopping.** A stop of the agent stops its subagents with it: `/admin/cancel-turn`, the provider's stop and a delete
 ([Stopping a runaway agent](#stopping-a-runaway-agent)) mark every running subagent `stopped` and cancel its turn, on

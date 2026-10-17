@@ -4424,7 +4424,10 @@ export class AgentRuntime {
     if (this.#isPd()) {
       const conversation = pdConversationId(sql as never, session);
       if (conversation === null || !has("pd_submissions")) return null;
-      const row = sql.exec("SELECT id FROM pd_submissions WHERE conversation_id = ? AND request_id = ? ORDER BY id LIMIT 1", conversation, key).toArray()[0] as { id?: unknown } | undefined;
+      // Under its request id, or carried in a submission's text: reports posted together share one message, whose
+      // request id is the first one's key.
+      const row = sql.exec("SELECT id FROM pd_submissions WHERE conversation_id = ? AND (request_id = ? OR instr(record, ?) > 0) ORDER BY id LIMIT 1",
+        conversation, key, key).toArray()[0] as { id?: unknown } | undefined;
       return row ? { op: String(row.id) } : null;
     }
     const t = piTables(session);
@@ -4471,48 +4474,66 @@ export class AgentRuntime {
         appendTrace(sql, [subagentTurnRow(owner, s, end.outcome, now)]);
       } catch (e) { console.error(`the subagent.turn row of ${tenantId}/${agentId} could not be written:`, e); }
     }
+    // Every report owed to one conversation in this pass goes as one message, so the parent runs once for all of them;
+    // each keeps its own block and key (`reportKey`), which is what "already posted" is read by. Reports that arrive
+    // while the parent runs join that run (a steer), so they too are answered in one turn.
     let reported = 0;
+    const groups = new Map<string, Subagent[]>();
     for (const s of reportingSubagents(sql, owner)) {
       await this.#deps.subagentFault?.("report-decided", s.id);
       // A task that is over takes no report, as it takes no background completion (`step`).
       if (this.#deps.ended?.(owner) === true) { markReported(sql, owner, s.id); continue; }
+      groups.set(s.parentSession, [...(groups.get(s.parentSession) ?? []), s]);
+    }
+    for (const [parent, owed] of groups) {
+      // Read again at the post: a stop since the list was read dropped them (`stopRunningSubagents`).
+      const stillOwed = () => owed.every((s) => subagentOf(sql, owner, s.id)?.state === "reporting");
+      if (!stillOwed()) continue;
+      // One already in the conversation (a pass that crashed after its post) is not posted again, only marked.
+      const fresh = owed.filter((s) => !this.#postedOp(parent, reportKey(s)));
       try {
-        // Read again at the post: a stop since the list was read dropped it (`stopRunningSubagents`).
-        if (subagentOf(sql, owner, s.id)?.state !== "reporting") continue;
-        await this.#deps.subagentFault?.("report-posting", s.id);
-        // Checked again at the last synchronous point before the write (`postMessage`'s `unless`): the post awaits the
-        // catalogue and the tool lists first, and a stop, or a stop and the person's next message, can land meanwhile.
-        const posted = await this.#postOnce(tenantId, agentId, s.parentSession, s.report ?? "", reportKey(s), "postMessage",
-          () => subagentOf(sql, owner, s.id)?.state !== "reporting");
-        if (posted.skipped) continue;
-        // A stop that landed inside the write itself, after that check: the report is in, and the run it started — only
-        // that run, never the conversation, which the person may have spoken to since — is cancelled.
-        if (subagentOf(sql, owner, s.id)?.state !== "reporting") {
-          await this.#cancelOwnRun(tenantId, agentId, s.parentSession, posted.op)
-            .catch((e) => console.error(`cancelling the run ${tenantId}/${agentId}'s report started after a stop failed:`, e));
-          continue;
+        if (fresh.length) {
+          for (const s of fresh) await this.#deps.subagentFault?.("report-posting", s.id);
+          const text = fresh.length === 1 ? fresh[0]!.report ?? ""
+            : `[${fresh.length} subagent reports, each below with its own head; notices from the harness, not messages from the user.]\n\n` +
+              fresh.map((s) => s.report ?? "").join("\n\n---\n\n");
+          // Checked again at the last synchronous point before the write (`postMessage`'s `unless`): the post awaits the
+          // catalogue and the tool lists first, and a stop, or a stop and the person's next message, can land meanwhile.
+          const posted = await this.#postOnce(tenantId, agentId, parent, text, reportKey(fresh[0]!), "postMessage", () => !stillOwed());
+          if (posted.skipped) continue;
+          // A stop that landed inside the write itself, after that check: the reports are in, and the run they started —
+          // only that run, never the conversation, which the person may have spoken to since — is cancelled.
+          if (!stillOwed()) {
+            await this.#cancelOwnRun(tenantId, agentId, parent, posted.op)
+              .catch((e) => console.error(`cancelling the run ${tenantId}/${agentId}'s report started after a stop failed:`, e));
+            continue;
+          }
         }
       } catch (e) {
         if (e instanceof SessionNeedsReset) {
           // Dropped, as a background completion is (`refusedForReset`): the conversation takes nothing until it is reset.
           refusedForReset(e, tenantId, agentId, "subagent report");
-          markReported(sql, owner, s.id);
+          for (const s of owed) markReported(sql, owner, s.id);
           continue;
         }
-        // Owed still, and tried again later, until `REPORT_MAX_ATTEMPTS`, when it is dropped; this pass goes on to the
-        // other reports and the rest of the step.
-        const { attempts, dropped } = reportFailed(sql, owner, s.id, Date.now());
+        // Owed still, and tried again later, until `REPORT_MAX_ATTEMPTS`, when each is dropped; this pass goes on to the
+        // other conversations' reports and the rest of the step.
         const error = String((e as Error)?.message ?? e).slice(0, 200);
-        console.error(`posting ${tenantId}/${agentId}'s subagent ${s.id} report failed (attempt ${attempts}${dropped ? ", dropped" : ""}):`, e);
-        try {
-          appendTrace(sql, [subagentTurnRow(owner, s, "report_failed", Date.now(), { attempts, error }),
-            ...(dropped ? [subagentTurnRow(owner, s, "report_dropped", Date.now(), { attempts, error })] : [])]);
-        } catch (t) { console.error(`the subagent.turn row of ${tenantId}/${agentId} could not be written:`, t); }
+        for (const s of owed) {
+          const { attempts, dropped } = reportFailed(sql, owner, s.id, Date.now());
+          console.error(`posting ${tenantId}/${agentId}'s subagent ${s.id} report failed (attempt ${attempts}${dropped ? ", dropped" : ""}):`, e);
+          try {
+            appendTrace(sql, [subagentTurnRow(owner, s, "report_failed", Date.now(), { attempts, error }),
+              ...(dropped ? [subagentTurnRow(owner, s, "report_dropped", Date.now(), { attempts, error })] : [])]);
+          } catch (t) { console.error(`the subagent.turn row of ${tenantId}/${agentId} could not be written:`, t); }
+        }
         continue;
       }
-      reported += 1;
-      await this.#deps.subagentFault?.("report-posted", s.id);
-      markReported(sql, owner, s.id);
+      reported += owed.length;
+      for (const s of owed) {
+        await this.#deps.subagentFault?.("report-posted", s.id);
+        markReported(sql, owner, s.id);
+      }
     }
     return reported;
   }

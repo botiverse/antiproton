@@ -15,7 +15,7 @@ function assert(cond: unknown, msg: string) { if (!cond) throw new Error(msg); }
 function fakeDeps() {
   let t = 1_800_000_000_000, n = 0;
   const agents = new Map<string, StoredAgent>(), sessions = new Map<string, StoredSession>();
-  const log = { toolResults: [] as Array<{ session: string; results: Array<{ turnId: string; callId: string; output: string; isError: boolean }> }>, cancelled: [] as string[], stoppedSubagents: [] as string[], adopted: [] as string[], persona: [] as Array<{ id: string; instructions: string | null }>, opened: [] as string[], inputs: [] as Array<{ session: string; text: string }> };
+  const log = { toolResults: [] as Array<{ session: string; results: Array<{ turnId: string; callId: string; output: string; isError: boolean }> }>, cancelled: [] as string[], stoppedSubagents: [] as string[], removed: [] as string[], adopted: [] as string[], persona: [] as Array<{ id: string; instructions: string | null }>, opened: [] as string[], inputs: [] as Array<{ session: string; text: string }> };
   // What the agents' own objects hold (agent id -> instructions), and the dependency calls made to fail.
   const built = new Map<string, string | null>(), fail = new Set<string>();
   const maybeFail = (name: string) => { if (fail.has(name)) throw new Error(`${name} failed (injected)`); };
@@ -46,6 +46,7 @@ function fakeDeps() {
       toolResults: async (_a, s, results) => { log.toolResults.push({ session: s, results }); return { unknown: results.filter((r) => r.callId.startsWith("unknown")).map((r) => r.callId) }; },
       cancel: async (_a, s) => { log.cancelled.push(s); },
       stopSubagents: async (_a, s) => { log.stoppedSubagents.push(s); },
+      remove: async (a) => { log.removed.push(a); },
       transcript: async () => ({ entries: [], running: false, pending: [] }),
     },
     // No options and no admin rows: "default" is the one model a caller may send (test/agents-api-model.ts covers the rest).
@@ -100,6 +101,8 @@ await check("agents: create, retrieve, list, update reaching the persona, delete
   assert(log.persona.at(-1)?.instructions === "Be brief.", "an update did not reach the persona the harness reads");
   const d = await call(deps, "DELETE", "/agents/agent_1");
   assert(d.body.object === "agent.deleted" && d.body.deleted === true, `delete: ${JSON.stringify(d.body)}`);
+  // The agent's own object is ended first: its turn and its subagents stopped, the object marked deleted.
+  assert(log.removed.join() === "agent_1", `the delete did not end the agent in its object: ${JSON.stringify(log.removed)}`);
   const gone = await call(deps, "GET", "/agents/agent_1");
   assert(gone.status === 404 && gone.body.error?.code === "not_found", `a deleted agent is still reachable: ${JSON.stringify(gone)}`);
 });
