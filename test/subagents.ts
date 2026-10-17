@@ -359,6 +359,98 @@ for (const engine of (process.env.ENGINES ?? "pi085,pd").split(",").filter((e) =
     must(rowsOf(w).every((r) => r.state === "idle"), show(rowsOf(w)));
   });
 
+  for (const phase of ["report-decided", "report-posted", "report-written"] as const) {
+    await check(`${engine}: two reports posted together to a BUSY parent, then ${phase === "report-written" ? "a post that commits and then throws" : `a crash at ${phase}`}: each lands once`, async () => {
+      const w = await world(engine);
+      let parentCalls = 0, releaseChildren = false, parentBusy = false;
+      w.reply = (session, req) => {
+        if (session === "main") {
+          parentCalls++;
+          if (parentCalls === 1) return calls({ id: "c1", args: { task: "part A" } }, { id: "c2", args: { task: "part B" } });
+          return parentBusy ? null : say(`parent ${parentCalls}`);
+        }
+        return releaseChildren ? say(`report of ${/part (\w)/.exec(taskOf(req))?.[1]}`) : null;
+      };
+      await w.rt.postMessage("t", "a", "go", "prompt", "main");
+      for (let i = 0; i < 6; i++) await pass(w);
+      // The parent runs: its model call is out and held, so a report posted now is queued behind it.
+      parentBusy = true;
+      await w.rt.postMessage("t", "a", "keep working", "prompt", "main");
+      for (let i = 0; i < 3; i++) await pass(w);
+      let crashed = 0;
+      w.fault.at = (p) => { if (p === phase && crashed === 0) { crashed++; throw new Error(`crash at ${p}`); } };
+      releaseChildren = true;
+      for (let i = 0; i < 12 && !crashed; i++) { await pass(w).catch((e) => { if (!/crash at/.test(String(e))) throw e; }); await sleep(5); }
+      must(crashed === 1, "the fault never fired");
+      // A crash is an isolate gone; a post that threw is retried by the same one once due.
+      w.fault.at = null;
+      if (phase !== "report-written") { w.rt = w.isolate(); await w.rt.ready(); }
+      w.raw.sql.exec("UPDATE subagents SET report_retry_at = 0 WHERE state = 'reporting'");
+      for (let i = 0; i < 4; i++) { await pass(w); await sleep(5); }
+      parentBusy = false;
+      await settle(w);
+      const blocks = await reports(w);
+      for (const n of ["A", "B"]) {
+        const seen = blocks.filter((b) => b.includes(`report of ${n}`)).length;
+        must(seen === 1, `${phase}: the report of ${n} landed ${seen} times: ${show(blocks.map((b) => b.slice(0, 60)))}`);
+      }
+      must(rowsOf(w).every((r) => r.state === "idle"), show(rowsOf(w)));
+    });
+  }
+
+  await check(`${engine}: A's report posted alone, a crash, then B owed beside it: B is delivered once and A is not posted again`, async () => {
+    const w = await world(engine);
+    let parentCalls = 0;
+    const released = new Set<string>();
+    w.reply = (session, req) => {
+      if (session === "main") return ++parentCalls === 1 ? calls({ id: "c1", args: { task: "part A" } }, { id: "c2", args: { task: "part B" } }) : say("ok");
+      const n = /part (\w)/.exec(taskOf(req))?.[1] ?? "?";
+      return released.has(n) ? say(`report of ${n}`) : null;
+    };
+    await w.rt.postMessage("t", "a", "go", "prompt", "main");
+    for (let i = 0; i < 6; i++) await pass(w);
+    let crashed = 0;
+    w.fault.at = (p) => { if (p === "report-posted" && crashed === 0) { crashed++; throw new Error("crash at report-posted"); } };
+    released.add("A");
+    for (let i = 0; i < 12 && !crashed; i++) { await pass(w).catch((e) => { if (!/crash at/.test(String(e))) throw e; }); await sleep(5); }
+    must(crashed === 1 && (await reports(w)).length === 1, `control: ${crashed}, ${(await reports(w)).length}`);
+    w.fault.at = null;
+    w.rt = w.isolate();
+    await w.rt.ready();
+    // B's answer lands before the restarted isolate's first pass, so that pass owes A (still marked owed) and B together.
+    released.add("B");
+    for (const id of w.sent.filter((x) => !w.answered.has(x))) {
+      const job = await w.rt.takeJob("t", "a", id).catch(() => null) as Job | null;
+      if (!job) continue;
+      w.answered.add(id); w.held.delete(id);
+      const req = toRequest(job.context);
+      w.requests.push({ session: sessionOfJob(w, id), req, operatorModel: job.operatorModel ?? null });
+      await w.rt.deliverAnswer("t", "a", id, fromResponse(w.reply(sessionOfJob(w, id), req) as ModelResponse, job.model, id), undefined);
+    }
+    await settle(w);
+    const blocks = await reports(w);
+    must(blocks.filter((b) => b.includes("report of A")).length === 1 && blocks.filter((b) => b.includes("report of B")).length === 1,
+      `A ${blocks.filter((b) => b.includes("report of A")).length}, B ${blocks.filter((b) => b.includes("report of B")).length}`);
+  });
+
+  await check(`${engine}: a report dropped after its attempts leaves the parent a notice that it could not be delivered`, async () => {
+    const w = await world(engine);
+    let parentCalls = 0;
+    w.reply = (session) => session === "main" ? (++parentCalls === 1 ? calls({ id: "c1", args: { task: "t" } }) : say("ok")) : say("the lost report");
+    w.fault.at = (p) => { if (p === "report-posting") throw new Error("the parent's lane said no"); };
+    await w.rt.postMessage("t", "a", "go", "prompt", "main");
+    const has = () => w.raw.sql.exec("SELECT 1 FROM sqlite_master WHERE name = 'subagents'").toArray().length > 0;
+    for (let i = 0; i < 30 && !(has() && rowsOf(w)[0]?.state === "idle"); i++) {
+      await pass(w);
+      if (has()) w.raw.sql.exec("UPDATE subagents SET report_retry_at = 0 WHERE state = 'reporting'");
+    }
+    await settle(w);
+    const child = rowsOf(w)[0]!.id as string;
+    const notices = (await mainTexts(w)).filter((t) => t.includes(`the report of subagent ${child} could not be delivered`));
+    must(notices.length === 1, `notices: ${show(await mainTexts(w))}`);
+    must(!(await mainTexts(w)).some((t) => t.includes("the lost report")), "the dropped report itself landed");
+  });
+
   await check(`${engine}: an isolate dying mid-spawn: the replayed send finds the child it made, and the parent is told about it`, async () => {
     const w = await world(engine);
     let parentCalls = 0;

@@ -68,7 +68,7 @@ import {
   runningSubagents, setSubagentTurnOp, startedResult as subagentStarted, startSubagentTurn, stopRunningSubagents, subagentOf, subagentTool,
   SUBAGENT_TOOL, speakingRefusal, speakingTools, taskMessage, turnEnd, type Subagent, type TurnEnd,
   markReported, reportingSubagents, reportKey, subagentIdFor, taskKey, turnKeyOf,
-  reportFailed, reportRetryMs, subagentSpent, subagentTurnRow, noteSubagentModel,
+  reportFailed, reportRetryMs, subagentSpent, subagentTurnRow, noteSubagentModel, combinedRequestId, undeliveredKey, undeliveredNotice,
 } from "../../src/runtime/subagents.ts";
 import { subagentModelChoice } from "./model-request.ts";
 import type { ModelLayers } from "./control-plane.ts";
@@ -802,7 +802,7 @@ export interface RuntimeDeps {
    * A test's knob: called at the points of a subagent's send and report where a crash must lose nothing. A throw is the
    * crash; a promise that never settles is an isolate that died there.
    */
-  subagentFault?: (phase: "task-posting" | "task-posted" | "report-decided" | "report-posting" | "report-posted", subagent: string) => void | Promise<void>;
+  subagentFault?: (phase: "task-posting" | "task-posted" | "report-decided" | "report-posting" | "report-written" | "report-posted", subagent: string) => void | Promise<void>;
   /**
    * What decides over a subagent's model option besides USER_MODELS, read from the control plane for the agent: the
    * administrator's rows and the owner's pick (`ModelLayers`), and whether the server's picker switch refuses another
@@ -4392,7 +4392,7 @@ export class AgentRuntime {
    */
   async #postOnce(
     tenantId: string, agentId: string, session: string, text: string, key: string, via: "say" | "postMessage" = "say",
-    unless?: () => boolean,
+    unless?: () => boolean, requestId: string = key,
   ): Promise<{ op: string | null; skipped: boolean }> {
     const posted = this.#postedOp(session, key);
     if (posted) return { op: posted.op, skipped: false };
@@ -4401,11 +4401,11 @@ export class AgentRuntime {
     // the agent's conversation's, and a notice taken by a child would never reach the agent.
     let res: any;
     if (via === "postMessage") {
-      const out = await this.postMessage(tenantId, agentId, text, "prompt", session, { requestId: key, ...(unless ? { unless } : {}) });
+      const out = await this.postMessage(tenantId, agentId, text, "prompt", session, { requestId, ...(unless ? { unless } : {}) });
       if ((out as { skipped?: true }).skipped) return { op: null, skipped: true };
       res = out.result;
     } else {
-      res = await (await this.agent(tenantId, agentId, session)).say(text, "prompt", { requestId: key });
+      res = await (await this.agent(tenantId, agentId, session)).say(text, "prompt", { requestId });
     }
     if (res?.ok === false) throw new Error(res.error?.message ?? res.error?._tag ?? "the message was refused");
     const op = res?.value?.operationId ?? res?.value?.submissionId ?? null;
@@ -4425,16 +4425,11 @@ export class AgentRuntime {
       const conversation = pdConversationId(sql as never, session);
       if (conversation === null || !has("pd_submissions")) return null;
       // pi-durable keeps the request id as JSON (`"report sub_…/1"`, quotes included): compared as it is stored.
-      const row = sql.exec("SELECT id FROM pd_submissions WHERE conversation_id = ? AND request_id = ? ORDER BY id LIMIT 1", conversation, JSON.stringify(key)).toArray()[0] as { id?: unknown } | undefined;
-      if (row) return { op: String(row.id) };
-      // Reports posted together share one message, whose request id is only the first one's key; the others are found
-      // by its text, which pi-durable keeps in the conversation's entry once placed, or in its inbox while queued
-      // (@earendil-works/pi-durable 1.0.0, dist/harness/submissions.js), not in the submission.
-      const inEntry = has("pd_entries") && sql.exec("SELECT 1 AS x FROM pd_entries WHERE conversation_id = ? AND instr(record, ?) > 0 LIMIT 1", conversation, key).toArray().length > 0;
-      const queued = !inEntry && has("pd_documents") && sql.exec(
-        "SELECT 1 AS x FROM pd_documents WHERE scope_kind = 'conversation' AND owner_id = ? AND retired_at IS NULL AND instr(record, ?) > 0 LIMIT 1",
-        conversation, key).toArray().length > 0;
-      return inEntry || queued ? { op: null } : null;
+      // The submission names every key it carries in its request id (`combinedRequestId`), queued or placed alike, so
+      // the lookup is the submission row pi-durable writes in the same commit as the message, never the message's text.
+      const row = sql.exec("SELECT id FROM pd_submissions WHERE conversation_id = ? AND (request_id = ? OR instr(request_id, ?) > 0) ORDER BY id LIMIT 1",
+        conversation, JSON.stringify(key), `<${key}>`).toArray()[0] as { id?: unknown } | undefined;
+      return row ? { op: String(row.id) } : null;
     }
     const t = piTables(session);
     if (!has(t.entries)) return null;
@@ -4505,8 +4500,10 @@ export class AgentRuntime {
               fresh.map((s) => s.report ?? "").join("\n\n---\n\n");
           // Checked again at the last synchronous point before the write (`postMessage`'s `unless`): the post awaits the
           // catalogue and the tool lists first, and a stop, or a stop and the person's next message, can land meanwhile.
-          const posted = await this.#postOnce(tenantId, agentId, parent, text, reportKey(fresh[0]!), "postMessage", () => !stillOwed());
+          const posted = await this.#postOnce(tenantId, agentId, parent, text, reportKey(fresh[0]!), "postMessage", () => !stillOwed(),
+            combinedRequestId(fresh.map((s) => reportKey(s))));
           if (posted.skipped) continue;
+          for (const s of fresh) await this.#deps.subagentFault?.("report-written", s.id);
           // A stop that landed inside the write itself, after that check: the reports are in, and the run they started —
           // only that run, never the conversation, which the person may have spoken to since — is cancelled.
           if (!stillOwed()) {
@@ -4532,6 +4529,12 @@ export class AgentRuntime {
             appendTrace(sql, [subagentTurnRow(owner, s, "report_failed", Date.now(), { attempts, error }),
               ...(dropped ? [subagentTurnRow(owner, s, "report_dropped", Date.now(), { attempts, error })] : [])]);
           } catch (t) { console.error(`the subagent.turn row of ${tenantId}/${agentId} could not be written:`, t); }
+          // A dropped report leaves its parent a short notice, so it can delegate again: once (keyed), best effort — if
+          // this fails too, the trace row is what is left.
+          if (dropped) {
+            await this.#postOnce(tenantId, agentId, parent, undeliveredNotice(s, attempts), undeliveredKey(s), "postMessage")
+              .catch((n) => console.error(`the undelivered-report notice of ${tenantId}/${agentId}'s subagent ${s.id} failed too:`, n));
+          }
         }
         continue;
       }

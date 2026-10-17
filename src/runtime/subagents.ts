@@ -160,6 +160,24 @@ export async function subagentIdFor(turnKey: string): Promise<string> {
 export const taskKey = (id: string, turn: number) => `task ${id}/${turn}`;
 export const reportKey = (s: Pick<Subagent, "id" | "turns">) => `report ${s.id}/${s.turns}`;
 
+/**
+ * The request id of one post carrying several reports: every key, each between `<` and `>`, so a lookup for one of them
+ * finds the post whichever it was (cf/src/runtime.ts `#postedOp`), and a key is never found inside a longer one
+ * (`sub_…/1` in `sub_…/10`). One report's post keeps its own key as its id.
+ */
+export function combinedRequestId(keys: readonly string[]): string {
+  return keys.length === 1 ? keys[0]! : `reports ${keys.map((k) => `<${k}>`).join("")}`;
+}
+
+/** The key of the notice a dropped report leaves its parent (`undeliveredNotice`): posted once. */
+export const undeliveredKey = (s: Pick<Subagent, "id" | "turns">) => `undelivered ${s.id}/${s.turns}`;
+
+/** What the parent is told when a report could not be posted in `REPORT_MAX_ATTEMPTS` tries and was dropped. */
+export function undeliveredNotice(s: Pick<Subagent, "id" | "turns">, attempts: number): string {
+  return `[subagent ${s.id} (${undeliveredKey(s)}) — the report of subagent ${s.id} could not be delivered after ${attempts} attempts; ` +
+    "a notice from the harness, not a message from the user. Its answer is lost: you may delegate the task again, to a new subagent or with a follow-up.]";
+}
+
 export function subagentOf(sql: Sql, owner: SubagentOwner, id: string): Subagent | null {
   if (!hasSubagentTable(sql)) return null;
   const r = sql.exec("SELECT * FROM subagents WHERE id = ? AND tenant_id = ? AND agent_id = ?", id, owner.tenantId, owner.agentId).toArray()[0];
