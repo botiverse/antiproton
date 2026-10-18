@@ -509,6 +509,16 @@ newer list stands. A plugin whose list
 depends only on its server (`mcp.ts`) declares no basis: nothing in the build
 changes that list.
 
+**Declare `toolsDue` when part of a list comes from a far end that moves on its
+own.** `toolsDue(mount, now)` is synchronous and local, like `mountTools`: it
+reads the record and whatever the plugin remembers in memory, never a server.
+When it answers true for a mount that has a snapshot, the same turn-start pass
+lists the mount again, with the same timeout, back-off and keep-a-credentialed-list
+rules as a basis that moved (`snapshotStale`, `cf/src/runtime.ts`; issue #937).
+Raft's managed MCP is the user: its catalogue changes when a person adds,
+removes or reconnects a connector in Raft, and a call can be told it is stale.
+A throw is read as not due.
+
 **Read `context.offered` before naming one of your own tools.** It is the
 names of the tools this mount offers right now, as `toolsOf(plugin, mount)`
 answers — the list the model was given and the gateway admits calls against —
@@ -688,7 +698,93 @@ SDK's saved state did not load or save (the SDK's `onStateError`; `status` and
 `stateBytes`, the size of the record it tried to write), which it also says on
 the console. Before Raft SDK 0.19.0 this row was `raft.state_save_failed`. A
 failed load or save never fails the call: it costs at most a batch delivered
-again or one more hold.
+again or one more hold. A fourth, `raft.mcp_call`, is one managed MCP call's end
+(below).
+
+**Raft's managed MCP** (`src/plugins/raft-mcp.ts`, SDK 0.21.1's `raft.mcp`) puts
+the connectors the agent's Raft Server has connected (Notion and the like) on the
+raft mount, as tools of their own. Raft holds the connectors' credentials and
+attaches them to each call; the mount sends only its own Raft credential, to its
+own origin. It is part of the raft mount rather than a mount of its own because
+everything it needs is that mount's: the identity and credential, the origin, the
+capability list the listing already reads, and the re-take on a credential
+change.
+
+- *Listing.* When the credential holds the `mcp` capability, `snapshotTools`
+  also asks for the catalogue (`raft.mcp.tools()`, `GET
+  /internal/agent-api/mcp/tools`) and lists one tool per entry after Raft's own:
+  `mcp_` and the entry's `runtimeName` with every character outside
+  `[A-Za-z0-9_]` made `_` (`_2`, `_3`, … for a name already given), so the model
+  is offered `<alias>__mcp_…`; the entry's description and `inputSchema` as they
+  came; `sideEffects: "write"`, `idempotency: "none"`, whatever the remote
+  annotations say. The kernel's admission bounds apply, so a tool whose
+  description is over `MAX_DESCRIPTION_BYTES` is left out with the reason, not
+  shortened. `mountTools` offers the snapshot's `mcp_` entries whole. What a call
+  needs beyond the schema (the server's id, the config and assignment versions
+  Raft checks) is kept in the mount's database (`context` store, key `mcp`),
+  written only once the kernel keeps the listing as the mount's list
+  (`ListedTools.onKept`, which the gateway runs after it writes the snapshot or
+  finds it unchanged, and never for a listing it sets aside), so a call goes out
+  with the versions of the list it was offered from. The catalogue's clock is
+  marked at the same moment, so a listing set aside does not put off the next.
+  A catalogue Raft cannot answer does not fail the listing: the tools kept from the
+  last one stay, and a `skipped` entry says why.
+- *Freshness.* Besides the runtime's own reasons to list, the plugin's
+  `toolsDue` makes a turn's start list again when this isolate last listed the
+  catalogue `MCP_CATALOG_TTL_MS` (5 minutes) ago or more — an isolate that has
+  not listed it reads the snapshot's `takenAt` — and at once after a call was
+  answered `stale`. A turn keeps the tools it started with; the next one is
+  built from the new list.
+- *Reconnect.* Each connector the catalogue names in `reconnectRequired` is one
+  line of the mount's prompt paragraph, in the SDK's words
+  (`formatMcpReconnectRequired`), so the agent tells the person instead of
+  saying it has no such connector. Beside them, each catalogue tool the
+  kernel's admission leaves out of the mount's list (a description over
+  `MAX_DESCRIPTION_BYTES`, a schema over `MAX_SCHEMA_BYTES`, a list already
+  full) is one line, `"<server>": "<tool>" is not available here (<rule>).`, by
+  server and remote tool name only, never the description; at most
+  `MCP_UNAVAILABLE_LINES` (20) and one line counting the rest. The listing
+  works them out by running the kernel's own admission (`admitTools`) on the
+  list it returns. Every connector-supplied name in these lines (a server's, a
+  remote tool's) is the SDK's prompt form (`formatMcpPromptName`, which
+  `formatMcpReconnectRequired` uses too): control and format characters made a
+  space, one line, cut at 80 characters, quoted as a JSON string, so a name
+  cannot start a line of its own in the system prompt. On pi085 a change reaches a conversation under way as a
+  notice (src/runtime/prompt-context.ts).
+- *Calls and results.* A call sends the catalogue entry and the model's
+  arguments once (`raft.mcp.call`), with a 60 s bound (`MCP_CALL_TIMEOUT_MS`)
+  rather than the mount's `timeoutMs`: Raft's gateway aborts the remote
+  server's connect and call together after about 20 s and then answers, and a
+  call cut short near that would read as `outcome_unknown` while Raft completes
+  or answers it. The SDK sets no timeout of its own. Nothing above the plugin
+  bounds the wait (the gateway sets no deadline; run_js's dynamic worker
+  counts CPU time). A `result` is the tool result (`content`,
+  and `structuredContent` when there is one). A `tool_error` is a failed call
+  whose message is the remote tool's text, capped by the SDK at 4,000 characters
+  with `…[truncated]`. A failure's message is the SDK's `error.nextAction`
+  exactly (`mcpFailureKind`): `stale` also marks the catalogue due;
+  `reconnect_required` and `unavailable` are failed calls; `outcome_unknown` (the
+  connection to Raft failed mid-call, a gateway answered 5xx with no Raft code,
+  or Raft's own `managed_mcp_internal_error`) is recorded as an operation whose outcome
+  is `unknown`.
+- *No retries.* The SDK makes one attempt (`managedMcpCall` is a single-attempt
+  route) and the plugin calls once. The gateway starts an operation once and
+  answers a second start under the same key `already_attempted` without reaching
+  the plugin, which is what a run_js program re-run after a restart meets, since
+  its calls are keyed `${toolCallId}:${n}`. A model's own call is not re-run by
+  either engine after a crash (`replayPolicy` "never"; pi-durable `unsafe`):
+  it gets an error result instead. Tool calls do not go through a queue, so
+  nothing redelivers one.
+- *Trace.* The gateway's `tool.call` row, as for every call (`attrs.tool`
+  `raft.mcp_…`, the mount, the task, the call id; never arguments or a result),
+  and `raft.mcp_call` on the same span: `status` `result`, `tool_error`, the
+  failure kind or `error`; `attrs.server` the connector's server name and
+  `attrs.tool` the remote tool's name. Nothing else is recorded.
+- *Subagents* are not offered the tools: they are writes, and raft does not
+  declare `actsAs: "self"` (`childMayCall`). An agent without a raft mount, or
+  whose credential lacks `mcp`, has none.
+
+How to check one agent: [runbook.md](runbook.md#raft-managed-mcp-on-an-agent).
 
 Four of `raft`'s hand-written tools are Raft Agent Login for Connected Apps
 (`src/plugins/raft-agent-login.ts`, the steps of Raft's CLI `integration list`,

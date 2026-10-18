@@ -131,6 +131,14 @@ export interface ListedTools {
    * are words for a person.
    */
   refused?: true;
+  /**
+   * Run once the kernel has kept this list as the mount's — written, or found the same as the stored one — and never
+   * when it was set aside (a failure, a re-take that keeps the previous list, a list replaced by someone else's while
+   * this one was taken). For what the plugin keeps beside the list that must describe the list the mount offers: raft
+   * keeps each managed MCP tool's catalogue entry this way, so a call is sent with the versions of the schema it was
+   * offered under, not those of a listing the kernel discarded (#937). A throw is reported and changes nothing kept.
+   */
+  onKept?(): Promise<void>;
 }
 
 /**
@@ -1973,6 +1981,18 @@ export interface Plugin {
    * on the far end (an MCP server) leaves it out: nothing in the build changes that list.
    */
   toolsBasis?: string;
+  /**
+   * Whether this mount's list should be re-taken at the start of this turn although its basis still matches: part of
+   * the list comes from the far end and has aged past what the plugin will serve (raft's managed MCP catalogue, whose
+   * connectors a person adds and removes in Raft), or a call has just been told the list is stale. Asked beside the
+   * basis check, by the same pass, with the same timeout and back-off (cf/src/runtime.ts `snapshotStale`,
+   * `AgentRuntime.retakeStaleSnapshots`), and only of a mount that has a snapshot.
+   *
+   * Synchronous and local, like `mountTools`: it reads the record and what the plugin remembers in memory, never a
+   * server. `now` is the caller's clock, so the pass and the tool export agree on one answer. Absent: only the basis
+   * decides, as before.
+   */
+  toolsDue?(mount: MountRecord, now: number): boolean;
   /** This mount holds something real; see {@link Holding}. Declaring it is what
    *  makes the mount exclusive — ask {@link isExclusive}, never the two separately. */
   holds?: Holding;
