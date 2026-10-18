@@ -4,7 +4,7 @@ import type { Json, MountPolicy, MountRecord, OperationStatus, PolicyDecision } 
 import { AGENT_REF, agentRef, isAgentRef, KEPT_NAME, KEPT_PREFIX, OWNER_PREFIX, secretRefKind } from "./secrets.ts";
 import type { ToolError, ToolResult } from "../core/tools.ts";
 import { parseToolRef } from "../core/tools.ts";
-import type { Plugin, PluginContext, PromptPart, MountActivity, MountUsage, InboundEvent, InboundHooks, InboundResult, HeldListing, HeldRead } from "../plugins/types.ts";
+import type { Plugin, PluginContext, PromptPart, MountActivity, MountUsage, InboundEvent, InboundHooks, InboundResult, HeldListing, HeldRead, ListedTools } from "../plugins/types.ts";
 import { type ActivityEvent, type SandboxForm, holdingOf, backgroundOf, isExclusive } from "../plugins/types.ts";
 import { Backgrounded, Interrupt, interruptsOf } from "../plugins/types.ts";
 import { answerSpecOf } from "./run-js-resume.ts";
@@ -1466,8 +1466,9 @@ export class ToolGateway {
       return { ok: false, error: `${alias}'s credential did not resolve, so its tools were not listed again; the list taken under it is kept` };
     }
     let snapshot;
+    let listed: ListedTools;
     try {
-      const listed = await plugin.snapshotTools(this.#contextFor({ tenantId, agentId, taskId: "tool-snapshot" }, mount, credential, false, undefined, true));
+      listed = await plugin.snapshotTools(this.#contextFor({ tenantId, agentId, taskId: "tool-snapshot" }, mount, credential, false, undefined, true));
       // A re-take keeps a list a credential was behind unless the new answer is about that credential's reach: the far
       // end refusing it (`ListedTools.refused`) says nothing about what it may do, and one unreachable or refused
       // moment must not shrink a working list for good — the basis the shrunken list would carry stops every later
@@ -1522,6 +1523,11 @@ export class ToolGateway {
       }
     }
     const kept = changed ? snapshot : now.toolSnapshot!;
+    // The list is the mount's now, so what the plugin keeps beside it may follow (`ListedTools.onKept`).
+    if (listed.onKept) {
+      try { await listed.onKept(); }
+      catch (e) { console.warn(`${alias}: keeping what goes with its tool list failed: ${String((e as Error)?.message ?? e).slice(0, 300)}`); }
+    }
     return { ok: true, changed, hash: kept.hash, tools: kept.tools.map((t) => t.name), skipped: kept.skipped };
   }
 

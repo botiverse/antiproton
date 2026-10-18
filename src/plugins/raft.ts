@@ -22,7 +22,7 @@ import {
   type AgentLoginDeps, type ManifestCache,
 } from "./raft-agent-login.ts";
 import { internalHost } from "./http.ts";
-import { callMcp, isMcpTool, keptMcpOf, leftOut, listMcp, mcpClock, mcpLines, MCP_CAPABILITY, MCP_KEY, MCP_PREFIX } from "./raft-mcp.ts";
+import { callMcp, isMcpTool, keptMcpOf, leftOut, listMcp, mcpClock, mcpLines, MCP_CALL_TIMEOUT_MS, MCP_CAPABILITY, MCP_KEY, MCP_PREFIX } from "./raft-mcp.ts";
 import { modelToolName } from "../runtime/pi-tools.ts";
 import { isSubagentSession } from "../runtime/subagent-session.ts";
 import { toAgentRef } from "../store/refs.ts";
@@ -2555,13 +2555,18 @@ export function createRaftPlugin(deps: {
       // The managed MCP catalogue, last: asked only of a credential that holds `mcp`, and never the reason the listing
       // fails (`listMcp`). After Raft's own tools, so the kernel's bound on a list's length never costs one of those.
       const managed = await listMcp(raft, ctx, CONTEXT_STORE, capabilities.has(MCP_CAPABILITY));
-      mcp.listed(ctx, Date.now());
       tools.push(...managed.tools);
       // First, since the kernel keeps only the first few reasons (`MAX_SKIPPED`), and a credential that lacks several
       // capabilities fills them with one line per tool.
-      const listed = { tools, skipped: [...managed.skipped, ...skipped] };
-      // Kept with the catalogue tools this list's admission leaves out, which the mount's paragraph names (`mcpLines`).
-      await managed.keep(await leftOut(listed, managed.tools));
+      const listed: ListedTools = { tools, skipped: [...managed.skipped, ...skipped] };
+      const left = await leftOut(listed, managed.tools);
+      // The catalogue entries each tool is bound to, and the clock, only once the kernel keeps this list as the mount's
+      // (`ListedTools.onKept`): a listing it sets aside must not hand its versions to calls made under the list it kept,
+      // nor put off the next listing. Kept with the tools its admission leaves out, which the paragraph names.
+      listed.onKept = async () => {
+        await managed.keep(left);
+        mcp.listed(ctx, Date.now());
+      };
       return listed;
     },
 
@@ -2672,7 +2677,9 @@ export function createRaftPlugin(deps: {
     },
 
     async invoke(name, args, ctx): Promise<Json> {
-      if (isMcpTool(name)) return callMcp(name, args, ctx, () => raftFor(ctx, { state: false }), CONTEXT_STORE, mcp);
+      // Not the mount's own timeout: Raft gives the remote server its own budget to connect and to answer
+      // (`MCP_CALL_TIMEOUT_MS`), and a call cut short here is one Raft may still complete.
+      if (isMcpTool(name)) return callMcp(name, args, ctx, () => raftFor(ctx, { state: false, timeoutMs: MCP_CALL_TIMEOUT_MS }), CONTEXT_STORE, mcp);
       const op = operationOf.get(name);
       if (op) return operate(op, args, ctx) as Promise<Json>;
       // Answered wherever the download is generated, as the download is: with no storage it says why nothing was kept.

@@ -131,6 +131,14 @@ export interface ListedTools {
    * are words for a person.
    */
   refused?: true;
+  /**
+   * Run once the kernel has kept this list as the mount's — written, or found the same as the stored one — and never
+   * when it was set aside (a failure, a re-take that keeps the previous list, a list replaced by someone else's while
+   * this one was taken). For what the plugin keeps beside the list that must describe the list the mount offers: raft
+   * keeps each managed MCP tool's catalogue entry this way, so a call is sent with the versions of the schema it was
+   * offered under, not those of a listing the kernel discarded (#937). A throw is reported and changes nothing kept.
+   */
+  onKept?(): Promise<void>;
 }
 
 /**

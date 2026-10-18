@@ -696,8 +696,13 @@ change.
   description is over `MAX_DESCRIPTION_BYTES` is left out with the reason, not
   shortened. `mountTools` offers the snapshot's `mcp_` entries whole. What a call
   needs beyond the schema (the server's id, the config and assignment versions
-  Raft checks) is kept in the mount's database (`context` store, key `mcp`). A
-  catalogue Raft cannot answer does not fail the listing: the tools kept from the
+  Raft checks) is kept in the mount's database (`context` store, key `mcp`),
+  written only once the kernel keeps the listing as the mount's list
+  (`ListedTools.onKept`, which the gateway runs after it writes the snapshot or
+  finds it unchanged, and never for a listing it sets aside), so a call goes out
+  with the versions of the list it was offered from. The catalogue's clock is
+  marked at the same moment, so a listing set aside does not put off the next.
+  A catalogue Raft cannot answer does not fail the listing: the tools kept from the
   last one stay, and a `skipped` entry says why.
 - *Freshness.* Besides the runtime's own reasons to list, the plugin's
   `toolsDue` makes a turn's start list again when this isolate last listed the
@@ -711,14 +716,23 @@ change.
   saying it has no such connector. Beside them, each catalogue tool the
   kernel's admission leaves out of the mount's list (a description over
   `MAX_DESCRIPTION_BYTES`, a schema over `MAX_SCHEMA_BYTES`, a list already
-  full) is one line, `<server>: <tool> is not available here (<rule>).`, by
+  full) is one line, `"<server>": "<tool>" is not available here (<rule>).`, by
   server and remote tool name only, never the description; at most
   `MCP_UNAVAILABLE_LINES` (20) and one line counting the rest. The listing
   works them out by running the kernel's own admission (`admitTools`) on the
-  list it returns. On pi085 a change reaches a conversation under way as a
+  list it returns. Every connector-supplied name in these lines (a server's, a
+  remote tool's) is cleaned and quoted (`promptName`): control and format
+  characters (line breaks, the Unicode line separators, bidi controls) become a
+  space, it is cut to 64 characters, and it is written as a JSON string, so a
+  name cannot start a line of its own in the system prompt. On pi085 a change reaches a conversation under way as a
   notice (src/runtime/prompt-context.ts).
 - *Calls and results.* A call sends the catalogue entry and the model's
-  arguments once (`raft.mcp.call`). A `result` is the tool result (`content`,
+  arguments once (`raft.mcp.call`), with a 60 s bound (`MCP_CALL_TIMEOUT_MS`)
+  rather than the mount's `timeoutMs`: Raft's gateway gives the remote server
+  about 20 s to connect and 20 s to answer, and a call cut short sooner would
+  read as `outcome_unknown` while Raft completes it. Nothing above the plugin
+  bounds the wait (the gateway sets no deadline; run_js's dynamic worker
+  counts CPU time). A `result` is the tool result (`content`,
   and `structuredContent` when there is one). A `tool_error` is a failed call
   whose message is the remote tool's text, capped by the SDK at 4,000 characters
   with `…[truncated]`. A failure's message is the SDK's `error.nextAction`
