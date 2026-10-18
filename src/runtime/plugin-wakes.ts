@@ -11,7 +11,9 @@
  *   with every ask, so the pass that ran a wake drops only the row it ran, and an ask that landed meanwhile stays;
  * - **an answer** a hook gave (`PluginNext`), written in the same transaction that marks its turn end handled or
  *   drops its wake, so a hook that has answered is never asked again. Its turn is posted once: the row is marked
- *   `posting` just before the post's write, and a row found `posting` later is dropped rather than posted twice.
+ *   `posting` just before the post's write, and a row found `posting` later is dropped rather than posted twice;
+ * - **a turn a hook asked for**, by its run's operation id, with the mount and the key it gave, so its end is told to
+ *   that mount with that key (`TurnEnd.turnKey`) and to every other mount as a turn it did not ask for.
  */
 import type { PluginNext, TurnEnd } from "../plugins/types.ts";
 
@@ -22,6 +24,7 @@ const HANDLED_KEPT_MS = 24 * 3_600_000;
 export function ensurePluginWakeTables(sql: Sql) {
   sql.exec("CREATE TABLE IF NOT EXISTS plugin_turn_ends (seq INTEGER PRIMARY KEY AUTOINCREMENT, operation_id TEXT NOT NULL UNIQUE, body TEXT NOT NULL, at INTEGER NOT NULL, handled INTEGER)");
   sql.exec("CREATE TABLE IF NOT EXISTS plugin_wakes (alias TEXT PRIMARY KEY, at INTEGER NOT NULL, gen INTEGER NOT NULL)");
+  sql.exec("CREATE TABLE IF NOT EXISTS plugin_turns (operation_id TEXT PRIMARY KEY, alias TEXT NOT NULL, turn_key TEXT NOT NULL, at INTEGER NOT NULL)");
   sql.exec("CREATE TABLE IF NOT EXISTS plugin_answers (seq INTEGER PRIMARY KEY AUTOINCREMENT, alias TEXT NOT NULL, body TEXT NOT NULL, posting INTEGER NOT NULL DEFAULT 0)");
 }
 
@@ -34,15 +37,29 @@ export function keepsPluginCalls(sql: Sql): boolean {
 }
 
 /** A turn's end, owed to the plugins that take it. The same turn told again is ignored. */
-export function recordTurnEnd(sql: Sql, operationId: string, end: TurnEnd, at: number) {
+export function recordTurnEnd(sql: Sql, operationId: string, end: Omit<TurnEnd, "turnId" | "turnKey">, at: number) {
   ensurePluginWakeTables(sql);
   sql.exec("INSERT OR IGNORE INTO plugin_turn_ends (operation_id, body, at) VALUES (?, ?, ?)", operationId, JSON.stringify(end), at);
 }
 
-export function pendingTurnEnds(sql: Sql): Array<{ seq: number; operationId: string; end: TurnEnd }> {
+/** The ends not yet told, each as a given mount is to be told it: with the key that mount gave, if it asked for the turn. */
+export function pendingTurnEnds(sql: Sql): Array<{ seq: number; operationId: string; endFor(alias: string): TurnEnd }> {
   ensurePluginWakeTables(sql);
-  return sql.exec("SELECT seq, operation_id, body FROM plugin_turn_ends WHERE handled IS NULL ORDER BY seq").toArray()
-    .map((r) => ({ seq: Number(r.seq), operationId: String(r.operation_id), end: JSON.parse(String(r.body)) as TurnEnd }));
+  return sql.exec("SELECT seq, operation_id, body FROM plugin_turn_ends WHERE handled IS NULL ORDER BY seq").toArray().map((r) => {
+    const operationId = String(r.operation_id), end = JSON.parse(String(r.body)) as Omit<TurnEnd, "turnId" | "turnKey">;
+    const asked = sql.exec("SELECT alias, turn_key FROM plugin_turns WHERE operation_id = ?", operationId).toArray()[0];
+    return {
+      seq: Number(r.seq), operationId,
+      endFor: (alias: string) => ({ ...end, turnId: operationId, turnKey: asked && String(asked.alias) === alias ? String(asked.turn_key) : null }),
+    };
+  });
+}
+
+/** The turn a mount's answer started, by its run's operation id; a day of them is kept, past any turn's end. */
+export function bindTurn(sql: Sql, operationId: string, alias: string, turnKey: string, now: number) {
+  ensurePluginWakeTables(sql);
+  sql.exec("INSERT OR REPLACE INTO plugin_turns (operation_id, alias, turn_key, at) VALUES (?, ?, ?, ?)", operationId, alias, turnKey, now);
+  sql.exec("DELETE FROM plugin_turns WHERE at < ?", now - HANDLED_KEPT_MS);
 }
 
 export function turnEndHandled(sql: Sql, seq: number, now: number) {
@@ -98,7 +115,7 @@ export function dropAnswer(sql: Sql, seq: number) {
  * How a settled run ended, from its status and the branch's last message: the model's text when that message is the
  * model's, a cancel when the run or the message was aborted, a failure when either says so.
  */
-export function turnEndOf(status: string, last: unknown): TurnEnd {
+export function turnEndOf(status: string, last: unknown): Omit<TurnEnd, "turnId" | "turnKey"> {
   const m = last && typeof last === "object" ? last as { role?: unknown; content?: unknown; stopReason?: unknown; errorMessage?: unknown } : null;
   const mine = m?.role === "assistant";
   const text = mine && Array.isArray(m!.content)

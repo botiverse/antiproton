@@ -9,7 +9,8 @@
  *   the profile's own mount beside `raft`;
  * - **the tools the model is offered**: none (`#turnTools`, cf/src/runtime.ts). The mounts are there for the plugin's
  *   code and for provisioning, not for the model;
- * - **each model call's output cap** (`maxTokens`), marked on every job the agent's model is asked (`takeJob`);
+ * - **each model call's output cap** (`maxTokens`), marked on every job the agent's model is asked (`takeJob`), and
+ *   whether an overflowed conversation is rebuilt with an extra briefing call (`rebuildsContext`);
  * - **the system prompt**: the profile's plugin's instructions, alone (`profilePrompt`, src/runtime/pi-prompt.ts) —
  *   not the default prompt, the persona, or any mount's paragraph.
  *
@@ -30,12 +31,19 @@ export interface ProfileSpec {
   toolConfig: ToolConfig;
   /** The output cap of every model call the agent makes (`AgentRuntime.takeJob` marks each job with it). */
   maxTokens: number;
+  /**
+   * Whether a main conversation that overflowed its window is rebuilt with a briefing (src/runtime/overflow-backstop.ts):
+   * that briefing is a model call the agent did not ask for, and a turn of its own.
+   */
+  rebuildsContext: boolean;
 }
 
 export const AGENT_PROFILES = {
   raftbench_service: {
     plugin: "raftbench", alias: "raftbench", instructions: RAFTBENCH_INSTRUCTIONS,
     toolConfig: { mounts: [], harness: "minimal" }, maxTokens: RAFTBENCH_MAX_TOKENS,
+    // Each run starts a conversation of its own, and its plugin counts its model calls: an overflow fails the run.
+    rebuildsContext: false,
   },
 } as const satisfies Record<string, ProfileSpec>;
 
@@ -54,7 +62,7 @@ export function profileOf(config: unknown): AgentProfile | null {
 export function profileSpec(profile: AgentProfile): ProfileSpec {
   const s = AGENT_PROFILES[profile];
   return {
-    plugin: s.plugin, alias: s.alias, instructions: s.instructions, maxTokens: s.maxTokens,
+    plugin: s.plugin, alias: s.alias, instructions: s.instructions, maxTokens: s.maxTokens, rebuildsContext: s.rebuildsContext,
     toolConfig: { mounts: [...s.toolConfig.mounts], harness: s.toolConfig.harness },
   };
 }

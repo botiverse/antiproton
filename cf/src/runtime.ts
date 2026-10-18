@@ -56,7 +56,7 @@ import { logicalMain, physicalSession } from "./fresh-context.ts";
 import { profilePrompt, systemPrompt } from "../../src/runtime/pi-prompt.ts";
 import { profileOf, profileSpec } from "../../src/runtime/agent-profile.ts";
 import {
-  askWake, dropAnswer, dropWake, dueWakes, keepAnswer, keepsPluginCalls, markAnswerPosting, nextWakeAt, pendingAnswers, pendingTurnEnds, recordTurnEnd,
+  askWake, bindTurn, dropAnswer, dropWake, dueWakes, keepAnswer, keepsPluginCalls, markAnswerPosting, nextWakeAt, pendingAnswers, pendingTurnEnds, recordTurnEnd,
   turnEndHandled, turnEndOf,
 } from "../../src/runtime/plugin-wakes.ts";
 import type { PluginHookAnswer } from "../../src/runtime/gateway.ts";
@@ -3654,7 +3654,11 @@ export class AgentRuntime {
   async #migrateEngine(tenantId: string, agentId: string, op: "migrate" | "revert", opts: { dryRun?: boolean }):
     Promise<MigrationResult | RevertResult | null> {
     await this.ready();
-    if (!(await this.store.loadAgent(tenantId, agentId))) return null;
+    const record = await this.store.loadAgent(tenantId, agentId);
+    if (!record) return null;
+    // A profile's plugin is driven by turn ends, which pd does not tell (`#recordTurnEnds`).
+    const profile = profileOf(record.config);
+    if (profile && op === "migrate") return { ok: false, refused: `this agent's profile (${profile}) runs on pi085 only: pd does not tell its plugin when a turn ends` };
     const binding = await this.store.getModelBinding(tenantId, agentId);
     if (!binding) return { ok: false, refused: `no model binding for ${tenantId}/${agentId}` };
     const storage = this.#deps.ctx.storage;
@@ -5281,6 +5285,10 @@ export class AgentRuntime {
     // pd: one harness runs every conversation of the object, and one step drives it whole
     // (`DurableAgent.step`), so there is nothing to choose. pi085: the sessions its list says have work.
     const sessions = pd ? [MAIN_SESSION] : sessionsWithWork(sql);
+    // Whether a main conversation that overflowed is rebuilt (`#overflowBackstop`): not for a profile that says it is
+    // not (src/runtime/agent-profile.ts), whose turns each start a conversation of their own and are counted by its plugin.
+    const profile = profileOf((await this.store.loadAgent(tenantId, agentId))?.config);
+    const rebuilds = profile === null || profileSpec(profile).rebuildsContext;
     if (!sessions.length) sessions.push(MAIN_SESSION);
     let open = 0, wakeInMs: number | null = bg.wakeInMs;
     const settled: Array<{ operationId: string; status: string }> = [];
@@ -5312,7 +5320,7 @@ export class AgentRuntime {
       }
       // A run of pi085's main conversation that ended on a context overflow is rebuilt rather than left to fail again
       // on every wake (`#overflowBackstop`); this pass then drives the rebuilt conversation's first call.
-      if (!pd && session === MAIN_SESSION && out.open === 0 && (out.settled.length || readBackstop(sql).pending !== null)) {
+      if (!pd && session === MAIN_SESSION && rebuilds && out.open === 0 && (out.settled.length || readBackstop(sql).pending !== null)) {
         const rebuilt = await this.#overflowBackstop(tenantId, agentId);
         if (rebuilt) out = { ...rebuilt, settled: [...out.settled, ...rebuilt.settled] };
       }
@@ -5414,7 +5422,7 @@ export class AgentRuntime {
       }
     };
     for (const row of pendingTurnEnds(sql)) {
-      const answers = await this.#gateway.afterTurn(tenantId, agentId, row.end);
+      const answers = await this.#gateway.afterTurn(tenantId, agentId, row.endFor);
       transact(() => { keep("afterTurn", answers); turnEndHandled(sql, row.seq, Date.now()); });
     }
     for (const w of dueWakes(sql, Date.now())) {
@@ -5435,8 +5443,20 @@ export class AgentRuntime {
       }
       if (typeof a.next.turn === "string") {
         try {
-          await this.postMessage(tenantId, agentId, a.next.turn, "prompt", MAIN_SESSION, { beforeSay: () => markAnswerPosting(sql, a.seq) });
-          posted = true;
+          // A turn that stands on its own starts a conversation of its own, so nothing from an earlier one is sent with it.
+          const busy = a.next.fresh ? mainBusy(sql) : null;
+          if (busy) {
+            logEvent("plugin.hook", { tenantId, agentId, mount: a.alias, hook: "turn", dropped: `a fresh conversation was asked for while ${busy}` });
+          } else {
+            if (a.next.fresh) {
+              startFreshMain(this.#deps.ctx.storage, Date.now());
+              await this.dropHarnesses(tenantId, agentId, "fresh-context");
+            }
+            const out = await this.postMessage(tenantId, agentId, a.next.turn, "prompt", MAIN_SESSION, { beforeSay: () => markAnswerPosting(sql, a.seq) });
+            const op = (out.result as { value?: { operationId?: unknown } } | null)?.value?.operationId;
+            if (typeof a.next.turnKey === "string" && typeof op === "string") bindTurn(sql, op, a.alias, a.next.turnKey, Date.now());
+            posted = true;
+          }
         } catch (e) {
           logEvent("plugin.hook", { tenantId, agentId, mount: a.alias, hook: "turn", error: String((e as Error)?.message ?? e).slice(0, 200) });
         }

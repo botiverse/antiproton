@@ -791,9 +791,9 @@ botiverse/slock#10130 and #10134). Every other Raft POST leaves it out.
   tokens (`RAFTBENCH_MAX_TOKENS`). It runs on the deployment's default model, as an agent created without `model`
   does; `GET /provision/agents/{agentId}/model` says which.
 - **A run.** Raft assigns one as a `system.raftbench` event and pushes the agent its usual inbox notice. Under the
-  profile a push is never a message to the model: it wakes the plugin, which reads the agent's events, reads every
-  page of the run's material, and starts one turn with it (the coverage block, the messages, and one line asking for
-  the result). The model's answer is submitted as it wrote it, `incomplete` included, except for its run id, revision and
+  profile a push is never a message to the model: it wakes the plugin, which reads the agent's events (an assignment counts only from Raft's `system.raftbench` app), reads every
+  page of the run's material, and starts one turn with it in a conversation of its own (the coverage block, the messages, and one line
+  asking for the result); its fix-up turn stays in that conversation, and no overflowed conversation is rebuilt. The model's answer is submitted as it wrote it, `incomplete` included, except for its run id, revision and
   `gaps`, which the plugin sets (the gaps from what the read covered; the model is never asked for them). An invalid answer gets one
   fix-up turn with the list of what is wrong; a second invalid one, a read that failed, a model that failed, a
   cancelled turn and the deadline end the run as failed, with the reason (`raft.raftbench.submitFailure`: an
@@ -801,7 +801,8 @@ botiverse/slock#10130 and #10134). Every other Raft POST leaves it out.
   refused before anything is sent, and counts as invalid output. A revision
   conflict reads the run again once; at most two model calls per read and four per run. A run ends 25 minutes after
   its assignment arrived (Raft stops taking results at 30): the turn in flight is cancelled and the run ends as
-  `timeout`. A submission Raft could not confirm is sent again, the same bytes, after 1, 2, 4, 8 and 16 minutes, then
+  `timeout`; its answer is discarded, but a provider call already under way may still finish and be billed (up to the
+  8,192-token cap), because the queue's model call takes no abort. A submission Raft could not confirm is sent again, the same bytes, after 1, 2, 4, 8 and 16 minutes, then
   given up with a `raftbench.run` log line (`outcome: "gave_up…"`, `admin: true`) and nothing else sent. An agent
   without the profile never acts on an assignment: `receive_events` leaves it out and logs `raft.raftbench_dropped`.
 - **What it needs from Raft.** The provider's credential check and push registration (`GET /internal/agent-api`,

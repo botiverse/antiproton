@@ -20,6 +20,8 @@ async function check(name: string, fn: () => Promise<void>) {
 }
 function must(cond: unknown, msg: string): asserts cond { if (!cond) throw new Error(msg); }
 const show = (v: unknown) => JSON.stringify(v);
+/** An end without its id, which is the run's and differs every time. */
+const told = (end: TurnEnd) => { const { turnId: _id, ...rest } = end; return rest; };
 const logs: any[] = [];
 setLogSink((line) => logs.push(JSON.parse(line)));
 
@@ -93,7 +95,8 @@ await check("a plugin that declares afterTurn is told how the turn ended and the
   const w = await world();
   await w.rt.postMessage("t", "a", "hello", "prompt", "main");
   await reply(w, "the answer");
-  must(show(w.seen) === show([{ alias: "watcher-m", end: { finalText: "the answer", outcome: "completed" } }]), show(w.seen));
+  must(show(w.seen.map((s) => ({ alias: s.alias, end: told(s.end) }))) === show([{ alias: "watcher-m", end: { finalText: "the answer", outcome: "completed", turnKey: null } }]), show(w.seen));
+  must(typeof w.seen[0]!.end.turnId === "string" && w.seen[0]!.end.turnId.length > 0, "no turn id");
   for (let i = 0; i < 3; i++) await steps(w);
   must(w.seen.length === 1, `told ${w.seen.length} times`);
 });
@@ -118,6 +121,26 @@ await check("a turn the hook asks for is posted once, as the next turn's input; 
   must(w.host.sql.exec("SELECT COUNT(*) AS n FROM plugin_answers").toArray()[0]!.n === 0, "an answer was left behind");
 });
 
+await check("a turn a mount asked for is told to it with its key; a turn it did not ask for has none", async () => {
+  const w = await world();
+  w.script.afterTurn.push({ turn: "mine", turnKey: "k-1" });
+  await w.rt.postMessage("t", "a", "hello", "prompt", "main");
+  await reply(w, "first");
+  await reply(w, "second");
+  const second = w.seen[1]!.end;
+  must(second.finalText === "second" && second.turnKey === "k-1" && w.seen[0]!.end.turnKey === null, show(w.seen));
+});
+
+await check("a fresh turn starts a conversation of its own: the model is sent none of the one before", async () => {
+  const w = await world();
+  w.script.afterTurn.push({ turn: "on its own", fresh: true });
+  await w.rt.postMessage("t", "a", "remember the word avocado", "prompt", "main");
+  await reply(w, "noted");
+  const job = await reply(w, "done");
+  const sent = show(job.context.messages);
+  must(sent.includes("on its own") && !sent.includes("avocado") && !sent.includes("noted"), sent.slice(0, 400));
+});
+
 await check("a cancelled turn is told as cancelled, once, though the cancel and the step that follows both see it end", async () => {
   const w = await world();
   await w.rt.postMessage("t", "a", "hello", "prompt", "main");
@@ -125,7 +148,7 @@ await check("a cancelled turn is told as cancelled, once, though the cancel and 
   const r = await w.rt.stopTurn("t", "a", "provider_stop");
   must(r.result === "interrupted", show(r));
   for (let i = 0; i < 3; i++) await steps(w);
-  must(show(w.seen.map((s) => s.end)) === show([{ finalText: null, outcome: "cancelled" }]), show(w.seen));
+  must(show(w.seen.map((s) => told(s.end))) === show([{ finalText: null, outcome: "cancelled", turnKey: null }]), show(w.seen));
 });
 
 await check("cancelTurn ends the running turn through the runtime's own cancel", async () => {
@@ -194,7 +217,7 @@ await check("a turn's end recorded twice, before or after it was handled, is tol
   await steps(w);
   recordTurnEnd(w.host.sql as any, "op-1", { finalText: "later", outcome: "completed" }, Date.now());
   await steps(w);
-  must(show(w.seen.map((s) => s.end)) === show([{ finalText: null, outcome: "cancelled" }]), show(w.seen));
+  must(show(w.seen.map((s) => s.end)) === show([{ finalText: null, outcome: "cancelled", turnId: "op-1", turnKey: null }]), show(w.seen));
 });
 
 await check("turnEndOf: the model's text, a cancel, and a failure with the model's own error", async () => {

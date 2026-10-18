@@ -1459,9 +1459,10 @@ Two hooks let a plugin's own code act on what the model did, without offering th
 are in the contract (`src/plugins/types.ts`, where each promise is spelled out), both are optional, and neither is
 called for a plugin that does not declare it.
 
-- **`afterTurn(ctx, { finalText, outcome, error? })`**: a model turn of the agent's main conversation has ended —
-  `completed`, `failed` (with what the model or the run reported) or `cancelled` — and `finalText` is the model's last
-  text, or null. A subagent's turn is not told.
+- **`afterTurn(ctx, { turnId, turnKey, finalText, outcome, error? })`**: a model turn of the agent's main
+  conversation has ended — `completed`, `failed` (with what the model or the run reported) or `cancelled` — and
+  `finalText` is the model's last text, or null. `turnKey` is the key this mount gave when it asked for the turn, and
+  null for any other turn: a plugin that acts on its own turns ignores the rest. A subagent's turn is not told.
 - **`wake(ctx)`**: the plugin asked to be called again (`wakeAt` below), or, for the plugin an agent profile names
   (`src/runtime/agent-profile.ts`), a service pushed an event at the agent: under a profile a push is that plugin's to
   act on, and never reaches the model as a message.
@@ -1471,8 +1472,10 @@ Either answers with what it wants next (`PluginNext`), or nothing:
 | Field | What the runtime does |
 |---|---|
 | `turn` | posts the text as a new turn's input on the main conversation |
+| `turnKey` | names that turn; its end is told to this mount with the key |
+| `fresh` | posts that turn in a new main conversation, so the model is sent nothing from before it; refused, with a log line, while a run is going |
 | `wakeAt` | calls this mount's `wake` at or after that time (epoch ms); one wake is kept per mount, and an earlier ask wins, so a plugin says the time it needs in every answer |
-| `cancelTurn` | ends the running turn with the runtime's own cancel; its end is told to `afterTurn` as `cancelled` |
+| `cancelTurn` | ends the running turn with the runtime's own cancel; its end is told to `afterTurn` as `cancelled`. Its model job is dropped, so a call not yet taken is never made, but one already under way runs to its end |
 
 What the runtime promises, and what it leaves to the plugin (`src/runtime/plugin-wakes.ts`, `#runPluginHooks` in
 `cf/src/runtime.ts`):

@@ -6,7 +6,8 @@
  * everything around it, in code, with the agent's `raft` mount's credential, which carries the `raftbench` capability:
  *
  * 1. **The assignment** (`wake`). Under the profile a push from Raft wakes this plugin rather than the model. It reads
- *    the agent's events and takes the `raftbench_run_assigned` among them (`isRaftbenchRunAssigned`); anything else is
+ *    the agent's events and takes the `raftbench_run_assigned` that Raft's `system.raftbench` app sent among them
+ *    (`raftbenchRunAssignment`); anything else, the same payload from another source included, is
  *    logged and dropped, since nothing else is this agent's to act on.
  * 2. **The material.** Every page of the run (`raft.raftbench.readAll`), which the SDK returns as one text: the
  *    coverage block, then the messages. The model's first turn is that text and one line asking for the result.
@@ -24,7 +25,9 @@
  *   counted, before it is asked for. Each call's output is capped by the profile (`RAFTBENCH_MAX_TOKENS`);
  * - **time**: `RUN_DEADLINE_MS` after the assignment arrived, five minutes before Raft stops taking results. At the
  *   deadline the turn in flight is cancelled (`PluginNext.cancelTurn`, the runtime's own cancel) and the run ends as
- *   "timeout". A result already waiting to be sent again keeps its retries instead: it is not replaced.
+ *   "timeout": its answer is discarded, though a provider call already under way may still finish (and be billed, up
+ *   to the output cap), since the queue's call takes no abort. A result already waiting to be sent again keeps its
+ *   retries instead: it is not replaced.
  *
  * What a failure means is the SDK's (`raftbenchFailureKind`): `reread` reads the run again from its first page and
  * redoes the result; `stop` ends the run with nothing submitted; `retry_identical` sends the same result again later,
@@ -38,8 +41,8 @@
 import { clip, logEvent, routeOf } from "../core/log.ts";
 import type { Json } from "../core/types.ts";
 import {
-  createRaft, isRaftbenchRunAssigned, raftbenchFailureKind, raftbenchGapsFromCoverage,
-  type Raft, type RaftFailure, type RaftbenchMaterial, type RaftbenchReport, type RaftbenchRunAssigned, type RaftbenchValidationIssue,
+  createRaft, raftbenchFailureKind, raftbenchGapsFromCoverage, raftbenchRunAssignment,
+  type Raft, type RaftFailure, type RaftbenchMaterial, type RaftbenchReport, type RaftbenchValidationIssue,
 } from "@botiverse/raft-sdk";
 import type { Plugin, PluginContext, PluginNext, TurnEnd } from "./types.ts";
 
@@ -135,6 +138,8 @@ interface RunState {
   deadline: number;
   /** Reads of the material started: at most `MAX_READS`. */
   reads: number;
+  /** The key of the turn this run asked for last (`PluginNext.turnKey`): only that turn's end is this run's answer. */
+  turnKey?: string;
   /** Model calls asked for in this read, and in the whole run: counted before each is asked for. */
   readCalls: number;
   calls: number;
@@ -224,7 +229,8 @@ async function pullAssignments(ctx: PluginContext, raft: Raft): Promise<void> {
     const r = await raft.routes.request("events", { query: { ack: "cursor", limit: String(EVENT_LIMIT), ...(since !== null ? { since: String(since) } : {}) } });
     if (!r.ok) throw new Error(`could not read this agent's events: ${r.error.message}`);
     for (const event of r.data.events as unknown[]) {
-      const a = assignmentOf(event);
+      // Only from Raft's own `system.raftbench` app: the same payload from any other source is not an assignment.
+      const a = raftbenchRunAssignment(event);
       if (!a) {
         const seq = (event as { seq?: unknown } | null)?.seq;
         log(ctx, null, "event_dropped", { seq: typeof seq === "number" ? seq : null });
@@ -237,16 +243,6 @@ async function pullAssignments(ctx: PluginContext, raft: Raft): Promise<void> {
     if (r.data.ack_mode === "cursor" && typeof r.data.last_seen_seq === "number") await ctx.db.put(STORE, r.data.last_seen_seq, SINCE);
     if (!r.data.has_more) break;
   }
-}
-
-/**
- * The run assignment an `/events` envelope carries, or null. Raft delivers it as a system event
- * (`system.raftbench`, botiverse/slock#10134 `advanceServer`), whose payload is the assignment itself.
- */
-export function assignmentOf(envelope: unknown): RaftbenchRunAssigned | null {
-  const event = envelope && typeof envelope === "object" ? (envelope as { third_party_event?: unknown }).third_party_event : undefined;
-  const payload = event && typeof event === "object" ? (event as { payload?: unknown }).payload : undefined;
-  return isRaftbenchRunAssigned(payload) ? payload : null;
 }
 
 const same = (a: { runId: string; revision: number } | null, b: { runId: string; revision: number }) =>
@@ -286,14 +282,20 @@ async function resumeRead(ctx: PluginContext, raft: Raft, reading: RunState): Pr
   log(ctx, run, "read", { pages: material.data.pages, fetched: run.coverage!.fetched, stopReason: material.data.coverage.stopReason });
   if (Date.now() >= run.deadline) return timeout(ctx, raft, run);
   if (run.calls >= MAX_CALLS) return submitFailed(ctx, raft, run, `the run's ${MAX_CALLS} model calls are spent`);
-  return ask(ctx, run, firstTurnText(material.data));
+  return ask(ctx, run, firstTurnText(material.data), true);
 }
 
-/** One model call, counted in the run's state before it is asked for. Its callers check the limits first. */
-async function ask(ctx: PluginContext, run: RunState, text: string): Promise<PluginNext> {
-  const asking: RunState = { ...run, phase: "turn", readCalls: run.readCalls + 1, calls: run.calls + 1 };
+/**
+ * One model call, counted in the run's state before it is asked for, under a key of its own that its end carries back.
+ * A read's first turn starts a conversation of its own (`fresh`), so the model is sent only this run's material; its
+ * fix-up stays in that conversation, beside the material and the answer it corrects. Its callers check the limits.
+ */
+async function ask(ctx: PluginContext, run: RunState, text: string, fresh: boolean): Promise<PluginNext> {
+  const calls = run.calls + 1;
+  const turnKey = `${run.runId}:${run.revision}:${calls}`;
+  const asking: RunState = { ...run, phase: "turn", readCalls: run.readCalls + 1, calls, turnKey };
   await save(ctx, CURRENT, asking);
-  return { turn: text };
+  return { turn: text, turnKey, ...(fresh ? { fresh: true as const } : {}) };
 }
 
 /** Keep the model's result, then send it: from here every send of this run's result is these bytes. */
@@ -330,7 +332,7 @@ async function send(ctx: PluginContext, raft: Raft, run: RunState): Promise<Plug
       const fixing: RunState = { ...run };
       delete fixing.from;
       delete fixing.body;
-      return ask(ctx, fixing, fixupTurnText(r.text));
+      return ask(ctx, fixing, fixupTurnText(r.text), false);
     }
     return submitFailed(ctx, raft, run, validationFailed(issues));
   }
@@ -359,6 +361,9 @@ async function sendFailed(ctx: PluginContext, raft: Raft, run: RunState, failure
     log(ctx, run, "reread", { code });
     return read(ctx, raft, run);
   }
+  // A refusal the contract does not name, of the model's result: the run failed, which Raft is told, so it tries the
+  // material again. Of the plugin's own failure, or a `stop`, there is nothing left to send that Raft would take.
+  if (kind === null && run.from === "model") return submitFailed(ctx, raft, run, `Raft refused the result: ${code}`);
   return end(ctx, raft, run, `stopped: ${code}`, { kind });
 }
 
@@ -431,55 +436,77 @@ export const raftbenchPlugin: Plugin = {
   },
 
   async wake(ctx) {
-    const raft = await raftOf(ctx);
-    const run = await load(ctx, CURRENT);
-    const now = Date.now();
-    // A result Raft has not confirmed is sent again, as it is, when its retry is due; the deadline does not replace it.
-    if (run?.phase === "submitting" && (run.retryAt === undefined || now >= run.retryAt)) return answer(ctx, await send(ctx, raft, run));
-    if (run && (run.phase === "reading" || run.phase === "turn") && now >= run.deadline) {
-      // The model is still working at the deadline: its turn is cancelled, and that turn's end is the timeout. If no
-      // end comes within the grace, the run ends without it. A read the deadline overtook ends here.
-      if (run.phase === "turn" && run.timedOut === undefined) {
-        await save(ctx, CURRENT, { ...run, timedOut: now });
-        log(ctx, run, "deadline");
-        return answer(ctx, { cancelTurn: true });
-      }
-      return answer(ctx, await timeout(ctx, raft, run));
+    try { return await woken(ctx); }
+    catch (e) {
+      // Kept for the next wake rather than lost with this one: the run's own deadline or retry is asked for again.
+      log(ctx, null, "wake_failed", { error: clip(String((e as Error)?.message ?? e)) });
+      return answer(ctx, { wakeAt: Date.now() + RETRY_DELAYS_MS[0]! });
     }
-    await pullAssignments(ctx, raft);
-    const pulled = await ctx.db.get(STORE, PULLED) as { runId: string; revision: number; receivedAt: number } | undefined;
-    if (pulled) {
-      const next = await load(ctx, NEXT);
-      if (same(run, pulled) || same(next, pulled)) {
-        log(ctx, pulled, "assignment_repeated");
-      } else if (run && run.phase !== "done") {
-        await save(ctx, NEXT, assigned(pulled, pulled.receivedAt));
-        log(ctx, pulled, "queued", { behind: run.runId });
-      } else {
-        log(ctx, pulled, "assigned");
-        await save(ctx, CURRENT, assigned(pulled, pulled.receivedAt));
-      }
-      await ctx.db.delete(STORE, PULLED);
-    }
-    const current = await load(ctx, CURRENT);
-    // A run not read yet (just assigned) starts; one an eviction cut short mid-read starts again, counted as it was.
-    if (current?.phase === "reading") return answer(ctx, await (current.reads > 0 ? resumeRead(ctx, raft, current) : read(ctx, raft, current)));
-    return answer(ctx, undefined);
   },
 
   async afterTurn(ctx, end: TurnEnd) {
-    const run = await load(ctx, CURRENT);
-    if (!run || run.phase === "done") return;
-    const raft = await raftOf(ctx);
-    // Told again after an eviction cut this hook short: a kept result is sent as it is, nothing new, and a reread
-    // that was under way starts again.
-    if (run.phase === "submitting") return answer(ctx, await send(ctx, raft, run));
-    if (run.phase === "reading") return answer(ctx, run.reads > 0 ? await resumeRead(ctx, raft, run) : undefined);
-    if (run.timedOut !== undefined || Date.now() >= run.deadline) return answer(ctx, await timeout(ctx, raft, run));
-    if (end.outcome === "cancelled") return answer(ctx, await submitFailed(ctx, raft, run, "The analysis turn was cancelled before it gave a result."));
-    if (end.outcome === "failed") {
-      return answer(ctx, await submitFailed(ctx, raft, run, `The model failed before giving a result: ${end.error ?? "no reason was given"}`));
+    try { return await turnEnded(ctx, end); }
+    catch (e) {
+      log(ctx, null, "after_turn_failed", { turnId: end.turnId, error: clip(String((e as Error)?.message ?? e)) });
+      return answer(ctx, undefined);
     }
-    return answer(ctx, await submitModel(ctx, raft, run, resultOf(end.finalText, run)));
   },
 };
+
+async function woken(ctx: PluginContext): Promise<PluginNext | void> {
+  const raft = await raftOf(ctx);
+  const run = await load(ctx, CURRENT);
+  const now = Date.now();
+  // A result Raft has not confirmed is sent again, as it is, when its retry is due; the deadline does not replace it.
+  if (run?.phase === "submitting" && (run.retryAt === undefined || now >= run.retryAt)) return answer(ctx, await send(ctx, raft, run));
+  if (run && (run.phase === "reading" || run.phase === "turn") && now >= run.deadline) {
+    // The model is still working at the deadline: its turn is cancelled, and that turn's end is the timeout. If no
+    // end comes within the grace, the run ends without it. A read the deadline overtook ends here.
+    if (run.phase === "turn" && run.timedOut === undefined) {
+      await save(ctx, CURRENT, { ...run, timedOut: now });
+      log(ctx, run, "deadline");
+      return answer(ctx, { cancelTurn: true });
+    }
+    return answer(ctx, await timeout(ctx, raft, run));
+  }
+  await pullAssignments(ctx, raft);
+  const pulled = await ctx.db.get(STORE, PULLED) as { runId: string; revision: number; receivedAt: number } | undefined;
+  if (pulled) {
+    const next = await load(ctx, NEXT);
+    if (same(run, pulled) || same(next, pulled)) {
+      log(ctx, pulled, "assignment_repeated");
+    } else if (run && run.phase !== "done") {
+      await save(ctx, NEXT, assigned(pulled, pulled.receivedAt));
+      log(ctx, pulled, "queued", { behind: run.runId });
+    } else {
+      log(ctx, pulled, "assigned");
+      await save(ctx, CURRENT, assigned(pulled, pulled.receivedAt));
+    }
+    await ctx.db.delete(STORE, PULLED);
+  }
+  const current = await load(ctx, CURRENT);
+  // A run not read yet (just assigned) starts; one an eviction cut short mid-read starts again, counted as it was.
+  if (current?.phase === "reading") return answer(ctx, await (current.reads > 0 ? resumeRead(ctx, raft, current) : read(ctx, raft, current)));
+  return answer(ctx, undefined);
+}
+
+async function turnEnded(ctx: PluginContext, end: TurnEnd): Promise<PluginNext | void> {
+  const run = await load(ctx, CURRENT);
+  if (!run || run.phase === "done") return;
+  // Only the turn this run asked for answers it: a person's message, an earlier run's late end, anything else is not.
+  if (end.turnKey === null || end.turnKey !== run.turnKey) {
+    log(ctx, run, "turn_ignored", { turnId: end.turnId, turnKey: end.turnKey });
+    return;
+  }
+  const raft = await raftOf(ctx);
+  // Told again after an eviction cut this hook short: a kept result is sent as it is, nothing new, and a reread
+  // that was under way starts again.
+  if (run.phase === "submitting") return answer(ctx, await send(ctx, raft, run));
+  if (run.phase === "reading") return answer(ctx, run.reads > 0 ? await resumeRead(ctx, raft, run) : undefined);
+  if (run.timedOut !== undefined || Date.now() >= run.deadline) return answer(ctx, await timeout(ctx, raft, run));
+  if (end.outcome === "cancelled") return answer(ctx, await submitFailed(ctx, raft, run, "The analysis turn was cancelled before it gave a result."));
+  if (end.outcome === "failed") {
+    return answer(ctx, await submitFailed(ctx, raft, run, `The model failed before giving a result: ${end.error ?? "no reason was given"}`));
+  }
+  return answer(ctx, await submitModel(ctx, raft, run, resultOf(end.finalText, run)));
+}

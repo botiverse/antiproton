@@ -1423,11 +1423,12 @@ export class ToolGateway {
   }
 
   /**
-   * A turn's end, to every mount whose plugin takes it (`Plugin.afterTurn`), behind the gate a report passes. Each
+   * A turn's end, to every mount whose plugin takes it (`Plugin.afterTurn`), as `endFor` says it to that mount (with the
+   * key it gave, when it asked for the turn), behind the gate a report passes. Each
    * answer comes back with its alias; a throw is that mount's alone, and is returned as `failed`.
    */
-  async afterTurn(tenantId: string, agentId: string, end: TurnEnd): Promise<PluginHookAnswer[]> {
-    return this.#toHookMounts(tenantId, agentId, (p) => !!p.afterTurn, null, (p, ctx) => p.afterTurn!(ctx, end));
+  async afterTurn(tenantId: string, agentId: string, endFor: (alias: string) => TurnEnd): Promise<PluginHookAnswer[]> {
+    return this.#toHookMounts(tenantId, agentId, (p) => !!p.afterTurn, null, (p, ctx) => p.afterTurn!(ctx, endFor(ctx.alias)));
   }
 
   /** The `wake` of one mount (`Plugin.wake`), behind the same gate. Empty when the alias has no such mount. */

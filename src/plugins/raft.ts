@@ -13,7 +13,7 @@ import { createHash } from "node:crypto";
 import { clip, logEvent, routeOf } from "../core/log.ts";
 import type { Json, MountRecord } from "../core/types.ts";
 import {
-  createRaft, describeRaftRoute, hashRaftSendContent, isInterrupted, projectRaftMessage, RAFT_OPERATIONS, RAFT_STATE_SCHEMA, SeenFrontier,
+  createRaft, describeRaftRoute, hashRaftSendContent, isInterrupted, projectRaftMessage, raftbenchRunAssignment, RAFT_OPERATIONS, RAFT_STATE_SCHEMA, SeenFrontier,
   type Raft, type RaftInboxBatch, type RaftInterrupt, type RaftMessage, type RaftOperationSpec, type RaftState, type RaftStateStore, type RaftFailure,
 } from "@botiverse/raft-sdk";
 import { PARK_BYTES } from "./artifacts.ts";
@@ -22,7 +22,6 @@ import {
   type AgentLoginDeps, type ManifestCache,
 } from "./raft-agent-login.ts";
 import { internalHost } from "./http.ts";
-import { assignmentOf } from "./raftbench.ts";
 import { callMcp, isMcpTool, keptMcpOf, leftOut, listMcp, mcpClock, mcpLines, MCP_CALL_TIMEOUT_MS, MCP_CAPABILITY, MCP_KEY, MCP_PREFIX } from "./raft-mcp.ts";
 import { modelToolName } from "../runtime/pi-tools.ts";
 import { isSubagentSession } from "../runtime/subagent-session.ts";
@@ -1500,13 +1499,13 @@ async function legacySend(
  * when it was handed out, so leaving it out moves no cursor.
  */
 function withoutRunAssignments(ctx: PluginContext, batch: RaftInboxBatch): RaftInboxBatch {
-  const runs = batch.messages.map((m) => assignmentOf(m.raw)).filter((a) => a !== null);
+  const runs = batch.messages.map((m) => raftbenchRunAssignment(m.raw)).filter((a) => a !== null);
   if (!runs.length) return batch;
   logEvent("raft.raftbench_dropped", {
     tenantId: ctx.caller.tenantId, agentId: ctx.caller.agentId, mount: ctx.alias,
     runs: runs.map((r) => `${r.runId}@${r.revision}`).join(","),
   });
-  return { ...batch, messages: batch.messages.filter((m) => assignmentOf(m.raw) === null) };
+  return { ...batch, messages: batch.messages.filter((m) => raftbenchRunAssignment(m.raw) === null) };
 }
 
 /**

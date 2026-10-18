@@ -2332,6 +2332,13 @@ export interface Plugin {
 
 /** How a model turn ended, as {@link Plugin.afterTurn} is told it. */
 export interface TurnEnd {
+  /** The turn's own id (its run's operation id): the same each time this end is told. */
+  turnId: string;
+  /**
+   * The `turnKey` this mount gave when it asked for this turn ({@link PluginNext.turn}), or null for a turn it did not
+   * ask for — a person's message, another mount's turn. A plugin acting on its own turns acts only on its key.
+   */
+  turnKey: string | null;
   /** The turn's last assistant text, or null when it ended with none (a tool call cut short, an error, a cancel). */
   finalText: string | null;
   outcome: "completed" | "failed" | "cancelled";
@@ -2343,12 +2350,22 @@ export interface TurnEnd {
 export interface PluginNext {
   /** Post this text as a new turn's input on the agent's main conversation. */
   turn?: string;
+  /** The plugin's name for that turn, handed back as {@link TurnEnd.turnKey} when it ends. */
+  turnKey?: string;
+  /**
+   * Post `turn` in a new main conversation (cf/src/fresh-context.ts), so the model is sent nothing from before it: for
+   * a turn whose input stands on its own. Refused, with the turn not posted and a log line, while a run is still going
+   * in the main conversation.
+   */
+  fresh?: true;
   /** Call this mount's `wake` at or after this time (epoch ms). */
   wakeAt?: number;
   /**
    * End the main conversation's running turn, as the runtime's own cancel does (`AgentRuntime.cancelSession`): the run
-   * is aborted and its model call dropped, and its end is told to `afterTurn` as `cancelled`. For a plugin that keeps a
-   * deadline on a turn it asked for. Nothing running is not an error.
+   * is aborted and its model job dropped, so a call not yet taken is never made and an answer that arrives later is
+   * discarded — a provider call already under way still runs to its end, since the queue's call takes no abort. Its end
+   * is told to `afterTurn` as `cancelled`. For a plugin that keeps a deadline on a turn it asked for. Nothing running is
+   * not an error.
    */
   cancelTurn?: true;
 }
