@@ -13,7 +13,7 @@ import { createHash } from "node:crypto";
 import { clip, logEvent, routeOf } from "../core/log.ts";
 import type { Json, MountRecord } from "../core/types.ts";
 import {
-  createRaft, describeRaftRoute, hashRaftSendContent, isInterrupted, projectRaftMessage, RAFT_OPERATIONS, RAFT_STATE_SCHEMA, SeenFrontier,
+  createRaft, describeRaftRoute, hashRaftSendContent, isInterrupted, projectRaftMessage, raftbenchRunAssignment, RAFT_OPERATIONS, RAFT_STATE_SCHEMA, SeenFrontier,
   type Raft, type RaftInboxBatch, type RaftInterrupt, type RaftMessage, type RaftOperationSpec, type RaftState, type RaftStateStore, type RaftFailure,
 } from "@botiverse/raft-sdk";
 import { PARK_BYTES } from "./artifacts.ts";
@@ -1492,6 +1492,23 @@ async function legacySend(
 }
 
 /**
+ * The batch without its RaftBench run assignments. One is the service agent's plugin's to act on, in code
+ * (src/plugins/raftbench.ts, under the agent's `raftbench_service` profile); to any other agent it is nothing to do,
+ * and Raft delivers it as a system event the SDK shows like a message. So it is never shown to the model, and the log
+ * says it arrived and went nowhere, where an operator looking for a lost run would look. It is seq-less, acknowledged
+ * when it was handed out, so leaving it out moves no cursor.
+ */
+function withoutRunAssignments(ctx: PluginContext, batch: RaftInboxBatch): RaftInboxBatch {
+  const runs = batch.messages.map((m) => raftbenchRunAssignment(m.raw)).filter((a) => a !== null);
+  if (!runs.length) return batch;
+  logEvent("raft.raftbench_dropped", {
+    tenantId: ctx.caller.tenantId, agentId: ctx.caller.agentId, mount: ctx.alias,
+    runs: runs.map((r) => `${r.runId}@${r.revision}`).join(","),
+  });
+  return { ...batch, messages: batch.messages.filter((m) => raftbenchRunAssignment(m.raw) === null) };
+}
+
+/**
  * What one `receive_events` hands the model out of the batch Raft returned, what it acknowledges, and whether it
  * records the shown messages as seen.
  *
@@ -2875,7 +2892,7 @@ export function createRaftPlugin(deps: {
         const out = await raftFor(ctx, { state: false }).invoke("inbox.check",
           { ack: "cursor", limit, ...(since !== null ? { since } : {}) }, { origin: "model" });
         if (!out.ok) throw sdkFailure(out as RaftFailure, unofferedFor(ctx));
-        const batch = (out as { data: RaftInboxBatch }).data;
+        const batch = withoutRunAssignments(ctx, (out as { data: RaftInboxBatch }).data);
         const given = handOver(batch, unofferedFor(ctx));
         // Exactly this call's cursor, lower than the last one or not: the next pull acknowledges what was shown here.
         // A Server that acknowledged on read has nothing pending, so the next pull sends none. Written before anything

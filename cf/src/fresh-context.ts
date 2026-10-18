@@ -146,6 +146,33 @@ export function startFreshMain(host: Host, now: number, cause: MainCause = "fres
   return host.transactionSync ? host.transactionSync(run) : run();
 }
 
+/**
+ * Start a new main conversation, and erase the one that ends rather than archive it: its transcript's tables, its model
+ * jobs (requests and answers), and its row's pointer to the archive. Only the conversation's id and times stay in
+ * `main_sessions`. Idempotent: with nothing in the main conversation it does nothing, and answers null. For an agent whose conversations hold material that must not outlive their use
+ * (src/runtime/agent-profile.ts `keepsConversations`). Called with no run in the main conversation, so every job
+ * filed under it belongs to the one ending.
+ */
+export function eraseMain(host: Host, now: number): { oldSessionId: string; newSessionId: string } | null {
+  const sql = host.sql;
+  // Asked again after an eviction, or with nothing said since: an empty conversation has nothing to erase.
+  const table = (name: string) => rows(sql, "SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = ?", name).length > 0;
+  const entries = table(piTables(MAIN_SESSION).entries) && rows(sql, `SELECT 1 AS x FROM ${piTables(MAIN_SESSION).entries} LIMIT 1`).length > 0;
+  const jobs = table("pi_model_jobs") && rows(sql, "SELECT 1 AS x FROM pi_model_jobs WHERE session = ? LIMIT 1", MAIN_SESSION).length > 0;
+  if (!entries && !jobs) return null;
+  const out = startFreshMain(host, now);
+  const run = () => {
+    const archive = archivedName(out.oldSessionId);
+    const t = piTables(archive);
+    for (const table of [t.entries, t.usage, t.values, t.list, t.meta]) sql.exec(`DROP TABLE IF EXISTS ${table}`);
+    sql.exec("UPDATE main_sessions SET archived_as = NULL WHERE session_id = ?", out.oldSessionId);
+    if (rows(sql, "SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = 'pi_sessions'").length) sql.exec("DELETE FROM pi_sessions WHERE session = ?", archive);
+    if (rows(sql, "SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = 'pi_model_jobs'").length) sql.exec("DELETE FROM pi_model_jobs WHERE session = ?", MAIN_SESSION);
+  };
+  host.transactionSync ? host.transactionSync(run) : run();
+  return out;
+}
+
 // ---- model input evidence
 
 export interface MessageEvidence {

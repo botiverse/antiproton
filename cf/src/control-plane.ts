@@ -23,6 +23,8 @@
  * before the Worker ships. Depends on: those files. A column changed there is changed in the queries below.
  */
 
+import { isAgentProfile, type AgentProfile } from "../../src/runtime/agent-profile.ts";
+
 /** What sign-in needs from a row. */
 export interface Invitation {
   agentId: string;
@@ -404,6 +406,12 @@ export interface ProvisionedAgent {
    * patched. Optional: absent reads as null.
    */
   budget?: AgentBudget | null;
+  /**
+   * The agent profile the creating POST asked for (0025, src/runtime/agent-profile.ts), null for today's agent. Fixed
+   * at creation and compared on a replay, like `awaitImport`; the agent's object keeps the copy it runs by. Optional:
+   * absent reads as null.
+   */
+  profile?: AgentProfile | null;
   status: ProvisionStatus;
   pushRegistered: boolean;
   pushError: string | null;
@@ -442,6 +450,7 @@ export function d1ProvisionedAgents(db: D1Database, now: () => number = Date.now
     modelPending: Number(r.model_pending ?? 0) === 1,
     awaitImport: Number(r.await_import ?? 0) === 1,
     budget: r.budget === AGENT_BUDGETS[0] ? AGENT_BUDGETS[0] : null,
+    profile: isAgentProfile(r.profile) ? r.profile : null,
     status: String(r.status) as ProvisionStatus,
     pushRegistered: Number(r.push_registered) === 1, pushError: r.push_error === null ? null : String(r.push_error),
     createdAt: Number(r.created_at), updatedAt: Number(r.updated_at),
@@ -456,9 +465,9 @@ export function d1ProvisionedAgents(db: D1Database, now: () => number = Date.now
     async create(r) {
       const t = now();
       await db.prepare(
-        "INSERT INTO provisioned_agents(tenant_id, raft_agent_id, agent_id, raft_server_id, raft_origin, name, instructions, credential_hash, model, model_pending, await_import, budget, status, push_registered, push_error, created_at, updated_at) " +
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-      ).bind(r.tenantId, r.raftAgentId, r.agentId, r.raftServerId, r.raftOrigin, r.name, r.instructions, r.credentialHash, r.model ?? null, r.modelPending ? 1 : 0, r.awaitImport ? 1 : 0, r.budget ?? null, r.status,
+        "INSERT INTO provisioned_agents(tenant_id, raft_agent_id, agent_id, raft_server_id, raft_origin, name, instructions, credential_hash, model, model_pending, await_import, budget, profile, status, push_registered, push_error, created_at, updated_at) " +
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      ).bind(r.tenantId, r.raftAgentId, r.agentId, r.raftServerId, r.raftOrigin, r.name, r.instructions, r.credentialHash, r.model ?? null, r.modelPending ? 1 : 0, r.awaitImport ? 1 : 0, r.budget ?? null, r.profile ?? null, r.status,
         r.pushRegistered ? 1 : 0, r.pushError, t, t).run();
     },
     async get(tenantId, raftAgentId) {

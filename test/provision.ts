@@ -575,6 +575,48 @@ await check("connectors: a confirmed connection is the tenant's; another agent i
   if ((await call(f.deps, "GET", b)).body.connectors.length !== 0) throw new Error("a disconnected connector is still listed");
 });
 
+await check("profile: opt-in, kept on the row and handed to the agent's object; absent is today's agent", async () => {
+  const f = fakeDeps();
+  const asked: unknown[] = [];
+  f.deps.agent.adopt = async (_t, _a, spec) => { asked.push(spec.profile); };
+  const plain = await call(f.deps, "POST", "/agents", body({ raftAgentId: "01JPLAIN" }), "01JPLAIN");
+  assert(plain.status === 201 && plain.body.profile === undefined && (f.rows.get("t-raft/01JPLAIN")!.profile ?? null) === null, plain.text);
+  const service = await call(f.deps, "POST", "/agents", body({ profile: "raftbench_service" }), "01JAGENT");
+  assert(service.status === 201 && service.body.profile === "raftbench_service", service.text);
+  assert(f.rows.get("t-raft/01JAGENT")!.profile === "raftbench_service", JSON.stringify(f.rows.get("t-raft/01JAGENT")));
+  assert(JSON.stringify(asked) === JSON.stringify([null, "raftbench_service"]), `adopt was asked ${JSON.stringify(asked)}`);
+});
+
+await check("profile: the same profile replays as the same answer; another, or none, is 409 idempotency_conflict naming profile", async () => {
+  const f = fakeDeps();
+  await call(f.deps, "POST", "/agents", body({ profile: "raftbench_service" }), "01JAGENT");
+  const again = await call(f.deps, "POST", "/agents", body({ profile: "raftbench_service" }), "01JAGENT");
+  assert(again.status === 200 && again.body.profile === "raftbench_service", again.text);
+  f.calls.length = 0;
+  for (const over of [{}, { profile: null }]) {
+    const r = await call(f.deps, "POST", "/agents", body(over), "01JAGENT");
+    assert(r.status === 409 && r.body.error.code === "idempotency_conflict" && /\(profile\)/.test(r.body.error.message), `${JSON.stringify(over)} → ${r.status} ${r.text}`);
+  }
+  assert(f.calls.length === 0 && f.rows.get("t-raft/01JAGENT")!.profile === "raftbench_service", `calls ${f.calls.join(";")}`);
+  // And the other way: an agent made without one is not given one by a replay.
+  await call(f.deps, "POST", "/agents", body({ raftAgentId: "01JPLAIN" }), "01JPLAIN");
+  const late = await call(f.deps, "POST", "/agents", body({ raftAgentId: "01JPLAIN", profile: "raftbench_service" }), "01JPLAIN");
+  assert(late.status === 409 && /\(profile\)/.test(late.body.error.message) && (f.rows.get("t-raft/01JPLAIN")!.profile ?? null) === null, late.text);
+});
+
+await check("profile: any other value is 400 invalid naming profile, and nothing is made; it does not combine with mounts or harness", async () => {
+  const f = fakeDeps();
+  for (const v of ["raftbench", "RAFTBENCH_SERVICE", "", 1, true, { name: "raftbench_service" }, ["raftbench_service"], "toString", "__proto__"]) {
+    const r = await call(f.deps, "POST", "/agents", body({ profile: v }), "01JAGENT");
+    assert(r.status === 400 && r.body.error.code === "invalid" && r.body.error.param === "profile", `${JSON.stringify(v)} → ${r.status} ${r.text}`);
+  }
+  for (const named of ["mounts", "harness"]) {
+    const r = await call(f.deps, "POST", "/agents", body({ profile: "raftbench_service", [named]: named === "mounts" ? [] : "minimal" }), "01JAGENT");
+    assert(r.status === 400 && r.body.error.param === named, `${named} → ${r.status} ${r.text}`);
+  }
+  assert(f.rows.size === 0 && f.calls.length === 0, `made: ${f.rows.size} rows, calls ${f.calls.join(";")}`);
+});
+
 for (const r of results) console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);
 const passed = results.filter((r) => r.ok).length;
 console.log(`  ${"─".repeat(56)}\n  ${passed} passed, ${results.length - passed} failed\n`);
