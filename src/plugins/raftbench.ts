@@ -42,7 +42,7 @@ import { randomUUID } from "node:crypto";
 import { clip, logEvent, routeOf } from "../core/log.ts";
 import type { Json } from "../core/types.ts";
 import {
-  createRaft, raftbenchFailureKind, raftbenchGapsFromCoverage, raftbenchRunAssignment,
+  createRaft, raftbenchEmptyWindowReport, raftbenchFailureKind, raftbenchGapsFromCoverage, raftbenchRunAssignment,
   type Raft, type RaftFailure, type RaftbenchMaterial, type RaftbenchReport, type RaftbenchValidationIssue,
 } from "@botiverse/raft-sdk";
 import type { Plugin, PluginContext, PluginNext, TurnEnd } from "./types.ts";
@@ -301,8 +301,9 @@ async function resumeRead(ctx: PluginContext, raft: Raft, reading: RunState): Pr
   };
   log(ctx, run, "read", { pages: material.data.pages, fetched: run.coverage!.fetched, stopReason: material.data.coverage.stopReason });
   if (Date.now() >= run.deadline) return timeout(ctx, raft, run);
-  // Nothing was read: there is nothing for a model to analyse, and nothing failed.
-  if (material.data.coverage.fetchedMessages === 0) return submitResult(ctx, raft, run, emptyWindowReport(material.data), "empty");
+  // Nothing was read: there is nothing for a model to analyse, and nothing failed. An ordinary `incomplete`, sent with
+  // `submit`, not the run's failure, which Raft would try again and count towards its limit.
+  if (material.state === "empty") return submitResult(ctx, raft, run, raftbenchEmptyWindowReport(material.data), "empty");
   if (run.calls >= MAX_CALLS) return submitFailed(ctx, raft, run, `the run's ${MAX_CALLS} model calls are spent`);
   return ask(ctx, run, firstTurnText(material.data), true);
 }
@@ -318,18 +319,6 @@ async function ask(ctx: PluginContext, run: RunState, text: string, fresh: boole
   const asking: RunState = { ...run, phase: "turn", readCalls: run.readCalls + 1, calls, turnKey };
   await save(ctx, CURRENT, asking);
   return { turn: text, turnKey, ...(fresh ? { fresh: true as const } : {}) };
-}
-
-/**
- * The result of a window with no messages in it: an ordinary `incomplete`, sent with `submit` — not the run's failure,
- * which Raft would try again and count towards its limit — with the window's gaps and no patterns.
- * SWAP POINT: SDK 0.23.0's `raftbenchEmptyWindowReport(material)`, once `readAll` says `state: "empty"`.
- */
-export function emptyWindowReport(material: RaftbenchMaterial): RaftbenchReport {
-  return {
-    runId: material.runId, revision: material.revision, status: "incomplete",
-    reason: "No messages were read in this window; nothing was analyzed.", patterns: [], gaps: raftbenchGapsFromCoverage(material.coverage),
-  };
 }
 
 /** Keep the model's result, then send it: from here every send of this run's result is these bytes. */

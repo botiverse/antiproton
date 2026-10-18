@@ -722,6 +722,7 @@ await check("an empty window: no model call, an ordinary incomplete through subm
     patterns: [], gaps: ["missing_tool_outcomes"] }), submits[0]!.raw);
   must(runLogs("done").some((l) => l.outcome === "accepted" && l.from === "empty"), show(runLogs("done")));
   must(w.host.sql.exec("SELECT COUNT(*) AS n FROM pi_entries").toArray()[0]!.n === 0 && w.host.sql.exec("SELECT COUNT(*) AS n FROM pi_model_jobs").toArray()[0]!.n === 0, "a conversation was kept");
+  must(show(whereIs(w, "nothing was analyzed")) === "[]", `the submitted result was kept: ${show(whereIs(w, "nothing was analyzed"))}`);
   // A window with messages in it still goes to the model.
   const v = await world();
   await assign(v);
