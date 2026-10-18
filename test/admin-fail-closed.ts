@@ -16,6 +16,7 @@ const STAND_IN = "export class DurableObject { constructor(ctx, env) { this.ctx 
 register("data:text/javascript," + encodeURIComponent(
   `export async function resolve(s, c, next) { if (s.startsWith("cloudflare:")) return { url: ${JSON.stringify("data:text/javascript," + encodeURIComponent(STAND_IN))}, shortCircuit: true }; return next(s, c); }`));
 const { default: worker } = await import("../cf/src/index.ts");
+const { sessionCookieFor } = await import("../cf/src/auth.ts");
 const { setLogSink } = await import("../src/core/log.ts");
 setLogSink(() => {});
 
@@ -28,6 +29,8 @@ function must(cond: unknown, msg: string): asserts cond { if (!cond) throw new E
 const show = (v: unknown) => JSON.stringify(v);
 
 const TOKEN = "operator-token-814";
+/** The session sealing key: a cookie minted with it is the same thing a browser presents. */
+const SESSION = "s".repeat(32);
 
 // No route here should fetch from the Worker; in a test any fetch is recorded and answered here, never sent. Whichever
 // world is current records it, so a refused route shows an outbound fetch as plainly as an object call.
@@ -58,9 +61,16 @@ function world(token: string | undefined) {
   };
   outbound = calls;
   const env: Record<string, unknown> = {
-    AGENT: { idFromName: (n: string) => n, get: () => objectStub },
+    // Choosing an object is recorded too, not only calling it: `get` contacts nothing until a method is called, so a
+    // path that is handed an object it never uses would otherwise leave no trace.
+    AGENT: {
+      idFromName: (n: string) => { calls.push(`agent.idFromName ${n}`); return n; },
+      get: (id: string) => { calls.push(`agent.get ${id}`); return objectStub; },
+    },
     CONTROL_DB: { prepare: () => stmt, batch: async () => [] },
     ARTIFACTS: bucket,
+    // A viewer's own session is minted here (below): one route must refuse it whatever it owns.
+    SESSION_SECRET: SESSION,
     ...(token === undefined ? {} : { AUTOMATION_TOKEN: token }),
   };
   return { env, calls };
@@ -167,6 +177,78 @@ for (const path of DELETED) {
     }
   });
 }
+
+// `/agent/activity/reset` empties the object's `do_activity` — the rows its billed time is counted from, with an
+// hourly watermark that never runs backwards (src/usage/active.ts) — so it is a write that loses the part of an hour
+// not yet charged. It answers a GET, and the session cookie is SameSite=Lax, so a viewer who owns the agent would
+// reach it from another site's plain link. It is the operator's: the same door `/bench/activity/reset` uses.
+const RESET = "/agent/activity/reset?tenantId=demo&agentId=u-a";
+const cookie = (await sessionCookieFor(SESSION,
+  { email: "owner@x.test", name: null, username: null, picture: null, source: "github", agentId: "u-a", tenantId: "demo" },
+  "gh-u-a")).split(";")[0]!;
+
+await check("GET /agent/activity/reset: the agent's own signed-in owner cannot clear it", async () => {
+  for (const [label, presented] of [["a session cookie", null], ["a session cookie and a wrong token", "nope"]] as const) {
+    const w = world(TOKEN);
+    const headers: Record<string, string> = { cookie };
+    if (presented !== null) headers["x-harness-token"] = presented;
+    const res = await worker.fetch(new Request(`https://x${RESET}`, { method: "GET", headers }), w.env as never,
+      { waitUntil() {}, passThroughOnException() {} } as never);
+    must(res.status === 401, `${label}: ${res.status} ${(await res.text()).slice(0, 200)}`);
+    must(!w.calls.some((c) => /^(object|r2|fetch)\./.test(c)), `${label} reached the object: ${w.calls}`);
+  }
+});
+
+await check("GET /agent/activity/reset: the operator's token clears it", async () => {
+  const w = world(TOKEN);
+  const res = await worker.fetch(new Request(`https://x${RESET}`, { method: "GET", headers: { "x-harness-token": TOKEN } }),
+    w.env as never, { waitUntil() {}, passThroughOnException() {} } as never);
+  must(res.status === 200, `${res.status} ${(await res.text()).slice(0, 200)}`);
+  must(w.calls.includes("object.resetActivity"), `the object was not asked: ${w.calls}`);
+});
+
+// The mechanism behind #924: the object is chosen from the path's prefix, and a path under none used to land on one
+// shared object with no identity. Now such a path is answered before any object is chosen, so the only way an
+// unprefixed path reaches an object is to name one itself. Read from the env: no object is chosen, let alone called,
+// whoever asks and however. `/agent-other` and the case variants hold the prefix to a whole segment, matched exactly.
+const UNPREFIXED = ["/probe/next", "/x", "/agent-other", "/agentx/activity", "/Agent/activity", "/AGENT/activity/reset",
+  "/UI", "/Bench/start", "/conformanceX/executor", "/p0", "//agent/activity"];
+for (const path of UNPREFIXED) {
+  await check(`${path}: under no prefix, so the 404 index and no object chosen`, async () => {
+    for (const method of ["GET", "POST"]) {
+      for (const [label, token, headers] of [
+        ["no credential", undefined, {}], ["a wrong token", TOKEN, { "x-harness-token": "nope" }],
+        ["the operator's token", TOKEN, { "x-harness-token": TOKEN }], ["an owner's session", TOKEN, { cookie }],
+      ] as Array<[string, string | undefined, Record<string, string>]>) {
+        const w = world(token);
+        const res = await worker.fetch(new Request(`https://x${path}?tenantId=demo&agentId=u-a`, { method, headers }), w.env as never,
+          { waitUntil() {}, passThroughOnException() {} } as never);
+        const text = await res.text();
+        must(res.status === 404, `${method} with ${label}: ${res.status} ${text.slice(0, 200)}`);
+        must((JSON.parse(text) as { demo?: string }).demo === "/ui", `${method} with ${label}: not the index: ${text.slice(0, 200)}`);
+        must(!w.calls.some((c) => /^(agent|object|r2|fetch)[. ]/.test(c)), `${method} with ${label} chose or reached an object: ${w.calls}`);
+      }
+    }
+  });
+}
+
+// `/` is unprefixed too, and is the redirect to the console: still no object.
+await check("/: the redirect to /ui, with no object chosen", async () => {
+  const w = world(TOKEN);
+  const res = await worker.fetch(new Request("https://x/", { method: "GET", headers: { cookie } }), w.env as never,
+    { waitUntil() {}, passThroughOnException() {} } as never);
+  must(res.status === 302 && new URL(res.headers.get("location") ?? "").pathname === "/ui", `${res.status} ${res.headers.get("location")}`);
+  must(!w.calls.some((c) => /^(agent|object|r2|fetch)[. ]/.test(c)), `chose or reached an object: ${w.calls}`);
+});
+
+// The control for the rows above: the recorder sees an object being chosen when a prefix does choose one.
+await check("/agent/activity: a prefixed path does choose its object by identity, and the recorder sees it", async () => {
+  const w = world(TOKEN);
+  const res = await worker.fetch(new Request("https://x/agent/activity?tenantId=demo&agentId=u-a", { headers: { "x-harness-token": TOKEN } }),
+    w.env as never, { waitUntil() {}, passThroughOnException() {} } as never);
+  must(res.status === 200, `${res.status} ${(await res.text()).slice(0, 200)}`);
+  must(w.calls.some((c) => c.startsWith("agent.idFromName ") && c.includes("u-a")) && w.calls.includes("object.activity"), `calls=${w.calls}`);
+});
 
 const failed = results.filter((r) => !r.ok);
 for (const r of results) console.log(`${r.ok ? "PASS" : "FAIL"}  ${r.name}${r.ok ? "" : `\n      ${r.error}`}`);
