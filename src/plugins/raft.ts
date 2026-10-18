@@ -22,6 +22,7 @@ import {
   type AgentLoginDeps, type ManifestCache,
 } from "./raft-agent-login.ts";
 import { internalHost } from "./http.ts";
+import { assignmentOf } from "./raftbench.ts";
 import { callMcp, isMcpTool, keptMcpOf, leftOut, listMcp, mcpClock, mcpLines, MCP_CALL_TIMEOUT_MS, MCP_CAPABILITY, MCP_KEY, MCP_PREFIX } from "./raft-mcp.ts";
 import { modelToolName } from "../runtime/pi-tools.ts";
 import { isSubagentSession } from "../runtime/subagent-session.ts";
@@ -1492,6 +1493,23 @@ async function legacySend(
 }
 
 /**
+ * The batch without its RaftBench run assignments. One is the service agent's plugin's to act on, in code
+ * (src/plugins/raftbench.ts, under the agent's `raftbench_service` profile); to any other agent it is nothing to do,
+ * and Raft delivers it as a system event the SDK shows like a message. So it is never shown to the model, and the log
+ * says it arrived and went nowhere, where an operator looking for a lost run would look. It is seq-less, acknowledged
+ * when it was handed out, so leaving it out moves no cursor.
+ */
+function withoutRunAssignments(ctx: PluginContext, batch: RaftInboxBatch): RaftInboxBatch {
+  const runs = batch.messages.map((m) => assignmentOf(m.raw)).filter((a) => a !== null);
+  if (!runs.length) return batch;
+  logEvent("raft.raftbench_dropped", {
+    tenantId: ctx.caller.tenantId, agentId: ctx.caller.agentId, mount: ctx.alias,
+    runs: runs.map((r) => `${r.runId}@${r.revision}`).join(","),
+  });
+  return { ...batch, messages: batch.messages.filter((m) => assignmentOf(m.raw) === null) };
+}
+
+/**
  * What one `receive_events` hands the model out of the batch Raft returned, what it acknowledges, and whether it
  * records the shown messages as seen.
  *
@@ -2875,7 +2893,7 @@ export function createRaftPlugin(deps: {
         const out = await raftFor(ctx, { state: false }).invoke("inbox.check",
           { ack: "cursor", limit, ...(since !== null ? { since } : {}) }, { origin: "model" });
         if (!out.ok) throw sdkFailure(out as RaftFailure, unofferedFor(ctx));
-        const batch = (out as { data: RaftInboxBatch }).data;
+        const batch = withoutRunAssignments(ctx, (out as { data: RaftInboxBatch }).data);
         const given = handOver(batch, unofferedFor(ctx));
         // Exactly this call's cursor, lower than the last one or not: the next pull acknowledges what was shown here.
         // A Server that acknowledged on read has nothing pending, so the next pull sends none. Written before anything

@@ -183,7 +183,8 @@ export function queuedCall(env: ModelEnv, bucket: Parameters<typeof imageLoaderF
  * An OpenAI reasoning model (`usesResponses`) is called through the Responses API at the same provider, with its
  * reasoning on and its earlier reasoning replayed (src/model/openai-responses.ts); every other model through
  * chat/completions, whose request — DeepSeek's among them — test/model-request-snapshot.ts pins byte for byte.
- * The job's own options are not forwarded on either path: the reasoning level is each client's default, except where
+ * The job's own options are not forwarded on either path: the reasoning level and the output cap are each client's
+ * default, except for an output cap a profile set (`maxTokens`, src/runtime/agent-profile.ts) and except where
  * the object marked the job `reasoning: "off"` (an agent's first turn made to run without, src/runtime/prewarm.ts).
  *
  * An image in the conversation is stored as a reference (src/model/images.ts); for a model that can see images
@@ -215,19 +216,20 @@ export async function callQueuedModel(env: ModelEnv, job: any, jobId: string, im
   // Told the status of each HTTP answer only when it is recorded, so a call that is not is the call it always was.
   let lastStatus: number | undefined;
   const observe = recording ? { onStatus: (s: number) => { lastStatus = s; } } : {};
-  // The one option a job may carry: reasoning off for a first turn its object marked (`AgentRuntime.takeJob`). A job
-  // without it is sent exactly the request it always was.
-  const reasoning = jobReasoning(job);
+  // The options a job may carry, each marked by its object (`AgentRuntime.takeJob`): reasoning off for a first turn
+  // made to run without, and an output cap for an agent whose profile sets one. A job without them is sent exactly the
+  // request it always was.
+  const options = jobOptions(job);
   let call: () => Promise<ModelResponse>;
   if (usesResponses(called)) {
     const toolImages = env.RESPONSES_TOOL_IMAGES === "user" ? "user" as const : "output" as const;
     const { input, tools } = toResponsesInput(context, called, { images: sees, toolImages });
     const model = new OpenAiResponsesModel(request);
-    call = () => model.complete(input, { ...(tools ? { tools } : {}), ...observe, ...reasoning });
+    call = () => model.complete(input, { ...(tools ? { tools } : {}), ...observe, ...options });
   } else {
     const model = new OpenAiCompatibleModel(request);
     const { messages, tools } = toRequest(context, { images: sees });
-    call = () => model.complete(messages, { ...(tools ? { tools } : {}), ...observe, ...reasoning });
+    call = () => model.complete(messages, { ...(tools ? { tools } : {}), ...observe, ...options });
   }
   const identity = {
     api: String(job.model?.api ?? "offloaded"),
@@ -261,8 +263,11 @@ export async function callQueuedModel(env: ModelEnv, job: any, jobId: string, im
 }
 
 /** `reasoning` as a taken job carries it: only "off" is ever set (`AgentRuntime.takeJob`); anything else is no option. */
-function jobReasoning(job: any): { reasoning: "off" } | Record<string, never> {
-  return job?.reasoning === "off" ? { reasoning: "off" } : {};
+function jobOptions(job: any): { reasoning?: "off"; maxTokens?: number } {
+  return {
+    ...(job?.reasoning === "off" ? { reasoning: "off" as const } : {}),
+    ...(Number.isInteger(job?.maxTokens) && job.maxTokens > 0 ? { maxTokens: job.maxTokens as number } : {}),
+  };
 }
 
 const RESPONSES_MIN_OUTPUT_TOKENS = 16;
@@ -289,7 +294,8 @@ export async function callPrewarm(env: ModelEnv, job: any): Promise<PrewarmResul
   const t0 = Date.now();
   try {
     const request = operatorRequest(operatorModelOf(env), { provider, model: called });
-    const reasoning = jobReasoning(job);
+    // A prewarm generates nothing, so of a job's options only its reasoning applies.
+    const reasoning = jobOptions(job).reasoning ? { reasoning: "off" as const } : {};
     let res: ModelResponse;
     if (usesResponses(called)) {
       const { input, tools } = toResponsesInput({ ...job.context, messages: [] }, called, {});

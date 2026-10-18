@@ -19,6 +19,7 @@
  * So the sandbox paragraph appears only where a sandbox exists, and nothing in
  * here equates finishing with not acting.
  */
+import { profileSpec, type AgentProfile } from "./agent-profile.ts";
 
 const CORE = `You are a long-running agent working on the user's behalf.
 
@@ -157,4 +158,14 @@ export function personaSection(p: PromptParts["persona"]): string {
   if (name) lines.push(`You are ${name}.`);
   if (description) lines.push(description);
   return lines.join("\n\n");
+}
+
+/**
+ * The system prompt of an agent made with a profile (src/runtime/agent-profile.ts): the profile's own instructions and
+ * nothing else. Not the core above, which tells a conversational agent to act with its tools; not the persona, which
+ * is the provider's words for a conversational agent; not the plugins' paragraphs, which describe mounts the model is
+ * not offered. Every one of those would be an instruction competing with the one job the profile is for.
+ */
+export function profilePrompt(profile: AgentProfile): string {
+  return profileSpec(profile).instructions;
 }

@@ -1453,6 +1453,48 @@ What is specific to GitHub:
 
 `test/github-inbound.ts` holds these rules.
 
+## Code that runs after a turn, or later
+
+Two hooks let a plugin's own code act on what the model did, without offering the model a tool to do it with. Both
+are in the contract (`src/plugins/types.ts`, where each promise is spelled out), both are optional, and neither is
+called for a plugin that does not declare it.
+
+- **`afterTurn(ctx, { finalText, outcome, error? })`**: a model turn of the agent's main conversation has ended —
+  `completed`, `failed` (with what the model or the run reported) or `cancelled` — and `finalText` is the model's last
+  text, or null. A subagent's turn is not told.
+- **`wake(ctx)`**: the plugin asked to be called again (`wakeAt` below), or, for the plugin an agent profile names
+  (`src/runtime/agent-profile.ts`), a service pushed an event at the agent: under a profile a push is that plugin's to
+  act on, and never reaches the model as a message.
+
+Either answers with what it wants next (`PluginNext`), or nothing:
+
+| Field | What the runtime does |
+|---|---|
+| `turn` | posts the text as a new turn's input on the main conversation |
+| `wakeAt` | calls this mount's `wake` at or after that time (epoch ms); one wake is kept per mount, and an earlier ask wins, so a plugin says the time it needs in every answer |
+| `cancelTurn` | ends the running turn with the runtime's own cancel; its end is told to `afterTurn` as `cancelled` |
+
+What the runtime promises, and what it leaves to the plugin (`src/runtime/plugin-wakes.ts`, `#runPluginHooks` in
+`cf/src/runtime.ts`):
+
+- **Written down first.** A turn's end and a wake are kept in the agent's own storage before the hook is called, and
+  marked done in the same transaction that keeps the hook's answer. An eviction while the hook runs calls it again;
+  one after it has answered never does. So a hook must be safe to run twice: keep progress in `ctx.db`, and read it
+  first.
+- **A turn asked for is posted once.** Its answer is marked just before the post's write, and a pass that finds it
+  marked drops it rather than posting it a second time.
+- **Once per turn.** A turn's end is keyed by its run, so one recorded twice — a cancel and a step can both see the
+  same run end — is told once.
+- **A throw is logged** (`plugin.hook`, with `failed`) and the call dropped, so a broken hook cannot wake the agent
+  for ever. A mount whose plugin is switched off, or pinned to another version, is skipped, and the skip is logged.
+- **How many turns is the plugin's decision.** The runtime starts each turn it is given; a plugin that asks for a
+  fix-up turn keeps its own count, in `ctx.db`, of how many it has asked for.
+- **pi085 only, for now.** pd's step reports the runs of every conversation without saying whose, so its turn ends
+  are not told yet.
+
+`src/plugins/raftbench.ts` is the plugin that uses all three; `test/after-turn.ts` holds the runtime's side with
+plugins of its own.
+
 ## Tests
 
 Every `test/*.ts` runs in the deploy gate (`cf/scripts/verify-and-deploy.sh`).
@@ -1509,3 +1551,5 @@ it distinguishes comes from a single plugin (`test/mount-config.ts`). Run
 | Pushed events: limits and statuses | `src/runtime/inbound.ts` |
 | Pushed events: route and admin calls | `cf/src/index.ts` |
 | Pushed events: mount check, delivery, record | `cf/src/runtime.ts` (`receiveHook`), `src/runtime/gateway.ts` |
+| Code after a turn, and wakes | `src/runtime/plugin-wakes.ts`, `cf/src/runtime.ts` (`#runPluginHooks`), `test/after-turn.ts` |
+| An agent made for one job (profile) | `src/runtime/agent-profile.ts`, `src/plugins/raftbench.ts`, `test/raftbench-service.ts` |

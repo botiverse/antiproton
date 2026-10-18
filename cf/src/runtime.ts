@@ -53,7 +53,13 @@ import {
 } from "../../src/runtime/overflow-backstop.ts";
 import { credentialRedactor, agentSecretValues } from "./eval-read.ts";
 import { logicalMain, physicalSession } from "./fresh-context.ts";
-import { systemPrompt } from "../../src/runtime/pi-prompt.ts";
+import { profilePrompt, systemPrompt } from "../../src/runtime/pi-prompt.ts";
+import { profileOf, profileSpec } from "../../src/runtime/agent-profile.ts";
+import {
+  askWake, dropAnswer, dropWake, dueWakes, keepAnswer, keepsPluginCalls, markAnswerPosting, nextWakeAt, pendingAnswers, pendingTurnEnds, recordTurnEnd,
+  turnEndHandled, turnEndOf,
+} from "../../src/runtime/plugin-wakes.ts";
+import type { PluginHookAnswer } from "../../src/runtime/gateway.ts";
 import { ASSUMED_CONTEXT_WINDOW } from "../../src/model/context-windows.ts";
 import { BACKGROUND_CONTEXT } from "@earendil-works/pi-agent-core/harness/context";
 import { callTurns, CANCELLED_NOTE, TURN_CANCELLED } from "./agents-api/transcript.ts";
@@ -367,6 +373,7 @@ import { artifactsPlugin, PARK_BYTES, READ_WHOLE_MAX } from "../../src/plugins/a
 import { createRaftPlugin } from "../../src/plugins/raft.ts";
 import { mcpPlugin } from "../../src/plugins/mcp.ts";
 import { createReminderPlugin } from "../../src/plugins/reminder.ts";
+import { raftbenchPlugin } from "../../src/plugins/raftbench.ts";
 import { PROVISION_MOUNT_ALIAS, PROVISIONED_BY, provisionPushStatus } from "./provision/steps.ts";
 import { markReady } from "../../src/runtime/ready.ts";
 import { toAgentRef } from "../../src/store/refs.ts";
@@ -1229,6 +1236,7 @@ export class AgentRuntime {
       createRaftPlugin({ artifacts: this.#artifacts }),
       mcpPlugin,
       createReminderPlugin({ serviceUrl: deps.reminderApp?.origin, clientCredential: deps.reminderApp?.credential }),
+      raftbenchPlugin,
       ...(deps.extraPlugins ?? []),
       // Discovery agrees with dispatch: a withheld tool is not found by searching for it either.
       builtinToolsPlugin(this.store, () => plugins, deps.withholdTools ?? []),
@@ -1558,6 +1566,9 @@ export class AgentRuntime {
         (row.lastError ? `: ${row.lastError}` : ""));
       out.failed++;
     }
+    // Under a profile a push is its plugin's to act on, never a message to the model (src/runtime/agent-profile.ts).
+    const profile = profileOf((await this.store.loadAgent(tenantId, agentId))?.config);
+    const driver = profile ? profileSpec(profile).alias : null;
     let prepared = false;
     for (;;) {
       const head = nextPendingInbound(sql);
@@ -1588,6 +1599,15 @@ export class AgentRuntime {
           out.ignored++;
           continue;
         }
+      }
+      // Handed over as a wake (`Plugin.wake`), which the step after this pass runs: nothing is posted, so it is
+      // delivered as soon as it is kept.
+      if (driver !== null) {
+        // The wake first: a pass cut off between the two leaves the push queued, and its next pass asks again.
+        askWake(sql, driver, Date.now());
+        settle(head, "delivered");
+        out.posted++;
+        continue;
       }
       // A main conversation the overflow backstop gave up on is not posted to: the push would cost a model call that
       // fails the same way (src/runtime/overflow-backstop.ts). Settled at once with the reason, for an operator to read.
@@ -3260,8 +3280,12 @@ export class AgentRuntime {
   ) {
     const catalogue = await this.#catalogueFor(tenantId, agentId);
     const { records, unoffered } = catalogue;
+    const agentConfig = (await this.store.loadAgent(tenantId, agentId))?.config;
     // A subagent is read-only: it is offered only what it may call (`childWithheld`); its dispatch refuses the rest as well (`#host`).
-    const tools = isSubagentSession(session)
+    // An agent made with a profile is offered nothing: its mounts are its plugin's code's and provisioning's
+    // (src/runtime/agent-profile.ts), and their calls still go through the gateway, which this list does not change.
+    const tools = profileOf(agentConfig) ? []
+      : isSubagentSession(session)
       ? (() => { const withheld = this.#childWithheldIn(catalogue); return catalogue.tools.filter((t) => !withheld.has(t.address)); })()
       : catalogue.tools;
     const sandbox = this.#deps.sandbox ?? true;
@@ -3306,7 +3330,6 @@ export class AgentRuntime {
     // Function tools an API caller runs itself (Agents API, task #17): offered to
     // the model like any tool; calling one pauses the turn for the caller's
     // result (client-calls.ts). A name the model is already offered is skipped.
-    const agentConfig = (await store.loadAgent(tenantId, agentId))?.config;
     const apiConfig = (agentConfig as any)?.openai;
     const apiTools = apiConfig?.tools;
     // An agent made through the Agents API is offered only what its caller declared, plus a container when a
@@ -3443,10 +3466,12 @@ export class AgentRuntime {
     }
     // Read here rather than inside the harness, so the harness keeps holding
     // no I/O of its own.
-    const prompt = systemPrompt({
+    const record = (await this.store.loadAgent(tenantId, agentId))?.config;
+    const profile = profileOf(record);
+    const prompt = profile ? profilePrompt(profile) : systemPrompt({
       // The agent's own record: a person named and described it at creation,
       // and that is the first thing the prompt says after the core.
-      persona: personaOf((await this.store.loadAgent(tenantId, agentId))?.config),
+      persona: personaOf(record),
       // Whatever the mounted plugins have to say, in registry order. The
       // framework no longer reaches into any one plugin for this (Piper,
       // tygg, 2026-09-12).
@@ -3471,9 +3496,10 @@ export class AgentRuntime {
     const dispatch = this.#dispatchFor(tenantId, agentId);
     // A call to a tool the model was not offered is answered by pi with its own line; each engine sends this
     // instead (src/runtime/unavailable-tool.ts), read from the same mounts the catalogue was built from.
+    // Under a profile no mount is the model's, so a call it invents is answered without naming any of them.
     const explainUnavailable = (name: string) => explainUnavailableTool(name, {
-      mounts: records.map((m) => ({ alias: m.alias, plugin: this.#plugins.find((pl) => pl.id === m.plugin), toolSnapshot: m.toolSnapshot })),
-      offered: offered as MountedTool[], unoffered,
+      mounts: profile ? [] : records.map((m) => ({ alias: m.alias, plugin: this.#plugins.find((pl) => pl.id === m.plugin), toolSnapshot: m.toolSnapshot })),
+      offered: offered as MountedTool[], unoffered: profile ? [] : unoffered,
     });
 
     if (engine === "pd") {
@@ -4181,11 +4207,14 @@ export class AgentRuntime {
     // Not a follow-up: on an idle pi085 lane one is queued and starts no run (`PiAgent.say`; measured 2026-10-08, the
     // text was in no transcript after the post and after an alarm), so a notice it carried could wait unread behind
     // a run that never comes, while the next prompt or steer, which does reach the model, would no longer carry it.
-    const told = mode === "followUp" ? null : await this.#takeNotices(tenantId, agentId, agent);
+    // Under a profile the model has no tools and its prompt is the profile's alone (src/runtime/agent-profile.ts): a line
+    // about a capability added, or about what moved in a plugin's paragraph, describes nothing it was given.
+    const profiled = profileOf((await this.store.loadAgent(tenantId, agentId))?.config) !== null;
+    const told = mode === "followUp" || profiled ? null : await this.#takeNotices(tenantId, agentId, agent);
     // What moved in the system prompt's moving parts since the model last saw them (src/runtime/prompt-context.ts),
     // after the capability lines, for the same reason they skip a follow-up. pi085 only: pd patches its prompt in place.
     // A failure to read it is logged and never fails the message; what moved is still unseen, so the next one says it.
-    const moved = mode === "followUp" || this.#isPd() ? null
+    const moved = mode === "followUp" || this.#isPd() || profiled ? null
       : await this.#takeContextChange(tenantId, agentId, session)
         .catch((e) => { console.error(`reading what moved in ${tenantId}/${agentId}'s prompt failed:`, e); return null; });
     const lines = [...(told?.lines ?? []), ...(moved ? [moved.change.notice] : [])];
@@ -4369,6 +4398,10 @@ export class AgentRuntime {
     const dropped = await agent.dropClientCalls();
     if (dropped > 0 && !cancelledTurn) {
       await agent.markCancelled(TURN_CANCELLED);
+    }
+    // A cancelled turn ends here, and no step will settle it as a turn the plugins can be told of (`Plugin.afterTurn`).
+    if (cancelledTurn && session === MAIN_SESSION && !this.#isPd() && await this.#takesTurnEnds(tenantId, agentId)) {
+      recordTurnEnd(sql, cancelledTurn, { finalText: null, outcome: "cancelled" }, Date.now());
     }
     // A first turn cancelled mid tool loop leaves no turn-ending answer; without this mark the next turn would still
     // read as the first (`#reasoningFor`).
@@ -5284,6 +5317,8 @@ export class AgentRuntime {
         if (rebuilt) out = { ...rebuilt, settled: [...out.settled, ...rebuilt.settled] };
       }
       if (!pd) this.#turnTiming(tenantId, agentId, "ending", () => this.#turnStepEnd(tenantId, agentId, session, out));
+      // A main-conversation turn that ended here is owed to the plugins that act on its answer (`Plugin.afterTurn`).
+      if (!pd && session === MAIN_SESSION && out.settled.length) await this.#recordTurnEnds(tenantId, agentId, agent, out.settled);
       open += out.open;
       settled.push(...out.settled);
       if (out.wakeInMs !== null) wakeInMs = wakeInMs === null ? out.wakeInMs : Math.min(wakeInMs, out.wakeInMs);
@@ -5294,6 +5329,12 @@ export class AgentRuntime {
         for (const s of sessionsWithWork(sql)) if (!stepped.has(s) && isSubagentSession(s)) sessions.push(s);
       }
     }
+    // The plugin code owed a call: the turn ends just recorded and those before, and the wakes now due. A turn a plugin
+    // asks for is posted here and driven by the next pass, at once.
+    const hooks = await this.#runPluginHooks(tenantId, agentId);
+    if (hooks.posted) open += 1;
+    if (hooks.posted || hooks.cancelled) wakeInMs = 0;
+    else if (hooks.wakeInMs !== null) wakeInMs = wakeInMs === null ? hooks.wakeInMs : Math.min(wakeInMs, hooks.wakeInMs);
     // A subagent whose turn ended is reported to the session that started it (src/runtime/subagents.ts). Read from
     // the engines' records, not from this pass's `settled`, so an end that a pass before an eviction saw is still
     // reported. A report starts a turn of the parent, which the next pass, at once, drives.
@@ -5333,6 +5374,77 @@ export class AgentRuntime {
       }
     }
     return { open, wakeInMs, settled, releaseFailed };
+  }
+
+  /** Whether any of the agent's mounts has a plugin that acts on a turn's end: without one, nothing is written down. */
+  async #takesTurnEnds(tenantId: string, agentId: string): Promise<boolean> {
+    return (await this.store.listMounts(tenantId, agentId)).some((m) => !!this.#plugins.find((p) => p.id === m.plugin)?.afterTurn);
+  }
+
+  /**
+   * The ends of the main conversation's runs this step settled, written down for `#runPluginHooks`, with the text each
+   * ended on: the branch's last message when it is the model's. pi085 only: pd's step settles every conversation's
+   * runs without saying whose (src/runtime/durable-agent.ts `takeSettled`), and a subagent's turn is not the agent's.
+   */
+  async #recordTurnEnds(tenantId: string, agentId: string, agent: AgentEngine, settled: Array<{ operationId: string; status: string }>) {
+    if (!(await this.#takesTurnEnds(tenantId, agentId))) return;
+    const branch = await agent.branch();
+    const last = ([...branch].reverse().find((e) => e.type === "message") as { message?: unknown } | undefined)?.message;
+    const now = Date.now();
+    for (const s of settled) recordTurnEnd(this.#deps.ctx.storage.sql, s.operationId, turnEndOf(s.status, last), now);
+  }
+
+  /**
+   * Run the plugin code the agent owes a call (src/runtime/plugin-wakes.ts): every turn end not yet handled, every wake
+   * now due, then what their answers asked for. A hook's answer is kept in the same transaction that marks what it
+   * answered, so an eviction after it never asks the plugin again; a turn it asked for is posted as a prompt on the
+   * main conversation, once (`markAnswerPosting` just before the write). A hook that threw, or a mount that is switched
+   * off, is logged and its call dropped. Says whether a turn was posted, whether one was cancelled (its end is told on
+   * the next pass, which comes at once), and when the next wake is due.
+   */
+  async #runPluginHooks(tenantId: string, agentId: string): Promise<{ posted: boolean; cancelled: boolean; wakeInMs: number | null }> {
+    const sql = this.#deps.ctx.storage.sql;
+    if (!keepsPluginCalls(sql)) return { posted: false, cancelled: false, wakeInMs: null };
+    const transact = this.#transact();
+    const keep = (hook: string, answers: PluginHookAnswer[]) => {
+      for (const a of answers) {
+        if ("next" in a) {
+          if (a.next && (a.next.turn !== undefined || a.next.wakeAt !== undefined || a.next.cancelTurn)) keepAnswer(sql, a.alias, a.next);
+        } else logEvent("plugin.hook", { tenantId, agentId, mount: a.alias, hook, ...("failed" in a ? { failed: a.failed } : { skipped: a.skipped }) });
+      }
+    };
+    for (const row of pendingTurnEnds(sql)) {
+      const answers = await this.#gateway.afterTurn(tenantId, agentId, row.end);
+      transact(() => { keep("afterTurn", answers); turnEndHandled(sql, row.seq, Date.now()); });
+    }
+    for (const w of dueWakes(sql, Date.now())) {
+      const answers = await this.#gateway.wake(tenantId, agentId, w.alias);
+      transact(() => { keep("wake", answers); dropWake(sql, w.alias, w.gen); });
+    }
+    let posted = false, cancelled = false;
+    for (const a of pendingAnswers(sql)) {
+      if (a.posting) {
+        logEvent("plugin.hook", { tenantId, agentId, mount: a.alias, hook: "turn", dropped: "the pass posting it ended mid-way; not posted again, so it cannot start twice" });
+        dropAnswer(sql, a.seq);
+        continue;
+      }
+      if (a.next.wakeAt !== undefined) askWake(sql, a.alias, a.next.wakeAt);
+      if (a.next.cancelTurn) {
+        try { cancelled = (await this.cancelSession(tenantId, agentId, MAIN_SESSION)).cancelledTurn !== null || cancelled; }
+        catch (e) { logEvent("plugin.hook", { tenantId, agentId, mount: a.alias, hook: "cancel", error: String((e as Error)?.message ?? e).slice(0, 200) }); }
+      }
+      if (typeof a.next.turn === "string") {
+        try {
+          await this.postMessage(tenantId, agentId, a.next.turn, "prompt", MAIN_SESSION, { beforeSay: () => markAnswerPosting(sql, a.seq) });
+          posted = true;
+        } catch (e) {
+          logEvent("plugin.hook", { tenantId, agentId, mount: a.alias, hook: "turn", error: String((e as Error)?.message ?? e).slice(0, 200) });
+        }
+      }
+      dropAnswer(sql, a.seq);
+    }
+    const next = nextWakeAt(sql);
+    return { posted, cancelled, wakeInMs: next === null ? null : Math.max(0, next - Date.now()) };
   }
 
   /**
@@ -5795,8 +5907,10 @@ export class AgentRuntime {
         } catch (e) { console.error(`the subagent.model_changed row of ${tenantId}/${agentId} could not be written:`, e); }
       }
     }
+    // A profile caps every call's output (src/runtime/agent-profile.ts); the consumer sends it as the call's limit.
+    const profile = profileOf((await this.store.loadAgent(tenantId, agentId))?.config);
     return { ...job, operatorModel: chosen?.model ?? (provider ? b!.model : null), operatorProvider: chosen?.provider ?? provider,
-      ...(mark ? { imageEvidence: true } : {}), ...(reasoning ? { reasoning } : {}) };
+      ...(mark ? { imageEvidence: true } : {}), ...(reasoning ? { reasoning } : {}), ...(profile ? { maxTokens: profileSpec(profile).maxTokens } : {}) };
   }
 
   /**

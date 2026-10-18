@@ -2301,4 +2301,54 @@ export interface Plugin {
    */
   unmount?(ctx: PluginContext): Promise<void>;
 
+  /**
+   * A model turn of the agent's main conversation has ended: how it ended, and the text it ended with. For a plugin
+   * whose code acts on the model's answer — checks it, sends it somewhere, or asks once more — without offering the
+   * model a tool to do that with.
+   *
+   * What the runtime promises (`AgentRuntime.step`, cf/src/runtime.ts; src/runtime/plugin-wakes.ts):
+   * - **Once per turn, at least once.** The end is written down in the agent's own storage when the turn is seen to
+   *   end — a step that settles its run (`completed` or `failed`), or a cancel (`cancelled`) — and is removed only
+   *   after this returns, on the alarm pass after it. An eviction in between asks again, so what this does must be
+   *   safe to do twice: a plugin keeps its own progress in `ctx.db` and reads it first.
+   * - **Only the main conversation**, never a subagent's, and only for a mount whose plugin declares this, is switched
+   *   on and is the version the mount pins.
+   * - **A throw is logged and the end is dropped**, so a failing hook cannot wake the agent for ever.
+   *
+   * The answer ({@link PluginNext}) is what the plugin asks for next: a new turn with the text it gives, or a later
+   * `wake`. The plugin decides how many turns it asks for; the runtime starts each one it is given.
+   */
+  afterTurn?(ctx: PluginContext, end: TurnEnd): Promise<PluginNext | void>;
+
+  /**
+   * The plugin's own code, run on the agent's alarm pass when it is due: when an earlier hook asked for it
+   * (`PluginNext.wakeAt`), or, for the plugin an agent profile names, when a service pushed an event at the agent
+   * (src/runtime/agent-profile.ts: under a profile a push is the plugin's to act on, never the model's message).
+   * Kept in the agent's storage until this returns, so a wake survives an eviction, and an eviction mid-way runs
+   * it again. One wake is kept per mount: asking again for an earlier time brings it forward, never back.
+   */
+  wake?(ctx: PluginContext): Promise<PluginNext | void>;
+}
+
+/** How a model turn ended, as {@link Plugin.afterTurn} is told it. */
+export interface TurnEnd {
+  /** The turn's last assistant text, or null when it ended with none (a tool call cut short, an error, a cancel). */
+  finalText: string | null;
+  outcome: "completed" | "failed" | "cancelled";
+  /** For `failed`: what the model or the run reported. */
+  error?: string;
+}
+
+/** What a plugin's code asks the runtime to do next, answering {@link Plugin.afterTurn} or {@link Plugin.wake}. */
+export interface PluginNext {
+  /** Post this text as a new turn's input on the agent's main conversation. */
+  turn?: string;
+  /** Call this mount's `wake` at or after this time (epoch ms). */
+  wakeAt?: number;
+  /**
+   * End the main conversation's running turn, as the runtime's own cancel does (`AgentRuntime.cancelSession`): the run
+   * is aborted and its model call dropped, and its end is told to `afterTurn` as `cancelled`. For a plugin that keeps a
+   * deadline on a turn it asked for. Nothing running is not an error.
+   */
+  cancelTurn?: true;
 }
