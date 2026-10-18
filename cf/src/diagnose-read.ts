@@ -215,6 +215,16 @@ export async function readDiagnosis(
     // be seen, beside what else this object has had go wrong.
     traceDrops: rows(sql, "trace_drops", "SELECT at, dropped FROM trace_drops ORDER BY at DESC LIMIT 3")
       .map((r) => ({ at: Number(r.at), dropped: Number(r.dropped) })),
+    // The `github.refresh` forward (cf/src/github-refresh-forward.ts): null while it has never run here (it is off until
+    // configured, and makes no table until then); otherwise what waits, the backoff, and its last counted outcomes.
+    githubRefreshForward: hasTable(sql, "ghr_forward_staged") ? {
+      stagedThrough: Number(rows(sql, "ghr_forward_staged", "SELECT through_seq FROM ghr_forward_staged WHERE id = 1")[0]?.through_seq ?? 0),
+      queued: Number(rows(sql, "ghr_forward_queue", "SELECT COUNT(*) AS n FROM ghr_forward_queue")[0]?.n ?? 0),
+      backoff: rows(sql, "ghr_forward_state", "SELECT failures, next_at FROM ghr_forward_state WHERE id = 1")
+        .map((r) => ({ failures: Number(r.failures), nextAt: Number(r.next_at) }))[0] ?? null,
+      recent: rows(sql, "ghr_forward_log", "SELECT at, reason, status, rows FROM ghr_forward_log ORDER BY at DESC LIMIT 5")
+        .map((r) => ({ at: Number(r.at), reason: String(r.reason), status: r.status === null ? null : Number(r.status), rows: Number(r.rows) })),
+    } : null,
     // Trace rows a pd commit failed to write (src/runtime/pd-outbox.ts): the commit lands without them.
     traceErrors: rows(sql, "trace_errors", "SELECT at, message FROM trace_errors ORDER BY at DESC LIMIT 3")
       .map((r) => ({ at: Number(r.at), message: String(r.message) })),

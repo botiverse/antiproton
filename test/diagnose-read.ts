@@ -9,6 +9,8 @@
  */
 import { BACKGROUND_CONTEXT as CTX } from "@earendil-works/pi-agent-core/harness/context";
 import { readDiagnosis } from "../cf/src/diagnose-read.ts";
+import { forwardConfigOf, sendForward, stageForward } from "../cf/src/github-refresh-forward.ts";
+import { appendTrace } from "../src/trace/outbox.ts";
 import { DurableObjectStore } from "../src/store/durable-object.ts";
 import { PiSqliteStorage } from "../src/store/pi-storage.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
@@ -199,6 +201,21 @@ await check("model jobs are listed answered or not: a pending one by its wait, a
   assert(byId.mj_open?.ageMs === 30_000 && byId.mj_open.answeredAt === null && byId.mj_open.answerMs === undefined,
     `the pending job: ${JSON.stringify(byId.mj_open)}`);
   assert(r.modelJobs[0].id === "mj_open", "newest first");
+  host.dispose();
+});
+
+await check("the github.refresh forward: null while it never ran, then its cursor, queue, backoff and counted outcomes", async () => {
+  const { host, store } = await agentObject();
+  const none = await readDiagnosis(host.sql, "demo", "u-a", "t_u-a", deps(store)) as any;
+  assert(none.githubRefreshForward === null, `without the tables: ${JSON.stringify(none.githubRefreshForward)}`);
+  const cfg = forwardConfigOf({ GITHUB_REFRESH_INGEST_URL: "https://ingest.example", GITHUB_REFRESH_INGEST_TOKEN: "t", DEPLOYMENT_ENV: "preview" })!;
+  appendTrace(host.sql as any, [{ at: 1_000, tenantId: "demo", agentId: "u-a", kind: "github.refresh", spanId: "refresh_1", status: "broken", verdict: "failed", attrs: { scope: "mount" } }]);
+  stageForward(host.sql as any, cfg, "demo", "u-a");
+  await sendForward(host.sql as any, cfg, "demo", "u-a", async () => new Response(null, { status: 401 }), () => 2_000);
+  const r = await readDiagnosis(host.sql, "demo", "u-a", "t_u-a", deps(store)) as any;
+  const f = r.githubRefreshForward;
+  assert(f && f.stagedThrough >= 1 && f.queued === 1 && f.backoff?.failures === 1 && f.backoff.nextAt > 2_000, `forward: ${JSON.stringify(f)}`);
+  assert(JSON.stringify(f.recent) === JSON.stringify([{ at: 2_000, reason: "auth_or_off", status: 401, rows: 1 }]), `recent: ${JSON.stringify(f.recent)}`);
   host.dispose();
 });
 

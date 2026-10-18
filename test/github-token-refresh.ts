@@ -20,6 +20,7 @@ import { githubExchangeCode, GITHUB_TOKEN } from "../cf/src/auth.ts";
 import { OAUTH_PREFIX, RECONNECT_REASON, reasonCode } from "../cf/src/github-refresh.ts";
 import { setLogSink } from "../src/core/log.ts";
 import { pendingTrace } from "../src/trace/outbox.ts";
+import { forwardRow } from "../cf/src/github-refresh-forward.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void>) {
@@ -293,6 +294,15 @@ await check("a token within five minutes of its expiry is renewed before the cal
   must(rows.every((r) => r.attrs.connectorId === id && r.attrs.why === "expiring" && r.attrs.mount === "gh" && r.tenantId === TENANT && r.agentId === a.agentId), JSON.stringify(rows));
   must(rows.find((r) => r.attrs.scope === "connector")!.attrs.stored === true, "the rotation's row does not say the pair was stored");
   clean(rows);
+  // The writer's attrs as the forwarder reads them (cf/src/github-refresh-forward.ts): a renamed attr would arrive as null.
+  const fwd = rows.map((r) => forwardRow(r, "preview"));
+  must(fwd.every((f) => f.outcome === "rotated" && f.connector_id === id && f.why === "expiring" && f.mount === "gh" && (f.scope === "connector" || f.scope === "mount")),
+    `forwarded: ${JSON.stringify(fwd)}`);
+  must(fwd.find((f) => f.scope === "connector")!.stored === true, `forwarded: ${JSON.stringify(fwd)}`);
+  // Every attr the writer may set has a column, so nothing it records is silently left behind.
+  const sample: Record<string, unknown> = { scope: "mount", connectorId: "c", mount: "m", why: "w", attempt: 2, stored: false, reasonCode: "no-answer" };
+  const filled = (attrs: Record<string, unknown>) => Object.values(forwardRow({ ...rows[0]!, attrs }, "preview")).filter((v) => v !== null).length;
+  for (const k of TRACE_ATTRS) must(k in sample && filled({ [k]: sample[k] }) === filled({}) + 1, `the trace attr ${k} has no column in a forwarded row`);
   w.dispose();
 });
 

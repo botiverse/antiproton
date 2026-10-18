@@ -97,6 +97,7 @@ import type { SurfaceDeps } from "./agent-surface/surface.ts";
 import type { HeldListing, HeldRead } from "../../src/plugins/types.ts";
 import { heldFiles as surfaceHeldFiles, stateGet as surfaceStateGet, stateList as surfaceStateList } from "./agent-surface/in-agent.ts";
 import { flushActivityThenTrace, subagentActivityFor } from "./activity-raft.ts";
+import { forwardPass } from "./github-refresh-forward.ts";
 import { usagePanel } from "./usage.ts";
 import { d1ApiKeys, admit, d1Identities, d1InboundHooks, type IdentityDirectory } from "./control-plane.ts";
 import { d1ServiceTokens } from "./control-plane.ts";
@@ -229,6 +230,15 @@ export interface Env {
    * stripped there, and a child's step without its marker would read as the agent's own.
    */
   SUBAGENT_ACTIVITY?: string;
+  /**
+   * Where `github.refresh` trace rows are forwarded (cf/src/github-refresh-forward.ts): Raft's trace-upload worker's
+   * base URL (a var), and its write-only bearer token (a secret). Forwarding is off unless both are set; DEPLOYMENT_ENV is what each
+   * row says it came from. docs/runbook.md, "Forwarding github.refresh rows".
+   */
+  GITHUB_REFRESH_INGEST_URL?: string;
+  GITHUB_REFRESH_INGEST_TOKEN?: string;
+  /** Which deployment this is, `production` or `preview` (cf/wrangler.jsonc, cf/wrangler.preview.jsonc). */
+  DEPLOYMENT_ENV?: string;
   /** "1" stops the daily friction scan and its on-demand route (cf/src/friction-scan.ts; docs/runbook.md, "Where agents get stuck"). */
   FRICTION_SCAN_DISABLED?: string;
   /**
@@ -2741,8 +2751,14 @@ export class AgentDO extends DurableObject<Env> {
         // This pass's activity to the service that runs this agent, then this pass's trace rows
         // to R2, with the export holding whatever activity did not consume (cf/src/activity-raft.ts).
         // Same terms as usage: a failure keeps the rows and asks for another pass.
+        // The `github.refresh` rows' copy for Raft's trace-upload worker (cf/src/github-refresh-forward.ts) is staged
+        // first, so the export holds what it has not copied; its send comes after and is its own: off until
+        // configured, and never a reason for this pass to fail or come back.
+        const forward = forwardPass(this.env as unknown as Record<string, unknown>, this.sql as any, who.tenantId, who.agentId);
         const flushed = await flushActivityThenTrace(rt.gateway(), this.env.ARTIFACTS, this.sql as any, who.tenantId, who.agentId,
-          subagentActivityFor(this.sql as any, this.env as unknown as Record<string, unknown>));
+          subagentActivityFor(this.sql as any, this.env as unknown as Record<string, unknown>), forward.before());
+        const forwarded = await forward.after();
+        if (forwarded?.error) console.warn(`github.refresh forward for ${who.agentId}: ${forwarded.error} (${forwarded.kept} kept)`);
         if (flushed.activityError) { usagePending = true; console.warn(`activity flush failed for ${who.agentId}: ${flushed.activityError}`); }
         if (flushed.traceError) { usagePending = true; console.warn(`trace flush failed for ${who.agentId}: ${flushed.traceError}`); }
         // The pass says when to come back — a retry has a time, a model call has a poll interval,

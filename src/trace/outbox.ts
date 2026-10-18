@@ -81,6 +81,7 @@ const TABLE = "CREATE TABLE IF NOT EXISTS trace_outbox(" +
 // `kept-unstored`, `interrupted-before`, `propagate-failed`), `attrs` only ids and fixed codes (`scope`, `connectorId`,
 // `mount`, `why`, `attempt`, `stored`, `reasonCode`), never a token or GitHub's own words. It is here because an object's
 // log lines can be dropped from Workers Logs (docs/runbook.md) and this export is what is left. Activity and status skip it.
+// It is the one kind forwarded outside the account, as fixed columns, once configured (cf/src/github-refresh-forward.ts).
 // The rest are the kinds a plugin may write itself, through `PluginContext.trace` (`PLUGIN_TRACE_KINDS`). Activity and
 // status skip them. `raft.state_save_failed` is no longer written (it is `raft.state_failed` now) and stays here only so
 // a row of that kind still in an outbox is drained and read as a row, not dropped as damage.
