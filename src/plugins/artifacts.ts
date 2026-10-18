@@ -2,6 +2,7 @@ import { Buffer } from "node:buffer";
 import type { Plugin } from "./types.ts";
 import { keyForRef, toAgentRef, type RefOwner } from "../store/refs.ts";
 import { imageProblem, sha256Hex, sniffImage } from "../model/images.ts";
+import { magicType, textOf } from "./binary.ts";
 
 /**
  * Reading back what the gateway parked. Without this the offload in §5.4 is a
@@ -45,55 +46,6 @@ export const BASE64_PAGE = 12 * 1024;
 export interface ArtifactReader {
   get(key: string): Promise<Uint8Array>;
   getObject?(key: string): Promise<{ bytes: Uint8Array; contentType?: string }>;
-}
-
-/**
- * File types known by their first bytes that are not text, beyond the four images (`sniffImage`). Only signatures
- * that no ordinary text starts with: a text file beginning "BM" or "BZh" is still text.
- */
-const MAGIC: Array<{ at: number; sig: string; mimeType: string }> = [
-  { at: 0, sig: "%PDF-", mimeType: "application/pdf" },
-  { at: 0, sig: "PK\x03\x04", mimeType: "application/zip" },
-  { at: 0, sig: "\x1f\x8b", mimeType: "application/gzip" },
-  { at: 0, sig: "7z\xbc\xaf\x27\x1c", mimeType: "application/x-7z-compressed" },
-  { at: 0, sig: "\xfd7zXZ\x00", mimeType: "application/x-xz" },
-  { at: 0, sig: "\x28\xb5\x2f\xfd", mimeType: "application/zstd" },
-  { at: 0, sig: "\x7fELF", mimeType: "application/x-elf" },
-  { at: 0, sig: "\x00asm", mimeType: "application/wasm" },
-  { at: 257, sig: "ustar", mimeType: "application/x-tar" },
-  { at: 4, sig: "ftyp", mimeType: "video/mp4" }, // the brand after it may say otherwise (`magicType`)
-];
-
-/** How far a NUL byte is looked for: text has none, and nearly every binary format has one early. */
-const NUL_WINDOW = 8 * 1024;
-
-/** The type a file's own first bytes declare, when they are a known non-text signature. */
-function magicType(b: Uint8Array): string | null {
-  const image = sniffImage(b);
-  if (image) return image.mimeType;
-  const hit = MAGIC.find(({ at, sig }) => at + sig.length <= b.length && [...sig].every((c, k) => b[at + k] === c.charCodeAt(0)));
-  if (hit?.sig === "ftyp") {
-    // An ISO media file names what it is in the four bytes after `ftyp`: AVIF and HEIC are stills, not video.
-    const brand = String.fromCharCode(...b.subarray(8, 12));
-    if (/^avi[fs]$/.test(brand)) return "image/avif";
-    if (/^(?:hei[cx]|hev[cx]|mif1|msf1)$/.test(brand)) return "image/heic";
-  }
-  return hit?.mimeType ?? null;
-}
-
-/**
- * The stored bytes as text, or null when they are not text: a known binary signature, a NUL in the first 8 KiB, or
- * bytes that are not valid UTF-8. Decoding leniently turned a JPEG into a "text" result of U+FFFD characters, which
- * is neither the image nor anything the model can use.
- */
-function textOf(b: Uint8Array): string | null {
-  if (magicType(b) !== null) return null;
-  if (b.subarray(0, NUL_WINDOW).includes(0)) return null;
-  try {
-    return new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(b);
-  } catch {
-    return null;
-  }
 }
 
 /**
