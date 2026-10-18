@@ -217,6 +217,62 @@ check("a set-aside box keeps being counted as held, under the account it was mad
   eq(pendingUsage(host.sql, 0).filter((r) => r.unit === "seconds").reduce((a, r) => a + r.quantity, 0), 120, "every second, once");
 });
 
+// ---- one box id, several sessions: the idle lease switches a box off and a command wakes it ------------------
+
+check("a woken box is one id with several sessions, and the report keeps each one", () => {
+  const report = {
+    // Running again since H0+20m; switched off once before, at H0+10m.
+    activity: { live: { id: "b1", startedAt: H0 + 20 * 60_000 } },
+    usage: [{ id: "b1", startedAt: H0, endedAt: H0 + 10 * 60_000, uses: 2 }],
+  };
+  eq(boxesOf(report).map((b) => [b.startedAt, b.endedAt]), [[H0 + 20 * 60_000, null], [H0, H0 + 10 * 60_000]],
+    "the running session and the finished one, not one box");
+  // Switched off: the record still names the box under the start of the session that just ended.
+  const parked = { activity: { live: { id: "b1", startedAt: H0 + 20 * 60_000 } }, usage: [{ id: "b1", startedAt: H0 + 20 * 60_000, endedAt: H0 + 30 * 60_000 }, ...report.usage] };
+  eq(boxesOf(parked).map((b) => [b.startedAt, b.endedAt]), [[H0 + 20 * 60_000, H0 + 30 * 60_000], [H0, H0 + 10 * 60_000]],
+    "a switched-off box is its finished sessions, and is not running");
+});
+
+check("sessions are counted in time order whatever order the mount lists them in", () => {
+  const s1 = { id: "b1", startedAt: H0, endedAt: H0 + 60_000, uses: 2 };
+  const s2 = { id: "b1", startedAt: H0 + 120_000, endedAt: H0 + 180_000, uses: 3 };
+  for (const order of [[s1, s2], [s2, s1]]) {
+    const got = heldRows(base, "sandbox", order, new Map(), H0 + 600_000);
+    eq(secs(got.rows), [[0, 60], [0, 60]], "both sessions, and not the gap");
+    eq(got.rows.filter((r) => r.unit === "execs").map((r) => r.quantity), [2, 3], "each session's uses");
+    eq(got.marks, [{ id: "b1", mark: { through: H0 + 180_000, uses: 3 } }], "one watermark, at the newest session");
+    const again = heldRows(base, "sandbox", order, marks({ b1: got.marks[0]!.mark }), H0 + 900_000);
+    eq(again.rows, [], "and a second pass adds nothing");
+  }
+});
+
+check("a watermark the box-at-a-time meter left behind is read without counting anything twice", () => {
+  // That meter kept only a box's oldest session, so its watermark sits at that session's end with its uses.
+  const s1 = { id: "b1", startedAt: H0, endedAt: H0 + 60_000, uses: 2 };
+  const s2 = { id: "b1", startedAt: H0 + 120_000, endedAt: H0 + 180_000, uses: 3 };
+  const live = { id: "b1", startedAt: H0 + 240_000, endedAt: null };
+  const got = heldRows(base, "sandbox", [live, s2, s1], marks({ b1: { through: H0 + 60_000, uses: 2 } }), H0 + 300_000);
+  eq(secs(got.rows), [[0, 60], [0, 60]], "the sessions it missed, and none of the one it counted");
+  eq(got.rows.filter((r) => r.unit === "execs").map((r) => r.quantity), [3], "and only the missed session's uses");
+});
+
+check("a session that starts at the instant the watermark stands is a new one, with all of its uses", () => {
+  // The previous session was counted to its end, and the box woke in that same millisecond.
+  const s2 = { id: "b1", startedAt: H0 + 60_000, endedAt: H0 + 120_000, uses: 3 };
+  const got = heldRows(base, "sandbox", [s2], marks({ b1: { through: H0 + 60_000, uses: 2 } }), H0 + 300_000);
+  eq(secs(got.rows), [[0, 60]], "all of its time");
+  eq(got.rows.filter((r) => r.unit === "execs").map((r) => r.quantity), [3], "and its own uses, not less the last session's");
+});
+
+check("against a real table: one box under two payer keys in one pass is still counted once", () => {
+  const host = sqliteHost();
+  // A session recorded before the credential was, beside the running one that records it: two keys, one box.
+  const report = { activity: { live: { id: "b1", startedAt: H0 + 120_000, credentialRef: "operator" } }, usage: [{ id: "b1", startedAt: H0, endedAt: H0 + 60_000 }] };
+  pass(host, report, true, H0 + 180_000);
+  pass(host, report, true, H0 + 240_000);
+  eq(pendingUsage(host.sql, 0).filter((r) => r.unit === "seconds").reduce((a, r) => a + r.quantity, 0), 60 + 120, "each session once");
+});
+
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.error ? `\n    ${r.error}` : ""}`);
 const failed = results.filter((r) => !r.ok).length;
 console.log(`${results.length - failed}/${results.length} passed`);
