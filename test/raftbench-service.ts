@@ -73,6 +73,8 @@ interface Fake {
   /** Accepted results by run and revision: the body hash and its receipt. */
   accepted: Map<string, { hash: string; receiptId: string; body: string }>;
   push: { url: string; secret: string } | null;
+  /** Fields a newer Server adds to each context page and to its coverage. */
+  newer: { page: Record<string, unknown>; coverage: Record<string, unknown> };
   /** Answers queued for the next requests to a path, before the contract's own. */
   inject: Map<string, Array<() => Response>>;
   submits(): Array<{ raw: string; body: any }>;
@@ -103,7 +105,7 @@ function coverageOf(p: Page) {
 
 function fakeRaft(): Fake {
   const f: Fake = {
-    calls: [], events: [], pages: TWO_PAGES, run: { runId: randomUUID(), revision: 3 }, accepted: new Map(), push: null, inject: new Map(),
+    calls: [], events: [], pages: TWO_PAGES, run: { runId: randomUUID(), revision: 3 }, accepted: new Map(), push: null, inject: new Map(), newer: { page: {}, coverage: {} },
     submits: () => f.calls.filter((c) => c.path === "/internal/agent-api/raftbench/submit").map((c) => ({ raw: c.raw!, body: c.body })),
   };
   globalThis.fetch = (async (input: any, init?: any) => {
@@ -135,7 +137,8 @@ function fakeRaft(): Fake {
         const at = u.searchParams.get("cursor") ? Number(u.searchParams.get("cursor")!.split(":")[2]) : 0;
         const p = f.pages[at]!;
         const next = at + 1 < f.pages.length ? `${f.run.runId}:${f.run.revision}:${at + 1}` : null;
-        return json(200, { runId: f.run.runId, revision: f.run.revision, sourceText: p.sourceText, sources: p.sources, coverage: coverageOf(p), nextCursor: next });
+        return json(200, { runId: f.run.runId, revision: f.run.revision, sourceText: p.sourceText, sources: p.sources,
+          coverage: { ...coverageOf(p), ...f.newer.coverage }, nextCursor: next, ...f.newer.page });
       }
       case "POST /internal/agent-api/raftbench/submit": {
         if (body.runId !== f.run.runId) return refusal(404, "raftbench_run_not_owned")();
@@ -388,6 +391,15 @@ await check("gaps are the plugin's: a result without them is given them, a wrong
   await assign(w);
   await answer(w, goodResult({ status: "incomplete", reason: "stopped early" }));
   must(show(w.raft.submits()[0]?.body.gaps) === show(["missing_tool_outcomes", "budget"]), w.raft.submits()[0]?.raw ?? "nothing submitted");
+});
+
+await check("a newer Server's context (an unknown field, skippedChunks) still reads, and a skipped chunk is a partial scan", async () => {
+  const w = await world();
+  w.raft.newer = { page: { readerVersion: 2 }, coverage: { skippedChunks: 1, chunkHint: "x" } };
+  await assign(w);
+  must(w.sent.length === 1, `the read did not reach the model: ${show(runLogs("read_failed"))}`);
+  await answer(w, goodResult());
+  must(show(w.raft.submits()[0]?.body.gaps) === show(["missing_tool_outcomes", "partial_scan"]), w.raft.submits()[0]?.raw ?? "nothing submitted");
 });
 
 await check("the fixture's message lines carry the server's time format", async () => {
