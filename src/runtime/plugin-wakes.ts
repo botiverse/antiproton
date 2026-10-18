@@ -119,12 +119,15 @@ export function pendingAnswers(sql: Sql): Array<{ seq: number; alias: string; ne
     .map((r) => ({ seq: Number(r.seq), alias: String(r.alias), next: JSON.parse(String(r.body)) as PluginNext, posting: Number(r.posting) === 1 }));
 }
 
-/** What a turn's end said of the model's text, gone: kept ends say only how each turn ended. */
+/**
+ * What a turn's end said of the conversation, gone: the model's text, and an error's, which can quote what the model
+ * was sent. Kept ends say only how each turn ended.
+ */
 export function forgetTurnText(sql: Sql) {
   if (!keepsPluginCalls(sql)) return;
   for (const r of sql.exec("SELECT seq, body FROM plugin_turn_ends").toArray()) {
-    const end = JSON.parse(String(r.body)) as { finalText?: unknown };
-    if (end.finalText === null || end.finalText === undefined) continue;
+    const { error, ...end } = JSON.parse(String(r.body)) as { finalText?: unknown; error?: unknown };
+    if ((end.finalText === null || end.finalText === undefined) && error === undefined) continue;
     sql.exec("UPDATE plugin_turn_ends SET body = ? WHERE seq = ?", JSON.stringify({ ...end, finalText: null }), Number(r.seq));
   }
 }

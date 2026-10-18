@@ -3971,7 +3971,13 @@ export class AgentRuntime {
     if (this.#isPd()) return { ok: false, status: 409, error: "this agent runs on the pd engine, whose conversations a fresh context does not reach" };
     const busy = this.notIdle();
     if (busy) return { ok: false, status: 409, error: `${busy}; a fresh context starts only between turns` };
-    const out = startFreshMain(this.#deps.ctx.storage, Date.now());
+    // A profile that keeps no conversations has the one ending erased, not archived (src/runtime/agent-profile.ts).
+    const profile = profileOf((await this.store.loadAgent(tenantId, agentId))?.config);
+    const sql = this.#deps.ctx.storage.sql;
+    const out = profile && !profileSpec(profile).keepsConversations
+      ? eraseMain(this.#deps.ctx.storage, Date.now()) ?? { oldSessionId: currentMainId(sql), newSessionId: currentMainId(sql) }
+      : startFreshMain(this.#deps.ctx.storage, Date.now());
+    if (profile && !profileSpec(profile).keepsConversations) forgetTurnText(sql);
     await this.dropHarnesses(tenantId, agentId, "fresh-context");
     return { ok: true, ...out };
   }
@@ -5688,6 +5694,11 @@ export class AgentRuntime {
     if (!opts.rebuild) {
       clearBackstop(sql, { tenantId, agentId, why: "operator", now: Date.now() });
       return { ok: true, cleared: mark ? { at: mark.at, reason: mark.reason } : null, rebuilt: null };
+    }
+    // A rebuild's briefing is a copy of the conversation, which a profile that rebuilds none must not get.
+    const profile = profileOf((await this.store.loadAgent(tenantId, agentId))?.config);
+    if (profile && !profileSpec(profile).rebuildsContext) {
+      return { ok: false, status: 409, error: `this agent's profile (${profile}) rebuilds no conversation, since a briefing would copy it; rebuild=0 clears the mark alone` };
     }
     const busy = this.notIdle();
     if (busy) return { ok: false, status: 409, error: `${busy}; a rebuild starts only between turns (rebuild=0 clears the mark alone)` };

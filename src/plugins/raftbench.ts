@@ -159,6 +159,12 @@ interface RunState {
   retryAt?: number;
   /** While `done`: what became of the run, for the log. */
   outcome?: string;
+  /**
+   * While `done`: the run's conversation is to be erased (`PluginNext.forget`). Written with the outcome, in one write,
+   * so a hook cut off before the runtime kept its answer sends the erase again when it is asked again: every hook asks
+   * for it while this stands. Erasing an erased conversation does nothing, and the next run's state replaces this one.
+   */
+  forgetPending?: true;
 }
 
 /**
@@ -262,7 +268,12 @@ function assigned(a: { runId: string; revision: number }, receivedAt: number): R
 /** Read the run's material (again, on a reread) and hand the model its first turn. */
 async function read(ctx: PluginContext, raft: Raft, run: RunState): Promise<PluginNext | void> {
   if (run.reads >= MAX_READS) return end(ctx, raft, run, "stopped: the run's material changed again after it was read again", {});
+  // A reread starts over: what the last read's result held goes with it.
   const reading: RunState = { ...run, phase: "reading", reads: run.reads + 1, readCalls: 0 };
+  delete reading.body;
+  delete reading.from;
+  delete reading.reason;
+  delete reading.retryAt;
   await save(ctx, CURRENT, reading);
   return resumeRead(ctx, raft, reading);
 }
@@ -388,7 +399,7 @@ function timeout(ctx: PluginContext, raft: Raft, run: RunState): Promise<PluginN
  * (`forget`). An assignment that arrived meanwhile starts now, in a conversation of its own.
  */
 async function end(ctx: PluginContext, raft: Raft, run: RunState, outcome: string, extra: Record<string, unknown>): Promise<PluginNext | void> {
-  const done: RunState = { ...run, phase: "done", outcome };
+  const done: RunState = { ...run, phase: "done", outcome, forgetPending: true };
   delete done.body;
   delete done.reason;
   delete done.retryAt;
@@ -467,6 +478,8 @@ export const raftbenchPlugin: Plugin = {
 async function woken(ctx: PluginContext): Promise<PluginNext | void> {
   const raft = await raftOf(ctx);
   const run = await load(ctx, CURRENT);
+  // An erase a cut-off hook may have lost goes first; the wake then carries on, so an assignment is still taken.
+  const erase: PluginNext | undefined = run?.phase === "done" && run.forgetPending ? { forget: true } : undefined;
   const now = Date.now();
   // A result Raft has not confirmed is sent again, as it is, when its retry is due; the deadline does not replace it.
   if (run?.phase === "submitting" && (run.retryAt === undefined || now >= run.retryAt)) return answer(ctx, await send(ctx, raft, run));
@@ -497,13 +510,17 @@ async function woken(ctx: PluginContext): Promise<PluginNext | void> {
   }
   const current = await load(ctx, CURRENT);
   // A run not read yet (just assigned) starts; one an eviction cut short mid-read starts again, counted as it was.
-  if (current?.phase === "reading") return answer(ctx, await (current.reads > 0 ? resumeRead(ctx, raft, current) : read(ctx, raft, current)));
-  return answer(ctx, undefined);
+  if (current?.phase === "reading") {
+    return answer(ctx, { ...(erase ?? {}), ...((await (current.reads > 0 ? resumeRead(ctx, raft, current) : read(ctx, raft, current))) ?? {}) });
+  }
+  return answer(ctx, erase);
 }
 
 async function turnEnded(ctx: PluginContext, end: TurnEnd): Promise<PluginNext | void> {
   const run = await load(ctx, CURRENT);
-  if (!run || run.phase === "done") return;
+  if (!run) return;
+  // Over, but its erase may not have reached the runtime: asked for again (see `forgetPending`).
+  if (run.phase === "done") return run.forgetPending ? { forget: true } : undefined;
   // Only the turn this run asked for answers it: a person's message, an earlier run's late end, anything else is not.
   if (end.turnKey === null || end.turnKey !== run.turnKey) {
     log(ctx, run, "turn_ignored", { turnId: end.turnId, turnKey: end.turnKey });

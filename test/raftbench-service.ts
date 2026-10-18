@@ -183,6 +183,8 @@ function fakeBucket(objects: Map<string, string>) {
   };
 }
 
+/** Armed, the next storage transaction throws, as an eviction would cut the pass off there; then it disarms. */
+const crash = { armed: false, when: (): boolean => true };
 function newRuntime(host: ReturnType<typeof sqliteHost>, sent: string[], r2: Map<string, string> = new Map()) {
   const rows = new Map<string, HookRow>();
   const directory = {
@@ -192,7 +194,10 @@ function newRuntime(host: ReturnType<typeof sqliteHost>, sent: string[], r2: Map
     async revoke(id: string) { const r = rows.get(id); if (!r || r.revokedAt !== null) return null; r.revokedAt = 2; return r; },
   };
   return new AgentRuntime({
-    ctx: { storage: { sql: host.sql, transactionSync: host.transactionSync } },
+    ctx: { storage: { sql: host.sql, transactionSync: <T>(fn: () => T): T => {
+      if (crash.armed && crash.when()) { crash.armed = false; throw new Error("evicted"); }
+      return host.transactionSync(fn);
+    } } },
     bucket: fakeBucket(r2) as never, bucketName: "b", models: { resolve: () => null },
     autoRelease: false, secretKek: Buffer.from(new Uint8Array(32).fill(5)).toString("base64"),
     operatorModel: operatorModelOf({ DEEPSEEK_BASE_URL: "https://model.example/v1", DEEPSEEK_API_KEY: "operator-key", HARNESS_MODEL: "deepseek-flash" } as never),
@@ -641,6 +646,88 @@ await check("retention: once a run ends, no copy of its material or its answer i
   must((w.raft.accepted as Map<string, unknown>).size === 2, "run 2 was not accepted");
   must(show(whereIs(w, MATERIAL_MARK)) === "[]" && show(whereIs(w, ANSWER_MARK)) === "[]" && show(whereIs(w, "rollback finished?")) === "[]",
     `after run 2: ${show({ material: whereIs(w, MATERIAL_MARK), answer: whereIs(w, ANSWER_MARK), run2: whereIs(w, "rollback finished?") })}`);
+});
+
+/** Neither of run 1's markers anywhere in the agent's storage, said with where they are when they are. */
+function mustBeGone(w: World, when: string) {
+  const left = { material: whereIs(w, MATERIAL_MARK), answer: whereIs(w, ANSWER_MARK) };
+  must(left.material.length === 0 && left.answer.length === 0, `${when}: ${show(left)}`);
+}
+const markedFailure = (marker: string) => ({ role: "assistant", content: [], stopReason: "error", errorMessage: `upstream echoed: ${marker}`, api: "offloaded", provider: "openai-compatible", model: "m", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, timestamp: Date.now() });
+
+await check("retention: a crash between the run's end and its erase is erased on the replay", async () => {
+  const w = await world();
+  w.raft.pages = markedPages();
+  await assign(w);
+  must(whereIs(w, MATERIAL_MARK).length > 0, "the marker never reached storage");
+  // The pass is cut off at the transaction that would keep the hook's answer, after the plugin saved the run as done.
+  crash.when = () => w.host.sql.exec(`SELECT 1 AS x FROM plugin_db WHERE value LIKE '%"forgetPending":true%'`).toArray().length > 0;
+  crash.armed = true;
+  await answer(w, markedAnswer()).catch(() => {});
+  must(!crash.armed && w.raft.accepted.size === 1, `the crash was not where it was meant to be: armed ${crash.armed}, accepted ${w.raft.accepted.size}`);
+  must(whereIs(w, MATERIAL_MARK).length > 0, "the material was gone before the replay, so the case proves nothing");
+  const fresh = newRuntime(w.host, w.sent, w.r2);
+  await fresh.ready();
+  await fresh.step("t", SERVICE);
+  mustBeGone(w, "after the replay");
+  must(w.raft.submits().length === 1, `submits ${w.raft.submits().length}`);
+});
+
+await check("retention: every terminal path leaves no copy — timeout, read failure, stop, model failure, overflow, cancel, reread", async () => {
+  const paths: Record<string, (w: World) => Promise<void>> = {
+    timeout: async (w) => { skew += RUN_DEADLINE_MS + 1_000; try { for (let i = 0; i < 3; i++) await pass(w); } finally { skew = 0; } },
+    "read failure on a reread": async (w) => {
+      w.raft.inject.set("/internal/agent-api/raftbench/submit", [refusal(409, "raftbench_revision_conflict")]);
+      w.raft.inject.set("/internal/agent-api/raftbench/context", [refusal(400, "raftbench_validation_failed")]);
+      await answer(w, markedAnswer());
+    },
+    stop: async (w) => { w.raft.inject.set("/internal/agent-api/raftbench/submit", [refusal(403, "raftbench_read_permission_revoked")]); await answer(w, markedAnswer()); },
+    "model failure (its error quoting the material)": async (w) => {
+      const id = w.sent.find((x) => !w.answered.has(x))!;
+      w.answered.add(id);
+      await w.rt.takeJob("t", SERVICE, id);
+      await w.rt.deliverAnswer("t", SERVICE, id, { ...markedFailure(MATERIAL_MARK), jobId: id } as never, undefined);
+      await pass(w);
+    },
+    overflow: async (w) => {
+      const id = w.sent.find((x) => !w.answered.has(x))!;
+      w.answered.add(id);
+      const job = await w.rt.takeJob("t", SERVICE, id) as any;
+      const refused = new ModelRequestRefused(400, JSON.stringify({ error: { type: "invalid_request_error", message: "This model's maximum context length is 131072 tokens. However, you requested 140211 tokens (139211 in the messages, 1000 in the completion). Please reduce the length of the messages or completion." } }));
+      await w.rt.deliverAnswer("t", SERVICE, id, { ...errorMessage(refused.message, { api: job.model.api, provider: job.model.provider, id: job.model.id }), providerError: refused.turnError, jobId: id } as never, undefined);
+      await pass(w);
+    },
+    cancel: async (w) => { await w.rt.stopTurn("t", SERVICE, "provider_stop"); for (let i = 0; i < 2; i++) await pass(w); },
+    reread: async (w) => {
+      w.raft.inject.set("/internal/agent-api/raftbench/submit", [refusal(409, "raftbench_revision_conflict")]);
+      await answer(w, markedAnswer());
+      must(whereIs(w, ANSWER_MARK).length === 0, `the first read's answer outlived its reread: ${show(whereIs(w, ANSWER_MARK))}`);
+      await answer(w, markedAnswer());
+    },
+  };
+  for (const [name, path] of Object.entries(paths)) {
+    const w = await world();
+    w.raft.pages = markedPages();
+    await assign(w);
+    must(whereIs(w, MATERIAL_MARK).length > 0, `${name}: the marker never reached storage`);
+    await path(w);
+    must(runLogs("done").length > 0 && w.raft.submits().length + runLogs("done").length > 0, `${name}: the run did not end`);
+    mustBeGone(w, name);
+    logs.length = 0;
+  }
+});
+
+await check("retention: an operator's fresh context erases a profile agent's conversation; a rebuild is refused", async () => {
+  const w = await world();
+  w.raft.pages = markedPages();
+  await assign(w);
+  await w.rt.stopTurn("t", SERVICE, "provider_stop");
+  // Before the plugin's own erase runs: only the operator's fresh context acts.
+  const fresh = await w.rt.freshContext("t", SERVICE);
+  must(fresh.ok, show(fresh));
+  must(whereIs(w, MATERIAL_MARK).length === 0, `the fresh context kept the material: ${show(whereIs(w, MATERIAL_MARK))}`);
+  const rebuild = await w.rt.resetSession("t", SERVICE, { rebuild: true });
+  must(!rebuild.ok && rebuild.status === 409 && /rebuilds no conversation/.test(rebuild.error), show(rebuild));
 });
 
 await check("retention: a result waiting for its retry is kept until the retry succeeds, and gone after", async () => {
