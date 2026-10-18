@@ -953,13 +953,17 @@ export type OfferedToolsExport = {
 
 /**
  * Whether a turn's start re-takes this mount's tool list (`AgentRuntime.retakeStaleSnapshots`): its plugin lists its
- * own tools and declares a basis, and the mount has a snapshot taken under another basis (one with none differs). The
- * re-take itself and the tool export (`AgentRuntime.offeredTools`) both ask this, so the export's "due" is the pass's.
+ * own tools, the mount has a snapshot, and either the plugin declares a basis the snapshot was not taken under (one
+ * with none differs) or the plugin says the list is due again (`Plugin.toolsDue`: part of it comes from a far end and
+ * has aged, or a call was told it is stale). The re-take itself and the tool export (`AgentRuntime.offeredTools`) both
+ * ask this, so the export's "due" is the pass's. A `toolsDue` that throws is read as not due: the list stays.
  */
 export function snapshotStale(
-  m: Pick<MountRecord, "toolSnapshot">, p: Pick<Plugin, "snapshotTools" | "toolsBasis"> | undefined,
+  m: MountRecord, p: Pick<Plugin, "snapshotTools" | "toolsBasis" | "toolsDue"> | undefined, now = Date.now(),
 ): boolean {
-  return !!p?.snapshotTools && p.toolsBasis !== undefined && !!m.toolSnapshot && m.toolSnapshot.basis !== p.toolsBasis;
+  if (!p?.snapshotTools || !m.toolSnapshot) return false;
+  if (p.toolsBasis !== undefined && m.toolSnapshot.basis !== p.toolsBasis) return true;
+  try { return p.toolsDue?.(m, now) === true; } catch { return false; }
 }
 
 /**
@@ -2712,7 +2716,7 @@ export class AgentRuntime {
 
   /**
    * Re-take, at the start of a turn, every tool list taken under a basis that is not its plugin's now
-   * (`Plugin.toolsBasis`, `ToolSnapshot.basis`). A snapshot is otherwise taken only when a mount is added, its
+   * (`Plugin.toolsBasis`, `ToolSnapshot.basis`), and every list its plugin says is due again (`Plugin.toolsDue`). A snapshot is otherwise taken only when a mount is added, its
    * credential changes or an operator refreshes it, so a deploy that adds a tool would never reach a mount whose list
    * already existed: the model was not offered the tool, and a plugin that hinted at it named a tool the mount lacked.
    *
@@ -2746,14 +2750,14 @@ export class AgentRuntime {
 
   async #retakeStale(tenantId: string, agentId: string): Promise<void> {
     const byId = new Map(this.#plugins.map((p) => [p.id, p]));
-    const stale = (await this.store.listMounts(tenantId, agentId)).filter((m) => snapshotStale(m, byId.get(m.plugin)));
+    const now = Date.now();
+    const stale = (await this.store.listMounts(tenantId, agentId)).filter((m) => snapshotStale(m, byId.get(m.plugin), now));
     if (!stale.length) return;
     const choices = await this.store.pluginChoices(tenantId, agentId);
-    const now = Date.now();
     const due = stale.filter((m) => {
       if (!pluginEnabled(SEEDED_PLUGINS.has(m.plugin), choices[m.plugin])) return false;
       const failed = this.#retakeFailed.get(`${tenantId}/${agentId}/${m.alias}`);
-      return !failed || failed.basis !== byId.get(m.plugin)!.toolsBasis || now - failed.at >= RETAKE_BACKOFF_MS;
+      return !failed || failed.basis !== (byId.get(m.plugin)!.toolsBasis ?? "") || now - failed.at >= RETAKE_BACKOFF_MS;
     });
     if (!due.length) return;
     // The gateway refuses to list for a mount whose pin is not the registry's, and the build that moved the basis
@@ -2761,7 +2765,8 @@ export class AgentRuntime {
     if (due.some((m) => this.pluginVersion(m.plugin) !== m.toolVersion)) await this.repinMounts(tenantId, agentId);
     for (const m of due) {
       const key = `${tenantId}/${agentId}/${m.alias}`;
-      const basis = byId.get(m.plugin)!.toolsBasis!;
+      // A plugin due by `toolsDue` alone may declare no basis; its back-off is then keyed on the empty one.
+      const basis = byId.get(m.plugin)!.toolsBasis ?? "";
       let timer: ReturnType<typeof setTimeout> | undefined;
       const timedOut = new Promise<"timeout">((resolve) => { timer = setTimeout(() => resolve("timeout"), RETAKE_TIMEOUT_MS); });
       let r: Awaited<ReturnType<AgentRuntime["refreshMountTools"]>> | "timeout";
@@ -3915,7 +3920,7 @@ export class AgentRuntime {
       const p = byId.get(m.plugin);
       const snap = m.toolSnapshot;
       const failed = this.#retakeFailed.get(`${tenantId}/${agentId}/${m.alias}`);
-      const backedOff = !!failed && failed.basis === p?.toolsBasis && now - failed.at < RETAKE_BACKOFF_MS;
+      const backedOff = !!failed && failed.basis === (p?.toolsBasis ?? "") && now - failed.at < RETAKE_BACKOFF_MS;
       const offeredHere = tools.filter((x) => x.alias === m.alias).map((x) => x.name);
       return {
         alias: m.alias, plugin: m.plugin, toolVersion: m.toolVersion,
@@ -3930,7 +3935,7 @@ export class AgentRuntime {
           tools: snap.tools.map((x) => x.name), skipped: snap.skipped.map((x) => ({ ...x })),
         } : null,
         basis: p?.toolsBasis ?? null,
-        retake: enabled.has(m.alias) && snapshotStale(m, p) ? (backedOff ? "backed_off" : "due") : null,
+        retake: enabled.has(m.alias) && snapshotStale(m, p, now) ? (backedOff ? "backed_off" : "due") : null,
         snapshotError: this.snapshotError(m.alias, { readOnly: true }),
       };
     });

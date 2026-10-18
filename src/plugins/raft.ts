@@ -22,6 +22,7 @@ import {
   type AgentLoginDeps, type ManifestCache,
 } from "./raft-agent-login.ts";
 import { internalHost } from "./http.ts";
+import { callMcp, isMcpTool, keptMcpOf, listMcp, mcpClock, mcpLines, MCP_CAPABILITY, MCP_KEY, MCP_PREFIX } from "./raft-mcp.ts";
 import { modelToolName } from "../runtime/pi-tools.ts";
 import { isSubagentSession } from "../runtime/subagent-session.ts";
 import { toAgentRef } from "../store/refs.ts";
@@ -2389,6 +2390,8 @@ export function createRaftPlugin(deps: {
   const manifests: ManifestCache = new Map();
   /** Agent Login's Raft client: its state is never saved, since a login and a list book nothing as seen. */
   const agentLogin = (ctx: PluginContext): AgentLoginDeps => ({ raft: () => raftFor(ctx, { state: false }), timeoutMs: timeout(ctx) });
+  /** When each mount's managed MCP catalogue was last listed in this isolate, and which a call found stale (src/plugins/raft-mcp.ts). */
+  const mcp = mcpClock();
   /** One generated operation: the attachment download is this plugin's own (`downloadAttachment`), the rest the SDK's. */
   const operate = (op: RaftOperationSpec, args: unknown, ctx: PluginContext, resumed?: { seen?: { upToSeq: number }; heldAt?: number }) =>
     op.name === DOWNLOAD_OP ? downloadAttachment(args, ctx, artifacts, unofferedFor(ctx)) : runOperation(op, args, ctx, unofferedFor(ctx), resumed);
@@ -2412,7 +2415,7 @@ export function createRaftPlugin(deps: {
       // Version 5 added the Server's flags as the listing last read them (`CONTEXT_STORE`); nothing to carry over.
       version: 5, stores: {
         [PUSH_STORE]: { listed: [PUSH_KEY] }, [INBOX_STORE]: { listed: [STATE_KEY, SINCE_KEY] }, [SESSION_STORE]: {},
-        [CONTEXT_STORE]: { listed: [FEATURES_KEY] },
+        [CONTEXT_STORE]: { listed: [FEATURES_KEY, MCP_KEY] },
       },
       /**
        * Version 2 kept the cursor and the frontier under their own keys; version 3 keeps the SDK's state record.
@@ -2464,8 +2467,15 @@ export function createRaftPlugin(deps: {
      * call last kept (`CONTEXT_STORE`); null with none kept or none on, which leaves the prompt as it was.
      */
     async promptContribution(ctx) {
-      return featuresParagraph(featuresOf(await ctx.db.get(CONTEXT_STORE, FEATURES_KEY)), ctx.alias);
+      const features = featuresParagraph(featuresOf(await ctx.db.get(CONTEXT_STORE, FEATURES_KEY)), ctx.alias);
+      // One line per managed MCP connector that needs reconnecting, so the agent tells the person what is wrong instead
+      // of saying it has no such connector; kept by the listing that read the catalogue (`listMcp`).
+      const reconnect = mcpLines(keptMcpOf(await ctx.db.get(CONTEXT_STORE, MCP_KEY)));
+      const parts = [features, reconnect.length ? reconnect.join("\n") : null].filter((p): p is string => p !== null);
+      return parts.length ? parts.join("\n\n") : null;
     },
+    /** A turn's start lists the mount again when its managed MCP catalogue has aged or a call found it stale (`mcpClock`). */
+    toolsDue: (m, now) => mcp.due(m, now),
     retired: RETIRED,
 
     /**
@@ -2490,7 +2500,9 @@ export function createRaftPlugin(deps: {
       const generatedHere = generatedTools.filter((t) => allowed.has(t.name));
       // The view needs the download's capability and storage, so it goes only with the download offered beside it.
       const view = generatedHere.some((t) => t.name === DOWNLOAD_TOOL) ? viewTools.filter((t) => allowed.has(t.name)) : [];
-      return [...OWN_TOOLS, ...generatedHere, ...view, ...ASSISTANT_TOOLS.filter((t) => allowed.has(t.name))];
+      // The managed MCP tools are the catalogue's, so they are read whole from the snapshot (src/plugins/raft-mcp.ts).
+      const managed = snapshot.tools.filter((t) => t.name.startsWith(MCP_PREFIX));
+      return [...OWN_TOOLS, ...generatedHere, ...view, ...ASSISTANT_TOOLS.filter((t) => allowed.has(t.name)), ...managed];
     },
 
     /**
@@ -2516,7 +2528,8 @@ export function createRaftPlugin(deps: {
       if (!ctx.credential) {
         return { tools: [], skipped: [{ name: EVERY_OPERATION, reason: "this mount has no Raft credential, so it has no capabilities", every: true }] };
       }
-      const me = await raftFor(ctx, { state: false }).routes.agent.context();
+      const raft = raftFor(ctx, { state: false });
+      const me = await raft.routes.agent.context();
       if (!me.ok) {
         if (me.status === 401 || me.status === 403) {
           return { tools: [], refused: true, skipped: [{ name: EVERY_OPERATION, reason: `Raft refused this mount's credential (HTTP ${me.status})`, every: true }] };
@@ -2539,7 +2552,14 @@ export function createRaftPlugin(deps: {
       }
       if (tools.some((t) => t.name === DOWNLOAD_TOOL)) tools.push(...viewTools);
       if (isAssistantOf(me.data.agent.assistantOf)) tools.push(...ASSISTANT_TOOLS);
-      return { tools, skipped };
+      // The managed MCP catalogue, last: asked only of a credential that holds `mcp`, and never the reason the listing
+      // fails (`listMcp`). After Raft's own tools, so the kernel's bound on a list's length never costs one of those.
+      const managed = await listMcp(raft, ctx, CONTEXT_STORE, capabilities.has(MCP_CAPABILITY));
+      mcp.listed(ctx, Date.now());
+      tools.push(...managed.tools);
+      // First, since the kernel keeps only the first few reasons (`MAX_SKIPPED`), and a credential that lacks several
+      // capabilities fills them with one line per tool.
+      return { tools, skipped: [...managed.skipped, ...skipped] };
     },
 
     /**
@@ -2649,6 +2669,7 @@ export function createRaftPlugin(deps: {
     },
 
     async invoke(name, args, ctx): Promise<Json> {
+      if (isMcpTool(name)) return callMcp(name, args, ctx, () => raftFor(ctx, { state: false }), CONTEXT_STORE, mcp);
       const op = operationOf.get(name);
       if (op) return operate(op, args, ctx) as Promise<Json>;
       // Answered wherever the download is generated, as the download is: with no storage it says why nothing was kept.

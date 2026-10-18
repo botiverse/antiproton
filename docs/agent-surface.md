@@ -738,6 +738,18 @@ A stop ends the agent's subagents' turns as well ([Subagents](#subagents-send_to
 delete stops again. A stop that fails does not fail the delete: it is logged as a `turn.stop` line with `result`
 `failed` ([`runbook.md`](runbook.md)).
 
+## Raft managed MCP
+
+A hosted agent whose raft mount's credential holds Raft's `mcp` capability is offered the connectors its Raft Server has
+connected (Notion and the like) as tools of that mount, `raft__mcp_…`, one per entry of Raft's managed MCP catalogue,
+with the catalogue's description and input schema. Raft holds the connectors' credentials and attaches them to each
+call; Antiproton holds none. The catalogue is read when the mount is listed and again at a turn's start once it is five
+minutes old or a call was told it is stale; a connector that needs reconnecting is one line in the mount's paragraph of
+the agent's instructions. Every such tool is a write: a subagent is not offered it, and no call is retried or replayed.
+An agent without a raft mount, or whose credential lacks `mcp`, has none. How it works is in
+[docs/plugins.md](plugins.md) (Raft's managed MCP); how to check it on an agent is in
+[runbook.md](runbook.md#raft-managed-mcp-on-an-agent).
+
 ## Subagents (`send_to_agent`)
 
 Every hosted agent is offered one more harness tool, `send_to_agent`, in its own conversations, its Agents API sessions
@@ -1173,7 +1185,7 @@ answer with `/admin/transcript`'s for the same agent).
 turn, `status` `done`, `failed`, `cancelled`, `stopped`, `report_failed`, `report_dropped` or `wake_failed` (a background
 completion that could not be posted, so no turn started), `attrs.parentSession` and, on an end, `reportChars`, the report
 body's length; a `cancelled` end's `attrs.cause` is `ceiling` or `aborted`, a kill switch's `stopped` end's is `switched_off`), `subagent.start` (a child's turn beginning: `spanId` its session,
-`parentId` the parent's `send_to_agent` call, `status` `spawn`, `follow_up` or `wake`), and the rows a plugin writes of its own, `raft.held`, `raft.held_answer` and `raft.state_failed` (written as `raft.state_save_failed` before Raft SDK 0.19.0)
+`parentId` the parent's `send_to_agent` call, `status` `spawn`, `follow_up` or `wake`), and the rows a plugin writes of its own, `raft.held`, `raft.held_answer`, `raft.state_failed` (written as `raft.state_save_failed` before Raft SDK 0.19.0) and `raft.mcp_call` (one [managed MCP](#raft-managed-mcp) call's end: `status` `result`, `tool_error` or the failure kind, `attrs.server` and `attrs.tool`; never arguments or a result)
 ([docs/plugins.md](plugins.md)); `src/trace/outbox.ts`) — with `from <= at < to`, in `seq` order.
 
 - `from`, `to` — ISO 8601 or milliseconds since the epoch; the window is at most 24 hours. One alone
