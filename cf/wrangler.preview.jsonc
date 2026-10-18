@@ -61,7 +61,10 @@
     "RUN9_MAX_IDLE_MINUTES": "30",
     // An evaluation's setup routes under /provision (seeded workspace files, fresh context, model-input evidence;
     // cf/src/provision/handlers.ts). Preview only: test/eval-seed.ts fails if cf/wrangler.jsonc sets it.
-    "EVAL_SEED_ROUTES": "1"
+    "EVAL_SEED_ROUTES": "1",
+    // POST /admin/provider-tokens may register a token by its hash, so its holder keeps the plaintext
+    // (cf/src/admin-provider-tokens.ts). Not production: test/provider-tokens.ts fails if cf/wrangler.jsonc sets it.
+    "PROVIDER_TOKEN_HASH_REGISTRATION": "1"
   },
   // Once a day, 03:17 UTC: the usage ledger's retention, whole days of
   // hours past KEEP_HOURLY_DAYS folded into usage_daily (`scheduled` in src/index.ts). The preview has its own database, so it folds its own.
