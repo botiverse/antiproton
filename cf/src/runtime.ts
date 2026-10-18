@@ -166,13 +166,14 @@ export function personaOf(config: unknown): { name?: string; description?: strin
  * sets it on every call it makes, after the program's options, and the gateway
  * refuses a `modelOnly` tool on it — dropped here, that refusal never fires.
  */
-export function hostCallOpts(call: { opts?: unknown; callId?: string }): InvokeOpts {
+export function hostCallOpts(call: { opts?: unknown; callId?: string }, offered?: InvokeOpts["offered"]): InvokeOpts {
   const o = (call.opts ?? {}) as { confirm?: unknown; idempotencyKey?: unknown; fromProgram?: unknown };
   return {
     ...(o.confirm === true ? { confirm: true } : {}),
     ...(o.fromProgram === true ? { fromProgram: true } : {}),
     ...(typeof o.idempotencyKey === "string" ? { idempotencyKey: o.idempotencyKey } : {}),
     ...(call.callId === undefined ? {} : { callId: call.callId }),
+    ...(offered === undefined ? {} : { offered }),
   };
 }
 import type { MountPolicy, MountRecord } from "../../src/core/types.ts";
@@ -2293,7 +2294,7 @@ export class AgentRuntime {
     // finished exactly as a call's is (a job, a parked result, the held line).
     const dispatch = async (
       call: { tool: string; args: any; opts?: any; callId?: string },
-      send: () => Promise<ToolResult> = () => gw.invoke(inTurn(), call.tool, call.args, hostCallOpts(call)),
+      send: () => Promise<ToolResult> = () => gw.invoke(inTurn(), call.tool, call.args, hostCallOpts(call, offered)),
     ): Promise<ToolResult> => {
         const res = await send();
         // Work that has started and outlives this call (task #16). The model is
@@ -2400,7 +2401,7 @@ export class AgentRuntime {
         const speaking = subagent ? await speaks(call.tool) : null;
         if (speaking) return childRefusal(speaking);
         if (ended?.({ tenantId: ctx.tenantId, agentId: ctx.agentId })) return taskEndedRefusal(call.tool);
-        return held(call.tool, await dispatch(call, () => gw.resumeInterrupt(inTurn(), i, answer, { callId })));
+        return held(call.tool, await dispatch(call, () => gw.resumeInterrupt(inTurn(), i, answer, { callId, offered })));
       },
       async cancelInterrupt(i: ToolInterrupt): Promise<string | null> {
         return gw.cancelInterrupt(inTurn(), i);

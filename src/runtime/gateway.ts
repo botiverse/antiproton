@@ -152,6 +152,13 @@ export interface InvokeOpts {
    */
   callId?: string;
   /**
+   * The tool list the call was made against: the turn's offered tools, names qualified (`qualifyMountedTools`). The
+   * operation records the offered name of the tool the call resolves to (`OperationRecord.modelName`, `offeredName`),
+   * whichever form named it: an offered name the bridge or run_js mapped, an `alias.tool` address, or a `plugin.tool`
+   * one only this gateway can resolve. Changes nothing about the call. Set by the host, never by a program.
+   */
+  offered?: ReadonlyArray<{ address: string; name: string }>;
+  /**
    * The call comes from a run_js program, not from the model: set by `runJsTool`
    * after the program's own options, so a program cannot clear it. A tool that
    * declares `modelOnly` is refused for it here, whatever name reached the
@@ -163,6 +170,17 @@ export interface InvokeOpts {
 }
 
 type Resolution = { mount: MountRecord; tool: string } | { error: ToolError };
+
+/**
+ * The offered name of the tool a call resolved to: looked up by its `alias.tool` address in the list the call was made
+ * against (`InvokeOpts.offered`), so a tie-break's suffix is the one the model saw. Null when that list does not hold
+ * it. A call can still run then: dispatch checks the mount's tools as they are now (`toolsOf` in `#invoke`), and the
+ * turn's list was fixed when the turn began, so a mount added, or a tool list re-taken, since then runs unnamed.
+ */
+function offeredName(offered: InvokeOpts["offered"], alias: string, tool: string): string | null {
+  const address = `${alias}.${tool}`;
+  return offered?.find((t) => t.address === address)?.name ?? null;
+}
 
 /** Whether two stored tool lists are the same record: what a re-take compares before it writes (`refreshMountTools`). */
 function sameSnapshot(a: ToolSnapshot | null | undefined, b: ToolSnapshot | null | undefined): boolean {
@@ -869,6 +887,7 @@ export class ToolGateway {
       taskId: ctx.taskId,
       mountAlias: r.mount.alias,
       tool: `${r.mount.plugin}.${r.tool}`,
+      modelName: offeredName(opts.offered, r.mount.alias, r.tool),
       toolVersion: r.mount.toolVersion,
     });
 
@@ -1099,7 +1118,7 @@ export class ToolGateway {
     ctx: CallContext,
     i: { alias: string; tool: string; state: Json; operationId?: string },
     answer: Json,
-    opts: { callId?: string } = {},
+    opts: { callId?: string; offered?: InvokeOpts["offered"] } = {},
   ): Promise<ToolResult> {
     const mount = await this.#store.getMountByAlias(ctx.tenantId, ctx.agentId, i.alias);
     const plugin = mount ? this.#plugins.get(mount.plugin) : undefined;
@@ -1118,7 +1137,7 @@ export class ToolGateway {
       const operationId = `op_${randomUUID().replace(/-/g, "").slice(0, 20)}`;
       await this.#store.recordOperation({
         operationId, tenantId: ctx.tenantId, agentId: ctx.agentId, taskId: ctx.taskId,
-        mountAlias: mount.alias, tool: `${mount.plugin}.${i.tool}`, toolVersion: mount.toolVersion,
+        mountAlias: mount.alias, tool: `${mount.plugin}.${i.tool}`, modelName: offeredName(opts.offered, mount.alias, i.tool), toolVersion: mount.toolVersion,
       });
       const facts = () => (opts.callId === undefined ? {} : { callId: opts.callId });
       // Recorded as a step of its own, but the plugin is told the operation it continues: a resume is the same

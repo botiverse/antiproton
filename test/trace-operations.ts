@@ -13,6 +13,7 @@ import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { SqliteStore } from "../src/store/sqlite.ts";
 import { DurableObjectStore } from "../src/store/durable-object.ts";
 import { pendingTrace } from "../src/trace/outbox.ts";
+import { activityEvents } from "../src/runtime/activity.ts";
 import { answerEnded, answerVerdict, operationEnded, operationVerdict } from "../src/trace/seams.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
@@ -45,8 +46,40 @@ const BACKENDS = {
 
 const OP = {
   operationId: "op_1", tenantId: "t", agentId: "a", taskId: "k",
-  mountAlias: "svc", tool: "svc.go", toolVersion: "1.0.0",
+  mountAlias: "svc", tool: "svc.go", modelName: "svc__go2", toolVersion: "1.0.0",
 };
+
+/** The operations table as it was before `model_name`, holding one row written then: what an existing object opens with. */
+const OLD_OPERATIONS = [
+  `CREATE TABLE operations (
+     operation_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL, task_id TEXT NOT NULL,
+     mount_alias TEXT NOT NULL, tool TEXT NOT NULL, tool_version TEXT NOT NULL, status TEXT NOT NULL,
+     result_ref TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
+  `INSERT INTO operations VALUES ('op_old', 't', 'a', 'k', 'svc', 'svc.go', '1.0.0', 'pending', NULL, 1, 1)`,
+];
+const OLD_BACKENDS = {
+  sqlite: async () => {
+    const path = join(mkdtempSync(join(tmpdir(), "trace-ops-")), "store.sqlite");
+    const before = new DatabaseSync(path);
+    for (const q of OLD_OPERATIONS) before.exec(q);
+    before.close();
+    const s = new SqliteStore(path); await s.init();
+    const db = new DatabaseSync(path);
+    const sql = { exec: (q: string, ...b: unknown[]) => {
+      const st = db.prepare(q);
+      const rows = st.columns().length ? st.all(...(b as any[])) : (st.run(...(b as any[])), []);
+      return { toArray: () => rows };
+    } };
+    return { store: s as any, sql: sql as any };
+  },
+  "durable-object": async () => {
+    const host = sqliteHost();
+    for (const q of OLD_OPERATIONS) host.sql.exec(q);
+    const s = new DurableObjectStore({ storage: { sql: host.sql, transactionSync: host.transactionSync } } as any);
+    await s.init();
+    return { store: s as any, sql: host.sql };
+  },
+} as const;
 
 for (const backend of Object.keys(BACKENDS) as Array<keyof typeof BACKENDS>) {
   await check(`an operation's end leaves a tool.call row that joins back to it (${backend})`, async () => {
@@ -72,6 +105,23 @@ for (const backend of Object.keys(BACKENDS) as Array<keyof typeof BACKENDS>) {
     must(row.tenantId === "t" && row.agentId === String(fact.agent_id), "the row lost its owner");
     must(row.attrs.tool === "svc.go" && row.attrs.mount === "svc" && row.attrs.task === String(fact.task_id)
       && row.attrs.callId === "toolu_9", `attrs ${JSON.stringify(row.attrs)}`);
+    // The name the model called it by, as dispatch recorded it, on the record and on its row.
+    must(row.attrs.name === "svc__go2", `attrs ${JSON.stringify(row.attrs)}`);
+    must((await store.getOperation("t", "op_1"))?.modelName === "svc__go2", "the record lost the name");
+  });
+
+  await check(`an operations table from before model_name gains it, and its old row ends with no name (${backend})`, async () => {
+    const { store, sql } = await OLD_BACKENDS[backend]();
+    must((await store.getOperation("t", "op_old"))?.modelName === null, "an old row reads back a name");
+    await store.completeOperation("t", "op_old", "succeeded", null);
+    const old = pendingTrace(sql, 0).rows.find((x) => x.spanId === "op_old");
+    must(old && !("name" in old.attrs) && old.attrs.tool === "svc.go", `the old row's trace: ${JSON.stringify(old)}`);
+    const ev = activityEvents("a", [old]);
+    must(ev.length === 2 && ev.every((e) => e.toolName === "svc.go"), `reported: ${JSON.stringify(ev)}`);
+    // And a new call on the same table records its name.
+    await store.recordOperation({ ...OP, operationId: "op_new" });
+    await store.completeOperation("t", "op_new", "succeeded", null);
+    must(pendingTrace(sql, 0).rows.find((x) => x.spanId === "op_new")?.attrs.name === "svc__go2", "a new row on the migrated table has no name");
   });
 
   await check(`an operation ends once: a second completion writes no second row; the end carries exitCode and runMs (${backend})`, async () => {

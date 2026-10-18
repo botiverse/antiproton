@@ -1230,8 +1230,9 @@ for (const engine of (process.env.ENGINES ?? "pi085,pd").split(",").filter((e) =
     const start = marked.filter((e) => e.hookEventName === "SubagentStart");
     must(start.length === 1 && show(start[0]!.subagent) === show({ ...lin, phase: "started" }), `SubagentStart: ${show(start)}`);
     const steps = marked.filter((e) => e.hookEventName === "PreToolUse" || e.hookEventName === "PostToolUse");
-    // Named as the agent's own steps are named (`hookEvents`: `<mount>__<tool>` from the row).
-    must(steps.length === 2 && steps.every((e) => /^chat__.*peek$/.test(String(e.toolName)) && show(e.subagent) === show({ ...lin, phase: "active" })), `child steps: ${show(steps)}`);
+    // Named as the agent's own steps are named (`toolCallEvents`): the name the child was offered and called, recorded
+    // when its call was dispatched, not the row's address (`chatter.peek`).
+    must(steps.length === 2 && steps.every((e) => e.toolName === "chat__peek" && show(e.subagent) === show({ ...lin, phase: "active" })), `child steps: ${show(steps)}`);
     // The same pairing and outcome fields as the agent's own steps (`toolCallEvents`), beside the marker, not in it.
     must(steps[0]?.toolUseId !== undefined && steps[0].toolUseId === steps[1]?.toolUseId && !("ok" in steps[0]) && steps[1]?.ok === true
       && typeof steps[1]?.durationMs === "number", `child steps' toolUseId / ok: ${show(steps)}`);
