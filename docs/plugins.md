@@ -721,16 +721,17 @@ change.
   `MCP_UNAVAILABLE_LINES` (20) and one line counting the rest. The listing
   works them out by running the kernel's own admission (`admitTools`) on the
   list it returns. Every connector-supplied name in these lines (a server's, a
-  remote tool's) is cleaned and quoted (`promptName`): control and format
-  characters (line breaks, the Unicode line separators, bidi controls) become a
-  space, it is cut to 64 characters, and it is written as a JSON string, so a
-  name cannot start a line of its own in the system prompt. On pi085 a change reaches a conversation under way as a
+  remote tool's) is the SDK's prompt form (`formatMcpPromptName`, which
+  `formatMcpReconnectRequired` uses too): control and format characters made a
+  space, one line, cut at 80 characters, quoted as a JSON string, so a name
+  cannot start a line of its own in the system prompt. On pi085 a change reaches a conversation under way as a
   notice (src/runtime/prompt-context.ts).
 - *Calls and results.* A call sends the catalogue entry and the model's
   arguments once (`raft.mcp.call`), with a 60 s bound (`MCP_CALL_TIMEOUT_MS`)
-  rather than the mount's `timeoutMs`: Raft's gateway gives the remote server
-  about 20 s to connect and 20 s to answer, and a call cut short sooner would
-  read as `outcome_unknown` while Raft completes it. Nothing above the plugin
+  rather than the mount's `timeoutMs`: Raft's gateway aborts the remote
+  server's connect and call together after about 20 s and then answers, and a
+  call cut short near that would read as `outcome_unknown` while Raft completes
+  or answers it. The SDK sets no timeout of its own. Nothing above the plugin
   bounds the wait (the gateway sets no deadline; run_js's dynamic worker
   counts CPU time). A `result` is the tool result (`content`,
   and `structuredContent` when there is one). A `tool_error` is a failed call

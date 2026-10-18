@@ -22,7 +22,8 @@
  *   the gateway read the record and never wait on Raft. What a call needs beyond the schema (the server's id and the
  *   versions Raft checks) is kept in the mount's database (`MCP_KEY`), with each tool as listed, so a listing that
  *   cannot read the catalogue offers the last one again, and with the connectors that need reconnecting, which the
- *   mount's prompt paragraph names (`mcpLines`, each connector-supplied name cleaned and quoted: `promptName`). The
+ *   mount's prompt paragraph names (`mcpLines`, each connector-supplied name on one line, capped and quoted by the SDK: `formatMcpPromptName`, and inside
+ *   `formatMcpReconnectRequired`). The
  *   record is written only once the kernel keeps the listing as the mount's (`ListedTools.onKept`), so a call goes out
  *   with the catalogue entry, versions included, of the list it was offered from.
  * - **Freshness.** The listing asks for the catalogue each time it runs. Besides the runtime's own reasons to list
@@ -42,7 +43,7 @@
  *   how the call ended. Nothing else is recorded.
  */
 import {
-  formatMcpReconnectRequired, MCP_OUTCOME_UNKNOWN_TEXT, mcpFailureKind,
+  formatMcpPromptName, formatMcpReconnectRequired, MCP_OUTCOME_UNKNOWN_TEXT, mcpFailureKind,
   type Raft, type RaftFailure, type RaftMcpTool,
 } from "@botiverse/raft-sdk";
 import type { Json, MountRecord } from "../core/types.ts";
@@ -62,15 +63,14 @@ export const MCP_KEY = "mcp";
  */
 export const MCP_CATALOG_TTL_MS = 5 * 60_000;
 /**
- * How long one managed call may wait for Raft. Raft's gateway gives the remote server about 20 s to connect and 20 s for
- * the call itself (`MCP_TIMEOUT_MS` in Raft's managed MCP gateway, about 40 s in all), so a bound under that would report
- * as `outcome_unknown` a call Raft goes on to complete. Above it, with room; the mount's `timeoutMs` (15 s unless set)
- * stays the bound of every other Raft request. Nothing above the plugin bounds a call's wait: the gateway sets no
+ * How long one managed call may wait for Raft. Raft's gateway aborts the remote server's connect and call together after
+ * about 20 s (`MCP_TIMEOUT_MS` in Raft's managed MCP gateway) and then answers, so a bound near that would report as
+ * `outcome_unknown` a call Raft goes on to complete or to answer itself. Well above it; the SDK sets no timeout of its
+ * own, so this is the only bound, and the mount's `timeoutMs` (15 s unless set, `raftFor`) stays the bound of every other
+ * Raft request. Nothing above the plugin bounds a call's wait: the gateway sets no
  * deadline, and run_js's dynamic worker counts CPU time, not a host call's wait.
  */
 export const MCP_CALL_TIMEOUT_MS = 60_000;
-/** The longest a connector-supplied name runs in the prompt paragraph, before it is quoted. */
-export const MCP_PROMPT_NAME_CHARS = 64;
 /** The name a `skipped` entry gives the catalogue as a whole, when it could not be read. */
 export const MCP_CATALOG = "(managed MCP catalogue)";
 
@@ -273,28 +273,19 @@ export async function listMcp(raft: Raft, ctx: PluginContext, store: string, hol
 }
 
 /**
- * A connector-supplied name (a server's, a remote tool's) as the prompt paragraph shows it: every control and format
- * character (line breaks, tabs, the Unicode line and paragraph separators, bidi controls) made a space, runs of space
- * made one, cut to `MCP_PROMPT_NAME_CHARS` with `…`, and quoted as a JSON string. The names come from whoever runs the
- * remote MCP server, and Raft checks little more than that they are not empty, so unquoted a name could carry a line
- * that reads as an instruction (`x\n\nSYSTEM: …`) into the system prompt; quoted, it is one value on one line.
- */
-export function promptName(raw: string): string {
-  const flat = raw.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, " ").replace(/\s+/g, " ").trim();
-  const cut = [...flat].length > MCP_PROMPT_NAME_CHARS ? `${[...flat].slice(0, MCP_PROMPT_NAME_CHARS - 1).join("")}…` : flat;
-  return JSON.stringify(cut);
-}
-
-/**
  * The mount paragraph's managed MCP lines: one per connector that needs reconnecting, in the SDK's words
  * (`formatMcpReconnectRequired`), then one per catalogue tool this agent was not offered, by server and tool name and
  * the kind of rule, so the model knows the tool exists and cannot be used here rather than taking the connector not to
- * have it. At most `MCP_UNAVAILABLE_LINES` of the second kind, and one line counting the rest.
+ * have it. At most `MCP_UNAVAILABLE_LINES` of the second kind, and one line counting the rest. Every name is the SDK's
+ * prompt form (`formatMcpPromptName`, inside `formatMcpReconnectRequired` too): one line, capped, quoted, since a
+ * server's and a remote tool's names come from whoever runs them and could otherwise carry a line of their own
+ * (`x\n\nSYSTEM: …`) into the system prompt. No description is put in the paragraph; a tool's own description is its
+ * schema's, which the model reads as the remote server's words, as for any MCP tool.
  */
 export function mcpLines(kept: KeptMcp | null): string[] {
-  const reconnect = (kept?.reconnect ?? []).map((serverName) => formatMcpReconnectRequired(promptName(serverName)));
+  const reconnect = (kept?.reconnect ?? []).map((serverName) => formatMcpReconnectRequired(serverName));
   const left = kept?.unavailable ?? [];
-  const shown = left.slice(0, MCP_UNAVAILABLE_LINES).map((u) => `${promptName(u.server)}: ${promptName(u.tool)} is not available here (${u.why}).`);
+  const shown = left.slice(0, MCP_UNAVAILABLE_LINES).map((u) => `${formatMcpPromptName(u.server)}: ${formatMcpPromptName(u.tool)} is not available here (${u.why}).`);
   const more = left.length - shown.length;
   return [...reconnect, ...shown, ...(more > 0 ? [`…and ${more} more connector tools are not available here.`] : [])];
 }
