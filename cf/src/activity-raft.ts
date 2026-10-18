@@ -97,9 +97,13 @@ export async function flushActivity(
  * "nothing held" would let the export prune the very rows the next pass needs
  * Each failure is reported, not thrown: the
  * pass goes on and asks for another pass.
+ *
+ * `alsoHold`: a third reader's cursor (cf/src/github-refresh-forward.ts, staged before this runs), so the export
+ * prunes through the lowest of the three. Null: no third reader.
  */
 export async function flushActivityThenTrace(
   gateway: ActivityGateway, sink: TraceSink, sql: Sql, tenantId: string, agentId: string, subagents?: SubagentActivity,
+  alsoHold: number | null = null,
 ): Promise<{ activityError: string | null; traceError: string | null }> {
   let holdThrough: number;
   let activityError: string | null = null;
@@ -112,7 +116,8 @@ export async function flushActivityThenTrace(
   let traceError: string | null = null;
   let days: string[] = [];
   try {
-    days = (await flushTrace(sink, sql, tenantId, agentId, 500, Date.now, holdThrough)).days;
+    const hold = alsoHold === null ? holdThrough : Math.min(holdThrough, alsoHold);
+    days = (await flushTrace(sink, sql, tenantId, agentId, 500, Date.now, hold)).days;
   } catch (e) {
     traceError = String((e as { message?: unknown })?.message ?? e).slice(0, 200);
   }

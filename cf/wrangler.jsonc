@@ -49,6 +49,10 @@
       { "queue": "antiproton-model-dlq", "max_batch_size": 10, "max_batch_timeout": 5 }
     ]
   },
+  // Forwarding `github.refresh` trace rows to Raft's trace-upload worker (cf/src/github-refresh-forward.ts) is off
+  // until BOTH of these are set, and neither is written here: GITHUB_REFRESH_INGEST_URL (the worker's base URL, a
+  // var or a secret) and GITHUB_REFRESH_INGEST_TOKEN (its dedicated write-only token, a secret only:
+  // `wrangler secret put GITHUB_REFRESH_INGEST_TOKEN --config cf/wrangler.jsonc`). docs/runbook.md, "Forwarding github.refresh rows".
   "vars": {
     "DEEPSEEK_BASE_URL": "https://api.deepseek.com",
     // The window is looked up from this name rather than configured beside it:
@@ -97,7 +101,10 @@
     // warning here applies to holders that report none. Plain vars, never secrets: a
     // secret of the same name would outlive a deploy that changed these.
     "RUN9_WARN_MINUTES": "5",
-    "RUN9_MAX_IDLE_MINUTES": "30"
+    "RUN9_MAX_IDLE_MINUTES": "30",
+    // Which deployment this is: what a forwarded `github.refresh` row says in its `env` column
+    // (cf/src/github-refresh-forward.ts).
+    "DEPLOYMENT_ENV": "production"
   },
   // Once a day, 03:17 UTC: the usage ledger's retention, whole days of
   // hours past KEEP_HOURLY_DAYS folded into usage_daily (`scheduled` in src/index.ts).
