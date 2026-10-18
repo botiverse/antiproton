@@ -13,8 +13,9 @@
  * at DeepSeek directly, and through the gateway's /compat for a DeepSeek and an OpenAI model. The OpenAI model is
  * a reasoning one, called through the Responses API (src/model/openai-responses.ts) with a Responses reply, and
  * one more case pins its own earlier reasoning item being replayed.
- * Beside them, the tool-less shapes (no `tools`, or an empty set: no `tools` key is sent), and a job whose options
- * ask a tool choice, which the consumer does not forward. The providers are
+ * Beside them, the tool-less shapes (no `tools`, or an empty set: no `tools` key is sent), a job whose options
+ * ask a tool choice, which the consumer does not forward, and a profile's job, marked with its reasoning level and
+ * output cap, which the consumer does. The providers are
  * declared here, not read from cf/wrangler*.jsonc, so a change to a deployment's providers does not move these
  * literals; a change to how a declared provider is called does.
  *
@@ -22,6 +23,7 @@
  * provider is sent should ever paste it.
  */
 import { callQueuedModel, type ModelEnv } from "../cf/src/model-request.ts";
+import { RAFTBENCH_MAX_TOKENS } from "../src/plugins/raftbench.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void> | void) {
@@ -200,6 +202,18 @@ const CASES: Array<{ name: string; env: ModelEnv; job: unknown; reply?: string; 
     
     request: String.raw`{"url":"https://gateway.ai.cloudflare.com/v1/acct/gw/compat/chat/completions","method":"POST","headers":[["authorization","Bearer sk-snapshot-deepseek"],["cf-aig-authorization","Bearer snapshot-gateway-token"],["content-type","application/json"]],"body":"{\"model\":\"deepseek/deepseek-flash\",\"messages\":[{\"role\":\"system\",\"content\":\"You are a careful agent.\"},{\"role\":\"user\",\"content\":\"Read https://example.com\"},{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"url\\\":\\\"https://example.com\\\"}\"}}]},{\"role\":\"tool\",\"tool_call_id\":\"call_1\",\"content\":\"Example Domain\"},{\"role\":\"system\",\"content\":\"Updated system prompt section \\\"time\\\":\\n\\n<time>2026-10-05</time>\"},{\"role\":\"user\",\"content\":\"summarise\"}],\"max_tokens\":32768,\"temperature\":0,\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"read\",\"description\":\"Read a page\",\"parameters\":{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\"}},\"required\":[\"url\"]}}},{\"type\":\"function\",\"function\":{\"name\":\"run_js\",\"description\":\"Run code\",\"parameters\":{\"type\":\"object\",\"properties\":{\"code\":{\"type\":\"string\"},\"timeout\":{\"type\":\"number\"}}}}}]}"}`,
     answer: String.raw`{"role":"assistant","content":[{"type":"thinking","thinking":"Short trace."},{"type":"text","text":"Summarising."},{"type":"toolCall","id":"call_2","name":"run_js","arguments":{"code":"1+1"}}],"api":"offloaded","provider":"openai-compatible","model":"deepseek/deepseek-flash","usage":{"input":120,"output":30,"cacheRead":64,"cacheWrite":0,"reasoning":9,"totalTokens":150,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"toolUse","rawStopReason":"tool_calls","jobId":"mj_2"}` },
+  // A profile's job (src/runtime/agent-profile.ts), marked by `AgentRuntime.takeJob`: its output cap and its reasoning
+  // level reach the provider as DeepSeek's `max_tokens` and `reasoning_effort`; every case above carries neither mark,
+  // and is sent no reasoning field and the client's own cap.
+  { name: "deepseek, version 1 with no tools, a raftbench_service job (reasoning low, its output cap)", env: ENV,
+    job: { ...job(V1_NO_TOOLS), reasoning: "low", maxTokens: RAFTBENCH_MAX_TOKENS },
+    request: String.raw`{"url":"https://api.deepseek.com/chat/completions","method":"POST","headers":[["authorization","Bearer sk-snapshot-deepseek"],["content-type","application/json"]],"body":"{\"model\":\"deepseek-flash\",\"messages\":[{\"role\":\"system\",\"content\":\"You are a careful agent.\"},{\"role\":\"user\",\"content\":\"Read https://example.com\"},{\"role\":\"assistant\",\"content\":\"Reading.\",\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"url\\\":\\\"https://example.com\\\"}\"}}]},{\"role\":\"tool\",\"tool_call_id\":\"call_1\",\"content\":\"Example Domain\"},{\"role\":\"user\",\"content\":\"And now summarise.\"}],\"max_tokens\":8192,\"temperature\":0,\"reasoning_effort\":\"low\"}"}`,
+    answer: String.raw`{"role":"assistant","content":[{"type":"thinking","thinking":"Short trace."},{"type":"text","text":"Summarising."},{"type":"toolCall","id":"call_2","name":"run_js","arguments":{"code":"1+1"}}],"api":"offloaded","provider":"openai-compatible","model":"deepseek-flash","usage":{"input":120,"output":30,"cacheRead":64,"cacheWrite":0,"reasoning":9,"totalTokens":150,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"toolUse","rawStopReason":"tool_calls","jobId":"mj_2"}` },
+  // The same job asked again without reasoning (`PluginNext.reasoning`, after an empty reply at the cap).
+  { name: "deepseek, version 1 with no tools, a raftbench_service job asked again with reasoning off", env: ENV,
+    job: { ...job(V1_NO_TOOLS), reasoning: "off", maxTokens: RAFTBENCH_MAX_TOKENS },
+    request: String.raw`{"url":"https://api.deepseek.com/chat/completions","method":"POST","headers":[["authorization","Bearer sk-snapshot-deepseek"],["content-type","application/json"]],"body":"{\"model\":\"deepseek-flash\",\"messages\":[{\"role\":\"system\",\"content\":\"You are a careful agent.\"},{\"role\":\"user\",\"content\":\"Read https://example.com\"},{\"role\":\"assistant\",\"content\":\"Reading.\",\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"url\\\":\\\"https://example.com\\\"}\"}}]},{\"role\":\"tool\",\"tool_call_id\":\"call_1\",\"content\":\"Example Domain\"},{\"role\":\"user\",\"content\":\"And now summarise.\"}],\"max_tokens\":8192,\"temperature\":0,\"thinking\":{\"type\":\"disabled\"}}"}`,
+    answer: String.raw`{"role":"assistant","content":[{"type":"thinking","thinking":"Short trace."},{"type":"text","text":"Summarising."},{"type":"toolCall","id":"call_2","name":"run_js","arguments":{"code":"1+1"}}],"api":"offloaded","provider":"openai-compatible","model":"deepseek-flash","usage":{"input":120,"output":30,"cacheRead":64,"cacheWrite":0,"reasoning":9,"totalTokens":150,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"toolUse","rawStopReason":"tool_calls","jobId":"mj_2"}` },
 ];
 
 for (const c of CASES) {

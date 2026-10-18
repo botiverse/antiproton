@@ -1,6 +1,7 @@
 import type { Json, MountPolicy, MountRecord } from "../core/types.ts";
 import type { AnswerSpec } from "../core/execution.ts";
 import type { PluginTraceKind, TraceVerdict } from "../trace/outbox.ts";
+import type { AnswerErrorCode } from "../model/pi-bridge.ts";
 
 export interface ToolSchema {
   name: string;
@@ -2344,12 +2345,29 @@ export interface TurnEnd {
   outcome: "completed" | "failed" | "cancelled";
   /** For `failed`: what the model or the run reported. */
   error?: string;
+  /**
+   * For `failed`: the model layer's code for why, when it has one (`AnswerErrorCode`, src/model/pi-bridge.ts) —
+   * `output_limit` when the call spent its whole output cap before writing any answer. Absent for every other failure.
+   */
+  errorCode?: AnswerErrorCode;
 }
 
 /** What a plugin's code asks the runtime to do next, answering {@link Plugin.afterTurn} or {@link Plugin.wake}. */
 export interface PluginNext {
   /** Post this text as a new turn's input on the agent's main conversation. */
   turn?: string;
+  /**
+   * In place of `turn`: post again the input of the main conversation's last turn, as it is, read when this answer is
+   * kept. With `fresh`, the model is sent the request that turn's first call was, so a call can be asked again without
+   * the plugin keeping a copy of what it sent. Nothing is posted when that conversation holds no turn input.
+   */
+  again?: true;
+  /**
+   * With `fresh`: the reasoning level of every model call of the conversation it starts, in place of the agent's own
+   * (its profile's, src/runtime/agent-profile.ts), sent in the provider's dialect (`OpenAiCompatibleModel.complete`).
+   * The conversation after it is back at the agent's own.
+   */
+  reasoning?: "off" | "low" | "high";
   /** The plugin's name for that turn, handed back as {@link TurnEnd.turnKey} when it ends. */
   turnKey?: string;
   /**

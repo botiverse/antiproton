@@ -9,8 +9,9 @@
  *   the profile's own mount beside `raft`;
  * - **the tools the model is offered**: none (`#turnTools`, cf/src/runtime.ts). The mounts are there for the plugin's
  *   code and for provisioning, not for the model;
- * - **each model call's output cap** (`maxTokens`), marked on every job the agent's model is asked (`takeJob`), and
- *   whether an overflowed conversation is rebuilt with an extra briefing call (`rebuildsContext`);
+ * - **each model call's output cap** (`maxTokens`) and **reasoning level** (`reasoning`), both marked on every job the
+ *   agent's model is asked (`takeJob`), and whether an overflowed conversation is rebuilt with an extra briefing call
+ *   (`rebuildsContext`);
  * - **the system prompt**: the profile's plugin's instructions, alone (`profilePrompt`, src/runtime/pi-prompt.ts) —
  *   not the default prompt, the persona, or any mount's paragraph.
  *
@@ -32,6 +33,13 @@ export interface ProfileSpec {
   /** The output cap of every model call the agent makes (`AgentRuntime.takeJob` marks each job with it). */
   maxTokens: number;
   /**
+   * The reasoning level of every model call the agent makes, marked on each job beside `maxTokens` and sent in the
+   * provider's dialect (`OpenAiCompatibleModel.complete`: DeepSeek's `reasoning_effort`). Reasoning is billed against
+   * `maxTokens` and DeepSeek takes no separate budget for it, so a level below the provider's default is what leaves
+   * room for the answer.
+   */
+  reasoning: "off" | "low" | "high";
+  /**
    * Whether a main conversation that overflowed its window is rebuilt with a briefing (src/runtime/overflow-backstop.ts):
    * that briefing is a model call the agent did not ask for, and a turn of its own.
    */
@@ -48,6 +56,9 @@ export const AGENT_PROFILES = {
   raftbench_service: {
     plugin: "raftbench", alias: "raftbench", instructions: RAFTBENCH_INSTRUCTIONS,
     toolConfig: { mounts: [], harness: "minimal" }, maxTokens: RAFTBENCH_MAX_TOKENS,
+    // DeepSeek's default (thinking on, effort high) spent a whole 8192-token call on reasoning and left no answer
+    // (finishReason length, 8192 reasoning tokens, no text); the same material answered at 3238 on another run.
+    reasoning: "low",
     // Each run starts a conversation of its own, and its plugin counts its model calls: an overflow fails the run.
     rebuildsContext: false,
     // RaftBench keeps only the latest result and no copy of the source text (botiverse/slock#10130).
@@ -70,7 +81,7 @@ export function profileOf(config: unknown): AgentProfile | null {
 export function profileSpec(profile: AgentProfile): ProfileSpec {
   const s = AGENT_PROFILES[profile];
   return {
-    plugin: s.plugin, alias: s.alias, instructions: s.instructions, maxTokens: s.maxTokens, rebuildsContext: s.rebuildsContext,
+    plugin: s.plugin, alias: s.alias, instructions: s.instructions, maxTokens: s.maxTokens, reasoning: s.reasoning, rebuildsContext: s.rebuildsContext,
     keepsConversations: s.keepsConversations,
     toolConfig: { mounts: [...s.toolConfig.mounts], harness: s.toolConfig.harness },
   };

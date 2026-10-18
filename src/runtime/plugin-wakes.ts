@@ -15,7 +15,9 @@
  * - **a turn a hook asked for**, by its run's operation id, with the mount and the key it gave, so its end is told to
  *   that mount with that key (`TurnEnd.turnKey`) and to every other mount as a turn it did not ask for. The key is
  *   written down (`plugin_turn_asked`) in the same synchronous step as the post's write, before the run's id is known,
- *   and bound to it once it is; an eviction between the two is bound when the run's end is recorded.
+ *   and bound to it once it is; an eviction between the two is bound when the run's end is recorded;
+ * - **a conversation's reasoning level** a hook set for the main conversation its `fresh` turn starts
+ *   (`PluginNext.reasoning`), by that conversation's id, made only by the first hook that sets one.
  */
 import type { PluginNext, TurnEnd } from "../plugins/types.ts";
 
@@ -134,9 +136,30 @@ export function forgetTurnText(sql: Sql) {
 
 /** An answer whose turn or erase waits for the main conversation to be free, kept as only those. */
 export function keepTurnOnly(sql: Sql, seq: number, next: PluginNext) {
-  const { turn, turnKey, fresh, forget } = next;
+  const { turn, turnKey, fresh, forget, reasoning } = next;
   sql.exec("UPDATE plugin_answers SET body = ? WHERE seq = ?",
-    JSON.stringify({ turn, ...(turnKey ? { turnKey } : {}), ...(fresh ? { fresh } : {}), ...(forget ? { forget } : {}) }), seq);
+    JSON.stringify({ turn, ...(turnKey ? { turnKey } : {}), ...(fresh ? { fresh } : {}), ...(forget ? { forget } : {}), ...(reasoning ? { reasoning } : {}) }), seq);
+}
+
+/**
+ * The reasoning level a plugin set for one main conversation (`PluginNext.reasoning`), by that conversation's id
+ * (cf/src/fresh-context.ts `currentMainId`): written before the turn that starts it is posted, read for each of its
+ * model calls (`AgentRuntime.takeJob`). A conversation with no row runs at the agent's own level.
+ */
+export function setConversationReasoning(sql: Sql, conversation: string, reasoning: "off" | "low" | "high", now: number) {
+  sql.exec("CREATE TABLE IF NOT EXISTS plugin_conversation_reasoning (conversation TEXT PRIMARY KEY, reasoning TEXT NOT NULL, at INTEGER NOT NULL)");
+  sql.exec("INSERT OR REPLACE INTO plugin_conversation_reasoning (conversation, reasoning, at) VALUES (?, ?, ?)", conversation, reasoning, now);
+}
+
+export function conversationReasoning(sql: Sql, conversation: string): "off" | "low" | "high" | undefined {
+  if (!keepsPluginCalls(sql)) return undefined;
+  try {
+    const r = String(sql.exec("SELECT reasoning FROM plugin_conversation_reasoning WHERE conversation = ?", conversation).toArray()[0]?.reasoning ?? "");
+    return r === "off" || r === "low" || r === "high" ? r : undefined;
+  } catch (e) {
+    if (/no such table/i.test(String((e as Error)?.message ?? e))) return undefined;
+    throw e;
+  }
 }
 
 export function markAnswerPosting(sql: Sql, seq: number) {
@@ -152,7 +175,7 @@ export function dropAnswer(sql: Sql, seq: number) {
  * model's, a cancel when the run or the message was aborted, a failure when either says so.
  */
 export function turnEndOf(status: string, last: unknown): Omit<TurnEnd, "turnId" | "turnKey"> {
-  const m = last && typeof last === "object" ? last as { role?: unknown; content?: unknown; stopReason?: unknown; errorMessage?: unknown } : null;
+  const m = last && typeof last === "object" ? last as { role?: unknown; content?: unknown; stopReason?: unknown; errorMessage?: unknown; errorCode?: unknown } : null;
   const mine = m?.role === "assistant";
   const text = mine && Array.isArray(m!.content)
     ? m!.content.filter((c: any) => c?.type === "text" && typeof c.text === "string").map((c: any) => c.text as string).join("")
@@ -161,7 +184,7 @@ export function turnEndOf(status: string, last: unknown): Omit<TurnEnd, "turnId"
   if (status === "aborted" || (mine && m!.stopReason === "aborted")) return { finalText, outcome: "cancelled" };
   if (status === "failed" || (mine && m!.stopReason === "error")) {
     const error = mine && typeof m!.errorMessage === "string" && m!.errorMessage.trim() ? m!.errorMessage : `the run ended ${status}`;
-    return { finalText, outcome: "failed", error: error.slice(0, 300) };
+    return { finalText, outcome: "failed", error: error.slice(0, 300), ...(mine && m!.errorCode === "output_limit" ? { errorCode: "output_limit" as const } : {}) };
   }
   return { finalText, outcome: "completed" };
 }

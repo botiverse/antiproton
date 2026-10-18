@@ -321,7 +321,15 @@ function usageOf(res: ModelResponse): Usage {
  * "the field is still there when it is read back" is said by the type, not
  * only by the test that reads the stored entry.
  */
-export type AnsweredMessage = AssistantMessage & { jobId?: string; providerError?: string };
+export type AnsweredMessage = AssistantMessage & { jobId?: string; providerError?: string; errorCode?: AnswerErrorCode };
+
+/**
+ * Why a failed answer failed, where the model layer knows it as a fact rather than as text: `output_limit`, the call
+ * spent its whole output cap (reasoning included) before writing any answer. Read by the turn's end
+ * (`TurnEnd.errorCode`, src/runtime/plugin-wakes.ts `turnEndOf`), so a caller acting on it never parses `errorMessage`,
+ * which is free text the harness's retry check also scans.
+ */
+export type AnswerErrorCode = "output_limit";
 
 /**
  * `jobId` is the trace spine's one durable link from an answer back to the
@@ -365,6 +373,7 @@ export function fromResponse(
         model),
       usage: usageOf(res),
       rawStopReason: res.finishReason,
+      errorCode: "output_limit",
       ...(jobId ? { jobId } : {}),
     };
   }
