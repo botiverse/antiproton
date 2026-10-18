@@ -1510,7 +1510,8 @@ What is never there: a span still open (a model call awaiting its answer, a tool
 anything the trace does not record (`src/trace/outbox.ts` names the documented silences). Each row is
 as exported: `{ seq, at, tenantId, agentId, kind, spanId, parentId?, status, verdict, ms?, attrs }`.
 A `model.call` row's `attrs` carry `model`, `session` (the conversation that made the call: `main`, an Agents API
-session, or a subagent's `sub_…`) and the answer's `input`, `output`, `cacheRead` and `cacheWrite` tokens;
+session, or a subagent's `sub_…`) and the answer's `input`, `output`, `cacheRead` and `cacheWrite` tokens, and
+`reasoning` (the part of `output` spent reasoning) when the provider reported any;
 on the pi085 engine also `prefix` (`src/runtime/request-prefix.ts`): the sha256 of the system prompt
 and of the tool list, the request's message count and characters, how many leading messages (and their
 characters) are the previous request's byte for byte, and `broken` — `system`, `tools`, `message`, or

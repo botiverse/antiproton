@@ -36,7 +36,7 @@ function worker(agent: PiAgent) {
     pending(host: ReturnType<typeof sqliteHost>) {
       return host.sql.exec("SELECT id FROM pi_model_jobs WHERE answer IS NULL").toArray() as any[];
     },
-    answer(id: string, res: Partial<{ text: string; toolCalls: any[] }>) {
+    answer(id: string, res: Partial<{ text: string; toolCalls: any[]; reasoningTokens: number }>) {
       const request = agent.takeJob(id);
       if (!request) throw new Error(`job ${id} was not available`);
       seen.push(request);
@@ -44,7 +44,7 @@ function worker(agent: PiAgent) {
       agent.deliver(id, fromResponse({
         text: res.text ?? "", finishReason: res.toolCalls ? "tool_calls" : "stop",
         truncated: false, toolCalls: res.toolCalls,
-        usage: { promptTokens: 1, completionTokens: 1, reasoningTokens: 0, cachedPromptTokens: 0 },
+        usage: { promptTokens: 1, completionTokens: 1, reasoningTokens: res.reasoningTokens ?? 0, cachedPromptTokens: 0 },
       } as any, { api: "offloaded", provider: MODEL.provider, id: MODEL.id }, id));
     },
   };
@@ -362,6 +362,26 @@ await check("an answered call leaves a model.call row that joins back to its job
   if (row.status !== "stop" || row.verdict !== "ok") throw new Error(`status ${row.status} verdict ${row.verdict}`);
   if (row.tenantId !== "t1" || row.agentId !== "a1") throw new Error("the row lost its owner");
   if (row.attrs.model !== MODEL.id) throw new Error(`attrs ${JSON.stringify(row.attrs)}`);
+  await f.agent.close();
+});
+
+await check("a model.call row carries the answer's reasoning tokens when the provider reported them, and none when not", async () => {
+  // The usage ledger has had them (src/usage/outbox.ts) but only as an hourly sum; the row is where one call's
+  // reasoning share is read. Unreported (the worker's 0) is no key at all, not a 0 that reads as a measurement.
+  const f = await fixture(undefined, { tenantId: "t1", agentId: "a1" });
+  await f.agent.say("hello");
+  await f.agent.step();
+  const [first] = f.w.pending(f.host);
+  f.w.answer(first!.id, { toolCalls: [{ id: "c1", name: "demo__lookup", arguments: { q: "x" } }], reasoningTokens: 42 });
+  await f.agent.step();
+  const [second] = f.w.pending(f.host);
+  if (!second) throw new Error("no second call after the tool result");
+  f.w.answer(second.id, { text: "done" });
+  for (let i = 0; i < 5 && (await f.agent.step()).open !== 0; i++) { /* settle */ }
+  const calls = pendingTrace(f.host.sql, 0).rows.filter((r) => r.kind === "model.call");
+  const by = new Map(calls.map((r) => [r.spanId, r.attrs]));
+  if (by.get(first!.id)?.reasoning !== 42 || by.get(first!.id)?.output !== 1) throw new Error(`first call: ${JSON.stringify(by.get(first!.id))}`);
+  if (!by.has(second.id) || "reasoning" in by.get(second.id)!) throw new Error(`second call: ${JSON.stringify(by.get(second.id))}`);
   await f.agent.close();
 });
 
