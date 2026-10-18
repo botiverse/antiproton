@@ -9,7 +9,8 @@
  * has ended (`#settleBehaviour`), one `rebuild.behaviour` row is written (`summariseBehaviour`, `recordBehaviour`) and
  * the watch dropped:
  *
- *   - `firstSendMs`: from the wake to the first message the agent sent (`isSendTool`), null when it sent none;
+ *   - `firstSendMs`: from the wake to the first message the agent sent (`isSendTool`, a call that succeeded), null when
+ *     it sent none (a send Raft refused is not one);
  *   - `toolCallsBeforeSend`, `recapCallsBeforeSend`: the calls before that send (all of them when none), and how many
  *     of those re-read what the old context held (`isRecapTool`: memory and state reads, message history reads);
  *   - `firstAction`: `recap`, `send` or `act`, the run's first tool call that is not an inbox read, or null;
@@ -52,8 +53,14 @@ export const callKey = (name: string, args: unknown) =>
 
 interface Call {
   name: string; args: unknown; id: string; at: number; ok: boolean | null; endedAt: number | null;
-  /** A message went out: a messaging tool, or a program (`run_js`) whose result reports a send it made (`sendsReported`). */
+  /**
+   * A message went out: a messaging tool's call that succeeded, or a program (`run_js`) whose result reports a send it
+   * made (`sendsReported`). A messaging call that failed (Raft refused it: a 404 channel, a 403) or has no result yet
+   * sent nothing, as a program's failed send is not counted either (`programSendCounter` reads succeeded operations).
+   */
   sends: boolean;
+  /** A messaging tool was called, whatever came of it: what the run chose to do, for `firstAction`. */
+  triedSend: boolean;
 }
 
 /** Every tool call in `entries`, in order, with whether it succeeded and when its result came. */
@@ -75,7 +82,8 @@ function callsOf(entries: readonly BriefingEntry[], programSends: ProgramSends =
       const name = String(p.name ?? "");
       out.push({ name, args: p.arguments ?? {}, id: String(p.id ?? ""), at: Number(m.timestamp ?? e.timestamp),
         ok: r ? r.ok : null, endedAt: r ? r.at : null,
-        sends: isSendTool(name) || (isProgramTool(name) && !!r && r.ok && sendsReported(r.text, programSends(String(p.id ?? ""))).length > 0) });
+        sends: !!r && r.ok && (isSendTool(name) || (isProgramTool(name) && sendsReported(r.text, programSends(String(p.id ?? ""))).length > 0)),
+        triedSend: isSendTool(name) });
     }
   }
   return out;
@@ -124,7 +132,7 @@ export function summariseBehaviour(entries: readonly BriefingEntry[], o: { wakeA
     failedToolCalls: calls.filter((c) => c.ok === false).length,
     toolCallsBeforeSend: before.length,
     recapCallsBeforeSend: before.filter((c) => isRecapTool(c.name)).length,
-    firstAction: !first ? null : first.sends ? "send" : isRecapTool(first.name) ? "recap" : "act",
+    firstAction: !first ? null : first.sends || first.triedSend ? "send" : isRecapTool(first.name) ? "recap" : "act",
     repeatedCalls: repeated(calls),
     repeatedBeforeSend: repeated(before),
     priorActions: prior.size,
