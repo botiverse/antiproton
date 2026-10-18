@@ -205,8 +205,8 @@ database was right. Both fields stay on every row under either rule.
 
 `rewardBasis` on a row is the list it was scored over. `unjudged` names a
 listed component that has criteria this grader cannot check (an NL assertion
-needs a judge model), so the reward stood on the rest; tasks 2, 3 and 4 carry
-`NL_ASSERTION` there.
+needs a judge model), so the reward stood on the rest. Of the eight tasks a
+run takes, tasks 2, 3 and 4 carry `NL_ASSERTION` there.
 
 To read an older record under the current rule, run
 `node bench/tau2/rescore.ts`: it re-grades every record in `manifest.tsv` from
