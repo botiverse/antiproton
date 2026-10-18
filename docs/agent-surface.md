@@ -805,6 +805,15 @@ botiverse/slock#10130 and #10134). Every other Raft POST leaves it out.
   8,192-token cap), because the queue's model call takes no abort. A submission Raft could not confirm is sent again, the same bytes, after 1, 2, 4, 8 and 16 minutes, then
   given up with a `raftbench.run` log line (`outcome: "gave_up…"`, `admin: true`) and nothing else sent. An agent
   without the profile never acts on an assignment: `receive_events` leaves it out and logs `raft.raftbench_dropped`.
+- **Data retention.** Raft's contract is the latest result only, with no copy or history of the source text, and the
+  agent keeps to it. While a run is going, its material and the model's answers exist only in its own conversation (the
+  transcript and its model jobs), plus the result while it is being submitted. When the run ends (accepted, failed,
+  stopped, timed out, or its retries given up), that conversation is erased: its transcript tables, its model jobs
+  (requests and answers), and the model's text in the turn ends kept. Nothing is archived. The next run, or a reread,
+  starts in an empty conversation. The run's own state keeps ids, revision, counters, the deadline and the outcome. A
+  result waiting for a retry keeps its bytes only until the retry succeeds or gives up. Nothing of a run is written to
+  R2: model calls are handed to the queue by id, trace rows carry no content, and the daily friction scan reads none
+  of this agent's conversations. The only copy left anywhere is the result Raft accepted.
 - **What it needs from Raft.** The provider's credential check and push registration (`GET /internal/agent-api`,
   `PUT /internal/agent-api/push-webhook`, and `DELETE` of it on a delete) are refused to the service identity by the
   contract as merged (`raftbench_read_only`); until Raft allows them, the create answers `422 credential_refused`, and

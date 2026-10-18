@@ -1462,7 +1462,8 @@ called for a plugin that does not declare it.
 - **`afterTurn(ctx, { turnId, turnKey, finalText, outcome, error? })`**: a model turn of the agent's main
   conversation has ended — `completed`, `failed` (with what the model or the run reported) or `cancelled` — and
   `finalText` is the model's last text, or null. `turnKey` is the key this mount gave when it asked for the turn, and
-  null for any other turn: a plugin that acts on its own turns ignores the rest. A subagent's turn is not told.
+  null for any other turn: a plugin that acts on its own turns ignores the rest. The key is written down as the turn
+  is posted, so an eviction before its run's id is known still binds it. A subagent's turn is not told.
 - **`wake(ctx)`**: the plugin asked to be called again (`wakeAt` below), or, for the plugin an agent profile names
   (`src/runtime/agent-profile.ts`), a service pushed an event at the agent: under a profile a push is that plugin's to
   act on, and never reaches the model as a message.
@@ -1473,7 +1474,8 @@ Either answers with what it wants next (`PluginNext`), or nothing:
 |---|---|
 | `turn` | posts the text as a new turn's input on the main conversation |
 | `turnKey` | names that turn; its end is told to this mount with the key |
-| `fresh` | posts that turn in a new main conversation, so the model is sent nothing from before it; refused, with a log line, while a run is going |
+| `fresh` | posts that turn in a new main conversation, so the model is sent nothing from before it; while a run is going it waits, kept, for a later pass |
+| `forget` | erases the main conversation: its transcript, its model jobs, and the model's text in the turn ends kept. Under a profile that keeps no conversations, `fresh` erases the one before rather than archiving it |
 | `wakeAt` | calls this mount's `wake` at or after that time (epoch ms); one wake is kept per mount, and an earlier ask wins, so a plugin says the time it needs in every answer |
 | `cancelTurn` | ends the running turn with the runtime's own cancel; its end is told to `afterTurn` as `cancelled`. Its model job is dropped, so a call not yet taken is never made, but one already under way runs to its end |
 
