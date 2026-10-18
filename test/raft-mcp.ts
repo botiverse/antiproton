@@ -181,11 +181,11 @@ await check("a catalogue tool the kernel leaves out is one line in the mount's p
   await w.rt.refreshMountTools("t", "a", "raft");
   const offeredNow = mcpNames(await w.offered()).length;
   const leftCount = tools.length - offeredNow;
-  const said2 = (await paragraph()).split("\n").filter((l) => l.includes("not available here"));
+  const said2 = (await paragraph()).split("\n").filter((l: string) => l.includes("not available here"));
   must(leftCount > MCP_UNAVAILABLE_LINES, `control: only ${leftCount} left out`);
   must(said2.length === MCP_UNAVAILABLE_LINES + 1, `lines: ${said2.length}`);
   must(said2[0] === "Notion: big0 is not available here (its description is too long).", `first: ${said2[0]}`);
-  must(said2.some((l) => /^Notion: t\d+ is not available here \(this agent already has as many tools as it can be offered\)\.$/.test(l)), `the list bound: ${said2.join(" | ")}`);
+  must(said2.some((l: string) => /^Notion: t\d+ is not available here \(this agent already has as many tools as it can be offered\)\.$/.test(l)), `the list bound: ${said2.join(" | ")}`);
   must(said2.at(-1) === `…and ${leftCount - MCP_UNAVAILABLE_LINES} more connector tools are not available here.`, `last: ${said2.at(-1)}`);
   // All offered again: no line.
   tools = [SEARCH];
