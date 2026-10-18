@@ -4916,11 +4916,16 @@ async function unaddressed(request: Request, env: Env, url: URL): Promise<Respon
           if (!t || !a) return Response.json({ error: "tenantId and agentId are required" }, { status: 400 });
           const why = needleProblem(b.needle);
           if (why) return Response.json({ error: why }, { status: 400 });
-          // A failure is answered with a fixed text: an error's message can quote what was being read.
+          // A failure is answered with a fixed text and a reason code naming the step that threw, and logged with the
+          // error's class: an error's message can quote what was being read, so it is never answered or logged.
+          // Right after a deploy the agent's object can still run the previous build while this Worker runs the new one
+          // (an object picks up a deploy when it restarts: `harness.open` `cause=deploy`); its failure is `object_scan`.
+          let stage: "object_scan" | "r2_scan" = "object_scan";
           let out: StorageScan;
           try {
             const tables = await env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a))).adminStorageScan(t, a, b.needle as string);
             if (!tables) return Response.json({ error: "no such agent" }, { status: 404 });
+            stage = "r2_scan";
             const objects = await scanObjects(env.ARTIFACTS as unknown as ScanBucket, agentPrefixes(t, a), b.needle as string);
             out = {
               found: tables.tables.length > 0 || objects.objects > 0, tables: tables.tables, objects: objects.objects,
@@ -4929,9 +4934,9 @@ async function unaddressed(request: Request, env: Env, url: URL): Promise<Respon
               truncated: tables.truncated || objects.truncated,
               complete: !tables.truncated && !objects.truncated && tables.unreadable.length === 0,
             };
-          } catch {
-            logEvent("admin.storage_scan", { tenantId: t, agentId: a, failed: true });
-            return Response.json({ error: "the scan failed" }, { status: 500 });
+          } catch (e) {
+            logEvent("admin.storage_scan", { tenantId: t, agentId: a, failed: true, reason: stage, errorName: errorClassOf(e), build: env.GIT_COMMIT ?? null });
+            return Response.json({ error: "the scan failed", reason: stage }, { status: 500 });
           }
           logEvent("admin.storage_scan", { tenantId: t, agentId: a, found: out.found, truncated: out.truncated, unreadable: out.unreadable.length });
           return Response.json(out);
@@ -5034,6 +5039,12 @@ async function unaddressed(request: Request, env: Env, url: URL): Promise<Respon
     } catch (e: any) {
       return failed(url, e);
     }
+}
+
+/** An error's class, for a log line that must not carry its message: a name made of letters, or `unknown`. */
+export function errorClassOf(e: unknown): string {
+  const name = (e as { name?: unknown } | null)?.name;
+  return typeof name === "string" && /^[A-Za-z][A-Za-z0-9]{0,39}$/.test(name) ? name : "unknown";
 }
 
 /** The first path segment, when it is one that chooses an object; matched whole, so `/agent-x` and `/Agent` are not `/agent`. */
