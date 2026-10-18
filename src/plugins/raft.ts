@@ -22,7 +22,7 @@ import {
   type AgentLoginDeps, type ManifestCache,
 } from "./raft-agent-login.ts";
 import { internalHost } from "./http.ts";
-import { callMcp, isMcpTool, keptMcpOf, listMcp, mcpClock, mcpLines, MCP_CAPABILITY, MCP_KEY, MCP_PREFIX } from "./raft-mcp.ts";
+import { callMcp, isMcpTool, keptMcpOf, leftOut, listMcp, mcpClock, mcpLines, MCP_CAPABILITY, MCP_KEY, MCP_PREFIX } from "./raft-mcp.ts";
 import { modelToolName } from "../runtime/pi-tools.ts";
 import { isSubagentSession } from "../runtime/subagent-session.ts";
 import { toAgentRef } from "../store/refs.ts";
@@ -2468,8 +2468,8 @@ export function createRaftPlugin(deps: {
      */
     async promptContribution(ctx) {
       const features = featuresParagraph(featuresOf(await ctx.db.get(CONTEXT_STORE, FEATURES_KEY)), ctx.alias);
-      // One line per managed MCP connector that needs reconnecting, so the agent tells the person what is wrong instead
-      // of saying it has no such connector; kept by the listing that read the catalogue (`listMcp`).
+      // One line per managed MCP connector that needs reconnecting and per catalogue tool this agent is not offered, so
+      // the agent tells the person what is wrong instead of saying the connector has no such tool (`mcpLines`).
       const reconnect = mcpLines(keptMcpOf(await ctx.db.get(CONTEXT_STORE, MCP_KEY)));
       const parts = [features, reconnect.length ? reconnect.join("\n") : null].filter((p): p is string => p !== null);
       return parts.length ? parts.join("\n\n") : null;
@@ -2559,7 +2559,10 @@ export function createRaftPlugin(deps: {
       tools.push(...managed.tools);
       // First, since the kernel keeps only the first few reasons (`MAX_SKIPPED`), and a credential that lacks several
       // capabilities fills them with one line per tool.
-      return { tools, skipped: [...managed.skipped, ...skipped] };
+      const listed = { tools, skipped: [...managed.skipped, ...skipped] };
+      // Kept with the catalogue tools this list's admission leaves out, which the mount's paragraph names (`mcpLines`).
+      await managed.keep(await leftOut(listed, managed.tools));
+      return listed;
     },
 
     /**

@@ -139,8 +139,9 @@ needs a Raft message or a model call.
    `null` and an `error` is a connection that failed mid-call: the operation is recorded `unknown`, the model was told
    to check before calling again, and nothing retried it.
 3. **A connector that needs reconnecting** is one line in the raft mount's paragraph of the agent's instructions, in the
-   SDK's words ("… is set up on this server but disconnected right now; …"); it reaches a conversation already under
-   way as a notice. The catalogue only carries these once Raft's Server sends `unavailable` (Raft #10091).
+   SDK's words ("… is set up on this server but disconnected right now; …"); a connector tool the agent is not offered
+   (step 1's `skipped`) is a line "<server>: <tool> is not available here (…)." beside it. Either reaches a
+   conversation already under way as a notice. The catalogue only carries these once Raft's Server sends `unavailable` (Raft #10091).
 4. **Freshness.** The catalogue is listed again at the agent's first turn five minutes after the last listing, and at
    once after a call was told it is stale; step 1 lists it now.
 

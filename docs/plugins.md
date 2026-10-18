@@ -708,8 +708,15 @@ change.
 - *Reconnect.* Each connector the catalogue names in `reconnectRequired` is one
   line of the mount's prompt paragraph, in the SDK's words
   (`formatMcpReconnectRequired`), so the agent tells the person instead of
-  saying it has no such connector. On pi085 a change reaches a conversation
-  under way as a notice (src/runtime/prompt-context.ts).
+  saying it has no such connector. Beside them, each catalogue tool the
+  kernel's admission leaves out of the mount's list (a description over
+  `MAX_DESCRIPTION_BYTES`, a schema over `MAX_SCHEMA_BYTES`, a list already
+  full) is one line, `<server>: <tool> is not available here (<rule>).`, by
+  server and remote tool name only, never the description; at most
+  `MCP_UNAVAILABLE_LINES` (20) and one line counting the rest. The listing
+  works them out by running the kernel's own admission (`admitTools`) on the
+  list it returns. On pi085 a change reaches a conversation under way as a
+  notice (src/runtime/prompt-context.ts).
 - *Calls and results.* A call sends the catalogue entry and the model's
   arguments once (`raft.mcp.call`). A `result` is the tool result (`content`,
   and `structuredContent` when there is one). A `tool_error` is a failed call

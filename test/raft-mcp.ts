@@ -12,7 +12,8 @@
 import { formatMcpReconnectRequired, MCP_CALL_INTERNAL_ERROR_TEXT, MCP_OUTCOME_UNKNOWN_TEXT } from "@botiverse/raft-sdk";
 import { AgentRuntime, mountedToolEntries } from "../cf/src/runtime.ts";
 import { raftPlugin } from "../src/plugins/raft.ts";
-import { MCP_CATALOG_TTL_MS, mcpToolName } from "../src/plugins/raft-mcp.ts";
+import { MCP_CATALOG_TTL_MS, MCP_UNAVAILABLE_LINES, mcpToolName } from "../src/plugins/raft-mcp.ts";
+import { MAX_DESCRIPTION_BYTES, MAX_SCHEMA_BYTES, MAX_SNAPSHOT_TOOLS } from "../src/runtime/mount-tools.ts";
 import { toolsOf } from "../src/plugins/types.ts";
 import { qualifyMountedTools, replayPolicy } from "../src/runtime/pi-tools.ts";
 import { durableTool } from "../src/runtime/durable-tools.ts";
@@ -151,6 +152,45 @@ await check("a connector that needs reconnecting is one line in the mount's para
   unavailable = [];
   await w.rt.refreshMountTools("t", "a", "raft");
   must(!(await paragraph()).includes("Linear"), `still says Linear: ${await paragraph()}`);
+});
+
+await check("a catalogue tool the kernel leaves out is one line in the mount's paragraph, by server and tool name and the rule, never its description; capped", async () => {
+  const secretish = "DESCRIPTION-TEXT-MUST-NOT-REACH-THE-PROMPT ";
+  const longDescription = { ...SEARCH, toolName: "notion-big", runtimeName: "mcp__notion__notion-big", description: secretish.repeat(Math.ceil((MAX_DESCRIPTION_BYTES + 1) / secretish.length)) };
+  const hugeSchema = { ...SEARCH, toolName: "notion-wide", runtimeName: "mcp__notion__notion-wide",
+    inputSchema: { type: "object", properties: Object.fromEntries(Array.from({ length: 400 }, (_, i) => [`p${i}`, { type: "string", description: "x".repeat(40) }])) } };
+  let tools: RemoteTool[] = [SEARCH, longDescription, hugeSchema];
+  let unavailable: Array<{ mcpServerId: string; serverName: string; status: "reconnect_required" }> = [{ mcpServerId: LINEAR, serverName: "Linear", status: "reconnect_required" }];
+  raftServer({ catalogue: () => ({ tools, unavailable }) });
+  const w = await world();
+  must(JSON.stringify(hugeSchema.inputSchema).length > MAX_SCHEMA_BYTES, "control: the schema is over the bound");
+  const paragraph = async () => (await w.rt.gateway().promptContributions(T)).join("\n");
+  const said = await paragraph();
+  must(JSON.stringify(mcpNames(await w.offered())) === JSON.stringify(["mcp_notion__notion_search"]), `control: offered ${mcpNames(await w.offered())}`);
+  must(said.includes("Notion: notion-big is not available here (its description is too long)."), `long description: ${said}`);
+  must(said.includes("Notion: notion-wide is not available here (its input schema is too large)."), `huge schema: ${said}`);
+  must(!said.includes("DESCRIPTION-TEXT") && !said.includes("notion-search is not"), `said too much: ${said}`);
+  // Beside the reconnect line.
+  const lines = said.split("\n");
+  const at = lines.indexOf(formatMcpReconnectRequired("Linear"));
+  must(at >= 0 && lines[at + 1] === "Notion: notion-big is not available here (its description is too long).", `order: ${JSON.stringify(lines)}`);
+  // A huge catalogue: past the list's own bound, and more left out than the paragraph names.
+  const many = Array.from({ length: MAX_SNAPSHOT_TOOLS + 10 }, (_, i) => ({ ...SEARCH, toolName: `t${i}`, runtimeName: `mcp__notion__t${i}`, description: "short" }));
+  tools = [...Array.from({ length: 5 }, (_, i) => ({ ...longDescription, toolName: `big${i}`, runtimeName: `mcp__notion__big${i}` })), ...many];
+  unavailable = [];
+  await w.rt.refreshMountTools("t", "a", "raft");
+  const offeredNow = mcpNames(await w.offered()).length;
+  const leftCount = tools.length - offeredNow;
+  const said2 = (await paragraph()).split("\n").filter((l) => l.includes("not available here"));
+  must(leftCount > MCP_UNAVAILABLE_LINES, `control: only ${leftCount} left out`);
+  must(said2.length === MCP_UNAVAILABLE_LINES + 1, `lines: ${said2.length}`);
+  must(said2[0] === "Notion: big0 is not available here (its description is too long).", `first: ${said2[0]}`);
+  must(said2.some((l) => /^Notion: t\d+ is not available here \(this agent already has as many tools as it can be offered\)\.$/.test(l)), `the list bound: ${said2.join(" | ")}`);
+  must(said2.at(-1) === `…and ${leftCount - MCP_UNAVAILABLE_LINES} more connector tools are not available here.`, `last: ${said2.at(-1)}`);
+  // All offered again: no line.
+  tools = [SEARCH];
+  await w.rt.refreshMountTools("t", "a", "raft");
+  must(!(await paragraph()).includes("not available here"), `still says: ${await paragraph()}`);
 });
 
 await check("a call sends the catalogue entry's ids and versions and the model's arguments as they are, once, and hands back Raft's content", async () => {

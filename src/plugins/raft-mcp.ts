@@ -44,7 +44,8 @@ import {
   type Raft, type RaftFailure, type RaftMcpTool,
 } from "@botiverse/raft-sdk";
 import type { Json, MountRecord } from "../core/types.ts";
-import type { PluginContext, PluginErrorFields, SkippedTool, ToolSchema } from "./types.ts";
+import { admitTools } from "../runtime/mount-tools.ts";
+import type { ListedTools, PluginContext, PluginErrorFields, SkippedTool, ToolSchema } from "./types.ts";
 
 /** The prefix of every managed MCP tool's name: no tool of the plugin's own starts with it. */
 export const MCP_PREFIX = "mcp_";
@@ -80,7 +81,15 @@ export interface KeptMcp {
   tools: KeptMcpTool[];
   /** Connectors set up for this agent that need reconnecting, by server name. */
   reconnect: string[];
+  /**
+   * Catalogue tools the kernel's admission left out of the mount's list (`admitTools`), by server and remote tool name
+   * and the kind of rule, never the description or the schema: the model is told they exist and cannot be used here.
+   */
+  unavailable: Array<{ server: string; tool: string; why: string }>;
 }
+
+/** The most lines `mcpLines` gives the tools left out; the rest are counted in one more. */
+export const MCP_UNAVAILABLE_LINES = 20;
 
 function obj(v: unknown): Record<string, unknown> {
   return v && typeof v === "object" && !Array.isArray(v) ? v as Record<string, unknown> : {};
@@ -96,7 +105,9 @@ export function keptMcpOf(raw: unknown): KeptMcp | null {
     typeof t.configVersion === "number" && typeof t.assignmentVersion === "number" &&
     typeof obj(t.schema).name === "string" && obj(t.schema).name === t.name) as unknown as KeptMcpTool[];
   const reconnect = Array.isArray(r.reconnect) ? r.reconnect.filter((s): s is string => typeof s === "string") : [];
-  return { at: r.at, tools, reconnect };
+  const unavailable = (Array.isArray(r.unavailable) ? r.unavailable : []).map(obj)
+    .filter((u) => typeof u.server === "string" && typeof u.tool === "string" && typeof u.why === "string") as KeptMcp["unavailable"];
+  return { at: r.at, tools, reconnect, unavailable };
 }
 
 /**
@@ -163,6 +174,37 @@ export function mcpClock() {
 }
 export type McpClock = ReturnType<typeof mcpClock>;
 
+/**
+ * The kind of admission rule a reason from `admitTools` names, said for the model. Read from the kernel's own reason, so
+ * a rule added there reads as the fallback until it is named here; never the tool's description or schema.
+ */
+function admissionWhy(reason: string): string {
+  if (/its description is \d+ characters/.test(reason)) return "its description is too long";
+  if (/its input schema is \d+ characters/.test(reason)) return "its input schema is too large";
+  if (/lists more than \d+ tools|already fill/.test(reason)) return "this agent already has as many tools as it can be offered";
+  return "it could not be added to this agent's tools";
+}
+
+/**
+ * The catalogue tools the kernel will leave out of this listing, and why, from the same admission the kernel runs on
+ * it (`admitTools`, deterministic), so what the prompt says is what the mount offers: a tool's bounds, and the whole
+ * list's (Raft's own tools come first and fill it first).
+ */
+export async function leftOut(listed: ListedTools, managed: readonly ToolSchema[]): Promise<Map<string, string>> {
+  const admitted = await admitTools(listed, 0);
+  const kept = new Set(admitted.tools.map((t) => t.name));
+  // admitTools keeps only the first few reasons, so the reasons are read from a listing of the managed tools alone
+  // where the full one dropped them; a tool cut by the whole list's bounds says so.
+  const alone = await admitTools({ tools: [...managed] }, 0);
+  const reasons = new Map([...alone.skipped].map((s) => [s.name, s.reason]));
+  const out = new Map<string, string>();
+  for (const t of managed) {
+    if (kept.has(t.name)) continue;
+    out.set(t.name, admissionWhy(reasons.get(t.name) ?? "the tools before it already fill the list"));
+  }
+  return out;
+}
+
 /** Keep the catalogue; a write that fails costs the calls their details until the next listing, never the listing. */
 async function keep(ctx: PluginContext, store: string, value: KeptMcp): Promise<void> {
   try { await ctx.db.put(store, value as unknown as Json, MCP_KEY); }
@@ -175,12 +217,13 @@ async function keep(ctx: PluginContext, store: string, value: KeptMcp): Promise<
  * read does not fail the listing, which lists Raft's own operations too: the catalogue kept last time is offered
  * again, and the entry in `skipped` says why it was not read.
  */
-export async function listMcp(raft: Raft, ctx: PluginContext, store: string, holdsMcp: boolean): Promise<{ tools: ToolSchema[]; skipped: SkippedTool[] }> {
+export async function listMcp(raft: Raft, ctx: PluginContext, store: string, holdsMcp: boolean): Promise<{
+  tools: ToolSchema[]; skipped: SkippedTool[];
+  /** Keep what was read, with the tools the listing's admission leaves out (`leftOut`); nothing when it was not read. */
+  keep(left: ReadonlyMap<string, string>): Promise<void>;
+}> {
   const now = Date.now();
-  if (!holdsMcp) {
-    await keep(ctx, store, { at: now, tools: [], reconnect: [] });
-    return { tools: [], skipped: [] };
-  }
+  if (!holdsMcp) return { tools: [], skipped: [], keep: () => keep(ctx, store, { at: now, tools: [], reconnect: [], unavailable: [] }) };
   const out = await raft.mcp.tools();
   if (!out.ok) {
     let kept: KeptMcp | null = null;
@@ -191,6 +234,8 @@ export async function listMcp(raft: Raft, ctx: PluginContext, store: string, hol
     return {
       tools,
       skipped: [{ name: MCP_CATALOG, reason: `the managed MCP catalogue could not be read (${why}); ${tools.length ? "the tools listed before are offered until it can" : "none is offered until it can"}` }],
+      // The record kept last time stands, with what it said was left out.
+      keep: async () => {},
     };
   }
   const used = new Set<string>();
@@ -206,13 +251,27 @@ export async function listMcp(raft: Raft, ctx: PluginContext, store: string, hol
     });
   }
   const reconnect = [...new Set(out.data.reconnectRequired.map((r) => r.serverName))];
-  await keep(ctx, store, { at: now, tools: kept, reconnect });
-  return { tools, skipped: [] };
+  return {
+    tools, skipped: [],
+    keep: (left) => keep(ctx, store, {
+      at: now, tools: kept, reconnect,
+      unavailable: kept.filter((t) => left.has(t.name)).map((t) => ({ server: t.serverName, tool: t.toolName, why: left.get(t.name)! })),
+    }),
+  };
 }
 
-/** One line per connector that needs reconnecting, in the SDK's words (`formatMcpReconnectRequired`). */
+/**
+ * The mount paragraph's managed MCP lines: one per connector that needs reconnecting, in the SDK's words
+ * (`formatMcpReconnectRequired`), then one per catalogue tool this agent was not offered, by server and tool name and
+ * the kind of rule, so the model knows the tool exists and cannot be used here rather than taking the connector not to
+ * have it. At most `MCP_UNAVAILABLE_LINES` of the second kind, and one line counting the rest.
+ */
 export function mcpLines(kept: KeptMcp | null): string[] {
-  return (kept?.reconnect ?? []).map((serverName) => formatMcpReconnectRequired(serverName));
+  const reconnect = (kept?.reconnect ?? []).map((serverName) => formatMcpReconnectRequired(serverName));
+  const left = kept?.unavailable ?? [];
+  const shown = left.slice(0, MCP_UNAVAILABLE_LINES).map((u) => `${u.server}: ${u.tool} is not available here (${u.why}).`);
+  const more = left.length - shown.length;
+  return [...reconnect, ...shown, ...(more > 0 ? [`…and ${more} more connector tools are not available here.`] : [])];
 }
 
 function failed(message: string, marks: { mayHaveLanded?: boolean; transient?: boolean } = {}): Error {
