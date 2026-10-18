@@ -457,25 +457,23 @@ await check("a renewal's pair is in D1 before anything else runs, and the token 
   const id = await w.connect(a);
   await w.call("PUT", `/agents/by-raft-agent/B15/connections/github`, { connectorId: id, actingRaftUserId: "u_owner", actingRole: "creator" });
   await w.expireAt(a, Date.now() + 30_000, id);
-  // Read the instant the refresh answers: the connector row must already be the pair GitHub just issued.
+  // The order things happen in once GitHub has answered: the D1 write, the call itself, and telling b.
+  const order: string[] = [];
+  const rotate = w.grants.rotate.bind(w.grants);
+  w.grants.rotate = async (...x: Parameters<typeof rotate>) => { const r = await rotate(...x); order.push(r ? "d1" : "d1-lost"); return r; };
   const real = globalThis.fetch;
-  let seenInD1: string | null = null;
   globalThis.fetch = (async (url: any, init?: any) => {
-    const res = await real(url, init);
-    if (String(url) === GITHUB_TOKEN && JSON.parse(String(init?.body)).grant_type === "refresh_token") {
-      queueMicrotask(() => setTimeout(async () => {
-        const s = await w.stored(a);
-        const row = w.db.raw.prepare("SELECT ciphertext, iv FROM connectors WHERE id = ?").get(id) as any;
-        seenInD1 = await s.open(s.kek, { ciphertext: row.ciphertext, iv: row.iv });
-      }, 0));
-    }
-    return res;
+    const u = String(url);
+    if (u === GITHUB_TOKEN) order.push("github-refresh");
+    else if (u.startsWith("https://api.github.com/")) order.push("api");
+    return real(url, init);
   }) as any;
-  w.delayPropagation(50);
+  const was = w.propagated.length;
   must(succeeded(await w.tool(a)), "the call failed");
+  await w.settle();
   globalThis.fetch = real;
-  const issued = w.gh.issued.filter((t) => t.startsWith("ghu_")).at(-1);
-  must(seenInD1 === issued, "the connector did not hold the new pair before the call went on");
+  if (w.propagated.length > was) order.push("propagated");
+  must(order.join(",") === "github-refresh,d1,api,propagated", `order: ${order.join(",")}`);
   w.dispose();
 });
 
