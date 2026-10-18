@@ -1,10 +1,8 @@
 # antiproton
 
-> **Building with a Raft of Agents**
+> A durable, multi-tenant serverless runtime for autonomous AI agents that interact with real-world systems.
 > 
-> *Humans and agents, one team: autonomous agents with humans in the loop can take on bigger work.*
-> 
-> A durable, multi-tenant serverless runtime for AI agents that interact with real-world systems, built on infrastructure that costs nothing while idle.
+> Built on a three-tier architecture that decouples state from model waiting and execution environments: agents sleep for free, wake to think without container overhead, and mount real-world sandboxes strictly on demand.
 
 The agent loop itself is commodity — bring your own, or use the reference harness. Antiproton provides the durable execution substrate underneath it, designed around four core architectural guarantees:
 
@@ -22,10 +20,8 @@ The agent loop itself is commodity — bring your own, or use the reference harn
 - [Plugin Authoring Guide](docs/plugins.md)
 - [Philosophy & Design Principles](docs/philosophy.md)
 - [Architecture](#architecture)
-  - [The Symmetrical Collaboration Model](#the-symmetrical-collaboration-model)
   - [The Problem: Why Not 'One Sandbox per Agent'?](#the-problem-why-not-one-sandbox-per-agent)
-  - [The Three-Layer Architecture](#the-three-layer-architecture)
-  - [Workload Division: Local and Cloud](#workload-division-local-and-cloud)
+  - [The Three-Tier Runtime Model](#the-three-tier-runtime-model)
 - [Getting Started](#getting-started)
 - [Core Invariants](#core-invariants)
   - [Zero Cost While Idle](#zero-cost-while-idle)
@@ -42,24 +38,16 @@ The agent loop itself is commodity — bring your own, or use the reference harn
 
 ## Architecture
 
-### The Symmetrical Collaboration Model
-
-Software engineering is fundamentally a team sport. Rather than treating an agent as a solitary command-line utility or a passive, mention-driven chatbot, Antiproton is designed for **symmetrical human-agent teamwork**:
-
-- **Agents are not underlying workers; agents carry every role.** In an engineering organization, specialized agents serve as architects, developers, adversarial QA reviewers, observability engineers, and release managers.
-- **Symmetrical task workflow:** Humans assign directional intent to agents, agents hand off tasks to each other, and **agents proactively assign tasks to humans** — such as requesting a human teammate to review UI consistency and visual feel. Machines excel at exhaustive logic and rapid iteration; humans excel at aesthetic judgment and strategic direction.
-- **Shared social fabric:** Channels for projects, threads for tasks. Agents possess persistent identities, cross-session memory, and explicit organizational scopes.
-
 ### The Problem: Why Not 'One Sandbox per Agent'?
 
-When deploying agents to the cloud, the reflexive reaction is: *"Just spin up a dedicated container for every agent."* While familiar, that model collides with four practical realities:
+When deploying agents to the cloud, the reflexive reaction is: *"Just spin up a dedicated container for every agent."* While familiar, that model collides with four practical engineering realities:
 
-1. **Heterogeneity:** Different tasks require radically different environments. Some need a headless browser, some need GPUs, some need heavy RAM and compilers, while others only need basic CPU. A single generic container cannot satisfy all requirements.
+1. **Heterogeneous Demands:** Different tasks need radically different environments. Some need a headless browser, some need GPUs, some need heavy RAM and compilers, while others only need basic CPU. A single generic container cannot fit all of them.
 2. **Wake, Think, Sleep:** Autonomous agents wake up frequently to inspect ambient events (webhooks, alerts, reminders), think for two seconds, and return to sleep. Booting and provisioning a heavy container just for two seconds of cognitive triage is structurally inefficient.
 3. **The Scaling Dilemma:** Fixed, always-on containers sit idle most of the day, burning memory and compute; dynamically autoscaling pools suffer from slow cold starts, state-restoration delays, and fragile maintenance.
-4. **Auto-Sleep Task Disruption:** If a container is automatically put to sleep whenever the agent goes idle, long-running background tasks initiated by the agent get terminated.
+4. **Auto-Sleep Disruption:** If a container is automatically put to sleep whenever an agent goes idle, background tasks initiated by the agent get killed.
 
-### The Three-Layer Architecture
+### The Three-Tier Runtime Model
 
 Antiproton resolves this dilemma by separating cognitive state from execution environments across three distinct tiers:
 
@@ -86,14 +74,6 @@ Antiproton resolves this dilemma by separating cognitive state from execution en
 1. **Tier 1 (Harness & Zero-Wait DOs):** Every agent is backed by a serverless Durable Object with a transactional SQLite database. It wakes in milliseconds, restores state, enqueues model calls onto background queues, and suspends synchronously (`stopReason: "deferred"`). On a real 17.4s turn, the Durable Object is active for only 3.71s (21%), consuming zero compute while awaiting model responses across the network.
 2. **Tier 2 (Sandbox-less Code Mode):** For data processing, formatting, and tool orchestration, the model executes JavaScript inside an ephemeral V8 isolate (Cloudflare Dynamic Workers). It has zero direct internet access (`globalOutbound: null`), strict deterministic CPU/sub-request limits, and supports `await pause(...)` to await model feedback. It orchestrates tools without container boot overhead.
 3. **Tier 3 (Real-World Sandboxes):** When a task genuinely requires `cargo build`, a Linux shell, or a browser, the agent mounts an on-demand container powered by **Run9** (PingCAP's project). Sandboxes operate on a 30-minute idle lease with a 5-minute pre-release warning, allowing agents to postpone or release immediately. A container is an on-demand tool, not an architectural cage.
-
-### Workload Division: Local and Cloud
-
-Antiproton is built on the premise that developers should not have to choose between local control and cloud availability — **we want both**:
-
-- **Local Execution:** Direct access to native disk caches, compilers, hardware dongles, private keys, and local browser sessions with zero cloud latency.
-- **Cloud Presence:** 24/7 channel presence, webhook ingestion, background alert triage, and cross-team task delegation.
-- Both environments are essential and communicate continuously.
 
 ---
 
