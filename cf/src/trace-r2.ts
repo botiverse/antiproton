@@ -38,9 +38,11 @@
  *   nothing deleting them. The usage ledger's is the daily Cron Trigger
  *   (`scheduled` in cf/src/index.ts, `retainUsage` in cf/src/usage-d1.ts);
  *   that handler is where a trace sweep would run too.
- * - reads across tenants or by time: the one reader (cf/src/eval-read.ts)
+ * - reads across tenants by seq: the one reader (cf/src/eval-read.ts)
  *   lists one agent's prefix and orders by the seq range in each key, so a
- *   change to the key scheme must change `traceKeyRange` with it.
+ *   change to the key scheme must change `traceKeyRange` with it. Which
+ *   agents had rows on a given UTC day is the day index's question
+ *   (`noteTraceDays`, read by cf/src/friction-scan.ts), not a listing's.
  * - a stall detector: a run that stops silently leaves no row here, so "no
  *   row" must not be read as "nothing stalled" until one exists.
  */
@@ -91,7 +93,7 @@ export function traceBody(rows: readonly TraceOutboxRow[]): Uint8Array {
 export async function flushTrace(
   sink: TraceSink, sql: Sql, tenantId: string, agentId: string, limit = 500,
   now: () => number = Date.now, holdThrough: number | null = null,
-): Promise<{ rows: number; dropped: number; key: string | null }> {
+): Promise<{ rows: number; dropped: number; key: string | null; days: string[] }> {
   sql.exec(LOCAL);
   const known = sql.exec("SELECT through_seq FROM trace_sent WHERE id = 1").toArray()[0];
   const sent = known ? Number(known.through_seq) : 0;
@@ -117,5 +119,42 @@ export async function flushTrace(
   const prunable = holdThrough === null ? exported : Math.min(exported, holdThrough);
   // A read before the write: an idle pass used to issue a DELETE that deleted nothing.
   if (prunable > 0 && sql.exec("SELECT 1 AS hit FROM trace_outbox WHERE seq <= ? LIMIT 1", prunable).toArray().length) pruneTrace(sql, prunable);
-  return { rows: rows.length, dropped, key };
+  return { rows: rows.length, dropped, key, days: [...new Set(rows.map((r) => utcDay(r.at)))].sort() };
+}
+
+/** The UTC day of a time, `YYYY-MM-DD`. */
+export const utcDay = (at: number): string => new Date(at).toISOString().slice(0, 10);
+
+/**
+ * The day index: one empty object per agent per UTC day it exported rows for, so a reader asking "who was active on
+ * that day" lists `trace-index/<day>/` (a few hundred keys) instead of `trace/` (every batch ever written: 33k objects
+ * measured 2026-10-18, and nothing deletes them). The key is the whole record; there is no body to merge, so two
+ * passes writing the same marker cannot race.
+ */
+export const TRACE_INDEX_PREFIX = "trace-index/";
+export function traceIndexKey(day: string, tenantId: string, agentId: string): string {
+  return `${TRACE_INDEX_PREFIX}${day}/${tenantId}/${agentId}`;
+}
+const INDEXED = "CREATE TABLE IF NOT EXISTS trace_index_days (day TEXT PRIMARY KEY)";
+/** How many days this object remembers having indexed: a batch's rows are minutes old, so two would do. */
+const INDEXED_KEEP_DAYS = 7;
+
+/**
+ * Write the day index for `days` this object has not written yet, and remember each one that landed. A put that
+ * throws is left unremembered, so the next pass writes it again; the caller treats a failure as costing the reader a
+ * listing, never as costing a row.
+ */
+export async function noteTraceDays(sink: TraceSink, sql: Sql, tenantId: string, agentId: string, days: readonly string[]): Promise<number> {
+  if (!days.length) return 0;
+  sql.exec(INDEXED);
+  let wrote = 0;
+  for (const day of days) {
+    if (sql.exec("SELECT 1 AS hit FROM trace_index_days WHERE day = ?", day).toArray().length) continue;
+    await sink.put(traceIndexKey(day, tenantId, agentId), new Uint8Array(0));
+    sql.exec("INSERT OR IGNORE INTO trace_index_days(day) VALUES (?)", day);
+    wrote++;
+  }
+  const horizon = utcDay(Date.parse(days[days.length - 1]! + "T00:00:00Z") - INDEXED_KEEP_DAYS * 86_400_000);
+  sql.exec("DELETE FROM trace_index_days WHERE day < ?", horizon);
+  return wrote;
 }

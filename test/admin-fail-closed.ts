@@ -87,6 +87,8 @@ const ROUTES: Route[] = [
   { path: "/admin/migrate-engine", method: "GET", refused: 401, passed: (s) => s === 405 },
   { path: "/admin/diagnose", method: "GET", refused: 401, passed: (s) => s === 400 },
   { path: "/admin/transcript", method: "GET", refused: 401, passed: (s) => s === 400 },
+  // The friction scan on demand (cf/src/friction-scan.ts): without a day it is a 400, before anything is read.
+  { path: "/admin/friction-scan", method: "POST", refused: 401, passed: (s, c) => s === 400 && !c.some((x) => /^(object|r2)\./.test(x)) },
   // A signed-in admin or the operator's token (auth.ts isAdmin); its refusal is "no such route".
   { path: "/admin/models", method: "PATCH", refused: 404, passed: (s) => s === 405 },
   // The probe (PROBE_ROUTES): no identity of its own, and it starts Dynamic Workers on the deployment's account, so an
