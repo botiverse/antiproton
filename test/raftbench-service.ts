@@ -20,7 +20,7 @@ import type { ModelResponse } from "../src/model/types.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { setLogSink } from "../src/core/log.ts";
 import type { HookRow } from "../cf/src/control-plane.ts";
-import { computeGaps, MAX_CALLS, RAFTBENCH_INSTRUCTIONS, RAFTBENCH_MAX_TOKENS, RETRY_DELAYS_MS, RUN_DEADLINE_MS } from "../src/plugins/raftbench.ts";
+import { MAX_CALLS, RAFTBENCH_INSTRUCTIONS, RAFTBENCH_MAX_TOKENS, RETRY_DELAYS_MS, RUN_DEADLINE_MS } from "../src/plugins/raftbench.ts";
 import { BASE_SYSTEM } from "../src/runtime/pi-prompt.ts";
 import { modelToolName } from "../src/runtime/pi-tools.ts";
 
@@ -253,7 +253,7 @@ const goodResult = (over: Record<string, unknown> = {}) => JSON.stringify({
   }],
   ...over,
 });
-/** What the plugin computes from TWO_PAGES' coverage: tool outcomes are not included, and the window was read whole. */
+/** The gaps of TWO_PAGES' coverage (`raftbenchGapsFromCoverage`): tool outcomes are never included; the window was read whole. */
 const GAPS = ["missing_tool_outcomes"];
 /** What the model was given, as the cases below saw it, for RAFTBENCH_PROMPTS_DIR. */
 const exported: { system?: string; firstTurn?: string; fixup?: string } = {};
@@ -382,10 +382,12 @@ await check("gaps are the plugin's: a result without them is given them, a wrong
     const [s] = w.raft.submits();
     must(s && show(s.body.gaps) === show(GAPS) && w.sent.length === 1 && w.raft.accepted.size === 1, `${show(modelGaps)} → ${s?.raw}, calls ${w.sent.length}`);
   }
-  const cov = { from: "x", to: "y", fetchedMessages: 9, notRead: NOT_READ };
-  must(show(computeGaps({ ...cov, exhausted: false, stopReason: "char_limit" })) === show(["missing_tool_outcomes", "budget", "partial_scan"]), "char_limit");
-  must(show(computeGaps({ ...cov, exhausted: false, stopReason: "more_pages" })) === show(["missing_tool_outcomes", "partial_scan"]), "more_pages");
-  must(show(computeGaps({ ...cov, notRead: [], exhausted: true, stopReason: "window_end" })) === show([]), "whole window");
+  // A read that stopped early is given its reason, from the SDK's own reading of the coverage.
+  const w = await world();
+  w.raft.pages = [{ ...TWO_PAGES[0]!, exhausted: false, stopReason: "char_limit" }];
+  await assign(w);
+  await answer(w, goodResult({ status: "incomplete", reason: "stopped early" }));
+  must(show(w.raft.submits()[0]?.body.gaps) === show(["missing_tool_outcomes", "budget"]), w.raft.submits()[0]?.raw ?? "nothing submitted");
 });
 
 await check("the fixture's message lines carry the server's time format", async () => {

@@ -38,8 +38,8 @@
 import { clip, logEvent, routeOf } from "../core/log.ts";
 import type { Json } from "../core/types.ts";
 import {
-  createRaft, isRaftbenchRunAssigned, raftbenchFailureKind,
-  type Raft, type RaftFailure, type RaftbenchCoverage, type RaftbenchMaterial, type RaftbenchReport, type RaftbenchRunAssigned, type RaftbenchValidationIssue,
+  createRaft, isRaftbenchRunAssigned, raftbenchFailureKind, raftbenchGapsFromCoverage,
+  type Raft, type RaftFailure, type RaftbenchMaterial, type RaftbenchReport, type RaftbenchRunAssigned, type RaftbenchValidationIssue,
 } from "@botiverse/raft-sdk";
 import type { Plugin, PluginContext, PluginNext, TurnEnd } from "./types.ts";
 
@@ -97,19 +97,6 @@ export function firstTurnText(material: RaftbenchMaterial): string {
 /** The fix-up turn: the SDK's list of what is wrong, as it is. It already says what to answer with. */
 export function fixupTurnText(invalid: string): string {
   return invalid;
-}
-
-/**
- * The result's `gaps`, from what the read covered: the plugin's to say, not the model's, which is never asked for
- * them. SWAP POINT: the SDK's `raftbenchGapsFromCoverage(coverage)` from 0.22.4. The coverage names neither a history
- * limit nor an inaccessible source, so those two are never set here.
- */
-export function computeGaps(coverage: RaftbenchCoverage): RaftbenchReport["gaps"] {
-  const gaps: RaftbenchReport["gaps"] = [];
-  if (coverage.notRead.some((n) => /tool (execution )?outcomes/i.test(n))) gaps.push("missing_tool_outcomes");
-  if (coverage.stopReason === "message_limit" || coverage.stopReason === "char_limit") gaps.push("budget");
-  if (!coverage.exhausted) gaps.push("partial_scan");
-  return gaps;
 }
 
 /** Output tokens of every model call of a run (the profile's, src/runtime/agent-profile.ts). */
@@ -292,7 +279,7 @@ async function resumeRead(ctx: PluginContext, raft: Raft, reading: RunState): Pr
   const run: RunState = {
     ...reading, runId: material.data.runId, revision: material.data.revision,
     coverage: {
-      fetched: material.data.coverage.fetchedMessages, exhausted: material.data.coverage.exhausted, gaps: computeGaps(material.data.coverage),
+      fetched: material.data.coverage.fetchedMessages, exhausted: material.data.coverage.exhausted, gaps: raftbenchGapsFromCoverage(material.data.coverage),
     },
   };
   log(ctx, run, "read", { pages: material.data.pages, fetched: run.coverage!.fetched, stopReason: material.data.coverage.stopReason });
@@ -403,8 +390,8 @@ function resultOf(text: string | null, run: RunState): unknown {
   let value: unknown;
   try { value = JSON.parse(fenced ? fenced[1]! : raw); } catch { return raw; }
   if (!value || typeof value !== "object" || Array.isArray(value)) return value;
-  // The run it answers for, and what the read left out, are the plugin's to say: a copy or a guess the model wrote is
-  // replaced before anything checks it, so it never costs the fix-up turn.
+  // The run it answers for, and what the read left out (the SDK's gaps from the coverage), are the plugin's to say: a
+  // copy or a guess the model wrote is replaced before anything checks it, so it never costs the fix-up turn.
   return { ...value, runId: run.runId, revision: run.revision, gaps: run.coverage?.gaps ?? [] };
 }
 
