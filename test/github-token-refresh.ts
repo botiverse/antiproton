@@ -850,6 +850,18 @@ await check("the D1 write refuses a connector with no id yet whose login is anot
   w.dispose();
 });
 
+await check("the D1 backfill writes an id only over none, and only for the connector's own login", async () => {
+  const w = await world();
+  const a = await w.agent("R13");
+  const id = await w.connect(a);
+  must(!(await w.grants.fillAccountId(TENANT, id, "9", "octocat")) && connectorRow(w, id).account_id === "1", "an id was written over one already kept");
+  w.db.raw.prepare("UPDATE connectors SET account_id = NULL WHERE id = ?").run(id);
+  must(!(await w.grants.fillAccountId(TENANT, id, "2", "mallory")) && connectorRow(w, id).account_id === null, "another login's id was written");
+  must(!(await w.grants.fillAccountId("t-other", id, "1", "octocat")) && connectorRow(w, id).account_id === null, "another tenant wrote the id");
+  must(await w.grants.fillAccountId(TENANT, id, "1", "OctoCat") && connectorRow(w, id).account_id === "1", "its own login's id was not written");
+  w.dispose();
+});
+
 for (const [label, setup, expect, outcome] of [
   ["learns GitHub's id from the renewed token", (_w: any, _id: string) => {}, "1", "filled"],
   ["ignores GET /user failing: the renewal stands, the id stays unknown", (w: any) => { w.gh.s.failUser = 1; }, null, "unknown"],
