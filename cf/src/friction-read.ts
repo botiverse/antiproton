@@ -14,6 +14,7 @@
 import { sessionFor, readEntries, transcriptEvents, hasTable } from "./transcript-read.ts";
 import { mainSessions } from "./fresh-context.ts";
 import { MAIN_SESSION, type SqlHost } from "../../src/store/pi-storage.ts";
+import { profileOf, profileSpec } from "../../src/runtime/agent-profile.ts";
 import type { FrictionEvent } from "./friction.ts";
 
 type Sql = SqlHost["sql"];
@@ -69,10 +70,22 @@ export function windowConversations(sql: Sql, tenantId: string, agentId: string,
 }
 
 /** Null when the object holds no such agent; never creates anything. */
+function keepsNoConversations(sql: Sql, tenantId: string, agentId: string): boolean {
+  if (!hasTable(sql, "agents")) return false;
+  const r = sql.exec("SELECT config FROM agents WHERE tenant_id = ? AND agent_id = ?", tenantId, agentId).toArray()[0] as { config?: unknown } | undefined;
+  let config: unknown = null;
+  try { config = r ? JSON.parse(String(r.config ?? "{}")) : null; } catch { return false; }
+  const profile = profileOf(config);
+  return profile !== null && !profileSpec(profile).keepsConversations;
+}
+
 export function readFrictionWindow(
   sql: Sql, tenantId: string, agentId: string, from: number, to: number, limits: FrictionLimits = FRICTION_LIMITS,
 ): FrictionWindow | null {
   if (sessionFor(sql, tenantId, agentId, `t_${agentId}`) === null) return null;
+  // An agent whose profile keeps no conversations (src/runtime/agent-profile.ts) is not read: its turns are material
+  // that must not be copied anywhere, the scan's report included.
+  if (keepsNoConversations(sql, tenantId, agentId)) return { conversations: [], truncated: false };
   const ids = windowConversations(sql, tenantId, agentId, from, to);
   const conversations: FrictionConversation[] = [];
   for (const id of ids.slice(0, limits.maxConversations)) {

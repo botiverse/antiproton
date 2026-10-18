@@ -770,6 +770,67 @@ POST /provision/agents
 — `budget` on the onboarding agent only (every other agent leaves it out), and `plan` whenever Raft knows the
 server's plan ([above](#the-servers-plan-plan)); a retry repeats the same body, as for every field.
 
+#### An agent for one job (`profile`)
+
+`POST /provision/agents` takes `profile: "raftbench_service"` (optional; absent or `null` is today's agent) for
+RaftBench's read-only analysis service (`src/runtime/agent-profile.ts`, `src/plugins/raftbench.ts`; the Raft side is
+botiverse/slock#10130 and #10134). Every other Raft POST leaves it out.
+
+- **Values.** Exactly `"raftbench_service"`. Anything else (another string, a different case, a non-string) is `400`,
+  `code: "invalid"`, `param: "profile"`, and nothing is made. A profile decides the agent's tools, so `mounts` or
+  `harness` beside it is `400` naming that field.
+- **Fixed at creation.** Stored on the agent's row (`provisioned_agents.profile`) and on the agent's own record, and
+  given back as `profile` in the agent's view (absent for an agent without one). A replay must repeat it (absent and
+  `null` being one value): another, or none where the create had one, or one where it had none, is
+  `409 idempotency_conflict` naming `profile`. A `PATCH` (name and instructions only) keeps it, and no catalogue
+  reconcile touches the agent.
+- **What the agent is.** Exactly two mounts: `raft`, with the credential Raft sends (its `raftbench` capability), and
+  `raftbench`, whose code does the work. The harness is minimal (no `run_js`, `resume`, jobs or subagents) and the
+  model is offered no tools at all. Its system prompt is the plugin's instructions and nothing else: not the default
+  prompt, not the `instructions` Raft sends, not any mount's paragraph. Every model call's output is capped at 8,192
+  tokens (`RAFTBENCH_MAX_TOKENS`). It runs on the deployment's default model, as an agent created without `model`
+  does; `GET /provision/agents/{agentId}/model` says which.
+- **A run.** Raft assigns one as a `system.raftbench` event and pushes the agent its usual inbox notice. Under the
+  profile a push is never a message to the model: it wakes the plugin, which reads the agent's events (an assignment counts only from Raft's `system.raftbench` app), reads every
+  page of the run's material, and starts one turn with it in a conversation of its own (the coverage block, the messages, and one line
+  asking for the result); its fix-up turn stays in that conversation, and no overflowed conversation is rebuilt. The model's answer is submitted as it wrote it, `incomplete` included, except for its run id, revision and
+  `gaps`, which the plugin sets (the gaps from what the read covered; the model is never asked for them). An invalid answer gets one
+  fix-up turn with the list of what is wrong; a second invalid one, a read that failed, a model that failed, a
+  cancelled turn and the deadline end the run as failed, with the reason (`raft.raftbench.submitFailure`: an
+  `incomplete` result with `failure: true`, so Raft tries the same material again); a `failure` the model writes is
+  refused before anything is sent, and counts as invalid output. A revision
+  conflict reads the run again once; at most two model calls per read and four per run. A run ends 25 minutes after
+  its assignment arrived (Raft stops taking results at 30): the turn in flight is cancelled and the run ends as
+  `timeout`; its answer is discarded, but a provider call already under way may still finish and be billed (up to the
+  8,192-token cap), because the queue's model call takes no abort. A submission Raft could not confirm is sent again, the same bytes, after 1, 2, 4, 8 and 16 minutes, then
+  given up with a `raftbench.run` log line (`outcome: "gave_up…"`, `admin: true`) and nothing else sent. An agent
+  without the profile never acts on an assignment: `receive_events` leaves it out and logs `raft.raftbench_dropped`.
+- **Data retention.** Raft's contract is the latest result only, with no copy or history of the source text, and the
+  agent keeps to it. While a run is going, its material and the model's answers exist only in its own conversation (the
+  transcript and its model jobs), plus the result while it is being submitted. When the run ends (accepted, failed,
+  stopped, timed out, or its retries given up), that conversation is erased: its transcript tables, its model jobs
+  (requests and answers), and the model's text in the turn ends kept. Nothing is archived. The next run, or a reread,
+  starts in an empty conversation. The run's own state keeps ids, revision, counters, the deadline and the outcome. A
+  result waiting for a retry keeps its bytes only until the retry succeeds or gives up. Nothing of a run is written to
+  R2: model calls are handed to the queue by id, trace rows carry no content, and the daily friction scan reads none
+  of this agent's conversations. The only copy left anywhere is the result Raft accepted. The erase is crash-safe:
+  the run's end and the request to erase are written together, and any later wake or replay asks again (erasing an
+  empty conversation does nothing). An operator's fresh context erases this agent's conversation instead of archiving
+  it, and `/admin/reset-session?rebuild=1` is refused, since its briefing would copy it.
+  Out of scope, by decision: hashes and lengths of the material (`model_request_prefix`, `model_input_digests`), which
+  are not copies; and platform-level copies this code cannot reach — SQLite free pages in the Durable Object, Cloudflare's
+  point-in-time recovery of D1 and Durable Objects, and the model provider, which receives the material to answer it.
+- **What it needs from Raft.** The provider's credential check and push registration (`GET /internal/agent-api`,
+  `PUT /internal/agent-api/push-webhook`, and `DELETE` of it on a delete) are refused to the service identity by the
+  contract as merged (`raftbench_read_only`); until Raft allows them, the create answers `422 credential_refused`, and
+  a push registration refused leaves the agent made with `push.registered: false`, which no run can wake.
+
+```json
+POST /provision/agents
+{ "raftAgentId": "…", "raftServerId": "…", "raftOrigin": "…", "name": "raftbench-service", "instructions": "…",
+  "credential": "sk_agent_…", "profile": "raftbench_service" }
+```
+
 ### The agent's GitHub connection (`connections/github`)
 
 ```
@@ -958,7 +1019,7 @@ reported.
 
 | Field | On | Value |
 |---|---|---|
-| `toolName` | both | the tool as the model names it, `<mount>__<tool>` |
+| `toolName` | both | the name the model called the tool by, exactly as its tool list offered it (`state__list`, `raft__messages_send`, a collision tie-break's suffix included), recorded when the call was dispatched, whichever form named it (an offered name, `raft.messages_send`, or the plugin's address). A call to a tool the turn was not offered (a mount added during the turn), one no model named, or one recorded before the name was, gives its dispatch address (`raft.messages_send`) |
 | `toolUseId` | both | the call's operation id: the same on the two events of a call, different for every call (two calls to one tool, the host calls of one `run_js` program, the step that continues a tool's question, a call run after approval) |
 | `ok` | the end | `true` succeeded (including a command that exited non-zero), `false` failed or refused (by the mount's policy, or by a person denying the approval), `null` the outcome is not known (lost, or cancelled) |
 | `durationMs` | the end | how long the tool ran; a call held for approval counts from when it began after the approval, not from the request |

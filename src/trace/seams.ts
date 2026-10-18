@@ -63,6 +63,8 @@ export function operationEnds(prior: OperationStatus | null, status: OperationSt
 export function toolCallRow(op: {
   tenantId: string; agentId: string; taskId: string; operationId: string;
   mountAlias: string; tool: string; status: OperationStatus;
+  /** The name the model called the tool by (`OperationRecord.modelName`); null when no model named it. */
+  modelName?: string | null;
   createdAt: number; endedAt: number; callId?: string | null;
   /** The command's exit status, when the tool ran one (`CompletedFacts.exitCode`). */
   exitCode?: number | null;
@@ -80,7 +82,8 @@ export function toolCallRow(op: {
     // approval.wait row). `runMs` is the part after the attempt began, which is what the activity log reports.
     ms: Math.max(0, op.endedAt - op.createdAt),
     attrs: {
-      tool: op.tool, mount: op.mountAlias, task: op.taskId, ...(op.callId ? { callId: op.callId } : {}),
+      tool: op.tool, mount: op.mountAlias, ...(op.modelName ? { name: op.modelName } : {}), task: op.taskId,
+      ...(op.callId ? { callId: op.callId } : {}),
       ...(num(op.exitCode) ? { exitCode: op.exitCode } : {}),
       ...(num(op.startedAt) ? { runMs: Math.max(0, op.endedAt - Math.max(op.startedAt, op.createdAt)) } : {}),
       ...(op.denied === true ? { denied: true } : {}),

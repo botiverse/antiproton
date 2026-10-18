@@ -45,6 +45,7 @@ import { optionFor, type UserModels } from "../../../src/model/user-models.ts";
 import type { ModelChoice } from "../../../src/model/providers.ts";
 import { onboardingPool, tenantUsage, type ProvisionUsage } from "./usage.ts";
 import type { FirstTurn } from "../../../src/runtime/prewarm.ts";
+import { AGENT_PROFILES, isAgentProfile, type AgentProfile } from "../../../src/runtime/agent-profile.ts";
 
 export type ProvisionTool = "enable_push" | "disable_push";
 
@@ -59,7 +60,7 @@ export interface ProvisionAgentOps {
    * says nothing about them. A Fail is the agent's refusal of it (cf/src/provision/steps.ts): another one recorded
    * already (409), or one this deployment cannot give (400). Nothing is written when it refuses.
    */
-  adopt(tenantId: string, agentId: string, spec: { name: string; instructions: string; raftOrigin: string; toolConfig?: ToolConfig | null; awaitImport?: boolean; firstTurn?: FirstTurn | null }): Promise<void | Fail>;
+  adopt(tenantId: string, agentId: string, spec: { name: string; instructions: string; raftOrigin: string; toolConfig?: ToolConfig | null; awaitImport?: boolean; firstTurn?: FirstTurn | null; profile?: AgentProfile | null }): Promise<void | Fail>;
   /** Seal the credential onto the `raft` mount; the plugin checks it against Raft. */
   attachCredential(tenantId: string, agentId: string, credential: string): Promise<{ ok: true; account: string | null } | { ok: false; error: string }>;
   removeCredential(tenantId: string, agentId: string): Promise<boolean>;
@@ -379,6 +380,25 @@ export function budgetField(body: unknown): AgentBudget | null | Fail {
   return v as AgentBudget;
 }
 
+/**
+ * `profile` of a POST (src/runtime/agent-profile.ts): absent or null is today's agent; any value but a profile this
+ * deployment knows is refused. A profile decides the agent's tools, so it does not combine with an evaluation's
+ * `mounts` or `harness`.
+ */
+export function profileField(body: unknown): AgentProfile | null | Fail {
+  const v = field(body, "profile");
+  if (v === undefined || v === null) return null;
+  if (!isAgentProfile(v)) {
+    return { status: 400, code: "invalid", param: "profile", message: `profile is ${Object.keys(AGENT_PROFILES).map((p) => `"${p}"`).join(" or ")}, or absent` };
+  }
+  for (const named of ["mounts", "harness"]) {
+    if (field(body, named) !== undefined) {
+      return { status: 400, code: "invalid", param: named, message: `profile ${JSON.stringify(v)} decides this agent's tools; leave ${named} out` };
+    }
+  }
+  return v;
+}
+
 /** `plan` of a POST or a plan PUT: one of `PLANS`, exactly; absent (null on POST) is none said. */
 export function planField(body: unknown, required: boolean): Plan | null | Fail {
   const v = field(body, "plan");
@@ -427,6 +447,7 @@ function view(row: ProvisionedAgent, live?: Json) {
     updatedAt: new Date(row.updatedAt).toISOString(),
     deletedAt: row.deletedAt === null ? null : new Date(row.deletedAt).toISOString(),
     ...(row.budget ? { budget: row.budget } : {}),
+    ...(row.profile ? { profile: row.profile } : {}),
     /** The services Raft may offer a Connect button for (connections/:provider). */
     connections: [...CONNECTION_PROVIDERS],
   };
@@ -585,6 +606,9 @@ export async function handleProvision(
     if (isFail(instructions)) return fail(instructions);
     const credential = credentialField(body);
     if (isFail(credential)) return fail(credential);
+    // Before the tool choice: a profile decides the tools, and says so where `mounts` or `harness` is named beside it.
+    const profile = profileField(body);
+    if (isFail(profile)) return fail(profile);
     const toolConfig = toolConfigField(body, deps.seed);
     if (isFail(toolConfig)) return fail(toolConfig);
     // Only its type here: whether it is offered, and not locked, is a first create's question (`createPick`). A replay
@@ -620,7 +644,8 @@ export async function handleProvision(
     // `model` is part of the request a replay must repeat: absent and null are one value (null), as on a create.
     // `awaitImport` likewise: absent and false are one value.
     // `budget` likewise: absent and null are one value (the tenant's own).
-    const asked = { raftServerId: raftServerId!, raftOrigin, name: name!, instructions, model, awaitImport, budget };
+    // `profile` likewise: absent and null are one value (today's agent).
+    const asked = { raftServerId: raftServerId!, raftOrigin, name: name!, instructions, model, awaitImport, budget, profile };
     const credentialHash = await sha256Hex(credential);
     let row = await deps.registry.get(tenantId, raftAgentId);
     let created = false;
@@ -629,7 +654,8 @@ export async function handleProvision(
         return fail({ status: 409, code: "deleted", message: "this Raft agent was deleted here; a new agent needs a new id" });
       }
       const differs = (Object.keys(asked) as Array<keyof typeof asked>).filter((k) =>
-        (k === "model" ? row!.model ?? null : k === "awaitImport" ? row!.awaitImport ?? false : k === "budget" ? row!.budget ?? null : row![k]) !== asked[k]);
+        (k === "model" ? row!.model ?? null : k === "awaitImport" ? row!.awaitImport ?? false : k === "budget" ? row!.budget ?? null
+          : k === "profile" ? row!.profile ?? null : row![k]) !== asked[k]);
       // The credential is the one field that matters most: a delayed retry with an old one must not
       // overwrite a newer PUT /credential. Compared by hash; a row from
       // before the hash existed accepts the first replay and records it.
@@ -684,7 +710,7 @@ export async function handleProvision(
     // From here every step is idempotent, so a replay of a request that died half-way finishes it. The tool choice is
     // compared by the agent's object, where it is recorded: a replay asking for other tools is 409, as for any field.
     const adopted = await deps.agent.adopt(tenantId, agentId, { name: row.name, instructions: row.instructions, raftOrigin: row.raftOrigin, toolConfig,
-      firstTurn, ...(row.awaitImport ? { awaitImport: true } : {}) });
+      firstTurn, profile: row.profile ?? null, ...(row.awaitImport ? { awaitImport: true } : {}) });
     if (adopted) return fail(adopted);
     const attached = await deps.agent.attachCredential(tenantId, agentId, credential);
     if (!attached.ok) return fail({ status: 422, code: "credential_refused", message: attached.error, param: "credential" });

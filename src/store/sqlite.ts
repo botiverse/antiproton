@@ -101,7 +101,7 @@ CREATE TABLE IF NOT EXISTS operations (
   operation_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL,
   task_id TEXT NOT NULL, mount_alias TEXT NOT NULL, tool TEXT NOT NULL,
   tool_version TEXT NOT NULL, status TEXT NOT NULL, result_ref TEXT,
-  created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+  created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, model_name TEXT);
 CREATE INDEX IF NOT EXISTS operations_task ON operations(tenant_id, task_id, status);
 
 -- Config-time binding (alias -> installation + connection). The agent addresses
@@ -196,6 +196,7 @@ export class SqliteStore implements StorageAdapter {
       "ALTER TABLE tasks ADD COLUMN state_version INTEGER NOT NULL DEFAULT 0",
       "ALTER TABLE mounts ADD COLUMN policy TEXT",
       "ALTER TABLE mounts ADD COLUMN tool_snapshot TEXT",
+      "ALTER TABLE operations ADD COLUMN model_name TEXT",
       // A secrets table created before the suffix column was dropped keeps a
       // NOT NULL column the insert no longer fills; drop it, and with it the
       // one plaintext fragment of a value the row ever held.
@@ -621,8 +622,8 @@ export class SqliteStore implements StorageAdapter {
     this.#db
       .prepare(
         `INSERT INTO operations(operation_id, tenant_id, agent_id, task_id, mount_alias,
-           tool, tool_version, status, result_ref, created_at, updated_at)
-         VALUES (?,?,?,?,?,?,?, 'pending', NULL, ?, ?)
+           tool, model_name, tool_version, status, result_ref, created_at, updated_at)
+         VALUES (?,?,?,?,?,?,?,?, 'pending', NULL, ?, ?)
          ON CONFLICT(operation_id) DO NOTHING`,
       )
       .run(
@@ -632,6 +633,7 @@ export class SqliteStore implements StorageAdapter {
         op.taskId,
         op.mountAlias,
         op.tool,
+        op.modelName ?? null,
         op.toolVersion,
         now(),
         now(),
@@ -661,6 +663,7 @@ export class SqliteStore implements StorageAdapter {
       taskId: r.task_id,
       mountAlias: r.mount_alias,
       tool: r.tool,
+      modelName: r.model_name ?? null,
       toolVersion: r.tool_version,
       status: r.status,
       resultRef: r.result_ref,
@@ -718,7 +721,7 @@ export class SqliteStore implements StorageAdapter {
         .run(tenantId, operationId);
       // Uniform wakeup: everything the harness reacts to arrives as an event.
       const op = this.#db
-        .prepare("SELECT agent_id, task_id, mount_alias, tool, created_at FROM operations WHERE tenant_id=? AND operation_id=?")
+        .prepare("SELECT agent_id, task_id, mount_alias, tool, model_name, created_at FROM operations WHERE tenant_id=? AND operation_id=?")
         .get(tenantId, operationId) as any;
       if (op) {
         this.#insertEvent({
@@ -735,7 +738,7 @@ export class SqliteStore implements StorageAdapter {
         if (operationEnds(prior ? prior.status : null, status)) {
           appendTrace(this.#usageSql() as any, [toolCallRow({
             tenantId, agentId: op.agent_id, taskId: op.task_id, operationId,
-            mountAlias: op.mount_alias, tool: op.tool, status,
+            mountAlias: op.mount_alias, tool: op.tool, modelName: op.model_name ?? null, status,
             createdAt: Number(op.created_at), endedAt, callId: facts?.callId ?? null,
             exitCode: facts?.exitCode ?? null, startedAt: facts?.startedAt ?? null, denied: facts?.denied === true,
           })]);

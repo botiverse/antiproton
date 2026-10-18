@@ -52,6 +52,16 @@ export function subagentRow(row: Pick<TraceOutboxRow, "attrs">): boolean {
   return isSubagentSession(row.attrs.session) || isSubagentSession(row.attrs.task);
 }
 
+/**
+ * A tool call's name as Raft shows it: the name the model called it by, recorded at dispatch (`attrs.name`, src/trace/
+ * seams.ts `toolCallRow`); a row without one (no model named the call, or written before the name was recorded) by its
+ * dispatch address.
+ */
+export function toolCallName(row: Pick<TraceOutboxRow, "attrs">): string | null {
+  const { name, tool } = row.attrs;
+  return typeof name === "string" && name ? name : typeof tool === "string" && tool ? tool : null;
+}
+
 /** The errorClass of a turn that was ended from outside: the row's own, else its kind. Raft cuts it at 120. */
 export function turnEndClass(row: TraceOutboxRow): string {
   const c = typeof row.attrs.errorClass === "string" && row.attrs.errorClass ? row.attrs.errorClass : row.kind;
@@ -71,10 +81,8 @@ export function statusEvents(agentId: string, rows: readonly TraceOutboxRow[], b
         break;
       case "tool.call": {
         if (operatorCall(row)) break;
-        // What "working" is working on, named as the model names the tool; shown with the status in Raft.
-        const tool = typeof row.attrs.tool === "string" ? row.attrs.tool : null;
-        const mount = typeof row.attrs.mount === "string" ? row.attrs.mount : null;
-        const name = tool ? (mount ? `${mount}__${tool}` : tool) : null;
+        // What "working" is working on, shown with the status in Raft (`toolCallName`).
+        const name = toolCallName(row);
         raw.push({ at: row.at - ms, key: `${id}:start`, status: "working", ...(name ? { detail: `Using ${name}`.slice(0, 200) } : {}) });
         break;
       }
