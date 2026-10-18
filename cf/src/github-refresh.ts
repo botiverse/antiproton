@@ -22,7 +22,7 @@ import { logEvent } from "../../src/core/log.ts";
 import { open, seal, type Sealed } from "../../src/runtime/secrets.ts";
 import type { StorageAdapter } from "../../src/core/store.ts";
 import type { ConnectorGrant, ConnectorGrants } from "./control-plane.ts";
-import { refreshGithubToken, REFRESH_SKEW_MS } from "./github-token.ts";
+import { githubUser, refreshGithubToken, REFRESH_SKEW_MS } from "./github-token.ts";
 
 /** The row beside a mount's secret that renews it. ":" keeps it apart from every alias (MOUNT_ALIAS has none). */
 export const OAUTH_PREFIX = "oauth:";
@@ -181,6 +181,7 @@ export async function renewConnector(d: ConnectorDeps, tenantId: string, id: str
     }
     // Not landed means the connector moved past the lease's expiry; the pair just traded is still GitHub's newest.
     logEvent("github.refresh", { tenantId, connectorId: id, why, outcome: "rotated", stored: landed, keys: r.keys.join(" ") });
+    if (landed && !k.accountId) await fillAccountId(d, tenantId, id, k.account, r.grant.accessToken);
     return pair;
   }
   if (r.ok) {
@@ -207,6 +208,27 @@ export async function renewConnector(d: ConnectorDeps, tenantId: string, id: str
   await d.grants.release(tenantId, id, holder);
   logEvent("github.refresh", { tenantId, connectorId: id, why, outcome: "unavailable", reason: r.reason });
   return { ok: false, broken: false, reason: r.reason };
+}
+
+/**
+ * A connector from before 0024 keeps only its login, which a rename changes and someone else can then claim; a reconnect
+ * in place compares the numeric id when there is one. Learned here from the pair just renewed, the first time the
+ * connector renews: only when GitHub names the same login, so a connector never takes the id of another account. Best
+ * effort: the renewal has already landed, and whatever goes wrong here is logged, never its failure.
+ */
+async function fillAccountId(d: ConnectorDeps, tenantId: string, id: string, login: string | null, token: string): Promise<void> {
+  try {
+    const who = await githubUser(token, d.fetch);
+    if (!who) { logEvent("github.account_id", { tenantId, connectorId: id, outcome: "unknown" }); return; }
+    if (!login || who.login.toLowerCase() !== login.toLowerCase()) {
+      logEvent("github.account_id", { tenantId, connectorId: id, outcome: "login-mismatch" });
+      return;
+    }
+    const filled = await d.grants.fillAccountId(tenantId, id, who.id, who.login);
+    logEvent("github.account_id", { tenantId, connectorId: id, outcome: filled ? "filled" : "unchanged" });
+  } catch (e) {
+    logEvent("github.account_id", { tenantId, connectorId: id, outcome: "failed", reason: String((e as Error)?.message ?? e).slice(0, 120) });
+  }
 }
 
 const GUARD_TABLE = "CREATE TABLE IF NOT EXISTS oauth_refreshing(name TEXT PRIMARY KEY, until INTEGER NOT NULL, owner TEXT NOT NULL)";

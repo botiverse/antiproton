@@ -72,7 +72,9 @@ function github(opts: { expiring?: boolean } = {}) {
     /** Something other than GitHub's own answer at the token endpoint: an HTML error page, say. */
     tokenAnswer: null as null | (() => Response),
     /** Who the person signing in at GitHub is: the account the next code's tokens act as. A refresh keeps its pair's. */
-    as: { login: "octocat", id: 1 } as { login: string; id: number } };
+    as: { login: "octocat", id: 1 } as { login: string; id: number },
+    /** How many of the next `GET /user` calls answer 503, as an outage would. */
+    failUser: 0 };
   const owner = new Map<string, { login: string; id: number }>(); // access token -> the account it acts as
   const pair = (expiring: boolean, who = s.as) => {
     n++;
@@ -106,6 +108,7 @@ function github(opts: { expiring?: boolean } = {}) {
       // An endpoint that wants an App's JWT refuses any user token, live or not.
       if (u.startsWith("https://api.github.com/app")) { s.unauthorized++; return json({ message: "A JSON web token could not be decoded" }, 401); }
       if (!live.has(token)) { s.unauthorized++; return json({ message: "Bad credentials" }, 401); }
+      if (u === "https://api.github.com/user" && s.failUser > 0) { s.failUser--; return json({ message: "Service Unavailable" }, 503); }
       return json(owner.get(token) ?? { login: "octocat", id: 1 });
     }
     return json({ message: "Not Found" }, 404);
@@ -832,6 +835,45 @@ await check("the D1 write itself refuses another account's id, for an id that ch
   must(JSON.stringify(connectorRow(w, id)) === JSON.stringify(row0), "the connector changed");
   w.dispose();
 });
+
+await check("the D1 write refuses a connector with no id yet whose login is another's: a renamed login can be someone else's", async () => {
+  const w = await world();
+  const a = await w.agent("R11");
+  const id = await w.connect(a);
+  w.db.raw.prepare("UPDATE connectors SET account_id = NULL WHERE id = ?").run(id);
+  const row0 = connectorRow(w, id);
+  const next = { sealed: { ciphertext: "x", iv: "y" }, refresh: null, account: "mallory", accountId: "2", at: Date.now() };
+  must(!(await d1Connectors(w.db).reconnect(TENANT, id, next)), "another login's pair was written over a connector with no id");
+  must(JSON.stringify(connectorRow(w, id)) === JSON.stringify(row0), "the connector changed");
+  must(await d1Connectors(w.db).reconnect(TENANT, id, { ...next, account: "OctoCat", accountId: "1" }), "its own login, in another case, was refused");
+  must(connectorRow(w, id).account_id === "1", "the id was not stored");
+  w.dispose();
+});
+
+for (const [label, setup, expect, outcome] of [
+  ["learns GitHub's id from the renewed token", (_w: any, _id: string) => {}, "1", "filled"],
+  ["ignores GET /user failing: the renewal stands, the id stays unknown", (w: any) => { w.gh.s.failUser = 1; }, null, "unknown"],
+  ["leaves the id unknown when GitHub names another login", (w: any, id: string) => { w.db.raw.prepare("UPDATE connectors SET account = 'someone-else' WHERE id = ?").run(id); }, null, "login-mismatch"],
+] as const) {
+  await check(`a connector from before the id was kept, renewing, ${label}`, async () => {
+    const w = await world();
+    const a = await w.agent(`R12${String(expect)}${label.length}`);
+    const id = await w.connect(a);
+    w.db.raw.prepare("UPDATE connectors SET account_id = NULL WHERE id = ?").run(id);
+    (setup as (w: any, id: string) => void)(w, id);
+    await w.expireAt(a, Date.now() + 30_000, id);
+    const before = connectorRow(w, id).ciphertext;
+    const from = logged.length;
+    const r = await w.tool(a);
+    must(succeeded(r) && w.gh.s.refreshes === 1, `the renewal or its call failed: ${errorText(r)}`);
+    const row = connectorRow(w, id);
+    must(row.ciphertext !== before && row.broken_at === null, "the renewal did not land");
+    must(row.account_id === expect, `account_id ${row.account_id}, expected ${expect}`);
+    const said = logged.slice(from).filter((l) => l.includes('"evt":"github.account_id"') && l.includes(`"connectorId":"${id}"`) && l.includes(`"tenantId":"${TENANT}"`));
+    must(said.length > 0 && said.at(-1)!.includes(`"outcome":"${outcome}"`), `logged ${said.at(-1) ?? "nothing"}, expected ${outcome}`);
+    w.dispose();
+  });
+}
 
 await check("a connector from before the id was kept is matched by its login, and learns the id at the reconnect", async () => {
   const w = await world();
