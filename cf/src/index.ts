@@ -69,6 +69,8 @@ import {
   isAdmin,
 } from "./auth.ts";
 import { adminTranscript } from "./admin-transcript.ts";
+import { readFrictionWindow, type FrictionLimits, type FrictionWindow } from "./friction-read.ts";
+import { dailyCron, frictionDaily, scanDay, tenantScope, writeReport, type FrictionBucket, type WindowReader } from "./friction-scan.ts";
 import { refuseSecret } from "./secret-shape.ts";
 import { adminDiagnose } from "./admin-diagnose.ts";
 import { adminMigrateEngine, type MigrateOp } from "./admin-migrate.ts";
@@ -225,6 +227,21 @@ export interface Env {
    * stripped there, and a child's step without its marker would read as the agent's own.
    */
   SUBAGENT_ACTIVITY?: string;
+  /** "1" stops the daily friction scan and its on-demand route (cf/src/friction-scan.ts; docs/runbook.md, "Where agents get stuck"). */
+  FRICTION_SCAN_DISABLED?: string;
+  /**
+   * Whose conversations the friction scan reads: comma-separated tenant ids, or `*` for every hosted (`raft_`) tenant.
+   * Unset or empty: nobody. The bench tenant never, whatever this says.
+   */
+  FRICTION_SCAN_TENANTS?: string;
+  /** "1" files the scan's findings as GitHub issues, and only together with FRICTION_GITHUB_TOKEN and FRICTION_HASH_KEY. Unset: off. */
+  FRICTION_ISSUES?: string;
+  /** The friction scan's own GitHub credential (a secret), used for nothing else. */
+  FRICTION_GITHUB_TOKEN?: string;
+  /** The secret key agent ids are HMAC'd under in a public issue (cf/src/friction.ts `agentHash`); without it, no issues. */
+  FRICTION_HASH_KEY?: string;
+  /** Where the friction scan files issues; unset is botiverse/antiproton. */
+  FRICTION_ISSUES_REPO?: string;
   /** The canonical origin, so the registered callback URL is built from a
    *  constant and never from an inbound Host header. */
   /** Login with GitHub: the OAuth App tygg owns, callback /login/github/callback. */
@@ -2453,6 +2470,15 @@ export class AgentDO extends DurableObject<Env> {
     return readTranscript(this.sql, tenantId, agentId, taskId);
   }
 
+  /**
+   * The friction scan's read of this agent (cf/src/friction-read.ts): its conversations live in [from, to), shrunk to
+   * what the classifier reads, user messages left out. SELECTs only, as adminTranscript. Null for an agent this object
+   * does not hold.
+   */
+  async frictionWindow(tenantId: string, agentId: string, from: number, to: number, limits: FrictionLimits): Promise<FrictionWindow | null> {
+    return readFrictionWindow(this.sql as any, tenantId, agentId, from, to, limits);
+  }
+
   #ownerAgent(): string | null {
     const row = this.sql.exec("SELECT agent_id FROM owner WHERE k='self'").toArray()[0] as any;
     return row ? String(row.agent_id) : null;
@@ -3861,6 +3887,10 @@ async function guardSpending(request: Request, env: Env): Promise<Response | nul
   );
 }
 
+/** Each agent's own object, asked for its friction window (`AgentDO.frictionWindow`). */
+const frictionWindowOf = (env: Env): WindowReader => (t, a, from, to, limits) =>
+  env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a))).frictionWindow(t, a, from, to, limits) as Promise<FrictionWindow | null>;
+
 async function sha256(s: string): Promise<string> {
   const d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
   return [...new Uint8Array(d)].map((b) => b.toString(16).padStart(2, "0")).join("");
@@ -3878,13 +3908,18 @@ export default {
 
   /**
    * The daily Cron Trigger (`triggers.crons` in cf/wrangler.jsonc and the preview's): the usage ledger's
-   * retention, hours older than KEEP_HOURLY_DAYS folded into days (`retainUsage`, cf/src/usage-d1.ts).
-   * Idempotent, so a trigger that fires twice, or a manual one, changes nothing the first did not.
+   * retention, hours older than KEEP_HOURLY_DAYS folded into days (`retainUsage`, cf/src/usage-d1.ts), then
+   * yesterday's friction report (`frictionDaily`, cf/src/friction-scan.ts). Idempotent, so a trigger that fires
+   * twice, or a manual one, changes nothing the first did not: the report is rewritten under the same key.
    */
   async scheduled(controller: ScheduledController, env: Env) {
     // Awaited, not handed to waitUntil: a fold that throws then marks this invocation failed in the
-    // trigger's own history, which is where a missed retention day is looked for.
-    await retainUsage(env.CONTROL_DB, controller.scheduledTime);
+    // trigger's own history, which is where a missed retention day is looked for. The friction step
+    // cannot throw and is cut off at its limit, so it can neither hide nor cause that failure.
+    await dailyCron(
+      async () => { await retainUsage(env.CONTROL_DB, controller.scheduledTime); },
+      () => frictionDaily(env, { bucket: env.ARTIFACTS as unknown as FrictionBucket, window: frictionWindowOf(env) }, controller.scheduledTime),
+    );
   },
 };
 
@@ -4325,6 +4360,27 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
         case "/admin/diagnose":
           return await adminDiagnose(request, env.AUTOMATION_TOKEN,
             (t, a) => env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a))));
+        case "/admin/friction-scan": {
+          // The daily friction scan for one day, on demand (docs/runbook.md, "Where agents get stuck"). Reads as the
+          // cron does, under the same tenant list and kill switch; writes the report unless write=0, and never files
+          // issues: that is the cron's alone.
+          if (!isOperator(env.AUTOMATION_TOKEN, request.headers.get("x-harness-token"))) {
+            return Response.json({ error: "unauthorized" }, { status: 401 });
+          }
+          if (request.method !== "POST") return Response.json({ error: "POST" }, { status: 405, headers: { allow: "POST" } });
+          if (env.FRICTION_SCAN_DISABLED === "1") return Response.json({ error: "friction scan disabled (FRICTION_SCAN_DISABLED)" }, { status: 503 });
+          const day = String(url.searchParams.get("day") ?? "");
+          if (!/^\d{4}-\d{2}-\d{2}$/.test(day) || Number.isNaN(Date.parse(day + "T00:00:00Z"))) {
+            return Response.json({ error: "day=YYYY-MM-DD is required" }, { status: 400 });
+          }
+          const scope = tenantScope(env.FRICTION_SCAN_TENANTS);
+          if (scope.kind === "none") return Response.json({ error: "no tenants in scope (FRICTION_SCAN_TENANTS)" }, { status: 409 });
+          const bucket = env.ARTIFACTS as unknown as FrictionBucket;
+          const report = await scanDay({ bucket, window: frictionWindowOf(env), build: env.GIT_COMMIT ?? null }, scope, day);
+          const written = url.searchParams.get("write") === "0" ? null
+            : await writeReport(bucket, report, new Date().toISOString().slice(0, 10));
+          return Response.json({ written: written?.keys ?? null, report }, { headers: { "cache-control": "no-store" } });
+        }
         case "/admin/transcript":
           // Awaited, so a failure reaches this route's catch and its log instead of the platform's 1101.
           return await adminTranscript(request, env.AUTOMATION_TOKEN,

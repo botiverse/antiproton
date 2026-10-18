@@ -162,7 +162,10 @@
     "test/admin-fail-closed.ts",
     "test/mount-settings.ts",
     "test/eval-read.ts",
-    "test/rebuild-shadow.ts"
+    "test/rebuild-shadow.ts",
+    "test/friction-classify.ts",
+    "test/friction-scan.ts",
+    "test/spec/friction-fixtures.ts"
   ],
   "exclude": ["node_modules"]
 }

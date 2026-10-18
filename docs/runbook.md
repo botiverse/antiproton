@@ -313,6 +313,87 @@ to 10 minutes), each failure a `subagent.turn` row with status `report_failed`; 
 (`report_dropped`) and the subagent is idle with outcome `report_failed`. A subagent whose model option a pin or the
 picker switch overrides after its spawn writes a `subagent.model_changed` row, and its next report says so.
 
+## Where agents get stuck
+
+A daily friction scan reads yesterday's (UTC) conversations of the hosted agents in scope and writes a report of where
+they got stuck to the private artifacts bucket (`antiproton-artifacts`, never the public runs bucket):
+`friction/<YYYY-MM-DD>.json` and `friction/<YYYY-MM-DD>.md`. It runs in the daily Cron Trigger (`17 3 * * *`), after
+the usage retention (`dailyCron`, `cf/src/friction-scan.ts`); the classifier is `cf/src/friction.ts`, and its rules
+were calibrated on the hosted traffic of 2026-10-17 and 2026-10-18.
+
+**Scope, and what was decided.** `FRICTION_SCAN_TENANTS` decides whose conversations are read: comma-separated tenant
+ids, or `*` for every hosted (`raft_…`) tenant. Unset or empty, nothing is read and no report is written. The `bench`
+tenant (and any agent named `bench…`) is never read, whatever the var says. No wrangler config sets it; set it as a
+Worker var (`wrangler deploy --var FRICTION_SCAN_TENANTS:'*'`, or the dashboard's variables). Scanning every hosted
+agent was approved on these terms, and the var is not to be widened, nor the terms changed, without a new decision:
+
+- purpose: finding product friction, and nothing else;
+- the private report carries tenant, agent and conversation ids, seq numbers, templated errors and short redacted
+  excerpts of the agent's own words and commands (at most 140 characters, credential shapes removed); never a user
+  message and never raw tool output. User messages do not leave the agent's object at all (`cf/src/friction-read.ts`);
+- reports are kept 30 days (each run deletes older ones);
+- reports are read by the antiproton team only;
+- public GitHub issues carry counts and id-free templates only (below).
+
+**Reading the report.** The `.md` is for people, the `.json` for tools. Its header says what was read: agents found
+(from the day index, or a listing when the day has none), agents read, conversations, events, and whether anything was
+cut (`maxAgents`, the time budget, conversations or events capped per agent). Section 1 is the headline: **stuck
+episodes**, grouped by root cause. An episode is one conversation with 3 or more friction classes less than 10 minutes
+apart that ends in the agent saying it cannot do something or in 3 or more hard failures; its root is the first hard
+failure (a tool error, an auth failure, a binary read as text, a guessed endpoint's 404, a model failure), which is
+what a fix targets. Section 2 ranks every signal group by class weight × distinct agents × log2(1 + count). Each root
+and group has a fingerprint (`fr_…`), a hash of its class and id-free key: the same problem has the same fingerprint
+on every day and every agent. To see an episode in full, follow its ids:
+
+```
+curl -s -H "x-harness-token: $AUTOMATION_TOKEN" "$HOST/admin/transcript?tenantId=<tenant>&agentId=<agent>&taskId=<conversation>"
+```
+
+and look at the `sequence` numbers the report lists. Inability text still matches some explanations (it counts only
+as a turn's last words or within 10 minutes after a failure), so treat a group of `inability_text` alone as a lead,
+not a finding.
+
+**On demand.** `POST /admin/friction-scan?day=YYYY-MM-DD` runs the same scan for any day, under the same tenant list
+and kill switch, and answers the report. It writes the report unless `write=0`, and never files issues.
+
+```
+curl -s -X POST -H "x-harness-token: $AUTOMATION_TOKEN" "$HOST/admin/friction-scan?day=2026-10-18&write=0" | jq '.report.roots'
+```
+
+It answers `409` when no tenant is in scope and `503` when the scan is switched off.
+
+**Kill switch.** Set the Worker var `FRICTION_SCAN_DISABLED` to `1`: the cron step and the route stop before reading
+anything. The usage retention in the same cron is not affected. Each cron run logs one `friction.scan` line saying what
+it did or why it failed; a failing or slow scan cannot fail the cron (it is cut off after its budget plus a minute).
+
+**Issues** are off. They are filed only when the Worker var `FRICTION_ISSUES` is `1` **and** two Worker secrets are
+set; with either missing nothing is filed, and each cron run logs a `friction.issues` line naming what is missing:
+
+- `FRICTION_GITHUB_TOKEN`: a token used for nothing else, allowed to create issues and comments in
+  `FRICTION_ISSUES_REPO` (default `botiverse/antiproton`);
+- `FRICTION_HASH_KEY`: a random key (e.g. `openssl rand -hex 32`) that agent ids are HMAC'd under in an issue, so
+  knowing an agent's id does not let anyone check whether it is in one. Never in the repository or a wrangler config;
+  changing it renames every agent in later issues.
+
+Set both with `wrangler secret put`, then the var. Then the cron (never the route) opens one issue labelled
+`agent-friction` for each new fingerprint among the hard classes that is an episode's root, an auth failure, or seen
+on 2 or more agents, at most 5 a day, and comments on a known one only when its counts changed. The repository is
+public, so an issue holds the fingerprint, the class, counts, the hashed agent ids, the build and the window. An error
+text appears only when the key matches one of our own fixed product messages (`KNOWN_TEMPLATES` in
+`cf/src/friction-scan.ts`: the attachments_view size refusals, the background-job limit, the gh mount's refused
+credential, web__get's refused scheme, the two fixed managed-MCP texts from `@botiverse/raft-sdk`
+(`MCP_OUTCOME_UNKNOWN_TEXT`, `MCP_CALL_INTERNAL_ERROR_TEXT`), binary read as text, our own API hosts' 401/403/404), and then it is that
+list's text, never the key. Anything else reads "withheld (see private report, fingerprint fr_…)". Never an excerpt,
+a command, a raw id or a conversation id. Adding a message to the list needs its source and a test. Which issue a
+fingerprint has is kept in `friction-state/issues.json` in the private bucket. Create the label in the repository
+before turning issues on.
+
+**The day index.** Each agent's trace flush writes an empty object `trace-index/<day>/<tenant>/<agent>` the first
+time it exports rows for a UTC day (`noteTraceDays`, `cf/src/trace-r2.ts`), so the scan never lists the whole
+`trace/` prefix. Its failure is only warned about (`trace day index for …`) and retried on the next flush. Index days
+older than 14 days are deleted by the scan, one day per run. A day with no index at all (one before the index was
+deployed) falls back to listing the in-scope tenants' `trace/<tenant>/` prefixes, bounded by `maxAgents`.
+
 ## Moving a Raft server's agents to a new tenant
 
 A platform token acts in the tenant its request's server id derives (`derivedTenant`, cf/src/provision/handlers.ts).

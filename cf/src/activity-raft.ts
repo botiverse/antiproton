@@ -18,7 +18,7 @@
  * events and the service dedupes.
  */
 import { pendingTrace } from "../../src/trace/outbox.ts";
-import { flushTrace, type TraceSink } from "./trace-r2.ts";
+import { flushTrace, noteTraceDays, type TraceSink } from "./trace-r2.ts";
 import { ACTIVITY_BATCH_MAX, activityEvents, orderStatuses, type SubagentActivity } from "../../src/runtime/activity.ts";
 import { turnLineage } from "../../src/runtime/subagents.ts";
 import type { ActivityEvent } from "../../src/plugins/types.ts";
@@ -110,10 +110,18 @@ export async function flushActivityThenTrace(
     holdThrough = activityCursor(sql);
   }
   let traceError: string | null = null;
+  let days: string[] = [];
   try {
-    await flushTrace(sink, sql, tenantId, agentId, 500, Date.now, holdThrough);
+    days = (await flushTrace(sink, sql, tenantId, agentId, 500, Date.now, holdThrough)).days;
   } catch (e) {
     traceError = String((e as { message?: unknown })?.message ?? e).slice(0, 200);
+  }
+  // The day index (cf/src/trace-r2.ts `noteTraceDays`). Its failure is not a trace error: the rows are exported, and
+  // a missing marker costs the friction scan a listing, so it is warned about and written again on the next pass.
+  try {
+    await noteTraceDays(sink, sql, tenantId, agentId, days);
+  } catch (e) {
+    console.warn(`trace day index for ${tenantId}/${agentId}: ${String((e as { message?: unknown })?.message ?? e).slice(0, 200)}`);
   }
   return { activityError, traceError };
 }
