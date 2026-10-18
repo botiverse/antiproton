@@ -674,8 +674,12 @@ export interface ConnectorGrants {
   release(tenantId: string, id: string, holder: string): Promise<void>;
   /** The new pair, only over the refresh token it was traded from (`expect`); clears any broken state, and `holder`'s lease. */
   rotate(tenantId: string, id: string, next: { sealed: { ciphertext: string; iv: string }; refresh: ConnectorRefresh; at: number }, expect: string, holder: string): Promise<boolean>;
-  /** Record that only a reconnect mends it, with a `broken` event, releasing `holder`'s lease; false when it was already broken. */
-  markBroken(tenantId: string, id: string, reason: string, at: number, holder: string | null): Promise<boolean>;
+  /**
+   * Record that only a reconnect mends it, with a `broken` event, releasing `holder`'s lease. Only while the connector
+   * still holds `spent` (the refresh token GitHub refused, sealed; null: whatever it holds), like `rotate`. False when
+   * it was already broken, or holds another pair now.
+   */
+  markBroken(tenantId: string, id: string, reason: string, at: number, holder: string | null, spent: string | null): Promise<boolean>;
   /** The same, for an agent's connection that has no connector. */
   markAgentBroken(tenantId: string, agentId: string, provider: string, reason: string, at: number): Promise<boolean>;
 }
@@ -708,13 +712,13 @@ export function d1ConnectorGrants(db: D1Database): ConnectorGrants {
         next.refresh.refreshExpiresAt, next.at, next.at, holder, holder, tenantId, id, expect).run();
       return Number(r.meta?.changes ?? 0) > 0;
     },
-    async markBroken(tenantId, id, reason, at, holder) {
+    async markBroken(tenantId, id, reason, at, holder, spent) {
       const r = await db.prepare(
         `UPDATE connectors SET broken_at = ?, broken_reason = ?, last_checked_at = ?,
            refreshing_until = CASE WHEN refreshing_by = ? THEN NULL ELSE refreshing_until END,
            refreshing_by = CASE WHEN refreshing_by = ? THEN NULL ELSE refreshing_by END
-         WHERE tenant_id = ? AND id = ? AND broken_at IS NULL`,
-      ).bind(at, reason, at, holder, holder, tenantId, id).run();
+         WHERE tenant_id = ? AND id = ? AND broken_at IS NULL AND (? IS NULL OR refresh_ciphertext = ?)`,
+      ).bind(at, reason, at, holder, holder, tenantId, id, spent, spent).run();
       const changed = Number(r.meta?.changes ?? 0) > 0;
       if (changed) {
         await db.prepare(

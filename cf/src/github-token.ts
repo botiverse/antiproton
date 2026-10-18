@@ -74,13 +74,19 @@ export async function refreshGithubToken(
   const code = j && typeof j.error === "string" && j.error ? j.error : null;
   if (!code) return { ok: false, kind: "unavailable", reason: `the token endpoint answered ${r.status} without an OAuth error` };
   const said = typeof j!.error_description === "string" ? `: ${(j!.error_description as string).slice(0, 160)}` : "";
-  // Errors about this deployment's own request or App (its id or secret, a grant type it got wrong) are the
-  // deployment's to fix; a reconnect would meet the same refusal.
-  if (DEPLOYMENT_ERRORS.has(code)) return { ok: false, kind: "unavailable", reason: `${code}${said}` };
-  return { ok: false, kind: "refused", reason: `${code}${said}` };
+  // Only a code that says the grant itself is gone is a verdict. Anything else (the deployment's own App errors, a
+  // code GitHub adds later, a rate limit or a temporary outage spelled as an OAuth error) is no reason to make a
+  // person reconnect: the next call tries again.
+  return { ok: false, kind: RECONNECT_ERRORS.has(code) ? "refused" : "unavailable", reason: `${code}${said}` };
 }
 
-const DEPLOYMENT_ERRORS = new Set(["incorrect_client_credentials", "invalid_client", "unsupported_grant_type", "invalid_request", "redirect_uri_mismatch"]);
+/**
+ * The OAuth error codes that mean the refresh token is spent, expired or revoked. GitHub's page on refreshing user
+ * tokens documents no error codes at all (read 2026-10-17); `bad_refresh_token` is what it answers for a spent or
+ * expired one ("The refresh token passed is incorrect or expired."). `invalid_grant` is OAuth 2.0's code for the same
+ * refusal (RFC 6749 §5.2), and `unauthorized` the spelling some token endpoints use for a revoked authorization.
+ */
+export const RECONNECT_ERRORS: ReadonlySet<string> = new Set(["bad_refresh_token", "invalid_grant", "unauthorized"]);
 
 /** How long the token endpoint is given: inside the connector's lease (LEASE_MS, 30 s), so the lease outlives the call. */
 export const TOKEN_TIMEOUT_MS = 25_000;

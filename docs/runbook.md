@@ -98,14 +98,18 @@ curl -s -X DELETE -H "x-harness-token: $AUTOMATION_TOKEN" -H "content-type: appl
 
 Connect GitHub hands out expiring user tokens (8 hours, renewed with a single-use refresh token that lasts about 6
 months). The deployment renews them (cf/src/github-refresh.ts). Only GitHub refusing a renewal marks the connection
-as needing reconnecting: a JSON answer from the token endpoint with an OAuth `error` code such as `bad_refresh_token`
-(spent, expired, or the App revoked). Nothing else marks it:
-- a `401` from the API, even for a token just renewed: some endpoints (`/app`) refuse every user token, and a renewed
-  pair is itself proof that the authorization is alive. The call reports its `401`, and a `401` within a minute of a
-  renewal does not renew again;
-- an answer from the token endpoint without an OAuth error code (an HTML page, a 5xx, a timeout), or an error about
-  the deployment's own App (`incorrect_client_credentials`, `invalid_client`, `unsupported_grant_type`): logged as
-  `unavailable`, and the next call tries again.
+as needing reconnecting: a JSON answer from the token endpoint whose OAuth `error` code is one that means the grant is
+gone: `bad_refresh_token` (spent, expired, or the App revoked), `invalid_grant` or `unauthorized` (`RECONNECT_ERRORS`
+in cf/src/github-token.ts; GitHub documents no refresh error codes). Nothing else marks it:
+- a `401` from the API. Before a `401` renews anything, `GET /user` is asked with the same token: only a `401` there
+  says the token is dead. A live token refused by an endpoint that refuses every user token (`/app`) rotates nothing,
+  and the call reports its `401`. Even a renewed token's `401` marks nothing, and a `401` within a minute of a renewal
+  does not renew again;
+- any other OAuth error code (`temporarily_unavailable`, the deployment's own `incorrect_client_credentials`, a code
+  GitHub adds later), or an answer without one (an HTML page, a 5xx, a timeout): logged as `unavailable`, and the next
+  call tries again;
+- a refusal that lost its lease while GitHub answered: it marks the connector only while the connector still holds the
+  refresh token it spent. If another renewal stored a good pair meanwhile, that pair is taken instead.
 
 A mount whose connector was deleted stops renewing and says to reconnect: it never renews with its own copy of a pair
 its owner removed.
@@ -131,10 +135,12 @@ releases it); one in the past is a renewal that did not finish, and the next one
 given 25 seconds, inside the lease.
 
 **A renewal cut off half-way can cost a reconnect.** GitHub spends the old pair the moment it hands out a new one. The
-new pair is written to the connector immediately, before anything else is done with it, but a deploy, an eviction or
-a timeout between GitHub's answer and that write loses it, and the connector is left holding a spent refresh token:
-its next renewal is refused and the connection is marked as needing reconnecting. A `rotated` line with
-`stored: false`, or an `interrupted-before` line followed by `broken`, is this case.
+new pair is written to the connector immediately, before anything else is done with it. A write that fails is tried
+three times (`store-failed` lines with `attempt`). If D1 still refuses, the mount that asked keeps the pair
+(`kept-unstored`) and its own calls keep working. The connector, though, holds a spent refresh token, and once the
+lease runs out another agent's renewal is refused and marks the connection as needing reconnecting. A deploy, an
+eviction or a timeout between GitHub's answer and the write loses the pair outright. A `rotated` line with
+`stored: false`, `kept-unstored`, or an `interrupted-before` line followed by `broken`, is this case.
 
 **Other agents on the connector** are told of a new pair after the renewing call has answered, not during it
 (`waitUntil`). One that is not reached (`propagate-failed`) takes the pair on its own next GitHub tool call's `401`,
@@ -144,7 +150,7 @@ comes within five minutes, when it is renewed (adopted from the connector) befor
 **In the logs.** Every renewal is a `github.refresh` line: `outcome` `rotated` (a new pair), `adopted` (an agent took
 the pair another agent's renewal stored), `broken`, `unavailable` (GitHub did not answer: not a verdict, nothing is
 marked), `interrupted-before` (a renewal in this object stopped part-way; the next one goes ahead) or
-`propagate-failed` (an agent on the connector was not told, below), with
+`propagate-failed` (an agent on the connector was not told, below), `store-failed` and `kept-unstored` (above), with
 `tenantId`, `agentId`, `connectorId`, `why` (`expiring`, `rejected`, `adopt`) and GitHub's error as `reason`. Never a
 token. Each connect also writes `connect.exchange` with the **names** of the keys GitHub's answer carried: one with
 `expires_in` and `refresh_token` is an expiring token (`expiring: true`).

@@ -754,9 +754,10 @@ the person while that works. A connector is shared by the agents pointed at it, 
 lease on the connector, and reaches every agent on it.
 
 **A connection that needs reconnecting.** When GitHub refuses the renewal (`bad_refresh_token`: spent, expired, or the
-person revoked the App), only the person can mend it. A `401` from GitHub's API never marks it, even after a renewal:
-some endpoints refuse every user token, and the tool reports that `401` as it is. Nor does a token endpoint that
-answers without an OAuth error (an outage page, a timeout). The connection is reported:
+person revoked the App; also `invalid_grant` and `unauthorized`), only the person can mend it. A `401` from GitHub's
+API never marks it: some endpoints refuse every user token, and the tool reports that `401` as it is (a `401` renews
+only after `GET /user` confirms the token is dead). Nor does any other answer from the token endpoint: another OAuth
+error code, an outage page, a timeout. The connection is reported:
 
 ```json
 {
