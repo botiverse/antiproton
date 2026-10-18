@@ -16,6 +16,7 @@ import { readFrictionWindow, FRICTION_LIMITS, type FrictionWindow } from "../cf/
 import { noteTraceDays, traceIndexKey } from "../cf/src/trace-r2.ts";
 import { agentHash, template, type FrictionClass } from "../cf/src/friction.ts";
 import { admitBackground } from "../src/runtime/background-jobs.ts";
+import { MCP_CALL_INTERNAL_ERROR_TEXT, MCP_OUTCOME_UNKNOWN_TEXT } from "@botiverse/raft-sdk";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { PiSqliteStorage } from "../src/store/pi-storage.ts";
 import { BACKGROUND_CONTEXT as CTX } from "@earendil-works/pi-agent-core/harness/context";
@@ -249,6 +250,20 @@ await check("a public template is a closed allowlist: our own messages are shown
   // The shown text is the list's, never the key: a mount alias the pattern lets vary does not reach the issue.
   const aliased = gh.replace(/^gh:/, "acme-corp-gh:");
   must(shownFor("tool_error", aliased) !== null && !(await issueBody(DAY, null, g("tool_error", aliased), 0, KEY)).includes("acme-corp"), "the alias reached the issue");
+});
+
+await check("the managed-MCP fixed texts from raft-sdk are shown exactly, and withheld with anything added", async () => {
+  for (const text of [MCP_OUTCOME_UNKNOWN_TEXT, MCP_CALL_INTERNAL_ERROR_TEXT]) {
+    // As the scan keys it: the tool's error under its `<alias>__mcp_…` name, templated, behind the mount.
+    const key = `linear: ${template(`linear__mcp_create_issue: ${text}`)}`;
+    must(issueTemplate("tool_error", key) === text, `not shown: ${key}`);
+    must((await issueBody(DAY, null, { fingerprint: "fr_0000000000000000", cls: "tool_error", key, count: 1, agents: [AGENT], conversations: 1, tools: [], score: 1, examples: [] }, 0, KEY)).includes(text), "the body lacks the SDK text");
+    for (const extra of [`${key} Acme roadmap sync`, key.replace("Raft", "Raft at acme-corp"), `${key}.`]) {
+      must(issueTemplate("tool_error", extra) === null, `shown with extra text: ${extra}`);
+    }
+  }
+  // A managed-MCP message that names a connector or a tool stays withheld.
+  must(issueTemplate("tool_error", "linear: The Linear connector is disconnected; ask the person to reconnect it before calling create_issue again.") === null, "a named-connector message was shown");
 });
 
 await check("issues: one per new qualifying fingerprint, a comment only when its counts change, none for probes", async () => {

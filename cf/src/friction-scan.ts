@@ -21,11 +21,12 @@
  * are set (`issuesFrom`).
  */
 import {
-  agentHash, episodes, excerpt, fingerprint, HARD, scanConversation, score,
+  agentHash, episodes, excerpt, fingerprint, HARD, scanConversation, score, template,
   type Episode, type FrictionClass, type Signal,
 } from "./friction.ts";
 import { FRICTION_LIMITS, type FrictionLimits, type FrictionWindow } from "./friction-read.ts";
 import { TRACE_INDEX_PREFIX, utcDay } from "./trace-r2.ts";
+import { MCP_CALL_INTERNAL_ERROR_TEXT, MCP_OUTCOME_UNKNOWN_TEXT } from "@botiverse/raft-sdk";
 
 // ---------- what it needs ----------
 
@@ -381,6 +382,11 @@ export const KNOWN_TEMPLATES: readonly KnownTemplate[] = [
   { id: "gh-bad-credentials", cls: "auth_failure", pattern: new RegExp(`^${MOUNT} mount 401 ${esc(GH_401.slice(0, 60))}$`), shown: GH_401 },
   // src/plugins/http.ts, a scheme web__get does not fetch (an artifact:// ref, in calibration).
   { id: "web-refused-scheme", cls: "tool_error", pattern: new RegExp(String.raw`^${MOUNT}: refused scheme [a-z][a-z0-9+.-]{0,20}:$`), shown: "refused scheme <scheme>:" },
+  // src/plugins/raft-mcp.ts, a managed MCP call whose outcome is unknown, and one Raft failed inside: the SDK's own
+  // fixed texts, imported rather than copied so this follows its wording. The other managed-MCP messages (disconnected,
+  // stale, unreachable) name a connector and a tool, so they stay withheld.
+  { id: "mcp-outcome-unknown", cls: "tool_error", pattern: new RegExp(`^${MOUNT}: ${esc(template(MCP_OUTCOME_UNKNOWN_TEXT))}$`), shown: MCP_OUTCOME_UNKNOWN_TEXT },
+  { id: "mcp-call-internal-error", cls: "tool_error", pattern: new RegExp(`^${MOUNT}: ${esc(template(MCP_CALL_INTERNAL_ERROR_TEXT))}$`), shown: MCP_CALL_INTERNAL_ERROR_TEXT },
   // cf/src/friction.ts `binary_as_text`: bytes a read tool returned as UTF-8 text.
   { id: "binary-as-text", cls: "binary_as_text", pattern: /^[a-z0-9_-]{1,40}__(read|get) kind=(text|\?)$/, shown: "binary bytes returned as text (U+FFFD) by a read tool" },
   // cf/src/friction.ts, our own API hosts refusing or not knowing a guessed endpoint.

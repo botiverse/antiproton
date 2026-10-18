@@ -365,7 +365,8 @@ on 2 or more agents, at most 5 a day, and comments on a known one only when its 
 public, so an issue holds the fingerprint, the class, counts, the hashed agent ids, the build and the window. An error
 text appears only when the key matches one of our own fixed product messages (`KNOWN_TEMPLATES` in
 `cf/src/friction-scan.ts`: the attachments_view size refusals, the background-job limit, the gh mount's refused
-credential, web__get's refused scheme, binary read as text, our own API hosts' 401/403/404), and then it is that
+credential, web__get's refused scheme, the two fixed managed-MCP texts from `@botiverse/raft-sdk`
+(`MCP_OUTCOME_UNKNOWN_TEXT`, `MCP_CALL_INTERNAL_ERROR_TEXT`), binary read as text, our own API hosts' 401/403/404), and then it is that
 list's text, never the key. Anything else reads "withheld (see private report, fingerprint fr_…)". Never an excerpt,
 a command, a raw id or a conversation id. Adding a message to the list needs its source and a test. Which issue a
 fingerprint has is kept in `friction-state/issues.json` in the private bucket. Create the label in the repository
