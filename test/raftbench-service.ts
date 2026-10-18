@@ -710,6 +710,24 @@ await check("retention: an erase still owed is done by a wake even when the raft
   mustBeGone(w, "after the wake");
 });
 
+await check("an empty window: no model call, an ordinary incomplete through submit, and nothing kept", async () => {
+  const w = await world();
+  w.raft.pages = [{ sourceText: "", sources: [], fetched: 0, exhausted: true, stopReason: "window_end" }];
+  await assign(w);
+  for (let i = 0; i < 2; i++) await pass(w);
+  must(w.sent.length === 0, `model calls: ${w.sent.length}`);
+  const submits = w.raft.submits();
+  must(submits.length === 1 && w.raft.accepted.size === 1, `submits ${submits.length}`);
+  must(canon(submits[0]!.body) === canon({ runId: w.raft.run.runId, revision: 3, status: "incomplete", reason: "No messages were read in this window; nothing was analyzed.",
+    patterns: [], gaps: ["missing_tool_outcomes"] }), submits[0]!.raw);
+  must(runLogs("done").some((l) => l.outcome === "accepted" && l.from === "empty"), show(runLogs("done")));
+  must(w.host.sql.exec("SELECT COUNT(*) AS n FROM pi_entries").toArray()[0]!.n === 0 && w.host.sql.exec("SELECT COUNT(*) AS n FROM pi_model_jobs").toArray()[0]!.n === 0, "a conversation was kept");
+  // A window with messages in it still goes to the model.
+  const v = await world();
+  await assign(v);
+  must(v.sent.length === 1 && v.raft.submits().length === 0, `a normal read: calls ${v.sent.length}, submits ${v.raft.submits().length}`);
+});
+
 await check("retention: every terminal path leaves no copy — timeout, read failure, stop, model failure, overflow, cancel, reread", async () => {
   const paths: Record<string, (w: World) => Promise<void>> = {
     timeout: async (w) => { skew += RUN_DEADLINE_MS + 1_000; try { for (let i = 0; i < 3; i++) await pass(w); } finally { skew = 0; } },

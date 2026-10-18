@@ -150,8 +150,11 @@ interface RunState {
   coverage?: { fetched: number; exhausted: boolean; gaps: RaftbenchReport["gaps"] };
   /** When the deadline was found passing during a turn, which was then cancelled: that turn's end is the timeout. */
   timedOut?: number;
-  /** While `submitting`: whose result it is, and the result — the model's bytes, or the reason of the plugin's own. */
-  from?: "model" | "plugin";
+  /**
+   * While `submitting`: whose result it is, and the result — the model's bytes or an empty window's (sent with
+   * `submit`), or the reason of the plugin's own failure (sent with `sendFailure`).
+   */
+  from?: "model" | "empty" | "plugin";
   body?: string;
   reason?: string;
   /** Later sends after Raft could not confirm one (`RETRY_DELAYS_MS`), and when the next is due. */
@@ -298,6 +301,8 @@ async function resumeRead(ctx: PluginContext, raft: Raft, reading: RunState): Pr
   };
   log(ctx, run, "read", { pages: material.data.pages, fetched: run.coverage!.fetched, stopReason: material.data.coverage.stopReason });
   if (Date.now() >= run.deadline) return timeout(ctx, raft, run);
+  // Nothing was read: there is nothing for a model to analyse, and nothing failed.
+  if (material.data.coverage.fetchedMessages === 0) return submitResult(ctx, raft, run, emptyWindowReport(material.data), "empty");
   if (run.calls >= MAX_CALLS) return submitFailed(ctx, raft, run, `the run's ${MAX_CALLS} model calls are spent`);
   return ask(ctx, run, firstTurnText(material.data), true);
 }
@@ -315,9 +320,26 @@ async function ask(ctx: PluginContext, run: RunState, text: string, fresh: boole
   return { turn: text, turnKey, ...(fresh ? { fresh: true as const } : {}) };
 }
 
+/**
+ * The result of a window with no messages in it: an ordinary `incomplete`, sent with `submit` — not the run's failure,
+ * which Raft would try again and count towards its limit — with the window's gaps and no patterns.
+ * SWAP POINT: SDK 0.23.0's `raftbenchEmptyWindowReport(material)`, once `readAll` says `state: "empty"`.
+ */
+export function emptyWindowReport(material: RaftbenchMaterial): RaftbenchReport {
+  return {
+    runId: material.runId, revision: material.revision, status: "incomplete",
+    reason: "No messages were read in this window; nothing was analyzed.", patterns: [], gaps: raftbenchGapsFromCoverage(material.coverage),
+  };
+}
+
 /** Keep the model's result, then send it: from here every send of this run's result is these bytes. */
 async function submitModel(ctx: PluginContext, raft: Raft, run: RunState, result: unknown): Promise<PluginNext | void> {
-  const pending: RunState = { ...run, phase: "submitting", from: "model", body: JSON.stringify(result), retries: 0 };
+  return submitResult(ctx, raft, run, result, "model");
+}
+
+/** Keep a result sent with `submit` (the model's, or an empty window's), then send it: every send is these bytes. */
+async function submitResult(ctx: PluginContext, raft: Raft, run: RunState, result: unknown, from: "model" | "empty"): Promise<PluginNext | void> {
+  const pending: RunState = { ...run, phase: "submitting", from, body: JSON.stringify(result), retries: 0 };
   delete pending.reason;
   delete pending.retryAt;
   await save(ctx, CURRENT, pending);
@@ -343,7 +365,7 @@ async function send(ctx: PluginContext, raft: Raft, run: RunState): Promise<Plug
   }
   if (r.ok && r.data.kind === "invalid") {
     const issues = r.data.issues;
-    if (run.from === "plugin") return end(ctx, raft, run, "refused: the plugin's own result was invalid", { issues: issues.length });
+    if (run.from !== "model") return end(ctx, raft, run, "refused: the plugin's own result was invalid", { issues: issues.length });
     if (run.readCalls < MAX_CALLS_PER_READ && run.calls < MAX_CALLS && Date.now() < run.deadline) {
       log(ctx, run, "fixup", { issues: issues.length });
       const fixing: RunState = { ...run };

@@ -793,7 +793,9 @@ botiverse/slock#10130 and #10134). Every other Raft POST leaves it out.
 - **A run.** Raft assigns one as a `system.raftbench` event and pushes the agent its usual inbox notice. Under the
   profile a push is never a message to the model: it wakes the plugin, which reads the agent's events (an assignment counts only from Raft's `system.raftbench` app), reads every
   page of the run's material, and starts one turn with it in a conversation of its own (the coverage block, the messages, and one line
-  asking for the result); its fix-up turn stays in that conversation, and no overflowed conversation is rebuilt. The model's answer is submitted as it wrote it, `incomplete` included, except for its run id, revision and
+  asking for the result); its fix-up turn stays in that conversation, and no overflowed conversation is rebuilt. A window with no messages in it makes no model call: it is submitted as an ordinary `incomplete` ("No messages were
+  read in this window; nothing was analyzed.", through `submit`, so it is not a failure Raft retries). The model's
+  answer is submitted as it wrote it, `incomplete` included, except for its run id, revision and
   `gaps`, which the plugin sets (the gaps from what the read covered; the model is never asked for them). An invalid answer gets one
   fix-up turn with the list of what is wrong; a second invalid one, a read that failed, a model that failed, a
   cancelled turn and the deadline end the run as failed, with the reason (`raft.raftbench.submitFailure`: an
