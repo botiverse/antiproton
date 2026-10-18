@@ -184,8 +184,9 @@ export function queuedCall(env: ModelEnv, bucket: Parameters<typeof imageLoaderF
  * reasoning on and its earlier reasoning replayed (src/model/openai-responses.ts); every other model through
  * chat/completions, whose request — DeepSeek's among them — test/model-request-snapshot.ts pins byte for byte.
  * The job's own options are not forwarded on either path: the reasoning level and the output cap are each client's
- * default, except for an output cap a profile set (`maxTokens`, src/runtime/agent-profile.ts) and except where
- * the object marked the job `reasoning: "off"` (an agent's first turn made to run without, src/runtime/prewarm.ts).
+ * default, except for the output cap and reasoning level a profile set (`maxTokens`, `reasoning`,
+ * src/runtime/agent-profile.ts) and except where the object marked the job `reasoning: "off"` (an agent's first turn
+ * made to run without, src/runtime/prewarm.ts).
  *
  * An image in the conversation is stored as a reference (src/model/images.ts); for a model that can see images
  * (`acceptsImages`) the newest ones, within the image window (`imageWindowOf`), are read through `images` — the
@@ -217,7 +218,7 @@ export async function callQueuedModel(env: ModelEnv, job: any, jobId: string, im
   let lastStatus: number | undefined;
   const observe = recording ? { onStatus: (s: number) => { lastStatus = s; } } : {};
   // The options a job may carry, each marked by its object (`AgentRuntime.takeJob`): reasoning off for a first turn
-  // made to run without, and an output cap for an agent whose profile sets one. A job without them is sent exactly the
+  // made to run without, and the output cap and reasoning level of an agent whose profile sets them. A job without them is sent exactly the
   // request it always was.
   const options = jobOptions(job);
   let call: () => Promise<ModelResponse>;
@@ -262,10 +263,15 @@ export async function callQueuedModel(env: ModelEnv, job: any, jobId: string, im
   return fromResponse(res, identity, jobId);
 }
 
-/** `reasoning` as a taken job carries it: only "off" is ever set (`AgentRuntime.takeJob`); anything else is no option. */
-function jobOptions(job: any): { reasoning?: "off"; maxTokens?: number } {
+const REASONING_LEVELS: ReadonlySet<unknown> = new Set(["off", "low", "high"]);
+
+/**
+ * The options a taken job carries (`AgentRuntime.takeJob`): `reasoning` is "off" for a first turn made to run without,
+ * or a profile's level; anything that is not a level is no option.
+ */
+function jobOptions(job: any): { reasoning?: "off" | "low" | "high"; maxTokens?: number } {
   return {
-    ...(job?.reasoning === "off" ? { reasoning: "off" as const } : {}),
+    ...(REASONING_LEVELS.has(job?.reasoning) ? { reasoning: job.reasoning as "off" | "low" | "high" } : {}),
     ...(Number.isInteger(job?.maxTokens) && job.maxTokens > 0 ? { maxTokens: job.maxTokens as number } : {}),
   };
 }
@@ -295,7 +301,8 @@ export async function callPrewarm(env: ModelEnv, job: any): Promise<PrewarmResul
   try {
     const request = operatorRequest(operatorModelOf(env), { provider, model: called });
     // A prewarm generates nothing, so of a job's options only its reasoning applies.
-    const reasoning = jobOptions(job).reasoning ? { reasoning: "off" as const } : {};
+    const level = jobOptions(job).reasoning;
+    const reasoning = level ? { reasoning: level } : {};
     let res: ModelResponse;
     if (usesResponses(called)) {
       const { input, tools } = toResponsesInput({ ...job.context, messages: [] }, called, {});

@@ -787,8 +787,11 @@ botiverse/slock#10130 and #10134). Every other Raft POST leaves it out.
 - **What the agent is.** Exactly two mounts: `raft`, with the credential Raft sends (its `raftbench` capability), and
   `raftbench`, whose code does the work. The harness is minimal (no `run_js`, `resume`, jobs or subagents) and the
   model is offered no tools at all. Its system prompt is the plugin's instructions and nothing else: not the default
-  prompt, not the `instructions` Raft sends, not any mount's paragraph. Every model call's output is capped at 8,192
-  tokens (`RAFTBENCH_MAX_TOKENS`). It runs on the deployment's default model, as an agent created without `model`
+  prompt, not the `instructions` Raft sends, not any mount's paragraph. Every model call's output, reasoning included, is capped at
+  8,192 tokens (`RAFTBENCH_MAX_TOKENS`), and every call asks for low reasoning (the profile's `reasoning`; DeepSeek
+  `reasoning_effort: "low"`): DeepSeek's default is thinking on at high effort, it takes no separate budget for the
+  reasoning, and at that default a call has spent all 8,192 tokens reasoning and returned no answer. In DeepSeek's
+  thinking mode `temperature` is ignored, so the `0` every call sends has no effect there. It runs on the deployment's default model, as an agent created without `model`
   does; `GET /provision/agents/{agentId}/model` says which.
 - **A run.** Raft assigns one as a `system.raftbench` event and pushes the agent its usual inbox notice. Under the
   profile a push is never a message to the model: it wakes the plugin, which reads the agent's events (an assignment counts only from Raft's `system.raftbench` app), reads every
@@ -797,7 +800,10 @@ botiverse/slock#10130 and #10134). Every other Raft POST leaves it out.
   read in this window; nothing was analyzed.", through `submit`, so it is not a failure Raft retries). The model's
   answer is submitted as it wrote it, `incomplete` included, except for its run id, revision and
   `gaps`, which the plugin sets (the gaps from what the read covered; the model is never asked for them). An invalid answer gets one
-  fix-up turn with the list of what is wrong; a second invalid one, a read that failed, a model that failed, a
+  fix-up turn with the list of what is wrong. A call that spent its whole output cap without writing anything takes
+  that slot instead: the same request is sent once more, in a conversation of its own, with reasoning off (DeepSeek
+  `thinking: { type: "disabled" }`), and its result is then treated as a fix-up's; a second empty reply at the cap fails
+  the run; a second invalid one, a read that failed, a model that failed, a
   cancelled turn and the deadline end the run as failed, with the reason (`raft.raftbench.submitFailure`: an
   `incomplete` result with `failure: true`, so Raft tries the same material again); a `failure` the model writes is
   refused before anything is sent, and counts as invalid output. A revision

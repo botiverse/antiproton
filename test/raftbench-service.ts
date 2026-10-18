@@ -14,7 +14,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { AgentRuntime } from "../cf/src/runtime.ts";
 import { adoptProvisionedAgent, provisionTool, PROVISION_MOUNT_ALIAS } from "../cf/src/provision/steps.ts";
-import { operatorModelOf } from "../cf/src/model-request.ts";
+import { callQueuedModel, operatorModelOf } from "../cf/src/model-request.ts";
 import { errorMessage, fromResponse } from "../src/model/pi-bridge.ts";
 import { ModelRequestRefused } from "../src/model/openai-compatible.ts";
 import type { ModelResponse } from "../src/model/types.ts";
@@ -254,16 +254,42 @@ async function pass(w: World) {
 const usage = { promptTokens: 1, completionTokens: 1, reasoningTokens: 0, cachedPromptTokens: 0 };
 /** Answer the model call that is out with `text`, and run the pass its answer wakes. Returns the job it answered. */
 async function answer(w: World, text: string) {
+  return answerWith(w, { text, finishReason: "stop", truncated: false, usage, toolCalls: [] } as ModelResponse);
+}
+/** Answer the model call that is out with the provider's reply `res`, as the queue consumer would (`fromResponse`). */
+async function answerWith(w: World, res: ModelResponse) {
   const id = w.sent.find((x) => !w.answered.has(x));
   must(id, `no model call is out (sent ${w.sent.length})`);
   w.answered.add(id);
   const job = await w.rt.takeJob("t", SERVICE, id) as any;
   w.jobs.push(job);
-  await w.rt.deliverAnswer("t", SERVICE, id, fromResponse({ text, finishReason: "stop", truncated: false, usage, toolCalls: [] } as ModelResponse,
-    { api: job.model.api, provider: job.model.provider, id: job.model.id }, id), undefined);
+  await w.rt.deliverAnswer("t", SERVICE, id, fromResponse(res, { api: job.model.api, provider: job.model.provider, id: job.model.id }, id), undefined);
   await pass(w);
   return job;
 }
+/** DeepSeek's reply when the reasoning spent the whole cap: finish_reason length, every token reasoning, no text. */
+const atCap = (): ModelResponse => ({ text: "", finishReason: "length", truncated: true, toolCalls: [],
+  usage: { promptTokens: 1, completionTokens: RAFTBENCH_MAX_TOKENS, reasoningTokens: RAFTBENCH_MAX_TOKENS, cachedPromptTokens: 0 } } as ModelResponse);
+
+/**
+ * The body the queue consumer sends for a taken job (`callQueuedModel`), at a DeepSeek-shaped provider: `fetch` is
+ * replaced for the one call and given back, so the fake Raft keeps answering everything else.
+ */
+async function sentBody(job: unknown): Promise<Record<string, unknown>> {
+  const real = globalThis.fetch;
+  const bodies: string[] = [];
+  globalThis.fetch = (async (_input: unknown, init?: RequestInit) => {
+    bodies.push(String(init?.body));
+    return new Response(JSON.stringify({ choices: [{ finish_reason: "stop", message: { content: "{}" } }], usage: { prompt_tokens: 1, completion_tokens: 1 } }),
+      { status: 200, headers: { "content-type": "application/json" } });
+  }) as typeof fetch;
+  try { await callQueuedModel({ HARNESS_MODEL: "deepseek-flash", DEEPSEEK_BASE_URL: "https://api.deepseek.com", DEEPSEEK_API_KEY: "sk-test" } as never, job, "mj_body"); }
+  finally { globalThis.fetch = real; }
+  must(bodies.length === 1, `provider requests: ${bodies.length}`);
+  return JSON.parse(bodies[0]!);
+}
+/** The options a body carries beside its messages: the cap, temperature and any reasoning field. */
+const dials = (b: Record<string, unknown>) => show(Object.fromEntries(Object.entries(b).filter(([k]) => k !== "messages" && k !== "tools")));
 
 /** What the model's latest call was asked: its last user message's text. */
 const lastUserText = (job: any) => {
@@ -317,6 +343,9 @@ await check("prompt: the profile's agent sees only the plugin's instructions and
   must(service.systemPrompt.includes("\n- If the material shows none of these patterns, return an empty patterns list; do not invent a pattern to have something to report.\n"),
     "the empty-patterns rule is not in the prompt as reviewed");
   must(service.systemPrompt.includes("- Write reason, explanation and suggestion in Simplified Chinese; keep enum values as they are."), "the language rule is missing");
+  // Its own bullet: reasoning and the answer share one output cap, and a call that spends it reasoning answers nothing.
+  must(service.systemPrompt.endsWith("\n- Keep your reasoning brief. Your reply must contain the complete JSON object; an empty or cut-off reply is a failure."),
+    "the short-reasoning rule is not the prompt's last bullet, word for word");
   // The plugin says what the read left out; the model is never asked for it.
   must(!/gaps/i.test(service.systemPrompt), "the prompt mentions gaps");
   for (const kind of ["repeated_clarification", "repeated_attempt", "unsupported_completion", "successful_practice"]) {
@@ -331,6 +360,18 @@ await check("prompt: the profile's agent sees only the plugin's instructions and
   const plain = await (await w.rt.agent("t", "raft_plain")).requestPrefix!();
   must(plain.systemPrompt.startsWith(BASE_SYSTEM.split("\n")[0]!) && plain.systemPrompt.includes("You are Cody.") && !plain.systemPrompt.includes(RAFTBENCH_INSTRUCTIONS.slice(0, 50)), plain.systemPrompt.slice(0, 300));
   must(plain.tools.some((t) => t.name === modelToolName("raft", "receive_events")) && plain.tools.some((t) => t.name === "run_js"), plain.tools.map((t) => t.name).join(", "));
+});
+
+await check("a default agent beside the profile's is sent the request it always was: no reasoning field, the client's own cap", async () => {
+  const w = await world();
+  must((await adoptProvisionedAgent(w.rt, "t", "raft_plain", { name: "Cody", instructions: "be brief", raftOrigin: ORIGIN, avatar: "00", toolConfig: null, profile: null })).ok, "plain adopt");
+  await w.rt.postMessage("t", "raft_plain", "hello", "prompt", "main");
+  await w.rt.step("t", "raft_plain");
+  must(w.sent.length === 1, `model calls: ${w.sent.length}`);
+  const job = await w.rt.takeJob("t", "raft_plain", w.sent[0]!) as any;
+  must(!("reasoning" in job) && !("maxTokens" in job), `the job carries ${show({ reasoning: job.reasoning, maxTokens: job.maxTokens })}`);
+  const body = await sentBody(job);
+  must(dials(body) === show({ model: "deepseek-flash", max_tokens: 32768, temperature: 0 }), dials(body));
 });
 
 // ---- the assignment and the read ----------------------------------------------------------------------------
@@ -349,6 +390,9 @@ await check("an assignment reaches the plugin, not the model: the first turn is 
   must(text.endsWith(`\n\nReply with the result for runId=${w.raft.run.runId} revision=3 as one JSON object.`), text.slice(-200));
   must(!text.includes("Inbox update") && !text.includes("receive_events") && !text.includes("This run is handled automatically"), "the notice or the event reached the model");
   must(job.maxTokens === RAFTBENCH_MAX_TOKENS && (job.context.tools ?? []).length === 0, `maxTokens ${job.maxTokens}, tools ${(job.context.tools ?? []).length}`);
+  // DeepSeek's default reasoning (on, effort high) can spend the whole cap and leave no answer: the profile asks low.
+  const body = await sentBody(job);
+  must(dials(body) === show({ model: "deepseek-flash", max_tokens: RAFTBENCH_MAX_TOKENS, temperature: 0, reasoning_effort: "low" }), dials(body));
   must(job.context.systemPrompt === RAFTBENCH_INSTRUCTIONS, "the call's system prompt is not the plugin's");
   exported.firstTurn = text;
   exported.system = job.context.systemPrompt;
@@ -440,7 +484,11 @@ await check("invalid output gets exactly one fix-up turn with the SDK's list; in
   await answer(w, bad);
   must(w.sent.length === 2, `model calls after the first invalid result: ${w.sent.length}`);
   must(w.raft.submits().length === 0, "an invalid result reached Raft");
-  const fix = lastUserText(await w.rt.takeJob("t", SERVICE, w.sent[1]!));
+  const fixJob = await w.rt.takeJob("t", SERVICE, w.sent[1]!);
+  const fix = lastUserText(fixJob);
+  // The fix-up is a second call of the same conversation, not a first turn: it is asked at the profile's level too.
+  const fixBody = await sentBody(fixJob);
+  must(dials(fixBody) === show({ model: "deepseek-flash", max_tokens: RAFTBENCH_MAX_TOKENS, temperature: 0, reasoning_effort: "low" }), dials(fixBody));
   must(fix.startsWith("The result was not saved. Fix every item below in one go:") && /status/.test(fix) && /messageId/.test(fix), fix);
   must(fix.trim().endsWith("Reply with the complete corrected result, not only the changes.") && fix.split("Reply with the complete corrected result").length === 2, fix);
   must(!/failure/i.test(fix), "the fix-up turn mentions failure");
@@ -470,7 +518,11 @@ await check("a result the Server refuses (evidence not read) also gets its one f
   const unread = goodResult({ patterns: [{ kind: "repeated_attempt", explanation: "x", evidence: [{ target: "#eng", messageId: "c3d4e5f6" }], counterevidence: [], evidenceLevel: "conversation_only", intent: "unknown", suggestion: "" }] });
   await answer(w, unread);
   must(w.raft.submits().length === 1 && w.sent.length === 2, `submits ${w.raft.submits().length}, calls ${w.sent.length}`);
-  const fix = lastUserText(await w.rt.takeJob("t", SERVICE, w.sent[1]!));
+  const fixJob = await w.rt.takeJob("t", SERVICE, w.sent[1]!);
+  const fix = lastUserText(fixJob);
+  // The fix-up is a second call of the same conversation, not a first turn: it is asked at the profile's level too.
+  const fixBody = await sentBody(fixJob);
+  must(dials(fixBody) === show({ model: "deepseek-flash", max_tokens: RAFTBENCH_MAX_TOKENS, temperature: 0, reasoning_effort: "low" }), dials(fixBody));
   must(/patterns\.0\.evidence\.0|patterns\[0\]\.evidence\[0\]/.test(fix) && /not read in this run/.test(fix), fix);
   await answer(w, goodResult());
   must(w.raft.accepted.size === 1 && w.raft.submits().length === 2, "the fixed result was not accepted");
@@ -501,6 +553,88 @@ await check("a cancelled turn submits the plugin's failure once", async () => {
   for (let i = 0; i < 3; i++) await pass(w);
   const submits = w.raft.submits();
   must(submits.length === 1 && /cancelled/.test(submits[0]!.body.reason) && submits[0]!.body.failure === true, show(submits));
+});
+
+// ---- an empty reply at the output cap ------------------------------------------------------------------------
+
+const LOW = { model: "deepseek-flash", max_tokens: RAFTBENCH_MAX_TOKENS, temperature: 0, reasoning_effort: "low" };
+const OFF = { model: "deepseek-flash", max_tokens: RAFTBENCH_MAX_TOKENS, temperature: 0, thinking: { type: "disabled" } };
+
+await check("an empty reply at the cap is asked again once, the same request with reasoning off, and its valid result is submitted", async () => {
+  const w = await world();
+  logs.length = 0;
+  await assign(w);
+  const first = await answerWith(w, atCap());
+  must(w.sent.length === 2 && w.raft.submits().length === 0, `calls ${w.sent.length}, submits ${w.raft.submits().length}`);
+  must(runLogs("retry_without_reasoning").length === 1, show(logs.filter((l) => l.evt === "raftbench.run")));
+  const retry = await w.rt.takeJob("t", SERVICE, w.sent[1]!) as any;
+  must(retry.reasoning === "off", `the retry's reasoning: ${retry.reasoning}`);
+  const [was, again] = [await sentBody(first), await sentBody(retry)];
+  must(dials(was) === show(LOW) && dials(again) === show(OFF), `first ${dials(was)}, retry ${dials(again)}`);
+  // The same input: the system prompt and the material, and nothing of the failed call or any added text.
+  must(show(again.messages) === show(was.messages) && (again.messages as unknown[]).length === 2, `the retry's messages moved:\n${show(again.messages).slice(0, 400)}`);
+  await answer(w, goodResult());
+  const submits = w.raft.submits();
+  must(submits.length === 1 && w.raft.accepted.size === 1 && submits[0]!.body.failure === undefined, show(submits));
+  must(w.sent.length === 2 && runLogs("done").some((l) => l.outcome === "accepted" && l.from === "model"), show(runLogs("done")));
+});
+
+await check("an empty reply at the cap twice ends as the plugin's failure, with no third call", async () => {
+  const w = await world();
+  logs.length = 0;
+  await assign(w);
+  await answerWith(w, atCap());
+  await answerWith(w, atCap());
+  for (let i = 0; i < 3; i++) await pass(w);
+  const submits = w.raft.submits();
+  must(w.sent.length === 2, `model calls: ${w.sent.length}`);
+  must(submits.length === 1 && submits[0]!.body.failure === true && /^The model failed before giving a result: the model reached its output limit/.test(submits[0]!.body.reason), show(submits));
+  must(runLogs("retry_without_reasoning").length === 1, show(runLogs("retry_without_reasoning")));
+});
+
+await check("the retry takes the fix-up slot: an invalid result from it ends as validation failed, with no third call", async () => {
+  const w = await world();
+  logs.length = 0;
+  await assign(w);
+  await answerWith(w, atCap());
+  await answer(w, goodResult({ status: "maybe" }));
+  for (let i = 0; i < 3; i++) await pass(w);
+  const submits = w.raft.submits();
+  must(w.sent.length === 2, `model calls: ${w.sent.length}`);
+  must(submits.length === 1 && submits[0]!.body.failure === true && /^validation failed: /.test(submits[0]!.body.reason), show(submits));
+  must(!runLogs("fixup").length, show(runLogs("fixup")));
+});
+
+await check("an empty reply at the cap with the fix-up slot spent is not retried: the run fails", async () => {
+  const w = await world();
+  logs.length = 0;
+  await assign(w);
+  await answer(w, goodResult({ status: "maybe" }));
+  must(w.sent.length === 2 && runLogs("fixup").length === 1, `calls ${w.sent.length}`);
+  await answerWith(w, atCap());
+  for (let i = 0; i < 3; i++) await pass(w);
+  const submits = w.raft.submits();
+  must(w.sent.length === 2 && !runLogs("retry_without_reasoning").length, `calls ${w.sent.length}`);
+  must(submits.length === 1 && submits[0]!.body.failure === true && /output limit/.test(submits[0]!.body.reason), show(submits));
+});
+
+await check("limits with the retry: a reread after it is asked at the profile's level again, and the run stays within four calls", async () => {
+  const w = await world();
+  logs.length = 0;
+  await assign(w);
+  // First read: an empty reply at the cap, then its retry's result meets a revision conflict.
+  await answerWith(w, atCap());
+  w.raft.inject.set("/internal/agent-api/raftbench/submit", [refusal(409, "raftbench_revision_conflict")]);
+  await answer(w, goodResult());
+  must(w.sent.length === 3, `after the reread: ${w.sent.length} model calls`);
+  const reread = await w.rt.takeJob("t", SERVICE, w.sent[2]!) as any;
+  must(dials(await sentBody(reread)) === show(LOW), `the reread's call: ${dials(await sentBody(reread))}`);
+  // Second read: the same again; its retry fails too, which ends the run.
+  await answerWith(w, atCap());
+  await answerWith(w, atCap());
+  for (let i = 0; i < 3; i++) await pass(w);
+  must(w.sent.length === MAX_CALLS, `model calls: ${w.sent.length}`);
+  must(w.raft.submits().filter((s) => s.body.failure === true).length === 1, show(w.raft.submits()));
 });
 
 // ---- limits -------------------------------------------------------------------------------------------------
@@ -815,6 +949,7 @@ await check("retention: every terminal path leaves no copy — timeout, read fai
       await pass(w);
     },
     cancel: async (w) => { await w.rt.stopTurn("t", SERVICE, "provider_stop"); for (let i = 0; i < 2; i++) await pass(w); },
+    "an empty reply at the cap, twice": async (w) => { await answerWith(w, atCap()); await answerWith(w, atCap()); },
     reread: async (w) => {
       w.raft.inject.set("/internal/agent-api/raftbench/submit", [refusal(409, "raftbench_revision_conflict")]);
       await answer(w, markedAnswer());

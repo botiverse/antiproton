@@ -56,8 +56,8 @@ import { logicalMain, physicalSession } from "./fresh-context.ts";
 import { profilePrompt, systemPrompt } from "../../src/runtime/pi-prompt.ts";
 import { profileOf, profileSpec } from "../../src/runtime/agent-profile.ts";
 import {
-  askedTurn, askWake, bindTurn, dropAnswer, forgetTurnText, keepTurnOnly, dropWake, dueWakes, keepAnswer, keepsPluginCalls, markAnswerPosting, nextWakeAt, pendingAnswers, pendingTurnEnds, recordTurnEnd,
-  turnEndHandled, turnEndOf,
+  askedTurn, askWake, bindTurn, conversationReasoning, dropAnswer, forgetTurnText, keepTurnOnly, dropWake, dueWakes, keepAnswer, keepsPluginCalls, markAnswerPosting, nextWakeAt, pendingAnswers, pendingTurnEnds, recordTurnEnd,
+  setConversationReasoning, turnEndHandled, turnEndOf,
 } from "../../src/runtime/plugin-wakes.ts";
 import type { PluginHookAnswer } from "../../src/runtime/gateway.ts";
 import { ASSUMED_CONTEXT_WINDOW } from "../../src/model/context-windows.ts";
@@ -3903,20 +3903,28 @@ export class AgentRuntime {
   /**
    * The reasoning a model call of this agent runs with, when it is not the provider's default: `off` for a call of
    * the agent's first turn on an agent made with `firstTurn: { reasoning: "off" }` (POST /provision/agents;
-   * src/runtime/prewarm.ts). Undefined otherwise, which sends the request it always was. Had once per agent: this
+   * src/runtime/prewarm.ts), and otherwise its profile's level for every call (`reasoning`, src/runtime/agent-profile.ts);
+   * a level a plugin set for the current main conversation (`PluginNext.reasoning`) before either.
+   * Undefined for any other agent, which sends the request it always was. The first turn is had once per agent: this
    * call's conversation holds no turn-ending answer (`inFirstTurn`), it is the agent's first main conversation, and no
    * cancel ended a turn of it (`firstTurnDone`). A reply ends it within its conversation, and every later conversation
    * is a new one after an ended first, so no other mark is needed (pi085 does not compact in place; a fresh context, a
    * rebuild and the overflow backstop all start a new main conversation, `startFreshMain`). `model` is the one the
-   * call reaches: one with no known off field (`reasoningOffSupported`) runs with its default.
+   * call reaches: one with no known off field (`reasoningOffSupported`) runs its first turn as any other call.
    */
-  async #reasoningFor(tenantId: string, agentId: string, session: string, context: unknown, model: string | undefined): Promise<"off" | undefined> {
-    if (session !== MAIN_SESSION) return undefined;
-    const first = firstTurnOf((await this.store.loadAgent(tenantId, agentId))?.config);
-    if (!first || !model || !reasoningOffSupported(model)) return undefined;
+  async #reasoningFor(tenantId: string, agentId: string, session: string, context: unknown, model: string | undefined): Promise<"off" | "low" | "high" | undefined> {
+    const config = (await this.store.loadAgent(tenantId, agentId))?.config;
+    const profile = profileOf(config);
+    const level = profile ? profileSpec(profile).reasoning : undefined;
+    if (session !== MAIN_SESSION) return level;
     const sql = this.#deps.ctx.storage.sql;
-    if (firstTurnDone(sql, tenantId, agentId)) return undefined;
-    return inFirstTurn(context) ? first.reasoning : undefined;
+    // A plugin's level for this one conversation, set when it started it (`PluginNext.reasoning`), comes first.
+    const set = conversationReasoning(sql, currentMainId(sql));
+    if (set) return set;
+    const first = firstTurnOf(config);
+    if (!first || !model || !reasoningOffSupported(model)) return level;
+    if (firstTurnDone(sql, tenantId, agentId)) return level;
+    return inFirstTurn(context) ? first.reasoning : level;
   }
 
   /** A turn of the main conversation was cancelled: an agent made with `firstTurn` has had its first. */
@@ -5436,12 +5444,25 @@ export class AgentRuntime {
         } else logEvent("plugin.hook", { tenantId, agentId, mount: a.alias, hook, ...("failed" in a ? { failed: a.failed } : { skipped: a.skipped }) });
       }
     };
+    // `again` is read here, while the conversation it repeats is still there: a `fresh` or a `forget` with it ends that
+    // conversation before the turn is posted, and an erase leaves nothing to read. Kept as the `turn` it names.
+    const resolved = async (hook: string, answers: PluginHookAnswer[]): Promise<PluginHookAnswer[]> => {
+      const out: PluginHookAnswer[] = [];
+      for (const a of answers) {
+        if (!("next" in a) || !a.next?.again) { out.push(a); continue; }
+        const { again: _again, ...next } = a.next;
+        const input = await this.#lastTurnInput(tenantId, agentId);
+        if (input === null) logEvent("plugin.hook", { tenantId, agentId, mount: a.alias, hook, dropped: "again: the main conversation holds no turn input" });
+        out.push({ ...a, next: input === null ? next : { ...next, turn: input } });
+      }
+      return out;
+    };
     for (const row of pendingTurnEnds(sql)) {
-      const answers = await this.#gateway.afterTurn(tenantId, agentId, row.endFor);
+      const answers = await resolved("afterTurn", await this.#gateway.afterTurn(tenantId, agentId, row.endFor));
       transact(() => { keep("afterTurn", answers); turnEndHandled(sql, row.seq, Date.now()); });
     }
     for (const w of dueWakes(sql, Date.now())) {
-      const answers = await this.#gateway.wake(tenantId, agentId, w.alias);
+      const answers = await resolved("wake", await this.#gateway.wake(tenantId, agentId, w.alias));
       transact(() => { keep("wake", answers); dropWake(sql, w.alias, w.gen); });
     }
     let posted = false, cancelled = false, waiting = false;
@@ -5476,6 +5497,8 @@ export class AgentRuntime {
         startFreshMain(this.#deps.ctx.storage, Date.now());
         await this.dropHarnesses(tenantId, agentId, "fresh-context");
       }
+      // Before the post, so the conversation's first call is taken at it (`#reasoningFor`).
+      if (a.next.fresh && a.next.reasoning) setConversationReasoning(sql, currentMainId(sql), a.next.reasoning, Date.now());
       if (typeof a.next.turn === "string") {
         const turnKey = a.next.turnKey;
         try {
@@ -5495,6 +5518,21 @@ export class AgentRuntime {
     const next = nextWakeAt(sql);
     const due = next === null ? null : Math.max(0, next - Date.now());
     return { posted, cancelled, wakeInMs: waiting ? Math.min(due ?? HOOK_WAIT_MS, HOOK_WAIT_MS) : due };
+  }
+
+  /**
+   * The input of the main conversation's last turn, as it was posted (`PluginNext.again`): the text of the branch's last
+   * user message, or null when there is none.
+   */
+  async #lastTurnInput(tenantId: string, agentId: string): Promise<string | null> {
+    const branch = await (await this.agent(tenantId, agentId)).branch();
+    for (let i = branch.length - 1; i >= 0; i--) {
+      const m = (branch[i] as { type?: string; message?: { role?: unknown; content?: unknown } }).message;
+      if (branch[i]!.type !== "message" || m?.role !== "user") continue;
+      if (typeof m.content === "string") return m.content;
+      return Array.isArray(m.content) ? m.content.filter((c: any) => c?.type === "text").map((c: any) => String(c.text)).join("") : null;
+    }
+    return null;
   }
 
   /**
@@ -5930,7 +5968,7 @@ export class AgentRuntime {
     // (`recordImageAttempt`); the flag is the object's, and the consumer has no other way to know it. Not on pd,
     // whose calls have no input record for the evidence to join.
     const mark = this.#deps.modelInputEvidence && !this.#isPd();
-    // The first turn's reasoning, for an agent made to answer its first message without (`#reasoningFor`).
+    // The first turn's reasoning, for an agent made to answer its first message without, or its profile's (`#reasoningFor`).
     const reasoning = await this.#reasoningFor(tenantId, agentId, session, (job as { context?: unknown }).context, this.#calledModel(b));
     // A subagent started on one of the owner's model options runs on it (`send_to_agent`'s `model`): the option was
     // checked against USER_MODELS when the subagent was started, and is the operator's account, as an owner's pick is.

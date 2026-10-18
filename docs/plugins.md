@@ -1459,9 +1459,11 @@ Two hooks let a plugin's own code act on what the model did, without offering th
 are in the contract (`src/plugins/types.ts`, where each promise is spelled out), both are optional, and neither is
 called for a plugin that does not declare it.
 
-- **`afterTurn(ctx, { turnId, turnKey, finalText, outcome, error? })`**: a model turn of the agent's main
+- **`afterTurn(ctx, { turnId, turnKey, finalText, outcome, error?, errorCode? })`**: a model turn of the agent's main
   conversation has ended — `completed`, `failed` (with what the model or the run reported) or `cancelled` — and
-  `finalText` is the model's last text, or null. `turnKey` is the key this mount gave when it asked for the turn, and
+  `finalText` is the model's last text, or null. `errorCode` says why a `failed` turn failed where the model layer
+  knows it: `output_limit`, the call spent its whole output cap (reasoning included) before writing any answer. Act on
+  the code, never on `error`'s text. `turnKey` is the key this mount gave when it asked for the turn, and
   null for any other turn: a plugin that acts on its own turns ignores the rest. The key is written down as the turn
   is posted, so an eviction before its run's id is known still binds it. A subagent's turn is not told.
 - **`wake(ctx)`**: the plugin asked to be called again (`wakeAt` below), or, for the plugin an agent profile names
@@ -1475,6 +1477,8 @@ Either answers with what it wants next (`PluginNext`), or nothing:
 | `turn` | posts the text as a new turn's input on the main conversation |
 | `turnKey` | names that turn; its end is told to this mount with the key |
 | `fresh` | posts that turn in a new main conversation, so the model is sent nothing from before it; while a run is going it waits, kept, for a later pass |
+| `again` | in place of `turn`, posts again the input of the main conversation's last turn, read as the answer is kept; with `fresh`, the model is sent the request that turn's first call was, and the plugin need keep no copy of it |
+| `reasoning` | with `fresh`, the reasoning level (`off`, `low`, `high`) of every model call in the conversation it starts, in place of the agent's own; the next conversation is back at the agent's own |
 | `forget` | erases the main conversation: its transcript, its model jobs, and the model's text in the turn ends kept. Under a profile that keeps no conversations, `fresh` erases the one before rather than archiving it |
 | `wakeAt` | calls this mount's `wake` at or after that time (epoch ms); one wake is kept per mount, and an earlier ask wins, so a plugin says the time it needs in every answer |
 | `cancelTurn` | ends the running turn with the runtime's own cancel; its end is told to `afterTurn` as `cancelled`. Its model job is dropped, so a call not yet taken is never made, but one already under way runs to its end |

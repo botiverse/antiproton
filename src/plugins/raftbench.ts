@@ -13,7 +13,9 @@
  *    coverage block, then the messages. The model's first turn is that text and one line asking for the result.
  * 3. **The result** (`afterTurn`). The model's last text is parsed and submitted (`raft.raftbench.submit`, which checks
  *    it locally first). An invalid result gets one fix-up turn with the SDK's list of what is wrong; a second invalid
- *    one ends the run through the plugin's own failure (`sendFailure`), "validation failed", with the problems.
+ *    one ends the run through the plugin's own failure (`sendFailure`), "validation failed", with the problems. A call
+ *    that spent its whole output cap without writing anything takes that same slot instead: the same request again,
+ *    with reasoning off (`askAgainWithoutReasoning`), whose result is then treated as a fix-up's.
  *
  * The plugin's own results — a read that failed, a model that failed, a cancelled turn, the deadline, invalid output
  * after the fix-up — all go through `sendFailure`, and nothing else does: a result the model wrote, `incomplete`
@@ -22,7 +24,8 @@
  * Limits, kept in the run's state so an eviction or a replay cannot exceed them:
  * - **model calls**: at most `MAX_CALLS_PER_READ` per read of the material (the analysis and one fix-up), and at most
  *   `MAX_READS` reads, so at most four per run. With no tools offered a turn is one model call, so a turn is what is
- *   counted, before it is asked for. Each call's output is capped by the profile (`RAFTBENCH_MAX_TOKENS`);
+ *   counted, before it is asked for. Each call's output, reasoning included, is capped by the profile
+ *   (`RAFTBENCH_MAX_TOKENS`), which also asks for low reasoning;
  * - **time**: `RUN_DEADLINE_MS` after the assignment arrived, five minutes before Raft stops taking results. At the
  *   deadline the turn in flight is cancelled (`PluginNext.cancelTurn`, the runtime's own cancel) and the run ends as
  *   "timeout": its answer is discarded, though a provider call already under way may still finish (and be billed, up
@@ -92,7 +95,8 @@ How to fill it in:
 - If the material is not enough to judge, do not guess: answer with status "incomplete" and a reason that says what is missing, and include only the patterns the material supports.
 - evidenceLevel is "conversation_only" when the messages themselves show the pattern, "insufficient" when they only suggest it. Tool outcomes are not in the material, so no pattern is verified by them.
 - intent is "deliberately_paused" only when a message says the work was paused on purpose, and "unknown" when you cannot tell.
-- A suggestion is a specific, reusable practice or a draft skill, kept compact: what to change, where it applies, and how to check afterwards that it worked — not a full skill file and not a long diff. If the owner or version of a skill it refers to is unknown, say so instead of inventing one. Nobody carries it out because you wrote it.`;
+- A suggestion is a specific, reusable practice or a draft skill, kept compact: what to change, where it applies, and how to check afterwards that it worked — not a full skill file and not a long diff. If the owner or version of a skill it refers to is unknown, say so instead of inventing one. Nobody carries it out because you wrote it.
+- Keep your reasoning brief. Your reply must contain the complete JSON object; an empty or cut-off reply is a failure.`;
 
 /** The model's first turn: the material, then what to answer with. */
 export function firstTurnText(material: RaftbenchMaterial): string {
@@ -324,11 +328,26 @@ async function resumeRead(ctx: PluginContext, raft: Raft, reading: RunState): Pr
  * fix-up stays in that conversation, beside the material and the answer it corrects. Its callers check the limits.
  */
 async function ask(ctx: PluginContext, run: RunState, text: string, fresh: boolean): Promise<PluginNext> {
+  return { ...(await counted(ctx, run)), turn: text, ...(fresh ? { fresh: true as const } : {}) };
+}
+
+/**
+ * The call that just ended spent its whole output cap before writing anything (`TurnEnd.errorCode` `output_limit`):
+ * the same request again, with reasoning off for that one call. The runtime posts that turn's own input again in a
+ * conversation of its own (`again`), so the model is sent what it was sent before and the plugin keeps no copy of the
+ * material; only the reasoning differs. It takes the read's second call, as a fix-up would, so the limits are the same.
+ */
+async function askAgainWithoutReasoning(ctx: PluginContext, run: RunState): Promise<PluginNext> {
+  return { ...(await counted(ctx, run)), again: true, fresh: true, reasoning: "off" };
+}
+
+/** A model call counted in the run's state, under a key of its own, before it is asked for. */
+async function counted(ctx: PluginContext, run: RunState): Promise<{ turnKey: string }> {
   const calls = run.calls + 1;
   const turnKey = `${run.runId}:${run.revision}:${run.nonce}:${calls}`;
   const asking: RunState = { ...run, phase: "turn", readCalls: run.readCalls + 1, calls, turnKey };
   await save(ctx, CURRENT, asking);
-  return { turn: text, turnKey, ...(fresh ? { fresh: true as const } : {}) };
+  return { turnKey };
 }
 
 /** Keep the model's result, then send it: from here every send of this run's result is these bytes. */
@@ -459,7 +478,7 @@ async function answer(ctx: PluginContext, next: PluginNext | void): Promise<Plug
   const at = [next?.wakeAt, due ?? undefined].filter((t): t is number => t !== undefined);
   const out: PluginNext = { ...(next ?? {}) };
   if (at.length) out.wakeAt = Math.min(...at);
-  return out.turn !== undefined || out.wakeAt !== undefined || out.cancelTurn || out.forget ? out : undefined;
+  return out.turn !== undefined || out.again || out.wakeAt !== undefined || out.cancelTurn || out.forget ? out : undefined;
 }
 
 export const raftbenchPlugin: Plugin = {
@@ -561,6 +580,12 @@ async function turnEnded(ctx: PluginContext, end: TurnEnd): Promise<PluginNext |
   if (run.timedOut !== undefined || Date.now() >= run.deadline) return answer(ctx, await timeout(ctx, raft, run));
   if (end.outcome === "cancelled") return answer(ctx, await submitFailed(ctx, raft, run, "The analysis turn was cancelled before it gave a result."));
   if (end.outcome === "failed") {
+    // An empty reply at the cap is the reasoning having used it all, not an answer: asked once more with none, in the
+    // read's fix-up slot. A second one, or one with the slot spent, fails the run as any model failure does.
+    if (end.errorCode === "output_limit" && run.readCalls < MAX_CALLS_PER_READ && run.calls < MAX_CALLS) {
+      log(ctx, run, "retry_without_reasoning");
+      return answer(ctx, await askAgainWithoutReasoning(ctx, run));
+    }
     return answer(ctx, await submitFailed(ctx, raft, run, `The model failed before giving a result: ${end.error ?? "no reason was given"}`));
   }
   return answer(ctx, await submitModel(ctx, raft, run, resultOf(end.finalText, run)));
