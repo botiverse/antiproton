@@ -271,7 +271,7 @@ const OPS_TENANT = "t-ops";
  * operations. A program's `n`th call is the operation the gateway keys `<run_js call id>:<n>` in task `main`; the id is
  * derived here by hand, not with the runtime's helper, so a change to how the gateway names them shows here. `tool` is
  * the dispatch address the gateway records (`raft.messages_send`, src/runtime/gateway.ts); a send is told by the
- * recorded `modelName`, and a row written before it was recorded (`null`) is none.
+ * recorded `modelName`, or by the address's tool part when there is none (test/model-name-in-the-record.ts).
  */
 async function recordedSends(ops: Array<[callId: string, n: number, alias: string, tool: string, modelName: string | null, status: OperationStatus]>) {
   const host = sqliteHost();
@@ -372,8 +372,6 @@ await check("a program that sent once and also returned a note quoting Raft's wo
     ["p3", 1, "state", "state.get", "state__get", "succeeded"],
     ["p3", 2, "raft", "raft.messages_send", "raft__messages_send", "failed"],
     ["p3", 3, "raft", "raft.messages_send", "raft__messages_send", "succeeded"],
-    // An operation from before the name was recorded: read without crashing, and not a send it can vouch for.
-    ["p3", 4, "raft", "raft.messages_send", null, "succeeded"],
   ]);
   const entries: BriefingEntry[] = [
     user("go", T0),

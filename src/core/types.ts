@@ -104,8 +104,9 @@ export interface OperationRecord {
   /**
    * The name the model was offered this tool under and called it by, exactly as it appeared in its tool list (a
    * collision tie-break's suffix included): recorded at dispatch, because nothing after it can tell which of two
-   * clashing tools got the suffix. Null when no model named the call (an operator's or a provisioning step's) and
-   * on a row from before it was recorded. `tool` is the dispatch address (`<plugin>.<tool>`), which no model sees.
+   * clashing tools got the suffix: the gateway looks the tool a call resolved to up in the turn's offered list
+   * (`InvokeOpts.offered`). Null when that list does not hold it (no model named the call, or the tool was not offered
+   * this turn) and on a row from before it was recorded. `tool` is the dispatch address (`<plugin>.<tool>`), which no model sees.
    */
   modelName: string | null;
   toolVersion: string;

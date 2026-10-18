@@ -443,6 +443,9 @@ export function sendsReported(resultText: string, made: number): Array<{ target:
   return found.slice(0, made).sort((x, y) => x.order - y.order).map(({ target, id }) => ({ target, id }));
 }
 
+/** The tool part of a dispatch address (`raft.messages_send` → `messages_send`): after the first dot, as the gateway splits it. */
+const addressTool = (address: string) => address.slice(address.indexOf(".") + 1);
+
 /** How many sends a program made, given its `run_js` call's id; the transcript does not say (`programSendCounter`). */
 export type ProgramSends = (toolCallId: string) => number;
 
@@ -465,11 +468,13 @@ export function programSendCounter(sql: Sql, tenantId: string, taskId: string = 
     let sends = 0;
     for (let from = 0; from < PROGRAM_CALLS_LOOKED_AT; from += IDS_PER_QUERY) {
       const ids = Array.from({ length: IDS_PER_QUERY }, (_, k) => keyedOperationId(tenantId, taskId, programCallKey(toolCallId, from + k)));
-      // By the name the program called the tool by (`model_name`), the vocabulary `isSendTool` reads; `tool` is the
-      // dispatch address. A row from before the name was recorded has none and counts as no send.
-      const rows = sql.exec(`SELECT model_name FROM operations WHERE tenant_id = ? AND status = 'succeeded' AND operation_id IN (${ids.map(() => "?").join(", ")})`,
-        tenantId, ...ids).toArray() as Array<{ model_name: unknown }>;
-      sends += rows.filter((r) => typeof r.model_name === "string" && isSendTool(r.model_name)).length;
+      // By the offered name the call resolved to (`model_name`), the vocabulary `isSendTool` reads. A call with none
+      // still ran: one to a tool the turn was not offered, which dispatch allows when the mount's tools changed during
+      // the turn (`offeredName`, src/runtime/gateway.ts), or one recorded before names were. It is read by the tool
+      // part of its dispatch address (`<plugin>.<tool>`), since a send that is not counted is a send made twice.
+      const rows = sql.exec(`SELECT model_name, tool FROM operations WHERE tenant_id = ? AND status = 'succeeded' AND operation_id IN (${ids.map(() => "?").join(", ")})`,
+        tenantId, ...ids).toArray() as Array<{ model_name: unknown; tool: unknown }>;
+      sends += rows.filter((r) => isSendTool(typeof r.model_name === "string" ? r.model_name : addressTool(String(r.tool)))).length;
     }
     return sends;
   };

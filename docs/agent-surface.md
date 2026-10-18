@@ -958,7 +958,7 @@ reported.
 
 | Field | On | Value |
 |---|---|---|
-| `toolName` | both | the name the model called the tool by, exactly as its tool list offered it (`state__list`, `raft__messages_send`, a collision tie-break's suffix included), recorded when the call was dispatched. A call no model named, or one recorded before the name was, gives its dispatch address (`raft.messages_send`) |
+| `toolName` | both | the name the model called the tool by, exactly as its tool list offered it (`state__list`, `raft__messages_send`, a collision tie-break's suffix included), recorded when the call was dispatched, whichever form named it (an offered name, `raft.messages_send`, or the plugin's address). A call to a tool the turn was not offered (a mount added during the turn), one no model named, or one recorded before the name was, gives its dispatch address (`raft.messages_send`) |
 | `toolUseId` | both | the call's operation id: the same on the two events of a call, different for every call (two calls to one tool, the host calls of one `run_js` program, the step that continues a tool's question, a call run after approval) |
 | `ok` | the end | `true` succeeded (including a command that exited non-zero), `false` failed or refused (by the mount's policy, or by a person denying the approval), `null` the outcome is not known (lost, or cancelled) |
 | `durationMs` | the end | how long the tool ran; a call held for approval counts from when it began after the approval, not from the request |
