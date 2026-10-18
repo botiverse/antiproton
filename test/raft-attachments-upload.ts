@@ -35,11 +35,20 @@ function ctx() {
   } as any;
 }
 
-/** The agent's object storage: `objects` by key, and every key asked for. */
-function fakeArtifacts(objects: Record<string, Uint8Array> = {}) {
+/**
+ * The agent's object storage: `objects` by key, and every key asked for, by a whole read (`gets`) and by a metadata
+ * read (`heads`). `sizes` overrides what the metadata reports for a key, as a real object of that size would.
+ */
+function fakeArtifacts(objects: Record<string, Uint8Array> = {}, sizes: Record<string, number> = {}) {
   const gets: string[] = [];
+  const heads: string[] = [];
   return {
-    gets, objects,
+    gets, heads, objects,
+    async head(key: string): Promise<{ bytes: number } | null> {
+      heads.push(key);
+      if (key in sizes) return { bytes: sizes[key]! };
+      return objects[key] ? { bytes: objects[key]!.byteLength } : null;
+    },
     async put(key: string, body: Uint8Array) { objects[key] = body; return { ref: `r2://bucket/${key}`, bytes: body.byteLength }; },
     async get(key: string): Promise<Uint8Array> {
       gets.push(key);
@@ -140,11 +149,15 @@ await check("only the caller's own artifact:// files resolve: raw r2:// refs (an
   const other = fakeArtifacts({ "t/tenant/other/sandbox/box-1/work/report.pdf": PNG });
   const e = await failure(() => uploadAttachment({ ref: "artifact://sandbox/box-1/work/report.pdf", target: "#general" }, ctx(), other));
   must(/no file is stored at artifact:\/\/sandbox\/box-1\/work\/report.pdf/.test(e.message), e.message);
-  must(other.gets.length === 1 && other.gets[0] === "t/tenant/agent/sandbox/box-1/work/report.pdf", `asked for: ${JSON.stringify(other.gets)}`);
+  must(other.heads.length === 1 && other.heads[0] === "t/tenant/agent/sandbox/box-1/work/report.pdf" && other.gets.length === 0, `asked for: ${JSON.stringify(other.heads)} ${JSON.stringify(other.gets)}`);
   // Storage failing is not the file being absent: said as a failure that may clear.
-  const down = { ...fakeArtifacts(), async get(): Promise<Uint8Array> { throw new Error("R2 timed out"); } };
-  const d = await failure(() => uploadAttachment({ ref: OWN_REF, target: "#general" }, ctx(), down));
-  must(/storage did not answer/.test(d.message) && (d as any).transient === true && !/R2 timed out/.test(d.message), `${d.message} ${JSON.stringify(d)}`);
+  for (const down of [
+    { ...fakeArtifacts(), async head(): Promise<{ bytes: number } | null> { throw new Error("R2 timed out"); } },
+    { ...fakeArtifacts({ [OWN_KEY]: PNG }), async get(): Promise<Uint8Array> { throw new Error("R2 timed out"); } },
+  ]) {
+    const d = await failure(() => uploadAttachment({ ref: OWN_REF, target: "#general" }, ctx(), down));
+    must(/storage did not answer/.test(d.message) && (d as any).transient === true && !/R2 timed out/.test(d.message), `${d.message} ${JSON.stringify(d)}`);
+  }
   must(seen.paths.length === 0, `Raft was asked: ${seen.paths}`);
 });
 
@@ -164,6 +177,25 @@ await check(`a file over ${UPLOAD_MAX_BYTES / 1024 / 1024} MiB is refused before
   seen = raft();
   const at: any = await uploadAttachment({ ref: OWN_REF, target: "#general" }, ctx(), fakeArtifacts({ [OWN_KEY]: over.subarray(0, UPLOAD_MAX_BYTES) }));
   must(at.bytes === UPLOAD_MAX_BYTES && seen.upload?.bytes.byteLength === UPLOAD_MAX_BYTES, JSON.stringify(at));
+});
+
+await check("an artifact whose metadata reports 26 MiB is refused from the size alone: its bytes are never read", async () => {
+  const seen = raft();
+  const store = fakeArtifacts({ [OWN_KEY]: PNG }, { [OWN_KEY]: 26 * 1024 * 1024 });
+  const e = await failure(() => uploadAttachment({ ref: OWN_REF, target: "#general" }, ctx(), store));
+  must(/is 26\.0 MiB \(27262976 bytes\), over the 25 MiB this mount uploads; nothing was uploaded/.test(e.message), e.message);
+  must(store.heads.length === 1 && store.heads[0] === OWN_KEY, `heads: ${JSON.stringify(store.heads)}`);
+  must(store.gets.length === 0, `the bytes were read: ${JSON.stringify(store.gets)}`);
+  must(seen.paths.length === 0, `Raft was asked: ${seen.paths}`);
+  // Control: the same store reporting the real size is read and uploaded, so it is the size that refused it.
+  const small = fakeArtifacts({ [OWN_KEY]: PNG });
+  await uploadAttachment({ ref: OWN_REF, target: "#general" }, ctx(), small);
+  must(small.heads.length === 1 && small.gets.length === 1, `${JSON.stringify(small.heads)} ${JSON.stringify(small.gets)}`);
+  // And an object that grew past the cap between the size and the read is held to it on the bytes.
+  const grew = new Uint8Array(UPLOAD_MAX_BYTES + 1);
+  const raced = fakeArtifacts({ [OWN_KEY]: grew }, { [OWN_KEY]: PNG.byteLength });
+  const r = await failure(() => uploadAttachment({ ref: OWN_REF, target: "#general" }, ctx(), raced));
+  must(/over the 25 MiB this mount uploads/.test(r.message) && raced.gets.length === 1, r.message);
 });
 
 await check("the Server's own, lower limit is the SDK's to apply, and its refusal reaches the model", async () => {

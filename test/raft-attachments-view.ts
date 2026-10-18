@@ -87,7 +87,7 @@ function ctx() {
 }
 function fakeArtifacts() {
   const puts: Array<{ key: string; body: Uint8Array; type?: string }> = [];
-  return { puts, async put(key: string, body: Uint8Array, type?: string) { puts.push({ key, body, type }); return { ref: `r2://bucket/${key}`, bytes: body.byteLength }; }, async get(): Promise<Uint8Array> { throw new Error("no such artifact"); } };
+  return { puts, async put(key: string, body: Uint8Array, type?: string) { puts.push({ key, body, type }); return { ref: `r2://bucket/${key}`, bytes: body.byteLength }; }, async get(): Promise<Uint8Array> { throw new Error("no such artifact"); }, async head() { return null; } };
 }
 const PRESIGNED = "https://storage.example/obj/x?X-Amz-Signature=SIG";
 /** Raft mints a URL for att-1 with `filename` and the type it declares; storage answers with `body`. */

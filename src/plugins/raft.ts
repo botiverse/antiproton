@@ -2325,6 +2325,10 @@ const UPLOAD_CAPABILITY: readonly string[] = [describeRaftRoute("attachmentUploa
  */
 export const UPLOAD_MAX_BYTES = ATTACHMENT_MAX_BYTES;
 
+function overUpload(ref: string, bytes: number): Error {
+  return new Error(`${ref} is ${sizeOf(bytes)}, over the ${UPLOAD_MAX_BYTES / 1024 / 1024} MiB this mount uploads; nothing was uploaded`);
+}
+
 /**
  * `attachments_upload`, end to end. Everything is checked before Raft is asked: the reference must be this agent's
  * own (`keyForRef` under the caller's scope; only the `artifact://` form, never a raw `r2://` one, which no tool hands
@@ -2350,6 +2354,14 @@ export async function uploadAttachment(
   const key = keyForRef(ref, ctx.caller);
   if (!key) throw new Error(`${ref} does not name a file in this agent's storage; nothing was uploaded`);
   if (!artifacts) throw new Error("this deployment has no object storage to upload a file from; nothing was uploaded");
+  // The size first, from the object's metadata: a file over the cap is refused without its bytes ever being loaded
+  // into the Durable Object's memory, which a whole-object read would do before any length could be checked.
+  let head: { bytes: number } | null;
+  try { head = await artifacts.head(key); } catch {
+    throw marked(new Error(`this agent's storage did not answer for ${ref}; nothing was uploaded`), { transient: true });
+  }
+  if (!head) throw new Error(`no file is stored at ${ref}; nothing was uploaded`);
+  if (head.bytes > UPLOAD_MAX_BYTES) throw overUpload(ref, head.bytes);
   let bytes: Uint8Array;
   try {
     bytes = await artifacts.get(key);
@@ -2360,9 +2372,8 @@ export async function uploadAttachment(
     throw marked(new Error(`this agent's storage did not answer for ${ref}; nothing was uploaded`), { transient: true });
   }
   if (bytes.byteLength === 0) throw new Error(`${ref} is empty, and Raft takes no 0-byte attachment; nothing was uploaded`);
-  if (bytes.byteLength > UPLOAD_MAX_BYTES) {
-    throw new Error(`${ref} is ${sizeOf(bytes.byteLength)}, over the ${UPLOAD_MAX_BYTES / 1024 / 1024} MiB this mount uploads; nothing was uploaded`);
-  }
+  // Again on the bytes read: an object replaced between the two calls is held to the same cap.
+  if (bytes.byteLength > UPLOAD_MAX_BYTES) throw overUpload(ref, bytes.byteLength);
   const filename = typeof a.filename === "string" ? a.filename.trim() : ref.slice(ref.lastIndexOf("/") + 1);
   const mimeType = typeof a.mimeType === "string" ? a.mimeType.trim() : undefined;
   const out = await raftFor(ctx, { state: false }).attachments.upload({ target, filename, bytes, ...(mimeType ? { mimeType } : {}) });
@@ -2430,6 +2441,8 @@ export interface RaftArtifacts {
   put(key: string, body: Uint8Array, contentType?: string): Promise<{ ref: string; bytes: number }>;
   /** The whole object; throws when there is none. `attachments_upload` reads what it sends to Raft through this. */
   get(key: string): Promise<Uint8Array>;
+  /** The object's size from its metadata, without its body; null when there is none. Asked before `get`. */
+  head(key: string): Promise<{ bytes: number } | null>;
 }
 
 /**

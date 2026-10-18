@@ -19,7 +19,7 @@ import { bridgeTools, offeredToolName, qualifyMountedTools, runJsTool, type Moun
  * The plugin as the runtime builds it (cf/src/runtime.ts): with object storage, so the attachment download is offered.
  * The module's `raftPlugin` has none, and so does not offer it (`raftWithoutStorage`, held below).
  */
-const raftPlugin = createRaftPlugin({ artifacts: { async put() { throw new Error("test: nothing should be stored here"); }, async get() { throw new Error("test: nothing should be read here"); } } });
+const raftPlugin = createRaftPlugin({ artifacts: { async put() { throw new Error("test: nothing should be stored here"); }, async get() { throw new Error("test: nothing should be read here"); }, async head() { throw new Error("test: nothing should be read here"); } } });
 
 const originalFetch = globalThis.fetch;
 const PUSH_SECRET = "raft-push-secret-for-tests";
@@ -3463,7 +3463,7 @@ await check("a person's words that name an unoffered tool come back as written f
 /** Object storage as the runtime hands it to a plugin: what was put, under which key, with which type. */
 function fakeArtifacts() {
   const puts: Array<{ key: string; body: Uint8Array; type?: string }> = [];
-  return { puts, async put(key: string, body: Uint8Array, type?: string) { puts.push({ key, body, type }); return { ref: `r2://bucket/${key}`, bytes: body.byteLength }; }, async get(): Promise<Uint8Array> { throw new Error("no such artifact"); } };
+  return { puts, async put(key: string, body: Uint8Array, type?: string) { puts.push({ key, body, type }); return { ref: `r2://bucket/${key}`, bytes: body.byteLength }; }, async get(): Promise<Uint8Array> { throw new Error("no such artifact"); }, async head() { return null; } };
 }
 const PRESIGNED = "https://storage.example/obj/plan.pdf?X-Amz-Signature=deadbeefSIGNATURE";
 const FILE = new TextEncoder().encode("%PDF-1.7 the plan");
@@ -3733,7 +3733,7 @@ await check("a storage redirect is a failure: the Location is never fetched, not
 await check("a stored reference outside this agent's scope is refused: the call fails cleanly, shows no reference, and carries no URL", async () => {
   for (const ref of ["r2://bucket/t/other-tenant/agent/raft/attachments/att-1/plan.pdf", "r2://bucket/t/tenant/agent/raft/../../x/plan.pdf", "not-a-ref"]) {
     const puts: string[] = [];
-    const elsewhere = { async put(key: string, body: Uint8Array) { puts.push(key); return { ref, bytes: body.byteLength }; }, async get(): Promise<Uint8Array> { throw new Error("no such artifact"); } };
+    const elsewhere = { async put(key: string, body: Uint8Array) { puts.push(key); return { ref, bytes: body.byteLength }; }, async get(): Promise<Uint8Array> { throw new Error("no such artifact"); }, async head() { return null; } };
     attachmentServer();
     let lines: string[] = [];
     let out: unknown;
