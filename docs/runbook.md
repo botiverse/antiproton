@@ -408,7 +408,11 @@ table that fails to read is named in `unreadable`, and the answer is then `trunc
 
 **A scan passes only with `found: false`, `truncated: false` and an empty `unreadable`** (`complete: true`). Anything
 else is not a pass: a `found: false` beside `truncated` or `unreadable` says only that the part that was read held none.
-A failure is answered `500` with a fixed text. It is operator-only for a reason: any substring of four characters or more can
+A failure is answered `500` with a fixed text and a `reason`: `object_scan` (the agent's object threw) or `r2_scan`
+(the R2 walk threw). The `admin.storage_scan` log line carries the same reason and the error's class (`errorName`),
+never its message. Right after a deploy, an agent's object can still run the previous build until it restarts (its
+`harness.open` line says `cause=deploy` when it does): a scan that fails `object_scan` then is that object, so wait for
+the restart and ask again. It is operator-only for a reason: any substring of four characters or more can
 be asked about, so it answers whether a text is stored, and is an oracle for what an agent holds.
 
 ```

@@ -197,8 +197,52 @@ await check("route: an unreadable table makes the answer not complete, never a c
   must(partial.status === 200 && body.found === false && body.complete === false && body.truncated === true && show(body.unreadable) === show(["broken"]), partial.text);
   // The object's half throws, its error naming what it read: the answer is a fixed text.
   const failed = await call({ adminStorageScan: async () => { throw new Error(`access to _cf_METADATA.key is prohibited: SQLITE_AUTH near ${NEEDLE}`); } });
-  must(failed.status === 500 && failed.text === JSON.stringify({ error: "the scan failed" }), `${failed.status} ${failed.text}`);
+  must(failed.status === 500 && failed.text === JSON.stringify({ error: "the scan failed", reason: "object_scan" }), `${failed.status} ${failed.text}`);
   for (const t of [partial.text, failed.text, ...logs]) must(!t.toLowerCase().includes(NEEDLE.toLowerCase()) && !t.includes("_cf_METADATA"), `leaked: ${t.slice(0, 200)}`);
+});
+
+/**
+ * The agent's object as the build before #963 answered (`git show e32f932:cf/src/storage-scan.ts`): its table walk read
+ * `_cf_METADATA`, which workerd refuses. Right after a deploy an object can still run that build while the Worker runs
+ * the new one, which is how preview answered "the scan failed" for every needle until the object restarted.
+ */
+function previousBuildObject() {
+  const host = cursorHost();
+  (host as any).db.exec("CREATE TABLE _cf_METADATA (key TEXT, value TEXT)");
+  (host as any).db.exec("CREATE TABLE notes (v TEXT)");
+  return {
+    adminStorageScan: async () => {
+      const names = [...host.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")].map((r: any) => String(r.name));
+      for (const name of names) for (const _row of host.sql.exec(`SELECT * FROM "${name}"`)) { /* read */ }
+      return { tables: [], scanned: { tables: names.length, rows: 0 }, truncated: false, systemSkipped: 0, unreadable: [] };
+    },
+  };
+}
+
+await check("route: a failure says which step threw and logs the error's class, never its message or the needle", async () => {
+  const call = async (half: unknown, artifacts?: unknown) => {
+    logs.length = 0;
+    const w = env(TOKEN, {});
+    (w.env.AGENT as any).get = () => half;
+    if (artifacts) (w.env as any).ARTIFACTS = artifacts;
+    const res = await worker.fetch(new Request("https://x/admin/storage-scan", { method: "POST", headers: { "x-harness-token": TOKEN, "content-type": "application/json" },
+      body: JSON.stringify({ tenantId: "t1", agentId: "a1", needle: NEEDLE }) }), w.env as never, { waitUntil() {}, passThroughOnException() {} } as never);
+    return { status: res.status, text: await res.text(), logs: [...logs] };
+  };
+  // The object on the previous build: its read of a `_cf_` table throws SQLITE_AUTH.
+  const skew = await call(previousBuildObject());
+  must(skew.status === 500 && JSON.parse(skew.text).reason === "object_scan", skew.text);
+  const line = skew.logs.find((l) => l.includes("admin.storage_scan"));
+  must(line && JSON.parse(line).reason === "object_scan" && JSON.parse(line).errorName === "Error" && JSON.parse(line).failed === true, String(line));
+  // R2 failing: its own reason code.
+  const r2 = await call({ adminStorageScan: async (_t: string, _a: string, needle: string) => scanTables(storage().sql as never, needle) },
+    { list: async () => { throw new TypeError(`listing broke near ${NEEDLE}`); }, get: async () => null });
+  must(r2.status === 500 && JSON.parse(r2.text).reason === "r2_scan", r2.text);
+  const r2line = r2.logs.find((l) => l.includes("admin.storage_scan"));
+  must(r2line && JSON.parse(r2line).errorName === "TypeError", String(r2line));
+  for (const t of [skew.text, r2.text, ...skew.logs, ...r2.logs]) {
+    must(!t.toLowerCase().includes(NEEDLE.toLowerCase()) && !t.includes("SQLITE_AUTH") && !t.includes("listing broke"), `leaked: ${t.slice(0, 200)}`);
+  }
 });
 
 await check("route: refused without the operator's token, before the object is asked; bad requests are 400, an unknown agent 404", async () => {
