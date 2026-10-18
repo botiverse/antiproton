@@ -149,8 +149,12 @@ export function modelCallRow(m: {
   model: string; at: number; createdAt?: number | null; answeredAt?: number | null;
   /** What the request shared with the previous one (src/runtime/request-prefix.ts), as the job row kept it. */
   prefix?: Record<string, unknown> | null;
-  /** The answer's own token counts, so a cache miss can be read against the prefix on the same row, and a session's total read off its rows. */
-  usage?: { input?: unknown; output?: unknown; cacheRead?: unknown; cacheWrite?: unknown } | null;
+  /**
+   * The answer's own token counts, so a cache miss can be read against the prefix on the same row, and a session's total read off its rows.
+   * `reasoning` is the part of `output` the model spent reasoning, as the usage ledger counts it (src/usage/outbox.ts
+   * `modelTokenRows`); absent when the provider reported none (src/model/pi-bridge.ts `usageOf`), never a 0 written for unknown.
+   */
+  usage?: { input?: unknown; output?: unknown; cacheRead?: unknown; cacheWrite?: unknown; reasoning?: unknown } | null;
   /** The sentence of a call refused for a daily spend limit (`spendLimitRefusal`, src/model/pi-bridge.ts), for Raft. */
   limit?: string;
   /**
@@ -164,7 +168,8 @@ export function modelCallRow(m: {
     ? Math.max(0, m.answeredAt - m.createdAt) : undefined;
   const num = (v: unknown) => typeof v === "number" && Number.isFinite(v) ? v : undefined;
   const tokens = m.usage ? Object.fromEntries(
-    ([["input", m.usage.input], ["output", m.usage.output], ["cacheRead", m.usage.cacheRead], ["cacheWrite", m.usage.cacheWrite]] as const)
+    ([["input", m.usage.input], ["output", m.usage.output], ["cacheRead", m.usage.cacheRead], ["cacheWrite", m.usage.cacheWrite],
+      ["reasoning", m.usage.reasoning]] as const)
       .flatMap(([k, v]) => num(v) === undefined ? [] : [[k, num(v)]])) : {};
   return {
     at: m.at, tenantId: m.tenantId, agentId: m.agentId,
