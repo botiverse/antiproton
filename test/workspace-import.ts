@@ -442,7 +442,7 @@ await check("every refused file in one answer: the first one's status, code and 
   must(one.status === 422 && show(one.body.error.rejected) === show([{ index: 1, path: "with space.md", reason: "invalid", param: "files[1].path" }]), `one: ${one.text}`);
   // A refused path shaped like a credential is not echoed either.
   const shaped = await imp(w, body(uuid(), [{ path: "/sk-ant-api03-" + "Z".repeat(90), bytes: "a" }]));
-  must(shaped.status === 422 && shaped.body.error.rejected[0].path === null && !shaped.text.includes("ZZZZZZZZ"), `credential-shaped path: ${shaped.text.slice(0, 300)}`);
+  must(shaped.status === 422 && shaped.body.error.rejected[0].path === null && shaped.body.error.rejected[0].reason === "credential_in_path" && !shaped.text.includes("ZZZZZZZZ"), `credential-shaped path: ${shaped.text.slice(0, 300)}`);
   // The status is the first refused file's: a file over its bound first is 413, as it was.
   const big = await imp(w, body(uuid(), [{ path: "big.txt", bytes: "x".repeat(2 * MIB + 1) }, { path: "/abs", bytes: "y" }]));
   must(big.status === 413 && big.body.error.code === "file_too_large" && show(big.body.error.rejected.map((x: any) => x.reason)) === show(["file_too_large", "invalid"]), `413 first: ${big.status} ${big.text.slice(0, 300)}`);
@@ -559,6 +559,82 @@ await check(`an imported MEMORY.md is shown whole up to ${IMPORTED_MEMORY_BUDGET
     }
   }
   must(IMPORTED_MEMORY_BUDGET === 16_000, `the budget is ${IMPORTED_MEMORY_BUDGET}`);
+});
+
+await check("a path shaped like a credential is refused (credential_in_path) on the import and the check, named null, and never repeated in any answer", async () => {
+  const w = await world();
+  const SECRET_PATH = "notes/sk-ant-api03-" + "P".repeat(90) + ".md";
+  // A path the key rule takes, so only the credential rule refuses it.
+  must(/^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/.test(SECRET_PATH), "the path is not a valid key");
+  const b = body(uuid(), [{ path: "ok.md", bytes: "fine" }, { path: SECRET_PATH, bytes: "x" }, { path: "./" + SECRET_PATH, bytes: "y" }]);
+  const want = [
+    { index: 1, path: null, reason: "credential_in_path", param: "files[1].path" },
+    { index: 2, path: null, reason: "credential_in_path", param: "files[2].path" },
+  ];
+  const r = await imp(w, b);
+  must(r.status === 422 && r.body.error.code === "credential_in_path" && r.body.error.param === "files[1].path" && show(r.body.error.rejected) === show(want), `import: ${r.status} ${r.text.slice(0, 400)}`);
+  const c = await check_(w, b);
+  must(c.status === 200 && c.body.ok === false && show(c.body.rejected) === show(want) && show(c.body.totals) === show({ files: 1, bytes: 4 }), `check: ${c.status} ${c.text.slice(0, 400)}`);
+  for (const [what, text] of [["import", r.text], ["check", c.text], ["log", lines.join("\n")]]) {
+    must(!text.includes("PPPPPPPP") && !text.includes("sk-ant-"), `${what} repeats the path: ${text.slice(0, 300)}`);
+  }
+  await nothingWritten(w, "credential path");
+  const ok = await imp(w, body(uuid(), [{ path: "ok.md", bytes: "fine" }]));
+  must(ok.status === 201 && !ok.text.includes("sk-ant-"), `the rest: ${ok.status} ${ok.text}`);
+});
+
+await check("an imported MEMORY.md kept in object storage is shown from the excerpt written at import: CJK whole or cut at 16,000, the same bytes, no bucket read; one replaced since is not", async () => {
+  const CJK = "记住用户偏好简短回答。";
+  const cjk = (n: number) => CJK.repeat(Math.ceil(n / CJK.length)).slice(0, n - 4) + "END!";
+  for (const [n, cut] of [[12_000, false], [20_000, true], [40_000, true]] as const) {
+    const w = await world();
+    const text = cjk(n);
+    must(enc(text).byteLength > 32 * 1024, `${n}: under 32 KiB of UTF-8`);
+    must((await imp(w, body(uuid(), [{ path: "MEMORY.md", bytes: text }, { path: "notes/a.md", bytes: "a" }]))).status === 201, `${n}: import`);
+    const row = await w.rt.store.getState(T, A, "MEMORY.md");
+    // The row's bound is 32 KiB of JSON characters: past it the copy is in the bucket and the row holds only its name.
+    const spilled = JSON.stringify(text).length > 32 * 1024;
+    must(spilled === (row?.value == null && !!row?.ref), `${n}: spilled ${spilled}, row ${show({ value: typeof row?.value, ref: row?.ref })}`);
+    const reads: string[] = [];
+    const { get, head } = w.R2;
+    w.R2.get = async (k: string) => { reads.push(k); return get(k); };
+    w.R2.head = async (k: string) => { reads.push(k); return head(k); };
+    const a = await importedFilesParts(w.rt.store, T, A, new Set());
+    const b = await importedFilesParts(w.rt.store, T, A, new Set());
+    w.R2.get = get; w.R2.head = head;
+    must(reads.length === 0, `${n}: the prompt read the bucket: ${show(reads)}`);
+    must(a.text === b.text && show(a.parts) === show(b.parts), `${n}: two builds differ`);
+    if (!cut) {
+      must(a.text.includes("\n" + text + "\n```") && !a.text.includes("… cut at"), `${n}: not shown whole: ${a.text.slice(-200)}`);
+    } else {
+      must(a.text.includes("\n" + text.slice(0, IMPORTED_MEMORY_BUDGET) + "\n```\n… cut at " + IMPORTED_MEMORY_BUDGET + " of " + n + " characters; get `MEMORY.md` with "),
+        `${n}: not cut at ${IMPORTED_MEMORY_BUDGET}: ${a.text.slice(-300)}`);
+      must(!a.text.includes("END!") && / for the rest\.$/m.test(a.text), `${n}: past the cut`);
+    }
+    if (spilled) {
+      // The same characters the row would have shown inline: the paragraph does not depend on where the copy is.
+      const inline = await world();
+      must((await imp(inline, body(uuid(), [{ path: "MEMORY.md", bytes: text.slice(0, 16_100) }, { path: "notes/a.md", bytes: "a" }]))).status === 201, "inline import");
+      const shown = (t: string) => t.slice(t.indexOf("Its current content"), t.indexOf(`… cut at ${IMPORTED_MEMORY_BUDGET} of `));
+      const fromRow = shown((await importedFilesParts(inline.rt.store, T, A, new Set())).text);
+      must(fromRow.length > IMPORTED_MEMORY_BUDGET && shown(a.text) === fromRow, `${n}: the excerpt shows other characters than the row would`);
+      // A copy the agent replaced since with another too large for its row names another object: no excerpt is its.
+      w.raw.sql.exec("UPDATE agent_state SET ref = ? WHERE key = 'MEMORY.md'", "artifact:replaced");
+      const after = await importedFilesParts(w.rt.store, T, A, new Set());
+      must(after.text.includes("too large to show here and is kept in object storage") && !after.text.includes(CJK), `${n}: a replaced copy: ${after.text.slice(-300)}`);
+    }
+  }
+});
+
+await check("a surrogate pair across the 16,000th character is not split, inline or kept in object storage", async () => {
+  for (const pad of [100, 40_000]) {
+    const w = await world();
+    const text = "a".repeat(IMPORTED_MEMORY_BUDGET - 1) + "😀" + "b".repeat(pad);
+    must((await imp(w, body(uuid(), [{ path: "MEMORY.md", bytes: text }]))).status === 201, "import");
+    const a = await importedFilesParts(w.rt.store, T, A, new Set());
+    must(a.text.includes(`\n${"a".repeat(IMPORTED_MEMORY_BUDGET - 1)}\n\`\`\`\n… cut at ${IMPORTED_MEMORY_BUDGET - 1} of ${text.length} characters;`) && !a.text.includes("�"),
+      `pad ${pad}: ${a.text.slice(-250)}`);
+  }
 });
 
 await check("idempotent: the same migrationId and body again answers the same body (200), writes nothing more; a different one is 409 already_imported", async () => {

@@ -714,24 +714,35 @@ function utf8Bytes(value: Json | undefined): number | null {
 }
 
 /**
- * `MEMORY.md`'s text as the prompt shows it, seeded or imported: fenced, and cut at `budget` characters
- * (`SEEDED_MEMORY_BUDGET` or `IMPORTED_MEMORY_BUDGET`) with a line after the fence saying where the rest is. The cut
- * line is outside the fence: it is the prompt speaking, not the file.
+ * The part of `text` the prompt shows at `budget` characters: the first `budget`, or one fewer where the last would
+ * be the first half of a surrogate pair, so it ends on a code point; and the whole text's length, which the cut line
+ * gives. What an imported `MEMORY.md` kept in object storage is shown by, written once at import
+ * (cf/src/runtime.ts `importWorkspace`), so the prompt shows it without reading the bucket.
  */
-function fencedMemory(value: Json, getTool: string | null, budget: number): string {
-  const text = typeof value === "string" ? value : JSON.stringify(value);
-  let kept = text;
-  let cut = "";
-  if (text.length > budget) {
-    // Not between the two halves of a surrogate pair.
-    const end = /[\uD800-\uDBFF]/.test(text[budget - 1]!) ? budget - 1 : budget;
-    kept = text.slice(0, end);
-    cut = `\n… cut at ${end} of ${text.length} characters; ` +
-      (getTool ? `get \`${SEEDED_MEMORY}\` with ${getTool} for the rest.` : "the rest is not shown.");
-  }
-  kept = kept.trimEnd();
+export function memoryExcerpt(text: string, budget: number): { excerpt: string; chars: number } {
+  if (text.length <= budget) return { excerpt: text, chars: text.length };
+  const end = /[\uD800-\uDBFF]/.test(text[budget - 1]!) ? budget - 1 : budget;
+  return { excerpt: text.slice(0, end), chars: text.length };
+}
+
+/**
+ * `MEMORY.md`'s text as the prompt shows it, seeded or imported, from its excerpt (`memoryExcerpt`): fenced, and when
+ * the excerpt is not the whole text, a line after the fence saying where the rest is. The cut line is outside the
+ * fence: it is the prompt speaking, not the file. The same excerpt gives the same bytes, wherever it was read from.
+ */
+function fencedExcerpt(x: { excerpt: string; chars: number }, getTool: string | null): string {
+  const cut = x.excerpt.length < x.chars
+    ? `\n… cut at ${x.excerpt.length} of ${x.chars} characters; ` +
+      (getTool ? `get \`${SEEDED_MEMORY}\` with ${getTool} for the rest.` : "the rest is not shown.")
+    : "";
+  const kept = x.excerpt.trimEnd();
   const fence = fenceFor(kept);
   return `${fence}\n${kept}\n${fence}${cut}`;
+}
+
+/** `MEMORY.md`'s value as the prompt shows it, cut at `budget` (`SEEDED_MEMORY_BUDGET` or `IMPORTED_MEMORY_BUDGET`). */
+function fencedMemory(value: Json, getTool: string | null, budget: number): string {
+  return fencedExcerpt(memoryExcerpt(typeof value === "string" ? value : JSON.stringify(value), budget), getTool);
 }
 
 /**
@@ -850,7 +861,9 @@ export const IMPORTED_PATHS_SHOWN = 40;
  *
  * Read from the working copy, as `seededFilesParts` reads its own, never from what the import carried: the agent may
  * have edited `MEMORY.md` since, and what it is shown is what its `get` would answer. One kept in object storage is
- * not fetched (opening the harness does not wait on a bucket); the agent is told to `get` it. The other paths are
+ * not fetched (opening the harness does not wait on a bucket): while it is the copy imported, the excerpt the import
+ * wrote in the object's own database is shown, the same characters its row would have shown inline; one the agent
+ * replaced since with another too large for its row is not shown, and the agent is told to `get` it. The other paths are
  * named from the import's manifest, without sizes: reading each row to size it would cost a read per path on every
  * open, and a path the agent removed since is answered as missing by `get`, which the heading says may happen.
  *
@@ -884,11 +897,17 @@ export async function importedFilesParts(
   const memory = shown.includes(SEEDED_MEMORY);
   if (memory) {
     const got = await store.getState(tenantId, agentId, SEEDED_MEMORY);
+    // Kept in object storage, the copy is shown by the excerpt the import wrote beside it, while it is still the copy
+    // imported (the row names the same object); a copy the agent has since replaced with another too large for its
+    // row has no excerpt, and is not fetched.
+    const spilled = got?.ref && got.value == null ? await store.importedExcerpt(tenantId, agentId, SEEDED_MEMORY) : null;
     const body = !got
       ? "It has since been removed from your workspace."
       : got.ref && got.value == null
-        ? "It is too large to show here and is kept in object storage; " +
-          (getTool ? `read it with ${getTool}.` : "you have no tool mounted for reading it.")
+        ? spilled && spilled.ref === got.ref
+          ? "Its current content is the text inside the fence below:\n\n" + fencedExcerpt(spilled, getTool)
+          : "It is too large to show here and is kept in object storage; " +
+            (getTool ? `read it with ${getTool}.` : "you have no tool mounted for reading it.")
         : "Its current content is the text inside the fence below:\n\n" + fencedMemory(got.value, getTool, IMPORTED_MEMORY_BUDGET);
     parts.push(`## \`${SEEDED_MEMORY}\`, in your workspace when you were created\n${body}`);
   }

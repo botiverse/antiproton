@@ -547,13 +547,16 @@ imported file is the agent's own: it may change or remove it.
 that were in your workspace when you were created": `MEMORY.md`'s current text (what its `get` answers now, not the copy
 imported) fenced, up to **16,000** characters (`IMPORTED_MEMORY_BUDGET`, the 16 KB Raft agents are told to keep it
 under) with a line after the fence saying where the rest is (`… cut at 16000 of N characters; get \`MEMORY.md\` with
-the \`get\` tool on the \`state\` mount for the rest.`), or a note that it is kept in object storage (a value over
-32 KiB as JSON) or was removed; then up to 40 of the other imported paths by name, with the count of the rest;
+the \`get\` tool on the \`state\` mount for the rest.`), or a note that it was removed. A copy over its row's
+bound (32 KiB as JSON) is kept in object storage, and shown all the same from the excerpt the import wrote beside it
+in the agent's own database (`import_excerpt`): the prompt never reads the bucket, and the excerpt is the same
+characters the row would have shown. Once the agent replaces that copy with another too large for its row, the
+note says it is kept in object storage and to `get` it; then up to 40 of the other imported paths by name, with the count of the rest;
 and the state mount's `get` to open them (`importedFilesParts`, `src/plugins/state.ts`).
 
 **What a file may be.** UTF-8 text with no NUL byte: a state value is text, and a file that is not could not
 read back as the bytes it was (`422 not_text`). Nothing shaped like a credential (`422 credential_in_text`,
-the kind named and none of the text). Paths are normalised, then checked: empty and `.` segments drop out
+the kind named and none of the text), in its text or in its path (`422 credential_in_path`, `param: "files[i].path"`: a path is a key named in the prompt, listings and answers, and one shaped like a credential is never repeated in any of them). Paths are normalised, then checked: empty and `.` segments drop out
 (`./notes//a.md` is `notes/a.md`); refused with `422`, `param: "files[i].path"`: a leading `/`, a `..`
 segment, a trailing `/`, a backslash, a control character, anything the state key rule
 (`^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$`) refuses once normalised, and a path two files share
@@ -595,8 +598,8 @@ later `PATCH`.
 
 `files` is sorted by path. Errors use the provider envelope, `param` naming the field: `400`
 (`invalid_json`, `unknown_field`), `401`, `404 not_found`, `409` (`already_imported`, `agent_active`),
-`413`, `422` (`invalid`, `reserved`, `duplicate_path`, `sha256_mismatch`, `total_mismatch`, `not_text`,
-`credential_in_text`); a failure underneath is `500`, after which the same request is safe to retry.
+`413`, `422` (`invalid`, `reserved`, `duplicate_path`, `credential_in_path`, `sha256_mismatch`, `total_mismatch`,
+`not_text`, `credential_in_text`); a failure underneath is `500`, after which the same request is safe to retry.
 
 **Every refused file in one answer.** A problem with one file refuses that file, and the check goes on: the answer
 names every file the import refuses, so dropping them takes one round trip, not one per file. The envelope's
@@ -617,8 +620,8 @@ first **200** (`IMPORT_REJECTIONS_SHOWN`):
 
 `index` is the file's place in `files`; `path` the path as sent (cut to 256 characters; `null` when it was not a
 string or is itself shaped like a credential); `reason` the code that file alone would have been refused with
-(`invalid`, `unknown_field`, `reserved`, `duplicate_path`, `sha256_mismatch`, `file_too_large`, `not_text`,
-`credential_in_text`); `param` the field. Never a file's bytes, nor the text a credential was recognised by. A
+(`invalid`, `unknown_field`, `reserved`, `duplicate_path`, `credential_in_path`, `sha256_mismatch`, `file_too_large`,
+`not_text`, `credential_in_text`); `param` the field. Never a file's bytes, nor the text a credential was recognised by. A
 problem with the body as a whole (an unknown top-level field, `migrationId`, `instructions`, `totalBytes`, too many
 files) has no `rejected`. Past 10 MiB together the check ends at the file that crosses it (`413 too_large`,
 `param: "files"`), carrying in `rejected` the files refused before it. `total_mismatch` is checked once no file is

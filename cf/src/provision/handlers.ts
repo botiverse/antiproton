@@ -860,7 +860,7 @@ export function importPath(raw: unknown): { path: string } | { problem: string; 
 export interface ImportRejection { index: number; path: string | null; reason: string; param: string }
 /** How many refused files one answer lists; past it they are counted (`more`), so a bad workspace cannot make the answer as large as the request. */
 export const IMPORT_REJECTIONS_SHOWN = 200;
-/** A sent path as a rejection names it: the caller's own string, cut short, and never one shaped like a credential. */
+/** A sent path as a rejection names it: the caller's own string, cut short; one shaped like a credential is refused and named `null`. */
 const PATH_ECHO_MAX = 256;
 
 /** A refused import: the first problem as the envelope's code and message, and every refused file with it. */
@@ -909,11 +909,17 @@ function importChecked(body: unknown, instructionsMax: Limit): ImportChecked | I
   for (let i = 0; i < list.length; i++) {
     const at = `files[${i}]`, f = list[i] as unknown;
     const sent = typeof f === "object" && f !== null ? field(f, "path") : undefined;
-    const echo = typeof sent === "string" && !secretShape(sent) ? sent.slice(0, PATH_ECHO_MAX) : null;
+    // A path is a state key, named in the prompt, in listings and in every answer about the import: one shaped like a
+    // credential would put the credential in all of them, so it is refused, and never repeated, here or in a message.
+    const credentialPath = typeof sent === "string" && secretShape(sent) !== null;
+    const echo = typeof sent === "string" && !credentialPath ? sent.slice(0, PATH_ECHO_MAX) : null;
     const refuse = (x: Fail) => { rejected.push({ rejection: { index: i, path: echo, reason: x.code, param: x.param ?? at }, fail: x }); };
     if (typeof f !== "object" || f === null || Array.isArray(f)) { refuse({ status: 422, code: "invalid", param: at, message: `${at} is an object { path, contentBase64, sha256 }` }); continue; }
     const extra = Object.keys(f).find((k) => !IMPORT_FILE_FIELDS.has(k));
     if (extra) { refuse({ status: 400, code: "unknown_field", param: `${at}.${extra}`, message: `unknown field ${at}.${extra}${extra === "content" ? "; a file is sent as contentBase64" : ""}` }); continue; }
+    if (credentialPath) {
+      refuse({ status: 422, code: "credential_in_path", param: `${at}.path`, message: `${at}.path carries what looks like a ${secretShape(sent as string)}; credentials are never imported, not even as a name` }); continue;
+    }
     const p = importPath(sent);
     if ("problem" in p) { refuse({ status: 422, code: p.reserved ? "reserved" : "invalid", param: `${at}.path`, message: `${at}.path: ${p.problem}` }); continue; }
     if (seen.has(p.path)) { refuse({ status: 422, code: "duplicate_path", param: `${at}.path`, message: `${at}.path is ${p.path}, which an earlier file already is` }); continue; }

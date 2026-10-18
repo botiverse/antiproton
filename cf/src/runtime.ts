@@ -359,7 +359,7 @@ import { githubPlugin } from "../../src/plugins/github.ts";
 import { demoPlugin } from "../../src/plugins/demo.ts";
 import { httpPlugin } from "../../src/plugins/http.ts";
 import { exaPlugin } from "../../src/plugins/exa.ts";
-import { keptDelete, keptList, keptNameProblem, keptPut, keptValueProblem, statePlugin } from "../../src/plugins/state.ts";
+import { IMPORTED_MEMORY_BUDGET, keptDelete, keptList, keptNameProblem, keptPut, keptValueProblem, memoryExcerpt, SEEDED_MEMORY, statePlugin } from "../../src/plugins/state.ts";
 import { sandboxPlugin, SANDBOX_ALIAS } from "../../src/plugins/sandbox.ts";
 import { builtinToolsPlugin } from "../../src/plugins/builtin.ts";
 import { artifactsPlugin, PARK_BYTES, READ_WHOLE_MAX } from "../../src/plugins/artifacts.ts";
@@ -3731,7 +3731,8 @@ export class AgentRuntime {
         const key = spillKey(tenantId, agentId, attempt, f.sha256);
         if (!uploaded.includes(key)) uploaded.push(key);
         const ref = (await this.#artifacts.put(key, json)).ref;
-        rows.push({ path: f.path, value: null, ref, bytes: json.length });
+        rows.push({ path: f.path, value: null, ref, bytes: json.length,
+          ...(f.path === SEEDED_MEMORY ? { excerpt: memoryExcerpt(f.text, IMPORTED_MEMORY_BUDGET) } : {}) });
       }
       const files = imp.files.map((f) => ({ path: f.path, bytes: f.bytes, sha256: f.sha256 }));
       const r = this.#transact()(() => {

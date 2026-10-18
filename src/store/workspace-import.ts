@@ -164,8 +164,29 @@ export const importInline = (text: string) => JSON.stringify(text).length <= STA
 export const spillKey = (tenantId: string, agentId: string, attempt: string, sha256: string) =>
   `t/${tenantId}/${agentId}/import/${attempt}/${sha256}.json`;
 
-/** One file's row, decided before the transaction: its value's JSON inline, or the reference to it. */
-export interface ImportRow { path: string; value: string | null; ref: string | null; bytes: number }
+/**
+ * One file's row, decided before the transaction: its value's JSON inline, or the reference to it. A spilled file the
+ * prompt shows (`MEMORY.md`) also carries what the prompt shows of it (src/plugins/state.ts `memoryExcerpt`).
+ */
+export interface ImportRow { path: string; value: string | null; ref: string | null; bytes: number; excerpt?: { excerpt: string; chars: number } }
+
+/**
+ * What the prompt shows of an imported file kept in object storage, written with its row: the system prompt is built
+ * on every open of the harness and never waits on the bucket, so without this a `MEMORY.md` over the row's bound
+ * (32 KiB as JSON; 11,000 CJK characters is past it) would be named but never shown. `ref` is the object the row named
+ * when imported: the excerpt is the file's only while the row still names it.
+ */
+export interface ImportExcerpt { ref: string; excerpt: string; chars: number }
+
+const EXCERPT_SCHEMA = `CREATE TABLE IF NOT EXISTS import_excerpt (
+  tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL, path TEXT NOT NULL, ref TEXT NOT NULL, excerpt TEXT NOT NULL,
+  chars INTEGER NOT NULL, PRIMARY KEY (tenant_id, agent_id, path))`;
+
+/** The excerpt an import wrote for `path`, or null. A read: makes no table. */
+export function readImportExcerpt(sql: Sql, tenantId: string, agentId: string, path: string): ImportExcerpt | null {
+  const r = rowsIfAny(sql, "SELECT ref, excerpt, chars FROM import_excerpt WHERE tenant_id=? AND agent_id=? AND path=?", tenantId, agentId, path)[0];
+  return r ? { ref: String(r.ref), excerpt: String(r.excerpt), chars: Number(r.chars) } : null;
+}
 
 export type CommitResult =
   | { ok: true; created: boolean; record: ImportRecord; lifted?: ImportHold | null }
@@ -211,6 +232,11 @@ export function commitImport(
        ON CONFLICT(tenant_id, agent_id, key) DO UPDATE SET value=excluded.value, ref=excluded.ref, bytes=excluded.bytes,
          updated_at=excluded.updated_at`,
       tenantId, agentId, r.path, r.value, r.ref, r.bytes, now);
+    if (r.ref && r.excerpt) {
+      sql.exec(EXCERPT_SCHEMA);
+      sql.exec("INSERT OR REPLACE INTO import_excerpt(tenant_id, agent_id, path, ref, excerpt, chars) VALUES (?,?,?,?,?,?)",
+        tenantId, agentId, r.path, r.ref, r.excerpt.excerpt, r.excerpt.chars);
+    }
   }
   const files = [...imp.files].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
   const instructions = imp.instructions ? "pending" : "none";

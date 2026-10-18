@@ -29,7 +29,7 @@ import {
 import {
   listSeedFiles, readSeal, SEED_FILES_ALTERS, SEED_FILES_SCHEMA, seedManifestOf, sealSeedFiles, writeSeedFile, type SealHow, type SeedWrite,
 } from "./seed-files.ts";
-import { readImport } from "./workspace-import.ts";
+import { readImport, readImportExcerpt } from "./workspace-import.ts";
 
 const SCHEMA = `
 PRAGMA journal_mode = WAL;
@@ -1166,6 +1166,10 @@ export class SqliteStore implements StorageAdapter {
 
   async listImportedFiles(tenantId: string, agentId: string) {
     return readImport(this.#usageSql(), tenantId, agentId)?.record.files ?? null;
+  }
+
+  async importedExcerpt(tenantId: string, agentId: string, path: string) {
+    return readImportExcerpt(this.#usageSql(), tenantId, agentId, path);
   }
 
   async setPluginChoice(tenantId: string, agentId: string, plugin: string, choice: PluginChoice) {
