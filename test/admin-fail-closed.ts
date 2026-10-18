@@ -17,7 +17,6 @@ register("data:text/javascript," + encodeURIComponent(
   `export async function resolve(s, c, next) { if (s.startsWith("cloudflare:")) return { url: ${JSON.stringify("data:text/javascript," + encodeURIComponent(STAND_IN))}, shortCircuit: true }; return next(s, c); }`));
 const { default: worker } = await import("../cf/src/index.ts");
 const { sessionCookieFor } = await import("../cf/src/auth.ts");
-const { readFileSync } = await import("node:fs");
 const { setLogSink } = await import("../src/core/log.ts");
 setLogSink(() => {});
 
@@ -62,7 +61,12 @@ function world(token: string | undefined) {
   };
   outbound = calls;
   const env: Record<string, unknown> = {
-    AGENT: { idFromName: (n: string) => n, get: () => objectStub },
+    // Choosing an object is recorded too, not only calling it: `get` contacts nothing until a method is called, so a
+    // path that is handed an object it never uses would otherwise leave no trace.
+    AGENT: {
+      idFromName: (n: string) => { calls.push(`agent.idFromName ${n}`); return n; },
+      get: (id: string) => { calls.push(`agent.get ${id}`); return objectStub; },
+    },
     CONTROL_DB: { prepare: () => stmt, batch: async () => [] },
     ARTIFACTS: bucket,
     // A viewer's own session is minted here (below): one route must refuse it whatever it owns.
@@ -203,32 +207,47 @@ await check("GET /agent/activity/reset: the operator's token clears it", async (
   must(w.calls.includes("object.resetActivity"), `the object was not asked: ${w.calls}`);
 });
 
-// The mechanism behind #924: the object is chosen from the path's PREFIX, and everything else lands on one shared
-// object with no identity. #932 deleted the probes that were reachable that way and left a comment saying no route
-// reaches the fallback — a comment cannot fail. This is the rule a new `case` has to keep, read from the source, so
-// a diagnostic added next year without a prefix fails here instead of being born anonymous.
-await check("every case that calls the shared stub is under a prefix that picks its object by identity", () => {
-  const source = readFileSync(new URL("../cf/src/index.ts", import.meta.url), "utf8").split("\n");
-  const start = source.findIndex((l) => /switch \(url\.pathname\)/.test(l));
-  must(start > 0, "the switch over url.pathname is not in cf/src/index.ts");
-  const cases = new Map<string, { line: number; stub: boolean }>();
-  let current: string | null = null;
-  for (let i = start; i < source.length; i++) {
-    const line = source[i]!;
-    const opened = /^\s*case "([^"]*)":(.*)$/.exec(line);
-    if (opened) {
-      current = opened[1]!;
-      if (!cases.has(current)) cases.set(current, { line: i + 1, stub: false });
-      if (opened[2]!.includes("stub.")) cases.get(current)!.stub = true;
-      continue;
+// The mechanism behind #924: the object is chosen from the path's prefix, and a path under none used to land on one
+// shared object with no identity. Now such a path is answered before any object is chosen, so the only way an
+// unprefixed path reaches an object is to name one itself. Read from the env: no object is chosen, let alone called,
+// whoever asks and however. `/agent-other` and the case variants hold the prefix to a whole segment, matched exactly.
+const UNPREFIXED = ["/probe/next", "/x", "/agent-other", "/agentx/activity", "/Agent/activity", "/AGENT/activity/reset",
+  "/UI", "/Bench/start", "/conformanceX/executor", "/p0", "//agent/activity"];
+for (const path of UNPREFIXED) {
+  await check(`${path}: under no prefix, so the 404 index and no object chosen`, async () => {
+    for (const method of ["GET", "POST"]) {
+      for (const [label, token, headers] of [
+        ["no credential", undefined, {}], ["a wrong token", TOKEN, { "x-harness-token": "nope" }],
+        ["the operator's token", TOKEN, { "x-harness-token": TOKEN }], ["an owner's session", TOKEN, { cookie }],
+      ] as Array<[string, string | undefined, Record<string, string>]>) {
+        const w = world(token);
+        const res = await worker.fetch(new Request(`https://x${path}?tenantId=demo&agentId=u-a`, { method, headers }), w.env as never,
+          { waitUntil() {}, passThroughOnException() {} } as never);
+        const text = await res.text();
+        must(res.status === 404, `${method} with ${label}: ${res.status} ${text.slice(0, 200)}`);
+        must((JSON.parse(text) as { demo?: string }).demo === "/ui", `${method} with ${label}: not the index: ${text.slice(0, 200)}`);
+        must(!w.calls.some((c) => /^(agent|object|r2|fetch)[. ]/.test(c)), `${method} with ${label} chose or reached an object: ${w.calls}`);
+      }
     }
-    if (/^\s*default:/.test(line)) { current = null; continue; }
-    if (current && line.includes("stub.")) cases.get(current)!.stub = true;
-  }
-  must(cases.size > 40, `only ${cases.size} cases read: the parse, not the tree, is wrong`);
-  const gated = /^\/(conformance|bench|agent|ui)/;
-  const past = [...cases].filter(([path, v]) => v.stub && !gated.test(path)).map(([path, v]) => `${path} (line ${v.line})`);
-  must(past.length === 0, `these cases call the shared \`stub\` without a prefix that chose its object: ${past.join(", ")}`);
+  });
+}
+
+// `/` is unprefixed too, and is the redirect to the console: still no object.
+await check("/: the redirect to /ui, with no object chosen", async () => {
+  const w = world(TOKEN);
+  const res = await worker.fetch(new Request("https://x/", { method: "GET", headers: { cookie } }), w.env as never,
+    { waitUntil() {}, passThroughOnException() {} } as never);
+  must(res.status === 302 && new URL(res.headers.get("location") ?? "").pathname === "/ui", `${res.status} ${res.headers.get("location")}`);
+  must(!w.calls.some((c) => /^(agent|object|r2|fetch)[. ]/.test(c)), `chose or reached an object: ${w.calls}`);
+});
+
+// The control for the rows above: the recorder sees an object being chosen when a prefix does choose one.
+await check("/agent/activity: a prefixed path does choose its object by identity, and the recorder sees it", async () => {
+  const w = world(TOKEN);
+  const res = await worker.fetch(new Request("https://x/agent/activity?tenantId=demo&agentId=u-a", { headers: { "x-harness-token": TOKEN } }),
+    w.env as never, { waitUntil() {}, passThroughOnException() {} } as never);
+  must(res.status === 200, `${res.status} ${(await res.text()).slice(0, 200)}`);
+  must(w.calls.some((c) => c.startsWith("agent.idFromName ") && c.includes("u-a")) && w.calls.includes("object.activity"), `calls=${w.calls}`);
 });
 
 const failed = results.filter((r) => !r.ok);

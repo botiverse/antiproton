@@ -4020,17 +4020,21 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
     // cross-talk impossible instead of merely unlikely.
     // Agent traffic is addressed by identity; the conformance probe and the
     // benchmark keep their own fixed objects.
+    // Only a path under one of these prefixes is given an object, and each prefix chooses it its own way. Any other
+    // path is answered before an object exists, so none is shared by whatever no prefix claims.
+    const prefix = objectPrefix(url.pathname);
+    if (prefix === null) return unaddressed(request, env, url);
     let name: string;
     let uiSelected: { who: string; home: string; agentId: string; tenantId: string } | null = null;
-    if (url.pathname.startsWith("/conformance")) name = "conformance-v2";
-    else if (url.pathname.startsWith("/bench")) {
+    if (prefix === "conformance") name = "conformance-v2";
+    else if (prefix === "bench") {
       // The benchmark runners' door, and only theirs (see programmaticAccess).
       if (programmaticAccess(await viewer(request, env), "bench", { tenantId: "bench", agentId: "" }) !== "allow") {
         return Response.json({ error: "NOT_AUTHORIZED", hint: "the benchmark routes need x-harness-token" }, { status: 401 });
       }
       name = `bench-${url.searchParams.get("obj") ?? "v1"}`;
     }
-    else if (url.pathname.startsWith("/ui")) {
+    else if (prefix === "ui") {
       // One demo agent per signed-in person, so two people trying it at once
       // do not share a conversation — and so the isolation is real, not a demo
       // shortcut.
@@ -4073,7 +4077,7 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
       } catch (e: any) {
         return Response.json({ error: String(e?.message ?? e) }, { status: 400 });
       }
-    } else if (url.pathname.startsWith("/agent")) {
+    } else { // "/agent"
       const body = request.method === "POST" ? await request.clone().json().catch(() => ({})) : {};
       const tenantId = String((body as any).tenantId ?? url.searchParams.get("tenantId") ?? "tenant-a");
       const agentId = String((body as any).agentId ?? url.searchParams.get("agentId") ?? "agent-1");
@@ -4099,10 +4103,6 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
         return Response.json({ error: `no such agent: ${agentId} (not this viewer's, or never created)` }, { status: 404 });
       }
     }
-    // Everything else (`/admin/*`, `/` and the 404 index) addresses the objects it needs itself, or none. The
-    // switch below still wants a stub, and `get` contacts no object until a method is called on it, so this
-    // name is never reached by any route that remains.
-    else name = "p0";
     const stub = env.AGENT.get(env.AGENT.idFromName(name));
     try {
       switch (url.pathname) {
@@ -4225,177 +4225,6 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
           }
           return Response.json(await stub.resetActivity());
         }
-        // What identity a request actually resolves to is /ui/whoami's
-        // business; here only the automation token opens the door, and a
-        // client-supplied header never does.
-        case "/admin/identity": {
-          // Who may sign in with GitHub, and as which agent. Header-only like
-          // the other /admin routes, and closed when no token is configured:
-          // the operator adds a row before a person's first sign-in.
-          if (!isOperator(env.AUTOMATION_TOKEN, request.headers.get("x-harness-token"))) {
-            return Response.json({ error: "unauthorized" }, { status: 401 });
-          }
-          const dir = identities(env);
-          try {
-            if (request.method === "POST") {
-              const body: any = await request.json().catch(() => null);
-              const key = String(body?.key ?? "").trim();
-              const agentId = String(body?.agentId ?? "").trim();
-              const tenantId = String(body?.tenantId ?? "demo").trim();
-              // Admission equals the naming rule: a row the object name would
-              // refuse must not be written, or it fails at sign-in instead
-              // (Piper, 2026-09-12).
-              let named = "";
-              try { named = agentObjectName(tenantId, agentId); } catch (e: any) { named = ""; }
-              if (!/^github:\d+$/.test(key) || !agentId.startsWith("u-") || !named) {
-                return Response.json({ error: "BAD_ROW", hint: "key is github:<numeric id>; agentId is u-<…>; tenantId (optional, default demo); both must be valid object-name parts" }, { status: 400 });
-              }
-              await dir.upsert(key, { agentId, tenantId }, "automation");
-              return Response.json({ ok: true, key, agentId, tenantId });
-            }
-            if (request.method === "DELETE") {
-              // Removes the invitation, not the agent: the object and its data
-              // stay where they are; the person just cannot sign in to it.
-              const key = String(url.searchParams.get("key") ?? "").trim();
-              if (!/^github:\d+$/.test(key)) return Response.json({ error: "BAD_KEY", hint: "?key=github:<numeric id>" }, { status: 400 });
-              // The same button is two operations. A self-registered row is
-              // rebuilt by the next sign-in as the same tenant/agent pair (the
-              // derivations are pure in the id), so deleting it is an un-invite
-              // the person undoes themselves. A row that lives elsewhere (the
-              // pre-tenant rows in "demo") is rebuilt as a FRESH pair: the old
-              // object keeps the data and nothing reads it. Say so in the reply
-              // (Piper, Vera, Dora, 2026-09-12).
-              const row = await dir.lookup(key);
-              const rebuiltAs = githubDefaultTenantId({ id: Number(key.slice("github:".length)) });
-              const warning = row && row.tenantId !== rebuiltAs
-                ? `this row lives in tenant ${row.tenantId}; a re-registration under open sign-up lands in ${rebuiltAs}, a fresh object, and the data in ${row.tenantId}/${row.agentId} stays there unread. To restore access to the old object, POST the same row back with tenantId ${row.tenantId}.`
-                : null;
-              await dir.remove(key);
-              return Response.json({ ok: true, key, removed: row, ...(warning ? { warning } : {}) });
-            }
-            return Response.json({ identities: await dir.list() });
-          } catch (e: any) {
-            // D1 did not answer. Say that, rather than a bare 500 that reads as a bug in the route.
-            console.error("admin/identity: control plane unavailable", String(e?.message ?? e));
-            return Response.json({ error: "CONTROL_PLANE_UNAVAILABLE", hint: String(e?.message ?? e) }, { status: 503 });
-          }
-        }
-        case "/admin/compact": {
-          // The operator's way in, alongside /admin/diagnose. The UI button
-          // derives the agent from whoever is signed in, which is right for a
-          // person and useless for unsticking someone else's task.
-          if (!isOperator(env.AUTOMATION_TOKEN, request.headers.get("x-harness-token"))) {
-            return Response.json({ error: "unauthorized" }, { status: 401 });
-          }
-          const t = url.searchParams.get("tenantId") ?? "demo";
-          const a = String(url.searchParams.get("agentId"));
-          const k = url.searchParams.get("taskId") ?? `t_${a}`;
-          const s2 = env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a)));
-          const r = await s2.uiCompact(t, a, k);
-          return compactionRefusal(r, "json") ?? Response.json(r);
-        }
-        case "/admin/reset-session": {
-          // The operator's way out of an overflow backstop that gave up (src/runtime/overflow-backstop.ts): the mark is
-          // cleared and the conversation rebuilt, or with rebuild=0 only cleared, so the next push is tried again.
-          if (!isOperator(env.AUTOMATION_TOKEN, request.headers.get("x-harness-token"))) {
-            return Response.json({ error: "unauthorized" }, { status: 401 });
-          }
-          if (request.method !== "POST") return Response.json({ error: "POST" }, { status: 405 });
-          const t = url.searchParams.get("tenantId") ?? "demo";
-          const a = String(url.searchParams.get("agentId") ?? "");
-          if (!a) return Response.json({ error: "agentId is required" }, { status: 400 });
-          const s4 = env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a)));
-          const r = await s4.resetSession(t, a, url.searchParams.get("rebuild") !== "0");
-          return Response.json(r, { status: r.ok ? 200 : r.status });
-        }
-        case "/admin/cancel-turn": {
-          // The operator's stop for a runaway turn (docs/runbook.md, "Stopping a runaway agent"): the running turn
-          // is aborted, as the Agents API's cancel aborts one, and nothing is deleted. /admin/reset-session does not do
-          // this: it clears the overflow backstop's mark, and its rebuild refuses while a turn runs.
-          if (!isOperator(env.AUTOMATION_TOKEN, request.headers.get("x-harness-token"))) {
-            return Response.json({ error: "unauthorized" }, { status: 401 });
-          }
-          if (request.method !== "POST") return Response.json({ error: "POST" }, { status: 405 });
-          const t = url.searchParams.get("tenantId") ?? "";
-          const a = url.searchParams.get("agentId") ?? "";
-          if (!t || !a) return Response.json({ error: "tenantId and agentId are required" }, { status: 400 });
-          let r: StopTurnOutcome;
-          try { r = await env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a))).stopTurn(t, a, "admin_cancel"); }
-          catch (e) { r = { result: "failed", error: String((e as Error)?.message ?? e).slice(0, 200) }; }
-          // Logged here as well as in the object: the object's logs can be dropped when its invocation overlaps
-          // another, as a stop waiting on a tool call does (cf/src/provision/handlers.ts `stopTurnOf`).
-          logTurnStop({ tenantId: t, agentId: a, trigger: "admin_cancel", side: "worker" }, r);
-          return Response.json({ tenantId: t, agentId: a, ...r }, { status: r.result === "failed" ? 503 : 200 });
-        }
-        case "/admin/migrate-engine":
-          return await adminMigrateEngine(request, env.AUTOMATION_TOKEN,
-            (t, a) => env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a))));
-        case "/admin/rename-mount": {
-          // Renaming a mount is an operator act, not something an agent or a
-          // page does: it moves the mount row, the connection state and the
-          // credential together, and it is refused while the mount is holding
-          // a container. There is no button for it on purpose — the one
-          // occasion it exists for is a deployment-wide rename someone decided
-          // to apply, and that decision does not belong to whoever has the
-          // page open.
-          if (!isOperator(env.AUTOMATION_TOKEN, request.headers.get("x-harness-token"))) {
-            return Response.json({ error: "unauthorized" }, { status: 401 });
-          }
-          if (request.method !== "POST") return Response.json({ error: "POST" }, { status: 405 });
-          const t = url.searchParams.get("tenantId") ?? "demo";
-          const a = String(url.searchParams.get("agentId"));
-          const from = String(url.searchParams.get("from") ?? "");
-          const to = String(url.searchParams.get("to") ?? "");
-          if (!a || !from || !to) {
-            return Response.json({ error: "agentId, from and to are required" }, { status: 400 });
-          }
-          const s3 = env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a)));
-          return Response.json(await s3.uiRenameMount(t, a, from, to));
-        }
-        case "/admin/provision-push": {
-          // Register push again for one provisioned agent, through the same tool creation uses. The
-          // operator's repair for a mount whose push record is gone while Raft still points at the
-          // old hook — a storage change that dropped per-mount state was the first occasion. Raft
-          // need do nothing: the plugin rebuilds the hook and re-registers it with the agent's own
-          // credential, so this is ours to run, and it is idempotent.
-          if (!isOperator(env.AUTOMATION_TOKEN, request.headers.get("x-harness-token"))) {
-            return Response.json({ error: "unauthorized" }, { status: 401 });
-          }
-          if (request.method !== "POST") return Response.json({ error: "POST" }, { status: 405 });
-          const t = String(url.searchParams.get("tenantId") ?? "");
-          const r = String(url.searchParams.get("raftAgentId") ?? "");
-          if (!t || !r) return Response.json({ error: "tenantId and raftAgentId are required" }, { status: 400 });
-          const out = await repairPush(provisionDeps(env), t, r);
-          return Response.json(out, { status: out.ok ? 200 : 404 });
-        }
-        case "/admin/diagnose":
-          return await adminDiagnose(request, env.AUTOMATION_TOKEN,
-            (t, a) => env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a))));
-        case "/admin/friction-scan": {
-          // The daily friction scan for one day, on demand (docs/runbook.md, "Where agents get stuck"). Reads as the
-          // cron does, under the same tenant list and kill switch; writes the report unless write=0, and never files
-          // issues: that is the cron's alone.
-          if (!isOperator(env.AUTOMATION_TOKEN, request.headers.get("x-harness-token"))) {
-            return Response.json({ error: "unauthorized" }, { status: 401 });
-          }
-          if (request.method !== "POST") return Response.json({ error: "POST" }, { status: 405, headers: { allow: "POST" } });
-          if (env.FRICTION_SCAN_DISABLED === "1") return Response.json({ error: "friction scan disabled (FRICTION_SCAN_DISABLED)" }, { status: 503 });
-          const day = String(url.searchParams.get("day") ?? "");
-          if (!/^\d{4}-\d{2}-\d{2}$/.test(day) || Number.isNaN(Date.parse(day + "T00:00:00Z"))) {
-            return Response.json({ error: "day=YYYY-MM-DD is required" }, { status: 400 });
-          }
-          const scope = tenantScope(env.FRICTION_SCAN_TENANTS);
-          if (scope.kind === "none") return Response.json({ error: "no tenants in scope (FRICTION_SCAN_TENANTS)" }, { status: 409 });
-          const bucket = env.ARTIFACTS as unknown as FrictionBucket;
-          const report = await scanDay({ bucket, window: frictionWindowOf(env), build: env.GIT_COMMIT ?? null }, scope, day);
-          const written = url.searchParams.get("write") === "0" ? null
-            : await writeReport(bucket, report, new Date().toISOString().slice(0, 10));
-          return Response.json({ written: written?.keys ?? null, report }, { headers: { "cache-control": "no-store" } });
-        }
-        case "/admin/transcript":
-          // Awaited, so a failure reaches this route's catch and its log instead of the platform's 1101.
-          return await adminTranscript(request, env.AUTOMATION_TOKEN,
-            (t, a) => env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a))));
         case "/ui": {
           const gate = await requireViewer(request, env);
           if (gate instanceof Response) return gate;
@@ -4960,28 +4789,231 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
           // with a name the caller chose would be worth nothing.
           return html(approvals(await stub.uiDecide(gate.tenantId, agentId, taskId, String(form.get("operationId")), decision, who)));
         }
+        default:
+          return unrouted();
+      }
+    } catch (e: any) {
+      return failed(url, e);
+    }
+  }
+
+/**
+ * The paths no prefix addresses. Nothing here is given an object: an operator route names the one it acts on from
+ * its own query, behind its own token, and anything else is the 404 index. There is no shared object a path can fall
+ * through to, so an unprefixed path can only reach an object by naming one here, in plain sight.
+ */
+async function unaddressed(request: Request, env: Env, url: URL): Promise<Response> {
+    try {
+      switch (url.pathname) {
+        // What identity a request actually resolves to is /ui/whoami's
+        // business; here only the automation token opens the door, and a
+        // client-supplied header never does.
+        case "/admin/identity": {
+          // Who may sign in with GitHub, and as which agent. Header-only like
+          // the other /admin routes, and closed when no token is configured:
+          // the operator adds a row before a person's first sign-in.
+          if (!isOperator(env.AUTOMATION_TOKEN, request.headers.get("x-harness-token"))) {
+            return Response.json({ error: "unauthorized" }, { status: 401 });
+          }
+          const dir = identities(env);
+          try {
+            if (request.method === "POST") {
+              const body: any = await request.json().catch(() => null);
+              const key = String(body?.key ?? "").trim();
+              const agentId = String(body?.agentId ?? "").trim();
+              const tenantId = String(body?.tenantId ?? "demo").trim();
+              // Admission equals the naming rule: a row the object name would
+              // refuse must not be written, or it fails at sign-in instead
+              // (Piper, 2026-09-12).
+              let named = "";
+              try { named = agentObjectName(tenantId, agentId); } catch (e: any) { named = ""; }
+              if (!/^github:\d+$/.test(key) || !agentId.startsWith("u-") || !named) {
+                return Response.json({ error: "BAD_ROW", hint: "key is github:<numeric id>; agentId is u-<…>; tenantId (optional, default demo); both must be valid object-name parts" }, { status: 400 });
+              }
+              await dir.upsert(key, { agentId, tenantId }, "automation");
+              return Response.json({ ok: true, key, agentId, tenantId });
+            }
+            if (request.method === "DELETE") {
+              // Removes the invitation, not the agent: the object and its data
+              // stay where they are; the person just cannot sign in to it.
+              const key = String(url.searchParams.get("key") ?? "").trim();
+              if (!/^github:\d+$/.test(key)) return Response.json({ error: "BAD_KEY", hint: "?key=github:<numeric id>" }, { status: 400 });
+              // The same button is two operations. A self-registered row is
+              // rebuilt by the next sign-in as the same tenant/agent pair (the
+              // derivations are pure in the id), so deleting it is an un-invite
+              // the person undoes themselves. A row that lives elsewhere (the
+              // pre-tenant rows in "demo") is rebuilt as a FRESH pair: the old
+              // object keeps the data and nothing reads it. Say so in the reply
+              // (Piper, Vera, Dora, 2026-09-12).
+              const row = await dir.lookup(key);
+              const rebuiltAs = githubDefaultTenantId({ id: Number(key.slice("github:".length)) });
+              const warning = row && row.tenantId !== rebuiltAs
+                ? `this row lives in tenant ${row.tenantId}; a re-registration under open sign-up lands in ${rebuiltAs}, a fresh object, and the data in ${row.tenantId}/${row.agentId} stays there unread. To restore access to the old object, POST the same row back with tenantId ${row.tenantId}.`
+                : null;
+              await dir.remove(key);
+              return Response.json({ ok: true, key, removed: row, ...(warning ? { warning } : {}) });
+            }
+            return Response.json({ identities: await dir.list() });
+          } catch (e: any) {
+            // D1 did not answer. Say that, rather than a bare 500 that reads as a bug in the route.
+            console.error("admin/identity: control plane unavailable", String(e?.message ?? e));
+            return Response.json({ error: "CONTROL_PLANE_UNAVAILABLE", hint: String(e?.message ?? e) }, { status: 503 });
+          }
+        }
+        case "/admin/compact": {
+          // The operator's way in, alongside /admin/diagnose. The UI button
+          // derives the agent from whoever is signed in, which is right for a
+          // person and useless for unsticking someone else's task.
+          if (!isOperator(env.AUTOMATION_TOKEN, request.headers.get("x-harness-token"))) {
+            return Response.json({ error: "unauthorized" }, { status: 401 });
+          }
+          const t = url.searchParams.get("tenantId") ?? "demo";
+          const a = String(url.searchParams.get("agentId"));
+          const k = url.searchParams.get("taskId") ?? `t_${a}`;
+          const s2 = env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a)));
+          const r = await s2.uiCompact(t, a, k);
+          return compactionRefusal(r, "json") ?? Response.json(r);
+        }
+        case "/admin/reset-session": {
+          // The operator's way out of an overflow backstop that gave up (src/runtime/overflow-backstop.ts): the mark is
+          // cleared and the conversation rebuilt, or with rebuild=0 only cleared, so the next push is tried again.
+          if (!isOperator(env.AUTOMATION_TOKEN, request.headers.get("x-harness-token"))) {
+            return Response.json({ error: "unauthorized" }, { status: 401 });
+          }
+          if (request.method !== "POST") return Response.json({ error: "POST" }, { status: 405 });
+          const t = url.searchParams.get("tenantId") ?? "demo";
+          const a = String(url.searchParams.get("agentId") ?? "");
+          if (!a) return Response.json({ error: "agentId is required" }, { status: 400 });
+          const s4 = env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a)));
+          const r = await s4.resetSession(t, a, url.searchParams.get("rebuild") !== "0");
+          return Response.json(r, { status: r.ok ? 200 : r.status });
+        }
+        case "/admin/cancel-turn": {
+          // The operator's stop for a runaway turn (docs/runbook.md, "Stopping a runaway agent"): the running turn
+          // is aborted, as the Agents API's cancel aborts one, and nothing is deleted. /admin/reset-session does not do
+          // this: it clears the overflow backstop's mark, and its rebuild refuses while a turn runs.
+          if (!isOperator(env.AUTOMATION_TOKEN, request.headers.get("x-harness-token"))) {
+            return Response.json({ error: "unauthorized" }, { status: 401 });
+          }
+          if (request.method !== "POST") return Response.json({ error: "POST" }, { status: 405 });
+          const t = url.searchParams.get("tenantId") ?? "";
+          const a = url.searchParams.get("agentId") ?? "";
+          if (!t || !a) return Response.json({ error: "tenantId and agentId are required" }, { status: 400 });
+          let r: StopTurnOutcome;
+          try { r = await env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a))).stopTurn(t, a, "admin_cancel"); }
+          catch (e) { r = { result: "failed", error: String((e as Error)?.message ?? e).slice(0, 200) }; }
+          // Logged here as well as in the object: the object's logs can be dropped when its invocation overlaps
+          // another, as a stop waiting on a tool call does (cf/src/provision/handlers.ts `stopTurnOf`).
+          logTurnStop({ tenantId: t, agentId: a, trigger: "admin_cancel", side: "worker" }, r);
+          return Response.json({ tenantId: t, agentId: a, ...r }, { status: r.result === "failed" ? 503 : 200 });
+        }
+        case "/admin/migrate-engine":
+          return await adminMigrateEngine(request, env.AUTOMATION_TOKEN,
+            (t, a) => env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a))));
+        case "/admin/rename-mount": {
+          // Renaming a mount is an operator act, not something an agent or a
+          // page does: it moves the mount row, the connection state and the
+          // credential together, and it is refused while the mount is holding
+          // a container. There is no button for it on purpose — the one
+          // occasion it exists for is a deployment-wide rename someone decided
+          // to apply, and that decision does not belong to whoever has the
+          // page open.
+          if (!isOperator(env.AUTOMATION_TOKEN, request.headers.get("x-harness-token"))) {
+            return Response.json({ error: "unauthorized" }, { status: 401 });
+          }
+          if (request.method !== "POST") return Response.json({ error: "POST" }, { status: 405 });
+          const t = url.searchParams.get("tenantId") ?? "demo";
+          const a = String(url.searchParams.get("agentId"));
+          const from = String(url.searchParams.get("from") ?? "");
+          const to = String(url.searchParams.get("to") ?? "");
+          if (!a || !from || !to) {
+            return Response.json({ error: "agentId, from and to are required" }, { status: 400 });
+          }
+          const s3 = env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a)));
+          return Response.json(await s3.uiRenameMount(t, a, from, to));
+        }
+        case "/admin/provision-push": {
+          // Register push again for one provisioned agent, through the same tool creation uses. The
+          // operator's repair for a mount whose push record is gone while Raft still points at the
+          // old hook — a storage change that dropped per-mount state was the first occasion. Raft
+          // need do nothing: the plugin rebuilds the hook and re-registers it with the agent's own
+          // credential, so this is ours to run, and it is idempotent.
+          if (!isOperator(env.AUTOMATION_TOKEN, request.headers.get("x-harness-token"))) {
+            return Response.json({ error: "unauthorized" }, { status: 401 });
+          }
+          if (request.method !== "POST") return Response.json({ error: "POST" }, { status: 405 });
+          const t = String(url.searchParams.get("tenantId") ?? "");
+          const r = String(url.searchParams.get("raftAgentId") ?? "");
+          if (!t || !r) return Response.json({ error: "tenantId and raftAgentId are required" }, { status: 400 });
+          const out = await repairPush(provisionDeps(env), t, r);
+          return Response.json(out, { status: out.ok ? 200 : 404 });
+        }
+        case "/admin/diagnose":
+          return await adminDiagnose(request, env.AUTOMATION_TOKEN,
+            (t, a) => env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a))));
+        case "/admin/friction-scan": {
+          // The daily friction scan for one day, on demand (docs/runbook.md, "Where agents get stuck"). Reads as the
+          // cron does, under the same tenant list and kill switch; writes the report unless write=0, and never files
+          // issues: that is the cron's alone.
+          if (!isOperator(env.AUTOMATION_TOKEN, request.headers.get("x-harness-token"))) {
+            return Response.json({ error: "unauthorized" }, { status: 401 });
+          }
+          if (request.method !== "POST") return Response.json({ error: "POST" }, { status: 405, headers: { allow: "POST" } });
+          if (env.FRICTION_SCAN_DISABLED === "1") return Response.json({ error: "friction scan disabled (FRICTION_SCAN_DISABLED)" }, { status: 503 });
+          const day = String(url.searchParams.get("day") ?? "");
+          if (!/^\d{4}-\d{2}-\d{2}$/.test(day) || Number.isNaN(Date.parse(day + "T00:00:00Z"))) {
+            return Response.json({ error: "day=YYYY-MM-DD is required" }, { status: 400 });
+          }
+          const scope = tenantScope(env.FRICTION_SCAN_TENANTS);
+          if (scope.kind === "none") return Response.json({ error: "no tenants in scope (FRICTION_SCAN_TENANTS)" }, { status: 409 });
+          const bucket = env.ARTIFACTS as unknown as FrictionBucket;
+          const report = await scanDay({ bucket, window: frictionWindowOf(env), build: env.GIT_COMMIT ?? null }, scope, day);
+          const written = url.searchParams.get("write") === "0" ? null
+            : await writeReport(bucket, report, new Date().toISOString().slice(0, 10));
+          return Response.json({ written: written?.keys ?? null, report }, { headers: { "cache-control": "no-store" } });
+        }
+        case "/admin/transcript":
+          // Awaited, so a failure reaches this route's catch and its log instead of the platform's 1101.
+          return await adminTranscript(request, env.AUTOMATION_TOKEN,
+            (t, a) => env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a))));
         case "/":
           // The demo is the point of this deployment; making people know to
           // type /ui is a papercut with no upside.
           return Response.redirect(new URL("/ui", url).toString(), 302);
         default:
-          return Response.json({
-            demo: "/ui",
-            diagnostics: ["/conformance/executor", "/ui/whoami"],
-          }, { status: 404 });
+          return unrouted();
       }
     } catch (e: any) {
-      // A conversation the viewer may not address is a 404 for reads and
-      // writes alike, not a fault.
-      if (/^no such conversation:/.test(String(e?.message ?? ""))) {
-        return Response.json({ error: String(e.message) }, { status: 404 });
-      }
-      // The stack goes to the Worker's log, not to whoever made the request: it names our files and call
-      // paths, and the console now puts the response body on the page under a failed form (#334).
-      console.error("request failed:", url.pathname, e?.stack ?? e);
-      return Response.json({ error: String(e?.message ?? e) }, { status: 500 });
+      return failed(url, e);
     }
+}
+
+/** The first path segment, when it is one that chooses an object; matched whole, so `/agent-x` and `/Agent` are not `/agent`. */
+function objectPrefix(pathname: string): "conformance" | "bench" | "ui" | "agent" | null {
+  const first = pathname.split("/")[1];
+  return first === "conformance" || first === "bench" || first === "ui" || first === "agent" ? first : null;
+}
+
+/** The 404 index: what an unknown path is told, under a prefix or not. */
+function unrouted(): Response {
+  return Response.json({
+    demo: "/ui",
+    diagnostics: ["/conformance/executor", "/ui/whoami"],
+  }, { status: 404 });
+}
+
+/** A route that threw. */
+function failed(url: URL, e: any): Response {
+  // A conversation the viewer may not address is a 404 for reads and
+  // writes alike, not a fault.
+  if (/^no such conversation:/.test(String(e?.message ?? ""))) {
+    return Response.json({ error: String(e.message) }, { status: 404 });
   }
+  // The stack goes to the Worker's log, not to whoever made the request: it names our files and call
+  // paths, and the console now puts the response body on the page under a failed form (#334).
+  console.error("request failed:", url.pathname, e?.stack ?? e);
+  return Response.json({ error: String(e?.message ?? e) }, { status: 500 });
+}
 
 setLogSink((line) => console.log(line));
 
