@@ -57,7 +57,7 @@ const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS operations (
      operation_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL, task_id TEXT NOT NULL,
      mount_alias TEXT NOT NULL, tool TEXT NOT NULL, tool_version TEXT NOT NULL, status TEXT NOT NULL,
-     result_ref TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
+     result_ref TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, model_name TEXT)`,
   `CREATE INDEX IF NOT EXISTS operations_task ON operations(tenant_id, task_id, status)`,
 `CREATE TABLE IF NOT EXISTS model_bindings (
   tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL DEFAULT '',
@@ -143,6 +143,7 @@ export class DurableObjectStore implements StorageAdapter {
       "ALTER TABLE tasks ADD COLUMN state_version INTEGER NOT NULL DEFAULT 0",
       "ALTER TABLE mounts ADD COLUMN policy TEXT",
       "ALTER TABLE mounts ADD COLUMN tool_snapshot TEXT",
+      "ALTER TABLE operations ADD COLUMN model_name TEXT",
       // A secrets table created before the suffix column was dropped keeps a
       // NOT NULL column the insert no longer fills; drop it, and with it the
       // one plaintext fragment of a value the row ever held.
@@ -418,10 +419,10 @@ export class DurableObjectStore implements StorageAdapter {
 
   async recordOperation(op: Omit<OperationRecord, "status" | "resultRef">) {
     this.#sql.exec(
-      `INSERT INTO operations(operation_id, tenant_id, agent_id, task_id, mount_alias, tool, tool_version,
-         status, result_ref, created_at, updated_at) VALUES (?,?,?,?,?,?,?,'pending',NULL,?,?)
+      `INSERT INTO operations(operation_id, tenant_id, agent_id, task_id, mount_alias, tool, model_name, tool_version,
+         status, result_ref, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,'pending',NULL,?,?)
        ON CONFLICT(operation_id) DO NOTHING`,
-      op.operationId, op.tenantId, op.agentId, op.taskId, op.mountAlias, op.tool, op.toolVersion,
+      op.operationId, op.tenantId, op.agentId, op.taskId, op.mountAlias, op.tool, op.modelName ?? null, op.toolVersion,
       this.#now(), this.#now());
   }
 
@@ -451,7 +452,7 @@ export class DurableObjectStore implements StorageAdapter {
     if (!r) return null;
     return {
       operationId: r.operation_id, tenantId: r.tenant_id, agentId: r.agent_id, taskId: r.task_id,
-      mountAlias: r.mount_alias, tool: r.tool, toolVersion: r.tool_version, status: r.status,
+      mountAlias: r.mount_alias, tool: r.tool, modelName: r.model_name ?? null, toolVersion: r.tool_version, status: r.status,
       resultRef: r.result_ref,
     };
   }
@@ -478,7 +479,7 @@ export class DurableObjectStore implements StorageAdapter {
       this.#sql.exec("UPDATE waits SET resolved=1 WHERE tenant_id=? AND operation_id=? AND resolved=0",
         tenantId, operationId);
       const op = this.#one(
-        "SELECT agent_id, task_id, mount_alias, tool, created_at FROM operations WHERE tenant_id=? AND operation_id=?",
+        "SELECT agent_id, task_id, mount_alias, tool, model_name, created_at FROM operations WHERE tenant_id=? AND operation_id=?",
         tenantId, operationId);
       if (op) {
         this.#insertEvent({
@@ -491,7 +492,7 @@ export class DurableObjectStore implements StorageAdapter {
         if (operationEnds(prior ? prior.status : null, status)) {
           appendTrace(this.#sql, [toolCallRow({
             tenantId, agentId: op.agent_id, taskId: op.task_id, operationId,
-            mountAlias: op.mount_alias, tool: op.tool, status,
+            mountAlias: op.mount_alias, tool: op.tool, modelName: op.model_name ?? null, status,
             createdAt: Number(op.created_at), endedAt, callId: facts?.callId ?? null,
             exitCode: facts?.exitCode ?? null, startedAt: facts?.startedAt ?? null, denied: facts?.denied === true,
           })]);

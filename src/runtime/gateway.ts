@@ -4,7 +4,7 @@ import type { Json, MountPolicy, MountRecord, OperationStatus, PolicyDecision } 
 import { AGENT_REF, agentRef, isAgentRef, KEPT_NAME, KEPT_PREFIX, OWNER_PREFIX, secretRefKind } from "./secrets.ts";
 import type { ToolError, ToolResult } from "../core/tools.ts";
 import { parseToolRef } from "../core/tools.ts";
-import type { Plugin, PluginContext, PromptPart, MountActivity, MountUsage, InboundEvent, InboundHooks, InboundResult, HeldListing, HeldRead, ListedTools } from "../plugins/types.ts";
+import type { Plugin, PluginContext, PluginNext, PromptPart, MountActivity, MountUsage, InboundEvent, InboundHooks, InboundResult, HeldListing, HeldRead, ListedTools, TurnEnd } from "../plugins/types.ts";
 import { type ActivityEvent, type SandboxForm, holdingOf, backgroundOf, isExclusive } from "../plugins/types.ts";
 import { Backgrounded, Interrupt, interruptsOf } from "../plugins/types.ts";
 import { answerSpecOf } from "./run-js-resume.ts";
@@ -16,6 +16,9 @@ import { isReleased, leaseRow, releasedFacts } from "../trace/seams.ts";
 import { PLUGIN_TRACE_KINDS } from "../trace/outbox.ts";
 import { openPluginDatabase } from "./plugin-db.ts";
 import { payerKey, toolCallRows } from "../usage/outbox.ts";
+
+/** One mount's answer to a plugin hook the runtime called (`ToolGateway.afterTurn`, `wake`). */
+export type PluginHookAnswer = { alias: string; next: PluginNext | null } | { alias: string; skipped: string } | { alias: string; failed: string };
 
 /** Resolves secret_ref -> credential. Values never enter the JS sandbox, a
  *  checkpoint, the trajectory, or a model prompt. */
@@ -152,6 +155,13 @@ export interface InvokeOpts {
    */
   callId?: string;
   /**
+   * The tool list the call was made against: the turn's offered tools, names qualified (`qualifyMountedTools`). The
+   * operation records the offered name of the tool the call resolves to (`OperationRecord.modelName`, `offeredName`),
+   * whichever form named it: an offered name the bridge or run_js mapped, an `alias.tool` address, or a `plugin.tool`
+   * one only this gateway can resolve. Changes nothing about the call. Set by the host, never by a program.
+   */
+  offered?: ReadonlyArray<{ address: string; name: string }>;
+  /**
    * The call comes from a run_js program, not from the model: set by `runJsTool`
    * after the program's own options, so a program cannot clear it. A tool that
    * declares `modelOnly` is refused for it here, whatever name reached the
@@ -163,6 +173,17 @@ export interface InvokeOpts {
 }
 
 type Resolution = { mount: MountRecord; tool: string } | { error: ToolError };
+
+/**
+ * The offered name of the tool a call resolved to: looked up by its `alias.tool` address in the list the call was made
+ * against (`InvokeOpts.offered`), so a tie-break's suffix is the one the model saw. Null when that list does not hold
+ * it. A call can still run then: dispatch checks the mount's tools as they are now (`toolsOf` in `#invoke`), and the
+ * turn's list was fixed when the turn began, so a mount added, or a tool list re-taken, since then runs unnamed.
+ */
+function offeredName(offered: InvokeOpts["offered"], alias: string, tool: string): string | null {
+  const address = `${alias}.${tool}`;
+  return offered?.find((t) => t.address === address)?.name ?? null;
+}
 
 /** Whether two stored tool lists are the same record: what a re-take compares before it writes (`refreshMountTools`). */
 function sameSnapshot(a: ToolSnapshot | null | undefined, b: ToolSnapshot | null | undefined): boolean {
@@ -869,6 +890,7 @@ export class ToolGateway {
       taskId: ctx.taskId,
       mountAlias: r.mount.alias,
       tool: `${r.mount.plugin}.${r.tool}`,
+      modelName: offeredName(opts.offered, r.mount.alias, r.tool),
       toolVersion: r.mount.toolVersion,
     });
 
@@ -1099,7 +1121,7 @@ export class ToolGateway {
     ctx: CallContext,
     i: { alias: string; tool: string; state: Json; operationId?: string },
     answer: Json,
-    opts: { callId?: string } = {},
+    opts: { callId?: string; offered?: InvokeOpts["offered"] } = {},
   ): Promise<ToolResult> {
     const mount = await this.#store.getMountByAlias(ctx.tenantId, ctx.agentId, i.alias);
     const plugin = mount ? this.#plugins.get(mount.plugin) : undefined;
@@ -1118,7 +1140,7 @@ export class ToolGateway {
       const operationId = `op_${randomUUID().replace(/-/g, "").slice(0, 20)}`;
       await this.#store.recordOperation({
         operationId, tenantId: ctx.tenantId, agentId: ctx.agentId, taskId: ctx.taskId,
-        mountAlias: mount.alias, tool: `${mount.plugin}.${i.tool}`, toolVersion: mount.toolVersion,
+        mountAlias: mount.alias, tool: `${mount.plugin}.${i.tool}`, modelName: offeredName(opts.offered, mount.alias, i.tool), toolVersion: mount.toolVersion,
       });
       const facts = () => (opts.callId === undefined ? {} : { callId: opts.callId });
       // Recorded as a step of its own, but the plugin is told the operation it continues: a resume is the same
@@ -1398,6 +1420,50 @@ export class ToolGateway {
   async reportActivity(tenantId: string, agentId: string, events: readonly ActivityEvent[]):
     Promise<Array<{ alias: string; sent: number } | { alias: string; skipped: string }>> {
     return this.#toReporters(tenantId, agentId, (p) => !!p.reportActivity, (p, ctx) => p.reportActivity!(events, ctx));
+  }
+
+  /**
+   * A turn's end, to every mount whose plugin takes it (`Plugin.afterTurn`), as `endFor` says it to that mount (with the
+   * key it gave, when it asked for the turn), behind the gate a report passes. Each
+   * answer comes back with its alias; a throw is that mount's alone, and is returned as `failed`.
+   */
+  async afterTurn(tenantId: string, agentId: string, endFor: (alias: string) => TurnEnd): Promise<PluginHookAnswer[]> {
+    return this.#toHookMounts(tenantId, agentId, (p) => !!p.afterTurn, null, (p, ctx) => p.afterTurn!(ctx, endFor(ctx.alias)));
+  }
+
+  /** The `wake` of one mount (`Plugin.wake`), behind the same gate. Empty when the alias has no such mount. */
+  async wake(tenantId: string, agentId: string, alias: string): Promise<PluginHookAnswer[]> {
+    return this.#toHookMounts(tenantId, agentId, (p) => !!p.wake, alias, (p, ctx) => p.wake!(ctx));
+  }
+
+  async #toHookMounts(
+    tenantId: string, agentId: string, takes: (plugin: Plugin) => boolean, alias: string | null,
+    run: (plugin: Plugin, ctx: PluginContext) => Promise<PluginNext | void>,
+  ): Promise<PluginHookAnswer[]> {
+    const out: PluginHookAnswer[] = [];
+    const choices = await this.#store.pluginChoices(tenantId, agentId);
+    for (const mount of await this.#store.listMounts(tenantId, agentId)) {
+      if (alias !== null && mount.alias !== alias) continue;
+      const plugin = this.#plugins.get(mount.plugin);
+      if (!plugin || !takes(plugin)) continue;
+      if (!pluginEnabled(this.#seeded.has(mount.plugin), choices[mount.plugin])) {
+        out.push({ alias: mount.alias, skipped: `${mount.plugin} is switched off for this agent` });
+        continue;
+      }
+      if (plugin.version !== mount.toolVersion) {
+        out.push({ alias: mount.alias, skipped: `mount pins ${mount.toolVersion}, registry has ${plugin.version}` });
+        continue;
+      }
+      const credential = mount.secretRef
+        ? await this.#secrets.resolve(mount.secretRef, { tenantId: mount.tenantId, agentId: mount.agentId })
+        : null;
+      try {
+        out.push({ alias: mount.alias, next: (await run(plugin, this.#contextFor({ tenantId, agentId, taskId: "" }, mount, credential))) ?? null });
+      } catch (e) {
+        out.push({ alias: mount.alias, failed: String((e as Error)?.message ?? e).slice(0, 300) });
+      }
+    }
+    return out;
   }
 
   /**

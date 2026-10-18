@@ -313,7 +313,7 @@ export function controlPlaneCases(db: D1Database): SpecCase[] {
   add("provider_tokens and provisioned_agents have exactly the columns their queries read", async () => {
     const cols = async (table: string) => ((await db.prepare(`PRAGMA table_info(${table})`).all()).results as any[]).map((r) => String(r.name)).sort().join(",");
     assert((await cols("provider_tokens")) === "created_at,hash,label,last_used_at,raft_origin,revoked_at,scope,tenant_id", `provider_tokens ${await cols("provider_tokens")}`);
-    assert((await cols("provisioned_agents")) === "agent_id,await_import,budget,created_at,credential_hash,deleted_at,instructions,model,model_pending,name,push_error,push_registered,raft_agent_id,raft_origin,raft_server_id,status,tenant_id,updated_at",
+    assert((await cols("provisioned_agents")) === "agent_id,await_import,budget,created_at,credential_hash,deleted_at,instructions,model,model_pending,name,profile,push_error,push_registered,raft_agent_id,raft_origin,raft_server_id,status,tenant_id,updated_at",
       `provisioned_agents ${await cols("provisioned_agents")}`);
   });
 
@@ -369,6 +369,10 @@ export function controlPlaneCases(db: D1Database): SpecCase[] {
     assert(byRaft!.budget === null, `a create without budget: ${JSON.stringify(byRaft!.budget)}`);
     await registry.create({ ...base, raftAgentId: "01N", agentId: "raft_01N", budget: "onboarding" });
     assert((await registry.get("t-raft", "01N"))!.budget === "onboarding", "budget did not round-trip");
+    // `profile` likewise (0025): absent reads null, and a profile comes back as written.
+    assert((byRaft!.profile ?? null) === null, `a create without profile: ${JSON.stringify(byRaft!.profile)}`);
+    await registry.create({ ...base, raftAgentId: "01P", agentId: "raft_01P", profile: "raftbench_service" });
+    assert((await registry.get("t-raft", "01P"))!.profile === "raftbench_service", "profile did not round-trip");
     let threw = false;
     try { await registry.create({ ...base, raftAgentId: "01J/x" }); } catch { threw = true; }
     assert(threw, "a second Raft id claimed the same agent id");

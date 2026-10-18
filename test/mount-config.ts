@@ -23,6 +23,7 @@ import { artifactsPlugin } from "../src/plugins/artifacts.ts";
 import { raftPlugin } from "../src/plugins/raft.ts";
 import { mcpPlugin } from "../src/plugins/mcp.ts";
 import { reminderPlugin } from "../src/plugins/reminder.ts";
+import { raftbenchPlugin } from "../src/plugins/raftbench.ts";
 import { appworldPlugins, type Catalogue } from "../src/plugins/appworld.ts";
 import { credentialForm, originProblem, credentialState, identityNote, type CredentialRefKind } from "../src/plugins/types.ts";
 import { secretRefKind } from "../src/runtime/secrets.ts";
@@ -224,6 +225,7 @@ const everyPlugin: Plugin[] = [
   raftPlugin,
   mcpPlugin,
   reminderPlugin,
+  raftbenchPlugin,
   builtinToolsPlugin(null as any, () => []),
   ...appworldPlugins(catalogue, { apiBaseUrl: "http://localhost:8800" }),
 ];

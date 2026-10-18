@@ -15,6 +15,7 @@ import { objectMoved } from "./do-retry.ts";
 import { HANDOFF_PATH, adminHostServes, adminShell, handoffTicket, redeemTicket, safeReturnTo } from "./admin-host.ts";
 import { UNACCEPTED_TOKENS } from "../../src/usage/outbox.ts";
 import { nextAlarm } from "./alarm-next.ts";
+import type { AgentProfile } from "../../src/runtime/agent-profile.ts";
 import { adminModels } from "./admin-models.ts";
 import { agentModel } from "./agent-model.ts";
 import { html, conditional, holds, notModified } from "./version.ts";
@@ -2049,7 +2050,10 @@ export class AgentDO extends DurableObject<Env> {
   /** Provisioning's record + model + mount, in this agent's object (cf/src/provision/steps.ts). */
   async provisionAdopt(tenantId: string, agentId: string, specJson: string) {
     this.#claim(tenantId, agentId);
-    const spec = JSON.parse(specJson) as { name: string; instructions: string; raftOrigin: string; toolConfig?: ToolConfig | null; awaitImport?: boolean; firstTurn?: FirstTurn | null };
+    const spec = JSON.parse(specJson) as {
+      name: string; instructions: string; raftOrigin: string; toolConfig?: ToolConfig | null; awaitImport?: boolean; firstTurn?: FirstTurn | null;
+      profile?: AgentProfile | null;
+    };
     return this.#busy("provisionAdopt", async () =>
       adoptProvisionedAgent(this.runtime(), tenantId, agentId, { ...spec, avatar: mintAvatar() }, await this.#modelFor(tenantId, agentId)));
   }

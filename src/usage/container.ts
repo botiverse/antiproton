@@ -47,7 +47,13 @@ type Sql = SqlHost["sql"];
 const WATERMARK = "CREATE TABLE IF NOT EXISTS usage_held(box_id TEXT PRIMARY KEY, through INTEGER NOT NULL, uses INTEGER NOT NULL)";
 const KEEP_MARKS_MS = 7 * 86_400_000;
 
-/** What a mount is holding or has held. `endedAt: null` means still alive. */
+/**
+ * One stretch of time a mount held a box: from `startedAt`, and `endedAt: null` while it still runs.
+ *
+ * A stretch, not a box: a box the idle lease switched off is started again under the same id, so one id can
+ * have several of these (src/plugins/sandbox.ts records one per compute session). They follow one another and
+ * never overlap, because one box runs one session at a time.
+ */
 export interface HeldBox {
   id: string;
   startedAt: number;
@@ -61,34 +67,45 @@ export interface HeldBox {
   credentialRef?: string;
 }
 
-/** How far one box has been counted: to when, and how many uses of it. */
+/**
+ * How far one box has been counted: to when, and how many uses of the session that instant falls in.
+ *
+ * Per box rather than per session, because a box's sessions come one after another: an instant names the
+ * session it is in, and every session that ended before it has been counted whole.
+ */
 export interface HeldMark { through: number; uses: number }
 
 /**
  * Rows for what is new, and the watermarks to store.
  *
- * A live box is counted up to `now`; a finished one up to `endedAt`. Seconds are
+ * A live session is counted up to `now`; a finished one up to `endedAt`. Seconds are
  * fractional on purpose: rounding each hour to a whole second would make the
  * parts stop adding up to the life of the box.
  *
- * A box whose watermark is already past its end contributes nothing. A clock
- * that went backwards — `now` before the watermark — contributes nothing rather
+ * A box's sessions are walked oldest first against its one watermark: a session that ended before the
+ * watermark contributes nothing, the one the watermark falls in contributes what is after it, and a later one
+ * all of itself. A clock that went backwards — `now` before the watermark — contributes nothing rather
  * than a negative second, for the reason the active-time watermark has: what is
  * in the ledger was billed.
  */
 export function heldRows(
   base: { tenantId: string; agentId: string },
-  key: string,
+  /** The ledger key: one for every session, or each session's own (whose account it is on). */
+  keyOf: string | ((box: HeldBox) => string),
   boxes: readonly HeldBox[],
   counted: ReadonlyMap<string, HeldMark>,
   now: number,
 ): { rows: UsageRow[]; marks: Array<{ id: string; mark: HeldMark }> } {
   const rows: UsageRow[] = [];
-  const marks: Array<{ id: string; mark: HeldMark }> = [];
-  for (const box of boxes) {
-    const had = counted.get(box.id);
-    const from = Math.max(box.startedAt, had?.through ?? box.startedAt);
+  const marks = new Map<string, HeldMark>();
+  for (const box of [...boxes].sort((a, b) => a.startedAt - b.startedAt)) {
+    const had = marks.get(box.id) ?? counted.get(box.id);
     const to = box.endedAt ?? now;
+    if (had && had.through > to) continue;
+    // The watermark is inside this session when it is past its start; at or before the start, this session
+    // is one nothing has counted yet, and neither have its uses.
+    const inside = had !== undefined && had.through > box.startedAt;
+    const from = inside ? had.through : box.startedAt;
     // Held time is booked to the hours the BOX EXISTED, not the hour we counted it. A box held since
     // last week therefore writes rows for last week's hours the first time a pass sees it, and the
     // ledger's first hour for sandbox.container can predate this code (on 2026-09-20 the production
@@ -98,13 +115,15 @@ export function heldRows(
     // explain that: nothing there claims when billing started, so a sentence about it would answer a
     // question no reader has asked. It belongs where the decision is made, which is here.
     const parts = msByHour(from, to);
-    const uses = Math.max(0, Math.floor(box.uses ?? 0) - (had?.uses ?? 0));
+    const total = Math.max(0, Math.floor(box.uses ?? 0));
+    const uses = Math.max(0, total - (inside ? had.uses : 0));
     if (!parts.length && !uses) continue;
+    const key = typeof keyOf === "string" ? keyOf : keyOf(box);
     for (const { hour, ms } of parts) {
       rows.push({ at: hour, ...base, resource: "sandbox.container", key, quantity: ms / 1000, unit: "seconds" });
     }
     if (uses) {
-      // Uses land in the hour the box was last seen in, which is where the
+      // Uses land in the hour the session was last seen in, which is where the
       // seconds that go with them are: the mount counts them, it does not date
       // them. They share the resource id with the seconds and differ only by
       // `unit`, so anything totalling this resource has to filter by unit — a
@@ -113,17 +132,21 @@ export function heldRows(
       const at = parts.at(-1)?.hour ?? Math.floor(to / 3_600_000) * 3_600_000;
       rows.push({ at, ...base, resource: "sandbox.container", key, quantity: uses, unit: "execs" });
     }
-    marks.push({ id: box.id, mark: { through: Math.max(to, had?.through ?? to), uses: Math.max(Math.floor(box.uses ?? 0), had?.uses ?? 0) } });
+    marks.set(box.id, { through: Math.max(to, had?.through ?? to), uses: Math.max(total, inside ? had.uses : 0) });
   }
-  return { rows, marks };
+  return { rows, marks: [...marks].map(([id, mark]) => ({ id, mark })) };
 }
 
 /**
- * The boxes a mount report describes, live one first.
+ * The sessions a mount report describes, live one first.
  *
- * A mount can report the same box twice — alive in `activity` and finished in
- * `usage` — in the pass where it ended between the two reads. The finished
- * record wins, because it has the end.
+ * One per session, not one per box: a woken box is the same id as the sessions it finished before it was
+ * switched off, and each of those is time it was held. A session is its box id and its start.
+ *
+ * A mount can report the same session twice — alive in `activity` and finished in
+ * `usage` — in the pass where it ended between the two reads, and a switched-off
+ * box stays in `activity` under the start of the session its switch-off ended.
+ * The finished record wins, because it has the end.
  */
 export function boxesOf(
   report: {
@@ -136,12 +159,13 @@ export function boxesOf(
   } | null | undefined,
 ): HeldBox[] {
   const out = new Map<string, HeldBox>();
+  const session = (v: { id: string; startedAt: number }) => JSON.stringify([v.id, v.startedAt]);
   const under = (v: { credentialRef?: unknown }) => typeof v.credentialRef === "string" ? { credentialRef: v.credentialRef } : {};
   const live = report?.activity?.live;
-  if (live) out.set(live.id, { id: live.id, startedAt: live.startedAt, endedAt: null, ...under(live) });
-  for (const a of report?.activity?.aside ?? []) out.set(a.id, { id: a.id, startedAt: a.startedAt, endedAt: null, ...under(a) });
+  if (live) out.set(session(live), { id: live.id, startedAt: live.startedAt, endedAt: null, ...under(live) });
+  for (const a of report?.activity?.aside ?? []) out.set(session(a), { id: a.id, startedAt: a.startedAt, endedAt: null, ...under(a) });
   for (const s of report?.usage ?? []) {
-    out.set(s.id, { id: s.id, startedAt: s.startedAt, endedAt: s.endedAt, ...(s.uses === undefined ? {} : { uses: s.uses }), ...under(s) });
+    out.set(session(s), { id: s.id, startedAt: s.startedAt, endedAt: s.endedAt, ...(s.uses === undefined ? {} : { uses: s.uses }), ...under(s) });
   }
   return [...out.values()];
 }
@@ -244,27 +268,21 @@ export function countHeldTime(
     for (const b of boxes) seen.add(b.id);
     // A box on the tenant's own credential is theirs to pay for: kept, under a key that says so (`payerKey`).
     // Whose it is, box by box (`boxIsOwn`): one mount can hold a box on our account beside one on theirs.
-    const mountKey = payerKey(plugin, own === true);
-    const byKey = new Map<string, HeldBox[]>();
-    for (const b of boxes) {
-      const key = payerKey(plugin, boxIsOwn(b, own === true));
-      byKey.set(key, [...(byKey.get(key) ?? []), b]);
-    }
+    // All of a mount's sessions go through one walk whatever their keys, because a box's sessions share one
+    // watermark and have to be walked in time order.
+    const { rows, marks } = heldRows(base, (b) => payerKey(plugin, boxIsOwn(b, own === true)), boxes, counted, now);
     // The marker has no box, so it goes under the mount's key.
-    const marker = heldUnreadableRows(base, mountKey, (report as any)?.activity ?? null, now);
-    if (marker.length) byKey.set(mountKey, byKey.get(mountKey) ?? []);
-    for (const [key, group] of byKey) {
-      const { rows, marks } = heldRows(base, key, group, counted, now);
-      const flagged = key === mountKey ? marker : [];
-      if (rows.length || flagged.length) appendUsage(sql, [...rows, ...flagged]);
-      for (const { id, mark } of marks) {
-        sql.exec(
-          "INSERT INTO usage_held(box_id, through, uses) VALUES (?, ?, ?) " +
-          "ON CONFLICT(box_id) DO UPDATE SET through = excluded.through, uses = excluded.uses",
-          id, Math.round(mark.through), Math.round(mark.uses));
-      }
-      if (rows.length || flagged.length) out.push({ key, rows: rows.length + flagged.length });
+    const marker = heldUnreadableRows(base, payerKey(plugin, own === true), (report as any)?.activity ?? null, now);
+    if (rows.length || marker.length) appendUsage(sql, [...rows, ...marker]);
+    for (const { id, mark } of marks) {
+      sql.exec(
+        "INSERT INTO usage_held(box_id, through, uses) VALUES (?, ?, ?) " +
+        "ON CONFLICT(box_id) DO UPDATE SET through = excluded.through, uses = excluded.uses",
+        id, Math.round(mark.through), Math.round(mark.uses));
     }
+    const byKey = new Map<string, number>();
+    for (const r of [...rows, ...marker]) byKey.set(r.key, (byKey.get(r.key) ?? 0) + 1);
+    for (const [key, n] of byKey) out.push({ key, rows: n });
   }
   for (const [id, mark] of counted) {
     if (!seen.has(id) && mark.through < now - KEEP_MARKS_MS) sql.exec("DELETE FROM usage_held WHERE box_id = ?", id);

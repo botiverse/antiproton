@@ -13,6 +13,7 @@ import { canonicalToolConfig, sameToolConfig, toolConfigOf, type ToolConfig } fr
 import { interruptsOf } from "../../../src/plugins/types.ts";
 import { firstTurnOf, type FirstTurn } from "../../../src/runtime/prewarm.ts";
 import { PROVISION_TASK } from "../../../src/runtime/status.ts";
+import { profileOf, profileSpec, type AgentProfile } from "../../../src/runtime/agent-profile.ts";
 
 /** The alias the provisioned mount carries: the plugin's own name, as a person would pick. */
 export const PROVISION_MOUNT_ALIAS = "raft";
@@ -67,16 +68,30 @@ function toolConfigProblem(rt: AgentRuntime, t: ToolConfig): string | null {
  */
 export async function adoptProvisionedAgent(
   rt: AgentRuntime, tenantId: string, agentId: string,
-  spec: { name: string; instructions: string; raftOrigin: string; avatar: string; toolConfig?: ToolConfig | null; awaitImport?: boolean; firstTurn?: FirstTurn | null },
+  spec: {
+    name: string; instructions: string; raftOrigin: string; avatar: string; toolConfig?: ToolConfig | null; awaitImport?: boolean; firstTurn?: FirstTurn | null;
+    profile?: AgentProfile | null;
+  },
   model?: ModelChoice | null,
 ): Promise<{ ok: true; avatar: string; modelRefused?: string } | { ok: false; error: string; refused?: Fail }> {
   await rt.ready();
   const existing = await rt.store.loadAgent(tenantId, agentId);
   const config = (existing?.config ?? {}) as Record<string, unknown>;
+  // The profile (src/runtime/agent-profile.ts) is fixed when the agent is made, as `toolConfig` is: a POST asking for
+  // another, or none where one is recorded, is refused and writes nothing; absent (a PATCH, an import) keeps it.
+  const recordedProfile = profileOf(config);
+  if (spec.profile !== undefined && existing && recordedProfile !== spec.profile) {
+    const error = `this agent was provisioned with profile ${JSON.stringify(recordedProfile)}, and this request asks for ${JSON.stringify(spec.profile)}; ` +
+      "it is fixed when the agent is made (profile)";
+    return { ok: false, error, refused: { status: 409, code: "idempotency_conflict", message: error, param: "profile" } };
+  }
+  const profile = spec.profile === undefined ? recordedProfile : spec.profile;
   const recorded = toolConfigOf(config);
-  if (spec.toolConfig !== undefined && existing && !sameToolConfig(recorded, spec.toolConfig)) {
+  // A profile's tools are the profile's: what its POST asks for is that, whatever the body said of tools.
+  const askedTools = profile && spec.toolConfig !== undefined ? profileSpec(profile).toolConfig : spec.toolConfig;
+  if (askedTools !== undefined && existing && !sameToolConfig(recorded, askedTools)) {
     const say = (t: ToolConfig | null) => t === null ? "none (the default tools)" : JSON.stringify(t);
-    const error = `this agent was provisioned with toolConfig ${say(recorded)}, and this request asks for ${say(spec.toolConfig)}; ` +
+    const error = `this agent was provisioned with toolConfig ${say(recorded)}, and this request asks for ${say(askedTools)}; ` +
       "an agent's tools are fixed when it is made, so a different set needs a new agent";
     return { ok: false, error, refused: { status: 409, code: "tool_config_conflict", message: error } };
   }
@@ -90,7 +105,7 @@ export async function adoptProvisionedAgent(
   }
   const firstTurn = spec.firstTurn === undefined ? recordedFirst : spec.firstTurn;
   // Written canonical whoever called (src/core/tool-config.ts), so the stored form is the compared and hashed one.
-  const toolConfig = spec.toolConfig === undefined ? recorded : spec.toolConfig && canonicalToolConfig(spec.toolConfig);
+  const toolConfig = askedTools === undefined ? recorded : askedTools && canonicalToolConfig(askedTools);
   const problem = toolConfig ? toolConfigProblem(rt, toolConfig) : null;
   if (problem) return { ok: false, error: problem, refused: { status: 400, code: "invalid", message: problem, param: "mounts" } };
   const avatar = typeof config.avatar === "string" ? config.avatar : spec.avatar;
@@ -98,6 +113,7 @@ export async function adoptProvisionedAgent(
     ...config, name: spec.name, description: spec.instructions, avatar, provisionedBy: PROVISIONED_BY,
     ...(toolConfig ? { toolConfig } : {}),
     ...(firstTurn ? { firstTurn } : {}),
+    ...(profile ? { profile } : {}),
   };
   if (!existing) await rt.store.createAgent(tenantId, agentId, persona as Json);
   else await rt.store.updateAgentConfig(tenantId, agentId, persona as Json);
@@ -127,6 +143,15 @@ export async function adoptProvisionedAgent(
   // another origin is a different mount.
   const mount = await rt.addMount(tenantId, agentId, { alias: PROVISION_MOUNT_ALIAS, plugin: "raft", config: { serverUrl: spec.raftOrigin } });
   if (!mount.ok) return mount;
+  if (profile) {
+    // The profile's own mount, beside raft: its plugin's code reads and answers with raft's credential.
+    const driver = profileSpec(profile);
+    await rt.store.setPluginChoice(tenantId, agentId, driver.plugin, "enable");
+    const own = await rt.addMount(tenantId, agentId, {
+      alias: driver.alias, plugin: driver.plugin, config: { serverUrl: spec.raftOrigin, raftMount: PROVISION_MOUNT_ALIAS },
+    });
+    if (!own.ok) return own;
+  }
   return { ok: true, avatar, ...(plan.refused ? { modelRefused: plan.refused } : {}) };
 }
 
