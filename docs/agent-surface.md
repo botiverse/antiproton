@@ -174,6 +174,7 @@ read of the tenant as a whole:
 | `PUT` | `/provision/servers/{raftServerId}/model-picker` — whether the server's agents may pick another model than the default ([below](#the-servers-model-picker-model-picker)) |
 | `POST` | `/provision/agents/{agentId}/import` — the agent's workspace, once ([below](#workspace-import)) |
 | `GET` | `/provision/import-limits` — the bounds an import is held to ([below](#workspace-import)) |
+| `POST` | `/provision/import-check` — which files an import would refuse, without importing ([below](#checking-an-import-first)) |
 | `POST` | `/provision/agents/{agentId}/stop` — end the agent's running turn without deleting it ([below](#stopping-a-turn-stop)) |
 | `GET` | `/provision/agents/{agentId}/connections/github` — the agent's GitHub connection, and whether it needs reconnecting ([below](#the-agents-github-connection-connectionsgithub)) |
 
@@ -533,7 +534,8 @@ agent and an unknown id are `404 not_found`.
 - The request as sent is at most 16 MiB (`413`, `param: "body"`).
 
 `GET /provision/import-limits` answers `{ "maxTotalBytes": 10485760, "maxFiles": 2000, "maxFileBytes": 2097152 }`
-(`IMPORT_LIMITS`), for Raft's exporter to refuse a workspace over them before sending it.
+(`IMPORT_LIMITS`), for Raft's exporter to refuse a workspace over them before sending it. To learn which files
+would be refused without importing, check the body first ([below](#checking-an-import-first)).
 
 **Where the files go.** Each file is the agent's state key `path` — what its state tools `get` and `put`,
 and `state/{path}` in the workspace reads above — so it reads back through
@@ -543,13 +545,18 @@ imported file is the agent's own: it may change or remove it.
 
 **What the agent is shown.** From its first turn the agent's system prompt carries a block headed "Files
 that were in your workspace when you were created": `MEMORY.md`'s current text (what its `get` answers now, not the copy
-imported) fenced, up to 4,000 characters with a line saying where the rest is, or a note that it is kept in
-object storage or was removed; then up to 40 of the other imported paths by name, with the count of the rest;
+imported) fenced, up to **16,000** characters (`IMPORTED_MEMORY_BUDGET`, the 16 KB Raft agents are told to keep it
+under) with a line after the fence saying where the rest is (`… cut at 16000 of N characters; get \`MEMORY.md\` with
+the \`get\` tool on the \`state\` mount for the rest.`), or a note that it was removed. A copy over its row's
+bound (32 KiB as JSON) is kept in object storage, and shown all the same from the excerpt the import wrote beside it
+in the agent's own database (`import_excerpt`): the prompt never reads the bucket, and the excerpt is the same
+characters the row would have shown. Once the agent replaces that copy with another too large for its row, the
+note says it is kept in object storage and to `get` it; then up to 40 of the other imported paths by name, with the count of the rest;
 and the state mount's `get` to open them (`importedFilesParts`, `src/plugins/state.ts`).
 
 **What a file may be.** UTF-8 text with no NUL byte: a state value is text, and a file that is not could not
 read back as the bytes it was (`422 not_text`). Nothing shaped like a credential (`422 credential_in_text`,
-the kind named and none of the text). Paths are normalised, then checked: empty and `.` segments drop out
+the kind named and none of the text), in its text or in its path (`422 credential_in_path`, `param: "files[i].path"`: a path is a key named in the prompt, listings and answers, and one shaped like a credential is never repeated in any of them). Paths are normalised, then checked: empty and `.` segments drop out
 (`./notes//a.md` is `notes/a.md`); refused with `422`, `param: "files[i].path"`: a leading `/`, a `..`
 segment, a trailing `/`, a backslash, a control character, anything the state key rule
 (`^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$`) refuses once normalised, and a path two files share
@@ -591,12 +598,67 @@ later `PATCH`.
 
 `files` is sorted by path. Errors use the provider envelope, `param` naming the field: `400`
 (`invalid_json`, `unknown_field`), `401`, `404 not_found`, `409` (`already_imported`, `agent_active`),
-`413`, `422` (`invalid`, `reserved`, `duplicate_path`, `sha256_mismatch`, `total_mismatch`, `not_text`,
-`credential_in_text`); a failure underneath is `500`, after which the same request is safe to retry.
+`413`, `422` (`invalid`, `reserved`, `duplicate_path`, `credential_in_path`, `sha256_mismatch`, `total_mismatch`,
+`not_text`, `credential_in_text`); a failure underneath is `500`, after which the same request is safe to retry.
+
+**Every refused file in one answer.** A problem with one file refuses that file, and the check goes on: the answer
+names every file the import refuses, so dropping them takes one round trip, not one per file. The envelope's
+`code`, `message`, `param` and status are the first refused file's, as they were when the check stopped there;
+`error.rejected` lists each refused file, in order, with its first problem, and `error.more` counts those past the
+first **200** (`IMPORT_REJECTIONS_SHOWN`):
+
+```json
+422
+{ "error": { "code": "invalid", "param": "files[1].path",
+  "message": "files[1].path: path must not have a `..` segment; 3 files are refused in all, each named in rejected",
+  "rejected": [
+    { "index": 1, "path": "../escape.md", "reason": "invalid", "param": "files[1].path" },
+    { "index": 2, "path": "notes/keys.env", "reason": "credential_in_text", "param": "files[2].contentBase64" },
+    { "index": 5, "path": "memory", "reason": "reserved", "param": "files[5].path" }],
+  "more": 0 } }
+```
+
+`index` is the file's place in `files`; `path` the path as sent (cut to 256 characters; `null` when it was not a
+string or is itself shaped like a credential); `reason` the code that file alone would have been refused with
+(`invalid`, `unknown_field`, `reserved`, `duplicate_path`, `credential_in_path`, `sha256_mismatch`, `file_too_large`,
+`not_text`, `credential_in_text`); `param` the field. Never a file's bytes, nor the text a credential was recognised by. A
+problem with the body as a whole (an unknown top-level field, `migrationId`, `instructions`, `totalBytes`, too many
+files) has no `rejected`. Past 10 MiB together the check ends at the file that crosses it (`413 too_large`,
+`param: "files"`), carrying in `rejected` the files refused before it. `total_mismatch` is checked once no file is
+refused: with one dropped, the sum to send is the one without it. The audit line counts the refused files.
 
 **Audit.** One `provision.import` log line per request that names a live agent: the token's hash
 (`credentialId`), the tenant and agent, the outcome (`imported`, `replayed`, `refused` with its `code`,
-`failed`), the file count and bytes, and the `migrationId`. Never a path's content or the token.
+`failed`), the file count and bytes, the count of refused files, and the `migrationId`. Never a path's content or the token.
+
+#### Checking an import first
+
+```
+POST /provision/import-check
+POST /provision/import-check?raftServerId=…     (a platform token)
+```
+
+The body is an import's, exactly (`migrationId` included), under the same 16 MiB bound; the answer is what the import
+would refuse, without importing: Raft calls it before a migration is confirmed, to show which files would not come
+over. It names no agent, so it reads and writes no agent's state: it takes no agent's one import, never answers
+`409`, and leaves an import already made as it was. A tenant's provider token, or a platform token with
+`?raftServerId=`, as the other tenant routes; no token is `401`.
+
+```json
+200
+{ "ok": false,
+  "rejected": [{ "index": 1, "path": "../escape.md", "reason": "invalid", "param": "files[1].path" }],
+  "more": 0,
+  "totals": { "files": 2, "bytes": 12 },
+  "limits": { "maxTotalBytes": 10485760, "maxFiles": 2000, "maxFileBytes": 2097152 } }
+```
+
+`ok` is whether the import would take every file; `rejected` and `more` as in the import's refusal; `totals` the
+files that pass and their decoded bytes (what an import of them alone would carry as `totalBytes`); `limits` the
+same as `GET /provision/import-limits`. A problem with the body as a whole answers the import's own `4xx`. What it
+cannot know, since it names no agent: `409 already_imported` and `agent_active`, and, on a deployment serving the
+evaluation routes, a path already seeded. One `provision.import_check` log line per request: the token's hash, the
+tenant, the outcome (`ok`, `rejected`, `refused` with its `code`) and the counts.
 
 #### Waiting for the import (`awaitImport`)
 

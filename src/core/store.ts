@@ -1,6 +1,6 @@
 import type { SeedNoticeRow, SeedPassResult, SeedPlan, SeedRecord } from "../store/seed-record.ts";
 import type { SealHow, SeedFileMeta, SeedSeal, SeedStoreResult, SeedWrite } from "../store/seed-files.ts";
-import type { ImportedFile } from "../store/workspace-import.ts";
+import type { ImportedFile, ImportExcerpt } from "../store/workspace-import.ts";
 import type { ToolConfig } from "./tool-config.ts";
 import type {
   AdvanceTxn,
@@ -440,6 +440,11 @@ export interface StorageAdapter {
    * null when the agent had none. What the state plugin's prompt paragraph names them by. Read-only, one row.
    */
   listImportedFiles(tenantId: string, agentId: string): Promise<ImportedFile[] | null>;
+  /**
+   * What the prompt shows of an imported file kept in object storage (src/store/workspace-import.ts `ImportExcerpt`),
+   * written with the import; null when there is none. Read-only, one row, never the bucket.
+   */
+  importedExcerpt(tenantId: string, agentId: string, path: string): Promise<ImportExcerpt | null>;
   /** `"inherit"` is stored as the absence of a row, not as a third value. */
   setPluginChoice(
     tenantId: string, agentId: string, plugin: string, choice: PluginChoice,

@@ -25,6 +25,7 @@ async function check(name: string, fn: () => Promise<void> | void) {
   catch (e) { results.push({ name, ok: false, error: String((e as Error)?.stack ?? e).split("\n").slice(0, 3).join("\n      ") }); }
 }
 function must(cond: unknown, msg: string): asserts cond { if (!cond) throw new Error(msg); }
+const show = (v: unknown) => JSON.stringify(v);
 
 const TOKEN = "operator-token-814";
 
@@ -126,6 +127,23 @@ for (const r of ROUTES) {
   await check(`${name}: the configured token gets past the gate`, async () => {
     const out = await hit(r, TOKEN, TOKEN);
     must(r.passed(out.status, out.calls), `${out.status} ${out.text.slice(0, 200)} calls=${out.calls}`);
+  });
+}
+
+// The provider routes that name no agent (cf/src/provision/handlers.ts): behind the provider token, not the operator's.
+// No token, one that is not a provider token, one this deployment never issued (the database knows none), and the
+// operator's own token in either header are all 401, before any object, R2 or network call.
+for (const [method, path] of [["POST", "/provision/import-check"], ["GET", "/provision/import-limits"]] as const) {
+  await check(`${method} ${path}: refused without a provider token this deployment issued`, async () => {
+    for (const headers of [{}, { authorization: "Bearer anything" }, { authorization: "Bearer pt-" + "0".repeat(40) },
+      { authorization: `Bearer ${TOKEN}` }, { "x-harness-token": TOKEN }] as Array<Record<string, string>>) {
+      const w = world(TOKEN);
+      const res = await worker.fetch(new Request(`https://x${path}`, { method, headers, ...(method === "POST" ? { body: "{}" } : {}) }),
+        w.env as never, { waitUntil() {}, passThroughOnException() {} } as never);
+      const text = await res.text();
+      must(res.status === 401 && JSON.parse(text).error?.code === "unauthorized", `${show(headers)}: ${res.status} ${text.slice(0, 200)}`);
+      must(!w.calls.some((c) => /^(object|r2|fetch)\./.test(c)), `${show(headers)} reached the object, R2 or the network: ${w.calls}`);
+    }
   });
 }
 
