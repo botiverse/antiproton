@@ -9,12 +9,13 @@
  */
 import { register } from "node:module";
 import {
-  activeAgents, dailyCron, fileIssues, frictionDaily, inScope, issueBody, issueTrackerFrom, renderMarkdown, scanDay,
-  tenantScope, writeReport, SCAN_DEFAULTS, type FrictionBucket, type IssueTracker, type WindowReader,
+  activeAgents, dailyCron, fileIssues, frictionDaily, inScope, issueBody, issuesFrom, issueTemplate, renderMarkdown, scanDay,
+  tenantScope, writeReport, KNOWN_TEMPLATES, SCAN_DEFAULTS, type FrictionBucket, type IssueTracker, type ReportGroup, type WindowReader,
 } from "../cf/src/friction-scan.ts";
 import { readFrictionWindow, FRICTION_LIMITS, type FrictionWindow } from "../cf/src/friction-read.ts";
 import { noteTraceDays, traceIndexKey } from "../cf/src/trace-r2.ts";
-import { agentHash } from "../cf/src/friction.ts";
+import { agentHash, template, type FrictionClass } from "../cf/src/friction.ts";
+import { admitBackground } from "../src/runtime/background-jobs.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { PiSqliteStorage } from "../src/store/pi-storage.ts";
 import { BACKGROUND_CONTEXT as CTX } from "@earendil-works/pi-agent-core/harness/context";
@@ -75,7 +76,7 @@ const indexed = (...pairs: Array<[string, string]>) => pairs.map(([t, a]) => tra
 await check("an empty or missing tenant list scans nothing: no listing, no object read, no report", async () => {
   for (const v of [undefined, "", " , ", "not a valid id!"]) {
     const b = bucket(indexed([HOSTED, AGENT])); const o = objects();
-    const out = await frictionDaily({ FRICTION_SCAN_TENANTS: v }, { bucket: b, window: o.window, tracker: null }, Date.parse("2026-10-19T03:17:00Z"));
+    const out = await frictionDaily({ FRICTION_SCAN_TENANTS: v }, { bucket: b, window: o.window }, Date.parse("2026-10-19T03:17:00Z"));
     must(out === "no tenants in scope", `${JSON.stringify(v)}: ${out}`);
     must(o.read.length === 0 && b.calls.length === 0, `${JSON.stringify(v)}: read ${o.read} calls ${b.calls}`);
   }
@@ -159,27 +160,49 @@ function tracker() {
   return t;
 }
 
-await check("issues are off by default: neither the switch nor the token alone turns them on, and the cron files none", async () => {
-  must(issueTrackerFrom({}) === null, "on with nothing set");
-  must(issueTrackerFrom({ FRICTION_ISSUES: "1" }) === null, "on without a token");
-  must(issueTrackerFrom({ FRICTION_GITHUB_TOKEN: "x" }) === null, "on without the switch");
-  must(issueTrackerFrom({ FRICTION_ISSUES: "true", FRICTION_GITHUB_TOKEN: "x" }) === null, "on with a switch that is not 1");
-  must(issueTrackerFrom({ FRICTION_ISSUES: "1", FRICTION_GITHUB_TOKEN: "x" }) !== null, "control: both set is still off");
-  // The cron with only the switch set: no tracker is built, nothing is fetched, and the issue state is never touched.
-  let fetched = 0; const real = globalThis.fetch;
+const KEY = "test-hash-key-not-a-secret";
+const ON = { FRICTION_ISSUES: "1", FRICTION_GITHUB_TOKEN: "x", FRICTION_HASH_KEY: KEY };
+
+await check("issues are off by default: the switch needs both the token and the hash key, and the cron files none without them", async () => {
+  must("off" in issuesFrom({}), "on with nothing set");
+  must("off" in issuesFrom({ FRICTION_ISSUES: "1" }), "on with neither secret");
+  must("off" in issuesFrom({ FRICTION_ISSUES: "1", FRICTION_HASH_KEY: KEY }), "on without a token");
+  must("off" in issuesFrom({ FRICTION_ISSUES: "1", FRICTION_GITHUB_TOKEN: "x" }), "on without a hash key");
+  must("off" in issuesFrom({ FRICTION_GITHUB_TOKEN: "x", FRICTION_HASH_KEY: KEY }), "on without the switch");
+  must("off" in issuesFrom({ ...ON, FRICTION_ISSUES: "true" }), "on with a switch that is not 1");
+  const on = issuesFrom(ON);
+  must(!("off" in on) && on.hashKey === KEY, "control: all three set is still off");
+  // The cron with the switch and the token but no key: nothing is filed or fetched, the state is never touched, and
+  // the misconfiguration is logged by name.
+  let fetched = 0; const real = globalThis.fetch; const quiet = console.warn; const warned: string[] = [];
   globalThis.fetch = (async () => { fetched++; return new Response("{}"); }) as typeof fetch;
+  console.warn = (...a: unknown[]) => warned.push(a.join(" "));
   try {
-    const b = bucket(indexed([HOSTED, AGENT]));
-    const out = await frictionDaily({ FRICTION_SCAN_TENANTS: HOSTED, FRICTION_ISSUES: "1" }, { bucket: b, window: objects().window }, Date.parse("2026-10-19T03:17:00Z"));
-    must(/issues off/.test(out) && !b.calls.some((c) => c.includes("friction-state")), `${out} ${b.calls}`);
-    must(fetched === 0, `fetched ${fetched} time(s)`);
-  } finally { globalThis.fetch = real; }
+    const b = bucket(indexed([HOSTED, AGENT])); const t = tracker();
+    const out = await frictionDaily({ FRICTION_SCAN_TENANTS: HOSTED, FRICTION_ISSUES: "1", FRICTION_GITHUB_TOKEN: "x" }, { bucket: b, window: objects().window, tracker: t }, Date.parse("2026-10-19T03:17:00Z"));
+    must(/issues off: .*FRICTION_HASH_KEY/.test(out) && t.made.length === 0 && t.comments.length === 0, `${out}, made ${t.made.length}`);
+    must(!b.calls.some((c) => c.includes("friction-state")) && fetched === 0, `${b.calls} fetched ${fetched}`);
+    must(warned.some((w) => w.includes("friction.issues") && w.includes("FRICTION_HASH_KEY")), `not logged: ${warned}`);
+    // Control: the same run with the key files.
+    const t2 = tracker();
+    const out2 = await frictionDaily({ FRICTION_SCAN_TENANTS: HOSTED, ...ON }, { bucket: bucket(indexed([HOSTED, AGENT])), window: objects().window, tracker: t2 }, Date.parse("2026-10-19T03:17:00Z"));
+    must(t2.made.length > 0 && /issues \d+ new/.test(out2), `control: ${out2}`);
+    let threw = false; try { await fileIssues(bucket(), tracker(), "", await scanDay({ bucket: bucket(), window: objects().window }, tenantScope(HOSTED), DAY)); } catch { threw = true; }
+    must(threw, "fileIssues filed with an empty key");
+  } finally { globalThis.fetch = real; console.warn = quiet; }
 });
 
-await check("an issue body carries no excerpt, command, raw agent id or conversation id; a risky template is withheld", async () => {
+await check("agent ids are an HMAC under the secret key: another key, another hash; no key, no hash", async () => {
+  const a = await agentHash(AGENT, KEY), b = await agentHash(AGENT, KEY + "x"), c = await agentHash(OTHER_AGENT, KEY);
+  must(/^ag_[0-9a-f]{16}$/.test(a) && a !== b && a !== c && a === await agentHash(AGENT, KEY), `${a} ${b} ${c}`);
+  let threw = false; try { await agentHash(AGENT, ""); } catch { threw = true; }
+  must(threw, "hashed without a key");
+});
+
+await check("an issue body carries no excerpt, command, raw agent id or conversation id", async () => {
   const r = await scanDay({ bucket: bucket(indexed([HOSTED, AGENT])), window: objects().window, build: "abc1234" }, tenantScope(HOSTED), DAY);
   const t = tracker();
-  await fileIssues(bucket(), t, r);
+  await fileIssues(bucket(), t, KEY, r);
   must(t.made.length >= 2, `made ${t.made.length}`);
   const text = JSON.stringify(t.made);
   const excerpts = [...r.roots.flatMap((x) => x.examples.flatMap((e) => e.evidence)), ...r.groups.flatMap((g) => g.examples.map((e) => e.evidence))]
@@ -187,27 +210,58 @@ await check("an issue body carries no excerpt, command, raw agent id or conversa
   must(excerpts.length > 3, "the report has no excerpts to test against");
   for (const e of excerpts) must(!text.includes(e), `an excerpt reached an issue: ${e}`);
   for (const id of [AGENT, HOSTED, "main.1", "sub_8a4f448c39e2623b", "做不到", "ls -a", "which raft"]) must(!text.includes(id), `${id} reached an issue`);
-  must(text.includes(await agentHash(AGENT)) && text.includes("abc1234") && text.includes(`${DAY}T00:00Z`), "the hash, build or window is missing");
+  must(text.includes(await agentHash(AGENT, KEY)) && text.includes("abc1234") && text.includes(`${DAY}T00:00Z`), "the hash, build or window is missing");
   must(t.made.every((m) => m.labels.join() === "agent-friction"), "label");
-  // A template that could hold user text (not plain ASCII, or naming a host that is not ours) is left out.
-  const risky = { ...r.groups[0]!, cls: "tool_error" as const, key: "fs: 用户的文件 <path> 不存在", agents: [AGENT] };
-  const body = await issueBody(DAY, null, risky, 0);
-  must(!body.includes("用户") && /withheld/.test(body), body);
-  const host = await issueBody(DAY, null, { ...risky, key: "web: fetch failed for <url:intranet.acme-corp.example> and acme-corp.example" }, 0);
-  must(!host.includes("acme-corp") && host.includes("<url>") && host.includes("<host>"), host);
+  // The calibration's own messages are shown, as the allowlist's text.
+  must(t.made.some((m) => m.body.includes("is too large to view: <n>×<n> px")) && t.made.some((m) => m.body.includes("Bad credentials")), `known templates not shown: ${text.slice(0, 400)}`);
+});
+
+await check("a public template is a closed allowlist: our own messages are shown, anything else (or ours with more on it) is withheld", async () => {
+  const shownFor = (cls: FrictionClass, key: string) => issueTemplate(cls, key);
+  const g = (cls: FrictionClass, key: string): ReportGroup => ({ fingerprint: "fr_0000000000000000", cls, key, count: 1, agents: [AGENT], conversations: 1, tools: [], score: 1, examples: [] });
+  // Paths and arguments in plain ASCII, the kind a denylist let through.
+  for (const raw of ["web__get: GET /repos/acme-corp/secret-roadmap/contents/plan.md returned 500", "fs__read: cannot open /home/alice/clients/foo.md"]) {
+    const key = `${raw.split("__")[0]}: ${template(raw)}`;
+    must(shownFor("tool_error", key) === null, `shown: ${key}`);
+    const body = await issueBody(DAY, null, g("tool_error", key), 0, KEY);
+    for (const leak of ["acme-corp", "secret-roadmap", "alice", "clients", "foo.md"]) must(!body.includes(leak), `${leak} in ${body}`);
+    must(body.includes("withheld (see private report, fingerprint fr_0000000000000000)"), body);
+  }
+  // Known messages, built by the code that sends them and templated as the scan does.
+  const att = "1b2c3d4e-0000-4000-8000-00000000abcd";
+  const px = `raft: ${template(`raft__attachments_view: attachment ${att} ("IMG.jpg") is too large to view: 1449×2048 px, over the 2000 px limit on a side. Images are not resized here. It was kept as artifact://raft/attachments/${att}.jpg.`)}`;
+  const mib = `raft: ${template(`attachment ${att} ("a.png") is too large to view: 6.2 MiB (6501171 bytes), over the 5.0 MiB (5242880 bytes) limit. Images are not resized here. It was kept as artifact://raft/attachments/${att}.png.`)}`;
+  const jobs = admitBackground([{ id: "op_a1", mount: "sandbox", tool: "sandbox__shell", createdAt: 0 }, { id: "op_b2", mount: "sandbox", tool: "sandbox__shell", createdAt: 0 }, { id: "op_c3", mount: "sandbox", tool: "sandbox__shell", createdAt: 0 }], 3, 12_000);
+  must(!jobs.ok, "the job limit did not refuse");
+  const job = `sandbox: ${template(jobs.message)}`;
+  const gh = `gh: ${template(`gh__repo_view: github 401: Bad credentials — the "gh" mount's account was used, and GitHub refused that credential itself, so it has to be replaced rather than added to`)}`;
+  for (const [cls, key] of [["tool_error", px], ["tool_error", mib], ["tool_error", job], ["tool_error", gh], ["tool_error", "web: refused scheme artifact:"],
+    ["binary_as_text", "artifacts__read kind=text"], ["auth_failure", "HTTP 401 api.raft.build"], ["guessed_endpoint_404", "web__get 404 content.raft.build"]] as Array<[FrictionClass, string]>) {
+    const shown = shownFor(cls, key);
+    must(shown !== null && KNOWN_TEMPLATES.some((t) => t.shown === shown), `${cls} not shown: ${key}`);
+    must((await issueBody(DAY, null, g(cls, key), 0, KEY)).includes(shown), "the body does not carry the shown text");
+  }
+  // Ours with user text appended, or in a slot that varies, is not ours any more.
+  for (const [cls, key] of [["tool_error", px + " see /home/alice/clients/foo.md"], ["tool_error", gh + " for acme-corp/secret-roadmap"],
+    ["tool_error", "web: refused scheme artifact: acme-corp"], ["auth_failure", "HTTP 401 api.acme-corp.example"], ["binary_as_text", "artifacts__read kind=text acme"]] as Array<[FrictionClass, string]>) {
+    must(shownFor(cls, key) === null, `shown: ${key}`);
+  }
+  // The shown text is the list's, never the key: a mount alias the pattern lets vary does not reach the issue.
+  const aliased = gh.replace(/^gh:/, "acme-corp-gh:");
+  must(shownFor("tool_error", aliased) !== null && !(await issueBody(DAY, null, g("tool_error", aliased), 0, KEY)).includes("acme-corp"), "the alias reached the issue");
 });
 
 await check("issues: one per new qualifying fingerprint, a comment only when its counts change, none for probes", async () => {
   const b = bucket(); const t = tracker();
   const r = await scanDay({ bucket: bucket(indexed([HOSTED, AGENT])), window: objects().window }, tenantScope(HOSTED), DAY);
-  const first = await fileIssues(b, t, r);
+  const first = await fileIssues(b, t, KEY, r);
   must(first.created === t.made.length && first.commented === 0, JSON.stringify(first));
   must(t.made.every((m) => !/env_probe|inability_text|repeated_call/.test(m.title)), `a probe was filed: ${t.made.map((m) => m.title)}`);
   must(t.made.some((m) => m.title.includes(r.roots[0]!.fingerprint)), "an episode root was not filed");
-  const again = await fileIssues(b, t, r);
+  const again = await fileIssues(b, t, KEY, r);
   must(again.created === 0 && again.commented === 0, `same counts: ${JSON.stringify(again)}`);
   const more = structuredClone(r); more.groups.find((g) => g.fingerprint === r.roots[0]!.fingerprint)!.count += 2;
-  const third = await fileIssues(b, t, more);
+  const third = await fileIssues(b, t, KEY, more);
   must(third.created === 0 && third.commented === 1 && t.comments[0]!.issue >= 101, JSON.stringify(third));
 });
 

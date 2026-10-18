@@ -15,12 +15,13 @@
  * a step that can neither throw into the cron nor outlive its budget (`dailyCron`).
  *
  * Public issues are a separate, stricter boundary (`issueBody`): the repository is public, so an issue carries an
- * error template only when it can hold no user text, counts, hashed agent ids, the build and the window. Never an
- * excerpt, a command, a raw id or a conversation id. Off unless both `FRICTION_ISSUES=1` and a
- * `FRICTION_GITHUB_TOKEN` secret are set (`issueTrackerFrom`).
+ * error text only when the key is one of our own fixed product messages (`KNOWN_TEMPLATES`), and then our text, not
+ * the key; counts, agent ids as a keyed HMAC, the build and the window. Never an excerpt, a command, a raw id or a
+ * conversation id. Off unless `FRICTION_ISSUES=1` and both secrets `FRICTION_GITHUB_TOKEN` and `FRICTION_HASH_KEY`
+ * are set (`issuesFrom`).
  */
 import {
-  agentHash, episodes, excerpt, fingerprint, HARD, INABILITY_ZH, OWN_HOSTS, scanConversation, score,
+  agentHash, episodes, excerpt, fingerprint, HARD, scanConversation, score,
   type Episode, type FrictionClass, type Signal,
 } from "./friction.ts";
 import { FRICTION_LIMITS, type FrictionLimits, type FrictionWindow } from "./friction-read.ts";
@@ -46,6 +47,7 @@ export interface FrictionEnv {
   FRICTION_SCAN_TENANTS?: string;
   FRICTION_ISSUES?: string;
   FRICTION_GITHUB_TOKEN?: string;
+  FRICTION_HASH_KEY?: string;
   FRICTION_ISSUES_REPO?: string;
   GIT_COMMIT?: string;
 }
@@ -308,10 +310,19 @@ export interface IssueTracker {
 
 export const ISSUE_LABEL = "agent-friction";
 
-/** Filing is on only when it is asked for AND has its own credential: neither alone turns it on. */
-export function issueTrackerFrom(env: FrictionEnv, fetcher: typeof fetch = fetch): IssueTracker | null {
-  if (env.FRICTION_ISSUES !== "1" || !env.FRICTION_GITHUB_TOKEN) return null;
-  return githubTracker(env.FRICTION_GITHUB_TOKEN, env.FRICTION_ISSUES_REPO || "botiverse/antiproton", fetcher);
+/** What filing needs, or why it is off. */
+export type IssueConfig = { tracker: IssueTracker; hashKey: string } | { off: string };
+
+/**
+ * Filing is on only when it is asked for (`FRICTION_ISSUES=1`) AND both of its secrets are set: its own GitHub token
+ * and the key agent ids are hashed under. Asked for with a secret missing is a misconfiguration, said in `off` (by
+ * name, never by value) and logged by the caller.
+ */
+export function issuesFrom(env: FrictionEnv, fetcher: typeof fetch = fetch): IssueConfig {
+  if (env.FRICTION_ISSUES !== "1") return { off: "issues off" };
+  const missing = [env.FRICTION_GITHUB_TOKEN ? null : "FRICTION_GITHUB_TOKEN", env.FRICTION_HASH_KEY ? null : "FRICTION_HASH_KEY"].filter(Boolean);
+  if (missing.length) return { off: `issues off: FRICTION_ISSUES=1 but ${missing.join(" and ")} not set` };
+  return { tracker: githubTracker(env.FRICTION_GITHUB_TOKEN!, env.FRICTION_ISSUES_REPO || "botiverse/antiproton", fetcher), hashKey: env.FRICTION_HASH_KEY! };
 }
 
 export function githubTracker(token: string, repo: string, fetcher: typeof fetch = fetch): IssueTracker {
@@ -335,31 +346,63 @@ export function githubTracker(token: string, repo: string, fetcher: typeof fetch
 }
 
 /**
- * The key as a public issue may show it, or null when it might carry user text. Urls and hosts other than ours go,
- * and anything left that is not plain ASCII (with a few typographic marks), or that has a long unbroken run, is
- * withheld whole rather than trimmed: a template cannot be proven clean, so only one that looks like a product's own
- * message is shown.
+ * Our own product messages, as `template` (cf/src/friction.ts) leaves them, that a public issue may name. A closed list,
+ * on purpose: an error text that is not ours can carry anything (an org, a repo, a path, a file name, in plain ASCII),
+ * and no denylist can tell those from product words. A key is shown only when it matches one of these patterns
+ * whole, and what is shown is the entry's own `shown` text, never the key: even the parts a pattern lets vary (a mount
+ * alias, a tool name) stay out of the issue. Anything else is withheld, with the fingerprint to find it in the private
+ * report. A new message belongs here only with its source (each entry names it) and a test.
  */
+export interface KnownTemplate { id: string; cls: FrictionClass; pattern: RegExp; shown: string }
+const SIZE = String.raw`<n>MiB \(<n>bytes\), over the <n>MiB \(<n>bytes\) limit`;
+const SIDE = String.raw`<n>×<n>px, over the <n>px limit on a side`;
+const MOUNT = String.raw`[a-z0-9_-]{1,40}`;
+const JOB = String.raw`<op_id> \([a-z0-9_-]{1,80}, running <n>s\)`;
+const GH_401 = "github <n>: Bad credentials — the <q> mount's account was used, and GitHub refused that credential itself, so it has to be replaced rather than added to";
+const esc = (t: string) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const OWN = String.raw`(?:[a-z0-9-]+\.)*(?:raft\.build|antiproton\.ai)`;
+export const KNOWN_TEMPLATES: readonly KnownTemplate[] = [
+  // src/plugins/raft.ts, the attachments_view size refusals: bytes, px, or both.
+  { id: "attachment-too-large-bytes", cls: "tool_error",
+    pattern: new RegExp(String.raw`^${MOUNT}: attachment <uuid> \(<q>\) is too large to view: ${SIZE}\. Images are not resized here\. It was kept as <artifact-ref>$`),
+    shown: "attachment <uuid> (<q>) is too large to view: <n> MiB, over the <n> MiB limit. Images are not resized here." },
+  { id: "attachment-too-large-px", cls: "tool_error",
+    pattern: new RegExp(String.raw`^${MOUNT}: attachment <uuid> \(<q>\) is too large to view: ${SIDE}\. Images are not resized here\. It was kept as <artifact-ref>$`),
+    shown: "attachment <uuid> (<q>) is too large to view: <n>×<n> px, over the <n> px limit on a side. Images are not resized here." },
+  { id: "attachment-too-large-both", cls: "tool_error",
+    pattern: new RegExp(String.raw`^${MOUNT}: attachment <uuid> \(<q>\) is too large to view: ${SIZE}; and ${SIDE}\. Images are not resized here\. It was kept as <artifact-ref>$`),
+    shown: "attachment <uuid> (<q>) is too large to view: over the MiB limit and the px limit on a side. Images are not resized here." },
+  // src/runtime/background-jobs.ts, the cap on running background jobs.
+  { id: "background-job-limit", cls: "tool_error",
+    pattern: new RegExp(String.raw`^${MOUNT}: <n>background jobs are already running, the most this agent may have at once: ${JOB}(?:, ${JOB}){0,9}\. Wait for one to finish \(its result arrives as a message\) or cancel one with jobs\.cancel\.$`),
+    shown: "<n> background jobs are already running, the most this agent may have at once. Wait for one to finish or cancel one with jobs.cancel." },
+  // src/plugins/github.ts `identityLine`, a 401 on an attached credential: as the tool's error, and as its auth reading.
+  { id: "gh-bad-credentials", cls: "tool_error", pattern: new RegExp(`^${MOUNT}: ${esc(GH_401)}$`), shown: GH_401 },
+  { id: "gh-bad-credentials", cls: "auth_failure", pattern: new RegExp(`^${MOUNT} mount 401 ${esc(GH_401.slice(0, 60))}$`), shown: GH_401 },
+  // src/plugins/http.ts, a scheme web__get does not fetch (an artifact:// ref, in calibration).
+  { id: "web-refused-scheme", cls: "tool_error", pattern: new RegExp(String.raw`^${MOUNT}: refused scheme [a-z][a-z0-9+.-]{0,20}:$`), shown: "refused scheme <scheme>:" },
+  // cf/src/friction.ts `binary_as_text`: bytes a read tool returned as UTF-8 text.
+  { id: "binary-as-text", cls: "binary_as_text", pattern: /^[a-z0-9_-]{1,40}__(read|get) kind=(text|\?)$/, shown: "binary bytes returned as text (U+FFFD) by a read tool" },
+  // cf/src/friction.ts, our own API hosts refusing or not knowing a guessed endpoint.
+  { id: "own-api-auth", cls: "auth_failure", pattern: new RegExp(`^HTTP (401|403) ${OWN}$`), shown: "HTTP 401/403 from an antiproton or Raft API host" },
+  { id: "own-api-404", cls: "guessed_endpoint_404", pattern: new RegExp(`^${MOUNT}__get 404 ${OWN}$`), shown: "HTTP 404 from an antiproton or Raft API host (a guessed endpoint)" },
+];
+
+/** The text a public issue may show for a key: a known template's own text, or null (withheld). */
 export function issueTemplate(cls: FrictionClass, key: string): string | null {
-  if (cls === "inability_text") return INABILITY_ZH.includes(key) || /^[a-z' ]{3,40}$/.test(key) ? key : null;
-  const t = key
-    .replace(/<url:([^>]+)>/g, (_m, h: string) => OWN_HOSTS.test(h) ? `<url:${h}>` : "<url>")
-    .replace(/\b(?:[a-z0-9-]+\.)+[a-z]{2,}\b/gi, (h) => OWN_HOSTS.test(h.toLowerCase()) ? h : "<host>");
-  if (/[^\x20-\x7e×—–…]/.test(t)) return null;
-  if (/[A-Za-z0-9_-]{32,}/.test(t)) return null;
-  return t.slice(0, 160);
+  return KNOWN_TEMPLATES.find((t) => t.cls === cls && t.pattern.test(key))?.shown ?? null;
 }
 
 export interface IssueCounts { occurrences: number; agents: number; conversations: number; episodes: number }
 
 /** An issue's body: the fingerprint, the class, a safe template or none, counts, hashed agents, build and window. */
-export async function issueBody(day: string, build: string | null, g: ReportGroup, episodesAsRoot: number): Promise<string> {
+export async function issueBody(day: string, build: string | null, g: ReportGroup, episodesAsRoot: number, hashKey: string): Promise<string> {
   const tmpl = issueTemplate(g.cls, g.key);
-  const hashes = await Promise.all(g.agents.slice(0, 20).map(agentHash));
+  const hashes = await Promise.all(g.agents.slice(0, 20).map((a) => agentHash(a, hashKey)));
   return [
     `Fingerprint: \`${g.fingerprint}\``,
     `Class: \`${g.cls}\``,
-    tmpl === null ? "Error template: withheld here (it may carry user text); see the private report." : `Error template: \`${tmpl.replace(/`/g, "'")}\``,
+    tmpl === null ? `Error template: withheld (see private report, fingerprint ${g.fingerprint})` : `Error template: \`${tmpl}\``,
     `Window: ${day}T00:00Z to ${utcDay(Date.parse(day + "T00:00:00Z") + 86_400_000)}T00:00Z`,
     `Counts: ${g.count} occurrence(s), ${g.agents.length} agent(s), ${g.conversations} conversation(s), ${episodesAsRoot} stuck episode(s) as root`,
     `Agents (hashed): ${hashes.join(", ")}`,
@@ -382,7 +425,8 @@ type IssueState = Record<string, { issue: number; counts: IssueCounts }>;
  * most `maxNew` issues a run. State is the private bucket's `friction-state/issues.json`; when it is lost, `find`
  * keeps a known fingerprint from being filed twice.
  */
-export async function fileIssues(bucket: FrictionBucket, tracker: IssueTracker, r: FrictionReport, maxNew = 5): Promise<{ created: number; commented: number }> {
+export async function fileIssues(bucket: FrictionBucket, tracker: IssueTracker, hashKey: string, r: FrictionReport, maxNew = 5): Promise<{ created: number; commented: number }> {
+  if (!hashKey) throw new Error("no FRICTION_HASH_KEY: agent ids cannot be hashed, so nothing is filed");
   const raw = await bucket.get(ISSUE_STATE_KEY);
   const state: IssueState = raw ? JSON.parse(await raw.text()) : {};
   const rootEpisodes = new Map(r.roots.map((x) => [x.fingerprint, x.episodes]));
@@ -393,14 +437,14 @@ export async function fileIssues(bucket: FrictionBucket, tracker: IssueTracker, 
     const known = state[g.fingerprint];
     if (known) {
       if (JSON.stringify(known.counts) !== JSON.stringify(counts)) {
-        await tracker.comment(known.issue, await issueBody(r.day, r.build, g, counts.episodes));
+        await tracker.comment(known.issue, await issueBody(r.day, r.build, g, counts.episodes, hashKey));
         state[g.fingerprint] = { issue: known.issue, counts }; commented++;
       }
       continue;
     }
     if (!(counts.episodes > 0 || g.cls === "auth_failure" || counts.agents >= 2) || created >= maxNew) continue;
     const existing = await tracker.find(g.fingerprint);
-    const issue = existing ?? await tracker.create(issueTitle(g), await issueBody(r.day, r.build, g, counts.episodes), [ISSUE_LABEL]);
+    const issue = existing ?? await tracker.create(issueTitle(g), await issueBody(r.day, r.build, g, counts.episodes, hashKey), [ISSUE_LABEL]);
     if (existing === null) created++;
     state[g.fingerprint] = { issue, counts };
   }
@@ -418,7 +462,7 @@ export const dayBefore = (at: number): string => utcDay(at - 86_400_000);
  * log; the kill switch and an empty scope return before anything is read.
  */
 export async function frictionDaily(
-  env: FrictionEnv, deps: { bucket: FrictionBucket; window: WindowReader; now?: () => number; tracker?: IssueTracker | null },
+  env: FrictionEnv, deps: { bucket: FrictionBucket; window: WindowReader; now?: () => number; tracker?: IssueTracker },
   scheduledTime: number, opts: ScanOptions = SCAN_DEFAULTS,
 ): Promise<string> {
   if (env.FRICTION_SCAN_DISABLED === "1") return "disabled";
@@ -427,11 +471,15 @@ export async function frictionDaily(
   const day = dayBefore(scheduledTime);
   const report = await scanDay({ bucket: deps.bucket, window: deps.window, now: deps.now, build: env.GIT_COMMIT ?? null }, scope, day, opts);
   const { keys } = await writeReport(deps.bucket, report, utcDay(scheduledTime));
-  let issues = "issues off";
-  const tracker = deps.tracker === undefined ? issueTrackerFrom(env) : deps.tracker;
-  if (tracker) {
-    try { const f = await fileIssues(deps.bucket, tracker, report); issues = `issues ${f.created} new, ${f.commented} updated`; }
-    catch (e) { issues = `issues failed: ${String((e as Error)?.message ?? e).slice(0, 160)}`; }
+  // A tracker handed in (a test's fake) stands in for GitHub only: the switch and both secrets are still the env's.
+  const config = issuesFrom(env);
+  let issues: string;
+  if ("off" in config) {
+    issues = config.off;
+    if (config.off !== "issues off") console.warn(JSON.stringify({ evt: "friction.issues", error: config.off }));
+  } else {
+    try { const f = await fileIssues(deps.bucket, deps.tracker ?? config.tracker, config.hashKey, report); issues = `issues ${f.created} new, ${f.commented} updated`; }
+    catch (e) { issues = `issues failed: ${String((e as Error)?.message ?? e).slice(0, 160)}`; console.warn(JSON.stringify({ evt: "friction.issues", error: issues })); }
   }
   return `${keys[0]}: ${report.roots.length} root cause(s), ${report.groups.length} group(s), ${report.coverage.agentsRead}/${report.coverage.agents} agents; ${issues}`;
 }

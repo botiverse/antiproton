@@ -255,15 +255,26 @@ It answers `409` when no tenant is in scope and `503` when the scan is switched 
 anything. The usage retention in the same cron is not affected. Each cron run logs one `friction.scan` line saying what
 it did or why it failed; a failing or slow scan cannot fail the cron (it is cut off after its budget plus a minute).
 
-**Issues** are off. They are filed only when the Worker var `FRICTION_ISSUES` is `1` **and** the secret
-`FRICTION_GITHUB_TOKEN` is set (a token used for nothing else, allowed to create issues and comments in
-`FRICTION_ISSUES_REPO`, default `botiverse/antiproton`); either alone does nothing. Then the cron (never the route)
-opens one issue labelled `agent-friction` for each new fingerprint among the hard classes that is an episode's root,
-an auth failure, or seen on 2 or more agents, at most 5 a day, and comments on a known one only when its counts
-changed. The repository is public, so an issue holds the fingerprint, the class, the error template only when it is
-plain ASCII with no foreign host in it (otherwise it says the template was withheld), counts, hashed agent ids, the
-build and the window. Never an excerpt, a command, a raw id or a conversation id. Which issue a fingerprint has is kept
-in `friction-state/issues.json` in the private bucket. Create the label in the repository before turning issues on.
+**Issues** are off. They are filed only when the Worker var `FRICTION_ISSUES` is `1` **and** two Worker secrets are
+set; with either missing nothing is filed, and each cron run logs a `friction.issues` line naming what is missing:
+
+- `FRICTION_GITHUB_TOKEN`: a token used for nothing else, allowed to create issues and comments in
+  `FRICTION_ISSUES_REPO` (default `botiverse/antiproton`);
+- `FRICTION_HASH_KEY`: a random key (e.g. `openssl rand -hex 32`) that agent ids are HMAC'd under in an issue, so
+  knowing an agent's id does not let anyone check whether it is in one. Never in the repository or a wrangler config;
+  changing it renames every agent in later issues.
+
+Set both with `wrangler secret put`, then the var. Then the cron (never the route) opens one issue labelled
+`agent-friction` for each new fingerprint among the hard classes that is an episode's root, an auth failure, or seen
+on 2 or more agents, at most 5 a day, and comments on a known one only when its counts changed. The repository is
+public, so an issue holds the fingerprint, the class, counts, the hashed agent ids, the build and the window. An error
+text appears only when the key matches one of our own fixed product messages (`KNOWN_TEMPLATES` in
+`cf/src/friction-scan.ts`: the attachments_view size refusals, the background-job limit, the gh mount's refused
+credential, web__get's refused scheme, binary read as text, our own API hosts' 401/403/404), and then it is that
+list's text, never the key. Anything else reads "withheld (see private report, fingerprint fr_…)". Never an excerpt,
+a command, a raw id or a conversation id. Adding a message to the list needs its source and a test. Which issue a
+fingerprint has is kept in `friction-state/issues.json` in the private bucket. Create the label in the repository
+before turning issues on.
 
 **The day index.** Each agent's trace flush writes an empty object `trace-index/<day>/<tenant>/<agent>` the first
 time it exports rows for a UTC day (`noteTraceDays`, `cf/src/trace-r2.ts`), so the scan never lists the whole

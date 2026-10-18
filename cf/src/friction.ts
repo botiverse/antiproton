@@ -103,8 +103,11 @@ export function template(msg: unknown): string {
     .replace(/(^|[\s(=:,])(~|\.{1,2})?(\/[\w.@%+-]+)+\/?/g, "$1<path>")
     .replace(/\b[0-9a-f]{12,}\b/gi, "<hex>")
     .replace(/\b\d+(\.\d+)?\s*(ms|s|px|bytes|KB|MB|MiB|KiB|GB)?\b/g, (_m, _a, u?: string) => "<n>" + (u ?? ""))
-    .replace(/\s+/g, " ").trim().slice(0, 160);
+    // Long enough for the longest product message whole (the background-job limit lists every running job), so a
+    // known message is never cut where the public allowlist (cf/src/friction-scan.ts `KNOWN_TEMPLATES`) must match it.
+    .replace(/\s+/g, " ").trim().slice(0, TEMPLATE_MAX);
 }
+export const TEMPLATE_MAX = 400;
 
 export const OWN_HOSTS = /(^|\.)(raft\.build|antiproton\.ai|botiverse\.dev|workers\.dev)$/;
 const hostOf = (u: unknown): string => { try { return new URL(String(u)).host.toLowerCase(); } catch { return "?"; } };
@@ -312,7 +315,14 @@ export async function fingerprint(cls: FrictionClass, key: string): Promise<stri
   return "fr_" + (await sha256Hex(`${cls}\u0000${key}`)).slice(0, 16);
 }
 
-/** An agent as a public issue may name it: a hash, so its id is never published. */
-export async function agentHash(agentId: string): Promise<string> {
-  return "ag_" + (await sha256Hex(`antiproton-friction-agent\u0000${agentId}`)).slice(0, 12);
+/**
+ * An agent as a public issue may name it: an HMAC keyed with a secret (`FRICTION_HASH_KEY`), so neither its id nor a
+ * guess at it can be checked against an issue by anyone without the key. A plain hash would let whoever knows an id
+ * confirm that agent is in a public issue.
+ */
+export async function agentHash(agentId: string, key: string): Promise<string> {
+  if (!key) throw new Error("agentHash needs a key");
+  const k = await crypto.subtle.importKey("raw", new TextEncoder().encode(key), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const mac = new Uint8Array(await crypto.subtle.sign("HMAC", k, new TextEncoder().encode(agentId)));
+  return "ag_" + [...mac.slice(0, 8)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }

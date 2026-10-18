@@ -233,10 +233,12 @@ export interface Env {
    * Unset or empty: nobody. The bench tenant never, whatever this says.
    */
   FRICTION_SCAN_TENANTS?: string;
-  /** "1" files the scan's findings as GitHub issues, and only together with FRICTION_GITHUB_TOKEN. Unset: off. */
+  /** "1" files the scan's findings as GitHub issues, and only together with FRICTION_GITHUB_TOKEN and FRICTION_HASH_KEY. Unset: off. */
   FRICTION_ISSUES?: string;
   /** The friction scan's own GitHub credential (a secret), used for nothing else. */
   FRICTION_GITHUB_TOKEN?: string;
+  /** The secret key agent ids are HMAC'd under in a public issue (cf/src/friction.ts `agentHash`); without it, no issues. */
+  FRICTION_HASH_KEY?: string;
   /** Where the friction scan files issues; unset is botiverse/antiproton. */
   FRICTION_ISSUES_REPO?: string;
   /** The canonical origin, so the registered callback URL is built from a
