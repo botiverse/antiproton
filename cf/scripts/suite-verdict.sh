@@ -146,16 +146,33 @@ suite_descendants() {
 # be gone, and what it started (`npx wrangler dev`, then workerd) has been
 # re-parented and can no longer be found by walking children. Left running,
 # that server keeps its port, and a later run can read its answer.
+# suite_live PGID: the pids in the group that have not ended. A process that has exited but whose
+# parent has not reaped it keeps its pid, and `pgrep -g` keeps listing it, so a group in which every
+# process is dead can still read as busy. In a container whose pid 1 does not reap — `docker run` with
+# a shell as pid 1 is the default, and that shell does not call wait — a suite that spawned anything
+# leaves zombies behind, and `suite_stop` then says "left processes running that could not be killed"
+# about processes that ended. On 2026-10-18 that is how every DO suite in this repository read in such
+# a container (184 zombies, pid 1 = /bin/sh, every assertion green). The state is what to ask; the test
+# file already says why: "a zombie has ended and only waits to be reaped" (test/suite-timeout.ts).
+suite_live() {
+  local p stat
+  for p in $(pgrep -g "$1" 2>/dev/null); do
+    stat=$(ps -o stat= -p "$p" 2>/dev/null) || continue
+    case "$stat" in Z*) continue ;; esac
+    echo "$p"
+  done
+}
+
 suite_stop() {
   local pgid="$1" grace
-  pgrep -g "$pgid" >/dev/null 2>&1 || return 0
+  [ -n "$(suite_live "$pgid")" ] || return 0
   kill -TERM -- "-$pgid" 2>/dev/null || true
   grace=$((SECONDS + 5))
-  while [ "$SECONDS" -lt "$grace" ]; do pgrep -g "$pgid" >/dev/null 2>&1 || return 0; sleep 0.1; done
+  while [ "$SECONDS" -lt "$grace" ]; do [ -n "$(suite_live "$pgid")" ] || return 0; sleep 0.1; done
   kill -KILL -- "-$pgid" 2>/dev/null || true
   grace=$((SECONDS + 2))
-  while [ "$SECONDS" -lt "$grace" ]; do pgrep -g "$pgid" >/dev/null 2>&1 || return 0; sleep 0.1; done
-  ! pgrep -g "$pgid" >/dev/null 2>&1
+  while [ "$SECONDS" -lt "$grace" ]; do [ -n "$(suite_live "$pgid")" ] || return 0; sleep 0.1; done
+  [ -z "$(suite_live "$pgid")" ]
 }
 
 # The watchdog: `suite_watchdog LIMIT MARKER PGID`, run as a script of its own
