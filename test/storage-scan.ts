@@ -34,17 +34,26 @@ const TOKEN = "operator-token-scan";
  * SQLite read the way the Durable Object's `exec` reads it: a cursor, iterated row by row (node:sqlite's `iterate`),
  * counting every row it is asked for, so a test can see that a scan stopped reading at its cap.
  */
-function cursorHost() {
+function cursorHost(o: { failAfter?: Record<string, number> } = {}) {
   const db = new DatabaseSync(":memory:");
   const pulled = { rows: 0 };
   return {
     pulled,
+    db,
     sql: {
       exec(query: string, ...bindings: unknown[]) {
+        // As workerd answers a read of Cloudflare's own tables.
+        const from = /from\s+"?([A-Za-z0-9_]+)"?/i.exec(query)?.[1];
+        if (from && /^_cf_/i.test(from) && /^\s*select/i.test(query)) throw new Error(`access to ${from}.key is prohibited: SQLITE_AUTH`);
         const stmt = db.prepare(query);
+        const failAt = from ? o.failAfter?.[from] : undefined;
         if (!/^\s*select/i.test(query)) { stmt.run(...(bindings as any[])); return [][Symbol.iterator](); }
         const it = stmt.iterate(...(bindings as any[])) as IterableIterator<Record<string, unknown>>;
-        return { [Symbol.iterator]: () => ({ next: () => { const r = it.next(); if (!r.done) pulled.rows++; return r; }, return: () => { it.return?.(); return { done: true, value: undefined }; } }) };
+        let n = 0;
+        return { [Symbol.iterator]: () => ({ next: () => {
+          if (failAt !== undefined && n++ >= failAt) throw new Error("SQLITE_IOERR: the read failed part-way");
+          const r = it.next(); if (!r.done) pulled.rows++; return r;
+        }, return: () => { it.return?.(); return { done: true, value: undefined }; } }) };
       },
     },
   };
@@ -77,6 +86,26 @@ await check("tables: found case-insensitively, as plain text and inside a JSON-e
   must(none.tables.length === 0 && none.scanned.rows === 3, show(none));
 });
 
+await check("tables: Cloudflare's and SQLite's own tables are skipped and counted as systemSkipped, not unreadable; a clean scan is not truncated", () => {
+  const host = storage();
+  (host as any).db.exec("CREATE TABLE _cf_METADATA (key TEXT, value TEXT)");
+  (host as any).db.exec("INSERT INTO _cf_METADATA VALUES ('k', 'v')");
+  (host as any).db.exec("CREATE TABLE seq (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)");
+  (host as any).db.exec("INSERT INTO seq (v) VALUES ('x')");
+  const out = scanTables(host.sql as never, NEEDLE);
+  must(out.systemSkipped === 2 && out.unreadable.length === 0 && !out.truncated && show(out.tables.sort()) === show(["notes", "plugin_db"]), show(out));
+});
+
+await check("tables: a table that fails part-way is named unreadable, the rest are still read, and the scan is truncated", () => {
+  const host = cursorHost({ failAfter: { broken: 1 } });
+  host.sql.exec("CREATE TABLE broken (v TEXT)");
+  for (let i = 0; i < 3; i++) host.sql.exec("INSERT INTO broken VALUES (?)", `b ${i}`);
+  host.sql.exec("CREATE TABLE later (v TEXT)");
+  host.sql.exec("INSERT INTO later VALUES (?)", `here ${NEEDLE}`);
+  const out = scanTables(host.sql as never, NEEDLE);
+  must(show(out.unreadable) === show(["broken"]) && out.truncated && show(out.tables) === show(["later"]), show(out));
+});
+
 await check("tables: a table past the caps is read row by row and only up to the cap, and the answer says truncated", () => {
   const host = cursorHost();
   host.sql.exec("CREATE TABLE many (v TEXT)");
@@ -98,6 +127,16 @@ await check("objects: only the agent's prefixes are read; found ones are counted
   const out = await scanObjects(watched, ["t/t1/a1/", "trace/t1/a1/"], NEEDLE, { ...SCAN_LIMITS, maxObjectBytes: 50 });
   must(out.objects === 1 && out.scanned === 2 && out.skipped === 1 && out.truncated && !fetched.includes("t/t1/a1/big.bin"), show({ out, fetched }));
   must(SCAN_LIMITS.maxObjectBytes <= 16 * 1024 * 1024 && SCAN_LIMITS.maxBytes <= 16 * 1024 * 1024, show(SCAN_LIMITS));
+});
+
+await check("objects: the walk stops at the call's R2 byte budget, before fetching the object that would pass it, and says truncated", async () => {
+  const objects: Record<string, string> = {};
+  for (let i = 0; i < 10; i++) objects[`t/t1/a1/o${i}.json`] = `${i} ${"y".repeat(95)}`;
+  objects["t/t1/a1/z.json"] = NEEDLE;
+  const fetched: string[] = [];
+  const b = bucket(objects);
+  const out = await scanObjects({ list: b.list, get: async (k: string) => { fetched.push(k); return b.get(k); } }, ["t/t1/a1/"], NEEDLE, { ...SCAN_LIMITS, maxObjectTotalBytes: 350 });
+  must(out.truncated && out.scanned === 3 && fetched.length === 3 && out.objects === 0, show({ out, fetched }));
 });
 
 // ---- the route ------------------------------------------------------------------------------------------------
@@ -131,13 +170,35 @@ await check("route: found and not found, the needle in neither the answer nor an
   const found = await scan(TOKEN, TOKEN, { tenantId: "t1", agentId: "a1", needle: NEEDLE }, { "trace/t1/a1/b.json": `x ${NEEDLE} y` });
   const body = JSON.parse(found.text);
   must(found.status === 200 && body.found === true && show(body.tables.sort()) === show(["notes", "plugin_db"]) && body.objects === 1, found.text);
-  must(show(Object.keys(body).sort()) === show(["found", "objects", "scanned", "skipped", "tables", "truncated"]), found.text);
+  must(show(Object.keys(body).sort()) === show(["complete", "found", "objects", "scanned", "skipped", "systemSkipped", "tables", "truncated", "unreadable"]), found.text);
+  must(body.complete === true && body.systemSkipped === 0 && show(body.unreadable) === "[]", found.text);
   const missing = await scan(TOKEN, TOKEN, { tenantId: "t1", agentId: "a1", needle: "Zq-Nowhere-0000" });
   must(missing.status === 200 && JSON.parse(missing.text).found === false, missing.text);
   for (const text of [found.text, missing.text, ...logs]) {
     must(!text.toLowerCase().includes(NEEDLE.toLowerCase()) && !text.toLowerCase().includes("zq-nowhere"), `the needle leaked: ${text.slice(0, 200)}`);
   }
   must(logs.some((l) => l.includes("admin.storage_scan") && l.includes('"found":true')), logs.join("\n"));
+});
+
+await check("route: an unreadable table makes the answer not complete, never a clean not-found; a failure says only a fixed text", async () => {
+  logs.length = 0;
+  const host = cursorHost({ failAfter: { broken: 0 } });
+  host.sql.exec("CREATE TABLE broken (v TEXT)");
+  host.sql.exec("INSERT INTO broken VALUES (?)", NEEDLE);
+  const call = async (half: unknown) => {
+    const w = env(TOKEN, {});
+    (w.env.AGENT as any).get = () => half;
+    const res = await worker.fetch(new Request("https://x/admin/storage-scan", { method: "POST", headers: { "x-harness-token": TOKEN, "content-type": "application/json" },
+      body: JSON.stringify({ tenantId: "t1", agentId: "a1", needle: NEEDLE }) }), w.env as never, { waitUntil() {}, passThroughOnException() {} } as never);
+    return { status: res.status, text: await res.text() };
+  };
+  const partial = await call({ adminStorageScan: async (_t: string, _a: string, needle: string) => scanTables(host.sql as never, needle) });
+  const body = JSON.parse(partial.text);
+  must(partial.status === 200 && body.found === false && body.complete === false && body.truncated === true && show(body.unreadable) === show(["broken"]), partial.text);
+  // The object's half throws, its error naming what it read: the answer is a fixed text.
+  const failed = await call({ adminStorageScan: async () => { throw new Error(`access to _cf_METADATA.key is prohibited: SQLITE_AUTH near ${NEEDLE}`); } });
+  must(failed.status === 500 && failed.text === JSON.stringify({ error: "the scan failed" }), `${failed.status} ${failed.text}`);
+  for (const t of [partial.text, failed.text, ...logs]) must(!t.toLowerCase().includes(NEEDLE.toLowerCase()) && !t.includes("_cf_METADATA"), `leaked: ${t.slice(0, 200)}`);
 });
 
 await check("route: refused without the operator's token, before the object is asked; bad requests are 400, an unknown agent 404", async () => {
