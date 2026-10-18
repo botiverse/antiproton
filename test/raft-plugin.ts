@@ -19,7 +19,7 @@ import { bridgeTools, offeredToolName, qualifyMountedTools, runJsTool, type Moun
  * The plugin as the runtime builds it (cf/src/runtime.ts): with object storage, so the attachment download is offered.
  * The module's `raftPlugin` has none, and so does not offer it (`raftWithoutStorage`, held below).
  */
-const raftPlugin = createRaftPlugin({ artifacts: { async put() { throw new Error("test: nothing should be stored here"); } } });
+const raftPlugin = createRaftPlugin({ artifacts: { async put() { throw new Error("test: nothing should be stored here"); }, async get() { throw new Error("test: nothing should be read here"); }, async head() { throw new Error("test: nothing should be read here"); } } });
 
 const originalFetch = globalThis.fetch;
 const PUSH_SECRET = "raft-push-secret-for-tests";
@@ -147,6 +147,8 @@ const OWN = ["receive_events", "enable_push", "disable_push", "push_status", "in
 const ASSISTANT = ["assistant_owner_inbox", "assistant_owner_messages"];
 /** The image view: hand-written, and offered exactly where the download is (test/raft-attachments-view.ts holds it). */
 const VIEW = "attachments_view";
+/** The upload: hand-written, offered with storage to a credential holding `send` (test/raft-attachments-upload.ts holds it). */
+const UPLOAD = "attachments_upload";
 /** What a mount with no snapshot is offered: every tool of the plugin but the assistant's. */
 const fallbackNames = () => raftPlugin.tools.map((t) => t.name).filter((n) => !ASSISTANT.includes(n));
 const toolNamed = (name: string) => raftPlugin.tools.find((t) => t.name === name);
@@ -219,7 +221,7 @@ await check("every manifest operation is a generated tool or in the exclusion ta
   const generated = GENERATED.map((op) => op.name);
   if (JSON.stringify(generated) !== JSON.stringify(names.filter((n) => EXPECTED_GENERATED.includes(n)))) throw new Error(`generated: ${generated.join(", ")}`);
   const offered = raftPlugin.tools.map((t) => t.name);
-  const want = [...OWN, ...RAFT_OPERATIONS.filter((op) => EXPECTED_GENERATED.includes(op.name)).map((op) => op.toolName), VIEW, ...ASSISTANT];
+  const want = [...OWN, ...RAFT_OPERATIONS.filter((op) => EXPECTED_GENERATED.includes(op.name)).map((op) => op.toolName), VIEW, UPLOAD, ...ASSISTANT];
   if (JSON.stringify(offered) !== JSON.stringify(want)) throw new Error(`offered: ${offered.join(", ")}`);
   if (new Set(offered).size !== offered.length) throw new Error("two tools share a name");
 });
@@ -424,7 +426,7 @@ const SENT = (n = 21) => json(200, { ok: true, state: "sent", messageId: `m-${n}
  * what a held call's question must be, verbatim. Asked of the SDK rather than written out here, so the assertion is
  * "passed on unchanged" and not a copy of the SDK's wording.
  */
-async function sdkHeld(answer: Response, op: "messages.send" | "tasks.claim", args: Record<string, unknown>, options: { contextId?: string; cards?: boolean } = {}) {
+async function sdkHeld(answer: Response, op: "messages.send" | "tasks.claim" | "tasks.updateStatus" | "tasks.amend", args: Record<string, unknown>, options: { contextId?: string; cards?: boolean } = {}) {
   one(answer);
   const out = await createRaft({ serverUrl: "https://raft.example", credential: "sk_agent_test_1234567890", hints: "tool", ...(options.cards ? { conversationCards: true } : {}) })
     .invoke(op, args, { origin: "model", ...(options.contextId ? { contextId: options.contextId } : {}) });
@@ -663,9 +665,167 @@ await check("a held task claim asks proceed or drop, and proceed makes the ident
   }
   if ("idempotencyKey" in ((held.state as any).args ?? {}) || "seen" in (held.state as any)) throw new Error(`a claim carries a send's continuation: ${JSON.stringify(held.state)}`);
   const out = await raftPlugin.interrupts!.resume("tasks_claim", held.state, "proceed", inTurn(m.ctx)) as any;
-  if (calls.length !== 2 || calls[1]!.init.body !== calls[0]!.init.body || out.state !== "claimed") throw new Error(`resume: ${JSON.stringify({ out, bodies: calls.map((c) => c.init.body) })}`);
+  // The identical claim, now attesting the message the question showed (task writes attest since SDK 0.20.0).
+  const { seenUpToSeq, ...again } = JSON.parse(String(calls[1]?.init.body));
+  if (calls.length !== 2 || JSON.stringify(again) !== calls[0]!.init.body || seenUpToSeq !== 20 || out.state !== "claimed") throw new Error(`resume: ${JSON.stringify({ out, bodies: calls.map((c) => c.init.body) })}`);
   const dropped = await raftPlugin.interrupts!.resume("tasks_claim", held.state, "drop", inTurn(m.ctx)) as any;
   if (dropped.state !== "dropped" || !/Nothing was done/.test(dropped.note)) throw new Error(JSON.stringify(dropped));
+});
+
+/**
+ * A Server for one task write: it holds the write unless it attests seq 20, the newest message on #general's board
+ * (task writes attest what the context has seen since SDK 0.20.0, as a send does), and otherwise applies it. `applied`
+ * counts the writes it applied; `bodies` is every body the route received, in order. Both are read through functions,
+ * since a call between two checks changes them.
+ */
+function boardServer(path: string, applied: () => Response) {
+  let applied_ = 0;
+  const bodies: any[] = [];
+  globalThis.fetch = (async (url: any, init?: any) => {
+    const at = new URL(String(url)).pathname.replace("/internal/agent-api", "");
+    if (at !== path) return json(404, { error: "not found", code: "NOT_FOUND" });
+    const body = JSON.parse(String(init?.body ?? "{}"));
+    bodies.push(body);
+    if ((body.seenUpToSeq ?? 0) < 20) return HELD();
+    applied_++;
+    return applied();
+  }) as any;
+  return { applied: () => applied_, bodies, sent: () => bodies.length };
+}
+const TASK_WRITES = [
+  ["tasks_claim", "tasks.claim", { target: "#general", taskNumbers: [7] }, "/tasks/claim", () => json(200, { results: [{ taskNumber: 7, success: true }] }), "claimed"],
+  ["tasks_update_status", "tasks.updateStatus", { target: "#general", taskNumber: 7, status: "in_review" }, "/tasks/update-status", () => json(200, { ok: true }), "updated"],
+  ["tasks_amend", "tasks.amend", { target: "#general", taskNumber: 7, title: "rotate the keys" }, "/tasks/amend",
+    () => json(200, { task: { taskNumber: 7, title: "rotate the keys", description: null, revision: 3 },
+      event: { id: "0b7c3a1e-1111-4222-8333-944455556667", seq: 3, eventType: "amended", actorType: "agent", actorName: "cody", payload: { title: "rotate the keys" }, createdAt: "2026-10-17T10:00:00.000Z" } }), "amended"],
+] as const;
+
+await check("a held task write (unread_messages) is a question, never a success: the SDK's held text, nothing applied, and proceed applies it once, attesting what the question showed", async () => {
+  for (const [tool, op, args, path, ok, state] of TASK_WRITES) {
+    const sdk = await sdkHeld(HELD(), op, args, { contextId: "ctx_turn" });
+    const m = cardsMount({});
+    const server = boardServer(path, ok);
+    const held = await raftPlugin.invoke(tool, args, m.ctx) as any;
+    if (!(held instanceof Interrupt)) throw new Error(`${tool}: a held write came back as a result: ${JSON.stringify(held)}`);
+    if (held.question !== sdk.context || JSON.stringify(held.answer) !== '{"choices":["proceed","drop"]}' ||
+        JSON.stringify(held.context) !== JSON.stringify({ reason: "unread_messages", target: "#general" })) {
+      throw new Error(`${tool}: the question: ${JSON.stringify({ question: held.question, answer: held.answer, context: held.context })}`);
+    }
+    if (server.applied() !== 0 || server.sent() !== 1) throw new Error(`${tool}: applied at the hold: ${JSON.stringify({ applied: server.applied(), bodies: server.bodies })}`);
+    if (JSON.stringify((held.state as any).args) !== JSON.stringify(args)) throw new Error(`${tool}: the held call is not the identical call: ${JSON.stringify(held.state)}`);
+    const row = m.rows.find((r) => r.kind === "raft.held");
+    if (row?.status !== "unread_messages" || row.attrs?.reason !== "unread_messages" || row.attrs?.tool !== tool || row.verdict !== "blocked") {
+      throw new Error(`${tool}: raft.held: ${JSON.stringify(row)}`);
+    }
+    const out = await raftPlugin.interrupts!.resume(tool, held.state, "proceed", m.ctx) as any;
+    if (out instanceof Interrupt || out.state !== state || server.applied() !== 1 || server.sent() !== 2) {
+      throw new Error(`${tool}: resume: ${JSON.stringify({ out, applied: server.applied(), bodies: server.bodies })}`);
+    }
+    // The identical call, now attesting the held message it showed.
+    const { seenUpToSeq, seenExactSeqs: _x, ...second } = server.bodies[1];
+    const { seenUpToSeq: _s, seenExactSeqs: _y, ...first } = server.bodies[0];
+    if (seenUpToSeq !== 20 || JSON.stringify(second) !== JSON.stringify(first)) throw new Error(`${tool}: the resumed write: ${JSON.stringify(server.bodies)}`);
+    const answer = m.rows.find((r) => r.kind === "raft.held_answer");
+    if (answer?.status !== "proceed" || answer.attrs?.reason !== "unread_messages" || answer.attrs?.outcome !== state) throw new Error(`${tool}: raft.held_answer: ${JSON.stringify(answer)}`);
+    // The model calling again instead of answering: the identical call, attesting what it was shown, applied once.
+    const again = cardsMount({});
+    const twice = boardServer(path, ok);
+    const first2 = await raftPlugin.invoke(tool, args, again.ctx);
+    const out2 = await raftPlugin.invoke(tool, args, again.ctx) as any;
+    if (!(first2 instanceof Interrupt) || out2 instanceof Interrupt || out2.state !== state || twice.applied() !== 1 || twice.bodies[1]?.seenUpToSeq !== 20) {
+      throw new Error(`${tool}: called again: ${JSON.stringify({ out2, applied: twice.applied(), bodies: twice.bodies })}`);
+    }
+  }
+});
+
+/** The thread `#general:abcdef12`, with seq 5 in it, and #general: what a read of each, and a send, answer. */
+const THREAD = "#general:abcdef12";
+function threadServer(): any[] {
+  const sends: any[] = [];
+  globalThis.fetch = (async (url: any, init?: any) => {
+    const u = new URL(String(url));
+    const path = u.pathname.replace("/internal/agent-api", "");
+    if (path === "/history") {
+      const target = u.searchParams.get("channel") ?? u.searchParams.get("target") ?? "";
+      return target === THREAD
+        ? history([historyMessage(5, "the thread's last word", { channel_name: "general" })], { target: THREAD })
+        : history([historyMessage(4, "the channel's last word", { channel_name: "general" })], { target: "#general" });
+    }
+    if (path === "/v2/send") { sends.push(JSON.parse(String(init?.body ?? "{}"))); return SENT(30 + sends.length); }
+    return json(404, { error: "not found", code: "NOT_FOUND" });
+  }) as any;
+  return sends;
+}
+
+await check("a thread_target hold: a top-level send right after reading one of its threads asks first; send confirms under the same key, drop sends nothing, and sending to the thread just works", async () => {
+  // Control: the SDK's own text for this hold, from a client made as the plugin makes its clients.
+  const raw = createRaft({ serverUrl: "https://raft.example", credential: "sk_agent_test_1234567890", hints: "tool" });
+  raw.frontier.inContext("ctx_turn").recordRead(THREAD, 5);
+  const sdk = await raw.invoke("messages.send", { target: "#general", content: "wrap-up", idempotencyKey: "k-tt" }, { origin: "model", contextId: "ctx_turn" });
+  if (!isInterrupted(sdk) || sdk.interrupt.reason !== "thread_target" || sdk.interrupt.threadTarget !== THREAD || sdk.interrupt.resume.with?.targetConfirmed !== true) {
+    throw new Error(`control: the SDK did not hold for the thread: ${JSON.stringify(sdk)}`);
+  }
+  const m = cardsMount({});
+  const sends = threadServer();
+  const read = await raftPlugin.invoke("messages_read", { target: THREAD }, m.ctx) as any;
+  if (!/the thread's last word/.test(read.text)) throw new Error(`the thread read: ${JSON.stringify(read)}`);
+  const held = await raftPlugin.invoke("messages_send", { target: "#general", content: "wrap-up", idempotencyKey: "k-tt" }, m.ctx) as any;
+  if (!(held instanceof Interrupt)) throw new Error(`not held after reading a thread: ${JSON.stringify(held)}`);
+  if (held.question !== sdk.interrupt.context || JSON.stringify(held.answer) !== '{"choices":["send","drop"]}' ||
+      JSON.stringify(held.context) !== JSON.stringify({ reason: "thread_target", target: "#general" }) ||
+      !held.question.includes(`messages_send({ target: "${THREAD}", content: … })`) || !held.question.includes('messages_send({ target: "#general", targetConfirmed: true, content: … })')) {
+    throw new Error(`the question: ${JSON.stringify({ question: held.question, answer: held.answer, context: held.context })}`);
+  }
+  const st = held.state as any;
+  if (sends.length !== 0 || st.reason !== "thread_target" || st.args?.targetConfirmed !== true || st.args?.idempotencyKey !== "k-tt" || st.seen !== undefined || st.attest !== undefined) {
+    throw new Error(`held: ${JSON.stringify({ sends, state: st })}`);
+  }
+  const row = m.rows.find((r) => r.kind === "raft.held");
+  if (row?.status !== "thread_target" || row.attrs?.reason !== "thread_target" || row.attrs?.threadTarget !== THREAD) throw new Error(`raft.held: ${JSON.stringify(row)}`);
+  // Drop: nothing is sent.
+  const dropped = await raftPlugin.interrupts!.resume("messages_send", held.state, "drop", m.ctx) as any;
+  if (dropped.state !== "dropped" || sends.length !== 0) throw new Error(`drop: ${JSON.stringify({ dropped, sends })}`);
+  const dropRow = m.rows.find((r) => r.kind === "raft.held_answer");
+  if (dropRow?.status !== "drop" || dropRow.attrs?.reason !== "thread_target") throw new Error(`raft.held_answer on drop: ${JSON.stringify(dropRow)}`);
+  // Send: top-level as written, under the same key, once.
+  const sent = await raftPlugin.interrupts!.resume("messages_send", held.state, "send", m.ctx) as any;
+  if (sent instanceof Interrupt || sent.state !== "sent" || sends.length as number !== 1 || sends[0].target !== "#general" || sends[0].idempotencyKey !== "k-tt" || sends[0].content !== "wrap-up") {
+    throw new Error(`send: ${JSON.stringify({ sent, sends })}`);
+  }
+  const sendRow = m.rows.filter((r) => r.kind === "raft.held_answer").at(-1);
+  if (sendRow?.status !== "send" || sendRow.attrs?.reason !== "thread_target" || sendRow.attrs?.outcome !== "sent") throw new Error(`raft.held_answer on send: ${JSON.stringify(sendRow)}`);
+
+  // Redirect: the model sends to the thread instead, a call of its own, and it goes.
+  const r = cardsMount({});
+  const redirected = threadServer();
+  await raftPlugin.invoke("messages_read", { target: THREAD }, r.ctx);
+  if (!(await raftPlugin.invoke("messages_send", { target: "#general", content: "wrap-up" }, r.ctx) instanceof Interrupt)) throw new Error("control: not held");
+  const toThread = await raftPlugin.invoke("messages_send", { target: THREAD, content: "wrap-up" }, r.ctx) as any;
+  if (toThread instanceof Interrupt || toThread.state !== "sent" || redirected.length !== 1 || redirected[0].target !== THREAD) {
+    throw new Error(`to the thread: ${JSON.stringify({ toThread, redirected })}`);
+  }
+  // The text's other way on: the same send again with targetConfirmed: true, which the tool offers.
+  const confirmed = await raftPlugin.invoke("messages_send", { target: "#general", content: "wrap-up", targetConfirmed: true }, r.ctx) as any;
+  if (confirmed instanceof Interrupt || redirected.length as number !== 2 || redirected[1].target !== "#general") throw new Error(`confirmed: ${JSON.stringify({ confirmed, redirected })}`);
+  // Reading the channel itself after the thread clears it: the latest read under #general is #general.
+  const c = cardsMount({});
+  const cleared = threadServer();
+  await raftPlugin.invoke("messages_read", { target: THREAD }, c.ctx);
+  await raftPlugin.invoke("messages_read", { target: "#general" }, c.ctx);
+  const after = await raftPlugin.invoke("messages_send", { target: "#general", content: "wrap-up" }, c.ctx) as any;
+  if (after instanceof Interrupt || cleared.length !== 1) throw new Error(`after reading the channel: ${JSON.stringify({ after, cleared })}`);
+});
+
+await check("the thread-target check is the model's only: a program's top-level send after the model read a thread is not checked", async () => {
+  const m = cardsMount({});
+  const sends = threadServer();
+  await raftPlugin.invoke("messages_read", { target: THREAD }, m.ctx);
+  const program = { ...m.ctx, caller: { ...m.ctx.caller, fromProgram: true } };
+  const out = await raftPlugin.invoke("messages_send", { target: "#general", content: "from code", idempotencyKey: "k-code" }, program) as any;
+  if (out instanceof Interrupt || out.state !== "sent" || sends.length !== 1 || sends[0].target !== "#general") throw new Error(`a program's send was checked: ${JSON.stringify({ out, sends })}`);
+  // Control: the same send from the model, in the same context, is held.
+  const model = await raftPlugin.invoke("messages_send", { target: "#general", content: "from the model", idempotencyKey: "k-model" }, m.ctx) as any;
+  if (!(model instanceof Interrupt) || (model.context as any)?.reason !== "thread_target" || sends.length !== 1) throw new Error(`control: ${JSON.stringify(model)}`);
 });
 
 await check("a send held under the old send_message tool, still waiting across the change, resumes and drops as before", async () => {
@@ -939,7 +1099,31 @@ await check("conversation cards a history read showed are booked for the next ca
   if (!(heldAgain instanceof Interrupt) || after[0]?.seenCards?.channel !== null) throw new Error(`a parked read booked its card: ${JSON.stringify(after)}`);
 });
 
-await check("a state save that fails is a raft.state_save_failed trace row, with its phase, the error and the record's size in UTF-8 bytes, and a console line; the call still answers", async () => {
+await check("a subagent's history read leaves the agent's saved Raft state byte-identical, cards and reads alike", async () => {
+  // A subagent (src/runtime/subagents.ts) speaks for no one, so what it read is booked nowhere the agent's next call reads:
+  // whatever a history read carries into the saved state (its cards here, and with SDK 0.20.0 the read itself) is the
+  // agent's only when the agent read it.
+  const read = () => json(200, {
+    target: "#general", messages: [historyMessage(5, "hello", { channel_name: "general" })], has_more: false, has_older: false, has_newer: false,
+    channel_card: CARD,
+  });
+  const m = cardsMount();
+  const saved = () => JSON.stringify(m.fresh.tables.get(m.fresh.scope, INBOX_STORE, "state") ?? null);
+  // The agent's own read first, so there is a state to keep, and to show the same read does write it (the control).
+  const empty = saved();
+  many(read());
+  await raftPlugin.invoke("messages_read", { target: "#general" }, m.ctx);
+  const before = saved();
+  if (before === empty) throw new Error("control: the agent's own read booked nothing");
+  // The subagent's read, in its own context: same mount, same database.
+  const child = { ...m.ctx, caller: { ...m.ctx.caller, taskId: "sub_0123456789abcdef", contextId: "ctx_sub_child" } };
+  many(read());
+  const out = await raftPlugin.invoke("messages_read", { target: "#general" }, child) as any;
+  if (!out.text.startsWith("Channel #general (public): Where the team talks.")) throw new Error(`control: the subagent's read: ${out.text}`);
+  if (saved() !== before) throw new Error(`a subagent's read wrote the agent's state: ${saved()}`);
+});
+
+await check("a state save that fails is a raft.state_failed trace row, with its phase, the error and the record's size in UTF-8 bytes, and a console line; the call still answers", async () => {
   const m = cardsMount({});
   const db = Object.create(m.ctx.db);
   // The record the save tried to write, taken from inside the transaction before it fails.
@@ -960,7 +1144,7 @@ await check("a state save that fails is a raft.state_save_failed trace row, with
     if (!(held instanceof Interrupt)) throw new Error(`the call did not answer: ${JSON.stringify(held)}`);
   } finally { console.warn = warn; }
   // One row per failed save, each sized as the record that save tried to write.
-  const failed = m.rows.filter((r) => r.kind === "raft.state_save_failed");
+  const failed = m.rows.filter((r) => r.kind === "raft.state_failed");
   if (attempted.length === 0 || failed.length !== attempted.length) throw new Error(`control: ${attempted.length} saves, ${failed.length} rows`);
   attempted.forEach((record, i) => {
     const text = JSON.stringify(record);
@@ -972,6 +1156,32 @@ await check("a state save that fails is a raft.state_save_failed trace row, with
     }
   });
   if (!warned.some((w) => w.includes("raft state save failed for mount raft: storage full"))) throw new Error(`the console line: ${JSON.stringify(warned)}`);
+});
+
+await check("a state load that fails is a raft.state_failed trace row with phase load and no stateBytes, and a console line; the call still answers", async () => {
+  const m = cardsMount({});
+  const db = Object.create(m.ctx.db);
+  // Only the SDK's state record fails to read; every other read of the mount's database answers as before.
+  db.get = async (store: string, key: string) => {
+    if (store === INBOX_STORE && key === "state") throw new Error("disk unreadable");
+    return m.ctx.db.get(store, key);
+  };
+  const c = { ...m.ctx, db };
+  const warned: string[] = [];
+  const warn = console.warn;
+  console.warn = (...a: unknown[]) => { warned.push(a.join(" ")); };
+  let out: any;
+  try {
+    // A send attests the seen frontier, so it loads the state first.
+    one(SENT());
+    out = await raftPlugin.invoke("messages_send", { target: "#general", content: "x", idempotencyKey: "k-load" }, c);
+  } finally { console.warn = warn; }
+  must(out?.state === "sent", `the call did not answer: ${JSON.stringify(out)}`);
+  const failed = m.rows.filter((r) => r.kind === "raft.state_failed");
+  must(failed.length === 1 && failed[0].status === "load" && failed[0].verdict === "failed" && failed[0].attrs.phase === "load" &&
+    failed[0].attrs.error === "disk unreadable" && !("stateBytes" in failed[0].attrs), `rows: ${JSON.stringify(m.rows)}`);
+  must(!m.rows.some((r) => r.kind === "raft.state_save_failed"), `the retired kind was written: ${JSON.stringify(m.rows)}`);
+  must(warned.some((w) => w.includes("raft state load failed for mount raft: disk unreadable")), `the console line: ${JSON.stringify(warned)}`);
 });
 
 /** A /events answer in the shape the Raft SDK validates. */
@@ -1581,6 +1791,57 @@ await check("messages_search passes its parameters through and answers with the 
   if (out.text !== "No search results. (truncated=false)") throw new Error(JSON.stringify(out));
 });
 
+/** One search hit as Raft's `/search` returns it. */
+function searchHit(id: string, content: string) {
+  return { id, seq: 1, channelId: "c", threadId: null, parentMessageId: null, parentMessageContent: null, parentChannelId: "c",
+    parentChannelName: "ops", parentChannelType: "channel", parentChannelArchivedAt: null, senderId: "s", senderType: "human", senderName: "tygg",
+    channelName: "ops", channelType: "channel", channelArchivedAt: null, content, snippet: content, createdAt: "2026-09-21T10:00:00.000Z" };
+}
+/** A recent-sort text search Raft stopped at its scan budget (SDK 0.19.0): `results` are what it found before it stopped. */
+const stoppedSearch = (results: unknown[]) => json(200, { results, hasMore: false, incomplete: true, nextCursor: "cur-9f3a",
+  searchedThrough: "2026-09-01T00:00:00.000Z", searchedMessages: 10000 });
+/** The continuing call the SDK's text names, `messages_search({ … cursor: "…" … })`, and the cursor in it. */
+const CONTINUE = /Next \(search older messages\): messages_search\(\{[^\n]*\bcursor: "([^"]+)"[^\n]*\}\)/;
+
+await check("a search Raft stopped with nothing found reaches the model as the SDK's incomplete state and text, with the call that continues it, not as no results", async () => {
+  const calls = one(stoppedSearch([]));
+  const out = await raftPlugin.invoke("messages_search", { query: "launch plan", sort: "recent" }, inTurn(ctx())) as any;
+  must(calls.length === 1 && new URL(calls[0]!.url).pathname.endsWith("/search"), `request: ${JSON.stringify(calls.map((c) => c.url))}`);
+  must(out.state === "incomplete", `state: ${JSON.stringify(out)}`);
+  must(/^Search incomplete: no matches in the messages searched so far \(stopped after reading 10,000 messages, back to [^)]+\)\. Older messages were not searched, so this does NOT mean no message matches\./.test(out.text),
+    `the SDK's sentence: ${out.text}`);
+  must(!/No search results/.test(out.text) && !/"empty"/.test(JSON.stringify(out)), `read as no results: ${JSON.stringify(out)}`);
+  const next = CONTINUE.exec(out.text);
+  must(next && next[1] === "cur-9f3a" && /query: "launch plan"/.test(next[0]), `the continuing call: ${out.text}`);
+  must(/\nOr narrow the search: add target or sender\.$/.test(out.text), `the narrowing line: ${out.text}`);
+});
+
+await check("a search Raft stopped after finding some is the SDK's results state, its text saying these are not all the matches, with the call that continues it", async () => {
+  one(stoppedSearch([searchHit("r-1", "the launch plan is in the doc")]));
+  const out = await raftPlugin.invoke("messages_search", { query: "launch plan", sort: "recent" }, inTurn(ctx())) as any;
+  must(out.state === "results", `state: ${JSON.stringify(out)}`);
+  must(/msg:r-1/.test(out.text) && /incomplete=true · stopped after reading 10,000 messages, back to [^;]+; older messages were not searched, so these are NOT all the matches/.test(out.text),
+    `the SDK's incomplete line: ${out.text}`);
+  must(!/truncated=false/.test(out.text), `read as complete: ${out.text}`);
+  must(CONTINUE.exec(out.text)?.[1] === "cur-9f3a", `the continuing call: ${out.text}`);
+});
+
+await check("messages_search offers cursor, and the cursor the SDK's text hands back is sent to Raft as given, with no offset", async () => {
+  const offered = (toolNamed("messages_search")!.parameters as any).properties.cursor;
+  must(offered?.type === "string" && /nextCursor/.test(offered.description ?? ""), `the schema: ${JSON.stringify(toolNamed("messages_search")!.parameters)}`);
+  const snapshotted = toolsOf(raftPlugin, { toolSnapshot: { tools: [{ name: "messages_search" }] } } as any).find((t) => t.name === "messages_search");
+  must((snapshotted?.parameters as any)?.properties?.cursor?.type === "string", `a snapshotted mount's schema: ${JSON.stringify(snapshotted?.parameters)}`);
+  one(stoppedSearch([]));
+  const first = await raftPlugin.invoke("messages_search", { query: "launch plan", sort: "recent" }, inTurn(ctx())) as any;
+  const cursor = CONTINUE.exec(first.text)?.[1];
+  must(cursor === "cur-9f3a", `control: no cursor in ${first.text}`);
+  const calls = one(json(200, { results: [searchHit("r-2", "found it: launch plan")], hasMore: false }));
+  const second = await raftPlugin.invoke("messages_search", { query: "launch plan", sort: "recent", cursor }, inTurn(ctx())) as any;
+  const p = new URL(calls[0]!.url).searchParams;
+  must(p.get("cursor") === "cur-9f3a" && p.get("q") === "launch plan" && !p.has("offset"), `request: ${calls[0]!.url}`);
+  must(second.state === "results" && /msg:r-2/.test(second.text), `the next page: ${JSON.stringify(second)}`);
+});
+
 /** The operations whose result the manifest says may be large and that page by `limit`: the ones capped here. */
 // users.info's limit is how many visible channels it inspects for memberships: capped, it bounds the result (and,
 // since 0.12.0 asks Raft for one window in one request, how many rosters Raft reads for one call).
@@ -1766,7 +2027,7 @@ function freshnessServer(answers: { history?: Response; events?: Response }) {
 const SEEN_PAGE = { target: "#wg-raft-sdk", messages: [historyMessage(41, "one"), historyMessage(42, "wait, one more thing")],
   has_more: false, has_older: false, has_newer: false, last_read_seq: 42, model_seen_up_to_seq: 42 };
 
-await check("a history read does not count as seen, even the model's own in its turn: a send after it is still held, and nothing is saved", async () => {
+await check("a history read does not count as seen, even the model's own in its turn: a send after it is still held, and only where it read is saved", async () => {
   // The SDK would book the page as seen inside invoke, before the runtime parks a result over PARK_BYTES: the model
   // would then have read a preview while the record says it saw the page. Only receive_events attests.
   const fresh = freshDb();
@@ -1778,7 +2039,11 @@ await check("a history read does not count as seen, even the model's own in its 
   await raftPlugin.invoke("messages_read", { target: "#wg-raft-sdk" }, m);
   // The model's own read still consumes on the Server's side (no consume=false): only the seen record is withheld.
   if (reads.length !== 1 || new URL(reads[0]!).searchParams.has("consume")) throw new Error(`request: ${reads[0]}`);
-  if (fresh.tables.get(fresh.scope, INBOX_STORE, "state") !== undefined) throw new Error("the read saved the mount's Raft state");
+  // What is saved is that it read there, and when (the thread-target check compares reads, `keepShown`), never a seen boundary.
+  const saved = (fresh.tables.get(fresh.scope, INBOX_STORE, "state") as any)?.frontier;
+  if (Object.keys(saved?.targets ?? {}).length !== 0 || JSON.stringify((saved?.reads ?? []).map((r: any) => [r.target, r.seq, r.contextId])) !== '[["#wg-raft-sdk",42,"ctx_a"]]') {
+    throw new Error(`the read saved more than where it read: ${JSON.stringify(saved)}`);
+  }
   const held = await raftPlugin.invoke("messages_send", { target: "#wg-raft-sdk", content: "y", idempotencyKey: "k-a" }, m);
   if (!(held instanceof Interrupt)) throw new Error(`the read let the send through: ${JSON.stringify(held)}`);
   // Positive control: the same conversation handed over by receive_events, in the same context, does attest.
@@ -1868,7 +2133,8 @@ function context(capabilities: string[]) {
 /** What a snapshot lists under `caps`: the generated tools they reach, and attachments_view after them wherever the download is. */
 const allowedBy = (caps: string[]) => {
   const generated = GENERATED.filter((op) => op.capability.every((c) => caps.includes(c))).map((op) => op.toolName);
-  return generated.includes("attachments_download_url") ? [...generated, VIEW] : generated;
+  const withView = generated.includes("attachments_download_url") ? [...generated, VIEW] : generated;
+  return caps.includes("send") ? [...withView, UPLOAD] : withView;
 };
 
 await check("a mount's snapshot lists only the operations whose every capability its credential holds", async () => {
@@ -3214,7 +3480,7 @@ await check("a person's words that name an unoffered tool come back as written f
 /** Object storage as the runtime hands it to a plugin: what was put, under which key, with which type. */
 function fakeArtifacts() {
   const puts: Array<{ key: string; body: Uint8Array; type?: string }> = [];
-  return { puts, async put(key: string, body: Uint8Array, type?: string) { puts.push({ key, body, type }); return { ref: `r2://bucket/${key}`, bytes: body.byteLength }; } };
+  return { puts, async put(key: string, body: Uint8Array, type?: string) { puts.push({ key, body, type }); return { ref: `r2://bucket/${key}`, bytes: body.byteLength }; }, async get(): Promise<Uint8Array> { throw new Error("no such artifact"); }, async head() { return null; } };
 }
 const PRESIGNED = "https://storage.example/obj/plan.pdf?X-Amz-Signature=deadbeefSIGNATURE";
 const FILE = new TextEncoder().encode("%PDF-1.7 the plan");
@@ -3484,7 +3750,7 @@ await check("a storage redirect is a failure: the Location is never fetched, not
 await check("a stored reference outside this agent's scope is refused: the call fails cleanly, shows no reference, and carries no URL", async () => {
   for (const ref of ["r2://bucket/t/other-tenant/agent/raft/attachments/att-1/plan.pdf", "r2://bucket/t/tenant/agent/raft/../../x/plan.pdf", "not-a-ref"]) {
     const puts: string[] = [];
-    const elsewhere = { async put(key: string, body: Uint8Array) { puts.push(key); return { ref, bytes: body.byteLength }; } };
+    const elsewhere = { async put(key: string, body: Uint8Array) { puts.push(key); return { ref, bytes: body.byteLength }; }, async get(): Promise<Uint8Array> { throw new Error("no such artifact"); }, async head() { return null; } };
     attachmentServer();
     let lines: string[] = [];
     let out: unknown;
@@ -3828,8 +4094,9 @@ await check("the basis covers each tool's name and the capability it needs, in a
   const base = toolsBasisOf(tools);
   // attachments_view counts with the download's capability, since a snapshot lists it exactly where it lists the download.
   const view = { name: VIEW, capability: opNamed("attachments.downloadUrl").capability };
+  const upload = { name: UPLOAD, capability: ["send"] };
   // FEATURES_BASIS stands for what a listing records beside the list (the Server's flags), not a tool.
-  must(toolsBasisOf([{ name: FEATURES_BASIS }, ...OWN.map((name) => ({ name })), ...ASSISTANT.map((name) => ({ name })), ...tools, view]) === raftPlugin.toolsBasis, `control: the plugin's basis is made this way: ${raftPlugin.toolsBasis}`);
+  must(toolsBasisOf([{ name: FEATURES_BASIS }, ...OWN.map((name) => ({ name })), ...ASSISTANT.map((name) => ({ name })), ...tools, view, upload]) === raftPlugin.toolsBasis, `control: the plugin's basis is made this way: ${raftPlugin.toolsBasis}`);
   // Same names and capabilities, other orders (the tools reversed, a capability list reversed): the same basis.
   const reordered = [...tools].reverse().map((t) => ({ ...t, capability: [...t.capability].reverse() }));
   must(toolsBasisOf(reordered) === base, "the order moved the basis");

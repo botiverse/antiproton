@@ -45,8 +45,11 @@ export interface EngineStatus {
 }
 
 export interface AgentEngine {
-  /** A person's message; durable before it returns. */
-  say(text: string, mode?: "prompt" | "steer" | "followUp"): Promise<unknown>;
+  /**
+   * A person's message; durable before it returns. `requestId`: the message's own id, where an engine keeps one (pd:
+   * a second submission under it is the first); pi085 has none, and a caller that must not post twice checks first.
+   */
+  say(text: string, mode?: "prompt" | "steer" | "followUp", opts?: { requestId?: string }): Promise<unknown>;
   /** Cancel the run in flight, writing a `marker` entry naming it. Null when nothing was running. */
   cancel(marker: string): Promise<string | null>;
   /** A `marker` entry for a turn that ended with no run to abort (a pause for the caller's functions). */

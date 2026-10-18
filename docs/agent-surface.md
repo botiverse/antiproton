@@ -174,7 +174,9 @@ read of the tenant as a whole:
 | `PUT` | `/provision/servers/{raftServerId}/model-picker` — whether the server's agents may pick another model than the default ([below](#the-servers-model-picker-model-picker)) |
 | `POST` | `/provision/agents/{agentId}/import` — the agent's workspace, once ([below](#workspace-import)) |
 | `GET` | `/provision/import-limits` — the bounds an import is held to ([below](#workspace-import)) |
+| `POST` | `/provision/import-check` — which files an import would refuse, without importing ([below](#checking-an-import-first)) |
 | `POST` | `/provision/agents/{agentId}/stop` — end the agent's running turn without deleting it ([below](#stopping-a-turn-stop)) |
+| `GET` | `/provision/agents/{agentId}/connections/github` — the agent's GitHub connection, and whether it needs reconnecting ([below](#the-agents-github-connection-connectionsgithub)) |
 
 `{agentId}` is the `providerAgentId` the provisioning call returned. As on every provider route,
 `/provision/agents/by-raft-agent/{raftAgentId}/...` reaches the same agent by the Raft agent's id.
@@ -182,7 +184,12 @@ read of the tenant as a whole:
 - **Tenant.** A tenant-scoped token is its tenant. A platform-scoped token needs `?raftServerId=` on
   every one of these requests, beside the read's own parameters; without it the answer is `422` with
   `param: "raftServerId"`. The agent is looked up in the tenant that server names, so an agent of
-  another server is `404`.
+  another server is `404`. The tenant is `raft_<raftServerId>` when that is a legal tenant id as it
+  stands (letters, digits, `.`, `_`, `-`, at most 59 — `raft_`, a tenant id and an object name's 64
+  characters leave 59), and `raft_<the id made legal>_<12 hex of its sha256>` when it is not, so two
+  server ids that spell alike (`srv:prod` and `srv_prod`) or share their first 59 characters name two
+  tenants and never one. (An id already ending in `_` and twelve hex digits takes the second form as
+  well, so a plain name can never be read as another server's digested one.)
 - **Which agents.** Only a provisioned agent of the token's tenant that has not been deleted. Another
   tenant's agent, a deleted agent, and an id that never existed are all `404`, `code: "not_found"`.
 - **Bodies.** Identical to the public API's, except that the usage answer names the agent as
@@ -527,7 +534,8 @@ agent and an unknown id are `404 not_found`.
 - The request as sent is at most 16 MiB (`413`, `param: "body"`).
 
 `GET /provision/import-limits` answers `{ "maxTotalBytes": 10485760, "maxFiles": 2000, "maxFileBytes": 2097152 }`
-(`IMPORT_LIMITS`), for Raft's exporter to refuse a workspace over them before sending it.
+(`IMPORT_LIMITS`), for Raft's exporter to refuse a workspace over them before sending it. To learn which files
+would be refused without importing, check the body first ([below](#checking-an-import-first)).
 
 **Where the files go.** Each file is the agent's state key `path` — what its state tools `get` and `put`,
 and `state/{path}` in the workspace reads above — so it reads back through
@@ -537,13 +545,18 @@ imported file is the agent's own: it may change or remove it.
 
 **What the agent is shown.** From its first turn the agent's system prompt carries a block headed "Files
 that were in your workspace when you were created": `MEMORY.md`'s current text (what its `get` answers now, not the copy
-imported) fenced, up to 4,000 characters with a line saying where the rest is, or a note that it is kept in
-object storage or was removed; then up to 40 of the other imported paths by name, with the count of the rest;
+imported) fenced, up to **16,000** characters (`IMPORTED_MEMORY_BUDGET`, the 16 KB Raft agents are told to keep it
+under) with a line after the fence saying where the rest is (`… cut at 16000 of N characters; get \`MEMORY.md\` with
+the \`get\` tool on the \`state\` mount for the rest.`), or a note that it was removed. A copy over its row's
+bound (32 KiB as JSON) is kept in object storage, and shown all the same from the excerpt the import wrote beside it
+in the agent's own database (`import_excerpt`): the prompt never reads the bucket, and the excerpt is the same
+characters the row would have shown. Once the agent replaces that copy with another too large for its row, the
+note says it is kept in object storage and to `get` it; then up to 40 of the other imported paths by name, with the count of the rest;
 and the state mount's `get` to open them (`importedFilesParts`, `src/plugins/state.ts`).
 
 **What a file may be.** UTF-8 text with no NUL byte: a state value is text, and a file that is not could not
 read back as the bytes it was (`422 not_text`). Nothing shaped like a credential (`422 credential_in_text`,
-the kind named and none of the text). Paths are normalised, then checked: empty and `.` segments drop out
+the kind named and none of the text), in its text or in its path (`422 credential_in_path`, `param: "files[i].path"`: a path is a key named in the prompt, listings and answers, and one shaped like a credential is never repeated in any of them). Paths are normalised, then checked: empty and `.` segments drop out
 (`./notes//a.md` is `notes/a.md`); refused with `422`, `param: "files[i].path"`: a leading `/`, a `..`
 segment, a trailing `/`, a backslash, a control character, anything the state key rule
 (`^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$`) refuses once normalised, and a path two files share
@@ -585,12 +598,67 @@ later `PATCH`.
 
 `files` is sorted by path. Errors use the provider envelope, `param` naming the field: `400`
 (`invalid_json`, `unknown_field`), `401`, `404 not_found`, `409` (`already_imported`, `agent_active`),
-`413`, `422` (`invalid`, `reserved`, `duplicate_path`, `sha256_mismatch`, `total_mismatch`, `not_text`,
-`credential_in_text`); a failure underneath is `500`, after which the same request is safe to retry.
+`413`, `422` (`invalid`, `reserved`, `duplicate_path`, `credential_in_path`, `sha256_mismatch`, `total_mismatch`,
+`not_text`, `credential_in_text`); a failure underneath is `500`, after which the same request is safe to retry.
+
+**Every refused file in one answer.** A problem with one file refuses that file, and the check goes on: the answer
+names every file the import refuses, so dropping them takes one round trip, not one per file. The envelope's
+`code`, `message`, `param` and status are the first refused file's, as they were when the check stopped there;
+`error.rejected` lists each refused file, in order, with its first problem, and `error.more` counts those past the
+first **200** (`IMPORT_REJECTIONS_SHOWN`):
+
+```json
+422
+{ "error": { "code": "invalid", "param": "files[1].path",
+  "message": "files[1].path: path must not have a `..` segment; 3 files are refused in all, each named in rejected",
+  "rejected": [
+    { "index": 1, "path": "../escape.md", "reason": "invalid", "param": "files[1].path" },
+    { "index": 2, "path": "notes/keys.env", "reason": "credential_in_text", "param": "files[2].contentBase64" },
+    { "index": 5, "path": "memory", "reason": "reserved", "param": "files[5].path" }],
+  "more": 0 } }
+```
+
+`index` is the file's place in `files`; `path` the path as sent (cut to 256 characters; `null` when it was not a
+string or is itself shaped like a credential); `reason` the code that file alone would have been refused with
+(`invalid`, `unknown_field`, `reserved`, `duplicate_path`, `credential_in_path`, `sha256_mismatch`, `file_too_large`,
+`not_text`, `credential_in_text`); `param` the field. Never a file's bytes, nor the text a credential was recognised by. A
+problem with the body as a whole (an unknown top-level field, `migrationId`, `instructions`, `totalBytes`, too many
+files) has no `rejected`. Past 10 MiB together the check ends at the file that crosses it (`413 too_large`,
+`param: "files"`), carrying in `rejected` the files refused before it. `total_mismatch` is checked once no file is
+refused: with one dropped, the sum to send is the one without it. The audit line counts the refused files.
 
 **Audit.** One `provision.import` log line per request that names a live agent: the token's hash
 (`credentialId`), the tenant and agent, the outcome (`imported`, `replayed`, `refused` with its `code`,
-`failed`), the file count and bytes, and the `migrationId`. Never a path's content or the token.
+`failed`), the file count and bytes, the count of refused files, and the `migrationId`. Never a path's content or the token.
+
+#### Checking an import first
+
+```
+POST /provision/import-check
+POST /provision/import-check?raftServerId=…     (a platform token)
+```
+
+The body is an import's, exactly (`migrationId` included), under the same 16 MiB bound; the answer is what the import
+would refuse, without importing: Raft calls it before a migration is confirmed, to show which files would not come
+over. It names no agent, so it reads and writes no agent's state: it takes no agent's one import, never answers
+`409`, and leaves an import already made as it was. A tenant's provider token, or a platform token with
+`?raftServerId=`, as the other tenant routes; no token is `401`.
+
+```json
+200
+{ "ok": false,
+  "rejected": [{ "index": 1, "path": "../escape.md", "reason": "invalid", "param": "files[1].path" }],
+  "more": 0,
+  "totals": { "files": 2, "bytes": 12 },
+  "limits": { "maxTotalBytes": 10485760, "maxFiles": 2000, "maxFileBytes": 2097152 } }
+```
+
+`ok` is whether the import would take every file; `rejected` and `more` as in the import's refusal; `totals` the
+files that pass and their decoded bytes (what an import of them alone would carry as `totalBytes`); `limits` the
+same as `GET /provision/import-limits`. A problem with the body as a whole answers the import's own `4xx`. What it
+cannot know, since it names no agent: `409 already_imported` and `agent_active`, and, on a deployment serving the
+evaluation routes, a path already seeded. One `provision.import_check` log line per request: the token's hash, the
+tenant, the outcome (`ok`, `rejected`, `refused` with its `code`) and the counts.
 
 #### Waiting for the import (`awaitImport`)
 
@@ -702,6 +770,153 @@ POST /provision/agents
 — `budget` on the onboarding agent only (every other agent leaves it out), and `plan` whenever Raft knows the
 server's plan ([above](#the-servers-plan-plan)); a retry repeats the same body, as for every field.
 
+### The agent's GitHub connection (`connections/github`)
+
+```
+GET /provision/agents/{agentId}/connections/github
+GET /provision/agents/by-raft-agent/{raftAgentId}/connections/github
+```
+
+What Raft may show about the agent's connection to GitHub: never a credential. Connecting it (`POST`, then
+`POST …/confirm`), pointing it at another of the tenant's connectors (`PUT`) and removing it (`DELETE`) are the same
+route with other methods (`connection` in `cf/src/provision/handlers.ts`).
+
+```json
+{
+  "connected": true,
+  "connectorId": "con_…",
+  "account": "octocat",
+  "connectedAt": "2026-10-17T13:26:02.504Z",
+  "connectedBy": "<raftUserId>",
+  "oauthStatus": "connected",
+  "lastCheckError": null,
+  "lastCheckedAt": "2026-10-17T13:26:02.504Z",
+  "connectors": [
+    { "id": "con_…", "account": "octocat", "creatorRaftUserId": "<raftUserId>", "createdAt": "…", "current": true,
+      "oauthStatus": "connected", "lastCheckError": null, "lastCheckedAt": "…" }
+  ]
+}
+```
+
+The connection's state uses the fields and words of Raft's own managed-MCP OAuth connectors, so Raft can show both
+alike. All three are always present, on the answer and on each connector in `connectors`:
+
+| Field | |
+|---|---|
+| `oauthStatus` | `connected` (working), `disconnected` (this agent has no connection; then `connected` is `false` and the other fields are `null`), or `error` (it needs reconnecting, below). A connector in `connectors` is `connected` or `error`. |
+| `lastCheckError` | `null`, or `"OAuth authorization expired; reconnect required"` with `error`. |
+| `lastCheckedAt` | When the connection was last checked, whatever came of it: the connect, pointing an agent at the connector, each renewal, and the refusal that broke it. An ordinary tool call is not recorded. For a connection made before connectors, its connect or the refusal. `null` with `disconnected`. |
+
+`connectors` lists the tenant's GitHub connectors whether or not this agent uses one.
+
+**An expiring connection.** GitHub's user tokens from this deployment's App last 8 hours, with a refresh token that
+lasts about 6 months and is single-use. The token is renewed by the deployment: before a call when it expires within
+5 minutes, and once after GitHub answers `401`, after which the call is made once more. Nothing is asked of Raft or of
+the person while that works. A connector is shared by the agents pointed at it, so its renewal happens once, under a
+lease on the connector, and reaches every agent on it.
+
+**A connection that needs reconnecting.** When GitHub refuses the renewal (`bad_refresh_token`: spent, expired, or the
+person revoked the App; also `invalid_grant` and `unauthorized`), only the person can mend it. A `401` from GitHub's
+API never marks it: some endpoints refuse every user token, and the tool reports that `401` as it is (a `401` renews
+only after `GET /user` confirms the token is dead). Nor does any other answer from the token endpoint: another OAuth
+error code, an outage page, a timeout. The connection is reported:
+
+```json
+{
+  "connected": false,
+  "connectorId": "con_…",
+  "account": "octocat",
+  "connectedAt": "…",
+  "connectedBy": "<raftUserId>",
+  "oauthStatus": "error",
+  "lastCheckError": "OAuth authorization expired; reconnect required",
+  "lastCheckedAt": "2026-10-17T23:28:42.744Z",
+  "connectors": [
+    { "id": "con_…", "account": "octocat", "creatorRaftUserId": "<raftUserId>", "createdAt": "…", "current": true,
+      "oauthStatus": "error", "lastCheckError": "OAuth authorization expired; reconnect required", "lastCheckedAt": "…" }
+  ]
+}
+```
+
+- **New for Raft:** `connected: false` may now carry `connectorId` and `account` (before, it always came with nulls).
+  With `oauthStatus: "error"` it is this state and no other: which account it was, and
+  that it is not usable.
+- The same fields are on the connector in `connectors`, so every agent pointed at it shows it.
+- The agent is told as well: a GitHub tool's result says `OAuth authorization expired; reconnect required` and that the
+  user must reconnect GitHub, and that retrying will not help.
+- `PUT` pointing an agent at a connector in this state is refused: `422`, `code: "connect_failed"`.
+- **Reconnecting** mends the connector in place, for every agent on it: the same flow as connecting, with the
+  connector named in the `POST` ([below](#reconnecting-a-connector-in-place)). A `POST` without it still makes a new
+  connector and points only this agent at it; other agents on the broken connector then stay broken until they are
+  pointed at the new one (`PUT` with its `connectorId`).
+- GitHub's own words (`bad_refresh_token: The refresh token passed is incorrect or expired.`) are kept for the
+  operator, not sent here ([`runbook.md`](runbook.md#a-github-connection-that-needs-reconnecting)).
+
+A token that does not expire is never renewed and never reported this way: a `401` for it reads as it always has.
+
+#### Reconnecting a connector in place
+
+**New for Raft.** One person authorizing GitHub again mends a connector for every agent pointed at it, broken
+(`oauthStatus: "error"`) or healthy (a re-authorization). The connector keeps its id, so no agent has to be pointed
+anywhere. Two calls, the same as connecting:
+
+```json
+POST /provision/agents/by-raft-agent/{raftAgentId}/connections/github
+{ "returnUrl": "…", "initiatedBy": { "raftUserId": "<session user>" },
+  "connectorId": "con_…", "actingRole": "creator" | "admin", "access": "public" | "private" }
+```
+
+- `connectorId` is the connector to mend, one of this tenant's (`connectors` in `GET`). It is signed into the link,
+  carried in the flow and sealed into the hold in the agent's object. `POST …/confirm` reads it from there and takes
+  no `connectorId` of its own: one sent is `400`, `code: "unknown_field"`. Nothing the browser holds can point the new
+  authorization at another connector.
+- `actingRole` is required with `connectorId`, and only with it (`422`, `param: "actingRole"`). It says in which
+  capacity Raft checked that `initiatedBy.raftUserId` may reconnect this connector: `creator` (the connector's
+  creator) or `admin` (a server owner or admin). This is the rule `PUT` and `DELETE /connectors/:id` follow.
+  **Raft must check owner/admin before it sends `admin`**: antiproton cannot see Raft's roles and takes `admin` on
+  Raft's word. A `creator` claim is checked here against `creatorRaftUserId`, at the `POST` and again at confirm
+  (`403`, `code: "not_creator"`).
+- The answer is the usual `{ url, expiresAt, scopes }` plus `"reconnect": "con_…"`. An unknown connector, or another
+  tenant's, is `404 not_found`, and no link is made.
+- The browser comes back `status=pending&pending=…&by=…` as for a connect, and Raft confirms as for a connect:
+  `POST …/confirm { pending, raftUserId }`.
+
+The authorization must be **the connector's own GitHub account**. GitHub's numeric user id is compared, because a login
+can be renamed. A connector made before the id was kept (before migration 0024) is compared by login, ignoring case,
+both here and in the D1 write itself, and keeps the id from then on. Such a connector also learns the id at its first
+successful renewal, from GitHub's `GET /user` with the renewed token, but only when GitHub names the same login. Any other account is refused, and **nothing changes**: not the connector, not any
+agent's mount, not this agent. The agents on the connector never start acting as someone else:
+
+```json
+409 { "error": { "code": "account_mismatch", "message": "this connector is GitHub account octocat, and the authorization was for mallory; nothing was changed. …" } }
+```
+
+On success, in order: the connector's token pair is replaced in one D1 write. That write also clears the broken state,
+sets `lastCheckedAt` and releases any renewal's lease. The connector's `account` takes the login GitHub now reports, so
+a rename shows. The new pair then goes onto the mount of every agent pointed at the connector, which clears each
+mount's own broken flag, and onto this agent. This agent is pointed at the connector if it was not already, with a
+`bind` event. A `reconnect` event names who did it and in which role.
+
+```json
+200 {
+  "connected": true, "reconnected": true, "connectorId": "con_…", "account": "octocat",
+  "connectedAt": "…", "connectedBy": "<raftUserId>",
+  "updated": ["<raftAgentId>", "…"],
+  "failed": [{ "raftAgentId": "…", "error": "…" }]
+}
+```
+
+- `updated`: the agents whose mount now holds the new pair. An agent pointed at the connector whose mount has since
+  been given a key in the console is left alone: the connector is not its credential any more.
+- `failed`: agents the pair did not reach in this call. The connector is mended regardless. Each one's next GitHub
+  call asks the connector, finds it healthy and takes the pair. `connected` is `false` only when this agent is among
+  them.
+- Other errors at confirm: `404 not_found` for a connector deleted since the link was made (nothing is created or
+  attached), `403 not_creator` as above, and `422 connect_failed` when GitHub's `GET /user` did not say which account
+  was authorized (nothing changes). The pending id is spent either way, so a retry starts from the `POST`.
+- A renewal in flight when the reconnect lands cannot undo it. Its write expects the old refresh token, and so does
+  its refusal, so neither matches any more: the connector keeps the reconnect's pair and is not marked broken.
+
 ### Stopping a turn (`stop`)
 
 ```
@@ -726,6 +941,8 @@ The ended turn reports itself to Raft: a "Bridge fatal" activity event with `err
 status `error` with that detail. Every attempt is a `turn.stop` line in the Workers logs, whatever came of it, written
 by the Worker that answered it (`side` = `worker`; [`runbook.md`](runbook.md#logs-and-what-an-object-did)).
 
+A stop ends the agent's subagents' turns as well ([Subagents](#subagents-send_to_agent)): none of them reports.
+
 **A delete ends the turn too.** `DELETE /provision/agents/{agentId}` first stops the running turn (`errorClass`
 `stopped: agent deleted`), and from then on the agent's object takes no step for it, whatever arrives; a repeated
 delete stops again. A stop that fails does not fail the delete: it is logged as a `turn.stop` line with `result`
@@ -749,6 +966,146 @@ reported.
 
 An operation has exactly one `tool.call` row, at its first end; completing it again (an approved call, a result
 too large to inline) updates the record and writes no second row, so a call is never reported twice.
+
+## Raft managed MCP
+
+A hosted agent whose raft mount's credential holds Raft's `mcp` capability is offered the connectors its Raft Server has
+connected (Notion and the like) as tools of that mount, `raft__mcp_…`, one per entry of Raft's managed MCP catalogue,
+with the catalogue's description and input schema. Raft holds the connectors' credentials and attaches them to each
+call; Antiproton holds none. The catalogue is read when the mount is listed and again at a turn's start once it is five
+minutes old or a call was told it is stale; a connector that needs reconnecting is one line in the mount's paragraph of
+the agent's instructions. Every such tool is a write: a subagent is not offered it, and no call is retried or replayed.
+An agent without a raft mount, or whose credential lacks `mcp`, has none. How it works is in
+[docs/plugins.md](plugins.md) (Raft's managed MCP); how to check it on an agent is in
+[runbook.md](runbook.md#raft-managed-mcp-on-an-agent).
+
+## Subagents (`send_to_agent`)
+
+Every hosted agent is offered one more harness tool, `send_to_agent`, in its own conversations, its Agents API sessions
+included — unless an operator turned its `subagents` setting off, or the deployment's `SUBAGENTS_DISABLED=1` kill switch
+is set ([`runbook.md`](runbook.md#subagents)). Measurements are exempt from the default, so a deploy changes no arm: the
+bench tenant's agents (the τ² Agents API arm included) and an agent provisioned with an explicit tool choice
+([Choosing the agent's tools](#choosing-the-agents-tools)) have it only where their setting turns it on, and
+`harness: "minimal"` never does. It
+delegates a self-contained piece of work to a **subagent**: a child conversation in the same agent object, with its own
+context. The design is issue #926; the code is `src/runtime/subagents.ts` and `cf/src/runtime.ts` (`#sendToAgent`,
+`#reportSubagents`).
+
+**Subagents are read-only.** Subagents can read and research but cannot change anything or act as this agent: no writes, no messages, no shell. Give them reading tasks and do the changes yourself.
+
+```
+send_to_agent { task: string, agent?: string, model?: string }
+  → { "agent": "sub_…", "status": "started", "note": "…" }
+```
+
+- **`task`** is the whole instruction. The subagent sees none of the parent's conversation, so the task must carry the
+  paths, ids, constraints and the format of the report wanted back. The tool's description tells the model when to
+  delegate: independent pieces that can run in parallel, or work too big for one context where only a summary matters;
+  never a simple question, a few tool calls' worth, or tightly coupled steps.
+- **Without `agent`** a new subagent starts: a session `sub_<hex>` in the same object (on pi085 a transcript of its
+  own; on pd an ownerless pi-durable conversation), the task its first message. The tool answers at once; the parent's
+  turn goes on, and usually ends. Nothing in the object waits for the child.
+- **With `agent`** (an id this conversation started) the task is a follow-up: the subagent keeps its history. Refused
+  while that subagent is still running, and for an id the conversation did not start.
+- **`model`** is offered only where the deployment lists owner model options (`USER_MODELS`, the same list as the
+  [model picker](#the-servers-model-picker-model-picker)): one option's `id`. The queue calls that option's provider and
+  model for the subagent's calls; without it the subagent runs on the agent's own model. It is held to the rules the
+  agent's own pick is: refused while an administrator's agent or tenant row decides the agent's model, and, where the
+  server's picker switch is enforced and off, for anything but the default; an id that is not listed is refused. Asked
+  at the spawn, where a refusal starts nothing, and again at each of the subagent's model calls (from an answer kept for
+  30 s), where a pin or a switch set since makes the call run on the agent's own model: a `subagent.model_changed`
+  trace row, and the subagent's next report says which model it ran on and why. Rules that cannot be read leave the
+  decision as it was.
+- **At most 3** subagents of one agent run at once; a fourth start (or a follow-up that would be the fourth) is refused,
+  naming the running ones. One subagent takes at most 10 turns and lives at most 2 hours from its creation; each turn is
+  cancelled after 30 minutes. A background job a subagent started is delivered to it only under the same limits; one
+  that cannot be posted frees the slot at once (outcome `failed`). The lifetime is counted from creation: follow-ups
+  and wakes never move it, so no subagent runs past 2 hours or 10 turns, whatever it is sent.
+- **Kept for 7 days.** A subagent idle and finished for 7 days is archived by a later pass (at most 5 a pass): its
+  transcript is deleted (pi085: its session's tables; pd: its directory entry, so it is never opened again —
+  pi-durable keeps its own records, having no way to delete a conversation) and its row stays as `archived`. A
+  subagent owing a report or with a background job still running is kept. A follow-up to an archived subagent is
+  refused; start a new one. A finished subagent's harness is not kept in memory.
+- **Depth 1.** A subagent is never offered `send_to_agent`, nor an Agents API caller's functions, nor `jobs`.
+- **Read-only.** A subagent is offered a mount's tool only when the tool declares `sideEffects: "read"`, or its plugin
+  declares `actsAs: "self"` ([docs/plugins.md](plugins.md); no built-in plugin does). Everything else is withheld:
+  GitHub writes with the agent's token, an MCP tool not marked read-only, `http.send` with a stored secret, the sandbox's
+  shell and commands (its environment carries credentials), Raft messages and task changes, the agent's own memory
+  writes. A tool that declares no side effect, and any plugin that declares nothing, is withheld too, so a new plugin is
+  safe by default. A call to a withheld tool — by the model, by a `run_js` program, in an answer to a held question,
+  by the mount's alias or by the plugin's id — is refused at dispatch with `subagent_read_only`, decided on the mount
+  and tool the name resolves to. A subagent keeps `run_js` and `resume`, which reach only what it may call. Its Raft
+  reads run on a state of their own and never save over the agent's Raft state.
+- **Replay-safe.** The tool is `replay: "safe"`: a call cut off by an isolate dying runs again, on either engine. The
+  child's id is derived from the call (the conversation, the call's invocation — pi085's invocation id, pd's tool task —
+  and its call id), so the second run finds the child the first one made, the task is posted once, and the parent is
+  told `started` for the one child that exists.
+
+**Reports.** When a subagent's turn ends, its last answer is posted to the conversation that started it as a message,
+through the same post a background job's completion takes — so it waits behind a workspace import, is dropped while
+the conversation needs a reset, carries a rebuild's pending briefing and any notices — and wakes that conversation:
+
+```
+[subagent sub_… — done after 42s (report sub_…/1); its report, a notice from the harness, not a message from the user. send_to_agent with agent "sub_…" sends it a follow-up.]
+<the subagent's final answer>
+```
+
+Reports owed to one conversation in the same pass go as one message, so the parent runs once for all of them: a head
+line (`[3 subagent reports, …]`) and then each report as above, its own head and key included, separated by `---`.
+Reports that arrive while the conversation is already running join that run. A kill switch set while children run
+([`runbook.md`](runbook.md#subagents)) stops them, and the conversation gets one notice naming them all in place of
+their reports (`[subagents were switched off for this agent; 2 running children were stopped: …]`); its own turn goes on.
+
+`failed` carries the error (a model call that failed, a run that ended without an answer); `cancelled` is a turn
+past the 30-minute ceiling, cancelled by the agent's next pass. A report is cut at 20,000 characters. A turn's end is
+read from what the engine committed when the run ended (pi085's run result, pd's settled submission), so a report is
+delivered by the first pass after it, whether or not the object was evicted or restarted meanwhile. It is delivered
+exactly once: the report is decided and kept on the subagent's row, posted unless the parent's conversation already
+holds its key (`report sub_…/<turn>`: on pd a submission under that request id, on pi085 an entry or queued input
+carrying it), and the row is marked delivered after the post. A crash before the post leaves it owed and the next pass
+posts it; a crash after leaves it owed and already there, and the next pass only marks it. A background job a
+subagent started that ends after its report starts another turn of the subagent, which reports in turn.
+
+**Stopping.** A stop of the agent — the provider's [stop](#stopping-a-turn-stop), a delete, `/admin/cancel-turn` —
+marks every running subagent `stopped` and drops every owed report, then cancels every subagent session: no model call
+follows, and no report is sent, since a report would wake the conversation the stop just ended. A stop that lands while a subagent's task is being posted is
+caught after the post, and the subagent's run is cancelled. One that lands while a report is being posted is caught at
+the last moment before the report is written, and nothing is written: a message the person sends after the stop is
+answered as theirs. Only a stop inside the write itself is caught after it, and then only the run the report started
+is cancelled, never the conversation. On pd a stop cancels the subagent conversations pi-durable says have live work,
+not every one the agent ever had. Any subagent run nothing tracks is cancelled by the agent's next pass. An Agents API
+session's cancel stops the subagents it started; deleting the session stops them and drops their reports. A report
+whose post fails is kept and tried again with backoff, at most 8 times; it holds up neither the other reports nor the
+rest of the pass.
+
+**Raft.** Activity and status come from the agent's own conversations only. A subagent's model calls and tool calls
+are neither activity nor status: a subagent's final answer is not a `Stop`, and does not show the agent `online`; its
+tools do not show as the agent's. The agent's own turn ends with its own `Stop` after it starts subagents, and it shows
+working again when a report wakes it and it calls the model. A subagent's work is in the [trace](#trace) only.
+
+Where the deployment sets `SUBAGENT_ACTIVITY=1` (off by default, until Raft's ingest accepts the fields), a subagent's
+work is sent as Raft's `SubagentLineage` events, `subagent: { parentToolUseId, taskId, phase }` with `parentToolUseId` the
+parent's `send_to_agent` tool call id and `taskId` the child's session: `SubagentStart` (`phase: "started"`) when a turn
+of it starts, the child's tool steps as `PreToolUse`/`PostToolUse` (`phase: "active"`, with the same `toolUseId`, `ok`,
+`durationMs` and `exitCode` as the agent's own, [above](#tool-calls-in-rafts-activity-log)), and `SubagentStop`
+(`phase: "ended"`, and in the marker `outcome` — `done`, `failed`, `stopped`, `ceiling` — and `reportChars`, the report
+body's length without its head; nothing of them beside it). `ceiling` is only a turn the harness took at its time or its
+lifetime; any other cancel, a kill switch's included, is `stopped`. A turn has one end: a stop while its report is owed
+drops the report and gives it no second `SubagentStop`. The parent's own
+`send_to_agent` is then a plain `PreToolUse`/`PostToolUse` of the agent, with no marker; its `toolUseId` is the call id
+the marker names as `parentToolUseId`, and its end is `ok: true`. Never a `Stop` or a prompt for a
+child, never the agent's status on a child's event, and never a task, a prompt or a report: ids and enums only. Off, a
+child's rows make no event at all.
+
+**Cost.** A subagent's calls are the agent's: metered under its `agent_id`, and each call is admitted against the daily
+spend limits like any other. Its share is visible in the trace: its `model.call` rows name its session.
+
+**Known limits.** On pi085 a subagent's conversation has no compaction and no overflow backstop (both are the main
+conversation's), so a subagent's task must fit one context window. On pd every conversation's tools are opened when a
+cold isolate first drives the harness, so an agent with many past subagents pays for opening each of them then.
+Subagents cannot run commands: a sandbox without the agent's credentials, which a subagent could have, is a future
+change. There is no route or tool that stops one subagent alone. On pd the context window a subagent runs in is the agent's model's, not
+its model option's.
 
 ## Evaluation setup (preview only)
 
@@ -1001,7 +1358,8 @@ carries.
 Each tool's `name`, `description` and `parameters` are exactly what the model is sent: the name as
 offered (`<alias>__<tool>`, as the harness names it, `offeredToolName`), the description with
 whatever the harness appends. `source` is `mount` for a mount's tool, `harness` for the harness's own
-(`run_js`, `resume`, `jobs`) and `caller` for an Agents API caller's function; a mount's tool also
+(`run_js`, `resume`, `jobs`, and `send_to_agent` where the agent's `subagents` setting is on) and `caller` for an Agents
+API caller's function; a mount's tool also
 carries `alias`, `plugin`, `tool` (its name in the plugin), `sideEffects`, `idempotency`, `replay`
 (whether the harness may run it again after an interruption: `safe` or `never`), and `modelOnly`,
 `reads` and `exclusive` where they are set.
@@ -1053,7 +1411,12 @@ answer with `/admin/transcript`'s for the same agent).
 `GET …/trace` answers the agent's trace rows — the spans of its work, one row each when it ended
 (`model.call`, `tool.call`, `approval.wait`, `container.lease`, `inbound`, `mount.seeded`,
 `rebuild.decision`, `rebuild.outcome`, `rebuild.behaviour`, `turn.timing`, `import.hold`, `model.prewarm`, `agent.ready`,
-`mount.settings` (an operator's in-place change of a mount's settings, [docs/plugins.md](plugins.md)), and the rows a plugin writes of its own, `raft.held`, `raft.held_answer` and `raft.state_save_failed`
+`mount.settings` (an operator's in-place change of a mount's settings, [docs/plugins.md](plugins.md)), `subagent.turn`
+(one turn of a [subagent](#subagents-send_to_agent) ending: `spanId` its session, `parentId` the tool call that sent the
+turn, `status` `done`, `failed`, `cancelled`, `stopped`, `report_failed`, `report_dropped` or `wake_failed` (a background
+completion that could not be posted, so no turn started), `attrs.parentSession` and, on an end, `reportChars`, the report
+body's length; a `cancelled` end's `attrs.cause` is `ceiling` or `aborted`, a kill switch's `stopped` end's is `switched_off`), `subagent.start` (a child's turn beginning: `spanId` its session,
+`parentId` the parent's `send_to_agent` call, `status` `spawn`, `follow_up` or `wake`), and the rows a plugin writes of its own, `raft.held`, `raft.held_answer`, `raft.state_failed` (written as `raft.state_save_failed` before Raft SDK 0.19.0) and `raft.mcp_call` (one [managed MCP](#raft-managed-mcp) call's end: `status` `result`, `tool_error` or the failure kind, `attrs.server` and `attrs.tool`; never arguments or a result)
 ([docs/plugins.md](plugins.md)); `src/trace/outbox.ts`) — with `from <= at < to`, in `seq` order.
 
 - `from`, `to` — ISO 8601 or milliseconds since the epoch; the window is at most 24 hours. One alone
@@ -1073,7 +1436,8 @@ exported, and one exported between the two reads is found in its batch: no lag p
 What is never there: a span still open (a model call awaiting its answer, a tool still running), and
 anything the trace does not record (`src/trace/outbox.ts` names the documented silences). Each row is
 as exported: `{ seq, at, tenantId, agentId, kind, spanId, parentId?, status, verdict, ms?, attrs }`.
-A `model.call` row's `attrs` carry `model` and the answer's `input`, `cacheRead` and `cacheWrite` tokens;
+A `model.call` row's `attrs` carry `model`, `session` (the conversation that made the call: `main`, an Agents API
+session, or a subagent's `sub_…`) and the answer's `input`, `output`, `cacheRead` and `cacheWrite` tokens;
 on the pi085 engine also `prefix` (`src/runtime/request-prefix.ts`): the sha256 of the system prompt
 and of the tool list, the request's message count and characters, how many leading messages (and their
 characters) are the previous request's byte for byte, and `broken` — `system`, `tools`, `message`, or

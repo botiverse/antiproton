@@ -97,6 +97,9 @@ export function sessionFor(sql: Sql, tenantId: string, agentId: string, taskId: 
   // first id while it is still the current one is left to the rule below, as it was before conversations had ids.
   const main = physicalSession(sql, taskId);
   if (main !== null && !(main === MAIN_SESSION && taskId === MAIN_SESSION)) return main;
+  // A subagent's session (src/runtime/subagents.ts), by its id, where the agent's row names it: a child is a conversation of the agent's.
+  if (taskId.startsWith("sub_") && hasTable(sql, "subagents")
+    && sql.exec("SELECT 1 AS x FROM subagents WHERE id = ? AND tenant_id = ? AND agent_id = ?", taskId, tenantId, agentId).toArray().length > 0) return taskId;
   const task = hasTable(sql, "tasks")
     ? sql.exec("SELECT agent_id FROM tasks WHERE tenant_id=? AND task_id=?", tenantId, taskId).toArray()[0] as any
     : undefined;

@@ -187,6 +187,16 @@ export function cancelJob(ap: Pick<ApStore, "query">, id: string): void {
 }
 
 /** The commit hook's body. Synchronous, inside the commit's transaction; see the header for what it writes. */
+/**
+ * The session a job's conversation holds (`ap_conversations`, the directory `PdHost.conversation` writes), for the
+ * `model.call` row's `session`. Null for a job recorded without its conversation, or one the directory does not list.
+ */
+function sessionOfConversation(ap: BookContext["ap"], conversationId: unknown): string | null {
+  if (conversationId === null || conversationId === undefined) return null;
+  const [row] = ap.query("SELECT task_id FROM conversations WHERE conversation_id = ?", Number(conversationId));
+  return row ? String((row as { task_id: unknown }).task_id) : null;
+}
+
 /** Returns the jobs the batch recorded: each is dispatched once the commit has landed. */
 export function bookCommit(exec: SqliteSyncExecutor, writes: readonly StorageWrite[], ctx: BookContext): string[] {
   const recorded: string[] = [];
@@ -204,11 +214,11 @@ export function bookCommit(exec: SqliteSyncExecutor, writes: readonly StorageWri
   // Answers: the job is consumed.
   const messages = assistantMessages(writes, ctx.owner);
   /** Jobs this batch moved to consumed, with their instants: the ones that get a trace row. */
-  const jobs = new Map<string, { created_at: unknown; answered_at: unknown }>();
+  const jobs = new Map<string, { created_at: unknown; answered_at: unknown; conversation_id: unknown }>();
   for (const m of messages) {
     if (typeof m.jobId !== "string") continue;
-    const [row] = ctx.ap.query("UPDATE model_jobs SET state = 'consumed' WHERE id = ? AND state IS NULL RETURNING created_at, answered_at", m.jobId);
-    if (row) jobs.set(m.jobId, row as { created_at: unknown; answered_at: unknown });
+    const [row] = ctx.ap.query("UPDATE model_jobs SET state = 'consumed' WHERE id = ? AND state IS NULL RETURNING created_at, answered_at, conversation_id", m.jobId);
+    if (row) jobs.set(m.jobId, row as { created_at: unknown; answered_at: unknown; conversation_id: unknown });
   }
 
   // A poll that ended without its response never read its answer: the job is cancelled, as `PdHost.#dropJob` does —
@@ -241,6 +251,7 @@ export function bookCommit(exec: SqliteSyncExecutor, writes: readonly StorageWri
           answeredAt: job.answered_at !== null ? Number(job.answered_at) : null,
           usage: (m as { usage?: Parameters<typeof modelCallRow>[0]["usage"] }).usage ?? null,
           limit: spendLimitRefusal(m as { errorMessage?: unknown; providerError?: unknown }),
+          session: sessionOfConversation(ctx.ap, job.conversation_id),
         }));
       }
       appendTrace(ctx.raw as Parameters<typeof appendTrace>[0], trace);

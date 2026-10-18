@@ -15,7 +15,7 @@ import { operatorRefFor, providerOfRef, type OperatorModel } from "../../src/mod
 import { DEFAULT_PROVIDER, providerFor, type ModelChoice, type ModelProviders } from "../../src/model/providers.ts";
 import { DurableObjectStore } from "../../src/store/durable-object.ts";
 import { DynamicWorkerExecutor } from "../../src/runtime/dynamic-worker-executor.ts";
-import type { AgentEngine, StepOutcome } from "../../src/runtime/engine.ts";
+import type { AgentEngine, EngineEntry, StepOutcome } from "../../src/runtime/engine.ts";
 import { PiAgent, ensureAgentTables, jobSession, sessionsWithWork, markSession, mainBusy } from "../../src/runtime/pi-agent.ts";
 import { DurableAgent, PdHost, recordedEngine } from "../../src/runtime/durable-agent.ts";
 import { busyReason, clientCallsWaiting, migrateToPd, revertToPi085, type MigrationResult, type RevertResult } from "../../src/runtime/pd-migrate.ts";
@@ -63,6 +63,20 @@ import {
   answerClientCall, clientTools, pendingClientCalls, turnClientCalls,
 } from "../../src/runtime/client-calls.ts";
 import { closeTurn, discardTurn, openTurn, turnInbound, turnNotSaid, turnPaused, turnResumed, turnSaid, turnStepStart } from "../../src/runtime/turn-timing.ts";
+import {
+  admitSubagent, hasSubagentTable, finishSubagentTurn, runningSubagentCount, subagentCeilingMs, SUBAGENT_CAP, SUBAGENT_MAX_MS, SUBAGENT_LIFETIME_MS, isSubagentSession, listSubagents, overdueSubagent, recordSubagent, reportMessage,
+  runningSubagents, setSubagentTurnOp, startedResult as subagentStarted, startSubagentTurn, stopRunningSubagents, subagentOf, subagentTool,
+  switchOffSubagents, switchedOffNotice, reportBodyChars,
+  SUBAGENT_TOOL, childMayCall, childRefusal, childWithheld, taskMessage, turnEnd, type Subagent, type TurnEnd,
+  markReported, reportingSubagents, reportKey, subagentIdFor, taskKey, turnKeyOf,
+  reportFailed, reportRetryMs, subagentSpent, subagentTurnRow, noteSubagentModel, combinedRequestId, undeliveredKey, undeliveredNotice,
+  archivableSubagents, markArchived, releaseUnstartedTurn, SUBAGENT_ARCHIVE_PER_PASS, SUBAGENT_RETENTION_MS, subagentStartRow,
+} from "../../src/runtime/subagents.ts";
+import { subagentModelChoice } from "./model-request.ts";
+import type { ModelLayers } from "./control-plane.ts";
+import { AGENT_SETTING_ABOUT, agentSettings, updateAgentSettings } from "../../src/runtime/agent-settings.ts";
+import type { UserModels } from "../../src/model/user-models.ts";
+import { pdConversationId, pdSubmissionStatus, readPdEntries } from "../../src/runtime/pd-transcript.ts";
 
 export { ASSUMED_CONTEXT_WINDOW } from "../../src/model/context-windows.ts";
 
@@ -162,7 +176,11 @@ export function hostCallOpts(call: { opts?: unknown; callId?: string }): InvokeO
   };
 }
 import type { MountPolicy, MountRecord } from "../../src/core/types.ts";
-import type { HookDirectory, HookRow } from "./control-plane.ts";
+import type { ConnectorGrants, ConnectorRefresh, HookDirectory, HookRow } from "./control-plane.ts";
+import { GithubRefresher, RECONNECT_REASON, type GithubApp, type MountGrant } from "./github-refresh.ts";
+import { githubUser, REFRESH_SKEW_MS } from "./github-token.ts";
+import type { ReconnectTarget } from "./provision/connect.ts";
+import type { GithubGrant } from "./github-token.ts";
 import { appendUsage, jsRunRows, modelTokenRows } from "../../src/usage/outbox.ts";
 import {
   finishPrewarm, firstTurnDone, firstTurnOf, inFirstTurn, markFirstTurnDone, PREWARM_USER_TEXT, prewarmable, prewarmJobId,
@@ -341,7 +359,7 @@ import { githubPlugin } from "../../src/plugins/github.ts";
 import { demoPlugin } from "../../src/plugins/demo.ts";
 import { httpPlugin } from "../../src/plugins/http.ts";
 import { exaPlugin } from "../../src/plugins/exa.ts";
-import { keptDelete, keptList, keptNameProblem, keptPut, keptValueProblem, statePlugin } from "../../src/plugins/state.ts";
+import { IMPORTED_MEMORY_BUDGET, keptDelete, keptList, keptNameProblem, keptPut, keptValueProblem, memoryExcerpt, SEEDED_MEMORY, statePlugin } from "../../src/plugins/state.ts";
 import { sandboxPlugin, SANDBOX_ALIAS } from "../../src/plugins/sandbox.ts";
 import { builtinToolsPlugin } from "../../src/plugins/builtin.ts";
 import { artifactsPlugin, PARK_BYTES, READ_WHOLE_MAX } from "../../src/plugins/artifacts.ts";
@@ -608,21 +626,27 @@ function holdEnded(sql: any, tenantId: string, agentId: string, h: ImportHold) {
 }
 
 /** Same surface the SigV4 client exposes, backed by the R2 binding instead. */
-class BoundArtifacts {
+export class BoundArtifacts {
   #bucket: R2Bucket;
   #name: string;
   constructor(bucket: R2Bucket, name: string) {
     this.#bucket = bucket;
     this.#name = name;
   }
-  async put(key: string, body: string | Uint8Array) {
+  /** `contentType` is kept as the object's metadata, as the SigV4 client sends it, so a reader can say what a file was stored as. */
+  async put(key: string, body: string | Uint8Array, contentType?: string) {
     const bytes = typeof body === "string" ? new TextEncoder().encode(body) : body;
-    await this.#bucket.put(key, bytes);
+    await this.#bucket.put(key, bytes, contentType ? { httpMetadata: { contentType } } : undefined);
     return { ref: `r2://${this.#name}/${key}`, etag: "", bytes: bytes.byteLength };
   }
   /** Remove objects nothing names any more (a workspace import that did not land, `importWorkspace`). */
   async delete(keys: string[]) {
     if (keys.length) await this.#bucket.delete(keys);
+  }
+  /** An object's size, read from its metadata without its body; null when there is none. */
+  async head(key: string): Promise<{ bytes: number } | null> {
+    const obj = await this.#bucket.head(key);
+    return obj ? { bytes: obj.size } : null;
   }
   async get(key: string): Promise<Uint8Array> {
     const obj = await this.#bucket.get(key);
@@ -630,6 +654,18 @@ class BoundArtifacts {
     // message reaches the model through the reader's error.
     if (!obj) throw new Error("no such artifact");
     return new Uint8Array(await obj.arrayBuffer());
+  }
+  /** The stored object's length, read without its body; null when there is no such object. */
+  async size(key: string): Promise<number | null> {
+    const obj = await this.#bucket.head(key);
+    return obj ? obj.size : null;
+  }
+  /** `get`, with the content type the object was stored with (`put`), when it has one. */
+  async getObject(key: string): Promise<{ bytes: Uint8Array; contentType?: string }> {
+    const obj = await this.#bucket.get(key);
+    if (!obj) throw new Error("no such artifact");
+    const contentType = obj.httpMetadata?.contentType;
+    return { bytes: new Uint8Array(await obj.arrayBuffer()), ...(contentType ? { contentType } : {}) };
   }
 }
 
@@ -663,6 +699,16 @@ export interface RuntimeDeps {
   /** reminder-app's origin and this deployment's client credential there, handed to the `reminder` plugin when it is
    *  built: deployment configuration, not a mount's credential. Either absent means its tools refuse and send nothing. */
   reminderApp?: { origin?: string; credential?: string };
+  /**
+   * Renewing expiring GitHub user tokens (cf/src/github-refresh.ts): the OAuth App that issued them, the tenant
+   * connectors they are shared through, and how a connector's new pair reaches the other agents pointed at it.
+   * Absent: an expiring token is kept as it came and dies with its 8 hours, as before #935.
+   */
+  github?: {
+    app: GithubApp | null;
+    grants?: ConnectorGrants;
+    propagate?(tenantId: string, connectorId: string, fromAgentId: string): Promise<void>;
+  };
   /** The key under which per-agent secrets are sealed at rest: 32 bytes,
    *  base64, a Worker secret. Absent means `agent:` references cannot be
    *  stored or resolved, and the credential form says so. */
@@ -780,6 +826,34 @@ export interface RuntimeDeps {
    * (EVAL_SEED_ROUTES, cf/wrangler.preview.jsonc): it reads the whole transcript on every call.
    */
   modelInputEvidence?: boolean;
+  /**
+   * The deployment's owner model options (USER_MODELS, src/model/user-models.ts): the models a subagent may be started
+   * on (`send_to_agent`'s `model`), the same list the owner's picker offers. Absent: none, and a subagent runs on the
+   * agent's own model.
+   */
+  userModels?: UserModels;
+  /**
+   * A test's knob: called at the points of a subagent's send and report where a crash must lose nothing. A throw is the
+   * crash; a promise that never settles is an isolate that died there.
+   */
+  subagentFault?: (phase: "send-start" | "task-posting" | "task-posted" | "report-decided" | "report-posting" | "report-written" | "report-posted" | "ceiling-cancel" | "wake-posting", subagent: string) => void | Promise<void>;
+  /**
+   * Whether an agent with no `subagents` setting of its own is offered `send_to_agent`: on for the hosted agents
+   * (cf/src/index.ts), absent — off — for the bench and for a runtime built without saying. A stored setting wins.
+   */
+  subagentsDefault?: boolean;
+  /** The deployment's kill switch (SUBAGENTS_DISABLED=1, `subagentsDisabledBy`): no agent is offered `send_to_agent`. */
+  subagentsDisabled?: boolean;
+  /** How long a finished child's transcript is kept (`SUBAGENT_RETENTION_MS` when unset). A test's knob. */
+  subagentRetentionMs?: number;
+  /**
+   * What decides over a subagent's model option besides USER_MODELS, read from the control plane for the agent: the
+   * administrator's rows and the owner's pick (`ModelLayers`), and whether the server's picker switch refuses another
+   * model than the default (MODEL_PICKER_ENFORCE and the switch). Absent: no pins and no switch.
+   */
+  subagentModelRules?: (tenantId: string, agentId: string) => Promise<{ layers: ModelLayers; pickerOff: boolean }>;
+  /** How long one answer of `subagentModelRules` serves a subagent's model calls; 30 s when unset. A test's knob. */
+  subagentRulesTtlMs?: number;
 }
 
 /**
@@ -911,13 +985,17 @@ export type OfferedToolsExport = {
 
 /**
  * Whether a turn's start re-takes this mount's tool list (`AgentRuntime.retakeStaleSnapshots`): its plugin lists its
- * own tools and declares a basis, and the mount has a snapshot taken under another basis (one with none differs). The
- * re-take itself and the tool export (`AgentRuntime.offeredTools`) both ask this, so the export's "due" is the pass's.
+ * own tools, the mount has a snapshot, and either the plugin declares a basis the snapshot was not taken under (one
+ * with none differs) or the plugin says the list is due again (`Plugin.toolsDue`: part of it comes from a far end and
+ * has aged, or a call was told it is stale). The re-take itself and the tool export (`AgentRuntime.offeredTools`) both
+ * ask this, so the export's "due" is the pass's. A `toolsDue` that throws is read as not due: the list stays.
  */
 export function snapshotStale(
-  m: Pick<MountRecord, "toolSnapshot">, p: Pick<Plugin, "snapshotTools" | "toolsBasis"> | undefined,
+  m: MountRecord, p: Pick<Plugin, "snapshotTools" | "toolsBasis" | "toolsDue"> | undefined, now = Date.now(),
 ): boolean {
-  return !!p?.snapshotTools && p.toolsBasis !== undefined && !!m.toolSnapshot && m.toolSnapshot.basis !== p.toolsBasis;
+  if (!p?.snapshotTools || !m.toolSnapshot) return false;
+  if (p.toolsBasis !== undefined && m.toolSnapshot.basis !== p.toolsBasis) return true;
+  try { return p.toolsDue?.(m, now) === true; } catch { return false; }
 }
 
 /**
@@ -1060,6 +1138,17 @@ export type RestartResult =
   | { ok: true; sessionId: string; restartedAt: number }
   | { ok: false; status: 404 | 409; error: string };
 
+/**
+ * Whether an Agents API caller declared a function named `send_to_agent`: then the caller's function is offered under
+ * its name, and the agent's own `send_to_agent` is not, in that session. Said once as a log line (`subagent.tool_shadowed`)
+ * when it decides, so an operator who expected subagents there can see why there are none.
+ */
+function callerShadows(tenantId: string, agentId: string, session: string, callerDefs: ReadonlyArray<{ name: string }>): boolean {
+  const shadows = callerDefs.some((d) => d.name === SUBAGENT_TOOL);
+  if (shadows) logEvent("subagent.tool_shadowed", { tenantId, agentId, session });
+  return shadows;
+}
+
 export class AgentRuntime {
   readonly store: DurableObjectStore;
   #deps: RuntimeDeps;
@@ -1117,6 +1206,8 @@ export class AgentRuntime {
   /** Programs suspended at a pause, for every session of this agent; memory only (run-js-resume.ts). */
   #continuations: RunJsContinuations;
   #artifacts: BoundArtifacts;
+  /** Renewals of this object's expiring GitHub tokens (cf/src/github-refresh.ts). */
+  #oauth: GithubRefresher;
   #ready = false;
 
   constructor(deps: RuntimeDeps) {
@@ -1133,7 +1224,7 @@ export class AgentRuntime {
       sandboxPlugin(this.#artifacts as any, deps.bucketName, deps.idle ?? null),
       // The key is read when a secret tool runs, not now: `#kek` is set a few lines below.
       statePlugin(this.store, this.#artifacts as any, deps.bucketName, () => this.#kek),
-      artifactsPlugin(this.#artifacts as any, deps.bucketName),
+      artifactsPlugin(this.#artifacts, deps.bucketName),
       createRaftPlugin({ artifacts: this.#artifacts }),
       mcpPlugin,
       createReminderPlugin({ serviceUrl: deps.reminderApp?.origin, clientCredential: deps.reminderApp?.credential }),
@@ -1149,12 +1240,26 @@ export class AgentRuntime {
     const kekPromise = deps.secretKek ? importKek(deps.secretKek) : Promise.resolve(null);
     const operator = { resolve: (ref: string) => resolveOperatorRef(ref, deps, (r) => envSecrets.resolve(r)) };
     this.#kek = kekPromise;
+    this.#oauth = new GithubRefresher({
+      store: this.store, kek: kekPromise, sql: deps.ctx.storage.sql,
+      app: deps.github?.app ?? null, grants: deps.github?.grants, propagate: deps.github?.propagate,
+      waitUntil: (p) => deps.ctx.waitUntil?.(p),
+    });
     this.#secrets = {
-      resolve: async (ref, scope, opts) => agentSecrets(this.store, await kekPromise, operator).resolve(ref, scope, opts),
+      resolve: async (ref, scope, opts) => {
+        // Every reader of a mount's key comes through here — a tool call, the sandbox's egress before each
+        // command, a program's calls — so an expiring one is renewed here, before it is handed out.
+        if (isAgentRef(ref) && scope && deps.github) {
+          try { await this.#oauth.beforeUse(scope.tenantId, scope.agentId, ref.slice(agentRef("").length)); }
+          catch (e) { console.error("github: renewing before use failed:", String((e as Error)?.message ?? e).slice(0, 200)); }
+        }
+        return agentSecrets(this.store, await kekPromise, operator).resolve(ref, scope, opts);
+      },
     };
     // The operator's catalogue, told to the kernel rather than read by it.
     this.#gateway = new ToolGateway(this.store, plugins, SEEDED_PLUGINS, this.#secrets,
-      deps.hooks ? (tenantId, agentId, alias) => this.#inboundFor(tenantId, agentId, alias) : undefined);
+      deps.hooks ? (tenantId, agentId, alias) => this.#inboundFor(tenantId, agentId, alias) : undefined,
+      deps.github ? { credentialRejected: (scope, name, token) => this.#oauth.rejected(scope.tenantId, scope.agentId, name, token) } : {});
     this.#executor = new DynamicWorkerExecutor({
       loader: deps.loader,
       makeToolBinding: deps.makeToolBinding,
@@ -1609,6 +1714,9 @@ export class AgentRuntime {
     const sealed = await seal(kek, value);
     const name = alias;
     await this.store.putSecret(tenantId, agentId, name, { ciphertext: sealed.ciphertext, iv: sealed.iv });
+    // A key put here is renewed by nothing: what renewed the one it replaces goes with it. A connection's own
+    // attach writes it again afterwards (`attachSealedConnection`).
+    await this.#oauth.forget(tenantId, agentId, name);
     await this.store.setMountSecretRef(tenantId, agentId, alias, agentRef(name));
     if (check?.ok) {
       await this.store.putSecret(tenantId, agentId, name, {
@@ -1745,9 +1853,10 @@ export class AgentRuntime {
    * started it — so a link sent to someone else cannot put their account on this agent. Expired rows
    * are cleared each time a new one is held. On these rows the `account` column holds the Raft user
    * the flow was started for, not an account the credential grants: they are never a mount's credential.
+   * `reconnect`, from the signed link, is sealed in with the grant: confirm reads the connector to mend from here.
    */
-  async holdConnection(tenantId: string, agentId: string, plugin: string, token: string, id: string, exp: number, raftUserId: string):
-    Promise<{ ok: true } | { ok: false; error: string }> {
+  async holdConnection(tenantId: string, agentId: string, plugin: string, grant: GithubGrant | string, id: string, exp: number, raftUserId: string,
+    reconnect: ReconnectTarget | null = null): Promise<{ ok: true } | { ok: false; error: string }> {
     await this.ready();
     const kek = await this.#kek;
     if (!kek) return { ok: false, error: "this deployment has no SECRET_KEK, so it cannot keep a credential" };
@@ -1755,7 +1864,10 @@ export class AgentRuntime {
     for (const r of await this.store.listSecretNames(tenantId, agentId, "pending:")) {
       if (Number(r.name.split(":")[2]) <= now) await this.store.removeSecret(tenantId, agentId, r.name);
     }
-    const sealed = await seal(kek, token);
+    // The whole grant, as JSON: an expiring token's refresh token and lifetimes have to reach the mount with it.
+    const g: GithubGrant | string = typeof grant === "string" && reconnect
+      ? { accessToken: grant, refreshToken: null, expiresAt: null, refreshExpiresAt: null } : grant;
+    const sealed = await seal(kek, typeof g === "string" ? g : JSON.stringify({ v: 1, ...g, ...(reconnect ? { reconnect } : {}) }));
     await this.store.putSecret(tenantId, agentId, `pending:${plugin}:${exp}:${id}`, { ciphertext: sealed.ciphertext, iv: sealed.iv, account: raftUserId });
     return { ok: true };
   }
@@ -1763,9 +1875,15 @@ export class AgentRuntime {
   /**
    * Make a held connection the credential of this agent's mount of that plugin: once, before it expires,
    * and only for the Raft user it was held for. The held row goes whatever the outcome.
+   *
+   * A hold for a reconnect in place (`reconnect`, sealed in at the hold) is NOT attached here: the provider handler
+   * first checks that the account is the connector's own, and a refusal must leave this mount as it was. It comes
+   * back with the account GitHub names for the token (`GET /user`, which also proves it works), or is refused when
+   * GitHub does not say. Either way `accountId` is GitHub's numeric id, null when a plain connect could not learn it.
    */
-  async confirmConnection(tenantId: string, agentId: string, plugin: string, id: string, raftUserId: string):
-    Promise<{ ok: true; account: string | null; sealed: Sealed } | { ok: false; error: string; missing?: true }> {
+  async confirmConnection(tenantId: string, agentId: string, plugin: string, id: string, raftUserId: string, connectorId: string | null = null):
+    Promise<{ ok: true; account: string | null; accountId: string | null; sealed: Sealed; refresh: ConnectorRefresh | null; reconnect: ReconnectTarget | null }
+      | { ok: false; error: string; missing?: true }> {
     await this.ready();
     const kek = await this.#kek;
     if (!kek) return { ok: false, error: "this deployment has no SECRET_KEK, so it cannot keep a credential" };
@@ -1777,13 +1895,61 @@ export class AgentRuntime {
     if (!meta || !sealed || Number(row.name.split(":")[2]) <= Date.now() || meta.account !== raftUserId) {
       return { ok: false, error: "no such pending connection", missing: true };
     }
-    // Handed back sealed: the connection it becomes is the tenant's (cf/migrations/0012_connectors.sql).
-    const r = await this.attachSealedConnection(tenantId, agentId, plugin, sealed);
-    return r.ok ? { ...r, sealed: { ciphertext: sealed.ciphertext, iv: sealed.iv } } : r;
+    // A hold from before #935 is the bare token; one since is the grant as JSON. A token never begins with "{".
+    const held = await open(kek, sealed);
+    const parsed = held.startsWith("{") ? JSON.parse(held) as GithubGrant & { reconnect?: ReconnectTarget } : null;
+    const grant: GithubGrant = parsed
+      ? { accessToken: parsed.accessToken, refreshToken: parsed.refreshToken, expiresAt: parsed.expiresAt, refreshExpiresAt: parsed.refreshExpiresAt }
+      : { accessToken: held, refreshToken: null, expiresAt: null, refreshExpiresAt: null };
+    const reconnect = parsed?.reconnect ?? null;
+    const access = await seal(kek, grant.accessToken);
+    const refresh: ConnectorRefresh | null = grant.refreshToken
+      ? { sealed: await seal(kek, grant.refreshToken), expiresAt: grant.expiresAt, refreshExpiresAt: grant.refreshExpiresAt }
+      : null;
+    if (reconnect) {
+      const who = await githubUser(grant.accessToken);
+      if (!who) return { ok: false, error: "GitHub did not say which account was authorized, so the connector was not changed; reconnect again" };
+      return { ok: true, account: who.login, accountId: who.id, sealed: access, refresh, reconnect };
+    }
+    // Handed back sealed: the connection it becomes is the tenant's (cf/migrations/0012_connectors.sql), under the
+    // id the caller is about to create it with, which is how this mount finds the pair when it needs renewing.
+    const r = await this.attachSealedConnection(tenantId, agentId, plugin, access, refresh ? { ...refresh, connectorId } : null, grant);
+    if (!r.ok) return r;
+    // The id a later reconnect in place compares, since a login can be renamed. Not a reason to refuse this connect:
+    // a connector without one falls back to its login.
+    const who = await githubUser(grant.accessToken);
+    return { ...r, accountId: who?.id ?? null, sealed: access, refresh, reconnect: null };
   }
 
-  /** A connection's credential, sealed under this deployment's key, onto this agent's one mount of that plugin. */
-  async attachSealedConnection(tenantId: string, agentId: string, plugin: string, sealed: Sealed):
+  /**
+   * A connector this agent's mount is on was reconnected in place: put its new pair on the mount, which also clears
+   * the mount's own broken flag (the renewal record is written afresh). Only while the mount is still the connector's
+   * — its renewal record names the connector, or it holds the connector's previous token (`was`) — as
+   * `detachConnectionIfFrom` judges it: a key put on the mount since is not the connector's to replace.
+   */
+  async reconnectConnection(tenantId: string, agentId: string, plugin: string, connectorId: string, was: Sealed, sealed: Sealed,
+    refresh: ConnectorRefresh | null): Promise<{ ok: true; updated: boolean } | { ok: false; error: string }> {
+    await this.ready();
+    const kek = await this.#kek;
+    if (!kek) return { ok: false, error: "this deployment has no SECRET_KEK, so it cannot keep a credential" };
+    const mount = (await this.store.findMountsByPlugin(tenantId, agentId, plugin))[0];
+    if (!mount || !isAgentRef(mount.secretRef)) return { ok: true, updated: false };
+    const name = mount.secretRef!.slice(agentRef("").length);
+    const renewedFrom = (await this.#oauth.read(tenantId, agentId, name))?.connectorId === connectorId;
+    const held = await this.store.getSecret(tenantId, agentId, name);
+    if (!held || (!renewedFrom && await open(kek, held) !== await open(kek, was))) return { ok: true, updated: false };
+    const r = await this.attachSealedConnection(tenantId, agentId, plugin, sealed, refresh ? { ...refresh, connectorId } : null);
+    return r.ok ? { ok: true, updated: true } : r;
+  }
+
+  /**
+   * A connection's credential, sealed under this deployment's key, onto this agent's one mount of that plugin, with
+   * what renews it when it expires (`refresh`; null for a token that does not). A connector's token that is about to
+   * expire is renewed through the connector first: GitHub refuses an expired one at the attach's own check.
+   * `grant` is the pair in the clear, when the caller already opened it.
+   */
+  async attachSealedConnection(tenantId: string, agentId: string, plugin: string, sealed: Sealed,
+    refresh: (ConnectorRefresh & { connectorId: string | null }) | null = null, grant?: GithubGrant):
     Promise<{ ok: true; account: string | null } | { ok: false; error: string }> {
     await this.ready();
     const kek = await this.#kek;
@@ -1793,8 +1959,36 @@ export class AgentRuntime {
     // More than one and the choice would be arbitrary; say so rather than attach to one of them.
     if (mounts.length > 1) return { ok: false, error: `this agent has ${mounts.length} ${plugin} mounts (${mounts.map((m) => m.alias).join(", ")}); connect one in the console` };
     const mount = mounts[0]!;
-    const r = await this.attachCredential(tenantId, agentId, mount.alias, { token: await open(kek, sealed) });
-    return r.ok ? { ok: true, account: r.account } : { ok: false, error: r.error };
+    let token = grant?.accessToken ?? await open(kek, sealed);
+    let rec: Omit<MountGrant, "v"> | null = refresh ? {
+      refreshToken: grant?.refreshToken ?? await open(kek, refresh.sealed),
+      expiresAt: refresh.expiresAt, refreshExpiresAt: refresh.refreshExpiresAt, connectorId: refresh.connectorId,
+    } : null;
+    if (rec && rec.connectorId && rec.expiresAt !== null && rec.expiresAt - Date.now() < REFRESH_SKEW_MS) {
+      const r = await this.#oauth.connectorPair(tenantId, rec.connectorId);
+      if (!r.ok) return { ok: false, error: r.broken ? `${RECONNECT_REASON} (${r.reason})` : `the connection could not be renewed: ${r.reason}` };
+      token = r.accessToken;
+      rec = { ...rec, refreshToken: r.refreshToken, expiresAt: r.expiresAt, refreshExpiresAt: r.refreshExpiresAt };
+    }
+    const r = await this.attachCredential(tenantId, agentId, mount.alias, { token });
+    if (!r.ok) return { ok: false, error: r.error };
+    // After the attach, which clears it: the attach is what wrote the mount's secret this renews.
+    await this.#oauth.remember(tenantId, agentId, mount.alias, rec);
+    return { ok: true, account: r.account };
+  }
+
+  /**
+   * Take the pair another agent's renewal stored on a connector this agent's mount was pointed at: GitHub spent the
+   * access token this mount holds when it handed out the new one, and the sandbox's egress has no 401 to learn it
+   * from. False when the mount is not on that connector (any more).
+   */
+  async adoptConnection(tenantId: string, agentId: string, plugin: string, connectorId: string): Promise<boolean> {
+    await this.ready();
+    const mount = (await this.store.findMountsByPlugin(tenantId, agentId, plugin))[0];
+    if (!mount || !isAgentRef(mount.secretRef)) return false;
+    const name = mount.secretRef!.slice(agentRef("").length);
+    if ((await this.#oauth.read(tenantId, agentId, name))?.connectorId !== connectorId) return false;
+    return (await this.#oauth.renew(tenantId, agentId, name, "adopt", null)).ok;
   }
 
   /** Remove the credential from this agent's mount of that plugin; false when there was none. */
@@ -1809,13 +2003,17 @@ export class AgentRuntime {
    * since, in the console, is not the connector's to take when the connector goes. Compared by value,
    * because each attach seals afresh and the ciphertexts never match.
    */
-  async detachConnectionIfFrom(tenantId: string, agentId: string, plugin: string, sealed: Sealed): Promise<boolean> {
+  async detachConnectionIfFrom(tenantId: string, agentId: string, plugin: string, sealed: Sealed, connectorId: string | null = null): Promise<boolean> {
     await this.ready();
     const kek = await this.#kek;
     const mount = (await this.store.findMountsByPlugin(tenantId, agentId, plugin))[0];
     if (!kek || !mount || !isAgentRef(mount.secretRef)) return false;
-    const held = await this.store.getSecret(tenantId, agentId, mount.secretRef!.slice(agentRef("").length));
-    if (!held || await open(kek, held) !== await open(kek, sealed)) return false;
+    const name = mount.secretRef!.slice(agentRef("").length);
+    // A renewed connector's token differs from the copy a mount took before the renewal reached it, so the mount
+    // is also the connector's while what renews it names that connector: a key put there since cleared that.
+    const renewedFrom = connectorId !== null && (await this.#oauth.read(tenantId, agentId, name))?.connectorId === connectorId;
+    const held = await this.store.getSecret(tenantId, agentId, name);
+    if (!held || (!renewedFrom && await open(kek, held) !== await open(kek, sealed))) return false;
     return this.removeCredential(tenantId, agentId, mount.alias);
   }
 
@@ -1842,6 +2040,7 @@ export class AgentRuntime {
     const held = await this.#releaseBeforeCredentialChange(tenantId, agentId, alias);
     if (held) return { ok: false, error: held };
     await this.store.removeSecret(tenantId, agentId, alias);
+    await this.#oauth.forget(tenantId, agentId, alias);
     await this.store.setMountSecretRef(tenantId, agentId, alias, AgentRuntime.seededSecretRef(mount));
     await this.#toolsAfterCredentialChange(tenantId, agentId, alias);
     return { ok: true };
@@ -1978,6 +2177,8 @@ export class AgentRuntime {
     const r = await this.store.renameMount(tenantId, agentId, from, to, own ? { newRef: agentRef(to) } : null);
     // The last snapshot error is keyed by the alias too, and is about the same mount under its new name.
     if (r.ok) this.#snapshotErrors()?.exec("UPDATE mount_snapshot_errors SET alias = ? WHERE alias = ?", to, from);
+    // What renews the key is named after it, and the key moved.
+    if (r.ok && own) await this.#oauth.move(tenantId, agentId, from, to);
     return r;
   }
 
@@ -2062,6 +2263,20 @@ export class AgentRuntime {
   ) {
     const readBack = reader?.name ?? null;
     const withheld = new Set(this.#deps.withholdTools ?? []);
+    const subagent = isSubagentSession(ctx.taskId);
+    // Whether a subagent may make this call (`childMayCall`: reads, and a `self` plugin's writes), decided on what the
+    // gateway resolves the name to — `alias.tool` or `plugin.tool` alike (`ToolGateway.resolve`) — never on the string.
+    // Asked of the catalogue as it is at the call, so a mount added since the harness was built counts; a tool the
+    // catalogue does not list declares no side effect, and is refused. A name that resolves to no mount is the
+    // gateway's to refuse. Answers the address refused, or null.
+    const speaks = async (raw: string): Promise<string | null> => {
+      const r = await gw.resolve(ctx, raw);
+      if (!("mount" in r) || !r.mount) return null;
+      const plugin = this.#plugins.find((p) => p.id === r.mount!.plugin);
+      const address = `${r.mount.alias}.${r.tool}`;
+      const declared = (await this.#catalogueFor(ctx.tenantId, ctx.agentId)).tools.find((t) => t.address === address);
+      return childMayCall(declared, plugin?.actsAs) ? null : address;
+    };
     const ended = this.#deps.ended;
     const gw = this.#gateway;
     const store = this.store;
@@ -2173,12 +2388,17 @@ export class AgentRuntime {
       async invoke(call: { tool: string; args: any; opts?: any; callId?: string }): Promise<ToolResult> {
         const refused = refuseWithheld(call.tool, withheld);
         if (refused) return refused;
+        // A subagent's session is never offered a tool that acts as the agent; a program of its could still name one.
+        const speaking = subagent ? await speaks(call.tool) : null;
+        if (speaking) return childRefusal(speaking);
         if (ended?.({ tenantId: ctx.tenantId, agentId: ctx.agentId })) return taskEndedRefusal(call.tool);
         return held(call.tool, await dispatch(call));
       },
       /** The model's answer to a tool's question (pi-tools.ts `resume`), finished as a call's result is. */
       async resumeInterrupt(i: ToolInterrupt, answer: Json, callId: string): Promise<ToolResult> {
         const call = { tool: `${i.alias}.${i.tool}`, args: null, callId };
+        const speaking = subagent ? await speaks(call.tool) : null;
+        if (speaking) return childRefusal(speaking);
         if (ended?.({ tenantId: ctx.tenantId, agentId: ctx.agentId })) return taskEndedRefusal(call.tool);
         return held(call.tool, await dispatch(call, () => gw.resumeInterrupt(inTurn(), i, answer, { callId })));
       },
@@ -2640,7 +2860,7 @@ export class AgentRuntime {
 
   /**
    * Re-take, at the start of a turn, every tool list taken under a basis that is not its plugin's now
-   * (`Plugin.toolsBasis`, `ToolSnapshot.basis`). A snapshot is otherwise taken only when a mount is added, its
+   * (`Plugin.toolsBasis`, `ToolSnapshot.basis`), and every list its plugin says is due again (`Plugin.toolsDue`). A snapshot is otherwise taken only when a mount is added, its
    * credential changes or an operator refreshes it, so a deploy that adds a tool would never reach a mount whose list
    * already existed: the model was not offered the tool, and a plugin that hinted at it named a tool the mount lacked.
    *
@@ -2674,14 +2894,14 @@ export class AgentRuntime {
 
   async #retakeStale(tenantId: string, agentId: string): Promise<void> {
     const byId = new Map(this.#plugins.map((p) => [p.id, p]));
-    const stale = (await this.store.listMounts(tenantId, agentId)).filter((m) => snapshotStale(m, byId.get(m.plugin)));
+    const now = Date.now();
+    const stale = (await this.store.listMounts(tenantId, agentId)).filter((m) => snapshotStale(m, byId.get(m.plugin), now));
     if (!stale.length) return;
     const choices = await this.store.pluginChoices(tenantId, agentId);
-    const now = Date.now();
     const due = stale.filter((m) => {
       if (!pluginEnabled(SEEDED_PLUGINS.has(m.plugin), choices[m.plugin])) return false;
       const failed = this.#retakeFailed.get(`${tenantId}/${agentId}/${m.alias}`);
-      return !failed || failed.basis !== byId.get(m.plugin)!.toolsBasis || now - failed.at >= RETAKE_BACKOFF_MS;
+      return !failed || failed.basis !== (byId.get(m.plugin)!.toolsBasis ?? "") || now - failed.at >= RETAKE_BACKOFF_MS;
     });
     if (!due.length) return;
     // The gateway refuses to list for a mount whose pin is not the registry's, and the build that moved the basis
@@ -2689,7 +2909,8 @@ export class AgentRuntime {
     if (due.some((m) => this.pluginVersion(m.plugin) !== m.toolVersion)) await this.repinMounts(tenantId, agentId);
     for (const m of due) {
       const key = `${tenantId}/${agentId}/${m.alias}`;
-      const basis = byId.get(m.plugin)!.toolsBasis!;
+      // A plugin due by `toolsDue` alone may declare no basis; its back-off is then keyed on the empty one.
+      const basis = byId.get(m.plugin)!.toolsBasis ?? "";
       let timer: ReturnType<typeof setTimeout> | undefined;
       const timedOut = new Promise<"timeout">((resolve) => { timer = setTimeout(() => resolve("timeout"), RETAKE_TIMEOUT_MS); });
       let r: Awaited<ReturnType<AgentRuntime["refreshMountTools"]>> | "timeout";
@@ -2885,6 +3106,8 @@ export class AgentRuntime {
     if (!(await this.store.removeMount(tenantId, agentId, alias, shared ? null : alias, mount.installationId))) {
       return refuse(changedWhileRemoving(alias));
     }
+    // What renewed the row just deleted goes with it.
+    if (!shared) await this.#oauth.forget(tenantId, agentId, alias);
     this.#unchecked.delete(`${tenantId}/${agentId}/${alias}`);
     const warned = sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='held_warnings'").toArray().length > 0;
     if (warned) sql.exec("DELETE FROM held_warnings WHERE alias = ?", alias);
@@ -2994,8 +3217,18 @@ export class AgentRuntime {
 
   /** The key a cached harness is checked against (`harnessKey`): its catalogue, its persona and its model binding, as stored now. */
   async #harnessKeyFor(tenantId: string, agentId: string): Promise<string> {
-    return harnessKey(await this.#catalogueKeyFor(tenantId, agentId),
-      personaOf((await this.store.loadAgent(tenantId, agentId))?.config), await this.store.getModelBinding(tenantId, agentId));
+    const config = (await this.store.loadAgent(tenantId, agentId))?.config;
+    const key = harnessKey(await this.#catalogueKeyFor(tenantId, agentId), personaOf(config), await this.store.getModelBinding(tenantId, agentId));
+    // The agent's settings decide a tool (`send_to_agent`), so a harness built before one moved offers the wrong list.
+    // Appended only when one is on, so an agent with none keeps the key it had.
+    const settings = this.#settingsNow(tenantId, config);
+    return Object.values(settings).some(Boolean) ? `${key}|${JSON.stringify(settings)}` : key;
+  }
+
+  /** The catalogue's tools a subagent may not call (`childWithheld`, src/runtime/subagents.ts), by address. */
+  #childWithheldIn(c: { records: Array<{ alias: string; plugin: string }>; tools: Array<{ address: string; sideEffects?: "read" | "write" }> }): Set<string> {
+    const pluginOf = new Map(c.records.map((m) => [m.alias, m.plugin]));
+    return childWithheld(c.tools, (alias) => this.#plugins.find((p) => p.id === pluginOf.get(alias))?.actsAs);
   }
 
   async #catalogueFor(tenantId: string, agentId: string) {
@@ -3024,7 +3257,12 @@ export class AgentRuntime {
   async #turnTools(
     tenantId: string, agentId: string, session: string, engine: "pi085" | "pd" | null, agentRef: { current: PiAgent | null },
   ) {
-    const { tools, records, unoffered } = await this.#catalogueFor(tenantId, agentId);
+    const catalogue = await this.#catalogueFor(tenantId, agentId);
+    const { records, unoffered } = catalogue;
+    // A subagent is read-only: it is offered only what it may call (`childWithheld`); its dispatch refuses the rest as well (`#host`).
+    const tools = isSubagentSession(session)
+      ? (() => { const withheld = this.#childWithheldIn(catalogue); return catalogue.tools.filter((t) => !withheld.has(t.address)); })()
+      : catalogue.tools;
     const sandbox = this.#deps.sandbox ?? true;
     const store = this.store;
     // The call context's task is the conversation, so held calls and audit
@@ -3082,13 +3320,18 @@ export class AgentRuntime {
         (id) => !!backgroundOf(this.#plugins.find((pl) => pl.id === id) ?? {}),
       ),
     });
+    // `send_to_agent` is not taken from the caller: an Agents API caller that declares a function by that name keeps it,
+    // and the agent is then not offered ours (below). The caller's API is theirs; delegation is a feature on top of it.
     const taken = new Set([...offered.map((t) => t.name), "run_js", "resume", "jobs"]);
-    const callerDefs = Array.isArray(apiTools)
+    // A subagent's session (src/runtime/subagents.ts) is offered neither the caller's functions, which only the caller's
+    // own session can answer, nor `send_to_agent`: delegation is one level deep.
+    const child = isSubagentSession(session);
+    const callerDefs = !child && Array.isArray(apiTools)
       ? apiTools.filter((t: any) => typeof t?.name === "string" && !taken.has(t.name)).map((t: any) => ({
           name: String(t.name), description: String(t.description ?? ""), parameters: t.parameters ?? { type: "object", properties: {} },
         }))
       : [];
-    const callerTools = Array.isArray(apiTools) && engine !== "pd"
+    const callerTools = !child && Array.isArray(apiTools) && engine !== "pd"
       ? clientTools(callerDefs,
           { sql: this.#deps.ctx.storage.sql, session, lane: () => agentRef.current!.lane,
             branch: (tip) => agentRef.current!.storage.scanBranch({ start: tip, order: "oldestFirst" }, BACKGROUND_CONTEXT) as any })
@@ -3128,7 +3371,16 @@ export class AgentRuntime {
             scope: session,
           })
         : asks ? [resumeTool(this.#continuations, { ...counting, scope: session })] : []),
-      ...(extras.jobs ? [jobs] : []),
+      // Not a child's: `jobs` cancels the agent's background work, and a subagent starts none (it cannot write).
+      ...(extras.jobs && !child ? [jobs] : []),
+      // Only where the agent's setting is on, never in a child (above), and not where the caller's own function has the
+      // name (`callerShadows`). Its body is this object's (`#sendToAgent`).
+      ...(!child && this.#settingsNow(tenantId, agentConfig).subagents && !callerShadows(tenantId, agentId, session, callerDefs)
+        ? [subagentTool({
+            models: (this.#deps.userModels?.offered ?? []).map((o) => ({ id: o.id, label: o.label })),
+            send: (p, callId, invocation) => this.#sendToAgent(tenantId, agentId, session, p, callId, invocation),
+          })]
+        : []),
       ...callerTools,
     ];
     return { tools, records, unoffered, reader, offered, activityOf, nameOf, host, extras, callerDefs, keeping, extraTools };
@@ -3479,7 +3731,8 @@ export class AgentRuntime {
         const key = spillKey(tenantId, agentId, attempt, f.sha256);
         if (!uploaded.includes(key)) uploaded.push(key);
         const ref = (await this.#artifacts.put(key, json)).ref;
-        rows.push({ path: f.path, value: null, ref, bytes: json.length });
+        rows.push({ path: f.path, value: null, ref, bytes: json.length,
+          ...(f.path === SEEDED_MEMORY ? { excerpt: memoryExcerpt(f.text, IMPORTED_MEMORY_BUDGET) } : {}) });
       }
       const files = imp.files.map((f) => ({ path: f.path, bytes: f.bytes, sha256: f.sha256 }));
       const r = this.#transact()(() => {
@@ -3704,6 +3957,8 @@ export class AgentRuntime {
     const busy = busyReason(sql);
     const reasons: string[] = [];
     if (this.#continuations.size > 0) reasons.push(`${this.#continuations.size} program(s) are held for resume`);
+    const children = runningSubagentCount(sql);
+    if (children > 0) reasons.push(`${children} subagent(s) are running`);
     // Each of these lands in the main conversation when it arrives: a push queued or being handed over
     // (`deliverPendingInbound`), an Agents API caller's answer to a function call its turn waits on.
     if (hasPendingInbound(sql)) reasons.push("a push is queued for the agent");
@@ -3812,7 +4067,7 @@ export class AgentRuntime {
       const p = byId.get(m.plugin);
       const snap = m.toolSnapshot;
       const failed = this.#retakeFailed.get(`${tenantId}/${agentId}/${m.alias}`);
-      const backedOff = !!failed && failed.basis === p?.toolsBasis && now - failed.at < RETAKE_BACKOFF_MS;
+      const backedOff = !!failed && failed.basis === (p?.toolsBasis ?? "") && now - failed.at < RETAKE_BACKOFF_MS;
       const offeredHere = tools.filter((x) => x.alias === m.alias).map((x) => x.name);
       return {
         alias: m.alias, plugin: m.plugin, toolVersion: m.toolVersion,
@@ -3827,7 +4082,7 @@ export class AgentRuntime {
           tools: snap.tools.map((x) => x.name), skipped: snap.skipped.map((x) => ({ ...x })),
         } : null,
         basis: p?.toolsBasis ?? null,
-        retake: enabled.has(m.alias) && snapshotStale(m, p) ? (backedOff ? "backed_off" : "due") : null,
+        retake: enabled.has(m.alias) && snapshotStale(m, p, now) ? (backedOff ? "backed_off" : "due") : null,
         snapshotError: this.snapshotError(m.alias, { readOnly: true }),
       };
     });
@@ -3865,6 +4120,14 @@ export class AgentRuntime {
       retake?: "await" | "background"; beforeSay?: () => void; pendingOnly?: true;
       /** When the object took the message in, for the turn's timing (src/runtime/turn-timing.ts); now when absent. */
       receivedAt?: number;
+      /** The message's own id, where the engine keeps one (`AgentEngine.say`): what a post that must land once is checked by. */
+      requestId?: string;
+      /**
+       * Asked at the last synchronous point before the engine's write, after every await: true writes nothing, gives
+       * back what was taken for the message, and answers `skipped`. For a post that may stop being wanted while it
+       * waits (a subagent's report, when the agent is stopped meanwhile).
+       */
+      unless?: () => boolean;
     } = {},
   ) {
     const inboundAt = opts.receivedAt ?? Date.now();
@@ -3980,10 +4243,15 @@ export class AgentRuntime {
     }
     // Synchronously before the engine's write, with the harness already open: what a caller retires here
     // (`deliverPendingInbound`'s queued row) is gone exactly when the message is about to be written.
+    if (opts.unless?.()) {
+      if (timing && timed) timingSafe("taking back", () => turnNotSaid(timing, session, opened));
+      await giveAllBack();
+      return { mode, queued: false, result: null, skipped: true as const };
+    }
     opts.beforeSay?.();
     let res: any;
     try {
-      res = await agent.say(lines.length ? `${lines.join("\n")}\n\n${body}` : body, mode);
+      res = await agent.say(lines.length ? `${lines.join("\n")}\n\n${body}` : body, mode, opts.requestId ? { requestId: opts.requestId } : undefined);
     } catch (e) {
       // A post that throws wrote nothing (the rule `deliverPendingInbound` retries by), so the notices were not said.
       if (timing && timed) timingSafe("taking back", () => turnNotSaid(timing, session, opened));
@@ -4063,6 +4331,33 @@ export class AgentRuntime {
    * was cancelled. A background job whose stop cannot be confirmed stays
    * tracked, and the ceiling asks again. Nothing running is not an error.
    */
+  /**
+   * `cancelSession` for a conversation and the subagents it started (an Agents API session's cancel, or its delete with
+   * `drop`): each child marked stopped and its owed report dropped first, as `stopTurn` does for the agent, then each
+   * child's session cancelled, then the conversation's own turn — unless `drop` alone was asked, for a delete, which
+   * leaves the conversation's turn to the caller.
+   */
+  async cancelSessionTree(tenantId: string, agentId: string, session: string, o: { childrenOnly?: boolean } = {}) {
+    await this.ready();
+    const sql = this.#deps.ctx.storage.sql;
+    if (!this.#isPd()) ensureAgentTables(sql);
+    const r = this.#stopSubagents(tenantId, agentId, session);
+    // Only the children this stop ended and those with work, as `stopTurn` does: a cancel opens the child's harness,
+    // and a session's finished children are many and idle. If pd's tasks cannot be read, every child of the session.
+    const ids = new Set(r.ids);
+    let live: string[];
+    try { live = this.#isPd() ? this.#pdSubagentSessions({ live: true, strict: true }) : sessionsWithWork(sql); }
+    catch (e) { console.error(`reading ${tenantId}/${agentId}'s live subagent conversations failed; cancelling every child of ${session}:`, e); live = r.ids; }
+    const children = [...new Set([...r.stopped, ...live.filter((x) => ids.has(x))])];
+    for (const child of children) {
+      try { await this.cancelSession(tenantId, agentId, child); }
+      catch (e) { console.error(`cancelling ${tenantId}/${agentId}'s subagent ${child} of ${session} failed:`, e); }
+      if (!this.#isPd()) markSession(sql, child, false);
+    }
+    const own = o.childrenOnly ? null : await this.cancelSession(tenantId, agentId, session);
+    return { ...(own ?? { cancelledTurn: null as string | null, stoppedJobs: [] as string[], stillRunning: [] as string[] }), stoppedSubagents: r.stopped };
+  }
+
   async cancelSession(tenantId: string, agentId: string, session: string = MAIN_SESSION) {
     const agent = await this.agent(tenantId, agentId, session);
     const cancelledTurn = await agent.cancel(TURN_CANCELLED);
@@ -4119,7 +4414,24 @@ export class AgentRuntime {
       }
       const pd = this.#isPd();
       if (!pd) ensureAgentTables(sql);
-      const sessions = pd ? [MAIN_SESSION] : [...new Set([MAIN_SESSION, ...sessionsWithWork(sql)])];
+      // Every running subagent is marked stopped, and every owed report dropped, before any turn is cancelled, so no
+      // pass reads a cancelled child's end as a report: it would wake the parent this stop is ending
+      // (src/runtime/subagents.ts). Then every child session is cancelled, whatever its row says — a task posted while
+      // this stop was landing can have started a run on a row already marked stopped. On pd they are conversations
+      // the main one's cancel does not reach (ownerless); on pi085 every session with work is cancelled anyway.
+      const children = this.#stopSubagents(tenantId, agentId);
+      // pd: the children this stop ended, and every child conversation pi-durable says has a live task — not every one
+      // the agent ever had, each of which a cancel would open. Only if pi-durable's tasks cannot be read, all of them.
+      let pdChildren: string[] = [];
+      if (pd) {
+        try { pdChildren = [...children.stopped, ...this.#pdSubagentSessions({ live: true, strict: true })]; }
+        catch (e) {
+          console.error(`reading ${tenantId}/${agentId}'s live subagent conversations failed; cancelling every one:`, e);
+          pdChildren = [...children.ids, ...this.#pdSubagentSessions()];
+        }
+      }
+      const sessions = pd ? [MAIN_SESSION, ...new Set(pdChildren)]
+        : [...new Set([MAIN_SESSION, ...sessionsWithWork(sql)])];
       let cancelled: string | null = null;
       for (const session of sessions) {
         const r = await this.cancelSession(tenantId, agentId, session);
@@ -4183,6 +4495,674 @@ export class AgentRuntime {
   }
 
   /**
+   * `send_to_agent`'s body (src/runtime/subagents.ts): start a subagent of `parentSession`, or send one of its subagents a
+   * follow-up, and answer at once. A refusal throws, which the model reads as the tool's error.
+   *
+   * Replay-safe, as the tool declares: the child's id and the turn's key come from the call (`turnKeyOf`: the session,
+   * the run it was made in, the call id), so a send that runs again after an interruption finds the child and the turn
+   * the first run wrote, and the task is posted once (`#postOnce`). The row is written before the task is posted,
+   * running, so the cap counts it from the start and a stop that lands meanwhile already covers it.
+   */
+  async #sendToAgent(
+    tenantId: string, agentId: string, parentSession: string, p: { task: string; agent: string | null; model: string | null },
+    callId: string, run: string,
+  ) {
+    const sql = this.#deps.ctx.storage.sql;
+    const owner = { tenantId, agentId };
+    const now = Date.now();
+    await this.#deps.subagentFault?.("send-start", parentSession);
+    const turnKey = turnKeyOf(parentSession, run, callId);
+    let model: { option: string; provider: string; model: string } | null = null;
+    if (p.model !== null) {
+      // The same rules as the agent's own model (`resolveModel`): an administrator's pin, the server's picker switch.
+      const r = await this.#subagentModel(tenantId, agentId, p.model);
+      if (!r.ok) throw new Error(`${SUBAGENT_TOOL}: ${r.error}. Nothing was started.`);
+      model = { option: p.model, ...r.choice };
+    }
+    let id: string;
+    let existing: Subagent | null;
+    if (p.agent === null) {
+      id = await subagentIdFor(turnKey);
+      existing = subagentOf(sql, owner, id);
+    } else {
+      existing = subagentOf(sql, owner, p.agent);
+      if (!existing || existing.parentSession !== parentSession) {
+        throw new Error(`${SUBAGENT_TOOL}: no subagent ${JSON.stringify(p.agent.slice(0, 64))} was started from this conversation; leave agent out to start a new one`);
+      }
+      id = existing.id;
+    }
+    const replay = existing !== null && existing.turnKey === turnKey;
+    // Asked at the call, not only when the tool was offered: a kill switch set while this turn runs (the agent's setting,
+    // or SUBAGENTS_DISABLED) stops it starting any child, or sending one a follow-up, from here on. After the replay is
+    // known: a call that already started its child (a crash, then the switch, then the call ran again) answers what it
+    // did, and the switch's sweep has stopped that child and owes the parent its notice.
+    if (!replay && !(await this.#subagentsOn(tenantId, agentId))) {
+      throw new Error(`${SUBAGENT_TOOL}: subagents are switched off for this agent, so nothing was started. Do the reading yourself.`);
+    }
+    if (!replay) {
+      if (existing?.state === "archived") {
+        throw new Error(`${SUBAGENT_TOOL}: ${existing.id} finished long ago and its transcript is gone; start a new subagent with the whole task.`);
+      }
+      if (existing && existing.state !== "idle") {
+        throw new Error(`${SUBAGENT_TOOL}: ${existing.id} is still working on its last task. Its report arrives as a message; send the follow-up after that.`);
+      }
+      const spent = existing ? subagentSpent(existing, now) : null;
+      if (spent) throw new Error(`${SUBAGENT_TOOL}: ${existing!.id} takes no more tasks: ${spent}.`);
+      const admit = admitSubagent(runningSubagents(sql, owner), SUBAGENT_CAP, now);
+      if (!admit.ok) throw new Error(admit.message);
+      if (existing) startSubagentTurn(sql, owner, id, { callId, turnOp: null, now, model, turnKey });
+      else recordSubagent(sql, owner, { id, parentSession, callId, modelOption: model?.option ?? null, provider: model?.provider ?? null, model: model?.model ?? null, turnOp: null, turnKey, now });
+    }
+    const s = subagentOf(sql, owner, id)!;
+    const followUp = s.turns > 1;
+    if (s.state === "running" && s.turnOp === null) {
+      let op: string | null;
+      try {
+        await this.#deps.subagentFault?.("task-posting", id);
+        op = (await this.#postOnce(tenantId, agentId, id, taskMessage(id, p.task, followUp, taskKey(id, s.turns)), taskKey(id, s.turns))).op;
+      } catch (e) {
+        finishSubagentTurn(sql, owner, id, "failed", Date.now());
+        throw new Error(`${SUBAGENT_TOOL}: the subagent could not be given its task: ${String((e as Error)?.message ?? e).slice(0, 300)}`);
+      }
+      // A stop can land while the task is being posted: it marks the row stopped and cancels the child's session, which
+      // has nothing to cancel yet; the task then lands and starts a run nothing tracks. So the row is read again, and a
+      // turn that is no longer this one running is cancelled here, before anything records it.
+      const after = subagentOf(sql, owner, id);
+      if (!after || after.state !== "running" || after.turnKey !== turnKey) {
+        await this.cancelSession(tenantId, agentId, id).catch((e) => console.error(`cancelling ${tenantId}/${agentId}'s stopped subagent ${id} failed:`, e));
+        if (!this.#isPd()) markSession(sql, id, false);
+        throw new Error(`${SUBAGENT_TOOL}: the agent was stopped while ${id} was being started, so it was stopped too.`);
+      }
+      // The engine's id for the turn, which its end is read by (`#subagentTurnEnd`): pi085's operation, pd's submission.
+      setSubagentTurnOp(sql, owner, id, op);
+      if (!this.#isPd()) markSession(sql, id, true);
+      logEvent("subagent.start", { tenantId, agentId, subagent: id, parentSession, callId, followUp, model: s.modelOption });
+      try { appendTrace(sql, [subagentStartRow(owner, s, followUp ? "follow_up" : "spawn", callId, Date.now())]); }
+      catch (e) { console.error(`the subagent.start row of ${tenantId}/${agentId} could not be written:`, e); }
+    }
+    await this.#deps.subagentFault?.("task-posted", id);
+    return subagentStarted({ id, followUp, model: s.modelOption });
+  }
+
+  /**
+   * Post `text` to `session` unless a message carrying `key` is already there, and answer the engine's id for the run
+   * it is part of. What makes a retried post — a report after a crash, a replayed spawn — land once: the check reads
+   * the conversation itself (`#postedOp`), which the post writes, so there is no second record to fall out of step.
+   */
+  async #postOnce(
+    tenantId: string, agentId: string, session: string, text: string, key: string, via: "say" | "postMessage" = "say",
+    unless?: () => boolean, requestId: string = key,
+  ): Promise<{ op: string | null; skipped: boolean; started: boolean }> {
+    const posted = this.#postedOp(session, key);
+    if (posted) return { op: posted.op, skipped: false, started: false };
+    // A report goes the way a background completion does (`postMessage`): the import hold, the overflow backstop's
+    // refusal, a rebuild's pending briefing, the notices. A child's task is said to its own session directly: those are
+    // the agent's conversation's, and a notice taken by a child would never reach the agent.
+    let res: any;
+    if (via === "postMessage") {
+      const out = await this.postMessage(tenantId, agentId, text, "prompt", session, { requestId, ...(unless ? { unless } : {}) });
+      if ((out as { skipped?: true }).skipped) return { op: null, skipped: true, started: false };
+      res = out.result;
+    } else {
+      res = await (await this.agent(tenantId, agentId, session)).say(text, "prompt", { requestId });
+    }
+    if (res?.ok === false) throw new Error(res.error?.message ?? res.error?._tag ?? "the message was refused");
+    const op = res?.value?.operationId ?? res?.value?.submissionId ?? null;
+    // `started`: the post began a run of its own (both engines answer that with an operation id); one that joined a run
+    // under way, or was queued behind it, did not.
+    return { op: op === null ? null : String(op), skipped: false, started: res?.value?.operationId !== undefined && res?.value?.operationId !== null };
+  }
+
+  /**
+   * Whether a message carrying `key` reached `session`, read with SELECTs; with the run it belongs to when that is
+   * known. pd: a submission of the session's conversation under that request id (`DurableAgent.say` submits under the
+   * caller's id). pi085: an entry of the session's transcript holding the key, or the lane's own state holding it as
+   * input queued for the run in flight; its run is the lane's current one, else the newest that ended.
+   */
+  #postedOp(session: string, key: string): { op: string | null } | null {
+    const sql = this.#deps.ctx.storage.sql;
+    const has = (name: string) => sql.exec("SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = ?", name).toArray().length > 0;
+    if (this.#isPd()) {
+      const conversation = pdConversationId(sql as never, session);
+      if (conversation === null || !has("pd_submissions")) return null;
+      // pi-durable keeps the request id as JSON (`"report sub_…/1"`, quotes included): compared as it is stored.
+      // The submission names every key it carries in its request id (`combinedRequestId`), queued or placed alike, so
+      // the lookup is the submission row pi-durable writes in the same commit as the message, never the message's text.
+      const row = sql.exec("SELECT id FROM pd_submissions WHERE conversation_id = ? AND (request_id = ? OR instr(request_id, ?) > 0) ORDER BY id LIMIT 1",
+        conversation, JSON.stringify(key), `<${key}>`).toArray()[0] as { id?: unknown } | undefined;
+      return row ? { op: String(row.id) } : null;
+    }
+    const t = piTables(session);
+    if (!has(t.entries)) return null;
+    const found = sql.exec(`SELECT 1 AS x FROM ${t.entries} WHERE instr(body, ?) > 0 LIMIT 1`, key).toArray().length > 0
+      || sql.exec(`SELECT 1 AS x FROM ${t.values} WHERE instr(body, ?) > 0 LIMIT 1`, key).toArray().length > 0
+      || sql.exec(`SELECT 1 AS x FROM ${t.list} WHERE instr(body, ?) > 0 LIMIT 1`, key).toArray().length > 0;
+    if (!found) return null;
+    const state = sql.exec(`SELECT body FROM ${t.values} WHERE namespace = 'pi.lane.state' AND key = 'main'`).toArray()[0] as { body?: unknown } | undefined;
+    const current = state ? (JSON.parse(String(state.body)) as { currentOperationId?: unknown }).currentOperationId : undefined;
+    if (typeof current === "string") return { op: current };
+    const last = sql.exec(`SELECT key FROM ${t.values} WHERE namespace = 'pi.result' ORDER BY seq DESC LIMIT 1`).toArray()[0] as { key?: unknown } | undefined;
+    return { op: last ? String(last.key) : null };
+  }
+
+  /**
+   * Every running subagent whose turn has ended gets its report decided, and every report owed is posted to the session
+   * that started the child; how many were posted. The end is read from what the engine committed when the run ended
+   * (`#subagentTurnEnd`), so it is found by whichever pass comes first after it, an eviction or a restart between them
+   * included. A turn past its ceiling is cancelled here and reported as cancelled.
+   *
+   * Exactly once, across a crash at any point: the report is decided and kept on the row (`reporting`) in one write,
+   * posted only if the parent's conversation does not already hold it (`#postOnce`), and the row marked idle after the
+   * post. A crash before the post leaves it owed, and the next pass posts it; one after the post leaves it owed and
+   * already there, and the next pass finds it and only marks it.
+   *
+   * Called once a pass, after its step loop (`step`) and the stray sweep, never from inside the loop: a child whose
+   * turn a step in this pass ended is reported in this same pass, rather than one pass later, and the reports of every
+   * child that ended in the pass go to their parent as one message. The kill switch's sweep runs before the loop
+   * (`#switchOffSubagents`), so the children it stopped are reported here too.
+   */
+  async #reportSubagents(tenantId: string, agentId: string): Promise<number> {
+    const sql = this.#deps.ctx.storage.sql;
+    const owner = { tenantId, agentId };
+    for (const s of runningSubagents(sql, owner)) {
+      const now = Date.now();
+      let end: TurnEnd | null;
+      if (overdueSubagent(s, now)) {
+        // A cancel that fails leaves the run going; the row is ended and reported all the same, and the next pass's
+        // sweep (`#cancelStraySubagents`) cancels the run again, since its row no longer says it runs.
+        try {
+          await this.#deps.subagentFault?.("ceiling-cancel", s.id);
+          await this.cancelSession(tenantId, agentId, s.id);
+        } catch (e) { console.error(`cancelling ${tenantId}/${agentId}'s subagent ${s.id} at its ceiling failed; the next pass tries again:`, e); }
+        if (!this.#isPd()) markSession(sql, s.id, false);
+        end = { outcome: "cancelled", text: `it ran longer than ${Math.round(SUBAGENT_MAX_MS / 60_000)} minutes`, cause: "ceiling" };
+      } else {
+        try { end = this.#subagentTurnEnd(s, owner); }
+        catch (e) { console.error(`reading the end of ${tenantId}/${agentId}'s subagent ${s.id} failed:`, e); continue; }
+      }
+      if (!end || !finishSubagentTurn(sql, owner, s.id, end.outcome, now, reportMessage(s, end, now))) continue;
+      // Its turn is over: the harness built for it is not kept in this isolate (a follow-up builds another).
+      this.#evictAgent(tenantId, agentId, s.id);
+      try {
+        // The report body's length, not its text, and not the head the harness wraps it in: what a reader may count
+        // without reading what the child said. A cancel says why (`TurnEnd.cause`), which Raft's outcome is read from.
+        appendTrace(sql, [subagentTurnRow(owner, s, end.outcome, now, { reportChars: reportBodyChars(end), ...(end.cause ? { cause: end.cause } : {}) })]);
+      } catch (e) { console.error(`the subagent.turn row of ${tenantId}/${agentId} could not be written:`, e); }
+    }
+    // Every report owed to one conversation in this pass goes as one message, so the parent runs once for all of them;
+    // each keeps its own block and key (`reportKey`), which is what "already posted" is read by. Reports that arrive
+    // while the parent runs join that run (a steer), so they too are answered in one turn.
+    let reported = 0;
+    const groups = new Map<string, Subagent[]>();
+    for (const s of reportingSubagents(sql, owner)) {
+      await this.#deps.subagentFault?.("report-decided", s.id);
+      // A task that is over takes no report, as it takes no background completion (`step`).
+      if (this.#deps.ended?.(owner) === true) { markReported(sql, owner, s.id); continue; }
+      groups.set(s.parentSession, [...(groups.get(s.parentSession) ?? []), s]);
+    }
+    for (const [parent, owed] of groups) {
+      // Read again at the post: a stop since the list was read dropped them (`stopRunningSubagents`).
+      const stillOwed = () => owed.every((s) => subagentOf(sql, owner, s.id)?.state === "reporting");
+      if (!stillOwed()) continue;
+      // One already in the conversation (a pass that crashed after its post) is not posted again, only marked.
+      const fresh = owed.filter((s) => !this.#postedOp(parent, reportKey(s)));
+      try {
+        if (fresh.length) {
+          for (const s of fresh) await this.#deps.subagentFault?.("report-posting", s.id);
+          // Children a kill switch stopped (`switchOffSubagents`, the only rows owing a report with outcome `stopped`)
+          // share one notice; every other report keeps its own block.
+          const off = fresh.filter((s) => s.outcome === "stopped");
+          const blocks = [...fresh.filter((s) => s.outcome !== "stopped").map((s) => s.report ?? ""), ...(off.length ? [switchedOffNotice(off)] : [])];
+          const text = blocks.length === 1 ? blocks[0]!
+            : `[${blocks.length} subagent reports, each below with its own head; notices from the harness, not messages from the user.]\n\n` +
+              blocks.join("\n\n---\n\n");
+          // Checked again at the last synchronous point before the write (`postMessage`'s `unless`): the post awaits the
+          // catalogue and the tool lists first, and a stop, or a stop and the person's next message, can land meanwhile.
+          const posted = await this.#postOnce(tenantId, agentId, parent, text, reportKey(fresh[0]!), "postMessage", () => !stillOwed(),
+            combinedRequestId(fresh.map((s) => reportKey(s))));
+          if (posted.skipped) continue;
+          for (const s of fresh) await this.#deps.subagentFault?.("report-written", s.id);
+          // A stop that landed inside the write itself, after that check: the reports are in, and the run they started —
+          // only that run, never the conversation, which the person may have spoken to since — is cancelled.
+          if (!stillOwed()) {
+            await this.#cancelOwnRun(tenantId, agentId, parent, posted.op)
+              .catch((e) => console.error(`cancelling the run ${tenantId}/${agentId}'s report started after a stop failed:`, e));
+            continue;
+          }
+          if (posted.started) this.#reportInbound(tenantId, agentId, "subagent_report");
+        }
+      } catch (e) {
+        if (e instanceof SessionNeedsReset) {
+          // Dropped, as a background completion is (`refusedForReset`): the conversation takes nothing until it is reset.
+          refusedForReset(e, tenantId, agentId, "subagent report");
+          for (const s of owed) markReported(sql, owner, s.id);
+          continue;
+        }
+        // Owed still, and tried again later, until `REPORT_MAX_ATTEMPTS`, when each is dropped; this pass goes on to the
+        // other conversations' reports and the rest of the step.
+        const error = String((e as Error)?.message ?? e).slice(0, 200);
+        const lost: Array<{ s: Subagent; attempts: number }> = [];
+        for (const s of owed) {
+          const { attempts, dropped } = reportFailed(sql, owner, s.id, Date.now());
+          console.error(`posting ${tenantId}/${agentId}'s subagent ${s.id} report failed (attempt ${attempts}${dropped ? ", dropped" : ""}):`, e);
+          try {
+            appendTrace(sql, [subagentTurnRow(owner, s, "report_failed", Date.now(), { attempts, error }),
+              ...(dropped ? [subagentTurnRow(owner, s, "report_dropped", Date.now(), { attempts, error })] : [])]);
+          } catch (t) { console.error(`the subagent.turn row of ${tenantId}/${agentId} could not be written:`, t); }
+          if (dropped) lost.push({ s, attempts });
+        }
+        // Reports dropped leave their parent one short notice naming them all, so it can delegate again: once (keyed),
+        // best effort — if this fails too, the trace rows are what is left.
+        if (lost.length) {
+          const keys = lost.map((x) => undeliveredKey(x.s));
+          await this.#postOnce(tenantId, agentId, parent, undeliveredNotice(lost.map((x) => x.s), lost[0]!.attempts), keys[0]!, "postMessage", undefined, combinedRequestId(keys))
+            .then((n) => { if (n.started) this.#reportInbound(tenantId, agentId, "subagent_report"); })
+            .catch((n) => console.error(`the undelivered-report notice of ${tenantId}/${agentId} failed too:`, n));
+        }
+        continue;
+      }
+      reported += owed.length;
+      for (const s of owed) {
+        await this.#deps.subagentFault?.("report-posted", s.id);
+        markReported(sql, owner, s.id);
+      }
+    }
+    return reported;
+  }
+
+  /**
+   * How a subagent's turn ended, or null while it runs: read with SELECTs from what each engine commits as a run ends —
+   * pi085's `pi.result` value for the operation, keyed by its id; pd's submission, settled `done` or `unanswered` —
+   * and the child's transcript for its answer. Opens no harness.
+   */
+  #subagentTurnEnd(s: Subagent, owner: { tenantId: string; agentId: string }): TurnEnd | null {
+    const sql = this.#deps.ctx.storage.sql;
+    // No engine id was recorded for the turn: the task, or a background completion, was queued behind a run rather
+    // than starting one (pi085 answers a steer with an entry, not an operation). The turn is then read from the session
+    // itself: a run it started is adopted as the turn's; with nothing running, queued or out, it is over, and its end is
+    // its transcript's — rather than holding the slot until the ceiling and reporting a cancel that did not happen.
+    if (s.turnOp === null) {
+      const now = this.#sessionActivity(s.id);
+      if (now.op) { setSubagentTurnOp(sql, owner, s.id, now.op); return null; }
+      if (now.busy) return null;
+      const entries = this.#isPd() ? readPdEntries(sql as never, s.id) : this.#piMessages(s.id);
+      return turnEnd(entries, s.turnStartedAt, { status: "completed" });
+    }
+    if (this.#isPd()) {
+      const status = pdSubmissionStatus(sql as never, s.turnOp);
+      if (status !== "done" && status !== "unanswered") return null;
+      return turnEnd(readPdEntries(sql as never, s.id), s.turnStartedAt, { status });
+    }
+    const t = piTables(s.id);
+    if (sql.exec("SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = ?", t.values).toArray().length === 0) return null;
+    const row = sql.exec(`SELECT body FROM ${t.values} WHERE namespace = 'pi.result' AND key = ?`, s.turnOp).toArray()[0] as { body?: unknown } | undefined;
+    if (!row) return null;
+    const result = JSON.parse(String(row.body)) as { status?: unknown; error?: { message?: unknown } };
+    const entries = this.#piMessages(s.id);
+    return turnEnd(entries, s.turnStartedAt, {
+      status: String(result.status ?? "unknown"),
+      error: typeof result.error?.message === "string" ? result.error.message : null,
+    });
+  }
+
+  /**
+   * A delivered report (or a combined one, or a dropped-report notice) that started a turn of its parent is that turn's
+   * prompt, as a push is: the same `inbound` row, `delivered`, which activity reads as the turn's UserPromptSubmit. Only
+   * when the post began a run (`#postOnce`'s `started`): one that joined a run under way is part of that run's turn, and
+   * a second start mid-turn would be false. No text and no child id: alias `subagent_report`. A reading: a failure is logged.
+   */
+  #reportInbound(tenantId: string, agentId: string, alias: string) {
+    const at = Date.now();
+    try {
+      appendTrace(this.#deps.ctx.storage.sql, [{ at, tenantId, agentId, kind: "inbound", spanId: `${alias}:${at}`,
+        status: "delivered", verdict: "ok", attrs: { alias, source: alias } }]);
+    } catch (e) { console.error(`the inbound row of ${tenantId}/${agentId}'s report could not be written:`, e); }
+  }
+
+  /** Forget the harness this isolate built for `session` (`agent`'s cache): a finished child's is not kept for nothing. */
+  #evictAgent(tenantId: string, agentId: string, session: string) {
+    this.#agents.delete(`${tenantId}/${agentId}#${session}`);
+  }
+
+  /**
+   * Retention: children idle and finished longer than `subagentRetentionMs` (7 days) are archived, at most
+   * `SUBAGENT_ARCHIVE_PER_PASS` a pass, oldest first. A child owing a report, running, or with a background job of its
+   * own still running is not one (`archivableSubagents`). On pi085 its session's tables, its session row and its model
+   * jobs are dropped; on pd its directory entry (`ap_conversations`) is, so nothing lists or opens it again —
+   * pi-durable 1.0.0 has no way to delete a conversation, so its records stay in pi-durable's tables. The row stays,
+   * `archived`, as the record that the child existed; a follow-up to it is refused. Returns the children archived.
+   */
+  async #archiveSubagents(tenantId: string, agentId: string): Promise<string[]> {
+    const sql = this.#deps.ctx.storage.sql;
+    const owner = { tenantId, agentId };
+    const retention = this.#deps.subagentRetentionMs ?? SUBAGENT_RETENTION_MS;
+    const done: string[] = [];
+    for (const s of archivableSubagents(sql, owner, Date.now(), retention, SUBAGENT_ARCHIVE_PER_PASS)) {
+      try {
+        this.#evictAgent(tenantId, agentId, s.id);
+        if (this.#isPd()) {
+          sql.exec("DELETE FROM ap_conversations WHERE task_id = ?", s.id);
+        } else {
+          const t = piTables(s.id);
+          for (const table of [t.entries, t.usage, t.values, t.list, t.meta]) sql.exec(`DROP TABLE IF EXISTS ${table}`);
+          sql.exec("DELETE FROM pi_sessions WHERE session = ?", s.id);
+          sql.exec("DELETE FROM pi_model_jobs WHERE session = ?", s.id);
+        }
+        markArchived(sql, owner, s.id);
+        logEvent("subagent.archived", { tenantId, agentId, subagent: s.id, finishedAt: s.finishedAt });
+        done.push(s.id);
+      } catch (e) { console.error(`archiving ${tenantId}/${agentId}'s subagent ${s.id} failed:`, e); }
+    }
+    return done;
+  }
+
+  /** pi085: a session's last 20 message entries, oldest first, read with a SELECT. */
+  #piMessages(session: string): EngineEntry[] {
+    const t = piTables(session);
+    const sql = this.#deps.ctx.storage.sql;
+    if (sql.exec("SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = ?", t.entries).toArray().length === 0) return [];
+    return (sql.exec(`SELECT body FROM ${t.entries} WHERE type = 'message' ORDER BY seq DESC LIMIT 20`).toArray() as Array<{ body: string }>)
+      .map((r) => JSON.parse(String(r.body))).reverse();
+  }
+
+  /**
+   * What a session is doing now, read with SELECTs: `op`, the run in flight (pi085's lane operation; on pd the newest
+   * placed submission of its conversation that has not settled); `busy`, whether anything of it is under way — a run, a
+   * model call out, input queued (pi085), a live task or a queued submission (pd).
+   */
+  #sessionActivity(session: string): { op: string | null; busy: boolean } {
+    const sql = this.#deps.ctx.storage.sql;
+    const has = (name: string) => sql.exec("SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = ?", name).toArray().length > 0;
+    if (this.#isPd()) {
+      const conversation = pdConversationId(sql as never, session);
+      if (conversation === null || !has("pd_submissions")) return { op: null, busy: false };
+      const sub = sql.exec("SELECT id, status FROM pd_submissions WHERE conversation_id = ? AND status IN ('queued', 'placed') ORDER BY id DESC LIMIT 1", conversation).toArray()[0] as { id?: unknown; status?: unknown } | undefined;
+      const live = has("pd_tasks") && sql.exec("SELECT 1 AS x FROM pd_tasks WHERE conversation_id = ? AND status != 'terminal' AND background = 0 LIMIT 1", conversation).toArray().length > 0;
+      return { op: sub?.status === "placed" ? String(sub.id) : null, busy: live || sub !== undefined };
+    }
+    const out = has("pi_model_jobs") && sql.exec("SELECT 1 AS x FROM pi_model_jobs WHERE session = ? AND answer IS NULL LIMIT 1", session).toArray().length > 0;
+    const t = piTables(session);
+    const row = has(t.values) ? sql.exec(`SELECT body FROM ${t.values} WHERE namespace = 'pi.lane.state' AND key = 'main'`).toArray()[0] as { body?: unknown } | undefined : undefined;
+    const state = row ? JSON.parse(String(row.body)) as { currentOperationId?: unknown; inbox?: unknown } : {};
+    const op = typeof state.currentOperationId === "string" ? state.currentOperationId : null;
+    return { op, busy: op !== null || out || (Array.isArray(state.inbox) && state.inbox.length > 0) };
+  }
+
+  /**
+   * `stopRunningSubagents` with a `subagent.turn` row, status `stopped`, for each turn it ended, so the trace has every
+   * turn's end. A reading: a row that cannot be written is logged and the stop goes on. Returns every child it covers.
+   */
+  #stopSubagents(tenantId: string, agentId: string, parentSession?: string): { ids: string[]; stopped: string[] } {
+    const sql = this.#deps.ctx.storage.sql;
+    const owner = { tenantId, agentId };
+    const now = Date.now();
+    const r = stopRunningSubagents(sql, owner, now, parentSession);
+    if (r.stopped.length) {
+      try { appendTrace(sql, r.stopped.map((s) => subagentTurnRow(owner, s, "stopped", now, { reportChars: 0 }))); }
+      catch (e) { console.error(`the subagent.turn rows of ${tenantId}/${agentId}'s stop could not be written:`, e); }
+    }
+    return { ids: r.ids, stopped: r.stopped.map((x) => x.id) };
+  }
+
+  /**
+   * A kill switch turned off stops the children already running, not only new ones: each is marked stopped and owing its
+   * parent one notice (`switchOffSubagents`), its end written, and its run cancelled. The parent's own turn is left as it
+   * is; the notice is posted by `#reportSubagents`, one message a parent. Asked at the start of every pass (the
+   * deployment's switch is read by the first pass after it is set, and a running child's model call out has a pass come
+   * back within the engine's poll backstop, 5 minutes) and when the agent's setting is written. A cancel that fails leaves the run to the stray sweep (`#cancelStraySubagents`), as its row no longer
+   * runs. Returns the children it stopped.
+   */
+  async #switchOffSubagents(tenantId: string, agentId: string): Promise<string[]> {
+    const sql = this.#deps.ctx.storage.sql;
+    const owner = { tenantId, agentId };
+    if (!hasSubagentTable(sql) || runningSubagents(sql, owner).length === 0) return [];
+    if (await this.#subagentsOn(tenantId, agentId)) return [];
+    const now = Date.now();
+    const off = switchOffSubagents(sql, owner, now);
+    if (!off.length) return [];
+    try { appendTrace(sql, off.map((s) => subagentTurnRow(owner, s, "stopped", now, { reportChars: 0, cause: "switched_off" }))); }
+    catch (e) { console.error(`the subagent.turn rows of ${tenantId}/${agentId}'s switch-off could not be written:`, e); }
+    for (const s of off) {
+      try { await this.cancelSession(tenantId, agentId, s.id); }
+      catch (e) { console.error(`cancelling ${tenantId}/${agentId}'s subagent ${s.id} at the switch-off failed; the stray sweep tries again:`, e); }
+      if (!this.#isPd()) markSession(sql, s.id, false);
+      this.#evictAgent(tenantId, agentId, s.id);
+    }
+    logEvent("subagent.switched_off", { tenantId, agentId, stopped: off.length, disabledEverywhere: this.#deps.subagentsDisabled === true });
+    return off.map((s) => s.id);
+  }
+
+  /**
+   * Cancel every subagent session that has work while its row says no turn of it runs (stopped, idle, owed a report,
+   * or no row at all): a run that landed after a stop, or any other run nothing tracks. Each would call the model
+   * unbounded, since the ceiling reads running rows. pi085: the sessions its list says have work. pd: a conversation of a
+   * subagent with a live task, read from pi-durable's tasks with a SELECT. Returns the sessions it cancelled.
+   */
+  async #cancelStraySubagents(tenantId: string, agentId: string): Promise<string[]> {
+    const sql = this.#deps.ctx.storage.sql;
+    const owner = { tenantId, agentId };
+    const pd = this.#isPd();
+    // pi085 lists a session with work only while it is marked or has a call out; a run left in a lane that nothing marks
+    // (a ceiling's cancel that failed) is in no list and would resume on the session's next post, so the lanes of the
+    // children that ended within a lifetime are read too.
+    const recent = pd ? [] : listSubagents(sql, owner, 200).filter((r) => r.state !== "running" && (r.finishedAt ?? 0) > Date.now() - SUBAGENT_LIFETIME_MS)
+      .map((r) => r.id).filter((x) => this.#piSessionRuns(x));
+    const busy = pd ? this.#pdSubagentSessions({ live: true }) : [...new Set([...sessionsWithWork(sql).filter((x) => isSubagentSession(x)), ...recent])];
+    // Any work of a subagent whose row says no turn of it runs is stray — a run that landed as a stop did, one a
+    // ceiling's cancel failed to end, anything else — with one exception: a finished child's own background job, which
+    // pi085 lists as its session's work, and whose completion wakes the child under its limits (`#subagentWakeGate`).
+    // That exception is only the job: a run or a model call beside it is stray all the same, and a stop's row is never
+    // spared (the stop already ended its jobs). pd lists only live pi-durable tasks, which a background job is not.
+    const stray = busy.filter((x) => {
+      const row = subagentOf(sql, owner, x);
+      if (!row) return true;
+      if (row.state === "running") return false;
+      if (row.outcome === "stopped" || pd) return true;
+      return this.#piSessionRuns(x);
+    });
+    for (const session of stray) {
+      try { await this.cancelSession(tenantId, agentId, session); }
+      catch (e) { console.error(`cancelling ${tenantId}/${agentId}'s untracked subagent run ${session} failed:`, e); }
+      if (!pd) markSession(sql, session, false);
+      logEvent("subagent.stray", { tenantId, agentId, subagent: session });
+    }
+    return stray;
+  }
+
+  /**
+   * Cancel the run `op` started in `session`, and only that: when it is the conversation's run now and no input of
+   * anyone else's is queued behind it or placed after it. Anything else leaves the conversation alone: a person's
+   * message after a stop starts a turn that is theirs. Returns whether it cancelled.
+   */
+  async #cancelOwnRun(tenantId: string, agentId: string, session: string, op: string | null): Promise<boolean> {
+    if (op === null) return false;
+    const sql = this.#deps.ctx.storage.sql;
+    let own = false;
+    if (this.#isPd()) {
+      const conversation = pdConversationId(sql as never, session);
+      own = conversation !== null && pdSubmissionStatus(sql as never, op) === "placed"
+        && sql.exec("SELECT 1 AS x FROM pd_submissions WHERE conversation_id = ? AND id > ? LIMIT 1", conversation, Number(op)).toArray().length === 0;
+    } else {
+      const t = piTables(session);
+      const row = sql.exec(`SELECT body FROM ${t.values} WHERE namespace = 'pi.lane.state' AND key = 'main'`).toArray()[0] as { body?: unknown } | undefined;
+      const state = row ? JSON.parse(String(row.body)) as { currentOperationId?: unknown; inbox?: unknown } : {};
+      own = state.currentOperationId === op && !(Array.isArray(state.inbox) && state.inbox.length > 0);
+    }
+    if (!own) return false;
+    await this.cancelSession(tenantId, agentId, session);
+    if (!this.#isPd()) markSession(sql, session, false);
+    return true;
+  }
+
+  /**
+   * pi085: whether a session has a run of its own under way — a model call unanswered, a run in flight, or input queued
+   * for one — as opposed to only a background job, which `sessionsWithWork` also counts. Read with SELECTs.
+   */
+  #piSessionRuns(session: string): boolean {
+    const sql = this.#deps.ctx.storage.sql;
+    if (sql.exec("SELECT 1 AS x FROM pi_model_jobs WHERE session = ? AND answer IS NULL LIMIT 1", session).toArray().length) return true;
+    const t = piTables(session);
+    if (sql.exec("SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = ?", t.values).toArray().length === 0) return false;
+    const row = sql.exec(`SELECT body FROM ${t.values} WHERE namespace = 'pi.lane.state' AND key = 'main'`).toArray()[0] as { body?: unknown } | undefined;
+    const state = row ? JSON.parse(String(row.body)) as { currentOperationId?: unknown; inbox?: unknown } : {};
+    return typeof state.currentOperationId === "string" || (Array.isArray(state.inbox) && state.inbox.length > 0);
+  }
+
+  /** pd: the subagent sessions with a conversation (`ap_conversations`); with `live`, only those with a live task. */
+  #pdSubagentSessions(o: { live?: boolean; strict?: boolean } = {}): string[] {
+    const sql = this.#deps.ctx.storage.sql;
+    const has = (name: string) => sql.exec("SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = ?", name).toArray().length > 0;
+    if (!has("ap_conversations")) return [];
+    // No tasks table is no task ever run: none live. `strict`: a read of it that fails throws to the caller, who then
+    // cannot tell which are live; otherwise such a read is "none live".
+    let rows: unknown[];
+    try {
+      rows = o.live
+      ? (has("pd_tasks") ? sql.exec(
+          "SELECT DISTINCT c.task_id AS s FROM pd_tasks t JOIN ap_conversations c ON c.conversation_id = t.conversation_id " +
+          "WHERE t.status != 'terminal' AND t.background = 0").toArray() : [])
+      : sql.exec("SELECT task_id AS s FROM ap_conversations").toArray();
+    } catch (e) {
+      if (o.strict) throw e;
+      rows = [];
+    }
+    return (rows as Array<{ s: unknown }>).map((r) => String(r.s)).filter((x) => isSubagentSession(x));
+  }
+
+  /**
+   * The provider and model a subagent started on the owner's option `option` runs on, decided by the rules the agent's
+   * own model is (`resolveModel`, cf/src/model-request.ts): refused while an administrator's agent or tenant row decides
+   * the agent's model, while the server's picker switch is enforced and off for another model than the default, and for
+   * an option the deployment does not offer. Asked at the spawn and again at each of the subagent's model calls, so a pin
+   * or a switch set since applies at once. The control plane's answer comes through `subagentModelRules`; a deployment
+   * without it (a test, the bench) has neither pins nor a switch.
+   */
+  async #subagentModel(tenantId: string, agentId: string, option: string, o: { cached?: boolean } = {}): Promise<{ ok: true; choice: { provider: string; model: string } } | { ok: false; error: string }> {
+    const none = { layers: { agent: null, tenant: null, deployment: null, owner: null }, pickerOff: false };
+    const rules = this.#deps.subagentModelRules ? await this.#rulesFor(tenantId, agentId, o.cached === true) : none;
+    return subagentModelChoice(rules.layers, this.#deps.userModels ?? { offered: [] }, this.#deps.operatorModel?.model ?? "", option, rules.pickerOff);
+  }
+
+  /**
+   * The control plane's rules for the agent's model (`subagentModelRules`): two D1 reads, so a subagent's model calls
+   * share one answer for `subagentRulesTtlMs` (30 s) rather than each reading again. The spawn reads fresh. A read that
+   * fails is not kept, and throws to the caller.
+   */
+  #rulesCache = new Map<string, { at: number; rules: { layers: ModelLayers; pickerOff: boolean } }>();
+  async #rulesFor(tenantId: string, agentId: string, cached: boolean) {
+    const key = `${tenantId}/${agentId}`;
+    const ttl = this.#deps.subagentRulesTtlMs ?? 30_000;
+    const hit = this.#rulesCache.get(key);
+    if (cached && hit && Date.now() - hit.at < ttl) return hit.rules;
+    const rules = await this.#deps.subagentModelRules!(tenantId, agentId);
+    this.#rulesCache.set(key, { at: Date.now(), rules });
+    return rules;
+  }
+
+  /**
+   * Whether a background completion may be delivered to a subagent's session: `join` its turn running, `start` a turn
+   * of an idle subagent (under the cap, its lifetime and its turn count), or why not.
+   */
+  #subagentWakeGate(tenantId: string, agentId: string, session: string, on: boolean): "join" | "start" | string {
+    const sql = this.#deps.ctx.storage.sql;
+    const owner = { tenantId, agentId };
+    const s = subagentOf(sql, owner, session);
+    if (!s) return "no such subagent";
+    if (s.state === "running") return "join";
+    // A kill switch stops new turns, a completion's included; a turn already running is the stop's to end.
+    if (!on) return "subagents are switched off";
+    if (s.state === "reporting") return "its report is owed";
+    if (s.outcome === "stopped") return "stopped";
+    const spent = subagentSpent(s, Date.now());
+    if (spent) return spent;
+    const admit = admitSubagent(runningSubagents(sql, owner), SUBAGENT_CAP, Date.now());
+    return admit.ok ? "start" : "the cap is full";
+  }
+
+  /** The woken turn's engine id, once the completion was posted: what its end is read by. */
+  #subagentWoken(tenantId: string, agentId: string, session: string, res: unknown) {
+    const sql = this.#deps.ctx.storage.sql;
+    // pd answers an input queued behind a run with its submission, which its end is read by as well (`#subagentTurnEnd`);
+    // pi085's steer answers with neither, and the turn is then read from the session.
+    const value = (res as { value?: { operationId?: unknown; submissionId?: unknown } } | undefined)?.value;
+    const op = value?.operationId ?? value?.submissionId;
+    if (op !== undefined && op !== null) setSubagentTurnOp(sql, { tenantId, agentId }, session, String(op));
+  }
+
+  /** The subagent a model job belongs to, or null: its session, which on pd is the job's conversation's. */
+  #subagentOfJob(tenantId: string, agentId: string, jobId: string, session: string): Subagent | null {
+    const sql = this.#deps.ctx.storage.sql;
+    let real = session;
+    if (this.#isPd()) {
+      const row = sql.exec(
+        "SELECT c.task_id AS session FROM ap_model_jobs j JOIN ap_conversations c ON c.conversation_id = j.conversation_id WHERE j.id = ?", jobId,
+      ).toArray()[0] as { session?: unknown } | undefined;
+      if (!row) return null;
+      real = String(row.session);
+    }
+    return isSubagentSession(real) ? subagentOf(sql, { tenantId, agentId }, real) : null;
+  }
+
+  /**
+   * What a setting is where the agent stored none: this runtime's (`subagentsDefault`), except where a measurement must
+   * get exactly what it set up — the bench tenant (`BENCH_TENANT`: the τ² Agents API arm runs there, and its agents are
+   * offered exactly their catalogue) and an agent provisioned with an explicit tool choice (`toolConfig`, an evaluation's).
+   * A stored setting still decides for those.
+   */
+  #settingDefaults(tenantId: string, config: unknown) {
+    const measured = tenantId === BENCH_TENANT || toolConfigOf(config) !== null;
+    return { subagents: this.#deps.subagentsDefault === true && !measured };
+  }
+
+  /**
+   * The settings in force: the stored value, else the default (`#settingDefaults`), under the deployment's kill switch
+   * (`subagentsDisabled`, SUBAGENTS_DISABLED) and an evaluation's `harness: "minimal"`, either of which turns subagents
+   * off whatever is stored.
+   */
+  #settingsNow(tenantId: string, config: unknown) {
+    const s = agentSettings(this.#deps.ctx.storage.sql, this.#settingDefaults(tenantId, config));
+    return this.#deps.subagentsDisabled || toolConfigOf(config)?.harness === "minimal" ? { ...s, subagents: false } : s;
+  }
+
+  /** Whether subagents are on for this agent now: its setting in force, under the deployment's kill switch. */
+  async #subagentsOn(tenantId: string, agentId: string): Promise<boolean> {
+    return this.#settingsNow(tenantId, (await this.store.loadAgent(tenantId, agentId))?.config).subagents;
+  }
+
+  /** The agent's settings as in force, and its subagents, newest first (`/admin/agent-settings`). */
+  async agentSettingsOf(tenantId: string, agentId: string) {
+    await this.ready();
+    const record = await this.store.loadAgent(tenantId, agentId);
+    if (!record) return null;
+    const sql = this.#deps.ctx.storage.sql;
+    // A deleted agent has no settings to read: its delete stopped every subagent (`stopTurn`), and the rows stay only as a record.
+    if (agentDeletedAt(sql) !== null) return null;
+    return {
+      settings: this.#settingsNow(tenantId, record.config), stored: agentSettings(sql, this.#settingDefaults(tenantId, record.config)),
+      defaults: this.#settingDefaults(tenantId, record.config),
+      disabledEverywhere: this.#deps.subagentsDisabled === true, about: AGENT_SETTING_ABOUT, subagents: listSubagents(sql, { tenantId, agentId }),
+    };
+  }
+
+  /**
+   * An operator's change to the agent's settings (src/runtime/agent-settings.ts). A cached harness is rebuilt on its next
+   * open, since the settings are in its key (`#harnessKeyFor`); a turn running now keeps the tools it started with.
+   */
+  async updateAgentSettings(tenantId: string, agentId: string, patch: unknown, who: string) {
+    await this.ready();
+    const record = await this.store.loadAgent(tenantId, agentId);
+    if (!record) return { ok: false as const, status: 404, error: "no such agent" };
+    if (agentDeletedAt(this.#deps.ctx.storage.sql) !== null) return { ok: false as const, status: 404, error: "the agent was deleted" };
+    const r = updateAgentSettings(this.#deps.ctx.storage.sql, patch, who, Date.now(), this.#settingDefaults(tenantId, record.config));
+    if (!r.ok) return { ok: false as const, status: 400, error: r.error };
+    // Switched off: the children running stop now, at the write; their notice goes on the next pass, which the
+    // object asks for at once (cf/src/index.ts `adminUpdateAgentSettings`).
+    const stopped = await this.#switchOffSubagents(tenantId, agentId);
+    return { ...r, settings: this.#settingsNow(tenantId, record.config), disabledEverywhere: this.#deps.subagentsDisabled === true, about: AGENT_SETTING_ABOUT,
+      ...(stopped.length ? { stoppedSubagents: stopped.length } : {}) };
+  }
+
+  /**
    * One pass over every session with work, which is all an alarm should ever
    * do. A session is stepped when its last step left something open or a
    * model call of its is still out; the rest stay closed and cost nothing.
@@ -4196,10 +5176,13 @@ export class AgentRuntime {
     // A deleted agent takes no step: its delete ended the turn (`stopTurn`), and anything that started a run since
     // is ended here rather than driven. Nothing is asked to wake it again.
     if (agentDeletedAt(sql) !== null) {
-      const busy = pd ? await (await this.agent(tenantId, agentId, MAIN_SESSION)).running().catch(() => false) : mainBusy(sql) !== null || sessionsWithWork(sql).length > 0;
+      const busy = runningSubagents(sql, { tenantId, agentId }).length > 0
+        || (pd ? await (await this.agent(tenantId, agentId, MAIN_SESSION)).running().catch(() => false) : mainBusy(sql) !== null || sessionsWithWork(sql).length > 0);
       if (busy) await this.stopTurn(tenantId, agentId, "delete");
       return { open: 0, wakeInMs: null, settled: [] as Array<{ operationId: string; status: string }>, releaseFailed: [] as Array<{ alias: string; error: string }> };
     }
+    // A kill switch set since the last pass ends the children still running before anything drives them.
+    await this.#switchOffSubagents(tenantId, agentId);
     // Background work first (task #16). A job that ended is delivered as a
     // message, which marks its session as having work, so the loop below steps
     // it in this same pass; the rest say when they want checking again.
@@ -4220,6 +5203,45 @@ export class AgentRuntime {
     // before the pass: the pass awaits the plugin's poll, and the task can end during that await.
     const bg = await pass(async (session, text) => {
       if (this.#deps.ended?.(owner) === true) return;
+      // A subagent's job ending starts another turn of the subagent, tracked like one its parent sent, so its answer
+      // is reported too (`#reportSubagents`), and held to the same cap, lifetime and turn count; one that joins a turn
+      // still running is tracked already. One the subagent may not take (stopped, owed a report, past its limits, the
+      // cap full) is not delivered: an untracked run would call the model with nothing to bound it.
+      if (isSubagentSession(session)) {
+        const gate = this.#subagentWakeGate(tenantId, agentId, session, await this.#subagentsOn(tenantId, agentId));
+        if (gate !== "join" && gate !== "start") {
+          logEvent("subagent.wake_dropped", { tenantId, agentId, subagent: session, why: gate });
+          return;
+        }
+        if (gate === "start") startSubagentTurn(sql, owner, session, { callId: subagentOf(sql, owner, session)?.callId ?? null, turnOp: null, now: Date.now() });
+        let posted: Awaited<ReturnType<AgentRuntime["postMessage"]>> | undefined;
+        try {
+          await this.#deps.subagentFault?.("wake-posting", session);
+          posted = await this.postMessage(tenantId, agentId, text, "prompt", session);
+        } catch (e) {
+          // Not posted, so no turn started: the slot is freed at once, not held to the ceiling (`releaseUnstartedTurn`).
+          if (gate === "start" && releaseUnstartedTurn(sql, owner, session, Date.now())) {
+            const row = subagentOf(sql, owner, session);
+            if (row) {
+              // `wake_failed`, not a turn's end: the turn never started (no `subagent.start` was written), so Raft is given
+              // no SubagentStop for it (src/runtime/activity.ts); the row stays the trace's record of the attempt.
+              try { appendTrace(sql, [subagentTurnRow(owner, row, "wake_failed", Date.now(), { why: "its background completion could not be delivered", error: String((e as Error)?.message ?? e).slice(0, 160) })]); }
+              catch (t) { console.error(`the subagent.turn row of ${tenantId}/${agentId} could not be written:`, t); }
+            }
+          }
+          console.error(`delivering a background completion to ${tenantId}/${agentId}'s subagent ${session} failed:`, e);
+          return;
+        }
+        if (gate === "start") {
+          this.#subagentWoken(tenantId, agentId, session, posted?.result);
+          const row = subagentOf(sql, owner, session);
+          if (row) {
+            try { appendTrace(sql, [subagentStartRow(owner, row, "wake", null, Date.now())]); }
+            catch (e) { console.error(`the subagent.start row of ${tenantId}/${agentId} could not be written:`, e); }
+          }
+        }
+        return;
+      }
       await this.postMessage(tenantId, agentId, text, "prompt", session).catch((e) => refusedForReset(e, tenantId, agentId, "background completion"));
     });
     // pd: one harness runs every conversation of the object, and one step drives it whole
@@ -4228,7 +5250,12 @@ export class AgentRuntime {
     if (!sessions.length) sessions.push(MAIN_SESSION);
     let open = 0, wakeInMs: number | null = bg.wakeInMs;
     const settled: Array<{ operationId: string; status: string }> = [];
-    for (const session of sessions) {
+    // pi085: a session that a step in this pass gave work — a subagent its parent just started — is stepped in this
+    // pass too, once, so its first model call is sent now rather than at a wake nothing asked for.
+    const stepped = new Set<string>();
+    for (let i = 0; i < sessions.length; i++) {
+      const session = sessions[i]!;
+      stepped.add(session);
       // The first step after a message is its turn's start (src/runtime/turn-timing.ts), opening the harness included.
       if (!pd) this.#turnTiming(tenantId, agentId, "starting", () => turnStepStart(sql, session, Date.now()));
       const agent = await this.agent(tenantId, agentId, session);
@@ -4262,7 +5289,21 @@ export class AgentRuntime {
       if (!pd) markSession(sql, session, out.open > 0 || out.wakeInMs !== null);
       // The run after an idle rebuild, once it has ended: what the agent did on it, as numbers (`#settleBehaviour`).
       if (!pd && session === MAIN_SESSION && out.open === 0) this.#settleBehaviour(tenantId, agentId);
+      if (!pd && i === sessions.length - 1) {
+        for (const s of sessionsWithWork(sql)) if (!stepped.has(s) && isSubagentSession(s)) sessions.push(s);
+      }
     }
+    // A subagent whose turn ended is reported to the session that started it (src/runtime/subagents.ts). Read from
+    // the engines' records, not from this pass's `settled`, so an end that a pass before an eviction saw is still
+    // reported. A report starts a turn of the parent, which the next pass, at once, drives.
+    await this.#cancelStraySubagents(tenantId, agentId);
+    if (await this.#reportSubagents(tenantId, agentId) > 0) wakeInMs = 0;
+    await this.#archiveSubagents(tenantId, agentId);
+    const retry = reportRetryMs(sql, { tenantId, agentId }, Date.now());
+    if (retry !== null) wakeInMs = wakeInMs === null ? retry : Math.min(wakeInMs, retry);
+    // A running subagent past its ceiling is cancelled by a pass; the pass comes back for the ceiling's moment.
+    const ceiling = subagentCeilingMs(sql, { tenantId, agentId }, Date.now());
+    if (ceiling !== null) wakeInMs = wakeInMs === null ? ceiling : Math.min(wakeInMs, ceiling);
     // A finished run should not still be holding a metered container — either
     // by handing it back at once, or, where the deployment leases them, by
     // asking the agent first and taking it at the ceiling.
@@ -4723,8 +5764,38 @@ export class AgentRuntime {
     const mark = this.#deps.modelInputEvidence && !this.#isPd();
     // The first turn's reasoning, for an agent made to answer its first message without (`#reasoningFor`).
     const reasoning = await this.#reasoningFor(tenantId, agentId, session, (job as { context?: unknown }).context, this.#calledModel(b));
-    return { ...job, operatorModel: provider ? b!.model : null, operatorProvider: provider, ...(mark ? { imageEvidence: true } : {}),
-      ...(reasoning ? { reasoning } : {}) };
+    // A subagent started on one of the owner's model options runs on it (`send_to_agent`'s `model`): the option was
+    // checked against USER_MODELS when the subagent was started, and is the operator's account, as an owner's pick is.
+    const child = this.#subagentOfJob(tenantId, agentId, jobId, session);
+    // Decided again at each call, by the rules the spawn was (`#subagentModel`): a pin or a switch set since applies now.
+    // Refused, or the rules unreadable, the call runs on the agent's own model, never on the option.
+    // A refusal runs the call on the agent's own model; rules that cannot be read keep what was decided before (the
+    // spawn's, or the last call's), rather than moving the subagent on a read that failed. A move is a trace row
+    // (`subagent.model_changed`), and the subagent's next report says it, so the parent knows what answered.
+    let chosen: { model: string; provider: string } | null = null;
+    if (child?.modelOption) {
+      let why: string;
+      try {
+        const r = await this.#subagentModel(tenantId, agentId, child.modelOption, { cached: true });
+        if (r.ok) { chosen = r.choice; why = `the ${child.modelOption} option is allowed again`; }
+        else why = r.error.replace(/; leave model out$/, "");
+      } catch (e) {
+        logEvent("subagent.model_unread", { tenantId, agentId, subagent: child.id, error: String((e as Error)?.message ?? e).slice(0, 200) });
+        chosen = child.modelNow !== null && child.provider ? { model: child.modelNow, provider: child.provider } : null;
+        why = "";
+      }
+      const moved = why ? noteSubagentModel(this.#deps.ctx.storage.sql, { tenantId, agentId }, child, chosen?.model ?? null, why) : null;
+      if (moved) {
+        try {
+          appendTrace(this.#deps.ctx.storage.sql, [{
+            at: Date.now(), tenantId, agentId, kind: "subagent.model_changed", spanId: child.id, status: "changed", verdict: "ok",
+            attrs: { from: moved.from ?? "agent", to: chosen?.model ?? "agent", option: child.modelOption, why: why.slice(0, 160) },
+          }]);
+        } catch (e) { console.error(`the subagent.model_changed row of ${tenantId}/${agentId} could not be written:`, e); }
+      }
+    }
+    return { ...job, operatorModel: chosen?.model ?? (provider ? b!.model : null), operatorProvider: chosen?.provider ?? provider,
+      ...(mark ? { imageEvidence: true } : {}), ...(reasoning ? { reasoning } : {}) };
   }
 
   /**

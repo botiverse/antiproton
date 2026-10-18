@@ -21,6 +21,7 @@
  *   model.call toolUse      → nothing             (still working)
  *   session.needs_reset set → BridgeFatal         (the overflow backstop gave up: pushes are refused until a reset)
  *   agent.ready             → nothing             (its `online` is a status-only event, src/runtime/status.ts)
+ *   a subagent's row        → nothing             (a child session's work: trace only, `subagentRow`)
  *
  * The event id is the row's seq under the agent: unique for the agent's
  * lifetime because seq is AUTOINCREMENT and never reused, so a batch sent
@@ -30,7 +31,7 @@
  */
 import type { TraceOutboxRow } from "../trace/outbox.ts";
 import type { ActivityEvent } from "../plugins/types.ts";
-import { operatorCall, statusEvents, turnEndClass } from "./status.ts";
+import { operatorCall, statusEvents, subagentRow, turnEndClass } from "./status.ts";
 
 export const ACTIVITY_SCHEMA = "raft-agent-activity-ingest.v1";
 /**
@@ -48,14 +49,23 @@ export function activityEventId(agentId: string, seq: number): string {
  * The events a run of trace rows means, with the agent's status changes on them: each change goes on
  * the activity event of the same instant when there is one, otherwise it is a status-only event.
  */
-export function activityEvents(agentId: string, rows: readonly TraceOutboxRow[]): ActivityEvent[] {
-  const events = hookEvents(agentId, rows);
+/**
+ * What maps a subagent's rows to events (`activityEvents`), present only where the deployment turns it on
+ * (SUBAGENT_ACTIVITY=1, cf/src/index.ts): `lineage` answers the parent's `send_to_agent` call id for a child session.
+ * Absent — the default — a child's rows make no event at all, as before: Raft's ingest strips fields it does not know,
+ * so a child's tool call sent with its marker stripped would read as the agent's own.
+ */
+export interface SubagentActivity { lineage(session: string, at: number): string | null }
+
+export function activityEvents(agentId: string, rows: readonly TraceOutboxRow[], subagents?: SubagentActivity): ActivityEvent[] {
+  const events = hookEvents(agentId, rows, subagents);
   // The status after an instant is the last change at that instant; earlier ones at the same instant
   // were superseded before anyone could see them.
   const after = new Map<string, ReturnType<typeof statusEvents>[number]>();
   for (const s of statusEvents(agentId, rows)) after.set(s.occurredAt, s);
   const hosts = new Map<string, ActivityEvent>();
-  for (const e of events) hosts.set(e.occurredAt, e);   // the last activity event at an instant carries it
+  // The last of the agent's own events at an instant carries it; never a subagent's, which is not the agent's state.
+  for (const e of events) if (!e.subagent) hosts.set(e.occurredAt, e);
   for (const [instant, s] of after) {
     const host = hosts.get(instant);
     if (host) {
@@ -90,45 +100,23 @@ export function orderStatuses(events: readonly ActivityEvent[], after: number): 
 }
 
 /** The activity events a run of trace rows means, in row order; rows that mean nothing to the service yield none. */
-function hookEvents(agentId: string, rows: readonly TraceOutboxRow[]): ActivityEvent[] {
+function hookEvents(agentId: string, rows: readonly TraceOutboxRow[], subagents?: SubagentActivity): ActivityEvent[] {
   const out: ActivityEvent[] = [];
   for (const row of rows) {
+    // A subagent's model calls and tools are its own, not the agent's (`subagentRow`, src/runtime/status.ts): no event,
+    // unless the deployment maps them (`subagentEvents`), and even then never a Stop or a prompt.
+    if (subagentRow(row) || row.kind === "subagent.start" || row.kind === "subagent.turn") {
+      if (subagents) out.push(...subagentEvents(agentId, row, subagents));
+      continue;
+    }
     const base = { eventId: activityEventId(agentId, row.seq), occurredAt: new Date(row.at).toISOString() };
     switch (row.kind) {
       case "inbound":
         if (row.status === "delivered") out.push({ ...base, hookEventName: "UserPromptSubmit" });
         break;
-      case "tool.call": {
-        if (operatorCall(row)) break;
-        const tool = typeof row.attrs.tool === "string" ? row.attrs.tool : "tool";
-        const mount = typeof row.attrs.mount === "string" ? row.attrs.mount : null;
-        // Named as the model names it, so the service's trajectory reads like the transcript.
-        const toolName = mount ? `${mount}__${tool}` : tool;
-        const ok = row.verdict === "ok";
-        const ms = typeof row.ms === "number" ? row.ms : 0;
-        // The operation id, on both events, is what pairs them: one per call and one row per operation
-        // (src/trace/seams.ts `operationEnds`). Not the model's call id, which a run_js program's host calls
-        // share and a resumed question reuses.
-        const toolUseId = row.spanId;
-        // How long the tool ran: from the attempt's start when the row says it (`attrs.runMs`), so a call held
-        // for a person's approval does not count the wait; otherwise the whole span. The call itself stays dated
-        // at the request, when the model asked for it.
-        const runMs = typeof row.attrs.runMs === "number" ? row.attrs.runMs : null;
-        const durationMs = runMs ?? (typeof row.ms === "number" ? row.ms : null);
-        const exitCode = typeof row.attrs.exitCode === "number" ? row.attrs.exitCode : null;
-        out.push({ eventId: `${base.eventId}:pre`, occurredAt: new Date(row.at - ms).toISOString(), hookEventName: "PreToolUse", toolName, toolUseId });
-        out.push({
-          ...base,
-          hookEventName: ok ? "PostToolUse" : "PostToolUseFailure",
-          toolName,
-          toolUseId,
-          ok: toolOutcome(row.status, row.attrs.denied === true),
-          ...(durationMs === null ? {} : { durationMs }),
-          ...(exitCode === null ? {} : { exitCode }),
-          ...(ok ? {} : { errorClass: row.status }),
-        });
+      case "tool.call":
+        if (!operatorCall(row)) out.push(...toolCallEvents(base, row));
         break;
-      }
       // A turn that was ended from outside: who ended it is the row's errorClass (cf/src/runtime.ts `stopTurn`,
       // `turnEndClass` in src/runtime/status.ts), so the activity log says why the agent stopped instead of going quiet.
       case "turn.stop":
@@ -149,6 +137,44 @@ function hookEvents(agentId: string, rows: readonly TraceOutboxRow[]): ActivityE
 }
 
 /**
+ * A tool call's two events from its row: PreToolUse dated the span's start, PostToolUse(Failure) at its end. The agent's
+ * own calls (`hookEvents`) and a subagent's (`subagentEvents`, with its marker on both) are mapped the same way.
+ */
+function toolCallEvents(base: { eventId: string; occurredAt: string }, row: TraceOutboxRow, subagent?: ActivityEvent["subagent"]): ActivityEvent[] {
+  const tool = typeof row.attrs.tool === "string" ? row.attrs.tool : "tool";
+  const mount = typeof row.attrs.mount === "string" ? row.attrs.mount : null;
+  // Named as the model names it, so the service's trajectory reads like the transcript.
+  const toolName = mount ? `${mount}__${tool}` : tool;
+  const ok = row.verdict === "ok";
+  const ms = typeof row.ms === "number" ? row.ms : 0;
+  // The operation id, on both events, is what pairs them: one per call and one row per operation
+  // (src/trace/seams.ts `operationEnds`). Not the model's call id, which a run_js program's host calls
+  // share and a resumed question reuses.
+  const toolUseId = row.spanId;
+  // How long the tool ran: from the attempt's start when the row says it (`attrs.runMs`), so a call held
+  // for a person's approval does not count the wait; otherwise the whole span. The call itself stays dated
+  // at the request, when the model asked for it.
+  const runMs = typeof row.attrs.runMs === "number" ? row.attrs.runMs : null;
+  const durationMs = runMs ?? (typeof row.ms === "number" ? row.ms : null);
+  const exitCode = typeof row.attrs.exitCode === "number" ? row.attrs.exitCode : null;
+  const marker = subagent ? { subagent } : {};
+  return [
+    { eventId: `${base.eventId}:pre`, occurredAt: new Date(row.at - ms).toISOString(), hookEventName: "PreToolUse", toolName, toolUseId, ...marker },
+    {
+      ...base,
+      hookEventName: ok ? "PostToolUse" : "PostToolUseFailure",
+      toolName,
+      toolUseId,
+      ...marker,
+      ok: toolOutcome(row.status, row.attrs.denied === true),
+      ...(durationMs === null ? {} : { durationMs }),
+      ...(exitCode === null ? {} : { exitCode }),
+      ...(ok ? {} : { errorClass: row.status }),
+    },
+  ];
+}
+
+/**
  * `ok` on a tool's end, from the operation's status (`row.status`, written verbatim): whether the call did what it
  * was asked. `succeeded` is true even for a command that exited non-zero (`exitCode` says that); `failed` and
  * `rejected` are false; `unknown` (the outcome was lost) and `cancelled` are null, which the service reads as "not
@@ -163,6 +189,59 @@ export function toolOutcome(status: string, denied = false): boolean | null {
     default: return null;
   }
 }
+
+/**
+ * A subagent's rows as Raft's subagent events (`SubagentLineage`): its start, its tool calls, its end. Ids and enums only.
+ *
+ *   subagent.start (spawn, follow_up) → the parent's own PreToolUse + PostToolUse for send_to_agent (no marker), then
+ *                                       SubagentStart { phase: "started" }
+ *   subagent.start (wake)             → SubagentStart { phase: "started" }
+ *   a child's tool.call               → PreToolUse + PostToolUse / PostToolUseFailure { phase: "active" }
+ *   subagent.turn done|failed|stopped|cancelled → SubagentStop { phase: "ended", outcome, reportChars }: a cancel is
+ *                                       `ceiling` only when its row's `cause` says the harness took it at its time or
+ *                                       lifetime; any other cancel is `stopped`
+ *   a child's model.call, js.run, a report's retry or drop, a wake that was never posted → nothing (never a Stop,
+ *                                       never a prompt)
+ */
+function subagentEvents(agentId: string, row: TraceOutboxRow, subagents: SubagentActivity): ActivityEvent[] {
+  const base = { eventId: activityEventId(agentId, row.seq), occurredAt: new Date(row.at).toISOString() };
+  const lineage = (taskId: string, parent: string | null | undefined, phase: "started" | "active" | "ended") =>
+    ({ ...(parent ? { parentToolUseId: parent } : {}), taskId, phase });
+  if (row.kind === "subagent.start") {
+    const taskId = row.spanId;
+    const parent = row.parentId ?? subagents.lineage(taskId, row.at);
+    // send_to_agent has no tool.call row (it is a model tool, not a gateway operation), so its pair's `toolUseId` is the
+    // model's call id: the same id the child's marker names as `parentToolUseId`, so the service can join the step to
+    // its child. It is unique per send: the start row is written once per turn (cf/src/runtime.ts `#sendToAgent`, a
+    // replay finds the turn already posted), and the tool is the model's own, not one of run_js's host calls (`offered`).
+    const toolUseId = row.parentId;
+    const own = row.status !== "wake" && toolUseId
+      ? [{ eventId: `${base.eventId}:pre`, occurredAt: base.occurredAt, hookEventName: "PreToolUse" as const, toolName: SEND_TOOL, toolUseId },
+         { ...base, eventId: `${base.eventId}:post`, hookEventName: "PostToolUse" as const, toolName: SEND_TOOL, toolUseId, ok: true }]
+      : [];
+    return [...own, { ...base, hookEventName: "SubagentStart", subagent: lineage(taskId, parent, "started") }];
+  }
+  if (row.kind === "subagent.turn") {
+    const outcome = row.status === "done" || row.status === "failed" || row.status === "stopped" ? row.status
+      : row.status === "cancelled" ? (row.attrs.cause === "ceiling" ? "ceiling" : "stopped") : null;
+    if (!outcome) return [];
+    const chars = typeof row.attrs.reportChars === "number" ? row.attrs.reportChars : 0;
+    // Inside the marker, where Raft reads them: its ingest keeps the marker and drops unknown top-level fields.
+    return [{ ...base, hookEventName: "SubagentStop",
+      subagent: { ...lineage(row.spanId, row.parentId ?? subagents.lineage(row.spanId, row.at), "ended"), outcome, reportChars: chars } }];
+  }
+  if (row.kind === "tool.call" && typeof row.attrs.task === "string") {
+    const taskId = row.attrs.task;
+    const ms = typeof row.ms === "number" ? row.ms : 0;
+    // The turn the step was part of: the one that had started when the step began, whatever turn runs by the time this
+    // is read (a flush behind a follow-up must not give a turn-1 step turn 2's parent).
+    return toolCallEvents(base, row, lineage(taskId, subagents.lineage(taskId, row.at - ms), "active"));
+  }
+  return [];
+}
+
+/** The parent's tool, as the model names it. */
+const SEND_TOOL = "send_to_agent";
 
 /**
  * What the service shows for a conversation the overflow backstop gave up on (src/runtime/overflow-backstop.ts): the

@@ -18,7 +18,7 @@ import { fromResponse, toRequest } from "../../src/model/pi-bridge.ts";
 import { clientTools } from "../../src/runtime/client-calls.ts";
 import { DurableAgent, PdHost } from "../../src/runtime/durable-agent.ts";
 import { ClientCallsDoc, waitingCalls } from "../../src/runtime/durable-tools.ts";
-import { parkVerdict, readSnapshot } from "../../src/runtime/durable-drive.ts";
+import { parkVerdict, readSnapshot, type SettleResult } from "../../src/runtime/durable-drive.ts";
 import { PiAgent } from "../../src/runtime/pi-agent.ts";
 import type { DurableSqlHost } from "../../src/store/pi-durable-sqlite.ts";
 import { UnknownJob } from "../../cf/src/model-queue.ts";
@@ -40,7 +40,12 @@ const NOTE_PROJECTOR = {
 /** What pi-durable 1.0.0 ends a call cut off by its turn's abort with (dist/harness/tool.js, the task's `abort`). */
 const ABORTED = "was aborted";
 
-type Eng = Engine & { name: "pi085" | "pd" };
+/**
+ * `deadlines` (pd only): every pass of the host that ended because its step deadline passed with work still running
+ * (`SettleResult` "timeout", src/runtime/durable-drive.ts `settle`), in order. Read off the pass itself rather than
+ * off the clock, so a slow host is not mistaken for a step that waited out its deadline.
+ */
+type Eng = Engine & { name: "pi085" | "pd"; deadlines?: Array<Extract<SettleResult, { state: "timeout" }>> };
 
 async function pi085(storage: DurableSqlHost, w: World): Promise<Eng> {
   const dispatched: string[] = [];
@@ -71,27 +76,38 @@ function pd(storage: DurableSqlHost, w: World, opts: { stepDeadlineMs?: number }
     dispatch: async (id) => { dispatched.push(id); }, unknownJob: (id) => new UnknownJob(id),
     ...toolOptions(w), clientTools: WEATHER, cancelNote: CANCELLED_NOTE,
   });
-  return { name: "pd", agent, dispatched, pd: host };
+  const deadlines: NonNullable<Eng["deadlines"]> = [];
+  const pass = host.drive.bind(host);
+  host.drive = async () => {
+    const result = await pass();
+    if (result.state === "timeout") deadlines.push(result);
+    return result;
+  };
+  return { name: "pd", agent, dispatched, pd: host, deadlines };
 }
 
 type Job = { model: { api: string; provider: string; id: string }; context: Parameters<typeof toRequest>[0] };
 
 /**
  * Drive until nothing is open and nothing is due, as `AgentRuntime.step` does, answering each model call from
- * `script` in turn (`at` counts the turns used so far, across calls). Returns the last outcome.
+ * `script` in turn (`at` counts the turns used so far, across calls). Returns the last outcome. Every `wakeInMs` it
+ * slept for, the alarms the object would have set, is added to `alarms` for the engine.
  */
 const taken = new WeakMap<Eng, Set<string>>();
+const alarms = new WeakMap<Eng, number[]>();
 async function drive(e: Eng, script: Turn[], at: { n: number }, requests: Request[], onPass?: () => Promise<void>) {
   const answered = taken.get(e) ?? new Set<string>();
   taken.set(e, answered);
   for (let guard = 0; guard < 300; guard++) {
-    const t0 = Date.now();
+    const before = e.deadlines?.length ?? 0;
     const out = await e.agent.step();
     await onPass?.();
     // No pass driven here has work that runs that long (a slow call is stepped by `stepUntil` instead): a pd step that
-    // reaches its deadline was held open by something the park rule did not let go.
-    check(e.name !== "pd" || Date.now() - t0 < STEP_DEADLINE_MS - 500,
-      `pd: the step held the harness open until its deadline (${Date.now() - t0} ms) and left ${show(out)}`);
+    // reaches its deadline was held open by something the park rule did not let go. Asked of the pass, not of the
+    // elapsed time: a step on a loaded host can take longer than the deadline's worth of wall time and still have
+    // ended because its work let go, and the time bound read that as this failure.
+    const late = e.deadlines?.slice(before) ?? [];
+    check(late.length === 0, `pd: the step held the harness open until its deadline, the last verdict ${show(late.at(-1)?.last)}, and left ${show(out)}`);
     const pending = e.dispatched.filter((id) => !answered.has(id));
     for (const id of pending) {
       answered.add(id);
@@ -111,6 +127,7 @@ async function drive(e: Eng, script: Turn[], at: { n: number }, requests: Reques
       return out;
     }
     check(out.wakeInMs !== null && out.wakeInMs <= 5_000, `${e.name}: stuck: ${show(out)}`);
+    alarms.set(e, [...(alarms.get(e) ?? []), out.wakeInMs]);
     await sleep(out.wakeInMs);
   }
   throw new Error(`${e.name}: did not settle`);
@@ -294,9 +311,10 @@ export function pdCancelCases(withHost: WithDriveHost): DriveCase[] {
       const at = { n: 0 };
       const script = [calls(["call_1", "get_weather", { city: "Paris" }]), say("21 degrees")];
       await e.agent.say("weather in Paris?");
-      const t0 = Date.now();
       const paused = await drive(e, script, at, requests);
-      check(Date.now() - t0 < 2_500, `${e.name}: pausing for the caller took ${Date.now() - t0} ms`);
+      // Pausing for the caller waits on nothing: no alarm, and on pd no deadline (`drive` checks that each step). Asked
+      // of what the steps returned rather than of the elapsed time, which a loaded host stretches with nothing wrong.
+      check(!alarms.get(e)?.length, `${e.name}: pausing for the caller waited on alarms ${show(alarms.get(e))}`);
       check(paused.open === 0 && paused.wakeInMs === null, `${e.name}: the paused step said ${show(paused)}`);
       if (e.name === "pd") check(!e.pd!.open, "pd: the harness is still open while only the caller is awaited");
       const waiting = await apiView(e);
@@ -316,10 +334,9 @@ export function pdCancelCases(withHost: WithDriveHost): DriveCase[] {
   add("client", "the park rule: a tool waiting on the caller is parked with no alarm when its call is unanswered in ap.clientCalls, and held open when it is not named", async () => {
     await onPd(async (e) => {
       await e.agent.say("weather?");
-      const t0 = Date.now();
       const out = await drive(e, [calls(["call_9", "get_weather", { city: "Oslo" }])], { n: 0 }, []);
       check(out.open === 0 && out.wakeInMs === null && !e.pd!.open, `the step left ${show(out)}, open ${e.pd!.open}`);
-      check(Date.now() - t0 < 5_000, "the step waited out its deadline instead of parking on the caller");
+      check(e.deadlines!.length === 0, `the step waited out its deadline instead of parking on the caller: ${show(e.deadlines)}`);
       // The same state, live: resumed, the tool runs again, finds no answer and waits. The verdict on it with the
       // document read, and — the control — without.
       const verdicts = await e.pd!.withHarness(async (h) => {

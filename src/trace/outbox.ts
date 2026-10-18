@@ -68,21 +68,33 @@ const TABLE = "CREATE TABLE IF NOT EXISTS trace_outbox(" +
 // is `online`, a status-only activity event.
 // `mount.settings` is an operator's in-place change of a mount's settings (`PATCH /admin/mounts`, cf/src/runtime.ts
 // `updateMountSettings`): `attrs` the alias, the plugin and the keys that changed. Activity and status skip it.
+// `subagent.turn` is one turn of a subagent ending (src/runtime/subagents.ts, cf/src/runtime.ts `#reportSubagents`): its
+// span the child's session, its parent the tool call that sent the turn, `status` done, failed, cancelled; `attrs` the
+// session that started it. The child's own `model.call` and `tool.call` rows name its session. Activity and status skip it.
+// `subagent.start` is a child's turn beginning (cf/src/runtime.ts `#sendToAgent`, a background wake): span the child,
+// parent the tool call that sent it (none for a wake), `attrs` the session that started it, the turn, and `how` (`spawn`,
+// `follow_up`, `wake`). Ids and counts only, never the task. Activity and status skip it unless SUBAGENT_ACTIVITY is on.
+// `subagent.model_changed` is a child's calls moving to another model since its spawn (a pin or a picker switch set
+// since, cf/src/runtime.ts `takeJob`): span the child, `attrs` from, to and why. Activity and status skip it.
 // The rest are the kinds a plugin may write itself, through `PluginContext.trace` (`PLUGIN_TRACE_KINDS`). Activity and
-// status skip them.
+// status skip them. `raft.state_save_failed` is no longer written (it is `raft.state_failed` now) and stays here only so
+// a row of that kind still in an outbox is drained and read as a row, not dropped as damage.
 export const TRACE_KINDS = ["model.call", "tool.call", "approval.wait", "container.lease", "inbound", "mount.seeded", "harness.open",
   "turn.stop", "js.run",
   "rebuild.decision", "rebuild.outcome", "rebuild.behaviour", "session.needs_reset", "turn.timing", "import.hold", "model.prewarm",
-  "agent.ready", "mount.settings", "raft.held", "raft.held_answer", "raft.state_save_failed"] as const;
+  "agent.ready", "mount.settings", "subagent.start", "subagent.turn", "subagent.model_changed", "raft.held", "raft.held_answer", "raft.state_failed", "raft.state_save_failed", "raft.mcp_call"] as const;
 export type TraceKind = (typeof TRACE_KINDS)[number];
 
 /**
  * The kinds a plugin may write (`PluginContext.trace`): its own facts, never a kind a seam of the kernel writes, so a
  * plugin cannot add a `tool.call` or a `model.call` the drain would count. The gateway refuses any other kind.
  * `raft.held` is a Raft call held for the model's decision, `raft.held_answer` the model's answer to one, and
- * `raft.state_save_failed` the Raft SDK's state that did not load or save (src/plugins/raft.ts says what each holds).
+ * `raft.state_failed` the Raft SDK's state that did not load or save (src/plugins/raft.ts says what each holds).
+ * `raft.mcp_call` is one managed MCP call's end, on the call's span: the connector's server name and the remote tool's
+ * name, and how it ended (`result`, `tool_error`, or the SDK's failure kind); never its arguments or its result
+ * (src/plugins/raft-mcp.ts).
  */
-export const PLUGIN_TRACE_KINDS = ["raft.held", "raft.held_answer", "raft.state_save_failed"] as const satisfies readonly TraceKind[];
+export const PLUGIN_TRACE_KINDS = ["raft.held", "raft.held_answer", "raft.state_failed", "raft.mcp_call"] as const satisfies readonly TraceKind[];
 export type PluginTraceKind = (typeof PLUGIN_TRACE_KINDS)[number];
 
 export const TRACE_VERDICTS = ["ok", "failed", "blocked", "cancelled"] as const;

@@ -37,7 +37,7 @@ import { secretRefKind } from "../../src/runtime/secrets.ts";
 import { DynamicWorkerExecutor, handleSandboxCall, handleSandboxSuspend, type SuspendRequest } from "../../src/runtime/dynamic-worker-executor.ts";
 import { executorSpec } from "../../test/spec/executor-spec.ts";
 import {
-  AgentRuntime, type FreshContextResult, type RestartResult, reconcileSeed, OPERATOR_RUN9_REF, isOperatorModelRef, parsePluginChoice, SEEDED_PLUGINS, installedRows, messageRefusal, consoleAdded, CONSOLE_MOUNTS_MAX, agentKind, seedInstallation, recordReleaseError } from "./runtime.ts";
+  AgentRuntime, type RuntimeDeps, type FreshContextResult, type RestartResult, reconcileSeed, OPERATOR_RUN9_REF, isOperatorModelRef, parsePluginChoice, SEEDED_PLUGINS, installedRows, messageRefusal, consoleAdded, CONSOLE_MOUNTS_MAX, agentKind, seedInstallation, recordReleaseError } from "./runtime.ts";
 import { readMeter } from "../../bench/meter.ts";
 import { BENCH_SWE_WITHHELD } from "../../bench/swebench/withheld.ts";
 import { contextWindowFor } from "../../src/model/context-windows.ts";
@@ -69,6 +69,8 @@ import {
   isAdmin,
 } from "./auth.ts";
 import { adminTranscript } from "./admin-transcript.ts";
+import { readFrictionWindow, type FrictionLimits, type FrictionWindow } from "./friction-read.ts";
+import { dailyCron, frictionDaily, scanDay, tenantScope, writeReport, type FrictionBucket, type WindowReader } from "./friction-scan.ts";
 import { refuseSecret } from "./secret-shape.ts";
 import { adminDiagnose } from "./admin-diagnose.ts";
 import { adminMigrateEngine, type MigrateOp } from "./admin-migrate.ts";
@@ -77,7 +79,7 @@ import { agentObjectName } from "./object-name.ts";
 import { readTranscript, transcriptEvents, approvalsByOp, isPd, type TranscriptEvents } from "./transcript-read.ts";
 import { operatorCredentials } from "./operator-ref.ts";
 import { agentSecretValues, credentialRedactor, evalTranscript, localTrace, readTraceWindow, redactCredentials, type EvalTranscript } from "./eval-read.ts";
-import type { TraceOutboxRow } from "../../src/trace/outbox.ts";
+import { appendTrace, type TraceOutboxRow } from "../../src/trace/outbox.ts";
 import { readEngineStorage } from "./engine-read.ts";
 import { pdVersion } from "../../src/runtime/pd-transcript.ts";
 import { compactionRefusal, refusingCompaction } from "./compact-refusal.ts";
@@ -92,15 +94,16 @@ import { drainCursors, hasUnsent, standDownDelay, USAGE_WAKE_DELAY_MS } from "./
 import type { SurfaceDeps } from "./agent-surface/surface.ts";
 import type { HeldListing, HeldRead } from "../../src/plugins/types.ts";
 import { heldFiles as surfaceHeldFiles, stateGet as surfaceStateGet, stateList as surfaceStateList } from "./agent-surface/in-agent.ts";
-import { flushActivityThenTrace } from "./activity-raft.ts";
+import { flushActivityThenTrace, subagentActivityFor } from "./activity-raft.ts";
 import { usagePanel } from "./usage.ts";
 import { d1ApiKeys, admit, d1Identities, d1InboundHooks, type IdentityDirectory } from "./control-plane.ts";
 import { d1ServiceTokens } from "./control-plane.ts";
 import { adminServiceTokens } from "./admin-service-tokens.ts";
 import { hashServiceToken, looksLikeServiceToken } from "./service-token.ts";
-import { adminProviderTokens } from "./admin-provider-tokens.ts";
-import { d1Connections, d1Connectors, d1ModelChoices, d1ModelOverrides, d1ProviderTokens, d1ProvisionedAgents, d1TenantModelPicker } from "./control-plane.ts";
-import { CONNECT_START_PATH, CONNECTION_PLUGIN, connectCallback, connectLink, connectStart, isConnectCallback, type ConnectDeps } from "./provision/connect.ts";
+import { adminProviderTokens, reservedTenantProblem } from "./admin-provider-tokens.ts";
+import { d1ConnectorGrants, d1Connections, d1Connectors, type ConnectorRefresh, d1ModelChoices, d1ModelOverrides, d1ProviderTokens, d1ProvisionedAgents, d1TenantModelPicker } from "./control-plane.ts";
+import type { GithubGrant } from "./github-token.ts";
+import { CONNECT_START_PATH, CONNECTION_PLUGIN, connectCallback, connectLink, connectStart, isConnectCallback, type ConnectDeps, type ReconnectTarget } from "./provision/connect.ts";
 import { hashProviderToken, looksLikeProviderToken } from "./provider-token.ts";
 import { handleProvision, IMPORT_REQUEST_MAX_BYTES, IMPORT_ROUTE, type ProvisionDeps, type ProvisionTool } from "./provision/handlers.ts";
 import { sharedUsageCache } from "./provision/usage.ts";
@@ -116,6 +119,7 @@ import { clip, logEvent, routeOf, setLogSink } from "../../src/core/log.ts";
 import type { FirstTurn } from "../../src/runtime/prewarm.ts";
 import { callPrewarm, operatorModelOf, queuedCall, planBinding, resolveModel } from "./model-request.ts";
 import { userModelsFrom } from "../../src/model/user-models.ts";
+import { subagentsDisabledBy } from "../../src/runtime/agent-settings.ts";
 import { DEFAULT_PROVIDER, providerStatus, type ModelChoice } from "../../src/model/providers.ts";
 import { consumeModelCalls, isUnknownJobReply, replyingUnknownJob, type ModelQueueDeps, type QueuedModelCall, type UnknownJobReply } from "./model-queue.ts";
 import {
@@ -212,6 +216,32 @@ export interface Env {
    * cf/wrangler.jsonc or cf/wrangler.preview.jsonc sets it.
    */
   MODEL_PICKER_ENFORCE?: string;
+  /**
+   * "1" turns subagents (src/runtime/subagents.ts) off for every agent of the deployment, whatever an agent's own setting
+   * says: the kill switch, a var rather than a code change (docs/runbook.md, "Subagents"). Unset: on for every hosted agent.
+   */
+  SUBAGENTS_DISABLED?: string;
+  /**
+   * "1" sends subagents' activity to Raft as its `SubagentLineage` events (src/runtime/activity.ts `subagentEvents`):
+   * SubagentStart, the child's tool steps, SubagentStop. Off until Raft's ingest accepts the marker: unknown fields are
+   * stripped there, and a child's step without its marker would read as the agent's own.
+   */
+  SUBAGENT_ACTIVITY?: string;
+  /** "1" stops the daily friction scan and its on-demand route (cf/src/friction-scan.ts; docs/runbook.md, "Where agents get stuck"). */
+  FRICTION_SCAN_DISABLED?: string;
+  /**
+   * Whose conversations the friction scan reads: comma-separated tenant ids, or `*` for every hosted (`raft_`) tenant.
+   * Unset or empty: nobody. The bench tenant never, whatever this says.
+   */
+  FRICTION_SCAN_TENANTS?: string;
+  /** "1" files the scan's findings as GitHub issues, and only together with FRICTION_GITHUB_TOKEN and FRICTION_HASH_KEY. Unset: off. */
+  FRICTION_ISSUES?: string;
+  /** The friction scan's own GitHub credential (a secret), used for nothing else. */
+  FRICTION_GITHUB_TOKEN?: string;
+  /** The secret key agent ids are HMAC'd under in a public issue (cf/src/friction.ts `agentHash`); without it, no issues. */
+  FRICTION_HASH_KEY?: string;
+  /** Where the friction scan files issues; unset is botiverse/antiproton. */
+  FRICTION_ISSUES_REPO?: string;
   /** The canonical origin, so the registered callback URL is built from a
    *  constant and never from an inbound Host header. */
   /** Login with GitHub: the OAuth App tygg owns, callback /login/github/callback. */
@@ -267,16 +297,6 @@ type WorkerCode = {
   limits?: { cpuMs?: number; subRequests?: number };
 };
 type WorkerStub = { getEntrypoint(name?: string | null, opts?: unknown): { fetch(req: Request): Promise<Response> } };
-
-/** The P0 probe binding (kept for the substrate checks). */
-export class ToolBinding extends WorkerEntrypoint {
-  async invoke(name: string, args: unknown) {
-    const caller = (this.ctx as any).props ?? {};
-    if (name === "echo") return { status: "succeeded", result: { args, tenant: caller.tenantId } };
-    if (name === "slow") { await new Promise((r) => setTimeout(r, 20)); return { status: "succeeded", result: {} }; }
-    return { status: "rejected", error: { code: "not_mounted", message: name } };
-  }
-}
 
 /**
  * What the sandbox sees as `env.TOOLS`. It holds no authority of its own: the
@@ -359,50 +379,10 @@ function modelQueueDeps(env: Env): ModelQueueDeps {
 
 export { agentObjectName };
 
-const RUNNER = (body: string) => `
-export default {
-  async fetch(request, env) {
-    const out = [];
-    const output = (v) => out.push(v);
-    try {
-      const result = await (async () => { ${body} })();
-      return Response.json({ ok: true, out, result: result ?? null });
-    } catch (e) {
-      return Response.json({ ok: false, out, error: String(e && e.message || e) });
-    }
-  }
-};`;
-
-async function runSandbox(
-  env: Env,
-  body: string,
-  opts: { limits?: { cpuMs?: number; subRequests?: number }; outbound?: unknown; tools?: unknown } = {},
-) {
-  const stub = env.LOADER.load({
-    compatibilityDate: "2026-09-05",
-    mainModule: "main.js",
-    modules: { "main.js": RUNNER(body) },
-    globalOutbound: opts.outbound === undefined ? null : opts.outbound,
-    env: opts.tools ? { TOOLS: opts.tools } : {},
-    limits: opts.limits,
-  });
-  // A CPU/subrequest kill is NOT catchable inside the sandbox: it surfaces as a
-  // rejection here, in the caller. Every invocation must therefore be wrapped —
-  // otherwise one runaway script takes down the supervisor's whole request.
-  try {
-    const res = await stub.getEntrypoint().fetch(new Request("https://sandbox/"));
-    return await res.json();
-  } catch (e: any) {
-    return { ok: false, terminatedByHost: true, error: String(e?.message ?? e).slice(0, 120) };
-  }
-}
-
 export class AgentDO extends DurableObject<Env> {
   sql: SqlStorage;
   #store: DurableObjectStore | null = null;
   #runtime: AgentRuntime | null = null;
-  alarmFiredAt: number | null = null;
-  alarmSetAt: number | null = null;
   /** One variable, flipped at runtime, so the A/B is the same code path. */
   // NOT instance state. A Durable Object is evicted and rebuilt freely, and an
   // in-memory flag silently reverts to its default when that happens — which is
@@ -423,9 +403,6 @@ export class AgentDO extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
-    this.sql.exec(`CREATE TABLE IF NOT EXISTS probe_tasks(
-      task_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, generation INTEGER NOT NULL,
-      checkpoint_version INTEGER NOT NULL, fencing_token INTEGER NOT NULL, checkpoint TEXT NOT NULL)`);
     // What Cloudflare bills this object for: wall clock while it is active.
     this.sql.exec("CREATE TABLE IF NOT EXISTS do_activity(at INTEGER, ms INTEGER, kind TEXT)");
     // Created here rather than on first claim: the alarm reads it, and an alarm
@@ -439,44 +416,6 @@ export class AgentDO extends DurableObject<Env> {
     // The bench runtime has to survive eviction: an alarm on a fresh instance
     // must rebuild the same harness, not fall back to the default one.
     this.sql.exec("CREATE TABLE IF NOT EXISTS bench_config(k TEXT PRIMARY KEY, v TEXT)");
-    this.sql.exec(`CREATE TABLE IF NOT EXISTS probe_outbox(
-      command_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, state TEXT NOT NULL)`);
-  }
-
-  /** The three-gate advance from §7.3, on DO SQLite, timed. */
-  async verifyStorage() {
-    const t0 = Date.now();
-    this.sql.exec("DELETE FROM probe_tasks");
-    this.sql.exec("DELETE FROM probe_outbox");
-    this.sql.exec(
-      "INSERT INTO probe_tasks VALUES ('t1','tenant-a',0,0,0,?)", JSON.stringify({ log: [] }));
-
-    const commit = (gen: number, token: number, version: number, cmd: string) =>
-      this.ctx.storage.transactionSync(() => {
-        const row = [...this.sql.exec("SELECT * FROM probe_tasks WHERE task_id='t1'")][0] as any;
-        if (token < row.fencing_token) return "fenced";
-        if (gen !== row.generation) return "stale_generation";
-        if (version !== row.checkpoint_version) return "version_conflict";
-        this.sql.exec(
-          "UPDATE probe_tasks SET checkpoint_version=?, fencing_token=?, checkpoint=? WHERE task_id='t1'",
-          row.checkpoint_version + 1, token, JSON.stringify({ log: [cmd] }));
-        this.sql.exec("INSERT INTO probe_outbox VALUES (?, 't1', 'pending') ON CONFLICT DO NOTHING", cmd);
-        return "ok";
-      });
-
-    const results = {
-      happyPath: commit(0, 5, 0, "cmd-1"),
-      staleVersion: commit(0, 5, 0, "cmd-dup"),
-      fenced: commit(0, 1, 1, "cmd-zombie"),
-      staleGeneration: commit(9, 6, 1, "cmd-oldgen"),
-      replayIsIdempotent: (() => {
-        commit(0, 6, 1, "cmd-1");
-        return [...this.sql.exec("SELECT count(*) AS n FROM probe_outbox WHERE command_id='cmd-1'")][0];
-      })(),
-      rowsAfter: [...this.sql.exec("SELECT * FROM probe_tasks")][0],
-      ms: Date.now() - t0,
-    };
-    return results;
   }
 
   /**
@@ -501,7 +440,18 @@ export class AgentDO extends DurableObject<Env> {
       ...operatorCredentials(this.env),
       reminderApp: { origin: this.env.REMINDER_APP_ORIGIN, credential: this.env.REMINDER_APP_CREDENTIAL },
       secretKek: this.env.SECRET_KEK,
+      github: githubRenewal(this.env),
       modelInputEvidence: evalSeedRoutes(this.env),
+      // Subagents for every hosted agent, unless the agent's setting says no or the deployment's kill switch is set.
+      subagentsDefault: true,
+      subagentsDisabled: subagentsDisabledBy(this.env as unknown as Record<string, unknown>),
+      // The owner's model options: what a subagent may be started on (src/runtime/subagents.ts), under the same pins and
+      // switch as the agent's own pick.
+      userModels: userModelsFrom(this.env as unknown as Record<string, unknown>, operatorModelOf(this.env).providers),
+      subagentModelRules: async (tenantId, agentId) => ({
+        layers: await d1ModelChoices(this.env.CONTROL_DB).layers(tenantId, agentId),
+        pickerOff: modelPickerEnforced(this.env) && !(await d1TenantModelPicker(this.env.CONTROL_DB).enabled(tenantId)),
+      }),
       // Plugins may make their own mount's hooks (Raft push); the URL must be
       // one a service can reach, which the console's own origin may not be.
       hooks: this.env.HOOK_ORIGIN
@@ -566,7 +516,7 @@ export class AgentDO extends DurableObject<Env> {
    * never a decision. That rule has already been broken once: the offload flag
    * lived only in memory, silently reverted to its default after an eviction,
    * and turned the control arm of an A/B into a half-offloaded run that looked
-   * completely plausible. Exercised by /eviction so the rule is checked rather
+   * completely plausible. `restart` uses it, so the rule is exercised rather
    * than remembered.
    */
   async simulateEviction() {
@@ -579,15 +529,6 @@ export class AgentDO extends DurableObject<Env> {
     this.#benchOffload = true;
     this.#offloadDefault = true;
     return { evicted: true };
-  }
-
-  /** Which tenants have rows in THIS object's database. Structural isolation
-   *  means this can only ever be the one tenant the object belongs to. */
-  async listTenants(): Promise<string[]> {
-    try {
-      return (this.sql.exec("SELECT DISTINCT tenant_id FROM tasks").toArray() as any[])
-        .map((r) => String(r.tenant_id)).sort();
-    } catch { return []; }
   }
 
   /** Who this object serves, once claimed. Absent until something claims it —
@@ -868,18 +809,6 @@ export class AgentDO extends DurableObject<Env> {
     return this.#busy("migrateEngine", () => (dryRun ? run() : this.ctx.blockConcurrencyWhile(run)));
   }
 
-  /** The binding, credential-free, so an operator can see whose key is in use. */
-  async modelBinding(tenantId: string, agentId: string) {
-    const rt = this.#activeRuntime();
-    await rt.ready();
-    return rt.store.getModelBinding(tenantId, agentId);
-  }
-
-  /** Exposed so the eviction check can read the persisted decision. */
-  async readOffload(): Promise<boolean> {
-    return this.#offloadOn();
-  }
-
   #offloadOn(): boolean {
     const row = this.sql.exec("SELECT v FROM bench_config WHERE k='offload'").toArray()[0] as any;
     return row ? row.v === "1" : this.#offloadDefault;
@@ -941,6 +870,8 @@ export class AgentDO extends DurableObject<Env> {
     this.#benchModeCached = mode;
     const swe = mode === "swe";
     this.#benchRuntime = new AgentRuntime({
+      // Off unless a task's agent is given the setting: a bench arm must not change under a measurement.
+      subagentsDisabled: subagentsDisabledBy(this.env as unknown as Record<string, unknown>),
       ctx: this.ctx,
       bucket: this.env.ARTIFACTS,
       bucketName: this.env.ARTIFACT_BUCKET,
@@ -1105,7 +1036,8 @@ export class AgentDO extends DurableObject<Env> {
    * through the agent's dispatch, which is where an ended task is refused. Without this, the runner graded
    * and released while a stalled agent kept running: its next shell command provisioned a new box that
    * nobody released or counted, and a job left on the released box failed about forty minutes later and woke
-   * the idle agent into doing the same. Idempotent, and release calls it too.
+   * the idle agent into doing the same. Idempotent, and release calls it too. The agent's subagents, if it has any,
+   * end with it.
    */
   async benchSweFinish(taskId: string) {
     return this.#busy("benchSweFinish", () => this.#benchSweFinish(taskId));
@@ -1116,7 +1048,9 @@ export class AgentDO extends DurableObject<Env> {
     this.#setBenchConfig(`ended:${agentId}`, String(Date.now()));
     const rt = this.#activeRuntime();
     await rt.ready();
-    return rt.cancelSession("bench", agentId, MAIN_SESSION);
+    // The task's subagents with it, as a stop ends them: marked stopped first, so none reports into the ended task,
+    // then each one with work cancelled (`cancelSessionTree`); then the agent's own turn.
+    return rt.cancelSessionTree("bench", agentId, MAIN_SESSION);
   }
 
   /** Hands the machine back, after ending the agent's part (benchSweFinish) so nothing can make another. */
@@ -1578,10 +1512,27 @@ export class AgentDO extends DurableObject<Env> {
       if (!(await rt.store.getModelBinding(tenantId, agentId))) {
         return { cancelledTurn: null as string | null, stoppedJobs: [] as string[], stillRunning: [] as string[] };
       }
-      const out = await rt.cancelSession(tenantId, agentId, sessionId);
+      // The session's subagents with it: they are its work (src/runtime/subagents.ts).
+      const { stoppedSubagents: _children, ...out } = await rt.cancelSessionTree(tenantId, agentId, sessionId);
       await this.#wake();
       await this.broadcast();
       return out;
+    });
+  }
+
+  /**
+   * Before a session is deleted (Agents API DELETE /sessions/:id): the subagents it started are stopped, and their owed
+   * reports dropped, so nothing it began keeps calling the model or wakes a conversation nobody can read any more.
+   */
+  async apiStopSessionSubagents(tenantId: string, agentId: string, sessionId: string) {
+    this.#claim(tenantId, agentId);
+    return this.#busy("apiStopSessionSubagents", async () => {
+      const rt = this.runtime();
+      await rt.ready();
+      if (!(await rt.store.getModelBinding(tenantId, agentId))) return { stoppedSubagents: [] as string[] };
+      const { stoppedSubagents } = await rt.cancelSessionTree(tenantId, agentId, sessionId, { childrenOnly: true });
+      await this.broadcast();
+      return { stoppedSubagents };
     });
   }
 
@@ -1979,24 +1930,39 @@ export class AgentDO extends DurableObject<Env> {
   }
 
   /** Connect flow (provision/connect.ts): a finished flow's token, held until Raft confirms its initiator. */
-  async connectionHold(tenantId: string, agentId: string, plugin: string, token: string, id: string, exp: number, raftUserId: string) {
+  async connectionHold(tenantId: string, agentId: string, plugin: string, grant: GithubGrant, id: string, exp: number, raftUserId: string,
+    reconnect: ReconnectTarget | null = null) {
     this.#claim(tenantId, agentId);
-    return this.#busy("connectionHold", () => this.runtime().holdConnection(tenantId, agentId, plugin, token, id, exp, raftUserId));
+    return this.#busy("connectionHold", () => this.runtime().holdConnection(tenantId, agentId, plugin, grant, id, exp, raftUserId, reconnect));
   }
 
-  async connectionConfirm(tenantId: string, agentId: string, plugin: string, id: string, raftUserId: string) {
+  /** A connector this agent is on was reconnected in place: take its new pair (provision/handlers.ts `reconnectInPlace`). */
+  async connectionReconnect(tenantId: string, agentId: string, plugin: string, connectorId: string, was: { ciphertext: string; iv: string },
+    sealed: { ciphertext: string; iv: string }, refresh: ConnectorRefresh | null) {
     this.#claim(tenantId, agentId);
-    return this.#busy("connectionConfirm", () => this.runtime().confirmConnection(tenantId, agentId, plugin, id, raftUserId));
+    return this.#busy("connectionReconnect", () => this.runtime().reconnectConnection(tenantId, agentId, plugin, connectorId, was, sealed, refresh));
   }
 
-  async connectionAttach(tenantId: string, agentId: string, plugin: string, sealed: { ciphertext: string; iv: string }) {
+  async connectionConfirm(tenantId: string, agentId: string, plugin: string, id: string, raftUserId: string, connectorId: string | null = null) {
     this.#claim(tenantId, agentId);
-    return this.#busy("connectionAttach", () => this.runtime().attachSealedConnection(tenantId, agentId, plugin, sealed));
+    return this.#busy("connectionConfirm", () => this.runtime().confirmConnection(tenantId, agentId, plugin, id, raftUserId, connectorId));
   }
 
-  async connectionDetachIfFrom(tenantId: string, agentId: string, plugin: string, sealed: { ciphertext: string; iv: string }) {
+  async connectionAttach(tenantId: string, agentId: string, plugin: string, sealed: { ciphertext: string; iv: string },
+    refresh: (ConnectorRefresh & { connectorId: string | null }) | null = null) {
     this.#claim(tenantId, agentId);
-    return this.#busy("connectionDetachIfFrom", () => this.runtime().detachConnectionIfFrom(tenantId, agentId, plugin, sealed));
+    return this.#busy("connectionAttach", () => this.runtime().attachSealedConnection(tenantId, agentId, plugin, sealed, refresh));
+  }
+
+  async connectionDetachIfFrom(tenantId: string, agentId: string, plugin: string, sealed: { ciphertext: string; iv: string }, connectorId: string | null = null) {
+    this.#claim(tenantId, agentId);
+    return this.#busy("connectionDetachIfFrom", () => this.runtime().detachConnectionIfFrom(tenantId, agentId, plugin, sealed, connectorId));
+  }
+
+  /** Another agent renewed a connector this agent's mount is on: take the new pair (cf/src/github-refresh.ts). */
+  async connectionAdopt(tenantId: string, agentId: string, plugin: string, connectorId: string) {
+    this.#claim(tenantId, agentId);
+    return this.#busy("connectionAdopt", () => this.runtime().adoptConnection(tenantId, agentId, plugin, connectorId));
   }
 
   async connectionDetach(tenantId: string, agentId: string, plugin: string) {
@@ -2026,6 +1992,22 @@ export class AgentDO extends DurableObject<Env> {
   async adminMountSettings(tenantId: string, agentId: string, alias: string, settings: Json) {
     this.#claim(tenantId, agentId);
     return this.#busy("adminMountSettings", () => this.runtime().updateMountSettings(tenantId, agentId, alias, settings));
+  }
+
+  /** The agent's settings and subagents (`/admin/agent-settings`); null for an agent that is not here. */
+  async adminAgentSettings(tenantId: string, agentId: string) {
+    this.#claim(tenantId, agentId);
+    return this.#busy("adminAgentSettings", () => this.runtime().agentSettingsOf(tenantId, agentId));
+  }
+
+  async adminUpdateAgentSettings(tenantId: string, agentId: string, settings: unknown) {
+    this.#claim(tenantId, agentId);
+    return this.#busy("adminUpdateAgentSettings", async () => {
+      const r = await this.runtime().updateAgentSettings(tenantId, agentId, settings, "operator");
+      // Subagents switched off stop at the write (`updateAgentSettings`); the pass asked for now posts their notice.
+      if (r.ok && (r as { stoppedSubagents?: number }).stoppedSubagents) await this.#wake();
+      return r;
+    });
   }
 
   async adminRefreshMountTools(tenantId: string, agentId: string, alias: string) {
@@ -2488,6 +2470,15 @@ export class AgentDO extends DurableObject<Env> {
     return readTranscript(this.sql, tenantId, agentId, taskId);
   }
 
+  /**
+   * The friction scan's read of this agent (cf/src/friction-read.ts): its conversations live in [from, to), shrunk to
+   * what the classifier reads, user messages left out. SELECTs only, as adminTranscript. Null for an agent this object
+   * does not hold.
+   */
+  async frictionWindow(tenantId: string, agentId: string, from: number, to: number, limits: FrictionLimits): Promise<FrictionWindow | null> {
+    return readFrictionWindow(this.sql as any, tenantId, agentId, from, to, limits);
+  }
+
   #ownerAgent(): string | null {
     const row = this.sql.exec("SELECT agent_id FROM owner WHERE k='self'").toArray()[0] as any;
     return row ? String(row.agent_id) : null;
@@ -2541,6 +2532,17 @@ export class AgentDO extends DurableObject<Env> {
       await rt.provision(tenantId, agentId);
       await this.#bindModel(rt, tenantId, agentId);
       const r = await rt.postMessage(tenantId, agentId, text);
+      // The operator's message is one the agent was given, as a push is: the same `inbound` row, `delivered`, so activity
+      // reads it as the turn's UserPromptSubmit. Alias `operator`: no hook carried it. Only for a message the engine
+      // took: a refusal throws above, and a post that wrote nothing answers no result. The span id is capped, as the
+      // task id is the caller's. A reading: a failure is logged.
+      const took = r.result !== null && r.result !== undefined && (r.result as { ok?: unknown }).ok !== false && !(r as { skipped?: true }).skipped;
+      if (took) {
+        try {
+          appendTrace(this.sql as never, [{ at: Date.now(), tenantId, agentId, kind: "inbound", spanId: `operator:${String(taskId).slice(0, 64)}`,
+            status: "delivered", verdict: "ok", attrs: { alias: "operator", source: "operator" } }]);
+        } catch (e) { console.error(`the inbound row of ${tenantId}/${agentId}'s operator message could not be written:`, e); }
+      }
       // Wakeup is an alarm, not a poll: nothing spins while the agent has no work.
       await this.#wake();
       return r;
@@ -2669,12 +2671,6 @@ export class AgentDO extends DurableObject<Env> {
     return { implementation: "cloudflare-dynamic-workers", ms: Date.now() - t0, results };
   }
 
-  async armAlarm(delayMs: number) {
-    this.alarmSetAt = Date.now();
-    this.alarmFiredAt = null;
-    await this.#wake(Date.now() + delayMs);
-    return { armedAt: this.alarmSetAt, delayMs };
-  }
   /**
    * Arm the next alarm *before* doing the work, not after.
    *
@@ -2696,9 +2692,6 @@ export class AgentDO extends DurableObject<Env> {
     if (failures < 20) await this.ctx.storage.setAlarm(Date.now() + 30_000);
     try {
       await this.#busy("alarm", async (span) => {
-        this.alarmFiredAt = Date.now();
-        this.sql.exec("CREATE TABLE IF NOT EXISTS alarms(at INTEGER)");
-        this.sql.exec("INSERT INTO alarms VALUES (?)", this.alarmFiredAt);
         // The object may have been evicted since the alarm was armed, so this
         // instance can be brand new: build the runtime rather than assuming it.
         const rt = this.#activeRuntime();
@@ -2733,7 +2726,8 @@ export class AgentDO extends DurableObject<Env> {
         // This pass's activity to the service that runs this agent, then this pass's trace rows
         // to R2, with the export holding whatever activity did not consume (cf/src/activity-raft.ts).
         // Same terms as usage: a failure keeps the rows and asks for another pass.
-        const flushed = await flushActivityThenTrace(rt.gateway(), this.env.ARTIFACTS, this.sql as any, who.tenantId, who.agentId);
+        const flushed = await flushActivityThenTrace(rt.gateway(), this.env.ARTIFACTS, this.sql as any, who.tenantId, who.agentId,
+          subagentActivityFor(this.sql as any, this.env as unknown as Record<string, unknown>));
         if (flushed.activityError) { usagePending = true; console.warn(`activity flush failed for ${who.agentId}: ${flushed.activityError}`); }
         if (flushed.traceError) { usagePending = true; console.warn(`trace flush failed for ${who.agentId}: ${flushed.traceError}`); }
         // The pass says when to come back — a retry has a time, a model call has a poll interval,
@@ -2795,102 +2789,6 @@ export class AgentDO extends DurableObject<Env> {
     const r = this.sql.exec("SELECT v FROM counters2 WHERE k='alarmFailures'").toArray()[0] as any;
     return Number(r?.v ?? 0);
   }
-  async alarmStatus() {
-    this.sql.exec("CREATE TABLE IF NOT EXISTS alarms(at INTEGER)");
-    const rows = [...this.sql.exec("SELECT at FROM alarms ORDER BY at DESC LIMIT 1")] as any[];
-    return {
-      armedAt: this.alarmSetAt, firedAt: rows[0]?.at ?? null,
-      latencyMs: rows[0]?.at && this.alarmSetAt ? rows[0].at - this.alarmSetAt : null,
-    };
-  }
-
-  /** Isolated: does a runaway child kill the supervisor, or only itself? */
-  async verifyCpuLimit(cpuMs: number) {
-    const t0 = Date.now();
-    const killed = await runSandbox(this.env, `while (true) {}`, { limits: { cpuMs } });
-    const afterMs = Date.now() - t0;
-    // If the supervisor is still executing here, it survived the runaway child.
-    const survivor = await runSandbox(this.env, `output("still alive"); return "alive";`);
-    return { killed, killTookMs: afterMs, hostSurvived: survivor };
-  }
-
-  /** Dynamic Workers get a higher concurrency budget inside a DO (10 vs 4). */
-  async verifySandbox() {
-    const checks: Record<string, unknown> = {};
-    const timed = async (name: string, fn: () => Promise<unknown>) => {
-      const t = Date.now();
-      try { checks[name] = { ...(await fn() as object), ms: Date.now() - t }; }
-      catch (e: any) { checks[name] = { threw: String(e?.message ?? e).slice(0, 120), ms: Date.now() - t }; }
-    };
-    const t0 = Date.now();
-
-    await timed("freshIsolateA", () => runSandbox(this.env, `globalThis.leaked = 42; output(typeof globalThis.leaked); return "a";`));
-    await timed("freshIsolateB", () => runSandbox(this.env, `output(typeof globalThis.leaked); return "b";`));
-    checks.twoLoadsMs = Date.now() - t0;
-
-    await timed("networkBlocked", () => runSandbox(this.env, `
-      const probe = {};
-      try { await fetch("https://example.com"); probe.fetch = "ALLOWED"; }
-      catch (e) { probe.fetch = "blocked"; }
-      probe.hasConnect = typeof connect;
-      output(probe); return probe;`));
-
-    await timed("capabilityBinding", () => runSandbox(this.env, `
-      const r = await env.TOOLS.invoke("echo", { repo: "example/project" });
-      const bad = await env.TOOLS.invoke("slack.post", {});
-      return { ok: r, rejected: bad };`,
-      { tools: this.ctx.exports.ToolBinding({ props: { tenantId: "tenant-a" } }) }));
-
-    await timed("subRequestLimit", () => runSandbox(this.env, `
-      let n = 0;
-      try { for (let i = 0; i < 10; i++) { await env.TOOLS.invoke("slow", {}); n++; } }
-      catch (e) { return { completed: n, stopped: String(e.message || e).slice(0, 60) }; }
-      return { completed: n, stopped: null };`,
-      { tools: this.ctx.exports.ToolBinding({ props: {} }), limits: { subRequests: 3 } }));
-
-    await timed("noBindingsMeansNoTools", () => runSandbox(this.env, `
-      return { envKeys: Object.keys(env ?? {}), hasTools: typeof (env ?? {}).TOOLS };`));
-
-    await timed("nodeCompatSurface", () => runSandbox(this.env, `
-      const probe = { hasProcess: typeof process };
-      try {
-        const fs = await import("node:fs");
-        probe.importedFs = Object.keys(fs).slice(0, 6);
-        try { probe.readEtcPasswd = String(fs.readFileSync("/etc/passwd")).slice(0, 20); }
-        catch (e) { probe.readEtcPasswd = "threw: " + String(e.message || e).slice(0, 60); }
-        try { probe.readdirRoot = fs.readdirSync("/"); }
-        catch (e) { probe.readdirRoot = "threw: " + String(e.message || e).slice(0, 60); }
-      } catch (e) { probe.importedFs = "import refused: " + String(e.message || e).slice(0, 60); }
-      try { const cp = await import("node:child_process"); probe.childProcess = Object.keys(cp).slice(0, 4); }
-      catch (e) { probe.childProcess = "refused"; }
-      try {
-        const net = await import("node:net");
-        probe.net = typeof net.Socket;
-        // The real question: globalOutbound is documented to intercept connect()
-        // as well as fetch(). Does the node:net path honour it?
-        probe.socketConnect = await new Promise((resolve) => {
-          try {
-            const sock = net.connect({ host: "example.com", port: 443 });
-            const done = (v) => { try { sock.destroy(); } catch {} resolve(v); };
-            sock.on("connect", () => done("CONNECTED — ESCAPE"));
-            sock.on("error", (e) => done("refused: " + String(e && e.message).slice(0, 50)));
-            setTimeout(() => done("timeout (no connection)"), 3000);
-          } catch (e) { resolve("threw: " + String(e.message || e).slice(0, 50)); }
-        });
-      } catch (e) { probe.net = "refused"; }
-      try {
-        const cp2 = await import("node:child_process");
-        probe.execWorks = await new Promise((resolve) => {
-          try { cp2.exec("id", (err, out) => resolve(err ? "threw: " + String(err.message).slice(0, 50) : "RAN: " + out)); }
-          catch (e) { resolve("threw: " + String(e.message || e).slice(0, 50)); }
-        });
-      } catch (e) { probe.execWorks = "refused"; }
-      try { const fs2 = await import("node:fs"); probe.bundleListing = fs2.readdirSync("/bundle").slice(0, 5); }
-      catch (e) { probe.bundleListing = "refused"; }
-      return probe;`));
-
-    return checks;
-  }
 }
 
 
@@ -2915,6 +2813,30 @@ async function viewer(request: Request, env: Env, allowAnonymous = false): Promi
 function githubConfig(env: Env): GithubConfig | null {
   if (!env.GITHUB_CLIENT_ID || !env.GITHUB_CLIENT_SECRET || !env.UI_ORIGIN || !env.SESSION_SECRET) return null;
   return { clientId: env.GITHUB_CLIENT_ID, clientSecret: env.GITHUB_CLIENT_SECRET, redirectUri: `${env.UI_ORIGIN}/login/github/callback` };
+}
+
+/**
+ * What an agent's object renews its expiring GitHub tokens with (cf/src/github-refresh.ts): the OAuth App that
+ * issued them, the connectors in D1, and the other agents a connector's new pair has to reach. The other agents are
+ * told one by one and a failure is only logged: an agent that missed it renews on its own next 401.
+ */
+function githubRenewal(env: Env): RuntimeDeps["github"] {
+  const app = env.GITHUB_CLIENT_ID && env.GITHUB_CLIENT_SECRET ? { clientId: env.GITHUB_CLIENT_ID, clientSecret: env.GITHUB_CLIENT_SECRET } : null;
+  return {
+    app, grants: d1ConnectorGrants(env.CONTROL_DB),
+    async propagate(tenantId, connectorId, fromAgentId) {
+      const agents = d1ProvisionedAgents(env.CONTROL_DB);
+      for (const raftAgentId of await d1Connections(env.CONTROL_DB).boundTo(tenantId, connectorId)) {
+        const row = await agents.get(tenantId, raftAgentId);
+        if (!row || row.agentId === fromAgentId) continue;
+        try {
+          await env.AGENT.get(env.AGENT.idFromName(agentObjectName(tenantId, row.agentId))).connectionAdopt(tenantId, row.agentId, CONNECTION_PLUGIN.github, connectorId);
+        } catch (e) {
+          logEvent("github.refresh", { tenantId, agentId: row.agentId, connectorId, outcome: "propagate-failed", reason: clip(String((e as Error)?.message ?? e)) });
+        }
+      }
+    },
+  };
 }
 
 /** The identity table, in the control plane (cf/src/control-plane.ts). */
@@ -2951,8 +2873,8 @@ function connectDeps(env: Env): ConnectDeps | null {
     origin: env.UI_ORIGIN!, secret: env.SESSION_SECRET!,
     github: { clientId: cfg.clientId, clientSecret: cfg.clientSecret },
     registry: d1Connections(env.CONTROL_DB),
-    hold: (tenantId, agentId, plugin, token, id, exp, raftUserId) =>
-      stub(tenantId, agentId).connectionHold(tenantId, agentId, plugin, token, id, exp, raftUserId),
+    hold: (tenantId, agentId, plugin, token, id, exp, raftUserId, reconnect) =>
+      stub(tenantId, agentId).connectionHold(tenantId, agentId, plugin, token, id, exp, raftUserId, reconnect ?? null),
     exchange: (code, redirectUri) => githubExchangeCode({ ...cfg, redirectUri }, code),
     now: () => Date.now(),
   };
@@ -3027,7 +2949,7 @@ async function handleLogin(request: Request, env: Env, url: URL): Promise<Respon
       }
       let profile, emails;
       try {
-        const token = await githubExchangeCode(cfg, code);
+        const token = (await githubExchangeCode(cfg, code)).grant.accessToken;
         ({ profile, emails } = await githubFetchProfile(token));
       } catch (e: any) {
         console.error("login: github exchange failed", String(e?.message ?? e));
@@ -3258,6 +3180,10 @@ async function adminApiKeys(request: Request, env: Env): Promise<Response> {
   }
   const tenantId = String(b?.tenantId ?? ""), ownerAgentId = String(b?.ownerAgentId ?? ""), label = String(b?.label ?? "");
   try { agentObjectName(tenantId, ownerAgentId); } catch (e: any) { return Response.json({ error: String(e?.message ?? e) }, { status: 400 }); }
+  // The key's owner agent, and every agent it makes, live in this tenant and spend its limit, so it may not be a
+  // tenant a Raft server derives (cf/src/admin-provider-tokens.ts reservedTenantProblem).
+  const reserved = reservedTenantProblem(tenantId);
+  if (reserved) return Response.json({ error: "tenantId", hint: `${reserved}; pick another tenant id` }, { status: 400 });
   const key = newApiKey();
   await d1ApiKeys(env.CONTROL_DB).issue({ hash: await hashApiKey(key), tenantId, ownerAgentId, label });
   return Response.json({ key, tenantId, ownerAgentId, label });
@@ -3415,6 +3341,39 @@ async function adminHooks(request: Request, env: Env, url: URL): Promise<Respons
   if (!made.ok) return Response.json({ error: made.error }, { status: 400 });
   await dir.create({ hookId, tenantId, agentId, alias });
   return Response.json({ hookId, url: `${url.origin}/hooks/${hookId}`, secret: made.secret, tenantId, agentId, alias });
+}
+
+/**
+ * `/admin/agent-settings`, automation token only: an agent's own switches (src/runtime/agent-settings.ts), kept in its
+ * object. docs/runbook.md, "Subagents".
+ *
+ *   GET   ?tenantId=&agentId=                      → { settings, about, subagents }
+ *   PATCH { tenantId, agentId, settings: { subagents: true } } → { settings, changed, about }
+ *
+ * `about` says what each setting does (src/runtime/agent-settings.ts): for `subagents`, that they only read.
+ *
+ * `subagents` lists the agent's subagents, newest first, with each one's state and last outcome: what an operator reads
+ * to see what a stop stopped. 404 for an agent that is not there; a setting this does not know, or a value that is not
+ * a boolean, is 400 and nothing is written. A change is logged by the Worker as `agent.settings`.
+ */
+async function adminAgentSettings(request: Request, env: Env, url: URL): Promise<Response> {
+  if (!isOperator(env.AUTOMATION_TOKEN, request.headers.get("x-harness-token"))) {
+    return Response.json({ error: "unauthorized" }, { status: 401 });
+  }
+  if (request.method !== "GET" && request.method !== "PATCH") return Response.json({ error: "GET or PATCH" }, { status: 405 });
+  const b = request.method === "PATCH" ? (await request.json().catch(() => null)) as any : null;
+  const tenantId = String((b ? b.tenantId : url.searchParams.get("tenantId")) ?? "");
+  const agentId = String((b ? b.agentId : url.searchParams.get("agentId")) ?? "");
+  try { agentObjectName(tenantId, agentId); } catch (e: any) { return Response.json({ error: String(e?.message ?? e) }, { status: 400 }); }
+  const stub = env.AGENT.get(env.AGENT.idFromName(agentObjectName(tenantId, agentId)));
+  if (request.method === "GET") {
+    const r = await stub.adminAgentSettings(tenantId, agentId);
+    return r ? Response.json(r) : Response.json({ error: "no such agent, or it was deleted" }, { status: 404 });
+  }
+  const r = await stub.adminUpdateAgentSettings(tenantId, agentId, b?.settings);
+  if (!r.ok) return Response.json({ error: r.error }, { status: r.status });
+  logEvent("agent.settings", { tenantId, agentId, changed: r.changed.join(","), settings: JSON.stringify(r.settings) });
+  return Response.json({ settings: r.settings, changed: r.changed, about: r.about });
 }
 
 /**
@@ -3678,12 +3637,14 @@ function provisionDeps(env: Env): ProvisionDeps {
         registry: d1Connections(env.CONTROL_DB),
         link: (spec) => connectLink(env.UI_ORIGIN!, env.SESSION_SECRET!, spec, Date.now()),
         detach: (tenantId, agentId, provider) => stub(tenantId, agentId).connectionDetach(tenantId, agentId, CONNECTION_PLUGIN[provider]),
-        confirm: (tenantId, agentId, provider, pending, raftUserId) =>
-          stub(tenantId, agentId).connectionConfirm(tenantId, agentId, CONNECTION_PLUGIN[provider], pending, raftUserId),
-        detachIfFrom: (tenantId, agentId, provider, sealed) =>
-          stub(tenantId, agentId).connectionDetachIfFrom(tenantId, agentId, CONNECTION_PLUGIN[provider], sealed),
-        attach: (tenantId, agentId, provider, sealed) =>
-          stub(tenantId, agentId).connectionAttach(tenantId, agentId, CONNECTION_PLUGIN[provider], sealed),
+        confirm: (tenantId, agentId, provider, pending, raftUserId, connectorId) =>
+          stub(tenantId, agentId).connectionConfirm(tenantId, agentId, CONNECTION_PLUGIN[provider], pending, raftUserId, connectorId),
+        detachIfFrom: (tenantId, agentId, provider, sealed, connectorId) =>
+          stub(tenantId, agentId).connectionDetachIfFrom(tenantId, agentId, CONNECTION_PLUGIN[provider], sealed, connectorId),
+        attach: (tenantId, agentId, provider, sealed, refresh) =>
+          stub(tenantId, agentId).connectionAttach(tenantId, agentId, CONNECTION_PLUGIN[provider], sealed, refresh),
+        reconnect: (tenantId, agentId, provider, connectorId, was, sealed, refresh) =>
+          stub(tenantId, agentId).connectionReconnect(tenantId, agentId, CONNECTION_PLUGIN[provider], connectorId, was, sealed, refresh),
         connectors: d1Connectors(env.CONTROL_DB),
         newId: () => `con_${crypto.randomUUID().replace(/-/g, "").slice(0, 20)}`,
       },
@@ -3798,6 +3759,13 @@ async function v1(request: Request, env: Env, url: URL): Promise<Response> {
       },
       status: (agentId, sessionId) => agentStub(agentId).apiSessionStatus(tenantId, agentId, sessionId),
       cancel: async (agentId, sessionId) => { await agentStub(agentId).apiCancelSession(tenantId, agentId, sessionId); },
+      stopSubagents: async (agentId, sessionId) => { await agentStub(agentId).apiStopSessionSubagents(tenantId, agentId, sessionId); },
+      remove: async (agentId) => {
+        // The path a provider's delete takes (cf/src/provision/handlers.ts): the object's stopTurn with `delete`.
+        const r = await agentStub(agentId).stopTurn(tenantId, agentId, "delete").catch((e: unknown) => ({ result: "failed", error: String((e as Error)?.message ?? e).slice(0, 200) }));
+        // Logged here as the provider's delete logs its stop: the object's own line can be lost (cf/src/provision/handlers.ts).
+        logTurnStop({ tenantId, agentId, trigger: "delete", side: "worker" }, r as StopTurnOutcome);
+      },
       toolResults: (agentId, sessionId, results) => agentStub(agentId).apiToolResults(tenantId, agentId, sessionId, results),
       transcript: async (agentId, sessionId) =>
         JSON.parse(await agentStub(agentId).apiTranscript(tenantId, agentId, sessionId)) as {
@@ -3906,9 +3874,9 @@ async function requireViewer(request: Request, env: Env): Promise<{ who: string;
  *
  * Every hostname reaches this Worker, and several routes start a real agent.
  * A signed-in identity or the automation secret is required; anything else is
- * refused, and the anonymous switch does not open this door. The
- * diagnostics (conformance, isolation, eviction) stay open because they call no
- * provider and cost nothing.
+ * refused, and the anonymous switch does not open this door. The probe routes are
+ * not reached from here at all: they ask for the operator's token themselves
+ * (`PROBE_ROUTES`).
  */
 async function guardSpending(request: Request, env: Env): Promise<Response | null> {
   // Never anonymous here, whatever the deployment says: this path spends.
@@ -3919,32 +3887,13 @@ async function guardSpending(request: Request, env: Env): Promise<Response | nul
   );
 }
 
+/** Each agent's own object, asked for its friction window (`AgentDO.frictionWindow`). */
+const frictionWindowOf = (env: Env): WindowReader => (t, a, from, to, limits) =>
+  env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a))).frictionWindow(t, a, from, to, limits) as Promise<FrictionWindow | null>;
+
 async function sha256(s: string): Promise<string> {
   const d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
   return [...new Uint8Array(d)].map((b) => b.toString(16).padStart(2, "0")).join("");
-}
-
-/** Where does the wall clock actually go, measured from the edge? */
-async function latency(env: Env) {
-  const time = async (label: string, fn: () => Promise<unknown>) => {
-    const t = Date.now();
-    try { await fn(); return [label, Date.now() - t] as const; }
-    catch (e: any) { return [label, `error: ${String(e?.message ?? e).slice(0, 60)}`] as const; }
-  };
-  const small = new Uint8Array(200).fill(65);
-  const big = new Uint8Array(1024 * 1024).fill(66);
-  const results = await Promise.all([]);
-  void results;
-  const out: Record<string, unknown> = {};
-  for (const r of [
-    await time("r2.put 200B", () => env.ARTIFACTS.put("bench/small.bin", small)),
-    await time("r2.get 200B", () => env.ARTIFACTS.get("bench/small.bin").then((o) => o?.arrayBuffer())),
-    await time("r2.put 1MB", () => env.ARTIFACTS.put("bench/big.bin", big)),
-    await time("r2.get 1MB", () => env.ARTIFACTS.get("bench/big.bin").then((o) => o?.arrayBuffer())),
-    await time("fetch api.github.com", () => fetch("https://api.github.com/repos/nodejs/node", { headers: { "user-agent": "antiproton/0.1" } }).then((r) => r.text())),
-    await time("fetch api.deepseek.com (unauth RTT)", () => fetch("https://api.deepseek.com/models").then((r) => r.text())),
-  ]) out[r[0]] = r[1];
-  return out;
 }
 
 export default {
@@ -3959,15 +3908,33 @@ export default {
 
   /**
    * The daily Cron Trigger (`triggers.crons` in cf/wrangler.jsonc and the preview's): the usage ledger's
-   * retention, hours older than KEEP_HOURLY_DAYS folded into days (`retainUsage`, cf/src/usage-d1.ts).
-   * Idempotent, so a trigger that fires twice, or a manual one, changes nothing the first did not.
+   * retention, hours older than KEEP_HOURLY_DAYS folded into days (`retainUsage`, cf/src/usage-d1.ts), then
+   * yesterday's friction report (`frictionDaily`, cf/src/friction-scan.ts). Idempotent, so a trigger that fires
+   * twice, or a manual one, changes nothing the first did not: the report is rewritten under the same key.
    */
   async scheduled(controller: ScheduledController, env: Env) {
     // Awaited, not handed to waitUntil: a fold that throws then marks this invocation failed in the
-    // trigger's own history, which is where a missed retention day is looked for.
-    await retainUsage(env.CONTROL_DB, controller.scheduledTime);
+    // trigger's own history, which is where a missed retention day is looked for. The friction step
+    // cannot throw and is cut off at its limit, so it can neither hide nor cause that failure.
+    await dailyCron(
+      async () => { await retainUsage(env.CONTROL_DB, controller.scheduledTime); },
+      () => frictionDaily(env, { bucket: env.ARTIFACTS as unknown as FrictionBucket, window: frictionWindowOf(env) }, controller.scheduledTime),
+    );
   },
 };
+
+/**
+ * The probe routes: an operator's tools, never the internet's.
+ *
+ * A path here reaches an object without an identity check of its own and spends on arriving:
+ * `/conformance/executor` starts Dynamic Workers on the deployment's account (bench/cf-conformance.mjs runs it).
+ * It is not answerable to a caller with no credential, so it asks for the operator's token — the door
+ * `/agent/message` has always had (`guardSpending`).
+ *
+ * The check runs in `route` before any path prefix chooses an object, so it holds whichever object a probe is
+ * routed to: `/conformance/executor` is routed by its `/conformance` prefix to its own object.
+ */
+const PROBE_ROUTES = new Set(["/conformance/executor"]);
 
 async function route(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
@@ -3995,7 +3962,7 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
     // object is chosen: they authenticate differently and address by key.
     if (url.pathname === "/admin/api-keys") return adminApiKeys(request, env);
     // The operator's service tokens (task #7): identities, so before any object as well.
-    if (url.pathname === "/admin/service-tokens") return adminServiceTokens(request, env.AUTOMATION_TOKEN, d1ServiceTokens(env.CONTROL_DB), url);
+    if (url.pathname === "/admin/service-tokens") return adminServiceTokens(request, env.AUTOMATION_TOKEN, d1ServiceTokens(env.CONTROL_DB), url, d1ProvisionedAgents(env.CONTROL_DB));
     // A Raft server's provider tokens, and the agents it provisions with them (raft-agent-provider.v1).
     if (url.pathname === "/admin/provider-tokens") return adminProviderTokens(request, env.AUTOMATION_TOKEN, d1ProviderTokens(env.CONTROL_DB), url);
     // Every tenant's estimated cost (credits phase 1: accounting, nothing enforced). The operator's token, or a
@@ -4013,6 +3980,7 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
     if (url.pathname.startsWith("/hooks/")) return inboundHook(request, env, url, ctx);
     if (url.pathname === "/admin/hooks") return adminHooks(request, env, url);
     if (url.pathname === "/admin/mounts") return adminMounts(request, env);
+    if (url.pathname === "/admin/agent-settings") return adminAgentSettings(request, env, url);
     if (url.pathname === "/admin/models") {
       // A signed-in admin or the operator's token (auth.ts isAdmin); anyone else is told nothing.
       const v = await viewer(request, env);
@@ -4039,14 +4007,19 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
       return adminSpendLimits(request.method, body, v!.sub ?? v!.email, { store: d1SpendLimits(env.CONTROL_DB), limits: limitsOf(env), now: Date.now, plans: d1TenantPlans(env.CONTROL_DB) });
     }
     if (url.pathname.startsWith("/v1/")) return v1(request, env, url);
+    // The probes ask for the operator's token before any prefix below picks their object (PROBE_ROUTES above),
+    // so the gate holds whichever object a probe is routed to, for every method.
+    if (PROBE_ROUTES.has(url.pathname) && !isOperator(env.AUTOMATION_TOKEN, request.headers.get("x-harness-token"))) {
+      return Response.json({ error: "unauthorized", hint: "the probe routes need x-harness-token" }, { status: 401 });
+    }
     // Conformance gets its own object: the P0 probe created an incompatible
     // `tasks` table in "p0", and CREATE TABLE IF NOT EXISTS silently accepted it.
     // Each benchmark arm gets its own object. Sharing one meant asynchronous
     // stragglers from an earlier run — dispatcher callbacks, re-armed alarms —
     // landed in the next arm's measurement window. A fresh object per arm makes
     // cross-talk impossible instead of merely unlikely.
-    // Agent traffic is addressed by identity; probes and the benchmark keep
-    // their own fixed objects.
+    // Agent traffic is addressed by identity; the conformance probe and the
+    // benchmark keep their own fixed objects.
     let name: string;
     let uiSelected: { who: string; home: string; agentId: string; tenantId: string } | null = null;
     if (url.pathname.startsWith("/conformance")) name = "conformance-v2";
@@ -4125,11 +4098,14 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
       if (access === "not-found") {
         return Response.json({ error: `no such agent: ${agentId} (not this viewer's, or never created)` }, { status: 404 });
       }
-    } else name = "p0";
+    }
+    // Everything else (`/admin/*`, `/` and the 404 index) addresses the objects it needs itself, or none. The
+    // switch below still wants a stub, and `get` contacts no object until a method is called on it, so this
+    // name is never reached by any route that remains.
+    else name = "p0";
     const stub = env.AGENT.get(env.AGENT.idFromName(name));
     try {
       switch (url.pathname) {
-        case "/storage": return Response.json(await stub.verifyStorage());
         case "/conformance/executor": return Response.json(await stub.runExecutorSpec());
         case "/agent/message": {
           const g = await guardSpending(request, env);
@@ -4238,44 +4214,6 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
         case "/agent/activity":
           return Response.json(await stub.activity(Number(url.searchParams.get("since") ?? 0)));
         case "/agent/activity/reset": return Response.json(await stub.resetActivity());
-        case "/model-binding": {
-          // Whether an agent can run at all now depends on a binding existing.
-          const stub3 = env.AGENT.get(env.AGENT.idFromName(agentObjectName("tenant-nokey", "agent-1")));
-          const out: Record<string, unknown> = {};
-          try {
-            await stub3.startTask("tenant-nokey", "agent-1", `nk_${Date.now()}`, "hello");
-            // startTask binds explicitly, so clear it and try to advance.
-            out.provisionedWithBinding = true;
-          } catch (e: any) {
-            out.provisionedWithBinding = false;
-            out.error = String(e?.message ?? e).slice(0, 160);
-          }
-          out.binding = await stub3.modelBinding("tenant-nokey", "agent-1");
-          out.unboundTenant = await stub3.modelBinding("tenant-never-configured", "agent-1");
-          return Response.json(out);
-        }
-        case "/eviction": {
-          // Configuration set before an eviction must still be in force after
-          // it, without the caller restating anything.
-          const stub2 = env.AGENT.get(env.AGENT.idFromName(agentObjectName("tenant-evict", "agent-1")));
-          const out: Record<string, unknown> = {};
-          await stub2.startTask("tenant-evict", "agent-1", `ev_${Date.now()}`, "hello");
-          await stub2.setOffload(false);
-          out.before = { offload: (await stub2.setOffload(false)).offload, owner: await stub2.owner() };
-
-          await stub2.simulateEviction();
-
-          out.after = { offload: (await stub2.readOffload()), owner: await stub2.owner() };
-          out.offloadSurvived = (out.after as any).offload === false;
-          out.ownerSurvived =
-            JSON.stringify((out.before as any).owner) === JSON.stringify((out.after as any).owner);
-          // And the object still refuses a foreign identity after being rebuilt.
-          try {
-            await stub2.startTask("tenant-other", "agent-1", "ev_x", "wrong tenant");
-            out.guardSurvived = false;
-          } catch { out.guardSurvived = true; }
-          return Response.json(out);
-        }
         // What identity a request actually resolves to is /ui/whoami's
         // business; here only the automation token opens the door, and a
         // client-supplied header never does.
@@ -4422,6 +4360,27 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
         case "/admin/diagnose":
           return await adminDiagnose(request, env.AUTOMATION_TOKEN,
             (t, a) => env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a))));
+        case "/admin/friction-scan": {
+          // The daily friction scan for one day, on demand (docs/runbook.md, "Where agents get stuck"). Reads as the
+          // cron does, under the same tenant list and kill switch; writes the report unless write=0, and never files
+          // issues: that is the cron's alone.
+          if (!isOperator(env.AUTOMATION_TOKEN, request.headers.get("x-harness-token"))) {
+            return Response.json({ error: "unauthorized" }, { status: 401 });
+          }
+          if (request.method !== "POST") return Response.json({ error: "POST" }, { status: 405, headers: { allow: "POST" } });
+          if (env.FRICTION_SCAN_DISABLED === "1") return Response.json({ error: "friction scan disabled (FRICTION_SCAN_DISABLED)" }, { status: 503 });
+          const day = String(url.searchParams.get("day") ?? "");
+          if (!/^\d{4}-\d{2}-\d{2}$/.test(day) || Number.isNaN(Date.parse(day + "T00:00:00Z"))) {
+            return Response.json({ error: "day=YYYY-MM-DD is required" }, { status: 400 });
+          }
+          const scope = tenantScope(env.FRICTION_SCAN_TENANTS);
+          if (scope.kind === "none") return Response.json({ error: "no tenants in scope (FRICTION_SCAN_TENANTS)" }, { status: 409 });
+          const bucket = env.ARTIFACTS as unknown as FrictionBucket;
+          const report = await scanDay({ bucket, window: frictionWindowOf(env), build: env.GIT_COMMIT ?? null }, scope, day);
+          const written = url.searchParams.get("write") === "0" ? null
+            : await writeReport(bucket, report, new Date().toISOString().slice(0, 10));
+          return Response.json({ written: written?.keys ?? null, report }, { headers: { "cache-control": "no-store" } });
+        }
         case "/admin/transcript":
           // Awaited, so a failure reaches this route's catch and its log instead of the platform's 1101.
           return await adminTranscript(request, env.AUTOMATION_TOKEN,
@@ -4990,42 +4949,6 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
           // with a name the caller chose would be worth nothing.
           return html(approvals(await stub.uiDecide(gate.tenantId, agentId, taskId, String(form.get("operationId")), decision, who)));
         }
-        case "/isolation": {
-          // Proves the property rather than asserting it: two tenants, two
-          // objects, and an object that refuses an identity that is not its own.
-          const out: Record<string, unknown> = {};
-          const nameA = agentObjectName("tenant-a", "agent-1");
-          const nameB = agentObjectName("tenant-b", "agent-1");
-          out.distinctNames = nameA !== nameB;
-          const idA = env.AGENT.idFromName(nameA);
-          const idB = env.AGENT.idFromName(nameB);
-          out.distinctObjects = idA.toString() !== idB.toString();
-
-          const a = env.AGENT.get(idA);
-          const b = env.AGENT.get(idB);
-          await a.startTask("tenant-a", "agent-1", `iso_a_${Date.now()}`, "hello from a");
-          await b.startTask("tenant-b", "agent-1", `iso_b_${Date.now()}`, "hello from b");
-          out.ownerA = await a.owner();
-          out.ownerB = await b.owner();
-
-          // Same agent id, different tenant: the object must refuse.
-          try {
-            await a.startTask("tenant-b", "agent-1", "iso_x", "wrong tenant");
-            out.crossTenantRefused = false;
-          } catch (e: any) {
-            out.crossTenantRefused = true;
-            out.refusal = String(e?.message ?? e).slice(0, 160);
-          }
-          // Each object's storage holds only its own tenant's rows.
-          out.tasksA = (await a.listTenants());
-          out.tasksB = (await b.listTenants());
-          return Response.json(out);
-        }
-        case "/latency": return Response.json({ colo: request.cf?.colo ?? null, ...(await latency(env)) });
-        case "/sandbox": return Response.json(await stub.verifySandbox());
-        case "/sandbox/cpu": return Response.json(await stub.verifyCpuLimit(Number(url.searchParams.get("ms") ?? 50)));
-        case "/alarm/arm": return Response.json(await stub.armAlarm(Number(url.searchParams.get("ms") ?? 2000)));
-        case "/alarm/status": return Response.json(await stub.alarmStatus());
         case "/":
           // The demo is the point of this deployment; making people know to
           // type /ui is a papercut with no upside.
@@ -5033,9 +4956,7 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
         default:
           return Response.json({
             demo: "/ui",
-            diagnostics: ["/conformance/executor", "/isolation",
-                          "/eviction", "/model-binding", "/ui/whoami"],
-            probes: ["/storage", "/sandbox", "/latency", "/alarm/status"],
+            diagnostics: ["/conformance/executor", "/ui/whoami"],
           }, { status: 404 });
       }
     } catch (e: any) {

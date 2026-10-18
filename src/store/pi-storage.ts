@@ -178,6 +178,8 @@ export class PiSqliteStorage implements Storage {
 
   /** Whose usage this transcript's model replies are; absent: not counted (benchmarks, conformance). */
   #usageOwner: { tenantId: string; agentId: string } | null;
+  /** Which of the agent's transcripts this is: the session its `model.call` rows name. */
+  #session: string;
 
   /** Whether answers are read for rebuild outcomes and overflows (src/runtime/rebuild.ts), with the model's window. */
   #rebuilds: { contextWindow: number } | null;
@@ -187,6 +189,7 @@ export class PiSqliteStorage implements Storage {
   } = {}) {
     this.#host = host;
     this.#usageOwner = opts.usageOwner ?? null;
+    this.#session = opts.session ?? MAIN_SESSION;
     this.#rebuilds = opts.rebuilds ?? null;
     this.#now = opts.now ?? (() => Date.now());
     this.#t = piTables(opts.session ?? MAIN_SESSION);
@@ -290,6 +293,7 @@ export class PiSqliteStorage implements Storage {
                 prefix: parsedPrefix(prefix),
                 usage: m.usage,
                 limit: spendLimitRefusal(m),
+                session: this.#session,
               })]);
               // A rebuild decision waiting for this transcript's next call is measured by it (src/runtime/rebuild.ts). A
               // shadow reading: a failure is logged and never fails the answer it reads. An answer that is a context

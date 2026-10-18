@@ -13,7 +13,7 @@ import { createHash } from "node:crypto";
 import { clip, logEvent, routeOf } from "../core/log.ts";
 import type { Json, MountRecord } from "../core/types.ts";
 import {
-  createRaft, hashRaftSendContent, isInterrupted, projectRaftMessage, RAFT_OPERATIONS, RAFT_STATE_SCHEMA, SeenFrontier,
+  createRaft, describeRaftRoute, hashRaftSendContent, isInterrupted, projectRaftMessage, RAFT_OPERATIONS, RAFT_STATE_SCHEMA, SeenFrontier,
   type Raft, type RaftInboxBatch, type RaftInterrupt, type RaftMessage, type RaftOperationSpec, type RaftState, type RaftStateStore, type RaftFailure,
 } from "@botiverse/raft-sdk";
 import { PARK_BYTES } from "./artifacts.ts";
@@ -22,8 +22,10 @@ import {
   type AgentLoginDeps, type ManifestCache,
 } from "./raft-agent-login.ts";
 import { internalHost } from "./http.ts";
+import { callMcp, isMcpTool, keptMcpOf, leftOut, listMcp, mcpClock, mcpLines, MCP_CALL_TIMEOUT_MS, MCP_CAPABILITY, MCP_KEY, MCP_PREFIX } from "./raft-mcp.ts";
 import { modelToolName } from "../runtime/pi-tools.ts";
-import { toAgentRef } from "../store/refs.ts";
+import { isSubagentSession } from "../runtime/subagent-session.ts";
+import { AGENT_REF, keyForRef, toAgentRef } from "../store/refs.ts";
 import {
   interrupt, originProblem,
   type ActivityEvent, type InboundEvent, type InboundResult, Interrupt, type ListedTools, type Plugin, type PluginContext,
@@ -482,7 +484,16 @@ function stateStore(ctx: PluginContext, last: { state?: RaftState } = {}): RaftS
  * `contextId` (an approved call's replay) has none: it is never held for a card, and a send makes one extra history
  * read for the conversation it shows after the receipt.
  */
-function raftFor(ctx: PluginContext, options: { state?: false; response?: (res: Response) => Response; timeoutMs?: number } = {}): Raft {
+function raftFor(ctx: PluginContext, options: {
+  state?: false; response?: (res: Response) => Response; timeoutMs?: number;
+  /**
+   * Requests to anywhere but the Raft server — the presigned PUT of the SDK's upload session, which it makes through
+   * this fetch — are checked as the download checks its URL (`presignedProblem`). A refused one is not sent: it is
+   * answered 400 here, which the SDK reads as a PUT that definitely failed and cancels the session, and the reason is
+   * left in `refused` for the caller to say.
+   */
+  presigned?: { refused?: PresignedProblem };
+} = {}): Raft {
   const last: { state?: RaftState } = {};
   return createRaft({
     serverUrl: baseUrl(ctx).origin, credential: requireCredential(ctx), hints: "tool",
@@ -492,6 +503,14 @@ function raftFor(ctx: PluginContext, options: { state?: false; response?: (res: 
       const started = Date.now();
       const u = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
       const line = { tenantId: ctx.caller.tenantId, agentId: ctx.caller.agentId, mount: ctx.alias, method: init?.method ?? "GET", route: routeOf(u.pathname) };
+      if (options.presigned && u.origin !== baseUrl(ctx).origin) {
+        const problem = presignedProblem(u);
+        if (problem) {
+          options.presigned.refused = problem;
+          logEvent("raft.call", { ...line, route: "(presigned)", status: null, ms: 0, error: `refused: ${problem}` });
+          return new Response(null, { status: 400 });
+        }
+      }
       let res: Response;
       try {
         res = await fetch(input, { ...init, redirect: "manual", signal: AbortSignal.timeout(options.timeoutMs ?? timeout(ctx)) });
@@ -502,12 +521,16 @@ function raftFor(ctx: PluginContext, options: { state?: false; response?: (res: 
       logEvent("raft.call", { ...line, status: res.status, ms: Date.now() - started });
       return options.response ? options.response(res) : res;
     },
-    ...(options.state === false ? {} : { state: stateStore(ctx, last) }),
+    // A subagent's client never has the saved state, whatever the caller asked for: everything that carries a call's
+    // bookings into it — a history read's cards and reads (`keepCardsShown`), a hold, an answer — builds its client
+    // here, so this one line keeps a subagent from writing what the agent's next call reads (`savesState` says why).
+    ...(options.state === false || isSubagentSession(ctx.caller.taskId) ? {} : { state: stateStore(ctx, last) }),
     // A save that failed or lost a race costs at most one repeated batch or one extra hold; it never fails
-    // the call, and the SDK does not retry it. Kept as a trace row, which is stored with the agent's spans and read
-    // through its trace (`raft.state_save_failed`), since the object's console lines may be dropped; and said on
-    // the console too, where an operator watching the log would look.
-    onStateSaveError: (error, { phase }) => stateSaveFailed(ctx, phase, error, phase === "save" ? stateBytes(last.state) : undefined),
+    // the call, and the SDK does not retry it; a load that failed is read as no state, with the same cost. Kept as a
+    // trace row, which is stored with the agent's spans and read through its trace (`raft.state_failed`, its phase in
+    // `status` and `attrs`), since the object's console lines may be dropped; and said on the console too, where an
+    // operator watching the log would look.
+    onStateError: (error, { phase }) => stateFailed(ctx, phase, error, phase === "save" ? stateBytes(last.state) : undefined),
   });
 }
 
@@ -527,11 +550,11 @@ function stateBytes(state: RaftState | undefined): number | undefined {
 }
 
 /** One failed load or save of the SDK's state: a trace row (`PluginContext.trace`) and a console line. */
-export function stateSaveFailed(ctx: PluginContext, phase: "load" | "save", error: unknown, stateBytes?: number): void {
+export function stateFailed(ctx: PluginContext, phase: "load" | "save", error: unknown, stateBytes?: number): void {
   const message = clip(String((error as Error)?.message ?? error), 200) ?? "";
   console.warn(`raft state ${phase} failed for mount ${ctx.alias}: ${message}`);
   ctx.trace?.({
-    kind: "raft.state_save_failed", status: phase, verdict: "failed",
+    kind: "raft.state_failed", status: phase, verdict: "failed",
     attrs: { phase, error: message, ...(stateBytes !== undefined ? { stateBytes } : {}) },
   });
 }
@@ -918,6 +941,9 @@ export function toolOf(op: RaftOperationSpec): ToolSchema {
     ? ` Held here, the call comes back as a question with those messages: answer "${goAhead(op)}" to go ahead as written, or "drop" to do nothing.` +
       (op.idempotency.kind === "key"
         ? ` An answer given ${KEY_LIFETIME_MS / 3_600_000} hours or more after the question does nothing: read the conversation, then call again if it is still wanted.`
+        : "") +
+      (op.inputSchema.properties?.targetConfirmed
+        ? ` A send to a channel or DM right after you read one of its threads is also asked first: answer "send" to post it there as written, or "drop" and send it to the thread instead.`
         : "")
     : "";
   return {
@@ -1203,6 +1229,17 @@ function retryKey(op: RaftOperationSpec, out: RaftFailure, sent: Record<string, 
   return out.error.retryable && typeof passed === "string" && passed.trim() ? passed.trim() : undefined;
 }
 
+/**
+ * Whether an operation runs on the mount's saved state. Not one that books "seen" (below, in `runOperation`), and not
+ * any call of a subagent (src/runtime/subagents.ts): a subagent only reads (`childMayCall`), and what it read is its
+ * own context's, which nothing it does later attests. Its calls also run beside the agent's: the store saves with a
+ * compare-and-set (`stateStore`), a lost race is not retried and costs the loser's bookings, so a subagent that saved
+ * could cost the agent what it had booked. On a state of its own for the call, it saves nothing and loses the agent nothing.
+ */
+export function savesState(op: Pick<RaftOperationSpec, "consumes">, ctx: Pick<PluginContext, "caller">): boolean {
+  return !op.consumes.model.includes("seen") && !isSubagentSession(ctx.caller.taskId);
+}
+
 /** One operation, run through the SDK's `invoke` under the caller's origin and context. */
 async function runOperation(
   op: RaftOperationSpec, args: unknown, ctx: PluginContext, unoffered: ReadonlySet<string>,
@@ -1217,11 +1254,17 @@ async function runOperation(
   // extra hold on a send after reading history, which asks the model with the newer messages: the safe side.
   // Only `messages.read` books it among the generated tools (the manifest's `consumes.model`; the inbox pulls,
   // which also do, are excluded and stay with receive_events).
-  const raft = raftFor(ctx, op.consumes.model.includes("seen") ? { state: false } : {});
+  const raft = raftFor(ctx, savesState(op, ctx) ? {} : { state: false });
   const keyed = await keyedInput(op, input, ctx, raft);
   // Taken before the request, so it is never later than when Raft first saw the key.
   const started = Date.now();
   const { seen } = resumed;
+  // A task write (claim, status, amend) attests what this context has seen (SDK 0.20.0), as a send does. In 0.20.0 the
+  // SDK did not load the saved state for it, so on a client made for this call it attested nothing: Raft would never
+  // hold it, and the answer to a hold would not carry what the question showed, so it would be held again. 0.20.1 loads
+  // it too (`invoke`'s tasks.* entries run in `withState`); this stays as belt-and-braces, since the load happens once
+  // per client and costs nothing when the SDK has already done it. Loaded for every call that may be held.
+  if (op.mayInterrupt) await raft.state.load();
   const out = await raft.invoke(op.name, seen ? { ...keyed, seen } : keyed, caller);
   if (!out.ok) {
     const key = retryKey(op, out as RaftFailure, keyed);
@@ -1235,28 +1278,45 @@ async function runOperation(
   // projection and stays out, so a new server field cannot silently enter the model's context.
   // A message's line is rebuilt by `modelLine` from the message itself (its attachment suffix is the SDK's, not the
   // author's); everything else a person wrote is set aside by `quotedCalls`.
+  // No state is singled out here, so none is said in other words: a search Raft stopped at its scan budget (SDK 0.19.0)
+  // comes back as `incomplete` with nothing found, or `results` with the page marked incomplete, and its text says that
+  // older messages were not searched and gives the continuing `messages_search` call with its `cursor`, an argument
+  // the tool offers since the manifest does. Read as `empty`, it would tell the model nothing matches.
   const data = (out as { data?: unknown }).data as Record<string, unknown> | undefined;
   const messages = [...(Array.isArray(data?.messages) ? data.messages : []), data?.message].filter(isMessage);
   let text = out.text.trim();
   for (const m of messages) text = text.replace(m.text, modelLine(m, unoffered));
   const result = { state: out.state, text: offeredTerms(text, unoffered, quotedCalls(data, unofferedPattern(unoffered))) };
-  if (op.consumes.model.includes("seen")) await keepCardsShown(raft, ctx, result);
+  if (op.consumes.model.includes("seen")) await keepShown(raft, ctx, result);
   return result;
 }
 
 /**
- * The cards a history read showed (`conversationCards`), booked where the next call reads them. The read ran on a
- * client whose state is not saved (`runOperation` says why), so without this its cards would be shown on every read
- * and the first send after it held for a card the model had just read. Only the cards are carried over, never the
- * messages, and only when the model reads the result whole: a result over PARK_BYTES is parked and the model reads a
- * preview, which may not reach them. Each is booked under the context it was shown in, which is the call's.
+ * What a history read showed besides its messages, booked where the next call reads it. The read ran on a client
+ * whose state is not saved (`runOperation` says why), so without this the next call would know nothing of it:
+ * - which conversation it read, and when (`SeenFrontier.recordRead`, SDK 0.20.0): the thread-target check compares
+ *   when a thread and its parent were last read in a context, so a top-level send right after the model read one of
+ *   its threads asks first (`heldCall`, `thread_target`). Booked whatever the page's size: a parked page is still
+ *   where the model's attention went, and booking it costs at most one question. The aliases the Server resolved go
+ *   with it, so a read and a send spelled differently still name the same conversation. None of this is "seen":
+ *   no message counts as read by it, and a send attests nothing more for it.
+ * - the cards it showed (`conversationCards`), only when the model reads the result whole: a result over PARK_BYTES
+ *   is parked and the model reads a preview, which may not reach them. Without this its cards would be shown on
+ *   every read and the first send after it held for a card the model had just read.
+ * Each is booked under the context it was made in, which is the call's. A program's read books nothing (the SDK
+ * records nothing for origin "code"), so this has nothing to carry for it.
  */
-async function keepCardsShown(read: Raft, ctx: PluginContext, result: Record<string, Json>): Promise<void> {
-  const shown = read.frontier.snapshot().observations ?? [];
-  if (!cardsOn(ctx) || !shown.length || JSON.stringify(result).length > PARK_BYTES) return;
+async function keepShown(read: Raft, ctx: PluginContext, result: Record<string, Json>): Promise<void> {
+  const shown = read.frontier.snapshot();
+  const reads = shown.reads ?? [];
+  const cards = cardsOn(ctx) && JSON.stringify(result).length <= PARK_BYTES ? shown.observations ?? [] : [];
+  if (!reads.length && !cards.length) return;
   const kept = raftFor(ctx);
   await kept.state.load();
-  for (const o of shown) kept.frontier.inContext(o.contextId).recordCard(o.type, o.id, o.rev);
+  for (const [alias, canonical] of Object.entries(shown.aliases ?? {})) kept.frontier.recordAlias(alias, canonical);
+  // Oldest first, as the snapshot keeps them, so the order between them survives the copy.
+  for (const r of [...reads].sort((a, b) => a.order - b.order)) kept.frontier.inContext(r.contextId ?? null).recordRead(r.target, r.seq);
+  for (const o of cards) kept.frontier.inContext(o.contextId).recordCard(o.type, o.id, o.rev);
   await kept.state.save();
 }
 
@@ -1264,7 +1324,11 @@ async function keepCardsShown(read: Raft, ctx: PluginContext, result: Record<str
  * A held call, as a question for the model. Raft held it because the conversation moved since this context last
  * looked (`unread_messages`: newer messages, and with conversation cards any card it has not seen ride along), or,
  * with conversation cards on, because this context has not seen the conversation's card (`unseen_card`: no new
- * messages, only the card). The question is the SDK's own held text, `interrupt.context`, passed on as it came: the
+ * messages, only the card), or, for a send the model made itself, because this context last read one of the
+ * target's threads and the send is to the target top-level (`thread_target`, SDK 0.20.0: nothing was sent, nothing to
+ * attest; `keepShown` books the reads it compares). A task write (claim, status, amend) is held for newer messages as a
+ * send is, and asked the same way: since SDK 0.20.0 it attests what the context has seen, and its resume is the
+ * identical call. The question is the SDK's own held text, `interrupt.context`, passed on as it came: the
  * opening "Held — …" line, the cards, the conversation's window and the `messages_read` call that reads it in full,
  * all in tool form (`hints: "tool"`). It is the text the CLI prints for the same hold, and it names the call's
  * `idempotencyKey`, which is the key a resume goes ahead under, so a model that sends again with it lands once.
@@ -1285,7 +1349,9 @@ async function keepCardsShown(read: Raft, ctx: PluginContext, result: Record<str
  * shown, which is every time they were not withheld.
  *
  * The state is the call itself: the operation, its arguments with the interrupt's `resume.idempotencyKey` under
- * the operation's key argument when it has one, for a message the `seen` boundary when the question showed
+ * the operation's key argument when it has one and with what the interrupt's `resume.with` adds (a `thread_target`
+ * hold's `targetConfirmed: true`, so "send" posts it top-level as written, under the same key; sending it to the thread
+ * instead is a new call the model makes, and "drop" sends nothing), for a message the `seen` boundary when the question showed
  * every new message, `attest` when it showed them all or showed a card, the hold's `reason`, and `heldAt`, when the
  * call was first held (`KEY_LIFETIME_MS`). Plain data, no credential, and never shown. The interrupt's
  * `resume.argv`/`cancel`, which belong to the CLI, are not used at all.
@@ -1306,6 +1372,8 @@ async function heldCall(
   }
   const go = goAhead(op);
   const key = op.idempotency.kind === "key" && held.resume.idempotencyKey ? { [op.idempotency.arg]: held.resume.idempotencyKey } : {};
+  // What going ahead adds to the call (`thread_target`: `targetConfirmed: true`), kept with its arguments as the key is.
+  const confirmed = held.resume.with ?? {};
   const reason = reasonOf(held);
   ctx.trace?.({
     kind: "raft.held", status: reason, verdict: "blocked",
@@ -1313,6 +1381,7 @@ async function heldCall(
       tool: op.toolName, reason, target: held.target, newMessageCount: held.newMessageCount,
       cards: Object.keys(cards ?? {}).sort().join(","), contextBytes: held.context.length, origin: caller.origin,
       contextComplete: held.contextComplete, ...(held.withheld ? { withheld: true } : {}),
+      ...(typeof held.threadTarget === "string" ? { threadTarget: held.threadTarget } : {}),
     },
   });
   return interrupt({
@@ -1320,7 +1389,7 @@ async function heldCall(
     context: { reason, target: held.target },
     answer: { choices: [go, "drop"] },
     state: {
-      op: op.name, args: { ...input, ...key } as Json, heldAt, reason,
+      op: op.name, args: { ...input, ...key, ...confirmed } as Json, heldAt, reason,
       ...(go === "send" && attested && held.seenUpToSeq !== null ? { seen: { upToSeq: held.seenUpToSeq } } : {}),
       ...(attested || cards ? {
         attest: {
@@ -1349,6 +1418,7 @@ function reasonOf(held: RaftInterrupt): string {
   switch (reason) {
     case "unread_messages":
     case "unseen_card":
+    case "thread_target":
       return reason;
     default:
       return typeof reason === "string" && reason ? clip(reason, 40)! : "unknown";
@@ -1977,9 +2047,9 @@ function capped(res: Response, over: () => void): Response {
 async function fetchPresigned(url: string, ctx: PluginContext): Promise<Uint8Array> {
   let parsed: URL;
   try { parsed = new URL(url); } catch { throw new Error("Raft returned a download address that is not a URL; nothing was kept"); }
-  if (parsed.protocol !== "https:") throw new Error("Raft returned a download address that is not https; nothing was kept");
-  if (parsed.username || parsed.password) throw new Error("Raft returned a download address that carries a user name or password; nothing was fetched or kept");
-  if (internalHost(parsed.hostname)) throw new Error("Raft returned a download address on a private or local network; nothing was fetched or kept");
+  const problem = presignedProblem(parsed);
+  if (problem === "https") throw new Error("Raft returned a download address that is not https; nothing was kept");
+  if (problem) throw new Error(`Raft returned a download address ${PRESIGNED_PROBLEM[problem]}; nothing was fetched or kept`);
   let over = false;
   let res: Response;
   try {
@@ -1998,6 +2068,22 @@ async function fetchPresigned(url: string, ctx: PluginContext): Promise<Uint8Arr
     throw marked(new Error("the attachment's bytes stopped arriving; nothing was kept"), { transient: true });
   }
 }
+
+/**
+ * What is wrong with an address Raft minted for its storage (a presigned URL), by the rule `fetchPresigned` states:
+ * not https, a user name or password in it, or a host inward by construction (`internalHost`). Null when nothing is.
+ * Shared by the download's GET and the upload session's PUT (`raftFor`'s `presigned`), so both refuse the same URLs.
+ */
+type PresignedProblem = "https" | "userinfo" | "internal";
+function presignedProblem(url: URL): PresignedProblem | null {
+  if (url.protocol !== "https:") return "https";
+  if (url.username || url.password) return "userinfo";
+  if (internalHost(url.hostname)) return "internal";
+  return null;
+}
+const PRESIGNED_PROBLEM: Readonly<Record<PresignedProblem, string>> = {
+  https: "that is not https", userinfo: "that carries a user name or password", internal: "on a private or local network",
+};
 
 /** A storage path segment from a name someone chose: plain characters only, never `.`/`..` or empty. */
 function pathSegment(name: string, fallback: string): string {
@@ -2078,12 +2164,14 @@ async function keepAttachment(
  */
 export const VIEW_TOOL = "attachments_view";
 /**
- * The largest image `attachments_view` shows: 1.5 MiB of file and 2000 px a side. Nothing here resizes or re-encodes
+ * The largest image `attachments_view` shows: 1.5 MiB of file and 2048 px a side. 2048 because a phone screenshot is
+ * often exactly that tall (1449x2048 was refused at 2000), and it stays far under the 8192 px a provider accepts
+ * (src/model/images.ts `MAX_IMAGE_SIDE`). Nothing here resizes or re-encodes
  * (the Worker has no image library), so an image over either is refused with its size and the limit, and the agent is
  * left the stored file.
  */
 export const VIEW_MAX_BYTES = 1.5 * 1024 * 1024;
-export const VIEW_MAX_SIDE = 2000;
+export const VIEW_MAX_SIDE = 2048;
 
 /** What `imageHeader` read: a still image of a type `attachments_view` shows, or what the bytes are instead. */
 export type ImageHeader =
@@ -2253,6 +2341,113 @@ const VIEW_SCHEMA: ToolSchema = {
 };
 
 /**
+ * `attachments_upload`: a file in the agent's own object storage (an `artifact://` reference — what `sandbox.save` and
+ * the download hand back) uploaded to Raft as an attachment for one conversation, through the SDK's
+ * typed `attachments.upload` with this mount's credential. The SDK keeps it out of its manifest (a binary payload has
+ * no JSON form), so this plugin writes the tool itself, beside the download it mirrors. The upload posts nothing:
+ * the model gets the attachment's id and is told to pass it to `messages_send` in `attachmentIds`.
+ */
+export const UPLOAD_TOOL = "attachments_upload";
+/**
+ * The capability the upload needs, as the SDK's route contract states it (`send`), so an SDK that changes it moves
+ * `toolsBasis` and which credentials list the tool.
+ */
+const UPLOAD_CAPABILITY: readonly string[] = [describeRaftRoute("attachmentUpload").capability];
+/**
+ * The largest file the upload reads and sends: the download's 25 MiB, for the same reason — the bytes are held whole
+ * in the Worker's memory (128 MB per isolate) on the way out. The Server's own limit (`maxBytes`, from
+ * `attachments.uploadCapabilities`) is applied by the SDK, which also picks the multipart or the upload-session path
+ * by the Server's direct-upload threshold, so neither is repeated here.
+ */
+export const UPLOAD_MAX_BYTES = ATTACHMENT_MAX_BYTES;
+
+function overUpload(ref: string, bytes: number): Error {
+  return new Error(`${ref} is ${sizeOf(bytes)}, over the ${UPLOAD_MAX_BYTES / 1024 / 1024} MiB this mount uploads; nothing was uploaded`);
+}
+
+/**
+ * `attachments_upload`, end to end. Everything is checked before Raft is asked: the reference must be this agent's
+ * own (`keyForRef` under the caller's scope; only the `artifact://` form, never a raw `r2://` one, which no tool hands
+ * out any more), the object must exist and be 1 byte to `UPLOAD_MAX_BYTES`. The type is the caller's when given,
+ * else the SDK's inference (the bytes, then the filename's extension): storage keeps no type to read, since the
+ * runtime's store drops the one it is given (`BoundArtifacts.put`, cf/src/runtime.ts). Raft's refusal is the SDK's,
+ * said as every other.
+ */
+export async function uploadAttachment(
+  args: unknown, ctx: PluginContext, artifacts: RaftArtifacts | null, unoffered: ReadonlySet<string> = DEFAULT_UNOFFERED,
+): Promise<Json> {
+  if (args === null || typeof args !== "object" || Array.isArray(args)) throw new Error(`${UPLOAD_TOOL} takes an object of arguments`);
+  const a = args as Record<string, unknown>;
+  const ref = typeof a.ref === "string" ? a.ref.trim() : "";
+  const target = typeof a.target === "string" ? a.target.trim() : "";
+  if (!ref) throw new Error(`ref is required: an ${AGENT_REF}… reference to a file in this agent's storage, as sandbox save or ${DOWNLOAD_TOOL} returns it`);
+  if (!target) throw new Error("target is required: the conversation the attachment is for (#channel, dm:@peer, or a thread target), the one you will send it to");
+  if (a.filename !== undefined && (typeof a.filename !== "string" || !a.filename.trim())) throw new Error("filename, when given, is a non-empty string");
+  if (a.mimeType !== undefined && (typeof a.mimeType !== "string" || !/^[\w.+-]+\/[\w.+-]+$/.test(a.mimeType.trim()))) {
+    throw new Error("mimeType, when given, looks like type/subtype, for example image/png");
+  }
+  if (!ref.startsWith(AGENT_REF)) throw new Error(`ref must be an ${AGENT_REF}… reference to a file in this agent's storage; nothing was uploaded`);
+  const key = keyForRef(ref, ctx.caller);
+  if (!key) throw new Error(`${ref} does not name a file in this agent's storage; nothing was uploaded`);
+  if (!artifacts) throw new Error("this deployment has no object storage to upload a file from; nothing was uploaded");
+  // The size first, from the object's metadata: a file over the cap is refused without its bytes ever being loaded
+  // into the Durable Object's memory, which a whole-object read would do before any length could be checked.
+  let head: { bytes: number } | null;
+  try { head = await artifacts.head(key); } catch {
+    throw marked(new Error(`this agent's storage did not answer for ${ref}; nothing was uploaded`), { transient: true });
+  }
+  if (!head) throw new Error(`no file is stored at ${ref}; nothing was uploaded`);
+  if (head.bytes > UPLOAD_MAX_BYTES) throw overUpload(ref, head.bytes);
+  let bytes: Uint8Array;
+  try {
+    bytes = await artifacts.get(key);
+  } catch (e) {
+    // The runtime's store says a missing object in these words (`BoundArtifacts.get`, cf/src/runtime.ts); anything
+    // else is storage failing, which may clear, and is not the agent's file being absent.
+    if ((e as Error)?.message === "no such artifact") throw new Error(`no file is stored at ${ref}; nothing was uploaded`);
+    throw marked(new Error(`this agent's storage did not answer for ${ref}; nothing was uploaded`), { transient: true });
+  }
+  if (bytes.byteLength === 0) throw new Error(`${ref} is empty, and Raft takes no 0-byte attachment; nothing was uploaded`);
+  // Again on the bytes read: an object replaced between the two calls is held to the same cap.
+  if (bytes.byteLength > UPLOAD_MAX_BYTES) throw overUpload(ref, bytes.byteLength);
+  const filename = typeof a.filename === "string" ? a.filename.trim() : ref.slice(ref.lastIndexOf("/") + 1);
+  const mimeType = typeof a.mimeType === "string" ? a.mimeType.trim() : undefined;
+  const presigned: { refused?: PresignedProblem } = {};
+  const out = await raftFor(ctx, { state: false, presigned }).attachments.upload({ target, filename, bytes, ...(mimeType ? { mimeType } : {}) });
+  if (presigned.refused) {
+    throw new Error(`Raft returned an upload address ${PRESIGNED_PROBLEM[presigned.refused]}; nothing was sent there, and nothing was uploaded`);
+  }
+  // Not a write that may have landed: an upload that went through with its answer lost is an attachment nobody
+  // sent, which posts nothing, so calling again costs nothing but a second unsent copy.
+  if (!out.ok) throw sdkFailure(out, unoffered);
+  const id = out.data.id;
+  return {
+    attachmentId: id, target, filename: out.data.filename, mimeType: out.data.mimeType, bytes: out.data.sizeBytes,
+    next: `Uploaded, not posted: call messages_send with target ${JSON.stringify(target)} and attachmentIds ${JSON.stringify([id])} to post it.`,
+  };
+}
+
+const UPLOAD_SCHEMA: ToolSchema = {
+  name: UPLOAD_TOOL,
+  summary: `Upload a file from this agent's storage (an ${AGENT_REF}… reference, as sandbox save or ${DOWNLOAD_TOOL} returns it) ` +
+    `to Raft as an attachment for one conversation, up to ${UPLOAD_MAX_BYTES / 1024 / 1024} MiB. Posts nothing by itself: ` +
+    "returns an attachmentId to pass to messages_send in attachmentIds, with the same target.",
+  parameters: {
+    type: "object",
+    properties: {
+      ref: { type: "string", description: `The file: an ${AGENT_REF}… reference to this agent's own storage.` },
+      target: { type: "string", description: "The conversation it is for: #channel, dm:@peer, or a thread target. Send it to the same one." },
+      filename: { type: "string", description: "The name people see. Defaults to the reference's last segment." },
+      mimeType: { type: "string", description: "Its type, such as image/png. Defaults to what the file's bytes and name say." },
+    },
+    required: ["ref", "target"],
+    additionalProperties: false,
+  },
+  sideEffects: "write",
+  idempotency: "none",
+};
+
+/**
  * The basis of a raft snapshot (`Plugin.toolsBasis`): a digest of every tool this build can offer, each as its name and
  * the capabilities it needs, sorted, so it moves exactly when what a listing could return moves — an SDK upgrade that
  * adds or removes an operation or changes the capability one needs (which changes which credentials list it), a change
@@ -2278,17 +2473,22 @@ export const FEATURES_BASIS = "(listing records the Server's features: 1)";
 const EVERY_OPERATION = "(every Raft operation)";
 
 /**
- * Where the attachment download keeps a file: the agent's object storage, as the runtime hands it to the plugins that
+ * Where the attachment download keeps a file and the upload reads one: the agent's object storage, as the runtime hands it to the plugins that
  * store files (`sandboxPlugin`'s `save`, `statePlugin`), so the same reader (`artifacts.read`) and the same reference
  * form (`artifact://…`, src/store/refs.ts) apply.
  */
 export interface RaftArtifacts {
   put(key: string, body: Uint8Array, contentType?: string): Promise<{ ref: string; bytes: number }>;
+  /** The whole object; throws when there is none. `attachments_upload` reads what it sends to Raft through this. */
+  get(key: string): Promise<Uint8Array>;
+  /** The object's size from its metadata, without its body; null when there is none. Asked before `get`. */
+  head(key: string): Promise<{ bytes: number } | null>;
 }
 
 /**
  * The plugin, built for a runtime. `artifacts` is where `attachments_download_url` and `attachments_view` keep what
- * they fetch (none: neither is offered, and every pointer at the download is said in words). `excluded` is the exclusion table, `EXCLUDED` unless
+ * they fetch and where `attachments_upload` reads what it sends (none: none of the three is offered, and every pointer
+ * at the download is said in words). `excluded` is the exclusion table, `EXCLUDED` unless
  * a test builds it otherwise: every list below derives from it — which tools are generated and offered, how each is dispatched, which hints are
  * put in words (`offeredTerms`), and a message line's attachment suffix (`modelLine`) — so taking an operation out of
  * the table is the whole change that offers it. `assistant` is the wire a personal assistant's owner reads go
@@ -2316,9 +2516,15 @@ export function createRaftPlugin(deps: {
    * the view existed lists the download alone, and is re-taken at the next turn because the view moved `toolsBasis`.
    */
   const viewTools: readonly ToolSchema[] = offerable.some((op) => op.name === DOWNLOAD_OP) ? [VIEW_SCHEMA] : [];
+  /**
+   * `attachments_upload` needs storage to read from and the `send` capability (`UPLOAD_CAPABILITY`): built only with
+   * storage, listed by a snapshot only for a credential holding the capability, and offered by `mountTools` only when
+   * its snapshot lists it. It is not an operation of the SDK's manifest, so the exclusion table does not reach it.
+   */
+  const uploadTools: readonly ToolSchema[] = artifacts ? [UPLOAD_SCHEMA] : [];
   const operationOf = new Map(generated.map((op) => [op.toolName, op]));
   /** What a mount with no snapshot is offered: every tool but a personal assistant's (`ASSISTANT_TOOLS`). */
-  const allTools: ToolSchema[] = [...OWN_TOOLS, ...generatedTools, ...viewTools];
+  const allTools: ToolSchema[] = [...OWN_TOOLS, ...generatedTools, ...viewTools, ...uploadTools];
   /**
    * What this call's mount does not offer, for the hints and the attachment suffix: `unoffered`, plus every generated
    * tool the kernel says this mount is not offered right now (`PluginContext.offered`) — one its credential lacks the
@@ -2337,6 +2543,8 @@ export function createRaftPlugin(deps: {
   const manifests: ManifestCache = new Map();
   /** Agent Login's Raft client: its state is never saved, since a login and a list book nothing as seen. */
   const agentLogin = (ctx: PluginContext): AgentLoginDeps => ({ raft: () => raftFor(ctx, { state: false }), timeoutMs: timeout(ctx) });
+  /** When each mount's managed MCP catalogue was last listed in this isolate, and which a call found stale (src/plugins/raft-mcp.ts). */
+  const mcp = mcpClock();
   /** One generated operation: the attachment download is this plugin's own (`downloadAttachment`), the rest the SDK's. */
   const operate = (op: RaftOperationSpec, args: unknown, ctx: PluginContext, resumed?: { seen?: { upToSeq: number }; heldAt?: number }) =>
     op.name === DOWNLOAD_OP ? downloadAttachment(args, ctx, artifacts, unofferedFor(ctx)) : runOperation(op, args, ctx, unofferedFor(ctx), resumed);
@@ -2353,6 +2561,7 @@ export function createRaftPlugin(deps: {
       ...OWN_TOOLS.map((t) => ({ name: t.name })), ...ASSISTANT_TOOLS.map((t) => ({ name: t.name })),
       ...offerable.map((op) => ({ name: op.toolName, capability: op.capability })),
       ...viewTools.map((t) => ({ name: t.name, capability: RAFT_OPERATIONS.find((o) => o.name === DOWNLOAD_OP)!.capability })),
+      ...uploadTools.map((t) => ({ name: t.name, capability: UPLOAD_CAPABILITY })),
     ]),
     /** The push registration this mount holds: whether it exists is listable, what it holds is not. */
     database: {
@@ -2360,7 +2569,7 @@ export function createRaftPlugin(deps: {
       // Version 5 added the Server's flags as the listing last read them (`CONTEXT_STORE`); nothing to carry over.
       version: 5, stores: {
         [PUSH_STORE]: { listed: [PUSH_KEY] }, [INBOX_STORE]: { listed: [STATE_KEY, SINCE_KEY] }, [SESSION_STORE]: {},
-        [CONTEXT_STORE]: { listed: [FEATURES_KEY] },
+        [CONTEXT_STORE]: { listed: [FEATURES_KEY, MCP_KEY] },
       },
       /**
        * Version 2 kept the cursor and the frontier under their own keys; version 3 keeps the SDK's state record.
@@ -2412,8 +2621,15 @@ export function createRaftPlugin(deps: {
      * call last kept (`CONTEXT_STORE`); null with none kept or none on, which leaves the prompt as it was.
      */
     async promptContribution(ctx) {
-      return featuresParagraph(featuresOf(await ctx.db.get(CONTEXT_STORE, FEATURES_KEY)), ctx.alias);
+      const features = featuresParagraph(featuresOf(await ctx.db.get(CONTEXT_STORE, FEATURES_KEY)), ctx.alias);
+      // One line per managed MCP connector that needs reconnecting and per catalogue tool this agent is not offered, so
+      // the agent tells the person what is wrong instead of saying the connector has no such tool (`mcpLines`).
+      const reconnect = mcpLines(keptMcpOf(await ctx.db.get(CONTEXT_STORE, MCP_KEY)));
+      const parts = [features, reconnect.length ? reconnect.join("\n") : null].filter((p): p is string => p !== null);
+      return parts.length ? parts.join("\n\n") : null;
     },
+    /** A turn's start lists the mount again when its managed MCP catalogue has aged or a call found it stale (`mcpClock`). */
+    toolsDue: (m, now) => mcp.due(m, now),
     retired: RETIRED,
 
     /**
@@ -2438,7 +2654,9 @@ export function createRaftPlugin(deps: {
       const generatedHere = generatedTools.filter((t) => allowed.has(t.name));
       // The view needs the download's capability and storage, so it goes only with the download offered beside it.
       const view = generatedHere.some((t) => t.name === DOWNLOAD_TOOL) ? viewTools.filter((t) => allowed.has(t.name)) : [];
-      return [...OWN_TOOLS, ...generatedHere, ...view, ...ASSISTANT_TOOLS.filter((t) => allowed.has(t.name))];
+      // The managed MCP tools are the catalogue's, so they are read whole from the snapshot (src/plugins/raft-mcp.ts).
+      const managed = snapshot.tools.filter((t) => t.name.startsWith(MCP_PREFIX));
+      return [...OWN_TOOLS, ...generatedHere, ...view, ...uploadTools.filter((t) => allowed.has(t.name)), ...ASSISTANT_TOOLS.filter((t) => allowed.has(t.name)), ...managed];
     },
 
     /**
@@ -2464,7 +2682,8 @@ export function createRaftPlugin(deps: {
       if (!ctx.credential) {
         return { tools: [], skipped: [{ name: EVERY_OPERATION, reason: "this mount has no Raft credential, so it has no capabilities", every: true }] };
       }
-      const me = await raftFor(ctx, { state: false }).routes.agent.context();
+      const raft = raftFor(ctx, { state: false });
+      const me = await raft.routes.agent.context();
       if (!me.ok) {
         if (me.status === 401 || me.status === 403) {
           return { tools: [], refused: true, skipped: [{ name: EVERY_OPERATION, reason: `Raft refused this mount's credential (HTTP ${me.status})`, every: true }] };
@@ -2486,13 +2705,34 @@ export function createRaftPlugin(deps: {
         else tools.push(toolOf(op));
       }
       if (tools.some((t) => t.name === DOWNLOAD_TOOL)) tools.push(...viewTools);
+      const uploadMissing = UPLOAD_CAPABILITY.filter((c) => !capabilities.has(c));
+      for (const t of uploadTools) {
+        if (uploadMissing.length) skipped.push({ name: t.name, reason: `the credential lacks the Raft capability ${uploadMissing.join(", ")}` });
+        else tools.push(t);
+      }
       if (isAssistantOf(me.data.agent.assistantOf)) tools.push(...ASSISTANT_TOOLS);
-      return { tools, skipped };
+      // The managed MCP catalogue, last: asked only of a credential that holds `mcp`, and never the reason the listing
+      // fails (`listMcp`). After Raft's own tools, so the kernel's bound on a list's length never costs one of those.
+      const managed = await listMcp(raft, ctx, CONTEXT_STORE, capabilities.has(MCP_CAPABILITY));
+      tools.push(...managed.tools);
+      // First, since the kernel keeps only the first few reasons (`MAX_SKIPPED`), and a credential that lacks several
+      // capabilities fills them with one line per tool.
+      const listed: ListedTools = { tools, skipped: [...managed.skipped, ...skipped] };
+      const left = await leftOut(listed, managed.tools);
+      // The catalogue entries each tool is bound to, and the clock, only once the kernel keeps this list as the mount's
+      // (`ListedTools.onKept`): a listing it sets aside must not hand its versions to calls made under the list it kept,
+      // nor put off the next listing. Kept with the tools its admission leaves out, which the paragraph names.
+      listed.onKept = async () => {
+        await managed.keep(left);
+        mcp.listed(ctx, Date.now());
+      };
+      return listed;
     },
 
     /**
      * A held call's question, answered. "send" (a message) or "proceed" (a task write) makes the same call again
-     * with the same arguments — under the interrupt's `resume.idempotencyKey` for a send — attesting what the
+     * with the same arguments — under the interrupt's `resume.idempotencyKey` for a send, and with its `resume.with`
+     * (`targetConfirmed: true` for a `thread_target` hold), both kept in the state by `heldCall` — attesting what the
      * question showed, so it goes through unless the conversation moved again since, which asks again with the
      * newer messages. "drop" does nothing. Expiry and cancel do nothing either, so no `cancel` is declared: an
      * in-process held call leaves nothing on the Server, and cancelling is not making the call. Going ahead with a
@@ -2596,10 +2836,15 @@ export function createRaftPlugin(deps: {
     },
 
     async invoke(name, args, ctx): Promise<Json> {
+      // Not the mount's own timeout: Raft gives the remote server its own budget to connect and to answer
+      // (`MCP_CALL_TIMEOUT_MS`), and a call cut short here is one Raft may still complete.
+      if (isMcpTool(name)) return callMcp(name, args, ctx, () => raftFor(ctx, { state: false, timeoutMs: MCP_CALL_TIMEOUT_MS }), CONTEXT_STORE, mcp);
       const op = operationOf.get(name);
       if (op) return operate(op, args, ctx) as Promise<Json>;
       // Answered wherever the download is generated, as the download is: with no storage it says why nothing was kept.
       if (name === VIEW_TOOL && operationOf.has(DOWNLOAD_TOOL)) return viewAttachment(args, ctx, artifacts, unofferedFor(ctx));
+      // Answered with no storage too, so a direct call says why nothing was uploaded rather than naming no such tool.
+      if (name === UPLOAD_TOOL) return uploadAttachment(args, ctx, artifacts, unofferedFor(ctx));
       const a = object(args);
       if (name === LIST_TOOL) return integrationsList(ctx, agentLogin(ctx));
       if (name === LOGIN_TOOL) return integrationsLogin(args, ctx, agentLogin(ctx));

@@ -314,6 +314,11 @@ await check("a platform token acts in the tenant named by the Raft server: raft_
   // Reads and deletes need the server on the URL; without it nothing is looked up.
   const noServer = await call(f.deps, "GET", "/agents/by-raft-agent/01JAGENT", undefined, null, PLATFORM);
   assert(noServer.status === 422 && noServer.body.error.param === "raftServerId", noServer.text);
+  // The refusal names the one place this route reads the server from, and not the other.
+  assert(/\?raftServerId= on the URL/.test(noServer.body.error.message) && !/in the body/.test(noServer.body.error.message), `a URL route's refusal: ${noServer.body.error.message}`);
+  const noServerPost = await call(f.deps, "POST", "/agents", body({ raftServerId: undefined }), "01JNOSRV", PLATFORM);
+  assert(noServerPost.status === 422 && noServerPost.body.error.param === "raftServerId", noServerPost.text);
+  assert(/raftServerId in the body/.test(noServerPost.body.error.message) && !/on the URL/.test(noServerPost.body.error.message), `the create's refusal: ${noServerPost.body.error.message}`);
   const got = await call(f.deps, "GET", "/agents/by-raft-agent/01JAGENT", undefined, null, PLATFORM, "95f993fa-2a68-4797-b8ae-7beb7d984ada");
   assert(got.status === 200 && got.body.raftServerId === "95f993fa-2a68-4797-b8ae-7beb7d984ada", got.text);
   const gone = await call(f.deps, "DELETE", "/agents/by-raft-agent/01JAGENT", undefined, null, PLATFORM, "d21383ee-df0a-4ed0-8f4c-ef263f2adb68");
@@ -325,6 +330,54 @@ await check("a platform token acts in the tenant named by the Raft server: raft_
   assert(ignored.status === 200 && [...fixed.tenants].join(",") === "t-raft", ignored.text);
   const badServer = await call(f.deps, "POST", "/agents", body({ raftServerId: "has space" }), "01JAGENT", PLATFORM);
   assert(badServer.status === 422 && badServer.body.error.param === "raftServerId", badServer.text);
+});
+
+await check("two Raft servers never share a tenant, whatever their ids spell", async () => {
+  // The tenant is the per-server namespace every row is keyed in, so two ids that derive one tenant are two
+  // servers sharing agents, quota and billing. Both spellings that used to collide are here: `:` is legal in a
+  // Raft id and was substituted away, and an id longer than the 59 an object name leaves was cut.
+  const made = async (id: string) => {
+    const f = fakeDeps();
+    const r = await call(f.deps, "POST", "/agents", body({ raftServerId: id }), "01JAGENT", PLATFORM);
+    assert(r.status === 201, `${id.slice(0, 24)}: ${r.status} ${r.text}`);
+    const tenant = [...f.tenants][0]!;
+    assert(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(tenant), `${id.slice(0, 24)} derives a tenant that is not an object name: ${tenant}`);
+    return tenant;
+  };
+  // Already safe: spelled as it always was, so rows written before this read back under the same tenant.
+  assert((await made("srv-1")) === "raft_srv-1", "a plain server id no longer derives raft_<id>");
+  assert((await made("d21383ee-df0a-4ed0-8f4c-ef263f2adb68")) === "raft_d21383ee-df0a-4ed0-8f4c-ef263f2adb68", "a UUID server id no longer derives raft_<id>");
+  // Substitution is not the name: `srv:prod` and `srv_prod` are two servers.
+  const colon = await made("srv:prod");
+  const plain = await made("srv_prod");
+  assert(colon !== plain, `srv:prod and srv_prod share the tenant ${colon}`);
+  // Cutting is not the name either: the same first 59 characters, then two different ones.
+  const long = "x".repeat(59);
+  const longA = await made(`${long}a`);
+  const longB = await made(`${long}b`);
+  assert(longA !== longB, `two 60-character ids share the tenant ${longA.slice(0, 32)}…`);
+  // And a safe id cannot spell the other shape, so neither branch can be read as the other's tenant: one that
+  // ends as a digest does takes the digest, and the name is still an object name's 64 at most.
+  const looks = await made(`${"y".repeat(46)}_0123456789ab`);
+  assert(looks.length === 64 && /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(looks), `the digest shape: ${looks}`);
+});
+
+await check("a plain-looking server id spelled as another server's digested tenant still derives a tenant of its own", async () => {
+  // `srv:prod` needs a substitution, so it derives `raft_srv_prod_<digest>`. `srv_prod_<digest>` is legal as it
+  // is, and spelled as `raft_` plus its id it would be that same tenant: a server that picked that id would be
+  // addressing the other's agents. Ending as a digest ends is what sends it down the digest branch instead.
+  const tenantOf = async (id: string) => {
+    const f = fakeDeps();
+    const r = await call(f.deps, "POST", "/agents", body({ raftServerId: id }), "01JAGENT", PLATFORM);
+    assert(r.status === 201, `${id}: ${r.status} ${r.text}`);
+    return [...f.tenants][0]!;
+  };
+  const y = await tenantOf("srv:prod");
+  const digest = /^raft_srv_prod_([0-9a-f]{12})$/.exec(y)?.[1];
+  assert(digest, `srv:prod no longer derives raft_srv_prod_<digest>: ${y}`);
+  const x = await tenantOf(`srv_prod_${digest}`);
+  assert(x !== y, `srv_prod_${digest} and srv:prod share the tenant ${y}`);
+  assert(/^raft_srv_prod_[0-9a-f]{12}_[0-9a-f]{12}$/.test(x), `srv_prod_${digest} did not take the digest branch: ${x}`);
 });
 
 await check("the antiproton agent id is the Raft id, prefixed, made legal for an object name, and bounded", async () => {
@@ -377,8 +430,15 @@ function connectionsFake() {
       async list(t, p) { return [...connectors.values()].filter((c) => c.tenantId === t && c.provider === p); },
       async remove(t, id) { const c = connectors.get(id); return !!c && c.tenantId === t && connectors.delete(id); },
       async record(e) { events.push(e); },
+      async reconnect(t, id, next) {
+        const c = connectors.get(id);
+        if (!c || c.tenantId !== t || (c.accountId && c.accountId !== next.accountId)) return false;
+        connectors.set(id, { ...c, sealed: next.sealed, refresh: next.refresh, account: next.account, accountId: next.accountId, brokenAt: null, lastCheckedAt: next.at });
+        return true;
+      },
     },
     newId: () => `con_${++n}`,
+    async reconnect(_t, agentId, _p, _id, _was, sealed) { attached.push({ agentId, sealed }); return { ok: true, updated: true }; },
     async attach(_t, agentId, _p, sealed) { attached.push({ agentId, sealed }); return { ok: true, account: "octocat" }; },
     async link(spec) { links.push(spec); return { url: "https://ap.example/connect/start?t=signed", expiresAt: "2026-09-29T07:00:00.000Z" }; },
     async detach(_t, agentId, provider) { detached.push(`${agentId}/${provider}`); return true; },
@@ -394,6 +454,37 @@ function connectionsFake() {
   };
   return { f, links, detached, attached, conns, connectors, events, failDetach };
 }
+
+await check("connections: a reconnect in place names its connector and role at the link, where they are signed in; each is checked there", async () => {
+  const { f, links, connectors } = connectionsFake();
+  await call(f.deps, "POST", "/agents", body(), "01JAGENT");
+  const path = "/agents/by-raft-agent/01JAGENT/connections/github";
+  const ret = `${WHO.raftOrigin}/agents/01JAGENT`;
+  connectors.set("con_mine", { id: "con_mine", tenantId: "t-raft", provider: "github", account: "octocat", accountId: "1", creatorRaftUserId: "u_owner", sealed: { ciphertext: "s", iv: "i" }, createdAt: 1 });
+  connectors.set("con_theirs", { id: "con_theirs", tenantId: "t-other", provider: "github", account: "octocat", accountId: "1", creatorRaftUserId: "u_owner", sealed: { ciphertext: "s", iv: "i" }, createdAt: 1 });
+  const ask = (extra: Record<string, unknown>, by = "u_owner") => call(f.deps, "POST", path, { returnUrl: ret, initiatedBy: { raftUserId: by }, ...extra });
+  const made = await ask({ connectorId: "con_mine", actingRole: "creator" });
+  assert(made.status === 200 && made.body.reconnect === "con_mine" && JSON.stringify(links.at(-1).reconnect) === '{"connectorId":"con_mine","actingRole":"creator"}', `${made.status} ${made.text}`);
+  const admin = await ask({ connectorId: "con_mine", actingRole: "admin" }, "u_admin");
+  assert(admin.status === 200 && links.at(-1).reconnect.actingRole === "admin", admin.text);
+  const n = links.length;
+  for (const [extra, by, status, code] of [
+    [{ connectorId: "con_mine", actingRole: "creator" }, "u_stranger", 403, "not_creator"],
+    [{ connectorId: "con_theirs", actingRole: "admin" }, "u_owner", 404, "not_found"],
+    [{ connectorId: "con_nope", actingRole: "admin" }, "u_owner", 404, "not_found"],
+    [{ connectorId: "con_mine" }, "u_owner", 422, "invalid"],
+    [{ connectorId: "con_mine", actingRole: "owner" }, "u_owner", 422, "invalid"],
+    [{ connectorId: "", actingRole: "admin" }, "u_owner", 422, "invalid"],
+    [{ actingRole: "admin" }, "u_owner", 422, "invalid"],
+  ] as const) {
+    const r = await ask(extra, by);
+    assert(r.status === status && r.body.error.code === code, `${JSON.stringify(extra)} by ${by}: ${r.status} ${r.text}`);
+  }
+  assert(links.length === n, "a refused reconnect was given a link");
+  // A plain connect is as it was: no reconnect in its link or its answer.
+  const plain = await ask({});
+  assert(plain.status === 200 && !("reconnect" in plain.body) && !("reconnect" in links.at(-1)), plain.text);
+});
 
 await check("connections: a link for the agent's Raft only, bound to who asked, with the scopes gh needs; GET shows the account, never a credential; DELETE detaches", async () => {
   const { f, links, detached } = connectionsFake();

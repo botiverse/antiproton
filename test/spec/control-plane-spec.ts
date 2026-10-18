@@ -228,7 +228,8 @@ export function controlPlaneCases(db: D1Database): SpecCase[] {
     assert((await c.remove("t", "a1", "github")) === false, "removing twice said it removed something");
     assert((await c.consumeLink("n1", 1)) === true && (await c.consumeLink("n1", 2)) === false, "a link was spent twice");
     const cols = async (t: string) => ((await db.prepare(`SELECT name FROM pragma_table_info('${t}')`).all()).results as any[]).map((r) => r.name).sort().join(",");
-    assert((await cols("provisioned_connections")) === "account,connected_at,connected_by,connector_id,provider,raft_agent_id,tenant_id", `provisioned_connections ${await cols("provisioned_connections")}`);
+    // What Raft may show and the broken state (0023), never a credential.
+    assert((await cols("provisioned_connections")) === "account,broken_at,broken_reason,connected_at,connected_by,connector_id,provider,raft_agent_id,tenant_id", `provisioned_connections ${await cols("provisioned_connections")}`);
     assert((await cols("connect_links")) === "nonce,used_at", `connect_links ${await cols("connect_links")}`);
   });
 

@@ -25,8 +25,17 @@ async function check(name: string, fn: () => Promise<void> | void) {
   catch (e) { results.push({ name, ok: false, error: String((e as Error)?.stack ?? e).split("\n").slice(0, 3).join("\n      ") }); }
 }
 function must(cond: unknown, msg: string): asserts cond { if (!cond) throw new Error(msg); }
+const show = (v: unknown) => JSON.stringify(v);
 
 const TOKEN = "operator-token-814";
+
+// No route here should fetch from the Worker; in a test any fetch is recorded and answered here, never sent. Whichever
+// world is current records it, so a refused route shows an outbound fetch as plainly as an object call.
+let outbound: string[] = [];
+globalThis.fetch = (async (input: RequestInfo | URL) => {
+  outbound.push(`fetch.${typeof input === "string" ? input : input instanceof URL ? input.href : input.url}`);
+  return new Response("{}");
+}) as typeof fetch;
 
 /** An env whose object and database record every call and answer harmlessly. */
 function world(token: string | undefined) {
@@ -43,9 +52,15 @@ function world(token: string | undefined) {
     all: async () => { calls.push("db.all"); return { results: [] }; },
     run: async () => { calls.push("db.run"); return { meta: { changes: 0 } }; },
   };
+  const bucket = {
+    put: async (key: string) => { calls.push(`r2.put ${key}`); return {}; },
+    get: async (key: string) => { calls.push(`r2.get ${key}`); return { arrayBuffer: async () => new ArrayBuffer(0) }; },
+  };
+  outbound = calls;
   const env: Record<string, unknown> = {
     AGENT: { idFromName: (n: string) => n, get: () => objectStub },
     CONTROL_DB: { prepare: () => stmt, batch: async () => [] },
+    ARTIFACTS: bucket,
     ...(token === undefined ? {} : { AUTOMATION_TOKEN: token }),
   };
   return { env, calls };
@@ -64,14 +79,25 @@ const ROUTES: Route[] = [
   { path: "/admin/mounts", method: "GET", refused: 401, passed: (s) => s === 405 },
   // An in-place settings change; with no body its agent is not named, a 400 only a caller past the gate is given.
   { path: "/admin/mounts", method: "PATCH", refused: 401, passed: (s) => s === 400 },
+  // An agent's settings (src/runtime/agent-settings.ts): the read is a call on the object; a PATCH with no body names no agent.
+  { path: "/admin/agent-settings?tenantId=demo&agentId=u-a", method: "GET", refused: 401, passed: (s, c) => s === 200 && c.includes("object.adminAgentSettings") },
+  { path: "/admin/agent-settings", method: "PATCH", refused: 401, passed: (s, c) => s === 400 && !c.some((x) => x.startsWith("object.")) },
   { path: "/admin/service-tokens", method: "PATCH", refused: 401, passed: (s) => s === 405 },
   { path: "/admin/provider-tokens", method: "PATCH", refused: 401, passed: (s) => s === 405 },
   { path: "/admin/usage-costs", method: "GET", refused: 401, passed: (s, c) => s === 200 && c.includes("db.all") },
   { path: "/admin/migrate-engine", method: "GET", refused: 401, passed: (s) => s === 405 },
   { path: "/admin/diagnose", method: "GET", refused: 401, passed: (s) => s === 400 },
   { path: "/admin/transcript", method: "GET", refused: 401, passed: (s) => s === 400 },
+  // The friction scan on demand (cf/src/friction-scan.ts): without a day it is a 400, before anything is read.
+  { path: "/admin/friction-scan", method: "POST", refused: 401, passed: (s, c) => s === 400 && !c.some((x) => /^(object|r2)\./.test(x)) },
   // A signed-in admin or the operator's token (auth.ts isAdmin); its refusal is "no such route".
   { path: "/admin/models", method: "PATCH", refused: 404, passed: (s) => s === 405 },
+  // The probe (PROBE_ROUTES): no identity of its own, and it starts Dynamic Workers on the deployment's account, so an
+  // unauthenticated caller must not reach the object at all (the loop below checks that no object method was called).
+  // It is routed by its prefix to its own object (conformance-v2); every method is held to the token, since the
+  // switch answers it whatever the method.
+  ...["GET", "HEAD", "OPTIONS", "POST"].map((method): Route => (
+    { path: "/conformance/executor", method, refused: 401, passed: (s, c) => s === 200 && c.includes("object.runExecutorSpec") })),
 ];
 
 async function hit(r: Route, token: string | undefined, presented: string | null) {
@@ -88,19 +114,57 @@ for (const r of ROUTES) {
     for (const presented of [null, "", "anything", "undefined"]) {
       const out = await hit(r, undefined, presented);
       must(out.status === r.refused, `header ${JSON.stringify(presented)}: ${out.status} ${out.text.slice(0, 200)}`);
-      must(!out.calls.some((c) => c.startsWith("object.")), `header ${JSON.stringify(presented)} reached the object: ${out.calls}`);
+      must(!out.calls.some((c) => /^(object|r2|fetch)\./.test(c)), `header ${JSON.stringify(presented)} reached the object, R2 or the network: ${out.calls}`);
     }
   });
   await check(`${name}: a wrong or missing token is refused`, async () => {
     for (const presented of [null, "", "operator-token-81", TOKEN + "x"]) {
       const out = await hit(r, TOKEN, presented);
       must(out.status === r.refused, `header ${JSON.stringify(presented)}: ${out.status} ${out.text.slice(0, 200)}`);
-      must(!out.calls.some((c) => c.startsWith("object.")), `header ${JSON.stringify(presented)} reached the object: ${out.calls}`);
+      must(!out.calls.some((c) => /^(object|r2|fetch)\./.test(c)), `header ${JSON.stringify(presented)} reached the object, R2 or the network: ${out.calls}`);
     }
   });
   await check(`${name}: the configured token gets past the gate`, async () => {
     const out = await hit(r, TOKEN, TOKEN);
     must(r.passed(out.status, out.calls), `${out.status} ${out.text.slice(0, 200)} calls=${out.calls}`);
+  });
+}
+
+// The provider routes that name no agent (cf/src/provision/handlers.ts): behind the provider token, not the operator's.
+// No token, one that is not a provider token, one this deployment never issued (the database knows none), and the
+// operator's own token in either header are all 401, before any object, R2 or network call.
+for (const [method, path] of [["POST", "/provision/import-check"], ["GET", "/provision/import-limits"]] as const) {
+  await check(`${method} ${path}: refused without a provider token this deployment issued`, async () => {
+    for (const headers of [{}, { authorization: "Bearer anything" }, { authorization: "Bearer pt-" + "0".repeat(40) },
+      { authorization: `Bearer ${TOKEN}` }, { "x-harness-token": TOKEN }] as Array<Record<string, string>>) {
+      const w = world(TOKEN);
+      const res = await worker.fetch(new Request(`https://x${path}`, { method, headers, ...(method === "POST" ? { body: "{}" } : {}) }),
+        w.env as never, { waitUntil() {}, passThroughOnException() {} } as never);
+      const text = await res.text();
+      must(res.status === 401 && JSON.parse(text).error?.code === "unauthorized", `${show(headers)}: ${res.status} ${text.slice(0, 200)}`);
+      must(!w.calls.some((c) => /^(object|r2|fetch)\./.test(c)), `${show(headers)} reached the object, R2 or the network: ${w.calls}`);
+    }
+  });
+}
+
+// The diagnostic routes that had no caller are gone. Each is now an unknown path: the 404 index, whoever asks and
+// whatever the method, and nothing behind it runs — no object, no R2, no outbound fetch.
+const DELETED = [
+  "/isolation", "/eviction", "/model-binding", "/sandbox", "/sandbox/cpu?ms=50", "/alarm/arm?ms=1000",
+  "/alarm/status", "/storage", "/latency",
+];
+for (const path of DELETED) {
+  await check(`${path.split("?")[0]}: deleted, so the 404 index with no object, R2 or network touched`, async () => {
+    for (const method of ["GET", "POST"]) {
+      for (const [token, presented] of [[undefined, null], [TOKEN, null], [TOKEN, TOKEN]] as const) {
+        const out = await hit({ path, method, refused: 0, passed: () => false }, token, presented);
+        must(out.status === 404, `${method} token=${token ?? "unset"} presented=${presented ?? "none"}: ${out.status} ${out.text.slice(0, 200)}`);
+        const index = JSON.parse(out.text) as { demo?: string; diagnostics?: string[] };
+        must(index.demo === "/ui" && Array.isArray(index.diagnostics), `not the index: ${out.text.slice(0, 200)}`);
+        must(!index.diagnostics.includes(path.split("?")[0]), `the index still offers ${path}: ${out.text}`);
+        must(!out.calls.some((c) => /^(object|r2|fetch)\./.test(c)), `${method} ${path} reached the object, R2 or the network: ${out.calls}`);
+      }
+    }
   });
 }
 

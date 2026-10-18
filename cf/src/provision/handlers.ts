@@ -17,6 +17,7 @@
  * body. Same key with any field different is 409, never a quiet update — Raft edits through PATCH (and the
  * model through PUT …/model), and a delayed POST retry must not overwrite an edit that landed after it (Tenny's race).
  */
+import { RECONNECT_REASON, type OAuthStatus } from "../github-refresh.ts";
 import type { Json } from "../../../src/core/types.ts";
 import { originProblem } from "../../../src/plugins/types.ts";
 import { secretShape } from "../secret-shape.ts";
@@ -24,9 +25,9 @@ import {
   MAIN_SESSION_ID, redactCredentials, TRACE_LIMIT_DEFAULT, TRACE_LIMIT_MAX, TRACE_WINDOW_MAX_MS, TRANSCRIPT_LIMIT_DEFAULT, TRANSCRIPT_LIMIT_MAX,
   type EvalTranscript, type TraceQuery, type TraceWindow,
 } from "../eval-read.ts";
-import { AGENT_BUDGETS, type AgentBudget, type ConnectionRegistry, type ConnectorStore, type ProviderTokenIdentity, type ProvisionRegistry, type ProvisionedAgent } from "../control-plane.ts";
+import { AGENT_BUDGETS, type AgentBudget, type ConnectionRegistry, type ConnectorRefresh, type ConnectorStore, type ProviderTokenIdentity, type ProvisionRegistry, type ProvisionedAgent } from "../control-plane.ts";
 import { PLANS, type Plan, type TenantPlanStore } from "../spend-limit.ts";
-import { CONNECTION_PROVIDERS, returnUrlProblem, scopesFor, type ConnectionProvider } from "./connect.ts";
+import { CONNECTION_PROVIDERS, returnUrlProblem, scopesFor, type ConnectionProvider, type ReconnectTarget } from "./connect.ts";
 import { surface, surfaceReadOf, type SurfaceDeps } from "../agent-surface/surface.ts";
 import { logEvent } from "../../../src/core/log.ts";
 import { logTurnStop, type StopTurnOutcome } from "../../../src/runtime/turn-stop.ts";
@@ -86,14 +87,53 @@ export type StopTurnResult = StopTurnOutcome;
  * for a whole Raft deployment, tygg 2026-09-28) derives it from the Raft server the request names —
  * the POST body's raftServerId, `?raftServerId=` on every other route — so isolation and billing
  * follow the server while Raft holds a single key. A tenant exists by being named: nothing to create.
+ * `from` is where this route reads it, so the refusal names the one place that would have worked.
  */
-export function tenantFor(who: ProviderTokenIdentity, raftServerId: string | null): string | Fail {
+export function tenantFor(who: ProviderTokenIdentity, raftServerId: string | null, from: "body" | "query" = "query"): string | Fail {
   if (who.scope === "tenant") return who.tenantId;
   if (!raftServerId || !RAFT_ID.test(raftServerId)) {
-    return { status: 422, code: "missing", message: "a platform token needs the Raft server: raftServerId in the body, or ?raftServerId= on the URL", param: "raftServerId" };
+    const where = from === "body" ? "raftServerId in the body" : "?raftServerId= on the URL";
+    return { status: 422, code: "missing", message: `a platform token needs the Raft server: ${where}`, param: "raftServerId" };
   }
-  return `raft_${raftServerId.replace(/[^A-Za-z0-9._-]/g, "_")}`.slice(0, 64);
+  return derivedTenant(raftServerId);
 }
+
+/**
+ * A server id as the tenant it names: `raft_<id>` where the id needs no help, and `raft_<readable>_<digest>`
+ * where it does.
+ *
+ * The tenant is a per-server namespace — `provisioned_agents` is keyed on `(tenant_id, raft_agent_id)`, and
+ * the routes reach a row by the tenant the request's server derives — so two servers that derive one tenant
+ * share agents, quota and billing. Two spellings used to collide:
+ *
+ *  - ``:`` is legal in a Raft id (`RAFT_ID`) and not in an object name, and the substitution that made it legal
+ *    sent `srv:prod` and `srv_prod` to one tenant;
+ *  - `raft_` plus a 64-character id is 69 characters, and cutting it to an object name's 64 kept only the id's
+ *    first 59, so every server with those 59 in common derived one tenant.
+ *
+ * So a substitution or a cut is never the whole name: an id that needs one carries a digest of its exact
+ * spelling, which is what makes the tenant that server's alone. The readable part is for whoever reads a log or
+ * a D1 row. An id that is already safe is spelled exactly as before, so rows written earlier read back
+ * unchanged. (`providerAgentId` below has the same two spellings, and a clash there is refused as
+ * `agent_id_taken` at create; here a clash is silent cross-tenant addressing, which is why only this one
+ * changes.)
+ */
+export function derivedTenant(raftServerId: string): string {
+  if (TENANT_SAFE.test(raftServerId) && !DIGEST_TAIL.test(raftServerId)) return `raft_${raftServerId}`;
+  // 5 + 46 + 1 + 12 = an object name's 64. The digest is of the id as sent, before any substitution.
+  const readable = raftServerId.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 46);
+  return `raft_${readable}_${sha256Sync(raftServerId).slice(0, 12)}`;
+}
+
+/** A server id a tenant can be named after as it is: `raft_` and an object name's 64 characters leave 59. */
+const TENANT_SAFE = /^[A-Za-z0-9._-]{1,59}$/;
+
+/**
+ * How a derived-with-digest name ends. Such an id takes the digest branch, so the two shapes stay apart: a
+ * plain `raft_<id>` never reads as another server's `raft_<readable>_<digest>`, whichever ids the two servers
+ * were given.
+ */
+const DIGEST_TAIL = /_[0-9a-f]{12}$/;
 
 /**
  * The model routes' sources (`/provision/models`, `…/model`): the deployment's options (USER_MODELS), its default
@@ -132,19 +172,26 @@ export interface ProvisionDeps {
     /** The tenant's connectors (0012): each connection is one, shared by the agents pointed at it. */
     connectors: ConnectorStore;
     newId(): string;
-    /** Put a connector's sealed credential on the agent's one mount of the provider's plugin. */
-    attach(tenantId: string, agentId: string, provider: ConnectionProvider, sealed: { ciphertext: string; iv: string }):
+    /** Put a connector's sealed credential on the agent's one mount of the provider's plugin, with what renews it (0023). */
+    attach(tenantId: string, agentId: string, provider: ConnectionProvider, sealed: { ciphertext: string; iv: string },
+      refresh?: (ConnectorRefresh & { connectorId: string | null }) | null):
       Promise<{ ok: true; account: string | null } | { ok: false; error: string }>;
-    /** The one-time link the browser opens; signed, ten minutes. */
-    link(spec: { tenantId: string; agentId: string; raftAgentId: string; provider: ConnectionProvider; returnUrl: string; raftUserId: string; scopes: string[] }):
-      Promise<{ url: string; expiresAt: string }>;
+    /** The one-time link the browser opens; signed, ten minutes. `reconnect` is signed into it (connect.ts). */
+    link(spec: { tenantId: string; agentId: string; raftAgentId: string; provider: ConnectionProvider; returnUrl: string; raftUserId: string; scopes: string[];
+      reconnect?: ReconnectTarget }): Promise<{ url: string; expiresAt: string }>;
+    /** A connector was reconnected in place: its new pair onto this agent's mount, if the mount is still the connector's (`was`: its previous token). */
+    reconnect(tenantId: string, agentId: string, provider: ConnectionProvider, connectorId: string, was: { ciphertext: string; iv: string },
+      sealed: { ciphertext: string; iv: string }, refresh: ConnectorRefresh | null): Promise<{ ok: true; updated: boolean } | { ok: false; error: string }>;
     /** Remove it only while the mount still holds this connector's credential, not a key put there since. */
-    detachIfFrom(tenantId: string, agentId: string, provider: ConnectionProvider, sealed: { ciphertext: string; iv: string }): Promise<boolean>;
+    detachIfFrom(tenantId: string, agentId: string, provider: ConnectionProvider, sealed: { ciphertext: string; iv: string }, connectorId?: string | null): Promise<boolean>;
     /** Remove the provider's credential from the agent's mount. */
     detach(tenantId: string, agentId: string, provider: ConnectionProvider): Promise<boolean>;
-    /** Make a held connection the mount's credential, for the Raft user it was held for (connect.ts). */
-    confirm(tenantId: string, agentId: string, provider: ConnectionProvider, pending: string, raftUserId: string):
-      Promise<{ ok: true; account: string | null; sealed: { ciphertext: string; iv: string } } | { ok: false; error: string; missing?: true }>;
+    /** Make a held connection the mount's credential, for the Raft user it was held for (connect.ts), as connector `connectorId`. */
+    confirm(tenantId: string, agentId: string, provider: ConnectionProvider, pending: string, raftUserId: string, connectorId?: string):
+      Promise<{ ok: true; account: string | null; accountId?: string | null; sealed: { ciphertext: string; iv: string }; refresh?: ConnectorRefresh | null;
+        /** Present for a reconnect in place: the hold was not attached, and the handler decides (`reconnectInPlace`). */
+        reconnect?: ReconnectTarget | null }
+        | { ok: false; error: string; missing?: true }>;
   };
   /**
    * An agent's usage and workspace, read through the same core the public API uses
@@ -274,7 +321,10 @@ export function providerAgentId(raftAgentId: string): string {
 }
 
 export type Fail = { status: number; code: string; message: string; param?: string };
-const fail = (f: Fail) => Response.json({ error: { code: f.code, message: f.message, ...(f.param ? { param: f.param } : {}) } }, { status: f.status, headers: { "cache-control": "no-store" } });
+const fail = (f: Fail & { rejected?: ImportRejection[]; more?: number }) => Response.json({ error: {
+  code: f.code, message: f.message, ...(f.param ? { param: f.param } : {}),
+  ...(f.rejected ? { rejected: f.rejected, more: f.more ?? 0 } : {}),
+} }, { status: f.status, headers: { "cache-control": "no-store" } });
 const ok = (body: unknown, status = 200) => Response.json(body, { status, headers: { "cache-control": "no-store" } });
 
 const field = (body: unknown, key: string): unknown => (typeof body === "object" && body !== null ? (body as Record<string, unknown>)[key] : undefined);
@@ -461,6 +511,13 @@ export async function handleProvision(
     if (!deps.imports) return null;
     return ok(IMPORT_LIMITS);
   }
+  // Read by Raft before a migration is confirmed, to show which files would not come over.
+  if (seg[0] === "import-check" && seg.length === 1 && method === "POST") {
+    if (!deps.imports) return null;
+    const tenant = tenantFor(who, headers.raftServerId);
+    if (isFail(tenant)) return fail(tenant);
+    return importCheck(body, tenant, headers.credentialId ?? null, deps);
+  }
   // The Raft server's plan, which Raft sends whenever it changes: the tenant's default daily limit follows it.
   if (seg[0] === "servers" && seg.length === 3 && seg[2] === "plan" && method === "PUT") {
     if (!deps.plans) return null;
@@ -495,10 +552,11 @@ export async function handleProvision(
   }
   if (seg[0] !== "agents") return null;
   // On POST the body names the server; elsewhere the URL does.
-  const serverForTenant = method === "POST" && seg.length === 1
+  const fromBody = method === "POST" && seg.length === 1;
+  const serverForTenant = fromBody
     ? (typeof field(body, "raftServerId") === "string" ? field(body, "raftServerId") as string : null)
     : headers.raftServerId;
-  const tenant = tenantFor(who, serverForTenant);
+  const tenant = tenantFor(who, serverForTenant, fromBody ? "body" : "query");
   if (isFail(tenant)) return fail(tenant);
   const tenantId = tenant;
 
@@ -756,7 +814,8 @@ export const IMPORT_LIMITS = { maxTotalBytes: IMPORT_TOTAL_MAX_BYTES, maxFiles: 
  * instructions fit in what is left. Refused before the body is parsed (cf/src/index.ts `provision`).
  */
 export const IMPORT_REQUEST_MAX_BYTES = 16 * 1024 * 1024;
-export const IMPORT_ROUTE = /^\/provision\/agents\/(?:by-raft-agent\/)?[^/]+\/import$/;
+/** The routes whose body is an import's, bounded by `IMPORT_REQUEST_MAX_BYTES`: the import, and its check. */
+export const IMPORT_ROUTE = /^\/provision\/(?:agents\/(?:by-raft-agent\/)?[^/]+\/import|import-check)$/;
 const MIGRATION_ID = /^[A-Za-z0-9._:-]{1,128}$/;
 const SHA256_HEX = /^[0-9a-f]{64}$/;
 const BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
@@ -797,13 +856,30 @@ export function importPath(raw: unknown): { path: string } | { problem: string; 
   return { path };
 }
 
+/** One file an import refuses, as the answer lists it: where it is in `files`, the path as sent, and why. Never its bytes. */
+export interface ImportRejection { index: number; path: string | null; reason: string; param: string }
+/** How many refused files one answer lists; past it they are counted (`more`), so a bad workspace cannot make the answer as large as the request. */
+export const IMPORT_REJECTIONS_SHOWN = 200;
+/** A sent path as a rejection names it: the caller's own string, cut short; one shaped like a credential is refused and named `null`. */
+const PATH_ECHO_MAX = 256;
+
+/** A refused import: the first problem as the envelope's code and message, and every refused file with it. */
+export type ImportFail = Fail & { rejected?: ImportRejection[]; more?: number };
+
+/** What `importChecked` found in a body whose shape and bounds hold: the files that pass, and every one that does not. */
+interface ImportChecked {
+  migrationId: string; instructions: string | undefined; files: ImportFile[]; totalBytes: number;
+  rejected: Array<{ rejection: ImportRejection; fail: Fail }>;
+}
+
 /**
- * The body of `POST …/import`, checked whole before anything is written: shape, bounds, paths, each file's bytes
- * against its `sha256`, and `totalBytes` against their sum. Over a bound is 413, anything else 422 (400 for a field
- * this route does not know), each naming the field.
+ * The body of `POST …/import` and `POST /provision/import-check`, checked whole: shape, bounds, paths, each file's
+ * bytes against its `sha256`, and `totalBytes` against their sum. A problem with the body itself (a field, a bound
+ * on the whole) ends the check, as a `Fail`. A problem with one file refuses that file and the check goes on to the
+ * next, so one answer names every file that would be refused: a caller dropping them one round trip at a time
+ * would need as many round trips as files. Each file gets its first problem only.
  */
-export function importRequest(body: unknown, instructionsMax: Limit):
-  { migrationId: string; instructions: string | undefined; files: ImportFile[]; totalBytes: number } | Fail {
+function importChecked(body: unknown, instructionsMax: Limit): ImportChecked | ImportFail {
   if (typeof body !== "object" || body === null || Array.isArray(body)) return { status: 422, code: "invalid", message: "the body is a JSON object" };
   const unknownField = Object.keys(body).find((k) => !IMPORT_FIELDS.has(k));
   if (unknownField) return { status: 400, code: "unknown_field", param: unknownField, message: `unknown field ${unknownField}` };
@@ -827,49 +903,102 @@ export function importRequest(body: unknown, instructionsMax: Limit):
     return { status: 413, code: "too_many_files", param: "files", message: `an import is at most ${IMPORT_FILES_MAX} files; this one has ${list.length}` };
   }
   const files: ImportFile[] = [];
+  const rejected: ImportChecked["rejected"] = [];
   const seen = new Set<string>();
   let sum = 0;
   for (let i = 0; i < list.length; i++) {
     const at = `files[${i}]`, f = list[i] as unknown;
-    if (typeof f !== "object" || f === null || Array.isArray(f)) return { status: 422, code: "invalid", param: at, message: `${at} is an object { path, contentBase64, sha256 }` };
+    const sent = typeof f === "object" && f !== null ? field(f, "path") : undefined;
+    // A path is a state key, named in the prompt, in listings and in every answer about the import: one shaped like a
+    // credential would put the credential in all of them, so it is refused, and never repeated, here or in a message.
+    const credentialPath = typeof sent === "string" && secretShape(sent) !== null;
+    const echo = typeof sent === "string" && !credentialPath ? sent.slice(0, PATH_ECHO_MAX) : null;
+    const refuse = (x: Fail) => { rejected.push({ rejection: { index: i, path: echo, reason: x.code, param: x.param ?? at }, fail: x }); };
+    if (typeof f !== "object" || f === null || Array.isArray(f)) { refuse({ status: 422, code: "invalid", param: at, message: `${at} is an object { path, contentBase64, sha256 }` }); continue; }
     const extra = Object.keys(f).find((k) => !IMPORT_FILE_FIELDS.has(k));
-    if (extra) return { status: 400, code: "unknown_field", param: `${at}.${extra}`, message: `unknown field ${at}.${extra}${extra === "content" ? "; a file is sent as contentBase64" : ""}` };
-    const p = importPath(field(f, "path"));
-    if ("problem" in p) return { status: 422, code: p.reserved ? "reserved" : "invalid", param: `${at}.path`, message: `${at}.path: ${p.problem}` };
-    if (seen.has(p.path)) return { status: 422, code: "duplicate_path", param: `${at}.path`, message: `${at}.path is ${p.path}, which an earlier file already is` };
+    if (extra) { refuse({ status: 400, code: "unknown_field", param: `${at}.${extra}`, message: `unknown field ${at}.${extra}${extra === "content" ? "; a file is sent as contentBase64" : ""}` }); continue; }
+    if (credentialPath) {
+      refuse({ status: 422, code: "credential_in_path", param: `${at}.path`, message: `${at}.path carries what looks like a ${secretShape(sent as string)}; credentials are never imported, not even as a name` }); continue;
+    }
+    const p = importPath(sent);
+    if ("problem" in p) { refuse({ status: 422, code: p.reserved ? "reserved" : "invalid", param: `${at}.path`, message: `${at}.path: ${p.problem}` }); continue; }
+    if (seen.has(p.path)) { refuse({ status: 422, code: "duplicate_path", param: `${at}.path`, message: `${at}.path is ${p.path}, which an earlier file already is` }); continue; }
     seen.add(p.path);
     const sha = field(f, "sha256");
     if (typeof sha !== "string" || !SHA256_HEX.test(sha.toLowerCase())) {
-      return { status: 422, code: "invalid", param: `${at}.sha256`, message: `${at}.sha256 is the hex SHA-256 of the file's bytes` };
+      refuse({ status: 422, code: "invalid", param: `${at}.sha256`, message: `${at}.sha256 is the hex SHA-256 of the file's bytes` }); continue;
     }
     const b64 = field(f, "contentBase64");
     if (typeof b64 !== "string" || !BASE64.test(b64)) {
-      return { status: 422, code: "invalid", param: `${at}.contentBase64`, message: `${at}.contentBase64 is the file's bytes in standard, padded base64` };
+      refuse({ status: 422, code: "invalid", param: `${at}.contentBase64`, message: `${at}.contentBase64 is the file's bytes in standard, padded base64` }); continue;
     }
     // The decoded size, known from the length: a file over the bound is refused without decoding it.
     const size = (b64.length / 4) * 3 - (b64.endsWith("==") ? 2 : b64.endsWith("=") ? 1 : 0);
     if (size > IMPORT_FILE_MAX_BYTES) {
-      return { status: 413, code: "file_too_large", param: `${at}.contentBase64`, message: `a file is at most ${IMPORT_FILE_MAX_BYTES} bytes; ${at} is ${size}` };
+      refuse({ status: 413, code: "file_too_large", param: `${at}.contentBase64`, message: `a file is at most ${IMPORT_FILE_MAX_BYTES} bytes; ${at} is ${size}` }); continue;
     }
+    // Only a file decoded counts: what this bounds is the decoding one request costs, and a file refused above is
+    // not decoded. Past it the check ends, a bound on the whole, carrying the files refused before it.
     sum += size;
     if (sum > IMPORT_TOTAL_MAX_BYTES) {
-      return { status: 413, code: "too_large", param: "files", message: `an import is at most ${IMPORT_TOTAL_MAX_BYTES} bytes together; the files through ${at} are ${sum}` };
+      return { status: 413, code: "too_large", param: "files", message: `an import is at most ${IMPORT_TOTAL_MAX_BYTES} bytes together; the files through ${at} are ${sum}`,
+        ...(rejected.length ? rejectionList(rejected) : {}) };
     }
     const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
     const hash = sha256Sync(bytes);
-    if (hash !== sha.toLowerCase()) return { status: 422, code: "sha256_mismatch", param: `${at}.sha256`, message: `${at}.sha256 is not the SHA-256 of its decoded bytes` };
+    if (hash !== sha.toLowerCase()) { refuse({ status: 422, code: "sha256_mismatch", param: `${at}.sha256`, message: `${at}.sha256 is not the SHA-256 of its decoded bytes` }); continue; }
     // A state value is text: a file that is not UTF-8, or carries a NUL, could not read back as the bytes it was. The
     // size was bounded above, by this route's own bound (not `seedText`'s, which is a seeded file's).
     const text = utf8Text(bytes);
-    if (text === null) return { status: 422, code: "not_text", param: `${at}.contentBase64`, message: `${at} is not UTF-8 text with no NUL byte; an imported file is a text document` };
+    if (text === null) { refuse({ status: 422, code: "not_text", param: `${at}.contentBase64`, message: `${at} is not UTF-8 text with no NUL byte; an imported file is a text document` }); continue; }
     const shape = secretShape(text);
-    if (shape) return { status: 422, code: "credential_in_text", param: `${at}.contentBase64`, message: `${at} carries what looks like a ${shape}; credentials are never imported` };
+    if (shape) { refuse({ status: 422, code: "credential_in_text", param: `${at}.contentBase64`, message: `${at} carries what looks like a ${shape}; credentials are never imported` }); continue; }
     files.push({ path: p.path, text, bytes: bytes.byteLength, sha256: hash });
   }
-  if (sum !== totalBytes) {
+  // Only once every file passed: with one refused, the sum the caller should send is the one without it.
+  if (!rejected.length && sum !== totalBytes) {
     return { status: 422, code: "total_mismatch", param: "totalBytes", message: `totalBytes is ${totalBytes}, and the files decode to ${sum}` };
   }
-  return { migrationId, instructions, files, totalBytes: sum };
+  return { migrationId, instructions, files, totalBytes: files.reduce((n, f) => n + f.bytes, 0), rejected };
+}
+
+/** The listed part of a refusal: the first `IMPORT_REJECTIONS_SHOWN`, and how many past them. */
+function rejectionList(rejected: ImportChecked["rejected"]): { rejected: ImportRejection[]; more: number } {
+  return { rejected: rejected.slice(0, IMPORT_REJECTIONS_SHOWN).map((r) => r.rejection), more: Math.max(0, rejected.length - IMPORT_REJECTIONS_SHOWN) };
+}
+
+/**
+ * The body of `POST …/import`, as the import takes it: every file passing, or refused. A refusal with files in it
+ * keeps the status, code, `param` and message of the first refused file, as when the check stopped there, and adds
+ * `rejected` (every refused file, up to `IMPORT_REJECTIONS_SHOWN`) and `more`. Over a bound is 413, anything else
+ * 422 (400 for a field this route does not know), each naming the field.
+ */
+export function importRequest(body: unknown, instructionsMax: Limit):
+  { migrationId: string; instructions: string | undefined; files: ImportFile[]; totalBytes: number } | ImportFail {
+  const c = importChecked(body, instructionsMax);
+  if (isFail(c)) return c;
+  if (c.rejected.length) {
+    const first = c.rejected[0]!.fail;
+    const also = c.rejected.length > 1 ? `; ${c.rejected.length} files are refused in all, each named in rejected` : "";
+    return { ...first, message: first.message + also, ...rejectionList(c.rejected) };
+  }
+  return { migrationId: c.migrationId, instructions: c.instructions, files: c.files, totalBytes: c.totalBytes };
+}
+
+/**
+ * `POST /provision/import-check` (docs/agent-surface.md "Checking an import first"): the import's own check, for Raft
+ * to show which files would not come over before anyone confirms a migration. Validation only: it names no agent,
+ * so it reads and writes no agent's object, takes no import's place and changes no import already made. A problem
+ * with the body itself answers as the import would; a refused file is listed, in a 200.
+ */
+function importCheck(body: unknown, tenantId: string, credentialId: string | null, deps: ProvisionDeps): Response {
+  const c = importChecked(body, instructionsLimit(deps.seed));
+  if (isFail(c)) {
+    logEvent("provision.import_check", { tenant: tenantId, credentialId, outcome: "refused", code: c.code, ...(c.param ? { param: c.param } : {}) });
+    return fail(c);
+  }
+  logEvent("provision.import_check", { tenant: tenantId, credentialId, outcome: c.rejected.length ? "rejected" : "ok", files: c.files.length, bytes: c.totalBytes, rejected: c.rejected.length });
+  return ok({ ok: !c.rejected.length, ...rejectionList(c.rejected), totals: { files: c.files.length, bytes: c.totalBytes }, limits: IMPORT_LIMITS });
 }
 
 /**
@@ -886,7 +1015,7 @@ async function workspaceImport(
     logEvent("provision.import", { tenant: tenantId, agent: row.agentId, raftAgentId: row.raftAgentId, credentialId, outcome, ...extra });
   const req = importRequest(body, instructionsLimit(deps.seed));
   if (isFail(req)) {
-    audit("refused", { code: req.code, ...(req.param ? { param: req.param } : {}) });
+    audit("refused", { code: req.code, ...(req.param ? { param: req.param } : {}), ...(req.rejected ? { rejected: req.rejected.length + (req.more ?? 0) } : {}) });
     return fail(req);
   }
   const { migrationId, instructions, files } = req;
@@ -955,16 +1084,21 @@ async function connection(
     if (typeof b.raftUserId !== "string" || !RAFT_ID.test(b.raftUserId)) {
       return fail({ status: 422, code: "invalid", message: "raftUserId is required: the user of Raft's current session", param: "raftUserId" });
     }
-    const r = await c.confirm(tenantId, row.agentId, p, b.pending, b.raftUserId);
+    // The id first: the agent's mount records which connector renews it (cf/src/github-refresh.ts).
+    const connectorId = c.newId();
+    const r = await c.confirm(tenantId, row.agentId, p, b.pending, b.raftUserId, connectorId);
     if (!r.ok) {
       return r.missing
         ? fail({ status: 404, code: "not_found", message: "no pending connection with that id for this agent and user; it may have expired or been used" })
         : fail({ status: 422, code: "connect_failed", message: r.error });
     }
+    // The connector to mend came from the hold, sealed in from the signed link, never from this body.
+    if (r.reconnect) return reconnectInPlace(tenantId, row, p, b.raftUserId, r.reconnect, { ...r, accountId: r.accountId ?? null, refresh: r.refresh ?? null }, deps);
     // A finished authorization is a new connector of the tenant, created by whoever confirmed it.
+    // A plain connect again mends only this agent: a new connector, and this agent's row written afresh, which clears
+    // its broken state. A reconnect in place (above) mends the connector for every agent on it.
     const connectedAt = deps.now();
-    const connectorId = c.newId();
-    await c.connectors.create({ id: connectorId, tenantId, provider: p, account: r.account, creatorRaftUserId: b.raftUserId, sealed: r.sealed, createdAt: connectedAt });
+    await c.connectors.create({ id: connectorId, tenantId, provider: p, account: r.account, accountId: r.accountId ?? null, creatorRaftUserId: b.raftUserId, sealed: r.sealed, refresh: r.refresh ?? null, createdAt: connectedAt });
     await c.registry.put({ tenantId, raftAgentId: row.raftAgentId, provider: p, account: r.account, connectedBy: b.raftUserId, connectedAt, connectorId });
     await c.connectors.record({ tenantId, connectorId, raftAgentId: row.raftAgentId, action: "create", actingRaftUserId: b.raftUserId, actingRole: "creator", at: connectedAt });
     return ok({ connected: true, connectorId, account: r.account, connectedAt: new Date(connectedAt).toISOString(), connectedBy: b.raftUserId });
@@ -972,7 +1106,7 @@ async function connection(
 
   if (method === "POST") {
     const b = (body && typeof body === "object" && !Array.isArray(body) ? body : {}) as Record<string, unknown>;
-    const allowed = new Set(["returnUrl", "initiatedBy", "access"]);
+    const allowed = new Set(["returnUrl", "initiatedBy", "access", "connectorId", "actingRole"]);
     const unknown = Object.keys(b).find((k) => !allowed.has(k));
     if (unknown) return fail({ status: 400, code: "unknown_field", message: `unknown field ${unknown}`, param: unknown });
     if (typeof b.returnUrl !== "string") return fail({ status: 422, code: "invalid", message: "returnUrl is required", param: "returnUrl" });
@@ -985,20 +1119,44 @@ async function connection(
     if (b.access !== undefined && b.access !== "public" && b.access !== "private") {
       return fail({ status: 422, code: "invalid", message: "access is public or private", param: "access" });
     }
+    // A reconnect in place names its connector here, where it is signed into the link: checked now, so a link is
+    // never issued for a connector the initiator may not mend, and again at confirm, which may come ten minutes later.
+    let reconnect: ReconnectTarget | undefined;
+    if (b.connectorId !== undefined) {
+      if (typeof b.connectorId !== "string" || !b.connectorId) return fail({ status: 422, code: "invalid", message: "connectorId is the connector to reconnect in place", param: "connectorId" });
+      if (b.actingRole !== "creator" && b.actingRole !== "admin") {
+        return fail({ status: 422, code: "invalid", message: "actingRole is creator or admin: the capacity Raft checked the initiator reconnects this connector in", param: "actingRole" });
+      }
+      const k = await c.connectors.get(tenantId, b.connectorId);
+      if (!k || k.provider !== p) return fail({ status: 404, code: "not_found", message: `no ${p} connector ${b.connectorId} in this tenant` });
+      const refused = creatorRefused(k, { actingRaftUserId: by, actingRole: b.actingRole });
+      if (refused) return fail(refused);
+      reconnect = { connectorId: k.id, actingRole: b.actingRole };
+    } else if (b.actingRole !== undefined) {
+      return fail({ status: 422, code: "invalid", message: "actingRole goes with connectorId, for a reconnect in place", param: "actingRole" });
+    }
     const scopes = scopesFor(b.access === "private" ? "private" : "public");
-    const link = await c.link({ tenantId, agentId: row.agentId, raftAgentId: row.raftAgentId, provider: p, returnUrl: b.returnUrl, raftUserId: by, scopes });
-    return ok({ ...link, scopes });
+    const link = await c.link({ tenantId, agentId: row.agentId, raftAgentId: row.raftAgentId, provider: p, returnUrl: b.returnUrl, raftUserId: by, scopes, ...(reconnect ? { reconnect } : {}) });
+    return ok({ ...link, scopes, ...(reconnect ? { reconnect: reconnect.connectorId } : {}) });
   }
   if (method === "GET") {
     const got = await c.registry.get(tenantId, row.raftAgentId, p);
     const current = got?.connectorId ?? null;
-    const connectors = (await c.connectors.list(tenantId, p)).map((k) => ({
+    const all = await c.connectors.list(tenantId, p);
+    const connectors = all.map((k) => ({
       id: k.id, account: k.account, creatorRaftUserId: k.creatorRaftUserId, createdAt: new Date(k.createdAt).toISOString(), current: k.id === current,
+      ...oauthState(k.brokenAt ?? null, k.lastCheckedAt ?? k.brokenAt ?? k.createdAt),
     }));
+    // A connection GitHub refused to renew is not connected, though its row stays: which account it was, and that
+    // only connecting again mends it, in the words Raft's own OAuth connectors use (`oauthStatus`).
+    const k = current === null ? undefined : all.find((x) => x.id === current);
+    // A row with no connector has no checks of its own recorded: its connect, or the refusal that broke it.
+    const brokenAt = (k ? k.brokenAt : got?.brokenAt) ?? null;
+    const checkedAt = k ? (k.lastCheckedAt ?? k.brokenAt ?? k.createdAt) : (got?.brokenAt ?? got?.connectedAt ?? null);
     return ok({
       ...(got
-        ? { connected: true, connectorId: current, account: got.account, connectedAt: new Date(got.connectedAt).toISOString(), connectedBy: got.connectedBy }
-        : { connected: false, connectorId: null, account: null, connectedAt: null, connectedBy: null }),
+        ? { connected: brokenAt === null, connectorId: current, account: got.account, connectedAt: new Date(got.connectedAt).toISOString(), connectedBy: got.connectedBy, ...oauthState(brokenAt, checkedAt) }
+        : { connected: false, connectorId: null, account: null, connectedAt: null, connectedBy: null, oauthStatus: "disconnected" as OAuthStatus, lastCheckError: null, lastCheckedAt: null }),
       connectors,
     });
   }
@@ -1011,9 +1169,13 @@ async function connection(
     if (!k || k.provider !== p) return fail({ status: 404, code: "not_found", message: `no ${p} connector ${connectorId} in this tenant` });
     const refused = creatorRefused(k, acting);
     if (refused) return fail(refused);
-    const r = await c.attach(tenantId, row.agentId, p, k.sealed);
+    // Its token can no longer be renewed: pointing an agent at it would hand over a connection that cannot work.
+    if (k.brokenAt) return fail({ status: 422, code: "connect_failed", message: `${RECONNECT_REASON}: this connector has to be connected again before an agent is pointed at it` });
+    const r = await c.attach(tenantId, row.agentId, p, k.sealed, k.refresh ? { ...k.refresh, connectorId: k.id } : null);
     if (!r.ok) return fail({ status: 422, code: "connect_failed", message: r.error });
     const at = deps.now();
+    // The attach checked the credential with GitHub and it was taken.
+    await c.connectors.checked?.(tenantId, k.id, at);
     await c.registry.put({ tenantId, raftAgentId: row.raftAgentId, provider: p, account: k.account, connectedBy: acting.actingRaftUserId, connectedAt: at, connectorId: k.id });
     await c.connectors.record({ tenantId, connectorId: k.id, raftAgentId: row.raftAgentId, action: "bind", ...acting, at });
     return ok({ connected: true, connectorId: k.id, account: k.account, connectedAt: new Date(at).toISOString(), connectedBy: acting.actingRaftUserId });
@@ -1030,6 +1192,89 @@ async function connection(
     return new Response(null, { status: 204 });
   }
   return null;
+}
+
+/**
+ * `POST …/confirm` for a link made with `connectorId`: the connector is mended in place rather than replaced. The
+ * authorization must be the connector's own GitHub account — by GitHub's numeric user id, which a rename does not
+ * change; by login for a connector made before the id was kept (0024) — or nothing changes (`409 account_mismatch`),
+ * so the agents on it can never start acting as someone else. Who may: the connector's creator, or an admin by Raft's
+ * word, as for `DELETE /connectors/:id`.
+ *
+ * Then, in order: the new pair over the connector's in one D1 write, which also clears its broken state and any
+ * renewal's lease (`ConnectorStore.reconnect`); the pair onto every agent pointed at it, and onto this one, which is
+ * pointed at it if it was not. An agent the pair does not reach here is named in `failed`: its mount still says
+ * broken, and its next GitHub call asks the connector, finds it healthy and takes the pair (github-refresh.ts).
+ */
+async function reconnectInPlace(
+  tenantId: string, row: ProvisionedAgent, p: ConnectionProvider, raftUserId: string, target: ReconnectTarget,
+  r: { account: string | null; accountId: string | null; sealed: { ciphertext: string; iv: string }; refresh: ConnectorRefresh | null },
+  deps: ProvisionDeps,
+): Promise<Response> {
+  const c = deps.connections!;
+  const acting: Acting = { actingRaftUserId: raftUserId, actingRole: target.actingRole };
+  const k = await c.connectors.get(tenantId, target.connectorId);
+  if (!k || k.provider !== p) return fail({ status: 404, code: "not_found", message: `no ${p} connector ${target.connectorId} in this tenant; it may have been disconnected since the link was made` });
+  const refused = creatorRefused(k, acting);
+  if (refused) return fail(refused);
+  if (!r.accountId) return fail({ status: 422, code: "connect_failed", message: "GitHub did not say which account was authorized, so the connector was not changed" });
+  const same = k.accountId ? k.accountId === r.accountId : !!k.account && !!r.account && k.account.toLowerCase() === r.account.toLowerCase();
+  const mismatch = () => fail({ status: 409, code: "account_mismatch",
+    message: `this connector is GitHub account ${k.account ?? "(unknown)"}, and the authorization was for ${r.account ?? "another account"}; nothing was changed. Sign in to GitHub as ${k.account ?? "the connector's account"} and reconnect, or connect without connectorId to make a new connector` });
+  if (!same) return mismatch();
+  const at = deps.now();
+  if (!(await c.connectors.reconnect(tenantId, k.id, { sealed: r.sealed, refresh: r.refresh, account: r.account, accountId: r.accountId, at }))) {
+    // Gone, or given another account's id, between the read and the write.
+    const now = await c.connectors.get(tenantId, k.id);
+    return now ? mismatch() : fail({ status: 404, code: "not_found", message: `no ${p} connector ${k.id} in this tenant; it was disconnected meanwhile` });
+  }
+  await c.connectors.record({ tenantId, connectorId: k.id, raftAgentId: row.raftAgentId, action: "reconnect", ...acting, at });
+  const updated: string[] = [];
+  const failed: Array<{ raftAgentId: string; error: string }> = [];
+  const bound = await c.registry.boundTo(tenantId, k.id);
+  for (const raftAgentId of bound) {
+    try {
+      const a = raftAgentId === row.raftAgentId ? row : await deps.registry.get(tenantId, raftAgentId);
+      if (!a) continue;
+      const got = await c.reconnect(tenantId, a.agentId, p, k.id, k.sealed, r.sealed, r.refresh);
+      if (!got.ok) { failed.push({ raftAgentId, error: got.error }); continue; }
+      if (got.updated) updated.push(raftAgentId);
+    } catch (e) {
+      failed.push({ raftAgentId, error: String((e as { message?: unknown })?.message ?? e).slice(0, 200) });
+    }
+  }
+  // This agent ends on the connector: pointed at it if it was not, and given the pair if its mount held something else
+  // (a key put there since) — the person reconnected from this agent's page. The same attach a PUT makes.
+  let connected = updated.includes(row.raftAgentId);
+  if (!connected && !failed.some((f) => f.raftAgentId === row.raftAgentId)) {
+    const got = await c.attach(tenantId, row.agentId, p, r.sealed, r.refresh ? { ...r.refresh, connectorId: k.id } : null)
+      .catch((e: unknown) => ({ ok: false as const, error: String((e as { message?: unknown })?.message ?? e).slice(0, 200) }));
+    if (got.ok) { connected = true; updated.push(row.raftAgentId); }
+    else failed.push({ raftAgentId: row.raftAgentId, error: got.error });
+  }
+  if (connected) {
+    // Written afresh, which clears a broken state kept on this agent's own row.
+    await c.registry.put({ tenantId, raftAgentId: row.raftAgentId, provider: p, account: r.account, connectedBy: raftUserId, connectedAt: at, connectorId: k.id });
+    if (!bound.includes(row.raftAgentId)) await c.connectors.record({ tenantId, connectorId: k.id, raftAgentId: row.raftAgentId, action: "bind", ...acting, at });
+  }
+  logEvent("connect.reconnect", { tenantId, connectorId: k.id, raftAgentId: row.raftAgentId, actingRole: acting.actingRole, updated: updated.length, failed: failed.length });
+  return ok({
+    connected, reconnected: true, connectorId: k.id, account: r.account, connectedAt: new Date(at).toISOString(), connectedBy: raftUserId,
+    updated: updated.sort(), failed,
+  });
+}
+
+/**
+ * A connection's state in the words Raft's managed-MCP OAuth connectors use (0023): `error` once GitHub refused to
+ * renew it, with the reason Raft shows; `lastCheckedAt` the last check whatever came of it.
+ */
+function oauthState(brokenAt: number | null, checkedAt: number | null):
+  { oauthStatus: OAuthStatus; lastCheckError: string | null; lastCheckedAt: string | null } {
+  return {
+    oauthStatus: brokenAt === null ? "connected" : "error",
+    lastCheckError: brokenAt === null ? null : RECONNECT_REASON,
+    lastCheckedAt: checkedAt === null ? null : new Date(checkedAt).toISOString(),
+  };
 }
 
 type Acting = { actingRaftUserId: string; actingRole: "creator" | "admin" };
@@ -1083,7 +1328,7 @@ async function disconnect(tenantId: string, connectorId: string, body: unknown, 
   for (const raftAgentId of await c.registry.boundTo(tenantId, k.id)) {
     try {
       const row = await deps.registry.get(tenantId, raftAgentId);
-      if (row) await c.detachIfFrom(tenantId, row.agentId, provider, k.sealed);
+      if (row) await c.detachIfFrom(tenantId, row.agentId, provider, k.sealed, k.id);
       await c.registry.remove(tenantId, raftAgentId, provider);
       detached.push(raftAgentId);
     } catch (e) {

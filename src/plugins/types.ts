@@ -131,6 +131,14 @@ export interface ListedTools {
    * are words for a person.
    */
   refused?: true;
+  /**
+   * Run once the kernel has kept this list as the mount's — written, or found the same as the stored one — and never
+   * when it was set aside (a failure, a re-take that keeps the previous list, a list replaced by someone else's while
+   * this one was taken). For what the plugin keeps beside the list that must describe the list the mount offers: raft
+   * keeps each managed MCP tool's catalogue entry this way, so a call is sent with the versions of the schema it was
+   * offered under, not those of a listing the kernel discarded (#937). A throw is reported and changes nothing kept.
+   */
+  onKept?(): Promise<void>;
 }
 
 /**
@@ -416,6 +424,14 @@ export interface PluginContext {
    * does not supply it must not be read as saying no credential is named.
    */
   credentialRefKind?: CredentialRefKind;
+  /**
+   * The far end refused `credential` (GitHub's 401). Present only where the deployment can renew this mount's
+   * credential (an expiring OAuth token): it renews once and answers the token to retry with, once. A refusal of the
+   * retry is reported like any other: an endpoint may refuse this kind of credential whatever its state. `reconnect`
+   * is the sentence to report when the renewal itself was refused, which only the person can mend. Null: nothing to
+   * renew with, nobody answered, or it was renewed moments ago; the refusal is reported as it would be without this.
+   */
+  credentialRejected?(credential: string): Promise<{ credential: string } | { reconnect: string } | null>;
   publicConfig: Record<string, Json>;
   /**
    * This mount's database, as declared in {@link Plugin.database}. Survives
@@ -1517,7 +1533,8 @@ export type AgentStatus = "online" | "thinking" | "working" | "error" | "offline
  * (src/runtime/activity.ts). Only the fields listed exist: the service refuses
  * an unknown field with 400, so a plugin passes these through and adds none.
  */
-export type ActivityEventName = "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "PostToolUseFailure" | "Stop" | "BridgeFatal" | "SessionEnd";
+export type ActivityEventName = "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "PostToolUseFailure" | "Stop" | "BridgeFatal" | "SessionEnd"
+  | "SubagentStart" | "SubagentStop";
 export interface ActivityEvent {
   /** Unique per agent for all time; the service dedupes on it. */
   eventId: string;
@@ -1557,6 +1574,19 @@ export interface ActivityEvent {
   status?: AgentStatus;
   /** A short phrase shown with the status (at most 200 characters): what the agent is working on. */
   detail?: string;
+  /**
+   * Which subagent an event belongs to (Raft's `SubagentLineage`: slock's @botiverse/raft-shared 0.1.0, packages/shared/src/index.ts): the parent's
+   * `send_to_agent` call it came from, the child, and where in its life it is. Ids and bounded enums only — activity is
+   * seen by more people than the conversation, so never the task, a prompt or what anyone said. Sent only where the
+   * deployment turns it on (SUBAGENT_ACTIVITY, src/runtime/activity.ts).
+   */
+  subagent?: {
+    parentToolUseId?: string; taskId: string; phase: "started" | "active" | "ended";
+    /** On `phase: "ended"` only: how the child's turn ended. `ceiling` is a turn cancelled at its time limit. */
+    outcome?: "done" | "failed" | "stopped" | "ceiling";
+    /** On `phase: "ended"` only: the length of the child's report in characters, never the report. */
+    reportChars?: number;
+  };
 }
 
 /**
@@ -1968,6 +1998,18 @@ export interface Plugin {
    * on the far end (an MCP server) leaves it out: nothing in the build changes that list.
    */
   toolsBasis?: string;
+  /**
+   * Whether this mount's list should be re-taken at the start of this turn although its basis still matches: part of
+   * the list comes from the far end and has aged past what the plugin will serve (raft's managed MCP catalogue, whose
+   * connectors a person adds and removes in Raft), or a call has just been told the list is stale. Asked beside the
+   * basis check, by the same pass, with the same timeout and back-off (cf/src/runtime.ts `snapshotStale`,
+   * `AgentRuntime.retakeStaleSnapshots`), and only of a mount that has a snapshot.
+   *
+   * Synchronous and local, like `mountTools`: it reads the record and what the plugin remembers in memory, never a
+   * server. `now` is the caller's clock, so the pass and the tool export agree on one answer. Absent: only the basis
+   * decides, as before.
+   */
+  toolsDue?(mount: MountRecord, now: number): boolean;
   /** This mount holds something real; see {@link Holding}. Declaring it is what
    *  makes the mount exclusive — ask {@link isExclusive}, never the two separately. */
   holds?: Holding;
@@ -1985,6 +2027,15 @@ export interface Plugin {
    */
   provides?: readonly ("container")[];
 
+  /**
+   * `self`: this plugin's writes act on nothing but the caller's own scratch — no message, no change anyone else sees,
+   * no credential used, nothing the agent's own memory or workspace keeps. Only such a plugin's writes are offered to a
+   * subagent (src/runtime/subagents.ts), which is read-only otherwise: a subagent is offered a tool only when its
+   * `sideEffects` is `read` or its plugin declares this, and its call to anything else, a program's included, is refused
+   * at dispatch. Absent — every plugin today — is "its writes may act as the agent": withheld from subagents. A new
+   * plugin is safe by default; declare this only for a plugin whose every write is the caller's own business.
+   */
+  actsAs?: "self";
   /** What a mount of this plugin may be configured with. */
   config?: ConfigField[];
   /**

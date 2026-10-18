@@ -190,6 +190,20 @@ chooses, the plugin must bound that host with a setting. `http` declares no
 credential today, but its `allowedHosts` setting is already marked
 `requiredWithCredential` for the day it does.
 
+**A credential the far end stops taking.** Where the deployment can renew a
+mount's credential (today an expiring GitHub user token from Connect GitHub,
+cf/src/github-refresh.ts), the context carries `ctx.credentialRejected`. A
+plugin that gets the service's "this credential is no longer valid" (GitHub's
+`401`) calls it once with the credential it sent, and on `{ credential }`
+makes the call once more with that one. A refusal of the retry is reported
+like any other: an endpoint may refuse a kind of credential whatever its state,
+so a `401` is never taken as the authorization being gone. `{ reconnect }` is
+the sentence to put in the error when the renewal itself was refused, which
+only the person can mend. `null` means there is nothing to renew with, nobody
+answered, or the credential was renewed moments ago, and the failure is
+reported as it would be without the hook. Renewing before a token expires
+needs nothing from the plugin: it happens where the credential is read.
+
 **Say which identity a call was made with.** `ctx.credential` being null has
 several causes, and different people fix them: the mount names no credential,
 so its owner attaches an account; it names `agent:<name>` and that row is gone,
@@ -366,6 +380,16 @@ each one offers rather than by looking for the id `sandbox`, so a second
 plugin that can run a container is chosen without the kernel learning its
 name.
 
+**Declare `sideEffects` honestly, and `actsAs: "self"` only for scratch.** A
+subagent (docs/agent-surface.md, "Subagents") is read-only: it is offered a tool
+only when the tool declares `sideEffects: "read"`, or the plugin declares
+`actsAs: "self"`, and its call to anything else, a program's included, is refused
+at dispatch. A tool with no `sideEffects` counts as a write. `actsAs: "self"` says
+every write of the plugin acts on nothing but the caller's own scratch: no
+message, no change anyone else sees, no credential used, nothing the agent's
+memory or workspace keeps. No built-in plugin declares it; leave it out unless
+that is true of every write, and the plugin is withheld from subagents by default.
+
 **Declare `sandboxForm` when the service has a command-line tool.** It says
 what a mount of the plugin becomes inside the agent's container: the environment
 variables the tool reads, the headers it sends the credential in, and the hosts
@@ -485,6 +509,16 @@ newer list stands. A plugin whose list
 depends only on its server (`mcp.ts`) declares no basis: nothing in the build
 changes that list.
 
+**Declare `toolsDue` when part of a list comes from a far end that moves on its
+own.** `toolsDue(mount, now)` is synchronous and local, like `mountTools`: it
+reads the record and whatever the plugin remembers in memory, never a server.
+When it answers true for a mount that has a snapshot, the same turn-start pass
+lists the mount again, with the same timeout, back-off and keep-a-credentialed-list
+rules as a basis that moved (`snapshotStale`, `cf/src/runtime.ts`; issue #937).
+Raft's managed MCP is the user: its catalogue changes when a person adds,
+removes or reconnects a connector in Raft, and a call can be told it is stale.
+A throw is read as not due.
+
 **Read `context.offered` before naming one of your own tools.** It is the
 names of the tools this mount offers right now, as `toolsOf(plugin, mount)`
 answers — the list the model was given and the gateway admits calls against —
@@ -550,6 +584,12 @@ description, a title, a preview) is passed on as written, except that the names
 in a message's header line (sender, channel, thread, task assignee, attachment
 filename) have line breaks and other control characters replaced with a space
 (`namesOnOneLine`), so a name cannot start a line that reads as another message.
+A generated tool's outcome reaches the model as the SDK's own `state` and
+`text`, with no state rewritten: a `messages_search` that Raft stopped at its scan budget is
+`incomplete` (nothing found in what it searched) or `results` with a page
+marked incomplete, and its text says older messages were not searched and gives
+the continuing `messages_search({ …, cursor })` call; the tool offers `cursor`
+as the manifest does.
 `attachments_download_url` fetches the file Raft points at into the agent's
 object storage (at most `ATTACHMENT_MAX_BYTES`) and returns its `artifact://`
 reference, never the URL; it is offered when the plugin is built with object
@@ -557,12 +597,23 @@ storage (`createRaftPlugin({ artifacts })`, as the runtime builds it) and not
 at all without, falling back to `attachments.download` when the Server cannot mint a URL.
 `attachments_view` keeps an attachment the same way and, when its first bytes
 are a PNG, JPEG, WebP or still GIF of at most `VIEW_MAX_BYTES` (1.5 MiB) and
-`VIEW_MAX_SIDE` (2000 px a side), returns the same fields plus a `view` (the
+`VIEW_MAX_SIDE` (2048 px a side), returns the same fields plus a `view` (the
 reference, the type read from the bytes, width, height and size) that the gateway
 can hand the model as an image; anything else, an animated GIF, WebP or PNG, or an
 image over a limit is refused with what it is and the reference to the copy
 kept, since nothing resizes. It is listed by a snapshot exactly where the
-download is and offered only beside it. A tool's description and every parameter description in its
+download is and offered only beside it.
+`attachments_upload` goes the other way: it reads a file from the agent's own
+object storage (an `artifact://` reference, such as `sandbox` `save` returns;
+a raw `r2://` reference or one outside the caller's scope is refused before
+anything is read) and uploads it to Raft for one conversation through the SDK's
+typed `attachments.upload`, with the mount's credential. At most
+`UPLOAD_MAX_BYTES` (25 MiB) is read; the Server's own limit and the choice
+between a multipart upload and an upload session are the SDK's. It posts
+nothing: it returns the `attachmentId` to pass to `messages_send` in
+`attachmentIds`. It is offered only with object storage and to a credential
+holding `send`, and it is declared a write, so approval policy for writes
+applies and a subagent is never handed it. A tool's description and every parameter description in its
 schema name operations by their tool names, never by the manifest's dotted
 names, SDK field paths or CLI flags (`inMountTerms`). Its
 `snapshotTools` asks Raft what the mount's credential may do
@@ -605,6 +656,18 @@ booked as seen in the asking context when it is the model's own call, and in
 the answering context when the model answers one raised elsewhere (a run_js
 program), so the answer is not held again.
 
+Since Raft SDK 0.20.0 a task claim, status change or amend attests what the
+context has seen, as a send does, and Raft may hold it for newer messages; the
+SDK does not load the saved state for those, so the plugin loads it before any
+call that may be held. A send the model makes itself (origin `"model"`, never a
+run_js program's) to a channel or DM right after its context read one of that
+conversation's threads is stopped before sending (`interrupt.reason:
+"thread_target"`, nothing sent, nothing to book as seen). `send` posts it
+top-level as written, under the same key, with the interrupt's `resume.with`
+(`targetConfirmed: true`); `drop` sends nothing; sending to the thread instead is
+a new call. The check compares reads, so each history read's target and order
+are carried into the mount's saved state (never as seen).
+
 Conversation cards (the SDK's `conversationCards`, 0.18.0) are the mount's
 `conversationCards` setting, a boolean that is off unless set to `true`; every
 client the plugin makes for that mount is then created with the option, and no
@@ -625,14 +688,103 @@ them.
 
 The plugin writes three trace rows of its own (`context.trace`): `raft.held`
 for each held call (`status` its reason; `attrs` the tool, reason, target,
-`newMessageCount`, the kinds of card it showed, `contextBytes`, the origin), and
+`newMessageCount`, the kinds of card it showed, `contextBytes`, the origin, and
+for `thread_target` the `threadTarget`), and
 `raft.held_answer` for each answer (`status` `send`, `proceed`, `drop` or
-`expired`; `ms` from when the call was first held; `attrs.outcome` what came of
-it), both under the call's operation; and `raft.state_save_failed` when the
-SDK's saved state did not load or save (`status` the phase; `attrs` the error
-and, for a save, `stateBytes`, the size of the record it tried to write), which
-it also says on the console. A failed save never fails the call: it costs at
-most a batch delivered again or one more hold.
+`expired`; `ms` from when the call was first held; `attrs.reason` the hold's
+reason; `attrs.outcome` what came of it), both under the call's operation; and `raft.state_failed` when the
+SDK's saved state did not load or save (the SDK's `onStateError`; `status` and
+`attrs.phase` the phase, `load` or `save`; `attrs` the error and, for a save,
+`stateBytes`, the size of the record it tried to write), which it also says on
+the console. Before Raft SDK 0.19.0 this row was `raft.state_save_failed`. A
+failed load or save never fails the call: it costs at most a batch delivered
+again or one more hold. A fourth, `raft.mcp_call`, is one managed MCP call's end
+(below).
+
+**Raft's managed MCP** (`src/plugins/raft-mcp.ts`, SDK 0.21.1's `raft.mcp`) puts
+the connectors the agent's Raft Server has connected (Notion and the like) on the
+raft mount, as tools of their own. Raft holds the connectors' credentials and
+attaches them to each call; the mount sends only its own Raft credential, to its
+own origin. It is part of the raft mount rather than a mount of its own because
+everything it needs is that mount's: the identity and credential, the origin, the
+capability list the listing already reads, and the re-take on a credential
+change.
+
+- *Listing.* When the credential holds the `mcp` capability, `snapshotTools`
+  also asks for the catalogue (`raft.mcp.tools()`, `GET
+  /internal/agent-api/mcp/tools`) and lists one tool per entry after Raft's own:
+  `mcp_` and the entry's `runtimeName` with every character outside
+  `[A-Za-z0-9_]` made `_` (`_2`, `_3`, … for a name already given), so the model
+  is offered `<alias>__mcp_…`; the entry's description and `inputSchema` as they
+  came; `sideEffects: "write"`, `idempotency: "none"`, whatever the remote
+  annotations say. The kernel's admission bounds apply, so a tool whose
+  description is over `MAX_DESCRIPTION_BYTES` is left out with the reason, not
+  shortened. `mountTools` offers the snapshot's `mcp_` entries whole. What a call
+  needs beyond the schema (the server's id, the config and assignment versions
+  Raft checks) is kept in the mount's database (`context` store, key `mcp`),
+  written only once the kernel keeps the listing as the mount's list
+  (`ListedTools.onKept`, which the gateway runs after it writes the snapshot or
+  finds it unchanged, and never for a listing it sets aside), so a call goes out
+  with the versions of the list it was offered from. The catalogue's clock is
+  marked at the same moment, so a listing set aside does not put off the next.
+  A catalogue Raft cannot answer does not fail the listing: the tools kept from the
+  last one stay, and a `skipped` entry says why.
+- *Freshness.* Besides the runtime's own reasons to list, the plugin's
+  `toolsDue` makes a turn's start list again when this isolate last listed the
+  catalogue `MCP_CATALOG_TTL_MS` (5 minutes) ago or more — an isolate that has
+  not listed it reads the snapshot's `takenAt` — and at once after a call was
+  answered `stale`. A turn keeps the tools it started with; the next one is
+  built from the new list.
+- *Reconnect.* Each connector the catalogue names in `reconnectRequired` is one
+  line of the mount's prompt paragraph, in the SDK's words
+  (`formatMcpReconnectRequired`), so the agent tells the person instead of
+  saying it has no such connector. Beside them, each catalogue tool the
+  kernel's admission leaves out of the mount's list (a description over
+  `MAX_DESCRIPTION_BYTES`, a schema over `MAX_SCHEMA_BYTES`, a list already
+  full) is one line, `"<server>": "<tool>" is not available here (<rule>).`, by
+  server and remote tool name only, never the description; at most
+  `MCP_UNAVAILABLE_LINES` (20) and one line counting the rest. The listing
+  works them out by running the kernel's own admission (`admitTools`) on the
+  list it returns. Every connector-supplied name in these lines (a server's, a
+  remote tool's) is the SDK's prompt form (`formatMcpPromptName`, which
+  `formatMcpReconnectRequired` uses too): control and format characters made a
+  space, one line, cut at 80 characters, quoted as a JSON string, so a name
+  cannot start a line of its own in the system prompt. On pi085 a change reaches a conversation under way as a
+  notice (src/runtime/prompt-context.ts).
+- *Calls and results.* A call sends the catalogue entry and the model's
+  arguments once (`raft.mcp.call`), with a 60 s bound (`MCP_CALL_TIMEOUT_MS`)
+  rather than the mount's `timeoutMs`: Raft's gateway aborts the remote
+  server's connect and call together after about 20 s and then answers, and a
+  call cut short near that would read as `outcome_unknown` while Raft completes
+  or answers it. The SDK sets no timeout of its own. Nothing above the plugin
+  bounds the wait (the gateway sets no deadline; run_js's dynamic worker
+  counts CPU time). A `result` is the tool result (`content`,
+  and `structuredContent` when there is one). A `tool_error` is a failed call
+  whose message is the remote tool's text, capped by the SDK at 4,000 characters
+  with `…[truncated]`. A failure's message is the SDK's `error.nextAction`
+  exactly (`mcpFailureKind`): `stale` also marks the catalogue due;
+  `reconnect_required` and `unavailable` are failed calls; `outcome_unknown` (the
+  connection to Raft failed mid-call, a gateway answered 5xx with no Raft code,
+  or Raft's own `managed_mcp_internal_error`) is recorded as an operation whose outcome
+  is `unknown`.
+- *No retries.* The SDK makes one attempt (`managedMcpCall` is a single-attempt
+  route) and the plugin calls once. The gateway starts an operation once and
+  answers a second start under the same key `already_attempted` without reaching
+  the plugin, which is what a run_js program re-run after a restart meets, since
+  its calls are keyed `${toolCallId}:${n}`. A model's own call is not re-run by
+  either engine after a crash (`replayPolicy` "never"; pi-durable `unsafe`):
+  it gets an error result instead. Tool calls do not go through a queue, so
+  nothing redelivers one.
+- *Trace.* The gateway's `tool.call` row, as for every call (`attrs.tool`
+  `raft.mcp_…`, the mount, the task, the call id; never arguments or a result),
+  and `raft.mcp_call` on the same span: `status` `result`, `tool_error`, the
+  failure kind or `error`; `attrs.server` the connector's server name and
+  `attrs.tool` the remote tool's name. Nothing else is recorded.
+- *Subagents* are not offered the tools: they are writes, and raft does not
+  declare `actsAs: "self"` (`childMayCall`). An agent without a raft mount, or
+  whose credential lacks `mcp`, has none.
+
+How to check one agent: [runbook.md](runbook.md#raft-managed-mcp-on-an-agent).
 
 Four of `raft`'s hand-written tools are Raft Agent Login for Connected Apps
 (`src/plugins/raft-agent-login.ts`, the steps of Raft's CLI `integration list`,
@@ -744,6 +896,13 @@ on both engines and present only when they say something:
   when the call is not made in a session's turn (an approved call's replay,
   provisioning, a bench shell, a background job's poll): treat that as
   "nothing is known to be seen".
+
+`taskId` is the conversation the call was made in: `main` for the agent's
+own, an Agents API session's id, or `sub_…` for a subagent's
+(docs/agent-surface.md, "Subagents"). A subagent shares the agent's mounts, so
+its calls reach a plugin as the agent's do, with its own `contextId`: a plugin
+that keys what the model has seen by conversation keeps a subagent's apart from
+its parent's.
 
 **Use `context.operationId` as the idempotency key you hand a service.** It is
 the gateway's id for the operation the context serves, set by the gateway

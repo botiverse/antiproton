@@ -12,6 +12,7 @@
  *   model.call error              → error      (with why, for a daily spend limit's refusal)
  *   session.needs_reset set       → error      (with why: pushes are refused until a reset)
  *   agent.ready                   → online     (a provisioned agent ready before its first turn, src/runtime/ready.ts)
+ *   a subagent's row              → nothing    (`subagentRow`: a child's work is not the agent's turn)
  *
  * A row is one ENDED span, so a start is dated back by its measured `ms`. Events
  * are sorted by time and a change to the status already in force is dropped:
@@ -24,6 +25,7 @@
  */
 import type { TraceOutboxRow } from "../trace/outbox.ts";
 import type { ActivityEvent, AgentStatus } from "../plugins/types.ts";
+import { isSubagentSession } from "./subagent-session.ts";
 
 /**
  * The task the raft plugin's push tools run under when the provider, not the model, calls them
@@ -39,6 +41,17 @@ export function operatorCall(row: TraceOutboxRow): boolean {
   return row.kind === "tool.call" && row.attrs.task === PROVISION_TASK;
 }
 
+/**
+ * Whether a row is a subagent's work (src/runtime/subagents.ts): a `model.call` or `js.run` naming a subagent's session,
+ * or a `tool.call` whose task is one. Not the agent's turn, so it is neither activity nor status: a child's final answer
+ * is a `model.call` `stop`, which would show the agent idle while its own turn waits on the child, and a child's tool
+ * would show as the agent's. A child's work is in the trace only. The agent goes working again when a child's report
+ * wakes its own conversation and that conversation calls the model.
+ */
+export function subagentRow(row: Pick<TraceOutboxRow, "attrs">): boolean {
+  return isSubagentSession(row.attrs.session) || isSubagentSession(row.attrs.task);
+}
+
 /** The errorClass of a turn that was ended from outside: the row's own, else its kind. Raft cuts it at 120. */
 export function turnEndClass(row: TraceOutboxRow): string {
   const c = typeof row.attrs.errorClass === "string" && row.attrs.errorClass ? row.attrs.errorClass : row.kind;
@@ -49,6 +62,7 @@ export function turnEndClass(row: TraceOutboxRow): string {
 export function statusEvents(agentId: string, rows: readonly TraceOutboxRow[], before: AgentStatus | null = null): Array<ActivityEvent & { status: AgentStatus }> {
   const raw: Array<{ at: number; key: string; status: AgentStatus; detail?: string }> = [];
   for (const row of rows) {
+    if (subagentRow(row)) continue;
     const id = `${agentId}:${row.seq}:status`;
     const ms = typeof row.ms === "number" ? row.ms : 0;
     switch (row.kind) {

@@ -17,6 +17,7 @@ import { d1ProviderTokens, d1ProvisionedAgents } from "../cf/src/control-plane.t
 import { hashProviderToken, newProviderToken } from "../cf/src/provider-token.ts";
 import { sha256Hex } from "../src/store/seed-files.ts";
 import { IMPORT_HOLD_MAX_MS } from "../src/store/workspace-import.ts";
+import { IMPORTED_MEMORY_BUDGET, importedFilesParts } from "../src/plugins/state.ts";
 import { ApStore } from "../src/store/ap-store.ts";
 import { prefixedNamespace } from "../src/store/sql-namespace.ts";
 import { d1ServiceTokens } from "../cf/src/control-plane.ts";
@@ -404,6 +405,236 @@ await check("contents: a wrong sha256, a wrong totalBytes, bytes that are not UT
   const notJson = await imp(w, "{not json");
   must(notJson.status === 400 && notJson.body.error.code === "invalid_json", `not JSON: ${notJson.text}`);
   await nothingWritten(w, "contents");
+});
+
+// ---- every refused file at once, and the check before an import -------------------------------
+
+const CRED_TEXT = "key: sk-ant-api03-" + "Q".repeat(90);
+/** A body with five refused files among two that pass, each refused for another reason. */
+const MIXED: F[] = [
+  { path: "ok.md", bytes: "fine" },
+  { path: "../escape.md", bytes: "x" },
+  { path: "notes/keys.env", bytes: CRED_TEXT },
+  { path: "bin/blob", bytes: new Uint8Array([0xff, 0xfe, 0x00, 0x41]) },
+  { path: "./ok.md", bytes: "again" },
+  { path: "memory", bytes: "mine" },
+  { path: "notes/also-ok.md", bytes: "fine too" },
+];
+const MIXED_REJECTED = [
+  { index: 1, path: "../escape.md", reason: "invalid", param: "files[1].path" },
+  { index: 2, path: "notes/keys.env", reason: "credential_in_text", param: "files[2].contentBase64" },
+  { index: 3, path: "bin/blob", reason: "not_text", param: "files[3].contentBase64" },
+  { index: 4, path: "./ok.md", reason: "duplicate_path", param: "files[4].path" },
+  { index: 5, path: "memory", reason: "reserved", param: "files[5].path" },
+];
+const echoes = (text: string) => text.includes("sk-ant-") || text.includes(Buffer.from(CRED_TEXT).toString("base64")) || text.includes("Q".repeat(20));
+
+await check("every refused file in one answer: the first one's status, code and param as before, then each with its reason; no content echoed; nothing written; the body without them imports", async () => {
+  const w = await world();
+  const r = await imp(w, body(uuid(), MIXED));
+  must(r.status === 422 && r.body.error.code === "invalid" && r.body.error.param === "files[1].path", `top level: ${r.status} ${r.text.slice(0, 300)}`);
+  must(/5 files are refused in all/.test(r.body.error.message), `message: ${r.body.error.message}`);
+  must(show(r.body.error.rejected) === show(MIXED_REJECTED) && r.body.error.more === 0, `rejected: ${show(r.body.error.rejected)} more ${r.body.error.more}`);
+  must(!echoes(r.text), `a content was echoed: ${r.text}`);
+  await nothingWritten(w, "mixed");
+  // One refused file still lists itself, so a caller reads one shape whatever the count.
+  const one = await imp(w, body(uuid(), [{ path: "a.txt", bytes: "a" }, { path: "with space.md", bytes: "b" }]));
+  must(one.status === 422 && show(one.body.error.rejected) === show([{ index: 1, path: "with space.md", reason: "invalid", param: "files[1].path" }]), `one: ${one.text}`);
+  // A refused path shaped like a credential is not echoed either.
+  const shaped = await imp(w, body(uuid(), [{ path: "/sk-ant-api03-" + "Z".repeat(90), bytes: "a" }]));
+  must(shaped.status === 422 && shaped.body.error.rejected[0].path === null && shaped.body.error.rejected[0].reason === "credential_in_path" && !shaped.text.includes("ZZZZZZZZ"), `credential-shaped path: ${shaped.text.slice(0, 300)}`);
+  // The status is the first refused file's: a file over its bound first is 413, as it was.
+  const big = await imp(w, body(uuid(), [{ path: "big.txt", bytes: "x".repeat(2 * MIB + 1) }, { path: "/abs", bytes: "y" }]));
+  must(big.status === 413 && big.body.error.code === "file_too_large" && show(big.body.error.rejected.map((x: any) => x.reason)) === show(["file_too_large", "invalid"]), `413 first: ${big.status} ${big.text.slice(0, 300)}`);
+  await nothingWritten(w, "refusals");
+  const good = MIXED.filter((_, i) => !MIXED_REJECTED.some((x) => x.index === i));
+  const landed = await imp(w, body(uuid(), good));
+  must(landed.status === 201 && landed.body.fileCount === 2, `the rest: ${landed.status} ${landed.text}`);
+});
+
+await check("the list is capped: 250 refused files list 200 and count 50 more; a bound on the whole still ends the check, carrying the files refused before it", async () => {
+  const w = await world();
+  const bad = Array.from({ length: 250 }, (_, i) => ({ path: `bad name ${i}.md`, bytes: `${i}` }));
+  const r = await imp(w, body(uuid(), [{ path: "ok.md", bytes: "fine" }, ...bad]));
+  must(r.status === 422 && r.body.error.param === "files[1].path", `top: ${r.status} ${r.text.slice(0, 200)}`);
+  must(r.body.error.rejected.length === 200 && r.body.error.more === 50 && r.body.error.rejected[199].index === 200, `cap: ${r.body.error.rejected.length} more ${r.body.error.more}`);
+  must(/250 files are refused in all/.test(r.body.error.message), r.body.error.message);
+  const over = [{ path: "/abs", bytes: "z" }, ...Array.from({ length: 5 }, (_, i) => ({ path: `b${i}.txt`, bytes: "x".repeat(2 * MIB) })), { path: "b5.txt", bytes: "y" }];
+  const r2 = await imp(w, { ...body(uuid(), over), totalBytes: 10 * MIB });
+  must(r2.status === 413 && r2.body.error.code === "too_large" && r2.body.error.param === "files"
+    && show(r2.body.error.rejected) === show([{ index: 0, path: "/abs", reason: "invalid", param: "files[0].path" }]), `whole: ${r2.status} ${r2.text.slice(0, 400)}`);
+  await nothingWritten(w, "capped");
+});
+
+const check_ = (w: World, b: unknown, opts: { auth?: string | null; query?: string } = {}) =>
+  call(w, "POST", `import-check${opts.query ?? ""}`, { body: typeof b === "string" ? b : JSON.stringify(b), auth: opts.auth });
+
+await check("POST /provision/import-check: the import's own check, listed in a 200 with totals and limits; nothing written and no import's place taken", async () => {
+  const w = await world();
+  const id = uuid();
+  const r = await check_(w, body(id, MIXED));
+  const passing = enc("fine").byteLength + enc("fine too").byteLength;
+  must(r.status === 200 && r.body.ok === false && show(r.body.rejected) === show(MIXED_REJECTED) && r.body.more === 0, `mixed: ${r.status} ${r.text.slice(0, 400)}`);
+  must(show(r.body.totals) === show({ files: 2, bytes: passing }), `totals: ${show(r.body.totals)}`);
+  must(show(r.body.limits) === show({ maxTotalBytes: 10 * MIB, maxFiles: 2000, maxFileBytes: 2 * MIB }), `limits: ${show(r.body.limits)}`);
+  must(!echoes(r.text), `a content was echoed: ${r.text}`);
+  const clean = await check_(w, body(id, [{ path: "a.md", bytes: "one" }, { path: "MEMORY.md", bytes: "notes" }]));
+  must(clean.status === 200 && clean.body.ok === true && show(clean.body.rejected) === "[]" && clean.body.more === 0
+    && show(clean.body.totals) === show({ files: 2, bytes: 8 }), `clean: ${clean.status} ${clean.text}`);
+  // A problem with the body itself answers as the import would.
+  for (const [b, status, code, param] of [
+    [{ ...body(id, []), importId: "x" }, 400, "unknown_field", "importId"],
+    [{ files: [], totalBytes: 0 }, 422, "invalid", "migrationId"],
+    [{ ...body(id, [{ path: "a.txt", bytes: "x" }]), totalBytes: 2 }, 422, "total_mismatch", "totalBytes"],
+    [body(id, Array.from({ length: 2001 }, (_, i) => ({ path: `f/${i}`, bytes: "" }))), 413, "too_many_files", "files"],
+  ] as const) {
+    const x = await check_(w, b);
+    must(x.status === status && x.body.error.code === code && x.body.error.param === param, `${code}: ${x.status} ${x.text.slice(0, 200)}`);
+  }
+  const notJson = await check_(w, "{not json");
+  must(notJson.status === 400 && notJson.body.error.code === "invalid_json", `not JSON: ${notJson.text}`);
+  const huge = await check_(w, "{\"migrationId\":\"" + "x".repeat(16 * MIB) + "\"}");
+  must(huge.status === 413 && huge.body.error.param === "body", `16 MiB request: ${huge.status} ${huge.text.slice(0, 200)}`);
+  await nothingWritten(w, "checks");
+  // The checked migrationId is still a first import.
+  const landed = await imp(w, body(id, [{ path: "a.md", bytes: "one" }, { path: "MEMORY.md", bytes: "notes" }]));
+  must(landed.status === 201, `import after checks: ${landed.status} ${landed.text}`);
+});
+
+await check("POST /provision/import-check after an import: still a check (200), never 409, and the import stays as it was", async () => {
+  const w = await world();
+  const id = uuid();
+  const files: F[] = [{ path: "a.md", bytes: "one" }];
+  const first = await imp(w, body(id, files));
+  must(first.status === 201, `import: ${first.text}`);
+  const keys = show(await stateKeys(w));
+  const record = show(w.raw.sql.exec("SELECT * FROM workspace_import").toArray());
+  for (const b of [body(id, [{ path: "b.md", bytes: "two" }]), body(uuid(), MIXED), body(id, files)]) {
+    const r = await check_(w, b);
+    must(r.status === 200 && typeof r.body.ok === "boolean", `check: ${r.status} ${r.text.slice(0, 200)}`);
+  }
+  must(show(await stateKeys(w)) === keys && show(w.raw.sql.exec("SELECT * FROM workspace_import").toArray()) === record, "a check changed the import");
+  const replay = await imp(w, body(id, files));
+  must(replay.status === 200 && replay.text === first.text, `replay: ${replay.status} ${replay.text}`);
+  must((await imp(w, body(id, [{ path: "b.md", bytes: "two" }]))).status === 409, "a different import after the checks was not 409");
+});
+
+await check("POST /provision/import-check is behind the provider token and scoped to its tenant: none or an unknown one is 401; a platform token names its server", async () => {
+  const w = await world();
+  const b = body(uuid(), [{ path: "a.md", bytes: "one" }]);
+  for (const auth of [null, "", "pt-" + "0".repeat(40), AUTOMATION]) {
+    const r = await check_(w, b, { auth });
+    must(r.status === 401, `token ${show(auth)}: ${r.status} ${r.text.slice(0, 200)}`);
+  }
+  must((await check_(w, b, { auth: w.other })).status === 200, "another tenant's token checks without naming an agent");
+  const platform = newProviderToken();
+  await d1ProviderTokens(w.DB).issue({ hash: await hashProviderToken(platform), label: "raft-platform", raftOrigin: "https://raft.example", scope: "platform" });
+  const bare = await check_(w, b, { auth: platform });
+  must(bare.status === 422 && bare.body.error.code === "missing" && bare.body.error.param === "raftServerId", `platform, no server: ${bare.status} ${bare.text}`);
+  const named = await check_(w, b, { auth: platform, query: "?raftServerId=srv-1" });
+  must(named.status === 200 && named.body.ok === true, `platform with a server: ${named.status} ${named.text}`);
+  // Only POST.
+  must((await call(w, "GET", "import-check")).status === 404, "GET import-check is served");
+  const audit = lines.map((l) => JSON.parse(l)).filter((l) => l.evt === "provision.import_check");
+  must(audit.length >= 3 && audit.every((l) => !show(l).includes(platform) && !show(l).includes(w.token)), `audit: ${show(audit.slice(0, 3))}`);
+});
+
+// ---- what the agent is shown of an imported MEMORY.md ------------------------------------------
+
+await check(`an imported MEMORY.md is shown whole up to ${IMPORTED_MEMORY_BUDGET} characters; past it, cut there with the line saying where the rest is; the same bytes on every open`, async () => {
+  for (const [n, cut] of [[10_000, false], [IMPORTED_MEMORY_BUDGET, false], [20_000, true]] as const) {
+    const w = await world();
+    // The character at each position says where it is, so a cut one off shows.
+    const text = Array.from({ length: n }, (_, i) => (i < IMPORTED_MEMORY_BUDGET ? "m" : "T")).join("").slice(0, n - 4) + "END!";
+    must((await imp(w, body(uuid(), [{ path: "MEMORY.md", bytes: text }, { path: "notes/a.md", bytes: "a" }]))).status === 201, `${n}: import`);
+    const a = await importedFilesParts(w.rt.store, T, A, new Set());
+    const b = await importedFilesParts(w.rt.store, T, A, new Set());
+    must(a.text === b.text && show(a.parts) === show(b.parts), `${n}: two opens differ`);
+    if (!cut) {
+      must(a.text.includes("\n" + text + "\n```") && !a.text.includes("… cut at"), `${n}: not shown whole: ${a.text.slice(-200)}`);
+    } else {
+      const kept = text.slice(0, IMPORTED_MEMORY_BUDGET);
+      must(a.text.includes("\n" + kept + "\n```\n… cut at " + IMPORTED_MEMORY_BUDGET + " of " + n + " characters; get `MEMORY.md` with "), `${n}: not cut at ${IMPORTED_MEMORY_BUDGET}: ${a.text.slice(-300)}`);
+      must(/ for the rest\.$/m.test(a.text) && !a.text.includes("mT") && !a.text.includes("TTT") && !a.text.includes("END!"), `${n}: shows past the cut`);
+    }
+  }
+  must(IMPORTED_MEMORY_BUDGET === 16_000, `the budget is ${IMPORTED_MEMORY_BUDGET}`);
+});
+
+await check("a path shaped like a credential is refused (credential_in_path) on the import and the check, named null, and never repeated in any answer", async () => {
+  const w = await world();
+  const SECRET_PATH = "notes/sk-ant-api03-" + "P".repeat(90) + ".md";
+  // A path the key rule takes, so only the credential rule refuses it.
+  must(/^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/.test(SECRET_PATH), "the path is not a valid key");
+  const b = body(uuid(), [{ path: "ok.md", bytes: "fine" }, { path: SECRET_PATH, bytes: "x" }, { path: "./" + SECRET_PATH, bytes: "y" }]);
+  const want = [
+    { index: 1, path: null, reason: "credential_in_path", param: "files[1].path" },
+    { index: 2, path: null, reason: "credential_in_path", param: "files[2].path" },
+  ];
+  const r = await imp(w, b);
+  must(r.status === 422 && r.body.error.code === "credential_in_path" && r.body.error.param === "files[1].path" && show(r.body.error.rejected) === show(want), `import: ${r.status} ${r.text.slice(0, 400)}`);
+  const c = await check_(w, b);
+  must(c.status === 200 && c.body.ok === false && show(c.body.rejected) === show(want) && show(c.body.totals) === show({ files: 1, bytes: 4 }), `check: ${c.status} ${c.text.slice(0, 400)}`);
+  for (const [what, text] of [["import", r.text], ["check", c.text], ["log", lines.join("\n")]]) {
+    must(!text.includes("PPPPPPPP") && !text.includes("sk-ant-"), `${what} repeats the path: ${text.slice(0, 300)}`);
+  }
+  await nothingWritten(w, "credential path");
+  const ok = await imp(w, body(uuid(), [{ path: "ok.md", bytes: "fine" }]));
+  must(ok.status === 201 && !ok.text.includes("sk-ant-"), `the rest: ${ok.status} ${ok.text}`);
+});
+
+await check("an imported MEMORY.md kept in object storage is shown from the excerpt written at import: CJK whole or cut at 16,000, the same bytes, no bucket read; one replaced since is not", async () => {
+  const CJK = "记住用户偏好简短回答。";
+  const cjk = (n: number) => CJK.repeat(Math.ceil(n / CJK.length)).slice(0, n - 4) + "END!";
+  for (const [n, cut] of [[12_000, false], [20_000, true], [40_000, true]] as const) {
+    const w = await world();
+    const text = cjk(n);
+    must(enc(text).byteLength > 32 * 1024, `${n}: under 32 KiB of UTF-8`);
+    must((await imp(w, body(uuid(), [{ path: "MEMORY.md", bytes: text }, { path: "notes/a.md", bytes: "a" }]))).status === 201, `${n}: import`);
+    const row = await w.rt.store.getState(T, A, "MEMORY.md");
+    // The row's bound is 32 KiB of JSON characters: past it the copy is in the bucket and the row holds only its name.
+    const spilled = JSON.stringify(text).length > 32 * 1024;
+    must(spilled === (row?.value == null && !!row?.ref), `${n}: spilled ${spilled}, row ${show({ value: typeof row?.value, ref: row?.ref })}`);
+    const reads: string[] = [];
+    const { get, head } = w.R2;
+    w.R2.get = async (k: string) => { reads.push(k); return get(k); };
+    w.R2.head = async (k: string) => { reads.push(k); return head(k); };
+    const a = await importedFilesParts(w.rt.store, T, A, new Set());
+    const b = await importedFilesParts(w.rt.store, T, A, new Set());
+    w.R2.get = get; w.R2.head = head;
+    must(reads.length === 0, `${n}: the prompt read the bucket: ${show(reads)}`);
+    must(a.text === b.text && show(a.parts) === show(b.parts), `${n}: two builds differ`);
+    if (!cut) {
+      must(a.text.includes("\n" + text + "\n```") && !a.text.includes("… cut at"), `${n}: not shown whole: ${a.text.slice(-200)}`);
+    } else {
+      must(a.text.includes("\n" + text.slice(0, IMPORTED_MEMORY_BUDGET) + "\n```\n… cut at " + IMPORTED_MEMORY_BUDGET + " of " + n + " characters; get `MEMORY.md` with "),
+        `${n}: not cut at ${IMPORTED_MEMORY_BUDGET}: ${a.text.slice(-300)}`);
+      must(!a.text.includes("END!") && / for the rest\.$/m.test(a.text), `${n}: past the cut`);
+    }
+    if (spilled) {
+      // The same characters the row would have shown inline: the paragraph does not depend on where the copy is.
+      const inline = await world();
+      must((await imp(inline, body(uuid(), [{ path: "MEMORY.md", bytes: text.slice(0, 16_100) }, { path: "notes/a.md", bytes: "a" }]))).status === 201, "inline import");
+      const shown = (t: string) => t.slice(t.indexOf("Its current content"), t.indexOf(`… cut at ${IMPORTED_MEMORY_BUDGET} of `));
+      const fromRow = shown((await importedFilesParts(inline.rt.store, T, A, new Set())).text);
+      must(fromRow.length > IMPORTED_MEMORY_BUDGET && shown(a.text) === fromRow, `${n}: the excerpt shows other characters than the row would`);
+      // A copy the agent replaced since with another too large for its row names another object: no excerpt is its.
+      w.raw.sql.exec("UPDATE agent_state SET ref = ? WHERE key = 'MEMORY.md'", "artifact:replaced");
+      const after = await importedFilesParts(w.rt.store, T, A, new Set());
+      must(after.text.includes("too large to show here and is kept in object storage") && !after.text.includes(CJK), `${n}: a replaced copy: ${after.text.slice(-300)}`);
+    }
+  }
+});
+
+await check("a surrogate pair across the 16,000th character is not split, inline or kept in object storage", async () => {
+  for (const pad of [100, 40_000]) {
+    const w = await world();
+    const text = "a".repeat(IMPORTED_MEMORY_BUDGET - 1) + "😀" + "b".repeat(pad);
+    must((await imp(w, body(uuid(), [{ path: "MEMORY.md", bytes: text }]))).status === 201, "import");
+    const a = await importedFilesParts(w.rt.store, T, A, new Set());
+    must(a.text.includes(`\n${"a".repeat(IMPORTED_MEMORY_BUDGET - 1)}\n\`\`\`\n… cut at ${IMPORTED_MEMORY_BUDGET - 1} of ${text.length} characters;`) && !a.text.includes("�"),
+      `pad ${pad}: ${a.text.slice(-250)}`);
+  }
 });
 
 await check("idempotent: the same migrationId and body again answers the same body (200), writes nothing more; a different one is 409 already_imported", async () => {

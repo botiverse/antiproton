@@ -76,6 +76,8 @@ function fake() {
       status: async () => ({ status: "idle" as const, pending: [] }),
       toolResults: async () => ({ unknown: [] }),
       cancel: async () => {},
+      stopSubagents: async () => {},
+      remove: async () => {},
       transcript: async () => ({ entries: [], running: false, pending: [] }),
     },
     models: {

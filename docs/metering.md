@@ -400,3 +400,7 @@ reader sums both tables, so a total — quantity or cost — does not change whe
 a day is folded. The hours are kept for 35 days rather than fewer because the
 views promise hourly buckets that far back: a folded day would sit in an
 hourly bucket at 00:00Z as if it had happened at midnight.
+
+The same trigger then writes the previous day's friction report (`frictionDaily`, `cf/src/friction-scan.ts`;
+docs/runbook.md, "Where agents get stuck"). That step cannot throw into the handler, so a retention failure is still
+what marks the invocation failed, and a friction failure never does.
