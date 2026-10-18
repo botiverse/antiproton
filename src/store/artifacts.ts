@@ -82,4 +82,11 @@ export class R2Artifacts {
     const res = await this.#request("GET", key);
     return new Uint8Array(await res.arrayBuffer());
   }
+
+  /** `get`, with the content type the object was stored with (`put`). */
+  async getObject(key: string): Promise<{ bytes: Uint8Array; contentType?: string }> {
+    const res = await this.#request("GET", key);
+    const contentType = res.headers.get("content-type") ?? undefined;
+    return { bytes: new Uint8Array(await res.arrayBuffer()), ...(contentType ? { contentType } : {}) };
+  }
 }

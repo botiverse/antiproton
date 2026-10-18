@@ -13,7 +13,9 @@
  * is the same for each: either the arguments apply, or the result says they did
  * not. A dropped argument must not look like one that had nothing to do.
  */
-import { artifactsPlugin } from "../src/plugins/artifacts.ts";
+import { createHash, randomBytes } from "node:crypto";
+import { artifactsPlugin, BASE64_PAGE } from "../src/plugins/artifacts.ts";
+import { BoundArtifacts } from "../cf/src/runtime.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void>) {
@@ -205,6 +207,157 @@ await check("a from on the second half of a character starts at the whole charac
   if (r.from !== 11) throw new Error(`the page must start at the pair, and say so: from ${r.from}`);
   const c = r.text.charCodeAt(0);
   if (c >= 0xdc00 && c <= 0xdfff) throw new Error(`page starts with half a character: ${c.toString(16)}`);
+});
+
+// ---- bytes that are not text -------------------------------------------------------------------------------------
+// Every stored object was decoded as UTF-8 and, when it did not parse as JSON, returned as text: a JPEG came back as
+// {"kind":"text","bytes":217302} of U+FFFD, and `bytes` counted UTF-16 characters, not bytes.
+
+const REF = `r2://${BUCKET}/t/t/a/op.bin`;
+/** The `read` tool over a store holding `body`, with the content type it was stored with when one is given. */
+function bytesReader(body: Uint8Array, contentType?: string) {
+  const artifacts = contentType === undefined
+    ? { async get() { return body; } }
+    : { async get() { return body; }, async getObject() { return { bytes: body, contentType }; } };
+  const plugin = artifactsPlugin(artifacts, BUCKET);
+  const ctx = { caller: { tenantId: "t", agentId: "a" }, alias: "artifacts" } as any;
+  return (args: Record<string, unknown> = {}) => plugin.invoke("read", { ref: REF, ...args } as any, ctx) as Promise<any>;
+}
+const cat = (...parts: Array<number[] | Uint8Array>) => Uint8Array.from(parts.flatMap((p) => [...p]));
+const ascii = (s: string) => [...s].map((c) => c.charCodeAt(0));
+const be32 = (n: number) => [(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255];
+const png = (w: number, h: number) => cat([0x89, ...ascii("PNG\r\n\x1a\n")], be32(13), ascii("IHDR"), be32(w), be32(h), [8, 6, 0, 0, 0], [0, 0, 0, 0],
+  be32(0), ascii("IEND"), [0xae, 0x42, 0x60, 0x82]);
+const jpeg = (w: number, h: number) => cat([0xff, 0xd8], [0xff, 0xe0], [0, 16], ascii("JFIF\0"), [1, 1, 0, 0, 1, 0, 1, 0, 0],
+  [0xff, 0xc0], [0, 17], [8], [h >> 8, h & 255], [w >> 8, w & 255], [3, 1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1], [0xff, 0xd9]);
+const sha = (b: Uint8Array) => createHash("sha256").update(b).digest("hex");
+const notText = (r: any) => {
+  if ("text" in r || "value" in r || "items" in r) throw new Error(`binary content came back as text: ${JSON.stringify(r).slice(0, 160)}`);
+};
+
+await check("a JPEG is an image with its size and dimensions, and a view so the model sees it", async () => {
+  const body = jpeg(1449, 2048);
+  const r = await bytesReader(body)();
+  notText(r);
+  if (r.kind !== "image" || r.mimeType !== "image/jpeg") throw new Error(`not read as a JPEG: ${JSON.stringify(r).slice(0, 160)}`);
+  if (r.width !== 1449 || r.height !== 2048 || r.bytes !== body.byteLength) throw new Error(`size or dimensions wrong: ${JSON.stringify(r)}`);
+  if (r.sha256 !== sha(body)) throw new Error(`sha256 wrong: ${r.sha256}`);
+  const v = r.view;
+  if (!v || v.ref !== "artifact://op.bin" || v.mimeType !== "image/jpeg" || v.bytes !== body.byteLength || v.width !== 1449 || v.height !== 2048) {
+    throw new Error(`no view, or not the stored image's: ${JSON.stringify(v)}`);
+  }
+});
+
+await check("a PNG is an image with a view; one over the harness's side limit is described and not shown", async () => {
+  const r = await bytesReader(png(640, 480))();
+  if (r.kind !== "image" || r.mimeType !== "image/png" || r.width !== 640 || r.height !== 480 || !r.view) {
+    throw new Error(`not a viewable PNG: ${JSON.stringify(r).slice(0, 160)}`);
+  }
+  const big = await bytesReader(png(9000, 10))();
+  notText(big);
+  if (big.kind !== "image" || big.view !== undefined) throw new Error(`an image over the limit was offered for viewing: ${JSON.stringify(big)}`);
+  if (!/cannot be shown: .*9000x10, over the 8192-pixel limit/.test(String(big.note))) throw new Error(`the note does not say why: ${big.note}`);
+});
+
+await check("random bytes are binary: size and sha256, no text", async () => {
+  const body = new Uint8Array(randomBytes(4096));
+  const r = await bytesReader(body)();
+  notText(r);
+  if (r.kind !== "binary" || r.bytes !== 4096 || r.sha256 !== sha(body)) throw new Error(`not described as binary: ${JSON.stringify(r).slice(0, 160)}`);
+  if (!/binary content is not returned as text/.test(String(r.note))) throw new Error(`no hint: ${r.note}`);
+});
+
+await check("bytes that are not valid UTF-8, with no NUL and no signature, are binary", async () => {
+  const body = cat(ascii("caf"), [0xe9], ascii(" au lait, "), [0xc3, 0x28], ascii(" and more text"));
+  if (body.includes(0)) throw new Error("fixture holds a NUL, so it would not test the decoder");
+  const r = await bytesReader(body)();
+  notText(r);
+  if (r.kind !== "binary" || r.bytes !== body.byteLength) throw new Error(`invalid UTF-8 was not binary: ${JSON.stringify(r).slice(0, 160)}`);
+});
+
+await check("valid UTF-8 with a NUL in it is binary", async () => {
+  const body = new TextEncoder().encode("header\0payload that is otherwise plain text");
+  const r = await bytesReader(body)();
+  notText(r);
+  if (r.kind !== "binary") throw new Error(`a NUL-holding file was text: ${JSON.stringify(r).slice(0, 160)}`);
+});
+
+await check("a known signature names the type: gzip", async () => {
+  const r = await bytesReader(cat([0x1f, 0x8b, 0x08, 0x00], ascii("rest")))();
+  if (r.kind !== "binary" || r.mimeType !== "application/gzip") throw new Error(`gzip not named: ${JSON.stringify(r)}`);
+});
+
+await check("multi-byte UTF-8 text: bytes is the stored byte length, not a count of characters", async () => {
+  const text = "héllo 世界 \u{1F600} plain text, not JSON";
+  const body = new TextEncoder().encode(text);
+  if (body.byteLength === text.length) throw new Error("fixture is single-byte, so it would not test the count");
+  const r = await bytesReader(body)();
+  if (r.kind !== "text" || r.text !== text) throw new Error(`text changed: ${JSON.stringify(r)}`);
+  if (r.bytes !== body.byteLength) throw new Error(`bytes is ${r.bytes}, the file is ${body.byteLength} bytes`);
+  const paged = await bytesReader(body)({ from: 0 });
+  if (paged.kind !== "text" || paged.bytes !== body.byteLength || paged.text !== text) throw new Error(`from page wrong: ${JSON.stringify(paged)}`);
+});
+
+await check("JSON with multi-byte characters still reads as a value", async () => {
+  const r = await bytesReader(new TextEncoder().encode(JSON.stringify({ name: "世界", n: 1 })))();
+  if (r.kind !== "value" || r.value.name !== "世界" || r.value.n !== 1) throw new Error(`JSON changed: ${JSON.stringify(r)}`);
+});
+
+await check("the content type it was stored with is the type of a file no signature names", async () => {
+  const body = cat([0x01, 0x02, 0x00, 0x03]);
+  const r = await bytesReader(body, "application/x-custom")();
+  if (r.kind !== "binary" || r.mimeType !== "application/x-custom" || r.contentType !== "application/x-custom") {
+    throw new Error(`stored type not used: ${JSON.stringify(r)}`);
+  }
+  // The bytes outrank a declared type.
+  const lied = await bytesReader(png(10, 10), "text/plain")();
+  if (lied.kind !== "image" || lied.mimeType !== "image/png") throw new Error(`a declared type overrode the bytes: ${JSON.stringify(lied)}`);
+});
+
+await check("the runtime's store keeps the content type it is given, and read reports it", async () => {
+  const objects = new Map<string, { bytes: Uint8Array; contentType?: string }>();
+  const bucket = {
+    async put(key: string, bytes: Uint8Array, opts?: { httpMetadata?: { contentType?: string } }) {
+      objects.set(key, { bytes, contentType: opts?.httpMetadata?.contentType });
+    },
+    async get(key: string) {
+      const o = objects.get(key);
+      return o ? { httpMetadata: { contentType: o.contentType }, async arrayBuffer() { return o.bytes.slice().buffer; } } : null;
+    },
+  } as any;
+  const store = new BoundArtifacts(bucket, BUCKET);
+  await store.put("t/t/a/op.bin", cat([0x00, 0x10, 0x20]), "application/x-sqlite3");
+  const plugin = artifactsPlugin(store, BUCKET);
+  const r = await plugin.invoke("read", { ref: REF } as any, { caller: { tenantId: "t", agentId: "a" }, alias: "artifacts" } as any) as any;
+  if (r.kind !== "binary" || r.mimeType !== "application/x-sqlite3") throw new Error(`the stored content type was lost: ${JSON.stringify(r)}`);
+});
+
+await check("encoding base64 pages the stored bytes, and the pages put back are the file", async () => {
+  const body = new Uint8Array(randomBytes(BASE64_PAGE * 2 + 100));
+  const read = bytesReader(body);
+  const parts: Buffer[] = [];
+  let from = 0;
+  for (let i = 0; i < 5; i++) {
+    const r = await read({ encoding: "base64", from });
+    if (r.kind !== "base64" || r.from !== from || r.bytes !== body.byteLength) throw new Error(`page wrong: ${JSON.stringify(r).slice(0, 160)}`);
+    if (r.to - r.from > BASE64_PAGE) throw new Error(`page over ${BASE64_PAGE} bytes: ${r.to - r.from}`);
+    parts.push(Buffer.from(r.data, "base64"));
+    if (r.to >= body.byteLength) {
+      if (!/end of artifact/.test(r.note)) throw new Error(`last page does not say so: ${r.note}`);
+      break;
+    }
+    if (!r.note.includes(`from: ${r.to}`)) throw new Error(`the note does not give the next call: ${r.note}`);
+    from = r.to;
+  }
+  if (!Buffer.concat(parts).equals(Buffer.from(body))) throw new Error("the pages do not reassemble the file");
+  await read({ encoding: "hex" }).then(() => { throw new Error("an unknown encoding was accepted"); }, (e) => {
+    if (!/encoding must be "base64"/.test(String(e?.message))) throw e;
+  });
+});
+
+await check("a from on binary content is named as not used, not silently dropped", async () => {
+  const r = await bytesReader(new Uint8Array(randomBytes(64)))({ from: 10 });
+  if (r.kind !== "binary" || !/from page text or a list, so they were not used/.test(String(r.note))) throw new Error(`from was dropped silently: ${JSON.stringify(r)}`);
 });
 
 for (const r of results) {

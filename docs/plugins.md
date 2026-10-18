@@ -573,7 +573,7 @@ storage (`createRaftPlugin({ artifacts })`, as the runtime builds it) and not
 at all without, falling back to `attachments.download` when the Server cannot mint a URL.
 `attachments_view` keeps an attachment the same way and, when its first bytes
 are a PNG, JPEG, WebP or still GIF of at most `VIEW_MAX_BYTES` (1.5 MiB) and
-`VIEW_MAX_SIDE` (2000 px a side), returns the same fields plus a `view` (the
+`VIEW_MAX_SIDE` (2048 px a side), returns the same fields plus a `view` (the
 reference, the type read from the bytes, width, height and size) that the gateway
 can hand the model as an image; anything else, an animated GIF, WebP or PNG, or an
 image over a limit is refused with what it is and the reference to the copy

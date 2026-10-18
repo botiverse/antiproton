@@ -121,6 +121,7 @@
     "test/model-request-snapshot.ts",
     "test/model-images.ts",
     "test/model-image-evidence.ts",
+    "test/artifacts-read.ts",
     "test/openai-responses.ts",
     "test/durable-agent.ts",
     "test/spec/durable-agent-spec.ts",
