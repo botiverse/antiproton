@@ -84,6 +84,7 @@ How to fill it in:
 - Counterevidence is messages that weigh against the pattern.
 - Whatever the Coverage block says was not read or not included is unknown, not free of problems. Never treat it as "no problem".
 - status is "complete" only when the Coverage block says the whole window was read. Otherwise it is "incomplete", with the reason the Coverage block gives.
+- If the material shows none of these patterns, return an empty patterns list; do not invent a pattern to have something to report.
 - If the material is not enough to judge, do not guess: answer with status "incomplete" and a reason that says what is missing, and include only the patterns the material supports.
 - evidenceLevel is "conversation_only" when the messages themselves show the pattern, "insufficient" when they only suggest it. Tool outcomes are not in the material, so no pattern is verified by them.
 - intent is "deliberately_paused" only when a message says the work was paused on purpose, and "unknown" when you cannot tell.
