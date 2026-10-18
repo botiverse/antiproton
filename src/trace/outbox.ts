@@ -82,7 +82,7 @@ const TABLE = "CREATE TABLE IF NOT EXISTS trace_outbox(" +
 export const TRACE_KINDS = ["model.call", "tool.call", "approval.wait", "container.lease", "inbound", "mount.seeded", "harness.open",
   "turn.stop", "js.run",
   "rebuild.decision", "rebuild.outcome", "rebuild.behaviour", "session.needs_reset", "turn.timing", "import.hold", "model.prewarm",
-  "agent.ready", "mount.settings", "subagent.start", "subagent.turn", "subagent.model_changed", "raft.held", "raft.held_answer", "raft.state_failed", "raft.state_save_failed"] as const;
+  "agent.ready", "mount.settings", "subagent.start", "subagent.turn", "subagent.model_changed", "raft.held", "raft.held_answer", "raft.state_failed", "raft.state_save_failed", "raft.mcp_call"] as const;
 export type TraceKind = (typeof TRACE_KINDS)[number];
 
 /**
@@ -90,8 +90,11 @@ export type TraceKind = (typeof TRACE_KINDS)[number];
  * plugin cannot add a `tool.call` or a `model.call` the drain would count. The gateway refuses any other kind.
  * `raft.held` is a Raft call held for the model's decision, `raft.held_answer` the model's answer to one, and
  * `raft.state_failed` the Raft SDK's state that did not load or save (src/plugins/raft.ts says what each holds).
+ * `raft.mcp_call` is one managed MCP call's end, on the call's span: the connector's server name and the remote tool's
+ * name, and how it ended (`result`, `tool_error`, or the SDK's failure kind); never its arguments or its result
+ * (src/plugins/raft-mcp.ts).
  */
-export const PLUGIN_TRACE_KINDS = ["raft.held", "raft.held_answer", "raft.state_failed"] as const satisfies readonly TraceKind[];
+export const PLUGIN_TRACE_KINDS = ["raft.held", "raft.held_answer", "raft.state_failed", "raft.mcp_call"] as const satisfies readonly TraceKind[];
 export type PluginTraceKind = (typeof PLUGIN_TRACE_KINDS)[number];
 
 export const TRACE_VERDICTS = ["ok", "failed", "blocked", "cancelled"] as const;

@@ -180,6 +180,36 @@ an undeclared key is `400`, a value of the wrong type is `400`, and an agent or 
 change writes a `mount.settings` line to the Workers logs (filter on `evt` = `mount.settings`) and a `mount.settings`
 row to the agent's trace.
 
+## Raft managed MCP on an agent
+
+What the agent is offered from its Raft Server's connectors (docs/plugins.md, "Raft's managed MCP"). Nothing here
+needs a Raft message or a model call.
+
+1. **Its credential holds `mcp`.** The raft mount's listing asks for the catalogue only then. List the mount again and
+   read what it offers; the answer carries no credential:
+
+   ```
+   curl -s -X POST -H "x-harness-token: $AUTOMATION_TOKEN" -H "content-type: application/json" \
+     "$HOST/admin/mounts" -d '{"tenantId":"<tenantId>","agentId":"<agentId>","refreshTools":"raft"}' | jq '{tools: [.tools[] | select(startswith("mcp_"))], skipped}'
+   ```
+
+   One `mcp_…` name per catalogue entry is the expected answer for a Server with a connected connector. None, with
+   `mcp_` entries absent from `skipped` too, means the credential lacks `mcp` or the Server has no connector for the
+   agent. A `skipped` entry named `(managed MCP catalogue)` means Raft did not answer the catalogue request (its reason
+   says how); one per tool means the kernel left that tool out (a description over 2,048 characters, a schema over
+   16,384, or more than 128 tools on the mount).
+2. **The request reached Raft.** The listing and each call write a `raft.call` line to the Workers logs:
+   `node cf/scripts/logs.mjs --agent <agentId> --since 30m`, and look for `route` `/internal/agent-api/mcp/tools`
+   (the listing) and `/internal/agent-api/mcp/call` (a call), each with its `status`. A call's line with `status`
+   `null` and an `error` is a connection that failed mid-call: the operation is recorded `unknown`, the model was told
+   to check before calling again, and nothing retried it.
+3. **A connector that needs reconnecting** is one line in the raft mount's paragraph of the agent's instructions, in the
+   SDK's words ("… is set up on this server but disconnected right now; …"); a connector tool the agent is not offered
+   (step 1's `skipped`) is a line `"<server>": "<tool>" is not available here (…).` beside it, the names cleaned and quoted. Either reaches a
+   conversation already under way as a notice. The catalogue only carries these once Raft's Server sends `unavailable` (Raft #10091).
+4. **Freshness.** The catalogue is listed again at the agent's first turn five minutes after the last listing, and at
+   once after a call was told it is stale; step 1 lists it now.
+
 ## Subagents
 
 Every hosted agent can delegate work to subagents (docs/agent-surface.md, "Subagents"), its Agents API sessions

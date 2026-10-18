@@ -1,0 +1,353 @@
+/**
+ * Raft's managed MCP for a hosted agent: the connectors a person set up for the agent's Raft Server (Notion and the
+ * like), offered as tools of the agent's raft mount and called through Raft's gateway (`raft.mcp`, SDK 0.21.1). Raft
+ * holds the connectors' credentials and attaches them to each call; this file never sees one, and the only credential
+ * it sends is the mount's own Raft agent credential, to the mount's Raft origin, through the same client every other
+ * Raft call here uses.
+ *
+ * Part of the raft mount rather than a mount of its own, because everything it needs is that mount's: the agent's Raft
+ * identity and credential, the origin it may send them to, the capability list the listing already reads (the
+ * catalogue is asked for only when the credential holds `mcp`), and the listing's re-take on a credential change. A
+ * sibling mount would need its own copy of the credential, a seed on every hosted agent, and a way to follow the raft
+ * mount's credential when it changes; as part of the mount, every agent with a raft mount has it, and none without one
+ * does.
+ *
+ * - **Tools.** One per catalogue entry, named from its `runtimeName` (`mcpToolName`): `mcp_` and the name with every
+ *   character outside `[A-Za-z0-9_]` made `_`, so no name can be one of the plugin's own and the model's name reads
+ *   `<alias>__mcp_…`. The description and `inputSchema` are the catalogue's, passed through; the kernel's admission
+ *   bounds apply to them as to any listed tool (src/runtime/mount-tools.ts), and a tool over one is left out with the
+ *   reason rather than shortened. Every one is a write with no idempotency: a managed call is not idempotent, so it is
+ *   never replayed after a crash, and a subagent is not offered it (`childMayCall`, src/runtime/subagents.ts).
+ * - **Where the catalogue lives.** The tools are in the mount's snapshot, as every listed tool is: the catalogue and
+ *   the gateway read the record and never wait on Raft. What a call needs beyond the schema (the server's id and the
+ *   versions Raft checks) is kept in the mount's database (`MCP_KEY`), with each tool as listed, so a listing that
+ *   cannot read the catalogue offers the last one again, and with the connectors that need reconnecting, which the
+ *   mount's prompt paragraph names (`mcpLines`, each connector-supplied name on one line, capped and quoted by the SDK: `formatMcpPromptName`, and inside
+ *   `formatMcpReconnectRequired`). The
+ *   record is written only once the kernel keeps the listing as the mount's (`ListedTools.onKept`), so a call goes out
+ *   with the catalogue entry, versions included, of the list it was offered from.
+ * - **Freshness.** The listing asks for the catalogue each time it runs. Besides the runtime's own reasons to list
+ *   (a credential change, a build whose tool set moved), a turn's start lists again when the catalogue is older than
+ *   `MCP_CATALOG_TTL_MS`, or at once after a call was told it is stale (`mcpDue`, `Plugin.toolsDue`). The list a turn
+ *   starts with is its list; a new one reaches the model on the next turn (`catalogueKey` moves with the snapshot).
+ * - **Results.** A result is the tool's content as Raft returned it. A `tool_error` is an error with its text (capped
+ *   by the SDK). A failure is an error whose message is the SDK's `error.nextAction`, exactly as it came; `stale` also
+ *   marks the catalogue due. `outcome_unknown` is recorded as an operation whose outcome is unknown (`mayHaveLanded`).
+ * - **No retries.** The SDK makes one attempt (`managedMcpCall` is a single-attempt route), this file calls once, and
+ *   nothing above it calls again: the gateway runs a call once, refuses a second start of the same operation
+ *   (`already_attempted`, which a run_js program re-run after a restart meets, since its calls are keyed), and neither
+ *   engine re-runs a write with no idempotency after a crash (`replayPolicy`, src/runtime/pi-tools.ts; pi-durable's
+ *   `unsafe`). Tool calls do not travel through a queue, so there is no redelivery to guard against.
+ * - **Trace.** The gateway's `tool.call` row as for every call (tool, mount, task, call id; never arguments or a
+ *   result), and one `raft.mcp_call` row on the same span with the connector's server name, the remote tool's name and
+ *   how the call ended. Nothing else is recorded.
+ */
+import {
+  formatMcpPromptName, formatMcpReconnectRequired, MCP_OUTCOME_UNKNOWN_TEXT, mcpFailureKind,
+  type Raft, type RaftFailure, type RaftMcpTool,
+} from "@botiverse/raft-sdk";
+import type { Json, MountRecord } from "../core/types.ts";
+import { admitTools } from "../runtime/mount-tools.ts";
+import type { ListedTools, PluginContext, PluginErrorFields, SkippedTool, ToolSchema } from "./types.ts";
+
+/** The prefix of every managed MCP tool's name: no tool of the plugin's own starts with it. */
+export const MCP_PREFIX = "mcp_";
+/** The Raft capability the catalogue and the call need. */
+export const MCP_CAPABILITY = "mcp";
+/** Where the catalogue's call details are kept, in the mount's `context` store. Listed: ids and names, no credential. */
+export const MCP_KEY = "mcp";
+/**
+ * How old the catalogue may grow before a turn's start lists it again. A connector a person adds or reconnects in
+ * Raft reaches the agent within this long of its next turn; the cost is one catalogue request (and the credential
+ * context the listing reads anyway) per mount at most once per this long, under the runtime's re-take timeout.
+ */
+export const MCP_CATALOG_TTL_MS = 5 * 60_000;
+/**
+ * How long one managed call may wait for Raft. Raft's gateway aborts the remote server's connect and call together after
+ * about 20 s (`MCP_TIMEOUT_MS` in Raft's managed MCP gateway) and then answers, so a bound near that would report as
+ * `outcome_unknown` a call Raft goes on to complete or to answer itself. Well above it; the SDK sets no timeout of its
+ * own, so this is the only bound, and the mount's `timeoutMs` (15 s unless set, `raftFor`) stays the bound of every other
+ * Raft request. Nothing above the plugin bounds a call's wait: the gateway sets no
+ * deadline, and run_js's dynamic worker counts CPU time, not a host call's wait.
+ */
+export const MCP_CALL_TIMEOUT_MS = 60_000;
+/** The name a `skipped` entry gives the catalogue as a whole, when it could not be read. */
+export const MCP_CATALOG = "(managed MCP catalogue)";
+
+/** One catalogue entry as a call needs it, under the name the model was offered. */
+export interface KeptMcpTool {
+  name: string;
+  mcpServerId: string;
+  serverName: string;
+  toolName: string;
+  runtimeName: string;
+  configVersion: number;
+  assignmentVersion: number;
+  /** The tool as it was listed, so a listing that cannot read the catalogue can offer it again. */
+  schema: ToolSchema;
+}
+
+/** What the listing keeps under `MCP_KEY`. */
+export interface KeptMcp {
+  at: number;
+  tools: KeptMcpTool[];
+  /** Connectors set up for this agent that need reconnecting, by server name. */
+  reconnect: string[];
+  /**
+   * Catalogue tools the kernel's admission left out of the mount's list (`admitTools`), by server and remote tool name
+   * and the kind of rule, never the description or the schema: the model is told they exist and cannot be used here.
+   */
+  unavailable: Array<{ server: string; tool: string; why: string }>;
+}
+
+/** The most lines `mcpLines` gives the tools left out; the rest are counted in one more. */
+export const MCP_UNAVAILABLE_LINES = 20;
+
+function obj(v: unknown): Record<string, unknown> {
+  return v && typeof v === "object" && !Array.isArray(v) ? v as Record<string, unknown> : {};
+}
+
+/** The kept catalogue, read leniently: an entry that does not read is left out, a record that does not read is none. */
+export function keptMcpOf(raw: unknown): KeptMcp | null {
+  const r = obj(raw);
+  if (typeof r.at !== "number" || !Array.isArray(r.tools)) return null;
+  const tools = r.tools.map(obj).filter((t) =>
+    typeof t.name === "string" && typeof t.mcpServerId === "string" && typeof t.serverName === "string" &&
+    typeof t.toolName === "string" && typeof t.runtimeName === "string" &&
+    typeof t.configVersion === "number" && typeof t.assignmentVersion === "number" &&
+    typeof obj(t.schema).name === "string" && obj(t.schema).name === t.name) as unknown as KeptMcpTool[];
+  const reconnect = Array.isArray(r.reconnect) ? r.reconnect.filter((s): s is string => typeof s === "string") : [];
+  const unavailable = (Array.isArray(r.unavailable) ? r.unavailable : []).map(obj)
+    .filter((u) => typeof u.server === "string" && typeof u.tool === "string" && typeof u.why === "string") as KeptMcp["unavailable"];
+  return { at: r.at, tools, reconnect, unavailable };
+}
+
+/**
+ * The tool name for a catalogue entry's `runtimeName`: `mcp_` and the name with every character a tool name may not
+ * hold made `_` (a leading `mcp_`/`mcp__` is not doubled), and `_2`, `_3`, … after a name already given. Deterministic
+ * in the catalogue's order, so the same catalogue names its tools the same way every time.
+ */
+export function mcpToolName(runtimeName: string, used: Set<string>): string {
+  const clean = runtimeName.replace(/[^A-Za-z0-9_]/g, "_").replace(/^mcp_+/i, "");
+  const base = `${MCP_PREFIX}${clean || "tool"}`;
+  let name = base;
+  for (let n = 2; used.has(name); n++) name = `${base}_${n}`;
+  used.add(name);
+  return name;
+}
+
+export function isMcpTool(name: string): boolean {
+  return name.startsWith(MCP_PREFIX);
+}
+
+/** A catalogue entry as a tool: its own description and schema, a write with no idempotency. */
+function schemaOf(name: string, t: RaftMcpTool): ToolSchema {
+  return {
+    name,
+    summary: t.description ?? t.title ?? "",
+    parameters: t.inputSchema as unknown as Json,
+    // A managed call is not idempotent, whatever the remote tool's annotations claim: never replayed, never a child's.
+    sideEffects: "write",
+    idempotency: "none",
+  };
+}
+
+const key = (tenantId: string, agentId: string, alias: string) => `${tenantId}/${agentId}/${alias}`;
+
+/**
+ * The catalogue's clock, per mount, in this isolate: when this isolate last listed it, and the mounts a call was told
+ * are stale. An isolate that has not listed a mount reads the snapshot's own `takenAt` instead, so a fresh object lists
+ * a catalogue older than the TTL once, at its first turn.
+ */
+export function mcpClock() {
+  const listedAt = new Map<string, number>();
+  const stale = new Set<string>();
+  return {
+    listed(ctx: Pick<PluginContext, "caller" | "alias">, at: number): void {
+      const k = key(ctx.caller.tenantId, ctx.caller.agentId, ctx.alias);
+      listedAt.set(k, at);
+      stale.delete(k);
+    },
+    markStale(ctx: Pick<PluginContext, "caller" | "alias">): void {
+      stale.add(key(ctx.caller.tenantId, ctx.caller.agentId, ctx.alias));
+    },
+    /**
+     * Whether a turn's start should list this mount again (`Plugin.toolsDue`). Only a mount whose list was taken under a
+     * credential: one with none has no catalogue to ask for, and a re-take would only be refused.
+     */
+    due(m: MountRecord, now: number): boolean {
+      const snap = m.toolSnapshot;
+      if (!snap || !m.secretRef || snap.withoutCredential) return false;
+      const k = key(m.tenantId, m.agentId, m.alias);
+      if (stale.has(k)) return true;
+      return now - (listedAt.get(k) ?? snap.takenAt) >= MCP_CATALOG_TTL_MS;
+    },
+  };
+}
+export type McpClock = ReturnType<typeof mcpClock>;
+
+/**
+ * The kind of admission rule a reason from `admitTools` names, said for the model. Read from the kernel's own reason, so
+ * a rule added there reads as the fallback until it is named here; never the tool's description or schema.
+ */
+function admissionWhy(reason: string): string {
+  if (/its description is \d+ characters/.test(reason)) return "its description is too long";
+  if (/its input schema is \d+ characters/.test(reason)) return "its input schema is too large";
+  if (/lists more than \d+ tools|already fill/.test(reason)) return "this agent already has as many tools as it can be offered";
+  return "it could not be added to this agent's tools";
+}
+
+/**
+ * The catalogue tools the kernel will leave out of this listing, and why, from the same admission the kernel runs on
+ * it (`admitTools`, deterministic), so what the prompt says is what the mount offers: a tool's bounds, and the whole
+ * list's (Raft's own tools come first and fill it first).
+ */
+export async function leftOut(listed: ListedTools, managed: readonly ToolSchema[]): Promise<Map<string, string>> {
+  const admitted = await admitTools(listed, 0);
+  const kept = new Set(admitted.tools.map((t) => t.name));
+  // admitTools keeps only the first few reasons, so the reasons are read from a listing of the managed tools alone
+  // where the full one dropped them; a tool cut by the whole list's bounds says so.
+  const alone = await admitTools({ tools: [...managed] }, 0);
+  const reasons = new Map([...alone.skipped].map((s) => [s.name, s.reason]));
+  const out = new Map<string, string>();
+  for (const t of managed) {
+    if (kept.has(t.name)) continue;
+    out.set(t.name, admissionWhy(reasons.get(t.name) ?? "the tools before it already fill the list"));
+  }
+  return out;
+}
+
+/** Keep the catalogue; a write that fails costs the calls their details until the next listing, never the listing. */
+async function keep(ctx: PluginContext, store: string, value: KeptMcp): Promise<void> {
+  try { await ctx.db.put(store, value as unknown as Json, MCP_KEY); }
+  catch (e) { console.warn(`raft managed MCP catalogue could not be kept for mount ${ctx.alias}: ${String((e as Error)?.message ?? e)}`); }
+}
+
+/**
+ * The catalogue as tools, for the listing (`snapshotTools`), and kept for the calls. Asked only of a credential that
+ * holds `mcp`; for one that does not, the kept catalogue is emptied and nothing is listed. A catalogue that cannot be
+ * read does not fail the listing, which lists Raft's own operations too: the catalogue kept last time is offered
+ * again, and the entry in `skipped` says why it was not read.
+ */
+export async function listMcp(raft: Raft, ctx: PluginContext, store: string, holdsMcp: boolean): Promise<{
+  tools: ToolSchema[]; skipped: SkippedTool[];
+  /** Keep what was read, with the tools the listing's admission leaves out (`leftOut`); nothing when it was not read. */
+  keep(left: ReadonlyMap<string, string>): Promise<void>;
+}> {
+  const now = Date.now();
+  if (!holdsMcp) return { tools: [], skipped: [], keep: () => keep(ctx, store, { at: now, tools: [], reconnect: [], unavailable: [] }) };
+  const out = await raft.mcp.tools();
+  if (!out.ok) {
+    let kept: KeptMcp | null = null;
+    try { kept = keptMcpOf(await ctx.db.get(store, MCP_KEY)); } catch { /* none to offer again */ }
+    const why = out.error.code === "TRANSPORT_ERROR" ? "no answer from Raft"
+      : out.error.status !== undefined ? `Raft answered HTTP ${out.error.status}` : "Raft's answer did not match the Raft SDK's contract";
+    const tools = kept?.tools.map((t) => t.schema) ?? [];
+    return {
+      tools,
+      skipped: [{ name: MCP_CATALOG, reason: `the managed MCP catalogue could not be read (${why}); ${tools.length ? "the tools listed before are offered until it can" : "none is offered until it can"}` }],
+      // The record kept last time stands, with what it said was left out.
+      keep: async () => {},
+    };
+  }
+  const used = new Set<string>();
+  const tools: ToolSchema[] = [];
+  const kept: KeptMcpTool[] = [];
+  for (const t of out.data.tools) {
+    const name = mcpToolName(t.runtimeName, used);
+    const schema = schemaOf(name, t);
+    tools.push(schema);
+    kept.push({
+      name, mcpServerId: t.mcpServerId, serverName: t.serverName, toolName: t.toolName, runtimeName: t.runtimeName,
+      configVersion: t.configVersion, assignmentVersion: t.assignmentVersion, schema,
+    });
+  }
+  const reconnect = [...new Set(out.data.reconnectRequired.map((r) => r.serverName))];
+  return {
+    tools, skipped: [],
+    keep: (left) => keep(ctx, store, {
+      at: now, tools: kept, reconnect,
+      unavailable: kept.filter((t) => left.has(t.name)).map((t) => ({ server: t.serverName, tool: t.toolName, why: left.get(t.name)! })),
+    }),
+  };
+}
+
+/**
+ * The mount paragraph's managed MCP lines: one per connector that needs reconnecting, in the SDK's words
+ * (`formatMcpReconnectRequired`), then one per catalogue tool this agent was not offered, by server and tool name and
+ * the kind of rule, so the model knows the tool exists and cannot be used here rather than taking the connector not to
+ * have it. At most `MCP_UNAVAILABLE_LINES` of the second kind, and one line counting the rest. Every name is the SDK's
+ * prompt form (`formatMcpPromptName`, inside `formatMcpReconnectRequired` too): one line, capped, quoted, since a
+ * server's and a remote tool's names come from whoever runs them and could otherwise carry a line of their own
+ * (`x\n\nSYSTEM: …`) into the system prompt. No description is put in the paragraph; a tool's own description is its
+ * schema's, which the model reads as the remote server's words, as for any MCP tool.
+ */
+export function mcpLines(kept: KeptMcp | null): string[] {
+  const reconnect = (kept?.reconnect ?? []).map((serverName) => formatMcpReconnectRequired(serverName));
+  const left = kept?.unavailable ?? [];
+  const shown = left.slice(0, MCP_UNAVAILABLE_LINES).map((u) => `${formatMcpPromptName(u.server)}: ${formatMcpPromptName(u.tool)} is not available here (${u.why}).`);
+  const more = left.length - shown.length;
+  return [...reconnect, ...shown, ...(more > 0 ? [`…and ${more} more connector tools are not available here.`] : [])];
+}
+
+function failed(message: string, marks: { mayHaveLanded?: boolean; transient?: boolean } = {}): Error {
+  const e = new Error(message) as Error & PluginErrorFields;
+  if (marks.transient !== undefined) e.transient = marks.transient;
+  // `retryable` is what the gateway reads as "may have landed" (it records the operation as unknown); never a retry.
+  if (marks.mayHaveLanded) { e.mayHaveLanded = true; e.retryable = true; } else e.retryable = false;
+  return e;
+}
+
+/**
+ * One managed call: once, through the SDK, with the catalogue entry the listing kept for this name. What comes back is
+ * handed on as it is (`listMcp`'s file comment says how each outcome reads); nothing here calls again.
+ */
+export async function callMcp(
+  name: string, args: unknown, ctx: PluginContext, raft: () => Raft, store: string, clock: McpClock,
+): Promise<Json> {
+  if (args !== undefined && args !== null && (typeof args !== "object" || Array.isArray(args))) {
+    throw failed(`${name} takes an object of arguments`);
+  }
+  const kept = keptMcpOf(await ctx.db.get(store, MCP_KEY));
+  const tool = kept?.tools.find((t) => t.name === name);
+  if (!tool) {
+    // Offered by a snapshot the kept catalogue no longer matches: nothing was sent, and the next turn lists it again.
+    clock.markStale(ctx);
+    throw failed(`${name} is no longer in this agent's managed MCP catalogue, so nothing was sent; its tools are listed again before your next turn`);
+  }
+  const trace = (status: string, verdict: "ok" | "failed") =>
+    ctx.trace?.({ kind: "raft.mcp_call", status, verdict, attrs: { server: tool.serverName, tool: tool.toolName } });
+  const out = await raft().mcp.call({ tool, arguments: (args ?? {}) as Record<string, unknown> });
+  if (out.ok && out.state === "result") {
+    trace("result", "ok");
+    return { content: out.data.content, ...(out.data.structuredContent ? { structuredContent: out.data.structuredContent } : {}) } as unknown as Json;
+  }
+  if (out.ok) {
+    // The remote tool answered with an error: it ran, and what it said is the model's to read.
+    trace("tool_error", "failed");
+    throw failed(out.text);
+  }
+  const failure = out as RaftFailure;
+  const kind = mcpFailureKind(failure);
+  const nextAction = failure.error.nextAction;
+  trace(kind ?? "error", "failed");
+  switch (kind) {
+    case "stale":
+      clock.markStale(ctx);
+      throw failed(nextAction);
+    case "reconnect_required":
+      throw failed(nextAction);
+    case "unavailable":
+      // Raft confirmed the tool was not called; it may work later, on the model's own decision.
+      throw failed(nextAction, { transient: true });
+    case "outcome_unknown":
+      // The SDK's own words for it (`MCP_OUTCOME_UNKNOWN_TEXT`), and an operation recorded as unknown.
+      throw failed(nextAction || MCP_OUTCOME_UNKNOWN_TEXT, { mayHaveLanded: true });
+    default: {
+      // Raft answered with something the SDK does not class as a managed MCP failure. The SDK already reads a 5xx with
+      // no Raft code as outcome_unknown (0.21.1); a 5xx that carries some other code may still have reached the tool.
+      const status = failure.error.status;
+      throw failed(nextAction, status !== undefined && status >= 500 ? { mayHaveLanded: true } : {});
+    }
+  }
+}
