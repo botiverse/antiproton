@@ -587,8 +587,10 @@ export function buildBriefing(entries: readonly BriefingEntry[], o: {
     const said = r && !r.isError ? sendsReported(r.text, o.programSends(c.id)) : [];
     if (said.length) nested.set(c.id, said);
   }
+  // Only a send that succeeded answered anything: one Raft refused (a channel it cannot see, a 403) posted nothing.
+  const delivered = (c: Call) => { const r = results.get(c.id); return !!r && !r.isError; };
   const sends = [
-    ...calls.filter((c) => isSendTool(c.name)).map((c) => ({ index: c.index, ...sendPlace(c.args) })),
+    ...calls.filter((c) => isSendTool(c.name) && delivered(c)).map((c) => ({ index: c.index, ...sendPlace(c.args) })),
     ...calls.flatMap((c) => (nested.get(c.id) ?? []).map((n) => ({ index: c.index, target: n.target as string | null, replyTo: null as string | null }))),
   ];
   // A reply names the message it answers, and answers that one alone; any other send answers its whole target.
@@ -624,9 +626,10 @@ export function buildBriefing(entries: readonly BriefingEntry[], o: {
       const { target, replyTo } = sendPlace(c.args);
       const id = sentId(results.get(c.id)?.text ?? "");
       const place = replyTo === null ? undefined : placeOf.get(replyTo) ?? [...placeOf].find(([m]) => sameMsg(m, replyTo))?.[1];
-      const where = replyTo !== null ? ` replied to msg=${tag(replyTo)}${place !== undefined ? ` in ${tag(place)}` : ""}`
-        : target !== null ? ` sent to ${tag(target)}` : " sent";
-      out.push({ label: `[${o.conversation} · ${at} · you${where}${id ? ` as msg=${tag(id)}` : ""} with ${c.name}]`, text: sent, kind: "sent" });
+      const ok = delivered(c);
+      const where = replyTo !== null ? ` ${ok ? "replied" : "tried to reply"} to msg=${tag(replyTo)}${place !== undefined ? ` in ${tag(place)}` : ""}`
+        : target !== null ? ` ${ok ? "sent" : "tried to send"} to ${tag(target)}` : ok ? " sent" : " tried to send";
+      out.push({ label: `[${o.conversation} · ${at} · you${where}${ok && id ? ` as msg=${tag(id)}` : ""} with ${c.name}${ok ? "" : ", which failed: nothing was sent"}]`, text: sent, kind: "sent" });
     }
     for (const c of calls.filter((c) => c.index === i && nested.has(c.id))) {
       for (const n of nested.get(c.id)!) {
