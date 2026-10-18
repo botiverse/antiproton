@@ -256,6 +256,14 @@ check("a watermark the box-at-a-time meter left behind is read without counting 
   eq(got.rows.filter((r) => r.unit === "execs").map((r) => r.quantity), [3], "and only the missed session's uses");
 });
 
+check("a session that starts at the instant the watermark stands is a new one, with all of its uses", () => {
+  // The previous session was counted to its end, and the box woke in that same millisecond.
+  const s2 = { id: "b1", startedAt: H0 + 60_000, endedAt: H0 + 120_000, uses: 3 };
+  const got = heldRows(base, "sandbox", [s2], marks({ b1: { through: H0 + 60_000, uses: 2 } }), H0 + 300_000);
+  eq(secs(got.rows), [[0, 60]], "all of its time");
+  eq(got.rows.filter((r) => r.unit === "execs").map((r) => r.quantity), [3], "and its own uses, not less the last session's");
+});
+
 check("against a real table: one box under two payer keys in one pass is still counted once", () => {
   const host = sqliteHost();
   // A session recorded before the credential was, beside the running one that records it: two keys, one box.
