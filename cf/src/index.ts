@@ -4330,7 +4330,7 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
           const objects = await scanObjects(env.ARTIFACTS as unknown as ScanBucket, agentPrefixes(t, a), b.needle as string);
           const out: StorageScan = {
             found: tables.tables.length > 0 || objects.objects > 0, tables: tables.tables, objects: objects.objects,
-            scanned: { tables: tables.scanned.tables, rows: tables.scanned.rows, objects: objects.scanned },
+            scanned: { tables: tables.scanned.tables, rows: tables.scanned.rows, objects: objects.scanned }, skipped: objects.skipped,
             truncated: tables.truncated || objects.truncated,
           };
           logEvent("admin.storage_scan", { tenantId: t, agentId: a, found: out.found, truncated: out.truncated });

@@ -401,7 +401,9 @@ its prefixes (`t/<tenant>/<agent>/`, `trace/<tenant>/<agent>/`), and says where 
 count of objects, with how much was read. It is the check for a data contract such as RaftBench's (no copy of the
 source text outlives a run). A match is case-insensitive and also looks inside JSON-escaped strings. The needle is not
 returned and not logged (`admin.storage_scan` carries the ids and `found`). Past its caps the answer says `truncated`,
-and a `found: false` then covers only what was read.
+and a `found: false` then covers only what was read. Each call reads a few MB of an agent's tables at most, and
+skips R2 objects over 16 MB (`skipped`). It is operator-only for a reason: any substring of four characters or more can
+be asked about, so it answers whether a text is stored, and is an oracle for what an agent holds.
 
 ```
 curl -s -X POST -H "x-harness-token: $AUTOMATION_TOKEN" -H "content-type: application/json" \

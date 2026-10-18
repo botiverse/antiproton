@@ -771,6 +771,25 @@ await check("an empty window: no model call, an ordinary incomplete through subm
   must(v.sent.length === 1 && v.raft.submits().length === 0, `a normal read: calls ${v.sent.length}, submits ${v.raft.submits().length}`);
 });
 
+await check("a wake that keeps failing backs off, doubling to six hours, and a wake that works resets it", async () => {
+  const { wakeBackoffMs } = await import("../src/plugins/raftbench.ts");
+  must(show([1, 2, 3, 10, 50].map(wakeBackoffMs)) === show([60_000, 120_000, 240_000, 6 * 3_600_000, 6 * 3_600_000]), show([1, 2, 3, 10, 50].map(wakeBackoffMs)));
+  const w = await world();
+  must((await w.rt.removeCredential("t", SERVICE, PROVISION_MOUNT_ALIAS)) !== false, "the credential was not removed");
+  const { askWake, nextWakeAt } = await import("../src/runtime/plugin-wakes.ts");
+  const gaps: number[] = [];
+  for (let i = 0; i < 3; i++) {
+    askWake(w.host.sql as never, "raftbench", Date.now());
+    await w.rt.step("t", SERVICE);
+    gaps.push(nextWakeAt(w.host.sql as never)! - Date.now());
+  }
+  must(gaps[0]! > 50_000 && gaps[1]! > 110_000 && gaps[2]! > 230_000 && gaps[2]! <= 240_000, show(gaps));
+  must((await w.rt.attachCredential("t", SERVICE, PROVISION_MOUNT_ALIAS, { token: CRED })).ok, "re-attach");
+  askWake(w.host.sql as never, "raftbench", Date.now());
+  await w.rt.step("t", SERVICE);
+  must(!runLogs("wake_failed").some((l) => l.failures === 4) && w.host.sql.exec(`SELECT 1 AS x FROM plugin_db WHERE key = 'wake_failures'`).toArray().length === 0, "the count was not reset");
+});
+
 await check("retention: every terminal path leaves no copy — timeout, read failure, stop, model failure, overflow, cancel, reread", async () => {
   const paths: Record<string, (w: World) => Promise<void>> = {
     timeout: async (w) => { skew += RUN_DEADLINE_MS + 1_000; try { for (let i = 0; i < 3; i++) await pass(w); } finally { skew = 0; } },

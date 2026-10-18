@@ -4,7 +4,7 @@
  * or a row. Through the Worker's own `fetch` for the route, with the object's half run on a real SQLite.
  */
 import { register } from "node:module";
-import { sqliteHost } from "../src/store/sqlite-host.ts";
+import { DatabaseSync } from "node:sqlite";
 
 const STAND_IN = "export class DurableObject { constructor(ctx, env) { this.ctx = ctx; this.env = env; } }" +
   " export class WorkerEntrypoint { constructor(ctx, env) { this.ctx = ctx; this.env = env; } }" +
@@ -30,9 +30,29 @@ for (const k of ["log", "warn", "error"] as const) (console as any)[k] = (...a: 
 const NEEDLE = "Zq-Needle-3301";
 const TOKEN = "operator-token-scan";
 
+/**
+ * SQLite read the way the Durable Object's `exec` reads it: a cursor, iterated row by row (node:sqlite's `iterate`),
+ * counting every row it is asked for, so a test can see that a scan stopped reading at its cap.
+ */
+function cursorHost() {
+  const db = new DatabaseSync(":memory:");
+  const pulled = { rows: 0 };
+  return {
+    pulled,
+    sql: {
+      exec(query: string, ...bindings: unknown[]) {
+        const stmt = db.prepare(query);
+        if (!/^\s*select/i.test(query)) { stmt.run(...(bindings as any[])); return [][Symbol.iterator](); }
+        const it = stmt.iterate(...(bindings as any[])) as IterableIterator<Record<string, unknown>>;
+        return { [Symbol.iterator]: () => ({ next: () => { const r = it.next(); if (!r.done) pulled.rows++; return r; }, return: () => { it.return?.(); return { done: true, value: undefined }; } }) };
+      },
+    },
+  };
+}
+
 /** An agent's object: a few tables, the needle in one as plain text and in another only as escaped JSON. */
 function storage() {
-  const host = sqliteHost();
+  const host = cursorHost();
   host.sql.exec("CREATE TABLE notes (id INTEGER, body TEXT)");
   host.sql.exec("CREATE TABLE plugin_db (k TEXT, value TEXT)");
   host.sql.exec("CREATE TABLE quiet (k TEXT, v BLOB)");
@@ -57,18 +77,27 @@ await check("tables: found case-insensitively, as plain text and inside a JSON-e
   must(none.tables.length === 0 && none.scanned.rows === 3, show(none));
 });
 
-await check("tables: past the row cap the answer says truncated", () => {
-  const host = sqliteHost();
+await check("tables: a table past the caps is read row by row and only up to the cap, and the answer says truncated", () => {
+  const host = cursorHost();
   host.sql.exec("CREATE TABLE many (v TEXT)");
-  for (let i = 0; i < 50; i++) host.sql.exec("INSERT INTO many VALUES (?)", `row ${i}`);
-  const out = scanTables(host.sql as never, "row 49", { ...SCAN_LIMITS, maxRows: 10 });
+  for (let i = 0; i < 5000; i++) host.sql.exec("INSERT INTO many VALUES (?)", `row ${i} ${"x".repeat(100)}`);
+  const before = host.pulled.rows;
+  const out = scanTables(host.sql as never, "row 4999", { ...SCAN_LIMITS, maxRows: 10 });
   must(out.truncated && out.scanned.rows === 10 && out.tables.length === 0, show(out));
+  // The cursor was asked for the sqlite_master listing and 11 rows of the table, never the 5,000.
+  must(host.pulled.rows - before <= 12 + 2, `rows pulled from the cursor: ${host.pulled.rows - before}`);
+  const bytes = scanTables(host.sql as never, "row 4999", { ...SCAN_LIMITS, maxBytes: 2_000 });
+  must(bytes.truncated && bytes.scanned.rows < 30, show(bytes));
 });
 
-await check("objects: only the agent's prefixes are read; found ones are counted; an object over the cap is not read and says so", async () => {
-  const b = bucket({ "t/t1/a1/x.json": `{"q":"${NEEDLE}"}`, "trace/t1/a1/b1.json": "clean", "t/t1/other/y.json": NEEDLE, "t/t1/a1/big.bin": "x".repeat(100) });
-  const out = await scanObjects(b, ["t/t1/a1/", "trace/t1/a1/"], NEEDLE, { ...SCAN_LIMITS, maxObjectBytes: 50 });
-  must(out.objects === 1 && out.scanned === 2 && out.truncated, show(out));
+await check("objects: only the agent's prefixes are read; found ones are counted; an object over the cap is never fetched, and is counted skipped", async () => {
+  const objects = { "t/t1/a1/x.json": `{"q":"${NEEDLE}"}`, "trace/t1/a1/b1.json": "clean", "t/t1/other/y.json": NEEDLE, "t/t1/a1/big.bin": `${NEEDLE}${"x".repeat(100)}` };
+  const fetched: string[] = [];
+  const b = bucket(objects);
+  const watched = { list: b.list, get: async (key: string) => { fetched.push(key); return b.get(key); } };
+  const out = await scanObjects(watched, ["t/t1/a1/", "trace/t1/a1/"], NEEDLE, { ...SCAN_LIMITS, maxObjectBytes: 50 });
+  must(out.objects === 1 && out.scanned === 2 && out.skipped === 1 && out.truncated && !fetched.includes("t/t1/a1/big.bin"), show({ out, fetched }));
+  must(SCAN_LIMITS.maxObjectBytes <= 16 * 1024 * 1024 && SCAN_LIMITS.maxBytes <= 16 * 1024 * 1024, show(SCAN_LIMITS));
 });
 
 // ---- the route ------------------------------------------------------------------------------------------------
@@ -102,7 +131,7 @@ await check("route: found and not found, the needle in neither the answer nor an
   const found = await scan(TOKEN, TOKEN, { tenantId: "t1", agentId: "a1", needle: NEEDLE }, { "trace/t1/a1/b.json": `x ${NEEDLE} y` });
   const body = JSON.parse(found.text);
   must(found.status === 200 && body.found === true && show(body.tables.sort()) === show(["notes", "plugin_db"]) && body.objects === 1, found.text);
-  must(show(Object.keys(body).sort()) === show(["found", "objects", "scanned", "tables", "truncated"]), found.text);
+  must(show(Object.keys(body).sort()) === show(["found", "objects", "scanned", "skipped", "tables", "truncated"]), found.text);
   const missing = await scan(TOKEN, TOKEN, { tenantId: "t1", agentId: "a1", needle: "Zq-Nowhere-0000" });
   must(missing.status === 200 && JSON.parse(missing.text).found === false, missing.text);
   for (const text of [found.text, missing.text, ...logs]) {

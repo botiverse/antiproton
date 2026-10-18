@@ -11,16 +11,27 @@
  */
 import { tracePrefix } from "./trace-r2.ts";
 
-type Sql = { exec(query: string, ...bindings: unknown[]): { toArray(): any[] } };
+/**
+ * The object's SQL, read through its cursor: the Durable Object's `exec` returns one, iterated row by row, so a table
+ * is never held whole in memory and a scan stops at its caps having read no further.
+ */
+type Sql = { exec(query: string, ...bindings: unknown[]): Iterable<Record<string, unknown>> };
 
+/**
+ * Per call. The scan runs inside the agent's live object, synchronously for the tables, so the caps are what keep one
+ * scan from holding it: a few MB of cells read and a bounded number of rows, well under the object's memory; an R2
+ * object larger than `maxObjectBytes` is not read at all, and counted as skipped.
+ */
 export interface ScanLimits { maxRows: number; maxBytes: number; maxObjects: number; maxObjectBytes: number }
-export const SCAN_LIMITS: ScanLimits = { maxRows: 500_000, maxBytes: 128 * 1024 * 1024, maxObjects: 5_000, maxObjectBytes: 64 * 1024 * 1024 };
+export const SCAN_LIMITS: ScanLimits = { maxRows: 200_000, maxBytes: 8 * 1024 * 1024, maxObjects: 2_000, maxObjectBytes: 16 * 1024 * 1024 };
 
 export interface StorageScan {
   found: boolean;
   tables: string[];
   objects: number;
   scanned: { tables: number; rows: number; objects: number };
+  /** R2 objects over the per-object cap, not read. */
+  skipped: number;
   truncated: boolean;
 }
 
@@ -55,14 +66,14 @@ const cellText = (v: unknown): string | null =>
   : null;
 
 /** Every table of an agent's object, row by row. Reads only. */
-export function scanTables(sql: Sql, needle: string, limits: ScanLimits = SCAN_LIMITS): Omit<StorageScan, "objects" | "found"> & { scanned: { objects: 0 } } {
+export function scanTables(sql: Sql, needle: string, limits: ScanLimits = SCAN_LIMITS): { tables: string[]; scanned: { tables: number; rows: number }; truncated: boolean } {
   const n = needle.toLowerCase();
   const found = new Set<string>();
   let rows = 0, bytes = 0, tables = 0, truncated = false;
-  const names = sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").toArray().map((r) => String(r.name));
+  const names = [...sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")].map((r) => String(r.name));
   outer: for (const name of names) {
     tables++;
-    for (const row of sql.exec(`SELECT * FROM "${name.replace(/"/g, '""')}"`).toArray()) {
+    for (const row of sql.exec(`SELECT * FROM "${name.replace(/"/g, '""')}"`)) {
       if (rows >= limits.maxRows || bytes >= limits.maxBytes) { truncated = true; break outer; }
       rows++;
       for (const cell of Object.values(row as Record<string, unknown>)) {
@@ -73,7 +84,7 @@ export function scanTables(sql: Sql, needle: string, limits: ScanLimits = SCAN_L
       }
     }
   }
-  return { tables: [...found], scanned: { tables, rows, objects: 0 }, truncated };
+  return { tables: [...found], scanned: { tables, rows }, truncated };
 }
 
 /** The part of an R2 bucket this reads. */
@@ -89,16 +100,17 @@ export function agentPrefixes(tenantId: string, agentId: string): string[] {
 
 /** Every object under the agent's prefixes. Reads only; an object over the per-object cap is not read, and says so. */
 export async function scanObjects(bucket: ScanBucket, prefixes: string[], needle: string, limits: ScanLimits = SCAN_LIMITS):
-  Promise<{ objects: number; scanned: number; truncated: boolean }> {
+  Promise<{ objects: number; scanned: number; skipped: number; truncated: boolean }> {
   const n = needle.toLowerCase();
-  let objects = 0, scanned = 0, bytes = 0, truncated = false;
+  let objects = 0, scanned = 0, skipped = 0, bytes = 0, truncated = false;
   for (const prefix of prefixes) {
     let cursor: string | undefined;
     do {
       const page = await bucket.list({ prefix, ...(cursor ? { cursor } : {}), limit: 1000 });
       for (const o of page.objects) {
-        if (scanned >= limits.maxObjects || bytes >= limits.maxBytes) return { objects, scanned, truncated: true };
-        if ((o.size ?? 0) > limits.maxObjectBytes) { truncated = true; continue; }
+        if (scanned >= limits.maxObjects) return { objects, scanned, skipped, truncated: true };
+        // Not read: an object of unknown size is not trusted to be small.
+        if (o.size === undefined || o.size > limits.maxObjectBytes) { skipped++; truncated = true; continue; }
         const body = await bucket.get(o.key);
         if (!body) continue;
         const text = await body.text();
@@ -109,5 +121,5 @@ export async function scanObjects(bucket: ScanBucket, prefixes: string[], needle
       cursor = page.truncated ? page.cursor : undefined;
     } while (cursor);
   }
-  return { objects, scanned, truncated };
+  return { objects, scanned, skipped, truncated };
 }

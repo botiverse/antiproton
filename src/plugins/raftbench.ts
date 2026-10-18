@@ -128,6 +128,12 @@ const CURRENT = "current";
 const NEXT = "next";
 const SINCE = "since";
 const PULLED = "pulled";
+const WAKE_FAILURES = "wake_failures";
+
+/** How long after the `failures`-th wake in a row that failed the next one comes: a minute, doubling, at most six hours. */
+export function wakeBackoffMs(failures: number): number {
+  return Math.min(60_000 * 2 ** Math.max(0, failures - 1), 6 * 3_600_000);
+}
 
 type Phase = "reading" | "turn" | "submitting" | "done";
 /** One run's progress, written before every step that leaves the object. */
@@ -477,11 +483,17 @@ export const raftbenchPlugin: Plugin = {
     // asked for whatever else this wake manages.
     const done = await load(ctx, CURRENT);
     const erase: PluginNext = done?.phase === "done" && done.forgetPending ? { forget: true } : {};
-    try { return await answer(ctx, { ...erase, ...((await woken(ctx)) ?? {}) }); }
-    catch (e) {
-      // Kept for the next wake rather than lost with this one: the run's own deadline or retry is asked for again.
-      log(ctx, null, "wake_failed", { error: clip(String((e as Error)?.message ?? e)) });
-      return answer(ctx, { ...erase, wakeAt: Date.now() + RETRY_DELAYS_MS[0]! });
+    try {
+      const out = await answer(ctx, { ...erase, ...((await woken(ctx)) ?? {}) });
+      await ctx.db.delete(STORE, WAKE_FAILURES);
+      return out;
+    } catch (e) {
+      // Kept for the next wake rather than lost with this one: the run's own deadline or retry is asked for again, and
+      // a wake that keeps failing (the raft mount gone for good) backs off, doubling to six hours, rather than every minute.
+      const failures = Number(await ctx.db.get(STORE, WAKE_FAILURES) ?? 0) + 1;
+      await ctx.db.put(STORE, failures, WAKE_FAILURES);
+      log(ctx, null, "wake_failed", { failures, error: clip(String((e as Error)?.message ?? e)) });
+      return answer(ctx, { ...erase, wakeAt: Date.now() + wakeBackoffMs(failures) });
     }
   },
 
