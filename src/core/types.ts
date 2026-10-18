@@ -101,6 +101,13 @@ export interface OperationRecord {
   taskId: string; // ownership fields the plan's §7.2 model was missing
   mountAlias: string;
   tool: string;
+  /**
+   * The name the model was offered this tool under and called it by, exactly as it appeared in its tool list (a
+   * collision tie-break's suffix included): recorded at dispatch, because nothing after it can tell which of two
+   * clashing tools got the suffix. Null when no model named the call (an operator's or a provisioning step's) and
+   * on a row from before it was recorded. `tool` is the dispatch address (`<plugin>.<tool>`), which no model sees.
+   */
+  modelName: string | null;
   toolVersion: string;
   status: OperationStatus;
   resultRef: string | null;

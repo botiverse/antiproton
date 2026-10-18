@@ -98,6 +98,7 @@
     "test/mount-reports.ts",
     "test/run-js-resume.ts",
     "test/run-js-opts.ts",
+    "test/model-name-in-the-record.ts",
     "test/caller-context.ts",
     "test/operation-id.ts",
     "test/stable-prompt.ts",

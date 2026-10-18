@@ -152,6 +152,12 @@ export interface InvokeOpts {
    */
   callId?: string;
   /**
+   * The name the model was offered this tool under and called it by (`OperationRecord.modelName`), from the tool list
+   * the call was made against: the bridged tool's own name, or the offered name a run_js program's address maps to.
+   * Absent when no model named the call. Changes nothing about the call; it is recorded on the operation.
+   */
+  modelName?: string;
+  /**
    * The call comes from a run_js program, not from the model: set by `runJsTool`
    * after the program's own options, so a program cannot clear it. A tool that
    * declares `modelOnly` is refused for it here, whatever name reached the
@@ -869,6 +875,7 @@ export class ToolGateway {
       taskId: ctx.taskId,
       mountAlias: r.mount.alias,
       tool: `${r.mount.plugin}.${r.tool}`,
+      modelName: opts.modelName ?? null,
       toolVersion: r.mount.toolVersion,
     });
 
@@ -1116,9 +1123,11 @@ export class ToolGateway {
     if (!resuming) return { status: "rejected", error: { code: "not_resumable", message: `${plugin.id} cannot take an answer` } };
     const go = async () => {
       const operationId = `op_${randomUUID().replace(/-/g, "").slice(0, 20)}`;
+      // A resume is the same request going on, so its step carries the name the asking call was recorded under.
+      const asked = i.operationId ? await this.#store.getOperation(ctx.tenantId, i.operationId) : null;
       await this.#store.recordOperation({
         operationId, tenantId: ctx.tenantId, agentId: ctx.agentId, taskId: ctx.taskId,
-        mountAlias: mount.alias, tool: `${mount.plugin}.${i.tool}`, toolVersion: mount.toolVersion,
+        mountAlias: mount.alias, tool: `${mount.plugin}.${i.tool}`, modelName: asked?.modelName ?? null, toolVersion: mount.toolVersion,
       });
       const facts = () => (opts.callId === undefined ? {} : { callId: opts.callId });
       // Recorded as a step of its own, but the plugin is told the operation it continues: a resume is the same

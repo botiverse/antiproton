@@ -23,7 +23,7 @@ import { programCallKey } from "./operation-id.ts";
 import { splitView, viewContent, type ViewHost, type ViewMarker } from "./tool-view.ts";
 import type { Json } from "../core/types.ts";
 import type { Continuation, HeldCall, Paused } from "../core/execution.ts";
-import { parseToolRef, type ToolInterrupt } from "../core/tools.ts";
+import type { ToolInterrupt } from "../core/tools.ts";
 import {
   answerProblem, answerSpecOf, type AnswerSpec, type InterruptHost, type RunJsContinuations,
 } from "./run-js-resume.ts";
@@ -86,7 +86,11 @@ export interface ToolResult {
 export interface ToolHost extends ViewHost {
   /** `callId` is the model's id for this tool call, passed to be RECORDED. It is
    *  not `opts.idempotencyKey`: one call can make several requests. */
-  invoke(call: { tool: string; args: Json; opts?: unknown; callId?: string }): Promise<ToolResult>;
+  invoke(call: {
+    tool: string; args: Json; opts?: unknown; callId?: string;
+    /** The name the model was offered the tool under, recorded on the operation (`InvokeOpts.modelName`). */
+    name?: string;
+  }): Promise<ToolResult>;
   /**
    * A checked answer to a question a tool asked, delivered to its plugin
    * (gateway `resumeInterrupt`); `callId` is the resume call's. Absent: no
@@ -124,18 +128,6 @@ export function modelToolName(alias: string, tool: string): string {
   const a = modelName(alias);
   const room = Math.max(1, MAX_NAME - a.length - 2);
   return `${a}__${modelName(tool).slice(0, room)}`;
-}
-
-/**
- * The name the model was shown for an operation's tool, from the two things the operation records: its mount's alias
- * and its dispatch address. The address is `<plugin>.<tool>` (src/runtime/gateway.ts, where `recordOperation` is
- * called), so prefixing it with the alias as it stands named a tool nobody was offered (`raft__raft.messages_send`).
- * It is split the way the gateway splits an address (`parseToolRef`, at the first dot: a plugin id has none); an
- * address that is not one is taken as the bare tool. Like {@link modelToolName}, this is not the name a collision
- * tie-break gave, which no operation or trace row records.
- */
-export function operationToolName(alias: string, address: string): string {
-  return modelToolName(alias, parseToolRef(address)?.tool ?? address);
 }
 
 /**
@@ -315,7 +307,7 @@ export function bridgeTools(
       const lifted = declaresConfirm(t.parameters) ? { args: params, confirm: false } : liftConfirm(params);
       // The model's id for this call travels with it, so the operation it starts can be lined up
       // with the `tool.result` the console already pairs by that same id (cf/src/ui.ts).
-      const res = await host.invoke({ tool: t.address, args: lifted.args, callId: toolCallId, ...(lifted.confirm ? { opts: { confirm: true } } : {}) });
+      const res = await host.invoke({ tool: t.address, name: t.name, args: lifted.args, callId: toolCallId, ...(lifted.confirm ? { opts: { confirm: true } } : {}) });
       return deliverToolResult(res, { name: t.name, address: t.address, callId: toolCallId, host, keeping });
     },
   })) as AgentHarnessTool<undefined>[];
@@ -1088,6 +1080,10 @@ export function runJsTool(
           return host.invoke({
             ...call,
             tool: address(call.tool),
+            // The offered name, whichever form the program wrote: an address it was offered under maps back to it.
+            // A name outside the tool list (`plugin.tool`, resolved by the gateway) was offered under no name. Set
+            // here, never taken from the program's call, so the record says what was offered, not what it claims.
+            name: target?.name,
             args: lifted.args,
             // Every host call a script makes serves this ONE model call, so they all name it --
             // which is exactly why the id is not the idempotency key below: that one has to differ

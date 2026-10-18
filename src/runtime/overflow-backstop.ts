@@ -31,7 +31,6 @@ import { appendTrace } from "../trace/outbox.ts";
 import { MAIN_SESSION, piTables, type SqlHost } from "../store/pi-storage.ts";
 import { fenceFor } from "../plugins/state.ts";
 import { keyedOperationId, programCallKey } from "./operation-id.ts";
-import { operationToolName } from "./pi-tools.ts";
 import { BRIEFING_BUDGET_TOKENS, recordRebuildDecision, type RebuildTrigger } from "./rebuild.ts";
 
 type Sql = SqlHost["sql"];
@@ -466,10 +465,11 @@ export function programSendCounter(sql: Sql, tenantId: string, taskId: string = 
     let sends = 0;
     for (let from = 0; from < PROGRAM_CALLS_LOOKED_AT; from += IDS_PER_QUERY) {
       const ids = Array.from({ length: IDS_PER_QUERY }, (_, k) => keyedOperationId(tenantId, taskId, programCallKey(toolCallId, from + k)));
-      const rows = sql.exec(`SELECT mount_alias, tool FROM operations WHERE tenant_id = ? AND status = 'succeeded' AND operation_id IN (${ids.map(() => "?").join(", ")})`,
-        tenantId, ...ids).toArray() as Array<{ mount_alias: unknown; tool: unknown }>;
-      // `tool` is the dispatch address (`raft.messages_send`), which `isSendTool` does not read as a send.
-      sends += rows.filter((r) => isSendTool(operationToolName(String(r.mount_alias), String(r.tool)))).length;
+      // By the name the program called the tool by (`model_name`), the vocabulary `isSendTool` reads; `tool` is the
+      // dispatch address. A row from before the name was recorded has none and counts as no send.
+      const rows = sql.exec(`SELECT model_name FROM operations WHERE tenant_id = ? AND status = 'succeeded' AND operation_id IN (${ids.map(() => "?").join(", ")})`,
+        tenantId, ...ids).toArray() as Array<{ model_name: unknown }>;
+      sends += rows.filter((r) => typeof r.model_name === "string" && isSendTool(r.model_name)).length;
     }
     return sends;
   };

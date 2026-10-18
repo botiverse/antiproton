@@ -166,13 +166,14 @@ export function personaOf(config: unknown): { name?: string; description?: strin
  * sets it on every call it makes, after the program's options, and the gateway
  * refuses a `modelOnly` tool on it — dropped here, that refusal never fires.
  */
-export function hostCallOpts(call: { opts?: unknown; callId?: string }): InvokeOpts {
+export function hostCallOpts(call: { opts?: unknown; callId?: string; name?: string }): InvokeOpts {
   const o = (call.opts ?? {}) as { confirm?: unknown; idempotencyKey?: unknown; fromProgram?: unknown };
   return {
     ...(o.confirm === true ? { confirm: true } : {}),
     ...(o.fromProgram === true ? { fromProgram: true } : {}),
     ...(typeof o.idempotencyKey === "string" ? { idempotencyKey: o.idempotencyKey } : {}),
     ...(call.callId === undefined ? {} : { callId: call.callId }),
+    ...(call.name === undefined ? {} : { modelName: call.name }),
   };
 }
 import type { MountPolicy, MountRecord } from "../../src/core/types.ts";
@@ -2292,7 +2293,7 @@ export class AgentRuntime {
     // answer to a question a tool asked, whose result is the tool's own and is
     // finished exactly as a call's is (a job, a parked result, the held line).
     const dispatch = async (
-      call: { tool: string; args: any; opts?: any; callId?: string },
+      call: { tool: string; args: any; opts?: any; callId?: string; name?: string },
       send: () => Promise<ToolResult> = () => gw.invoke(inTurn(), call.tool, call.args, hostCallOpts(call)),
     ): Promise<ToolResult> => {
         const res = await send();
@@ -2385,7 +2386,7 @@ export class AgentRuntime {
        * result with a wrapper of their own: attached before, the line would be
        * parked into storage along with the body the model cannot see.
        */
-      async invoke(call: { tool: string; args: any; opts?: any; callId?: string }): Promise<ToolResult> {
+      async invoke(call: { tool: string; args: any; opts?: any; callId?: string; name?: string }): Promise<ToolResult> {
         const refused = refuseWithheld(call.tool, withheld);
         if (refused) return refused;
         // A subagent's session is never offered a tool that acts as the agent; a program of its could still name one.
