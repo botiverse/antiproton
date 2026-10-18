@@ -17,7 +17,7 @@
  * body. Same key with any field different is 409, never a quiet update — Raft edits through PATCH (and the
  * model through PUT …/model), and a delayed POST retry must not overwrite an edit that landed after it (Tenny's race).
  */
-import { OAUTH_STATUS_ERROR, RECONNECT_REASON } from "../github-refresh.ts";
+import { RECONNECT_REASON, type OAuthStatus } from "../github-refresh.ts";
 import type { Json } from "../../../src/core/types.ts";
 import { originProblem } from "../../../src/plugins/types.ts";
 import { secretShape } from "../secret-shape.ts";
@@ -25,7 +25,7 @@ import {
   MAIN_SESSION_ID, redactCredentials, TRACE_LIMIT_DEFAULT, TRACE_LIMIT_MAX, TRACE_WINDOW_MAX_MS, TRANSCRIPT_LIMIT_DEFAULT, TRANSCRIPT_LIMIT_MAX,
   type EvalTranscript, type TraceQuery, type TraceWindow,
 } from "../eval-read.ts";
-import { AGENT_BUDGETS, type AgentBudget, type ConnectionRegistry, type Connector, type ConnectorRefresh, type ConnectorStore, type ProviderTokenIdentity, type ProvisionRegistry, type ProvisionedAgent } from "../control-plane.ts";
+import { AGENT_BUDGETS, type AgentBudget, type ConnectionRegistry, type ConnectorRefresh, type ConnectorStore, type ProviderTokenIdentity, type ProvisionRegistry, type ProvisionedAgent } from "../control-plane.ts";
 import { PLANS, type Plan, type TenantPlanStore } from "../spend-limit.ts";
 import { CONNECTION_PROVIDERS, returnUrlProblem, scopesFor, type ConnectionProvider } from "./connect.ts";
 import { surface, surfaceReadOf, type SurfaceDeps } from "../agent-surface/surface.ts";
@@ -1037,16 +1037,18 @@ async function connection(
     const all = await c.connectors.list(tenantId, p);
     const connectors = all.map((k) => ({
       id: k.id, account: k.account, creatorRaftUserId: k.creatorRaftUserId, createdAt: new Date(k.createdAt).toISOString(), current: k.id === current,
-      ...needsReconnect(k.brokenAt),
+      ...oauthState(k.brokenAt ?? null, k.lastCheckedAt ?? k.brokenAt ?? k.createdAt),
     }));
     // A connection GitHub refused to renew is not connected, though its row stays: which account it was, and that
     // only connecting again mends it, in the words Raft's own OAuth connectors use (`oauthStatus`).
     const k = current === null ? undefined : all.find((x) => x.id === current);
+    // A row with no connector has no checks of its own recorded: its connect, or the refusal that broke it.
     const brokenAt = (k ? k.brokenAt : got?.brokenAt) ?? null;
+    const checkedAt = k ? (k.lastCheckedAt ?? k.brokenAt ?? k.createdAt) : (got?.brokenAt ?? got?.connectedAt ?? null);
     return ok({
       ...(got
-        ? { connected: brokenAt === null, connectorId: current, account: got.account, connectedAt: new Date(got.connectedAt).toISOString(), connectedBy: got.connectedBy, ...needsReconnect(brokenAt) }
-        : { connected: false, connectorId: null, account: null, connectedAt: null, connectedBy: null }),
+        ? { connected: brokenAt === null, connectorId: current, account: got.account, connectedAt: new Date(got.connectedAt).toISOString(), connectedBy: got.connectedBy, ...oauthState(brokenAt, checkedAt) }
+        : { connected: false, connectorId: null, account: null, connectedAt: null, connectedBy: null, oauthStatus: "disconnected" as OAuthStatus, lastCheckError: null, lastCheckedAt: null }),
       connectors,
     });
   }
@@ -1062,6 +1064,8 @@ async function connection(
     const r = await c.attach(tenantId, row.agentId, p, k.sealed, k.refresh ? { ...k.refresh, connectorId: k.id } : null);
     if (!r.ok) return fail({ status: 422, code: "connect_failed", message: r.error });
     const at = deps.now();
+    // The attach checked the credential with GitHub and it was taken.
+    await c.connectors.checked?.(tenantId, k.id, at);
     await c.registry.put({ tenantId, raftAgentId: row.raftAgentId, provider: p, account: k.account, connectedBy: acting.actingRaftUserId, connectedAt: at, connectorId: k.id });
     await c.connectors.record({ tenantId, connectorId: k.id, raftAgentId: row.raftAgentId, action: "bind", ...acting, at });
     return ok({ connected: true, connectorId: k.id, account: k.account, connectedAt: new Date(at).toISOString(), connectedBy: acting.actingRaftUserId });
@@ -1080,9 +1084,17 @@ async function connection(
   return null;
 }
 
-/** The fields a connection GitHub refused to renew carries (0023); none for one that works. */
-function needsReconnect(brokenAt: Connector["brokenAt"]): Record<string, string> {
-  return brokenAt == null ? {} : { oauthStatus: OAUTH_STATUS_ERROR, oauthError: RECONNECT_REASON, oauthErrorAt: new Date(brokenAt).toISOString() };
+/**
+ * A connection's state in the words Raft's managed-MCP OAuth connectors use (0023): `error` once GitHub refused to
+ * renew it, with the reason Raft shows; `lastCheckedAt` the last check whatever came of it.
+ */
+function oauthState(brokenAt: number | null, checkedAt: number | null):
+  { oauthStatus: OAuthStatus; lastCheckError: string | null; lastCheckedAt: string | null } {
+  return {
+    oauthStatus: brokenAt === null ? "connected" : "error",
+    lastCheckError: brokenAt === null ? null : RECONNECT_REASON,
+    lastCheckedAt: checkedAt === null ? null : new Date(checkedAt).toISOString(),
+  };
 }
 
 type Acting = { actingRaftUserId: string; actingRole: "creator" | "admin" };

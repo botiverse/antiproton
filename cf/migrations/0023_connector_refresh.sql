@@ -15,6 +15,9 @@ ALTER TABLE connectors ADD COLUMN refreshing_until INTEGER;
 -- a reconnect, which makes a new connector, and by a rotation.
 ALTER TABLE connectors ADD COLUMN broken_at INTEGER;
 ALTER TABLE connectors ADD COLUMN broken_reason TEXT;
+-- When the connection was last checked, whatever came of it: the connect, a pointing at an agent, a renewal,
+-- and a refused one all set it. What Raft shows as `lastCheckedAt`.
+ALTER TABLE connectors ADD COLUMN last_checked_at INTEGER;
 
 -- The same state for an agent's connection that has no connector (made before 0012). Cleared when the
 -- row is written again, which a reconnect does.

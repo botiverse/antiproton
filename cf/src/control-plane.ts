@@ -573,6 +573,8 @@ export interface Connector {
   /** Set when GitHub refused the renewal: the connection needs its person to connect again (0023). */
   brokenAt?: number | null;
   brokenReason?: string | null;
+  /** When it was last checked, whatever came of it (0023); null on a row from before. */
+  lastCheckedAt?: number | null;
 }
 
 /** What renews a connector's access token. Times are ms since the epoch. */
@@ -601,6 +603,8 @@ export interface ConnectorStore {
   list(tenantId: string, provider: string): Promise<Connector[]>;
   remove(tenantId: string, id: string): Promise<boolean>;
   record(e: ConnectorEvent): Promise<void>;
+  /** Its credential was checked and taken (pointing an agent at it): the time Raft shows as `lastCheckedAt`. */
+  checked?(tenantId: string, id: string, at: number): Promise<void>;
 }
 
 export function d1Connectors(db: D1Database): ConnectorStore {
@@ -610,9 +614,14 @@ export function d1Connectors(db: D1Database): ConnectorStore {
       const f = c.refresh ?? null;
       await db.prepare(
         `INSERT INTO connectors (id, tenant_id, provider, account, creator_raft_user_id, ciphertext, iv, created_at,
-           refresh_ciphertext, refresh_iv, expires_at, refresh_expires_at, refreshed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           refresh_ciphertext, refresh_iv, expires_at, refresh_expires_at, refreshed_at, last_checked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).bind(c.id, c.tenantId, c.provider, c.account, c.creatorRaftUserId, c.sealed.ciphertext, c.sealed.iv, c.createdAt,
-        f?.sealed.ciphertext ?? null, f?.sealed.iv ?? null, f?.expiresAt ?? null, f?.refreshExpiresAt ?? null, f ? c.createdAt : null).run();
+        f?.sealed.ciphertext ?? null, f?.sealed.iv ?? null, f?.expiresAt ?? null, f?.refreshExpiresAt ?? null, f ? c.createdAt : null,
+        // Made from a confirm, whose attach has just checked the credential with GitHub.
+        c.createdAt).run();
+    },
+    async checked(tenantId, id, at) {
+      await db.prepare("UPDATE connectors SET last_checked_at = ? WHERE tenant_id = ? AND id = ?").bind(at, tenantId, id).run();
     },
     async get(tenantId, id) {
       const r = await db.prepare("SELECT * FROM connectors WHERE tenant_id = ? AND id = ?").bind(tenantId, id).first<any>();
@@ -642,6 +651,7 @@ function connectorRow(r: any): Connector {
     refresh: r.refresh_ciphertext == null ? null
       : { sealed: { ciphertext: String(r.refresh_ciphertext), iv: String(r.refresh_iv) }, expiresAt: n(r.expires_at), refreshExpiresAt: n(r.refresh_expires_at) },
     brokenAt: n(r.broken_at), brokenReason: r.broken_reason == null ? null : String(r.broken_reason),
+    lastCheckedAt: n(r.last_checked_at),
   };
 }
 
@@ -688,16 +698,16 @@ export function d1ConnectorGrants(db: D1Database): ConnectorGrants {
     async rotate(tenantId, id, next, expect) {
       const r = await db.prepare(
         `UPDATE connectors SET ciphertext = ?, iv = ?, refresh_ciphertext = ?, refresh_iv = ?, expires_at = ?, refresh_expires_at = ?,
-           refreshed_at = ?, refreshing_until = NULL, broken_at = NULL, broken_reason = NULL
+           refreshed_at = ?, last_checked_at = ?, refreshing_until = NULL, broken_at = NULL, broken_reason = NULL
          WHERE tenant_id = ? AND id = ? AND refresh_ciphertext = ?`,
       ).bind(next.sealed.ciphertext, next.sealed.iv, next.refresh.sealed.ciphertext, next.refresh.sealed.iv, next.refresh.expiresAt,
-        next.refresh.refreshExpiresAt, next.at, tenantId, id, expect).run();
+        next.refresh.refreshExpiresAt, next.at, next.at, tenantId, id, expect).run();
       return Number(r.meta?.changes ?? 0) > 0;
     },
     async markBroken(tenantId, id, reason, at) {
       const r = await db.prepare(
-        "UPDATE connectors SET broken_at = ?, broken_reason = ?, refreshing_until = NULL WHERE tenant_id = ? AND id = ? AND broken_at IS NULL",
-      ).bind(at, reason, tenantId, id).run();
+        "UPDATE connectors SET broken_at = ?, broken_reason = ?, last_checked_at = ?, refreshing_until = NULL WHERE tenant_id = ? AND id = ? AND broken_at IS NULL",
+      ).bind(at, reason, at, tenantId, id).run();
       const changed = Number(r.meta?.changes ?? 0) > 0;
       if (changed) {
         await db.prepare(

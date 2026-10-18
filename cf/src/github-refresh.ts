@@ -32,7 +32,7 @@ export const LEASE_MS = 30_000;
  * How a dead connection is said to Raft: the words Raft's own managed-MCP OAuth connectors use for the same
  * state, so it can render both alike. What GitHub actually said is kept beside it (`broken_reason`), not here.
  */
-export const OAUTH_STATUS_ERROR = "error";
+export type OAuthStatus = "connected" | "disconnected" | "error";
 export const RECONNECT_REASON = "OAuth authorization expired; reconnect required";
 
 /** What renews one mount's access token. Sealed as JSON under `oauth:<name>`. */

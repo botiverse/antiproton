@@ -100,13 +100,14 @@ Connect GitHub hands out expiring user tokens (8 hours, renewed with a single-us
 months). The deployment renews them (cf/src/github-refresh.ts); when GitHub refuses a renewal, or still answers `401`
 for a renewed token, the connection is marked as needing reconnecting and only its person can mend it.
 
-**Where it shows.** Raft's `GET …/connections/github` answers `connected: false, oauthStatus: "error"`
+**Where it shows.** Raft's `GET …/connections/github` answers `connected: false, oauthStatus: "error"` and
+`lastCheckError`
 ([`agent-surface.md`](agent-surface.md#the-agents-github-connection-connectionsgithub)), and the agent's GitHub tools say
 the user must reconnect GitHub. In D1 (`antiproton-control`):
 
 ```sql
 -- Connectors that need reconnecting, and what GitHub said.
-SELECT tenant_id, id, account, broken_at, broken_reason, refreshed_at, expires_at FROM connectors WHERE broken_at IS NOT NULL;
+SELECT tenant_id, id, account, broken_at, broken_reason, refreshed_at, last_checked_at, expires_at FROM connectors WHERE broken_at IS NOT NULL;
 -- The agents pointed at one of them.
 SELECT raft_agent_id FROM provisioned_connections WHERE tenant_id = '<tenantId>' AND connector_id = '<connectorId>';
 -- When it was marked (`acting_role` system), beside who made and pointed it.

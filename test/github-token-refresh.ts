@@ -204,6 +204,8 @@ await check("the exchange keeps the refresh pair and both lifetimes, and the con
   must(grant.refreshToken?.startsWith("ghr_") && grant.expiresAt! > Date.now() + 7.9 * H && grant.refreshExpiresAt! > Date.now() + 180 * 24 * H, JSON.stringify({ ...grant, accessToken: "-", refreshToken: "-" }));
   must(keys.join(",") === "access_token,expires_in,refresh_token,refresh_token_expires_in,scope,token_type", `keys ${keys}`);
   const a = await w.agent("A1");
+  const none = await w.status("A1");
+  must(none.body.connected === false && none.body.oauthStatus === "disconnected" && none.body.lastCheckError === null && none.body.lastCheckedAt === null, none.text);
   const id = await w.connect(a);
   const row = w.db.raw.prepare("SELECT * FROM connectors WHERE id = ?").get(id) as any;
   must(row.refresh_ciphertext && row.refresh_iv && row.expires_at > Date.now() + 7.9 * H && row.refresh_expires_at > Date.now() + 180 * 24 * H && row.broken_at === null, JSON.stringify(row));
@@ -230,6 +232,8 @@ await check("a token within five minutes of its expiry is renewed before the cal
   const row = w.db.raw.prepare("SELECT * FROM connectors WHERE id = ?").get(id) as any;
   must(await after.open(after.kek, { ciphertext: row.ciphertext, iv: row.iv }) === after.token && row.refreshed_at, "the connector was not given the new pair");
   must(await after.open(after.kek, { ciphertext: row.refresh_ciphertext, iv: row.refresh_iv }) === after.rec.refreshToken, "the connector and the mount disagree on the refresh token");
+  // A renewal is a check: lastCheckedAt is its time, success or not.
+  must(row.last_checked_at === row.refreshed_at && (await w.status("A2")).body.lastCheckedAt === new Date(row.refreshed_at).toISOString(), `last_checked_at ${row.last_checked_at}, refreshed_at ${row.refreshed_at}`);
   w.dispose();
 });
 
@@ -255,6 +259,8 @@ await check("concurrent calls in one object, and an agent on the same connector 
   const id = await w.connect(a);
   const bound = await w.call("PUT", `/agents/by-raft-agent/B4/connections/github`, { connectorId: id, actingRaftUserId: "u_owner", actingRole: "creator" });
   must(bound.status === 200, `bind: ${bound.text}`);
+  const checked = (w.db.raw.prepare("SELECT created_at, last_checked_at FROM connectors WHERE id = ?").get(id) as any);
+  must(checked.last_checked_at >= checked.created_at && Date.parse((await w.status("B4")).body.lastCheckedAt) === checked.last_checked_at, `pointing an agent at it is a check: ${JSON.stringify(checked)}`);
   await w.expireAt(a, Date.now() + 30_000, id);
   await w.expireAt(b, Date.now() + 30_000);
   w.gh.s.delayMs = 50;
@@ -308,7 +314,9 @@ await check("a refused renewal marks the connection as needing a reconnect: in D
   const w = await world();
   const a = await w.agent("A6");
   const id = await w.connect(a);
-  must((await w.status("A6")).body.connected === true && (await w.status("A6")).body.oauthStatus === undefined, "a working connection says otherwise");
+  const before = await w.status("A6");
+  must(before.body.connected === true && before.body.oauthStatus === "connected" && before.body.lastCheckError === null && before.body.lastCheckedAt, `a working connection says otherwise: ${before.text}`);
+  must(before.body.connectors[0].oauthStatus === "connected" && before.body.connectors[0].lastCheckError === null, before.text);
   await w.expireAt(a, Date.now() + 30_000, id);
   // Expired at GitHub as well, and its refresh token no longer taken.
   w.gh.live.delete((await w.stored(a)).token!);
@@ -322,8 +330,10 @@ await check("a refused renewal marks the connection as needing a reconnect: in D
   const ev = w.db.raw.prepare("SELECT * FROM connector_events WHERE connector_id = ? AND action = 'broken'").all(id) as any[];
   must(ev.length === 1 && ev[0].acting_role === "system" && /bad_refresh_token/.test(ev[0].reason) && !/gh[ur]_/.test(JSON.stringify(ev)), JSON.stringify(ev));
   const got = await w.status("A6");
-  must(got.body.connected === false && got.body.oauthStatus === "error" && got.body.oauthError === RECONNECT_REASON && got.body.account === "octocat" && got.body.connectorId === id, got.text);
-  must(got.body.connectors[0].oauthStatus === "error" && !/gh[ur]_/.test(got.text), got.text);
+  must(got.body.connected === false && got.body.oauthStatus === "error" && got.body.lastCheckError === RECONNECT_REASON && got.body.account === "octocat" && got.body.connectorId === id, got.text);
+  must(got.body.lastCheckedAt === new Date(row.broken_at).toISOString() && got.body.lastCheckedAt > before.body.lastCheckedAt, `lastCheckedAt ${got.body.lastCheckedAt}`);
+  must(got.body.connectors[0].oauthStatus === "error" && got.body.connectors[0].lastCheckError === RECONNECT_REASON && !/gh[ur]_/.test(got.text), got.text);
+  must(!("oauthError" in got.body) && !("oauthErrorAt" in got.body), "the old field names are still sent");
   // Asked again, it does not go back to GitHub: the mount knows.
   const refreshes = w.gh.s.refreshes;
   must(!succeeded(await w.tool(a)) && w.gh.s.refreshes === refreshes, "a broken connection asked GitHub again");
@@ -331,7 +341,7 @@ await check("a refused renewal marks the connection as needing a reconnect: in D
   w.gh.s.refuse = false;
   const again = await w.connect(a, "pend_A6_again_01");
   const mended = await w.status("A6");
-  must(mended.body.connected === true && mended.body.oauthStatus === undefined && mended.body.connectorId === again, mended.text);
+  must(mended.body.connected === true && mended.body.oauthStatus === "connected" && mended.body.lastCheckError === null && mended.body.connectorId === again, mended.text);
   must(succeeded(await w.tool(a)), "the reconnected agent's call failed");
   w.dispose();
 });
@@ -351,11 +361,11 @@ await check("a connection with no connector (made before connectors) is marked o
   const row = w.db.raw.prepare("SELECT broken_at, broken_reason FROM provisioned_connections WHERE raft_agent_id = 'A12'").get() as any;
   must(row.broken_at && /bad_refresh_token/.test(row.broken_reason), JSON.stringify(row));
   const got = await w.status("A12");
-  must(got.body.connected === false && got.body.oauthStatus === "error" && got.body.oauthError === RECONNECT_REASON && got.body.connectorId === null, got.text);
+  must(got.body.connected === false && got.body.oauthStatus === "error" && got.body.lastCheckError === RECONNECT_REASON && got.body.connectorId === null, got.text);
   w.gh.s.refuse = false;
   await w.connect(a, "pend_A12_again_1");
   const mended = await w.status("A12");
-  must(mended.body.connected === true && mended.body.oauthStatus === undefined, mended.text);
+  must(mended.body.connected === true && mended.body.oauthStatus === "connected", mended.text);
   must((w.db.raw.prepare("SELECT broken_at FROM provisioned_connections WHERE raft_agent_id = 'A12'").get() as any).broken_at === null, "the row still says broken");
   w.dispose();
 });

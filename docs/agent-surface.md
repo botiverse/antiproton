@@ -726,14 +726,26 @@ route with other methods (`connection` in `cf/src/provision/handlers.ts`).
   "account": "octocat",
   "connectedAt": "2026-10-17T13:26:02.504Z",
   "connectedBy": "<raftUserId>",
+  "oauthStatus": "connected",
+  "lastCheckError": null,
+  "lastCheckedAt": "2026-10-17T13:26:02.504Z",
   "connectors": [
-    { "id": "con_…", "account": "octocat", "creatorRaftUserId": "<raftUserId>", "createdAt": "…", "current": true }
+    { "id": "con_…", "account": "octocat", "creatorRaftUserId": "<raftUserId>", "createdAt": "…", "current": true,
+      "oauthStatus": "connected", "lastCheckError": null, "lastCheckedAt": "…" }
   ]
 }
 ```
 
-With no connection, `connected` is `false` and the other fields are `null`. `connectors` lists the tenant's GitHub
-connectors whether or not this agent uses one.
+The connection's state uses the fields and words of Raft's own managed-MCP OAuth connectors, so Raft can show both
+alike. All three are always present, on the answer and on each connector in `connectors`:
+
+| Field | |
+|---|---|
+| `oauthStatus` | `connected` (working), `disconnected` (this agent has no connection; then `connected` is `false` and the other fields are `null`), or `error` (it needs reconnecting, below). A connector in `connectors` is `connected` or `error`. |
+| `lastCheckError` | `null`, or `"OAuth authorization expired; reconnect required"` with `error`. |
+| `lastCheckedAt` | When the connection was last checked, whatever came of it: the connect, pointing an agent at the connector, each renewal, and the refusal that broke it. An ordinary tool call is not recorded. For a connection made before connectors, its connect or the refusal. `null` with `disconnected`. |
+
+`connectors` lists the tenant's GitHub connectors whether or not this agent uses one.
 
 **An expiring connection.** GitHub's user tokens from this deployment's App last 8 hours, with a refresh token that
 lasts about 6 months and is single-use. The token is renewed by the deployment: before a call when it expires within
@@ -742,8 +754,7 @@ the person while that works. A connector is shared by the agents pointed at it, 
 lease on the connector, and reaches every agent on it.
 
 **A connection that needs reconnecting.** When GitHub refuses the renewal (`bad_refresh_token`: spent, expired, or the
-person revoked the App), or still answers `401` for the renewed token, only the person can mend it. The connection is
-then reported with the words Raft's own OAuth connectors use for the same state:
+person revoked the App), or still answers `401` for the renewed token, only the person can mend it:
 
 ```json
 {
@@ -753,18 +764,18 @@ then reported with the words Raft's own OAuth connectors use for the same state:
   "connectedAt": "…",
   "connectedBy": "<raftUserId>",
   "oauthStatus": "error",
-  "oauthError": "OAuth authorization expired; reconnect required",
-  "oauthErrorAt": "2026-10-17T23:28:42.744Z",
+  "lastCheckError": "OAuth authorization expired; reconnect required",
+  "lastCheckedAt": "2026-10-17T23:28:42.744Z",
   "connectors": [
     { "id": "con_…", "account": "octocat", "creatorRaftUserId": "<raftUserId>", "createdAt": "…", "current": true,
-      "oauthStatus": "error", "oauthError": "OAuth authorization expired; reconnect required", "oauthErrorAt": "…" }
+      "oauthStatus": "error", "lastCheckError": "OAuth authorization expired; reconnect required", "lastCheckedAt": "…" }
   ]
 }
 ```
 
 - `connected: false` with `connectorId` and `account` still set is this state and no other: which account it was, and
-  that it is not usable. A working connection carries no `oauthStatus` at all.
-- The same three fields are on the connector in `connectors`, so every agent pointed at it shows it.
+  that it is not usable.
+- The same fields are on the connector in `connectors`, so every agent pointed at it shows it.
 - The agent is told as well: a GitHub tool's result says `OAuth authorization expired; reconnect required` and that the
   user must reconnect GitHub, and that retrying will not help.
 - **Reconnecting** is the same flow as connecting (`POST`, then `POST …/confirm`). It makes a new connector, points
