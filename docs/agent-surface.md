@@ -821,7 +821,8 @@ POST /provision/agents/by-raft-agent/{raftAgentId}/connections/github
 
 The authorization must be **the connector's own GitHub account**. GitHub's numeric user id is compared, because a login
 can be renamed. A connector made before the id was kept (before migration 0024) is compared by login, ignoring case,
-and keeps the id from then on. Any other account is refused, and **nothing changes**: not the connector, not any
+both here and in the D1 write itself, and keeps the id from then on. Such a connector also learns the id at its first
+successful renewal, from GitHub's `GET /user` with the renewed token, but only when GitHub names the same login. Any other account is refused, and **nothing changes**: not the connector, not any
 agent's mount, not this agent. The agents on the connector never start acting as someone else:
 
 ```json

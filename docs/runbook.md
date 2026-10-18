@@ -162,8 +162,10 @@ still makes a new connector for that one agent, and the other agents stay on the
 at the new one. Nothing an operator writes to D1 brings a refused refresh token back.
 
 The reconnect has to be the connector's own GitHub account. `connectors.account_id` (migration 0024) is GitHub's
-numeric user id. It is null for a connector made before 0024, and then the login is compared until a reconnect
-stores the id. Any other account is `409 account_mismatch` and changes nothing. A reconnect in place shows as:
+numeric user id. It is null for a connector made before 0024, and then the login is compared until the id is stored.
+A reconnect stores it, and so does the connector's first successful renewal, best effort: a `github.account_id` log
+line says `filled`, `unknown` (`GET /user` did not answer; the renewal stands), `login-mismatch` (GitHub named another
+login, so the id is left null) or `failed`. Any other account is `409 account_mismatch` and changes nothing. A reconnect in place shows as:
 
 ```sql
 -- Who reconnected it, and in what role (`creator`, or `admin` on Raft's word).
