@@ -1404,6 +1404,8 @@ export class AgentRuntime {
       return done("ignored", MOUNT_REMOVED_REASON);
     }
     const installationId = accepting.installationId;
+    // Read before the checks below, which run with the write in one synchronous step (no await between).
+    const profile = profileOf((await this.store.loadAgent(tenantId, agentId))?.config);
     const key = result.dedupeKey ?? null;
     if (key && seenBefore(sql, hookId, key, now)) return done("duplicate", null, key);
     // Each 429 says when to come back (`Retry-After`): the rate's from the rows it counts, the queue's from its
@@ -1424,7 +1426,6 @@ export class AgentRuntime {
     // Under a profile a push is its plugin's wake, decided here, before anything of it is written: its text (Raft's notice,
     // which names conversations and senders) is never queued, posted or stored, and the plugin reads its events itself,
     // taking only its own (src/plugins/raftbench.ts). Answered as delivered, so the service does not send it again.
-    const profile = profileOf((await this.store.loadAgent(tenantId, agentId))?.config);
     if (profile) {
       askWake(sql, profileSpec(profile).alias, now);
       return done("delivered", `a wake for the ${profileSpec(profile).alias} plugin`, key);
