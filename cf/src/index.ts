@@ -232,7 +232,7 @@ export interface Env {
   SUBAGENT_ACTIVITY?: string;
   /**
    * Where `github.refresh` trace rows are forwarded (cf/src/github-refresh-forward.ts): Raft's trace-upload worker's
-   * base URL, and its write-only token (a secret). Forwarding is off unless both are set; DEPLOYMENT_ENV is what each
+   * base URL (a var), and its write-only bearer token (a secret). Forwarding is off unless both are set; DEPLOYMENT_ENV is what each
    * row says it came from. docs/runbook.md, "Forwarding github.refresh rows".
    */
   GITHUB_REFRESH_INGEST_URL?: string;

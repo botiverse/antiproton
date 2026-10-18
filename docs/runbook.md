@@ -195,9 +195,10 @@ worker writes them as OTLP logs to `otel.logs`; antiproton only posts to it (cf/
 **It is off** unless both of these are set on the deployment; with either missing nothing is sent, nothing is staged and
 no table is made:
 
-- `GITHUB_REFRESH_INGEST_URL`: the worker's base URL (a var or a secret);
-- `GITHUB_REFRESH_INGEST_TOKEN`: a dedicated write-only token for that endpoint, a secret, never in a wrangler config
-  or the repository. It is not a ScopeDB key: antiproton never talks to ScopeDB.
+- the Worker **var** `GITHUB_REFRESH_INGEST_URL`: the worker's base URL, without a path (the code appends
+  `/api/external/github-refresh`);
+- the Worker **secret** `GITHUB_REFRESH_INGEST_TOKEN`: a dedicated write-only bearer token for that endpoint, never in
+  a wrangler config or the repository. It is not a ScopeDB key: antiproton never talks to ScopeDB.
 
 `DEPLOYMENT_ENV` (`production` in cf/wrangler.jsonc, `preview` in cf/wrangler.preview.jsonc) is what each row says in
 `env`; a deployment without it forwards nothing.
@@ -223,17 +224,20 @@ dropped (`lost`).
 
 **Turning it on, preview first.**
 
-1. `wrangler secret put GITHUB_REFRESH_INGEST_TOKEN --config cf/wrangler.preview.jsonc` (the preview token), and the
-   same for `GITHUB_REFRESH_INGEST_URL` (the staging worker's base URL, no trailing path).
+1. `wrangler secret put GITHUB_REFRESH_INGEST_TOKEN --config cf/wrangler.preview.jsonc` (the preview token), then add
+   `"GITHUB_REFRESH_INGEST_URL": "<staging worker's base URL>"` to `vars` in `cf/wrangler.preview.jsonc` and deploy the
+   preview. It is a var in the config rather than one set in the dashboard, because a deploy replaces the dashboard's
+   vars with the config's.
 2. Make a renewal happen on a preview agent with an expiring GitHub token, or wait for one.
 3. Check it: `GET $HOST/admin/diagnose?tenantId=<tenantId>&agentId=<agentId>` has `githubRefreshForward`: `stagedThrough` moving, `queued` 0,
    `backoff` null and nothing in `recent` (or the reasons it was not sent: `auth_or_off` with 401 is the token, with
    404 the receiver switched off). Workers Logs has `github.refresh.forward` lines (`result` `sent`, `kept` or
    `dropped`, with `reason` and `status`; never the URL or the token), though the object's lines can be dropped
    (above). On the receiving side, the rows are in `otel.logs` with `env` `preview`.
-4. Then the same with `--config cf/wrangler.jsonc` for production.
+4. Then the same for production: the secret with `--config cf/wrangler.jsonc`, the var in `cf/wrangler.jsonc`.
 
-**Turning it off.** `wrangler secret delete GITHUB_REFRESH_INGEST_TOKEN` (or delete the URL). From the next pass nothing
+**Turning it off.** `wrangler secret delete GITHUB_REFRESH_INGEST_TOKEN --config <that deployment's config>` (immediate),
+or remove the `GITHUB_REFRESH_INGEST_URL` var and deploy. From the next pass nothing
 is staged or sent; whatever an object had queued stays in its queue, untouched, and goes out if it is turned back on.
 Nothing else changes: the R2 export carries every row either way.
 

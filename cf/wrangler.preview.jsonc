@@ -31,8 +31,9 @@
     ]
   },
   // Forwarding `github.refresh` trace rows to Raft's trace-upload worker (cf/src/github-refresh-forward.ts) is off
-  // until BOTH of these are set, and neither is written here: GITHUB_REFRESH_INGEST_URL (the worker's base URL, a
-  // var or a secret) and GITHUB_REFRESH_INGEST_TOKEN (its dedicated write-only token, a secret only:
+  // until BOTH of these are set, and neither is set yet: the Worker var GITHUB_REFRESH_INGEST_URL (the worker's base
+  // URL; the code appends /api/external/github-refresh), to be added to "vars" below once the URL is known, and the
+  // Worker secret GITHUB_REFRESH_INGEST_TOKEN (its dedicated write-only bearer token, never written here:
   // `wrangler secret put GITHUB_REFRESH_INGEST_TOKEN --config cf/wrangler.preview.jsonc`). docs/runbook.md, "Forwarding github.refresh rows".
   "vars": {
     "DEEPSEEK_BASE_URL": "https://api.deepseek.com",
