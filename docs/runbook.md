@@ -155,6 +155,17 @@ marked), `interrupted-before` (a renewal in this object stopped part-way; the ne
 token. Each connect also writes `connect.exchange` with the **names** of the keys GitHub's answer carried: one with
 `expires_in` and `refresh_token` is an expiring token (`expiring: true`).
 
+**In the trace.** The renewal runs in the agent's object, whose lines Workers Logs can drop (above, "Logs and what an
+object did"): on 2026-10-18 a connector rotated at 18:38:04Z with no `github.refresh` line, while the R2 trace export
+held that same alarm pass's `model.call` row, whose log line was missing too. So every outcome is also a
+`github.refresh` row in the agent's trace (`GET …/trace`, and the export under `trace/<tenantId>/<agentId>/`): `status`
+the outcome, `verdict` `ok` for `rotated` and `adopted`, `attrs.scope` `connector` (the connector's own renewal) or
+`mount` (what this agent's mount took), `connectorId`, `mount`, `why`, `attempt`, `stored`, and `reasonCode`: the
+OAuth error code (`oauth:bad_refresh_token`; `oauth:other` for a code not known to be GitHub's), `http-<status>`,
+`no-answer`, `no-refresh-token`, `d1-write-failed`, `propagate-error`, `no-app`, `lease-timeout`, `connector-gone`,
+`nothing-to-renew`, `refused` or `other` (`reasonCode` in cf/src/github-refresh.ts). The reason's own text stays in
+the log line only.
+
 **Mending it** is the person's: reconnect from the agent's page. Raft sends the broken connector's id with the
 connect (`connectorId`, [`agent-surface.md`](agent-surface.md#reconnecting-a-connector-in-place)), so the connector
 is mended in place, keeps its id, and every agent on it gets the new pair in the same call. A connect without the id

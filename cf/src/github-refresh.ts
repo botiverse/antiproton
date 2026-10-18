@@ -19,6 +19,7 @@
  *  - another agent's object meets the connector's lease in D1.
  */
 import { logEvent } from "../../src/core/log.ts";
+import { appendTrace, type TraceVerdict } from "../../src/trace/outbox.ts";
 import { open, seal, type Sealed } from "../../src/runtime/secrets.ts";
 import type { StorageAdapter } from "../../src/core/store.ts";
 import type { ConnectorGrant, ConnectorGrants } from "./control-plane.ts";
@@ -79,7 +80,68 @@ interface ConnectorDeps {
   fetch?: typeof fetch;
   now(): number;
   sleep?(ms: number): Promise<void>;
+  /** Told every outcome as it is logged: an agent's object writes it to its trace (`GithubRefresher`). */
+  note?(e: RefreshEvent): void;
 }
+
+/** What a renewal can end in: the `outcome` of its `github.refresh` line, and the `status` of its trace row. */
+export type RenewalOutcome = "rotated" | "adopted" | "broken" | "unavailable" | "store-failed" | "kept-unstored" | "interrupted-before" | "propagate-failed";
+
+/** One `github.refresh` line. `reason` is said in the log only; the trace row carries `code`, or a code read from it. */
+export interface RefreshEvent {
+  tenantId: string;
+  agentId?: string;
+  mount?: string;
+  connectorId?: string | null;
+  why?: Why;
+  outcome: RenewalOutcome;
+  attempt?: number;
+  stored?: boolean;
+  keys?: string;
+  reason?: string;
+  /** The fixed code for a reason that is not one of GitHub's or this module's own (a D1 error, say). */
+  code?: string;
+}
+
+function report(e: RefreshEvent, note?: (e: RefreshEvent) => void): void {
+  const { code: _code, ...line } = e;
+  logEvent("github.refresh", line);
+  try { note?.(e); } catch { /* a trace row is never worth a failed renewal */ }
+}
+
+/**
+ * The OAuth error codes a trace row may name. Anything else GitHub says is `oauth:other`: the row is a fixed vocabulary,
+ * so nothing GitHub or an error message put in a reason (its own words, a value echoed back) is carried into the export.
+ */
+const OAUTH_CODES = new Set(["bad_refresh_token", "invalid_grant", "unauthorized", "temporarily_unavailable", "slow_down",
+  "incorrect_client_credentials", "invalid_client", "invalid_request", "unsupported_grant_type", "access_denied", "server_error"]);
+
+/** This module's and cf/src/github-token.ts's own reasons, as codes. */
+const REASON_CODES: Array<[RegExp, string]> = [
+  [/^the token endpoint did not answer\b/, "no-answer"],
+  [/^(no refresh token in the answer|GitHub answered without a refresh token)$/, "no-refresh-token"],
+  [/^this deployment has no GitHub App credentials\b/, "no-app"],
+  [/^another renewal of this connection did not finish$/, "lease-timeout"],
+  [/^(the connector is gone|the connection was removed)$/, "connector-gone"],
+  [/^this mount has nothing to renew with$/, "nothing-to-renew"],
+  [/^refused$/, "refused"],
+];
+
+/** A reason as a code from a fixed set: never the reason's own text, which can carry what someone else wrote. */
+export function reasonCode(reason: string | undefined): string | undefined {
+  if (reason === undefined) return undefined;
+  const http = /^the token endpoint answered (\d{3}) without an OAuth error$/.exec(reason);
+  if (http) return `http-${http[1]}`;
+  for (const [re, code] of REASON_CODES) if (re.test(reason)) return code;
+  const oauth = /^([a-z_]{1,64})(?::|$)/.exec(reason)?.[1];
+  if (oauth) return OAUTH_CODES.has(oauth) ? `oauth:${oauth}` : "oauth:other";
+  return "other";
+}
+
+const VERDICTS: Record<RenewalOutcome, TraceVerdict> = {
+  rotated: "ok", adopted: "ok", broken: "failed", unavailable: "failed", "store-failed": "failed", "kept-unstored": "failed",
+  "interrupted-before": "cancelled", "propagate-failed": "failed",
+};
 
 /** How many times a new pair's write to D1 is tried before the pair is handed back unstored (`UnstoredPair`). */
 export const ROTATE_ATTEMPTS = 3;
@@ -174,20 +236,20 @@ export async function renewConnector(d: ConnectorDeps, tenantId: string, id: str
     for (let attempt = 1; ; attempt++) {
       try { landed = await d.grants.rotate(tenantId, id, { sealed, refresh, at: d.now() }, k.refresh.sealed.ciphertext, holder); break; }
       catch (e) {
-        logEvent("github.refresh", { tenantId, connectorId: id, why, outcome: "store-failed", attempt, reason: String((e as Error)?.message ?? e).slice(0, 120) });
+        report({ tenantId, connectorId: id, why, outcome: "store-failed", attempt, reason: String((e as Error)?.message ?? e).slice(0, 120), code: "d1-write-failed" }, d.note);
         // The lease is left held: a renewal behind it would trade the spent token and mark the connection broken.
         if (attempt >= ROTATE_ATTEMPTS) throw new UnstoredPair(pair, e);
       }
     }
     // Not landed means the connector moved past the lease's expiry; the pair just traded is still GitHub's newest.
-    logEvent("github.refresh", { tenantId, connectorId: id, why, outcome: "rotated", stored: landed, keys: r.keys.join(" ") });
+    report({ tenantId, connectorId: id, why, outcome: "rotated", stored: landed, keys: r.keys.join(" ") }, d.note);
     if (landed && !k.accountId) await fillAccountId(d, tenantId, id, k.account, r.grant.accessToken);
     return pair;
   }
   if (r.ok) {
     // A refresh that answers a token without a refresh token beside it has nothing to renew it with next time.
     await d.grants.release(tenantId, id, holder);
-    logEvent("github.refresh", { tenantId, connectorId: id, why, outcome: "unavailable", reason: "no refresh token in the answer", keys: r.keys.join(" ") });
+    report({ tenantId, connectorId: id, why, outcome: "unavailable", reason: "no refresh token in the answer", keys: r.keys.join(" ") }, d.note);
     return { ok: false, broken: false, reason: "GitHub answered without a refresh token" };
   }
   if (r.kind === "refused") {
@@ -202,11 +264,11 @@ export async function renewConnector(d: ConnectorDeps, tenantId: string, id: str
       if (!now) return { ok: false, broken: false, reason: "the connector is gone", missing: true };
       return { ok: false, broken: true, reason: now.brokenReason ?? r.reason };
     }
-    logEvent("github.refresh", { tenantId, connectorId: id, why, outcome: "broken", reason: r.reason });
+    report({ tenantId, connectorId: id, why, outcome: "broken", reason: r.reason }, d.note);
     return { ok: false, broken: true, reason: r.reason };
   }
   await d.grants.release(tenantId, id, holder);
-  logEvent("github.refresh", { tenantId, connectorId: id, why, outcome: "unavailable", reason: r.reason });
+  report({ tenantId, connectorId: id, why, outcome: "unavailable", reason: r.reason }, d.note);
   return { ok: false, broken: false, reason: r.reason };
 }
 
@@ -276,12 +338,29 @@ export class GithubRefresher {
     await this.#d.store.putSecret(tenantId, agentId, OAUTH_PREFIX + name, s);
   }
 
-  /** A connector's pair, renewed first if it is about to expire: for pointing another agent at it. */
-  async connectorPair(tenantId: string, connectorId: string): Promise<Renewed> {
+  /** A connector's pair, renewed first if it is about to expire: for pointing an agent (`agentId`, this object's) at it. */
+  async connectorPair(tenantId: string, connectorId: string, agentId?: string): Promise<Renewed> {
     const kek = await this.#d.kek;
     if (!kek || !this.#d.grants) return { ok: false, broken: false, reason: "this deployment keeps no connectors" };
-    return renewConnector({ grants: this.#d.grants, kek, app: this.#d.app, fetch: this.#d.fetch, now: () => this.#now(), sleep: (ms) => this.#sleep(ms) },
-      tenantId, connectorId, "expiring", null);
+    return renewConnector({ grants: this.#d.grants, kek, app: this.#d.app, fetch: this.#d.fetch, now: () => this.#now(), sleep: (ms) => this.#sleep(ms),
+      note: (e) => this.#trace({ ...e, agentId }, "connector") }, tenantId, connectorId, "expiring", null);
+  }
+
+  /** A mount's outcome: its line, and its row in this object's trace. */
+  #report(e: RefreshEvent): void { report(e, (x) => this.#trace(x, "mount")); }
+
+  /**
+   * The outcome as a `github.refresh` trace row (src/trace/outbox.ts), which reaches the trace export in R2 even when
+   * Workers Logs drops the object's line (docs/runbook.md). Ids and fixed codes only: no token, and no reason's text.
+   */
+  #trace(e: RefreshEvent, scope: "connector" | "mount"): void {
+    if (!e.agentId) return;
+    const at = this.#now();
+    const attrs: Record<string, unknown> = { scope, connectorId: e.connectorId ?? undefined, mount: e.mount, why: e.why, attempt: e.attempt,
+      stored: e.stored, reasonCode: e.code ?? reasonCode(e.reason) };
+    for (const k of Object.keys(attrs)) if (attrs[k] === undefined || attrs[k] === null) delete attrs[k];
+    appendTrace(this.#d.sql, [{ at, tenantId: e.tenantId, agentId: e.agentId, kind: "github.refresh",
+      spanId: `refresh_${crypto.randomUUID()}`, status: e.outcome, verdict: VERDICTS[e.outcome], attrs }]);
   }
 
   /** Move what renews a mount's secret with it, when the mount is renamed. */
@@ -342,7 +421,7 @@ export class GithubRefresher {
     // Held by another runtime in this object: wait for it, then read what it wrote. Past its time, it died mid-way.
     // Read and taken with no await in between, so two runtimes cannot both find it free.
     for (let g = held(); g && g.owner !== this.#owner && Number(g.until) > this.#now(); g = held()) await this.#sleep(250);
-    if (held()) logEvent("github.refresh", { tenantId, agentId, mount: name, why, outcome: "interrupted-before" });
+    if (held()) this.#report({ tenantId, agentId, mount: name, why, outcome: "interrupted-before" });
     sql.exec("INSERT OR REPLACE INTO oauth_refreshing(name, until, owner) VALUES (?, ?, ?)", gname, this.#now() + LEASE_MS, this.#owner);
     try {
       return await this.#renew(tenantId, agentId, name, why, stale);
@@ -373,14 +452,14 @@ export class GithubRefresher {
     if (rec.connectorId && this.#d.grants) {
       let r: Renewed;
       try {
-        r = await renewConnector({ grants: this.#d.grants, kek, app: this.#d.app, fetch: this.#d.fetch, now: () => this.#now(), sleep: (ms) => this.#sleep(ms) },
-          tenantId, rec.connectorId, why, stale ?? current);
+        r = await renewConnector({ grants: this.#d.grants, kek, app: this.#d.app, fetch: this.#d.fetch, now: () => this.#now(), sleep: (ms) => this.#sleep(ms),
+          note: (e) => this.#trace({ ...e, agentId, mount: name }, "connector") }, tenantId, rec.connectorId, why, stale ?? current);
       } catch (e) {
         // D1 would not take the new pair. GitHub has spent the old one, so this mount keeps the new one before the
         // error goes on: its own calls keep working, and the pair is somewhere rather than nowhere.
         if (e instanceof UnstoredPair) {
           await this.#write(tenantId, agentId, name, current, { ...rec, refreshToken: e.pair.refreshToken, expiresAt: e.pair.expiresAt, refreshExpiresAt: e.pair.refreshExpiresAt }, e.pair.accessToken);
-          logEvent("github.refresh", { tenantId, agentId, mount: name, connectorId: rec.connectorId, why, outcome: "kept-unstored" });
+          this.#report({ tenantId, agentId, mount: name, connectorId: rec.connectorId, why, outcome: "kept-unstored" });
         }
         throw e;
       }
@@ -388,7 +467,7 @@ export class GithubRefresher {
         // Also when only the mount's own broken flag is stale: the connector says it is healthy.
         if (r.accessToken !== current || r.expiresAt !== rec.expiresAt || rec.brokenAt) {
           await this.#write(tenantId, agentId, name, current, { ...rec, refreshToken: r.refreshToken, expiresAt: r.expiresAt, refreshExpiresAt: r.refreshExpiresAt }, r.accessToken);
-          logEvent("github.refresh", { tenantId, agentId, mount: name, connectorId: rec.connectorId, why, outcome: r.rotated ? "rotated" : "adopted" });
+          this.#report({ tenantId, agentId, mount: name, connectorId: rec.connectorId, why, outcome: r.rotated ? "rotated" : "adopted" });
         }
         // Not waited for: the pair is in D1 already, and this call's caller is owed its answer. An agent it does not
         // reach takes the pair on its own next 401; its sandbox's egress has no 401 to learn from and keeps the spent
@@ -396,7 +475,7 @@ export class GithubRefresher {
         if (r.rotated && this.#d.propagate) {
           const connectorId = rec.connectorId;
           const p = this.#d.propagate(tenantId, connectorId, agentId).catch((e) =>
-            logEvent("github.refresh", { tenantId, agentId, connectorId, outcome: "propagate-failed", reason: String((e as Error)?.message ?? e).slice(0, 120) }));
+            this.#report({ tenantId, agentId, mount: name, connectorId, outcome: "propagate-failed", reason: String((e as Error)?.message ?? e).slice(0, 120), code: "propagate-error" }));
           this.#d.waitUntil?.(p);
         }
         return r;
@@ -420,7 +499,7 @@ export class GithubRefresher {
     if (r.ok && r.grant.refreshToken) {
       const next = { ...rec, refreshToken: r.grant.refreshToken, expiresAt: r.grant.expiresAt, refreshExpiresAt: r.grant.refreshExpiresAt, rotatedAt: now };
       await this.#write(tenantId, agentId, name, current, next, r.grant.accessToken);
-      logEvent("github.refresh", { tenantId, agentId, mount: name, why, outcome: "rotated", keys: r.keys.join(" ") });
+      this.#report({ tenantId, agentId, mount: name, why, outcome: "rotated", keys: r.keys.join(" ") });
       return { ok: true, accessToken: r.grant.accessToken, refreshToken: next.refreshToken, expiresAt: next.expiresAt, refreshExpiresAt: next.refreshExpiresAt, rotated: true };
     }
     if (!r.ok && r.kind === "refused") {
@@ -428,7 +507,7 @@ export class GithubRefresher {
       return { ok: false, broken: true, reason: r.reason };
     }
     const reason = r.ok ? "GitHub answered without a refresh token" : r.reason;
-    logEvent("github.refresh", { tenantId, agentId, mount: name, why, outcome: "unavailable", reason });
+    this.#report({ tenantId, agentId, mount: name, why, outcome: "unavailable", reason });
     return { ok: false, broken: false, reason };
   }
 
@@ -461,6 +540,6 @@ export class GithubRefresher {
       if (rec.connectorId) await this.#d.grants.markBroken(tenantId, rec.connectorId, reason, at, null, null);
       else await this.#d.grants.markAgentBroken(tenantId, agentId, "github", reason, at);
     }
-    logEvent("github.refresh", { tenantId, agentId, mount: name, connectorId: rec.connectorId, outcome: "broken", reason });
+    this.#report({ tenantId, agentId, mount: name, connectorId: rec.connectorId, outcome: "broken", reason });
   }
 }
