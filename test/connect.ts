@@ -5,6 +5,7 @@
  * Raft as pending, with the id and the initiator — never the credential, and never yet on the mount.
  */
 import { connectCallback, connectLink, connectStart, CONNECT_CALLBACK_PATH, isConnectCallback, type ConnectDeps } from "../cf/src/provision/connect.ts";
+import { setLogSink } from "../src/core/log.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void>) {
@@ -25,8 +26,11 @@ function deps(over: Partial<ConnectDeps> = {}) {
     registry: {
       async consumeLink(nonce) { if (used.has(nonce)) return false; used.add(nonce); return true; },
     },
-    async hold(tenantId, agentId, plugin, token, id, exp, raftUserId) { held.push({ tenantId, agentId, plugin, token, id, exp, raftUserId }); return { ok: true }; },
-    async exchange(code, redirectUri) { exchanged.push(`${code}@${redirectUri}`); return TOKEN; },
+    async hold(tenantId, agentId, plugin, grant, id, exp, raftUserId) { held.push({ tenantId, agentId, plugin, token: grant.accessToken, grant, id, exp, raftUserId }); return { ok: true }; },
+    async exchange(code, redirectUri) {
+      exchanged.push(`${code}@${redirectUri}`);
+      return { grant: { accessToken: TOKEN, refreshToken: null, expiresAt: null, refreshExpiresAt: null }, keys: ["access_token", "scope", "token_type"] };
+    },
     now: () => clock,
     ...over,
   };
@@ -91,6 +95,25 @@ await check("the callback holds the token in the agent's object and sends Raft o
   must(x.held.length === 1 && x.held[0].plugin === "github" && x.held[0].token === TOKEN && x.held[0].agentId === "raft_a1" &&
     x.held[0].raftUserId === "u_owner" && x.held[0].exp > x.d.now(), JSON.stringify(x.held));
   must(x.exchanged[0] === `c0de@${ORIGIN}${CONNECT_CALLBACK_PATH}`, `exchanged with ${x.exchanged[0]}`);
+});
+
+await check("the callback logs which keys GitHub's answer carried, never a value, and holds the whole grant (#935)", async () => {
+  const grant = { accessToken: "ghu_" + "a".repeat(36), refreshToken: "ghr_" + "r".repeat(72), expiresAt: 1_800_028_800_000, refreshExpiresAt: 1_815_897_600_000 };
+  const keys = ["access_token", "expires_in", "refresh_token", "refresh_token_expires_in", "scope", "token_type"];
+  const x = deps({ async exchange() { return { grant, keys }; } });
+  const lines: string[] = [];
+  setLogSink((l) => lines.push(l));
+  try {
+    const { url } = await connectLink(ORIGIN, SECRET, spec, x.d.now());
+    const start = await connectStart(new URL(url), x.d);
+    const state = new URL(start.headers.get("location")!).searchParams.get("state")!;
+    const cb = new URL(`${ORIGIN}${CONNECT_CALLBACK_PATH}?code=c0de&state=${state}`);
+    await connectCallback(new Request(cb, { headers: { cookie: cookieFrom(start) } }), cb, x.d);
+  } finally { setLogSink(null); }
+  const said = lines.map((l) => JSON.parse(l)).filter((l) => l.evt === "connect.exchange");
+  must(said.length === 1 && said[0].keys === keys.join(" ") && said[0].expiring === true && said[0].agentId === "raft_a1", JSON.stringify(said));
+  must(!lines.some((l) => l.includes(grant.accessToken) || l.includes(grant.refreshToken)), "a token value was logged");
+  must(JSON.stringify(x.held[0]?.grant) === JSON.stringify(grant), "the hold did not get the whole grant");
 });
 
 await check("a callback without the flow's cookie or with another state is refused, and nothing is attached", async () => {
