@@ -564,6 +564,8 @@ export interface Connector {
   tenantId: string;
   provider: string;
   account: string | null;
+  /** GitHub's numeric user id for `account`, which a rename does not change (0024); null on a connector from before. */
+  accountId?: string | null;
   creatorRaftUserId: string;
   /** The access token, sealed. Rotated in place when an expiring one is refreshed (0023). */
   sealed: { ciphertext: string; iv: string };
@@ -586,7 +588,7 @@ export interface ConnectorRefresh {
 
 export interface ConnectorEvent {
   tenantId: string; connectorId: string; raftAgentId: string | null;
-  action: "create" | "bind" | "unbind" | "disconnect" | "broken";
+  action: "create" | "bind" | "unbind" | "disconnect" | "broken" | "reconnect";
   /** `system` for what the deployment records itself (`broken`), with SYSTEM_ACTOR as the user. */
   actingRaftUserId: string; actingRole: "creator" | "admin" | "system"; at: number;
   /** Why, for `broken`: GitHub's error, never a token. */
@@ -605,6 +607,22 @@ export interface ConnectorStore {
   record(e: ConnectorEvent): Promise<void>;
   /** Its credential was checked and taken (pointing an agent at it): the time Raft shows as `lastCheckedAt`. */
   checked?(tenantId: string, id: string, at: number): Promise<void>;
+  /**
+   * A reconnect in place: the new pair over whatever the connector holds, in one write that also clears its broken
+   * state and any renewal's lease, and records the account's id when it had none. Only while the connector still acts
+   * as `accountId`, or has no id yet and its login is `account` (a connector from before 0024): false when it is gone
+   * or another account's, and then nothing was written.
+   */
+  reconnect(tenantId: string, id: string, next: ConnectorReconnect): Promise<boolean>;
+}
+
+/** What a reconnect in place writes. */
+export interface ConnectorReconnect {
+  sealed: { ciphertext: string; iv: string };
+  refresh: ConnectorRefresh | null;
+  account: string | null;
+  accountId: string;
+  at: number;
 }
 
 export function d1Connectors(db: D1Database): ConnectorStore {
@@ -614,11 +632,27 @@ export function d1Connectors(db: D1Database): ConnectorStore {
       const f = c.refresh ?? null;
       await db.prepare(
         `INSERT INTO connectors (id, tenant_id, provider, account, creator_raft_user_id, ciphertext, iv, created_at,
-           refresh_ciphertext, refresh_iv, expires_at, refresh_expires_at, refreshed_at, last_checked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           refresh_ciphertext, refresh_iv, expires_at, refresh_expires_at, refreshed_at, last_checked_at, account_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).bind(c.id, c.tenantId, c.provider, c.account, c.creatorRaftUserId, c.sealed.ciphertext, c.sealed.iv, c.createdAt,
         f?.sealed.ciphertext ?? null, f?.sealed.iv ?? null, f?.expiresAt ?? null, f?.refreshExpiresAt ?? null, f ? c.createdAt : null,
         // Made from a confirm, whose attach has just checked the credential with GitHub.
-        c.createdAt).run();
+        c.createdAt, c.accountId ?? null).run();
+    },
+    async reconnect(tenantId, id, next) {
+      const f = next.refresh;
+      // The lease is cleared whoever holds it: a renewal still in flight traded the old refresh token, and its write
+      // (`rotate`, which expects that token) and its refusal (`markBroken`, likewise) no longer match, so neither can
+      // put the old chain back over this pair or mark it broken.
+      const r = await db.prepare(
+        `UPDATE connectors SET ciphertext = ?, iv = ?, refresh_ciphertext = ?, refresh_iv = ?, expires_at = ?, refresh_expires_at = ?,
+           refreshed_at = ?, last_checked_at = ?, broken_at = NULL, broken_reason = NULL, refreshing_until = NULL, refreshing_by = NULL,
+           account = ?, account_id = ?
+         WHERE tenant_id = ? AND id = ? AND (account_id IS NULL OR account_id = ?)
+           -- With no id yet, the login has to match here too: a renamed login can be claimed by someone else.
+           AND (account_id IS NOT NULL OR lower(account) = lower(?))`,
+      ).bind(next.sealed.ciphertext, next.sealed.iv, f?.sealed.ciphertext ?? null, f?.sealed.iv ?? null, f?.expiresAt ?? null, f?.refreshExpiresAt ?? null,
+        f ? next.at : null, next.at, next.account, next.accountId, tenantId, id, next.accountId, next.account).run();
+      return Number(r.meta?.changes ?? 0) > 0;
     },
     async checked(tenantId, id, at) {
       await db.prepare("UPDATE connectors SET last_checked_at = ? WHERE tenant_id = ? AND id = ?").bind(at, tenantId, id).run();
@@ -647,6 +681,7 @@ function connectorRow(r: any): Connector {
   const n = (v: unknown) => (v === null || v === undefined ? null : Number(v));
   return {
     id: String(r.id), tenantId: String(r.tenant_id), provider: String(r.provider), account: r.account === null ? null : String(r.account),
+    accountId: r.account_id == null ? null : String(r.account_id),
     creatorRaftUserId: String(r.creator_raft_user_id), sealed: { ciphertext: String(r.ciphertext), iv: String(r.iv) }, createdAt: Number(r.created_at),
     refresh: r.refresh_ciphertext == null ? null
       : { sealed: { ciphertext: String(r.refresh_ciphertext), iv: String(r.refresh_iv) }, expiresAt: n(r.expires_at), refreshExpiresAt: n(r.refresh_expires_at) },
@@ -680,6 +715,11 @@ export interface ConnectorGrants {
    * it was already broken, or holds another pair now.
    */
   markBroken(tenantId: string, id: string, reason: string, at: number, holder: string | null, spent: string | null): Promise<boolean>;
+  /**
+   * Record GitHub's numeric user id on a connector from before 0024: only while it has none, and only while its login is
+   * `login`. False when either no longer holds, and then nothing was written.
+   */
+  fillAccountId(tenantId: string, id: string, accountId: string, login: string): Promise<boolean>;
   /** The same, for an agent's connection that has no connector. */
   markAgentBroken(tenantId: string, agentId: string, provider: string, reason: string, at: number): Promise<boolean>;
 }
@@ -726,6 +766,11 @@ export function d1ConnectorGrants(db: D1Database): ConnectorGrants {
         ).bind(tenantId, id, SYSTEM_ACTOR, at, reason).run();
       }
       return changed;
+    },
+    async fillAccountId(tenantId, id, accountId, login) {
+      const r = await db.prepare("UPDATE connectors SET account_id = ? WHERE tenant_id = ? AND id = ? AND account_id IS NULL AND lower(account) = lower(?)")
+        .bind(accountId, tenantId, id, login).run();
+      return Number(r.meta?.changes ?? 0) > 0;
     },
     async markAgentBroken(tenantId, agentId, provider, reason, at) {
       const r = await db.prepare(

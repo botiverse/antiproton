@@ -27,7 +27,7 @@ import {
 } from "../eval-read.ts";
 import { AGENT_BUDGETS, type AgentBudget, type ConnectionRegistry, type ConnectorRefresh, type ConnectorStore, type ProviderTokenIdentity, type ProvisionRegistry, type ProvisionedAgent } from "../control-plane.ts";
 import { PLANS, type Plan, type TenantPlanStore } from "../spend-limit.ts";
-import { CONNECTION_PROVIDERS, returnUrlProblem, scopesFor, type ConnectionProvider } from "./connect.ts";
+import { CONNECTION_PROVIDERS, returnUrlProblem, scopesFor, type ConnectionProvider, type ReconnectTarget } from "./connect.ts";
 import { surface, surfaceReadOf, type SurfaceDeps } from "../agent-surface/surface.ts";
 import { logEvent } from "../../../src/core/log.ts";
 import { logTurnStop, type StopTurnOutcome } from "../../../src/runtime/turn-stop.ts";
@@ -87,11 +87,13 @@ export type StopTurnResult = StopTurnOutcome;
  * for a whole Raft deployment, tygg 2026-09-28) derives it from the Raft server the request names —
  * the POST body's raftServerId, `?raftServerId=` on every other route — so isolation and billing
  * follow the server while Raft holds a single key. A tenant exists by being named: nothing to create.
+ * `from` is where this route reads it, so the refusal names the one place that would have worked.
  */
-export function tenantFor(who: ProviderTokenIdentity, raftServerId: string | null): string | Fail {
+export function tenantFor(who: ProviderTokenIdentity, raftServerId: string | null, from: "body" | "query" = "query"): string | Fail {
   if (who.scope === "tenant") return who.tenantId;
   if (!raftServerId || !RAFT_ID.test(raftServerId)) {
-    return { status: 422, code: "missing", message: "a platform token needs the Raft server: raftServerId in the body, or ?raftServerId= on the URL", param: "raftServerId" };
+    const where = from === "body" ? "raftServerId in the body" : "?raftServerId= on the URL";
+    return { status: 422, code: "missing", message: `a platform token needs the Raft server: ${where}`, param: "raftServerId" };
   }
   return derivedTenant(raftServerId);
 }
@@ -174,16 +176,22 @@ export interface ProvisionDeps {
     attach(tenantId: string, agentId: string, provider: ConnectionProvider, sealed: { ciphertext: string; iv: string },
       refresh?: (ConnectorRefresh & { connectorId: string | null }) | null):
       Promise<{ ok: true; account: string | null } | { ok: false; error: string }>;
-    /** The one-time link the browser opens; signed, ten minutes. */
-    link(spec: { tenantId: string; agentId: string; raftAgentId: string; provider: ConnectionProvider; returnUrl: string; raftUserId: string; scopes: string[] }):
-      Promise<{ url: string; expiresAt: string }>;
+    /** The one-time link the browser opens; signed, ten minutes. `reconnect` is signed into it (connect.ts). */
+    link(spec: { tenantId: string; agentId: string; raftAgentId: string; provider: ConnectionProvider; returnUrl: string; raftUserId: string; scopes: string[];
+      reconnect?: ReconnectTarget }): Promise<{ url: string; expiresAt: string }>;
+    /** A connector was reconnected in place: its new pair onto this agent's mount, if the mount is still the connector's (`was`: its previous token). */
+    reconnect(tenantId: string, agentId: string, provider: ConnectionProvider, connectorId: string, was: { ciphertext: string; iv: string },
+      sealed: { ciphertext: string; iv: string }, refresh: ConnectorRefresh | null): Promise<{ ok: true; updated: boolean } | { ok: false; error: string }>;
     /** Remove it only while the mount still holds this connector's credential, not a key put there since. */
     detachIfFrom(tenantId: string, agentId: string, provider: ConnectionProvider, sealed: { ciphertext: string; iv: string }, connectorId?: string | null): Promise<boolean>;
     /** Remove the provider's credential from the agent's mount. */
     detach(tenantId: string, agentId: string, provider: ConnectionProvider): Promise<boolean>;
     /** Make a held connection the mount's credential, for the Raft user it was held for (connect.ts), as connector `connectorId`. */
     confirm(tenantId: string, agentId: string, provider: ConnectionProvider, pending: string, raftUserId: string, connectorId?: string):
-      Promise<{ ok: true; account: string | null; sealed: { ciphertext: string; iv: string }; refresh?: ConnectorRefresh | null } | { ok: false; error: string; missing?: true }>;
+      Promise<{ ok: true; account: string | null; accountId?: string | null; sealed: { ciphertext: string; iv: string }; refresh?: ConnectorRefresh | null;
+        /** Present for a reconnect in place: the hold was not attached, and the handler decides (`reconnectInPlace`). */
+        reconnect?: ReconnectTarget | null }
+        | { ok: false; error: string; missing?: true }>;
   };
   /**
    * An agent's usage and workspace, read through the same core the public API uses
@@ -534,10 +542,11 @@ export async function handleProvision(
   }
   if (seg[0] !== "agents") return null;
   // On POST the body names the server; elsewhere the URL does.
-  const serverForTenant = method === "POST" && seg.length === 1
+  const fromBody = method === "POST" && seg.length === 1;
+  const serverForTenant = fromBody
     ? (typeof field(body, "raftServerId") === "string" ? field(body, "raftServerId") as string : null)
     : headers.raftServerId;
-  const tenant = tenantFor(who, serverForTenant);
+  const tenant = tenantFor(who, serverForTenant, fromBody ? "body" : "query");
   if (isFail(tenant)) return fail(tenant);
   const tenantId = tenant;
 
@@ -1002,11 +1011,13 @@ async function connection(
         ? fail({ status: 404, code: "not_found", message: "no pending connection with that id for this agent and user; it may have expired or been used" })
         : fail({ status: 422, code: "connect_failed", message: r.error });
     }
+    // The connector to mend came from the hold, sealed in from the signed link, never from this body.
+    if (r.reconnect) return reconnectInPlace(tenantId, row, p, b.raftUserId, r.reconnect, { ...r, accountId: r.accountId ?? null, refresh: r.refresh ?? null }, deps);
     // A finished authorization is a new connector of the tenant, created by whoever confirmed it.
-    // Connecting again is how a connection that needs reconnecting is mended: a new connector, and this agent's row
-    // written afresh, which clears its broken state.
+    // A plain connect again mends only this agent: a new connector, and this agent's row written afresh, which clears
+    // its broken state. A reconnect in place (above) mends the connector for every agent on it.
     const connectedAt = deps.now();
-    await c.connectors.create({ id: connectorId, tenantId, provider: p, account: r.account, creatorRaftUserId: b.raftUserId, sealed: r.sealed, refresh: r.refresh ?? null, createdAt: connectedAt });
+    await c.connectors.create({ id: connectorId, tenantId, provider: p, account: r.account, accountId: r.accountId ?? null, creatorRaftUserId: b.raftUserId, sealed: r.sealed, refresh: r.refresh ?? null, createdAt: connectedAt });
     await c.registry.put({ tenantId, raftAgentId: row.raftAgentId, provider: p, account: r.account, connectedBy: b.raftUserId, connectedAt, connectorId });
     await c.connectors.record({ tenantId, connectorId, raftAgentId: row.raftAgentId, action: "create", actingRaftUserId: b.raftUserId, actingRole: "creator", at: connectedAt });
     return ok({ connected: true, connectorId, account: r.account, connectedAt: new Date(connectedAt).toISOString(), connectedBy: b.raftUserId });
@@ -1014,7 +1025,7 @@ async function connection(
 
   if (method === "POST") {
     const b = (body && typeof body === "object" && !Array.isArray(body) ? body : {}) as Record<string, unknown>;
-    const allowed = new Set(["returnUrl", "initiatedBy", "access"]);
+    const allowed = new Set(["returnUrl", "initiatedBy", "access", "connectorId", "actingRole"]);
     const unknown = Object.keys(b).find((k) => !allowed.has(k));
     if (unknown) return fail({ status: 400, code: "unknown_field", message: `unknown field ${unknown}`, param: unknown });
     if (typeof b.returnUrl !== "string") return fail({ status: 422, code: "invalid", message: "returnUrl is required", param: "returnUrl" });
@@ -1027,9 +1038,25 @@ async function connection(
     if (b.access !== undefined && b.access !== "public" && b.access !== "private") {
       return fail({ status: 422, code: "invalid", message: "access is public or private", param: "access" });
     }
+    // A reconnect in place names its connector here, where it is signed into the link: checked now, so a link is
+    // never issued for a connector the initiator may not mend, and again at confirm, which may come ten minutes later.
+    let reconnect: ReconnectTarget | undefined;
+    if (b.connectorId !== undefined) {
+      if (typeof b.connectorId !== "string" || !b.connectorId) return fail({ status: 422, code: "invalid", message: "connectorId is the connector to reconnect in place", param: "connectorId" });
+      if (b.actingRole !== "creator" && b.actingRole !== "admin") {
+        return fail({ status: 422, code: "invalid", message: "actingRole is creator or admin: the capacity Raft checked the initiator reconnects this connector in", param: "actingRole" });
+      }
+      const k = await c.connectors.get(tenantId, b.connectorId);
+      if (!k || k.provider !== p) return fail({ status: 404, code: "not_found", message: `no ${p} connector ${b.connectorId} in this tenant` });
+      const refused = creatorRefused(k, { actingRaftUserId: by, actingRole: b.actingRole });
+      if (refused) return fail(refused);
+      reconnect = { connectorId: k.id, actingRole: b.actingRole };
+    } else if (b.actingRole !== undefined) {
+      return fail({ status: 422, code: "invalid", message: "actingRole goes with connectorId, for a reconnect in place", param: "actingRole" });
+    }
     const scopes = scopesFor(b.access === "private" ? "private" : "public");
-    const link = await c.link({ tenantId, agentId: row.agentId, raftAgentId: row.raftAgentId, provider: p, returnUrl: b.returnUrl, raftUserId: by, scopes });
-    return ok({ ...link, scopes });
+    const link = await c.link({ tenantId, agentId: row.agentId, raftAgentId: row.raftAgentId, provider: p, returnUrl: b.returnUrl, raftUserId: by, scopes, ...(reconnect ? { reconnect } : {}) });
+    return ok({ ...link, scopes, ...(reconnect ? { reconnect: reconnect.connectorId } : {}) });
   }
   if (method === "GET") {
     const got = await c.registry.get(tenantId, row.raftAgentId, p);
@@ -1084,6 +1111,76 @@ async function connection(
     return new Response(null, { status: 204 });
   }
   return null;
+}
+
+/**
+ * `POST …/confirm` for a link made with `connectorId`: the connector is mended in place rather than replaced. The
+ * authorization must be the connector's own GitHub account — by GitHub's numeric user id, which a rename does not
+ * change; by login for a connector made before the id was kept (0024) — or nothing changes (`409 account_mismatch`),
+ * so the agents on it can never start acting as someone else. Who may: the connector's creator, or an admin by Raft's
+ * word, as for `DELETE /connectors/:id`.
+ *
+ * Then, in order: the new pair over the connector's in one D1 write, which also clears its broken state and any
+ * renewal's lease (`ConnectorStore.reconnect`); the pair onto every agent pointed at it, and onto this one, which is
+ * pointed at it if it was not. An agent the pair does not reach here is named in `failed`: its mount still says
+ * broken, and its next GitHub call asks the connector, finds it healthy and takes the pair (github-refresh.ts).
+ */
+async function reconnectInPlace(
+  tenantId: string, row: ProvisionedAgent, p: ConnectionProvider, raftUserId: string, target: ReconnectTarget,
+  r: { account: string | null; accountId: string | null; sealed: { ciphertext: string; iv: string }; refresh: ConnectorRefresh | null },
+  deps: ProvisionDeps,
+): Promise<Response> {
+  const c = deps.connections!;
+  const acting: Acting = { actingRaftUserId: raftUserId, actingRole: target.actingRole };
+  const k = await c.connectors.get(tenantId, target.connectorId);
+  if (!k || k.provider !== p) return fail({ status: 404, code: "not_found", message: `no ${p} connector ${target.connectorId} in this tenant; it may have been disconnected since the link was made` });
+  const refused = creatorRefused(k, acting);
+  if (refused) return fail(refused);
+  if (!r.accountId) return fail({ status: 422, code: "connect_failed", message: "GitHub did not say which account was authorized, so the connector was not changed" });
+  const same = k.accountId ? k.accountId === r.accountId : !!k.account && !!r.account && k.account.toLowerCase() === r.account.toLowerCase();
+  const mismatch = () => fail({ status: 409, code: "account_mismatch",
+    message: `this connector is GitHub account ${k.account ?? "(unknown)"}, and the authorization was for ${r.account ?? "another account"}; nothing was changed. Sign in to GitHub as ${k.account ?? "the connector's account"} and reconnect, or connect without connectorId to make a new connector` });
+  if (!same) return mismatch();
+  const at = deps.now();
+  if (!(await c.connectors.reconnect(tenantId, k.id, { sealed: r.sealed, refresh: r.refresh, account: r.account, accountId: r.accountId, at }))) {
+    // Gone, or given another account's id, between the read and the write.
+    const now = await c.connectors.get(tenantId, k.id);
+    return now ? mismatch() : fail({ status: 404, code: "not_found", message: `no ${p} connector ${k.id} in this tenant; it was disconnected meanwhile` });
+  }
+  await c.connectors.record({ tenantId, connectorId: k.id, raftAgentId: row.raftAgentId, action: "reconnect", ...acting, at });
+  const updated: string[] = [];
+  const failed: Array<{ raftAgentId: string; error: string }> = [];
+  const bound = await c.registry.boundTo(tenantId, k.id);
+  for (const raftAgentId of bound) {
+    try {
+      const a = raftAgentId === row.raftAgentId ? row : await deps.registry.get(tenantId, raftAgentId);
+      if (!a) continue;
+      const got = await c.reconnect(tenantId, a.agentId, p, k.id, k.sealed, r.sealed, r.refresh);
+      if (!got.ok) { failed.push({ raftAgentId, error: got.error }); continue; }
+      if (got.updated) updated.push(raftAgentId);
+    } catch (e) {
+      failed.push({ raftAgentId, error: String((e as { message?: unknown })?.message ?? e).slice(0, 200) });
+    }
+  }
+  // This agent ends on the connector: pointed at it if it was not, and given the pair if its mount held something else
+  // (a key put there since) — the person reconnected from this agent's page. The same attach a PUT makes.
+  let connected = updated.includes(row.raftAgentId);
+  if (!connected && !failed.some((f) => f.raftAgentId === row.raftAgentId)) {
+    const got = await c.attach(tenantId, row.agentId, p, r.sealed, r.refresh ? { ...r.refresh, connectorId: k.id } : null)
+      .catch((e: unknown) => ({ ok: false as const, error: String((e as { message?: unknown })?.message ?? e).slice(0, 200) }));
+    if (got.ok) { connected = true; updated.push(row.raftAgentId); }
+    else failed.push({ raftAgentId: row.raftAgentId, error: got.error });
+  }
+  if (connected) {
+    // Written afresh, which clears a broken state kept on this agent's own row.
+    await c.registry.put({ tenantId, raftAgentId: row.raftAgentId, provider: p, account: r.account, connectedBy: raftUserId, connectedAt: at, connectorId: k.id });
+    if (!bound.includes(row.raftAgentId)) await c.connectors.record({ tenantId, connectorId: k.id, raftAgentId: row.raftAgentId, action: "bind", ...acting, at });
+  }
+  logEvent("connect.reconnect", { tenantId, connectorId: k.id, raftAgentId: row.raftAgentId, actingRole: acting.actingRole, updated: updated.length, failed: failed.length });
+  return ok({
+    connected, reconnected: true, connectorId: k.id, account: r.account, connectedAt: new Date(at).toISOString(), connectedBy: raftUserId,
+    updated: updated.sort(), failed,
+  });
 }
 
 /**

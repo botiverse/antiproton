@@ -70,12 +70,17 @@ function github(opts: { expiring?: boolean } = {}) {
   const issued: string[] = [];
   const s = { refreshes: 0, refused: 0, api: 0, unauthorized: 0, delayMs: 0, refuse: false, sent: [] as string[],
     /** Something other than GitHub's own answer at the token endpoint: an HTML error page, say. */
-    tokenAnswer: null as null | (() => Response) };
-  const pair = (expiring: boolean) => {
+    tokenAnswer: null as null | (() => Response),
+    /** Who the person signing in at GitHub is: the account the next code's tokens act as. A refresh keeps its pair's. */
+    as: { login: "octocat", id: 1 } as { login: string; id: number },
+    /** How many of the next `GET /user` calls answer 503, as an outage would. */
+    failUser: 0 };
+  const owner = new Map<string, { login: string; id: number }>(); // access token -> the account it acts as
+  const pair = (expiring: boolean, who = s.as) => {
     n++;
     const access = `ghu_${String(n).padStart(4, "0")}${"a".repeat(36)}`;
     const refresh = `ghr_${String(n).padStart(4, "0")}${"r".repeat(72)}`;
-    live.add(access); issued.push(access);
+    live.add(access); issued.push(access); owner.set(access, { ...who });
     if (!expiring) return { access_token: access, scope: "public_repo,read:org", token_type: "bearer" };
     refreshes.set(refresh, access); issued.push(refresh);
     return { access_token: access, expires_in: 28800, refresh_token: refresh, refresh_token_expires_in: 15897600, scope: "public_repo,read:org", token_type: "bearer" };
@@ -92,7 +97,7 @@ function github(opts: { expiring?: boolean } = {}) {
         const was = refreshes.get(b.refresh_token);
         if (s.refuse || was === undefined) { s.refused++; return json({ error: "bad_refresh_token", error_description: "The refresh token passed is incorrect or expired." }); }
         refreshes.delete(b.refresh_token); live.delete(was);
-        return json(pair(true));
+        return json(pair(true, owner.get(was)));
       }
       return json(pair(opts.expiring !== false));
     }
@@ -103,7 +108,8 @@ function github(opts: { expiring?: boolean } = {}) {
       // An endpoint that wants an App's JWT refuses any user token, live or not.
       if (u.startsWith("https://api.github.com/app")) { s.unauthorized++; return json({ message: "A JSON web token could not be decoded" }, 401); }
       if (!live.has(token)) { s.unauthorized++; return json({ message: "Bad credentials" }, 401); }
-      return json({ login: "octocat", id: 1 });
+      if (u === "https://api.github.com/user" && s.failUser > 0) { s.failUser--; return json({ message: "Service Unavailable" }, 503); }
+      return json(owner.get(token) ?? { login: "octocat", id: 1 });
     }
     return json({ message: "Not Found" }, 404);
   };
@@ -124,6 +130,7 @@ async function world(opts: { expiring?: boolean; github?: boolean } = {}) {
   const settle = async () => { while (pending.length) await pending.shift(); };
   const grants = d1ConnectorGrants(db);
   let ids = 0;
+  const links: any[] = [];
   const rtOf = (agentId: string) => objects.get(agentId)!.rt;
   async function agent(raftAgentId: string, twinOf?: { agentId: string }) {
     const agentId = twinOf?.agentId ?? `raft_${raftAgentId}`;
@@ -162,7 +169,8 @@ async function world(opts: { expiring?: boolean; github?: boolean } = {}) {
     connections: {
       registry: d1Connections(db), connectors: d1Connectors(db), newId: () => `con_${++ids}`,
       attach: (t, a, _p, sealed, refresh) => rtOf(a).attachSealedConnection(t, a, "github", sealed, refresh ?? null),
-      async link() { return { url: "https://ap.example/connect/start?t=x", expiresAt: new Date().toISOString() }; },
+      async link(spec) { links.push(spec); return { url: "https://ap.example/connect/start?t=x", expiresAt: new Date().toISOString() }; },
+      reconnect: (t, a, _p, connectorId, was, sealed, refresh) => rtOf(a).reconnectConnection(t, a, "github", connectorId, was, sealed, refresh),
       detachIfFrom: (t, a, _p, sealed, connectorId) => rtOf(a).detachConnectionIfFrom(t, a, "github", sealed, connectorId ?? null),
       detach: (t, a) => rtOf(a).detachConnection(t, a, "github"),
       confirm: (t, a, _p, pending, user, connectorId) => rtOf(a).confirmConnection(t, a, "github", pending, user, connectorId ?? null),
@@ -180,6 +188,20 @@ async function world(opts: { expiring?: boolean; github?: boolean } = {}) {
     const r = await call("POST", `/agents/by-raft-agent/${a.raftAgentId}/connections/github/confirm`, { pending, raftUserId: "u_owner" });
     must(r.status === 200 && r.body.connected === true, `confirm: ${r.status} ${r.text}`);
     return r.body.connectorId as string;
+  }
+  /**
+   * Reconnect in place from one agent's page: the link asked for with the connector (the handler's checks), the code
+   * exchanged as whoever `gh.s.as` is, held with the link's own `reconnect` as connect.ts carries it, and confirmed.
+   */
+  async function reconnect(a: { rt: AgentRuntime; agentId: string; raftAgentId: string }, connectorId: string,
+    by: { raftUserId?: string; actingRole?: "creator" | "admin" } = {}, pending = `pend_${a.raftAgentId}_re${links.length}`) {
+    const raftUserId = by.raftUserId ?? "u_owner";
+    const asked = await call("POST", `/agents/by-raft-agent/${a.raftAgentId}/connections/github`,
+      { returnUrl: `${WHO.raftOrigin}/agents/${a.raftAgentId}`, initiatedBy: { raftUserId }, connectorId, actingRole: by.actingRole ?? "creator" });
+    if (asked.status !== 200) return asked;
+    const { grant } = await gh.code();
+    await a.rt.holdConnection(TENANT, a.agentId, "github", grant, pending, Date.now() + 600_000, raftUserId, links.at(-1).reconnect ?? null);
+    return call("POST", `/agents/by-raft-agent/${a.raftAgentId}/connections/github/confirm`, { pending, raftUserId });
   }
   const status = (raftAgentId: string) => call("GET", `/agents/by-raft-agent/${raftAgentId}/connections/github`);
   const tool = async (a: { rt: AgentRuntime; agentId: string }, name = "auth_status", args: Record<string, unknown> = {}) =>
@@ -207,7 +229,7 @@ async function world(opts: { expiring?: boolean; github?: boolean } = {}) {
     if (connectorId) db.raw.prepare("UPDATE connectors SET refreshed_at = ? WHERE id = ?").run(Date.now() - 2 * H, connectorId);
   }
   const dispose = () => { for (const o of objects.values()) o.host.dispose(); };
-  return { db, gh, agent, connect, status, tool, stored, expireAt, age, call, grants, propagated, settle, dispose,
+  return { db, gh, agent, connect, reconnect, links, status, tool, stored, expireAt, age, call, grants, propagated, settle, dispose,
     delayPropagation: (ms: number) => { propagateDelayMs = ms; } };
 }
 
@@ -692,6 +714,297 @@ await check("a key pasted over a connection is renewed by nothing: what renewed 
   must((await w.stored(a)).rec === null, "the connection's renewal record outlived the key it renewed");
   w.dispose();
 });
+
+/** Break a connector the way GitHub does: the token expired and its refresh token refused, found by a's next call. */
+async function breakIt(w: Awaited<ReturnType<typeof world>>, a: { rt: AgentRuntime; agentId: string }, id: string) {
+  await w.expireAt(a, Date.now() + 30_000, id);
+  w.gh.live.delete((await w.stored(a)).token!);
+  w.gh.s.refuse = true;
+  must(!succeeded(await w.tool(a)), "the call succeeded on a dead connection");
+  w.gh.s.refuse = false;
+  must((w.db.raw.prepare("SELECT broken_at FROM connectors WHERE id = ?").get(id) as any).broken_at, "the connector was not marked broken");
+}
+const connectorRow = (w: Awaited<ReturnType<typeof world>>, id: string) => w.db.raw.prepare("SELECT * FROM connectors WHERE id = ?").get(id) as any;
+const connectorCount = (w: Awaited<ReturnType<typeof world>>) => (w.db.raw.prepare("SELECT COUNT(*) AS n FROM connectors").get() as any).n as number;
+
+await check("a connect keeps GitHub's numeric user id on the connector beside the login (0024)", async () => {
+  const w = await world();
+  const a = await w.agent("R0");
+  const id = await w.connect(a);
+  const row = connectorRow(w, id);
+  must(row.account === "octocat" && row.account_id === "1", `account ${row.account}, account_id ${row.account_id}`);
+  w.dispose();
+});
+
+await check("reconnecting in place mends the connector itself: every agent on it gets the new pair, their broken flags clear, and an agent not on it is pointed at it", async () => {
+  const w = await world();
+  const a = await w.agent("R1");
+  const b = await w.agent("S1");
+  const c = await w.agent("T1");
+  const id = await w.connect(a);
+  must((await w.call("PUT", `/agents/by-raft-agent/S1/connections/github`, { connectorId: id, actingRaftUserId: "u_owner", actingRole: "creator" })).status === 200, "bind b");
+  await breakIt(w, a, id);
+  // b's mount learns it too, from its own call.
+  w.gh.live.delete((await w.stored(b)).token!);
+  must(!succeeded(await w.tool(b)) && (await w.stored(b)).rec?.brokenAt, "b's mount was not marked broken");
+  must((await w.status("R1")).body.oauthStatus === "error" && (await w.status("S1")).body.oauthStatus === "error", "not reported broken");
+  const before = connectorCount(w);
+  // From an agent not on it, by an admin: Raft's word for the role.
+  const r = await w.reconnect(c, id, { raftUserId: "u_admin", actingRole: "admin" });
+  must(r.status === 200 && r.body.reconnected === true && r.body.connected === true && r.body.connectorId === id && r.body.account === "octocat", `${r.status} ${r.text}`);
+  must(JSON.stringify(r.body.updated) === JSON.stringify(["R1", "S1", "T1"].sort()) && r.body.failed.length === 0, `updated ${JSON.stringify(r.body.updated)} failed ${JSON.stringify(r.body.failed)}`);
+  must(connectorCount(w) === before, "a reconnect in place made a new connector");
+  const row = connectorRow(w, id);
+  must(row.broken_at === null && row.broken_reason === null && row.refreshing_until === null && row.refreshing_by === null && row.last_checked_at >= row.refreshed_at, JSON.stringify({ ...row, ciphertext: "-", refresh_ciphertext: "-" }));
+  const k = await w.stored(a);
+  const connectorToken = await k.open(k.kek, { ciphertext: row.ciphertext, iv: row.iv });
+  must(w.gh.live.has(connectorToken), "the connector does not hold the new, live token");
+  for (const x of [a, b, c]) {
+    const s = await w.stored(x);
+    must(s.token === connectorToken && s.rec?.connectorId === id && !s.rec.brokenAt, `${x.agentId}: token ${s.token === connectorToken}, rec ${JSON.stringify({ ...s.rec, refreshToken: "-" })}`);
+    must(s.rec.refreshToken === await s.open(s.kek, { ciphertext: row.refresh_ciphertext, iv: row.refresh_iv }), `${x.agentId} holds another refresh token than the connector`);
+  }
+  for (const r of ["R1", "S1", "T1"]) {
+    const st = await w.status(r);
+    must(st.body.connected === true && st.body.oauthStatus === "connected" && st.body.lastCheckError === null && st.body.connectorId === id, `${r}: ${st.text}`);
+  }
+  const refreshes = w.gh.s.refreshes;
+  for (const x of [a, b, c]) must(succeeded(await w.tool(x)), `${x.agentId}'s call failed after the reconnect`);
+  must(w.gh.s.refreshes === refreshes, "a call after the reconnect needed a renewal");
+  const ev = w.db.raw.prepare("SELECT action, raft_agent_id, acting_raft_user_id, acting_role FROM connector_events WHERE connector_id = ? AND action IN ('reconnect', 'bind') ORDER BY at").all(id) as any[];
+  must(ev.some((e) => e.action === "reconnect" && e.raft_agent_id === "T1" && e.acting_raft_user_id === "u_admin" && e.acting_role === "admin"), `no reconnect event: ${JSON.stringify(ev)}`);
+  must(ev.some((e) => e.action === "bind" && e.raft_agent_id === "T1"), `T1's pointing is not recorded: ${JSON.stringify(ev)}`);
+  w.dispose();
+});
+
+await check("reconnecting in place a healthy connector re-authorizes it the same way, from an agent already on it, by its creator", async () => {
+  const w = await world();
+  const a = await w.agent("R2");
+  const b = await w.agent("S2");
+  const id = await w.connect(a);
+  await w.call("PUT", `/agents/by-raft-agent/S2/connections/github`, { connectorId: id, actingRaftUserId: "u_owner", actingRole: "creator" });
+  const was = (await w.stored(a)).token;
+  const r = await w.reconnect(a, id);
+  must(r.status === 200 && r.body.connected === true && JSON.stringify(r.body.updated) === '["R2","S2"]', `${r.status} ${r.text}`);
+  must((await w.stored(a)).token !== was && (await w.stored(a)).token === (await w.stored(b)).token, "the agents did not both take the new token");
+  must(succeeded(await w.tool(a)) && succeeded(await w.tool(b)), "a call failed");
+  w.dispose();
+});
+
+await check("a reconnect authorized as another GitHub account is refused, 409 account_mismatch, and nothing changes: not the connector, a mount, or the agent's row", async () => {
+  const w = await world();
+  const a = await w.agent("R3");
+  const b = await w.agent("S3");
+  const id = await w.connect(a);
+  await w.call("PUT", `/agents/by-raft-agent/S3/connections/github`, { connectorId: id, actingRaftUserId: "u_owner", actingRole: "creator" });
+  await breakIt(w, a, id);
+  const row0 = connectorRow(w, id);
+  const sa = await w.stored(a), sb = await w.stored(b);
+  const conns0 = JSON.stringify(w.db.raw.prepare("SELECT * FROM provisioned_connections ORDER BY raft_agent_id").all());
+  const n0 = connectorCount(w);
+  for (const as of [
+    { login: "mallory", id: 2 },
+    // The connector's login, now someone else's: a rename freed it. The id is what counts.
+    { login: "octocat", id: 3 },
+  ]) {
+    w.gh.s.as = as;
+    const r = await w.reconnect(b, id);
+    must(r.status === 409 && r.body.error.code === "account_mismatch" && /nothing was changed/.test(r.body.error.message), `${as.login}/${as.id}: ${r.status} ${r.text}`);
+  }
+  must(JSON.stringify(connectorRow(w, id)) === JSON.stringify(row0), "the connector changed");
+  must(connectorCount(w) === n0, "a refused reconnect made a connector");
+  must(JSON.stringify(await w.stored(a)) === JSON.stringify(sa) && JSON.stringify(await w.stored(b)) === JSON.stringify(sb), "a mount changed");
+  must(JSON.stringify(w.db.raw.prepare("SELECT * FROM provisioned_connections ORDER BY raft_agent_id").all()) === conns0, "an agent's connection row changed");
+  must((w.db.raw.prepare("SELECT COUNT(*) AS n FROM connector_events WHERE action = 'reconnect'").get() as any).n === 0, "a reconnect was recorded");
+  must((await w.status("S3")).body.oauthStatus === "error", "the refused reconnect cleared the broken state");
+  // The account itself, renamed: the same id under a new login is the same account, and the login follows it.
+  w.gh.s.as = { login: "octocat-renamed", id: 1 };
+  const ok = await w.reconnect(b, id);
+  must(ok.status === 200 && ok.body.account === "octocat-renamed" && connectorRow(w, id).account === "octocat-renamed" && connectorRow(w, id).account_id === "1", `${ok.status} ${ok.text}`);
+  w.dispose();
+});
+
+await check("the D1 write itself refuses another account's id, for an id that changed between the handler's read and its write", async () => {
+  const w = await world();
+  const a = await w.agent("R10");
+  const id = await w.connect(a);
+  const row0 = connectorRow(w, id);
+  const next = { sealed: { ciphertext: "x", iv: "y" }, refresh: null, account: "mallory", accountId: "2", at: Date.now() };
+  must(!(await d1Connectors(w.db).reconnect(TENANT, id, next)), "another account's pair was written");
+  must(!(await d1Connectors(w.db).reconnect("t-other", id, { ...next, accountId: "1" })), "another tenant wrote over the connector");
+  must(JSON.stringify(connectorRow(w, id)) === JSON.stringify(row0), "the connector changed");
+  w.dispose();
+});
+
+await check("the D1 write refuses a connector with no id yet whose login is another's: a renamed login can be someone else's", async () => {
+  const w = await world();
+  const a = await w.agent("R11");
+  const id = await w.connect(a);
+  w.db.raw.prepare("UPDATE connectors SET account_id = NULL WHERE id = ?").run(id);
+  const row0 = connectorRow(w, id);
+  const next = { sealed: { ciphertext: "x", iv: "y" }, refresh: null, account: "mallory", accountId: "2", at: Date.now() };
+  must(!(await d1Connectors(w.db).reconnect(TENANT, id, next)), "another login's pair was written over a connector with no id");
+  must(JSON.stringify(connectorRow(w, id)) === JSON.stringify(row0), "the connector changed");
+  must(await d1Connectors(w.db).reconnect(TENANT, id, { ...next, account: "OctoCat", accountId: "1" }), "its own login, in another case, was refused");
+  must(connectorRow(w, id).account_id === "1", "the id was not stored");
+  w.dispose();
+});
+
+await check("the D1 backfill writes an id only over none, and only for the connector's own login", async () => {
+  const w = await world();
+  const a = await w.agent("R13");
+  const id = await w.connect(a);
+  must(!(await w.grants.fillAccountId(TENANT, id, "9", "octocat")) && connectorRow(w, id).account_id === "1", "an id was written over one already kept");
+  w.db.raw.prepare("UPDATE connectors SET account_id = NULL WHERE id = ?").run(id);
+  must(!(await w.grants.fillAccountId(TENANT, id, "2", "mallory")) && connectorRow(w, id).account_id === null, "another login's id was written");
+  must(!(await w.grants.fillAccountId("t-other", id, "1", "octocat")) && connectorRow(w, id).account_id === null, "another tenant wrote the id");
+  must(await w.grants.fillAccountId(TENANT, id, "1", "OctoCat") && connectorRow(w, id).account_id === "1", "its own login's id was not written");
+  w.dispose();
+});
+
+for (const [label, setup, expect, outcome] of [
+  ["learns GitHub's id from the renewed token", (_w: any, _id: string) => {}, "1", "filled"],
+  ["ignores GET /user failing: the renewal stands, the id stays unknown", (w: any) => { w.gh.s.failUser = 1; }, null, "unknown"],
+  ["leaves the id unknown when GitHub names another login", (w: any, id: string) => { w.db.raw.prepare("UPDATE connectors SET account = 'someone-else' WHERE id = ?").run(id); }, null, "login-mismatch"],
+] as const) {
+  await check(`a connector from before the id was kept, renewing, ${label}`, async () => {
+    const w = await world();
+    const a = await w.agent(`R12${String(expect)}${label.length}`);
+    const id = await w.connect(a);
+    w.db.raw.prepare("UPDATE connectors SET account_id = NULL WHERE id = ?").run(id);
+    (setup as (w: any, id: string) => void)(w, id);
+    await w.expireAt(a, Date.now() + 30_000, id);
+    const before = connectorRow(w, id).ciphertext;
+    const from = logged.length;
+    const r = await w.tool(a);
+    must(succeeded(r) && w.gh.s.refreshes === 1, `the renewal or its call failed: ${errorText(r)}`);
+    const row = connectorRow(w, id);
+    must(row.ciphertext !== before && row.broken_at === null, "the renewal did not land");
+    must(row.account_id === expect, `account_id ${row.account_id}, expected ${expect}`);
+    const said = logged.slice(from).filter((l) => l.includes('"evt":"github.account_id"') && l.includes(`"connectorId":"${id}"`) && l.includes(`"tenantId":"${TENANT}"`));
+    must(said.length > 0 && said.at(-1)!.includes(`"outcome":"${outcome}"`), `logged ${said.at(-1) ?? "nothing"}, expected ${outcome}`);
+    w.dispose();
+  });
+}
+
+await check("a connector from before the id was kept is matched by its login, and learns the id at the reconnect", async () => {
+  const w = await world();
+  const a = await w.agent("R4");
+  const id = await w.connect(a);
+  w.db.raw.prepare("UPDATE connectors SET account_id = NULL WHERE id = ?").run(id);
+  w.gh.s.as = { login: "mallory", id: 2 };
+  const wrong = await w.reconnect(a, id);
+  must(wrong.status === 409 && wrong.body.error.code === "account_mismatch" && connectorRow(w, id).account_id === null, `${wrong.status} ${wrong.text}`);
+  // Logins are case-insensitive at GitHub.
+  w.gh.s.as = { login: "OctoCat", id: 1 };
+  const r = await w.reconnect(a, id);
+  must(r.status === 200 && connectorRow(w, id).account_id === "1", `${r.status} ${r.text}`);
+  w.dispose();
+});
+
+await check("reconnecting in place is the creator's or an admin's: a stranger claiming to be the creator is refused at the link and at confirm", async () => {
+  const w = await world();
+  const a = await w.agent("R5");
+  const id = await w.connect(a);
+  const r = await w.reconnect(a, id, { raftUserId: "u_stranger", actingRole: "creator" });
+  must(r.status === 403 && r.body.error.code === "not_creator" && w.links.length === 0, `at the link: ${r.status} ${r.text}`);
+  must((await w.call("POST", `/agents/by-raft-agent/R5/connections/github`, { returnUrl: `${WHO.raftOrigin}/x`, initiatedBy: { raftUserId: "u_owner" }, connectorId: id })).body.error?.param === "actingRole", "a reconnect without a role was accepted");
+  must((await w.call("POST", `/agents/by-raft-agent/R5/connections/github`, { returnUrl: `${WHO.raftOrigin}/x`, initiatedBy: { raftUserId: "u_owner" }, actingRole: "creator" })).body.error?.param === "actingRole", "a role without a connector was accepted");
+  // A hold naming a role the link could not have carried: confirm checks again.
+  const was = (await w.stored(a)).token;
+  const { grant } = await w.gh.code();
+  await a.rt.holdConnection(TENANT, a.agentId, "github", grant, "pend_R5_forged01", Date.now() + 600_000, "u_stranger", { connectorId: id, actingRole: "creator" });
+  const c = await w.call("POST", `/agents/by-raft-agent/R5/connections/github/confirm`, { pending: "pend_R5_forged01", raftUserId: "u_stranger" });
+  must(c.status === 403 && c.body.error.code === "not_creator" && (await w.stored(a)).token === was, `at confirm: ${c.status} ${c.text}`);
+  w.dispose();
+});
+
+await check("another tenant's connector, and one deleted after the link was made, are refused 404 and change nothing", async () => {
+  const w = await world();
+  const a = await w.agent("R6");
+  const id = await w.connect(a);
+  const theirs = connectorRow(w, id);
+  await d1Connectors(w.db).create({ id: "con_theirs", tenantId: "t-other", provider: "github", account: "octocat", accountId: "1", creatorRaftUserId: "u_owner",
+    sealed: { ciphertext: theirs.ciphertext, iv: theirs.iv }, createdAt: Date.now() });
+  const other = await w.reconnect(a, "con_theirs");
+  must(other.status === 404 && other.body.error.code === "not_found" && w.links.length === 0, `another tenant's: ${other.status} ${other.text}`);
+  // And at confirm, for a hold that names it.
+  const { grant } = await w.gh.code();
+  await a.rt.holdConnection(TENANT, a.agentId, "github", grant, "pend_R6_theirs01", Date.now() + 600_000, "u_owner", { connectorId: "con_theirs", actingRole: "admin" });
+  const at = await w.call("POST", `/agents/by-raft-agent/R6/connections/github/confirm`, { pending: "pend_R6_theirs01", raftUserId: "u_owner" });
+  must(at.status === 404 && JSON.stringify(connectorRow(w, "con_theirs")) !== undefined && connectorRow(w, "con_theirs").tenant_id === "t-other", `${at.status} ${at.text}`);
+  // Deleted between the link and the confirm.
+  const asked = await w.call("POST", `/agents/by-raft-agent/R6/connections/github`, { returnUrl: `${WHO.raftOrigin}/x`, initiatedBy: { raftUserId: "u_owner" }, connectorId: id, actingRole: "creator" });
+  must(asked.status === 200 && asked.body.reconnect === id, asked.text);
+  must((await w.call("DELETE", `/connectors/${id}`, { actingRaftUserId: "u_owner", actingRole: "creator" })).status === 200, "disconnect");
+  const n0 = connectorCount(w);
+  const g2 = await w.gh.code();
+  await a.rt.holdConnection(TENANT, a.agentId, "github", g2.grant, "pend_R6_gone0001", Date.now() + 600_000, "u_owner", w.links.at(-1).reconnect);
+  const gone = await w.call("POST", `/agents/by-raft-agent/R6/connections/github/confirm`, { pending: "pend_R6_gone0001", raftUserId: "u_owner" });
+  must(gone.status === 404 && gone.body.error.code === "not_found", `deleted: ${gone.status} ${gone.text}`);
+  must(connectorCount(w) === n0 && (await w.stored(a)).token === null && (await w.status("R6")).body.connected === false, "a reconnect of a deleted connector made one, or attached the token");
+  w.dispose();
+});
+
+await check("the connector a reconnect mends is the link's: confirm takes no connectorId, and one sent is refused 400", async () => {
+  const w = await world();
+  const a = await w.agent("R7");
+  const mine = await w.connect(a);
+  const b = await w.agent("S7");
+  const other = await w.connect(b);
+  const asked = await w.call("POST", `/agents/by-raft-agent/R7/connections/github`, { returnUrl: `${WHO.raftOrigin}/x`, initiatedBy: { raftUserId: "u_owner" }, connectorId: mine, actingRole: "creator" });
+  must(asked.status === 200 && w.links.at(-1).reconnect?.connectorId === mine, `the link does not carry the connector: ${JSON.stringify(w.links.at(-1))}`);
+  const { grant } = await w.gh.code();
+  await a.rt.holdConnection(TENANT, a.agentId, "github", grant, "pend_R7_swap0001", Date.now() + 600_000, "u_owner", w.links.at(-1).reconnect);
+  const swapped = await w.call("POST", `/agents/by-raft-agent/R7/connections/github/confirm`, { pending: "pend_R7_swap0001", raftUserId: "u_owner", connectorId: other });
+  must(swapped.status === 400 && swapped.body.error.code === "unknown_field" && swapped.body.error.param === "connectorId", `${swapped.status} ${swapped.text}`);
+  const otherRow = connectorRow(w, other);
+  const r = await w.call("POST", `/agents/by-raft-agent/R7/connections/github/confirm`, { pending: "pend_R7_swap0001", raftUserId: "u_owner" });
+  must(r.status === 200 && r.body.connectorId === mine && JSON.stringify(connectorRow(w, other)) === JSON.stringify(otherRow), `${r.status} ${r.text}`);
+  w.dispose();
+});
+
+for (const refused of [false, true]) {
+  await check(`a reconnect landing while another agent's renewal holds the lease${refused ? " and GitHub refuses that renewal" : ""}: the reconnect's pair stays, nothing is marked broken, and every agent ends up working`, async () => {
+    const w = await world();
+    const a = await w.agent(refused ? "R9" : "R8");
+    const b = await w.agent(refused ? "S9" : "S8");
+    const id = await w.connect(a);
+    await w.call("PUT", `/agents/by-raft-agent/${b.raftAgentId}/connections/github`, { connectorId: id, actingRaftUserId: "u_owner", actingRole: "creator" });
+    await w.expireAt(a, Date.now() + 30_000, id);
+    w.gh.s.delayMs = 400;
+    w.gh.s.refuse = refused;
+    let answered = false;
+    const renewing = w.tool(a).finally(() => { answered = true; });
+    // The renewal is at GitHub, under the lease.
+    for (let i = 0; i < 50 && !connectorRow(w, id).refreshing_until; i++) await sleep(5);
+    must(connectorRow(w, id).refreshing_until, "the renewal never took the lease");
+    // A reconnect trades a code, never a refresh token: GitHub refusing refreshes does not touch it.
+    const r = await w.reconnect(b, id);
+    must(r.status === 200 && r.body.reconnected === true, `${r.status} ${r.text}`);
+    must(!answered, "the renewal finished before the reconnect: the race was not run");
+    const mended = connectorRow(w, id);
+    await renewing;
+    w.gh.s.refuse = false;
+    if (refused) must(w.gh.s.refused > 0, "GitHub never refused the renewal");
+    await w.settle();
+    w.gh.s.delayMs = 0;
+    const row = connectorRow(w, id);
+    must(row.ciphertext === mended.ciphertext && row.refresh_ciphertext === mended.refresh_ciphertext, "the renewal's write replaced the reconnect's pair");
+    must(row.broken_at === null && row.refreshing_until === null, `left broken or leased: ${JSON.stringify({ broken_at: row.broken_at, refreshing_until: row.refreshing_until })}`);
+    const s = await w.stored(b);
+    const token = await s.open(s.kek, { ciphertext: row.ciphertext, iv: row.iv });
+    must(w.gh.live.has(token), "the connector's pair is not live at GitHub");
+    for (const x of [a, b]) {
+      const st = await w.stored(x);
+      // Whichever live pair a mount holds, it is not broken, and the connector's own is reachable from it.
+      must(w.gh.live.has(st.token!) && !st.rec?.brokenAt && st.rec?.connectorId === id, `${x.agentId} holds a dead token or a broken flag`);
+      must(succeeded(await w.tool(x)), `${x.agentId}'s call failed`);
+    }
+    must((await w.status(a.raftAgentId)).body.oauthStatus === "connected" && (await w.status(b.raftAgentId)).body.oauthStatus === "connected", "reported broken");
+    w.dispose();
+  });
+}
 
 await check("nothing logged carries a token value: not the exchange's, a renewal's, or a refusal's", async () => {
   // Every scenario above has run with every log line and console line captured.
