@@ -257,10 +257,11 @@ await check("concurrent calls in one object, and an agent on the same connector 
   const a = await w.agent("A4");
   const b = await w.agent("B4");
   const id = await w.connect(a);
+  w.db.raw.prepare("UPDATE connectors SET last_checked_at = 1 WHERE id = ?").run(id);
   const bound = await w.call("PUT", `/agents/by-raft-agent/B4/connections/github`, { connectorId: id, actingRaftUserId: "u_owner", actingRole: "creator" });
   must(bound.status === 200, `bind: ${bound.text}`);
   const checked = (w.db.raw.prepare("SELECT created_at, last_checked_at FROM connectors WHERE id = ?").get(id) as any);
-  must(checked.last_checked_at >= checked.created_at && Date.parse((await w.status("B4")).body.lastCheckedAt) === checked.last_checked_at, `pointing an agent at it is a check: ${JSON.stringify(checked)}`);
+  must(checked.last_checked_at >= checked.created_at && checked.last_checked_at > 1 && Date.parse((await w.status("B4")).body.lastCheckedAt) === checked.last_checked_at, `pointing an agent at it is a check: ${JSON.stringify(checked)}`);
   await w.expireAt(a, Date.now() + 30_000, id);
   await w.expireAt(b, Date.now() + 30_000);
   w.gh.s.delayMs = 50;
