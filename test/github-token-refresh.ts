@@ -336,6 +336,30 @@ await check("a refused renewal marks the connection as needing a reconnect: in D
   w.dispose();
 });
 
+await check("a connection with no connector (made before connectors) is marked on its own row, GET reports it, and a reconnect clears it", async () => {
+  const w = await world();
+  const a = await w.agent("A12");
+  const { grant } = await w.gh.code();
+  await a.rt.holdConnection(TENANT, a.agentId, "github", grant, "pend_A12_00001", Date.now() + 600_000, "u_owner");
+  must((await a.rt.confirmConnection(TENANT, a.agentId, "github", "pend_A12_00001", "u_owner")).ok, "confirm");
+  await d1Connections(w.db).put({ tenantId: TENANT, raftAgentId: "A12", provider: "github", account: "octocat", connectedBy: "u_owner", connectedAt: Date.now(), connectorId: null });
+  must((await w.status("A12")).body.connected === true, "not connected to begin with");
+  await w.expireAt(a, Date.now() + 30_000);
+  w.gh.live.delete((await w.stored(a)).token!);
+  w.gh.s.refuse = true;
+  must(!succeeded(await w.tool(a)), "the call succeeded on a dead connection");
+  const row = w.db.raw.prepare("SELECT broken_at, broken_reason FROM provisioned_connections WHERE raft_agent_id = 'A12'").get() as any;
+  must(row.broken_at && /bad_refresh_token/.test(row.broken_reason), JSON.stringify(row));
+  const got = await w.status("A12");
+  must(got.body.connected === false && got.body.oauthStatus === "error" && got.body.oauthError === RECONNECT_REASON && got.body.connectorId === null, got.text);
+  w.gh.s.refuse = false;
+  await w.connect(a, "pend_A12_again_1");
+  const mended = await w.status("A12");
+  must(mended.body.connected === true && mended.body.oauthStatus === undefined, mended.text);
+  must((w.db.raw.prepare("SELECT broken_at FROM provisioned_connections WHERE raft_agent_id = 'A12'").get() as any).broken_at === null, "the row still says broken");
+  w.dispose();
+});
+
 await check("a 401 that persists after a renewal is GitHub's verdict: the connection is marked, once", async () => {
   const w = await world();
   const a = await w.agent("A7");

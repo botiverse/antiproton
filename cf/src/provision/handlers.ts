@@ -1041,7 +1041,8 @@ async function connection(
     }));
     // A connection GitHub refused to renew is not connected, though its row stays: which account it was, and that
     // only connecting again mends it, in the words Raft's own OAuth connectors use (`oauthStatus`).
-    const brokenAt = all.find((k) => k.id === current)?.brokenAt ?? got?.brokenAt ?? null;
+    const k = current === null ? undefined : all.find((x) => x.id === current);
+    const brokenAt = (k ? k.brokenAt : got?.brokenAt) ?? null;
     return ok({
       ...(got
         ? { connected: brokenAt === null, connectorId: current, account: got.account, connectedAt: new Date(got.connectedAt).toISOString(), connectedBy: got.connectedBy, ...needsReconnect(brokenAt) }

@@ -144,7 +144,7 @@ export async function renewConnector(d: ConnectorDeps, tenantId: string, id: str
   return { ok: false, broken: false, reason: r.reason };
 }
 
-const GUARD_TABLE = "CREATE TABLE IF NOT EXISTS oauth_refreshing(name TEXT PRIMARY KEY, until INTEGER NOT NULL)";
+const GUARD_TABLE = "CREATE TABLE IF NOT EXISTS oauth_refreshing(name TEXT PRIMARY KEY, until INTEGER NOT NULL, owner TEXT NOT NULL)";
 
 export interface RefresherDeps {
   store: Pick<StorageAdapter, "getSecret" | "putSecret" | "removeSecret" | "secretMeta" | "touchSecret">;
@@ -163,6 +163,8 @@ export interface RefresherDeps {
 export class GithubRefresher {
   #d: RefresherDeps;
   #chains = new Map<string, Promise<unknown>>();
+  /** Whose stored guard is whose: this runtime's own calls are ordered by the chain, and wait only on another's. */
+  #owner = crypto.randomUUID();
   constructor(d: RefresherDeps) { this.#d = d; }
   #now() { return this.#d.now?.() ?? Date.now(); }
   #sleep(ms: number) { return this.#d.sleep?.(ms) ?? new Promise<void>((r) => setTimeout(r, ms)); }
@@ -249,11 +251,12 @@ export class GithubRefresher {
     const sql = this.#d.sql;
     sql.exec(GUARD_TABLE);
     const gname = `${tenantId}/${agentId}/${name}`;
-    const until = () => Number((sql.exec("SELECT until FROM oauth_refreshing WHERE name = ?", gname).toArray()[0] as any)?.until ?? 0);
+    const held = () => sql.exec("SELECT until, owner FROM oauth_refreshing WHERE name = ?", gname).toArray()[0] as { until: number; owner: string } | undefined;
     // Held by another runtime in this object: wait for it, then read what it wrote. Past its time, it died mid-way.
-    while (until() > this.#now()) await this.#sleep(250);
-    if (until()) logEvent("github.refresh", { tenantId, agentId, mount: name, why, outcome: "interrupted-before" });
-    sql.exec("INSERT OR REPLACE INTO oauth_refreshing(name, until) VALUES (?, ?)", gname, this.#now() + LEASE_MS);
+    // Read and taken with no await in between, so two runtimes cannot both find it free.
+    for (let g = held(); g && g.owner !== this.#owner && Number(g.until) > this.#now(); g = held()) await this.#sleep(250);
+    if (held()) logEvent("github.refresh", { tenantId, agentId, mount: name, why, outcome: "interrupted-before" });
+    sql.exec("INSERT OR REPLACE INTO oauth_refreshing(name, until, owner) VALUES (?, ?, ?)", gname, this.#now() + LEASE_MS, this.#owner);
     try {
       return await this.#renew(tenantId, agentId, name, why, stale);
     } finally {
