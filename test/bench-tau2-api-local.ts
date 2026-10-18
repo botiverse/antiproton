@@ -187,9 +187,14 @@ const TASK = { id: "fx", user_scenario: { instructions: { reason_for_call: "canc
   { name: "cancel_pending_order", arguments: { order_id: "#W1", reason: "no longer needed" } },
 ] } };
 const POLICY = "# Retail agent policy\n\nOnly cancel pending orders.\n";
-/** The customer: asks once, then ends. Each reply sleeps, so the row's simMs is pinned against a known floor. */
+/** The customer: asks once, then ends. Each reply takes SIM_MS, so the row's simMs is pinned against a known floor. */
+const SIM_MS = 30;
 const sim: ApiTaskDeps["sim"] = async (messages) => {
-  await new Promise((r) => setTimeout(r, 30));
+  // The floor is kept on Date.now(), the clock the runner times simMs with (bench/tau2/api-task.ts `converse`).
+  // A timer keeps its delay on the event loop's own millisecond clock instead, so a single setTimeout(30)
+  // measures 29 by Date.now() in about 2 calls in 100, and two of them summed to 59 under the floor of 60.
+  const until = Date.now() + SIM_MS;
+  while (Date.now() < until) await new Promise((r) => setTimeout(r, until - Date.now()));
   return { text: messages.length <= 2 ? "Please cancel my order #W1, I no longer need it." : "Thanks! ###STOP###", finishReason: "stop" };
 };
 
@@ -214,8 +219,8 @@ await check("a task over the API runs to dbMatch: the customer's message, two ca
   flashWindow.to = Date.now();
   must(flash.dbMatch && flash.actionMatch && flash.reward === 1, show(flash));
   must(flash.ended === "stop" && flash.turns === 1 && flash.simCalls === 2, show([flash.ended, flash.turns, flash.simCalls]));
-  // The runner times the sim (30ms a call, twice here): without simMs in the row this reds.
-  must(flash.simMs >= 60, show(flash.simMs));
+  // The runner times the sim (SIM_MS a call, twice here): without simMs in the row this reds.
+  must(flash.simMs >= 2 * SIM_MS, `simMs ${show(flash.simMs)} is under the sim's floor of ${2 * SIM_MS}`);
   // One agent answer this row, received in-process; two tool runs (get_order_details, cancel_pending_order).
   must(Array.isArray(flash.replyAts) && flash.replyAts.length === 1 && flash.replyAts[0] >= flashWindow.from, show(flash.replyAts));
   must(typeof flash.toolExecMs === "number", show(flash.toolExecMs));
