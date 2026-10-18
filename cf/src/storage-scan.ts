@@ -22,8 +22,18 @@ type Sql = { exec(query: string, ...bindings: unknown[]): Iterable<Record<string
  * scan from holding it: a few MB of cells read and a bounded number of rows, well under the object's memory; an R2
  * object larger than `maxObjectBytes` is not read at all, and counted as skipped.
  */
-export interface ScanLimits { maxRows: number; maxBytes: number; maxObjects: number; maxObjectBytes: number }
-export const SCAN_LIMITS: ScanLimits = { maxRows: 200_000, maxBytes: 8 * 1024 * 1024, maxObjects: 2_000, maxObjectBytes: 16 * 1024 * 1024 };
+export interface ScanLimits { maxRows: number; maxBytes: number; maxObjects: number; maxObjectBytes: number; maxObjectTotalBytes: number }
+export const SCAN_LIMITS: ScanLimits = {
+  maxRows: 200_000, maxBytes: 8 * 1024 * 1024, maxObjects: 2_000, maxObjectBytes: 16 * 1024 * 1024,
+  // R2 is read one object at a time, so this bounds the call's time rather than its memory.
+  maxObjectTotalBytes: 256 * 1024 * 1024,
+};
+
+/**
+ * Tables a Durable Object may not read: Cloudflare's own (`_cf_…`, which answer SQLITE_AUTH) and SQLite's (`sqlite_…`).
+ * Not the agent's data, so skipped, and counted so the answer says what it did not read.
+ */
+const SYSTEM_TABLE = /^(?:_cf_|sqlite_)/i;
 
 export interface StorageScan {
   found: boolean;
@@ -32,6 +42,12 @@ export interface StorageScan {
   scanned: { tables: number; rows: number; objects: number };
   /** R2 objects over the per-object cap, not read. */
   skipped: number;
+  /** System tables not read (`SYSTEM_TABLE`): not the agent's data, so not a gap. */
+  systemSkipped: number;
+  /** The agent's tables a read of failed, by name. Any makes the scan `truncated` and not `complete`. */
+  unreadable: string[];
+  /** Everything of the agent's was read: not `truncated`, nothing `unreadable`. Only then is `found: false` a pass. */
+  complete: boolean;
   truncated: boolean;
 }
 
@@ -66,25 +82,34 @@ const cellText = (v: unknown): string | null =>
   : null;
 
 /** Every table of an agent's object, row by row. Reads only. */
-export function scanTables(sql: Sql, needle: string, limits: ScanLimits = SCAN_LIMITS): { tables: string[]; scanned: { tables: number; rows: number }; truncated: boolean } {
+export function scanTables(sql: Sql, needle: string, limits: ScanLimits = SCAN_LIMITS): {
+  tables: string[]; scanned: { tables: number; rows: number }; truncated: boolean; systemSkipped: number; unreadable: string[];
+} {
   const n = needle.toLowerCase();
   const found = new Set<string>();
-  let rows = 0, bytes = 0, tables = 0, truncated = false;
+  const unreadable: string[] = [];
+  let rows = 0, bytes = 0, tables = 0, system = 0, truncated = false;
   const names = [...sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")].map((r) => String(r.name));
-  outer: for (const name of names) {
+  for (const name of names) {
+    if (SYSTEM_TABLE.test(name)) { system++; continue; }
+    if (rows >= limits.maxRows || bytes >= limits.maxBytes) { truncated = true; break; }
     tables++;
-    for (const row of sql.exec(`SELECT * FROM "${name.replace(/"/g, '""')}"`)) {
-      if (rows >= limits.maxRows || bytes >= limits.maxBytes) { truncated = true; break outer; }
-      rows++;
-      for (const cell of Object.values(row as Record<string, unknown>)) {
-        const text = cellText(cell);
-        if (text === null) continue;
-        bytes += text.length;
-        if (!found.has(name) && holds(text, n)) found.add(name);
+    // One table the object may not read, or that fails part-way, is named and passed over; the others are still read.
+    try {
+      for (const row of sql.exec(`SELECT * FROM "${name.replace(/"/g, '""')}"`)) {
+        if (rows >= limits.maxRows || bytes >= limits.maxBytes) { truncated = true; break; }
+        rows++;
+        for (const cell of Object.values(row as Record<string, unknown>)) {
+          const text = cellText(cell);
+          if (text === null) continue;
+          bytes += text.length;
+          if (!found.has(name) && holds(text, n)) found.add(name);
+        }
       }
-    }
+    } catch { unreadable.push(name); }
+    if (truncated) break;
   }
-  return { tables: [...found], scanned: { tables, rows }, truncated };
+  return { tables: [...found], scanned: { tables, rows }, truncated: truncated || unreadable.length > 0, systemSkipped: system, unreadable };
 }
 
 /** The part of an R2 bucket this reads. */
@@ -111,6 +136,8 @@ export async function scanObjects(bucket: ScanBucket, prefixes: string[], needle
         if (scanned >= limits.maxObjects) return { objects, scanned, skipped, truncated: true };
         // Not read: an object of unknown size is not trusted to be small.
         if (o.size === undefined || o.size > limits.maxObjectBytes) { skipped++; truncated = true; continue; }
+        // The call's budget for R2 as a whole: an object that would pass it is not fetched, and the walk ends there.
+        if (bytes + o.size > limits.maxObjectTotalBytes) return { objects, scanned, skipped, truncated: true };
         const body = await bucket.get(o.key);
         if (!body) continue;
         const text = await body.text();

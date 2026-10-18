@@ -4916,15 +4916,24 @@ async function unaddressed(request: Request, env: Env, url: URL): Promise<Respon
           if (!t || !a) return Response.json({ error: "tenantId and agentId are required" }, { status: 400 });
           const why = needleProblem(b.needle);
           if (why) return Response.json({ error: why }, { status: 400 });
-          const tables = await env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a))).adminStorageScan(t, a, b.needle as string);
-          if (!tables) return Response.json({ error: "no such agent" }, { status: 404 });
-          const objects = await scanObjects(env.ARTIFACTS as unknown as ScanBucket, agentPrefixes(t, a), b.needle as string);
-          const out: StorageScan = {
-            found: tables.tables.length > 0 || objects.objects > 0, tables: tables.tables, objects: objects.objects,
-            scanned: { tables: tables.scanned.tables, rows: tables.scanned.rows, objects: objects.scanned }, skipped: objects.skipped,
-            truncated: tables.truncated || objects.truncated,
-          };
-          logEvent("admin.storage_scan", { tenantId: t, agentId: a, found: out.found, truncated: out.truncated });
+          // A failure is answered with a fixed text: an error's message can quote what was being read.
+          let out: StorageScan;
+          try {
+            const tables = await env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a))).adminStorageScan(t, a, b.needle as string);
+            if (!tables) return Response.json({ error: "no such agent" }, { status: 404 });
+            const objects = await scanObjects(env.ARTIFACTS as unknown as ScanBucket, agentPrefixes(t, a), b.needle as string);
+            out = {
+              found: tables.tables.length > 0 || objects.objects > 0, tables: tables.tables, objects: objects.objects,
+              scanned: { tables: tables.scanned.tables, rows: tables.scanned.rows, objects: objects.scanned }, skipped: objects.skipped,
+              systemSkipped: tables.systemSkipped, unreadable: tables.unreadable,
+              truncated: tables.truncated || objects.truncated,
+              complete: !tables.truncated && !objects.truncated && tables.unreadable.length === 0,
+            };
+          } catch {
+            logEvent("admin.storage_scan", { tenantId: t, agentId: a, failed: true });
+            return Response.json({ error: "the scan failed" }, { status: 500 });
+          }
+          logEvent("admin.storage_scan", { tenantId: t, agentId: a, found: out.found, truncated: out.truncated, unreadable: out.unreadable.length });
           return Response.json(out);
         }
         case "/admin/cancel-turn": {

@@ -401,8 +401,14 @@ its prefixes (`t/<tenant>/<agent>/`, `trace/<tenant>/<agent>/`), and says where 
 count of objects, with how much was read. It is the check for a data contract such as RaftBench's (no copy of the
 source text outlives a run). A match is case-insensitive and also looks inside JSON-escaped strings. The needle is not
 returned and not logged (`admin.storage_scan` carries the ids and `found`). Past its caps the answer says `truncated`,
-and a `found: false` then covers only what was read. Each call reads a few MB of an agent's tables at most, and
-skips R2 objects over 16 MB (`skipped`). It is operator-only for a reason: any substring of four characters or more can
+and a `found: false` then covers only what was read. Each call reads a few MB of an agent's tables at most, skips R2
+objects over 16 MB (`skipped`), and stops its R2 walk at 256 MB read. Cloudflare's and SQLite's own tables (`_cf_…`,
+`sqlite_…`), which an object may not read and which hold none of the agent's data, are counted in `systemSkipped`. A
+table that fails to read is named in `unreadable`, and the answer is then `truncated` and not `complete`.
+
+**A scan passes only with `found: false`, `truncated: false` and an empty `unreadable`** (`complete: true`). Anything
+else is not a pass: a `found: false` beside `truncated` or `unreadable` says only that the part that was read held none.
+A failure is answered `500` with a fixed text. It is operator-only for a reason: any substring of four characters or more can
 be asked about, so it answers whether a text is stored, and is an oracle for what an agent holds.
 
 ```
