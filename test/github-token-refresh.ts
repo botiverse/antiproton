@@ -821,6 +821,18 @@ await check("a reconnect authorized as another GitHub account is refused, 409 ac
   w.dispose();
 });
 
+await check("the D1 write itself refuses another account's id, for an id that changed between the handler's read and its write", async () => {
+  const w = await world();
+  const a = await w.agent("R10");
+  const id = await w.connect(a);
+  const row0 = connectorRow(w, id);
+  const next = { sealed: { ciphertext: "x", iv: "y" }, refresh: null, account: "mallory", accountId: "2", at: Date.now() };
+  must(!(await d1Connectors(w.db).reconnect(TENANT, id, next)), "another account's pair was written");
+  must(!(await d1Connectors(w.db).reconnect("t-other", id, { ...next, accountId: "1" })), "another tenant wrote over the connector");
+  must(JSON.stringify(connectorRow(w, id)) === JSON.stringify(row0), "the connector changed");
+  w.dispose();
+});
+
 await check("a connector from before the id was kept is matched by its login, and learns the id at the reconnect", async () => {
   const w = await world();
   const a = await w.agent("R4");
