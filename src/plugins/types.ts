@@ -2354,10 +2354,17 @@ export interface PluginNext {
   turnKey?: string;
   /**
    * Post `turn` in a new main conversation (cf/src/fresh-context.ts), so the model is sent nothing from before it: for
-   * a turn whose input stands on its own. Refused, with the turn not posted and a log line, while a run is still going
-   * in the main conversation.
+   * a turn whose input stands on its own. While a run is still going in the main conversation the turn waits, kept,
+   * and is posted on a later pass. Under a profile that keeps no conversations (src/runtime/agent-profile.ts) the one
+   * before is erased rather than archived (`forget`).
    */
   fresh?: true;
+  /**
+   * Erase the main conversation: its transcript, its model jobs, and the model's text in the turn ends kept, so nothing
+   * it held stays in the agent's storage. For a plugin whose turns carry material that must not outlive their use.
+   * Waits, kept, while a run is going in it.
+   */
+  forget?: true;
   /** Call this mount's `wake` at or after this time (epoch ms). */
   wakeAt?: number;
   /**

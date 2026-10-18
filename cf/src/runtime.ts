@@ -28,7 +28,7 @@ import {
 import { logEvent } from "../../src/core/log.ts";
 import { appendTrace } from "../../src/trace/outbox.ts";
 import { markHarnessDrop, recordHarnessOpen, type HarnessDropReason } from "../../src/runtime/harness-open.ts";
-import { currentMainId, mainSessions, modelInputCalls, readModelInput, recordModelInput, startFreshMain, type MainSessionRow, type ModelInputEvidence } from "./fresh-context.ts";
+import { currentMainId, eraseMain, mainSessions, modelInputCalls, readModelInput, recordModelInput, startFreshMain, type MainSessionRow, type ModelInputEvidence } from "./fresh-context.ts";
 import { recordImageAttempt } from "./image-evidence.ts";
 import { heldDecision, warningText } from "../../src/runtime/idle-lease.ts";
 import { heldItems, heldLines, heldParagraph, heldResources, withHeldNote } from "../../src/runtime/held.ts";
@@ -56,7 +56,7 @@ import { logicalMain, physicalSession } from "./fresh-context.ts";
 import { profilePrompt, systemPrompt } from "../../src/runtime/pi-prompt.ts";
 import { profileOf, profileSpec } from "../../src/runtime/agent-profile.ts";
 import {
-  askWake, bindTurn, dropAnswer, dropWake, dueWakes, keepAnswer, keepsPluginCalls, markAnswerPosting, nextWakeAt, pendingAnswers, pendingTurnEnds, recordTurnEnd,
+  askedTurn, askWake, bindTurn, dropAnswer, forgetTurnText, keepTurnOnly, dropWake, dueWakes, keepAnswer, keepsPluginCalls, markAnswerPosting, nextWakeAt, pendingAnswers, pendingTurnEnds, recordTurnEnd,
   turnEndHandled, turnEndOf,
 } from "../../src/runtime/plugin-wakes.ts";
 import type { PluginHookAnswer } from "../../src/runtime/gateway.ts";
@@ -5417,7 +5417,7 @@ export class AgentRuntime {
     const keep = (hook: string, answers: PluginHookAnswer[]) => {
       for (const a of answers) {
         if ("next" in a) {
-          if (a.next && (a.next.turn !== undefined || a.next.wakeAt !== undefined || a.next.cancelTurn)) keepAnswer(sql, a.alias, a.next);
+          if (a.next && (a.next.turn !== undefined || a.next.wakeAt !== undefined || a.next.cancelTurn || a.next.forget)) keepAnswer(sql, a.alias, a.next);
         } else logEvent("plugin.hook", { tenantId, agentId, mount: a.alias, hook, ...("failed" in a ? { failed: a.failed } : { skipped: a.skipped }) });
       }
     };
@@ -5429,7 +5429,10 @@ export class AgentRuntime {
       const answers = await this.#gateway.wake(tenantId, agentId, w.alias);
       transact(() => { keep("wake", answers); dropWake(sql, w.alias, w.gen); });
     }
-    let posted = false, cancelled = false;
+    let posted = false, cancelled = false, waiting = false;
+    // Whether this agent's ended conversations are archived or erased (src/runtime/agent-profile.ts `keepsConversations`).
+    const profile = profileOf((await this.store.loadAgent(tenantId, agentId))?.config);
+    const keeps = profile === null || profileSpec(profile).keepsConversations;
     for (const a of pendingAnswers(sql)) {
       if (a.posting) {
         logEvent("plugin.hook", { tenantId, agentId, mount: a.alias, hook: "turn", dropped: "the pass posting it ended mid-way; not posted again, so it cannot start twice" });
@@ -5441,22 +5444,33 @@ export class AgentRuntime {
         try { cancelled = (await this.cancelSession(tenantId, agentId, MAIN_SESSION)).cancelledTurn !== null || cancelled; }
         catch (e) { logEvent("plugin.hook", { tenantId, agentId, mount: a.alias, hook: "cancel", error: String((e as Error)?.message ?? e).slice(0, 200) }); }
       }
+      // A fresh turn, or an erase, waits while a run is going in the main conversation: kept as only what is left of it,
+      // for a later pass, which comes back soon.
+      const busy = (a.next.fresh || a.next.forget) ? mainBusy(sql) : null;
+      if (busy) {
+        keepTurnOnly(sql, a.seq, a.next);
+        waiting = true;
+        continue;
+      }
+      if (a.next.forget || (a.next.fresh && !keeps)) {
+        // Before the post, so the turn it may carry starts in an empty conversation: nothing of the one ending is kept.
+        eraseMain(this.#deps.ctx.storage, Date.now());
+        forgetTurnText(sql);
+        await this.dropHarnesses(tenantId, agentId, "fresh-context");
+      } else if (a.next.fresh) {
+        startFreshMain(this.#deps.ctx.storage, Date.now());
+        await this.dropHarnesses(tenantId, agentId, "fresh-context");
+      }
       if (typeof a.next.turn === "string") {
+        const turnKey = a.next.turnKey;
         try {
-          // A turn that stands on its own starts a conversation of its own, so nothing from an earlier one is sent with it.
-          const busy = a.next.fresh ? mainBusy(sql) : null;
-          if (busy) {
-            logEvent("plugin.hook", { tenantId, agentId, mount: a.alias, hook: "turn", dropped: `a fresh conversation was asked for while ${busy}` });
-          } else {
-            if (a.next.fresh) {
-              startFreshMain(this.#deps.ctx.storage, Date.now());
-              await this.dropHarnesses(tenantId, agentId, "fresh-context");
-            }
-            const out = await this.postMessage(tenantId, agentId, a.next.turn, "prompt", MAIN_SESSION, { beforeSay: () => markAnswerPosting(sql, a.seq) });
-            const op = (out.result as { value?: { operationId?: unknown } } | null)?.value?.operationId;
-            if (typeof a.next.turnKey === "string" && typeof op === "string") bindTurn(sql, op, a.alias, a.next.turnKey, Date.now());
-            posted = true;
-          }
+          const out = await this.postMessage(tenantId, agentId, a.next.turn, "prompt", MAIN_SESSION, {
+            // In the same synchronous step as the post's write: an eviction before the run's id is bound still names it.
+            beforeSay: () => { markAnswerPosting(sql, a.seq); if (typeof turnKey === "string") askedTurn(sql, a.alias, turnKey, Date.now()); },
+          });
+          const op = (out.result as { value?: { operationId?: unknown } } | null)?.value?.operationId;
+          if (typeof turnKey === "string" && typeof op === "string") bindTurn(sql, op, a.alias, turnKey, Date.now());
+          posted = true;
         } catch (e) {
           logEvent("plugin.hook", { tenantId, agentId, mount: a.alias, hook: "turn", error: String((e as Error)?.message ?? e).slice(0, 200) });
         }
@@ -5464,7 +5478,8 @@ export class AgentRuntime {
       dropAnswer(sql, a.seq);
     }
     const next = nextWakeAt(sql);
-    return { posted, cancelled, wakeInMs: next === null ? null : Math.max(0, next - Date.now()) };
+    const due = next === null ? null : Math.max(0, next - Date.now());
+    return { posted, cancelled, wakeInMs: waiting ? Math.min(due ?? HOOK_WAIT_MS, HOOK_WAIT_MS) : due };
   }
 
   /**
@@ -6025,6 +6040,9 @@ export const SEEDED_PLUGINS: ReadonlySet<string> = new Set(
  * Pure on purpose: the same inputs, no I/O, so one case can compute rows from
  * the real registry and the real catalogue and hand them to the page.
  */
+/** How soon a pass comes back for a plugin's turn that waits for the main conversation to be free. */
+const HOOK_WAIT_MS = 5_000;
+
 export function installedRows(
   installed: readonly Plugin[],
   choices: Record<string, PluginChoice>,

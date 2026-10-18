@@ -38,6 +38,7 @@
  * eviction: what is to be submitted is written before it is first sent, and every later send is the same result, so
  * a replay never submits a different one and never runs the model again.
  */
+import { randomUUID } from "node:crypto";
 import { clip, logEvent, routeOf } from "../core/log.ts";
 import type { Json } from "../core/types.ts";
 import {
@@ -138,6 +139,8 @@ interface RunState {
   deadline: number;
   /** Reads of the material started: at most `MAX_READS`. */
   reads: number;
+  /** Made when the assignment is kept, so a run assigned again under the same id and revision asks under other keys. */
+  nonce: string;
   /** The key of the turn this run asked for last (`PluginNext.turnKey`): only that turn's end is this run's answer. */
   turnKey?: string;
   /** Model calls asked for in this read, and in the whole run: counted before each is asked for. */
@@ -250,7 +253,10 @@ const same = (a: { runId: string; revision: number } | null, b: { runId: string;
 
 /** A new run's state: nothing read, no call made, its deadline from when its assignment arrived. */
 function assigned(a: { runId: string; revision: number }, receivedAt: number): RunState {
-  return { runId: a.runId, revision: a.revision, phase: "reading", deadline: receivedAt + RUN_DEADLINE_MS, reads: 0, readCalls: 0, calls: 0, retries: 0 };
+  return {
+    runId: a.runId, revision: a.revision, phase: "reading", deadline: receivedAt + RUN_DEADLINE_MS, nonce: randomUUID().slice(0, 8),
+    reads: 0, readCalls: 0, calls: 0, retries: 0,
+  };
 }
 
 /** Read the run's material (again, on a reread) and hand the model its first turn. */
@@ -292,7 +298,7 @@ async function resumeRead(ctx: PluginContext, raft: Raft, reading: RunState): Pr
  */
 async function ask(ctx: PluginContext, run: RunState, text: string, fresh: boolean): Promise<PluginNext> {
   const calls = run.calls + 1;
-  const turnKey = `${run.runId}:${run.revision}:${calls}`;
+  const turnKey = `${run.runId}:${run.revision}:${run.nonce}:${calls}`;
   const asking: RunState = { ...run, phase: "turn", readCalls: run.readCalls + 1, calls, turnKey };
   await save(ctx, CURRENT, asking);
   return { turn: text, turnKey, ...(fresh ? { fresh: true as const } : {}) };
@@ -376,17 +382,22 @@ function timeout(ctx: PluginContext, raft: Raft, run: RunState): Promise<PluginN
   return submitFailed(ctx, raft, run, `timeout (${read})`);
 }
 
-/** The run is over; an assignment that arrived meanwhile starts now. */
+/**
+ * The run is over, whatever became of it: what it kept of its material and its answer goes. Its state keeps ids,
+ * counters, the deadline and the outcome; the conversation that held the material and the model's answers is erased
+ * (`forget`). An assignment that arrived meanwhile starts now, in a conversation of its own.
+ */
 async function end(ctx: PluginContext, raft: Raft, run: RunState, outcome: string, extra: Record<string, unknown>): Promise<PluginNext | void> {
   const done: RunState = { ...run, phase: "done", outcome };
   delete done.body;
+  delete done.reason;
   delete done.retryAt;
   await save(ctx, CURRENT, done);
   log(ctx, run, "done", { outcome, ...extra });
   const next = await load(ctx, NEXT);
-  if (!next) return;
+  if (!next) return { forget: true };
   await ctx.db.delete(STORE, NEXT);
-  return read(ctx, raft, next);
+  return { ...(await read(ctx, raft, next) ?? {}), forget: true };
 }
 
 /** The model's last text as the result it is meant to be: one JSON object, or a single fenced JSON block. */
@@ -416,7 +427,7 @@ async function answer(ctx: PluginContext, next: PluginNext | void): Promise<Plug
   const at = [next?.wakeAt, due ?? undefined].filter((t): t is number => t !== undefined);
   const out: PluginNext = { ...(next ?? {}) };
   if (at.length) out.wakeAt = Math.min(...at);
-  return out.turn !== undefined || out.wakeAt !== undefined || out.cancelTurn ? out : undefined;
+  return out.turn !== undefined || out.wakeAt !== undefined || out.cancelTurn || out.forget ? out : undefined;
 }
 
 export const raftbenchPlugin: Plugin = {

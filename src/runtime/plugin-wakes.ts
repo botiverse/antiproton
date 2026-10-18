@@ -13,7 +13,9 @@
  *   drops its wake, so a hook that has answered is never asked again. Its turn is posted once: the row is marked
  *   `posting` just before the post's write, and a row found `posting` later is dropped rather than posted twice;
  * - **a turn a hook asked for**, by its run's operation id, with the mount and the key it gave, so its end is told to
- *   that mount with that key (`TurnEnd.turnKey`) and to every other mount as a turn it did not ask for.
+ *   that mount with that key (`TurnEnd.turnKey`) and to every other mount as a turn it did not ask for. The key is
+ *   written down (`plugin_turn_asked`) in the same synchronous step as the post's write, before the run's id is known,
+ *   and bound to it once it is; an eviction between the two is bound when the run's end is recorded.
  */
 import type { PluginNext, TurnEnd } from "../plugins/types.ts";
 
@@ -25,6 +27,7 @@ export function ensurePluginWakeTables(sql: Sql) {
   sql.exec("CREATE TABLE IF NOT EXISTS plugin_turn_ends (seq INTEGER PRIMARY KEY AUTOINCREMENT, operation_id TEXT NOT NULL UNIQUE, body TEXT NOT NULL, at INTEGER NOT NULL, handled INTEGER)");
   sql.exec("CREATE TABLE IF NOT EXISTS plugin_wakes (alias TEXT PRIMARY KEY, at INTEGER NOT NULL, gen INTEGER NOT NULL)");
   sql.exec("CREATE TABLE IF NOT EXISTS plugin_turns (operation_id TEXT PRIMARY KEY, alias TEXT NOT NULL, turn_key TEXT NOT NULL, at INTEGER NOT NULL)");
+  sql.exec("CREATE TABLE IF NOT EXISTS plugin_turn_asked (id INTEGER PRIMARY KEY CHECK (id = 1), alias TEXT NOT NULL, turn_key TEXT NOT NULL, at INTEGER NOT NULL)");
   sql.exec("CREATE TABLE IF NOT EXISTS plugin_answers (seq INTEGER PRIMARY KEY AUTOINCREMENT, alias TEXT NOT NULL, body TEXT NOT NULL, posting INTEGER NOT NULL DEFAULT 0)");
 }
 
@@ -39,6 +42,12 @@ export function keepsPluginCalls(sql: Sql): boolean {
 /** A turn's end, owed to the plugins that take it. The same turn told again is ignored. */
 export function recordTurnEnd(sql: Sql, operationId: string, end: Omit<TurnEnd, "turnId" | "turnKey">, at: number) {
   ensurePluginWakeTables(sql);
+  // A turn asked for whose run's id was never bound (an eviction right after its post) is this one: nothing else
+  // starts a run between a post and its end being recorded.
+  const asked = sql.exec("SELECT alias, turn_key FROM plugin_turn_asked WHERE id = 1").toArray()[0];
+  if (asked && sql.exec("SELECT 1 AS x FROM plugin_turns WHERE operation_id = ?", operationId).toArray().length === 0) {
+    bindTurn(sql, operationId, String(asked.alias), String(asked.turn_key), at);
+  }
   sql.exec("INSERT OR IGNORE INTO plugin_turn_ends (operation_id, body, at) VALUES (?, ?, ?)", operationId, JSON.stringify(end), at);
 }
 
@@ -55,9 +64,16 @@ export function pendingTurnEnds(sql: Sql): Array<{ seq: number; operationId: str
   });
 }
 
+/** A turn about to be posted for a mount, under its key: called synchronously just before the post's write. */
+export function askedTurn(sql: Sql, alias: string, turnKey: string, now: number) {
+  ensurePluginWakeTables(sql);
+  sql.exec("INSERT OR REPLACE INTO plugin_turn_asked (id, alias, turn_key, at) VALUES (1, ?, ?, ?)", alias, turnKey, now);
+}
+
 /** The turn a mount's answer started, by its run's operation id; a day of them is kept, past any turn's end. */
 export function bindTurn(sql: Sql, operationId: string, alias: string, turnKey: string, now: number) {
   ensurePluginWakeTables(sql);
+  sql.exec("DELETE FROM plugin_turn_asked WHERE id = 1 AND turn_key = ?", turnKey);
   sql.exec("INSERT OR REPLACE INTO plugin_turns (operation_id, alias, turn_key, at) VALUES (?, ?, ?, ?)", operationId, alias, turnKey, now);
   sql.exec("DELETE FROM plugin_turns WHERE at < ?", now - HANDLED_KEPT_MS);
 }
@@ -101,6 +117,23 @@ export function pendingAnswers(sql: Sql): Array<{ seq: number; alias: string; ne
   ensurePluginWakeTables(sql);
   return sql.exec("SELECT seq, alias, body, posting FROM plugin_answers ORDER BY seq").toArray()
     .map((r) => ({ seq: Number(r.seq), alias: String(r.alias), next: JSON.parse(String(r.body)) as PluginNext, posting: Number(r.posting) === 1 }));
+}
+
+/** What a turn's end said of the model's text, gone: kept ends say only how each turn ended. */
+export function forgetTurnText(sql: Sql) {
+  if (!keepsPluginCalls(sql)) return;
+  for (const r of sql.exec("SELECT seq, body FROM plugin_turn_ends").toArray()) {
+    const end = JSON.parse(String(r.body)) as { finalText?: unknown };
+    if (end.finalText === null || end.finalText === undefined) continue;
+    sql.exec("UPDATE plugin_turn_ends SET body = ? WHERE seq = ?", JSON.stringify({ ...end, finalText: null }), Number(r.seq));
+  }
+}
+
+/** An answer whose turn or erase waits for the main conversation to be free, kept as only those. */
+export function keepTurnOnly(sql: Sql, seq: number, next: PluginNext) {
+  const { turn, turnKey, fresh, forget } = next;
+  sql.exec("UPDATE plugin_answers SET body = ? WHERE seq = ?",
+    JSON.stringify({ turn, ...(turnKey ? { turnKey } : {}), ...(fresh ? { fresh } : {}), ...(forget ? { forget } : {}) }), seq);
 }
 
 export function markAnswerPosting(sql: Sql, seq: number) {

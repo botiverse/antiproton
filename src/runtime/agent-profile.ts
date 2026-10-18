@@ -36,6 +36,12 @@ export interface ProfileSpec {
    * that briefing is a model call the agent did not ask for, and a turn of its own.
    */
   rebuildsContext: boolean;
+  /**
+   * Whether a main conversation that ends is archived, readable later, or erased (`eraseMain`, cf/src/fresh-context.ts):
+   * a profile whose turns carry material that must not be kept says false, and its plugin erases each one it is done
+   * with (`PluginNext.forget`).
+   */
+  keepsConversations: boolean;
 }
 
 export const AGENT_PROFILES = {
@@ -44,6 +50,8 @@ export const AGENT_PROFILES = {
     toolConfig: { mounts: [], harness: "minimal" }, maxTokens: RAFTBENCH_MAX_TOKENS,
     // Each run starts a conversation of its own, and its plugin counts its model calls: an overflow fails the run.
     rebuildsContext: false,
+    // RaftBench keeps only the latest result and no copy of the source text (botiverse/slock#10130).
+    keepsConversations: false,
   },
 } as const satisfies Record<string, ProfileSpec>;
 
@@ -63,6 +71,7 @@ export function profileSpec(profile: AgentProfile): ProfileSpec {
   const s = AGENT_PROFILES[profile];
   return {
     plugin: s.plugin, alias: s.alias, instructions: s.instructions, maxTokens: s.maxTokens, rebuildsContext: s.rebuildsContext,
+    keepsConversations: s.keepsConversations,
     toolConfig: { mounts: [...s.toolConfig.mounts], harness: s.toolConfig.harness },
   };
 }

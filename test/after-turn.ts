@@ -141,6 +141,21 @@ await check("a fresh turn starts a conversation of its own: the model is sent no
   must(sent.includes("on its own") && !sent.includes("avocado") && !sent.includes("noted"), sent.slice(0, 400));
 });
 
+await check("a fresh turn asked for while a run is going waits, kept, and is posted once the run has ended", async () => {
+  const w = await world();
+  await w.rt.postMessage("t", "a", "busy with this", "prompt", "main");
+  await steps(w);
+  const { keepAnswer, pendingAnswers } = await import("../src/runtime/plugin-wakes.ts");
+  keepAnswer(w.host.sql as any, "watcher-m", { turn: "after it", turnKey: "k-wait", fresh: true });
+  const out = await w.rt.step("t", "a");
+  must(pendingAnswers(w.host.sql as any).length === 1 && out.wakeInMs !== null && out.wakeInMs <= 5_000, `kept ${pendingAnswers(w.host.sql as any).length}, wake ${out.wakeInMs}`);
+  await reply(w, "done with it");
+  const job = await reply(w, "after");
+  must(lastUser(job) === "after it" && pendingAnswers(w.host.sql as any).length === 0, `posted ${JSON.stringify(lastUser(job))}`);
+  must(!show(job.context.messages).includes("busy with this"), "the waiting fresh turn was not fresh");
+  must(w.seen.some((s) => s.end.turnKey === "k-wait" && s.end.finalText === "after"), show(w.seen));
+});
+
 await check("a cancelled turn is told as cancelled, once, though the cancel and the step that follows both see it end", async () => {
   const w = await world();
   await w.rt.postMessage("t", "a", "hello", "prompt", "main");

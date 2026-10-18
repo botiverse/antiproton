@@ -169,9 +169,21 @@ function fakeRaft(): Fake {
 
 // ---- the agent ----------------------------------------------------------------------------------------------
 
-type World = { host: ReturnType<typeof sqliteHost>; rt: AgentRuntime; sent: string[]; answered: Set<string>; raft: Fake; jobs: any[] };
+type World = { host: ReturnType<typeof sqliteHost>; rt: AgentRuntime; sent: string[]; answered: Set<string>; raft: Fake; jobs: any[]; r2: Map<string, string> };
 
-function newRuntime(host: ReturnType<typeof sqliteHost>, sent: string[]) {
+/** The agent's R2 bucket (artifacts, parked results, the trace export's objects), recording every object written. */
+function fakeBucket(objects: Map<string, string>) {
+  const text = (b: unknown) => typeof b === "string" ? b : b instanceof Uint8Array ? new TextDecoder().decode(b) : b instanceof ArrayBuffer ? new TextDecoder().decode(new Uint8Array(b)) : JSON.stringify(b);
+  return {
+    async put(key: string, body: unknown) { objects.set(key, text(body)); return { key }; },
+    async get(key: string) { const v = objects.get(key); return v === undefined ? null : { text: async () => v, arrayBuffer: async () => new TextEncoder().encode(v).buffer, body: v }; },
+    async head(key: string) { const v = objects.get(key); return v === undefined ? null : { key, size: v.length }; },
+    async delete(keys: string | string[]) { for (const k of [keys].flat()) objects.delete(k); },
+    async list() { return { objects: [...objects.keys()].map((key) => ({ key })), truncated: false, delimitedPrefixes: [] }; },
+  };
+}
+
+function newRuntime(host: ReturnType<typeof sqliteHost>, sent: string[], r2: Map<string, string> = new Map()) {
   const rows = new Map<string, HookRow>();
   const directory = {
     async create(r: { hookId: string; tenantId: string; agentId: string; alias: string }) { rows.set(r.hookId, { ...r, createdAt: 1, revokedAt: null }); },
@@ -181,7 +193,7 @@ function newRuntime(host: ReturnType<typeof sqliteHost>, sent: string[]) {
   };
   return new AgentRuntime({
     ctx: { storage: { sql: host.sql, transactionSync: host.transactionSync } },
-    bucket: {} as never, bucketName: "b", models: { resolve: () => null },
+    bucket: fakeBucket(r2) as never, bucketName: "b", models: { resolve: () => null },
     autoRelease: false, secretKek: Buffer.from(new Uint8Array(32).fill(5)).toString("base64"),
     operatorModel: operatorModelOf({ DEEPSEEK_BASE_URL: "https://model.example/v1", DEEPSEEK_API_KEY: "operator-key", HARNESS_MODEL: "deepseek-flash" } as never),
     offloadModel: async (job: { commandId: string }) => { sent.push(job.commandId); },
@@ -194,13 +206,14 @@ async function world(): Promise<World> {
   const raft = fakeRaft();
   const host = sqliteHost();
   const sent: string[] = [];
-  const rt = newRuntime(host, sent);
+  const r2 = new Map<string, string>();
+  const rt = newRuntime(host, sent, r2);
   await rt.ready();
   const adopted = await adoptProvisionedAgent(rt, "t", SERVICE, { name: "raftbench-service", instructions: "Read-only RaftBench analysis service.", raftOrigin: ORIGIN, avatar: "00", toolConfig: null, profile: "raftbench_service" });
   must(adopted.ok, show(adopted));
   must((await rt.attachCredential("t", SERVICE, PROVISION_MOUNT_ALIAS, { token: CRED })).ok, "the credential was refused");
   must((await provisionTool(rt, "t", SERVICE, "enable_push")).ok && raft.push, "push was not registered");
-  return { host, rt, sent, answered: new Set(), raft, jobs: [] };
+  return { host, rt, sent, answered: new Set(), raft, jobs: [], r2 };
 }
 
 const hookOf = (w: World) => w.raft.push!.url.split("/").pop()!;
@@ -582,6 +595,112 @@ await check("an overflowed request is the run's failure, never a briefing: no mo
   must(new Set(w.sent).size === 1, `model calls after the overflow: ${show([...new Set(w.sent)])}`);
   const [s] = w.raft.submits();
   must(s && s.body.failure === true && /model failed/.test(s.body.reason), show(w.raft.submits().map((x) => x.body)));
+});
+
+// ---- what is kept: the latest result only, no copy of the material -------------------------------------------
+
+/** Every place `marker` is stored: each table of the agent's object, row by row, and each object in its R2 bucket. */
+function whereIs(w: World, marker: string): string[] {
+  const hits = new Set<string>();
+  const text = (v: unknown) => JSON.stringify(v, (_k, x) => x instanceof Uint8Array || x instanceof ArrayBuffer ? new TextDecoder().decode(x as Uint8Array) : x);
+  for (const t of w.host.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table'").toArray()) {
+    const name = String(t.name);
+    for (const r of w.host.sql.exec(`SELECT * FROM "${name.replace(/"/g, '""')}"`).toArray()) if (text(r).includes(marker)) hits.add(`table ${name}`);
+  }
+  for (const [key, body] of w.r2) if (body.includes(marker)) hits.add(`r2 ${key}`);
+  return [...hits];
+}
+const MATERIAL_MARK = "ZQ-MATERIAL-7741", ANSWER_MARK = "ZQ-ANSWER-7741";
+const markedPages = (): Page[] => [{ ...OTHER_PAGES[0]!, sourceText: `${OTHER_PAGES[0]!.sourceText} ${MATERIAL_MARK}` }];
+const markedAnswer = (over: Record<string, unknown> = {}) => goodResult({ patterns: [{ kind: "unsupported_completion", explanation: ANSWER_MARK,
+  evidence: [{ target: "#ops", messageId: MSG2[1] }], counterevidence: [], evidenceLevel: "conversation_only", intent: "active", suggestion: "" }], ...over });
+
+await check("retention: once a run ends, no copy of its material or its answer is left anywhere in the agent's storage", async () => {
+  const w = await world();
+  w.raft.pages = markedPages();
+  await assign(w);
+  must(whereIs(w, MATERIAL_MARK).length > 0, "the marker never reached storage, so the scan proves nothing");
+  // Its first answer is refused by the Server and fixed, so a fix-up and two answers are in the conversation.
+  await answer(w, markedAnswer({ patterns: [{ kind: "repeated_attempt", explanation: ANSWER_MARK, evidence: [{ target: "#ops", messageId: "deadbeef" }], counterevidence: [], evidenceLevel: "conversation_only", intent: "unknown", suggestion: "" }] }));
+  await answer(w, markedAnswer());
+  must(w.raft.accepted.size === 1, "run 1 was not accepted");
+  must(show(whereIs(w, MATERIAL_MARK)) === "[]" && show(whereIs(w, ANSWER_MARK)) === "[]", `after run 1: ${show({ material: whereIs(w, MATERIAL_MARK), answer: whereIs(w, ANSWER_MARK) })}`);
+  // Run 2, while it runs and once it has ended: run 1's markers are nowhere.
+  w.raft.run = { runId: randomUUID(), revision: 6 };
+  w.raft.pages = OTHER_PAGES;
+  await assign(w);
+  must(show(whereIs(w, MATERIAL_MARK)) === "[]" && show(whereIs(w, ANSWER_MARK)) === "[]", `during run 2: ${show({ material: whereIs(w, MATERIAL_MARK), answer: whereIs(w, ANSWER_MARK) })}`);
+  must(whereIs(w, MSG2[0]!).length > 0, "run 2's material is not where it runs");
+  // The friction scan, which reads conversations into its report, reads none of this agent's, even mid-run.
+  w.host.sql.exec("CREATE TABLE IF NOT EXISTS owner (k TEXT PRIMARY KEY, tenant_id TEXT, agent_id TEXT)");
+  w.host.sql.exec("INSERT OR REPLACE INTO owner (k, tenant_id, agent_id) VALUES ('self', 't', ?)", SERVICE);
+  const { readFrictionWindow } = await import("../cf/src/friction-read.ts");
+  const read = readFrictionWindow(w.host.sql as never, "t", SERVICE, 0, Date.now() + 1e9);
+  must(show(read) === show({ conversations: [], truncated: false }), `the friction scan reads the service agent: ${show(read).slice(0, 300)}`);
+  await answer(w, goodResult({ patterns: [{ kind: "unsupported_completion", explanation: "y", evidence: [{ target: "#ops", messageId: MSG2[1] }], counterevidence: [], evidenceLevel: "conversation_only", intent: "active", suggestion: "" }] }));
+  must((w.raft.accepted as Map<string, unknown>).size === 2, "run 2 was not accepted");
+  must(show(whereIs(w, MATERIAL_MARK)) === "[]" && show(whereIs(w, ANSWER_MARK)) === "[]" && show(whereIs(w, "rollback finished?")) === "[]",
+    `after run 2: ${show({ material: whereIs(w, MATERIAL_MARK), answer: whereIs(w, ANSWER_MARK), run2: whereIs(w, "rollback finished?") })}`);
+});
+
+await check("retention: a result waiting for its retry is kept until the retry succeeds, and gone after", async () => {
+  const w = await world();
+  w.raft.pages = markedPages();
+  await assign(w);
+  w.raft.inject.set("/internal/agent-api/raftbench/submit", [refusal(503, "raftbench_unavailable")]);
+  await answer(w, markedAnswer());
+  must(whereIs(w, ANSWER_MARK).length > 0, "the result waiting for its retry was not kept");
+  skew += RETRY_DELAYS_MS[0]! + 1_000;
+  try { await pass(w); } finally { skew = 0; }
+  must(w.raft.accepted.size === 1 && show(whereIs(w, ANSWER_MARK)) === "[]" && show(whereIs(w, MATERIAL_MARK)) === "[]",
+    `after the retry: ${show({ answer: whereIs(w, ANSWER_MARK), material: whereIs(w, MATERIAL_MARK) })}`);
+});
+
+await check("retention: a result waiting for its retry is gone once the retries give up", async () => {
+  const w = await world();
+  w.raft.pages = markedPages();
+  await assign(w);
+  w.raft.inject.set("/internal/agent-api/raftbench/submit", Array.from({ length: 2 * (RETRY_DELAYS_MS.length + 1) }, () => refusal(503, "raftbench_unavailable")));
+  await answer(w, markedAnswer());
+  must(whereIs(w, ANSWER_MARK).length > 0, "the result waiting for its retry was not kept");
+  try { for (const delay of RETRY_DELAYS_MS) { skew += delay + 1_000; await pass(w); } } finally { skew = 0; }
+  must(runLogs("done").some((l) => /^gave_up/.test(l.outcome)), "the retries did not give up");
+  must(show(whereIs(w, ANSWER_MARK)) === "[]" && show(whereIs(w, MATERIAL_MARK)) === "[]", `after giving up: ${show({ answer: whereIs(w, ANSWER_MARK), material: whereIs(w, MATERIAL_MARK) })}`);
+});
+
+await check("a run's turn is still its own when the object is evicted between the post and the binding", async () => {
+  const w = await world();
+  await assign(w);
+  // What an eviction right after the post leaves: the turn asked for, under its key, and no binding to its run.
+  const [bound] = w.host.sql.exec("SELECT alias, turn_key FROM plugin_turns").toArray() as any[];
+  must(bound, "no binding was written");
+  w.host.sql.exec("DELETE FROM plugin_turns");
+  w.host.sql.exec("INSERT INTO plugin_turn_asked (id, alias, turn_key, at) VALUES (1, ?, ?, ?)", bound.alias, bound.turn_key, Date.now());
+  await answer(w, goodResult());
+  must(w.raft.accepted.size === 1 && runLogs("turn_ignored").length === 0, `accepted ${w.raft.accepted.size}, ignored ${show(runLogs("turn_ignored"))}`);
+});
+
+await check("a run assigned again under the same id and revision asks under new keys: an old turn's end is not its answer", async () => {
+  const w = await world();
+  const a = w.raft.run;
+  await assign(w);
+  const [first] = w.host.sql.exec("SELECT turn_key FROM plugin_turns").toArray() as any[];
+  await answer(w, goodResult());
+  w.raft.run = { runId: randomUUID(), revision: 7 };
+  await assign(w);
+  await answer(w, goodResult());
+  const accepted = w.raft.accepted as Map<string, unknown>;
+  // A assigned again: the Server has forgotten its result.
+  w.raft.run = a;
+  w.raft.accepted.delete(`${a.runId}:${a.revision}`);
+  await assign(w);
+  const { bindTurn, recordTurnEnd } = await import("../src/runtime/plugin-wakes.ts");
+  bindTurn(w.host.sql as any, "old-op", "raftbench", String(first.turn_key), Date.now());
+  recordTurnEnd(w.host.sql as any, "old-op", { finalText: goodResult(), outcome: "completed" }, Date.now());
+  await pass(w);
+  must(!accepted.has(`${a.runId}:${a.revision}`) && runLogs("turn_ignored").some((l) => l.turnId === "old-op"), `the old key was taken: ${show(runLogs("turn_ignored"))}`);
+  await answer(w, goodResult());
+  must(accepted.has(`${a.runId}:${a.revision}`), "the run's own turn was not accepted");
 });
 
 // ---- retries and replays ------------------------------------------------------------------------------------

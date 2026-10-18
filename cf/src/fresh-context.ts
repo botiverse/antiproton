@@ -146,6 +146,28 @@ export function startFreshMain(host: Host, now: number, cause: MainCause = "fres
   return host.transactionSync ? host.transactionSync(run) : run();
 }
 
+/**
+ * Start a new main conversation, and erase the one that ends rather than archive it: its transcript's tables, its model
+ * jobs (requests and answers), and its row's pointer to the archive. Only the conversation's id and times stay in
+ * `main_sessions`. For an agent whose conversations hold material that must not outlive their use
+ * (src/runtime/agent-profile.ts `keepsConversations`). Called with no run in the main conversation, so every job
+ * filed under it belongs to the one ending.
+ */
+export function eraseMain(host: Host, now: number): { oldSessionId: string; newSessionId: string } {
+  const out = startFreshMain(host, now);
+  const sql = host.sql;
+  const run = () => {
+    const archive = archivedName(out.oldSessionId);
+    const t = piTables(archive);
+    for (const table of [t.entries, t.usage, t.values, t.list, t.meta]) sql.exec(`DROP TABLE IF EXISTS ${table}`);
+    sql.exec("UPDATE main_sessions SET archived_as = NULL WHERE session_id = ?", out.oldSessionId);
+    if (rows(sql, "SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = 'pi_sessions'").length) sql.exec("DELETE FROM pi_sessions WHERE session = ?", archive);
+    if (rows(sql, "SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = 'pi_model_jobs'").length) sql.exec("DELETE FROM pi_model_jobs WHERE session = ?", MAIN_SESSION);
+  };
+  host.transactionSync ? host.transactionSync(run) : run();
+  return out;
+}
+
 // ---- model input evidence
 
 export interface MessageEvidence {
