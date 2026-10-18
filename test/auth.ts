@@ -168,7 +168,8 @@ await check("github: the authorize URL carries client, callback, scopes, state a
 await check("github: the code exchange sends the secret, and a 200 with an error body is a refusal", async () => {
   let seen: any = null;
   const ok = fakeFetch({ [GITHUB_TOKEN]: (init) => { seen = init; return json({ access_token: "gho_x", token_type: "bearer" }); } });
-  assert(await githubExchangeCode(GH, "code-1", ok) === "gho_x", "token not returned");
+  const got = await githubExchangeCode(GH, "code-1", ok);
+  assert(got.grant.accessToken === "gho_x" && got.grant.refreshToken === null && got.grant.expiresAt === null, "token not returned");
   assert((seen.headers as any).accept === "application/json" && (seen.headers as any)["user-agent"], "accept json + user-agent required");
   const body = JSON.parse(String(seen.body));
   assert(body.client_secret === "s3cret" && body.code === "code-1" && body.redirect_uri === GH.redirectUri, "exchange body");

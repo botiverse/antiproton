@@ -190,6 +190,20 @@ chooses, the plugin must bound that host with a setting. `http` declares no
 credential today, but its `allowedHosts` setting is already marked
 `requiredWithCredential` for the day it does.
 
+**A credential the far end stops taking.** Where the deployment can renew a
+mount's credential (today an expiring GitHub user token from Connect GitHub,
+cf/src/github-refresh.ts), the context carries `ctx.credentialRejected`. A
+plugin that gets the service's "this credential is no longer valid" (GitHub's
+`401`) calls it once with the credential it sent, and on `{ credential }`
+makes the call once more with that one. A refusal of the retry is reported
+like any other: an endpoint may refuse a kind of credential whatever its state,
+so a `401` is never taken as the authorization being gone. `{ reconnect }` is
+the sentence to put in the error when the renewal itself was refused, which
+only the person can mend. `null` means there is nothing to renew with, nobody
+answered, or the credential was renewed moments ago, and the failure is
+reported as it would be without the hook. Renewing before a token expires
+needs nothing from the plugin: it happens where the credential is read.
+
 **Say which identity a call was made with.** `ctx.credential` being null has
 several causes, and different people fix them: the mount names no credential,
 so its owner attaches an account; it names `agent:<name>` and that row is gone,

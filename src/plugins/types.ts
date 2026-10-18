@@ -416,6 +416,14 @@ export interface PluginContext {
    * does not supply it must not be read as saying no credential is named.
    */
   credentialRefKind?: CredentialRefKind;
+  /**
+   * The far end refused `credential` (GitHub's 401). Present only where the deployment can renew this mount's
+   * credential (an expiring OAuth token): it renews once and answers the token to retry with, once. A refusal of the
+   * retry is reported like any other: an endpoint may refuse this kind of credential whatever its state. `reconnect`
+   * is the sentence to report when the renewal itself was refused, which only the person can mend. Null: nothing to
+   * renew with, nobody answered, or it was renewed moments ago; the refusal is reported as it would be without this.
+   */
+  credentialRejected?(credential: string): Promise<{ credential: string } | { reconnect: string } | null>;
   publicConfig: Record<string, Json>;
   /**
    * This mount's database, as declared in {@link Plugin.database}. Survives
