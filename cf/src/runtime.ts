@@ -642,6 +642,11 @@ export class BoundArtifacts {
   async delete(keys: string[]) {
     if (keys.length) await this.#bucket.delete(keys);
   }
+  /** An object's size, read from its metadata without its body; null when there is none. */
+  async head(key: string): Promise<{ bytes: number } | null> {
+    const obj = await this.#bucket.head(key);
+    return obj ? { bytes: obj.size } : null;
+  }
   async get(key: string): Promise<Uint8Array> {
     const obj = await this.#bucket.get(key);
     // Not the key: it names the bucket, the tenant and the agent, and this

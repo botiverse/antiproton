@@ -87,7 +87,7 @@ function ctx() {
 }
 function fakeArtifacts() {
   const puts: Array<{ key: string; body: Uint8Array; type?: string }> = [];
-  return { puts, async put(key: string, body: Uint8Array, type?: string) { puts.push({ key, body, type }); return { ref: `r2://bucket/${key}`, bytes: body.byteLength }; } };
+  return { puts, async put(key: string, body: Uint8Array, type?: string) { puts.push({ key, body, type }); return { ref: `r2://bucket/${key}`, bytes: body.byteLength }; }, async get(): Promise<Uint8Array> { throw new Error("no such artifact"); }, async head() { return null; } };
 }
 const PRESIGNED = "https://storage.example/obj/x?X-Amz-Signature=SIG";
 /** Raft mints a URL for att-1 with `filename` and the type it declares; storage answers with `body`. */
@@ -375,9 +375,11 @@ await check("toolsBasis moved with the view, so a snapshot taken without it is r
   const download = RAFT_OPERATIONS.find((op) => op.name === "attachments.downloadUrl")!;
   // FEATURES_BASIS stands for what a listing records beside the list (the Server's flags), not a tool.
   const named = [FEATURES_BASIS, ...OWN, ...ASSISTANT].map((name) => ({ name }));
-  const without = toolsBasisOf([...named, ...generated]);
   // Control: the formula is the plugin's — with the view it gives the plugin's basis.
-  must(toolsBasisOf([...named, ...generated, { name: VIEW_TOOL, capability: download.capability }]) === withStorage.toolsBasis, `control: ${withStorage.toolsBasis}`);
+  // The upload is in it too (test/raft-attachments-upload.ts), with the capability it needs.
+  const upload = { name: "attachments_upload", capability: ["send"] };
+  const without = toolsBasisOf([...named, ...generated, upload]);
+  must(toolsBasisOf([...named, ...generated, { name: VIEW_TOOL, capability: download.capability }, upload]) === withStorage.toolsBasis, `control: ${withStorage.toolsBasis}`);
   must(withStorage.toolsBasis !== without, "the view left the basis where it was");
   // The runtime's own re-take: a mount whose snapshot was taken under the basis without the view.
   const host = sqliteHost();

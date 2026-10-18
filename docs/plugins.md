@@ -592,7 +592,18 @@ reference, the type read from the bytes, width, height and size) that the gatewa
 can hand the model as an image; anything else, an animated GIF, WebP or PNG, or an
 image over a limit is refused with what it is and the reference to the copy
 kept, since nothing resizes. It is listed by a snapshot exactly where the
-download is and offered only beside it. A tool's description and every parameter description in its
+download is and offered only beside it.
+`attachments_upload` goes the other way: it reads a file from the agent's own
+object storage (an `artifact://` reference, such as `sandbox` `save` returns;
+a raw `r2://` reference or one outside the caller's scope is refused before
+anything is read) and uploads it to Raft for one conversation through the SDK's
+typed `attachments.upload`, with the mount's credential. At most
+`UPLOAD_MAX_BYTES` (25 MiB) is read; the Server's own limit and the choice
+between a multipart upload and an upload session are the SDK's. It posts
+nothing: it returns the `attachmentId` to pass to `messages_send` in
+`attachmentIds`. It is offered only with object storage and to a credential
+holding `send`, and it is declared a write, so approval policy for writes
+applies and a subagent is never handed it. A tool's description and every parameter description in its
 schema name operations by their tool names, never by the manifest's dotted
 names, SDK field paths or CLI flags (`inMountTerms`). Its
 `snapshotTools` asks Raft what the mount's credential may do
