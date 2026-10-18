@@ -614,6 +614,13 @@ export async function workingSetParts(
 export const SEEDED_MEMORY = "MEMORY.md";
 /** How much of it, in characters: the working set's own `memory` budget. */
 export const SEEDED_MEMORY_BUDGET = 4000;
+/**
+ * How much of an imported `MEMORY.md` the prompt shows, in characters: the 16 KB Raft tells its agents to keep the
+ * file under, so a migrated agent sees the notes it kept as it saw them before, where 4,000 cut most of them (12 of 13
+ * measured daemon workspaces had one over 4,000). Read from the stored text alone, so the bytes are the same on every
+ * open while the file is unchanged, and the prefix stays cached.
+ */
+export const IMPORTED_MEMORY_BUDGET = 16_000;
 
 /**
  * A code fence `text` cannot close: one backtick longer than its longest run of
@@ -707,16 +714,17 @@ function utf8Bytes(value: Json | undefined): number | null {
 }
 
 /**
- * `MEMORY.md`'s text as the prompt shows it, seeded or imported: fenced, and cut at `SEEDED_MEMORY_BUDGET` with a line
- * after the fence saying where the rest is. The cut line is outside the fence: it is the prompt speaking, not the file.
+ * `MEMORY.md`'s text as the prompt shows it, seeded or imported: fenced, and cut at `budget` characters
+ * (`SEEDED_MEMORY_BUDGET` or `IMPORTED_MEMORY_BUDGET`) with a line after the fence saying where the rest is. The cut
+ * line is outside the fence: it is the prompt speaking, not the file.
  */
-function fencedMemory(value: Json, getTool: string | null): string {
+function fencedMemory(value: Json, getTool: string | null, budget: number): string {
   const text = typeof value === "string" ? value : JSON.stringify(value);
   let kept = text;
   let cut = "";
-  if (text.length > SEEDED_MEMORY_BUDGET) {
+  if (text.length > budget) {
     // Not between the two halves of a surrogate pair.
-    const end = /[\uD800-\uDBFF]/.test(text[SEEDED_MEMORY_BUDGET - 1]!) ? SEEDED_MEMORY_BUDGET - 1 : SEEDED_MEMORY_BUDGET;
+    const end = /[\uD800-\uDBFF]/.test(text[budget - 1]!) ? budget - 1 : budget;
     kept = text.slice(0, end);
     cut = `\n… cut at ${end} of ${text.length} characters; ` +
       (getTool ? `get \`${SEEDED_MEMORY}\` with ${getTool} for the rest.` : "the rest is not shown.");
@@ -800,7 +808,7 @@ export async function seededFilesParts(
       body = `${what} It is too large to show here and is kept in object storage; ` +
         (getTool ? `read it with ${getTool}.` : "you have no tool mounted for reading it.");
     } else {
-      body = `${what} Its current content is the text inside the fence below:\n\n` + fencedMemory(got.value, getTool);
+      body = `${what} Its current content is the text inside the fence below:\n\n` + fencedMemory(got.value, getTool, SEEDED_MEMORY_BUDGET);
     }
     parts.push(`${seedLine(memory.path, sizeOf(memory, got), mode)}\n${body}`);
   }
@@ -836,7 +844,7 @@ export const IMPORTED_PATHS_SHOWN = 40;
 
 /**
  * The files a workspace import brought (src/store/workspace-import.ts), as the agent is shown them when the harness
- * opens: `MEMORY.md`'s working copy fenced up to `SEEDED_MEMORY_BUDGET`, by `fencedMemory` as a seeded one is, then
+ * opens: `MEMORY.md`'s working copy fenced up to `IMPORTED_MEMORY_BUDGET`, by `fencedMemory` as a seeded one is, then
  * up to `IMPORTED_PATHS_SHOWN` of the other paths, and the `get` that opens them. Empty when nothing was imported, so
  * every other agent's prompt is the one it had. `exclude` is the seeded paths, which the seeded block shows already.
  *
@@ -881,7 +889,7 @@ export async function importedFilesParts(
       : got.ref && got.value == null
         ? "It is too large to show here and is kept in object storage; " +
           (getTool ? `read it with ${getTool}.` : "you have no tool mounted for reading it.")
-        : "Its current content is the text inside the fence below:\n\n" + fencedMemory(got.value, getTool);
+        : "Its current content is the text inside the fence below:\n\n" + fencedMemory(got.value, getTool, IMPORTED_MEMORY_BUDGET);
     parts.push(`## \`${SEEDED_MEMORY}\`, in your workspace when you were created\n${body}`);
   }
   const memoryPart: PromptPart[] = memory

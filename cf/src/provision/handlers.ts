@@ -321,7 +321,10 @@ export function providerAgentId(raftAgentId: string): string {
 }
 
 export type Fail = { status: number; code: string; message: string; param?: string };
-const fail = (f: Fail) => Response.json({ error: { code: f.code, message: f.message, ...(f.param ? { param: f.param } : {}) } }, { status: f.status, headers: { "cache-control": "no-store" } });
+const fail = (f: Fail & { rejected?: ImportRejection[]; more?: number }) => Response.json({ error: {
+  code: f.code, message: f.message, ...(f.param ? { param: f.param } : {}),
+  ...(f.rejected ? { rejected: f.rejected, more: f.more ?? 0 } : {}),
+} }, { status: f.status, headers: { "cache-control": "no-store" } });
 const ok = (body: unknown, status = 200) => Response.json(body, { status, headers: { "cache-control": "no-store" } });
 
 const field = (body: unknown, key: string): unknown => (typeof body === "object" && body !== null ? (body as Record<string, unknown>)[key] : undefined);
@@ -507,6 +510,13 @@ export async function handleProvision(
   if (seg[0] === "import-limits" && seg.length === 1 && method === "GET") {
     if (!deps.imports) return null;
     return ok(IMPORT_LIMITS);
+  }
+  // Read by Raft before a migration is confirmed, to show which files would not come over.
+  if (seg[0] === "import-check" && seg.length === 1 && method === "POST") {
+    if (!deps.imports) return null;
+    const tenant = tenantFor(who, headers.raftServerId);
+    if (isFail(tenant)) return fail(tenant);
+    return importCheck(body, tenant, headers.credentialId ?? null, deps);
   }
   // The Raft server's plan, which Raft sends whenever it changes: the tenant's default daily limit follows it.
   if (seg[0] === "servers" && seg.length === 3 && seg[2] === "plan" && method === "PUT") {
@@ -804,7 +814,8 @@ export const IMPORT_LIMITS = { maxTotalBytes: IMPORT_TOTAL_MAX_BYTES, maxFiles: 
  * instructions fit in what is left. Refused before the body is parsed (cf/src/index.ts `provision`).
  */
 export const IMPORT_REQUEST_MAX_BYTES = 16 * 1024 * 1024;
-export const IMPORT_ROUTE = /^\/provision\/agents\/(?:by-raft-agent\/)?[^/]+\/import$/;
+/** The routes whose body is an import's, bounded by `IMPORT_REQUEST_MAX_BYTES`: the import, and its check. */
+export const IMPORT_ROUTE = /^\/provision\/(?:agents\/(?:by-raft-agent\/)?[^/]+\/import|import-check)$/;
 const MIGRATION_ID = /^[A-Za-z0-9._:-]{1,128}$/;
 const SHA256_HEX = /^[0-9a-f]{64}$/;
 const BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
@@ -845,13 +856,30 @@ export function importPath(raw: unknown): { path: string } | { problem: string; 
   return { path };
 }
 
+/** One file an import refuses, as the answer lists it: where it is in `files`, the path as sent, and why. Never its bytes. */
+export interface ImportRejection { index: number; path: string | null; reason: string; param: string }
+/** How many refused files one answer lists; past it they are counted (`more`), so a bad workspace cannot make the answer as large as the request. */
+export const IMPORT_REJECTIONS_SHOWN = 200;
+/** A sent path as a rejection names it: the caller's own string, cut short, and never one shaped like a credential. */
+const PATH_ECHO_MAX = 256;
+
+/** A refused import: the first problem as the envelope's code and message, and every refused file with it. */
+export type ImportFail = Fail & { rejected?: ImportRejection[]; more?: number };
+
+/** What `importChecked` found in a body whose shape and bounds hold: the files that pass, and every one that does not. */
+interface ImportChecked {
+  migrationId: string; instructions: string | undefined; files: ImportFile[]; totalBytes: number;
+  rejected: Array<{ rejection: ImportRejection; fail: Fail }>;
+}
+
 /**
- * The body of `POST …/import`, checked whole before anything is written: shape, bounds, paths, each file's bytes
- * against its `sha256`, and `totalBytes` against their sum. Over a bound is 413, anything else 422 (400 for a field
- * this route does not know), each naming the field.
+ * The body of `POST …/import` and `POST /provision/import-check`, checked whole: shape, bounds, paths, each file's
+ * bytes against its `sha256`, and `totalBytes` against their sum. A problem with the body itself (a field, a bound
+ * on the whole) ends the check, as a `Fail`. A problem with one file refuses that file and the check goes on to the
+ * next, so one answer names every file that would be refused: a caller dropping them one round trip at a time
+ * would need as many round trips as files. Each file gets its first problem only.
  */
-export function importRequest(body: unknown, instructionsMax: Limit):
-  { migrationId: string; instructions: string | undefined; files: ImportFile[]; totalBytes: number } | Fail {
+function importChecked(body: unknown, instructionsMax: Limit): ImportChecked | ImportFail {
   if (typeof body !== "object" || body === null || Array.isArray(body)) return { status: 422, code: "invalid", message: "the body is a JSON object" };
   const unknownField = Object.keys(body).find((k) => !IMPORT_FIELDS.has(k));
   if (unknownField) return { status: 400, code: "unknown_field", param: unknownField, message: `unknown field ${unknownField}` };
@@ -875,49 +903,96 @@ export function importRequest(body: unknown, instructionsMax: Limit):
     return { status: 413, code: "too_many_files", param: "files", message: `an import is at most ${IMPORT_FILES_MAX} files; this one has ${list.length}` };
   }
   const files: ImportFile[] = [];
+  const rejected: ImportChecked["rejected"] = [];
   const seen = new Set<string>();
   let sum = 0;
   for (let i = 0; i < list.length; i++) {
     const at = `files[${i}]`, f = list[i] as unknown;
-    if (typeof f !== "object" || f === null || Array.isArray(f)) return { status: 422, code: "invalid", param: at, message: `${at} is an object { path, contentBase64, sha256 }` };
+    const sent = typeof f === "object" && f !== null ? field(f, "path") : undefined;
+    const echo = typeof sent === "string" && !secretShape(sent) ? sent.slice(0, PATH_ECHO_MAX) : null;
+    const refuse = (x: Fail) => { rejected.push({ rejection: { index: i, path: echo, reason: x.code, param: x.param ?? at }, fail: x }); };
+    if (typeof f !== "object" || f === null || Array.isArray(f)) { refuse({ status: 422, code: "invalid", param: at, message: `${at} is an object { path, contentBase64, sha256 }` }); continue; }
     const extra = Object.keys(f).find((k) => !IMPORT_FILE_FIELDS.has(k));
-    if (extra) return { status: 400, code: "unknown_field", param: `${at}.${extra}`, message: `unknown field ${at}.${extra}${extra === "content" ? "; a file is sent as contentBase64" : ""}` };
-    const p = importPath(field(f, "path"));
-    if ("problem" in p) return { status: 422, code: p.reserved ? "reserved" : "invalid", param: `${at}.path`, message: `${at}.path: ${p.problem}` };
-    if (seen.has(p.path)) return { status: 422, code: "duplicate_path", param: `${at}.path`, message: `${at}.path is ${p.path}, which an earlier file already is` };
+    if (extra) { refuse({ status: 400, code: "unknown_field", param: `${at}.${extra}`, message: `unknown field ${at}.${extra}${extra === "content" ? "; a file is sent as contentBase64" : ""}` }); continue; }
+    const p = importPath(sent);
+    if ("problem" in p) { refuse({ status: 422, code: p.reserved ? "reserved" : "invalid", param: `${at}.path`, message: `${at}.path: ${p.problem}` }); continue; }
+    if (seen.has(p.path)) { refuse({ status: 422, code: "duplicate_path", param: `${at}.path`, message: `${at}.path is ${p.path}, which an earlier file already is` }); continue; }
     seen.add(p.path);
     const sha = field(f, "sha256");
     if (typeof sha !== "string" || !SHA256_HEX.test(sha.toLowerCase())) {
-      return { status: 422, code: "invalid", param: `${at}.sha256`, message: `${at}.sha256 is the hex SHA-256 of the file's bytes` };
+      refuse({ status: 422, code: "invalid", param: `${at}.sha256`, message: `${at}.sha256 is the hex SHA-256 of the file's bytes` }); continue;
     }
     const b64 = field(f, "contentBase64");
     if (typeof b64 !== "string" || !BASE64.test(b64)) {
-      return { status: 422, code: "invalid", param: `${at}.contentBase64`, message: `${at}.contentBase64 is the file's bytes in standard, padded base64` };
+      refuse({ status: 422, code: "invalid", param: `${at}.contentBase64`, message: `${at}.contentBase64 is the file's bytes in standard, padded base64` }); continue;
     }
     // The decoded size, known from the length: a file over the bound is refused without decoding it.
     const size = (b64.length / 4) * 3 - (b64.endsWith("==") ? 2 : b64.endsWith("=") ? 1 : 0);
     if (size > IMPORT_FILE_MAX_BYTES) {
-      return { status: 413, code: "file_too_large", param: `${at}.contentBase64`, message: `a file is at most ${IMPORT_FILE_MAX_BYTES} bytes; ${at} is ${size}` };
+      refuse({ status: 413, code: "file_too_large", param: `${at}.contentBase64`, message: `a file is at most ${IMPORT_FILE_MAX_BYTES} bytes; ${at} is ${size}` }); continue;
     }
+    // Only a file decoded counts: what this bounds is the decoding one request costs, and a file refused above is
+    // not decoded. Past it the check ends, a bound on the whole, carrying the files refused before it.
     sum += size;
     if (sum > IMPORT_TOTAL_MAX_BYTES) {
-      return { status: 413, code: "too_large", param: "files", message: `an import is at most ${IMPORT_TOTAL_MAX_BYTES} bytes together; the files through ${at} are ${sum}` };
+      return { status: 413, code: "too_large", param: "files", message: `an import is at most ${IMPORT_TOTAL_MAX_BYTES} bytes together; the files through ${at} are ${sum}`,
+        ...(rejected.length ? rejectionList(rejected) : {}) };
     }
     const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
     const hash = sha256Sync(bytes);
-    if (hash !== sha.toLowerCase()) return { status: 422, code: "sha256_mismatch", param: `${at}.sha256`, message: `${at}.sha256 is not the SHA-256 of its decoded bytes` };
+    if (hash !== sha.toLowerCase()) { refuse({ status: 422, code: "sha256_mismatch", param: `${at}.sha256`, message: `${at}.sha256 is not the SHA-256 of its decoded bytes` }); continue; }
     // A state value is text: a file that is not UTF-8, or carries a NUL, could not read back as the bytes it was. The
     // size was bounded above, by this route's own bound (not `seedText`'s, which is a seeded file's).
     const text = utf8Text(bytes);
-    if (text === null) return { status: 422, code: "not_text", param: `${at}.contentBase64`, message: `${at} is not UTF-8 text with no NUL byte; an imported file is a text document` };
+    if (text === null) { refuse({ status: 422, code: "not_text", param: `${at}.contentBase64`, message: `${at} is not UTF-8 text with no NUL byte; an imported file is a text document` }); continue; }
     const shape = secretShape(text);
-    if (shape) return { status: 422, code: "credential_in_text", param: `${at}.contentBase64`, message: `${at} carries what looks like a ${shape}; credentials are never imported` };
+    if (shape) { refuse({ status: 422, code: "credential_in_text", param: `${at}.contentBase64`, message: `${at} carries what looks like a ${shape}; credentials are never imported` }); continue; }
     files.push({ path: p.path, text, bytes: bytes.byteLength, sha256: hash });
   }
-  if (sum !== totalBytes) {
+  // Only once every file passed: with one refused, the sum the caller should send is the one without it.
+  if (!rejected.length && sum !== totalBytes) {
     return { status: 422, code: "total_mismatch", param: "totalBytes", message: `totalBytes is ${totalBytes}, and the files decode to ${sum}` };
   }
-  return { migrationId, instructions, files, totalBytes: sum };
+  return { migrationId, instructions, files, totalBytes: files.reduce((n, f) => n + f.bytes, 0), rejected };
+}
+
+/** The listed part of a refusal: the first `IMPORT_REJECTIONS_SHOWN`, and how many past them. */
+function rejectionList(rejected: ImportChecked["rejected"]): { rejected: ImportRejection[]; more: number } {
+  return { rejected: rejected.slice(0, IMPORT_REJECTIONS_SHOWN).map((r) => r.rejection), more: Math.max(0, rejected.length - IMPORT_REJECTIONS_SHOWN) };
+}
+
+/**
+ * The body of `POST …/import`, as the import takes it: every file passing, or refused. A refusal with files in it
+ * keeps the status, code, `param` and message of the first refused file, as when the check stopped there, and adds
+ * `rejected` (every refused file, up to `IMPORT_REJECTIONS_SHOWN`) and `more`. Over a bound is 413, anything else
+ * 422 (400 for a field this route does not know), each naming the field.
+ */
+export function importRequest(body: unknown, instructionsMax: Limit):
+  { migrationId: string; instructions: string | undefined; files: ImportFile[]; totalBytes: number } | ImportFail {
+  const c = importChecked(body, instructionsMax);
+  if (isFail(c)) return c;
+  if (c.rejected.length) {
+    const first = c.rejected[0]!.fail;
+    const also = c.rejected.length > 1 ? `; ${c.rejected.length} files are refused in all, each named in rejected` : "";
+    return { ...first, message: first.message + also, ...rejectionList(c.rejected) };
+  }
+  return { migrationId: c.migrationId, instructions: c.instructions, files: c.files, totalBytes: c.totalBytes };
+}
+
+/**
+ * `POST /provision/import-check` (docs/agent-surface.md "Checking an import first"): the import's own check, for Raft
+ * to show which files would not come over before anyone confirms a migration. Validation only: it names no agent,
+ * so it reads and writes no agent's object, takes no import's place and changes no import already made. A problem
+ * with the body itself answers as the import would; a refused file is listed, in a 200.
+ */
+function importCheck(body: unknown, tenantId: string, credentialId: string | null, deps: ProvisionDeps): Response {
+  const c = importChecked(body, instructionsLimit(deps.seed));
+  if (isFail(c)) {
+    logEvent("provision.import_check", { tenant: tenantId, credentialId, outcome: "refused", code: c.code, ...(c.param ? { param: c.param } : {}) });
+    return fail(c);
+  }
+  logEvent("provision.import_check", { tenant: tenantId, credentialId, outcome: c.rejected.length ? "rejected" : "ok", files: c.files.length, bytes: c.totalBytes, rejected: c.rejected.length });
+  return ok({ ok: !c.rejected.length, ...rejectionList(c.rejected), totals: { files: c.files.length, bytes: c.totalBytes }, limits: IMPORT_LIMITS });
 }
 
 /**
@@ -934,7 +1009,7 @@ async function workspaceImport(
     logEvent("provision.import", { tenant: tenantId, agent: row.agentId, raftAgentId: row.raftAgentId, credentialId, outcome, ...extra });
   const req = importRequest(body, instructionsLimit(deps.seed));
   if (isFail(req)) {
-    audit("refused", { code: req.code, ...(req.param ? { param: req.param } : {}) });
+    audit("refused", { code: req.code, ...(req.param ? { param: req.param } : {}), ...(req.rejected ? { rejected: req.rejected.length + (req.more ?? 0) } : {}) });
     return fail(req);
   }
   const { migrationId, instructions, files } = req;
