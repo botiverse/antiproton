@@ -519,6 +519,12 @@ await check("a mount's own broken flag heals when the connector is healthy: by a
   await w.age(a, id);
   const r = await w.tool(b);
   must(succeeded(r) && !(await w.stored(b)).rec.brokenAt, `b's 401 did not heal it: ${errorText(r)}`);
+  // And when nothing needs renewing at all (the pair is fresh, the connector holds the mount's own token): a 401 from
+  // an endpoint that refuses user tokens still clears the stale flag, so renewing before use works again.
+  await markLocal(b);
+  const refreshes = w.gh.s.refreshes;
+  must(!succeeded(await w.tool(b, "api_get", { path: "/app" })) && w.gh.s.refreshes === refreshes, "the /app call renewed");
+  must(!(await w.stored(b)).rec.brokenAt, "the stale flag stayed although the connector is healthy");
   w.dispose();
 });
 
