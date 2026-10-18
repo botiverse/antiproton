@@ -14,7 +14,7 @@
  */
 import type { RetailDB } from "./retail.ts";
 import { WRITE_TOOLS } from "./retail.ts";
-import { canonJson as canon, actionMatch as grade } from "./grade.ts";
+import { canonJson as canon, actionMatch as grade, rewardOf } from "./grade.ts";
 import { gold, MAX_TURNS, OPENING, rowTaskId, SIM, SIM_LAST_MAX, sha256, simEnding, simSystem } from "./episode.ts";
 import { runRetailCall, type FunctionTool } from "./api-tools.ts";
 import { apiStallAtDeadline, waitForTurn, type Delivered, type Snapshot } from "./api-turn.ts";
@@ -240,7 +240,7 @@ async function converse(task: any, d: ApiTaskDeps, t0: number, agentId: string, 
     // Client functions are offered off pd only (cf/src/runtime.ts), so a call made says which engine ran.
     engine: Object.keys(figures.byTool).length ? "pi085" : null,
     object, activity, provider,
-    reward: dbMatch && actionMatch ? 1 : 0, dbMatch, actionMatch, ended, stall, stallWhy,
+    ...rewardOf(task, { dbMatch, actionMatch }), dbMatch, actionMatch, ended, stall, stallWhy,
     simLast: simLast.slice(0, SIM_LAST_MAX),
     ...(dropInfo.length ? { dropInfo } : {}),
     delivered, turns: turns - 1, simCalls, simMs, replyAts, toolExecMs,

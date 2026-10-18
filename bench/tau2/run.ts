@@ -29,7 +29,7 @@ import type { MountedTool } from "../../src/runtime/pi-tools.ts";
 import { builtinToolsPlugin } from "../../src/plugins/builtin.ts";
 import type { Plugin } from "../../src/plugins/types.ts";
 import { retailPlugin, applyRetailAction, WRITE_TOOLS, type RetailDB } from "./retail.ts";
-import { canonJson as canon, actionMatch as grade } from "./grade.ts";
+import { canonJson as canon, actionMatch as grade, rewardOf } from "./grade.ts";
 import { nodeWorker, runToRest } from "../node-worker.ts";
 import { readMeter, ratesFromEnv, meterLine } from "../meter.ts";
 import { BACKGROUND_CONTEXT as CTX } from "@earendil-works/pi-agent-core/harness/context";
@@ -202,7 +202,7 @@ async function runTask(task: any, verbose: boolean) {
   await store.close();
 
   return {
-    id: task.id, reward: dbMatch && actionMatch ? 1 : 0, dbMatch, actionMatch, ended,
+    id: task.id, ...rewardOf(task, { dbMatch, actionMatch }), dbMatch, actionMatch, ended,
     turns: turns - 1, simCalls, passes, byTool, meter, ...usage,
     seconds: Math.round((Date.now() - t0) / 1000),
     expectedWrites: expected.map((e) => e.name), performedWrites: writes.map((x) => x.name),

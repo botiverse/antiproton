@@ -15,6 +15,7 @@ import { seqOf } from "./api-turn.ts";
 import { passRecord } from "./passk.ts";
 import { endingsAllRows, failingRowsByEndingAndCause } from "./endings.ts";
 import { sumActivity } from "../objects.ts";
+import { REWARD_RULE } from "./grade.ts";
 
 /** Which way a record's rows were driven. A record without the field was driven over `/bench`. */
 export const RUNNER_METHOD = "agents-api";
@@ -199,6 +200,7 @@ export function runProvider(rows: ReadonlyArray<{ provider?: Provider | null }>)
  *   sim        the simulator's settings and guidelines (`simRecord`, bench/tau2/episode.ts) plus `id`, the
  *              host and model it was called on, so a record says which simulator ran rather than leaving it
  *              to whatever the environment held
+ *   rewardRule which rule each row's `reward` follows (`REWARD_RULE`, bench/tau2/grade.ts)
  */
 export function apiRunRecord(i: {
   base: string; build: string | null; driver: unknown; tenantId: string; owner: string;
@@ -232,6 +234,7 @@ export function apiRunRecord(i: {
       bench: "tau2-retail", runnerMethod: RUNNER_METHOD, base: i.base, build: i.build, driver: i.driver,
       object: `api:${i.tenantId}/${i.owner}`, engine: engines.size === 1 ? [...engines][0] : null, objects: "per-task",
       model: provider.provider?.name ?? null, modelRequested: i.modelRequested, wait: "sse", sim: { ...i.sim, id: i.simId },
+      rewardRule: REWARD_RULE,
       provider: provider.provider,
       tasks: i.tasks, trials: i.trials, order: i.order,
       ...(i.ignoreAnswers ? { ignoreAnswers: i.ignoreAnswers } : {}),

@@ -56,3 +56,57 @@ export function argDiff(expected: Array<{ name: string; args: unknown }>, perfor
 }
 
 export { canonJson };
+
+/**
+ * Which rule a record's `reward` follows, written into every record so a series can be split where it changed.
+ * Records without the field were scored `dbMatch && actionMatch` on every task (report/runs/README.md).
+ */
+export const REWARD_RULE = "reward_basis";
+
+/** The components τ² can list in a task's `reward_basis` (tau2 `RewardType`, src/tau2/data_model/tasks.py). */
+const COMPONENTS = new Set(["DB", "ENV_ASSERTION", "ACTION", "COMMUNICATE", "NL_ASSERTION"]);
+
+/** τ²'s default when a task lists none: the original τ-bench's pair. */
+const DEFAULT_BASIS = ["DB", "COMMUNICATE"];
+
+export interface Graded {
+  reward: 0 | 1;
+  /** The task's `reward_basis`, as the reward was computed over it. */
+  rewardBasis: string[];
+  /**
+   * Listed components this grader has no judge for, with criteria present, so they could not count either way.
+   * Present only when non-empty: a reward that stood on fewer components than τ² would use says which.
+   */
+  unjudged?: string[];
+}
+
+/**
+ * The reward τ² gives a task: the AND of the components its `reward_basis` lists, and of no others.
+ *
+ * Upstream multiplies only the listed components into the reward and runs the rest for diagnostics
+ * (tau2-bench `evaluate_simulation`, src/tau2/evaluator/evaluator.py). Every retail task here lists
+ * `["DB", "NL_ASSERTION"]` or `["DB"]`, so `actionMatch` does not decide one of them: an agent whose write
+ * carried an argument the tool ignores still left the database the task asked for, and τ² passes it.
+ * `actionMatch` stays on the row as a diagnostic.
+ *
+ * A component with nothing to check is satisfied, as upstream's evaluators return 1.0 when their criteria are
+ * empty or null ("No nl_assertions to evaluate", evaluator_nl_assertions.py). NL_ASSERTION with assertions
+ * needs an LLM judge, and COMMUNICATE and ENV_ASSERTION need the transcript or the environment; this grader
+ * has none of those, so such a component is named in `unjudged` rather than passed or failed silently.
+ * An unknown component throws, as upstream raises on a basis it did not evaluate.
+ */
+export function rewardOf(task: any, m: { dbMatch: boolean; actionMatch: boolean }): Graded {
+  const ec = task?.evaluation_criteria ?? {};
+  const basis: string[] = Array.isArray(ec.reward_basis) ? ec.reward_basis.map(String) : DEFAULT_BASIS;
+  const unknown = basis.filter((b) => !COMPONENTS.has(b));
+  if (unknown.length) throw new Error(`task ${task?.id}: reward_basis lists ${unknown.join(", ")}, which this grader does not know`);
+  const has = (v: unknown) => Array.isArray(v) && v.length > 0;
+  let ok = true;
+  const unjudged: string[] = [];
+  for (const b of basis) {
+    if (b === "DB") ok &&= m.dbMatch;
+    else if (b === "ACTION") ok &&= m.actionMatch;
+    else if (has(ec[{ NL_ASSERTION: "nl_assertions", COMMUNICATE: "communicate_info", ENV_ASSERTION: "env_assertions" }[b]!])) unjudged.push(b);
+  }
+  return { reward: ok ? 1 : 0, rewardBasis: basis, ...(unjudged.length ? { unjudged } : {}) };
+}
