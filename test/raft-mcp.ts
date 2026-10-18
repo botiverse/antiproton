@@ -325,8 +325,10 @@ await check("a call goes out with the catalogue entry of the list the mount kept
   await w.rt.retakeStaleSnapshots("t", "a");
   must(server.lists().length === lists + 1 && race === null, `control: the re-take listed (${server.lists().length - lists}) and met the race`);
   // Nothing of the set-aside listing was bound: the call still carries the version of the list the mount offers.
-  version = 99;
-  await w.call("mcp_notion__notion_search", { query: "q" });
+  // (Raft answers it, so the call itself leaves no new stale mark: what lists the next turn again is the first one's.)
+  version = 3;
+  const bound: any = await w.call("mcp_notion__notion_search", { query: "q" });
+  must(bound.status === "succeeded", `bound call: ${JSON.stringify(bound)}`);
   must((server.calls().at(-1)!.body as any).expectedConfigVersion === 3, `sent with ${(server.calls().at(-1)!.body as any).expectedConfigVersion}`);
   // And the next turn lists again, rather than waiting out the catalogue's TTL.
   version = 4;
