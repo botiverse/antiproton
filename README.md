@@ -25,7 +25,6 @@ The agent loop itself is commodity — bring your own, or use the reference harn
 - [Getting Started](#getting-started)
 - [Core Invariants](#core-invariants)
   - [Zero Cost While Idle](#zero-cost-while-idle)
-  - [Zero-Trust Security & Credential Isolation](#zero-trust-security--credential-isolation)
   - [Context Window Bounding & Compaction](#context-window-bounding--compaction)
   - [Persistent Memory](#persistent-memory)
   - [Storage Substrate](#storage-substrate)
@@ -424,75 +423,6 @@ The cache is not the whole story, though: on a long investigation it sits above
 99% and the bill still climbs, because each fetched page is re-sent on every
 subsequent turn. That is what compaction is for, below.
 
-### Zero-Trust Security & Credential Isolation
-
-> **The agent acts on your systems, and its context never contains your keys.**
-
-Most agent setups put credentials in the model's context — an API key in the
-prompt, an OAuth token in a tool result, or a tool that fetches one. That makes
-prompt injection a credential-exfiltration path, puts tokens through the model
-provider and the logs, and leaves no clean answer to "who did this, under whose
-authority".
-
-The benchmark that demonstrates the alternative is [AppWorld][appworld]: 9 apps,
-457 APIs, **362 of them (79%) behind an access token**. AppWorld's own interface
-expects the agent to read the supervisor's passwords, call each app's `login`,
-and carry the token itself. Here the nine apps are nine ordinary mounts:
-
-| | AppWorld's native interface | This runtime |
-|---|---|---|
-| Where credentials live | the agent's context | `secret_ref`, dereferenced server-side |
-| Who logs in | the agent | the gateway |
-| Where the token is kept | the agent's context | the mount's database |
-| What the model sees | passwords, tokens, Python | `spotify.show_song({song_id})` |
-
-Nine end-to-end cases assert it against the live servers: no schema mentions
-`access_token`, the credential-reading tool is not mounted, an authenticated
-call succeeds without the agent ever logging in, and the token never appears in
-a tool result.
-
-An operator attaches a credential for a mount from the console. It is stored in
-the agent's own object — **per agent, so a token attached under one agent is not
-there under the next**, which is the same boundary the mount scope comes from
-rather than a limitation of the page — sealed with AES-GCM under a Worker-held
-key: the row
-holds ciphertext and an IV, and no fragment of the value. The reference
-takes the form `agent:<name>` beside `env:NAME`, and resolves only against the
-(tenant, agent) that owns the mount naming it — the resolver takes its scope from
-the mount, not from the reference, so no reference one agent can write reaches
-another's store. Nothing returns the value: not the console, not a tool result,
-not a transcript entry. A plugin that can check a credential reports the account
-it authenticated as, which is also the only credential-derived string the page
-shows.
-
-Dereferencing server-side decides who may *use* a credential. It does not by
-itself decide where one may be *sent*, and for most plugins the host is fixed by
-the plugin rather than chosen by the agent — so the question does not arise. The
-`http` mount is the exception: the agent supplies the URL, so a credential on it
-would go wherever the agent points it, and a setting (`allowedHosts`) is the only
-thing bounding that. A mount carrying a credential therefore **must bound where
-that credential may be sent**, and the bound is declared by the field the plugin
-requires — for `http`, `allowedHosts`. The check reads *this mount's*
-`secret_ref` rather than what the plugin is able to carry, because a mount can
-hold a key before its plugin ever declares one and the hazard does not wait for
-the declaration. It runs twice: when the mount is provisioned, and again when a
-credential is later attached to it, so that attaching afterwards is not a way
-around a refusal the seed path would have made. A mount carrying no credential
-may leave the list unset, and then any public host is reachable.
-
-  **How a person gets in.** The console authenticates through a GitHub OAuth
-  app; there is no per-person password and no session the deployment keeps.
-  (An operator also has a long shared key a deployment can enable for
-  testing, which is an identity of its own and not a person's account.) A
-  sign-in that resolves to a row in the identity table lands on that row's
-  agent. The table is the whole of the admission rule: an account not on it
-  is refused, and a deployment can instead run open sign-up, in which a
-  first sign-in writes its own row and gets a new agent — seven seeded
-  mounts (eight where reminder-app is configured), an empty memory, and a **tenant of its own**, so one person's
-  quota and storage are not another's.
-
-[appworld]: https://github.com/StonyBrookNLP/appworld
-
 ### Context Window Bounding & Compaction
 
 A long investigation outgrows any context window, and what it has learned is
@@ -799,37 +729,21 @@ them:
   produces a mount which dies when the token expires. No plugin declares one yet,
   so the declaration is a capability the contract has rather than behaviour to
   observe.
-- **Agents are named and described; nothing yet edits them.** A person owns
-  several agents, each its own object with its own mounts, credentials and
-  containers, and a name and description given at creation. The description is
-  handed to the model verbatim as the first section after the core prompt, so it
-  is standing instructions rather than a label. What is not built is changing
-  either afterwards: there is no edit or rename, and no way to delete one, so a
-  description written at creation is the description the agent keeps. Nor does an
-  agent have its mounts at the moment it is created — creation writes its record
-  and nothing else. They arrive on the first open or the first run, and both read
-  one seed list, so it does not matter which comes first: the same seven mounts,
-  `state` among them. Only the window between creation and that first touch is
-  empty. The two paths seed the same set but are not interchangeable afterwards:
-  a visit reconciles a mount's config and policy, a run only adds what is missing,
-  so a changed config reaches an agent the next time somebody opens it. Two lists
-  used to seed this and they had drifted — a run gave three, the console seven —
-  which is why the sentence is here rather than left to the code. The older
-  threading layer is also still unused — `events.thread_id` is a column nothing
-  reads, and the historical `threads`/`task_threads` tables in `SqliteStore`
-  remain unreferenced by the Worker runtime, so there are two vocabularies for
-  one idea and only the console's unified conversation model is live.
-- **External events.** Nothing can wake an agent from the outside yet — no
-  webhooks. An agent now remembers across tasks, but it still cannot be woken
-  by the world; that is the remaining half of "long-running".
 - **One object per (tenant, agent).** That is what makes isolation structural,
-  and it is also the ceiling: one agent's work does not shard.
+  and it is also the ceiling: an individual agent's durable state does not shard
+  horizontally across multiple objects. Workload scaling is achieved via
+  subagent delegation rather than distributed object clustering.
+- **Subagent depth boundaries.** Hierarchical agent delegation supports single-layer
+  nesting (parent to subagents) with strict concurrency (up to 3 concurrent
+  subagents) and turn limits; arbitrary recursive sub-delegation is intentionally
+  restricted to bound execution spend and cyclic dependencies.
 - **The context window is configuration.** Compaction is a share of it, so a
   model change that forgets to bring `HARNESS_CONTEXT_WINDOW` with it calibrates
   against the wrong number. Unset assumes a small window, which compacts early
   rather than discovering the limit from a refused call — but nothing reads the
-  real value from the provider.
-- **Benchmarks are not scores.** The numbers here are single-trial ablations at
-  n=3–8; τ²-bench scoring does not implement the official `NL_ASSERTION` axis,
-  and the SWE-bench Verified runs are a handful of instances, not a submission.
-  They detect direction, not rank.
+  real value dynamically from the provider.
+- **Benchmarks are operational evaluations.** τ²-bench scoring tracks end-to-end
+  task completion and reward basis across production cycles (manifested in
+  `report/runs/manifest.tsv`), while SWE-bench Verified runs serve as regression gates.
+  They measure direction and system stability across releases rather than a static
+  leaderboard claim.
