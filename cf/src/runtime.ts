@@ -1995,7 +1995,7 @@ export class AgentRuntime {
       expiresAt: refresh.expiresAt, refreshExpiresAt: refresh.refreshExpiresAt, connectorId: refresh.connectorId,
     } : null;
     if (rec && rec.connectorId && rec.expiresAt !== null && rec.expiresAt - Date.now() < REFRESH_SKEW_MS) {
-      const r = await this.#oauth.connectorPair(tenantId, rec.connectorId);
+      const r = await this.#oauth.connectorPair(tenantId, rec.connectorId, agentId);
       if (!r.ok) return { ok: false, error: r.broken ? `${RECONNECT_REASON} (${r.reason})` : `the connection could not be renewed: ${r.reason}` };
       token = r.accessToken;
       rec = { ...rec, refreshToken: r.refreshToken, expiresAt: r.expiresAt, refreshExpiresAt: r.refreshExpiresAt };

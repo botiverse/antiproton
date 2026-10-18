@@ -76,13 +76,18 @@ const TABLE = "CREATE TABLE IF NOT EXISTS trace_outbox(" +
 // `follow_up`, `wake`). Ids and counts only, never the task. Activity and status skip it unless SUBAGENT_ACTIVITY is on.
 // `subagent.model_changed` is a child's calls moving to another model since its spawn (a pin or a picker switch set
 // since, cf/src/runtime.ts `takeJob`): span the child, `attrs` from, to and why. Activity and status skip it.
+// `github.refresh` is one outcome of renewing an expiring GitHub token (cf/src/github-refresh.ts), the same outcomes
+// as its `github.refresh` log line: `status` the outcome (`rotated`, `adopted`, `broken`, `unavailable`, `store-failed`,
+// `kept-unstored`, `interrupted-before`, `propagate-failed`), `attrs` only ids and fixed codes (`scope`, `connectorId`,
+// `mount`, `why`, `attempt`, `stored`, `reasonCode`), never a token or GitHub's own words. It is here because an object's
+// log lines can be dropped from Workers Logs (docs/runbook.md) and this export is what is left. Activity and status skip it.
 // The rest are the kinds a plugin may write itself, through `PluginContext.trace` (`PLUGIN_TRACE_KINDS`). Activity and
 // status skip them. `raft.state_save_failed` is no longer written (it is `raft.state_failed` now) and stays here only so
 // a row of that kind still in an outbox is drained and read as a row, not dropped as damage.
 export const TRACE_KINDS = ["model.call", "tool.call", "approval.wait", "container.lease", "inbound", "mount.seeded", "harness.open",
   "turn.stop", "js.run",
   "rebuild.decision", "rebuild.outcome", "rebuild.behaviour", "session.needs_reset", "turn.timing", "import.hold", "model.prewarm",
-  "agent.ready", "mount.settings", "subagent.start", "subagent.turn", "subagent.model_changed", "raft.held", "raft.held_answer", "raft.state_failed", "raft.state_save_failed", "raft.mcp_call"] as const;
+  "agent.ready", "mount.settings", "subagent.start", "subagent.turn", "subagent.model_changed", "github.refresh", "raft.held", "raft.held_answer", "raft.state_failed", "raft.state_save_failed", "raft.mcp_call"] as const;
 export type TraceKind = (typeof TRACE_KINDS)[number];
 
 /**

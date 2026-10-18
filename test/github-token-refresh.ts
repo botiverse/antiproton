@@ -17,8 +17,9 @@ import { operatorModelOf } from "../cf/src/model-request.ts";
 import { d1ConnectorGrants, d1Connections, d1Connectors, d1ProvisionedAgents } from "../cf/src/control-plane.ts";
 import { handleProvision, type ProvisionDeps } from "../cf/src/provision/handlers.ts";
 import { githubExchangeCode, GITHUB_TOKEN } from "../cf/src/auth.ts";
-import { OAUTH_PREFIX, RECONNECT_REASON } from "../cf/src/github-refresh.ts";
+import { OAUTH_PREFIX, RECONNECT_REASON, reasonCode } from "../cf/src/github-refresh.ts";
 import { setLogSink } from "../src/core/log.ts";
+import { pendingTrace } from "../src/trace/outbox.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void>) {
@@ -228,13 +229,24 @@ async function world(opts: { expiring?: boolean; github?: boolean } = {}) {
     await a.rt.store.putSecret(TENANT, a.agentId, `${OAUTH_PREFIX}gh`, await seal(kek, JSON.stringify({ ...rec, rotatedAt: Date.now() - 2 * H })));
     if (connectorId) db.raw.prepare("UPDATE connectors SET refreshed_at = ? WHERE id = ?").run(Date.now() - 2 * H, connectorId);
   }
+  /** The `github.refresh` rows in an agent's trace outbox, as the export will carry them (#980). */
+  const traced = (a: { agentId: string }) => pendingTrace(objects.get(a.agentId)!.host.sql as any, 0).rows.filter((r) => r.kind === "github.refresh");
   const dispose = () => { for (const o of objects.values()) o.host.dispose(); };
-  return { db, gh, agent, connect, reconnect, links, status, tool, stored, expireAt, age, call, grants, propagated, settle, dispose,
+  return { db, gh, agent, connect, reconnect, links, status, tool, stored, expireAt, age, call, grants, propagated, settle, dispose, traced,
     delayPropagation: (ms: number) => { propagateDelayMs = ms; } };
 }
 
 const succeeded = (r: any) => r.status === "succeeded";
 const errorText = (r: any) => JSON.stringify(r.error ?? r);
+/** The only attrs a `github.refresh` trace row may carry: ids and fixed codes. */
+const TRACE_ATTRS = new Set(["scope", "connectorId", "mount", "why", "attempt", "stored", "reasonCode"]);
+/** Rows that carry nothing but what TRACE_ATTRS allows, no token, and none of `words` (a reason's own text). */
+function clean(rows: Array<{ attrs: Record<string, unknown> }>, words: string[] = []) {
+  const text = JSON.stringify(rows);
+  must(!/gh[ur]_/.test(text), `a token is in a trace row: ${text.replace(/gh[ur]_[A-Za-z0-9]+/g, "<token>")}`);
+  for (const w of words) must(!text.includes(w), `a reason's text is in a trace row: ${w}`);
+  for (const r of rows) for (const k of Object.keys(r.attrs)) must(TRACE_ATTRS.has(k), `a trace row carries ${k}`);
+}
 
 console.log(`\n  github token refresh (#935)\n  ${"─".repeat(56)}`);
 
@@ -274,6 +286,13 @@ await check("a token within five minutes of its expiry is renewed before the cal
   must(await after.open(after.kek, { ciphertext: row.refresh_ciphertext, iv: row.refresh_iv }) === after.rec.refreshToken, "the connector and the mount disagree on the refresh token");
   // A renewal is a check: lastCheckedAt is its time, success or not.
   must(row.last_checked_at === row.refreshed_at && (await w.status("A2")).body.lastCheckedAt === new Date(row.refreshed_at).toISOString(), `last_checked_at ${row.last_checked_at}, refreshed_at ${row.refreshed_at}`);
+  // The renewal is in the agent's trace as well as its log (#980): the connector's rotation and the mount's.
+  const rows = w.traced(a);
+  const seen = rows.map((r) => `${r.attrs.scope}:${r.status}:${r.verdict}`).sort().join(" ");
+  must(seen === "connector:rotated:ok mount:rotated:ok", `trace: ${seen}`);
+  must(rows.every((r) => r.attrs.connectorId === id && r.attrs.why === "expiring" && r.attrs.mount === "gh" && r.tenantId === TENANT && r.agentId === a.agentId), JSON.stringify(rows));
+  must(rows.find((r) => r.attrs.scope === "connector")!.attrs.stored === true, "the rotation's row does not say the pair was stored");
+  clean(rows);
   w.dispose();
 });
 
@@ -377,6 +396,12 @@ await check("a refused renewal marks the connection as needing a reconnect: in D
   must(got.body.lastCheckedAt === new Date(row.broken_at).toISOString() && got.body.lastCheckedAt > before.body.lastCheckedAt, `lastCheckedAt ${got.body.lastCheckedAt}`);
   must(got.body.connectors[0].oauthStatus === "error" && got.body.connectors[0].lastCheckError === RECONNECT_REASON && !/gh[ur]_/.test(got.text), got.text);
   must(!("oauthError" in got.body) && !("oauthErrorAt" in got.body), "the old field names are still sent");
+  // In the trace (#980): the refusal, as GitHub's code and never GitHub's words.
+  const broken = w.traced(a).filter((r) => r.status === "broken");
+  must(broken.length >= 1 && broken.every((r) => r.verdict === "failed" && r.attrs.reasonCode === "oauth:bad_refresh_token" && r.attrs.connectorId === id),
+    `trace: ${JSON.stringify(broken)}`);
+  must(broken.some((r) => r.attrs.scope === "connector"), "the connector's refusal is not in the trace");
+  clean(broken, ["The refresh token passed is incorrect"]);
   // Asked again, it does not go back to GitHub: the mount knows.
   const refreshes = w.gh.s.refreshes;
   must(!succeeded(await w.tool(a)) && w.gh.s.refreshes === refreshes, "a broken connection asked GitHub again");
@@ -532,6 +557,14 @@ await check("a new pair D1 will not take is retried, and when D1 still refuses t
     // One failure is always retried and lands; the last allowed attempt failing leaves D1 without it.
     if (failures === 1) must(tries === 2 && inD1 === issued, `one failure: tried ${tries} times, D1 holds the new pair: ${inD1 === issued}`);
     else must(tries === ROTATE_ATTEMPTS && inD1 !== issued, `tries ${tries}`);
+    // Each failed write is a trace row with its attempt and a fixed code, never D1's message (#980).
+    const rows = w.traced(a);
+    const failed = rows.filter((r) => r.status === "store-failed");
+    must(failed.map((r) => r.attrs.attempt).join(",") === [...Array(failures).keys()].map((i) => i + 1).join(","), `store-failed attempts: ${JSON.stringify(failed)}`);
+    must(failed.every((r) => r.verdict === "failed" && r.attrs.reasonCode === "d1-write-failed" && r.attrs.connectorId === id), JSON.stringify(failed));
+    const kept = rows.filter((r) => r.status === "kept-unstored").length;
+    must(failures === 1 ? kept === 0 : kept === 1, `${failures} failure(s): kept-unstored rows ${kept}`);
+    clean(rows, ["D1_ERROR", "network connection lost"]);
     w.dispose();
   }
 });
@@ -551,6 +584,11 @@ for (const [code, verdict] of [["bad_refresh_token", "broken"], ["invalid_grant"
     const status = (await w.status("A22")).body.oauthStatus;
     if (verdict === "broken") must(row.broken_at && status === "error" && errorText(r).includes(RECONNECT_REASON), `${code}: not marked (${status})`);
     else must(row.broken_at === null && status === "connected" && !errorText(r).includes(RECONNECT_REASON), `${code}: marked (${status})`);
+    // The trace row names the code when it is one GitHub is known to send, and `oauth:other` otherwise (#980).
+    const rows = w.traced(a).filter((x) => x.status === verdict);
+    const want = code === "something_github_adds_later" ? "oauth:other" : `oauth:${code}`;
+    must(rows.length >= 1 && rows.every((x) => x.attrs.reasonCode === want && x.verdict === "failed"), `${code}: trace ${JSON.stringify(rows)}`);
+    clean(rows, ["as GitHub might say it", ...(code === "something_github_adds_later" ? [code] : [])]);
     w.dispose();
   });
 }
@@ -1005,6 +1043,29 @@ for (const refused of [false, true]) {
     w.dispose();
   });
 }
+
+await check("a trace row's reason is a code from a fixed set: never a reason's own text, whatever it carries (#980)", async () => {
+  const cases: Array<[string | undefined, string | undefined]> = [
+    [undefined, undefined],
+    ["bad_refresh_token: The refresh token passed is incorrect or expired.", "oauth:bad_refresh_token"],
+    ["invalid_grant", "oauth:invalid_grant"],
+    ["something_new: says ghr_SECRETVALUE1234", "oauth:other"],
+    ["ghr_SECRETVALUE1234", "other"],
+    ["ghrabcdefsecret", "oauth:other"],
+    ["the token endpoint did not answer: TypeError: fetch failed ghu_SECRET", "no-answer"],
+    ["the token endpoint answered 502 without an OAuth error", "http-502"],
+    ["the token endpoint answered 502 without an OAuth error ghu_SECRET", "other"],
+    ["GitHub answered without a refresh token", "no-refresh-token"],
+    ["no refresh token in the answer", "no-refresh-token"],
+    ["this deployment has no GitHub App credentials to renew with", "no-app"],
+    ["another renewal of this connection did not finish", "lease-timeout"],
+    ["the connection was removed", "connector-gone"],
+    ["the connector is gone", "connector-gone"],
+    ["refused", "refused"],
+    ["D1_ERROR: UNIQUE constraint failed: ghu_SECRET", "other"],
+  ];
+  for (const [reason, want] of cases) must(reasonCode(reason) === want, `${reason}: ${reasonCode(reason)}, wanted ${want}`);
+});
 
 await check("nothing logged carries a token value: not the exchange's, a renewal's, or a refusal's", async () => {
   // Every scenario above has run with every log line and console line captured.
