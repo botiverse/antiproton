@@ -28,7 +28,10 @@
  * - 401, 403, 404: the token is wrong or expired, or the receiver is switched off (it answers 404 while it has no token
  *   of its own), none of which says anything about the rows: forwarding pauses (`auth_or_off`), the rows stay, and the
  *   backoff below applies, so the backlog drains once either side is mended.
- * - 408, 429, 5xx, or no answer: the rows stay (`unavailable`) and the backoff applies.
+ * - 408, 429, 5xx, or no answer: the rows stay (`unavailable`) and the backoff applies. No answer includes one that
+ *   has not come within FORWARD_TIMEOUT_MS: every request, each half of a 413 split included, is aborted then, since
+ *   the send runs inside the agent's alarm pass and a receiver that hangs would otherwise hold that pass open. A
+ *   timeout ends the pass's sending like any other failure: no later batch is tried until the backoff is over.
  * - any other 4xx: dropped (`rejected`), as a resend of the same request gets the same.
  * The backoff: FORWARD_BACKOFF_BASE_MS, doubling to FORWARD_BACKOFF_MAX_MS, cleared by the next success.
  * A resent row is the same row: its identity is (tenant_id, agent_id, seq), the outbox's own, and the receiver dedupes
@@ -66,6 +69,8 @@ export const FORWARD_BATCH_MAX = 500;
 export const FORWARD_QUEUE_MAX = 5_000;
 /** How many outbox rows one pass stages at most; the rest are staged by the next pass (and held from pruning till then). */
 const STAGE_READ_MAX = 2_000;
+/** How long one request may take before it is aborted and counted as no answer (`unavailable`). */
+export const FORWARD_TIMEOUT_MS = 10_000;
 export const FORWARD_BACKOFF_BASE_MS = 60_000;
 export const FORWARD_BACKOFF_MAX_MS = 60 * 60_000;
 /** How long a drop stays on record, as `trace_drops` (cf/src/trace-r2.ts). */
@@ -179,11 +184,30 @@ export function answerOf(status: number): "accepted" | "split" | ForwardReason {
 }
 
 /**
+ * One request, given at most `ms`: past that its signal aborts and the returned promise rejects with a `TimeoutError`,
+ * whether or not `fetchFn` honours the signal, so a hung receiver costs the pass `ms` and no more.
+ */
+async function fetchWithin(fetchFn: Fetch, url: string, init: RequestInit, ms: number): Promise<Response> {
+  const ctl = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      const e = new DOMException(`no answer within ${ms} ms`, "TimeoutError");
+      ctl.abort(e); reject(e);
+    }, ms);
+  });
+  try { return await Promise.race([fetchFn(url, { ...init, signal: ctl.signal }), expired]); }
+  finally { clearTimeout(timer); }
+}
+
+/**
  * Send the queue, oldest first, until it is empty or the endpoint fails. Never throws: a failure is the return
- * value's `error`, and the rows it concerned are still queued.
+ * value's `error`, and the rows it concerned are still queued. `timeoutMs` bounds each request (FORWARD_TIMEOUT_MS;
+ * a test passes a short one).
  */
 export async function sendForward(
   sql: Sql, cfg: ForwardConfig, tenantId: string, agentId: string, fetchFn: Fetch = fetch, now: () => number = Date.now,
+  timeoutMs: number = FORWARD_TIMEOUT_MS,
 ): Promise<ForwardResult> {
   const out: ForwardResult = { sent: 0, dropped: 0, kept: 0, error: null };
   try {
@@ -199,10 +223,11 @@ export async function sendForward(
       const { url, init } = ingestRequest(cfg, rows);
       let status: number;
       try {
-        const res = await fetchFn(url, init);
+        const res = await fetchWithin(fetchFn, url, init, timeoutMs);
         status = res.status;
         try { await res.body?.cancel(); } catch { /* nothing to read */ }
       } catch (e) {
+        // A timeout lands here too (`network: TimeoutError`): no answer, the rows kept, the backoff applies.
         // The error's name, not its message: a message can carry the request, and neither the URL nor the token is logged.
         out.error = `network: ${String((e as { name?: unknown })?.name ?? "error").slice(0, 40)}`;
         note(sql, now(), "unavailable", null, rows.length, tenantId, agentId);

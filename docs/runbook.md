@@ -214,7 +214,8 @@ identity is (`tenant_id`, `agent_id`, `seq`), the same on every resend, and the 
 **What an answer does.** 2xx: sent. 413: the batch is halved until it fits; one row still too large is dropped
 (`too-large`). 400 or 422: the batch is dropped (`schema`). 401, 403 or 404 (the receiver answers 404 while it is
 switched off): forwarding pauses with the rows kept (`auth_or_off`). 408, 429, 5xx or no answer: kept (`unavailable`).
-Any other 4xx: dropped (`rejected`). A kept batch is tried again on the first alarm pass after a backoff of a minute,
+No answer includes none within 10 s: every request, each half of a 413 split included, is aborted then, because the
+send runs inside the agent's alarm pass, and the pass sends no further batch after it. Any other 4xx: dropped (`rejected`). A kept batch is tried again on the first alarm pass after a backoff of a minute,
 doubling to an hour, and a success clears it. A failure never fails the pass, never delays the R2 export, and asks for
 no extra pass: an idle agent's waiting rows go on its next pass.
 
