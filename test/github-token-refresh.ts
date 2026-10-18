@@ -489,6 +489,7 @@ await check("a refusal that lost its lease to a renewal that landed does not mar
 
 await check("a new pair D1 will not take is retried, and when D1 still refuses the mount keeps the pair rather than lose it", async () => {
   const { ROTATE_ATTEMPTS } = await import("../cf/src/github-refresh.ts");
+  must(ROTATE_ATTEMPTS >= 2 && ROTATE_ATTEMPTS <= 3, `attempts ${ROTATE_ATTEMPTS}`);
   for (const failures of [1, ROTATE_ATTEMPTS]) {
     const w = await world();
     const a = await w.agent(`A21_${failures}`);
@@ -506,7 +507,8 @@ await check("a new pair D1 will not take is retried, and when D1 still refuses t
     must(s.token === issued && s.rec.refreshToken && w.gh.refreshes.has(s.rec.refreshToken), `${failures} failure(s): the mount does not hold the live pair`);
     const row = w.db.raw.prepare("SELECT ciphertext, iv FROM connectors WHERE id = ?").get(id) as any;
     const inD1 = await s.open(s.kek, { ciphertext: row.ciphertext, iv: row.iv });
-    if (failures < ROTATE_ATTEMPTS) must(tries === failures + 1 && inD1 === issued, `retried ${tries}, D1 holds the new pair: ${inD1 === issued}`);
+    // One failure is always retried and lands; the last allowed attempt failing leaves D1 without it.
+    if (failures === 1) must(tries === 2 && inD1 === issued, `one failure: tried ${tries} times, D1 holds the new pair: ${inD1 === issued}`);
     else must(tries === ROTATE_ATTEMPTS && inD1 !== issued, `tries ${tries}`);
     w.dispose();
   }
