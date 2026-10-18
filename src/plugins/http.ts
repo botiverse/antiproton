@@ -1,5 +1,7 @@
 import type { Json } from "../core/types.ts";
 import type { Plugin, PluginContext } from "./types.ts";
+import { sha256Hex, sniffImage } from "../model/images.ts";
+import { hasEarlyNul, magicType, strictUtf8 } from "./binary.ts";
 
 /**
  * Outbound HTTP, as a mount rather than a capability.
@@ -265,6 +267,94 @@ const decodeEntities = (s: string) =>
   s.replace(/&nbsp;/g, " ").replace(/&amp;/g, "&").replace(/&lt;/g, "<")
    .replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'");
 
+/** A gzip stream's first two bytes. */
+const isGzip = (b: Uint8Array) => b.length >= 2 && b[0] === 0x1f && b[1] === 0x8b;
+
+/**
+ * The most a gzip body is expanded to. The fetch already undoes a `content-encoding` it understands, so a body that
+ * still starts with the gzip magic is a `.gz` file or a proxy that compressed twice or labelled its encoding wrong;
+ * either way a small body can expand without bound, so the expansion stops here.
+ */
+const GUNZIP_MAX = 16 * 1024 * 1024;
+
+/** The gzip stream expanded, or why it was not: corrupt, or larger than `GUNZIP_MAX` once expanded. */
+async function gunzip(b: Uint8Array): Promise<{ bytes: Uint8Array } | { problem: string }> {
+  try {
+    const reader = new Blob([b as Uint8Array<ArrayBuffer>]).stream().pipeThrough(new DecompressionStream("gzip")).getReader();
+    const parts: Uint8Array[] = [];
+    let n = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      n += value.byteLength;
+      if (n > GUNZIP_MAX) {
+        await reader.cancel();
+        return { problem: `it expands past ${GUNZIP_MAX} bytes, so it was not expanded` };
+      }
+      parts.push(value);
+    }
+    const out = new Uint8Array(n);
+    let at = 0;
+    for (const p of parts) { out.set(p, at); at += p.byteLength; }
+    return { bytes: out };
+  } catch {
+    return { problem: "it is not a gzip stream that decompresses" };
+  }
+}
+
+/**
+ * A content type that says the body is text. Such a body that is not valid UTF-8 is most often a page in another
+ * charset (Latin-1, Shift_JIS), still readable with a few U+FFFD in it, so it stays text as it always was; only a
+ * signature or a NUL, which no charset's text has, turns it into bytes.
+ */
+const DECLARED_TEXT = /^\s*(?:text\/|application\/(?:json|xml|javascript|ecmascript|x-www-form-urlencoded)\b|[^;]*\+(?:json|xml)\b)/i;
+
+/**
+ * The response body as the text the model is given, or the bytes when they are not text: a known binary signature
+ * (src/plugins/binary.ts), a NUL in the first 8 KiB, or bytes that are not UTF-8 under a type that does not say text.
+ * A gzip body is expanded first and the expansion judged instead. Text decodes exactly as `Response.text()` decodes
+ * it, so a text result is what it was before bytes were looked at.
+ */
+async function bodyOf(received: Uint8Array, type: string): Promise<
+  { text: string; gunzipped?: number } | { bytes: Uint8Array; gunzipped?: number; gzipProblem?: string }
+> {
+  let b = received;
+  let gunzipped: number | undefined;
+  let gzipProblem: string | undefined;
+  if (isGzip(b)) {
+    const out = await gunzip(b);
+    if ("bytes" in out) { gunzipped = b.byteLength; b = out.bytes; } else gzipProblem = out.problem;
+  }
+  const from = gunzipped === undefined ? {} : { gunzipped };
+  if (magicType(b) !== null || hasEarlyNul(b) || (!DECLARED_TEXT.test(type) && strictUtf8(b) === null)) {
+    return { bytes: b, ...from, ...(gzipProblem ? { gzipProblem } : {}) };
+  }
+  return { text: new TextDecoder().decode(b), ...from };
+}
+
+/**
+ * What a binary body is, in place of its bytes: type, size and sha256, and for an image its dimensions. This mount
+ * keeps nothing, so the image is described rather than attached with a `view` marker (src/runtime/tool-view.ts),
+ * which needs an artifact the agent can read.
+ */
+function binaryOf(b: Uint8Array, type: string, gunzipped: number | undefined, gzipProblem: string | undefined) {
+  const image = sniffImage(b);
+  const mimeType = magicType(b) ?? (type.split(";")[0]!.trim().slice(0, 200) || undefined);
+  const dims = image ? {
+    ...(image.width ? { width: image.width } : {}),
+    ...(image.height ? { height: image.height } : {}),
+  } : {};
+  const what = gunzipped === undefined ? "binary content" : "the body is gzip; what it expands to is binary, and it";
+  const lead = gzipProblem ? `the body is gzip, but ${gzipProblem}; binary content` : what;
+  return {
+    kind: image ? "image" : "binary",
+    ...(mimeType ? { mimeType } : {}), ...dims,
+    bytes: b.byteLength, sha256: sha256Hex(b),
+    ...(gunzipped === undefined ? {} : { decompressed: { from: "gzip", bytes: gunzipped } }),
+    note: `${lead} is not returned as text, and this mount cannot keep or show it`,
+  };
+}
+
 /** Declared on the setting and applied in the code, from one place, because a
  *  console showing a blank default for a setting that has one is how a person
  *  learns the wrong number. */
@@ -498,8 +588,21 @@ export const httpPlugin: Plugin = {
         continue;
       }
 
-      const payload = await res.text();
       const type = res.headers.get("content-type") ?? "";
+      const read = await bodyOf(new Uint8Array(await res.arrayBuffer()), type);
+      if ("bytes" in read) {
+        return {
+          status: res.status, statusText: res.statusText,
+          url: hide(check.url.toString()), contentType: type,
+          headers: hideHeaders(responseHeaders(res.headers)),
+          ...(refused.length ? { refusedHeaders: refused } : {}),
+          ...secretNote(),
+          hops: hops.length > 1 ? hops.map(hide) : undefined,
+          ...binaryOf(read.bytes, type, read.gunzipped, read.gzipProblem),
+        };
+      }
+      const payload = read.text;
+      const gunzipped = read.gunzipped === undefined ? {} : { decompressed: { from: "gzip", bytes: read.gunzipped } };
       const isHtml = /html|xml/i.test(type) || /^\s*<(!doctype|html)/i.test(payload);
 
       if (isHtml && !a.raw) {
@@ -515,6 +618,7 @@ export const httpPlugin: Plugin = {
           ...secretNote(),
           truncated: text.length > body.length,
           hops: hops.length > 1 ? hops.map(hide) : undefined,
+          ...gunzipped,
           text: hide(body),
         };
       }
@@ -531,6 +635,7 @@ export const httpPlugin: Plugin = {
         ...secretNote(),
         truncated: payload.length > body.length,
         hops: hops.length > 1 ? hops.map(hide) : undefined,
+        ...gunzipped,
         body: hide(body),
       };
     }
