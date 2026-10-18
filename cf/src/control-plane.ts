@@ -503,6 +503,9 @@ export interface ProvisionedConnection {
   connectedAt: number;
   /** The tenant connector it came from (0012); null for one made before connectors. */
   connectorId: string | null;
+  /** GitHub refused this connection's renewal (0023); only for one with no connector, whose state is the connector's. Writing the row clears it. */
+  brokenAt?: number | null;
+  brokenReason?: string | null;
 }
 
 export interface ConnectionRegistry {
@@ -519,19 +522,20 @@ export function d1Connections(db: D1Database): ConnectionRegistry {
   return {
     async get(tenantId, raftAgentId, provider) {
       const r = await db.prepare(
-        "SELECT account, connected_by, connected_at, connector_id FROM provisioned_connections WHERE tenant_id = ? AND raft_agent_id = ? AND provider = ?",
+        "SELECT account, connected_by, connected_at, connector_id, broken_at, broken_reason FROM provisioned_connections WHERE tenant_id = ? AND raft_agent_id = ? AND provider = ?",
       ).bind(tenantId, raftAgentId, provider).first<any>();
       if (!r) return null;
       return {
         tenantId, raftAgentId, provider, account: r.account === null ? null : String(r.account), connectedBy: String(r.connected_by),
         connectedAt: Number(r.connected_at), connectorId: r.connector_id === null || r.connector_id === undefined ? null : String(r.connector_id),
+        brokenAt: r.broken_at == null ? null : Number(r.broken_at), brokenReason: r.broken_reason == null ? null : String(r.broken_reason),
       };
     },
     async put(c) {
       await db.prepare(
         `INSERT INTO provisioned_connections (tenant_id, raft_agent_id, provider, account, connected_by, connected_at, connector_id) VALUES (?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT (tenant_id, raft_agent_id, provider) DO UPDATE SET account = excluded.account, connected_by = excluded.connected_by,
-           connected_at = excluded.connected_at, connector_id = excluded.connector_id`,
+           connected_at = excluded.connected_at, connector_id = excluded.connector_id, broken_at = NULL, broken_reason = NULL`,
       ).bind(c.tenantId, c.raftAgentId, c.provider, c.account, c.connectedBy, c.connectedAt, c.connectorId).run();
     },
     async boundTo(tenantId, connectorId) {
@@ -561,15 +565,36 @@ export interface Connector {
   provider: string;
   account: string | null;
   creatorRaftUserId: string;
+  /** The access token, sealed. Rotated in place when an expiring one is refreshed (0023). */
   sealed: { ciphertext: string; iv: string };
   createdAt: number;
+  /** The refresh token, sealed, with both expiries; absent or null for a token that does not expire (0023). */
+  refresh?: ConnectorRefresh | null;
+  /** Set when GitHub refused the renewal: the connection needs its person to connect again (0023). */
+  brokenAt?: number | null;
+  brokenReason?: string | null;
+  /** When it was last checked, whatever came of it (0023); null on a row from before. */
+  lastCheckedAt?: number | null;
+}
+
+/** What renews a connector's access token. Times are ms since the epoch. */
+export interface ConnectorRefresh {
+  sealed: { ciphertext: string; iv: string };
+  expiresAt: number | null;
+  refreshExpiresAt: number | null;
 }
 
 export interface ConnectorEvent {
   tenantId: string; connectorId: string; raftAgentId: string | null;
-  action: "create" | "bind" | "unbind" | "disconnect";
-  actingRaftUserId: string; actingRole: "creator" | "admin"; at: number;
+  action: "create" | "bind" | "unbind" | "disconnect" | "broken";
+  /** `system` for what the deployment records itself (`broken`), with SYSTEM_ACTOR as the user. */
+  actingRaftUserId: string; actingRole: "creator" | "admin" | "system"; at: number;
+  /** Why, for `broken`: GitHub's error, never a token. */
+  reason?: string | null;
 }
+
+/** Who a `system` connector event names: no Raft user did it. */
+export const SYSTEM_ACTOR = "antiproton";
 
 export interface ConnectorStore {
   create(c: Connector): Promise<void>;
@@ -578,18 +603,25 @@ export interface ConnectorStore {
   list(tenantId: string, provider: string): Promise<Connector[]>;
   remove(tenantId: string, id: string): Promise<boolean>;
   record(e: ConnectorEvent): Promise<void>;
+  /** Its credential was checked and taken (pointing an agent at it): the time Raft shows as `lastCheckedAt`. */
+  checked?(tenantId: string, id: string, at: number): Promise<void>;
 }
 
 export function d1Connectors(db: D1Database): ConnectorStore {
-  const row = (r: any): Connector => ({
-    id: String(r.id), tenantId: String(r.tenant_id), provider: String(r.provider), account: r.account === null ? null : String(r.account),
-    creatorRaftUserId: String(r.creator_raft_user_id), sealed: { ciphertext: String(r.ciphertext), iv: String(r.iv) }, createdAt: Number(r.created_at),
-  });
+  const row = connectorRow;
   return {
     async create(c) {
+      const f = c.refresh ?? null;
       await db.prepare(
-        "INSERT INTO connectors (id, tenant_id, provider, account, creator_raft_user_id, ciphertext, iv, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-      ).bind(c.id, c.tenantId, c.provider, c.account, c.creatorRaftUserId, c.sealed.ciphertext, c.sealed.iv, c.createdAt).run();
+        `INSERT INTO connectors (id, tenant_id, provider, account, creator_raft_user_id, ciphertext, iv, created_at,
+           refresh_ciphertext, refresh_iv, expires_at, refresh_expires_at, refreshed_at, last_checked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).bind(c.id, c.tenantId, c.provider, c.account, c.creatorRaftUserId, c.sealed.ciphertext, c.sealed.iv, c.createdAt,
+        f?.sealed.ciphertext ?? null, f?.sealed.iv ?? null, f?.expiresAt ?? null, f?.refreshExpiresAt ?? null, f ? c.createdAt : null,
+        // Made from a confirm, whose attach has just checked the credential with GitHub.
+        c.createdAt).run();
+    },
+    async checked(tenantId, id, at) {
+      await db.prepare("UPDATE connectors SET last_checked_at = ? WHERE tenant_id = ? AND id = ?").bind(at, tenantId, id).run();
     },
     async get(tenantId, id) {
       const r = await db.prepare("SELECT * FROM connectors WHERE tenant_id = ? AND id = ?").bind(tenantId, id).first<any>();
@@ -605,8 +637,92 @@ export function d1Connectors(db: D1Database): ConnectorStore {
     },
     async record(e) {
       await db.prepare(
-        "INSERT INTO connector_events (tenant_id, connector_id, raft_agent_id, action, acting_raft_user_id, acting_role, at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-      ).bind(e.tenantId, e.connectorId, e.raftAgentId, e.action, e.actingRaftUserId, e.actingRole, e.at).run();
+        "INSERT INTO connector_events (tenant_id, connector_id, raft_agent_id, action, acting_raft_user_id, acting_role, at, reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      ).bind(e.tenantId, e.connectorId, e.raftAgentId, e.action, e.actingRaftUserId, e.actingRole, e.at, e.reason ?? null).run();
+    },
+  };
+}
+
+function connectorRow(r: any): Connector {
+  const n = (v: unknown) => (v === null || v === undefined ? null : Number(v));
+  return {
+    id: String(r.id), tenantId: String(r.tenant_id), provider: String(r.provider), account: r.account === null ? null : String(r.account),
+    creatorRaftUserId: String(r.creator_raft_user_id), sealed: { ciphertext: String(r.ciphertext), iv: String(r.iv) }, createdAt: Number(r.created_at),
+    refresh: r.refresh_ciphertext == null ? null
+      : { sealed: { ciphertext: String(r.refresh_ciphertext), iv: String(r.refresh_iv) }, expiresAt: n(r.expires_at), refreshExpiresAt: n(r.refresh_expires_at) },
+    brokenAt: n(r.broken_at), brokenReason: r.broken_reason == null ? null : String(r.broken_reason),
+    lastCheckedAt: n(r.last_checked_at),
+  };
+}
+
+/** A connector as its refresh reads it: the stored pair, and who may trade it and until when. */
+export interface ConnectorGrant extends Connector {
+  refreshedAt: number | null;
+  refreshingUntil: number | null;
+}
+
+/**
+ * Renewing connectors' expiring tokens (0023), from the agents' objects. Every write
+ * names what it expects to replace, so two refreshes racing on one connector cannot both land: the refresh
+ * token is single-use, and GitHub spends the old access token with it.
+ */
+export interface ConnectorGrants {
+  grant(tenantId: string, id: string): Promise<ConnectorGrant | null>;
+  /** Take the right to trade the refresh token until `until`; false while someone else holds it. */
+  lease(tenantId: string, id: string, now: number, until: number): Promise<boolean>;
+  release(tenantId: string, id: string): Promise<void>;
+  /** The new pair, only over the refresh token it was traded from (`expect`); clears the lease and any broken state. */
+  rotate(tenantId: string, id: string, next: { sealed: { ciphertext: string; iv: string }; refresh: ConnectorRefresh; at: number }, expect: string): Promise<boolean>;
+  /** Record that only a reconnect mends it, with a `broken` event; false when it was already broken. */
+  markBroken(tenantId: string, id: string, reason: string, at: number): Promise<boolean>;
+  /** The same, for an agent's connection that has no connector. */
+  markAgentBroken(tenantId: string, agentId: string, provider: string, reason: string, at: number): Promise<boolean>;
+}
+
+export function d1ConnectorGrants(db: D1Database): ConnectorGrants {
+  return {
+    async grant(tenantId, id) {
+      const r = await db.prepare("SELECT * FROM connectors WHERE tenant_id = ? AND id = ?").bind(tenantId, id).first<any>();
+      if (!r) return null;
+      return { ...connectorRow(r), refreshedAt: r.refreshed_at == null ? null : Number(r.refreshed_at), refreshingUntil: r.refreshing_until == null ? null : Number(r.refreshing_until) };
+    },
+    async lease(tenantId, id, now, until) {
+      const r = await db.prepare(
+        "UPDATE connectors SET refreshing_until = ? WHERE tenant_id = ? AND id = ? AND (refreshing_until IS NULL OR refreshing_until <= ?)",
+      ).bind(until, tenantId, id, now).run();
+      return Number(r.meta?.changes ?? 0) > 0;
+    },
+    async release(tenantId, id) {
+      await db.prepare("UPDATE connectors SET refreshing_until = NULL WHERE tenant_id = ? AND id = ?").bind(tenantId, id).run();
+    },
+    async rotate(tenantId, id, next, expect) {
+      const r = await db.prepare(
+        `UPDATE connectors SET ciphertext = ?, iv = ?, refresh_ciphertext = ?, refresh_iv = ?, expires_at = ?, refresh_expires_at = ?,
+           refreshed_at = ?, last_checked_at = ?, refreshing_until = NULL, broken_at = NULL, broken_reason = NULL
+         WHERE tenant_id = ? AND id = ? AND refresh_ciphertext = ?`,
+      ).bind(next.sealed.ciphertext, next.sealed.iv, next.refresh.sealed.ciphertext, next.refresh.sealed.iv, next.refresh.expiresAt,
+        next.refresh.refreshExpiresAt, next.at, next.at, tenantId, id, expect).run();
+      return Number(r.meta?.changes ?? 0) > 0;
+    },
+    async markBroken(tenantId, id, reason, at) {
+      const r = await db.prepare(
+        "UPDATE connectors SET broken_at = ?, broken_reason = ?, last_checked_at = ?, refreshing_until = NULL WHERE tenant_id = ? AND id = ? AND broken_at IS NULL",
+      ).bind(at, reason, at, tenantId, id).run();
+      const changed = Number(r.meta?.changes ?? 0) > 0;
+      if (changed) {
+        await db.prepare(
+          "INSERT INTO connector_events (tenant_id, connector_id, raft_agent_id, action, acting_raft_user_id, acting_role, at, reason) VALUES (?, ?, NULL, 'broken', ?, 'system', ?, ?)",
+        ).bind(tenantId, id, SYSTEM_ACTOR, at, reason).run();
+      }
+      return changed;
+    },
+    async markAgentBroken(tenantId, agentId, provider, reason, at) {
+      const r = await db.prepare(
+        `UPDATE provisioned_connections SET broken_at = ?, broken_reason = ?
+         WHERE tenant_id = ? AND provider = ? AND broken_at IS NULL
+           AND raft_agent_id IN (SELECT raft_agent_id FROM provisioned_agents WHERE tenant_id = ? AND agent_id = ?)`,
+      ).bind(at, reason, tenantId, provider, tenantId, agentId).run();
+      return Number(r.meta?.changes ?? 0) > 0;
     },
   };
 }

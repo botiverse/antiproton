@@ -17,6 +17,7 @@
  * body. Same key with any field different is 409, never a quiet update — Raft edits through PATCH (and the
  * model through PUT …/model), and a delayed POST retry must not overwrite an edit that landed after it (Tenny's race).
  */
+import { RECONNECT_REASON, type OAuthStatus } from "../github-refresh.ts";
 import type { Json } from "../../../src/core/types.ts";
 import { originProblem } from "../../../src/plugins/types.ts";
 import { secretShape } from "../secret-shape.ts";
@@ -24,7 +25,7 @@ import {
   MAIN_SESSION_ID, redactCredentials, TRACE_LIMIT_DEFAULT, TRACE_LIMIT_MAX, TRACE_WINDOW_MAX_MS, TRANSCRIPT_LIMIT_DEFAULT, TRANSCRIPT_LIMIT_MAX,
   type EvalTranscript, type TraceQuery, type TraceWindow,
 } from "../eval-read.ts";
-import { AGENT_BUDGETS, type AgentBudget, type ConnectionRegistry, type ConnectorStore, type ProviderTokenIdentity, type ProvisionRegistry, type ProvisionedAgent } from "../control-plane.ts";
+import { AGENT_BUDGETS, type AgentBudget, type ConnectionRegistry, type ConnectorRefresh, type ConnectorStore, type ProviderTokenIdentity, type ProvisionRegistry, type ProvisionedAgent } from "../control-plane.ts";
 import { PLANS, type Plan, type TenantPlanStore } from "../spend-limit.ts";
 import { CONNECTION_PROVIDERS, returnUrlProblem, scopesFor, type ConnectionProvider } from "./connect.ts";
 import { surface, surfaceReadOf, type SurfaceDeps } from "../agent-surface/surface.ts";
@@ -169,19 +170,20 @@ export interface ProvisionDeps {
     /** The tenant's connectors (0012): each connection is one, shared by the agents pointed at it. */
     connectors: ConnectorStore;
     newId(): string;
-    /** Put a connector's sealed credential on the agent's one mount of the provider's plugin. */
-    attach(tenantId: string, agentId: string, provider: ConnectionProvider, sealed: { ciphertext: string; iv: string }):
+    /** Put a connector's sealed credential on the agent's one mount of the provider's plugin, with what renews it (0023). */
+    attach(tenantId: string, agentId: string, provider: ConnectionProvider, sealed: { ciphertext: string; iv: string },
+      refresh?: (ConnectorRefresh & { connectorId: string | null }) | null):
       Promise<{ ok: true; account: string | null } | { ok: false; error: string }>;
     /** The one-time link the browser opens; signed, ten minutes. */
     link(spec: { tenantId: string; agentId: string; raftAgentId: string; provider: ConnectionProvider; returnUrl: string; raftUserId: string; scopes: string[] }):
       Promise<{ url: string; expiresAt: string }>;
     /** Remove it only while the mount still holds this connector's credential, not a key put there since. */
-    detachIfFrom(tenantId: string, agentId: string, provider: ConnectionProvider, sealed: { ciphertext: string; iv: string }): Promise<boolean>;
+    detachIfFrom(tenantId: string, agentId: string, provider: ConnectionProvider, sealed: { ciphertext: string; iv: string }, connectorId?: string | null): Promise<boolean>;
     /** Remove the provider's credential from the agent's mount. */
     detach(tenantId: string, agentId: string, provider: ConnectionProvider): Promise<boolean>;
-    /** Make a held connection the mount's credential, for the Raft user it was held for (connect.ts). */
-    confirm(tenantId: string, agentId: string, provider: ConnectionProvider, pending: string, raftUserId: string):
-      Promise<{ ok: true; account: string | null; sealed: { ciphertext: string; iv: string } } | { ok: false; error: string; missing?: true }>;
+    /** Make a held connection the mount's credential, for the Raft user it was held for (connect.ts), as connector `connectorId`. */
+    confirm(tenantId: string, agentId: string, provider: ConnectionProvider, pending: string, raftUserId: string, connectorId?: string):
+      Promise<{ ok: true; account: string | null; sealed: { ciphertext: string; iv: string }; refresh?: ConnectorRefresh | null } | { ok: false; error: string; missing?: true }>;
   };
   /**
    * An agent's usage and workspace, read through the same core the public API uses
@@ -992,16 +994,19 @@ async function connection(
     if (typeof b.raftUserId !== "string" || !RAFT_ID.test(b.raftUserId)) {
       return fail({ status: 422, code: "invalid", message: "raftUserId is required: the user of Raft's current session", param: "raftUserId" });
     }
-    const r = await c.confirm(tenantId, row.agentId, p, b.pending, b.raftUserId);
+    // The id first: the agent's mount records which connector renews it (cf/src/github-refresh.ts).
+    const connectorId = c.newId();
+    const r = await c.confirm(tenantId, row.agentId, p, b.pending, b.raftUserId, connectorId);
     if (!r.ok) {
       return r.missing
         ? fail({ status: 404, code: "not_found", message: "no pending connection with that id for this agent and user; it may have expired or been used" })
         : fail({ status: 422, code: "connect_failed", message: r.error });
     }
     // A finished authorization is a new connector of the tenant, created by whoever confirmed it.
+    // Connecting again is how a connection that needs reconnecting is mended: a new connector, and this agent's row
+    // written afresh, which clears its broken state.
     const connectedAt = deps.now();
-    const connectorId = c.newId();
-    await c.connectors.create({ id: connectorId, tenantId, provider: p, account: r.account, creatorRaftUserId: b.raftUserId, sealed: r.sealed, createdAt: connectedAt });
+    await c.connectors.create({ id: connectorId, tenantId, provider: p, account: r.account, creatorRaftUserId: b.raftUserId, sealed: r.sealed, refresh: r.refresh ?? null, createdAt: connectedAt });
     await c.registry.put({ tenantId, raftAgentId: row.raftAgentId, provider: p, account: r.account, connectedBy: b.raftUserId, connectedAt, connectorId });
     await c.connectors.record({ tenantId, connectorId, raftAgentId: row.raftAgentId, action: "create", actingRaftUserId: b.raftUserId, actingRole: "creator", at: connectedAt });
     return ok({ connected: true, connectorId, account: r.account, connectedAt: new Date(connectedAt).toISOString(), connectedBy: b.raftUserId });
@@ -1029,13 +1034,21 @@ async function connection(
   if (method === "GET") {
     const got = await c.registry.get(tenantId, row.raftAgentId, p);
     const current = got?.connectorId ?? null;
-    const connectors = (await c.connectors.list(tenantId, p)).map((k) => ({
+    const all = await c.connectors.list(tenantId, p);
+    const connectors = all.map((k) => ({
       id: k.id, account: k.account, creatorRaftUserId: k.creatorRaftUserId, createdAt: new Date(k.createdAt).toISOString(), current: k.id === current,
+      ...oauthState(k.brokenAt ?? null, k.lastCheckedAt ?? k.brokenAt ?? k.createdAt),
     }));
+    // A connection GitHub refused to renew is not connected, though its row stays: which account it was, and that
+    // only connecting again mends it, in the words Raft's own OAuth connectors use (`oauthStatus`).
+    const k = current === null ? undefined : all.find((x) => x.id === current);
+    // A row with no connector has no checks of its own recorded: its connect, or the refusal that broke it.
+    const brokenAt = (k ? k.brokenAt : got?.brokenAt) ?? null;
+    const checkedAt = k ? (k.lastCheckedAt ?? k.brokenAt ?? k.createdAt) : (got?.brokenAt ?? got?.connectedAt ?? null);
     return ok({
       ...(got
-        ? { connected: true, connectorId: current, account: got.account, connectedAt: new Date(got.connectedAt).toISOString(), connectedBy: got.connectedBy }
-        : { connected: false, connectorId: null, account: null, connectedAt: null, connectedBy: null }),
+        ? { connected: brokenAt === null, connectorId: current, account: got.account, connectedAt: new Date(got.connectedAt).toISOString(), connectedBy: got.connectedBy, ...oauthState(brokenAt, checkedAt) }
+        : { connected: false, connectorId: null, account: null, connectedAt: null, connectedBy: null, oauthStatus: "disconnected" as OAuthStatus, lastCheckError: null, lastCheckedAt: null }),
       connectors,
     });
   }
@@ -1048,9 +1061,11 @@ async function connection(
     if (!k || k.provider !== p) return fail({ status: 404, code: "not_found", message: `no ${p} connector ${connectorId} in this tenant` });
     const refused = creatorRefused(k, acting);
     if (refused) return fail(refused);
-    const r = await c.attach(tenantId, row.agentId, p, k.sealed);
+    const r = await c.attach(tenantId, row.agentId, p, k.sealed, k.refresh ? { ...k.refresh, connectorId: k.id } : null);
     if (!r.ok) return fail({ status: 422, code: "connect_failed", message: r.error });
     const at = deps.now();
+    // The attach checked the credential with GitHub and it was taken.
+    await c.connectors.checked?.(tenantId, k.id, at);
     await c.registry.put({ tenantId, raftAgentId: row.raftAgentId, provider: p, account: k.account, connectedBy: acting.actingRaftUserId, connectedAt: at, connectorId: k.id });
     await c.connectors.record({ tenantId, connectorId: k.id, raftAgentId: row.raftAgentId, action: "bind", ...acting, at });
     return ok({ connected: true, connectorId: k.id, account: k.account, connectedAt: new Date(at).toISOString(), connectedBy: acting.actingRaftUserId });
@@ -1067,6 +1082,19 @@ async function connection(
     return new Response(null, { status: 204 });
   }
   return null;
+}
+
+/**
+ * A connection's state in the words Raft's managed-MCP OAuth connectors use (0023): `error` once GitHub refused to
+ * renew it, with the reason Raft shows; `lastCheckedAt` the last check whatever came of it.
+ */
+function oauthState(brokenAt: number | null, checkedAt: number | null):
+  { oauthStatus: OAuthStatus; lastCheckError: string | null; lastCheckedAt: string | null } {
+  return {
+    oauthStatus: brokenAt === null ? "connected" : "error",
+    lastCheckError: brokenAt === null ? null : RECONNECT_REASON,
+    lastCheckedAt: checkedAt === null ? null : new Date(checkedAt).toISOString(),
+  };
 }
 
 type Acting = { actingRaftUserId: string; actingRole: "creator" | "admin" };
@@ -1120,7 +1148,7 @@ async function disconnect(tenantId: string, connectorId: string, body: unknown, 
   for (const raftAgentId of await c.registry.boundTo(tenantId, k.id)) {
     try {
       const row = await deps.registry.get(tenantId, raftAgentId);
-      if (row) await c.detachIfFrom(tenantId, row.agentId, provider, k.sealed);
+      if (row) await c.detachIfFrom(tenantId, row.agentId, provider, k.sealed, k.id);
       await c.registry.remove(tenantId, raftAgentId, provider);
       detached.push(raftAgentId);
     } catch (e) {

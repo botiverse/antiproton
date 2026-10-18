@@ -103,6 +103,14 @@ export interface SecretResolver {
   resolve(ref: string, scope?: { tenantId: string; agentId: string }, opts?: { touch?: boolean }): Promise<string | null>;
 }
 
+/**
+ * Renewing a mount's own credential after the far end refused it (`PluginContext.credentialRejected`): for the
+ * secret the mount's `agent:` reference names, in the mount owner's store.
+ */
+export type CredentialRejected = (
+  scope: { tenantId: string; agentId: string }, secretName: string, credential: string, retried: boolean,
+) => Promise<{ credential: string } | { reconnect: string } | null>;
+
 export const envSecrets: SecretResolver = {
   async resolve(ref) {
     return process.env[ref.replace(/^env:/, "")] ?? null;
@@ -255,13 +263,17 @@ export class ToolGateway {
     store: StorageAdapter, plugins: Plugin[], seeded: ReadonlySet<string>,
     secrets: SecretResolver = envSecrets,
     inbound?: (tenantId: string, agentId: string, alias: string) => InboundHooks,
+    opts: { credentialRejected?: CredentialRejected } = {},
   ) {
     this.#store = store;
     this.#plugins = new Map(plugins.map((p) => [p.id, p]));
     this.#secrets = secrets;
     this.#inbound = inbound;
     this.#seeded = seeded;
+    this.#credentialRejected = opts.credentialRejected;
   }
+
+  #credentialRejected?: CredentialRejected;
 
   readonly #seeded: ReadonlySet<string>;
 
@@ -1177,6 +1189,11 @@ export class ToolGateway {
       // asking what the list should be, and the answer it would be handed is the one being replaced.
       ...(plugin && !listing ? { offered: toolsOf(plugin, mount).map((t) => t.name) } : {}),
       credential,
+      // Only for the mount's own key, and only where the deployment can renew one.
+      ...(this.#credentialRejected && credential && isAgentRef(mount.secretRef) ? {
+        credentialRejected: (token: string, o?: { retried?: boolean }) => this.#credentialRejected!(
+          { tenantId: mount.tenantId, agentId: mount.agentId }, mount.secretRef!.slice(AGENT_REF.length), token, !!o?.retried),
+      } : {}),
       // What kind of credential the mount names, so a null `credential` can be read as "names none" or
       // "names one that did not arrive" rather than guessed. The KIND, never the reference: a reference
       // carries the bucket, the tenant and the agent (src/store/refs.ts), and a plugin writes what it

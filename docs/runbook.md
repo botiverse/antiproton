@@ -94,6 +94,43 @@ curl -s -X DELETE -H "x-harness-token: $AUTOMATION_TOKEN" -H "content-type: appl
 
 `GET /admin/spend-limits` lists what is set.
 
+## A GitHub connection that needs reconnecting
+
+Connect GitHub hands out expiring user tokens (8 hours, renewed with a single-use refresh token that lasts about 6
+months). The deployment renews them (cf/src/github-refresh.ts); when GitHub refuses a renewal, or still answers `401`
+for a renewed token, the connection is marked as needing reconnecting and only its person can mend it.
+
+**Where it shows.** Raft's `GET …/connections/github` answers `connected: false, oauthStatus: "error"` and
+`lastCheckError`
+([`agent-surface.md`](agent-surface.md#the-agents-github-connection-connectionsgithub)), and the agent's GitHub tools say
+the user must reconnect GitHub. In D1 (`antiproton-control`):
+
+```sql
+-- Connectors that need reconnecting, and what GitHub said.
+SELECT tenant_id, id, account, broken_at, broken_reason, refreshed_at, last_checked_at, expires_at FROM connectors WHERE broken_at IS NOT NULL;
+-- The agents pointed at one of them.
+SELECT raft_agent_id FROM provisioned_connections WHERE tenant_id = '<tenantId>' AND connector_id = '<connectorId>';
+-- When it was marked (`acting_role` system), beside who made and pointed it.
+SELECT action, raft_agent_id, acting_raft_user_id, acting_role, at, reason FROM connector_events WHERE connector_id = '<connectorId>' ORDER BY at;
+-- An agent's connection made before connectors carries the state on its own row.
+SELECT tenant_id, raft_agent_id, broken_at, broken_reason FROM provisioned_connections WHERE broken_at IS NOT NULL;
+```
+
+`refreshing_until` on a connector is a renewal in progress (a 30-second lease); one in the past is a renewal that did
+not finish, and the next one takes over.
+
+**In the logs.** Every renewal is a `github.refresh` line: `outcome` `rotated` (a new pair), `adopted` (an agent took
+the pair another agent's renewal stored), `broken`, `unavailable` (GitHub did not answer: not a verdict, nothing is
+marked), `interrupted-before` (a renewal in this object stopped part-way; the next one goes ahead) or
+`propagate-failed` (an agent on the connector was not told; it renews on its own next `401`), with
+`tenantId`, `agentId`, `connectorId`, `why` (`expiring`, `rejected`, `adopt`) and GitHub's error as `reason`. Never a
+token. Each connect also writes `connect.exchange` with the **names** of the keys GitHub's answer carried: one with
+`expires_in` and `refresh_token` is an expiring token (`expiring: true`).
+
+**Mending it** is the person's: Connect GitHub again from the agent's page. That makes a new connector and clears the
+state for that agent; other agents on the old connector are pointed at the new one from their own pages. Nothing an
+operator writes to D1 brings a refused refresh token back.
+
 ## Trying conversation cards on an agent
 
 Conversation cards are the `raft` mount's `conversationCards` setting, off unless `true` (docs/plugins.md). Turn them on
