@@ -394,6 +394,22 @@ time it exports rows for a UTC day (`noteTraceDays`, `cf/src/trace-r2.ts`), so t
 older than 14 days are deleted by the scan, one day per run. A day with no index at all (one before the index was
 deployed) falls back to listing the in-scope tenants' `trace/<tenant>/` prefixes, bounded by `maxAgents`.
 
+## Checking that a string is stored nowhere for an agent
+
+`POST /admin/storage-scan` (operator token) reads every table and row of one agent's object and every R2 object under
+its prefixes (`t/<tenant>/<agent>/`, `trace/<tenant>/<agent>/`), and says where a string is found: table names and a
+count of objects, with how much was read. It is the check for a data contract such as RaftBench's (no copy of the
+source text outlives a run). A match is case-insensitive and also looks inside JSON-escaped strings. The needle is not
+returned and not logged (`admin.storage_scan` carries the ids and `found`). Past its caps the answer says `truncated`,
+and a `found: false` then covers only what was read. Each call reads a few MB of an agent's tables at most, and
+skips R2 objects over 16 MB (`skipped`). It is operator-only for a reason: any substring of four characters or more can
+be asked about, so it answers whether a text is stored, and is an oracle for what an agent holds.
+
+```
+curl -s -X POST -H "x-harness-token: $AUTOMATION_TOKEN" -H "content-type: application/json" \
+  -d '{"tenantId":"<tenant>","agentId":"<agent>","needle":"<a marker placed in the material>"}' "$HOST/admin/storage-scan"
+```
+
 ## Moving a Raft server's agents to a new tenant
 
 A platform token acts in the tenant its request's server id derives (`derivedTenant`, cf/src/provision/handlers.ts).

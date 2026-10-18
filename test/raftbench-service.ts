@@ -230,17 +230,17 @@ async function assign(w: World, run = w.raft.run) {
 }
 
 /** Raft's inbox notice to the agent, for whatever events are queued, and the pass that follows. */
-async function notify(w: World) {
+async function notify(w: World, o: { agentId?: string; hookId?: string; secret?: string; text?: string; targets?: unknown[]; noPass?: true } = {}) {
   const noticeId = `ntc_${randomUUID().replace(/-/g, "").slice(0, 16)}`;
   const body = new TextEncoder().encode(JSON.stringify({
     schema: "raft-agent-inbox-notice.v1", noticeId, recipientAgentId: RAFT_AGENT, occurredAt: "2026-10-18T08:00:00.000Z",
-    text: "Inbox update: 1 unread event\nagent-event:abcd1234  pending: 1 · latest sender @system.raftbench",
-    targets: [{ target: "agent-event:abcd1234", pendingCount: 1, firstPendingMsgId: "e1", latestMsgId: "e1", latestSenderName: "system.raftbench", latestSenderType: "third_party_app", flags: [] }],
+    text: o.text ?? "Inbox update: 1 unread event\nagent-event:abcd1234  pending: 1 · latest sender @system.raftbench",
+    targets: o.targets ?? [{ target: "agent-event:abcd1234", pendingCount: 1, firstPendingMsgId: "e1", latestMsgId: "e1", latestSenderName: "system.raftbench", latestSenderType: "third_party_app", flags: [] }],
   }));
-  const signature = createHmac("sha256", w.raft.push!.secret).update(body).digest("hex");
-  const r = await w.rt.receiveHook("t", SERVICE, PROVISION_MOUNT_ALIAS, hookOf(w), { headers: { "x-raft-signature-256": `sha256=${signature}`, "x-raft-delivery-id": noticeId }, body });
+  const signature = createHmac("sha256", o.secret ?? w.raft.push!.secret).update(body).digest("hex");
+  const r = await w.rt.receiveHook("t", o.agentId ?? SERVICE, PROVISION_MOUNT_ALIAS, o.hookId ?? hookOf(w), { headers: { "x-raft-signature-256": `sha256=${signature}`, "x-raft-delivery-id": noticeId }, body });
   must(r.outcome === "delivered", `the notice was ${r.outcome}`);
-  await pass(w);
+  if ((o.agentId ?? SERVICE) === SERVICE && !o.noPass) await pass(w);
 }
 
 /** The alarm passes the object runs: one, and again at once while a pass asks to come back at once. */
@@ -671,6 +671,123 @@ await check("retention: a crash between the run's end and its erase is erased on
   await fresh.step("t", SERVICE);
   mustBeGone(w, "after the replay");
   must(w.raft.submits().length === 1, `submits ${w.raft.submits().length}`);
+});
+
+await check("retention: an erase cut off between its archive and its drop leaves no archived copy, and the next one erases", async () => {
+  const w = await world();
+  w.raft.pages = markedPages();
+  await assign(w);
+  await w.rt.stopTurn("t", SERVICE, "provider_stop");
+  const { eraseMain } = await import("../cf/src/fresh-context.ts");
+  let failed = false;
+  const failing = { sql: { exec: (q: string, ...b: unknown[]) => {
+    if (!failed && /^DROP TABLE IF EXISTS pi_s_archived/.test(q)) { failed = true; throw new Error("evicted mid-erase"); }
+    return w.host.sql.exec(q, ...b);
+  } }, transactionSync: w.host.transactionSync };
+  let threw = false;
+  try { eraseMain(failing as never, Date.now()); } catch { threw = true; }
+  must(failed && threw, "the failure was not injected between the archive and the drop");
+  const archived = () => w.host.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'pi_s_archived%'").toArray().map((r: any) => String(r.name));
+  must(archived().length === 0 && whereIs(w, MATERIAL_MARK).some((h) => h === "table pi_entries"), `after the cut-off erase: archived ${show(archived())}, material ${show(whereIs(w, MATERIAL_MARK))}`);
+  must(eraseMain(w.host as never, Date.now()) !== null, "the next erase found nothing to erase");
+  must(archived().length === 0 && !whereIs(w, MATERIAL_MARK).some((h) => /pi_|model_jobs/.test(h)), `after the next erase: ${show({ archived: archived(), material: whereIs(w, MATERIAL_MARK) })}`);
+});
+
+await check("retention: an erase still owed is done by a wake even when the raft mount's credential is gone", async () => {
+  const w = await world();
+  w.raft.pages = markedPages();
+  await assign(w);
+  crash.when = () => w.host.sql.exec(`SELECT 1 AS x FROM plugin_db WHERE value LIKE '%"forgetPending":true%'`).toArray().length > 0;
+  crash.armed = true;
+  await answer(w, markedAnswer()).catch(() => {});
+  must(!crash.armed && whereIs(w, MATERIAL_MARK).length > 0, "the crash was not where it was meant to be");
+  // The end is taken as told, so only a wake is left to ask for the erase; and the plugin cannot reach Raft.
+  w.host.sql.exec("UPDATE plugin_turn_ends SET handled = ?", Date.now());
+  must((await w.rt.removeCredential("t", SERVICE, PROVISION_MOUNT_ALIAS)) !== false, "the credential was not removed");
+  const { askWake } = await import("../src/runtime/plugin-wakes.ts");
+  askWake(w.host.sql as never, "raftbench", Date.now());
+  await w.rt.step("t", SERVICE);
+  mustBeGone(w, "after the wake");
+});
+
+await check("chat pushed to the service agent — a message, an @mention, a DM — is never queued, stored, posted or answered", async () => {
+  const w = await world();
+  const CHAT = "ZQ-CHAT-9913";
+  const chat = (over: Record<string, unknown>) => ({ seq: 40 + Object.keys(over).length, message_id: randomUUID(), sender_type: "human", sender_name: `ana-${CHAT}`,
+    content: `please look at this ${CHAT}`, timestamp: "2026-10-18T08:00:00.000Z", ...over });
+  w.raft.events.push(chat({ channel_type: "channel", channel_name: `ops-${CHAT}` }), chat({ channel_type: "channel", channel_name: "ops", mentioned: true }),
+    chat({ channel_type: "dm", channel_name: `dm-${CHAT}` }));
+  logs.length = 0;
+  await notify(w, { text: `Inbox update: 3 unread\n#ops-${CHAT} pending: 2 messages · latest sender @ana-${CHAT} · you were mentioned\ndm:@ana-${CHAT} pending: 1`,
+    targets: [{ target: `#ops-${CHAT}`, channelId: "c1", channelType: "channel", pendingCount: 2, firstPendingMsgId: "m1", latestMsgId: "m2", latestSenderName: `ana-${CHAT}`, latestSenderType: "human", flags: ["mention"] },
+      { target: `dm:@ana-${CHAT}`, channelId: "c2", channelType: "dm", pendingCount: 1, firstPendingMsgId: "m3", latestMsgId: "m3", latestSenderName: `ana-${CHAT}`, latestSenderType: "human", flags: [] }], noPass: true });
+  // Decided as it arrives: nothing of the push is written, not even until the next pass.
+  must(show(whereIs(w, CHAT)) === "[]", `the push was stored on arrival: ${show(whereIs(w, CHAT))}`);
+  await pass(w);
+  must(show(whereIs(w, CHAT)) === "[]", `chat was stored: ${show(whereIs(w, CHAT))}`);
+  must(w.sent.length === 0 && !w.raft.calls.some((c) => c.path.startsWith("/internal/agent-api/raftbench/")), `calls ${w.sent.length}`);
+  must(w.raft.calls.some((c) => c.path === "/internal/agent-api/events"), "the events were not read, so they were not acknowledged");
+  const dropped = runLogs("event_dropped");
+  must(dropped.length === 3 && !show(dropped).includes(CHAT) && show(dropped.map((d) => d.kind)) === show(["channel", "channel", "dm"]), show(dropped));
+  must(!show(logs).includes(CHAT), "the chat's content reached a log line");
+  // The assignment still works, after it.
+  await assign(w);
+  must((w.sent as string[]).length === 1, `the assignment made no call: ${w.sent.length}`);
+  // A default agent still receives chat as before: its notice is queued for its model.
+  must((await adoptProvisionedAgent(w.rt, "t", "raft_plain", { name: "Cody", instructions: "", raftOrigin: ORIGIN, avatar: "00", toolConfig: null, profile: null })).ok, "plain adopt");
+  must((await w.rt.attachCredential("t", "raft_plain", PROVISION_MOUNT_ALIAS, { token: CRED })).ok, "plain credential");
+  must((await provisionTool(w.rt, "t", "raft_plain", "enable_push")).ok, "plain push");
+  await notify(w, { agentId: "raft_plain", hookId: w.raft.push!.url.split("/").pop()!, secret: w.raft.push!.secret, text: `Inbox update: #ops pending: 1 · latest sender @ana-${CHAT}` });
+  must(w.host.sql.exec("SELECT message FROM inbound_pending").toArray().some((r: any) => String(r.message).includes(CHAT)), "the default agent's notice was not queued");
+});
+
+await check("rows a profile agent's queue held from before are deleted by the next pass, never posted", async () => {
+  const w = await world();
+  const { acceptInbound, ensureInboundTable } = await import("../src/runtime/inbound.ts");
+  ensureInboundTable(w.host.sql as never);
+  const mount = await w.rt.store.getMountByAlias("t", SERVICE, PROVISION_MOUNT_ALIAS);
+  acceptInbound(w.host.sql as never, { hookId: hookOf(w), alias: PROVISION_MOUNT_ALIAS, dedupeKey: "old-1", message: "Inbox update: #ops ZQ-OLD-4471", now: Date.now(), installationId: mount!.installationId });
+  must(whereIs(w, "ZQ-OLD-4471").length > 0, "the old row was not written");
+  await pass(w);
+  must(show(whereIs(w, "ZQ-OLD-4471")) === "[]" && w.sent.length === 0, `left: ${show(whereIs(w, "ZQ-OLD-4471"))}, calls ${w.sent.length}`);
+});
+
+await check("an empty window: no model call, an ordinary incomplete through submit, and nothing kept", async () => {
+  const w = await world();
+  w.raft.pages = [{ sourceText: "", sources: [], fetched: 0, exhausted: true, stopReason: "window_end" }];
+  await assign(w);
+  for (let i = 0; i < 2; i++) await pass(w);
+  must(w.sent.length === 0, `model calls: ${w.sent.length}`);
+  const submits = w.raft.submits();
+  must(submits.length === 1 && w.raft.accepted.size === 1, `submits ${submits.length}`);
+  must(canon(submits[0]!.body) === canon({ runId: w.raft.run.runId, revision: 3, status: "incomplete", reason: "No messages were read in this window; nothing was analyzed.",
+    patterns: [], gaps: ["missing_tool_outcomes"] }), submits[0]!.raw);
+  must(runLogs("done").some((l) => l.outcome === "accepted" && l.from === "empty"), show(runLogs("done")));
+  must(w.host.sql.exec("SELECT COUNT(*) AS n FROM pi_entries").toArray()[0]!.n === 0 && w.host.sql.exec("SELECT COUNT(*) AS n FROM pi_model_jobs").toArray()[0]!.n === 0, "a conversation was kept");
+  must(show(whereIs(w, "nothing was analyzed")) === "[]", `the submitted result was kept: ${show(whereIs(w, "nothing was analyzed"))}`);
+  // A window with messages in it still goes to the model.
+  const v = await world();
+  await assign(v);
+  must(v.sent.length === 1 && v.raft.submits().length === 0, `a normal read: calls ${v.sent.length}, submits ${v.raft.submits().length}`);
+});
+
+await check("a wake that keeps failing backs off, doubling to six hours, and a wake that works resets it", async () => {
+  const { wakeBackoffMs } = await import("../src/plugins/raftbench.ts");
+  must(show([1, 2, 3, 10, 50].map(wakeBackoffMs)) === show([60_000, 120_000, 240_000, 6 * 3_600_000, 6 * 3_600_000]), show([1, 2, 3, 10, 50].map(wakeBackoffMs)));
+  const w = await world();
+  must((await w.rt.removeCredential("t", SERVICE, PROVISION_MOUNT_ALIAS)) !== false, "the credential was not removed");
+  const { askWake, nextWakeAt } = await import("../src/runtime/plugin-wakes.ts");
+  const gaps: number[] = [];
+  for (let i = 0; i < 3; i++) {
+    askWake(w.host.sql as never, "raftbench", Date.now());
+    await w.rt.step("t", SERVICE);
+    gaps.push(nextWakeAt(w.host.sql as never)! - Date.now());
+  }
+  must(gaps[0]! > 50_000 && gaps[1]! > 110_000 && gaps[2]! > 230_000 && gaps[2]! <= 240_000, show(gaps));
+  must((await w.rt.attachCredential("t", SERVICE, PROVISION_MOUNT_ALIAS, { token: CRED })).ok, "re-attach");
+  askWake(w.host.sql as never, "raftbench", Date.now());
+  await w.rt.step("t", SERVICE);
+  must(!runLogs("wake_failed").some((l) => l.failures === 4) && w.host.sql.exec(`SELECT 1 AS x FROM plugin_db WHERE key = 'wake_failures'`).toArray().length === 0, "the count was not reset");
 });
 
 await check("retention: every terminal path leaves no copy — timeout, read failure, stop, model failure, overflow, cancel, reread", async () => {

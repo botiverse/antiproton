@@ -15,6 +15,7 @@ import { objectMoved } from "./do-retry.ts";
 import { HANDOFF_PATH, adminHostServes, adminShell, handoffTicket, redeemTicket, safeReturnTo } from "./admin-host.ts";
 import { UNACCEPTED_TOKENS } from "../../src/usage/outbox.ts";
 import { nextAlarm } from "./alarm-next.ts";
+import { agentPrefixes, needleProblem, scanObjects, scanTables, type ScanBucket, type StorageScan } from "./storage-scan.ts";
 import type { AgentProfile } from "../../src/runtime/agent-profile.ts";
 import { adminModels } from "./admin-models.ts";
 import { agentModel } from "./agent-model.ts";
@@ -2226,6 +2227,16 @@ export class AgentDO extends DurableObject<Env> {
    * Whether this object is the agent named, read without claiming it: a look at an object that was
    * never made must not make it the agent's (`#claim` writes the owner row when it is missing).
    */
+  /**
+   * The storage-scan route's half in this object (cf/src/storage-scan.ts): where in this agent's SQLite `needle` is
+   * stored, by table name only. SELECTs only, with no runtime built, so the read changes nothing. Null for an agent
+   * this object does not hold.
+   */
+  async adminStorageScan(tenantId: string, agentId: string, needle: string) {
+    if (!this.#isAgent(tenantId, agentId)) return null;
+    return scanTables(this.sql as never, needle);
+  }
+
   #isAgent(tenantId: string, agentId: string): boolean {
     try {
       const row = this.sql.exec("SELECT tenant_id, agent_id FROM owner WHERE k='self'").toArray()[0] as any;
@@ -4891,6 +4902,30 @@ async function unaddressed(request: Request, env: Env, url: URL): Promise<Respon
           const s4 = env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a)));
           const r = await s4.resetSession(t, a, url.searchParams.get("rebuild") !== "0");
           return Response.json(r, { status: r.ok ? 200 : r.status });
+        }
+        case "/admin/storage-scan": {
+          // Whether a string is stored anywhere for one agent (cf/src/storage-scan.ts): where, never what. The needle is
+          // not logged and not answered.
+          if (!isOperator(env.AUTOMATION_TOKEN, request.headers.get("x-harness-token"))) {
+            return Response.json({ error: "unauthorized" }, { status: 401 });
+          }
+          if (request.method !== "POST") return Response.json({ error: "POST" }, { status: 405 });
+          let b: Record<string, unknown>;
+          try { b = (await request.json()) as Record<string, unknown>; } catch { return Response.json({ error: "the body is JSON" }, { status: 400 }); }
+          const t = typeof b?.tenantId === "string" ? b.tenantId : "", a = typeof b?.agentId === "string" ? b.agentId : "";
+          if (!t || !a) return Response.json({ error: "tenantId and agentId are required" }, { status: 400 });
+          const why = needleProblem(b.needle);
+          if (why) return Response.json({ error: why }, { status: 400 });
+          const tables = await env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a))).adminStorageScan(t, a, b.needle as string);
+          if (!tables) return Response.json({ error: "no such agent" }, { status: 404 });
+          const objects = await scanObjects(env.ARTIFACTS as unknown as ScanBucket, agentPrefixes(t, a), b.needle as string);
+          const out: StorageScan = {
+            found: tables.tables.length > 0 || objects.objects > 0, tables: tables.tables, objects: objects.objects,
+            scanned: { tables: tables.scanned.tables, rows: tables.scanned.rows, objects: objects.scanned }, skipped: objects.skipped,
+            truncated: tables.truncated || objects.truncated,
+          };
+          logEvent("admin.storage_scan", { tenantId: t, agentId: a, found: out.found, truncated: out.truncated });
+          return Response.json(out);
         }
         case "/admin/cancel-turn": {
           // The operator's stop for a runaway turn (docs/runbook.md, "Stopping a runaway agent"): the running turn

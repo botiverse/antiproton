@@ -116,61 +116,64 @@ const archivedName = (id: string) => `archived:${id}`;
  * written. The caller has made sure nothing is running (`AgentRuntime.freshContext`).
  */
 export function startFreshMain(host: Host, now: number, cause: MainCause = "fresh-context"): { oldSessionId: string; newSessionId: string } {
-  const sql = host.sql;
-  const run = () => {
-    sql.exec(MAIN_SESSIONS);
-    try { sql.exec("ALTER TABLE main_sessions ADD COLUMN cause TEXT"); } catch { /* already there */ }
-    // An operator's fresh context starts over; a rebuild keeps the backstop's count, which is what bounds it.
-    if (cause === "fresh-context") clearBackstop(sql as never);
-    ensurePiTables(sql, MAIN_SESSION);
-    const oldSessionId = currentMainId(sql);
-    const last = Number(sql.exec("SELECT COALESCE(MAX(generation), 0) AS g FROM main_sessions").toArray()[0]?.g ?? 0);
-    const generation = last + 1;
-    const newSessionId = `${FIRST_MAIN_ID}.${generation}`;
-    const archive = archivedName(oldSessionId);
-    const from = piTables(MAIN_SESSION), to = piTables(archive);
-    const tables = Object.keys(from) as Array<keyof typeof from>;
-    for (const ix of sql.exec(
-      `SELECT name FROM sqlite_master WHERE type = 'index' AND sql IS NOT NULL AND tbl_name IN (${tables.map(() => "?").join(",")})`,
-      ...tables.map((k) => from[k])).toArray()) {
-      sql.exec(`DROP INDEX "${String(ix.name).replace(/"/g, "")}"`);
-    }
-    for (const k of tables) sql.exec(`ALTER TABLE ${from[k]} RENAME TO ${to[k]}`);
-    ensurePiTables(sql, archive);
-    ensurePiTables(sql, MAIN_SESSION);
-    sql.exec("INSERT OR IGNORE INTO main_sessions(generation, session_id, started_at) VALUES (0, ?, NULL)", FIRST_MAIN_ID);
-    sql.exec("UPDATE main_sessions SET ended_at = ?, archived_as = ? WHERE session_id = ?", now, archive, oldSessionId);
-    sql.exec("INSERT INTO main_sessions(generation, session_id, started_at, cause) VALUES (?, ?, ?, ?)", generation, newSessionId, now, cause);
-    return { oldSessionId, newSessionId };
-  };
-  return host.transactionSync ? host.transactionSync(run) : run();
+  return host.transactionSync ? host.transactionSync(() => freshMain(host.sql, now, cause)) : freshMain(host.sql, now, cause);
+}
+
+/** `startFreshMain`'s steps, for a caller that runs them inside a transaction of its own (`eraseMain`). */
+function freshMain(sql: Sql, now: number, cause: MainCause): { oldSessionId: string; newSessionId: string } {
+  sql.exec(MAIN_SESSIONS);
+  try { sql.exec("ALTER TABLE main_sessions ADD COLUMN cause TEXT"); } catch { /* already there */ }
+  // An operator's fresh context starts over; a rebuild keeps the backstop's count, which is what bounds it.
+  if (cause === "fresh-context") clearBackstop(sql as never);
+  ensurePiTables(sql, MAIN_SESSION);
+  const oldSessionId = currentMainId(sql);
+  const last = Number(sql.exec("SELECT COALESCE(MAX(generation), 0) AS g FROM main_sessions").toArray()[0]?.g ?? 0);
+  const generation = last + 1;
+  const newSessionId = `${FIRST_MAIN_ID}.${generation}`;
+  const archive = archivedName(oldSessionId);
+  const from = piTables(MAIN_SESSION), to = piTables(archive);
+  const tables = Object.keys(from) as Array<keyof typeof from>;
+  for (const ix of sql.exec(
+    `SELECT name FROM sqlite_master WHERE type = 'index' AND sql IS NOT NULL AND tbl_name IN (${tables.map(() => "?").join(",")})`,
+    ...tables.map((k) => from[k])).toArray()) {
+    sql.exec(`DROP INDEX "${String(ix.name).replace(/"/g, "")}"`);
+  }
+  for (const k of tables) sql.exec(`ALTER TABLE ${from[k]} RENAME TO ${to[k]}`);
+  ensurePiTables(sql, archive);
+  ensurePiTables(sql, MAIN_SESSION);
+  sql.exec("INSERT OR IGNORE INTO main_sessions(generation, session_id, started_at) VALUES (0, ?, NULL)", FIRST_MAIN_ID);
+  sql.exec("UPDATE main_sessions SET ended_at = ?, archived_as = ? WHERE session_id = ?", now, archive, oldSessionId);
+  sql.exec("INSERT INTO main_sessions(generation, session_id, started_at, cause) VALUES (?, ?, ?, ?)", generation, newSessionId, now, cause);
+  return { oldSessionId, newSessionId };
 }
 
 /**
  * Start a new main conversation, and erase the one that ends rather than archive it: its transcript's tables, its model
  * jobs (requests and answers), and its row's pointer to the archive. Only the conversation's id and times stay in
- * `main_sessions`. Idempotent: with nothing in the main conversation it does nothing, and answers null. For an agent whose conversations hold material that must not outlive their use
- * (src/runtime/agent-profile.ts `keepsConversations`). Called with no run in the main conversation, so every job
- * filed under it belongs to the one ending.
+ * `main_sessions`. For an agent whose conversations hold material that must not outlive their use
+ * (src/runtime/agent-profile.ts `keepsConversations`). Called with no run in the main conversation, so every job filed
+ * under it belongs to the one ending. One transaction, so the archive made on the way never outlives it. Idempotent:
+ * with nothing in the main conversation it does nothing, and answers null.
  */
 export function eraseMain(host: Host, now: number): { oldSessionId: string; newSessionId: string } | null {
   const sql = host.sql;
-  // Asked again after an eviction, or with nothing said since: an empty conversation has nothing to erase.
   const table = (name: string) => rows(sql, "SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = ?", name).length > 0;
-  const entries = table(piTables(MAIN_SESSION).entries) && rows(sql, `SELECT 1 AS x FROM ${piTables(MAIN_SESSION).entries} LIMIT 1`).length > 0;
-  const jobs = table("pi_model_jobs") && rows(sql, "SELECT 1 AS x FROM pi_model_jobs WHERE session = ? LIMIT 1", MAIN_SESSION).length > 0;
-  if (!entries && !jobs) return null;
-  const out = startFreshMain(host, now);
   const run = () => {
+    // Asked again after an eviction, or with nothing said since: an empty conversation has nothing to erase.
+    const main = piTables(MAIN_SESSION).entries;
+    const entries = table(main) && rows(sql, `SELECT 1 AS x FROM ${main} LIMIT 1`).length > 0;
+    const jobs = table("pi_model_jobs") && rows(sql, "SELECT 1 AS x FROM pi_model_jobs WHERE session = ? LIMIT 1", MAIN_SESSION).length > 0;
+    if (!entries && !jobs) return null;
+    const out = freshMain(sql, now, "fresh-context");
     const archive = archivedName(out.oldSessionId);
     const t = piTables(archive);
-    for (const table of [t.entries, t.usage, t.values, t.list, t.meta]) sql.exec(`DROP TABLE IF EXISTS ${table}`);
+    for (const name of [t.entries, t.usage, t.values, t.list, t.meta]) sql.exec(`DROP TABLE IF EXISTS ${name}`);
     sql.exec("UPDATE main_sessions SET archived_as = NULL WHERE session_id = ?", out.oldSessionId);
-    if (rows(sql, "SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = 'pi_sessions'").length) sql.exec("DELETE FROM pi_sessions WHERE session = ?", archive);
-    if (rows(sql, "SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = 'pi_model_jobs'").length) sql.exec("DELETE FROM pi_model_jobs WHERE session = ?", MAIN_SESSION);
+    if (table("pi_sessions")) sql.exec("DELETE FROM pi_sessions WHERE session = ?", archive);
+    if (table("pi_model_jobs")) sql.exec("DELETE FROM pi_model_jobs WHERE session = ?", MAIN_SESSION);
+    return out;
   };
-  host.transactionSync ? host.transactionSync(run) : run();
-  return out;
+  return host.transactionSync ? host.transactionSync(run) : run();
 }
 
 // ---- model input evidence

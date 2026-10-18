@@ -1404,6 +1404,8 @@ export class AgentRuntime {
       return done("ignored", MOUNT_REMOVED_REASON);
     }
     const installationId = accepting.installationId;
+    // Read before the checks below, which run with the write in one synchronous step (no await between).
+    const profile = profileOf((await this.store.loadAgent(tenantId, agentId))?.config);
     const key = result.dedupeKey ?? null;
     if (key && seenBefore(sql, hookId, key, now)) return done("duplicate", null, key);
     // Each 429 says when to come back (`Retry-After`): the rate's from the rows it counts, the queue's from its
@@ -1421,6 +1423,13 @@ export class AgentRuntime {
     // The seeded workspace closes in that same run, before the row that starts the agent's first turn: a seed write
     // is a statement in this object too, so it either came first or finds the seal, even while this push is queued
     // and its turn has not begun (src/store/seed-files.ts).
+    // Under a profile a push is its plugin's wake, decided here, before anything of it is written: its text (Raft's notice,
+    // which names conversations and senders) is never queued, posted or stored, and the plugin reads its events itself,
+    // taking only its own (src/plugins/raftbench.ts). Answered as delivered, so the service does not send it again.
+    if (profile) {
+      askWake(sql, profileSpec(profile).alias, now);
+      return done("delivered", `a wake for the ${profileSpec(profile).alias} plugin`, key);
+    }
     sealedBy(tenantId, agentId, sealSeedFiles(sql, tenantId, agentId, "first-inbound", now));
     acceptInbound(sql, { hookId, alias, dedupeKey: key, message: inboundMessage(alias, String(result.text), result.kind === "inbox" ? "inbox" : "event"), now, installationId });
     // The answer the service has always had for a push the agent will be given.
