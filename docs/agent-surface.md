@@ -754,7 +754,9 @@ the person while that works. A connector is shared by the agents pointed at it, 
 lease on the connector, and reaches every agent on it.
 
 **A connection that needs reconnecting.** When GitHub refuses the renewal (`bad_refresh_token`: spent, expired, or the
-person revoked the App), or still answers `401` for the renewed token, only the person can mend it:
+person revoked the App), only the person can mend it. A `401` from GitHub's API never marks it, even after a renewal:
+some endpoints refuse every user token, and the tool reports that `401` as it is. Nor does a token endpoint that
+answers without an OAuth error (an outage page, a timeout). The connection is reported:
 
 ```json
 {
@@ -773,11 +775,13 @@ person revoked the App), or still answers `401` for the renewed token, only the 
 }
 ```
 
-- `connected: false` with `connectorId` and `account` still set is this state and no other: which account it was, and
+- **New for Raft:** `connected: false` may now carry `connectorId` and `account` (before, it always came with nulls).
+  With `oauthStatus: "error"` it is this state and no other: which account it was, and
   that it is not usable.
 - The same fields are on the connector in `connectors`, so every agent pointed at it shows it.
 - The agent is told as well: a GitHub tool's result says `OAuth authorization expired; reconnect required` and that the
   user must reconnect GitHub, and that retrying will not help.
+- `PUT` pointing an agent at a connector in this state is refused: `422`, `code: "connect_failed"`.
 - **Reconnecting** is the same flow as connecting (`POST`, then `POST …/confirm`). It makes a new connector, points
   this agent at it and clears the state for this agent. Other agents on the broken connector stay broken until they
   are pointed at the new one (`PUT` with its `connectorId`).

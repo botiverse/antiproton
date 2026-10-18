@@ -26,8 +26,14 @@ import { refreshGithubToken, REFRESH_SKEW_MS } from "./github-token.ts";
 
 /** The row beside a mount's secret that renews it. ":" keeps it apart from every alias (MOUNT_ALIAS has none). */
 export const OAUTH_PREFIX = "oauth:";
-/** How long the right to trade a refresh token is held; GitHub answers well within it. */
+/** How long the right to trade a refresh token is held: longer than the token endpoint's timeout (TOKEN_TIMEOUT_MS). */
 export const LEASE_MS = 30_000;
+/**
+ * A 401 this soon after the pair was renewed is not GitHub saying the authorization is gone: the renewal itself just
+ * proved it alive. It is an endpoint that refuses this kind of token (`/app` wants an App's JWT), and renewing again
+ * for it would let any call rotate the pair at will.
+ */
+export const RECENT_MS = 60_000;
 /**
  * How a dead connection is said to Raft: the words Raft's own managed-MCP OAuth connectors use for the same
  * state, so it can render both alike. What GitHub actually said is kept beside it (`broken_reason`), not here.
@@ -42,6 +48,8 @@ export interface MountGrant {
   expiresAt: number | null;
   refreshExpiresAt: number | null;
   connectorId: string | null;
+  /** When this mount itself last traded for a new pair (a mount with no connector); a connector keeps its own. */
+  rotatedAt?: number | null;
   brokenAt?: number | null;
   brokenReason?: string | null;
 }
@@ -90,21 +98,25 @@ async function pairOf(kek: CryptoKey, k: ConnectorGrant, rotated: boolean): Prom
  */
 export async function renewConnector(d: ConnectorDeps, tenantId: string, id: string, why: Why, stale: string | null): Promise<Renewed> {
   const sleep = d.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  // Whose lease is whose: a renewal that outlived its lease must not release, or clear, the one that took over.
+  const holder = crypto.randomUUID();
   let k = await d.grants.grant(tenantId, id);
   if (!k) return { ok: false, broken: false, reason: "the connector is gone", missing: true };
   if (k.brokenAt) return { ok: false, broken: true, reason: k.brokenReason ?? "refused" };
   const needs = async (g: ConnectorGrant) => {
     if (!g.refresh || why === "adopt") return false;
     if (!fresh(g.refresh.expiresAt, d.now())) return true;
+    if (why !== "rejected" || stale === null) return false;
+    if (g.refreshedAt !== null && d.now() - g.refreshedAt < RECENT_MS) return false;
     // Refused by GitHub while not yet expired by our clock: renew only if the connector still holds that same token.
-    return why === "rejected" && stale !== null && (await open(d.kek, g.sealed)) === stale;
+    return (await open(d.kek, g.sealed)) === stale;
   };
   if (!(await needs(k))) return pairOf(d.kek, k, false);
   if (!d.app) return { ok: false, broken: false, reason: "this deployment has no GitHub App credentials to renew with" };
   // The lease, or the result of whoever holds it.
   const was = k.refresh!.sealed.ciphertext;
   const deadline = d.now() + LEASE_MS + 5_000;
-  while (!(await d.grants.lease(tenantId, id, d.now(), d.now() + LEASE_MS))) {
+  while (!(await d.grants.lease(tenantId, id, d.now(), d.now() + LEASE_MS, holder))) {
     if (d.now() > deadline) return { ok: false, broken: false, reason: "another renewal of this connection did not finish" };
     await sleep(250);
     const again = await d.grants.grant(tenantId, id);
@@ -114,32 +126,34 @@ export async function renewConnector(d: ConnectorDeps, tenantId: string, id: str
   }
   // Read again under the lease: a renewal that finished between the first read and the lease is taken, not repeated.
   k = (await d.grants.grant(tenantId, id))!;
-  if (!k || !k.refresh) { await d.grants.release(tenantId, id); return { ok: false, broken: false, reason: "the connector is gone", missing: true }; }
-  if (k.refresh.sealed.ciphertext !== was || !(await needs(k))) { await d.grants.release(tenantId, id); return pairOf(d.kek, k, false); }
+  if (!k || !k.refresh) { await d.grants.release(tenantId, id, holder); return { ok: false, broken: false, reason: "the connector is gone", missing: true }; }
+  if (k.refresh.sealed.ciphertext !== was || !(await needs(k))) { await d.grants.release(tenantId, id, holder); return pairOf(d.kek, k, false); }
   const r = await refreshGithubToken(d.app, await open(d.kek, k.refresh.sealed), d.now(), d.fetch);
   if (r.ok && r.grant.refreshToken) {
+    // Stored first, before anything else is done with it: GitHub has already spent the old pair, and a pair that
+    // only this call knows is lost with it (a deploy, a timeout), which only a reconnect mends.
     const sealed = await seal(d.kek, r.grant.accessToken);
     const refresh = { sealed: await seal(d.kek, r.grant.refreshToken), expiresAt: r.grant.expiresAt, refreshExpiresAt: r.grant.refreshExpiresAt };
-    const landed = await d.grants.rotate(tenantId, id, { sealed, refresh, at: d.now() }, k.refresh.sealed.ciphertext);
+    const landed = await d.grants.rotate(tenantId, id, { sealed, refresh, at: d.now() }, k.refresh.sealed.ciphertext, holder);
     // Not landed means the connector moved past the lease's expiry; the pair just traded is still GitHub's newest.
     logEvent("github.refresh", { tenantId, connectorId: id, why, outcome: "rotated", stored: landed, keys: r.keys.join(" ") });
     return { ok: true, accessToken: r.grant.accessToken, refreshToken: r.grant.refreshToken, expiresAt: r.grant.expiresAt, refreshExpiresAt: r.grant.refreshExpiresAt, rotated: true };
   }
   if (r.ok) {
     // A refresh that answers a token without a refresh token beside it has nothing to renew it with next time.
-    await d.grants.release(tenantId, id);
+    await d.grants.release(tenantId, id, holder);
     logEvent("github.refresh", { tenantId, connectorId: id, why, outcome: "unavailable", reason: "no refresh token in the answer", keys: r.keys.join(" ") });
     return { ok: false, broken: false, reason: "GitHub answered without a refresh token" };
   }
   if (r.kind === "refused") {
     // Someone else's renewal landing while ours was refused means ours spent nothing that mattered.
     const after = await d.grants.grant(tenantId, id);
-    if (after?.refresh && after.refresh.sealed.ciphertext !== k.refresh.sealed.ciphertext) { await d.grants.release(tenantId, id); return pairOf(d.kek, after, false); }
-    await d.grants.markBroken(tenantId, id, r.reason, d.now());
+    if (after?.refresh && after.refresh.sealed.ciphertext !== k.refresh.sealed.ciphertext) { await d.grants.release(tenantId, id, holder); return pairOf(d.kek, after, false); }
+    await d.grants.markBroken(tenantId, id, r.reason, d.now(), holder);
     logEvent("github.refresh", { tenantId, connectorId: id, why, outcome: "broken", reason: r.reason });
     return { ok: false, broken: true, reason: r.reason };
   }
-  await d.grants.release(tenantId, id);
+  await d.grants.release(tenantId, id, holder);
   logEvent("github.refresh", { tenantId, connectorId: id, why, outcome: "unavailable", reason: r.reason });
   return { ok: false, broken: false, reason: r.reason };
 }
@@ -154,6 +168,8 @@ export interface RefresherDeps {
   grants?: ConnectorGrants;
   /** Hand a connector's new pair to the other agents pointed at it, so their mounts (and their sandboxes' egress) stop holding the spent one. */
   propagate?(tenantId: string, connectorId: string, fromAgentId: string): Promise<void>;
+  /** Keep work alive past the call that started it (the object's `waitUntil`): propagation is not the caller's to wait for. */
+  waitUntil?(p: Promise<unknown>): void;
   fetch?: typeof fetch;
   now?(): number;
   sleep?(ms: number): Promise<void>;
@@ -215,22 +231,17 @@ export class GithubRefresher {
   }
 
   /**
-   * GitHub answered 401 for `token`. The first time: renew once and hand back the token to retry with. After that
-   * retry (`retried`), a 401 for the renewed token is GitHub's verdict on the connection itself. Null: this mount
-   * has nothing to renew with, or nobody could answer; the caller reports the 401 as it always has.
+   * GitHub answered 401 for `token`: renew once and hand back the token to retry with. A 401 is never itself taken
+   * as the authorization being gone — an endpoint may refuse this kind of token whatever its state — only GitHub
+   * refusing the refresh token is. Null: nothing to renew with, nobody answered, or the pair was renewed moments ago;
+   * the caller reports the 401 as it always has.
    */
-  async rejected(tenantId: string, agentId: string, name: string, token: string, retried: boolean):
+  async rejected(tenantId: string, agentId: string, name: string, token: string):
     Promise<{ credential: string } | { reconnect: string } | null> {
     const rec = await this.read(tenantId, agentId, name);
     if (!rec || (rec.refreshToken === null && rec.connectorId === null)) return null;
-    if (rec.brokenAt) return { reconnect: reconnectSentence(rec.brokenReason ?? "refused") };
-    if (retried) {
-      const current = await this.#access(tenantId, agentId, name);
-      if (current !== token) return null;
-      const reason = "GitHub refused the renewed token (401 Bad credentials)";
-      await this.#broken(tenantId, agentId, name, rec, reason, true);
-      return { reconnect: reconnectSentence(reason) };
-    }
+    // A mount on a connector asks the connector, which may have been mended since; one alone knows its own state.
+    if (rec.brokenAt && !(rec.connectorId && this.#d.grants)) return { reconnect: reconnectSentence(rec.brokenReason ?? "refused") };
     const r = await this.renew(tenantId, agentId, name, "rejected", token);
     if (r.ok) return r.accessToken === token ? null : { credential: r.accessToken };
     return r.broken ? { reconnect: reconnectSentence(r.reason) } : null;
@@ -275,37 +286,50 @@ export class GithubRefresher {
     const rec = await this.read(tenantId, agentId, name);
     const current = await this.#access(tenantId, agentId, name);
     if (!kek || !rec || current === null) return { ok: false, broken: false, reason: "this mount has nothing to renew with" };
-    if (rec.brokenAt) return { ok: false, broken: true, reason: rec.brokenReason ?? "refused" };
+    const viaConnector = !!(rec.connectorId && this.#d.grants);
+    if (rec.brokenAt && !viaConnector) return { ok: false, broken: true, reason: rec.brokenReason ?? "refused" };
     const now = this.#now();
     const mine: Renewed = { ok: true, accessToken: current, refreshToken: rec.refreshToken, expiresAt: rec.expiresAt, refreshExpiresAt: rec.refreshExpiresAt, rotated: false };
     // Whoever went before this call in the chain may already have done the work.
     if (why === "rejected" && stale !== null && current !== stale) return mine;
-    if (why === "expiring" && fresh(rec.expiresAt, now)) return mine;
+    if (why === "expiring" && fresh(rec.expiresAt, now) && !rec.brokenAt) return mine;
+    if (why === "rejected" && !viaConnector && rec.rotatedAt && now - rec.rotatedAt < RECENT_MS) return mine;
     if (rec.connectorId && this.#d.grants) {
       const r = await renewConnector({ grants: this.#d.grants, kek, app: this.#d.app, fetch: this.#d.fetch, now: () => this.#now(), sleep: (ms) => this.#sleep(ms) },
         tenantId, rec.connectorId, why, stale ?? current);
       if (r.ok) {
-        if (r.accessToken !== current || r.expiresAt !== rec.expiresAt) {
+        // Also when only the mount's own broken flag is stale: the connector says it is healthy.
+        if (r.accessToken !== current || r.expiresAt !== rec.expiresAt || rec.brokenAt) {
           await this.#write(tenantId, agentId, name, current, { ...rec, refreshToken: r.refreshToken, expiresAt: r.expiresAt, refreshExpiresAt: r.refreshExpiresAt }, r.accessToken);
           logEvent("github.refresh", { tenantId, agentId, mount: name, connectorId: rec.connectorId, why, outcome: r.rotated ? "rotated" : "adopted" });
         }
+        // Not waited for: the pair is in D1 already, and this call's caller is owed its answer. An agent it does not
+        // reach takes the pair on its own next 401; its sandbox's egress has no 401 to learn from and keeps the spent
+        // token until its own recorded expiry comes near.
         if (r.rotated && this.#d.propagate) {
-          try { await this.#d.propagate(tenantId, rec.connectorId, agentId); }
-          catch (e) { logEvent("github.refresh", { tenantId, agentId, connectorId: rec.connectorId, outcome: "propagate-failed", reason: String((e as Error)?.message ?? e).slice(0, 120) }); }
+          const connectorId = rec.connectorId;
+          const p = this.#d.propagate(tenantId, connectorId, agentId).catch((e) =>
+            logEvent("github.refresh", { tenantId, agentId, connectorId, outcome: "propagate-failed", reason: String((e as Error)?.message ?? e).slice(0, 120) }));
+          this.#d.waitUntil?.(p);
         }
         return r;
       }
       if (r.broken) { await this.#broken(tenantId, agentId, name, rec, r.reason, false); return r; }
-      if (!("missing" in r)) return r;
-      // The connector is gone but the mount still holds its pair (a disconnect that has not reached this agent yet):
-      // renewed on its own below.
+      if ("missing" in r) {
+        // The connector was deleted (disconnected) and this mount was not told yet. Its own copy of the pair is the
+        // connector's, and renewing it alone would keep alive an authorization its owner removed.
+        const reason = "the connection was removed";
+        await this.#broken(tenantId, agentId, name, rec, reason, false);
+        return { ok: false, broken: true, reason };
+      }
+      return r;
     }
     if (why === "adopt") return mine;
     if (!rec.refreshToken) return { ok: false, broken: false, reason: "this mount has nothing to renew with" };
     if (!this.#d.app) return { ok: false, broken: false, reason: "this deployment has no GitHub App credentials to renew with" };
     const r = await refreshGithubToken(this.#d.app, rec.refreshToken, now, this.#d.fetch);
     if (r.ok && r.grant.refreshToken) {
-      const next = { ...rec, refreshToken: r.grant.refreshToken, expiresAt: r.grant.expiresAt, refreshExpiresAt: r.grant.refreshExpiresAt };
+      const next = { ...rec, refreshToken: r.grant.refreshToken, expiresAt: r.grant.expiresAt, refreshExpiresAt: r.grant.refreshExpiresAt, rotatedAt: now };
       await this.#write(tenantId, agentId, name, current, next, r.grant.accessToken);
       logEvent("github.refresh", { tenantId, agentId, mount: name, why, outcome: "rotated", keys: r.keys.join(" ") });
       return { ok: true, accessToken: r.grant.accessToken, refreshToken: next.refreshToken, expiresAt: next.expiresAt, refreshExpiresAt: next.refreshExpiresAt, rotated: true };
@@ -339,11 +363,13 @@ export class GithubRefresher {
 
   /** Only a reconnect mends it: said on the mount, so later calls do not ask GitHub again, and in D1, where Raft reads it. */
   async #broken(tenantId: string, agentId: string, name: string, rec: MountGrant, reason: string, recordInD1: boolean): Promise<void> {
+    // Already said, on the mount and wherever the connector keeps it: said once.
+    if (rec.brokenAt && !recordInD1) return;
     const kek = (await this.#d.kek)!;
     const at = this.#now();
     await this.#d.store.putSecret(tenantId, agentId, OAUTH_PREFIX + name, await seal(kek, JSON.stringify({ ...rec, v: 1, brokenAt: at, brokenReason: reason })));
     if (recordInD1 && this.#d.grants) {
-      if (rec.connectorId) await this.#d.grants.markBroken(tenantId, rec.connectorId, reason, at);
+      if (rec.connectorId) await this.#d.grants.markBroken(tenantId, rec.connectorId, reason, at, null);
       else await this.#d.grants.markAgentBroken(tenantId, agentId, "github", reason, at);
     }
     logEvent("github.refresh", { tenantId, agentId, mount: name, connectorId: rec.connectorId, outcome: "broken", reason });

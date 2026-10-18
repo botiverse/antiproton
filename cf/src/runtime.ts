@@ -1220,6 +1220,7 @@ export class AgentRuntime {
     this.#oauth = new GithubRefresher({
       store: this.store, kek: kekPromise, sql: deps.ctx.storage.sql,
       app: deps.github?.app ?? null, grants: deps.github?.grants, propagate: deps.github?.propagate,
+      waitUntil: (p) => deps.ctx.waitUntil?.(p),
     });
     this.#secrets = {
       resolve: async (ref, scope, opts) => {
@@ -1235,7 +1236,7 @@ export class AgentRuntime {
     // The operator's catalogue, told to the kernel rather than read by it.
     this.#gateway = new ToolGateway(this.store, plugins, SEEDED_PLUGINS, this.#secrets,
       deps.hooks ? (tenantId, agentId, alias) => this.#inboundFor(tenantId, agentId, alias) : undefined,
-      deps.github ? { credentialRejected: (scope, name, token, retried) => this.#oauth.rejected(scope.tenantId, scope.agentId, name, token, retried) } : {});
+      deps.github ? { credentialRejected: (scope, name, token) => this.#oauth.rejected(scope.tenantId, scope.agentId, name, token) } : {});
     this.#executor = new DynamicWorkerExecutor({
       loader: deps.loader,
       makeToolBinding: deps.makeToolBinding,

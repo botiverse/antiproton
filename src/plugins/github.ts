@@ -161,17 +161,14 @@ async function call(
   };
   let { url, res } = await send();
   // An expiring token GitHub no longer takes (#935): renewed once and the call made once more. A 401 for the
-  // renewed one is GitHub's verdict on the connection, and only the person reconnecting can mend it.
+  // renewed one is reported as any 401 is: some endpoints refuse a user token whatever its state (`/app`), so it
+  // says nothing about the connection. Only GitHub refusing the renewal does, and then `reconnect` says so.
   let reconnect: string | null = null;
   if (res.status === 401 && ctx.credential && ctx.credentialRejected && new URL(url).origin === new URL(API).origin) {
     const renewed = await ctx.credentialRejected(ctx.credential);
     if (renewed && "credential" in renewed) {
       headers.authorization = `Bearer ${renewed.credential}`;
       ({ url, res } = await send());
-      if (res.status === 401) {
-        const verdict = await ctx.credentialRejected(renewed.credential, { retried: true });
-        if (verdict && "reconnect" in verdict) reconnect = verdict.reconnect;
-      }
     } else if (renewed) {
       reconnect = renewed.reconnect;
     }

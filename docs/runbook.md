@@ -97,8 +97,18 @@ curl -s -X DELETE -H "x-harness-token: $AUTOMATION_TOKEN" -H "content-type: appl
 ## A GitHub connection that needs reconnecting
 
 Connect GitHub hands out expiring user tokens (8 hours, renewed with a single-use refresh token that lasts about 6
-months). The deployment renews them (cf/src/github-refresh.ts); when GitHub refuses a renewal, or still answers `401`
-for a renewed token, the connection is marked as needing reconnecting and only its person can mend it.
+months). The deployment renews them (cf/src/github-refresh.ts). Only GitHub refusing a renewal marks the connection
+as needing reconnecting: a JSON answer from the token endpoint with an OAuth `error` code such as `bad_refresh_token`
+(spent, expired, or the App revoked). Nothing else marks it:
+- a `401` from the API, even for a token just renewed: some endpoints (`/app`) refuse every user token, and a renewed
+  pair is itself proof that the authorization is alive. The call reports its `401`, and a `401` within a minute of a
+  renewal does not renew again;
+- an answer from the token endpoint without an OAuth error code (an HTML page, a 5xx, a timeout), or an error about
+  the deployment's own App (`incorrect_client_credentials`, `invalid_client`, `unsupported_grant_type`): logged as
+  `unavailable`, and the next call tries again.
+
+A mount whose connector was deleted stops renewing and says to reconnect: it never renews with its own copy of a pair
+its owner removed.
 
 **Where it shows.** Raft's `GET …/connections/github` answers `connected: false, oauthStatus: "error"` and
 `lastCheckError`
@@ -116,13 +126,25 @@ SELECT action, raft_agent_id, acting_raft_user_id, acting_role, at, reason FROM 
 SELECT tenant_id, raft_agent_id, broken_at, broken_reason FROM provisioned_connections WHERE broken_at IS NOT NULL;
 ```
 
-`refreshing_until` on a connector is a renewal in progress (a 30-second lease); one in the past is a renewal that did
-not finish, and the next one takes over.
+`refreshing_until` on a connector is a renewal in progress (a 30-second lease, held by `refreshing_by`; only its holder
+releases it); one in the past is a renewal that did not finish, and the next one takes over. The token endpoint is
+given 25 seconds, inside the lease.
+
+**A renewal cut off half-way can cost a reconnect.** GitHub spends the old pair the moment it hands out a new one. The
+new pair is written to the connector immediately, before anything else is done with it, but a deploy, an eviction or
+a timeout between GitHub's answer and that write loses it, and the connector is left holding a spent refresh token:
+its next renewal is refused and the connection is marked as needing reconnecting. A `rotated` line with
+`stored: false`, or an `interrupted-before` line followed by `broken`, is this case.
+
+**Other agents on the connector** are told of a new pair after the renewing call has answered, not during it
+(`waitUntil`). One that is not reached (`propagate-failed`) takes the pair on its own next GitHub tool call's `401`,
+but its sandbox's `git` and `gh` have no `401` path: they keep the spent token until that mount's own recorded expiry
+comes within five minutes, when it is renewed (adopted from the connector) before use.
 
 **In the logs.** Every renewal is a `github.refresh` line: `outcome` `rotated` (a new pair), `adopted` (an agent took
 the pair another agent's renewal stored), `broken`, `unavailable` (GitHub did not answer: not a verdict, nothing is
 marked), `interrupted-before` (a renewal in this object stopped part-way; the next one goes ahead) or
-`propagate-failed` (an agent on the connector was not told; it renews on its own next `401`), with
+`propagate-failed` (an agent on the connector was not told, below), with
 `tenantId`, `agentId`, `connectorId`, `why` (`expiring`, `rejected`, `adopt`) and GitHub's error as `reason`. Never a
 token. Each connect also writes `connect.exchange` with the **names** of the keys GitHub's answer carried: one with
 `expires_in` and `refresh_token` is an expiring token (`expiring: true`).

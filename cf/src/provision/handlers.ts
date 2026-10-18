@@ -1061,6 +1061,8 @@ async function connection(
     if (!k || k.provider !== p) return fail({ status: 404, code: "not_found", message: `no ${p} connector ${connectorId} in this tenant` });
     const refused = creatorRefused(k, acting);
     if (refused) return fail(refused);
+    // Its token can no longer be renewed: pointing an agent at it would hand over a connection that cannot work.
+    if (k.brokenAt) return fail({ status: 422, code: "connect_failed", message: `${RECONNECT_REASON}: this connector has to be connected again before an agent is pointed at it` });
     const r = await c.attach(tenantId, row.agentId, p, k.sealed, k.refresh ? { ...k.refresh, connectorId: k.id } : null);
     if (!r.ok) return fail({ status: 422, code: "connect_failed", message: r.error });
     const at = deps.now();

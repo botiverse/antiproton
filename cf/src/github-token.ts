@@ -59,23 +59,31 @@ export async function refreshGithubToken(
       method: "POST",
       headers: { accept: "application/json", "content-type": "application/json", "user-agent": GITHUB_UA },
       body: JSON.stringify({ client_id: app.clientId, client_secret: app.clientSecret, grant_type: "refresh_token", refresh_token: refreshToken }),
-      signal: AbortSignal.timeout(15_000),
+      signal: AbortSignal.timeout(TOKEN_TIMEOUT_MS),
     });
   } catch (e) {
     return { ok: false, kind: "unavailable", reason: `the token endpoint did not answer: ${String((e as Error)?.message ?? e).slice(0, 120)}` };
   }
-  if (r.status >= 500 || r.status === 429) return { ok: false, kind: "unavailable", reason: `the token endpoint answered ${r.status}` };
-  let j: Record<string, unknown> = {};
-  try { j = (await r.json()) as Record<string, unknown>; } catch { /* an empty or HTML body: judged by its status below */ }
-  const got = r.ok ? grantOf(j, now) : null;
+  const text = await r.text().catch(() => "");
+  let j: Record<string, unknown> | null = null;
+  try { const v = JSON.parse(text); if (v && typeof v === "object" && !Array.isArray(v)) j = v as Record<string, unknown>; } catch { /* not JSON */ }
+  const got = r.ok && j ? grantOf(j, now) : null;
   if (got) return { ok: true, ...got };
-  // GitHub answers 200 with an error body for a refused grant, as it does for a bad code.
-  const code = typeof j.error === "string" ? j.error : `status ${r.status}`;
-  const said = typeof j.error_description === "string" ? `: ${j.error_description.slice(0, 160)}` : "";
-  // The App's own id or secret being wrong is the deployment's to fix; a reconnect would meet the same refusal.
-  if (code === "incorrect_client_credentials") return { ok: false, kind: "unavailable", reason: `${code}${said}` };
+  // Only GitHub's own answer about the grant is a verdict: a JSON body naming an OAuth error. An HTML page, an
+  // empty body, a rate limit or a 5xx is something between here and GitHub, and says nothing about the token.
+  const code = j && typeof j.error === "string" && j.error ? j.error : null;
+  if (!code) return { ok: false, kind: "unavailable", reason: `the token endpoint answered ${r.status} without an OAuth error` };
+  const said = typeof j!.error_description === "string" ? `: ${(j!.error_description as string).slice(0, 160)}` : "";
+  // Errors about this deployment's own request or App (its id or secret, a grant type it got wrong) are the
+  // deployment's to fix; a reconnect would meet the same refusal.
+  if (DEPLOYMENT_ERRORS.has(code)) return { ok: false, kind: "unavailable", reason: `${code}${said}` };
   return { ok: false, kind: "refused", reason: `${code}${said}` };
 }
+
+const DEPLOYMENT_ERRORS = new Set(["incorrect_client_credentials", "invalid_client", "unsupported_grant_type", "invalid_request", "redirect_uri_mismatch"]);
+
+/** How long the token endpoint is given: inside the connector's lease (LEASE_MS, 30 s), so the lease outlives the call. */
+export const TOKEN_TIMEOUT_MS = 25_000;
 
 /** How close to its expiry an access token is refreshed before use. */
 export const REFRESH_SKEW_MS = 5 * 60_000;

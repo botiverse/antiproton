@@ -108,7 +108,7 @@ export interface SecretResolver {
  * secret the mount's `agent:` reference names, in the mount owner's store.
  */
 export type CredentialRejected = (
-  scope: { tenantId: string; agentId: string }, secretName: string, credential: string, retried: boolean,
+  scope: { tenantId: string; agentId: string }, secretName: string, credential: string,
 ) => Promise<{ credential: string } | { reconnect: string } | null>;
 
 export const envSecrets: SecretResolver = {
@@ -1191,8 +1191,8 @@ export class ToolGateway {
       credential,
       // Only for the mount's own key, and only where the deployment can renew one.
       ...(this.#credentialRejected && credential && isAgentRef(mount.secretRef) ? {
-        credentialRejected: (token: string, o?: { retried?: boolean }) => this.#credentialRejected!(
-          { tenantId: mount.tenantId, agentId: mount.agentId }, mount.secretRef!.slice(AGENT_REF.length), token, !!o?.retried),
+        credentialRejected: (token: string) => this.#credentialRejected!(
+          { tenantId: mount.tenantId, agentId: mount.agentId }, mount.secretRef!.slice(AGENT_REF.length), token),
       } : {}),
       // What kind of credential the mount names, so a null `credential` can be read as "names none" or
       // "names one that did not arrive" rather than guessed. The KIND, never the reference: a reference

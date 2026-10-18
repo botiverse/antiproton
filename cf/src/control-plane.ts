@@ -668,13 +668,14 @@ export interface ConnectorGrant extends Connector {
  */
 export interface ConnectorGrants {
   grant(tenantId: string, id: string): Promise<ConnectorGrant | null>;
-  /** Take the right to trade the refresh token until `until`; false while someone else holds it. */
-  lease(tenantId: string, id: string, now: number, until: number): Promise<boolean>;
-  release(tenantId: string, id: string): Promise<void>;
-  /** The new pair, only over the refresh token it was traded from (`expect`); clears the lease and any broken state. */
-  rotate(tenantId: string, id: string, next: { sealed: { ciphertext: string; iv: string }; refresh: ConnectorRefresh; at: number }, expect: string): Promise<boolean>;
-  /** Record that only a reconnect mends it, with a `broken` event; false when it was already broken. */
-  markBroken(tenantId: string, id: string, reason: string, at: number): Promise<boolean>;
+  /** Take the right to trade the refresh token until `until`, as `holder`; false while someone else holds it. */
+  lease(tenantId: string, id: string, now: number, until: number, holder: string): Promise<boolean>;
+  /** Give it back; only `holder`'s own lease is released. */
+  release(tenantId: string, id: string, holder: string): Promise<void>;
+  /** The new pair, only over the refresh token it was traded from (`expect`); clears any broken state, and `holder`'s lease. */
+  rotate(tenantId: string, id: string, next: { sealed: { ciphertext: string; iv: string }; refresh: ConnectorRefresh; at: number }, expect: string, holder: string): Promise<boolean>;
+  /** Record that only a reconnect mends it, with a `broken` event, releasing `holder`'s lease; false when it was already broken. */
+  markBroken(tenantId: string, id: string, reason: string, at: number, holder: string | null): Promise<boolean>;
   /** The same, for an agent's connection that has no connector. */
   markAgentBroken(tenantId: string, agentId: string, provider: string, reason: string, at: number): Promise<boolean>;
 }
@@ -686,28 +687,34 @@ export function d1ConnectorGrants(db: D1Database): ConnectorGrants {
       if (!r) return null;
       return { ...connectorRow(r), refreshedAt: r.refreshed_at == null ? null : Number(r.refreshed_at), refreshingUntil: r.refreshing_until == null ? null : Number(r.refreshing_until) };
     },
-    async lease(tenantId, id, now, until) {
+    async lease(tenantId, id, now, until, holder) {
       const r = await db.prepare(
-        "UPDATE connectors SET refreshing_until = ? WHERE tenant_id = ? AND id = ? AND (refreshing_until IS NULL OR refreshing_until <= ?)",
-      ).bind(until, tenantId, id, now).run();
+        "UPDATE connectors SET refreshing_until = ?, refreshing_by = ? WHERE tenant_id = ? AND id = ? AND (refreshing_until IS NULL OR refreshing_until <= ?)",
+      ).bind(until, holder, tenantId, id, now).run();
       return Number(r.meta?.changes ?? 0) > 0;
     },
-    async release(tenantId, id) {
-      await db.prepare("UPDATE connectors SET refreshing_until = NULL WHERE tenant_id = ? AND id = ?").bind(tenantId, id).run();
+    async release(tenantId, id, holder) {
+      await db.prepare("UPDATE connectors SET refreshing_until = NULL, refreshing_by = NULL WHERE tenant_id = ? AND id = ? AND refreshing_by = ?")
+        .bind(tenantId, id, holder).run();
     },
-    async rotate(tenantId, id, next, expect) {
+    async rotate(tenantId, id, next, expect, holder) {
       const r = await db.prepare(
         `UPDATE connectors SET ciphertext = ?, iv = ?, refresh_ciphertext = ?, refresh_iv = ?, expires_at = ?, refresh_expires_at = ?,
-           refreshed_at = ?, last_checked_at = ?, refreshing_until = NULL, broken_at = NULL, broken_reason = NULL
+           refreshed_at = ?, last_checked_at = ?, broken_at = NULL, broken_reason = NULL,
+           refreshing_until = CASE WHEN refreshing_by = ? THEN NULL ELSE refreshing_until END,
+           refreshing_by = CASE WHEN refreshing_by = ? THEN NULL ELSE refreshing_by END
          WHERE tenant_id = ? AND id = ? AND refresh_ciphertext = ?`,
       ).bind(next.sealed.ciphertext, next.sealed.iv, next.refresh.sealed.ciphertext, next.refresh.sealed.iv, next.refresh.expiresAt,
-        next.refresh.refreshExpiresAt, next.at, next.at, tenantId, id, expect).run();
+        next.refresh.refreshExpiresAt, next.at, next.at, holder, holder, tenantId, id, expect).run();
       return Number(r.meta?.changes ?? 0) > 0;
     },
-    async markBroken(tenantId, id, reason, at) {
+    async markBroken(tenantId, id, reason, at, holder) {
       const r = await db.prepare(
-        "UPDATE connectors SET broken_at = ?, broken_reason = ?, last_checked_at = ?, refreshing_until = NULL WHERE tenant_id = ? AND id = ? AND broken_at IS NULL",
-      ).bind(at, reason, at, tenantId, id).run();
+        `UPDATE connectors SET broken_at = ?, broken_reason = ?, last_checked_at = ?,
+           refreshing_until = CASE WHEN refreshing_by = ? THEN NULL ELSE refreshing_until END,
+           refreshing_by = CASE WHEN refreshing_by = ? THEN NULL ELSE refreshing_by END
+         WHERE tenant_id = ? AND id = ? AND broken_at IS NULL`,
+      ).bind(at, reason, at, holder, holder, tenantId, id).run();
       const changed = Number(r.meta?.changes ?? 0) > 0;
       if (changed) {
         await db.prepare(

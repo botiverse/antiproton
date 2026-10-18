@@ -11,6 +11,8 @@ ALTER TABLE connectors ADD COLUMN refreshed_at INTEGER;        -- when the pair 
 -- A refresh in progress: whoever set it may trade the refresh token until then, and nobody else may.
 -- A lease rather than a flag, so a holder that died mid-refresh blocks nobody past its expiry.
 ALTER TABLE connectors ADD COLUMN refreshing_until INTEGER;
+-- Who holds it: only the holder releases it, so one that outlived its lease cannot free the one that took over.
+ALTER TABLE connectors ADD COLUMN refreshing_by TEXT;
 -- GitHub refused the refresh, or the renewed token: only the person reconnecting can mend it. Cleared by
 -- a reconnect, which makes a new connector, and by a rotation.
 ALTER TABLE connectors ADD COLUMN broken_at INTEGER;

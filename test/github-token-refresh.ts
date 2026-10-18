@@ -68,7 +68,9 @@ function github(opts: { expiring?: boolean } = {}) {
   const live = new Set<string>();
   const refreshes = new Map<string, string>(); // refresh token -> the access token issued with it
   const issued: string[] = [];
-  const s = { refreshes: 0, refused: 0, api: 0, unauthorized: 0, delayMs: 0, refuse: false, sent: [] as string[] };
+  const s = { refreshes: 0, refused: 0, api: 0, unauthorized: 0, delayMs: 0, refuse: false, sent: [] as string[],
+    /** Something other than GitHub's own answer at the token endpoint: an HTML error page, say. */
+    tokenAnswer: null as null | (() => Response) };
   const pair = (expiring: boolean) => {
     n++;
     const access = `ghu_${String(n).padStart(4, "0")}${"a".repeat(36)}`;
@@ -86,6 +88,7 @@ function github(opts: { expiring?: boolean } = {}) {
         s.refreshes++;
         if (b.client_id !== "cid" || b.client_secret !== "csecret") return json({ error: "incorrect_client_credentials" });
         if (s.delayMs) await sleep(s.delayMs);
+        if (s.tokenAnswer) return s.tokenAnswer();
         const was = refreshes.get(b.refresh_token);
         if (s.refuse || was === undefined) { s.refused++; return json({ error: "bad_refresh_token", error_description: "The refresh token passed is incorrect or expired." }); }
         refreshes.delete(b.refresh_token); live.delete(was);
@@ -97,6 +100,8 @@ function github(opts: { expiring?: boolean } = {}) {
       s.api++;
       const token = new Headers(init?.headers ?? {}).get("authorization")?.replace(/^Bearer /, "") ?? "";
       s.sent.push(token);
+      // An endpoint that wants an App's JWT refuses any user token, live or not.
+      if (u.startsWith("https://api.github.com/app")) { s.unauthorized++; return json({ message: "A JSON web token could not be decoded" }, 401); }
       if (!live.has(token)) { s.unauthorized++; return json({ message: "Bad credentials" }, 401); }
       return json({ login: "octocat", id: 1 });
     }
@@ -113,6 +118,10 @@ async function world(opts: { expiring?: boolean; github?: boolean } = {}) {
   const objects = new Map<string, { rt: AgentRuntime; host: ReturnType<typeof sqliteHost> }>();
   const registry = d1ProvisionedAgents(db);
   const propagated: string[] = [];
+  /** What an object handed to waitUntil: propagation, which the renewing call does not wait for. */
+  const pending: Promise<unknown>[] = [];
+  let propagateDelayMs = 0;
+  const settle = async () => { while (pending.length) await pending.shift(); };
   const grants = d1ConnectorGrants(db);
   let ids = 0;
   const rtOf = (agentId: string) => objects.get(agentId)!.rt;
@@ -120,7 +129,7 @@ async function world(opts: { expiring?: boolean; github?: boolean } = {}) {
     const agentId = twinOf?.agentId ?? `raft_${raftAgentId}`;
     const host = twinOf ? objects.get(twinOf.agentId)!.host : sqliteHost();
     const rt = new AgentRuntime({
-      ctx: { storage: { sql: host.sql, transactionSync: host.transactionSync } } as any,
+      ctx: { storage: { sql: host.sql, transactionSync: host.transactionSync }, waitUntil: (p: Promise<unknown>) => { pending.push(p); } } as any,
       bucket: {} as any, bucketName: "b", models: { resolve: () => null } as any,
       secretKek: KEK,
       operatorModel: operatorModelOf({ DEEPSEEK_BASE_URL: "https://model.example/v1", DEEPSEEK_API_KEY: "k", HARNESS_MODEL: "deepseek-flash" } as any),
@@ -133,6 +142,7 @@ async function world(opts: { expiring?: boolean; github?: boolean } = {}) {
               const row = await registry.get(tenantId, r);
               if (!row || row.agentId === fromAgentId) continue;
               propagated.push(row.agentId);
+              if (propagateDelayMs) await sleep(propagateDelayMs);
               await rtOf(row.agentId).adoptConnection(tenantId, row.agentId, "github", connectorId);
             }
           },
@@ -172,8 +182,8 @@ async function world(opts: { expiring?: boolean; github?: boolean } = {}) {
     return r.body.connectorId as string;
   }
   const status = (raftAgentId: string) => call("GET", `/agents/by-raft-agent/${raftAgentId}/connections/github`);
-  const tool = async (a: { rt: AgentRuntime; agentId: string }, name = "auth_status") =>
-    a.rt.gateway().invoke({ tenantId: TENANT, agentId: a.agentId, taskId: "t1" }, `gh.${name}`, {});
+  const tool = async (a: { rt: AgentRuntime; agentId: string }, name = "auth_status", args: Record<string, unknown> = {}) =>
+    a.rt.gateway().invoke({ tenantId: TENANT, agentId: a.agentId, taskId: "t1" }, `gh.${name}`, args as any);
   /** The mount's token as stored, and what renews it. */
   async function stored(a: { rt: AgentRuntime; agentId: string }) {
     const { importKek, open } = await import("../src/runtime/secrets.ts");
@@ -189,8 +199,16 @@ async function world(opts: { expiring?: boolean; github?: boolean } = {}) {
     await a.rt.store.putSecret(TENANT, a.agentId, `${OAUTH_PREFIX}gh`, await seal(kek, JSON.stringify({ ...rec, expiresAt: at })));
     if (connectorId) db.raw.prepare("UPDATE connectors SET expires_at = ? WHERE id = ?").run(at, connectorId);
   }
+  /** As if the connector's pair (and a mount's own) were renewed long ago, not moments ago at the connect. */
+  async function age(a: { rt: AgentRuntime; agentId: string }, connectorId?: string) {
+    const { kek, rec } = await stored(a);
+    const { seal } = await import("../src/runtime/secrets.ts");
+    await a.rt.store.putSecret(TENANT, a.agentId, `${OAUTH_PREFIX}gh`, await seal(kek, JSON.stringify({ ...rec, rotatedAt: Date.now() - 2 * H })));
+    if (connectorId) db.raw.prepare("UPDATE connectors SET refreshed_at = ? WHERE id = ?").run(Date.now() - 2 * H, connectorId);
+  }
   const dispose = () => { for (const o of objects.values()) o.host.dispose(); };
-  return { db, gh, agent, connect, status, tool, stored, expireAt, call, grants, propagated, dispose };
+  return { db, gh, agent, connect, status, tool, stored, expireAt, age, call, grants, propagated, settle, dispose,
+    delayPropagation: (ms: number) => { propagateDelayMs = ms; } };
 }
 
 const succeeded = (r: any) => r.status === "succeeded";
@@ -240,7 +258,7 @@ await check("a token within five minutes of its expiry is renewed before the cal
 await check("a 401 for a token not yet expired by our clock renews once and retries once", async () => {
   const w = await world();
   const a = await w.agent("A3");
-  await w.connect(a);
+  await w.age(a, await w.connect(a));
   const before = (await w.stored(a)).token!;
   // Revoked behind our back, with the refresh token still good: what an outside renewal or a clock skew looks like.
   w.gh.live.delete(before);
@@ -300,6 +318,7 @@ await check("a renewal by one agent reaches the other agents on the connector, s
   await w.call("PUT", `/agents/by-raft-agent/B5/connections/github`, { connectorId: id, actingRaftUserId: "u_owner", actingRole: "creator" });
   await w.expireAt(a, Date.now() + 30_000, id);
   must(succeeded(await w.tool(a)) && w.gh.s.refreshes === 1, "a did not renew");
+  await w.settle();
   must(w.propagated.join() === b.agentId, `propagated to ${w.propagated.join()}`);
   // b's sandbox would read the mount directly, with no 401 to learn from: the mount itself must hold the new token.
   must((await w.stored(b)).token === (await w.stored(a)).token, "b still holds the spent token");
@@ -371,24 +390,166 @@ await check("a connection with no connector (made before connectors) is marked o
   w.dispose();
 });
 
-await check("a 401 that persists after a renewal is GitHub's verdict: the connection is marked, once", async () => {
+await check("a 401 that persists after a renewal (an endpoint that refuses user tokens, /app) is an ordinary error: the connection stays healthy and is not renewed again", async () => {
   const w = await world();
   const a = await w.agent("A7");
-  const id = await w.connect(a);
-  // Every token refused, renewed or not: an App authorisation the person revoked.
-  const real = globalThis.fetch;
-  globalThis.fetch = (async (url: any, init?: any) => {
-    if (String(url).startsWith("https://api.github.com/")) { w.gh.s.api++; w.gh.s.unauthorized++; return json({ message: "Bad credentials" }, 401); }
-    return real(url, init);
-  }) as any;
+  const id = await w.age(a, await w.connect(a)).then(() => w.db.raw.prepare("SELECT id FROM connectors").get() as any).then((r) => r.id as string);
+  const before = (await w.stored(a)).token;
   const api = w.gh.s.api;
-  const r = await w.tool(a);
-  must(!succeeded(r) && errorText(r).includes(RECONNECT_REASON), `the result: ${errorText(r)}`);
+  const r = await w.tool(a, "api_get", { path: "/app" });
+  const text = errorText(r);
+  must(!succeeded(r) && /401/.test(text) && !text.includes(RECONNECT_REASON), `the result: ${text}`);
   must(w.gh.s.refreshes === 1 && w.gh.s.api - api === 2, `refreshes ${w.gh.s.refreshes}, calls ${w.gh.s.api - api}`);
+  must((await w.stored(a)).token !== before && !(await w.stored(a)).rec.brokenAt, "the mount was not renewed, or was marked");
   const got = await w.status("A7");
-  must(got.body.connected === false && got.body.oauthStatus === "error", got.text);
-  must((w.db.raw.prepare("SELECT count(*) AS n FROM connector_events WHERE connector_id = ? AND action = 'broken'").get(id) as any).n === 1, "not one event");
+  must(got.body.connected === true && got.body.oauthStatus === "connected" && got.body.lastCheckError === null, got.text);
+  must((w.db.raw.prepare("SELECT count(*) AS n FROM connector_events WHERE connector_id = ? AND action = 'broken'").get(id) as any).n === 0, "a broken event was written");
+  // Asked again at once: the pair was renewed moments ago, so the 401 is not GitHub saying it is gone, and nothing rotates.
+  const again = await w.tool(a, "api_get", { path: "/app" });
+  must(!succeeded(again) && w.gh.s.refreshes === 1, `renewed again: ${w.gh.s.refreshes}`);
+  must(succeeded(await w.tool(a)), "an ordinary call failed afterwards");
+  w.dispose();
+});
+
+for (const [label, answer] of [
+  ["a 403 HTML page", () => new Response("<html><body>Forbidden</body></html>", { status: 403, headers: { "content-type": "text/html" } })],
+  ["a 200 HTML page", () => new Response("<html><body>Please wait</body></html>", { status: 200, headers: { "content-type": "text/html" } })],
+  ["a 400 JSON body with no error code", () => json({ message: "oops" }, 400)],
+] as const) {
+  await check(`a token endpoint answering ${label} is no verdict: nothing is marked, and the call reports its 401`, async () => {
+    const w = await world();
+    const a = await w.agent("A13");
+    const id = await w.connect(a);
+    await w.expireAt(a, Date.now() + 30_000, id);
+    w.gh.live.delete((await w.stored(a)).token!);
+    w.gh.s.tokenAnswer = answer;
+    const r = await w.tool(a);
+    must(!succeeded(r) && !errorText(r).includes(RECONNECT_REASON), errorText(r));
+    const row = w.db.raw.prepare("SELECT broken_at, refreshing_until FROM connectors WHERE id = ?").get(id) as any;
+    must(row.broken_at === null && row.refreshing_until === null, JSON.stringify(row));
+    must(!(await w.stored(a)).rec.brokenAt && (await w.status("A13")).body.oauthStatus === "connected", "marked broken");
+    // GitHub answering again is all it takes.
+    w.gh.s.tokenAnswer = null;
+    must(succeeded(await w.tool(a)), "the connection did not recover once GitHub answered");
+    w.dispose();
+  });
+}
+
+await check("pointing an agent at a connector that needs reconnecting is refused, 422 connect_failed", async () => {
+  const w = await world();
+  const a = await w.agent("A14");
+  const b = await w.agent("B14");
+  const id = await w.connect(a);
+  await w.grants.markBroken(TENANT, id, "bad_refresh_token", Date.now(), null);
+  const r = await w.call("PUT", `/agents/by-raft-agent/B14/connections/github`, { connectorId: id, actingRaftUserId: "u_owner", actingRole: "creator" });
+  must(r.status === 422 && r.body.error.code === "connect_failed" && r.body.error.message.includes(RECONNECT_REASON), `${r.status} ${r.text}`);
+  must((await w.stored(b)).token === null && (await w.status("B14")).body.oauthStatus === "disconnected", "the agent was pointed at it anyway");
+  w.dispose();
+});
+
+await check("a renewal's pair is in D1 before anything else runs, and the token endpoint's timeout sits inside the lease", async () => {
+  const { TOKEN_TIMEOUT_MS } = await import("../cf/src/github-token.ts");
+  const { LEASE_MS } = await import("../cf/src/github-refresh.ts");
+  must(TOKEN_TIMEOUT_MS >= 20_000 && TOKEN_TIMEOUT_MS < LEASE_MS, `timeout ${TOKEN_TIMEOUT_MS}, lease ${LEASE_MS}`);
+  const w = await world();
+  const a = await w.agent("A15");
+  const b = await w.agent("B15");
+  const id = await w.connect(a);
+  await w.call("PUT", `/agents/by-raft-agent/B15/connections/github`, { connectorId: id, actingRaftUserId: "u_owner", actingRole: "creator" });
+  await w.expireAt(a, Date.now() + 30_000, id);
+  // Read the instant the refresh answers: the connector row must already be the pair GitHub just issued.
+  const real = globalThis.fetch;
+  let seenInD1: string | null = null;
+  globalThis.fetch = (async (url: any, init?: any) => {
+    const res = await real(url, init);
+    if (String(url) === GITHUB_TOKEN && JSON.parse(String(init?.body)).grant_type === "refresh_token") {
+      queueMicrotask(() => setTimeout(async () => {
+        const s = await w.stored(a);
+        const row = w.db.raw.prepare("SELECT ciphertext, iv FROM connectors WHERE id = ?").get(id) as any;
+        seenInD1 = await s.open(s.kek, { ciphertext: row.ciphertext, iv: row.iv });
+      }, 0));
+    }
+    return res;
+  }) as any;
+  w.delayPropagation(50);
+  must(succeeded(await w.tool(a)), "the call failed");
   globalThis.fetch = real;
+  const issued = w.gh.issued.filter((t) => t.startsWith("ghu_")).at(-1);
+  must(seenInD1 === issued, "the connector did not hold the new pair before the call went on");
+  w.dispose();
+});
+
+await check("the lease is its holder's: one that outlived it cannot free the renewal that took over", async () => {
+  const w = await world();
+  const a = await w.agent("A16");
+  const id = await w.connect(a);
+  const g = w.grants;
+  must(await g.lease(TENANT, id, 1_000, 2_000, "h1"), "h1 did not get a free lease");
+  must(!(await g.lease(TENANT, id, 1_500, 2_500, "h2")), "h2 took a lease h1 still held");
+  must(await g.lease(TENANT, id, 2_500, Date.now() + 60_000, "h2"), "h2 could not take over an expired lease");
+  await g.release(TENANT, id, "h1");
+  must(!(await g.lease(TENANT, id, Date.now(), Date.now() + 1_000, "h3")), "h1's late release freed h2's lease");
+  const k = (await g.grant(TENANT, id))!;
+  must(!(await g.rotate(TENANT, id, { sealed: k.sealed, refresh: k.refresh!, at: Date.now() }, "not-the-ciphertext", "h1")), "a stale rotation landed");
+  await g.markBroken(TENANT, id, "test", Date.now(), "h1");
+  must((await g.grant(TENANT, id))!.refreshingUntil !== null, "h1 marking it broken released h2's lease");
+  await g.release(TENANT, id, "h2");
+  must((await g.grant(TENANT, id))!.refreshingUntil === null, "h2 could not release its own lease");
+  w.dispose();
+});
+
+await check("a mount's own broken flag heals when the connector is healthy: by another agent's renewal, and by its own next 401", async () => {
+  const w = await world();
+  const a = await w.agent("A17");
+  const b = await w.agent("B17");
+  const id = await w.connect(a);
+  await w.call("PUT", `/agents/by-raft-agent/B17/connections/github`, { connectorId: id, actingRaftUserId: "u_owner", actingRole: "creator" });
+  const { seal } = await import("../src/runtime/secrets.ts");
+  const markLocal = async (x: typeof b) => {
+    const s = await w.stored(x);
+    await x.rt.store.putSecret(TENANT, x.agentId, `${OAUTH_PREFIX}gh`, await seal(s.kek, JSON.stringify({ ...s.rec, brokenAt: Date.now(), brokenReason: "stale" })));
+  };
+  await markLocal(b);
+  await w.expireAt(a, Date.now() + 30_000, id);
+  must(succeeded(await w.tool(a)), "a's renewal failed");
+  await w.settle();
+  must(!(await w.stored(b)).rec.brokenAt && succeeded(await w.tool(b)), "propagation did not heal b");
+  await markLocal(b);
+  w.gh.live.delete((await w.stored(b)).token!);
+  await w.age(a, id);
+  const r = await w.tool(b);
+  must(succeeded(r) && !(await w.stored(b)).rec.brokenAt, `b's 401 did not heal it: ${errorText(r)}`);
+  w.dispose();
+});
+
+await check("a mount whose connector was deleted stops renewing: no refresh with its own copy, and it says to reconnect", async () => {
+  const w = await world();
+  const a = await w.agent("A18");
+  const id = await w.connect(a);
+  w.db.raw.prepare("DELETE FROM connectors WHERE id = ?").run(id);
+  await w.expireAt(a, Date.now() + 30_000);
+  w.gh.live.delete((await w.stored(a)).token!);
+  const r = await w.tool(a);
+  must(!succeeded(r) && errorText(r).includes(RECONNECT_REASON), errorText(r));
+  must(w.gh.s.refreshes === 0, `renewed with the mount's own copy: ${w.gh.s.refreshes}`);
+  must((await w.stored(a)).rec.brokenAt, "the mount was not marked");
+  w.dispose();
+});
+
+await check("propagation is not waited for: the renewing call answers first, and the other agent gets the pair after", async () => {
+  const w = await world();
+  const a = await w.agent("A19");
+  const b = await w.agent("B19");
+  const id = await w.connect(a);
+  await w.call("PUT", `/agents/by-raft-agent/B19/connections/github`, { connectorId: id, actingRaftUserId: "u_owner", actingRole: "creator" });
+  const old = (await w.stored(b)).token;
+  await w.expireAt(a, Date.now() + 30_000, id);
+  w.delayPropagation(300);
+  const t0 = Date.now();
+  must(succeeded(await w.tool(a)), "a's call failed");
+  must(Date.now() - t0 < 300 && (await w.stored(b)).token === old, `the call waited for propagation (${Date.now() - t0} ms)`);
+  await w.settle();
+  must((await w.stored(b)).token === (await w.stored(a)).token, "b never got the pair");
   w.dispose();
 });
 
