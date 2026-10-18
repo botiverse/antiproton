@@ -190,6 +190,20 @@ chooses, the plugin must bound that host with a setting. `http` declares no
 credential today, but its `allowedHosts` setting is already marked
 `requiredWithCredential` for the day it does.
 
+**A credential the far end stops taking.** Where the deployment can renew a
+mount's credential (today an expiring GitHub user token from Connect GitHub,
+cf/src/github-refresh.ts), the context carries `ctx.credentialRejected`. A
+plugin that gets the service's "this credential is no longer valid" (GitHub's
+`401`) calls it once with the credential it sent, and on `{ credential }`
+makes the call once more with that one. A refusal of the retry is reported
+like any other: an endpoint may refuse a kind of credential whatever its state,
+so a `401` is never taken as the authorization being gone. `{ reconnect }` is
+the sentence to put in the error when the renewal itself was refused, which
+only the person can mend. `null` means there is nothing to renew with, nobody
+answered, or the credential was renewed moments ago, and the failure is
+reported as it would be without the hook. Renewing before a token expires
+needs nothing from the plugin: it happens where the credential is read.
+
 **Say which identity a call was made with.** `ctx.credential` being null has
 several causes, and different people fix them: the mount names no credential,
 so its owner attaches an account; it names `agent:<name>` and that row is gone,
@@ -573,12 +587,23 @@ storage (`createRaftPlugin({ artifacts })`, as the runtime builds it) and not
 at all without, falling back to `attachments.download` when the Server cannot mint a URL.
 `attachments_view` keeps an attachment the same way and, when its first bytes
 are a PNG, JPEG, WebP or still GIF of at most `VIEW_MAX_BYTES` (1.5 MiB) and
-`VIEW_MAX_SIDE` (2000 px a side), returns the same fields plus a `view` (the
+`VIEW_MAX_SIDE` (2048 px a side), returns the same fields plus a `view` (the
 reference, the type read from the bytes, width, height and size) that the gateway
 can hand the model as an image; anything else, an animated GIF, WebP or PNG, or an
 image over a limit is refused with what it is and the reference to the copy
 kept, since nothing resizes. It is listed by a snapshot exactly where the
-download is and offered only beside it. A tool's description and every parameter description in its
+download is and offered only beside it.
+`attachments_upload` goes the other way: it reads a file from the agent's own
+object storage (an `artifact://` reference, such as `sandbox` `save` returns;
+a raw `r2://` reference or one outside the caller's scope is refused before
+anything is read) and uploads it to Raft for one conversation through the SDK's
+typed `attachments.upload`, with the mount's credential. At most
+`UPLOAD_MAX_BYTES` (25 MiB) is read; the Server's own limit and the choice
+between a multipart upload and an upload session are the SDK's. It posts
+nothing: it returns the `attachmentId` to pass to `messages_send` in
+`attachmentIds`. It is offered only with object storage and to a credential
+holding `send`, and it is declared a write, so approval policy for writes
+applies and a subagent is never handed it. A tool's description and every parameter description in its
 schema name operations by their tool names, never by the manifest's dotted
 names, SDK field paths or CLI flags (`inMountTerms`). Its
 `snapshotTools` asks Raft what the mount's credential may do

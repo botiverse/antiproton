@@ -1,6 +1,7 @@
+import { Buffer } from "node:buffer";
 import type { Plugin } from "./types.ts";
-import { keyForRef } from "../store/refs.ts";
-import type { R2Artifacts } from "../store/artifacts.ts";
+import { keyForRef, toAgentRef, type RefOwner } from "../store/refs.ts";
+import { imageProblem, sha256Hex, sniffImage } from "../model/images.ts";
 
 /**
  * Reading back what the gateway parked. Without this the offload in §5.4 is a
@@ -34,8 +35,100 @@ export const READ_PAGE = 16 * 1024;
  */
 export const READ_WHOLE_MAX = 32 * 1024;
 
+/**
+ * How many raw bytes one `read { encoding: "base64" }` returns: 12 KiB is 16 KiB of base64, under READ_WHOLE_MAX
+ * with the rest of the result around it, so a page is never parked again.
+ */
+export const BASE64_PAGE = 12 * 1024;
 
-export function artifactsPlugin(artifacts: R2Artifacts, bucket: string): Plugin {
+/** What this plugin reads through: the store's `get`, and the content type it was stored with where the store keeps one. */
+export interface ArtifactReader {
+  get(key: string): Promise<Uint8Array>;
+  getObject?(key: string): Promise<{ bytes: Uint8Array; contentType?: string }>;
+}
+
+/**
+ * File types known by their first bytes that are not text, beyond the four images (`sniffImage`). Only signatures
+ * that no ordinary text starts with: a text file beginning "BM" or "BZh" is still text.
+ */
+const MAGIC: Array<{ at: number; sig: string; mimeType: string }> = [
+  { at: 0, sig: "%PDF-", mimeType: "application/pdf" },
+  { at: 0, sig: "PK\x03\x04", mimeType: "application/zip" },
+  { at: 0, sig: "\x1f\x8b", mimeType: "application/gzip" },
+  { at: 0, sig: "7z\xbc\xaf\x27\x1c", mimeType: "application/x-7z-compressed" },
+  { at: 0, sig: "\xfd7zXZ\x00", mimeType: "application/x-xz" },
+  { at: 0, sig: "\x28\xb5\x2f\xfd", mimeType: "application/zstd" },
+  { at: 0, sig: "\x7fELF", mimeType: "application/x-elf" },
+  { at: 0, sig: "\x00asm", mimeType: "application/wasm" },
+  { at: 257, sig: "ustar", mimeType: "application/x-tar" },
+  { at: 4, sig: "ftyp", mimeType: "video/mp4" }, // the brand after it may say otherwise (`magicType`)
+];
+
+/** How far a NUL byte is looked for: text has none, and nearly every binary format has one early. */
+const NUL_WINDOW = 8 * 1024;
+
+/** The type a file's own first bytes declare, when they are a known non-text signature. */
+function magicType(b: Uint8Array): string | null {
+  const image = sniffImage(b);
+  if (image) return image.mimeType;
+  const hit = MAGIC.find(({ at, sig }) => at + sig.length <= b.length && [...sig].every((c, k) => b[at + k] === c.charCodeAt(0)));
+  if (hit?.sig === "ftyp") {
+    // An ISO media file names what it is in the four bytes after `ftyp`: AVIF and HEIC are stills, not video.
+    const brand = String.fromCharCode(...b.subarray(8, 12));
+    if (/^avi[fs]$/.test(brand)) return "image/avif";
+    if (/^(?:hei[cx]|hev[cx]|mif1|msf1)$/.test(brand)) return "image/heic";
+  }
+  return hit?.mimeType ?? null;
+}
+
+/**
+ * The stored bytes as text, or null when they are not text: a known binary signature, a NUL in the first 8 KiB, or
+ * bytes that are not valid UTF-8. Decoding leniently turned a JPEG into a "text" result of U+FFFD characters, which
+ * is neither the image nor anything the model can use.
+ */
+function textOf(b: Uint8Array): string | null {
+  if (magicType(b) !== null) return null;
+  if (b.subarray(0, NUL_WINDOW).includes(0)) return null;
+  try {
+    return new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(b);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * What `read` returns for bytes that are not text: their type, size and hash, and for an image within the harness's
+ * limits (`imageProblem`) a `view` marker, so the model sees the picture itself (src/runtime/tool-view.ts).
+ */
+function binaryResult(b: Uint8Array, key: string, owner: RefOwner, contentType: string | undefined, hint: string) {
+  const bytes = b.byteLength;
+  const sha256 = sha256Hex(b);
+  const declared = contentType ? { contentType: contentType.slice(0, 200) } : {};
+  const image = sniffImage(b);
+  if (image) {
+    const dims = {
+      ...(image.width ? { width: image.width } : {}),
+      ...(image.height ? { height: image.height } : {}),
+    };
+    const ref = toAgentRef(key, owner);
+    const problem = imageProblem(b, image.mimeType)
+      ?? (image.width === 0 || image.height === 0 ? "its header gives no dimensions" : null)
+      ?? (ref === null ? "it has no reference this agent can be shown" : null);
+    if (problem === null) {
+      return {
+        kind: "image", mimeType: image.mimeType, ...dims, bytes, sha256, ...declared,
+        note: `the image is attached to this result for you to see; ${hint}`,
+        view: { ref: ref!, mimeType: image.mimeType, ...dims, bytes },
+      };
+    }
+    return { kind: "image", mimeType: image.mimeType, ...dims, bytes, sha256, ...declared, note: `the image cannot be shown: ${problem}; ${hint}` };
+  }
+  const mimeType = magicType(b) ?? contentType?.slice(0, 200);
+  return { kind: "binary", ...(mimeType ? { mimeType } : {}), bytes, sha256, ...declared, note: hint };
+}
+
+
+export function artifactsPlugin(artifacts: ArtifactReader, bucket: string): Plugin {
   return {
     id: "artifacts",
     version: "1.0.0",
@@ -70,12 +163,14 @@ export function artifactsPlugin(artifacts: R2Artifacts, bucket: string): Plugin 
         name: "read",
         summary:
           "Read back a parked result by its r2:// reference: whole, fields/offset/limit for part of a list, "
-          + "or from to page through one too large to return at once.",
+          + "or from to page through one too large to return at once. An image comes back as an image you can see; "
+          + "other binary files as their type, size and sha256, or their bytes as base64 with encoding \"base64\".",
         parameters: {
           type: "object",
           properties: {
             ref: { type: "string" },
-            from: { type: "integer", description: "character to read from, a page at a time, as the note says" },
+            from: { type: "integer", description: "character to read from, a page at a time, as the note says (with encoding base64, a byte offset)" },
+            encoding: { type: "string", enum: ["base64"], description: `the stored bytes as base64, ${BASE64_PAGE / 1024} KiB a page from \`from\`` },
             fields: { type: "array", items: { type: "string" }, description: "keys to keep from each array item" },
             offset: { type: "integer" },
             limit: { type: "integer" },
@@ -88,7 +183,7 @@ export function artifactsPlugin(artifacts: R2Artifacts, bucket: string): Plugin 
     ],
     async invoke(tool, args, ctx) {
       if (tool !== "read") throw new Error(`unknown tool: ${tool}`);
-      const a = args as { ref: string; from?: number; fields?: string[]; offset?: number; limit?: number };
+      const a = args as { ref: string; from?: number; fields?: string[]; offset?: number; limit?: number; encoding?: string };
       // One question, asked by the contract that owns it: does this reference
       // name something of the agent holding it? `keyForRef` answers for both
       // forms — the shown `artifact://<path>` and a legacy raw reference still
@@ -98,7 +193,31 @@ export function artifactsPlugin(artifacts: R2Artifacts, bucket: string): Plugin 
       if (key === null) {
         throw new Error(`reference is not readable by this agent: ${String(a.ref).slice(0, 80)}`);
       }
-      const raw = new TextDecoder().decode(await artifacts.get(key));
+      const stored = artifacts.getObject ? await artifacts.getObject(key) : { bytes: await artifacts.get(key) };
+      const body = stored.bytes;
+      // `from`, `fields`, `offset` and `limit` page text or a list; a dropped argument must not look like one that
+      // had nothing to do (#270), so a result that cannot use them names them.
+      const unusedOf = (keys: ReadonlyArray<"from" | "fields" | "offset" | "limit">) => keys.filter((k) => a[k] !== undefined);
+      if (a.encoding !== undefined) {
+        if (a.encoding !== "base64") throw new Error(`encoding must be "base64", not ${JSON.stringify(String(a.encoding).slice(0, 40))}`);
+        const from = Math.min(Math.max(0, Math.floor(Number(a.from ?? 0)) || 0), body.byteLength);
+        const to = Math.min(from + BASE64_PAGE, body.byteLength);
+        const paging = to < body.byteLength
+          ? `showing bytes ${from}-${to} of ${body.byteLength}; continue with read { ref, encoding: "base64", from: ${to} }`
+          : `end of artifact (${body.byteLength} bytes)`;
+        const unused = unusedOf(["fields", "offset", "limit"]);
+        return {
+          kind: "base64", bytes: body.byteLength, from, to, data: Buffer.from(body.subarray(from, to)).toString("base64"),
+          note: unused.length ? `${paging}; ${unused.join(", ")} page a list and do not apply with encoding, so they were not used` : paging,
+        };
+      }
+      const raw = textOf(body);
+      if (raw === null) {
+        const unused = unusedOf(["from", "fields", "offset", "limit"]);
+        const hint = `binary content is not returned as text; read { ref, encoding: "base64", from: 0 } returns its bytes`
+          + (unused.length ? `; ${unused.join(", ")} page text or a list, so they were not used` : "");
+        return binaryResult(body, key, ctx.caller, stored.contentType, hint);
+      }
       // The continuation a cut result points at: the stored text as-is, a page
       // at a time, each page ending with the call that reads the next — the way
       // pi's own read tool continues a file (pi-coding-agent 0.83.0, dist/core/tools/read.js).
@@ -126,7 +245,7 @@ export function artifactsPlugin(artifacts: R2Artifacts, bucket: string): Plugin 
           ? `showing characters ${from}-${to} of ${raw.length}; continue with read { ref, from: ${to} }`
           : `end of result (${raw.length} characters)`;
         return {
-          kind: "text", bytes: raw.length, from, to, text,
+          kind: "text", bytes: body.byteLength, from, to, text,
           note: unused.length
             ? `${paging}; ${unused.join(", ")} page a list and do not apply with from, so they were not used`
             : paging,
@@ -136,7 +255,7 @@ export function artifactsPlugin(artifacts: R2Artifacts, bucket: string): Plugin 
       try {
         parsed = JSON.parse(raw);
       } catch {
-        return { kind: "text", bytes: raw.length, text: raw.slice(a.offset ?? 0, (a.offset ?? 0) + (a.limit ?? 4000)) };
+        return { kind: "text", bytes: body.byteLength, text: raw.slice(a.offset ?? 0, (a.offset ?? 0) + (a.limit ?? 4000)) };
       }
       // `fields`, `offset` and `limit` page a list, and this tool's summary
       // promises them without conditions — as does `state.get`, which tells the

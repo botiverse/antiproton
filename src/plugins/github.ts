@@ -137,24 +137,41 @@ async function call(
   // drops that header on a cross-origin hop; a Worker's was not measured. So a
   // hop within the API keeps the headers (a renamed repository redirects there
   // and needs them), and any other host gets none: its URL is its credential.
-  let url = new URL(API + path);
-  let res = await fetch(url, {
-    method, headers,
-    body: body === undefined ? undefined : JSON.stringify(body),
-    signal: AbortSignal.timeout(30_000), redirect: "manual",
-  });
-  for (let hop = 0; hop < 3 && res.status >= 300 && res.status < 400 && res.headers.get("location"); hop++) {
-    url = new URL(res.headers.get("location")!, url);
-    const sameApi = url.origin === new URL(API).origin;
-    // 303 means "go and GET this"; 307 and 308 repeat the request as it was.
-    const asGet = res.status === 303 || method === "GET";
-    res = await fetch(url, {
-      ...(sameApi ? {
-        method: asGet ? "GET" : method, headers,
-        body: asGet || body === undefined ? undefined : JSON.stringify(body),
-      } : {}),
+  const send = async () => {
+    let url = new URL(API + path);
+    let res = await fetch(url, {
+      method, headers,
+      body: body === undefined ? undefined : JSON.stringify(body),
       signal: AbortSignal.timeout(30_000), redirect: "manual",
     });
+    for (let hop = 0; hop < 3 && res.status >= 300 && res.status < 400 && res.headers.get("location"); hop++) {
+      url = new URL(res.headers.get("location")!, url);
+      const sameApi = url.origin === new URL(API).origin;
+      // 303 means "go and GET this"; 307 and 308 repeat the request as it was.
+      const asGet = res.status === 303 || method === "GET";
+      res = await fetch(url, {
+        ...(sameApi ? {
+          method: asGet ? "GET" : method, headers,
+          body: asGet || body === undefined ? undefined : JSON.stringify(body),
+        } : {}),
+        signal: AbortSignal.timeout(30_000), redirect: "manual",
+      });
+    }
+    return { url, res };
+  };
+  let { url, res } = await send();
+  // An expiring token GitHub no longer takes (#935): renewed once and the call made once more. A 401 for the
+  // renewed one is reported as any 401 is: some endpoints refuse a user token whatever its state (`/app`), so it
+  // says nothing about the connection. Only GitHub refusing the renewal does, and then `reconnect` says so.
+  let reconnect: string | null = null;
+  if (res.status === 401 && ctx.credential && ctx.credentialRejected && new URL(url).origin === new URL(API).origin) {
+    const renewed = await ctx.credentialRejected(ctx.credential);
+    if (renewed && "credential" in renewed) {
+      headers.authorization = `Bearer ${renewed.credential}`;
+      ({ url, res } = await send());
+    } else if (renewed) {
+      reconnect = renewed.reconnect;
+    }
   }
   // Who answered, for errors: GitHub, or the storage host it sent us to. The
   // host only, never the signed query string.
@@ -181,7 +198,8 @@ async function call(
     // console badges a stored failure, and a badge matched out of prose breaks
     // silently the next time the prose changes.
     const err = markIdentity(new Error(
-      `${who} ${res.status}: ${parsed?.message ?? res.statusText}${rate}${identityLine(ctx, res.status, res.headers.get("x-oauth-scopes"))}`,
+      `${who} ${res.status}: ${parsed?.message ?? res.statusText}${rate}` +
+        (reconnect ? ` — ${reconnect}` : identityLine(ctx, res.status, res.headers.get("x-oauth-scopes"))),
     ), ctx);
     const limited = res.status === 429 || (res.status === 403 && remaining === "0");
     // Two questions, and a 5xx answers yes to both: it may clear on its own,

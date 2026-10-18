@@ -37,7 +37,7 @@ import { secretRefKind } from "../../src/runtime/secrets.ts";
 import { DynamicWorkerExecutor, handleSandboxCall, handleSandboxSuspend, type SuspendRequest } from "../../src/runtime/dynamic-worker-executor.ts";
 import { executorSpec } from "../../test/spec/executor-spec.ts";
 import {
-  AgentRuntime, type FreshContextResult, type RestartResult, reconcileSeed, OPERATOR_RUN9_REF, isOperatorModelRef, parsePluginChoice, SEEDED_PLUGINS, installedRows, messageRefusal, consoleAdded, CONSOLE_MOUNTS_MAX, agentKind, seedInstallation, recordReleaseError } from "./runtime.ts";
+  AgentRuntime, type RuntimeDeps, type FreshContextResult, type RestartResult, reconcileSeed, OPERATOR_RUN9_REF, isOperatorModelRef, parsePluginChoice, SEEDED_PLUGINS, installedRows, messageRefusal, consoleAdded, CONSOLE_MOUNTS_MAX, agentKind, seedInstallation, recordReleaseError } from "./runtime.ts";
 import { readMeter } from "../../bench/meter.ts";
 import { BENCH_SWE_WITHHELD } from "../../bench/swebench/withheld.ts";
 import { contextWindowFor } from "../../src/model/context-windows.ts";
@@ -101,7 +101,8 @@ import { d1ServiceTokens } from "./control-plane.ts";
 import { adminServiceTokens } from "./admin-service-tokens.ts";
 import { hashServiceToken, looksLikeServiceToken } from "./service-token.ts";
 import { adminProviderTokens, reservedTenantProblem } from "./admin-provider-tokens.ts";
-import { d1Connections, d1Connectors, d1ModelChoices, d1ModelOverrides, d1ProviderTokens, d1ProvisionedAgents, d1TenantModelPicker } from "./control-plane.ts";
+import { d1ConnectorGrants, d1Connections, d1Connectors, type ConnectorRefresh, d1ModelChoices, d1ModelOverrides, d1ProviderTokens, d1ProvisionedAgents, d1TenantModelPicker } from "./control-plane.ts";
+import type { GithubGrant } from "./github-token.ts";
 import { CONNECT_START_PATH, CONNECTION_PLUGIN, connectCallback, connectLink, connectStart, isConnectCallback, type ConnectDeps } from "./provision/connect.ts";
 import { hashProviderToken, looksLikeProviderToken } from "./provider-token.ts";
 import { handleProvision, IMPORT_REQUEST_MAX_BYTES, IMPORT_ROUTE, type ProvisionDeps, type ProvisionTool } from "./provision/handlers.ts";
@@ -439,6 +440,7 @@ export class AgentDO extends DurableObject<Env> {
       ...operatorCredentials(this.env),
       reminderApp: { origin: this.env.REMINDER_APP_ORIGIN, credential: this.env.REMINDER_APP_CREDENTIAL },
       secretKek: this.env.SECRET_KEK,
+      github: githubRenewal(this.env),
       modelInputEvidence: evalSeedRoutes(this.env),
       // Subagents for every hosted agent, unless the agent's setting says no or the deployment's kill switch is set.
       subagentsDefault: true,
@@ -1928,24 +1930,31 @@ export class AgentDO extends DurableObject<Env> {
   }
 
   /** Connect flow (provision/connect.ts): a finished flow's token, held until Raft confirms its initiator. */
-  async connectionHold(tenantId: string, agentId: string, plugin: string, token: string, id: string, exp: number, raftUserId: string) {
+  async connectionHold(tenantId: string, agentId: string, plugin: string, grant: GithubGrant, id: string, exp: number, raftUserId: string) {
     this.#claim(tenantId, agentId);
-    return this.#busy("connectionHold", () => this.runtime().holdConnection(tenantId, agentId, plugin, token, id, exp, raftUserId));
+    return this.#busy("connectionHold", () => this.runtime().holdConnection(tenantId, agentId, plugin, grant, id, exp, raftUserId));
   }
 
-  async connectionConfirm(tenantId: string, agentId: string, plugin: string, id: string, raftUserId: string) {
+  async connectionConfirm(tenantId: string, agentId: string, plugin: string, id: string, raftUserId: string, connectorId: string | null = null) {
     this.#claim(tenantId, agentId);
-    return this.#busy("connectionConfirm", () => this.runtime().confirmConnection(tenantId, agentId, plugin, id, raftUserId));
+    return this.#busy("connectionConfirm", () => this.runtime().confirmConnection(tenantId, agentId, plugin, id, raftUserId, connectorId));
   }
 
-  async connectionAttach(tenantId: string, agentId: string, plugin: string, sealed: { ciphertext: string; iv: string }) {
+  async connectionAttach(tenantId: string, agentId: string, plugin: string, sealed: { ciphertext: string; iv: string },
+    refresh: (ConnectorRefresh & { connectorId: string | null }) | null = null) {
     this.#claim(tenantId, agentId);
-    return this.#busy("connectionAttach", () => this.runtime().attachSealedConnection(tenantId, agentId, plugin, sealed));
+    return this.#busy("connectionAttach", () => this.runtime().attachSealedConnection(tenantId, agentId, plugin, sealed, refresh));
   }
 
-  async connectionDetachIfFrom(tenantId: string, agentId: string, plugin: string, sealed: { ciphertext: string; iv: string }) {
+  async connectionDetachIfFrom(tenantId: string, agentId: string, plugin: string, sealed: { ciphertext: string; iv: string }, connectorId: string | null = null) {
     this.#claim(tenantId, agentId);
-    return this.#busy("connectionDetachIfFrom", () => this.runtime().detachConnectionIfFrom(tenantId, agentId, plugin, sealed));
+    return this.#busy("connectionDetachIfFrom", () => this.runtime().detachConnectionIfFrom(tenantId, agentId, plugin, sealed, connectorId));
+  }
+
+  /** Another agent renewed a connector this agent's mount is on: take the new pair (cf/src/github-refresh.ts). */
+  async connectionAdopt(tenantId: string, agentId: string, plugin: string, connectorId: string) {
+    this.#claim(tenantId, agentId);
+    return this.#busy("connectionAdopt", () => this.runtime().adoptConnection(tenantId, agentId, plugin, connectorId));
   }
 
   async connectionDetach(tenantId: string, agentId: string, plugin: string) {
@@ -2798,6 +2807,30 @@ function githubConfig(env: Env): GithubConfig | null {
   return { clientId: env.GITHUB_CLIENT_ID, clientSecret: env.GITHUB_CLIENT_SECRET, redirectUri: `${env.UI_ORIGIN}/login/github/callback` };
 }
 
+/**
+ * What an agent's object renews its expiring GitHub tokens with (cf/src/github-refresh.ts): the OAuth App that
+ * issued them, the connectors in D1, and the other agents a connector's new pair has to reach. The other agents are
+ * told one by one and a failure is only logged: an agent that missed it renews on its own next 401.
+ */
+function githubRenewal(env: Env): RuntimeDeps["github"] {
+  const app = env.GITHUB_CLIENT_ID && env.GITHUB_CLIENT_SECRET ? { clientId: env.GITHUB_CLIENT_ID, clientSecret: env.GITHUB_CLIENT_SECRET } : null;
+  return {
+    app, grants: d1ConnectorGrants(env.CONTROL_DB),
+    async propagate(tenantId, connectorId, fromAgentId) {
+      const agents = d1ProvisionedAgents(env.CONTROL_DB);
+      for (const raftAgentId of await d1Connections(env.CONTROL_DB).boundTo(tenantId, connectorId)) {
+        const row = await agents.get(tenantId, raftAgentId);
+        if (!row || row.agentId === fromAgentId) continue;
+        try {
+          await env.AGENT.get(env.AGENT.idFromName(agentObjectName(tenantId, row.agentId))).connectionAdopt(tenantId, row.agentId, CONNECTION_PLUGIN.github, connectorId);
+        } catch (e) {
+          logEvent("github.refresh", { tenantId, agentId: row.agentId, connectorId, outcome: "propagate-failed", reason: clip(String((e as Error)?.message ?? e)) });
+        }
+      }
+    },
+  };
+}
+
 /** The identity table, in the control plane (cf/src/control-plane.ts). */
 function identities(env: Env): IdentityDirectory {
   return d1Identities(env.CONTROL_DB);
@@ -2908,7 +2941,7 @@ async function handleLogin(request: Request, env: Env, url: URL): Promise<Respon
       }
       let profile, emails;
       try {
-        const token = await githubExchangeCode(cfg, code);
+        const token = (await githubExchangeCode(cfg, code)).grant.accessToken;
         ({ profile, emails } = await githubFetchProfile(token));
       } catch (e: any) {
         console.error("login: github exchange failed", String(e?.message ?? e));
@@ -3596,12 +3629,12 @@ function provisionDeps(env: Env): ProvisionDeps {
         registry: d1Connections(env.CONTROL_DB),
         link: (spec) => connectLink(env.UI_ORIGIN!, env.SESSION_SECRET!, spec, Date.now()),
         detach: (tenantId, agentId, provider) => stub(tenantId, agentId).connectionDetach(tenantId, agentId, CONNECTION_PLUGIN[provider]),
-        confirm: (tenantId, agentId, provider, pending, raftUserId) =>
-          stub(tenantId, agentId).connectionConfirm(tenantId, agentId, CONNECTION_PLUGIN[provider], pending, raftUserId),
-        detachIfFrom: (tenantId, agentId, provider, sealed) =>
-          stub(tenantId, agentId).connectionDetachIfFrom(tenantId, agentId, CONNECTION_PLUGIN[provider], sealed),
-        attach: (tenantId, agentId, provider, sealed) =>
-          stub(tenantId, agentId).connectionAttach(tenantId, agentId, CONNECTION_PLUGIN[provider], sealed),
+        confirm: (tenantId, agentId, provider, pending, raftUserId, connectorId) =>
+          stub(tenantId, agentId).connectionConfirm(tenantId, agentId, CONNECTION_PLUGIN[provider], pending, raftUserId, connectorId),
+        detachIfFrom: (tenantId, agentId, provider, sealed, connectorId) =>
+          stub(tenantId, agentId).connectionDetachIfFrom(tenantId, agentId, CONNECTION_PLUGIN[provider], sealed, connectorId),
+        attach: (tenantId, agentId, provider, sealed, refresh) =>
+          stub(tenantId, agentId).connectionAttach(tenantId, agentId, CONNECTION_PLUGIN[provider], sealed, refresh),
         connectors: d1Connectors(env.CONTROL_DB),
         newId: () => `con_${crypto.randomUUID().replace(/-/g, "").slice(0, 20)}`,
       },

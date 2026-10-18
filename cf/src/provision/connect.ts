@@ -23,6 +23,7 @@
 import { clip, logEvent } from "../../../src/core/log.ts";
 import { constantTimeEqual, cookieHeader, clearCookieHeader, GITHUB_AUTHORIZE, open, randomToken, readCookie, seal } from "../auth.ts";
 import type { ConnectionRegistry } from "../control-plane.ts";
+import type { GithubGrant } from "../github-token.ts";
 
 export const CONNECTION_PROVIDERS = ["github"] as const;
 export type ConnectionProvider = typeof CONNECTION_PROVIDERS[number];
@@ -85,10 +86,11 @@ export interface ConnectDeps {
   secret: string;
   github: { clientId: string; clientSecret: string };
   registry: Pick<ConnectionRegistry, "consumeLink">;
-  /** Keep the token sealed in the agent's own object until Raft confirms who finished the flow. */
-  hold(tenantId: string, agentId: string, plugin: string, token: string, id: string, exp: number, raftUserId: string):
+  /** Keep the grant sealed in the agent's own object until Raft confirms who finished the flow. */
+  hold(tenantId: string, agentId: string, plugin: string, grant: GithubGrant, id: string, exp: number, raftUserId: string):
     Promise<{ ok: true } | { ok: false; error: string }>;
-  exchange(code: string, redirectUri: string): Promise<string>;
+  /** The grant behind a code, and the names of the keys GitHub's answer carried (never their values). */
+  exchange(code: string, redirectUri: string): Promise<{ grant: GithubGrant; keys: string[] }>;
   now(): number;
 }
 
@@ -152,16 +154,22 @@ export async function connectCallback(request: Request, url: URL, deps: ConnectD
   if (url.searchParams.get("error")) { said("denied", clip(url.searchParams.get("error"))); return done(back(link, "denied")); }
   const code = url.searchParams.get("code");
   if (!code) { said("failed", "no_code"); return done(back(link, "failed", { reason: "no_code" })); }
-  let token: string;
+  let grant: GithubGrant;
   try {
-    token = await deps.exchange(code, new URL(CONNECT_CALLBACK_PATH, deps.origin).toString());
+    const got = await deps.exchange(code, new URL(CONNECT_CALLBACK_PATH, deps.origin).toString());
+    grant = got.grant;
+    // Which kind of token this App hands out, read from the answer itself: an expiring one carries
+    // `expires_in` and `refresh_token`. Key names only.
+    logEvent("connect.exchange", {
+      tenantId: link.tenantId, agentId: link.agentId, provider: link.provider, keys: got.keys.join(" "), expiring: grant.expiresAt !== null,
+    });
   } catch (e) {
     console.error(`connect: ${link.provider} exchange failed for ${link.tenantId}/${link.agentId}: ${String((e as Error)?.message ?? e).slice(0, 200)}`);
     said("failed", "exchange");
     return done(back(link, "failed", { reason: "exchange" }));
   }
   const id = randomToken(18);
-  const held = await deps.hold(link.tenantId, link.agentId, CONNECTION_PLUGIN[link.provider], token, id, deps.now() + CONNECT_HOLD_TTL_MS, link.raftUserId);
+  const held = await deps.hold(link.tenantId, link.agentId, CONNECTION_PLUGIN[link.provider], grant, id, deps.now() + CONNECT_HOLD_TTL_MS, link.raftUserId);
   if (!held.ok) {
     console.error(`connect: holding ${link.provider} for ${link.tenantId}/${link.agentId} failed: ${held.error}`);
     said("failed", "hold");

@@ -1776,7 +1776,7 @@ await check("rules: a subagent may call only declared reads and a self-acting pl
   }
   // The ones that act as the agent by name, as the review listed them: GitHub writes, an HTTP send, the sandbox shell, raft.
   const by = (id: string) => rt.plugins().find((p) => p.id === id)!;
-  for (const [plugin, tool] of [["github", "api"], ["github", "issue_comment"], ["http", "send"], ["sandbox", "shell"], ["sandbox", "run"], ["raft", "messages_send"], ["state", "secret_put"]] as const) {
+  for (const [plugin, tool] of [["github", "api"], ["github", "issue_comment"], ["http", "send"], ["sandbox", "shell"], ["sandbox", "run"], ["raft", "messages_send"], ["raft", "attachments_upload"], ["state", "secret_put"]] as const) {
     const t = (by(plugin).tools as any[]).find((x) => x.name === tool);
     must(t && !childMayCall(t, by(plugin).actsAs), `${plugin}.${tool} is callable by a subagent`);
   }

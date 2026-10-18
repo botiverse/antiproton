@@ -176,7 +176,10 @@ export function hostCallOpts(call: { opts?: unknown; callId?: string }): InvokeO
   };
 }
 import type { MountPolicy, MountRecord } from "../../src/core/types.ts";
-import type { HookDirectory, HookRow } from "./control-plane.ts";
+import type { ConnectorGrants, ConnectorRefresh, HookDirectory, HookRow } from "./control-plane.ts";
+import { GithubRefresher, RECONNECT_REASON, type GithubApp, type MountGrant } from "./github-refresh.ts";
+import { REFRESH_SKEW_MS } from "./github-token.ts";
+import type { GithubGrant } from "./github-token.ts";
 import { appendUsage, jsRunRows, modelTokenRows } from "../../src/usage/outbox.ts";
 import {
   finishPrewarm, firstTurnDone, firstTurnOf, inFirstTurn, markFirstTurnDone, PREWARM_USER_TEXT, prewarmable, prewarmJobId,
@@ -622,21 +625,27 @@ function holdEnded(sql: any, tenantId: string, agentId: string, h: ImportHold) {
 }
 
 /** Same surface the SigV4 client exposes, backed by the R2 binding instead. */
-class BoundArtifacts {
+export class BoundArtifacts {
   #bucket: R2Bucket;
   #name: string;
   constructor(bucket: R2Bucket, name: string) {
     this.#bucket = bucket;
     this.#name = name;
   }
-  async put(key: string, body: string | Uint8Array) {
+  /** `contentType` is kept as the object's metadata, as the SigV4 client sends it, so a reader can say what a file was stored as. */
+  async put(key: string, body: string | Uint8Array, contentType?: string) {
     const bytes = typeof body === "string" ? new TextEncoder().encode(body) : body;
-    await this.#bucket.put(key, bytes);
+    await this.#bucket.put(key, bytes, contentType ? { httpMetadata: { contentType } } : undefined);
     return { ref: `r2://${this.#name}/${key}`, etag: "", bytes: bytes.byteLength };
   }
   /** Remove objects nothing names any more (a workspace import that did not land, `importWorkspace`). */
   async delete(keys: string[]) {
     if (keys.length) await this.#bucket.delete(keys);
+  }
+  /** An object's size, read from its metadata without its body; null when there is none. */
+  async head(key: string): Promise<{ bytes: number } | null> {
+    const obj = await this.#bucket.head(key);
+    return obj ? { bytes: obj.size } : null;
   }
   async get(key: string): Promise<Uint8Array> {
     const obj = await this.#bucket.get(key);
@@ -644,6 +653,18 @@ class BoundArtifacts {
     // message reaches the model through the reader's error.
     if (!obj) throw new Error("no such artifact");
     return new Uint8Array(await obj.arrayBuffer());
+  }
+  /** The stored object's length, read without its body; null when there is no such object. */
+  async size(key: string): Promise<number | null> {
+    const obj = await this.#bucket.head(key);
+    return obj ? obj.size : null;
+  }
+  /** `get`, with the content type the object was stored with (`put`), when it has one. */
+  async getObject(key: string): Promise<{ bytes: Uint8Array; contentType?: string }> {
+    const obj = await this.#bucket.get(key);
+    if (!obj) throw new Error("no such artifact");
+    const contentType = obj.httpMetadata?.contentType;
+    return { bytes: new Uint8Array(await obj.arrayBuffer()), ...(contentType ? { contentType } : {}) };
   }
 }
 
@@ -677,6 +698,16 @@ export interface RuntimeDeps {
   /** reminder-app's origin and this deployment's client credential there, handed to the `reminder` plugin when it is
    *  built: deployment configuration, not a mount's credential. Either absent means its tools refuse and send nothing. */
   reminderApp?: { origin?: string; credential?: string };
+  /**
+   * Renewing expiring GitHub user tokens (cf/src/github-refresh.ts): the OAuth App that issued them, the tenant
+   * connectors they are shared through, and how a connector's new pair reaches the other agents pointed at it.
+   * Absent: an expiring token is kept as it came and dies with its 8 hours, as before #935.
+   */
+  github?: {
+    app: GithubApp | null;
+    grants?: ConnectorGrants;
+    propagate?(tenantId: string, connectorId: string, fromAgentId: string): Promise<void>;
+  };
   /** The key under which per-agent secrets are sealed at rest: 32 bytes,
    *  base64, a Worker secret. Absent means `agent:` references cannot be
    *  stored or resolved, and the credential form says so. */
@@ -1170,6 +1201,8 @@ export class AgentRuntime {
   /** Programs suspended at a pause, for every session of this agent; memory only (run-js-resume.ts). */
   #continuations: RunJsContinuations;
   #artifacts: BoundArtifacts;
+  /** Renewals of this object's expiring GitHub tokens (cf/src/github-refresh.ts). */
+  #oauth: GithubRefresher;
   #ready = false;
 
   constructor(deps: RuntimeDeps) {
@@ -1186,7 +1219,7 @@ export class AgentRuntime {
       sandboxPlugin(this.#artifacts as any, deps.bucketName, deps.idle ?? null),
       // The key is read when a secret tool runs, not now: `#kek` is set a few lines below.
       statePlugin(this.store, this.#artifacts as any, deps.bucketName, () => this.#kek),
-      artifactsPlugin(this.#artifacts as any, deps.bucketName),
+      artifactsPlugin(this.#artifacts, deps.bucketName),
       createRaftPlugin({ artifacts: this.#artifacts }),
       mcpPlugin,
       createReminderPlugin({ serviceUrl: deps.reminderApp?.origin, clientCredential: deps.reminderApp?.credential }),
@@ -1202,12 +1235,26 @@ export class AgentRuntime {
     const kekPromise = deps.secretKek ? importKek(deps.secretKek) : Promise.resolve(null);
     const operator = { resolve: (ref: string) => resolveOperatorRef(ref, deps, (r) => envSecrets.resolve(r)) };
     this.#kek = kekPromise;
+    this.#oauth = new GithubRefresher({
+      store: this.store, kek: kekPromise, sql: deps.ctx.storage.sql,
+      app: deps.github?.app ?? null, grants: deps.github?.grants, propagate: deps.github?.propagate,
+      waitUntil: (p) => deps.ctx.waitUntil?.(p),
+    });
     this.#secrets = {
-      resolve: async (ref, scope, opts) => agentSecrets(this.store, await kekPromise, operator).resolve(ref, scope, opts),
+      resolve: async (ref, scope, opts) => {
+        // Every reader of a mount's key comes through here — a tool call, the sandbox's egress before each
+        // command, a program's calls — so an expiring one is renewed here, before it is handed out.
+        if (isAgentRef(ref) && scope && deps.github) {
+          try { await this.#oauth.beforeUse(scope.tenantId, scope.agentId, ref.slice(agentRef("").length)); }
+          catch (e) { console.error("github: renewing before use failed:", String((e as Error)?.message ?? e).slice(0, 200)); }
+        }
+        return agentSecrets(this.store, await kekPromise, operator).resolve(ref, scope, opts);
+      },
     };
     // The operator's catalogue, told to the kernel rather than read by it.
     this.#gateway = new ToolGateway(this.store, plugins, SEEDED_PLUGINS, this.#secrets,
-      deps.hooks ? (tenantId, agentId, alias) => this.#inboundFor(tenantId, agentId, alias) : undefined);
+      deps.hooks ? (tenantId, agentId, alias) => this.#inboundFor(tenantId, agentId, alias) : undefined,
+      deps.github ? { credentialRejected: (scope, name, token) => this.#oauth.rejected(scope.tenantId, scope.agentId, name, token) } : {});
     this.#executor = new DynamicWorkerExecutor({
       loader: deps.loader,
       makeToolBinding: deps.makeToolBinding,
@@ -1662,6 +1709,9 @@ export class AgentRuntime {
     const sealed = await seal(kek, value);
     const name = alias;
     await this.store.putSecret(tenantId, agentId, name, { ciphertext: sealed.ciphertext, iv: sealed.iv });
+    // A key put here is renewed by nothing: what renewed the one it replaces goes with it. A connection's own
+    // attach writes it again afterwards (`attachSealedConnection`).
+    await this.#oauth.forget(tenantId, agentId, name);
     await this.store.setMountSecretRef(tenantId, agentId, alias, agentRef(name));
     if (check?.ok) {
       await this.store.putSecret(tenantId, agentId, name, {
@@ -1799,7 +1849,7 @@ export class AgentRuntime {
    * are cleared each time a new one is held. On these rows the `account` column holds the Raft user
    * the flow was started for, not an account the credential grants: they are never a mount's credential.
    */
-  async holdConnection(tenantId: string, agentId: string, plugin: string, token: string, id: string, exp: number, raftUserId: string):
+  async holdConnection(tenantId: string, agentId: string, plugin: string, grant: GithubGrant | string, id: string, exp: number, raftUserId: string):
     Promise<{ ok: true } | { ok: false; error: string }> {
     await this.ready();
     const kek = await this.#kek;
@@ -1808,7 +1858,8 @@ export class AgentRuntime {
     for (const r of await this.store.listSecretNames(tenantId, agentId, "pending:")) {
       if (Number(r.name.split(":")[2]) <= now) await this.store.removeSecret(tenantId, agentId, r.name);
     }
-    const sealed = await seal(kek, token);
+    // The whole grant, as JSON: an expiring token's refresh token and lifetimes have to reach the mount with it.
+    const sealed = await seal(kek, typeof grant === "string" ? grant : JSON.stringify({ v: 1, ...grant }));
     await this.store.putSecret(tenantId, agentId, `pending:${plugin}:${exp}:${id}`, { ciphertext: sealed.ciphertext, iv: sealed.iv, account: raftUserId });
     return { ok: true };
   }
@@ -1817,8 +1868,8 @@ export class AgentRuntime {
    * Make a held connection the credential of this agent's mount of that plugin: once, before it expires,
    * and only for the Raft user it was held for. The held row goes whatever the outcome.
    */
-  async confirmConnection(tenantId: string, agentId: string, plugin: string, id: string, raftUserId: string):
-    Promise<{ ok: true; account: string | null; sealed: Sealed } | { ok: false; error: string; missing?: true }> {
+  async confirmConnection(tenantId: string, agentId: string, plugin: string, id: string, raftUserId: string, connectorId: string | null = null):
+    Promise<{ ok: true; account: string | null; sealed: Sealed; refresh: ConnectorRefresh | null } | { ok: false; error: string; missing?: true }> {
     await this.ready();
     const kek = await this.#kek;
     if (!kek) return { ok: false, error: "this deployment has no SECRET_KEK, so it cannot keep a credential" };
@@ -1830,13 +1881,29 @@ export class AgentRuntime {
     if (!meta || !sealed || Number(row.name.split(":")[2]) <= Date.now() || meta.account !== raftUserId) {
       return { ok: false, error: "no such pending connection", missing: true };
     }
-    // Handed back sealed: the connection it becomes is the tenant's (cf/migrations/0012_connectors.sql).
-    const r = await this.attachSealedConnection(tenantId, agentId, plugin, sealed);
-    return r.ok ? { ...r, sealed: { ciphertext: sealed.ciphertext, iv: sealed.iv } } : r;
+    // A hold from before #935 is the bare token; one since is the grant as JSON. A token never begins with "{".
+    const held = await open(kek, sealed);
+    const grant: GithubGrant = held.startsWith("{")
+      ? JSON.parse(held) as GithubGrant
+      : { accessToken: held, refreshToken: null, expiresAt: null, refreshExpiresAt: null };
+    const access = await seal(kek, grant.accessToken);
+    const refresh: ConnectorRefresh | null = grant.refreshToken
+      ? { sealed: await seal(kek, grant.refreshToken), expiresAt: grant.expiresAt, refreshExpiresAt: grant.refreshExpiresAt }
+      : null;
+    // Handed back sealed: the connection it becomes is the tenant's (cf/migrations/0012_connectors.sql), under the
+    // id the caller is about to create it with, which is how this mount finds the pair when it needs renewing.
+    const r = await this.attachSealedConnection(tenantId, agentId, plugin, access, refresh ? { ...refresh, connectorId } : null, grant);
+    return r.ok ? { ...r, sealed: access, refresh } : r;
   }
 
-  /** A connection's credential, sealed under this deployment's key, onto this agent's one mount of that plugin. */
-  async attachSealedConnection(tenantId: string, agentId: string, plugin: string, sealed: Sealed):
+  /**
+   * A connection's credential, sealed under this deployment's key, onto this agent's one mount of that plugin, with
+   * what renews it when it expires (`refresh`; null for a token that does not). A connector's token that is about to
+   * expire is renewed through the connector first: GitHub refuses an expired one at the attach's own check.
+   * `grant` is the pair in the clear, when the caller already opened it.
+   */
+  async attachSealedConnection(tenantId: string, agentId: string, plugin: string, sealed: Sealed,
+    refresh: (ConnectorRefresh & { connectorId: string | null }) | null = null, grant?: GithubGrant):
     Promise<{ ok: true; account: string | null } | { ok: false; error: string }> {
     await this.ready();
     const kek = await this.#kek;
@@ -1846,8 +1913,36 @@ export class AgentRuntime {
     // More than one and the choice would be arbitrary; say so rather than attach to one of them.
     if (mounts.length > 1) return { ok: false, error: `this agent has ${mounts.length} ${plugin} mounts (${mounts.map((m) => m.alias).join(", ")}); connect one in the console` };
     const mount = mounts[0]!;
-    const r = await this.attachCredential(tenantId, agentId, mount.alias, { token: await open(kek, sealed) });
-    return r.ok ? { ok: true, account: r.account } : { ok: false, error: r.error };
+    let token = grant?.accessToken ?? await open(kek, sealed);
+    let rec: Omit<MountGrant, "v"> | null = refresh ? {
+      refreshToken: grant?.refreshToken ?? await open(kek, refresh.sealed),
+      expiresAt: refresh.expiresAt, refreshExpiresAt: refresh.refreshExpiresAt, connectorId: refresh.connectorId,
+    } : null;
+    if (rec && rec.connectorId && rec.expiresAt !== null && rec.expiresAt - Date.now() < REFRESH_SKEW_MS) {
+      const r = await this.#oauth.connectorPair(tenantId, rec.connectorId);
+      if (!r.ok) return { ok: false, error: r.broken ? `${RECONNECT_REASON} (${r.reason})` : `the connection could not be renewed: ${r.reason}` };
+      token = r.accessToken;
+      rec = { ...rec, refreshToken: r.refreshToken, expiresAt: r.expiresAt, refreshExpiresAt: r.refreshExpiresAt };
+    }
+    const r = await this.attachCredential(tenantId, agentId, mount.alias, { token });
+    if (!r.ok) return { ok: false, error: r.error };
+    // After the attach, which clears it: the attach is what wrote the mount's secret this renews.
+    await this.#oauth.remember(tenantId, agentId, mount.alias, rec);
+    return { ok: true, account: r.account };
+  }
+
+  /**
+   * Take the pair another agent's renewal stored on a connector this agent's mount was pointed at: GitHub spent the
+   * access token this mount holds when it handed out the new one, and the sandbox's egress has no 401 to learn it
+   * from. False when the mount is not on that connector (any more).
+   */
+  async adoptConnection(tenantId: string, agentId: string, plugin: string, connectorId: string): Promise<boolean> {
+    await this.ready();
+    const mount = (await this.store.findMountsByPlugin(tenantId, agentId, plugin))[0];
+    if (!mount || !isAgentRef(mount.secretRef)) return false;
+    const name = mount.secretRef!.slice(agentRef("").length);
+    if ((await this.#oauth.read(tenantId, agentId, name))?.connectorId !== connectorId) return false;
+    return (await this.#oauth.renew(tenantId, agentId, name, "adopt", null)).ok;
   }
 
   /** Remove the credential from this agent's mount of that plugin; false when there was none. */
@@ -1862,13 +1957,17 @@ export class AgentRuntime {
    * since, in the console, is not the connector's to take when the connector goes. Compared by value,
    * because each attach seals afresh and the ciphertexts never match.
    */
-  async detachConnectionIfFrom(tenantId: string, agentId: string, plugin: string, sealed: Sealed): Promise<boolean> {
+  async detachConnectionIfFrom(tenantId: string, agentId: string, plugin: string, sealed: Sealed, connectorId: string | null = null): Promise<boolean> {
     await this.ready();
     const kek = await this.#kek;
     const mount = (await this.store.findMountsByPlugin(tenantId, agentId, plugin))[0];
     if (!kek || !mount || !isAgentRef(mount.secretRef)) return false;
-    const held = await this.store.getSecret(tenantId, agentId, mount.secretRef!.slice(agentRef("").length));
-    if (!held || await open(kek, held) !== await open(kek, sealed)) return false;
+    const name = mount.secretRef!.slice(agentRef("").length);
+    // A renewed connector's token differs from the copy a mount took before the renewal reached it, so the mount
+    // is also the connector's while what renews it names that connector: a key put there since cleared that.
+    const renewedFrom = connectorId !== null && (await this.#oauth.read(tenantId, agentId, name))?.connectorId === connectorId;
+    const held = await this.store.getSecret(tenantId, agentId, name);
+    if (!held || (!renewedFrom && await open(kek, held) !== await open(kek, sealed))) return false;
     return this.removeCredential(tenantId, agentId, mount.alias);
   }
 
@@ -1895,6 +1994,7 @@ export class AgentRuntime {
     const held = await this.#releaseBeforeCredentialChange(tenantId, agentId, alias);
     if (held) return { ok: false, error: held };
     await this.store.removeSecret(tenantId, agentId, alias);
+    await this.#oauth.forget(tenantId, agentId, alias);
     await this.store.setMountSecretRef(tenantId, agentId, alias, AgentRuntime.seededSecretRef(mount));
     await this.#toolsAfterCredentialChange(tenantId, agentId, alias);
     return { ok: true };
@@ -2031,6 +2131,8 @@ export class AgentRuntime {
     const r = await this.store.renameMount(tenantId, agentId, from, to, own ? { newRef: agentRef(to) } : null);
     // The last snapshot error is keyed by the alias too, and is about the same mount under its new name.
     if (r.ok) this.#snapshotErrors()?.exec("UPDATE mount_snapshot_errors SET alias = ? WHERE alias = ?", to, from);
+    // What renews the key is named after it, and the key moved.
+    if (r.ok && own) await this.#oauth.move(tenantId, agentId, from, to);
     return r;
   }
 
@@ -2957,6 +3059,8 @@ export class AgentRuntime {
     if (!(await this.store.removeMount(tenantId, agentId, alias, shared ? null : alias, mount.installationId))) {
       return refuse(changedWhileRemoving(alias));
     }
+    // What renewed the row just deleted goes with it.
+    if (!shared) await this.#oauth.forget(tenantId, agentId, alias);
     this.#unchecked.delete(`${tenantId}/${agentId}/${alias}`);
     const warned = sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='held_warnings'").toArray().length > 0;
     if (warned) sql.exec("DELETE FROM held_warnings WHERE alias = ?", alias);
