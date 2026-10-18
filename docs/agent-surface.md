@@ -813,7 +813,13 @@ botiverse/slock#10130 and #10134). Every other Raft POST leaves it out.
   starts in an empty conversation. The run's own state keeps ids, revision, counters, the deadline and the outcome. A
   result waiting for a retry keeps its bytes only until the retry succeeds or gives up. Nothing of a run is written to
   R2: model calls are handed to the queue by id, trace rows carry no content, and the daily friction scan reads none
-  of this agent's conversations. The only copy left anywhere is the result Raft accepted.
+  of this agent's conversations. The only copy left anywhere is the result Raft accepted. The erase is crash-safe:
+  the run's end and the request to erase are written together, and any later wake or replay asks again (erasing an
+  empty conversation does nothing). An operator's fresh context erases this agent's conversation instead of archiving
+  it, and `/admin/reset-session?rebuild=1` is refused, since its briefing would copy it.
+  Out of scope, by decision: hashes and lengths of the material (`model_request_prefix`, `model_input_digests`), which
+  are not copies; and platform-level copies this code cannot reach — SQLite free pages in the Durable Object, Cloudflare's
+  point-in-time recovery of D1 and Durable Objects, and the model provider, which receives the material to answer it.
 - **What it needs from Raft.** The provider's credential check and push registration (`GET /internal/agent-api`,
   `PUT /internal/agent-api/push-webhook`, and `DELETE` of it on a delete) are refused to the service identity by the
   contract as merged (`raftbench_read_only`); until Raft allows them, the create answers `422 credential_refused`, and
