@@ -214,7 +214,7 @@ await check("an animated WebP (the VP8X animation flag) is refused; the same hea
 // ---- limits ------------------------------------------------------------------------------------------------------
 
 await check("the byte limit: exactly VIEW_MAX_BYTES is shown, one byte more is refused with both sizes said", async () => {
-  must(VIEW_MAX_BYTES === 1.5 * 1024 * 1024 && VIEW_MAX_SIDE === 2000, `limits: ${VIEW_MAX_BYTES} ${VIEW_MAX_SIDE}`);
+  must(VIEW_MAX_BYTES === 1.5 * 1024 * 1024 && VIEW_MAX_SIDE === 2048, `limits: ${VIEW_MAX_BYTES} ${VIEW_MAX_SIDE}`);
   const at = await view(png(100, 100, VIEW_MAX_BYTES));
   must(at.view.bytes === VIEW_MAX_BYTES && at.bytes === VIEW_MAX_BYTES, JSON.stringify(at));
   const store = fakeArtifacts();
@@ -223,13 +223,16 @@ await check("the byte limit: exactly VIEW_MAX_BYTES is shown, one byte more is r
   must(why.message.includes("not resized") && why.message.includes("It was kept as artifact://raft/attachments/att-1/big.png.") && store.puts.length === 1, why.message);
 });
 
-await check("the side limit: 2000×2000 is shown; 2001 on either side is refused with the dimensions and the limit said", async () => {
+await check("the side limit: 2048×2048 is shown; 2049 on either side is refused with the dimensions and the limit said", async () => {
   const at = await view(png(VIEW_MAX_SIDE, VIEW_MAX_SIDE));
-  must(at.view.width === 2000 && at.view.height === 2000, JSON.stringify(at));
-  for (const [w, h] of [[2001, 10], [10, 2001]]) {
+  must(at.view.width === 2048 && at.view.height === 2048, JSON.stringify(at));
+  // The size that was refused at the old 2000 px cap: a phone screenshot.
+  const shot = await view(jpeg(1449, 2048));
+  must(shot.view.width === 1449 && shot.view.height === 2048, JSON.stringify(shot));
+  for (const [w, h] of [[2049, 10], [10, 2049]]) {
     for (const body of [png(w, h), jpeg(w, h), webpLossless(w, h), gif(w, h)]) {
       const why = await failure(() => view(body));
-      must(why.message.includes(`${w}×${h} px, over the 2000 px limit on a side`), `${w}×${h}: ${why.message}`);
+      must(why.message.includes(`${w}×${h} px, over the 2048 px limit on a side`), `${w}×${h}: ${why.message}`);
     }
   }
   // Both over at once: both said.
@@ -408,7 +411,7 @@ await check("toolsBasis moved with the view, so a snapshot taken without it is r
 
 await check("the description says what it shows, the limits, and where other files go; the schema is the download's", async () => {
   const tool = withStorage.tools.find((t) => t.name === VIEW_TOOL)!;
-  for (const term of ["image attachment", "look at it", "PNG, JPEG, WebP or a still GIF", "1.5 MiB", "2000 px", "attachments_download_url"]) {
+  for (const term of ["image attachment", "look at it", "PNG, JPEG, WebP or a still GIF", "1.5 MiB", "2048 px", "attachments_download_url"]) {
     must(tool.summary.includes(term), `missing ${term}: ${tool.summary}`);
   }
   const download = withStorage.tools.find((t) => t.name === "attachments_download_url")!;

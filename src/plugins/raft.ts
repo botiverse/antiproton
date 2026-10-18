@@ -2130,12 +2130,14 @@ async function keepAttachment(
  */
 export const VIEW_TOOL = "attachments_view";
 /**
- * The largest image `attachments_view` shows: 1.5 MiB of file and 2000 px a side. Nothing here resizes or re-encodes
+ * The largest image `attachments_view` shows: 1.5 MiB of file and 2048 px a side. 2048 because a phone screenshot is
+ * often exactly that tall (1449x2048 was refused at 2000), and it stays far under the 8192 px a provider accepts
+ * (src/model/images.ts `MAX_IMAGE_SIDE`). Nothing here resizes or re-encodes
  * (the Worker has no image library), so an image over either is refused with its size and the limit, and the agent is
  * left the stored file.
  */
 export const VIEW_MAX_BYTES = 1.5 * 1024 * 1024;
-export const VIEW_MAX_SIDE = 2000;
+export const VIEW_MAX_SIDE = 2048;
 
 /** What `imageHeader` read: a still image of a type `attachments_view` shows, or what the bytes are instead. */
 export type ImageHeader =
