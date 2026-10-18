@@ -415,7 +415,7 @@ await check("messages render as messages_read's lines, in seq order, with the pa
       hasMore: true, hasOlder: true, hasNewer: false,
     } },
   });
-  const plugin = createRaftPlugin({ assistant: wire, artifacts: { async put() { throw new Error("test: nothing should be stored"); } } });
+  const plugin = createRaftPlugin({ assistant: wire, artifacts: { async put() { throw new Error("test: nothing should be stored"); }, async get() { throw new Error("test: nothing should be read"); } } });
   must(plugin.tools.some((t) => t.name === "attachments_download_url"), "control: this plugin offers the download");
   // And this mount's list has it, so nothing but the owner read itself decides that the line not name it.
   const lines = String(await plugin.invoke(MESSAGES, { channelId: "ch-1" }, ctx([...ASSISTANT, "attachments_download_url"]).ctx)).split("\n");

@@ -19,7 +19,7 @@ import { bridgeTools, offeredToolName, qualifyMountedTools, runJsTool, type Moun
  * The plugin as the runtime builds it (cf/src/runtime.ts): with object storage, so the attachment download is offered.
  * The module's `raftPlugin` has none, and so does not offer it (`raftWithoutStorage`, held below).
  */
-const raftPlugin = createRaftPlugin({ artifacts: { async put() { throw new Error("test: nothing should be stored here"); } } });
+const raftPlugin = createRaftPlugin({ artifacts: { async put() { throw new Error("test: nothing should be stored here"); }, async get() { throw new Error("test: nothing should be read here"); } } });
 
 const originalFetch = globalThis.fetch;
 const PUSH_SECRET = "raft-push-secret-for-tests";
@@ -147,6 +147,8 @@ const OWN = ["receive_events", "enable_push", "disable_push", "push_status", "in
 const ASSISTANT = ["assistant_owner_inbox", "assistant_owner_messages"];
 /** The image view: hand-written, and offered exactly where the download is (test/raft-attachments-view.ts holds it). */
 const VIEW = "attachments_view";
+/** The upload: hand-written, offered with storage to a credential holding `send` (test/raft-attachments-upload.ts holds it). */
+const UPLOAD = "attachments_upload";
 /** What a mount with no snapshot is offered: every tool of the plugin but the assistant's. */
 const fallbackNames = () => raftPlugin.tools.map((t) => t.name).filter((n) => !ASSISTANT.includes(n));
 const toolNamed = (name: string) => raftPlugin.tools.find((t) => t.name === name);
@@ -219,7 +221,7 @@ await check("every manifest operation is a generated tool or in the exclusion ta
   const generated = GENERATED.map((op) => op.name);
   if (JSON.stringify(generated) !== JSON.stringify(names.filter((n) => EXPECTED_GENERATED.includes(n)))) throw new Error(`generated: ${generated.join(", ")}`);
   const offered = raftPlugin.tools.map((t) => t.name);
-  const want = [...OWN, ...RAFT_OPERATIONS.filter((op) => EXPECTED_GENERATED.includes(op.name)).map((op) => op.toolName), VIEW, ...ASSISTANT];
+  const want = [...OWN, ...RAFT_OPERATIONS.filter((op) => EXPECTED_GENERATED.includes(op.name)).map((op) => op.toolName), VIEW, UPLOAD, ...ASSISTANT];
   if (JSON.stringify(offered) !== JSON.stringify(want)) throw new Error(`offered: ${offered.join(", ")}`);
   if (new Set(offered).size !== offered.length) throw new Error("two tools share a name");
 });
@@ -2131,7 +2133,8 @@ function context(capabilities: string[]) {
 /** What a snapshot lists under `caps`: the generated tools they reach, and attachments_view after them wherever the download is. */
 const allowedBy = (caps: string[]) => {
   const generated = GENERATED.filter((op) => op.capability.every((c) => caps.includes(c))).map((op) => op.toolName);
-  return generated.includes("attachments_download_url") ? [...generated, VIEW] : generated;
+  const withView = generated.includes("attachments_download_url") ? [...generated, VIEW] : generated;
+  return caps.includes("send") ? [...withView, UPLOAD] : withView;
 };
 
 await check("a mount's snapshot lists only the operations whose every capability its credential holds", async () => {
@@ -3460,7 +3463,7 @@ await check("a person's words that name an unoffered tool come back as written f
 /** Object storage as the runtime hands it to a plugin: what was put, under which key, with which type. */
 function fakeArtifacts() {
   const puts: Array<{ key: string; body: Uint8Array; type?: string }> = [];
-  return { puts, async put(key: string, body: Uint8Array, type?: string) { puts.push({ key, body, type }); return { ref: `r2://bucket/${key}`, bytes: body.byteLength }; } };
+  return { puts, async put(key: string, body: Uint8Array, type?: string) { puts.push({ key, body, type }); return { ref: `r2://bucket/${key}`, bytes: body.byteLength }; }, async get(): Promise<Uint8Array> { throw new Error("no such artifact"); } };
 }
 const PRESIGNED = "https://storage.example/obj/plan.pdf?X-Amz-Signature=deadbeefSIGNATURE";
 const FILE = new TextEncoder().encode("%PDF-1.7 the plan");
@@ -3730,7 +3733,7 @@ await check("a storage redirect is a failure: the Location is never fetched, not
 await check("a stored reference outside this agent's scope is refused: the call fails cleanly, shows no reference, and carries no URL", async () => {
   for (const ref of ["r2://bucket/t/other-tenant/agent/raft/attachments/att-1/plan.pdf", "r2://bucket/t/tenant/agent/raft/../../x/plan.pdf", "not-a-ref"]) {
     const puts: string[] = [];
-    const elsewhere = { async put(key: string, body: Uint8Array) { puts.push(key); return { ref, bytes: body.byteLength }; } };
+    const elsewhere = { async put(key: string, body: Uint8Array) { puts.push(key); return { ref, bytes: body.byteLength }; }, async get(): Promise<Uint8Array> { throw new Error("no such artifact"); } };
     attachmentServer();
     let lines: string[] = [];
     let out: unknown;
@@ -4074,8 +4077,9 @@ await check("the basis covers each tool's name and the capability it needs, in a
   const base = toolsBasisOf(tools);
   // attachments_view counts with the download's capability, since a snapshot lists it exactly where it lists the download.
   const view = { name: VIEW, capability: opNamed("attachments.downloadUrl").capability };
+  const upload = { name: UPLOAD, capability: ["send"] };
   // FEATURES_BASIS stands for what a listing records beside the list (the Server's flags), not a tool.
-  must(toolsBasisOf([{ name: FEATURES_BASIS }, ...OWN.map((name) => ({ name })), ...ASSISTANT.map((name) => ({ name })), ...tools, view]) === raftPlugin.toolsBasis, `control: the plugin's basis is made this way: ${raftPlugin.toolsBasis}`);
+  must(toolsBasisOf([{ name: FEATURES_BASIS }, ...OWN.map((name) => ({ name })), ...ASSISTANT.map((name) => ({ name })), ...tools, view, upload]) === raftPlugin.toolsBasis, `control: the plugin's basis is made this way: ${raftPlugin.toolsBasis}`);
   // Same names and capabilities, other orders (the tools reversed, a capability list reversed): the same basis.
   const reordered = [...tools].reverse().map((t) => ({ ...t, capability: [...t.capability].reverse() }));
   must(toolsBasisOf(reordered) === base, "the order moved the basis");

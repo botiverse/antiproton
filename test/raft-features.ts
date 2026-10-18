@@ -19,7 +19,7 @@ import { systemPrompt } from "../src/runtime/pi-prompt.ts";
 import { promptContextFor, takeContextChange, type PromptContext } from "../src/runtime/prompt-context.ts";
 import type { Plugin } from "../src/plugins/types.ts";
 
-const raftPlugin = createRaftPlugin({ artifacts: { async put() { throw new Error("test: nothing should be stored here"); } } });
+const raftPlugin = createRaftPlugin({ artifacts: { async put() { throw new Error("test: nothing should be stored here"); }, async get() { throw new Error("test: nothing should be read here"); } } });
 const originalFetch = globalThis.fetch;
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void> | void) {
