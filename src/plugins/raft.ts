@@ -13,7 +13,7 @@ import { createHash } from "node:crypto";
 import { clip, logEvent, routeOf } from "../core/log.ts";
 import type { Json, MountRecord } from "../core/types.ts";
 import {
-  createRaft, hashRaftSendContent, isInterrupted, projectRaftMessage, RAFT_OPERATIONS, RAFT_STATE_SCHEMA, SeenFrontier,
+  createRaft, describeRaftRoute, hashRaftSendContent, isInterrupted, projectRaftMessage, RAFT_OPERATIONS, RAFT_STATE_SCHEMA, SeenFrontier,
   type Raft, type RaftInboxBatch, type RaftInterrupt, type RaftMessage, type RaftOperationSpec, type RaftState, type RaftStateStore, type RaftFailure,
 } from "@botiverse/raft-sdk";
 import { PARK_BYTES } from "./artifacts.ts";
@@ -25,7 +25,7 @@ import { internalHost } from "./http.ts";
 import { callMcp, isMcpTool, keptMcpOf, leftOut, listMcp, mcpClock, mcpLines, MCP_CALL_TIMEOUT_MS, MCP_CAPABILITY, MCP_KEY, MCP_PREFIX } from "./raft-mcp.ts";
 import { modelToolName } from "../runtime/pi-tools.ts";
 import { isSubagentSession } from "../runtime/subagent-session.ts";
-import { toAgentRef } from "../store/refs.ts";
+import { AGENT_REF, keyForRef, toAgentRef } from "../store/refs.ts";
 import {
   interrupt, originProblem,
   type ActivityEvent, type InboundEvent, type InboundResult, Interrupt, type ListedTools, type Plugin, type PluginContext,
@@ -484,7 +484,16 @@ function stateStore(ctx: PluginContext, last: { state?: RaftState } = {}): RaftS
  * `contextId` (an approved call's replay) has none: it is never held for a card, and a send makes one extra history
  * read for the conversation it shows after the receipt.
  */
-function raftFor(ctx: PluginContext, options: { state?: false; response?: (res: Response) => Response; timeoutMs?: number } = {}): Raft {
+function raftFor(ctx: PluginContext, options: {
+  state?: false; response?: (res: Response) => Response; timeoutMs?: number;
+  /**
+   * Requests to anywhere but the Raft server — the presigned PUT of the SDK's upload session, which it makes through
+   * this fetch — are checked as the download checks its URL (`presignedProblem`). A refused one is not sent: it is
+   * answered 400 here, which the SDK reads as a PUT that definitely failed and cancels the session, and the reason is
+   * left in `refused` for the caller to say.
+   */
+  presigned?: { refused?: PresignedProblem };
+} = {}): Raft {
   const last: { state?: RaftState } = {};
   return createRaft({
     serverUrl: baseUrl(ctx).origin, credential: requireCredential(ctx), hints: "tool",
@@ -494,6 +503,14 @@ function raftFor(ctx: PluginContext, options: { state?: false; response?: (res: 
       const started = Date.now();
       const u = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
       const line = { tenantId: ctx.caller.tenantId, agentId: ctx.caller.agentId, mount: ctx.alias, method: init?.method ?? "GET", route: routeOf(u.pathname) };
+      if (options.presigned && u.origin !== baseUrl(ctx).origin) {
+        const problem = presignedProblem(u);
+        if (problem) {
+          options.presigned.refused = problem;
+          logEvent("raft.call", { ...line, route: "(presigned)", status: null, ms: 0, error: `refused: ${problem}` });
+          return new Response(null, { status: 400 });
+        }
+      }
       let res: Response;
       try {
         res = await fetch(input, { ...init, redirect: "manual", signal: AbortSignal.timeout(options.timeoutMs ?? timeout(ctx)) });
@@ -2030,9 +2047,9 @@ function capped(res: Response, over: () => void): Response {
 async function fetchPresigned(url: string, ctx: PluginContext): Promise<Uint8Array> {
   let parsed: URL;
   try { parsed = new URL(url); } catch { throw new Error("Raft returned a download address that is not a URL; nothing was kept"); }
-  if (parsed.protocol !== "https:") throw new Error("Raft returned a download address that is not https; nothing was kept");
-  if (parsed.username || parsed.password) throw new Error("Raft returned a download address that carries a user name or password; nothing was fetched or kept");
-  if (internalHost(parsed.hostname)) throw new Error("Raft returned a download address on a private or local network; nothing was fetched or kept");
+  const problem = presignedProblem(parsed);
+  if (problem === "https") throw new Error("Raft returned a download address that is not https; nothing was kept");
+  if (problem) throw new Error(`Raft returned a download address ${PRESIGNED_PROBLEM[problem]}; nothing was fetched or kept`);
   let over = false;
   let res: Response;
   try {
@@ -2051,6 +2068,22 @@ async function fetchPresigned(url: string, ctx: PluginContext): Promise<Uint8Arr
     throw marked(new Error("the attachment's bytes stopped arriving; nothing was kept"), { transient: true });
   }
 }
+
+/**
+ * What is wrong with an address Raft minted for its storage (a presigned URL), by the rule `fetchPresigned` states:
+ * not https, a user name or password in it, or a host inward by construction (`internalHost`). Null when nothing is.
+ * Shared by the download's GET and the upload session's PUT (`raftFor`'s `presigned`), so both refuse the same URLs.
+ */
+type PresignedProblem = "https" | "userinfo" | "internal";
+function presignedProblem(url: URL): PresignedProblem | null {
+  if (url.protocol !== "https:") return "https";
+  if (url.username || url.password) return "userinfo";
+  if (internalHost(url.hostname)) return "internal";
+  return null;
+}
+const PRESIGNED_PROBLEM: Readonly<Record<PresignedProblem, string>> = {
+  https: "that is not https", userinfo: "that carries a user name or password", internal: "on a private or local network",
+};
 
 /** A storage path segment from a name someone chose: plain characters only, never `.`/`..` or empty. */
 function pathSegment(name: string, fallback: string): string {
@@ -2131,12 +2164,14 @@ async function keepAttachment(
  */
 export const VIEW_TOOL = "attachments_view";
 /**
- * The largest image `attachments_view` shows: 1.5 MiB of file and 2000 px a side. Nothing here resizes or re-encodes
+ * The largest image `attachments_view` shows: 1.5 MiB of file and 2048 px a side. 2048 because a phone screenshot is
+ * often exactly that tall (1449x2048 was refused at 2000), and it stays far under the 8192 px a provider accepts
+ * (src/model/images.ts `MAX_IMAGE_SIDE`). Nothing here resizes or re-encodes
  * (the Worker has no image library), so an image over either is refused with its size and the limit, and the agent is
  * left the stored file.
  */
 export const VIEW_MAX_BYTES = 1.5 * 1024 * 1024;
-export const VIEW_MAX_SIDE = 2000;
+export const VIEW_MAX_SIDE = 2048;
 
 /** What `imageHeader` read: a still image of a type `attachments_view` shows, or what the bytes are instead. */
 export type ImageHeader =
@@ -2306,6 +2341,113 @@ const VIEW_SCHEMA: ToolSchema = {
 };
 
 /**
+ * `attachments_upload`: a file in the agent's own object storage (an `artifact://` reference — what `sandbox.save` and
+ * the download hand back) uploaded to Raft as an attachment for one conversation, through the SDK's
+ * typed `attachments.upload` with this mount's credential. The SDK keeps it out of its manifest (a binary payload has
+ * no JSON form), so this plugin writes the tool itself, beside the download it mirrors. The upload posts nothing:
+ * the model gets the attachment's id and is told to pass it to `messages_send` in `attachmentIds`.
+ */
+export const UPLOAD_TOOL = "attachments_upload";
+/**
+ * The capability the upload needs, as the SDK's route contract states it (`send`), so an SDK that changes it moves
+ * `toolsBasis` and which credentials list the tool.
+ */
+const UPLOAD_CAPABILITY: readonly string[] = [describeRaftRoute("attachmentUpload").capability];
+/**
+ * The largest file the upload reads and sends: the download's 25 MiB, for the same reason — the bytes are held whole
+ * in the Worker's memory (128 MB per isolate) on the way out. The Server's own limit (`maxBytes`, from
+ * `attachments.uploadCapabilities`) is applied by the SDK, which also picks the multipart or the upload-session path
+ * by the Server's direct-upload threshold, so neither is repeated here.
+ */
+export const UPLOAD_MAX_BYTES = ATTACHMENT_MAX_BYTES;
+
+function overUpload(ref: string, bytes: number): Error {
+  return new Error(`${ref} is ${sizeOf(bytes)}, over the ${UPLOAD_MAX_BYTES / 1024 / 1024} MiB this mount uploads; nothing was uploaded`);
+}
+
+/**
+ * `attachments_upload`, end to end. Everything is checked before Raft is asked: the reference must be this agent's
+ * own (`keyForRef` under the caller's scope; only the `artifact://` form, never a raw `r2://` one, which no tool hands
+ * out any more), the object must exist and be 1 byte to `UPLOAD_MAX_BYTES`. The type is the caller's when given,
+ * else the SDK's inference (the bytes, then the filename's extension): storage keeps no type to read, since the
+ * runtime's store drops the one it is given (`BoundArtifacts.put`, cf/src/runtime.ts). Raft's refusal is the SDK's,
+ * said as every other.
+ */
+export async function uploadAttachment(
+  args: unknown, ctx: PluginContext, artifacts: RaftArtifacts | null, unoffered: ReadonlySet<string> = DEFAULT_UNOFFERED,
+): Promise<Json> {
+  if (args === null || typeof args !== "object" || Array.isArray(args)) throw new Error(`${UPLOAD_TOOL} takes an object of arguments`);
+  const a = args as Record<string, unknown>;
+  const ref = typeof a.ref === "string" ? a.ref.trim() : "";
+  const target = typeof a.target === "string" ? a.target.trim() : "";
+  if (!ref) throw new Error(`ref is required: an ${AGENT_REF}… reference to a file in this agent's storage, as sandbox save or ${DOWNLOAD_TOOL} returns it`);
+  if (!target) throw new Error("target is required: the conversation the attachment is for (#channel, dm:@peer, or a thread target), the one you will send it to");
+  if (a.filename !== undefined && (typeof a.filename !== "string" || !a.filename.trim())) throw new Error("filename, when given, is a non-empty string");
+  if (a.mimeType !== undefined && (typeof a.mimeType !== "string" || !/^[\w.+-]+\/[\w.+-]+$/.test(a.mimeType.trim()))) {
+    throw new Error("mimeType, when given, looks like type/subtype, for example image/png");
+  }
+  if (!ref.startsWith(AGENT_REF)) throw new Error(`ref must be an ${AGENT_REF}… reference to a file in this agent's storage; nothing was uploaded`);
+  const key = keyForRef(ref, ctx.caller);
+  if (!key) throw new Error(`${ref} does not name a file in this agent's storage; nothing was uploaded`);
+  if (!artifacts) throw new Error("this deployment has no object storage to upload a file from; nothing was uploaded");
+  // The size first, from the object's metadata: a file over the cap is refused without its bytes ever being loaded
+  // into the Durable Object's memory, which a whole-object read would do before any length could be checked.
+  let head: { bytes: number } | null;
+  try { head = await artifacts.head(key); } catch {
+    throw marked(new Error(`this agent's storage did not answer for ${ref}; nothing was uploaded`), { transient: true });
+  }
+  if (!head) throw new Error(`no file is stored at ${ref}; nothing was uploaded`);
+  if (head.bytes > UPLOAD_MAX_BYTES) throw overUpload(ref, head.bytes);
+  let bytes: Uint8Array;
+  try {
+    bytes = await artifacts.get(key);
+  } catch (e) {
+    // The runtime's store says a missing object in these words (`BoundArtifacts.get`, cf/src/runtime.ts); anything
+    // else is storage failing, which may clear, and is not the agent's file being absent.
+    if ((e as Error)?.message === "no such artifact") throw new Error(`no file is stored at ${ref}; nothing was uploaded`);
+    throw marked(new Error(`this agent's storage did not answer for ${ref}; nothing was uploaded`), { transient: true });
+  }
+  if (bytes.byteLength === 0) throw new Error(`${ref} is empty, and Raft takes no 0-byte attachment; nothing was uploaded`);
+  // Again on the bytes read: an object replaced between the two calls is held to the same cap.
+  if (bytes.byteLength > UPLOAD_MAX_BYTES) throw overUpload(ref, bytes.byteLength);
+  const filename = typeof a.filename === "string" ? a.filename.trim() : ref.slice(ref.lastIndexOf("/") + 1);
+  const mimeType = typeof a.mimeType === "string" ? a.mimeType.trim() : undefined;
+  const presigned: { refused?: PresignedProblem } = {};
+  const out = await raftFor(ctx, { state: false, presigned }).attachments.upload({ target, filename, bytes, ...(mimeType ? { mimeType } : {}) });
+  if (presigned.refused) {
+    throw new Error(`Raft returned an upload address ${PRESIGNED_PROBLEM[presigned.refused]}; nothing was sent there, and nothing was uploaded`);
+  }
+  // Not a write that may have landed: an upload that went through with its answer lost is an attachment nobody
+  // sent, which posts nothing, so calling again costs nothing but a second unsent copy.
+  if (!out.ok) throw sdkFailure(out, unoffered);
+  const id = out.data.id;
+  return {
+    attachmentId: id, target, filename: out.data.filename, mimeType: out.data.mimeType, bytes: out.data.sizeBytes,
+    next: `Uploaded, not posted: call messages_send with target ${JSON.stringify(target)} and attachmentIds ${JSON.stringify([id])} to post it.`,
+  };
+}
+
+const UPLOAD_SCHEMA: ToolSchema = {
+  name: UPLOAD_TOOL,
+  summary: `Upload a file from this agent's storage (an ${AGENT_REF}… reference, as sandbox save or ${DOWNLOAD_TOOL} returns it) ` +
+    `to Raft as an attachment for one conversation, up to ${UPLOAD_MAX_BYTES / 1024 / 1024} MiB. Posts nothing by itself: ` +
+    "returns an attachmentId to pass to messages_send in attachmentIds, with the same target.",
+  parameters: {
+    type: "object",
+    properties: {
+      ref: { type: "string", description: `The file: an ${AGENT_REF}… reference to this agent's own storage.` },
+      target: { type: "string", description: "The conversation it is for: #channel, dm:@peer, or a thread target. Send it to the same one." },
+      filename: { type: "string", description: "The name people see. Defaults to the reference's last segment." },
+      mimeType: { type: "string", description: "Its type, such as image/png. Defaults to what the file's bytes and name say." },
+    },
+    required: ["ref", "target"],
+    additionalProperties: false,
+  },
+  sideEffects: "write",
+  idempotency: "none",
+};
+
+/**
  * The basis of a raft snapshot (`Plugin.toolsBasis`): a digest of every tool this build can offer, each as its name and
  * the capabilities it needs, sorted, so it moves exactly when what a listing could return moves — an SDK upgrade that
  * adds or removes an operation or changes the capability one needs (which changes which credentials list it), a change
@@ -2331,17 +2473,22 @@ export const FEATURES_BASIS = "(listing records the Server's features: 1)";
 const EVERY_OPERATION = "(every Raft operation)";
 
 /**
- * Where the attachment download keeps a file: the agent's object storage, as the runtime hands it to the plugins that
+ * Where the attachment download keeps a file and the upload reads one: the agent's object storage, as the runtime hands it to the plugins that
  * store files (`sandboxPlugin`'s `save`, `statePlugin`), so the same reader (`artifacts.read`) and the same reference
  * form (`artifact://…`, src/store/refs.ts) apply.
  */
 export interface RaftArtifacts {
   put(key: string, body: Uint8Array, contentType?: string): Promise<{ ref: string; bytes: number }>;
+  /** The whole object; throws when there is none. `attachments_upload` reads what it sends to Raft through this. */
+  get(key: string): Promise<Uint8Array>;
+  /** The object's size from its metadata, without its body; null when there is none. Asked before `get`. */
+  head(key: string): Promise<{ bytes: number } | null>;
 }
 
 /**
  * The plugin, built for a runtime. `artifacts` is where `attachments_download_url` and `attachments_view` keep what
- * they fetch (none: neither is offered, and every pointer at the download is said in words). `excluded` is the exclusion table, `EXCLUDED` unless
+ * they fetch and where `attachments_upload` reads what it sends (none: none of the three is offered, and every pointer
+ * at the download is said in words). `excluded` is the exclusion table, `EXCLUDED` unless
  * a test builds it otherwise: every list below derives from it — which tools are generated and offered, how each is dispatched, which hints are
  * put in words (`offeredTerms`), and a message line's attachment suffix (`modelLine`) — so taking an operation out of
  * the table is the whole change that offers it. `assistant` is the wire a personal assistant's owner reads go
@@ -2369,9 +2516,15 @@ export function createRaftPlugin(deps: {
    * the view existed lists the download alone, and is re-taken at the next turn because the view moved `toolsBasis`.
    */
   const viewTools: readonly ToolSchema[] = offerable.some((op) => op.name === DOWNLOAD_OP) ? [VIEW_SCHEMA] : [];
+  /**
+   * `attachments_upload` needs storage to read from and the `send` capability (`UPLOAD_CAPABILITY`): built only with
+   * storage, listed by a snapshot only for a credential holding the capability, and offered by `mountTools` only when
+   * its snapshot lists it. It is not an operation of the SDK's manifest, so the exclusion table does not reach it.
+   */
+  const uploadTools: readonly ToolSchema[] = artifacts ? [UPLOAD_SCHEMA] : [];
   const operationOf = new Map(generated.map((op) => [op.toolName, op]));
   /** What a mount with no snapshot is offered: every tool but a personal assistant's (`ASSISTANT_TOOLS`). */
-  const allTools: ToolSchema[] = [...OWN_TOOLS, ...generatedTools, ...viewTools];
+  const allTools: ToolSchema[] = [...OWN_TOOLS, ...generatedTools, ...viewTools, ...uploadTools];
   /**
    * What this call's mount does not offer, for the hints and the attachment suffix: `unoffered`, plus every generated
    * tool the kernel says this mount is not offered right now (`PluginContext.offered`) — one its credential lacks the
@@ -2408,6 +2561,7 @@ export function createRaftPlugin(deps: {
       ...OWN_TOOLS.map((t) => ({ name: t.name })), ...ASSISTANT_TOOLS.map((t) => ({ name: t.name })),
       ...offerable.map((op) => ({ name: op.toolName, capability: op.capability })),
       ...viewTools.map((t) => ({ name: t.name, capability: RAFT_OPERATIONS.find((o) => o.name === DOWNLOAD_OP)!.capability })),
+      ...uploadTools.map((t) => ({ name: t.name, capability: UPLOAD_CAPABILITY })),
     ]),
     /** The push registration this mount holds: whether it exists is listable, what it holds is not. */
     database: {
@@ -2502,7 +2656,7 @@ export function createRaftPlugin(deps: {
       const view = generatedHere.some((t) => t.name === DOWNLOAD_TOOL) ? viewTools.filter((t) => allowed.has(t.name)) : [];
       // The managed MCP tools are the catalogue's, so they are read whole from the snapshot (src/plugins/raft-mcp.ts).
       const managed = snapshot.tools.filter((t) => t.name.startsWith(MCP_PREFIX));
-      return [...OWN_TOOLS, ...generatedHere, ...view, ...ASSISTANT_TOOLS.filter((t) => allowed.has(t.name)), ...managed];
+      return [...OWN_TOOLS, ...generatedHere, ...view, ...uploadTools.filter((t) => allowed.has(t.name)), ...ASSISTANT_TOOLS.filter((t) => allowed.has(t.name)), ...managed];
     },
 
     /**
@@ -2551,6 +2705,11 @@ export function createRaftPlugin(deps: {
         else tools.push(toolOf(op));
       }
       if (tools.some((t) => t.name === DOWNLOAD_TOOL)) tools.push(...viewTools);
+      const uploadMissing = UPLOAD_CAPABILITY.filter((c) => !capabilities.has(c));
+      for (const t of uploadTools) {
+        if (uploadMissing.length) skipped.push({ name: t.name, reason: `the credential lacks the Raft capability ${uploadMissing.join(", ")}` });
+        else tools.push(t);
+      }
       if (isAssistantOf(me.data.agent.assistantOf)) tools.push(...ASSISTANT_TOOLS);
       // The managed MCP catalogue, last: asked only of a credential that holds `mcp`, and never the reason the listing
       // fails (`listMcp`). After Raft's own tools, so the kernel's bound on a list's length never costs one of those.
@@ -2684,6 +2843,8 @@ export function createRaftPlugin(deps: {
       if (op) return operate(op, args, ctx) as Promise<Json>;
       // Answered wherever the download is generated, as the download is: with no storage it says why nothing was kept.
       if (name === VIEW_TOOL && operationOf.has(DOWNLOAD_TOOL)) return viewAttachment(args, ctx, artifacts, unofferedFor(ctx));
+      // Answered with no storage too, so a direct call says why nothing was uploaded rather than naming no such tool.
+      if (name === UPLOAD_TOOL) return uploadAttachment(args, ctx, artifacts, unofferedFor(ctx));
       const a = object(args);
       if (name === LIST_TOOL) return integrationsList(ctx, agentLogin(ctx));
       if (name === LOGIN_TOOL) return integrationsLogin(args, ctx, agentLogin(ctx));

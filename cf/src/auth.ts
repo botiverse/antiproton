@@ -13,6 +13,7 @@
  * `node test/auth.ts` and by the deployed Worker.
  */
 
+import { GITHUB_TOKEN_URL, grantOf, type GithubGrant } from "./github-token.ts";
 import type { ServiceTokenIdentity } from "./control-plane.ts";
 import { hashServiceToken, looksLikeServiceToken } from "./service-token.ts";
 
@@ -326,7 +327,7 @@ export interface GithubConfig {
 }
 
 export const GITHUB_AUTHORIZE = "https://github.com/login/oauth/authorize";
-export const GITHUB_TOKEN = "https://github.com/login/oauth/access_token";
+export const GITHUB_TOKEN = GITHUB_TOKEN_URL;
 export const GITHUB_API = "https://api.github.com";
 /** GitHub refuses API calls without a User-Agent; this names the caller. */
 const GITHUB_UA = "antiproton-console";
@@ -341,7 +342,14 @@ export function githubAuthorizeUrl(cfg: GithubConfig, state: string): string {
   return u.toString();
 }
 
-export async function githubExchangeCode(cfg: GithubConfig, code: string, fetchImpl: typeof fetch = fetch): Promise<string> {
+/**
+ * A code for the grant behind it. The whole grant comes back, not only the access token: an App with
+ * expiring user tokens answers a refresh token and two lifetimes beside it, and dropping them left a
+ * connection that died 8 hours in with nothing able to renew it (#935). `keys` names what the response
+ * carried, for a log line; never a value.
+ */
+export async function githubExchangeCode(cfg: GithubConfig, code: string, fetchImpl: typeof fetch = fetch, now = Date.now()):
+  Promise<{ grant: GithubGrant; keys: string[] }> {
   const r = await fetchImpl(GITHUB_TOKEN, {
     method: "POST",
     headers: { accept: "application/json", "content-type": "application/json", "user-agent": GITHUB_UA },
@@ -349,9 +357,10 @@ export async function githubExchangeCode(cfg: GithubConfig, code: string, fetchI
   });
   if (!r.ok) throw new Error(`github token exchange failed: ${r.status} ${(await r.text()).slice(0, 300)}`);
   const j = (await r.json()) as { access_token?: string; error?: string; error_description?: string };
+  const got = grantOf(j as Record<string, unknown>, now);
   // GitHub answers 200 with an error body for a bad code.
-  if (!j.access_token) throw new Error(`github token exchange refused: ${j.error ?? "no token"} ${j.error_description ?? ""}`.trim());
-  return j.access_token;
+  if (!got) throw new Error(`github token exchange refused: ${j.error ?? "no token"} ${j.error_description ?? ""}`.trim());
+  return got;
 }
 
 export interface GithubProfile {
