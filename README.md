@@ -554,7 +554,7 @@ SWE-bench rows below say which environment produced them.
 | `pi-bridge` | 5 | pi's request shape against our provider client, both ways |
 | `executor` · `http-plugin` | 21 | sandbox contract in-process (`executor` 11 runs the `spec/executor-spec` rows including script syntax errors), fetch and HTML extraction (`http-plugin` 10) |
 | `state` | 17 | memory that survives a task, byte budgets, per-agent isolation, `remember` and `put` sharing one namespace, every row `list` returns carrying the `ref` it is read back by, parked notes pointing to read calls, path segment traversal refusal, and stale unreadable rows offering `forget` |
-| `markdown` | 8 | the console renders the agent's markdown and never its HTML |
+| `markdown` | 11 | the console renders the agent's markdown and never its HTML |
 | `model-binding` | 6 | whose key an agent spends |
 
 Benchmarks are not tests and are reported separately, because they measure a

@@ -19,35 +19,60 @@ const esc = (s: unknown) =>
   String(s ?? "").replace(/[&<>"']/g, (c) =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]!));
 
+// A fence opens on a line that is only ``` and an optional language, and closes on the next
+// line that is only ```. Indentation is allowed on both, so a block nested under a list item
+// is still a block. Nothing may follow the language, a CR included, as before: a CRLF opener
+// has never opened a block here.
+const FENCE_OPEN = /^\s*```[a-zA-Z0-9_-]*$/;
+const FENCE_CLOSE = /^\s*```\s*$/;
+
 export function md(src: string): string {
-  const fences: string[] = [];
   // Escaped before anything else, so every branch below works on inert text.
-  let t = esc(src ?? "");
-  // The fence placeholders below are delimited by U+0001, so that character is taken out
-  // of the text first: without that, anything the agent quotes — a page it read — can write
-  // the delimiter itself and forge a placeholder. A forged one is no way to a tag (the
-  // fences' bodies are escaped too), but it is a way to print another block's text where
-  // the model never wrote it, or the word "undefined". U+0001 renders as nothing, so
-  // dropping it costs nothing that was visible.
-  t = t.replace(/\u0001/g, "");
-  t = t.replace(/```([a-zA-Z0-9_-]*)\n([\s\S]*?)```/g, (_m, _lang, body) => {
-    fences.push(`<pre>${String(body).replace(/\n$/, "")}</pre>`);
-    return ` F${fences.length - 1} `;
-  });
+  const lines = esc(src ?? "").split("\n");
 
-  const inline = (x: string) =>
-    x
-      .replace(/`([^`\n]+)`/g, "<code>$1</code>")
-      .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
-      .replace(/(^|[\s(])\*([^*\n]+)\*/g, "$1<em>$2</em>")
-      // http(s) only, and never sharing the opener's window.
-      .replace(
-        /\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g,
-        '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>',
-      );
-
+  // Fenced blocks are found by scanning lines and kept apart from the prose as their own
+  // segments, never as a marker written into the text: a marker in the text is something the
+  // text can already contain, and then a page the agent quoted could print a block where the
+  // model wrote none. The input is not altered to make that impossible; there is simply no
+  // second pass that reads the text back.
   const out: string[] = [];
-  const lines = t.split("\n");
+  let prose: string[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (FENCE_OPEN.test(lines[i]!)) {
+      let j = i + 1;
+      while (j < lines.length && !FENCE_CLOSE.test(lines[j]!)) j++;
+      // An opener with no closer is not a block: it stays the text it was.
+      if (j < lines.length) {
+        out.push(...blocks(prose));
+        prose = [];
+        // The <p> and the spaces inside it keep the console's output byte for byte what it
+        // was when a block passed through the prose rules as a padded line of its own; they
+        // render as nothing, and dropping them is a separate change.
+        out.push(`<p> <pre>${lines.slice(i + 1, j).join("\n")}</pre> </p>`);
+        i = j;
+        continue;
+      }
+    }
+    prose.push(lines[i]!);
+  }
+  out.push(...blocks(prose));
+  return out.join("\n");
+}
+
+const inline = (x: string) =>
+  x
+    .replace(/`([^`\n]+)`/g, "<code>$1</code>")
+    .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/(^|[\s(])\*([^*\n]+)\*/g, "$1<em>$2</em>")
+    // http(s) only, and never sharing the opener's window.
+    .replace(
+      /\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g,
+      '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>',
+    );
+
+/** The block rules, over a run of prose lines that contains no fenced block. */
+function blocks(lines: string[]): string[] {
+  const out: string[] = [];
   let list: "ul" | "ol" | null = null;
   const closeList = () => {
     if (list) { out.push(`</${list}>`); list = null; }
@@ -103,6 +128,5 @@ export function md(src: string): string {
     out.push(`<p>${inline(line)}</p>`);
   }
   closeList();
-
-  return out.join("\n").replace(/F(\d+)/g, (_m, n) => fences[Number(n)] ?? "");
+  return out;
 }
