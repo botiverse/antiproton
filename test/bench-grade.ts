@@ -14,7 +14,8 @@
  * down is indistinguishable from a copy that drifted.
  */
 import { canonJson } from "../src/core/canon-json.ts";
-import { canonArgs, actionMatch } from "../bench/tau2/grade.ts";
+import { canonArgs, actionMatch, rewardOf } from "../bench/tau2/grade.ts";
+import { readFileSync } from "node:fs";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 function check(name: string, fn: () => void) {
@@ -82,6 +83,53 @@ check("actionMatch still rejects a different argument", () => {
     throw new Error("a different tool name passed");
   }
   if (actionMatch(expected, [])) throw new Error("an empty performed list passed");
+});
+
+// The case the reward_basis rule exists for (task 0's write, as a published row performed it): the agent added
+// `confirm: true`, the tool ignored it, and the database came out exactly as the task asked.
+const exchange = { order_id: "#W2378156", item_ids: ["1151293680", "4983901480"], new_item_ids: ["7706410293", "7747408585"], payment_method_id: "credit_card_9513926" };
+const withConfirm = [{ name: "exchange_delivered_order_items", args: { ...exchange, confirm: true } }];
+const expectedExchange = [{ name: "exchange_delivered_order_items", args: exchange }];
+const task = (reward_basis: string[] | undefined, extra: Record<string, unknown> = {}) =>
+  ({ id: "t", evaluation_criteria: { actions: [], reward_basis, nl_assertions: null, ...extra } });
+
+check("an extra argument with the right database passes when ACTION is not in the basis", () => {
+  const act = actionMatch(expectedExchange, withConfirm);
+  if (act) throw new Error("actionMatch accepted an extra key; the diagnostic would stop showing the difference");
+  const g = rewardOf(task(["DB", "NL_ASSERTION"]), { dbMatch: true, actionMatch: act });
+  if (g.reward !== 1) throw new Error(`reward ${g.reward}: an argument the task never checks decided it`);
+  if (g.unjudged) throw new Error(`null nl_assertions were reported unjudged (${g.unjudged}); upstream counts them satisfied`);
+});
+
+check("a task that lists ACTION still fails on mismatched arguments", () => {
+  const g = rewardOf(task(["DB", "ACTION"]), { dbMatch: true, actionMatch: actionMatch(expectedExchange, withConfirm) });
+  if (g.reward !== 0) throw new Error("ACTION was listed and the arguments differ, yet the task passed");
+});
+
+check("a wrong database fails whatever else matched", () => {
+  for (const basis of [["DB", "NL_ASSERTION"], ["DB"], ["DB", "ACTION"]]) {
+    const g = rewardOf(task(basis), { dbMatch: false, actionMatch: true });
+    if (g.reward !== 0) throw new Error(`basis ${basis}: a wrong database passed`);
+  }
+});
+
+check("a component with criteria and no judge is named, not passed or failed silently", () => {
+  const g = rewardOf(task(["DB", "NL_ASSERTION"], { nl_assertions: ["Agent should tell the user there are 10 options."] }), { dbMatch: true, actionMatch: false });
+  if (JSON.stringify(g.unjudged) !== JSON.stringify(["NL_ASSERTION"])) throw new Error(`unjudged ${JSON.stringify(g.unjudged)}`);
+});
+
+check("no basis means tau2's default, and an unknown component throws", () => {
+  if (JSON.stringify(rewardOf(task(undefined), { dbMatch: true, actionMatch: false }).rewardBasis) !== '["DB","COMMUNICATE"]') {
+    throw new Error("the default basis is not [DB, COMMUNICATE]");
+  }
+  let threw = false;
+  try { rewardOf(task(["DB", "VIBES"]), { dbMatch: true, actionMatch: true }); } catch { threw = true; }
+  if (!threw) throw new Error("an unknown component was graded as if it passed");
+});
+
+check("every shipped task's basis is one this grader knows", () => {
+  const tasks: any[] = JSON.parse(readFileSync(new URL("../bench/tau2/data/tasks.json", import.meta.url), "utf8"));
+  for (const t of tasks) rewardOf(t, { dbMatch: true, actionMatch: true });
 });
 
 console.log(`\n  τ² grading\n  ${"─".repeat(56)}`);
