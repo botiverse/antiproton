@@ -815,7 +815,11 @@ botiverse/slock#10130 and #10134). Every other Raft POST leaves it out.
   starts in an empty conversation. The run's own state keeps ids, revision, counters, the deadline and the outcome. A
   result waiting for a retry keeps its bytes only until the retry succeeds or gives up. Nothing of a run is written to
   R2: model calls are handed to the queue by id, trace rows carry no content, and the daily friction scan reads none
-  of this agent's conversations. The only copy left anywhere is the result Raft accepted. The erase is crash-safe:
+  of this agent's conversations. A push to this agent is decided as it arrives: it is the plugin's wake and nothing of
+  it (Raft's notice, which names conversations and senders) is queued, posted or stored; the plugin then takes only
+  Raft's own assignment from the agent's events, and logs any other event with its ids and kind only, so chat that
+  reaches the agent is never kept and never starts a turn. `POST /admin/storage-scan` (docs/runbook.md) checks a
+  deployed agent for a marker. The only copy left anywhere is the result Raft accepted. The erase is crash-safe:
   the run's end and the request to erase are written together, and any later wake or replay asks again (erasing an
   empty conversation does nothing). An operator's fresh context erases this agent's conversation instead of archiving
   it, and `/admin/reset-session?rebuild=1` is refused, since its briefing would copy it.

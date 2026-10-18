@@ -111,6 +111,7 @@
     "test/after-turn.ts",
     "test/raftbench-service.ts",
     "test/raftbench-alarm.ts",
+    "test/storage-scan.ts",
     "test/subagents.ts",
     "test/overflow-backstop.ts",
     "test/idle-rebuild.ts",

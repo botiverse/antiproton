@@ -244,8 +244,12 @@ async function pullAssignments(ctx: PluginContext, raft: Raft): Promise<void> {
       // Only from Raft's own `system.raftbench` app: the same payload from any other source is not an assignment.
       const a = raftbenchRunAssignment(event);
       if (!a) {
-        const seq = (event as { seq?: unknown } | null)?.seq;
-        log(ctx, null, "event_dropped", { seq: typeof seq === "number" ? seq : null });
+        // Ids and kind only: whatever the event says is not this agent's to keep, the log included.
+        const e = (event ?? {}) as { seq?: unknown; message_id?: unknown; channel_type?: unknown; third_party_event?: { kind?: unknown; client_id?: unknown } };
+        log(ctx, null, "event_dropped", {
+          seq: typeof e.seq === "number" ? e.seq : null, messageId: typeof e.message_id === "string" ? e.message_id : null,
+          kind: e.third_party_event ? `third_party:${String(e.third_party_event.client_id ?? "?")}` : typeof e.channel_type === "string" ? e.channel_type : "unknown",
+        });
         continue;
       }
       const held = await ctx.db.get(STORE, PULLED) as { runId?: string; revision?: number } | undefined;
