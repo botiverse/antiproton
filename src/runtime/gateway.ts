@@ -370,7 +370,7 @@ export class ToolGateway {
     if (decision === "denied") {
       await this.#store.completeOperation(tenantId, operationId, "cancelled", null, {
         denied: true, approver,
-      });
+      }, { denied: true });
       return { ok: true, executed: false };
     }
 
@@ -956,6 +956,9 @@ export class ToolGateway {
     // What every completion of this call records, whichever way it ends. Built once rather than
     // spelled at each `completeOperation`: a call that carries its id when it succeeds and drops it
     // when it fails would leave the failures — the ones worth looking at — as the unlinkable ones.
+    // `startedAt` is this moment, not the record's creation: an approved call was recorded when it was
+    // asked for and reaches here only after the decision, so the time it ran excludes the wait for a person.
+    const ended = () => ({ ...facts(), startedAt: started });
     // Counting is never the call's problem: a failure here must not turn a
     // call that succeeded into one reported as failed.
     // A mount holding the agent's own credential spends the tenant's account, not ours: its key says so
@@ -1011,11 +1014,11 @@ export class ToolGateway {
           if (interruptsOf(plugin)?.cancel) {
             try { await interruptsOf(plugin)!.cancel!(r.tool, result.state, this.#contextFor(ctx, r.mount, credential, fromProgram, serves)); } catch { /* reported below either way */ }
           }
-          await this.#store.completeOperation(ctx.tenantId, operationId, "failed", null, undefined, facts());
+          await this.#store.completeOperation(ctx.tenantId, operationId, "failed", null, undefined, ended());
           await counted("failed");
           return { status: "failed", operationId, error: { code: "tool_error", message: why } };
         }
-        await this.#store.completeOperation(ctx.tenantId, operationId, "succeeded", null, undefined, facts());
+        await this.#store.completeOperation(ctx.tenantId, operationId, "succeeded", null, undefined, ended());
         await counted("ok");
         return {
           status: "interrupted", operationId,
@@ -1030,7 +1033,7 @@ export class ToolGateway {
         };
       }
       if (result instanceof Backgrounded) {
-        await this.#store.completeOperation(ctx.tenantId, operationId, "running", null, undefined, facts());
+        await this.#store.completeOperation(ctx.tenantId, operationId, "running", null, undefined, ended());
         // Counted as started; the time it runs in the background is the sandbox's to count.
         await counted("ok");
         return {
@@ -1041,7 +1044,12 @@ export class ToolGateway {
           },
         };
       }
-      await this.#store.completeOperation(ctx.tenantId, operationId, "succeeded", null, undefined, facts());
+      // A command's exit status (sandbox `shell` / `run`) goes onto the record's end, so the activity log can say how
+      // the command ended without reading the result. Only a number: a tool with no command to report has none.
+      const exit = (result as { exitCode?: unknown } | null)?.exitCode;
+      await this.#store.completeOperation(ctx.tenantId, operationId, "succeeded", null, undefined, {
+        ...ended(), ...(typeof exit === "number" && Number.isFinite(exit) ? { exitCode: exit } : {}),
+      });
       await counted("ok");
       return { status: "succeeded", operationId, result };
     } catch (err) {
@@ -1056,7 +1064,7 @@ export class ToolGateway {
       // -- the two hops are `pi-tools.ts`'s collapse and `tool.result`'s missing slot, either of which
       // is enough on its own.
       await this.#store.completeOperation(ctx.tenantId, operationId, status, null, undefined, {
-        ...facts(),
+        ...ended(),
         ...(e.identity === undefined ? {} : { identity: e.identity }),
         ...(e.credentialRef === undefined ? {} : { credentialRef: e.credentialRef }),
       });

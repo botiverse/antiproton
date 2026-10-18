@@ -26,6 +26,25 @@ export interface BackgroundJob {
   finishedAt: number | null;
   polls: number;
   session: string;
+  /**
+   * The model's id for the tool call that started the job (`CompletedFacts.callId`), so the operation's end, which
+   * happens here and not in the call, records it as a call that ended in place does. Null for a job recorded before
+   * the column existed, or by a caller that had none.
+   */
+  callId: string | null;
+}
+
+/**
+ * What a job's end records on its operation (`CompletedFacts`): the call it served and, for a command that finished,
+ * its exit status, read as the gateway reads it from a result that ended in place (src/runtime/gateway.ts `#run`).
+ */
+export type JobEndFacts = { callId?: string; exitCode?: number };
+export function jobEndFacts(job: Pick<BackgroundJob, "callId">, result?: unknown): JobEndFacts {
+  const exit = result !== null && typeof result === "object" ? (result as { exitCode?: unknown }).exitCode : undefined;
+  return {
+    ...(job.callId ? { callId: job.callId } : {}),
+    ...(typeof exit === "number" && Number.isFinite(exit) ? { exitCode: exit } : {}),
+  };
 }
 
 /** Per agent, across every mount: a plugin sees only its own, so it cannot count this. */
@@ -124,23 +143,30 @@ export function ensureBackgroundTable(sql: Sql) {
     session TEXT NOT NULL, mount TEXT NOT NULL, tool TEXT NOT NULL,
     handle TEXT NOT NULL, state TEXT NOT NULL, created_at INTEGER NOT NULL,
     finished_at INTEGER, polls INTEGER NOT NULL DEFAULT 0, next_poll_at INTEGER NOT NULL,
-    outcome TEXT)`);
+    outcome TEXT, call_id TEXT)`);
+  // A table made before `call_id` existed gets it; asked once per SQL handle rather than on every read.
+  if (!withCallId.has(sql)) {
+    try { sql.exec("SELECT call_id FROM background_jobs WHERE 0"); } catch { sql.exec("ALTER TABLE background_jobs ADD COLUMN call_id TEXT"); }
+    withCallId.add(sql);
+  }
 }
+const withCallId = new WeakSet<object>();
 
 const rowToJob = (r: any): BackgroundJob => ({
   id: String(r.id), session: String(r.session), mount: String(r.mount), tool: String(r.tool),
   handle: JSON.parse(String(r.handle)), state: r.state, createdAt: Number(r.created_at),
   finishedAt: r.finished_at === null || r.finished_at === undefined ? null : Number(r.finished_at),
   polls: Number(r.polls),
+  callId: r.call_id === null || r.call_id === undefined ? null : String(r.call_id),
 });
 
 export function recordBackgroundJob(
-  sql: Sql, owner: JobOwner, job: { id: string; session: string; mount: string; tool: string; handle: unknown }, now: number = Date.now(),
+  sql: Sql, owner: JobOwner, job: { id: string; session: string; mount: string; tool: string; handle: unknown; callId?: string | null }, now: number = Date.now(),
 ) {
   ensureBackgroundTable(sql);
   sql.exec(
-    "INSERT INTO background_jobs(id, tenant_id, agent_id, session, mount, tool, handle, state, created_at, polls, next_poll_at) VALUES (?,?,?,?,?,?,?,'running',?,0,?)",
-    job.id, owner.tenantId, owner.agentId, job.session, job.mount, job.tool, JSON.stringify(job.handle ?? null), now, now + nextPollDelay(0));
+    "INSERT INTO background_jobs(id, tenant_id, agent_id, session, mount, tool, handle, state, created_at, polls, next_poll_at, call_id) VALUES (?,?,?,?,?,?,?,'running',?,0,?,?)",
+    job.id, owner.tenantId, owner.agentId, job.session, job.mount, job.tool, JSON.stringify(job.handle ?? null), now, now + nextPollDelay(0), job.callId ?? null);
 }
 
 export function runningBackgroundJobs(sql: Sql, owner: JobOwner): BackgroundJob[] {
@@ -222,7 +248,7 @@ export interface BackgroundPassDeps {
   maxMs?: number;
   poll(job: BackgroundJob): Promise<{ done: false; progress?: unknown } | { done: true; result: unknown }>;
   cancel(job: BackgroundJob): Promise<void>;
-  completeOperation(operationId: string, status: "succeeded" | "failed" | "cancelled"): Promise<void>;
+  completeOperation(operationId: string, status: "succeeded" | "failed" | "cancelled", facts: JobEndFacts): Promise<void>;
   deliver(session: string, text: string): Promise<void>;
 }
 
@@ -256,7 +282,7 @@ export async function runBackgroundPass(d: BackgroundPassDeps): Promise<{ checke
         ? `ran longer than ${minutes} minutes and was cancelled`
         : `ran longer than ${minutes} minutes and could not be stopped (${stopError}); it may still be running in its container` };
       if (finishBackgroundJob(d.sql, d.owner, job.id, outcome, now)) {
-        await d.completeOperation(job.id, "failed");
+        await d.completeOperation(job.id, "failed", jobEndFacts(job));
         await d.deliver(job.session, completionMessage(job, outcome, now));
         finished.push(job.id);
       }
@@ -268,7 +294,7 @@ export async function runBackgroundPass(d: BackgroundPassDeps): Promise<{ checke
     if (!answer.done) { markPolled(d.sql, d.owner, job.id, now); continue; }
     const outcome = { state: "done" as const, result: answer.result };
     if (finishBackgroundJob(d.sql, d.owner, job.id, outcome, now)) {
-      await d.completeOperation(job.id, "succeeded");
+      await d.completeOperation(job.id, "succeeded", jobEndFacts(job, answer.result));
       await d.deliver(job.session, completionMessage(job, outcome, now));
       finished.push(job.id);
     }
@@ -292,14 +318,14 @@ export async function stopSessionJobs(d: {
   owner: JobOwner;
   session: string;
   cancel(job: BackgroundJob): Promise<void>;
-  completeOperation(operationId: string, status: "cancelled"): Promise<void>;
+  completeOperation(operationId: string, status: "cancelled", facts: JobEndFacts): Promise<void>;
   now?: number;
 }): Promise<{ stopped: string[]; stillRunning: string[] }> {
   const stopped: string[] = [], stillRunning: string[] = [];
   for (const job of runningBackgroundJobs(d.sql, d.owner).filter((j) => j.session === d.session)) {
     try { await d.cancel(job); } catch { stillRunning.push(job.id); continue; }
     if (finishBackgroundJob(d.sql, d.owner, job.id, { state: "cancelled" }, d.now ?? Date.now())) {
-      await d.completeOperation(job.id, "cancelled");
+      await d.completeOperation(job.id, "cancelled", jobEndFacts(job));
     }
     stopped.push(job.id);
   }
@@ -310,7 +336,7 @@ export function jobsTool(d: {
   sql: Sql;
   owner: JobOwner;
   cancel(job: BackgroundJob): Promise<void>;
-  completeOperation(operationId: string, status: "cancelled"): Promise<void>;
+  completeOperation(operationId: string, status: "cancelled", facts: JobEndFacts): Promise<void>;
   now?: () => number;
 }) {
   const text = (v: unknown) => ({ content: [{ type: "text" as const, text: JSON.stringify(v) }], details: {} });
@@ -336,7 +362,7 @@ export function jobsTool(d: {
         try { await d.cancel(job); }
         catch (e) { throw new Error(`jobs: could not stop ${job.id}: ${(e as Error).message}`); }
         finishBackgroundJob(d.sql, d.owner, job.id, { state: "cancelled" }, now);
-        await d.completeOperation(job.id, "cancelled");
+        await d.completeOperation(job.id, "cancelled", jobEndFacts(job));
         return text({ cancelled: job.id });
       }
       const running = runningBackgroundJobs(d.sql, d.owner)
@@ -367,7 +393,7 @@ export function jobsTool(d: {
 export async function refuseOverCap(d: {
   sql: Sql;
   owner: JobOwner;
-  job: { id: string; session: string; mount: string; tool: string; handle: unknown };
+  job: { id: string; session: string; mount: string; tool: string; handle: unknown; callId?: string | null };
   running: Array<Pick<BackgroundJob, "id" | "mount" | "tool" | "createdAt">>;
   cancel(): Promise<void>;
   now?: number;

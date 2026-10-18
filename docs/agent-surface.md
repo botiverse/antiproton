@@ -948,6 +948,25 @@ A stop ends the agent's subagents' turns as well ([Subagents](#subagents-send_to
 delete stops again. A stop that fails does not fail the delete: it is logged as a `turn.stop` line with `result`
 `failed` ([`runbook.md`](runbook.md)).
 
+### Tool calls in Raft's activity log
+
+While push is on, each tool call the agent makes is reported to Raft (`raft-agent-activity-ingest.v1`) as two
+events, built from the call's `tool.call` trace row when it ends (`src/runtime/activity.ts`): `PreToolUse`, dated
+when the call was asked for, and `PostToolUse` (it succeeded) or `PostToolUseFailure` (anything else, with the
+operation's status as `errorClass`), dated when it ended. Calls the provider makes on the agent's behalf are not
+reported.
+
+| Field | On | Value |
+|---|---|---|
+| `toolName` | both | the tool as the model names it, `<mount>__<tool>` |
+| `toolUseId` | both | the call's operation id: the same on the two events of a call, different for every call (two calls to one tool, the host calls of one `run_js` program, the step that continues a tool's question, a call run after approval) |
+| `ok` | the end | `true` succeeded (including a command that exited non-zero), `false` failed or refused (by the mount's policy, or by a person denying the approval), `null` the outcome is not known (lost, or cancelled) |
+| `durationMs` | the end | how long the tool ran; a call held for approval counts from when it began after the approval, not from the request |
+| `exitCode` | the end | only for a command (sandbox `shell` / `run`, backgrounded or not): its exit status |
+
+An operation has exactly one `tool.call` row, at its first end; completing it again (an approved call, a result
+too large to inline) updates the record and writes no second row, so a call is never reported twice.
+
 ## Raft managed MCP
 
 A hosted agent whose raft mount's credential holds Raft's `mcp` capability is offered the connectors its Raft Server has
@@ -1067,12 +1086,14 @@ working again when a report wakes it and it calls the model. A subagent's work i
 Where the deployment sets `SUBAGENT_ACTIVITY=1` (off by default, until Raft's ingest accepts the fields), a subagent's
 work is sent as Raft's `SubagentLineage` events, `subagent: { parentToolUseId, taskId, phase }` with `parentToolUseId` the
 parent's `send_to_agent` tool call id and `taskId` the child's session: `SubagentStart` (`phase: "started"`) when a turn
-of it starts, the child's tool steps as `PreToolUse`/`PostToolUse` (`phase: "active"`), and `SubagentStop`
+of it starts, the child's tool steps as `PreToolUse`/`PostToolUse` (`phase: "active"`, with the same `toolUseId`, `ok`,
+`durationMs` and `exitCode` as the agent's own, [above](#tool-calls-in-rafts-activity-log)), and `SubagentStop`
 (`phase: "ended"`, and in the marker `outcome` — `done`, `failed`, `stopped`, `ceiling` — and `reportChars`, the report
 body's length without its head; nothing of them beside it). `ceiling` is only a turn the harness took at its time or its
 lifetime; any other cancel, a kill switch's included, is `stopped`. A turn has one end: a stop while its report is owed
 drops the report and gives it no second `SubagentStop`. The parent's own
-`send_to_agent` is then a plain `PreToolUse`/`PostToolUse` of the agent, with no marker. Never a `Stop` or a prompt for a
+`send_to_agent` is then a plain `PreToolUse`/`PostToolUse` of the agent, with no marker; its `toolUseId` is the call id
+the marker names as `parentToolUseId`, and its end is `ok: true`. Never a `Stop` or a prompt for a
 child, never the agent's status on a child's event, and never a task, a prompt or a report: ids and enums only. Off, a
 child's rows make no event at all.
 

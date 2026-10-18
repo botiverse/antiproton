@@ -13,6 +13,7 @@
  *
  *   inbound, delivered      → UserPromptSubmit   (a message entered the model)
  *   tool.call               → PreToolUse + PostToolUse / PostToolUseFailure  (not one the provider ran: `operatorCall`)
+ *                             both with `toolUseId`; the end with `ok`, `durationMs`, and `exitCode` when there is one
  *   turn.stop stopped       → BridgeFatal         (the turn was ended from outside: `stopped: by owner`, `stopped: agent deleted`, …)
  *   model.call stop|length  → Stop                (the turn is answered)
  *   model.call aborted      → Stop                (cancelled: no longer working)
@@ -113,24 +114,9 @@ function hookEvents(agentId: string, rows: readonly TraceOutboxRow[], subagents?
       case "inbound":
         if (row.status === "delivered") out.push({ ...base, hookEventName: "UserPromptSubmit" });
         break;
-      case "tool.call": {
-        if (operatorCall(row)) break;
-        const tool = typeof row.attrs.tool === "string" ? row.attrs.tool : "tool";
-        const mount = typeof row.attrs.mount === "string" ? row.attrs.mount : null;
-        // Named as the model names it, so the service's trajectory reads like the transcript.
-        const toolName = mount ? `${mount}__${tool}` : tool;
-        const ok = row.verdict === "ok";
-        const ms = typeof row.ms === "number" ? row.ms : 0;
-        out.push({ eventId: `${base.eventId}:pre`, occurredAt: new Date(row.at - ms).toISOString(), hookEventName: "PreToolUse", toolName });
-        out.push({
-          ...base,
-          hookEventName: ok ? "PostToolUse" : "PostToolUseFailure",
-          toolName,
-          ...(typeof row.ms === "number" ? { durationMs: row.ms } : {}),
-          ...(ok ? {} : { errorClass: row.status }),
-        });
+      case "tool.call":
+        if (!operatorCall(row)) out.push(...toolCallEvents(base, row));
         break;
-      }
       // A turn that was ended from outside: who ended it is the row's errorClass (cf/src/runtime.ts `stopTurn`,
       // `turnEndClass` in src/runtime/status.ts), so the activity log says why the agent stopped instead of going quiet.
       case "turn.stop":
@@ -148,6 +134,60 @@ function hookEvents(agentId: string, rows: readonly TraceOutboxRow[], subagents?
     }
   }
   return out;
+}
+
+/**
+ * A tool call's two events from its row: PreToolUse dated the span's start, PostToolUse(Failure) at its end. The agent's
+ * own calls (`hookEvents`) and a subagent's (`subagentEvents`, with its marker on both) are mapped the same way.
+ */
+function toolCallEvents(base: { eventId: string; occurredAt: string }, row: TraceOutboxRow, subagent?: ActivityEvent["subagent"]): ActivityEvent[] {
+  const tool = typeof row.attrs.tool === "string" ? row.attrs.tool : "tool";
+  const mount = typeof row.attrs.mount === "string" ? row.attrs.mount : null;
+  // Named as the model names it, so the service's trajectory reads like the transcript.
+  const toolName = mount ? `${mount}__${tool}` : tool;
+  const ok = row.verdict === "ok";
+  const ms = typeof row.ms === "number" ? row.ms : 0;
+  // The operation id, on both events, is what pairs them: one per call and one row per operation
+  // (src/trace/seams.ts `operationEnds`). Not the model's call id, which a run_js program's host calls
+  // share and a resumed question reuses.
+  const toolUseId = row.spanId;
+  // How long the tool ran: from the attempt's start when the row says it (`attrs.runMs`), so a call held
+  // for a person's approval does not count the wait; otherwise the whole span. The call itself stays dated
+  // at the request, when the model asked for it.
+  const runMs = typeof row.attrs.runMs === "number" ? row.attrs.runMs : null;
+  const durationMs = runMs ?? (typeof row.ms === "number" ? row.ms : null);
+  const exitCode = typeof row.attrs.exitCode === "number" ? row.attrs.exitCode : null;
+  const marker = subagent ? { subagent } : {};
+  return [
+    { eventId: `${base.eventId}:pre`, occurredAt: new Date(row.at - ms).toISOString(), hookEventName: "PreToolUse", toolName, toolUseId, ...marker },
+    {
+      ...base,
+      hookEventName: ok ? "PostToolUse" : "PostToolUseFailure",
+      toolName,
+      toolUseId,
+      ...marker,
+      ok: toolOutcome(row.status, row.attrs.denied === true),
+      ...(durationMs === null ? {} : { durationMs }),
+      ...(exitCode === null ? {} : { exitCode }),
+      ...(ok ? {} : { errorClass: row.status }),
+    },
+  ];
+}
+
+/**
+ * `ok` on a tool's end, from the operation's status (`row.status`, written verbatim): whether the call did what it
+ * was asked. `succeeded` is true even for a command that exited non-zero (`exitCode` says that); `failed` and
+ * `rejected` are false; `unknown` (the outcome was lost) and `cancelled` are null, which the service reads as "not
+ * known" — sent as an explicit null, not left out. A held call a person refused ends `cancelled` too, but is false
+ * (`attrs.denied`, src/trace/seams.ts): the call was refused, as a policy refusal is, which is not an unknown outcome.
+ */
+export function toolOutcome(status: string, denied = false): boolean | null {
+  if (denied) return false;
+  switch (status) {
+    case "succeeded": return true;
+    case "failed": case "rejected": return false;
+    default: return null;
+  }
 }
 
 /**
@@ -170,9 +210,14 @@ function subagentEvents(agentId: string, row: TraceOutboxRow, subagents: Subagen
   if (row.kind === "subagent.start") {
     const taskId = row.spanId;
     const parent = row.parentId ?? subagents.lineage(taskId, row.at);
-    const own = row.status !== "wake" && row.parentId
-      ? [{ eventId: `${base.eventId}:pre`, occurredAt: base.occurredAt, hookEventName: "PreToolUse" as const, toolName: SEND_TOOL },
-         { ...base, eventId: `${base.eventId}:post`, hookEventName: "PostToolUse" as const, toolName: SEND_TOOL }]
+    // send_to_agent has no tool.call row (it is a model tool, not a gateway operation), so its pair's `toolUseId` is the
+    // model's call id: the same id the child's marker names as `parentToolUseId`, so the service can join the step to
+    // its child. It is unique per send: the start row is written once per turn (cf/src/runtime.ts `#sendToAgent`, a
+    // replay finds the turn already posted), and the tool is the model's own, not one of run_js's host calls (`offered`).
+    const toolUseId = row.parentId;
+    const own = row.status !== "wake" && toolUseId
+      ? [{ eventId: `${base.eventId}:pre`, occurredAt: base.occurredAt, hookEventName: "PreToolUse" as const, toolName: SEND_TOOL, toolUseId },
+         { ...base, eventId: `${base.eventId}:post`, hookEventName: "PostToolUse" as const, toolName: SEND_TOOL, toolUseId, ok: true }]
       : [];
     return [...own, { ...base, hookEventName: "SubagentStart", subagent: lineage(taskId, parent, "started") }];
   }
@@ -187,19 +232,10 @@ function subagentEvents(agentId: string, row: TraceOutboxRow, subagents: Subagen
   }
   if (row.kind === "tool.call" && typeof row.attrs.task === "string") {
     const taskId = row.attrs.task;
-    const tool = typeof row.attrs.tool === "string" ? row.attrs.tool : "tool";
-    const mount = typeof row.attrs.mount === "string" ? row.attrs.mount : null;
-    const toolName = mount ? `${mount}__${tool}` : tool;
-    const ok = row.verdict === "ok";
     const ms = typeof row.ms === "number" ? row.ms : 0;
     // The turn the step was part of: the one that had started when the step began, whatever turn runs by the time this
     // is read (a flush behind a follow-up must not give a turn-1 step turn 2's parent).
-    const marker = lineage(taskId, subagents.lineage(taskId, row.at - ms), "active");
-    return [
-      { eventId: `${base.eventId}:pre`, occurredAt: new Date(row.at - ms).toISOString(), hookEventName: "PreToolUse", toolName, subagent: marker },
-      { ...base, hookEventName: ok ? "PostToolUse" : "PostToolUseFailure", toolName, subagent: marker,
-        ...(typeof row.ms === "number" ? { durationMs: row.ms } : {}), ...(ok ? {} : { errorClass: row.status }) },
-    ];
+    return toolCallEvents(base, row, lineage(taskId, subagents.lineage(taskId, row.at - ms), "active"));
   }
   return [];
 }

@@ -1232,6 +1232,9 @@ for (const engine of (process.env.ENGINES ?? "pi085,pd").split(",").filter((e) =
     const steps = marked.filter((e) => e.hookEventName === "PreToolUse" || e.hookEventName === "PostToolUse");
     // Named as the agent's own steps are named (`hookEvents`: `<mount>__<tool>` from the row).
     must(steps.length === 2 && steps.every((e) => /^chat__.*peek$/.test(String(e.toolName)) && show(e.subagent) === show({ ...lin, phase: "active" })), `child steps: ${show(steps)}`);
+    // The same pairing and outcome fields as the agent's own steps (`toolCallEvents`), beside the marker, not in it.
+    must(steps[0]?.toolUseId !== undefined && steps[0].toolUseId === steps[1]?.toolUseId && !("ok" in steps[0]) && steps[1]?.ok === true
+      && typeof steps[1]?.durationMs === "number", `child steps' toolUseId / ok: ${show(steps)}`);
     const stop = marked.filter((e) => e.hookEventName === "SubagentStop");
     // Outcome and size inside the marker, nothing of them beside it (Raft drops unknown top-level fields).
     const ended = stop[0]?.subagent as any;
@@ -1242,6 +1245,8 @@ for (const engine of (process.env.ENGINES ?? "pi085,pd").split(",").filter((e) =
     must(!marked.some((e) => e.hookEventName === "Stop" || e.hookEventName === "UserPromptSubmit"), "a child's Stop or prompt");
     const parentSend = on.filter((e) => !e.subagent && e.toolName === SUBAGENT_TOOL);
     must(parentSend.length === 2 && parentSend.map((e) => e.hookEventName).join() === "PreToolUse,PostToolUse", `the parent's own send_to_agent step: ${show(parentSend)}`);
+    // Its id is the one the child's marker names, so the service joins the step to its child.
+    must(parentSend.every((e) => e.toolUseId === "c_ev") && parentSend[1]?.ok === true, `the parent's send_to_agent toolUseId / ok: ${show(parentSend)}`);
     must(!JSON.stringify(on).includes("SECRET"), "an event carries task or report text");
     must(marked.every((e) => e.status === undefined), "a child's event carries the agent's status");
     must(show(on.filter((e) => !e.subagent && e.toolName !== SUBAGENT_TOOL)) === show(off), "turning it on changed the agent's own events");
