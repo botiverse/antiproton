@@ -458,11 +458,15 @@ export const raftbenchPlugin: Plugin = {
   },
 
   async wake(ctx) {
-    try { return await woken(ctx); }
+    // Decided before anything that can fail (the raft mount, its credential, Raft itself): an erase still owed is
+    // asked for whatever else this wake manages.
+    const done = await load(ctx, CURRENT);
+    const erase: PluginNext = done?.phase === "done" && done.forgetPending ? { forget: true } : {};
+    try { return await answer(ctx, { ...erase, ...((await woken(ctx)) ?? {}) }); }
     catch (e) {
       // Kept for the next wake rather than lost with this one: the run's own deadline or retry is asked for again.
       log(ctx, null, "wake_failed", { error: clip(String((e as Error)?.message ?? e)) });
-      return answer(ctx, { wakeAt: Date.now() + RETRY_DELAYS_MS[0]! });
+      return answer(ctx, { ...erase, wakeAt: Date.now() + RETRY_DELAYS_MS[0]! });
     }
   },
 
@@ -478,8 +482,6 @@ export const raftbenchPlugin: Plugin = {
 async function woken(ctx: PluginContext): Promise<PluginNext | void> {
   const raft = await raftOf(ctx);
   const run = await load(ctx, CURRENT);
-  // An erase a cut-off hook may have lost goes first; the wake then carries on, so an assignment is still taken.
-  const erase: PluginNext | undefined = run?.phase === "done" && run.forgetPending ? { forget: true } : undefined;
   const now = Date.now();
   // A result Raft has not confirmed is sent again, as it is, when its retry is due; the deadline does not replace it.
   if (run?.phase === "submitting" && (run.retryAt === undefined || now >= run.retryAt)) return answer(ctx, await send(ctx, raft, run));
@@ -510,10 +512,8 @@ async function woken(ctx: PluginContext): Promise<PluginNext | void> {
   }
   const current = await load(ctx, CURRENT);
   // A run not read yet (just assigned) starts; one an eviction cut short mid-read starts again, counted as it was.
-  if (current?.phase === "reading") {
-    return answer(ctx, { ...(erase ?? {}), ...((await (current.reads > 0 ? resumeRead(ctx, raft, current) : read(ctx, raft, current))) ?? {}) });
-  }
-  return answer(ctx, erase);
+  if (current?.phase === "reading") return answer(ctx, await (current.reads > 0 ? resumeRead(ctx, raft, current) : read(ctx, raft, current)));
+  return answer(ctx, undefined);
 }
 
 async function turnEnded(ctx: PluginContext, end: TurnEnd): Promise<PluginNext | void> {

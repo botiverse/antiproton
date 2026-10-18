@@ -107,6 +107,7 @@
     "test/turn-stop.ts",
     "test/after-turn.ts",
     "test/raftbench-service.ts",
+    "test/raftbench-alarm.ts",
     "test/subagents.ts",
     "test/overflow-backstop.ts",
     "test/idle-rebuild.ts",

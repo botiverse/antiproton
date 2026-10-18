@@ -673,6 +673,43 @@ await check("retention: a crash between the run's end and its erase is erased on
   must(w.raft.submits().length === 1, `submits ${w.raft.submits().length}`);
 });
 
+await check("retention: an erase cut off between its archive and its drop leaves no archived copy, and the next one erases", async () => {
+  const w = await world();
+  w.raft.pages = markedPages();
+  await assign(w);
+  await w.rt.stopTurn("t", SERVICE, "provider_stop");
+  const { eraseMain } = await import("../cf/src/fresh-context.ts");
+  let failed = false;
+  const failing = { sql: { exec: (q: string, ...b: unknown[]) => {
+    if (!failed && /^DROP TABLE IF EXISTS pi_s_archived/.test(q)) { failed = true; throw new Error("evicted mid-erase"); }
+    return w.host.sql.exec(q, ...b);
+  } }, transactionSync: w.host.transactionSync };
+  let threw = false;
+  try { eraseMain(failing as never, Date.now()); } catch { threw = true; }
+  must(failed && threw, "the failure was not injected between the archive and the drop");
+  const archived = () => w.host.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'pi_s_archived%'").toArray().map((r: any) => String(r.name));
+  must(archived().length === 0 && whereIs(w, MATERIAL_MARK).some((h) => h === "table pi_entries"), `after the cut-off erase: archived ${show(archived())}, material ${show(whereIs(w, MATERIAL_MARK))}`);
+  must(eraseMain(w.host as never, Date.now()) !== null, "the next erase found nothing to erase");
+  must(archived().length === 0 && !whereIs(w, MATERIAL_MARK).some((h) => /pi_|model_jobs/.test(h)), `after the next erase: ${show({ archived: archived(), material: whereIs(w, MATERIAL_MARK) })}`);
+});
+
+await check("retention: an erase still owed is done by a wake even when the raft mount's credential is gone", async () => {
+  const w = await world();
+  w.raft.pages = markedPages();
+  await assign(w);
+  crash.when = () => w.host.sql.exec(`SELECT 1 AS x FROM plugin_db WHERE value LIKE '%"forgetPending":true%'`).toArray().length > 0;
+  crash.armed = true;
+  await answer(w, markedAnswer()).catch(() => {});
+  must(!crash.armed && whereIs(w, MATERIAL_MARK).length > 0, "the crash was not where it was meant to be");
+  // The end is taken as told, so only a wake is left to ask for the erase; and the plugin cannot reach Raft.
+  w.host.sql.exec("UPDATE plugin_turn_ends SET handled = ?", Date.now());
+  must((await w.rt.removeCredential("t", SERVICE, PROVISION_MOUNT_ALIAS)) !== false, "the credential was not removed");
+  const { askWake } = await import("../src/runtime/plugin-wakes.ts");
+  askWake(w.host.sql as never, "raftbench", Date.now());
+  await w.rt.step("t", SERVICE);
+  mustBeGone(w, "after the wake");
+});
+
 await check("retention: every terminal path leaves no copy — timeout, read failure, stop, model failure, overflow, cancel, reread", async () => {
   const paths: Record<string, (w: World) => Promise<void>> = {
     timeout: async (w) => { skew += RUN_DEADLINE_MS + 1_000; try { for (let i = 0; i < 3; i++) await pass(w); } finally { skew = 0; } },
