@@ -67,24 +67,58 @@ const OWN_REF = "artifact://sandbox/box-1/work/out.png";
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 
 /** What reached the fake Raft: each request's path, and the upload's form as the SDK built it. */
-interface Seen { paths: string[]; auth: string[]; upload?: { channelId: string | null; filename: string; type: string; mimeType: string | null; bytes: Uint8Array } }
+interface Seen {
+  paths: string[]; auth: string[];
+  upload?: { channelId: string | null; filename: string; type: string; mimeType: string | null; bytes: Uint8Array };
+  /** The upload session's create body, the presigned PUT as it was sent, and every request to anywhere but Raft. */
+  created?: Record<string, unknown>; put?: { url: string; method: string; headers: Headers; bytes: Uint8Array }; elsewhere: string[];
+}
+const CHANNEL_UUID = "0b6c3a52-5f1e-4c8e-9a51-1f7d2c3b4a10";
+const UPLOAD_UUID = "6a0f1e2d-3c4b-4a59-8e7d-6c5b4a392817";
+const SESSION_ATTACHMENT_UUID = "9f8e7d6c-5b4a-4392-8170-6f5e4d3c2b1a";
+const PUT_URL = "https://objects.example/bucket/upload-1?X-Amz-Signature=SIG";
 /**
- * Raft, faked: the upload limits (`maxBytes`), the channel a target resolves to, the upload itself (or `uploadFails`),
- * and the credential context a listing reads (`caps`).
+ * Raft, faked: the upload limits (`maxBytes`, and `session` for a direct-upload threshold, at or above which the SDK
+ * takes an upload session to `putUrl`), the channel a target resolves to, the upload itself (or `uploadFails`), and
+ * the credential context a listing reads (`caps`).
  */
-function raft(opts: { caps?: string[]; maxBytes?: number; uploadFails?: Response; resolveFails?: Response } = {}): Seen {
-  const seen: Seen = { paths: [], auth: [] };
+function raft(opts: { caps?: string[]; maxBytes?: number; uploadFails?: Response; resolveFails?: Response; session?: { threshold: number; putUrl?: string } } = {}): Seen {
+  const seen: Seen = { paths: [], auth: [], elsewhere: [] };
   globalThis.fetch = (async (input: any, init?: RequestInit) => {
     const u = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
+    if (u.origin !== "https://raft.example") {
+      seen.elsewhere.push(`${init?.method ?? "GET"} ${u.href}`);
+      if (u.href === (opts.session?.putUrl ?? PUT_URL)) {
+        seen.put = { url: u.href, method: init?.method ?? "GET", headers: new Headers(init?.headers), bytes: new Uint8Array(init?.body as ArrayBuffer) };
+        return new Response(null, { status: 200 });
+      }
+      return new Response(null, { status: 404 });
+    }
     seen.paths.push(`${init?.method ?? "GET"} ${u.pathname}`);
     seen.auth.push(new Headers(init?.headers).get("authorization") ?? "");
     if (u.pathname === "/internal/agent-api/attachment-upload-capabilities") {
-      return json({ directUploadEnabled: false, directUploadThresholdBytes: null, maxBytes: opts.maxBytes ?? 200 * 1024 * 1024, sessionExpiresInSeconds: null });
+      return json(opts.session
+        ? { directUploadEnabled: true, directUploadThresholdBytes: opts.session.threshold, maxBytes: opts.maxBytes ?? 200 * 1024 * 1024, sessionExpiresInSeconds: 900 }
+        : { directUploadEnabled: false, directUploadThresholdBytes: null, maxBytes: opts.maxBytes ?? 200 * 1024 * 1024, sessionExpiresInSeconds: null });
     }
     if (u.pathname === "/internal/agent-api/resolve-channel") {
       if (opts.resolveFails) return opts.resolveFails;
       const body = JSON.parse(String(init?.body ?? "{}"));
-      return json({ channelId: `ch-${String(body.target).replace(/\W/g, "")}` });
+      // A session's create takes the channel as a UUID; the multipart form takes any id.
+      return json({ channelId: opts.session ? CHANNEL_UUID : `ch-${String(body.target).replace(/\W/g, "")}` });
+    }
+    if (u.pathname === "/internal/agent-api/attachment-upload-sessions" && init?.method === "POST") {
+      seen.created = JSON.parse(String(init.body));
+      return json({ uploadId: UPLOAD_UUID, attachmentId: SESSION_ATTACHMENT_UUID, state: "pending", expiresAt: "2026-10-17T23:00:00.000Z",
+        upload: { method: "PUT", url: opts.session?.putUrl ?? PUT_URL, headers: { "Content-Type": String(seen.created!.mimeType), "If-None-Match": "*" } } });
+    }
+    if (u.pathname === `/internal/agent-api/attachment-upload-sessions/${UPLOAD_UUID}/complete`) {
+      const size = seen.put?.bytes.byteLength ?? 0;
+      return json({ uploadId: UPLOAD_UUID, state: "completed",
+        attachment: { id: SESSION_ATTACHMENT_UUID, filename: String(seen.created?.filename), mimeType: String(seen.created?.mimeType), sizeBytes: size, thumbnailUrl: null } });
+    }
+    if (u.pathname === `/internal/agent-api/attachment-upload-sessions/${UPLOAD_UUID}` && init?.method === "DELETE") {
+      return json({ uploadId: UPLOAD_UUID, state: "canceled", expiresAt: "2026-10-17T23:00:00.000Z", attachment: null, terminalReason: null });
     }
     if (u.pathname === "/internal/agent-api/upload") {
       if (opts.uploadFails) return opts.uploadFails;
@@ -129,6 +163,47 @@ await check("a filename and mimeType given are what Raft gets", async () => {
     ctx(), fakeArtifacts({ [OWN_KEY]: PNG }));
   must(seen.upload!.filename === "chart.png" && seen.upload!.type === "image/x-custom" && seen.upload!.mimeType === "image/x-custom", JSON.stringify({ ...seen.upload, bytes: undefined }));
   must(out.filename === "chart.png" && out.mimeType === "image/x-custom", JSON.stringify(out));
+});
+
+// ---- the upload session ---------------------------------------------------------------------------------------------
+
+const BIG_KEY = "t/tenant/agent/sandbox/box-1/work/report.bin";
+const BIG_REF = "artifact://sandbox/box-1/work/report.bin";
+/** About 4 KiB of bytes no two positions of which repeat in a short cycle, so a truncated or shifted body differs. */
+const BIG = Uint8Array.from({ length: 4096 + 37 }, (_, i) => (i * 131 + (i >> 8)) & 255);
+
+await check("at or above the Server's direct-upload threshold the SDK's session is taken: create, the presigned PUT of exactly the file, complete; the id is complete's", async () => {
+  const seen = raft({ session: { threshold: 1024 } });
+  const out: any = await uploadAttachment({ ref: BIG_REF, target: "#general" }, ctx(), fakeArtifacts({ [BIG_KEY]: BIG }));
+  const order = seen.paths.filter((p) => p.includes("attachment-upload-sessions") || p.endsWith("/upload"));
+  must(JSON.stringify(order) === JSON.stringify(["POST /internal/agent-api/attachment-upload-sessions", `POST /internal/agent-api/attachment-upload-sessions/${UPLOAD_UUID}/complete`]),
+    `Raft saw: ${seen.paths}`);
+  must(seen.created?.channelId === CHANNEL_UUID && seen.created?.filename === "report.bin" && seen.created?.sizeBytes === BIG.byteLength, JSON.stringify(seen.created));
+  must(seen.put && seen.put.method === "PUT" && seen.put.url === PUT_URL, `PUT: ${JSON.stringify(seen.elsewhere)}`);
+  must(seen.put!.bytes.byteLength === BIG.byteLength && Buffer.compare(Buffer.from(seen.put!.bytes), Buffer.from(BIG)) === 0, `PUT ${seen.put!.bytes.byteLength} bytes, not the file's ${BIG.byteLength}`);
+  // The presigned URL carries its own grant: the mount's credential never goes with it.
+  must(!seen.put!.headers.has("authorization") && seen.put!.headers.get("if-none-match") === "*", JSON.stringify([...seen.put!.headers]));
+  must(out.attachmentId === SESSION_ATTACHMENT_UUID && out.bytes === BIG.byteLength && out.next.includes(SESSION_ATTACHMENT_UUID), JSON.stringify(out));
+  // Control: below the threshold the same file goes as one multipart request, and no session is made.
+  const below = raft({ session: { threshold: BIG.byteLength + 1 } });
+  const small: any = await uploadAttachment({ ref: BIG_REF, target: "#general" }, ctx(), fakeArtifacts({ [BIG_KEY]: BIG }));
+  must(small.attachmentId === "att-up-1" && !below.put && !below.paths.some((p) => p.includes("upload-sessions")), `below: ${below.paths}`);
+});
+
+await check("a presigned upload address that is not https, carries a user name, or is on a private network is never sent to; the session is cancelled and the model told why", async () => {
+  for (const [putUrl, why] of [
+    ["http://objects.example/bucket/upload-1?sig=1", "that is not https"],
+    ["https://user:pass@objects.example/bucket/upload-1", "that carries a user name or password"],
+    ["https://169.254.169.254/latest/meta-data", "on a private or local network"],
+    ["https://localhost/upload", "on a private or local network"],
+  ] as const) {
+    const seen = raft({ session: { threshold: 1024, putUrl } });
+    const e = await failure(() => uploadAttachment({ ref: BIG_REF, target: "#general" }, ctx(), fakeArtifacts({ [BIG_KEY]: BIG })));
+    must(e.message === `Raft returned an upload address ${why}; nothing was sent there, and nothing was uploaded`, `${putUrl}: ${e.message}`);
+    must(seen.elsewhere.length === 0 && !seen.put, `${putUrl} was fetched: ${seen.elsewhere}`);
+    must(seen.paths.includes(`DELETE /internal/agent-api/attachment-upload-sessions/${UPLOAD_UUID}`) && !seen.paths.some((p) => p.endsWith("/complete")),
+      `${putUrl}: ${seen.paths}`);
+  }
 });
 
 // ---- whose file -----------------------------------------------------------------------------------------------------

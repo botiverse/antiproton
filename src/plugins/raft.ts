@@ -483,7 +483,16 @@ function stateStore(ctx: PluginContext, last: { state?: RaftState } = {}): RaftS
  * `contextId` (an approved call's replay) has none: it is never held for a card, and a send makes one extra history
  * read for the conversation it shows after the receipt.
  */
-function raftFor(ctx: PluginContext, options: { state?: false; response?: (res: Response) => Response; timeoutMs?: number } = {}): Raft {
+function raftFor(ctx: PluginContext, options: {
+  state?: false; response?: (res: Response) => Response; timeoutMs?: number;
+  /**
+   * Requests to anywhere but the Raft server — the presigned PUT of the SDK's upload session, which it makes through
+   * this fetch — are checked as the download checks its URL (`presignedProblem`). A refused one is not sent: it is
+   * answered 400 here, which the SDK reads as a PUT that definitely failed and cancels the session, and the reason is
+   * left in `refused` for the caller to say.
+   */
+  presigned?: { refused?: PresignedProblem };
+} = {}): Raft {
   const last: { state?: RaftState } = {};
   return createRaft({
     serverUrl: baseUrl(ctx).origin, credential: requireCredential(ctx), hints: "tool",
@@ -493,6 +502,14 @@ function raftFor(ctx: PluginContext, options: { state?: false; response?: (res: 
       const started = Date.now();
       const u = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
       const line = { tenantId: ctx.caller.tenantId, agentId: ctx.caller.agentId, mount: ctx.alias, method: init?.method ?? "GET", route: routeOf(u.pathname) };
+      if (options.presigned && u.origin !== baseUrl(ctx).origin) {
+        const problem = presignedProblem(u);
+        if (problem) {
+          options.presigned.refused = problem;
+          logEvent("raft.call", { ...line, route: "(presigned)", status: null, ms: 0, error: `refused: ${problem}` });
+          return new Response(null, { status: 400 });
+        }
+      }
       let res: Response;
       try {
         res = await fetch(input, { ...init, redirect: "manual", signal: AbortSignal.timeout(options.timeoutMs ?? timeout(ctx)) });
@@ -2029,9 +2046,9 @@ function capped(res: Response, over: () => void): Response {
 async function fetchPresigned(url: string, ctx: PluginContext): Promise<Uint8Array> {
   let parsed: URL;
   try { parsed = new URL(url); } catch { throw new Error("Raft returned a download address that is not a URL; nothing was kept"); }
-  if (parsed.protocol !== "https:") throw new Error("Raft returned a download address that is not https; nothing was kept");
-  if (parsed.username || parsed.password) throw new Error("Raft returned a download address that carries a user name or password; nothing was fetched or kept");
-  if (internalHost(parsed.hostname)) throw new Error("Raft returned a download address on a private or local network; nothing was fetched or kept");
+  const problem = presignedProblem(parsed);
+  if (problem === "https") throw new Error("Raft returned a download address that is not https; nothing was kept");
+  if (problem) throw new Error(`Raft returned a download address ${PRESIGNED_PROBLEM[problem]}; nothing was fetched or kept`);
   let over = false;
   let res: Response;
   try {
@@ -2050,6 +2067,22 @@ async function fetchPresigned(url: string, ctx: PluginContext): Promise<Uint8Arr
     throw marked(new Error("the attachment's bytes stopped arriving; nothing was kept"), { transient: true });
   }
 }
+
+/**
+ * What is wrong with an address Raft minted for its storage (a presigned URL), by the rule `fetchPresigned` states:
+ * not https, a user name or password in it, or a host inward by construction (`internalHost`). Null when nothing is.
+ * Shared by the download's GET and the upload session's PUT (`raftFor`'s `presigned`), so both refuse the same URLs.
+ */
+type PresignedProblem = "https" | "userinfo" | "internal";
+function presignedProblem(url: URL): PresignedProblem | null {
+  if (url.protocol !== "https:") return "https";
+  if (url.username || url.password) return "userinfo";
+  if (internalHost(url.hostname)) return "internal";
+  return null;
+}
+const PRESIGNED_PROBLEM: Readonly<Record<PresignedProblem, string>> = {
+  https: "that is not https", userinfo: "that carries a user name or password", internal: "on a private or local network",
+};
 
 /** A storage path segment from a name someone chose: plain characters only, never `.`/`..` or empty. */
 function pathSegment(name: string, fallback: string): string {
@@ -2376,7 +2409,11 @@ export async function uploadAttachment(
   if (bytes.byteLength > UPLOAD_MAX_BYTES) throw overUpload(ref, bytes.byteLength);
   const filename = typeof a.filename === "string" ? a.filename.trim() : ref.slice(ref.lastIndexOf("/") + 1);
   const mimeType = typeof a.mimeType === "string" ? a.mimeType.trim() : undefined;
-  const out = await raftFor(ctx, { state: false }).attachments.upload({ target, filename, bytes, ...(mimeType ? { mimeType } : {}) });
+  const presigned: { refused?: PresignedProblem } = {};
+  const out = await raftFor(ctx, { state: false, presigned }).attachments.upload({ target, filename, bytes, ...(mimeType ? { mimeType } : {}) });
+  if (presigned.refused) {
+    throw new Error(`Raft returned an upload address ${PRESIGNED_PROBLEM[presigned.refused]}; nothing was sent there, and nothing was uploaded`);
+  }
   // Not a write that may have landed: an upload that went through with its answer lost is an attachment nobody
   // sent, which posts nothing, so calling again costs nothing but a second unsent copy.
   if (!out.ok) throw sdkFailure(out, unoffered);
