@@ -91,6 +91,15 @@ async function consume(agent: DurableAgent, id: string, answer: (model: { api: s
   toRequest(job.context);
   check(await agent.deliver(id, answer({ api: job.model.api, provider: job.model.provider, id: job.model.id }, id)) === true, `deliver of ${id} was refused`);
 }
+/**
+ * The faked model answers as soon as it is asked, so a job could be created and answered within one millisecond:
+ * its span would measure `ms` 0, and `statusEvents` (src/runtime/status.ts) derives no `thinking` from a span that
+ * did not measure itself. No real call is that fast, so the worker waits until the clock has moved past the job's
+ * creation: every span then measures at least 1 ms on either engine, whatever the machine's speed.
+ */
+async function pastCreation(createdAt: number) {
+  while (Date.now() <= createdAt) await sleep(1);
+}
 const replying = (res: ModelResponse) => (model: { api: string; provider: string; id: string }, id: string) => fromResponse(res, model, id);
 const MODEL_REF = { api: "offloaded", provider: MODEL.provider, id: MODEL.id };
 
@@ -104,6 +113,7 @@ async function pdTurn(storage: DurableSqlHost, agent: DurableAgent, say: string 
     if (open) {
       const next = answers.shift();
       check(next, `the turn "${say}" asked for more answers than scripted`);
+      await pastCreation(open.created_at);
       await consume(agent, open.id, next);
     }
     await sleep(out.wakeInMs);
@@ -124,9 +134,10 @@ async function runPi085(storage: DurableSqlHost) {
     let out = await agent.step();
     for (let guard = 0; out.wakeInMs !== null || out.open > 0; guard++) {
       check(guard < 50, `pi085: the turn "${turn.say}" did not end: ${show(out)}`);
-      const open = storage.sql.exec("SELECT id FROM pi_model_jobs WHERE answer IS NULL").toArray()[0];
+      const open = storage.sql.exec("SELECT id, created_at FROM pi_model_jobs WHERE answer IS NULL").toArray()[0];
       if (open) {
         const id = String(open.id);
+        await pastCreation(Number(open.created_at));
         check(agent.takeJob(id), `pi085: job ${id} was not handed out`);
         agent.deliver(id, fromResponse(turn.reply, MODEL_REF, id));
       }
