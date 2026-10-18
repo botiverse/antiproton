@@ -72,15 +72,19 @@ run_suite() {
   local name="$1"; shift; suite_name "$name"; local out n limit status=0 file
   limit=$(suite_limit "$name"); file=$(mktemp)
   suite_run_bounded "$limit" "$file" "$@" || status=$?
-  out=$(cat "$file"); rm -f "$file"
+  out=$(cat "$file")
+  # A failing suite's whole output is kept and its path printed: the 15 lines
+  # shown are the end of the report, and a case's error printed above them
+  # (with its stack) was lost with the file.
   if [ -n "$SUITE_TIMED_OUT" ]; then
-    echo "TIMEOUT (still running after ${limit}s; killed)"; printf '%s\n' "$out" | tail -15
+    echo "TIMEOUT (still running after ${limit}s; killed)"; printf '%s\n' "$out" | tail -15; echo "  full output: $file"
     timeouts=$((timeouts+1)); fails=$((fails+1)); return
   fi
-  if [ -n "$SUITE_ERROR" ]; then echo "FAIL ($SUITE_ERROR)"; printf '%s\n' "$out" | tail -15; fails=$((fails+1)); return; fi
-  if [ "$status" -ne 0 ]; then echo FAIL; printf '%s\n' "$out" | tail -15; fails=$((fails+1)); return; fi
+  if [ -n "$SUITE_ERROR" ]; then echo "FAIL ($SUITE_ERROR)"; printf '%s\n' "$out" | tail -15; echo "  full output: $file"; fails=$((fails+1)); return; fi
+  if [ "$status" -ne 0 ]; then echo FAIL; printf '%s\n' "$out" | tail -15; echo "  full output: $file"; fails=$((fails+1)); return; fi
   n=$(printf '%s\n' "$out" | suite_passed_count)
-  if [ -z "$n" ] || [ "$n" -eq 0 ]; then echo "FAIL (asserted nothing)"; fails=$((fails+1)); return; fi
+  if [ -z "$n" ] || [ "$n" -eq 0 ]; then echo "FAIL (asserted nothing)"; echo "  full output: $file"; fails=$((fails+1)); return; fi
+  rm -f "$file"
   echo "ok ($n)"
 }
 
