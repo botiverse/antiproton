@@ -3,13 +3,13 @@
  * lines in the mount's paragraph, one call per call and its outcome as Raft gave it, the catalogue listed again when it
  * ages or a call finds it stale, and nothing for a subagent or an agent without a raft mount.
  *
- * Raft is a fake agent API behind `globalThis.fetch`, answering the routes the SDK 0.21.0 calls with the shapes its
+ * Raft is a fake agent API behind `globalThis.fetch`, answering the routes the SDK 0.21.1 calls with the shapes its
  * contract validates (dist/esm/index.js: `agentApiManagedMcpToolsResponseSchema`, `agentApiManagedMcpCallBodySchema`,
  * `agentApiManagedMcpCallResponseSchema`; an error body's `errorCode` and `suggestedNextAction`, as
  * `transportResponseFromFetch` reads them). Through the real runtime, gateway and store, so the list offered, the call
  * dispatched and the rows recorded are the ones production builds.
  */
-import { formatMcpReconnectRequired, MCP_OUTCOME_UNKNOWN_TEXT } from "@botiverse/raft-sdk";
+import { formatMcpReconnectRequired, MCP_CALL_INTERNAL_ERROR_TEXT, MCP_OUTCOME_UNKNOWN_TEXT } from "@botiverse/raft-sdk";
 import { AgentRuntime, mountedToolEntries } from "../cf/src/runtime.ts";
 import { raftPlugin } from "../src/plugins/raft.ts";
 import { MCP_CATALOG_TTL_MS, mcpToolName } from "../src/plugins/raft-mcp.ts";
@@ -248,6 +248,19 @@ await check("outcome_unknown: one request, the SDK's words, an operation recorde
   must(replayPolicy(entry) === "never", `pi085 replay: ${replayPolicy(entry)}`);
   const registered = durableTool({ name: entry.name, label: entry.name, description: "", parameters: {} as any, replay: replayPolicy(entry), execute: async () => ({ content: [] }) } as any);
   must(registered.replay === "unsafe", `pi-durable replay: ${registered.replay}`);
+});
+
+await check("a gateway's 5xx with no Raft code, and Raft's managed_mcp_internal_error, are outcome_unknown (SDK 0.21.1): one request, the SDK's words, recorded unknown", async () => {
+  let answer = new Response("<html>bad gateway</html>", { status: 502, headers: { "content-type": "text/html" } });
+  const server = raftServer({ call: () => answer });
+  const w = await world();
+  const r: any = await w.call("mcp_notion__notion_search", { query: "q" });
+  must(r.status === "unknown" && r.error.message === MCP_OUTCOME_UNKNOWN_TEXT, `gateway 5xx: ${JSON.stringify(r)}`);
+  answer = json(500, { error: "x", errorCode: "managed_mcp_internal_error" });
+  const r2: any = await w.call("mcp_notion__notion_search", { query: "q" });
+  must(r2.status === "unknown" && r2.error.message === MCP_CALL_INTERNAL_ERROR_TEXT, `internal error: ${JSON.stringify(r2)}`);
+  must(server.calls().length === 2, `sent ${server.calls().length} times for two calls`);
+  must(JSON.stringify(w.rows("raft.mcp_call").map((x) => x.status)) === JSON.stringify(["outcome_unknown", "outcome_unknown"]), "trace kinds");
 });
 
 await check("unavailable and reconnect_required: nextAction exactly as Raft wrote it, one request each, nothing retried", async () => {

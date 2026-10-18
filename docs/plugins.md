@@ -676,7 +676,7 @@ failed load or save never fails the call: it costs at most a batch delivered
 again or one more hold. A fourth, `raft.mcp_call`, is one managed MCP call's end
 (below).
 
-**Raft's managed MCP** (`src/plugins/raft-mcp.ts`, SDK 0.21.0's `raft.mcp`) puts
+**Raft's managed MCP** (`src/plugins/raft-mcp.ts`, SDK 0.21.1's `raft.mcp`) puts
 the connectors the agent's Raft Server has connected (Notion and the like) on the
 raft mount, as tools of their own. Raft holds the connectors' credentials and
 attaches them to each call; the mount sends only its own Raft credential, to its
@@ -717,7 +717,8 @@ change.
   with `…[truncated]`. A failure's message is the SDK's `error.nextAction`
   exactly (`mcpFailureKind`): `stale` also marks the catalogue due;
   `reconnect_required` and `unavailable` are failed calls; `outcome_unknown` (the
-  connection to Raft failed mid-call) is recorded as an operation whose outcome
+  connection to Raft failed mid-call, a gateway answered 5xx with no Raft code,
+  or Raft's own `managed_mcp_internal_error`) is recorded as an operation whose outcome
   is `unknown`.
 - *No retries.* The SDK makes one attempt (`managedMcpCall` is a single-attempt
   route) and the plugin calls once. The gateway starts an operation once and

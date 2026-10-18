@@ -1,6 +1,6 @@
 /**
  * Raft's managed MCP for a hosted agent: the connectors a person set up for the agent's Raft Server (Notion and the
- * like), offered as tools of the agent's raft mount and called through Raft's gateway (`raft.mcp`, SDK 0.21.0). Raft
+ * like), offered as tools of the agent's raft mount and called through Raft's gateway (`raft.mcp`, SDK 0.21.1). Raft
  * holds the connectors' credentials and attaches them to each call; this file never sees one, and the only credential
  * it sends is the mount's own Raft agent credential, to the mount's Raft origin, through the same client every other
  * Raft call here uses.
@@ -269,7 +269,8 @@ export async function callMcp(
       // The SDK's own words for it (`MCP_OUTCOME_UNKNOWN_TEXT`), and an operation recorded as unknown.
       throw failed(nextAction || MCP_OUTCOME_UNKNOWN_TEXT, { mayHaveLanded: true });
     default: {
-      // Raft answered with something the SDK does not class as a managed MCP failure. A 5xx may have reached the tool.
+      // Raft answered with something the SDK does not class as a managed MCP failure. The SDK already reads a 5xx with
+      // no Raft code as outcome_unknown (0.21.1); a 5xx that carries some other code may still have reached the tool.
       const status = failure.error.status;
       throw failed(nextAction, status !== undefined && status >= 500 ? { mayHaveLanded: true } : {});
     }
