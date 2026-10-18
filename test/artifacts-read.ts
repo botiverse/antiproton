@@ -16,6 +16,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import { artifactsPlugin, BASE64_PAGE } from "../src/plugins/artifacts.ts";
 import { BoundArtifacts } from "../cf/src/runtime.ts";
+import { R2Artifacts } from "../src/store/artifacts.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void>) {
@@ -358,6 +359,38 @@ await check("encoding base64 pages the stored bytes, and the pages put back are 
 await check("a from on binary content is named as not used, not silently dropped", async () => {
   const r = await bytesReader(new Uint8Array(randomBytes(64)))({ from: 10 });
   if (r.kind !== "binary" || !/from page text or a list, so they were not used/.test(String(r.note))) throw new Error(`from was dropped silently: ${JSON.stringify(r)}`);
+});
+
+await check("both stores answer size (sandbox put) and getObject (read) for the same object", async () => {
+  const objects = new Map<string, { bytes: Uint8Array; contentType?: string }>();
+  const bucket = {
+    async put(key: string, bytes: Uint8Array, opts?: { httpMetadata?: { contentType?: string } }) {
+      objects.set(key, { bytes, contentType: opts?.httpMetadata?.contentType });
+    },
+    async get(key: string) {
+      const o = objects.get(key);
+      return o ? { httpMetadata: { contentType: o.contentType }, async arrayBuffer() { return o.bytes.slice().buffer; } } : null;
+    },
+    async head(key: string) { const o = objects.get(key); return o ? { size: o.bytes.byteLength } : null; },
+  } as any;
+  const bound = new BoundArtifacts(bucket, BUCKET);
+  await bound.put("t/t/a/p.jpg", cat([0xff, 0xd8, 0xff, 0xd9]), "image/jpeg");
+  const got = await bound.getObject("t/t/a/p.jpg");
+  if (await bound.size("t/t/a/p.jpg") !== 4 || await bound.size("t/t/a/none") !== null) throw new Error("binding size wrong");
+  if (got.bytes.byteLength !== 4 || got.contentType !== "image/jpeg") throw new Error(`binding getObject wrong: ${JSON.stringify(got)}`);
+
+  const realFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = (async (url: string, init?: any) => {
+      const there = String(url).endsWith("/b/t/t/a/p.jpg");
+      if (init?.method === "HEAD") return there ? new Response(null, { headers: { "content-length": "4" } }) : new Response(null, { status: 404 });
+      return there ? new Response(cat([0xff, 0xd8, 0xff, 0xd9]), { headers: { "content-type": "image/jpeg" } }) : new Response("", { status: 404 });
+    }) as any;
+    const sig = new R2Artifacts({ endpoint: "https://r2.example", accessKeyId: "k", secretAccessKey: "s", bucket: BUCKET });
+    if (await sig.size("t/t/a/p.jpg") !== 4 || await sig.size("t/t/a/none") !== null) throw new Error("SigV4 size wrong");
+    const o = await sig.getObject("t/t/a/p.jpg");
+    if (o.bytes.byteLength !== 4 || o.contentType !== "image/jpeg") throw new Error(`SigV4 getObject wrong: ${JSON.stringify(o)}`);
+  } finally { globalThis.fetch = realFetch; }
 });
 
 for (const r of results) {

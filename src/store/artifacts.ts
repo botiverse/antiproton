@@ -83,6 +83,17 @@ export class R2Artifacts {
     return new Uint8Array(await res.arrayBuffer());
   }
 
+  /** The stored object's length, read without its body; null when there is no such object. */
+  async size(key: string): Promise<number | null> {
+    try {
+      const res = await this.#request("HEAD", key);
+      return Number(res.headers.get("content-length") ?? NaN);
+    } catch (e) {
+      if (/^r2 HEAD 404:/.test(String((e as Error)?.message ?? e))) return null;
+      throw e;
+    }
+  }
+
   /** `get`, with the content type the object was stored with (`put`). */
   async getObject(key: string): Promise<{ bytes: Uint8Array; contentType?: string }> {
     const res = await this.#request("GET", key);

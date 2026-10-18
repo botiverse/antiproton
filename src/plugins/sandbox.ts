@@ -2,7 +2,7 @@ import type { Json } from "../core/types.ts";
 import type { CredentialRefKind, HeldFiles, Plugin, PluginContext, MountActivity, MountUsage, Released, SandboxForm } from "./types.ts";
 import { backgrounded, LEASE_KEY, markReleased, releaseRetryMs } from "./types.ts";
 import type { R2Artifacts } from "../store/artifacts.ts";
-import { toAgentRef } from "../store/refs.ts";
+import { AGENT_REF, keyForRef, toAgentRef } from "../store/refs.ts";
 import { spanText } from "../runtime/idle-lease.ts";
 
 /**
@@ -1823,6 +1823,48 @@ function boxPathOf(cfg: ReturnType<typeof cfgOf>, path: string): string {
   return rest ? `${root === "/" ? "" : root}/${rest}` : root;
 }
 
+/**
+ * The largest file `put` copies into a box. The same 25 MiB as a Raft attachment download
+ * (`ATTACHMENT_MAX_BYTES` in src/plugins/raft.ts), so anything that arrives that way fits; and the whole file
+ * is held in the agent's isolate while it goes out, which a larger one would crowd.
+ */
+export const PUT_MAX_BYTES = 25 * 1024 * 1024;
+/**
+ * How long `put` waits for run9 to finish the transfer it accepted. run9 answers an upload with a "prepared
+ * transfer session" (swagger `uploadBoxFiles`, `DataTransferPrepareView`, https://api.run.sys9.ai/swagger.yaml
+ * read 2026-10-17), which carries a `state` but no id to read it back by; the one place a transfer's progress is
+ * documented is `GET /workspace/data-transfers/active` (`pending` / `running` / `succeeded` / `error` /
+ * `cancelled`). So the call waits there until no upload into the box is still active, and then checks the file.
+ */
+export const PUT_SETTLE_MS = 60_000;
+
+/**
+ * Where `put` writes: `path` resolved like a filesystem would (`.` and `..` applied), relative ones from the
+ * working directory, and refused unless the result is inside the working directory. Refused rather than moved
+ * there, because a file silently written somewhere other than where the agent asked is one it then looks for
+ * in the wrong place. Not a security boundary (the agent has root in its own box): it keeps work where `save`,
+ * the workspace view and the next command expect it.
+ */
+export function putPathOf(workdir: string, path: string): string {
+  const root = "/" + segmentsOf(workdir).join("/");
+  const asked = String(path ?? "").trim();
+  if (!asked) throw new Error("path is required: where in the container the file goes, e.g. \"in/photo.jpg\"");
+  const resolved = "/" + segmentsOf(asked.startsWith("/") ? asked : `${root}/${asked}`).join("/");
+  const inside = root === "/" ? resolved !== "/" : resolved.startsWith(root + "/");
+  if (!inside) {
+    throw new Error(`path must name a file inside the working directory ${root}; ${JSON.stringify(asked)} is ${resolved}`);
+  }
+  return resolved;
+}
+
+/** Make the file's directory, and refuse a path that is a directory (exit 6) or under a file (exit 5). */
+export const PUT_PREPARE_SCRIPT = 'mkdir -p -- "$(dirname -- "$1")" 2>/dev/null || exit 5; test -d "$1" && exit 6; exit 0';
+/** The file as the box has it: its size, then its sha256 when the image has `sha256sum`. Exit 3: not a file. */
+export const PUT_CHECK_SCRIPT = 'test -f "$1" || exit 3; stat -c %s -- "$1"; sha256sum -- "$1" 2>/dev/null | cut -d " " -f 1';
+
+const hexOf = (b: ArrayBuffer) => [...new Uint8Array(b)].map((x) => x.toString(16).padStart(2, "0")).join("");
+const mib = (n: number) => `${(n / 1024 / 1024).toFixed(1)} MiB`;
+
 export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lease: BoxLease | null = null): Plugin {
   // **"container", never "sandbox"**, in every sentence below that the model
   // reads. The harness already calls the per-execution JavaScript isolate a
@@ -2186,6 +2228,31 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       // the part with consequences: a durable object that is billed and
       // outlives the container. An operator who wants it free of approval says
       // so per tool; the declaration's job is to be true.
+      sideEffects: "write",
+      idempotency: "none",
+    },
+    {
+      name: "put",
+      summary:
+        "Copy a stored file into the container, so a command there can work on it. `ref` is an artifact:// " +
+        "reference of yours: what an attachment download or `save` returned. The usual way to process an " +
+        "attachment is: download it (attachments_download_url), `put` it here, work on it with `shell` or `run`, " +
+        "`save` the result, then view or upload what `save` returned. No URLs: anything from outside arrives " +
+        `through a download first. At most ${PUT_MAX_BYTES / 1024 / 1024} MiB. Returns the path, size and sha256 ` +
+        "as the container has it. An existing file at the path is replaced.",
+      parameters: {
+        type: "object",
+        properties: {
+          ref: { type: "string", description: "artifact:// reference to copy in" },
+          path: {
+            type: "string",
+            description: "where the file goes, inside the working directory; relative paths start there, e.g. \"in/photo.jpg\"",
+          },
+          machine: MACHINE_PARAM,
+        },
+        required: ["ref", "path"],
+      },
+      // It writes into the container, replacing whatever was at the path.
       sideEffects: "write",
       idempotency: "none",
     },
@@ -2558,6 +2625,33 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       return parsed;
     };
 
+    // Everything about the file is settled before a container is asked for, so a reference that is not this
+    // agent's, a path outside the working directory, or a file too large starts and wakes nothing.
+    let putting: { ref: string; path: string; bytes: Uint8Array; sha256: string } | null = null;
+    if (tool === "put") {
+      if (!artifacts) throw new Error("no object storage is mounted, so there is nothing to put");
+      const ref = String((args as any)?.ref ?? "");
+      // Only the shown form: it is the only one any tool hands out (src/store/refs.ts), and this tool is newer
+      // than every transcript that holds a raw `r2://` one, so it has none to stay compatible with.
+      if (!ref.startsWith(AGENT_REF)) {
+        throw new Error(`ref must be an ${AGENT_REF} reference, as an attachment download or \`save\` returns; ` +
+          `a URL or a storage address is not accepted: ${ref.slice(0, 80)}`);
+      }
+      // The same question every reader of a reference asks: does it name something of the agent holding it.
+      const key = keyForRef(ref, ctx.caller);
+      if (key === null) throw new Error(`reference is not readable by this agent: ${ref.slice(0, 80)}`);
+      const path = putPathOf(cfg.workdir, String((args as any)?.path ?? ""));
+      const tooLarge = (n: number) => new Error(
+        `${ref.slice(0, 80)} is ${mib(n)}, over the ${mib(PUT_MAX_BYTES)} \`put\` copies into a container`);
+      // Asked before the body is read, so an oversized object is never pulled into the isolate.
+      const size = await artifacts.size(key);
+      if (size === null) throw new Error(`no such artifact: ${ref.slice(0, 80)}`);
+      if (size > PUT_MAX_BYTES) throw tooLarge(size);
+      const bytes = await artifacts.get(key);
+      if (bytes.byteLength > PUT_MAX_BYTES) throw tooLarge(bytes.byteLength);
+      putting = { ref, path, bytes, sha256: hexOf(await crypto.subtle.digest("SHA-256", bytes)) };
+    }
+
     // One box per machine, remembered, so an install survives to the next call.
     let state: BoxState | null = await readView(ctx, machine);
     // An emptied record keeps the session history and what was kept, but has no box.
@@ -2646,7 +2740,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     // so it has to be back on the short idle schedule even if this call fails. A new compute session starts
     // (the last one was recorded when it was switched off), and a postponement of its deletion does not carry
     // over to hold off switching it off. `save` included: reading a file out of a stopped box may start it.
-    if (!created && parkedAt(state) !== null && (tool === "run" || tool === "shell" || tool === "save")) {
+    if (!created && parkedAt(state) !== null && (tool === "run" || tool === "shell" || tool === "save" || tool === "put")) {
       const { parkedAt: _p, quietUntil: _q, ...running } = state;
       const t = Date.now();
       state = { ...running, createdAt: t, lastUsedAt: t, execs: 0, saved: [] };
@@ -2729,6 +2823,81 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     if (tool === "save") {
       const r = await saveOut(String((args as any)?.path ?? ""), (args as any)?.archive === true);
       return { ...r, note: savedNote(lease) };
+    }
+
+    if (tool === "put") {
+      const p = putting!;
+      const boxPath = `/projects/${cfg.project}/workspace/boxes/${state!.boxId}`;
+      // A short script on the box, waited for: its exit code and output. Not the agent's shell, so its
+      // directory and the agent's command count are left alone.
+      const script = async (body: string, what: string): Promise<{ exit: number; out: string }> => {
+        const started = await api("POST", `${boxPath}/background-execs`, { command: ["sh", "-c", body, "sh", p.path] });
+        const until = Date.now() + cfg.timeoutMs;
+        for (;;) {
+          const rec = await api("GET", `/projects/${cfg.project}/workspace/execs/${started.exec_id}`);
+          if (rec.state === "succeeded" || rec.state === "failed") return { exit: Number(rec.exit_code ?? -1), out: String(rec.output_summary ?? "") };
+          if (TERMINAL.includes(rec.state)) throw new Error(`could not ${what} for ${p.path}: ${rec.state} ${String(rec.reason ?? "").slice(0, 120)}`);
+          if (Date.now() > until) throw new Error(`could not ${what} for ${p.path}: the command did not finish in time`);
+          await new Promise((r) => setTimeout(r, 300));
+        }
+      };
+      const ready = await script(PUT_PREPARE_SCRIPT, "make the directory");
+      if (ready.exit === 6) throw new Error(`${p.path} is a directory in the container; name a file inside it instead`);
+      if (ready.exit === 5) throw new Error(`could not make the directory for ${p.path}: something on the way there is a file`);
+      if (ready.exit !== 0) throw new Error(`could not make the directory for ${p.path}: exit ${ready.exit} ${ready.out.slice(0, 120)}`);
+
+      // `box_abs_path` as a query parameter, the one place run9 accepts it for both of its upload modes.
+      const form = new FormData();
+      form.append("file", new Blob([p.bytes as Uint8Array<ArrayBuffer>]), p.path.split("/").at(-1) ?? "file");
+      const res = await fetch(`${cfg.endpoint}${boxPath}/files/upload?box_abs_path=${encodeURIComponent(p.path)}`, {
+        method: "POST", headers: { authorization: auth }, body: form, signal: AbortSignal.timeout(cfg.timeoutMs),
+      });
+      const text = await res.text();
+      if (!res.ok) throw new Error(`run9 refused the upload to ${p.path}: ${res.status} ${text.slice(0, 160)}`);
+      let view: any = null;
+      try { view = JSON.parse(text); } catch { /* checked below by reading the file */ }
+      const said = String(view?.state ?? "").toLowerCase();
+      const failure = String(view?.failure_code ?? "");
+      if (failure || ["error", "cancelled", "failed"].includes(said)) {
+        throw new Error(`run9 did not complete the upload to ${p.path}: ${[said, failure, view?.reason].filter(Boolean).join(", ")}`);
+      }
+      // Anything short of finished is waited for where run9 reports transfers (see `PUT_SETTLE_MS`).
+      if (said !== "succeeded") {
+        const settleBy = Date.now() + PUT_SETTLE_MS;
+        for (;;) {
+          const active = await api("GET", `/projects/${cfg.project}/workspace/data-transfers/active?box_id=${encodeURIComponent(state!.boxId)}`);
+          const uploads = (Array.isArray(active) ? active : [])
+            .filter((t: any) => (!t?.box_id || t.box_id === state!.boxId) && t?.direction === "upload");
+          const broken = uploads.find((t: any) => t?.state === "error" || t?.state === "cancelled");
+          if (broken) throw new Error(`run9 did not complete the upload to ${p.path}: ${broken.state}${broken.reason ? `, ${String(broken.reason).slice(0, 120)}` : ""}`);
+          if (!uploads.some((t: any) => t?.state !== "succeeded")) break;
+          if (Date.now() > settleBy) {
+            throw new Error(`run9 had not finished the upload to ${p.path} after ${PUT_SETTLE_MS / 1000} s; ` +
+              "it may still land, so check the file before using it, or put it again");
+          }
+          await new Promise((r) => setTimeout(r, 500));
+        }
+      }
+
+      // Read back from the box itself: run9's answer says a transfer ended, this says the file is the one sent.
+      const got = await script(PUT_CHECK_SCRIPT, "read the file back");
+      if (got.exit === 3) throw new Error(`run9 accepted the upload, but ${p.path} is not a file in the container`);
+      if (got.exit !== 0) throw new Error(`could not read ${p.path} back: exit ${got.exit} ${got.out.slice(0, 120)}`);
+      const [sizeLine, hashLine] = got.out.trim().split("\n").map((l) => l.trim());
+      const boxSize = Number(sizeLine);
+      const boxHash = /^[0-9a-f]{64}$/.test(hashLine ?? "") ? hashLine! : null;
+      if (boxSize !== p.bytes.byteLength || (boxHash !== null && boxHash !== p.sha256)) {
+        throw new Error(`${p.path} in the container is not the file sent: ${sizeLine} bytes` +
+          `${boxHash ? `, sha256 ${boxHash}` : ""}, where ${p.bytes.byteLength} bytes, sha256 ${p.sha256} were sent`);
+      }
+      state = { ...state!, lastUsedAt: Date.now() };
+      await writeView(ctx, machine, state);
+      return {
+        path: p.path, bytes: p.bytes.byteLength, sha256: p.sha256, ref: p.ref, ...named,
+        // Whether the box's own sha256 was compared, or only its size (an image without `sha256sum`).
+        checked: boxHash ? "sha256" : "size",
+        note: "in the container now; work on it with `shell` or `run`, and `save` what you make from it",
+      };
     }
 
     if (tool === "release") {
