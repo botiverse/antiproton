@@ -25,6 +25,7 @@
  */
 import type { TraceOutboxRow } from "../trace/outbox.ts";
 import type { ActivityEvent, AgentStatus } from "../plugins/types.ts";
+import { operationToolName } from "./pi-tools.ts";
 import { isSubagentSession } from "./subagent-session.ts";
 
 /**
@@ -71,10 +72,11 @@ export function statusEvents(agentId: string, rows: readonly TraceOutboxRow[], b
         break;
       case "tool.call": {
         if (operatorCall(row)) break;
-        // What "working" is working on, named as the model names the tool; shown with the status in Raft.
+        // What "working" is working on, named as the model names the tool; shown with the status in Raft. The row's
+        // `tool` is the dispatch address (`operationToolName`).
         const tool = typeof row.attrs.tool === "string" ? row.attrs.tool : null;
         const mount = typeof row.attrs.mount === "string" ? row.attrs.mount : null;
-        const name = tool ? (mount ? `${mount}__${tool}` : tool) : null;
+        const name = tool ? (mount ? operationToolName(mount, tool) : tool) : null;
         raw.push({ at: row.at - ms, key: `${id}:start`, status: "working", ...(name ? { detail: `Using ${name}`.slice(0, 200) } : {}) });
         break;
       }

@@ -19,11 +19,34 @@ check("a delivered inbound row is the message that starts the turn; other inboun
 });
 
 check("a tool row is two events: the call dated its start and the result dated its end, named as the model names the tool", () => {
-  const ev = activityEvents("raft_a", [row(5, "tool.call", "succeeded", "ok", { ms: 2500, attrs: { tool: "messages_send", mount: "raft" } })]);
+  const ev = activityEvents("raft_a", [row(5, "tool.call", "succeeded", "ok", { ms: 2500, attrs: { tool: "raft.messages_send", mount: "raft" } })]);
   must(ev.length === 2, JSON.stringify(ev));
   const [pre, post] = ev;
   must(pre!.hookEventName === "PreToolUse" && pre!.eventId === "raft_a:5:pre" && pre!.toolName === "raft__messages_send" && pre!.occurredAt === new Date(T0 + 5000 - 2500).toISOString(), JSON.stringify(pre));
   must(post!.hookEventName === "PostToolUse" && post!.eventId === "raft_a:5" && post!.durationMs === 2500 && post!.errorClass === undefined && post!.occurredAt === new Date(T0 + 5000).toISOString(), JSON.stringify(post));
+});
+
+check("a tool row's toolName is the name the model was shown, not the row's dispatch address under the alias", () => {
+  // `tool` as the gateway records it: `<plugin>.<tool>` (src/runtime/gateway.ts), the alias kept beside it as `mount`.
+  const named = (seq: number, attrs: Record<string, unknown>, subagents?: Parameters<typeof activityEvents>[2]) => {
+    const ev = activityEvents("raft_a", [row(seq, "tool.call", "succeeded", "ok", { ms: 10, attrs })], subagents);
+    const tools = ev.filter((e) => e.hookEventName === "PreToolUse" || e.hookEventName === "PostToolUse");
+    must(tools.length === 2 && tools[0]!.toolName === tools[1]!.toolName, `the pair: ${JSON.stringify(ev)}`);
+    return { name: tools[0]!.toolName, detail: ev.find((e) => e.detail !== undefined)?.detail };
+  };
+  const state = named(50, { tool: "state.list", mount: "state" });
+  must(state.name === "state__list" && state.detail === "Using state__list", `state: ${JSON.stringify(state)}`);
+  must(named(51, { tool: "raft.messages_send", mount: "raft" }).name === "raft__messages_send", "raft");
+  // The alias, not the plugin id, heads the name: one MCP plugin serves every connector mount.
+  must(named(52, { tool: "mcp.list_issues", mount: "linear" }).name === "linear__list_issues", "an alias that is not its plugin's id");
+  // An alias stored before MOUNT_ALIAS may hold "." (sanitised, as qualification does) or "__" (kept): the tool part
+  // comes from the address, so neither is split.
+  must(named(53, { tool: "sandbox.run", mount: "my.box" }).name === "my_box__run", "an alias with a dot");
+  must(named(54, { tool: "sandbox.run", mount: "old__box" }).name === "old__box__run", "an alias with __");
+  must(named(55, { tool: "send_to_agent" }).name === "send_to_agent" && named(56, { tool: "x.y" }).name === "x.y", "a tool with no mount is unchanged");
+  // A child's step is named the same way, beside its marker.
+  const child = named(57, { tool: "state.list", mount: "state", task: "sub_c1", session: "sub_c1" }, { lineage: () => "call_1" });
+  must(child.name === "state__list", `a subagent's step: ${JSON.stringify(child)}`);
 });
 
 check("both events of a tool call carry the operation id as toolUseId, and two calls never share one, even under one model call id", () => {
@@ -70,7 +93,7 @@ check("durationMs is how long the tool ran (runMs) when the row says it, so an a
 
 check("a tool row that did not succeed is a failure carrying the status as its class", () => {
   for (const [status, verdict] of [["failed", "failed"], ["rejected", "blocked"], ["cancelled", "cancelled"]] as const) {
-    const ev = activityEvents("raft_a", [row(7, "tool.call", status, verdict, { ms: 10, attrs: { tool: "run", mount: "sandbox" } })]);
+    const ev = activityEvents("raft_a", [row(7, "tool.call", status, verdict, { ms: 10, attrs: { tool: "sandbox.run", mount: "sandbox" } })]);
     must(ev[1]!.hookEventName === "PostToolUseFailure" && ev[1]!.errorClass === status && ev[1]!.toolName === "sandbox__run", `${status}: ${JSON.stringify(ev)}`);
   }
 });
@@ -112,7 +135,7 @@ check("in a real turn the tool call says which tool it is working on, on the Pre
   // The model asks for a tool (answer at 30s), the tool runs 30.005–30.2s, the model answers (stop at 31s).
   const ev = activityEvents("raft_a", [
     row(30, "model.call", "toolUse", "ok", { ms: 800 }),
-    { ...row(30, "tool.call", "succeeded", "ok", { ms: 195, attrs: { tool: "messages_send", mount: "raft" } }), seq: 301, at: T0 + 30_200 },
+    { ...row(30, "tool.call", "succeeded", "ok", { ms: 195, attrs: { tool: "raft.messages_send", mount: "raft" } }), seq: 301, at: T0 + 30_200 },
     row(31, "model.call", "stop", "ok", { ms: 700 }),
   ]);
   const pre = ev.find((e) => e.hookEventName === "PreToolUse");

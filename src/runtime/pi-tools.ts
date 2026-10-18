@@ -23,7 +23,7 @@ import { programCallKey } from "./operation-id.ts";
 import { splitView, viewContent, type ViewHost, type ViewMarker } from "./tool-view.ts";
 import type { Json } from "../core/types.ts";
 import type { Continuation, HeldCall, Paused } from "../core/execution.ts";
-import type { ToolInterrupt } from "../core/tools.ts";
+import { parseToolRef, type ToolInterrupt } from "../core/tools.ts";
 import {
   answerProblem, answerSpecOf, type AnswerSpec, type InterruptHost, type RunJsContinuations,
 } from "./run-js-resume.ts";
@@ -124,6 +124,18 @@ export function modelToolName(alias: string, tool: string): string {
   const a = modelName(alias);
   const room = Math.max(1, MAX_NAME - a.length - 2);
   return `${a}__${modelName(tool).slice(0, room)}`;
+}
+
+/**
+ * The name the model was shown for an operation's tool, from the two things the operation records: its mount's alias
+ * and its dispatch address. The address is `<plugin>.<tool>` (src/runtime/gateway.ts, where `recordOperation` is
+ * called), so prefixing it with the alias as it stands named a tool nobody was offered (`raft__raft.messages_send`).
+ * It is split the way the gateway splits an address (`parseToolRef`, at the first dot: a plugin id has none); an
+ * address that is not one is taken as the bare tool. Like {@link modelToolName}, this is not the name a collision
+ * tie-break gave, which no operation or trace row records.
+ */
+export function operationToolName(alias: string, address: string): string {
+  return modelToolName(alias, parseToolRef(address)?.tool ?? address);
 }
 
 /**

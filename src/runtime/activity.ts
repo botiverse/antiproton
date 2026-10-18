@@ -31,6 +31,7 @@
  */
 import type { TraceOutboxRow } from "../trace/outbox.ts";
 import type { ActivityEvent } from "../plugins/types.ts";
+import { operationToolName } from "./pi-tools.ts";
 import { operatorCall, statusEvents, subagentRow, turnEndClass } from "./status.ts";
 
 export const ACTIVITY_SCHEMA = "raft-agent-activity-ingest.v1";
@@ -143,8 +144,9 @@ function hookEvents(agentId: string, rows: readonly TraceOutboxRow[], subagents?
 function toolCallEvents(base: { eventId: string; occurredAt: string }, row: TraceOutboxRow, subagent?: ActivityEvent["subagent"]): ActivityEvent[] {
   const tool = typeof row.attrs.tool === "string" ? row.attrs.tool : "tool";
   const mount = typeof row.attrs.mount === "string" ? row.attrs.mount : null;
-  // Named as the model names it, so the service's trajectory reads like the transcript.
-  const toolName = mount ? `${mount}__${tool}` : tool;
+  // Named as the model names it, so the service's trajectory reads like the transcript. The row's `tool` is the
+  // dispatch address (`raft.messages_send`), not the tool's own name (`operationToolName`).
+  const toolName = mount ? operationToolName(mount, tool) : tool;
   const ok = row.verdict === "ok";
   const ms = typeof row.ms === "number" ? row.ms : 0;
   // The operation id, on both events, is what pairs them: one per call and one row per operation

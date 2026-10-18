@@ -31,6 +31,7 @@ import { appendTrace } from "../trace/outbox.ts";
 import { MAIN_SESSION, piTables, type SqlHost } from "../store/pi-storage.ts";
 import { fenceFor } from "../plugins/state.ts";
 import { keyedOperationId, programCallKey } from "./operation-id.ts";
+import { operationToolName } from "./pi-tools.ts";
 import { BRIEFING_BUDGET_TOKENS, recordRebuildDecision, type RebuildTrigger } from "./rebuild.ts";
 
 type Sql = SqlHost["sql"];
@@ -467,7 +468,8 @@ export function programSendCounter(sql: Sql, tenantId: string, taskId: string = 
       const ids = Array.from({ length: IDS_PER_QUERY }, (_, k) => keyedOperationId(tenantId, taskId, programCallKey(toolCallId, from + k)));
       const rows = sql.exec(`SELECT mount_alias, tool FROM operations WHERE tenant_id = ? AND status = 'succeeded' AND operation_id IN (${ids.map(() => "?").join(", ")})`,
         tenantId, ...ids).toArray() as Array<{ mount_alias: unknown; tool: unknown }>;
-      sends += rows.filter((r) => isSendTool(`${String(r.mount_alias)}__${String(r.tool)}`)).length;
+      // `tool` is the dispatch address (`raft.messages_send`), which `isSendTool` does not read as a send.
+      sends += rows.filter((r) => isSendTool(operationToolName(String(r.mount_alias), String(r.tool)))).length;
     }
     return sends;
   };
