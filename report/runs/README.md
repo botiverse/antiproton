@@ -193,6 +193,25 @@ analysed round that was 6 of `gpt-5.6-luna`'s 9 failures and 5 of
 `deepseek-flash`'s 6. A rise in pass rate at the change of `sim.guideline` is
 therefore partly that, and is not the agent improving.
 
+## Reading a τ² record: `rewardRule`, and what decided `reward`
+
+A record with `rewardRule: "reward_basis"` scored each row as τ² does: the AND
+of only the components its task lists in `reward_basis` (`rewardOf` in
+`bench/tau2/grade.ts`). Every retail task lists `["DB","NL_ASSERTION"]` or
+`["DB"]`, so the database decides. A record without the field scored every row
+`dbMatch && actionMatch`, and `actionMatch` compares arguments exactly: a write
+with one argument the tool ignored (`confirm: true`) failed a task whose
+database was right. Both fields stay on every row under either rule.
+
+`rewardBasis` on a row is the list it was scored over. `unjudged` names a
+listed component that has criteria this grader cannot check (an NL assertion
+needs a judge model), so the reward stood on the rest; tasks 2, 3 and 4 carry
+`NL_ASSERTION` there.
+
+To read an older record under the current rule, run
+`node bench/tau2/rescore.ts`: it re-grades every record in `manifest.tsv` from
+the rows' own `dbMatch` and `actionMatch`, and changes nothing.
+
 ## Publishing a run
 
 `bench/record.ts` writes each record under `report/runs/<day>/` in the working
