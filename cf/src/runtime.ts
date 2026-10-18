@@ -645,6 +645,11 @@ class BoundArtifacts {
     if (!obj) throw new Error("no such artifact");
     return new Uint8Array(await obj.arrayBuffer());
   }
+  /** The stored object's length, read without its body; null when there is no such object. */
+  async size(key: string): Promise<number | null> {
+    const obj = await this.#bucket.head(key);
+    return obj ? obj.size : null;
+  }
 }
 
 /** Whether a binding spends the operator's model account, through any provider. */
