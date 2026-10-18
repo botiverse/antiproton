@@ -26,7 +26,7 @@ function deps(over: Partial<ConnectDeps> = {}) {
     registry: {
       async consumeLink(nonce) { if (used.has(nonce)) return false; used.add(nonce); return true; },
     },
-    async hold(tenantId, agentId, plugin, grant, id, exp, raftUserId) { held.push({ tenantId, agentId, plugin, token: grant.accessToken, grant, id, exp, raftUserId }); return { ok: true }; },
+    async hold(tenantId, agentId, plugin, grant, id, exp, raftUserId, reconnect) { held.push({ tenantId, agentId, plugin, token: grant.accessToken, grant, id, exp, raftUserId, reconnect }); return { ok: true }; },
     async exchange(code, redirectUri) {
       exchanged.push(`${code}@${redirectUri}`);
       return { grant: { accessToken: TOKEN, refreshToken: null, expiresAt: null, refreshExpiresAt: null }, keys: ["access_token", "scope", "token_type"] };
@@ -114,6 +114,33 @@ await check("the callback logs which keys GitHub's answer carried, never a value
   must(said.length === 1 && said[0].keys === keys.join(" ") && said[0].expiring === true && said[0].agentId === "raft_a1", JSON.stringify(said));
   must(!lines.some((l) => l.includes(grant.accessToken) || l.includes(grant.refreshToken)), "a token value was logged");
   must(JSON.stringify(x.held[0]?.grant) === JSON.stringify(grant), "the hold did not get the whole grant");
+});
+
+await check("a reconnect's connector travels signed from the link to the hold; a link respelled to name another connector starts nothing", async () => {
+  const x = deps();
+  const reconnect = { connectorId: "con_mine", actingRole: "creator" as const };
+  const { url } = await connectLink(ORIGIN, SECRET, { ...spec, reconnect }, x.d.now());
+  // The browser holds the link: rewriting the connector in it, signature kept, is a forgery.
+  const [body, sig] = new URL(url).searchParams.get("t")!.split(".") as [string, string];
+  const payload = JSON.parse(Buffer.from(body, "base64url").toString("utf8"));
+  must(payload.reconnect?.connectorId === "con_mine", `the link does not carry the connector: ${JSON.stringify(payload)}`);
+  const swapped = new URL(url);
+  swapped.searchParams.set("t", `${Buffer.from(JSON.stringify({ ...payload, reconnect: { ...reconnect, connectorId: "con_other" } })).toString("base64url")}.${sig}`);
+  must((await connectStart(swapped, x.d)).status === 400, "a link naming another connector started");
+  const start = await connectStart(new URL(url), x.d);
+  must(start.status === 302, `start ${start.status}`);
+  const state = new URL(start.headers.get("location")!).searchParams.get("state")!;
+  const cb = new URL(`${ORIGIN}${CONNECT_CALLBACK_PATH}?code=c0de&state=${state}`);
+  const res = await connectCallback(new Request(cb, { headers: { cookie: cookieFrom(start) } }), cb, x.d);
+  must(res.status === 302 && new URL(res.headers.get("location")!).searchParams.get("status") === "pending", `callback ${res.status}`);
+  must(JSON.stringify(x.held[0]?.reconnect) === JSON.stringify(reconnect), `the hold got ${JSON.stringify(x.held[0]?.reconnect)}`);
+  // A plain connect holds none.
+  const y = deps();
+  const plain = await connectStart(new URL((await connectLink(ORIGIN, SECRET, spec, y.d.now())).url), y.d);
+  const st = new URL(plain.headers.get("location")!).searchParams.get("state")!;
+  const cb2 = new URL(`${ORIGIN}${CONNECT_CALLBACK_PATH}?code=c0de&state=${st}`);
+  await connectCallback(new Request(cb2, { headers: { cookie: cookieFrom(plain) } }), cb2, y.d);
+  must(y.held[0] && y.held[0].reconnect === null, `a plain connect held ${JSON.stringify(y.held[0]?.reconnect)}`);
 });
 
 await check("a callback without the flow's cookie or with another state is refused, and nothing is attached", async () => {

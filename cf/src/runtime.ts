@@ -178,7 +178,8 @@ export function hostCallOpts(call: { opts?: unknown; callId?: string }): InvokeO
 import type { MountPolicy, MountRecord } from "../../src/core/types.ts";
 import type { ConnectorGrants, ConnectorRefresh, HookDirectory, HookRow } from "./control-plane.ts";
 import { GithubRefresher, RECONNECT_REASON, type GithubApp, type MountGrant } from "./github-refresh.ts";
-import { REFRESH_SKEW_MS } from "./github-token.ts";
+import { githubUser, REFRESH_SKEW_MS } from "./github-token.ts";
+import type { ReconnectTarget } from "./provision/connect.ts";
 import type { GithubGrant } from "./github-token.ts";
 import { appendUsage, jsRunRows, modelTokenRows } from "../../src/usage/outbox.ts";
 import {
@@ -1848,9 +1849,10 @@ export class AgentRuntime {
    * started it — so a link sent to someone else cannot put their account on this agent. Expired rows
    * are cleared each time a new one is held. On these rows the `account` column holds the Raft user
    * the flow was started for, not an account the credential grants: they are never a mount's credential.
+   * `reconnect`, from the signed link, is sealed in with the grant: confirm reads the connector to mend from here.
    */
-  async holdConnection(tenantId: string, agentId: string, plugin: string, grant: GithubGrant | string, id: string, exp: number, raftUserId: string):
-    Promise<{ ok: true } | { ok: false; error: string }> {
+  async holdConnection(tenantId: string, agentId: string, plugin: string, grant: GithubGrant | string, id: string, exp: number, raftUserId: string,
+    reconnect: ReconnectTarget | null = null): Promise<{ ok: true } | { ok: false; error: string }> {
     await this.ready();
     const kek = await this.#kek;
     if (!kek) return { ok: false, error: "this deployment has no SECRET_KEK, so it cannot keep a credential" };
@@ -1859,7 +1861,9 @@ export class AgentRuntime {
       if (Number(r.name.split(":")[2]) <= now) await this.store.removeSecret(tenantId, agentId, r.name);
     }
     // The whole grant, as JSON: an expiring token's refresh token and lifetimes have to reach the mount with it.
-    const sealed = await seal(kek, typeof grant === "string" ? grant : JSON.stringify({ v: 1, ...grant }));
+    const g: GithubGrant | string = typeof grant === "string" && reconnect
+      ? { accessToken: grant, refreshToken: null, expiresAt: null, refreshExpiresAt: null } : grant;
+    const sealed = await seal(kek, typeof g === "string" ? g : JSON.stringify({ v: 1, ...g, ...(reconnect ? { reconnect } : {}) }));
     await this.store.putSecret(tenantId, agentId, `pending:${plugin}:${exp}:${id}`, { ciphertext: sealed.ciphertext, iv: sealed.iv, account: raftUserId });
     return { ok: true };
   }
@@ -1867,9 +1871,15 @@ export class AgentRuntime {
   /**
    * Make a held connection the credential of this agent's mount of that plugin: once, before it expires,
    * and only for the Raft user it was held for. The held row goes whatever the outcome.
+   *
+   * A hold for a reconnect in place (`reconnect`, sealed in at the hold) is NOT attached here: the provider handler
+   * first checks that the account is the connector's own, and a refusal must leave this mount as it was. It comes
+   * back with the account GitHub names for the token (`GET /user`, which also proves it works), or is refused when
+   * GitHub does not say. Either way `accountId` is GitHub's numeric id, null when a plain connect could not learn it.
    */
   async confirmConnection(tenantId: string, agentId: string, plugin: string, id: string, raftUserId: string, connectorId: string | null = null):
-    Promise<{ ok: true; account: string | null; sealed: Sealed; refresh: ConnectorRefresh | null } | { ok: false; error: string; missing?: true }> {
+    Promise<{ ok: true; account: string | null; accountId: string | null; sealed: Sealed; refresh: ConnectorRefresh | null; reconnect: ReconnectTarget | null }
+      | { ok: false; error: string; missing?: true }> {
     await this.ready();
     const kek = await this.#kek;
     if (!kek) return { ok: false, error: "this deployment has no SECRET_KEK, so it cannot keep a credential" };
@@ -1883,17 +1893,49 @@ export class AgentRuntime {
     }
     // A hold from before #935 is the bare token; one since is the grant as JSON. A token never begins with "{".
     const held = await open(kek, sealed);
-    const grant: GithubGrant = held.startsWith("{")
-      ? JSON.parse(held) as GithubGrant
+    const parsed = held.startsWith("{") ? JSON.parse(held) as GithubGrant & { reconnect?: ReconnectTarget } : null;
+    const grant: GithubGrant = parsed
+      ? { accessToken: parsed.accessToken, refreshToken: parsed.refreshToken, expiresAt: parsed.expiresAt, refreshExpiresAt: parsed.refreshExpiresAt }
       : { accessToken: held, refreshToken: null, expiresAt: null, refreshExpiresAt: null };
+    const reconnect = parsed?.reconnect ?? null;
     const access = await seal(kek, grant.accessToken);
     const refresh: ConnectorRefresh | null = grant.refreshToken
       ? { sealed: await seal(kek, grant.refreshToken), expiresAt: grant.expiresAt, refreshExpiresAt: grant.refreshExpiresAt }
       : null;
+    if (reconnect) {
+      const who = await githubUser(grant.accessToken);
+      if (!who) return { ok: false, error: "GitHub did not say which account was authorized, so the connector was not changed; reconnect again" };
+      return { ok: true, account: who.login, accountId: who.id, sealed: access, refresh, reconnect };
+    }
     // Handed back sealed: the connection it becomes is the tenant's (cf/migrations/0012_connectors.sql), under the
     // id the caller is about to create it with, which is how this mount finds the pair when it needs renewing.
     const r = await this.attachSealedConnection(tenantId, agentId, plugin, access, refresh ? { ...refresh, connectorId } : null, grant);
-    return r.ok ? { ...r, sealed: access, refresh } : r;
+    if (!r.ok) return r;
+    // The id a later reconnect in place compares, since a login can be renamed. Not a reason to refuse this connect:
+    // a connector without one falls back to its login.
+    const who = await githubUser(grant.accessToken);
+    return { ...r, accountId: who?.id ?? null, sealed: access, refresh, reconnect: null };
+  }
+
+  /**
+   * A connector this agent's mount is on was reconnected in place: put its new pair on the mount, which also clears
+   * the mount's own broken flag (the renewal record is written afresh). Only while the mount is still the connector's
+   * — its renewal record names the connector, or it holds the connector's previous token (`was`) — as
+   * `detachConnectionIfFrom` judges it: a key put on the mount since is not the connector's to replace.
+   */
+  async reconnectConnection(tenantId: string, agentId: string, plugin: string, connectorId: string, was: Sealed, sealed: Sealed,
+    refresh: ConnectorRefresh | null): Promise<{ ok: true; updated: boolean } | { ok: false; error: string }> {
+    await this.ready();
+    const kek = await this.#kek;
+    if (!kek) return { ok: false, error: "this deployment has no SECRET_KEK, so it cannot keep a credential" };
+    const mount = (await this.store.findMountsByPlugin(tenantId, agentId, plugin))[0];
+    if (!mount || !isAgentRef(mount.secretRef)) return { ok: true, updated: false };
+    const name = mount.secretRef!.slice(agentRef("").length);
+    const renewedFrom = (await this.#oauth.read(tenantId, agentId, name))?.connectorId === connectorId;
+    const held = await this.store.getSecret(tenantId, agentId, name);
+    if (!held || (!renewedFrom && await open(kek, held) !== await open(kek, was))) return { ok: true, updated: false };
+    const r = await this.attachSealedConnection(tenantId, agentId, plugin, sealed, refresh ? { ...refresh, connectorId } : null);
+    return r.ok ? { ok: true, updated: true } : r;
   }
 
   /**

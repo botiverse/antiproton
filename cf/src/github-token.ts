@@ -93,3 +93,23 @@ export const TOKEN_TIMEOUT_MS = 25_000;
 
 /** How close to its expiry an access token is refreshed before use. */
 export const REFRESH_SKEW_MS = 5 * 60_000;
+
+/** Who a token acts as: the login, which can be renamed, and GitHub's numeric user id, which cannot. */
+export interface GithubIdentity { login: string; id: string }
+
+/**
+ * `GET /user` for `token`: which account the person authorized. Null when GitHub did not say (a refusal, an outage, an
+ * answer without both fields): a caller that needs the account to be a particular one must then refuse, not guess.
+ */
+export async function githubUser(token: string, fetchImpl: typeof fetch = fetch): Promise<GithubIdentity | null> {
+  try {
+    const r = await fetchImpl("https://api.github.com/user", {
+      headers: { authorization: `Bearer ${token}`, accept: "application/vnd.github+json", "user-agent": GITHUB_UA },
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!r.ok) { await r.body?.cancel().catch(() => {}); return null; }
+    const j = await r.json() as { login?: unknown; id?: unknown };
+    if (typeof j.login !== "string" || !j.login || (typeof j.id !== "number" && typeof j.id !== "string") || String(j.id) === "") return null;
+    return { login: j.login, id: String(j.id) };
+  } catch { return null; }
+}

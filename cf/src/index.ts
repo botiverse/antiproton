@@ -101,7 +101,7 @@ import { hashServiceToken, looksLikeServiceToken } from "./service-token.ts";
 import { adminProviderTokens, reservedTenantProblem } from "./admin-provider-tokens.ts";
 import { d1ConnectorGrants, d1Connections, d1Connectors, type ConnectorRefresh, d1ModelChoices, d1ModelOverrides, d1ProviderTokens, d1ProvisionedAgents, d1TenantModelPicker } from "./control-plane.ts";
 import type { GithubGrant } from "./github-token.ts";
-import { CONNECT_START_PATH, CONNECTION_PLUGIN, connectCallback, connectLink, connectStart, isConnectCallback, type ConnectDeps } from "./provision/connect.ts";
+import { CONNECT_START_PATH, CONNECTION_PLUGIN, connectCallback, connectLink, connectStart, isConnectCallback, type ConnectDeps, type ReconnectTarget } from "./provision/connect.ts";
 import { hashProviderToken, looksLikeProviderToken } from "./provider-token.ts";
 import { handleProvision, IMPORT_REQUEST_MAX_BYTES, IMPORT_ROUTE, type ProvisionDeps, type ProvisionTool } from "./provision/handlers.ts";
 import { sharedUsageCache } from "./provision/usage.ts";
@@ -1913,9 +1913,17 @@ export class AgentDO extends DurableObject<Env> {
   }
 
   /** Connect flow (provision/connect.ts): a finished flow's token, held until Raft confirms its initiator. */
-  async connectionHold(tenantId: string, agentId: string, plugin: string, grant: GithubGrant, id: string, exp: number, raftUserId: string) {
+  async connectionHold(tenantId: string, agentId: string, plugin: string, grant: GithubGrant, id: string, exp: number, raftUserId: string,
+    reconnect: ReconnectTarget | null = null) {
     this.#claim(tenantId, agentId);
-    return this.#busy("connectionHold", () => this.runtime().holdConnection(tenantId, agentId, plugin, grant, id, exp, raftUserId));
+    return this.#busy("connectionHold", () => this.runtime().holdConnection(tenantId, agentId, plugin, grant, id, exp, raftUserId, reconnect));
+  }
+
+  /** A connector this agent is on was reconnected in place: take its new pair (provision/handlers.ts `reconnectInPlace`). */
+  async connectionReconnect(tenantId: string, agentId: string, plugin: string, connectorId: string, was: { ciphertext: string; iv: string },
+    sealed: { ciphertext: string; iv: string }, refresh: ConnectorRefresh | null) {
+    this.#claim(tenantId, agentId);
+    return this.#busy("connectionReconnect", () => this.runtime().reconnectConnection(tenantId, agentId, plugin, connectorId, was, sealed, refresh));
   }
 
   async connectionConfirm(tenantId: string, agentId: string, plugin: string, id: string, raftUserId: string, connectorId: string | null = null) {
@@ -2839,8 +2847,8 @@ function connectDeps(env: Env): ConnectDeps | null {
     origin: env.UI_ORIGIN!, secret: env.SESSION_SECRET!,
     github: { clientId: cfg.clientId, clientSecret: cfg.clientSecret },
     registry: d1Connections(env.CONTROL_DB),
-    hold: (tenantId, agentId, plugin, token, id, exp, raftUserId) =>
-      stub(tenantId, agentId).connectionHold(tenantId, agentId, plugin, token, id, exp, raftUserId),
+    hold: (tenantId, agentId, plugin, token, id, exp, raftUserId, reconnect) =>
+      stub(tenantId, agentId).connectionHold(tenantId, agentId, plugin, token, id, exp, raftUserId, reconnect ?? null),
     exchange: (code, redirectUri) => githubExchangeCode({ ...cfg, redirectUri }, code),
     now: () => Date.now(),
   };
@@ -3609,6 +3617,8 @@ function provisionDeps(env: Env): ProvisionDeps {
           stub(tenantId, agentId).connectionDetachIfFrom(tenantId, agentId, CONNECTION_PLUGIN[provider], sealed, connectorId),
         attach: (tenantId, agentId, provider, sealed, refresh) =>
           stub(tenantId, agentId).connectionAttach(tenantId, agentId, CONNECTION_PLUGIN[provider], sealed, refresh),
+        reconnect: (tenantId, agentId, provider, connectorId, was, sealed, refresh) =>
+          stub(tenantId, agentId).connectionReconnect(tenantId, agentId, CONNECTION_PLUGIN[provider], connectorId, was, sealed, refresh),
         connectors: d1Connectors(env.CONTROL_DB),
         newId: () => `con_${crypto.randomUUID().replace(/-/g, "").slice(0, 20)}`,
       },

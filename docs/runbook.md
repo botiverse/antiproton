@@ -155,9 +155,23 @@ marked), `interrupted-before` (a renewal in this object stopped part-way; the ne
 token. Each connect also writes `connect.exchange` with the **names** of the keys GitHub's answer carried: one with
 `expires_in` and `refresh_token` is an expiring token (`expiring: true`).
 
-**Mending it** is the person's: Connect GitHub again from the agent's page. That makes a new connector and clears the
-state for that agent; other agents on the old connector are pointed at the new one from their own pages. Nothing an
-operator writes to D1 brings a refused refresh token back.
+**Mending it** is the person's: reconnect from the agent's page. Raft sends the broken connector's id with the
+connect (`connectorId`, [`agent-surface.md`](agent-surface.md#reconnecting-a-connector-in-place)), so the connector
+is mended in place, keeps its id, and every agent on it gets the new pair in the same call. A connect without the id
+still makes a new connector for that one agent, and the other agents stay on the broken one until they are pointed
+at the new one. Nothing an operator writes to D1 brings a refused refresh token back.
+
+The reconnect has to be the connector's own GitHub account. `connectors.account_id` (migration 0024) is GitHub's
+numeric user id. It is null for a connector made before 0024, and then the login is compared until a reconnect
+stores the id. Any other account is `409 account_mismatch` and changes nothing. A reconnect in place shows as:
+
+```sql
+-- Who reconnected it, and in what role (`creator`, or `admin` on Raft's word).
+SELECT action, raft_agent_id, acting_raft_user_id, acting_role, at FROM connector_events WHERE connector_id = '<connectorId>' AND action IN ('reconnect', 'bind') ORDER BY at;
+```
+
+The log has a `connect.reconnect` line with `connectorId`, `actingRole` and how many agents were `updated` or
+`failed`. A failed agent takes the pair from the connector on its next GitHub call.
 
 ## Trying conversation cards on an agent
 

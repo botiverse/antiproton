@@ -783,13 +783,76 @@ error code, an outage page, a timeout. The connection is reported:
 - The agent is told as well: a GitHub tool's result says `OAuth authorization expired; reconnect required` and that the
   user must reconnect GitHub, and that retrying will not help.
 - `PUT` pointing an agent at a connector in this state is refused: `422`, `code: "connect_failed"`.
-- **Reconnecting** is the same flow as connecting (`POST`, then `POST …/confirm`). It makes a new connector, points
-  this agent at it and clears the state for this agent. Other agents on the broken connector stay broken until they
-  are pointed at the new one (`PUT` with its `connectorId`).
+- **Reconnecting** mends the connector in place, for every agent on it: the same flow as connecting, with the
+  connector named in the `POST` ([below](#reconnecting-a-connector-in-place)). A `POST` without it still makes a new
+  connector and points only this agent at it; other agents on the broken connector then stay broken until they are
+  pointed at the new one (`PUT` with its `connectorId`).
 - GitHub's own words (`bad_refresh_token: The refresh token passed is incorrect or expired.`) are kept for the
   operator, not sent here ([`runbook.md`](runbook.md#a-github-connection-that-needs-reconnecting)).
 
 A token that does not expire is never renewed and never reported this way: a `401` for it reads as it always has.
+
+#### Reconnecting a connector in place
+
+**New for Raft.** One person authorizing GitHub again mends a connector for every agent pointed at it, broken
+(`oauthStatus: "error"`) or healthy (a re-authorization). The connector keeps its id, so no agent has to be pointed
+anywhere. Two calls, the same as connecting:
+
+```json
+POST /provision/agents/by-raft-agent/{raftAgentId}/connections/github
+{ "returnUrl": "…", "initiatedBy": { "raftUserId": "<session user>" },
+  "connectorId": "con_…", "actingRole": "creator" | "admin", "access": "public" | "private" }
+```
+
+- `connectorId` is the connector to mend, one of this tenant's (`connectors` in `GET`). It is signed into the link,
+  carried in the flow and sealed into the hold in the agent's object. `POST …/confirm` reads it from there and takes
+  no `connectorId` of its own: one sent is `400`, `code: "unknown_field"`. Nothing the browser holds can point the new
+  authorization at another connector.
+- `actingRole` is required with `connectorId`, and only with it (`422`, `param: "actingRole"`). It says in which
+  capacity Raft checked that `initiatedBy.raftUserId` may reconnect this connector: `creator` (the connector's
+  creator) or `admin` (a server owner or admin). This is the rule `PUT` and `DELETE /connectors/:id` follow.
+  **Raft must check owner/admin before it sends `admin`**: antiproton cannot see Raft's roles and takes `admin` on
+  Raft's word. A `creator` claim is checked here against `creatorRaftUserId`, at the `POST` and again at confirm
+  (`403`, `code: "not_creator"`).
+- The answer is the usual `{ url, expiresAt, scopes }` plus `"reconnect": "con_…"`. An unknown connector, or another
+  tenant's, is `404 not_found`, and no link is made.
+- The browser comes back `status=pending&pending=…&by=…` as for a connect, and Raft confirms as for a connect:
+  `POST …/confirm { pending, raftUserId }`.
+
+The authorization must be **the connector's own GitHub account**. GitHub's numeric user id is compared, because a login
+can be renamed. A connector made before the id was kept (before migration 0024) is compared by login, ignoring case,
+and keeps the id from then on. Any other account is refused, and **nothing changes**: not the connector, not any
+agent's mount, not this agent. The agents on the connector never start acting as someone else:
+
+```json
+409 { "error": { "code": "account_mismatch", "message": "this connector is GitHub account octocat, and the authorization was for mallory; nothing was changed. …" } }
+```
+
+On success, in order: the connector's token pair is replaced in one D1 write. That write also clears the broken state,
+sets `lastCheckedAt` and releases any renewal's lease. The connector's `account` takes the login GitHub now reports, so
+a rename shows. The new pair then goes onto the mount of every agent pointed at the connector, which clears each
+mount's own broken flag, and onto this agent. This agent is pointed at the connector if it was not already, with a
+`bind` event. A `reconnect` event names who did it and in which role.
+
+```json
+200 {
+  "connected": true, "reconnected": true, "connectorId": "con_…", "account": "octocat",
+  "connectedAt": "…", "connectedBy": "<raftUserId>",
+  "updated": ["<raftAgentId>", "…"],
+  "failed": [{ "raftAgentId": "…", "error": "…" }]
+}
+```
+
+- `updated`: the agents whose mount now holds the new pair. An agent pointed at the connector whose mount has since
+  been given a key in the console is left alone: the connector is not its credential any more.
+- `failed`: agents the pair did not reach in this call. The connector is mended regardless. Each one's next GitHub
+  call asks the connector, finds it healthy and takes the pair. `connected` is `false` only when this agent is among
+  them.
+- Other errors at confirm: `404 not_found` for a connector deleted since the link was made (nothing is created or
+  attached), `403 not_creator` as above, and `422 connect_failed` when GitHub's `GET /user` did not say which account
+  was authorized (nothing changes). The pending id is spent either way, so a retry starts from the `POST`.
+- A renewal in flight when the reconnect lands cannot undo it. Its write expects the old refresh token, and so does
+  its refusal, so neither matches any more: the connector keeps the reconnect's pair and is not marked broken.
 
 ### Stopping a turn (`stop`)
 
