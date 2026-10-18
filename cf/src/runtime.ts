@@ -622,16 +622,17 @@ function holdEnded(sql: any, tenantId: string, agentId: string, h: ImportHold) {
 }
 
 /** Same surface the SigV4 client exposes, backed by the R2 binding instead. */
-class BoundArtifacts {
+export class BoundArtifacts {
   #bucket: R2Bucket;
   #name: string;
   constructor(bucket: R2Bucket, name: string) {
     this.#bucket = bucket;
     this.#name = name;
   }
-  async put(key: string, body: string | Uint8Array) {
+  /** `contentType` is kept as the object's metadata, as the SigV4 client sends it, so a reader can say what a file was stored as. */
+  async put(key: string, body: string | Uint8Array, contentType?: string) {
     const bytes = typeof body === "string" ? new TextEncoder().encode(body) : body;
-    await this.#bucket.put(key, bytes);
+    await this.#bucket.put(key, bytes, contentType ? { httpMetadata: { contentType } } : undefined);
     return { ref: `r2://${this.#name}/${key}`, etag: "", bytes: bytes.byteLength };
   }
   /** Remove objects nothing names any more (a workspace import that did not land, `importWorkspace`). */
@@ -644,6 +645,13 @@ class BoundArtifacts {
     // message reaches the model through the reader's error.
     if (!obj) throw new Error("no such artifact");
     return new Uint8Array(await obj.arrayBuffer());
+  }
+  /** `get`, with the content type the object was stored with (`put`), when it has one. */
+  async getObject(key: string): Promise<{ bytes: Uint8Array; contentType?: string }> {
+    const obj = await this.#bucket.get(key);
+    if (!obj) throw new Error("no such artifact");
+    const contentType = obj.httpMetadata?.contentType;
+    return { bytes: new Uint8Array(await obj.arrayBuffer()), ...(contentType ? { contentType } : {}) };
   }
 }
 
@@ -1186,7 +1194,7 @@ export class AgentRuntime {
       sandboxPlugin(this.#artifacts as any, deps.bucketName, deps.idle ?? null),
       // The key is read when a secret tool runs, not now: `#kek` is set a few lines below.
       statePlugin(this.store, this.#artifacts as any, deps.bucketName, () => this.#kek),
-      artifactsPlugin(this.#artifacts as any, deps.bucketName),
+      artifactsPlugin(this.#artifacts, deps.bucketName),
       createRaftPlugin({ artifacts: this.#artifacts }),
       mcpPlugin,
       createReminderPlugin({ serviceUrl: deps.reminderApp?.origin, clientCredential: deps.reminderApp?.credential }),
