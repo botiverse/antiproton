@@ -2305,8 +2305,8 @@ const VIEW_SCHEMA: ToolSchema = {
 };
 
 /**
- * `attachments_upload`: a file in the agent's own object storage (an `artifact://` reference — what `sandbox.save`, the
- * download and the state plugin hand back) uploaded to Raft as an attachment for one conversation, through the SDK's
+ * `attachments_upload`: a file in the agent's own object storage (an `artifact://` reference — what `sandbox.save` and
+ * the download hand back) uploaded to Raft as an attachment for one conversation, through the SDK's
  * typed `attachments.upload` with this mount's credential. The SDK keeps it out of its manifest (a binary payload has
  * no JSON form), so this plugin writes the tool itself, beside the download it mirrors. The upload posts nothing:
  * the model gets the attachment's id and is told to pass it to `messages_send` in `attachmentIds`.
@@ -2329,8 +2329,9 @@ export const UPLOAD_MAX_BYTES = ATTACHMENT_MAX_BYTES;
  * `attachments_upload`, end to end. Everything is checked before Raft is asked: the reference must be this agent's
  * own (`keyForRef` under the caller's scope; only the `artifact://` form, never a raw `r2://` one, which no tool hands
  * out any more), the object must exist and be 1 byte to `UPLOAD_MAX_BYTES`. The type is the caller's when given,
- * else the SDK's inference (the bytes, then the filename's extension): storage keeps no type worth reading, since
- * `sandbox.save` stores every file as application/octet-stream. Raft's refusal is the SDK's, said as every other.
+ * else the SDK's inference (the bytes, then the filename's extension): storage keeps no type to read, since the
+ * runtime's store drops the one it is given (`BoundArtifacts.put`, cf/src/runtime.ts). Raft's refusal is the SDK's,
+ * said as every other.
  */
 export async function uploadAttachment(
   args: unknown, ctx: PluginContext, artifacts: RaftArtifacts | null, unoffered: ReadonlySet<string> = DEFAULT_UNOFFERED,
@@ -2350,7 +2351,14 @@ export async function uploadAttachment(
   if (!key) throw new Error(`${ref} does not name a file in this agent's storage; nothing was uploaded`);
   if (!artifacts) throw new Error("this deployment has no object storage to upload a file from; nothing was uploaded");
   let bytes: Uint8Array;
-  try { bytes = await artifacts.get(key); } catch { throw new Error(`no file is stored at ${ref}; nothing was uploaded`); }
+  try {
+    bytes = await artifacts.get(key);
+  } catch (e) {
+    // The runtime's store says a missing object in these words (`BoundArtifacts.get`, cf/src/runtime.ts); anything
+    // else is storage failing, which may clear, and is not the agent's file being absent.
+    if ((e as Error)?.message === "no such artifact") throw new Error(`no file is stored at ${ref}; nothing was uploaded`);
+    throw marked(new Error(`this agent's storage did not answer for ${ref}; nothing was uploaded`), { transient: true });
+  }
   if (bytes.byteLength === 0) throw new Error(`${ref} is empty, and Raft takes no 0-byte attachment; nothing was uploaded`);
   if (bytes.byteLength > UPLOAD_MAX_BYTES) {
     throw new Error(`${ref} is ${sizeOf(bytes.byteLength)}, over the ${UPLOAD_MAX_BYTES / 1024 / 1024} MiB this mount uploads; nothing was uploaded`);

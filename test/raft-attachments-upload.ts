@@ -141,6 +141,10 @@ await check("only the caller's own artifact:// files resolve: raw r2:// refs (an
   const e = await failure(() => uploadAttachment({ ref: "artifact://sandbox/box-1/work/report.pdf", target: "#general" }, ctx(), other));
   must(/no file is stored at artifact:\/\/sandbox\/box-1\/work\/report.pdf/.test(e.message), e.message);
   must(other.gets.length === 1 && other.gets[0] === "t/tenant/agent/sandbox/box-1/work/report.pdf", `asked for: ${JSON.stringify(other.gets)}`);
+  // Storage failing is not the file being absent: said as a failure that may clear.
+  const down = { ...fakeArtifacts(), async get(): Promise<Uint8Array> { throw new Error("R2 timed out"); } };
+  const d = await failure(() => uploadAttachment({ ref: OWN_REF, target: "#general" }, ctx(), down));
+  must(/storage did not answer/.test(d.message) && (d as any).transient === true && !/R2 timed out/.test(d.message), `${d.message} ${JSON.stringify(d)}`);
   must(seen.paths.length === 0, `Raft was asked: ${seen.paths}`);
 });
 
