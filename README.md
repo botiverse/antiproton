@@ -1,6 +1,10 @@
 # antiproton
 
-> A durable, multi-tenant runtime for AI agents that interact with real-world systems, built on serverless infrastructure that costs nothing while idle.
+> **Building with a Raft of Agents**
+> 
+> *Humans and agents, one team: autonomous agents with humans in the loop can take on bigger work.*
+> 
+> A durable, multi-tenant serverless runtime for AI agents that interact with real-world systems, built on infrastructure that costs nothing while idle.
 
 The agent loop itself is commodity — bring your own, or use the reference harness. Antiproton provides the durable execution substrate underneath it, designed around four core architectural guarantees:
 
@@ -18,6 +22,10 @@ The agent loop itself is commodity — bring your own, or use the reference harn
 - [Plugin Authoring Guide](docs/plugins.md)
 - [Philosophy & Design Principles](docs/philosophy.md)
 - [Architecture](#architecture)
+  - [The Symmetrical Collaboration Model](#the-symmetrical-collaboration-model)
+  - [The Problem: Why Not 'One Sandbox per Agent'?](#the-problem-why-not-one-sandbox-per-agent)
+  - [The Three-Layer Architecture](#the-three-layer-architecture)
+  - [Workload Division: Local and Cloud](#workload-division-local-and-cloud)
 - [Getting Started](#getting-started)
 - [Core Invariants](#core-invariants)
   - [Zero Cost While Idle](#zero-cost-while-idle)
@@ -33,6 +41,63 @@ The agent loop itself is commodity — bring your own, or use the reference harn
 ---
 
 ## Architecture
+
+### The Symmetrical Collaboration Model
+
+Software engineering is fundamentally a team sport. Rather than treating an agent as a solitary command-line utility or a passive, mention-driven chatbot, Antiproton is designed for **symmetrical human-agent teamwork**:
+
+- **Agents are not underlying workers; agents carry every role.** In an engineering organization, specialized agents serve as architects, developers, adversarial QA reviewers, observability engineers, and release managers.
+- **Symmetrical task workflow:** Humans assign directional intent to agents, agents hand off tasks to each other, and **agents proactively assign tasks to humans** — such as requesting a human teammate to review UI consistency and visual feel. Machines excel at exhaustive logic and rapid iteration; humans excel at aesthetic judgment and strategic direction.
+- **Shared social fabric:** Channels for projects, threads for tasks. Agents possess persistent identities, cross-session memory, and explicit organizational scopes.
+
+### The Problem: Why Not 'One Sandbox per Agent'?
+
+When deploying agents to the cloud, the reflexive reaction is: *"Just spin up a dedicated container for every agent."* While familiar, that model collides with four practical realities:
+
+1. **Heterogeneity:** Different tasks require radically different environments. Some need a headless browser, some need GPUs, some need heavy RAM and compilers, while others only need basic CPU. A single generic container cannot satisfy all requirements.
+2. **Wake, Think, Sleep:** Autonomous agents wake up frequently to inspect ambient events (webhooks, alerts, reminders), think for two seconds, and return to sleep. Booting and provisioning a heavy container just for two seconds of cognitive triage is structurally inefficient.
+3. **The Scaling Dilemma:** Fixed, always-on containers sit idle most of the day, burning memory and compute; dynamically autoscaling pools suffer from slow cold starts, state-restoration delays, and fragile maintenance.
+4. **Auto-Sleep Task Disruption:** If a container is automatically put to sleep whenever the agent goes idle, long-running background tasks initiated by the agent get terminated.
+
+### The Three-Layer Architecture
+
+Antiproton resolves this dilemma by separating cognitive state from execution environments across three distinct tiers:
+
+```
+┌────────────────────────────────────────────────────────┐
+│  Tier 3: Real-World Sandboxes (On-Demand / Run9)       │
+│  - Heavy compilation, tests, browsers, GPUs           │
+│  - 30-min idle lease with 5-min warning; auto-reclaim  │
+└───────────────────────────▲────────────────────────────┘
+                            │ On-demand mount
+┌───────────────────────────┴────────────────────────────┐
+│  Tier 2: Sandbox-less Code Mode (V8 Dynamic Worker)    │
+│  - Ephemeral V8 isolate with globalOutbound: null      │
+│  - Orchestrates tools without container boot overhead  │
+└───────────────────────────▲────────────────────────────┘
+                            │ Tool calling
+┌───────────────────────────┴────────────────────────────┐
+│  Tier 1: Harness & Zero-Wait Durable Objects (DO)      │
+│  - Instant millisecond wake; private SQLite databases  │
+│  - Synchronous suspension during async model waits     │
+└────────────────────────────────────────────────────────┘
+```
+
+1. **Tier 1 (Harness & Zero-Wait DOs):** Every agent is backed by a serverless Durable Object with a transactional SQLite database. It wakes in milliseconds, restores state, enqueues model calls onto background queues, and suspends synchronously (`stopReason: "deferred"`). On a real 17.4s turn, the Durable Object is active for only 3.71s (21%), consuming zero compute while awaiting model responses across the network.
+2. **Tier 2 (Sandbox-less Code Mode):** For data processing, formatting, and tool orchestration, the model executes JavaScript inside an ephemeral V8 isolate (Cloudflare Dynamic Workers). It has zero direct internet access (`globalOutbound: null`), strict deterministic CPU/sub-request limits, and supports `await pause(...)` to await model feedback. It orchestrates tools without container boot overhead.
+3. **Tier 3 (Real-World Sandboxes):** When a task genuinely requires `cargo build`, a Linux shell, or a browser, the agent mounts an on-demand container powered by **Run9** (PingCAP's project). Sandboxes operate on a 30-minute idle lease with a 5-minute pre-release warning, allowing agents to postpone or release immediately. A container is an on-demand tool, not an architectural cage.
+
+### Workload Division: Local and Cloud
+
+Antiproton is built on the premise that developers should not have to choose between local control and cloud availability — **we want both**:
+
+- **Local Execution:** Direct access to native disk caches, compilers, hardware dongles, private keys, and local browser sessions with zero cloud latency.
+- **Cloud Presence:** 24/7 channel presence, webhook ingestion, background alert triage, and cross-team task delegation.
+- Both environments are essential and communicate continuously.
+
+---
+
+### Implementation Details
 
 ```mermaid
 flowchart TB
@@ -547,13 +612,13 @@ SWE-bench rows below say which environment produced them.
 | Suite | Cases | Covers |
 |---|---|---|
 | `pi-storage` | 21 | pi's own storage conformance, unchanged, on node:sqlite (`npm run pi-storage`) and on Durable Object storage (`npm run pi-storage:do`, a worker that is never deployed): mixed-write atomicity, rollback across every store, value and list ordering within a transaction, branch stops before filters and cursors before limits, admission order under concurrent commits, close that seals admission but drains what it admitted |
-| `pi-agent` | 10 | the object-side loop: a message is a pure write, a pass suspends rather than waits, a tool turn goes model → gateway → model, a duplicated pass does not grow the transcript, a run is not dispatched twice, the alarm does not poll, a run interrupted by eviction is reported open and finished, turn cancellation discards model jobs and records a marker, and projected cancellation markers prevent models from continuing aborted tasks |
+| `pi-agent` | 14 | the object-side loop: a message is a pure write, a pass suspends rather than waits, a tool turn goes model → gateway → model, a duplicated pass does not grow the transcript, a run is not dispatched twice, the alarm does not poll, a run interrupted by eviction is reported open and finished, turn cancellation discards model jobs and records a marker, and projected cancellation markers prevent models from continuing aborted tasks |
 | `pi-offload` | 3 | the object never waits for the model: drive suspends, the answer resumes the same operation, and a suspension survives eviction |
-| `pi-tools` | 18 | mounts as tools: the gateway is still the only way out, a refusal reaches the model as a refusal, replay policy, and names the provider will accept. The `run_js` half runs against the real executors: a script reaches a tool by the name the model was offered, a mistyped name is answered with the nearest names rather than "not a tool name", an empty tool list says so, a switched-off mount says why, and a name is attributed to the longest alias it starts with — because an alias may itself contain `__` |
+| `pi-tools` | 24 | mounts as tools: the gateway is still the only way out, a refusal reaches the model as a refusal, replay policy, and names the provider will accept. The `run_js` half runs against the real executors: a script reaches a tool by the name the model was offered, a mistyped name is answered with the nearest names rather than "not a tool name", an empty tool list says so, a switched-off mount says why, and a name is attributed to the longest alias it starts with — because an alias may itself contain `__` |
 | `pi-loop` | 3 | pi's harness on our storage, and a rebuilt harness finding the transcript again |
-| `pi-bridge` | 5 | pi's request shape against our provider client, both ways |
-| `executor` · `http-plugin` | 21 | sandbox contract in-process (`executor` 11 runs the `spec/executor-spec` rows including script syntax errors), fetch and HTML extraction (`http-plugin` 10) |
-| `state` | 17 | memory that survives a task, byte budgets, per-agent isolation, `remember` and `put` sharing one namespace, every row `list` returns carrying the `ref` it is read back by, parked notes pointing to read calls, path segment traversal refusal, and stale unreadable rows offering `forget` |
+| `pi-bridge` | 11 | pi's request shape against our provider client, both ways |
+| `executor` · `http-plugin` | 46 | sandbox contract in-process (`executor` 11 runs the `spec/executor-spec` rows including script syntax errors), fetch and HTML extraction (`http-plugin` 10) |
+| `state` | 21 | memory that survives a task, byte budgets, per-agent isolation, `remember` and `put` sharing one namespace, every row `list` returns carrying the `ref` it is read back by, parked notes pointing to read calls, path segment traversal refusal, and stale unreadable rows offering `forget` |
 | `markdown` | 11 | the console renders the agent's markdown and never its HTML |
 | `model-binding` | 6 | whose key an agent spends |
 
