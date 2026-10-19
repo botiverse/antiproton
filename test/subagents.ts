@@ -33,7 +33,24 @@ import { returnPendingBriefing, takePendingBriefing, readBackstop } from "../src
 import { subagentModelChoice } from "../cf/src/model-request.ts";
 import { savesState } from "../src/plugins/raft.ts";
 import { SUBAGENT_MAX_TURNS, SUBAGENT_LIFETIME_MS, REPORT_MAX_ATTEMPTS, recordSubagent } from "../src/runtime/subagents.ts";
-import { REPORT_MAX_CHARS, reportBodyChars, reportMessage } from "../src/runtime/subagents.ts";
+import { REPORT_BUDGET_CHARS, REPORT_MAX_CHARS, reportBodyChars, reportMessage, taskMessage } from "../src/runtime/subagents.ts";
+import { artifactsPlugin } from "../src/plugins/artifacts.ts";
+import { BoundArtifacts } from "../cf/src/runtime.ts";
+
+/** An in-memory R2 bucket, as much of the binding as storing a report and reading it back use; `fail` refuses every put. */
+function memoryBucket() {
+  const objects = new Map<string, Uint8Array>();
+  return {
+    objects, fail: false,
+    async put(key: string, body: Uint8Array | string) {
+      if (this.fail) throw new Error("R2 internal error");
+      objects.set(key, typeof body === "string" ? new TextEncoder().encode(body) : new Uint8Array(body));
+      return {};
+    },
+    async get(key: string) { const b = objects.get(key); return b ? { arrayBuffer: async () => b.slice().buffer } : null; },
+    async head(key: string) { const b = objects.get(key); return b ? { size: b.byteLength } : null; },
+  };
+}
 
 const logs: any[] = [];
 setLogSink((line) => { try { logs.push(JSON.parse(line)); } catch { /* not ours */ } });
@@ -88,7 +105,7 @@ const USER_MODELS = { offered: [{ id: "cheap", label: "Cheap", provider: "deepse
 
 /** One agent on an AgentRuntime over node:sqlite, its object recording `engine`, its `subagents` setting as given. */
 type Rules = { layers: { agent: any; tenant: any; deployment: any; owner: string | null }; pickerOff: boolean };
-async function world(engine: "pi085" | "pd", opts: { on?: boolean; builder?: boolean; chatter?: boolean; sandbox?: boolean; rulesTtlMs?: number; slowBuilder?: number; retentionMs?: number; defaultOn?: boolean; disabled?: boolean } = {}) {
+async function world(engine: "pi085" | "pd", opts: { on?: boolean; builder?: boolean; chatter?: boolean; sandbox?: boolean; rulesTtlMs?: number; slowBuilder?: number; retentionMs?: number; defaultOn?: boolean; disabled?: boolean; bucket?: unknown } = {}) {
   const rules: { now: Rules | null; reads: number; fail: boolean } = { now: null, reads: 0, fail: false };
   const raw = sqliteHost();
   if (engine === "pd") {
@@ -127,7 +144,7 @@ async function world(engine: "pi085" | "pd", opts: { on?: boolean; builder?: boo
     get subagentsDisabled() { return opts.disabled === true || killAll.on; },
     ...(opts.sandbox ? { loader: standIn.loader, makeToolBinding: standIn.makeToolBinding } : {}),
     ctx: { storage: { sql: raw.sql, transactionSync: raw.transactionSync } },
-    bucket: {} as never, bucketName: "b", models: { resolve: () => null },
+    bucket: (opts.bucket ?? {}) as never, bucketName: "b", models: { resolve: () => null },
     sandbox: opts.sandbox === true, autoRelease: false, userModels: USER_MODELS, ...(plugins.length ? { extraPlugins: plugins } : {}),
     operatorModel: operatorModelOf({ DEEPSEEK_BASE_URL: "https://model.example/v1", DEEPSEEK_API_KEY: "operator-key", HARNESS_MODEL: "m1" }),
     offloadModel: async (job: { commandId: string }) => { sent.push(job.commandId); },
@@ -274,6 +291,41 @@ for (const engine of (process.env.ENGINES ?? "pi085,pd").split(",").filter((e) =
     must(toolNames(w.requests[0]!.req).includes(SUBAGENT_TOOL), `the parent was not offered it: ${show(toolNames(w.requests[0]!.req))}`);
     // A child saw only its task, none of the parent's conversation.
     must(childReqs.every((r) => !JSON.stringify(r.req.messages).includes("split the count in three")), "a child saw the parent's conversation");
+  });
+
+  await check(`${engine}: a report over the cap is cut, and its whole text is stored where the parent's offered reader reads it back; a failed store says so`, async () => {
+    for (const fail of [false, true]) {
+      const bucket = memoryBucket();
+      bucket.fail = fail;
+      const w = await world(engine, { bucket });
+      const answer = Array.from({ length: 400 }, (_, i) => `line ${i}: ${"z".repeat(40)}`).join("\n");
+      must(answer.length > REPORT_MAX_CHARS, "control: the answer is over the cap");
+      let parentCalls = 0;
+      w.reply = (session) => session === "main" ? (++parentCalls === 1 ? calls({ id: "c1", args: { task: "read it all" } }) : say("ok")) : say(answer);
+      await w.rt.postMessage("t", "a", "go", "prompt", "main");
+      await settle(w);
+      const rs = await reports(w);
+      must(rs.length === 1 && rs[0]!.includes(`[cut at ${REPORT_MAX_CHARS} of ${answer.length} characters; `), `fail=${fail}: ${show(rs.map((r) => r.slice(-300)))}`);
+      const id = String(rowsOf(w)[0]!.id);
+      if (fail) {
+        must(rs[0]!.includes(`the rest was not stored; ${SUBAGENT_TOOL} with agent "${id}" asks it for the part you need]`) && bucket.objects.size === 0, `a failed store: ${rs[0]!.slice(-300)}`);
+        continue;
+      }
+      // The call named is the reader the parent is offered, by the name it is offered under, and the reference is the agent's own form.
+      const named = /read it with (\S+) \{ ref: "([^"]+)", from: 0 \}/.exec(rs[0]!);
+      must(named, `no read call: ${rs[0]!.slice(-300)}`);
+      const offered = (await (await w.rt.agent("t", "a")).tools()).map((t) => t.name);
+      must(offered.includes(named[1]!) && named[2]!.startsWith("artifact://") && !named[2]!.includes("t/t/a"), `the call: ${show(named)} of ${show(offered)}`);
+      // Read back as that call does, page by page from 0: the whole answer, nothing lost.
+      const reader = artifactsPlugin(new BoundArtifacts(bucket as never, "b"), "b");
+      let text = "", from: number | null = 0;
+      while (from !== null) {
+        const page = await reader.invoke("read", { ref: named[2], from }, { caller: { tenantId: "t", agentId: "a" } } as never) as { text: string; to: number; note: string };
+        text += page.text;
+        from = /continue with/.test(page.note) ? page.to : null;
+      }
+      must(text === answer, `read back ${text.length} of ${answer.length} characters`);
+    }
   });
 
   await check(`${engine}: a fourth spawn while three run is refused, and nothing starts`, async () => {
@@ -1737,6 +1789,30 @@ await check("rules: a report's size is its body's: the answer as kept, without i
   const long = "x".repeat(REPORT_MAX_CHARS + 500);
   const msg = reportMessage(s, { outcome: "done", text: long }, 1000);
   must(msg.includes(`[cut at ${REPORT_MAX_CHARS} of`) && reportBodyChars({ outcome: "done", text: long }) === REPORT_MAX_CHARS, `cut: ${reportBodyChars({ outcome: "done", text: long })}`);
+  // Exactly at the cap is whole, and says nothing about a cut.
+  const atCap = reportMessage(s, { outcome: "done", text: "x".repeat(REPORT_MAX_CHARS) }, 1000);
+  must(!atCap.includes("[cut at"), "a report at the cap was cut");
+});
+
+await check("rules: a report over the cap names the exact call that reads all of it, or says the rest was not stored and how to ask", () => {
+  must(REPORT_MAX_CHARS === 8_000 && REPORT_BUDGET_CHARS < REPORT_MAX_CHARS, `the cap ${REPORT_MAX_CHARS}, the budget ${REPORT_BUDGET_CHARS}`);
+  const s = { id: "sub_x", turnStartedAt: 0, turns: 2 };
+  const long = "y".repeat(REPORT_MAX_CHARS + 1);
+  const stored = reportMessage(s, { outcome: "done", text: long }, 1000, { ref: "artifact://subagent-reports/sub_x-2.txt", readBack: "artifacts__read" });
+  must(stored.endsWith(`[cut at ${REPORT_MAX_CHARS} of ${REPORT_MAX_CHARS + 1} characters; the whole report is stored: read it with ` +
+    `artifacts__read { ref: "artifact://subagent-reports/sub_x-2.txt", from: 0 }, which returns it in pages]`), `stored: ${stored.slice(-300)}`);
+  const lost = reportMessage(s, { outcome: "done", text: long }, 1000, null);
+  must(lost.endsWith(`characters; the rest was not stored; ${SUBAGENT_TOOL} with agent "sub_x" asks it for the part you need]`), `not stored: ${lost.slice(-200)}`);
+  // Under the cap, a stored copy (none is made) changes nothing.
+  must(reportMessage(s, { outcome: "done", text: "short" }, 1000, { ref: "artifact://r", readBack: "r" }).endsWith("\nshort"), "a short report changed");
+});
+
+await check("rules: a child is told its report is all the agent gets, and its length budget; the parent is told the budget too", () => {
+  const m = taskMessage("sub_x", "count the files", false, "task sub_x/1");
+  must(m.includes("it is all the agent receives") && m.includes("nobody else reads this conversation"), `the point: ${m}`);
+  must(m.includes("Unless the task asks for a different length, keep it under about 3,000 characters: the conclusion first, then the evidence (paths, line numbers, ids)"), `the budget: ${m}`);
+  must(!m.includes("make it complete"), "the old open-ended wording is still there");
+  must(DELEGATE_GUIDANCE.includes("under about 3,000 characters unless the task asks for another length"), `the parent: ${DELEGATE_GUIDANCE}`);
   must(reportBodyChars({ outcome: "done", text: "abc" }) === 3 && reportBodyChars({ outcome: "failed", text: "boom" }) === 4, "short bodies");
 });
 

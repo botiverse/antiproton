@@ -55,8 +55,24 @@ export function reportRetryDelay(attempts: number): number {
   return Math.min(10 * 60_000, 5_000 * 2 ** Math.max(0, attempts - 1));
 }
 
-/** The most of a child's answer a report carries; the rest is in the child's transcript. */
-export const REPORT_MAX_CHARS = 20_000;
+/**
+ * How long a child is asked to keep its report, unless its task asks otherwise (`taskMessage`). A parent delegates to keep
+ * raw content out of its context, and a report with no stated length came back at 11k-15k characters in trials.
+ */
+export const REPORT_BUDGET_CHARS = 3_000;
+
+/**
+ * The most of a child's answer a report carries in the parent's conversation. Past it the whole answer is stored and
+ * the report says the call that reads it (`ReportOverflow`), so the cut loses nothing a parent can be given.
+ */
+export const REPORT_MAX_CHARS = 8_000;
+
+/**
+ * Where the whole of a report over `REPORT_MAX_CHARS` went: stored as a parked tool result is (cf/src/runtime.ts
+ * `parkResult`), with the reference as the agent is shown it and the offered tool that reads it back; or null when it
+ * could not be stored or nothing the parent is offered could read it.
+ */
+export type ReportOverflow = { ref: string; readBack: string } | null;
 
 type Sql = { exec(query: string, ...bindings: unknown[]): { toArray(): unknown[] } };
 
@@ -495,7 +511,9 @@ export function startedResult(s: { id: string; followUp: boolean; model: string 
  */
 export function taskMessage(id: string, task: string, followUp: boolean, key: string): string {
   return `[${followUp ? "a follow-up" : "a task"} (${key}) from the agent that started you, sent with ${SUBAGENT_TOOL}; you are its subagent ${id}. ` +
-    "Your final message is your report: it is all the agent receives, so make it complete. Nobody else reads this conversation. " +
+    "Your final message is your report, and it is all the agent receives: nobody else reads this conversation. Unless the task " +
+    `asks for a different length, keep it under about ${REPORT_BUDGET_CHARS.toLocaleString("en-US")} characters: the conclusion first, then the evidence ` +
+    "(paths, line numbers, ids). " +
     "You can only read: you cannot change anything or act as the agent, so put what you would have done in your report.]\n\n" + task;
 }
 
@@ -554,17 +572,31 @@ export function reportBodyChars(end: TurnEnd): number {
   return end.outcome === "done" ? Math.min(end.text.length, REPORT_MAX_CHARS) : end.text.length;
 }
 
+/** Whether a turn's answer is over the cap, so its whole text is stored before the report is decided. */
+export function reportOverflows(end: TurnEnd): boolean {
+  return end.outcome === "done" && end.text.length > REPORT_MAX_CHARS;
+}
+
 /**
  * The message that wakes the parent when a child's turn ends. Plain text, so every lane mode accepts it; the head says
  * whose it is, as a background completion's does, so a report is not taken for the person asking for something.
+ *
+ * An answer over the cap is cut, and the marker says the exact call that reads all of it (`overflow`). Always with
+ * `from`: the reader returns text without it only as far as its default list limit, and with it a page at a time, each
+ * page naming the next. Without a stored copy the rest is not lost to the child, which keeps its history, so the marker
+ * says how to ask it.
  */
-export function reportMessage(s: Pick<Subagent, "id" | "turnStartedAt" | "turns"> & { reportNote?: string | null }, end: TurnEnd, now = Date.now()): string {
+export function reportMessage(s: Pick<Subagent, "id" | "turnStartedAt" | "turns"> & { reportNote?: string | null }, end: TurnEnd, now = Date.now(),
+  overflow: ReportOverflow = null): string {
   const secs = Math.round((now - s.turnStartedAt) / 1000);
   const head = `[subagent ${s.id} — ${end.outcome} after ${secs}s (${reportKey(s)}); its report, a notice from the harness, not a message from the user. ` +
     `${SUBAGENT_TOOL} with agent "${s.id}" sends it a follow-up.${s.reportNote ? ` ${s.reportNote}` : ""}]`;
   if (end.outcome === "done") {
-    const text = end.text.length > REPORT_MAX_CHARS
-      ? `${end.text.slice(0, REPORT_MAX_CHARS)}\n[cut at ${REPORT_MAX_CHARS} of ${end.text.length} characters]` : end.text;
+    const where = overflow
+      ? `the whole report is stored: read it with ${overflow.readBack} { ref: "${overflow.ref}", from: 0 }, which returns it in pages`
+      : `the rest was not stored; ${SUBAGENT_TOOL} with agent "${s.id}" asks it for the part you need`;
+    const text = reportOverflows(end)
+      ? `${end.text.slice(0, REPORT_MAX_CHARS)}\n[cut at ${REPORT_MAX_CHARS} of ${end.text.length} characters; ${where}]` : end.text;
     return `${head}\n${text}`;
   }
   if (end.outcome === "failed") return `${head}\nIt failed: ${end.text}`;
@@ -609,7 +641,8 @@ export function childRefusal(address: string): { status: "rejected"; error: { co
  */
 export const DELEGATE_GUIDANCE = "prefer it for any read that would bring a lot of raw content into your context — long message " +
   "histories, reading a repository or documents, broad searches, browsing many pages — and ask for a short, structured report " +
-  "with exactly what you need. Do changes, messages and decisions yourself: subagents are read-only (no writes, no messages, " +
+  `with exactly what you need (a subagent keeps it under about ${REPORT_BUDGET_CHARS.toLocaleString("en-US")} characters unless the task asks ` +
+  "for another length). Do changes, messages and decisions yourself: subagents are read-only (no writes, no messages, " +
   "no shell). Don't delegate a single small lookup.";
 
 /** What a subagent can and cannot do, in the words the owner's setting and the model's tool both use. */
