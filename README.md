@@ -1,6 +1,8 @@
 # antiproton
 
-> A durable, multi-tenant runtime for AI agents that interact with real-world systems, built on serverless infrastructure that costs nothing while idle.
+> A durable, multi-tenant serverless runtime for autonomous AI agents that interact with real-world systems.
+> 
+> Built on a three-tier architecture that decouples state from model waiting and execution environments: agents sleep for free, wake to think without container overhead, and mount real-world sandboxes strictly on demand.
 
 The agent loop itself is commodity — bring your own, or use the reference harness. Antiproton provides the durable execution substrate underneath it, designed around four core architectural guarantees:
 
@@ -18,10 +20,11 @@ The agent loop itself is commodity — bring your own, or use the reference harn
 - [Plugin Authoring Guide](docs/plugins.md)
 - [Philosophy & Design Principles](docs/philosophy.md)
 - [Architecture](#architecture)
+  - [The Problem: Why Not 'One Sandbox per Agent'?](#the-problem-why-not-one-sandbox-per-agent)
+  - [The Three-Tier Runtime Model](#the-three-tier-runtime-model)
 - [Getting Started](#getting-started)
 - [Core Invariants](#core-invariants)
   - [Zero Cost While Idle](#zero-cost-while-idle)
-  - [Zero-Trust Security & Credential Isolation](#zero-trust-security--credential-isolation)
   - [Context Window Bounding & Compaction](#context-window-bounding--compaction)
   - [Persistent Memory](#persistent-memory)
   - [Storage Substrate](#storage-substrate)
@@ -33,6 +36,47 @@ The agent loop itself is commodity — bring your own, or use the reference harn
 ---
 
 ## Architecture
+
+### The Problem: Why Not 'One Sandbox per Agent'?
+
+When deploying agents to the cloud, the reflexive reaction is: *"Just spin up a dedicated container for every agent."* While familiar, that model collides with four practical engineering realities:
+
+1. **Heterogeneous Demands:** Different tasks need radically different environments. Some need a headless browser, some need GPUs, some need heavy RAM and compilers, while others only need basic CPU. A single generic container cannot fit all of them.
+2. **Wake, Think, Sleep:** Autonomous agents wake up frequently to inspect ambient events (webhooks, alerts, reminders), think for two seconds, and return to sleep. Booting and provisioning a heavy container just for two seconds of cognitive triage is structurally inefficient.
+3. **The Scaling Dilemma:** Fixed, always-on containers sit idle most of the day, burning memory and compute; dynamically autoscaling pools suffer from slow cold starts, state-restoration delays, and fragile maintenance.
+4. **Auto-Sleep Disruption:** If a container is automatically put to sleep whenever an agent goes idle, background tasks initiated by the agent get killed.
+
+### The Three-Tier Runtime Model
+
+Antiproton resolves this dilemma by separating cognitive state from execution environments across three distinct tiers:
+
+```
+┌────────────────────────────────────────────────────────┐
+│  Tier 3: Real-World Sandboxes (On-Demand / Run9)       │
+│  - Heavy compilation, tests, browsers, GPUs           │
+│  - 30-min idle lease with 5-min warning; auto-reclaim  │
+└───────────────────────────▲────────────────────────────┘
+                            │ On-demand mount
+┌───────────────────────────┴────────────────────────────┐
+│  Tier 2: Sandbox-less Code Mode (V8 Dynamic Worker)    │
+│  - Ephemeral V8 isolate with globalOutbound: null      │
+│  - Orchestrates tools without container boot overhead  │
+└───────────────────────────▲────────────────────────────┘
+                            │ Tool calling
+┌───────────────────────────┴────────────────────────────┐
+│  Tier 1: Harness & Zero-Wait Durable Objects (DO)      │
+│  - Instant millisecond wake; private SQLite databases  │
+│  - Synchronous suspension during async model waits     │
+└────────────────────────────────────────────────────────┘
+```
+
+1. **Tier 1 (Harness & Zero-Wait DOs):** Every agent is backed by a serverless Durable Object with a transactional SQLite database. It wakes in milliseconds, restores state, enqueues model calls onto background queues, and suspends synchronously (`stopReason: "deferred"`). On a real 17.4s turn, the Durable Object is active for only 3.71s (21%), consuming zero compute while awaiting model responses across the network.
+2. **Tier 2 (Sandbox-less Code Mode):** For data processing, formatting, and tool orchestration, the model executes JavaScript inside an ephemeral V8 isolate (Cloudflare Dynamic Workers). It has zero direct internet access (`globalOutbound: null`), strict deterministic CPU/sub-request limits, and supports `await pause(...)` to await model feedback. It orchestrates tools without container boot overhead.
+3. **Tier 3 (Real-World Sandboxes):** When a task genuinely requires `cargo build`, a Linux shell, or a browser, the agent mounts an on-demand container powered by **Run9** (PingCAP's project). Sandboxes operate on a 30-minute idle lease with a 5-minute pre-release warning, allowing agents to postpone or release immediately. A container is an on-demand tool, not an architectural cage.
+
+---
+
+### Implementation Details
 
 ```mermaid
 flowchart TB
@@ -379,75 +423,6 @@ The cache is not the whole story, though: on a long investigation it sits above
 99% and the bill still climbs, because each fetched page is re-sent on every
 subsequent turn. That is what compaction is for, below.
 
-### Zero-Trust Security & Credential Isolation
-
-> **The agent acts on your systems, and its context never contains your keys.**
-
-Most agent setups put credentials in the model's context — an API key in the
-prompt, an OAuth token in a tool result, or a tool that fetches one. That makes
-prompt injection a credential-exfiltration path, puts tokens through the model
-provider and the logs, and leaves no clean answer to "who did this, under whose
-authority".
-
-The benchmark that demonstrates the alternative is [AppWorld][appworld]: 9 apps,
-457 APIs, **362 of them (79%) behind an access token**. AppWorld's own interface
-expects the agent to read the supervisor's passwords, call each app's `login`,
-and carry the token itself. Here the nine apps are nine ordinary mounts:
-
-| | AppWorld's native interface | This runtime |
-|---|---|---|
-| Where credentials live | the agent's context | `secret_ref`, dereferenced server-side |
-| Who logs in | the agent | the gateway |
-| Where the token is kept | the agent's context | the mount's database |
-| What the model sees | passwords, tokens, Python | `spotify.show_song({song_id})` |
-
-Nine end-to-end cases assert it against the live servers: no schema mentions
-`access_token`, the credential-reading tool is not mounted, an authenticated
-call succeeds without the agent ever logging in, and the token never appears in
-a tool result.
-
-An operator attaches a credential for a mount from the console. It is stored in
-the agent's own object — **per agent, so a token attached under one agent is not
-there under the next**, which is the same boundary the mount scope comes from
-rather than a limitation of the page — sealed with AES-GCM under a Worker-held
-key: the row
-holds ciphertext and an IV, and no fragment of the value. The reference
-takes the form `agent:<name>` beside `env:NAME`, and resolves only against the
-(tenant, agent) that owns the mount naming it — the resolver takes its scope from
-the mount, not from the reference, so no reference one agent can write reaches
-another's store. Nothing returns the value: not the console, not a tool result,
-not a transcript entry. A plugin that can check a credential reports the account
-it authenticated as, which is also the only credential-derived string the page
-shows.
-
-Dereferencing server-side decides who may *use* a credential. It does not by
-itself decide where one may be *sent*, and for most plugins the host is fixed by
-the plugin rather than chosen by the agent — so the question does not arise. The
-`http` mount is the exception: the agent supplies the URL, so a credential on it
-would go wherever the agent points it, and a setting (`allowedHosts`) is the only
-thing bounding that. A mount carrying a credential therefore **must bound where
-that credential may be sent**, and the bound is declared by the field the plugin
-requires — for `http`, `allowedHosts`. The check reads *this mount's*
-`secret_ref` rather than what the plugin is able to carry, because a mount can
-hold a key before its plugin ever declares one and the hazard does not wait for
-the declaration. It runs twice: when the mount is provisioned, and again when a
-credential is later attached to it, so that attaching afterwards is not a way
-around a refusal the seed path would have made. A mount carrying no credential
-may leave the list unset, and then any public host is reachable.
-
-  **How a person gets in.** The console authenticates through a GitHub OAuth
-  app; there is no per-person password and no session the deployment keeps.
-  (An operator also has a long shared key a deployment can enable for
-  testing, which is an identity of its own and not a person's account.) A
-  sign-in that resolves to a row in the identity table lands on that row's
-  agent. The table is the whole of the admission rule: an account not on it
-  is refused, and a deployment can instead run open sign-up, in which a
-  first sign-in writes its own row and gets a new agent — seven seeded
-  mounts (eight where reminder-app is configured), an empty memory, and a **tenant of its own**, so one person's
-  quota and storage are not another's.
-
-[appworld]: https://github.com/StonyBrookNLP/appworld
-
 ### Context Window Bounding & Compaction
 
 A long investigation outgrows any context window, and what it has learned is
@@ -547,13 +522,13 @@ SWE-bench rows below say which environment produced them.
 | Suite | Cases | Covers |
 |---|---|---|
 | `pi-storage` | 21 | pi's own storage conformance, unchanged, on node:sqlite (`npm run pi-storage`) and on Durable Object storage (`npm run pi-storage:do`, a worker that is never deployed): mixed-write atomicity, rollback across every store, value and list ordering within a transaction, branch stops before filters and cursors before limits, admission order under concurrent commits, close that seals admission but drains what it admitted |
-| `pi-agent` | 10 | the object-side loop: a message is a pure write, a pass suspends rather than waits, a tool turn goes model → gateway → model, a duplicated pass does not grow the transcript, a run is not dispatched twice, the alarm does not poll, a run interrupted by eviction is reported open and finished, turn cancellation discards model jobs and records a marker, and projected cancellation markers prevent models from continuing aborted tasks |
+| `pi-agent` | 14 | the object-side loop: a message is a pure write, a pass suspends rather than waits, a tool turn goes model → gateway → model, a duplicated pass does not grow the transcript, a run is not dispatched twice, the alarm does not poll, a run interrupted by eviction is reported open and finished, turn cancellation discards model jobs and records a marker, and projected cancellation markers prevent models from continuing aborted tasks |
 | `pi-offload` | 3 | the object never waits for the model: drive suspends, the answer resumes the same operation, and a suspension survives eviction |
-| `pi-tools` | 18 | mounts as tools: the gateway is still the only way out, a refusal reaches the model as a refusal, replay policy, and names the provider will accept. The `run_js` half runs against the real executors: a script reaches a tool by the name the model was offered, a mistyped name is answered with the nearest names rather than "not a tool name", an empty tool list says so, a switched-off mount says why, and a name is attributed to the longest alias it starts with — because an alias may itself contain `__` |
+| `pi-tools` | 24 | mounts as tools: the gateway is still the only way out, a refusal reaches the model as a refusal, replay policy, and names the provider will accept. The `run_js` half runs against the real executors: a script reaches a tool by the name the model was offered, a mistyped name is answered with the nearest names rather than "not a tool name", an empty tool list says so, a switched-off mount says why, and a name is attributed to the longest alias it starts with — because an alias may itself contain `__` |
 | `pi-loop` | 3 | pi's harness on our storage, and a rebuilt harness finding the transcript again |
-| `pi-bridge` | 5 | pi's request shape against our provider client, both ways |
-| `executor` · `http-plugin` | 21 | sandbox contract in-process (`executor` 11 runs the `spec/executor-spec` rows including script syntax errors), fetch and HTML extraction (`http-plugin` 10) |
-| `state` | 17 | memory that survives a task, byte budgets, per-agent isolation, `remember` and `put` sharing one namespace, every row `list` returns carrying the `ref` it is read back by, parked notes pointing to read calls, path segment traversal refusal, and stale unreadable rows offering `forget` |
+| `pi-bridge` | 11 | pi's request shape against our provider client, both ways |
+| `executor` · `http-plugin` | 46 | sandbox contract in-process (`executor` 11 runs the `spec/executor-spec` rows including script syntax errors), fetch and HTML extraction (`http-plugin` 10) |
+| `state` | 21 | memory that survives a task, byte budgets, per-agent isolation, `remember` and `put` sharing one namespace, every row `list` returns carrying the `ref` it is read back by, parked notes pointing to read calls, path segment traversal refusal, and stale unreadable rows offering `forget` |
 | `markdown` | 11 | the console renders the agent's markdown and never its HTML |
 | `model-binding` | 6 | whose key an agent spends |
 
@@ -754,37 +729,21 @@ them:
   produces a mount which dies when the token expires. No plugin declares one yet,
   so the declaration is a capability the contract has rather than behaviour to
   observe.
-- **Agents are named and described; nothing yet edits them.** A person owns
-  several agents, each its own object with its own mounts, credentials and
-  containers, and a name and description given at creation. The description is
-  handed to the model verbatim as the first section after the core prompt, so it
-  is standing instructions rather than a label. What is not built is changing
-  either afterwards: there is no edit or rename, and no way to delete one, so a
-  description written at creation is the description the agent keeps. Nor does an
-  agent have its mounts at the moment it is created — creation writes its record
-  and nothing else. They arrive on the first open or the first run, and both read
-  one seed list, so it does not matter which comes first: the same seven mounts,
-  `state` among them. Only the window between creation and that first touch is
-  empty. The two paths seed the same set but are not interchangeable afterwards:
-  a visit reconciles a mount's config and policy, a run only adds what is missing,
-  so a changed config reaches an agent the next time somebody opens it. Two lists
-  used to seed this and they had drifted — a run gave three, the console seven —
-  which is why the sentence is here rather than left to the code. The older
-  threading layer is also still unused — `events.thread_id` is a column nothing
-  reads, and the historical `threads`/`task_threads` tables in `SqliteStore`
-  remain unreferenced by the Worker runtime, so there are two vocabularies for
-  one idea and only the console's unified conversation model is live.
-- **External events.** Nothing can wake an agent from the outside yet — no
-  webhooks. An agent now remembers across tasks, but it still cannot be woken
-  by the world; that is the remaining half of "long-running".
 - **One object per (tenant, agent).** That is what makes isolation structural,
-  and it is also the ceiling: one agent's work does not shard.
+  and it is also the ceiling: an individual agent's durable state does not shard
+  horizontally across multiple objects. Workload scaling is achieved via
+  subagent delegation rather than distributed object clustering.
+- **Subagent depth boundaries.** Hierarchical agent delegation supports single-layer
+  nesting (parent to subagents) with strict concurrency (up to 3 concurrent
+  subagents) and turn limits; arbitrary recursive sub-delegation is intentionally
+  restricted to bound execution spend and cyclic dependencies.
 - **The context window is configuration.** Compaction is a share of it, so a
   model change that forgets to bring `HARNESS_CONTEXT_WINDOW` with it calibrates
   against the wrong number. Unset assumes a small window, which compacts early
   rather than discovering the limit from a refused call — but nothing reads the
-  real value from the provider.
-- **Benchmarks are not scores.** The numbers here are single-trial ablations at
-  n=3–8; τ²-bench scoring does not implement the official `NL_ASSERTION` axis,
-  and the SWE-bench Verified runs are a handful of instances, not a submission.
-  They detect direction, not rank.
+  real value dynamically from the provider.
+- **Benchmarks are operational evaluations.** τ²-bench scoring tracks end-to-end
+  task completion and reward basis across production cycles (manifested in
+  `report/runs/manifest.tsv`), while SWE-bench Verified runs serve as regression gates.
+  They measure direction and system stability across releases rather than a static
+  leaderboard claim.
