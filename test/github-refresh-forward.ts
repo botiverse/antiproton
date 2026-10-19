@@ -2,14 +2,15 @@
  * Forwarding `github.refresh` trace rows to Raft's trace-upload worker (cf/src/github-refresh-forward.ts), on a real
  * SQLite outbox with a recording endpoint: only the allowlisted kind leaves, with exactly the receiver's columns; off
  * (and stateless) until configured; a 413 splits, another 4xx drops and counts, a 5xx keeps the rows and backs off;
- * a 400/422 drops and counts, a 401/403/404 pauses with the rows kept; the R2 export goes on whatever the forward does,
+ * a 400/422 drops and counts, a 401/403/404 pauses with the rows kept; a request with no answer in time is aborted and
+ * treated as no answer, and stops the pass; the R2 export goes on whatever the forward does,
  * and never prunes a row the forward has not copied.
  */
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { appendTrace, pendingTrace, type TraceRow } from "../src/trace/outbox.ts";
 import { flushActivityThenTrace } from "../cf/src/activity-raft.ts";
 import {
-  FORWARD_BACKOFF_BASE_MS, FORWARD_BATCH_MAX, FORWARD_COLUMNS, FORWARD_KINDS, forwardConfigOf, forwardCursor, forwardPass, forwardRow,
+  FORWARD_BACKOFF_BASE_MS, FORWARD_BATCH_MAX, FORWARD_TIMEOUT_MS, FORWARD_COLUMNS, FORWARD_KINDS, forwardConfigOf, forwardCursor, forwardPass, forwardRow,
   ingestRequest, sendForward, stageForward, type ForwardConfig, type ForwardRow,
 } from "../cf/src/github-refresh-forward.ts";
 
@@ -239,6 +240,90 @@ await check("a 5xx or no answer keeps the rows, backs off, and the retry sends t
   appendTrace(sql, [refresh(4)]);
   stageForward(sql, CFG, OWNER.tenantId, OWNER.agentId);
   must((await sendForward(sql, CFG, OWNER.tenantId, OWNER.agentId, e.fetch, () => now)).sent === 1, "the backoff outlived a success");
+});
+
+/**
+ * An endpoint that never answers the requests `hangs` picks (they wait on their signal, as a real fetch does, and
+ * would wait forever without one) and answers the rest with 200 or 413 as `answer` says. `ignoreSignal` makes a hung
+ * request deaf to its signal too, as if the fetch implementation did not honour it.
+ */
+function hanging(hangs: (rows: ForwardRow[]) => boolean, answer: (rows: ForwardRow[]) => number = () => 200, ignoreSignal = false) {
+  const h = {
+    hangs, answer,
+    requests: [] as Array<{ rows: ForwardRow[]; signal: AbortSignal | null; outcome: number | "aborted" | "hung" }>,
+    fetch: async (_url: string, init: RequestInit): Promise<Response> => {
+      const rows = JSON.parse(new TextDecoder().decode(init.body as Uint8Array)).rows as ForwardRow[];
+      const req = { rows, signal: init.signal ?? null, outcome: "hung" as number | "aborted" | "hung" };
+      h.requests.push(req);
+      if (!h.hangs(rows)) { req.outcome = h.answer(rows); return new Response(null, { status: req.outcome }); }
+      return new Promise<Response>((_, reject) => {
+        if (ignoreSignal || !init.signal) return;
+        init.signal.addEventListener("abort", () => { req.outcome = "aborted"; reject(init.signal!.reason); });
+      });
+    },
+  };
+  return h;
+}
+/** Fails, rather than hangs, a send that is still waiting after `ms`: what the test reports when there is no timeout. */
+async function within<T>(ms: number, p: Promise<T>): Promise<T> {
+  let t: ReturnType<typeof setTimeout> | undefined;
+  try { return await Promise.race([p, new Promise<never>((_, rej) => { t = setTimeout(() => rej(new Error(`the send was still waiting after ${ms} ms: no timeout`)), ms); })]); }
+  finally { clearTimeout(t); }
+}
+const SHORT = 30;
+
+await check("a request with no answer in time is aborted: the rows kept, counted unavailable, backed off; the retry drains on 2xx", async () => {
+  must(FORWARD_TIMEOUT_MS === 10_000, `the timeout is ${FORWARD_TIMEOUT_MS}`);
+  const { sql } = sqliteHost(); let now = T0;
+  const h = hanging(() => true);
+  appendTrace(sql, [refresh(1), tool(2), refresh(3, "broken")]);
+  stageForward(sql, CFG, OWNER.tenantId, OWNER.agentId);
+  const started = Date.now();
+  const first = await within(2_000, sendForward(sql, CFG, OWNER.tenantId, OWNER.agentId, h.fetch, () => now, SHORT));
+  const took = Date.now() - started;
+  must(h.requests.length === 1 && h.requests[0]!.outcome === "aborted" && h.requests[0]!.signal?.aborted, `not aborted: ${JSON.stringify(h.requests.map((r) => r.outcome))}`);
+  must(took < 1_000, `the send took ${took} ms`);
+  must(first.error === "network: TimeoutError" && first.kept === 2 && first.sent === 0 && first.dropped === 0, JSON.stringify(first));
+  must(queued(sql).join(",") === "1,3", `rows not kept: ${queued(sql)}`);
+  must(JSON.stringify(dropsOf(sql)) === JSON.stringify([{ reason: "unavailable", status: null, rows: 2 }]), JSON.stringify(dropsOf(sql)));
+  // The backoff applies as for any other no answer.
+  now += FORWARD_BACKOFF_BASE_MS - 1;
+  must((await sendForward(sql, CFG, OWNER.tenantId, OWNER.agentId, h.fetch, () => now, SHORT)).skipped === "backoff", "a timeout did not back off");
+  // The next pass after it: the receiver answers, and the same rows drain.
+  now += 1;
+  h.hangs = () => false;
+  const ok = await within(2_000, sendForward(sql, CFG, OWNER.tenantId, OWNER.agentId, h.fetch, () => now, SHORT));
+  must(ok.sent === 2 && ok.error === null && queued(sql).length === 0, JSON.stringify(ok));
+  must(h.requests.at(-1)!.rows.map(idOf).join(",") === h.requests[0]!.rows.map(idOf).join(","), "the retry did not send the same rows");
+});
+
+await check("a timeout stops the pass: no later batch is sent, and a fetch deaf to its signal still costs one timeout", async () => {
+  const { sql } = sqliteHost();
+  // Deaf: the request never settles, even when aborted; the pass must stop waiting for it all the same.
+  const h = hanging((rows) => rows[0]!.seq === 1, () => 200, true);
+  appendTrace(sql, Array.from({ length: FORWARD_BATCH_MAX * 2 + 10 }, (_, i) => refresh(i + 1)));
+  stageForward(sql, CFG, OWNER.tenantId, OWNER.agentId);
+  const started = Date.now();
+  const r = await within(2_000, sendForward(sql, CFG, OWNER.tenantId, OWNER.agentId, h.fetch, () => T0, SHORT));
+  must(Date.now() - started < 1_000, `the pass waited ${Date.now() - started} ms`);
+  must(h.requests.length === 1 && h.requests[0]!.signal?.aborted, `requests after a timeout: ${h.requests.length}`);
+  must(r.error === "network: TimeoutError" && r.kept === FORWARD_BATCH_MAX * 2 + 10 && r.sent === 0, JSON.stringify(r));
+});
+
+await check("each half of a 413 split has its own timeout, and a half that times out stops the rest", async () => {
+  const { sql } = sqliteHost();
+  // Four rows is too large; of the halves, the one starting at row 3 hangs.
+  const h = hanging((rows) => rows.length <= 2 && rows[0]!.seq === 3, (rows) => rows.length > 2 ? 413 : 200);
+  appendTrace(sql, Array.from({ length: 8 }, (_, i) => refresh(i + 1)));
+  stageForward(sql, CFG, OWNER.tenantId, OWNER.agentId);
+  const r = await within(2_000, sendForward(sql, CFG, OWNER.tenantId, OWNER.agentId, h.fetch, () => T0, SHORT));
+  // 1-8 (413), 1-4 (413), 1-2 (200), 3-4 (hangs, aborted); 5-8 never tried in this pass.
+  must(h.requests.map((q) => `${q.rows[0]!.seq}-${q.rows.at(-1)!.seq}:${q.outcome}`).join(" ") === "1-8:413 1-4:413 1-2:200 3-4:aborted",
+    h.requests.map((q) => `${q.rows[0]!.seq}-${q.rows.at(-1)!.seq}:${q.outcome}`).join(" "));
+  const signals = h.requests.map((q) => q.signal);
+  must(signals.every(Boolean) && new Set(signals).size === signals.length, "the split's requests share a signal");
+  must(!signals[2]!.aborted && signals[3]!.aborted, "the wrong request was aborted");
+  must(r.sent === 2 && r.error === "network: TimeoutError" && queued(sql).join(",") === "3,4,5,6,7,8", JSON.stringify({ r, q: queued(sql) }));
 });
 
 await check("a failing forward leaves the R2 export whole: every row exported and pruned, the forward's rows kept in its own queue", async () => {
