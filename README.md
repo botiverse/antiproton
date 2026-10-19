@@ -1,5 +1,7 @@
 # antiproton
 
+[![Built with Raft](https://raw.githubusercontent.com/raft-builders/awesome-raft-build/main/badge/built-with-raft.svg)](https://raft.build)
+
 > A durable, multi-tenant serverless runtime for autonomous AI agents that interact with real-world systems.
 > 
 > Built on a three-tier architecture that decouples state from model waiting and execution environments: agents sleep for free, wake to think without container overhead, and mount real-world sandboxes strictly on demand.
@@ -522,7 +524,7 @@ SWE-bench rows below say which environment produced them.
 | Suite | Cases | Covers |
 |---|---|---|
 | `pi-storage` | 21 | pi's own storage conformance, unchanged, on node:sqlite (`npm run pi-storage`) and on Durable Object storage (`npm run pi-storage:do`, a worker that is never deployed): mixed-write atomicity, rollback across every store, value and list ordering within a transaction, branch stops before filters and cursors before limits, admission order under concurrent commits, close that seals admission but drains what it admitted |
-| `pi-agent` | 14 | the object-side loop: a message is a pure write, a pass suspends rather than waits, a tool turn goes model → gateway → model, a duplicated pass does not grow the transcript, a run is not dispatched twice, the alarm does not poll, a run interrupted by eviction is reported open and finished, turn cancellation discards model jobs and records a marker, and projected cancellation markers prevent models from continuing aborted tasks |
+| `pi-agent` | 15 | the object-side loop: a message is a pure write, a pass suspends rather than waits, a tool turn goes model → gateway → model, a duplicated pass does not grow the transcript, a run is not dispatched twice, the alarm does not poll, a run interrupted by eviction is reported open and finished, turn cancellation discards model jobs and records a marker, and projected cancellation markers prevent models from continuing aborted tasks |
 | `pi-offload` | 3 | the object never waits for the model: drive suspends, the answer resumes the same operation, and a suspension survives eviction |
 | `pi-tools` | 24 | mounts as tools: the gateway is still the only way out, a refusal reaches the model as a refusal, replay policy, and names the provider will accept. The `run_js` half runs against the real executors: a script reaches a tool by the name the model was offered, a mistyped name is answered with the nearest names rather than "not a tool name", an empty tool list says so, a switched-off mount says why, and a name is attributed to the longest alias it starts with — because an alias may itself contain `__` |
 | `pi-loop` | 3 | pi's harness on our storage, and a rebuilt harness finding the transcript again |
