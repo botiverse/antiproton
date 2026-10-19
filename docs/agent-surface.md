@@ -75,7 +75,7 @@ row below), which keeps the ledger's units: sum those per `unit`.
 
 | `resource` | `dimensions` | `unit` | |
 |---|---|---|---|
-| `model.tokens` | `{ model, kind }` | `tokens` | `kind` is one of `input`, `output`, `reasoning`, `cache_read`, `cache_write_5m`, `cache_write_1h`. `output` **excludes** reasoning tokens (`output` as the provider counts it less `reasoning`); `cache_write_5m` is the cache write less its 1-hour part. A model's own name may contain `:`. |
+| `model.tokens` | `{ model, kind }` | `tokens` | `kind` is one of `input`, `output`, `reasoning`, `cache_read`, `cache_write_5m`, `cache_write_1h`. `output` **excludes** reasoning tokens (`output` as the provider counts it less `reasoning`), so the reasoning share of a bucket is `reasoning / (output + reasoning)` here, not `reasoning / output` as on a trace row; `cache_write_5m` is the cache write less its 1-hour part. A model's own name may contain `:`. |
 | `tool.call` | `{ tool, outcome }` | `calls` | `outcome` is `succeeded` or `failed`; `succeeded` is all calls less the failed ones. |
 | `tool.duration` | `{ tool }` | `ms` | Time spent in the tool (the ledger's `tool.call` rows in `ms`). |
 | anything else | `{ key }` | as recorded | Passed through as the ledger holds it (for example `js.run` / `{ key: "run_js" }` / `runs`). |
@@ -1511,7 +1511,9 @@ anything the trace does not record (`src/trace/outbox.ts` names the documented s
 as exported: `{ seq, at, tenantId, agentId, kind, spanId, parentId?, status, verdict, ms?, attrs }`.
 A `model.call` row's `attrs` carry `model`, `session` (the conversation that made the call: `main`, an Agents API
 session, or a subagent's `sub_…`) and the answer's `input`, `output`, `cacheRead` and `cacheWrite` tokens, and
-`reasoning` (the part of `output` spent reasoning) when the provider reported any;
+`reasoning` (the part of `output` spent reasoning) when the provider reported any — absent, not `0`, when it
+reported none, so a missing key reads as 0. Here `output` **includes** `reasoning`: a call's reasoning share is
+`reasoning / output`;
 on the pi085 engine also `prefix` (`src/runtime/request-prefix.ts`): the sha256 of the system prompt
 and of the tool list, the request's message count and characters, how many leading messages (and their
 characters) are the previous request's byte for byte, and `broken` — `system`, `tools`, `message`, or
