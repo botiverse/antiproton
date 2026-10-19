@@ -72,7 +72,7 @@ import { closeTurn, discardTurn, openTurn, turnInbound, turnNotSaid, turnPaused,
 import {
   admitSubagent, hasSubagentTable, finishSubagentTurn, runningSubagentCount, subagentCeilingMs, SUBAGENT_CAP, SUBAGENT_MAX_MS, SUBAGENT_LIFETIME_MS, isSubagentSession, listSubagents, overdueSubagent, recordSubagent, reportMessage,
   runningSubagents, setSubagentTurnOp, startedResult as subagentStarted, startSubagentTurn, stopRunningSubagents, subagentOf, subagentTool,
-  switchOffSubagents, switchedOffNotice, reportBodyChars,
+  switchOffSubagents, switchedOffNotice, reportBodyChars, reportOverflows, type ReportOverflow,
   SUBAGENT_TOOL, childMayCall, childRefusal, childWithheld, taskMessage, turnEnd, type Subagent, type TurnEnd,
   markReported, reportingSubagents, reportKey, subagentIdFor, taskKey, turnKeyOf,
   reportFailed, reportRetryMs, subagentSpent, subagentTurnRow, noteSubagentModel, combinedRequestId, undeliveredKey, undeliveredNotice,
@@ -4707,6 +4707,31 @@ export class AgentRuntime {
   }
 
   /**
+   * The whole of a report over the cap, stored the way a large tool result is parked (`parkResult`): under the agent's
+   * own prefix, shown as its `artifact://` reference, read back by the tool the parent is offered for parked results
+   * (`parkedReader`). Null when nothing the parent is offered reads one back (an agent made with a profile is offered no
+   * mounts, `#turnTools`), or the store failed twice: the report then says the rest was not stored. The key is the
+   * turn's, so a pass that stores it again after a crash writes the same object.
+   */
+  async #storeReport(owner: { tenantId: string; agentId: string }, s: Pick<Subagent, "id" | "turns">, text: string): Promise<ReportOverflow> {
+    const { tenantId, agentId } = owner;
+    try {
+      if (profileOf((await this.store.loadAgent(tenantId, agentId))?.config)) return null;
+      const reader = parkedReader((await this.#catalogueFor(tenantId, agentId)).tools as MountedTool[]);
+      if (!reader) return null;
+      const key = `t/${tenantId}/${agentId}/subagent-reports/${s.id}-${s.turns}.txt`;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const stored = await this.#artifacts.put(key, text, "text/plain; charset=utf-8");
+          const ref = toAgentRef(stored.ref, owner);
+          return ref ? { ref, readBack: reader.name } : null;
+        } catch (e) { if (attempt === 1) throw e; }
+      }
+    } catch (e) { console.error(`storing the whole report of ${tenantId}/${agentId}'s subagent ${s.id} failed; it is cut without a copy:`, e); }
+    return null;
+  }
+
+  /**
    * Every running subagent whose turn has ended gets its report decided, and every report owed is posted to the session
    * that started the child; how many were posted. The end is read from what the engine committed when the run ended
    * (`#subagentTurnEnd`), so it is found by whichever pass comes first after it, an eviction or a restart between them
@@ -4741,7 +4766,9 @@ export class AgentRuntime {
         try { end = this.#subagentTurnEnd(s, owner); }
         catch (e) { console.error(`reading the end of ${tenantId}/${agentId}'s subagent ${s.id} failed:`, e); continue; }
       }
-      if (!end || !finishSubagentTurn(sql, owner, s.id, end.outcome, now, reportMessage(s, end, now))) continue;
+      if (!end) continue;
+      const overflow = reportOverflows(end) ? await this.#storeReport(owner, s, end.text) : null;
+      if (!finishSubagentTurn(sql, owner, s.id, end.outcome, now, reportMessage(s, end, now, overflow))) continue;
       // Its turn is over: the harness built for it is not kept in this isolate (a follow-up builds another).
       this.#evictAgent(tenantId, agentId, s.id);
       try {

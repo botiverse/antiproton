@@ -1130,7 +1130,12 @@ Reports that arrive while the conversation is already running join that run. A k
 their reports (`[subagents were switched off for this agent; 2 running children were stopped: …]`); its own turn goes on.
 
 `failed` carries the error (a model call that failed, a run that ended without an answer); `cancelled` is a turn
-past the 30-minute ceiling, cancelled by the agent's next pass. A report is cut at 20,000 characters. A turn's end is
+past the 30-minute ceiling, cancelled by the agent's next pass. A subagent is asked to keep its report under about
+3,000 characters unless its task asks for another length. A report over 8,000 characters is cut there, and its whole
+text is stored the way a large tool result is parked: the cut marker names the exact read call
+(`<reader> { ref: "artifact://subagent-reports/…", from: 0 }`, which returns it in pages). When nothing the parent is
+offered reads parked results back, or storing fails, the marker says the rest was not stored and that a follow-up to
+the subagent can ask for it. A turn's end is
 read from what the engine committed when the run ended (pi085's run result, pd's settled submission), so a report is
 delivered by the first pass after it, whether or not the object was evicted or restarted meanwhile. It is delivered
 exactly once: the report is decided and kept on the subagent's row, posted unless the parent's conversation already
