@@ -842,6 +842,41 @@ not an owner here, and any other text is, UUID or not.
 fake Raft, and the rendering against a fake wire, which can hand it answers
 the SDK's contract would refuse first.
 
+Such an agent is also proactive (Raft RFC 075 §4.2, `src/plugins/raft-assistant.ts`),
+and code decides before any model is asked. A push notice that names RFC 074's
+doorbell (a `system.assistant` event) is answered `{ deliver: false, wake: true }`
+(`InboundResult`), so the runtime asks the mount's `wake` and the model is given
+nothing; a notice that also carries the owner's DM is delivered to the chat as
+well. The wake reads the owner's inbox itself and drops what a check already
+looked at, what the owner was already told and what a channel or sender rule
+covers; with nothing left it ends there. With something left it posts one turn
+with those conversations as input in a short session of its own
+(`PluginNext.isolated`, `src/runtime/isolated-session.ts`): a new session that
+sees nothing of the owner's chat, is offered only the reads and
+`assistant_notify_owner`, and is erased once its run ends. The same wake is the
+morning brief at 08:00 owner-local (Raft's `assistantOf.timezone`, else the zone
+the owner gave, else UTC), re-armed every time it runs, and skipped without a
+model call on a morning with nothing unread, nothing active and nothing held.
+Every wake writes a `raft.assistant_wake` trace row and a per-day count, its
+status one of `skipped_empty`, `skipped_filtered`, `invoked`, `paused`,
+`night_deferred` or `failed`. `assistant_notify_owner` composes and sends one
+DM to the owner (`assistantOf.dmTarget` when Raft gives it, else the DM learnt
+from the owner writing), and keeps its rules in code: an item already told is
+dropped, as is one a rule covers, and between 22:00 and 08:00 owner-local
+nothing is sent. `assistant_preferences`, offered in the chat, keeps the
+owner's rules and stated zone. A `403 assistant_not_enabled` from any call
+pauses the checks, the brief and the notify tool until Raft's context names the
+owner again. The chat is offered the owner DM, attachments, the reads and the
+preferences (plus `resume` and the parked-result reader), with no run_js, jobs
+or subagents, under a prompt of its own (`assistantSystemPrompt`,
+`src/runtime/pi-prompt.ts`). What an owner read returns is never parked: a result over the line is cut with a note
+to page, whatever reader is mounted, and a short session's erase also deletes anything its calls parked. Reads of an
+assistant's conversation by an operator or the console need a reason and are audited (docs/runbook.md). An assistant runs on pi085 only: moving it to pd
+(`migrateEngine`) is refused with the reason, and one already there has each
+wake counted `failed` with `reason: engine_pd_unsupported` and a warning, since
+pd cannot hold a short session. `test/raft-assistant-mode.ts` holds the rules,
+the code before the model, the short session, the engine and the offered lists.
+
 **`replay: "never"` overrides the read rule.** A tool that declares it is not
 run again on its own after an interruption, even when it is a read
 (`replayPolicy` asks it first). Declare it on a read whose claim to be harmless

@@ -9,6 +9,7 @@
  * Through the Worker, the whole object, an inbound push and a fresh conversation: test/eval-seed-object.ts.
  */
 import { readFileSync } from "node:fs";
+import type { ReadAudit, ReadAuditRow } from "../cf/src/read-audit.ts";
 import { EVAL_INSTRUCTIONS_MAX_UTF8, handleProvision, type ProvisionDeps, type SeedOps } from "../cf/src/provision/handlers.ts";
 import type { ProvisionedAgent, ProvisionRegistry } from "../cf/src/control-plane.ts";
 import type { SurfaceDeps } from "../cf/src/agent-surface/surface.ts";
@@ -44,7 +45,9 @@ const PLATFORM = { label: "raft-deployment", raftOrigin: "https://raft.example",
 const TOKEN_HASH = "a".repeat(64);
 const AGENT = "raft_01JEVAL";
 
-function fakeDeps(opts: { seed?: boolean; answer?: Awaited<ReturnType<SeedOps["write"]>>; transcript?: unknown; trace?: Awaited<ReturnType<SeedOps["trace"]>> } = {}) {
+function fakeDeps(opts: { seed?: boolean; answer?: Awaited<ReturnType<SeedOps["write"]>>; transcript?: unknown; trace?: Awaited<ReturnType<SeedOps["trace"]>>;
+  /** The agent's object answers as a personal assistant's does: its exports are not given. */
+  assistant?: boolean; audit?: ReadAudit } = {}) {
   const calls: Array<{ op: string; args: unknown[] }> = [];
   const rows = new Map<string, ProvisionedAgent>();
   const t = 1_800_000_000_000;
@@ -69,9 +72,9 @@ function fakeDeps(opts: { seed?: boolean; answer?: Awaited<ReturnType<SeedOps["w
     manifest: async (...args) => { calls.push({ op: "manifest", args }); return { manifest: [], toolConfig: null, manifestSha256: manifestSha256([], null), seal: null }; },
     freshContext: async (...args) => { calls.push({ op: "fresh", args }); return { ok: true, oldSessionId: "main", newSessionId: "main.1" }; },
     restart: async (...args) => { calls.push({ op: "restart", args }); return { ok: true, sessionId: "main", restartedAt: t }; },
-    modelInput: async (...args) => { calls.push({ op: "modelInput", args }); return { sessionId: "main", call: 1 }; },
+    modelInput: async (...args) => { calls.push({ op: "modelInput", args }); return opts.assistant ? { assistantPrivate: true } : { sessionId: "main", call: 1 }; },
     tools: async (...args) => { calls.push({ op: "tools", args }); return { agentId: args[1], tools: [], mounts: [] }; },
-    transcript: async (...args) => { calls.push({ op: "transcript", args }); return opts.transcript === undefined ? { agentId: args[1], sessionId: "main", events: [] } : opts.transcript; },
+    transcript: async (...args) => { calls.push({ op: "transcript", args }); return opts.assistant ? { assistantPrivate: true } : opts.transcript === undefined ? { agentId: args[1], sessionId: "main", events: [] } : opts.transcript; },
     trace: async (...args) => { calls.push({ op: "trace", args }); return opts.trace ?? { ok: true, rows: [], nextCursor: null, scanned: { local: 0, objects: 0 } }; },
     mountable: ["tools", "artifacts", "web", "search", "gh", "sandbox", "state"],
   };
@@ -80,14 +83,15 @@ function fakeDeps(opts: { seed?: boolean; answer?: Awaited<ReturnType<SeedOps["w
     agent: { adopt: async (...args) => { calls.push({ op: "adopt", args }); }, attachCredential: async (...args) => { calls.push({ op: "attach", args }); return { ok: true, account: null }; }, removeCredential: async () => true,
       tool: async (...args) => { calls.push({ op: "tool", args }); return { ok: true, result: null }; }, pushStatus: async () => null },
     ...(opts.seed === false ? {} : { seed }),
+    ...(opts.audit ? { readAudit: opts.audit } : {}),
   };
   return { deps, calls };
 }
 
-async function call(deps: ProvisionDeps, method: string, path: string, opts: { body?: string | Uint8Array; who?: typeof WHO | typeof PLATFORM; raftServerId?: string } = {}) {
+async function call(deps: ProvisionDeps, method: string, path: string, opts: { body?: string | Uint8Array; who?: typeof WHO | typeof PLATFORM; raftServerId?: string; reason?: string } = {}) {
   const q = new URL(`https://x${path}`).searchParams;
   const raw = opts.body === undefined ? null : typeof opts.body === "string" ? new TextEncoder().encode(opts.body) : opts.body;
-  const r = await handleProvision(method, new URL(`https://x${path}`).pathname, { idempotencyKey: null, raftServerId: opts.raftServerId ?? null, credentialId: TOKEN_HASH },
+  const r = await handleProvision(method, new URL(`https://x${path}`).pathname, { idempotencyKey: null, raftServerId: opts.raftServerId ?? null, credentialId: TOKEN_HASH, readReason: opts.reason ?? null },
     undefined, opts.who ?? WHO, deps, q, raw);
   if (!r) return { status: 0, body: null as any, text: "" };
   const text = await r.text();
@@ -737,6 +741,35 @@ await check("production (cf/wrangler.jsonc) does not set EVAL_SEED_ROUTES; previ
   must(!("EVAL_SEED_ROUTES" in prod), `cf/wrangler.jsonc sets EVAL_SEED_ROUTES = ${show(prod.EVAL_SEED_ROUTES)}: the evaluation routes would be served in production`);
   const preview = varsOf("wrangler.preview.jsonc");
   must(preview.EVAL_SEED_ROUTES === "1", `cf/wrangler.preview.jsonc: ${show(preview.EVAL_SEED_ROUTES)}`);
+});
+
+// ---- the exports' reads: audited, and refused for a personal assistant (cf/src/read-audit.ts) ----
+
+const auditInto = (rows: ReadAuditRow[], fail = false): ReadAudit => ({ async record(row) { if (fail) throw new Error("D1 down"); rows.push(row); } });
+
+await check("an assistant's transcript and model-input are refused (403 assistant_private), and each refusal is audited as refused", async () => {
+  for (const route of ["transcript", "model-input?session=main"]) {
+    const rows: ReadAuditRow[] = [];
+    const f = fakeDeps({ assistant: true, audit: auditInto(rows) });
+    const r = await call(f.deps, "GET", `/agents/${AGENT}/${route}`, { reason: "debugging a report" });
+    must(r.status === 403 && r.body.error?.code === "assistant_private" && !r.text.includes("assistantPrivate"), `${route}: ${r.status} ${r.text}`);
+    must(rows.length === 1 && rows[0]!.outcome === "refused" && rows[0]!.assistant && rows[0]!.tokenKind === "provider" && rows[0]!.tokenLabel === TOKEN_HASH &&
+      rows[0]!.reason === "debugging a report" && rows[0]!.route === `provision:${route.split("?")[0]}`, `${route} row: ${show(rows)}`);
+  }
+});
+
+await check("another agent's export is audited as read, with the reason when given; a failed audit does not take the export away", async () => {
+  const rows: ReadAuditRow[] = [];
+  const f = fakeDeps({ audit: auditInto(rows) });
+  const t = await call(f.deps, "GET", `/agents/${AGENT}/transcript`, { reason: "eval run 42" });
+  const m = await call(f.deps, "GET", `/agents/${AGENT}/model-input?session=main`);
+  must(t.status === 200 && m.status === 200, `${t.status} ${m.status}`);
+  must(rows.length === 2 && rows[0]!.outcome === "read" && rows[0]!.route === "provision:transcript" && rows[0]!.reason === "eval run 42" && rows[0]!.session === "main" &&
+    !rows[0]!.assistant && rows[1]!.route === "provision:model-input" && rows[1]!.reason === null, show(rows));
+  const failing = fakeDeps({ audit: auditInto([], true) });
+  const err = console.error; console.error = () => {};
+  try { must((await call(failing.deps, "GET", `/agents/${AGENT}/transcript`)).status === 200, "a failed audit refused a non-assistant's read"); }
+  finally { console.error = err; }
 });
 
 const failed = results.filter((r) => !r.ok);

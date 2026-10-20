@@ -1630,7 +1630,13 @@ export type InboundResult =
   // side `malformed` exists to avoid.
   | { deliver: false; reason: string; rejected?: true; malformed?: never }
   | { deliver: false; reason: string; malformed?: true; rejected?: never }
-  | { deliver: true; text: string; dedupeKey?: string; kind?: "event" | "inbox" };
+  | { deliver: true; text: string; dedupeKey?: string; kind?: "event" | "inbox"; wake?: true }
+  /**
+   * Nothing for the model: the push is this mount's own code's to act on, and the runtime asks its `wake` now
+   * (`Plugin.wake`). With `deliver: true` above, `wake` asks it as well as posting the text. For a plugin that decides
+   * in code whether a push is worth a model call at all (src/plugins/raft-assistant.ts).
+   */
+  | { deliver: false; wake: true; reason: string; dedupeKey?: string; rejected?: never; malformed?: never };
 
 /** `return backgrounded({ boxId, execId }, "…")` — see {@link Backgrounded}. */
 export function backgrounded(handle: Json, note?: string): Backgrounded {
@@ -2385,6 +2391,13 @@ export interface PluginNext {
   forget?: true;
   /** Call this mount's `wake` at or after this time (epoch ms). */
   wakeAt?: number;
+  /**
+   * Post `turn` in a short session of its own rather than the main conversation (src/runtime/isolated-session.ts): it
+   * starts from nothing, sees nothing of the main conversation and leaves nothing in it, and is erased once its run has
+   * ended. Its end is not told to `afterTurn`. For work that stands on its input alone and must not grow, or be seen
+   * in, the conversation a person is having with the agent. pi085 only: on pd the answer is logged and dropped.
+   */
+  isolated?: true;
   /**
    * End the main conversation's running turn, as the runtime's own cancel does (`AgentRuntime.cancelSession`): the run
    * is aborted and its model job dropped, so a call not yet taken is never made and an answer that arrives later is

@@ -22,6 +22,11 @@ import {
   type AgentLoginDeps, type ManifestCache,
 } from "./raft-agent-login.ts";
 import { internalHost } from "./http.ts";
+import {
+  ASSISTANT_OWN_TOOLS, ASSISTANT_STORE, DEFERRED_KEY, NOTIFY_TOOL, OWNER_KEY, PREFERENCES_TOOL, REMINDED_STORE, RULES_KEY,
+  assistantWake, assistantWakeInstruction, doorbellOf, isDoorbellTarget, keepOwnerFromContext, learnDm, loadOwner, noteDoorbell,
+  notifyOwner, pauseOn, preferences, type AssistantOwner, type OwnerContext, type OwnerSend,
+} from "./raft-assistant.ts";
 import { callMcp, isMcpTool, keptMcpOf, leftOut, listMcp, mcpClock, mcpLines, MCP_CALL_TIMEOUT_MS, MCP_CAPABILITY, MCP_KEY, MCP_PREFIX } from "./raft-mcp.ts";
 import { modelToolName } from "../runtime/pi-tools.ts";
 import { isSubagentSession } from "../runtime/subagent-session.ts";
@@ -1509,6 +1514,19 @@ function withoutRunAssignments(ctx: PluginContext, batch: RaftInboxBatch): RaftI
 }
 
 /**
+ * The batch without RFC 074's doorbells (`doorbellOf`: Raft's `system.assistant` app saying the owner's Activity
+ * changed). They are never the model's: an assistant's code takes the doorbell from the push that announced it
+ * (`receiveNotice`, src/plugins/raft-assistant.ts `assistantWake`), and to any other agent it is nothing to do. So it
+ * is left out, with a log line saying so. Seq-less like a run assignment, so leaving it out moves no cursor.
+ */
+function withoutDoorbells(ctx: PluginContext, batch: RaftInboxBatch): RaftInboxBatch {
+  const count = batch.messages.filter((m) => doorbellOf(m.raw) !== null).length;
+  if (!count) return batch;
+  logEvent("raft.doorbell_dropped", { tenantId: ctx.caller.tenantId, agentId: ctx.caller.agentId, mount: ctx.alias, count });
+  return { ...batch, messages: batch.messages.filter((m) => doorbellOf(m.raw) === null) };
+}
+
+/**
  * What one `receive_events` hands the model out of the batch Raft returned, what it acknowledges, and whether it
  * records the shown messages as seen.
  *
@@ -1694,6 +1712,9 @@ const ASSISTANT_TOOLS: readonly ToolSchema[] = [
     idempotency: "native",
     modelOnly: true,
   },
+  // What makes the assistant proactive within its owner's rules (src/plugins/raft-assistant.ts): offered exactly where
+  // the two reads are, since they are only an assistant's.
+  ...ASSISTANT_OWN_TOOLS,
 ];
 
 /** What the inbox read sends: every argument already checked (`ownerInboxRequest`). */
@@ -2562,10 +2583,17 @@ export function createRaftPlugin(deps: {
   const agentLogin = (ctx: PluginContext): AgentLoginDeps => ({ raft: () => raftFor(ctx, { state: false }), timeoutMs: timeout(ctx) });
   /** When each mount's managed MCP catalogue was last listed in this isolate, and which a call found stale (src/plugins/raft-mcp.ts). */
   const mcp = mcpClock();
+  /** An assistant's one composed DM to its owner, sent as `messages_send` would send it (`notifyOwner`). */
+  const sendToOwner = async (ctx: PluginContext, target: string, content: string, key: string): Promise<OwnerSend> => {
+    const op = operationOf.get("messages_send");
+    if (!op) throw new Error("raft: messages_send is not generated in this build, so nothing can be sent");
+    const out = await runOperation(op, { target, content, idempotencyKey: key }, ctx, unofferedFor(ctx));
+    return out instanceof Interrupt ? { sent: false, held: "your owner's DM has messages this conversation has not read" } : { sent: true };
+  };
   /** One generated operation: the attachment download is this plugin's own (`downloadAttachment`), the rest the SDK's. */
   const operate = (op: RaftOperationSpec, args: unknown, ctx: PluginContext, resumed?: { seen?: { upToSeq: number }; heldAt?: number }) =>
     op.name === DOWNLOAD_OP ? downloadAttachment(args, ctx, artifacts, unofferedFor(ctx)) : runOperation(op, args, ctx, unofferedFor(ctx), resumed);
-  return {
+  const plugin: Plugin = {
     id: "raft",
     version: "1.0.0",
     /**
@@ -2584,9 +2612,12 @@ export function createRaftPlugin(deps: {
     database: {
       // Version 4 added the Agent Login sessions: one sealed row per Connected App, none listed, since each is a credential.
       // Version 5 added the Server's flags as the listing last read them (`CONTEXT_STORE`); nothing to carry over.
-      version: 5, stores: {
+      // Version 6 added a personal assistant's owner, rules, held items and what it has told them
+      // (src/plugins/raft-assistant.ts); nothing to carry over.
+      version: 6, stores: {
         [PUSH_STORE]: { listed: [PUSH_KEY] }, [INBOX_STORE]: { listed: [STATE_KEY, SINCE_KEY] }, [SESSION_STORE]: {},
         [CONTEXT_STORE]: { listed: [FEATURES_KEY, MCP_KEY] },
+        [ASSISTANT_STORE]: { listed: [OWNER_KEY, RULES_KEY, DEFERRED_KEY] }, [REMINDED_STORE]: {},
       },
       /**
        * Version 2 kept the cursor and the frontier under their own keys; version 3 keeps the SDK's state record.
@@ -2712,6 +2743,8 @@ export function createRaftPlugin(deps: {
       }
       // The same answer carries the Server's flags; kept for the prompt paragraph, which has no credential to ask with.
       await keepFeatures(ctx, me.data.features);
+      // And whose assistant this is, with the owner's zone, for the brief and the night (src/plugins/raft-assistant.ts).
+      await keepOwner(ctx, me.data);
       const capabilities = new Set(me.data.credential.capabilities);
       const tools: ToolSchema[] = [];
       const skipped: Array<{ name: string; reason: string }> = [];
@@ -2868,6 +2901,11 @@ export function createRaftPlugin(deps: {
       if (name === ACTIONS_TOOL) return integrationsActions(args, ctx, agentLogin(ctx), manifests);
       if (name === INVOKE_TOOL) return integrationsInvoke(args, ctx, agentLogin(ctx), manifests);
       if (name === OWNER_INBOX_TOOL || name === OWNER_MESSAGES_TOOL) return ownerRead(name, args, ctx, assistant, unofferedFor(ctx));
+      if (name === NOTIFY_TOOL || name === PREFERENCES_TOOL) {
+        // Offered as the owner reads are, and refused the same way where the mount's list does not name them.
+        if (!ctx.offered?.includes(name)) throw ownerRefusal(`${name} is not offered on this mount: its Raft account is not a personal assistant`);
+        return name === NOTIFY_TOOL ? notifyOwner(args, ctx, { send: sendToOwner, recheck: recheckOwner }) : preferences(args, ctx);
+      }
       if (name === "receive_events") {
         const limit = integer(a.limit, "limit", 1, EVENTS_LIMIT) ?? EVENTS_LIMIT;
         const raft = raftFor(ctx);
@@ -2892,7 +2930,7 @@ export function createRaftPlugin(deps: {
         const out = await raftFor(ctx, { state: false }).invoke("inbox.check",
           { ack: "cursor", limit, ...(since !== null ? { since } : {}) }, { origin: "model" });
         if (!out.ok) throw sdkFailure(out as RaftFailure, unofferedFor(ctx));
-        const batch = withoutRunAssignments(ctx, (out as { data: RaftInboxBatch }).data);
+        const batch = withoutDoorbells(ctx, withoutRunAssignments(ctx, (out as { data: RaftInboxBatch }).data));
         const given = handOver(batch, unofferedFor(ctx));
         // Exactly this call's cursor, lower than the last one or not: the next pull acknowledges what was shown here.
         // A Server that acknowledged on read has nothing pending, so the next pull sends none. Written before anything
@@ -2907,6 +2945,13 @@ export function createRaftPlugin(deps: {
           for (const m of given.shown) if (m.seq !== null) byTarget.set(m.target, [...(byTarget.get(m.target) ?? []), m.seq]);
           for (const [target, seqs] of byTarget) seen.recordExact(target, seqs);
           await raft.state.save();
+        }
+        // An assistant learns its owner's DM from a message its owner wrote there, where Raft gives none (`learnDm`).
+        if (ctx.offered?.includes(PREFERENCES_TOOL)) {
+          for (const m of given.shown) {
+            if (!m.target.startsWith("dm:@") || m.raw.third_party_event !== undefined) continue;
+            if (await learnDm(ctx, m.target, m.raw.sender_id ?? m.raw.senderId).catch(() => false)) break;
+          }
         }
         return given.result;
       }
@@ -3078,7 +3123,41 @@ export function createRaftPlugin(deps: {
       }
       return receiveNotice(payload, inbound, ctx);
     },
+
+    /** A personal assistant's doorbell checks and morning brief (`assistantWake`); nothing for any other agent. */
+    async wake(ctx) {
+      return assistantWake(ctx, { recheck: recheckOwner, inbox: (c, r) => assistant.ownerInbox(c, r) });
+    },
   };
+  // Every call: a failure that is Raft's `assistant_not_enabled` pauses an assistant's proactive work (`pauseOn`), and
+  // is still the call's failure. Any other refusal (`assistant_route_not_allowed`, `forbidden`) is only the call's.
+  const invoke = plugin.invoke.bind(plugin);
+  plugin.invoke = async (name, args, ctx) => {
+    try { return await invoke(name, args, ctx); }
+    catch (e) {
+      await pauseOn(ctx, e).catch(() => {});
+      throw e;
+    }
+  };
+  return plugin;
+}
+
+/** Kept by the listing; a failure to keep it must not fail the listing, and leaves the last record as it was. */
+async function keepOwner(ctx: PluginContext, context: OwnerContext): Promise<void> {
+  try { await keepOwnerFromContext(ctx, context); }
+  catch (e) { console.warn(`raft assistant owner could not be kept for mount ${ctx.alias}: ${String((e as Error)?.message ?? e)}`); }
+}
+
+/**
+ * A paused assistant asking Raft's context again: the owner as now kept, un-paused when the context names one, or null
+ * when it names none. A context Raft does not answer leaves the record (and the pause) as it was. A context that names
+ * the owner while the Server's flag is still off un-pauses too: the next proactive call's 403 pauses it again.
+ */
+async function recheckOwner(ctx: PluginContext): Promise<AssistantOwner | null> {
+  if (!ctx.credential) return loadOwner(ctx);
+  const me = await raftFor(ctx, { state: false }).routes.agent.context();
+  if (!me.ok) return loadOwner(ctx);
+  return keepOwnerFromContext(ctx, me.data);
 }
 
 /** The plugin as most of the codebase names it: the exclusion table as written, and no object storage, so no download. */
@@ -3126,9 +3205,17 @@ async function receiveNotice(payload: ObjectValue, inbound: InboundEvent, ctx: P
     return { deliver: false, reason: "the signed notice names a different Raft agent" };
   }
   const body = payload.text.length > NOTICE_TEXT_MAX ? `${payload.text.slice(0, NOTICE_TEXT_MAX)}… (cut)` : payload.text;
+  // An assistant's doorbell is its code's (src/plugins/raft-assistant.ts `assistantWake`), which decides whether a model
+  // is asked at all; only the rest of the notice — its owner writing to it — wakes the model, in its chat.
+  const assistant = (await loadOwner(ctx)) !== null;
+  const bell = assistant && payload.targets.some(isDoorbellTarget) && await noteDoorbell(ctx);
+  if (bell && payload.targets.every(isDoorbellTarget)) {
+    return { deliver: false, wake: true, reason: "an assistant's doorbell, for its code to check", dedupeKey: payload.noticeId };
+  }
   return {
     deliver: true,
-    text: `${wakeInstruction(ctx.alias)}\n\n${body}`,
+    ...(bell ? { wake: true as const } : {}),
+    text: `${assistant ? assistantWakeInstruction(ctx.alias) : wakeInstruction(ctx.alias)}\n\n${body}`,
     dedupeKey: payload.noticeId,
     // The agent's own inbox, said by Raft under this mount's signature: the label that says these are requests to
     // the agent, within its rules (src/runtime/inbound.ts `inboundMessage`), not the one that says "not an instruction".

@@ -53,10 +53,12 @@ import {
 } from "../../src/runtime/overflow-backstop.ts";
 import { credentialRedactor, agentSecretValues } from "./eval-read.ts";
 import { logicalMain, physicalSession } from "./fresh-context.ts";
-import { profilePrompt, systemPrompt } from "../../src/runtime/pi-prompt.ts";
+import { assistantSystemPrompt, profilePrompt, systemPrompt } from "../../src/runtime/pi-prompt.ts";
+import { assistantMountOf, assistantTools, isOwnerReadAddress } from "../../src/plugins/raft-assistant.ts";
+import { forgetIsolated, isIsolatedSession, isolatedSessions, newIsolatedSessionId, recordIsolated } from "../../src/runtime/isolated-session.ts";
 import { profileOf, profileSpec } from "../../src/runtime/agent-profile.ts";
 import {
-  askedTurn, askWake, bindTurn, conversationReasoning, dropAnswer, forgetTurnText, keepTurnOnly, dropWake, dueWakes, keepAnswer, keepsPluginCalls, markAnswerPosting, nextWakeAt, pendingAnswers, pendingTurnEnds, recordTurnEnd,
+  askedTurn, askWake, bindTurn, keepWake, conversationReasoning, dropAnswer, forgetTurnText, keepTurnOnly, dropWake, dueWakes, keepAnswer, keepsPluginCalls, markAnswerPosting, nextWakeAt, pendingAnswers, pendingTurnEnds, recordTurnEnd,
   setConversationReasoning, turnEndHandled, turnEndOf,
 } from "../../src/runtime/plugin-wakes.ts";
 import type { PluginHookAnswer } from "../../src/runtime/gateway.ts";
@@ -492,6 +494,17 @@ export function tooLargeResult(
     : `${parked.readBack} { ref: "${parked.ref}", from: 0 }, which returns it in pages`;
   return { preview, bytes: body.length, ref: parked.ref,
     note: `${what}; all of it is stored: read it with ${call} (or fields/offset/limit for part of a list)` };
+}
+
+/**
+ * An owner read too large to hand back whole: the summary, and how to read less, since it is never stored. Not
+ * `tooLargeResult`'s "nothing could read it back": a reader may be mounted, and the reason is the owner's privacy.
+ */
+export function ownerReadTooLarge(value: unknown, body: string): Record<string, Json> {
+  return { preview: summarise(value), bytes: body.length,
+    note: `a summary of a ${body.length}-character result; the rest was discarded, not stored: what you read of your owner's ` +
+      "Raft is never kept outside this conversation. Ask for less: a smaller limit, the next page with offset (the inbox) or " +
+      "before/after (messages)" };
 }
 
 /**
@@ -1393,7 +1406,7 @@ export class AgentRuntime {
     // mount is not taking events, which the service should not report as broken.
     if ("skipped" in answer) return done("ignored", answer.skipped);
     const result = answer.result;
-    if (!result.deliver) return done(result.rejected ? "rejected" : result.malformed ? "malformed" : "ignored", result.reason);
+    if (!result.deliver && !("wake" in result && result.wake)) return done(result.rejected ? "rejected" : result.malformed ? "malformed" : "ignored", result.reason);
     // Which installation accepted it, read before the synchronous run below (which must not await): the pass
     // that posts it gives it up if the alias names another by then (`#deliverInbound`). A mount gone, or replaced,
     // since `receive` began is refused here rather than stamped, so every row this writes carries an installation
@@ -1430,6 +1443,10 @@ export class AgentRuntime {
       askWake(sql, profileSpec(profile).alias, now);
       return done("delivered", `a wake for the ${profileSpec(profile).alias} plugin`, key);
     }
+    // A push the plugin's own code acts on (`InboundResult.wake`): its wake is asked for now, and, with nothing for the
+    // model, nothing is queued or posted.
+    if (!result.deliver || result.wake) askWake(sql, alias, now);
+    if (!result.deliver) return done("delivered", `a wake for the ${alias} plugin`, key);
     sealedBy(tenantId, agentId, sealSeedFiles(sql, tenantId, agentId, "first-inbound", now));
     acceptInbound(sql, { hookId, alias, dedupeKey: key, message: inboundMessage(alias, String(result.text), result.kind === "inbox" ? "inbox" : "event"), now, installationId });
     // The answer the service has always had for a push the agent will be given.
@@ -2362,6 +2379,11 @@ export class AgentRuntime {
         const body = JSON.stringify(rest);
         const limit = limitForCall(call.tool, reader);
         if (body.length <= limit) return res;
+        // What a personal assistant reads of its owner's Raft is never stored outside its conversation with them: cut,
+        // never parked, whatever reader is mounted (src/plugins/raft-assistant.ts `isOwnerReadAddress`).
+        if (isOwnerReadAddress(call.tool)) {
+          return { status: "succeeded", operationId: res.operationId, result: withView(ownerReadTooLarge(rest, body), view) as Json };
+        }
         if (!readBack) {
           return {
             status: "succeeded",
@@ -3293,9 +3315,16 @@ export class AgentRuntime {
     // A subagent is read-only: it is offered only what it may call (`childWithheld`); its dispatch refuses the rest as well (`#host`).
     // An agent made with a profile is offered nothing: its mounts are its plugin's code's and provisioning's
     // (src/runtime/agent-profile.ts), and their calls still go through the gateway, which this list does not change.
+    // A personal assistant (its raft mount's snapshot says whose, src/plugins/raft-assistant.ts) is offered its owner DM,
+    // the owner reads and its own two tools, and none of the harness's own but `resume`: no run_js, no jobs, no subagents.
+    const assistant = profileOf(agentConfig) ? null : assistantMountOf(records);
+    // Its proactive checks run in short sessions of their own (`PluginNext.isolated`), offered only what a check reads
+    // and sends with; the main conversation is its chat with its owner.
+    const isolated = isIsolatedSession(session);
     const tools = profileOf(agentConfig) ? []
       : isSubagentSession(session)
       ? (() => { const withheld = this.#childWithheldIn(catalogue); return catalogue.tools.filter((t) => !withheld.has(t.address)); })()
+      : assistant ? assistantTools(catalogue.tools, assistant, isolated ? "check" : "chat")
       : catalogue.tools;
     const sandbox = this.#deps.sandbox ?? true;
     const store = this.store;
@@ -3346,7 +3375,8 @@ export class AgentRuntime {
     // (agents-api/provisioning.ts).
     // An evaluation's `harness: "minimal"` (src/core/tool-config.ts), read from the record every turn path and the
     // tool export build from here, so a prompt, a steer and a push are offered the same list, under either engine.
-    const extras = harnessExtras({
+    // An assistant keeps `resume`: a send to its owner's DM can be held for messages it has not read, and is answered with it.
+    const extras = assistant ? { runJs: false, jobs: false, resume: !isolated } : harnessExtras({
       apiAgent: !!apiConfig, sandbox, minimal: toolConfigOf(agentConfig)?.harness === "minimal",
       hasBackgroundMount: offersCapability(
         records, offered as MountedTool[],
@@ -3408,7 +3438,7 @@ export class AgentRuntime {
       ...(extras.jobs && !child ? [jobs] : []),
       // Only where the agent's setting is on, never in a child (above), and not where the caller's own function has the
       // name (`callerShadows`). Its body is this object's (`#sendToAgent`).
-      ...(!child && this.#settingsNow(tenantId, agentConfig).subagents && !callerShadows(tenantId, agentId, session, callerDefs)
+      ...(!child && !assistant && this.#settingsNow(tenantId, agentConfig).subagents && !callerShadows(tenantId, agentId, session, callerDefs)
         ? [subagentTool({
             models: (this.#deps.userModels?.offered ?? []).map((o) => ({ id: o.id, label: o.label })),
             send: (p, callId, invocation) => this.#sendToAgent(tenantId, agentId, session, p, callId, invocation),
@@ -3416,7 +3446,7 @@ export class AgentRuntime {
         : []),
       ...callerTools,
     ];
-    return { tools, records, unoffered, reader, offered, activityOf, nameOf, host, extras, callerDefs, keeping, extraTools };
+    return { tools, records, unoffered, reader, offered, activityOf, nameOf, host, extras, callerDefs, keeping, extraTools, assistant };
   }
 
   /**
@@ -3456,8 +3486,12 @@ export class AgentRuntime {
     await this.repinMounts(tenantId, agentId);
     const builtFrom = await this.#harnessKeyFor(tenantId, agentId);
     const agentRef: { current: PiAgent | null } = { current: null };
-    const { records, unoffered, offered, nameOf, host, extras, callerDefs, keeping, extraTools } =
+    const { records, unoffered, offered, nameOf, host, extras, callerDefs, keeping, extraTools, assistant } =
       await this.#turnTools(tenantId, agentId, session, engine, agentRef);
+    // An assistant's morning brief is its raft mount's own timer (`Plugin.wake`, src/plugins/raft-assistant.ts), which
+    // re-arms itself every time it runs. Asked for here, at the one moment every agent passes through, only where none is
+    // kept: so the first one is armed, and one a failing wake dropped comes back at the next open.
+    if (assistant && session === MAIN_SESSION) keepWake(this.#deps.ctx.storage.sql, assistant, Date.now());
 
     // The parts that move between turns, as they are now. On pi085 the prompt shows them as they were when the
     // conversation began (src/runtime/prompt-context.ts): every later open of a harness for it rebuilds the same bytes,
@@ -3477,7 +3511,9 @@ export class AgentRuntime {
     // no I/O of its own.
     const record = (await this.store.loadAgent(tenantId, agentId))?.config;
     const profile = profileOf(record);
-    const prompt = profile ? profilePrompt(profile) : systemPrompt({
+    // An assistant's prompt is its own: the persona's name and description, then what it is for. Not the default core,
+    // the sandbox page or the mounts' paragraphs, which describe tools it is not offered.
+    const prompt = profile ? profilePrompt(profile) : assistant ? assistantSystemPrompt(personaOf(record), assistant, isIsolatedSession(session) ? "check" : "chat") : systemPrompt({
       // The agent's own record: a person named and described it at creation,
       // and that is the first thing the prompt says after the core.
       persona: personaOf(record),
@@ -3668,6 +3704,13 @@ export class AgentRuntime {
     // A profile's plugin is driven by turn ends, which pd does not tell (`#recordTurnEnds`).
     const profile = profileOf(record.config);
     if (profile && op === "migrate") return { ok: false, refused: `this agent's profile (${profile}) runs on pi085 only: pd does not tell its plugin when a turn ends` };
+    // A personal assistant's checks and brief run in short sessions of their own (`PluginNext.isolated`), which pd
+    // cannot hold: it runs one conversation per object. Refused here, the one way an agent reaches pd, rather than
+    // left to fail at every wake.
+    const assistant = assistantMountOf(await this.store.listMounts(tenantId, agentId));
+    if (assistant && op === "migrate") {
+      return { ok: false, refused: `this agent is a personal assistant (its ${assistant} mount's Raft account has an owner), which runs on pi085 only: its checks run in short sessions of their own, and pd runs one conversation per object` };
+    }
     const binding = await this.store.getModelBinding(tenantId, agentId);
     if (!binding) return { ok: false, refused: `no model binding for ${tenantId}/${agentId}` };
     const storage = this.#deps.ctx.storage;
@@ -4944,6 +4987,44 @@ export class AgentRuntime {
     return done;
   }
 
+  /** Whether this agent is someone's personal assistant (src/plugins/raft-assistant.ts), read from its mounts. */
+  async isAssistant(tenantId: string, agentId: string): Promise<boolean> {
+    await this.ready();
+    return assistantMountOf(await this.store.listMounts(tenantId, agentId)) !== null;
+  }
+
+  /**
+   * The short sessions plugins asked for (`PluginNext.isolated`) whose run has ended: erased whole, transcript and model
+   * jobs, as an archived subagent is, so nothing a check read outlives it. One with work left (a run, a model call out)
+   * is kept for the pass after it. pi085 only: pd never makes one.
+   */
+  async #eraseIsolated(tenantId: string, agentId: string) {
+    if (this.#isPd()) return;
+    const sql = this.#deps.ctx.storage.sql;
+    const rows = isolatedSessions(sql);
+    if (!rows.length) return;
+    const busy = new Set(sessionsWithWork(sql));
+    for (const r of rows) {
+      if (busy.has(r.session)) continue;
+      try {
+        // Anything a call of it parked, though an owner read never is (`ownerReadTooLarge`): the stored copies first,
+        // then their references, so a failed delete leaves the row that names what is still there.
+        const parked = (sql.exec("SELECT operation_id, result_ref FROM operations WHERE tenant_id = ? AND task_id = ? AND result_ref IS NOT NULL",
+          tenantId, r.session).toArray() as Array<{ operation_id: string; result_ref: string }>);
+        const keys = parked.map((p) => /^r2:\/\/[^/]+\/(.+)$/.exec(String(p.result_ref))?.[1]).filter((k): k is string => !!k);
+        if (keys.length) await this.#artifacts.delete(keys);
+        if (parked.length) sql.exec("UPDATE operations SET result_ref = NULL WHERE tenant_id = ? AND task_id = ? AND result_ref IS NOT NULL", tenantId, r.session);
+        this.#evictAgent(tenantId, agentId, r.session);
+        const t = piTables(r.session);
+        for (const table of [t.entries, t.usage, t.values, t.list, t.meta]) sql.exec(`DROP TABLE IF EXISTS ${table}`);
+        sql.exec("DELETE FROM pi_sessions WHERE session = ?", r.session);
+        sql.exec("DELETE FROM pi_model_jobs WHERE session = ?", r.session);
+        forgetIsolated(sql, r.session);
+        logEvent("isolated.erased", { tenantId, agentId, session: r.session, mount: r.alias, ms: Date.now() - r.at });
+      } catch (e) { console.error(`erasing ${tenantId}/${agentId}'s short session ${r.session} failed:`, e); }
+    }
+  }
+
   /** pi085: a session's last 20 message entries, oldest first, read with a SELECT. */
   #piMessages(session: string): EngineEntry[] {
     const t = piTables(session);
@@ -5399,6 +5480,7 @@ export class AgentRuntime {
     await this.#cancelStraySubagents(tenantId, agentId);
     if (await this.#reportSubagents(tenantId, agentId) > 0) wakeInMs = 0;
     await this.#archiveSubagents(tenantId, agentId);
+    await this.#eraseIsolated(tenantId, agentId);
     const retry = reportRetryMs(sql, { tenantId, agentId }, Date.now());
     if (retry !== null) wakeInMs = wakeInMs === null ? retry : Math.min(wakeInMs, retry);
     // A running subagent past its ceiling is cancelled by a pass; the pass comes back for the ceiling's moment.
@@ -5488,7 +5570,20 @@ export class AgentRuntime {
       const answers = await resolved("afterTurn", await this.#gateway.afterTurn(tenantId, agentId, row.endFor));
       transact(() => { keep("afterTurn", answers); turnEndHandled(sql, row.seq, Date.now()); });
     }
+    // An assistant already on pd (made before its migration was refused): its checks cannot run, and each wake says so
+    // where its outcomes are counted rather than running the plugin to an answer that would be dropped.
+    const pdAssistant = this.#isPd() ? assistantMountOf(await this.store.listMounts(tenantId, agentId)) : null;
     for (const w of dueWakes(sql, Date.now())) {
+      if (w.alias === pdAssistant) {
+        const now = Date.now();
+        console.warn(`${tenantId}/${agentId}: the assistant's wake on mount ${w.alias} did not run: engine_pd_unsupported`);
+        try {
+          appendTrace(sql, [{ at: now, tenantId, agentId, kind: "raft.assistant_wake", spanId: `wake:${w.alias}:${now}`, status: "failed", verdict: "failed",
+            attrs: { reason: "engine_pd_unsupported", mount: w.alias } }]);
+        } catch (e) { console.error(`the raft.assistant_wake row of ${tenantId}/${agentId} could not be written:`, e); }
+        dropWake(sql, w.alias, w.gen);
+        continue;
+      }
       const answers = await resolved("wake", await this.#gateway.wake(tenantId, agentId, w.alias));
       transact(() => { keep("wake", answers); dropWake(sql, w.alias, w.gen); });
     }
@@ -5506,6 +5601,25 @@ export class AgentRuntime {
       if (a.next.cancelTurn) {
         try { cancelled = (await this.cancelSession(tenantId, agentId, MAIN_SESSION)).cancelledTurn !== null || cancelled; }
         catch (e) { logEvent("plugin.hook", { tenantId, agentId, mount: a.alias, hook: "cancel", error: String((e as Error)?.message ?? e).slice(0, 200) }); }
+      }
+      // A turn in a short session of its own (`PluginNext.isolated`): a new session, so nothing of the main conversation
+      // is sent with it and nothing of it is left there; erased once its run ends (`#eraseIsolated`).
+      if (typeof a.next.turn === "string" && a.next.isolated) {
+        if (this.#isPd()) console.warn(`${tenantId}/${agentId}: a short-session turn of mount ${a.alias} was dropped: engine_pd_unsupported`);
+        else {
+          const session = newIsolatedSessionId();
+          try {
+            await this.postMessage(tenantId, agentId, a.next.turn, "prompt", session, {
+              beforeSay: () => { markAnswerPosting(sql, a.seq); recordIsolated(sql, session, a.alias, Date.now()); },
+            });
+            posted = true;
+          } catch (e) {
+            forgetIsolated(sql, session);
+            logEvent("plugin.hook", { tenantId, agentId, mount: a.alias, hook: "turn", error: String((e as Error)?.message ?? e).slice(0, 200) });
+          }
+        }
+        dropAnswer(sql, a.seq);
+        continue;
       }
       // A fresh turn, or an erase, waits while a run is going in the main conversation: kept as only what is left of it,
       // for a later pass, which comes back soon.

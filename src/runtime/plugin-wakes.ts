@@ -92,6 +92,12 @@ export function askWake(sql: Sql, alias: string, at: number) {
     "ON CONFLICT(alias) DO UPDATE SET at = MIN(at, excluded.at), gen = gen + 1", alias, at);
 }
 
+/** Ask for the mount's `wake` at `at` only when none is kept: one already asked for, earlier or later, stays as it is. */
+export function keepWake(sql: Sql, alias: string, at: number) {
+  ensurePluginWakeTables(sql);
+  sql.exec("INSERT OR IGNORE INTO plugin_wakes (alias, at, gen) VALUES (?, ?, 1)", alias, at);
+}
+
 export function dueWakes(sql: Sql, now: number): Array<{ alias: string; gen: number }> {
   ensurePluginWakeTables(sql);
   return sql.exec("SELECT alias, gen FROM plugin_wakes WHERE at <= ? ORDER BY at, alias", now).toArray()

@@ -244,7 +244,7 @@ await check("actions_prepare's generated schema carries 0.16.0's hosting and mod
     const tool = plugin.tools.find((t) => t.name === "actions_prepare");
     const props = (tool?.parameters as any)?.properties?.action?.properties;
     must(props?.hosting && JSON.stringify(props.hosting.enum) === JSON.stringify(["computer", "antiproton"]), `hosting: ${JSON.stringify(props?.hosting)}`);
-    must(props?.model?.type === "string" && /only with hosting antiproton/.test(props.model.description ?? ""), `model: ${JSON.stringify(props?.model)}`);
+    must(props?.model?.type === "string" && /only with hosting:? "?antiproton"?/.test(props.model.description ?? ""), `model: ${JSON.stringify(props?.model)}`);
   }
 });
 

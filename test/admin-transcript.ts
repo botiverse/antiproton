@@ -28,6 +28,7 @@ function objects(answer: unknown | null = TRANSCRIPT) {
     opened.push(`${tenantId}/${agentId}`);
     return {
       async adminTranscript(t, a, k) { asked.push(`${t}/${a} ${k}`); return answer; },
+      async isAssistantAgent() { return false; },
     };
   };
   return { open, opened, asked };
@@ -130,7 +131,7 @@ await check("a pd agent's conversation comes back through the route, read from t
   try {
     const { agent } = await converse(host, "pd");
     await agent.close();
-    const open = (): TranscriptSource => ({ async adminTranscript(t, a, k) { return readTranscript(host.sql, t, a, k); } });
+    const open = (): TranscriptSource => ({ async adminTranscript(t, a, k) { return readTranscript(host.sql, t, a, k); }, async isAssistantAgent() { return false; } });
     const res = await adminTranscript(request("?tenantId=demo&agentId=u-a"), TOKEN, open);
     assert(res.status === 200, `${res.status}, not 200`);
     const body = await res.json() as { events: Array<{ kind: string; payload: { text?: string } }> };

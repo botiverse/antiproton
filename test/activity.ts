@@ -191,6 +191,33 @@ check("the agent's own tool call is still working, and the same call run under t
   must(activityEvents("raft_a", [{ ...own, attrs: { ...own.attrs, task: PROVISION_TASK } }]).length === 0, "the provider's call was reported");
 });
 
+check("the payload's field set is pinned: ids, names, times, outcomes and status, never a call's arguments or result", () => {
+  // Every row kind the mapping reads, each carrying what must never leave: arguments, a result, message content.
+  const MARK = "PRIVATE-OWNER-CONTENT";
+  const attrs = { tool: "raft.assistant_owner_messages", mount: "raft", name: "raft__assistant_owner_messages", args: { q: MARK }, result: MARK, text: MARK, preview: MARK, runMs: 5, exitCode: 0 };
+  const rows: TraceOutboxRow[] = [
+    row(1, "inbound", "delivered", "ok", { attrs: { text: MARK } }),
+    row(2, "model.call", "tool_calls", "ok", { attrs: { prompt: MARK } }),
+    row(3, "tool.call", "succeeded", "ok", { ms: 10, attrs }),
+    row(4, "tool.call", "failed", "failed", { ms: 10, attrs }),
+    row(5, "model.call", "stop", "ok", { attrs: { text: MARK } }),
+    row(6, "model.call", "error", "failed", { attrs: { error: MARK } }),
+    row(7, "turn.stop", "stopped", "ok", { attrs: { reason: MARK } }),
+    row(8, "session.needs_reset", "set", "ok", { attrs: { reason: MARK } }),
+    row(9, "raft.assistant_wake", "invoked", "ok", { attrs: { trigger: "doorbell", candidates: 2 } }),
+  ];
+  const events = activityEvents("raft_a", rows, { enabled: true, of: () => ({ taskId: "sub_1", parentToolUseId: "op_p", phase: "active" }) } as never);
+  must(events.length > 0, "control: the rows map to events");
+  const FIELDS = new Set(["eventId", "hookEventName", "occurredAt", "toolName", "toolUseId", "durationMs", "exitCode", "ok", "errorClass", "status", "detail", "subagent"]);
+  const SUBAGENT = new Set(["parentToolUseId", "taskId", "phase", "outcome", "reportChars"]);
+  for (const e of events) {
+    const extra = Object.keys(e).filter((k) => !FIELDS.has(k));
+    must(extra.length === 0, `a field outside the pinned set: ${extra} in ${JSON.stringify(e)}`);
+    if (e.subagent) must(Object.keys(e.subagent).every((k) => SUBAGENT.has(k)), `subagent: ${JSON.stringify(e.subagent)}`);
+  }
+  must(!JSON.stringify(events).includes(MARK), `arguments, results or content reached the payload: ${JSON.stringify(events)}`);
+});
+
 for (const r of results) console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);
 const passed = results.filter((r) => r.ok).length;
 console.log(`  ${"─".repeat(56)}\n  ${passed} passed, ${results.length - passed} failed\n`);
