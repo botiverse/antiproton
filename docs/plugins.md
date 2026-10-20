@@ -657,6 +657,17 @@ else checks a call against the schema. `messages_read` does not offer the SDK's
 `unread` (0.13.0), which moves the agent's own read position beside
 `receive_events`.
 
+Unread is not a to-do. A pull hands the inbox out oldest first, a page at a
+time, so a wake told to read until `hasMore` is false reads every channel's
+backlog to reach the one DM behind it. A pull that leaves more than it shows
+therefore also carries `inbox`: Raft's unread listing (`inbox.list`, which
+consumes nothing) as one line per DM, thread, or conversation that @mentions
+the agent, each with the `messages_read` call that opens it at the read
+position, and one line counting the rest as background (`inboxSummary`). The
+wake (`wakeInstruction`) says to read only those and never page back. Nothing
+is acknowledged that the model was not shown; a pull that leaves nothing behind
+makes no listing request and reads as it did before.
+
 A send, a reply, a task claim or a task write that Raft holds for the model's
 decision comes back as a question (`heldCall`) whose text is the SDK's own held
 text, `interrupt.context`, passed on unchanged: its opening "Held — …" line, any
