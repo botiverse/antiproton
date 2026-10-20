@@ -151,9 +151,15 @@ rather than `failed`. `github.ts` shows the pattern.
 **Declare every setting.** A mount whose settings contain a key the plugin does
 not declare is refused when the mount is written (`validateMount` in
 `src/runtime/mount-config.ts`). This catches a typo such as `timeout_ms` for
-`timeoutMs` while a person is there to read the message. Settings are flat:
+`timeoutMs` while a person is there to read the message. A plugin that declares
+no settings takes none: only `account`, which is the console's own label for
+who a mount belongs to rather than a setting of the plugin's, is accepted on it.
+That last part used to be the opposite — a plugin with `config: []` accepted
+every key — and the reason it changed is the next sentence. Settings are flat:
 `string`, `number`, `boolean` or `string[]`. Settings are public (they appear
-in the console and in `tools.mounts`), so a credential never goes in one. A
+in the console and in `tools.mounts`), so a credential never goes in one; on a
+plugin that declared nothing there was no declaration for that rule to be
+checked against, which left it unguarded exactly where nobody was looking. A
 setting whose name sounds like a credential must carry
 `references: "credential"`; the check for that runs over the `everyPlugin`
 list in `test/mount-config.ts`, so it only covers a plugin that list names.
@@ -163,7 +169,14 @@ list in `test/mount-config.ts`, so it only covers a plugin that list names.
 `PATCH /admin/mounts {tenantId, agentId, alias, settings}` (operator token):
 the keys given are merged into the mount's settings, each must be declared,
 marked and of its declared type, and the merged whole is judged by
-`validateMount` like any other write. Only the settings are written, so the
+`validateMount` like any other write. **A key given `null` is a deletion**, not
+a value — no setting type can hold null, so the reading is unambiguous
+(`MountSettingsPatch`, and `test/mount-settings.ts` asks the premise directly so
+a nullable type would redden there). A declared, `changeable` setting so deleted
+goes back to the plugin's default. A key the plugin does **not** declare can
+only be deleted that way: it is a typo or a row from an older build, and until
+this existed a single one froze every setting on its mount, because the merged
+whole was validated and the stray key failed it whatever else the patch named. Only the settings are written, so the
 mount's credential, installation id, tool snapshot and plugin database are
 kept, and the next call runs with the new values, since every call's context
 is built from the mount row read for that call. The answer is

@@ -31,7 +31,15 @@ export interface MountProblem {
   message: string;
 }
 
-const typeOf = (v: unknown): ConfigField["type"] | "unknown" => {
+/**
+ * The `ConfigField["type"]` a value is, or `"unknown"`.
+ *
+ * Exported because the deletion in `MountSettingsPatch` rests on what it answers:
+ * `null` is an operation rather than a value only while it is `"unknown"` here.
+ * `test/mount-settings.ts` asks it directly, so a type that could hold null
+ * reddens there instead of making `null` mean two things.
+ */
+export const settingType = (v: unknown): ConfigField["type"] | "unknown" => {
   if (typeof v === "string") return "string";
   if (typeof v === "number") return "number";
   if (typeof v === "boolean") return "boolean";
@@ -73,9 +81,18 @@ export function validateMount(
     if (key === "account") continue;
     const field = known.get(key);
     if (!field) {
-      // Nothing declared means the plugin takes no settings yet, and refusing
-      // every key would break every mount that already carries one.
-      if (!fields.length) continue;
+      // A plugin that declares no settings takes none. This used to accept every
+      // key, on the reasoning that refusing them would break mounts that already
+      // carry one (#994) — but a setting is public: it is rendered in the console
+      // and handed to the model by `tools.mounts` (src/plugins/builtin.ts), so
+      // "nothing is declared, so nothing is checked" left the one promise that
+      // makes a setting safe unguarded on exactly the plugins nobody was looking
+      // at (github, artifacts, tools, demo). `account` stays: it is the console's
+      // own label for who a mount belongs to, not the plugin's setting.
+      if (!fields.length) {
+        problems.push({ key, message: `${plugin.id} takes no settings, so a mount of it cannot carry "${key}"` });
+        continue;
+      }
       const guess = [...known.keys()]
         .map((k) => [k, near(key, k)] as const)
         .filter(([, d]) => d <= 2)
@@ -87,7 +104,7 @@ export function validateMount(
       continue;
     }
     if (value === null || value === undefined) continue;
-    const actual = typeOf(value);
+    const actual = settingType(value);
     if (actual !== field.type) {
       problems.push({ key, message: `"${key}" should be ${field.type}, got ${actual}` });
       continue;
@@ -241,12 +258,46 @@ export function repeatsMount(
 }
 
 /**
+ * A change to a mount's settings: what an operator sends to
+ * `PATCH /admin/mounts`, keyed by setting name.
+ *
+ * **`null` is an operation, not a value.** A key left out means "leave it as
+ * it is"; a key given `null` means "remove it"; a key given a value means "set
+ * it". That reading is only unambiguous because **no `ConfigField["type"]` can
+ * hold null** — `SettingValue` has no null member and `settingType(null)` answers
+ * `"unknown"` — so a null could never have meant "the value is null". A
+ * nullable field type would break this, which is why `test/mount-settings.ts`
+ * asks `settingType(null)` directly: the day a type can be null, that case reddens
+ * and this rule has to be decided again rather than silently doing one thing
+ * where the caller meant the other.
+ *
+ * The point of the delete is repair, not tidiness. A mount can hold a key its
+ * plugin never declared — `POST /admin/mounts` writes the body through, and an
+ * older build may have declared a setting since removed — and until #994
+ * nothing could take one back out: `PATCH` refused every key it could not type,
+ * and `addMount` refuses to overwrite a mount that differs. So one stray key
+ * froze the mount's *every* setting, because the merged whole is validated and
+ * the stray key failed it whatever else the patch named.
+ */
+export type MountSettingsPatch = Partial<Record<string, SettingValue | null>>;
+
+/**
  * A mount's settings with `settings` merged in, for an operator changing them
- * on a mount that exists (`PATCH /admin/mounts`): only keys the plugin
- * declares `changeable`, each of its declared type, and the merged whole judged
- * by `validateMount` as any other write is. `changed` is the keys whose value
- * moved. A mount with no credential yet is judged without the account rule,
- * as `addMount` judges one, since attaching it re-judges the settings.
+ * on a mount that exists (`PATCH /admin/mounts`), with `MountSettingsPatch`'s
+ * reading of `null` as a deletion. For a key the plugin declares: only
+ * `changeable` ones, each of its declared type. For one it does not declare:
+ * only a deletion, since a key it never declared is a spelling mistake or a
+ * row from an older build, and deleting it is the only sensible thing to do
+ * with it. The merged whole is then judged by `validateMount` as any other
+ * write is, which is what makes "delete the stray key and change a setting in
+ * one patch" work: the two are merged before either is judged. `changed` is
+ * the keys whose value moved, a removed key included. A mount with no
+ * credential yet is judged without the account rule, as `addMount` judges one,
+ * since attaching it re-judges the settings.
+ *
+ * `settings` is `unknown` and not the patch type because this is where JSON off
+ * the wire is judged: the type says what a well-formed change is, and a caller
+ * that could promise that would not need this function.
  */
 export function mergeMountSettings(
   plugin: Pick<Plugin, "id" | "config" | "credential" | "configProblem">,
@@ -259,22 +310,36 @@ export function mergeMountSettings(
   const fields = plugin.config ?? [];
   const changeable = fields.filter((f) => f.changeable).map((f) => f.name);
   const canSay = changeable.length ? `only ${changeable.join(", ")} can` : "none can";
-  for (const [key, value] of Object.entries(settings)) {
+  const patch = settings as MountSettingsPatch;
+  const removed = new Set<string>();
+  for (const [key, value] of Object.entries(patch)) {
     const field = fields.find((f) => f.name === key);
-    if (!field) return { ok: false, error: `${plugin.id} has no setting "${key}"; ${canSay} be changed on an existing mount` };
+    if (!field) {
+      // Not this plugin's setting: a spelling mistake, or a row an older build
+      // wrote. Deleting it is the one thing an operator may do to it — and the
+      // one thing that gets a mount carrying such a key moving again.
+      if (value === null) { removed.add(key); continue; }
+      return { ok: false, error: `${plugin.id} has no setting "${key}"; ${canSay} be changed on an existing mount` };
+    }
+    // A setting the plugin does not mark `changeable` is what the mount IS
+    // connected to (raft's `serverUrl`): moving it in place would carry the
+    // credential and the stored state to another server. Deleting it is the
+    // same move in the other direction, so it is refused the same way.
     if (!field.changeable) {
       return { ok: false, error: `"${key}" cannot be changed on an existing ${plugin.id} mount (${canSay}): ` +
         "a mount with another value of it is another mount" };
     }
-    const actual = typeOf(value);
-    if (actual !== field.type) return { ok: false, error: `"${key}" must be a ${field.type}, got ${value === null ? "null" : actual}` };
+    if (value === null) { removed.add(key); continue; }
+    const actual = settingType(value);
+    if (actual !== field.type) return { ok: false, error: `"${key}" must be a ${field.type}, got ${actual}` };
   }
   const stored = (have.publicConfig && typeof have.publicConfig === "object" && !Array.isArray(have.publicConfig)
     ? have.publicConfig : {}) as Record<string, Json>;
-  const config = { ...stored, ...(settings as Record<string, Json>) };
+  const config: Record<string, Json> = { ...stored, ...(patch as Record<string, Json>) };
+  for (const key of removed) delete config[key];
   const accountLater = plugin.credential && !have.secretRef ? { ...plugin, credential: { ...plugin.credential, required: false } } : plugin;
   const problems = validateMount(accountLater, config, have.secretRef);
   if (problems.length) return { ok: false, error: `cannot change ${plugin.id}'s settings: ${problems.map((p) => p.message).join("; ")}` };
-  const changed = Object.keys(settings).filter((k) => JSON.stringify(stored[k]) !== JSON.stringify(config[k]));
+  const changed = Object.keys(patch).filter((k) => JSON.stringify(stored[k]) !== JSON.stringify(config[k]));
   return { ok: true, config, changed };
 }
