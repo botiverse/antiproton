@@ -70,7 +70,7 @@ import { toolConfigOf, type ToolConfig } from "../../src/core/tool-config.ts";
 import {
   answerClientCall, clientTools, pendingClientCalls, turnClientCalls,
 } from "../../src/runtime/client-calls.ts";
-import { closeTurn, discardTurn, openTurn, turnInbound, turnNotSaid, turnPaused, turnResumed, turnSaid, turnStepStart } from "../../src/runtime/turn-timing.ts";
+import { closeTurn, discardTurn, openTurn, turnIdOf, turnInbound, turnNotSaid, turnPaused, turnResumed, turnSaid, turnStepStart } from "../../src/runtime/turn-timing.ts";
 import {
   admitSubagent, hasSubagentTable, finishSubagentTurn, runningSubagentCount, subagentCeilingMs, SUBAGENT_CAP, SUBAGENT_MAX_MS, SUBAGENT_LIFETIME_MS, isSubagentSession, listSubagents, overdueSubagent, recordSubagent, reportMessage,
   runningSubagents, setSubagentTurnOp, startedResult as subagentStarted, startSubagentTurn, stopRunningSubagents, subagentOf, subagentTool,
@@ -2307,6 +2307,8 @@ export class AgentRuntime {
      * a compaction in the middle of a run moves it, and a call after one belongs to the new context.
      */
     contextId: () => string | undefined = () => undefined,
+    /** The session's turn in flight (`turnIdOf`, src/runtime/turn-timing.ts), asked on each call as `contextId` is. */
+    turnId: () => string | undefined = () => undefined,
   ) {
     const readBack = reader?.name ?? null;
     const withheld = new Set(this.#deps.withholdTools ?? []);
@@ -2331,9 +2333,9 @@ export class AgentRuntime {
     const sql = this.#deps.ctx.storage.sql;
     // Every call through this host is made in the session's turn: the model's own, a program's inside one, the
     // model's answer to a tool's question. So each carries the context id; nothing a call carries can set it.
-    const inTurn = (): typeof ctx & { contextId?: string } => {
-      const id = contextId();
-      return id === undefined ? ctx : { ...ctx, contextId: id };
+    const inTurn = (): typeof ctx & { contextId?: string; turnId?: string } => {
+      const id = contextId(), turn = turnId();
+      return { ...ctx, ...(id === undefined ? {} : { contextId: id }), ...(turn === undefined ? {} : { turnId: turn }) };
     };
     // `send` is the gateway step behind this result: a call by default, or the
     // answer to a question a tool asked, whose result is the tool's own and is
@@ -3349,7 +3351,9 @@ export class AgentRuntime {
       heldLines(await heldResources(records.filter((m) => m.alias === alias), this.#plugins, activityOf), nameOf, Date.now());
     const host = this.#host(
       { tenantId, agentId, taskId: session === MAIN_SESSION ? LEGACY_TASK : session }, reader, offered, heldOn,
-      () => contextIdOf(this.#deps.ctx.storage.sql, { tenantId, agentId, session, engine: engine === "pd" ? "pd" : "pi085" }));
+      () => contextIdOf(this.#deps.ctx.storage.sql, { tenantId, agentId, session, engine: engine === "pd" ? "pd" : "pi085" }),
+      // pi085 only: pd keeps no turn record (src/runtime/turn-timing.ts), so its calls name no turn.
+      () => (engine === "pd" ? undefined : turnIdOf(this.#deps.ctx.storage.sql, session) ?? undefined));
     // The tools the model is offered are the mounts plus the sandbox. run_js is
     // not a mount — it is the one tool whose body is this object rather than a
     // plugin — so it is built here and handed to open beside the mounts. It
@@ -4537,13 +4541,15 @@ export class AgentRuntime {
       const sessions = pd ? [MAIN_SESSION, ...new Set(pdChildren)]
         : [...new Set([MAIN_SESSION, ...sessionsWithWork(sql)])];
       let cancelled: string | null = null;
+      // The main conversation's turn, read before the cancel closes it, for the row that says it was stopped.
+      const stoppedTurn = pd ? null : turnIdOf(sql, MAIN_SESSION);
       for (const session of sessions) {
         const r = await this.cancelSession(tenantId, agentId, session);
         if (r.cancelledTurn && cancelled === null) cancelled = r.cancelledTurn;
         if (!pd) markSession(sql, session, false);
       }
       if (cancelled === null) return done({ result: "not_running" });
-      try { appendTrace(sql, [turnStopRow({ tenantId, agentId, operationId: cancelled, trigger, at: Date.now() })]); }
+      try { appendTrace(sql, [turnStopRow({ tenantId, agentId, operationId: cancelled, trigger, at: Date.now(), turn: stoppedTurn })]); }
       catch (e) { console.error(`the turn.stop row of ${tenantId}/${agentId} could not be written:`, e); }
       return done({ result: "interrupted", cancelledTurn: cancelled });
     } catch (e) {

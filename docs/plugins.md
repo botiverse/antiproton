@@ -678,7 +678,11 @@ them), and `shownUnreadTargets`, exactly the conversations whose counts the
 pull's `inbox` lines showed (`renderInboxSummary` writes the lines and names the
 targets in one pass; a parked pull names none). Raft settles only a completed
 turn's background, never a DM, an unread @mention or an unread assigned task.
-Every turn that saw a snapshot reports once, however it ended; the model's own
+Each listing is kept under the turn it was made in (`caller.turnId`, the id
+a turn's model calls carry as `attrs.turn`; pi085 only), and a turn's end
+names only its own turn's listings: a turn lost without an end leaves its
+listings to be dropped unreported by the next end. Every turn that saw a
+snapshot reports once, however it ended; the model's own
 `inbox_list` keeps the snapshot but names nothing, and an assistant's owner
 inbox, another route, keeps none. Raft's answer is the `raft.turn_ended` trace
 row.

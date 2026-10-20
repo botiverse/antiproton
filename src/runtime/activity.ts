@@ -111,8 +111,12 @@ export function orderStatuses(events: readonly ActivityEvent[], after: number): 
 
 /** How a turn ended, as `turnEnds` says it. */
 export type TurnOutcome = "completed" | "interrupted" | "failed";
-/** One turn's end: the activity event that reports it (`eventId`, one of `activityEvents`' own) and how the turn ended. */
-export interface TurnEndEvent { eventId: string; outcome: TurnOutcome }
+/**
+ * One turn's end: the activity event that reports it (`eventId`, one of `activityEvents`' own), how the turn ended, and
+ * which turn it was (`turn`, the row's `attrs.turn`: `PluginContext.caller.turnId` of the calls made in it), when the
+ * row says.
+ */
+export interface TurnEndEvent { eventId: string; outcome: TurnOutcome; turn?: string }
 
 /**
  * How the turn a row ends ended, or null for a row that ends no turn of the agent's own. The same rows as the Stop and
@@ -136,7 +140,8 @@ export function turnEnds(agentId: string, rows: readonly TraceOutboxRow[]): Turn
   const out: TurnEndEvent[] = [];
   for (const row of rows) {
     const outcome = turnOutcomeOf(row);
-    if (outcome) out.push({ eventId: activityEventId(agentId, row.seq), outcome });
+    const turn = typeof row.attrs.turn === "string" && row.attrs.turn ? row.attrs.turn : null;
+    if (outcome) out.push({ eventId: activityEventId(agentId, row.seq), outcome, ...(turn ? { turn } : {}) });
   }
   return out;
 }

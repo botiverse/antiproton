@@ -132,6 +132,11 @@ export interface CallContext {
    * the plugin's context. A program never builds this object, so it cannot name one.
    */
   contextId?: string;
+  /**
+   * The turn the call is made in (`turnIdOf`, src/runtime/turn-timing.ts), handed to the plugin as `caller.turnId`. Set
+   * as `contextId` is, only by the agent's tool host, and only where the engine keeps a turn record (pi085).
+   */
+  turnId?: string;
 }
 
 /**
@@ -1218,6 +1223,7 @@ export class ToolGateway {
         tenantId: ctx.tenantId, agentId: ctx.agentId, taskId: ctx.taskId,
         ...(fromProgram ? { fromProgram: true as const } : {}),
         ...(typeof ctx.contextId === "string" ? { contextId: ctx.contextId } : {}),
+        ...(typeof ctx.turnId === "string" ? { turnId: ctx.turnId } : {}),
       },
       // Only from the gateway's own bookkeeping, never from what a call carries (`PluginContext.operationId`).
       ...(operationId !== undefined ? { operationId } : {}),

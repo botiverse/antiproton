@@ -3115,21 +3115,25 @@ function turnServer(items: unknown[], o: { snapshotId?: unknown; reply?: () => R
   }) as any;
   return { posts, paths };
 }
-/** A push-on mount in a turn, keeping its trace rows. */
+/** A push-on mount in a turn (`caller.turnId`, as the runtime's tool host sets it), keeping its trace rows. */
+const TURN1 = "tt_main@1", TURN2 = "tt_main@2";
 function turnMount() {
   const m = mount({ enabled: true, agentId: "agent-1", agentName: "raft-bot", lastReached: null });
   const traced: any[] = [];
   m.ctx = inTurn({ ...m.ctx, trace: (row: any) => traced.push(row) });
+  m.ctx.caller.turnId = TURN1;
   return { ...m, traced };
 }
+/** The same mount, its calls now made in another turn. */
+const inTurnId = (m: ReturnType<typeof turnMount>, turnId: string) => ({ ...m.ctx, caller: { ...m.ctx.caller, turnId } });
 /** The trace rows that end a turn the given way, after the pull, mapped by the runtime's own code into events and ends. */
 const T_END = () => Date.now() + 1000;
-function endRows(statuses: Array<[string, string]>, at = T_END()) {
+function endRows(statuses: Array<[string, string]>, at = T_END(), turn: string | null = TURN1) {
   return statuses.map(([kind, status], i) => ({ seq: 100 + i, at: at + i, tenantId: "tenant", agentId: "agent", kind, spanId: `s${i}`, status,
-    verdict: status === "stop" || status === "length" ? "ok" : status === "error" ? "failed" : "cancelled", attrs: {} })) as any[];
+    verdict: status === "stop" || status === "length" ? "ok" : status === "error" ? "failed" : "cancelled", attrs: turn ? { turn } : {} })) as any[];
 }
-async function endTurn(m: ReturnType<typeof turnMount>, statuses: Array<[string, string]>, at?: number) {
-  const rows = endRows(statuses, at);
+async function endTurn(m: ReturnType<typeof turnMount>, statuses: Array<[string, string]>, at?: number, turn?: string | null) {
+  const rows = endRows(statuses, at, turn);
   return raftPlugin.reportActivity!(activityEvents("agent", rows), m.ctx, turnEnds("agent", rows));
 }
 /** The targets the `Background` line names, read back from the text the model was given. */
@@ -3267,12 +3271,51 @@ await check("two turns in one batch: each end closes its own post with its own r
   const first = endRows([["model.call", "stop"]], T_END());
   const real = Date.now;
   Date.now = () => first[0].at + 500;
-  try { turnServer([background("#random", 1050)]); await raftPlugin.invoke("receive_events", {}, m.ctx); } finally { Date.now = real; }
+  try { turnServer([background("#random", 1050)]); await raftPlugin.invoke("receive_events", {}, inTurnId(m, TURN2)); } finally { Date.now = real; }
   globalThis.fetch = (async (_url: any, init?: any) => { server.posts.push(JSON.parse(String(init.body))); return json(200, { ok: true }); }) as any;
-  const rows = [...first, ...endRows([["model.call", "aborted"]], first[0].at + 1000).map((r) => ({ ...r, seq: 200 }))];
+  const rows = [...first, ...endRows([["model.call", "aborted"]], first[0].at + 1000, TURN2).map((r) => ({ ...r, seq: 200 }))];
   await raftPlugin.reportActivity!(activityEvents("agent", rows), m.ctx, turnEnds("agent", rows));
   const reports = server.posts.map((p) => p.turnEnded && `${p.turnEnded.outcome}:${p.turnEnded.shownUnreadTargets}`);
   must(JSON.stringify(reports) === '["completed:#general","interrupted:#random"]', JSON.stringify(server.posts));
+});
+
+await check("a turn lost without an end leaves what it showed unreported: the next turn's end names only its own, and still consumes the snapshot", async () => {
+  // Turn 1 shows #a and is lost: no end in the trace. Turn 2 lists again (Raft merges into the same snapshot) and shows #b.
+  turnServer([background("#a", 10)]);
+  const m = turnMount();
+  const one = await raftPlugin.invoke("receive_events", {}, m.ctx) as any;
+  must(backgroundIn(one.inbox).join() === "#a", `control: turn 1 showed #a: ${JSON.stringify(one.inbox)}`);
+  const server = turnServer([background("#b", 20)]);
+  const two = await raftPlugin.invoke("receive_events", {}, inTurnId(m, TURN2)) as any;
+  must(backgroundIn(two.inbox).join() === "#b", `control: turn 2 showed #b: ${JSON.stringify(two.inbox)}`);
+  await endTurn(m, [["model.call", "stop"]], T_END(), TURN2);
+  must(JSON.stringify(server.posts[0]?.turnEnded) === JSON.stringify({ snapshotId: SNAP, outcome: "completed", shownUnreadTargets: ["#b"] }), JSON.stringify(server.posts));
+  // Dropped, not kept for later: a late end under turn 1's id reports nothing.
+  await endTurn(m, [["model.call", "stop"]], T_END() + 5000, TURN1);
+  must(server.posts.length === 2 && !("turnEnded" in server.posts[1]), JSON.stringify(server.posts[1]));
+});
+
+await check("a turn that listed nothing reports nothing for a lost turn before it; a listing outside a known turn, or an end that names none, reports nothing", async () => {
+  turnServer([background("#a", 10)]);
+  const m = turnMount();
+  await raftPlugin.invoke("receive_events", {}, m.ctx);
+  const server = turnServer([]);
+  await endTurn(m, [["model.call", "stop"]], T_END(), TURN2);
+  must(server.posts.length === 1 && !("turnEnded" in server.posts[0]), `a lost turn's listing went with another turn: ${JSON.stringify(server.posts)}`);
+  // No turn on the call (pd, a replay): nothing is kept, so its turn's end has nothing to report.
+  const n = turnMount();
+  delete n.ctx.caller.turnId;
+  const none = turnServer([background("#c", 30)]);
+  await raftPlugin.invoke("receive_events", {}, n.ctx);
+  await endTurn(n, [["model.call", "stop"]]);
+  must(none.posts.length === 1 && !("turnEnded" in none.posts[0]), JSON.stringify(none.posts));
+  // An end whose row names no turn reports nothing, and leaves the listing for its own end.
+  const k = turnMount();
+  const later = turnServer([background("#d", 40)]);
+  await raftPlugin.invoke("receive_events", {}, k.ctx);
+  await endTurn(k, [["model.call", "stop"]], T_END(), null);
+  await endTurn(k, [["model.call", "stop"]], T_END() + 5000, TURN1);
+  must(!("turnEnded" in later.posts[0]) && later.posts[1]?.turnEnded?.shownUnreadTargets?.join() === "#d", JSON.stringify(later.posts));
 });
 
 await check("a pull whose result is parked shows the model a preview, so its turn names no conversation but still consumes the snapshot", async () => {

@@ -100,10 +100,13 @@ check("turnEnds tells stop from length, aborted and error, and an outside stop, 
     row(10, "model.call", "toolUse", "ok"), row(11, "model.call", "stop", "ok"), row(12, "model.call", "length", "ok"),
     row(13, "model.call", "aborted", "cancelled"), row(14, "model.call", "error", "failed"), row(15, "turn.stop", "stopped", "cancelled"),
     row(16, "model.call", "stop", "ok", { attrs: { session: "sub_child1" } }), row(17, "tool.call", "succeeded", "ok"),
+    row(18, "model.call", "stop", "ok", { attrs: { turn: "tt_main@9" } }), row(19, "turn.stop", "stopped", "cancelled", { attrs: { turn: "tt_main@9" } }),
   ];
   const ends = turnEnds("raft_a", rows);
   must(ends.map((e) => `${e.eventId}=${e.outcome}`).join(",") ===
-    "raft_a:11=completed,raft_a:12=failed,raft_a:13=interrupted,raft_a:14=failed,raft_a:15=interrupted", JSON.stringify(ends));
+    "raft_a:11=completed,raft_a:12=failed,raft_a:13=interrupted,raft_a:14=failed,raft_a:15=interrupted,raft_a:18=completed,raft_a:19=interrupted", JSON.stringify(ends));
+  // The turn a row names goes with its end; a row that names none gives an end with no turn.
+  must(ends.filter((e) => e.turn).map((e) => `${e.eventId}@${e.turn}`).join() === "raft_a:18@tt_main@9,raft_a:19@tt_main@9", JSON.stringify(ends));
   // Each names an event the batch has, and the event is what it always was: no outcome on it, the same hook and status.
   const ev = activityEvents("raft_a", rows);
   for (const e of ends) must(ev.some((x) => x.eventId === e.eventId && (x.hookEventName === "Stop" || x.hookEventName === "BridgeFatal")), `no event for ${e.eventId}: ${JSON.stringify(ev)}`);

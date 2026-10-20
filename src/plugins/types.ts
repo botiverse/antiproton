@@ -340,6 +340,13 @@ export interface PluginContext {
      * made is not part of the contract.
      */
     contextId?: string;
+    /**
+     * An opaque id for the turn this call is made in: the same on every call of one turn, and a new one for a turn
+     * that starts after an earlier one was lost without an end. The id a turn's model calls carry on their trace rows
+     * (`attrs.turn`, read by src/runtime/activity.ts `turnEnds`). Absent outside a turn, and where the engine keeps no
+     * turn record (pd). Compare it for equality only.
+     */
+    turnId?: string;
   };
   /**
    * The gateway's id for the operation this context serves. Opaque; compare it for equality only. Use it as the

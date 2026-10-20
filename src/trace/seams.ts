@@ -196,6 +196,8 @@ export function modelCallRow(m: {
    * (src/runtime/status.ts), so "working" never goes out without saying on what.
    */
   firstTool?: string | null;
+  /** The turn the call was made in (`turnIdOf`, src/runtime/turn-timing.ts), when one was open: what a turn's end is reported under. */
+  turn?: string | null;
 }): TraceRow {
   const ms = typeof m.createdAt === "number" && typeof m.answeredAt === "number"
     ? Math.max(0, m.answeredAt - m.createdAt) : undefined;
@@ -212,10 +214,12 @@ export function modelCallRow(m: {
     // The model first: keys drop from the end when attrs are too long (src/trace/outbox.ts `attrsOf`).
     // The limit's sentence next: what the owner is shown (src/runtime/activity.ts), the last thing to be dropped.
     // The session right after it: activity reads it to tell a subagent's call from the agent's own, so it is kept over the readings.
-    // The first tool right after: the status reads it, and it is one short name.
+    // The first tool right after: the status reads it, and it is one short name. The turn after that: a turn's end is
+    // reported under it (src/runtime/activity.ts `turnEnds`), so it is kept over the readings too.
     attrs: {
       model: m.model, ...(m.session ? { session: m.session } : {}), ...(m.limit ? { limit: m.limit } : {}),
       ...(m.stopReason === "toolUse" && m.firstTool ? { firstTool: m.firstTool.slice(0, 120) } : {}),
+      ...(m.turn ? { turn: m.turn.slice(0, 200) } : {}),
       ...tokens, ...(m.prefix ? { prefix: m.prefix } : {}),
     },
   };

@@ -1627,24 +1627,24 @@ export function renderInboxSummary(
  *
  * Kept in the mount's database under `TURN_KEY`, as `{ seen: SnapshotSeen[] }`, from the listing until the post
  * that reports the turn's end has been answered: the end is reported on the alarm pass, from the trace
- * (cf/src/activity-raft.ts), which may be a new process by then. A listing belongs to the first turn end at or after it
- * (`turnReports`). A turn whose object was lost mid-turn has no end in the trace, so what it saw goes with the next
- * turn's end; Raft settles nothing that is not in that report's snapshot, and only what the model was shown is named.
+ * (cf/src/activity-raft.ts), which may be a new process by then. A listing is kept under the turn it was made in
+ * (`caller.turnId`) and reported only with that turn's own end (`turnReports`). A turn lost without an end leaves its
+ * listings behind; the next turn's end drops them unreported.
  */
 const TURN_KEY = "turnSnapshots";
 /** The agent's own unread listing. A personal assistant's owner inbox is another route (`/assistant/owner-inbox`) and never matches. */
 const INBOX_LIST_PATH = "/internal/agent-api/inbox/conversations";
 /** At most this many listings are kept unreported, the newest; a mount whose ends are never reported does not grow. */
 const SNAPSHOTS_KEPT = 32;
-interface SnapshotSeen { id: string; at: number; snapshotId: string; shown: string[] }
+interface SnapshotSeen { id: string; at: number; turn: string; snapshotId: string; shown: string[] }
 
 function snapshotsOf(value: unknown): SnapshotSeen[] {
   const seen = object(value).seen;
   if (!Array.isArray(seen)) return [];
   return seen.flatMap((v) => {
     const s = object(v);
-    return typeof s.id === "string" && typeof s.at === "number" && typeof s.snapshotId === "string" && Array.isArray(s.shown)
-      ? [{ id: s.id, at: s.at, snapshotId: s.snapshotId, shown: s.shown.filter((t): t is string => typeof t === "string") }] : [];
+    return typeof s.id === "string" && typeof s.at === "number" && typeof s.turn === "string" && typeof s.snapshotId === "string" && Array.isArray(s.shown)
+      ? [{ id: s.id, at: s.at, turn: s.turn, snapshotId: s.snapshotId, shown: s.shown.filter((t): t is string => typeof t === "string") }] : [];
   });
 }
 
@@ -1669,15 +1669,18 @@ function snapshotTap(): { response: (res: Response, url: URL) => Response; snaps
 }
 
 /**
- * Keeps one listing's snapshot and the conversations it showed the model, for the turn's end. A subagent's listing is
- * not the agent's turn (its ends make no activity, `subagentRow`), so it keeps nothing. Never fails the call it is in.
+ * Keeps one listing's snapshot and the conversations it showed the model, under the turn it was shown in
+ * (`caller.turnId`), for that turn's end. A listing outside a known turn keeps nothing, since no end could be told to
+ * be its own; nor does a subagent's, which is not the agent's turn (its ends make no activity, `subagentRow`). Never
+ * fails the call it is in.
  */
 async function keepSnapshot(ctx: PluginContext, snapshotId: string | null, shown: readonly string[]): Promise<void> {
-  if (!snapshotId || isSubagentSession(ctx.caller.taskId)) return;
+  const turn = ctx.caller.turnId;
+  if (!snapshotId || !turn || isSubagentSession(ctx.caller.taskId)) return;
   try {
     await ctx.db.transaction(INBOX_STORE, "readwrite", (tx) => {
       const seen = snapshotsOf(tx.get(INBOX_STORE, TURN_KEY));
-      seen.push({ id: crypto.randomUUID(), at: Date.now(), snapshotId, shown: [...shown] });
+      seen.push({ id: crypto.randomUUID(), at: Date.now(), turn, snapshotId, shown: [...shown] });
       tx.put(INBOX_STORE, { seen: seen.slice(-SNAPSHOTS_KEPT) } as unknown as Json, TURN_KEY);
     });
   } catch (e) {
@@ -1703,26 +1706,31 @@ export interface TurnReport {
 
 /**
  * A batch of activity cut into the posts that carry it: a post ends at each turn end that kept a listing, and carries
- * that turn's `turnEnded`, so the report goes in the same call as the event that ends the turn. A listing belongs to the
- * first turn end at or after it, in event order. The snapshot is the first listing's; a later listing with another id
- * is counted, not merged, and only the first id's conversations are named. A batch with no such end is one post, as
- * before.
+ * that turn's `turnEnded`, so the report goes in the same call as the event that ends the turn. A turn end reports only
+ * the listings made in its own turn (`turn`). Listings from before it made in another turn belong to a turn that never
+ * ended (its object was lost, say): they are dropped, never reported, since no turn completed with them on screen; Raft
+ * merges a snapshot across turns, so this turn's own listings still name and consume it. An end whose row names no turn
+ * reports nothing and drops nothing. The snapshot is the turn's first listing's; a later listing with another id is
+ * counted, not merged, and only the first id's conversations are named. A batch with no such end is one post, as before.
  */
 export function turnReports(
   events: readonly ActivityEvent[], ends: readonly TurnEndEvent[], seen: readonly SnapshotSeen[],
-): Array<{ events: ActivityEvent[]; report: TurnReport | null }> {
-  const outcomeOf = new Map(ends.map((e) => [e.eventId, e.outcome] as const));
+): { parts: Array<{ events: ActivityEvent[]; report: TurnReport | null }>; dropped: string[] } {
+  const endOf = new Map(ends.map((e) => [e.eventId, e] as const));
   let left = [...seen].sort((a, b) => a.at - b.at);
   const parts: Array<{ events: ActivityEvent[]; report: TurnReport | null }> = [];
+  const dropped: string[] = [];
   let part: ActivityEvent[] = [];
   for (const e of events) {
     part.push(e);
-    const outcome = outcomeOf.get(e.eventId);
-    if (!outcome || !left.length) continue;
+    const end = endOf.get(e.eventId);
+    if (!end?.turn || !left.length) continue;
+    const { outcome, turn } = end;
     const at = Date.parse(e.occurredAt);
-    const owed = left.filter((s) => s.at <= at);
-    if (!owed.length) continue;
+    const owed = left.filter((s) => s.at <= at && s.turn === turn);
+    dropped.push(...left.filter((s) => s.at <= at && s.turn !== turn).map((s) => s.id));
     left = left.filter((s) => s.at > at);
+    if (!owed.length) continue;
     const snapshotId = owed[0]!.snapshotId;
     const same = owed.filter((s) => s.snapshotId === snapshotId);
     parts.push({
@@ -1736,7 +1744,7 @@ export function turnReports(
     part = [];
   }
   if (part.length || !parts.length) parts.push({ events: part, report: null });
-  return parts;
+  return { parts, dropped };
 }
 
 /**
@@ -3358,7 +3366,9 @@ export function createRaftPlugin(deps: {
         : !ctx.credential ? "this mount has no account, so Raft cannot be told" : null;
       if (events.length === 0) return skipped ? { skipped } : { sent: 0 };
       const seen = ends.length ? snapshotsOf(await ctx.db.get(INBOX_STORE, TURN_KEY)) : [];
-      const parts = turnReports(events, ends, seen);
+      const { parts, dropped } = turnReports(events, ends, seen);
+      // Listings of turns that never ended, gone before anything is sent: whatever comes of the posts, they are not reported.
+      await forgetSnapshots(ctx, dropped);
       if (skipped) {
         await forgetSnapshots(ctx, parts.flatMap((p) => p.report?.ids ?? []));
         return { skipped };

@@ -500,6 +500,7 @@ await check("an owner-inbox read carries no snapshot to a turn's end: only the a
   const a = await assistant(raft({ dm: "dm:@ada~human" }));
   a.r.unread = [conv(1)];
   a.write(PUSH_STORE, PUSH_KEY, { enabled: true, agentId: "agent-1", agentName: "ada-assistant", lastReached: null });
+  a.ctx.caller.turnId = "tt_main@1";
   // Raft's answers as they would be if every listing carried a snapshot, the owner's too.
   const fake = globalThis.fetch;
   const posts: any[] = [];
@@ -514,7 +515,7 @@ await check("an owner-inbox read carries no snapshot to a turn's end: only the a
     return json(res.status, { ...(await res.json() as object), snapshotId: "snap_owner" });
   }) as any;
   const end = (at: number) => {
-    const rows = [{ seq: at, at: Date.now() + at, tenantId: "tenant", agentId: "agent", kind: "model.call", spanId: `mj_${at}`, status: "stop", verdict: "ok", attrs: {} }] as any[];
+    const rows = [{ seq: at, at: Date.now() + at, tenantId: "tenant", agentId: "agent", kind: "model.call", spanId: `mj_${at}`, status: "stop", verdict: "ok", attrs: { turn: "tt_main@1" } }] as any[];
     return raftPlugin.reportActivity!(activityEvents("agent", rows), a.ctx, turnEnds("agent", rows));
   };
   const read = await raftPlugin.invoke("assistant_owner_inbox", {}, a.ctx) as any;
