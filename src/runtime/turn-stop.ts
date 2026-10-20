@@ -42,11 +42,12 @@ export function agentDeletedAt(sql: Sql): number | null {
 }
 
 /** The `turn.stop` row for a run that was ended: `cancelled`, with who ended it in its errorClass. */
-export function turnStopRow(o: { tenantId: string; agentId: string; operationId: string; trigger: StopTrigger; at: number }): TraceRow {
+export function turnStopRow(o: { tenantId: string; agentId: string; operationId: string; trigger: StopTrigger; at: number; turn?: string | null }): TraceRow {
   return {
     at: o.at, tenantId: o.tenantId, agentId: o.agentId, kind: "turn.stop", spanId: o.operationId,
     status: "stopped", verdict: "cancelled",
-    attrs: { errorClass: STOP_ERROR_CLASS[o.trigger], trigger: o.trigger },
+    // `turn`: the turn that was stopped (`turnIdOf`, read before the stop closed it), as a model call's row carries it.
+    attrs: { errorClass: STOP_ERROR_CLASS[o.trigger], trigger: o.trigger, ...(o.turn ? { turn: o.turn } : {}) },
   };
 }
 

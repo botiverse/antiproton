@@ -13,7 +13,7 @@ import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { standInLoader } from "./spec/worker-stand-in.ts";
 import { operatorModelOf } from "../cf/src/model-request.ts";
 import { pendingTrace } from "../src/trace/outbox.ts";
-import { activityEvents } from "../src/runtime/activity.ts";
+import { activityEvents, turnEnds } from "../src/runtime/activity.ts";
 import { statusEvents } from "../src/runtime/status.ts";
 import { setLogSink } from "../src/core/log.ts";
 
@@ -200,6 +200,11 @@ await check("a looping turn stopped by its owner: aborted with its call out, no 
   must(w.sent.length === jobsBefore && outstanding(w).length === 0, `calls after the stop: ${w.sent.length - jobsBefore}, out: ${show(outstanding(w))}`);
   const fatal = activityEvents("a", rows(w)).filter((e) => e.hookEventName === "BridgeFatal");
   must(show(fatal.map((e) => e.errorClass)) === show(["stopped: by owner"]), `BridgeFatal: ${show(fatal)}`);
+  // The stop's end names the turn it stopped: the one the loop's model calls were made in.
+  const ends = turnEnds("a", rows(w));
+  const stopEnd = ends.find((e) => e.eventId === fatal[0]!.eventId);
+  const callTurns = new Set(rows(w).filter((x: any) => x.kind === "model.call").map((x: any) => x.attrs.turn));
+  must(stopEnd?.outcome === "interrupted" && typeof stopEnd.turn === "string" && callTurns.size === 1 && callTurns.has(stopEnd.turn), `stop end: ${show(stopEnd)}, call turns ${show([...callTurns])}`);
   const st = statusEvents("a", rows(w));
   must(st[st.length - 1]!.status === "error" && st[st.length - 1]!.detail === "stopped: by owner", `status: ${show(st[st.length - 1])}`);
   const again = await w.rt.stopTurn("t", "a", "provider_stop");

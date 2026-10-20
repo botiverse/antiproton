@@ -1,6 +1,7 @@
 import { createHmac } from "node:crypto";
 import { createRaft, isInterrupted, RAFT_OPERATIONS } from "@botiverse/raft-sdk";
-import { raftPlugin as raftWithoutStorage, EXCLUDED, EVENTS_LIMIT, GENERATED, handOver, INBOX_STORE, KEY_LIFETIME_MS, PAGE_ROWS, PUSH_KEY, PUSH_STORE, originOf, pagingArg, toolOf, offeredTerms, escapeMarks, unescapeMarks, createRaftPlugin, downloadAttachment, ATTACHMENT_MAX_BYTES, toolsBasisOf, WITHHELD_ARGUMENTS, FEATURES_BASIS, wakeInstruction } from "../src/plugins/raft.ts";
+import { raftPlugin as raftWithoutStorage, EXCLUDED, EVENTS_LIMIT, GENERATED, handOver, INBOX_STORE, KEY_LIFETIME_MS, PAGE_ROWS, PUSH_KEY, PUSH_STORE, originOf, pagingArg, toolOf, offeredTerms, escapeMarks, unescapeMarks, createRaftPlugin, downloadAttachment, ATTACHMENT_MAX_BYTES, toolsBasisOf, WITHHELD_ARGUMENTS, FEATURES_BASIS, wakeInstruction, renderInboxSummary, INBOX_SUMMARY } from "../src/plugins/raft.ts";
+import { activityEvents, turnEnds } from "../src/runtime/activity.ts";
 import { readFileSync } from "node:fs";
 import { PARK_BYTES } from "../src/plugins/artifacts.ts";
 import { setLogSink } from "../src/core/log.ts";
@@ -3087,6 +3088,274 @@ await check("an activity post that fails throws, so the runtime keeps the events
   one(json(503, { errorCode: "UNAVAILABLE" }));
   const why = await failure(() => raftPlugin.reportActivity!([{ eventId: "raft_x:1", hookEventName: "Stop", occurredAt: "2026-09-28T08:00:00.000Z" }], on.ctx));
   if (!/HTTP 503/.test(why.message)) throw new Error(why.message);
+});
+
+/**
+ * The end of a turn, reported to Raft (`turnEnded`, slock#10507): a turn whose pull listed the inbox names Raft's
+ * snapshot, how the turn ended (from the trace, src/runtime/activity.ts `turnEnds`), and exactly the conversations whose
+ * unread counts the pull's `inbox` lines showed (`renderInboxSummary`). Raft as a fake: a pull that leaves more, a
+ * listing with a snapshot, and the activity post answered with `reply`.
+ */
+const SNAP = "snap_0001";
+const background = (target: string, unread: number) =>
+  ({ target, kind: "channel", unread, mentions: 0, lastReadSeq: 1, activitySeq: 1 + unread, latestSenderName: "tygg", latestAt: "2026-10-20T07:00:00Z" });
+function turnServer(items: unknown[], o: { snapshotId?: unknown; reply?: () => Response; totals?: number } = {}) {
+  const posts: any[] = [];
+  const paths: string[] = [];
+  globalThis.fetch = (async (url: any, init?: any) => {
+    const path = new URL(String(url)).pathname.replace("/internal/agent-api", "");
+    paths.push(path);
+    if (path === "/events") return events([inboxRow(7, "chatter", "general")], { last_seen_seq: 7, has_more: true });
+    if (path === "/inbox/conversations") {
+      return json(200, { view: "unread", items, hasMore: false, nextBeforeSeq: null,
+        totals: { conversations: o.totals ?? items.length, dms: 0, mentions: 0 }, ...("snapshotId" in o ? { snapshotId: o.snapshotId } : { snapshotId: SNAP }) });
+    }
+    if (path === "/activity") { posts.push(JSON.parse(String(init.body))); return o.reply ? o.reply() : json(200, { ok: true, turnEnded: { outcome: "settled" } }); }
+    return json(404, { error: "not found", code: "NOT_FOUND" });
+  }) as any;
+  return { posts, paths };
+}
+/** A push-on mount in a turn (`caller.turnId`, as the runtime's tool host sets it), keeping its trace rows. */
+const TURN1 = "tt_main@1", TURN2 = "tt_main@2";
+function turnMount() {
+  const m = mount({ enabled: true, agentId: "agent-1", agentName: "raft-bot", lastReached: null });
+  const traced: any[] = [];
+  m.ctx = inTurn({ ...m.ctx, trace: (row: any) => traced.push(row) });
+  m.ctx.caller.turnId = TURN1;
+  return { ...m, traced };
+}
+/** The same mount, its calls now made in another turn. */
+const inTurnId = (m: ReturnType<typeof turnMount>, turnId: string) => ({ ...m.ctx, caller: { ...m.ctx.caller, turnId } });
+/** The trace rows that end a turn the given way, after the pull, mapped by the runtime's own code into events and ends. */
+const T_END = () => Date.now() + 1000;
+function endRows(statuses: Array<[string, string]>, at = T_END(), turn: string | null = TURN1) {
+  return statuses.map(([kind, status], i) => ({ seq: 100 + i, at: at + i, tenantId: "tenant", agentId: "agent", kind, spanId: `s${i}`, status,
+    verdict: status === "stop" || status === "length" ? "ok" : status === "error" ? "failed" : "cancelled", attrs: turn ? { turn } : {} })) as any[];
+}
+async function endTurn(m: ReturnType<typeof turnMount>, statuses: Array<[string, string]>, at?: number, turn?: string | null) {
+  const rows = endRows(statuses, at, turn);
+  return raftPlugin.reportActivity!(activityEvents("agent", rows), m.ctx, turnEnds("agent", rows));
+}
+/** The targets the `Background` line names, read back from the text the model was given. */
+const backgroundIn = (inbox: readonly string[]) => {
+  const line = inbox.find((l) => l.startsWith("Background, no mention: "));
+  return line ? line.slice("Background, no mention: ".length, -1).split(", ").map((p) => p.replace(/ [\d,]+ unread$/, "")) : [];
+};
+
+await check("a turn whose pull showed two background counts and ended normally reports turnEnded completed with exactly those two", async () => {
+  const server = turnServer([background("#general", 1294), background("#random", 1050)]);
+  const m = turnMount();
+  const out = await raftPlugin.invoke("receive_events", {}, m.ctx) as any;
+  must(JSON.stringify(backgroundIn(out.inbox)) === '["#general","#random"]', `control: the pull showed both counts: ${JSON.stringify(out.inbox)}`);
+  const sent = await endTurn(m, [["model.call", "stop"]]);
+  must(server.posts.length === 1 && (sent as any).sent === 1, `posts: ${JSON.stringify(server.posts)}`);
+  const body = server.posts[0];
+  must(JSON.stringify(body.turnEnded) === JSON.stringify({ snapshotId: SNAP, outcome: "completed", shownUnreadTargets: ["#general", "#random"] }), `turnEnded: ${JSON.stringify(body.turnEnded)}`);
+  // In the same post as the Stop that ends the turn, and the events are as they always were.
+  must(body.events.length === 1 && body.events[0].hookEventName === "Stop" && Object.keys(body).sort().join() === "events,schema,turnEnded", JSON.stringify(body));
+  // Once: the same events again (a resend) carry no second report.
+  await endTurn(m, [["model.call", "stop"]]);
+  must(server.posts.length === 2 && !("turnEnded" in server.posts[1]), `reported twice: ${JSON.stringify(server.posts[1])}`);
+});
+
+await check("a summary that rendered only N of M background lines reports only the N, the same ones the line names", async () => {
+  const items = Array.from({ length: INBOX_SUMMARY.background + 3 }, (_, i) => background(`#bg${i}`, 100 + i));
+  const server = turnServer(items);
+  const m = turnMount();
+  const out = await raftPlugin.invoke("receive_events", {}, m.ctx) as any;
+  const rendered = backgroundIn(out.inbox);
+  must(rendered.length === INBOX_SUMMARY.background && out.inbox.some((l: string) => /3 more unread conversations not listed/.test(l)), `control: capped: ${JSON.stringify(out.inbox)}`);
+  await endTurn(m, [["model.call", "stop"]]);
+  const reported = server.posts[0]?.turnEnded?.shownUnreadTargets;
+  must(JSON.stringify(reported) === JSON.stringify(rendered), `reported ${JSON.stringify(reported)}, rendered ${JSON.stringify(rendered)}`);
+  // And the function behind both says the same of the listing directly.
+  const r = renderInboxSummary({ view: "unread", conversations: items as any, totals: { conversations: items.length, dms: 0, mentions: 0 }, hasMore: false, nextBeforeSeq: null });
+  must(JSON.stringify(r.shownUnreadTargets) === JSON.stringify(backgroundIn(r.lines)), JSON.stringify(r));
+});
+
+await check("an aborted or stopped turn reports interrupted; an error, a timeout's error and the length limit report failed", async () => {
+  for (const [ending, want] of [
+    [[["model.call", "aborted"]], "interrupted"], [[["turn.stop", "stopped"]], "interrupted"],
+    [[["model.call", "error"]], "failed"], [[["model.call", "length"]], "failed"],
+  ] as Array<[Array<[string, string]>, string]>) {
+    const server = turnServer([background("#general", 1294), background("#random", 1050)]);
+    const m = turnMount();
+    await raftPlugin.invoke("receive_events", {}, m.ctx);
+    await endTurn(m, ending);
+    const t = server.posts[0]?.turnEnded;
+    must(t?.outcome === want && t.snapshotId === SNAP && t.shownUnreadTargets.length === 2, `${ending}: ${JSON.stringify(server.posts)}`);
+  }
+});
+
+await check("an error path still sends turnEnded failed, beside the BridgeFatal Raft has always been shown", async () => {
+  const server = turnServer([background("#general", 1294)]);
+  const m = turnMount();
+  await raftPlugin.invoke("receive_events", {}, m.ctx);
+  await endTurn(m, [["model.call", "toolUse"], ["model.call", "error"]]);
+  const body = server.posts[0];
+  must(body?.turnEnded?.outcome === "failed", JSON.stringify(server.posts));
+  must(body.events.some((e: any) => e.hookEventName === "BridgeFatal" && e.errorClass === "model_call_failed"), `the error event changed: ${JSON.stringify(body.events)}`);
+});
+
+await check("a turn with no inbox listing sends no turnEnded; nor does a listing with no snapshot", async () => {
+  // A pull that leaves nothing more lists nothing.
+  const posts: any[] = [];
+  globalThis.fetch = (async (url: any, init?: any) => {
+    const path = new URL(String(url)).pathname;
+    if (path.endsWith("/events")) return events([inboxRow(7, "hi", "general")], { last_seen_seq: 7 });
+    posts.push(JSON.parse(String(init.body)));
+    return json(200, { ok: true });
+  }) as any;
+  const m = turnMount();
+  await raftPlugin.invoke("receive_events", {}, m.ctx);
+  await endTurn(m, [["model.call", "stop"]]);
+  must(posts.length === 1 && Object.keys(posts[0]).sort().join() === "events,schema", JSON.stringify(posts));
+  // A listing without a snapshot (nothing unread on the page, or a Raft before slock#10507).
+  const server = turnServer([background("#general", 1294)], { snapshotId: undefined });
+  const n = turnMount();
+  await raftPlugin.invoke("receive_events", {}, n.ctx);
+  await endTurn(n, [["model.call", "stop"]]);
+  must(server.paths.includes("/inbox/conversations") && server.posts.length === 1 && !("turnEnded" in server.posts[0]), JSON.stringify(server.posts));
+  must(n.traced.every((r) => r.kind !== "raft.turn_ended"), `traced: ${JSON.stringify(n.traced)}`);
+});
+
+await check("Raft's answer is kept on a raft.turn_ended trace row, counts and reason only, never a conversation's name", async () => {
+  const server = turnServer([background("#general", 1294), background("#random", 1050)],
+    { reply: () => json(200, { ok: true, turnEnded: { outcome: "skipped", reason: "stale_snapshot" } }) });
+  const m = turnMount();
+  await raftPlugin.invoke("receive_events", {}, m.ctx);
+  await endTurn(m, [["model.call", "stop"]]);
+  const rows = m.traced.filter((r) => r.kind === "raft.turn_ended");
+  must(server.posts.length === 1 && rows.length === 1, JSON.stringify(m.traced));
+  must(rows[0].status === "skipped" && rows[0].verdict === "ok" && JSON.stringify(rows[0].attrs) === JSON.stringify({ outcome: "completed", targets: 2, reason: "stale_snapshot" }), JSON.stringify(rows[0]));
+  must(!/#general|#random/.test(JSON.stringify(rows)), `a target name in the trace: ${JSON.stringify(rows)}`);
+  // settled
+  turnServer([background("#general", 1294)]);
+  const s = turnMount();
+  await raftPlugin.invoke("receive_events", {}, s.ctx);
+  await endTurn(s, [["model.call", "stop"]]);
+  must(s.traced.find((r) => r.kind === "raft.turn_ended")?.status === "settled", JSON.stringify(s.traced));
+});
+
+await check("a malformed or missing answer to turnEnded fails nothing: the batch counts as sent and the row says unreadable", async () => {
+  for (const reply of [() => json(200, { ok: true }), () => json(200, { ok: true, turnEnded: "yes" }), () => json(200, { ok: true, turnEnded: { outcome: 7 } }), () => new Response("", { status: 200 })]) {
+    const server = turnServer([background("#general", 1294)], { reply });
+    const m = turnMount();
+    await raftPlugin.invoke("receive_events", {}, m.ctx);
+    const out = await endTurn(m, [["model.call", "stop"]]) as any;
+    const row = m.traced.find((r) => r.kind === "raft.turn_ended");
+    must(out.sent === 1 && server.posts.length === 1 && row?.status === "unreadable" && row.verdict === "failed", `${JSON.stringify(out)} ${JSON.stringify(row)}`);
+    // And it is not reported again on the next end.
+    await endTurn(m, [["model.call", "stop"]], T_END() + 5000);
+    must(!("turnEnded" in server.posts[1]), JSON.stringify(server.posts[1]));
+  }
+});
+
+await check("an activity post that fails keeps the turn's report for the next pass, which sends it again with the same events", async () => {
+  let fail = true;
+  const server = turnServer([background("#general", 1294)], { reply: () => (fail ? json(503, { errorCode: "UNAVAILABLE" }) : json(200, { ok: true, turnEnded: { outcome: "settled" } })) });
+  const m = turnMount();
+  await raftPlugin.invoke("receive_events", {}, m.ctx);
+  const rows = endRows([["model.call", "stop"]]);
+  const why = await failure(() => raftPlugin.reportActivity!(activityEvents("agent", rows), m.ctx, turnEnds("agent", rows)));
+  must(/HTTP 503/.test(why.message), why.message);
+  fail = false;
+  await raftPlugin.reportActivity!(activityEvents("agent", rows), m.ctx, turnEnds("agent", rows));
+  must(server.posts.length === 2 && JSON.stringify(server.posts[0]) === JSON.stringify(server.posts[1]) && server.posts[1].turnEnded?.outcome === "completed", JSON.stringify(server.posts));
+});
+
+await check("two turns in one batch: each end closes its own post with its own report; a listing after an end waits for the next", async () => {
+  const server = turnServer([background("#general", 1294)]);
+  const m = turnMount();
+  await raftPlugin.invoke("receive_events", {}, m.ctx);
+  const first = endRows([["model.call", "stop"]], T_END());
+  const real = Date.now;
+  Date.now = () => first[0].at + 500;
+  try { turnServer([background("#random", 1050)]); await raftPlugin.invoke("receive_events", {}, inTurnId(m, TURN2)); } finally { Date.now = real; }
+  globalThis.fetch = (async (_url: any, init?: any) => { server.posts.push(JSON.parse(String(init.body))); return json(200, { ok: true }); }) as any;
+  const rows = [...first, ...endRows([["model.call", "aborted"]], first[0].at + 1000, TURN2).map((r) => ({ ...r, seq: 200 }))];
+  await raftPlugin.reportActivity!(activityEvents("agent", rows), m.ctx, turnEnds("agent", rows));
+  const reports = server.posts.map((p) => p.turnEnded && `${p.turnEnded.outcome}:${p.turnEnded.shownUnreadTargets}`);
+  must(JSON.stringify(reports) === '["completed:#general","interrupted:#random"]', JSON.stringify(server.posts));
+});
+
+await check("a turn lost without an end leaves what it showed unreported: the next turn's end names only its own, and still consumes the snapshot", async () => {
+  // Turn 1 shows #a and is lost: no end in the trace. Turn 2 lists again (Raft merges into the same snapshot) and shows #b.
+  turnServer([background("#a", 10)]);
+  const m = turnMount();
+  const one = await raftPlugin.invoke("receive_events", {}, m.ctx) as any;
+  must(backgroundIn(one.inbox).join() === "#a", `control: turn 1 showed #a: ${JSON.stringify(one.inbox)}`);
+  const server = turnServer([background("#b", 20)]);
+  const two = await raftPlugin.invoke("receive_events", {}, inTurnId(m, TURN2)) as any;
+  must(backgroundIn(two.inbox).join() === "#b", `control: turn 2 showed #b: ${JSON.stringify(two.inbox)}`);
+  await endTurn(m, [["model.call", "stop"]], T_END(), TURN2);
+  must(JSON.stringify(server.posts[0]?.turnEnded) === JSON.stringify({ snapshotId: SNAP, outcome: "completed", shownUnreadTargets: ["#b"] }), JSON.stringify(server.posts));
+  // Dropped, not kept for later: a late end under turn 1's id reports nothing.
+  await endTurn(m, [["model.call", "stop"]], T_END() + 5000, TURN1);
+  must(server.posts.length === 2 && !("turnEnded" in server.posts[1]), JSON.stringify(server.posts[1]));
+});
+
+await check("a turn that listed nothing reports nothing for a lost turn before it; a listing outside a known turn, or an end that names none, reports nothing", async () => {
+  turnServer([background("#a", 10)]);
+  const m = turnMount();
+  await raftPlugin.invoke("receive_events", {}, m.ctx);
+  const server = turnServer([]);
+  await endTurn(m, [["model.call", "stop"]], T_END(), TURN2);
+  must(server.posts.length === 1 && !("turnEnded" in server.posts[0]), `a lost turn's listing went with another turn: ${JSON.stringify(server.posts)}`);
+  // No turn on the call (pd, a replay): nothing is kept, so its turn's end has nothing to report.
+  const n = turnMount();
+  delete n.ctx.caller.turnId;
+  const none = turnServer([background("#c", 30)]);
+  await raftPlugin.invoke("receive_events", {}, n.ctx);
+  await endTurn(n, [["model.call", "stop"]]);
+  must(none.posts.length === 1 && !("turnEnded" in none.posts[0]), JSON.stringify(none.posts));
+  // An end whose row names no turn reports nothing, and leaves the listing for its own end.
+  const k = turnMount();
+  const later = turnServer([background("#d", 40)]);
+  await raftPlugin.invoke("receive_events", {}, k.ctx);
+  await endTurn(k, [["model.call", "stop"]], T_END(), null);
+  await endTurn(k, [["model.call", "stop"]], T_END() + 5000, TURN1);
+  must(!("turnEnded" in later.posts[0]) && later.posts[1]?.turnEnded?.shownUnreadTargets?.join() === "#d", JSON.stringify(later.posts));
+});
+
+await check("a pull whose result is parked shows the model a preview, so its turn names no conversation but still consumes the snapshot", async () => {
+  const posts: any[] = [];
+  globalThis.fetch = (async (url: any, init?: any) => {
+    const path = new URL(String(url)).pathname.replace("/internal/agent-api", "");
+    if (path === "/events") return events([inboxRow(7, "y".repeat(PULL_LINE), "general")], { last_seen_seq: 7, has_more: true });
+    if (path === "/inbox/conversations") return json(200, { view: "unread", items: [background("#general", 1294)], hasMore: false, nextBeforeSeq: null, totals: { conversations: 1, dms: 0, mentions: 0 }, snapshotId: SNAP });
+    posts.push(JSON.parse(String(init.body)));
+    return json(200, { ok: true, turnEnded: { outcome: "settled" } });
+  }) as any;
+  const m = turnMount();
+  const out = await raftPlugin.invoke("receive_events", {}, m.ctx) as any;
+  must(parked(out) && Array.isArray(out.inbox), `control: parked with its summary: ${JSON.stringify(out).length}`);
+  await endTurn(m, [["model.call", "stop"]]);
+  must(JSON.stringify(posts[0]?.turnEnded) === JSON.stringify({ snapshotId: SNAP, outcome: "completed", shownUnreadTargets: [] }), JSON.stringify(posts));
+});
+
+await check("the model's own inbox_list keeps the snapshot naming nothing; a later listing with another id is counted on the trace, not merged", async () => {
+  const server = turnServer([background("#general", 1294)], { snapshotId: "snap_A" });
+  const m = turnMount();
+  await raftPlugin.invoke("inbox_list", {}, m.ctx);
+  turnServer([background("#random", 1050)], { snapshotId: "snap_B" });
+  await raftPlugin.invoke("receive_events", {}, m.ctx);
+  globalThis.fetch = (async (_url: any, init?: any) => { server.posts.push(JSON.parse(String(init.body))); return json(200, { ok: true, turnEnded: { outcome: "skipped", reason: "stale_snapshot" } }); }) as any;
+  await endTurn(m, [["model.call", "stop"]]);
+  must(JSON.stringify(server.posts[0]?.turnEnded) === JSON.stringify({ snapshotId: "snap_A", outcome: "completed", shownUnreadTargets: [] }), JSON.stringify(server.posts));
+  const row = m.traced.find((r) => r.kind === "raft.turn_ended");
+  must(row?.attrs.snapshotMismatches === 1 && row.attrs.targets === 0, JSON.stringify(row));
+});
+
+await check("a mount Raft is not following forgets the snapshots its turn ends close, and a later turn does not report them", async () => {
+  const server = turnServer([background("#general", 1294)]);
+  const m = turnMount();
+  await raftPlugin.invoke("receive_events", {}, m.ctx);
+  const rows = endRows([["model.call", "stop"]]);
+  const off = await raftPlugin.reportActivity!(activityEvents("agent", rows), { ...m.ctx, credential: null }, turnEnds("agent", rows));
+  must("skipped" in off && server.posts.length === 0, JSON.stringify(off));
+  await endTurn(m, [["model.call", "stop"]], T_END() + 5000);
+  must(server.posts.length === 1 && !("turnEnded" in server.posts[0]), JSON.stringify(server.posts));
 });
 
 await check("disable_push tells Raft the session ended and the agent is offline before deregistering, and still deregisters when that post fails", async () => {

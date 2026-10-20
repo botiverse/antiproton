@@ -23,6 +23,16 @@
  *   agent.ready             → nothing             (its `online` is a status-only event, src/runtime/status.ts)
  *   a subagent's row        → nothing             (a child session's work: trace only, `subagentRow`)
  *
+ * Beside the events, `turnEnds` says how each turn-ending event's turn ended, for a service that settles what a
+ * turn was shown (Raft's `turnEnded`, slock#10507). It is a separate list, not a field on the event: an event goes to
+ * the service as it is, and the service refuses a field it does not know. The status text above is not moved by it:
+ *
+ *   model.call stop         → completed   (the model ended the turn itself)
+ *   model.call length       → failed      (cut at the output limit: the answer is not whole)
+ *   model.call aborted      → interrupted (cancelled by a person or the system)
+ *   model.call error        → failed      (a provider error, a timeout, a refused call)
+ *   turn.stop stopped       → interrupted (ended from outside)
+ *
  * The event id is the row's seq under the agent: unique for the agent's
  * lifetime because seq is AUTOINCREMENT and never reused, so a batch sent
  * twice is the same events twice, which the service dedupes. `errorClass` is a
@@ -97,6 +107,43 @@ export function orderStatuses(events: readonly ActivityEvent[], after: number): 
     if (last !== at) e.occurredAt = new Date(last).toISOString();
   }
   return last;
+}
+
+/** How a turn ended, as `turnEnds` says it. */
+export type TurnOutcome = "completed" | "interrupted" | "failed";
+/**
+ * One turn's end: the activity event that reports it (`eventId`, one of `activityEvents`' own), how the turn ended, and
+ * which turn it was (`turn`, the row's `attrs.turn`: `PluginContext.caller.turnId` of the calls made in it), when the
+ * row says.
+ */
+export interface TurnEndEvent { eventId: string; outcome: TurnOutcome; turn?: string }
+
+/**
+ * How the turn a row ends ended, or null for a row that ends no turn of the agent's own. The same rows as the Stop and
+ * BridgeFatal of `hookEvents`, told apart: a `stop` is the only completed end, since `length` is an answer cut short
+ * and `aborted` one taken away. A subagent's row ends no turn of the agent's (`subagentRow`), as it makes no Stop.
+ */
+export function turnOutcomeOf(row: TraceOutboxRow): TurnOutcome | null {
+  if (subagentRow(row)) return null;
+  if (row.kind === "turn.stop") return row.status === "stopped" ? "interrupted" : null;
+  if (row.kind !== "model.call") return null;
+  switch (row.status) {
+    case "stop": return "completed";
+    case "aborted": return "interrupted";
+    case "length": case "error": return "failed";
+    default: return null;
+  }
+}
+
+/** The turn ends among a run of trace rows, in row order, each named by the id of the event `activityEvents` makes for it. */
+export function turnEnds(agentId: string, rows: readonly TraceOutboxRow[]): TurnEndEvent[] {
+  const out: TurnEndEvent[] = [];
+  for (const row of rows) {
+    const outcome = turnOutcomeOf(row);
+    const turn = typeof row.attrs.turn === "string" && row.attrs.turn ? row.attrs.turn : null;
+    if (outcome) out.push({ eventId: activityEventId(agentId, row.seq), outcome, ...(turn ? { turn } : {}) });
+  }
+  return out;
 }
 
 /** The activity events a run of trace rows means, in row order; rows that mean nothing to the service yield none. */

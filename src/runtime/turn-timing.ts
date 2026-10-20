@@ -48,6 +48,24 @@ export function ensureTurnTiming(sql: Sql) {
   sql.exec(TABLE);
 }
 
+/** A turn's id: the span of its `turn.timing` row, and what `turnIdOf` answers while it is open. */
+const turnIdFor = (session: string, inboundAt: number) => `tt_${session}@${inboundAt}`;
+
+/**
+ * The id of the session's turn in flight, or null when none is open. It is the `turn.timing` row's span, so a fact
+ * tagged with it while the turn runs (a model call's row, a plugin's call) joins that turn and no other: a turn that was
+ * lost without an end is replaced when the next message finds its lane idle (`turnInbound`'s `stale`), under a new id.
+ * Never throws: a reading.
+ */
+export function turnIdOf(sql: Sql, session: string): string | null {
+  try {
+    const has = sql.exec("SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = 'turn_timing'").toArray().length > 0;
+    if (!has) return null;
+    const r = sql.exec("SELECT inbound_at FROM turn_timing WHERE session = ?", session).toArray()[0];
+    return r ? turnIdFor(session, Number(r.inbound_at)) : null;
+  } catch { return null; }
+}
+
 /** The conversation's turn in flight, or null. */
 export function openTurn(sql: Sql, session: string): { inboundAt: number; startAt: number | null; pausedAt: number | null } | null {
   ensureTurnTiming(sql);
@@ -164,7 +182,7 @@ export function closeTurn(sql: Sql, o: {
 
   const row: TraceRow = {
     at: replyAt, tenantId: o.tenantId, agentId: o.agentId, kind: "turn.timing",
-    spanId: `tt_${o.session}@${inboundAt}`,
+    spanId: turnIdFor(o.session, inboundAt),
     status: o.status, verdict: turnVerdict(o.status),
     ms: Math.max(0, replyAt - inboundAt),
     // The split first and the raw points after: keys drop from the end when attrs are too long (outbox.ts `attrsOf`).

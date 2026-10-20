@@ -25,11 +25,12 @@ const tool = (n: number): TraceRow => ({ at: 1_790_000_000_000 + n * 1000, ...OW
 const answered = (n: number): TraceRow => ({ at: 1_790_000_000_000 + n * 1000, ...OWNER, kind: "model.call", spanId: `mj_${n}`, status: "stop", verdict: "ok", attrs: { model: "m" } });
 function gateway(mode: "send" | "skip" | "throw" = "send") {
   const g = {
-    batches: [] as ActivityEvent[][], mode,
-    async reportActivity(_t: string, _a: string, events: readonly ActivityEvent[]) {
+    batches: [] as ActivityEvent[][], ends: [] as unknown[][], mode,
+    async reportActivity(_t: string, _a: string, events: readonly ActivityEvent[], ends: readonly unknown[] = []) {
       if (g.mode === "throw") throw new Error("raft unreachable");
       if (g.mode === "skip") return [{ alias: "raft", skipped: "push is disabled" }];
       g.batches.push([...events]);
+      g.ends.push([...ends]);
       return [{ alias: "raft", sent: events.length }];
     },
   };
@@ -45,6 +46,14 @@ await check("rows become events, the send returns, the cursor moves to the last 
   must(g.batches[0]!.map((e) => e.hookEventName).join(",") === "PreToolUse,PostToolUse,Stop", JSON.stringify(g.batches));
   const again = await flushActivity(g, sql, OWNER.tenantId, OWNER.agentId);
   must(again.events === 0 && g.batches.length === 1 && activityCursor(sql) === 2, JSON.stringify(again));
+});
+
+await check("the batch's turn ends go to the service beside its events, each naming the event that ends its turn", async () => {
+  const { sql } = sqliteHost(); const g = gateway();
+  appendTrace(sql, [tool(1), answered(2), { ...answered(3), status: "aborted", verdict: "cancelled" }]);
+  await flushActivity(g, sql, OWNER.tenantId, OWNER.agentId);
+  must(JSON.stringify(g.ends[0]) === JSON.stringify([{ eventId: "raft_a1:2", outcome: "completed" }, { eventId: "raft_a1:3", outcome: "interrupted" }]), JSON.stringify(g.ends));
+  must(g.ends[0]!.every((e: any) => g.batches[0]!.some((x) => x.eventId === e.eventId)), JSON.stringify(g.batches));
 });
 
 await check("a service that throws keeps the rows and the cursor, and the next pass resends the same event ids", async () => {

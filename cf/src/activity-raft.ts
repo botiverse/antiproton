@@ -19,13 +19,13 @@
  */
 import { pendingTrace } from "../../src/trace/outbox.ts";
 import { flushTrace, noteTraceDays, type TraceSink } from "./trace-r2.ts";
-import { ACTIVITY_BATCH_MAX, activityEvents, orderStatuses, type SubagentActivity } from "../../src/runtime/activity.ts";
+import { ACTIVITY_BATCH_MAX, activityEvents, orderStatuses, turnEnds, type SubagentActivity, type TurnEndEvent } from "../../src/runtime/activity.ts";
 import { turnLineage } from "../../src/runtime/subagents.ts";
 import type { ActivityEvent } from "../../src/plugins/types.ts";
 
 type Sql = { exec(query: string, ...bindings: unknown[]): { toArray(): any[] } };
 export type ActivityGateway = {
-  reportActivity(tenantId: string, agentId: string, events: readonly ActivityEvent[]):
+  reportActivity(tenantId: string, agentId: string, events: readonly ActivityEvent[], ends?: readonly TurnEndEvent[]):
     Promise<Array<{ alias: string; sent: number } | { alias: string; skipped: string }>>;
 };
 
@@ -75,12 +75,14 @@ export async function flushActivity(
   const sent0 = activityCursor(sql);
   const { rows, through } = pendingTrace(sql, sent0, limit);
   const events = activityEvents(agentId, rows, subagents);
+  // How each turn that ends in this batch ended, beside the events rather than on them (`turnEnds` says why).
+  const ends = turnEnds(agentId, rows);
   const clock0 = statusClock(sql);
   const clock = orderStatuses(events, clock0);
   let sent = 0;
   const skipped: string[] = [];
   if (events.length) {
-    for (const r of await gateway.reportActivity(tenantId, agentId, events)) {
+    for (const r of await gateway.reportActivity(tenantId, agentId, events, ends)) {
       if ("sent" in r) sent += r.sent;
       else skipped.push(`${r.alias}: ${r.skipped}`);
     }

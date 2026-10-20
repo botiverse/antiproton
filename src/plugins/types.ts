@@ -2,6 +2,7 @@ import type { Json, MountPolicy, MountRecord } from "../core/types.ts";
 import type { AnswerSpec } from "../core/execution.ts";
 import type { PluginTraceKind, TraceVerdict } from "../trace/outbox.ts";
 import type { AnswerErrorCode } from "../model/pi-bridge.ts";
+import type { TurnEndEvent } from "../runtime/activity.ts";
 
 export interface ToolSchema {
   name: string;
@@ -339,6 +340,13 @@ export interface PluginContext {
      * made is not part of the contract.
      */
     contextId?: string;
+    /**
+     * An opaque id for the turn this call is made in: the same on every call of one turn, and a new one for a turn
+     * that starts after an earlier one was lost without an end. The id a turn's model calls carry on their trace rows
+     * (`attrs.turn`, read by src/runtime/activity.ts `turnEnds`). Absent outside a turn, and where the engine keeps no
+     * turn record (pd). Compare it for equality only.
+     */
+    turnId?: string;
   };
   /**
    * The gateway's id for the operation this context serves. Opaque; compare it for equality only. Use it as the
@@ -2267,11 +2275,14 @@ export interface Plugin {
    * listening (push off, no account) says `skipped` and the runtime moves on;
    * a throw keeps the events for the next pass.
    *
+   * `ends` names the events among these that end a turn, and how that turn ended (src/runtime/activity.ts
+   * `turnEnds`): beside the events, never on them, since the service refuses a field it does not know.
+   *
    * Not named `activity`: that was a member of the retired mount-meter shape,
    * and test/mount-config.ts keeps every retired name from coming back with a
    * new meaning (the same word would read as the old thing to anyone who knew it).
    */
-  reportActivity?(events: readonly ActivityEvent[], ctx: PluginContext): Promise<{ sent: number } | { skipped: string }>;
+  reportActivity?(events: readonly ActivityEvent[], ctx: PluginContext, ends?: readonly TurnEndEvent[]): Promise<{ sent: number } | { skipped: string }>;
 
   /**
    * This mount is being removed: the plugin's one chance to clean up what it set up outside this agent.

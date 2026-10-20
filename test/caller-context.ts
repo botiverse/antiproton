@@ -15,6 +15,8 @@ import { fromResponse, toRequest } from "../src/model/pi-bridge.ts";
 import type { ModelResponse } from "../src/model/types.ts";
 import { interrupt, type Plugin, type PluginContext } from "../src/plugins/types.ts";
 import { contextIdOf, contextIdQuery } from "../src/runtime/context-id.ts";
+import { pendingTrace } from "../src/trace/outbox.ts";
+import { turnEnds } from "../src/runtime/activity.ts";
 import { DurableAgent } from "../src/runtime/durable-agent.ts";
 import { DynamicWorkerExecutor } from "../src/runtime/dynamic-worker-executor.ts";
 import { QuickJsExecutor } from "../src/runtime/executor.ts";
@@ -181,6 +183,28 @@ async function seeOnce(w: Awaited<ReturnType<typeof world>>, label: string, sess
   must(w.seen.length === before + 1, `${label}: the plugin ran ${w.seen.length - before} times`);
   return w.seen.at(-1)!.caller;
 }
+
+await check("pi085: a turn's calls carry one turnId, the next turn another, and the turn's ending model call names the same turn", async () => {
+  const w = await world("pi085");
+  try {
+    const before = w.seen.length;
+    await turn(w.r, "look twice", [call("c_1", "probe__see", {}), call("c_2", "probe__see", {}), say("done")]);
+    await turn(w.r, "look again", [call("c_3", "probe__see", {}), say("done")]);
+    const ids = w.seen.slice(before).map((x) => x.caller.turnId);
+    must(ids.length === 3 && typeof ids[0] === "string" && ids[0] === ids[1] && ids[2] !== ids[0] && typeof ids[2] === "string", `turn ids: ${show(ids)}`);
+    // The rows a turn's end is reported from: each turn's own end, under the id its calls carried.
+    const ends = turnEnds("a", pendingTrace(w.host.sql as never, 0, 1000).rows);
+    must(ends.length === 2 && ends[0]!.outcome === "completed" && ends[0]!.turn === ids[0] && ends[1]!.turn === ids[2], `ends: ${show(ends)} ids ${show(ids)}`);
+  } finally { w.host.dispose(); }
+});
+
+await check("pd: a call names no turn, since pd keeps no turn record", async () => {
+  const w = await world("pd");
+  try {
+    const c = await seeOnce(w, "pd");
+    must(!("turnId" in c), `pd named a turn: ${show(c)}`);
+  } finally { w.host.dispose(); }
+});
 
 for (const engine of ["pi085", "pd"] as const) {
   await check(`${engine}: the model's own calls carry one contextId across several turns, and no fromProgram`, async () => {
