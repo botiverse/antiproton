@@ -78,7 +78,7 @@ export function validateMount(
   for (const [key, value] of Object.entries(given)) {
     // `account` belongs to no plugin, and not to the console either: the catalogue writes it
     // (`DEFAULT_MOUNTS`, cf/src/runtime.ts), the model reads it as that mount's `label`
-    // (`tools.mounts`, src/plugins/builtin.ts:54), and an operator reads it in `/admin/diagnose`.
+    // (`tools.mounts` in src/plugins/builtin.ts), and an operator reads it in `/admin/diagnose`.
     // The console's own panel filters it out of the settings rows and shows instead whether an
     // account is attached, so "the console relies on it" would name a reader that does not exist.
     if (key === "account") continue;
