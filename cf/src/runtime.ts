@@ -3688,6 +3688,13 @@ export class AgentRuntime {
     // A profile's plugin is driven by turn ends, which pd does not tell (`#recordTurnEnds`).
     const profile = profileOf(record.config);
     if (profile && op === "migrate") return { ok: false, refused: `this agent's profile (${profile}) runs on pi085 only: pd does not tell its plugin when a turn ends` };
+    // A personal assistant's checks and brief run in short sessions of their own (`PluginNext.isolated`), which pd
+    // cannot hold: it runs one conversation per object. Refused here, the one way an agent reaches pd, rather than
+    // left to fail at every wake.
+    const assistant = assistantMountOf(await this.store.listMounts(tenantId, agentId));
+    if (assistant && op === "migrate") {
+      return { ok: false, refused: `this agent is a personal assistant (its ${assistant} mount's Raft account has an owner), which runs on pi085 only: its checks run in short sessions of their own, and pd runs one conversation per object` };
+    }
     const binding = await this.store.getModelBinding(tenantId, agentId);
     if (!binding) return { ok: false, refused: `no model binding for ${tenantId}/${agentId}` };
     const storage = this.#deps.ctx.storage;
@@ -5534,7 +5541,20 @@ export class AgentRuntime {
       const answers = await resolved("afterTurn", await this.#gateway.afterTurn(tenantId, agentId, row.endFor));
       transact(() => { keep("afterTurn", answers); turnEndHandled(sql, row.seq, Date.now()); });
     }
+    // An assistant already on pd (made before its migration was refused): its checks cannot run, and each wake says so
+    // where its outcomes are counted rather than running the plugin to an answer that would be dropped.
+    const pdAssistant = this.#isPd() ? assistantMountOf(await this.store.listMounts(tenantId, agentId)) : null;
     for (const w of dueWakes(sql, Date.now())) {
+      if (w.alias === pdAssistant) {
+        const now = Date.now();
+        console.warn(`${tenantId}/${agentId}: the assistant's wake on mount ${w.alias} did not run: engine_pd_unsupported`);
+        try {
+          appendTrace(sql, [{ at: now, tenantId, agentId, kind: "raft.assistant_wake", spanId: `wake:${w.alias}:${now}`, status: "failed", verdict: "failed",
+            attrs: { reason: "engine_pd_unsupported", mount: w.alias } }]);
+        } catch (e) { console.error(`the raft.assistant_wake row of ${tenantId}/${agentId} could not be written:`, e); }
+        dropWake(sql, w.alias, w.gen);
+        continue;
+      }
       const answers = await resolved("wake", await this.#gateway.wake(tenantId, agentId, w.alias));
       transact(() => { keep("wake", answers); dropWake(sql, w.alias, w.gen); });
     }
@@ -5556,7 +5576,7 @@ export class AgentRuntime {
       // A turn in a short session of its own (`PluginNext.isolated`): a new session, so nothing of the main conversation
       // is sent with it and nothing of it is left there; erased once its run ends (`#eraseIsolated`).
       if (typeof a.next.turn === "string" && a.next.isolated) {
-        if (this.#isPd()) logEvent("plugin.hook", { tenantId, agentId, mount: a.alias, hook: "turn", dropped: "isolated: pd runs one conversation per object" });
+        if (this.#isPd()) console.warn(`${tenantId}/${agentId}: a short-session turn of mount ${a.alias} was dropped: engine_pd_unsupported`);
         else {
           const session = newIsolatedSessionId();
           try {

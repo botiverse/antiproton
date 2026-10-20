@@ -14,6 +14,7 @@ import {
   assistantWakeInstruction, isQuietHours, itemOf, localDay, nextBriefAt, zoneOf,
 } from "../src/plugins/raft-assistant.ts";
 import { askWake } from "../src/runtime/plugin-wakes.ts";
+import { recordedEngine } from "../src/runtime/durable-agent.ts";
 import { AgentRuntime } from "../cf/src/runtime.ts";
 import { operatorModelOf } from "../cf/src/model-request.ts";
 import { fromResponse } from "../src/model/pi-bridge.ts";
@@ -565,6 +566,37 @@ await check("a doorbell with candidates runs in a fresh short session: the check
     const tables = (w.host.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'pi_s_iso_%'").toArray() as any[]).map((x) => x.name);
     must(tables.length === 0, `the short session's transcript outlived it: ${show(tables)}`);
     must(show(w.wakeRows().map((x) => x.status)) === show(["invoked"]), show(w.wakeRows()));
+  } finally { w.host.dispose(); }
+});
+
+await check("an assistant cannot be moved to the pd engine: the migration is refused, saying why, and the engine stays pi085", async () => {
+  const w = await runtimeWith(true);
+  try {
+    const out = await w.rt.migrateEngine("t", "a", "migrate") as any;
+    must(out && out.ok === false && /personal assistant[\s\S]*pi085 only/.test(out.refused), `migrate: ${show(out)}`);
+    must(recordedEngine(w.host.sql as never) === null, "the engine moved");
+  } finally { w.host.dispose(); }
+});
+
+await check("an assistant already on pd: each wake is counted failed (engine_pd_unsupported), not dropped in silence, and calls no model", async () => {
+  // Migrated while no one's assistant, then given an owner: the one way to be an assistant on pd.
+  const w = await runtimeWith(false);
+  try {
+    const moved = await w.rt.migrateEngine("t", "a", "migrate") as any;
+    must(moved && moved.ok !== false && recordedEngine(w.host.sql as never) === "pd", `control: the migration of a non-assistant: ${show(moved)}`);
+    w.r.owner = true;
+    const relisted = await w.rt.attachCredential("t", "a", "raft", { token: "sk_agent_assist_2234567890" });
+    must(relisted.ok && assistantMountOf(await w.rt.store.listMounts("t", "a")) === "raft", "control: it is an assistant now");
+    w.r.unread = [conv(1, { latestAt: new Date(Date.now() - 60_000).toISOString() })];
+    const calls = w.sent.length;
+    w.doorbell();
+    const warned: string[] = [];
+    const warn = console.warn;
+    console.warn = (...args: unknown[]) => { warned.push(args.map(String).join(" ")); };
+    try { await w.rt.step("t", "a"); } finally { console.warn = warn; }
+    must(show(w.wakeRows()) === show([{ status: "failed", attrs: { reason: "engine_pd_unsupported", mount: "raft" } }]), `rows: ${show(w.wakeRows())}`);
+    must(warned.some((l) => l.includes("engine_pd_unsupported")), `warned: ${show(warned)}`);
+    must(w.sent.length === calls && w.r.inboxReads.length === 0, `model calls ${w.sent.length - calls}, reads ${show(w.r.inboxReads)}`);
   } finally { w.host.dispose(); }
 });
 

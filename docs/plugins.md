@@ -869,8 +869,11 @@ pauses the checks, the brief and the notify tool until Raft's context names the
 owner again. The chat is offered the owner DM, attachments, the reads and the
 preferences (plus `resume` and the parked-result reader), with no run_js, jobs
 or subagents, under a prompt of its own (`assistantSystemPrompt`,
-`src/runtime/pi-prompt.ts`). `test/raft-assistant-mode.ts` holds the rules, the
-code before the model, the short session and the offered lists.
+`src/runtime/pi-prompt.ts`). An assistant runs on pi085 only: moving it to pd
+(`migrateEngine`) is refused with the reason, and one already there has each
+wake counted `failed` with `reason: engine_pd_unsupported` and a warning, since
+pd cannot hold a short session. `test/raft-assistant-mode.ts` holds the rules,
+the code before the model, the short session, the engine and the offered lists.
 
 **`replay: "never"` overrides the read rule.** A tool that declares it is not
 run again on its own after an interruption, even when it is a read
