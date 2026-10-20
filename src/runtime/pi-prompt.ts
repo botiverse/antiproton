@@ -20,6 +20,7 @@
  * here equates finishing with not acting.
  */
 import { profileSpec, type AgentProfile } from "./agent-profile.ts";
+import { assistantPrompt } from "../plugins/raft-assistant.ts";
 
 const CORE = `You are a long-running agent working on the user's behalf.
 
@@ -168,4 +169,13 @@ export function personaSection(p: PromptParts["persona"]): string {
  */
 export function profilePrompt(profile: AgentProfile): string {
   return profileSpec(profile).instructions;
+}
+
+/**
+ * The system prompt of a personal assistant (src/plugins/raft-assistant.ts): the persona a person gave it, then what an
+ * assistant is for, under the alias of the raft mount that makes it one. Not the core, which tells an agent to act on
+ * anyone's behalf with any tool, nor the mounts' paragraphs, which describe tools an assistant is not offered.
+ */
+export function assistantSystemPrompt(persona: PromptParts["persona"], alias: string): string {
+  return [personaSection(persona), assistantPrompt(alias)].filter(Boolean).join("\n\n");
 }

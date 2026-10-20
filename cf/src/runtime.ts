@@ -53,10 +53,11 @@ import {
 } from "../../src/runtime/overflow-backstop.ts";
 import { credentialRedactor, agentSecretValues } from "./eval-read.ts";
 import { logicalMain, physicalSession } from "./fresh-context.ts";
-import { profilePrompt, systemPrompt } from "../../src/runtime/pi-prompt.ts";
+import { assistantSystemPrompt, profilePrompt, systemPrompt } from "../../src/runtime/pi-prompt.ts";
+import { assistantMountOf, assistantTools } from "../../src/plugins/raft-assistant.ts";
 import { profileOf, profileSpec } from "../../src/runtime/agent-profile.ts";
 import {
-  askedTurn, askWake, bindTurn, conversationReasoning, dropAnswer, forgetTurnText, keepTurnOnly, dropWake, dueWakes, keepAnswer, keepsPluginCalls, markAnswerPosting, nextWakeAt, pendingAnswers, pendingTurnEnds, recordTurnEnd,
+  askedTurn, askWake, bindTurn, keepWake, conversationReasoning, dropAnswer, forgetTurnText, keepTurnOnly, dropWake, dueWakes, keepAnswer, keepsPluginCalls, markAnswerPosting, nextWakeAt, pendingAnswers, pendingTurnEnds, recordTurnEnd,
   setConversationReasoning, turnEndHandled, turnEndOf,
 } from "../../src/runtime/plugin-wakes.ts";
 import type { PluginHookAnswer } from "../../src/runtime/gateway.ts";
@@ -3293,9 +3294,13 @@ export class AgentRuntime {
     // A subagent is read-only: it is offered only what it may call (`childWithheld`); its dispatch refuses the rest as well (`#host`).
     // An agent made with a profile is offered nothing: its mounts are its plugin's code's and provisioning's
     // (src/runtime/agent-profile.ts), and their calls still go through the gateway, which this list does not change.
+    // A personal assistant (its raft mount's snapshot says whose, src/plugins/raft-assistant.ts) is offered its owner DM,
+    // the owner reads and its own two tools, and none of the harness's own but `resume`: no run_js, no jobs, no subagents.
+    const assistant = profileOf(agentConfig) ? null : assistantMountOf(records);
     const tools = profileOf(agentConfig) ? []
       : isSubagentSession(session)
       ? (() => { const withheld = this.#childWithheldIn(catalogue); return catalogue.tools.filter((t) => !withheld.has(t.address)); })()
+      : assistant ? assistantTools(catalogue.tools, assistant)
       : catalogue.tools;
     const sandbox = this.#deps.sandbox ?? true;
     const store = this.store;
@@ -3346,7 +3351,8 @@ export class AgentRuntime {
     // (agents-api/provisioning.ts).
     // An evaluation's `harness: "minimal"` (src/core/tool-config.ts), read from the record every turn path and the
     // tool export build from here, so a prompt, a steer and a push are offered the same list, under either engine.
-    const extras = harnessExtras({
+    // An assistant keeps `resume`: a send to its owner's DM can be held for messages it has not read, and is answered with it.
+    const extras = assistant ? { runJs: false, jobs: false, resume: true } : harnessExtras({
       apiAgent: !!apiConfig, sandbox, minimal: toolConfigOf(agentConfig)?.harness === "minimal",
       hasBackgroundMount: offersCapability(
         records, offered as MountedTool[],
@@ -3408,7 +3414,7 @@ export class AgentRuntime {
       ...(extras.jobs && !child ? [jobs] : []),
       // Only where the agent's setting is on, never in a child (above), and not where the caller's own function has the
       // name (`callerShadows`). Its body is this object's (`#sendToAgent`).
-      ...(!child && this.#settingsNow(tenantId, agentConfig).subagents && !callerShadows(tenantId, agentId, session, callerDefs)
+      ...(!child && !assistant && this.#settingsNow(tenantId, agentConfig).subagents && !callerShadows(tenantId, agentId, session, callerDefs)
         ? [subagentTool({
             models: (this.#deps.userModels?.offered ?? []).map((o) => ({ id: o.id, label: o.label })),
             send: (p, callId, invocation) => this.#sendToAgent(tenantId, agentId, session, p, callId, invocation),
@@ -3416,7 +3422,7 @@ export class AgentRuntime {
         : []),
       ...callerTools,
     ];
-    return { tools, records, unoffered, reader, offered, activityOf, nameOf, host, extras, callerDefs, keeping, extraTools };
+    return { tools, records, unoffered, reader, offered, activityOf, nameOf, host, extras, callerDefs, keeping, extraTools, assistant };
   }
 
   /**
@@ -3456,8 +3462,12 @@ export class AgentRuntime {
     await this.repinMounts(tenantId, agentId);
     const builtFrom = await this.#harnessKeyFor(tenantId, agentId);
     const agentRef: { current: PiAgent | null } = { current: null };
-    const { records, unoffered, offered, nameOf, host, extras, callerDefs, keeping, extraTools } =
+    const { records, unoffered, offered, nameOf, host, extras, callerDefs, keeping, extraTools, assistant } =
       await this.#turnTools(tenantId, agentId, session, engine, agentRef);
+    // An assistant's morning brief is its raft mount's own timer (`Plugin.wake`, src/plugins/raft-assistant.ts), which
+    // re-arms itself every time it runs. Asked for here, at the one moment every agent passes through, only where none is
+    // kept: so the first one is armed, and one a failing wake dropped comes back at the next open.
+    if (assistant && session === MAIN_SESSION) keepWake(this.#deps.ctx.storage.sql, assistant, Date.now());
 
     // The parts that move between turns, as they are now. On pi085 the prompt shows them as they were when the
     // conversation began (src/runtime/prompt-context.ts): every later open of a harness for it rebuilds the same bytes,
@@ -3477,7 +3487,9 @@ export class AgentRuntime {
     // no I/O of its own.
     const record = (await this.store.loadAgent(tenantId, agentId))?.config;
     const profile = profileOf(record);
-    const prompt = profile ? profilePrompt(profile) : systemPrompt({
+    // An assistant's prompt is its own: the persona's name and description, then what it is for. Not the default core,
+    // the sandbox page or the mounts' paragraphs, which describe tools it is not offered.
+    const prompt = profile ? profilePrompt(profile) : assistant ? assistantSystemPrompt(personaOf(record), assistant) : systemPrompt({
       // The agent's own record: a person named and described it at creation,
       // and that is the first thing the prompt says after the core.
       persona: personaOf(record),

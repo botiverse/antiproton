@@ -842,6 +842,26 @@ not an owner here, and any other text is, UUID or not.
 fake Raft, and the rendering against a fake wire, which can hand it answers
 the SDK's contract would refuse first.
 
+Such an agent is also proactive (Raft RFC 075 §4.2, `src/plugins/raft-assistant.ts`).
+Its snapshot lists two more tools beside the reads: `assistant_notify_owner`,
+the only way it messages its owner unasked, which takes the items waiting on
+them (each with a `#channel:msgid` or `task #N` reference) and composes and
+sends one DM; and `assistant_preferences`, the owner's "don't remind me about
+this" rules (by channel, sender or kind) and their stated time zone. The notify
+tool's rules are code, kept in the mount's database: an item already told is
+dropped, as is one a rule covers; between 22:00 and 08:00 owner-local (Raft's
+`assistantOf.timezone`, else the zone the owner gave, else UTC) nothing is
+sent and the items are kept for the morning brief, which is the mount's own
+timer (`Plugin.wake`), re-armed for the next 08:00 every time it runs. RFC 074's
+doorbell (a `system.assistant` event, `payload.type: "owner_inbox_updated"`) is
+taken out of `receive_events` and becomes an `ownerActivity` field saying what
+to check. A `403 assistant_not_enabled` from any call pauses the notify tool and
+the brief until Raft's context names the owner again. The runtime offers such
+an agent's model only its owner DM, attachments, the reads and these two tools
+(plus `resume` and the parked-result reader), with no run_js, jobs or subagents,
+under a prompt of its own (`assistantSystemPrompt`, `src/runtime/pi-prompt.ts`).
+`test/raft-assistant-mode.ts` holds the rules, the timer and the offered list.
+
 **`replay: "never"` overrides the read rule.** A tool that declares it is not
 run again on its own after an interruption, even when it is a read
 (`replayPolicy` asks it first). Declare it on a read whose claim to be harmless

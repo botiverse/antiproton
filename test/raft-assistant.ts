@@ -15,7 +15,8 @@ import { SqliteStore } from "../src/store/sqlite.ts";
 
 const INBOX = "assistant_owner_inbox";
 const MESSAGES = "assistant_owner_messages";
-const ASSISTANT = [INBOX, MESSAGES];
+// With the assistant's own two tools (test/raft-assistant-mode.ts), offered exactly where the reads are.
+const ASSISTANT = [INBOX, MESSAGES, "assistant_notify_owner", "assistant_preferences"];
 // A UUID, as Raft sends it (the SDK's contract takes any text since 0.13.1; 0.13.0 required a UUID).
 const OWNER = { userId: "7a0e1b2c-3d4e-4f50-8a61-72839405a6b7", name: "Ada" };
 const CH = "c0ffee00-0000-4000-8000-000000000001";
@@ -119,7 +120,7 @@ await check("the credential context's agent.assistantOf decides the two tools: n
     must(urls.length === 1 && new URL(urls[0]!).pathname === "/internal/agent-api/context", `${what}: requests: ${JSON.stringify(urls)}`);
     const names = listed.tools.map((t) => t.name);
     const has = ASSISTANT.filter((n) => names.includes(n));
-    must(has.length === (offered ? 2 : 0), `${what}: assistant tools listed: ${JSON.stringify(has)}`);
+    must(has.length === (offered ? ASSISTANT.length : 0), `${what}: assistant tools listed: ${JSON.stringify(has)}`);
     // Every other tool is the capability filter's answer, exactly as without the assistant tools.
     must(JSON.stringify(names.filter((n) => !ASSISTANT.includes(n))) === JSON.stringify(allowedBy(CAPS)), `${what}: other tools moved: ${names.join(", ")}`);
     // Left out silently: nearly every account is not an assistant, and a skipped entry would be a "not offered" line
@@ -148,7 +149,7 @@ await check("assistantOf with a userId that is not text, or not an object, fails
     answering(() => context(CAPS, { assistantOf }));
     const names = (await createRaftPlugin().snapshotTools!(ctx().ctx)).tools.map((t) => t.name);
     must(names.includes("messages_read"), `${what}: control: the listing is empty: ${names.join(", ")}`);
-    must(ASSISTANT.filter((n) => names.includes(n)).length === (offered ? 2 : 0), `${what}: assistant tools: ${names.filter((n) => ASSISTANT.includes(n))}`);
+    must(ASSISTANT.filter((n) => names.includes(n)).length === (offered ? ASSISTANT.length : 0), `${what}: assistant tools: ${names.filter((n) => ASSISTANT.includes(n))}`);
   }
   // The plugin's own check, which does not lean on the SDK's: only an object with a non-empty string userId counts.
   for (const v of [null, undefined, { name: "Ada" }, { userId: 42 }, { userId: "" }, OWNER.userId, [OWNER]]) {
@@ -247,7 +248,12 @@ await check("behind the gateway: a mount whose snapshot lacks them answers unkno
 
 // ---- Raft's failures -----------------------------------------------------------------------------------------------------
 
-await check("403 assistant_not_enabled and 404 channel_not_found reach the model verbatim, not retryable, and touch no record", async () => {
+// An assistant_not_enabled reads whether there is an assistant to pause (src/plugins/raft-assistant.ts `pauseOn`): with
+// none kept, that one read is all; any other failure touches nothing.
+const onlyPauseRead = (want: string, touched: string[]) =>
+  want.includes("assistant_not_enabled") ? touched.length === 1 && touched[0] === "get" : touched.length === 0;
+
+await check("403 assistant_not_enabled and 404 channel_not_found reach the model verbatim, not retryable, and write no record", async () => {
   // As Raft sends them: a 403 is a code alone; a 404 carries a message.
   const forbidden = { ok: false as const, status: 403, code: "assistant_not_enabled" };
   const missing = { ok: false as const, status: 404, code: "channel_not_found", message: "Channel not found or not visible" };
@@ -262,7 +268,7 @@ await check("403 assistant_not_enabled and 404 channel_not_found reach the model
     const e = await failure(() => plugin.invoke(name, args, c.ctx));
     must(e.message === want, `${name}: ${e.message}`);
     must(e.retryable === false && e.transient === false && e.mayHaveLanded !== true, `${name} marks: ${JSON.stringify({ r: e.retryable, t: e.transient, m: e.mayHaveLanded })}`);
-    must(c.touched.length === 0, `${name} touched the mount's database: ${c.touched.join(", ")}`);
+    must(onlyPauseRead(want, c.touched), `${name} touched the mount's database: ${c.touched.join(", ")}`);
   }
 });
 
@@ -325,7 +331,7 @@ await check("owner messages through the SDK: GET assistant/owner-messages with c
   }
 });
 
-await check("through the SDK: 403 assistant_not_enabled and 404 channel_not_found reach the model verbatim, not retryable, touching no record", async () => {
+await check("through the SDK: 403 assistant_not_enabled and 404 channel_not_found reach the model verbatim, not retryable, writing no record", async () => {
   for (const [name, args, status, body, want] of [
     [INBOX, {}, 403, { code: "assistant_not_enabled" }, "403 assistant_not_enabled"],
     [MESSAGES, { channelId: CH }, 403, { code: "assistant_not_enabled" }, "403 assistant_not_enabled"],
@@ -338,7 +344,7 @@ await check("through the SDK: 403 assistant_not_enabled and 404 channel_not_foun
     const e = await failure(() => plugin.invoke(name, args, c.ctx));
     must(e.message === want, `${name} ${status}: ${e.message}`);
     must(e.retryable === false && e.transient === false && e.mayHaveLanded !== true, `${name} ${status} marks: ${JSON.stringify({ r: e.retryable, t: e.transient, m: e.mayHaveLanded })}`);
-    must(c.touched.length === 0, `${name} touched the mount's database: ${c.touched.join(", ")}`);
+    must(onlyPauseRead(want, c.touched), `${name} touched the mount's database: ${c.touched.join(", ")}`);
   }
 });
 

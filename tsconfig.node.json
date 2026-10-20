@@ -116,6 +116,7 @@
     "test/tool-interrupts.ts",
     "test/mcp-plugin.ts",
     "test/raft-plugin.ts",
+    "test/raft-assistant-mode.ts",
     "test/raft-mcp.ts",
     "test/raft-attachments-view.ts",
     "test/mount-offered.ts",
