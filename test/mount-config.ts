@@ -107,11 +107,19 @@ await check("account 是控制台的标签,不算插件设置", () => {
   if (p.length) throw new Error(JSON.stringify(p));
 });
 
-await check("还没声明设置的插件不会因为已有的键被拒", () => {
-  // Refusing every key on a plugin that declares none would break every mount
-  // already carrying one, which is not a migration anyone asked for.
+await check("还没声明设置的插件不会因为已有的键被拒 — 现在会，而这正是 #994 要的", () => {
+  // This case used to pin the opposite: a plugin declaring no settings accepted
+  // every key, because refusing them would break mounts already carrying one.
+  // #994 decided the other way, and the reason is the one that decides it: a
+  // setting is public — the console renders it and `tools.mounts` hands it to
+  // the model — so on a plugin with nothing declared, the guarantee that a
+  // credential never sits in one was simply absent. "Nothing is declared" now
+  // means nothing is accepted, and the mounts carrying one are repaired by a
+  // `PATCH` that deletes it (`mergeMountSettings`, test/mount-settings.ts).
   const p = validateMount({ id: "demo", config: [], credential: undefined }, { anything: 1 } as any, null);
-  if (p.length) throw new Error(JSON.stringify(p));
+  if (!p.some((x) => x.key === "anything")) throw new Error(`a plugin with no settings accepted one: ${JSON.stringify(p)}`);
+  const ok = validateMount({ id: "demo", config: [], credential: undefined }, { account: "demo" } as any, null);
+  if (ok.length) throw new Error(`the console's own label was refused: ${JSON.stringify(ok)}`);
 });
 
 await check("assert 版本会抛,并且把问题都带上", () => {
@@ -290,6 +298,45 @@ await check("no plugin takes a credential as a setting", () => {
         );
       }
     }
+  }
+});
+
+await check("a plugin that declares no settings takes none, and the console's `account` label is the one key it keeps", () => {
+  // A setting is public — the console renders it and `tools.mounts` hands it to the model (src/plugins/builtin.ts) —
+  // so "nothing is declared, so nothing is checked" left that promise unguarded on exactly the plugins nobody was
+  // looking at (#994). `account` is the console's own label for who a mount belongs to and is on every mount, so it
+  // is not the plugin's setting and is not refused.
+  for (const plugin of everyPlugin.filter((p) => !(p.config ?? []).length)) {
+    const accepted = validateMount(plugin, { account: "somewhere" }, null).filter((p) => p.key !== undefined);
+    if (accepted.length) throw new Error(`${plugin.id} refuses the console's own label: ${JSON.stringify(accepted)}`);
+    const refused = validateMount(plugin, { account: "somewhere", token: "ghp_abcdef" }, null);
+    if (!refused.some((p) => p.key === "token")) {
+      throw new Error(`${plugin.id} declares no settings and accepted one: ${JSON.stringify(refused)}`);
+    }
+    // And said in words a person can act on, without the value: settings are public and a credential in one is
+    // published, so an error that quotes it would be the same mistake with a different audience.
+    if (refused.some((p) => p.message.includes("ghp_abcdef"))) throw new Error(`${plugin.id} quoted the value back`);
+  }
+  // The rule is only a rule if there is a plugin it applies to: an empty set would make the loop above vacuous.
+  const bare = everyPlugin.filter((p) => !(p.config ?? []).length).map((p) => p.id).sort();
+  if (!bare.length) throw new Error("no plugin declares zero settings, so this case checked nothing");
+});
+
+await check("every catalogue seed validates against its own plugin, so a stray key is caught here and not swallowed at seeding", () => {
+  // `reconcileSeeds` (cf/src/runtime.ts) validates each catalogue entry BEFORE adding it and withholds it on a
+  // problem (`withheld: "refused"`) rather than failing loudly. So a typo in `DEFAULT_MOUNTS` does not error: that
+  // mount silently does not exist for any agent, and the only trace is a line in the seed record. This is the same
+  // rule asked in CI, where it can be seen.
+  const byId = new Map(everyPlugin.map((p) => [p.id, p]));
+  const missing: string[] = [];
+  for (const seed of AgentRuntime.DEFAULT_MOUNTS) {
+    const plugin = byId.get(seed.plugin);
+    if (!plugin) { missing.push(`${seed.alias}: no plugin "${seed.plugin}"`); continue; }
+    const problems = validateMount(plugin, (seed.config ?? { account: seed.account }) as Record<string, any>, seed.secretRef ?? null);
+    if (problems.length) missing.push(`${seed.alias} (${seed.plugin}): ${problems.map((p) => p.message).join("; ")}`);
+  }
+  if (missing.length) {
+    throw new Error(`the catalogue seeds a mount its own plugin refuses, and seeding would withhold it in silence: ${missing.join(" | ")}`);
   }
 });
 

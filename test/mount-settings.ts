@@ -18,7 +18,7 @@ const { adoptProvisionedAgent, provisionTool, provisionPushStatus, PROVISION_MOU
 const { handleProvision } = await import("../cf/src/provision/handlers.ts");
 const { sqliteHost } = await import("../src/store/sqlite-host.ts");
 const { operatorModelOf } = await import("../cf/src/model-request.ts");
-const { repeatsMount } = await import("../src/runtime/mount-config.ts");
+const { repeatsMount, settingType } = await import("../src/runtime/mount-config.ts");
 const { raftPlugin } = await import("../src/plugins/raft.ts");
 import type { Plugin } from "../src/plugins/types.ts";
 import type { ProvisionDeps } from "../cf/src/provision/handlers.ts";
@@ -62,6 +62,15 @@ const ECHO: Plugin = {
   async invoke(_tool, _args, ctx) { return { config: ctx.publicConfig }; },
 };
 
+const STRAY_AGENT = "a-of-stray-keys";
+
+/** A plugin that declares no settings at all, so every key on a mount of it is one nobody declared. */
+const BARE: Plugin = {
+  id: "bare", version: "1.0.0", config: [],
+  tools: [{ name: "show", summary: "", parameters: {}, sideEffects: "read", idempotency: "native" }],
+  async invoke(_tool, _args, ctx) { return { config: ctx.publicConfig }; },
+};
+
 async function runtime() {
   const host = sqliteHost();
   const directory = {
@@ -78,7 +87,7 @@ async function runtime() {
     operatorModel: operatorModelOf({ DEEPSEEK_BASE_URL: "https://model.example/v1", DEEPSEEK_API_KEY: "operator-key", HARNESS_MODEL: "deepseek-flash",
       MODEL_PROVIDERS: [{ id: "deepseek", baseUrl: "https://model.example/v1", auth: { secret: "DEEPSEEK_API_KEY", header: "authorization" } }] } as any),
     hooks: { origin: "https://hooks.test", directory },
-    extraPlugins: [ECHO],
+    extraPlugins: [ECHO, BARE],
   } as any);
   await rt.ready();
   return { rt, host };
@@ -251,7 +260,9 @@ await check("serverUrl, an undeclared key and an empty change are 400; the mount
 
 await check("each value must be of its declared type: conversationCards a boolean, timeoutMs a number in its range", async () => {
   const { rt, host, agentId } = await raftAgent();
-  for (const v of ["true", 1, 0, null, {}, ["true"]]) {
+  // `null` is not in this list any more: it is not a value a setting can take, it is the DELETE operation
+  // (`MountSettingsPatch`, src/runtime/mount-config.ts), and the case below reads it as one (#994).
+  for (const v of ["true", 1, 0, {}, ["true"]]) {
     const r = await patch(env(rt), { tenantId: T, agentId, alias: "raft", settings: { conversationCards: v } });
     must(r.status === 400 && /"conversationCards" must be a boolean/.test(r.body.error), `${JSON.stringify(v)}: ${r.status} ${r.text}`);
   }
@@ -261,6 +272,119 @@ await check("each value must be of its declared type: conversationCards a boolea
   }
   must(settingsOf(host, agentId).conversationCards === undefined && settingsOf(host, agentId).timeoutMs === undefined, "a refused value was stored");
   host.dispose();
+});
+
+/** The mount row a build older than #994 can leave behind: a key its plugin never declared. */
+async function withStray(rt: InstanceType<typeof AgentRuntime>, alias: string, plugin: string, stray: Record<string, unknown>) {
+  await rt.store.addMount({
+    tenantId: T, agentId: STRAY_AGENT, alias, plugin, installationId: `i-${alias}`, connectionId: null,
+    toolVersion: "1.0.0", publicConfig: { account: "a", ...stray } as any, secretRef: null, policy: null,
+  });
+}
+await check("`null` is a deletion: an undeclared key goes, a declared changeable one goes, and `changed` names them", async () => {
+  const { rt, host, agentId } = await raftAgent();
+  // A setting this build does not declare, in the row, as `POST /admin/mounts` or an older build could leave it.
+  host.sql.exec("UPDATE mounts SET public_config = ? WHERE agent_id = ? AND alias = ?",
+    JSON.stringify({ serverUrl: ORIGIN, gh_token: "kept-from-an-older-build" }), agentId, PROVISION_MOUNT_ALIAS);
+  must(settingsOf(host, agentId).gh_token === "kept-from-an-older-build", "the fixture has no stray key to delete");
+  const r = await patch(env(rt), { tenantId: T, agentId, alias: "raft", settings: { gh_token: null } });
+  must(r.status === 200, `${r.status} ${r.text}`);
+  must(JSON.stringify(r.body.changed) === JSON.stringify(["gh_token"]), `changed: ${JSON.stringify(r.body.changed)}`);
+  must(settingsOf(host, agentId).gh_token === undefined, `still stored: ${JSON.stringify(settingsOf(host, agentId))}`);
+  must(!r.text.includes("kept-from-an-older-build"), `the answer quotes the value: ${r.text}`);
+  // And a setting the plugin does declare and marks changeable is deleted the same way — it goes back to the
+  // plugin's default rather than to a value the operator had to guess.
+  must((await patch(env(rt), { tenantId: T, agentId, alias: "raft", settings: { conversationCards: true } })).status === 200, "cards");
+  const gone = await patch(env(rt), { tenantId: T, agentId, alias: "raft", settings: { conversationCards: null } });
+  must(gone.status === 200 && gone.body.config.conversationCards === undefined, gone.text);
+  must(JSON.stringify(gone.body.changed) === JSON.stringify(["conversationCards"]), `changed: ${JSON.stringify(gone.body.changed)}`);
+  host.dispose();
+});
+
+await check("on a plugin that declares no settings, a stray key is deleted with null and nothing else", async () => {
+  // A zero-config plugin has nothing changeable, so a patch naming any other key is refused for that key alone; the
+  // freeze a stray key causes is pinned on raft below, where there is a setting it could block.
+  const { rt, host } = await runtime();
+  await rt.store.createAgent(T, STRAY_AGENT);
+  await withStray(rt, "bare", "bare", { token: "written-by-an-older-build" });
+  const set = await patch(env(rt), { tenantId: T, agentId: STRAY_AGENT, alias: "bare", settings: { token: "again" } });
+  must(set.status === 400 && /bare has no setting "token"/.test(set.body.error), `${set.status} ${set.text}`);
+  // On a plugin that declares nothing, deleting the stray key is the whole repair.
+  const repaired = await patch(env(rt), { tenantId: T, agentId: STRAY_AGENT, alias: "bare", settings: { token: null } });
+  must(repaired.status === 200, `${repaired.status} ${repaired.text}`);
+  must(settingsOf(host, STRAY_AGENT, "bare").token === undefined, "the stray key survived");
+  host.dispose();
+});
+
+await check("with a stray key stored, deleting it and changing a setting works in one patch and in two", async () => {
+  // Merge-then-validate is an implementation order, not something a reader would guess, so both orders are pinned.
+  const stray = async (host: ReturnType<typeof sqliteHost>, agentId: string) => host.sql.exec(
+    "UPDATE mounts SET public_config = ? WHERE agent_id = ? AND alias = ?",
+    JSON.stringify({ serverUrl: ORIGIN, gh_token: "kept-from-an-older-build" }), agentId, PROVISION_MOUNT_ALIAS);
+  const { rt, host, agentId } = await raftAgent();
+  await stray(host, agentId);
+  // Alone, a change to a changeable setting is refused, and the refusal names the key to delete (not its value).
+  const frozen = await patch(env(rt), { tenantId: T, agentId, alias: "raft", settings: { conversationCards: true } });
+  must(frozen.status === 400 && /"gh_token"/.test(frozen.body.error) && /null/.test(frozen.body.error), `${frozen.status} ${frozen.text}`);
+  must(!frozen.text.includes("kept-from-an-older-build"), `the refusal quotes the stray value: ${frozen.text}`);
+  must(settingsOf(host, agentId).conversationCards === undefined, "a refused patch was written");
+  // (a) One patch: delete the stray key and change the setting.
+  const one = await patch(env(rt), { tenantId: T, agentId, alias: "raft", settings: { gh_token: null, conversationCards: true } });
+  must(one.status === 200, `one patch: ${one.status} ${one.text}`);
+  must(settingsOf(host, agentId).gh_token === undefined && settingsOf(host, agentId).conversationCards === true,
+    `one patch: ${JSON.stringify(settingsOf(host, agentId))}`);
+  // (b) Two patches: delete first, then change.
+  await stray(host, agentId);
+  const first = await patch(env(rt), { tenantId: T, agentId, alias: "raft", settings: { gh_token: null } });
+  must(first.status === 200, `first: ${first.status} ${first.text}`);
+  const second = await patch(env(rt), { tenantId: T, agentId, alias: "raft", settings: { conversationCards: true } });
+  must(second.status === 200, `second: ${second.status} ${second.text}`);
+  must(settingsOf(host, agentId).gh_token === undefined && settingsOf(host, agentId).conversationCards === true,
+    `two patches: ${JSON.stringify(settingsOf(host, agentId))}`);
+  host.dispose();
+});
+
+await check("a stray key may NOT be set, and a setting that is the mount's identity may not be deleted", async () => {
+  const { rt, host, agentId } = await raftAgent();
+  const set = await patch(env(rt), { tenantId: T, agentId, alias: "raft", settings: { gh_token: "x" } });
+  must(set.status === 400 && /raft has no setting "gh_token"/.test(set.body.error), set.text);
+  const identity = await patch(env(rt), { tenantId: T, agentId, alias: "raft", settings: { serverUrl: null } });
+  must(identity.status === 400 && /"serverUrl" cannot be changed/.test(identity.body.error), identity.text);
+  must(settingsOf(host, agentId).serverUrl === ORIGIN, "the server the credential belongs to moved");
+  // A declared setting the plugin does NOT mark changeable is its identity, and deleting it is the same move as
+  // changing it: both are refused above. One it does mark changeable is deleted like any other, and the plugin's
+  // default applies again.
+  must((await patch(env(rt), { tenantId: T, agentId, alias: "raft", settings: { timeoutMs: 5000 } })).status === 200, "set");
+  const optional = await patch(env(rt), { tenantId: T, agentId, alias: "raft", settings: { timeoutMs: null } });
+  must(optional.status === 200 && optional.body.config.timeoutMs === undefined, optional.text);
+  must(settingsOf(host, agentId).timeoutMs === undefined, "the deleted setting is still stored");
+  host.dispose();
+});
+
+await check("`account` is the mount's label: a patch can neither delete it nor set it", async () => {
+  const { rt, host, agentId } = await raftAgent();
+  host.sql.exec("UPDATE mounts SET public_config = ? WHERE agent_id = ? AND alias = ?",
+    JSON.stringify({ serverUrl: ORIGIN, account: "cody" }), agentId, PROVISION_MOUNT_ALIAS);
+  const del = await patch(env(rt), { tenantId: T, agentId, alias: "raft", settings: { account: null } });
+  must(del.status === 400 && /"account" is the mount's label and cannot be removed/.test(del.body.error), `delete: ${del.status} ${del.text}`);
+  // Not even alongside a legal change: the whole patch is refused and nothing is written.
+  const withChange = await patch(env(rt), { tenantId: T, agentId, alias: "raft", settings: { account: null, conversationCards: true } });
+  must(withChange.status === 400, `delete with a change: ${withChange.status} ${withChange.text}`);
+  must(settingsOf(host, agentId).account === "cody" && settingsOf(host, agentId).conversationCards === undefined,
+    `stored: ${JSON.stringify(settingsOf(host, agentId))}`);
+  const set = await patch(env(rt), { tenantId: T, agentId, alias: "raft", settings: { account: "someone" } });
+  must(set.status === 400 && /raft has no setting "account"/.test(set.body.error), `set: ${set.status} ${set.text}`);
+  must(settingsOf(host, agentId).account === "cody", "the label moved");
+  host.dispose();
+});
+
+await check("`null` means `delete` only because no setting type can hold it — the premise this rule rests on", async () => {
+  // `MountSettingsPatch` reads a key's `null` as an operation on the field, not as a value. That is unambiguous
+  // exactly while no `ConfigField["type"]` accepts null; the day one does, `null` would mean two things and this
+  // has to be decided again. So the premise is a case, not a sentence in a comment.
+  for (const v of [null, undefined]) {
+    must(settingType(v) === "unknown", `a setting type now accepts ${String(v)}, so null is ambiguous between "delete" and "set to null"`);
+  }
 });
 
 await check("an unknown agent or alias is 404, and a malformed agent id is 400 before the object", async () => {
