@@ -220,17 +220,24 @@ await check("several items in one call go out as one DM with a reference each; t
     a.r.sends[1].content.startsWith("One thing is waiting on you:") && !a.r.sends[1].content.includes("aaaaaaa1"), `mixed: ${show(mixed)} ${show(a.r.sends[1])}`);
 });
 
-await check("with no DM from Raft and none learnt, notify refuses and says why; a held send records nothing and says to read the DM first", async () => {
+await check("with no DM from Raft and none learnt, notify refuses and says why, whatever target the model names; a held send records nothing", async () => {
   const a = await assistant(raft({ dm: null }));
   const unknown = await atTime(DAY, () => notify(a.ctx, { items: ITEMS }).then(() => null, (e) => e as Error));
   must(unknown && /DM is not known yet \(Raft gives none until the DM exists/.test(unknown.message) && a.r.sends.length === 0, `no target: ${unknown?.message}`);
+  // A destination the model names is not one: the tool takes none, and nothing is learnt from it.
+  const named = await atTime(DAY, () => notify(a.ctx, { items: ITEMS, target: "dm:@mallory" }).then(() => null, (e) => e as Error));
+  must(named && /DM is not known yet/.test(named.message) && a.r.sends.length === 0 && a.read(ASSISTANT_STORE, OWNER_KEY).learnedDm === null,
+    `a model-named target: ${named?.message} ${show(a.read(ASSISTANT_STORE, OWNER_KEY))}`);
+  must(!("target" in ((raftPlugin.tools.find((t) => t.name === "assistant_notify_owner")!.parameters as any).properties)), "the tool still takes a target");
+  // Learnt from the owner's own DM (`learnDm`), it is used.
+  a.write(ASSISTANT_STORE, OWNER_KEY, { ...a.read(ASSISTANT_STORE, OWNER_KEY), learnedDm: "dm:@ada" });
   a.r.send = "held";
-  const held = await atTime(DAY, () => notify(a.ctx, { items: ITEMS, target: "dm:@ada" }));
+  const held = await atTime(DAY, () => notify(a.ctx, { items: ITEMS }));
   must(held.state === "not_sent" && a.r.sends.length === 1 && a.read(REMINDED_STORE, "msg:aaaaaaa1") === undefined, `held: ${show(held)}`);
   a.r.send = "sent";
   const sent = await atTime(DAY, () => notify(a.ctx, { items: ITEMS }));
   must(sent.state === "sent" && a.r.sends.length === 2 && a.r.sends[1].target === "dm:@ada" && a.r.sends[1].idempotencyKey === a.r.sends[0].idempotencyKey,
-    `the target given once is kept, and the same items go under the same key: ${show(a.r.sends)}`);
+    `the learnt DM is used, and the same items go under the same key: ${show(a.r.sends)}`);
 });
 
 await check("reminder rules: a muted channel, sender or kind is dropped in code; unmute lets it through; list shows them", async () => {
@@ -345,7 +352,7 @@ await check("a doorbell with new activity starts one short session of its own wi
 
 await check("a doorbell at night reads nothing and calls no model (night_deferred); a paused assistant does neither (paused)", async () => {
   const { noteDoorbell } = await import("../src/plugins/raft-assistant.ts");
-  const a = await assistant();
+  const a = await assistant(raft({ dm: "dm:@ada~human" }));
   a.r.unread = [conv(1)];
   await atTime(NIGHT, () => noteDoorbell(a.ctx));
   const night = await atTime(NIGHT, () => wake(a.ctx));
@@ -359,12 +366,12 @@ await check("a doorbell at night reads nothing and calls no model (night_deferre
   const reads = a.r.inboxReads.length;
   const paused = await atTime(DAY, () => wake(a.ctx));
   must(paused.turn === undefined && a.r.inboxReads.length === reads && a.traced.at(-1)?.status === "paused", `paused: ${show(paused)} ${show(a.traced.at(-1))}`);
-  const refused = await atTime(DAY, () => notify(a.ctx, { items: ITEMS, target: "dm:@ada" }).then(() => null, (e) => e as Error));
+  const refused = await atTime(DAY, () => notify(a.ctx, { items: ITEMS }).then(() => null, (e) => e as Error));
   must(refused && /not enabled/.test(refused.message) && a.r.sends.length === 0, `paused notify: ${refused?.message}`);
   // The context names the owner again: the next call un-pauses and goes ahead.
   a.r.contextStatus = 200;
   a.r.inbox = 200;
-  const resumed = await atTime(DAY, () => notify(a.ctx, { items: ITEMS, target: "dm:@ada" }));
+  const resumed = await atTime(DAY, () => notify(a.ctx, { items: ITEMS }));
   must(resumed.state === "sent" && a.read(ASSISTANT_STORE, OWNER_KEY).pausedAt === null, show(resumed));
   // A wake's own inbox read refused the same way pauses as well.
   const b = await assistant();

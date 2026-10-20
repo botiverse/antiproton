@@ -861,7 +861,8 @@ Every wake writes a `raft.assistant_wake` trace row and a per-day count, its
 status one of `skipped_empty`, `skipped_filtered`, `invoked`, `paused`,
 `night_deferred` or `failed`. `assistant_notify_owner` composes and sends one
 DM to the owner (`assistantOf.dmTarget` when Raft gives it, else the DM learnt
-from the owner writing), and keeps its rules in code: an item already told is
+from the owner writing; it takes no destination from the model, and refuses while
+neither is known), and keeps its rules in code: an item already told is
 dropped, as is one a rule covers, and between 22:00 and 08:00 owner-local
 nothing is sent. `assistant_preferences`, offered in the chat, keeps the
 owner's rules and stated zone. A `403 assistant_not_enabled` from any call
