@@ -1,19 +1,27 @@
 /**
  * Daily spend limits (credits phase 2; docs/metering.md, "Daily limits").
  *
- * Three limits per UTC day, all in US dollars at the ledger's prices (cf/src/usage-d1.ts `priceFor`):
+ * Limits per UTC day, all in US dollars at the ledger's prices (cf/src/usage-d1.ts `priceFor`). **Raft is the source of
+ * each server's two budgets**; this deployment's figures are fallbacks while Raft has sent none, and backstops that can
+ * only lower what Raft said:
  *
- * - **per tenant**: an admin's override for that tenant (`spend_limits`, cf/migrations/0018_spend_limits.sql; NULL
- *   there is "no per-tenant limit"), else by the tenant's plan as Raft last said it (`tenant_plans`, 0021):
- *   FREE_DAILY_LIMIT_USD (default $3) for `free`, PRO_DAILY_LIMIT_USD (default $10) for `pro`, and DAILY_LIMIT_USD
- *   (default $5, the limit every tenant had before plans) for a tenant Raft has never given a plan, so no tenant's
- *   limit drops before Raft has said what its server is on;
+ * - **per tenant**: the `dailyBudgetCents` Raft last sent for the server (`tenant_plans.daily_budget_cents`, 0027),
+ *   else the mapping of its plan as Raft last said it (`tenant_plans`, 0021): FREE_DAILY_LIMIT_USD (default $3) for
+ *   `free`, PRO_DAILY_LIMIT_USD (default $10) for `pro`, and DAILY_LIMIT_USD (default $5, the limit every tenant had
+ *   before plans) for a tenant Raft has never given a plan. An admin's override for the tenant (`spend_limits`,
+ *   cf/migrations/0018_spend_limits.sql) can only lower that: the limit is the smaller of the two, and an override of
+ *   NULL ("no limit") lowers nothing;
  * - **platform**: PLATFORM_DAILY_LIMIT_USD (default $2000) over every tenant's spend, `bench` included;
  * - **onboarding**: ONBOARDING_DAILY_LIMIT_USD (default $30), or an admin's override (`spend_pool_limits`, 0021), over
  *   the spend of every agent created with `budget: "onboarding"` (`provisioned_agents.budget`), in any tenant;
- * - **a tenant's onboarding share**: ONBOARDING_TENANT_DAILY_LIMIT_USD (default $1), or an admin's override for that
- *   tenant (`spend_pool_limits` with its tenant id), over that tenant's onboarding agents alone. Without it one server's
- *   users could spend the whole pool and stop onboarding on every other server.
+ * - **a tenant's onboarding share**: the `onboardingDailyBudgetCents` Raft last sent
+ *   (`tenant_plans.onboarding_daily_budget_cents`), else ONBOARDING_TENANT_DAILY_LIMIT_USD (default $1), over that
+ *   tenant's onboarding agents alone; an admin's override for that tenant (`spend_pool_limits` with its tenant id) can
+ *   only lower it, as for the tenant's own. Without it one server's users could spend the whole pool and stop
+ *   onboarding on every other server.
+ *
+ * The platform's limit and the onboarding pool's are judged before a tenant's own figure, so whatever Raft sends, they
+ * still refuse when they are reached.
  *
  * The onboarding pool is a pool of its own: its agents' spend is in neither the tenant's figure nor the platform's,
  * and their calls are judged by the onboarding limits alone (the pool's, then the tenant's share). So an onboarding agent is not refused because its tenant or
@@ -81,6 +89,22 @@ export interface SpendLimits {
   exempt: ReadonlySet<string>;
 }
 
+/**
+ * The most a Raft budget may say, in cents a day: $10,000, five times the default platform limit. A larger figure is
+ * refused as a mistake (a dollar amount sent as cents a hundred times over, say) rather than stored; the platform limit
+ * still bounds what any budget can spend.
+ */
+export const MAX_BUDGET_CENTS = 1_000_000;
+
+/**
+ * What Raft last sent of a server's two budgets, in whole cents a day (`tenant_plans`, 0027). Null: never sent (or
+ * cleared with an explicit `null`), so the fallback applies.
+ */
+export interface RaftBudget { dailyCents: number | null; onboardingDailyCents: number | null }
+
+/** Where a limit's figure came from: Raft's budget, the plan's mapping or the deployment's default, or an admin's lowering override. */
+export type LimitSource = "raft" | "plan" | "default" | "override";
+
 /** A Raft server's plan (`plan` on POST /provision/agents, PUT /provision/servers/:id/plan). No plan is its own case. */
 export const PLANS = ["free", "pro"] as const;
 export type Plan = (typeof PLANS)[number];
@@ -129,12 +153,14 @@ export const dayOf = (t: number) => Math.floor(t / DAY_MS) * DAY_MS;
  * - `tenantOnboardingUsd`: this tenant's share of that, unaccepted left out (as in `tenantUsd`) — what the tenant's
  *   onboarding share is judged on, and in neither of the tenant's other figures;
  * - `plan`: the tenant's plan as Raft last said it, null when it never did;
+ * - `budget`: the budgets Raft last sent, absent or null when it never sent either;
  * - `onboardingOverride` the pool's override, `onboardingTenantOverride` the admin's override of this tenant's share.
  */
 export interface DaySpend {
   day: number; tenantUsd: number; platformUsd: number; onboardingUsd: number; tenantOnboardingUsd: number;
   override: { limitUsd: number | null } | null; plan: Plan | null; onboardingOverride: { limitUsd: number | null } | null;
   onboardingTenantOverride: { limitUsd: number | null } | null;
+  budget?: RaftBudget | null;
 }
 
 const limitRow = (r: any) => r ? { limitUsd: r.limit_usd === null || r.limit_usd === undefined ? null : Number(r.limit_usd) } : null;
@@ -165,7 +191,7 @@ export async function readDaySpend(db: D1Database, tenantId: string, now: number
     ).bind(tenantId, day, day + DAY_MS).all(),
     usagePrices(db),
     db.prepare("SELECT limit_usd FROM spend_limits WHERE tenant_id = ?").bind(tenantId).first() as Promise<any>,
-    db.prepare("SELECT plan FROM tenant_plans WHERE tenant_id = ?").bind(tenantId).first() as Promise<any>,
+    db.prepare("SELECT plan, daily_budget_cents, onboarding_daily_budget_cents FROM tenant_plans WHERE tenant_id = ?").bind(tenantId).first() as Promise<any>,
     db.prepare("SELECT tenant_id, limit_usd FROM spend_pool_limits WHERE pool = 'onboarding' AND tenant_id IN ('', ?)").bind(tenantId).all(),
   ]);
   let tenantUsd = 0;
@@ -191,9 +217,17 @@ export async function readDaySpend(db: D1Database, tenantId: string, now: number
     day, tenantUsd, platformUsd, onboardingUsd, tenantOnboardingUsd,
     override: limitRow(override),
     plan: plan && (PLANS as readonly string[]).includes(String(plan.plan)) ? String(plan.plan) as Plan : null,
+    budget: plan ? { dailyCents: centsOf(plan.daily_budget_cents), onboardingDailyCents: centsOf(plan.onboarding_daily_budget_cents) } : null,
     onboardingOverride: limitRow(((poolRows.results ?? []) as any[]).find((r) => r.tenant_id === "")),
     onboardingTenantOverride: limitRow(((poolRows.results ?? []) as any[]).find((r) => r.tenant_id === tenantId)),
   };
+}
+
+/** Whole cents as stored, or null: anything else in the column (SQLite does not enforce its type) reads as never sent. */
+function centsOf(v: unknown): number | null {
+  if (v === null || v === undefined) return null;
+  const n = Number(v);
+  return Number.isSafeInteger(n) && n >= 0 && n <= MAX_BUDGET_CENTS ? n : null;
 }
 
 /** The budget an agent's calls are judged by: its `provisioned_agents.budget`, its tenant's when it has no row. */
@@ -220,13 +254,40 @@ export type Admission =
   | { admit: true; why: "exempt" | "under" | "read_failed" }
   | { admit: false; limit: "platform" | "tenant" | "onboarding" | "onboarding_tenant"; text: string };
 
+/** A limit and where its figure came from; `usd` null is no limit. */
+export interface SourcedLimit { usd: number | null; source: LimitSource }
+
 /**
- * The tenant's limit today: an admin's override when there is one (null there is none), else its plan's default, and
- * with no plan ever said the default every tenant had before plans.
+ * An admin's override applied to a limit: it can only lower it. The smaller of the two wins; an override of null (no
+ * limit) lowers nothing, and neither does one at or above the limit, so a raised override reads as no override at all.
+ * The source is the override's only when it is what decides the figure.
  */
+export function lowered(base: SourcedLimit, override: { limitUsd: number | null } | null): SourcedLimit {
+  if (!override || override.limitUsd === null) return base;
+  if (base.usd !== null && base.usd <= override.limitUsd) return base;
+  return { usd: override.limitUsd, source: "override" };
+}
+
+/** The tenant's figure before an admin's override: Raft's budget when it sent one, else its plan's mapping. */
+export function tenantBaseOf(plan: Plan | null, budget: RaftBudget | null | undefined, limits: Pick<SpendLimits, "tenantUsd" | "freeUsd" | "proUsd">): SourcedLimit {
+  if (budget && budget.dailyCents !== null) return { usd: budget.dailyCents / 100, source: "raft" };
+  return { usd: plan === "pro" ? limits.proUsd : plan === "free" ? limits.freeUsd : limits.tenantUsd, source: "plan" };
+}
+
+/** The tenant's onboarding share before an admin's override: Raft's budget when it sent one, else the deployment's. */
+export function onboardingTenantBaseOf(budget: RaftBudget | null | undefined, limits: Pick<SpendLimits, "onboardingTenantUsd">): SourcedLimit {
+  if (budget && budget.onboardingDailyCents !== null) return { usd: budget.onboardingDailyCents / 100, source: "raft" };
+  return { usd: limits.onboardingTenantUsd, source: "default" };
+}
+
+/** The tenant's limit today, and its source: Raft's budget or the plan's mapping, lowered by an admin's override. */
+export function tenantLimitDetail(spend: DaySpend, limits: SpendLimits): SourcedLimit {
+  return lowered(tenantBaseOf(spend.plan, spend.budget, limits), spend.override);
+}
+
+/** The tenant's limit today (null: none). `tenantLimitDetail` says where it came from. */
 export function tenantLimitOf(spend: DaySpend, limits: SpendLimits): number | null {
-  if (spend.override) return spend.override.limitUsd;
-  return spend.plan === "pro" ? limits.proUsd : spend.plan === "free" ? limits.freeUsd : limits.tenantUsd;
+  return tenantLimitDetail(spend, limits).usd;
 }
 
 /** The onboarding pool's limit today: an admin's override when there is one (null there is none), else the deployment's. */
@@ -234,9 +295,14 @@ export function onboardingLimitOf(spend: DaySpend, limits: SpendLimits): number 
   return spend.onboardingOverride ? spend.onboardingOverride.limitUsd : limits.onboardingUsd;
 }
 
-/** The tenant's share of the onboarding pool today: an admin's override for it (null there is none), else the deployment's. */
+/** The tenant's share of the onboarding pool today, and its source: Raft's budget or the default, lowered by an admin's override. */
+export function onboardingTenantLimitDetail(spend: DaySpend, limits: SpendLimits): SourcedLimit {
+  return lowered(onboardingTenantBaseOf(spend.budget, limits), spend.onboardingTenantOverride);
+}
+
+/** The tenant's share of the onboarding pool today (null: none). */
 export function onboardingTenantLimitOf(spend: DaySpend, limits: SpendLimits): number | null {
-  return spend.onboardingTenantOverride ? spend.onboardingTenantOverride.limitUsd : limits.onboardingTenantUsd;
+  return onboardingTenantLimitDetail(spend, limits).usd;
 }
 
 /** Whether the platform's limit is reached: then nobody but an exempt tenant works. */
@@ -278,6 +344,10 @@ export function judge(spend: DaySpend, limits: SpendLimits, pool: Pool = "tenant
  */
 export interface Standing {
   spentUsd: number; limitUsd: number | null; /** null: Raft has never said. */ plan: Plan | null; exempt: boolean; platformLimitReached: boolean; refusing: boolean;
+  /** Where `limitUsd` came from: Raft's budget, the plan's mapping, or an admin's override that lowered it. Null when exempt. */
+  limitSource: LimitSource | null;
+  /** Where `onboardingLimitUsd` came from: Raft's budget, the deployment's default, or an admin's lowering override. Null when exempt. */
+  onboardingLimitSource: LimitSource | null;
   /** The tenant's onboarding agents' spend today: paid by the platform, in neither `spentUsd` nor `limitUsd`. */
   onboardingUsd: number;
   /** The tenant's share of the onboarding pool (null: none, or exempt), and whether its onboarding agents' next call would be refused. */
@@ -286,12 +356,16 @@ export interface Standing {
 }
 export function standing(tenantId: string, spend: DaySpend, limits: SpendLimits): Standing {
   const exempt = isExempt(tenantId, limits);
+  const own = tenantLimitDetail(spend, limits);
+  const share = onboardingTenantLimitDetail(spend, limits);
   return {
     spentUsd: spend.tenantUsd,
-    limitUsd: exempt ? null : tenantLimitOf(spend, limits),
+    limitUsd: exempt ? null : own.usd,
+    limitSource: exempt ? null : own.source,
     plan: spend.plan,
     onboardingUsd: spend.tenantOnboardingUsd,
-    onboardingLimitUsd: exempt ? null : onboardingTenantLimitOf(spend, limits),
+    onboardingLimitUsd: exempt ? null : share.usd,
+    onboardingLimitSource: exempt ? null : share.source,
     onboardingRefusing: exempt ? false : !judge(spend, limits, "onboarding").admit,
     exempt,
     platformLimitReached: platformReached(spend, limits),
@@ -509,25 +583,43 @@ export function d1SpendLimits(db: D1Database): SpendLimitStore {
 
 // ---- a tenant's plan, as Raft says it ----------------------------------------------------------------------------
 
-export interface TenantPlanRow { tenantId: string; plan: Plan; setBy: string; setAt: number }
+export interface TenantPlanRow {
+  tenantId: string; plan: Plan; setBy: string; setAt: number;
+  /** Raft's budgets in whole cents a day; null: never sent, so the fallback applies. */
+  dailyBudgetCents: number | null; onboardingDailyBudgetCents: number | null;
+}
+/**
+ * Raft's budgets as a write carries them: a field left out (undefined) keeps what is stored, `null` clears it back to
+ * the fallback, a number of whole cents replaces it.
+ */
+export interface BudgetWrite { dailyBudgetCents?: number | null; onboardingDailyBudgetCents?: number | null }
 export interface TenantPlanStore {
-  /** The latest write wins: a plan is the server's current one, not a fact fixed at some create. */
-  set(tenantId: string, plan: Plan, by: string, at: number): Promise<void>;
+  /**
+   * The latest write wins: a plan is the server's current one, not a fact fixed at some create. A budget the write
+   * leaves out is kept (`BudgetWrite`), so a Raft that sends only `{ plan }` changes the plan alone.
+   */
+  set(tenantId: string, plan: Plan, by: string, at: number, budgets?: BudgetWrite): Promise<void>;
   list(): Promise<TenantPlanRow[]>;
 }
 
 export function d1TenantPlans(db: D1Database): TenantPlanStore {
   return {
-    async set(tenantId, plan, by, at) {
+    async set(tenantId, plan, by, at, budgets = {}) {
+      // Only the columns the write names are touched on a conflict; a new row starts with NULL (never sent) for the rest.
+      const cols = ([["dailyBudgetCents", "daily_budget_cents"], ["onboardingDailyBudgetCents", "onboarding_daily_budget_cents"]] as const)
+        .filter(([k]) => budgets[k] !== undefined);
       await db.prepare(
-        `INSERT INTO tenant_plans (tenant_id, plan, set_by, set_at) VALUES (?, ?, ?, ?)
-         ON CONFLICT(tenant_id) DO UPDATE SET plan = excluded.plan, set_by = excluded.set_by, set_at = excluded.set_at`,
-      ).bind(tenantId, plan, by, at).run();
+        `INSERT INTO tenant_plans (tenant_id, plan, set_by, set_at${cols.map(([, c]) => `, ${c}`).join("")})
+         VALUES (?, ?, ?, ?${cols.map(() => ", ?").join("")})
+         ON CONFLICT(tenant_id) DO UPDATE SET plan = excluded.plan, set_by = excluded.set_by, set_at = excluded.set_at${cols.map(([, c]) => `, ${c} = excluded.${c}`).join("")}`,
+      ).bind(tenantId, plan, by, at, ...cols.map(([k]) => budgets[k] ?? null)).run();
     },
     async list() {
-      const { results } = await db.prepare("SELECT tenant_id, plan, set_by, set_at FROM tenant_plans ORDER BY tenant_id").all();
+      const { results } = await db.prepare(
+        "SELECT tenant_id, plan, set_by, set_at, daily_budget_cents, onboarding_daily_budget_cents FROM tenant_plans ORDER BY tenant_id").all();
       return ((results ?? []) as any[]).filter((r) => (PLANS as readonly string[]).includes(String(r.plan))).map((r) => ({
         tenantId: String(r.tenant_id), plan: String(r.plan) as Plan, setBy: String(r.set_by), setAt: Number(r.set_at),
+        dailyBudgetCents: centsOf(r.daily_budget_cents), onboardingDailyBudgetCents: centsOf(r.onboarding_daily_budget_cents),
       }));
     },
   };
@@ -540,18 +632,21 @@ const TENANT = /^[A-Za-z0-9_.:-]{1,128}$/;
  *
  *   GET                                        → { defaults: { tenantUsd, freeUsd, proUsd, platformUsd, onboardingUsd,
  *                                                  onboardingTenantUsd, exempt }, overrides, events, pools, poolEvents, plans }
- *   PUT    { tenantId, limitUsd: number|null } → the row as kept; null is "no per-tenant limit"
+ *   PUT    { tenantId, limitUsd: number|null } → the row as kept; it can only lower the tenant's limit (Raft's budget,
+ *                                                else the plan's mapping), and null lowers nothing
  *   DELETE { tenantId }                        → 204, or 404 when the tenant had no override
  *   PUT    { pool, limitUsd: number|null }     → a pool's own override (`pool`: "onboarding"); null is "no limit for it"
  *   DELETE { pool }                            → 204, or 404 when the pool had no override
- *   PUT    { pool, tenantId, limitUsd }        → one tenant's share of the pool; null is "no share limit for it"
+ *   PUT    { pool, tenantId, limitUsd }        → one tenant's share of the pool; it too can only lower (null: nothing)
  *   DELETE { pool, tenantId }                  → 204, or 404 when that tenant's share had no override
  *
  * The body's keys say what is set: `pool` a pool's limit, `tenantId` a tenant's, both together the tenant's share of
  * the pool.
  *
  * Every PUT and DELETE writes an audit row (`spend_limit_events`, `spend_pool_limit_events`). A change reaches a
- * running isolate within `SPEND_CACHE_MS`, the life of its last reading. `plans` is what Raft said, read only here.
+ * running isolate within `SPEND_CACHE_MS`, the life of its last reading. `plans` is what Raft said (plan and budgets),
+ * read only here. The pool's own override still replaces ONBOARDING_DAILY_LIMIT_USD either way: it is the operator's
+ * figure, not one Raft sends.
  */
 export async function adminSpendLimits(
   method: string, body: unknown, actor: string,

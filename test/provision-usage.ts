@@ -192,18 +192,23 @@ await check("today under, at and over the limit: spentUsd, limitUsd and refusing
   }
 });
 
-await check("an admin's override is the limit shown; an override of null is no per-tenant limit, and nothing is refused under the platform", async () => {
+await check("an admin's override only lowers the limit shown, and says so; a higher one or null leaves the plan's default", async () => {
   const db = d1();
   const day = today();
   spend(db, "t-a", 6, day);
   const a = await token(db, { scope: "tenant", tenantId: "t-a" });
   const e = env(db);
-  db.raw.prepare("INSERT INTO spend_limits (tenant_id, limit_usd, set_by, set_at) VALUES (?, ?, ?, ?)").run("t-a", 12.5, "github:1", 0);
   let r = await get(e, "/provision/usage", `Bearer ${a}`);
-  must(r.body.today.limitUsd === 12.5 && r.body.today.refusing === false && r.body.today.exempt === false, show(r.body.today));
+  must(r.body.today.limitUsd === 5 && r.body.today.limitSource === "plan" && r.body.today.onboardingLimitSource === "default", show(r.body.today));
+  db.raw.prepare("INSERT INTO spend_limits (tenant_id, limit_usd, set_by, set_at) VALUES (?, ?, ?, ?)").run("t-a", 12.5, "github:1", 0);
+  r = await get(e, "/provision/usage", `Bearer ${a}`);
+  must(r.body.today.limitUsd === 5 && r.body.today.limitSource === "plan" && r.body.today.refusing === true && r.body.today.exempt === false, show(r.body.today));
   db.raw.prepare("UPDATE spend_limits SET limit_usd = NULL WHERE tenant_id = ?").run("t-a");
   r = await get(e, "/provision/usage", `Bearer ${a}`);
-  must(r.body.today.limitUsd === null && r.body.today.refusing === false && r.body.today.exempt === false, show(r.body.today));
+  must(r.body.today.limitUsd === 5 && r.body.today.limitSource === "plan" && r.body.today.refusing === true, show(r.body.today));
+  db.raw.prepare("UPDATE spend_limits SET limit_usd = 2 WHERE tenant_id = ?").run("t-a");
+  r = await get(e, "/provision/usage", `Bearer ${a}`);
+  must(r.body.today.limitUsd === 2 && r.body.today.limitSource === "override" && r.body.today.refusing === true, show(r.body.today));
 });
 
 await check("an exempt tenant: limitUsd null and exempt true, never refusing, even over the default limit", async () => {

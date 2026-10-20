@@ -20,8 +20,8 @@ import { handleProvision, type ProvisionDeps } from "../cf/src/provision/handler
 import { d1ProvisionedAgents, d1ProviderTokens } from "../cf/src/control-plane.ts";
 import { hashProviderToken, newProviderToken } from "../cf/src/provider-token.ts";
 import {
-  adminSpendLimits, d1SpendLimits, d1TenantPlans, judge, limitsOf, ONBOARDING_LIMIT_TEXT, onboardingTenantLimitText, readAgentPool, readDaySpend,
-  SPEND_LIMIT_ERROR, SpendGate, tenantLimitText,
+  adminSpendLimits, d1SpendLimits, d1TenantPlans, judge, limitsOf, MAX_BUDGET_CENTS, ONBOARDING_LIMIT_TEXT, onboardingTenantLimitText, PLATFORM_LIMIT_TEXT,
+  readAgentPool, readDaySpend, SPEND_LIMIT_ERROR, SpendGate, standing, tenantLimitText,
 } from "../cf/src/spend-limit.ts";
 import { readUsageCosts } from "../cf/src/usage-d1.ts";
 import { adminUsageCosts } from "../cf/src/admin-usage-costs.ts";
@@ -208,6 +208,76 @@ await check("PUT /servers/:raftServerId/plan: the tenant the token gives, a body
   must(create.status === 503 && create.body.error.param === "plan" && bare.rows() === 0, `a plan it cannot keep: ${create.status} ${create.text}`);
 });
 
+
+// ---- Raft's daily budgets -----------------------------------------------------------------------------------------
+
+/** What the plan row holds of Raft's budgets. */
+const budgets = (w: ReturnType<typeof provisionWorld>, tenantId: string) =>
+  (w.db.raw.prepare("SELECT plan, daily_budget_cents AS d, onboarding_daily_budget_cents AS o FROM tenant_plans WHERE tenant_id = ?").get(tenantId) as any) ?? null;
+
+await check("PUT …/plan budgets: whole cents from 0 to MAX_BUDGET_CENTS, null, or absent; anything else is 422 naming the field and writes nothing", async () => {
+  const w = provisionWorld();
+  must((await w.call("PUT", "/servers/srv-9/plan", { plan: "free", dailyBudgetCents: 300, onboardingDailyBudgetCents: 100 }, PLATFORM)).status === 200, "first");
+  for (const key of ["dailyBudgetCents", "onboardingDailyBudgetCents"]) {
+    for (const bad of [-1, 1.5, 0.1, "500", "5.00", true, {}, [], MAX_BUDGET_CENTS + 1, 1e12, Number.NaN, Infinity]) {
+      // NaN and Infinity go over JSON as null in a real request; here the handler is called with the value itself.
+      if (typeof bad === "number" && !Number.isFinite(bad)) continue;
+      const r = await w.call("PUT", "/servers/srv-9/plan", { plan: "pro", [key]: bad }, PLATFORM);
+      must(r.status === 422 && r.body.error.param === key && r.body.error.code === "invalid", `${key} ${show(bad)}: ${r.status} ${r.text}`);
+    }
+  }
+  must(show(budgets(w, "raft_srv-9")) === show({ plan: "free", d: 300, o: 100 }), `a refused PUT wrote: ${show(budgets(w, "raft_srv-9"))}`);
+  // The edges are accepted, and the answer echoes what was sent.
+  let r = await w.call("PUT", "/servers/srv-9/plan", { plan: "pro", dailyBudgetCents: 0, onboardingDailyBudgetCents: MAX_BUDGET_CENTS }, PLATFORM);
+  must(r.status === 200 && r.body.dailyBudgetCents === 0 && r.body.onboardingDailyBudgetCents === MAX_BUDGET_CENTS, r.text);
+  must(show(budgets(w, "raft_srv-9")) === show({ plan: "pro", d: 0, o: MAX_BUDGET_CENTS }), show(budgets(w, "raft_srv-9")));
+  // Any other field is still refused naming it.
+  r = await w.call("PUT", "/servers/srv-9/plan", { plan: "pro", dailyBudgetUsd: 5 }, PLATFORM);
+  must(r.status === 422 && r.body.error.param === "dailyBudgetUsd", r.text);
+});
+
+await check("PUT …/plan budgets: a field left out is kept (an older Raft sending { plan } wipes nothing), null clears it, each field on its own", async () => {
+  const w = provisionWorld();
+  // A first PUT with no budgets: the row says "never sent".
+  must((await w.call("PUT", "/servers/srv-9/plan", { plan: "free" }, PLATFORM)).status === 200, "plan only");
+  must(show(budgets(w, "raft_srv-9")) === show({ plan: "free", d: null, o: null }), show(budgets(w, "raft_srv-9")));
+  must((await w.call("PUT", "/servers/srv-9/plan", { plan: "pro", dailyBudgetCents: 1200, onboardingDailyBudgetCents: 150 }, PLATFORM)).status === 200, "both");
+  // An older Raft: the plan moves, the budgets stay.
+  const old = await w.call("PUT", "/servers/srv-9/plan", { plan: "free" }, PLATFORM);
+  must(old.status === 200 && !("dailyBudgetCents" in old.body) && !("onboardingDailyBudgetCents" in old.body), old.text);
+  must(show(budgets(w, "raft_srv-9")) === show({ plan: "free", d: 1200, o: 150 }), `plan-only PUT wiped a budget: ${show(budgets(w, "raft_srv-9"))}`);
+  // One field at a time: the other is kept.
+  must((await w.call("PUT", "/servers/srv-9/plan", { plan: "free", dailyBudgetCents: 900 }, PLATFORM)).status === 200, "daily alone");
+  must(show(budgets(w, "raft_srv-9")) === show({ plan: "free", d: 900, o: 150 }), show(budgets(w, "raft_srv-9")));
+  const cleared = await w.call("PUT", "/servers/srv-9/plan", { plan: "free", onboardingDailyBudgetCents: null }, PLATFORM);
+  must(cleared.status === 200 && cleared.body.onboardingDailyBudgetCents === null, cleared.text);
+  must(show(budgets(w, "raft_srv-9")) === show({ plan: "free", d: 900, o: null }), show(budgets(w, "raft_srv-9")));
+  // And the store lists them for the admin.
+  const listed = await d1TenantPlans(w.db).list();
+  must(show(listed.map((p) => [p.tenantId, p.plan, p.dailyBudgetCents, p.onboardingDailyBudgetCents])) === show([["raft_srv-9", "free", 900, null]]), show(listed));
+});
+
+await check("POST budgets: validated as on the PUT, sent with plan, written by a create and never by a replay", async () => {
+  const w = provisionWorld();
+  for (const [extra, param] of [[{ plan: "pro", dailyBudgetCents: 2.5 }, "dailyBudgetCents"], [{ plan: "pro", onboardingDailyBudgetCents: -5 }, "onboardingDailyBudgetCents"],
+    [{ dailyBudgetCents: 500 }, "dailyBudgetCents"], [{ plan: null, onboardingDailyBudgetCents: 500 }, "onboardingDailyBudgetCents"]] as const) {
+    const r = await w.call("POST", "/agents", body(extra));
+    must(r.status === 422 && r.body.error.param === param, `${show(extra)}: ${r.status} ${r.text}`);
+  }
+  must(w.rows() === 0 && w.plan("t-raft") === null, "a refused create wrote something");
+  must((await w.call("POST", "/agents", body({ plan: "pro", dailyBudgetCents: 1500, onboardingDailyBudgetCents: 200 }))).status === 201, "create");
+  must(show(budgets(w, "t-raft")) === show({ plan: "pro", d: 1500, o: 200 }), show(budgets(w, "t-raft")));
+  must((await w.call("PUT", "/servers/srv-1/plan", { plan: "pro", dailyBudgetCents: 700 })).status === 200, "PUT");
+  // A late retry of the create says 1500 still; it is a replay, and must not undo the PUT.
+  const replay = await w.call("POST", "/agents", body({ plan: "pro", dailyBudgetCents: 1500, onboardingDailyBudgetCents: 200 }));
+  must(replay.status === 200 && show(budgets(w, "t-raft")) === show({ plan: "pro", d: 700, o: 200 }), `replay ${replay.status}: ${show(budgets(w, "t-raft"))}`);
+  // A new create without budgets keeps them; with one, it writes that one.
+  must((await w.call("POST", "/agents", body({ raftAgentId: "01JNEXT", plan: "free" }))).status === 201, "next");
+  must(show(budgets(w, "t-raft")) === show({ plan: "free", d: 700, o: 200 }), show(budgets(w, "t-raft")));
+  must((await w.call("POST", "/agents", body({ raftAgentId: "01JTHIRD", plan: "free", onboardingDailyBudgetCents: 50 }))).status === 201, "third");
+  must(show(budgets(w, "t-raft")) === show({ plan: "free", d: 700, o: 50 }), show(budgets(w, "t-raft")));
+});
+
 // ---- the pools --------------------------------------------------------------------------------------------------
 
 const AT = limitsOf({});
@@ -282,7 +352,7 @@ await check("the tenant's limit is not charged with its onboarding agent's spend
   must(!c.admit && c.limit === "tenant" && c.text === tenantLimitText(25, 5), show(c));
 });
 
-await check("the plan picks the tenant's default: never said $5 (as before plans), free $3, pro $10; an admin's override wins over each", async () => {
+await check("the plan picks the tenant's default: never said $5 (as before plans), free $3, pro $10; an admin's override only lowers each", async () => {
   const db = d1();
   spend(db, "t", "a", 4);
   const plans = d1TenantPlans(db);
@@ -304,7 +374,8 @@ await check("the plan picks the tenant's default: never said $5 (as before plans
   v = judge(s, AT);
   must(!v.admit && v.text === tenantLimitText(s.tenantUsd, 10) && near(s.tenantUsd, 10.5), `pro at $10.50: ${show(v)}`);
   await d1SpendLimits(db).set("t", 20, "op", 3);
-  must(judge(await readDaySpend(db, "t", NOON), AT).admit, "the override did not win over the plan");
+  v = judge(await readDaySpend(db, "t", NOON), AT);
+  must(!v.admit && v.text === tenantLimitText(s.tenantUsd, 10), `a $20 override raised pro's $10: ${show(v)}`);
   await d1SpendLimits(db).set("t", 1, "op", 4);
   must(!judge(await readDaySpend(db, "t", NOON), AT).admit, "a lower override did not win over pro");
   for (const plan of ["free", null] as const) {
@@ -371,30 +442,32 @@ await check("a tenant's onboarding share: one server's Cindy at its $1 is refuse
   must(!vp.admit && vp.limit === "onboarding" && vp.text === ONBOARDING_LIMIT_TEXT, show(vp));
 });
 
-await check("/admin/spend-limits with pool and tenantId: one tenant's share is set, lifted and cleared, audited, and touches no other tenant", async () => {
+await check("/admin/spend-limits with pool and tenantId: one tenant's share is lowered and cleared, audited, touches no other tenant, and never raises", async () => {
   const db = d1();
   await agentRow(db, "a", "cindy-a", "onboarding");
   await agentRow(db, "b", "cindy-b", "onboarding");
-  spend(db, "a", "cindy-a", 2);
-  spend(db, "b", "cindy-b", 2);
+  spend(db, "a", "cindy-a", 0.6);
+  spend(db, "b", "cindy-b", 1.5);
   const store = d1SpendLimits(db);
   let now = NOON;
   const call = (method: string, b?: unknown) => adminSpendLimits(method, b, "github:1", { store, limits: AT, now: () => now });
   const admitted = async (t: string) => (await gateOn(db).gate.admit(t, `cindy-${t}`)).admit;
-  must(!(await admitted("a")) && !(await admitted("b")), "the $1 default did not refuse $2");
-  const r = await call("PUT", { pool: "onboarding", tenantId: "a", limitUsd: 3 });
-  must(r.status === 200 && show(await r.json()) === show({ pool: "onboarding", tenantId: "a", limitUsd: 3, setBy: "github:1", setAt: NOON }), "set");
-  must(await admitted("a") && !(await admitted("b")), "the share applied to the wrong tenant");
+  must(await admitted("a") && !(await admitted("b")), "the $1 default: $0.60 admitted, $1.50 refused");
+  const r = await call("PUT", { pool: "onboarding", tenantId: "a", limitUsd: 0.5 });
+  must(r.status === 200 && show(await r.json()) === show({ pool: "onboarding", tenantId: "a", limitUsd: 0.5, setBy: "github:1", setAt: NOON }), "set");
+  must(!(await admitted("a")) && !(await admitted("b")), "the lowered share did not refuse a");
   must((await readDaySpend(db, "a", NOON)).onboardingOverride === null, "the share read as the pool's override");
   now += 1;
-  must((await call("PUT", { pool: "onboarding", tenantId: "b", limitUsd: null })).status === 200 && await admitted("b"), "null: no share limit");
+  must((await call("PUT", { pool: "onboarding", tenantId: "b", limitUsd: null })).status === 200 && !(await admitted("b")), "null lifted b's share");
   now += 1;
-  must((await call("DELETE", { pool: "onboarding", tenantId: "a" })).status === 204 && !(await admitted("a")) && await admitted("b"), "clear");
+  must((await call("PUT", { pool: "onboarding", tenantId: "b", limitUsd: 3 })).status === 200 && !(await admitted("b")), "$3 raised b's $1 share");
+  now += 1;
+  must((await call("DELETE", { pool: "onboarding", tenantId: "a" })).status === 204 && await admitted("a") && !(await admitted("b")), "clear");
   must((await call("DELETE", { pool: "onboarding", tenantId: "a" })).status === 404, "a second clear");
   must((await call("DELETE", { pool: "onboarding" })).status === 404, "the pool's own row was made by a share");
   const got = await (await call("GET")).json() as any;
-  must(show(got.pools.map((p: any) => [p.pool, p.tenantId, p.limitUsd])) === show([["onboarding", "b", null]]), show(got.pools));
-  must(show(got.poolEvents.map((e: any) => [e.tenantId, e.action, e.limitUsd])) === show([["a", "clear", null], ["b", "set", null], ["a", "set", 3]]), show(got.poolEvents));
+  must(show(got.pools.map((p: any) => [p.pool, p.tenantId, p.limitUsd])) === show([["onboarding", "b", 3]]), show(got.pools));
+  must(show(got.poolEvents.map((e: any) => [e.tenantId, e.action, e.limitUsd])) === show([["a", "clear", null], ["b", "set", 3], ["b", "set", null], ["a", "set", 0.5]]), show(got.poolEvents));
   must(got.overrides.length === 0 && got.events.length === 0, "the tenant's own limit was written");
 });
 
@@ -431,7 +504,7 @@ await check("/admin/spend-limits with pool: set, set to none, clear; audited apa
   must(got.defaults.onboardingUsd === 30 && got.defaults.onboardingTenantUsd === 1 && got.defaults.proUsd === 10 && got.defaults.freeUsd === 3
     && got.defaults.tenantUsd === 5 && got.defaults.platformUsd === 2000, show(got.defaults));
   must(got.pools.length === 0 && got.overrides.length === 0 && got.events.length === 0, `tenant audit touched: ${show(got)}`);
-  must(show(got.plans) === show([{ tenantId: "t", plan: "pro", setBy: "h", setAt: 7 }]), show(got.plans));
+  must(show(got.plans) === show([{ tenantId: "t", plan: "pro", setBy: "h", setAt: 7, dailyBudgetCents: null, onboardingDailyBudgetCents: null }]), show(got.plans));
   must(show(got.poolEvents.map((e: any) => [e.pool, e.tenantId, e.action, e.limitUsd, e.previous, e.at])) === show([
     ["onboarding", null, "clear", null, { limitUsd: null }, NOON + 2],
     ["onboarding", null, "set", null, { limitUsd: 50 }, NOON + 1],
@@ -439,6 +512,98 @@ await check("/admin/spend-limits with pool: set, set to none, clear; audited apa
   ]), show(got.poolEvents));
   // The tenant form of the same route still works beside it.
   must((await call("PUT", { tenantId: "t", limitUsd: 9 })).status === 200, "the tenant override");
+});
+
+
+// ---- Raft's budgets enforced ----------------------------------------------------------------------------------------
+
+await check("Raft's dailyBudgetCents is the tenant's limit, over the plan's mapping both ways; absent, the plan's mapping; $0 refuses every paid call", async () => {
+  const db = d1();
+  spend(db, "t", "a", 4);
+  const plans = d1TenantPlans(db);
+  await plans.set("t", "free", "h", 1);
+  let s = await readDaySpend(db, "t", NOON);
+  let v = judge(s, AT);
+  must(!v.admit && v.text === tenantLimitText(s.tenantUsd, 3) && standing("t", s, AT).limitSource === "plan", `free, no budget: ${show(v)}`);
+  // Above the plan's figure: Raft says $6 for this free server.
+  await plans.set("t", "free", "h", 2, { dailyBudgetCents: 600 });
+  s = await readDaySpend(db, "t", NOON);
+  must(judge(s, AT).admit && standing("t", s, AT).limitUsd === 6 && standing("t", s, AT).limitSource === "raft", show(standing("t", s, AT)));
+  // Below it: Raft says $3.50 for a pro server, whose plan maps to $10.
+  await plans.set("t", "pro", "h", 3, { dailyBudgetCents: 350 });
+  s = await readDaySpend(db, "t", NOON);
+  v = judge(s, AT);
+  must(!v.admit && v.text === tenantLimitText(s.tenantUsd, 3.5), `pro at Raft's $3.50: ${show(v)}`);
+  await plans.set("t", "pro", "h", 4, { dailyBudgetCents: 0 });
+  s = await readDaySpend(db, "t", NOON);
+  must(!judge(s, AT).admit && standing("t", s, AT).limitUsd === 0, "Raft's $0 did not refuse");
+  // Cleared: the plan's mapping again.
+  await plans.set("t", "pro", "h", 5, { dailyBudgetCents: null });
+  s = await readDaySpend(db, "t", NOON);
+  must(judge(s, AT).admit && standing("t", s, AT).limitUsd === 10 && standing("t", s, AT).limitSource === "plan", show(standing("t", s, AT)));
+  // A value in the column outside what the route accepts reads as never sent, not as a figure.
+  db.raw.prepare("UPDATE tenant_plans SET daily_budget_cents = 12.5 WHERE tenant_id = 't'").run();
+  must(standing("t", await readDaySpend(db, "t", NOON), AT).limitSource === "plan", "a fractional stored cents value was used");
+});
+
+await check("an admin's override against Raft's budget: min of the two — lower wins, higher and null change nothing — for the tenant and its onboarding share", async () => {
+  const db = d1();
+  await agentRow(db, "t", "cindy", "onboarding");
+  spend(db, "t", "own", 7);
+  spend(db, "t", "cindy", 2.5);
+  await d1TenantPlans(db).set("t", "free", "h", 1, { dailyBudgetCents: 800, onboardingDailyBudgetCents: 300 });
+  const store = d1SpendLimits(db);
+  const read = async () => { const s = await readDaySpend(db, "t", NOON); return { s, st: standing("t", s, AT) }; };
+  let { s, st } = await read();
+  must(judge(s, AT).admit && judge(s, AT, "onboarding").admit && st.limitUsd === 8 && st.onboardingLimitUsd === 3 && st.onboardingLimitSource === "raft", show(st));
+  // Higher overrides: nothing moves.
+  await store.set("t", 50, "op", 2);
+  await store.setPool("onboarding", "t", 40, "op", 2);
+  ({ s, st } = await read());
+  must(st.limitUsd === 8 && st.limitSource === "raft" && st.onboardingLimitUsd === 3 && st.onboardingLimitSource === "raft", `a higher override moved a limit: ${show(st)}`);
+  // null ("no limit") overrides: nothing moves either.
+  await store.set("t", null, "op", 3);
+  await store.setPool("onboarding", "t", null, "op", 3);
+  ({ s, st } = await read());
+  must(st.limitUsd === 8 && st.onboardingLimitUsd === 3 && st.limitSource === "raft", `a null override lifted a limit: ${show(st)}`);
+  // Lower overrides: they decide, and say so.
+  await store.set("t", 6.5, "op", 4);
+  await store.setPool("onboarding", "t", 2, "op", 4);
+  ({ s, st } = await read());
+  const own = judge(s, AT), share = judge(s, AT, "onboarding");
+  must(!own.admit && own.text === tenantLimitText(s.tenantUsd, 6.5) && st.limitSource === "override", `own: ${show(own)} ${show(st)}`);
+  must(!share.admit && share.limit === "onboarding_tenant" && share.text === onboardingTenantLimitText(s.tenantOnboardingUsd, 2) && st.onboardingLimitSource === "override", `share: ${show(share)}`);
+  // $0: the emergency stop, whatever Raft says.
+  await d1TenantPlans(db).set("t", "pro", "h", 5, { dailyBudgetCents: MAX_BUDGET_CENTS });
+  await store.set("t", 0, "op", 5);
+  ({ s, st } = await read());
+  must(!judge(s, AT).admit && st.limitUsd === 0 && st.limitSource === "override", show(st));
+});
+
+await check("the backstops hold over Raft's budgets: the platform limit and the onboarding pool still refuse; an exempt tenant is not refused by a $0 budget", async () => {
+  const db = d1();
+  await agentRow(db, "t", "cindy", "onboarding");
+  await agentRow(db, "z", "cindy-z", "onboarding");
+  spend(db, "t", "own", 1);
+  spend(db, "other", "x", 30);
+  spend(db, "z", "cindy-z", 30);
+  await d1TenantPlans(db).set("t", "pro", "h", 1, { dailyBudgetCents: MAX_BUDGET_CENTS, onboardingDailyBudgetCents: MAX_BUDGET_CENTS });
+  const limits = limitsOf({ PLATFORM_DAILY_LIMIT_USD: "30" });
+  const s = await readDaySpend(db, "t", NOON);
+  const own = judge(s, limits), share = judge(s, limits, "onboarding");
+  must(!own.admit && own.limit === "platform" && own.text === PLATFORM_LIMIT_TEXT, `platform: ${show(own)}`);
+  must(!share.admit && share.limit === "onboarding" && share.text === ONBOARDING_LIMIT_TEXT, `pool: ${show(share)}`);
+  // The control: with the platform limit off and the pool's raised by an admin, Raft's large budgets admit both.
+  await d1SpendLimits(db).setPool("onboarding", null, 100, "op", 2);
+  const s2 = await readDaySpend(db, "t", NOON);
+  must(judge(s2, limitsOf({ PLATFORM_DAILY_LIMIT_USD: "off" })).admit && judge(s2, limits, "onboarding").admit, "the control was refused");
+  // Exempt: Raft's $0 refuses nothing, and the panel says no limit, as before budgets.
+  await d1TenantPlans(db).set("bench", "free", "h", 3, { dailyBudgetCents: 0, onboardingDailyBudgetCents: 0 });
+  spend(db, "bench", "b", 5);
+  const g = gateOn(db);
+  must((await g.gate.admit("bench", "b")).admit, "an exempt tenant was refused by Raft's $0");
+  const sb = standing("bench", await readDaySpend(db, "bench", NOON), AT);
+  must(sb.exempt && sb.limitUsd === null && sb.limitSource === null && sb.onboardingLimitUsd === null && !sb.refusing, show(sb));
 });
 
 // ---- what the operator and the tenant see -------------------------------------------------------------------------
@@ -459,14 +624,14 @@ await check("the cost views: onboarding spend is its own line (API, usage-costs 
   must(/<b>onboarding pool<\/b>[\s\S]*?\$2\.00/.test(page) && /incl\. \$2\.00 onboarding/.test(page), "the usage-costs page has no onboarding line");
   const limits = spendLimitsPanel({
     defaults: { tenantUsd: 5, freeUsd: 3, proUsd: 10, platformUsd: 2000, onboardingUsd: 30, onboardingTenantUsd: 1, exempt: [] }, overrides: [], events: [],
-    pools: [{ pool: "onboarding", tenantId: null, limitUsd: 40, setBy: "op", setAt: NOON }, { pool: "onboarding", tenantId: "t", limitUsd: 2.5, setBy: "op", setAt: NOON }],
+    pools: [{ pool: "onboarding", tenantId: null, limitUsd: 40, setBy: "op", setAt: NOON }, { pool: "onboarding", tenantId: "t", limitUsd: 0.5, setBy: "op", setAt: NOON }],
     poolEvents: [], plans: [{ tenantId: "t", plan: "pro" }],
     today: [{ tenantId: "t", usd: 1, onboarding: 2 }], platformToday: 5, onboardingToday: 2,
   });
   must(/onboarding pool — \$2\.00 today of \$40\.00/.test(limits), "the pool's line against its override");
-  must(/<code>t<\/code> <span class="tag">pro<\/span>[\s\S]*?\$1\.00[\s\S]*?\+\$2\.00 onboarding of \$2\.50[\s\S]*?\$10\.00 <span class="hint-inline">default/.test(limits), "the tenant row: own spend, onboarding beside it, the pro default");
+  must(/<code>t<\/code> <span class="tag">pro<\/span>[\s\S]*?\$1\.00[\s\S]*?\+\$2\.00 onboarding of \$0\.50[\s\S]*?\$10\.00 <span class="hint-inline">plan default/.test(limits), "the tenant row: own spend, onboarding beside it, the pro default");
   must(/name="pool" value="onboarding"/.test(limits), "no form to set the onboarding limit");
-  must(/<code>t<\/code>'s share:\s*\$2\.50/.test(limits) && /name="tenantId" value="t"/.test(limits), "the tenant's share override and its clear form");
+  must(/<code>t<\/code>'s share:\s*\$0\.50/.test(limits) && /name="tenantId" value="t"/.test(limits), "the tenant's share override and its clear form");
 });
 
 // ---- the real Worker: the queue consumer, the routes ----------------------------------------------------------------
@@ -511,8 +676,7 @@ await check("the Worker's queue handler: an onboarding agent is called while its
     // Its pool spent, in a tenant of its own, so the isolate's readings of q-t do not stand in the way.
     await agentRow(db, "q-u", "q-cindy2", "onboarding");
     spend(db, "q-u", "q-cindy2", 30, hour);
-    // q-u's share is lifted, so it is the pool that refuses (the share's own sentence has its own check).
-    await d1SpendLimits(db).setPool("onboarding", "q-u", null, "op", 0);
+    // The pool is asked before the share, so it is the pool's sentence (the share's own has its own check).
     await worker.queue(batch("q-u", "q-cindy2") as never, env as never);
     must(Number(calls) === 1 && delivered[2]!.answer.errorMessage === SPEND_LIMIT_ERROR && delivered[2]!.answer.providerError === ONBOARDING_LIMIT_TEXT
       && delivered[2]!.answer.stopReason === "error", `pool spent: ${show(delivered[2])}`);
@@ -547,10 +711,29 @@ await check("GET /provision/usage and PUT /provision/servers/:id/plan through th
   must((await req("PUT", "/provision/servers/srv-7/plan", { plan: "free" })).status === 200, "downgrade");
   u = await req("GET", "/provision/usage?raftServerId=srv-7");
   must(u.body.today.plan === "free" && u.body.today.limitUsd === 3 && u.body.today.refusing === true, show(u.body.today));
-  // The tenant's share raised by an admin: its onboarding agents are no longer refused, and the panel says so.
-  await d1SpendLimits(db).setPool("onboarding", "raft_srv-7", 5, "op", 0);
+  // The tenant's share raised by Raft: its onboarding agents are no longer refused, and the panel says where it came from.
+  const ob = await req("PUT", "/provision/servers/srv-7/plan", { plan: "free", onboardingDailyBudgetCents: 500 });
+  must(ob.status === 200 && ob.body.onboardingDailyBudgetCents === 500 && !("dailyBudgetCents" in ob.body), ob.text);
   u = await req("GET", "/provision/usage?raftServerId=srv-7");
-  must(u.body.today.onboardingLimitUsd === 5 && u.body.today.onboardingRefusing === false, show(u.body.today));
+  must(u.body.today.onboardingLimitUsd === 5 && u.body.today.onboardingLimitSource === "raft" && u.body.today.onboardingRefusing === false
+    && u.body.today.limitUsd === 3 && u.body.today.limitSource === "plan", show(u.body.today));
+  // An admin's override of the share can still lower it (an emergency stop), and the panel names it.
+  await d1SpendLimits(db).setPool("onboarding", "raft_srv-7", 0.5, "op", 0);
+  u = await req("GET", "/provision/usage?raftServerId=srv-7");
+  must(u.body.today.onboardingLimitUsd === 0.5 && u.body.today.onboardingLimitSource === "override" && u.body.today.onboardingRefusing === true, show(u.body.today));
+  // Raft's own daily budget: the tenant's limit is its figure, whatever the plan maps to.
+  const own = await req("PUT", "/provision/servers/srv-7/plan", { plan: "free", dailyBudgetCents: 800 });
+  must(own.status === 200 && own.body.dailyBudgetCents === 800, own.text);
+  u = await req("GET", "/provision/usage?raftServerId=srv-7");
+  must(u.body.today.limitUsd === 8 && u.body.today.limitSource === "raft" && u.body.today.refusing === false, show(u.body.today));
+  // An older Raft sending { plan } alone changes the plan and keeps both budgets.
+  must((await req("PUT", "/provision/servers/srv-7/plan", { plan: "pro" })).status === 200, "plan alone");
+  u = await req("GET", "/provision/usage?raftServerId=srv-7");
+  must(u.body.today.plan === "pro" && u.body.today.limitUsd === 8 && u.body.today.limitSource === "raft", show(u.body.today));
+  // null clears it: the plan's mapping applies again.
+  must((await req("PUT", "/provision/servers/srv-7/plan", { plan: "pro", dailyBudgetCents: null })).status === 200, "clear");
+  u = await req("GET", "/provision/usage?raftServerId=srv-7");
+  must(u.body.today.limitUsd === 10 && u.body.today.limitSource === "plan" && u.body.today.onboardingLimitSource === "override", show(u.body.today));
   const bad = await req("PUT", "/provision/servers/srv-7/plan", { plan: "gold" });
   must(bad.status === 422 && bad.body.error.param === "plan", bad.text);
 });

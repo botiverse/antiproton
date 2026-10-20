@@ -208,14 +208,20 @@ await check("an exempt tenant (bench) is refused by neither limit, and is not ev
   must(!(await gate.admit("t")).admit, "the control tenant was admitted at $1000");
 });
 
-await check("a per-tenant override replaces the default; null is no per-tenant limit, and the platform limit still applies", async () => {
+await check("a per-tenant override only lowers the default: a higher one or null changes nothing, and the platform limit still applies", async () => {
+  // Above the $5 default: no raise, the tenant is refused at the default as with no override at all.
   const raised = gateOver(async () => reading(7, 7, { limitUsd: 10 }));
-  must((await raised.gate.admit("t")).admit, "refused at $7 under a $10 override");
+  const r = await raised.gate.admit("t");
+  must(!r.admit && r.text === tenantLimitText(7, 5), `a $10 override raised the $5 default: ${show(r)}`);
   const lowered = gateOver(async () => reading(1, 1, { limitUsd: 0.5 }));
   const v = await lowered.gate.admit("t");
   must(!v.admit && v.text === tenantLimitText(1, 0.5), show(v));
+  const stop = gateOver(async () => reading(0, 0, { limitUsd: 0 }));
+  must(!(await stop.gate.admit("t")).admit, "a $0 override did not stop the tenant");
+  // null ("no limit") lowers nothing: the default still refuses.
   const unlimited = gateOver(async () => reading(25, 25, { limitUsd: null }));
-  must((await unlimited.gate.admit("t")).admit, "refused at $25 with no per-tenant limit");
+  must(!(await unlimited.gate.admit("t")).admit, "a null override lifted the default");
+  must((await gateOver(async () => reading(4, 4, { limitUsd: null })).gate.admit("t")).admit, "refused under the default with a null override");
   const platform = gateOver(async () => reading(31, 31, { limitUsd: null }));
   const p = await platform.gate.admit("t");
   must(!p.admit && p.limit === "platform", show(p));

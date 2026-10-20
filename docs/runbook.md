@@ -96,6 +96,9 @@ curl -s -X PUT -H "x-harness-token: $AUTOMATION_TOKEN" -H "content-type: applica
   "$HOST/admin/spend-limits" -d '{"pool":"onboarding","tenantId":"<tenantId>","limitUsd":0}'
 ```
 
+An override can only lower a limit, never raise it, so `0` stops the tenant whatever daily budget Raft has sent for
+its server; for the same reason an override cannot be used to lift a tenant above Raft's budget.
+
 These are rows in `spend_limits` and `spend_pool_limits` (pool `onboarding`); every set and clear is audited in
 `spend_limit_events` / `spend_pool_limit_events`. **Remove them afterwards**, or the tenant stays cut off: the same
 requests with `DELETE` and no `limitUsd`.
