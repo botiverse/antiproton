@@ -101,13 +101,12 @@ export interface AssistantOwner {
   /** Set by a `403 assistant_not_enabled`: no proactive send and no brief until a context check names the owner again. */
   pausedAt: number | null;
   /**
-   * The owner's DM, as a send target (`dm:@name`): Raft's (`assistantOf.dmTarget`) when it gives one; else learnt from
-   * the DM itself, or given to the notify tool once.
+   * The owner's DM, as a send target (`dm:@name`), as Raft gives it (`assistantOf.dmTarget`); null until it does.
    */
   dmTarget: string | null;
   /**
-   * The owner's DM as learnt where Raft gives none (`dmTarget` null): from a message the owner wrote in it (`learnDm`), or
-   * given to the notify tool once. Raft's always wins (`dmOf`).
+   * The owner's DM as learnt where Raft gives none (`dmTarget` null): from a message the owner wrote in it (`learnDm`),
+   * and from nothing else — never from the model. Raft's always wins (`dmOf`).
    */
   learnedDm: string | null;
   /** When a doorbell arrived that no wake has checked yet. */
@@ -373,7 +372,6 @@ export const ASSISTANT_OWN_TOOLS: readonly ToolSchema[] = [
           },
         },
         brief: { type: "boolean", description: "This is the morning brief." },
-        target: { type: "string", description: "Your owner's DM (dm:@name), needed only until you have been in it once." },
       },
     },
     sideEffects: "write",
@@ -439,9 +437,6 @@ export async function notifyOwner(args: unknown, ctx: PluginContext, deps: Notif
   // `brief: true` lets decisions through and ignores the night, so it counts only for the brief its timer posted today
   // (`briefWake`), once: the model cannot make any other message a brief.
   const brief = a.brief === true && owner.lastBrief === today && owner.briefSent !== today;
-  // The owner's DM, once given, is kept whatever this call then does, so a later call (the brief) has it.
-  const given = typeof a.target === "string" && DM_TARGET.test(a.target.trim()) ? a.target.trim() : null;
-  if (given && given !== owner.learnedDm) await saveOwner(ctx, owner = { ...owner, learnedDm: given });
   if (!Array.isArray(a.items) || a.items.length > ITEMS_MAX) throw refusal(`items must be a list of at most ${ITEMS_MAX}`);
   const items: Item[] = [];
   for (const raw of a.items) {
@@ -483,8 +478,8 @@ export async function notifyOwner(args: unknown, ctx: PluginContext, deps: Notif
   }
   const target = dmOf(owner);
   if (!target) {
-    throw refusal(`${NOTIFY_TOOL}: your owner's DM is not known yet (Raft gives none until the DM exists, and none has been seen): ` +
-      "call again with target set to it (dm:@<their name>) if you know it; otherwise nothing can be sent yet");
+    throw refusal(`${NOTIFY_TOOL}: your owner's DM is not known yet (Raft gives none until the DM exists, and your owner has ` +
+      "not written in it yet), so nothing can be sent; it is known once they write to you there");
   }
   const content = compose(send, { brief, now, askZone });
   // One key per set of items, so a retry of the same call lands once.
