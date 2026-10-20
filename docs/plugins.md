@@ -152,8 +152,9 @@ rather than `failed`. `github.ts` shows the pattern.
 not declare is refused when the mount is written (`validateMount` in
 `src/runtime/mount-config.ts`). This catches a typo such as `timeout_ms` for
 `timeoutMs` while a person is there to read the message. A plugin that declares
-no settings takes none: only `account`, which is the console's own label for
-who a mount belongs to rather than a setting of the plugin's, is accepted on it.
+no settings takes none: only `account`, which belongs to no plugin — the
+catalogue writes it, and the model reads it as that mount's `label` in
+`tools.mounts` — is accepted on it.
 That last part used to be the opposite — a plugin with `config: []` accepted
 every key — and the reason it changed is the next sentence. Settings are flat:
 `string`, `number`, `boolean` or `string[]`. Settings are public (they appear
@@ -176,8 +177,8 @@ a nullable type would redden there). A declared, `changeable` setting so deleted
 goes back to the plugin's default. A key the plugin does **not** declare can
 only be deleted that way: it is a typo or a row from an older build, and until
 this existed a single one froze every setting on its mount, because the merged
-whole was validated and the stray key failed it whatever else the patch named. `account`, the mount's label, is
-neither: a PATCH can not set it and can not delete it. Only the settings are written, so the
+whole was validated and the stray key failed it whatever else the patch named. `account`, the catalogue's label for the
+mount, is neither: a PATCH can not set it and can not delete it. Only the settings are written, so the
 mount's credential, installation id, tool snapshot and plugin database are
 kept, and the next call runs with the new values, since every call's context
 is built from the mount row read for that call. The answer is

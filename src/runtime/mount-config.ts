@@ -76,8 +76,11 @@ export function validateMount(
   const given = publicConfig ?? {};
 
   for (const [key, value] of Object.entries(given)) {
-    // `account` is the console's own label for who a mount belongs to and is
-    // set on every mount, including plugins that declare no settings at all.
+    // `account` belongs to no plugin, and not to the console either: the catalogue writes it
+    // (`DEFAULT_MOUNTS`, cf/src/runtime.ts), the model reads it as that mount's `label`
+    // (`tools.mounts`, src/plugins/builtin.ts:54), and an operator reads it in `/admin/diagnose`.
+    // The console's own panel filters it out of the settings rows and shows instead whether an
+    // account is attached, so "the console relies on it" would name a reader that does not exist.
     if (key === "account") continue;
     const field = known.get(key);
     if (!field) {
@@ -87,8 +90,8 @@ export function validateMount(
       // and handed to the model by `tools.mounts` (src/plugins/builtin.ts), so
       // "nothing is declared, so nothing is checked" left the one promise that
       // makes a setting safe unguarded on exactly the plugins nobody was looking
-      // at (github, artifacts, tools, demo). `account` stays: it is the console's
-      // own label for who a mount belongs to, not the plugin's setting.
+      // at (github, artifacts, tools, demo). `account` stays: it belongs to no plugin, it is the
+      // catalogue's label for who a mount is (see above).
       if (!fields.length) {
         problems.push({ key, message: `${plugin.id} takes no settings, so a mount of it cannot carry "${key}"` });
         continue;
@@ -317,8 +320,10 @@ export function mergeMountSettings(
   const removed = new Set<string>();
   for (const [key, value] of Object.entries(patch)) {
     const field = fields.find((f) => f.name === key);
-    // `account` is the label every mount carries and the console relies on, not the plugin's setting, so the
-    // undeclared-key deletion below does not reach it. Setting it is refused as before (it is not declared).
+    // `account` belongs to no plugin (see `validateMount` above), so neither the undeclared-key deletion below nor
+    // the "no such setting" refusal fits it and it gets its own answer. It has two readers and only one of them is a
+    // person looking at something: the model (`tools.mounts`) and `/admin/diagnose`. Deleting it would hand the model
+    // an unnamed mount, while the console — which does not show this field — looked exactly the same.
     if (key === "account" && value === null) {
       return { ok: false, error: `"account" is the mount's label and cannot be removed` };
     }
