@@ -10,7 +10,7 @@
 import { createHmac } from "node:crypto";
 import { raftPlugin, wakeInstruction } from "../src/plugins/raft.ts";
 import {
-  ASSISTANT_STORE, CHAT_TOOLS, CHECK_TOOLS, COUNTS_KEY, DEFERRED_KEY, OWNER_KEY, REMINDED_STORE, RETRY_BACKOFF_MS, REVIEWED_KEY, UNREADABLE_KEY, assistantCheckPrompt, assistantMountOf, assistantPrompt,
+  ASSISTANT_STORE, CHAT_TOOLS, CHECK_TOOLS, COUNTS_KEY, DEFERRED_KEY, INBOX_LAG_RETRY_MS, OWNER_KEY, REMINDED_STORE, RETRY_BACKOFF_MS, REVIEWED_KEY, UNREADABLE_KEY, assistantCheckPrompt, assistantMountOf, assistantPrompt,
   assistantWakeInstruction, confirmRef, isQuietHours, itemOf, localDay, nextBriefAt, zoneOf,
 } from "../src/plugins/raft-assistant.ts";
 import { askWake } from "../src/runtime/plugin-wakes.ts";
@@ -113,6 +113,8 @@ function raft(o: { zone?: unknown; owner?: boolean; dm?: unknown } = {}) {
     unread: [] as unknown[], all: [] as unknown[], inboxReads: [] as string[],
     /** Conversations whose owner-messages answer fails Raft's shape (the message names no conversation), and every read of one. */
     broken: new Set<string>(), messageReads: [] as string[],
+    /** Doorbell events by their address (`agent-event:<id8>`), as `GET /history` answers one; every such read. */
+    bellEvents: {} as Record<string, unknown>, historyReads: [] as string[],
   };
   globalThis.fetch = (async (url: any, init?: any) => {
     const u = new URL(String(url));
@@ -138,6 +140,15 @@ function raft(o: { zone?: unknown; owner?: boolean; dm?: unknown } = {}) {
     if (path === "/events") {
       return json(200, { events: r.events.splice(0), last_seen_msgId: null, last_seen_seq: null, reply_target: null, has_more: false, ack_mode: "cursor" });
     }
+    if (path === "/history") {
+      const channel = u.searchParams.get("channel") ?? "";
+      r.historyReads.push(`${channel} consume=${u.searchParams.get("consume")}`);
+      const payload = r.bellEvents[channel];
+      if (!payload) return json(404, { error: "Channel not found" });
+      const id = `${channel.slice("agent-event:".length)}-2222-4333-8444-555566667777`;
+      return json(200, { messages: [{ message_id: id, sender_name: "system.assistant", sender_type: "third_party_app", channel_type: "dm", content: "System event: ...",
+        third_party_event: { id, kind: "event", client_id: "system.assistant", client_name: "system.assistant", payload } }], has_more: false, has_older: false, has_newer: false });
+    }
     if (path === "/assistant/owner-messages") {
       // A conversation's one message is its inbox row's first unread (`conv`), so a reference to it can be confirmed.
       const channelId = u.searchParams.get("channelId") ?? "";
@@ -161,7 +172,7 @@ function raft(o: { zone?: unknown; owner?: boolean; dm?: unknown } = {}) {
 function mount(offered: readonly string[] = ALL_TOOLS) {
   const tables = new PluginDbTables(sqliteHost()).ensure();
   const scope = { tenantId: "tenant", agentId: "agent", alias: "raft", plugin: raftPlugin.id };
-  const traced: Array<{ kind: string; status: string; attrs: Record<string, unknown> }> = [];
+  const traced: Array<{ kind: string; status: string; verdict?: string; attrs: Record<string, unknown> }> = [];
   const ctx = {
     caller: { tenantId: "tenant", agentId: "agent", taskId: "task", contextId: "ctx_turn" },
     alias: "raft", credential: "sk_agent_test_1234567890", publicConfig: { serverUrl: "https://raft.example" },
@@ -613,6 +624,187 @@ await check("the notify and preferences tools are refused on a mount not offered
   }
 });
 
+await check("a notify call that sends nothing says so on its trace row: its state and counts by drop category, no refs or contents", async () => {
+  const a = await assistant(raft({ dm: "dm:@ada" }));
+  a.write(REMINDED_STORE, "msg:aaaaaaa1", { at: 1 });
+  a.write(REMINDED_STORE, "msg:bbbbbbb7", { at: 1 });
+  const out = await atTime(DAY, () => notify(a.ctx, { items: ITEMS }));
+  must(out.state === "nothing_to_send" && a.r.sends.length === 0, show(out));
+  const rows = a.traced.filter((t) => t.kind === "raft.assistant_notify");
+  must(rows.length === 1 && rows[0].status === "nothing_to_send" && rows[0].verdict === "ok", show(rows));
+  must(show(rows[0].attrs) === show({ notifyState: "nothing_to_send", given: 2, sent: 0, dropped: 2, dropped_already_told: 2 }), show(rows[0].attrs));
+  must(!/aaaaaaa1|bbbbbbb7|launch|Bob|rollout/.test(show(rows[0])), `content on the row: ${show(rows[0])}`);
+  // And a send: sent counts what went out.
+  const b = await assistant(raft({ dm: "dm:@ada" }));
+  b.write(REMINDED_STORE, "msg:aaaaaaa1", { at: 1 });
+  await atTime(DAY, () => notify(b.ctx, { items: ITEMS }));
+  const sent = b.traced.filter((t) => t.kind === "raft.assistant_notify").at(-1);
+  must(show(sent?.attrs) === show({ notifyState: "sent", given: 2, sent: 1, dropped: 1, dropped_already_told: 1 }), show(sent));
+});
+
+// ---- the doorbell and an inbox that lags it -----------------------------------------------------------------------------
+
+/**
+ * Raft ringing the doorbell as it does: a signed push naming only the event's address, whose payload (`first_change_at`,
+ * `last_change_at`) the plugin reads by that address. `payload: null` is a doorbell whose event cannot be read.
+ */
+let bellNo = 0;
+async function ring(a: { ctx: unknown; r: ReturnType<typeof raft> }, payload: Record<string, unknown> | null) {
+  const secret = "push-secret-0123456789";
+  const id8 = (0x10000000 + ++bellNo).toString(16);
+  const target = `agent-event:${id8}`;
+  if (payload) a.r.bellEvents[target] = { type: "owner_inbox_updated", owner_user_id: OWNER, ...payload };
+  const notice = { schema: "raft-agent-inbox-notice.v1", noticeId: `ntc_${id8}${id8}`, recipientAgentId: "agent-1", text: "Inbox update: 1 event",
+    targets: [{ target, pendingCount: 1, latestSenderName: "system.assistant", latestSenderType: "third_party_app", flags: [] }] };
+  const body = new TextEncoder().encode(JSON.stringify(notice));
+  const headers = { "x-raft-signature-256": `sha256=${createHmac("sha256", secret).update(body).digest("hex")}`, "x-raft-delivery-id": notice.noticeId };
+  const out = await raftPlugin.receive!({ headers, body, hookId: "hk_0123456789abcdef" } as never, secret, a.ctx as never) as any;
+  must(!out.deliver && out.wake === true, `control: the doorbell asks a wake: ${show(out)}`);
+}
+
+/** The incident's shape: four conversations a check has looked at, then B's @mention, which the doorbell announces 6 s later. */
+const OLD4 = [conv(1), conv(2), conv(3), conv(4)];
+const MENTION_AT = "2026-10-20T09:59:54.000Z";
+const mentioned = () => conv(2, { latestAt: "2026-10-20T09:59:54.004Z", hasMention: true, unread: 2, latestPreview: "@ada can you sign off?" });
+async function lookedAtFour() {
+  const a = await assistant(raft({ dm: "dm:@ada" }));
+  a.r.unread = OLD4;
+  briefPosted(a, "2026-10-20"); // 11:55 in Berlin is in the brief's window: this is a doorbell's check
+  await ring(a, null);
+  must((await atTime("2026-10-20T09:55:00Z", () => wake(a.ctx))).isolated === true, "control: the first check looks at all four");
+  must(Object.keys(a.read(ASSISTANT_STORE, REVIEWED_KEY)).length === 4, "control: all four looked at");
+  return a;
+}
+const wakeRows = (a: { traced: any[] }) => a.traced.filter((t) => t.kind === "raft.assistant_wake");
+
+await check("the doorbell's first_change_at reaches the owner state, read by its address without consuming; the earliest awaited change is kept", async () => {
+  const a = await assistant();
+  await atTime(DAY, () => ring(a, { first_change_at: MENTION_AT, last_change_at: DAY }));
+  must(a.read(ASSISTANT_STORE, OWNER_KEY).changeAt === MENTION_AT && typeof a.read(ASSISTANT_STORE, OWNER_KEY).doorbellAt === "number", show(a.read(ASSISTANT_STORE, OWNER_KEY)));
+  must(a.r.historyReads.length === 1 && /^agent-event:[0-9a-f]{8} consume=false$/.test(a.r.historyReads[0]), show(a.r.historyReads));
+  // A later doorbell before any read shows the first change: the first, earlier one is what is awaited.
+  await atTime("2026-10-20T10:00:40Z", () => ring(a, { first_change_at: "2026-10-20T10:00:30.000Z", last_change_at: "2026-10-20T10:00:40.000Z" }));
+  must(a.read(ASSISTANT_STORE, OWNER_KEY).changeAt === MENTION_AT, show(a.read(ASSISTANT_STORE, OWNER_KEY)));
+  // A doorbell whose event cannot be read leaves what is awaited as it was, and is still a doorbell.
+  const b = await assistant();
+  await atTime(DAY, () => ring(b, null));
+  must(b.read(ASSISTANT_STORE, OWNER_KEY).changeAt === null && typeof b.read(ASSISTANT_STORE, OWNER_KEY).doorbellAt === "number", show(b.read(ASSISTANT_STORE, OWNER_KEY)));
+});
+
+await check("a doorbell whose first read predates its change decides nothing; the read that shows it gets the candidate and the summary", async () => {
+  const a = await lookedAtFour();
+  const reviewed = show(a.read(ASSISTANT_STORE, REVIEWED_KEY)), probes = a.r.messageReads.length;
+  await atTime(DAY, () => ring(a, { first_change_at: MENTION_AT, last_change_at: DAY }));
+  // The materialized view has not caught up: the same four, all older than the change.
+  const reads0 = a.r.inboxReads.length;
+  const stale = await atTime(DAY, () => wake(a.ctx));
+  must(show(a.r.inboxReads.slice(reads0)) === show(["unread", "all"]), `a stale unread read asks the read of everything: ${show(a.r.inboxReads.slice(reads0))}`);
+  must(stale.turn === undefined && stale.wakeAt === at(DAY) + INBOX_LAG_RETRY_MS[0] && INBOX_LAG_RETRY_MS[0] === 5_000, `stale: ${show(stale)}`);
+  must(show(a.read(ASSISTANT_STORE, REVIEWED_KEY)) === reviewed && a.r.messageReads.length === probes, `the stale read was recorded or probed: ${show(a.read(ASSISTANT_STORE, REVIEWED_KEY))}`);
+  const row = wakeRows(a).at(-1);
+  must(row?.status === "inbox_lagging" && row.attrs.inbox_lagging === true && row.attrs.lagRetry === 0 && row.attrs.caught_up === false, show(row));
+  must(a.read(ASSISTANT_STORE, OWNER_KEY).changeAt === MENTION_AT && typeof a.read(ASSISTANT_STORE, OWNER_KEY).doorbellAt === "number", "the change is still awaited, as a doorbell");
+  // Caught up: the mention is in the inbox now.
+  a.r.unread = [conv(1), mentioned(), conv(3), conv(4)];
+  const reads1 = a.r.inboxReads.length;
+  const caught = await atTime("2026-10-20T10:00:05Z", () => wake(a.ctx));
+  must(show(a.r.inboxReads.slice(reads1)) === show(["unread"]), `caught up in the unread read: no second read: ${show(a.r.inboxReads.slice(reads1))}`);
+  must(caught.isolated === true && caught.turn.includes(conv(2).channelId) && !caught.turn.includes(conv(1).channelId), `caught up: ${show(caught)}`);
+  const row2 = wakeRows(a).at(-1);
+  must(row2?.status === "invoked" && row2.attrs.candidates === 1 && row2.attrs.lagRetry === 1 && row2.attrs.caught_up === true && row2.attrs.caught_up_via === "unread" && row2.attrs.inbox_lagging === undefined, show(row2));
+  must(a.read(ASSISTANT_STORE, OWNER_KEY).changeAt === null && a.read(ASSISTANT_STORE, OWNER_KEY).lagReads === 0, "the change is no longer awaited");
+  const sent = await atTime("2026-10-20T10:00:10Z", () => notify(a.ctx, { items: [{ ref: "#ch2:aaaaaaa2", summary: "B asks you to sign off", kind: "mention" }] }));
+  must(sent.state === "sent" && a.r.sends.at(-1).content.includes("#ch2:aaaaaaa2"), `the summary: ${show(sent)}`);
+});
+
+await check("caught up is a row at most 2 s older than first_change_at; a much later last_change_at is not what is awaited", async () => {
+  // At the boundary: 1 s older counts, 3 s older does not.
+  const a = await lookedAtFour();
+  a.r.unread = [conv(1), conv(2, { latestAt: "2026-10-20T09:59:53.000Z", hasMention: true })];
+  await atTime(DAY, () => ring(a, { first_change_at: MENTION_AT, last_change_at: DAY }));
+  const edge = await atTime(DAY, () => wake(a.ctx));
+  must(edge.isolated === true && edge.turn.includes(conv(2).channelId) && wakeRows(a).at(-1)?.attrs.caught_up === true, `1 s older: ${show(edge)}`);
+  const b = await lookedAtFour();
+  b.r.unread = [conv(1), conv(2, { latestAt: "2026-10-20T09:59:51.000Z", hasMention: true })];
+  await atTime(DAY, () => ring(b, { first_change_at: MENTION_AT, last_change_at: DAY }));
+  const past = await atTime(DAY, () => wake(b.ctx));
+  must(past.turn === undefined && wakeRows(b).at(-1)?.status === "inbox_lagging", `3 s older: ${show(past)} ${show(wakeRows(b).at(-1))}`);
+  // Raft sends the doorbell well after the change (coalescing): last_change_at 5 minutes on is no lag.
+  const c = await lookedAtFour();
+  c.r.unread = [conv(1), mentioned(), conv(3), conv(4)];
+  await atTime("2026-10-20T10:05:00Z", () => ring(c, { first_change_at: MENTION_AT, last_change_at: "2026-10-20T10:05:00.000Z" }));
+  const late = await atTime("2026-10-20T10:05:00Z", () => wake(c.ctx));
+  must(late.isolated === true && late.turn.includes(conv(2).channelId) && wakeRows(c).every((r) => r.status !== "inbox_lagging"), `last_change_at later: ${show(late)}`);
+});
+
+await check("an inbox that stays stale: reads again at 5 s, 20 s, 60 s, then 2, 5, 15 minutes, no model call, then gives up once and decides", async () => {
+  const a = await lookedAtFour();
+  const reviewed = show(a.read(ASSISTANT_STORE, REVIEWED_KEY)), probes = a.r.messageReads.length;
+  // Besides the four, one no check has looked at, its activity still older than the change: a candidate on any read.
+  a.r.unread = [...OLD4, conv(5)];
+  await atTime(DAY, () => ring(a, { first_change_at: MENTION_AT, last_change_at: DAY }));
+  let when = at(DAY);
+  const delays = [5_000, 20_000, 60_000, 2 * 60_000, 5 * 60_000, 15 * 60_000];
+  for (const [i, d] of delays.entries()) {
+    const out = await atTime(new Date(when).toISOString(), () => wake(a.ctx));
+    const row = wakeRows(a).at(-1);
+    must(out.turn === undefined && out.wakeAt === when + d, `read ${i}: ${show(out)}`);
+    must(row?.status === "inbox_lagging" && row.attrs.lagRetry === i && row.attrs.inbox_lagging === true, `read ${i}: ${show(row)}`);
+    when = out.wakeAt;
+  }
+  must(show(a.read(ASSISTANT_STORE, REVIEWED_KEY)) === reviewed && a.r.messageReads.length === probes, "a stale read was recorded or probed");
+  // The read after the 15-minute one: given up, decided on what was read (the one not looked at goes to the model), and
+  // still not recorded as looked at, since it never showed the change.
+  const last = await atTime(new Date(when).toISOString(), () => wake(a.ctx));
+  const row = wakeRows(a).at(-1);
+  must(last.isolated === true && last.turn.includes(conv(5).channelId) && last.wakeAt === at("2026-10-21T06:00:00Z"), `gave up: ${show(last)}`);
+  must(row?.status === "invoked" && row.attrs.candidates === 1 && row.attrs.inbox_lagging_gave_up === true && row.attrs.inbox_lagging === true && row.attrs.lagRetry === 6 && row.attrs.caught_up === false, show(row));
+  must(show(a.read(ASSISTANT_STORE, REVIEWED_KEY)) === reviewed, "the given-up read was recorded as looked at");
+  must(a.read(ASSISTANT_STORE, OWNER_KEY).changeAt === null && a.read(ASSISTANT_STORE, OWNER_KEY).doorbellAt === null, "still awaited after giving up");
+  // No loop: the next wake has no doorbell and reads nothing.
+  const reads = a.r.inboxReads.length;
+  const idle = await atTime(new Date(when + 60_000).toISOString(), () => wake(a.ctx));
+  must(idle.turn === undefined && a.r.inboxReads.length === reads && wakeRows(a).filter((r) => r.status === "inbox_lagging").length === 6, `after giving up: ${show(idle)}`);
+});
+
+await check("an inbox that catches up only by the 2-minute follow-up still gets the mention summarised", async () => {
+  const a = await lookedAtFour();
+  await atTime(DAY, () => ring(a, { first_change_at: MENTION_AT, last_change_at: DAY }));
+  let when = at(DAY);
+  for (let i = 0; i < 4; i++) when = (await atTime(new Date(when).toISOString(), () => wake(a.ctx))).wakeAt;
+  must(when === at(DAY) + 5_000 + 20_000 + 60_000 + 2 * 60_000, `the 2-minute follow-up: ${new Date(when).toISOString()}`);
+  a.r.unread = [conv(1), mentioned(), conv(3), conv(4)];
+  const out = await atTime(new Date(when).toISOString(), () => wake(a.ctx));
+  must(out.isolated === true && out.turn.includes(conv(2).channelId) && wakeRows(a).at(-1)?.attrs.lagRetry === 4 && wakeRows(a).at(-1)?.attrs.caught_up === true, `${show(out)} ${show(wakeRows(a).at(-1))}`);
+  const sent = await atTime(new Date(when + 1_000).toISOString(), () => notify(a.ctx, { items: [{ ref: "#ch2:aaaaaaa2", summary: "B asks you to sign off", kind: "mention" }] }));
+  must(sent.state === "sent" && a.r.sends.at(-1).content.includes("#ch2:aaaaaaa2"), show(sent));
+});
+
+await check("a change the owner already read is caught up through the read of everything: no retries, nothing to notify", async () => {
+  const a = await lookedAtFour();
+  // Read on the web: gone from unread, still in the read of everything with its new activity.
+  a.r.unread = [conv(1), conv(3), conv(4)];
+  a.r.all = [conv(1), { ...mentioned(), unread: 0 }, conv(3), conv(4)];
+  const reads = a.r.inboxReads.length;
+  await atTime(DAY, () => ring(a, { first_change_at: MENTION_AT, last_change_at: DAY }));
+  const out = await atTime(DAY, () => wake(a.ctx));
+  const row = wakeRows(a).at(-1);
+  must(out.turn === undefined && out.wakeAt === at("2026-10-21T06:00:00Z") && show(a.r.inboxReads.slice(reads)) === show(["unread", "all"]), `${show(out)} ${show(a.r.inboxReads.slice(reads))}`);
+  must(row?.status === "skipped_filtered" && row.attrs.caught_up === true && row.attrs.caught_up_via === "all" && row.attrs.lagRetry === 0 && !("inbox_lagging" in row.attrs), show(row));
+  must(wakeRows(a).every((r) => r.status !== "inbox_lagging") && a.read(ASSISTANT_STORE, OWNER_KEY).changeAt === null && a.read(ASSISTANT_STORE, OWNER_KEY).doorbellAt === null, "retried");
+  must(a.r.sends.length === 0, `notified: ${show(a.r.sends)}`);
+});
+
+await check("a doorbell without first_change_at decides on its first read, as before: no lag, no read again", async () => {
+  const a = await lookedAtFour();
+  const reads = a.r.inboxReads.length;
+  await atTime(DAY, () => ring(a, { last_change_at: DAY }));
+  const out = await atTime(DAY, () => wake(a.ctx));
+  const row = wakeRows(a).at(-1);
+  must(out.turn === undefined && out.wakeAt === at("2026-10-21T06:00:00Z") && show(a.r.inboxReads.slice(reads)) === show(["unread"]), `${show(out)} ${show(a.r.inboxReads.slice(reads))}`);
+  must(row?.status === "skipped_filtered" && row.attrs.seen === 4 && !("lagRetry" in row.attrs) && !("inbox_lagging" in row.attrs), show(row));
+});
+
 // ---- the runtime: the chat, the short sessions, and what each is offered and told --------------------------------------
 
 type Ctx = { systemPrompt: string; messages: any[]; tools: Array<{ name: string }> };
@@ -748,6 +940,29 @@ await check("a doorbell with candidates runs in a fresh short session: the check
     const tables = (w.host.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'pi_s_iso_%'").toArray() as any[]).map((x) => x.name);
     must(tables.length === 0, `the short session's transcript outlived it: ${show(tables)}`);
     must(show(w.wakeRows().map((x) => x.status)) === show(["invoked"]), show(w.wakeRows()));
+  } finally { w.host.dispose(); }
+});
+
+await check("a check's notify call that sends nothing: the gateway keeps its raft.assistant_notify row on the tool.call's span", async () => {
+  let notified = false;
+  const w = await runtimeWith(true, (c) => !notified && c.systemPrompt.endsWith(assistantCheckPrompt("raft"))
+    ? (notified = true, { text: "", finishReason: "tool_calls", truncated: false, usage, toolCalls: [{ id: "n1", name: "raft__assistant_notify_owner",
+      arguments: { items: [{ ref: "#ch1:aaaaaaa1", summary: "Bob asks you to pick a date", kind: "question" }] } }] } as ModelResponse)
+    : say("done"));
+  try {
+    w.db.write(REMINDED_STORE, "msg:aaaaaaa1", { at: 1 });
+    // Told already, yet not filtered before the model: the conversation has two unread messages.
+    w.r.unread = [conv(1, { latestAt: new Date(Date.now() - 60_000).toISOString(), unread: 2 })];
+    w.doorbell();
+    await w.drive();
+    must(notified, "control: the check called notify");
+    const rows = w.host.sql.exec("SELECT kind, span_id, status, attrs FROM trace_outbox WHERE kind IN ('tool.call', 'raft.assistant_notify') ORDER BY seq").toArray() as any[];
+    const call = rows.find((x) => x.kind === "tool.call" && JSON.parse(String(x.attrs)).tool === "raft.assistant_notify_owner");
+    const mine = rows.filter((x) => x.kind === "raft.assistant_notify");
+    must(call && mine.length === 1 && mine[0].span_id === call.span_id && mine[0].status === "nothing_to_send", show(rows));
+    const attrs = JSON.parse(String(mine[0].attrs));
+    must(attrs.notifyState === "nothing_to_send" && attrs.given === 1 && attrs.sent === 0 && attrs.dropped_already_told === 1 && attrs.mount === "raft", show(attrs));
+    must(w.r.sends.length === 0, show(w.r.sends));
   } finally { w.host.dispose(); }
 });
 

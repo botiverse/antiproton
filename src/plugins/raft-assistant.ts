@@ -10,7 +10,8 @@
  * its input; it starts from nothing, reads what it needs, calls the notify tool or nothing, and is erased. The main
  * conversation is the owner's chat with the assistant and never sees a check. Each wake is a `raft.assistant_wake`
  * trace row and a per-day count (`COUNTS_KEY`): `skipped_empty`, `skipped_filtered`, `invoked`, `unreadable` (every
- * conversation to look at failed to read twice), `paused`, `night_deferred` or `failed`.
+ * conversation to look at failed to read twice), `inbox_lagging` (the read did not yet show the change the doorbell
+ * announced, `INBOX_LAG_FOLLOW_UPS_MS`), `paused`, `night_deferred` or `failed`.
  *
  * A check never summarizes as if it read what it did not. The wake reads each conversation it hands the model first,
  * once more on a failure; what still fails is left out of the model's input, is not recorded as looked at, is named
@@ -107,6 +108,31 @@ export const CHECK_KEY = "check";
  * then 15 minutes, and after that only at the next doorbell or brief.
  */
 export const RETRY_BACKOFF_MS: readonly number[] = [2 * 60_000, 5 * 60_000, 15 * 60_000];
+/**
+ * How soon a doorbell's check reads the inbox again when the read does not show the change the doorbell announced, by
+ * how many reads in a row have not. Raft rings from Postgres, but serves the owner inbox from a materialized view that
+ * lags it by an amount not yet measured (put at 7 s to 5 min; 6 s on staging, 2026-10-20), so a read made at once can be older than the doorbell. The
+ * first three are the retries for that lag, and the one constant to tune once it is measured.
+ */
+export const INBOX_LAG_RETRY_MS: readonly number[] = [5_000, 20_000, 60_000];
+/**
+ * Every read again a change waits for, in order: the lag retries, then the could-not-read backoff. Raft rings again only
+ * on new activity, so without these an announced change a stale read missed would wait for the morning brief. After the
+ * last, the check gives up on it (`inbox_lagging_gave_up`) and decides on what it read.
+ */
+export const INBOX_LAG_FOLLOW_UPS_MS: readonly number[] = [...INBOX_LAG_RETRY_MS, ...RETRY_BACKOFF_MS];
+/**
+ * How much earlier than the doorbell's `first_change_at` a row's `latestAt` may be and still show the change: the
+ * doorbell row is written in the change's own transaction, a few ms after the message's `created_at`, and the two
+ * times come from different clocks.
+ */
+export const INBOX_LAG_SLACK_MS = 2_000;
+
+/** Whether an inbox read shows the change a doorbell announced at `changeAt`: some row's activity is at least that recent. */
+export function inboxCaughtUp(items: readonly Pick<InboxItem, "latestAt">[], changeAt: string): boolean {
+  const from = Date.parse(changeAt) - INBOX_LAG_SLACK_MS;
+  return items.some((i) => i.latestAt !== null && Date.parse(i.latestAt) >= from);
+}
 /** Wakes by owner-local day, trigger and outcome, the last `COUNT_DAYS` days: wake-ups against model-invoked runs. */
 export const COUNTS_KEY = "counts";
 
@@ -132,6 +158,13 @@ export interface AssistantOwner {
   doorbellAt: number | null;
   /** When a doorbell was last checked. What is new is decided per conversation (`REVIEWED_KEY`), never by this. */
   lastCheckAt: number | null;
+  /**
+   * The change a doorbell announced that no inbox read has shown yet: the earliest such doorbell's `first_change_at`
+   * (`doorbellOf`), or null. While it is set a doorbell's check does not decide on what it read (`inboxCaughtUp`).
+   */
+  changeAt: string | null;
+  /** How many reads in a row have not shown `changeAt`: the index into `INBOX_LAG_FOLLOW_UPS_MS`. */
+  lagReads: number;
   /** The owner-local day (YYYY-MM-DD) of the last brief turn, so one day never gets two. */
   lastBrief: string | null;
   /** The day whose brief was sent: `brief: true` counts only once, on the day its turn was posted. */
@@ -154,6 +187,8 @@ function ownerOf(raw: unknown): AssistantOwner | null {
     userId: o.userId, timezone: validZone(o.timezone), statedTimezone: validZone(o.statedTimezone), serverId: str(o.serverId),
     pausedAt: typeof o.pausedAt === "number" ? o.pausedAt : null, dmTarget: str(o.dmTarget), learnedDm: str(o.learnedDm), lastBrief: str(o.lastBrief),
     doorbellAt: typeof o.doorbellAt === "number" ? o.doorbellAt : null, lastCheckAt: typeof o.lastCheckAt === "number" ? o.lastCheckAt : null,
+    changeAt: str(o.changeAt) !== null && Number.isFinite(Date.parse(o.changeAt as string)) ? o.changeAt as string : null,
+    lagReads: typeof o.lagReads === "number" && o.lagReads >= 0 ? o.lagReads : 0,
     briefSent: str(o.briefSent), askedTimezone: o.askedTimezone === true,
   };
 }
@@ -192,7 +227,8 @@ export async function keepOwnerFromContext(ctx: PluginContext, context: OwnerCon
   const owner: AssistantOwner = {
     userId: of.userId, timezone: validZone(of.timezone ?? null), statedTimezone: same?.statedTimezone ?? null,
     serverId: context.server.id, pausedAt: null,
-    dmTarget: dm, learnedDm: same?.learnedDm ?? null, doorbellAt: same?.doorbellAt ?? null, lastCheckAt: same?.lastCheckAt ?? null, lastBrief: same?.lastBrief ?? null, briefSent: same?.briefSent ?? null, askedTimezone: same?.askedTimezone ?? false,
+    dmTarget: dm, learnedDm: same?.learnedDm ?? null, doorbellAt: same?.doorbellAt ?? null, lastCheckAt: same?.lastCheckAt ?? null,
+    changeAt: same?.changeAt ?? null, lagReads: same?.lagReads ?? 0, lastBrief: same?.lastBrief ?? null, briefSent: same?.briefSent ?? null, askedTimezone: same?.askedTimezone ?? false,
   };
   await saveOwner(ctx, owner);
   return owner;
@@ -458,6 +494,34 @@ function refusal(message: string): Error {
  * is recorded as said only once Raft took the message, so a send that failed or was held repeats nothing it did not say.
  */
 export async function notifyOwner(args: unknown, ctx: PluginContext, deps: NotifyDeps): Promise<Json> {
+  const out = await notifyOnce(args, ctx, deps);
+  ctx.trace?.({ kind: "raft.assistant_notify", status: String(out.state), verdict: "ok", attrs: notifyAttrs(args, out) });
+  return out as unknown as Json;
+}
+
+/** Why a notify call dropped an item, as the trace counts it: the category, never the item, its reference or a rule's id. */
+function dropCategory(why: string): string {
+  if (why === "already told") return "already_told";
+  if (why.startsWith("rule ")) return "rule";
+  if (why === "decisions go in the morning brief") return "decisions_in_brief";
+  if (why === "not in a conversation this check was given") return "not_confirmed";
+  return "other";
+}
+
+/**
+ * What a notify call that returned did, for its trace row (`raft.assistant_notify`, on the call's span, so it joins
+ * the call's `tool.call` row): its state, how many items it was given and sent, and how many it dropped by category.
+ * A deliberate "nothing to send" is then told apart from a send that never happened. Counts only.
+ */
+export function notifyAttrs(args: unknown, out: Record<string, unknown>): Record<string, number | string> {
+  const given = args && typeof args === "object" && Array.isArray((args as { items?: unknown }).items) ? (args as { items: unknown[] }).items.length : 0;
+  const dropped: Record<string, number> = {};
+  const why = out.dropped && typeof out.dropped === "object" ? Object.values(out.dropped as Record<string, unknown>) : [];
+  for (const w of why) { const c = `dropped_${dropCategory(String(w))}`; dropped[c] = (dropped[c] ?? 0) + 1; }
+  return { notifyState: String(out.state), given, sent: out.state === "sent" && typeof out.items === "number" ? out.items : 0, dropped: why.length, ...dropped };
+}
+
+async function notifyOnce(args: unknown, ctx: PluginContext, deps: NotifyDeps): Promise<Record<string, unknown>> {
   const now = (deps.now ?? Date.now)();
   let owner = await loadOwner(ctx);
   if (!owner) throw refusal(`${NOTIFY_TOOL}: this agent is not anyone's assistant now, so there is nobody to tell`);
@@ -619,11 +683,19 @@ export function isDoorbellTarget(t: unknown): boolean {
   return typeof o.target === "string" && o.target.startsWith("agent-event:") && o.latestSenderName === SYSTEM_ASSISTANT_APP;
 }
 
-/** A doorbell for this mount's assistant, kept for the wake the push asks for. False when this is no one's assistant. */
-export async function noteDoorbell(ctx: PluginContext, now = Date.now()): Promise<boolean> {
+/**
+ * A doorbell for this mount's assistant, kept for the wake the push asks for. False when this is no one's assistant.
+ * `firstChangeAt` is the doorbell's `first_change_at` when it could be read: the change the wake must see in the inbox
+ * before deciding. One still waiting for an earlier doorbell's change keeps the earlier, which no read has shown yet;
+ * `last_change_at` is not used, being when Raft sent the doorbell rather than when anything changed.
+ */
+export async function noteDoorbell(ctx: PluginContext, now = Date.now(), firstChangeAt: string | null = null): Promise<boolean> {
   const owner = await loadOwner(ctx);
   if (!owner) return false;
-  if (owner.doorbellAt === null) await saveOwner(ctx, { ...owner, doorbellAt: now });
+  const changeAt = owner.changeAt === null || (firstChangeAt !== null && Date.parse(firstChangeAt) < Date.parse(owner.changeAt)) ? firstChangeAt ?? owner.changeAt : owner.changeAt;
+  if (owner.doorbellAt === null || changeAt !== owner.changeAt) {
+    await saveOwner(ctx, { ...owner, doorbellAt: owner.doorbellAt ?? now, changeAt, lagReads: owner.changeAt === null ? 0 : owner.lagReads });
+  }
   return true;
 }
 
@@ -693,7 +765,7 @@ export async function prefilter(
 
 const REVIEWED_MAX = 500;
 const COUNT_DAYS = 14;
-export type WakeOutcome = "skipped_empty" | "skipped_filtered" | "invoked" | "unreadable" | "paused" | "night_deferred" | "failed";
+export type WakeOutcome = "skipped_empty" | "skipped_filtered" | "invoked" | "unreadable" | "inbox_lagging" | "paused" | "night_deferred" | "failed";
 
 /** A conversation no read of which succeeded: how many wakes in a row tried, and whether the owner was told so. */
 /**
@@ -760,7 +832,7 @@ export function confirmRef(i: Item, rows: readonly CheckRow[]): Item | null {
 }
 
 /** One wake's outcome: a trace row, a log line and the day's count. Counts only, never content. */
-async function record(ctx: PluginContext, day: string, trigger: "doorbell" | "brief", outcome: WakeOutcome, attrs: Record<string, number | string> = {}) {
+async function record(ctx: PluginContext, day: string, trigger: "doorbell" | "brief", outcome: WakeOutcome, attrs: Record<string, number | string | boolean> = {}) {
   ctx.trace?.({ kind: "raft.assistant_wake", status: outcome, verdict: outcome === "failed" ? "failed" : "ok", attrs: { trigger, ...attrs } });
   logEvent("raft.assistant_wake", { tenantId: ctx.caller.tenantId, agentId: ctx.caller.agentId, mount: ctx.alias, trigger, outcome, ...attrs });
   const raw = await ctx.db.get(ASSISTANT_STORE, COUNTS_KEY);
@@ -862,7 +934,8 @@ export async function assistantWake(ctx: PluginContext, deps: WakeDeps): Promise
     await record(ctx, day, trigger, "night_deferred");
     return { wakeAt: next };
   }
-  if (trigger === "brief") await saveOwner(ctx, owner = { ...owner, lastBrief: day });
+  // The brief reads everything still unread, whatever was looked at, so a change still awaited is the brief's now.
+  if (trigger === "brief") await saveOwner(ctx, owner = { ...owner, lastBrief: day, changeAt: null, lagReads: 0 });
   const read = async (filter: "unread" | "all") => {
     const out = await deps.inbox(ctx, { filter, limit: INBOX_LIMIT });
     if (!out.ok) {
@@ -936,21 +1009,44 @@ export async function assistantWake(ctx: PluginContext, deps: WakeDeps): Promise
   try {
     if (trigger === "doorbell") {
       const items = await read("unread");
+      // A doorbell that said when its change happened: a read that shows nothing that recent is older than the change
+      // (the inbox lags the doorbell), so nothing is decided on it — no model call, nothing recorded as looked at, else
+      // its old activity would be judged seen and the change never looked at — and the inbox is read again shortly.
+      // Past the last read again, what was read is decided on, still without recording it as looked at. A change the
+      // owner has already read is in no unread read however long one waits, so when the unread read does not show it
+      // the read of every conversation decides; the candidates still come from the unread read alone.
+      let lag: Record<string, number | string | boolean> = {};
+      if (owner.changeAt !== null) {
+        const lagRetry = owner.lagReads;
+        const via = inboxCaughtUp(items, owner.changeAt) ? "unread" : inboxCaughtUp(await read("all"), owner.changeAt) ? "all" : null;
+        const caughtUp = via !== null;
+        const delay = caughtUp ? undefined : INBOX_LAG_FOLLOW_UPS_MS[lagRetry];
+        if (delay !== undefined) {
+          const wakeAt = Math.min(now + delay, next);
+          await saveOwner(ctx, { ...owner, lagReads: lagRetry + 1, doorbellAt: wakeAt < next ? now : null });
+          await record(ctx, day, trigger, "inbox_lagging", { conversations: items.length, inbox_lagging: true, lagRetry, caught_up: false });
+          return { wakeAt };
+        }
+        lag = { lagRetry, caught_up: caughtUp, ...(via ? { caught_up_via: via } : { inbox_lagging: true, inbox_lagging_gave_up: true }) };
+        await saveOwner(ctx, owner = { ...owner, changeAt: null, lagReads: 0 });
+      }
       const reviewed = reviewedOf(await ctx.db.get(ASSISTANT_STORE, REVIEWED_KEY));
       const f = await prefilter(items, { rules, reviewed, told });
       const { rows, failed } = await probe(f.candidates);
       // What this check looked at is not new to the next one, whether or not the model is asked; what it could not
-      // read was not looked at.
-      const merged = { ...reviewed };
-      for (const i of items) if (i.latestAt && !failed.includes(i)) merged[i.channelId] = i.latestAt;
-      const bounded = Object.fromEntries(Object.entries(merged).sort(([, a], [, b]) => Date.parse(b) - Date.parse(a)).slice(0, REVIEWED_MAX));
-      await ctx.db.put(ASSISTANT_STORE, bounded as unknown as Json, REVIEWED_KEY);
+      // read was not looked at, and nor was a read that never showed the change it was rung for.
+      if (lag.inbox_lagging_gave_up !== true) {
+        const merged = { ...reviewed };
+        for (const i of items) if (i.latestAt && !failed.includes(i)) merged[i.channelId] = i.latestAt;
+        const bounded = Object.fromEntries(Object.entries(merged).sort(([, a], [, b]) => Date.parse(b) - Date.parse(a)).slice(0, REVIEWED_MAX));
+        await ctx.db.put(ASSISTANT_STORE, bounded as unknown as Json, REVIEWED_KEY);
+      }
       const kept = await keepUnreadable(failed, rows);
       const wakeAt = again(kept, failed);
       // The short wake comes back as a doorbell, so it reads again.
       await saveOwner(ctx, { ...owner, lastCheckAt: now, doorbellAt: wakeAt < next ? now : null });
       const candidates = f.candidates.filter((i) => !failed.includes(i));
-      const counts = { conversations: items.length, candidates: candidates.length, muted: f.muted, told: f.told, seen: f.seen, unreadable: failed.length };
+      const counts = { conversations: items.length, candidates: candidates.length, muted: f.muted, told: f.told, seen: f.seen, unreadable: failed.length, ...lag };
       if (!candidates.length) {
         if (failed.length) {
           await record(ctx, day, trigger, "unreadable", { ...counts, said: await sayUnreadable(failed, kept) });
