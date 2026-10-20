@@ -25,7 +25,7 @@ import { internalHost } from "./http.ts";
 import {
   ASSISTANT_OWN_TOOLS, ASSISTANT_STORE, DEFERRED_KEY, NOTIFY_TOOL, OWNER_KEY, PREFERENCES_TOOL, REMINDED_STORE, RULES_KEY,
   assistantWake, assistantWakeInstruction, doorbellOf, isDoorbellTarget, keepOwnerFromContext, learnDm, loadOwner, noteDoorbell,
-  notifyOwner, pauseOn, preferences, type AssistantOwner, type OwnerSend,
+  notifyOwner, pauseOn, preferences, type AssistantOwner, type OwnerContext, type OwnerSend,
 } from "./raft-assistant.ts";
 import { callMcp, isMcpTool, keptMcpOf, leftOut, listMcp, mcpClock, mcpLines, MCP_CALL_TIMEOUT_MS, MCP_CAPABILITY, MCP_KEY, MCP_PREFIX } from "./raft-mcp.ts";
 import { modelToolName } from "../runtime/pi-tools.ts";
@@ -3141,7 +3141,7 @@ export function createRaftPlugin(deps: {
 }
 
 /** Kept by the listing; a failure to keep it must not fail the listing, and leaves the last record as it was. */
-async function keepOwner(ctx: PluginContext, context: { agent?: unknown; server?: unknown }): Promise<void> {
+async function keepOwner(ctx: PluginContext, context: OwnerContext): Promise<void> {
   try { await keepOwnerFromContext(ctx, context); }
   catch (e) { console.warn(`raft assistant owner could not be kept for mount ${ctx.alias}: ${String((e as Error)?.message ?? e)}`); }
 }

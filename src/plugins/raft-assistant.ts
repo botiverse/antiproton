@@ -31,6 +31,7 @@
 import { createHash } from "node:crypto";
 import { logEvent } from "../core/log.ts";
 import type { Json, MountRecord } from "../core/types.ts";
+import type { RaftAssistantOf } from "@botiverse/raft-sdk";
 import { modelToolName } from "../runtime/pi-tools.ts";
 import type { PluginContext, PluginNext, ToolSchema } from "./types.ts";
 
@@ -63,6 +64,12 @@ export const CHECK_TOOLS: readonly string[] = [OWNER_INBOX, OWNER_MESSAGES, NOTI
 export function assistantMountOf(records: ReadonlyArray<Pick<MountRecord, "alias" | "plugin" | "toolSnapshot">>): string | null {
   const m = records.find((r) => r.plugin === "raft" && !!r.toolSnapshot?.tools.some((t) => t.name === OWNER_INBOX));
   return m ? m.alias : null;
+}
+
+/** Whether a tool address (`alias.tool`) is one of the owner reads, whose results are never stored (cf/src/runtime.ts). */
+export function isOwnerReadAddress(address: string): boolean {
+  const tool = address.slice(address.indexOf(".") + 1);
+  return address.includes(".") && (tool === OWNER_INBOX || tool === OWNER_MESSAGES);
 }
 
 /** The tools an assistant's model is offered out of the mounts' (`address` is `alias.tool`): `CHAT_TOOLS` or `CHECK_TOOLS`. */
@@ -146,31 +153,35 @@ export function zoneOf(owner: Pick<AssistantOwner, "timezone" | "statedTimezone"
  * none drops it, and with it the brief, while the rules and what was already said stay for an owner who comes back.
  * Called by the listing and by every check a paused assistant makes.
  */
-export async function keepOwnerFromContext(ctx: PluginContext, context: { agent?: unknown; server?: unknown }): Promise<AssistantOwner | null> {
-  const agent = context.agent && typeof context.agent === "object" ? context.agent as Record<string, unknown> : {};
-  const of = agent.assistantOf && typeof agent.assistantOf === "object" ? agent.assistantOf as Record<string, unknown> : null;
-  if (!of || typeof of.userId !== "string" || !of.userId) {
+export async function keepOwnerFromContext(ctx: PluginContext, context: OwnerContext): Promise<AssistantOwner | null> {
+  const of = context.agent.assistantOf ?? null;
+  if (!of || !of.userId) {
     // Read first: nearly every agent is no one's assistant, and its every listing need not be a write.
     if (await ctx.db.get(ASSISTANT_STORE, OWNER_KEY) !== undefined) await ctx.db.delete(ASSISTANT_STORE, OWNER_KEY);
     return null;
   }
   const kept = await loadOwner(ctx);
-  const server = context.server && typeof context.server === "object" ? context.server as Record<string, unknown> : {};
   // A new owner starts over: nothing learnt about the last one (their DM, their brief) is theirs.
   const same = kept?.userId === of.userId ? kept : null;
-  // Raft's DM target when it gives one (null while the DM does not exist yet, and absent on older Servers): read
-  // defensively, as the SDK passes the field through untyped.
-  const dm = typeof of.dmTarget === "string" && DM_TARGET.test(of.dmTarget.trim()) ? of.dmTarget.trim() : null;
+  // Raft's DM target and zone (SDK 0.25.0 types both, null until known and on older Servers). Each is still checked
+  // here: the contract says a string, not a zone `Intl` knows or a DM target this tool can send to.
+  const dm = of.dmTarget && DM_TARGET.test(of.dmTarget.trim()) ? of.dmTarget.trim() : null;
   const owner: AssistantOwner = {
-    userId: of.userId, timezone: validZone(of.timezone), statedTimezone: same?.statedTimezone ?? null,
-    serverId: typeof server.id === "string" ? server.id : same?.serverId ?? null, pausedAt: null,
+    userId: of.userId, timezone: validZone(of.timezone ?? null), statedTimezone: same?.statedTimezone ?? null,
+    serverId: context.server.id, pausedAt: null,
     dmTarget: dm ?? same?.dmTarget ?? null, doorbellAt: same?.doorbellAt ?? null, lastCheckAt: same?.lastCheckAt ?? null, lastBrief: same?.lastBrief ?? null, briefSent: same?.briefSent ?? null, askedTimezone: same?.askedTimezone ?? false,
   };
   await saveOwner(ctx, owner);
   return owner;
 }
 
-/** A DM as a send target, without a thread's suffix. */
+/** The part of the credential context (`routes.agent.context`) the owner is kept from. */
+export interface OwnerContext {
+  agent: { assistantOf?: (Pick<RaftAssistantOf, "userId"> & Partial<Pick<RaftAssistantOf, "timezone" | "dmTarget">>) | null };
+  server: { id: string };
+}
+
+/** A DM as a send target, without a thread's suffix (Raft's own is `dm:@owner~human`). */
 export const DM_TARGET = /^dm:@[^:\s]+$/;
 
 /** Raft's code for "this agent may not act as an assistant now" (flag off, no longer an assistant, owner left). */

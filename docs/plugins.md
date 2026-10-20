@@ -869,7 +869,9 @@ pauses the checks, the brief and the notify tool until Raft's context names the
 owner again. The chat is offered the owner DM, attachments, the reads and the
 preferences (plus `resume` and the parked-result reader), with no run_js, jobs
 or subagents, under a prompt of its own (`assistantSystemPrompt`,
-`src/runtime/pi-prompt.ts`). An assistant runs on pi085 only: moving it to pd
+`src/runtime/pi-prompt.ts`). What an owner read returns is never parked: a result over the line is cut with a note
+to page, whatever reader is mounted, and a short session's erase also deletes anything its calls parked. Reads of an
+assistant's conversation by an operator or the console need a reason and are audited (docs/runbook.md). An assistant runs on pi085 only: moving it to pd
 (`migrateEngine`) is refused with the reason, and one already there has each
 wake counted `failed` with `reason: engine_pd_unsupported` and a warning, since
 pd cannot hold a short session. `test/raft-assistant-mode.ts` holds the rules,

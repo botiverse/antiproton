@@ -1462,6 +1462,10 @@ read from the agent's storage with SELECTs only: nothing is written, no table is
 nothing is sealed (`test/eval-seed-object.ts` compares every table and row before and after, and the
 answer with `/admin/transcript`'s for the same agent).
 
+Each read of `…/transcript` and `…/model-input` is audited (`admin_read_audit`, docs/runbook.md): give the reason with
+`reason=` or the `X-Read-Reason` header, recorded with the provider credential's id. A personal assistant's are refused,
+`403` with code `assistant_private`: what it read of its owner's Raft is the owner's alone.
+
 - `session` — the conversation: `main` for the agent's first main conversation, `main.<n>` for the n-th
   [fresh one](#fresh-context), current or ended (an ended one is read from where the fresh context kept
   it). Without it, the current main conversation. Only main conversations: anything else, a task id

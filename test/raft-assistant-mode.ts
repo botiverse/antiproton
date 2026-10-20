@@ -178,10 +178,14 @@ await check("the listing keeps the owner with Raft's zone and DM; an invalid or 
   const a = await assistant(raft({ zone: "Europe/Berlin", dm: "dm:@ada" }));
   const kept = a.read(ASSISTANT_STORE, OWNER_KEY);
   must(kept.userId === OWNER && kept.timezone === "Europe/Berlin" && kept.dmTarget === "dm:@ada" && kept.serverId === "server-1" && kept.pausedAt === null, show(kept));
-  for (const zone of [undefined, null, "Mars/Olympus", 7]) {
+  for (const zone of [undefined, null, "Mars/Olympus"]) {
     const b = await assistant(raft({ zone }));
     must(b.read(ASSISTANT_STORE, OWNER_KEY).timezone === null, `${show(zone)}: ${show(b.read(ASSISTANT_STORE, OWNER_KEY))}`);
   }
+  // Not a string at all fails the SDK's contract (0.25.0 types the field), and with it the whole listing, as any field does.
+  raft({ zone: 7 });
+  const typed = await raftPlugin.snapshotTools!(mount().ctx).then(() => null, (e) => e as Error);
+  must(typed && /did not match the Raft SDK's contract/.test(typed.message), `a numeric zone: ${typed?.message}`);
   for (const dm of [undefined, null, "#general", "dm:@ada:abcdef12"]) {
     const b = await assistant(raft({ dm }));
     must(b.read(ASSISTANT_STORE, OWNER_KEY).dmTarget === null, `dm ${show(dm)}: ${show(b.read(ASSISTANT_STORE, OWNER_KEY))}`);
@@ -452,13 +456,20 @@ function afternoonZone(): string {
   return k === 0 ? "UTC" : `Etc/GMT${k > 0 ? "-" : "+"}${Math.abs(k)}`;
 }
 
-async function runtimeWith(owner: boolean) {
+async function runtimeWith(owner: boolean, answer: (c: Ctx) => ModelResponse = () => say("noted")) {
   const host = sqliteHost();
   const sent: string[] = [], answered = new Set<string>(), calls: Ctx[] = [];
   const standIn = standInLoader();
+  /** The object storage parked results go to: every put and delete recorded. */
+  const r2 = { puts: [] as string[], deletes: [] as string[] };
+  const bucket = {
+    put: async (key: string) => { r2.puts.push(key); return {}; },
+    delete: async (keys: string | string[]) => { r2.deletes.push(...(Array.isArray(keys) ? keys : [keys])); },
+    get: async () => null, head: async () => null, list: async () => ({ objects: [], truncated: false }),
+  };
   const rt = new AgentRuntime({
     ctx: { storage: { sql: host.sql, transactionSync: host.transactionSync } },
-    bucket: {} as never, bucketName: "b", models: { resolve: () => null },
+    bucket: bucket as never, bucketName: "b", models: { resolve: () => null },
     autoRelease: false, subagentsDefault: true, loader: standIn.loader, makeToolBinding: standIn.makeToolBinding,
     operatorModel: operatorModelOf({ DEEPSEEK_BASE_URL: "https://model.example/v1", DEEPSEEK_API_KEY: "operator-key", HARNESS_MODEL: "m1" }),
     offloadModel: async (job: { commandId: string }) => { sent.push(job.commandId); },
@@ -483,8 +494,9 @@ async function runtimeWith(owner: boolean) {
         answered.add(id);
         const job = await rt.takeJob("t", "a", id) as { model: { api: string; provider: string; id: string }; context: Ctx } | null;
         if (!job) continue;
-        calls.push(JSON.parse(JSON.stringify(job.context)));
-        await rt.deliverAnswer("t", "a", id, fromResponse(say("noted"), { api: job.model.api, provider: job.model.provider, id: job.model.id }, id), undefined);
+        const c = JSON.parse(JSON.stringify(job.context)) as Ctx;
+        calls.push(c);
+        await rt.deliverAnswer("t", "a", id, fromResponse(answer(c), { api: job.model.api, provider: job.model.provider, id: job.model.id }, id), undefined);
       }
       if (pending.length) continue;
       if (out?.wakeInMs === null || out?.wakeInMs === undefined || out.wakeInMs > 1000) return;
@@ -501,7 +513,7 @@ async function runtimeWith(owner: boolean) {
   const sessions = () => (host.sql.exec("SELECT session FROM pi_sessions").toArray() as Array<{ session: string }>).map((x) => x.session);
   const wakeRows = () => (host.sql.exec("SELECT status, attrs FROM trace_outbox WHERE kind = 'raft.assistant_wake' ORDER BY seq").toArray() as any[])
     .map((x) => ({ status: String(x.status), attrs: JSON.parse(String(x.attrs)) }));
-  return { rt, host, r, calls, sent, turn, drive, db, doorbell, sessions, wakeRows, zone };
+  return { rt, host, r, calls, sent, turn, drive, db, doorbell, sessions, wakeRows, zone, r2 };
 }
 
 await check("an assistant's chat is offered its owner DM, the reads and its preferences, no notify, run_js, jobs or subagents, under its own prompt", async () => {
@@ -566,6 +578,45 @@ await check("a doorbell with candidates runs in a fresh short session: the check
     const tables = (w.host.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'pi_s_iso_%'").toArray() as any[]).map((x) => x.name);
     must(tables.length === 0, `the short session's transcript outlived it: ${show(tables)}`);
     must(show(w.wakeRows().map((x) => x.status)) === show(["invoked"]), show(w.wakeRows()));
+  } finally { w.host.dispose(); }
+});
+
+await check("an owner read too large to hand back is cut and never parked, though a reader is mounted", async () => {
+  const CH = "c0ffee00-0000-4000-8000-000000000001";
+  const big = Array.from({ length: 40 }, (_, i) => ({ seq: i + 1, id: `0000000${i % 10}-aaaa-4bbb-8ccc-dddddddddddd`, timestamp: "2026-10-20T09:00:00.000Z",
+    sender_type: "human", sender_name: "bob", channel_type: "channel", channel_name: "general", content: `OWNER-PRIVATE ${"x".repeat(300)} ${i}` }));
+  let step = 0;
+  const w = await runtimeWith(true, () => step++ === 0
+    ? { text: "", finishReason: "tool_calls", truncated: false, usage, toolCalls: [{ id: "r1", name: "raft__assistant_owner_messages", arguments: { channelId: CH, limit: 40 } }] } as ModelResponse
+    : say("noted"));
+  try {
+    const inner = globalThis.fetch;
+    globalThis.fetch = (async (url: any, init?: any) => new URL(String(url)).pathname === "/internal/agent-api/assistant/owner-messages"
+      ? json(200, { owner: { userId: OWNER }, channelId: CH, messages: big, hasMore: true, hasOlder: true, hasNewer: false })
+      : inner(url, init)) as typeof fetch;
+    await w.turn("what is happening in #general?");
+    const result = JSON.stringify(w.calls.at(-1)!.messages.filter((m: any) => m.role === "toolResult"));
+    must(/never kept outside this conversation/.test(result) && !/"ref"/.test(result), `the tool result: ${result.slice(0, 600)}`);
+    must(w.r2.puts.length === 0, `parked: ${show(w.r2.puts)}`);
+    const refs = w.host.sql.exec("SELECT COUNT(*) AS n FROM operations WHERE result_ref IS NOT NULL").toArray()[0].n;
+    must(refs === 0, `operations with a stored result: ${refs}`);
+  } finally { w.host.dispose(); }
+});
+
+await check("a short session's erase deletes anything its calls parked, and the references to it (belt and braces)", async () => {
+  const w = await runtimeWith(true);
+  try {
+    w.r.unread = [conv(1, { latestAt: new Date(Date.now() - 60_000).toISOString() })];
+    w.doorbell();
+    await w.rt.step("t", "a");
+    const iso = w.sessions().find((s) => s.startsWith("iso_"))!;
+    must(iso, `control: a short session: ${show(w.sessions())}`);
+    // As a parked result of one of its calls would leave it.
+    w.host.sql.exec("INSERT INTO operations (operation_id, tenant_id, agent_id, task_id, mount_alias, tool, tool_version, status, result_ref, created_at, updated_at) " +
+      "VALUES ('op_iso_1', 't', 'a', ?, 'raft', 'assistant_owner_messages', '1.0.0', 'succeeded', 'r2://b/t/t/a/op_iso_1.json', 1, 1)", iso);
+    await w.drive();
+    must(show(w.r2.deletes) === show(["t/t/a/op_iso_1.json"]), `deleted: ${show(w.r2.deletes)}`);
+    must(w.host.sql.exec("SELECT result_ref FROM operations WHERE operation_id = 'op_iso_1'").toArray()[0].result_ref === null, "the reference outlived the object");
   } finally { w.host.dispose(); }
 });
 

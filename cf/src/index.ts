@@ -71,6 +71,7 @@ import {
   isAdmin,
 } from "./auth.ts";
 import { adminTranscript } from "./admin-transcript.ts";
+import { auditRead, d1ReadAudit, readReason } from "./read-audit.ts";
 import { readFrictionWindow, type FrictionLimits, type FrictionWindow } from "./friction-read.ts";
 import { dailyCron, frictionDaily, scanDay, tenantScope, writeReport, type FrictionBucket, type WindowReader } from "./friction-scan.ts";
 import { refuseSecret } from "./secret-shape.ts";
@@ -2185,8 +2186,16 @@ export class AgentDO extends DurableObject<Env> {
     }));
   }
 
+  /** Whether this object's agent is someone's personal assistant, whose conversation is its owner's alone (cf/src/read-audit.ts). */
+  async isAssistantAgent(tenantId: string, agentId: string): Promise<boolean> {
+    if (!this.#isAgent(tenantId, agentId)) return false;
+    return this.runtime().isAssistant(tenantId, agentId);
+  }
+
   async modelInput(tenantId: string, agentId: string, session: string | null, call: number | null) {
     if (!this.#isAgent(tenantId, agentId)) return null;
+    // An evaluation's export is not for a personal assistant: what it read of its owner's Raft is the owner's alone.
+    if (await this.runtime().isAssistant(tenantId, agentId)) return { assistantPrivate: true as const };
     return this.runtime().modelInput(tenantId, agentId, session, call);
   }
 
@@ -2202,8 +2211,9 @@ export class AgentDO extends DurableObject<Env> {
    * mounts. Redacted here, before it leaves the object, with the agent's own sealed values scrubbed by exact match:
    * those values are opened in this object and never returned. Refused (503) when they cannot be opened.
    */
-  async evalTranscript(tenantId: string, agentId: string, session: string | null, offset: number, limit: number): Promise<EvalTranscript | null | { unavailable: string }> {
+  async evalTranscript(tenantId: string, agentId: string, session: string | null, offset: number, limit: number): Promise<EvalTranscript | null | { unavailable: string } | { assistantPrivate: true }> {
     if (!this.#isAgent(tenantId, agentId)) return null;
+    if (await this.runtime().isAssistant(tenantId, agentId)) return { assistantPrivate: true };
     const secrets = await agentSecretValues(this.sql, tenantId, agentId, this.env);
     if (!secrets.ok) return { unavailable: secrets.message };
     return evalTranscript(this.sql, tenantId, agentId, session, offset, limit, credentialRedactor({ secrets: secrets.values }));
@@ -3499,7 +3509,7 @@ async function provision(request: Request, env: Env, url: URL): Promise<Response
   try {
     const res = await handleProvision(request.method, url.pathname.slice("/provision".length),
       // The token's hash names it in the operator's listing (cf/src/admin-provider-tokens.ts): what an audit line may say.
-      { idempotencyKey: request.headers.get("idempotency-key"), raftServerId: url.searchParams.get("raftServerId"), credentialId: hash },
+      { idempotencyKey: request.headers.get("idempotency-key"), raftServerId: url.searchParams.get("raftServerId"), credentialId: hash, readReason: readReason(request) },
       body, who, deps, url.searchParams, raw);
     return res ?? refuse(404, "not_found", `${request.method} ${url.pathname} is not part of raft-agent-provider.v1`);
   } catch (e) {
@@ -3609,6 +3619,7 @@ function provisionDeps(env: Env): ProvisionDeps {
       picker: d1TenantModelPicker(env.CONTROL_DB),
       enforcePicker: modelPickerEnforced(env),
     },
+    readAudit: d1ReadAudit(env.CONTROL_DB),
     ...(evalSeedRoutes(env) ? {
       seed: {
         write: (tenantId, agentId, f) => stub(tenantId, agentId).seedWrite(tenantId, agentId, f.path, f.mode, f.text),
@@ -4057,6 +4068,8 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
     if (prefix === null) return unaddressed(request, env, url);
     let name: string;
     let uiSelected: { who: string; home: string; agentId: string; tenantId: string } | null = null;
+    // Who an `/agent/*` read is made by, for its audit row (cf/src/read-audit.ts).
+    let agentReader: { tenantId: string; agentId: string; kind: string; label: string | null } | null = null;
     if (prefix === "conformance") name = "conformance-v2";
     else if (prefix === "bench") {
       // The benchmark runners' door, and only theirs (see programmaticAccess).
@@ -4133,8 +4146,18 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
       if (access === "not-found") {
         return Response.json({ error: `no such agent: ${agentId} (not this viewer's, or never created)` }, { status: 404 });
       }
+      agentReader = { tenantId, agentId, kind: v?.source === "automation" ? "automation" : "viewer", label: v?.source === "automation" ? null : v?.sub ?? v?.email ?? null };
     }
     const stub = env.AGENT.get(env.AGENT.idFromName(name));
+    // The `/agent/*` reads of what an agent was told or said are audited before they are made (cf/src/read-audit.ts).
+    if (agentReader && AUDITED_AGENT_READS.has(url.pathname)) {
+      const refused = await auditRead(d1ReadAudit(env.CONTROL_DB), {
+        route: url.pathname, tenantId: agentReader.tenantId, agentId: agentReader.agentId, session: url.searchParams.get("taskId"),
+        tokenKind: agentReader.kind, tokenLabel: agentReader.label, reason: readReason(request),
+        assistant: (await stub.isAssistantAgent(agentReader.tenantId, agentReader.agentId)) === true,
+      });
+      if (refused) return refused;
+    }
     try {
       switch (url.pathname) {
         case "/conformance/executor": return Response.json(await stub.runExecutorSpec());
@@ -4277,6 +4300,12 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
           const taskId = url.searchParams.get("taskId") || `t_${agentId}`;
           const v = await versionOf(request, stub, gate.tenantId, agentId, taskId);
           if (v.unchanged) return v.unchanged;
+          // Audited when it returns content (a 304 above returns none): cf/src/read-audit.ts.
+          const refused = await auditRead(d1ReadAudit(env.CONTROL_DB), {
+            route: "/ui/transcript", tenantId: gate.tenantId, agentId, session: taskId, tokenKind: "console", tokenLabel: who,
+            reason: readReason(request), assistant: (await stub.isAssistantAgent(gate.tenantId, agentId)) === true,
+          });
+          if (refused) return refused;
           const tail = url.searchParams.get("all") === "1" ? 0 : 120;
           const t = await stub.uiTranscript(gate.tenantId, agentId, taskId, tail);
           return html(
@@ -5044,7 +5073,7 @@ async function unaddressed(request: Request, env: Env, url: URL): Promise<Respon
         case "/admin/transcript":
           // Awaited, so a failure reaches this route's catch and its log instead of the platform's 1101.
           return await adminTranscript(request, env.AUTOMATION_TOKEN,
-            (t, a) => env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a))));
+            (t, a) => env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a))), d1ReadAudit(env.CONTROL_DB));
         case "/":
           // The demo is the point of this deployment; making people know to
           // type /ui is a papercut with no upside.
@@ -5056,6 +5085,9 @@ async function unaddressed(request: Request, env: Env, url: URL): Promise<Respon
       return failed(url, e);
     }
 }
+
+/** The `/agent/*` routes that return what an agent was told or said, so are audited (cf/src/read-audit.ts). */
+const AUDITED_AGENT_READS = new Set(["/agent/events", "/agent/state", "/agent/activity"]);
 
 /** An error's class, for a log line that must not carry its message: a name made of letters, or `unknown`. */
 export function errorClassOf(e: unknown): string {

@@ -54,7 +54,7 @@ import {
 import { credentialRedactor, agentSecretValues } from "./eval-read.ts";
 import { logicalMain, physicalSession } from "./fresh-context.ts";
 import { assistantSystemPrompt, profilePrompt, systemPrompt } from "../../src/runtime/pi-prompt.ts";
-import { assistantMountOf, assistantTools } from "../../src/plugins/raft-assistant.ts";
+import { assistantMountOf, assistantTools, isOwnerReadAddress } from "../../src/plugins/raft-assistant.ts";
 import { forgetIsolated, isIsolatedSession, isolatedSessions, newIsolatedSessionId, recordIsolated } from "../../src/runtime/isolated-session.ts";
 import { profileOf, profileSpec } from "../../src/runtime/agent-profile.ts";
 import {
@@ -494,6 +494,17 @@ export function tooLargeResult(
     : `${parked.readBack} { ref: "${parked.ref}", from: 0 }, which returns it in pages`;
   return { preview, bytes: body.length, ref: parked.ref,
     note: `${what}; all of it is stored: read it with ${call} (or fields/offset/limit for part of a list)` };
+}
+
+/**
+ * An owner read too large to hand back whole: the summary, and how to read less, since it is never stored. Not
+ * `tooLargeResult`'s "nothing could read it back": a reader may be mounted, and the reason is the owner's privacy.
+ */
+export function ownerReadTooLarge(value: unknown, body: string): Record<string, Json> {
+  return { preview: summarise(value), bytes: body.length,
+    note: `a summary of a ${body.length}-character result; the rest was discarded, not stored: what you read of your owner's ` +
+      "Raft is never kept outside this conversation. Ask for less: a smaller limit, the next page with offset (the inbox) or " +
+      "before/after (messages)" };
 }
 
 /**
@@ -2368,6 +2379,11 @@ export class AgentRuntime {
         const body = JSON.stringify(rest);
         const limit = limitForCall(call.tool, reader);
         if (body.length <= limit) return res;
+        // What a personal assistant reads of its owner's Raft is never stored outside its conversation with them: cut,
+        // never parked, whatever reader is mounted (src/plugins/raft-assistant.ts `isOwnerReadAddress`).
+        if (isOwnerReadAddress(call.tool)) {
+          return { status: "succeeded", operationId: res.operationId, result: withView(ownerReadTooLarge(rest, body), view) as Json };
+        }
         if (!readBack) {
           return {
             status: "succeeded",
@@ -4971,12 +4987,18 @@ export class AgentRuntime {
     return done;
   }
 
+  /** Whether this agent is someone's personal assistant (src/plugins/raft-assistant.ts), read from its mounts. */
+  async isAssistant(tenantId: string, agentId: string): Promise<boolean> {
+    await this.ready();
+    return assistantMountOf(await this.store.listMounts(tenantId, agentId)) !== null;
+  }
+
   /**
    * The short sessions plugins asked for (`PluginNext.isolated`) whose run has ended: erased whole, transcript and model
    * jobs, as an archived subagent is, so nothing a check read outlives it. One with work left (a run, a model call out)
    * is kept for the pass after it. pi085 only: pd never makes one.
    */
-  #eraseIsolated(tenantId: string, agentId: string) {
+  async #eraseIsolated(tenantId: string, agentId: string) {
     if (this.#isPd()) return;
     const sql = this.#deps.ctx.storage.sql;
     const rows = isolatedSessions(sql);
@@ -4985,6 +5007,13 @@ export class AgentRuntime {
     for (const r of rows) {
       if (busy.has(r.session)) continue;
       try {
+        // Anything a call of it parked, though an owner read never is (`ownerReadTooLarge`): the stored copies first,
+        // then their references, so a failed delete leaves the row that names what is still there.
+        const parked = (sql.exec("SELECT operation_id, result_ref FROM operations WHERE tenant_id = ? AND task_id = ? AND result_ref IS NOT NULL",
+          tenantId, r.session).toArray() as Array<{ operation_id: string; result_ref: string }>);
+        const keys = parked.map((p) => /^r2:\/\/[^/]+\/(.+)$/.exec(String(p.result_ref))?.[1]).filter((k): k is string => !!k);
+        if (keys.length) await this.#artifacts.delete(keys);
+        if (parked.length) sql.exec("UPDATE operations SET result_ref = NULL WHERE tenant_id = ? AND task_id = ? AND result_ref IS NOT NULL", tenantId, r.session);
         this.#evictAgent(tenantId, agentId, r.session);
         const t = piTables(r.session);
         for (const table of [t.entries, t.usage, t.values, t.list, t.meta]) sql.exec(`DROP TABLE IF EXISTS ${table}`);
@@ -5451,7 +5480,7 @@ export class AgentRuntime {
     await this.#cancelStraySubagents(tenantId, agentId);
     if (await this.#reportSubagents(tenantId, agentId) > 0) wakeInMs = 0;
     await this.#archiveSubagents(tenantId, agentId);
-    this.#eraseIsolated(tenantId, agentId);
+    await this.#eraseIsolated(tenantId, agentId);
     const retry = reportRetryMs(sql, { tenantId, agentId }, Date.now());
     if (retry !== null) wakeInMs = wakeInMs === null ? retry : Math.min(wakeInMs, retry);
     // A running subagent past its ceiling is cancelled by a pass; the pass comes back for the ceiling's moment.

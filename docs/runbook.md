@@ -33,7 +33,22 @@ To see what one agent is doing, read its conversation; a loop shows as the same 
 and again, at the end:
 
 ```
-curl -s -H "x-harness-token: $AUTOMATION_TOKEN" "$HOST/admin/transcript?tenantId=<tenantId>&agentId=<agentId>"
+curl -s -H "x-harness-token: $AUTOMATION_TOKEN" -H "X-Read-Reason: <why>" "$HOST/admin/transcript?tenantId=<tenantId>&agentId=<agentId>"
+```
+
+Every read of a conversation is audited in D1 (`admin_read_audit`, migration 0026, `cf/src/read-audit.ts`):
+`/admin/transcript`, the `/agent/*` reads (`/agent/state`, `/agent/events`, `/agent/activity`), the console's
+`/ui/transcript`, and the provisioning eval `transcript` and `model-input`. Each row says when, which route, which agent
+and conversation, what kind of credential read it and its label, and the reason given, never the content. Say why with
+`reason=` in the query or the `X-Read-Reason` header. For a personal assistant (an agent whose Raft account has an
+owner, `src/plugins/raft-assistant.ts`) the reason is required (400 `read_reason_required` without one), a read whose
+row cannot be written is refused (503 `read_audit_failed`), and its eval `transcript` and `model-input` are not
+exported at all (403 `assistant_private`). For any other agent the reason is recorded when given, and a row that
+cannot be written is logged and the read goes ahead.
+
+```
+SELECT datetime(at / 1000, 'unixepoch'), route, agent_id, session, token_kind, token_label, reason, outcome
+  FROM admin_read_audit WHERE tenant_id = '<tenantId>' ORDER BY at DESC LIMIT 50;
 ```
 
 Every stop, cancel or delete of a turn writes a `turn.stop` line to the Workers logs: `trigger` (`admin_cancel`,

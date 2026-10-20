@@ -17,6 +17,7 @@
  * body. Same key with any field different is 409, never a quiet update — Raft edits through PATCH (and the
  * model through PUT …/model), and a delayed POST retry must not overwrite an edit that landed after it (Tenny's race).
  */
+import { auditRead, auditRefused, type ReadAudit } from "../read-audit.ts";
 import { RECONNECT_REASON, type OAuthStatus } from "../github-refresh.ts";
 import type { Json } from "../../../src/core/types.ts";
 import { originProblem } from "../../../src/plugins/types.ts";
@@ -219,6 +220,8 @@ export interface ProvisionDeps {
    * than made without storing it.
    */
   plans?: Pick<TenantPlanStore, "set">;
+  /** Where the eval exports' reads are audited (cf/src/read-audit.ts). Absent: not recorded, and an assistant's are refused anyway. */
+  readAudit?: ReadAudit;
 }
 
 /** What the import route asks of the agent's object; each is one RPC (cf/src/index.ts AgentDO). */
@@ -493,7 +496,7 @@ async function stopTurnOf(stop: NonNullable<ProvisionAgentOps["stopTurn"]>, tena
 
 export async function handleProvision(
   method: string, path: string,
-  headers: { idempotencyKey: string | null; raftServerId: string | null; credentialId?: string | null }, body: unknown,
+  headers: { idempotencyKey: string | null; raftServerId: string | null; credentialId?: string | null; readReason?: string | null }, body: unknown,
   who: ProviderTokenIdentity, deps: ProvisionDeps, query: URLSearchParams = new URLSearchParams(),
   /** The body as sent, for the one route whose body is not JSON (`PUT …/seed`). */
   raw: Uint8Array | null = null,
@@ -742,7 +745,8 @@ export async function handleProvision(
     if (!found || found.status === "deleted") {
       return fail({ status: 404, code: "not_found", message: `no provisioned agent ${byRaft ? "made from Raft agent " : ""}${rest[0]}` });
     }
-    return evalSetup(method, rest.slice(1).join("/"), tenantId, found.agentId, query, raw, headers.credentialId ?? null, deps.seed);
+    return evalSetup(method, rest.slice(1).join("/"), tenantId, found.agentId, query, raw, headers.credentialId ?? null, deps.seed,
+      { audit: deps.readAudit ?? null, reason: headers.readReason ?? null });
   }
   const read = method === "GET" && rest.length >= 2 ? surfaceReadOf(rest.slice(1), "provider") : null;
   if (read && deps.surface) {
@@ -1581,7 +1585,18 @@ const EVAL_ROUTES = new Set(["seed", "seed/seal", "seed/manifest", "fresh-contex
 async function evalSetup(
   method: string, route: string, tenantId: string, agentId: string, query: URLSearchParams, raw: Uint8Array | null,
   credentialId: string | null, seed: SeedOps,
+  reads: { audit: ReadAudit | null; reason: string | null } = { audit: null, reason: null },
 ): Promise<Response | null> {
+  // The two exports of what the model was told are audited (cf/src/read-audit.ts), and refused for a personal
+  // assistant, whose conversation holds what it read of its owner's Raft: theirs alone, not an evaluation's.
+  const readRow = (route: string, session: string | null) => ({
+    route: `provision:${route}`, tenantId, agentId, session, tokenKind: "provider", tokenLabel: credentialId, reason: reads.reason, assistant: false,
+  });
+  const assistantPrivate = async (route: string, session: string | null) => {
+    await auditRefused(reads.audit, { ...readRow(route, session), assistant: true });
+    return fail({ status: 403, code: "assistant_private", message: `agent ${agentId} is a personal assistant: what it read of its owner's Raft is theirs alone, so its ${route} is not exported` });
+  };
+  const isPrivate = (r: unknown) => !!r && typeof r === "object" && "assistantPrivate" in r;
   const audit = (op: string, fields: Record<string, string | number | boolean | null>) =>
     logEvent("eval.seed", { tenant: tenantId, agent: agentId, op, ...fields, credentialId });
   const gone = () => fail({ status: 404, code: "not_found", message: `no agent ${agentId} in this object` });
@@ -1644,7 +1659,10 @@ async function evalSetup(
     const call = callText === null ? null : Number(callText);
     if (call !== null && !(Number.isInteger(call) && call >= 1)) return fail({ status: 422, code: "invalid", message: "call is a whole number from 1", param: "call" });
     const r = await seed.modelInput(tenantId, agentId, session, call);
+    if (isPrivate(r)) return assistantPrivate(route, session);
     if (!r) return fail({ status: 404, code: "not_found", message: session === null ? `no agent ${agentId}` : `no recorded call ${call ?? 1} of session ${session}` });
+    const refused = await auditRead(reads.audit, readRow(route, session));
+    if (refused) return refused;
     return ok(r);
   }
   // What the next turn offers the model, as its harness would be built now (cf/src/runtime.ts `offeredTools`).
@@ -1665,10 +1683,14 @@ async function evalSetup(
     if (session !== null && !MAIN_SESSION_ID.test(session)) {
       return fail({ status: 422, code: "invalid", message: "session is a main conversation's id: main or main.<n>", param: "session" });
     }
-    const r = await seed.transcript(tenantId, agentId, session, offset, limit) as EvalTranscript | { unavailable: string } | null;
+    const got = await seed.transcript(tenantId, agentId, session, offset, limit);
+    if (isPrivate(got)) return assistantPrivate(route, session);
+    const r = got as EvalTranscript | { unavailable: string } | null;
     if (!r) return fail({ status: 404, code: "not_found", message: session === null ? `no agent ${agentId}` : `no conversation ${session} of agent ${agentId}` });
     if ("unavailable" in r) return fail({ status: 503, code: "unavailable", message: r.unavailable });
     const body = redacted(r);
+    const refused = await auditRead(reads.audit, readRow(route, r.sessionId));
+    if (refused) return refused;
     read({ route, session: r.sessionId, cursor: offset, count: r.shown, redactions: body.redactions });
     return ok(body);
   }
