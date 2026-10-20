@@ -129,23 +129,75 @@ export const INBOX_LAG_FOLLOW_UPS_MS: readonly number[] = [...INBOX_LAG_RETRY_MS
 export const INBOX_LAG_SLACK_MS = 2_000;
 
 /**
- * Whether an inbox read shows the change a doorbell announced at `changeAt`: some row's activity is at least that recent.
+ * The time rule: whether an inbox read shows the change a doorbell announced at `changeAt`, in that some row's activity
+ * is at least that recent. It applies only to a doorbell that names no conversation (`sources` empty: one recorded
+ * before Raft named them), and to a wake whose reads carry no `latestSeq` at all (an older Raft); otherwise
+ * `changeShown` decides exactly.
  *
- * Any row, not the conversation that changed (the doorbell names none): the inbox is served from a view that applies
+ * Any row, not the conversation that changed (such a doorbell names none): the inbox is served from a view that applies
  * Postgres changes in commit order, so a read that shows any row at least as recent as the change has, in general,
- * applied the change too. Checking one conversation would need the doorbell to name it.
+ * applied the change too.
  *
  * The comparison is on `latestAt` (a message's `created_at`), not commit order, so it is not exact: a message in
  * another conversation created within `INBOX_LAG_SLACK_MS` before the change can be visible while the change is not,
  * and the read then counts as caught up too early (the two times also come from different clocks: the app's, and
  * Postgres's transaction start). The changed conversation is then judged on a read that does not show it, and a
- * doorbell only rings again on new activity, so it can wait for the morning brief. `caught_up_via` on the wake row
- * lets that case be counted (a read caught up via "unread" that yields no candidate). The exact check needs the
- * doorbell to carry the conversation and seq that rang it; until it does, this rule stands.
+ * doorbell only rings again on new activity, so it can wait for the morning brief. `caught_up_rule: "time"` on the wake
+ * row counts the wakes still judged this way.
  */
 export function inboxCaughtUp(items: readonly Pick<InboxItem, "latestAt">[], changeAt: string): boolean {
   const from = Date.parse(changeAt) - INBOX_LAG_SLACK_MS;
   return items.some((i) => i.latestAt !== null && Date.parse(i.latestAt) >= from);
+}
+
+/** Per conversation (its channelId, a thread's own), the highest seq a doorbell announced in it (`sources`). */
+export type ChangeSources = Record<string, number>;
+
+/** `a` and `b` as one: every conversation of either, at the higher of its two seqs. */
+export function mergeSources(a: Readonly<ChangeSources>, b: Readonly<ChangeSources>): ChangeSources {
+  const out: ChangeSources = { ...a };
+  for (const [id, seq] of Object.entries(b)) out[id] = Math.max(out[id] ?? -1, seq);
+  return out;
+}
+
+/** A seq as Raft may send one (a number, or a bigint as a string of digits), or null. */
+export function seqOf(v: unknown): number | null {
+  const n = typeof v === "number" ? v : typeof v === "string" && /^\d{1,15}$/.test(v) ? Number(v) : NaN;
+  return Number.isSafeInteger(n) && n >= 0 ? n : null;
+}
+
+/**
+ * Whether the inbox shows the change a doorbell announced, and by which rule.
+ *
+ * The seq rule, when the doorbell named the conversations that rang it (`sources`): caught up only when EVERY one of
+ * them is a row whose `latestSeq` is at least the seq the doorbell announced in it. This is exact: a seq is the
+ * conversation's own commit order, so no other conversation's activity and no clock can make a read count early, as
+ * the time rule can. The unread read is asked first; what it does not show is asked of the read of every conversation
+ * (`readAll`), since a conversation the owner has read since is in no unread read however long one waits, which is
+ * `caught_up_via: "mixed"` when each read showed some. A row without `latestSeq` shows nothing for its conversation;
+ * but when no row of either read carries the field the Raft is one that does not send it, and the time rule decides
+ * for this wake (`rule: "time"`) rather than lagging until the retries give up.
+ *
+ * With no sources the time rule decides (`inboxCaughtUp`), and the read of everything is asked only when the unread
+ * read does not show the change, as before. `via` is null when the change is not shown.
+ */
+export async function changeShown(
+  unread: readonly InboxItem[], readAll: () => Promise<readonly InboxItem[]>, change: { changeAt: string | null; sources: Readonly<ChangeSources> },
+): Promise<{ via: "unread" | "all" | "mixed" | null; rule: "seq" | "time" }> {
+  const timeRule = async (all?: readonly InboxItem[]) => {
+    if (change.changeAt === null || inboxCaughtUp(unread, change.changeAt)) return { via: "unread" as const, rule: "time" as const };
+    return { via: inboxCaughtUp(all ?? await readAll(), change.changeAt) ? "all" as const : null, rule: "time" as const };
+  };
+  const ids = Object.keys(change.sources);
+  if (!ids.length) return timeRule();
+  const shows = (items: readonly InboxItem[], id: string) =>
+    items.some((i) => i.channelId === id && typeof i.latestSeq === "number" && i.latestSeq >= change.sources[id]);
+  const missing = ids.filter((id) => !shows(unread, id));
+  if (!missing.length) return { via: "unread", rule: "seq" };
+  const all = await readAll();
+  if (![...unread, ...all].some((i) => i.latestSeq !== undefined)) return timeRule(all);
+  if (missing.some((id) => !shows(all, id))) return { via: null, rule: "seq" };
+  return { via: missing.length === ids.length ? "all" : "mixed", rule: "seq" };
 }
 /** Wakes by owner-local day, trigger and outcome, the last `COUNT_DAYS` days: wake-ups against model-invoked runs. */
 export const COUNTS_KEY = "counts";
@@ -174,10 +226,16 @@ export interface AssistantOwner {
   lastCheckAt: number | null;
   /**
    * The change a doorbell announced that no inbox read has shown yet: the earliest such doorbell's `first_change_at`
-   * (`doorbellOf`), or null. While it is set a doorbell's check does not decide on what it read (`inboxCaughtUp`).
+   * (`doorbellOf`), or null. While it or `changeSources` is set a doorbell's check does not decide on what it read
+   * until a read shows the change (`changeShown`).
    */
   changeAt: string | null;
-  /** How many reads in a row have not shown `changeAt`: the index into `INBOX_LAG_FOLLOW_UPS_MS`. */
+  /**
+   * The conversations those doorbells named (`sources`), each at the highest seq any of them announced in it: what a
+   * read must show for the change to count as shown. Empty for doorbells that named none.
+   */
+  changeSources: ChangeSources;
+  /** How many reads in a row have not shown the change: the index into `INBOX_LAG_FOLLOW_UPS_MS`. */
   lagReads: number;
   /** The owner-local day (YYYY-MM-DD) of the last brief turn, so one day never gets two. */
   lastBrief: string | null;
@@ -202,10 +260,21 @@ function ownerOf(raw: unknown): AssistantOwner | null {
     pausedAt: typeof o.pausedAt === "number" ? o.pausedAt : null, dmTarget: str(o.dmTarget), learnedDm: str(o.learnedDm), lastBrief: str(o.lastBrief),
     doorbellAt: typeof o.doorbellAt === "number" ? o.doorbellAt : null, lastCheckAt: typeof o.lastCheckAt === "number" ? o.lastCheckAt : null,
     changeAt: str(o.changeAt) !== null && Number.isFinite(Date.parse(o.changeAt as string)) ? o.changeAt as string : null,
+    changeSources: sourcesOf(o.changeSources),
     lagReads: typeof o.lagReads === "number" && o.lagReads >= 0 ? o.lagReads : 0,
     briefSent: str(o.briefSent), askedTimezone: o.askedTimezone === true,
   };
 }
+
+/** Kept `changeSources`, read defensively: an entry whose seq is not one is dropped. */
+function sourcesOf(raw: unknown): ChangeSources {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  return Object.fromEntries(Object.entries(raw).flatMap(([id, seq]) => (id && seqOf(seq) !== null ? [[id, seqOf(seq)!]] : [])));
+}
+
+/** Whether a doorbell's change is still awaited: no read has shown it yet. */
+export const changePending = (owner: Pick<AssistantOwner, "changeAt" | "changeSources">): boolean =>
+  owner.changeAt !== null || Object.keys(owner.changeSources).length > 0;
 
 export async function loadOwner(ctx: PluginContext): Promise<AssistantOwner | null> {
   return ownerOf(await ctx.db.get(ASSISTANT_STORE, OWNER_KEY));
@@ -242,7 +311,7 @@ export async function keepOwnerFromContext(ctx: PluginContext, context: OwnerCon
     userId: of.userId, timezone: validZone(of.timezone ?? null), statedTimezone: same?.statedTimezone ?? null,
     serverId: context.server.id, pausedAt: null,
     dmTarget: dm, learnedDm: same?.learnedDm ?? null, doorbellAt: same?.doorbellAt ?? null, lastCheckAt: same?.lastCheckAt ?? null,
-    changeAt: same?.changeAt ?? null, lagReads: same?.lagReads ?? 0, lastBrief: same?.lastBrief ?? null, briefSent: same?.briefSent ?? null, askedTimezone: same?.askedTimezone ?? false,
+    changeAt: same?.changeAt ?? null, changeSources: same?.changeSources ?? {}, lagReads: same?.lagReads ?? 0, lastBrief: same?.lastBrief ?? null, briefSent: same?.briefSent ?? null, askedTimezone: same?.askedTimezone ?? false,
   };
   await saveOwner(ctx, owner);
   return owner;
@@ -677,15 +746,23 @@ export const SYSTEM_ASSISTANT_APP = "system.assistant";
 /**
  * The doorbell's payload when `raw` is one — Raft's `system.assistant` app saying the owner's Activity changed — or
  * null. Both the app and the payload's type are required: the same payload from any other source is not one.
+ * `sources` is the conversations that rang it, each at its highest seq (slock#10499); empty when the doorbell names none,
+ * which is every doorbell from before Raft did, and an entry that is not a channel id and a seq is left out.
  */
-export function doorbellOf(raw: unknown): { firstChangeAt: string | null; lastChangeAt: string | null } | null {
+export function doorbellOf(raw: unknown): { firstChangeAt: string | null; lastChangeAt: string | null; sources: ChangeSources } | null {
   const e = raw && typeof raw === "object" ? (raw as Record<string, unknown>).third_party_event : null;
   if (!e || typeof e !== "object") return null;
   const ev = e as Record<string, unknown>;
   const p = ev.payload && typeof ev.payload === "object" ? ev.payload as Record<string, unknown> : null;
   if (ev.client_id !== SYSTEM_ASSISTANT_APP || !p || p.type !== "owner_inbox_updated") return null;
   const at = (v: unknown) => (typeof v === "string" && !Number.isNaN(Date.parse(v)) ? v : null);
-  return { firstChangeAt: at(p.first_change_at), lastChangeAt: at(p.last_change_at) };
+  let sources: ChangeSources = {};
+  for (const e of Array.isArray(p.sources) ? p.sources : []) {
+    const o = e && typeof e === "object" ? e as Record<string, unknown> : {};
+    const seq = seqOf(o.max_seq);
+    if (typeof o.channel_id === "string" && o.channel_id && seq !== null) sources = mergeSources(sources, { [o.channel_id]: seq });
+  }
+  return { firstChangeAt: at(p.first_change_at), lastChangeAt: at(p.last_change_at), sources };
 }
 
 /**
@@ -701,14 +778,16 @@ export function isDoorbellTarget(t: unknown): boolean {
  * A doorbell for this mount's assistant, kept for the wake the push asks for. False when this is no one's assistant.
  * `firstChangeAt` is the doorbell's `first_change_at` when it could be read: the change the wake must see in the inbox
  * before deciding. One still waiting for an earlier doorbell's change keeps the earlier, which no read has shown yet;
- * `last_change_at` is not used, being when Raft sent the doorbell rather than when anything changed.
+ * `last_change_at` is not used, being when Raft sent the doorbell rather than when anything changed. `sources` are the
+ * conversations it named: they join those still awaited, each at the higher seq, since a read must show every one.
  */
-export async function noteDoorbell(ctx: PluginContext, now = Date.now(), firstChangeAt: string | null = null): Promise<boolean> {
+export async function noteDoorbell(ctx: PluginContext, now = Date.now(), firstChangeAt: string | null = null, sources: Readonly<ChangeSources> = {}): Promise<boolean> {
   const owner = await loadOwner(ctx);
   if (!owner) return false;
   const changeAt = owner.changeAt === null || (firstChangeAt !== null && Date.parse(firstChangeAt) < Date.parse(owner.changeAt)) ? firstChangeAt ?? owner.changeAt : owner.changeAt;
-  if (owner.doorbellAt === null || changeAt !== owner.changeAt) {
-    await saveOwner(ctx, { ...owner, doorbellAt: owner.doorbellAt ?? now, changeAt, lagReads: owner.changeAt === null ? 0 : owner.lagReads });
+  const changeSources = mergeSources(owner.changeSources, sources);
+  if (owner.doorbellAt === null || changeAt !== owner.changeAt || JSON.stringify(changeSources) !== JSON.stringify(owner.changeSources)) {
+    await saveOwner(ctx, { ...owner, doorbellAt: owner.doorbellAt ?? now, changeAt, changeSources, lagReads: changePending(owner) ? owner.lagReads : 0 });
   }
   return true;
 }
@@ -721,6 +800,11 @@ export interface InboxItem {
   latestAt: string | null; latestSenderName: string | null; latestPreview: string | null; firstUnreadMessageId: string | null;
   /** A thread's parent message (null for a channel): `#channel:<its short id>` is the link to the thread. */
   parentMessageId?: string | null;
+  /**
+   * The seq of the conversation's latest message (a thread's latest reply), slock#10499; null when Raft sends none for
+   * the row, absent when it does not send the field at all (an older Raft).
+   */
+  latestSeq?: number | null;
 }
 
 /** The owner inbox read, as the plugin's wire answers it (`AssistantWire.ownerInbox`). */
@@ -742,6 +826,7 @@ export function inboxItemsOf(data: unknown): InboxItem[] | null {
       unread: typeof o.unread === "number" ? o.unread : 0, hasMention: o.hasMention === true, latestAt: str(o.latestAt),
       latestSenderName: str(o.latestSenderName), latestPreview: str(o.latestPreview), firstUnreadMessageId: str(o.firstUnreadMessageId),
       ...(str(o.parentMessageId) ? { parentMessageId: str(o.parentMessageId) } : {}),
+      ...("latestSeq" in o ? { latestSeq: seqOf(o.latestSeq) } : {}),
     }];
   });
 }
@@ -949,7 +1034,7 @@ export async function assistantWake(ctx: PluginContext, deps: WakeDeps): Promise
     return { wakeAt: next };
   }
   // The brief reads everything still unread, whatever was looked at, so a change still awaited is the brief's now.
-  if (trigger === "brief") await saveOwner(ctx, owner = { ...owner, lastBrief: day, changeAt: null, lagReads: 0 });
+  if (trigger === "brief") await saveOwner(ctx, owner = { ...owner, lastBrief: day, changeAt: null, changeSources: {}, lagReads: 0 });
   const read = async (filter: "unread" | "all") => {
     const out = await deps.inbox(ctx, { filter, limit: INBOX_LIMIT });
     if (!out.ok) {
@@ -1023,26 +1108,26 @@ export async function assistantWake(ctx: PluginContext, deps: WakeDeps): Promise
   try {
     if (trigger === "doorbell") {
       const items = await read("unread");
-      // A doorbell that said when its change happened: a read that shows nothing that recent is older than the change
-      // (the inbox lags the doorbell), so nothing is decided on it — no model call, nothing recorded as looked at, else
+      // A doorbell that said what changed (the conversations and seqs that rang it, or else when): a read that does not
+      // show that is older than the change (the inbox lags the doorbell), so nothing is decided on it — no model call, nothing recorded as looked at, else
       // its old activity would be judged seen and the change never looked at — and the inbox is read again shortly.
       // Past the last read again, what was read is decided on, still without recording it as looked at. A change the
-      // owner has already read is in no unread read however long one waits, so when the unread read does not show it
-      // the read of every conversation decides; the candidates still come from the unread read alone.
+      // owner has already read is in no unread read however long one waits, so what the unread read does not show
+      // the read of every conversation is asked (`changeShown`); the candidates still come from the unread read alone.
       let lag: Record<string, number | string | boolean> = {};
-      if (owner.changeAt !== null) {
+      if (changePending(owner)) {
         const lagRetry = owner.lagReads;
-        const via = inboxCaughtUp(items, owner.changeAt) ? "unread" : inboxCaughtUp(await read("all"), owner.changeAt) ? "all" : null;
+        const { via, rule } = await changeShown(items, () => read("all"), { changeAt: owner.changeAt, sources: owner.changeSources });
         const caughtUp = via !== null;
         const delay = caughtUp ? undefined : INBOX_LAG_FOLLOW_UPS_MS[lagRetry];
         if (delay !== undefined) {
           const wakeAt = Math.min(now + delay, next);
           await saveOwner(ctx, { ...owner, lagReads: lagRetry + 1, doorbellAt: wakeAt < next ? now : null });
-          await record(ctx, day, trigger, "inbox_lagging", { conversations: items.length, inbox_lagging: true, lagRetry, caught_up: false });
+          await record(ctx, day, trigger, "inbox_lagging", { conversations: items.length, inbox_lagging: true, lagRetry, caught_up: false, caught_up_rule: rule });
           return { wakeAt };
         }
-        lag = { lagRetry, caught_up: caughtUp, ...(via ? { caught_up_via: via } : { inbox_lagging: true, inbox_lagging_gave_up: true }) };
-        await saveOwner(ctx, owner = { ...owner, changeAt: null, lagReads: 0 });
+        lag = { lagRetry, caught_up: caughtUp, caught_up_rule: rule, ...(via ? { caught_up_via: via } : { inbox_lagging: true, inbox_lagging_gave_up: true }) };
+        await saveOwner(ctx, owner = { ...owner, changeAt: null, changeSources: {}, lagReads: 0 });
       }
       const reviewed = reviewedOf(await ctx.db.get(ASSISTANT_STORE, REVIEWED_KEY));
       const f = await prefilter(items, { rules, reviewed, told });
