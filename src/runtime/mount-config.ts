@@ -266,7 +266,9 @@ export function repeatsMount(
  * it". That reading is only unambiguous because **no `ConfigField["type"]` can
  * hold null** (`src/plugins/types.ts`) — `settingType(null)` answers `"unknown"`
  * — so a null could never have meant "the value is null". (`SettingValue` does
- * carry `null`, but as this marker and a stored absence, not as a field type.) A
+ * list `null`: it is the type a setting's value crosses a Durable Object stub as.
+ * But it is not a *declared* field type: no `ConfigField` may say `null`, which is
+ * the half this rule rests on.) A
  * nullable field type would break this, which is why `test/mount-settings.ts`
  * asks `settingType(null)` directly: the day a type can be null, that case reddens
  * and this rule has to be decided again rather than silently doing one thing
