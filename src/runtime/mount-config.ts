@@ -315,6 +315,11 @@ export function mergeMountSettings(
   const removed = new Set<string>();
   for (const [key, value] of Object.entries(patch)) {
     const field = fields.find((f) => f.name === key);
+    // `account` is the label every mount carries and the console relies on, not the plugin's setting, so the
+    // undeclared-key deletion below does not reach it. Setting it is refused as before (it is not declared).
+    if (key === "account" && value === null) {
+      return { ok: false, error: `"account" is the mount's label and cannot be removed` };
+    }
     if (!field) {
       // Not this plugin's setting: a spelling mistake, or a row an older build
       // wrote. Deleting it is the one thing an operator may do to it — and the

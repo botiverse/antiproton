@@ -361,6 +361,23 @@ await check("a stray key may NOT be set, and a setting that is the mount's ident
   host.dispose();
 });
 
+await check("`account` is the mount's label: a patch can neither delete it nor set it", async () => {
+  const { rt, host, agentId } = await raftAgent();
+  host.sql.exec("UPDATE mounts SET public_config = ? WHERE agent_id = ? AND alias = ?",
+    JSON.stringify({ serverUrl: ORIGIN, account: "cody" }), agentId, PROVISION_MOUNT_ALIAS);
+  const del = await patch(env(rt), { tenantId: T, agentId, alias: "raft", settings: { account: null } });
+  must(del.status === 400 && /"account" is the mount's label and cannot be removed/.test(del.body.error), `delete: ${del.status} ${del.text}`);
+  // Not even alongside a legal change: the whole patch is refused and nothing is written.
+  const withChange = await patch(env(rt), { tenantId: T, agentId, alias: "raft", settings: { account: null, conversationCards: true } });
+  must(withChange.status === 400, `delete with a change: ${withChange.status} ${withChange.text}`);
+  must(settingsOf(host, agentId).account === "cody" && settingsOf(host, agentId).conversationCards === undefined,
+    `stored: ${JSON.stringify(settingsOf(host, agentId))}`);
+  const set = await patch(env(rt), { tenantId: T, agentId, alias: "raft", settings: { account: "someone" } });
+  must(set.status === 400 && /raft has no setting "account"/.test(set.body.error), `set: ${set.status} ${set.text}`);
+  must(settingsOf(host, agentId).account === "cody", "the label moved");
+  host.dispose();
+});
+
 await check("`null` means `delete` only because no setting type can hold it — the premise this rule rests on", async () => {
   // `MountSettingsPatch` reads a key's `null` as an operation on the field, not as a value. That is unambiguous
   // exactly while no `ConfigField["type"]` accepts null; the day one does, `null` would mean two things and this
