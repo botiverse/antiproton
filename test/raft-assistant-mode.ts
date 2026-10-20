@@ -10,8 +10,8 @@
 import { createHmac } from "node:crypto";
 import { raftPlugin, wakeInstruction } from "../src/plugins/raft.ts";
 import {
-  ASSISTANT_STORE, CHAT_TOOLS, CHECK_TOOLS, COUNTS_KEY, DEFERRED_KEY, OWNER_KEY, REMINDED_STORE, assistantCheckPrompt, assistantMountOf, assistantPrompt,
-  assistantWakeInstruction, isQuietHours, itemOf, localDay, nextBriefAt, zoneOf,
+  ASSISTANT_STORE, CHAT_TOOLS, CHECK_TOOLS, COUNTS_KEY, DEFERRED_KEY, OWNER_KEY, REMINDED_STORE, RETRY_BACKOFF_MS, REVIEWED_KEY, UNREADABLE_KEY, assistantCheckPrompt, assistantMountOf, assistantPrompt,
+  assistantWakeInstruction, confirmRef, isQuietHours, itemOf, localDay, nextBriefAt, zoneOf,
 } from "../src/plugins/raft-assistant.ts";
 import { askWake } from "../src/runtime/plugin-wakes.ts";
 import { recordedEngine } from "../src/runtime/durable-agent.ts";
@@ -64,18 +64,33 @@ await check("the next brief is the next 08:00 owner-local, strictly after now, a
     zoneOf({ timezone: "Europe/Paris", statedTimezone: "Asia/Tokyo" }) === "Europe/Paris", "zone precedence: Raft's, then the owner's word, then UTC");
 });
 
-await check("an item's reference must be clickable, and its key is the message's short id or the task", () => {
+await check("an item's reference must be clickable from the owner's DM, and its key is the message's short id", () => {
   const msg = itemOf({ ref: "#launch:ABCDEF12-3456", summary: "  Bob asks\nfor a date ", kind: "question" });
   must(typeof msg !== "string" && msg.key === "msg:abcdef12" && msg.channel === "launch" && msg.summary === "Bob asks for a date", show(msg));
   const short = itemOf({ ref: "#launch:abcdef12", summary: "s", kind: "review" });
   must(typeof short !== "string" && short.key === "msg:abcdef12", "a short and a full id are one item");
-  const task = itemOf({ ref: "task #12", summary: "s", kind: "task", channel: "#eng" });
-  must(typeof task !== "string" && task.key === "task:eng#12", show(task));
-  const prefixed = itemOf({ ref: "#eng task #12", summary: "s", kind: "task" });
-  must(typeof prefixed !== "string" && prefixed.key === "task:eng#12", show(prefixed));
+  // A task number is no link from the DM, where Raft resolves task #N in the DM itself, with a channel before it or not:
+  // refused, saying to cite the task's message.
+  for (const ref of ["task #12", "#eng task #12", "Task #3"]) {
+    const refused = itemOf({ ref, summary: "s", kind: "task", channel: "#eng" });
+    must(typeof refused === "string" && /DM's own task #N/.test(refused) && /#channel:msgid/.test(refused), `${ref}: ${show(refused)}`);
+  }
+  const byMessage = itemOf({ ref: "#eng:abcdef12", summary: "Review the plan (task #12)", kind: "task" });
+  must(typeof byMessage !== "string" && byMessage.key === "msg:abcdef12" && byMessage.channel === "eng" && byMessage.summary === "Review the plan (task 12)", show(byMessage));
   for (const bad of [{ ref: "https://x", summary: "s", kind: "task" }, { ref: "#launch", summary: "s", kind: "task" }, { ref: "#a:abcdef12", summary: "", kind: "task" }, { ref: "#a:abcdef12", summary: "s", kind: "fyi" }]) {
     must(typeof itemOf(bad) === "string", `accepted: ${show(bad)}`);
   }
+});
+
+await check("a reference built from an inbox row: a channel's first unread message, a thread's root, the short id; the key is always the first unread", () => {
+  const item = itemOf({ ref: "#qa-x:deadbeef", summary: "s", kind: "question" });
+  must(typeof item !== "string", "control");
+  const channel = confirmRef(item as never, [{ channelId: "c1", channelName: "qa-x", firstUnreadMessageId: "49F5D538-1111-4222-8333-444455556666", parentMessageId: null, ids: [] }]);
+  must(channel?.ref === "#qa-x:49f5d538" && channel.key === "msg:49f5d538", show(channel));
+  const thread = confirmRef(item as never, [{ channelId: "t1", channelName: "qa-x", firstUnreadMessageId: "aaaaaaa1-1111-4222-8333-444455556666", parentMessageId: "bbbbbbb2-1111-4222-8333-444455556666", ids: [] }]);
+  must(thread?.ref === "#qa-x:bbbbbbb2" && thread.key === "msg:aaaaaaa1", show(thread));
+  const read = confirmRef(item as never, [{ channelId: "c1", channelName: "qa-x", firstUnreadMessageId: "49f5d538-1111", parentMessageId: null, ids: ["deadbeef"] }]);
+  must(read === item, `a message the read showed is kept: ${show(read)}`);
 });
 
 // ---- the plugin, end to end -----------------------------------------------------------------------------------------
@@ -96,6 +111,8 @@ function raft(o: { zone?: unknown; owner?: boolean; dm?: unknown } = {}) {
     owner: o.owner ?? true, zone: "zone" in o ? o.zone : "Europe/Berlin", dm: o.dm, contextStatus: 200,
     sends: [] as any[], send: "sent" as "sent" | "held", events: [] as unknown[], inbox: 200, contexts: 0,
     unread: [] as unknown[], all: [] as unknown[], inboxReads: [] as string[],
+    /** Conversations whose owner-messages answer fails Raft's shape (the message names no conversation), and every read of one. */
+    broken: new Set<string>(), messageReads: [] as string[],
   };
   globalThis.fetch = (async (url: any, init?: any) => {
     const u = new URL(String(url));
@@ -120,6 +137,14 @@ function raft(o: { zone?: unknown; owner?: boolean; dm?: unknown } = {}) {
     }
     if (path === "/events") {
       return json(200, { events: r.events.splice(0), last_seen_msgId: null, last_seen_seq: null, reply_target: null, has_more: false, ack_mode: "cursor" });
+    }
+    if (path === "/assistant/owner-messages") {
+      // A conversation's one message is its inbox row's first unread (`conv`), so a reference to it can be confirmed.
+      const channelId = u.searchParams.get("channelId") ?? "";
+      r.messageReads.push(channelId);
+      const m = { seq: 1, id: `aaaaaaa${channelId.slice(-1)}-1111-4222-8333-444455556666`, timestamp: "2026-10-20T09:50:00.000Z", sender_type: "human",
+        sender_name: "bob", content: "can you pick a date?", ...(r.broken.has(channelId) ? {} : { channel_type: "channel", channel_name: `ch${channelId.slice(-1)}` }) };
+      return json(200, { owner: { userId: OWNER }, channelId, messages: [m], hasMore: false, hasOlder: false, hasNewer: false });
     }
     if (path === "/assistant/owner-inbox") {
       const filter = u.searchParams.get("filter") ?? "unread";
@@ -167,7 +192,7 @@ const notify = (ctx: unknown, args: unknown) => raftPlugin.invoke("assistant_not
 const wake = (ctx: unknown) => raftPlugin.wake!(ctx as never) as Promise<any>;
 const ITEMS = [
   { ref: "#launch:aaaaaaa1", summary: "Bob asks you to pick the launch date", kind: "decision", sender: "@bob", since: "2026-10-20T07:00:00Z" },
-  { ref: "task #7", channel: "eng", summary: "Review the rollout plan", kind: "task" },
+  { ref: "#eng:bbbbbbb7", summary: "Review the rollout plan (its task)", kind: "task" },
 ];
 const DAY = "2026-10-20T10:00:00Z"; // 12:00 in Berlin
 const NIGHT = "2026-10-20T21:00:00Z"; // 23:00 in Berlin
@@ -209,12 +234,12 @@ await check("several items in one call go out as one DM with a reference each; t
   const first = await atTime(DAY, () => notify(a.ctx, { items: ITEMS }));
   must(first.state === "sent" && first.items === 2 && a.r.sends.length === 1, `first: ${show(first)} sends ${a.r.sends.length}`);
   const sent = a.r.sends[0];
-  must(sent.target === "dm:@ada" && sent.content.includes("#launch:aaaaaaa1") && sent.content.includes("task #7") &&
+  must(sent.target === "dm:@ada" && sent.content.includes("#launch:aaaaaaa1") && sent.content.includes("#eng:bbbbbbb7") &&
     sent.content.startsWith("2 things are waiting on you:") && sent.content.includes("(waiting 3h)"), `content: ${show(sent)}`);
-  must(a.read(REMINDED_STORE, "msg:aaaaaaa1") && a.read(REMINDED_STORE, "task:eng#7"), "what was said is recorded");
+  must(a.read(REMINDED_STORE, "msg:aaaaaaa1") && a.read(REMINDED_STORE, "msg:bbbbbbb7"), "what was said is recorded");
   const again = await atTime(DAY, () => notify(a.ctx, { items: ITEMS }));
   must(again.state === "nothing_to_send" && a.r.sends.length === 1, `again: ${show(again)} sends ${a.r.sends.length}`);
-  must(again.dropped["#launch:aaaaaaa1"] === "already told" && again.dropped["task #7"] === "already told", show(again.dropped));
+  must(again.dropped["#launch:aaaaaaa1"] === "already told" && again.dropped["#eng:bbbbbbb7"] === "already told", show(again.dropped));
   const mixed = await atTime(DAY, () => notify(a.ctx, { items: [ITEMS[0], { ref: "#launch:bbbbbbb2", summary: "Cy asks for a review", kind: "review" }] }));
   must(mixed.state === "sent" && mixed.items === 1 && a.r.sends.length === 2 &&
     a.r.sends[1].content.startsWith("One thing is waiting on you:") && !a.r.sends[1].content.includes("aaaaaaa1"), `mixed: ${show(mixed)} ${show(a.r.sends[1])}`);
@@ -348,6 +373,115 @@ await check("a doorbell with new activity starts one short session of its own wi
   await atTime(DAY, () => noteDoorbell(a.ctx));
   const newer = await atTime(DAY, () => wake(a.ctx));
   must(newer.isolated === true && newer.turn.includes(conv(1).channelId) && !newer.turn.includes(conv(3).channelId), `newer: ${show(newer)}`);
+});
+
+await check("a conversation that reaches the unread inbox after a check, with activity from before it, is still a candidate; one looked at stays filtered", async () => {
+  const { noteDoorbell } = await import("../src/plugins/raft-assistant.ts");
+  const a = await assistant();
+  a.r.unread = [conv(1)];
+  await atTime(DAY, () => noteDoorbell(a.ctx));
+  const first = await atTime(DAY, () => wake(a.ctx));
+  must(first.isolated === true && first.turn.includes(conv(1).channelId), `control, the first check: ${show(first)}`);
+  // A thread reply, or the inbox catching up: in the unread inbox only now, with activity (09:40) older than the last check (10:00).
+  a.r.unread = [conv(1), conv(3, { latestAt: "2026-10-20T09:40:00.000Z" })];
+  await atTime("2026-10-20T10:01:00Z", () => noteDoorbell(a.ctx));
+  const late = await atTime("2026-10-20T10:01:00Z", () => wake(a.ctx));
+  must(late.isolated === true && late.turn.includes(conv(3).channelId) && !late.turn.includes(conv(1).channelId), `the late conversation: ${show(late)}`);
+  must(a.traced.at(-1)?.status === "invoked" && a.traced.at(-1)?.attrs.candidates === 1 && a.traced.at(-1)?.attrs.seen === 1, show(a.traced.at(-1)));
+});
+
+await check("a conversation that cannot be read is read once more, left out of the check, named in the DM, not recorded as looked at, and read again by a short wake", async () => {
+  const { noteDoorbell } = await import("../src/plugins/raft-assistant.ts");
+  const a = await assistant(raft({ dm: "dm:@ada" }));
+  a.r.unread = [conv(1), conv(2, { hasMention: true, latestPreview: "@ada can you answer?" })];
+  a.r.broken.add(conv(2).channelId);
+  await atTime(DAY, () => noteDoorbell(a.ctx));
+  const out = await atTime(DAY, () => wake(a.ctx));
+  must(out.isolated === true && out.turn.includes(conv(1).channelId) && !out.turn.includes(conv(2).channelId), `the check's input: ${show(out)}`);
+  must(a.r.messageReads.filter((c) => c === conv(2).channelId).length === 2, `read once more in code: ${show(a.r.messageReads)}`);
+  must(out.wakeAt === at(DAY) + 2 * 60_000 && RETRY_BACKOFF_MS[0] === 2 * 60_000 && typeof a.read(ASSISTANT_STORE, OWNER_KEY).doorbellAt === "number", `a short wake to look again: ${show(out)}`);
+  const row = a.traced.at(-1);
+  must(row?.status === "invoked" && row.attrs.unreadable === 1 && row.attrs.candidates === 1, show(row));
+  must(!(conv(2).channelId in a.read(ASSISTANT_STORE, REVIEWED_KEY)) && conv(1).channelId in a.read(ASSISTANT_STORE, REVIEWED_KEY), `reviewed: ${show(a.read(ASSISTANT_STORE, REVIEWED_KEY))}`);
+  must(conv(2).channelId in a.read(ASSISTANT_STORE, UNREADABLE_KEY), show(a.read(ASSISTANT_STORE, UNREADABLE_KEY)));
+  // The check's one message says what it did not read.
+  const sent = await atTime(DAY, () => notify(a.ctx, { items: [{ ref: "#ch1:aaaaaaa1", summary: "Bob asks you to pick a date", kind: "question" }] }));
+  must(sent.state === "sent" && sent.unreadable === 1, show(sent));
+  const content = a.r.sends[0].content as string;
+  must(content.endsWith("\nI couldn't read 1 conversation (#ch2); I'll look again shortly.") && content.includes("#ch1:aaaaaaa1"), content);
+  // The short wake: the conversation reads now, and is a candidate although its activity is older than the last check.
+  a.r.broken.clear();
+  const retry = await atTime("2026-10-20T10:05:00Z", () => wake(a.ctx));
+  must(retry.isolated === true && retry.turn.includes(conv(2).channelId) && !retry.turn.includes(conv(1).channelId), `the re-check: ${show(retry)}`);
+  must(retry.wakeAt === at("2026-10-21T06:00:00Z") && show(a.read(ASSISTANT_STORE, UNREADABLE_KEY)) === "{}", `settled: ${show(retry)} ${show(a.read(ASSISTANT_STORE, UNREADABLE_KEY))}`);
+});
+
+await check("a wake that can read none of its conversations calls no model and sends only the line saying so, once; retries back off 2, 5, 15 minutes", async () => {
+  const { noteDoorbell } = await import("../src/plugins/raft-assistant.ts");
+  const a = await assistant(raft({ dm: "dm:@ada" }));
+  a.r.unread = [conv(2, { hasMention: true }), conv(5)];
+  a.r.broken.add(conv(2).channelId).add(conv(5).channelId);
+  await atTime(DAY, () => noteDoorbell(a.ctx));
+  const out = await atTime(DAY, () => wake(a.ctx));
+  must(out.turn === undefined && out.wakeAt === at(DAY) + 2 * 60_000, `no model call, a short wake: ${show(out)}`);
+  must(a.r.sends.length === 1 && a.r.sends[0].content === "I couldn't read 2 conversations (#ch2, #ch5); I'll look again shortly." && a.r.sends[0].target === "dm:@ada",
+    `sent: ${show(a.r.sends)}`);
+  must(a.traced.at(-1)?.status === "unreadable" && a.traced.at(-1)?.attrs.unreadable === 2 && a.traced.at(-1)?.attrs.said === 1, show(a.traced.at(-1)));
+  must(counted(a, "2026-10-20")["doorbell.unreadable"] === 1, show(counted(a, "2026-10-20")));
+  // Still unreadable at each short wake, with nothing new in them: read again, nothing more said, the next wake further off.
+  const reads = a.r.messageReads.length;
+  for (const [when, wantNext] of [["2026-10-20T10:02:00Z", at("2026-10-20T10:07:00Z")], ["2026-10-20T10:07:00Z", at("2026-10-20T10:22:00Z")],
+    ["2026-10-20T10:22:00Z", at("2026-10-21T06:00:00Z")]] as const) {
+    const again = await atTime(when, () => wake(a.ctx));
+    must(again.turn === undefined && again.wakeAt === wantNext && a.r.sends.length === 1 && a.traced.at(-1)?.status === "unreadable" && a.traced.at(-1)?.attrs.said === 0,
+      `${when}: ${show(again)} ${show(a.r.sends)} ${show(a.traced.at(-1))}`);
+  }
+  must(a.r.messageReads.length === reads + 3 * 4, `each short wake read both twice: ${a.r.messageReads.length - reads}`);
+  // Retries spent: no wake until a real doorbell. New activity in one of them is said, of that one alone.
+  must((await atTime("2026-10-20T10:40:00Z", () => wake(a.ctx))).turn === undefined && a.r.messageReads.length === reads + 12, "a wake with no doorbell read again");
+  a.r.unread = [conv(2, { hasMention: true, latestAt: "2026-10-20T10:30:00.000Z" }), conv(5)];
+  await atTime("2026-10-20T10:41:00Z", () => noteDoorbell(a.ctx));
+  const moved = await atTime("2026-10-20T10:41:00Z", () => wake(a.ctx));
+  must(a.r.sends.length === 2 && a.r.sends[1].content === "I couldn't read 1 conversation (#ch2); I'll look again shortly." && moved.wakeAt === at("2026-10-20T10:43:00Z"),
+    `new activity: ${show(a.r.sends)} ${show(moved)}`);
+});
+
+await check("an unreadable conversation said once, read at a later wake, is processed as usual: one notification, no second couldn't-read line", async () => {
+  const { noteDoorbell } = await import("../src/plugins/raft-assistant.ts");
+  const a = await assistant(raft({ dm: "dm:@ada" }));
+  a.r.unread = [conv(2, { hasMention: true, latestPreview: "@ada can you answer?" })];
+  a.r.broken.add(conv(2).channelId);
+  await atTime(DAY, () => noteDoorbell(a.ctx));
+  await atTime(DAY, () => wake(a.ctx));
+  await atTime("2026-10-20T10:02:00Z", () => wake(a.ctx));
+  must(a.r.sends.length === 1 && /^I couldn't read 1 conversation \(#ch2\)/.test(a.r.sends[0].content), `said once over two wakes: ${show(a.r.sends)}`);
+  a.r.broken.clear();
+  const read = await atTime("2026-10-20T10:07:00Z", () => wake(a.ctx));
+  must(read.isolated === true && read.turn.includes(conv(2).channelId) && read.wakeAt === at("2026-10-21T06:00:00Z"), `read now: ${show(read)}`);
+  const sent = await atTime("2026-10-20T10:08:00Z", () => notify(a.ctx, { items: [{ ref: "#ch2:aaaaaaa2", summary: "Bob asks you a question", kind: "mention" }] }));
+  must(sent.state === "sent" && a.r.sends.length === 2 && !/couldn't read/.test(a.r.sends[1].content) && a.r.sends[1].content.includes("#ch2:aaaaaaa2"), `${show(sent)} ${show(a.r.sends)}`);
+  // Looked at now: the same activity rung again is not new, and nothing is said.
+  await atTime("2026-10-20T10:09:00Z", () => noteDoorbell(a.ctx));
+  const after = await atTime("2026-10-20T10:09:00Z", () => wake(a.ctx));
+  must(after.turn === undefined && a.traced.at(-1)?.status === "skipped_filtered" && a.r.sends.length === 2, `after: ${show(after)} ${show(a.traced.at(-1))}`);
+});
+
+await check("notify replaces a reference the check's reads cannot confirm with the conversation's own, drops one outside them, and refuses a bare task", async () => {
+  const { noteDoorbell } = await import("../src/plugins/raft-assistant.ts");
+  const a = await assistant(raft({ dm: "dm:@ada" }));
+  a.r.unread = [conv(1)];
+  await atTime(DAY, () => noteDoorbell(a.ctx));
+  must((await atTime(DAY, () => wake(a.ctx))).isolated === true, "control: a check");
+  const bareTask = await atTime(DAY, () => notify(a.ctx, { items: [{ ref: "task #1", summary: "Review the plan", kind: "task" }] }).then(() => null, (e) => e as Error));
+  must(bareTask && /DM's own task #N/.test(bareTask.message) && /#channel:msgid/.test(bareTask.message) && a.r.sends.length === 0, `a bare task: ${bareTask?.message}`);
+  const out = await atTime(DAY, () => notify(a.ctx, { items: [
+    { ref: "#ch1:deadbeef", summary: "Bob asks you to pick a date", kind: "question" },
+    { ref: "#elsewhere:12345678", summary: "made up", kind: "question" },
+  ] }));
+  must(out.state === "sent" && out.items === 1 && out.replaced["#ch1:deadbeef"] === "#ch1:aaaaaaa1" && out.dropped["#elsewhere:12345678"] === "not in a conversation this check was given", show(out));
+  const content = a.r.sends[0].content as string;
+  must(content.includes("#ch1:aaaaaaa1") && !content.includes("deadbeef") && !content.includes("elsewhere"), content);
+  must(a.read(REMINDED_STORE, "msg:aaaaaaa1") && a.read(REMINDED_STORE, "msg:deadbeef") === undefined, "told is counted by the confirmed message");
 });
 
 await check("a doorbell at night reads nothing and calls no model (night_deferred); a paused assistant does neither (paused)", async () => {

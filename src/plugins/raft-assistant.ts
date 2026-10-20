@@ -9,8 +9,14 @@
  * model call. Something left: one short session of its own (`PluginNext.isolated`) is posted with those candidates as
  * its input; it starts from nothing, reads what it needs, calls the notify tool or nothing, and is erased. The main
  * conversation is the owner's chat with the assistant and never sees a check. Each wake is a `raft.assistant_wake`
- * trace row and a per-day count (`COUNTS_KEY`): `skipped_empty`, `skipped_filtered`, `invoked`, `paused`,
- * `night_deferred` or `failed`.
+ * trace row and a per-day count (`COUNTS_KEY`): `skipped_empty`, `skipped_filtered`, `invoked`, `unreadable` (every
+ * conversation to look at failed to read twice), `paused`, `night_deferred` or `failed`.
+ *
+ * A check never summarizes as if it read what it did not. The wake reads each conversation it hands the model first,
+ * once more on a failure; what still fails is left out of the model's input, is not recorded as looked at, is named
+ * in a DM's last line ("I couldn't read …") once, until its read succeeds or it has new activity, and brings short
+ * wakes back to look again (`UNREADABLE_KEY`, `RETRY_BACKOFF_MS`). With nothing readable there is no model call, and the
+ * owner gets only that line.
  *
  * The model decides what is waiting on the owner; this file's code decides what reaches them. Every proactive message
  * goes through one tool, `assistant_notify_owner`, which takes the items and composes and sends the one DM itself,
@@ -88,6 +94,19 @@ export const RULES_KEY = "rules";
 export const DEFERRED_KEY = "deferred";
 /** Per conversation (its channelId), the `latestAt` a check last looked at: activity at or before it is not new. */
 export const REVIEWED_KEY = "reviewed";
+/**
+ * Conversations a check could not read (`Unreadable`, by channelId): never recorded as looked at, so every wake looks at
+ * them again until a read succeeds, and said to the owner as not read rather than passed over, once for the same
+ * activity.
+ */
+export const UNREADABLE_KEY = "unreadable";
+/** What the last check was given to read (`CheckRecord`): the notify tool confirms a reference against it. */
+export const CHECK_KEY = "check";
+/**
+ * How soon a wake that could not read a conversation looks again, by how many wakes in a row could not: 2, then 5,
+ * then 15 minutes, and after that only at the next doorbell or brief.
+ */
+export const RETRY_BACKOFF_MS: readonly number[] = [2 * 60_000, 5 * 60_000, 15 * 60_000];
 /** Wakes by owner-local day, trigger and outcome, the last `COUNT_DAYS` days: wake-ups against model-invoked runs. */
 export const COUNTS_KEY = "counts";
 
@@ -111,7 +130,7 @@ export interface AssistantOwner {
   learnedDm: string | null;
   /** When a doorbell arrived that no wake has checked yet. */
   doorbellAt: number | null;
-  /** When a doorbell was last checked: activity in a conversation no check has looked at counts as new after it. */
+  /** When a doorbell was last checked. What is new is decided per conversation (`REVIEWED_KEY`), never by this. */
   lastCheckAt: number | null;
   /** The owner-local day (YYYY-MM-DD) of the last brief turn, so one day never gets two. */
   lastBrief: string | null;
@@ -270,20 +289,28 @@ export type ItemKind = (typeof ITEM_KINDS)[number];
 export interface Item { ref: string; summary: string; kind: ItemKind; channel: string | null; sender: string | null; since: string | null; key: string }
 
 const MESSAGE_REF = /^#([^\s:#]{1,80}):([0-9A-Za-z-]{8,36})$/;
-const TASK_REF = /^(?:#([^\s:#]{1,80})\s+)?task\s+#(\d{1,9})$/i;
+/**
+ * A task as a reference, bare (`task #N`) or after a channel (`#eng task #N`). Neither is one in the owner's DM: Raft's
+ * reference grammar has no channel-qualified task (`parseRaftRefTarget` in the SDK knows `task #N` alone, resolved in
+ * the conversation it is written in), so `task #1` sent to the DM links the DM's own task #1, and `#eng task #1` is a
+ * link to #eng beside that same wrong one. A task is cited by its message instead, which is channel-qualified.
+ */
+const TASK_REF = /(?:^|\s)task\s*#\d+/i;
 const SUMMARY_MAX = 300;
 const ITEMS_MAX = 20;
 
 const bare = (v: unknown, mark: string) => typeof v === "string" && v.trim() ? v.trim().replace(new RegExp(`^\\${mark}`), "").toLowerCase() : null;
 
 /**
- * One item as the tool takes it, checked: its reference must be one the owner can click (`#channel:msgid`, `task #N`
- * or `#channel task #N`), and its key — what "already told" is counted by — is the message's short id or the task.
+ * One item as the tool takes it, checked: its reference must be one the owner can click from their DM, a message's
+ * `#channel:msgid` (a task's too, by the message it was made from), and its key — what "already told" is counted by —
+ * is the message's short id.
  */
 export function itemOf(raw: unknown): Item | string {
   const o = raw && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, unknown> : {};
   const ref = typeof o.ref === "string" ? o.ref.trim() : "";
-  const summary = typeof o.summary === "string" ? o.summary.replace(/\s+/g, " ").trim() : "";
+  // A task number in the summary would be a link in the DM too, to the DM's own task (`TASK_REF`): kept as plain words.
+  const summary = typeof o.summary === "string" ? o.summary.replace(/\s+/g, " ").trim().replace(/\btask\s*#(\d+)/gi, "task $1") : "";
   if (!summary) return `item ${JSON.stringify(ref)} has no summary`;
   const kind = ITEM_KINDS.find((k) => k === o.kind);
   if (!kind) return `item ${JSON.stringify(ref)}: kind must be one of ${ITEM_KINDS.join(", ")}`;
@@ -293,12 +320,11 @@ export function itemOf(raw: unknown): Item | string {
   if (msg) {
     return { ref, summary: summary.slice(0, SUMMARY_MAX), kind, channel: msg[1]!.toLowerCase(), sender, since, key: `msg:${msg[2]!.slice(0, 8).toLowerCase()}` };
   }
-  const task = TASK_REF.exec(ref);
-  if (task) {
-    const channel = task[1]?.toLowerCase() ?? bare(o.channel, "#");
-    return { ref, summary: summary.slice(0, SUMMARY_MAX), kind, channel, sender, since, key: `task:${channel ?? ""}#${task[2]}` };
+  if (TASK_REF.test(ref)) {
+    return `item ref ${JSON.stringify(ref)}: a task number is not a link from your owner's DM (there, task #N is the DM's own task #N, ` +
+      "whatever channel is written before it). Cite the task by its message instead: #channel:msgid, the msg= id of the message that is the task";
   }
-  return `item ref ${JSON.stringify(ref)} is not a reference the owner can click: use #channel:msgid (a message's msg= id) or task #N`;
+  return `item ref ${JSON.stringify(ref)} is not a reference the owner can click: use #channel:msgid (a message's msg= id; a task's message for a task)`;
 }
 
 /** A "don't remind me about this" rule: every field it names must match; a rule names at least one. */
@@ -328,18 +354,28 @@ export function waited(since: string | null, now: number): string | null {
   return `${Math.floor(minutes / 1440)}d`;
 }
 
+/** The line that says what was not read, so a message never reads as if everything was. */
+export function couldNotRead(labels: readonly string[]): string {
+  const n = labels.length;
+  return `I couldn't read ${n} conversation${n === 1 ? "" : "s"} (${labels.join(", ")}); I'll look again shortly.`;
+}
+
 const line = (i: Item, now: number) => {
   const w = i.kind === "decided" ? null : waited(i.since, now);
   return `• ${i.summary} — ${i.ref}${w ? ` (waiting ${w})` : ""}`;
 };
 
 /** The one message: what is waiting on the owner, then (in the brief) what was decided. */
-export function compose(items: readonly Item[], o: { brief: boolean; now: number; askZone: boolean }): string {
+export function compose(items: readonly Item[], o: { brief: boolean; now: number; askZone: boolean; unreadable?: readonly string[] }): string {
   const waiting = items.filter((i) => i.kind !== "decided"), decided = items.filter((i) => i.kind === "decided");
+  const unread = o.unreadable ?? [];
   const out: string[] = [];
-  if (o.brief) out.push(waiting.length || decided.length ? "Good morning. Your brief:" : "Good morning. Nothing is waiting on you.");
+  if (o.brief) {
+    out.push(waiting.length || decided.length ? "Good morning. Your brief:" : `Good morning. Nothing is waiting on you${unread.length ? " in what I could read" : ""}.`);
+  }
   if (waiting.length) out.push(`${o.brief ? "Waiting on you" : `${waiting.length === 1 ? "One thing is" : `${waiting.length} things are`} waiting on you`}:`, ...waiting.map((i) => line(i, o.now)));
   if (decided.length) out.push("Decided yesterday:", ...decided.map((i) => line(i, o.now)));
+  if (unread.length) out.push(couldNotRead(unread));
   if (o.askZone) out.push("", "I am using UTC for your morning brief and for staying quiet at night. What time zone are you in?");
   return out.join("\n");
 }
@@ -350,7 +386,8 @@ export const ASSISTANT_OWN_TOOLS: readonly ToolSchema[] = [
   {
     name: NOTIFY_TOOL,
     summary: "Tell your owner, in one DM, what is waiting on them: the only way to message them without being asked. " +
-      "Give every item of this wake at once, each with a reference they can click (#channel:msgid, or task #N) and a one-line summary. " +
+      "Give every item of this wake at once, each with a reference they can click, #channel:msgid (for a task, its message's; a bare task #N is refused, " +
+      "since in their DM it means the DM's own task), and a one-line summary. A reference this check's reads cannot confirm is replaced by the conversation's first unread message. " +
       "This tool drops an item your owner was already told about, and one their reminder rules cover; during their night " +
       `(${QUIET_HOURS.from}:00-0${QUIET_HOURS.to}:00 their time) it sends nothing and keeps the items for the morning brief. ` +
       "Its result says what was sent, kept or dropped. Set brief: true only when the morning brief asks you to.",
@@ -362,10 +399,9 @@ export const ASSISTANT_OWN_TOOLS: readonly ToolSchema[] = [
           items: {
             type: "object", additionalProperties: false, required: ["ref", "summary", "kind"],
             properties: {
-              ref: { type: "string", description: "#channel:msgid (the msg= of a message line) or task #N." },
+              ref: { type: "string", description: "#channel:msgid: the channel's name and the msg= id of the message (for a task, the message that is the task). Never task #N." },
               summary: { type: "string", description: `What it is and what your owner needs to do, one line, at most ${SUMMARY_MAX} characters.` },
               kind: { type: "string", enum: [...ITEM_KINDS], description: "question, review or decision asked of your owner, a task assigned to them, an unanswered @mention; decided is a decision others made (brief only)." },
-              channel: { type: "string", description: "The channel's name, for a task reference without one." },
               sender: { type: "string", description: "Who is waiting (their @name), so a rule about them applies." },
               since: { type: "string", description: "When it started waiting (ISO time), so your owner sees how long." },
             },
@@ -444,8 +480,26 @@ export async function notifyOwner(args: unknown, ctx: PluginContext, deps: Notif
     if (typeof i === "string") throw refusal(i);
     if (!items.some((x) => x.key === i.key)) items.push(i);
   }
-  const rules = rulesOf(await ctx.db.get(ASSISTANT_STORE, RULES_KEY));
+  const check = checkOf(await ctx.db.get(ASSISTANT_STORE, CHECK_KEY));
   const dropped: Record<string, string> = {};
+  const replaced: Record<string, string> = {};
+  if (check) {
+    // A reference the check's reads cannot confirm is the model's guess: the conversation's own first unread message
+    // stands in for it, and an item in no conversation the check was given has nothing to stand in.
+    const confirmed: Item[] = [];
+    for (const i of items) {
+      const c = confirmRef(i, check.rows);
+      if (!c) { dropped[i.ref] = "not in a conversation this check was given"; continue; }
+      if (c.ref !== i.ref) replaced[i.ref] = c.ref;
+      if (!confirmed.some((x) => x.key === c.key)) confirmed.push(c);
+    }
+    items.splice(0, items.length, ...confirmed);
+  }
+  // What the check could not read and the owner has not been told so, at its present activity: said once, in this DM.
+  const pendingReads = unreadableOf(await ctx.db.get(ASSISTANT_STORE, UNREADABLE_KEY));
+  const unreadIds = (check?.unreadable ?? []).filter((id) => pendingReads[id] && !toldUnreadable(pendingReads[id]));
+  const unreadable = unreadIds.map((id) => pendingReads[id]!.label);
+  const rules = rulesOf(await ctx.db.get(ASSISTANT_STORE, RULES_KEY));
   const keep = async (i: Item) => {
     if (await ctx.db.get(REMINDED_STORE, i.key) !== undefined) { dropped[i.ref] = "already told"; return false; }
     const rule = rules.find((r) => ruleCovers(r, i));
@@ -474,14 +528,14 @@ export async function notifyOwner(args: unknown, ctx: PluginContext, deps: Notif
       await ctx.db.delete(ASSISTANT_STORE, DEFERRED_KEY);
       await saveOwner(ctx, { ...owner, briefSent: today });
     }
-    return { state: "nothing_to_send", ...(Object.keys(dropped).length ? { dropped } : {}), note: "Nothing new is waiting on your owner: send them nothing." };
+    return { state: "nothing_to_send", ...(Object.keys(dropped).length ? { dropped } : {}), ...(Object.keys(replaced).length ? { replaced } : {}), note: "Nothing new is waiting on your owner: send them nothing." };
   }
   const target = dmOf(owner);
   if (!target) {
     throw refusal(`${NOTIFY_TOOL}: your owner's DM is not known yet (Raft gives none until the DM exists, and your owner has ` +
       "not written in it yet), so nothing can be sent; it is known once they write to you there");
   }
-  const content = compose(send, { brief, now, askZone });
+  const content = compose(send, { brief, now, askZone, unreadable });
   // One key per set of items, so a retry of the same call lands once.
   const key = `assistant-${createHash("sha256").update(JSON.stringify([brief ? today : "", ...send.map((i) => i.key).sort()])).digest("hex").slice(0, 32)}`;
   const out = await deps.send(ctx, target, content, key);
@@ -489,12 +543,16 @@ export async function notifyOwner(args: unknown, ctx: PluginContext, deps: Notif
     return { state: "not_sent", reason: out.held, note: `Read your owner's DM (${target}) first, then call ${NOTIFY_TOOL} again with the same items.` };
   }
   for (const i of send) await ctx.db.put(REMINDED_STORE, { at: now, ref: i.ref } as unknown as Json, i.key);
+  if (unreadIds.length) await markToldUnreadable(ctx, unreadIds, now);
   // The brief took everything the night held: sent now, or dropped as said or covered.
   if (brief) await ctx.db.delete(ASSISTANT_STORE, DEFERRED_KEY);
   await saveOwner(ctx, {
     ...(await loadOwner(ctx) ?? owner), ...(askZone ? { askedTimezone: true } : {}), ...(brief ? { briefSent: today } : {}),
   });
-  return { state: "sent", items: send.length, target, ...(Object.keys(dropped).length ? { dropped } : {}) };
+  return {
+    state: "sent", items: send.length, target, ...(Object.keys(dropped).length ? { dropped } : {}), ...(Object.keys(replaced).length ? { replaced } : {}),
+    ...(unreadable.length ? { unreadable: unreadable.length } : {}),
+  };
 }
 
 export async function preferences(args: unknown, ctx: PluginContext): Promise<Json> {
@@ -575,6 +633,8 @@ export async function noteDoorbell(ctx: PluginContext, now = Date.now()): Promis
 export interface InboxItem {
   channelId: string; channelName: string | null; kind: string; unread: number; hasMention: boolean;
   latestAt: string | null; latestSenderName: string | null; latestPreview: string | null; firstUnreadMessageId: string | null;
+  /** A thread's parent message (null for a channel): `#channel:<its short id>` is the link to the thread. */
+  parentMessageId?: string | null;
 }
 
 /** The owner inbox read, as the plugin's wire answers it (`AssistantWire.ownerInbox`). */
@@ -595,6 +655,7 @@ export function inboxItemsOf(data: unknown): InboxItem[] | null {
       channelId: o.channelId, channelName: str(o.channelName), kind: str(o.kind) ?? "channel",
       unread: typeof o.unread === "number" ? o.unread : 0, hasMention: o.hasMention === true, latestAt: str(o.latestAt),
       latestSenderName: str(o.latestSenderName), latestPreview: str(o.latestPreview), firstUnreadMessageId: str(o.firstUnreadMessageId),
+      ...(str(o.parentMessageId) ? { parentMessageId: str(o.parentMessageId) } : {}),
     }];
   });
 }
@@ -603,22 +664,24 @@ export interface Filtered { candidates: InboxItem[]; muted: number; told: number
 
 /**
  * What of the inbox is worth a model's look, decided in code:
- * - not new (`seen`): a doorbell's check skips a conversation whose latest activity a check already looked at
- *   (`reviewed`), or, in one no check has looked at, activity from before the last check (`since`). The brief passes
- *   neither: it looks at everything still unread;
+ * - not new (`seen`): a doorbell's check skips a conversation whose latest activity an earlier check looked at
+ *   (`reviewed`, per conversation). One no check has looked at is new however old its activity: a conversation can
+ *   reach the unread inbox after a check with activity from before it (a thread reply, the inbox catching up), and a
+ *   time-based cutoff dropped such a one without any check reading it. One whose read failed is never recorded in
+ *   `reviewed` (`assistantWake`), so it stays new. The brief passes none: it looks at everything still unread;
  * - covered by a rule (`muted`): one that names only the channel, or only the sender of the conversation's single
  *   unread message. A rule that names a kind needs the model to know the kind, and the notify tool applies it;
  * - already told (`told`): a conversation whose single unread message the owner was told about.
  */
 export async function prefilter(
-  items: readonly InboxItem[], o: { rules: readonly Rule[]; reviewed?: Readonly<Record<string, string>>; since?: number | null; told(key: string): Promise<boolean> },
+  items: readonly InboxItem[], o: { rules: readonly Rule[]; reviewed?: Readonly<Record<string, string>>; told(key: string): Promise<boolean> },
 ): Promise<Filtered> {
   const out: Filtered = { candidates: [], muted: 0, told: 0, seen: 0 };
   for (const i of items) {
     const at = i.latestAt ? Date.parse(i.latestAt) : NaN;
     const before = o.reviewed?.[i.channelId];
-    const seenUpTo = before !== undefined ? Date.parse(before) : o.since ?? null;
-    if (seenUpTo !== null && Number.isFinite(at) && at <= seenUpTo) { out.seen++; continue; }
+    const seenUpTo = before !== undefined ? Date.parse(before) : NaN;
+    if (Number.isFinite(seenUpTo) && Number.isFinite(at) && at <= seenUpTo) { out.seen++; continue; }
     const channel = i.channelName?.replace(/^#/, "").toLowerCase() ?? null, sender = i.latestSenderName?.replace(/^@/, "").toLowerCase() ?? null;
     if (o.rules.some((r) => r.kind === null && ((r.sender === null && r.channel !== null && r.channel === channel) ||
       (r.channel === null && r.sender !== null && r.sender === sender && i.unread <= 1)))) { out.muted++; continue; }
@@ -630,7 +693,71 @@ export async function prefilter(
 
 const REVIEWED_MAX = 500;
 const COUNT_DAYS = 14;
-export type WakeOutcome = "skipped_empty" | "skipped_filtered" | "invoked" | "paused" | "night_deferred" | "failed";
+export type WakeOutcome = "skipped_empty" | "skipped_filtered" | "invoked" | "unreadable" | "paused" | "night_deferred" | "failed";
+
+/** A conversation no read of which succeeded: how many wakes in a row tried, and whether the owner was told so. */
+/**
+ * A conversation no read of which succeeded: how many wakes in a row tried, its latest activity as the inbox last gave
+ * it, and the activity the owner was last told it could not be read at (null: not told). The inbox gives a
+ * conversation's latest activity as a time and no seq, so that time is what "the same activity" is counted by.
+ */
+export interface Unreadable { label: string; attempts: number; latestAt: string | null; toldAt: string | null }
+
+function unreadableOf(raw: unknown): Record<string, Unreadable> {
+  const o = raw && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, unknown> : {};
+  const str = (v: unknown) => (typeof v === "string" && v ? v : null);
+  return Object.fromEntries(Object.entries(o).flatMap(([k, v]) => {
+    const u = v && typeof v === "object" ? v as Record<string, unknown> : null;
+    return u && typeof u.label === "string" ? [[k, { label: u.label, attempts: Number(u.attempts) || 0, latestAt: str(u.latestAt), toldAt: str(u.toldAt) }]] : [];
+  }));
+}
+
+/** Whether the owner was told this conversation could not be read, at its activity now: then nothing more is said of it. */
+const toldUnreadable = (u: Unreadable | undefined) =>
+  !!u && u.toldAt !== null && (u.latestAt === null || Date.parse(u.latestAt) <= Date.parse(u.toldAt));
+
+/** The conversations of `ids` the owner was just told could not be read, kept as told at their present activity. */
+async function markToldUnreadable(ctx: PluginContext, ids: readonly string[], now: number): Promise<void> {
+  const kept = unreadableOf(await ctx.db.get(ASSISTANT_STORE, UNREADABLE_KEY));
+  for (const id of ids) if (kept[id]) kept[id].toldAt = kept[id].latestAt ?? new Date(now).toISOString();
+  await ctx.db.put(ASSISTANT_STORE, kept as unknown as Json, UNREADABLE_KEY);
+}
+
+/** One conversation a check was given, with the short ids of the messages its read showed. */
+export interface CheckRow { channelId: string; channelName: string | null; firstUnreadMessageId: string | null; parentMessageId: string | null; ids: string[] }
+/** What the last check was given: the conversations it could read, and the channelIds of those it could not. */
+export interface CheckRecord { at: number; rows: CheckRow[]; unreadable: string[] }
+
+function checkOf(raw: unknown): CheckRecord | null {
+  const o = raw && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, unknown> : null;
+  if (!o || !Array.isArray(o.rows)) return null;
+  return {
+    at: Number(o.at) || 0, rows: o.rows.filter((r): r is CheckRow => !!r && typeof r === "object" && typeof (r as CheckRow).channelId === "string" && Array.isArray((r as CheckRow).ids)),
+    unreadable: Array.isArray(o.unreadable) ? o.unreadable.filter((l): l is string => typeof l === "string") : [],
+  };
+}
+
+const short8 = (id: string) => id.slice(0, 8).toLowerCase();
+const nameOf = (row: { channelName: string | null }) => row.channelName?.replace(/^#/, "").toLowerCase() ?? null;
+/** How a conversation is named to the owner: its channel (a thread's parent channel), else its id. */
+const labelOf = (i: InboxItem) => i.channelName ? `#${i.channelName.replace(/^#/, "")}${i.kind === "thread" ? " (a thread)" : ""}` : i.channelId;
+
+/**
+ * An item's reference held against what the check read: kept when a read of a conversation in its channel showed that
+ * message (or it is the inbox's first unread); else the inbox row's own link, `#channel:<first unread>` (a thread's
+ * `#channel:<parent>`), with the first unread as its key, so it is the same item as the prefilter's "already told";
+ * null when no conversation the check was given is in that channel, or the row has nothing to link.
+ */
+export function confirmRef(i: Item, rows: readonly CheckRow[]): Item | null {
+  const same = rows.filter((r) => i.channel !== null && nameOf(r) === i.channel);
+  if (!same.length) return null;
+  const id = i.key.startsWith("msg:") ? i.key.slice(4) : null;
+  if (id && same.some((r) => r.ids.includes(id) || (r.firstUnreadMessageId !== null && short8(r.firstUnreadMessageId) === id))) return i;
+  const row = same.find((r) => r.firstUnreadMessageId !== null);
+  if (!row) return null;
+  const link = short8(row.parentMessageId ?? row.firstUnreadMessageId!);
+  return { ...i, ref: `#${row.channelName!.replace(/^#/, "")}:${link}`, key: `msg:${short8(row.firstUnreadMessageId!)}` };
+}
 
 /** One wake's outcome: a trace row, a log line and the day's count. Counts only, never content. */
 async function record(ctx: PluginContext, day: string, trigger: "doorbell" | "brief", outcome: WakeOutcome, attrs: Record<string, number | string> = {}) {
@@ -681,9 +808,18 @@ export function briefInstruction(alias: string, o: { zone: string; held: number;
     "Call it even with no items: it decides whether anything is sent.";
 }
 
+/**
+ * One conversation read as the check's model would first read it (src/plugins/raft.ts: the wire, then
+ * `renderOwnerMessages`'s checks): the short ids of the messages it showed, or why it could not be read.
+ */
+export type MessagesProbe = (ctx: PluginContext, channelId: string) => Promise<{ ok: true; ids: string[] } | { ok: false; error: string }>;
+
 export interface WakeDeps {
   recheck(ctx: PluginContext): Promise<AssistantOwner | null>;
   inbox: InboxRead;
+  messages: MessagesProbe;
+  /** The notify tool's send, for the one line a wake says itself: that it could not read anything it was to look at. */
+  send: NotifyDeps["send"];
   now?: () => number;
 }
 
@@ -707,7 +843,8 @@ export async function assistantWake(ctx: PluginContext, deps: WakeDeps): Promise
   const briefDue = hour >= BRIEF_HOUR && hour < BRIEF_LATEST_HOUR && owner.lastBrief !== day;
   const trigger = briefDue ? "brief" : owner.doorbellAt !== null ? "doorbell" : null;
   if (trigger === null) return { wakeAt: nextBriefAt(now, zone0) };
-  // The doorbell is taken now, whatever comes of it: a check that fails is not retried, the next doorbell or brief reads again.
+  // The doorbell is taken now, whatever comes of it: a check that fails is not retried, the next doorbell or brief
+  // reads again. A conversation that could not be read is the exception: it asks short wakes of its own (`RETRY_BACKOFF_MS`).
   if (owner.doorbellAt !== null) await saveOwner(ctx, owner = { ...owner, doorbellAt: null });
   if (owner.pausedAt !== null) {
     const again = await deps.recheck(ctx);
@@ -739,43 +876,119 @@ export async function assistantWake(ctx: PluginContext, deps: WakeDeps): Promise
   };
   const rules = rulesOf(await ctx.db.get(ASSISTANT_STORE, RULES_KEY));
   const told = async (key: string) => (await ctx.db.get(REMINDED_STORE, key)) !== undefined;
+  const pending = unreadableOf(await ctx.db.get(ASSISTANT_STORE, UNREADABLE_KEY));
+  /**
+   * Each conversation the model is to look at, read here first, and once more on a failure: what still cannot be read
+   * is not handed to the model, whose summary would otherwise read as if it had been. A refusal that is Raft's
+   * `assistant_not_enabled` pauses and ends the wake, as the inbox read's does.
+   */
+  const probe = async (candidates: readonly InboxItem[]) => {
+    const rows: CheckRow[] = [], failed: InboxItem[] = [];
+    for (const i of candidates) {
+      let out: Awaited<ReturnType<MessagesProbe>> = { ok: false, error: "not read" };
+      for (let attempt = 0; attempt < 2 && !out.ok; attempt++) {
+        out = await deps.messages(ctx, i.channelId).catch((e) => ({ ok: false as const, error: String((e as Error)?.message ?? e) }));
+        if (!out.ok) {
+          await pauseOn(ctx, new Error(out.error));
+          if ((await loadOwner(ctx))?.pausedAt != null) throw new Error(out.error);
+        }
+      }
+      if (out.ok) {
+        rows.push({ channelId: i.channelId, channelName: i.channelName, firstUnreadMessageId: i.firstUnreadMessageId, parentMessageId: i.parentMessageId ?? null, ids: out.ids.map(short8) });
+      } else failed.push(i);
+    }
+    return { rows, failed };
+  };
+  /**
+   * What this wake could not read, kept with its count of wakes in a row; anything else drops out (read now, read by
+   * the owner, or covered by a rule since). The check's record says what the model was given and what it was not.
+   */
+  const keepUnreadable = async (failed: readonly InboxItem[], rows: readonly CheckRow[]) => {
+    const next: Record<string, Unreadable> = {};
+    for (const i of failed) {
+      const was = pending[i.channelId];
+      // New activity starts the retries over; what the owner was told stays, and covers only the activity it was told at.
+      const moved = !was || (i.latestAt !== null && (was.latestAt === null || Date.parse(i.latestAt) > Date.parse(was.latestAt)));
+      next[i.channelId] = { label: labelOf(i), attempts: moved ? 1 : was.attempts + 1, latestAt: i.latestAt, toldAt: was?.toldAt ?? null };
+    }
+    await ctx.db.put(ASSISTANT_STORE, next as unknown as Json, UNREADABLE_KEY);
+    await ctx.db.put(ASSISTANT_STORE, { at: now, rows, unreadable: failed.map((i) => i.channelId) } as unknown as Json, CHECK_KEY);
+    return next;
+  };
+  /** The short wake to look again while something could not be read and its retries are not spent; else `next`. */
+  const again = (kept: Readonly<Record<string, Unreadable>>, failed: readonly InboxItem[]) => {
+    const delays = failed.flatMap((i) => { const d = RETRY_BACKOFF_MS[(kept[i.channelId]?.attempts ?? Infinity) - 1]; return d === undefined ? [] : [d]; });
+    return delays.length ? Math.min(now + Math.min(...delays), next) : next;
+  };
+  /**
+   * Nothing the wake was to look at could be read: no model call, since there is nothing it could say truthfully, and
+   * the owner gets only the line saying so, about the conversations not already said at their present activity.
+   */
+  const sayUnreadable = async (failed: readonly InboxItem[], kept: Readonly<Record<string, Unreadable>>) => {
+    const fresh = failed.filter((i) => !toldUnreadable(kept[i.channelId]));
+    const target = dmOf(owner!);
+    if (!fresh.length || !target) return 0;
+    const key = `assistant-unreadable-${createHash("sha256").update(JSON.stringify(fresh.map((i) => [i.channelId, i.latestAt]).sort())).digest("hex").slice(0, 32)}`;
+    const out = await deps.send(ctx, target, couldNotRead(fresh.map(labelOf)), key);
+    if (out.sent) await markToldUnreadable(ctx, fresh.map((i) => i.channelId), now);
+    return out.sent ? 1 : 0;
+  };
   try {
     if (trigger === "doorbell") {
       const items = await read("unread");
       const reviewed = reviewedOf(await ctx.db.get(ASSISTANT_STORE, REVIEWED_KEY));
-      const f = await prefilter(items, { rules, reviewed, since: owner.lastCheckAt, told });
-      // What this check looked at is not new to the next one, whether or not the model is asked.
+      const f = await prefilter(items, { rules, reviewed, told });
+      const { rows, failed } = await probe(f.candidates);
+      // What this check looked at is not new to the next one, whether or not the model is asked; what it could not
+      // read was not looked at.
       const merged = { ...reviewed };
-      for (const i of items) if (i.latestAt) merged[i.channelId] = i.latestAt;
+      for (const i of items) if (i.latestAt && !failed.includes(i)) merged[i.channelId] = i.latestAt;
       const bounded = Object.fromEntries(Object.entries(merged).sort(([, a], [, b]) => Date.parse(b) - Date.parse(a)).slice(0, REVIEWED_MAX));
       await ctx.db.put(ASSISTANT_STORE, bounded as unknown as Json, REVIEWED_KEY);
-      await saveOwner(ctx, { ...owner, lastCheckAt: now });
-      const counts = { conversations: items.length, candidates: f.candidates.length, muted: f.muted, told: f.told, seen: f.seen };
-      if (!f.candidates.length) {
+      const kept = await keepUnreadable(failed, rows);
+      const wakeAt = again(kept, failed);
+      // The short wake comes back as a doorbell, so it reads again.
+      await saveOwner(ctx, { ...owner, lastCheckAt: now, doorbellAt: wakeAt < next ? now : null });
+      const candidates = f.candidates.filter((i) => !failed.includes(i));
+      const counts = { conversations: items.length, candidates: candidates.length, muted: f.muted, told: f.told, seen: f.seen, unreadable: failed.length };
+      if (!candidates.length) {
+        if (failed.length) {
+          await record(ctx, day, trigger, "unreadable", { ...counts, said: await sayUnreadable(failed, kept) });
+          return { wakeAt };
+        }
         await record(ctx, day, trigger, items.length ? "skipped_filtered" : "skipped_empty", counts);
-        return { wakeAt: next };
+        return { wakeAt };
       }
       await record(ctx, day, trigger, "invoked", counts);
-      return { turn: checkInstruction(ctx.alias, f.candidates, rules), isolated: true, turnKey: "assistant.check", wakeAt: next };
+      return { turn: checkInstruction(ctx.alias, candidates, rules), isolated: true, turnKey: "assistant.check", wakeAt };
     }
     const unread = await read("unread");
     const all = await read("all");
-    const waiting = (await prefilter(unread, { rules, told })).candidates;
+    const waiting0 = (await prefilter(unread, { rules, told })).candidates;
     const dayAgo = now - 24 * 3_600_000;
-    const recent = all.filter((i) => i.latestAt && Date.parse(i.latestAt) >= dayAgo && !waiting.some((w) => w.channelId === i.channelId));
-    const active = (await prefilter(recent, { rules, told: async () => false })).candidates;
+    const recent = all.filter((i) => i.latestAt && Date.parse(i.latestAt) >= dayAgo && !waiting0.some((w) => w.channelId === i.channelId));
+    const active0 = (await prefilter(recent, { rules, told: async () => false })).candidates;
+    const { rows, failed } = await probe([...waiting0, ...active0]);
+    const waiting = waiting0.filter((i) => !failed.includes(i)), active = active0.filter((i) => !failed.includes(i));
+    const kept = await keepUnreadable(failed, rows);
+    const wakeAt = again(kept, failed);
+    if (wakeAt < next) await saveOwner(ctx, owner = { ...owner, doorbellAt: now });
     const held = deferredOf(await ctx.db.get(ASSISTANT_STORE, DEFERRED_KEY)).length;
     const askZone = owner.timezone === null && owner.statedTimezone === null && !owner.askedTimezone;
-    const counts = { conversations: unread.length + recent.length, candidates: waiting.length + active.length, held };
+    const counts = { conversations: unread.length + recent.length, candidates: waiting.length + active.length, held, unreadable: failed.length };
     // Nothing unread worth a look, nothing active in the last day, nothing kept overnight and nothing to ask: no brief,
     // and no model call to find that out. A quiet morning is said by not writing.
     if (!waiting.length && !active.length && !held && !askZone) {
       await saveOwner(ctx, { ...owner, briefSent: day });
+      if (failed.length) {
+        await record(ctx, day, trigger, "unreadable", { ...counts, said: await sayUnreadable(failed, kept) });
+        return { wakeAt };
+      }
       await record(ctx, day, trigger, unread.length || recent.length ? "skipped_filtered" : "skipped_empty", counts);
-      return { wakeAt: next };
+      return { wakeAt };
     }
     await record(ctx, day, trigger, "invoked", counts);
-    return { turn: briefInstruction(ctx.alias, { zone, held, waiting, active, rules }), isolated: true, turnKey: "assistant.brief", wakeAt: next };
+    return { turn: briefInstruction(ctx.alias, { zone, held, waiting, active, rules }), isolated: true, turnKey: "assistant.brief", wakeAt };
   } catch (e) {
     const paused = (await loadOwner(ctx))?.pausedAt !== null;
     await record(ctx, day, trigger, paused ? "paused" : "failed", { error: String((e as Error)?.message ?? e).slice(0, 120) });
@@ -802,7 +1015,7 @@ export function assistantPrompt(alias: string): string {
 
 ${READS(t)} You never post anywhere but your owner's DM, and never speak for your owner.
 
-When your owner writes to you, answer in your DM with ${t("messages_send")}: what is happening in a channel, what someone asked them, a summary of a thread. Read before you answer, cite references (#channel:msgid for a message, task #N for a task), and say plainly when you cannot see something.
+When your owner writes to you, answer in your DM with ${t("messages_send")}: what is happening in a channel, what someone asked them, a summary of a thread. Read before you answer, cite references as #channel:msgid (for a task, the msg= id of the message that is the task: a bare task #N in your DM means the DM's own task, not the channel's), and say plainly when you cannot see something.
 
 Telling your owner unasked what is waiting on them happens apart from this chat, on its own schedule and within their rules. When they tell you not to remind them about something (a channel, a person, a kind of thing), or tell you their time zone, record it with ${t(PREFERENCES_TOOL)} and confirm in one line.
 
@@ -816,5 +1029,5 @@ export function assistantCheckPrompt(alias: string): string {
 
 ${READS(t)}
 
-Report only what is waiting on your owner: ${WAITING}. Each item carries a reference your owner can click — #channel:msgid for a message (the msg= id from a read), task #N for a task — and a one-line summary: who wants what from them. The notify tool drops what they were already told, what their rules cover, and holds everything at night, so give it every item you found and let it decide. Never message anyone any other way. When there is nothing, end without a call.`;
+Report only what is waiting on your owner: ${WAITING}. Each item carries a reference your owner can click — #channel:msgid, the channel's name and the msg= id from a read (for a task, the message that is the task; never a bare task #N, which in their DM means the DM's own task) — and a one-line summary: who wants what from them. The notify tool drops what they were already told, what their rules cover, and holds everything at night, so give it every item you found and let it decide. Never message anyone any other way. When there is nothing, end without a call.`;
 }

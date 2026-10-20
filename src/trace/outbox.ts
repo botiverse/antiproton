@@ -100,8 +100,9 @@ export type TraceKind = (typeof TRACE_KINDS)[number];
  * `raft.mcp_call` is one managed MCP call's end, on the call's span: the connector's server name and the remote tool's
  * name, and how it ended (`result`, `tool_error`, or the SDK's failure kind); never its arguments or its result
  * (src/plugins/raft-mcp.ts). `raft.assistant_wake` is one wake of a personal assistant's proactive check (a doorbell or
- * the morning brief) and what came of it — `skipped_empty`, `skipped_filtered`, `invoked`, `paused`, `night_deferred`
- * or `failed` — with counts, never content (src/plugins/raft-assistant.ts).
+ * the morning brief) and what came of it — `skipped_empty`, `skipped_filtered`, `invoked`, `unreadable`, `paused`,
+ * `night_deferred` or `failed` — with counts (`unreadable`: conversations no read of which succeeded), never content
+ * (src/plugins/raft-assistant.ts).
  */
 export const PLUGIN_TRACE_KINDS = ["raft.held", "raft.held_answer", "raft.state_failed", "raft.mcp_call", "raft.assistant_wake"] as const satisfies readonly TraceKind[];
 export type PluginTraceKind = (typeof PLUGIN_TRACE_KINDS)[number];

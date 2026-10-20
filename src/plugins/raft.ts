@@ -2026,6 +2026,24 @@ export function renderOwnerInbox(data: unknown, alias: string, filter: OwnerInbo
   ].join("\n");
 }
 
+/**
+ * One conversation of the owner's, read as `assistant_owner_messages` reads it with no arguments but the channel, and
+ * held to the same checks (`renderOwnerMessages`): what an assistant's wake does before handing the conversation to a
+ * model (src/plugins/raft-assistant.ts `assistantWake`). The ids of the messages it showed confirm the model's
+ * references later; a failure is said in the words the tool's own failure would use.
+ */
+export async function probeOwnerMessages(ctx: PluginContext, channelId: string, wire: AssistantWire): Promise<{ ok: true; ids: string[] } | { ok: false; error: string }> {
+  try {
+    const out = await wire.ownerMessages(ctx, { channelId, limit: OWNER_MESSAGES_LIMIT.default });
+    if (!out.ok) throw ownerFailure(out);
+    renderOwnerMessages(out.data, ctx.alias, new Set());
+    const messages = (out.data as { messages: Array<Record<string, unknown>> }).messages;
+    return { ok: true, ids: messages.map((m) => m.id ?? m.message_id).filter((id): id is string => typeof id === "string") };
+  } catch (e) {
+    return { ok: false, error: String((e as Error)?.message ?? e) };
+  }
+}
+
 /** One owner read, end to end: offered on this mount, its arguments checked, the wire asked, the answer checked. */
 async function ownerRead(
   name: typeof OWNER_INBOX_TOOL | typeof OWNER_MESSAGES_TOOL, args: unknown, ctx: PluginContext, wire: AssistantWire,
@@ -3141,7 +3159,10 @@ export function createRaftPlugin(deps: {
 
     /** A personal assistant's doorbell checks and morning brief (`assistantWake`); nothing for any other agent. */
     async wake(ctx) {
-      return assistantWake(ctx, { recheck: recheckOwner, inbox: (c, r) => assistant.ownerInbox(c, r) });
+      return assistantWake(ctx, {
+        recheck: recheckOwner, inbox: (c, r) => assistant.ownerInbox(c, r), send: sendToOwner,
+        messages: (c, channelId) => probeOwnerMessages(c, channelId, assistant),
+      });
     },
   };
   // Every call: a failure that is Raft's `assistant_not_enabled` pauses an assistant's proactive work (`pauseOn`), and
