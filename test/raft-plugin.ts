@@ -1318,9 +1318,14 @@ await check("actions_prepare posts the card the manifest describes, as a write t
 
 await check("a truncated pull says so in words, and a complete one carries no such note", async () => {
   const m = mount();
-  const calls = one(events([{ message_id: "m-9aaaaaa", seq: 12, content: "x", sender_type: "human", sender_name: "t", timestamp: "2026-09-28T10:00:00.000Z", channel_name: "g", channel_type: "channel" }], { last_seen_seq: 12, has_more: true }));
+  // The listing that would summarise the rest fails: the pull still answers, and its note alone says what to do.
+  const calls = many(events([{ message_id: "m-9aaaaaa", seq: 12, content: "x", sender_type: "human", sender_name: "t", timestamp: "2026-09-28T10:00:00.000Z", channel_name: "g", channel_type: "channel" }], { last_seen_seq: 12, has_more: true }),
+    json(500, { error: "down" }));
   const out = await raftPlugin.invoke("receive_events", { limit: 4 }, m.ctx) as any;
-  if (out.hasMore !== true || !/call receive_events again until hasMore is false/.test(out.note) || calls.length !== 1) throw new Error(JSON.stringify(out));
+  if (out.hasMore !== true || !/Read what is addressed to you \(DMs, @mentions, your threads\) and stop/.test(out.note) || !/do not page through channel backlog/.test(out.note) ||
+      /again until hasMore is false/.test(out.note) || "inbox" in out || out.messages.length !== 1 || calls.length !== 2 || !/\/inbox\/conversations/.test(calls[1]!.url)) {
+    throw new Error(JSON.stringify({ out, calls: calls.map((c) => c.url) }));
+  }
   one(events([], { last_seen_seq: 12 }));
   const done = await raftPlugin.invoke("receive_events", {}, m.ctx) as any;
   if (done.hasMore !== false || "note" in done) throw new Error(JSON.stringify(done));
@@ -1507,6 +1512,133 @@ function failingSinceWrites(db: any, at: readonly number[]) {
       return t.put(store, value, key);
     } });
 }
+
+/**
+ * An agent's inbox after a migration, as one wake meets it: two channels with over a thousand unread each that never
+ * mention it, one DM, and one channel message that @mentions it. Raft's rules are `raftInbox`'s (cursor acks, at most
+ * five rows per conversation per response, the backlog first in the queue, so the first pull is backlog only), plus the unread listing
+ * (`/inbox/conversations`), a conversation's history (`/history`) and a send. `before` on `/history` is paging back.
+ */
+const BACKLOG = { "#general": 1294, "#random": 1050 } as const;
+function wakeInbox() {
+  const row = (seq: number, content: string, channel: string, type = "channel", sender = "tygg") => ({
+    id: `m${String(seq).padStart(7, "0")}`, seq, content, sender_type: "human", sender_name: sender,
+    timestamp: "2026-10-20T08:00:00Z", channel_name: channel, channel_type: type,
+  });
+  const general = Array.from({ length: BACKLOG["#general"] }, (_, i) => row(i + 1, `general chatter ${i + 1}`, "general"));
+  const random = Array.from({ length: BACKLOG["#random"] }, (_, i) => row(2001 + i, `random chatter ${i + 1}`, "random"));
+  const dm = row(5000, "can you look at the release notes?", "ada", "dm", "ada");
+  const mention = row(5001, "@gwynne the deploy is stuck, can you check?", "ops");
+  let waiting = [...general, ...random, dm, mention];
+  let pending: typeof waiting = [];
+  const requests: Array<{ path: string; query: Record<string, string>; body?: any }> = [];
+  const acked: number[] = [];
+  const listing = {
+    view: "unread", hasMore: false, nextBeforeSeq: null, totals: { conversations: 4, dms: 1, mentions: 1 },
+    items: [
+      { target: "#ops", kind: "channel", unread: 1, mentions: 1, lastReadSeq: 4990, activitySeq: 5001, latestSenderName: "tygg", latestAt: "2026-10-20T08:00:00Z" },
+      { target: "dm:@ada", kind: "dm", unread: 1, mentions: 0, lastReadSeq: 4980, activitySeq: 5000, latestSenderName: "ada", latestAt: "2026-10-20T08:00:00Z" },
+      { target: "#random", kind: "channel", unread: BACKLOG["#random"], mentions: 0, lastReadSeq: 2000, activitySeq: 3050, latestSenderName: "tygg", latestAt: "2026-10-20T07:00:00Z" },
+      { target: "#general", kind: "channel", unread: BACKLOG["#general"], mentions: 0, lastReadSeq: 0, activitySeq: 1294, latestSenderName: "tygg", latestAt: "2026-10-20T06:00:00Z" },
+    ],
+  };
+  globalThis.fetch = (async (url: any, init?: any) => {
+    const u = new URL(String(url));
+    const path = u.pathname.replace("/internal/agent-api", "");
+    const query = Object.fromEntries(u.searchParams);
+    requests.push({ path, query, ...(init?.body ? { body: JSON.parse(String(init.body)) } : {}) });
+    if (path === "/events") {
+      const since = query.since, limit = Number(query.limit ?? 50);
+      if (since !== undefined && /^\d+$/.test(since)) {
+        for (const r of pending) if (r.seq <= Number(since)) acked.push(r.seq);
+        pending = pending.filter((r) => r.seq > Number(since));
+      }
+      const out = [...pending], per = new Map<string, number>();
+      for (const r of out) per.set(r.channel_name, (per.get(r.channel_name) ?? 0) + 1);
+      for (const r of [...waiting]) {
+        if (out.length >= limit) break;
+        if ((per.get(r.channel_name) ?? 0) >= 5) continue;
+        out.push(r); per.set(r.channel_name, (per.get(r.channel_name) ?? 0) + 1); waiting = waiting.filter((q) => q !== r);
+      }
+      pending = out;
+      return events(out, { last_seen_seq: out.length ? Math.max(...out.map((r) => r.seq)) : null, has_more: waiting.length > 0 });
+    }
+    if (path === "/inbox/conversations") return json(200, listing);
+    if (path === "/history") {
+      const target = query.channel ?? query.target ?? "";
+      if (target === "dm:@ada") return history([historyMessage(5000, dm.content, { channel_name: "ada", channel_type: "dm", sender_name: "ada" })], { target });
+      if (target === "#ops") return history([historyMessage(5001, mention.content, { channel_name: "ops" })], { target });
+      const rows = target === "#general" ? general : random;
+      return history(rows.slice(-9).map((r) => historyMessage(r.seq, r.content, { channel_name: r.channel_name })), { target, has_older: true });
+    }
+    if (path === "/v2/send") return SENT(6000 + requests.filter((r) => r.path === "/v2/send").length);
+    return json(404, { error: "not found", code: "NOT_FOUND" });
+  }) as any;
+  return { requests, acked, left: () => waiting.length + pending.length };
+}
+/** The read calls an `inbox` line hands the model, as the arguments the model would pass. */
+const readsIn = (lines: readonly string[]) => lines.flatMap((l) => {
+  const m = /Read: messages_read\(\{ target: ("[^"]+"), after: (\d+) \}\)/.exec(l);
+  return m ? [{ target: JSON.parse(m[1]!) as string, after: Number(m[2]) }] : [];
+});
+
+/**
+ * The most Raft requests one wake makes on that inbox when the model does what its tools say: one pull, one listing
+ * (both inside receive_events), one read of each owed conversation, and one answer to each.
+ */
+const WAKE_CALL_BOUND = 6;
+
+await check("a wake on two 1,000+ backlogs, a DM and a mention reads the DM and the mention, answers both, never pages the backlog, and stays within the call bound", async () => {
+  const server = wakeInbox();
+  const fresh = freshDb();
+  const m = inTurn({ ...ctx(), db: fresh.db }, "ctx_wake");
+  // The wake: one read, as the instruction says.
+  const out = await raftPlugin.invoke("receive_events", {}, m) as any;
+  if (out.hasMore !== true || !Array.isArray(out.inbox)) throw new Error(`no inbox summary beside a pull that leaves more: ${JSON.stringify(out)}`);
+  if (parked(out)) throw new Error(`the pull with its summary would be parked: ${JSON.stringify(out).length} > ${PULL_LINE}`);
+  if (!/never paging back/.test(out.note) || /again until hasMore is false/.test(out.note)) throw new Error(`note: ${out.note}`);
+  // The pull itself is backlog only: what is owed reaches the model through the summary, not by paging to it.
+  if ((out.messages as string[]).some((l) => /target=(?:dm:@ada|#ops) /.test(l))) throw new Error(`the owed messages came in the first pull, so this shows nothing: ${JSON.stringify(out.messages)}`);
+  // The backlog as counts on one line, with nothing to call; the owed two each with the read that opens them.
+  const background = (out.inbox as string[]).filter((l) => l.startsWith("Background"));
+  if (background.length !== 1 || !background[0]!.includes("#general 1,294 unread") || !background[0]!.includes("#random 1,050 unread") || /messages_read/.test(background[0]!)) {
+    throw new Error(`the backlog is not summarised as counts: ${JSON.stringify(out.inbox)}`);
+  }
+  const reads = readsIn(out.inbox);
+  if (JSON.stringify(reads) !== JSON.stringify([{ target: "#ops", after: 4990 }, { target: "dm:@ada", after: 4980 }])) throw new Error(`owed reads: ${JSON.stringify(out.inbox)}`);
+  // The model does what the lines say: reads each owed conversation, and answers what it found there.
+  const answered: string[] = [];
+  for (const r of reads) {
+    const page = await raftPlugin.invoke("messages_read", r, m) as any;
+    if (!/release notes|deploy is stuck/.test(page.text)) throw new Error(`${r.target} read: ${JSON.stringify(page)}`);
+    const sent = await raftPlugin.invoke("messages_send", { target: r.target, content: "on it", idempotencyKey: `k-${r.target}` }, m) as any;
+    if (sent instanceof Interrupt || sent.state !== "sent") throw new Error(`${r.target} answer: ${JSON.stringify(sent)}`);
+    answered.push(r.target);
+  }
+  const pulls = server.requests.filter((q) => q.path === "/events");
+  const historyOf = (t: string) => server.requests.filter((q) => q.path === "/history" && (q.query.channel ?? q.query.target) === t);
+  if (pulls.length !== 1) throw new Error(`pulls: ${pulls.length}`);
+  for (const t of Object.keys(BACKLOG)) if (historyOf(t).length) throw new Error(`${t} was read: ${JSON.stringify(historyOf(t))}`);
+  if (server.requests.some((q) => q.path === "/history" && q.query.before !== undefined)) throw new Error("paged back");
+  if (JSON.stringify(server.requests.filter((q) => q.path === "/v2/send").map((q) => q.body.target)) !== JSON.stringify(["#ops", "dm:@ada"])) throw new Error(`sends: ${JSON.stringify(server.requests)}`);
+  if (server.requests.length > WAKE_CALL_BOUND) throw new Error(`${server.requests.length} Raft requests, bound ${WAKE_CALL_BOUND}: ${server.requests.map((q) => q.path).join(", ")}`);
+  // Nothing was acknowledged on the agent's behalf, and the backlog is still Raft's to hand out.
+  if (server.acked.length !== 0 || server.left() < BACKLOG["#general"] + BACKLOG["#random"] - EVENTS_LIMIT) throw new Error(`acked ${server.acked.length}, left ${server.left()}`);
+  if (JSON.stringify(answered) !== JSON.stringify(["#ops", "dm:@ada"])) throw new Error(`answered ${answered}`);
+});
+
+await check("an inbox holding only a DM is read as before: one pull, no listing, the same result", async () => {
+  const requests: string[] = [];
+  globalThis.fetch = (async (url: any) => {
+    requests.push(new URL(String(url)).pathname);
+    return events([{ id: "m0005000", seq: 5000, content: "can you look at the release notes?", sender_type: "human", sender_name: "ada",
+      timestamp: "2026-10-20T08:00:00Z", channel_name: "ada", channel_type: "dm" }], { last_seen_seq: 5000, reply_target: "dm:@ada" });
+  }) as any;
+  const out = await raftPlugin.invoke("receive_events", {}, inTurn(mount().ctx)) as any;
+  const expected = { messages: ["[target=dm:@ada msg=m0005000 time=2026-10-20 08:00:00Z type=human] @ada: can you look at the release notes?"], hasMore: false, replyTarget: "dm:@ada" };
+  if (JSON.stringify(out) !== JSON.stringify(expected)) throw new Error(JSON.stringify(out));
+  if (JSON.stringify(requests) !== JSON.stringify(["/internal/agent-api/events"])) throw new Error(`requests: ${requests}`);
+});
 
 await check("a response lost after Raft built it is acknowledged by no later pull: the next pull sends no cursor and the batch is shown again", async () => {
   const fresh = freshDb();
@@ -2797,9 +2929,11 @@ await check("an inbox notice reaches the agent as Raft wrote it, with the one in
 
 await check("the wake says messages to the agent are requests, names the read and send tools as the model sees them, and says plain closing text goes nowhere", async () => {
   const w = wakeInstruction("raft");
-  if (!/^Messages addressed to you \(DMs, @mentions, threads you are in\) are requests to you\./.test(w)) throw new Error(`who is talking is not said first: ${w}`);
+  if (!/^Messages addressed to you \(DMs, @mentions, threads you are in\) are requests to you; other channel activity is background\./.test(w)) throw new Error(`who is talking is not said first: ${w}`);
+  // Unread is not a to-do: one read, then only what is owed, and never the backlog page by page.
+  if (!w.includes("`raft__receive_events` once") || /until hasMore is false/.test(w) || !/never paging back/.test(w) || !/reported as a count/.test(w)) throw new Error(`the wake still asks for the whole inbox: ${w}`);
   if (!w.includes("`raft__receive_events`") || !w.includes("`raft__messages_send`") || !w.includes("`replyTarget`")) throw new Error(w);
-  if (!/plain text that ends your turn is delivered to no one/.test(w) || !/If nothing needs an answer, end without sending/.test(w)) throw new Error(w);
+  if (!/plain text ending your turn reaches no one/.test(w) || !/If nothing needs an answer, end without sending/.test(w)) throw new Error(w);
   // Another alias, another name: the model only knows the names the catalogue gives (src/runtime/pi-tools.ts
   // `qualifyMountedTools`), for a short alias and the longest the console allows.
   for (const alias of ["team-chat", "r".repeat(24)]) {

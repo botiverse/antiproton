@@ -14,7 +14,7 @@ import { clip, logEvent, routeOf } from "../core/log.ts";
 import type { Json, MountRecord } from "../core/types.ts";
 import {
   createRaft, describeRaftRoute, hashRaftSendContent, isInterrupted, projectRaftMessage, raftbenchRunAssignment, RAFT_OPERATIONS, RAFT_STATE_SCHEMA, SeenFrontier,
-  type Raft, type RaftInboxBatch, type RaftInterrupt, type RaftMessage, type RaftOperationSpec, type RaftState, type RaftStateStore, type RaftFailure,
+  type Raft, type RaftInboxBatch, type RaftInboxListing, type RaftInterrupt, type RaftMessage, type RaftOperationSpec, type RaftState, type RaftStateStore, type RaftFailure,
 } from "@botiverse/raft-sdk";
 import { PARK_BYTES } from "./artifacts.ts";
 import {
@@ -50,7 +50,7 @@ const NOTICE_SCHEMA = "raft-agent-inbox-notice.v1";
  * Under the runtime's 4,000-character cut (src/runtime/inbound.ts INBOUND_TEXT_MAX) with room for the
  * one instruction below it: the two caps stack, and the instruction used to be exactly the part a
  * long notice lost. The instruction also goes first, so no cut can reach it. 3,400 leaves the instruction
- * (`wakeInstruction`) its ~430 characters, ~470 with a 24-character alias (the longest cf/src/ui.ts allows).
+ * (`wakeInstruction`) its ~545 characters, ~585 with a 24-character alias (the longest cf/src/ui.ts allows).
  */
 const NOTICE_TEXT_MAX = 3_400;
 const PUSH_REGISTRATION_PATH = "/internal/agent-api/push-webhook";
@@ -1542,6 +1542,62 @@ function withoutDoorbells(ctx: PluginContext, batch: RaftInboxBatch): RaftInboxB
 }
 
 /**
+ * Unread is not a to-do. The agent owes an answer to what is addressed to it — a DM, an @mention, a thread it is in —
+ * and nothing to the rest of a channel's unread activity, which is background. A pull hands the inbox out in seq order,
+ * oldest first, a page at a time, so an agent told to read "until hasMore is false" reads a channel's whole backlog to
+ * reach the one DM behind it: 572 and 1,294 unread in two channels that never mentioned it, every wake, and 117k of
+ * context in seven minutes (a hosted agent after its migration, 2026-10-20). So when more remains than one pull
+ * shows, the pull also says, per conversation, what is unread there and whether it is owed (`inboxSummary`), and the
+ * note says to read only what is owed and stop.
+ */
+const MORE_NOTE = "More unread messages remain. Read what is addressed to you (DMs, @mentions, your threads) and stop: " +
+  "inbox_list counts the rest per conversation; do not page through channel backlog.";
+const INBOX_NOTE = "More unread messages remain; inbox lists them per conversation. Read each DM, thread and @mention there with " +
+  "its read call and answer it. The rest is background: at most its latest page (messages_read with only target), never paging back.";
+
+/**
+ * How much of Raft's unread listing a pull asks for and shows. Raft lists the newest activity first, 1..50 a page. A
+ * pull's result has to stay under `PARK_BYTES` with messages beside it, so owed conversations get a line each, up to
+ * `owed`, and the background ones share one line of counts, up to `background`; the rest is a count.
+ */
+export const INBOX_SUMMARY = { limit: 20, owed: 6, background: 10 } as const;
+
+type InboxConversation = RaftInboxListing["conversations"][number];
+/** Owed an answer: a DM, a thread the agent is in, or a conversation that @mentions it. */
+const owedOf = (c: InboxConversation) => c.kind !== "channel" || c.mentions > 0;
+
+/**
+ * Raft's unread listing (`inbox.list`, the Activity panel; it consumes nothing) for a pull's `inbox`: one line per owed
+ * conversation, with the read that opens it at the agent's read position, then one line counting the background. A
+ * mentioning conversation with more unread than a page is opened at its latest page instead, since reading it from the
+ * read position is the backlog again. Nothing here acknowledges or reads anything on the agent's behalf.
+ */
+export function inboxSummary(listing: RaftInboxListing, unoffered: ReadonlySet<string> = DEFAULT_UNOFFERED): string[] {
+  const n = (k: number) => k.toLocaleString("en-US");
+  const owedLine = (c: InboxConversation) => {
+    const what = c.mentions > 0 ? `mentions you${c.mentions > 1 ? ` ${n(c.mentions)} times` : ""}` : c.kind === "dm" ? "DM to you" : "thread you are in";
+    const read = c.unread <= PAGE_ROWS || c.mentions === 0
+      ? `messages_read({ target: ${JSON.stringify(c.target)}, after: ${c.lastReadSeq} })`
+      : `messages_read({ target: ${JSON.stringify(c.target)} }), then before until you reach the mention`;
+    return offeredTerms(`${c.target}: ${n(c.unread)} unread, ${what}. Read: ${read}`, unoffered);
+  };
+  const owed = listing.conversations.filter(owedOf), background = listing.conversations.filter((c) => !owedOf(c));
+  const shownOwed = owed.slice(0, INBOX_SUMMARY.owed), shownBackground = background.slice(0, INBOX_SUMMARY.background);
+  const lines = shownOwed.map(owedLine);
+  if (shownBackground.length) {
+    lines.push(`Background, no mention: ${shownBackground.map((c) => `${c.target} ${n(c.unread)} unread`).join(", ")}.`);
+  }
+  const unlisted = listing.totals.conversations - shownOwed.length - shownBackground.length;
+  if (unlisted > 0) {
+    const dms = Math.max(0, listing.totals.dms - shownOwed.filter((c) => c.kind === "dm").length);
+    const mentions = Math.max(0, listing.totals.mentions - shownOwed.filter((c) => c.mentions > 0).length);
+    const owedLeft = dms || mentions ? ` (${[dms ? `${n(dms)} DM${dms === 1 ? "" : "s"}` : "", mentions ? `${n(mentions)} mentioning you` : ""].filter(Boolean).join(", ")})` : "";
+    lines.push(offeredTerms(`${n(unlisted)} more unread conversation${unlisted === 1 ? "" : "s"}${owedLeft} not listed: inbox_list pages them.`, unoffered));
+  }
+  return lines;
+}
+
+/**
  * What one `receive_events` hands the model out of the batch Raft returned, what it acknowledges, and whether it
  * records the shown messages as seen.
  *
@@ -1566,7 +1622,9 @@ function withoutDoorbells(ctx: PluginContext, batch: RaftInboxBatch): RaftInboxB
  * Server that acknowledges on read: it has already taken the whole batch, so all of it is handed over, and
  * recorded as seen only when it fits.
  */
-export function handOver(batch: RaftInboxBatch, unoffered: ReadonlySet<string> = DEFAULT_UNOFFERED): { result: Record<string, Json>; shown: RaftMessage[]; cursor: number | null; attested: boolean } {
+export function handOver(
+  batch: RaftInboxBatch, unoffered: ReadonlySet<string> = DEFAULT_UNOFFERED, inbox: readonly string[] | null = null,
+): { result: Record<string, Json>; shown: RaftMessage[]; cursor: number | null; attested: boolean } {
   const queued = batch.messages.filter((m) => m.seq !== null).sort((x, y) => x.seq! - y.seq!);
   const handedOff = batch.messages.filter((m) => m.seq === null);
   const onRead = batch.ackMode === "immediate";
@@ -1578,12 +1636,13 @@ export function handOver(batch: RaftInboxBatch, unoffered: ReadonlySet<string> =
       // Kept short: it is read in the runtime's preview of a parked result, which cuts each string field.
       ...(attested ? [] : ["Too long to show whole; read the stored copy as the note beside this preview says. Not counted as seen, so a send there first shows what is new."]),
       ...(attested && left > 0 ? [`${left} more message${left === 1 ? " was" : "s were"} left unacknowledged so this result is not cut; they come first on your next call.`] : []),
-      ...(hasMore ? ["More unread messages remain: call receive_events again until hasMore is false."] : []),
+      ...(hasMore ? [inbox ? INBOX_NOTE : MORE_NOTE] : []),
     ];
     return {
       messages: shownAt(k).map((m) => modelLine(m, unoffered)),
       hasMore,
-      ...(notes.length ? { note: notes.join(" ") } : {}),
+      ...(inbox && hasMore ? { inbox: [...inbox] } : {}),
+      ...(notes.length ? { note: offeredTerms(notes.join(" "), unoffered) } : {}),
       // Raft's reply target names the newest message of the whole batch, which may not be among those shown.
       ...(batch.replyTarget && left === 0 ? { replyTarget: batch.replyTarget } : {}),
       // A Server that predates cursor acks acknowledged this batch already; say so rather than imply safety.
@@ -1614,7 +1673,8 @@ const OWN_TOOLS: readonly ToolSchema[] = [
     name: "receive_events",
     summary: "Read your queued Raft messages: the way to read after an inbox notice. Each message is one line, " +
       "`[target=… msg=… time=… type=…] @sender: content`; reply with messages_send to that target. A call hands out at most " +
-      `${EVENTS_LIMIT} messages, fewer when they are long, and Raft at most a few per conversation: while hasMore is true, call again. ` +
+      `${EVENTS_LIMIT} messages, oldest first, fewer when they are long. When hasMore is true, inbox lists what is unread per conversation: ` +
+      "read the DMs, threads and @mentions to you it names, and do not page through the rest, which is background. " +
       "What a call showed you is acknowledged by your next call. A call that fails acknowledges nothing: repeat it, and it may hand you messages you were already given.",
     parameters: {
       type: "object", additionalProperties: false,
@@ -2946,7 +3006,15 @@ export function createRaftPlugin(deps: {
           { ack: "cursor", limit, ...(since !== null ? { since } : {}) }, { origin: "model" });
         if (!out.ok) throw sdkFailure(out as RaftFailure, unofferedFor(ctx));
         const batch = withoutDoorbells(ctx, withoutRunAssignments(ctx, (out as { data: RaftInboxBatch }).data));
-        const given = handOver(batch, unofferedFor(ctx));
+        let given = handOver(batch, unofferedFor(ctx));
+        // More than this pull shows: what is unread, per conversation, so the model reads what is owed and stops
+        // (`inboxSummary`). Shown in place of messages it would push over the parking line, which then come next time.
+        // A listing that fails costs only the summary: the pull has happened, and its note still says what to do.
+        if (given.result.hasMore === true) {
+          const listed = await raft.invoke("inbox.list", { limit: INBOX_SUMMARY.limit }, originOf(ctx)).catch(() => null);
+          if (listed?.ok) given = handOver(batch, unofferedFor(ctx), inboxSummary((listed as { data: RaftInboxListing }).data, unofferedFor(ctx)));
+          else logEvent("raft.inbox_summary_failed", { tenantId: ctx.caller.tenantId, agentId: ctx.caller.agentId, mount: ctx.alias });
+        }
         // Exactly this call's cursor, lower than the last one or not: the next pull acknowledges what was shown here.
         // A Server that acknowledged on read has nothing pending, so the next pull sends none. Written before anything
         // is recorded as seen, so a write that fails leaves nothing attested and the next pull acknowledging nothing.
@@ -3249,9 +3317,10 @@ async function receiveNotice(payload: ObjectValue, inbound: InboundEvent, ctx: P
  */
 export function wakeInstruction(alias: string): string {
   const receive = modelToolName(alias, "receive_events"), send = modelToolName(alias, "messages_send");
-  return "Messages addressed to you (DMs, @mentions, threads you are in) are requests to you. " +
-    `Read them with \`${receive}\` until hasMore is false; your next read acknowledges what you were given. ` +
-    `Answer each one that needs it with \`${send}\` to that message's target (its \`target=\`, or the read's \`replyTarget\`): ` +
-    "the plain text that ends your turn is delivered to no one. If nothing needs an answer, end without sending.";
+  return "Messages addressed to you (DMs, @mentions, threads you are in) are requests to you; other channel activity is background. " +
+    `Call \`${receive}\` once; your next read acknowledges what it gave. If hasMore, read each DM, thread and @mention its inbox ` +
+    "lists, with the call on its line; background: at most its latest page, never paging back, reported as a count. " +
+    `Answer with \`${send}\` to the message's target (\`target=\` or \`replyTarget\`): ` +
+    "plain text ending your turn reaches no one. If nothing needs an answer, end without sending.";
 }
 
