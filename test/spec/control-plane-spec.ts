@@ -392,7 +392,7 @@ export function controlPlaneCases(db: D1Database): SpecCase[] {
     await db.batch([db.prepare("DELETE FROM usage_hourly"), db.prepare("DELETE FROM tenant_plans"), db.prepare("DELETE FROM spend_pool_limits"),
       db.prepare("DELETE FROM spend_limits")]);
     const cols = async (t: string) => ((await db.prepare(`PRAGMA table_info(${t})`).all()).results as any[]).map((r) => String(r.name)).sort().join(",");
-    assert((await cols("tenant_plans")) === "plan,set_at,set_by,tenant_id", `tenant_plans ${await cols("tenant_plans")}`);
+    assert((await cols("tenant_plans")) === "daily_budget_cents,onboarding_daily_budget_cents,plan,set_at,set_by,tenant_id", `tenant_plans ${await cols("tenant_plans")}`);
     assert((await cols("spend_pool_limits")) === "limit_usd,pool,set_at,set_by,tenant_id", `spend_pool_limits ${await cols("spend_pool_limits")}`);
     assert((await cols("spend_pool_limit_events")) === "action,at,by,id,limit_usd,pool,previous,tenant_id", `spend_pool_limit_events ${await cols("spend_pool_limit_events")}`);
     const base = { tenantId: "t-a", raftServerId: "srv", raftOrigin: "https://raft.example", name: "C", instructions: "", credentialHash: null,

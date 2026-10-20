@@ -321,12 +321,14 @@ Antiproton is designed to run as a Cloudflare Worker backed by Durable Objects:
    429, 5xx and network errors are retried, and then dead-lettered, as before.
 
    **Daily spend limits.** Model calls on the operator's accounts stop for the day once a tenant's priced
-   usage reaches its limit — by the plan Raft says its server is on, `FREE_DAILY_LIMIT_USD` ($3 when unset) for
-   `free` and `PRO_DAILY_LIMIT_USD` ($10) for `pro`, `DAILY_LIMIT_USD` ($5) while Raft has said none, or an admin's per-tenant override through
-   `/admin/spend-limits` (audited; `null` for none) — or once every tenant's together reaches
+   usage reaches its limit — the `dailyBudgetCents` Raft sends for its server, and only while Raft has sent none the
+   plan's fallback, `FREE_DAILY_LIMIT_USD` ($3 when unset) for `free` and `PRO_DAILY_LIMIT_USD` ($10) for `pro`,
+   `DAILY_LIMIT_USD` ($5) while Raft has said no plan; an admin's per-tenant override through `/admin/spend-limits`
+   (audited) can only lower it — or once every tenant's together reaches
    `PLATFORM_DAILY_LIMIT_USD`, $2000 when unset. Agents Raft creates with `budget: "onboarding"` are a pool of
-   their own, in neither figure, refused only at `ONBOARDING_DAILY_LIMIT_USD` ($30) for all of them, or `ONBOARDING_TENANT_DAILY_LIMIT_USD` ($1) for one
-   tenant's (an admin's override wins over either).
+   their own, in neither figure, refused only at `ONBOARDING_DAILY_LIMIT_USD` ($30) for all of them (an admin's
+   override replaces it), or one tenant's share: Raft's `onboardingDailyBudgetCents`, else
+   `ONBOARDING_TENANT_DAILY_LIMIT_USD` ($1), which an admin's override can only lower.
    Tenants in `DAILY_LIMIT_EXEMPT_TENANTS` (`bench` when unset) are never refused but count toward the
    platform total. Usage paid with the tenant's own
    credential counts nothing. The check is made in the queue consumer before each provider call, on a

@@ -146,7 +146,8 @@ check("spendLimitsPanel renders defaults, today against limits, and the audit tr
   must(html.includes('class="usd-over"'), "a tenant over its limit is marked");
   must(/acme[\s\S]*?\$1\.62[\s\S]*?\$1\.50[\s\S]*?over/.test(html), "acme's spend is shown against its override, flagged over");
   must(/bench[\s\S]*?<span class="tag">exempt<\/span>/.test(html), "an exempt tenant over the default limit is not flagged");
-  must(/demo[\s\S]*?\$0\.40[\s\S]*?\$5\.00 <span class="hint-inline">default<\/span>/.test(html), "a tenant on the default says so");
+  must(/demo[\s\S]*?\$0\.40[\s\S]*?\$5\.00 <span class="hint-inline">plan default<\/span>/.test(html), "a tenant on the default says so");
+  must(/acme[\s\S]*?\$1\.50 <span class="hint-inline">override<\/span>/.test(html), "a lowering override says it is the source");
   must(/today so far — \$6\.12 of \$30\.00/.test(html), "the platform total is shown against the platform limit");
   must(/Clear the override for acme/.test(html), "clearing an override asks before it acts");
   must(/hx-post="\/ui\/admin\/spend-limits"/.test(html), "writes post back to the fragment");

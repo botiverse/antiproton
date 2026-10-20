@@ -18,6 +18,7 @@ import { md } from "./md.ts";
 import { asMountReports, type MountReports } from "./mount-reports.ts";
 import { FONT_CSS, HEAD_ASSETS } from "./static.ts";
 import { USAGE_CSS } from "./usage.ts";
+import { lowered, onboardingTenantBaseOf, tenantBaseOf, type LimitSource } from "./spend-limit.ts";
 
 const esc = (s: unknown) =>
   String(s ?? "").replace(/[&<>"']/g, (c) =>
@@ -1997,7 +1998,7 @@ export function spendLimitsPanel(d: {
   events: Array<{ tenantId: string; action: "set" | "clear"; limitUsd: number | null; previous: { limitUsd?: number | null }; by: string; at: number }>;
   pools: Array<{ pool: string; tenantId: string | null; limitUsd: number | null; setBy: string; setAt: number }>;
   poolEvents: Array<{ pool: string; tenantId: string | null; action: "set" | "clear"; limitUsd: number | null; previous: { limitUsd?: number | null }; by: string; at: number }>;
-  plans: Array<{ tenantId: string; plan: "free" | "pro" }>;
+  plans: Array<{ tenantId: string; plan: "free" | "pro"; dailyBudgetCents?: number | null; onboardingDailyBudgetCents?: number | null }>;
   /** What each tenant has spent so far today (priced usage, from readUsageCosts over today). */
   today: SpendTodayRow[];
   platformToday: number;
@@ -2007,27 +2008,30 @@ export function spendLimitsPanel(d: {
 }): string {
   const target = `hx-target="#admin" hx-swap="innerHTML"`;
   const overrideOf = new Map(d.overrides.map((o) => [o.tenantId, o]));
+  const planRow = new Map(d.plans.map((p) => [p.tenantId, p]));
   const planOf = new Map(d.plans.map((p) => [p.tenantId, p.plan]));
-  const tenantIds = [...new Set([...d.today.map((t) => t.tenantId), ...d.overrides.map((o) => o.tenantId)])].sort();
-  // As tenantLimitOf (cf/src/spend-limit.ts): the override, else the plan's default, else (no plan ever said) the unset one.
-  const limitOf = (id: string): { value: number | null; via: "override" | "default" | "none" } => {
-    const o = overrideOf.get(id);
-    if (o) return { value: o.limitUsd, via: "override" };
-    const plan = planOf.get(id);
-    const value = plan === "pro" ? d.defaults.proUsd : plan === "free" ? d.defaults.freeUsd : d.defaults.tenantUsd;
-    return { value, via: value === null ? "none" : "default" };
+  const budgetOf = (id: string) => {
+    const p = planRow.get(id);
+    return p ? { dailyCents: p.dailyBudgetCents ?? null, onboardingDailyCents: p.onboardingDailyBudgetCents ?? null } : null;
   };
-  // As onboardingTenantLimitOf: the admin's override of the tenant's share, else the default share.
-  const shareOf = (id: string): number | null => {
-    const o = d.pools.find((p) => p.pool === "onboarding" && p.tenantId === id);
-    return o ? o.limitUsd : d.defaults.onboardingTenantUsd;
+  const tenantIds = [...new Set([...d.today.map((t) => t.tenantId), ...d.overrides.map((o) => o.tenantId),
+    ...d.plans.filter((p) => p.dailyBudgetCents != null).map((p) => p.tenantId)])].sort();
+  // The enforcer's own rule (tenantLimitDetail, cf/src/spend-limit.ts): Raft's budget, else the plan's mapping, and an
+  // admin's override only ever lowers it.
+  const limitOf = (id: string): { value: number | null; via: LimitSource } => {
+    const l = lowered(tenantBaseOf(planOf.get(id) ?? null, budgetOf(id), d.defaults), overrideOf.get(id) ?? null);
+    return { value: l.usd, via: l.source };
   };
+  // As onboardingTenantLimitDetail: Raft's share, else the default, lowered by the admin's override of the tenant's share.
+  const shareOf = (id: string): number | null =>
+    lowered(onboardingTenantBaseOf(budgetOf(id), d.defaults), d.pools.find((p) => p.pool === "onboarding" && p.tenantId === id) ?? null).usd;
+  const viaText: Record<LimitSource, string> = { raft: "from Raft", plan: "plan default", default: "default", override: "override" };
   const onboardingOverride = d.pools.find((p) => p.pool === "onboarding" && p.tenantId === null);
   const onboardingLimit = onboardingOverride ? onboardingOverride.limitUsd : d.defaults.onboardingUsd;
   const onboardingOver = onboardingLimit !== null && d.onboardingToday >= onboardingLimit;
   // What an override's removal restores: the default's dollar amount, or the plain fact of no
   // tenant limit when the default is off — "The — default applies again" would read as a bug.
-  const backTo = "the plan's default applies again";
+  const backTo = "Raft's budget, or the plan's default, applies again";
   const clearForm = (id: string) => `<form hx-post="/ui/admin/spend-limits" ${target}
         hx-confirm="Clear the override for ${esc(id)}? ${backTo}.">
       <input type="hidden" name="action" value="clear"><input type="hidden" name="tenantId" value="${esc(id)}">
@@ -2044,7 +2048,7 @@ export function spendLimitsPanel(d: {
     return `<tr class="${over ? "usd-over" : near ? "usd-near" : ""}">
       <td><code>${esc(id)}</code>${exempt ? ` <span class="tag">exempt</span>` : ""}${planOf.get(id) === "pro" ? ` <span class="tag">pro</span>` : ""}</td>
       <td>${usd(spent)}${t && t.unaccepted ? ` <span class="hint-inline" title="unaccepted answers are our cost, not the tenant's — they count toward the platform total, not this tenant's limit">+${usd(t.unaccepted)} unaccepted</span>` : ""}${t && t.onboarding ? ` <span class="hint-inline${shareOf(id) !== null && t.onboarding >= shareOf(id)! ? " usd-over" : ""}" title="onboarding agents are paid from the onboarding pool — in neither this tenant's limit nor the platform total; judged by the tenant's onboarding share">+${usd(t.onboarding)} onboarding of ${shareOf(id) === null ? "no share limit" : usd(shareOf(id))}</span>` : ""}</td>
-      <td>${limit.value === null ? "no tenant limit" : usd(limit.value)}${limit.via === "default" ? ` <span class="hint-inline">default</span>` : ""}${over ? ` <span class="tag">over</span>` : near ? ` <span class="tag">near</span>` : ""}</td>
+      <td>${limit.value === null ? "no tenant limit" : usd(limit.value)} <span class="hint-inline">${viaText[limit.via]}</span>${overrideOf.has(id) && limit.via !== "override" ? ` <span class="hint-inline" title="an override only lowers the limit; this one is not below it">override not lower</span>` : ""}${over ? ` <span class="tag">over</span>` : near ? ` <span class="tag">near</span>` : ""}</td>
       <td>${overrideOf.has(id) ? clearForm(id) : ""}</td></tr>`;
   }).join("");
   const events = d.events.map((e) => `<tr><td><code>${esc(e.tenantId)}</code></td><td>${e.action}</td>
@@ -2067,9 +2071,10 @@ ${d.error ? `<div class="err">${esc(d.error)}</div>` : ""}
     <b>${d.defaults.platformUsd === null ? "no platform limit" : `${usd(d.defaults.platformUsd)} / platform / day`}</b>
     <span>exempt: ${d.defaults.exempt.length ? d.defaults.exempt.map((t) => `<code>${esc(t)}</code>`).join(" ") : "none"}</span>
   </div>
-  <div class="hint" style="padding:8px 0 0">Set by FREE_DAILY_LIMIT_USD, PRO_DAILY_LIMIT_USD, DAILY_LIMIT_USD (a tenant Raft has never
-    given a plan), PLATFORM_DAILY_LIMIT_USD and DAILY_LIMIT_EXEMPT_TENANTS; a tenant's plan is what Raft last said. A per-tenant override below wins over the plan's default.
-    A tenant with no tenant limit is still refused at the platform limit.</div>
+  <div class="hint" style="padding:8px 0 0">Raft is the source of each tenant's daily limit (<code>dailyBudgetCents</code>, "from Raft").
+    While Raft has sent none, the plan's default applies: FREE_DAILY_LIMIT_USD, PRO_DAILY_LIMIT_USD, DAILY_LIMIT_USD (a tenant Raft has never
+    given a plan). A per-tenant override below can only lower the limit (an emergency stop), never raise it. PLATFORM_DAILY_LIMIT_USD and
+    DAILY_LIMIT_EXEMPT_TENANTS apply over all. A tenant with no tenant limit is still refused at the platform limit.</div>
 </div>
 <h3>onboarding pool — ${usd(d.onboardingToday)} today${onboardingLimit !== null ? ` of ${usd(onboardingLimit)}${onboardingOver ? ` <span class="tag">over</span>` : ""}` : " (no limit)"}</h3>
 <div class="card"><div class="state">
@@ -2080,8 +2085,8 @@ ${d.error ? `<div class="err">${esc(d.error)}</div>` : ""}
   <div class="hint" style="padding:8px 0 0">Agents Raft creates with <code>budget: "onboarding"</code>, in every tenant, paid by the platform:
     in neither their tenant's limit nor the platform total, and refused only by this limit or by their tenant's share of it.
     ONBOARDING_DAILY_LIMIT_USD (${d.defaults.onboardingUsd === null ? "off" : usd(d.defaults.onboardingUsd)}) and
-    ONBOARDING_TENANT_DAILY_LIMIT_USD (${d.defaults.onboardingTenantUsd === null ? "off" : usd(d.defaults.onboardingTenantUsd)}) unless overridden here;
-    with a tenant named, the form sets that tenant's share.</div>
+    ONBOARDING_TENANT_DAILY_LIMIT_USD (${d.defaults.onboardingTenantUsd === null ? "off" : usd(d.defaults.onboardingTenantUsd)}) is the share of a tenant
+    Raft has sent no <code>onboardingDailyBudgetCents</code> for; with a tenant named, the form sets an override that can only lower that tenant's share.</div>
   <form class="admin-set" hx-post="/ui/admin/spend-limits" ${target}>
     <input type="hidden" name="action" value="set"><input type="hidden" name="pool" value="onboarding">
     <label><span>tenant (empty: the pool)</span><input type="text" name="tenantId" autocomplete="off" spellcheck="false"></label>
@@ -2113,9 +2118,9 @@ ${tenantIds.length ? `<table class="overrides"><thead><tr><th>tenant</th><th>spe
 </details>
 <h3>overrides — ${d.overrides.length}</h3>
 ${d.overrides.length ? `<table class="overrides"><thead><tr><th>tenant</th><th>limit</th><th>set by</th><th>set at</th><th></th></tr></thead><tbody>${d.overrides.map((o) => `<tr>
-    <td><code>${esc(o.tenantId)}</code></td><td>${o.limitUsd === null ? "no tenant limit" : usd(o.limitUsd)}</td>
+    <td><code>${esc(o.tenantId)}</code></td><td>${o.limitUsd === null ? "no tenant limit (lowers nothing)" : usd(o.limitUsd)}</td>
     <td>${esc(o.setBy)}</td><td>${when(o.setAt) ?? ""}</td><td>${clearForm(o.tenantId)}</td></tr>`).join("")}</tbody></table>`
-    : `<div class="empty">no overrides — every tenant has the default limit</div>`}
+    : `<div class="empty">no overrides — every tenant has Raft's budget, or the plan's default</div>`}
 <h3>audit — last ${d.events.length}</h3>
 ${d.events.length ? `<table class="overrides"><thead><tr><th>tenant</th><th>action</th><th>limit</th><th>was</th><th>by</th><th>at</th></tr></thead><tbody>${events}</tbody></table>`
     : `<div class="empty">no changes yet</div>`}

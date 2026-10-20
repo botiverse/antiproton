@@ -27,7 +27,7 @@ import {
   type EvalTranscript, type TraceQuery, type TraceWindow,
 } from "../eval-read.ts";
 import { AGENT_BUDGETS, type AgentBudget, type ConnectionRegistry, type ConnectorRefresh, type ConnectorStore, type ProviderTokenIdentity, type ProvisionRegistry, type ProvisionedAgent } from "../control-plane.ts";
-import { PLANS, type Plan, type TenantPlanStore } from "../spend-limit.ts";
+import { MAX_BUDGET_CENTS, PLANS, type BudgetWrite, type Plan, type TenantPlanStore } from "../spend-limit.ts";
 import { CONNECTION_PROVIDERS, returnUrlProblem, scopesFor, type ConnectionProvider, type ReconnectTarget } from "./connect.ts";
 import { surface, surfaceReadOf, type SurfaceDeps } from "../agent-surface/surface.ts";
 import { logEvent } from "../../../src/core/log.ts";
@@ -215,9 +215,9 @@ export interface ProvisionDeps {
    */
   imports?: ImportOps;
   /**
-   * The Raft server's plan (`plan` on POST, `PUT /servers/:raftServerId/plan`), which picks the tenant's default daily
-   * limit (cf/src/spend-limit.ts). Absent: the route answers 404, and a POST naming a plan is refused (503) rather
-   * than made without storing it.
+   * The Raft server's plan and daily budgets (`plan`, `dailyBudgetCents`, `onboardingDailyBudgetCents` on POST and
+   * `PUT /servers/:raftServerId/plan`), which set the tenant's daily limits (cf/src/spend-limit.ts). Absent: the route
+   * answers 404, and a POST naming a plan is refused (503) rather than made without storing it.
    */
   plans?: Pick<TenantPlanStore, "set">;
   /** Where the eval exports' reads are audited (cf/src/read-audit.ts). Absent: not recorded, and an assistant's are refused anyway. */
@@ -412,6 +412,29 @@ export function planField(body: unknown, required: boolean): Plan | null | Fail 
   return v as Plan;
 }
 
+/** The budget fields Raft sends beside `plan`, in whole US cents a day. */
+export const BUDGET_FIELDS = ["dailyBudgetCents", "onboardingDailyBudgetCents"] as const;
+
+/**
+ * `dailyBudgetCents` / `onboardingDailyBudgetCents` of a POST or a plan PUT: absent is "not sent" (undefined: what is
+ * stored is kept), `null` clears a value sent before (the plan's mapping or the default applies again), otherwise a whole
+ * number of cents from 0 to `MAX_BUDGET_CENTS`. Money is never read from a float or a string: `5.5`, `"500"` and `1e9`
+ * are refused naming the field.
+ */
+export function budgetCentsFields(body: unknown): BudgetWrite | Fail {
+  const out: BudgetWrite = {};
+  for (const key of BUDGET_FIELDS) {
+    const v = field(body, key);
+    if (v === undefined) continue;
+    if (v !== null && !(typeof v === "number" && Number.isSafeInteger(v) && v >= 0 && v <= MAX_BUDGET_CENTS)) {
+      return { status: 422, code: "invalid", param: key, message: `${key} is a whole number of US cents a day from 0 to ${MAX_BUDGET_CENTS}, null to clear it, or absent to keep it` };
+    }
+    out[key] = v;
+  }
+  return out;
+}
+const budgetsSent = (b: BudgetWrite) => BUDGET_FIELDS.some((k) => b[k] !== undefined);
+
 function credentialField(body: unknown): string | Fail {
   const v = field(body, "credential");
   if (typeof v !== "string" || !v) return { status: 422, code: "missing", message: "credential is required", param: "credential" };
@@ -542,20 +565,26 @@ export async function handleProvision(
     if (isFail(tenant)) return fail(tenant);
     return importCheck(body, tenant, headers.credentialId ?? null, deps);
   }
-  // The Raft server's plan, which Raft sends whenever it changes: the tenant's default daily limit follows it.
+  // The Raft server's plan and daily budgets, which Raft sends whenever they change: the tenant's daily limits follow.
   if (seg[0] === "servers" && seg.length === 3 && seg[2] === "plan" && method === "PUT") {
     if (!deps.plans) return null;
     const tenant = await serverTenant(who, seg[1]!, deps.registry, "a plan");
     if (isFail(tenant)) return fail(tenant);
     const b = typeof body === "object" && body !== null && !Array.isArray(body) ? body as Record<string, unknown> : {};
-    const extra = Object.keys(b).find((k) => k !== "plan");
-    if (extra) return fail({ status: 422, code: "invalid", param: extra, message: `unknown field ${extra}; the body is { "plan": "free" | "pro" }` });
+    const extra = Object.keys(b).find((k) => k !== "plan" && !(BUDGET_FIELDS as readonly string[]).includes(k));
+    if (extra) {
+      return fail({ status: 422, code: "invalid", param: extra,
+        message: `unknown field ${extra}; the body is { "plan": "free" | "pro", "dailyBudgetCents"?: integer | null, "onboardingDailyBudgetCents"?: integer | null }` });
+    }
     const plan = planField(b, true);
     if (isFail(plan)) return fail(plan);
+    const budgets = budgetCentsFields(b);
+    if (isFail(budgets)) return fail(budgets);
     const at = deps.now();
-    await deps.plans.set(tenant, plan!, headers.credentialId ?? "provider", at);
-    logEvent("provision.plan", { tenantId: tenant, raftServerId: seg[1], plan, via: "put" });
-    return ok({ raftServerId: seg[1], plan, updatedAt: new Date(at).toISOString() });
+    // A budget left out keeps what was stored: an older Raft that sends `{ plan }` alone changes the plan and nothing else.
+    await deps.plans.set(tenant, plan!, headers.credentialId ?? "provider", at, budgets);
+    logEvent("provision.plan", { tenantId: tenant, raftServerId: seg[1], plan, ...budgets, via: "put" });
+    return ok({ raftServerId: seg[1], plan, ...budgets, updatedAt: new Date(at).toISOString() });
   }
   // Whether the server's agents may be given another model than the default (`pickerProblem`), which Raft sends whenever
   // its own switch for the server changes. The same tenant rules as the plan's.
@@ -638,9 +667,16 @@ export async function handleProvision(
     // outside the tenant's limit. Fixed at creation like `model`, so a replay must repeat it.
     const budget = budgetField(body);
     if (isFail(budget)) return fail(budget);
-    // The server's plan as Raft says it now. Not part of the agent, so not compared on a replay (below).
+    // The server's plan and budgets as Raft says them now. Not part of the agent, so not compared on a replay (below).
     const plan = planField(body, false);
     if (isFail(plan)) return fail(plan);
+    const budgets = budgetCentsFields(body);
+    if (isFail(budgets)) return fail(budgets);
+    // The budgets are kept with the plan (one row per tenant), so they travel with it, as on the PUT.
+    if (plan === null && budgetsSent(budgets)) {
+      const named = BUDGET_FIELDS.find((k) => budgets[k] !== undefined)!;
+      return fail({ status: 422, code: "invalid", param: named, message: `${named} is sent with plan` });
+    }
     if (plan !== null && !deps.plans) return fail({ status: 503, code: "unavailable", param: "plan", message: "this deployment cannot record a plan" });
 
     const agentId = providerAgentId(raftAgentId);
@@ -691,8 +727,8 @@ export async function handleProvision(
       // first send, and must not undo a `PUT /servers/:id/plan` that landed since. Before the row, so a create that
       // dies after this has still said it, and its replay (which writes no plan) loses nothing.
       if (plan !== null) {
-        await deps.plans!.set(tenantId, plan, headers.credentialId ?? "provider", deps.now());
-        logEvent("provision.plan", { tenantId, raftServerId, plan, via: "create" });
+        await deps.plans!.set(tenantId, plan, headers.credentialId ?? "provider", deps.now(), budgets);
+        logEvent("provision.plan", { tenantId, raftServerId, plan, ...budgets, via: "create" });
       }
       const t = deps.now();
       // Pending only while there is a pick to store: the default taken with the picker off stores none.

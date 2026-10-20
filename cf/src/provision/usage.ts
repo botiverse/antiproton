@@ -112,6 +112,9 @@ async function read(
       day: iso(spend.day).slice(0, 10),
       spentUsd: tidy(s.spentUsd),
       limitUsd: s.limitUsd,
+      // Where `limitUsd` came from: "raft" (the dailyBudgetCents Raft sent), "plan" (the plan's mapping, Raft having sent
+      // none), or "override" (an admin's override that lowered it); null when exempt.
+      limitSource: s.limitSource,
       plan: s.plan,
       // Paid by the platform (`budget: "onboarding"`), so in neither figure above; given so the panel can say why the
       // history's total for today is larger than `spentUsd`.
@@ -119,6 +122,8 @@ async function read(
       // The tenant's share of the onboarding pool, and whether its onboarding agents' next call would be refused (by the
       // share, or by the pool as a whole being spent: only that boolean is said of the pool, as of the platform).
       onboardingLimitUsd: s.onboardingLimitUsd,
+      // "raft" (onboardingDailyBudgetCents), "default" (ONBOARDING_TENANT_DAILY_LIMIT_USD) or "override"; null when exempt.
+      onboardingLimitSource: s.onboardingLimitSource,
       onboardingRefusing: s.onboardingRefusing,
       exempt: s.exempt,
       platformLimitReached: s.platformLimitReached,

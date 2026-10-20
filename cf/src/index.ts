@@ -166,19 +166,23 @@ export interface Env {
   DEEPSEEK_BASE_URL: string;
   HARNESS_MODEL: string;
   /**
-   * The daily spend limit in US dollars of a tenant Raft has never given a plan (cf/src/spend-limit.ts): unset is $5,
-   * `off` none. An admin's override per tenant wins, as for the two below.
+   * Raft is the source of a tenant's daily limit (`dailyBudgetCents`, PUT /provision/servers/:id/plan;
+   * cf/src/spend-limit.ts). These three are the fallbacks while Raft has sent none: this one for a tenant Raft has never
+   * given a plan, unset $5, `off` none. An admin's override per tenant can only lower the limit, never raise it.
    */
   DAILY_LIMIT_USD?: string;
-  /** A free tenant's (`plan`, as Raft says it): unset is $3, `off` none. */
+  /** Fallback for a free tenant (`plan`, as Raft says it) with no `dailyBudgetCents`: unset is $3, `off` none. */
   FREE_DAILY_LIMIT_USD?: string;
-  /** A pro tenant's: unset is $10, `off` none. */
+  /** Fallback for a pro tenant with no `dailyBudgetCents`: unset is $10, `off` none. */
   PRO_DAILY_LIMIT_USD?: string;
   /** Every tenant's spend together, onboarding agents' left out, per UTC day, in US dollars: unset is $2000, `off` none. */
   PLATFORM_DAILY_LIMIT_USD?: string;
   /** The onboarding agents' spend together (`budget: "onboarding"`): unset is $30, `off` none. An admin's override wins. */
   ONBOARDING_DAILY_LIMIT_USD?: string;
-  /** One tenant's onboarding agents' spend: unset is $1, `off` none. An admin's override for the tenant wins. */
+  /**
+   * One tenant's onboarding agents' spend, the fallback while Raft has sent no `onboardingDailyBudgetCents`: unset is
+   * $1, `off` none. An admin's override for the tenant can only lower it.
+   */
   ONBOARDING_TENANT_DAILY_LIMIT_USD?: string;
   /** Comma-separated tenants no limit refuses (they still count toward the platform total); unset is `bench`. */
   DAILY_LIMIT_EXEMPT_TENANTS?: string;
@@ -3597,7 +3601,7 @@ function provisionDeps(env: Env): ProvisionDeps {
   return {
     now: () => Date.now(),
     registry: d1ProvisionedAgents(env.CONTROL_DB),
-    // The Raft server's plan, which the daily limit's reading picks up (cf/src/spend-limit.ts readDaySpend).
+    // The Raft server's plan and budgets, which the daily limit's reading picks up (cf/src/spend-limit.ts readDaySpend).
     plans: d1TenantPlans(env.CONTROL_DB),
     surface: surfaceDeps(env),
     // The enforcer's own limits and reading (cf/src/spend-limit.ts), so the panel and the queue consumer agree.
