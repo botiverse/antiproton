@@ -23,6 +23,10 @@ import { appworldPlugins, type Catalogue } from "../src/plugins/appworld.ts";
 import { exaPlugin } from "../src/plugins/exa.ts";
 import { githubPlugin } from "../src/plugins/github.ts";
 import { raftPlugin } from "../src/plugins/raft.ts";
+import { SESSION_STORE } from "../src/plugins/raft-agent-login.ts";
+import { PluginDbTables } from "../src/store/plugin-db.ts";
+import { openPluginDatabase } from "../src/runtime/plugin-db.ts";
+import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { sandboxPlugin } from "../src/plugins/sandbox.ts";
 import type { Plugin } from "../src/plugins/types.ts";
 
@@ -119,6 +123,15 @@ for (const [id, c] of Object.entries(CREDENTIAL_PLUGINS)) {
         `${kind}: identity is ${JSON.stringify(r.error!.identity)}, not "unreadable" — so the state is in the sentence only`);
       must(r.error!.credentialRef === kind, `${kind}: credentialRef is ${JSON.stringify(r.error!.credentialRef)}, not "${kind}"`);
     }
+    // "No credential" is not a state that clears on its own, so no call may report it as retriable: the gateway
+    // records a `retryable` failure as `unknown`, which means "it may have landed", and retrying this one can only
+    // fail again. Asserted as `!== true` rather than `=== false` because an absent field is already the answer every
+    // reader handles — what must never appear is the claim.
+    for (const [kind, r] of [["none", none], ["agent", agent], ["operator", operator]] as const) {
+      const e = r.error! as { retryable?: boolean; transient?: boolean };
+      must(e.retryable !== true, `${id} / ${kind}: a missing credential is reported as retriable`);
+      must(e.transient !== true, `${id} / ${kind}: a missing credential is reported as transient`);
+    }
     const said = new Set([none.error!.message, agent.error!.message, operator.error!.message]);
     must(said.size === 3,
       `${id} answers "no account attached", "the agent's account could not be read" and "the operator's credential is ` +
@@ -126,6 +139,45 @@ for (const [id, c] of Object.entries(CREDENTIAL_PLUGINS)) {
       `people to fetch: ${JSON.stringify([...said])}`);
   });
 }
+
+await check("raft: every Agent Login tool reports the identity the call had, not one sentence for three states", async () => {
+  // The Agent Login functions live beside the plugin (src/plugins/raft-agent-login.ts) and reach the model through
+  // four of raft's tools, so a plugin-level case that only drives `receive_events` never touches them. This drives
+  // all four with no credential AND a kept session row, which is the state in which a session is read before any
+  // Raft call: the read must not become the first thing that fails, and if it ever does it must say which state it
+  // is in. (It cannot today: `loadSession` swallows a session that does not open, and the call stops at
+  // `requireCredential`, which is where the identity comes from.)
+  const host = sqliteHost();
+  const plugin = raftPlugin;
+  const tables = new PluginDbTables(host).ensure();
+  const scope = { tenantId: "t", agentId: "a", alias: "raft", plugin: "raft" };
+  const db = openPluginDatabase(tables, scope, plugin.database);
+  await db.put(SESSION_STORE, { v: 1, serviceId: "svc", clientId: "cid", returnUrl: "https://app.test/cb",
+    scopes: null, expiresAt: null, createdAt: 1, iv: "AAAA", ciphertext: "AAAA" } as any, "svc");
+  for (const kind of ["none", "agent", "operator"] as const) {
+    const seen = new Set<string>();
+    for (const tool of ["integrations_list", "integrations_login", "integrations_actions", "integrations_invoke"]) {
+      const ctx: any = {
+        caller: { tenantId: "t", agentId: "a", taskId: "main" }, alias: "raft",
+        publicConfig: { serverUrl: "https://raft.test" }, credential: null, credentialRefKind: kind,
+        db, sibling: async () => null, sandboxForms: async () => [],
+        offered: (plugin.tools ?? []).map((t: any) => t.name),
+      };
+      let e: any = null;
+      try { await plugin.invoke(tool, { service: "svc", action: "a" }, ctx); } catch (err) { e = err; }
+      if (!e) throw new Error(`${tool} answered with no credential at all (kind ${kind})`);
+      const want = kind === "none" ? "none" : "unreadable";
+      if (e.identity !== want) throw new Error(`${tool} / ${kind}: identity is ${JSON.stringify(e.identity)}, not "${want}"`);
+      if (kind !== "none" && e.credentialRef !== kind) throw new Error(`${tool} / ${kind}: credentialRef is ${JSON.stringify(e.credentialRef)}`);
+      if (e.retryable === true || e.transient === true) {
+        throw new Error(`${tool} / ${kind}: a missing credential is reported as something to retry`);
+      }
+      seen.add(e.message);
+    }
+    if (seen.size !== 1) throw new Error(`${kind}: the four tools disagree about the state: ${JSON.stringify([...seen])}`);
+  }
+  host.dispose();
+});
 
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.error ? `\n    ${r.error}` : ""}`);
 const failed = results.filter((r) => !r.ok).length;

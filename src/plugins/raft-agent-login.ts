@@ -27,6 +27,7 @@ import { clip, logEvent, routeOf } from "../core/log.ts";
 import type { Json } from "../core/types.ts";
 import type { Raft } from "@botiverse/raft-sdk";
 import { internalHost } from "./http.ts";
+import { identityNote, markIdentity } from "./types.ts";
 import type { PluginContext, PluginErrorFields, ToolSchema } from "./types.ts";
 
 /** Where a mount keeps its app sessions: one row per Raft service id, none of them listed. */
@@ -251,7 +252,12 @@ const unb64 = (s: string) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
  * those sessions belonged to the identity the old credential named.
  */
 async function sealingKey(ctx: PluginContext): Promise<Awaited<ReturnType<typeof crypto.subtle.deriveKey>>> {
-  if (!ctx.credential) throw fail("raft needs an account: a person must attach an agent credential to this mount");
+  // Not reachable through any tool today, and kept so that stays true: `loadSession` swallows this throw (a kept
+  // session that does not open is "no session", not a failure), and `storeSession` runs only after a Raft call that
+  // needs the credential itself, so every Agent Login tool fails first at raft.ts `requireCredential` — which reports
+  // the identity. Said in the same words and with the same fields anyway, so a reordering that makes this the first
+  // check reports the same three states rather than one sentence for all of them.
+  if (!ctx.credential) throw markIdentity(fail(`raft needs an account: ${identityNote(ctx)}`), ctx);
   const material = await crypto.subtle.importKey("raw", enc.encode(ctx.credential), "HKDF", false, ["deriveKey"]);
   return crypto.subtle.deriveKey(
     { name: "HKDF", hash: "SHA-256", salt: enc.encode(`${ctx.caller.tenantId}\u0000${ctx.caller.agentId}\u0000${ctx.alias}`), info: enc.encode("antiproton raft agent-login session v1") },
