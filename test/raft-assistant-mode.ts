@@ -805,6 +805,111 @@ await check("a doorbell without first_change_at decides on its first read, as be
   must(row?.status === "skipped_filtered" && row.attrs.seen === 4 && !("lagRetry" in row.attrs) && !("inbox_lagging" in row.attrs), show(row));
 });
 
+// ---- the doorbell that names its conversations: the seq rule (slock#10499) -----------------------------------------------
+
+const id = (n: number) => conv(n).channelId;
+const src = (n: number, max_seq: number | string) => ({ channel_id: id(n), max_seq });
+/** The four looked at, each now carrying its latest seq, as a Raft with slock#10499 sends them. */
+const OLD4_SEQ = () => [conv(1, { latestSeq: 30 }), conv(2, { latestSeq: 11 }), conv(3, { latestSeq: 5 }), conv(4, { latestSeq: 8 })];
+
+await check("seq rule: the named conversation at its seq is caught up; below it is lagging however recent another conversation is", async () => {
+  const a = await lookedAtFour();
+  await atTime(DAY, () => ring(a, { first_change_at: MENTION_AT, last_change_at: DAY, sources: [src(2, 12)] }));
+  must(show(a.read(ASSISTANT_STORE, OWNER_KEY).changeSources) === show({ [id(2)]: 12 }), show(a.read(ASSISTANT_STORE, OWNER_KEY)));
+  // B's mention (seq 12) is not in the view yet, but ch1 got a message 4 s after it: the time rule calls this caught up.
+  const busy = conv(1, { latestAt: "2026-10-20T09:59:58.000Z", latestSeq: 31 });
+  a.r.unread = [busy, conv(2, { latestSeq: 11 }), conv(3, { latestSeq: 5 }), conv(4, { latestSeq: 8 })];
+  a.r.all = a.r.unread;
+  const reads0 = a.r.inboxReads.length;
+  const stale = await atTime(DAY, () => wake(a.ctx));
+  const row = wakeRows(a).at(-1);
+  must(stale.turn === undefined && stale.wakeAt === at(DAY) + 5_000, `ch1's recent activity counted as the change: ${show(stale)} ${show(row)}`);
+  must(row?.status === "inbox_lagging" && row.attrs.caught_up === false && row.attrs.caught_up_rule === "seq", show(row));
+  must(show(a.r.inboxReads.slice(reads0)) === show(["unread", "all"]), show(a.r.inboxReads.slice(reads0)));
+  // The view has the mention: seq 12, exactly what was announced.
+  a.r.unread = [busy, mentioned(), conv(3, { latestSeq: 5 }), conv(4, { latestSeq: 8 })];
+  (a.r.unread[1] as any).latestSeq = 12;
+  const reads1 = a.r.inboxReads.length;
+  const caught = await atTime("2026-10-20T10:00:05Z", () => wake(a.ctx));
+  const row2 = wakeRows(a).at(-1);
+  must(caught.isolated === true && caught.turn.includes(id(2)), `caught up: ${show(caught)}`);
+  must(row2?.status === "invoked" && row2.attrs.caught_up === true && row2.attrs.caught_up_via === "unread" && row2.attrs.caught_up_rule === "seq" && row2.attrs.lagRetry === 1, show(row2));
+  must(show(a.r.inboxReads.slice(reads1)) === show(["unread"]), `caught up in the unread read: ${show(a.r.inboxReads.slice(reads1))}`);
+  must(a.read(ASSISTANT_STORE, OWNER_KEY).changeAt === null && show(a.read(ASSISTANT_STORE, OWNER_KEY).changeSources) === "{}", "the change is no longer awaited");
+});
+
+await check("seq rule: a named conversation gone from unread is caught up through the read of everything; one in each read is mixed", async () => {
+  const a = await lookedAtFour();
+  a.r.unread = [conv(1, { latestSeq: 30 }), conv(3, { latestSeq: 5 }), conv(4, { latestSeq: 8 })];
+  a.r.all = [conv(1, { latestSeq: 30 }), { ...mentioned(), unread: 0, latestSeq: 12 }, conv(3, { latestSeq: 5 }), conv(4, { latestSeq: 8 })];
+  await atTime(DAY, () => ring(a, { first_change_at: MENTION_AT, last_change_at: DAY, sources: [src(2, 12)] }));
+  const out = await atTime(DAY, () => wake(a.ctx));
+  const row = wakeRows(a).at(-1);
+  must(out.turn === undefined && row?.status === "skipped_filtered" && row.attrs.caught_up_via === "all" && row.attrs.caught_up_rule === "seq" && row.attrs.lagRetry === 0, `${show(out)} ${show(row)}`);
+  const b = await lookedAtFour();
+  b.r.unread = [conv(1, { latestSeq: 30 }), conv(3, { latestSeq: 7, latestAt: "2026-10-20T09:59:55.000Z" }), conv(4, { latestSeq: 8 })];
+  b.r.all = [conv(1, { latestSeq: 30 }), { ...mentioned(), unread: 0, latestSeq: 12 }, ...b.r.unread.slice(1)];
+  await atTime(DAY, () => ring(b, { first_change_at: MENTION_AT, last_change_at: DAY, sources: [src(2, 12), src(3, 7)] }));
+  await atTime(DAY, () => wake(b.ctx));
+  const rowB = wakeRows(b).at(-1);
+  must(rowB?.attrs.caught_up === true && rowB.attrs.caught_up_via === "mixed" && rowB.attrs.caught_up_rule === "seq", show(rowB));
+});
+
+await check("seq rule: of several named conversations, one below its seq keeps the whole change lagging", async () => {
+  const a = await lookedAtFour();
+  // ch2 is caught up, ch3 (seq 6 < 7) is not, in either read.
+  a.r.unread = [conv(1, { latestSeq: 30 }), { ...mentioned(), latestSeq: 12 }, conv(3, { latestSeq: 6, latestAt: "2026-10-20T09:59:56.000Z" }), conv(4, { latestSeq: 8 })];
+  a.r.all = a.r.unread;
+  await atTime(DAY, () => ring(a, { first_change_at: MENTION_AT, last_change_at: DAY, sources: [src(2, 12), src(3, 7)] }));
+  const out = await atTime(DAY, () => wake(a.ctx));
+  const row = wakeRows(a).at(-1);
+  must(out.turn === undefined && out.wakeAt === at(DAY) + 5_000 && row?.status === "inbox_lagging" && row.attrs.caught_up_rule === "seq", `${show(out)} ${show(row)}`);
+});
+
+await check("a doorbell naming no conversation (sources empty) keeps the time rule as it was, and records it", async () => {
+  const a = await lookedAtFour();
+  // The AndyLok shape again: under the time rule ch1's recent message counts, early, as it always has.
+  a.r.unread = [conv(1, { latestAt: "2026-10-20T09:59:58.000Z", latestSeq: 31 }), conv(2, { latestSeq: 11 }), conv(3, { latestSeq: 5 }), conv(4, { latestSeq: 8 })];
+  await atTime(DAY, () => ring(a, { first_change_at: MENTION_AT, last_change_at: DAY, sources: [] }));
+  const reads = a.r.inboxReads.length;
+  await atTime(DAY, () => wake(a.ctx));
+  const row = wakeRows(a).at(-1);
+  must(row?.attrs.caught_up === true && row.attrs.caught_up_via === "unread" && row.attrs.caught_up_rule === "time" && show(a.r.inboxReads.slice(reads)) === show(["unread"]), `${show(row)} ${show(a.r.inboxReads.slice(reads))}`);
+  // And a stale read under it lags, as before.
+  const b = await lookedAtFour();
+  b.r.unread = OLD4_SEQ();
+  await atTime(DAY, () => ring(b, { first_change_at: MENTION_AT, last_change_at: DAY }));
+  await atTime(DAY, () => wake(b.ctx));
+  must(wakeRows(b).at(-1)?.status === "inbox_lagging" && wakeRows(b).at(-1)?.attrs.caught_up_rule === "time", show(wakeRows(b).at(-1)));
+});
+
+await check("an inbox with no latestSeq on any row (an older Raft) is judged by the time rule, recorded; a row lacking it among others is not caught up", async () => {
+  const a = await lookedAtFour();
+  a.r.unread = [conv(1), mentioned(), conv(3), conv(4)];
+  await atTime(DAY, () => ring(a, { first_change_at: MENTION_AT, last_change_at: DAY, sources: [src(2, 12)] }));
+  const reads = a.r.inboxReads.length;
+  const out = await atTime(DAY, () => wake(a.ctx));
+  const row = wakeRows(a).at(-1);
+  must(out.isolated === true && out.turn.includes(id(2)), `the time rule did not decide: ${show(out)} ${show(row)}`);
+  must(row?.attrs.caught_up === true && row.attrs.caught_up_via === "unread" && row.attrs.caught_up_rule === "time", show(row));
+  must(show(a.r.inboxReads.slice(reads)) === show(["unread", "all"]), show(a.r.inboxReads.slice(reads)));
+  // Some rows carry it, ch2's does not: ch2 shows nothing, so the change is not shown.
+  const b = await lookedAtFour();
+  b.r.unread = [conv(1, { latestSeq: 30 }), mentioned(), conv(3, { latestSeq: 5 }), conv(4, { latestSeq: 8 })];
+  await atTime(DAY, () => ring(b, { first_change_at: MENTION_AT, last_change_at: DAY, sources: [src(2, 12)] }));
+  await atTime(DAY, () => wake(b.ctx));
+  must(wakeRows(b).at(-1)?.status === "inbox_lagging" && wakeRows(b).at(-1)?.attrs.caught_up_rule === "seq", show(wakeRows(b).at(-1)));
+});
+
+await check("pending doorbells' sources are united at the highest seq of each; malformed entries are left out", async () => {
+  const a = await assistant();
+  await atTime(DAY, () => ring(a, { first_change_at: MENTION_AT, last_change_at: DAY, sources: [src(2, 12), src(3, 5), src(3, 4), { channel_id: "", max_seq: 1 }, { channel_id: id(5), max_seq: -1 }] }));
+  must(show(a.read(ASSISTANT_STORE, OWNER_KEY).changeSources) === show({ [id(2)]: 12, [id(3)]: 5 }), show(a.read(ASSISTANT_STORE, OWNER_KEY)));
+  await atTime("2026-10-20T10:00:40Z", () => ring(a, { first_change_at: "2026-10-20T10:00:30.000Z", last_change_at: "2026-10-20T10:00:40.000Z", sources: [src(2, 10), src(3, "9"), src(4, 2)] }));
+  const owner = a.read(ASSISTANT_STORE, OWNER_KEY);
+  must(show(owner.changeSources) === show({ [id(2)]: 12, [id(3)]: 9, [id(4)]: 2 }) && owner.changeAt === MENTION_AT, show(owner));
+});
+
 // ---- the runtime: the chat, the short sessions, and what each is offered and told --------------------------------------
 
 type Ctx = { systemPrompt: string; messages: any[]; tools: Array<{ name: string }> };

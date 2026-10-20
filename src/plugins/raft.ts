@@ -24,8 +24,8 @@ import {
 import { internalHost } from "./http.ts";
 import {
   ASSISTANT_OWN_TOOLS, ASSISTANT_STORE, DEFERRED_KEY, NOTIFY_TOOL, OWNER_KEY, PREFERENCES_TOOL, REMINDED_STORE, RULES_KEY,
-  assistantWake, assistantWakeInstruction, doorbellOf, isDoorbellTarget, keepOwnerFromContext, learnDm, loadOwner, noteDoorbell,
-  notifyOwner, pauseOn, preferences, type AssistantOwner, type OwnerContext, type OwnerSend,
+  assistantWake, assistantWakeInstruction, doorbellOf, isDoorbellTarget, keepOwnerFromContext, learnDm, loadOwner, mergeSources, noteDoorbell,
+  notifyOwner, pauseOn, preferences, type AssistantOwner, type ChangeSources, type OwnerContext, type OwnerSend,
 } from "./raft-assistant.ts";
 import { callMcp, isMcpTool, keptMcpOf, leftOut, listMcp, mcpClock, mcpLines, MCP_CALL_TIMEOUT_MS, MCP_CAPABILITY, MCP_KEY, MCP_PREFIX } from "./raft-mcp.ts";
 import { modelToolName } from "../runtime/pi-tools.ts";
@@ -3313,7 +3313,8 @@ async function receiveNotice(payload: ObjectValue, inbound: InboundEvent, ctx: P
   // is asked at all; only the rest of the notice — its owner writing to it — wakes the model, in its chat.
   const assistant = (await loadOwner(ctx)) !== null;
   const bells = assistant ? payload.targets.filter(isDoorbellTarget) : [];
-  const bell = bells.length > 0 && await noteDoorbell(ctx, Date.now(), await doorbellChangeAt(ctx, bells));
+  const change = bells.length > 0 ? await doorbellChange(ctx, bells) : null;
+  const bell = change !== null && await noteDoorbell(ctx, Date.now(), change.firstChangeAt, change.sources);
   if (bell && payload.targets.every(isDoorbellTarget)) {
     return { deliver: false, wake: true, reason: "an assistant's doorbell, for its code to check", dedupeKey: payload.noticeId };
   }
@@ -3329,27 +3330,30 @@ async function receiveNotice(payload: ObjectValue, inbound: InboundEvent, ctx: P
 }
 
 /**
- * When the change a push's doorbells announced happened: the earliest `first_change_at` among them, or null when none
- * could be read. The notice names a doorbell only by its address (`agent-event:<id8>`); the payload is the event's, so
+ * What a push's doorbells announced: when the change happened (the earliest `first_change_at` among them, or null when
+ * none could be read), and the conversations that rang them (`sources`, merged at the highest seq of each; empty when
+ * none names any). The notice names a doorbell only by its address (`agent-event:<id8>`); the payload is the event's, so
  * it is read by that address (`GET /history`, `consume: false`, which marks nothing read and leaves the events cursor
- * receive_events keeps alone). Null is today's behaviour: the wake decides on its first read. `last_change_at` is when
+ * receive_events keeps alone). Null and no sources is the old behaviour: the wake decides on its first read. `last_change_at` is when
  * Raft sent the doorbell, not when anything changed, so it says nothing about whether a read is recent enough.
  */
-async function doorbellChangeAt(ctx: PluginContext, targets: readonly unknown[]): Promise<string | null> {
-  if (!ctx.credential) return null;
-  let earliest: string | null = null;
+async function doorbellChange(ctx: PluginContext, targets: readonly unknown[]): Promise<{ firstChangeAt: string | null; sources: ChangeSources }> {
+  let earliest: string | null = null, sources: ChangeSources = {};
+  if (!ctx.credential) return { firstChangeAt: earliest, sources };
   for (const t of targets) {
     const channel = (t as { target: string }).target;
     try {
       const out = await raftFor(ctx, { state: false }).routes.history.read({ query: { channel, limit: "1", consume: "false" } });
-      const at = out.ok ? doorbellOf(out.data.messages[0])?.firstChangeAt ?? null : null;
+      const bell = out.ok ? doorbellOf(out.data.messages[0]) : null;
+      const at = bell?.firstChangeAt ?? null;
+      if (bell) sources = mergeSources(sources, bell.sources);
       if (at !== null && (earliest === null || Date.parse(at) < Date.parse(earliest))) earliest = at;
       if (at === null) logEvent("raft.doorbell_unread", { tenantId: ctx.caller.tenantId, agentId: ctx.caller.agentId, mount: ctx.alias, ok: out.ok });
     } catch (e) {
       logEvent("raft.doorbell_unread", { tenantId: ctx.caller.tenantId, agentId: ctx.caller.agentId, mount: ctx.alias, error: String((e as Error)?.message ?? e).slice(0, 120) });
     }
   }
-  return earliest;
+  return { firstChangeAt: earliest, sources };
 }
 
 /**
