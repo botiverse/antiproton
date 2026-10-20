@@ -494,6 +494,34 @@ function refusal(message: string): Error {
  * is recorded as said only once Raft took the message, so a send that failed or was held repeats nothing it did not say.
  */
 export async function notifyOwner(args: unknown, ctx: PluginContext, deps: NotifyDeps): Promise<Json> {
+  const out = await notifyOnce(args, ctx, deps);
+  ctx.trace?.({ kind: "raft.assistant_notify", status: String(out.state), verdict: "ok", attrs: notifyAttrs(args, out) });
+  return out as unknown as Json;
+}
+
+/** Why a notify call dropped an item, as the trace counts it: the category, never the item, its reference or a rule's id. */
+function dropCategory(why: string): string {
+  if (why === "already told") return "already_told";
+  if (why.startsWith("rule ")) return "rule";
+  if (why === "decisions go in the morning brief") return "decisions_in_brief";
+  if (why === "not in a conversation this check was given") return "not_confirmed";
+  return "other";
+}
+
+/**
+ * What a notify call that returned did, for its trace row (`raft.assistant_notify`, on the call's span, so it joins
+ * the call's `tool.call` row): its state, how many items it was given and sent, and how many it dropped by category.
+ * A deliberate "nothing to send" is then told apart from a send that never happened. Counts only.
+ */
+export function notifyAttrs(args: unknown, out: Record<string, unknown>): Record<string, number | string> {
+  const given = args && typeof args === "object" && Array.isArray((args as { items?: unknown }).items) ? (args as { items: unknown[] }).items.length : 0;
+  const dropped: Record<string, number> = {};
+  const why = out.dropped && typeof out.dropped === "object" ? Object.values(out.dropped as Record<string, unknown>) : [];
+  for (const w of why) { const c = `dropped_${dropCategory(String(w))}`; dropped[c] = (dropped[c] ?? 0) + 1; }
+  return { notifyState: String(out.state), given, sent: out.state === "sent" && typeof out.items === "number" ? out.items : 0, dropped: why.length, ...dropped };
+}
+
+async function notifyOnce(args: unknown, ctx: PluginContext, deps: NotifyDeps): Promise<Record<string, unknown>> {
   const now = (deps.now ?? Date.now)();
   let owner = await loadOwner(ctx);
   if (!owner) throw refusal(`${NOTIFY_TOOL}: this agent is not anyone's assistant now, so there is nobody to tell`);
@@ -984,10 +1012,14 @@ export async function assistantWake(ctx: PluginContext, deps: WakeDeps): Promise
       // A doorbell that said when its change happened: a read that shows nothing that recent is older than the change
       // (the inbox lags the doorbell), so nothing is decided on it — no model call, nothing recorded as looked at, else
       // its old activity would be judged seen and the change never looked at — and the inbox is read again shortly.
-      // Past the last read again, what was read is decided on, still without recording it as looked at.
-      let lag: Record<string, number | boolean> = {};
+      // Past the last read again, what was read is decided on, still without recording it as looked at. A change the
+      // owner has already read is in no unread read however long one waits, so when the unread read does not show it
+      // the read of every conversation decides; the candidates still come from the unread read alone.
+      let lag: Record<string, number | string | boolean> = {};
       if (owner.changeAt !== null) {
-        const lagRetry = owner.lagReads, caughtUp = inboxCaughtUp(items, owner.changeAt);
+        const lagRetry = owner.lagReads;
+        const via = inboxCaughtUp(items, owner.changeAt) ? "unread" : inboxCaughtUp(await read("all"), owner.changeAt) ? "all" : null;
+        const caughtUp = via !== null;
         const delay = caughtUp ? undefined : INBOX_LAG_FOLLOW_UPS_MS[lagRetry];
         if (delay !== undefined) {
           const wakeAt = Math.min(now + delay, next);
@@ -995,7 +1027,7 @@ export async function assistantWake(ctx: PluginContext, deps: WakeDeps): Promise
           await record(ctx, day, trigger, "inbox_lagging", { conversations: items.length, inbox_lagging: true, lagRetry, caught_up: false });
           return { wakeAt };
         }
-        lag = { lagRetry, caught_up: caughtUp, ...(caughtUp ? {} : { inbox_lagging: true, inbox_lagging_gave_up: true }) };
+        lag = { lagRetry, caught_up: caughtUp, ...(via ? { caught_up_via: via } : { inbox_lagging: true, inbox_lagging_gave_up: true }) };
         await saveOwner(ctx, owner = { ...owner, changeAt: null, lagReads: 0 });
       }
       const reviewed = reviewedOf(await ctx.db.get(ASSISTANT_STORE, REVIEWED_KEY));

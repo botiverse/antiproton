@@ -172,7 +172,7 @@ function raft(o: { zone?: unknown; owner?: boolean; dm?: unknown } = {}) {
 function mount(offered: readonly string[] = ALL_TOOLS) {
   const tables = new PluginDbTables(sqliteHost()).ensure();
   const scope = { tenantId: "tenant", agentId: "agent", alias: "raft", plugin: raftPlugin.id };
-  const traced: Array<{ kind: string; status: string; attrs: Record<string, unknown> }> = [];
+  const traced: Array<{ kind: string; status: string; verdict?: string; attrs: Record<string, unknown> }> = [];
   const ctx = {
     caller: { tenantId: "tenant", agentId: "agent", taskId: "task", contextId: "ctx_turn" },
     alias: "raft", credential: "sk_agent_test_1234567890", publicConfig: { serverUrl: "https://raft.example" },
@@ -624,6 +624,24 @@ await check("the notify and preferences tools are refused on a mount not offered
   }
 });
 
+await check("a notify call that sends nothing says so on its trace row: its state and counts by drop category, no refs or contents", async () => {
+  const a = await assistant(raft({ dm: "dm:@ada" }));
+  a.write(REMINDED_STORE, "msg:aaaaaaa1", { at: 1 });
+  a.write(REMINDED_STORE, "msg:bbbbbbb7", { at: 1 });
+  const out = await atTime(DAY, () => notify(a.ctx, { items: ITEMS }));
+  must(out.state === "nothing_to_send" && a.r.sends.length === 0, show(out));
+  const rows = a.traced.filter((t) => t.kind === "raft.assistant_notify");
+  must(rows.length === 1 && rows[0].status === "nothing_to_send" && rows[0].verdict === "ok", show(rows));
+  must(show(rows[0].attrs) === show({ notifyState: "nothing_to_send", given: 2, sent: 0, dropped: 2, dropped_already_told: 2 }), show(rows[0].attrs));
+  must(!/aaaaaaa1|bbbbbbb7|launch|Bob|rollout/.test(show(rows[0])), `content on the row: ${show(rows[0])}`);
+  // And a send: sent counts what went out.
+  const b = await assistant(raft({ dm: "dm:@ada" }));
+  b.write(REMINDED_STORE, "msg:aaaaaaa1", { at: 1 });
+  await atTime(DAY, () => notify(b.ctx, { items: ITEMS }));
+  const sent = b.traced.filter((t) => t.kind === "raft.assistant_notify").at(-1);
+  must(show(sent?.attrs) === show({ notifyState: "sent", given: 2, sent: 1, dropped: 1, dropped_already_told: 1 }), show(sent));
+});
+
 // ---- the doorbell and an inbox that lags it -----------------------------------------------------------------------------
 
 /**
@@ -678,7 +696,9 @@ await check("a doorbell whose first read predates its change decides nothing; th
   const reviewed = show(a.read(ASSISTANT_STORE, REVIEWED_KEY)), probes = a.r.messageReads.length;
   await atTime(DAY, () => ring(a, { first_change_at: MENTION_AT, last_change_at: DAY }));
   // The materialized view has not caught up: the same four, all older than the change.
+  const reads0 = a.r.inboxReads.length;
   const stale = await atTime(DAY, () => wake(a.ctx));
+  must(show(a.r.inboxReads.slice(reads0)) === show(["unread", "all"]), `a stale unread read asks the read of everything: ${show(a.r.inboxReads.slice(reads0))}`);
   must(stale.turn === undefined && stale.wakeAt === at(DAY) + INBOX_LAG_RETRY_MS[0] && INBOX_LAG_RETRY_MS[0] === 5_000, `stale: ${show(stale)}`);
   must(show(a.read(ASSISTANT_STORE, REVIEWED_KEY)) === reviewed && a.r.messageReads.length === probes, `the stale read was recorded or probed: ${show(a.read(ASSISTANT_STORE, REVIEWED_KEY))}`);
   const row = wakeRows(a).at(-1);
@@ -686,10 +706,12 @@ await check("a doorbell whose first read predates its change decides nothing; th
   must(a.read(ASSISTANT_STORE, OWNER_KEY).changeAt === MENTION_AT && typeof a.read(ASSISTANT_STORE, OWNER_KEY).doorbellAt === "number", "the change is still awaited, as a doorbell");
   // Caught up: the mention is in the inbox now.
   a.r.unread = [conv(1), mentioned(), conv(3), conv(4)];
+  const reads1 = a.r.inboxReads.length;
   const caught = await atTime("2026-10-20T10:00:05Z", () => wake(a.ctx));
+  must(show(a.r.inboxReads.slice(reads1)) === show(["unread"]), `caught up in the unread read: no second read: ${show(a.r.inboxReads.slice(reads1))}`);
   must(caught.isolated === true && caught.turn.includes(conv(2).channelId) && !caught.turn.includes(conv(1).channelId), `caught up: ${show(caught)}`);
   const row2 = wakeRows(a).at(-1);
-  must(row2?.status === "invoked" && row2.attrs.candidates === 1 && row2.attrs.lagRetry === 1 && row2.attrs.caught_up === true && row2.attrs.inbox_lagging === undefined, show(row2));
+  must(row2?.status === "invoked" && row2.attrs.candidates === 1 && row2.attrs.lagRetry === 1 && row2.attrs.caught_up === true && row2.attrs.caught_up_via === "unread" && row2.attrs.inbox_lagging === undefined, show(row2));
   must(a.read(ASSISTANT_STORE, OWNER_KEY).changeAt === null && a.read(ASSISTANT_STORE, OWNER_KEY).lagReads === 0, "the change is no longer awaited");
   const sent = await atTime("2026-10-20T10:00:10Z", () => notify(a.ctx, { items: [{ ref: "#ch2:aaaaaaa2", summary: "B asks you to sign off", kind: "mention" }] }));
   must(sent.state === "sent" && a.r.sends.at(-1).content.includes("#ch2:aaaaaaa2"), `the summary: ${show(sent)}`);
@@ -758,13 +780,28 @@ await check("an inbox that catches up only by the 2-minute follow-up still gets 
   must(sent.state === "sent" && a.r.sends.at(-1).content.includes("#ch2:aaaaaaa2"), show(sent));
 });
 
+await check("a change the owner already read is caught up through the read of everything: no retries, nothing to notify", async () => {
+  const a = await lookedAtFour();
+  // Read on the web: gone from unread, still in the read of everything with its new activity.
+  a.r.unread = [conv(1), conv(3), conv(4)];
+  a.r.all = [conv(1), { ...mentioned(), unread: 0 }, conv(3), conv(4)];
+  const reads = a.r.inboxReads.length;
+  await atTime(DAY, () => ring(a, { first_change_at: MENTION_AT, last_change_at: DAY }));
+  const out = await atTime(DAY, () => wake(a.ctx));
+  const row = wakeRows(a).at(-1);
+  must(out.turn === undefined && out.wakeAt === at("2026-10-21T06:00:00Z") && show(a.r.inboxReads.slice(reads)) === show(["unread", "all"]), `${show(out)} ${show(a.r.inboxReads.slice(reads))}`);
+  must(row?.status === "skipped_filtered" && row.attrs.caught_up === true && row.attrs.caught_up_via === "all" && row.attrs.lagRetry === 0 && !("inbox_lagging" in row.attrs), show(row));
+  must(wakeRows(a).every((r) => r.status !== "inbox_lagging") && a.read(ASSISTANT_STORE, OWNER_KEY).changeAt === null && a.read(ASSISTANT_STORE, OWNER_KEY).doorbellAt === null, "retried");
+  must(a.r.sends.length === 0, `notified: ${show(a.r.sends)}`);
+});
+
 await check("a doorbell without first_change_at decides on its first read, as before: no lag, no read again", async () => {
   const a = await lookedAtFour();
   const reads = a.r.inboxReads.length;
   await atTime(DAY, () => ring(a, { last_change_at: DAY }));
   const out = await atTime(DAY, () => wake(a.ctx));
   const row = wakeRows(a).at(-1);
-  must(out.turn === undefined && out.wakeAt === at("2026-10-21T06:00:00Z") && a.r.inboxReads.length === reads + 1, show(out));
+  must(out.turn === undefined && out.wakeAt === at("2026-10-21T06:00:00Z") && show(a.r.inboxReads.slice(reads)) === show(["unread"]), `${show(out)} ${show(a.r.inboxReads.slice(reads))}`);
   must(row?.status === "skipped_filtered" && row.attrs.seen === 4 && !("lagRetry" in row.attrs) && !("inbox_lagging" in row.attrs), show(row));
 });
 
@@ -903,6 +940,29 @@ await check("a doorbell with candidates runs in a fresh short session: the check
     const tables = (w.host.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'pi_s_iso_%'").toArray() as any[]).map((x) => x.name);
     must(tables.length === 0, `the short session's transcript outlived it: ${show(tables)}`);
     must(show(w.wakeRows().map((x) => x.status)) === show(["invoked"]), show(w.wakeRows()));
+  } finally { w.host.dispose(); }
+});
+
+await check("a check's notify call that sends nothing: the gateway keeps its raft.assistant_notify row on the tool.call's span", async () => {
+  let notified = false;
+  const w = await runtimeWith(true, (c) => !notified && c.systemPrompt.endsWith(assistantCheckPrompt("raft"))
+    ? (notified = true, { text: "", finishReason: "tool_calls", truncated: false, usage, toolCalls: [{ id: "n1", name: "raft__assistant_notify_owner",
+      arguments: { items: [{ ref: "#ch1:aaaaaaa1", summary: "Bob asks you to pick a date", kind: "question" }] } }] } as ModelResponse)
+    : say("done"));
+  try {
+    w.db.write(REMINDED_STORE, "msg:aaaaaaa1", { at: 1 });
+    // Told already, yet not filtered before the model: the conversation has two unread messages.
+    w.r.unread = [conv(1, { latestAt: new Date(Date.now() - 60_000).toISOString(), unread: 2 })];
+    w.doorbell();
+    await w.drive();
+    must(notified, "control: the check called notify");
+    const rows = w.host.sql.exec("SELECT kind, span_id, status, attrs FROM trace_outbox WHERE kind IN ('tool.call', 'raft.assistant_notify') ORDER BY seq").toArray() as any[];
+    const call = rows.find((x) => x.kind === "tool.call" && JSON.parse(String(x.attrs)).tool === "raft.assistant_notify_owner");
+    const mine = rows.filter((x) => x.kind === "raft.assistant_notify");
+    must(call && mine.length === 1 && mine[0].span_id === call.span_id && mine[0].status === "nothing_to_send", show(rows));
+    const attrs = JSON.parse(String(mine[0].attrs));
+    must(attrs.notifyState === "nothing_to_send" && attrs.given === 1 && attrs.sent === 0 && attrs.dropped_already_told === 1 && attrs.mount === "raft", show(attrs));
+    must(w.r.sends.length === 0, show(w.r.sends));
   } finally { w.host.dispose(); }
 });
 

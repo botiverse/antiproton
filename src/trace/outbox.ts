@@ -89,7 +89,7 @@ export const TRACE_KINDS = ["model.call", "tool.call", "approval.wait", "contain
   "turn.stop", "js.run",
   "rebuild.decision", "rebuild.outcome", "rebuild.behaviour", "session.needs_reset", "turn.timing", "import.hold", "model.prewarm",
   "agent.ready", "mount.settings", "subagent.start", "subagent.turn", "subagent.model_changed", "github.refresh", "raft.held", "raft.held_answer", "raft.state_failed", "raft.state_save_failed", "raft.mcp_call",
-  "raft.assistant_wake"] as const;
+  "raft.assistant_wake", "raft.assistant_notify"] as const;
 export type TraceKind = (typeof TRACE_KINDS)[number];
 
 /**
@@ -102,9 +102,11 @@ export type TraceKind = (typeof TRACE_KINDS)[number];
  * (src/plugins/raft-mcp.ts). `raft.assistant_wake` is one wake of a personal assistant's proactive check (a doorbell or
  * the morning brief) and what came of it — `skipped_empty`, `skipped_filtered`, `invoked`, `unreadable`, `paused`,
  * `night_deferred` or `failed` — with counts (`unreadable`: conversations no read of which succeeded), never content
- * (src/plugins/raft-assistant.ts).
+ * (src/plugins/raft-assistant.ts). `raft.assistant_notify` is one notify call's end, on the call's span: its state
+ * (`sent`, `nothing_to_send`, `kept_for_brief`, `not_sent`) and counts of the items given, sent and dropped by
+ * category, never an item, a reference or a rule (src/plugins/raft-assistant.ts `notifyAttrs`).
  */
-export const PLUGIN_TRACE_KINDS = ["raft.held", "raft.held_answer", "raft.state_failed", "raft.mcp_call", "raft.assistant_wake"] as const satisfies readonly TraceKind[];
+export const PLUGIN_TRACE_KINDS = ["raft.held", "raft.held_answer", "raft.state_failed", "raft.mcp_call", "raft.assistant_wake", "raft.assistant_notify"] as const satisfies readonly TraceKind[];
 export type PluginTraceKind = (typeof PLUGIN_TRACE_KINDS)[number];
 
 export const TRACE_VERDICTS = ["ok", "failed", "blocked", "cancelled"] as const;

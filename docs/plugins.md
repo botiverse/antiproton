@@ -878,7 +878,8 @@ well. The wake reads the owner's inbox itself. Raft serves that inbox from a
 view that lags the facts the doorbell rings from, so when the doorbell's event
 says when its change happened (`first_change_at`, read by the notice's
 `agent-event:` address with `consume: false`) and no row is that recent (2 s of
-slack), the read decides nothing: no model call, nothing recorded as looked at,
+slack) in the unread read nor in a read of every conversation (which shows a
+change the owner already read; asked only then), the read decides nothing: no model call, nothing recorded as looked at,
 and the inbox is read again after 5, 20 and 60 s (`INBOX_LAG_RETRY_MS`), then 2, 5
 and 15 minutes, after which the wake gives up on the change
 (`inbox_lagging_gave_up`) and decides on what it read without recording it as
@@ -903,7 +904,11 @@ Every wake writes a `raft.assistant_wake` trace row and a per-day count, its
 status one of `skipped_empty`, `skipped_filtered`, `invoked`, `unreadable`,
 `inbox_lagging`, `paused`, `night_deferred` or `failed`, with an `unreadable`
 count, and, on a doorbell that said when its change happened, `lagRetry` (the
-reads before this one that did not show it) and `caught_up`. `assistant_notify_owner` composes and sends one
+reads before this one that did not show it), `caught_up`, and `caught_up_via`
+(`unread` or `all`). Each `assistant_notify_owner` call that returns writes a
+`raft.assistant_notify` row on its call's span (beside its `tool.call` row): its
+state (`sent`, `nothing_to_send`, `kept_for_brief`, `not_sent`), the items given
+and sent, and the items dropped by category, never an item or a reference. `assistant_notify_owner` composes and sends one
 DM to the owner (`assistantOf.dmTarget` when Raft gives it, else the DM learnt
 from the owner writing; it takes no destination from the model, and refuses while
 neither is known), and keeps its rules in code: every reference is a message's
