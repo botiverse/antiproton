@@ -5,6 +5,7 @@ import { AGENT_REF, agentRef, isAgentRef, KEPT_NAME, KEPT_PREFIX, OWNER_PREFIX, 
 import type { ToolError, ToolResult } from "../core/tools.ts";
 import { parseToolRef } from "../core/tools.ts";
 import type { Plugin, PluginContext, PluginNext, PromptPart, MountActivity, MountUsage, InboundEvent, InboundHooks, InboundResult, HeldListing, HeldRead, ListedTools, TurnEnd } from "../plugins/types.ts";
+import type { TurnEndEvent } from "./activity.ts";
 import { type ActivityEvent, type SandboxForm, holdingOf, backgroundOf, isExclusive } from "../plugins/types.ts";
 import { Backgrounded, Interrupt, interruptsOf } from "../plugins/types.ts";
 import { answerSpecOf } from "./run-js-resume.ts";
@@ -1424,9 +1425,9 @@ export class ToolGateway {
    * caller keeps the events for the next pass; one that says `skipped` is
    * done with them.
    */
-  async reportActivity(tenantId: string, agentId: string, events: readonly ActivityEvent[]):
+  async reportActivity(tenantId: string, agentId: string, events: readonly ActivityEvent[], ends: readonly TurnEndEvent[] = []):
     Promise<Array<{ alias: string; sent: number } | { alias: string; skipped: string }>> {
-    return this.#toReporters(tenantId, agentId, (p) => !!p.reportActivity, (p, ctx) => p.reportActivity!(events, ctx));
+    return this.#toReporters(tenantId, agentId, (p) => !!p.reportActivity, (p, ctx) => p.reportActivity!(events, ctx, ends));
   }
 
   /**

@@ -30,6 +30,7 @@ import {
 import { callMcp, isMcpTool, keptMcpOf, leftOut, listMcp, mcpClock, mcpLines, MCP_CALL_TIMEOUT_MS, MCP_CAPABILITY, MCP_KEY, MCP_PREFIX } from "./raft-mcp.ts";
 import { modelToolName } from "../runtime/pi-tools.ts";
 import { isSubagentSession } from "../runtime/subagent-session.ts";
+import type { TurnEndEvent, TurnOutcome } from "../runtime/activity.ts";
 import { AGENT_REF, keyForRef, toAgentRef } from "../store/refs.ts";
 import {
   interrupt, originProblem,
@@ -502,7 +503,7 @@ function stateStore(ctx: PluginContext, last: { state?: RaftState } = {}): RaftS
  * read for the conversation it shows after the receipt.
  */
 function raftFor(ctx: PluginContext, options: {
-  state?: false; response?: (res: Response) => Response; timeoutMs?: number;
+  state?: false; response?: (res: Response, url: URL) => Response; timeoutMs?: number;
   /**
    * Requests to anywhere but the Raft server — the presigned PUT of the SDK's upload session, which it makes through
    * this fetch — are checked as the download checks its URL (`presignedProblem`). A refused one is not sent: it is
@@ -536,7 +537,7 @@ function raftFor(ctx: PluginContext, options: {
         throw e;
       }
       logEvent("raft.call", { ...line, status: res.status, ms: Date.now() - started });
-      return options.response ? options.response(res) : res;
+      return options.response ? options.response(res, u) : res;
     },
     // A subagent's client never has the saved state, whatever the caller asked for: everything that carries a call's
     // bookings into it — a history read's cards and reads (`keepCardsShown`), a hold, an answer — builds its client
@@ -1274,7 +1275,10 @@ async function runOperation(
   // extra hold on a send after reading history, which asks the model with the newer messages: the safe side.
   // Only `messages.read` books it among the generated tools (the manifest's `consumes.model`; the inbox pulls,
   // which also do, are excluded and stay with receive_events).
-  const raft = raftFor(ctx, savesState(op, ctx) ? {} : { state: false });
+  // The model's own listing (inbox_list) carries Raft's snapshot too: kept, so the turn's end consumes it, but naming no
+  // conversation, since its rows reach the model as the SDK's text and not through `renderInboxSummary`.
+  const tap = op.name === "inbox.list" ? snapshotTap() : null;
+  const raft = raftFor(ctx, { ...(savesState(op, ctx) ? {} : { state: false as const }), ...(tap ? { response: tap.response } : {}) });
   const keyed = await keyedInput(op, input, ctx, raft);
   // Taken before the request, so it is never later than when Raft first saw the key.
   const started = Date.now();
@@ -1291,6 +1295,7 @@ async function runOperation(
     const failed = op.name === "channels.join" ? joinFailure(out as RaftFailure) : out as RaftFailure;
     throw sdkFailure(failed, unoffered, op.sideEffect !== "read", { tool: op.toolName, ...(key ? { key } : {}) });
   }
+  if (tap) await keepSnapshot(ctx, await tap.snapshotId(), []);
   // A call held again on resume keeps when it was first held: its key is the same one, as old as that.
   if (isInterrupted(out)) return heldCall(op, raft, caller, out.interrupt, input, resumed.heldAt ?? started, ctx);
   // The SDK's text is the outcome as the model reads it (the CLI's output for the same operation, its hints written as
@@ -1573,6 +1578,20 @@ const owedOf = (c: InboxConversation) => c.kind !== "channel" || c.mentions > 0;
  * read position is the backlog again. Nothing here acknowledges or reads anything on the agent's behalf.
  */
 export function inboxSummary(listing: RaftInboxListing, unoffered: ReadonlySet<string> = DEFAULT_UNOFFERED): string[] {
+  return renderInboxSummary(listing, unoffered).lines;
+}
+
+/**
+ * `inboxSummary`'s lines, and the conversations whose unread count those lines show (`shownUnreadTargets`, each the
+ * listing's `target` verbatim), in one pass: a target is named at the moment its count is written into a line, so the
+ * list a turn's end reports to Raft (`turnReports`) is the rendered list and nothing else. A conversation the caps
+ * leave out is in the "more not listed" count only, which names none, so it is not shown.
+ */
+export function renderInboxSummary(
+  listing: RaftInboxListing, unoffered: ReadonlySet<string> = DEFAULT_UNOFFERED,
+): { lines: string[]; shownUnreadTargets: string[] } {
+  const shownUnreadTargets: string[] = [];
+  const shows = (c: InboxConversation) => { shownUnreadTargets.push(c.target); return c; };
   const n = (k: number) => k.toLocaleString("en-US");
   const owedLine = (c: InboxConversation) => {
     const what = c.mentions > 0 ? `mentions you${c.mentions > 1 ? ` ${n(c.mentions)} times` : ""}` : c.kind === "dm" ? "DM to you" : "thread you are in";
@@ -1583,9 +1602,9 @@ export function inboxSummary(listing: RaftInboxListing, unoffered: ReadonlySet<s
   };
   const owed = listing.conversations.filter(owedOf), background = listing.conversations.filter((c) => !owedOf(c));
   const shownOwed = owed.slice(0, INBOX_SUMMARY.owed), shownBackground = background.slice(0, INBOX_SUMMARY.background);
-  const lines = shownOwed.map(owedLine);
+  const lines = shownOwed.map((c) => owedLine(shows(c)));
   if (shownBackground.length) {
-    lines.push(`Background, no mention: ${shownBackground.map((c) => `${c.target} ${n(c.unread)} unread`).join(", ")}.`);
+    lines.push(`Background, no mention: ${shownBackground.map((c) => `${shows(c).target} ${n(c.unread)} unread`).join(", ")}.`);
   }
   const unlisted = listing.totals.conversations - shownOwed.length - shownBackground.length;
   if (unlisted > 0) {
@@ -1594,7 +1613,147 @@ export function inboxSummary(listing: RaftInboxListing, unoffered: ReadonlySet<s
     const owedLeft = dms || mentions ? ` (${[dms ? `${n(dms)} DM${dms === 1 ? "" : "s"}` : "", mentions ? `${n(mentions)} mentioning you` : ""].filter(Boolean).join(", ")})` : "";
     lines.push(offeredTerms(`${n(unlisted)} more unread conversation${unlisted === 1 ? "" : "s"}${owedLeft} not listed: inbox_list pages them.`, unoffered));
   }
-  return lines;
+  return { lines, shownUnreadTargets };
+}
+
+/**
+ * The end of a turn, told to Raft so it can mark read the background a turn was shown and owed nothing to
+ * (`turnEnded` on the activity post, slock#10507). Raft answers an agent's unread listing (`inbox.list`) with a
+ * `snapshotId` whenever the page has unread, the same on every listing of one turn; the turn's end names that id, how
+ * the turn ended, and which conversations' unread counts the model was shown. Raft settles only a `completed` turn,
+ * only the conversations its own snapshot holds, only up to the seq it held then, and never a DM, an unread @mention
+ * or an unread assigned task; any report consumes the snapshot, so every turn that saw one reports its end, however
+ * it ended, and once.
+ *
+ * Kept in the mount's database under `TURN_KEY`, as `{ seen: SnapshotSeen[] }`, from the listing until the post
+ * that reports the turn's end has been answered: the end is reported on the alarm pass, from the trace
+ * (cf/src/activity-raft.ts), which may be a new process by then. A listing belongs to the first turn end at or after it
+ * (`turnReports`). A turn whose object was lost mid-turn has no end in the trace, so what it saw goes with the next
+ * turn's end; Raft settles nothing that is not in that report's snapshot, and only what the model was shown is named.
+ */
+const TURN_KEY = "turnSnapshots";
+/** The agent's own unread listing. A personal assistant's owner inbox is another route (`/assistant/owner-inbox`) and never matches. */
+const INBOX_LIST_PATH = "/internal/agent-api/inbox/conversations";
+/** At most this many listings are kept unreported, the newest; a mount whose ends are never reported does not grow. */
+const SNAPSHOTS_KEPT = 32;
+interface SnapshotSeen { id: string; at: number; snapshotId: string; shown: string[] }
+
+function snapshotsOf(value: unknown): SnapshotSeen[] {
+  const seen = object(value).seen;
+  if (!Array.isArray(seen)) return [];
+  return seen.flatMap((v) => {
+    const s = object(v);
+    return typeof s.id === "string" && typeof s.at === "number" && typeof s.snapshotId === "string" && Array.isArray(s.shown)
+      ? [{ id: s.id, at: s.at, snapshotId: s.snapshotId, shown: s.shown.filter((t): t is string => typeof t === "string") }] : [];
+  });
+}
+
+/**
+ * Reads the `snapshotId` off an `inbox.list` answer as it arrives (the SDK's listing keeps only the fields it knows),
+ * for the client's `response` option. Only the agent's own listing path: an owner-inbox read cannot supply one.
+ */
+function snapshotTap(): { response: (res: Response, url: URL) => Response; snapshotId: () => Promise<string | null> } {
+  let read: Promise<string | null> = Promise.resolve(null);
+  return {
+    response: (res, url) => {
+      if (res.ok && url.pathname === INBOX_LIST_PATH) {
+        read = res.clone().json().then((body) => {
+          const id = object(body).snapshotId;
+          return typeof id === "string" && id ? id : null;
+        }, () => null);
+      }
+      return res;
+    },
+    snapshotId: () => read,
+  };
+}
+
+/**
+ * Keeps one listing's snapshot and the conversations it showed the model, for the turn's end. A subagent's listing is
+ * not the agent's turn (its ends make no activity, `subagentRow`), so it keeps nothing. Never fails the call it is in.
+ */
+async function keepSnapshot(ctx: PluginContext, snapshotId: string | null, shown: readonly string[]): Promise<void> {
+  if (!snapshotId || isSubagentSession(ctx.caller.taskId)) return;
+  try {
+    await ctx.db.transaction(INBOX_STORE, "readwrite", (tx) => {
+      const seen = snapshotsOf(tx.get(INBOX_STORE, TURN_KEY));
+      seen.push({ id: crypto.randomUUID(), at: Date.now(), snapshotId, shown: [...shown] });
+      tx.put(INBOX_STORE, { seen: seen.slice(-SNAPSHOTS_KEPT) } as unknown as Json, TURN_KEY);
+    });
+  } catch (e) {
+    console.warn(`raft mount ${ctx.alias}: an inbox snapshot could not be kept for the turn's end: ${String((e as Error)?.message ?? e).slice(0, 200)}`);
+  }
+}
+
+async function forgetSnapshots(ctx: PluginContext, ids: readonly string[]): Promise<void> {
+  if (!ids.length) return;
+  const gone = new Set(ids);
+  await ctx.db.transaction(INBOX_STORE, "readwrite", (tx) => {
+    const seen = snapshotsOf(tx.get(INBOX_STORE, TURN_KEY));
+    tx.put(INBOX_STORE, { seen: seen.filter((s) => !gone.has(s.id)) } as unknown as Json, TURN_KEY);
+  });
+}
+
+/** One turn's `turnEnded`, with what it consumed (`ids`) and how many listings named another snapshot than the first. */
+export interface TurnReport {
+  turnEnded: { snapshotId: string; outcome: TurnOutcome; shownUnreadTargets: string[] };
+  ids: string[];
+  mismatches: number;
+}
+
+/**
+ * A batch of activity cut into the posts that carry it: a post ends at each turn end that kept a listing, and carries
+ * that turn's `turnEnded`, so the report goes in the same call as the event that ends the turn. A listing belongs to the
+ * first turn end at or after it, in event order. The snapshot is the first listing's; a later listing with another id
+ * is counted, not merged, and only the first id's conversations are named. A batch with no such end is one post, as
+ * before.
+ */
+export function turnReports(
+  events: readonly ActivityEvent[], ends: readonly TurnEndEvent[], seen: readonly SnapshotSeen[],
+): Array<{ events: ActivityEvent[]; report: TurnReport | null }> {
+  const outcomeOf = new Map(ends.map((e) => [e.eventId, e.outcome] as const));
+  let left = [...seen].sort((a, b) => a.at - b.at);
+  const parts: Array<{ events: ActivityEvent[]; report: TurnReport | null }> = [];
+  let part: ActivityEvent[] = [];
+  for (const e of events) {
+    part.push(e);
+    const outcome = outcomeOf.get(e.eventId);
+    if (!outcome || !left.length) continue;
+    const at = Date.parse(e.occurredAt);
+    const owed = left.filter((s) => s.at <= at);
+    if (!owed.length) continue;
+    left = left.filter((s) => s.at > at);
+    const snapshotId = owed[0]!.snapshotId;
+    const same = owed.filter((s) => s.snapshotId === snapshotId);
+    parts.push({
+      events: part,
+      report: {
+        turnEnded: { snapshotId, outcome, shownUnreadTargets: [...new Set(same.flatMap((s) => s.shown))] },
+        ids: owed.map((s) => s.id),
+        mismatches: owed.length - same.length,
+      },
+    });
+    part = [];
+  }
+  if (part.length || !parts.length) parts.push({ events: part, report: null });
+  return parts;
+}
+
+/**
+ * Raft's answer to one `turnEnded`, on a `raft.turn_ended` trace row: `settled` or `skipped` with Raft's reason, or
+ * `unreadable` when the answer says neither (an older Raft, a malformed body), which fails nothing. Counts only, never
+ * a conversation's name.
+ */
+function reportTurnEnd(ctx: PluginContext, report: TurnReport, answer: ObjectValue): void {
+  const reply = object(answer.turnEnded);
+  const status = reply.outcome === "settled" || reply.outcome === "skipped" ? reply.outcome : "unreadable";
+  const reason = typeof reply.reason === "string" && reply.reason ? reply.reason.slice(0, 64) : null;
+  const attrs = {
+    outcome: report.turnEnded.outcome, targets: report.turnEnded.shownUnreadTargets.length,
+    ...(reason ? { reason } : {}), ...(report.mismatches ? { snapshotMismatches: report.mismatches } : {}),
+  };
+  ctx.trace?.({ kind: "raft.turn_ended", status, verdict: status === "unreadable" ? "failed" : "ok", attrs });
+  logEvent("raft.turn_ended", { tenantId: ctx.caller.tenantId, agentId: ctx.caller.agentId, mount: ctx.alias, status, ...attrs });
 }
 
 /**
@@ -3001,7 +3160,9 @@ export function createRaftPlugin(deps: {
       }
       if (name === "receive_events") {
         const limit = integer(a.limit, "limit", 1, EVENTS_LIMIT) ?? EVENTS_LIMIT;
-        const raft = raftFor(ctx);
+        // The listing's snapshot is read off its response (`snapshotTap`); nothing else this client fetches matches.
+        const tap = snapshotTap();
+        const raft = raftFor(ctx, { response: tap.response });
         // Cursor acknowledgement: nothing is acknowledged by being fetched. The cursor the previous call computed
         // (`SINCE_KEY`, kept in the mount's database, since the object may be a new process by now) goes as `since`,
         // which is what acknowledges what that call showed.
@@ -3030,8 +3191,15 @@ export function createRaftPlugin(deps: {
         // A listing that fails costs only the summary: the pull has happened, and its note still says what to do.
         if (given.result.hasMore === true) {
           const listed = await raft.invoke("inbox.list", { limit: INBOX_SUMMARY.limit }, originOf(ctx)).catch(() => null);
-          if (listed?.ok) given = handOver(batch, unofferedFor(ctx), inboxSummary((listed as { data: RaftInboxListing }).data, unofferedFor(ctx)));
-          else logEvent("raft.inbox_summary_failed", { tenantId: ctx.caller.tenantId, agentId: ctx.caller.agentId, mount: ctx.alias });
+          if (listed?.ok) {
+            const summary = renderInboxSummary((listed as { data: RaftInboxListing }).data, unofferedFor(ctx));
+            given = handOver(batch, unofferedFor(ctx), summary.lines);
+            // Shown only if the result carries the lines and is not parked: a parked result reaches the model as a
+            // preview that cuts its strings, so a count in it may not have been read. Then the snapshot is still kept,
+            // naming nothing, so the turn's end still consumes it.
+            const shown = given.attested && Array.isArray(given.result.inbox) ? summary.shownUnreadTargets : [];
+            await keepSnapshot(ctx, await tap.snapshotId(), shown);
+          } else logEvent("raft.inbox_summary_failed", { tenantId: ctx.caller.tenantId, agentId: ctx.caller.agentId, mount: ctx.alias });
         }
         // Exactly this call's cursor, lower than the last one or not: the next pull acknowledges what was shown here.
         // A Server that acknowledged on read has nothing pending, so the next pull sends none. Written before anything
@@ -3175,24 +3343,45 @@ export function createRaftPlugin(deps: {
      * the way it shows a managed one. Only while push is on: that is the state
      * in which Raft is running this agent and looking. The events are passed
      * through as given; the field set is the runtime's (src/runtime/activity.ts)
-     * and Raft refuses an unknown field, so nothing is added here.
+     * and Raft refuses an unknown field, so nothing is added to an event.
+     *
+     * A turn end that kept an inbox snapshot (`ends`, `turnReports`) closes its post, which carries the turn's
+     * `turnEnded` beside the events; the snapshot is forgotten once that post is answered, so a post that throws
+     * reports it again with the same events next pass, and Raft counts only the first report of a snapshot.
      */
-    async reportActivity(events: readonly ActivityEvent[], ctx: PluginContext) {
+    async reportActivity(events: readonly ActivityEvent[], ctx: PluginContext, ends: readonly TurnEndEvent[] = []) {
       const state = await loadPushState(ctx);
-      if (!state.enabled) return { skipped: "push is disabled for this mount, so Raft is not following this agent" };
-      // A mount whose account is gone (a delete whose disable_push could not run) has nobody to tell; it
-      // is skipped, not an error, or the alarm would retry every minute for ever.
-      if (!ctx.credential) return { skipped: "this mount has no account, so Raft cannot be told" };
-      if (events.length === 0) return { sent: 0 };
-      const answer = (await call(ctx, "POST", ACTIVITY_PATH, { schema: ACTIVITY_SCHEMA, events })).data;
-      // A 200 is not "all taken": Raft counts what it refused and still answers 200. Refused events are
-      // not resent — they are the same events next time too — so they are said, where an operator would look.
-      const refused = typeof answer.rejectedCount === "number" ? answer.rejectedCount : 0;
-      if (refused > 0) {
-        const statusOnly = events.filter((e) => !e.hookEventName).length;
-        console.warn(`raft mount ${ctx.alias}: Raft refused ${refused} of ${events.length} activity event(s) (${statusOnly} status-only in the batch)`);
+      // Nobody to tell (push off; a mount whose account is gone, a delete whose disable_push could not run): skipped,
+      // not an error, or the alarm would retry every minute for ever. The snapshots these ends close are forgotten
+      // with them, or a later turn would report what this one saw.
+      const skipped = !state.enabled ? "push is disabled for this mount, so Raft is not following this agent"
+        : !ctx.credential ? "this mount has no account, so Raft cannot be told" : null;
+      if (events.length === 0) return skipped ? { skipped } : { sent: 0 };
+      const seen = ends.length ? snapshotsOf(await ctx.db.get(INBOX_STORE, TURN_KEY)) : [];
+      const parts = turnReports(events, ends, seen);
+      if (skipped) {
+        await forgetSnapshots(ctx, parts.flatMap((p) => p.report?.ids ?? []));
+        return { skipped };
       }
-      return { sent: Math.max(0, events.length - refused) };
+      let sent = 0;
+      for (const part of parts) {
+        const answer = (await call(ctx, "POST", ACTIVITY_PATH, {
+          schema: ACTIVITY_SCHEMA, events: part.events, ...(part.report ? { turnEnded: part.report.turnEnded } : {}),
+        })).data;
+        // A 200 is not "all taken": Raft counts what it refused and still answers 200. Refused events are
+        // not resent — they are the same events next time too — so they are said, where an operator would look.
+        const refused = typeof answer.rejectedCount === "number" ? answer.rejectedCount : 0;
+        if (refused > 0) {
+          const statusOnly = part.events.filter((e) => !e.hookEventName).length;
+          console.warn(`raft mount ${ctx.alias}: Raft refused ${refused} of ${part.events.length} activity event(s) (${statusOnly} status-only in the batch)`);
+        }
+        sent += Math.max(0, part.events.length - refused);
+        if (part.report) {
+          reportTurnEnd(ctx, part.report, answer);
+          await forgetSnapshots(ctx, part.report.ids);
+        }
+      }
+      return { sent };
     },
 
     /**

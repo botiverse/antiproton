@@ -8,7 +8,8 @@
 //
 //   node test/raft-assistant-mode.ts
 import { createHmac } from "node:crypto";
-import { raftPlugin, wakeInstruction } from "../src/plugins/raft.ts";
+import { PUSH_KEY, PUSH_STORE, raftPlugin, wakeInstruction } from "../src/plugins/raft.ts";
+import { activityEvents, turnEnds } from "../src/runtime/activity.ts";
 import {
   ASSISTANT_STORE, CHAT_TOOLS, CHECK_TOOLS, COUNTS_KEY, DEFERRED_KEY, INBOX_LAG_RETRY_MS, OWNER_KEY, REMINDED_STORE, RETRY_BACKOFF_MS, REVIEWED_KEY, UNREADABLE_KEY, assistantCheckPrompt, assistantMountOf, assistantPrompt,
   assistantWakeInstruction, confirmRef, isQuietHours, itemOf, localDay, nextBriefAt, zoneOf,
@@ -493,6 +494,38 @@ await check("notify replaces a reference the check's reads cannot confirm with t
   const content = a.r.sends[0].content as string;
   must(content.includes("#ch1:aaaaaaa1") && !content.includes("deadbeef") && !content.includes("elsewhere"), content);
   must(a.read(REMINDED_STORE, "msg:aaaaaaa1") && a.read(REMINDED_STORE, "msg:deadbeef") === undefined, "told is counted by the confirmed message");
+});
+
+await check("an owner-inbox read carries no snapshot to a turn's end: only the agent's own inbox listing does", async () => {
+  const a = await assistant(raft({ dm: "dm:@ada~human" }));
+  a.r.unread = [conv(1)];
+  a.write(PUSH_STORE, PUSH_KEY, { enabled: true, agentId: "agent-1", agentName: "ada-assistant", lastReached: null });
+  // Raft's answers as they would be if every listing carried a snapshot, the owner's too.
+  const fake = globalThis.fetch;
+  const posts: any[] = [];
+  globalThis.fetch = (async (url: any, init?: any) => {
+    const path = new URL(String(url)).pathname.replace("/internal/agent-api", "");
+    if (path === "/activity") { posts.push(JSON.parse(String(init.body))); return json(200, { ok: true, turnEnded: { outcome: "settled" } }); }
+    if (path === "/inbox/conversations") {
+      return json(200, { view: "unread", items: [], hasMore: false, nextBeforeSeq: null, totals: { conversations: 0, dms: 0, mentions: 0 }, snapshotId: "snap_agent" });
+    }
+    const res = await fake(url, init);
+    if (path !== "/assistant/owner-inbox") return res;
+    return json(res.status, { ...(await res.json() as object), snapshotId: "snap_owner" });
+  }) as any;
+  const end = (at: number) => {
+    const rows = [{ seq: at, at: Date.now() + at, tenantId: "tenant", agentId: "agent", kind: "model.call", spanId: `mj_${at}`, status: "stop", verdict: "ok", attrs: {} }] as any[];
+    return raftPlugin.reportActivity!(activityEvents("agent", rows), a.ctx, turnEnds("agent", rows));
+  };
+  const read = await raftPlugin.invoke("assistant_owner_inbox", {}, a.ctx) as any;
+  must(a.r.inboxReads.length === 1 && JSON.stringify(read).includes("ch1"), `control: the owner inbox was read: ${show(read)}`);
+  await end(1000);
+  must(posts.length === 1 && !("turnEnded" in posts[0]), `an owner-inbox read reported a turn end: ${show(posts)}`);
+  // Control: the agent's own listing on the same mount does.
+  await raftPlugin.invoke("inbox_list", {}, a.ctx);
+  await end(2000);
+  must(posts.length === 2 && posts[1].turnEnded?.snapshotId === "snap_agent", `control: ${show(posts)}`);
+  must(!show(posts).includes("snap_owner"), show(posts));
 });
 
 await check("a doorbell at night reads nothing and calls no model (night_deferred); a paused assistant does neither (paused)", async () => {

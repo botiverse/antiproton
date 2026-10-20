@@ -34,8 +34,8 @@ const pushy: Plugin = {
 };
 const quiet: Plugin = { ...pushy, id: "quiet", receive: undefined };
 // Reports activity; records what it was handed and with which mount's credential state.
-const told: Array<{ alias: string; n: number; credential: string | null }> = [];
-pushy.reportActivity = async (events, ctx) => { told.push({ alias: ctx.alias, n: events.length, credential: ctx.credential }); return { sent: events.length }; };
+const told: Array<{ alias: string; n: number; credential: string | null; ends?: unknown }> = [];
+pushy.reportActivity = async (events, ctx, ends) => { told.push({ alias: ctx.alias, n: events.length, credential: ctx.credential, ends }); return { sent: events.length }; };
 
 async function runtime(opts: { hooks?: boolean } = {}) {
   const host = sqliteHost();
@@ -82,6 +82,10 @@ await check("activity reaches every mount whose plugin reports it, through the g
   const out = await rt.gateway().reportActivity("t", "a", events);
   must(out.length === 2 && out.every((r) => "sent" in r && r.sent === 1) && told.map((t) => t.alias).sort().join(",") === "p,p2", JSON.stringify({ out, told }));
   must(told.every((t) => t.credential === null), "a mount with no account showed a credential");
+  // The turn ends beside the events reach each mount as given (src/runtime/activity.ts `turnEnds`).
+  told.length = 0;
+  await rt.gateway().reportActivity("t", "a", events, [{ eventId: "a:1", outcome: "completed" }]);
+  must(told.length === 2 && told.every((t) => JSON.stringify(t.ends) === '[{"eventId":"a:1","outcome":"completed"}]'), JSON.stringify(told));
   await rt.store.setPluginChoice("t", "a", "pushy", "disable");
   told.length = 0;
   const off = await rt.gateway().reportActivity("t", "a", events);

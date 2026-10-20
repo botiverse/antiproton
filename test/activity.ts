@@ -1,5 +1,5 @@
 /** The trace-row → activity-event mapping (src/runtime/activity.ts): what each row kind becomes, and nothing the service does not know. */
-import { activityEvents, ACTIVITY_BATCH_MAX, orderStatuses } from "../src/runtime/activity.ts";
+import { activityEvents, ACTIVITY_BATCH_MAX, orderStatuses, turnEnds } from "../src/runtime/activity.ts";
 import type { TraceOutboxRow } from "../src/trace/outbox.ts";
 import { PROVISION_TASK } from "../src/runtime/status.ts";
 
@@ -93,6 +93,21 @@ check("a tool row that did not succeed is a failure carrying the status as its c
     const ev = activityEvents("raft_a", [row(7, "tool.call", status, verdict, { ms: 10, attrs: { tool: "sandbox.run", mount: "sandbox", name: "sandbox__run" } })]);
     must(ev[1]!.hookEventName === "PostToolUseFailure" && ev[1]!.errorClass === status && ev[1]!.toolName === "sandbox__run", `${status}: ${JSON.stringify(ev)}`);
   }
+});
+
+check("turnEnds tells stop from length, aborted and error, and an outside stop, on the events that end the turn, which stay as they were", () => {
+  const rows = [
+    row(10, "model.call", "toolUse", "ok"), row(11, "model.call", "stop", "ok"), row(12, "model.call", "length", "ok"),
+    row(13, "model.call", "aborted", "cancelled"), row(14, "model.call", "error", "failed"), row(15, "turn.stop", "stopped", "cancelled"),
+    row(16, "model.call", "stop", "ok", { attrs: { session: "sub_child1" } }), row(17, "tool.call", "succeeded", "ok"),
+  ];
+  const ends = turnEnds("raft_a", rows);
+  must(ends.map((e) => `${e.eventId}=${e.outcome}`).join(",") ===
+    "raft_a:11=completed,raft_a:12=failed,raft_a:13=interrupted,raft_a:14=failed,raft_a:15=interrupted", JSON.stringify(ends));
+  // Each names an event the batch has, and the event is what it always was: no outcome on it, the same hook and status.
+  const ev = activityEvents("raft_a", rows);
+  for (const e of ends) must(ev.some((x) => x.eventId === e.eventId && (x.hookEventName === "Stop" || x.hookEventName === "BridgeFatal")), `no event for ${e.eventId}: ${JSON.stringify(ev)}`);
+  must(!JSON.stringify(ev).includes("completed") && !JSON.stringify(ev).includes("interrupted"), `an outcome reached an event: ${JSON.stringify(ev)}`);
 });
 
 check("a model row ends the turn on stop, length and aborted, dies on error, and says nothing while it asked for tools", () => {

@@ -668,6 +668,21 @@ wake (`wakeInstruction`) says to read only those and never page back. Nothing
 is acknowledged that the model was not shown; a pull that leaves nothing behind
 makes no listing request and reads as it did before.
 
+Raft answers that listing with a `snapshotId` when the page has unread
+(slock#10507), and the turn's end reports it back as `turnEnded` on the
+activity post that carries the event ending the turn: the snapshot, how the
+turn ended (`completed` only for a model that stopped on its own; `interrupted`
+for an abort or an outside stop; `failed` for an error, a timeout or the length
+limit — src/runtime/activity.ts `turnEnds`, beside the events and never on
+them), and `shownUnreadTargets`, exactly the conversations whose counts the
+pull's `inbox` lines showed (`renderInboxSummary` writes the lines and names the
+targets in one pass; a parked pull names none). Raft settles only a completed
+turn's background, never a DM, an unread @mention or an unread assigned task.
+Every turn that saw a snapshot reports once, however it ended; the model's own
+`inbox_list` keeps the snapshot but names nothing, and an assistant's owner
+inbox, another route, keeps none. Raft's answer is the `raft.turn_ended` trace
+row.
+
 A send, a reply, a task claim or a task write that Raft holds for the model's
 decision comes back as a question (`heldCall`) whose text is the SDK's own held
 text, `interrupt.context`, passed on unchanged: its opening "Held — …" line, any
@@ -725,7 +740,12 @@ SDK's saved state did not load or save (the SDK's `onStateError`; `status` and
 the console. Before Raft SDK 0.19.0 this row was `raft.state_save_failed`. A
 failed load or save never fails the call: it costs at most a batch delivered
 again or one more hold. A fourth, `raft.mcp_call`, is one managed MCP call's end
-(below).
+(below). `raft.turn_ended` is Raft's answer to one turn's `turnEnded`: `status`
+`settled`, `skipped` or `unreadable` (an answer that says neither, which fails
+nothing), `attrs.outcome` how the turn ended, `attrs.reason` Raft's reason for a
+skip, `attrs.targets` how many conversations were named and
+`attrs.snapshotMismatches` listings of the turn that carried another snapshot
+id; never a conversation's name.
 
 **Raft's managed MCP** (`src/plugins/raft-mcp.ts`, SDK 0.21.1's `raft.mcp`) puts
 the connectors the agent's Raft Server has connected (Notion and the like) on the
