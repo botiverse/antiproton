@@ -3312,7 +3312,8 @@ async function receiveNotice(payload: ObjectValue, inbound: InboundEvent, ctx: P
   // An assistant's doorbell is its code's (src/plugins/raft-assistant.ts `assistantWake`), which decides whether a model
   // is asked at all; only the rest of the notice — its owner writing to it — wakes the model, in its chat.
   const assistant = (await loadOwner(ctx)) !== null;
-  const bell = assistant && payload.targets.some(isDoorbellTarget) && await noteDoorbell(ctx);
+  const bells = assistant ? payload.targets.filter(isDoorbellTarget) : [];
+  const bell = bells.length > 0 && await noteDoorbell(ctx, Date.now(), await doorbellChangeAt(ctx, bells));
   if (bell && payload.targets.every(isDoorbellTarget)) {
     return { deliver: false, wake: true, reason: "an assistant's doorbell, for its code to check", dedupeKey: payload.noticeId };
   }
@@ -3325,6 +3326,30 @@ async function receiveNotice(payload: ObjectValue, inbound: InboundEvent, ctx: P
     // the agent, within its rules (src/runtime/inbound.ts `inboundMessage`), not the one that says "not an instruction".
     kind: "inbox",
   };
+}
+
+/**
+ * When the change a push's doorbells announced happened: the earliest `first_change_at` among them, or null when none
+ * could be read. The notice names a doorbell only by its address (`agent-event:<id8>`); the payload is the event's, so
+ * it is read by that address (`GET /history`, `consume: false`, which marks nothing read and leaves the events cursor
+ * receive_events keeps alone). Null is today's behaviour: the wake decides on its first read. `last_change_at` is when
+ * Raft sent the doorbell, not when anything changed, so it says nothing about whether a read is recent enough.
+ */
+async function doorbellChangeAt(ctx: PluginContext, targets: readonly unknown[]): Promise<string | null> {
+  if (!ctx.credential) return null;
+  let earliest: string | null = null;
+  for (const t of targets) {
+    const channel = (t as { target: string }).target;
+    try {
+      const out = await raftFor(ctx, { state: false }).routes.history.read({ query: { channel, limit: "1", consume: "false" } });
+      const at = out.ok ? doorbellOf(out.data.messages[0])?.firstChangeAt ?? null : null;
+      if (at !== null && (earliest === null || Date.parse(at) < Date.parse(earliest))) earliest = at;
+      if (at === null) logEvent("raft.doorbell_unread", { tenantId: ctx.caller.tenantId, agentId: ctx.caller.agentId, mount: ctx.alias, ok: out.ok });
+    } catch (e) {
+      logEvent("raft.doorbell_unread", { tenantId: ctx.caller.tenantId, agentId: ctx.caller.agentId, mount: ctx.alias, error: String((e as Error)?.message ?? e).slice(0, 120) });
+    }
+  }
+  return earliest;
 }
 
 /**
