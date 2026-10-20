@@ -1,5 +1,6 @@
 import type { Json } from "../core/types.ts";
 import type { Plugin, PluginContext, PluginErrorFields, ToolSchema } from "./types.ts";
+import { identityNote, markIdentity } from "./types.ts";
 
 /**
  * AppWorld as ordinary mounts.
@@ -166,7 +167,7 @@ export function appworldPlugins(catalogue: Catalogue, cfg: AppWorldConfig): Plug
         if (cached?.token) return cached.token;
       }
       if (!ctx.credential) {
-        throw new Error(`mount for ${app} has no credential; the harness cannot authenticate`);
+        throw markIdentity(new Error(`this mount cannot authenticate: ${identityNote(ctx)}`), ctx);
       }
       const cred = JSON.parse(ctx.credential) as AppCredential;
       const token = await login(cfg.apiBaseUrl, app, cred);
