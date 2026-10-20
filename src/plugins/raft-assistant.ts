@@ -128,7 +128,21 @@ export const INBOX_LAG_FOLLOW_UPS_MS: readonly number[] = [...INBOX_LAG_RETRY_MS
  */
 export const INBOX_LAG_SLACK_MS = 2_000;
 
-/** Whether an inbox read shows the change a doorbell announced at `changeAt`: some row's activity is at least that recent. */
+/**
+ * Whether an inbox read shows the change a doorbell announced at `changeAt`: some row's activity is at least that recent.
+ *
+ * Any row, not the conversation that changed (the doorbell names none): the inbox is served from a view that applies
+ * Postgres changes in commit order, so a read that shows any row at least as recent as the change has, in general,
+ * applied the change too. Checking one conversation would need the doorbell to name it.
+ *
+ * The comparison is on `latestAt` (a message's `created_at`), not commit order, so it is not exact: a message in
+ * another conversation created within `INBOX_LAG_SLACK_MS` before the change can be visible while the change is not,
+ * and the read then counts as caught up too early (the two times also come from different clocks: the app's, and
+ * Postgres's transaction start). The changed conversation is then judged on a read that does not show it, and a
+ * doorbell only rings again on new activity, so it can wait for the morning brief. `caught_up_via` on the wake row
+ * lets that case be counted (a read caught up via "unread" that yields no candidate). The exact check needs the
+ * doorbell to carry the conversation and seq that rang it; until it does, this rule stands.
+ */
 export function inboxCaughtUp(items: readonly Pick<InboxItem, "latestAt">[], changeAt: string): boolean {
   const from = Date.parse(changeAt) - INBOX_LAG_SLACK_MS;
   return items.some((i) => i.latestAt !== null && Date.parse(i.latestAt) >= from);
