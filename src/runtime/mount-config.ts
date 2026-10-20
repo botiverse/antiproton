@@ -264,8 +264,9 @@ export function repeatsMount(
  * **`null` is an operation, not a value.** A key left out means "leave it as
  * it is"; a key given `null` means "remove it"; a key given a value means "set
  * it". That reading is only unambiguous because **no `ConfigField["type"]` can
- * hold null** — `SettingValue` has no null member and `settingType(null)` answers
- * `"unknown"` — so a null could never have meant "the value is null". A
+ * hold null** (`src/plugins/types.ts`) — `settingType(null)` answers `"unknown"`
+ * — so a null could never have meant "the value is null". (`SettingValue` does
+ * carry `null`, but as this marker and a stored absence, not as a field type.) A
  * nullable field type would break this, which is why `test/mount-settings.ts`
  * asks `settingType(null)` directly: the day a type can be null, that case reddens
  * and this rule has to be decided again rather than silently doing one thing
@@ -339,7 +340,14 @@ export function mergeMountSettings(
   for (const key of removed) delete config[key];
   const accountLater = plugin.credential && !have.secretRef ? { ...plugin, credential: { ...plugin.credential, required: false } } : plugin;
   const problems = validateMount(accountLater, config, have.secretRef);
-  if (problems.length) return { ok: false, error: `cannot change ${plugin.id}'s settings: ${problems.map((p) => p.message).join("; ")}` };
+  if (problems.length) {
+    // A key the plugin does not declare that is still in the merged settings came from the stored row (the patch
+    // itself may only delete one), and it fails every patch that leaves it there. Say how to get out, naming the
+    // key and never its value: settings are public, and the value may be exactly what should not have been there.
+    const stray = Object.keys(config).filter((k) => k !== "account" && !fields.some((f) => f.name === k));
+    const way = stray.length ? ` — delete ${stray.map((k) => `"${k}"`).join(", ")} by sending it as null, in this patch or before it` : "";
+    return { ok: false, error: `cannot change ${plugin.id}'s settings: ${problems.map((p) => p.message).join("; ")}${way}` };
+  }
   const changed = Object.keys(patch).filter((k) => JSON.stringify(stored[k]) !== JSON.stringify(config[k]));
   return { ok: true, config, changed };
 }

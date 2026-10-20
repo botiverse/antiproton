@@ -301,21 +301,46 @@ await check("`null` is a deletion: an undeclared key goes, a declared changeable
   host.dispose();
 });
 
-await check("a stray key freezes every setting on its mount until one patch removes it; that patch may change a setting too", async () => {
-  // The reading that makes the deletion more than tidiness: the merged whole is validated, so a key the plugin
-  // does not declare fails EVERY patch that leaves it there — the mount's other settings cannot be touched.
+await check("on a plugin that declares no settings, a stray key is deleted with null and nothing else", async () => {
+  // A zero-config plugin has nothing changeable, so a patch naming any other key is refused for that key alone; the
+  // freeze a stray key causes is pinned on raft below, where there is a setting it could block.
   const { rt, host } = await runtime();
   await rt.store.createAgent(T, STRAY_AGENT);
   await withStray(rt, "bare", "bare", { token: "written-by-an-older-build" });
-  const frozen = await patch(env(rt), { tenantId: T, agentId: STRAY_AGENT, alias: "bare", settings: { other: 1 } });
-  must(frozen.status === 400, `a stray key did not block the change: ${frozen.status} ${frozen.text}`);
-  // One patch that deletes the stray key and sets a legal one: allowed, because the merge happens before the judgement.
-  const both = await patch(env(rt), { tenantId: T, agentId: STRAY_AGENT, alias: "bare", settings: { token: null } });
-  must(both.status === 200, `${both.status} ${both.text}`);
+  const set = await patch(env(rt), { tenantId: T, agentId: STRAY_AGENT, alias: "bare", settings: { token: "again" } });
+  must(set.status === 400 && /bare has no setting "token"/.test(set.body.error), `${set.status} ${set.text}`);
+  // On a plugin that declares nothing, deleting the stray key is the whole repair.
+  const repaired = await patch(env(rt), { tenantId: T, agentId: STRAY_AGENT, alias: "bare", settings: { token: null } });
+  must(repaired.status === 200, `${repaired.status} ${repaired.text}`);
   must(settingsOf(host, STRAY_AGENT, "bare").token === undefined, "the stray key survived");
-  // Deleted first, then a change: also fine. Both orders work because validation runs on the merged whole.
-  const after = await patch(env(rt), { tenantId: T, agentId: STRAY_AGENT, alias: "bare", settings: { account: null } });
-  must(after.status === 200, `after the repair: ${after.status} ${after.text}`);
+  host.dispose();
+});
+
+await check("with a stray key stored, deleting it and changing a setting works in one patch and in two", async () => {
+  // Merge-then-validate is an implementation order, not something a reader would guess, so both orders are pinned.
+  const stray = async (host: ReturnType<typeof sqliteHost>, agentId: string) => host.sql.exec(
+    "UPDATE mounts SET public_config = ? WHERE agent_id = ? AND alias = ?",
+    JSON.stringify({ serverUrl: ORIGIN, gh_token: "kept-from-an-older-build" }), agentId, PROVISION_MOUNT_ALIAS);
+  const { rt, host, agentId } = await raftAgent();
+  await stray(host, agentId);
+  // Alone, a change to a changeable setting is refused, and the refusal names the key to delete (not its value).
+  const frozen = await patch(env(rt), { tenantId: T, agentId, alias: "raft", settings: { conversationCards: true } });
+  must(frozen.status === 400 && /"gh_token"/.test(frozen.body.error) && /null/.test(frozen.body.error), `${frozen.status} ${frozen.text}`);
+  must(!frozen.text.includes("kept-from-an-older-build"), `the refusal quotes the stray value: ${frozen.text}`);
+  must(settingsOf(host, agentId).conversationCards === undefined, "a refused patch was written");
+  // (a) One patch: delete the stray key and change the setting.
+  const one = await patch(env(rt), { tenantId: T, agentId, alias: "raft", settings: { gh_token: null, conversationCards: true } });
+  must(one.status === 200, `one patch: ${one.status} ${one.text}`);
+  must(settingsOf(host, agentId).gh_token === undefined && settingsOf(host, agentId).conversationCards === true,
+    `one patch: ${JSON.stringify(settingsOf(host, agentId))}`);
+  // (b) Two patches: delete first, then change.
+  await stray(host, agentId);
+  const first = await patch(env(rt), { tenantId: T, agentId, alias: "raft", settings: { gh_token: null } });
+  must(first.status === 200, `first: ${first.status} ${first.text}`);
+  const second = await patch(env(rt), { tenantId: T, agentId, alias: "raft", settings: { conversationCards: true } });
+  must(second.status === 200, `second: ${second.status} ${second.text}`);
+  must(settingsOf(host, agentId).gh_token === undefined && settingsOf(host, agentId).conversationCards === true,
+    `two patches: ${JSON.stringify(settingsOf(host, agentId))}`);
   host.dispose();
 });
 
