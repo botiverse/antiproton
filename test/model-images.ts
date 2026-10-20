@@ -107,13 +107,20 @@ await check("a view marker is read strictly: its five keys, an artifact:// refer
     [{ ...VIEW, bytes: "182" }, "bytes is not a positive whole number"],
     [{ ...VIEW, bytes: MAX_IMAGE_BYTES + 1 }, "over the 1572864-byte limit"],
     [{ ...VIEW, width: 0 }, "width is not a positive whole number"],
-    [{ ...VIEW, height: 9000 }, "over the 8192-pixel limit"],
+    [{ ...VIEW, height: 9000 }, "over the 8000-pixel limit"],
     [{ ref: VIEW.ref, mimeType: VIEW.mimeType }, "bytes is not"],
   ];
   for (const [v, says] of refused) {
     const got = parseView(v);
     must("problem" in got && got.problem.includes(says), `${show(v).slice(0, 80)}: ${show(got)} (wanted "${says}")`);
   }
+});
+
+await check("the side limit is 8000 pixels, the smallest a vision model we offer accepts (Anthropic's): 8000 is attached, 8001 is refused", () => {
+  must(MAX_IMAGE_SIDE === 8000, `MAX_IMAGE_SIDE ${MAX_IMAGE_SIDE}`);
+  for (const [w, h] of [[8000, 10], [1200, 8000]]) must(imageProblem(png(w, h), "image/png") === null, `${w}x${h} refused: ${imageProblem(png(w, h), "image/png")}`);
+  for (const [w, h] of [[8001, 10], [1200, 8100]]) must(/over the 8000-pixel limit/.test(String(imageProblem(png(w, h), "image/png"))), `${w}x${h}: ${imageProblem(png(w, h), "image/png")}`);
+  must("problem" in parseView({ ...VIEW, width: 8001 }) && !("problem" in parseView({ ...VIEW, width: 8000 })), "the view marker's side check");
 });
 
 await check("splitView leaves a result without the field untouched, and withView puts it back on a wrapper", () => {
@@ -155,7 +162,7 @@ await check("attachViewImage reads under the caller's scope, checks the bytes, a
   await refusedWith({ ...VIEW, bytes: IMG.byteLength + 1 }, OWNER, `is ${IMG.byteLength} bytes, not`);
   await refusedWith({ ...VIEW, mimeType: "image/jpeg" }, OWNER, "the bytes are image/png, not image/jpeg");
   bucket.objects.set("t/t/a/uploads/huge.png", png(9000, 10));
-  await refusedWith({ ...VIEW, ref: "artifact://uploads/huge.png", bytes: bucket.objects.get("t/t/a/uploads/huge.png")!.byteLength }, OWNER, "over the 8192-pixel limit");
+  await refusedWith({ ...VIEW, ref: "artifact://uploads/huge.png", bytes: bucket.objects.get("t/t/a/uploads/huge.png")!.byteLength }, OWNER, "over the 8000-pixel limit");
   bucket.objects.set("t/t/a/uploads/fake.png", new TextEncoder().encode("not an image at all"));
   await refusedWith({ ...VIEW, ref: "artifact://uploads/fake.png", bytes: 19 }, OWNER, "not a PNG, JPEG, WebP or GIF");
 });
@@ -170,7 +177,7 @@ await check("viewContent: attached for a model that sees, the sentence for one t
   let attached = 0;
   const blind = await viewContent(VIEW, shown, { seesImages: async () => false, attachImage: async () => { attached++; return "x"; } });
   must(blind.length === 1 && (blind[0] as any).text.endsWith(NO_VISION_SENTENCE) && attached === 0, `${show(blind)}, attached ${attached}`);
-  must(NO_VISION_SENTENCE.includes("cannot see images") && NO_VISION_SENTENCE.includes("DeepSeek Flash or GPT-5.6 Luna"), NO_VISION_SENTENCE);
+  must(NO_VISION_SENTENCE.includes("cannot see images") && NO_VISION_SENTENCE === "This model cannot see images; an owner can switch this agent to a model that can.", NO_VISION_SENTENCE);
 
   const bad = await viewContent({ ...VIEW, mimeType: "image/bmp" }, shown, sees);
   must(bad.length === 1 && (bad[0] as any).text.includes("could not be attached: view.mimeType is not one of"), show(bad));
@@ -477,7 +484,7 @@ const ROWS: Array<{ name: string; env: ModelEnv; job: unknown; reply: string; re
     request: String.raw`{"url":"https://gateway.ai.cloudflare.com/v1/acct/gw/compat/responses","body":"{\"model\":\"openai/gpt-5.6-luna\",\"input\":[{\"role\":\"developer\",\"content\":\"Look closely.\"},{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"What is in this chart?\"},{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,AQIDBAUGBwg=\",\"detail\":\"auto\"}]},{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"view\",\"arguments\":\"{\\\"name\\\":\\\"a.png\\\"}\"},{\"type\":\"function_call\",\"call_id\":\"call_2\",\"name\":\"read\",\"arguments\":\"{}\"},{\"type\":\"function_call_output\",\"call_id\":\"call_1\",\"output\":\"{\\\"name\\\":\\\"a.png\\\"}\\n\\nImage attached: artifact://a.png (image/png, 8 bytes).\"},{\"type\":\"function_call_output\",\"call_id\":\"call_2\",\"output\":\"page\"},{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Attached image(s) from tool result:\"},{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,AQIDBAUGBwg=\",\"detail\":\"auto\"}]}],\"max_output_tokens\":32768,\"store\":false,\"reasoning\":{\"effort\":\"medium\",\"summary\":\"auto\"},\"include\":[\"reasoning.encrypted_content\"]}"}` },
   { name: "deepseek-v4-pro (cannot see images), version 1: each image is the sentence, and nothing is read",
     env: ENV, job: job(V1, { provider: "deepseek", model: "deepseek-v4-pro" }), reply: CHAT_REPLY,
-    request: String.raw`{"url":"https://api.deepseek.com/chat/completions","body":"{\"model\":\"deepseek-v4-pro\",\"messages\":[{\"role\":\"system\",\"content\":\"Look closely.\"},{\"role\":\"user\",\"content\":\"What is in this chart?\\n\\nThis model cannot see images; an owner can switch this agent to a model that can (DeepSeek Flash or GPT-5.6 Luna).\"},{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"view\",\"arguments\":\"{\\\"name\\\":\\\"a.png\\\"}\"}},{\"id\":\"call_2\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{}\"}}]},{\"role\":\"tool\",\"tool_call_id\":\"call_1\",\"content\":\"{\\\"name\\\":\\\"a.png\\\"}\\n\\nImage attached: artifact://a.png (image/png, 8 bytes).\\n\\nThis model cannot see images; an owner can switch this agent to a model that can (DeepSeek Flash or GPT-5.6 Luna).\"},{\"role\":\"tool\",\"tool_call_id\":\"call_2\",\"content\":\"page\"}],\"max_tokens\":32768,\"temperature\":0}"}` },
+    request: String.raw`{"url":"https://api.deepseek.com/chat/completions","body":"{\"model\":\"deepseek-v4-pro\",\"messages\":[{\"role\":\"system\",\"content\":\"Look closely.\"},{\"role\":\"user\",\"content\":\"What is in this chart?\\n\\nThis model cannot see images; an owner can switch this agent to a model that can.\"},{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"view\",\"arguments\":\"{\\\"name\\\":\\\"a.png\\\"}\"}},{\"id\":\"call_2\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{}\"}}]},{\"role\":\"tool\",\"tool_call_id\":\"call_1\",\"content\":\"{\\\"name\\\":\\\"a.png\\\"}\\n\\nImage attached: artifact://a.png (image/png, 8 bytes).\\n\\nThis model cannot see images; an owner can switch this agent to a model that can.\"},{\"role\":\"tool\",\"tool_call_id\":\"call_2\",\"content\":\"page\"}],\"max_tokens\":32768,\"temperature\":0}"}` },
 ];
 
 for (const row of ROWS) {

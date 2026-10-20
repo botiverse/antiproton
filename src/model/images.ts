@@ -33,14 +33,17 @@ export type ImageMimeType = typeof IMAGE_MIME_TYPES[number];
 export const MAX_IMAGE_BYTES = 1.5 * 1024 * 1024;
 
 /**
- * The longest side a provider accepts: DeepSeek refuses an image over 8192 pixels on either side. A refused image
- * would be in every later request of the conversation, so one is refused here instead, before it is attached.
+ * The longest side every provider we offer accepts: Anthropic refuses an image over 8000 pixels on either side, and
+ * DeepSeek one over 8192. A refused image would be in every later request of the conversation (a permanent 400 on each
+ * call until the image window moved past it), so one is refused here instead, before it is attached.
  */
-export const MAX_IMAGE_SIDE = 8192;
+export const MAX_IMAGE_SIDE = 8000;
 
-/** What a model that cannot see an image is told in its place. */
-export const NO_VISION_SENTENCE =
-  "This model cannot see images; an owner can switch this agent to a model that can (DeepSeek Flash or GPT-5.6 Luna).";
+/**
+ * What a model that cannot see an image is told in its place. It names no model: which ones can see changes with the
+ * deployment's list (src/model/context-windows.ts `VISION_MODELS`), and a sentence that named them went stale.
+ */
+export const NO_VISION_SENTENCE = "This model cannot see images; an owner can switch this agent to a model that can.";
 
 const SHA = /^[0-9a-f]{64}$/;
 

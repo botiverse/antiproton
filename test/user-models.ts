@@ -89,11 +89,12 @@ function varsOf(file: string): Record<string, unknown> {
   return JSON.parse(text.split("\n").filter((l) => !l.trim().startsWith("//")).join("\n")).vars;
 }
 
-await check("config: each deployment offers exactly DeepSeek Flash and GPT-5.6 Luna, accepted against its own providers, and DeepSeek stays the default", () => {
+await check("config: each deployment offers exactly DeepSeek Flash, GPT-5.6 Luna and Claude Haiku 5.5, accepted against its own providers, and DeepSeek stays the default", () => {
   for (const file of ["wrangler.jsonc", "wrangler.preview.jsonc"]) {
     const vars = varsOf(file);
     const ps = { configs: parseProviders(vars.MODEL_PROVIDERS), secrets: {} };
-    must(show(parseUserModels(vars.USER_MODELS, ps)) === show([FLASH, LUNA]), `${file}: ${show(vars.USER_MODELS)}`);
+    const haiku = { id: "claude-haiku-5-5", label: "Claude Haiku 5.5", provider: "cloudflare-anthropic", model: "claude-haiku-5-5" };
+    must(show(parseUserModels(vars.USER_MODELS, ps)) === show([FLASH, LUNA, haiku]), `${file}: ${show(vars.USER_MODELS)}`);
     must(vars.HARNESS_MODEL === "deepseek-flash", `${file}: the default moved`);
   }
 });

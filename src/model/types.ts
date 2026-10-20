@@ -23,6 +23,12 @@ export interface ModelUsage {
   /** Counted inside completionTokens by DeepSeek-style providers. */
   reasoningTokens: number;
   cachedPromptTokens: number;
+  /**
+   * Prompt tokens the provider wrote to its cache on this call, inside `promptTokens` like the cached ones.
+   * Only a provider that reports writes sets it (Anthropic's Messages API, src/model/anthropic-messages.ts);
+   * absent is none, which is what every other client has always recorded.
+   */
+  cacheWriteTokens?: number;
 }
 
 export interface ToolCall {
@@ -58,7 +64,25 @@ export interface ModelResponse {
    * so the model keeps its reasoning across the tool calls of one turn.
    */
   reasoningItems?: Array<{ text: string; signature: string }>;
+  /**
+   * The answer's content in the provider's own order, each block with its raw form as JSON, for a provider that must be
+   * sent its blocks back exactly as it wrote them (Anthropic's Messages API, src/model/anthropic-messages.ts: its
+   * thinking blocks are bound to the blocks around them). When present, `fromResponse` writes the transcript's blocks
+   * in this order, each raw block in that block's signature field, and `toAnthropicRequest` sends them back verbatim.
+   */
+  blocks?: ResponseBlock[];
+  /**
+   * Set when the provider ended the answer with nothing in it for a reason that is not a normal stop (Anthropic's
+   * `refusal` or `model_context_window_exceeded` with empty content): the answer is a failed turn, and this says why.
+   */
+  failure?: string;
 }
+
+/** One block of an answer in the provider's order, `raw` its block as the provider wrote it (JSON). */
+export type ResponseBlock =
+  | { type: "thinking"; text: string; raw: string }
+  | { type: "text"; text: string; raw: string }
+  | { type: "toolCall"; call: ToolCall; raw: string };
 
 /** Provider-native tool definition, normalised. */
 export interface ToolDefinition {

@@ -48,7 +48,7 @@ import { agentDeletedAt, logTurnStop, markAgentDeleted, turnStopRow, type StopTr
 import { explainUnavailableTool } from "../../src/runtime/unavailable-tool.ts";
 import {
   bindingKey, buildBriefing, programSendCounter, clearBackstop, conversationMessages, hasAnswer, judgeOverflow, mainCallOut, mainMessages, mainTip, needsReset, noteRebuilt,
-  jobFixedTokens, noteRunEndedWell, noticeHeads, overflowKind, readBackstop, recordBackstop, recordNoticeHead, requestFixedTokens, requestTokens, returnPendingBriefing,
+  jobFixedTokens, MAX_SOFT_HOLDS_IN_ROW, noteRunEndedWell, noteSoftHold, noticeHeads, overflowKind, readBackstop, softHoldsInRow, softWindowOf, recordBackstop, recordNoticeHead, requestFixedTokens, requestTokens, returnPendingBriefing,
   SessionNeedsReset, takePendingBriefing, type Briefing, type Judge,
 } from "../../src/runtime/overflow-backstop.ts";
 import { credentialRedactor, agentSecretValues } from "./eval-read.ts";
@@ -145,7 +145,7 @@ import type { InboundEvent, InboundHooks } from "../../src/plugins/types.ts";
 import { INBOUND_HOOKS_PER_MOUNT } from "../../src/plugins/types.ts";
 import { CONTEXT_BOUNDARY_WHERE, MAIN_SESSION, piTables } from "../../src/store/pi-storage.ts";
 import {
-  DEFAULT_IDLE_RULE, coldWakeRecord, idleRebuild, idleRebuildRecord, nearWindow, readWakeFacts, recordRebuildDecision, ruleFor, shouldRebuild, windowRecord,
+  DEFAULT_IDLE_RULE, coldWakeRecord, idleRebuild, idleRebuildRecord, nearWindow, readWakeFacts, recordRebuildDecision, ruleFor, shouldRebuild, softWindowFor, windowRecord,
   type RebuildPolicy, type RebuildRequest,
 } from "../../src/runtime/rebuild.ts";
 import {
@@ -3577,6 +3577,10 @@ export class AgentRuntime {
       host: this.#deps.ctx.storage,
       usageOwner: { tenantId, agentId },
       ...(session === MAIN_SESSION && this.#recordsRebuilds(tenantId) ? { rebuilds: true } : {}),
+      // Acted on whatever is recorded: a soft window is about what a call costs, not a reading.
+      ...(session === MAIN_SESSION ? {
+        softWindow: () => softHoldsInRow(this.#deps.ctx.storage.sql) < MAX_SOFT_HOLDS_IN_ROW ? softWindowFor(this.#deps.rebuildPolicy ?? null, binding.model) : null,
+      } : {}),
       sessionId: session === MAIN_SESSION ? key : `${key}#${session}`,
       // The conversation, not the session: a fresh context keeps the session's name and starts a new conversation,
       // and its first call is compared with nothing rather than with the last call of the one it ended.
@@ -5747,7 +5751,14 @@ export class AgentRuntime {
     const now = Date.now();
     const judge = await this.#judge(tenantId, agentId);
     const from = currentMainId(sql);
-    const verdict = judgeOverflow(sql, from, hasAnswer(mainMessages(sql)), judge.binding, now);
+    // A call held back at its soft window is not a failure, and is not counted as one: a long task crosses its soft window
+    // again after each rebuild, and three in a row would mark the session `needs_reset`. Its own bound is
+    // `MAX_SOFT_HOLDS_IN_ROW`, past which the soft window is not applied until a run ends well, and a conversation that
+    // starts at its soft window is never held back (src/runtime/rebuild.ts `softWindowReached`).
+    const soft = softWindowOf(tip!.message);
+    const state = readBackstop(sql);
+    const verdict: ReturnType<typeof judgeOverflow> = !soft ? judgeOverflow(sql, from, hasAnswer(mainMessages(sql)), judge.binding, now)
+      : state.needsReset ? { act: "skip", why: "needs-reset" } : { act: "rebuild", consecutive: state.consecutive };
     if (verdict.act === "skip") return null;
     const jobId = typeof tip!.message.jobId === "string" ? tip!.message.jobId : null;
     const base = {
@@ -5761,9 +5772,12 @@ export class AgentRuntime {
       });
       return null;
     }
+    // Counted before the rebuild, whose first run is driven inside it and may reach the soft window again.
+    const holds = soft ? noteSoftHold(sql) : undefined;
     const built = await this.#rebuildContext(tenantId, agentId, { trigger: "window", strategy: "briefing" }, now);
     recordBackstop(sql, this.#transact(), {
       ...base, trigger: "window", to: built.to, acted: true, reason: "overflow", rebuilds: built.rebuilds,
+      ...(soft ? { cause: "soft-window" as const, softWindow: soft, softHoldsInRow: holds } : {}),
       tokensAfter: built.tokensAfter, briefing: built.briefing, awaitOutcome: this.#recordsRebuilds(tenantId),
     });
     return built.step;
