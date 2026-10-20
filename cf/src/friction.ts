@@ -21,6 +21,7 @@
  * and an evidence line that is either a template or a short redacted excerpt of the agent's OWN text or command.
  * User messages are never read, and a tool's raw output is never excerpted.
  */
+import { redactCredentialShapes } from "../../src/trace/redact.ts";
 
 export interface FrictionEvent { sequence: number; kind: string; payload: any; createdAt: number }
 
@@ -62,22 +63,8 @@ const WINDOW_MS = 600_000;
 
 // ---------- redaction and normalisation ----------
 
-const TOKEN_SHAPES = /\b(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{16,}|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}|rmc\.[A-Za-z0-9._-]{10,})/g;
-const KEY_VALUE = /(bearer|token|secret|password|passwd|api[_-]?key|authorization|cookie|x-harness-token)(["'\s:=]+)[^\s"',;]{6,}/gi;
-const URL_CREDENTIALS = /\b([a-z][a-z0-9+.-]*:\/\/)[^\s/@"']+@/gi;
-const URL_QUERY = /(\b[a-z][a-z0-9+.-]*:\/\/[^\s?"'#]+)\?[^\s"'#]*/gi;
-const BLOB = /[A-Za-z0-9+/_-]{40,}={0,2}/g;
-
-/** Credential shapes out of a string the agent wrote: token shapes, `key=value` secrets, url userinfo and queries, long opaque blobs. */
-export function redact(s: unknown): string {
-  return String(s ?? "")
-    .replace(/__AP_[A-Za-z0-9_]+/g, "<placeholder>")
-    .replace(TOKEN_SHAPES, "<secret>")
-    .replace(KEY_VALUE, (_m, k: string, sep: string) => `${k}${sep}<redacted>`)
-    .replace(URL_CREDENTIALS, "$1<cred>@")
-    .replace(URL_QUERY, "$1?<query>")
-    .replace(BLOB, "<blob>");
-}
+/** Credential shapes out of a string the agent wrote; the one helper the trace's tool errors use too (src/trace/redact.ts). */
+export const redact = redactCredentialShapes;
 
 /** A short excerpt of the agent's own words: whitespace folded, redacted, capped. */
 export function excerpt(s: unknown, n = 140): string {

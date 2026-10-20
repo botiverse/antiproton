@@ -6,7 +6,7 @@
  *
  *   inbound, delivered            → thinking   (a message entered; the model is next)
  *   model.call, at its start      → thinking   (dated at - ms, when the call was made)
- *   model.call toolUse, at its end → working   (tools run next)
+ *   model.call toolUse, at its end → working   (tools run next; "Using" the first tool it asked for)
  *   tool.call, at its start       → working    (not one the provider ran: `operatorCall`)
  *   model.call stop|length|aborted → online    (the turn is over)
  *   model.call error              → error      (with why, for a daily spend limit's refusal)
@@ -94,7 +94,13 @@ export function statusEvents(agentId: string, rows: readonly TraceOutboxRow[], b
         // A start is only known when the span measured itself; without `ms` it would sit on the end's
         // own instant and say nothing the end does not.
         if (ms > 0) raw.push({ at: row.at - ms, key: `${id}:start`, status: "thinking" });
-        if (row.status === "toolUse") raw.push({ at: row.at, key: id, status: "working" });
+        // The change to working names the first tool asked for (`attrs.firstTool`, src/trace/seams.ts): Raft takes a
+        // detail with a status change, so a tool that starts later than this instant — any of a run_js program's, which
+        // start inside it — would leave the previous turn's "Using …" showing beside this "working".
+        if (row.status === "toolUse") {
+          const first = typeof row.attrs.firstTool === "string" && row.attrs.firstTool ? row.attrs.firstTool : null;
+          raw.push({ at: row.at, key: id, status: "working", ...(first ? { detail: `Using ${first}`.slice(0, 200) } : {}) });
+        }
         else if (row.status === "stop" || row.status === "length" || row.status === "aborted") raw.push({ at: row.at, key: id, status: "online" });
         // A call refused for a daily spend limit says why, as `detail`, which Raft's dot shows beside `error`.
         else if (row.status === "error") {

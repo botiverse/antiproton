@@ -36,7 +36,7 @@ import type { StorageWrite } from "@earendil-works/pi-durable";
 import type { SqliteSyncExecutor } from "../vendor/pi/pi-durable/dist/storage/sqlite/storage.js";
 import { logEvent } from "../core/log.ts";
 import { appendTrace, type TraceRow } from "../trace/outbox.ts";
-import { answerEnded, modelCallRow } from "../trace/seams.ts";
+import { answerEnded, firstToolCall, modelCallRow } from "../trace/seams.ts";
 import { spendLimitRefusal } from "../model/pi-bridge.ts";
 import { compactionRecord, recordRebuildDecision, settleRebuildOutcome } from "./rebuild.ts";
 import { modelTokenRows, UNACCEPTED_TOKENS, type UsageRow } from "../usage/outbox.ts";
@@ -252,6 +252,7 @@ export function bookCommit(exec: SqliteSyncExecutor, writes: readonly StorageWri
           usage: (m as { usage?: Parameters<typeof modelCallRow>[0]["usage"] }).usage ?? null,
           limit: spendLimitRefusal(m as { errorMessage?: unknown; providerError?: unknown }),
           session: sessionOfConversation(ctx.ap, job.conversation_id),
+          firstTool: firstToolCall((m as { content?: unknown }).content),
         }));
       }
       appendTrace(ctx.raw as Parameters<typeof appendTrace>[0], trace);
