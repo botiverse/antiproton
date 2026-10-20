@@ -2946,10 +2946,12 @@ export function createRaftPlugin(deps: {
           for (const [target, seqs] of byTarget) seen.recordExact(target, seqs);
           await raft.state.save();
         }
-        // An assistant learns its owner's DM from the DM itself, for the notify tool to send to, where Raft gives none.
+        // An assistant learns its owner's DM from a message its owner wrote there, where Raft gives none (`learnDm`).
         if (ctx.offered?.includes(PREFERENCES_TOOL)) {
-          const dm = given.shown.find((m) => m.target.startsWith("dm:@") && m.raw.third_party_event === undefined);
-          if (dm) await learnDm(ctx, dm.target, dm.sender.type).catch(() => {});
+          for (const m of given.shown) {
+            if (!m.target.startsWith("dm:@") || m.raw.third_party_event !== undefined) continue;
+            if (await learnDm(ctx, m.target, m.raw.sender_id ?? m.raw.senderId).catch(() => false)) break;
+          }
         }
         return given.result;
       }

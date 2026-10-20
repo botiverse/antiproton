@@ -105,6 +105,11 @@ export interface AssistantOwner {
    * the DM itself, or given to the notify tool once.
    */
   dmTarget: string | null;
+  /**
+   * The owner's DM as learnt where Raft gives none (`dmTarget` null): from a message the owner wrote in it (`learnDm`), or
+   * given to the notify tool once. Raft's always wins (`dmOf`).
+   */
+  learnedDm: string | null;
   /** When a doorbell arrived that no wake has checked yet. */
   doorbellAt: number | null;
   /** When a doorbell was last checked: activity in a conversation no check has looked at counts as new after it. */
@@ -129,7 +134,7 @@ function ownerOf(raw: unknown): AssistantOwner | null {
   const str = (v: unknown) => (typeof v === "string" && v ? v : null);
   return {
     userId: o.userId, timezone: validZone(o.timezone), statedTimezone: validZone(o.statedTimezone), serverId: str(o.serverId),
-    pausedAt: typeof o.pausedAt === "number" ? o.pausedAt : null, dmTarget: str(o.dmTarget), lastBrief: str(o.lastBrief),
+    pausedAt: typeof o.pausedAt === "number" ? o.pausedAt : null, dmTarget: str(o.dmTarget), learnedDm: str(o.learnedDm), lastBrief: str(o.lastBrief),
     doorbellAt: typeof o.doorbellAt === "number" ? o.doorbellAt : null, lastCheckAt: typeof o.lastCheckAt === "number" ? o.lastCheckAt : null,
     briefSent: str(o.briefSent), askedTimezone: o.askedTimezone === true,
   };
@@ -169,7 +174,7 @@ export async function keepOwnerFromContext(ctx: PluginContext, context: OwnerCon
   const owner: AssistantOwner = {
     userId: of.userId, timezone: validZone(of.timezone ?? null), statedTimezone: same?.statedTimezone ?? null,
     serverId: context.server.id, pausedAt: null,
-    dmTarget: dm ?? same?.dmTarget ?? null, doorbellAt: same?.doorbellAt ?? null, lastCheckAt: same?.lastCheckAt ?? null, lastBrief: same?.lastBrief ?? null, briefSent: same?.briefSent ?? null, askedTimezone: same?.askedTimezone ?? false,
+    dmTarget: dm, learnedDm: same?.learnedDm ?? null, doorbellAt: same?.doorbellAt ?? null, lastCheckAt: same?.lastCheckAt ?? null, lastBrief: same?.lastBrief ?? null, briefSent: same?.briefSent ?? null, askedTimezone: same?.askedTimezone ?? false,
   };
   await saveOwner(ctx, owner);
   return owner;
@@ -194,12 +199,24 @@ export async function pauseOn(ctx: PluginContext, error: unknown): Promise<void>
   if (owner && owner.pausedAt === null) await saveOwner(ctx, { ...owner, pausedAt: Date.now() });
 }
 
-/** The owner's DM learnt from a message in it: `dm:@name`, without a thread's suffix. Only a DM with a person. */
-export async function learnDm(ctx: PluginContext, target: string, senderType: unknown): Promise<void> {
+/** Where the notify tool sends: Raft's DM target whenever it gives one, else the one learnt. */
+export function dmOf(owner: Pick<AssistantOwner, "dmTarget" | "learnedDm">): string | null {
+  return owner.dmTarget ?? owner.learnedDm;
+}
+
+/**
+ * The owner's DM learnt from a message in it, only while Raft gives none: the target without a thread's suffix, its
+ * `~human` / `~agent` kept as the message carried it, and only from a message whose sender is the owner (its sender id
+ * is `assistantOf.userId`). A message with no sender id teaches nothing. True when it was kept.
+ */
+export async function learnDm(ctx: PluginContext, target: string, senderId: unknown): Promise<boolean> {
   const m = /^dm:@([^:\s]+)/.exec(target);
-  if (!m || senderType !== "human") return;
+  if (!m) return false;
   const owner = await loadOwner(ctx);
-  if (owner && owner.dmTarget !== `dm:@${m[1]}`) await saveOwner(ctx, { ...owner, dmTarget: `dm:@${m[1]}` });
+  // The owner's id is never empty (`keepOwnerFromContext`), so a message with no sender id never matches it.
+  if (!owner || owner.dmTarget !== null || senderId !== owner.userId) return false;
+  if (owner.learnedDm !== `dm:@${m[1]}`) await saveOwner(ctx, { ...owner, learnedDm: `dm:@${m[1]}` });
+  return true;
 }
 
 // ---- the owner's clock -----------------------------------------------------------------------------------------------
@@ -424,7 +441,7 @@ export async function notifyOwner(args: unknown, ctx: PluginContext, deps: Notif
   const brief = a.brief === true && owner.lastBrief === today && owner.briefSent !== today;
   // The owner's DM, once given, is kept whatever this call then does, so a later call (the brief) has it.
   const given = typeof a.target === "string" && DM_TARGET.test(a.target.trim()) ? a.target.trim() : null;
-  if (given && given !== owner.dmTarget) await saveOwner(ctx, owner = { ...owner, dmTarget: given });
+  if (given && given !== owner.learnedDm) await saveOwner(ctx, owner = { ...owner, learnedDm: given });
   if (!Array.isArray(a.items) || a.items.length > ITEMS_MAX) throw refusal(`items must be a list of at most ${ITEMS_MAX}`);
   const items: Item[] = [];
   for (const raw of a.items) {
@@ -464,7 +481,7 @@ export async function notifyOwner(args: unknown, ctx: PluginContext, deps: Notif
     }
     return { state: "nothing_to_send", ...(Object.keys(dropped).length ? { dropped } : {}), note: "Nothing new is waiting on your owner: send them nothing." };
   }
-  const target = owner.dmTarget;
+  const target = dmOf(owner);
   if (!target) {
     throw refusal(`${NOTIFY_TOOL}: your owner's DM is not known yet (Raft gives none until the DM exists, and none has been seen): ` +
       "call again with target set to it (dm:@<their name>) if you know it; otherwise nothing can be sent yet");

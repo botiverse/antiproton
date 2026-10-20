@@ -190,11 +190,14 @@ await check("the listing keeps the owner with Raft's zone and DM; an invalid or 
     const b = await assistant(raft({ dm }));
     must(b.read(ASSISTANT_STORE, OWNER_KEY).dmTarget === null, `dm ${show(dm)}: ${show(b.read(ASSISTANT_STORE, OWNER_KEY))}`);
   }
-  // Raft's null (no DM yet) does not forget one learnt from the DM itself.
+  // Raft's null (no DM yet) does not forget one learnt from the DM itself; Raft's own, once given, wins over it.
   const c = await assistant(raft({ dm: null }));
-  c.write(ASSISTANT_STORE, OWNER_KEY, { ...c.read(ASSISTANT_STORE, OWNER_KEY), dmTarget: "dm:@ada" });
+  c.write(ASSISTANT_STORE, OWNER_KEY, { ...c.read(ASSISTANT_STORE, OWNER_KEY), learnedDm: "dm:@ada" });
   await raftPlugin.snapshotTools!(c.ctx);
-  must(c.read(ASSISTANT_STORE, OWNER_KEY).dmTarget === "dm:@ada", "a learnt DM was dropped by Raft's null");
+  must(c.read(ASSISTANT_STORE, OWNER_KEY).learnedDm === "dm:@ada", "a learnt DM was dropped by Raft's null");
+  raft({ dm: "dm:@ada~human" });
+  await raftPlugin.snapshotTools!(c.ctx);
+  must(c.read(ASSISTANT_STORE, OWNER_KEY).dmTarget === "dm:@ada~human", "Raft's DM was not kept beside a learnt one");
   raft({ owner: false });
   const after = await raftPlugin.snapshotTools!(a.ctx);
   must(!after.tools.some((t) => t.name.startsWith("assistant_")), "no owner: no assistant tools");
@@ -423,15 +426,41 @@ await check("receive_events never shows the model a doorbell; an assistant learn
   });
   const a = await assistant();
   a.r.events.push(doorbell("11111111-0000-4000-8000-000000000001"),
-    { id: "22222222-0000-4000-8000-000000000003", seq: 4, content: "anything for me?", sender_type: "human", sender_name: "ada", timestamp: "2026-10-20T09:12:00Z", channel_name: "ada", channel_type: "dm" });
+    { id: "22222222-0000-4000-8000-000000000003", seq: 4, content: "anything for me?", sender_type: "human", sender_id: OWNER, sender_name: "ada", timestamp: "2026-10-20T09:12:00Z", channel_name: "ada", channel_type: "dm" });
   const out = await raftPlugin.invoke("receive_events", {}, a.ctx) as any;
   must(!("ownerActivity" in out) && out.messages.length === 1 && out.messages[0].includes("anything for me?") && !JSON.stringify(out).includes("system.assistant"), show(out));
-  must(a.read(ASSISTANT_STORE, OWNER_KEY).dmTarget === "dm:@ada", `the DM was not learnt: ${show(a.read(ASSISTANT_STORE, OWNER_KEY))}`);
+  must(a.read(ASSISTANT_STORE, OWNER_KEY).learnedDm === "dm:@ada", `the DM was not learnt: ${show(a.read(ASSISTANT_STORE, OWNER_KEY))}`);
   // The same payload from another app is an ordinary event line.
   const b = await assistant();
   b.r.events.push(doorbell("11111111-0000-4000-8000-00000000000a", "acme.app"));
   const other = await raftPlugin.invoke("receive_events", {}, b.ctx) as any;
   must(other.messages.length === 1, show(other));
+});
+
+await check("the owner's DM: Raft's is never overwritten; with none from Raft only the owner's own message teaches it, in its precise form", async () => {
+  const STRANGER = "99999999-0000-4000-8000-000000000009";
+  const dmFrom = (seq: number, senderId: string | undefined, name = "ada~human") => ({
+    id: `33333333-0000-4000-8000-00000000000${seq}`, seq, content: "hi", sender_type: "human", ...(senderId ? { sender_id: senderId } : {}),
+    sender_name: "ada", timestamp: "2026-10-20T09:12:00Z", channel_name: name, channel_type: "dm",
+  });
+  const pull = async (a: Awaited<ReturnType<typeof assistant>>, ev: unknown) => { a.r.events.push(ev); await raftPlugin.invoke("receive_events", {}, a.ctx); return a.read(ASSISTANT_STORE, OWNER_KEY); };
+  // Raft gives `dm:@ada~human`: the owner's DM and a stranger's leave it as it is, and nothing is learnt beside it.
+  const given = await assistant(raft({ dm: "dm:@ada~human" }));
+  for (const ev of [dmFrom(1, OWNER, "ada"), dmFrom(2, STRANGER, "bob")]) {
+    const o = await pull(given, ev);
+    must(o.dmTarget === "dm:@ada~human" && o.learnedDm === null, `Raft's DM moved: ${show(o)}`);
+  }
+  // Raft gives none: a stranger's DM and one with no sender id teach nothing; the owner's does, ~human kept.
+  const none = await assistant(raft({ dm: null }));
+  must((await pull(none, dmFrom(3, STRANGER, "bob~human"))).learnedDm === null, "a stranger's DM was learnt");
+  must((await pull(none, dmFrom(4, undefined))).learnedDm === null, "a DM with no sender id was learnt");
+  const learnt = await pull(none, dmFrom(5, OWNER));
+  must(learnt.dmTarget === null && learnt.learnedDm === "dm:@ada~human", `the owner's DM: ${show(learnt)}`);
+  // The notify tool sends to Raft's whenever it gives one.
+  const both = await assistant(raft({ dm: "dm:@ada~human" }));
+  both.write(ASSISTANT_STORE, OWNER_KEY, { ...both.read(ASSISTANT_STORE, OWNER_KEY), learnedDm: "dm:@stale" });
+  await atTime(DAY, () => notify(both.ctx, { items: [ITEMS[0]] }));
+  must(both.r.sends[0]?.target === "dm:@ada~human", `sent to: ${show(both.r.sends)}`);
 });
 
 await check("the notify and preferences tools are refused on a mount not offered them", async () => {
