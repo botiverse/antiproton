@@ -105,6 +105,7 @@
     "test/stable-prompt.ts",
     "test/harness-open.ts",
     "test/run-js-trace.ts",
+    "test/tool-name-and-failure-trace.ts",
     "test/turn-stop.ts",
     "test/after-turn.ts",
     "test/raftbench-service.ts",

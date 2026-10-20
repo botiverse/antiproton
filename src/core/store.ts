@@ -61,6 +61,19 @@ export interface CompletedFacts {
    * call that never ran do, and this is what tells a refusal apart from those. Trace row only, like `exitCode`.
    */
   denied?: boolean;
+  /**
+   * Why a call that failed failed, as the plugin's error said it (`PluginErrorFields.code`/`httpStatus`, and the
+   * message). Trace row only, like `exitCode`, and written there bounded and redacted (src/trace/seams.ts
+   * `failureAttrs`); never on the event payload, which the model's next turn is built from.
+   */
+  failure?: ToolFailure;
+}
+
+/** A failed tool call's error, before it is bounded and redacted for the trace (src/trace/seams.ts `failureAttrs`). */
+export interface ToolFailure {
+  code?: string;
+  httpStatus?: number;
+  message?: string;
 }
 
 /** A stored value: inline when small, a reference to object storage when not. */

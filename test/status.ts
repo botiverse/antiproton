@@ -59,6 +59,18 @@ check("a tool call the provider ran is no status of the agent's; the agent's own
   must(seq(statusEvents("a", [call(PROVISION_TASK), row(2, 2_000, "agent.ready", "ready")])) === "online@2000", "ready");
 });
 
+check("the change to working names the first tool the model asked for; a row written before firstTool was recorded says none", () => {
+  const asked = { ...row(1, 1_000, "model.call", "toolUse", 900), attrs: { model: "m", firstTool: "run_js" } } as TraceOutboxRow;
+  const named = statusEvents("a", [asked]).map((e) => [e.status, e.detail ?? null]);
+  must(JSON.stringify(named) === JSON.stringify([["thinking", null], ["working", "Using run_js"]]), JSON.stringify(named));
+  const old = statusEvents("a", [row(1, 1_000, "model.call", "toolUse", 900)]).map((e) => [e.status, e.detail ?? null]);
+  must(JSON.stringify(old) === JSON.stringify([["thinking", null], ["working", null]]), JSON.stringify(old));
+  // A direct call starting in the same millisecond with the same name is not a second change.
+  const tool = { ...row(2, 1_400, "tool.call", "succeeded", 400), attrs: { tool: "raft.messages_resolve", name: "raft__messages_resolve" } } as TraceOutboxRow;
+  const same = statusEvents("a", [{ ...asked, attrs: { model: "m", firstTool: "raft__messages_resolve" } } as TraceOutboxRow, tool]);
+  must(same.filter((e) => e.status === "working").length === 1, JSON.stringify(same));
+});
+
 for (const r of results) {
   console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);
 }

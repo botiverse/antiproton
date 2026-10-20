@@ -13,6 +13,8 @@ import type { OperationStatus } from "../core/types.ts";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { Released } from "../plugins/types.ts";
 import type { TraceRow, TraceVerdict } from "./outbox.ts";
+import type { ToolFailure } from "../core/store.ts";
+import { redactCredentialShapes } from "./redact.ts";
 
 /**
  * `completeOperation` is also how the gateway says "running" (a progress
@@ -72,6 +74,8 @@ export function toolCallRow(op: {
   startedAt?: number | null;
   /** A person refused the held call (`CompletedFacts.denied`). */
   denied?: boolean;
+  /** Why a call that failed failed (`CompletedFacts.failure`): written bounded and redacted (`failureAttrs`). */
+  failure?: ToolFailure | null;
 }): TraceRow {
   const num = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v);
   return {
@@ -87,7 +91,31 @@ export function toolCallRow(op: {
       ...(num(op.exitCode) ? { exitCode: op.exitCode } : {}),
       ...(num(op.startedAt) ? { runMs: Math.max(0, op.endedAt - Math.max(op.startedAt, op.createdAt)) } : {}),
       ...(op.denied === true ? { denied: true } : {}),
+      ...(op.status === "succeeded" || !op.failure ? {} : failureAttrs(op.failure)),
     },
+  };
+}
+
+/** A tool error's message is cut to this many characters on the trace row: enough for a sentence, not a body. */
+export const TOOL_ERROR_MAX = 200;
+/** A code is a machine token (`NOT_FOUND`, `TRANSPORT_ERROR`); anything else is not written as one. */
+const ERROR_CODE = /^[A-Za-z0-9_.:-]{1,64}$/;
+
+/**
+ * Why a failed `tool.call` failed, as the trace row records it: the plugin's error code (for Raft, the Server's own
+ * code when it sent one, else the SDK's), the HTTP status, and the sentence, with credential shapes redacted
+ * (`redactCredentialShapes`) and then cut to TOOL_ERROR_MAX. Redacted before it is cut, so a token cut in half is not
+ * left as a prefix no pattern recognises. A code that is not code-shaped and a status that is not an HTTP status are
+ * left out rather than written: the row is read by people looking for which rule refused the call.
+ */
+export function failureAttrs(f: ToolFailure): Record<string, unknown> {
+  const code = typeof f.code === "string" && ERROR_CODE.test(f.code) ? f.code : null;
+  const http = typeof f.httpStatus === "number" && Number.isInteger(f.httpStatus) && f.httpStatus >= 100 && f.httpStatus <= 599 ? f.httpStatus : null;
+  const said = typeof f.message === "string" ? redactCredentialShapes(f.message.replace(/\s+/g, " ").trim()) : "";
+  return {
+    ...(code ? { errorCode: code } : {}),
+    ...(http === null ? {} : { httpStatus: http }),
+    ...(said ? { error: said.length > TOOL_ERROR_MAX ? `${said.slice(0, TOOL_ERROR_MAX - 1)}…` : said } : {}),
   };
 }
 
@@ -163,6 +191,11 @@ export function modelCallRow(m: {
    * `subagentRow`), and a child's share of the cost is read by it. Absent where the writer could not tell.
    */
   session?: string | null;
+  /**
+   * The first tool an answer that ended `toolUse` asked for (`firstToolCall`): the status that answer means names it
+   * (src/runtime/status.ts), so "working" never goes out without saying on what.
+   */
+  firstTool?: string | null;
 }): TraceRow {
   const ms = typeof m.createdAt === "number" && typeof m.answeredAt === "number"
     ? Math.max(0, m.answeredAt - m.createdAt) : undefined;
@@ -179,8 +212,29 @@ export function modelCallRow(m: {
     // The model first: keys drop from the end when attrs are too long (src/trace/outbox.ts `attrsOf`).
     // The limit's sentence next: what the owner is shown (src/runtime/activity.ts), the last thing to be dropped.
     // The session right after it: activity reads it to tell a subagent's call from the agent's own, so it is kept over the readings.
-    attrs: { model: m.model, ...(m.session ? { session: m.session } : {}), ...(m.limit ? { limit: m.limit } : {}), ...tokens, ...(m.prefix ? { prefix: m.prefix } : {}) },
+    // The first tool right after: the status reads it, and it is one short name.
+    attrs: {
+      model: m.model, ...(m.session ? { session: m.session } : {}), ...(m.limit ? { limit: m.limit } : {}),
+      ...(m.stopReason === "toolUse" && m.firstTool ? { firstTool: m.firstTool.slice(0, 120) } : {}),
+      ...tokens, ...(m.prefix ? { prefix: m.prefix } : {}),
+    },
   };
+}
+
+/**
+ * The name of the first tool call in an answer's content, as the model called it (`raft__messages_resolve`, `run_js`),
+ * or null when it asked for none. A `run_js` call is named as itself: which host tools its program will call is in the
+ * program, and reading it out of the source would be a guess.
+ */
+export function firstToolCall(content: unknown): string | null {
+  if (!Array.isArray(content)) return null;
+  for (const c of content) {
+    if (c && typeof c === "object" && (c as { type?: unknown }).type === "toolCall") {
+      const name = (c as { name?: unknown }).name;
+      if (typeof name === "string" && name) return name;
+    }
+  }
+  return null;
 }
 
 /**

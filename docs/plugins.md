@@ -792,7 +792,8 @@ change.
   nothing redelivers one.
 - *Trace.* The gateway's `tool.call` row, as for every call (`attrs.tool`
   `raft.mcp_…`, `attrs.name` the name the model called it by, the mount, the
-  task, the call id; never arguments or a result),
+  task, the call id, and for a failed call its `errorCode`, `httpStatus` and
+  redacted, bounded `error`; never arguments or a result),
   and `raft.mcp_call` on the same span: `status` `result`, `tool_error`, the
   failure kind or `error`; `attrs.server` the connector's server name and
   `attrs.tool` the remote tool's name. Nothing else is recorded.

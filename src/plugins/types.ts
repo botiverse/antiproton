@@ -686,6 +686,14 @@ export function identityNote(ctx: Pick<PluginContext, "credential" | "credential
  */
 export interface PluginErrorFields {
   /**
+   * The service's machine code for the failure, when it gave one: for Raft the Server's own (`NOT_FOUND`), else the
+   * SDK's (`TRANSPORT_ERROR`). Recorded on the call's trace row (src/trace/seams.ts `failureAttrs`) so a failure can be
+   * told apart without parsing the sentence.
+   */
+  code?: string;
+  /** The HTTP status the service answered with, when it answered. Trace row only, like `code`. */
+  httpStatus?: number;
+  /**
    * Which identity the call was made with. Same value as `credentialState`, so
    * a reader badging a failure does not derive it from the sentence.
    */

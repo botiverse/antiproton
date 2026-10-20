@@ -170,6 +170,17 @@ function marked(
   return e;
 }
 
+/**
+ * Which rule refused a call, as fields beside the sentence (`PluginErrorFields.code`, `httpStatus`), for its trace row.
+ * Apart from `marked`, which also decides `retryable`: this only adds, so it can wrap an error already marked.
+ */
+function coded(error: Error, said: { code?: string; httpStatus?: number }): Error {
+  const e = error as Error & PluginErrorFields;
+  if (said.code !== undefined) e.code = said.code;
+  if (said.httpStatus !== undefined) e.httpStatus = said.httpStatus;
+  return e;
+}
+
 function retryable(error: Error, value = true): Error {
   // A transport answer: a 429 or a 5xx may clear on its own. Whether it landed
   // is not known from the status alone, and a 5xx may have.
@@ -242,9 +253,9 @@ async function call(
   catch {
     if (!response.ok) {
       const message = `raft returned HTTP ${response.status}`;
-      throw options.deliveryMayHaveOccurred
+      throw coded(options.deliveryMayHaveOccurred
         ? receiveFailure(message)
-        : retryable(new Error(message), response.status === 429 || response.status >= 500);
+        : retryable(new Error(message), response.status === 429 || response.status >= 500), { httpStatus: response.status });
     }
     throw options.deliveryMayHaveOccurred
       ? receiveFailure("raft returned a response that was not JSON")
@@ -254,9 +265,10 @@ async function call(
     const parsed = object(data);
     const code = text(parsed.errorCode) ?? text(parsed.code);
     const message = `raft returned HTTP ${response.status}${code ? ` (${code})` : ""}`;
-    throw options.deliveryMayHaveOccurred
+    throw coded(options.deliveryMayHaveOccurred
       ? receiveFailure(message)
-      : retryable(new Error(message), response.status === 429 || response.status >= 500);
+      : retryable(new Error(message), response.status === 429 || response.status >= 500),
+    { httpStatus: response.status, ...(code ? { code } : {}) });
   }
   return { status: response.status, data: object(data) };
 }
@@ -622,7 +634,10 @@ function sdkFailure(
   // `retryable` is still what the gateway reads as "may have landed" (it records such a call as unknown), so it
   // follows `mayHaveLanded`, not the SDK's own retryable; whether the failure may clear is `transient`.
   const landed = write && unanswered;
-  return marked(e, { retryable: landed, transient: out.error.retryable, mayHaveLanded: landed });
+  // The Server's code when it sent a code-shaped one, else the SDK's own (`NOT_FOUND`, `TRANSPORT_ERROR`).
+  const code = out.error.serverCode !== undefined && SERVER_CODE.test(out.error.serverCode) ? out.error.serverCode : out.error.code;
+  return coded(marked(e, { retryable: landed, transient: out.error.retryable, mayHaveLanded: landed }),
+    { code, ...(out.error.status !== undefined ? { httpStatus: out.error.status } : {}) });
 }
 
 /**
@@ -1858,9 +1873,9 @@ function ownerRefusal(message: string): Error {
  */
 function ownerFailure(out: { status: number; code?: string; message?: string }): Error {
   const said = out.message?.trim();
-  return marked(new Error(`${out.status}${out.code ? ` ${out.code}` : ""}${said ? `: ${said}` : ""}`), {
+  return coded(marked(new Error(`${out.status}${out.code ? ` ${out.code}` : ""}${said ? `: ${said}` : ""}`), {
     retryable: false, transient: out.status === 429 || out.status >= 500,
-  });
+  }), { httpStatus: out.status, ...(out.code ? { code: out.code } : {}) });
 }
 
 function malformed(tool: string, why: string): Error {

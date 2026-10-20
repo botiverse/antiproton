@@ -1036,7 +1036,7 @@ export class ToolGateway {
           if (interruptsOf(plugin)?.cancel) {
             try { await interruptsOf(plugin)!.cancel!(r.tool, result.state, this.#contextFor(ctx, r.mount, credential, fromProgram, serves)); } catch { /* reported below either way */ }
           }
-          await this.#store.completeOperation(ctx.tenantId, operationId, "failed", null, undefined, ended());
+          await this.#store.completeOperation(ctx.tenantId, operationId, "failed", null, undefined, { ...ended(), failure: { message: why } });
           await counted("failed");
           return { status: "failed", operationId, error: { code: "tool_error", message: why } };
         }
@@ -1085,8 +1085,15 @@ export class ToolGateway {
       // what the console reads, so a page that wants to badge an anonymous failure needs them there
       // -- the two hops are `pi-tools.ts`'s collapse and `tool.result`'s missing slot, either of which
       // is enough on its own.
+      // Why it failed goes onto the trace row (`CompletedFacts.failure`), bounded and redacted there: the sentence
+      // the model is returned does not reach the trace otherwise, and a run_js program's host calls end here too.
       await this.#store.completeOperation(ctx.tenantId, operationId, status, null, undefined, {
         ...ended(),
+        failure: {
+          ...(typeof e.code === "string" ? { code: e.code } : {}),
+          ...(typeof e.httpStatus === "number" ? { httpStatus: e.httpStatus } : {}),
+          message: String(e?.message ?? err),
+        },
         ...(e.identity === undefined ? {} : { identity: e.identity }),
         ...(e.credentialRef === undefined ? {} : { credentialRef: e.credentialRef }),
       });

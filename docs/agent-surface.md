@@ -1040,6 +1040,17 @@ reported.
 An operation has exactly one `tool.call` row, at its first end; completing it again (an approved call, a result
 too large to inline) updates the record and writes no second row, so a call is never reported twice.
 
+The agent's status goes `working` when a model call ends asking for tools, with `detail` `Using <name>`: the first
+tool that call asked for, by the name the model used (`run_js` for a program, whose own calls are in its source and
+not read out of it). Each tool that then starts says `Using <its name>` again. The name rides on the change to
+`working` itself because a tool that starts later — every call a `run_js` program makes — would otherwise be a
+detail-only update, and with no status change Raft keeps the detail it already shows.
+
+A call that fails records why on its `tool.call` trace row, not in the activity event: `errorCode` (for Raft, the
+Server's code when it sent one, else the SDK's: `NOT_FOUND`, `TRANSPORT_ERROR`), `httpStatus` when there was an
+answer, and `error`, the error's sentence with credential shapes redacted and cut to 200 characters
+(`src/trace/seams.ts` `failureAttrs`). A program's calls are recorded the same way.
+
 ## Raft managed MCP
 
 A hosted agent whose raft mount's credential holds Raft's `mcp` capability is offered the connectors its Raft Server has
