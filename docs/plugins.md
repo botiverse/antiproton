@@ -864,8 +864,15 @@ doorbell (a `system.assistant` event) is answered `{ deliver: false, wake: true 
 (`InboundResult`), so the runtime asks the mount's `wake` and the model is given
 nothing; a notice that also carries the owner's DM is delivered to the chat as
 well. The wake reads the owner's inbox itself and drops what a check already
-looked at, what the owner was already told and what a channel or sender rule
-covers; with nothing left it ends there. With something left it posts one turn
+looked at (per conversation: one no check has looked at is new however old its
+activity), what the owner was already told and what a channel or sender rule
+covers; with nothing left it ends there. It then reads each conversation left,
+once more on a failure; one that still cannot be read is not handed to the
+model, is not recorded as looked at, is named in the DM's last line ("I
+couldn't read …; I'll look again shortly") once, until its read succeeds or it
+has new activity, and brings wakes back after 2, 5 and 15 minutes, then waits
+for the next doorbell. With nothing readable there is no model call and that
+line is all the owner gets. With something left it posts one turn
 with those conversations as input in a short session of its own
 (`PluginNext.isolated`, `src/runtime/isolated-session.ts`): a new session that
 sees nothing of the owner's chat, is offered only the reads and
@@ -874,11 +881,14 @@ morning brief at 08:00 owner-local (Raft's `assistantOf.timezone`, else the zone
 the owner gave, else UTC), re-armed every time it runs, and skipped without a
 model call on a morning with nothing unread, nothing active and nothing held.
 Every wake writes a `raft.assistant_wake` trace row and a per-day count, its
-status one of `skipped_empty`, `skipped_filtered`, `invoked`, `paused`,
-`night_deferred` or `failed`. `assistant_notify_owner` composes and sends one
+status one of `skipped_empty`, `skipped_filtered`, `invoked`, `unreadable`,
+`paused`, `night_deferred` or `failed`, with an `unreadable` count. `assistant_notify_owner` composes and sends one
 DM to the owner (`assistantOf.dmTarget` when Raft gives it, else the DM learnt
 from the owner writing; it takes no destination from the model, and refuses while
-neither is known), and keeps its rules in code: an item already told is
+neither is known), and keeps its rules in code: every reference is a message's
+`#channel:msgid` (a bare `task #N` is refused, since in the DM it is the DM's own
+task, and Raft has no channel-qualified task reference); one the check's reads
+cannot confirm is replaced by the conversation's first unread message; an item already told is
 dropped, as is one a rule covers, and between 22:00 and 08:00 owner-local
 nothing is sent. `assistant_preferences`, offered in the chat, keeps the
 owner's rules and stated zone. A `403 assistant_not_enabled` from any call
