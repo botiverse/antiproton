@@ -27,8 +27,14 @@ export interface ToolSchema {
    * `.read`, which meant the reader had to be that plugin and had to keep that
    * tool name; with this, an operator may mount it under any alias and a second
    * plugin may offer the same service.
+   *
+   * `"own-state"`: this tool returns a value the agent itself stored (its
+   * notes, a workspace file it was given). Not a reader of parked results; its
+   * answer is held to the read-back line rather than the parking line
+   * (`limitForCall`, cf/src/runtime.ts), because parking it only makes the
+   * agent read the same bytes back with one more call.
    */
-  reads?: "parked-result";
+  reads?: "parked-result" | "own-state";
   /**
    * `"never"`: do not run this tool again on its own after an interruption,
    * whatever `sideEffects` and `idempotency` say.

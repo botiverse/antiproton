@@ -17,6 +17,9 @@ import { MAIN_SESSION } from "../src/store/pi-storage.ts";
 import { ensureAgentTables } from "../src/runtime/pi-agent.ts";
 import { setLogSink } from "../src/core/log.ts";
 import { callQueuedModel, operatorModelOf } from "../cf/src/model-request.ts";
+import { ModelCallTimedOut, ModelHttpError } from "../src/model/openai-compatible.ts";
+import { pendingTrace } from "../src/trace/outbox.ts";
+import type { FailedAttempt } from "../cf/src/model-queue.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void>) {
@@ -288,6 +291,93 @@ await check("consumer: any other failure is still retried, not acked", async () 
   try { await consumeModelCalls({ queue: "model-calls", messages: [msg] }, deps(stub, [])); }
   finally { console.error = err; }
   must(m.acked === 0 && m.retried === 1, JSON.stringify(m));
+});
+
+/** A stub whose take hands out `job` and whose failed attempts are collected, for the trace of a retry. */
+function attemptStub(job: unknown = { ...REQUEST, operatorModel: "deepseek-flash" }) {
+  const attempts: FailedAttempt[] = [];
+  const stub: ModelJobStub = {
+    async takeJob() { return job; },
+    async releaseJob() { return true; },
+    async deliverAnswer() { return true; },
+    async recordModelAttempt(_t, _a, _j, a) { attempts.push(a); return true; },
+  };
+  return { stub, attempts };
+}
+
+async function quietly<T>(fn: () => Promise<T>): Promise<T> {
+  const err = console.error; console.error = () => {};
+  try { return await fn(); } finally { console.error = err; }
+}
+
+await check("consumer: each failed attempt is told to the object with its delivery number, the step, the HTTP status and the provider's time; never the error's text", async () => {
+  // The case behind it: a 36 s model call whose trace said nothing about why. A retry in between was one of the
+  // explanations, and nothing could rule it in or out.
+  const { stub, attempts } = attemptStub();
+  const body = "upstream said: account sk-live-0123456789abcdef is over quota";
+  const failing: ModelQueueDeps = { ...deps(stub, []), async call() { await new Promise((r) => setTimeout(r, 30)); throw new ModelHttpError(503, `model 503: ${body}`); } };
+  const { msg, m } = message("job-a");
+  await quietly(() => consumeModelCalls({ queue: "model-calls", messages: [{ ...msg, attempts: 3 }] }, failing));
+  must(m.retried === 1 && m.acked === 0, JSON.stringify(m));
+  must(attempts.length === 1, JSON.stringify(attempts));
+  const a = attempts[0]!;
+  must(a.attempt === 3 && a.phase === "call" && a.outcome === "http" && a.httpStatus === 503 && a.model === "deepseek-flash", JSON.stringify(a));
+  must(typeof a.providerMs === "number" && a.providerMs >= 25 && a.ms >= a.providerMs, `times: ${JSON.stringify(a)}`);
+  must(!JSON.stringify(attempts).includes("quota") && !JSON.stringify(attempts).includes("sk-live"), `the error's text was sent: ${JSON.stringify(a)}`);
+});
+
+await check("consumer: a timeout, a transport error and a failed take are each told as what they were", async () => {
+  const cases: Array<[string, ModelQueueDeps["call"] | null, (a: FailedAttempt) => boolean]> = [
+    ["timeout", async () => { throw new ModelCallTimedOut("no answer within 120000 ms"); }, (a) => a.outcome === "timeout" && a.phase === "call" && a.httpStatus === undefined],
+    ["transport", async () => { throw new TypeError("fetch failed"); }, (a) => a.outcome === "transport_error" && a.errorClass === "TypeError" && a.phase === "call"],
+    ["take", null, (a) => a.phase === "take" && a.providerMs === undefined && a.model === undefined && a.attempt === null],
+  ];
+  for (const [name, call, ok] of cases) {
+    const { stub, attempts } = attemptStub();
+    const s: ModelJobStub = call ? stub : { ...stub, async takeJob() { throw new Error("object unavailable"); } };
+    const d: ModelQueueDeps = { ...deps(s, []), ...(call ? { call } : {}) };
+    const { msg, m } = message("job-a");
+    await quietly(() => consumeModelCalls({ queue: "model-calls", messages: [msg] }, d));
+    must(m.retried === 1 && attempts.length === 1 && ok(attempts[0]!), `${name}: ${JSON.stringify({ m, attempts })}`);
+  }
+});
+
+await check("consumer: an attempt whose record cannot be written is still retried, and a delivery that fails after the call keeps the provider's time", async () => {
+  const lines = captureLog();
+  const { stub } = attemptStub();
+  const broken: ModelJobStub = {
+    ...stub,
+    async deliverAnswer() { throw new Error("object reset"); },
+    async recordModelAttempt() { throw new Error("object reset"); },
+  };
+  const { msg, m } = message("job-a");
+  await quietly(() => consumeModelCalls({ queue: "model-calls", messages: [msg] }, deps(broken, [])));
+  setLogSink(null);
+  must(m.retried === 1 && m.acked === 0, JSON.stringify(m));
+  must(lines.some((l) => l.evt === "model_job.attempt_trace_failed" && l.jobId === "job-a"), JSON.stringify(lines));
+  // The same delivery failure, recorded: the call answered, so the step is the delivery and the provider's time is the call's.
+  const { stub: s2, attempts } = attemptStub();
+  await quietly(() => consumeModelCalls({ queue: "model-calls", messages: [message("job-b").msg] },
+    deps({ ...s2, async deliverAnswer() { throw new Error("object reset"); } }, [])));
+  must(attempts[0]?.phase === "deliver" && typeof attempts[0].providerMs === "number", JSON.stringify(attempts));
+});
+
+await check("runtime: a failed attempt becomes one model.attempt row on the job's span, with only checked fields", async () => {
+  const { rt, host } = await runtime();
+  const sent = {
+    attempt: 2, phase: "call", outcome: "http", httpStatus: 429, ms: 36_050.4, providerMs: 35_990, model: "deepseek-flash",
+    // What the consumer never sends, and the row must not carry if something did: words, and fields out of shape.
+    error: "model 429: rate limited for key sk-live-0123456789abcdef", errorClass: "not a class", extra: { body: "x" },
+  };
+  must(await rt.recordModelAttempt(T, A, "job-a", sent) === true, "not written");
+  must(await rt.recordModelAttempt(T, A, "job-a", null) === false, "a missing report was written");
+  const rows = pendingTrace(host.sql as any, 0).rows.filter((r) => r.kind === "model.attempt");
+  must(rows.length === 1, JSON.stringify(rows));
+  const r = rows[0]!;
+  must(r.spanId === "job-a" && r.status === "retried" && r.verdict === "failed" && r.ms === 36_050, JSON.stringify(r));
+  must(JSON.stringify(r.attrs) === JSON.stringify({ attempt: 2, phase: "call", outcome: "http", httpStatus: 429, providerMs: 35_990, model: "deepseek-flash" }),
+    `attrs: ${JSON.stringify(r.attrs)}`);
+  host.dispose();
 });
 
 await check("the reply shape is recognised and nothing else is", async () => {

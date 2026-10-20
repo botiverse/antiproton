@@ -1526,6 +1526,10 @@ Each read of `…/transcript` and `…/model-input` is audited (`admin_read_audi
 `rebuild.decision`, `rebuild.outcome`, `rebuild.behaviour`, `turn.timing`, `turn.end_unrecorded` (a pass that could not
 read or write down the main conversation's turn ends and went on without them: `attrs.stage` `read` or `record`,
 `attrs.error_class` the error's class, never its message), `import.hold`, `model.prewarm`, `agent.ready`,
+`model.attempt` (one queued model call's attempt that failed and was retried: `spanId` the job, `attrs` `attempt`, `phase`,
+`outcome`, `httpStatus` or `errorClass`, `providerMs`, `model`; never the error's text), `tool.refused` (a host call refused
+before an operation existed, by the gateway, run_js or the executor: `status` the refusal's code, `attrs` `tool`, `code`,
+`by`, `from` (`model` or `program`), `callId`, `task`; never its arguments),
 `mount.settings` (an operator's in-place change of a mount's settings, [docs/plugins.md](plugins.md)), `subagent.turn`
 (one turn of a [subagent](#subagents-send_to_agent) ending: `spanId` its session, `parentId` the tool call that sent the
 turn, `status` `done`, `failed`, `cancelled`, `stopped`, `report_failed`, `report_dropped` or `wake_failed` (a background

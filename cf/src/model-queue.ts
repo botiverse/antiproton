@@ -6,6 +6,7 @@
  * be imported there): the provider call and the stub are handed in.
  */
 import { logEvent } from "../../src/core/log.ts";
+import { providerOutcome } from "./image-evidence.ts";
 
 /** One message on the model-call queue: which object, which agent, which job row. */
 export interface QueuedModelCall {
@@ -73,6 +74,59 @@ export interface ModelJobStub {
   takePrewarm?(tenantId: string, agentId: string, jobId: string): Promise<unknown>;
   /** How the prewarm ended, and its usage to meter (`AgentRuntime.prewarmDone`). */
   prewarmDone?(tenantId: string, agentId: string, jobId: string, result: unknown): Promise<unknown>;
+  /** One attempt that failed and is retried, for the agent's trace (`AgentRuntime.recordModelAttempt`). */
+  recordModelAttempt?(tenantId: string, agentId: string, jobId: string, attempt: FailedAttempt): Promise<unknown>;
+}
+
+/**
+ * How far an attempt got (`runModelCall`), so a failure can say which step failed and how long the provider took.
+ * Written as the attempt goes; read only when it throws.
+ */
+export interface AttemptProgress {
+  phase: "take" | "admit" | "call" | "deliver";
+  /** The model the taken job names (`operatorModel`), once it is taken. */
+  model?: string;
+  /** When the provider call began; the provider's time is measured from here. */
+  callStartedAt?: number;
+  /** The provider call's time, once it has answered: a failure after it is the delivery's. */
+  providerMs?: number;
+}
+
+/**
+ * One failed attempt as its trace row records it (`modelAttemptRow`, src/trace/seams.ts): which delivery of the message
+ * it was, the step that failed, and what the failure was as classes and numbers (`providerOutcome`: an HTTP status, a
+ * timeout, or an error's class name). Never the error's message: a provider's error carries its response body, and the
+ * row is exported. The message stays where it was, in the consumer's own log line.
+ */
+export interface FailedAttempt {
+  /** The queue's delivery count for the message (Cloudflare's `Message.attempts`, from 1); null where it gave none. */
+  attempt: number | null;
+  phase: AttemptProgress["phase"];
+  outcome: "http" | "timeout" | "transport_error";
+  httpStatus?: number;
+  errorClass?: string;
+  /** The whole attempt, from before the take to the failure. */
+  ms: number;
+  /** The provider call alone: to its failure when the call failed, to its answer when the delivery after it did. */
+  providerMs?: number;
+  model?: string;
+}
+
+/** `e` and how far the attempt got, as a `FailedAttempt`. */
+export function failedAttempt(e: unknown, progress: AttemptProgress, attempt: number | undefined, startedAt: number, now = Date.now()): FailedAttempt {
+  const o = providerOutcome(e, undefined, new Date(now));
+  const providerMs = progress.providerMs
+    ?? (progress.phase === "call" && progress.callStartedAt !== undefined ? now - progress.callStartedAt : undefined);
+  return {
+    attempt: typeof attempt === "number" && Number.isInteger(attempt) && attempt > 0 ? attempt : null,
+    phase: progress.phase,
+    outcome: o.outcome,
+    ...(o.outcome === "http" ? { httpStatus: o.status } : {}),
+    ...(o.outcome === "transport_error" ? { errorClass: o.errorClass } : {}),
+    ms: Math.max(0, now - startedAt),
+    ...(providerMs === undefined ? {} : { providerMs: Math.max(0, providerMs) }),
+    ...(progress.model ? { model: progress.model } : {}),
+  };
 }
 
 export interface ModelQueueDeps {
@@ -93,8 +147,24 @@ export interface ModelQueueDeps {
 
 export interface ModelQueueMessage {
   readonly body: QueuedModelCall;
+  /** How many times the queue has delivered this message, this one included (Cloudflare's `Message.attempts`). */
+  readonly attempts?: number;
   ack(): void;
   retry(): void;
+}
+
+/**
+ * A failed attempt's trace row, written by the agent's object. Without it a retried call showed in the trace only as
+ * the one slow `model.call` its final answer closed, with nothing saying an attempt had failed in between (a 36 s call
+ * in an onboarding agent's turn, 2026-10-20). A failure to write it is logged and never stops the retry.
+ */
+async function traceFailedAttempt(m: QueuedModelCall, deps: ModelQueueDeps, attempt: FailedAttempt): Promise<void> {
+  try {
+    const stub = deps.stub(m);
+    if (stub.recordModelAttempt) await stub.recordModelAttempt(m.tenantId, m.agentId, m.jobId, attempt);
+  } catch (e) {
+    logEvent("model_job.attempt_trace_failed", { tenantId: m.tenantId, agentId: m.agentId, jobId: m.jobId, error: String((e as Error)?.message ?? e).slice(0, 200) });
+  }
 }
 
 /** Logged once per message whose job the agent does not hold; the message is then acked. */
@@ -134,9 +204,12 @@ async function withTake(
  * redelivery after success, which must not call the provider again), or another attempt is calling it now —
  * calls nothing.
  */
-export async function runModelCall(m: QueuedModelCall, deps: ModelQueueDeps): Promise<void> {
+export async function runModelCall(m: QueuedModelCall, deps: ModelQueueDeps, progress: AttemptProgress = { phase: "take" }): Promise<void> {
   const stub = deps.stub(m);
   await withTake(m, stub, "take", async (job, taker) => {
+    const model = (job as { operatorModel?: unknown }).operatorModel;
+    if (typeof model === "string" && model) progress.model = model.slice(0, 120);
+    progress.phase = "admit";
     const refused = deps.admit ? await deps.admit(job, m) : null;
     if (refused) {
       const wrote = await stub.deliverAnswer(m.tenantId, m.agentId, m.jobId, refused, 0, taker);
@@ -144,8 +217,12 @@ export async function runModelCall(m: QueuedModelCall, deps: ModelQueueDeps): Pr
       return;
     }
     const t0 = Date.now();
+    progress.phase = "call";
+    progress.callStartedAt = t0;
     const answer = await deps.call(job, m);
-    const wrote = await stub.deliverAnswer(m.tenantId, m.agentId, m.jobId, answer, Date.now() - t0, taker);
+    progress.providerMs = Date.now() - t0;
+    progress.phase = "deliver";
+    const wrote = await stub.deliverAnswer(m.tenantId, m.agentId, m.jobId, answer, progress.providerMs, taker);
     if (isUnknownJobReply(wrote)) unknownJob(m, "deliver");
   });
 }
@@ -208,14 +285,17 @@ export async function consumeModelCalls(
       message.ack();
       continue;
     }
+    const progress: AttemptProgress = { phase: "take" };
+    const startedAt = Date.now();
     try {
-      await runModelCall(message.body, deps);
+      await runModelCall(message.body, deps, progress);
       message.ack();
     } catch (e) {
       // Deliberately not acked: the queue redelivers, and after max_retries
       // the message lands in the dead letter queue, where it becomes a
       // visible failure on the task rather than a silence.
       console.error("model call failed", String((e as Error)?.message ?? e));
+      await traceFailedAttempt(message.body, deps, failedAttempt(e, progress, message.attempts, startedAt));
       message.retry();
     }
   }

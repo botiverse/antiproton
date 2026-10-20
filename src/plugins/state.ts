@@ -256,6 +256,13 @@ export function statePlugin(
         idempotency: "key",
       },
       {
+        // What it returns is the agent's own: a note it kept, a workspace file
+        // it was given. The runtime returns such a value whole up to the
+        // read-back line instead of parking it at 4 KiB (`limitForCall`,
+        // cf/src/runtime.ts): parked, an 8.9 KB playbook cost a second call to
+        // read back the same bytes into the same conversation (a case study of
+        // an onboarding agent, 2026-10-20).
+        reads: "own-state",
         name: "get",
         summary:
           "Read a key back. A value too large to return arrives as an r2:// reference; open it " +

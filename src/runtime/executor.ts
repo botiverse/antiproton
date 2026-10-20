@@ -2,7 +2,7 @@ import { getQuickJS, type QuickJSContext, type QuickJSHandle } from "quickjs-ems
 import { parseTemplateCall } from "../core/tools.ts";
 import type { ToolResult } from "../core/tools.ts";
 import type { Json } from "../core/types.ts";
-import { CANCELLED_NAME, DEFAULT_LIMITS as LIMITS, PAUSE_FACTORY, holdFrom, pauseFrom } from "../core/execution.ts";
+import { CANCELLED_NAME, DEFAULT_LIMITS as LIMITS, PAUSE_FACTORY, holdFrom, pauseFrom, tellRefused } from "../core/execution.ts";
 import type { Continuation, ExecutionLimits, ExecutionResult, ExecutorHost, HeldCall, JsExecutor, Paused } from "../core/execution.ts";
 
 export { DEFAULT_LIMITS } from "../core/execution.ts";
@@ -107,13 +107,16 @@ export class QuickJsExecutor implements JsExecutor {
         // Never reaches the host: a program that caught the pause cannot go on calling.
         rejectPaused(deferred);
       } else if ("error" in parsed) {
+        tellRefused(host, strings[0]?.trim() || null, parsed.error.code);
         settleWith(deferred, { status: "rejected", error: parsed.error });
       } else if (hostCalls >= limits.maxHostCalls) {
+        tellRefused(host, parsed.name, "host_call_budget_exceeded");
         settleWith(deferred, {
           status: "rejected",
           error: { code: "host_call_budget_exceeded", message: `limit ${limits.maxHostCalls}` },
         });
       } else if (inFlight >= limits.maxConcurrentHostCalls) {
+        tellRefused(host, parsed.name, "too_many_concurrent_calls");
         settleWith(deferred, {
           status: "rejected",
           error: { code: "too_many_concurrent_calls", message: `limit ${limits.maxConcurrentHostCalls}` },

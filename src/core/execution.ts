@@ -21,6 +21,18 @@ export const DEFAULT_LIMITS: ExecutionLimits = {
 
 export interface ExecutorHost {
   invoke(call: { tool: string; args: Json; opts: Record<string, Json> }): Promise<ToolResult>;
+  /**
+   * A call the executor refused itself, so `invoke` never saw it: a template that does not parse, the host-call
+   * budget spent, too many calls in flight. `tool` is the name the program wrote, when it wrote one. For the trace
+   * (`toolRefusedRow`, src/trace/seams.ts), so it is told the name and the code and never the arguments; it must not
+   * throw, and the executor does not wait for it.
+   */
+  refused?(call: { tool: string | null; code: string }): void;
+}
+
+/** Tells `host` of a call the executor refused (`ExecutorHost.refused`); a throw there is the host's and is dropped. */
+export function tellRefused(host: ExecutorHost, tool: string | null, code: string): void {
+  try { host.refused?.({ tool, code }); } catch { /* the trace is never worth the program */ }
 }
 
 export interface ExecutionResult {

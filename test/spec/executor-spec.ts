@@ -143,6 +143,33 @@ export async function executorSpec(exec: JsExecutor, only?: (row: string) => boo
     eq(JSON.stringify(r.outputs[0]), '{"last":"rejected","code":"host_call_budget_exceeded"}', "refused in-band");
   });
 
+  test("拒绝告知宿主", "a call the executor refuses itself is told to the host, by name and code and without its arguments", async () => {
+    // These never reach `invoke`, so without `refused` the host has no record that they were made (the trace's
+    // `tool.refused`, src/trace/seams.ts). Three ways: a template that does not parse, the budget, and a name that is not one.
+    calls = [];
+    const told: Array<{ tool: string | null; code: string }> = [];
+    const h: ExecutorHost = { ...host(), refused: (c) => { told.push(c); } };
+    const r = await exec.execute(
+      `await tool\`m.t \${"v4lue"}\`;
+       await tool\`not a name \${ { k: "v4lue" } }\`;
+       for (let i = 0; i < 3; i++) await tool\`m.t \${ { k: "v4lue" } }\`;
+       output("done");`,
+      h,
+      { ...DEFAULT_LIMITS, maxHostCalls: 2 },
+    );
+    eq(r.status, "completed", "the refusals are in-band, the program goes on");
+    eq(calls.length, 2, "dispatched exactly the budget");
+    eq(JSON.stringify(told), JSON.stringify([
+      { tool: "m.t", code: "bad_arguments" },
+      { tool: "not a name", code: "bad_tool_name" },
+      { tool: "m.t", code: "host_call_budget_exceeded" },
+    ]), "each refusal told once, in order");
+    assert(!JSON.stringify(told).includes("v4lue"), "an argument reached the host's refusal record");
+    // A host without the method is the host it always was.
+    const plain = await exec.execute(`const b = await tool\`m.t \${"x"}\`; output(b.error.code);`, host());
+    eq(plain.outputs[0], "bad_arguments", "a host without refused still gets the in-band refusal");
+  });
+
   test("输出上限", "oversized output is truncated, not silently dropped", async () => {
     const r = await exec.execute(`output("x".repeat(500)); output("second");`, host(), {
       ...DEFAULT_LIMITS,

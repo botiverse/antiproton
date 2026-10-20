@@ -226,6 +226,38 @@ export function modelCallRow(m: {
 }
 
 /**
+ * The model.attempt row for one provider attempt that failed and is retried by the queue (cf/src/model-queue.ts
+ * `FailedAttempt`). Its span is the job, so it joins `pi_model_jobs` and sits beside the `model.call` row the job's
+ * final answer writes; a job retried twice has two of these and one `model.call`. Built from what came over the RPC,
+ * so each field is checked rather than trusted: a phase or outcome outside the vocabulary, a status that is not an
+ * HTTP status, a class that is not an identifier, is left out. No message, ever: a provider's error message carries
+ * its response body.
+ */
+export function modelAttemptRow(o: { tenantId: string; agentId: string; jobId: string; at: number }, a: Record<string, unknown>): TraceRow {
+  const num = (v: unknown) => typeof v === "number" && Number.isFinite(v) && v >= 0 ? Math.round(v) : undefined;
+  const oneOf = <T extends string>(v: unknown, set: readonly T[]) => set.find((x) => x === v);
+  const phase = oneOf(a.phase, ["take", "admit", "call", "deliver"] as const);
+  const outcome = oneOf(a.outcome, ["http", "timeout", "transport_error"] as const);
+  const attempt = typeof a.attempt === "number" && Number.isInteger(a.attempt) && a.attempt > 0 ? a.attempt : undefined;
+  const http = typeof a.httpStatus === "number" && Number.isInteger(a.httpStatus) && a.httpStatus >= 100 && a.httpStatus <= 599 ? a.httpStatus : undefined;
+  const errorClass = typeof a.errorClass === "string" && /^[A-Za-z_$][A-Za-z0-9_$]{0,63}$/.test(a.errorClass) ? a.errorClass : undefined;
+  const model = typeof a.model === "string" && /^[A-Za-z0-9._:/@-]{1,120}$/.test(a.model) ? a.model : undefined;
+  const ms = num(a.ms), providerMs = num(a.providerMs);
+  return {
+    at: o.at, tenantId: o.tenantId, agentId: o.agentId,
+    kind: "model.attempt", spanId: o.jobId,
+    // The queue's decision, verbatim: this attempt is over and the message goes back for another.
+    status: "retried", verdict: "failed",
+    ...(ms === undefined ? {} : { ms }),
+    attrs: {
+      ...(attempt === undefined ? {} : { attempt }), ...(phase ? { phase } : {}), ...(outcome ? { outcome } : {}),
+      ...(http === undefined ? {} : { httpStatus: http }), ...(errorClass ? { errorClass } : {}),
+      ...(providerMs === undefined ? {} : { providerMs }), ...(model ? { model } : {}),
+    },
+  };
+}
+
+/**
  * The name of the first tool call in an answer's content, as the model called it (`raft__messages_resolve`, `run_js`),
  * or null when it asked for none. A `run_js` call is named as itself: which host tools its program will call is in the
  * program, and reading it out of the source would be a guess.
@@ -324,5 +356,49 @@ export function jsRunRow(o: {
     status, verdict: o.run.code === "cancelled" ? "cancelled" : o.run.ok ? "ok" : "failed",
     ms: Math.max(0, o.run.ms),
     attrs: { ...(o.run.code ? { code: o.run.code } : {}), hostCalls: o.run.hostCalls, session: o.session, ...(o.run.resumed ? { resumed: true } : {}) },
+  };
+}
+
+/** A tool name as a caller may write one: an address (`gh.api_get`) or the model's form (`gh__api_get`). */
+const REFUSED_TOOL = /^[A-Za-z0-9_.:-]{1,128}$/;
+
+/**
+ * The tool.refused row for a host call refused before an operation existed: by the gateway (a name that resolves to no
+ * mount, a mount switched off, a tool the mount does not have, a model-only tool from a program: src/runtime/gateway.ts
+ * `#refused`), by run_js on the model's behalf (src/runtime/pi-tools.ts `runJsTool`), or by the executor itself (a
+ * template that does not parse, the host-call budget: `ExecutorHost.refused`, src/core/execution.ts). A refused call
+ * that had an operation already has its `tool.call` row, ended `rejected`; these had none, so before this nothing in the
+ * trace said they were made (three in an onboarding agent's turn, 2026-10-20, whose reason no record kept).
+ *
+ * The name the caller wrote and the refusal's code, and nothing the caller passed: no arguments, no values, not the
+ * refusal's sentence, which can quote the name back inside other words. A name or code that is not shaped like one is
+ * left out, and so is a name shaped like a credential, so a program cannot write a value into the row by calling a
+ * tool named after it. Its span is the model's
+ * call, as `js.run`'s is, so a program's refusals sit under its run.
+ */
+export function toolRefusedRow(o: {
+  tenantId: string; agentId: string; at: number;
+  tool: string | null; code: string;
+  /** The model's call this one serves: the run_js call for a program's, the call itself for the model's own. */
+  callId?: string | null;
+  /** Who refused it: the gateway, run_js, or the executor running the program. */
+  by: "gateway" | "run_js" | "executor";
+  /** The call came from a run_js program rather than from the model directly. */
+  fromProgram: boolean;
+  /** The task the call was made under, as a `tool.call` row names it (`task`), when the writer knows it. */
+  task?: string | null;
+}): TraceRow {
+  const code = ERROR_CODE.test(o.code) ? o.code : "refused";
+  // A long name is a blob to `redactCredentialShapes` (an MCP tool's often is), so only its credential shapes count here.
+  const tool = typeof o.tool === "string" && REFUSED_TOOL.test(o.tool)
+    && !/<(secret|redacted|placeholder)>/.test(redactCredentialShapes(o.tool)) ? o.tool : null;
+  return {
+    at: o.at, tenantId: o.tenantId, agentId: o.agentId, kind: "tool.refused",
+    spanId: o.callId || `refused_${o.at}`,
+    status: code, verdict: "blocked",
+    attrs: {
+      ...(tool ? { tool } : {}), code, by: o.by, from: o.fromProgram ? "program" : "model",
+      ...(o.callId ? { callId: o.callId } : {}), ...(o.task ? { task: o.task } : {}),
+    },
   };
 }

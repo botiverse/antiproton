@@ -13,7 +13,7 @@ import { keyedOperationId } from "./operation-id.ts";
 import type { PluginErrorFields, ToolSnapshot } from "../plugins/types.ts";
 import { callSideEffects, pluginEnabled, LEASE_KEY, toolsOf } from "../plugins/types.ts";
 import { admitTools } from "./mount-tools.ts";
-import { isReleased, leaseRow, releasedFacts } from "../trace/seams.ts";
+import { isReleased, leaseRow, releasedFacts, toolRefusedRow } from "../trace/seams.ts";
 import { PLUGIN_TRACE_KINDS } from "../trace/outbox.ts";
 import { openPluginDatabase } from "./plugin-db.ts";
 import { payerKey, toolCallRows } from "../usage/outbox.ts";
@@ -768,7 +768,7 @@ export class ToolGateway {
     // something ever does, this is the note that says where to look
     // (the gap was spotted in review, 2026-09-12).
     const r0 = await this.resolve(ctx, raw);
-    if ("error" in r0) return { status: "rejected", error: r0.error };
+    if ("error" in r0) return this.#refused(ctx, raw, opts, r0.error);
     const p0 = this.#plugins.get(r0.mount.plugin);
     if (!p0 || !isExclusive(p0)) return this.#invoke(ctx, raw, args, opts);
 
@@ -802,6 +802,22 @@ export class ToolGateway {
     return run;
   }
 
+  /**
+   * A call refused before its operation was recorded, answered as it always was and written as a `tool.refused` trace
+   * row (`toolRefusedRow`): with no operation there is no `tool.call` row, so without it a refused call left nothing
+   * behind. The name as the caller wrote it and the refusal's code; never the arguments, nor the message, which the
+   * caller already has. A row that cannot be written is dropped: it is never worth the call's answer.
+   */
+  async #refused(ctx: CallContext, raw: string, opts: InvokeOpts, error: ToolError): Promise<ToolResult> {
+    try {
+      await this.#store.recordTrace?.([toolRefusedRow({
+        tenantId: ctx.tenantId, agentId: ctx.agentId, at: Date.now(), tool: raw, code: error.code,
+        callId: opts.callId ?? null, by: "gateway", fromProgram: opts.fromProgram === true, task: ctx.taskId,
+      })]);
+    } catch { /* the answer goes out whatever became of its row */ }
+    return { status: "rejected", error };
+  }
+
   async #invoke(
     ctx: CallContext,
     raw: string,
@@ -809,9 +825,9 @@ export class ToolGateway {
     opts: InvokeOpts = {},
   ): Promise<ToolResult> {
     const r = await this.resolve(ctx, raw);
-    if ("error" in r) return { status: "rejected", error: r.error };
+    if ("error" in r) return this.#refused(ctx, raw, opts, r.error);
     if (this.#removing.has(`${ctx.tenantId}/${ctx.agentId}/${r.mount.alias}`)) {
-      return { status: "rejected", error: { code: "not_mounted", message: `the \`${r.mount.alias}\` mount is being removed` } };
+      return this.#refused(ctx, raw, opts, { code: "not_mounted", message: `the \`${r.mount.alias}\` mount is being removed` });
     }
     // The agent's own hold: a call sent with `opts.confirm` is held exactly as
     // a policy hold would be, and the person decides. It is an option, not an
@@ -823,7 +839,7 @@ export class ToolGateway {
 
     const plugin = this.#plugins.get(r.mount.plugin);
     if (!plugin) {
-      return { status: "rejected", error: { code: "plugin_unavailable", message: pluginUnavailableMessage(r.mount.alias, r.mount.plugin) } };
+      return this.#refused(ctx, raw, opts, { code: "plugin_unavailable", message: pluginUnavailableMessage(r.mount.alias, r.mount.plugin) });
     }
     // Withholding the tools is not the same as refusing the call, and only the
     // second one holds. A conversation opened before the plugin was switched
@@ -839,40 +855,32 @@ export class ToolGateway {
     // oversight nobody dares remove (Piper asked, 2026-09-12).
     const choices = await this.#store.pluginChoices(ctx.tenantId, ctx.agentId);
     if (!pluginEnabled(this.#seeded.has(r.mount.plugin), choices[r.mount.plugin])) {
-      return {
-        status: "rejected",
-        // Addressed to the model, which must do something else now: it says
-        // the mount still exists and that a person, not the agent, reopens it.
-        error: {
-          code: "plugin_disabled",
-          message: switchedOffMessage(r.mount.alias),
-        },
-      };
+      // Addressed to the model, which must do something else now: it says
+      // the mount still exists and that a person, not the agent, reopens it.
+      return this.#refused(ctx, raw, opts, {
+        code: "plugin_disabled",
+        message: switchedOffMessage(r.mount.alias),
+      });
     }
     // Version is pinned by the mount, so an update mid-flight cannot change the
     // contract an in-flight operation was accepted under.
     if (plugin.version !== r.mount.toolVersion) {
-      return {
-        status: "rejected",
-        error: {
-          code: "version_mismatch",
-          message: `mount pins ${r.mount.toolVersion}, registry has ${plugin.version}`,
-        },
-      };
+      return this.#refused(ctx, raw, opts, {
+        code: "version_mismatch",
+        message: `mount pins ${r.mount.toolVersion}, registry has ${plugin.version}`,
+      });
     }
     // This mount's tools, not the plugin's: for a plugin whose tools come from
     // a remote server the two differ, and the catalogue offered the mount's.
     const schema = toolsOf(plugin, r.mount).find((t) => t.name === r.tool);
     if (!schema) {
-      return { status: "rejected", error: { code: "unknown_tool", message: unknownToolMessage(r.mount.alias, r.tool) } };
+      return this.#refused(ctx, raw, opts, { code: "unknown_tool", message: unknownToolMessage(r.mount.alias, r.tool) });
     }
     // A model-only tool from a program: what it consumes or attests would go to code the model may never print
     // (`ToolSchema.modelOnly`). Refused at the door, before an operation exists, as an unknown name is.
     if (schema.modelOnly && opts.fromProgram === true) {
-      return {
-        status: "rejected",
-        error: { code: "not_from_a_program", message: `${r.mount.alias}.${r.tool} is yours to call, not a program's: its result only counts once you have read it` },
-      };
+      return this.#refused(ctx, raw, opts,
+        { code: "not_from_a_program", message: `${r.mount.alias}.${r.tool} is yours to call, not a program's: its result only counts once you have read it` });
     }
 
     const operationId = opts.operationId ?? (opts.idempotencyKey
