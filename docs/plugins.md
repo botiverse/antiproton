@@ -842,25 +842,35 @@ not an owner here, and any other text is, UUID or not.
 fake Raft, and the rendering against a fake wire, which can hand it answers
 the SDK's contract would refuse first.
 
-Such an agent is also proactive (Raft RFC 075 §4.2, `src/plugins/raft-assistant.ts`).
-Its snapshot lists two more tools beside the reads: `assistant_notify_owner`,
-the only way it messages its owner unasked, which takes the items waiting on
-them (each with a `#channel:msgid` or `task #N` reference) and composes and
-sends one DM; and `assistant_preferences`, the owner's "don't remind me about
-this" rules (by channel, sender or kind) and their stated time zone. The notify
-tool's rules are code, kept in the mount's database: an item already told is
-dropped, as is one a rule covers; between 22:00 and 08:00 owner-local (Raft's
-`assistantOf.timezone`, else the zone the owner gave, else UTC) nothing is
-sent and the items are kept for the morning brief, which is the mount's own
-timer (`Plugin.wake`), re-armed for the next 08:00 every time it runs. RFC 074's
-doorbell (a `system.assistant` event, `payload.type: "owner_inbox_updated"`) is
-taken out of `receive_events` and becomes an `ownerActivity` field saying what
-to check. A `403 assistant_not_enabled` from any call pauses the notify tool and
-the brief until Raft's context names the owner again. The runtime offers such
-an agent's model only its owner DM, attachments, the reads and these two tools
-(plus `resume` and the parked-result reader), with no run_js, jobs or subagents,
-under a prompt of its own (`assistantSystemPrompt`, `src/runtime/pi-prompt.ts`).
-`test/raft-assistant-mode.ts` holds the rules, the timer and the offered list.
+Such an agent is also proactive (Raft RFC 075 §4.2, `src/plugins/raft-assistant.ts`),
+and code decides before any model is asked. A push notice that names RFC 074's
+doorbell (a `system.assistant` event) is answered `{ deliver: false, wake: true }`
+(`InboundResult`), so the runtime asks the mount's `wake` and the model is given
+nothing; a notice that also carries the owner's DM is delivered to the chat as
+well. The wake reads the owner's inbox itself and drops what a check already
+looked at, what the owner was already told and what a channel or sender rule
+covers; with nothing left it ends there. With something left it posts one turn
+with those conversations as input in a short session of its own
+(`PluginNext.isolated`, `src/runtime/isolated-session.ts`): a new session that
+sees nothing of the owner's chat, is offered only the reads and
+`assistant_notify_owner`, and is erased once its run ends. The same wake is the
+morning brief at 08:00 owner-local (Raft's `assistantOf.timezone`, else the zone
+the owner gave, else UTC), re-armed every time it runs, and skipped without a
+model call on a morning with nothing unread, nothing active and nothing held.
+Every wake writes a `raft.assistant_wake` trace row and a per-day count, its
+status one of `skipped_empty`, `skipped_filtered`, `invoked`, `paused`,
+`night_deferred` or `failed`. `assistant_notify_owner` composes and sends one
+DM to the owner (`assistantOf.dmTarget` when Raft gives it, else the DM learnt
+from the owner writing), and keeps its rules in code: an item already told is
+dropped, as is one a rule covers, and between 22:00 and 08:00 owner-local
+nothing is sent. `assistant_preferences`, offered in the chat, keeps the
+owner's rules and stated zone. A `403 assistant_not_enabled` from any call
+pauses the checks, the brief and the notify tool until Raft's context names the
+owner again. The chat is offered the owner DM, attachments, the reads and the
+preferences (plus `resume` and the parked-result reader), with no run_js, jobs
+or subagents, under a prompt of its own (`assistantSystemPrompt`,
+`src/runtime/pi-prompt.ts`). `test/raft-assistant-mode.ts` holds the rules, the
+code before the model, the short session and the offered lists.
 
 **`replay: "never"` overrides the read rule.** A tool that declares it is not
 run again on its own after an interruption, even when it is a read

@@ -55,6 +55,7 @@ import { credentialRedactor, agentSecretValues } from "./eval-read.ts";
 import { logicalMain, physicalSession } from "./fresh-context.ts";
 import { assistantSystemPrompt, profilePrompt, systemPrompt } from "../../src/runtime/pi-prompt.ts";
 import { assistantMountOf, assistantTools } from "../../src/plugins/raft-assistant.ts";
+import { forgetIsolated, isIsolatedSession, isolatedSessions, newIsolatedSessionId, recordIsolated } from "../../src/runtime/isolated-session.ts";
 import { profileOf, profileSpec } from "../../src/runtime/agent-profile.ts";
 import {
   askedTurn, askWake, bindTurn, keepWake, conversationReasoning, dropAnswer, forgetTurnText, keepTurnOnly, dropWake, dueWakes, keepAnswer, keepsPluginCalls, markAnswerPosting, nextWakeAt, pendingAnswers, pendingTurnEnds, recordTurnEnd,
@@ -1394,7 +1395,7 @@ export class AgentRuntime {
     // mount is not taking events, which the service should not report as broken.
     if ("skipped" in answer) return done("ignored", answer.skipped);
     const result = answer.result;
-    if (!result.deliver) return done(result.rejected ? "rejected" : result.malformed ? "malformed" : "ignored", result.reason);
+    if (!result.deliver && !("wake" in result && result.wake)) return done(result.rejected ? "rejected" : result.malformed ? "malformed" : "ignored", result.reason);
     // Which installation accepted it, read before the synchronous run below (which must not await): the pass
     // that posts it gives it up if the alias names another by then (`#deliverInbound`). A mount gone, or replaced,
     // since `receive` began is refused here rather than stamped, so every row this writes carries an installation
@@ -1431,6 +1432,10 @@ export class AgentRuntime {
       askWake(sql, profileSpec(profile).alias, now);
       return done("delivered", `a wake for the ${profileSpec(profile).alias} plugin`, key);
     }
+    // A push the plugin's own code acts on (`InboundResult.wake`): its wake is asked for now, and, with nothing for the
+    // model, nothing is queued or posted.
+    if (!result.deliver || result.wake) askWake(sql, alias, now);
+    if (!result.deliver) return done("delivered", `a wake for the ${alias} plugin`, key);
     sealedBy(tenantId, agentId, sealSeedFiles(sql, tenantId, agentId, "first-inbound", now));
     acceptInbound(sql, { hookId, alias, dedupeKey: key, message: inboundMessage(alias, String(result.text), result.kind === "inbox" ? "inbox" : "event"), now, installationId });
     // The answer the service has always had for a push the agent will be given.
@@ -3297,10 +3302,13 @@ export class AgentRuntime {
     // A personal assistant (its raft mount's snapshot says whose, src/plugins/raft-assistant.ts) is offered its owner DM,
     // the owner reads and its own two tools, and none of the harness's own but `resume`: no run_js, no jobs, no subagents.
     const assistant = profileOf(agentConfig) ? null : assistantMountOf(records);
+    // Its proactive checks run in short sessions of their own (`PluginNext.isolated`), offered only what a check reads
+    // and sends with; the main conversation is its chat with its owner.
+    const isolated = isIsolatedSession(session);
     const tools = profileOf(agentConfig) ? []
       : isSubagentSession(session)
       ? (() => { const withheld = this.#childWithheldIn(catalogue); return catalogue.tools.filter((t) => !withheld.has(t.address)); })()
-      : assistant ? assistantTools(catalogue.tools, assistant)
+      : assistant ? assistantTools(catalogue.tools, assistant, isolated ? "check" : "chat")
       : catalogue.tools;
     const sandbox = this.#deps.sandbox ?? true;
     const store = this.store;
@@ -3352,7 +3360,7 @@ export class AgentRuntime {
     // An evaluation's `harness: "minimal"` (src/core/tool-config.ts), read from the record every turn path and the
     // tool export build from here, so a prompt, a steer and a push are offered the same list, under either engine.
     // An assistant keeps `resume`: a send to its owner's DM can be held for messages it has not read, and is answered with it.
-    const extras = assistant ? { runJs: false, jobs: false, resume: true } : harnessExtras({
+    const extras = assistant ? { runJs: false, jobs: false, resume: !isolated } : harnessExtras({
       apiAgent: !!apiConfig, sandbox, minimal: toolConfigOf(agentConfig)?.harness === "minimal",
       hasBackgroundMount: offersCapability(
         records, offered as MountedTool[],
@@ -3489,7 +3497,7 @@ export class AgentRuntime {
     const profile = profileOf(record);
     // An assistant's prompt is its own: the persona's name and description, then what it is for. Not the default core,
     // the sandbox page or the mounts' paragraphs, which describe tools it is not offered.
-    const prompt = profile ? profilePrompt(profile) : assistant ? assistantSystemPrompt(personaOf(record), assistant) : systemPrompt({
+    const prompt = profile ? profilePrompt(profile) : assistant ? assistantSystemPrompt(personaOf(record), assistant, isIsolatedSession(session) ? "check" : "chat") : systemPrompt({
       // The agent's own record: a person named and described it at creation,
       // and that is the first thing the prompt says after the core.
       persona: personaOf(record),
@@ -4956,6 +4964,31 @@ export class AgentRuntime {
     return done;
   }
 
+  /**
+   * The short sessions plugins asked for (`PluginNext.isolated`) whose run has ended: erased whole, transcript and model
+   * jobs, as an archived subagent is, so nothing a check read outlives it. One with work left (a run, a model call out)
+   * is kept for the pass after it. pi085 only: pd never makes one.
+   */
+  #eraseIsolated(tenantId: string, agentId: string) {
+    if (this.#isPd()) return;
+    const sql = this.#deps.ctx.storage.sql;
+    const rows = isolatedSessions(sql);
+    if (!rows.length) return;
+    const busy = new Set(sessionsWithWork(sql));
+    for (const r of rows) {
+      if (busy.has(r.session)) continue;
+      try {
+        this.#evictAgent(tenantId, agentId, r.session);
+        const t = piTables(r.session);
+        for (const table of [t.entries, t.usage, t.values, t.list, t.meta]) sql.exec(`DROP TABLE IF EXISTS ${table}`);
+        sql.exec("DELETE FROM pi_sessions WHERE session = ?", r.session);
+        sql.exec("DELETE FROM pi_model_jobs WHERE session = ?", r.session);
+        forgetIsolated(sql, r.session);
+        logEvent("isolated.erased", { tenantId, agentId, session: r.session, mount: r.alias, ms: Date.now() - r.at });
+      } catch (e) { console.error(`erasing ${tenantId}/${agentId}'s short session ${r.session} failed:`, e); }
+    }
+  }
+
   /** pi085: a session's last 20 message entries, oldest first, read with a SELECT. */
   #piMessages(session: string): EngineEntry[] {
     const t = piTables(session);
@@ -5411,6 +5444,7 @@ export class AgentRuntime {
     await this.#cancelStraySubagents(tenantId, agentId);
     if (await this.#reportSubagents(tenantId, agentId) > 0) wakeInMs = 0;
     await this.#archiveSubagents(tenantId, agentId);
+    this.#eraseIsolated(tenantId, agentId);
     const retry = reportRetryMs(sql, { tenantId, agentId }, Date.now());
     if (retry !== null) wakeInMs = wakeInMs === null ? retry : Math.min(wakeInMs, retry);
     // A running subagent past its ceiling is cancelled by a pass; the pass comes back for the ceiling's moment.
@@ -5518,6 +5552,25 @@ export class AgentRuntime {
       if (a.next.cancelTurn) {
         try { cancelled = (await this.cancelSession(tenantId, agentId, MAIN_SESSION)).cancelledTurn !== null || cancelled; }
         catch (e) { logEvent("plugin.hook", { tenantId, agentId, mount: a.alias, hook: "cancel", error: String((e as Error)?.message ?? e).slice(0, 200) }); }
+      }
+      // A turn in a short session of its own (`PluginNext.isolated`): a new session, so nothing of the main conversation
+      // is sent with it and nothing of it is left there; erased once its run ends (`#eraseIsolated`).
+      if (typeof a.next.turn === "string" && a.next.isolated) {
+        if (this.#isPd()) logEvent("plugin.hook", { tenantId, agentId, mount: a.alias, hook: "turn", dropped: "isolated: pd runs one conversation per object" });
+        else {
+          const session = newIsolatedSessionId();
+          try {
+            await this.postMessage(tenantId, agentId, a.next.turn, "prompt", session, {
+              beforeSay: () => { markAnswerPosting(sql, a.seq); recordIsolated(sql, session, a.alias, Date.now()); },
+            });
+            posted = true;
+          } catch (e) {
+            forgetIsolated(sql, session);
+            logEvent("plugin.hook", { tenantId, agentId, mount: a.alias, hook: "turn", error: String((e as Error)?.message ?? e).slice(0, 200) });
+          }
+        }
+        dropAnswer(sql, a.seq);
+        continue;
       }
       // A fresh turn, or an erase, waits while a run is going in the main conversation: kept as only what is left of it,
       // for a later pass, which comes back soon.

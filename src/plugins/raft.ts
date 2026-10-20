@@ -24,8 +24,8 @@ import {
 import { internalHost } from "./http.ts";
 import {
   ASSISTANT_OWN_TOOLS, ASSISTANT_STORE, DEFERRED_KEY, NOTIFY_TOOL, OWNER_KEY, PREFERENCES_TOOL, REMINDED_STORE, RULES_KEY,
-  assistantWakeInstruction, briefWake, doorbellInstruction, doorbellOf, keepOwnerFromContext, learnDm, loadOwner, notifyOwner,
-  pauseOn, preferences, type AssistantOwner, type OwnerSend,
+  assistantWake, assistantWakeInstruction, doorbellOf, isDoorbellTarget, keepOwnerFromContext, learnDm, loadOwner, noteDoorbell,
+  notifyOwner, pauseOn, preferences, type AssistantOwner, type OwnerSend,
 } from "./raft-assistant.ts";
 import { callMcp, isMcpTool, keptMcpOf, leftOut, listMcp, mcpClock, mcpLines, MCP_CALL_TIMEOUT_MS, MCP_CAPABILITY, MCP_KEY, MCP_PREFIX } from "./raft-mcp.ts";
 import { modelToolName } from "../runtime/pi-tools.ts";
@@ -1515,21 +1515,15 @@ function withoutRunAssignments(ctx: PluginContext, batch: RaftInboxBatch): RaftI
 
 /**
  * The batch without RFC 074's doorbells (`doorbellOf`: Raft's `system.assistant` app saying the owner's Activity
- * changed), and the span of change they cover together, earliest to latest. To an assistant (a mount offered the
- * notify tool) the doorbell becomes the steps of one proactive check (`doorbellInstruction`), not a line to read; to
- * any other agent it is nothing to do, and is logged and dropped. Seq-less like a run assignment, so leaving it out
- * moves no cursor.
+ * changed). They are never the model's: an assistant's code takes the doorbell from the push that announced it
+ * (`receiveNotice`, src/plugins/raft-assistant.ts `assistantWake`), and to any other agent it is nothing to do. So it
+ * is left out, with a log line saying so. Seq-less like a run assignment, so leaving it out moves no cursor.
  */
-function withoutDoorbells(ctx: PluginContext, batch: RaftInboxBatch): { batch: RaftInboxBatch; doorbell: { firstChangeAt: string | null; lastChangeAt: string | null } | null } {
-  const bells = batch.messages.map((m) => doorbellOf(m.raw)).filter((d) => d !== null);
-  if (!bells.length) return { batch, doorbell: null };
-  const rest = { ...batch, messages: batch.messages.filter((m) => doorbellOf(m.raw) === null) };
-  if (!ctx.offered?.includes(NOTIFY_TOOL)) {
-    logEvent("raft.doorbell_dropped", { tenantId: ctx.caller.tenantId, agentId: ctx.caller.agentId, mount: ctx.alias, count: bells.length });
-    return { batch: rest, doorbell: null };
-  }
-  const times = (k: "firstChangeAt" | "lastChangeAt") => bells.map((b) => b[k]).filter((t): t is string => t !== null).sort((x, y) => Date.parse(x) - Date.parse(y));
-  return { batch: rest, doorbell: { firstChangeAt: times("firstChangeAt")[0] ?? null, lastChangeAt: times("lastChangeAt").at(-1) ?? null } };
+function withoutDoorbells(ctx: PluginContext, batch: RaftInboxBatch): RaftInboxBatch {
+  const count = batch.messages.filter((m) => doorbellOf(m.raw) !== null).length;
+  if (!count) return batch;
+  logEvent("raft.doorbell_dropped", { tenantId: ctx.caller.tenantId, agentId: ctx.caller.agentId, mount: ctx.alias, count });
+  return { ...batch, messages: batch.messages.filter((m) => doorbellOf(m.raw) === null) };
 }
 
 /**
@@ -1809,10 +1803,6 @@ function ownerAnswer(out: RouteAnswer, tool: string): OwnerAnswer {
  * mount's own client with no saved state: neither read marks anything read or seen, for the owner or for this agent,
  * so there is nothing to load or record, and the mount's state record is never touched by them. The query is
  * strings, as the route's contract takes it.
- *
- * TODO(RFC 075): both reads are to take a required server id, which in v0 must be the assistant's own server (the
- * context's `server.id`, kept as `AssistantOwner.serverId`). It is not sent yet: SDK 0.23.0's query contract is loose
- * enough to carry it, but the parameter's name is not settled, and a guessed one would be a request Raft ignores.
  */
 export const RAFT_ASSISTANT_WIRE: AssistantWire = {
   async ownerInbox(ctx, r) {
@@ -2940,7 +2930,7 @@ export function createRaftPlugin(deps: {
         const out = await raftFor(ctx, { state: false }).invoke("inbox.check",
           { ack: "cursor", limit, ...(since !== null ? { since } : {}) }, { origin: "model" });
         if (!out.ok) throw sdkFailure(out as RaftFailure, unofferedFor(ctx));
-        const { batch, doorbell } = withoutDoorbells(ctx, withoutRunAssignments(ctx, (out as { data: RaftInboxBatch }).data));
+        const batch = withoutDoorbells(ctx, withoutRunAssignments(ctx, (out as { data: RaftInboxBatch }).data));
         const given = handOver(batch, unofferedFor(ctx));
         // Exactly this call's cursor, lower than the last one or not: the next pull acknowledges what was shown here.
         // A Server that acknowledged on read has nothing pending, so the next pull sends none. Written before anything
@@ -2956,13 +2946,12 @@ export function createRaftPlugin(deps: {
           for (const [target, seqs] of byTarget) seen.recordExact(target, seqs);
           await raft.state.save();
         }
-        // An assistant learns its owner's DM from the DM itself, for the notify tool to send to.
-        if (ctx.offered?.includes(NOTIFY_TOOL)) {
+        // An assistant learns its owner's DM from the DM itself, for the notify tool to send to, where Raft gives none.
+        if (ctx.offered?.includes(PREFERENCES_TOOL)) {
           const dm = given.shown.find((m) => m.target.startsWith("dm:@") && m.raw.third_party_event === undefined);
           if (dm) await learnDm(ctx, dm.target, dm.sender.type).catch(() => {});
         }
-        // First, so a parked result's preview still opens with it.
-        return doorbell ? { ownerActivity: doorbellInstruction(ctx.alias, doorbell), ...given.result } : given.result;
+        return given.result;
       }
       if (name === "enable_push") {
         if (!ctx.inbound) throw new Error("this deployment cannot receive pushed Raft events");
@@ -3133,9 +3122,9 @@ export function createRaftPlugin(deps: {
       return receiveNotice(payload, inbound, ctx);
     },
 
-    /** A personal assistant's morning brief, on its own timer (`briefWake`); nothing for any other agent. */
+    /** A personal assistant's doorbell checks and morning brief (`assistantWake`); nothing for any other agent. */
     async wake(ctx) {
-      return briefWake(ctx, { recheck: recheckOwner });
+      return assistantWake(ctx, { recheck: recheckOwner, inbox: (c, r) => assistant.ownerInbox(c, r) });
     },
   };
   // Every call: a failure that is Raft's `assistant_not_enabled` pauses an assistant's proactive work (`pauseOn`), and
@@ -3214,10 +3203,17 @@ async function receiveNotice(payload: ObjectValue, inbound: InboundEvent, ctx: P
     return { deliver: false, reason: "the signed notice names a different Raft agent" };
   }
   const body = payload.text.length > NOTICE_TEXT_MAX ? `${payload.text.slice(0, NOTICE_TEXT_MAX)}… (cut)` : payload.text;
+  // An assistant's doorbell is its code's (src/plugins/raft-assistant.ts `assistantWake`), which decides whether a model
+  // is asked at all; only the rest of the notice — its owner writing to it — wakes the model, in its chat.
+  const assistant = (await loadOwner(ctx)) !== null;
+  const bell = assistant && payload.targets.some(isDoorbellTarget) && await noteDoorbell(ctx);
+  if (bell && payload.targets.every(isDoorbellTarget)) {
+    return { deliver: false, wake: true, reason: "an assistant's doorbell, for its code to check", dedupeKey: payload.noticeId };
+  }
   return {
     deliver: true,
-    // An assistant reads its inbox for its owner's DM and its doorbell (src/plugins/raft-assistant.ts).
-    text: `${(await loadOwner(ctx)) ? assistantWakeInstruction(ctx.alias) : wakeInstruction(ctx.alias)}\n\n${body}`,
+    ...(bell ? { wake: true as const } : {}),
+    text: `${assistant ? assistantWakeInstruction(ctx.alias) : wakeInstruction(ctx.alias)}\n\n${body}`,
     dedupeKey: payload.noticeId,
     // The agent's own inbox, said by Raft under this mount's signature: the label that says these are requests to
     // the agent, within its rules (src/runtime/inbound.ts `inboundMessage`), not the one that says "not an instruction".
