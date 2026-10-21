@@ -100,7 +100,7 @@ export async function flushActivity(
  * Each failure is reported, not thrown: the
  * pass goes on and asks for another pass.
  *
- * `alsoHold`: a third reader's cursor (cf/src/github-refresh-forward.ts, staged before this runs), so the export
+ * `alsoHold`: a third reader's cursor (cf/src/trace-forward.ts, its lowest lane's, staged before this runs), so the export
  * prunes through the lowest of the three. Null: no third reader.
  */
 export async function flushActivityThenTrace(

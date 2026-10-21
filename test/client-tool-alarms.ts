@@ -70,19 +70,22 @@ const answer = (r: Reply) => ({
   stopReason: "text" in r ? "stop" : "toolUse", timestamp: 0,
 });
 
-/** One agent object: its own storage and alarm, the shared D1. */
-function object(name: string) {
+/**
+ * One agent object: its own storage and alarm, the shared D1. `extraEnv` is added to its env; `events`, when given, has
+ * `pass` at each alarm's start and `arm` / `disarm` at each alarm set or deleted, in order, for a test of what comes first.
+ */
+function object(name: string, extraEnv: Record<string, unknown> = {}, events?: string[]) {
   const raw = sqliteHost();
   const jobs: string[] = [];
   const state = { alarmAt: null as number | null, alarms: 0, sent: 0 };
-  /** Each alarm: the model calls it sent, when it asked to be woken next (ms from its end), whether it threw. */
-  const passes: Array<{ sent: number; armedInMs: number | null; threw: boolean }> = [];
+  /** Each alarm: the model calls it sent, when it asked to be woken next (ms from its end), whether it threw, its real ms. */
+  const passes: Array<{ sent: number; armedInMs: number | null; threw: boolean; realMs: number }> = [];
   const ctx = {
     storage: {
       sql: raw.sql, transactionSync: raw.transactionSync,
       getAlarm: async () => state.alarmAt,
-      setAlarm: async (at: number) => { state.alarmAt = at; },
-      deleteAlarm: async () => { state.alarmAt = null; },
+      setAlarm: async (at: number) => { state.alarmAt = at; events?.push("arm"); },
+      deleteAlarm: async () => { state.alarmAt = null; events?.push("disarm"); },
     },
     blockConcurrencyWhile: async <R>(fn: () => Promise<R>) => fn(),
     id: { toString: () => name }, getWebSockets: () => [], exports: {},
@@ -96,6 +99,7 @@ function object(name: string) {
     ARTIFACT_BUCKET: "b", CONTROL_DB: control, HARNESS_MODEL: "deepseek-flash",
     DEEPSEEK_BASE_URL: "https://api.deepseek.com", DEEPSEEK_API_KEY: "dk-test",
     SECRET_KEK: Buffer.alloc(32, 7).toString("base64"),
+    ...extraEnv,
   };
   const D: any = new AgentDO(ctx as never, env as never);
   /** What each model call was handed: the roles and texts of its messages. */
@@ -123,8 +127,10 @@ function object(name: string) {
       state.alarms++;
       const sentBefore = state.sent;
       let threw = false;
+      events?.push("pass");
+      const real = performance.now();
       try { await D.alarm(); } catch { threw = true; /* recorded by the handler in alarm_errors, as the platform would see it */ }
-      passes.push({ sent: state.sent - sentBefore, armedInMs: state.alarmAt === null ? null : state.alarmAt - Date.now(), threw });
+      passes.push({ sent: state.sent - sentBefore, armedInMs: state.alarmAt === null ? null : state.alarmAt - Date.now(), threw, realMs: performance.now() - real });
       clock += 5;
     }
   };
@@ -317,6 +323,43 @@ await check("the step after a resume throws: the pass fails as any step's throw 
   must(r.o.state.alarms === 3 + 1 + 2 + 1, `alarms ${r.o.state.alarms}`);
   must(show(r.branch) === show(EXPECTED_BRANCH) && r.status.status === "idle", show([r.branch, r.status]));
   must(show(r.o.asked) === show(seq.o.asked), show(r.o.asked));
+});
+
+// ---- the trace forward's send never decides, or long delays, the next alarm ---------------------------
+
+await check("a trace ingest that never answers: every pass arms its next alarm before any ingest request, and ends within the forward's budget", async () => {
+  // Configured forwarding (cf/src/trace-forward.ts), an ingest that never answers and ignores its abort signal.
+  const INGEST = "https://ingest.example";
+  const events: string[] = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+    if (String(url).startsWith(INGEST)) { events.push("ingest"); return new Promise<Response>(() => {}); }
+    return realFetch(url as string, init);
+  }) as typeof fetch;
+  try {
+    const agentId = "a-forward";
+    const o = object(`api:${TENANT}/${agentId}`, { TRACE_INGEST_URL: INGEST, TRACE_INGEST_TOKEN: "tok_test", DEPLOYMENT_ENV: "preview" }, events);
+    const agentJson = JSON.stringify(AGENT);
+    await o.D.apiOpenSession(TENANT, agentId, agentJson, "sess_forward");
+    await o.D.apiPostInput(TENANT, agentId, agentJson, "sess_forward", "Hello?");
+    await o.settle(TENANT, agentId, [{ text: "Hello." }]);
+    must(events.includes("ingest"), `no pass reached the ingest: ${events.join(" ")}`);
+    // Per pass: once a request to the ingest has gone out, the alarm is not set or deleted again, so what the pass
+    // decided about the next alarm was decided before the ingest was asked anything.
+    const passes = events.join(" ").split("pass").slice(1).map((p) => p.trim().split(" ").filter(Boolean));
+    for (const p of passes) {
+      const first = p.indexOf("ingest");
+      must(first < 0 || !p.slice(first).some((x) => x === "arm" || x === "disarm"), `an alarm set after the ingest was asked: ${p.join(" ")}`);
+      must(first < 0 || p.slice(0, first).some((x) => x === "arm" || x === "disarm"), `no next alarm decided before the ingest was asked: ${p.join(" ")}`);
+    }
+    // The hung request costs a pass the forward's budget (FORWARD_PASS_MS, 2 s), not the request timeout (10 s).
+    must(o.passes.every((p) => p.realMs < 2_000 + 1_000), `pass times: ${o.passes.map((p) => Math.round(p.realMs))}`);
+    must(o.alarmErrors().length === 0 && o.passes.every((p) => !p.threw), show(o.alarmErrors()));
+    must((await o.D.apiSessionStatus(TENANT, agentId, "sess_forward")).status === "idle", "the turn did not end");
+    // The rows the ingest never took are still queued for a later pass.
+    const queued = Number(o.raw.sql.exec("SELECT COUNT(*) AS n FROM atr_forward_queue").toArray()[0]?.n ?? 0);
+    must(queued > 0, "the unanswered rows left the queue");
+  } finally { globalThis.fetch = realFetch; }
 });
 
 for (const r of results) console.log(`${r.ok ? "PASS" : "FAIL"}  ${r.name}${r.ok ? "" : `\n${r.error}`}`);

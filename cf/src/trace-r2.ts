@@ -86,7 +86,7 @@ export function traceBody(rows: readonly TraceOutboxRow[]): Uint8Array {
 
 /**
  * `holdThrough`: another reader of the outbox (cf/src/activity-raft.ts, and
- * the `github.refresh` forward's stage in cf/src/github-refresh-forward.ts) has
+ * the forward's stage in cf/src/trace-forward.ts, its lowest lane) has
  * consumed rows only up to this seq; rows past it are exported but not pruned,
  * so that reader still finds them on its next pass. Absent means no other
  * reader is holding anything.

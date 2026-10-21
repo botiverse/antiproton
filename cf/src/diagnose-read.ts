@@ -9,6 +9,7 @@
  * flight is reported instead: model calls with no answer yet, and background jobs.
  */
 import type { DbKey, DbSpec, Plugin, PluginContext } from "../../src/plugins/types.ts";
+import { forwardSettingsOf } from "./trace-forward.ts";
 import { holdingOf } from "../../src/plugins/types.ts";
 import { type DbScope, PluginDbTables } from "../../src/store/plugin-db.ts";
 import { openPluginDatabase } from "../../src/runtime/plugin-db.ts";
@@ -47,6 +48,8 @@ export interface DiagnosisDeps {
   /** When the object's alarm is set for, read from the platform. */
   alarm: () => Promise<number | null>;
   now?: () => number;
+  /** The deployment's settings, for how trace forwarding is configured (`forwardSettingsOf`); never shown as values. */
+  env?: Record<string, unknown>;
 }
 
 const rows = (sql: Sql, table: string, query: string, ...bindings: unknown[]): any[] =>
@@ -215,16 +218,13 @@ export async function readDiagnosis(
     // be seen, beside what else this object has had go wrong.
     traceDrops: rows(sql, "trace_drops", "SELECT at, dropped FROM trace_drops ORDER BY at DESC LIMIT 3")
       .map((r) => ({ at: Number(r.at), dropped: Number(r.dropped) })),
-    // The `github.refresh` forward (cf/src/github-refresh-forward.ts): null while it has never run here (it is off until
+    // The forward's lanes (cf/src/trace-forward.ts): each null while it has never run here (forwarding is off until
     // configured, and makes no table until then); otherwise what waits, the backoff, and its last counted outcomes.
-    githubRefreshForward: hasTable(sql, "ghr_forward_staged") ? {
-      stagedThrough: Number(rows(sql, "ghr_forward_staged", "SELECT through_seq FROM ghr_forward_staged WHERE id = 1")[0]?.through_seq ?? 0),
-      queued: Number(rows(sql, "ghr_forward_queue", "SELECT COUNT(*) AS n FROM ghr_forward_queue")[0]?.n ?? 0),
-      backoff: rows(sql, "ghr_forward_state", "SELECT failures, next_at FROM ghr_forward_state WHERE id = 1")
-        .map((r) => ({ failures: Number(r.failures), nextAt: Number(r.next_at) }))[0] ?? null,
-      recent: rows(sql, "ghr_forward_log", "SELECT at, reason, status, rows FROM ghr_forward_log ORDER BY at DESC LIMIT 5")
-        .map((r) => ({ at: Number(r.at), reason: String(r.reason), status: r.status === null ? null : Number(r.status), rows: Number(r.rows) })),
-    } : null,
+    // Whether forwarding is on, off, or misconfigured and why (an http URL is refused: the token would go in the clear),
+    // with which setting names it was read from; never the URL or the token.
+    traceForwardConfig: deps.env ? forwardConfigReport(deps.env) : null,
+    githubRefreshForward: forwardLaneOf(sql, "ghr_forward"),
+    agentTraceForward: forwardLaneOf(sql, "atr_forward"),
     // Trace rows a pd commit failed to write (src/runtime/pd-outbox.ts): the commit lands without them.
     traceErrors: rows(sql, "trace_errors", "SELECT at, message FROM trace_errors ORDER BY at DESC LIMIT 3")
       .map((r) => ({ at: Number(r.at), message: String(r.message) })),
@@ -255,4 +255,32 @@ export async function readDiagnosis(
       }
     })(),
   };
+}
+
+/** One forward lane's tables (cf/src/trace-forward.ts, `<prefix>_staged` and the rest) as diagnose shows them, or null. */
+function forwardLaneOf(sql: Sql, prefix: "ghr_forward" | "atr_forward") {
+  if (!hasTable(sql, `${prefix}_staged`)) return null;
+  // The agent.trace lane counts the rows its receiver rejected, with the receiver's reason (cf/src/trace-forward.ts `note`).
+  const detail = prefix === "atr_forward";
+  return {
+    stagedThrough: Number(rows(sql, `${prefix}_staged`, `SELECT through_seq FROM ${prefix}_staged WHERE id = 1`)[0]?.through_seq ?? 0),
+    queued: Number(rows(sql, `${prefix}_queue`, `SELECT COUNT(*) AS n FROM ${prefix}_queue`)[0]?.n ?? 0),
+    backoff: rows(sql, `${prefix}_state`, `SELECT failures, next_at FROM ${prefix}_state WHERE id = 1`)
+      .map((r) => ({ failures: Number(r.failures), nextAt: Number(r.next_at) }))[0] ?? null,
+    recent: rows(sql, `${prefix}_log`, `SELECT at, reason, status, rows${detail ? ", detail" : ""} FROM ${prefix}_log ORDER BY at DESC LIMIT 5`)
+      .map((r) => ({ at: Number(r.at), reason: String(r.reason), status: r.status === null ? null : Number(r.status), rows: Number(r.rows),
+        ...(detail && r.detail !== null && r.detail !== undefined ? { detail: String(r.detail) } : {}) })),
+    // The agent.trace lane's rows the receiver rejected in the last seven days, by its reason (never retried).
+    ...(detail ? {
+      rejected: Object.fromEntries(rows(sql, `${prefix}_log`, `SELECT detail, SUM(rows) AS n FROM ${prefix}_log WHERE reason = 'rejected' GROUP BY detail ORDER BY detail`)
+        .map((r) => [String(r.detail ?? "other"), Number(r.n)])),
+    } : {}),
+  };
+}
+
+function forwardConfigReport(env: Record<string, unknown>) {
+  const s = forwardSettingsOf(env);
+  if (s.state === "off") return { state: "off" };
+  if (s.state === "misconfigured") return { state: "misconfigured", problem: s.problem, urlFrom: s.urlFrom, tokenFrom: s.tokenFrom };
+  return { state: "on", env: s.config.env, urlFrom: s.urlFrom, tokenFrom: s.tokenFrom };
 }

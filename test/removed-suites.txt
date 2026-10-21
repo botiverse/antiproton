@@ -3,3 +3,5 @@
 # One name per line (file name without .ts), with a line saying why.
 # model-fallback: tested the first-turn model fallback (MODEL_FALLBACK), removed with the feature (reverts of #900, #894).
 model-fallback
+# github-refresh-forward: its cases moved, with cf/src/github-refresh-forward.ts, into test/trace-forward.ts (the github.refresh lane of cf/src/trace-forward.ts).
+github-refresh-forward
