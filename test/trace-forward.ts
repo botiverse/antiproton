@@ -443,10 +443,10 @@ const WORKER_FIELDS: Record<string, Record<string, string>> = {
 /**
  * What this side sends that the receiver does not keep yet, by the receiver's types: new kinds, new fields, and enums
  * widened (a value outside the receiver's list is dropped by it, the row kept). The field table sent to the receiving
- * side is this; when the receiver takes an entry, it moves to WORKER_FIELDS. Empty: botiverse/slock#10611 took every
- * entry it had.
+ * side is this; when the receiver takes an entry, it moves to WORKER_FIELDS. botiverse/slock#10611 took every entry it had;
+ * `behind` (Raft's check: 0/1, the inbox read trailed the doorbell) waits on botiverse/slock#10643.
  */
-const PROPOSED: Record<string, Record<string, string>> = {};
+const PROPOSED: Record<string, Record<string, string>> = { "raft.assistant_wake": { behind: "count" } };
 /** The receiver's fields once PROPOSED lands: what this side's fields are pinned to. */
 const CONTRACT: Record<string, Record<string, string>> = Object.fromEntries([...new Set([...Object.keys(WORKER_FIELDS), ...Object.keys(PROPOSED)])]
   .map((k) => [k, { ...WORKER_FIELDS[k], ...PROPOSED[k] }]));
@@ -556,7 +556,7 @@ async function newKinds(sql: any): Promise<void> {
     { at: T0 + 12, ...t, kind: "raft.assistant_wake", spanId: "mount:assistant", status: "invoked", verdict: "ok",
       attrs: { mount: "assistant", trigger: "brief", check_id: CHECK, raft_check: true, tools_offered: 1, tools_dropped: 2, placeholders_unknown: 1,
         placeholders_unoffered: 0, conversations: 5, items: 3, truncated: 0, told: 1, skipped: 1, muted: 2, digest: 1, always: 0, dm: 1, mention: 1,
-        thread: 0, named: 0, default_out: 2, night_held: 0 } },
+        thread: 0, named: 0, default_out: 2, night_held: 0, behind: 1 } },
     { at: T0 + 13, ...t, kind: "raft.assistant_wake", spanId: "mount:assistant", status: "check_refused", verdict: "ok",
       attrs: { mount: "assistant", trigger: "doorbell", check_id: CHECK, raft_check: true, reason: "instruction_too_large", instruction_bytes: 20000 } },
     { at: T0 + 14, ...t, kind: "raft.assistant_wake", spanId: "mount:assistant", status: "skipped_no_check", verdict: "ok",
@@ -613,7 +613,7 @@ const GOLDEN_NEW: Record<number, Record<string, unknown>> = {
     input: 5000, cache_read: 100, since_decision_ms: 1234 }),
   12: env0(12, "raft.assistant_wake", T0 + 12, { span_id: "mount", mount_index: 0, status: "invoked", verdict: "ok", result: "invoked", trigger: "brief",
     check_id: CHECK, raft_check: true, tools_offered: 1, tools_dropped: 2, placeholders_unknown: 1, placeholders_unoffered: 0, conversations: 5, items: 3,
-    truncated: 0, told: 1, skipped: 1, muted: 2, digest: 1, always: 0, dm: 1, mention: 1, thread: 0, named: 0, default_out: 2, night_held: 0 }),
+    truncated: 0, told: 1, skipped: 1, muted: 2, digest: 1, always: 0, dm: 1, mention: 1, thread: 0, named: 0, default_out: 2, night_held: 0, behind: 1 }),
   13: env0(13, "raft.assistant_wake", T0 + 13, { span_id: "mount", mount_index: 0, status: "check_refused", verdict: "ok", result: "check_refused",
     trigger: "doorbell", check_id: CHECK, raft_check: true, reason: "instruction_too_large", instruction_bytes: 20000 }),
   14: env0(14, "raft.assistant_wake", T0 + 14, { span_id: "mount", mount_index: 0, status: "skipped_no_check", verdict: "ok", result: "skipped_no_check",

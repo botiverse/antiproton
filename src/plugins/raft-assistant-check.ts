@@ -52,7 +52,7 @@ export const LOGICAL_TOOLS: Readonly<Record<string, string>> = {
  * to be kept in step with Raft's (any other key Raft sends is left off the row, never an error).
  */
 export const CHECK_COUNT_KEYS: readonly string[] = [
-  "conversations", "items", "truncated", "told", "skipped", "muted", "digest", "always", "dm", "mention", "thread", "named", "default_out", "night_held",
+  "conversations", "items", "truncated", "told", "skipped", "muted", "digest", "always", "dm", "mention", "thread", "named", "default_out", "night_held", "behind",
 ];
 
 export type CheckTrigger = "doorbell" | "brief";
