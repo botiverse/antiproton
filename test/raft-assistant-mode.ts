@@ -2301,6 +2301,98 @@ await check("reply fallback end to end: a chat turn that only writes its answer 
   } finally { v.host.dispose(); }
 });
 
+await check("reply fallback: a send to the owner's DM in the inbox's form (`dm:@ada`) answers the turn where Raft gives `dm:@ada~human`; its threads, case and kind variants too, never another person's", async () => {
+  // Raft's `assistantOf.dmTarget` carries `~human`; the inbox names the same DM `dm:@ada` (the model copies that one).
+  const answers: string[] = ["dm:@ada", "dm:@ada~human", "dm:@ada:abcdef12", "dm:@ada~human:abcdef12", "DM:@Ada", " dm:@ada "];
+  for (const target of answers) {
+    const a = await assistant(raft({ dm: "dm:@ada~human" }));
+    await raftPlugin.invoke("messages_send", { target, content: "Friday works." }, a.ctx);
+    await afterTurn(a.ctx, ended("t1"));
+    must(a.r.sends.length === 1 && fallbackRows(a).length === 0, `${target}: ${show(a.r.sends)}`);
+  }
+  // Another person, the agent of the same name, or a channel: the turn did not answer its owner.
+  for (const target of ["dm:@ada~agent", "dm:@adam", "dm:@bob", "#ada", "dm:@ada~agent:abcdef12"]) {
+    const a = await assistant(raft({ dm: "dm:@ada~human" }));
+    await raftPlugin.invoke("messages_send", { target, content: "elsewhere" }, a.ctx).catch(() => null);
+    await afterTurn(a.ctx, ended("t1"));
+    must(a.r.sends.at(-1)?.target === "dm:@ada~human" && a.r.sends.at(-1)?.content === TEXT && fallbackRows(a).length === 1, `${target} answered the owner: ${show(a.r.sends)}`);
+  }
+  // What such a send cites counts as told, as it does in Raft's form; a send to the agent of that name tells nothing.
+  const t = await assistant(raft({ dm: "dm:@ada~human" }));
+  await raftPlugin.invoke("messages_send", { target: "dm:@ada", content: "Bob asks about #launch:aaaaaaa1" }, t.ctx);
+  await raftPlugin.invoke("messages_send", { target: "dm:@ada~agent", content: "and #eng:bbbbbbb7" }, t.ctx);
+  must(t.read(REMINDED_STORE, "msg:aaaaaaa1")?.via === "chat" && t.read(REMINDED_STORE, "msg:bbbbbbb7") === undefined, "told in a `dm:@ada` send");
+  // A learnt DM in the bare form matches a send carrying `~human`.
+  const b = await assistant(raft({ dm: null }));
+  b.write(ASSISTANT_STORE, OWNER_KEY, { ...b.read(ASSISTANT_STORE, OWNER_KEY), learnedDm: "dm:@ada" });
+  await raftPlugin.invoke("messages_send", { target: "dm:@ada~human", content: "Friday works." }, b.ctx);
+  await afterTurn(b.ctx, ended("t1"));
+  must(b.r.sends.length === 1 && fallbackRows(b).length === 0, `learnt bare: ${show(b.r.sends)}`);
+});
+
+await check("reply fallback: a brand-new assistant's first turn, whose owner's DM is known only after its send (Raft's or learnt), is answered by that send", async () => {
+  // Raft gives no DM at the listing (it does not exist yet); the model sends; by the turn's end Raft gives it.
+  const a = await assistant(raft({ dm: null }));
+  must(a.read(ASSISTANT_STORE, OWNER_KEY).dmTarget === null && a.read(ASSISTANT_STORE, OWNER_KEY).learnedDm === null, "control: no DM known");
+  await raftPlugin.invoke("messages_send", { target: "dm:@ada", content: "Here's what's waiting: ..." }, a.ctx);
+  a.r.dm = "dm:@ada~human";
+  await raftPlugin.snapshotTools!(a.ctx);
+  must(a.read(ASSISTANT_STORE, OWNER_KEY).dmTarget === "dm:@ada~human", "control: the DM is known by the turn's end");
+  await afterTurn(a.ctx, ended("t1"));
+  must(a.r.sends.length === 1 && fallbackRows(a).length === 0, `the send was not counted: ${show(a.r.sends)}`);
+  // The next turn starts unanswered: what the first turn sent is not carried over.
+  await afterTurn(a.ctx, ended("t2"));
+  must(a.r.sends.length === 2 && a.r.sends[1].target === "dm:@ada~human" && a.r.sends[1].content === TEXT, `the next turn: ${show(a.r.sends)}`);
+  // The same, the DM learnt (no Raft DM) from the owner's message after the send.
+  const b = await assistant(raft({ dm: null }));
+  await raftPlugin.invoke("messages_send", { target: "dm:@ada", content: "Here's what's waiting: ..." }, b.ctx);
+  b.r.events.push({ id: "33333333-0000-4000-8000-000000000001", seq: 1, content: "thanks", sender_type: "human", sender_id: OWNER,
+    sender_name: "ada", timestamp: "2026-10-20T09:12:00Z", channel_name: "ada", channel_type: "dm" });
+  await raftPlugin.invoke("receive_events", {}, b.ctx);
+  must(b.read(ASSISTANT_STORE, OWNER_KEY).learnedDm === "dm:@ada", `control: learnt ${show(b.read(ASSISTANT_STORE, OWNER_KEY))}`);
+  await afterTurn(b.ctx, ended("t1"));
+  must(b.r.sends.length === 1 && fallbackRows(b).length === 0, `learnt after the send: ${show(b.r.sends)}`);
+  // Control: a turn that sent nothing on a new assistant still gets its closing text sent, once the DM is known.
+  const c = await assistant(raft({ dm: null }));
+  c.r.dm = "dm:@ada~human";
+  await raftPlugin.snapshotTools!(c.ctx);
+  await afterTurn(c.ctx, ended("t1"));
+  must(c.r.sends.length === 1 && c.r.sends[0].target === "dm:@ada~human" && c.r.sends[0].content === TEXT && fallbackRows(c).length === 1, `no send: ${show(c.r.sends)}`);
+});
+
+await check("reply fallback: none after a send as the owner that was posted or is uncertain (Raft's receipt is the answer); a refused one still gets it", async () => {
+  for (const [answer, fallback] of [[{ status: 200, code: null }, false], ["drop", false], [{ status: 500, code: "agent_api_assistant_send_as_owner_failed" }, false],
+    [{ status: 403, code: "assistant_send_as_owner_off" }, true]] as const) {
+    const a = await assistant(raft({ dm: "dm:@ada~human" }));
+    a.r.asOwnerAnswer = answer as never;
+    await asOwner(a, { target: conv(1).channelId, content: "Friday works for me." });
+    must(a.r.asOwner.length === 1, `control: one post: ${show(a.r.asOwner)}`);
+    await afterTurn(a.ctx, ended("t1"));
+    must((a.r.sends.length === 1) === fallback && fallbackRows(a).length === (fallback ? 1 : 0), `${show(answer)}: ${show(a.r.sends)}`);
+    // The next turn starts unanswered.
+    await afterTurn(a.ctx, ended("t2"));
+    must(a.r.sends.length === (fallback ? 2 : 1) && a.r.sends.at(-1)?.content === TEXT, `${show(answer)}, the next turn: ${show(a.r.sends)}`);
+  }
+});
+
+await check("reply fallback end to end: Raft's `dm:@ada~human` and the model's `dm:@ada` send: nothing sent twice; a send as the owner: no confirmation of ours", async () => {
+  let sent = false;
+  const w = await runtimeWith(true, () => sent ? say("I've sent your owner the rundown.") : (sent = true, { text: "", finishReason: "tool_calls", truncated: false, usage,
+    toolCalls: [{ id: "m1", name: "raft__messages_send", arguments: { target: "dm:@ada", content: "Nothing waiting on you." } }] } as ModelResponse));
+  try {
+    w.db.write(ASSISTANT_STORE, OWNER_KEY, { ...w.db.read(ASSISTANT_STORE, OWNER_KEY), dmTarget: "dm:@ada~human" });
+    await w.turn("anything for me?");
+    must(sent && w.r.sends.length === 1 && w.r.sends[0].content === "Nothing waiting on you.", `sends: ${show(w.r.sends)}`);
+  } finally { w.host.dispose(); }
+  let posted = false;
+  const v = await runtimeWith(true, () => posted ? say("Posted it in #ch1.") : (posted = true, { text: "", finishReason: "tool_calls", truncated: false, usage,
+    toolCalls: [{ id: "s1", name: "raft__assistant_send_as_owner", arguments: { target: conv(1).channelId, content: "Friday works for me." } }] } as ModelResponse));
+  try {
+    await v.turn("tell #ch1 Friday works");
+    must(posted && v.r.asOwner.length === 1 && v.r.sends.length === 0, `sends: ${show(v.r.sends)} asOwner: ${show(v.r.asOwner)}`);
+  } finally { v.host.dispose(); }
+});
+
 const failed = results.filter((r) => !r.ok);
 for (const r of results) console.log(`  ${r.ok ? "\x1b[32m✓\x1b[0m" : "\x1b[31m✗\x1b[0m"} ${r.name}${r.ok ? "" : `\n      \x1b[31m${r.error}\x1b[0m`}`);
 console.log("  ────────────────────────────────────────────────────────");
