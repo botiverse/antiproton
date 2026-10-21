@@ -204,61 +204,91 @@ SELECT action, raft_agent_id, acting_raft_user_id, acting_role, at FROM connecto
 The log has a `connect.reconnect` line with `connectorId`, `actingRole` and how many agents were `updated` or
 `failed`. A failed agent takes the pair from the connector on its next GitHub call.
 
-## Forwarding github.refresh rows
+## Forwarding trace rows
 
-The `github.refresh` trace rows (above, "In the trace") can be forwarded to Raft's trace-upload worker, so a renewal's
-outcome can be alerted on from the trace instead of from Workers Logs, which drops an object's lines (#980). The
-worker writes them as OTLP logs to `otel.logs`; antiproton only posts to it (cf/src/github-refresh-forward.ts).
+Some trace rows can be forwarded to Raft's trace-upload worker, which writes them as OTLP logs to `otel.logs`;
+antiproton only posts to it (cf/src/trace-forward.ts). There are two lanes, each with its own route, queue, cursor,
+backoff and counts:
+
+- **`github.refresh`**: the `github.refresh` rows (above, "In the trace"), so a renewal's outcome can be alerted on from
+  the trace instead of from Workers Logs, which drops an object's lines (#980). Route `/api/external/github-refresh`.
+- **`agent.trace`**: `model.call`, `model.attempt`, `tool.call`, `tool.refused`, `turn.timing`, `turn.stop`,
+  `raft.assistant_wake`, `raft.assistant_notify` and `raft.turn_ended`, so a turn's timing, its model attempts and an
+  assistant's wakes can be read next to Raft's own telemetry. Route `/api/external/antiproton-trace`
+  (botiverse/slock#10530); the rows land as `antiproton.<kind>`.
 
 **It is off** unless both of these are set on the deployment; with either missing nothing is sent, nothing is staged and
 no table is made:
 
-- the Worker **var** `GITHUB_REFRESH_INGEST_URL`: the worker's base URL, without a path (the code appends
-  `/api/external/github-refresh`);
-- the Worker **secret** `GITHUB_REFRESH_INGEST_TOKEN`: a dedicated write-only bearer token for that endpoint, never in
-  a wrangler config or the repository. It is not a ScopeDB key: antiproton never talks to ScopeDB.
+- the Worker **var** `TRACE_INGEST_URL`: the worker's base URL, without a path (the code appends each lane's route);
+- the Worker **secret** `TRACE_INGEST_TOKEN`: the dedicated write-only bearer token, one for both routes, never in a
+  wrangler config or the repository. It is not a ScopeDB key: antiproton never talks to ScopeDB.
+
+`GITHUB_REFRESH_INGEST_URL` and `GITHUB_REFRESH_INGEST_TOKEN`, their earlier names, are still read when the new ones
+are unset (an empty value counts as unset), so a deployment set up with them keeps working; set the new names and then
+delete the old. Both lanes run on the same settings: there is no switch for one lane alone. A receiver that does not
+have a lane's route yet answers 404, which pauses that lane only (below).
 
 `DEPLOYMENT_ENV` (`production` in cf/wrangler.jsonc, `preview` in cf/wrangler.preview.jsonc) is what each row says in
 `env`; a deployment without it forwards nothing.
 
-**What is sent.** On each alarm pass, rows of kind `github.refresh` only (`FORWARD_KINDS`, one entry), every outcome
-(`rotated`, `adopted`, `broken`, `unavailable`, `store-failed`, `kept-unstored`, `interrupted-before`,
-`propagate-failed`), as `POST <base>/api/external/github-refresh` with `Authorization: Bearer <token>` and the body
-`{"rows":[…]}`, at most 500 rows a request. Each row has exactly these fields and no other: `at` (ISO 8601), `tenant_id`,
+**What is sent, `github.refresh`.** Rows of kind `github.refresh` only, every outcome (`rotated`, `adopted`, `broken`,
+`unavailable`, `store-failed`, `kept-unstored`, `interrupted-before`, `propagate-failed`), as
+`POST <base>/api/external/github-refresh`. Each row has exactly these fields and no other: `at` (ISO 8601), `tenant_id`,
 `agent_id`, `seq`, `env`, `outcome`, `scope`, `connector_id`, `mount`, `why`, `attempt`, `stored`, `reason_code`; an
 attr the row does not have is `null`. No span id, no verdict, no other attr, no token and no reason text. A row's
 identity is (`tenant_id`, `agent_id`, `seq`), the same on every resend, and the receiver dedupes on it.
 
+**What is sent, `agent.trace`.** Rows of the nine kinds above only, as `POST <base>/api/external/antiproton-trace`.
+Each row has an envelope (`seq`, `at`, `kind`, `tenant_id`, `agent_id`, `span_id`, `env`, and when there are ones that
+fit, `status`, `verdict`, `ms`) and then its kind's fields, each named and typed in `AGENT_TRACE_FIELDS` and built from
+one attr; an attr that is not a field there is never sent, and a field whose value is not the receiver's shape (an id,
+a lowercase code, a listed value, a non-negative integer, a boolean) is left out rather than sent. So no message text,
+prompt, tool argument, error sentence, rule or conversation name leaves: a `tool.call` row's `error` (the tool's own
+sentence), a `model.call`'s `limit`, a wake's `error` are never fields. Codes are written lowercase (`toolUse` is
+`tool_use`, `NOT_FOUND` is `not_found`); a span id with a character the receiver refuses (an OpenAI tool call id's `|`)
+has it replaced by `_`. A row whose tenant, agent or span cannot be written as an id is not sent but counted
+(`unsendable`), since the receiver would refuse its whole batch. The receiver keys a row by
+(`tenant_id`, `agent_id`, `span_id`, `kind`[, `attempt`]) and drops any field it does not take; some fields here are
+ones it does not take yet (marked `proposed` in the code).
+
+**Both lanes.** At most 500 rows and 256 KiB a request (the receiver takes 500 rows, and 256 KiB on github-refresh,
+512 KiB on antiproton-trace), `Authorization: Bearer <token>`, the body `{"rows":[…]}`.
+
 **What an answer does.** 2xx: sent. 413: the batch is halved until it fits; one row still too large is dropped
 (`too-large`). 400 or 422: the batch is dropped (`schema`). 401, 403 or 404 (the receiver answers 404 while it is
-switched off): forwarding pauses with the rows kept (`auth_or_off`). 408, 429, 5xx or no answer: kept (`unavailable`).
-No answer includes none within 10 s: every request, each half of a 413 split included, is aborted then, because the
-send runs inside the agent's alarm pass, and the pass sends no further batch after it. Any other 4xx: dropped (`rejected`). A kept batch is tried again on the first alarm pass after a backoff of a minute,
-doubling to an hour, and a success clears it. A failure never fails the pass, never delays the R2 export, and asks for
-no extra pass: an idle agent's waiting rows go on its next pass.
+switched off, or has no such route): the lane pauses with the rows kept (`auth_or_off`). 408, 429, 5xx or no answer:
+kept (`unavailable`). No answer includes none within 10 s: every request, each half of a 413 split included, is aborted
+then, because the send runs inside the agent's alarm pass, and the lane sends no further batch in that pass. Any other
+4xx: dropped (`rejected`). A kept batch is tried again on the first alarm pass after a backoff of a minute, doubling to
+an hour, and a success clears it; each lane has its own. A failure never fails the pass, never delays the R2 export,
+and asks for no extra pass: an idle agent's waiting rows go on its next pass.
 
-The rows wait in the object's own queue (`ghr_forward_queue`), copied from the outbox before the export runs, so a
-paused forward never holds the outbox or the export. The queue keeps at most 5,000 rows; past that the oldest are
-dropped (`lost`).
+The rows wait in the lane's own queue in the object (`ghr_forward_queue`, `atr_forward_queue`), copied from the outbox
+before the export runs, so a paused lane never holds the outbox or the export. Each queue keeps at most 5,000 rows;
+past that the oldest are dropped (`lost`).
 
 **Turning it on, preview first.**
 
-1. `wrangler secret put GITHUB_REFRESH_INGEST_TOKEN --config cf/wrangler.preview.jsonc` (the preview token), then add
-   `"GITHUB_REFRESH_INGEST_URL": "<staging worker's base URL>"` to `vars` in `cf/wrangler.preview.jsonc` and deploy the
-   preview. It is a var in the config rather than one set in the dashboard, because a deploy replaces the dashboard's
-   vars with the config's.
-2. Make a renewal happen on a preview agent with an expiring GitHub token, or wait for one.
-3. Check it: `GET $HOST/admin/diagnose?tenantId=<tenantId>&agentId=<agentId>` has `githubRefreshForward`: `stagedThrough` moving, `queued` 0,
-   `backoff` null and nothing in `recent` (or the reasons it was not sent: `auth_or_off` with 401 is the token, with
-   404 the receiver switched off). Workers Logs has `github.refresh.forward` lines (`result` `sent`, `kept` or
-   `dropped`, with `reason` and `status`; never the URL or the token), though the object's lines can be dropped
-   (above). On the receiving side, the rows are in `otel.logs` with `env` `preview`.
+1. Deploy the worker side first (botiverse/slock#10530 for `agent.trace`), with its token. Then
+   `wrangler secret put TRACE_INGEST_TOKEN --config cf/wrangler.preview.jsonc` (the preview token), add
+   `"TRACE_INGEST_URL": "<staging worker's base URL>"` to `vars` in `cf/wrangler.preview.jsonc` and deploy the preview.
+   It is a var in the config rather than one set in the dashboard, because a deploy replaces the dashboard's vars with
+   the config's.
+2. Let a preview agent take a turn (and, for `github.refresh`, make a renewal happen or wait for one).
+3. Check it: `GET $HOST/admin/diagnose?tenantId=<tenantId>&agentId=<agentId>` has `githubRefreshForward` and
+   `agentTraceForward`, each with `stagedThrough` moving, `queued` 0, `backoff` null and nothing in `recent` (or the
+   reasons it was not sent: `auth_or_off` with 401 is the token, with 404 the receiver switched off or without the
+   route; `unsendable` a row with an id the receiver would refuse). Workers Logs has `github.refresh.forward` and
+   `trace.forward` lines (`result` `sent`, `kept`, `dropped` or `retry`, with `reason` and `status`; never the URL or
+   the token), though the object's lines can be dropped (above). On the receiving side, the rows are in `otel.logs`
+   with `env` `preview`.
 4. Then the same for production: the secret with `--config cf/wrangler.jsonc`, the var in `cf/wrangler.jsonc`.
 
-**Turning it off.** `wrangler secret delete GITHUB_REFRESH_INGEST_TOKEN --config <that deployment's config>` (immediate),
-or remove the `GITHUB_REFRESH_INGEST_URL` var and deploy. From the next pass nothing
-is staged or sent; whatever an object had queued stays in its queue, untouched, and goes out if it is turned back on.
-Nothing else changes: the R2 export carries every row either way.
+**Turning it off.** `wrangler secret delete TRACE_INGEST_TOKEN --config <that deployment's config>` (and the old
+`GITHUB_REFRESH_INGEST_TOKEN` if it is still set; immediate), or remove the URL var and deploy. From the next pass
+nothing is staged or sent; whatever an object had queued stays in its queues, untouched, and goes out if it is turned
+back on. Nothing else changes: the R2 export carries every row either way.
 
 ## Trying conversation cards on an agent
 

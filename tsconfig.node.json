@@ -71,7 +71,7 @@
     "test/provision.ts",
     "test/connect.ts",
     "test/activity-flush.ts",
-    "test/github-refresh-forward.ts",
+    "test/trace-forward.ts",
     "test/provision-runtime.ts",
     "test/github-token-refresh.ts",
     "test/agent-surface.ts",

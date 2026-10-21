@@ -49,11 +49,13 @@
       { "queue": "antiproton-model-dlq", "max_batch_size": 10, "max_batch_timeout": 5 }
     ]
   },
-  // Forwarding `github.refresh` trace rows to Raft's trace-upload worker (cf/src/github-refresh-forward.ts) is off
-  // until BOTH of these are set, and neither is set yet: the Worker var GITHUB_REFRESH_INGEST_URL (the worker's base
-  // URL; the code appends /api/external/github-refresh), to be added to "vars" below once the URL is known, and the
-  // Worker secret GITHUB_REFRESH_INGEST_TOKEN (its dedicated write-only bearer token, never written here:
-  // `wrangler secret put GITHUB_REFRESH_INGEST_TOKEN --config cf/wrangler.jsonc`). docs/runbook.md, "Forwarding github.refresh rows".
+  // Forwarding trace rows to Raft's trace-upload worker (cf/src/trace-forward.ts: `github.refresh` rows and the
+  // agent-trace kinds) is off until BOTH of these are set, and neither is set yet: the Worker var TRACE_INGEST_URL (the
+  // worker's base URL; the code appends /api/external/github-refresh and /api/external/antiproton-trace), to be added to
+  // "vars" below once the URL is known, and the Worker secret TRACE_INGEST_TOKEN (its dedicated write-only bearer token,
+  // one for both routes, never written here: `wrangler secret put TRACE_INGEST_TOKEN --config cf/wrangler.jsonc`).
+  // GITHUB_REFRESH_INGEST_URL / GITHUB_REFRESH_INGEST_TOKEN, their earlier names, still work when these are unset.
+  // docs/runbook.md, "Forwarding trace rows".
   "vars": {
     "DEEPSEEK_BASE_URL": "https://api.deepseek.com",
     // The window is looked up from this name rather than configured beside it:
@@ -103,8 +105,8 @@
     // secret of the same name would outlive a deploy that changed these.
     "RUN9_WARN_MINUTES": "5",
     "RUN9_MAX_IDLE_MINUTES": "30",
-    // Which deployment this is: what a forwarded `github.refresh` row says in its `env` column
-    // (cf/src/github-refresh-forward.ts).
+    // Which deployment this is: what a forwarded trace row says in its `env` field
+    // (cf/src/trace-forward.ts).
     "DEPLOYMENT_ENV": "production"
   },
   // Once a day, 03:17 UTC: the usage ledger's retention, whole days of
