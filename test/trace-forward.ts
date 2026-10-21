@@ -10,7 +10,7 @@ import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { appendTrace, pendingTrace, type TraceRow } from "../src/trace/outbox.ts";
 import { flushActivityThenTrace } from "../cf/src/activity-raft.ts";
 import {
-  FORWARD_BACKOFF_BASE_MS, FORWARD_BATCH_MAX, FORWARD_TIMEOUT_MS, FORWARD_COLUMNS, FORWARD_KINDS, forwardConfigOf, forwardCursor, forwardPass, forwardRow,
+  FORWARD_BACKOFF_BASE_MS, FORWARD_BATCH_MAX, FORWARD_PASS_REQUESTS, FORWARD_PASS_MS, FORWARD_TIMEOUT_MS, FORWARD_COLUMNS, FORWARD_KINDS, forwardConfigOf, forwardCursor, forwardPass, forwardRow,
   ingestRequest, sendForward, stageForward, forwardSettingsOf, GITHUB_REFRESH_LANE, AGENT_TRACE_LANE, AGENT_TRACE_KINDS, AGENT_TRACE_FIELDS, FORWARD_BATCH_BYTES,
   type ForwardConfig, type ForwardRow,
 } from "../cf/src/trace-forward.ts";
@@ -174,8 +174,13 @@ await check("a 413 splits the batch in half until it fits; a single row still to
   const e = endpoint((rows) => rows.length > 2 || rows.some((r) => r.seq === 4) ? 413 : 200);
   appendTrace(sql, Array.from({ length: 7 }, (_, i) => refresh(i + 1)));
   const { forwarded } = await pass(sql, e, r2());
-  must(sent(e).map((r) => r.seq).join(",") === "1,2,3,5,6,7", `accepted: ${sent(e).map((r) => r.seq)}`);
-  must(forwarded!.sent === 6 && forwarded!.dropped === 1 && forwarded!.error === null && queued(sql).length === 0, JSON.stringify(forwarded));
+  // 1-7, 1-4, 1-2, 3-4, 3, 4, 5-7, 5-6: the pass's eight requests (FORWARD_PASS_REQUESTS). Row 7 waits, kept, no backoff.
+  must(e.requests.length === FORWARD_PASS_REQUESTS, `requests: ${e.requests.length}`);
+  must(sent(e).map((r) => r.seq).join(",") === "1,2,3,5,6", `accepted: ${sent(e).map((r) => r.seq)}`);
+  must(forwarded!.sent === 5 && forwarded!.dropped === 1 && forwarded!.error === null && forwarded!.stopped === "budget"
+    && JSON.stringify(queued(sql)) === "[7]", JSON.stringify(forwarded));
+  const next = (await pass(sql, e, r2())).forwarded!;
+  must(sent(e).map((r) => r.seq).join(",") === "1,2,3,5,6,7" && next.sent === 1 && next.stopped === undefined && queued(sql).length === 0, JSON.stringify(next));
   must(JSON.stringify(dropsOf(sql)) === JSON.stringify([{ reason: "too-large", status: 413, rows: 1 }]), JSON.stringify(dropsOf(sql)));
   must(e.requests.every((r) => r.headers["content-length"] === String(r.bytes)), "a split request lost its Content-Length");
 });
@@ -388,7 +393,7 @@ console.log(`\n  agent.trace forward\n  ${"─".repeat(56)}`);
 
 /**
  * The receiver's fields per kind and their types, as the trace-upload worker's `antiprotonTrace.ts`
- * (`ANTIPROTON_TRACE_KINDS`) has them at botiverse/slock 2d91205. Pinned here so a drift on either side shows.
+ * (`ANTIPROTON_TRACE_KINDS`) has them at botiverse/slock 240303c6 (#10611). Pinned here so a drift on either side shows.
  * `mount_index` is this side's envelope (any row about a mount), so it is checked apart from the kind's fields.
  */
 const ENUM = (...v: string[]) => v.join("|");
@@ -406,48 +411,42 @@ const WORKER_FIELDS: Record<string, Record<string, string>> = {
     first_call_cached_tokens: "count", client_wait_ms: "count", client_pauses: "count", prep_ms: "count" },
   "turn.stop": { trigger: "code", turn: "id" },
   "raft.assistant_wake": { mount_index: "count",
-    result: ENUM("skipped_empty", "skipped_filtered", "invoked", "unreadable", "paused", "night_deferred", "failed", "inbox_lagging"),
+    result: ENUM("skipped_empty", "skipped_filtered", "invoked", "unreadable", "paused", "night_deferred", "failed", "inbox_lagging", "check_refused", "skipped_no_check"),
     trigger: "code", conversations: "count", candidates: "count", seen: "count", unreadable: "count", lag_retry: "count", caught_up: "bool",
     caught_up_via: ENUM("unread", "all", "mixed"), caught_up_rule: ENUM("seq", "time"), muted: "count", told: "count", held: "count", said: "count",
-    inbox_lagging_gave_up: "count" },
-  "raft.assistant_notify": { mount_index: "count", state: ENUM("sent", "nothing_to_send", "kept_for_brief", "not_sent"), items_in: "count", items_sent: "count", dropped: "count",
-    dropped_already_told: "count", dropped_rule: "count", dropped_not_confirmed: "count", dropped_decisions_in_brief: "count", dropped_other: "count" },
-  "raft.assistant_rules": { action: ENUM("add", "mute", "unmute", "remove", "list", "quiet", "timezone", ""), result: "code",
+    inbox_lagging_gave_up: "count", check_id: "id", raft_check: "bool",
+    reason: ENUM("malformed", "version", "instruction_too_large", "no_notify", "raft_check_off", "engine_pd_unsupported"),
+    instruction_bytes: "count", tools_offered: "count", tools_dropped: "count", placeholders_unknown: "count", placeholders_unoffered: "count",
+    items: "count", truncated: "count", skipped: "count", digest: "count", always: "count", dm: "count", mention: "count", thread: "count",
+    named: "count", default_out: "count", night_held: "count",
+    error_code: ENUM("inbox_refused", "inbox_shape", "not_enabled", "unexpected"), http_status: "count" },
+  "raft.assistant_check": { mount_index: "count", check_id: "id", trigger: ENUM("doorbell", "brief"), outcome: ENUM("completed", "failed", "cancelled"),
+    error_code: "code", attempts: "count", http_status: "count", code: "code" },
+  "raft.assistant_notify": { mount_index: "count", state: ENUM("sent", "duplicate", "nothing_to_send", "kept_for_brief", "not_sent", "unknown"),
+    items_in: "count", items_sent: "count", dropped: "count", dropped_already_told: "count", dropped_rule: "count", dropped_not_confirmed: "count",
+    dropped_decisions_in_brief: "count", dropped_other: "count", dropped_not_in_check: "count", held_back: "count", kept_for_brief: "count",
+    check_id: "id", trigger: ENUM("doorbell", "brief"), forwarded: "count", code: "code", http_status: "count" },
+  "raft.assistant_rules": { mount_index: "count", action: ENUM("add", "mute", "unmute", "remove", "list", "quiet", "timezone", "other", ""),
+    via: ENUM("raft"), left: "count", code: "code", result: "code",
     effect: ENUM("mute", "always", "digest"), scope: ENUM("channel", "thread", "person", "kind", "dms"), removed: "count", rules_total: "count",
     ...RULE_COUNT_FIELDS },
-  "raft.assistant_chat_told": { told: "count", reply_fallback: "count", failed_turn: "count", result: ENUM("sent", "held", "failed"), code: "code" },
-  "raft.assistant_send_as_owner": { result: "code", target_kind: ENUM("message", "channel", "dm", "channel_id"), in_thread: "bool", chars: "count",
-    http_status: "count" },
+  "raft.assistant_chat_told": { mount_index: "count", told: "count", reply_fallback: "count", failed_turn: "count", result: ENUM("sent", "held", "failed"), code: "code",
+    refs: "count", skipped: "count", forwarded: "count", http_status: "count" },
+  "raft.assistant_send_as_owner": { result: "code", mount_index: "count", target_kind: ENUM("message", "channel", "dm", "channel_id", "other"), in_thread: "bool",
+    chars: "count", http_status: "count" },
   "raft.turn_ended": { mount_index: "count", result: ENUM("settled", "skipped", "unreadable"), reason: "code", conversations: "count", outcome: ENUM("completed", "interrupted", "failed") },
-};
-/**
- * What this side sends that the receiver does not keep yet, by the receiver's types: new kinds, new fields, and enums
- * widened (a value outside the receiver's list is dropped by it, the row kept). The field table sent to the receiving
- * side is this; when the receiver takes an entry, it moves to WORKER_FIELDS.
- */
-const PROPOSED: Record<string, Record<string, string>> = {
   "turn.end_unrecorded": { stage: ENUM("read", "record"), error_class: "id" },
   "rebuild.outcome": { decision: "id", trigger: ENUM("window", "cold-wake", "operator"), strategy: ENUM("summary", "briefing"),
     agreement: ENUM("agree", "false-cold", "false-warm", "expected-cold", "unmeasured"), would_rebuild: "bool", predicted_cold: "bool",
     expected_cold: "bool", measured_cold: "bool", input: "count", cache_read: "count", since_decision_ms: "count" },
-  "raft.assistant_wake": {
-    result: ENUM("skipped_empty", "skipped_filtered", "invoked", "unreadable", "paused", "night_deferred", "failed", "inbox_lagging", "check_refused", "skipped_no_check"),
-    error_code: ENUM("inbox_refused", "inbox_shape", "not_enabled", "unexpected"), http_status: "count",
-    check_id: "id", raft_check: "bool",
-    reason: ENUM("malformed", "version", "instruction_too_large", "no_notify", "raft_check_off", "engine_pd_unsupported"),
-    instruction_bytes: "count", tools_offered: "count", tools_dropped: "count", placeholders_unknown: "count", placeholders_unoffered: "count",
-    items: "count", truncated: "count", skipped: "count", digest: "count", always: "count", dm: "count", mention: "count", thread: "count",
-    named: "count", default_out: "count", night_held: "count" },
-  "raft.assistant_check": { mount_index: "count", check_id: "id", trigger: ENUM("doorbell", "brief"), outcome: ENUM("completed", "failed", "cancelled"),
-    error_code: "code", attempts: "count", http_status: "count", code: "code" },
-  "raft.assistant_notify": { state: ENUM("sent", "duplicate", "nothing_to_send", "kept_for_brief", "not_sent", "unknown"),
-    held_back: "count", kept_for_brief: "count", dropped_not_in_check: "count", check_id: "id", trigger: ENUM("doorbell", "brief"),
-    forwarded: "count", code: "code", http_status: "count" },
-  "raft.assistant_chat_told": { mount_index: "count", refs: "count", skipped: "count", forwarded: "count", http_status: "count" },
-  "raft.assistant_rules": { mount_index: "count", action: ENUM("add", "mute", "unmute", "remove", "list", "quiet", "timezone", "other"),
-    via: ENUM("raft"), left: "count", code: "code" },
-  "raft.assistant_send_as_owner": { mount_index: "count", target_kind: ENUM("message", "channel", "dm", "channel_id", "other") },
 };
+/**
+ * What this side sends that the receiver does not keep yet, by the receiver's types: new kinds, new fields, and enums
+ * widened (a value outside the receiver's list is dropped by it, the row kept). The field table sent to the receiving
+ * side is this; when the receiver takes an entry, it moves to WORKER_FIELDS. Empty: botiverse/slock#10611 took every
+ * entry it had.
+ */
+const PROPOSED: Record<string, Record<string, string>> = {};
 /** The receiver's fields once PROPOSED lands: what this side's fields are pinned to. */
 const CONTRACT: Record<string, Record<string, string>> = Object.fromEntries([...new Set([...Object.keys(WORKER_FIELDS), ...Object.keys(PROPOSED)])]
   .map((k) => [k, { ...WORKER_FIELDS[k], ...PROPOSED[k] }]));
@@ -707,7 +706,9 @@ await check("the fields per kind are the receiver's names and types, or narrower
       if (mine === undefined) { unfilled.push(`${kind}.${f}`); continue; }
       // `flag`: a boolean attr sent as the 1 or 0 the receiver's count takes (a wake's inbox_lagging_gave_up).
       const ok = Array.isArray(mine)
-        ? mine.join("|") === type || (type === "id" && mine.every((v) => RECEIVER_ID.test(v))) || (type === "code" && mine.every((v) => RECEIVER_CODE.test(v)))
+        // A list here: the receiver's own list, or a part of it (the receiver keeps a rules action `""` this side never writes).
+        ? mine.join("|") === type || (type.includes("|") && mine.every((v) => type.split("|").includes(v)))
+          || (type === "id" && mine.every((v) => RECEIVER_ID.test(v))) || (type === "code" && mine.every((v) => RECEIVER_CODE.test(v)))
         : mine === "flag" ? type === "count"
         : mine === "session" || mine === "turn" || mine === "task" || mine === "mount" || mine === "check" || mine === "minted" ? type === "id"
         : mine === type;
@@ -844,6 +845,96 @@ await check("a value not in its field's shape is left out, never rewritten; a sp
   must(!("span_id" in b) && b.from === undefined && b.code === "No_Tools", JSON.stringify(b));
   must(!("span_id" in d) && d.seq === 4 && d.error_class === undefined && d.trigger === "admin_cancel", JSON.stringify(d));
   must(JSON.stringify(atrLog(sql)) === JSON.stringify([{ reason: "unsendable", status: null, rows: 1 }]), JSON.stringify(atrLog(sql)));
+});
+
+await check("a receiver that answers 413 to everything gets at most FORWARD_PASS_REQUESTS requests a pass; the rest stays queued, with no backoff", async () => {
+  must(FORWARD_PASS_REQUESTS === 8 && FORWARD_PASS_MS === 2_000, `the pass budget is ${FORWARD_PASS_REQUESTS} requests, ${FORWARD_PASS_MS} ms`);
+  const { sql } = sqliteHost(); const e = endpoint(() => 413);
+  appendTrace(sql, Array.from({ length: 40 }, (_, i) => refresh(i + 1)));
+  stageForward(sql, CFG, OWNER.tenantId, OWNER.agentId);
+  const r = await within(2_000, sendForward(sql, CFG, OWNER.tenantId, OWNER.agentId, e.fetch, () => T0));
+  // 1-40, 1-20, 1-10, 1-5, 1-3, 1-2, 1, 2: the split down to single rows, two of them dropped as too large.
+  must(e.requests.length === FORWARD_PASS_REQUESTS, `requests in one pass: ${e.requests.length}`);
+  must(r.dropped === 2 && r.kept === 38 && r.error === null && r.stopped === "budget" && queued(sql)[0] === 3, JSON.stringify({ r, q: queued(sql).length }));
+  // Not a failure: the next pass is not held back, and carries on where this one stopped, with its own eight.
+  const next = await within(2_000, sendForward(sql, CFG, OWNER.tenantId, OWNER.agentId, e.fetch, () => T0));
+  must(next.skipped === undefined && e.requests.length === 2 * FORWARD_PASS_REQUESTS && next.stopped === "budget", JSON.stringify(next));
+  // Through the pass, each lane has its own eight: both lanes answered 413 throughout, sixteen requests in all.
+  const both = routes(() => 413); const sql2 = sqliteHost().sql;
+  appendTrace(sql2, [...Array.from({ length: 40 }, (_, i) => refresh(i + 1)), ...Array.from({ length: 40 }, (_, i) => model(i + 41))]);
+  const p = await lanePass(sql2, both);
+  must(both.requests.filter((q) => q.path === GHR_PATH).length === FORWARD_PASS_REQUESTS
+    && both.requests.filter((q) => q.path === TRACE_PATH).length === FORWARD_PASS_REQUESTS, `requests: ${both.requests.map((q) => q.path)}`);
+  must(p.forwarded!["github.refresh"]!.stopped === "budget" && p.forwarded!["agent.trace"]!.stopped === "budget", JSON.stringify(p.forwarded));
+});
+
+await check("a pass's sending ends at its time budget, every lane together: a hung receiver costs it the budget, not the timeout, and what is left stays queued", async () => {
+  // The github.refresh route hangs, deaf to its signal; the agent.trace route would answer at once.
+  const { sql } = sqliteHost();
+  const h = hanging(() => true, () => 200, true);
+  const fetchFn = (url: string, init: RequestInit) => url.endsWith(GHR_PATH) ? h.fetch(url, init) : Promise.resolve(new Response(null, { status: 200 }));
+  appendTrace(sql, [refresh(1), model(2)]);
+  const f = forwardPass(ENV, sql, OWNER.tenantId, OWNER.agentId, fetchFn, undefined, 400);
+  f.before();
+  const started = Date.now();
+  const out = await within(3_000, f.after());
+  const took = Date.now() - started;
+  must(took >= 350 && took < 1_000, `the send took ${took} ms with a 400 ms budget (the timeout is ${FORWARD_TIMEOUT_MS} ms)`);
+  // The hung request is cut at the budget and counted as no answer, backed off as a timeout is; the other lane, with
+  // no time left to start a request, keeps its row for the next pass and is not backed off.
+  must(out!["github.refresh"]!.error === "network: TimeoutError" && queued(sql).join(",") === "1", JSON.stringify(out));
+  must(out!["agent.trace"]!.stopped === "budget" && out!["agent.trace"]!.error === null && ATR(sql).join(",") === "2", JSON.stringify(out));
+  // A slow receiver, every answer in 150 ms: the budget stops the batches, the rest wait.
+  const { sql: sql3 } = sqliteHost(); let n = 0;
+  const slow = async () => { n++; await new Promise((res) => setTimeout(res, 150)); return new Response(null, { status: 200 }); };
+  // Four batches: one stage reads at most 2,000 outbox rows.
+  appendTrace(sql3, Array.from({ length: FORWARD_BATCH_MAX * 4 }, (_, i) => refresh(i + 1)));
+  const g = forwardPass(ENV, sql3, OWNER.tenantId, OWNER.agentId, slow, [GITHUB_REFRESH_LANE], 400);
+  g.before();
+  const t0 = Date.now();
+  const r = (await within(3_000, g.after()))!["github.refresh"]!;
+  must(Date.now() - t0 < 700 && n >= 1 && n < 4, `${n} requests in ${Date.now() - t0} ms`);
+  must(r.error === null && r.stopped === "budget" && r.sent === n * FORWARD_BATCH_MAX && queued(sql3).length === (4 - n) * FORWARD_BATCH_MAX, JSON.stringify(r));
+});
+
+await check("a session, task or turn not in a shape this side mints is left out, and an envelope status that is not a code; the minted shapes pass", async () => {
+  const { sql } = sqliteHost(); const e = routes();
+  appendTrace(sql, [
+    // Each is a valid receiver `id` (or `code`), but a name, not a minted id: the id shape alone would send it.
+    { at: T0, ...OWNER, kind: "model.call", spanId: "mj_0123abcd", status: "stop", verdict: "ok", attrs: { model: "m", session: "alice", turn: "tt_alice@1" } },
+    { at: T0 + 1, ...OWNER, kind: "tool.call", spanId: "op_0123abcd", status: "failed: the tool said no", verdict: "failed", attrs: { tool: "x", task: "general" } },
+    { at: T0 + 2, ...OWNER, kind: "tool.call", spanId: "op_0123abce", status: "two words", verdict: "failed", attrs: { tool: "x", task: "general.1" } },
+    // The control: the same fields in the shapes this side mints.
+    { at: T0 + 3, ...OWNER, kind: "model.call", spanId: "mj_0123abcf", status: "stop", verdict: "ok", attrs: { model: "m", session: "sess_0123abcd", turn: "tt_main.2@1790000000000" } },
+    { at: T0 + 4, ...OWNER, kind: "tool.call", spanId: "op_0123abd0", status: "succeeded", verdict: "ok", attrs: { tool: "x", task: "sub_0123abcd" } },
+  ]);
+  await lanePass(sql, e);
+  const [a, b, c, d, f] = traced(e);
+  must(a && a.session === undefined && a.turn === undefined && a.model === "m", JSON.stringify(a));
+  must(b && b.task === undefined && b.status === undefined && b.verdict === "failed", JSON.stringify(b));
+  must(c && c.task === undefined && c.status === undefined, JSON.stringify(c));
+  must(d && d.session === "sess_0123abcd" && d.turn === "tt_main.2@1790000000000" && d.status === "stop", JSON.stringify(d));
+  must(f && f.task === "sub_0123abcd" && f.status === "succeeded", JSON.stringify(f));
+  const wire = e.requests.map((r) => r.text).join("");
+  must(!/alice|general|said no|two words/.test(wire), `a name or a sentence was sent: ${wire}`);
+});
+
+await check("github.refresh: a free-text why, scope, connector id or reason code is left out; a row whose outcome is not a code is not sent, but counted", async () => {
+  const { sql } = sqliteHost(); const e = routes();
+  appendTrace(sql, [
+    refresh(1, "rotated", { why: "GitHub rejected the token", scope: "the mount alice made", connectorId: "conn of alice", reasonCode: "GitHub said: bad_refresh_token" }),
+    refresh(2, "it went wrong somehow"),
+    refresh(3, "broken", { why: "rejected", scope: "connector", connectorId: "conn_1", reasonCode: "oauth:bad_refresh_token" }),
+  ]);
+  await lanePass(sql, e);
+  const rows = e.requests.filter((r) => r.path === GHR_PATH && r.status === 200).flatMap((r) => r.rows);
+  must(rows.map((r) => r.seq).join(",") === "1,3", `sent: ${rows.map((r) => r.seq)}`);
+  const [a, c] = rows;
+  must(a.outcome === "rotated" && a.why === null && a.scope === null && a.connector_id === null && a.reason_code === null && a.attempt === 1, JSON.stringify(a));
+  must(c.outcome === "broken" && c.why === "rejected" && c.scope === "connector" && c.connector_id === "conn_1" && c.reason_code === "oauth:bad_refresh_token", JSON.stringify(c));
+  must(JSON.stringify(dropsOf(sql)) === JSON.stringify([{ reason: "unsendable", status: null, rows: 1 }]), JSON.stringify(dropsOf(sql)));
+  const wire = e.requests.map((r) => r.text).join("");
+  must(!/GitHub|alice|somehow|said/.test(wire), `free text was sent: ${wire}`);
 });
 
 await check("batches: at most 500 rows and 256 KiB a request, oldest first, every row once", async () => {

@@ -243,7 +243,9 @@ have a lane's route yet answers 404, which pauses that lane only (below).
 `POST <base>/api/external/github-refresh`. Each row has exactly these fields and no other: `at` (ISO 8601), `tenant_id`,
 `agent_id`, `seq`, `env`, `outcome`, `scope`, `connector_id`, `mount` (the mount's plugin type, never its alias),
 `why`, `attempt`, `stored`, `reason_code`; an
-attr the row does not have is `null`. No span id, no verdict, no other attr, no token and no reason text. A row's
+attr the row does not have is `null`, and so is one that is not its shape, the same shapes as `agent.trace`'s:
+`outcome`, `scope`, `why` and `reason_code` must be codes and `connector_id` an id, and a row whose `outcome` is not a
+code is not sent but counted (`unsendable`). No span id, no verdict, no other attr, no token and no reason text. A row's
 identity is (`tenant_id`, `agent_id`, `seq`), the same on every resend, and the receiver dedupes on it.
 
 **What is sent, `agent.trace`.** Rows of the fifteen kinds above only, as `POST <base>/api/external/antiproton-trace`.
@@ -251,7 +253,7 @@ Each row has an envelope (`seq`, `at`, `kind`, `tenant_id`, `agent_id`, `env`, a
 `span_id`, `status`, `verdict`, `ms`) and then its kind's fields, each named and typed as the receiver's
 (`ANTIPROTON_TRACE_KINDS` there, `AGENT_TRACE_FIELDS` here) and built from one attr (a notify's `dropped_other` sums
 the drops by a reason without a field of its own); a field the receiver does not keep yet is dropped by it, the row
-kept, until it does (test/trace-forward.ts `PROPOSED` lists them); an attr that is not a field here is never sent, and a value that is not its field's shape (an id, a code, a listed value, a non-negative integer, a
+kept, until it does (test/trace-forward.ts `PROPOSED` lists them: none at present, as the receiver at botiverse/slock 240303c6 takes every field sent); an attr that is not a field here is never sent, and a value that is not its field's shape (an id, a code, a listed value, a non-negative integer, a
 boolean) is left out rather than rewritten. So no message text, prompt, tool argument, error sentence, rule or
 conversation name leaves: a `tool.call` row's `error` (the tool's own sentence), a `model.call`'s `limit`, a wake's
 `error` are never fields. Nor is a name a person or a conversation has: the receiver's id shape takes `alice` as
@@ -262,7 +264,9 @@ is never sent: `mount` is the mount's plugin type (`raft`, `github`, …), `moun
 list, and a plugin row's span `mount:<alias>` goes as `mount`, `wake:<alias>:<ms>` as `wake:<ms>`. Where the vocabulary is known (`by`, `trigger`,
 `outcome`, `stop_reason`, a wake's `reason`, a rules row's `action`, …) it is that list; a check's `check_id` is sent only
 in the shape Raft mints it. `model.call`'s `first_tool` and `tool.refused`'s `tool` are never filled:
-they are whatever the model wrote. A row's identity at the receiver is (`tenant_id`, `agent_id`, `seq`), the same on every resend;
+they are whatever the model wrote. Some id and code fields carry a value chosen outside this code, by Raft or by an MCP
+server the agent mounts (a tool's name, a `tool.call`'s `error_code`, a `check_id`, a notify's or rules row's `code`):
+those are only shape-checked, not checked against a list, so they are only as free of names as their source keeps them. A row's identity at the receiver is (`tenant_id`, `agent_id`, `seq`), the same on every resend;
 a span id is not unique per row (a wake's and a turn end's are the mount's). A row whose tenant or agent is not an id
 is not sent but counted (`unsendable`).
 
@@ -278,7 +282,10 @@ reason (diagnose `agentTraceForward.rejected`, by reason, seven days); the rest 
 switched off, or has no such route): the lane pauses with the rows kept (`auth_or_off`). 408, 429, 5xx or no answer:
 kept (`unavailable`). No answer includes none within 10 s: every request, each half of a 413 split included, is aborted
 then, because the send runs inside the agent's alarm pass, and the lane sends no further batch in that pass. Any other
-4xx: dropped (`rejected`). A kept batch is tried again on the first alarm pass after a backoff of a minute, doubling to
+4xx: dropped (`rejected`). The send runs at the end of the pass, after the agent's next alarm is armed, and within a
+budget per pass: 2 s of wall time for both lanes together (a request still waiting then is aborted, as one with no
+answer is) and 8 requests per lane, each half of a 413 split counted. What the budget leaves stays queued for the next
+pass, with no backoff; a pass's send never delays the agent's next step by more than the budget. A kept batch is tried again on the first alarm pass after a backoff of a minute, doubling to
 an hour, and a success clears it; each lane has its own. A failure never fails the pass, never delays the R2 export,
 and asks for no extra pass: an idle agent's waiting rows go on its next pass.
 

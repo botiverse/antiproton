@@ -93,8 +93,10 @@ const TABLE = "CREATE TABLE IF NOT EXISTS trace_outbox(" +
 // `mount`, `why`, `attempt`, `stored`, `reasonCode`), never a token or GitHub's own words. It is here because an object's
 // log lines can be dropped from Workers Logs (docs/runbook.md) and this export is what is left. Activity and status skip it.
 // Once configured it is forwarded outside the account as fixed columns (cf/src/trace-forward.ts, its own lane); so are
-// model.call, model.attempt, tool.call, tool.refused, turn.timing, turn.stop, raft.assistant_wake, raft.assistant_notify
-// and raft.turn_ended, as fixed per-kind fields (`AGENT_TRACE_FIELDS` there), never an attr that is not one of them.
+// model.call, model.attempt, tool.call, tool.refused, turn.timing, turn.stop, turn.end_unrecorded, rebuild.outcome,
+// raft.assistant_wake, raft.assistant_notify, raft.assistant_check, raft.assistant_chat_told, raft.assistant_rules,
+// raft.assistant_send_as_owner and raft.turn_ended, as fixed per-kind fields (`AGENT_TRACE_FIELDS` there, whose keys are
+// the list), never an attr that is not one of them.
 // The rest are the kinds a plugin may write itself, through `PluginContext.trace` (`PLUGIN_TRACE_KINDS`). Activity and
 // status skip them. `raft.state_save_failed` is no longer written (it is `raft.state_failed` now) and stays here only so
 // a row of that kind still in an outbox is drained and read as a row, not dropped as damage.

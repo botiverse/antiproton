@@ -2780,15 +2780,11 @@ export class AgentDO extends DurableObject<Env> {
         // to R2, with the export holding whatever activity did not consume (cf/src/activity-raft.ts).
         // Same terms as usage: a failure keeps the rows and asks for another pass.
         // The forwarded rows' copy for Raft's trace-upload worker (cf/src/trace-forward.ts, one queue per lane) is
-        // staged first, so the export holds what it has not copied; its send comes after and is its own: off until
-        // configured, and never a reason for this pass to fail or come back.
+        // staged first, so the export holds what it has not copied; its send is its own: off until configured, and
+        // never a reason for this pass to fail or come back. The send waits until the next alarm is armed, below.
         const forward = forwardPass(this.env as unknown as Record<string, unknown>, this.sql as any, who.tenantId, who.agentId);
         const flushed = await flushActivityThenTrace(rt.gateway(), this.env.ARTIFACTS, this.sql as any, who.tenantId, who.agentId,
           subagentActivityFor(this.sql as any, this.env as unknown as Record<string, unknown>), forward.before());
-        const forwarded = await forward.after();
-        for (const [lane, f] of Object.entries(forwarded ?? {})) {
-          if (f?.error) console.warn(`${lane} forward for ${who.agentId}: ${f.error} (${f.kept} kept)`);
-        }
         if (flushed.activityError) { usagePending = true; console.warn(`activity flush failed for ${who.agentId}: ${flushed.activityError}`); }
         if (flushed.traceError) { usagePending = true; console.warn(`trace flush failed for ${who.agentId}: ${flushed.traceError}`); }
         // The pass says when to come back — a retry has a time, a model call has a poll interval,
@@ -2818,6 +2814,15 @@ export class AgentDO extends DurableObject<Env> {
           if (next === null) await this.ctx.storage.deleteAlarm();
           else await this.ctx.storage.setAlarm(next);
         } else await this.ctx.storage.setAlarm(next);
+        // The forward's send, last: the next alarm is already as decided above, so a receiver that is slow or hangs
+        // decides nothing about when the agent runs next. A Durable Object runs one alarm at a time, though, so what
+        // the send spends still delays that alarm: it is bounded per pass (FORWARD_PASS_MS, every lane together), and
+        // what it leaves stays queued for the next pass. Awaited rather than left running past the handler's return,
+        // which nothing here relies on the platform to finish; a send cut off anyway leaves its rows queued.
+        const forwarded = await forward.after();
+        for (const [lane, f] of Object.entries(forwarded ?? {})) {
+          if (f?.error) console.warn(`${lane} forward for ${who.agentId}: ${f.error} (${f.kept} kept)`);
+        }
         logEvent("alarm.end", {
           tenantId: who.tenantId, agentId: who.agentId, ms: Date.now() - alarmStarted,
           wakeInMs: out.wakeInMs, usagePending, comeBackInMs: comeBackInMs ?? undefined,

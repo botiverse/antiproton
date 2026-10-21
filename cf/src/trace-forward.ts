@@ -24,21 +24,25 @@
  *   copied; and since it touches nothing remote, that hold does not stall when the endpoint is down.
  * - `sendForward`, remote: a lane's queue, oldest first, at most FORWARD_BATCH_MAX rows and FORWARD_BATCH_BYTES a
  *   request. Its outcome is the lane's alone: it never throws, never fails the pass, and asks for no extra pass. A row
- *   waiting on a backoff is sent on the first alarm pass after the backoff, whenever the agent next has one.
+ *   waiting on a backoff is sent on the first alarm pass after the backoff, whenever the agent next has one. It runs
+ *   after the pass has armed the agent's next alarm, and within a budget per pass (FORWARD_PASS_MS of wall time for
+ *   every lane together, FORWARD_PASS_REQUESTS requests per lane): what the budget leaves stays queued for the next pass.
  *
  * What an answer does (agreed with the receiving side). Every outcome but a 2xx is counted in the lane's `<lane>_log`
  * with a fixed reason and the status, and logged as the lane's line (`github.refresh.forward`, `trace.forward`):
  * - 2xx: accepted, duplicates included; the rows leave the queue.
  * - 413: the batch is split in half and each half sent, down to one row; a single row still too large is dropped
- *   (`too-large`).
+ *   (`too-large`). Each half is a request of the pass's budget, so a receiver that answers 413 to everything costs a
+ *   pass FORWARD_PASS_REQUESTS requests, and the rest of the split waits for the next.
  * - 400, 422: the receiver cannot take the batch's shape, which a resend will not mend: it is dropped (`schema`) and the
  *   queue moves on rather than wedging behind it.
  * - 401, 403, 404: the token is wrong or expired, or the receiver is switched off (it answers 404 while it has no token
  *   of its own, or has no such route yet), none of which says anything about the rows: the lane pauses (`auth_or_off`),
  *   the rows stay, and the backoff below applies, so the backlog drains once either side is mended.
  * - 408, 429, 5xx, or no answer: the rows stay (`unavailable`) and the backoff applies. No answer includes one that
- *   has not come within FORWARD_TIMEOUT_MS: every request, each half of a 413 split included, is aborted then, since
- *   the send runs inside the agent's alarm pass and a receiver that hangs would otherwise hold that pass open. A
+ *   has not come within FORWARD_TIMEOUT_MS, or by the end of the pass's budget, whichever is first: every request,
+ *   each half of a 413 split included, is aborted then, since the send runs inside the agent's alarm pass and a
+ *   receiver that hangs would otherwise hold that pass open. A
  *   timeout ends the lane's sending for the pass like any other failure: no later batch is tried until the backoff is over.
  * - any other 4xx: dropped (`rejected`), as a resend of the same request gets the same.
  * The backoff: FORWARD_BACKOFF_BASE_MS, doubling to FORWARD_BACKOFF_MAX_MS, cleared by the next success.
@@ -73,6 +77,19 @@ export const FORWARD_QUEUE_MAX = 5_000;
 const STAGE_READ_MAX = 2_000;
 /** How long one request may take before it is aborted and counted as no answer (`unavailable`). */
 export const FORWARD_TIMEOUT_MS = 10_000;
+/**
+ * What one alarm pass may spend sending, every lane together: FORWARD_PASS_MS of wall time from the start of the send,
+ * shared by the lanes, and at most FORWARD_PASS_REQUESTS requests per lane, each half of a 413 split counted as one.
+ * The send runs after the pass has armed its next alarm, but a Durable Object runs one alarm at a time, so whatever
+ * the send spends is a delay to the agent's next step: this is that delay's ceiling. A request is not started with
+ * less than FORWARD_REQUEST_MIN_MS of it left, and one that is started is cut at the pass's end (counted as no
+ * answer, as a timeout is). What the budget leaves is still queued, for the next pass, with no backoff.
+ */
+export const FORWARD_PASS_MS = 2_000;
+export const FORWARD_PASS_REQUESTS = 8;
+const FORWARD_REQUEST_MIN_MS = 250;
+/** One lane's share of a pass: requests left, and the instant (Date.now) the pass's sending ends. */
+export type ForwardBudget = { requests: number; until: number };
 export const FORWARD_BACKOFF_BASE_MS = 60_000;
 export const FORWARD_BACKOFF_MAX_MS = 60 * 60_000;
 /** How long a drop stays on record. */
@@ -176,42 +193,51 @@ export const FORWARD_KINDS: readonly TraceKind[] = ["github.refresh"];
 export const FORWARD_COLUMNS = ["at", "tenant_id", "agent_id", "seq", "env", "outcome", "scope", "connector_id", "mount", "why",
   "attempt", "stored", "reason_code"] as const;
 export type ForwardRow = {
-  at: string; tenant_id: string; agent_id: string; seq: number; env: ForwardEnv; outcome: string;
+  at: string; tenant_id: string; agent_id: string; seq: number; env: ForwardEnv; outcome: string | null;
   scope: string | null; connector_id: string | null; mount: string | null; why: string | null;
   attempt: number | null; stored: boolean | null; reason_code: string | null;
 };
 
-const str = (v: unknown): string | null => typeof v === "string" ? v : null;
+/**
+ * The receiver's shapes, mirrored so that what is sent is what it keeps. An id: letters, digits and `_ . : @ / | -`, at
+ * most 128. A code: letters, digits and `_ . : -`, at most 64, case kept.
+ */
+const ID = /^[A-Za-z0-9_.:@/|-]{1,128}$/;
+const CODE = /^[A-Za-z0-9_.:-]{1,64}$/;
+const codeOf = (v: unknown): string | null => typeof v === "string" && CODE.test(v) ? v : null;
+const idOf = (v: unknown): string | null => typeof v === "string" && ID.test(v) ? v : null;
 const int = (v: unknown): number | null => typeof v === "number" && Number.isFinite(v) ? Math.trunc(v) : null;
 const bool = (v: unknown): boolean | null => typeof v === "boolean" ? v : null;
 
-/** One outbox row as the github-refresh receiver's columns, built field by field: nothing in the stored row rides along. */
+/**
+ * One outbox row as the github-refresh receiver's columns, built field by field: nothing in the stored row rides along.
+ * The same shapes as the agent.trace lane's (`codeOf`, `idOf`): `outcome`, `scope`, `why` and `reason_code` are codes,
+ * `connector_id` an id, and a value that is not its shape is null, never sent as it was. A row whose `outcome` is not a
+ * code is not sent at all (`GITHUB_REFRESH_LANE`), as the column is the row's point.
+ */
 export function forwardRow(r: TraceOutboxRow, env: ForwardEnv, mounts: MountsView = NO_MOUNTS): ForwardRow {
   const a = r.attrs ?? {};
   return {
-    at: new Date(r.at).toISOString(), tenant_id: r.tenantId, agent_id: r.agentId, seq: r.seq, env, outcome: r.status,
+    at: new Date(r.at).toISOString(), tenant_id: r.tenantId, agent_id: r.agentId, seq: r.seq, env, outcome: codeOf(r.status),
     // `mount`: the mount's type, never its alias (`MountsView`); null when the alias names no mount now.
-    scope: str(a.scope), connector_id: str(a.connectorId), mount: typeof a.mount === "string" ? mounts.get(a.mount)?.plugin ?? null : null, why: str(a.why),
-    attempt: int(a.attempt), stored: bool(a.stored), reason_code: str(a.reasonCode),
+    scope: codeOf(a.scope), connector_id: idOf(a.connectorId), mount: typeof a.mount === "string" ? mounts.get(a.mount)?.plugin ?? null : null,
+    why: codeOf(a.why), attempt: int(a.attempt), stored: bool(a.stored), reason_code: codeOf(a.reasonCode),
   };
 }
 
 export const GITHUB_REFRESH_LANE: ForwardLane = {
   name: "github.refresh", path: "/api/external/github-refresh", kinds: FORWARD_KINDS, table: "ghr_forward",
-  log: "github.refresh.forward", map: forwardRow,
+  log: "github.refresh.forward", map: (r, env, mounts) => { const row = forwardRow(r, env, mounts); return row.outcome === null ? null : row; },
 };
 
 // ---------------------------------------------------------------------------------------------------------------------
 // The agent.trace lane: Raft's `POST /api/external/antiproton-trace` (botiverse/slock#10530,
 // the trace-upload worker's `antiprotonTrace.ts`, `ANTIPROTON_TRACE_KINDS`).
 
-/**
- * The receiver's shapes, mirrored so that what is sent is what it keeps. An id: letters, digits and `_ . : @ / | -`, at
- * most 128. A code: letters, digits and `_ . : -`, at most 64, case kept. A count: a non-negative safe integer. An int:
- * a safe integer. A value that is not its field's shape is not sent; nothing is rewritten to fit.
+/*
+ * The receiver's shapes: an id (`ID`) and a code (`CODE`), above, as both lanes check them; a count, a non-negative
+ * safe integer; an int, a safe integer. A value that is not its field's shape is not sent; nothing is rewritten to fit.
  */
-const ID = /^[A-Za-z0-9_.:@/|-]{1,128}$/;
-const CODE = /^[A-Za-z0-9_.:-]{1,64}$/;
 
 /**
  * A conversation id as this side mints one: `main` and a fresh context's `main.<n>` (cf/src/fresh-context.ts), a
@@ -289,7 +315,9 @@ const counts = (names: readonly string[]): Record<string, readonly [Source, Fiel
  * An id-typed field carries an opaque id or a name from code or configuration (a tool's, a model's, a mount's TYPE), never a
  * name a person or a conversation has: where the receiver takes `id` or `code` and this side knows the vocabulary, the
  * field is that list (`by`, `trigger`, `outcome`, `stop_reason`, `reason`, …); a session, turn or task must be in a shape this side
- * mints, a check's id in the shape Raft mints it (`CHECK_ID`). Two receiver fields are left unfilled because their value is whatever the model wrote, which can be any word:
+ * mints, a check's id in the shape Raft mints it (`CHECK_ID`). Some id and code fields carry a value chosen outside this
+ * code, by Raft or an MCP server (a tool's name, tool.call's `error_code`, a `check_id`, a notify's or rules row's
+ * `code`): those are only shape-checked. Two receiver fields are left unfilled because their value is whatever the model wrote, which can be any word:
  * model.call's `first_tool` (the first tool the answer asked for, as the model spelled it) and tool.refused's `tool`
  * (the name a refused call was made by, which by definition named no tool there is).
  */
@@ -404,8 +432,6 @@ export const AGENT_TRACE_KINDS = Object.keys(AGENT_TRACE_FIELDS) as TraceKind[];
 
 const VERDICTS = ["ok", "failed", "blocked", "cancelled"] as const;
 
-const codeOf = (v: unknown): string | null => typeof v === "string" && CODE.test(v) ? v : null;
-const idOf = (v: unknown): string | null => typeof v === "string" && ID.test(v) ? v : null;
 const countOf = (v: unknown): number | null => {
   if (typeof v !== "number" || !Number.isFinite(v) || v < 0) return null;
   const n = Math.round(v);
@@ -613,7 +639,8 @@ export function stageForward(sql: Sql, cfg: ForwardConfig, tenantId: string, age
   return Math.max(from, through);
 }
 
-export type ForwardResult = { sent: number; dropped: number; kept: number; error: string | null; skipped?: "backoff" };
+/** `stopped`: the pass's budget ended the lane's sending with rows still queued (`FORWARD_PASS_MS`); not a failure. */
+export type ForwardResult = { sent: number; dropped: number; kept: number; error: string | null; skipped?: "backoff"; stopped?: "budget" };
 
 /** What a status does to the batch that got it. */
 export function answerOf(status: number): "accepted" | "split" | ForwardReason {
@@ -659,13 +686,16 @@ function nextBatch(sql: Sql, lane: ForwardLane): WireRow[] {
 }
 
 /**
- * Send a lane's queue, oldest first, until it is empty or the endpoint fails. Never throws: a failure is the return
- * value's `error`, and the rows it concerned are still queued. `timeoutMs` bounds each request (FORWARD_TIMEOUT_MS;
- * a test passes a short one).
+ * Send a lane's queue, oldest first, until it is empty, the endpoint fails, or `budget` is spent (`FORWARD_PASS_MS`).
+ * Never throws: a failure is the return value's `error`, and the rows it concerned are still queued; rows the budget
+ * left are still queued too. `timeoutMs` bounds each request (FORWARD_TIMEOUT_MS; a test passes a short one), within
+ * what the budget has left. `budget` is read on the real clock (Date.now), whatever `now` says: `now` dates the
+ * backoff and the log, which a test moves.
  */
 export async function sendForward(
   sql: Sql, cfg: ForwardConfig, tenantId: string, agentId: string, fetchFn: Fetch = fetch, now: () => number = Date.now,
   timeoutMs: number = FORWARD_TIMEOUT_MS, lane: ForwardLane = GITHUB_REFRESH_LANE,
+  budget: ForwardBudget = { requests: FORWARD_PASS_REQUESTS, until: Date.now() + FORWARD_PASS_MS },
 ): Promise<ForwardResult> {
   const out: ForwardResult = { sent: 0, dropped: 0, kept: 0, error: null };
   const t = tablesOf(lane), d = ddl(lane);
@@ -679,22 +709,32 @@ export async function sendForward(
     if (state && Number(state.next_at) > now()) return { ...out, kept: queued(), skipped: "backoff" };
     const forget = (rows: readonly WireRow[]) => { for (const r of rows) sql.exec(`DELETE FROM ${t.queue} WHERE seq = ?`, r.seq); };
 
-    /** One batch, split on 413. False: the endpoint failed, and this pass stops. */
-    const post = async (rows: readonly WireRow[]): Promise<boolean> => {
+    let requests = 0;
+    /**
+     * One batch, split on 413. `failed`: the endpoint failed, and this pass stops with the backoff. `budget`: the pass
+     * may send no more (`ForwardBudget`), and this pass stops without one. Each request, a split's included, counts.
+     */
+    const post = async (rows: readonly WireRow[]): Promise<"ok" | "failed" | "budget"> => {
+      const left = budget.until - Date.now();
+      if (requests >= budget.requests || left < FORWARD_REQUEST_MIN_MS) return "budget";
+      requests++;
+      const ms = Math.min(timeoutMs, left);
       const { url, init } = ingestRequest(cfg, rows, lane);
       let status: number;
       let rejections = new Map<string, number>();
       try {
-        const res = await fetchWithin(fetchFn, url, init, timeoutMs);
+        const res = await fetchWithin(fetchFn, url, init, ms);
         status = res.status;
-        if (lane.rowRejections && status >= 200 && status < 300) rejections = await rejectionsOf(res, rows.length, timeoutMs);
+        if (lane.rowRejections && status >= 200 && status < 300) {
+          rejections = await rejectionsOf(res, rows.length, Math.min(timeoutMs, Math.max(FORWARD_REQUEST_MIN_MS, budget.until - Date.now())));
+        }
         else try { await res.body?.cancel(); } catch { /* nothing to read */ }
       } catch (e) {
         // A timeout lands here too (`network: TimeoutError`): no answer, the rows kept, the backoff applies.
         // The error's name, not its message: a message can carry the request, and neither the URL nor the token is logged.
         out.error = `network: ${String((e as { name?: unknown })?.name ?? "error").slice(0, 40)}`;
         note(sql, lane, now(), "unavailable", null, rows.length, tenantId, agentId);
-        return false;
+        return "failed";
       }
       const answer = answerOf(status);
       if (answer === "accepted") {
@@ -703,31 +743,33 @@ export async function sendForward(
         let refused = 0;
         for (const [why, n] of rejections) { refused += n; note(sql, lane, now(), "rejected", status, n, tenantId, agentId, why); }
         out.sent += rows.length - refused; out.dropped += refused;
-        return true;
+        return "ok";
       }
       if (answer === "split" && rows.length > 1) {
         const half = Math.ceil(rows.length / 2);
-        return await post(rows.slice(0, half)) && await post(rows.slice(half));
+        const first = await post(rows.slice(0, half));
+        return first === "ok" ? await post(rows.slice(half)) : first;
       }
       if (answer === "auth_or_off" || answer === "unavailable") {
         out.error = `${answer}: http-${status}`;
         note(sql, lane, now(), answer, status, rows.length, tenantId, agentId);
-        return false;
+        return "failed";
       }
       const reason: ForwardReason = answer === "split" ? "too-large" : answer;
       forget(rows); out.dropped += rows.length;
       note(sql, lane, now(), reason, status, rows.length, tenantId, agentId);
-      return true;
+      return "ok";
     };
 
-    let ok = true;
-    while (ok) {
+    let step: "ok" | "failed" | "budget" = "ok";
+    while (step === "ok") {
       const batch = nextBatch(sql, lane);
       if (!batch.length) break;
-      ok = await post(batch);
+      step = await post(batch);
     }
     out.kept = queued();
-    if (ok) {
+    if (step === "budget" && out.kept) out.stopped = "budget";
+    if (step !== "failed") {
       if (failures) sql.exec(`DELETE FROM ${t.state} WHERE id = 1`);
     } else {
       const n = failures + 1;
@@ -744,13 +786,16 @@ export async function sendForward(
 }
 
 /**
- * The alarm pass's two halves of the forward, around the R2 export: `before` stages every lane and returns the export's
- * prune hold, the lowest lane cursor (null when forwarding is off), `after` sends each lane and returns each lane's
- * outcome. Neither throws. A lane whose stage fails holds the export at its unmoved cursor, so the next pass stages the
- * same rows. `lanes`: which lanes run (all of them; a test narrows it).
+ * The alarm pass's two halves of the forward: `before`, around the R2 export, stages every lane and returns the export's
+ * prune hold, the lowest lane cursor (null when forwarding is off); `after` sends each lane and returns each lane's
+ * outcome, within one FORWARD_PASS_MS for all the lanes together (`ForwardBudget`). The pass runs `after` once it has
+ * armed its next alarm (cf/src/index.ts `alarm`), so a slow receiver never decides when the agent next runs and costs
+ * its next step at most the budget. Neither throws. A lane whose stage fails holds the export at its unmoved cursor, so
+ * the next pass stages the same rows. `lanes`: which lanes run (all of them; a test narrows it); `passMs`: the budget
+ * (FORWARD_PASS_MS; a test passes its own).
  */
 export function forwardPass(env: Record<string, unknown>, sql: Sql, tenantId: string, agentId: string, fetchFn: Fetch = fetch,
-  lanes: readonly ForwardLane[] = FORWARD_LANES) {
+  lanes: readonly ForwardLane[] = FORWARD_LANES, passMs: number = FORWARD_PASS_MS) {
   const cfg = forwardConfigOf(env);
   return {
     before(): number | null {
@@ -770,7 +815,11 @@ export function forwardPass(env: Record<string, unknown>, sql: Sql, tenantId: st
     async after(): Promise<Partial<Record<ForwardLane["name"], ForwardResult>> | null> {
       if (!cfg) return null;
       const out: Partial<Record<ForwardLane["name"], ForwardResult>> = {};
-      for (const lane of lanes) out[lane.name] = await sendForward(sql, cfg, tenantId, agentId, fetchFn, Date.now, FORWARD_TIMEOUT_MS, lane);
+      const until = Date.now() + passMs;
+      for (const lane of lanes) {
+        out[lane.name] = await sendForward(sql, cfg, tenantId, agentId, fetchFn, Date.now, FORWARD_TIMEOUT_MS, lane,
+          { requests: FORWARD_PASS_REQUESTS, until });
+      }
       return out;
     },
   };
