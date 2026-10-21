@@ -56,7 +56,7 @@ import { logicalMain, physicalSession } from "./fresh-context.ts";
 import { assistantSystemPrompt, profilePrompt, systemPrompt } from "../../src/runtime/pi-prompt.ts";
 import { returnToolsChange, takeToolsChange, type ToolsChange } from "../../src/runtime/tools-seen.ts";
 import { assistantMountOf, assistantTools, isOwnerReadAddress } from "../../src/plugins/raft-assistant.ts";
-import { forgetIsolated, isIsolatedSession, isolatedSessions, newIsolatedSessionId, recordIsolated } from "../../src/runtime/isolated-session.ts";
+import { forgetIsolated, isIsolatedSession, isolatedSession, isolatedSessions, newIsolatedSessionId, recordIsolated } from "../../src/runtime/isolated-session.ts";
 import { profileOf, profileSpec } from "../../src/runtime/agent-profile.ts";
 import {
   askedTurn, askWake, bindTurn, keepWake, conversationReasoning, dropAnswer, forgetTurnText, keepTurnOnly, dropWake, dueWakes, keepAnswer, keepsPluginCalls, markAnswerPosting, nextWakeAt, pendingAnswers, pendingTurnEnds, recordTurnEnd,
@@ -2329,6 +2329,11 @@ export class AgentRuntime {
     contextId: () => string | undefined = () => undefined,
     /** The session's turn in flight (`turnIdOf`, src/runtime/turn-timing.ts), asked on each call as `contextId` is. */
     turnId: () => string | undefined = () => undefined,
+    /**
+     * A short session as its mount asked for it (src/runtime/isolated-session.ts): its key, handed to that mount's calls
+     * as `caller.turnKey`, and the tools on that mount it may call at most, refused here too beyond the list it is offered.
+     */
+    isolated?: { alias: string; turnKey: string | null; tools: string[] | null },
   ) {
     const readBack = reader?.name ?? null;
     const withheld = new Set(this.#deps.withholdTools ?? []);
@@ -2348,14 +2353,22 @@ export class AgentRuntime {
     };
     const ended = this.#deps.ended;
     const gw = this.#gateway;
+    // A short session narrowed by its mount (`PluginNext.tools`): a call to a tool of that mount outside the list is
+    // refused here as well as never offered, so the list does not rest on the model loop alone (#1020).
+    const beyondNarrowed = async (raw: string) => {
+      if (!isolated || isolated.tools === null) return null;
+      const r = await gw.resolve(ctx, raw);
+      if (!("mount" in r) || !r.mount || r.mount.alias !== isolated.alias || isolated.tools.includes(r.tool)) return null;
+      return { status: "rejected" as const, error: { code: "not_offered", message: `${r.mount.alias}.${r.tool} is not offered in this session` } };
+    };
     const store = this.store;
     const artifacts = this.#artifacts;
     const sql = this.#deps.ctx.storage.sql;
     // Every call through this host is made in the session's turn: the model's own, a program's inside one, the
     // model's answer to a tool's question. So each carries the context id; nothing a call carries can set it.
-    const inTurn = (): typeof ctx & { contextId?: string; turnId?: string } => {
+    const inTurn = (): typeof ctx & { contextId?: string; turnId?: string; isolated?: { alias: string; turnKey: string } } => {
       const id = contextId(), turn = turnId();
-      return { ...ctx, ...(id === undefined ? {} : { contextId: id }), ...(turn === undefined ? {} : { turnId: turn }) };
+      return { ...ctx, ...(id === undefined ? {} : { contextId: id }), ...(turn === undefined ? {} : { turnId: turn }), ...(isolated && isolated.turnKey !== null ? { isolated: { alias: isolated.alias, turnKey: isolated.turnKey } } : {}) };
     };
     // `send` is the gateway step behind this result: a call by default, or the
     // answer to a question a tool asked, whose result is the tool's own and is
@@ -2465,6 +2478,8 @@ export class AgentRuntime {
         // A subagent's session is never offered a tool that acts as the agent; a program of its could still name one.
         const speaking = subagent ? await speaks(call.tool) : null;
         if (speaking) return childRefusal(speaking);
+        const narrowed = await beyondNarrowed(call.tool);
+        if (narrowed) return narrowed;
         if (ended?.({ tenantId: ctx.tenantId, agentId: ctx.agentId })) return taskEndedRefusal(call.tool);
         return held(call.tool, await dispatch(call));
       },
@@ -3356,11 +3371,19 @@ export class AgentRuntime {
     // Its proactive checks run in short sessions of their own (`PluginNext.isolated`), offered only what a check reads
     // and sends with; the main conversation is its chat with its owner.
     const isolated = isIsolatedSession(session);
-    const tools = profileOf(agentConfig) ? []
+    // What the mount that asked for a short session asked for with it (`PluginNext.tools`, `turnKey`): its tools on that
+    // mount narrowed to the list it gave, never widened, since only names already in the list below survive (#1020).
+    const ask = isolated ? isolatedSession(this.#deps.ctx.storage.sql, session) : null;
+    const narrowed = <T extends { address: string }>(list: T[]): T[] => {
+      if (!ask || ask.tools === null) return list;
+      const allowed = new Set(ask.tools.map((n) => `${ask.alias}.${n}`));
+      return list.filter((t) => !t.address.startsWith(`${ask.alias}.`) || allowed.has(t.address));
+    };
+    const tools = narrowed(profileOf(agentConfig) ? []
       : isSubagentSession(session)
       ? (() => { const withheld = this.#childWithheldIn(catalogue); return catalogue.tools.filter((t) => !withheld.has(t.address)); })()
       : assistant ? assistantTools(catalogue.tools, assistant, isolated ? "check" : "chat")
-      : catalogue.tools;
+      : catalogue.tools);
     const sandbox = this.#deps.sandbox ?? true;
     const store = this.store;
     // The call context's task is the conversation, so held calls and audit
@@ -3386,7 +3409,8 @@ export class AgentRuntime {
       { tenantId, agentId, taskId: session === MAIN_SESSION ? LEGACY_TASK : session }, reader, offered, heldOn,
       () => contextIdOf(this.#deps.ctx.storage.sql, { tenantId, agentId, session, engine: engine === "pd" ? "pd" : "pi085" }),
       // pi085 only: pd keeps no turn record (src/runtime/turn-timing.ts), so its calls name no turn.
-      () => (engine === "pd" ? undefined : turnIdOf(this.#deps.ctx.storage.sql, session) ?? undefined));
+      () => (engine === "pd" ? undefined : turnIdOf(this.#deps.ctx.storage.sql, session) ?? undefined),
+      ask ?? undefined);
     // The tools the model is offered are the mounts plus the sandbox. run_js is
     // not a mount — it is the one tool whose body is this object rather than a
     // plugin — so it is built here and handed to open beside the mounts. It
@@ -5552,6 +5576,11 @@ export class AgentRuntime {
         try { for (const e of ends) recordTurnEnd(sql, e.operationId, e.end, now); }
         catch (e) { this.#turnEndsUnrecorded(tenantId, agentId, "record", e); }
       }
+      // A short session's end, owed to the mount that asked for it with a key, and to it alone (#1020); best effort, as
+      // the main conversation's are (#1021): a read or write that throws loses only those ends, said on a trace row.
+      if (!pd && isIsolatedSession(session) && out.settled.length) {
+        await this.#recordIsolatedEnds(agent, session, out.settled).catch((e) => this.#turnEndsUnrecorded(tenantId, agentId, "record", e));
+      }
       open += out.open;
       settled.push(...out.settled);
       if (out.wakeInMs !== null) wakeInMs = wakeInMs === null ? out.wakeInMs : Math.min(wakeInMs, out.wakeInMs);
@@ -5647,6 +5676,21 @@ export class AgentRuntime {
   }
 
   /**
+   * The ends of a short session's runs this step settled (`PluginNext.isolated`), owed to the mount that asked for it
+   * when it gave a key: how each ended and its `errorCode`, never the text it ended on or an error's words, which can
+   * quote what the session read. A session asked for with no key is told to no one, as before.
+   */
+  async #recordIsolatedEnds(agent: AgentEngine, session: string, settled: Array<{ operationId: string; status: string }>) {
+    const sql = this.#deps.ctx.storage.sql;
+    const ask = isolatedSession(sql, session);
+    if (!ask || ask.turnKey === null) return;
+    const branch = await agent.branch();
+    const last = ([...branch].reverse().find((e) => e.type === "message") as { message?: unknown } | undefined)?.message;
+    const now = Date.now();
+    for (const s of settled) recordTurnEnd(sql, s.operationId, turnEndOf(s.status, last), now, { alias: ask.alias, turnKey: ask.turnKey });
+  }
+
+  /**
    * Run the plugin code the agent owes a call (src/runtime/plugin-wakes.ts): every turn end not yet handled, every wake
    * now due, then what their answers asked for. A hook's answer is kept in the same transaction that marks what it
    * answered, so an eviction after it never asks the plugin again; a turn it asked for is posted as a prompt on the
@@ -5679,7 +5723,7 @@ export class AgentRuntime {
       return out;
     };
     for (const row of pendingTurnEnds(sql)) {
-      const answers = await resolved("afterTurn", await this.#gateway.afterTurn(tenantId, agentId, row.endFor));
+      const answers = await resolved("afterTurn", await this.#gateway.afterTurn(tenantId, agentId, row.endFor, row.only));
       transact(() => { keep("afterTurn", answers); turnEndHandled(sql, row.seq, Date.now()); });
     }
     // An assistant already on pd (made before its migration was refused): its checks cannot run, and each wake says so
@@ -5721,8 +5765,12 @@ export class AgentRuntime {
         else {
           const session = newIsolatedSessionId();
           try {
+            // Kept with what the mount asked for with it, the tools it may be offered at most and its key (#1020), before
+            // the post: the post opens the session's harness, whose tool list is read from this row. A post that never
+            // lands forgets it below; one an eviction cut off leaves a row with no work, which the erase takes.
+            recordIsolated(sql, session, a.alias, Date.now(), { tools: a.next.tools ?? null, turnKey: a.next.turnKey ?? null });
             await this.postMessage(tenantId, agentId, a.next.turn, "prompt", session, {
-              beforeSay: () => { markAnswerPosting(sql, a.seq); recordIsolated(sql, session, a.alias, Date.now()); },
+              beforeSay: () => { markAnswerPosting(sql, a.seq); },
             });
             posted = true;
           } catch (e) {

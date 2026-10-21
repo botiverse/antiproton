@@ -41,9 +41,18 @@ export function keepsPluginCalls(sql: Sql): boolean {
   return sql.exec("SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = 'plugin_answers'").toArray().length > 0;
 }
 
-/** A turn's end, owed to the plugins that take it. The same turn told again is ignored. */
-export function recordTurnEnd(sql: Sql, operationId: string, end: Omit<TurnEnd, "turnId" | "turnKey">, at: number) {
+/**
+ * A turn's end, owed to the plugins that take it. The same turn told again is ignored. `only`: a short session's end
+ * (`PluginNext.isolated`), owed to the mount that asked for it alone, under its key, and kept with no text.
+ */
+export function recordTurnEnd(sql: Sql, operationId: string, end: Omit<TurnEnd, "turnId" | "turnKey">, at: number, only?: { alias: string; turnKey: string }) {
   ensurePluginWakeTables(sql);
+  if (only) {
+    const { error: _error, ...rest } = end;
+    const body = { ...rest, finalText: null, isolated: true, only };
+    sql.exec("INSERT OR IGNORE INTO plugin_turn_ends (operation_id, body, at) VALUES (?, ?, ?)", operationId, JSON.stringify(body), at);
+    return;
+  }
   // A turn asked for whose run's id was never bound (an eviction right after its post) is this one: nothing else
   // starts a run between a post and its end being recorded.
   const asked = sql.exec("SELECT alias, turn_key FROM plugin_turn_asked WHERE id = 1").toArray()[0];
@@ -53,14 +62,21 @@ export function recordTurnEnd(sql: Sql, operationId: string, end: Omit<TurnEnd, 
   sql.exec("INSERT OR IGNORE INTO plugin_turn_ends (operation_id, body, at) VALUES (?, ?, ?)", operationId, JSON.stringify(end), at);
 }
 
-/** The ends not yet told, each as a given mount is to be told it: with the key that mount gave, if it asked for the turn. */
-export function pendingTurnEnds(sql: Sql): Array<{ seq: number; operationId: string; endFor(alias: string): TurnEnd }> {
+/**
+ * The ends not yet told, each as a given mount is to be told it: with the key that mount gave, if it asked for the turn.
+ * A short session's end names its one mount (`only`), and is null for every other.
+ */
+export function pendingTurnEnds(sql: Sql): Array<{ seq: number; operationId: string; only: string | null; endFor(alias: string): TurnEnd | null }> {
   ensurePluginWakeTables(sql);
   return sql.exec("SELECT seq, operation_id, body FROM plugin_turn_ends WHERE handled IS NULL ORDER BY seq").toArray().map((r) => {
-    const operationId = String(r.operation_id), end = JSON.parse(String(r.body)) as Omit<TurnEnd, "turnId" | "turnKey">;
+    const operationId = String(r.operation_id);
+    const { only, ...end } = JSON.parse(String(r.body)) as Omit<TurnEnd, "turnId" | "turnKey"> & { only?: { alias: string; turnKey: string } };
+    if (only) {
+      return { seq: Number(r.seq), operationId, only: only.alias, endFor: (alias: string) => (alias === only.alias ? { ...end, turnId: operationId, turnKey: only.turnKey, isolated: true as const } : null) };
+    }
     const asked = sql.exec("SELECT alias, turn_key FROM plugin_turns WHERE operation_id = ?", operationId).toArray()[0];
     return {
-      seq: Number(r.seq), operationId,
+      seq: Number(r.seq), operationId, only: null,
       endFor: (alias: string) => ({ ...end, turnId: operationId, turnKey: asked && String(asked.alias) === alias ? String(asked.turn_key) : null }),
     };
   });

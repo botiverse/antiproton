@@ -137,6 +137,11 @@ export interface CallContext {
    * as `contextId` is, only by the agent's tool host, and only where the engine keeps a turn record (pi085).
    */
   turnId?: string;
+  /**
+   * The short session the call is made in, when a mount asked for it with a key (src/runtime/isolated-session.ts): that
+   * mount's alias and its key, handed as `caller.turnKey` to that mount's calls alone. Set only by the agent's tool host.
+   */
+  isolated?: { alias: string; turnKey: string };
 }
 
 /**
@@ -1224,6 +1229,8 @@ export class ToolGateway {
         ...(fromProgram ? { fromProgram: true as const } : {}),
         ...(typeof ctx.contextId === "string" ? { contextId: ctx.contextId } : {}),
         ...(typeof ctx.turnId === "string" ? { turnId: ctx.turnId } : {}),
+        // A short session's key goes to the mount that asked for the session, never to another mount's call.
+        ...(ctx.isolated && ctx.isolated.alias === mount.alias ? { turnKey: ctx.isolated.turnKey } : {}),
       },
       // Only from the gateway's own bookkeeping, never from what a call carries (`PluginContext.operationId`).
       ...(operationId !== undefined ? { operationId } : {}),
@@ -1441,8 +1448,12 @@ export class ToolGateway {
    * key it gave, when it asked for the turn), behind the gate a report passes. Each
    * answer comes back with its alias; a throw is that mount's alone, and is returned as `failed`.
    */
-  async afterTurn(tenantId: string, agentId: string, endFor: (alias: string) => TurnEnd): Promise<PluginHookAnswer[]> {
-    return this.#toHookMounts(tenantId, agentId, (p) => !!p.afterTurn, null, (p, ctx) => p.afterTurn!(ctx, endFor(ctx.alias)));
+  async afterTurn(tenantId: string, agentId: string, endFor: (alias: string) => TurnEnd | null, alias: string | null = null): Promise<PluginHookAnswer[]> {
+    // `alias`: an end told to one mount alone (a short session's, src/runtime/plugin-wakes.ts `recordTurnEnd`).
+    return this.#toHookMounts(tenantId, agentId, (p) => !!p.afterTurn, alias, async (p, ctx) => {
+      const end = endFor(ctx.alias);
+      return end ? p.afterTurn!(ctx, end) : undefined;
+    });
   }
 
   /** The `wake` of one mount (`Plugin.wake`), behind the same gate. Empty when the alias has no such mount. */
