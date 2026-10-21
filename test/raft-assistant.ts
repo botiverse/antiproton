@@ -517,7 +517,7 @@ await check("untold goes to the wire as filter untold; each line's told and the 
 await check("untold with totalCapped: the total line says it is a lower bound; totalCapped false reads as a plain total", async () => {
   const { plugin } = pluginWith({ inbox: untoldAnswer({ totalCapped: true, total: 300 }) });
   const lines = String(await plugin.invoke(INBOX, { filter: "untold" }, ctx(ASSISTANT).ctx)).split("\n");
-  must(lines[3] === "At least 300 match the filter untold; Raft counted only the first 300 conversations, so there may be more." &&
+  must(lines[3] === "At least 300 match the filter untold; Raft stopped counting there, so there may be more." &&
     !lines.some((l) => l.includes("in total, across all pages")) && lines[4] === "hasMore=true nextOffset=2" && lines.length === 5, `capped: ${JSON.stringify(lines)}`);
   const { plugin: uncapped } = pluginWith({ inbox: untoldAnswer({ totalCapped: false }) });
   const out = String(await uncapped.invoke(INBOX, { filter: "untold" }, ctx(ASSISTANT).ctx)).split("\n");
