@@ -11,7 +11,7 @@ import { AgentRuntime, HARNESS_NOTICE } from "../cf/src/runtime.ts";
 import { errorMessage, fromResponse } from "../src/model/pi-bridge.ts";
 import { ModelRequestRefused } from "../src/model/openai-compatible.ts";
 import type { ModelResponse } from "../src/model/types.ts";
-import type { Plugin } from "../src/plugins/types.ts";
+import type { Plugin, TurnEnd } from "../src/plugins/types.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { standInLoader } from "./spec/worker-stand-in.ts";
 import { operatorModelOf } from "../cf/src/model-request.ts";
@@ -268,13 +268,21 @@ const seats: Plugin = {
   },
 } as Plugin;
 
-type Opts = { policy?: boolean; idle?: { warnMs: number; maxMs: number } };
+/** A plugin that takes every turn end of the main conversation (`Plugin.afterTurn`), mounted only with `ends`. */
+const told: TurnEnd[] = [];
+const endsPlugin: Plugin = {
+  id: "ends", version: "1.0.0", tools: [] as never,
+  async invoke() { return { ok: true }; },
+  async afterTurn(_ctx, end) { told.push(end); },
+} as Plugin;
+
+type Opts = { policy?: boolean; idle?: { warnMs: number; maxMs: number }; ends?: boolean };
 function runtimeOver(w: { host: ReturnType<typeof sqliteHost>; sent: string[] }, o: Opts = {}): AgentRuntime {
   const standIn = standInLoader();
   return new AgentRuntime({
     ctx: { storage: { sql: w.host.sql, transactionSync: w.host.transactionSync } },
     bucket: {} as never, bucketName: "b", models: { resolve: () => null },
-    autoRelease: !!o.idle, ...(o.idle ? { idle: o.idle } : {}), extraPlugins: [chat, seats],
+    autoRelease: !!o.idle, ...(o.idle ? { idle: o.idle } : {}), extraPlugins: [chat, seats, endsPlugin],
     ...(o.policy ? { rebuildPolicy: DEFAULT_REBUILD_POLICY } : {}),
     loader: standIn.loader, makeToolBinding: standIn.makeToolBinding,
     operatorModel: operatorModelOf({ DEEPSEEK_BASE_URL: "https://model.example/v1", DEEPSEEK_API_KEY: "operator-key", HARNESS_MODEL: "m1" }),
@@ -288,7 +296,8 @@ async function world(o: Opts = {}): Promise<World> {
   const w = { ...base, rt: runtimeOver(base, o) } as World;
   await w.rt.ready();
   await w.rt.store.createAgent("t", "a");
-  for (const [alias, plugin] of [["state", "state"], ["chat", "chat"], ["seats", "seats"]] as const) {
+  told.length = 0;
+  for (const [alias, plugin] of [["state", "state"], ["chat", "chat"], ["seats", "seats"], ...(o.ends ? [["ends", "ends"]] as const : [])] as const) {
     await w.rt.store.setPluginChoice("t", "a", plugin, "enable");
     const added = await w.rt.addMount("t", "a", { alias, plugin, config: { account: alias } });
     must(added.ok, `the ${alias} mount was refused: ${show(added)}`);
@@ -569,7 +578,7 @@ await check(`overflows ${MAX_CONSECUTIVE_OVERFLOWS} times in a row, each rebuilt
 });
 
 await check("a briefing whose post fails stays pending, is posted on a later pass, and a post before then carries it first", async () => {
-  const w = await world();
+  const w = await world({ ends: true });
   w.answer = say("fine");
   await turn(w, "hello");
   // The engine's write of the briefing fails once, after the post has taken it.
@@ -597,6 +606,8 @@ await check("a briefing whose post fails stays pending, is posted on a later pas
   }
   await w.rt.step("t", "a");
   must(readBackstop(w.host.sql as never).pending !== null && mainSessions(w.host.sql as never).length === 2, "the briefing was not kept pending");
+  // The failed run was rebuilt, though its briefing is not posted yet: its end is told as rebuilding.
+  must(told.length === 2 && told[1]!.outcome === "failed" && told[1]!.rebuilding === true, `the overflowed run's end: ${show(told)}`);
   // A follow-up lands before the retry: it carries the briefing first, once, and starts the run (an idle follow-up
   // would start none, and the briefing would sit unread).
   const landed = await w.rt.postMessage("t", "a", "a follow-up", "followUp", "main");
@@ -605,6 +616,7 @@ await check("a briefing whose post fails stays pending, is posted on a later pas
   const msgs = w.calls.at(-1)!.messages;
   const text = textOf(msgs[0]);
   must(msgs.length === 1 && text.startsWith("Messages before") && text.includes("\n\nsecond") && text.endsWith("a follow-up"), `the first message:\n${text}`);
+  must(told.length === 3 && told[2]!.outcome === "completed" && told[2]!.rebuilding === undefined, `the rebuilt run's end: ${show(told)}`);
 });
 
 await check("an overflow while a push is being handed over waits for that push's run, and is judged with it", async () => {
@@ -627,6 +639,33 @@ await check("an overflow while a push is being handed over waits for that push's
   const brief = textOf(w.calls.at(-1)!.messages[0]);
   must(brief.endsWith("third") && brief.includes("second"), `the briefing:\n${brief}`);
   must(traceRows(w, "rebuild.decision").map((r) => r.status).join() === "ran" && readBackstop(w.host.sql as never).needsReset === null, "not one rebuild");
+});
+
+await check("turn ends: the run whose overflow was rebuilt is told as rebuilding; the rebuilt run, and every other, is not", async () => {
+  const w = await world({ ends: true });
+  w.answer = say("fine");
+  await turn(w, "hello");
+  must(told.length === 1 && told[0]!.outcome === "completed" && told[0]!.rebuilding === undefined, `control: an ordinary end: ${show(told)}`);
+  w.answer = script(overflow, say("answered after"));
+  must(await turn(w, "second") === 2, "control: the failed call and the rebuilt one");
+  must(mainSessions(w.host.sql as never).length === 2, "control: rebuilt");
+  const [a, b] = told.slice(1);
+  must(told.length === 3 && a!.turnId !== b!.turnId, `ends: ${show(told)}`);
+  must(a!.rebuilding === true && a!.outcome === "failed", `the overflowed run's end: ${show(a)}`);
+  must(b!.rebuilding === undefined && b!.outcome === "completed" && b!.finalText === "answered after", `the rebuilt run's end: ${show(b)}`);
+  // The rebuilt request overflows too: the backstop stops (needs_reset), and that run's end is final, not rebuilding.
+  const x = await world({ ends: true });
+  x.answer = say("fine");
+  await turn(x, "hello");
+  x.answer = overflow;
+  must(await turn(x, "second") === 2 && readBackstop(x.host.sql as never).needsReset !== null, "control: needs_reset");
+  const [xa, xb] = told.slice(1);
+  must(told.length === 3 && xa!.rebuilding === true && xb!.rebuilding === undefined && xb!.outcome === "failed", `ends: ${show(told)}`);
+  // A failure that is not an overflow is not rebuilt, and its end says nothing of a rebuild.
+  const y = await world({ ends: true });
+  y.answer = (_c, id) => ({ ...refused(401, JSON.stringify({ error: { message: "invalid api key", type: "authentication_error" } })), jobId: id });
+  await turn(y, "hello");
+  must(told.length === 1 && told[0]!.outcome === "failed" && told[0]!.rebuilding === undefined, `a non-overflow failure: ${show(told)}`);
 });
 
 await check("a failure that is not an overflow is left as it was", async () => {

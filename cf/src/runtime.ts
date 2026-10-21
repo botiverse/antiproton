@@ -3742,7 +3742,7 @@ export class AgentRuntime {
     await this.ready();
     const record = await this.store.loadAgent(tenantId, agentId);
     if (!record) return null;
-    // A profile's plugin is driven by turn ends, which pd does not tell (`#recordTurnEnds`).
+    // A profile's plugin is driven by turn ends, which pd does not tell (`#turnEndsOf`).
     const profile = profileOf(record.config);
     if (profile && op === "migrate") return { ok: false, refused: `this agent's profile (${profile}) runs on pi085 only: pd does not tell its plugin when a turn ends` };
     // A personal assistant's checks and brief run in short sessions of their own (`PluginNext.isolated`), which pd
@@ -5521,15 +5521,29 @@ export class AgentRuntime {
         out = await agent.step();
         out = { ...out, settled: [...before, ...out.settled] };
       }
+      // A main-conversation turn that ended here is owed to the plugins that act on its answer (`Plugin.afterTurn`), as
+      // its branch tells it: read before a rebuild, which closes this engine and starts a new transcript.
+      const ends = !pd && session === MAIN_SESSION ? await this.#turnEndsOf(tenantId, agentId, agent, out.settled) : null;
       // A run of pi085's main conversation that ended on a context overflow is rebuilt rather than left to fail again
       // on every wake (`#overflowBackstop`); this pass then drives the rebuilt conversation's first call.
       if (!pd && session === MAIN_SESSION && rebuilds && out.open === 0 && (out.settled.length || readBackstop(sql).pending !== null)) {
-        const rebuilt = await this.#overflowBackstop(tenantId, agentId);
-        if (rebuilt) out = { ...rebuilt, settled: [...out.settled, ...rebuilt.settled] };
+        const backstop = await this.#overflowBackstop(tenantId, agentId);
+        // The run whose overflow was rebuilt (the last to settle before the rebuild: a conversation's runs are one at a
+        // time) runs again for the same input; its end says so (`TurnEnd.rebuilding`), and the rebuilt run's own does not.
+        const last = ends?.at(-1);
+        if (backstop?.rebuilt && last) last.end = { ...last.end, rebuilding: true };
+        if (backstop?.step) {
+          out = { ...backstop.step, settled: [...out.settled, ...backstop.step.settled] };
+          if (ends && backstop.step.settled.length) {
+            ends.push(...(await this.#turnEndsOf(tenantId, agentId, await this.agent(tenantId, agentId, session), backstop.step.settled))!);
+          }
+        }
       }
       if (!pd) this.#turnTiming(tenantId, agentId, "ending", () => this.#turnStepEnd(tenantId, agentId, session, out));
-      // A main-conversation turn that ended here is owed to the plugins that act on its answer (`Plugin.afterTurn`).
-      if (!pd && session === MAIN_SESSION && out.settled.length) await this.#recordTurnEnds(tenantId, agentId, agent, out.settled);
+      if (ends?.length) {
+        const now = Date.now();
+        for (const e of ends) recordTurnEnd(sql, e.operationId, e.end, now);
+      }
       open += out.open;
       settled.push(...out.settled);
       if (out.wakeInMs !== null) wakeInMs = wakeInMs === null ? out.wakeInMs : Math.min(wakeInMs, out.wakeInMs);
@@ -5594,16 +5608,17 @@ export class AgentRuntime {
   }
 
   /**
-   * The ends of the main conversation's runs this step settled, written down for `#runPluginHooks`, with the text each
-   * ended on: the branch's last message when it is the model's. pi085 only: pd's step settles every conversation's
-   * runs without saying whose (src/runtime/durable-agent.ts `takeSettled`), and a subagent's turn is not the agent's.
+   * The ends of the main conversation's runs this step settled, to be written down for `#runPluginHooks`, with the text
+   * each ended on: the branch's last message when it is the model's. Null when no mount takes turn ends (nothing is
+   * read or written then). pi085 only: pd's step settles every conversation's runs without saying whose
+   * (src/runtime/durable-agent.ts `takeSettled`), and a subagent's turn is not the agent's.
    */
-  async #recordTurnEnds(tenantId: string, agentId: string, agent: AgentEngine, settled: Array<{ operationId: string; status: string }>) {
-    if (!(await this.#takesTurnEnds(tenantId, agentId))) return;
+  async #turnEndsOf(tenantId: string, agentId: string, agent: AgentEngine, settled: Array<{ operationId: string; status: string }>):
+    Promise<Array<{ operationId: string; end: Parameters<typeof recordTurnEnd>[2] }> | null> {
+    if (!settled.length || !(await this.#takesTurnEnds(tenantId, agentId))) return null;
     const branch = await agent.branch();
     const last = ([...branch].reverse().find((e) => e.type === "message") as { message?: unknown } | undefined)?.message;
-    const now = Date.now();
-    for (const s of settled) recordTurnEnd(this.#deps.ctx.storage.sql, s.operationId, turnEndOf(s.status, last), now);
+    return settled.map((s) => ({ operationId: s.operationId, end: turnEndOf(s.status, last) }));
   }
 
   /**
@@ -5779,7 +5794,8 @@ export class AgentRuntime {
   /**
    * The overflow backstop (src/runtime/overflow-backstop.ts), after a step that settled a run of pi085's main
    * conversation. When that run ended because the history no longer fits the window, the conversation is rebuilt
-   * (`#rebuildContext`, trigger `window`) and its first call sent; that step's outcome is returned. Null when nothing was rebuilt.
+   * (`#rebuildContext`, trigger `window`) and its first call sent; that step's outcome is returned, with `rebuilt` (the run
+   * that just ended runs again for its input). `rebuilt` is false for a pending briefing posted again. Null when nothing was done.
    *
    * Once per run that ended on an overflow, and bounded (`judgeOverflow`): when the rebuilt conversation's request
    * overflows again, or overflows come `MAX_CONSECUTIVE_OVERFLOWS` in a row, the session is marked `needs_reset` instead
@@ -5790,7 +5806,7 @@ export class AgentRuntime {
    * harness; that post's run ends the same way, and is judged then. A briefing whose post failed is posted again here,
    * unless a push is being handed over or is queued, whose post carries it.
    */
-  async #overflowBackstop(tenantId: string, agentId: string): Promise<Awaited<ReturnType<AgentEngine["step"]>> | null> {
+  async #overflowBackstop(tenantId: string, agentId: string): Promise<{ rebuilt: boolean; step: Awaited<ReturnType<AgentEngine["step"]>> | null } | null> {
     const storage = this.#deps.ctx.storage, sql = storage.sql;
     // A push being handed over, or queued to be (a post that failed waits for its retry), carries a pending briefing
     // ahead of it (`postMessage`), and an idle rebuild (`#coldWake`) leaves one for exactly that push: posted alone
@@ -5805,7 +5821,7 @@ export class AgentRuntime {
         logEvent("rebuild.briefing_held", { tenantId, agentId, decision: watch.decision, why: "its wake was not delivered" });
         return null;
       }
-      return this.#postBriefing(tenantId, agentId);
+      return { rebuilt: false, step: await this.#postBriefing(tenantId, agentId) };
     }
     const tip = mainTip(sql);
     const failedJob = tip?.message?.stopReason === "error" && typeof tip.message.jobId === "string" ? tip.message.jobId as string : null;
@@ -5838,7 +5854,7 @@ export class AgentRuntime {
       ...base, trigger: "window", to: built.to, acted: true, reason: "overflow", rebuilds: built.rebuilds,
       tokensAfter: built.tokensAfter, briefing: built.briefing, awaitOutcome: this.#recordsRebuilds(tenantId),
     });
-    return built.step;
+    return { rebuilt: true, step: built.step };
   }
 
   /** Watch a wake's run for its behaviour row. A reading for later: a watch that cannot be written loses the row, never the wake. */
