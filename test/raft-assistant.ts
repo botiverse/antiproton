@@ -504,12 +504,24 @@ await check("untold goes to the wire as filter untold; each line's told and the 
   const { plugin: plain } = pluginWith({ inbox: unreadAnswer });
   const out = String(await plain.invoke(INBOX, {}, ctx(ASSISTANT).ctx)).split("\n");
   must(out.length === 3 && !("told" in JSON.parse(out[1]!)) && out[2] === "hasMore=false nextOffset=null", `plain: ${JSON.stringify(out)}`);
-  // A told or a total that is not one is malformed, not shown.
-  for (const [what, bad] of [["told", untoldAnswer({ items: [inboxItem({ told: "yes" })] })], ["total", untoldAnswer({ total: -1 })]] as const) {
+  // A told, a total or a totalCapped that is not one is malformed, not shown.
+  for (const [what, bad] of [
+    ["told", untoldAnswer({ items: [inboxItem({ told: "yes" })] })], ["total", untoldAnswer({ total: -1 })], ["totalCapped", untoldAnswer({ totalCapped: "true" })],
+  ] as const) {
     const { plugin: p } = pluginWith({ inbox: bad });
     const e = await failure(() => p.invoke(INBOX, { filter: "untold" }, ctx(ASSISTANT).ctx));
     must(/not in the expected shape/.test(e.message), `${what}: ${e.message}`);
   }
+});
+
+await check("untold with totalCapped: the total line says it is a lower bound; totalCapped false reads as a plain total", async () => {
+  const { plugin } = pluginWith({ inbox: untoldAnswer({ totalCapped: true, total: 300 }) });
+  const lines = String(await plugin.invoke(INBOX, { filter: "untold" }, ctx(ASSISTANT).ctx)).split("\n");
+  must(lines[3] === "At least 300 match the filter untold; Raft stopped counting there, so there may be more." &&
+    !lines.some((l) => l.includes("in total, across all pages")) && lines[4] === "hasMore=true nextOffset=2" && lines.length === 5, `capped: ${JSON.stringify(lines)}`);
+  const { plugin: uncapped } = pluginWith({ inbox: untoldAnswer({ totalCapped: false }) });
+  const out = String(await uncapped.invoke(INBOX, { filter: "untold" }, ctx(ASSISTANT).ctx)).split("\n");
+  must(out[3] === "7 match the filter untold in total, across all pages." && !out.some((l) => /at least/i.test(l)) && out.length === 5, `uncapped: ${JSON.stringify(out)}`);
 });
 
 await check("untold answered 400, or with no numeric total: read once more with unread, same page, opening with the note and no total", async () => {
@@ -549,11 +561,26 @@ await check("untold answered any other failure is not retried: said as it is, af
   }
 });
 
-await check("through the SDK: untold, which the SDK's contract does not take yet, is not sent; one read with unread, the same page, with the note", async () => {
-  const { plugin, urls } = realWire(() => json(200, inboxAnswer()));
+await check("through the SDK: untold goes out as filter untold; a 200 with told and total renders with the total line, no note", async () => {
+  const { plugin, urls } = realWire(() => json(200, inboxAnswer({
+    filter: "untold", items: [inboxItem({ channelId: CH, firstUnreadMessageId: MSG(1), channelType: "channel", told: false })], total: 4,
+  })));
   const lines = String(await plugin.invoke(INBOX, { filter: "untold", limit: 5, offset: 10 }, ctx(ASSISTANT).ctx)).split("\n");
-  must(urls.length === 1 && JSON.stringify(query(urls[0]!)) === JSON.stringify({ filter: "unread", limit: "5", offset: "10" }), `requests: ${JSON.stringify(urls)}`);
+  must(urls.length === 1 && JSON.stringify(query(urls[0]!)) === JSON.stringify({ filter: "untold", limit: "5", offset: "10" }), `requests: ${JSON.stringify(urls)}`);
+  must(/^\[your owner's Raft inbox/.test(lines[0]!) && !lines.includes(UNTOLD_UNKNOWN), `head: ${lines[0]}`);
+  must(JSON.parse(lines[1]!).told === false, `item: ${lines[1]}`);
+  must(lines[2] === "4 match the filter untold in total, across all pages." && lines[3] === "hasMore=true nextOffset=10" && lines.length === 4, `tail: ${JSON.stringify(lines)}`);
+});
+
+await check("through the SDK: a server that answers untold with 400 is read once more with unread, the same page, with the note", async () => {
+  let n = 0;
+  const { plugin, urls } = realWire(() => n++ === 0 ? json(400, { error: "invalid filter" }) : json(200, inboxAnswer()));
+  const lines = String(await plugin.invoke(INBOX, { filter: "untold", limit: 5, offset: 10 }, ctx(ASSISTANT).ctx)).split("\n");
+  must(urls.length === 2 && JSON.stringify(urls.map(query)) === JSON.stringify([
+    { filter: "untold", limit: "5", offset: "10" }, { filter: "unread", limit: "5", offset: "10" },
+  ]), `requests: ${JSON.stringify(urls)}`);
   must(lines[0] === UNTOLD_UNKNOWN && /^\[your owner's Raft inbox/.test(lines[1]!), `head: ${JSON.stringify(lines.slice(0, 2))}`);
+  must(!lines.some((l) => /in total/.test(l)), `a total after the fallback: ${JSON.stringify(lines)}`);
 });
 
 await check("each read is parsed in its own naming: the other style is refused as malformed, never read as undefined", async () => {

@@ -1917,8 +1917,8 @@ export const OWNER_INBOX_TOOL = "assistant_owner_inbox";
 export const OWNER_MESSAGES_TOOL = "assistant_owner_messages";
 /**
  * `untold` is unread and not yet told to the owner (Raft's `assistant_told`, by seq; what the assistant skipped counts
- * as not told), with each row's `told` and the answer's `total`. Raft is adding it; until a Raft or the SDK this build
- * carries takes it, a read with it falls back to `unread` and says so (`ownerRead`).
+ * as not told), with each row's `told` and the answer's `total` (SDK 0.27.0). Until the Raft server takes it (an older
+ * server answers 400), a read with it falls back to `unread` and says so (`ownerRead`).
  */
 const OWNER_INBOX_FILTERS = ["unread", "all", "mentions", "unread_mentions", "untold"] as const;
 type OwnerInboxFilter = (typeof OWNER_INBOX_FILTERS)[number];
@@ -2078,11 +2078,10 @@ function ownerAnswer(out: RouteAnswer, tool: string): OwnerAnswer {
  */
 export const RAFT_ASSISTANT_WIRE: AssistantWire = {
   async ownerInbox(ctx, r) {
-    // `untold` is not in the SDK's contract yet (0.26.0); the query is passed as the SDK will type it.
-    const query = { filter: r.filter as "unread", limit: String(r.limit), ...(r.offset !== undefined ? { offset: String(r.offset) } : {}) };
+    const query = { filter: r.filter, limit: String(r.limit), ...(r.offset !== undefined ? { offset: String(r.offset) } : {}) };
     const out = await raftFor(ctx, { state: false }).routes.assistant.ownerInbox({ query });
-    // An SDK that does not know `untold` refuses it before sending, as a Raft that does not know it answers 400: the
-    // same answer, so `ownerRead` falls back the same way.
+    // An SDK older than 0.27.0 refuses `untold` before sending, as a Raft server that does not know it answers 400:
+    // should this build ever run against such a mismatch, it is the same answer, so `ownerRead` falls back the same way.
     if (r.filter === "untold" && !out.ok && out.error.kind === "validation" && out.error.reason === "request_contract_mismatch") {
       return { ok: false, status: 400 };
     }
@@ -2122,8 +2121,8 @@ export const RAFTBENCH_OP = "raftbench.findings";
 export const RAFTBENCH_TOOL = "raftbench_findings";
 /**
  * Whether the credential context's agent is a RaftBench reader: its `raftbenchReader` is literally `true`. Absent (an
- * older Server, or no grant), `false`, `"true"`, `1` and anything else are not. Read untyped: the SDK's type for the
- * field is not released yet, and its contract passes unknown agent fields through.
+ * older Server, or no grant), `false`, `"true"`, `1` and anything else are not. SDK 0.27.0's contract takes only `true`
+ * or absent (anything else fails the whole context answer before this is asked); the check stays the plugin's own.
  */
 export function isRaftbenchReader(agent: unknown): boolean {
   return object(agent).raftbenchReader === true;
@@ -2281,7 +2280,8 @@ export function renderOwnerMessages(data: unknown, alias: string, unoffered: Rea
  * item is shown as one line of JSON, with only the fields named here (so `owner` and `filter` are not shown; `channelType`
  * is, when Raft sends it, since it is what tells a DM from a channel, and so is `told`): a preview or a channel name is someone else's text, and as JSON its line breaks stay escaped,
  * so it cannot pass for a line of its own. The answer's `total`, when Raft sends it, is said in a line of its own: how
- * many match the filter across every page, the only count of what remains the model is to give.
+ * many match the filter across every page, the only count of what remains the model is to give. With `totalCapped`
+ * (Raft stopped counting at its own cap) that total is a lower bound, and the line says "at least".
  */
 export function renderOwnerInbox(data: unknown, alias: string, filter: OwnerInboxFilter, o: { untoldUnknown?: boolean } = {}): string {
   const tool = OWNER_INBOX_TOOL;
@@ -2315,12 +2315,16 @@ export function renderOwnerInbox(data: unknown, alias: string, filter: OwnerInbo
   if (!(total === undefined || (typeof total === "number" && Number.isSafeInteger(total) && total >= 0))) {
     throw malformed(tool, "total is not a count");
   }
+  const capped = d.totalCapped;
+  if (!(capped === undefined || typeof capped === "boolean")) throw malformed(tool, "totalCapped is not true or false");
   return [
     ...(o.untoldUnknown ? [UNTOLD_UNKNOWN] : []),
     ownerInboxLabel(alias),
     ...(lines.length ? lines : [`No conversations match the filter ${filter}.`]),
     // Not after a fallback: a count of unread conversations is not what remains untold.
-    ...(total !== undefined && !o.untoldUnknown ? [`${total} match the filter ${filter} in total, across all pages.`] : []),
+    ...(total !== undefined && !o.untoldUnknown ? [capped
+      ? `At least ${total} match the filter ${filter}; Raft stopped counting there, so there may be more.`
+      : `${total} match the filter ${filter} in total, across all pages.`] : []),
     `hasMore=${d.hasMore} nextOffset=${next}`,
   ].join("\n");
 }
@@ -2334,7 +2338,7 @@ export const UNTOLD_UNKNOWN = "[Told state is unavailable: Raft did not answer t
   "what remains. Do not state a number of remaining items.]";
 
 /**
- * Whether Raft answered `untold` as one: a 400 is a Raft (or an SDK, `RAFT_ASSISTANT_WIRE`) that does not know the
+ * Whether Raft answered `untold` as one: a 400 is a Raft (or an SDK older than 0.27.0, `RAFT_ASSISTANT_WIRE`) that does not know the
  * filter, and an answer with no numeric `total` is one that ignored it. Any other failure is said as it is.
  */
 function untoldAnswered(out: OwnerAnswer): boolean {
@@ -3118,7 +3122,7 @@ export function createRaftPlugin(deps: {
       // And whose assistant this is, with the owner's zone, for the brief and the night (src/plugins/raft-assistant.ts).
       await keepOwner(ctx, me.data);
       const capabilities = new Set(me.data.credential.capabilities);
-      // Read untyped: the SDK does not type `raftbenchReader` yet (`isRaftbenchReader`).
+      // Only literal true counts (`isRaftbenchReader`).
       const reader = isRaftbenchReader(me.data.agent);
       const tools: ToolSchema[] = [];
       const skipped: Array<{ name: string; reason: string }> = [];

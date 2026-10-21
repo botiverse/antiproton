@@ -879,7 +879,8 @@ lines show `channelType`), and never the DM between the assistant and its owner.
 `filter` is `unread` (the default), `all`, `mentions`, `unread_mentions` or `untold`: unread and
 not yet told to the owner (Raft's `assistant_told`, by seq; what the assistant skipped counts as
 not told). Each line shows its `told` and the result says the answer's `total` (how many match,
-across every page) when Raft sends them. Until Raft and the SDK take `untold`, a read with it
+across every page) when Raft sends them; with `totalCapped: true` (Raft read only its first 300
+conversations) the total is a lower bound and the line says "at least". Until Raft and the SDK take `untold`, a read with it
 that is answered 400, refused by the SDK's contract, or answered with no numeric `total` is read
 once more, the same page with `unread`, and the result opens with a note that told state is
 unavailable and there is no count of what remains; no other failure is retried. They are
@@ -971,7 +972,7 @@ what an `anytime` rule covers, is kept for the brief. A `#channel:msgid` the ass
 their chat (the answer to "more") counts as told too, so the next wake does not bring it back
 (`noteToldInChat`, a `raft.assistant_chat_told` row with the count). The chat prompt answers "more"
 and "what's new" from an inbox read with `untold`, at most three lines, and says how many are left
-only from the read's `total`, never from its own count or memory, and with no number when the read
+only from the read's `total` ("at least" that many when the read says so), never from its own count or memory, and with no number when the read
 says told state is unavailable.
 
 When Raft runs the check (RFC 077 step 2), it says so in the credential context, `assistantOf.raftCheck: true`, and
