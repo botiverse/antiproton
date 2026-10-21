@@ -235,6 +235,64 @@ await check("a turn's end recorded twice, before or after it was handled, is tol
   must(show(w.seen.map((s) => s.end)) === show([{ finalText: null, outcome: "cancelled", turnId: "op-1", turnKey: null }]), show(w.seen));
 });
 
+/** Trace rows of a kind, as the outbox holds them. */
+const traceRows = (w: World, kind: string) => (w.host.sql.exec("SELECT status, verdict, attrs FROM trace_outbox WHERE kind = ? ORDER BY seq", kind).toArray() as any[])
+  .map((r) => ({ status: String(r.status), verdict: String(r.verdict), attrs: JSON.parse(String(r.attrs)) }));
+
+await check("turn ends that cannot be read: one trace row with the stage and error class, and the rest of the pass still runs (#1021)", async () => {
+  const w = await world();
+  // The main conversation's engine, whose branch read throws while `broken` is set: what `#turnEndsOf` reads.
+  let broken = true;
+  const agentOf = w.rt.agent.bind(w.rt);
+  (w.rt as any).agent = async (...args: Parameters<typeof agentOf>) => {
+    const engine = await agentOf(...args);
+    return new Proxy(engine, {
+      get(target, prop) {
+        if (prop === "branch" && broken) return async () => { throw new TypeError("branch-PRIVATE-detail"); };
+        const v = Reflect.get(target, prop, target);
+        return typeof v === "function" ? v.bind(target) : v;
+      },
+    });
+  };
+  // A wake due in the same pass as the end: the hooks after the turn ends are part of what must still run.
+  const { askWake } = await import("../src/runtime/plugin-wakes.ts");
+  await w.rt.postMessage("t", "a", "hello", "prompt", "main");
+  await steps(w);
+  askWake(w.host.sql as any, "watcher-m", Date.now());
+  logs.length = 0;
+  await reply(w, "the answer");
+  must(!(await (await agentOf("t", "a")).running()), "control: the turn settled");
+  const rows = traceRows(w, "turn.end_unrecorded");
+  must(rows.length === 1 && show(rows[0]) === show({ status: "failed", verdict: "failed", attrs: { stage: "read", error_class: "TypeError" } }), show(rows));
+  must(!show(rows).includes("PRIVATE") && logs.some((l) => l.evt === "turn.end_unrecorded" && l.stage === "read" && l.errorClass === "TypeError")
+    && !show(logs).includes("PRIVATE"), `the error's text was kept: ${show(logs.filter((l) => l.evt === "turn.end_unrecorded"))}`);
+  // The pass went on: the wake due beside the end ran; the end itself was lost, so nobody was told of it.
+  must(show(w.woken) === show(["watcher-m"]) && w.seen.length === 0, show({ woken: w.woken, seen: w.seen }));
+  // And the agent is not stuck on it: the next turn's end is read and told as before.
+  broken = false;
+  await w.rt.postMessage("t", "a", "again", "prompt", "main");
+  await reply(w, "second");
+  must(show(w.seen.map((s) => s.end.finalText)) === show(["second"]) && traceRows(w, "turn.end_unrecorded").length === 1, show(w.seen));
+});
+
+await check("turn ends that cannot be written down: one trace row (stage record), and the pass still runs its hooks (#1021)", async () => {
+  const w = await world();
+  const { askWake, recordTurnEnd } = await import("../src/runtime/plugin-wakes.ts");
+  // The table exists before the trigger can name it: an end recorded and told, as any other.
+  recordTurnEnd(w.host.sql as any, "op-0", { finalText: null, outcome: "cancelled" }, Date.now());
+  await steps(w);
+  must(w.seen.length === 1, `control: ${show(w.seen)}`);
+  w.host.sql.exec("CREATE TRIGGER no_ends BEFORE INSERT ON plugin_turn_ends BEGIN SELECT RAISE(ABORT, 'disk-PRIVATE-detail'); END");
+  await w.rt.postMessage("t", "a", "hello", "prompt", "main");
+  await steps(w);
+  askWake(w.host.sql as any, "watcher-m", Date.now());
+  logs.length = 0;
+  await reply(w, "the answer");
+  const rows = traceRows(w, "turn.end_unrecorded");
+  must(rows.length === 1 && rows[0]!.attrs.stage === "record" && typeof rows[0]!.attrs.error_class === "string" && !show(rows).includes("PRIVATE"), show(rows));
+  must(show(w.woken) === show(["watcher-m"]) && w.seen.length === 1, show({ woken: w.woken, seen: w.seen }));
+});
+
 await check("turnEndOf: the model's text, a cancel, and a failure with the model's own error", async () => {
   const text = { role: "assistant", content: [{ type: "thinking", thinking: "x" }, { type: "text", text: "a" }, { type: "text", text: "b" }], stopReason: "stop" };
   must(show(turnEndOf("completed", text)) === show({ finalText: "ab", outcome: "completed" }), "completed");

@@ -1523,7 +1523,9 @@ Each read of `…/transcript` and `…/model-input` is audited (`admin_read_audi
 
 `GET …/trace` answers the agent's trace rows — the spans of its work, one row each when it ended
 (`model.call`, `tool.call`, `approval.wait`, `container.lease`, `inbound`, `mount.seeded`,
-`rebuild.decision`, `rebuild.outcome`, `rebuild.behaviour`, `turn.timing`, `import.hold`, `model.prewarm`, `agent.ready`,
+`rebuild.decision`, `rebuild.outcome`, `rebuild.behaviour`, `turn.timing`, `turn.end_unrecorded` (a pass that could not
+read or write down the main conversation's turn ends and went on without them: `attrs.stage` `read` or `record`,
+`attrs.error_class` the error's class, never its message), `import.hold`, `model.prewarm`, `agent.ready`,
 `mount.settings` (an operator's in-place change of a mount's settings, [docs/plugins.md](plugins.md)), `subagent.turn`
 (one turn of a [subagent](#subagents-send_to_agent) ending: `spanId` its session, `parentId` the tool call that sent the
 turn, `status` `done`, `failed`, `cancelled`, `stopped`, `report_failed`, `report_dropped` or `wake_failed` (a background
