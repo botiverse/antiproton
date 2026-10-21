@@ -1522,7 +1522,8 @@ await check("send as owner: an owner dropped by a recheck while the mount's list
   // A channelId goes straight to the POST without a read, so only the owner check stands between it and Raft.
   for (const target of ["#ch1", "@bob", "#ch1:aaaaaaa1", conv(1).channelId]) {
     const { out, requests } = await requestsDuring(() => asOwner(a, { target, content: "Friday works." }));
-    must(out instanceof Error && out.message.includes(`${SEND_AS_OWNER_TOOL}: this agent is not anyone's assistant now`), `${target}: ${show(out)} ${(out as Error)?.message}`);
+    // A refusal, not a retryable failure: the gateway records a retryable one `unknown` ("it may have been sent").
+    must(out instanceof Error && (out as Error & { retryable?: unknown }).retryable === false, `${target}: ${show(out)} ${(out as Error)?.message}`);
     must(requests.length === 0, `${target}: requests to Raft: ${show(requests)}`);
     must(a.r.asOwner.length === 1, `${target}: sent as the owner: ${show(a.r.asOwner)}`);
     const row = sendRows(a).at(-1);
@@ -1542,7 +1543,7 @@ await check("send as owner: the implementation with no owner record refuses ever
   } as never;
   for (const target of ["#ch1", "@bob", "#ch1:aaaaaaa1", conv(1).channelId]) {
     const e = await sendAsOwner({ target, content: "Friday works." }, a.ctx, deps).catch((x) => x as Error);
-    must(e instanceof Error && e.message.includes(`${SEND_AS_OWNER_TOOL}: this agent is not anyone's assistant now`), `${target}: ${show(e)} ${(e as Error)?.message}`);
+    must(e instanceof Error && (e as Error & { retryable?: unknown }).retryable === false, `${target}: ${show(e)} ${(e as Error)?.message}`);
     must(used.length === 0, `${target}: called ${show(used)}`);
     must(a.traced.at(-1)?.status === "refused:no_owner", `${target}: ${show(a.traced.at(-1))}`);
   }
@@ -2228,7 +2229,9 @@ await check("send as owner end to end: an owner dropped after the turn was offer
     must(w.db.read(ASSISTANT_STORE, OWNER_KEY) === undefined, `control: the owner record is back: ${show(w.db.read(ASSISTANT_STORE, OWNER_KEY))}`);
     must(w.r.asOwner.length === 1, `sent as an owner no longer there: ${show(w.r.asOwner)}`);
     must(show(rows()) === show(["sent/ok", "refused:no_owner/blocked"]), show(rows()));
-    must(/not anyone's assistant now/.test(JSON.stringify(turn.messages.at(-1))), JSON.stringify(turn.messages.at(-1)).slice(0, 600));
+    // Failed, not unknown: `unknown` is the gateway's "it may have been sent as the owner".
+    const ops = (w.host.sql.exec("SELECT status FROM operations WHERE tool LIKE '%assistant_send_as_owner' ORDER BY created_at, rowid").toArray() as any[]).map((x) => String(x.status));
+    must(show(ops) === show(["succeeded", "failed"]), `operations: ${show(ops)}`);
   } finally { w.host.dispose(); }
 });
 
