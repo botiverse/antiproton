@@ -1480,7 +1480,10 @@ await check("the chat prompt sends as the owner only when asked, directly, with 
   must(chat.includes("`raft__assistant_send_as_owner`") && /only when they explicitly ask/.test(chat) && /no draft for them to approve/.test(chat) &&
     /Ask one short question only when you can't tell what to send or to whom/.test(chat) && /Raft labels it as sent on their behalf/.test(chat) &&
     /send them its tell line as it is/.test(chat), chat);
-  must(!checkP.includes("send_as_owner"), checkP);
+  // A send it mentions later went out then: the owner may have retracted it since, so "still there" is not its to say.
+  must(chat.includes('When you mention a message you sent as them, say it went out then ("I sent it then"), not that it is still there, ' +
+    "unless you have just read its receipt in your DM: they may have retracted it, and Raft marks a retracted receipt."), chat);
+  must(!checkP.includes("send_as_owner") && !checkP.includes("I sent it then"), checkP);
 });
 
 // ---- the prompt's parts: Raft's instructions, then the code part, which wins ---------------------------------------------
@@ -1575,7 +1578,7 @@ await check("every tool the chat and check prompts name is one the raft plugin h
 await check("with send-as-owner not offered, the chat prompt does not mention sending as the owner; the rest of it is unchanged", () => {
   const without = CHAT_TOOLS.filter((n) => n !== SEND_AS_OWNER_TOOL);
   const chat = assistantPrompt("raft", without);
-  must(!/send_as_owner|send as your owner|on their behalf/i.test(chat), chat);
+  must(!/send_as_owner|send as your owner|on their behalf|I sent it then|retracted/i.test(chat), chat);
   // Control: the full prompt says it, and everything else is the same text with that paragraph out.
   const full = assistantPrompt("raft");
   must(full.includes("`raft__assistant_send_as_owner`"), "control: the full prompt does not name it");
