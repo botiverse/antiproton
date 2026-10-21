@@ -11,7 +11,7 @@ import { createHmac } from "node:crypto";
 import { PUSH_KEY, PUSH_STORE, raftPlugin, wakeInstruction } from "../src/plugins/raft.ts";
 import { activityEvents, turnEnds } from "../src/runtime/activity.ts";
 import {
-  ASSISTANT_STORE, CHAT_TOOLS, CHECK_KEY, CHECK_TOOLS, COUNTS_KEY, DEFERRED_KEY, DM_ITEMS_MAX, INBOX_LAG_RETRY_MS, OWNER_KEY, REMINDED_STORE, RETRY_BACKOFF_MS, REVIEWED_KEY, SUMMARY_MAX, UNREADABLE_KEY,
+  ASSISTANT_STORE, CHAT_TOOLS, CHECK_KEY, CHECK_TOOLS, SEND_AS_OWNER_TOOL, SEND_LIMITED_HOLD_MS, COUNTS_KEY, DEFERRED_KEY, DM_ITEMS_MAX, INBOX_LAG_RETRY_MS, OWNER_KEY, REMINDED_STORE, RETRY_BACKOFF_MS, REVIEWED_KEY, SUMMARY_MAX, UNREADABLE_KEY,
   assistantCheckPrompt, assistantMountOf, assistantPrompt, assistantWake, assistantWakeInstruction, compose, confirmRef, isQuietHours, itemOf, localDay, nextBriefAt, noteDoorbell, zoneOf,
 } from "../src/plugins/raft-assistant.ts";
 import { confirmLine, matches, ruleLine, rulesOf, winningRule, type ContactRule } from "../src/plugins/raft-assistant-rules.ts";
@@ -147,6 +147,10 @@ function raft(o: { zone?: unknown; owner?: boolean; dm?: unknown; name?: string 
     people: {} as Record<string, { id: string; type: string; name: string } | "unknown" | 500>, resolveRoute: false, resolves: [] as string[],
     /** Doorbell events by their address (`agent-event:<id8>`), as `GET /history` answers one; every such read. */
     bellEvents: {} as Record<string, unknown>, historyReads: [] as string[],
+    /** Every send-as-owner body, and how Raft answers the next ones: sent, a refusal (status and code), or no answer (`drop`). */
+    asOwner: [] as any[], asOwnerAnswer: { status: 200, code: null as string | null } as { status: number; code: string | null } | "drop",
+    /** Every owner-messages read's `around`, when it had one. */
+    arounds: [] as string[],
   };
   globalThis.fetch = (async (url: any, init?: any) => {
     const u = new URL(String(url));
@@ -181,10 +185,19 @@ function raft(o: { zone?: unknown; owner?: boolean; dm?: unknown; name?: string 
       return json(200, { messages: [{ message_id: id, sender_name: "system.assistant", sender_type: "third_party_app", channel_type: "dm", content: "System event: ...",
         third_party_event: { id, kind: "event", client_id: "system.assistant", client_name: "system.assistant", payload } }], has_more: false, has_older: false, has_newer: false });
     }
+    if (path === "/assistant/send-as-owner" && init?.method === "POST") {
+      r.asOwner.push(JSON.parse(String(init?.body ?? "{}")));
+      const answer = r.asOwnerAnswer;
+      if (answer === "drop") throw new TypeError("fetch failed");
+      if (answer.status !== 200) return json(answer.status, { error: "Refused by Raft", ...(answer.code ? { code: answer.code } : {}) });
+      const body = r.asOwner.at(-1);
+      return json(200, { messageId: "9d000000-0000-4000-8000-000000000001", channelId: body.channelId });
+    }
     if (path === "/assistant/owner-messages") {
       // A conversation's one message is its inbox row's first unread (`conv`), so a reference to it can be confirmed.
       const channelId = u.searchParams.get("channelId") ?? "";
       r.messageReads.push(channelId);
+      if (u.searchParams.get("around")) r.arounds.push(u.searchParams.get("around")!);
       const m = { seq: 1, id: `aaaaaaa${channelId.slice(-1)}-1111-4222-8333-444455556666`, timestamp: "2026-10-20T09:50:00.000Z", sender_type: "human",
         sender_name: "bob", content: "can you pick a date?", ...(r.broken.has(channelId) ? {} : { channel_type: "channel", channel_name: `ch${channelId.slice(-1)}` }) };
       return json(200, { owner: { userId: OWNER }, channelId, messages: [m], hasMore: false, hasOlder: false, hasNewer: false });
@@ -1237,6 +1250,188 @@ await check("privacy: no channel's or person's name or id reaches a trace row or
   } finally { setLogSink(null); }
 });
 
+// ---- sending as the owner ------------------------------------------------------------------------------------------------
+
+const asOwner = (a: { ctx: unknown }, args: unknown, when = DAY) => atTime(when, () => raftPlugin.invoke(SEND_AS_OWNER_TOOL, args, a.ctx as never) as Promise<any>);
+const sendRows = (a: { traced: Array<{ kind: string; status: string; verdict?: string; attrs: Record<string, unknown> }> }) => a.traced.filter((t) => t.kind === "raft.assistant_send_as_owner");
+/** The owner's conversations a send is resolved against: #ch1, a thread of #ch1 under bbbbbbb2, and a DM with @bob. */
+const THREAD_ROOT = "bbbbbbb2-1111-4222-8333-444455556666";
+const sendRows0 = () => [
+  conv(1),
+  conv(2, { kind: "thread", channelName: "ch1", parentChannelId: conv(1).channelId, parentMessageId: THREAD_ROOT }),
+  conv(3, { channelType: "dm", channelName: "bob" }),
+  conv(4, { channelType: "dm", channelName: "ada-assistant" }),
+];
+async function sender(o: { dm?: string } = {}) {
+  const a = await assistant(raft({ dm: o.dm ?? "dm:@ada" }));
+  a.r.all = sendRows0();
+  return a;
+}
+
+await check("send as owner: each target form is resolved to the body Raft takes, one POST each, and no receipt of our own", async () => {
+  const a = await sender();
+  const cases: Array<[Record<string, unknown>, Record<string, unknown>]> = [
+    [{ target: "#ch1", content: "On it." }, { channelId: conv(1).channelId, content: "On it." }],
+    // A message: its thread, by the full id a read around its short id gives.
+    [{ target: "#ch1:aaaaaaa1", content: "Friday works." }, { channelId: conv(1).channelId, content: "Friday works.", parentMessageId: "aaaaaaa1-1111-4222-8333-444455556666" }],
+    // A thread's root: its full id from the inbox's thread row, without a read.
+    [{ target: "#ch1:bbbbbbb2", content: "Agreed." }, { channelId: conv(1).channelId, content: "Agreed.", parentMessageId: THREAD_ROOT }],
+    [{ target: "#ch1:aaaaaaa1", content: "In the channel.", inThread: false }, { channelId: conv(1).channelId, content: "In the channel." }],
+    // A thread's own channelId, as the inbox gives it: taken as it is.
+    [{ target: conv(2).channelId, content: "In the thread." }, { channelId: conv(2).channelId, content: "In the thread." }],
+    [{ target: "@bob", content: "Running late." }, { channelId: conv(3).channelId, content: "Running late." }],
+  ];
+  for (const [args, body] of cases) {
+    const before = a.r.asOwner.length;
+    const out = await asOwner(a, args);
+    must(out.state === "sent" && /do not send them a confirmation/.test(out.note), `${show(args)}: ${show(out)}`);
+    must(a.r.asOwner.length === before + 1 && show(a.r.asOwner.at(-1)) === show(body), `${show(args)}: sent ${show(a.r.asOwner.slice(before))}, want ${show(body)}`);
+  }
+  must(show(a.r.arounds) === show(["aaaaaaa1"]), `reads around a message: ${show(a.r.arounds)}`);
+  // Raft sends the owner the receipt: nothing of ours went to their DM.
+  must(a.r.sends.length === 0, `our own receipt: ${show(a.r.sends)}`);
+  must(sendRows(a).length === cases.length && sendRows(a).every((t) => t.status === "sent" && t.verdict === "ok"), show(sendRows(a)));
+  must(show(sendRows(a).map((t) => t.attrs.target_kind)) === show(["channel", "message", "message", "message", "channel_id", "dm"]) &&
+    show(sendRows(a).map((t) => t.attrs.in_thread)) === show([false, true, true, false, false, false]), show(sendRows(a)));
+});
+
+await check("send as owner: every Raft refusal is not_sent with its code and the owner's line, the text only where they could send it, and one POST", async () => {
+  const table: Array<[number | "drop", string | null, string, RegExp, boolean]> = [
+    [403, "assistant_send_as_owner_off", "assistant_send_as_owner_off", /sending as you is turned off\. You can turn it on/, true],
+    [404, "channel_not_found", "channel_not_found", /can't post to that conversation for you/, true],
+    [404, "message_not_found", "message_not_found", /couldn't find that message to reply under/, true],
+    [403, "owner_cannot_post", "owner_cannot_post", /doesn't take messages from you/, false],
+    [400, "mass_mention_not_allowed", "mass_mention_not_allowed", /can't use @everyone or @here/, true],
+    [400, "invalid_content", "invalid_content", /wouldn't take the text/, false],
+    [429, "rate_limited", "rate_limited", /hit the limit for sending as you \(20 an hour, 5 per conversation\)\. I won't retry/, true],
+    [409, "channel_archived", "channel_archived", /archived/, false],
+    [404, "NOT_FOUND", "unavailable", /isn't available on this Raft yet/, true],
+    [403, "assistant_route_not_allowed", "unavailable", /isn't available on this Raft yet/, true],
+    [500, "agent_api_assistant_send_as_owner_failed", "uncertain", /couldn't tell whether it went through/, false],
+    ["drop", null, "uncertain", /couldn't tell whether it went through/, false],
+    [400, "something_new", "failed", /Raft gave an error/, true],
+  ];
+  for (const [status, code, want, line, text] of table) {
+    const a = await sender();
+    a.r.asOwnerAnswer = status === "drop" ? "drop" : { status, code };
+    const out = await asOwner(a, { target: "#ch1", content: "Ship it Friday." });
+    const tag = `${status} ${code}`;
+    must(out.state === "not_sent" && out.code === want && line.test(out.tell), `${tag}: ${show(out)}`);
+    must(out.tell.includes("Ship it Friday.") === text && (!text || out.tell.includes("Here's the text if you want to send it yourself:\nShip it Friday.")), `${tag}: the text: ${show(out.tell)}`);
+    must(!/[*#]{2}|^- /m.test(out.tell.split("\n")[0]) && out.tell.split("\n")[0]!.length < 140, `${tag}: one plain line: ${show(out.tell)}`);
+    must(/Do not call assistant_send_as_owner again/.test(out.note), `${tag}: ${show(out.note)}`);
+    must(a.r.asOwner.length === 1, `${tag}: POSTs ${a.r.asOwner.length}`);
+    const row = sendRows(a).at(-1);
+    const result = want === "uncertain" || want === "failed" ? want : `refused:${want}`;
+    must(row?.status === result && row.attrs.result === result && (status === "drop" ? !("status" in row.attrs) : row.attrs.status === status), `${tag}: ${show(row)}`);
+  }
+});
+
+await check("send as owner: rate_limited is not retried, and the same message to the same place is not sent again for a while; another one is", async () => {
+  const a = await sender();
+  a.r.asOwnerAnswer = { status: 429, code: "rate_limited" };
+  const first = await asOwner(a, { target: "#ch1", content: "Ping." });
+  must(first.code === "rate_limited" && a.r.asOwner.length === 1, `one POST for one call: ${a.r.asOwner.length}`);
+  a.r.asOwnerAnswer = { status: 200, code: null };
+  const again = await asOwner(a, { target: "#ch1", content: "Ping." }, "2026-10-20T10:05:00Z");
+  must(again.state === "not_sent" && again.code === "repeat_rate_limited" && /won't retry/.test(again.tell) && a.r.asOwner.length === 1, `the same send again: ${show(again)} ${a.r.asOwner.length}`);
+  must(sendRows(a).at(-1)?.status === "refused:repeat_rate_limited", show(sendRows(a).at(-1)));
+  const other = await asOwner(a, { target: "#ch1", content: "Something else." }, "2026-10-20T10:05:00Z");
+  must(other.state === "sent" && a.r.asOwner.length === 2, `another message: ${show(other)}`);
+  const later = await asOwner(a, { target: "#ch1", content: "Ping." }, new Date(at(DAY) + SEND_LIMITED_HOLD_MS + 1).toISOString());
+  must(later.state === "sent" && a.r.asOwner.length === 3, `after the hold: ${show(later)}`);
+});
+
+await check("send as owner: @everyone and @here are refused before anything is read or sent; an e-mail address or @hereford is not one", async () => {
+  for (const content of ["@here can someone look?", "ping @everyone", "Ok (@HERE)"]) {
+    const a = await sender();
+    const out = await asOwner(a, { target: "#ch1", content });
+    must(out.state === "not_sent" && out.code === "mass_mention_local" && /@everyone or @here/.test(out.tell), `${content}: ${show(out)}`);
+    must(a.r.asOwner.length === 0 && a.r.inboxReads.length === 0, `${content}: POSTs ${a.r.asOwner.length}, reads ${show(a.r.inboxReads)}`);
+    must(sendRows(a).at(-1)?.status === "refused:mass_mention_local", show(sendRows(a)));
+  }
+  for (const content of ["mail me at x@here.com", "@hereford is in", "@everyoneelse"]) {
+    const a = await sender();
+    must((await asOwner(a, { target: "#ch1", content })).state === "sent" && a.r.asOwner.length === 1, `refused: ${content}`);
+  }
+});
+
+await check("send as owner: what cannot be resolved is not sent, with the owner's line; a bad target or empty content is the model's error", async () => {
+  const a = await sender();
+  for (const [target, code] of [["#nope", "channel_unknown"], ["@carol", "dm_unknown"], ["@ada-assistant", "dm_unknown"], ["#ch1:cccccccc", "message_unknown"]] as const) {
+    const out = await asOwner(a, { target, content: "Hi." });
+    must(out.state === "not_sent" && out.code === code, `${target}: ${show(out)}`);
+  }
+  a.r.all = [...sendRows0(), conv(5, { channelType: "dm", channelName: "bob~agent" })];
+  const two = await asOwner(a, { target: "@bob", content: "Hi." });
+  must(two.code === "dm_ambiguous" && /Which one did you mean\?/.test(two.tell) && !two.tell.includes("Hi."), show(two));
+  a.r.inbox = 500;
+  must((await asOwner(a, { target: "#ch1", content: "Hi." })).code === "inbox_unreadable", "an unreadable inbox");
+  must(a.r.asOwner.length === 0, `sent: ${show(a.r.asOwner)}`);
+  for (const args of [{ target: "general", content: "x" }, { target: "#ch1", content: "  " }, { content: "x" }]) {
+    const e = await asOwner(a, args).then(() => null, (x) => x as Error);
+    must(e !== null, `accepted: ${show(args)}`);
+  }
+  must(/ask them in one short question/.test(String((await asOwner(a, { target: "#ch1", content: "" }).catch((x) => x)).message)), "empty content says to ask");
+});
+
+await check("send as owner: a 403 assistant_not_enabled pauses the assistant, as every call's does", async () => {
+  const a = await sender();
+  a.r.asOwnerAnswer = { status: 403, code: "assistant_not_enabled" };
+  const out = await asOwner(a, { target: "#ch1", content: "Hi." });
+  must(out.code === "assistant_not_enabled" && /switched off as your assistant/.test(out.tell), show(out));
+  must(typeof a.read(ASSISTANT_STORE, OWNER_KEY).pausedAt === "number", show(a.read(ASSISTANT_STORE, OWNER_KEY)));
+});
+
+await check("send as owner: never from a short session (a check or the brief) or a program, in code: refused before anything is read or sent", async () => {
+  for (const caller of [{ taskId: "iso_0123456789abcdef0123" }, { fromProgram: true }]) {
+    const a = await sender();
+    a.ctx.caller = { ...a.ctx.caller, ...caller };
+    const e = await asOwner(a, { target: "#ch1", content: "Hi." }).then(() => null, (x) => x as Error);
+    must(e && /never from a check/.test(e.message), `${show(caller)}: ${e?.message}`);
+    must(a.r.asOwner.length === 0 && a.r.inboxReads.length === 0, `${show(caller)}: POSTs ${a.r.asOwner.length}, reads ${show(a.r.inboxReads)}`);
+    must(sendRows(a).at(-1)?.status === "refused:proactive", show(sendRows(a)));
+  }
+  must(CHAT_TOOLS.includes(SEND_AS_OWNER_TOOL) && !CHECK_TOOLS.includes(SEND_AS_OWNER_TOOL), "offered in the chat only");
+});
+
+await check("send as owner: no message, channel or person name, or id reaches a trace row or a log line", async () => {
+  const CONTENT = "zz-SECRET-CONTENT-77", CHAN = "zz-secret-chan", PEER = "zz-peer-name";
+  const lines: string[] = [];
+  setLogSink((l) => lines.push(l));
+  try {
+    const a = await sender();
+    const rows = [conv(1, { channelName: CHAN }), conv(3, { channelType: "dm", channelName: PEER })];
+    a.r.all = rows;
+    const attempts: Array<[Record<string, unknown>, typeof a.r.asOwnerAnswer]> = [
+      [{ target: `#${CHAN}`, content: CONTENT }, { status: 200, code: null }],
+      [{ target: `#${CHAN}:aaaaaaa1`, content: CONTENT }, { status: 200, code: null }],
+      [{ target: `@${PEER}`, content: CONTENT }, { status: 403, code: "assistant_send_as_owner_off" }],
+      [{ target: rows[0]!.channelId, content: CONTENT }, { status: 429, code: "rate_limited" }],
+      [{ target: rows[0]!.channelId, content: CONTENT }, { status: 200, code: null }],
+      [{ target: `#${CHAN}`, content: `${CONTENT} @here` }, { status: 200, code: null }],
+      [{ target: `#${CHAN}-nope`, content: CONTENT }, { status: 200, code: null }],
+      [{ target: `#${CHAN}`, content: CONTENT }, "drop"],
+    ];
+    for (const [args, answer] of attempts) { a.r.asOwnerAnswer = answer; await asOwner(a, args); }
+    must(sendRows(a).length === attempts.length, `control: every call was traced: ${show(sendRows(a))}`);
+    must(lines.some((l) => l.includes("raft.assistant_send_as_owner")) && lines.some((l) => l.includes("send-as-owner")), "control: the log lines were caught");
+    for (const s of [CONTENT, "SECRET", CHAN, PEER, rows[0]!.channelId, rows[1]!.channelId, "aaaaaaa1", "9d000000"]) {
+      must(!show(a.traced).includes(s), `the trace carries ${s}: ${show(a.traced.filter((t) => show(t).includes(s)))}`);
+      must(!lines.some((l) => l.includes(s)), `a log line carries ${s}: ${show(lines.filter((l) => l.includes(s)))}`);
+    }
+  } finally { setLogSink(null); }
+});
+
+await check("the chat prompt sends as the owner only when asked, directly, with no draft to approve; the check prompt never mentions it", () => {
+  const chat = assistantPrompt("raft"), checkP = assistantCheckPrompt("raft");
+  must(!/never speak for your owner/i.test(chat), "the old rule is still in the prompt");
+  must(chat.includes("`raft__assistant_send_as_owner`") && /only when they explicitly ask/.test(chat) && /no draft for them to approve/.test(chat) &&
+    /Ask one short question only when you can't tell what to send or to whom/.test(chat) && /Raft labels it as sent on their behalf/.test(chat) &&
+    /send them its tell line as it is/.test(chat), chat);
+  must(!checkP.includes("send_as_owner"), checkP);
+});
+
 // ---- the doorbell and an inbox that lags it -----------------------------------------------------------------------------
 
 /**
@@ -1585,7 +1780,7 @@ await check("an assistant's chat is offered its owner DM, the reads and its pref
     const offered = (await w.rt.offeredTools("t", "a"))!.tools.map((t) => t.name);
     const allowed = new Set([...CHAT_TOOLS.map((n: string) => `raft__${n}`), "resume"]);
     must(offered.every((n) => allowed.has(n)), `offered beyond the chat's: ${offered.filter((n) => !allowed.has(n))}`);
-    for (const n of ["raft__assistant_preferences", "raft__assistant_owner_inbox", "raft__messages_send", "raft__receive_events", "resume"]) must(offered.includes(n), `missing ${n}: ${offered}`);
+    for (const n of ["raft__assistant_preferences", "raft__assistant_send_as_owner", "raft__assistant_owner_inbox", "raft__messages_send", "raft__receive_events", "resume"]) must(offered.includes(n), `missing ${n}: ${offered}`);
     for (const n of ["raft__assistant_notify_owner", "run_js", "jobs", "send_to_agent", "raft__tasks_list", "raft__enable_push"]) must(!offered.includes(n), `offered ${n}`);
     await w.turn("anything for me?");
     const prompt = w.calls[0]!.systemPrompt;
@@ -1664,6 +1859,42 @@ await check("a check's notify call that sends nothing: the gateway keeps its raf
     must(attrs.notifyState === "nothing_to_send" && attrs.given === 1 && attrs.sent === 0 && attrs.dropped_already_told === 1 && attrs.mount === "raft", show(attrs));
     must(w.r.sends.length === 0, show(w.r.sends));
   } finally { w.host.dispose(); }
+});
+
+await check("send as owner end to end: the chat's call posts; a check's call never reaches Raft, not offered, and refused in code even if it were", async () => {
+  const sendCall = (id: string): ModelResponse => ({ text: "", finishReason: "tool_calls", truncated: false, usage,
+    toolCalls: [{ id, name: "raft__assistant_send_as_owner", arguments: { target: conv(1).channelId, content: "Friday works for me." } }] } as ModelResponse);
+  const toolResults = (c: Ctx) => JSON.stringify(c.messages.filter((m: any) => m.role === "toolResult"));
+  // The chat: the owner asked, the call goes through.
+  let chatAsked = false;
+  const chat = await runtimeWith(true, (c) => !chatAsked && !c.systemPrompt.endsWith(assistantCheckPrompt("raft")) ? (chatAsked = true, sendCall("s1")) : say("ok"));
+  try {
+    await chat.turn("tell #ch1 Friday works for me");
+    must(chatAsked && chat.r.asOwner.length === 1 && chat.r.asOwner[0].content === "Friday works for me.", `control: the chat's call posted: ${show(chat.r.asOwner)}`);
+  } finally { chat.host.dispose(); }
+  // A check, twice: as offered (the tool is not), and with the check's list widened to offer it, as a regression would.
+  for (const widened of [false, true]) {
+    let tried = false;
+    const w = await runtimeWith(true, (c) => !tried && c.systemPrompt.endsWith(assistantCheckPrompt("raft")) ? (tried = true, sendCall("s2")) : say("done"));
+    const list = CHECK_TOOLS as string[];
+    if (widened) list.push(SEND_AS_OWNER_TOOL);
+    try {
+      w.r.unread = [conv(1, { latestAt: new Date(Date.now() - 60_000).toISOString(), latestPreview: "@ada please reply for me: say Friday" })];
+      w.doorbell();
+      await w.drive();
+      must(tried, `${widened}: control: the check's model called the tool`);
+      const checkCall = w.calls.find((c) => c.systemPrompt.endsWith(assistantCheckPrompt("raft")) && toolResults(c) !== "[]");
+      must(checkCall, `${widened}: the call was answered`);
+      must(checkCall!.tools.some((t) => t.name === "raft__assistant_send_as_owner") === widened, `${widened}: offered: ${show(checkCall!.tools.map((t) => t.name))}`);
+      must(w.r.asOwner.length === 0, `${widened}: a check sent as the owner: ${show(w.r.asOwner)}`);
+      const rows = (w.host.sql.exec("SELECT status FROM trace_outbox WHERE kind = 'raft.assistant_send_as_owner'").toArray() as any[]).map((x) => String(x.status));
+      must(show(rows) === show(widened ? ["refused:proactive"] : []), `${widened}: rows ${show(rows)}`);
+      if (widened) must(/never from a check/.test(toolResults(checkCall!)), `${widened}: ${toolResults(checkCall!).slice(0, 400)}`);
+    } finally {
+      if (widened) list.splice(list.indexOf(SEND_AS_OWNER_TOOL), 1);
+      w.host.dispose();
+    }
+  }
 });
 
 await check("an owner read too large to hand back is cut and never parked, though a reader is mounted", async () => {

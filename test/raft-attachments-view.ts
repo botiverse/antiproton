@@ -370,7 +370,7 @@ await check("a snapshot lists the view exactly where it lists the download, and 
 
 await check("toolsBasis moved with the view, so a snapshot taken without it is re-taken at the next turn and the view reaches the mount", async () => {
   const OWN = ["receive_events", "enable_push", "disable_push", "push_status", "integrations_list", "integrations_login", "integrations_actions", "integrations_invoke"];
-  const ASSISTANT = ["assistant_owner_inbox", "assistant_owner_messages", "assistant_notify_owner", "assistant_preferences"];
+  const ASSISTANT = ["assistant_owner_inbox", "assistant_owner_messages", "assistant_notify_owner", "assistant_preferences", "assistant_send_as_owner"];
   const generated = GENERATED.map((op) => ({ name: op.toolName, capability: op.capability }));
   const download = RAFT_OPERATIONS.find((op) => op.name === "attachments.downloadUrl")!;
   // FEATURES_BASIS stands for what a listing records beside the list (the Server's flags), not a tool.

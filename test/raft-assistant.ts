@@ -16,7 +16,7 @@ import { SqliteStore } from "../src/store/sqlite.ts";
 const INBOX = "assistant_owner_inbox";
 const MESSAGES = "assistant_owner_messages";
 // With the assistant's own two tools (test/raft-assistant-mode.ts), offered exactly where the reads are.
-const ASSISTANT = [INBOX, MESSAGES, "assistant_notify_owner", "assistant_preferences"];
+const ASSISTANT = [INBOX, MESSAGES, "assistant_notify_owner", "assistant_preferences", "assistant_send_as_owner"];
 // A UUID, as Raft sends it (the SDK's contract takes any text since 0.13.1; 0.13.0 required a UUID).
 const OWNER = { userId: "7a0e1b2c-3d4e-4f50-8a61-72839405a6b7", name: "Ada" };
 const CH = "c0ffee00-0000-4000-8000-000000000001";

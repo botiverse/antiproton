@@ -23,8 +23,8 @@ import {
 } from "./raft-agent-login.ts";
 import { internalHost } from "./http.ts";
 import {
-  ASSISTANT_OWN_TOOLS, ASSISTANT_STORE, CONTACT_KEY, DEFERRED_KEY, NOTIFY_TOOL, OWNER_KEY, PREFERENCES_TOOL, REMINDED_STORE, RULES_KEY,
-  assistantWake, assistantWakeInstruction, doorbellOf, isDoorbellTarget, keepOwnerFromContext, learnDm, loadOwner, mergeSources, noteDoorbell,
+  ASSISTANT_OWN_TOOLS, ASSISTANT_STORE, CONTACT_KEY, DEFERRED_KEY, NOTIFY_TOOL, OWNER_KEY, PREFERENCES_TOOL, REMINDED_STORE, RULES_KEY, SEND_AS_OWNER_TOOL,
+  sendAsOwner, type SendAsOwnerAnswer, assistantWake, assistantWakeInstruction, doorbellOf, isDoorbellTarget, keepOwnerFromContext, learnDm, loadOwner, mergeSources, noteDoorbell,
   notifyOwner, noteToldInChat, pauseOn, preferences, type PersonResolve, type AssistantOwner, type ChangeSources, type OwnerContext, type OwnerSend,
 } from "./raft-assistant.ts";
 import { callMcp, isMcpTool, keptMcpOf, leftOut, listMcp, mcpClock, mcpLines, MCP_CALL_TIMEOUT_MS, MCP_CAPABILITY, MCP_KEY, MCP_PREFIX } from "./raft-mcp.ts";
@@ -3184,6 +3184,13 @@ export function createRaftPlugin(deps: {
         return name === NOTIFY_TOOL ? notifyOwner(args, ctx, { send: sendToOwner, recheck: recheckOwner })
           : preferences(args, ctx, { inbox: (c, r) => assistant.ownerInbox(c, r), resolve: resolveOwnerPerson });
       }
+      if (name === SEND_AS_OWNER_TOOL) {
+        if (!ctx.offered?.includes(name)) throw ownerRefusal(`${name} is not offered on this mount: its Raft account is not a personal assistant`);
+        return sendAsOwner(args, ctx, {
+          inbox: (c, r) => assistant.ownerInbox(c, r), post: postAsOwner,
+          messages: (c, r) => assistant.ownerMessages(c, { channelId: r.channelId, around: r.around, limit: r.limit }),
+        });
+      }
       if (name === "receive_events") {
         const limit = integer(a.limit, "limit", 1, EVENTS_LIMIT) ?? EVENTS_LIMIT;
         // The listing's snapshot is read off its response (`snapshotTap`); nothing else this client fetches matches.
@@ -3483,6 +3490,22 @@ export const resolveOwnerPerson: PersonResolve = async (ctx, name) => {
     return { ok: false, reason: "failed" };
   }
 };
+
+/**
+ * Raft's send as the owner (`POST /assistant/send-as-owner`, RFC 077; no SDK route yet, so it goes through this plugin's
+ * own `call` on the mount's credential, which logs the route and never the body). One request, never retried: a failure
+ * is answered with Raft's status and code, and no answer at all with a null status, since the message may have landed.
+ */
+export const SEND_AS_OWNER_PATH = "/internal/agent-api/assistant/send-as-owner";
+export async function postAsOwner(ctx: PluginContext, body: { channelId: string; content: string; parentMessageId?: string }): Promise<SendAsOwnerAnswer> {
+  try {
+    const { data } = await call(ctx, "POST", SEND_AS_OWNER_PATH, body);
+    return typeof data.messageId === "string" && data.messageId ? { ok: true } : { ok: false, status: null, code: null };
+  } catch (e) {
+    const err = e as { httpStatus?: unknown; code?: unknown };
+    return { ok: false, status: typeof err.httpStatus === "number" ? err.httpStatus : null, code: typeof err.code === "string" ? err.code : null };
+  }
+}
 
 /** Kept by the listing; a failure to keep it must not fail the listing, and leaves the last record as it was. */
 async function keepOwner(ctx: PluginContext, context: OwnerContext): Promise<void> {

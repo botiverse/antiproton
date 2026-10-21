@@ -982,10 +982,35 @@ marked `anytime`; then only what such a rule covers is handed on. Each preferenc
 `refused:channel_unknown`, and the rules' counts per effect and subject kind); the wake row adds counts
 such as `muted_channel`, `muted_person`, `digest`, `always`, `anytime_night`, `night_held`, `dm`,
 `own_dm`, `default_chatter` and `rules_total`. No trace row or log line carries a channel's or a
-person's name or id. A `403 assistant_not_enabled` from any call
+person's name or id.
+
+When the owner explicitly asks the assistant to send, reply or post something for them, it does so
+with `assistant_send_as_owner`, offered in the chat only: Raft's `POST /assistant/send-as-owner`
+(RFC 077; the mount's credential and its `send` capability, no SDK route yet) posts it under the owner's
+name, labelled as sent by the assistant on their behalf, and sends the owner a receipt with a delete
+button, so the assistant sends no confirmation of its own. The prompt has it send at once, with no draft
+to approve, ask one short question only when what to send or to whom is unclear, and never send as the
+owner unasked. The tool takes a `target` (`#channel:msgid`, which replies in that message's thread, or
+with `inThread: false` posts in its channel; `#channel`; `@name` for the owner's DM with that person; or
+a `channelId` from the owner inbox, a thread's own posting in that thread) and the `content`. Names are
+resolved against the owner's inbox (a message's full id from a thread row whose root it is, else a read
+around its short id). Code keeps, whatever the model does: a call from a short session (a check or the
+brief) or from a program is refused before anything is read, and the tool is not offered there either;
+`@everyone` and `@here` are refused before anything is read; one request per call, never retried, and
+after a `rate_limited` the same message to the same place is not sent again for ten minutes. A refusal
+(`assistant_send_as_owner_off`, `channel_not_found`, `message_not_found`, `owner_cannot_post`,
+`mass_mention_not_allowed`, `invalid_content`, `rate_limited`, `channel_archived`, a missing route, or a
+target the inbox cannot resolve) is answered `not_sent` with the code and a `tell` line for the owner,
+followed by the message where they could send it themselves; no answer, or a 5xx, is `uncertain`,
+without the text, since it may have landed. Each call writes a `raft.assistant_send_as_owner` row:
+`result` (`sent`, `uncertain`, `failed` or `refused:<code>`, `refused:proactive` among them),
+`target_kind` (`message`, `channel`, `dm`, `channel_id`), `in_thread`, `chars` (the message's length)
+and Raft's HTTP `status`; never the message, a name or an id.
+
+A `403 assistant_not_enabled` from any call
 pauses the checks, the brief and the notify tool until Raft's context names the
-owner again. The chat is offered the owner DM, attachments, the reads and the
-preferences (plus `resume` and the parked-result reader), with no run_js, jobs
+owner again. The chat is offered the owner DM, attachments, the reads, the
+preferences and send-as-owner (plus `resume` and the parked-result reader), with no run_js, jobs
 or subagents, under a prompt of its own (`assistantSystemPrompt`,
 `src/runtime/pi-prompt.ts`). What an owner read returns is never parked: a result over the line is cut with a note
 to page, whatever reader is mounted, and a short session's erase also deletes anything its calls parked. Reads of an
@@ -993,6 +1018,7 @@ assistant's conversation by an operator or the console need a reason and are aud
 (`migrateEngine`) is refused with the reason, and one already there has each
 wake counted `failed` with `reason: engine_pd_unsupported` and a warning, since
 pd cannot hold a short session. `test/raft-assistant-mode.ts` holds the rules (precedence, each guard, migration, privacy with sentinel names),
+sending as the owner (each target, each refusal, no retry, the short-session guard end to end, privacy),
 the code before the model, the short session, the engine and the offered lists.
 
 **`replay: "never"` overrides the read rule.** A tool that declares it is not
