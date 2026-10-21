@@ -13,7 +13,7 @@ import { createHash } from "node:crypto";
 import { clip, logEvent, routeOf } from "../core/log.ts";
 import type { Json, MountRecord } from "../core/types.ts";
 import {
-  createRaft, describeRaftRoute, hashRaftSendContent, isInterrupted, projectRaftMessage, raftbenchRunAssignment, RAFT_OPERATIONS, RAFT_STATE_SCHEMA, SeenFrontier,
+  createRaft, describeRaftRoute, hashRaftSendContent, isInterrupted, projectRaftMessage, raftbenchFailureKind, raftbenchRunAssignment, RAFT_OPERATIONS, RAFT_STATE_SCHEMA, SeenFrontier,
   type Raft, type RaftInboxBatch, type RaftInboxListing, type RaftInterrupt, type RaftMessage, type RaftOperationSpec, type RaftState, type RaftStateStore, type RaftFailure,
 } from "@botiverse/raft-sdk";
 import { PARK_BYTES } from "./artifacts.ts";
@@ -607,6 +607,29 @@ function withServerCode(error: RaftFailure["error"]): string {
  */
 function joinFailure(out: RaftFailure): RaftFailure {
   return out.error.code === "HTTP_ERROR" ? { ...out, error: { ...out.error, message: "The Raft Server rejected the request." } } : out;
+}
+
+/**
+ * A `raftbench_findings` failure the SDK's `raftbenchFailureKind` (0.28.0) calls `stop` (`raftbench_findings_unavailable`,
+ * `raftbench_reader_not_authorized`, a capability the credential lacks) is marked as one that will not clear, whatever
+ * its HTTP class says (a 503 is `retryable` to the SDK). What the model is told to do is left as it came: the Server's
+ * `suggestedNextAction` (slock #10733) says it — read the first page again for `raftbench_findings_changed`, tell the
+ * person who asked for a stop — so the wording stays Raft's.
+ */
+function findingsFailure(out: RaftFailure): RaftFailure {
+  return raftbenchFailureKind(out) === "stop" ? { ...out, error: { ...out.error, retryable: false } } : out;
+}
+
+/**
+ * A `raftbench_findings` page with its next page as a call. The SDK's text for it is the Server's JSON, nextCursor
+ * and all, and since 0.28.0 the outcome's `next` is the call that reads on (the same filters and limit, with the
+ * cursor); like every outcome's `next` it does not reach the model, so the call is written after the page, with the
+ * SDK's reason. The last page has no `next` and gains nothing.
+ */
+function findingsText(text: string, next: unknown): string {
+  const step = object(next);
+  if (step.kind !== "next_findings_page" || !step.args || typeof step.args !== "object") return text;
+  return `${text}\nNext page: ${RAFTBENCH_TOOL}(${JSON.stringify(step.args)})${typeof step.why === "string" && step.why ? ` — ${step.why}` : ""}`;
 }
 
 /**
@@ -1313,7 +1336,7 @@ async function runOperation(
   const out = await raft.invoke(op.name, seen ? { ...keyed, seen } : keyed, caller);
   if (!out.ok) {
     const key = retryKey(op, out as RaftFailure, keyed);
-    const failed = op.name === "channels.join" ? joinFailure(out as RaftFailure) : out as RaftFailure;
+    const failed = op.name === "channels.join" ? joinFailure(out as RaftFailure) : op.name === RAFTBENCH_OP ? findingsFailure(out as RaftFailure) : out as RaftFailure;
     throw sdkFailure(failed, unoffered, op.sideEffect !== "read", { tool: op.toolName, ...(key ? { key } : {}) });
   }
   if (tap) await keepSnapshot(ctx, await tap.snapshotId(), []);
@@ -1332,6 +1355,7 @@ async function runOperation(
   const messages = [...(Array.isArray(data?.messages) ? data.messages : []), data?.message].filter(isMessage);
   let text = whoamiText(op, out.text, data).trim();
   for (const m of messages) text = text.replace(m.text, modelLine(m, unoffered));
+  if (op.name === RAFTBENCH_OP) text = findingsText(text, (out as { next?: unknown }).next);
   const result = { state: out.state, text: offeredTerms(text, unoffered, quotedCalls(data, unofferedPattern(unoffered))) };
   if (op.consumes.model.includes("seen")) await keepShown(raft, ctx, result);
   return result;

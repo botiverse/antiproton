@@ -314,7 +314,9 @@ await check("no tool description or parameter description, at any depth, names a
 /**
  * A description is the same on every mount, but a mount is offered only the generated tools its credential's
  * capabilities reach (`snapshotTools`). So a tool's description may name another generated tool only when every
- * credential that gets the first gets the second: the named tool needs no capability the naming one lacks.
+ * credential that gets the first gets the second: the named tool needs no capability the naming one lacks — or when
+ * the mention says so itself, the name followed by "if that tool is available" or "when that tool is available"
+ * (raftbench_findings' channelId, SDK 0.28.1, names channels_info that way: otherwise omit the filter).
  */
 function namedBeyondReach(tools: ReadonlyArray<{ name: string; summary: string; parameters: unknown }>): string[] {
   const capabilityOf = new Map(GENERATED.map((op) => [op.toolName, op.capability]));
@@ -322,7 +324,7 @@ function namedBeyondReach(tools: ReadonlyArray<{ name: string; summary: string; 
     const own = capabilityOf.get(t.name);
     if (!own) return [];
     const texts = [t.summary, ...descriptionsIn(t.parameters, t.name).map(([, d]) => d)];
-    return GENERATED.filter((op) => op.toolName !== t.name && texts.some((d) => new RegExp(`(?<![\\w.])${op.toolName}(?![\\w])`).test(d)))
+    return GENERATED.filter((op) => op.toolName !== t.name && texts.some((d) => new RegExp(`(?<![\\w.])${op.toolName}(?![\\w])(?!\\s+(?:if|when) that tool is available)`).test(d)))
       .filter((op) => op.capability.some((c) => !own.includes(c)))
       .map((op) => `${t.name} names ${op.toolName} (needs ${op.capability.filter((c) => !own.includes(c)).join(", ")})`);
   });
@@ -335,6 +337,11 @@ await check("no description names a generated tool a credential could lack while
   const card = toolNamed("actions_prepare")!;
   const doctored = namedBeyondReach([{ ...card, summary: `${card.summary} Or call mentions_add, or tasks_delete.` }]);
   if (JSON.stringify(doctored) !== JSON.stringify(["actions_prepare names mentions_add (needs mentions)"])) throw new Error(`control: ${JSON.stringify(doctored)}`);
+  // A mention that says it may be missing passes; the same tool named plainly in the same text is still caught.
+  const conditional = namedBeyondReach([{ ...card, summary: `${card.summary} Look it up with mentions_add if that tool is available; otherwise omit it.` }]);
+  if (conditional.length) throw new Error(`conditional: ${JSON.stringify(conditional)}`);
+  const both = namedBeyondReach([{ ...card, summary: `${card.summary} Use mentions_add when that tool is available, or call mentions_add.` }]);
+  if (JSON.stringify(both) !== JSON.stringify(["actions_prepare names mentions_add (needs mentions)"])) throw new Error(`both: ${JSON.stringify(both)}`);
 });
 
 await check("the manifest's declarations map onto the tool: side effect, model-only, idempotency, description and schema", async () => {
@@ -1979,7 +1986,7 @@ await check("messages_search offers cursor, and the cursor the SDK's text hands 
 /** The operations whose result the manifest says may be large and that page by `limit`: the ones capped here. */
 // users.info's limit is how many visible channels it inspects for memberships: capped, it bounds the result (and,
 // since 0.12.0 asks Raft for one window in one request, how many rosters Raft reads for one call).
-const CAPPED = ["raftbench.findings", "inbox.list", "messages.read", "messages.search", "attachments.comments", "mentions.pending", "server.info", "users.info"];
+const CAPPED = ["inbox.list", "messages.read", "messages.search", "attachments.comments", "mentions.pending", "server.info", "users.info", "raftbench.findings"];
 
 await check("a paged result stays under the parking line: limit is capped and defaulted on every operation that pages by it", async () => {
   if (PAGE_ROWS < 1 || PAGE_ROWS * 400 > PARK_BYTES) throw new Error(`PAGE_ROWS=${PAGE_ROWS} against PARK_BYTES=${PARK_BYTES}`);
@@ -2117,6 +2124,50 @@ await check("raftbench_findings (SDK 0.26.0) is generated from the manifest: a r
   one(json(403, { error: "raftbench_grant_required" }));
   const refused = await failure(() => raftPlugin.invoke("raftbench_findings", {}, reader()));
   if (!/403/.test(refused.message)) throw new Error(refused.message);
+});
+
+await check("raftbench_findings (SDK 0.28.0): a page with a nextCursor ends with the next page's call, the same filters and limit with the cursor; the last page gains nothing", async () => {
+  const reader = () => inTurn({ ...ctx(), offered: [RAFTBENCH_TOOL] });
+  const page = (nextCursor: string | null) => json(200, { revision: 3, findings: [], total: 12, nextCursor, coverage: { historyFrom: null, scannedThroughAt: null, note: "n" } });
+  one(page("c2"));
+  const first: any = await raftPlugin.invoke(RAFTBENCH_TOOL, { kind: "repeated_attempt" }, reader());
+  const line = String(first.text).split("\n").at(-1)!;
+  must(first.state === "page" && line.startsWith(`Next page: ${RAFTBENCH_TOOL}(${JSON.stringify({ kind: "repeated_attempt", limit: PAGE_ROWS, cursor: "c2" })})`) &&
+    /read the next page only if more examples would change the answer/.test(line), `page: ${JSON.stringify(first)}`);
+  // The call it names is the next page: the cursor goes out with the first page's filters and limit.
+  const calls = one(page(null));
+  const last: any = await raftPlugin.invoke(RAFTBENCH_TOOL, JSON.parse(line.slice(`Next page: ${RAFTBENCH_TOOL}(`.length, line.indexOf(")"))), reader());
+  const asked = new URL(calls[0]!.url).searchParams;
+  must(asked.get("cursor") === "c2" && asked.get("kind") === "repeated_attempt" && asked.get("limit") === String(PAGE_ROWS), `asked: ${calls[0]!.url}`);
+  must(last.state === "last_page" && !/Next page/.test(last.text), `last: ${JSON.stringify(last)}`);
+});
+
+/** Raft's own refusals of a findings read, as its route sends them: slock e706c2b (#10733), its server's raftbench readers. */
+const FINDINGS_CHANGED_NEXT = "Read the first page again without a cursor.";
+const FINDINGS_UNAVAILABLE_NEXT = "Tell the person who asked that an administrator needs to review the RaftBench settings. Retrying will not help until then.";
+const READER_NOT_ALLOWED_NEXT = "A server owner or administrator has to allow this agent in RaftBench settings. Tell the person who asked; retrying, or using another agent's identity, will not help.";
+
+await check("raftbench_findings failures pass Raft's suggestedNextAction through unchanged; a kind the SDK's raftbenchFailureKind calls stop is marked as one that will not clear", async () => {
+  const reader = () => inTurn({ ...ctx(), offered: [RAFTBENCH_TOOL] });
+  one(json(409, { error: "RaftBench access or analysis changed while reading.", code: "raftbench_findings_changed", suggestedNextAction: FINDINGS_CHANGED_NEXT }));
+  const changed = await failure(() => raftPlugin.invoke(RAFTBENCH_TOOL, { cursor: "c2" }, reader()));
+  must(changed.message.endsWith(` — ${FINDINGS_CHANGED_NEXT}`) && /raftbench_findings_changed/.test(changed.message), `changed: ${changed.message}`);
+  const stops: Array<[number, string, string, string]> = [
+    [409, "raftbench_findings_unavailable", "RaftBench analysis settings changed (its administrator, service agent or source channels) and need an administrator's review.", FINDINGS_UNAVAILABLE_NEXT],
+    [403, "raftbench_reader_not_authorized", "This agent does not have a current RaftBench reader grant.", READER_NOT_ALLOWED_NEXT],
+    // A 503 is retryable to the SDK by its HTTP class; the stop kind is what decides.
+    [503, "raftbench_findings_unavailable", "unavailable", FINDINGS_UNAVAILABLE_NEXT],
+  ];
+  for (const [status, code, error, next] of stops) {
+    one(json(status, { error, code, suggestedNextAction: next }));
+    const gone = await failure(() => raftPlugin.invoke(RAFTBENCH_TOOL, {}, reader()));
+    must(gone.message.endsWith(` — ${next}`) && gone.message.includes(code) && gone.transient === false && gone.retryable === false,
+      `${code} ${status}: ${gone.message} ${JSON.stringify(gone)}`);
+  }
+  // Control: the same 503 with a code the SDK has no stop for stays one that may clear.
+  one(json(503, { error: "down", code: "raftbench_unavailable", suggestedNextAction: "Retry in a moment." }));
+  const down = await failure(() => raftPlugin.invoke(RAFTBENCH_TOOL, {}, reader()));
+  must(down.transient === true && down.message.endsWith(" — Retry in a moment."), `control: ${down.message} ${JSON.stringify(down)}`);
 });
 
 /** The credential context with the agent's `raftbenchReader` as given (slock #10609), or left out when `undefined`. */
