@@ -240,17 +240,19 @@ attr the row does not have is `null`. No span id, no verdict, no other attr, no 
 identity is (`tenant_id`, `agent_id`, `seq`), the same on every resend, and the receiver dedupes on it.
 
 **What is sent, `agent.trace`.** Rows of the nine kinds above only, as `POST <base>/api/external/antiproton-trace`.
-Each row has an envelope (`seq`, `at`, `kind`, `tenant_id`, `agent_id`, `span_id`, `env`, and when there are ones that
-fit, `status`, `verdict`, `ms`) and then its kind's fields, each named and typed in `AGENT_TRACE_FIELDS` and built from
-one attr; an attr that is not a field there is never sent, and a field whose value is not the receiver's shape (an id,
-a lowercase code, a listed value, a non-negative integer, a boolean) is left out rather than sent. So no message text,
-prompt, tool argument, error sentence, rule or conversation name leaves: a `tool.call` row's `error` (the tool's own
-sentence), a `model.call`'s `limit`, a wake's `error` are never fields. Codes are written lowercase (`toolUse` is
-`tool_use`, `NOT_FOUND` is `not_found`); a span id with a character the receiver refuses (an OpenAI tool call id's `|`)
-has it replaced by `_`. A row whose tenant, agent or span cannot be written as an id is not sent but counted
-(`unsendable`), since the receiver would refuse its whole batch. The receiver keys a row by
-(`tenant_id`, `agent_id`, `span_id`, `kind`[, `attempt`]) and drops any field it does not take; some fields here are
-ones it does not take yet (marked `proposed` in the code).
+Each row has an envelope (`seq`, `at`, `kind`, `tenant_id`, `agent_id`, `env`, and when there are ones that fit,
+`span_id`, `status`, `verdict`, `ms`) and then its kind's fields, each named and typed as the receiver's
+(`ANTIPROTON_TRACE_KINDS` there, `AGENT_TRACE_FIELDS` here) and built from one attr; an attr that is not a field there
+is never sent, and a value that is not its field's shape (an id, a code, a listed value, a non-negative integer, a
+boolean) is left out rather than rewritten. So no message text, prompt, tool argument, error sentence, rule or
+conversation name leaves: a `tool.call` row's `error` (the tool's own sentence), a `model.call`'s `limit`, a wake's
+`error` are never fields. A row's identity at the receiver is (`tenant_id`, `agent_id`, `seq`), the same on every resend;
+a span id is not unique per row (a wake's and a turn end's are the mount's). A row whose tenant or agent is not an id
+is not sent but counted (`unsendable`).
+
+The receiver takes a batch row by row: a 2xx answers `{"accepted": n, "rejected": [{"index", "reason"}]}`. The rejected
+rows are dropped, never retried (the same row gets the same answer), and counted as `rejected` with the receiver's
+reason (diagnose `agentTraceForward.rejected`, by reason, seven days); the rest are sent, and the batch is a success.
 
 **Both lanes.** At most 500 rows and 256 KiB a request (the receiver takes 500 rows, and 256 KiB on github-refresh,
 512 KiB on antiproton-trace), `Authorization: Bearer <token>`, the body `{"rows":[…]}`.
@@ -279,7 +281,8 @@ past that the oldest are dropped (`lost`).
 3. Check it: `GET $HOST/admin/diagnose?tenantId=<tenantId>&agentId=<agentId>` has `githubRefreshForward` and
    `agentTraceForward`, each with `stagedThrough` moving, `queued` 0, `backoff` null and nothing in `recent` (or the
    reasons it was not sent: `auth_or_off` with 401 is the token, with 404 the receiver switched off or without the
-   route; `unsendable` a row with an id the receiver would refuse). Workers Logs has `github.refresh.forward` and
+   route; `unsendable` a row whose tenant or agent is not an id; `rejected` rows the receiver refused, with its reason
+   in `detail` and the totals in `agentTraceForward.rejected`). Workers Logs has `github.refresh.forward` and
    `trace.forward` lines (`result` `sent`, `kept`, `dropped` or `retry`, with `reason` and `status`; never the URL or
    the token), though the object's lines can be dropped (above). On the receiving side, the rows are in `otel.logs`
    with `env` `preview`.

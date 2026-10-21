@@ -41,10 +41,12 @@
  *   timeout ends the lane's sending for the pass like any other failure: no later batch is tried until the backoff is over.
  * - any other 4xx: dropped (`rejected`), as a resend of the same request gets the same.
  * The backoff: FORWARD_BACKOFF_BASE_MS, doubling to FORWARD_BACKOFF_MAX_MS, cleared by the next success.
- * A resent row is the same row. A `github.refresh` row's identity is (tenant_id, agent_id, seq), the outbox's own; an
- * `agent.trace` row carries the same `seq`, and the receiver keys it by (tenant_id, agent_id, span_id, kind[, attempt]).
- * A row the receiver would refuse whole (an id not shaped like one) is not sent but counted (`unsendable`) at staging,
- * since one such row would make the receiver refuse its whole batch.
+ * A resent row is the same row: its identity is (tenant_id, agent_id, seq), the outbox's own, on both lanes, and the
+ * receiver dedupes on it. The antiproton-trace route answers a 2xx with the rows it could not take
+ * (`{accepted, rejected: [{index, reason}]}`): those are dropped, not retried (the same row gets the same answer), and
+ * counted as `rejected` with the receiver's reason; the rest of the batch is accepted and the 2xx is a success. A row
+ * this side already knows the receiver would reject (a tenant or agent that is not an id) is not sent but counted
+ * (`unsendable`) at staging.
  *
  * What a pause costs, and why the queue rather than the outbox holds it: the export prunes the outbox through the lanes'
  * stage cursors, which always move, so a paused lane never holds the outbox (every kind's rows) or the export. What
@@ -106,6 +108,8 @@ export type ForwardLane = {
   table: string;
   log: string;
   map(r: TraceOutboxRow, env: ForwardEnv): WireRow | null;
+  /** The receiver answers a 2xx with `rejected: [{index, reason}]`, the rows of the batch it did not take. */
+  rowRejections?: boolean;
 };
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -147,14 +151,14 @@ export const GITHUB_REFRESH_LANE: ForwardLane = {
 // the trace-upload worker's `antiprotonTrace.ts`, `ANTIPROTON_TRACE_KINDS`).
 
 /**
- * The receiver's shapes, mirrored so that what is sent is what it keeps. An id: letters, digits and `_ . : @ / -`, at
- * most 128. A code: lowercase, digits and `_ . : -`, at most 64. A count: a non-negative safe integer. An int: a safe
- * integer. Anything else is not sent.
+ * The receiver's shapes, mirrored so that what is sent is what it keeps. An id: letters, digits and `_ . : @ / | -`, at
+ * most 128. A code: letters, digits and `_ . : -`, at most 64, case kept. A count: a non-negative safe integer. An int:
+ * a safe integer. A value that is not its field's shape is not sent; nothing is rewritten to fit.
  */
-const ID = /^[A-Za-z0-9_.:@/-]{1,128}$/;
-const CODE = /^[a-z0-9_.:-]{1,64}$/;
+const ID = /^[A-Za-z0-9_.:@/|-]{1,128}$/;
+const CODE = /^[A-Za-z0-9_.:-]{1,64}$/;
 
-type FieldType = "id" | "code" | "count" | "int" | "bool" | readonly string[];
+type FieldType = "id" | "code" | "count" | "int" | "bool" | "flag" | readonly string[];
 /** Where a field comes from: an attr by name, or the row's own `status` or `ms`. */
 type Source = string | { row: "status" | "ms" };
 /** wire name → [source, type]. */
@@ -164,12 +168,12 @@ const STATUS = { row: "status" } as const;
 const MS = { row: "ms" } as const;
 
 /**
- * Per kind, every field an `agent.trace` row may carry beyond its envelope, and where each comes from. The receiver's
- * fields first; after them, under `// proposed`, ids and counts the receiver does not keep yet (it drops a field it does
- * not know), named so it can take them without a change here. Deliberately absent: tool.call's `error` (a tool's own
- * sentence, redacted but free text), its `name` and `callId`; model.call's `limit` (a sentence) and `prefix` (an
- * object); a wake's `error` (a message) and every plugin row's `mount`; turn.stop's `errorClass` (a sentence for
- * people, which the receiver's id shape refuses; `trigger` says the same); turn.timing's raw instants.
+ * Per kind, every field an `agent.trace` row carries beyond its envelope, and where each comes from: the receiver's
+ * fields (`ANTIPROTON_TRACE_KINDS`), by its names and types, and nothing else. Deliberately absent: tool.call's `error`
+ * (a tool's own sentence, redacted but free text), its `name` and `callId`; model.call's `limit` (a sentence) and
+ * `prefix` (an object); a wake's `error` (a message) and every plugin row's `mount`; turn.stop's `errorClass` (a
+ * sentence for people; `trigger` says the same); turn.timing's raw instants. Attrs written that the receiver has no field
+ * for, so not sent: tool.refused's `task`, a wake's `inbox_lagging` and `reason`, turn_ended's `snapshotMismatches`.
  */
 export const AGENT_TRACE_FIELDS: Readonly<Partial<Record<TraceKind, FieldSpec>>> = {
   "model.call": {
@@ -178,57 +182,47 @@ export const AGENT_TRACE_FIELDS: Readonly<Partial<Record<TraceKind, FieldSpec>>>
     first_tool: ["firstTool", "id"], turn: ["turn", "id"], session: ["session", "id"],
   },
   "model.attempt": {
-    attempt: ["attempt", "count"], phase: ["phase", ["take", "admit", "call", "deliver"]], outcome: ["outcome", "id"],
-    total_ms: [MS, "count"], provider_ms: ["providerMs", "count"], model: ["model", "id"],
-    // proposed
-    http_status: ["httpStatus", "count"], error_class: ["errorClass", "id"],
+    attempt: ["attempt", "count"], phase: ["phase", ["take", "admit", "call", "deliver"]], outcome: ["outcome", "code"],
+    http_status: ["httpStatus", "count"], error_class: ["errorClass", "id"], total_ms: [MS, "count"],
+    provider_ms: ["providerMs", "count"], model: ["model", "id"],
   },
   "tool.call": {
     tool: ["tool", "id"], mount: ["mount", "id"], task: ["task", "id"], run_ms: ["runMs", "count"], exit_code: ["exitCode", "int"],
-    denied: ["denied", "bool"], error_code: ["errorCode", "code"],
-    // proposed
-    http_status: ["httpStatus", "count"],
+    denied: ["denied", "bool"], error_code: ["errorCode", "code"], http_status: ["httpStatus", "count"],
   },
   "tool.refused": {
     tool: ["tool", "id"], code: ["code", "code"], by: ["by", "id"], from: ["from", ["model", "program"]],
-    // proposed
-    task: ["task", "id"],
   },
   "turn.timing": {
     inbound_to_start_ms: ["inboundToStartMs", "count"], start_to_first_job_ms: ["startToFirstJobMs", "count"],
     model_ms: ["modelMs", "count"], between_jobs_ms: ["betweenJobsMs", "count"], tool_ms: ["toolMs", "count"],
     last_answer_to_reply_ms: ["lastAnswerToReplyMs", "count"], model_jobs: ["modelJobs", "count"], tools: ["tools", "count"],
     messages: ["messages", "count"], first_call_prompt_tokens: ["firstCallPromptTokens", "count"],
-    first_call_cached_tokens: ["firstCallCachedTokens", "count"],
-    // proposed
-    client_wait_ms: ["clientWaitMs", "count"], client_pauses: ["clientPauses", "count"], prep_ms: ["prepMs", "count"],
+    first_call_cached_tokens: ["firstCallCachedTokens", "count"], client_wait_ms: ["clientWaitMs", "count"],
+    client_pauses: ["clientPauses", "count"], prep_ms: ["prepMs", "count"],
   },
   "turn.stop": {
-    trigger: ["trigger", "code"],
-    // proposed
-    turn: ["turn", "id"],
+    trigger: ["trigger", "code"], turn: ["turn", "id"],
   },
   "raft.assistant_wake": {
-    result: [STATUS, ["skipped_empty", "skipped_filtered", "invoked", "unreadable", "paused", "night_deferred", "failed"]],
+    result: [STATUS, ["skipped_empty", "skipped_filtered", "invoked", "unreadable", "paused", "night_deferred", "failed", "inbox_lagging"]],
     trigger: ["trigger", "code"], conversations: ["conversations", "count"], candidates: ["candidates", "count"],
     seen: ["seen", "count"], unreadable: ["unreadable", "count"], lag_retry: ["lagRetry", "count"], caught_up: ["caught_up", "bool"],
     caught_up_via: ["caught_up_via", ["unread", "all", "mixed"]], caught_up_rule: ["caught_up_rule", ["seq", "time"]],
-    // proposed
     muted: ["muted", "count"], told: ["told", "count"], held: ["held", "count"], said: ["said", "count"],
-    inbox_lagging: ["inbox_lagging", "bool"], inbox_lagging_gave_up: ["inbox_lagging_gave_up", "bool"], reason: ["reason", "code"],
+    // The receiver types it a count; the plugin writes `true` (src/plugins/raft-assistant.ts `lag`), so it is sent as 1.
+    inbox_lagging_gave_up: ["inbox_lagging_gave_up", "flag"],
   },
   "raft.assistant_notify": {
     state: [STATUS, ["sent", "nothing_to_send", "kept_for_brief", "not_sent"]],
     items_in: ["given", "count"], items_sent: ["sent", "count"], dropped: ["dropped", "count"],
     dropped_already_told: ["dropped_already_told", "count"], dropped_rule: ["dropped_rule", "count"],
-    dropped_other: ["dropped_other", "count"],
-    // proposed (the receiver's `dropped_unresolved` has no source here: which of these it meant is its to say)
     dropped_not_confirmed: ["dropped_not_confirmed", "count"], dropped_decisions_in_brief: ["dropped_decisions_in_brief", "count"],
+    dropped_other: ["dropped_other", "count"],
   },
   "raft.turn_ended": {
     result: [STATUS, ["settled", "skipped", "unreadable"]], reason: ["reason", "code"], conversations: ["targets", "count"],
-    // proposed
-    outcome: ["outcome", ["completed", "interrupted", "failed"]], snapshot_mismatches: ["snapshotMismatches", "count"],
+    outcome: ["outcome", ["completed", "interrupted", "failed"]],
   },
 };
 
@@ -237,16 +231,7 @@ export const AGENT_TRACE_KINDS = Object.keys(AGENT_TRACE_FIELDS) as TraceKind[];
 
 const VERDICTS = ["ok", "failed", "blocked", "cancelled"] as const;
 
-/**
- * A code as the receiver takes one: lowercase. A stop reason is pi's camelCase (`toolUse` → `tool_use`), a plugin's error
- * code is often upper case (`NOT_FOUND` → `not_found`); either is the same token in the receiver's shape. Null when it
- * still is not one.
- */
-export function codeOf(v: unknown): string | null {
-  if (typeof v !== "string") return null;
-  const c = v.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase();
-  return CODE.test(c) ? c : null;
-}
+const codeOf = (v: unknown): string | null => typeof v === "string" && CODE.test(v) ? v : null;
 const idOf = (v: unknown): string | null => typeof v === "string" && ID.test(v) ? v : null;
 const countOf = (v: unknown): number | null => {
   if (typeof v !== "number" || !Number.isFinite(v) || v < 0) return null;
@@ -267,36 +252,28 @@ function fieldOf(v: unknown, type: FieldType): string | number | boolean | null 
     case "count": return countOf(v);
     case "int": return intOf(v);
     case "bool": return typeof v === "boolean" ? v : null;
+    // A boolean the receiver counts: 1 or 0.
+    case "flag": return typeof v === "boolean" ? (v ? 1 : 0) : null;
   }
   return null;
 }
 
 /**
- * A span id in the receiver's id shape. Most are already (`mj_…`, `op_…`, `tt_<session>@<ms>`, `wake:<alias>:<ms>`);
- * an OpenAI Responses tool call id is `call_…|fc_…`, whose `|` the receiver refuses, so any character outside the shape
- * becomes `_`, and a span longer than 128 is cut. Null when nothing is left.
- */
-export function spanOf(v: unknown): string | null {
-  if (typeof v !== "string") return null;
-  const s = v.replace(/[^A-Za-z0-9_.:@/-]/g, "_").slice(0, 128);
-  return s ? s : null;
-}
-
-/**
- * One outbox row as an `agent.trace` row: the envelope (`at`, `kind`, `tenant_id`, `agent_id`, `span_id`, `env`, `seq`,
- * `status`, `verdict`, `ms`), then the kind's fields from AGENT_TRACE_FIELDS, each checked; a field that does not pass
- * is left out, never sent as it was. Null, and nothing sent, when the row's kind is not this lane's or its tenant, agent
- * or span cannot be written in the receiver's id shape (it would refuse the whole batch for it).
+ * One outbox row as an `agent.trace` row: the envelope (`seq`, `at`, `kind`, `tenant_id`, `agent_id`, `env`, and when
+ * they fit their shapes `span_id`, `status`, `verdict`, `ms`), then the kind's fields from AGENT_TRACE_FIELDS, each
+ * checked; a value that does not pass is left out, never sent as it was. `seq` is the row's identity at the receiver
+ * (tenant_id:agent_id:seq). Null, and nothing sent, when the row's kind is not this lane's or its tenant or agent is not
+ * an id (the receiver would reject the row).
  */
 export function agentTraceRow(r: TraceOutboxRow, env: ForwardEnv): WireRow | null {
   const spec = Object.prototype.hasOwnProperty.call(AGENT_TRACE_FIELDS, r.kind) ? AGENT_TRACE_FIELDS[r.kind] ?? null : null;
   if (!spec) return null;
-  const tenant = idOf(r.tenantId), agent = idOf(r.agentId), span = spanOf(r.spanId);
-  if (!tenant || !agent || !span || !Number.isFinite(r.at)) return null;
+  const tenant = idOf(r.tenantId), agent = idOf(r.agentId);
+  if (!tenant || !agent || !Number.isFinite(r.at) || !Number.isSafeInteger(r.seq) || r.seq < 0) return null;
   const a = r.attrs ?? {};
-  const out: WireRow = {
-    seq: r.seq, at: new Date(r.at).toISOString(), kind: r.kind, tenant_id: tenant, agent_id: agent, span_id: span, env,
-  };
+  const out: WireRow = { seq: r.seq, at: new Date(r.at).toISOString(), kind: r.kind, tenant_id: tenant, agent_id: agent, env };
+  const span = idOf(r.spanId);
+  if (span) out.span_id = span;
   const status = codeOf(r.status);
   if (status) out.status = status;
   if ((VERDICTS as readonly string[]).includes(r.verdict)) out.verdict = r.verdict;
@@ -312,7 +289,7 @@ export function agentTraceRow(r: TraceOutboxRow, env: ForwardEnv): WireRow | nul
 
 export const AGENT_TRACE_LANE: ForwardLane = {
   name: "agent.trace", path: "/api/external/antiproton-trace", kinds: AGENT_TRACE_KINDS, table: "atr_forward",
-  log: "trace.forward", map: agentTraceRow,
+  log: "trace.forward", map: agentTraceRow, rowRejections: true,
 };
 
 /** Every lane, in the order a pass runs them. */
@@ -348,8 +325,10 @@ const ddl = (lane: ForwardLane) => {
     cursor: `CREATE TABLE IF NOT EXISTS ${t.staged} (id INTEGER PRIMARY KEY CHECK (id = 1), through_seq INTEGER NOT NULL)`,
     queue: `CREATE TABLE IF NOT EXISTS ${t.queue} (seq INTEGER PRIMARY KEY, row TEXT NOT NULL)`,
     state: `CREATE TABLE IF NOT EXISTS ${t.state} (id INTEGER PRIMARY KEY CHECK (id = 1), failures INTEGER NOT NULL, next_at INTEGER NOT NULL)`,
-    /** Every outcome but an accepted batch: `reason` one of FORWARD_REASONS, `status` the HTTP status when there was one. */
-    log: `CREATE TABLE IF NOT EXISTS ${t.log} (at INTEGER NOT NULL, reason TEXT NOT NULL, status INTEGER, rows INTEGER NOT NULL)`,
+    /** Every outcome but an accepted batch: `reason` one of FORWARD_REASONS, `status` the HTTP status when there was one,
+     *  and on a lane with row rejections `detail`, the receiver's reason for a `rejected` row. */
+    log: `CREATE TABLE IF NOT EXISTS ${t.log} (at INTEGER NOT NULL, reason TEXT NOT NULL, status INTEGER, rows INTEGER NOT NULL` +
+      `${lane.rowRejections ? ", detail TEXT" : ""})`,
   };
 };
 /** Dropped: `too-large`, `schema`, `rejected`, `lost`, `unsendable`. Kept for a later pass: `auth_or_off`, `unavailable`. */
@@ -364,13 +343,47 @@ export function forwardCursor(sql: Sql, lane: ForwardLane = GITHUB_REFRESH_LANE)
   return known ? Number(known.through_seq) : 0;
 }
 
-function note(sql: Sql, lane: ForwardLane, at: number, reason: ForwardReason, status: number | null, rows: number, tenantId: string, agentId: string) {
+function note(sql: Sql, lane: ForwardLane, at: number, reason: ForwardReason, status: number | null, rows: number, tenantId: string, agentId: string,
+  detail: string | null = null) {
   const t = tablesOf(lane);
   sql.exec(ddl(lane).log);
   sql.exec(`DELETE FROM ${t.log} WHERE at < ?`, at - DROPS_KEEP_MS);
-  sql.exec(`INSERT INTO ${t.log}(at, reason, status, rows) VALUES (?, ?, ?, ?)`, at, reason, status, rows);
+  if (lane.rowRejections) sql.exec(`INSERT INTO ${t.log}(at, reason, status, rows, detail) VALUES (?, ?, ?, ?, ?)`, at, reason, status, rows, detail);
+  else sql.exec(`INSERT INTO ${t.log}(at, reason, status, rows) VALUES (?, ?, ?, ?)`, at, reason, status, rows);
   const kept = reason === "auth_or_off" || reason === "unavailable";
-  logEvent(lane.log, { tenantId, agentId, result: kept ? "kept" : "dropped", reason, status: status ?? undefined, rows });
+  logEvent(lane.log, { tenantId, agentId, result: kept ? "kept" : "dropped", reason, status: status ?? undefined, rows, ...(detail ? { detail } : {}) });
+}
+
+/** A receiver's reason for one rejected row, as it is counted: its own code when it is one, else `other`. */
+const REJECT_REASON = /^[A-Za-z0-9_.:-]{1,64}$/;
+
+/**
+ * The rows of a batch a 2xx did not take, by the receiver's reason: `rejected: [{index, reason}]`, each index once and
+ * inside the batch. An answer without the list, or not JSON, rejected nothing. Read within `ms` and at most 64 KiB, as
+ * the request was: a body that does not come in time is read as rejecting nothing, since the status already said 2xx.
+ */
+async function rejectionsOf(res: Response, size: number, ms: number): Promise<Map<string, number>> {
+  const out = new Map<string, number>();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const text = await Promise.race([
+      res.text(),
+      new Promise<string>((resolve) => { timer = setTimeout(() => resolve(""), ms); }),
+    ]);
+    if (!text || text.length > 64 * 1024) return out;
+    const list = (JSON.parse(text) as { rejected?: unknown })?.rejected;
+    if (!Array.isArray(list)) return out;
+    const seen = new Set<number>();
+    for (const r of list) {
+      const index = (r as { index?: unknown })?.index, reason = (r as { reason?: unknown })?.reason;
+      if (typeof index !== "number" || !Number.isInteger(index) || index < 0 || index >= size || seen.has(index)) continue;
+      seen.add(index);
+      const why = typeof reason === "string" && REJECT_REASON.test(reason) ? reason : "other";
+      out.set(why, (out.get(why) ?? 0) + 1);
+    }
+  } catch { /* not the answer's shape: nothing rejected */ }
+  finally { clearTimeout(timer); }
+  return out;
 }
 
 /**
@@ -471,10 +484,12 @@ export async function sendForward(
     const post = async (rows: readonly WireRow[]): Promise<boolean> => {
       const { url, init } = ingestRequest(cfg, rows, lane);
       let status: number;
+      let rejections = new Map<string, number>();
       try {
         const res = await fetchWithin(fetchFn, url, init, timeoutMs);
         status = res.status;
-        try { await res.body?.cancel(); } catch { /* nothing to read */ }
+        if (lane.rowRejections && status >= 200 && status < 300) rejections = await rejectionsOf(res, rows.length, timeoutMs);
+        else try { await res.body?.cancel(); } catch { /* nothing to read */ }
       } catch (e) {
         // A timeout lands here too (`network: TimeoutError`): no answer, the rows kept, the backoff applies.
         // The error's name, not its message: a message can carry the request, and neither the URL nor the token is logged.
@@ -483,7 +498,14 @@ export async function sendForward(
         return false;
       }
       const answer = answerOf(status);
-      if (answer === "accepted") { forget(rows); out.sent += rows.length; return true; }
+      if (answer === "accepted") {
+        // The whole batch leaves the queue: the rows the receiver took, and the ones it said it never will.
+        forget(rows);
+        let refused = 0;
+        for (const [why, n] of rejections) { refused += n; note(sql, lane, now(), "rejected", status, n, tenantId, agentId, why); }
+        out.sent += rows.length - refused; out.dropped += refused;
+        return true;
+      }
       if (answer === "split" && rows.length > 1) {
         const half = Math.ceil(rows.length / 2);
         return await post(rows.slice(0, half)) && await post(rows.slice(half));

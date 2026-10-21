@@ -223,6 +223,12 @@ await check("the github.refresh forward: null while it never ran, then its curso
   const a = (await readDiagnosis(host.sql, "demo", "u-a", "t_u-a", deps(store)) as any).agentTraceForward;
   assert(a && a.stagedThrough >= 2 && a.queued === 1 && a.backoff?.failures === 1, `agent.trace: ${JSON.stringify(a)}`);
   assert(JSON.stringify(a.recent) === JSON.stringify([{ at: 4_000, reason: "auth_or_off", status: 404, rows: 1 }]), `recent: ${JSON.stringify(a.recent)}`);
+  // The receiver took the batch but rejected its row: dropped, counted by the receiver's reason, shown as such.
+  await sendForward(host.sql as any, cfg, "demo", "u-a", async () => new Response(JSON.stringify({ ok: true, accepted: 0, rejected: [{ index: 0, reason: "seq_invalid" }] }), { status: 200 }),
+    () => 10 * 60_000, 1_000, AGENT_TRACE_LANE);
+  const b = (await readDiagnosis(host.sql, "demo", "u-a", "t_u-a", deps(store)) as any).agentTraceForward;
+  assert(b.queued === 0 && b.backoff === null && JSON.stringify(b.rejected) === JSON.stringify({ seq_invalid: 1 }), `agent.trace: ${JSON.stringify(b)}`);
+  assert(b.recent[0]?.reason === "rejected" && b.recent[0]?.detail === "seq_invalid" && b.recent[0]?.status === 200, `recent: ${JSON.stringify(b.recent)}`);
   host.dispose();
 });
 

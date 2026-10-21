@@ -254,12 +254,20 @@ export async function readDiagnosis(
 /** One forward lane's tables (cf/src/trace-forward.ts, `<prefix>_staged` and the rest) as diagnose shows them, or null. */
 function forwardLaneOf(sql: Sql, prefix: "ghr_forward" | "atr_forward") {
   if (!hasTable(sql, `${prefix}_staged`)) return null;
+  // The agent.trace lane counts the rows its receiver rejected, with the receiver's reason (cf/src/trace-forward.ts `note`).
+  const detail = prefix === "atr_forward";
   return {
     stagedThrough: Number(rows(sql, `${prefix}_staged`, `SELECT through_seq FROM ${prefix}_staged WHERE id = 1`)[0]?.through_seq ?? 0),
     queued: Number(rows(sql, `${prefix}_queue`, `SELECT COUNT(*) AS n FROM ${prefix}_queue`)[0]?.n ?? 0),
     backoff: rows(sql, `${prefix}_state`, `SELECT failures, next_at FROM ${prefix}_state WHERE id = 1`)
       .map((r) => ({ failures: Number(r.failures), nextAt: Number(r.next_at) }))[0] ?? null,
-    recent: rows(sql, `${prefix}_log`, `SELECT at, reason, status, rows FROM ${prefix}_log ORDER BY at DESC LIMIT 5`)
-      .map((r) => ({ at: Number(r.at), reason: String(r.reason), status: r.status === null ? null : Number(r.status), rows: Number(r.rows) })),
+    recent: rows(sql, `${prefix}_log`, `SELECT at, reason, status, rows${detail ? ", detail" : ""} FROM ${prefix}_log ORDER BY at DESC LIMIT 5`)
+      .map((r) => ({ at: Number(r.at), reason: String(r.reason), status: r.status === null ? null : Number(r.status), rows: Number(r.rows),
+        ...(detail && r.detail !== null && r.detail !== undefined ? { detail: String(r.detail) } : {}) })),
+    // The agent.trace lane's rows the receiver rejected in the last seven days, by its reason (never retried).
+    ...(detail ? {
+      rejected: Object.fromEntries(rows(sql, `${prefix}_log`, `SELECT detail, SUM(rows) AS n FROM ${prefix}_log WHERE reason = 'rejected' GROUP BY detail ORDER BY detail`)
+        .map((r) => [String(r.detail ?? "other"), Number(r.n)])),
+    } : {}),
   };
 }
