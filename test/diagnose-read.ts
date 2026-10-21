@@ -217,6 +217,16 @@ await check("the github.refresh forward: null while it never ran, then its curso
   assert(f && f.stagedThrough >= 1 && f.queued === 1 && f.backoff?.failures === 1 && f.backoff.nextAt > 2_000, `forward: ${JSON.stringify(f)}`);
   assert(JSON.stringify(f.recent) === JSON.stringify([{ at: 2_000, reason: "auth_or_off", status: 401, rows: 1 }]), `recent: ${JSON.stringify(f.recent)}`);
   assert(r.agentTraceForward === null, `the agent.trace lane never ran: ${JSON.stringify(r.agentTraceForward)}`);
+  assert(r.traceForwardConfig === null, `no env given: ${JSON.stringify(r.traceForwardConfig)}`);
+  // An http ingest URL: forwarding is misconfigured, says why, and shows neither the URL nor the token.
+  const httpEnv = { TRACE_INGEST_URL: "http://ingest-alb.example", TRACE_INGEST_TOKEN: "tok_secret_value", DEPLOYMENT_ENV: "preview" };
+  const m = await readDiagnosis(host.sql, "demo", "u-a", "t_u-a", { ...deps(store), env: httpEnv }) as any;
+  assert(JSON.stringify(m.traceForwardConfig) === JSON.stringify({ state: "misconfigured", problem: "url_not_https", urlFrom: "TRACE_INGEST_URL", tokenFrom: "TRACE_INGEST_TOKEN" }),
+    `http: ${JSON.stringify(m.traceForwardConfig)}`);
+  assert(!JSON.stringify(m).includes("tok_secret_value") && !JSON.stringify(m).includes("ingest-alb"), "the report carries the URL or the token");
+  const on = await readDiagnosis(host.sql, "demo", "u-a", "t_u-a", { ...deps(store), env: { GITHUB_REFRESH_INGEST_URL: "https://ingest.example", GITHUB_REFRESH_INGEST_TOKEN: "t", DEPLOYMENT_ENV: "preview" } }) as any;
+  assert(JSON.stringify(on.traceForwardConfig) === JSON.stringify({ state: "on", env: "preview", urlFrom: "GITHUB_REFRESH_INGEST_URL", tokenFrom: "GITHUB_REFRESH_INGEST_TOKEN" }),
+    `on: ${JSON.stringify(on.traceForwardConfig)}`);
   appendTrace(host.sql as any, [{ at: 3_000, tenantId: "demo", agentId: "u-a", kind: "turn.stop", spanId: "op_1", status: "stopped", verdict: "cancelled", attrs: { trigger: "delete" } }]);
   stageForward(host.sql as any, cfg, "demo", "u-a", () => 3_000, AGENT_TRACE_LANE);
   await sendForward(host.sql as any, cfg, "demo", "u-a", async () => new Response(null, { status: 404 }), () => 4_000, 1_000, AGENT_TRACE_LANE);

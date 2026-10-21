@@ -9,6 +9,7 @@
  * flight is reported instead: model calls with no answer yet, and background jobs.
  */
 import type { DbKey, DbSpec, Plugin, PluginContext } from "../../src/plugins/types.ts";
+import { forwardSettingsOf } from "./trace-forward.ts";
 import { holdingOf } from "../../src/plugins/types.ts";
 import { type DbScope, PluginDbTables } from "../../src/store/plugin-db.ts";
 import { openPluginDatabase } from "../../src/runtime/plugin-db.ts";
@@ -47,6 +48,8 @@ export interface DiagnosisDeps {
   /** When the object's alarm is set for, read from the platform. */
   alarm: () => Promise<number | null>;
   now?: () => number;
+  /** The deployment's settings, for how trace forwarding is configured (`forwardSettingsOf`); never shown as values. */
+  env?: Record<string, unknown>;
 }
 
 const rows = (sql: Sql, table: string, query: string, ...bindings: unknown[]): any[] =>
@@ -217,6 +220,9 @@ export async function readDiagnosis(
       .map((r) => ({ at: Number(r.at), dropped: Number(r.dropped) })),
     // The forward's lanes (cf/src/trace-forward.ts): each null while it has never run here (forwarding is off until
     // configured, and makes no table until then); otherwise what waits, the backoff, and its last counted outcomes.
+    // Whether forwarding is on, off, or misconfigured and why (an http URL is refused: the token would go in the clear),
+    // with which setting names it was read from; never the URL or the token.
+    traceForwardConfig: deps.env ? forwardConfigReport(deps.env) : null,
     githubRefreshForward: forwardLaneOf(sql, "ghr_forward"),
     agentTraceForward: forwardLaneOf(sql, "atr_forward"),
     // Trace rows a pd commit failed to write (src/runtime/pd-outbox.ts): the commit lands without them.
@@ -270,4 +276,11 @@ function forwardLaneOf(sql: Sql, prefix: "ghr_forward" | "atr_forward") {
         .map((r) => [String(r.detail ?? "other"), Number(r.n)])),
     } : {}),
   };
+}
+
+function forwardConfigReport(env: Record<string, unknown>) {
+  const s = forwardSettingsOf(env);
+  if (s.state === "off") return { state: "off" };
+  if (s.state === "misconfigured") return { state: "misconfigured", problem: s.problem, urlFrom: s.urlFrom, tokenFrom: s.tokenFrom };
+  return { state: "on", env: s.config.env, urlFrom: s.urlFrom, tokenFrom: s.tokenFrom };
 }

@@ -51,7 +51,8 @@
   },
   // Forwarding trace rows to Raft's trace-upload worker (cf/src/trace-forward.ts: `github.refresh` rows and the
   // agent-trace kinds) is off until BOTH of these are set, and neither is set yet: the Worker var TRACE_INGEST_URL (the
-  // worker's base URL; the code appends /api/external/github-refresh and /api/external/antiproton-trace), to be added to
+  // worker's https base URL, never http: the token rides on it; the code appends /api/external/github-refresh and
+  // /api/external/antiproton-trace), to be added to
   // "vars" below once the URL is known, and the Worker secret TRACE_INGEST_TOKEN (its dedicated write-only bearer token,
   // one for both routes, never written here: `wrangler secret put TRACE_INGEST_TOKEN --config cf/wrangler.jsonc`).
   // GITHUB_REFRESH_INGEST_URL / GITHUB_REFRESH_INGEST_TOKEN, their earlier names, still work when these are unset.

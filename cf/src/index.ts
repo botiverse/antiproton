@@ -820,6 +820,7 @@ export class AgentDO extends DurableObject<Env> {
       store: new DurableObjectStore(this.ctx as any),
       plugins: this.#activeRuntime().plugins(),
       alarm: () => this.ctx.storage.getAlarm(),
+      env: this.env as unknown as Record<string, unknown>,
     });
   }
 

@@ -220,7 +220,12 @@ backoff and counts:
 **It is off** unless both of these are set on the deployment; with either missing nothing is sent, nothing is staged and
 no table is made:
 
-- the Worker **var** `TRACE_INGEST_URL`: the worker's base URL, without a path (the code appends each lane's route);
+- the Worker **var** `TRACE_INGEST_URL`: the worker's base URL, without a path (the code appends each lane's route).
+  It must be `https://`: the token goes on every request, so an `http://` URL (a bare load-balancer address, say), one
+  that does not parse, or one with a user or password in it is refused: nothing is staged or sent, and diagnose's
+  `traceForwardConfig` says `misconfigured` with the `problem` (`url_not_https`, `url_invalid`, `url_has_credentials`;
+  also `url_missing`, `token_missing`, `deployment_env_invalid` when only some of the settings are there) and which
+  setting names it read, never their values. A wrong `TRACE_INGEST_URL` does not fall back to the old name.
 - the Worker **secret** `TRACE_INGEST_TOKEN`: the dedicated write-only bearer token, one for both routes, never in a
   wrangler config or the repository. It is not a ScopeDB key: antiproton never talks to ScopeDB.
 
@@ -246,7 +251,12 @@ Each row has an envelope (`seq`, `at`, `kind`, `tenant_id`, `agent_id`, `env`, a
 is never sent, and a value that is not its field's shape (an id, a code, a listed value, a non-negative integer, a
 boolean) is left out rather than rewritten. So no message text, prompt, tool argument, error sentence, rule or
 conversation name leaves: a `tool.call` row's `error` (the tool's own sentence), a `model.call`'s `limit`, a wake's
-`error` are never fields. A row's identity at the receiver is (`tenant_id`, `agent_id`, `seq`), the same on every resend;
+`error` are never fields. Nor is a name a person or a conversation has: the receiver's id shape takes `alice` as
+readily as an id, so an id field here carries only an opaque id this side mints (a session, turn or task in the shapes
+`main`, `sub_…`, `sess_…`, `iso_…`; a span as a job, operation, provider call id or `mount:<alias>`, else no `span_id`)
+or a name from code or configuration (a tool, a mount, a model); where the vocabulary is known (`by`, `trigger`,
+`outcome`, `stop_reason`) it is that list. `model.call`'s `first_tool` and `tool.refused`'s `tool` are never filled:
+they are whatever the model wrote. A row's identity at the receiver is (`tenant_id`, `agent_id`, `seq`), the same on every resend;
 a span id is not unique per row (a wake's and a turn end's are the mount's). A row whose tenant or agent is not an id
 is not sent but counted (`unsendable`).
 
@@ -278,7 +288,8 @@ past that the oldest are dropped (`lost`).
    It is a var in the config rather than one set in the dashboard, because a deploy replaces the dashboard's vars with
    the config's.
 2. Let a preview agent take a turn (and, for `github.refresh`, make a renewal happen or wait for one).
-3. Check it: `GET $HOST/admin/diagnose?tenantId=<tenantId>&agentId=<agentId>` has `githubRefreshForward` and
+3. Check it: `GET $HOST/admin/diagnose?tenantId=<tenantId>&agentId=<agentId>` has `traceForwardConfig.state` `on`, and
+   `githubRefreshForward` and
    `agentTraceForward`, each with `stagedThrough` moving, `queued` 0, `backoff` null and nothing in `recent` (or the
    reasons it was not sent: `auth_or_off` with 401 is the token, with 404 the receiver switched off or without the
    route; `unsendable` a row whose tenant or agent is not an id; `rejected` rows the receiver refused, with its reason

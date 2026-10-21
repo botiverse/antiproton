@@ -11,14 +11,17 @@ import { appendTrace, pendingTrace, type TraceRow } from "../src/trace/outbox.ts
 import { flushActivityThenTrace } from "../cf/src/activity-raft.ts";
 import {
   FORWARD_BACKOFF_BASE_MS, FORWARD_BATCH_MAX, FORWARD_TIMEOUT_MS, FORWARD_COLUMNS, FORWARD_KINDS, forwardConfigOf, forwardCursor, forwardPass, forwardRow,
-  ingestRequest, sendForward, stageForward, GITHUB_REFRESH_LANE, AGENT_TRACE_LANE, AGENT_TRACE_KINDS, AGENT_TRACE_FIELDS, FORWARD_BATCH_BYTES,
+  ingestRequest, sendForward, stageForward, forwardSettingsOf, GITHUB_REFRESH_LANE, AGENT_TRACE_LANE, AGENT_TRACE_KINDS, AGENT_TRACE_FIELDS, FORWARD_BATCH_BYTES,
   type ForwardConfig, type ForwardRow,
 } from "../cf/src/trace-forward.ts";
 import { TRACE_KINDS, type TraceKind } from "../src/trace/outbox.ts";
 import { modelAttemptRow, modelCallRow, toolCallRow, toolRefusedRow } from "../src/trace/seams.ts";
 import { turnStopRow } from "../src/runtime/turn-stop.ts";
 import { closeTurn, turnInbound, turnSaid, turnStepStart, turnToolRan } from "../src/runtime/turn-timing.ts";
-import { notifyAttrs } from "../src/plugins/raft-assistant.ts";
+import { ASSISTANT_STORE, OWNER_KEY, assistantWake, notifyAttrs, notifyOwner } from "../src/plugins/raft-assistant.ts";
+import { raftPlugin } from "../src/plugins/raft.ts";
+import { PluginDbTables } from "../src/store/plugin-db.ts";
+import { openPluginDatabase } from "../src/runtime/plugin-db.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void>) {
@@ -430,31 +433,31 @@ async function lanePass(sql: any, e: ReturnType<typeof routes>, env: Record<stri
 function everyKind(sql: any): void {
   const t = { ...OWNER };
   appendTrace(sql, [modelCallRow({
-    ...t, jobId: "mj_aaa", stopReason: "toolUse", model: "anthropic/claude-sonnet-4.5", at: T0, createdAt: T0 - 4_000, answeredAt: T0,
+    ...t, jobId: "mj_0123456789abcdef01234567", stopReason: "toolUse", model: "anthropic/claude-sonnet-4.5", at: T0, createdAt: T0 - 4_000, answeredAt: T0,
     usage: { input: 1200, output: 80, cacheRead: 1000, cacheWrite: 200, reasoning: 12 }, session: "main", firstTool: "raft__messages_send",
     turn: "tt_main@1789999990000", limit: "You have spent your daily limit of $5", prefix: { same: 3 },
   })]);
-  appendTrace(sql, [modelAttemptRow({ ...t, jobId: "mj_aaa", at: T0 + 1 }, {
+  appendTrace(sql, [modelAttemptRow({ ...t, jobId: "mj_0123456789abcdef01234567", at: T0 + 1 }, {
     attempt: 2, phase: "call", outcome: "http", httpStatus: 529, errorClass: "OverloadedError", ms: 36_100, providerMs: 35_900,
     model: "anthropic/claude-sonnet-4.5", message: "overloaded: body {\"error\":\"x\"}",
   })]);
   appendTrace(sql, [toolCallRow({
-    ...t, taskId: "task_1", operationId: "op_1", mountAlias: "raft", tool: "messages.send", status: "failed", modelName: "raft__messages_send",
+    ...t, taskId: "main", operationId: "op_00000000000000000001", mountAlias: "raft", tool: "messages.send", status: "failed", modelName: "raft__messages_send",
     createdAt: T0, endedAt: T0 + 900, callId: "call_x|fc_y", exitCode: -1, startedAt: T0 + 100, denied: false,
     failure: { code: "NOT_FOUND", httpStatus: 404, message: "channel #secret-plans not found for user alice@example.com" },
   })]);
-  appendTrace(sql, [toolRefusedRow({ ...t, at: T0 + 3, tool: "gh.api_get", code: "unknown_tool", callId: "call_r|fc_r", by: "run_js", fromProgram: true, task: "task_1" })]);
+  appendTrace(sql, [toolRefusedRow({ ...t, at: T0 + 3, tool: "gh.api_get", code: "unknown_tool", callId: "call_Rf0r3fUs3d1|fc_0123456789abcdef0123", by: "run_js", fromProgram: true, task: "main" })]);
   turnInbound(sql, "main", T0 - 10_000, { stale: false });
   turnSaid(sql, "main", T0 - 9_900);
   turnStepStart(sql, "main", T0 - 9_000);
   turnToolRan(sql, "main", 700);
   closeTurn(sql, { ...t, session: "main", replyAt: T0 + 4, status: "completed" });
-  appendTrace(sql, [turnStopRow({ ...t, operationId: "op_stop", trigger: "provider_stop", at: T0 + 5, turn: "tt_main@1789999990000" })]);
+  appendTrace(sql, [turnStopRow({ ...t, operationId: "op_00000000000000000002", trigger: "provider_stop", at: T0 + 5, turn: "tt_main@1789999990000" })]);
   // raft-assistant.ts `record`: { trigger, ...counts } on the mount's span (a wake has no operation: gateway.ts `trace`).
   appendTrace(sql, [{ at: T0 + 6, ...t, kind: "raft.assistant_wake", spanId: "mount:assistant", status: "invoked", verdict: "ok",
     attrs: { mount: "assistant", trigger: "doorbell", conversations: 4, candidates: 2, muted: 1, told: 0, seen: 1, unreadable: 0,
       lagRetry: 1, caught_up: true, caught_up_rule: "seq", caught_up_via: "mixed" } }]);
-  appendTrace(sql, [{ at: T0 + 7, ...t, kind: "raft.assistant_notify", spanId: "op_notify", status: "sent", verdict: "ok",
+  appendTrace(sql, [{ at: T0 + 7, ...t, kind: "raft.assistant_notify", spanId: "op_00000000000000000003", status: "sent", verdict: "ok",
     attrs: { mount: "assistant", ...notifyAttrs({ items: [{}, {}, {}, {}] }, {
       state: "sent", items: 1, dropped: { "#a:1": "already told", "#b:2": "rule r_1", "#c:3": "not in a conversation this check was given" },
     }) } }]);
@@ -464,27 +467,27 @@ function everyKind(sql: any): void {
 }
 
 const GOLDEN: Record<string, Record<string, unknown>> = {
-  "model.call": { seq: 1, at: new Date(T0).toISOString(), kind: "model.call", tenant_id: "raft_t1", agent_id: "raft_a1", span_id: "mj_aaa", env: "preview",
+  "model.call": { seq: 1, at: new Date(T0).toISOString(), kind: "model.call", tenant_id: "raft_t1", agent_id: "raft_a1", span_id: "mj_0123456789abcdef01234567", env: "preview",
     status: "toolUse", verdict: "ok", ms: 4000, model: "anthropic/claude-sonnet-4.5", stop_reason: "toolUse", input: 1200, output: 80,
-    cache_read: 1000, cache_write: 200, reasoning: 12, first_tool: "raft__messages_send", turn: "tt_main@1789999990000", session: "main" },
-  "model.attempt": { seq: 2, at: new Date(T0 + 1).toISOString(), kind: "model.attempt", tenant_id: "raft_t1", agent_id: "raft_a1", span_id: "mj_aaa",
+    cache_read: 1000, cache_write: 200, reasoning: 12, turn: "tt_main@1789999990000", session: "main" },
+  "model.attempt": { seq: 2, at: new Date(T0 + 1).toISOString(), kind: "model.attempt", tenant_id: "raft_t1", agent_id: "raft_a1", span_id: "mj_0123456789abcdef01234567",
     env: "preview", status: "retried", verdict: "failed", ms: 36100, attempt: 2, phase: "call", outcome: "http", total_ms: 36100,
     provider_ms: 35900, model: "anthropic/claude-sonnet-4.5", http_status: 529, error_class: "OverloadedError" },
-  "tool.call": { seq: 3, at: new Date(T0 + 900).toISOString(), kind: "tool.call", tenant_id: "raft_t1", agent_id: "raft_a1", span_id: "op_1",
-    env: "preview", status: "failed", verdict: "failed", ms: 900, tool: "messages.send", mount: "raft", task: "task_1", run_ms: 800,
+  "tool.call": { seq: 3, at: new Date(T0 + 900).toISOString(), kind: "tool.call", tenant_id: "raft_t1", agent_id: "raft_a1", span_id: "op_00000000000000000001",
+    env: "preview", status: "failed", verdict: "failed", ms: 900, tool: "messages.send", mount: "raft", task: "main", run_ms: 800,
     exit_code: -1, error_code: "NOT_FOUND", http_status: 404 },
-  "tool.refused": { seq: 4, at: new Date(T0 + 3).toISOString(), kind: "tool.refused", tenant_id: "raft_t1", agent_id: "raft_a1", span_id: "call_r|fc_r",
-    env: "preview", status: "unknown_tool", verdict: "blocked", tool: "gh.api_get", code: "unknown_tool", by: "run_js", from: "program" },
+  "tool.refused": { seq: 4, at: new Date(T0 + 3).toISOString(), kind: "tool.refused", tenant_id: "raft_t1", agent_id: "raft_a1", span_id: "call_Rf0r3fUs3d1|fc_0123456789abcdef0123",
+    env: "preview", status: "unknown_tool", verdict: "blocked", code: "unknown_tool", by: "run_js", from: "program" },
   "turn.timing": { seq: 5, at: new Date(T0 + 4).toISOString(), kind: "turn.timing", tenant_id: "raft_t1", agent_id: "raft_a1",
     span_id: `tt_main@${T0 - 10_000}`, env: "preview", status: "completed", verdict: "ok", ms: 10004, inbound_to_start_ms: 1000, model_ms: 0,
     between_jobs_ms: 0, tool_ms: 700, model_jobs: 0, tools: 1, messages: 1, client_wait_ms: 0, client_pauses: 0, prep_ms: 100 },
-  "turn.stop": { seq: 6, at: new Date(T0 + 5).toISOString(), kind: "turn.stop", tenant_id: "raft_t1", agent_id: "raft_a1", span_id: "op_stop",
+  "turn.stop": { seq: 6, at: new Date(T0 + 5).toISOString(), kind: "turn.stop", tenant_id: "raft_t1", agent_id: "raft_a1", span_id: "op_00000000000000000002",
     env: "preview", status: "stopped", verdict: "cancelled", trigger: "provider_stop", turn: "tt_main@1789999990000" },
   "raft.assistant_wake": { seq: 7, at: new Date(T0 + 6).toISOString(), kind: "raft.assistant_wake", tenant_id: "raft_t1", agent_id: "raft_a1",
     span_id: "mount:assistant", env: "preview", status: "invoked", verdict: "ok", result: "invoked", trigger: "doorbell", conversations: 4,
     candidates: 2, seen: 1, unreadable: 0, lag_retry: 1, caught_up: true, caught_up_via: "mixed", caught_up_rule: "seq", muted: 1, told: 0 },
   "raft.assistant_notify": { seq: 8, at: new Date(T0 + 7).toISOString(), kind: "raft.assistant_notify", tenant_id: "raft_t1", agent_id: "raft_a1",
-    span_id: "op_notify", env: "preview", status: "sent", verdict: "ok", state: "sent", items_in: 4, items_sent: 1, dropped: 3,
+    span_id: "op_00000000000000000003", env: "preview", status: "sent", verdict: "ok", state: "sent", items_in: 4, items_sent: 1, dropped: 3,
     dropped_already_told: 1, dropped_rule: 1, dropped_not_confirmed: 1 },
   "raft.turn_ended": { seq: 9, at: new Date(T0 + 8).toISOString(), kind: "raft.turn_ended", tenant_id: "raft_t1", agent_id: "raft_a1",
     span_id: "mount:raft", env: "preview", status: "skipped", verdict: "ok", result: "skipped", reason: "snapshot_stale", conversations: 3,
@@ -503,19 +506,29 @@ await check("the agent.trace lane is the nine kinds the receiver takes, every on
   must(AGENT_TRACE_LANE.path === TRACE_PATH && GITHUB_REFRESH_LANE.path === GHR_PATH, "paths");
 });
 
-await check("the fields per kind are exactly the receiver's: same names, same types, same enum values", async () => {
-  const diff: string[] = [];
+/** The receiver's fields this side leaves unfilled: their value is whatever word the model wrote (cf/src/trace-forward.ts). */
+const UNFILLED = ["model.call.first_tool", "tool.refused.tool"];
+const RECEIVER_ID = /^[A-Za-z0-9_.:@/|-]{1,128}$/, RECEIVER_CODE = /^[A-Za-z0-9_.:-]{1,64}$/;
+
+await check("the fields per kind are the receiver's names and types, or narrower: a known list for an id or code, a minted shape for an id", async () => {
+  const diff: string[] = [], unfilled: string[] = [];
   for (const [kind, fields] of Object.entries(WORKER_FIELDS)) {
     const ours = AGENT_TRACE_FIELDS[kind as TraceKind]!;
     for (const [f, type] of Object.entries(fields)) {
       const mine = ours[f]?.[1];
+      if (mine === undefined) { unfilled.push(`${kind}.${f}`); continue; }
       // `flag`: a boolean attr sent as the 1 or 0 the receiver's count takes (a wake's inbox_lagging_gave_up).
-      const as = mine === undefined ? "missing" : Array.isArray(mine) ? mine.join("|") : mine === "flag" ? "count" : String(mine);
-      if (as !== type) diff.push(`${kind}.${f}: receiver ${type}, here ${as}`);
+      const ok = Array.isArray(mine)
+        ? mine.join("|") === type || (type === "id" && mine.every((v) => RECEIVER_ID.test(v))) || (type === "code" && mine.every((v) => RECEIVER_CODE.test(v)))
+        : mine === "flag" ? type === "count"
+        : mine === "session" || mine === "turn" || mine === "task" ? type === "id"
+        : mine === type;
+      if (!ok) diff.push(`${kind}.${f}: receiver ${type}, here ${Array.isArray(mine) ? mine.join("|") : mine}`);
     }
     for (const f of Object.keys(ours)) if (!(f in fields)) diff.push(`${kind}.${f}: not the receiver's`);
   }
   must(!diff.length, diff.join("; "));
+  must(unfilled.sort().join() === UNFILLED.slice().sort().join(), `unfilled: ${unfilled}`);
 });
 
 for (const kind of Object.keys(GOLDEN)) {
@@ -570,7 +583,7 @@ await check("a planted secret in a tool's error, in an unknown attr and in a wak
   must(traced(e).length === 4, `sent: ${traced(e).length}`);
   const text = e.requests.map((r) => r.text).join("\n");
   must(!text.includes("PLANTED") && !text.includes("ghp_") && !text.includes("hunter2"), `leaked: ${text.slice(0, 600)}`);
-  const s2 = traced(e).find((r) => r.span_id === "op_s2")!;
+  const s2 = traced(e).find((r) => r.seq === 2)!;
   must(s2.error_code === undefined && s2.tool === "api_get", JSON.stringify(s2));
 });
 
@@ -585,9 +598,9 @@ await check("a value not in its field's shape is left out, never rewritten; a sp
   await lanePass(sql, e);
   const rows = traced(e);
   must(rows.map((r) => r.seq).join(",") === "1,2,4", `sent: ${rows.map((r) => r.seq)}`);
-  const [a, b, d] = rows;
+  const [a, b, d] = rows;  // b's span is not a provider's call id shape (fc_ too short): left out
   must(a.tool === undefined && a.exit_code === 1 && a.run_ms === undefined && a.mount === "gh", JSON.stringify(a));
-  must(b.span_id === "call_a|fc_b" && b.from === undefined && b.code === "No_Tools", JSON.stringify(b));
+  must(!("span_id" in b) && b.from === undefined && b.code === "No_Tools", JSON.stringify(b));
   must(!("span_id" in d) && d.seq === 4 && d.error_class === undefined && d.trigger === "admin_cancel", JSON.stringify(d));
   must(JSON.stringify(atrLog(sql)) === JSON.stringify([{ reason: "unsendable", status: null, rows: 1 }]), JSON.stringify(atrLog(sql)));
 });
@@ -597,9 +610,10 @@ await check("batches: at most 500 rows and 256 KiB a request, oldest first, ever
   const long = (c: string) => `${c}`.repeat(128);
   const rows: TraceRow[] = [];
   for (let n = 1; n <= 1_400; n++) {
-    rows.push({ at: T0 + n, ...OWNER, kind: "model.call", spanId: `mj_${n}`, status: "stop", verdict: "ok", ms: n,
+    const hex = n.toString(16).padStart(40, "0");
+    rows.push({ at: T0 + n, ...OWNER, kind: "model.call", spanId: `mj_${hex}${hex.slice(0, 24)}`, status: "stop", verdict: "ok", ms: n,
       attrs: n <= 700
-        ? { model: long("m"), session: long("s"), turn: long("t"), firstTool: long("f"), input: n, output: n, cacheRead: n, cacheWrite: n, reasoning: n }
+        ? { model: long("m"), session: `sess_${hex}`, turn: `tt_sess_${hex}@${T0 + n}`, input: n, output: n, cacheRead: n, cacheWrite: n, reasoning: n }
         : { model: "m" } });
   }
   appendTrace(sql, rows);
@@ -719,6 +733,108 @@ await check("a 2xx whose body is not the answer's shape rejected nothing: every 
     const f = (await lanePass(sql, e)).forwarded!["agent.trace"]!;
     must(f.sent === 9 && f.dropped === 0 && f.error === null && ATR(sql).length === 0, `${body.slice(0, 20)}: ${JSON.stringify(f)}`);
   }
+});
+
+await check("RFC 077: an owner's DM peer and a channel's name, read by the assistant's real wake and notify, never leave in a request", async () => {
+  const PEER = "alice-peer-xyz", CHANNEL = "secret-channel-xyz";
+  const NOW = Date.parse("2026-10-20T10:30:00Z"); // 12:30 in Berlin: a doorbell's check, not the brief, not the night
+  const { sql } = sqliteHost();
+  const tables = new PluginDbTables(sqliteHost()).ensure();
+  const scope = { tenantId: OWNER.tenantId, agentId: OWNER.agentId, alias: "assistant", plugin: raftPlugin.id };
+  const local: TraceRow[] = [];
+  let op: string | null = null;
+  // The gateway's `trace` (src/runtime/gateway.ts): the operation's span, else the mount's; the mount first in attrs.
+  const ctx = {
+    caller: { tenantId: OWNER.tenantId, agentId: OWNER.agentId, taskId: "main" }, alias: "assistant",
+    db: openPluginDatabase(tables, scope, raftPlugin.database),
+    trace: (row: any) => local.push({ at: NOW, ...OWNER, kind: row.kind, spanId: op ?? "mount:assistant", status: row.status, verdict: row.verdict,
+      attrs: { mount: "assistant", ...row.attrs } }),
+  } as any;
+  await ctx.db.put(ASSISTANT_STORE, { userId: "owner-1", timezone: "Europe/Berlin", dmTarget: "dm:@owner", doorbellAt: NOW - 60_000,
+    lastBrief: "2026-10-20", briefSent: "2026-10-20" }, OWNER_KEY);
+  const items = [
+    { channelId: "c-dm-1", channelName: PEER, channelType: "dm", kind: "dm", unread: 2, hasMention: false, latestAt: "2026-10-20T10:20:00.000Z",
+      latestSenderName: PEER, latestPreview: `hi, ${PEER} here`, firstUnreadMessageId: "aaaaaaa1-1111-4222-8333-444455556666" },
+    { channelId: "c-ch-1", channelName: CHANNEL, channelType: "channel", kind: "channel", unread: 1, hasMention: true, latestAt: "2026-10-20T10:25:00.000Z",
+      latestSenderName: PEER, latestPreview: `plans for #${CHANNEL}`, firstUnreadMessageId: "bbbbbbb2-1111-4222-8333-444455556666" },
+  ];
+  const sends: string[] = [];
+  let unreadableDm = false;
+  const deps = {
+    recheck: async () => null, now: () => NOW,
+    inbox: async (_c: unknown, req: { filter: string }) => ({ ok: true as const, data: { owner: { userId: "owner-1" }, filter: req.filter, items } }),
+    messages: async (_c: unknown, channelId: string) => unreadableDm && channelId === "c-dm-1"
+      ? { ok: false as const, error: `could not read ${PEER}` } : { ok: true as const, ids: [channelId === "c-dm-1" ? "aaaaaaa1" : "bbbbbbb2"] },
+    send: async (_c: unknown, target: string, content: string) => { sends.push(`${target}: ${content}`); return { sent: true as const }; },
+  };
+  const first = await assistantWake(ctx, deps);
+  must(first && "turn" in first && String((first as any).turn).includes(CHANNEL), "control: the check's turn names the conversations it is to look at");
+  // The model's notify, about both, in the DM's and the channel's own references.
+  op = "op_0000000000000000000a";
+  const out = await notifyOwner({ items: [
+    { ref: `#${PEER}:aaaaaaa1`, summary: `${PEER} asks about Friday`, kind: "question", sender: `@${PEER}` },
+    { ref: `#${CHANNEL}:bbbbbbb2`, summary: `plans in #${CHANNEL}`, kind: "mention", sender: `@${PEER}` },
+  ] }, ctx, { send: deps.send, recheck: async () => null, now: () => NOW }) as any;
+  must(out.state === "sent" && sends.some((x) => x.includes(PEER)), `control: notify sent about them: ${JSON.stringify(out)}`);
+  // A second doorbell whose DM cannot be read: the unreadable outcome, which tells the owner by name.
+  op = null; unreadableDm = true;
+  await ctx.db.put(ASSISTANT_STORE, { ...(await ctx.db.get(ASSISTANT_STORE, OWNER_KEY)), doorbellAt: NOW - 1_000 }, OWNER_KEY);
+  items[0]!.latestAt = "2026-10-20T10:29:00.000Z"; items[1]!.latestAt = "2026-10-20T10:29:30.000Z";
+  await assistantWake(ctx, deps);
+  // Raft's answer to the turn's end, with the attrs src/plugins/raft.ts `reportTurnEnd` writes: the conversations counted, never named.
+  const shown = [PEER, CHANNEL];
+  local.push({ at: NOW, ...OWNER, kind: "raft.turn_ended", spanId: "mount:raft", status: "settled", verdict: "ok",
+    attrs: { mount: "raft", outcome: "completed", targets: shown.length } });
+  const kinds = local.map((r) => `${r.kind}:${r.status}`);
+  must(kinds.join() === "raft.assistant_wake:invoked,raft.assistant_notify:sent,raft.assistant_wake:unreadable,raft.turn_ended:settled", `rows: ${kinds}`);
+  appendTrace(sql, local);
+  const e = routes();
+  await lanePass(sql, e);
+  must(traced(e).length === 4, `sent ${traced(e).length}`);
+  const body = e.requests.map((r) => r.text).join("\n");
+  for (const name of [PEER, CHANNEL, "alice", "secret-channel", "c-dm-1", "c-ch-1", "aaaaaaa1", "bbbbbbb2", "owner-1", "dm:@owner"]) {
+    must(!body.includes(name), `the request body has ${name}`);
+  }
+  // And the rows as kept here, before the forward: nothing of them either (the plugin writes counts only).
+  const kept = JSON.stringify(local);
+  must(kept.includes('"conversations":2') && kept.includes('"given":2'), `control: the local rows are the plugin's: ${kept}`);
+  for (const name of [PEER, CHANNEL]) must(!kept.includes(name), `the local trace has ${name}: ${kept}`);
+});
+
+await check("a URL that is not https is refused: no fetch on either lane, nothing staged, the token never sent; the reason is named", async () => {
+  const cases: Array<[Record<string, unknown>, string]> = [
+    [{ TRACE_INGEST_URL: "http://10.0.3.7", TRACE_INGEST_TOKEN: TOKEN, DEPLOYMENT_ENV: "preview" }, "url_not_https"],
+    [{ TRACE_INGEST_URL: "http://ingest-alb-123.elb.amazonaws.com/", TRACE_INGEST_TOKEN: TOKEN, DEPLOYMENT_ENV: "preview" }, "url_not_https"],
+    [{ GITHUB_REFRESH_INGEST_URL: "http://ingest.example", GITHUB_REFRESH_INGEST_TOKEN: TOKEN, DEPLOYMENT_ENV: "production" }, "url_not_https"],
+    // The new name set wrong does not fall back to an old one set right: what someone wrote is what is reported.
+    [{ TRACE_INGEST_URL: "http://ingest.example", GITHUB_REFRESH_INGEST_URL: "https://ingest.example", TRACE_INGEST_TOKEN: TOKEN, DEPLOYMENT_ENV: "preview" }, "url_not_https"],
+    [{ TRACE_INGEST_URL: "ingest.example", TRACE_INGEST_TOKEN: TOKEN, DEPLOYMENT_ENV: "preview" }, "url_invalid"],
+    [{ TRACE_INGEST_URL: "ftp://ingest.example", TRACE_INGEST_TOKEN: TOKEN, DEPLOYMENT_ENV: "preview" }, "url_not_https"],
+    [{ TRACE_INGEST_URL: "https://user:pw@ingest.example", TRACE_INGEST_TOKEN: TOKEN, DEPLOYMENT_ENV: "preview" }, "url_has_credentials"],
+    [{ TRACE_INGEST_URL: "https://ingest.example", DEPLOYMENT_ENV: "preview" }, "token_missing"],
+    [{ TRACE_INGEST_TOKEN: TOKEN, DEPLOYMENT_ENV: "preview" }, "url_missing"],
+    [{ TRACE_INGEST_URL: "https://ingest.example", TRACE_INGEST_TOKEN: TOKEN }, "deployment_env_invalid"],
+  ];
+  for (const [env, problem] of cases) {
+    const s = forwardSettingsOf(env);
+    must(s.state === "misconfigured" && s.problem === problem, `${JSON.stringify(env)}: ${JSON.stringify(s)}`);
+    must(!JSON.stringify(s).includes(TOKEN) && !JSON.stringify(s).includes("ingest"), `the settings report carries a value: ${JSON.stringify(s)}`);
+    const { sql } = sqliteHost();
+    let fetched = 0;
+    const e = routes(); const f0 = e.fetch; e.fetch = async (u: string, i: RequestInit) => { fetched++; return f0(u, i); };
+    everyKind(sql); appendTrace(sql, [refresh(20)]);
+    const p = await lanePass(sql, e, env);
+    must(p.hold === null && p.forwarded === null && fetched === 0, `${problem}: ${JSON.stringify(p)} fetched ${fetched}`);
+  }
+  must(forwardSettingsOf({}).state === "off", "nothing set is off, not misconfigured");
+  // And a config that reached the sender some other way is still refused there, before any fetch.
+  const { sql } = sqliteHost(); everyKind(sql);
+  const forged = { url: "http://ingest.example", token: TOKEN, env: "preview" as const };
+  stageForward(sql, forged, OWNER.tenantId, OWNER.agentId, Date.now, AGENT_TRACE_LANE);
+  let fetched = 0;
+  const r = await sendForward(sql, forged, OWNER.tenantId, OWNER.agentId, async () => { fetched++; return new Response(null, { status: 200 }); },
+    Date.now, FORWARD_TIMEOUT_MS, AGENT_TRACE_LANE);
+  must(fetched === 0 && r.error === "config: url_not_https" && r.sent === 0 && ATR(sql).length === 9, JSON.stringify(r));
 });
 
 for (const r of results) console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);

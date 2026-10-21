@@ -82,18 +82,50 @@ export type ForwardConfig = { url: string; token: string; env: ForwardEnv };
 const setting = (env: Record<string, unknown>, name: string): string =>
   typeof env[name] === "string" ? (env[name] as string).trim() : "";
 
+/** Why a deployment that names some forwarding setting does not forward: shown by diagnose, never with a value. */
+export const FORWARD_CONFIG_PROBLEMS = ["url_missing", "token_missing", "deployment_env_invalid", "url_invalid", "url_not_https",
+  "url_has_credentials"] as const;
+export type ForwardConfigProblem = (typeof FORWARD_CONFIG_PROBLEMS)[number];
+
+export type ForwardSettings =
+  | { state: "off" }
+  | { state: "misconfigured"; problem: ForwardConfigProblem; urlFrom: string | null; tokenFrom: string | null }
+  | { state: "on"; config: ForwardConfig; urlFrom: string; tokenFrom: string };
+
 /**
- * The deployment's forwarding, or null when it is off. Off unless BOTH the URL and the token are set, and DEPLOYMENT_ENV
- * names which deployment this is (cf/wrangler.jsonc, cf/wrangler.preview.jsonc): a row that cannot say where it came
- * from is not sent. TRACE_INGEST_URL and TRACE_INGEST_TOKEN (one token for both routes); GITHUB_REFRESH_INGEST_URL and
- * GITHUB_REFRESH_INGEST_TOKEN, their earlier names, are read when the new ones are unset.
+ * The deployment's forwarding settings, read once: `off` when neither a URL nor a token is set, `on` with its config,
+ * else `misconfigured` with why, which sends nothing. TRACE_INGEST_URL and TRACE_INGEST_TOKEN (one token for both
+ * routes); GITHUB_REFRESH_INGEST_URL and GITHUB_REFRESH_INGEST_TOKEN, their earlier names, are read when the new ones
+ * are unset (an empty value is unset). DEPLOYMENT_ENV must name the deployment (cf/wrangler.jsonc,
+ * cf/wrangler.preview.jsonc): a row that cannot say where it came from is not sent.
+ *
+ * The URL must be `https:`: the bearer token rides on every request, and over `http:` it would cross the network in
+ * the clear (an ingest reachable only at a bare load balancer address over plain HTTP is exactly that). A URL that does
+ * not parse, is not https, or carries a user or password in it is refused as a whole, with no fallback to the other
+ * name: the setting someone wrote is the one that is wrong, and it is reported as such.
  */
-export function forwardConfigOf(env: Record<string, unknown>): ForwardConfig | null {
-  const url = setting(env, "TRACE_INGEST_URL") || setting(env, "GITHUB_REFRESH_INGEST_URL");
-  const token = setting(env, "TRACE_INGEST_TOKEN") || setting(env, "GITHUB_REFRESH_INGEST_TOKEN");
+export function forwardSettingsOf(env: Record<string, unknown>): ForwardSettings {
+  const urlFrom = setting(env, "TRACE_INGEST_URL") ? "TRACE_INGEST_URL" : setting(env, "GITHUB_REFRESH_INGEST_URL") ? "GITHUB_REFRESH_INGEST_URL" : null;
+  const tokenFrom = setting(env, "TRACE_INGEST_TOKEN") ? "TRACE_INGEST_TOKEN" : setting(env, "GITHUB_REFRESH_INGEST_TOKEN") ? "GITHUB_REFRESH_INGEST_TOKEN" : null;
+  if (!urlFrom && !tokenFrom) return { state: "off" };
+  const bad = (problem: ForwardConfigProblem): ForwardSettings => ({ state: "misconfigured", problem, urlFrom, tokenFrom });
+  if (!urlFrom) return bad("url_missing");
+  if (!tokenFrom) return bad("token_missing");
   const which = env.DEPLOYMENT_ENV;
-  if (!url || !token || !(FORWARD_ENVS as readonly unknown[]).includes(which)) return null;
-  return { url: url.replace(/\/+$/, ""), token, env: which as ForwardEnv };
+  if (!(FORWARD_ENVS as readonly unknown[]).includes(which)) return bad("deployment_env_invalid");
+  const raw = setting(env, urlFrom);
+  let url: URL;
+  try { url = new URL(raw); } catch { return bad("url_invalid"); }
+  if (url.protocol !== "https:") return bad("url_not_https");
+  if (url.username || url.password) return bad("url_has_credentials");
+  if (!url.hostname) return bad("url_invalid");
+  return { state: "on", config: { url: raw.replace(/\/+$/, ""), token: setting(env, tokenFrom), env: which as ForwardEnv }, urlFrom, tokenFrom };
+}
+
+/** The deployment's forwarding, or null when it is off or misconfigured (`forwardSettingsOf`): then nothing is sent. */
+export function forwardConfigOf(env: Record<string, unknown>): ForwardConfig | null {
+  const s = forwardSettingsOf(env);
+  return s.state === "on" ? s.config : null;
 }
 
 /** A row as it goes on the wire: its outbox seq is always there, as the queue's key. */
@@ -158,7 +190,34 @@ export const GITHUB_REFRESH_LANE: ForwardLane = {
 const ID = /^[A-Za-z0-9_.:@/|-]{1,128}$/;
 const CODE = /^[A-Za-z0-9_.:-]{1,64}$/;
 
-type FieldType = "id" | "code" | "count" | "int" | "bool" | "flag" | readonly string[];
+/**
+ * A conversation id as this side mints one: `main` and a fresh context's `main.<n>` (cf/src/fresh-context.ts), a
+ * subagent's `sub_<hex>`, an Agents API session's `sess_<hex>`, an isolated turn's `iso_<hex>`. None is ever made from
+ * a channel, a person or a message; anything else is not sent.
+ */
+const SESSION = "(?:main(?:\\.[0-9]{1,6})?|(?:sub|sess|iso)_[0-9a-f]{8,40})";
+const OPAQUE_SESSION = new RegExp(`^${SESSION}$`);
+/** A turn's id (src/runtime/turn-timing.ts `turnIdFor`): `tt_<session>@<ms>`. */
+const OPAQUE_TURN = new RegExp(`^tt_${SESSION}@[0-9]{1,16}$`);
+/**
+ * A span id, readable only in the shapes its writers mint: `<prefix>_<hex>` (a job `mj_`, an operation `op_`, a
+ * session), a turn, `refused_<ms>` / `js_<ms>`, a provider's tool call id (`toolu_…`, `call_…`, `call_…|fc_…`: random
+ * base62 the provider makes), and a plugin row's `mount:<alias>` / `wake:<alias>:<ms>` (an alias is a mount's
+ * configured name, cf/src/runtime.ts `MOUNT_ALIAS`). Any other span is left out: `span_id` is optional to the
+ * receiver, which keys a row by its `seq`.
+ */
+const OPAQUE_SPAN = [
+  /^[a-z]{1,8}_[0-9a-f]{8,64}$/, OPAQUE_TURN, /^(?:refused|js)_[0-9]{1,16}$/,
+  /^(?:toolu|call|fc)_[A-Za-z0-9]{8,64}(?:\|fc_[A-Za-z0-9_-]{8,60})?$/,
+  /^mount:[a-z][a-z0-9-]{0,23}$/, /^wake:[a-z][a-z0-9-]{0,23}:[0-9]{1,16}$/,
+];
+const spanOf = (v: unknown): string | null => typeof v === "string" && OPAQUE_SPAN.some((re) => re.test(v)) ? v : null;
+
+/**
+ * `session`, `turn`, `task`: ids this side mints, accepted only in the shapes it mints them (`OPAQUE_SESSION`), so a
+ * field the receiver types `id` can never carry a name: its id shape takes `alice` as readily as `sess_1f…`.
+ */
+type FieldType = "id" | "code" | "count" | "int" | "bool" | "flag" | "session" | "turn" | "task" | readonly string[];
 /** Where a field comes from: an attr by name, or the row's own `status` or `ms`. */
 type Source = string | { row: "status" | "ms" };
 /** wire name → [source, type]. */
@@ -174,24 +233,31 @@ const MS = { row: "ms" } as const;
  * `prefix` (an object); a wake's `error` (a message) and every plugin row's `mount`; turn.stop's `errorClass` (a
  * sentence for people; `trigger` says the same); turn.timing's raw instants. Attrs written that the receiver has no field
  * for, so not sent: tool.refused's `task`, a wake's `inbox_lagging` and `reason`, turn_ended's `snapshotMismatches`.
+ *
+ * An id-typed field carries an opaque id or a name from code or configuration (a tool's, a mount's, a model's), never a
+ * name a person or a conversation has: where the receiver takes `id` or `code` and this side knows the vocabulary, the
+ * field is that list (`by`, `trigger`, `outcome`, `stop_reason`); a session, turn or task must be in a shape this side
+ * mints. Two receiver fields are left unfilled because their value is whatever the model wrote, which can be any word:
+ * model.call's `first_tool` (the first tool the answer asked for, as the model spelled it) and tool.refused's `tool`
+ * (the name a refused call was made by, which by definition named no tool there is).
  */
 export const AGENT_TRACE_FIELDS: Readonly<Partial<Record<TraceKind, FieldSpec>>> = {
   "model.call": {
-    model: ["model", "id"], stop_reason: [STATUS, "code"], input: ["input", "count"], output: ["output", "count"],
+    model: ["model", "id"], stop_reason: [STATUS, ["stop", "length", "toolUse", "error", "aborted"]], input: ["input", "count"], output: ["output", "count"],
     cache_read: ["cacheRead", "count"], cache_write: ["cacheWrite", "count"], reasoning: ["reasoning", "count"],
-    first_tool: ["firstTool", "id"], turn: ["turn", "id"], session: ["session", "id"],
+    turn: ["turn", "turn"], session: ["session", "session"],
   },
   "model.attempt": {
-    attempt: ["attempt", "count"], phase: ["phase", ["take", "admit", "call", "deliver"]], outcome: ["outcome", "code"],
+    attempt: ["attempt", "count"], phase: ["phase", ["take", "admit", "call", "deliver"]], outcome: ["outcome", ["http", "timeout", "transport_error"]],
     http_status: ["httpStatus", "count"], error_class: ["errorClass", "id"], total_ms: [MS, "count"],
     provider_ms: ["providerMs", "count"], model: ["model", "id"],
   },
   "tool.call": {
-    tool: ["tool", "id"], mount: ["mount", "id"], task: ["task", "id"], run_ms: ["runMs", "count"], exit_code: ["exitCode", "int"],
+    tool: ["tool", "id"], mount: ["mount", "id"], task: ["task", "task"], run_ms: ["runMs", "count"], exit_code: ["exitCode", "int"],
     denied: ["denied", "bool"], error_code: ["errorCode", "code"], http_status: ["httpStatus", "count"],
   },
   "tool.refused": {
-    tool: ["tool", "id"], code: ["code", "code"], by: ["by", "id"], from: ["from", ["model", "program"]],
+    code: ["code", "code"], by: ["by", ["gateway", "run_js", "executor"]], from: ["from", ["model", "program"]],
   },
   "turn.timing": {
     inbound_to_start_ms: ["inboundToStartMs", "count"], start_to_first_job_ms: ["startToFirstJobMs", "count"],
@@ -202,11 +268,11 @@ export const AGENT_TRACE_FIELDS: Readonly<Partial<Record<TraceKind, FieldSpec>>>
     client_pauses: ["clientPauses", "count"], prep_ms: ["prepMs", "count"],
   },
   "turn.stop": {
-    trigger: ["trigger", "code"], turn: ["turn", "id"],
+    trigger: ["trigger", ["provider_stop", "admin_cancel", "delete"]], turn: ["turn", "turn"],
   },
   "raft.assistant_wake": {
     result: [STATUS, ["skipped_empty", "skipped_filtered", "invoked", "unreadable", "paused", "night_deferred", "failed", "inbox_lagging"]],
-    trigger: ["trigger", "code"], conversations: ["conversations", "count"], candidates: ["candidates", "count"],
+    trigger: ["trigger", ["doorbell", "brief"]], conversations: ["conversations", "count"], candidates: ["candidates", "count"],
     seen: ["seen", "count"], unreadable: ["unreadable", "count"], lag_retry: ["lagRetry", "count"], caught_up: ["caught_up", "bool"],
     caught_up_via: ["caught_up_via", ["unread", "all", "mixed"]], caught_up_rule: ["caught_up_rule", ["seq", "time"]],
     muted: ["muted", "count"], told: ["told", "count"], held: ["held", "count"], said: ["said", "count"],
@@ -254,6 +320,9 @@ function fieldOf(v: unknown, type: FieldType): string | number | boolean | null 
     case "bool": return typeof v === "boolean" ? v : null;
     // A boolean the receiver counts: 1 or 0.
     case "flag": return typeof v === "boolean" ? (v ? 1 : 0) : null;
+    case "session": return typeof v === "string" && OPAQUE_SESSION.test(v) ? v : null;
+    case "turn": return typeof v === "string" && OPAQUE_TURN.test(v) ? v : null;
+    case "task": return typeof v === "string" && OPAQUE_SESSION.test(v) ? v : null;
   }
   return null;
 }
@@ -272,7 +341,7 @@ export function agentTraceRow(r: TraceOutboxRow, env: ForwardEnv): WireRow | nul
   if (!tenant || !agent || !Number.isFinite(r.at) || !Number.isSafeInteger(r.seq) || r.seq < 0) return null;
   const a = r.attrs ?? {};
   const out: WireRow = { seq: r.seq, at: new Date(r.at).toISOString(), kind: r.kind, tenant_id: tenant, agent_id: agent, env };
-  const span = idOf(r.spanId);
+  const span = spanOf(r.spanId);
   if (span) out.span_id = span;
   const status = codeOf(r.status);
   if (status) out.status = status;
@@ -472,6 +541,8 @@ export async function sendForward(
 ): Promise<ForwardResult> {
   const out: ForwardResult = { sent: 0, dropped: 0, kept: 0, error: null };
   const t = tablesOf(lane), d = ddl(lane);
+  // The token never goes over anything but https, whoever built the config (`forwardSettingsOf` refuses it first).
+  if (!/^https:\/\//i.test(cfg.url)) return { ...out, error: "config: url_not_https" };
   try {
     sql.exec(d.queue); sql.exec(d.state);
     const state = sql.exec(`SELECT failures, next_at FROM ${t.state} WHERE id = 1`).toArray()[0];
