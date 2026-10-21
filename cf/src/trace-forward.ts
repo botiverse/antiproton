@@ -293,7 +293,7 @@ const MINTED = /^[a-z]{1,8}_[0-9a-f]{8,64}$/;
 const NOTIFY_DROPS = ["already_told", "rule_mute", "decisions_in_brief", "not_confirmed", "not_in_check", "other"] as const;
 /** Raft's counts on a check's wake (src/plugins/raft-assistant-check.ts `CHECK_COUNT_KEYS`), each a field by its own name. */
 const CHECK_COUNTS = ["conversations", "items", "truncated", "told", "skipped", "muted", "digest", "always", "dm", "mention", "thread", "named",
-  "default_out", "night_held"] as const;
+  "default_out", "night_held", "behind"] as const;
 /** A contact rule's `<effect>_<scope>` counts on a rules row (src/plugins/raft-assistant-rules.ts `rulesAttrs`). */
 const RULE_COUNTS = ["mute", "always", "digest"].flatMap((effect) => ["channel", "thread", "person", "kind", "dms", "legacy"].map((scope) => `${effect}_${scope}`));
 const counts = (names: readonly string[]): Record<string, readonly [Source, FieldType]> =>
