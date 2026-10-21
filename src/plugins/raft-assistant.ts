@@ -34,7 +34,8 @@
  * What the runtime does with an assistant (cf/src/runtime.ts): its model is offered `CHAT_TOOLS` in its chat and
  * `CHECK_TOOLS` in a check, with the parked-result reader, and nothing else, no run_js and no subagents, under
  * `assistantPrompt` or `assistantCheckPrompt` rather than the default prompt. It is told it is one by the mount's
- * snapshot listing the owner reads, which Raft's context decides.
+ * snapshot listing the owner reads, which Raft's context decides. A chat turn that ends with its answer only in its
+ * closing text, having sent nothing to the owner's DM, has that text sent there by code (`replyFallback`).
  *
  * Compiled by both typecheck programs.
  */
@@ -44,7 +45,7 @@ import type { Json, MountRecord } from "../core/types.ts";
 import type { RaftAssistantOf } from "@botiverse/raft-sdk";
 import { isIsolatedSession } from "../runtime/isolated-session.ts";
 import { modelToolName } from "../runtime/pi-tools.ts";
-import type { PluginContext, PluginNext, ToolSchema } from "./types.ts";
+import type { PluginContext, PluginNext, ToolSchema, TurnEnd } from "./types.ts";
 import {
   CONTACT_KEY, DEFAULTS_LINE, EFFECTS, ITEM_KINDS, PEER_FIELD, QUIET_FORMAT, RULES_MAX, SENDER_ID_FIELD, SENDER_TYPE_FIELD, personType, confirmLine, contactOf, inQuiet, isActive,
   keptRules, loadContact, modelRulesLine, personRulesUnenforced, quietLine, ruleLine, rulesAttrs, rulesOf, untilOf, winningRule,
@@ -880,6 +881,87 @@ export async function noteToldInChat(ctx: PluginContext, target: unknown, conten
   }
   if (fresh) ctx.trace?.({ kind: "raft.assistant_chat_told", status: "told", verdict: "ok", attrs: { told: fresh } });
   return fresh;
+}
+
+// ---- the chat's reply, when the model left it in its closing text ----------------------------------------------------
+
+/**
+ * Whether the owner's chat has been answered in their DM since its last turn ended (`AssistantReply`, one row): set by
+ * every send to the owner's DM (or a thread of it) that Raft accepted, made in the chat (`noteOwnerReply`), and read and
+ * cleared at each end of a chat turn (`replyFallback`), which keeps there the turn it last handled, so a turn's end told
+ * twice (`Plugin.afterTurn` is at least once) is acted on once.
+ */
+export const REPLY_KEY = "reply";
+interface AssistantReply { sent: boolean; handled: string | null }
+
+function replyOf(v: unknown): AssistantReply {
+  const o = v && typeof v === "object" && !Array.isArray(v) ? v as Record<string, unknown> : {};
+  return { sent: o.sent === true, handled: typeof o.handled === "string" ? o.handled : null };
+}
+
+/** Whether `target` is the owner's DM or one of its threads (`dm:@ada:abcdef12`). */
+function toOwnerDm(owner: AssistantOwner | null, target: unknown): boolean {
+  const dm = owner ? dmOf(owner) : null;
+  return !!dm && typeof target === "string" && (target === dm || target.startsWith(`${dm}:`));
+}
+
+/**
+ * A send Raft accepted (not held): when it went to the owner's DM from the chat — never from a short session — the chat
+ * turn it was made in has answered its owner, so that turn's end posts nothing more (`replyFallback`).
+ */
+export async function noteOwnerReply(ctx: PluginContext, target: unknown): Promise<void> {
+  if (isIsolatedSession(ctx.caller.taskId)) return;
+  if (!toOwnerDm(await loadOwner(ctx), target)) return;
+  const kept = replyOf(await ctx.db.get(ASSISTANT_STORE, REPLY_KEY));
+  if (!kept.sent) await ctx.db.put(ASSISTANT_STORE, { ...kept, sent: true } as unknown as Json, REPLY_KEY);
+}
+
+/** The turns the assistant's own code asks for, each in a short session: never the owner's chat. */
+const OWN_TURN_KEYS: ReadonlySet<string> = new Set(["assistant.check", "assistant.brief"]);
+
+/**
+ * The end of a turn of the owner's chat (`Plugin.afterTurn`, which the runtime calls for the main conversation only,
+ * never a short session's or a subagent's). The chat answers in the owner's DM with `messages_send`; a model that wrote
+ * its answer only as its closing text answered no one. So when a completed chat turn sent nothing the Server accepted
+ * to the owner's DM, its closing text is sent there, through the same send the model's would take (`send`, the
+ * notify tool's: `messages.send` attesting what the chat has seen), so a DM with messages the chat has not read holds
+ * it as it holds the model's, and nothing is sent. Nothing either for a turn with no text (or only whitespace), one
+ * that failed or was cancelled, or a turn the assistant's code asked for. The idempotency key is the turn's, so a
+ * second telling of the same end that gets this far is the same send. One `raft.assistant_chat_told` row per send
+ * tried, status `reply_fallback`: `reply_fallback` 1 when it was sent, else 0, and `result` (`sent`, `held`, `failed`
+ * with the error's `code`), never the text.
+ */
+export async function replyFallback(
+  ctx: PluginContext, end: Pick<TurnEnd, "turnId" | "turnKey" | "finalText" | "outcome">,
+  send: (ctx: PluginContext, target: string, content: string, key: string) => Promise<OwnerSend>,
+): Promise<"sent" | "held" | "failed" | "skipped"> {
+  // An assistant's chat alone: the mount offers its preferences tool exactly when Raft names an owner.
+  if (!ctx.offered?.includes(PREFERENCES_TOOL)) return "skipped";
+  const owner = await loadOwner(ctx);
+  const dm = owner ? dmOf(owner) : null;
+  if (!dm) return "skipped";
+  const kept = replyOf(await ctx.db.get(ASSISTANT_STORE, REPLY_KEY));
+  if (kept.handled === end.turnId) return "skipped";
+  const done = () => ctx.db.put(ASSISTANT_STORE, { sent: false, handled: end.turnId } as unknown as Json, REPLY_KEY);
+  const text = end.finalText ?? "";
+  if (kept.sent || end.outcome !== "completed" || !text.trim() || (end.turnKey !== null && OWN_TURN_KEYS.has(end.turnKey))) {
+    await done();
+    return "skipped";
+  }
+  const key = `assistant-reply-${createHash("sha256").update(end.turnId).digest("hex").slice(0, 32)}`;
+  let result: "sent" | "held" | "failed", code: string | undefined;
+  try {
+    result = (await send(ctx, dm, text, key)).sent ? "sent" : "held";
+  } catch (e) {
+    result = "failed";
+    const c = (e as { code?: unknown })?.code;
+    code = typeof c === "string" ? c.slice(0, 64) : undefined;
+  }
+  const attrs = { reply_fallback: result === "sent" ? 1 : 0, result, ...(code ? { code } : {}) };
+  ctx.trace?.({ kind: "raft.assistant_chat_told", status: "reply_fallback", verdict: result === "sent" ? "ok" : result === "held" ? "blocked" : "failed", attrs });
+  logEvent("raft.assistant_reply_fallback", { tenantId: ctx.caller.tenantId, agentId: ctx.caller.agentId, mount: ctx.alias, ...attrs });
+  await done();
+  return result;
 }
 
 /**

@@ -1981,6 +1981,124 @@ await check("control: the same agent without an owner is offered its whole catal
   } finally { w.host.dispose(); }
 });
 
+// ---- the chat's reply, when the model left it in its closing text (`replyFallback`) -----------------------------------
+
+const TEXT = "REPLY-PRIVATE-TEXT: Friday at 10 works, I checked #ch1.";
+const ended = (turnId: string, o: Record<string, unknown> = {}) => ({ turnId, turnKey: null, finalText: TEXT, outcome: "completed", ...o });
+const afterTurn = (ctx: unknown, end: unknown) => raftPlugin.afterTurn!(ctx as never, end as never);
+const fallbackRows = (a: { traced: Array<{ kind: string; status: string; verdict?: string; attrs: Record<string, unknown> }> }) =>
+  a.traced.filter((t) => t.kind === "raft.assistant_chat_told" && t.status === "reply_fallback");
+
+await check("reply fallback: a chat turn that sent nothing to the owner's DM posts its closing text there, once, and the trace counts it without the text", async () => {
+  const a = await assistant(raft({ dm: "dm:@ada" }));
+  const lines: unknown[] = [];
+  setLogSink((l) => lines.push(l));
+  try { await afterTurn(a.ctx, ended("op_1")); } finally { setLogSink(null); }
+  must(a.r.sends.length === 1 && a.r.sends[0].target === "dm:@ada" && a.r.sends[0].content === TEXT, `sends: ${show(a.r.sends)}`);
+  must(/^assistant-reply-[0-9a-f]{32}$/.test(a.r.sends[0].idempotencyKey ?? a.r.sends[0].idempotency_key ?? ""), `key: ${show(a.r.sends[0])}`);
+  const rows = fallbackRows(a);
+  must(rows.length === 1 && rows[0]!.attrs.reply_fallback === 1 && rows[0]!.attrs.result === "sent" && rows[0]!.verdict === "ok", show(rows));
+  must(!show(a.traced).includes("REPLY-PRIVATE") && !show(lines).includes("REPLY-PRIVATE"), `the text reached the trace or the log: ${show(a.traced)} ${show(lines)}`);
+  // The same end told again (at least once): nothing more.
+  await afterTurn(a.ctx, ended("op_1"));
+  must(a.r.sends.length === 1 && fallbackRows(a).length === 1, `told twice: ${show(a.r.sends)}`);
+});
+
+await check("reply fallback: none when the turn already sent to the owner's DM (or a thread of it); a send elsewhere or a held one does not count", async () => {
+  const a = await assistant(raft({ dm: "dm:@ada" }));
+  await raftPlugin.invoke("messages_send", { target: "dm:@ada", content: "Friday works." }, a.ctx);
+  await afterTurn(a.ctx, ended("op_1"));
+  must(a.r.sends.length === 1 && fallbackRows(a).length === 0, `sent: ${show(a.r.sends)}`);
+  // The next turn starts unanswered.
+  await afterTurn(a.ctx, ended("op_2"));
+  must(a.r.sends.length === 2 && a.r.sends[1].content === TEXT, `the next turn: ${show(a.r.sends)}`);
+  await raftPlugin.invoke("messages_send", { target: "dm:@ada:abcdef12", content: "in the thread" }, a.ctx);
+  await afterTurn(a.ctx, ended("op_3"));
+  must(a.r.sends.length === 3, `a thread of the DM is the DM: ${show(a.r.sends)}`);
+  await raftPlugin.invoke("messages_send", { target: "#general", content: "elsewhere" }, a.ctx).catch(() => null);
+  await afterTurn(a.ctx, ended("op_4"));
+  must(a.r.sends.length === 5 && a.r.sends[4].target === "dm:@ada" && a.r.sends[4].content === TEXT, `a send elsewhere answered the owner: ${show(a.r.sends)}`);
+  a.r.send = "held";
+  await raftPlugin.invoke("messages_send", { target: "dm:@ada", content: "held one" }, a.ctx);
+  a.r.send = "sent";
+  await afterTurn(a.ctx, ended("op_5"));
+  must(a.r.sends.length === 7 && a.r.sends[6].content === TEXT, `a held send answered the owner: ${show(a.r.sends)}`);
+});
+
+await check("reply fallback: none for an empty or whitespace closing text, a failed or cancelled turn, or a non-assistant", async () => {
+  const a = await assistant(raft({ dm: "dm:@ada" }));
+  for (const [id, o] of [["e1", { finalText: null }], ["e2", { finalText: "  \n\t " }], ["e3", { outcome: "failed", error: "x" }], ["e4", { outcome: "cancelled" }]] as const) {
+    await afterTurn(a.ctx, ended(id, o));
+  }
+  must(a.r.sends.length === 0 && fallbackRows(a).length === 0, `sent: ${show(a.r.sends)}`);
+  // Control: the same mount answers a turn that has text.
+  await afterTurn(a.ctx, ended("e5"));
+  must(a.r.sends.length === 1, "control: a completed turn with text is answered");
+  // No owner: not an assistant, nothing sent and nothing written.
+  const b = mount(ALL_TOOLS);
+  raft({ owner: false, dm: "dm:@ada" });
+  await afterTurn(b.ctx, ended("n1"));
+  must(b.read(ASSISTANT_STORE, "reply") === undefined && fallbackRows(b).length === 0, "a non-assistant's turn end was acted on");
+  // An assistant mount whose listing does not offer the preferences tool is not in assistant mode.
+  const c = await assistant(raft({ dm: "dm:@ada" }));
+  c.ctx.offered = ALL_TOOLS.filter((n) => n !== "assistant_preferences");
+  await afterTurn(c.ctx, ended("n2"));
+  must(c.r.sends.length === 0, `not offered the chat's tools: ${show(c.r.sends)}`);
+});
+
+await check("reply fallback: never for a check or the brief: their turn keys send nothing, and a short session's send does not answer the chat", async () => {
+  const a = await assistant(raft({ dm: "dm:@ada" }));
+  await afterTurn(a.ctx, ended("c1", { turnKey: "assistant.check" }));
+  await afterTurn(a.ctx, ended("c2", { turnKey: "assistant.brief" }));
+  must(a.r.sends.length === 0 && fallbackRows(a).length === 0, `sent: ${show(a.r.sends)}`);
+  const iso = { ...a.ctx, caller: { ...a.ctx.caller, taskId: "iso_0123456789abcdef0123" } };
+  await raftPlugin.invoke("messages_send", { target: "dm:@ada", content: "from a check" }, iso).catch(() => null);
+  await afterTurn(a.ctx, ended("c3"));
+  must(a.r.sends.at(-1)?.content === TEXT && fallbackRows(a).length === 1, `a short session's send answered the chat: ${show(a.r.sends)}`);
+});
+
+await check("reply fallback: an owner DM with messages the chat has not read holds it, as it holds the model's send: nothing sent, counted held", async () => {
+  const a = await assistant(raft({ dm: "dm:@ada" }));
+  a.r.send = "held";
+  await afterTurn(a.ctx, ended("h1"));
+  must(a.r.sends.length === 1 && a.r.sends[0].content === TEXT, `control: the send was asked once: ${show(a.r.sends)}`);
+  const rows = fallbackRows(a);
+  must(rows.length === 1 && rows[0]!.attrs.reply_fallback === 0 && rows[0]!.attrs.result === "held" && rows[0]!.verdict === "blocked", show(rows));
+  await afterTurn(a.ctx, ended("h1"));
+  must(a.r.sends.length === 1, "a held fallback was tried again on the same end");
+  // A send that fails is counted failed with its code, never thrown at the runtime.
+  const b = await assistant(raft({ dm: "dm:@ada" }));
+  const inner = globalThis.fetch;
+  globalThis.fetch = (async (url: any, init?: any) => new URL(String(url)).pathname.endsWith("/v2/send")
+    ? json(403, { error: "no", code: "forbidden" }) : inner(url, init)) as typeof fetch;
+  try { await afterTurn(b.ctx, ended("f1")); } finally { globalThis.fetch = inner; }
+  const failed = fallbackRows(b);
+  must(failed.length === 1 && failed[0]!.attrs.result === "failed" && failed[0]!.attrs.reply_fallback === 0 && !show(failed).includes("REPLY-PRIVATE"), show(failed));
+});
+
+await check("reply fallback end to end: a chat turn that only writes its answer reaches the owner's DM; one that sends does not send twice; a check's closing text never does", async () => {
+  const w = await runtimeWith(true, () => say("CHAT-ANSWER-ONLY-IN-TEXT"));
+  try {
+    await w.turn("anything for me?");
+    must(w.r.sends.length === 1 && w.r.sends[0].target === "dm:@ada" && w.r.sends[0].content === "CHAT-ANSWER-ONLY-IN-TEXT", `sends: ${show(w.r.sends)}`);
+    const rows = w.host.sql.exec("SELECT status, attrs FROM trace_outbox WHERE kind = 'raft.assistant_chat_told'").toArray() as any[];
+    must(rows.length === 1 && rows[0].status === "reply_fallback" && JSON.parse(String(rows[0].attrs)).reply_fallback === 1 && !String(rows[0].attrs).includes("CHAT-ANSWER"), show(rows));
+    // A doorbell's check, whose model closes with text: nothing more reaches the DM.
+    w.r.unread = [conv(1, { latestAt: new Date(Date.now() - 60_000).toISOString() })];
+    w.doorbell();
+    await w.drive();
+    must(show(w.wakeRows().map((x) => x.status)) === show(["invoked"]), `control: a check ran: ${show(w.wakeRows())}`);
+    must(w.r.sends.length === 1, `a check's closing text was sent: ${show(w.r.sends)}`);
+  } finally { w.host.dispose(); }
+  let sentOnce = false;
+  const v = await runtimeWith(true, () => sentOnce ? say("Sent it.") : (sentOnce = true, { text: "", finishReason: "tool_calls", truncated: false, usage,
+    toolCalls: [{ id: "m1", name: "raft__messages_send", arguments: { target: "dm:@ada", content: "Nothing waiting on you." } }] } as ModelResponse));
+  try {
+    await v.turn("anything for me?");
+    must(sentOnce && v.r.sends.length === 1 && v.r.sends[0].content === "Nothing waiting on you.", `sends: ${show(v.r.sends)}`);
+  } finally { v.host.dispose(); }
+});
+
 const failed = results.filter((r) => !r.ok);
 for (const r of results) console.log(`  ${r.ok ? "\x1b[32m✓\x1b[0m" : "\x1b[31m✗\x1b[0m"} ${r.name}${r.ok ? "" : `\n      \x1b[31m${r.error}\x1b[0m`}`);
 console.log("  ────────────────────────────────────────────────────────");
