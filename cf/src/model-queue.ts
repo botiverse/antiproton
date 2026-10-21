@@ -164,7 +164,8 @@ export const ATTEMPT_TRACE_BOUND_MS = 2_000;
  * A failed attempt's trace row, written by the agent's object. Without it a retried call showed in the trace only as
  * the one slow `model.call` its final answer closed, with nothing saying an attempt had failed in between (a 36 s call
  * in an onboarding agent's turn, 2026-10-20). A failure to write it, or no answer within ATTEMPT_TRACE_BOUND_MS, is
- * logged and never stops the retry.
+ * logged and never stops the retry; but the retry waits for it, at most ATTEMPT_TRACE_BOUND_MS per failed attempt. A
+ * batch's messages are handled one after another, so a batch with N failed attempts can wait up to N × that bound.
  */
 async function traceFailedAttempt(m: QueuedModelCall, deps: ModelQueueDeps, attempt: FailedAttempt, boundMs = ATTEMPT_TRACE_BOUND_MS): Promise<void> {
   const failed = (reason: "error" | "timeout", error: string) =>

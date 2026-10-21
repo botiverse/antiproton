@@ -456,10 +456,17 @@ export function offloadLimit(readBack: string | null): number {
  * Compared by address, because that is what reaches the host: both the
  * bridge and run_js resolve the offered name before they invoke. `reads` is
  * the called tool's own declaration, found by that address.
+ *
+ * `secret_get` never gets the wider line, whatever it declares (`NEVER_OWN_STATE`): a secret's value is the one stored
+ * value that must not sit in the conversation any longer than it has to, and a declaration added to it by mistake (it
+ * lives beside state.get in the same plugin) must not be what decides that.
  */
 export function limitForCall(tool: string, reader: { name: string; address: string } | null, reads?: string): number {
-  return reader && (tool === reader.address || reads === "own-state") ? offloadLimit(null) : offloadLimit(reader?.name ?? null);
+  const ownState = reads === "own-state" && !NEVER_OWN_STATE.has(tool.slice(tool.lastIndexOf(".") + 1));
+  return reader && (tool === reader.address || ownState) ? offloadLimit(null) : offloadLimit(reader?.name ?? null);
 }
+/** Tools, by bare name, held to the parking line even when they declare `reads: "own-state"` (`limitForCall`). */
+const NEVER_OWN_STATE: ReadonlySet<string> = new Set(["secret_get"]);
 
 /**
  * What the model gets instead of a result too big to put in the conversation.
@@ -6345,7 +6352,8 @@ export class AgentRuntime {
    * One queued attempt at the call `jobId` that failed and goes back to the queue, from the consumer
    * (cf/src/model-queue.ts `FailedAttempt`): a `model.attempt` trace row (`modelAttemptRow`), whose fields are checked
    * there. For this object's own agent only, which the object checks before it asks. A failure is logged and answered
-   * false: the row never fails the retry it describes.
+   * false: the row never fails the retry it describes, and the consumer waits on it at most ATTEMPT_TRACE_BOUND_MS
+   * (cf/src/model-queue.ts) before retrying without it.
    */
   async recordModelAttempt(tenantId: string, agentId: string, jobId: string, attempt: unknown): Promise<boolean> {
     if (typeof jobId !== "string" || !jobId || !attempt || typeof attempt !== "object") return false;

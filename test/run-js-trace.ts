@@ -130,6 +130,16 @@ await check("tool.refused keeps a name only when it is shaped like one and not l
   must(row(mcp).attrs.tool === mcp, `a long MCP name was dropped: ${show(row(mcp))}`);
   must(row("ghp_" + "a".repeat(36)).attrs.tool === undefined, "a token-shaped name was kept");
   must(row('gh.get {"q":1}').attrs.tool === undefined, "a name carrying text was kept");
+  // A token after `_`, `.`, `-` or `:` (no word boundary before it), and an opaque run inside a name.
+  const hex40 = "0123456789abcdef0123456789abcdef01234567";
+  for (const leak of ["x_ghp_" + "a".repeat(36), "x_sk-live0123456789abcdefXYZ", `${hex40}.x`, `gh.${hex40}`, "x.github_pat_" + "A1".repeat(12),
+    "mcp__AKIA0123456789ABCDEF", "x:xoxb-0123456789-abcdef", "s_" + "Ab3".repeat(9)]) {
+    must(row(leak).attrs.tool === undefined, `a credential-shaped name was kept: ${leak}`);
+  }
+  // Control: names of words, however long or numbered, are kept.
+  for (const name of ["gh.api_get", "task-runner_v2.list_items", "linear__create_issue_comment_2024", "x_skill-loader.run"]) {
+    must(row(name).attrs.tool === name, `a plain name was dropped: ${name}`);
+  }
   must(row(null).attrs.tool === undefined && row(null).attrs.from === "model", show(row(null)));
   must(row("x", "not a code!").status === "refused", `an odd code was written: ${show(row("x", "not a code!"))}`);
   must(row("x").spanId === "c" && toolRefusedRow({ tenantId: "t", agentId: "a", at, tool: "x", code: "c", by: "executor", fromProgram: true }).spanId === "refused_1",

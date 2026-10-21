@@ -272,6 +272,11 @@ await check("the agent's own stored value is returned whole up to the read-back 
   // The declaration is what widens it, not the address: an undeclared tool at the same address, and any other tool, park.
   must(playbook > limitForCall("state.get", reader), `state.get without its declaration is parked (limit ${limitForCall("state.get", reader)})`);
   must(playbook > limitForCall("http.get", reader, undefined), "an undeclared tool's 8.9 KB result is still parked");
+  // secret_get is held to the parking line by name, even were it to declare own-state, under any mount alias.
+  for (const address of ["state.secret_get", "my-state.secret_get"]) {
+    must(limitForCall(address, reader, "own-state") === limitForCall("http.get", reader), `${address} got the own-state line (limit ${limitForCall(address, reader, "own-state")})`);
+  }
+  must(limitForCall("my-state.get", reader, "own-state") === limitForCall("artifacts.read", reader), "control: a declared get under another alias is widened");
   // Without a reader nothing parks, so the declaration changes nothing there.
   must(limitForCall("state.get", null, "own-state") === offloadLimit(null), "without a reader the line is the one it always was");
 

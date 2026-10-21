@@ -361,6 +361,29 @@ export function jsRunRow(o: {
 
 /** A tool name as a caller may write one: an address (`gh.api_get`) or the model's form (`gh__api_get`). */
 const REFUSED_TOOL = /^[A-Za-z0-9_.:-]{1,128}$/;
+/**
+ * A credential's shape anywhere in a tool name: the token prefixes `redactCredentialShapes` knows, after the start or
+ * any character that is not a letter or digit (`_`, `.`, `-`, `:` included). `redactCredentialShapes` wants a word
+ * boundary before them, which `_` is not, so `x_ghp_…` passed it as a name.
+ */
+const NAME_TOKEN = /(?:^|[^A-Za-z0-9])(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{16,}|sk_(?:agent|machine|computer|daemon)_[A-Za-z0-9_-]{16,}|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|eyJ[A-Za-z0-9_-]{10,}|rmc\.[A-Za-z0-9._-]{10,})/;
+/**
+ * An opaque run inside a name: 32 or more hex digits, or 24 or more letters and digits with a digit among them, with
+ * no separator between. A tool's own name is words joined by `_`, `.` or `-` (`list_pull_request_review_comments`), so
+ * it never has one; a key, a hash or a token does.
+ */
+function opaqueRun(name: string): boolean {
+  if (/[0-9a-f]{32,}/i.test(name)) return true;
+  return (name.match(/[A-Za-z0-9]{24,}/g) ?? []).some((run) => /[0-9]/.test(run));
+}
+/** Whether a name a refused call was made by may be written: shaped like a name, and carrying nothing shaped like a credential. */
+export function refusedToolName(name: unknown): string | null {
+  if (typeof name !== "string" || !REFUSED_TOOL.test(name)) return null;
+  if (NAME_TOKEN.test(name) || opaqueRun(name)) return null;
+  // Whatever else the shared redaction recognizes (a placeholder, `key=value`); its `<blob>` is not used here, since a
+  // long name of words is a blob to it (an MCP tool's often is), and `opaqueRun` is the narrower test for that.
+  return /<(secret|redacted|placeholder)>/.test(redactCredentialShapes(name)) ? null : name;
+}
 
 /**
  * The tool.refused row for a host call refused before an operation existed: by the gateway (a name that resolves to no
@@ -389,9 +412,7 @@ export function toolRefusedRow(o: {
   task?: string | null;
 }): TraceRow {
   const code = ERROR_CODE.test(o.code) ? o.code : "refused";
-  // A long name is a blob to `redactCredentialShapes` (an MCP tool's often is), so only its credential shapes count here.
-  const tool = typeof o.tool === "string" && REFUSED_TOOL.test(o.tool)
-    && !/<(secret|redacted|placeholder)>/.test(redactCredentialShapes(o.tool)) ? o.tool : null;
+  const tool = refusedToolName(o.tool);
   return {
     at: o.at, tenantId: o.tenantId, agentId: o.agentId, kind: "tool.refused",
     spanId: o.callId || `refused_${o.at}`,

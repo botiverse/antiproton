@@ -937,7 +937,8 @@ export function runJsTool(
      *  answer is the reason, not "no such tool, try a neighbour". */
     unoffered?: Array<{ alias: string; plugin: string; reason: "switched_off" | "plugin_unavailable" }>;
     /** A program's host call refused before it reached the gateway: here, on the model's behalf, or by the executor
-     *  (`ExecutorHost.refused`). For its `tool.refused` trace row; at most REFUSALS_TOLD a run, and never awaited. */
+     *  (`ExecutorHost.refused`). For its `tool.refused` trace row; at most REFUSALS_TOLD a run (gateway refusals are the
+     *  gateway's own rows, bounded by the host-call budget instead), and never awaited. */
     onRefused?: (r: { tool: string | null; code: string; callId: string; by: "run_js" | "executor" }) => void;
   } = {},
 ): AgentHarnessTool<undefined> {
@@ -1143,6 +1144,11 @@ export function runJsTool(
  * How many of one run's refused calls are told for the trace (`onRefused`). A program that loops past its host-call
  * budget is refused on every turn of the loop until its wall time ends; the first few say what happened, and the
  * run's own `js.run` row says how it ended.
+ *
+ * It counts only the refusals run_js and the executor tell (`by: "run_js"`, `"executor"`). A program's call the gateway
+ * refuses has its row written by the gateway (`ToolGateway.#refused`) and is not counted here; it reached the gateway
+ * as a host call, though, and each host call counts against the run's budget (`maxHostCalls`, 64, src/core/execution.ts)
+ * before it is made, so one run writes at most 64 gateway rows and 16 of these: 80 tool.refused rows in all.
  */
 const REFUSALS_TOLD = 16;
 
