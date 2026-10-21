@@ -40,6 +40,13 @@
  * its closing text, having sent nothing to the owner's DM, has that text sent there by code (`replyFallback`); one that
  * failed before answering has a fixed line sent there instead (`FAILED_TURN_LINE`).
  *
+ * When Raft runs the check (RFC 077 step 2, `assistantOf.raftCheck`, `AssistantOwner.raftCheck`), everything above that
+ * decides what to tell the owner is Raft's, and this file keeps only the turn: a wake carrying Raft's check posts its
+ * instruction in a short session narrowed to the tools Raft allows (`raftCheckWake`, src/plugins/raft-assistant-check.ts),
+ * the notify tool forwards its items to Raft (`notifyRaft`), the chat's references are told to Raft (`toldToRaft`), the
+ * preferences tool reads and writes Raft's rules (`preferencesRaft`), and the day already briefed is pushed once
+ * (`pushBriefImport`). The flag read false puts everything back as described above.
+ *
  * Compiled by both typecheck programs.
  */
 import { createHash } from "node:crypto";
@@ -49,6 +56,10 @@ import type { RaftAssistantOf } from "@botiverse/raft-sdk";
 import { isIsolatedSession } from "../runtime/isolated-session.ts";
 import { modelToolName } from "../runtime/pi-tools.ts";
 import type { PluginContext, PluginNext, ToolSchema, TurnEnd } from "./types.ts";
+import {
+  CHECK_COUNT_KEYS, checkOf as raftCheckOf, checkOfTurnKey, checkTools, checkTurnKey, notifyIdempotencyKey, substituteTools,
+  type CheckTrigger, type RaftCheck, type RefusedCheck,
+} from "./raft-assistant-check.ts";
 import {
   CONTACT_KEY, DEFAULT_QUIET, DEFAULTS_LINE, EFFECTS, ITEM_KINDS, PEER_FIELD, QUIET_FORMAT, RULES_MAX, SENDER_ID_FIELD, SENDER_TYPE_FIELD, personType, confirmLine, contactOf, inQuiet, isActive,
   keptRules, loadContact, modelRulesLine, personRulesUnenforced, quietLine, ruleLine, rulesAttrs, rulesOf, untilOf, winningRule,
@@ -272,6 +283,13 @@ export interface AssistantOwner {
   ownerName: string | null;
   /** This agent's own name (`agent.name`), so the DM between it and its owner is never one of the owner's conversations to report. */
   selfName: string | null;
+  /**
+   * Whether Raft runs the check (`assistantOf.raftCheck`, RFC 077 step 2), as last read: at every listing, when the
+   * brief's timer fires, and when a wake carries a check. True: this file's own brief, prefilter, inbox-lag reads,
+   * notify composition and rules store are off, and Raft's are used (`raftCheckWake`, `notifyRaft`, `preferencesRaft`).
+   * False or absent: everything as before, which is what turning Raft's flag off rolls back to.
+   */
+  raftCheck: boolean;
 }
 
 /** A zone `Intl` knows, or null: Raft's field is passed through untyped by the SDK (0.23.0), so it is read defensively. */
@@ -292,6 +310,7 @@ function ownerOf(raw: unknown): AssistantOwner | null {
     changeSources: sourcesOf(o.changeSources),
     lagReads: typeof o.lagReads === "number" && o.lagReads >= 0 ? o.lagReads : 0,
     briefSent: str(o.briefSent), askedTimezone: o.askedTimezone === true, ownerName: str(o.ownerName), selfName: str(o.selfName),
+    raftCheck: o.raftCheck === true,
   };
 }
 
@@ -345,9 +364,23 @@ export async function keepOwnerFromContext(ctx: PluginContext, context: OwnerCon
     dmTarget: dm, learnedDm: same?.learnedDm ?? null, doorbellAt: same?.doorbellAt ?? null, lastCheckAt: same?.lastCheckAt ?? null,
     changeAt: same?.changeAt ?? null, changeSources: same?.changeSources ?? {}, lagReads: same?.lagReads ?? 0, lastBrief: same?.lastBrief ?? null, briefSent: same?.briefSent ?? null, askedTimezone: same?.askedTimezone ?? false,
     ownerName: name, selfName: typeof context.agent.name === "string" && context.agent.name ? context.agent.name : null,
+    raftCheck: extra.raftCheck === true,
   };
   await saveOwner(ctx, owner);
+  if (owner.raftCheck && !same?.raftCheck) await askBriefImport(ctx, owner);
   return owner;
+}
+
+/**
+ * Raft's flag as read again (`WakeDeps.mode`), kept on the owner record: the first time it reads true for this owner,
+ * the switch-over import is asked for (`pushBriefImport`). The record as now kept.
+ */
+export async function noteMode(ctx: PluginContext, owner: AssistantOwner, raftCheck: boolean): Promise<AssistantOwner> {
+  if (owner.raftCheck === raftCheck) return owner;
+  const next = { ...owner, raftCheck };
+  await saveOwner(ctx, next);
+  if (raftCheck) await askBriefImport(ctx, next);
+  return next;
 }
 
 /** The part of the credential context (`routes.agent.context`) the owner is kept from. */
@@ -387,6 +420,76 @@ export async function learnDm(ctx: PluginContext, target: string, senderId: unkn
   if (!owner || owner.dmTarget !== null || senderId !== owner.userId) return false;
   if (owner.learnedDm !== `dm:@${m[1]}`) await saveOwner(ctx, { ...owner, learnedDm: `dm:@${m[1]}` });
   return true;
+}
+
+// ---- Raft's assistant routes, when Raft runs the check --------------------------------------------------------------
+
+/** One answer of Raft's assistant routes: its body, or its status (null: no answer at all) and code. */
+export type RaftAnswer = { ok: true; data: Record<string, unknown> } | { ok: false; status: number | null; code: string | null; message?: string };
+/**
+ * One request to Raft's agent API on the mount's credential (src/plugins/raft.ts `assistantApi`), `path` under
+ * `/internal/agent-api` (`/assistant/notify`, …). Never throws: a failure is the answer.
+ */
+export type AssistantApi = (ctx: PluginContext, method: "GET" | "POST" | "PUT" | "DELETE", path: string, body?: unknown) => Promise<RaftAnswer>;
+
+/** A code as a trace row may carry it: Raft's, when it is a plain word, else a fixed stand-in. */
+const codeOf = (code: string | null | undefined, fallback: string) => (code && /^[a-z0-9_]{1,48}$/i.test(code) ? code : fallback);
+
+/**
+ * The switch-over import (`POST /assistant/check-state/import { briefSent }`): pushed once per owner, the first time
+ * Raft's flag reads true, so the day of the switch does not get a second brief. `briefSent` is the later of the day a
+ * brief turn was posted (`lastBrief`) and the day one was sent (`briefSent`), owner-local in this file's zone
+ * (`zoneOf`): a brief turn that was posted and then failed still counts as the day's brief. Retried with backoff
+ * (`BRIEF_IMPORT_RETRY_MS`) by the wakes until Raft takes it; never in the way of a check.
+ */
+export const BRIEF_IMPORT_KEY = "brief_import";
+export const BRIEF_IMPORT_RETRY_MS: readonly number[] = [60_000, 5 * 60_000, 30 * 60_000, 2 * 3_600_000, 6 * 3_600_000];
+interface BriefImport { userId: string; done: boolean; attempts: number; nextAt: number }
+
+function briefImportOf(raw: unknown): BriefImport | null {
+  const o = raw && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, unknown> : null;
+  if (!o || typeof o.userId !== "string") return null;
+  return { userId: o.userId, done: o.done === true, attempts: Number(o.attempts) || 0, nextAt: Number(o.nextAt) || 0 };
+}
+
+async function askBriefImport(ctx: PluginContext, owner: AssistantOwner): Promise<void> {
+  const kept = briefImportOf(await ctx.db.get(ASSISTANT_STORE, BRIEF_IMPORT_KEY));
+  if (kept?.userId === owner.userId) return;
+  await ctx.db.put(ASSISTANT_STORE, { userId: owner.userId, done: false, attempts: 0, nextAt: 0 } as unknown as Json, BRIEF_IMPORT_KEY);
+}
+
+/** The later of two owner-local days (YYYY-MM-DD), or null with neither. */
+const laterDay = (a: string | null, b: string | null) => (a === null ? b : b === null ? a : a > b ? a : b);
+
+/** Push the import when it is owed and due; the time it should be tried again, or null when nothing is owed. */
+export async function pushBriefImport(ctx: PluginContext, api: AssistantApi | undefined, now: number): Promise<number | null> {
+  const owner = await loadOwner(ctx);
+  const kept = briefImportOf(await ctx.db.get(ASSISTANT_STORE, BRIEF_IMPORT_KEY));
+  if (!owner?.raftCheck || !api || !kept || kept.userId !== owner.userId || kept.done) return null;
+  if (kept.nextAt > now) return kept.nextAt;
+  const briefSent = laterDay(owner.lastBrief, owner.briefSent);
+  const trace = (status: string, attrs: Record<string, number | string>) => {
+    ctx.trace?.({ kind: "raft.assistant_check", status, verdict: status === "import_failed" ? "failed" : "ok", attrs });
+    logEvent("raft.assistant_check", { tenantId: ctx.caller.tenantId, agentId: ctx.caller.agentId, mount: ctx.alias, status, ...attrs });
+  };
+  if (briefSent === null) {
+    // Nothing was ever briefed here: nothing for Raft to know.
+    await ctx.db.put(ASSISTANT_STORE, { ...kept, done: true } as unknown as Json, BRIEF_IMPORT_KEY);
+    trace("import_skipped", { attempts: kept.attempts });
+    return null;
+  }
+  const out = await api(ctx, "POST", "/assistant/check-state/import", { briefSent });
+  if (out.ok) {
+    await ctx.db.put(ASSISTANT_STORE, { ...kept, done: true, attempts: kept.attempts + 1 } as unknown as Json, BRIEF_IMPORT_KEY);
+    trace("import_sent", { attempts: kept.attempts + 1 });
+    return null;
+  }
+  if (out.code === NOT_ENABLED) await pauseOn(ctx, new Error(NOT_ENABLED));
+  const attempts = kept.attempts + 1;
+  const nextAt = now + BRIEF_IMPORT_RETRY_MS[Math.min(attempts, BRIEF_IMPORT_RETRY_MS.length) - 1]!;
+  await ctx.db.put(ASSISTANT_STORE, { ...kept, attempts, nextAt } as unknown as Json, BRIEF_IMPORT_KEY);
+  trace("import_failed", { attempts, ...(out.status !== null ? { http_status: out.status } : {}), code: codeOf(out.code, out.status === null ? "no_answer" : "http") });
+  return nextAt;
 }
 
 // ---- the owner's clock -----------------------------------------------------------------------------------------------
@@ -578,15 +681,18 @@ export const ASSISTANT_OWN_TOOLS: readonly ToolSchema[] = [
       "The tool writes the message itself. It drops what your owner was already told and what their rules mute; it keeps what a rule puts in " +
       "the brief, and during their quiet hours everything not marked for any time of day, for the morning brief. " +
       `It shows at most ${DM_ITEMS_MAX} items, @mentions first, and says how many more there are; those are not counted as told, and a later check looks at them again. ` +
-      "Its result says what was sent, held back, kept or dropped. Set brief: true only when the morning brief asks you to.",
+      "Its result says what was sent, held back, kept or dropped. Set brief: true only when the morning brief asks you to. " +
+      "When your check names its conversations by channelId, each item is that channelId and a summary (kind if you can tell), and nothing else.",
     parameters: {
       type: "object", additionalProperties: false, required: ["items"],
       properties: {
         items: {
           type: "array",
           items: {
-            type: "object", additionalProperties: false, required: ["ref", "summary", "kind"],
+            // `ref` and `kind` are required in code where this file runs the check, `channelId` where Raft does (`notifyRaft`).
+            type: "object", additionalProperties: false, required: ["summary"],
             properties: {
+              channelId: { type: "string", description: "When your check lists conversations by channelId: the conversation's channelId, as given. Raft writes the link itself." },
               ref: { type: "string", description: "#channel:msgid: the channel's name and the msg= id of the message (for a task, the message that is the task). Never task #N." },
               summary: { type: "string", description: `Who wants what from your owner, e.g. "@cy needs your OK on the launch date". One line, at most ${SUMMARY_MAX} characters; a longer one is cut.` },
               kind: { type: "string", enum: [...ITEM_KINDS], description: "question, review or decision asked of your owner, a task assigned to them, an unanswered @mention; decided is a decision others made (brief only)." },
@@ -668,6 +774,8 @@ export const ASSISTANT_OWN_TOOLS: readonly ToolSchema[] = [
 export type OwnerSend = { sent: true } | { sent: false; held: string };
 
 export interface NotifyDeps {
+  /** Raft's assistant routes: where a check Raft runs sends its items (`notifyRaft`). */
+  api?: AssistantApi;
   /** Send `content` to `target` as the agent, with `key` as its idempotency key (src/plugins/raft.ts, `messages.send`). */
   send(ctx: PluginContext, target: string, content: string, key: string): Promise<OwnerSend>;
   /** Ask Raft's context again; the owner as now kept, or null when it names none. */
@@ -685,9 +793,95 @@ function refusal(message: string): Error {
  * is recorded as said only once Raft took the message, so a send that failed or was held repeats nothing it did not say.
  */
 export async function notifyOwner(args: unknown, ctx: PluginContext, deps: NotifyDeps): Promise<Json> {
+  // A short session of Raft's check names it in its key (`checkTurnKey`); while Raft runs the check, every notify is its.
+  const check = checkOfTurnKey(ctx.caller.turnKey);
+  if (check || (await loadOwner(ctx))?.raftCheck) {
+    const { out, attrs } = await notifyRaft(args, ctx, deps, check);
+    ctx.trace?.({ kind: "raft.assistant_notify", status: String(out.state), verdict: out.state === "not_sent" ? "failed" : "ok", attrs });
+    return out as unknown as Json;
+  }
   const out = await notifyOnce(args, ctx, deps);
   ctx.trace?.({ kind: "raft.assistant_notify", status: String(out.state), verdict: "ok", attrs: notifyAttrs(args, out) });
   return out as unknown as Json;
+}
+
+/** The items one forwarded notify takes, at most: as many as one of Raft's checks holds. */
+export const RAFT_ITEMS_MAX = 30;
+const RAFT_OUTCOMES = ["sent", "duplicate", "nothing_to_send", "kept_for_brief"] as const;
+
+/**
+ * The notify tool while Raft runs the check (RFC 077 step 2): the items, checked here for shape only (a channelId and a
+ * summary each, cut to `SUMMARY_MAX`; a kind when given must be one), go to Raft (`POST /assistant/notify`) with the
+ * check's id, from the session's key (`checkOfTurnKey`), and an idempotency key made from the check and the items
+ * (`notifyIdempotencyKey`), neither of which the model gives or sees. Raft confirms each item against its check (one it
+ * did not offer is dropped, `not_in_check`), applies kind rules, composes and sends the one DM and records what it
+ * showed; its answer is turned into the result the model reads. Empty `items` is a call too: it tells Raft the model
+ * found nothing, which Raft records. A call made outside such a session while Raft runs the check sends nothing.
+ */
+async function notifyRaft(
+  args: unknown, ctx: PluginContext, deps: NotifyDeps, check: { id: string; trigger: CheckTrigger } | null,
+): Promise<{ out: Record<string, unknown>; attrs: Record<string, number | string> }> {
+  const a = args && typeof args === "object" && !Array.isArray(args) ? args as Record<string, unknown> : {};
+  const given = Array.isArray(a.items) ? a.items.length : 0;
+  const base = { notifyState: "", given, forwarded: 1, ...(check ? { check_id: check.id, trigger: check.trigger } : {}) };
+  const notSent = (code: string, note: string, extra: Record<string, number | string> = {}) =>
+    ({ out: { state: "not_sent", code, note }, attrs: { ...base, notifyState: "not_sent", sent: 0, code, ...extra } });
+  if (!check) {
+    return notSent("no_check", "Raft runs your owner's checks now, and this was not one of them: nothing was sent. Do not call again.");
+  }
+  if (!(await loadOwner(ctx))) throw refusal(`${NOTIFY_TOOL}: this agent is not anyone's assistant now, so there is nobody to tell`);
+  if (!deps.api) throw refusal(`${NOTIFY_TOOL}: this build cannot reach Raft's notify route`);
+  if (!Array.isArray(a.items) || a.items.length > RAFT_ITEMS_MAX) throw refusal(`items must be a list of at most ${RAFT_ITEMS_MAX}`);
+  const items: Array<{ channelId: string; summary: string; kind?: string }> = [];
+  for (const raw of a.items) {
+    const o = raw && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, unknown> : {};
+    const channelId = typeof o.channelId === "string" ? o.channelId.trim() : "";
+    if (!channelId || channelId.length > 64) throw refusal("each item needs the channelId of a conversation your check gave you");
+    const summary = typeof o.summary === "string" ? o.summary.replace(/\s+/g, " ").trim() : "";
+    if (!summary) throw refusal(`item ${JSON.stringify(channelId)} has no summary`);
+    let kind: string | undefined;
+    if (o.kind !== undefined && o.kind !== null) {
+      kind = ITEM_KINDS.find((k) => k === o.kind);
+      if (!kind) throw refusal(`item ${JSON.stringify(channelId)}: kind must be one of ${ITEM_KINDS.join(", ")}`);
+    }
+    if (!items.some((i) => i.channelId === channelId)) items.push({ channelId, summary: clipSummary(summary), ...(kind ? { kind } : {}) });
+  }
+  const answer = await deps.api(ctx, "POST", "/assistant/notify", { check_id: check.id, idempotency_key: notifyIdempotencyKey(check.id, items), items });
+  if (!answer.ok) {
+    const status = answer.status;
+    const http: Record<string, number> = status !== null ? { http_status: status } : {};
+    if (answer.code === NOT_ENABLED) {
+      await pauseOn(ctx, new Error(NOT_ENABLED));
+      throw refusal(`${NOTIFY_TOOL}: Raft said this assistant is not enabled (${NOT_ENABLED}), so nothing proactive is sent until it is again`);
+    }
+    if (answer.code === "check_unknown") return notSent("check_unknown", "Raft no longer knows this check (it is too old): nothing was sent. Do not call again.", http);
+    if (status === null || status >= 500) {
+      return notSent("failed", `Raft did not take it: nothing is known to be sent. You may call ${NOTIFY_TOOL} once more with exactly the same items; it is never sent twice.`, http);
+    }
+    if ((status === 404 && (answer.code === null || answer.code === "NOT_FOUND")) || (status === 403 && answer.code === "assistant_route_not_allowed")) {
+      return notSent("unavailable", "This Raft cannot take these yet: nothing was sent. Do not call again.", http);
+    }
+    return notSent(codeOf(answer.code, `http_${status}`), "Raft refused it: nothing was sent. Do not call again.", http);
+  }
+  const d = answer.data;
+  const outcome = RAFT_OUTCOMES.find((o) => o === d.outcome) ?? "unknown";
+  const shown = typeof d.shown === "number" && d.shown >= 0 ? d.shown : 0;
+  const more = typeof d.more === "number" && d.more > 0 ? d.more : 0;
+  const droppedList = Array.isArray(d.dropped) ? d.dropped.filter((x): x is Record<string, unknown> => !!x && typeof x === "object") : [];
+  const dropped: Record<string, string> = {};
+  const byReason: Record<string, number> = {};
+  for (const x of droppedList) {
+    const reason = codeOf(typeof x.reason === "string" ? x.reason : null, "other");
+    if (typeof x.channelId === "string") dropped[x.channelId] = reason;
+    byReason[`dropped_${reason}`] = (byReason[`dropped_${reason}`] ?? 0) + 1;
+  }
+  const note = outcome === "sent" ? `Sent to your owner.${more ? ` ${more} more ${more === 1 ? "was" : "were"} held back, not told; a later check offers them again.` : ""} Do not send them any of this another way.`
+    : outcome === "duplicate" ? "This was already sent for this check: nothing more was sent. Do not call again."
+    : outcome === "kept_for_brief" ? "Kept for your owner's morning brief: nothing was sent now. Do not message them about it."
+    : outcome === "nothing_to_send" ? "Nothing new is waiting on your owner: nothing was sent. Do not message them."
+    : "Raft answered in a way this build does not know. Do not call again.";
+  const out = { state: outcome, items: shown, ...(more ? { more } : {}), ...(droppedList.length ? { dropped } : {}), note };
+  return { out, attrs: { ...base, notifyState: outcome, sent: shown, ...(more ? { held_back: more } : {}), dropped: droppedList.length, ...byReason } };
 }
 
 /** Why a notify call dropped an item, as the trace counts it: the category, never the item, its reference or a rule's id. */
@@ -869,13 +1063,15 @@ const REF_IN_TEXT = /#([^\s:#]{1,80}):([0-9A-Za-z-]{8,36})/g;
  * back unasked. Called after a `messages_send` the Server accepted (src/plugins/raft.ts), to the owner's DM only; the
  * count goes on a `raft.assistant_chat_told` trace row, never a reference. Returns how many were new.
  */
-export async function noteToldInChat(ctx: PluginContext, target: unknown, content: unknown, now = Date.now()): Promise<number> {
+export async function noteToldInChat(ctx: PluginContext, target: unknown, content: unknown, now = Date.now(), api?: AssistantApi): Promise<number> {
   if (typeof target !== "string" || typeof content !== "string") return 0;
   const owner = await loadOwner(ctx);
   const dm = owner ? dmPeerOf(dmOf(owner)) : null;
   // The DM itself or one of its threads (`dm:@ada:abcdef12`), in Raft's form (`~human`) or the inbox's (`sameDm`).
   const to = dmPeerOf(target);
   if (!dm || !to || !sameDm(to, dm)) return 0;
+  // While Raft runs the check, what was told is Raft's to keep (`POST /assistant/told`, refs as written, short ids too).
+  if (owner!.raftCheck && api) return toldToRaft(ctx, content, api);
   let fresh = 0;
   for (const m of content.matchAll(REF_IN_TEXT)) {
     const key = `msg:${short8(m[2]!)}`;
@@ -885,6 +1081,28 @@ export async function noteToldInChat(ctx: PluginContext, target: unknown, conten
   }
   if (fresh) ctx.trace?.({ kind: "raft.assistant_chat_told", status: "told", verdict: "ok", attrs: { told: fresh } });
   return fresh;
+}
+
+/** The most refs one told record takes (Raft's `messageIds` bound, the same for refs). */
+const TOLD_REFS_MAX = 100;
+
+/**
+ * The chat's references, told to Raft (`POST /assistant/told { refs, via: "chat" }`), which resolves each within its
+ * channel with the owner's visibility and skips what it cannot. Nothing is kept here. One
+ * `raft.assistant_chat_told` row: how many refs were sent, recorded and skipped, and Raft's status on a failure; never
+ * a ref. A failure costs only the record: the chat's send has already gone.
+ */
+async function toldToRaft(ctx: PluginContext, content: string, api: AssistantApi): Promise<number> {
+  const refs = [...new Set([...content.matchAll(REF_IN_TEXT)].map((m) => m[0]))].slice(0, TOLD_REFS_MAX);
+  if (!refs.length) return 0;
+  const out = await api(ctx, "POST", "/assistant/told", { refs, via: "chat" });
+  const recorded = out.ok && typeof out.data.recorded === "number" ? out.data.recorded : 0;
+  const attrs = out.ok
+    ? { told: recorded, refs: refs.length, skipped: typeof out.data.skipped === "number" ? out.data.skipped : 0, forwarded: 1 }
+    : { told: 0, refs: refs.length, forwarded: 1, ...(out.status !== null ? { http_status: out.status } : {}), code: codeOf(out.code, out.status === null ? "no_answer" : "http") };
+  if (!out.ok && out.code === NOT_ENABLED) await pauseOn(ctx, new Error(NOT_ENABLED));
+  ctx.trace?.({ kind: "raft.assistant_chat_told", status: out.ok ? "told" : "told_failed", verdict: out.ok ? "ok" : "failed", attrs });
+  return recorded;
 }
 
 // ---- the chat's reply, when the model left it in its closing text ----------------------------------------------------
@@ -1004,9 +1222,11 @@ const OWN_TURN_KEYS: ReadonlySet<string> = new Set(["assistant.check", "assistan
  * never the text.
  */
 export async function replyFallback(
-  ctx: PluginContext, end: Pick<TurnEnd, "turnId" | "turnKey" | "finalText" | "outcome" | "rebuilding">,
+  ctx: PluginContext, end: Pick<TurnEnd, "turnId" | "turnKey" | "finalText" | "outcome" | "rebuilding" | "isolated">,
   send: (ctx: PluginContext, target: string, content: string, key: string) => Promise<OwnerSend>,
 ): Promise<"sent" | "held" | "failed" | "skipped"> {
+  // A short session's end is never the chat's (`TurnEnd.isolated`): told only to say how a check ended (`checkEnded`).
+  if (end.isolated) return "skipped";
   // A run being rebuilt runs again for the same input (`TurnEnd.rebuilding`): its end is not the turn's answer, and the
   // reply row is left as it is, so the rebuilt run's end is judged with whatever this one already sent.
   if (end.rebuilding) return "skipped";
@@ -1047,6 +1267,20 @@ export async function replyFallback(
 }
 
 /**
+ * The end of a short session this mount asked for (`TurnEnd.isolated`): for one of Raft's checks (`checkOfTurnKey`), a
+ * `raft.assistant_check` row with its id, trigger and how the turn ended (`outcome`, a failure's `error_code`), so Raft
+ * can tell a check that ran from one that failed or never called notify. Nothing for any other end.
+ */
+export function checkEnded(ctx: PluginContext, end: Pick<TurnEnd, "turnKey" | "outcome" | "errorCode" | "isolated">): boolean {
+  const check = end.isolated ? checkOfTurnKey(end.turnKey) : null;
+  if (!check) return false;
+  const attrs = { check_id: check.id, trigger: check.trigger, outcome: end.outcome, ...(end.errorCode ? { error_code: end.errorCode } : {}) };
+  ctx.trace?.({ kind: "raft.assistant_check", status: "turn_ended", verdict: end.outcome === "completed" ? "ok" : end.outcome === "cancelled" ? "cancelled" : "failed", attrs });
+  logEvent("raft.assistant_check", { tenantId: ctx.caller.tenantId, agentId: ctx.caller.agentId, mount: ctx.alias, status: "turn_ended", ...attrs });
+  return true;
+}
+
+/**
  * Raft's read of a person by the name the owner gave (`GET /assistant/owner-resolve?name=`, `alice~human` on a
  * collision): the person, `unknown` when Raft answers that the owner can see no one of that name, `unavailable` when the
  * route itself is not there (a Raft from before it), `failed` for any other failure.
@@ -1059,6 +1293,8 @@ export interface PreferencesDeps {
   inbox: InboxRead;
   /** Raft's person read; with none, or where Raft has no such route, a person is looked for in the owner's inbox rows. */
   resolve?: PersonResolve;
+  /** Raft's assistant routes: the owner's rules and settings while Raft runs the check (`preferencesRaft`). */
+  api?: AssistantApi;
   now?: () => number;
 }
 
@@ -1096,8 +1332,9 @@ export async function preferences(args: unknown, ctx: PluginContext, deps: Prefe
   const now = (deps.now ?? Date.now)();
   const a = args && typeof args === "object" && !Array.isArray(args) ? args as Record<string, unknown> : {};
   const action = typeof a.action === "string" ? a.action : "";
-  const rules = await loadRules(ctx);
   const owner = await loadOwner(ctx);
+  if (owner?.raftCheck && deps.api) return preferencesRaft(a, action, ctx, owner, deps.api);
+  const rules = await loadRules(ctx);
   const zone = owner ? zoneOf(owner) : "UTC";
   const contact = await loadContact(ctx, ASSISTANT_STORE);
   const refuse = (code: string, message: string, attrs: Record<string, string> = {}): never => {
@@ -1184,6 +1421,119 @@ export async function preferences(args: unknown, ctx: PluginContext, deps: Prefe
     if (!owner) return refuse("no_owner", "this agent is not anyone's assistant now");
     await saveOwner(ctx, { ...owner, statedTimezone: tz });
     traceRules(ctx, { action, result: "kept" }, rules, now);
+    return { state: "kept", timezone: tz, ...(owner.timezone ? { note: `Raft gives your owner's zone as ${owner.timezone}, which is used while it does.` } : {}) };
+  }
+  return refuse("action", "action must be add, list, remove, quiet, timezone, mute or unmute");
+}
+
+/**
+ * The preferences tool while Raft runs the check: the owner's rules and settings are Raft's (RFC 077 step 1,
+ * `/assistant/contact-rules`, `/assistant/contact-settings`), read and written there and nowhere here, since Raft is
+ * what applies them now. The tool and its answers keep their shape: `confirm` is Raft's confirmation, written from what
+ * it stored; a list is Raft's lines. What is checked here before Raft is asked is the same as before (one subject, an
+ * effect, `anytime` only for always, quiet as HH:MM, a zone `Intl` knows). Raft's refusal is the tool's error, in
+ * Raft's words (written for the model) with its code; its trace row says `via: raft` and the refusal's code only.
+ */
+async function preferencesRaft(a: Record<string, unknown>, action: string, ctx: PluginContext, owner: AssistantOwner, api: AssistantApi): Promise<Json> {
+  const trace = (attrs: Record<string, string | number>) => {
+    const row = { action, via: "raft", ...attrs };
+    ctx.trace?.({ kind: "raft.assistant_rules", status: String(attrs.result), verdict: "ok", attrs: row });
+    logEvent("raft.assistant_rules", { tenantId: ctx.caller.tenantId, agentId: ctx.caller.agentId, mount: ctx.alias, ...row });
+  };
+  const refuse = (code: string, message: string, attrs: Record<string, string> = {}): never => {
+    trace({ ...attrs, result: `refused:${code}` });
+    throw refusal(message);
+  };
+  /** Raft asked; its body, or the tool's error in Raft's words. */
+  const ask = async (method: "GET" | "POST" | "PUT" | "DELETE", path: string, body?: unknown, attrs: Record<string, string> = {}) => {
+    const out = await api(ctx, method, path, body);
+    if (out.ok) return out.data;
+    if (out.code === NOT_ENABLED) {
+      await pauseOn(ctx, new Error(NOT_ENABLED));
+      return refuse(NOT_ENABLED, `Raft said this assistant is not enabled (${NOT_ENABLED}): nothing was changed`, attrs);
+    }
+    const said = out.message && out.message.length <= 300 ? out.message : null;
+    return refuse(codeOf(out.code, out.status === null ? "no_answer" : `http_${out.status}`),
+      said ?? (out.status === null || out.status >= 500 ? "Raft could not be reached just now: nothing was changed; try again shortly" : `Raft refused it (${out.code ?? out.status})`), attrs);
+  };
+  const str = (v: unknown) => (typeof v === "string" ? v : "");
+  if (action === "list") {
+    const d = await ask("GET", "/assistant/contact-rules");
+    const rules = Array.isArray(d.rules) ? d.rules.filter((r): r is Record<string, unknown> => !!r && typeof r === "object") : [];
+    const lines = d.lines && typeof d.lines === "object" ? d.lines as Record<string, unknown> : {};
+    trace({ result: "listed", rules_total: rules.length });
+    return { rules: rules.map((r) => ({ id: str(r.id), line: str(r.line) })), quiet: str(lines.quiet), brief: str(lines.brief), defaults: str(lines.defaults) } as unknown as Json;
+  }
+  if (action === "add" || action === "mute") {
+    const effect = action === "mute" ? "mute" : EFFECTS.find((e) => e === a.effect);
+    if (!effect) return refuse("effect", `effect must be one of ${EFFECTS.join(", ")}`);
+    const person = a.person ?? (action === "mute" ? a.sender : undefined);
+    const given = { channel: a.channel, thread: a.thread, person, kind: a.kind, dms: a.dms === true ? true : undefined };
+    const named = Object.entries(given).filter(([, v]) => v !== undefined && v !== null && v !== "");
+    if (named.length !== 1) return refuse("scope", "a rule is about exactly one of channel, thread, person, kind or dms", { effect });
+    const [scope, value] = named[0]!;
+    const t = { effect, scope };
+    if (a.anytime === true && effect !== "always") return refuse("anytime", "anytime is only for effect always", t);
+    if (scope !== "dms" && (typeof value !== "string" || !value.trim())) return refuse(scope, `${scope} must be text`, t);
+    const v = typeof value === "string" ? value.trim() : "";
+    let subject: string;
+    if (scope === "dms") subject = "dms";
+    else if (scope === "kind") subject = `kind:${v}`;
+    else if (scope === "person") subject = `@${v.replace(/^@/, "")}`;
+    else if (scope === "channel") subject = `#${v.replace(/^#/, "")}`;
+    else {
+      const ref = MESSAGE_REF.exec(v);
+      if (!ref) return refuse("thread_ref", "a thread is #channel:msgid, its first message's", t);
+      subject = `#${ref[1]}:${short8(ref[2]!)}`;
+    }
+    const body = {
+      effect, subject, ...(a.anytime === true ? { anytime: true } : {}), ...(typeof a.until === "string" && a.until ? { until: a.until } : {}),
+      ...(typeof a.note === "string" && a.note.trim() ? { note: a.note.trim().slice(0, 200) } : {}),
+    };
+    const d = await ask("POST", "/assistant/contact-rules", body, t);
+    const rule = d.rule && typeof d.rule === "object" ? d.rule as Record<string, unknown> : {};
+    const updated = d.updated === true;
+    trace({ ...t, result: updated ? "updated" : "added" });
+    return { state: updated ? "updated" : "added", id: str(rule.id), line: str(rule.line), confirm: str(d.confirmation) } as unknown as Json;
+  }
+  if (action === "remove" || action === "unmute") {
+    if (a.all === true && action === "remove") {
+      const d = await ask("GET", "/assistant/contact-rules");
+      const ids = (Array.isArray(d.rules) ? d.rules : []).map((r) => (r && typeof r === "object" ? str((r as Record<string, unknown>).id) : "")).filter(Boolean);
+      for (const id of ids) await ask("DELETE", `/assistant/contact-rules/${encodeURIComponent(id)}`);
+      trace({ result: "removed_all", removed: ids.length });
+      return { state: "removed", removed: ids.length, confirm: ids.length ? "All your rules are gone; the defaults apply." : "You had no rules; the defaults apply." };
+    }
+    const id = str(a.id).trim();
+    if (id.length < 8 || id.length > 36) return refuse("no_such_rule", `no rule has the id ${JSON.stringify(a.id)}: list them first`);
+    const d = await ask("DELETE", `/assistant/contact-rules/${encodeURIComponent(id)}`);
+    trace({ result: "removed" });
+    return { state: "removed", id, confirm: str(d.confirmation) };
+  }
+  if (action === "quiet") {
+    let quiet: QuietHours | null;
+    if (a.off === true) quiet = null;
+    else {
+      const from = str(a.from).trim(), to = str(a.to).trim();
+      if (!QUIET_FORMAT.test(from) || !QUIET_FORMAT.test(to)) return refuse("quiet_format", "from and to must be HH:MM (24-hour), or give off: true");
+      if (from === to) return refuse("quiet_empty", "from and to are the same time: give off: true for no quiet hours");
+      quiet = { from, to };
+    }
+    const d = await ask("PUT", "/assistant/contact-settings", { quiet });
+    trace({ result: quiet ? "quiet_set" : "quiet_off" });
+    return { state: "kept", quiet: quiet ? `${quiet.from}-${quiet.to}` : "off", confirm: str(d.confirmation) } as unknown as Json;
+  }
+  if (action === "timezone") {
+    const tz = validZone(a.timezone);
+    if (!tz) return refuse("timezone", `${JSON.stringify(a.timezone)} is not an IANA time zone name (such as Europe/Berlin)`);
+    // The settings are written whole: the quiet hours as Raft has them now, with the zone the owner stated.
+    const now = await ask("GET", "/assistant/contact-rules");
+    const settings = now.settings && typeof now.settings === "object" ? now.settings as Record<string, unknown> : {};
+    const quiet = settings.quiet && typeof settings.quiet === "object" ? settings.quiet : null;
+    await ask("PUT", "/assistant/contact-settings", { quiet, statedTimezone: tz });
+    // Kept here as well: the owner's day for this file's own clock (`zoneOf`) while Raft gives no zone.
+    await saveOwner(ctx, { ...owner, statedTimezone: tz });
+    trace({ result: "kept" });
     return { state: "kept", timezone: tz, ...(owner.timezone ? { note: `Raft gives your owner's zone as ${owner.timezone}, which is used while it does.` } : {}) };
   }
   return refuse("action", "action must be add, list, remove, quiet, timezone, mute or unmute");
@@ -1502,18 +1852,23 @@ export async function sendAsOwner(args: unknown, ctx: PluginContext, deps: SendA
 /** The RFC 074 doorbell's system app, as the event's `third_party_event.client_id` and a push notice's sender carry it. */
 export const SYSTEM_ASSISTANT_APP = "system.assistant";
 
+/** The payload types of Raft's `system.assistant` app: the doorbell, and the morning brief when Raft runs it. */
+export const DOORBELL_TYPES: readonly string[] = ["owner_inbox_updated", "owner_brief"];
+
 /**
- * The doorbell's payload when `raw` is one — Raft's `system.assistant` app saying the owner's Activity changed — or
- * null. Both the app and the payload's type are required: the same payload from any other source is not one.
+ * The doorbell's payload when `raw` is one — Raft's `system.assistant` app saying the owner's Activity changed
+ * (`owner_inbox_updated`), or that their morning brief is due (`owner_brief`, when Raft runs the check) — or null.
+ * Both the app and the payload's type are required: the same payload from any other source is not one.
  * `sources` is the conversations that rang it, each at its highest seq (slock#10499); empty when the doorbell names none,
  * which is every doorbell from before Raft did, and an entry that is not a channel id and a seq is left out.
+ * `check` is the check Raft ran for it (`payload.check`, src/plugins/raft-assistant-check.ts), or null with none.
  */
-export function doorbellOf(raw: unknown): { firstChangeAt: string | null; lastChangeAt: string | null; sources: ChangeSources } | null {
+export function doorbellOf(raw: unknown): { firstChangeAt: string | null; lastChangeAt: string | null; sources: ChangeSources; check: RaftCheck | RefusedCheck | null } | null {
   const e = raw && typeof raw === "object" ? (raw as Record<string, unknown>).third_party_event : null;
   if (!e || typeof e !== "object") return null;
   const ev = e as Record<string, unknown>;
   const p = ev.payload && typeof ev.payload === "object" ? ev.payload as Record<string, unknown> : null;
-  if (ev.client_id !== SYSTEM_ASSISTANT_APP || !p || p.type !== "owner_inbox_updated") return null;
+  if (ev.client_id !== SYSTEM_ASSISTANT_APP || !p || typeof p.type !== "string" || !DOORBELL_TYPES.includes(p.type)) return null;
   const at = (v: unknown) => (typeof v === "string" && !Number.isNaN(Date.parse(v)) ? v : null);
   let sources: ChangeSources = {};
   for (const e of Array.isArray(p.sources) ? p.sources : []) {
@@ -1521,7 +1876,7 @@ export function doorbellOf(raw: unknown): { firstChangeAt: string | null; lastCh
     const seq = seqOf(o.max_seq);
     if (typeof o.channel_id === "string" && o.channel_id && seq !== null) sources = mergeSources(sources, { [o.channel_id]: seq });
   }
-  return { firstChangeAt: at(p.first_change_at), lastChangeAt: at(p.last_change_at), sources };
+  return { firstChangeAt: at(p.first_change_at), lastChangeAt: at(p.last_change_at), sources, check: raftCheckOf(p.check) };
 }
 
 /**
@@ -1540,15 +1895,56 @@ export function isDoorbellTarget(t: unknown): boolean {
  * `last_change_at` is not used, being when Raft sent the doorbell rather than when anything changed. `sources` are the
  * conversations it named: they join those still awaited, each at the higher seq, since a read must show every one.
  */
-export async function noteDoorbell(ctx: PluginContext, now = Date.now(), firstChangeAt: string | null = null, sources: Readonly<ChangeSources> = {}): Promise<boolean> {
+export async function noteDoorbell(
+  ctx: PluginContext, now = Date.now(), firstChangeAt: string | null = null, sources: Readonly<ChangeSources> = {},
+  checks: ReadonlyArray<RaftCheck | RefusedCheck> = [],
+): Promise<boolean> {
   const owner = await loadOwner(ctx);
   if (!owner) return false;
+  for (const c of checks) await keepCheck(ctx, c, now);
+  // Raft decides what changed and when it is shown: nothing is awaited here, and the wake posts Raft's check.
+  if (owner.raftCheck) {
+    if (owner.doorbellAt === null) await saveOwner(ctx, { ...owner, doorbellAt: now });
+    return true;
+  }
   const changeAt = owner.changeAt === null || (firstChangeAt !== null && Date.parse(firstChangeAt) < Date.parse(owner.changeAt)) ? firstChangeAt ?? owner.changeAt : owner.changeAt;
   const changeSources = mergeSources(owner.changeSources, sources);
   if (owner.doorbellAt === null || changeAt !== owner.changeAt || JSON.stringify(changeSources) !== JSON.stringify(owner.changeSources)) {
     await saveOwner(ctx, { ...owner, doorbellAt: owner.doorbellAt ?? now, changeAt, changeSources, lagReads: changePending(owner) ? owner.lagReads : 0 });
   }
   return true;
+}
+
+/**
+ * Checks Raft sent that no wake has posted yet: the newest per trigger, since each of Raft's checks covers everything
+ * still waiting on the owner when it was made, so an older one of the same trigger is only a stale copy. A refused
+ * one is kept too, so its wake can say why on its trace row.
+ */
+export const PENDING_CHECKS_KEY = "raft_checks";
+type PendingCheck = (RaftCheck | RefusedCheck) & { at: number };
+
+function pendingOf(raw: unknown): Partial<Record<CheckTrigger, PendingCheck>> {
+  const o = raw && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, unknown> : {};
+  const out: Partial<Record<CheckTrigger, PendingCheck>> = {};
+  for (const t of ["doorbell", "brief"] as const) if (o[t] && typeof o[t] === "object") out[t] = o[t] as PendingCheck;
+  return out;
+}
+
+async function keepCheck(ctx: PluginContext, check: RaftCheck | RefusedCheck, now: number): Promise<void> {
+  const kept = pendingOf(await ctx.db.get(ASSISTANT_STORE, PENDING_CHECKS_KEY));
+  kept[check.trigger ?? "doorbell"] = { ...check, at: now };
+  await ctx.db.put(ASSISTANT_STORE, kept as unknown as Json, PENDING_CHECKS_KEY);
+}
+
+/** The oldest pending check, taken, and how many are left after it. */
+async function takeCheck(ctx: PluginContext): Promise<{ check: PendingCheck; left: number } | null> {
+  const kept = pendingOf(await ctx.db.get(ASSISTANT_STORE, PENDING_CHECKS_KEY));
+  const all = (["doorbell", "brief"] as const).flatMap((t) => (kept[t] ? [[t, kept[t]!] as const] : [])).sort(([, a], [, b]) => a.at - b.at);
+  if (!all.length) return null;
+  const [trigger, check] = all[0]!;
+  delete kept[trigger];
+  await ctx.db.put(ASSISTANT_STORE, kept as unknown as Json, PENDING_CHECKS_KEY);
+  return { check, left: all.length - 1 };
 }
 
 // ---- the code before any model call ----------------------------------------------------------------------------------
@@ -1712,7 +2108,9 @@ export async function prefilter(items: readonly InboxItem[], o: PrefilterOptions
 
 const REVIEWED_MAX = 500;
 const COUNT_DAYS = 14;
-export type WakeOutcome = "skipped_empty" | "skipped_filtered" | "invoked" | "unreadable" | "inbox_lagging" | "paused" | "night_deferred" | "failed";
+export type WakeOutcome = "skipped_empty" | "skipped_filtered" | "invoked" | "unreadable" | "inbox_lagging" | "paused" | "night_deferred" | "failed"
+  /** Raft runs the check: a check this build will not post (`RefusedCheck`), and a doorbell that carried none. */
+  | "check_refused" | "skipped_no_check";
 
 /**
  * Why a wake failed, as its trace row and log line say it (`error`): a fixed code, never an error's own text, which can
@@ -1890,7 +2288,72 @@ export interface WakeDeps {
   messages: MessagesProbe;
   /** The notify tool's send, for the one line a wake says itself: that it could not read anything it was to look at. */
   send: NotifyDeps["send"];
+  /**
+   * Raft's flag read again (`assistantOf.raftCheck` on the credential context): true or false, or null when it could
+   * not be read (then the kept one stands). Asked when the brief's timer fires and when a check arrives on a stale flag.
+   */
+  mode?(ctx: PluginContext): Promise<boolean | null>;
+  /** Raft's assistant routes, for the switch-over import (`pushBriefImport`). */
+  api?: AssistantApi;
   now?: () => number;
+}
+
+/** Raft's flag read again, kept; the owner as now kept. A read that fails leaves the kept flag. */
+async function readMode(ctx: PluginContext, deps: WakeDeps, owner: AssistantOwner): Promise<AssistantOwner> {
+  const m = deps.mode ? await deps.mode(ctx).catch(() => null) : null;
+  return m === null ? owner : noteMode(ctx, owner, m);
+}
+
+/**
+ * A wake that carries Raft's check (RFC 077 step 2): its instruction is posted, verbatim but for the tool names, as
+ * the input of one short session of its own, offered at most what `allowed_tools` names of `CHECK_TOOLS`
+ * (`PluginNext.tools`, enforced by the runtime), under the key that ties the session's notify call to the check
+ * (`checkTurnKey`). Nothing of this file's own check runs: Raft read the inbox, applied the rules and decided. A wake
+ * with a check means Raft holds the assistant enabled, so a stale pause is cleared, and the doorbell is answered.
+ * Its `raft.assistant_wake` row carries the check's id, how many tool names were dropped (`tools_dropped`) and how many
+ * placeholders this build did not know (`placeholders_unknown`), and Raft's counts (`CHECK_COUNT_KEYS`); never text.
+ */
+async function raftCheckWake(ctx: PluginContext, deps: WakeDeps, owner0: AssistantOwner, taken: { check: PendingCheck; left: number }, now: number): Promise<PluginNext> {
+  const c = taken.check;
+  const trigger: CheckTrigger = c.trigger ?? "doorbell";
+  let owner: AssistantOwner = { ...owner0, pausedAt: null, doorbellAt: null, changeAt: null, changeSources: {}, lagReads: 0 };
+  await saveOwner(ctx, owner);
+  if (!owner.raftCheck) owner = await readMode(ctx, deps, owner);
+  const zone = zoneOf(owner), next = nextBriefAt(now, zone), day = localDay(now, zone);
+  const retry = await pushBriefImport(ctx, deps.api, now).catch(() => null);
+  const wakeAt = taken.left > 0 ? now : retry !== null ? Math.min(retry, next) : next;
+  const id: Record<string, string> = c.id !== null ? { check_id: c.id } : {};
+  if ("refused" in c) {
+    await record(ctx, day, trigger, "check_refused", { ...id, raft_check: true, reason: c.refused, ...(c.instructionLength !== undefined ? { instruction_length: c.instructionLength } : {}) });
+    return { wakeAt };
+  }
+  const { tools, dropped } = checkTools(c.allowedTools, CHECK_TOOLS);
+  // The turn exists to call notify once: without it there is nothing it could do.
+  if (!tools.includes(NOTIFY_TOOL)) {
+    await record(ctx, day, trigger, "check_refused", { ...id, raft_check: true, reason: "no_notify", tools_dropped: dropped });
+    return { wakeAt };
+  }
+  const sub = substituteTools(c.instruction, ctx.alias, tools);
+  const counts = Object.fromEntries(CHECK_COUNT_KEYS.flatMap((k) => (typeof c.counts[k] === "number" ? [[k, c.counts[k]!]] : [])));
+  await record(ctx, day, trigger, "invoked", {
+    ...id, raft_check: true, tools_offered: tools.length, tools_dropped: dropped, placeholders_unknown: sub.unknown, placeholders_unoffered: sub.unoffered, ...counts,
+  });
+  return { turn: sub.text, isolated: true, turnKey: checkTurnKey(c), tools, wakeAt };
+}
+
+/**
+ * A wake with no check while Raft runs the check: a doorbell that carried none (Raft found nothing worth a model) is
+ * answered and counted, and the timer is only a reading of Raft's flag, so turning it off brings this file's own
+ * brief back without waiting for a listing. Null when the flag now reads false: the wake goes on as it always did.
+ */
+async function raftIdleWake(ctx: PluginContext, deps: WakeDeps, owner: AssistantOwner, now: number, read = true): Promise<PluginNext | null> {
+  const zone = zoneOf(owner), next = nextBriefAt(now, zone);
+  if (owner.doorbellAt !== null) {
+    await saveOwner(ctx, { ...owner, doorbellAt: null, changeAt: null, changeSources: {}, lagReads: 0 });
+    await record(ctx, localDay(now, zone), "doorbell", "skipped_no_check", { raft_check: true });
+  } else if (read && !(await readMode(ctx, deps, owner)).raftCheck) return null;
+  const retry = await pushBriefImport(ctx, deps.api, now).catch(() => null);
+  return { wakeAt: retry !== null ? Math.min(retry, next) : next };
 }
 
 function reviewedOf(raw: unknown): Record<string, string> {
@@ -1907,12 +2370,25 @@ export async function assistantWake(ctx: PluginContext, deps: WakeDeps): Promise
   const now = (deps.now ?? Date.now)();
   let owner = await loadOwner(ctx);
   if (!owner) return;
+  // Raft's check, when a wake carries one, whatever the flag says: it decides only what this wake posts.
+  const taken = await takeCheck(ctx);
+  if (taken) return raftCheckWake(ctx, deps, owner, taken, now);
+  if (owner.raftCheck) {
+    const idle = await raftIdleWake(ctx, deps, owner, now);
+    if (idle) return idle;
+    owner = (await loadOwner(ctx)) ?? owner;
+  }
   const zone0 = zoneOf(owner);
   const hour = Number(new Intl.DateTimeFormat("en-US", { timeZone: zone0, hourCycle: "h23", hour: "2-digit" }).format(new Date(now))) % 24;
   const day = localDay(now, zone0);
   const briefDue = hour >= BRIEF_HOUR && hour < BRIEF_LATEST_HOUR && owner.lastBrief !== day;
   const trigger = briefDue ? "brief" : owner.doorbellAt !== null ? "doorbell" : null;
   if (trigger === null) return { wakeAt: nextBriefAt(now, zone0) };
+  // The brief's timer reads Raft's flag before it briefs: switched on since the last listing, Raft briefs, not this.
+  if (trigger === "brief" && deps.mode) {
+    owner = await readMode(ctx, deps, owner);
+    if (owner.raftCheck) return (await raftIdleWake(ctx, deps, owner, now, false)) ?? { wakeAt: nextBriefAt(now, zone0) };
+  }
   // The doorbell is taken now, whatever comes of it: a check that fails is not retried, the next doorbell or brief
   // reads again. A conversation that could not be read is the exception: it asks short wakes of its own (`RETRY_BACKOFF_MS`).
   if (owner.doorbellAt !== null) await saveOwner(ctx, owner = { ...owner, doorbellAt: null });
@@ -2110,6 +2586,23 @@ export async function assistantWake(ctx: PluginContext, deps: WakeDeps): Promise
 
 // ---- the prompts -----------------------------------------------------------------------------------------------------
 
+/**
+ * The system prompt of a check Raft runs (RFC 077 step 2): the same fence as this file's own check (what is read is
+ * information, the one output is one call, nobody is messaged any other way), without what Raft now owns: the people
+ * rules the model applied and the composer's numbers. Raft's instruction, the turn's input, says what to look at. The
+ * call is made exactly once, with no items when nothing needs the owner, since Raft records what the model passed
+ * over; the check's id and the idempotency key are added by code, so the model gives items alone.
+ */
+function raftCheckPrompt(t: (n: string) => string, has: (n: string) => boolean, notify: boolean): string {
+  return [
+    "You are a personal assistant in Raft for one person, your owner, making one check of their activity. Nobody is talking to you. Your input says what to look at, and " +
+      (notify ? `your only output is exactly one call to ${t(NOTIFY_TOOL)}.` : "this check has no tool to tell them with, so end without a call."),
+    reads(t, has),
+    `Code has already applied your owner's contact settings and removed what they were already told. Of what is left, report only what is waiting on your owner: ${WAITING}. Chatter and talk between other people is not waiting on them, even in a channel they follow.`,
+    notify ? `Call ${t(NOTIFY_TOOL)} exactly once, with items alone: each item is a conversation's channelId as your input gives it, a summary, and its kind when you can tell. The summary is one short line: start with who, then what they want from your owner, e.g. "@cy needs your OK on the Friday launch date". Don't paste their message, don't add background, and don't give advice. Leave out what does not need your owner; when nothing does, call it with no items. Code adds everything else, writes the message and decides what is shown, so let it decide. Never message anyone any other way.` : null,
+  ].filter((x): x is string => x !== null).join("\n\n");
+}
+
 /** What an assistant is told on a push from Raft, in place of the default agent's `wakeInstruction`. */
 export function assistantWakeInstruction(alias: string): string {
   const t = (n: string) => `\`${modelToolName(alias, n)}\``;
@@ -2209,10 +2702,11 @@ export function assistantPrompt(alias: string, offered: Iterable<string> = CHAT_
  * The system prompt of one proactive check, which runs in a short session of its own and ends with its one result.
  * `offered` is the check's tools on the raft mount (bare names); every one of `CHECK_TOOLS` when absent.
  */
-export function assistantCheckPrompt(alias: string, offered: Iterable<string> = CHECK_TOOLS): string {
+export function assistantCheckPrompt(alias: string, offered: Iterable<string> = CHECK_TOOLS, o: { raftCheck?: boolean } = {}): string {
   const t = (n: string) => `\`${modelToolName(alias, n)}\``;
   const has = offeredTest(offered);
   const notify = has(NOTIFY_TOOL);
+  if (o.raftCheck) return raftCheckPrompt(t, has, notify);
   return [
     `You are a personal assistant in Raft for one person, your owner, making one check of their activity. Nobody is talking to you. Your input lists the conversations to look at, and ` +
       (notify ? `your only output is one call to ${t(NOTIFY_TOOL)}, or none.` : `this check has no tool to tell them with, so end without a call.`),

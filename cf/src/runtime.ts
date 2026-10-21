@@ -3578,7 +3578,7 @@ export class AgentRuntime {
     // lacks what this build's prompt would otherwise send the model to.
     const onAssistant = assistant ? (offered as MountedTool[]).filter((t) => t.address.startsWith(`${assistant}.`))
       .map((t) => t.address.slice(assistant.length + 1)) : [];
-    const prompt = profile ? profilePrompt(profile) : assistant ? assistantSystemPrompt(personaOf(record), assistant, isIsolatedSession(session) ? "check" : "chat", onAssistant) : systemPrompt({
+    const prompt = profile ? profilePrompt(profile) : assistant ? assistantSystemPrompt(personaOf(record), assistant, isIsolatedSession(session) ? "check" : "chat", onAssistant, isolatedSession(this.#deps.ctx.storage.sql, session)?.turnKey ?? null) : systemPrompt({
       // The agent's own record: a person named and described it at creation,
       // and that is the first thing the prompt says after the core.
       persona: personaOf(record),

@@ -22,6 +22,7 @@
 import { profileSpec, type AgentProfile } from "./agent-profile.ts";
 import { assistantCheckPrompt, assistantPrompt } from "../plugins/raft-assistant.ts";
 import { DEFAULT_ASSISTANT_INSTRUCTIONS } from "../plugins/raft-assistant-instructions.ts";
+import { checkOfTurnKey } from "../plugins/raft-assistant-check.ts";
 
 const CORE = `You are a long-running agent working on the user's behalf.
 
@@ -187,12 +188,13 @@ export function profilePrompt(profile: AgentProfile): string {
  * even the name. What a check does is decided by code and the owner's rules, never by the instructions.
  *
  * `offered` is the session's tools on that mount, bare names: the code part names only those (every one its session
- * kind can have when absent).
+ * kind can have when absent). `turnKey` is a short session's key, which says whether Raft runs that check.
  */
 export function assistantSystemPrompt(
-  persona: PromptParts["persona"], alias: string, session: "chat" | "check" = "chat", offered?: Iterable<string>,
+  persona: PromptParts["persona"], alias: string, session: "chat" | "check" = "chat", offered?: Iterable<string>, turnKey?: string | null,
 ): string {
-  if (session === "check") return assistantCheckPrompt(alias, offered);
+  // A check Raft runs is told by its session's key (src/plugins/raft-assistant-check.ts): its prompt leaves Raft's part to Raft.
+  if (session === "check") return assistantCheckPrompt(alias, offered, { raftCheck: checkOfTurnKey(turnKey) !== null });
   const name = String(persona?.name ?? "").trim();
   const instructions = String(persona?.description ?? "").trim() || DEFAULT_ASSISTANT_INSTRUCTIONS;
   return [name ? `You are ${name}.` : "", instructions, assistantPrompt(alias, offered)].filter(Boolean).join("\n\n");
