@@ -1,6 +1,6 @@
 import { createHmac } from "node:crypto";
 import { createRaft, isInterrupted, RAFT_OPERATIONS } from "@botiverse/raft-sdk";
-import { raftPlugin as raftWithoutStorage, EXCLUDED, EVENTS_LIMIT, GENERATED, handOver, INBOX_STORE, KEY_LIFETIME_MS, PAGE_ROWS, PUSH_KEY, PUSH_STORE, originOf, pagingArg, toolOf, offeredTerms, escapeMarks, unescapeMarks, createRaftPlugin, downloadAttachment, ATTACHMENT_MAX_BYTES, toolsBasisOf, WITHHELD_ARGUMENTS, FEATURES_BASIS, wakeInstruction, renderInboxSummary, INBOX_SUMMARY } from "../src/plugins/raft.ts";
+import { raftPlugin as raftWithoutStorage, EXCLUDED, EVENTS_LIMIT, GENERATED, handOver, INBOX_STORE, KEY_LIFETIME_MS, PAGE_ROWS, PUSH_KEY, PUSH_STORE, originOf, pagingArg, toolOf, offeredTerms, escapeMarks, unescapeMarks, createRaftPlugin, downloadAttachment, ATTACHMENT_MAX_BYTES, toolsBasisOf, WITHHELD_ARGUMENTS, FEATURES_BASIS, wakeInstruction, renderInboxSummary, INBOX_SUMMARY, RAFTBENCH_TOOL, RAFTBENCH_READER_BASIS, isRaftbenchReader } from "../src/plugins/raft.ts";
 import { activityEvents, turnEnds } from "../src/runtime/activity.ts";
 import { readFileSync } from "node:fs";
 import { PARK_BYTES } from "../src/plugins/artifacts.ts";
@@ -152,7 +152,7 @@ const VIEW = "attachments_view";
 /** The upload: hand-written, offered with storage to a credential holding `send` (test/raft-attachments-upload.ts holds it). */
 const UPLOAD = "attachments_upload";
 /** What a mount with no snapshot is offered: every tool of the plugin but the assistant's. */
-const fallbackNames = () => raftPlugin.tools.map((t) => t.name).filter((n) => !ASSISTANT.includes(n));
+const fallbackNames = () => raftPlugin.tools.map((t) => t.name).filter((n) => !ASSISTANT.includes(n) && n !== RAFTBENCH_TOOL);
 const toolNamed = (name: string) => raftPlugin.tools.find((t) => t.name === name);
 const opNamed = (name: string) => RAFT_OPERATIONS.find((op) => op.name === name)!;
 /**
@@ -2106,15 +2106,94 @@ await check("raftbench_findings (SDK 0.26.0) is generated from the manifest: a r
   if (op.toolName !== "raftbench_findings" || op.sideEffect !== "read" || JSON.stringify(op.capability) !== JSON.stringify(["read"])) throw new Error(JSON.stringify(op));
   if (!tool || (tool.parameters as any).properties.limit.maximum !== PAGE_ROWS) throw new Error(JSON.stringify(tool?.parameters));
   const calls = one(json(200, { revision: 3, findings: [], total: 0, nextCursor: null, coverage: { historyFrom: null, scannedThroughAt: null, note: "nothing scanned yet" } }));
-  await raftPlugin.invoke("raftbench_findings", { kind: "repeated_attempt", period: "recent" }, inTurn(ctx()));
+  // Offered, as a RaftBench reader's mount is (its list names the tool).
+  const reader = () => inTurn({ ...ctx(), offered: [RAFTBENCH_TOOL] });
+  await raftPlugin.invoke("raftbench_findings", { kind: "repeated_attempt", period: "recent" }, reader());
   const asked = new URL(calls[0]!.url);
   if (calls.length !== 1 || !asked.pathname.endsWith("/raftbench/findings") || (calls[0]!.init.method ?? "GET") !== "GET" ||
     asked.searchParams.get("limit") !== String(PAGE_ROWS) || asked.searchParams.get("kind") !== "repeated_attempt" || asked.searchParams.get("period") !== "recent") {
     throw new Error(JSON.stringify(calls));
   }
   one(json(403, { error: "raftbench_grant_required" }));
-  const refused = await failure(() => raftPlugin.invoke("raftbench_findings", {}, inTurn(ctx())));
+  const refused = await failure(() => raftPlugin.invoke("raftbench_findings", {}, reader()));
   if (!/403/.test(refused.message)) throw new Error(refused.message);
+});
+
+/** The credential context with the agent's `raftbenchReader` as given (slock #10609), or left out when `undefined`. */
+function readerContext(capabilities: string[], raftbenchReader?: unknown) {
+  return json(200, {
+    agent: { id: "agent-1", name: "raft-bot", displayName: null, description: null, runtime: "external", external: true,
+      ...(raftbenchReader === undefined ? {} : { raftbenchReader }) },
+    server: { id: "server-1", slug: "s", name: "S" }, credential: { capabilities }, prompt: null,
+  });
+}
+
+await check("raftbench_findings is listed only for an agent whose context says raftbenchReader: true; absent, false, \"true\" and 1 list it nowhere", async () => {
+  const base: any = { tenantId: "t", agentId: "a", alias: "raft", plugin: "raft" };
+  const offeredUnder = async (flag: unknown) => {
+    one(readerContext(["read", "send"], flag));
+    const listed = await raftPlugin.snapshotTools!(ctx());
+    return { listed: listed.tools.map((t) => t.name), offered: toolsOf(raftPlugin, { ...base, toolSnapshot: await admitTools(listed, 0) }).map((t) => t.name), skipped: listed.skipped ?? [] };
+  };
+  const on = await offeredUnder(true);
+  must(on.listed.includes(RAFTBENCH_TOOL) && on.offered.includes(RAFTBENCH_TOOL), `true: ${on.offered.join(", ")}`);
+  for (const flag of [undefined, false, "true", 1, null, {}]) {
+    const off = await offeredUnder(flag);
+    must(!off.listed.includes(RAFTBENCH_TOOL) && !off.offered.includes(RAFTBENCH_TOOL), `${JSON.stringify(flag)}: offered ${off.offered.join(", ")}`);
+    // Left out quietly, as an assistant's reads are, and nothing else moved.
+    must(!off.skipped.some((x) => x.name === RAFTBENCH_TOOL), `${JSON.stringify(flag)}: skipped ${JSON.stringify(off.skipped)}`);
+    must(JSON.stringify(off.offered) === JSON.stringify(on.offered.filter((n) => n !== RAFTBENCH_TOOL)), `${JSON.stringify(flag)}: ${off.offered.join(", ")}`);
+  }
+  // Read off the agent, not elsewhere; only literal true counts.
+  must(isRaftbenchReader({ raftbenchReader: true }) && !isRaftbenchReader({ raftbenchReader: "true" }) && !isRaftbenchReader(null), "isRaftbenchReader");
+  // A credential without read is not offered it even as a reader: the capability filter still applies.
+  one(readerContext(["send"], true));
+  must(!(await raftPlugin.snapshotTools!(ctx())).tools.some((t) => t.name === RAFTBENCH_TOOL), "listed without read");
+  // A mount with no snapshot never asked, so it is not offered it (the fallback), though the plugin's catalogue names it.
+  for (const missing of [null, undefined]) {
+    must(!toolsOf(raftPlugin, { ...base, toolSnapshot: missing }).some((t) => t.name === RAFTBENCH_TOOL), `no snapshot (${missing}) offered it`);
+  }
+  must(raftPlugin.tools.some((t) => t.name === RAFTBENCH_TOOL), "the catalogue lost it");
+});
+
+await check("a grant revoked (raftbenchReader true -> absent) drops raftbench_findings at the next listing, a grant added brings it back, and a call while not offered is refused as an unknown tool", async () => {
+  const store = new SqliteStore(":memory:");
+  await store.init();
+  await store.createAgent("tenant", "agent");
+  await store.addMount({ tenantId: "tenant", agentId: "agent", alias: "inbox", plugin: "raft", installationId: "i", connectionId: null,
+    toolVersion: raftPlugin.version, publicConfig: { serverUrl: "https://raft.example" }, secretRef: "secret:raft", policy: null });
+  const gateway = new ToolGateway(store, [raftPlugin], new Set([raftPlugin.id]), { async resolve() { return "sk_agent_test_1234567890"; } });
+  const listOnce = async (flag: unknown) => {
+    one(readerContext(["read"], flag));
+    await store.updateMountToolSnapshot("tenant", "agent", "inbox", await admitTools(await raftPlugin.snapshotTools!(ctx()), 0));
+    const m = (await store.listMounts("tenant", "agent")).find((x: any) => x.alias === "inbox")!;
+    return toolsOf(raftPlugin, m).map((t) => t.name);
+  };
+  must((await listOnce(true)).includes(RAFTBENCH_TOOL), "granted: not offered");
+  must(!(await listOnce(undefined)).includes(RAFTBENCH_TOOL), "revoked: still offered");
+  // Called anyway (a stale list in the model's hands): the gateway refuses it as any unknown tool, and Raft is not asked.
+  let fetched = 0;
+  globalThis.fetch = (async () => { fetched++; return json(200, {}); }) as any;
+  const out: any = await gateway.invoke({ tenantId: "tenant", agentId: "agent", taskId: "task", contextId: "c" } as any, "inbox.raftbench_findings", {});
+  must(out.status === "rejected" && out.error?.code === "unknown_tool" && fetched === 0, `stale call: ${JSON.stringify(out)} fetched ${fetched}`);
+  // The plugin refuses it too, for a context made outside the gateway, before asking Raft.
+  const direct = await failure(() => raftPlugin.invoke(RAFTBENCH_TOOL, {}, inTurn({ ...ctx(), offered: ["messages_read"] })));
+  must(/unknown tool raftbench_findings/.test(direct.message) && fetched === 0, `direct: ${direct.message}`);
+  must((await listOnce(true)).includes(RAFTBENCH_TOOL), "granted again: not offered");
+});
+
+await check("Raft refusing raftbench_findings (403) has the mount listed again at the next turn's start; another failure does not", async () => {
+  // An agent of its own, so no earlier refusal in this file has marked its list already.
+  const own = () => inTurn({ ...ctx(), caller: { tenantId: "tenant", agentId: "agent-403", taskId: "task" }, offered: [RAFTBENCH_TOOL] });
+  const m: any = { tenantId: "tenant", agentId: "agent-403", alias: "raft", plugin: "raft", secretRef: "secret:raft",
+    toolSnapshot: { tools: [{ name: RAFTBENCH_TOOL }], hash: "h", takenAt: Date.now() } };
+  must(raftPlugin.toolsDue!(m, Date.now()) === false, "control: due at once");
+  one(json(500, { error: "down" }));
+  await failure(() => raftPlugin.invoke(RAFTBENCH_TOOL, {}, own()));
+  must(raftPlugin.toolsDue!(m, Date.now()) === false, "a 500 marked the list stale");
+  one(json(403, { error: "raftbench_grant_required" }));
+  await failure(() => raftPlugin.invoke(RAFTBENCH_TOOL, {}, own()));
+  must(raftPlugin.toolsDue!(m, Date.now()) === true, "a 403 left the list as it was");
 });
 
 await check("users_info asks Raft for one capped window of channels in one request, and the page fits under the parking line", async () => {
@@ -2281,9 +2360,12 @@ function context(capabilities: string[]) {
     server: { id: "server-1", slug: "s", name: "S" }, credential: { capabilities }, prompt: null,
   });
 }
-/** What a snapshot lists under `caps`: the generated tools they reach, and attachments_view after them wherever the download is. */
+/**
+ * What a snapshot lists under `caps` for an agent that is not a RaftBench reader (as `context` says): the generated
+ * tools they reach but `raftbench_findings`, and attachments_view after them wherever the download is.
+ */
 const allowedBy = (caps: string[]) => {
-  const generated = GENERATED.filter((op) => op.capability.every((c) => caps.includes(c))).map((op) => op.toolName);
+  const generated = GENERATED.filter((op) => op.capability.every((c) => caps.includes(c))).map((op) => op.toolName).filter((n) => n !== RAFTBENCH_TOOL);
   const withView = generated.includes("attachments_download_url") ? [...generated, VIEW] : generated;
   return caps.includes("send") ? [...withView, UPLOAD] : withView;
 };
@@ -4517,7 +4599,7 @@ await check("the basis covers each tool's name and the capability it needs, in a
   const view = { name: VIEW, capability: opNamed("attachments.downloadUrl").capability };
   const upload = { name: UPLOAD, capability: ["send"] };
   // FEATURES_BASIS stands for what a listing records beside the list (the Server's flags), not a tool.
-  must(toolsBasisOf([{ name: FEATURES_BASIS }, ...OWN.map((name) => ({ name })), ...ASSISTANT.map((name) => ({ name })), ...tools, view, upload]) === raftPlugin.toolsBasis, `control: the plugin's basis is made this way: ${raftPlugin.toolsBasis}`);
+  must(toolsBasisOf([{ name: FEATURES_BASIS }, { name: RAFTBENCH_READER_BASIS }, ...OWN.map((name) => ({ name })), ...ASSISTANT.map((name) => ({ name })), ...tools, view, upload]) === raftPlugin.toolsBasis, `control: the plugin's basis is made this way: ${raftPlugin.toolsBasis}`);
   // Same names and capabilities, other orders (the tools reversed, a capability list reversed): the same basis.
   const reordered = [...tools].reverse().map((t) => ({ ...t, capability: [...t.capability].reverse() }));
   must(toolsBasisOf(reordered) === base, "the order moved the basis");

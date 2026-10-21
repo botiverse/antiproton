@@ -903,6 +903,11 @@ not an owner here, and any other text is, UUID or not.
 fake Raft, and the rendering against a fake wire, which can hand it answers
 the SDK's contract would refuse first.
 
+The generated `raftbench_findings` (SDK 0.26.0) is gated the same way: listed only when the credential context's
+`agent.raftbenchReader` is literally `true` (slock #10609; absent or any other value is not a reader), never offered
+to a mount with no snapshot, refused as an unknown tool where the mount's list lacks it, and a 403 from Raft has the
+mount listed again at the next turn so a revoked grant drops it (`isRaftbenchReader`, `RAFTBENCH_READER_BASIS`).
+
 Such an agent is also proactive (Raft RFC 075 §4.2, `src/plugins/raft-assistant.ts`),
 and code decides before any model is asked. A push notice that names RFC 074's
 doorbell (a `system.assistant` event) is answered `{ deliver: false, wake: true }`

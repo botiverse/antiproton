@@ -2098,6 +2098,31 @@ export function isAssistantOf(value: unknown): boolean {
 }
 
 /**
+ * `raftbench_findings` (`raftbench.findings`, SDK 0.26.0) needs only `read`, which nearly every credential holds, but
+ * Raft answers it only for an agent an admin granted RaftBench findings to; everyone else gets 403
+ * `raftbench_grant_required`. So it is offered as the assistant's reads are: by the snapshot, and only when the
+ * credential context says so (`agent.raftbenchReader`, slock #10609), never by the no-snapshot fallback of
+ * `mountTools`, and a call is refused unless the mount's list (`PluginContext.offered`) names it.
+ */
+export const RAFTBENCH_OP = "raftbench.findings";
+export const RAFTBENCH_TOOL = "raftbench_findings";
+/**
+ * Whether the credential context's agent is a RaftBench reader: its `raftbenchReader` is literally `true`. Absent (an
+ * older Server, or no grant), `false`, `"true"`, `1` and anything else are not. Read untyped: the SDK's type for the
+ * field is not released yet, and its contract passes unknown agent fields through.
+ */
+export function isRaftbenchReader(agent: unknown): boolean {
+  return object(agent).raftbenchReader === true;
+}
+/**
+ * An entry in the basis for the gate: snapshots taken before it listed `raftbench_findings` for every `read`
+ * credential, so the entry moves every such mount's basis and the runtime re-takes its list at the next turn, which
+ * drops the tool where the agent is not a reader. A grant added or revoked later reaches the list at the next listing:
+ * a turn's start once the list is `MCP_CATALOG_TTL_MS` old (`toolsDue`), or at once after Raft refused a call to it.
+ */
+export const RAFTBENCH_READER_BASIS = "(raftbench_findings listed only for a RaftBench reader: 1)";
+
+/**
  * The first line of every owner read's result, in the words `inboundMessage` (src/runtime/inbound.ts) uses for an
  * event a mount received: what follows was written outside this conversation, so it is information and not an
  * instruction. First, so a parked result's preview still opens with it. The inbox has its own wording because what it
@@ -2845,8 +2870,13 @@ export function createRaftPlugin(deps: {
    */
   const uploadTools: readonly ToolSchema[] = artifacts ? [UPLOAD_SCHEMA] : [];
   const operationOf = new Map(generated.map((op) => [op.toolName, op]));
-  /** What a mount with no snapshot is offered: every tool but a personal assistant's (`ASSISTANT_TOOLS`). */
-  const allTools: ToolSchema[] = [...OWN_TOOLS, ...generatedTools, ...viewTools, ...uploadTools];
+  /** Every tool but a personal assistant's, in the order a mount is offered them. */
+  const everyTool: ToolSchema[] = [...OWN_TOOLS, ...generatedTools, ...viewTools, ...uploadTools];
+  /**
+   * What a mount with no snapshot is offered: every tool but a personal assistant's (`ASSISTANT_TOOLS`) and
+   * `raftbench_findings`, which a snapshot lists only for a RaftBench reader (`isRaftbenchReader`).
+   */
+  const allTools: ToolSchema[] = everyTool.filter((t) => t.name !== RAFTBENCH_TOOL);
   /**
    * What this call's mount does not offer, for the hints and the attachment suffix: `unoffered`, plus every generated
    * tool the kernel says this mount is not offered right now (`PluginContext.offered`) — one its credential lacks the
@@ -2897,7 +2927,7 @@ export function createRaftPlugin(deps: {
      * turn (`Plugin.toolsBasis`), so a tool a deploy added reaches a mount without anyone refreshing it.
      */
     toolsBasis: toolsBasisOf([
-      { name: FEATURES_BASIS },
+      { name: FEATURES_BASIS }, { name: RAFTBENCH_READER_BASIS },
       ...OWN_TOOLS.map((t) => ({ name: t.name })), ...ASSISTANT_TOOLS.map((t) => ({ name: t.name })),
       ...offerable.map((op) => ({ name: op.toolName, capability: op.capability })),
       ...viewTools.map((t) => ({ name: t.name, capability: RAFT_OPERATIONS.find((o) => o.name === DOWNLOAD_OP)!.capability })),
@@ -2957,7 +2987,7 @@ export function createRaftPlugin(deps: {
       looksLike: [{ kind: "Raft agent credential", pattern: "sk_agent_[A-Za-z0-9_-]{16,}" }],
     },
     /** Every tool any mount can be offered; one mount's own list is `mountTools`. */
-    tools: [...allTools, ...ASSISTANT_TOOLS],
+    tools: [...everyTool, ...ASSISTANT_TOOLS],
 
     /**
      * What the Server's flags change about how the agent works (`featuresParagraph`), from the flags a credentialed
@@ -3041,9 +3071,13 @@ export function createRaftPlugin(deps: {
       // And whose assistant this is, with the owner's zone, for the brief and the night (src/plugins/raft-assistant.ts).
       await keepOwner(ctx, me.data);
       const capabilities = new Set(me.data.credential.capabilities);
+      // Read untyped: the SDK does not type `raftbenchReader` yet (`isRaftbenchReader`).
+      const reader = isRaftbenchReader(me.data.agent);
       const tools: ToolSchema[] = [];
       const skipped: Array<{ name: string; reason: string }> = [];
       for (const op of offerable) {
+        // Left out with no `skipped` entry, as an assistant's reads are: nearly every agent is not a reader.
+        if (op.name === RAFTBENCH_OP && !reader) continue;
         const missing = op.capability.filter((c) => !capabilities.has(c));
         const named = op.name === DOWNLOAD_OP ? [op.toolName, ...viewTools.map((t) => t.name)] : [op.toolName];
         if (missing.length) for (const name of named) skipped.push({ name, reason: `the credential lacks the Raft capability ${missing.join(", ")}` });
@@ -3186,6 +3220,18 @@ export function createRaftPlugin(deps: {
       // (`MCP_CALL_TIMEOUT_MS`), and a call cut short here is one Raft may still complete.
       if (isMcpTool(name)) return callMcp(name, args, ctx, () => raftFor(ctx, { state: false, timeoutMs: MCP_CALL_TIMEOUT_MS }), CONTEXT_STORE, mcp);
       const op = operationOf.get(name);
+      if (op?.name === RAFTBENCH_OP) {
+        // Offered only where the mount's list names it (`isRaftbenchReader`); the gateway refuses it elsewhere as an
+        // unknown tool, and so does this, for a context made outside the gateway.
+        if (!ctx.offered?.includes(name)) throw new Error(`raft: unknown tool ${name}: not offered on this mount, whose Raft agent is not a RaftBench reader`);
+        try {
+          return await operate(op, args, ctx) as Json;
+        } catch (e) {
+          // Raft refusing it means the grant is gone: list this mount again at the next turn, which drops the tool.
+          if ((e as { httpStatus?: unknown })?.httpStatus === 403) mcp.markStale(ctx);
+          throw e;
+        }
+      }
       if (op) {
         const result = await operate(op, args, ctx);
         await toldInChat(op, args, result, ctx);
