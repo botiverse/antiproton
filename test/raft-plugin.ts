@@ -199,7 +199,7 @@ await check("declares the inbox pull as a model-only write that repeats safely, 
  * `EXCLUDED`, so without this list an operation a new SDK adds would become a tool with nobody deciding it.
  */
 const EXPECTED_GENERATED = [
-  "identity.whoami", "inbox.list", "messages.read", "messages.send", "messages.reply", "messages.search", "messages.resolve",
+  "raftbench.findings", "identity.whoami", "inbox.list", "messages.read", "messages.send", "messages.reply", "messages.search", "messages.resolve",
   "messages.react", "messages.unreact", "attachments.downloadUrl", "attachments.comments", "mentions.pending", "mentions.notify", "mentions.add", "mentions.delivery",
   "actions.prepare",
   "manual.get", "manual.search", "tasks.claim", "tasks.list", "tasks.create", "tasks.unclaim", "tasks.assign", "tasks.unassign",
@@ -1979,7 +1979,7 @@ await check("messages_search offers cursor, and the cursor the SDK's text hands 
 /** The operations whose result the manifest says may be large and that page by `limit`: the ones capped here. */
 // users.info's limit is how many visible channels it inspects for memberships: capped, it bounds the result (and,
 // since 0.12.0 asks Raft for one window in one request, how many rosters Raft reads for one call).
-const CAPPED = ["inbox.list", "messages.read", "messages.search", "attachments.comments", "mentions.pending", "server.info", "users.info"];
+const CAPPED = ["raftbench.findings", "inbox.list", "messages.read", "messages.search", "attachments.comments", "mentions.pending", "server.info", "users.info"];
 
 await check("a paged result stays under the parking line: limit is capped and defaulted on every operation that pages by it", async () => {
   if (PAGE_ROWS < 1 || PAGE_ROWS * 400 > PARK_BYTES) throw new Error(`PAGE_ROWS=${PAGE_ROWS} against PARK_BYTES=${PARK_BYTES}`);
@@ -2098,6 +2098,23 @@ await check("messages_read lists a history page whose messages carry no channel_
     "[target=#onboarding-eval msg=a1b2c3d4 time=2026-10-08 09:00:00Z type=human] @tygg: first",
     "[target=#onboarding-eval msg=b2c3d4e5 time=2026-10-08 09:01:00Z type=human] @qizhi: second",
   ].join("\n"), `page: ${JSON.stringify(page)}`);
+});
+
+await check("raftbench_findings (SDK 0.26.0) is generated from the manifest: a read, one capped GET /raftbench/findings with the model's filters, and Raft's refusal (admin grant, channel access) shown as Raft's", async () => {
+  const op = opNamed("raftbench.findings");
+  const tool = toolNamed("raftbench_findings")!;
+  if (op.toolName !== "raftbench_findings" || op.sideEffect !== "read" || JSON.stringify(op.capability) !== JSON.stringify(["read"])) throw new Error(JSON.stringify(op));
+  if (!tool || (tool.parameters as any).properties.limit.maximum !== PAGE_ROWS) throw new Error(JSON.stringify(tool?.parameters));
+  const calls = one(json(200, { revision: 3, findings: [], total: 0, nextCursor: null, coverage: { historyFrom: null, scannedThroughAt: null, note: "nothing scanned yet" } }));
+  await raftPlugin.invoke("raftbench_findings", { kind: "repeated_attempt", period: "recent" }, inTurn(ctx()));
+  const asked = new URL(calls[0]!.url);
+  if (calls.length !== 1 || !asked.pathname.endsWith("/raftbench/findings") || (calls[0]!.init.method ?? "GET") !== "GET" ||
+    asked.searchParams.get("limit") !== String(PAGE_ROWS) || asked.searchParams.get("kind") !== "repeated_attempt" || asked.searchParams.get("period") !== "recent") {
+    throw new Error(JSON.stringify(calls));
+  }
+  one(json(403, { error: "raftbench_grant_required" }));
+  const refused = await failure(() => raftPlugin.invoke("raftbench_findings", {}, inTurn(ctx())));
+  if (!/403/.test(refused.message)) throw new Error(refused.message);
 });
 
 await check("users_info asks Raft for one capped window of channels in one request, and the page fits under the parking line", async () => {
