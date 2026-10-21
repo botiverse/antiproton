@@ -209,6 +209,13 @@ await check("mountTools: a mount with no snapshot is not offered them; a snapsho
   // Each tool is this build's: read-only, model-only.
   const tool = toolsOf(plugin, { ...base, toolSnapshot: assistantSnap }).find((t) => t.name === MESSAGES);
   must(tool?.sideEffects === "read" && tool.modelOnly === true, `declaration: ${JSON.stringify(tool)}`);
+  // send-as-owner writes as the owner, and modelOnly is what keeps that write from being held for approval: the
+  // gateway refuses to hold a modelOnly call (not_from_a_program), and an approval replayed without the model reading
+  // its result is refused too (applyApproval's backstop). Without the flag a held send-as-owner would be approved by
+  // a person and sent as the owner with nobody reading what came back, and nothing else in the suite would notice.
+  // Found by Ward's access review of 66c8614.
+  const send = toolsOf(plugin, { ...base, toolSnapshot: assistantSnap }).find((t) => t.name === "assistant_send_as_owner");
+  must(send?.sideEffects === "write" && send.modelOnly === true, `send-as-owner declaration: ${JSON.stringify(send)}`);
 });
 
 await check("a call on a mount that does not offer the tool is refused without reaching the wire", async () => {
