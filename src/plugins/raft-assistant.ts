@@ -37,7 +37,8 @@
  * instructions (or `DEFAULT_ASSISTANT_INSTRUCTIONS`, src/plugins/raft-assistant-instructions.ts), then `assistantPrompt`,
  * the code part, which wins where they conflict; in a check, `assistantCheckPrompt` alone. It is told it is one by the
  * mount's snapshot listing the owner reads, which Raft's context decides. A chat turn that ends with its answer only in
- * its closing text, having sent nothing to the owner's DM, has that text sent there by code (`replyFallback`).
+ * its closing text, having sent nothing to the owner's DM, has that text sent there by code (`replyFallback`); one that
+ * failed before answering has a fixed line sent there instead (`FAILED_TURN_LINE`).
  *
  * Compiled by both typecheck programs.
  */
@@ -958,6 +959,31 @@ function answered(kept: AssistantReply, dm: string): boolean {
   return kept.sent || kept.asOwner || (owner !== null && kept.dms.some((d) => sameDm(d, owner)));
 }
 
+/**
+ * The notices from Raft that woke the owner's chat (`noteChatNotice`, one row): `last` is the latest one's id, and
+ * `failedTold` the notice a failed turn's line (`FAILED_TURN_LINE`) was last sent for. A turn's end does not say which
+ * message started it, and one owner message can end in more than one failed run: the overflow backstop
+ * (cf/src/runtime.ts `#overflowBackstop`) starts a new run, with a new turn id, for the input of one that failed. So the
+ * line is sent once per notice: never again until a new one arrives. Before any notice (`last` null) only the turn's
+ * own once applies.
+ */
+export const CHAT_NOTICE_KEY = "chat_notice";
+interface ChatNotice { last: string | null; failedTold: string | null }
+
+function chatNoticeOf(v: unknown): ChatNotice {
+  const o = v && typeof v === "object" && !Array.isArray(v) ? v as Record<string, unknown> : {};
+  return { last: typeof o.last === "string" ? o.last : null, failedTold: typeof o.failedTold === "string" ? o.failedTold : null };
+}
+
+/** A notice from Raft delivered to the owner's chat (src/plugins/raft.ts `receiveNotice`): its id is kept as `last`. */
+export async function noteChatNotice(ctx: PluginContext, noticeId: string): Promise<void> {
+  const kept = chatNoticeOf(await ctx.db.get(ASSISTANT_STORE, CHAT_NOTICE_KEY));
+  if (kept.last !== noticeId) await ctx.db.put(ASSISTANT_STORE, { ...kept, last: noticeId } as unknown as Json, CHAT_NOTICE_KEY);
+}
+
+/** What the owner is told when their chat's turn failed before answering them: the code's words, never the model's. */
+export const FAILED_TURN_LINE = "Something went wrong on my side and I couldn't finish that. Ask me again in a bit.";
+
 /** The turns the assistant's own code asks for, each in a short session: never the owner's chat. */
 const OWN_TURN_KEYS: ReadonlySet<string> = new Set(["assistant.check", "assistant.brief"]);
 
@@ -968,11 +994,13 @@ const OWN_TURN_KEYS: ReadonlySet<string> = new Set(["assistant.check", "assistan
  * to the owner's DM (as that DM is known at the turn's end, `answered`), and posted nothing as the owner (Raft's receipt
  * answers that turn), its closing text is sent there, through the same send the model's would take (`send`, the
  * notify tool's: `messages.send` attesting what the chat has seen), so a DM with messages the chat has not read holds
- * it as it holds the model's, and nothing is sent. Nothing either for a turn with no text (or only whitespace), one
- * that failed or was cancelled, or a turn the assistant's code asked for. The idempotency key is the turn's, so a
- * second telling of the same end that gets this far is the same send. One `raft.assistant_chat_told` row per send
- * tried, status `reply_fallback`: `reply_fallback` 1 when it was sent, else 0, and `result` (`sent`, `held`, `failed`
- * with the error's `code`), never the text.
+ * it as it holds the model's, and nothing is sent. Nothing either for a completed turn with no text (or only
+ * whitespace), one that was cancelled (stopped on purpose), or a turn the assistant's code asked for. A chat turn that
+ * failed and answered no one gets `FAILED_TURN_LINE` instead, under the same rules: a fixed line, never the model's
+ * partial text, and once per notice that woke the chat (`CHAT_NOTICE_KEY`). The idempotency key is the turn's, so a second telling of the same end that gets this far is the same
+ * send. One `raft.assistant_chat_told` row per send tried, status `reply_fallback`: `reply_fallback` 1 when it was
+ * sent, else 0, `result` (`sent`, `held`, `failed` with the error's `code`) and, for a failed turn, `failed_turn` 1;
+ * never the text.
  */
 export async function replyFallback(
   ctx: PluginContext, end: Pick<TurnEnd, "turnId" | "turnKey" | "finalText" | "outcome">,
@@ -986,8 +1014,14 @@ export async function replyFallback(
   const kept = replyOf(await ctx.db.get(ASSISTANT_STORE, REPLY_KEY));
   if (kept.handled === end.turnId) return "skipped";
   const done = () => ctx.db.put(ASSISTANT_STORE, { sent: false, handled: end.turnId, dms: [], asOwner: false } as unknown as Json, REPLY_KEY);
-  const text = end.finalText ?? "";
-  if (answered(kept, dm) || end.outcome !== "completed" || !text.trim() || (end.turnKey !== null && OWN_TURN_KEYS.has(end.turnKey))) {
+  const failedTurn = end.outcome === "failed";
+  const text = failedTurn ? FAILED_TURN_LINE : end.outcome === "completed" ? end.finalText ?? "" : "";
+  if (answered(kept, dm) || !text.trim() || (end.turnKey !== null && OWN_TURN_KEYS.has(end.turnKey))) {
+    await done();
+    return "skipped";
+  }
+  const notice = failedTurn ? chatNoticeOf(await ctx.db.get(ASSISTANT_STORE, CHAT_NOTICE_KEY)) : null;
+  if (notice?.last != null && notice.failedTold === notice.last) {
     await done();
     return "skipped";
   }
@@ -1000,9 +1034,10 @@ export async function replyFallback(
     const c = (e as { code?: unknown })?.code;
     code = typeof c === "string" ? c.slice(0, 64) : undefined;
   }
-  const attrs = { reply_fallback: result === "sent" ? 1 : 0, result, ...(code ? { code } : {}) };
+  const attrs = { reply_fallback: result === "sent" ? 1 : 0, result, ...(code ? { code } : {}), ...(failedTurn ? { failed_turn: 1 } : {}) };
   ctx.trace?.({ kind: "raft.assistant_chat_told", status: "reply_fallback", verdict: result === "sent" ? "ok" : result === "held" ? "blocked" : "failed", attrs });
   logEvent("raft.assistant_reply_fallback", { tenantId: ctx.caller.tenantId, agentId: ctx.caller.agentId, mount: ctx.alias, ...attrs });
+  if (notice?.last != null && result === "sent") await ctx.db.put(ASSISTANT_STORE, { ...notice, failedTold: notice.last } as unknown as Json, CHAT_NOTICE_KEY);
   await done();
   return result;
 }

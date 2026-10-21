@@ -110,7 +110,8 @@ export type TraceKind = (typeof TRACE_KINDS)[number];
  * (src/plugins/raft-assistant-rules.ts `rulesAttrs`). `raft.assistant_chat_told` counts the references an assistant's
  * chat reply to its owner recorded as told (`noteToldInChat`), never which; with status `reply_fallback`, it is a chat turn's
  * closing text sent to the owner's DM because the turn sent nothing there (`replyFallback`): `reply_fallback` 1 when sent,
- * else 0, `result` (`sent`, `held`, `failed`) and a failure's `code`, never the text. `raft.assistant_send_as_owner` is one call of the
+ * else 0, `result` (`sent`, `held`, `failed`) and a failure's `code`, and `failed_turn` 1 when the turn itself failed
+ * and what was sent is the code's fixed line, never the text. `raft.assistant_send_as_owner` is one call of the
  * assistant's send-as-owner tool: its `result` (`sent`, `uncertain`, `failed`, `refused:<code>`), the target's form
  * (`target_kind`), `in_thread`, the message's length (`chars`) and Raft's HTTP `status`, never the message, a name or an
  * id (src/plugins/raft-assistant.ts `sendAsOwner`). `raft.turn_ended` is

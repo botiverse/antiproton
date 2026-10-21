@@ -15,7 +15,7 @@ import { PUSH_KEY, PUSH_STORE, raftPlugin, wakeInstruction } from "../src/plugin
 import { activityEvents, turnEnds } from "../src/runtime/activity.ts";
 import {
   ASSISTANT_STORE, CHAT_TOOLS, CHECK_KEY, CHECK_TOOLS, SEND_AS_OWNER_TOOL, SEND_LIMITED_HOLD_MS, COUNTS_KEY, DEFERRED_KEY, DM_ITEMS_MAX, INBOX_LAG_RETRY_MS, OWNER_KEY, REMINDED_STORE, RETRY_BACKOFF_MS, REVIEWED_KEY, SUMMARY_MAX, UNREADABLE_KEY,
-  assistantCheckPrompt, assistantPrecedence, assistantMountOf, assistantPrompt, assistantWake, assistantWakeInstruction, compose, confirmRef, isQuietHours, itemOf, localDay, nextBriefAt, noteDoorbell, zoneOf,
+  assistantCheckPrompt, assistantPrecedence, assistantMountOf, assistantPrompt, assistantWake, assistantWakeInstruction, compose, confirmRef, FAILED_TURN_LINE, isQuietHours, itemOf, localDay, nextBriefAt, noteDoorbell, zoneOf,
 } from "../src/plugins/raft-assistant.ts";
 import { confirmLine, matches, ruleLine, rulesOf, winningRule, type ContactRule } from "../src/plugins/raft-assistant-rules.ts";
 import { setLogSink } from "../src/core/log.ts";
@@ -2230,9 +2230,9 @@ await check("reply fallback: none when the turn already sent to the owner's DM (
   must(a.r.sends.length === 7 && a.r.sends[6].content === TEXT, `a held send answered the owner: ${show(a.r.sends)}`);
 });
 
-await check("reply fallback: none for an empty or whitespace closing text, a failed or cancelled turn, or a non-assistant", async () => {
+await check("reply fallback: none for an empty or whitespace closing text, a cancelled turn, or a non-assistant", async () => {
   const a = await assistant(raft({ dm: "dm:@ada" }));
-  for (const [id, o] of [["e1", { finalText: null }], ["e2", { finalText: "  \n\t " }], ["e3", { outcome: "failed", error: "x" }], ["e4", { outcome: "cancelled" }]] as const) {
+  for (const [id, o] of [["e1", { finalText: null }], ["e2", { finalText: "  \n\t " }], ["e4", { outcome: "cancelled" }], ["e6", { outcome: "cancelled", finalText: null }]] as const) {
     await afterTurn(a.ctx, ended(id, o));
   }
   must(a.r.sends.length === 0 && fallbackRows(a).length === 0, `sent: ${show(a.r.sends)}`);
@@ -2249,6 +2249,92 @@ await check("reply fallback: none for an empty or whitespace closing text, a fai
   c.ctx.offered = ALL_TOOLS.filter((n) => n !== "assistant_preferences");
   await afterTurn(c.ctx, ended("n2"));
   must(c.r.sends.length === 0, `not offered the chat's tools: ${show(c.r.sends)}`);
+});
+
+await check("reply fallback: a failed chat turn that answered no one gets the fixed line, never its partial text, once, counted failed_turn", async () => {
+  const a = await assistant(raft({ dm: "dm:@ada" }));
+  const lines: unknown[] = [];
+  setLogSink((l) => lines.push(l));
+  try { await afterTurn(a.ctx, ended("x1", { outcome: "failed", error: "model-error-PRIVATE" })); } finally { setLogSink(null); }
+  must(a.r.sends.length === 1 && a.r.sends[0].target === "dm:@ada" && a.r.sends[0].content === FAILED_TURN_LINE, `sends: ${show(a.r.sends)}`);
+  must(FAILED_TURN_LINE === "Something went wrong on my side and I couldn't finish that. Ask me again in a bit.", FAILED_TURN_LINE);
+  must(/^assistant-reply-[0-9a-f]{32}$/.test(a.r.sends[0].idempotencyKey ?? a.r.sends[0].idempotency_key ?? ""), `key: ${show(a.r.sends[0])}`);
+  const rows = fallbackRows(a);
+  must(rows.length === 1 && rows[0]!.attrs.failed_turn === 1 && rows[0]!.attrs.reply_fallback === 1 && rows[0]!.attrs.result === "sent" && rows[0]!.verdict === "ok", show(rows));
+  must(!/PRIVATE/.test(show(a.traced)) && !/PRIVATE/.test(show(lines)), `the text or error reached the trace or the log: ${show(a.traced)} ${show(lines)}`);
+  // Told again: nothing more.
+  await afterTurn(a.ctx, ended("x1", { outcome: "failed", error: "model-error-PRIVATE" }));
+  must(a.r.sends.length === 1 && fallbackRows(a).length === 1, `told twice: ${show(a.r.sends)}`);
+  // A failed turn with no text at all is told too; a completed turn's row carries no failed_turn.
+  await afterTurn(a.ctx, ended("x2", { outcome: "failed", finalText: null }));
+  must(a.r.sends.length === 2 && a.r.sends[1].content === FAILED_TURN_LINE, `no text: ${show(a.r.sends)}`);
+  await afterTurn(a.ctx, ended("x3"));
+  must(a.r.sends.length === 3 && a.r.sends[2].content === TEXT && fallbackRows(a)[2]!.attrs.failed_turn === undefined, show(fallbackRows(a)));
+});
+
+await check("reply fallback: a failed chat turn that already answered the owner (their DM, or as them) gets nothing; a cancelled one never does", async () => {
+  const a = await assistant(raft({ dm: "dm:@ada" }));
+  await raftPlugin.invoke("messages_send", { target: "dm:@ada", content: "Friday works." }, a.ctx);
+  await afterTurn(a.ctx, ended("y1", { outcome: "failed", error: "x" }));
+  must(a.r.sends.length === 1 && fallbackRows(a).length === 0, `answered, then failed: ${show(a.r.sends)}`);
+  await afterTurn(a.ctx, ended("y3", { outcome: "cancelled" }));
+  must(a.r.sends.length === 1 && fallbackRows(a).length === 0, `cancelled: ${show(a.r.sends)}`);
+  // Control: the next failed turn, answering no one, is told.
+  await afterTurn(a.ctx, ended("y4", { outcome: "failed", error: "x" }));
+  must(a.r.sends.length === 2 && a.r.sends[1].content === FAILED_TURN_LINE, `control: ${show(a.r.sends)}`);
+  // A send as the owner that was posted, or may have landed, answered the turn too.
+  for (const answer of [{ status: 200, code: null }, "drop"] as const) {
+    const b = await assistant(raft({ dm: "dm:@ada~human" }));
+    b.r.asOwnerAnswer = answer as never;
+    await asOwner(b, { target: conv(1).channelId, content: "Friday works for me." });
+    must(b.r.asOwner.length === 1, `control: one post: ${show(b.r.asOwner)}`);
+    await afterTurn(b.ctx, ended("y2", { outcome: "failed", error: "x" }));
+    must(b.r.sends.length === 0 && fallbackRows(b).length === 0, `${show(answer)}: sent as the owner, then failed: ${show(b.r.sends)}`);
+    await afterTurn(b.ctx, ended("y5", { outcome: "failed", error: "x" }));
+    must(b.r.sends.length === 1 && b.r.sends[0].content === FAILED_TURN_LINE, `${show(answer)}, the next turn: ${show(b.r.sends)}`);
+  }
+});
+
+await check("reply fallback: one owner message whose turn fails twice (a new run, a new turn id) gets one failed-turn line; a new message may get another", async () => {
+  const secret = "push-secret-0123456789";
+  const ownerWrites = async (ctx: unknown, noticeId: string) => {
+    const payload = { schema: "raft-agent-inbox-notice.v1", noticeId, recipientAgentId: "agent-1", text: "Inbox update: 1 event",
+      targets: [{ target: "dm:@ada", channelType: "dm", pendingCount: 1, latestSenderName: "ada", latestSenderType: "human", flags: [] }] };
+    const body = new TextEncoder().encode(JSON.stringify(payload));
+    const headers = { "x-raft-signature-256": `sha256=${createHmac("sha256", secret).update(body).digest("hex")}`, "x-raft-delivery-id": noticeId };
+    const out = await raftPlugin.receive!({ headers, body, hookId: "hk_0123456789abcdef" } as never, secret, ctx as never) as any;
+    must(out.deliver === true, `control: the owner's message wakes the chat: ${show(out)}`);
+  };
+  const a = await assistant(raft({ dm: "dm:@ada" }));
+  await ownerWrites(a.ctx, "ntc_aaaaaaaaaaaaaaaa");
+  await afterTurn(a.ctx, ended("r1", { outcome: "failed", error: "x" }));
+  await afterTurn(a.ctx, ended("r2", { outcome: "failed", error: "x" }));
+  must(a.r.sends.length === 1 && a.r.sends[0].content === FAILED_TURN_LINE && fallbackRows(a).length === 1, `one message, two failed turns: ${show(a.r.sends)}`);
+  // A completed turn for the same message still answers with its closing text.
+  await afterTurn(a.ctx, ended("r3"));
+  must(a.r.sends.length === 2 && a.r.sends[1].content === TEXT, `a completed turn after: ${show(a.r.sends)}`);
+  // The same notice told again (Raft redelivers): still the same message.
+  await ownerWrites(a.ctx, "ntc_aaaaaaaaaaaaaaaa");
+  await afterTurn(a.ctx, ended("r4", { outcome: "failed", error: "x" }));
+  must(a.r.sends.length === 2, `a redelivered notice is not a new message: ${show(a.r.sends)}`);
+  // A new message: its failed turn is told.
+  await ownerWrites(a.ctx, "ntc_bbbbbbbbbbbbbbbb");
+  await afterTurn(a.ctx, ended("r5", { outcome: "failed", error: "x" }));
+  must(a.r.sends.length === 3 && a.r.sends[2].content === FAILED_TURN_LINE, `a new message: ${show(a.r.sends)}`);
+  // A line that was held (the DM has unread messages) was not told: the next failed turn for that message may try again.
+  await ownerWrites(a.ctx, "ntc_cccccccccccccccc");
+  a.r.send = "held";
+  await afterTurn(a.ctx, ended("r6", { outcome: "failed", error: "x" }));
+  a.r.send = "sent";
+  await afterTurn(a.ctx, ended("r7", { outcome: "failed", error: "x" }));
+  must(a.r.sends.length === 5 && a.r.sends[4].content === FAILED_TURN_LINE && fallbackRows(a).at(-1)!.attrs.result === "sent", `after a held line: ${show(a.r.sends)}`);
+});
+
+await check("reply fallback: a check's or the brief's failed turn sends nothing", async () => {
+  const a = await assistant(raft({ dm: "dm:@ada" }));
+  await afterTurn(a.ctx, ended("z1", { turnKey: "assistant.check", outcome: "failed", error: "x" }));
+  await afterTurn(a.ctx, ended("z2", { turnKey: "assistant.brief", outcome: "failed", error: "x" }));
+  must(a.r.sends.length === 0 && fallbackRows(a).length === 0, `sent: ${show(a.r.sends)}`);
 });
 
 await check("reply fallback: never for a check or the brief: their turn keys send nothing, and a short session's send does not answer the chat", async () => {
