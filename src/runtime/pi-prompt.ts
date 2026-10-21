@@ -178,7 +178,7 @@ export function profilePrompt(profile: AgentProfile): string {
  * paragraphs, which describe tools an assistant is not offered.
  *
  * Its chat with its owner: the name line, then Raft's instructions (the persona's description, verbatim; Raft owns how
- * the assistant talks and when by default it contacts its owner, and sends that as `instructions` on POST and PATCH),
+ * the assistant talks, with no concrete contact default in it, and sends that as `instructions` on POST and PATCH),
  * or `DEFAULT_ASSISTANT_INSTRUCTIONS` when Raft sent none, then the code part (`assistantPrompt`), which opens by
  * saying it wins over anything above it that conflicts. Stable parts first and nothing generated, so the whole prompt
  * is one cacheable prefix.

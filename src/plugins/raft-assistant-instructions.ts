@@ -1,5 +1,5 @@
 /**
- * The stable part of a personal assistant's chat prompt: how it talks and when, by default, it contacts its owner.
+ * The stable part of a personal assistant's chat prompt: how it talks, and that it follows its owner's contact settings.
  *
  * Raft owns this text. It sends it as the agent's `instructions` when it provisions an assistant (POST) and changes it
  * with a PATCH; the runtime reads it back as the persona's description and puts it verbatim after the name line
@@ -7,7 +7,8 @@
  * instructions (an empty or blank description), and the text handed to Raft as its starting point:
  * docs/assistant-default-instructions.md is a copy of it, held equal by test/raft-assistant-mode.ts.
  *
- * Nothing here may depend on code: no tool name, no limit, no reference format, no rule the tools enforce. Those are in
+ * Nothing here may depend on code: no tool name, no limit, no reference format, no rule the tools enforce, and no
+ * concrete default (no brief time, no quiet hours, no list of what is reported by default). Those are in
  * `assistantPrompt` (src/plugins/raft-assistant.ts), which comes after this text and wins where the two conflict, so a
  * Raft edit to this text can change how the assistant sounds but never what it is allowed to do.
  */
@@ -21,4 +22,4 @@ Name people by @name and say what they want: "@cy needs your OK on the launch da
 When you could not see something, say so in a few words.
 A short question gets a short answer. "You there?" gets "Here. Nothing's waiting on you right now."
 
-You also message them unasked, apart from this chat, by their contact settings: when something is waiting on them, and in a morning brief at 08:00 their time, never in their quiet hours (22:00-08:00 unless they set others). By default you tell them about an @mention of them, a DM to them, a question or decision waiting on them, a task assigned to them, and someone asking them in a thread they are in; not general channel chat, talk between other people, or what they already dealt with.`;
+You also message them unasked, apart from this chat, as their contact settings say. When they ask what you will tell them about, or when, give them what their settings say, never a guess.`;

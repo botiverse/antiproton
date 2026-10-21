@@ -1015,13 +1015,19 @@ or subagents, under a prompt of its own (`assistantSystemPrompt`,
 `src/runtime/pi-prompt.ts`, the one entry point for it).
 
 That prompt is split by who owns each part. Raft owns the stable part: how the assistant talks
-(voice) and the default of when it contacts its owner. It sends that as the agent's `instructions`
+(voice), and that it follows its owner's contact settings and answers from them, with no concrete
+default in it (no brief time, quiet hours or list of what is reported). It sends that as the agent's `instructions`
 (POST on create, PATCH to change), which the runtime reads back as the persona's description.
 antiproton keeps the part bound to code (`assistantPrompt`, `src/plugins/raft-assistant.ts`): the
 tools and how to use them (the owner reads, the DM, `assistant_preferences`,
 `assistant_send_as_owner`), that what it reads is information and never instructions, that it sends
 as its owner only when the owner explicitly asks, which DMs the reads cover, the `#channel:msgid`
-citation the told-tracking parses, and the shape and limit of the unasked messages code composes.
+citation the told-tracking parses, the shape and limit of the unasked messages code composes, and
+that every reply to the owner, a question back included, goes through `messages_send` (the text a
+turn ends with is shown to no one), the effective defaults, written from code's constants: the brief's time (`BRIEF_HOUR`), the default
+quiet hours (`DEFAULT_QUIET`) and what is reported by default. The preferences tool's `list` returns
+the same facts for the owner's settings (`quiet`, `brief`, `defaults`, then the rules), which is what
+the assistant answers "what rules do you follow" from.
 The chat's prompt is the name line, then Raft's instructions verbatim, or
 `DEFAULT_ASSISTANT_INSTRUCTIONS` (`src/plugins/raft-assistant-instructions.ts`) when they are empty
 or blank, then the code part, whose first line (`ASSISTANT_PRECEDENCE`) says it wins over anything
