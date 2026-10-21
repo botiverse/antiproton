@@ -971,8 +971,8 @@ dropped, as is one a rule mutes; one a digest rule covers, and everything in the
 what an `anytime` rule covers, is kept for the brief. A `#channel:msgid` the assistant sends its owner in
 their chat (the answer to "more") counts as told too, so the next wake does not bring it back
 (`noteToldInChat`, a `raft.assistant_chat_told` row with the count). The chat prompt answers "more"
-and "what's new" from an inbox read with `untold`, at most three lines, and says how many are left
-only from the read's `total` ("at least" that many when the read says so), never from its own count or memory, and with no number when the read
+and "what's new" from an inbox read with `untold` from the start (no offset: what was already told drops out of it), at most three lines, and says how many are left
+only from the read's `total` minus the lines of that reply ("at least" that many when the read says so), never from its own count or memory, and with no number when the read
 says told state is unavailable.
 
 When Raft runs the check (RFC 077 step 2), it says so in the credential context, `assistantOf.raftCheck: true`, and
