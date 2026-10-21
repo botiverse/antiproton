@@ -929,13 +929,17 @@ status one of `skipped_empty`, `skipped_filtered`, `invoked`, `unreadable`,
 `inbox_lagging`, `paused`, `night_deferred` or `failed`, with an `unreadable`
 count, and, on a doorbell that said when its change happened, `lagRetry` (the
 reads before this one that did not show it), `caught_up`, and `caught_up_via`
-(`unread` or `all`). Each `assistant_notify_owner` call that returns writes a
+(`unread` or `all`); a `failed` (or `paused`) row's `error` is a code (`inbox_refused` with the read's HTTP
+`status`, `inbox_shape`, `not_enabled`, `unexpected`), never an error's text, which can name a conversation.
+Each `assistant_notify_owner` call that returns writes a
 `raft.assistant_notify` row on its call's span (beside its `tool.call` row): its
-state (`sent`, `nothing_to_send`, `kept_for_brief`, `not_sent`), the items given
-and sent, and the items dropped by category, never an item or a reference. `assistant_notify_owner` composes and sends one
-DM to the owner (`assistantOf.dmTarget` when Raft gives it, else the DM learnt
-from the owner writing; it takes no destination from the model, and refuses while
-neither is known), and keeps its rules in code: every reference is a message's
+state (`sent`, `nothing_to_send`, `kept_for_brief`, `not_sent`), the items given,
+sent and held back, and the items dropped by category, never an item or a reference. `assistant_notify_owner` composes and sends one
+DM to the owner, one plain line per item (summaries cut at 120 characters), at most three items with an
+@mention or a DM first, then `N more — reply "more" to see them.`; what it holds back is not recorded as
+told and its conversations are not counted as looked at, so the next wake considers them again. It sends
+to `assistantOf.dmTarget` when Raft gives it, else to the DM learnt from the owner writing (it takes no
+destination from the model, and refuses while neither is known), and keeps its rules in code: every reference is a message's
 `#channel:msgid` (a bare `task #N` is refused, since in the DM it is the DM's own
 task, and Raft has no channel-qualified task reference); one the check's reads
 cannot confirm is replaced by the conversation's first unread message; an item already told is

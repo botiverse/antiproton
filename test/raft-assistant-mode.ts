@@ -11,9 +11,10 @@ import { createHmac } from "node:crypto";
 import { PUSH_KEY, PUSH_STORE, raftPlugin, wakeInstruction } from "../src/plugins/raft.ts";
 import { activityEvents, turnEnds } from "../src/runtime/activity.ts";
 import {
-  ASSISTANT_STORE, CHAT_TOOLS, CHECK_TOOLS, COUNTS_KEY, DEFERRED_KEY, INBOX_LAG_RETRY_MS, OWNER_KEY, REMINDED_STORE, RETRY_BACKOFF_MS, REVIEWED_KEY, UNREADABLE_KEY, assistantCheckPrompt, assistantMountOf, assistantPrompt,
-  assistantWakeInstruction, confirmRef, isQuietHours, itemOf, localDay, nextBriefAt, zoneOf,
+  ASSISTANT_STORE, CHAT_TOOLS, CHECK_TOOLS, COUNTS_KEY, DEFERRED_KEY, DM_ITEMS_MAX, INBOX_LAG_RETRY_MS, OWNER_KEY, REMINDED_STORE, RETRY_BACKOFF_MS, REVIEWED_KEY, SUMMARY_MAX, UNREADABLE_KEY,
+  assistantCheckPrompt, assistantMountOf, assistantPrompt, assistantWake, assistantWakeInstruction, compose, confirmRef, isQuietHours, itemOf, localDay, nextBriefAt, noteDoorbell, zoneOf,
 } from "../src/plugins/raft-assistant.ts";
+import { setLogSink } from "../src/core/log.ts";
 import { askWake } from "../src/runtime/plugin-wakes.ts";
 import { recordedEngine } from "../src/runtime/durable-agent.ts";
 import { AgentRuntime } from "../cf/src/runtime.ts";
@@ -92,6 +93,30 @@ await check("a reference built from an inbox row: a channel's first unread messa
   must(thread?.ref === "#qa-x:bbbbbbb2" && thread.key === "msg:aaaaaaa1", show(thread));
   const read = confirmRef(item as never, [{ channelId: "c1", channelName: "qa-x", firstUnreadMessageId: "49f5d538-1111", parentMessageId: null, ids: ["deadbeef"] }]);
   must(read === item, `a message the read showed is kept: ${show(read)}`);
+});
+
+await check("a summary is at most 120 characters, cut at a word with an ellipsis rather than refused; a short one is kept as written", () => {
+  const long = "@cy needs your OK on the Friday launch date before marketing locks the partner announcement, and asks whether the pricing page can ship with it too";
+  must(long.length > 120, "control: the summary is over the cap");
+  const cut = itemOf({ ref: "#launch:aaaaaaa1", summary: long, kind: "decision" });
+  must(typeof cut !== "string" && cut.summary.length <= 120 && cut.summary.endsWith("…"), show(cut));
+  const kept = (cut as { summary: string }).summary.slice(0, -1);
+  must(long.startsWith(kept) && long[kept.length] === " ", `cut mid-word: ${show(kept)}`);
+  const exact = "x".repeat(120);
+  must((itemOf({ ref: "#a:abcdef12", summary: exact, kind: "task" }) as { summary: string }).summary === exact, "120 exactly is kept whole");
+  const word = "y".repeat(200);
+  const one = (itemOf({ ref: "#a:abcdef12", summary: word, kind: "task" }) as { summary: string }).summary;
+  must(one.length === 120 && one.endsWith("…"), `one long word: ${one.length}`);
+  must(SUMMARY_MAX === 120 && (raftPlugin.tools.find((t) => t.name === "assistant_notify_owner")!.parameters as any).properties.items.items.properties.summary.description.includes("at most 120 characters"),
+    "the tool tells the model the cap");
+});
+
+await check("a composed DM has no header, bullet or label: one line per item, a decision as one line too, and the held-back count last", () => {
+  const now = at("2026-10-20T10:00:00Z");
+  const item = (n: number, o: Record<string, unknown> = {}) => itemOf({ ref: `#ch${n}:aaaaaaa${n}`, summary: `@p${n} wants thing ${n}.`, kind: "question", ...o }) as never;
+  const text = compose([item(1, { since: "2026-10-20T07:00:00Z" }), item(2, { kind: "decided" })], { brief: true, now, askZone: false, more: 4 });
+  must(text === 'Morning. @p1 wants thing 1: #ch1:aaaaaaa1 (3h)\nDecided yesterday: @p2 wants thing 2: #ch2:aaaaaaa2\n4 more — reply "more" to see them.', text);
+  must(compose([item(1)], { brief: false, now, askZone: false }) === "@p1 wants thing 1: #ch1:aaaaaaa1", "one item is one line");
 });
 
 // ---- the plugin, end to end -----------------------------------------------------------------------------------------
@@ -246,15 +271,16 @@ await check("several items in one call go out as one DM with a reference each; t
   const first = await atTime(DAY, () => notify(a.ctx, { items: ITEMS }));
   must(first.state === "sent" && first.items === 2 && a.r.sends.length === 1, `first: ${show(first)} sends ${a.r.sends.length}`);
   const sent = a.r.sends[0];
-  must(sent.target === "dm:@ada" && sent.content.includes("#launch:aaaaaaa1") && sent.content.includes("#eng:bbbbbbb7") &&
-    sent.content.startsWith("2 things are waiting on you:") && sent.content.includes("(waiting 3h)"), `content: ${show(sent)}`);
+  // One plain line per item, who wants what, its reference, how long it has waited: no header, no bullet.
+  must(sent.target === "dm:@ada" && sent.content === "Bob asks you to pick the launch date: #launch:aaaaaaa1 (3h)\nReview the rollout plan (its task): #eng:bbbbbbb7",
+    `content: ${show(sent)}`);
   must(a.read(REMINDED_STORE, "msg:aaaaaaa1") && a.read(REMINDED_STORE, "msg:bbbbbbb7"), "what was said is recorded");
   const again = await atTime(DAY, () => notify(a.ctx, { items: ITEMS }));
   must(again.state === "nothing_to_send" && a.r.sends.length === 1, `again: ${show(again)} sends ${a.r.sends.length}`);
   must(again.dropped["#launch:aaaaaaa1"] === "already told" && again.dropped["#eng:bbbbbbb7"] === "already told", show(again.dropped));
   const mixed = await atTime(DAY, () => notify(a.ctx, { items: [ITEMS[0], { ref: "#launch:bbbbbbb2", summary: "Cy asks for a review", kind: "review" }] }));
   must(mixed.state === "sent" && mixed.items === 1 && a.r.sends.length === 2 &&
-    a.r.sends[1].content.startsWith("One thing is waiting on you:") && !a.r.sends[1].content.includes("aaaaaaa1"), `mixed: ${show(mixed)} ${show(a.r.sends[1])}`);
+    a.r.sends[1].content === "Cy asks for a review: #launch:bbbbbbb2", `mixed: ${show(mixed)} ${show(a.r.sends[1])}`);
 });
 
 await check("with no DM from Raft and none learnt, notify refuses and says why, whatever target the model names; a held send records nothing", async () => {
@@ -308,12 +334,65 @@ await check("at night notify sends nothing and keeps the items for the brief; `b
   // The brief its timer posted carries them, with a decision, in one DM, once.
   briefPosted(a, "2026-10-21");
   const brief = await atTime("2026-10-21T06:01:00Z", () => notify(a.ctx, { brief: true, items: [{ ref: "#eng:eeeeeee5", summary: "Ship on Friday", kind: "decided" }] }));
-  must(brief.state === "sent" && brief.items === 4 && a.r.sends.length === 1, `brief: ${show(brief)}`);
+  // Four items: the three the night held go out, and the decision, ranked last, is held back as a count.
+  must(brief.state === "sent" && brief.items === 3 && brief.more === 1 && a.r.sends.length === 1, `brief: ${show(brief)}`);
   const content = a.r.sends[0].content as string;
-  must(content.startsWith("Good morning. Your brief:\nWaiting on you:") && content.includes("Decided yesterday:\n• Ship on Friday — #eng:eeeeeee5"), content);
+  must(content.startsWith("Morning. Bob asks you to pick the launch date: #launch:aaaaaaa1") && !content.includes("eeeeeee5") &&
+    content.endsWith('\n1 more — reply "more" to see them.') && content.split("\n").length === 4, content);
+  must(a.read(REMINDED_STORE, "msg:eeeeeee5") === undefined && a.read(REMINDED_STORE, "msg:ddddddd4"), "what was held back is not told; what went out is");
   must(a.read(ASSISTANT_STORE, DEFERRED_KEY) === undefined, "the night's items were left after the brief");
   const again = await atTime("2026-10-21T06:30:00Z", () => notify(a.ctx, { brief: true, items: [{ ref: "#eng:fffffff6", summary: "x", kind: "decided" }] }));
   must(again.state === "nothing_to_send" && again.dropped["#eng:fffffff6"] === "decisions go in the morning brief", show(again));
+});
+
+await check("a DM shows at most 3 items, an @mention first, with \"N more\" last; the held-back items are not told, and only the shown are", async () => {
+  must(DM_ITEMS_MAX === 3, `DM_ITEMS_MAX ${DM_ITEMS_MAX}`);
+  const a = await assistant(raft({ dm: "dm:@ada" }));
+  const items = [1, 2, 3, 4, 5].map((n) => ({ ref: `#ch${n}:aaaaaaa${n}`, summary: `@p${n} asks you something`, kind: n === 4 ? "mention" : "question" }));
+  const out = await atTime(DAY, () => notify(a.ctx, { items }));
+  must(out.state === "sent" && out.items === 3 && out.more === 2 && /not counted as told/.test(out.note), show(out));
+  const lines = (a.r.sends[0].content as string).split("\n");
+  must(show(lines) === show(["@p4 asks you something: #ch4:aaaaaaa4", "@p1 asks you something: #ch1:aaaaaaa1", "@p2 asks you something: #ch2:aaaaaaa2",
+    '2 more — reply "more" to see them.']), show(lines));
+  must(lines.every((l) => !/^\s*([•*#>-]|\d+\.)/.test(l) && !l.endsWith(":") && !l.includes("**")), `a header or bullet: ${show(lines)}`);
+  must([1, 2, 4].every((n) => a.read(REMINDED_STORE, `msg:aaaaaaa${n}`)) && [3, 5].every((n) => a.read(REMINDED_STORE, `msg:aaaaaaa${n}`) === undefined),
+    "the shown are told and the held back are not");
+  const row = a.traced.filter((t) => t.kind === "raft.assistant_notify").at(-1);
+  must(show(row?.attrs) === show({ notifyState: "sent", given: 5, sent: 3, held_back: 2, dropped: 0 }), show(row));
+  // The held back are not "already told": given again, they go out, with no "more" line.
+  const again = await atTime(DAY, () => notify(a.ctx, { items }));
+  must(again.state === "sent" && again.items === 2 && !("more" in again) && a.r.sends[1].content === "@p3 asks you something: #ch3:aaaaaaa3\n@p5 asks you something: #ch5:aaaaaaa5",
+    `${show(again)} ${show(a.r.sends[1])}`);
+});
+
+await check("what a DM held back is considered again at the next wake, as usual; mentions and DMs from the inbox go first; what went out is not new again", async () => {
+  const a = await assistant(raft({ dm: "dm:@ada" }));
+  a.r.unread = [conv(1), conv(2), conv(3), conv(4, { hasMention: true }), conv(5, { channelType: "dm" })];
+  await atTime(DAY, () => noteDoorbell(a.ctx));
+  const first = await atTime(DAY, () => wake(a.ctx));
+  must(first.isolated === true && [1, 2, 3, 4, 5].every((n) => first.turn.includes(conv(n).channelId)), `control, the check: ${show(first)}`);
+  must([1, 2, 3, 4, 5].every((n) => conv(n).channelId in a.read(ASSISTANT_STORE, REVIEWED_KEY)), "control: all five looked at");
+  const items = [1, 2, 3, 4, 5].map((n) => ({ ref: `#ch${n}:aaaaaaa${n}`, summary: `@p${n} asks you something`, kind: "question" }));
+  const out = await atTime(DAY, () => notify(a.ctx, { items }));
+  must(out.state === "sent" && out.items === 3 && out.more === 2, show(out));
+  // The row's own @mention and the DM go ahead of the order the model gave.
+  must((a.r.sends[0].content as string).startsWith("@p4 asks you something: #ch4:aaaaaaa4\n@p5 asks you something: #ch5:aaaaaaa5\n@p1 asks you something: #ch1:aaaaaaa1\n2 more"),
+    a.r.sends[0].content);
+  const reviewed = a.read(ASSISTANT_STORE, REVIEWED_KEY);
+  must([2, 3].every((n) => !(conv(n).channelId in reviewed)) && [1, 4, 5].every((n) => conv(n).channelId in reviewed), `reviewed: ${show(reviewed)}`);
+  must([2, 3].every((n) => a.read(REMINDED_STORE, `msg:aaaaaaa${n}`) === undefined), "held back recorded as told");
+  // The next doorbell, nothing new anywhere: the two held back are candidates again; the three that went out are not.
+  await atTime("2026-10-20T10:05:00Z", () => noteDoorbell(a.ctx));
+  const next = await atTime("2026-10-20T10:05:00Z", () => wake(a.ctx));
+  must(next.isolated === true && [2, 3].every((n) => next.turn.includes(conv(n).channelId)) && [1, 4, 5].every((n) => !next.turn.includes(conv(n).channelId)),
+    `next: ${show(next)}`);
+  must(a.traced.filter((t) => t.kind === "raft.assistant_wake").at(-1)?.attrs.candidates === 2, show(a.traced.at(-1)));
+  const rest = await atTime("2026-10-20T10:05:00Z", () => notify(a.ctx, { items: [items[1], items[2]] }));
+  must(rest.state === "sent" && rest.items === 2 && !("more" in rest) && !/more/.test(a.r.sends[1].content), `${show(rest)} ${show(a.r.sends[1])}`);
+  // Control: with nothing held back, the same activity is not new again.
+  await atTime("2026-10-20T10:06:00Z", () => noteDoorbell(a.ctx));
+  const after = await atTime("2026-10-20T10:06:00Z", () => wake(a.ctx));
+  must(after.turn === undefined && a.traced.at(-1)?.status === "skipped_filtered", `after: ${show(after)}`);
 });
 
 // ---- the wake: code first ---------------------------------------------------------------------------------------------
@@ -565,6 +644,37 @@ await check("a doorbell at night reads nothing and calls no model (night_deferre
   must(c.read(ASSISTANT_STORE, OWNER_KEY).pausedAt === null, "assistant_route_not_allowed paused the assistant");
 });
 
+await check("a wake that fails writes an error code and no error text: a channel's name in a refusal or a thrown message reaches no trace row or log line", async () => {
+  const SENTINEL = "zz-secret-chan";
+  const lines: string[] = [];
+  setLogSink((l) => lines.push(l));
+  try {
+    const cases: Array<[string, Partial<Parameters<typeof assistantWake>[1]>, Record<string, unknown>]> = [
+      ["a refused read", { inbox: async () => ({ ok: false as const, status: 500, code: SENTINEL, message: `#${SENTINEL} is not visible` }) }, { status: "failed", error: "inbox_refused", http: 500 }],
+      ["a thrown read", { inbox: async () => { throw new Error(`fetch failed for #${SENTINEL}`); } }, { status: "failed", error: "unexpected" }],
+      ["a malformed read", { inbox: async () => ({ ok: true as const, data: { nope: SENTINEL } }) }, { status: "failed", error: "inbox_shape" }],
+      ["a probe refused as not enabled", {
+        inbox: async () => ({ ok: true as const, data: { items: [conv(1, { channelName: SENTINEL })] } }),
+        messages: async () => ({ ok: false as const, error: `403 assistant_not_enabled: #${SENTINEL}` }),
+      }, { status: "paused", error: "not_enabled" }],
+    ];
+    for (const [name, deps, want] of cases) {
+      const a = await assistant();
+      await atTime(DAY, () => noteDoorbell(a.ctx));
+      const out = await assistantWake(a.ctx, {
+        recheck: async () => null, send: async () => ({ sent: true }), messages: async () => ({ ok: true, ids: [] }),
+        inbox: async () => ({ ok: true, data: { items: [] } }), now: () => at(DAY), ...deps,
+      });
+      const row = a.traced.filter((t) => t.kind === "raft.assistant_wake").at(-1);
+      must(out && "wakeAt" in out && row && row.status === want.status && row.attrs.error === want.error &&
+        (want.http === undefined ? !("status" in row.attrs) : row.attrs.status === want.http), `${name}: ${show(row)}`);
+      must(!show(a.traced).includes(SENTINEL), `${name}: the trace carries the error's text: ${show(a.traced)}`);
+    }
+    must(lines.some((l) => /"outcome":"failed"/.test(l)), `control: the wake's log lines were caught: ${show(lines)}`);
+    must(!lines.some((l) => l.includes(SENTINEL)), `a log line carries the error's text: ${show(lines.filter((l) => l.includes(SENTINEL)))}`);
+  } finally { setLogSink(null); }
+});
+
 await check("the brief: once a day between 08:00 and noon, in a short session with the inbox as input; a morning with nothing calls no model", async () => {
   const a = await assistant();
   // The first wake (the runtime's, at an assistant's first open) at 23:00 only arms the next.
@@ -594,7 +704,7 @@ await check("with no zone from Raft the brief runs on UTC and asks the owner the
   const w = await atTime("2026-10-21T08:10:00Z", () => wake(a.ctx));
   must(w.isolated === true && w.turn.includes("UTC"), `UTC brief, to ask: ${show(w)}`);
   const empty = await atTime("2026-10-21T08:11:00Z", () => notify(a.ctx, { brief: true, items: [] }));
-  must(empty.state === "sent" && /Nothing is waiting on you[\s\S]*What time zone are you in\?/.test(a.r.sends[0].content), `asked: ${show(a.r.sends[0])}`);
+  must(empty.state === "sent" && /^Morning\. Nothing is waiting on you\.\nWhich time zone are you in\?/.test(a.r.sends[0].content), `asked: ${show(a.r.sends[0])}`);
   must(a.read(ASSISTANT_STORE, OWNER_KEY).askedTimezone === true, "asked once");
   const kept = await raftPlugin.invoke("assistant_preferences", { action: "timezone", timezone: "Asia/Tokyo" }, a.ctx) as any;
   must(kept.state === "kept" && a.read(ASSISTANT_STORE, OWNER_KEY).statedTimezone === "Asia/Tokyo", show(kept));
