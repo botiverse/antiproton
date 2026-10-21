@@ -915,12 +915,12 @@ The generated `raftbench_findings` (SDK 0.26.0) is gated the same way: listed on
 `agent.raftbenchReader` is literally `true` (slock #10609; absent or any other value is not a reader), never offered
 to a mount with no snapshot, refused as an unknown tool where the mount's list lacks it, and a 403 from Raft has the
 mount listed again at the next turn so a revoked grant drops it (`isRaftbenchReader`, `RAFTBENCH_READER_BASIS`).
-Since SDK 0.28.0 a page with a `nextCursor` ends with its next page as a call (the SDK's `next`: the same filters
+Since SDK 0.28 a page with a `nextCursor` ends with its next page as a call (the SDK's `next`: the same filters
 and limit with the cursor, `findingsText`). A failure's next action is the Server's `suggestedNextAction` as it came
 (slock #10733: read the first page again without a cursor, or tell the person who asked); a failure the SDK's
 `raftbenchFailureKind` calls `stop` (`raftbench_findings_unavailable`, a reader no longer allowed) is marked as one
-that will not clear, even on a 503 (`findingsFailure`). Its `channelId` is described without naming `channels_info`,
-which a reader's `read` credential may lack (`PARAMETER_DESCRIPTIONS`), until the SDK's own wording changes.
+that will not clear, even on a 503 (`findingsFailure`). Its `channelId` names `channels_info`, which a reader's `read`
+credential may lack, only "if that tool is available" (SDK 0.28.1), the one way a description may name such a tool.
 
 Such an agent is also proactive (Raft RFC 075 §4.2, `src/plugins/raft-assistant.ts`),
 and code decides before any model is asked. A push notice that names RFC 074's

@@ -1,6 +1,6 @@
 import { createHmac } from "node:crypto";
 import { createRaft, isInterrupted, RAFT_OPERATIONS } from "@botiverse/raft-sdk";
-import { raftPlugin as raftWithoutStorage, EXCLUDED, EVENTS_LIMIT, GENERATED, handOver, INBOX_STORE, KEY_LIFETIME_MS, PAGE_ROWS, PUSH_KEY, PUSH_STORE, originOf, pagingArg, toolOf, offeredTerms, escapeMarks, unescapeMarks, createRaftPlugin, downloadAttachment, ATTACHMENT_MAX_BYTES, toolsBasisOf, WITHHELD_ARGUMENTS, PARAMETER_DESCRIPTIONS, FEATURES_BASIS, wakeInstruction, renderInboxSummary, INBOX_SUMMARY, RAFTBENCH_TOOL, RAFTBENCH_READER_BASIS, isRaftbenchReader } from "../src/plugins/raft.ts";
+import { raftPlugin as raftWithoutStorage, EXCLUDED, EVENTS_LIMIT, GENERATED, handOver, INBOX_STORE, KEY_LIFETIME_MS, PAGE_ROWS, PUSH_KEY, PUSH_STORE, originOf, pagingArg, toolOf, offeredTerms, escapeMarks, unescapeMarks, createRaftPlugin, downloadAttachment, ATTACHMENT_MAX_BYTES, toolsBasisOf, WITHHELD_ARGUMENTS, FEATURES_BASIS, wakeInstruction, renderInboxSummary, INBOX_SUMMARY, RAFTBENCH_TOOL, RAFTBENCH_READER_BASIS, isRaftbenchReader } from "../src/plugins/raft.ts";
 import { activityEvents, turnEnds } from "../src/runtime/activity.ts";
 import { readFileSync } from "node:fs";
 import { PARK_BYTES } from "../src/plugins/artifacts.ts";
@@ -314,7 +314,9 @@ await check("no tool description or parameter description, at any depth, names a
 /**
  * A description is the same on every mount, but a mount is offered only the generated tools its credential's
  * capabilities reach (`snapshotTools`). So a tool's description may name another generated tool only when every
- * credential that gets the first gets the second: the named tool needs no capability the naming one lacks.
+ * credential that gets the first gets the second: the named tool needs no capability the naming one lacks — or when
+ * the mention says so itself, the name followed by "if that tool is available" or "when that tool is available"
+ * (raftbench_findings' channelId, SDK 0.28.1, names channels_info that way: otherwise omit the filter).
  */
 function namedBeyondReach(tools: ReadonlyArray<{ name: string; summary: string; parameters: unknown }>): string[] {
   const capabilityOf = new Map(GENERATED.map((op) => [op.toolName, op.capability]));
@@ -322,7 +324,7 @@ function namedBeyondReach(tools: ReadonlyArray<{ name: string; summary: string; 
     const own = capabilityOf.get(t.name);
     if (!own) return [];
     const texts = [t.summary, ...descriptionsIn(t.parameters, t.name).map(([, d]) => d)];
-    return GENERATED.filter((op) => op.toolName !== t.name && texts.some((d) => new RegExp(`(?<![\\w.])${op.toolName}(?![\\w])`).test(d)))
+    return GENERATED.filter((op) => op.toolName !== t.name && texts.some((d) => new RegExp(`(?<![\\w.])${op.toolName}(?![\\w])(?!\\s+(?:if|when) that tool is available)`).test(d)))
       .filter((op) => op.capability.some((c) => !own.includes(c)))
       .map((op) => `${t.name} names ${op.toolName} (needs ${op.capability.filter((c) => !own.includes(c)).join(", ")})`);
   });
@@ -335,6 +337,11 @@ await check("no description names a generated tool a credential could lack while
   const card = toolNamed("actions_prepare")!;
   const doctored = namedBeyondReach([{ ...card, summary: `${card.summary} Or call mentions_add, or tasks_delete.` }]);
   if (JSON.stringify(doctored) !== JSON.stringify(["actions_prepare names mentions_add (needs mentions)"])) throw new Error(`control: ${JSON.stringify(doctored)}`);
+  // A mention that says it may be missing passes; the same tool named plainly in the same text is still caught.
+  const conditional = namedBeyondReach([{ ...card, summary: `${card.summary} Look it up with mentions_add if that tool is available; otherwise omit it.` }]);
+  if (conditional.length) throw new Error(`conditional: ${JSON.stringify(conditional)}`);
+  const both = namedBeyondReach([{ ...card, summary: `${card.summary} Use mentions_add when that tool is available, or call mentions_add.` }]);
+  if (JSON.stringify(both) !== JSON.stringify(["actions_prepare names mentions_add (needs mentions)"])) throw new Error(`both: ${JSON.stringify(both)}`);
 });
 
 await check("the manifest's declarations map onto the tool: side effect, model-only, idempotency, description and schema", async () => {
@@ -2161,17 +2168,6 @@ await check("raftbench_findings failures pass Raft's suggestedNextAction through
   one(json(503, { error: "down", code: "raftbench_unavailable", suggestedNextAction: "Retry in a moment." }));
   const down = await failure(() => raftPlugin.invoke(RAFTBENCH_TOOL, {}, reader()));
   must(down.transient === true && down.message.endsWith(" — Retry in a moment."), `control: ${down.message} ${JSON.stringify(down)}`);
-});
-
-await check("every operation and argument PARAMETER_DESCRIPTIONS names is in the manifest, and its tool carries the description written here", async () => {
-  for (const [name, args] of Object.entries(PARAMETER_DESCRIPTIONS)) {
-    const op = RAFT_OPERATIONS.find((o) => o.name === name);
-    must(op, `PARAMETER_DESCRIPTIONS names ${name}, which the manifest does not have`);
-    for (const [arg, description] of Object.entries(args)) {
-      must(Object.hasOwn(op!.inputSchema.properties ?? {}, arg), `PARAMETER_DESCRIPTIONS names ${name}'s ${arg}, which its manifest schema does not have`);
-      must((toolOf(op!).parameters as any).properties[arg].description === description, `${name}.${arg}: ${JSON.stringify((toolOf(op!).parameters as any).properties[arg])}`);
-    }
-  }
 });
 
 /** The credential context with the agent's `raftbenchReader` as given (slock #10609), or left out when `undefined`. */

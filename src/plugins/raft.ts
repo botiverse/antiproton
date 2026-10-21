@@ -926,15 +926,6 @@ const DESCRIPTION_OVERRIDES: Readonly<Record<string, string>> = {
 };
 
 /**
- * A parameter description written here in place of the manifest's, where the manifest's names a tool a credential
- * holding this tool's capabilities may lack, which `test/raft-plugin.ts` refuses. raftbench_findings needs only
- * `read`, and its channelId (SDK 0.28.0) points at channels_info, which needs `channels`.
- */
-export const PARAMETER_DESCRIPTIONS: Readonly<Record<string, Readonly<Record<string, string>>>> = {
-  "raftbench.findings": { channelId: "Only findings citing this source channel: its ID (a UUID), not its #name." },
-};
-
-/**
  * The manifest's text in this mount's terms, for a tool's description and every parameter description in its schema:
  * an operation named by its dotted name (`tasks.unassign`) is written as the tool name the model is offered
  * (`tasks_unassign`); a parenthesised SDK field path (`(interrupt.resume.idempotencyKey)`), which names an object this
@@ -980,9 +971,6 @@ export function toolOf(op: RaftOperationSpec): ToolSchema {
   for (const name of Object.keys(WITHHELD_ARGUMENTS[op.name] ?? {})) {
     delete parameters.properties?.[name];
     if (Array.isArray(parameters.required)) parameters.required = parameters.required.filter((r: unknown) => r !== name);
-  }
-  for (const [name, description] of Object.entries(PARAMETER_DESCRIPTIONS[op.name] ?? {})) {
-    if (parameters.properties?.[name]) parameters.properties[name].description = description;
   }
   const paging = pagingArg(op);
   if (paging) {
