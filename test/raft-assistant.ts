@@ -504,12 +504,24 @@ await check("untold goes to the wire as filter untold; each line's told and the 
   const { plugin: plain } = pluginWith({ inbox: unreadAnswer });
   const out = String(await plain.invoke(INBOX, {}, ctx(ASSISTANT).ctx)).split("\n");
   must(out.length === 3 && !("told" in JSON.parse(out[1]!)) && out[2] === "hasMore=false nextOffset=null", `plain: ${JSON.stringify(out)}`);
-  // A told or a total that is not one is malformed, not shown.
-  for (const [what, bad] of [["told", untoldAnswer({ items: [inboxItem({ told: "yes" })] })], ["total", untoldAnswer({ total: -1 })]] as const) {
+  // A told, a total or a totalCapped that is not one is malformed, not shown.
+  for (const [what, bad] of [
+    ["told", untoldAnswer({ items: [inboxItem({ told: "yes" })] })], ["total", untoldAnswer({ total: -1 })], ["totalCapped", untoldAnswer({ totalCapped: "true" })],
+  ] as const) {
     const { plugin: p } = pluginWith({ inbox: bad });
     const e = await failure(() => p.invoke(INBOX, { filter: "untold" }, ctx(ASSISTANT).ctx));
     must(/not in the expected shape/.test(e.message), `${what}: ${e.message}`);
   }
+});
+
+await check("untold with totalCapped: the total line says it is a lower bound; totalCapped false reads as a plain total", async () => {
+  const { plugin } = pluginWith({ inbox: untoldAnswer({ totalCapped: true, total: 300 }) });
+  const lines = String(await plugin.invoke(INBOX, { filter: "untold" }, ctx(ASSISTANT).ctx)).split("\n");
+  must(lines[3] === "At least 300 match the filter untold; Raft counted only the first 300 conversations, so there may be more." &&
+    !lines.some((l) => l.includes("in total, across all pages")) && lines[4] === "hasMore=true nextOffset=2" && lines.length === 5, `capped: ${JSON.stringify(lines)}`);
+  const { plugin: uncapped } = pluginWith({ inbox: untoldAnswer({ totalCapped: false }) });
+  const out = String(await uncapped.invoke(INBOX, { filter: "untold" }, ctx(ASSISTANT).ctx)).split("\n");
+  must(out[3] === "7 match the filter untold in total, across all pages." && !out.some((l) => /at least/i.test(l)) && out.length === 5, `uncapped: ${JSON.stringify(out)}`);
 });
 
 await check("untold answered 400, or with no numeric total: read once more with unread, same page, opening with the note and no total", async () => {

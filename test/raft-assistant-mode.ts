@@ -1647,7 +1647,7 @@ await check("with send-as-owner not offered, the chat prompt does not mention se
 await check("\"more\" and \"what's new\" read the inbox with untold and give a remaining count only from the tool's total; the persona's count is the tool's", () => {
   const chat = assistantPrompt("raft");
   must(chat.includes('When your owner says "more", or asks what\'s new or whether anything is new, read their inbox with `raft__assistant_owner_inbox` filter untold'), chat);
-  must(chat.includes("Say how many are left only from the tool's total, as that total minus the ones you gave; never count them yourself, and never work out from memory or this chat what was already said.") &&
+  must(chat.includes("Say how many are left only from the tool's total, as that total minus the ones you gave, and if the tool says \"at least\", say \"at least\" that many more; never count them yourself, and never work out from memory or this chat what was already said.") &&
     chat.includes("If the tool says told state is unavailable, give the items with no number.") && !chat.includes("then how many are left if any"), "the remaining count's source");
   must(chat.includes("Every #channel:msgid you send them counts as told"), "told in chat");
   must(DEFAULT_ASSISTANT_INSTRUCTIONS.includes("If there is more, offer it, saying how much only when a tool gave you the count") &&

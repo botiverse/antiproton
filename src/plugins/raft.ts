@@ -2281,7 +2281,8 @@ export function renderOwnerMessages(data: unknown, alias: string, unoffered: Rea
  * item is shown as one line of JSON, with only the fields named here (so `owner` and `filter` are not shown; `channelType`
  * is, when Raft sends it, since it is what tells a DM from a channel, and so is `told`): a preview or a channel name is someone else's text, and as JSON its line breaks stay escaped,
  * so it cannot pass for a line of its own. The answer's `total`, when Raft sends it, is said in a line of its own: how
- * many match the filter across every page, the only count of what remains the model is to give.
+ * many match the filter across every page, the only count of what remains the model is to give. With `totalCapped`
+ * (Raft read only its first 300 conversations) that total is a lower bound, and the line says "at least".
  */
 export function renderOwnerInbox(data: unknown, alias: string, filter: OwnerInboxFilter, o: { untoldUnknown?: boolean } = {}): string {
   const tool = OWNER_INBOX_TOOL;
@@ -2315,12 +2316,16 @@ export function renderOwnerInbox(data: unknown, alias: string, filter: OwnerInbo
   if (!(total === undefined || (typeof total === "number" && Number.isSafeInteger(total) && total >= 0))) {
     throw malformed(tool, "total is not a count");
   }
+  const capped = d.totalCapped;
+  if (!(capped === undefined || typeof capped === "boolean")) throw malformed(tool, "totalCapped is not true or false");
   return [
     ...(o.untoldUnknown ? [UNTOLD_UNKNOWN] : []),
     ownerInboxLabel(alias),
     ...(lines.length ? lines : [`No conversations match the filter ${filter}.`]),
     // Not after a fallback: a count of unread conversations is not what remains untold.
-    ...(total !== undefined && !o.untoldUnknown ? [`${total} match the filter ${filter} in total, across all pages.`] : []),
+    ...(total !== undefined && !o.untoldUnknown ? [capped
+      ? `At least ${total} match the filter ${filter}; Raft counted only the first 300 conversations, so there may be more.`
+      : `${total} match the filter ${filter} in total, across all pages.`] : []),
     `hasMore=${d.hasMore} nextOffset=${next}`,
   ].join("\n");
 }
