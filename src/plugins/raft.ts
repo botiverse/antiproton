@@ -3468,7 +3468,8 @@ export function createRaftPlugin(deps: {
 
     /**
      * The end of a turn of the agent's main conversation, which for a personal assistant is its owner's chat: a closing
-     * text no send to the owner's DM carried is sent there (`replyFallback`); nothing for any other agent.
+     * text no send to the owner's DM carried is sent there, or a fixed line for a failed turn (`replyFallback`); nothing
+     * for any other agent.
      */
     async afterTurn(ctx, end) {
       await replyFallback(ctx, end, sendToOwner);
