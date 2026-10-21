@@ -6,7 +6,7 @@
  */
 import { RAFT_OPERATIONS } from "@botiverse/raft-sdk";
 import {
-  raftPlugin as raftWithoutStorage, createRaftPlugin, downloadAttachment, viewAttachment, imageHeader, toolsBasisOf, EXCLUDED, FEATURES_BASIS,
+  raftPlugin as raftWithoutStorage, createRaftPlugin, downloadAttachment, viewAttachment, imageHeader, toolsBasisOf, EXCLUDED, FEATURES_BASIS, RAFTBENCH_READER_BASIS,
   GENERATED, VIEW_TOOL, VIEW_MAX_BYTES, VIEW_MAX_SIDE,
 } from "../src/plugins/raft.ts";
 import { admitTools } from "../src/runtime/mount-tools.ts";
@@ -373,8 +373,8 @@ await check("toolsBasis moved with the view, so a snapshot taken without it is r
   const ASSISTANT = ["assistant_owner_inbox", "assistant_owner_messages", "assistant_notify_owner", "assistant_preferences", "assistant_send_as_owner"];
   const generated = GENERATED.map((op) => ({ name: op.toolName, capability: op.capability }));
   const download = RAFT_OPERATIONS.find((op) => op.name === "attachments.downloadUrl")!;
-  // FEATURES_BASIS stands for what a listing records beside the list (the Server's flags), not a tool.
-  const named = [FEATURES_BASIS, ...OWN, ...ASSISTANT].map((name) => ({ name }));
+  // FEATURES_BASIS stands for what a listing records beside the list (the Server's flags), not a tool; RAFTBENCH_READER_BASIS for the reader gate.
+  const named = [FEATURES_BASIS, RAFTBENCH_READER_BASIS, ...OWN, ...ASSISTANT].map((name) => ({ name }));
   // Control: the formula is the plugin's — with the view it gives the plugin's basis.
   // The upload is in it too (test/raft-attachments-upload.ts), with the capability it needs.
   const upload = { name: "attachments_upload", capability: ["send"] };
