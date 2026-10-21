@@ -185,10 +185,15 @@ export function profilePrompt(profile: AgentProfile): string {
  *
  * One proactive check, in a short session of its own (`PluginNext.isolated`): the check's prompt and nothing else, not
  * even the name. What a check does is decided by code and the owner's rules, never by the instructions.
+ *
+ * `offered` is the session's tools on that mount, bare names: the code part names only those (every one its session
+ * kind can have when absent).
  */
-export function assistantSystemPrompt(persona: PromptParts["persona"], alias: string, session: "chat" | "check" = "chat"): string {
-  if (session === "check") return assistantCheckPrompt(alias);
+export function assistantSystemPrompt(
+  persona: PromptParts["persona"], alias: string, session: "chat" | "check" = "chat", offered?: Iterable<string>,
+): string {
+  if (session === "check") return assistantCheckPrompt(alias, offered);
   const name = String(persona?.name ?? "").trim();
   const instructions = String(persona?.description ?? "").trim() || DEFAULT_ASSISTANT_INSTRUCTIONS;
-  return [name ? `You are ${name}.` : "", instructions, assistantPrompt(alias)].filter(Boolean).join("\n\n");
+  return [name ? `You are ${name}.` : "", instructions, assistantPrompt(alias, offered)].filter(Boolean).join("\n\n");
 }

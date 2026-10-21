@@ -504,12 +504,17 @@ starts, before the agent's tool list is built (`AgentRuntime.postMessage` with
 `prompt` → `retakeStaleSnapshots`, `cf/src/runtime.ts`; never on a steer, a
 follow-up, a job's delivery or a read that opens the harness, none of which
 may wait on a far end; two turn starts at once share one pass; an inbound
-event's turn starts it without waiting, so the service's request is answered at
-once and that turn runs on the list as it stood), lists again any mount whose
+event's turn waits too when a basis moved, since it starts in the alarm pass
+after the service's request was answered), lists again any mount whose
 snapshot's basis is not its plugin's — a snapshot with no basis counts as
 different; a mount with no snapshot is left alone, being offered every tool
 already; a switched-off plugin is skipped. The listing is bounded by
-`RETAKE_TIMEOUT_MS` (3 s). When it fails or runs out, the old list stays —
+`RETAKE_TIMEOUT_MS` (3 s), and so is the turn's wait for the whole pass: past
+it the turn runs on the list as it stands, the pass goes on in the background
+(`tools.retake_timeout` in the log), and the next turn is built from what it
+lands; a message whose harness offers tools the conversation's previous message
+did not names the added ones at its head, once (`src/runtime/tools-seen.ts`).
+When the listing fails or runs out, the old list stays —
 `mountTools` still reads it against the running build, so a tool the build
 removed is not offered — the reason goes where every failed listing's does
 (`snapshotError`, on the mount's page), and the mount is not tried again for
@@ -529,7 +534,9 @@ own.** `toolsDue(mount, now)` is synchronous and local, like `mountTools`: it
 reads the record and whatever the plugin remembers in memory, never a server.
 When it answers true for a mount that has a snapshot, the same turn-start pass
 lists the mount again, with the same timeout, back-off and keep-a-credentialed-list
-rules as a basis that moved (`snapshotStale`, `cf/src/runtime.ts`; issue #937).
+rules as a basis that moved (`snapshotStale`, `cf/src/runtime.ts`; issue #937),
+except that an inbound event's turn does not wait for it: that re-take runs in
+the background and reaches the turn after.
 Raft's managed MCP is the user: its catalogue changes when a person adds,
 removes or reconnects a connector in Raft, and a call can be told it is stale.
 A throw is read as not due.

@@ -8,6 +8,8 @@
  * moves a plugin's tool set looks like to a mount whose list was taken before it.
  */
 import { AgentRuntime, RETAKE_BACKOFF_MS, RETAKE_TIMEOUT_MS } from "../cf/src/runtime.ts";
+import { setLogSink } from "../src/core/log.ts";
+import { returnToolsChange, takeToolsChange, toolsChangedLine, TOOLS_CHANGED_NAMES_MAX } from "../src/runtime/tools-seen.ts";
 import { interrupt, toolsOf, type Plugin, type PluginContext, type ToolSchema } from "../src/plugins/types.ts";
 import { ToolGateway, type CallContext } from "../src/runtime/gateway.ts";
 import { admitTools } from "../src/runtime/mount-tools.ts";
@@ -39,6 +41,8 @@ function lister(opts: { credential?: boolean } = {}) {
     release: [] as Array<() => void>,
     /** Makes reading `toolsBasis` throw, so a re-take pass rejects as a whole rather than failing one mount. */
     basisThrows: false,
+    /** What `toolsDue` answers: the list is due again with its basis unchanged (as a managed catalogue that aged). */
+    due: false,
     /** Whether `receive` hands the agent what arrived. */
     deliver: false,
     seen: [] as Array<{ where: string; offered: readonly string[] | undefined; has: boolean }>,
@@ -48,6 +52,7 @@ function lister(opts: { credential?: boolean } = {}) {
     id: "lister", version: "1.0.0",
     get tools() { return s.all.map(tool); },
     get toolsBasis() { if (s.basisThrows) throw new Error("the basis could not be read"); return s.basis; },
+    toolsDue: () => s.due,
     mountTools(mount) {
       const snap = mount.toolSnapshot;
       if (!snap) return s.all.map(tool);
@@ -462,44 +467,93 @@ async function hooked(w: Awaited<ReturnType<typeof runtimeWorld>>) {
   };
 }
 
-await check("an inbound push is answered at once: its turn starts the re-take without waiting, which still lands; a person's prompt waits", async () => {
+await check("an inbound push is answered at once; when a deploy moved the basis, the turn its pass starts waits for the re-take and is offered the new tool", async () => {
   const w = await runtimeWorld();
-  const push = await hooked(w);
+  const made = await w.rt.createHookSecret("t", "a", "m", "hook-1");
+  must(made.ok, `hook: ${show(made)}`);
+  w.l.s.deliver = true;
   w.l.s.listed = ["a", "b"];
   w.l.s.basis = "basis-2";
   w.l.s.fail = "hold";
+  // The service's answer: verified and queued, with no listing in it.
   const started = Date.now();
-  const r = await push();
-  const took = Date.now() - started;
-  must(r.outcome === "delivered" && took < 1_000, `the push: ${show(r)} after ${took} ms`);
-  must(w.l.s.release.length === 1 && show(await w.offered()) === show(["a"]), `control: the re-take is running, the list as it stood: ${w.l.s.release.length} ${show(await w.offered())}`);
-  // The running re-take was handed to the object's `waitUntil`, once, and is still open while the listing is held.
-  must(w.waited.length === 1, `promises handed to waitUntil: ${w.waited.length}`);
-  const kept = { state: "open" as "open" | "resolved" | "rejected" };
-  w.waited[0]!.then(() => { kept.state = "resolved"; }, () => { kept.state = "rejected"; });
+  const r = await w.rt.receiveHook("t", "a", "m", "hook-1", { headers: {}, body: new Uint8Array([1]) });
+  must(r.outcome === "delivered" && Date.now() - started < 1_000 && w.l.s.release.length === 0, `the push: ${show(r)}, listings in flight ${w.l.s.release.length}`);
+  // The pass that posts it (the alarm's): its turn's start waits on the listing rather than opening on the old list.
+  let done = false;
+  const pass = w.rt.deliverPendingInbound("t", "a").then((p) => { done = true; return p; });
   await settle();
-  must(kept.state === "open", `the waitUntil promise settled before the re-take did: ${kept.state}`);
-  // The background pass is the agent's one pass: joining it and releasing the listing lands the new list.
-  const pass = w.rt.retakeStaleSnapshots("t", "a");
+  must(!done && w.l.s.release.length === 1, `the push's turn did not wait for the re-take: done=${done}, in flight ${w.l.s.release.length}`);
+  w.l.s.fail = null;
   w.l.s.release.splice(0).forEach((go) => go());
-  await pass;
-  must(w.l.s.listings === 2 && show(await w.offered()) === show(["a", "b"]), `the background re-take: ${w.l.s.listings} ${show(await w.offered())}`);
-  await settle();
-  must(kept.state === "resolved", `the waitUntil promise, once the re-take finished: ${kept.state}`);
-  // A person's prompt waits for it.
-  w.l.s.basis = "basis-3";
+  const out = await pass;
+  must(out.posted === 1 && out.error === null, `the pass: ${show(out)}`);
+  must(show(await w.offered()) === show(["a", "b"]), `the list: ${show(await w.offered())}`);
+  const harness = (await (await w.rt.agent("t", "a")).tools()).map((t) => t.name);
+  must(harness.includes("m__b"), `the push's turn was opened on the old list: ${show(harness)}`);
+  must(w.waited.length === 0, `promises handed to waitUntil: ${w.waited.length}`);
+});
+
+await check("an inbound push whose list is due only because it aged (basis unchanged) does not wait: its turn runs on the list as it stands, the re-take lands in the background; a person's prompt waits", async () => {
+  const w = await runtimeWorld();
+  const made = await w.rt.createHookSecret("t", "a", "m", "hook-1");
+  must(made.ok, `hook: ${show(made)}`);
+  w.l.s.deliver = true;
+  w.l.s.listed = ["a", "b"];
+  w.l.s.due = true;
   w.l.s.fail = "hold";
+  must((await w.mount()).toolSnapshot?.basis === "basis-1" && w.l.s.basis === "basis-1", "control: the basis did not move");
+  must((await w.rt.receiveHook("t", "a", "m", "hook-1", { headers: {}, body: new Uint8Array([1]) })).outcome === "delivered", "the push");
+  const started = Date.now();
+  const out = await w.rt.deliverPendingInbound("t", "a");
+  must(out.posted === 1 && Date.now() - started < 1_000, `the pass waited: ${show(out)} after ${Date.now() - started} ms`);
+  must(w.l.s.release.length === 1 && w.waited.length === 1, `control: the re-take runs in the background: in flight ${w.l.s.release.length}, waitUntil ${w.waited.length}`);
+  const harness = (await (await w.rt.agent("t", "a")).tools()).map((t) => t.name);
+  must(harness.includes("m__a") && !harness.includes("m__b"), `the push's turn: ${show(harness)}`);
+  w.l.s.fail = null;
+  w.l.s.release.splice(0).forEach((go) => go());
+  await w.waited[0];
+  must(show(await w.offered()) === show(["a", "b"]), `the background re-take: ${show(await w.offered())}`);
+  // A person's prompt with only an aged list waits for it, as before.
+  w.l.s.listed = ["a", "b", "c"];
+  w.l.s.fail = "hold";
+  await w.rt.stopTurn("t", "a", "admin_cancel");
   let done = false;
   const prompt = w.turn("from a person").then(() => { done = true; });
   await settle();
   must(!done && w.l.s.release.length === 1, `the person's prompt did not wait: done=${done}`);
   w.l.s.release.splice(0).forEach((go) => go());
   await prompt;
-  must(done, "the person's prompt never finished");
   must(w.waited.length === 1, `the person's prompt handed waitUntil something: ${w.waited.length}`);
 });
 
-await check("a background re-take that throws is caught and logged: no unhandled rejection, and the push is delivered", async () => {
+await check("a re-take with no answer holds an inbound turn RETAKE_TIMEOUT_MS at most: it runs on the old list, the pass goes on under waitUntil, and a code is logged", async () => {
+  const w = await runtimeWorld();
+  const push = await hooked(w);
+  w.l.s.listed = ["a", "b"];
+  w.l.s.basis = "basis-2";
+  w.l.s.fail = "hang";
+  const lines: string[] = [];
+  setLogSink((l) => lines.push(l));
+  try {
+    const started = Date.now();
+    const r = await push();
+    const took = Date.now() - started;
+    must(r.outcome === "delivered", `the push: ${show(r)}`);
+    must(took >= RETAKE_TIMEOUT_MS - 50 && took < RETAKE_TIMEOUT_MS + 1_500, `the push's turn waited ${took} ms`);
+  } finally { setLogSink(null); }
+  must(show(await w.offered()) === show(["a"]), `control: the list as it stood: ${show(await w.offered())}`);
+  const harness = (await (await w.rt.agent("t", "a")).tools()).map((t) => t.name);
+  must(harness.includes("m__a") && !harness.includes("m__b"), `the turn's tools: ${show(harness)}`);
+  must(w.waited.length === 1, `promises handed to waitUntil: ${w.waited.length}`);
+  const logged = lines.map((l) => JSON.parse(l)).filter((l) => l.evt === "tools.retake_timeout");
+  must(logged.length === 1 && logged[0].ms === RETAKE_TIMEOUT_MS && logged[0].agentId === "a", `logged: ${show(lines)}`);
+  // The mount's own timeout inside the pass still records why, as before.
+  await w.waited[0];
+  must(/no answer within/.test(w.rt.snapshotError("m") ?? ""), `snapshotError: ${w.rt.snapshotError("m")}`);
+});
+
+await check("a re-take that throws at an inbound turn's start is caught and logged: no unhandled rejection, and the push is delivered", async () => {
   const w = await runtimeWorld();
   const push = await hooked(w);
   const unhandled: unknown[] = [];
@@ -514,7 +568,7 @@ await check("a background re-take that throws is caught and logged: no unhandled
     const r = await push();
     await settle();
     must(r.outcome === "delivered", `the push: ${show(r)}`);
-    // What `waitUntil` holds is the caught pass: it resolves, so the platform never sees a rejection.
+    // The basis could not be read, so the push's turn did not wait: the pass went to `waitUntil`, caught, so it resolves.
     must(w.waited.length === 1, `promises handed to waitUntil: ${w.waited.length}`);
     const ended = await w.waited[0]!.then(() => "resolved", (e) => `rejected: ${String(e)}`);
     must(ended === "resolved", `the waitUntil promise ${ended}`);
@@ -525,6 +579,47 @@ await check("a background re-take that throws is caught and logged: no unhandled
     process.off("unhandledRejection", onUnhandled);
     w.l.s.basisThrows = false;
   }
+});
+
+await check("a turn whose harness offers tools the conversation's last message did not names them at the head of its message, once; the first message names none", async () => {
+  const w = await runtimeWorld();
+  const lastUser = async () => {
+    const branch = await w.rt.branchEntries("t", "a", "main") as any[];
+    const m = branch.filter((e) => e?.message?.role === "user").at(-1)?.message;
+    return JSON.stringify(m?.content ?? "");
+  };
+  await w.turn("first");
+  must(/first/.test(await lastUser()) && !(await lastUser()).includes("Your tools changed"), `the first message: ${await lastUser()}`);
+  // The list moves under the plugin's own basis (as a re-take after a deploy leaves it), and the turn ends.
+  w.l.s.listed = ["a", "b", "c"];
+  must((await w.rt.refreshMountTools("t", "a", "m")).ok, "refresh");
+  await w.rt.stopTurn("t", "a", "admin_cancel");
+  await w.turn("second");
+  const second = await lastUser();
+  must(second.includes("Your tools changed: you can now use `m__b`, `m__c`. Earlier refusals that depended on missing tools no longer apply."), `the second message: ${second}`);
+  must(second.indexOf("Your tools changed") < second.indexOf("second"), `not at the head: ${second}`);
+  await w.rt.stopTurn("t", "a", "admin_cancel");
+  await w.turn("third");
+  must(!(await lastUser()).includes("Your tools changed"), `told twice: ${await lastUser()}`);
+});
+
+await check("takeToolsChange: the first list is recorded silently; added names are told once, capped, without those another notice names; a message not written puts it back", async () => {
+  const { sql } = sqliteHost();
+  const H = "[h] ";
+  must(takeToolsChange(sql, "o", "c", ["x__a"], H) === null, "the first message told something");
+  must(takeToolsChange(sql, "o", "c", ["x__a"], H) === null, "an unchanged list told something");
+  // A tool taken away is not told; the list is recorded, so it coming back is.
+  must(takeToolsChange(sql, "o", "c", [], H) === null, "a removal was told");
+  const back = takeToolsChange(sql, "o", "c", ["x__a", "y__b"], H, (n) => n.startsWith("y__"));
+  must(back?.notice === `${H}${toolsChangedLine(["x__a"])}`, `with y__ named elsewhere: ${show(back)}`);
+  // Not written: put back, so the next message tells it again; another conversation is its own.
+  returnToolsChange(sql, "o", "c", back!);
+  const again = takeToolsChange(sql, "o", "c", ["x__a", "y__b"], H);
+  must(again?.notice === `${H}${toolsChangedLine(["x__a", "y__b"])}`, `after the put-back: ${show(again)}`);
+  must(takeToolsChange(sql, "o", "other", ["x__a", "y__b", "z__c"], H) === null, "a new conversation was told");
+  const many = Array.from({ length: TOOLS_CHANGED_NAMES_MAX + 3 }, (_, i) => `m__t${String(i).padStart(2, "0")}`);
+  const capped = takeToolsChange(sql, "o", "c", ["x__a", "y__b", ...many], H)!.notice;
+  must(capped.includes("`m__t07`") && !capped.includes("`m__t08`") && capped.includes(" and 3 more."), capped);
 });
 
 for (const r of results) console.log(`  ${r.ok ? "\x1b[32m✓\x1b[0m" : "\x1b[31m✗\x1b[0m"} ${r.name}${r.error ? `\n      ${r.error}` : ""}`);
