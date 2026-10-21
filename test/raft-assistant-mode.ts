@@ -1323,7 +1323,7 @@ await check("send as owner: every Raft refusal is not_sent with its code and the
     must(a.r.asOwner.length === 1, `${tag}: POSTs ${a.r.asOwner.length}`);
     const row = sendRows(a).at(-1);
     const result = want === "uncertain" || want === "failed" ? want : `refused:${want}`;
-    must(row?.status === result && row.attrs.result === result && (status === "drop" ? !("status" in row.attrs) : row.attrs.status === status), `${tag}: ${show(row)}`);
+    must(row?.status === result && row.attrs.result === result && (status === "drop" ? !("http_status" in row.attrs) : row.attrs.http_status === status), `${tag}: ${show(row)}`);
   }
 });
 

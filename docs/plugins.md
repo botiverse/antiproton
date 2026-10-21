@@ -1005,7 +1005,7 @@ followed by the message where they could send it themselves; no answer, or a 5xx
 without the text, since it may have landed. Each call writes a `raft.assistant_send_as_owner` row:
 `result` (`sent`, `uncertain`, `failed` or `refused:<code>`, `refused:proactive` among them),
 `target_kind` (`message`, `channel`, `dm`, `channel_id`), `in_thread`, `chars` (the message's length)
-and Raft's HTTP `status`; never the message, a name or an id.
+and Raft's HTTP status as `http_status`; never the message, a name or an id.
 
 A `403 assistant_not_enabled` from any call
 pauses the checks, the brief and the notify tool until Raft's context names the

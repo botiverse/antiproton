@@ -1301,7 +1301,7 @@ export async function sendAsOwner(args: unknown, ctx: PluginContext, deps: SendA
   const result = raftResult(out);
   if (result === "rate_limited") await ctx.db.put(ASSISTANT_STORE, { key: sendKey, at: now } as unknown as Json, SEND_LIMITED_KEY);
   if (result === "assistant_not_enabled") await pauseOn(ctx, new Error(NOT_ENABLED));
-  return notSent(result, out.status !== null ? { status: out.status } : {});
+  return notSent(result, out.status !== null ? { http_status: out.status } : {});
 }
 
 // ---- the doorbell ----------------------------------------------------------------------------------------------------
