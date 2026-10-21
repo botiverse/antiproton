@@ -26,7 +26,9 @@ import {
   ASSISTANT_OWN_TOOLS, ASSISTANT_STORE, CONTACT_KEY, DEFERRED_KEY, NOTIFY_TOOL, OWNER_KEY, PREFERENCES_TOOL, REMINDED_STORE, RULES_KEY, SEND_AS_OWNER_TOOL,
   sendAsOwner, type SendAsOwnerAnswer, assistantWake, assistantWakeInstruction, doorbellOf, isDoorbellTarget, keepOwnerFromContext, learnDm, loadOwner, mergeSources, noteDoorbell,
   notifyOwner, noteChatNotice, noteOwnerReply, noteToldInChat, pauseOn, replyFallback, preferences, type PersonResolve, type AssistantOwner, type ChangeSources, type OwnerContext, type OwnerSend,
+  checkEnded, pushBriefImport, type AssistantApi, type RaftAnswer,
 } from "./raft-assistant.ts";
+import type { RaftCheck, RefusedCheck } from "./raft-assistant-check.ts";
 import { callMcp, isMcpTool, keptMcpOf, leftOut, listMcp, mcpClock, mcpLines, MCP_CALL_TIMEOUT_MS, MCP_CAPABILITY, MCP_KEY, MCP_PREFIX } from "./raft-mcp.ts";
 import { modelToolName } from "../runtime/pi-tools.ts";
 import { isSubagentSession } from "../runtime/subagent-session.ts";
@@ -266,10 +268,14 @@ async function call(
     const parsed = object(data);
     const code = text(parsed.errorCode) ?? text(parsed.code);
     const message = `raft returned HTTP ${response.status}${code ? ` (${code})` : ""}`;
-    throw coded(options.deliveryMayHaveOccurred
+    const failure = coded(options.deliveryMayHaveOccurred
       ? receiveFailure(message)
       : retryable(new Error(message), response.status === 429 || response.status >= 500),
     { httpStatus: response.status, ...(code ? { code } : {}) });
+    // Raft's own sentence, apart from the error's message: a caller that shows it does so on purpose (`assistantApi`).
+    const said = text(parsed.error);
+    if (said) Object.assign(failure, { raftMessage: said });
+    throw failure;
   }
   return { status: response.status, data: object(data) };
 }
@@ -2876,7 +2882,7 @@ export function createRaftPlugin(deps: {
   const toldInChat = async (op: RaftOperationSpec, args: unknown, result: unknown, ctx: PluginContext) => {
     if (op.name !== "messages.send" || result instanceof Interrupt || !ctx.offered?.includes(PREFERENCES_TOOL)) return;
     const a = object(args);
-    await noteToldInChat(ctx, a.target, a.content).catch(() => 0);
+    await noteToldInChat(ctx, a.target, a.content, Date.now(), assistantApi).catch(() => 0);
     await noteOwnerReply(ctx, a.target).catch(() => {});
   };
   /** One generated operation: the attachment download is this plugin's own (`downloadAttachment`), the rest the SDK's. */
@@ -3198,8 +3204,8 @@ export function createRaftPlugin(deps: {
       if (name === NOTIFY_TOOL || name === PREFERENCES_TOOL) {
         // Offered as the owner reads are, and refused the same way where the mount's list does not name them.
         if (!ctx.offered?.includes(name)) throw ownerRefusal(`${name} is not offered on this mount: its Raft account is not a personal assistant`);
-        return name === NOTIFY_TOOL ? notifyOwner(args, ctx, { send: sendToOwner, recheck: recheckOwner })
-          : preferences(args, ctx, { inbox: (c, r) => assistant.ownerInbox(c, r), resolve: resolveOwnerPerson });
+        return name === NOTIFY_TOOL ? notifyOwner(args, ctx, { send: sendToOwner, recheck: recheckOwner, api: assistantApi })
+          : preferences(args, ctx, { inbox: (c, r) => assistant.ownerInbox(c, r), resolve: resolveOwnerPerson, api: assistantApi });
       }
       if (name === SEND_AS_OWNER_TOOL) {
         if (!ctx.offered?.includes(name)) throw ownerRefusal(`${name} is not offered on this mount: its Raft account is not a personal assistant`);
@@ -3472,6 +3478,8 @@ export function createRaftPlugin(deps: {
      * for any other agent.
      */
     async afterTurn(ctx, end) {
+      // A short session's end is told to this mount only when it asked for the session: one of Raft's checks.
+      if (end.isolated) { checkEnded(ctx, end); return; }
       await replyFallback(ctx, end, sendToOwner);
     },
 
@@ -3480,6 +3488,7 @@ export function createRaftPlugin(deps: {
       return assistantWake(ctx, {
         recheck: recheckOwner, inbox: (c, r) => assistant.ownerInbox(c, r), send: sendToOwner,
         messages: (c, channelId) => probeOwnerMessages(c, channelId, assistant),
+        mode: readRaftCheck, api: assistantApi,
       });
     },
   };
@@ -3533,9 +3542,42 @@ export async function postAsOwner(ctx: PluginContext, body: { channelId: string;
   }
 }
 
+/**
+ * Raft's assistant routes for when Raft runs the check (RFC 077 step 2: notify, told, the switch-over import, and the
+ * owner's rules and settings), through this plugin's own `call` on the mount's credential, which logs the route and
+ * never the body. No SDK route yet. A failure is an answer, never a throw: its status (null with no answer at all),
+ * Raft's code and Raft's own sentence.
+ */
+export const assistantApi: AssistantApi = async (ctx, method, path, body) => {
+  try {
+    const { data } = await call(ctx, method, `/internal/agent-api${path}`, body);
+    return { ok: true, data };
+  } catch (e) {
+    const err = e as { httpStatus?: unknown; code?: unknown; raftMessage?: unknown };
+    return {
+      ok: false, status: typeof err.httpStatus === "number" ? err.httpStatus : null, code: typeof err.code === "string" ? err.code : null,
+      ...(typeof err.raftMessage === "string" ? { message: err.raftMessage } : {}),
+    } satisfies RaftAnswer;
+  }
+};
+
+/** Raft's flag (`assistantOf.raftCheck`) as the credential context says it now, or null when it cannot be read. */
+async function readRaftCheck(ctx: PluginContext): Promise<boolean | null> {
+  if (!ctx.credential) return null;
+  const me = await raftFor(ctx, { state: false }).routes.agent.context();
+  if (!me.ok) return null;
+  const of = me.data.agent.assistantOf as Record<string, unknown> | null | undefined;
+  return !!of && of.raftCheck === true;
+}
+
 /** Kept by the listing; a failure to keep it must not fail the listing, and leaves the last record as it was. */
 async function keepOwner(ctx: PluginContext, context: OwnerContext): Promise<void> {
-  try { await keepOwnerFromContext(ctx, context); }
+  try {
+    await keepOwnerFromContext(ctx, context);
+    // Raft's flag seen on by this listing: the switch-over import goes now, not at the next wake, which may be Raft's
+    // first brief (`pushBriefImport`; a failure is kept for the wakes to retry, and never fails the listing).
+    await pushBriefImport(ctx, assistantApi, Date.now()).catch(() => null);
+  }
   catch (e) { console.warn(`raft assistant owner could not be kept for mount ${ctx.alias}: ${String((e as Error)?.message ?? e)}`); }
 }
 
@@ -3601,7 +3643,7 @@ async function receiveNotice(payload: ObjectValue, inbound: InboundEvent, ctx: P
   const assistant = (await loadOwner(ctx)) !== null;
   const bells = assistant ? payload.targets.filter(isDoorbellTarget) : [];
   const change = bells.length > 0 ? await doorbellChange(ctx, bells) : null;
-  const bell = change !== null && await noteDoorbell(ctx, Date.now(), change.firstChangeAt, change.sources);
+  const bell = change !== null && await noteDoorbell(ctx, Date.now(), change.firstChangeAt, change.sources, change.checks);
   if (bell && payload.targets.every(isDoorbellTarget)) {
     return { deliver: false, wake: true, reason: "an assistant's doorbell, for its code to check", dedupeKey: payload.noticeId };
   }
@@ -3626,9 +3668,10 @@ async function receiveNotice(payload: ObjectValue, inbound: InboundEvent, ctx: P
  * receive_events keeps alone). Null and no sources is the old behaviour: the wake decides on its first read. `last_change_at` is when
  * Raft sent the doorbell, not when anything changed, so it says nothing about whether a read is recent enough.
  */
-async function doorbellChange(ctx: PluginContext, targets: readonly unknown[]): Promise<{ firstChangeAt: string | null; sources: ChangeSources }> {
+async function doorbellChange(ctx: PluginContext, targets: readonly unknown[]): Promise<{ firstChangeAt: string | null; sources: ChangeSources; checks: Array<RaftCheck | RefusedCheck> }> {
   let earliest: string | null = null, sources: ChangeSources = {};
-  if (!ctx.credential) return { firstChangeAt: earliest, sources };
+  const checks: Array<RaftCheck | RefusedCheck> = [];
+  if (!ctx.credential) return { firstChangeAt: earliest, sources, checks };
   for (const t of targets) {
     const channel = (t as { target: string }).target;
     try {
@@ -3636,13 +3679,15 @@ async function doorbellChange(ctx: PluginContext, targets: readonly unknown[]): 
       const bell = out.ok ? doorbellOf(out.data.messages[0]) : null;
       const at = bell?.firstChangeAt ?? null;
       if (bell) sources = mergeSources(sources, bell.sources);
+      // Raft's check for this doorbell or brief, when it ran one (`payload.check`).
+      if (bell?.check) checks.push(bell.check);
       if (at !== null && (earliest === null || Date.parse(at) < Date.parse(earliest))) earliest = at;
       if (at === null) logEvent("raft.doorbell_unread", { tenantId: ctx.caller.tenantId, agentId: ctx.caller.agentId, mount: ctx.alias, ok: out.ok });
     } catch (e) {
       logEvent("raft.doorbell_unread", { tenantId: ctx.caller.tenantId, agentId: ctx.caller.agentId, mount: ctx.alias, error: String((e as Error)?.message ?? e).slice(0, 120) });
     }
   }
-  return { firstChangeAt: earliest, sources };
+  return { firstChangeAt: earliest, sources, checks };
 }
 
 /**

@@ -92,7 +92,7 @@ export const TRACE_KINDS = ["model.call", "tool.call", "approval.wait", "contain
   "turn.stop", "js.run",
   "rebuild.decision", "rebuild.outcome", "rebuild.behaviour", "session.needs_reset", "turn.timing", "turn.end_unrecorded", "import.hold", "model.prewarm",
   "agent.ready", "mount.settings", "subagent.start", "subagent.turn", "subagent.model_changed", "github.refresh", "raft.held", "raft.held_answer", "raft.state_failed", "raft.state_save_failed", "raft.mcp_call",
-  "raft.assistant_wake", "raft.assistant_notify", "raft.assistant_rules", "raft.assistant_chat_told", "raft.assistant_send_as_owner", "raft.turn_ended"] as const;
+  "raft.assistant_wake", "raft.assistant_notify", "raft.assistant_rules", "raft.assistant_chat_told", "raft.assistant_send_as_owner", "raft.turn_ended", "raft.assistant_check"] as const;
 export type TraceKind = (typeof TRACE_KINDS)[number];
 
 /**
@@ -119,10 +119,13 @@ export type TraceKind = (typeof TRACE_KINDS)[number];
  * (`target_kind`), `in_thread`, the message's length (`chars`) and Raft's HTTP `status`, never the message, a name or an
  * id (src/plugins/raft-assistant.ts `sendAsOwner`). `raft.turn_ended` is
  * Raft's answer to one turn's `turnEnded` report: `settled`, `skipped` (with Raft's reason) or `unreadable`, and how many
- * conversations the report named, never which (src/plugins/raft.ts `reportTurnEnd`).
+ * conversations the report named, never which (src/plugins/raft.ts `reportTurnEnd`). `raft.assistant_check` is a check
+ * Raft runs (RFC 077 step 2): status `turn_ended` with the check's id, trigger, outcome and a failure's `error_code`
+ * (`checkEnded`), or `import_sent` / `import_skipped` / `import_failed` for the switch-over import, with attempts and
+ * Raft's status and code (`pushBriefImport`); never text.
  */
 export const PLUGIN_TRACE_KINDS = ["raft.held", "raft.held_answer", "raft.state_failed", "raft.mcp_call", "raft.assistant_wake", "raft.assistant_notify",
-  "raft.assistant_rules", "raft.assistant_chat_told", "raft.assistant_send_as_owner", "raft.turn_ended"] as const satisfies readonly TraceKind[];
+  "raft.assistant_rules", "raft.assistant_chat_told", "raft.assistant_send_as_owner", "raft.turn_ended", "raft.assistant_check"] as const satisfies readonly TraceKind[];
 export type PluginTraceKind = (typeof PLUGIN_TRACE_KINDS)[number];
 
 export const TRACE_VERDICTS = ["ok", "failed", "blocked", "cancelled"] as const;

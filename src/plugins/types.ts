@@ -347,6 +347,12 @@ export interface PluginContext {
      * turn record (pd). Compare it for equality only.
      */
     turnId?: string;
+    /**
+     * In a short session this mount asked for ({@link PluginNext.isolated}), the `turnKey` it gave with it, so a call
+     * can tell which of its short sessions it is made in. Only ever this mount's own key: absent for any other mount's
+     * call, for the main conversation, and for a short session asked for without a key.
+     */
+    turnKey?: string;
   };
   /**
    * The gateway's id for the operation this context serves. Opaque; compare it for equality only. Use it as the
@@ -2338,7 +2344,8 @@ export interface Plugin {
    *   after this returns, on the alarm pass after it. An eviction in between asks again, so what this does must be
    *   safe to do twice: a plugin keeps its own progress in `ctx.db` and reads it first.
    * - **Only the main conversation**, never a subagent's, and only for a mount whose plugin declares this, is switched
-   *   on and is the version the mount pins.
+   *   on and is the version the mount pins. The one exception is a short session a mount asked for with a `turnKey`
+   *   ({@link PluginNext.isolated}): its end is told to that mount alone, as {@link TurnEnd.isolated}, with no text.
    * - **A throw is logged and the end is dropped**, so a failing hook cannot wake the agent for ever.
    *
    * The answer ({@link PluginNext}) is what the plugin asks for next: a new turn with the text it gives, or a later
@@ -2368,6 +2375,12 @@ export interface TurnEnd {
   /** The turn's last assistant text, or null when it ended with none (a tool call cut short, an error, a cancel). */
   finalText: string | null;
   outcome: "completed" | "failed" | "cancelled";
+  /**
+   * Present, and true, for the end of a short session this mount asked for ({@link PluginNext.isolated}) with a
+   * `turnKey`: told to that mount alone, with `finalText` null and no `error` text (only `errorCode`), since what such a
+   * session read is not to outlive it. Absent for every turn of the main conversation.
+   */
+  isolated?: true;
   /** For `failed`: what the model or the run reported. */
   error?: string;
   /**
@@ -2424,6 +2437,13 @@ export interface PluginNext {
    * in, the conversation a person is having with the agent. pi085 only: on pd the answer is logged and dropped.
    */
   isolated?: true;
+  /**
+   * With `isolated`: the bare names of this mount's tools the short session may be offered, at most. It narrows what
+   * the runtime would offer the session anyway and never widens it: a name the session would not be offered is
+   * ignored, and the session's tools on other mounts (a parked-result reader) are left as they are. Absent: no
+   * narrowing. Kept with the session (src/runtime/isolated-session.ts) and applied to every call of its run.
+   */
+  tools?: readonly string[];
   /**
    * End the main conversation's running turn, as the runtime's own cancel does (`AgentRuntime.cancelSession`): the run
    * is aborted and its model job dropped, so a call not yet taken is never made and an answer that arrives later is
