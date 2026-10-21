@@ -875,7 +875,14 @@ mentions and a preview of the latest message) and `assistant_owner_messages`
 `before`, `after` and `around`). Since Raft RFC 077 they include the owner's DMs
 with other people unless the owner turned that off (a DM row is kind `channel`
 with `channelType` `dm`, the other person named only by `channelName`; the inbox
-lines show `channelType`), and never the DM between the assistant and its owner. They are
+lines show `channelType`), and never the DM between the assistant and its owner. The inbox's
+`filter` is `unread` (the default), `all`, `mentions`, `unread_mentions` or `untold`: unread and
+not yet told to the owner (Raft's `assistant_told`, by seq; what the assistant skipped counts as
+not told). Each line shows its `told` and the result says the answer's `total` (how many match,
+across every page) when Raft sends them. Until Raft and the SDK take `untold`, a read with it
+that is answered 400, refused by the SDK's contract, or answered with no numeric `total` is read
+once more, the same page with `unread`, and the result opens with a note that told state is
+unavailable and there is no count of what remains; no other failure is retried. They are
 read-only and model-only, and offered only when the mount's snapshot lists
 them, which it does when the same credential context names whose assistant the
 account is (`agent.assistantOf` with a `userId`): never with the tools every mount
@@ -962,7 +969,10 @@ cannot confirm is replaced by the conversation's first unread message; an item a
 dropped, as is one a rule mutes; one a digest rule covers, and everything in the owner's quiet hours but
 what an `anytime` rule covers, is kept for the brief. A `#channel:msgid` the assistant sends its owner in
 their chat (the answer to "more") counts as told too, so the next wake does not bring it back
-(`noteToldInChat`, a `raft.assistant_chat_told` row with the count).
+(`noteToldInChat`, a `raft.assistant_chat_told` row with the count). The chat prompt answers "more"
+and "what's new" from an inbox read with `untold`, at most three lines, and says how many are left
+only from the read's `total`, never from its own count or memory, and with no number when the read
+says told state is unavailable.
 
 When Raft runs the check (RFC 077 step 2), it says so in the credential context, `assistantOf.raftCheck: true`, and
 that flag is the only switch: read at every listing, when the brief's timer fires and when a check arrives on a stale

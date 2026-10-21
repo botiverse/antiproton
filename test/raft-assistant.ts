@@ -7,7 +7,7 @@
 // would refuse first.
 //
 //   node test/raft-assistant.ts
-import { GENERATED, RAFTBENCH_TOOL, createRaftPlugin, isAssistantOf, OWNER_ERROR_TEXT_MAX, type AssistantWire, type OwnerAnswer, type OwnerInboxRequest, type OwnerMessagesRequest } from "../src/plugins/raft.ts";
+import { GENERATED, RAFTBENCH_TOOL, UNTOLD_UNKNOWN, createRaftPlugin, isAssistantOf, OWNER_ERROR_TEXT_MAX, type AssistantWire, type OwnerAnswer, type OwnerInboxRequest, type OwnerMessagesRequest } from "../src/plugins/raft.ts";
 import { toolsOf, type PluginErrorFields } from "../src/plugins/types.ts";
 import { admitTools } from "../src/runtime/mount-tools.ts";
 import { ToolGateway } from "../src/runtime/gateway.ts";
@@ -64,11 +64,15 @@ function ctx(offered?: readonly string[], credential: string | null = "sk_agent_
   };
 }
 
-/** A wire that answers as told and records what it was asked. */
-function fakeWire(o: { inbox?: OwnerAnswer; messages?: OwnerAnswer } = {}) {
+/** A wire that answers as told and records what it was asked; an inbox list is its answers in turn. */
+function fakeWire(o: { inbox?: OwnerAnswer | OwnerAnswer[]; messages?: OwnerAnswer } = {}) {
   const asked = { inbox: [] as OwnerInboxRequest[], messages: [] as OwnerMessagesRequest[] };
   const wire: AssistantWire = {
-    async ownerInbox(_ctx, request) { asked.inbox.push(request); return o.inbox ?? { ok: true, data: { items: [], hasMore: false, nextOffset: null } }; },
+    async ownerInbox(_ctx, request) {
+      asked.inbox.push(request);
+      const answer = Array.isArray(o.inbox) ? o.inbox[asked.inbox.length - 1] : o.inbox;
+      return answer ?? { ok: true, data: { items: [], hasMore: false, nextOffset: null } };
+    },
     async ownerMessages(_ctx, request) { asked.messages.push(request); return o.messages ?? { ok: true, data: { messages: [], hasMore: false, hasOlder: false, hasNewer: false } }; },
   };
   return { wire, asked };
@@ -482,6 +486,76 @@ await check("inbox items render one JSON line each, so a preview's line break ca
   must(lines[4] === "hasMore=true nextOffset=20", `paging: ${lines[4]}`);
 });
 
+// ---- untold: what the owner was not told yet ---------------------------------------------------------------------------
+
+const untoldAnswer = (extra: Record<string, unknown> = {}): OwnerAnswer => ({ ok: true, data: {
+  owner: OWNER, filter: "untold", items: [inboxItem({ told: false }), inboxItem({ channelId: "ch-2", told: true })], hasMore: true, nextOffset: 2, total: 7, ...extra,
+} });
+const unreadAnswer: OwnerAnswer = { ok: true, data: { owner: OWNER, filter: "unread", items: [inboxItem()], hasMore: false, nextOffset: null } };
+
+await check("untold goes to the wire as filter untold; each line's told and the answer's total are shown, with no fallback note", async () => {
+  const { plugin, asked } = pluginWith({ inbox: untoldAnswer() });
+  const lines = String(await plugin.invoke(INBOX, { filter: "untold", limit: 2, offset: 4 }, ctx(ASSISTANT).ctx)).split("\n");
+  must(JSON.stringify(asked.inbox) === JSON.stringify([{ filter: "untold", limit: 2, offset: 4 }]), `inbox asked: ${JSON.stringify(asked.inbox)}`);
+  must(/^\[your owner's Raft inbox/.test(lines[0]!) && !lines.includes(UNTOLD_UNKNOWN), `first line: ${lines[0]}`);
+  must(JSON.parse(lines[1]!).told === false && JSON.parse(lines[2]!).told === true, `told: ${lines[1]} | ${lines[2]}`);
+  must(lines[3] === "7 match the filter untold in total, across all pages." && lines[4] === "hasMore=true nextOffset=2" && lines.length === 5, `tail: ${JSON.stringify(lines)}`);
+  // Control: an answer with neither (any other filter, today's Raft) renders as it did, no told key and no total line.
+  const { plugin: plain } = pluginWith({ inbox: unreadAnswer });
+  const out = String(await plain.invoke(INBOX, {}, ctx(ASSISTANT).ctx)).split("\n");
+  must(out.length === 3 && !("told" in JSON.parse(out[1]!)) && out[2] === "hasMore=false nextOffset=null", `plain: ${JSON.stringify(out)}`);
+  // A told or a total that is not one is malformed, not shown.
+  for (const [what, bad] of [["told", untoldAnswer({ items: [inboxItem({ told: "yes" })] })], ["total", untoldAnswer({ total: -1 })]] as const) {
+    const { plugin: p } = pluginWith({ inbox: bad });
+    const e = await failure(() => p.invoke(INBOX, { filter: "untold" }, ctx(ASSISTANT).ctx));
+    must(/not in the expected shape/.test(e.message), `${what}: ${e.message}`);
+  }
+});
+
+await check("untold answered 400, or with no numeric total: read once more with unread, same page, opening with the note and no total", async () => {
+  for (const [what, first] of [
+    ["400", { ok: false, status: 400, code: "invalid_filter" }],
+    ["no total", untoldAnswer({ total: undefined })],
+    ["a total that is not a number", untoldAnswer({ total: "7" })],
+  ] as const) {
+    // The unread re-read carries a total of its own: not shown, since unread is not what remains untold.
+    const { plugin, asked } = pluginWith({ inbox: [first as OwnerAnswer, { ok: true, data: { ...(unreadAnswer as any).data, total: 12 } }] });
+    const lines = String(await plugin.invoke(INBOX, { filter: "untold", limit: 3, offset: 6 }, ctx(ASSISTANT).ctx)).split("\n");
+    must(JSON.stringify(asked.inbox) === JSON.stringify([{ filter: "untold", limit: 3, offset: 6 }, { filter: "unread", limit: 3, offset: 6 }]), `${what}: asked ${JSON.stringify(asked.inbox)}`);
+    must(lines[0] === UNTOLD_UNKNOWN && /^\[your owner's Raft inbox/.test(lines[1]!), `${what}: head ${JSON.stringify(lines.slice(0, 2))}`);
+    must(/Told state is unavailable/.test(UNTOLD_UNKNOWN) && /Do not state a number/.test(UNTOLD_UNKNOWN), UNTOLD_UNKNOWN);
+    must(!lines.some((l) => /in total/.test(l)) && lines.at(-1) === "hasMore=false nextOffset=null" && lines.length === 4, `${what}: ${JSON.stringify(lines)}`);
+  }
+  // Once: the re-read failing too is said as it is, with no third read.
+  const { plugin, asked } = pluginWith({ inbox: [{ ok: false, status: 400 }, { ok: false, status: 400, code: "bad_request" }, unreadAnswer] });
+  const e = await failure(() => plugin.invoke(INBOX, { filter: "untold" }, ctx(ASSISTANT).ctx));
+  must(e.message === "400 bad_request" && asked.inbox.length === 2, `twice: ${e.message} ${JSON.stringify(asked.inbox)}`);
+  // Only untold falls back: unread answered 400 is a failure.
+  const { plugin: p2, asked: a2 } = pluginWith({ inbox: [{ ok: false, status: 400 }, unreadAnswer] });
+  const e2 = await failure(() => p2.invoke(INBOX, { filter: "unread" }, ctx(ASSISTANT).ctx));
+  must(e2.message === "400" && a2.inbox.length === 1, `unread 400: ${e2.message} ${JSON.stringify(a2.inbox)}`);
+});
+
+await check("untold answered any other failure is not retried: said as it is, after one read", async () => {
+  for (const failed of [
+    { ok: false as const, status: 403, code: "assistant_not_enabled" },
+    { ok: false as const, status: 404, code: "not_found" },
+    { ok: false as const, status: 429 },
+    { ok: false as const, status: 503, message: "busy" },
+  ]) {
+    const { plugin, asked } = pluginWith({ inbox: [failed, unreadAnswer] });
+    const e = await failure(() => plugin.invoke(INBOX, { filter: "untold" }, ctx(ASSISTANT).ctx));
+    must(e.message.startsWith(String(failed.status)) && asked.inbox.length === 1, `${failed.status}: ${e.message} ${JSON.stringify(asked.inbox)}`);
+  }
+});
+
+await check("through the SDK: untold, which the SDK's contract does not take yet, is not sent; one read with unread, the same page, with the note", async () => {
+  const { plugin, urls } = realWire(() => json(200, inboxAnswer()));
+  const lines = String(await plugin.invoke(INBOX, { filter: "untold", limit: 5, offset: 10 }, ctx(ASSISTANT).ctx)).split("\n");
+  must(urls.length === 1 && JSON.stringify(query(urls[0]!)) === JSON.stringify({ filter: "unread", limit: "5", offset: "10" }), `requests: ${JSON.stringify(urls)}`);
+  must(lines[0] === UNTOLD_UNKNOWN && /^\[your owner's Raft inbox/.test(lines[1]!), `head: ${JSON.stringify(lines.slice(0, 2))}`);
+});
+
 await check("each read is parsed in its own naming: the other style is refused as malformed, never read as undefined", async () => {
   const snakeMessages = { messages: [envelope(1, "x")], has_more: false, has_older: false, has_newer: false };
   const snakeInbox = { items: [], has_more: false, next_offset: null };
@@ -521,7 +595,7 @@ await check("arguments: at most one anchor, limits within Raft's bounds, a known
     ["no channelId", MESSAGES, {}, /channelId is required/],
     ["an empty anchor", MESSAGES, { channelId: "c", before: " " }, /before must be/],
     ["inbox limit over 50", INBOX, { limit: 51 }, /limit must be an integer from 1 to 50/],
-    ["unknown filter", INBOX, { filter: "dms" }, /filter must be one of unread, all, mentions, unread_mentions/],
+    ["unknown filter", INBOX, { filter: "dms" }, /filter must be one of unread, all, mentions, unread_mentions, untold$/],
     ["negative offset", INBOX, { offset: -1 }, /offset must be a non-negative integer/],
   ] as const) {
     const e = await failure(() => plugin.invoke(name, args, ctx(ASSISTANT).ctx)).catch((err) => { throw new Error(`${what}: ${err.message}`); });
