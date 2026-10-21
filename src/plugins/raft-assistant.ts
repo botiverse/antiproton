@@ -57,7 +57,7 @@ import { isIsolatedSession } from "../runtime/isolated-session.ts";
 import { modelToolName } from "../runtime/pi-tools.ts";
 import type { PluginContext, PluginNext, ToolSchema, TurnEnd } from "./types.ts";
 import {
-  CHECK_COUNT_KEYS, checkOf as raftCheckOf, checkOfTurnKey, checkTools, checkTurnKey, notifyIdempotencyKey, substituteTools,
+  CHECK_COUNT_KEYS, CHECK_INSTRUCTION_MAX_UTF8, checkOf as raftCheckOf, utf8Length, checkOfTurnKey, checkTools, checkTurnKey, notifyIdempotencyKey, substituteTools,
   type CheckTrigger, type RaftCheck, type RefusedCheck,
 } from "./raft-assistant-check.ts";
 import {
@@ -366,18 +366,33 @@ export async function keepOwnerFromContext(ctx: PluginContext, context: OwnerCon
     ownerName: name, selfName: typeof context.agent.name === "string" && context.agent.name ? context.agent.name : null,
     raftCheck: extra.raftCheck === true,
   };
-  await saveOwner(ctx, owner);
+  const next = same ? await modeChanged(ctx, same.raftCheck, owner, Date.now()) : owner;
+  await saveOwner(ctx, next);
   if (owner.raftCheck && !same?.raftCheck) await askBriefImport(ctx, owner);
-  return owner;
+  return next;
+}
+
+/**
+ * Raft's flag turned off (a rollback) after the brief's hour today: Raft briefed this morning, or was the one to, so the
+ * day is counted as briefed here too (`lastBrief`, `briefSent`) and this file's own brief does not repeat it. Turned off
+ * before the brief's hour, today's brief is this file's, as before. The owner as it is to be kept.
+ */
+async function modeChanged(_ctx: PluginContext, before: boolean, owner: AssistantOwner, now: number): Promise<AssistantOwner> {
+  if (!before || owner.raftCheck) return owner;
+  const zone = zoneOf(owner);
+  const hour = wallClock(now, zone).h;
+  if (hour < BRIEF_HOUR) return owner;
+  const today = localDay(now, zone);
+  return { ...owner, lastBrief: laterDay(owner.lastBrief, today), briefSent: laterDay(owner.briefSent, today) };
 }
 
 /**
  * Raft's flag as read again (`WakeDeps.mode`), kept on the owner record: the first time it reads true for this owner,
  * the switch-over import is asked for (`pushBriefImport`). The record as now kept.
  */
-export async function noteMode(ctx: PluginContext, owner: AssistantOwner, raftCheck: boolean): Promise<AssistantOwner> {
+export async function noteMode(ctx: PluginContext, owner: AssistantOwner, raftCheck: boolean, now = Date.now()): Promise<AssistantOwner> {
   if (owner.raftCheck === raftCheck) return owner;
-  const next = { ...owner, raftCheck };
+  const next = await modeChanged(ctx, owner.raftCheck, { ...owner, raftCheck }, now);
   await saveOwner(ctx, next);
   if (raftCheck) await askBriefImport(ctx, next);
   return next;
@@ -444,6 +459,8 @@ const codeOf = (code: string | null | undefined, fallback: string) => (code && /
  */
 export const BRIEF_IMPORT_KEY = "brief_import";
 export const BRIEF_IMPORT_RETRY_MS: readonly number[] = [60_000, 5 * 60_000, 30 * 60_000, 2 * 3_600_000, 6 * 3_600_000];
+/** Tries before the import is given up (`import_gave_up`): one more than the backoff has steps, about nine hours in all. */
+export const BRIEF_IMPORT_ATTEMPTS_MAX = BRIEF_IMPORT_RETRY_MS.length + 1;
 interface BriefImport { userId: string; done: boolean; attempts: number; nextAt: number }
 
 function briefImportOf(raw: unknown): BriefImport | null {
@@ -469,7 +486,7 @@ export async function pushBriefImport(ctx: PluginContext, api: AssistantApi | un
   if (kept.nextAt > now) return kept.nextAt;
   const briefSent = laterDay(owner.lastBrief, owner.briefSent);
   const trace = (status: string, attrs: Record<string, number | string>) => {
-    ctx.trace?.({ kind: "raft.assistant_check", status, verdict: status === "import_failed" ? "failed" : "ok", attrs });
+    ctx.trace?.({ kind: "raft.assistant_check", status, verdict: status === "import_failed" || status === "import_gave_up" ? "failed" : "ok", attrs });
     logEvent("raft.assistant_check", { tenantId: ctx.caller.tenantId, agentId: ctx.caller.agentId, mount: ctx.alias, status, ...attrs });
   };
   if (briefSent === null) {
@@ -486,9 +503,16 @@ export async function pushBriefImport(ctx: PluginContext, api: AssistantApi | un
   }
   if (out.code === NOT_ENABLED) await pauseOn(ctx, new Error(NOT_ENABLED));
   const attempts = kept.attempts + 1;
+  const failure = { attempts, ...(out.status !== null ? { http_status: out.status } : {}), code: codeOf(out.code, out.status === null ? "no_answer" : "http") };
+  if (attempts >= BRIEF_IMPORT_ATTEMPTS_MAX) {
+    // Not for ever: past this, a day of the switch may get a second brief, which the row says.
+    await ctx.db.put(ASSISTANT_STORE, { ...kept, done: true, attempts } as unknown as Json, BRIEF_IMPORT_KEY);
+    trace("import_gave_up", failure);
+    return null;
+  }
   const nextAt = now + BRIEF_IMPORT_RETRY_MS[Math.min(attempts, BRIEF_IMPORT_RETRY_MS.length) - 1]!;
   await ctx.db.put(ASSISTANT_STORE, { ...kept, attempts, nextAt } as unknown as Json, BRIEF_IMPORT_KEY);
-  trace("import_failed", { attempts, ...(out.status !== null ? { http_status: out.status } : {}), code: codeOf(out.code, out.status === null ? "no_answer" : "http") });
+  trace("import_failed", failure);
   return nextAt;
 }
 
@@ -823,7 +847,7 @@ async function notifyRaft(
 ): Promise<{ out: Record<string, unknown>; attrs: Record<string, number | string> }> {
   const a = args && typeof args === "object" && !Array.isArray(args) ? args as Record<string, unknown> : {};
   const given = Array.isArray(a.items) ? a.items.length : 0;
-  const base = { notifyState: "", given, forwarded: 1, ...(check ? { check_id: check.id, trigger: check.trigger } : {}) };
+  const base = { notifyState: "", given, forwarded: check ? 1 : 0, ...(check ? { check_id: check.id, trigger: check.trigger } : {}) };
   const notSent = (code: string, note: string, extra: Record<string, number | string> = {}) =>
     ({ out: { state: "not_sent", code, note }, attrs: { ...base, notifyState: "not_sent", sent: 0, code, ...extra } });
   if (!check) {
@@ -1435,8 +1459,10 @@ export async function preferences(args: unknown, ctx: PluginContext, deps: Prefe
  * Raft's words (written for the model) with its code; its trace row says `via: raft` and the refusal's code only.
  */
 async function preferencesRaft(a: Record<string, unknown>, action: string, ctx: PluginContext, owner: AssistantOwner, api: AssistantApi): Promise<Json> {
+  // The action as the row says it: one this tool knows, never the model's own word.
+  const known = ["add", "list", "remove", "quiet", "timezone", "mute", "unmute"].includes(action) ? action : "other";
   const trace = (attrs: Record<string, string | number>) => {
-    const row = { action, via: "raft", ...attrs };
+    const row = { action: known, via: "raft", ...attrs };
     ctx.trace?.({ kind: "raft.assistant_rules", status: String(attrs.result), verdict: "ok", attrs: row });
     logEvent("raft.assistant_rules", { tenantId: ctx.caller.tenantId, agentId: ctx.caller.agentId, mount: ctx.alias, ...row });
   };
@@ -1498,11 +1524,23 @@ async function preferencesRaft(a: Record<string, unknown>, action: string, ctx: 
   }
   if (action === "remove" || action === "unmute") {
     if (a.all === true && action === "remove") {
+      // Raft has no bulk delete: one at a time, and a failure part-way is said as it is, with what is left, never as all gone.
       const d = await ask("GET", "/assistant/contact-rules");
-      const ids = (Array.isArray(d.rules) ? d.rules : []).map((r) => (r && typeof r === "object" ? str((r as Record<string, unknown>).id) : "")).filter(Boolean);
-      for (const id of ids) await ask("DELETE", `/assistant/contact-rules/${encodeURIComponent(id)}`);
-      trace({ result: "removed_all", removed: ids.length });
-      return { state: "removed", removed: ids.length, confirm: ids.length ? "All your rules are gone; the defaults apply." : "You had no rules; the defaults apply." };
+      const rules = (Array.isArray(d.rules) ? d.rules : []).filter((r): r is Record<string, unknown> => !!r && typeof r === "object" && !!str((r as Record<string, unknown>).id));
+      let removed = 0;
+      for (const r of rules) {
+        const out = await api(ctx, "DELETE", `/assistant/contact-rules/${encodeURIComponent(str(r.id))}`);
+        if (out.ok || out.code === "contact_rule_not_found") { removed++; continue; }
+        if (out.code === NOT_ENABLED) await pauseOn(ctx, new Error(NOT_ENABLED));
+        const left = rules.slice(removed);
+        trace({ result: "removed_partial", removed, left: left.length, code: codeOf(out.code, out.status === null ? "no_answer" : `http_${out.status}`) });
+        return {
+          state: "removed_partial", removed, left: left.map((x) => ({ id: str(x.id), line: str(x.line) })),
+          confirm: `I removed ${removed} of your ${rules.length} rules; Raft stopped me there, so ${left.length} ${left.length === 1 ? "is" : "are"} still in place.`,
+        } as unknown as Json;
+      }
+      trace({ result: "removed_all", removed });
+      return { state: "removed", removed, confirm: removed ? "All your rules are gone; the defaults apply." : "You had no rules; the defaults apply." };
     }
     const id = str(a.id).trim();
     if (id.length < 8 || id.length > 36) return refuse("no_such_rule", `no rule has the id ${JSON.stringify(a.id)}: list them first`);
@@ -1901,11 +1939,12 @@ export async function noteDoorbell(
 ): Promise<boolean> {
   const owner = await loadOwner(ctx);
   if (!owner) return false;
-  for (const c of checks) await keepCheck(ctx, c, now);
-  // Raft decides what changed and when it is shown: nothing is awaited here, and the wake posts Raft's check.
-  if (owner.raftCheck) {
-    if (owner.doorbellAt === null) await saveOwner(ctx, { ...owner, doorbellAt: now });
-    return true;
+  // A check this build will not post is said now, on its own row, and never kept: kept, it would take the place of a
+  // pending check it could not stand in for. The doorbell itself is noted as ever, so a flag Raft has turned off since
+  // (read again by the wake) leaves the local check everything it needs.
+  for (const c of checks) {
+    if ("refused" in c) refusedCheck(ctx, c);
+    else await keepCheck(ctx, c, now);
   }
   const changeAt = owner.changeAt === null || (firstChangeAt !== null && Date.parse(firstChangeAt) < Date.parse(owner.changeAt)) ? firstChangeAt ?? owner.changeAt : owner.changeAt;
   const changeSources = mergeSources(owner.changeSources, sources);
@@ -1921,7 +1960,7 @@ export async function noteDoorbell(
  * one is kept too, so its wake can say why on its trace row.
  */
 export const PENDING_CHECKS_KEY = "raft_checks";
-type PendingCheck = (RaftCheck | RefusedCheck) & { at: number };
+type PendingCheck = RaftCheck & { at: number };
 
 function pendingOf(raw: unknown): Partial<Record<CheckTrigger, PendingCheck>> {
   const o = raw && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, unknown> : {};
@@ -1930,13 +1969,31 @@ function pendingOf(raw: unknown): Partial<Record<CheckTrigger, PendingCheck>> {
   return out;
 }
 
-async function keepCheck(ctx: PluginContext, check: RaftCheck | RefusedCheck, now: number): Promise<void> {
+/** A check refused as it arrived: its `raft.assistant_wake` row, `check_refused` with the reason. Never its text. */
+function refusedCheck(ctx: PluginContext, c: RefusedCheck): void {
+  const attrs = {
+    ...(c.trigger ? { trigger: c.trigger } : {}), ...(c.id !== null ? { check_id: c.id } : {}), raft_check: true, reason: c.refused,
+    ...(c.instructionBytes !== undefined ? { instruction_bytes: c.instructionBytes } : {}),
+  };
+  ctx.trace?.({ kind: "raft.assistant_wake", status: "check_refused", verdict: "ok", attrs });
+  logEvent("raft.assistant_wake", { tenantId: ctx.caller.tenantId, agentId: ctx.caller.agentId, mount: ctx.alias, outcome: "check_refused", ...attrs });
+}
+
+async function keepCheck(ctx: PluginContext, check: RaftCheck, now: number): Promise<void> {
   const kept = pendingOf(await ctx.db.get(ASSISTANT_STORE, PENDING_CHECKS_KEY));
-  kept[check.trigger ?? "doorbell"] = { ...check, at: now };
+  kept[check.trigger] = { ...check, at: now };
   await ctx.db.put(ASSISTANT_STORE, kept as unknown as Json, PENDING_CHECKS_KEY);
 }
 
 /** The oldest pending check, taken, and how many are left after it. */
+/** Every pending check, taken, for a wake that will not post them (`raft_check_off`). */
+async function dropChecks(ctx: PluginContext): Promise<PendingCheck[]> {
+  const kept = pendingOf(await ctx.db.get(ASSISTANT_STORE, PENDING_CHECKS_KEY));
+  const all = (["doorbell", "brief"] as const).flatMap((t) => (kept[t] ? [kept[t]!] : []));
+  if (all.length) await ctx.db.put(ASSISTANT_STORE, {} as unknown as Json, PENDING_CHECKS_KEY);
+  return all;
+}
+
 async function takeCheck(ctx: PluginContext): Promise<{ check: PendingCheck; left: number } | null> {
   const kept = pendingOf(await ctx.db.get(ASSISTANT_STORE, PENDING_CHECKS_KEY));
   const all = (["doorbell", "brief"] as const).flatMap((t) => (kept[t] ? [[t, kept[t]!] as const] : [])).sort(([, a], [, b]) => a.at - b.at);
@@ -2299,9 +2356,13 @@ export interface WakeDeps {
 }
 
 /** Raft's flag read again, kept; the owner as now kept. A read that fails leaves the kept flag. */
-async function readMode(ctx: PluginContext, deps: WakeDeps, owner: AssistantOwner): Promise<AssistantOwner> {
+async function readMode(ctx: PluginContext, deps: WakeDeps, owner: AssistantOwner, now = Date.now()): Promise<AssistantOwner> {
   const m = deps.mode ? await deps.mode(ctx).catch(() => null) : null;
-  return m === null ? owner : noteMode(ctx, owner, m);
+  if (m === null) return owner;
+  const next = await noteMode(ctx, owner, m, now);
+  // Seen on just now: the switch-over import goes at once, before any check of Raft's can brief (`pushBriefImport`).
+  if (m && !owner.raftCheck) await pushBriefImport(ctx, deps.api, now).catch(() => null);
+  return next;
 }
 
 /**
@@ -2315,18 +2376,13 @@ async function readMode(ctx: PluginContext, deps: WakeDeps, owner: AssistantOwne
  */
 async function raftCheckWake(ctx: PluginContext, deps: WakeDeps, owner0: AssistantOwner, taken: { check: PendingCheck; left: number }, now: number): Promise<PluginNext> {
   const c = taken.check;
-  const trigger: CheckTrigger = c.trigger ?? "doorbell";
-  let owner: AssistantOwner = { ...owner0, pausedAt: null, doorbellAt: null, changeAt: null, changeSources: {}, lagReads: 0 };
+  const trigger: CheckTrigger = c.trigger;
+  const owner: AssistantOwner = { ...owner0, pausedAt: null, doorbellAt: null, changeAt: null, changeSources: {}, lagReads: 0 };
   await saveOwner(ctx, owner);
-  if (!owner.raftCheck) owner = await readMode(ctx, deps, owner);
   const zone = zoneOf(owner), next = nextBriefAt(now, zone), day = localDay(now, zone);
   const retry = await pushBriefImport(ctx, deps.api, now).catch(() => null);
   const wakeAt = taken.left > 0 ? now : retry !== null ? Math.min(retry, next) : next;
-  const id: Record<string, string> = c.id !== null ? { check_id: c.id } : {};
-  if ("refused" in c) {
-    await record(ctx, day, trigger, "check_refused", { ...id, raft_check: true, reason: c.refused, ...(c.instructionLength !== undefined ? { instruction_length: c.instructionLength } : {}) });
-    return { wakeAt };
-  }
+  const id: Record<string, string> = { check_id: c.id };
   const { tools, dropped } = checkTools(c.allowedTools, CHECK_TOOLS);
   // The turn exists to call notify once: without it there is nothing it could do.
   if (!tools.includes(NOTIFY_TOOL)) {
@@ -2334,6 +2390,12 @@ async function raftCheckWake(ctx: PluginContext, deps: WakeDeps, owner0: Assista
     return { wakeAt };
   }
   const sub = substituteTools(c.instruction, ctx.alias, tools);
+  // The cap is on what is posted, after the names are put in, in UTF-8 bytes (`CHECK_INSTRUCTION_MAX_UTF8`).
+  const bytes = utf8Length(sub.text);
+  if (bytes > CHECK_INSTRUCTION_MAX_UTF8) {
+    await record(ctx, day, trigger, "check_refused", { ...id, raft_check: true, reason: "instruction_too_large", instruction_bytes: bytes });
+    return { wakeAt };
+  }
   const counts = Object.fromEntries(CHECK_COUNT_KEYS.flatMap((k) => (typeof c.counts[k] === "number" ? [[k, c.counts[k]!]] : [])));
   await record(ctx, day, trigger, "invoked", {
     ...id, raft_check: true, tools_offered: tools.length, tools_dropped: dropped, placeholders_unknown: sub.unknown, placeholders_unoffered: sub.unoffered, ...counts,
@@ -2348,10 +2410,13 @@ async function raftCheckWake(ctx: PluginContext, deps: WakeDeps, owner0: Assista
  */
 async function raftIdleWake(ctx: PluginContext, deps: WakeDeps, owner: AssistantOwner, now: number, read = true): Promise<PluginNext | null> {
   const zone = zoneOf(owner), next = nextBriefAt(now, zone);
+  // Raft's flag is read again before anything is decided (`read`): kept on, a doorbell without a check is Raft having
+  // found nothing; turned off since, the doorbell is this file's to check, as it always was.
+  if (read && !(await readMode(ctx, deps, owner, now)).raftCheck) return null;
   if (owner.doorbellAt !== null) {
     await saveOwner(ctx, { ...owner, doorbellAt: null, changeAt: null, changeSources: {}, lagReads: 0 });
     await record(ctx, localDay(now, zone), "doorbell", "skipped_no_check", { raft_check: true });
-  } else if (read && !(await readMode(ctx, deps, owner)).raftCheck) return null;
+  }
   const retry = await pushBriefImport(ctx, deps.api, now).catch(() => null);
   return { wakeAt: retry !== null ? Math.min(retry, next) : next };
 }
@@ -2370,10 +2435,18 @@ export async function assistantWake(ctx: PluginContext, deps: WakeDeps): Promise
   const now = (deps.now ?? Date.now)();
   let owner = await loadOwner(ctx);
   if (!owner) return;
-  // Raft's check, when a wake carries one, whatever the flag says: it decides only what this wake posts.
-  const taken = await takeCheck(ctx);
-  if (taken) return raftCheckWake(ctx, deps, owner, taken, now);
-  if (owner.raftCheck) {
+  // Raft's check is posted only while Raft's flag is on: kept off here, Raft's is read first, since a check says Raft
+  // turned it on. Off after that (a rollback), the checks queued before it are dropped, each said on its row, and the
+  // wake goes on as it always did, the doorbell's own state untouched.
+  const queued = pendingOf(await ctx.db.get(ASSISTANT_STORE, PENDING_CHECKS_KEY));
+  if (!owner.raftCheck && (queued.doorbell || queued.brief)) owner = await readMode(ctx, deps, owner, now);
+  if (!owner.raftCheck) {
+    for (const c of await dropChecks(ctx)) {
+      await record(ctx, localDay(now, zoneOf(owner)), c.trigger, "check_refused", { check_id: c.id, raft_check: true, reason: "raft_check_off" });
+    }
+  } else {
+    const taken = await takeCheck(ctx);
+    if (taken) return raftCheckWake(ctx, deps, owner, taken, now);
     const idle = await raftIdleWake(ctx, deps, owner, now);
     if (idle) return idle;
     owner = (await loadOwner(ctx)) ?? owner;

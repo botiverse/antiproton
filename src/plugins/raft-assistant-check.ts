@@ -4,7 +4,7 @@
  * model. The mode is Raft's to state (`assistantOf.raftCheck`, src/plugins/raft-assistant.ts `keepOwnerFromContext`);
  * whether a wake carries a check only decides what that one wake posts.
  *
- * - `instruction` is the check turn's input, verbatim, at most `CHECK_INSTRUCTION_MAX_BYTES`; a longer one is refused,
+ * - `instruction` is the check turn's input, verbatim, at most `CHECK_INSTRUCTION_MAX_UTF8` as posted; a longer one is refused,
  *   never cut, since a cut instruction is one Raft did not write. Tools are named in it by logical name only, as
  *   `{{tool:<name>}}`, and replaced here by the mount's model tool names (`substituteTools`): a placeholder for a tool
  *   the session is not offered is removed, so the text never names a tool the model cannot call (#1014), and one this
@@ -24,8 +24,21 @@ import { modelToolName } from "../runtime/pi-tools.ts";
 
 /** The `check` contract version this build reads; any other is refused (`version`). */
 export const CHECK_VERSION = 1;
-/** The longest `instruction` posted, counted as `String.length` (AGENTS.md: every `…Bytes` counts the same unit). */
-export const CHECK_INSTRUCTION_MAX_BYTES = 16 * 1024;
+/**
+ * The longest turn input a check posts, in UTF-8 bytes, counted on the text as posted (after the tool names are put
+ * in), since Raft's bound is 16 KB on the wire. Named `…Utf8`, not `…Bytes`: AGENTS.md keeps `…Bytes` for `String.length`.
+ */
+export const CHECK_INSTRUCTION_MAX_UTF8 = 16 * 1024;
+/**
+ * The longest `instruction` kept as it arrives, as `String.length`: far past the cap, so nothing the cap would take is
+ * refused here, only what is plainly not a check's input, before it is stored.
+ */
+const INSTRUCTION_KEPT_MAX = 4 * CHECK_INSTRUCTION_MAX_UTF8;
+
+/** `text`'s length in UTF-8 bytes. */
+export function utf8Length(text: string): number {
+  return new TextEncoder().encode(text).length;
+}
 
 /** The logical tool names Raft uses, and the bare name of each on an assistant's raft mount. */
 export const LOGICAL_TOOLS: Readonly<Record<string, string>> = {
@@ -56,11 +69,11 @@ export interface RaftCheck {
 
 /** Why a check is not posted, and what of it could be read, for its trace row. Never its text. */
 export interface RefusedCheck {
-  refused: "malformed" | "version" | "instruction_too_large" | "no_tools";
+  refused: "malformed" | "version" | "instruction_too_large";
   id: string | null;
   trigger: CheckTrigger | null;
-  /** `instruction`'s length, for `instruction_too_large`. */
-  instructionLength?: number;
+  /** `instruction`'s UTF-8 length, for `instruction_too_large`. */
+  instructionBytes?: number;
 }
 
 const CHECK_ID = /^[0-9A-Za-z][0-9A-Za-z-]{0,63}$/;
@@ -76,7 +89,7 @@ export function checkOf(raw: unknown): RaftCheck | RefusedCheck | null {
   const trigger = o.trigger === "doorbell" || o.trigger === "brief" ? o.trigger : null;
   if (o.version !== CHECK_VERSION) return { refused: o.version === undefined ? "malformed" : "version", id, trigger };
   if (!id || !trigger || typeof o.instruction !== "string" || !o.instruction.trim()) return { refused: "malformed", id, trigger };
-  if (o.instruction.length > CHECK_INSTRUCTION_MAX_BYTES) return { refused: "instruction_too_large", id, trigger, instructionLength: o.instruction.length };
+  if (o.instruction.length > INSTRUCTION_KEPT_MAX) return { refused: "instruction_too_large", id, trigger, instructionBytes: utf8Length(o.instruction) };
   if (o.allowed_tools !== undefined && o.allowed_tools !== null && !Array.isArray(o.allowed_tools)) return { refused: "malformed", id, trigger };
   const allowedTools = Array.isArray(o.allowed_tools) ? o.allowed_tools.map((t) => (typeof t === "string" ? t : "")) : null;
   const c = o.counts && typeof o.counts === "object" && !Array.isArray(o.counts) ? o.counts as Record<string, unknown> : {};

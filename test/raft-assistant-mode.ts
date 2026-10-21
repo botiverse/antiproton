@@ -163,6 +163,8 @@ function raft(o: { zone?: unknown; owner?: boolean; dm?: unknown; name?: string 
     /** Step 1's contact rules and settings, as Raft keeps them, and every call to them (`METHOD path body`). */
     raftRules: [] as Array<{ id: string; effect: string; subject: string; line: string }>, raftQuiet: { from: "22:00", to: "08:00" } as { from: string; to: string } | null,
     ruleCalls: [] as string[], ruleRefusal: null as { status: number; code: string; error: string } | null,
+    /** How many rule deletes Raft takes before it fails the rest with a 500. */
+    deletesOk: Infinity,
   };
   globalThis.fetch = (async (url: any, init?: any) => {
     const u = new URL(String(url));
@@ -236,6 +238,7 @@ function raft(o: { zone?: unknown; owner?: boolean; dm?: unknown; name?: string 
         return json(200, { rule: { ...rule, subject: { kind: "channel" }, anytime: false, until: null, note: null, createdAt: "2026-10-20T00:00:00Z" }, confirmation: `RAFT-CONFIRM ${body.effect} ${body.subject}`, updated: false });
       }
       if (path.startsWith("/assistant/contact-rules/") && init?.method === "DELETE") {
+        if (r.deletesOk-- <= 0) return json(500, { error: "boom" });
         const id = decodeURIComponent(path.slice("/assistant/contact-rules/".length));
         r.raftRules = r.raftRules.filter((x) => !x.id.startsWith(id));
         return json(200, { confirmation: `RAFT-REMOVED ${id}` });
@@ -2587,7 +2590,8 @@ await check("raftCheck: the listing reads the flag (absent is false), and the fi
   must(off.read(ASSISTANT_STORE, OWNER_KEY).raftCheck === false && off.read(ASSISTANT_STORE, "brief_import") === undefined, show(off.read(ASSISTANT_STORE, OWNER_KEY)));
   off.r.raftCheck = true;
   await raftPlugin.snapshotTools!(off.ctx);
-  must(off.read(ASSISTANT_STORE, OWNER_KEY).raftCheck === true && off.read(ASSISTANT_STORE, "brief_import")?.done === false, show(off.read(ASSISTANT_STORE, "brief_import")));
+  // Nothing was ever briefed here: the import is done at once, with nothing to send.
+  must(off.read(ASSISTANT_STORE, OWNER_KEY).raftCheck === true && off.read(ASSISTANT_STORE, "brief_import")?.done === true && off.r.imports.length === 0, show(off.read(ASSISTANT_STORE, "brief_import")));
   off.r.raftCheck = false;
   await raftPlugin.snapshotTools!(off.ctx);
   must(off.read(ASSISTANT_STORE, OWNER_KEY).raftCheck === false, "the flag turned off was not kept");
@@ -2600,11 +2604,14 @@ await check("raftCheck true: the brief's timer neither reads the inbox nor posts
   must(out && out.turn === undefined && out.wakeAt === at("2026-10-21T06:00:00Z"), `a brief under raftCheck: ${show(out)}`);
   must(a.r.inboxReads.length === 0 && a.r.messageReads.length === 0, `read: ${show(a.r.inboxReads)}`);
   must(a.read(ASSISTANT_STORE, OWNER_KEY).lastBrief === null, "the local brief was marked as done");
-  // Control: the same morning with Raft's flag off now: the timer reads it, and briefs as before.
+  // Raft's flag off now, read by the timer after 08:00: Raft had the morning, so today counts as briefed here too, and
+  // the next morning's brief is this file's again.
   a.r.raftCheck = false;
-  const back = await atTime(MORNING, () => wake(a.ctx));
-  must(back.isolated === true && back.turnKey === "assistant.brief" && a.r.inboxReads.length > 0, `flag off: ${show(back)}`);
-  must(a.read(ASSISTANT_STORE, OWNER_KEY).raftCheck === false, "the flag read at the timer was not kept");
+  const same = await atTime(MORNING, () => wake(a.ctx));
+  const owner = a.read(ASSISTANT_STORE, OWNER_KEY);
+  must(same.turn === undefined && owner.raftCheck === false && owner.lastBrief === "2026-10-20" && owner.briefSent === "2026-10-20", `the day of the rollback: ${show(same)} ${show(owner)}`);
+  const back = await atTime("2026-10-21T06:30:00Z", () => wake(a.ctx));
+  must(back.isolated === true && back.turnKey === "assistant.brief" && a.r.inboxReads.length > 0, `flag off, next morning: ${show(back)}`);
 });
 
 await check("raftCheck false, Raft's flag turned on since the listing: the brief's timer reads it and does not brief", async () => {
@@ -2619,10 +2626,11 @@ await check("raftCheck true: a doorbell without a check reads nothing and is cou
   const a = await raftAssistant();
   a.r.unread = [conv(1, { hasMention: true })];
   await atTime(DAY, () => ring(a, { first_change_at: DAY, last_change_at: DAY, sources: [src(1, 3)] }));
-  const owner = a.read(ASSISTANT_STORE, OWNER_KEY);
-  must(owner.changeAt === null && show(owner.changeSources) === "{}", `change tracking under raftCheck: ${show(owner)}`);
+  // Noted as ever, so a flag turned off before the wake leaves the local check what it needs.
+  must(a.read(ASSISTANT_STORE, OWNER_KEY).changeAt === DAY, show(a.read(ASSISTANT_STORE, OWNER_KEY)));
   const none = await atTime(DAY, () => wake(a.ctx));
   must(none.turn === undefined && wakeRows(a).at(-1)?.status === "skipped_no_check" && a.r.inboxReads.length === 0, `${show(none)} ${show(wakeRows(a))}`);
+  must(a.read(ASSISTANT_STORE, OWNER_KEY).changeAt === null, "the skipped doorbell's change was left awaited");
   await atTime(DAY, () => ring(a, { check: raftCheckPayload() }));
   const out = await atTime(DAY, () => wake(a.ctx));
   must(out.isolated === true && out.turnKey === `assistant.raft_check:doorbell:${CHECK_ID}`, `posted: ${show(out)}`);
@@ -2673,21 +2681,30 @@ await check("isolated_sessions made before tools and turn_key gains them; a sess
   } finally { host.dispose(); }
 });
 
-await check("a check is refused, never cut or guessed at: an instruction over 16 KB, another version, no id; each says why on its row", async () => {
+await check("a check is refused, never cut or guessed at: over 16 KB of UTF-8 as posted, another version, no id; said on its row, never kept", async () => {
   const a = await raftAssistant();
-  const cases: Array<[Record<string, unknown>, string]> = [
-    [{ instruction: "x".repeat(16 * 1024 + 1) }, "instruction_too_large"], [{ version: 2 }, "version"], [{ id: "" }, "malformed"],
-  ];
-  for (const [o, reason] of cases) {
-    await atTime(DAY, () => ring(a, { check: raftCheckPayload(o) }));
+  // Over the cap once its names are put in, and in UTF-8 bytes (3 per "€" here), not characters.
+  const over = "{{tool:notify}}" + "x".repeat(16 * 1024 - 15);
+  const wide = "{{tool:notify}}" + "€".repeat(6000);
+  for (const [instruction, why] of [[over, "names"], [wide, "utf8"]] as const) {
+    must(instruction.length <= 16 * 1024, `control, ${why}: under the cap as characters`);
+    await atTime(DAY, () => ring(a, { check: raftCheckPayload({ instruction }) }));
     const out = await atTime(DAY, () => wake(a.ctx));
     const row = wakeRows(a).at(-1)!;
-    must(out.turn === undefined && row.status === "check_refused" && row.attrs.reason === reason, `${reason}: ${show(out)} ${show(row)}`);
+    must(out.turn === undefined && row.status === "check_refused" && row.attrs.reason === "instruction_too_large" && (row.attrs.instruction_bytes as number) > 16 * 1024 && row.attrs.check_id === CHECK_ID, `${why}: ${show(out)} ${show(row)}`);
   }
-  must(wakeRows(a)[0]!.attrs.instruction_length === 16 * 1024 + 1 && wakeRows(a)[0]!.attrs.check_id === CHECK_ID, show(wakeRows(a)[0]));
-  // Control: exactly 16 KB is posted.
-  await atTime(DAY, () => ring(a, { check: raftCheckPayload({ instruction: "y".repeat(16 * 1024) }) }));
-  must((await atTime(DAY, () => wake(a.ctx))).turn?.length === 16 * 1024, "16 KB exactly was refused");
+  // A malformed check is said as it arrives and never kept, so it cannot take the place of a valid pending one.
+  await atTime(DAY, () => ring(a, { check: raftCheckPayload() }));
+  for (const [o, reason] of [[{ version: 2 }, "version"], [{ id: "" }, "malformed"], [{ trigger: undefined }, "malformed"]] as const) {
+    await atTime(DAY, () => ring(a, { check: raftCheckPayload(o) }));
+    must(wakeRows(a).at(-1)?.status === "check_refused" && wakeRows(a).at(-1)?.attrs.reason === reason, `${reason}: ${show(wakeRows(a).at(-1))}`);
+  }
+  const kept = await atTime(DAY, () => wake(a.ctx));
+  must(kept.isolated === true && kept.turnKey === `assistant.raft_check:doorbell:${CHECK_ID}`, `the valid check was overwritten: ${show(kept)}`);
+  // Control: exactly 16 KB of UTF-8 as posted is posted.
+  const exact = "{{tool:notify}}" + "y".repeat(16 * 1024 - "raft__assistant_notify_owner".length);
+  await atTime(DAY, () => ring(a, { check: raftCheckPayload({ instruction: exact }) }));
+  must(new TextEncoder().encode((await atTime(DAY, () => wake(a.ctx))).turn ?? "").length === 16 * 1024, "16 KB exactly was refused");
 });
 
 await check("a check wake clears a stale pause, and posts even on a stale flag (read again, kept)", async () => {
@@ -2796,16 +2813,19 @@ await check("the switch-over import: { briefSent } once, the later of the day br
   const a = await assistant(raft({ dm: "dm:@ada" }));
   a.write(ASSISTANT_STORE, OWNER_KEY, { ...a.read(ASSISTANT_STORE, OWNER_KEY), lastBrief: "2026-10-20", briefSent: "2026-10-19" });
   a.r.raftCheck = true;
-  await raftPlugin.snapshotTools!(a.ctx);
   a.r.importAnswer = { status: 404, code: "NOT_FOUND" };
+  // Pushed by the listing that sees the flag on, before any wake (which may be Raft's first brief).
+  await atTime(DAY, () => raftPlugin.snapshotTools!(a.ctx));
+  must(a.r.imports.length === 1 && show(a.r.imports[0]) === show({ briefSent: "2026-10-20" }), `not pushed at the listing: ${show(a.r.imports)}`);
   await atTime(DAY, () => ring(a, { check: raftCheckPayload() }));
   const out = await atTime(DAY, () => wake(a.ctx));
-  must(out.isolated === true && a.r.imports.length === 1 && show(a.r.imports[0]) === show({ briefSent: "2026-10-20" }), `${show(out)} ${show(a.r.imports)}`);
+  must(out.isolated === true && a.r.imports.length === 1, `${show(out)} ${show(a.r.imports)}`);
   must(out.wakeAt === at(DAY) + 60_000, `the retry is not asked for: ${show(out)}`);
   must(a.traced.some((t) => t.kind === "raft.assistant_check" && t.status === "import_failed" && t.attrs.http_status === 404), "no failed row");
   // Too soon: not asked again. Due: pushed, then never again.
   await atTime("2026-10-20T10:00:30Z", () => wake(a.ctx));
   must(a.r.imports.length === 1, "retried before its time");
+  must(a.read(ASSISTANT_STORE, "brief_import").attempts === 1, show(a.read(ASSISTANT_STORE, "brief_import")));
   a.r.importAnswer = { status: 200, code: null };
   await atTime("2026-10-20T10:01:00Z", () => wake(a.ctx));
   must(a.r.imports.length === 2 && a.read(ASSISTANT_STORE, "brief_import").done === true, show(a.read(ASSISTANT_STORE, "brief_import")));
@@ -2842,6 +2862,81 @@ await check("preferences while Raft runs the check: Raft's contact-rules and con
   must(await pref({ action: "add", effect: "mute", channel: "nope" }).then(() => false, (e) => e.message.includes("cannot see anything by that name")), "Raft's refusal was not said");
   const row = a.traced.filter((t) => t.kind === "raft.assistant_rules").at(-1)!;
   must(row.status === "refused:subject_not_found" && row.attrs.via === "raft", show(row));
+});
+
+await check("rollback: Raft's flag read off with checks queued: they are dropped (raft_check_off) and the doorbell is checked here, as before", async () => {
+  const a = await assistant(raft({ dm: "dm:@ada" }));
+  a.r.unread = [conv(1, { hasMention: true, latestAt: "2026-10-20T09:59:00.000Z" })];
+  // Queued while Raft's flag was on; Raft has turned it off since.
+  a.r.raftCheck = false;
+  await atTime(DAY, () => ring(a, { first_change_at: "2026-10-20T09:59:00.000Z", last_change_at: DAY, check: raftCheckPayload() }));
+  const out = await atTime(DAY, () => wake(a.ctx));
+  must(out.isolated === true && out.turnKey === "assistant.check" && out.turn.includes(conv(1).channelId), `the local check did not run: ${show(out)}`);
+  must(a.r.inboxReads.length > 0, "the inbox was not read here");
+  const dropped = wakeRows(a).find((r) => r.status === "check_refused");
+  must(dropped?.attrs.reason === "raft_check_off" && dropped.attrs.check_id === CHECK_ID, show(wakeRows(a)));
+  must((await atTime(DAY, () => wake(a.ctx))).turnKey !== `assistant.raft_check:doorbell:${CHECK_ID}`, "the dropped check came back");
+});
+
+await check("rollback: the flag kept on, Raft's turned off, a doorbell without a check: read again, and checked here rather than dropped", async () => {
+  const a = await raftAssistant();
+  a.r.unread = [conv(1, { hasMention: true, latestAt: "2026-10-20T09:59:00.000Z" })];
+  a.r.raftCheck = false;
+  await atTime(DAY, () => ring(a, { first_change_at: "2026-10-20T09:59:00.000Z", last_change_at: DAY }));
+  const out = await atTime(DAY, () => wake(a.ctx));
+  must(out.isolated === true && out.turnKey === "assistant.check" && a.read(ASSISTANT_STORE, OWNER_KEY).raftCheck === false, `dropped: ${show(out)} ${show(wakeRows(a))}`);
+  must(!wakeRows(a).some((r) => r.status === "skipped_no_check"), show(wakeRows(a)));
+});
+
+await check("rollback before 08:00 owner-local leaves today's brief to this file; after it, today counts as briefed", async () => {
+  const early = await raftAssistant();
+  early.r.raftCheck = false;
+  await atTime("2026-10-20T05:00:00Z", () => raftPlugin.snapshotTools!(early.ctx)); // 07:00 Berlin
+  must(early.read(ASSISTANT_STORE, OWNER_KEY).lastBrief === null, show(early.read(ASSISTANT_STORE, OWNER_KEY)));
+  const late = await raftAssistant();
+  late.r.raftCheck = false;
+  await atTime("2026-10-20T07:00:00Z", () => raftPlugin.snapshotTools!(late.ctx)); // 09:00 Berlin
+  must(late.read(ASSISTANT_STORE, OWNER_KEY).lastBrief === "2026-10-20" && late.read(ASSISTANT_STORE, OWNER_KEY).briefSent === "2026-10-20", show(late.read(ASSISTANT_STORE, OWNER_KEY)));
+  must((await atTime(MORNING, () => wake(late.ctx))).turn === undefined, "briefed twice on the day of the rollback");
+});
+
+await check("the switch-over import gives up after its last try, said on an import_gave_up row", async () => {
+  const { BRIEF_IMPORT_ATTEMPTS_MAX } = await import("../src/plugins/raft-assistant.ts");
+  const a = await assistant(raft({ dm: "dm:@ada" }));
+  a.write(ASSISTANT_STORE, OWNER_KEY, { ...a.read(ASSISTANT_STORE, OWNER_KEY), lastBrief: "2026-10-19" });
+  a.r.raftCheck = true;
+  a.r.importAnswer = { status: 503, code: null };
+  let t = at(DAY);
+  await atTime(new Date(t).toISOString(), () => raftPlugin.snapshotTools!(a.ctx));
+  for (let i = 1; i < BRIEF_IMPORT_ATTEMPTS_MAX + 3; i++) {
+    t += 7 * 3_600_000;
+    await atTime(new Date(t).toISOString(), () => wake(a.ctx));
+  }
+  must(a.r.imports.length === BRIEF_IMPORT_ATTEMPTS_MAX, `tries: ${a.r.imports.length}`);
+  must(a.traced.some((x) => x.kind === "raft.assistant_check" && x.status === "import_gave_up") && a.read(ASSISTANT_STORE, "brief_import").done === true, show(a.read(ASSISTANT_STORE, "brief_import")));
+});
+
+await check("notify outside one of Raft's checks is not forwarded, and its row says so (forwarded 0)", async () => {
+  const a = await raftAssistant();
+  await notify(a.ctx, { items: [] });
+  const row = a.traced.filter((x) => x.kind === "raft.assistant_notify").at(-1)!;
+  must(row.attrs.forwarded === 0 && row.attrs.code === "no_check" && !("check_id" in row.attrs), show(row));
+});
+
+await check("preferences through Raft: an unknown action is `other` on its row; remove all that Raft stops part-way says what is left", async () => {
+  const a = await raftAssistant();
+  const pref = (args: unknown) => raftPlugin.invoke("assistant_preferences", args, a.ctx) as Promise<any>;
+  must(await pref({ action: "drop table rules" }).then(() => false, () => true), "an unknown action was taken");
+  const row = a.traced.filter((x) => x.kind === "raft.assistant_rules").at(-1)!;
+  must(row.attrs.action === "other" && !JSON.stringify(row).includes("drop table"), show(row));
+  for (const ch of ["a", "b", "c"]) await pref({ action: "add", effect: "mute", channel: ch });
+  a.r.deletesOk = 1;
+  const out = await pref({ action: "remove", all: true });
+  must(out.state === "removed_partial" && out.removed === 1 && out.left.length === 2 && /removed 1 of your 3 rules/.test(out.confirm) && /2 are still in place/.test(out.confirm), show(out));
+  must(a.r.raftRules.length === 2, show(a.r.raftRules));
+  a.r.deletesOk = Infinity;
+  const rest = await pref({ action: "remove", all: true });
+  must(rest.state === "removed" && rest.removed === 2 && a.r.raftRules.length === 0, show(rest));
 });
 
 await check("the check prompt under Raft's check: notify exactly once, items alone, no people rules or composer numbers; the fence kept", () => {

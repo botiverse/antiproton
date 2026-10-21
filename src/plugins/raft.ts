@@ -26,7 +26,7 @@ import {
   ASSISTANT_OWN_TOOLS, ASSISTANT_STORE, CONTACT_KEY, DEFERRED_KEY, NOTIFY_TOOL, OWNER_KEY, PREFERENCES_TOOL, REMINDED_STORE, RULES_KEY, SEND_AS_OWNER_TOOL,
   sendAsOwner, type SendAsOwnerAnswer, assistantWake, assistantWakeInstruction, doorbellOf, isDoorbellTarget, keepOwnerFromContext, learnDm, loadOwner, mergeSources, noteDoorbell,
   notifyOwner, noteChatNotice, noteOwnerReply, noteToldInChat, pauseOn, replyFallback, preferences, type PersonResolve, type AssistantOwner, type ChangeSources, type OwnerContext, type OwnerSend,
-  checkEnded, type AssistantApi, type RaftAnswer,
+  checkEnded, pushBriefImport, type AssistantApi, type RaftAnswer,
 } from "./raft-assistant.ts";
 import type { RaftCheck, RefusedCheck } from "./raft-assistant-check.ts";
 import { callMcp, isMcpTool, keptMcpOf, leftOut, listMcp, mcpClock, mcpLines, MCP_CALL_TIMEOUT_MS, MCP_CAPABILITY, MCP_KEY, MCP_PREFIX } from "./raft-mcp.ts";
@@ -3572,7 +3572,12 @@ async function readRaftCheck(ctx: PluginContext): Promise<boolean | null> {
 
 /** Kept by the listing; a failure to keep it must not fail the listing, and leaves the last record as it was. */
 async function keepOwner(ctx: PluginContext, context: OwnerContext): Promise<void> {
-  try { await keepOwnerFromContext(ctx, context); }
+  try {
+    await keepOwnerFromContext(ctx, context);
+    // Raft's flag seen on by this listing: the switch-over import goes now, not at the next wake, which may be Raft's
+    // first brief (`pushBriefImport`; a failure is kept for the wakes to retry, and never fails the listing).
+    await pushBriefImport(ctx, assistantApi, Date.now()).catch(() => null);
+  }
   catch (e) { console.warn(`raft assistant owner could not be kept for mount ${ctx.alias}: ${String((e as Error)?.message ?? e)}`); }
 }
 

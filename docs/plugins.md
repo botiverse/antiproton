@@ -966,14 +966,19 @@ composition and rules store are off. Raft's doorbell (`owner_inbox_updated`) and
 `check` (`payload.check`, `src/plugins/raft-assistant-check.ts`), and a wake with one posts `check.instruction` as the
 short session's input, as written but for `{{tool:notify}}`, `{{tool:owner_inbox}}` and `{{tool:owner_messages}}`,
 which become the mount's model tool names (removed when the session lacks the tool; an unknown placeholder is left and
-counted). An instruction over 16 KB, another `version` or a check with no id is refused, never cut. `allowed_tools`
+counted). An instruction over 16 KB of UTF-8 as posted (names put in), another `version` or a check with no id or
+trigger is refused, never cut, and a malformed one is never kept in place of a valid pending one. `allowed_tools`
 can only narrow the check's tools: it is intersected in code with the reads and the notify tool, the runtime offers
 the session that list alone (`PluginNext.tools`) and refuses anything else of the mount at the host too. The notify
 tool then forwards the items (`{ channelId, summary, kind? }` each) to `POST /assistant/notify` with the check's id,
 from the session's key, and an idempotency key made from the check and the items; the model gives neither. A wake with
 a check clears a stale pause. The chat's references go to `POST /assistant/told` (`via: "chat"`), the preferences tool
 reads and writes Raft's `contact-rules` and `contact-settings`, and the first time the flag reads true the plugin pushes
-`{ briefSent }` once to `POST /assistant/check-state/import`, retried with backoff. With the flag false or absent,
+`{ briefSent }` once to `POST /assistant/check-state/import` (from the listing that sees it, or the wake that reads it),
+retried with backoff and given up after six tries (`import_gave_up`). Rollback: a check is posted only while the
+flag reads true (a check on a flag kept false makes the wake read Raft's first); checks queued before the flag went
+off are dropped (`check_refused`, `raft_check_off`), a doorbell with no check reads the flag again before it is
+skipped, and a flag turned off after 08:00 owner-local counts that day as briefed. With the flag false or absent,
 everything is as above.
 
 The owner's contact rules (`src/plugins/raft-assistant-rules.ts`) are set through
