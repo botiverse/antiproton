@@ -25,7 +25,7 @@ import { internalHost } from "./http.ts";
 import {
   ASSISTANT_OWN_TOOLS, ASSISTANT_STORE, CONTACT_KEY, DEFERRED_KEY, NOTIFY_TOOL, OWNER_KEY, PREFERENCES_TOOL, REMINDED_STORE, RULES_KEY, SEND_AS_OWNER_TOOL,
   sendAsOwner, type SendAsOwnerAnswer, assistantWake, assistantWakeInstruction, doorbellOf, isDoorbellTarget, keepOwnerFromContext, learnDm, loadOwner, mergeSources, noteDoorbell,
-  notifyOwner, noteToldInChat, pauseOn, preferences, type PersonResolve, type AssistantOwner, type ChangeSources, type OwnerContext, type OwnerSend,
+  notifyOwner, noteOwnerReply, noteToldInChat, pauseOn, replyFallback, preferences, type PersonResolve, type AssistantOwner, type ChangeSources, type OwnerContext, type OwnerSend,
 } from "./raft-assistant.ts";
 import { callMcp, isMcpTool, keptMcpOf, leftOut, listMcp, mcpClock, mcpLines, MCP_CALL_TIMEOUT_MS, MCP_CAPABILITY, MCP_KEY, MCP_PREFIX } from "./raft-mcp.ts";
 import { modelToolName } from "../runtime/pi-tools.ts";
@@ -2855,12 +2855,14 @@ export function createRaftPlugin(deps: {
   };
   /**
    * An assistant's send to its owner's DM that Raft accepted: what it cited counts as told (`noteToldInChat`), so the
-   * next wake does not bring it up again. A failure to record costs only that, never the send's result.
+   * next wake does not bring it up again, and the chat turn it was made in has answered its owner (`noteOwnerReply`),
+   * so its end sends nothing more (`afterTurn`). A failure to record costs only that, never the send's result.
    */
   const toldInChat = async (op: RaftOperationSpec, args: unknown, result: unknown, ctx: PluginContext) => {
     if (op.name !== "messages.send" || result instanceof Interrupt || !ctx.offered?.includes(PREFERENCES_TOOL)) return;
     const a = object(args);
     await noteToldInChat(ctx, a.target, a.content).catch(() => 0);
+    await noteOwnerReply(ctx, a.target).catch(() => {});
   };
   /** One generated operation: the attachment download is this plugin's own (`downloadAttachment`), the rest the SDK's. */
   const operate = (op: RaftOperationSpec, args: unknown, ctx: PluginContext, resumed?: { seen?: { upToSeq: number }; heldAt?: number }) =>
@@ -3447,6 +3449,14 @@ export function createRaftPlugin(deps: {
         return { deliver: false, malformed: true, reason: `signed, but the schema is ${JSON.stringify(schema)}, not ${NOTICE_SCHEMA}` };
       }
       return receiveNotice(payload, inbound, ctx);
+    },
+
+    /**
+     * The end of a turn of the agent's main conversation, which for a personal assistant is its owner's chat: a closing
+     * text no send to the owner's DM carried is sent there (`replyFallback`); nothing for any other agent.
+     */
+    async afterTurn(ctx, end) {
+      await replyFallback(ctx, end, sendToOwner);
     },
 
     /** A personal assistant's doorbell checks and morning brief (`assistantWake`); nothing for any other agent. */
