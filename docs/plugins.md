@@ -970,7 +970,8 @@ cannot confirm is replaced by the conversation's first unread message; an item a
 dropped, as is one a rule mutes; one a digest rule covers, and everything in the owner's quiet hours but
 what an `anytime` rule covers, is kept for the brief. A `#channel:msgid` the assistant sends its owner in
 their chat (the answer to "more") counts as told too, so the next wake does not bring it back
-(`noteToldInChat`, a `raft.assistant_chat_told` row with the count). The chat prompt answers "more"
+(`noteToldInChat`, a `raft.assistant_chat_told` row with the count; while Raft runs the check, Raft's
+Server records these itself and the plugin records nothing). The chat prompt answers "more"
 and "what's new" from an inbox read with `untold` from the start (no offset: what was already told drops out of it), at most three lines, and says how many are left
 only from the read's `total` minus the lines of that reply ("at least" that many when the read says so), never from its own count or memory, and with no number when the read
 says told state is unavailable.
@@ -988,7 +989,8 @@ can only narrow the check's tools: it is intersected in code with the reads and 
 the session that list alone (`PluginNext.tools`) and refuses anything else of the mount at the host too. The notify
 tool then forwards the items (`{ channelId, summary, kind? }` each) to `POST /assistant/notify` with the check's id,
 from the session's key, and an idempotency key made from the check and the items; the model gives neither. A wake with
-a check clears a stale pause. The chat's references go to `POST /assistant/told` (`via: "chat"`), the preferences tool
+a check clears a stale pause. The chat's references are recorded as told by Raft's Server itself (the plugin sends
+nothing and keeps nothing for them), the preferences tool
 reads and writes Raft's `contact-rules` and `contact-settings`, and the first time the flag reads true the plugin pushes
 `{ briefSent }` once to `POST /assistant/check-state/import` (from the listing that sees it, or the wake that reads it),
 retried with backoff and given up after six tries (`import_gave_up`). Rollback: a check is posted only while the

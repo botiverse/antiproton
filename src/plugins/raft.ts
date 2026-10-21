@@ -2956,14 +2956,14 @@ export function createRaftPlugin(deps: {
     return out instanceof Interrupt ? { sent: false, held: "your owner's DM has messages this conversation has not read" } : { sent: true };
   };
   /**
-   * An assistant's send that Raft accepted: what it cited in its owner's DM counts as told (`noteToldInChat`), so the
-   * next wake does not bring it up again, and the DM it went to is kept for the turn's end (`noteOwnerReply`), which
-   * sends nothing more when that was the owner's DM (`afterTurn`). A failure to record costs only that, never the send's result.
+   * An assistant's send that Raft accepted: what it cited in its owner's DM counts as told (`noteToldInChat`; while Raft
+   * runs the check, Raft's Server records it instead), so the next wake does not bring it up again, and the DM it went
+   * to is kept for the turn's end (`noteOwnerReply`), which sends nothing more when that was the owner's DM (`afterTurn`). A failure to record costs only that, never the send's result.
    */
   const toldInChat = async (op: RaftOperationSpec, args: unknown, result: unknown, ctx: PluginContext) => {
     if (op.name !== "messages.send" || result instanceof Interrupt || !ctx.offered?.includes(PREFERENCES_TOOL)) return;
     const a = object(args);
-    await noteToldInChat(ctx, a.target, a.content, Date.now(), assistantApi).catch(() => 0);
+    await noteToldInChat(ctx, a.target, a.content, Date.now()).catch(() => 0);
     await noteOwnerReply(ctx, a.target).catch(() => {});
   };
   /** One generated operation: the attachment download is this plugin's own (`downloadAttachment`), the rest the SDK's. */

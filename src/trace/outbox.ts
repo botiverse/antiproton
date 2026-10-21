@@ -123,7 +123,7 @@ export type TraceKind = (typeof TRACE_KINDS)[number];
  * call of the assistant's preferences tool: its action, effect, subject kind and result (`added`, `exists`, `removed`,
  * `refused:<code>`…) and the rules' counts per effect and subject kind, never a name, an id or a note
  * (src/plugins/raft-assistant-rules.ts `rulesAttrs`). `raft.assistant_chat_told` counts the references an assistant's
- * chat reply to its owner recorded as told (`noteToldInChat`), never which; with status `reply_fallback`, it is a chat turn's
+ * chat reply to its owner recorded as told (`noteToldInChat`, only while Raft does not run the check), never which; with status `reply_fallback`, it is a chat turn's
  * closing text sent to the owner's DM because the turn sent nothing there (`replyFallback`): `reply_fallback` 1 when sent,
  * else 0, `result` (`sent`, `held`, `failed`) and a failure's `code`, and `failed_turn` 1 when the turn itself failed
  * and what was sent is the code's fixed line, never the text. `raft.assistant_send_as_owner` is one call of the

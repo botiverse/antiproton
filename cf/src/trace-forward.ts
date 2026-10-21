@@ -401,7 +401,9 @@ export const AGENT_TRACE_FIELDS: Readonly<Partial<Record<TraceKind, FieldSpec>>>
     check_id: ["check_id", "check"], trigger: ["trigger", ["doorbell", "brief"]], outcome: ["outcome", ["completed", "failed", "cancelled"]],
     error_code: ["error_code", "code"], attempts: ["attempts", "count"], http_status: ["http_status", "count"], code: ["code", "code"],
   },
-  // src/plugins/raft-assistant.ts `noteToldInChat` / `toldToRaft` (`told`, `told_failed`) and `replyFallback`.
+  // src/plugins/raft-assistant.ts `noteToldInChat` (`told`, legacy check only) and `replyFallback`. `refs`, `skipped`,
+  // `forwarded`, `http_status` and `told_failed` came from the removed `toldToRaft` (Raft's Server now records the
+  // chat's told itself); kept so rows from older builds still forward.
   "raft.assistant_chat_told": {
     refs: ["refs", "count"], told: ["told", "count"], skipped: ["skipped", "count"], forwarded: ["forwarded", "count"],
     http_status: ["http_status", "count"], code: ["code", "code"], reply_fallback: ["reply_fallback", "count"],
