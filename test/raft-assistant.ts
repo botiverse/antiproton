@@ -561,11 +561,26 @@ await check("untold answered any other failure is not retried: said as it is, af
   }
 });
 
-await check("through the SDK: untold, which the SDK's contract does not take yet, is not sent; one read with unread, the same page, with the note", async () => {
-  const { plugin, urls } = realWire(() => json(200, inboxAnswer()));
+await check("through the SDK: untold goes out as filter untold; a 200 with told and total renders with the total line, no note", async () => {
+  const { plugin, urls } = realWire(() => json(200, inboxAnswer({
+    filter: "untold", items: [inboxItem({ channelId: CH, firstUnreadMessageId: MSG(1), channelType: "channel", told: false })], total: 4,
+  })));
   const lines = String(await plugin.invoke(INBOX, { filter: "untold", limit: 5, offset: 10 }, ctx(ASSISTANT).ctx)).split("\n");
-  must(urls.length === 1 && JSON.stringify(query(urls[0]!)) === JSON.stringify({ filter: "unread", limit: "5", offset: "10" }), `requests: ${JSON.stringify(urls)}`);
+  must(urls.length === 1 && JSON.stringify(query(urls[0]!)) === JSON.stringify({ filter: "untold", limit: "5", offset: "10" }), `requests: ${JSON.stringify(urls)}`);
+  must(/^\[your owner's Raft inbox/.test(lines[0]!) && !lines.includes(UNTOLD_UNKNOWN), `head: ${lines[0]}`);
+  must(JSON.parse(lines[1]!).told === false, `item: ${lines[1]}`);
+  must(lines[2] === "4 match the filter untold in total, across all pages." && lines[3] === "hasMore=true nextOffset=10" && lines.length === 4, `tail: ${JSON.stringify(lines)}`);
+});
+
+await check("through the SDK: a server that answers untold with 400 is read once more with unread, the same page, with the note", async () => {
+  let n = 0;
+  const { plugin, urls } = realWire(() => n++ === 0 ? json(400, { error: "invalid filter" }) : json(200, inboxAnswer()));
+  const lines = String(await plugin.invoke(INBOX, { filter: "untold", limit: 5, offset: 10 }, ctx(ASSISTANT).ctx)).split("\n");
+  must(urls.length === 2 && JSON.stringify(urls.map(query)) === JSON.stringify([
+    { filter: "untold", limit: "5", offset: "10" }, { filter: "unread", limit: "5", offset: "10" },
+  ]), `requests: ${JSON.stringify(urls)}`);
   must(lines[0] === UNTOLD_UNKNOWN && /^\[your owner's Raft inbox/.test(lines[1]!), `head: ${JSON.stringify(lines.slice(0, 2))}`);
+  must(!lines.some((l) => /in total/.test(l)), `a total after the fallback: ${JSON.stringify(lines)}`);
 });
 
 await check("each read is parsed in its own naming: the other style is refused as malformed, never read as undefined", async () => {

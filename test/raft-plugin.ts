@@ -2128,7 +2128,7 @@ function readerContext(capabilities: string[], raftbenchReader?: unknown) {
   });
 }
 
-await check("raftbench_findings is listed only for an agent whose context says raftbenchReader: true; absent, false, \"true\" and 1 list it nowhere", async () => {
+await check("raftbench_findings is listed only for an agent whose context says raftbenchReader: true; absent lists it nowhere, and any other value fails the listing (the SDK's contract)", async () => {
   const base: any = { tenantId: "t", agentId: "a", alias: "raft", plugin: "raft" };
   const offeredUnder = async (flag: unknown) => {
     one(readerContext(["read", "send"], flag));
@@ -2137,7 +2137,13 @@ await check("raftbench_findings is listed only for an agent whose context says r
   };
   const on = await offeredUnder(true);
   must(on.listed.includes(RAFTBENCH_TOOL) && on.offered.includes(RAFTBENCH_TOOL), `true: ${on.offered.join(", ")}`);
-  for (const flag of [undefined, false, "true", 1, null, {}]) {
+  // SDK 0.27.0 types the flag as true or absent: anything else is refused with the whole context answer, so the listing
+  // throws, which leaves a mount's stored list as it was.
+  for (const flag of [false, "true", 1, null, {}]) {
+    const e = await failure(() => offeredUnder(flag));
+    must(e.message === "could not ask Raft what this mount's credential may do: Raft's answer did not match the Raft SDK's contract", `${JSON.stringify(flag)}: ${e.message}`);
+  }
+  for (const flag of [undefined]) {
     const off = await offeredUnder(flag);
     must(!off.listed.includes(RAFTBENCH_TOOL) && !off.offered.includes(RAFTBENCH_TOOL), `${JSON.stringify(flag)}: offered ${off.offered.join(", ")}`);
     // Left out quietly, as an assistant's reads are, and nothing else moved.
