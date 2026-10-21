@@ -128,6 +128,27 @@ export function forwardConfigOf(env: Record<string, unknown>): ForwardConfig | n
   return s.state === "on" ? s.config : null;
 }
 
+/**
+ * The agent's mounts as the forward may name them: by alias, the mount's plugin type (`raft`, `github`, `mcp`, …: a
+ * plugin's id, from code) and its ordinal in the agent's mount list (by alias). An alias is a name someone typed, so it
+ * is never sent; the type is, and the ordinal tells two mounts of one type apart within a run.
+ */
+export type MountsView = ReadonlyMap<string, { plugin: string; index: number }>;
+const PLUGIN_TYPE = /^[a-z][a-z0-9_-]{0,31}$/;
+
+/** The mounts as the `mounts` table holds them now (src/store/durable-object.ts), or none when it has no such table. */
+export function mountsOf(sql: Sql, tenantId: string, agentId: string): MountsView {
+  const out = new Map<string, { plugin: string; index: number }>();
+  const has = sql.exec("SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = 'mounts'").toArray().length > 0;
+  if (!has) return out;
+  const rows = sql.exec("SELECT alias, plugin FROM mounts WHERE tenant_id = ? AND agent_id = ? ORDER BY alias", tenantId, agentId).toArray();
+  rows.forEach((r: any, index: number) => {
+    if (typeof r.alias === "string" && typeof r.plugin === "string" && PLUGIN_TYPE.test(r.plugin)) out.set(r.alias, { plugin: r.plugin, index });
+  });
+  return out;
+}
+const NO_MOUNTS: MountsView = new Map();
+
 /** A row as it goes on the wire: its outbox seq is always there, as the queue's key. */
 export type WireRow = { seq: number } & Record<string, string | number | boolean | null>;
 
@@ -139,7 +160,7 @@ export type ForwardLane = {
   /** Its tables' prefix: `<table>_staged`, `<table>_queue`, `<table>_state`, `<table>_log`. */
   table: string;
   log: string;
-  map(r: TraceOutboxRow, env: ForwardEnv): WireRow | null;
+  map(r: TraceOutboxRow, env: ForwardEnv, mounts: MountsView): WireRow | null;
   /** The receiver answers a 2xx with `rejected: [{index, reason}]`, the rows of the batch it did not take. */
   rowRejections?: boolean;
 };
@@ -164,11 +185,12 @@ const int = (v: unknown): number | null => typeof v === "number" && Number.isFin
 const bool = (v: unknown): boolean | null => typeof v === "boolean" ? v : null;
 
 /** One outbox row as the github-refresh receiver's columns, built field by field: nothing in the stored row rides along. */
-export function forwardRow(r: TraceOutboxRow, env: ForwardEnv): ForwardRow {
+export function forwardRow(r: TraceOutboxRow, env: ForwardEnv, mounts: MountsView = NO_MOUNTS): ForwardRow {
   const a = r.attrs ?? {};
   return {
     at: new Date(r.at).toISOString(), tenant_id: r.tenantId, agent_id: r.agentId, seq: r.seq, env, outcome: r.status,
-    scope: str(a.scope), connector_id: str(a.connectorId), mount: str(a.mount), why: str(a.why),
+    // `mount`: the mount's type, never its alias (`MountsView`); null when the alias names no mount now.
+    scope: str(a.scope), connector_id: str(a.connectorId), mount: typeof a.mount === "string" ? mounts.get(a.mount)?.plugin ?? null : null, why: str(a.why),
     attempt: int(a.attempt), stored: bool(a.stored), reason_code: str(a.reasonCode),
   };
 }
@@ -202,22 +224,27 @@ const OPAQUE_TURN = new RegExp(`^tt_${SESSION}@[0-9]{1,16}$`);
 /**
  * A span id, readable only in the shapes its writers mint: `<prefix>_<hex>` (a job `mj_`, an operation `op_`, a
  * session), a turn, `refused_<ms>` / `js_<ms>`, a provider's tool call id (`toolu_…`, `call_…`, `call_…|fc_…`: random
- * base62 the provider makes), and a plugin row's `mount:<alias>` / `wake:<alias>:<ms>` (an alias is a mount's
- * configured name, cf/src/runtime.ts `MOUNT_ALIAS`). Any other span is left out: `span_id` is optional to the
- * receiver, which keys a row by its `seq`.
+ * base62 the provider makes). A plugin row's `mount:<alias>` is sent as `mount` and `wake:<alias>:<ms>` as `wake:<ms>`:
+ * the alias is a name someone typed, never sent (the row's `mount_index` says which mount). Any other span is left out:
+ * `span_id` is optional to the receiver, which keys a row by its `seq`.
  */
 const OPAQUE_SPAN = [
   /^[a-z]{1,8}_[0-9a-f]{8,64}$/, OPAQUE_TURN, /^(?:refused|js)_[0-9]{1,16}$/,
   /^(?:toolu|call|fc)_[A-Za-z0-9]{8,64}(?:\|fc_[A-Za-z0-9_-]{8,60})?$/,
-  /^mount:[a-z][a-z0-9-]{0,23}$/, /^wake:[a-z][a-z0-9-]{0,23}:[0-9]{1,16}$/,
 ];
-const spanOf = (v: unknown): string | null => typeof v === "string" && OPAQUE_SPAN.some((re) => re.test(v)) ? v : null;
+function spanOf(v: unknown): string | null {
+  if (typeof v !== "string") return null;
+  if (/^mount:[^:]+$/.test(v)) return "mount";
+  const wake = /^wake:[^:]+:([0-9]{1,16})$/.exec(v);
+  if (wake) return `wake:${wake[1]}`;
+  return OPAQUE_SPAN.some((re) => re.test(v)) ? v : null;
+}
 
 /**
  * `session`, `turn`, `task`: ids this side mints, accepted only in the shapes it mints them (`OPAQUE_SESSION`), so a
  * field the receiver types `id` can never carry a name: its id shape takes `alice` as readily as `sess_1f…`.
  */
-type FieldType = "id" | "code" | "count" | "int" | "bool" | "flag" | "session" | "turn" | "task" | readonly string[];
+type FieldType = "id" | "code" | "count" | "int" | "bool" | "flag" | "session" | "turn" | "task" | "mount" | readonly string[];
 /** Where a field comes from: an attr by name, or the row's own `status` or `ms`. */
 type Source = string | { row: "status" | "ms" };
 /** wire name → [source, type]. */
@@ -230,11 +257,12 @@ const MS = { row: "ms" } as const;
  * Per kind, every field an `agent.trace` row carries beyond its envelope, and where each comes from: the receiver's
  * fields (`ANTIPROTON_TRACE_KINDS`), by its names and types, and nothing else. Deliberately absent: tool.call's `error`
  * (a tool's own sentence, redacted but free text), its `name` and `callId`; model.call's `limit` (a sentence) and
- * `prefix` (an object); a wake's `error` (a message) and every plugin row's `mount`; turn.stop's `errorClass` (a
+ * `prefix` (an object); a wake's `error` (a message) and every mount alias (tool.call's
+ * `mount` is the mount's type, `MountsView`); turn.stop's `errorClass` (a
  * sentence for people; `trigger` says the same); turn.timing's raw instants. Attrs written that the receiver has no field
  * for, so not sent: tool.refused's `task`, a wake's `inbox_lagging` and `reason`, turn_ended's `snapshotMismatches`.
  *
- * An id-typed field carries an opaque id or a name from code or configuration (a tool's, a mount's, a model's), never a
+ * An id-typed field carries an opaque id or a name from code or configuration (a tool's, a model's, a mount's TYPE), never a
  * name a person or a conversation has: where the receiver takes `id` or `code` and this side knows the vocabulary, the
  * field is that list (`by`, `trigger`, `outcome`, `stop_reason`); a session, turn or task must be in a shape this side
  * mints. Two receiver fields are left unfilled because their value is whatever the model wrote, which can be any word:
@@ -253,7 +281,7 @@ export const AGENT_TRACE_FIELDS: Readonly<Partial<Record<TraceKind, FieldSpec>>>
     provider_ms: ["providerMs", "count"], model: ["model", "id"],
   },
   "tool.call": {
-    tool: ["tool", "id"], mount: ["mount", "id"], task: ["task", "task"], run_ms: ["runMs", "count"], exit_code: ["exitCode", "int"],
+    tool: ["tool", "id"], mount: ["mount", "mount"], task: ["task", "task"], run_ms: ["runMs", "count"], exit_code: ["exitCode", "int"],
     denied: ["denied", "bool"], error_code: ["errorCode", "code"], http_status: ["httpStatus", "count"],
   },
   "tool.refused": {
@@ -310,7 +338,7 @@ const intOf = (v: unknown): number | null => {
   return Number.isSafeInteger(n) ? n : null;
 };
 
-function fieldOf(v: unknown, type: FieldType): string | number | boolean | null {
+function fieldOf(v: unknown, type: FieldType, mounts: MountsView): string | number | boolean | null {
   if (Array.isArray(type)) return typeof v === "string" && type.includes(v) ? v : null;
   switch (type) {
     case "id": return idOf(v);
@@ -323,6 +351,8 @@ function fieldOf(v: unknown, type: FieldType): string | number | boolean | null 
     case "session": return typeof v === "string" && OPAQUE_SESSION.test(v) ? v : null;
     case "turn": return typeof v === "string" && OPAQUE_TURN.test(v) ? v : null;
     case "task": return typeof v === "string" && OPAQUE_SESSION.test(v) ? v : null;
+    // An alias in, the mount's type out (`MountsView`); nothing when the alias names no mount now.
+    case "mount": return typeof v === "string" ? mounts.get(v)?.plugin ?? null : null;
   }
   return null;
 }
@@ -334,7 +364,7 @@ function fieldOf(v: unknown, type: FieldType): string | number | boolean | null 
  * (tenant_id:agent_id:seq). Null, and nothing sent, when the row's kind is not this lane's or its tenant or agent is not
  * an id (the receiver would reject the row).
  */
-export function agentTraceRow(r: TraceOutboxRow, env: ForwardEnv): WireRow | null {
+export function agentTraceRow(r: TraceOutboxRow, env: ForwardEnv, mounts: MountsView = NO_MOUNTS): WireRow | null {
   const spec = Object.prototype.hasOwnProperty.call(AGENT_TRACE_FIELDS, r.kind) ? AGENT_TRACE_FIELDS[r.kind] ?? null : null;
   if (!spec) return null;
   const tenant = idOf(r.tenantId), agent = idOf(r.agentId);
@@ -350,9 +380,13 @@ export function agentTraceRow(r: TraceOutboxRow, env: ForwardEnv): WireRow | nul
   if (ms !== null) out.ms = ms;
   for (const [name, [source, type]] of Object.entries(spec)) {
     const raw = typeof source === "string" ? (Object.prototype.hasOwnProperty.call(a, source) ? a[source] : undefined) : r[source.row];
-    const v = fieldOf(raw, type);
+    const v = fieldOf(raw, type, mounts);
     if (v !== null) out[name] = v;
   }
+  // Which of the agent's mounts the row is about (a tool's, a plugin's own row), as its ordinal: never the alias.
+  // Not a field the receiver keeps yet; it drops it until it does.
+  const m = typeof a.mount === "string" ? mounts.get(a.mount) : undefined;
+  if (m) out.mount_index = m.index;
   return out;
 }
 
@@ -464,11 +498,12 @@ export function stageForward(sql: Sql, cfg: ForwardConfig, tenantId: string, age
   const t = tablesOf(lane), d = ddl(lane);
   const from = forwardCursor(sql, lane);
   const { rows, through } = pendingTrace(sql, from, STAGE_READ_MAX);
+  const mounts = rows.length ? mountsOf(sql, tenantId, agentId) : NO_MOUNTS;
   sql.exec(d.queue);
   let unsendable = 0;
   for (const r of rows) {
     if (!lane.kinds.includes(r.kind)) continue;
-    const wire = lane.map(r, cfg.env);
+    const wire = lane.map(r, cfg.env, mounts);
     if (!wire) { unsendable++; continue; }
     sql.exec(`INSERT OR IGNORE INTO ${t.queue}(seq, row) VALUES (?, ?)`, r.seq, JSON.stringify(wire));
   }

@@ -32,6 +32,16 @@ function must(cond: unknown, msg: string): asserts cond { if (!cond) throw new E
 
 const OWNER = { tenantId: "raft_t1", agentId: "raft_a1" };
 const BASE = "https://ingest.example/";
+/** The agent's mounts, in the store's own `mounts` table (src/store/durable-object.ts): alias → plugin type. */
+function withMounts(sql: any, mounts: Array<[string, string]>, owner = OWNER) {
+  sql.exec("CREATE TABLE IF NOT EXISTS mounts (tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL, alias TEXT NOT NULL, installation_id TEXT NOT NULL, " +
+    "connection_id TEXT, plugin TEXT NOT NULL, tool_version TEXT NOT NULL, public_config TEXT NOT NULL, secret_ref TEXT, policy TEXT, tool_snapshot TEXT, " +
+    "PRIMARY KEY (tenant_id, agent_id, alias))");
+  for (const [alias, plugin] of mounts) {
+    sql.exec("INSERT INTO mounts(tenant_id, agent_id, alias, installation_id, plugin, tool_version, public_config) VALUES (?, ?, ?, ?, ?, '1', '{}')",
+      owner.tenantId, owner.agentId, alias, `inst_${alias}`, plugin);
+  }
+}
 const TOKEN = "tok_fake_write_only";
 const ENV = { GITHUB_REFRESH_INGEST_URL: BASE, GITHUB_REFRESH_INGEST_TOKEN: TOKEN, DEPLOYMENT_ENV: "preview" };
 const CFG = forwardConfigOf(ENV)!;
@@ -94,6 +104,7 @@ await check("the allowlist is one kind, github.refresh, and only its rows are fo
 
 await check("a forwarded row is exactly the receiver's columns, built from the row, and carries nothing else it held", async () => {
   const { sql } = sqliteHost(); const e = endpoint();
+  withMounts(sql, [["gh", "github"]]);
   // Extra attrs a future writer might add, one of them token-shaped: none may ride along.
   appendTrace(sql, [refresh(1, "kept-unstored", { attempt: 3, stored: false, reasonCode: "d1-write-failed", token: "ghu_secret", reason: "GitHub said x" })]);
   await pass(sql, e, r2());
@@ -103,10 +114,10 @@ await check("a forwarded row is exactly the receiver's columns, built from the r
   must(JSON.stringify([...FORWARD_COLUMNS].sort()) === JSON.stringify(["agent_id", "at", "attempt", "connector_id", "env", "mount", "outcome", "reason_code", "scope", "seq", "stored", "tenant_id", "why"]),
     `the column list moved: ${FORWARD_COLUMNS}`);
   const want: ForwardRow = { at: new Date(T0 + 1000).toISOString(), tenant_id: OWNER.tenantId, agent_id: OWNER.agentId, seq: 1, env: "preview",
-    outcome: "kept-unstored", scope: "mount", connector_id: "conn_1", mount: "gh", why: "expiring", attempt: 3, stored: false, reason_code: "d1-write-failed" };
+    outcome: "kept-unstored", scope: "mount", connector_id: "conn_1", mount: "github", why: "expiring", attempt: 3, stored: false, reason_code: "d1-write-failed" };
   must(JSON.stringify(row) === JSON.stringify(want), `row: ${JSON.stringify(row)}`);
   const wire = JSON.stringify(e.requests[0]!.rows);
-  must(!/ghu_|GitHub said|span|verdict|attrs/.test(wire), `something beyond the columns was sent: ${wire}`);
+  must(!/ghu_|GitHub said|span|verdict|attrs|"gh"/.test(wire), `something beyond the columns was sent: ${wire}`);
   // A missing attr is null, never a guess; a wrong-typed one is null too.
   const sparse = forwardRow({ ...pendingTrace(sql, 0).rows[0] ?? { seq: 9, at: T0, ...OWNER, kind: "github.refresh", spanId: "s", status: "broken", verdict: "failed" }, attrs: { scope: "connector", attempt: "2", stored: "yes" } } as any, "production");
   must(sparse.mount === null && sparse.attempt === null && sparse.stored === null && sparse.scope === "connector" && sparse.env === "production", JSON.stringify(sparse));
@@ -397,7 +408,7 @@ const WORKER_FIELDS: Record<string, Record<string, string>> = {
     dropped_already_told: "count", dropped_rule: "count", dropped_not_confirmed: "count", dropped_decisions_in_brief: "count", dropped_other: "count" },
   "raft.turn_ended": { result: ENUM("settled", "skipped", "unreadable"), reason: "code", conversations: "count", outcome: ENUM("completed", "interrupted", "failed") },
 };
-const ENVELOPE = ["seq", "at", "kind", "tenant_id", "agent_id", "span_id", "env", "status", "verdict", "ms"];
+const ENVELOPE = ["seq", "at", "kind", "tenant_id", "agent_id", "span_id", "env", "status", "verdict", "ms", "mount_index"];
 
 const ATR = (sql: any): number[] => sql.exec("SELECT seq FROM atr_forward_queue ORDER BY seq").toArray().map((r: any) => Number(r.seq));
 const atrLog = (sql: any) => sql.exec("SELECT reason, status, rows FROM atr_forward_log ORDER BY at").toArray();
@@ -432,6 +443,7 @@ async function lanePass(sql: any, e: ReturnType<typeof routes>, env: Record<stri
 /** One row of each kind, from the writers themselves where they can be called, else with the exact attrs their writer sets. */
 function everyKind(sql: any): void {
   const t = { ...OWNER };
+  withMounts(sql, [["assistant", "raft"], ["raft", "raft"]]);
   appendTrace(sql, [modelCallRow({
     ...t, jobId: "mj_0123456789abcdef01234567", stopReason: "toolUse", model: "anthropic/claude-sonnet-4.5", at: T0, createdAt: T0 - 4_000, answeredAt: T0,
     usage: { input: 1200, output: 80, cacheRead: 1000, cacheWrite: 200, reasoning: 12 }, session: "main", firstTool: "raft__messages_send",
@@ -474,7 +486,7 @@ const GOLDEN: Record<string, Record<string, unknown>> = {
     env: "preview", status: "retried", verdict: "failed", ms: 36100, attempt: 2, phase: "call", outcome: "http", total_ms: 36100,
     provider_ms: 35900, model: "anthropic/claude-sonnet-4.5", http_status: 529, error_class: "OverloadedError" },
   "tool.call": { seq: 3, at: new Date(T0 + 900).toISOString(), kind: "tool.call", tenant_id: "raft_t1", agent_id: "raft_a1", span_id: "op_00000000000000000001",
-    env: "preview", status: "failed", verdict: "failed", ms: 900, tool: "messages.send", mount: "raft", task: "main", run_ms: 800,
+    env: "preview", status: "failed", verdict: "failed", ms: 900, tool: "messages.send", mount: "raft", mount_index: 1, task: "main", run_ms: 800,
     exit_code: -1, error_code: "NOT_FOUND", http_status: 404 },
   "tool.refused": { seq: 4, at: new Date(T0 + 3).toISOString(), kind: "tool.refused", tenant_id: "raft_t1", agent_id: "raft_a1", span_id: "call_Rf0r3fUs3d1|fc_0123456789abcdef0123",
     env: "preview", status: "unknown_tool", verdict: "blocked", code: "unknown_tool", by: "run_js", from: "program" },
@@ -484,13 +496,13 @@ const GOLDEN: Record<string, Record<string, unknown>> = {
   "turn.stop": { seq: 6, at: new Date(T0 + 5).toISOString(), kind: "turn.stop", tenant_id: "raft_t1", agent_id: "raft_a1", span_id: "op_00000000000000000002",
     env: "preview", status: "stopped", verdict: "cancelled", trigger: "provider_stop", turn: "tt_main@1789999990000" },
   "raft.assistant_wake": { seq: 7, at: new Date(T0 + 6).toISOString(), kind: "raft.assistant_wake", tenant_id: "raft_t1", agent_id: "raft_a1",
-    span_id: "mount:assistant", env: "preview", status: "invoked", verdict: "ok", result: "invoked", trigger: "doorbell", conversations: 4,
+    span_id: "mount", mount_index: 0, env: "preview", status: "invoked", verdict: "ok", result: "invoked", trigger: "doorbell", conversations: 4,
     candidates: 2, seen: 1, unreadable: 0, lag_retry: 1, caught_up: true, caught_up_via: "mixed", caught_up_rule: "seq", muted: 1, told: 0 },
   "raft.assistant_notify": { seq: 8, at: new Date(T0 + 7).toISOString(), kind: "raft.assistant_notify", tenant_id: "raft_t1", agent_id: "raft_a1",
-    span_id: "op_00000000000000000003", env: "preview", status: "sent", verdict: "ok", state: "sent", items_in: 4, items_sent: 1, dropped: 3,
+    span_id: "op_00000000000000000003", mount_index: 0, env: "preview", status: "sent", verdict: "ok", state: "sent", items_in: 4, items_sent: 1, dropped: 3,
     dropped_already_told: 1, dropped_rule: 1, dropped_not_confirmed: 1 },
   "raft.turn_ended": { seq: 9, at: new Date(T0 + 8).toISOString(), kind: "raft.turn_ended", tenant_id: "raft_t1", agent_id: "raft_a1",
-    span_id: "mount:raft", env: "preview", status: "skipped", verdict: "ok", result: "skipped", reason: "snapshot_stale", conversations: 3,
+    span_id: "mount", mount_index: 1, env: "preview", status: "skipped", verdict: "ok", result: "skipped", reason: "snapshot_stale", conversations: 3,
     outcome: "completed" },
 };
 /** Same keys, same values, any order. */
@@ -521,7 +533,7 @@ await check("the fields per kind are the receiver's names and types, or narrower
       const ok = Array.isArray(mine)
         ? mine.join("|") === type || (type === "id" && mine.every((v) => RECEIVER_ID.test(v))) || (type === "code" && mine.every((v) => RECEIVER_CODE.test(v)))
         : mine === "flag" ? type === "count"
-        : mine === "session" || mine === "turn" || mine === "task" ? type === "id"
+        : mine === "session" || mine === "turn" || mine === "task" || mine === "mount" ? type === "id"
         : mine === type;
       if (!ok) diff.push(`${kind}.${f}: receiver ${type}, here ${Array.isArray(mine) ? mine.join("|") : mine}`);
     }
@@ -589,6 +601,7 @@ await check("a planted secret in a tool's error, in an unknown attr and in a wak
 
 await check("a value not in its field's shape is left out, never rewritten; a span that is not an id is left out; an unsendable row is counted, not sent", async () => {
   const { sql } = sqliteHost(); const e = routes();
+  withMounts(sql, [["gh", "github"]]);
   appendTrace(sql, [
     { at: T0, ...OWNER, kind: "tool.call", spanId: "op_ok", status: "succeeded", verdict: "ok", attrs: { tool: "has spaces in it", mount: "gh", exitCode: 1.7, runMs: -5 } },
     { at: T0 + 1, ...OWNER, kind: "tool.refused", spanId: "call_a|fc_b", status: "no_tools", verdict: "blocked", attrs: { code: "No_Tools", by: "gateway", from: "elsewhere" } },
@@ -599,7 +612,7 @@ await check("a value not in its field's shape is left out, never rewritten; a sp
   const rows = traced(e);
   must(rows.map((r) => r.seq).join(",") === "1,2,4", `sent: ${rows.map((r) => r.seq)}`);
   const [a, b, d] = rows;  // b's span is not a provider's call id shape (fc_ too short): left out
-  must(a.tool === undefined && a.exit_code === 1 && a.run_ms === undefined && a.mount === "gh", JSON.stringify(a));
+  must(a.tool === undefined && a.exit_code === 1 && a.run_ms === undefined && a.mount === "github" && a.mount_index === 0, JSON.stringify(a));
   must(!("span_id" in b) && b.from === undefined && b.code === "No_Tools", JSON.stringify(b));
   must(!("span_id" in d) && d.seq === 4 && d.error_class === undefined && d.trigger === "admin_cancel", JSON.stringify(d));
   must(JSON.stringify(atrLog(sql)) === JSON.stringify([{ reason: "unsendable", status: null, rows: 1 }]), JSON.stringify(atrLog(sql)));
@@ -835,6 +848,36 @@ await check("a URL that is not https is refused: no fetch on either lane, nothin
   const r = await sendForward(sql, forged, OWNER.tenantId, OWNER.agentId, async () => { fetched++; return new Response(null, { status: 200 }); },
     Date.now, FORWARD_TIMEOUT_MS, AGENT_TRACE_LANE);
   must(fetched === 0 && r.error === "config: url_not_https" && r.sent === 0 && ATR(sql).length === 9, JSON.stringify(r));
+});
+
+await check("a mount's alias never leaves, on either lane: its type is sent as `mount`, its ordinal as `mount_index`, its spans without it", async () => {
+  const ALIAS = "alice-alias-xyz", GONE = "bob-alias-gone";
+  const { sql } = sqliteHost();
+  withMounts(sql, [[ALIAS, "raft"], ["gh", "github"], ["zz-files", "artifacts"]]);
+  appendTrace(sql, [
+    toolCallRow({ ...OWNER, taskId: "main", operationId: "op_000000000000000000a1", mountAlias: ALIAS, tool: "messages.send", status: "succeeded",
+      createdAt: T0, endedAt: T0 + 5 }),
+    { at: T0 + 1, ...OWNER, kind: "raft.assistant_wake", spanId: `mount:${ALIAS}`, status: "invoked", verdict: "ok", attrs: { mount: ALIAS, trigger: "doorbell", conversations: 1 } },
+    { at: T0 + 2, ...OWNER, kind: "raft.assistant_wake", spanId: `wake:${ALIAS}:${T0 + 2}`, status: "failed", verdict: "failed", attrs: { reason: "engine_pd_unsupported", mount: ALIAS } },
+    { at: T0 + 3, ...OWNER, kind: "raft.assistant_notify", spanId: "op_000000000000000000a2", status: "sent", verdict: "ok", attrs: { mount: ALIAS, given: 1, sent: 1 } },
+    { at: T0 + 4, ...OWNER, kind: "raft.turn_ended", spanId: `mount:${ALIAS}`, status: "settled", verdict: "ok", attrs: { mount: ALIAS, targets: 1 } },
+    // A mount removed since: its alias names nothing now, so no type and no ordinal, and still never the alias.
+    toolCallRow({ ...OWNER, taskId: "main", operationId: "op_000000000000000000a3", mountAlias: GONE, tool: "x", status: "succeeded", createdAt: T0, endedAt: T0 + 6 }),
+    refresh(7, "rotated", { mount: ALIAS }),
+  ]);
+  const e = routes();
+  await lanePass(sql, e);
+  const body = e.requests.map((r) => r.text).join("\n");
+  for (const name of [ALIAS, "alice", GONE, "bob-alias"]) must(!body.includes(name), `the request body has ${name}: ${body.slice(0, 400)}`);
+  const rows = traced(e);
+  const bySeq = (n: number) => rows.find((r) => r.seq === n)!;
+  must(bySeq(1).mount === "raft" && bySeq(1).mount_index === 0, `tool.call: ${JSON.stringify(bySeq(1))}`);
+  must(bySeq(2).span_id === "mount" && bySeq(2).mount_index === 0, `wake: ${JSON.stringify(bySeq(2))}`);
+  must(bySeq(3).span_id === `wake:${T0 + 2}` && bySeq(3).mount_index === 0, `pd wake: ${JSON.stringify(bySeq(3))}`);
+  must(bySeq(4).mount_index === 0 && bySeq(5).span_id === "mount" && bySeq(5).mount_index === 0, `notify/turn_ended: ${JSON.stringify([bySeq(4), bySeq(5)])}`);
+  must(!("mount" in bySeq(6)) && !("mount_index" in bySeq(6)), `removed mount: ${JSON.stringify(bySeq(6))}`);
+  const ghr = e.requests.find((r) => r.path === GHR_PATH)!.rows[0];
+  must(ghr.mount === "raft" && ghr.seq === 7, `github.refresh: ${JSON.stringify(ghr)}`);
 });
 
 for (const r of results) console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);

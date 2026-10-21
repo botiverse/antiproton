@@ -295,13 +295,15 @@ await check("a token within five minutes of its expiry is renewed before the cal
   must(rows.find((r) => r.attrs.scope === "connector")!.attrs.stored === true, "the rotation's row does not say the pair was stored");
   clean(rows);
   // The writer's attrs as the forwarder reads them (cf/src/trace-forward.ts): a renamed attr would arrive as null.
-  const fwd = rows.map((r) => forwardRow(r, "preview"));
-  must(fwd.every((f) => f.outcome === "rotated" && f.connector_id === id && f.why === "expiring" && f.mount === "gh" && (f.scope === "connector" || f.scope === "mount")),
+  // The mount goes as its type, never its alias (cf/src/trace-forward.ts `MountsView`).
+  const MOUNTS = new Map([["gh", { plugin: "github", index: 0 }]]);
+  const fwd = rows.map((r) => forwardRow(r, "preview", MOUNTS));
+  must(fwd.every((f) => f.outcome === "rotated" && f.connector_id === id && f.why === "expiring" && f.mount === "github" && (f.scope === "connector" || f.scope === "mount")),
     `forwarded: ${JSON.stringify(fwd)}`);
   must(fwd.find((f) => f.scope === "connector")!.stored === true, `forwarded: ${JSON.stringify(fwd)}`);
   // Every attr the writer may set has a column, so nothing it records is silently left behind.
-  const sample: Record<string, unknown> = { scope: "mount", connectorId: "c", mount: "m", why: "w", attempt: 2, stored: false, reasonCode: "no-answer" };
-  const filled = (attrs: Record<string, unknown>) => Object.values(forwardRow({ ...rows[0]!, attrs }, "preview")).filter((v) => v !== null).length;
+  const sample: Record<string, unknown> = { scope: "mount", connectorId: "c", mount: "gh", why: "w", attempt: 2, stored: false, reasonCode: "no-answer" };
+  const filled = (attrs: Record<string, unknown>) => Object.values(forwardRow({ ...rows[0]!, attrs }, "preview", MOUNTS)).filter((v) => v !== null).length;
   for (const k of TRACE_ATTRS) must(k in sample && filled({ [k]: sample[k] }) === filled({}) + 1, `the trace attr ${k} has no column in a forwarded row`);
   w.dispose();
 });

@@ -240,7 +240,8 @@ have a lane's route yet answers 404, which pauses that lane only (below).
 **What is sent, `github.refresh`.** Rows of kind `github.refresh` only, every outcome (`rotated`, `adopted`, `broken`,
 `unavailable`, `store-failed`, `kept-unstored`, `interrupted-before`, `propagate-failed`), as
 `POST <base>/api/external/github-refresh`. Each row has exactly these fields and no other: `at` (ISO 8601), `tenant_id`,
-`agent_id`, `seq`, `env`, `outcome`, `scope`, `connector_id`, `mount`, `why`, `attempt`, `stored`, `reason_code`; an
+`agent_id`, `seq`, `env`, `outcome`, `scope`, `connector_id`, `mount` (the mount's plugin type, never its alias),
+`why`, `attempt`, `stored`, `reason_code`; an
 attr the row does not have is `null`. No span id, no verdict, no other attr, no token and no reason text. A row's
 identity is (`tenant_id`, `agent_id`, `seq`), the same on every resend, and the receiver dedupes on it.
 
@@ -253,8 +254,10 @@ boolean) is left out rather than rewritten. So no message text, prompt, tool arg
 conversation name leaves: a `tool.call` row's `error` (the tool's own sentence), a `model.call`'s `limit`, a wake's
 `error` are never fields. Nor is a name a person or a conversation has: the receiver's id shape takes `alice` as
 readily as an id, so an id field here carries only an opaque id this side mints (a session, turn or task in the shapes
-`main`, `sub_…`, `sess_…`, `iso_…`; a span as a job, operation, provider call id or `mount:<alias>`, else no `span_id`)
-or a name from code or configuration (a tool, a mount, a model); where the vocabulary is known (`by`, `trigger`,
+`main`, `sub_…`, `sess_…`, `iso_…`; a span as a job, operation, provider call id, else no `span_id`)
+or a name from code or configuration (a tool, a model, a mount's type); a mount's alias is a name someone typed, so it
+is never sent: `mount` is the mount's plugin type (`raft`, `github`, …), `mount_index` its ordinal in the agent's mount
+list, and a plugin row's span `mount:<alias>` goes as `mount`, `wake:<alias>:<ms>` as `wake:<ms>`. Where the vocabulary is known (`by`, `trigger`,
 `outcome`, `stop_reason`) it is that list. `model.call`'s `first_tool` and `tool.refused`'s `tool` are never filled:
 they are whatever the model wrote. A row's identity at the receiver is (`tenant_id`, `agent_id`, `seq`), the same on every resend;
 a span id is not unique per row (a wake's and a turn end's are the mount's). A row whose tenant or agent is not an id
