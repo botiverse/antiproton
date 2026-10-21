@@ -8,6 +8,7 @@
 | [`metering.md`](metering.md) | how a model call is metered on the pd engine: at delivery, verdict markers for unaccepted answers, and the drift check against pi-durable's `pi.usage`; prices (1 credit = $1), who pays, and the ledger's retention | yes — metering contract |
 | [`runbook.md`](runbook.md) | operating the deployment: finding and stopping a runaway agent | yes — operator procedure |
 | [`plugins.md`](plugins.md) | how to write, configure, observe, and test plugins in Antiproton | yes — plugin authoring guide |
+| [`assistant-default-instructions.md`](assistant-default-instructions.md) | the default `instructions` text of a personal assistant (its voice, and that it follows its owner's contact settings), verbatim, for Raft to send on provisioning; equal to `DEFAULT_ASSISTANT_INSTRUCTIONS` | yes — held equal to the code by a test |
 | [`philosophy.md`](philosophy.md) | the core philosophy, engineering invariants, and distributed systems rationale behind antiproton | yes — design manifesto |
 | [`pi-upstream.md`](pi-upstream.md) | how to stay in sync with pi — the seams, the copied source, the contracts no type expresses, the deliberate divergences, and the upgrade checklist | yes, for anything pi-related |
 | [`server-plan-archive.md`](server-plan-archive.md) | the original server-side (Cloudflare) pre-implementation plan doc, v1.1 | **no — frozen history** |

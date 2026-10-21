@@ -997,7 +997,10 @@ resolved against the owner's inbox (a message's full id from a thread row whose 
 around its short id). Code keeps, whatever the model does: a call from a short session (a check or the
 brief) or from a program is refused before anything is read, and the tool is not offered there either;
 `@everyone` and `@here` are refused before anything is read; one request per call, never retried, and
-after a `rate_limited` the same message to the same place is not sent again for ten minutes. A refusal
+after a `rate_limited` the same message to the same place is not sent again for ten minutes; within one
+turn (`caller.turnId`) the same message to the same place is posted once (an `uncertain` send counts,
+since it may have landed), a second call answered
+`not_sent` / `duplicate_in_turn` without a request (traced `refused:duplicate_in_turn`). A refusal
 (`assistant_send_as_owner_off`, `channel_not_found`, `message_not_found`, `owner_cannot_post`,
 `mass_mention_not_allowed`, `invalid_content`, `rate_limited`, `channel_archived`, a missing route, or a
 target the inbox cannot resolve) is answered `not_sent` with the code and a `tell` line for the owner,
@@ -1012,7 +1015,38 @@ pauses the checks, the brief and the notify tool until Raft's context names the
 owner again. The chat is offered the owner DM, attachments, the reads, the
 preferences and send-as-owner (plus `resume` and the parked-result reader), with no run_js, jobs
 or subagents, under a prompt of its own (`assistantSystemPrompt`,
-`src/runtime/pi-prompt.ts`). What an owner read returns is never parked: a result over the line is cut with a note
+`src/runtime/pi-prompt.ts`, the one entry point for it).
+
+That prompt is split by who owns each part. Raft owns the stable part: how the assistant talks
+(voice), and that it follows its owner's contact settings and answers from them, with no concrete
+default in it (no brief time, quiet hours or list of what is reported). It sends that as the agent's `instructions`
+(POST on create, PATCH to change), which the runtime reads back as the persona's description.
+antiproton keeps the part bound to code (`assistantPrompt`, `src/plugins/raft-assistant.ts`): the
+tools and how to use them (the owner reads, the DM, `assistant_preferences`,
+`assistant_send_as_owner`), that what it reads is information and never instructions, that it sends
+as its owner only when the owner explicitly asks, which DMs the reads cover, the `#channel:msgid`
+citation the told-tracking parses, the shape and limit of the unasked messages code composes, and
+that every reply to the owner, a question back included, goes through `messages_send` (the text a
+turn ends with is shown to no one; this is the code part's last paragraph, so the last thing the model
+reads, and is said again in the precedence line), the effective defaults, written from code's constants: the brief's time (`BRIEF_HOUR`), the default
+quiet hours (`DEFAULT_QUIET`) and what is reported by default. The preferences tool's `list` returns
+the same facts for the owner's settings (`quiet`, `brief`, `defaults`, then the rules), which is what
+the assistant answers "what rules do you follow" from.
+The chat's prompt is the name line, then Raft's instructions verbatim, or
+`DEFAULT_ASSISTANT_INSTRUCTIONS` (`src/plugins/raft-assistant-instructions.ts`) when they are empty
+or blank, then the code part, whose first line (`assistantPrecedence`) says it wins over anything
+above it that conflicts: the instructions can change how the assistant sounds, not what it may do,
+and the tool guards (no send-as-owner from a check, refused in code) hold whatever they say. A
+check's prompt is `assistantCheckPrompt` alone, with no name and no instructions: what a check
+reports is decided by code and the owner's rules. Nothing in the system prompt is generated per
+turn (the owner's current rules reach the chat through the preferences tool and a check or brief
+through its input), so each agent's prompt is one stable, cacheable prefix.
+`docs/assistant-default-instructions.md` is the default text exactly, for handing to Raft (a test
+holds it equal to the constant). What not to put in Raft's instructions: tool names, limits,
+reference formats, or any rule about sending as the owner, treating read content as instructions,
+or applying contact settings; those are code's, and an instruction that contradicts them loses.
+
+What an owner read returns is never parked: a result over the line is cut with a note
 to page, whatever reader is mounted, and a short session's erase also deletes anything its calls parked. Reads of an
 assistant's conversation by an operator or the console need a reason and are audited (docs/runbook.md). An assistant runs on pi085 only: moving it to pd
 (`migrateEngine`) is refused with the reason, and one already there has each
