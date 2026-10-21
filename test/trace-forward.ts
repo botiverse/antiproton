@@ -393,7 +393,7 @@ console.log(`\n  agent.trace forward\n  ${"─".repeat(56)}`);
 
 /**
  * The receiver's fields per kind and their types, as the trace-upload worker's `antiprotonTrace.ts`
- * (`ANTIPROTON_TRACE_KINDS`) has them at botiverse/slock 240303c6 (#10611). Pinned here so a drift on either side shows.
+ * (`ANTIPROTON_TRACE_KINDS`) has them at botiverse/slock 8596d839 (#10611, #10643). Pinned here so a drift on either side shows.
  * `mount_index` is this side's envelope (any row about a mount), so it is checked apart from the kind's fields.
  */
 const ENUM = (...v: string[]) => v.join("|");
@@ -418,7 +418,7 @@ const WORKER_FIELDS: Record<string, Record<string, string>> = {
     reason: ENUM("malformed", "version", "instruction_too_large", "no_notify", "raft_check_off", "engine_pd_unsupported"),
     instruction_bytes: "count", tools_offered: "count", tools_dropped: "count", placeholders_unknown: "count", placeholders_unoffered: "count",
     items: "count", truncated: "count", skipped: "count", digest: "count", always: "count", dm: "count", mention: "count", thread: "count",
-    named: "count", default_out: "count", night_held: "count",
+    named: "count", default_out: "count", night_held: "count", behind: "count",
     error_code: ENUM("inbox_refused", "inbox_shape", "not_enabled", "unexpected"), http_status: "count" },
   "raft.assistant_check": { mount_index: "count", check_id: "id", trigger: ENUM("doorbell", "brief"), outcome: ENUM("completed", "failed", "cancelled"),
     error_code: "code", attempts: "count", http_status: "count", code: "code" },
@@ -443,10 +443,10 @@ const WORKER_FIELDS: Record<string, Record<string, string>> = {
 /**
  * What this side sends that the receiver does not keep yet, by the receiver's types: new kinds, new fields, and enums
  * widened (a value outside the receiver's list is dropped by it, the row kept). The field table sent to the receiving
- * side is this; when the receiver takes an entry, it moves to WORKER_FIELDS. botiverse/slock#10611 took every entry it had;
- * `behind` (Raft's check: 0/1, the inbox read trailed the doorbell) waits on botiverse/slock#10643.
+ * side is this; when the receiver takes an entry, it moves to WORKER_FIELDS. Empty: botiverse/slock#10611 and #10643 took
+ * every entry they had.
  */
-const PROPOSED: Record<string, Record<string, string>> = { "raft.assistant_wake": { behind: "count" } };
+const PROPOSED: Record<string, Record<string, string>> = {};
 /** The receiver's fields once PROPOSED lands: what this side's fields are pinned to. */
 const CONTRACT: Record<string, Record<string, string>> = Object.fromEntries([...new Set([...Object.keys(WORKER_FIELDS), ...Object.keys(PROPOSED)])]
   .map((k) => [k, { ...WORKER_FIELDS[k], ...PROPOSED[k] }]));
