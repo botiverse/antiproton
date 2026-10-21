@@ -15,7 +15,7 @@ import { PUSH_KEY, PUSH_STORE, raftPlugin, wakeInstruction } from "../src/plugin
 import { activityEvents, turnEnds } from "../src/runtime/activity.ts";
 import {
   ASSISTANT_STORE, CHAT_TOOLS, CHECK_KEY, CHECK_TOOLS, SEND_AS_OWNER_TOOL, SEND_LIMITED_HOLD_MS, COUNTS_KEY, DEFERRED_KEY, DM_ITEMS_MAX, INBOX_LAG_RETRY_MS, OWNER_KEY, REMINDED_STORE, RETRY_BACKOFF_MS, REVIEWED_KEY, SUMMARY_MAX, UNREADABLE_KEY,
-  assistantCheckPrompt, assistantPrecedence, assistantMountOf, assistantPrompt, assistantWake, assistantWakeInstruction, compose, confirmRef, FAILED_TURN_LINE, isQuietHours, itemOf, localDay, nextBriefAt, noteDoorbell, zoneOf,
+  assistantCheckPrompt, assistantPrecedence, assistantMountOf, assistantPrompt, assistantWake, assistantWakeInstruction, compose, confirmRef, FAILED_TURN_LINE, isQuietHours, itemOf, localDay, nextBriefAt, noteDoorbell, sendAsOwner, zoneOf,
 } from "../src/plugins/raft-assistant.ts";
 import { confirmLine, matches, ruleLine, rulesOf, winningRule, type ContactRule } from "../src/plugins/raft-assistant-rules.ts";
 import { setLogSink } from "../src/core/log.ts";
@@ -1498,6 +1498,56 @@ await check("send as owner: never from a short session (a check or the brief) or
   must(CHAT_TOOLS.includes(SEND_AS_OWNER_TOOL) && !CHECK_TOOLS.includes(SEND_AS_OWNER_TOOL), "offered in the chat only");
 });
 
+/** Every request the plugin makes while `fn` runs, as `METHOD path`; the fake Raft still answers them. */
+async function requestsDuring<T>(fn: () => Promise<T>): Promise<{ out: T | Error; requests: string[] }> {
+  const real = globalThis.fetch;
+  const requests: string[] = [];
+  globalThis.fetch = (async (url: any, init?: any) => { requests.push(`${init?.method ?? "GET"} ${new URL(String(url)).pathname}`); return real(url, init); }) as any;
+  try { return { out: await fn().catch((e) => e as Error), requests }; } finally { globalThis.fetch = real; }
+}
+
+// The listing drops the assistant tools with the owner, but a recheck (a paused notify or wake asking Raft's context
+// again, `recheckOwner`) drops only the owner record: until the mount is listed again its list still names the tool,
+// so the gateway and the plugin's `offered` check both let the call through and the owner check is the one that holds.
+await check("send as owner: an owner dropped by a recheck while the mount's list still names the tool is refused before any request to Raft", async () => {
+  const a = await sender();
+  // Control: the same mount and list, with its owner, reaches Raft.
+  must((await asOwner(a, { target: "#ch1", content: "On it." })).state === "sent" && a.r.asOwner.length === 1, `control: ${show(a.r.asOwner)}`);
+  a.write(ASSISTANT_STORE, OWNER_KEY, { ...a.read(ASSISTANT_STORE, OWNER_KEY), pausedAt: 1 });
+  a.r.owner = false;
+  const n = await atTime(DAY, () => notify(a.ctx, { items: ITEMS }).then(() => null, (e) => e as Error));
+  must(n && /not enabled/.test(n.message), `the paused notify: ${n?.message}`);
+  must(a.read(ASSISTANT_STORE, OWNER_KEY) === undefined, `control: the recheck kept the owner: ${show(a.read(ASSISTANT_STORE, OWNER_KEY))}`);
+  must((a.ctx.offered as string[]).includes(SEND_AS_OWNER_TOOL), "control: the mount's list no longer names the tool");
+  // A channelId goes straight to the POST without a read, so only the owner check stands between it and Raft.
+  for (const target of ["#ch1", "@bob", "#ch1:aaaaaaa1", conv(1).channelId]) {
+    const { out, requests } = await requestsDuring(() => asOwner(a, { target, content: "Friday works." }));
+    must(out instanceof Error && out.message.includes(`${SEND_AS_OWNER_TOOL}: this agent is not anyone's assistant now`), `${target}: ${show(out)} ${(out as Error)?.message}`);
+    must(requests.length === 0, `${target}: requests to Raft: ${show(requests)}`);
+    must(a.r.asOwner.length === 1, `${target}: sent as the owner: ${show(a.r.asOwner)}`);
+    const row = sendRows(a).at(-1);
+    must(row?.status === "refused:no_owner" && row.verdict === "blocked", `${target}: ${show(row)}`);
+  }
+  // Nothing of the refusal reached the owner's DM either.
+  must(a.r.sends.length === 0, `sent: ${show(a.r.sends)}`);
+});
+
+await check("send as owner: the implementation with no owner record refuses every target before reading or posting anything", async () => {
+  const a = mount(ALL_TOOLS);
+  const used: string[] = [];
+  const deps = {
+    inbox: async () => { used.push("inbox"); return { ok: true, data: { items: sendRows0() } }; },
+    messages: async () => { used.push("messages"); return { ok: false, status: 404 }; },
+    post: async () => { used.push("post"); return { ok: true, status: 200, data: {} }; },
+  } as never;
+  for (const target of ["#ch1", "@bob", "#ch1:aaaaaaa1", conv(1).channelId]) {
+    const e = await sendAsOwner({ target, content: "Friday works." }, a.ctx, deps).catch((x) => x as Error);
+    must(e instanceof Error && e.message.includes(`${SEND_AS_OWNER_TOOL}: this agent is not anyone's assistant now`), `${target}: ${show(e)} ${(e as Error)?.message}`);
+    must(used.length === 0, `${target}: called ${show(used)}`);
+    must(a.traced.at(-1)?.status === "refused:no_owner", `${target}: ${show(a.traced.at(-1))}`);
+  }
+});
+
 await check("send as owner: no message, channel or person name, or id reaches a trace row or a log line", async () => {
   const CONTENT = "zz-SECRET-CONTENT-77", CHAN = "zz-secret-chan", PEER = "zz-peer-name";
   const lines: string[] = [];
@@ -2149,6 +2199,37 @@ await check("send as owner end to end: the chat's call posts; a check's call nev
       w.host.dispose();
     }
   }
+});
+
+// The turn's tools are fixed when it starts; the owner is read at the call. An owner Raft drops in between (here, as a
+// recheck drops the record) leaves the tool offered for the rest of the turn, and the call reaches the plugin.
+await check("send as owner end to end: an owner dropped after the turn was offered the tool is refused at the call, and nothing is posted", async () => {
+  const sendCall = (id: string, content: string): ModelResponse => ({ text: "", finishReason: "tool_calls", truncated: false, usage,
+    toolCalls: [{ id, name: "raft__assistant_send_as_owner", arguments: { target: conv(1).channelId, content } }] } as ModelResponse);
+  let drop = false, called = 0;
+  let dropOwner = () => {};
+  const w = await runtimeWith(true, (c) => {
+    if (c.systemPrompt === assistantCheckPrompt("raft") || (c.messages.at(-1) as any)?.role === "toolResult") return say("done");
+    called++;
+    if (drop) dropOwner();
+    return sendCall(`n${called}`, drop ? "Second." : "First.");
+  }, DEFAULT_ASSISTANT_INSTRUCTIONS);
+  const tables = new PluginDbTables(w.host).ensure();
+  dropOwner = () => { w.r.owner = false; tables.delete({ tenantId: "t", agentId: "a", alias: "raft", plugin: "raft" }, ASSISTANT_STORE, OWNER_KEY); };
+  const rows = () => (w.host.sql.exec("SELECT status, verdict FROM trace_outbox WHERE kind = 'raft.assistant_send_as_owner' ORDER BY seq").toArray() as any[]).map((x) => `${x.status}/${x.verdict}`);
+  try {
+    // Control: with the owner, the same call posts.
+    await w.turn("tell #ch1: First.");
+    must(called === 1 && w.r.asOwner.length === 1 && w.r.asOwner[0].content === "First.", `control: ${called} ${show(w.r.asOwner)}`);
+    drop = true;
+    await w.turn("tell #ch1: Second.");
+    const turn = w.calls.filter((c) => c.systemPrompt !== assistantCheckPrompt("raft")).at(-1)!;
+    must(called === 2 && turn.tools.some((t) => t.name === "raft__assistant_send_as_owner"), `control: the second turn was offered it and called it: ${called}`);
+    must(w.db.read(ASSISTANT_STORE, OWNER_KEY) === undefined, `control: the owner record is back: ${show(w.db.read(ASSISTANT_STORE, OWNER_KEY))}`);
+    must(w.r.asOwner.length === 1, `sent as an owner no longer there: ${show(w.r.asOwner)}`);
+    must(show(rows()) === show(["sent/ok", "refused:no_owner/blocked"]), show(rows()));
+    must(/not anyone's assistant now/.test(JSON.stringify(turn.messages.at(-1))), JSON.stringify(turn.messages.at(-1)).slice(0, 600));
+  } finally { w.host.dispose(); }
 });
 
 await check("send as owner end to end: a chat turn that calls it twice with the same message posts once, the second answered duplicate_in_turn", async () => {
