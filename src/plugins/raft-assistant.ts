@@ -1222,7 +1222,8 @@ const PERSON_TARGET = /^(?:dm:)?@([^\s:@]{1,64})$/;
 /** The last send Raft refused as `rate_limited`, by a hash of where and what: the same send is not tried again within this. */
 export const SEND_LIMITED_KEY = "send_limited";
 /**
- * What send-as-owner posted in the current turn: the turn's id and each post's key (target and content). The same
+ * What send-as-owner posted, or may have posted (`uncertain`), in the current turn: the turn's id and each post's key
+ * (target and content). The same
  * message to the same place a second time in one turn is answered `duplicate_in_turn` and not posted: a model that
  * sends, then sends again because it lost track, must not post twice for one request.
  */
@@ -1330,8 +1331,9 @@ async function resolveTarget(target: string, inThread: boolean, ctx: PluginConte
  * - no `@everyone` / `@here`, refused before anything is read;
  * - one request to Raft per call, never retried here; and after a `rate_limited` the same message to the same place is
  *   not sent again for `SEND_LIMITED_HOLD_MS`, whatever the model calls;
- * - the same message to the same place posted once per turn: a second identical call in the turn is answered
- *   `not_sent` / `duplicate_in_turn` without a request (`SENT_IN_TURN_KEY`);
+ * - the same message to the same place posted once per turn: after one that was sent, or that is `uncertain` (it may
+ *   have landed), a second identical call in the turn is answered `not_sent` / `duplicate_in_turn` without a request
+ *   (`SENT_IN_TURN_KEY`);
  * - a refusal is answered, not thrown: `not_sent` with Raft's code and the one line the owner is to get (`TELL`), and
  *   the message where they could send it themselves.
  * Its trace row (`raft.assistant_send_as_owner`) and log line say only the result's code, the target's form, whether it
@@ -1395,8 +1397,12 @@ export async function sendAsOwner(args: unknown, ctx: PluginContext, deps: SendA
   }
   const body = { channelId: resolved.channelId, content, ...(resolved.parentMessageId ? { parentMessageId: resolved.parentMessageId } : {}) };
   const out = await deps.post(ctx, body);
+  // Posted, or maybe posted: an uncertain send may have landed, and a second post as the owner is worse than a missed one.
+  const noteSent = () => turn !== null
+    ? ctx.db.put(ASSISTANT_STORE, { turn, keys: [...sentThisTurn, sendKey].slice(-SENT_IN_TURN_MAX) } as unknown as Json, SENT_IN_TURN_KEY)
+    : Promise.resolve();
   if (out.ok) {
-    if (turn !== null) await ctx.db.put(ASSISTANT_STORE, { turn, keys: [...sentThisTurn, sendKey].slice(-SENT_IN_TURN_MAX) } as unknown as Json, SENT_IN_TURN_KEY);
+    await noteSent();
     trace("sent");
     return {
       state: "sent", where: resolved.where,
@@ -1404,6 +1410,7 @@ export async function sendAsOwner(args: unknown, ctx: PluginContext, deps: SendA
     };
   }
   const result = raftResult(out);
+  if (result === "uncertain") await noteSent();
   if (result === "rate_limited") await ctx.db.put(ASSISTANT_STORE, { key: sendKey, at: now } as unknown as Json, SEND_LIMITED_KEY);
   if (result === "assistant_not_enabled") await pauseOn(ctx, new Error(NOT_ENABLED));
   return notSent(result, out.status !== null ? { http_status: out.status } : {});

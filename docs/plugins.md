@@ -998,7 +998,8 @@ around its short id). Code keeps, whatever the model does: a call from a short s
 brief) or from a program is refused before anything is read, and the tool is not offered there either;
 `@everyone` and `@here` are refused before anything is read; one request per call, never retried, and
 after a `rate_limited` the same message to the same place is not sent again for ten minutes; within one
-turn (`caller.turnId`) the same message to the same place is posted once, a second call answered
+turn (`caller.turnId`) the same message to the same place is posted once (an `uncertain` send counts,
+since it may have landed), a second call answered
 `not_sent` / `duplicate_in_turn` without a request (traced `refused:duplicate_in_turn`). A refusal
 (`assistant_send_as_owner_off`, `channel_not_found`, `message_not_found`, `owner_cannot_post`,
 `mass_mention_not_allowed`, `invalid_content`, `rate_limited`, `channel_archived`, a missing route, or a

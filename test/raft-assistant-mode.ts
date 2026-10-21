@@ -1412,6 +1412,28 @@ await check("send as owner: the same message to the same place twice in one turn
   must(!show(a.traced).includes("sounds good"), "the trace carries the text");
 });
 
+await check("send as owner: an uncertain send (it may have landed) counts as sent for the turn: the same call again is duplicate_in_turn; a refused one does not", async () => {
+  for (const answer of ["drop", { status: 503, code: null }] as const) {
+    const a = await sender();
+    a.ctx.caller = { ...a.ctx.caller, turnId: "turn-u" };
+    a.r.asOwnerAnswer = answer;
+    const first = await asOwner(a, { target: "#ch1", content: "sounds good" });
+    must(first.state === "not_sent" && first.code === "uncertain", `${show(answer)}: ${show(first)}`);
+    a.r.asOwnerAnswer = { status: 200, code: null };
+    const again = await asOwner(a, { target: "#ch1", content: "sounds good" });
+    must(again.state === "not_sent" && again.code === "duplicate_in_turn", `${show(answer)}: ${show(again)}`);
+    must(a.r.asOwner.length === 1, `${show(answer)}: POSTs ${a.r.asOwner.length}`);
+    must(show(sendRows(a).map((t) => t.status)) === show(["uncertain", "refused:duplicate_in_turn"]), show(sendRows(a)));
+  }
+  // A send Raft refused did not land: the same call again in the turn is tried.
+  const b = await sender();
+  b.ctx.caller = { ...b.ctx.caller, turnId: "turn-f" };
+  b.r.asOwnerAnswer = { status: 400, code: "invalid_content" };
+  must((await asOwner(b, { target: "#ch1", content: "sounds good" })).code === "invalid_content", "control: refused");
+  b.r.asOwnerAnswer = { status: 200, code: null };
+  must((await asOwner(b, { target: "#ch1", content: "sounds good" })).state === "sent" && b.r.asOwner.length === 2, `refused then sent: ${b.r.asOwner.length}`);
+});
+
 await check("send as owner: never from a short session (a check or the brief) or a program, in code: refused before anything is read or sent", async () => {
   for (const caller of [{ taskId: "iso_0123456789abcdef0123" }, { fromProgram: true }]) {
     const a = await sender();
