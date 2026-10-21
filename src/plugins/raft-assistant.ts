@@ -45,7 +45,7 @@ import type { RaftAssistantOf } from "@botiverse/raft-sdk";
 import { modelToolName } from "../runtime/pi-tools.ts";
 import type { PluginContext, PluginNext, ToolSchema } from "./types.ts";
 import {
-  CONTACT_KEY, DEFAULTS_LINE, EFFECTS, ITEM_KINDS, PEER_ID_FIELD, QUIET_FORMAT, RULES_MAX, SENDER_ID_FIELD, confirmLine, contactOf, inQuiet, isActive,
+  CONTACT_KEY, DEFAULTS_LINE, EFFECTS, ITEM_KINDS, PEER_FIELD, QUIET_FORMAT, RULES_MAX, SENDER_ID_FIELD, SENDER_TYPE_FIELD, personType, confirmLine, contactOf, inQuiet, isActive,
   keptRules, loadContact, modelRulesLine, personRulesUnenforced, quietLine, ruleLine, rulesAttrs, rulesOf, untilOf, winningRule,
   type ContactRule, type ItemKind, type QuietHours, type Subject, type Target,
 } from "./raft-assistant-rules.ts";
@@ -852,9 +852,19 @@ export async function noteToldInChat(ctx: PluginContext, target: unknown, conten
   return fresh;
 }
 
+/**
+ * Raft's read of a person by the name the owner gave (`GET /assistant/owner-resolve?name=`, `alice~human` on a
+ * collision): the person, `unknown` when Raft answers that the owner can see no one of that name, `unavailable` when the
+ * route itself is not there (a Raft from before it), `failed` for any other failure.
+ */
+export type PersonResolve = (ctx: PluginContext, name: string) =>
+  Promise<{ ok: true; id: string; type: unknown; name: string | null } | { ok: false; reason: "unknown" | "unavailable" | "failed" }>;
+
 export interface PreferencesDeps {
   /** The owner inbox read a channel, a thread or a person is resolved against, to its id. */
   inbox: InboxRead;
+  /** Raft's person read; with none, or where Raft has no such route, a person is looked for in the owner's inbox rows. */
+  resolve?: PersonResolve;
   now?: () => number;
 }
 
@@ -920,7 +930,7 @@ export async function preferences(args: unknown, ctx: PluginContext, deps: Prefe
     if (a.anytime === true && effect !== "always") return refuse("anytime", "anytime is only for effect always", t);
     const until = untilOf(a.until, now);
     if (until && typeof until === "object") return refuse("until", until.refused, t);
-    const subject = await subjectFor(scope, named[0]![1], ctx, deps.inbox);
+    const subject = await subjectFor(scope, named[0]![1], ctx, deps);
     if (typeof subject === "string") return refuse(subject.split(":")[0]!, subject.slice(subject.indexOf(":") + 1).trim(), t);
     const rule: ContactRule = {
       id: "", effect, subject, anytime: a.anytime === true, until: until as string | null,
@@ -1002,10 +1012,11 @@ const PERSON = /^@?([^\s@]{1,64})$/;
 /**
  * A rule's subject as the owner named it, resolved to Raft's ids against their inbox, or `code: message` when it cannot
  * be: a channel must be one of the owner's conversations; a thread one of the threads they follow, by its first
- * message; a person is kept by the id an inbox row gives for that name (`SENDER_ID_FIELD`, `PEER_ID_FIELD`), and with
+ * message; a person is kept by the id an inbox row gives for that name (`SENDER_ID_FIELD`, `PEER_FIELD`) when Raft's resolve read is not there yet, and with
  * no id while Raft sends none.
  */
-async function subjectFor(scope: string, value: unknown, ctx: PluginContext, inbox: InboxRead): Promise<Subject | string> {
+async function subjectFor(scope: string, value: unknown, ctx: PluginContext, deps: PreferencesDeps): Promise<Subject | string> {
+  const inbox = deps.inbox;
   if (scope === "dms") return { kind: "dms" };
   if (scope === "kind") {
     const k = ITEM_KINDS.find((x) => x === value);
@@ -1016,13 +1027,22 @@ async function subjectFor(scope: string, value: unknown, ctx: PluginContext, inb
     const m = PERSON.exec(value.trim());
     if (!m) return "person: a person is their @name, with no spaces";
     const name = m[1]!;
+    // Raft's own answer first: the person's id at once, whether or not they are in the owner's inbox now.
+    const said = deps.resolve ? await deps.resolve(ctx, name) : { ok: false as const, reason: "unavailable" as const };
+    if (said.ok) {
+      const type = personType(said.type);
+      if (!type) return `person_not_a_person: @${name} is not a person (a system account)`;
+      return { kind: "person", id: said.id, type, name: said.name?.replace(/^@/, "") || name };
+    }
+    if (said.reason === "unknown") return `person_unknown: your owner can see no one called @${name}; check the name (with ~human or ~agent when two share it)`;
+    if (said.reason === "failed") return `resolve: Raft could not look up @${name} just now; try again shortly`;
     const rows = await allConversations(ctx, inbox);
     const suffix = /~(human|agent)$/.exec(name)?.[1] as "human" | "agent" | undefined;
     const ids = new Map<string, "human" | "agent" | null>();
     for (const r of rows ?? []) {
-      const dmPeer = r.channelType === "dm" && r.peerId && r.channelName?.replace(/^@/, "").toLowerCase() === name.toLowerCase() ? r.peerId : null;
-      const sender = r.senderId && r.latestSenderName?.replace(/^@/, "").toLowerCase() === name.toLowerCase() ? r.senderId : null;
-      for (const id of [dmPeer, sender]) if (id) ids.set(id, suffix ?? (r.senderType === "agent" || r.senderType === "human" ? r.senderType : null));
+      const same = (n: string | null | undefined) => n?.replace(/^@/, "").toLowerCase() === name.toLowerCase();
+      if (r.channelType === "dm" && r.peerId && same(r.channelName)) ids.set(r.peerId, suffix ?? r.peerType ?? null);
+      if (r.senderId && same(r.latestSenderName)) ids.set(r.senderId, suffix ?? (r.senderType === "system" ? null : r.senderType ?? null));
     }
     if (ids.size > 1) return `person_ambiguous: more than one person is called @${name}: say @${name}~human or @${name}~agent`;
     const [id, type] = [...ids.entries()][0] ?? [null, suffix ?? null];
@@ -1127,12 +1147,14 @@ export interface InboxItem {
   /** A thread's channel (null for a channel). */
   parentChannelId?: string | null;
   /**
-   * The latest message's sender id (`SENDER_ID_FIELD`) and type, and on a DM row the other person's id (`PEER_ID_FIELD`):
-   * absent while Raft sends no such field (then no person rule matches in code), null when it sends none for the row.
+   * The latest message's sender id (`SENDER_ID_FIELD`) and type (Raft's `user` read as `human`; a `system` sender's id is
+   * dropped, it being no person), and on a DM row the other person's id and type (`PEER_FIELD`): absent while Raft sends
+   * no such field (then no person rule matches in code), null when it sends none for the row.
    */
   senderId?: string | null;
-  senderType?: string | null;
+  senderType?: "human" | "agent" | "system" | null;
   peerId?: string | null;
+  peerType?: "human" | "agent" | null;
   /** The conversation's type as Raft gives it (a thread's: its parent's), `dm` for a DM; absent when Raft sends none. */
   channelType?: string;
   /**
@@ -1148,6 +1170,22 @@ export type InboxRead = (ctx: PluginContext, request: { filter: "unread" | "all"
 
 const INBOX_LIMIT = 50;
 
+/** A row's people fields (`SENDER_ID_FIELD`, `SENDER_TYPE_FIELD`, `PEER_FIELD`), as far as Raft sent them. */
+function peopleOf(o: Record<string, unknown>): Pick<InboxItem, "senderId" | "senderType" | "peerId" | "peerType"> {
+  const str = (v: unknown) => (typeof v === "string" && v ? v : null);
+  const out: Pick<InboxItem, "senderId" | "senderType" | "peerId" | "peerType"> = {};
+  const system = o[SENDER_TYPE_FIELD] === "system";
+  if (SENDER_TYPE_FIELD in o) out.senderType = system ? "system" : personType(o[SENDER_TYPE_FIELD]);
+  if (SENDER_ID_FIELD in o) out.senderId = system ? null : str(o[SENDER_ID_FIELD]);
+  if (PEER_FIELD in o) {
+    const p = o[PEER_FIELD] && typeof o[PEER_FIELD] === "object" ? o[PEER_FIELD] as Record<string, unknown> : {};
+    const type = personType(p.type);
+    out.peerId = type ? str(p.id) : null;
+    out.peerType = type;
+  }
+  return out;
+}
+
 /** The answer's conversations, or null when it is not an inbox answer at all. */
 export function inboxItemsOf(data: unknown): InboxItem[] | null {
   const items = data && typeof data === "object" ? (data as Record<string, unknown>).items : null;
@@ -1162,9 +1200,7 @@ export function inboxItemsOf(data: unknown): InboxItem[] | null {
       latestSenderName: str(o.latestSenderName), latestPreview: str(o.latestPreview), firstUnreadMessageId: str(o.firstUnreadMessageId),
       ...(str(o.parentMessageId) ? { parentMessageId: str(o.parentMessageId) } : {}),
       ...(str(o.parentChannelId) ? { parentChannelId: str(o.parentChannelId) } : {}),
-      ...(SENDER_ID_FIELD in o ? { senderId: str(o[SENDER_ID_FIELD]) } : {}),
-      ...(str(o.latestSenderType) ? { senderType: str(o.latestSenderType) } : {}),
-      ...(PEER_ID_FIELD in o ? { peerId: str(o[PEER_ID_FIELD]) } : {}),
+      ...peopleOf(o),
       ...(str(o.channelType) ? { channelType: str(o.channelType)! } : {}),
       ...("latestSeq" in o ? { latestSeq: seqOf(o.latestSeq) } : {}),
     }];

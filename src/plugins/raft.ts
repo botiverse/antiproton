@@ -25,7 +25,7 @@ import { internalHost } from "./http.ts";
 import {
   ASSISTANT_OWN_TOOLS, ASSISTANT_STORE, CONTACT_KEY, DEFERRED_KEY, NOTIFY_TOOL, OWNER_KEY, PREFERENCES_TOOL, REMINDED_STORE, RULES_KEY,
   assistantWake, assistantWakeInstruction, doorbellOf, isDoorbellTarget, keepOwnerFromContext, learnDm, loadOwner, mergeSources, noteDoorbell,
-  notifyOwner, noteToldInChat, pauseOn, preferences, type AssistantOwner, type ChangeSources, type OwnerContext, type OwnerSend,
+  notifyOwner, noteToldInChat, pauseOn, preferences, type PersonResolve, type AssistantOwner, type ChangeSources, type OwnerContext, type OwnerSend,
 } from "./raft-assistant.ts";
 import { callMcp, isMcpTool, keptMcpOf, leftOut, listMcp, mcpClock, mcpLines, MCP_CALL_TIMEOUT_MS, MCP_CAPABILITY, MCP_KEY, MCP_PREFIX } from "./raft-mcp.ts";
 import { modelToolName } from "../runtime/pi-tools.ts";
@@ -3182,7 +3182,7 @@ export function createRaftPlugin(deps: {
         // Offered as the owner reads are, and refused the same way where the mount's list does not name them.
         if (!ctx.offered?.includes(name)) throw ownerRefusal(`${name} is not offered on this mount: its Raft account is not a personal assistant`);
         return name === NOTIFY_TOOL ? notifyOwner(args, ctx, { send: sendToOwner, recheck: recheckOwner })
-          : preferences(args, ctx, { inbox: (c, r) => assistant.ownerInbox(c, r) });
+          : preferences(args, ctx, { inbox: (c, r) => assistant.ownerInbox(c, r), resolve: resolveOwnerPerson });
       }
       if (name === "receive_events") {
         const limit = integer(a.limit, "limit", 1, EVENTS_LIMIT) ?? EVENTS_LIMIT;
@@ -3462,6 +3462,27 @@ export function createRaftPlugin(deps: {
   };
   return plugin;
 }
+
+/**
+ * Raft's person read for an assistant (`GET /assistant/owner-resolve?name=`, beside the owner inbox; no SDK route yet,
+ * so it goes through this plugin's own `call` on the mount's credential, which logs the route and never the query).
+ * A 404 is told apart by its code: none, or the Server's generic `NOT_FOUND`, is the route not being there (a Raft from
+ * before it), and the preferences tool then looks in the inbox rows instead; a 404 with a code of its own is Raft saying
+ * the owner can see no one of that name. A 403 `assistant_not_enabled` pauses, as every assistant read's does.
+ */
+export const OWNER_RESOLVE_PATH = "/internal/agent-api/assistant/owner-resolve";
+export const resolveOwnerPerson: PersonResolve = async (ctx, name) => {
+  try {
+    const { data } = await call(ctx, "GET", `${OWNER_RESOLVE_PATH}?name=${encodeURIComponent(name)}`);
+    if (typeof data.id !== "string" || !data.id) return { ok: false, reason: "failed" };
+    return { ok: true, id: data.id, type: data.type, name: typeof data.name === "string" ? data.name : null };
+  } catch (e) {
+    const err = e as { httpStatus?: unknown; code?: unknown };
+    if (err.httpStatus === 404) return { ok: false, reason: err.code === undefined || err.code === "NOT_FOUND" ? "unavailable" : "unknown" };
+    await pauseOn(ctx, e).catch(() => {});
+    return { ok: false, reason: "failed" };
+  }
+};
 
 /** Kept by the listing; a failure to keep it must not fail the listing, and leaves the last record as it was. */
 async function keepOwner(ctx: PluginContext, context: OwnerContext): Promise<void> {

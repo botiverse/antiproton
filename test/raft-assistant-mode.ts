@@ -140,6 +140,11 @@ function raft(o: { zone?: unknown; owner?: boolean; dm?: unknown; name?: string 
     unread: [] as unknown[], all: [] as unknown[], inboxReads: [] as string[],
     /** Conversations whose owner-messages answer fails Raft's shape (the message names no conversation), and every read of one. */
     broken: new Set<string>(), messageReads: [] as string[],
+    /**
+     * Raft's person read by name: a person, "unknown" (Raft's 404 for the name), or, with no entry for the name while
+     * `resolveRoute` is false (the default), the route missing (the generic 404 every unknown path gets); `resolves` every read.
+     */
+    people: {} as Record<string, { id: string; type: string; name: string } | "unknown" | 500>, resolveRoute: false, resolves: [] as string[],
     /** Doorbell events by their address (`agent-event:<id8>`), as `GET /history` answers one; every such read. */
     bellEvents: {} as Record<string, unknown>, historyReads: [] as string[],
   };
@@ -183,6 +188,13 @@ function raft(o: { zone?: unknown; owner?: boolean; dm?: unknown; name?: string 
       const m = { seq: 1, id: `aaaaaaa${channelId.slice(-1)}-1111-4222-8333-444455556666`, timestamp: "2026-10-20T09:50:00.000Z", sender_type: "human",
         sender_name: "bob", content: "can you pick a date?", ...(r.broken.has(channelId) ? {} : { channel_type: "channel", channel_name: `ch${channelId.slice(-1)}` }) };
       return json(200, { owner: { userId: OWNER }, channelId, messages: [m], hasMore: false, hasOlder: false, hasNewer: false });
+    }
+    if (path === "/assistant/owner-resolve" && r.resolveRoute) {
+      const name = u.searchParams.get("name") ?? "";
+      r.resolves.push(name);
+      const p = r.people[name];
+      if (p === 500) return json(500, { error: "boom" });
+      return p && p !== "unknown" ? json(200, p) : json(404, { error: "No such person", code: "person_not_found" });
     }
     if (path === "/assistant/owner-inbox") {
       const filter = u.searchParams.get("filter") ?? "unread";
@@ -890,7 +902,7 @@ await check("a person's mute drops their @mentions and DMs in code when rows car
   const added = await pref(a, { action: "add", effect: "mute", person: "cy" });
   must(added.confirm === "Nothing from @cy will notify you anymore, @mentions and DMs included.", added.confirm);
   a.r.unread = [conv(1, { hasMention: true, latestSenderName: "cy", latestSenderId: "u-cy" }),
-    conv(2, { kind: "channel", channelType: "dm", channelName: "cy", peerId: "u-cy", latestSenderName: "cy", latestSenderId: "u-cy", unread: 3 }),
+    conv(2, { kind: "channel", channelType: "dm", channelName: "cy", peer: { id: "u-cy", type: "user" }, latestSenderName: "ada", latestSenderId: OWNER, latestSenderType: "user", unread: 3 }),
     conv(3, { unread: 2, latestSenderName: "cy", latestSenderId: "u-cy" })];
   const out = await bell(a);
   must(out.isolated === true && out.turn.includes(conv(3).channelId) && !out.turn.includes(conv(1).channelId) && !out.turn.includes(conv(2).channelId), show(out));
@@ -1150,6 +1162,49 @@ await check("items the night held beyond the brief's 3 come back at the next wak
   must((await bell(a, "2026-10-21T06:20:00Z")).turn === undefined && lastWake(a).attrs.seen === 1, show(lastWake(a)));
 });
 
+await check("Raft's person fields: latestSenderType user is a human, a system sender is no person, a DM's other person is peer { id, type }", async () => {
+  const a = await assistant(raft({ dm: "dm:@ada" }));
+  a.r.all = [conv(1, { latestSenderName: "bo", latestSenderId: "u-bo", latestSenderType: "user" }),
+    conv(2, { channelType: "dm", channelName: "kit", peer: { id: "u-kit", type: "agent" }, latestSenderName: "ada", latestSenderId: OWNER, latestSenderType: "user" }),
+    conv(3, { latestSenderName: "deploybot", latestSenderId: "u-sys", latestSenderType: "system" })];
+  await pref(a, { action: "add", effect: "mute", person: "@bo" });
+  await pref(a, { action: "add", effect: "mute", person: "@kit" });
+  await pref(a, { action: "add", effect: "mute", person: "@deploybot" });
+  const kept = a.read(ASSISTANT_STORE, "rules").map((r: any) => [r.subject.name, r.subject.id, r.subject.type]);
+  must(show(kept) === show([["bo", "u-bo", "human"], ["kit", "u-kit", "agent"], ["deploybot", null, null]]), `user→human, the peer object, system ignored: ${show(kept)}`);
+  // On a wake: bo's channel row and kit's DM (whoever wrote last in it) are muted by id; a system row's id matches nothing.
+  a.r.unread = [conv(1, { latestSenderName: "bo", latestSenderId: "u-bo", latestSenderType: "user" }),
+    conv(2, { channelType: "dm", channelName: "kit", peer: { id: "u-kit", type: "agent" }, latestSenderName: "ada", latestSenderId: OWNER, latestSenderType: "user" }),
+    conv(4, { kind: "thread", channelType: "dm", channelName: "kit", parentChannelId: conv(2).channelId, peer: { id: "u-kit", type: "agent" }, latestSenderId: OWNER, latestSenderType: "user" }),
+    conv(3, { latestSenderName: "deploybot", latestSenderId: "u-sys", latestSenderType: "system" })];
+  const out = await bell(a);
+  must(out.isolated === true && out.turn.includes(conv(3).channelId) && [1, 2, 4].every((n) => !out.turn.includes(conv(n).channelId)), show(out));
+  must(lastWake(a).attrs.muted_person === 3 && lastWake(a).attrs.person_rule_unenforced === 1, show(lastWake(a)));
+});
+
+await check("a person named by the owner is resolved by Raft's owner-resolve read at once; its 404 for the name refuses; a Raft without the route falls back to the inbox rows", async () => {
+  const a = await assistant(raft({ dm: "dm:@ada" }));
+  a.r.resolveRoute = true;
+  a.r.people = { "sam~human": { id: "u-sam-1", type: "user", name: "sam" }, ghost: "unknown", bot: { id: "u-sys", type: "system", name: "bot" }, flaky: 500 };
+  const added = await pref(a, { action: "add", effect: "always", person: "@sam~human" });
+  must(added.state === "added" && !("note" in added) && show(a.r.resolves) === show(["sam~human"]) && show(a.r.inboxReads) === "[]", `resolved: ${show(added)} ${show(a.r)}`);
+  must(show(a.read(ASSISTANT_STORE, "rules")[0].subject) === show({ kind: "person", id: "u-sam-1", type: "human", name: "sam" }), show(a.read(ASSISTANT_STORE, "rules")));
+  must(/right away about @sam,/.test(added.confirm), added.confirm);
+  for (const [who, code, said] of [["@ghost", "person_unknown", /can see no one called @ghost/], ["@bot", "person_not_a_person", /not a person/], ["@flaky", "resolve", /try again shortly/]] as const) {
+    const e = await pref(a, { action: "add", effect: "mute", person: who }).then(() => null, (x) => x as Error);
+    must(e && said.test(e.message), `${who}: ${e?.message}`);
+    must(a.traced.filter((t) => t.kind === "raft.assistant_rules").at(-1)?.status === `refused:${code}`, `${who}: ${show(a.traced.at(-1))}`);
+  }
+  must(a.read(ASSISTANT_STORE, "rules").length === 1, "a refused person was kept");
+  // The query names the person: no log line or trace row does.
+  must(!show(a.traced).includes("ghost") && !show(a.traced).includes("u-sam-1"), show(a.traced));
+  // A Raft without the route: the generic 404, and the inbox rows are asked instead.
+  const b = await assistant(raft({ dm: "dm:@ada" }));
+  b.r.all = [conv(1, { latestSenderName: "sam", latestSenderId: "u-sam-1", latestSenderType: "user" })];
+  const fallback = await pref(b, { action: "add", effect: "mute", person: "@sam" });
+  must(fallback.state === "added" && b.r.resolves.length === 0 && b.r.inboxReads.includes("all") && b.read(ASSISTANT_STORE, "rules")[0].subject.id === "u-sam-1", `fallback: ${show(fallback)}`);
+});
+
 await check("privacy: no channel's or person's name or id reaches a trace row or a log line, whatever the rules, wakes and notify calls do", async () => {
   const CHAN = "zz-secret", PEER = "zz-peer", PEER_ID = "u-zz-peer-0001";
   const lines: string[] = [];
@@ -1157,7 +1212,7 @@ await check("privacy: no channel's or person's name or id reaches a trace row or
   try {
     const a = await assistant(raft({ dm: "dm:@ada" }));
     const secret = conv(1, { channelName: CHAN, latestSenderName: PEER, latestSenderId: PEER_ID, latestPreview: `${PEER} asks` });
-    const dm = conv(2, { channelType: "dm", channelName: PEER, peerId: PEER_ID, latestSenderName: PEER, latestSenderId: PEER_ID });
+    const dm = conv(2, { channelType: "dm", channelName: PEER, peer: { id: PEER_ID, type: "user" }, latestSenderName: PEER, latestSenderId: PEER_ID, latestSenderType: "user" });
     a.r.all = [secret, dm];
     for (const args of [{ action: "add", effect: "mute", channel: `#${CHAN}`, note: `${CHAN} is noise` }, { action: "add", effect: "always", person: `@${PEER}`, anytime: true },
       { action: "add", effect: "digest", thread: `#${CHAN}:abcdef12` }, { action: "add", effect: "mute", channel: `#${CHAN}-nope` }, { action: "list" },

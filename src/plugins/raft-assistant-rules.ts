@@ -19,7 +19,7 @@
  * everything for the brief, `always` included, unless the rule says `anytime` (the owner said "even at night").
  *
  * What code cannot apply yet, for want of a Raft field, is applied by the model from the rule list in its input:
- * a person rule, until inbox rows carry the sender's id (`SENDER_ID_FIELD`, `PEER_ID_FIELD`), counted on each wake row as
+ * a person rule, until inbox rows carry the sender's id (`SENDER_ID_FIELD`, `PEER_FIELD`), counted on each wake row as
  * `person_rule_unenforced`.
  */
 import type { Json } from "../core/types.ts";
@@ -33,12 +33,19 @@ export const EFFECTS = ["mute", "always", "digest"] as const;
 export type Effect = (typeof EFFECTS)[number];
 
 /**
- * The inbox row fields a person rule is matched by, once Raft sends them (requested; not in SDK 0.25.0): the latest
- * message's sender id, and on a DM row the other person's id. Feature-detected per read: while no row carries them, a
- * person rule is the model's to apply.
+ * The inbox row fields a person rule is matched by, once Raft sends them (Raft's owner-inbox fields; not in SDK 0.25.0):
+ * the latest message's sender id with `latestSenderType` (`user`, `agent` or `system`), and on a DM row or a DM's thread
+ * row (`channelType` "dm") the other person as `peer: { id, type }`. Feature-detected per read: while no row carries
+ * them, a person rule is the model's to apply. A `system` sender is no person: its id matches no rule.
  */
 export const SENDER_ID_FIELD = "latestSenderId";
-export const PEER_ID_FIELD = "peerId";
+export const SENDER_TYPE_FIELD = "latestSenderType";
+export const PEER_FIELD = "peer";
+
+/** Raft's account type as a person subject's: `user` is a human; `system` (and anything else) is no person. */
+export function personType(v: unknown): "human" | "agent" | null {
+  return v === "user" || v === "human" ? "human" : v === "agent" ? "agent" : null;
+}
 
 export type Subject =
   /** `name` is the channel's name as the owner said it, lowercased without `#`: for display only. `id` null: a rule kept from before ids, bound at the next wake. */

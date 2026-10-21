@@ -955,7 +955,9 @@ their chat (the answer to "more") counts as told too, so the next wake does not 
 The owner's contact rules (`src/plugins/raft-assistant-rules.ts`) are set through
 `assistant_preferences`, offered in the chat: `add` records one rule, an effect (`mute`, `always`,
 `digest`) about exactly one subject (a channel or a thread, kept by Raft's channelId; a person, kept by
-their Raft id; a kind of item; or the owner's DMs), with an optional `until` (at most 90 days) and, for
+their Raft id, which Raft's `GET /assistant/owner-resolve?name=` read gives at once, a 404 for the name
+refusing the rule, while a Raft without that route has the inbox rows looked in instead; a kind of item;
+or the owner's DMs), with an optional `until` (at most 90 days) and, for
 `always` only, `anytime` (also in quiet hours); `list` gives each rule as one plain line with the
 defaults and the quiet hours; `remove` deletes one by id or all; `quiet` sets the quiet hours (HH:MM
 owner-local, or off; 22:00-08:00 by default); `timezone` keeps the zone the owner gave; `mute` and
@@ -969,7 +971,8 @@ the person silences their @mentions and DMs. The defaults send a DM, an @mention
 to the model; a channel's general chat is dropped in code (`default_chatter`) only once Raft gives the
 owner's name (`assistantOf.name` or `handle`, read when present), so a message naming them without an @
 is told apart; until then it goes to the model (`chatter_unfiltered`). A person rule is applied in code
-only when inbox rows carry sender ids (`latestSenderId`, and `peerId` on a DM row, read when present);
+only when inbox rows carry sender ids (`latestSenderId` with `latestSenderType`, `user` read as a human and a
+`system` sender as no person, and `peer: { id, type }` on a DM row or a DM's thread row, read when present);
 until then the check's model applies it from a line in its input, and each wake counts
 `person_rule_unenforced`. Rules kept from before are read as this version's with their ids: a channel's
 is bound to its id at the next wake that shows it, and one that named several things at once is kept as
