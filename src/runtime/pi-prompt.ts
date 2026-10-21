@@ -21,6 +21,7 @@
  */
 import { profileSpec, type AgentProfile } from "./agent-profile.ts";
 import { assistantCheckPrompt, assistantPrompt } from "../plugins/raft-assistant.ts";
+import { DEFAULT_ASSISTANT_INSTRUCTIONS } from "../plugins/raft-assistant-instructions.ts";
 
 const CORE = `You are a long-running agent working on the user's behalf.
 
@@ -172,11 +173,22 @@ export function profilePrompt(profile: AgentProfile): string {
 }
 
 /**
- * The system prompt of a personal assistant (src/plugins/raft-assistant.ts): the persona a person gave it, then what an
- * assistant is for, under the alias of the raft mount that makes it one — its chat with its owner, or one proactive
- * check, which runs in a short session of its own (`PluginNext.isolated`). Not the core, which tells an agent to act on
- * anyone's behalf with any tool, nor the mounts' paragraphs, which describe tools an assistant is not offered.
+ * The system prompt of a personal assistant (src/plugins/raft-assistant.ts), the one entry point for it (the runtime and
+ * any eval build it here). Not the core, which tells an agent to act on anyone's behalf with any tool, nor the mounts'
+ * paragraphs, which describe tools an assistant is not offered.
+ *
+ * Its chat with its owner: the name line, then Raft's instructions (the persona's description, verbatim; Raft owns how
+ * the assistant talks and when by default it contacts its owner, and sends that as `instructions` on POST and PATCH),
+ * or `DEFAULT_ASSISTANT_INSTRUCTIONS` when Raft sent none, then the code part (`assistantPrompt`), which opens by
+ * saying it wins over anything above it that conflicts. Stable parts first and nothing generated, so the whole prompt
+ * is one cacheable prefix.
+ *
+ * One proactive check, in a short session of its own (`PluginNext.isolated`): the check's prompt and nothing else, not
+ * even the name. What a check does is decided by code and the owner's rules, never by the instructions.
  */
 export function assistantSystemPrompt(persona: PromptParts["persona"], alias: string, session: "chat" | "check" = "chat"): string {
-  return [personaSection(persona), session === "check" ? assistantCheckPrompt(alias) : assistantPrompt(alias)].filter(Boolean).join("\n\n");
+  if (session === "check") return assistantCheckPrompt(alias);
+  const name = String(persona?.name ?? "").trim();
+  const instructions = String(persona?.description ?? "").trim() || DEFAULT_ASSISTANT_INSTRUCTIONS;
+  return [name ? `You are ${name}.` : "", instructions, assistantPrompt(alias)].filter(Boolean).join("\n\n");
 }

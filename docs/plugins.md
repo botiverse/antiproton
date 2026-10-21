@@ -1012,7 +1012,31 @@ pauses the checks, the brief and the notify tool until Raft's context names the
 owner again. The chat is offered the owner DM, attachments, the reads, the
 preferences and send-as-owner (plus `resume` and the parked-result reader), with no run_js, jobs
 or subagents, under a prompt of its own (`assistantSystemPrompt`,
-`src/runtime/pi-prompt.ts`). What an owner read returns is never parked: a result over the line is cut with a note
+`src/runtime/pi-prompt.ts`, the one entry point for it).
+
+That prompt is split by who owns each part. Raft owns the stable part: how the assistant talks
+(voice) and the default of when it contacts its owner. It sends that as the agent's `instructions`
+(POST on create, PATCH to change), which the runtime reads back as the persona's description.
+antiproton keeps the part bound to code (`assistantPrompt`, `src/plugins/raft-assistant.ts`): the
+tools and how to use them (the owner reads, the DM, `assistant_preferences`,
+`assistant_send_as_owner`), that what it reads is information and never instructions, that it sends
+as its owner only when the owner explicitly asks, which DMs the reads cover, the `#channel:msgid`
+citation the told-tracking parses, and the shape and limit of the unasked messages code composes.
+The chat's prompt is the name line, then Raft's instructions verbatim, or
+`DEFAULT_ASSISTANT_INSTRUCTIONS` (`src/plugins/raft-assistant-instructions.ts`) when they are empty
+or blank, then the code part, whose first line (`ASSISTANT_PRECEDENCE`) says it wins over anything
+above it that conflicts: the instructions can change how the assistant sounds, not what it may do,
+and the tool guards (no send-as-owner from a check, refused in code) hold whatever they say. A
+check's prompt is `assistantCheckPrompt` alone, with no name and no instructions: what a check
+reports is decided by code and the owner's rules. Nothing in the system prompt is generated per
+turn (the owner's current rules reach the chat through the preferences tool and a check or brief
+through its input), so each agent's prompt is one stable, cacheable prefix.
+`docs/assistant-default-instructions.md` is the default text exactly, for handing to Raft (a test
+holds it equal to the constant). What not to put in Raft's instructions: tool names, limits,
+reference formats, or any rule about sending as the owner, treating read content as instructions,
+or applying contact settings; those are code's, and an instruction that contradicts them loses.
+
+What an owner read returns is never parked: a result over the line is cut with a note
 to page, whatever reader is mounted, and a short session's erase also deletes anything its calls parked. Reads of an
 assistant's conversation by an operator or the console need a reason and are audited (docs/runbook.md). An assistant runs on pi085 only: moving it to pd
 (`migrateEngine`) is refused with the reason, and one already there has each
