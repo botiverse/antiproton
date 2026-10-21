@@ -60,6 +60,9 @@ const TABLE = "CREATE TABLE IF NOT EXISTS trace_outbox(" +
 // and status skip all four.
 // `turn.timing` is one turn of a pi085 conversation, its wall time split into points (src/runtime/turn-timing.ts),
 // written when the turn ends. Activity and status skip it.
+// `turn.end_unrecorded` is a pass that could not read (`stage: read`) or write down (`stage: record`) the main
+// conversation's turn ends (cf/src/runtime.ts `#turnEndsUnrecorded`, #1021): `attrs.error_class` the error's class,
+// never its message. The pass goes on without them, so no `afterTurn` is told of those ends. Activity and status skip it.
 // `import.hold` is an agent's wait for its workspace import ending (src/store/workspace-import.ts): `import` when the
 // import lifted it, `valve` when no import came in time and it lifted on its own. Activity and status skip it.
 // `model.prewarm` is the prompt-cache prewarm after an import (src/runtime/prewarm.ts): `warmed`, `skipped` or
@@ -87,7 +90,7 @@ const TABLE = "CREATE TABLE IF NOT EXISTS trace_outbox(" +
 // a row of that kind still in an outbox is drained and read as a row, not dropped as damage.
 export const TRACE_KINDS = ["model.call", "tool.call", "approval.wait", "container.lease", "inbound", "mount.seeded", "harness.open",
   "turn.stop", "js.run",
-  "rebuild.decision", "rebuild.outcome", "rebuild.behaviour", "session.needs_reset", "turn.timing", "import.hold", "model.prewarm",
+  "rebuild.decision", "rebuild.outcome", "rebuild.behaviour", "session.needs_reset", "turn.timing", "turn.end_unrecorded", "import.hold", "model.prewarm",
   "agent.ready", "mount.settings", "subagent.start", "subagent.turn", "subagent.model_changed", "github.refresh", "raft.held", "raft.held_answer", "raft.state_failed", "raft.state_save_failed", "raft.mcp_call",
   "raft.assistant_wake", "raft.assistant_notify", "raft.assistant_rules", "raft.assistant_chat_told", "raft.assistant_send_as_owner", "raft.turn_ended"] as const;
 export type TraceKind = (typeof TRACE_KINDS)[number];

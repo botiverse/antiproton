@@ -5523,7 +5523,12 @@ export class AgentRuntime {
       }
       // A main-conversation turn that ended here is owed to the plugins that act on its answer (`Plugin.afterTurn`), as
       // its branch tells it: read before a rebuild, which closes this engine and starts a new transcript.
-      const ends = !pd && session === MAIN_SESSION ? await this.#turnEndsOf(tenantId, agentId, agent, out.settled) : null;
+      // Best effort within the pass (#1021): a read or write of the ends that throws loses only those ends (no `afterTurn`
+      // for them), said on a trace row; the rest of the pass — the session's mark, the hooks, the subagents' reports,
+      // the releases — still runs, where a throw here used to end the pass on every wake that settled a run.
+      const ends = !pd && session === MAIN_SESSION
+        ? await this.#turnEndsOf(tenantId, agentId, agent, out.settled).catch((e) => this.#turnEndsUnrecorded(tenantId, agentId, "read", e))
+        : null;
       // A run of pi085's main conversation that ended on a context overflow is rebuilt rather than left to fail again
       // on every wake (`#overflowBackstop`); this pass then drives the rebuilt conversation's first call.
       if (!pd && session === MAIN_SESSION && rebuilds && out.open === 0 && (out.settled.length || readBackstop(sql).pending !== null)) {
@@ -5535,14 +5540,17 @@ export class AgentRuntime {
         if (backstop?.step) {
           out = { ...backstop.step, settled: [...out.settled, ...backstop.step.settled] };
           if (ends && backstop.step.settled.length) {
-            ends.push(...(await this.#turnEndsOf(tenantId, agentId, await this.agent(tenantId, agentId, session), backstop.step.settled))!);
+            const more = await this.#turnEndsOf(tenantId, agentId, await this.agent(tenantId, agentId, session), backstop.step.settled)
+              .catch((e) => this.#turnEndsUnrecorded(tenantId, agentId, "read", e));
+            if (more) ends.push(...more);
           }
         }
       }
       if (!pd) this.#turnTiming(tenantId, agentId, "ending", () => this.#turnStepEnd(tenantId, agentId, session, out));
       if (ends?.length) {
         const now = Date.now();
-        for (const e of ends) recordTurnEnd(sql, e.operationId, e.end, now);
+        try { for (const e of ends) recordTurnEnd(sql, e.operationId, e.end, now); }
+        catch (e) { this.#turnEndsUnrecorded(tenantId, agentId, "record", e); }
       }
       open += out.open;
       settled.push(...out.settled);
@@ -5600,6 +5608,23 @@ export class AgentRuntime {
       }
     }
     return { open, wakeInMs, settled, releaseFailed };
+  }
+
+  /**
+   * Turn ends this pass could not read (`stage: read`, `#turnEndsOf`) or write down (`stage: record`): one trace row and
+   * one log line, saying the stage and the error's class (`error_class`, its constructor's name) and never its message,
+   * which may quote what the engine held. Null, so the pass goes on as if the step had ended no turn (#1021).
+   */
+  #turnEndsUnrecorded(tenantId: string, agentId: string, stage: "read" | "record", error: unknown): null {
+    const errorClass = (error instanceof Error ? error.constructor?.name || error.name : typeof error).slice(0, 64) || "unknown";
+    const at = Date.now();
+    console.error(`${tenantId}/${agentId}: the turn ends of this pass were not ${stage === "read" ? "read" : "written down"} (${errorClass}); the pass goes on without them`);
+    logEvent("turn.end_unrecorded", { tenantId, agentId, stage, errorClass });
+    try {
+      appendTrace(this.#deps.ctx.storage.sql, [{ at, tenantId, agentId, kind: "turn.end_unrecorded", spanId: `turn_end:${at}`, status: "failed", verdict: "failed",
+        attrs: { stage, error_class: errorClass } }]);
+    } catch (e) { console.error(`the turn.end_unrecorded row of ${tenantId}/${agentId} could not be written:`, e); }
+    return null;
   }
 
   /** Whether any of the agent's mounts has a plugin that acts on a turn's end: without one, nothing is written down. */

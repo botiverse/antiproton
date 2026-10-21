@@ -1941,6 +1941,8 @@ await check("an assistant's chat is offered its owner DM, the reads and its pref
     const allowed = new Set([...CHAT_TOOLS.map((n: string) => `raft__${n}`), "resume"]);
     must(offered.every((n) => allowed.has(n)), `offered beyond the chat's: ${offered.filter((n) => !allowed.has(n))}`);
     for (const n of ["raft__assistant_preferences", "raft__assistant_send_as_owner", "raft__assistant_owner_inbox", "raft__messages_send", "raft__receive_events", "resume"]) must(offered.includes(n), `missing ${n}: ${offered}`);
+    // Reacting on the owner's messages is the model's, in its chat (a status emoji while it works, say): never a check's.
+    for (const n of ["raft__messages_react", "raft__messages_unreact"]) must(offered.includes(n) && !CHECK_TOOLS.includes(n.slice("raft__".length)), `react in the chat only: ${n}: ${offered}`);
     for (const n of ["raft__assistant_notify_owner", "run_js", "jobs", "send_to_agent", "raft__tasks_list", "raft__enable_push"]) must(!offered.includes(n), `offered ${n}`);
     await w.turn("anything for me?");
     const prompt = w.calls[0]!.systemPrompt;
