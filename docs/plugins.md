@@ -865,7 +865,10 @@ Two more are a personal assistant's reads of its owner's Raft:
 `assistant_owner_inbox` (the owner's channels and threads with unread counts,
 mentions and a preview of the latest message) and `assistant_owner_messages`
 (one of those conversations by its `channelId`, paged with at most one of
-`before`, `after` and `around`). Neither ever shows a direct message. They are
+`before`, `after` and `around`). Since Raft RFC 077 they include the owner's DMs
+with other people unless the owner turned that off (a DM row is kind `channel`
+with `channelType` `dm`, the other person named only by `channelName`; the inbox
+lines show `channelType`), and never the DM between the assistant and its owner. They are
 read-only and model-only, and offered only when the mount's snapshot lists
 them, which it does when the same credential context names whose assistant the
 account is (`agent.assistantOf` with a `userId`): never with the tools every mount
@@ -909,8 +912,9 @@ and 15 minutes, after which the wake gives up on the change
 (`inbox_lagging_gave_up`) and decides on what it read without recording it as
 looked at. Otherwise it drops what a check already
 looked at (per conversation: one no check has looked at is new however old its
-activity), what the owner was already told and what a channel or sender rule
-covers; with nothing left it ends there. It then reads each conversation left,
+activity), what the owner was already told and the DM between the assistant and
+its owner, then applies the owner's contact rules (below) and the defaults; with
+nothing left it ends there. It then reads each conversation left,
 once more on a failure; one that still cannot be read is not handed to the
 model, is not recorded as looked at, is named in the DM's last line ("I
 couldn't read …; I'll look again shortly") once, until its read succeeds or it
@@ -943,9 +947,39 @@ destination from the model, and refuses while neither is known), and keeps its r
 `#channel:msgid` (a bare `task #N` is refused, since in the DM it is the DM's own
 task, and Raft has no channel-qualified task reference); one the check's reads
 cannot confirm is replaced by the conversation's first unread message; an item already told is
-dropped, as is one a rule covers, and between 22:00 and 08:00 owner-local
-nothing is sent. `assistant_preferences`, offered in the chat, keeps the
-owner's rules and stated zone. A `403 assistant_not_enabled` from any call
+dropped, as is one a rule mutes; one a digest rule covers, and everything in the owner's quiet hours but
+what an `anytime` rule covers, is kept for the brief. A `#channel:msgid` the assistant sends its owner in
+their chat (the answer to "more") counts as told too, so the next wake does not bring it back
+(`noteToldInChat`, a `raft.assistant_chat_told` row with the count).
+
+The owner's contact rules (`src/plugins/raft-assistant-rules.ts`) are set through
+`assistant_preferences`, offered in the chat: `add` records one rule, an effect (`mute`, `always`,
+`digest`) about exactly one subject (a channel or a thread, kept by Raft's channelId; a person, kept by
+their Raft id; a kind of item; or the owner's DMs), with an optional `until` (at most 90 days) and, for
+`always` only, `anytime` (also in quiet hours); `list` gives each rule as one plain line with the
+defaults and the quiet hours; `remove` deletes one by id or all; `quiet` sets the quiet hours (HH:MM
+owner-local, or off; 22:00-08:00 by default); `timezone` keeps the zone the owner gave; `mute` and
+`unmute` are the older names of `add` with `mute` and of `remove`. Code validates each (a channel or a
+thread must be one of the owner's conversations; a name two people share is refused) and answers with a
+`confirm` line written from the stored rule. The most specific matching rule wins (thread, then person,
+then channel or DMs, then kind), and at equal specificity the newer one; what was already told or
+looked at is dropped before any rule is asked. A channel's or a thread's mute or digest covers its
+general chat only: an @mention of the owner there still comes, and a DM is never in a channel; muting
+the person silences their @mentions and DMs. The defaults send a DM, an @mention and a followed thread
+to the model; a channel's general chat is dropped in code (`default_chatter`) only once Raft gives the
+owner's name (`assistantOf.name` or `handle`, read when present), so a message naming them without an @
+is told apart; until then it goes to the model (`chatter_unfiltered`). A person rule is applied in code
+only when inbox rows carry sender ids (`latestSenderId`, and `peerId` on a DM row, read when present);
+until then the check's model applies it from a line in its input, and each wake counts
+`person_rule_unenforced`. Rules kept from before are read as this version's with their ids: a channel's
+is bound to its id at the next wake that shows it, and one that named several things at once is kept as
+it was and still applied in notify. In quiet hours a doorbell reads nothing unless an `always` rule is
+marked `anytime`; then only what such a rule covers is handed on. Each preferences call writes a
+`raft.assistant_rules` row (action, effect, subject kind, result such as `added` or
+`refused:channel_unknown`, and the rules' counts per effect and subject kind); the wake row adds counts
+such as `muted_channel`, `muted_person`, `digest`, `always`, `anytime_night`, `night_held`, `dm`,
+`own_dm`, `default_chatter` and `rules_total`. No trace row or log line carries a channel's or a
+person's name or id. A `403 assistant_not_enabled` from any call
 pauses the checks, the brief and the notify tool until Raft's context names the
 owner again. The chat is offered the owner DM, attachments, the reads and the
 preferences (plus `resume` and the parked-result reader), with no run_js, jobs
@@ -955,7 +989,7 @@ to page, whatever reader is mounted, and a short session's erase also deletes an
 assistant's conversation by an operator or the console need a reason and are audited (docs/runbook.md). An assistant runs on pi085 only: moving it to pd
 (`migrateEngine`) is refused with the reason, and one already there has each
 wake counted `failed` with `reason: engine_pd_unsupported` and a warning, since
-pd cannot hold a short session. `test/raft-assistant-mode.ts` holds the rules,
+pd cannot hold a short session. `test/raft-assistant-mode.ts` holds the rules (precedence, each guard, migration, privacy with sentinel names),
 the code before the model, the short session, the engine and the offered lists.
 
 **`replay: "never"` overrides the read rule.** A tool that declares it is not
