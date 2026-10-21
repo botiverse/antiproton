@@ -20,6 +20,7 @@ import {
 import { confirmLine, matches, ruleLine, rulesOf, winningRule, type ContactRule } from "../src/plugins/raft-assistant-rules.ts";
 import { setLogSink } from "../src/core/log.ts";
 import { askWake } from "../src/runtime/plugin-wakes.ts";
+import { CONTACT_KEY } from "../src/plugins/raft-assistant.ts";
 import { recordedEngine } from "../src/runtime/durable-agent.ts";
 import { AgentRuntime } from "../cf/src/runtime.ts";
 import { operatorModelOf } from "../cf/src/model-request.ts";
@@ -154,6 +155,14 @@ function raft(o: { zone?: unknown; owner?: boolean; dm?: unknown; name?: string 
     asOwner: [] as any[], asOwnerAnswer: { status: 200, code: null as string | null } as { status: number; code: string | null } | "drop",
     /** Every owner-messages read's `around`, when it had one. */
     arounds: [] as string[],
+    /** Raft runs the check (`assistantOf.raftCheck`): absent from the context while undefined. */
+    raftCheck: undefined as boolean | undefined,
+    /** RFC 077 step 2 routes: every body, and how the next is answered (a status and code, or `drop` for no answer). */
+    notifies: [] as any[], notifyAnswer: { status: 200, code: null as string | null, body: { outcome: "sent", shown: 1, more: 0, dropped: [] } as unknown } as { status: number; code: string | null; body?: unknown } | "drop",
+    told: [] as any[], imports: [] as any[], importAnswer: { status: 200, code: null as string | null } as { status: number; code: string | null },
+    /** Step 1's contact rules and settings, as Raft keeps them, and every call to them (`METHOD path body`). */
+    raftRules: [] as Array<{ id: string; effect: string; subject: string; line: string }>, raftQuiet: { from: "22:00", to: "08:00" } as { from: string; to: string } | null,
+    ruleCalls: [] as string[], ruleRefusal: null as { status: number; code: string; error: string } | null,
   };
   globalThis.fetch = (async (url: any, init?: any) => {
     const u = new URL(String(url));
@@ -164,7 +173,7 @@ function raft(o: { zone?: unknown; owner?: boolean; dm?: unknown; name?: string 
       if (r.contextStatus !== 200) return json(r.contextStatus, { error: "no", code: "forbidden" });
       return json(200, {
         agent: { id: "agent-1", name: "ada-assistant", displayName: null, description: null, runtime: "external", external: true,
-          assistantOf: r.owner ? { userId: OWNER, ...(r.zone !== undefined ? { timezone: r.zone } : {}), ...(r.dm !== undefined ? { dmTarget: r.dm } : {}), ...(o.name ? { name: o.name } : {}) } : null },
+          assistantOf: r.owner ? { userId: OWNER, ...(r.zone !== undefined ? { timezone: r.zone } : {}), ...(r.dm !== undefined ? { dmTarget: r.dm } : {}), ...(o.name ? { name: o.name } : {}), ...(r.raftCheck !== undefined ? { raftCheck: r.raftCheck } : {}) } : null },
         server: { id: "server-1", slug: "s", name: "S" }, credential: { capabilities: ["read", "send", "reactions"] }, prompt: null,
       });
     }
@@ -195,6 +204,46 @@ function raft(o: { zone?: unknown; owner?: boolean; dm?: unknown; name?: string 
       if (answer.status !== 200) return json(answer.status, { error: "Refused by Raft", ...(answer.code ? { code: answer.code } : {}) });
       const body = r.asOwner.at(-1);
       return json(200, { messageId: "9d000000-0000-4000-8000-000000000001", channelId: body.channelId });
+    }
+    if (path === "/assistant/notify" && init?.method === "POST") {
+      r.notifies.push(JSON.parse(String(init?.body ?? "{}")));
+      const answer = r.notifyAnswer;
+      if (answer === "drop") throw new TypeError("fetch failed");
+      if (answer.status !== 200) return json(answer.status, { error: "Refused by Raft", ...(answer.code ? { code: answer.code } : {}) });
+      return json(200, answer.body);
+    }
+    if (path === "/assistant/told" && init?.method === "POST") {
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      r.told.push(body);
+      return json(200, { recorded: (body.refs ?? body.messageIds ?? []).length, skipped: 0 });
+    }
+    if (path === "/assistant/check-state/import" && init?.method === "POST") {
+      r.imports.push(JSON.parse(String(init?.body ?? "{}")));
+      return r.importAnswer.status === 200 ? json(200, { ok: true }) : json(r.importAnswer.status, { error: "no", ...(r.importAnswer.code ? { code: r.importAnswer.code } : {}) });
+    }
+    if (path.startsWith("/assistant/contact-")) {
+      const body = init?.body ? JSON.parse(String(init.body)) : undefined;
+      r.ruleCalls.push(`${init?.method ?? "GET"} ${path}${body ? ` ${JSON.stringify(body)}` : ""}`);
+      if (r.ruleRefusal) return json(r.ruleRefusal.status, { error: r.ruleRefusal.error, code: r.ruleRefusal.code });
+      const quietLine = r.raftQuiet ? `quiet ${r.raftQuiet.from}-${r.raftQuiet.to}` : "no quiet hours";
+      if (path === "/assistant/contact-rules" && (init?.method ?? "GET") === "GET") {
+        return json(200, { rules: r.raftRules.map((x) => ({ id: x.id, effect: x.effect, subject: { kind: "channel" }, anytime: false, until: null, note: null, createdAt: "2026-10-20T00:00:00Z", line: x.line })),
+          settings: { quiet: r.raftQuiet, brief: { at: "08:00" }, timezone: "Europe/Berlin" }, lines: { quiet: quietLine, brief: "morning brief at 08:00 Europe/Berlin", defaults: "RAFT-DEFAULTS" } });
+      }
+      if (path === "/assistant/contact-rules" && init?.method === "POST") {
+        const rule = { id: `9e000000-0000-4000-8000-00000000000${r.raftRules.length + 1}`, effect: body.effect, subject: body.subject, line: `${body.effect} ${body.subject}` };
+        r.raftRules.push(rule);
+        return json(200, { rule: { ...rule, subject: { kind: "channel" }, anytime: false, until: null, note: null, createdAt: "2026-10-20T00:00:00Z" }, confirmation: `RAFT-CONFIRM ${body.effect} ${body.subject}`, updated: false });
+      }
+      if (path.startsWith("/assistant/contact-rules/") && init?.method === "DELETE") {
+        const id = decodeURIComponent(path.slice("/assistant/contact-rules/".length));
+        r.raftRules = r.raftRules.filter((x) => !x.id.startsWith(id));
+        return json(200, { confirmation: `RAFT-REMOVED ${id}` });
+      }
+      if (path === "/assistant/contact-settings" && init?.method === "PUT") {
+        r.raftQuiet = body.quiet;
+        return json(200, { settings: { quiet: body.quiet }, confirmation: `RAFT-QUIET ${JSON.stringify(body.quiet)}` });
+      }
     }
     if (path === "/assistant/owner-messages") {
       // A conversation's one message is its inbox row's first unread (`conv`), so a reference to it can be confirmed.
@@ -2509,6 +2558,346 @@ await check("reply fallback end to end: Raft's `dm:@ada~human` and the model's `
     await v.turn("tell #ch1 Friday works");
     must(posted && v.r.asOwner.length === 1 && v.r.sends.length === 0, `sends: ${show(v.r.sends)} asOwner: ${show(v.r.asOwner)}`);
   } finally { v.host.dispose(); }
+});
+
+// ---- Raft runs the check (RFC 077 step 2): `assistantOf.raftCheck` ---------------------------------------------------------
+
+const CHECK_ID = "5c3f0e1a-7b2d-4c8e-9f10-112233445566";
+const MORNING = "2026-10-20T06:30:00Z"; // 08:30 in Berlin: the brief's window
+/** A check as Raft sends it in `payload.check`. */
+const raftCheckPayload = (o: Record<string, unknown> = {}) => ({
+  version: 1, id: CHECK_ID, trigger: "doorbell", allowed_tools: ["notify", "owner_messages"],
+  items: [{ channelId: conv(1).channelId, why: "mention" }],
+  instruction: "RAFT-INSTRUCTION: read with {{tool:owner_messages}}, then call {{tool:notify}} once. {{tool:owner_inbox}} is not yours. {{tool:frobnicate}} stays.",
+  counts: { conversations: 4, items: 1, told: 2, seen: 9, lag_reads: 1 }, ...o,
+});
+/** An assistant whose listing read `raftCheck: true`. */
+async function raftAssistant() {
+  const r = raft({ dm: "dm:@ada" });
+  r.raftCheck = true;
+  const a = await assistant(r);
+  must(a.read(ASSISTANT_STORE, OWNER_KEY).raftCheck === true, `control: the listing kept the flag: ${show(a.read(ASSISTANT_STORE, OWNER_KEY))}`);
+  return a;
+}
+/** The context of a call made in the short session of check `id`. */
+const inCheck = (ctx: any, id = CHECK_ID, trigger = "doorbell") => ({ ...ctx, caller: { ...ctx.caller, taskId: "iso_abc", turnKey: `assistant.raft_check:${trigger}:${id}` } });
+
+await check("raftCheck: the listing reads the flag (absent is false), and the first true asks the switch-over import once", async () => {
+  const off = await assistant(raft());
+  must(off.read(ASSISTANT_STORE, OWNER_KEY).raftCheck === false && off.read(ASSISTANT_STORE, "brief_import") === undefined, show(off.read(ASSISTANT_STORE, OWNER_KEY)));
+  off.r.raftCheck = true;
+  await raftPlugin.snapshotTools!(off.ctx);
+  must(off.read(ASSISTANT_STORE, OWNER_KEY).raftCheck === true && off.read(ASSISTANT_STORE, "brief_import")?.done === false, show(off.read(ASSISTANT_STORE, "brief_import")));
+  off.r.raftCheck = false;
+  await raftPlugin.snapshotTools!(off.ctx);
+  must(off.read(ASSISTANT_STORE, OWNER_KEY).raftCheck === false, "the flag turned off was not kept");
+});
+
+await check("raftCheck true: the brief's timer neither reads the inbox nor posts a brief; Raft's flag read false brings the local brief back", async () => {
+  const a = await raftAssistant();
+  a.r.unread = [conv(1, { hasMention: true })];
+  const out = await atTime(MORNING, () => wake(a.ctx));
+  must(out && out.turn === undefined && out.wakeAt === at("2026-10-21T06:00:00Z"), `a brief under raftCheck: ${show(out)}`);
+  must(a.r.inboxReads.length === 0 && a.r.messageReads.length === 0, `read: ${show(a.r.inboxReads)}`);
+  must(a.read(ASSISTANT_STORE, OWNER_KEY).lastBrief === null, "the local brief was marked as done");
+  // Control: the same morning with Raft's flag off now: the timer reads it, and briefs as before.
+  a.r.raftCheck = false;
+  const back = await atTime(MORNING, () => wake(a.ctx));
+  must(back.isolated === true && back.turnKey === "assistant.brief" && a.r.inboxReads.length > 0, `flag off: ${show(back)}`);
+  must(a.read(ASSISTANT_STORE, OWNER_KEY).raftCheck === false, "the flag read at the timer was not kept");
+});
+
+await check("raftCheck false, Raft's flag turned on since the listing: the brief's timer reads it and does not brief", async () => {
+  const a = await assistant(raft({ dm: "dm:@ada" }));
+  a.r.unread = [conv(1, { hasMention: true })];
+  a.r.raftCheck = true;
+  const out = await atTime(MORNING, () => wake(a.ctx));
+  must(out.turn === undefined && a.r.inboxReads.length === 0 && a.read(ASSISTANT_STORE, OWNER_KEY).raftCheck === true, `${show(out)} ${show(a.r.inboxReads)}`);
+});
+
+await check("raftCheck true: a doorbell without a check reads nothing and is counted skipped_no_check; with one, the check is posted verbatim, its tools named", async () => {
+  const a = await raftAssistant();
+  a.r.unread = [conv(1, { hasMention: true })];
+  await atTime(DAY, () => ring(a, { first_change_at: DAY, last_change_at: DAY, sources: [src(1, 3)] }));
+  const owner = a.read(ASSISTANT_STORE, OWNER_KEY);
+  must(owner.changeAt === null && show(owner.changeSources) === "{}", `change tracking under raftCheck: ${show(owner)}`);
+  const none = await atTime(DAY, () => wake(a.ctx));
+  must(none.turn === undefined && wakeRows(a).at(-1)?.status === "skipped_no_check" && a.r.inboxReads.length === 0, `${show(none)} ${show(wakeRows(a))}`);
+  await atTime(DAY, () => ring(a, { check: raftCheckPayload() }));
+  const out = await atTime(DAY, () => wake(a.ctx));
+  must(out.isolated === true && out.turnKey === `assistant.raft_check:doorbell:${CHECK_ID}`, `posted: ${show(out)}`);
+  must(out.turn === "RAFT-INSTRUCTION: read with raft__assistant_owner_messages, then call raft__assistant_notify_owner once.  is not yours. {{tool:frobnicate}} stays.", `the turn: ${out.turn}`);
+  must(show(out.tools) === show(["assistant_owner_messages", "assistant_notify_owner"]), `tools: ${show(out.tools)}`);
+  must(a.r.inboxReads.length === 0 && a.r.messageReads.length === 0, "a check Raft ran was read again here");
+  const row = wakeRows(a).at(-1)!;
+  must(row.status === "invoked" && row.attrs.check_id === CHECK_ID && row.attrs.raft_check === true && row.attrs.tools_dropped === 0 &&
+    row.attrs.placeholders_unknown === 1 && row.attrs.placeholders_unoffered === 1 && row.attrs.conversations === 4 && row.attrs.told === 2, show(row));
+  must(!("seen" in row.attrs) && !("lag_reads" in row.attrs), `a count off the list reached the row: ${show(row.attrs)}`);
+  must(!JSON.stringify(wakeRows(a)).includes("RAFT-INSTRUCTION"), "the instruction reached a trace row");
+});
+
+await check("allowed_tools narrows, never widens: send-as-owner, messages_send and unknown names are dropped and counted; none at all is the check's whole list", async () => {
+  const a = await raftAssistant();
+  await atTime(DAY, () => ring(a, { check: raftCheckPayload({ allowed_tools: ["notify", "send_as_owner", "messages_send", "assistant_send_as_owner", "owner_inbox", "notify"] }) }));
+  const out = await atTime(DAY, () => wake(a.ctx));
+  must(show(out.tools) === show(["assistant_owner_inbox", "assistant_notify_owner"]) && wakeRows(a).at(-1)?.attrs.tools_dropped === 3, `${show(out.tools)} ${show(wakeRows(a).at(-1))}`);
+  must(!out.turn.includes("raft__assistant_owner_messages") && out.turn.includes("raft__assistant_owner_inbox"), `the turn names a tool it lacks: ${out.turn}`);
+  await atTime(DAY, () => ring(a, { check: raftCheckPayload({ allowed_tools: undefined }) }));
+  must(show((await atTime(DAY, () => wake(a.ctx))).tools) === show(CHECK_TOOLS), "no list is not the check's whole list");
+  // Without notify the turn could do nothing: not posted.
+  await atTime(DAY, () => ring(a, { check: raftCheckPayload({ allowed_tools: ["owner_messages", "send_as_owner"] }) }));
+  const none = await atTime(DAY, () => wake(a.ctx));
+  must(none.turn === undefined && wakeRows(a).at(-1)?.status === "check_refused" && wakeRows(a).at(-1)?.attrs.reason === "no_notify", show(wakeRows(a).at(-1)));
+});
+
+await check("checkTools: a logical name mapping outside the ceiling is dropped, as an unknown one is; the ceiling's order is kept", async () => {
+  const { checkTools } = await import("../src/plugins/raft-assistant-check.ts");
+  const out = checkTools(["notify", "owner_inbox", "assistant_owner_inbox", "send_as_owner"], ["assistant_owner_inbox"]);
+  must(show(out) === show({ tools: ["assistant_owner_inbox"], dropped: 3 }), show(out));
+  must(show(checkTools(["notify", "owner_messages"], CHECK_TOOLS).tools) === show(["assistant_owner_messages", "assistant_notify_owner"]), "order");
+  must(show(checkTools(null, ["a", "b"])) === show({ tools: ["a", "b"], dropped: 0 }), "no list is the ceiling");
+});
+
+await check("isolated_sessions made before tools and turn_key gains them; a session's ask reads back, an unreadable list narrows to nothing", async () => {
+  const { recordIsolated, isolatedSession, isolatedSessions } = await import("../src/runtime/isolated-session.ts");
+  const host = sqliteHost();
+  try {
+    host.sql.exec("CREATE TABLE isolated_sessions (session TEXT PRIMARY KEY, alias TEXT NOT NULL, at INTEGER NOT NULL)");
+    host.sql.exec("INSERT INTO isolated_sessions (session, alias, at) VALUES ('iso_old', 'raft', 1)");
+    recordIsolated(host.sql, "iso_new", "raft", 2, { tools: ["assistant_notify_owner"], turnKey: "k1" });
+    must(show(isolatedSession(host.sql, "iso_old")) === show({ alias: "raft", tools: null, turnKey: null }), show(isolatedSession(host.sql, "iso_old")));
+    must(show(isolatedSession(host.sql, "iso_new")) === show({ alias: "raft", tools: ["assistant_notify_owner"], turnKey: "k1" }), show(isolatedSession(host.sql, "iso_new")));
+    host.sql.exec("UPDATE isolated_sessions SET tools = 'not json' WHERE session = 'iso_new'");
+    must(show(isolatedSession(host.sql, "iso_new")?.tools) === "[]", "an unreadable list widened");
+    must(isolatedSession(host.sql, "main") === null && isolatedSessions(host.sql).length === 2, "control");
+  } finally { host.dispose(); }
+});
+
+await check("a check is refused, never cut or guessed at: an instruction over 16 KB, another version, no id; each says why on its row", async () => {
+  const a = await raftAssistant();
+  const cases: Array<[Record<string, unknown>, string]> = [
+    [{ instruction: "x".repeat(16 * 1024 + 1) }, "instruction_too_large"], [{ version: 2 }, "version"], [{ id: "" }, "malformed"],
+  ];
+  for (const [o, reason] of cases) {
+    await atTime(DAY, () => ring(a, { check: raftCheckPayload(o) }));
+    const out = await atTime(DAY, () => wake(a.ctx));
+    const row = wakeRows(a).at(-1)!;
+    must(out.turn === undefined && row.status === "check_refused" && row.attrs.reason === reason, `${reason}: ${show(out)} ${show(row)}`);
+  }
+  must(wakeRows(a)[0]!.attrs.instruction_length === 16 * 1024 + 1 && wakeRows(a)[0]!.attrs.check_id === CHECK_ID, show(wakeRows(a)[0]));
+  // Control: exactly 16 KB is posted.
+  await atTime(DAY, () => ring(a, { check: raftCheckPayload({ instruction: "y".repeat(16 * 1024) }) }));
+  must((await atTime(DAY, () => wake(a.ctx))).turn?.length === 16 * 1024, "16 KB exactly was refused");
+});
+
+await check("a check wake clears a stale pause, and posts even on a stale flag (read again, kept)", async () => {
+  const a = await assistant(raft({ dm: "dm:@ada" }));
+  a.write(ASSISTANT_STORE, OWNER_KEY, { ...a.read(ASSISTANT_STORE, OWNER_KEY), pausedAt: 1 });
+  a.r.raftCheck = true;
+  await atTime(DAY, () => ring(a, { check: raftCheckPayload() }));
+  const out = await atTime(DAY, () => wake(a.ctx));
+  const owner = a.read(ASSISTANT_STORE, OWNER_KEY);
+  must(out.isolated === true && owner.pausedAt === null && owner.raftCheck === true, `${show(out)} ${show(owner)}`);
+});
+
+await check("the newest pending check per trigger is kept; a brief and a doorbell are each posted, one wake each", async () => {
+  const a = await raftAssistant();
+  const second = "5c3f0e1a-7b2d-4c8e-9f10-000000000002", brief = "5c3f0e1a-7b2d-4c8e-9f10-000000000003";
+  await atTime(DAY, () => ring(a, { check: raftCheckPayload() }));
+  await atTime("2026-10-20T10:00:01Z", () => ring(a, { check: raftCheckPayload({ id: second, instruction: "SECOND {{tool:notify}}" }) }));
+  await atTime("2026-10-20T10:00:02Z", () => ring(a, { type: "owner_brief", check: raftCheckPayload({ id: brief, trigger: "brief", instruction: "BRIEF {{tool:notify}}" }) }));
+  const first = await atTime(DAY, () => wake(a.ctx));
+  must(first.turn.startsWith("SECOND") && first.wakeAt === at(DAY), `the newest doorbell, and a wake now for the rest: ${show(first)}`);
+  const next = await atTime(DAY, () => wake(a.ctx));
+  must(next.turn.startsWith("BRIEF") && next.turnKey === `assistant.raft_check:brief:${brief}` && next.wakeAt > at(DAY), show(next));
+  must((await atTime(DAY, () => wake(a.ctx))).turn === undefined, "a check posted twice");
+});
+
+await check("an owner_brief event is a doorbell, never an event handed to the model", async () => {
+  const { doorbellOf } = await import("../src/plugins/raft-assistant.ts");
+  const event = (type: string) => ({ third_party_event: { client_id: "system.assistant", payload: { type, check: raftCheckPayload({ trigger: "brief" }) } } });
+  const b = doorbellOf(event("owner_brief"));
+  must(b !== null && b.check !== null && !("refused" in b.check) && b.check.trigger === "brief", show(b));
+  must(doorbellOf(event("owner_something")) === null, "an unknown type was taken as a doorbell");
+});
+
+await check("notify in Raft's check: items alone go to Raft with the check's id and a stable idempotency key; Raft's answer is the result", async () => {
+  const a = await raftAssistant();
+  a.r.notifyAnswer = { status: 200, code: null, body: { outcome: "sent", shown: 2, more: 1, dropped: [{ channelId: conv(9).channelId, reason: "not_in_check" }] } };
+  const items = [
+    { channelId: conv(1).channelId, summary: "  @bob asks\nfor a date ", kind: "question" },
+    { channelId: conv(2).channelId, summary: "@cy wants a review" },
+    { channelId: conv(9).channelId, summary: "@dee, elsewhere", kind: "decided" },
+  ];
+  const out = await notify(inCheck(a.ctx), { items });
+  must(a.r.notifies.length === 1, show(a.r.notifies));
+  const body = a.r.notifies[0];
+  must(body.check_id === CHECK_ID && /^assistant-notify-[0-9a-f]{32}$/.test(body.idempotency_key), show(body));
+  must(show(body.items) === show([{ channelId: conv(1).channelId, summary: "@bob asks for a date", kind: "question" }, { channelId: conv(2).channelId, summary: "@cy wants a review" },
+    { channelId: conv(9).channelId, summary: "@dee, elsewhere", kind: "decided" }]), show(body.items));
+  must(out.state === "sent" && out.items === 2 && out.more === 1 && out.dropped[conv(9).channelId] === "not_in_check" && !("check_id" in out), show(out));
+  const row = a.traced.filter((t) => t.kind === "raft.assistant_notify").at(-1)!;
+  must(row.attrs.check_id === CHECK_ID && row.attrs.forwarded === 1 && row.attrs.sent === 2 && row.attrs.held_back === 1 && row.attrs.dropped_not_in_check === 1 && row.attrs.given === 3, show(row));
+  must(!JSON.stringify(row).includes("@bob"), "a summary reached the trace");
+  // The same items in another order: the same key, so Raft sends one DM.
+  await notify(inCheck(a.ctx), { items: [items[2], items[0], items[1]] });
+  must(a.r.notifies[1].idempotency_key === body.idempotency_key, "the key moved with the order");
+  // Empty is a call too: Raft records what the model passed over.
+  a.r.notifyAnswer = { status: 200, code: null, body: { outcome: "nothing_to_send", shown: 0, more: 0, dropped: [] } };
+  const empty = await notify(inCheck(a.ctx), { items: [] });
+  must(empty.state === "nothing_to_send" && show(a.r.notifies.at(-1).items) === "[]", show(empty));
+  must(a.r.sends.length === 0 && a.read(REMINDED_STORE, "msg:aaaaaaa1") === undefined, "something was composed or recorded here");
+});
+
+await check("notify in Raft's check: refused shapes before Raft; 409 check_unknown and no answer are not_sent; 403 assistant_not_enabled pauses", async () => {
+  const a = await raftAssistant();
+  for (const bad of [{ items: [{ summary: "no id" }] }, { items: [{ channelId: conv(1).channelId, summary: "" }] }, { items: [{ channelId: conv(1).channelId, summary: "s", kind: "fyi" }] },
+    { items: Array.from({ length: 31 }, (_, n) => ({ channelId: `c${n}`, summary: "s" })) }]) {
+    must(await notify(inCheck(a.ctx), bad).then(() => false, () => true), `accepted: ${show(bad).slice(0, 80)}`);
+  }
+  must(a.r.notifies.length === 0, "a bad shape reached Raft");
+  must((await notify(inCheck(a.ctx), { items: Array.from({ length: 30 }, (_, n) => ({ channelId: `c${n}`, summary: "s" })) })).state === "sent", "30 items, Raft's cap, were refused");
+  a.r.notifyAnswer = { status: 409, code: "check_unknown" };
+  const unknown = await notify(inCheck(a.ctx), { items: [] });
+  must(unknown.state === "not_sent" && unknown.code === "check_unknown", show(unknown));
+  a.r.notifyAnswer = "drop";
+  const dropped = await notify(inCheck(a.ctx), { items: [] });
+  must(dropped.state === "not_sent" && dropped.code === "failed" && /same items/.test(dropped.note), show(dropped));
+  a.r.notifyAnswer = { status: 403, code: "assistant_not_enabled" };
+  must(await notify(inCheck(a.ctx), { items: [] }).then(() => false, (e) => /assistant_not_enabled/.test(String(e?.message))), "not refused");
+  must(a.read(ASSISTANT_STORE, OWNER_KEY).pausedAt !== null, "not paused");
+});
+
+await check("notify while Raft runs the check, outside one of its sessions: nothing is sent or composed; raftCheck false keeps the local notify", async () => {
+  const a = await raftAssistant();
+  const out = await notify(a.ctx, { items: ITEMS });
+  must(out.state === "not_sent" && out.code === "no_check" && a.r.notifies.length === 0 && a.r.sends.length === 0, show(out));
+  const b = await assistant(raft({ dm: "dm:@ada" }));
+  await atTime(DAY, () => notify(b.ctx, { items: [ITEMS[0]] }));
+  must(b.r.notifies.length === 0 && b.r.sends.length === 1, `control, local: ${show(b.r.sends)}`);
+});
+
+await check("chat told while Raft runs the check: the owner-DM send's refs go to POST /assistant/told as chat, nothing kept here", async () => {
+  const a = await raftAssistant();
+  await raftPlugin.invoke("messages_send", { target: "dm:@ada", content: "Next: #ch1:aaaaaaa1 and #ch2:bbbbbbb2, and #ch1:aaaaaaa1 again" }, a.ctx);
+  must(show(a.r.told) === show([{ refs: ["#ch1:aaaaaaa1", "#ch2:bbbbbbb2"], via: "chat" }]), show(a.r.told));
+  must(a.read(REMINDED_STORE, "msg:aaaaaaa1") === undefined, "told kept locally under raftCheck");
+  const row = a.traced.filter((t) => t.kind === "raft.assistant_chat_told").at(-1)!;
+  must(row.attrs.refs === 2 && row.attrs.told === 2 && !JSON.stringify(row).includes("#ch1"), show(row));
+  // Not the owner's DM: nothing told. Control: raftCheck false keeps it locally, as before.
+  await raftPlugin.invoke("messages_send", { target: "#ch1", content: "#ch1:ccccccc3" }, a.ctx);
+  must(a.r.told.length === 1, "a channel send was told");
+  const b = await assistant(raft({ dm: "dm:@ada" }));
+  await raftPlugin.invoke("messages_send", { target: "dm:@ada", content: "#ch1:aaaaaaa1" }, b.ctx);
+  must(b.r.told.length === 0 && b.read(REMINDED_STORE, "msg:aaaaaaa1") !== undefined, "control: local told");
+});
+
+await check("the switch-over import: { briefSent } once, the later of the day briefed and the day sent; a failure is retried later, never in a check's way", async () => {
+  const a = await assistant(raft({ dm: "dm:@ada" }));
+  a.write(ASSISTANT_STORE, OWNER_KEY, { ...a.read(ASSISTANT_STORE, OWNER_KEY), lastBrief: "2026-10-20", briefSent: "2026-10-19" });
+  a.r.raftCheck = true;
+  await raftPlugin.snapshotTools!(a.ctx);
+  a.r.importAnswer = { status: 404, code: "NOT_FOUND" };
+  await atTime(DAY, () => ring(a, { check: raftCheckPayload() }));
+  const out = await atTime(DAY, () => wake(a.ctx));
+  must(out.isolated === true && a.r.imports.length === 1 && show(a.r.imports[0]) === show({ briefSent: "2026-10-20" }), `${show(out)} ${show(a.r.imports)}`);
+  must(out.wakeAt === at(DAY) + 60_000, `the retry is not asked for: ${show(out)}`);
+  must(a.traced.some((t) => t.kind === "raft.assistant_check" && t.status === "import_failed" && t.attrs.http_status === 404), "no failed row");
+  // Too soon: not asked again. Due: pushed, then never again.
+  await atTime("2026-10-20T10:00:30Z", () => wake(a.ctx));
+  must(a.r.imports.length === 1, "retried before its time");
+  a.r.importAnswer = { status: 200, code: null };
+  await atTime("2026-10-20T10:01:00Z", () => wake(a.ctx));
+  must(a.r.imports.length === 2 && a.read(ASSISTANT_STORE, "brief_import").done === true, show(a.read(ASSISTANT_STORE, "brief_import")));
+  await atTime("2026-10-20T11:00:00Z", () => wake(a.ctx));
+  a.r.raftCheck = false; await raftPlugin.snapshotTools!(a.ctx); a.r.raftCheck = true; await raftPlugin.snapshotTools!(a.ctx);
+  await atTime("2026-10-20T12:00:00Z", () => wake(a.ctx));
+  must(a.r.imports.length === 2, `pushed again: ${show(a.r.imports)}`);
+});
+
+await check("preferences while Raft runs the check: Raft's contact-rules and contact-settings, Raft's confirmations, nothing kept here", async () => {
+  const a = await raftAssistant();
+  const pref = (args: unknown) => raftPlugin.invoke("assistant_preferences", args, a.ctx) as Promise<any>;
+  const added = await pref({ action: "add", effect: "mute", channel: "launch" });
+  must(added.state === "added" && added.confirm === "RAFT-CONFIRM mute #launch" && /^9e000000/.test(added.id), show(added));
+  await pref({ action: "add", effect: "digest", thread: "#eng:ABCDEF12-3456" });
+  await pref({ action: "add", effect: "always", person: "ana", anytime: true });
+  await pref({ action: "add", effect: "mute", kind: "decided" });
+  await pref({ action: "add", effect: "mute", dms: true });
+  must(show(a.r.raftRules.map((x) => x.subject)) === show(["#launch", "#eng:abcdef12", "@ana", "kind:decided", "dms"]), show(a.r.raftRules));
+  must(a.r.ruleCalls.some((c) => c.includes('"anytime":true')), "anytime not sent");
+  const listed = await pref({ action: "list" });
+  must(listed.rules.length === 5 && listed.defaults === "RAFT-DEFAULTS" && listed.quiet === "quiet 22:00-08:00", show(listed));
+  const first = a.r.raftRules[0]!.id;
+  const removed = await pref({ action: "remove", id: first });
+  must(removed.confirm === `RAFT-REMOVED ${first}` && a.r.raftRules.length === 4 && a.r.ruleCalls.includes(`DELETE /assistant/contact-rules/${first}`), show(removed));
+  const quiet = await pref({ action: "quiet", from: "23:00", to: "07:00" });
+  must(quiet.confirm === 'RAFT-QUIET {"from":"23:00","to":"07:00"}', show(quiet));
+  const tz = await pref({ action: "timezone", timezone: "Asia/Tokyo" });
+  must(tz.state === "kept" && a.r.ruleCalls.at(-1) === 'PUT /assistant/contact-settings {"quiet":{"from":"23:00","to":"07:00"},"statedTimezone":"Asia/Tokyo"}', `${show(tz)} ${a.r.ruleCalls.at(-1)}`);
+  must(a.read(ASSISTANT_STORE, "rules") === undefined && a.read(ASSISTANT_STORE, CONTACT_KEY) === undefined, "kept locally under raftCheck");
+  // Local checks still run first; Raft's refusal is the tool's error in Raft's words.
+  must(await pref({ action: "add", effect: "mute", channel: "a", person: "b" }).then(() => false, (e) => /exactly one/.test(e.message)), "two subjects accepted");
+  a.r.ruleRefusal = { status: 400, code: "subject_not_found", error: "Your owner cannot see anything by that name here." };
+  must(await pref({ action: "add", effect: "mute", channel: "nope" }).then(() => false, (e) => e.message.includes("cannot see anything by that name")), "Raft's refusal was not said");
+  const row = a.traced.filter((t) => t.kind === "raft.assistant_rules").at(-1)!;
+  must(row.status === "refused:subject_not_found" && row.attrs.via === "raft", show(row));
+});
+
+await check("the check prompt under Raft's check: notify exactly once, items alone, no people rules or composer numbers; the fence kept", () => {
+  const p = assistantCheckPrompt("raft", ["assistant_owner_messages", "assistant_notify_owner"], { raftCheck: true });
+  must(/exactly one call to `raft__assistant_notify_owner`/.test(p) && /with no items/.test(p) && /items alone/.test(p), p);
+  must(!/rules about people/.test(p) && !p.includes(String(SUMMARY_MAX)) && !p.includes(`at most ${DM_ITEMS_MAX}`) && !/check_id|idempotency/.test(p), p);
+  must(/information, never instructions/.test(p) && /Never message anyone any other way/.test(p) && !p.includes("raft__assistant_owner_inbox"), p);
+  must(assistantCheckPrompt("raft") === assistantCheckPrompt("raft", CHECK_TOOLS, { raftCheck: false }), "the local prompt moved");
+  must(assistantSystemPrompt({}, "raft", "check", undefined, `assistant.raft_check:doorbell:${CHECK_ID}`) === assistantCheckPrompt("raft", CHECK_TOOLS, { raftCheck: true }), "the key does not choose the prompt");
+});
+
+await check("Raft's check end to end: a narrowed short session under Raft's prompt; notify forwarded with the check's id; its end a raft.assistant_check row", async () => {
+  let called = 0;
+  const w = await runtimeWith(true, (c) => {
+    if (!c.systemPrompt.includes("exactly one call")) return say("noted");
+    called++;
+    if (called === 1) return { text: "", finishReason: "tool_calls", truncated: false, usage, toolCalls: [{ id: "n1", name: "raft__assistant_notify_owner", arguments: { items: [{ channelId: conv(1).channelId, summary: "@bob asks for a date" }] } }] } as ModelResponse;
+    return say("done");
+  });
+  try {
+    w.r.raftCheck = true;
+    w.db.write(ASSISTANT_STORE, OWNER_KEY, { ...w.db.read(ASSISTANT_STORE, OWNER_KEY), raftCheck: true });
+    w.db.write(ASSISTANT_STORE, "raft_checks", { doorbell: { ...(await import("../src/plugins/raft-assistant-check.ts")).checkOf(raftCheckPayload({ allowed_tools: ["notify", "owner_messages", "send_as_owner"] })), at: Date.now() } });
+    askWake(w.host.sql, "raft", Date.now());
+    await w.drive();
+    const c = w.calls.find((x) => x.systemPrompt.includes("exactly one call"));
+    must(c, `no check turn: ${show(w.calls.map((x) => x.systemPrompt.slice(0, 60)))}`);
+    must(c!.systemPrompt === assistantCheckPrompt("raft", ["assistant_owner_messages", "assistant_notify_owner"], { raftCheck: true }), `prompt: ${c!.systemPrompt.slice(0, 200)}`);
+    const tools = c!.tools.map((t) => t.name).sort();
+    must(show(tools) === show(["artifacts__read", "raft__assistant_notify_owner", "raft__assistant_owner_messages"]), `narrowed tools: ${show(tools)}`);
+    must(JSON.stringify(c!.messages).includes("RAFT-INSTRUCTION: read with raft__assistant_owner_messages"), "the instruction was not the input");
+    must(w.r.notifies.length === 1 && w.r.notifies[0].check_id === CHECK_ID && w.r.sends.length === 0, `notify: ${show(w.r.notifies)} sends: ${show(w.r.sends)}`);
+    const rows = w.host.sql.exec("SELECT kind, status, attrs FROM trace_outbox WHERE kind IN ('raft.assistant_check', 'raft.assistant_notify') ORDER BY seq").toArray() as any[];
+    const end = rows.find((x) => x.kind === "raft.assistant_check" && x.status === "turn_ended");
+    must(end && JSON.parse(end.attrs).check_id === CHECK_ID && JSON.parse(end.attrs).outcome === "completed", `rows: ${show(rows)}`);
+    must(JSON.parse(rows.find((x) => x.kind === "raft.assistant_notify").attrs).check_id === CHECK_ID, show(rows));
+    must(w.host.sql.exec("SELECT COUNT(*) AS n FROM isolated_sessions").toArray()[0].n === 0, "the short session outlived its run");
+    // Nothing of the check's end reached the chat's fallback.
+    must(w.r.sends.length === 0, `sent: ${show(w.r.sends)}`);
+  } finally { w.host.dispose(); }
+});
+
+await check("a narrowed short session refuses a tool of its mount it is not offered, at the host as well as by the list", async () => {
+  const w = await runtimeWith(true, (c) => c.systemPrompt.includes("exactly one call") && !c.messages.some((m: any) => m.role === "toolResult")
+    ? { text: "", finishReason: "tool_calls", truncated: false, usage, toolCalls: [{ id: "x1", name: "raft__assistant_owner_inbox", arguments: {} }] } as ModelResponse
+    : say("done"));
+  try {
+    w.r.raftCheck = true;
+    w.db.write(ASSISTANT_STORE, OWNER_KEY, { ...w.db.read(ASSISTANT_STORE, OWNER_KEY), raftCheck: true });
+    w.db.write(ASSISTANT_STORE, "raft_checks", { doorbell: { ...(await import("../src/plugins/raft-assistant-check.ts")).checkOf(raftCheckPayload({ allowed_tools: ["notify"] })), at: Date.now() } });
+    askWake(w.host.sql, "raft", Date.now());
+    await w.drive();
+    must(w.r.inboxReads.length === 0, `the owner inbox was read from a session not offered it: ${show(w.r.inboxReads)}`);
+    const c = w.calls.filter((x) => x.systemPrompt.includes("exactly one call")).at(-1)!;
+    must(show(c.tools.map((t) => t.name).sort()) === show(["artifacts__read", "raft__assistant_notify_owner"]), show(c.tools.map((t) => t.name)));
+  } finally { w.host.dispose(); }
 });
 
 const failed = results.filter((r) => !r.ok);

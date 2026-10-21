@@ -959,6 +959,23 @@ what an `anytime` rule covers, is kept for the brief. A `#channel:msgid` the ass
 their chat (the answer to "more") counts as told too, so the next wake does not bring it back
 (`noteToldInChat`, a `raft.assistant_chat_told` row with the count).
 
+When Raft runs the check (RFC 077 step 2), it says so in the credential context, `assistantOf.raftCheck: true`, and
+that flag is the only switch: read at every listing, when the brief's timer fires and when a check arrives on a stale
+flag (`src/plugins/raft-assistant.ts`). While it is true, the plugin's own brief, prefilter, inbox-lag reads,
+composition and rules store are off. Raft's doorbell (`owner_inbox_updated`) and its brief (`owner_brief`) carry a
+`check` (`payload.check`, `src/plugins/raft-assistant-check.ts`), and a wake with one posts `check.instruction` as the
+short session's input, as written but for `{{tool:notify}}`, `{{tool:owner_inbox}}` and `{{tool:owner_messages}}`,
+which become the mount's model tool names (removed when the session lacks the tool; an unknown placeholder is left and
+counted). An instruction over 16 KB, another `version` or a check with no id is refused, never cut. `allowed_tools`
+can only narrow the check's tools: it is intersected in code with the reads and the notify tool, the runtime offers
+the session that list alone (`PluginNext.tools`) and refuses anything else of the mount at the host too. The notify
+tool then forwards the items (`{ channelId, summary, kind? }` each) to `POST /assistant/notify` with the check's id,
+from the session's key, and an idempotency key made from the check and the items; the model gives neither. A wake with
+a check clears a stale pause. The chat's references go to `POST /assistant/told` (`via: "chat"`), the preferences tool
+reads and writes Raft's `contact-rules` and `contact-settings`, and the first time the flag reads true the plugin pushes
+`{ briefSent }` once to `POST /assistant/check-state/import`, retried with backoff. With the flag false or absent,
+everything is as above.
+
 The owner's contact rules (`src/plugins/raft-assistant-rules.ts`) are set through
 `assistant_preferences`, offered in the chat: `add` records one rule, an effect (`mute`, `always`,
 `digest`) about exactly one subject (a channel or a thread, kept by Raft's channelId; a person, kept by
@@ -1679,13 +1696,15 @@ Two hooks let a plugin's own code act on what the model did, without offering th
 are in the contract (`src/plugins/types.ts`, where each promise is spelled out), both are optional, and neither is
 called for a plugin that does not declare it.
 
-- **`afterTurn(ctx, { turnId, turnKey, finalText, outcome, error?, errorCode? })`**: a model turn of the agent's main
+- **`afterTurn(ctx, { turnId, turnKey, finalText, outcome, error?, errorCode?, isolated? })`**: a model turn of the agent's main
   conversation has ended — `completed`, `failed` (with what the model or the run reported) or `cancelled` — and
   `finalText` is the model's last text, or null. `errorCode` says why a `failed` turn failed where the model layer
   knows it: `output_limit`, the call spent its whole output cap (reasoning included) before writing any answer. Act on
   the code, never on `error`'s text. `turnKey` is the key this mount gave when it asked for the turn, and
   null for any other turn: a plugin that acts on its own turns ignores the rest. The key is written down as the turn
-  is posted, so an eviction before its run's id is known still binds it. A subagent's turn is not told.
+  is posted, so an eviction before its run's id is known still binds it. A subagent's turn is not told. A short
+  session this mount asked for with a `turnKey` (`isolated` below) is told to this mount alone, with `isolated: true`,
+  its key, its outcome and `errorCode`, and no `finalText` or `error` text.
 - **`wake(ctx)`**: the plugin asked to be called again (`wakeAt` below), or, for the plugin an agent profile names
   (`src/runtime/agent-profile.ts`), a service pushed an event at the agent: under a profile a push is that plugin's to
   act on, and never reaches the model as a message.
@@ -1701,6 +1720,8 @@ Either answers with what it wants next (`PluginNext`), or nothing:
 | `reasoning` | with `fresh`, the reasoning level (`off`, `low`, `high`) of every model call in the conversation it starts, in place of the agent's own; the next conversation is back at the agent's own |
 | `forget` | erases the main conversation: its transcript, its model jobs, and the model's text in the turn ends kept. Under a profile that keeps no conversations, `fresh` erases the one before rather than archiving it |
 | `wakeAt` | calls this mount's `wake` at or after that time (epoch ms); one wake is kept per mount, and an earlier ask wins, so a plugin says the time it needs in every answer |
+| `isolated` | posts `turn` in a short session of its own (`src/runtime/isolated-session.ts`), erased once its run ends; with a `turnKey`, that key is handed to this mount's calls in the session (`caller.turnKey`) and its end is told to this mount |
+| `tools` | with `isolated`: the bare names of this mount's tools the session may be offered, at most; it narrows, never widens, and a call beyond it is refused |
 | `cancelTurn` | ends the running turn with the runtime's own cancel; its end is told to `afterTurn` as `cancelled`. Its model job is dropped, so a call not yet taken is never made, but one already under way runs to its end |
 
 What the runtime promises, and what it leaves to the plugin (`src/runtime/plugin-wakes.ts`, `#runPluginHooks` in
