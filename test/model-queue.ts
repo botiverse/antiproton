@@ -9,7 +9,7 @@
 import { AgentRuntime } from "../cf/src/runtime.ts";
 import { adoptProvisionedAgent } from "../cf/src/provision/steps.ts";
 import {
-  UnknownJob, consumeModelCalls, isUnknownJobReply, replyingUnknownJob,
+  ATTEMPT_TRACE_BOUND_MS, UnknownJob, consumeModelCalls, isUnknownJobReply, replyingUnknownJob,
   type ModelJobStub, type ModelQueueDeps, type ModelQueueMessage, type QueuedModelCall,
 } from "../cf/src/model-queue.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
@@ -354,12 +354,29 @@ await check("consumer: an attempt whose record cannot be written is still retrie
   await quietly(() => consumeModelCalls({ queue: "model-calls", messages: [msg] }, deps(broken, [])));
   setLogSink(null);
   must(m.retried === 1 && m.acked === 0, JSON.stringify(m));
-  must(lines.some((l) => l.evt === "model_job.attempt_trace_failed" && l.jobId === "job-a"), JSON.stringify(lines));
+  must(lines.some((l) => l.evt === "model_job.attempt_trace_failed" && l.jobId === "job-a" && l.reason === "error"), JSON.stringify(lines));
   // The same delivery failure, recorded: the call answered, so the step is the delivery and the provider's time is the call's.
   const { stub: s2, attempts } = attemptStub();
   await quietly(() => consumeModelCalls({ queue: "model-calls", messages: [message("job-b").msg] },
     deps({ ...s2, async deliverAnswer() { throw new Error("object reset"); } }, [])));
   must(attempts[0]?.phase === "deliver" && typeof attempts[0].providerMs === "number", JSON.stringify(attempts));
+});
+
+await check("consumer: an object that never answers the attempt's record does not hold up the retry", async () => {
+  const lines = captureLog();
+  const { stub } = attemptStub();
+  const hung: ModelJobStub = { ...stub, recordModelAttempt: () => new Promise(() => {}) };
+  const failing: ModelQueueDeps = { ...deps(hung, []), async call() { throw new ModelHttpError(503, "model 503"); } };
+  const { msg, m } = message("job-a");
+  const t0 = Date.now();
+  await quietly(() => consumeModelCalls({ queue: "model-calls", messages: [msg] }, failing, 50));
+  const took = Date.now() - t0;
+  setLogSink(null);
+  must(m.retried === 1 && m.acked === 0, JSON.stringify(m));
+  must(took < 1_000, `the retry waited ${took} ms on the record`);
+  must(lines.some((l) => l.evt === "model_job.attempt_trace_failed" && l.jobId === "job-a" && l.reason === "timeout"), JSON.stringify(lines));
+  // The default bound is the short one the consumer uses in production, not the queue's whole visibility window.
+  must(ATTEMPT_TRACE_BOUND_MS <= 2_000, `bound ${ATTEMPT_TRACE_BOUND_MS}`);
 });
 
 await check("runtime: a failed attempt becomes one model.attempt row on the job's span, with only checked fields", async () => {

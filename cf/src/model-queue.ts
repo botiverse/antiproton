@@ -154,17 +154,34 @@ export interface ModelQueueMessage {
 }
 
 /**
+ * How long the consumer waits on a failed attempt's trace row before retrying without it. The same bound as an image
+ * evidence write (`EVIDENCE_WRITE_BOUND_MS`, cf/src/image-evidence.ts), for the same reason: a record is never worth
+ * holding up the call it describes, and here the object being asked may be the one that just failed.
+ */
+export const ATTEMPT_TRACE_BOUND_MS = 2_000;
+
+/**
  * A failed attempt's trace row, written by the agent's object. Without it a retried call showed in the trace only as
  * the one slow `model.call` its final answer closed, with nothing saying an attempt had failed in between (a 36 s call
- * in an onboarding agent's turn, 2026-10-20). A failure to write it is logged and never stops the retry.
+ * in an onboarding agent's turn, 2026-10-20). A failure to write it, or no answer within ATTEMPT_TRACE_BOUND_MS, is
+ * logged and never stops the retry.
  */
-async function traceFailedAttempt(m: QueuedModelCall, deps: ModelQueueDeps, attempt: FailedAttempt): Promise<void> {
+async function traceFailedAttempt(m: QueuedModelCall, deps: ModelQueueDeps, attempt: FailedAttempt, boundMs = ATTEMPT_TRACE_BOUND_MS): Promise<void> {
+  const failed = (reason: "error" | "timeout", error: string) =>
+    logEvent("model_job.attempt_trace_failed", { tenantId: m.tenantId, agentId: m.agentId, jobId: m.jobId, reason, error });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const bound = new Promise<"slow">((r) => { timer = setTimeout(() => r("slow"), boundMs); });
   try {
     const stub = deps.stub(m);
-    if (stub.recordModelAttempt) await stub.recordModelAttempt(m.tenantId, m.agentId, m.jobId, attempt);
+    if (!stub.recordModelAttempt) return;
+    const wrote = Promise.resolve().then(() => stub.recordModelAttempt!(m.tenantId, m.agentId, m.jobId, attempt)).then(() => "done" as const);
+    if (await Promise.race([wrote, bound]) === "slow") {
+      failed("timeout", `no answer within ${boundMs} ms`);
+      wrote.catch(() => { /* already reported as slow */ });
+    }
   } catch (e) {
-    logEvent("model_job.attempt_trace_failed", { tenantId: m.tenantId, agentId: m.agentId, jobId: m.jobId, error: String((e as Error)?.message ?? e).slice(0, 200) });
-  }
+    failed("error", String((e as Error)?.message ?? e).slice(0, 200));
+  } finally { clearTimeout(timer); }
 }
 
 /** Logged once per message whose job the agent does not hold; the message is then acked. */
@@ -272,6 +289,8 @@ export async function runPrewarm(m: QueuedModelCall, deps: ModelQueueDeps): Prom
 export async function consumeModelCalls(
   batch: { readonly queue: string; readonly messages: readonly ModelQueueMessage[] },
   deps: ModelQueueDeps,
+  /** How long a failed attempt's trace row is waited on (`traceFailedAttempt`); a test shortens it. */
+  traceBoundMs = ATTEMPT_TRACE_BOUND_MS,
 ): Promise<void> {
   for (const message of batch.messages) {
     if (message.body.kind === "prewarm") {
@@ -295,7 +314,7 @@ export async function consumeModelCalls(
       // the message lands in the dead letter queue, where it becomes a
       // visible failure on the task rather than a silence.
       console.error("model call failed", String((e as Error)?.message ?? e));
-      await traceFailedAttempt(message.body, deps, failedAttempt(e, progress, message.attempts, startedAt));
+      await traceFailedAttempt(message.body, deps, failedAttempt(e, progress, message.attempts, startedAt), traceBoundMs);
       message.retry();
     }
   }
