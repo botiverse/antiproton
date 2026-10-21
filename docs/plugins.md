@@ -997,7 +997,9 @@ resolved against the owner's inbox (a message's full id from a thread row whose 
 around its short id). Code keeps, whatever the model does: a call from a short session (a check or the
 brief) or from a program is refused before anything is read, and the tool is not offered there either;
 `@everyone` and `@here` are refused before anything is read; one request per call, never retried, and
-after a `rate_limited` the same message to the same place is not sent again for ten minutes. A refusal
+after a `rate_limited` the same message to the same place is not sent again for ten minutes; within one
+turn (`caller.turnId`) the same message to the same place is posted once, a second call answered
+`not_sent` / `duplicate_in_turn` without a request (traced `refused:duplicate_in_turn`). A refusal
 (`assistant_send_as_owner_off`, `channel_not_found`, `message_not_found`, `owner_cannot_post`,
 `mass_mention_not_allowed`, `invalid_content`, `rate_limited`, `channel_archived`, a missing route, or a
 target the inbox cannot resolve) is answered `not_sent` with the code and a `tell` line for the owner,
@@ -1024,13 +1026,14 @@ tools and how to use them (the owner reads, the DM, `assistant_preferences`,
 as its owner only when the owner explicitly asks, which DMs the reads cover, the `#channel:msgid`
 citation the told-tracking parses, the shape and limit of the unasked messages code composes, and
 that every reply to the owner, a question back included, goes through `messages_send` (the text a
-turn ends with is shown to no one), the effective defaults, written from code's constants: the brief's time (`BRIEF_HOUR`), the default
+turn ends with is shown to no one; this is the code part's last paragraph, so the last thing the model
+reads, and is said again in the precedence line), the effective defaults, written from code's constants: the brief's time (`BRIEF_HOUR`), the default
 quiet hours (`DEFAULT_QUIET`) and what is reported by default. The preferences tool's `list` returns
 the same facts for the owner's settings (`quiet`, `brief`, `defaults`, then the rules), which is what
 the assistant answers "what rules do you follow" from.
 The chat's prompt is the name line, then Raft's instructions verbatim, or
 `DEFAULT_ASSISTANT_INSTRUCTIONS` (`src/plugins/raft-assistant-instructions.ts`) when they are empty
-or blank, then the code part, whose first line (`ASSISTANT_PRECEDENCE`) says it wins over anything
+or blank, then the code part, whose first line (`assistantPrecedence`) says it wins over anything
 above it that conflicts: the instructions can change how the assistant sounds, not what it may do,
 and the tool guards (no send-as-owner from a check, refused in code) hold whatever they say. A
 check's prompt is `assistantCheckPrompt` alone, with no name and no instructions: what a check
