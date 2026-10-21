@@ -587,7 +587,7 @@ async function newKinds(sql: any): Promise<void> {
     // `pushBriefImport`'s failure.
     { at: T0 + 19, ...t, kind: "raft.assistant_check", spanId: "mount:assistant", status: "import_failed", verdict: "failed",
       attrs: { mount: "assistant", attempts: 3, http_status: 502, code: "http" } },
-    // `toldToRaft`'s failure and `replyFallback`'s.
+    // A `told_failed` row as older builds wrote it (`toldToRaft`, since removed), and `replyFallback`'s.
     { at: T0 + 20, ...t, kind: "raft.assistant_chat_told", spanId: "op_00000000000000000012", status: "told_failed", verdict: "failed",
       attrs: { mount: "assistant", told: 0, refs: 2, forwarded: 1, http_status: 503, code: "http" } },
     { at: T0 + 21, ...t, kind: "raft.assistant_chat_told", spanId: "mount:assistant", status: "reply_fallback", verdict: "failed",

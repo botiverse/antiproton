@@ -2805,19 +2805,18 @@ await check("notify while Raft runs the check, outside one of its sessions: noth
   must(b.r.notifies.length === 0 && b.r.sends.length === 1, `control, local: ${show(b.r.sends)}`);
 });
 
-await check("chat told while Raft runs the check: the owner-DM send's refs go to POST /assistant/told as chat, nothing kept here", async () => {
+await check("chat told while Raft runs the check: Raft's Server records it, so the owner-DM send makes no /assistant/told call and keeps nothing here; raftCheck false records it locally", async () => {
   const a = await raftAssistant();
-  await raftPlugin.invoke("messages_send", { target: "dm:@ada", content: "Next: #ch1:aaaaaaa1 and #ch2:bbbbbbb2, and #ch1:aaaaaaa1 again" }, a.ctx);
-  must(show(a.r.told) === show([{ refs: ["#ch1:aaaaaaa1", "#ch2:bbbbbbb2"], via: "chat" }]), show(a.r.told));
-  must(a.read(REMINDED_STORE, "msg:aaaaaaa1") === undefined, "told kept locally under raftCheck");
-  const row = a.traced.filter((t) => t.kind === "raft.assistant_chat_told").at(-1)!;
-  must(row.attrs.refs === 2 && row.attrs.told === 2 && !JSON.stringify(row).includes("#ch1"), show(row));
-  // Not the owner's DM: nothing told. Control: raftCheck false keeps it locally, as before.
-  await raftPlugin.invoke("messages_send", { target: "#ch1", content: "#ch1:ccccccc3" }, a.ctx);
-  must(a.r.told.length === 1, "a channel send was told");
+  const sent = await raftPlugin.invoke("messages_send", { target: "dm:@ada", content: "Next: #ch1:aaaaaaa1 and #ch2:bbbbbbb2" }, a.ctx);
+  must(sent && a.r.sends.length === 1, `control: sent ${show(sent)}`);
+  must(a.r.told.length === 0, `told to Raft: ${show(a.r.told)}`);
+  must(a.read(REMINDED_STORE, "msg:aaaaaaa1") === undefined && a.read(REMINDED_STORE, "msg:bbbbbbb2") === undefined, "told kept locally under raftCheck");
+  must(!a.traced.some((t) => t.kind === "raft.assistant_chat_told" && t.status !== "reply_fallback"), show(a.traced));
+  // Control: raftCheck false keeps it locally, as before, and tells Raft nothing.
   const b = await assistant(raft({ dm: "dm:@ada" }));
   await raftPlugin.invoke("messages_send", { target: "dm:@ada", content: "#ch1:aaaaaaa1" }, b.ctx);
-  must(b.r.told.length === 0 && b.read(REMINDED_STORE, "msg:aaaaaaa1") !== undefined, "control: local told");
+  must(b.r.told.length === 0 && b.read(REMINDED_STORE, "msg:aaaaaaa1")?.via === "chat", "control: local told");
+  must(b.traced.filter((t) => t.kind === "raft.assistant_chat_told").at(-1)?.attrs.told === 1, show(b.traced));
 });
 
 await check("the switch-over import: { briefSent } once, the later of the day briefed and the day sent; a failure is retried later, never in a check's way", async () => {

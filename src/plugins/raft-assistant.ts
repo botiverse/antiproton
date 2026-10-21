@@ -24,7 +24,7 @@
  * after dropping, in code:
  * - an item the owner was already told about (`REMINDED_STORE`, one row per message id or task, kept in the mount's
  *   own database, so a rebuilt context or a second doorbell does not repeat it; a reference the assistant sent them in
- *   its chat counts too, `noteToldInChat`);
+ *   its chat counts too, `noteToldInChat`, or, while Raft runs the check, Raft's Server records it);
  * - an item one of the owner's contact rules mutes (`RULES_KEY`, src/plugins/raft-assistant-rules.ts);
  * and holding, rather than sending, what a digest rule keeps for the brief and everything that arrives in the owner's
  * quiet hours (`CONTACT_KEY`, owner-local) but what an `anytime` rule lets through, for the morning brief (`DEFERRED_KEY`). The brief is this mount's own timer (`Plugin.wake`), not Raft's Reminder app.
@@ -43,9 +43,9 @@
  * When Raft runs the check (RFC 077 step 2, `assistantOf.raftCheck`, `AssistantOwner.raftCheck`), everything above that
  * decides what to tell the owner is Raft's, and this file keeps only the turn: a wake carrying Raft's check posts its
  * instruction in a short session narrowed to the tools Raft allows (`raftCheckWake`, src/plugins/raft-assistant-check.ts),
- * the notify tool forwards its items to Raft (`notifyRaft`), the chat's references are told to Raft (`toldToRaft`), the
- * preferences tool reads and writes Raft's rules (`preferencesRaft`), and the day already briefed is pushed once
- * (`pushBriefImport`). The flag read false puts everything back as described above.
+ * the notify tool forwards its items to Raft (`notifyRaft`), the chat's references are recorded as told by Raft's Server
+ * itself (`noteToldInChat` does nothing), the preferences tool reads and writes Raft's rules (`preferencesRaft`), and the
+ * day already briefed is pushed once (`pushBriefImport`). The flag read false puts everything back as described above.
  *
  * Compiled by both typecheck programs.
  */
@@ -1085,17 +1085,18 @@ const REF_IN_TEXT = /#([^\s:#]{1,80}):([0-9A-Za-z-]{8,36})/g;
  * next wake neither hands the model that conversation again (`prefilter`'s `told`) nor lets notify repeat it. This is
  * what the owner's "more" comes to: the chat lists the next items itself, by reference, and nothing it listed comes
  * back unasked. Called after a `messages_send` the Server accepted (src/plugins/raft.ts), to the owner's DM only; the
- * count goes on a `raft.assistant_chat_told` trace row, never a reference. Returns how many were new.
+ * count goes on a `raft.assistant_chat_told` trace row, never a reference. Returns how many were new. While Raft runs
+ * the check it does nothing: Raft's Server records every reference the assistant sends in its owner's DM as told.
  */
-export async function noteToldInChat(ctx: PluginContext, target: unknown, content: unknown, now = Date.now(), api?: AssistantApi): Promise<number> {
+export async function noteToldInChat(ctx: PluginContext, target: unknown, content: unknown, now = Date.now()): Promise<number> {
   if (typeof target !== "string" || typeof content !== "string") return 0;
   const owner = await loadOwner(ctx);
+  // While Raft runs the check, Raft's Server records what the assistant sends in its owner's DM as told itself.
+  if (owner?.raftCheck) return 0;
   const dm = owner ? dmPeerOf(dmOf(owner)) : null;
   // The DM itself or one of its threads (`dm:@ada:abcdef12`), in Raft's form (`~human`) or the inbox's (`sameDm`).
   const to = dmPeerOf(target);
   if (!dm || !to || !sameDm(to, dm)) return 0;
-  // While Raft runs the check, what was told is Raft's to keep (`POST /assistant/told`, refs as written, short ids too).
-  if (owner!.raftCheck && api) return toldToRaft(ctx, content, api);
   let fresh = 0;
   for (const m of content.matchAll(REF_IN_TEXT)) {
     const key = `msg:${short8(m[2]!)}`;
@@ -1105,28 +1106,6 @@ export async function noteToldInChat(ctx: PluginContext, target: unknown, conten
   }
   if (fresh) ctx.trace?.({ kind: "raft.assistant_chat_told", status: "told", verdict: "ok", attrs: { told: fresh } });
   return fresh;
-}
-
-/** The most refs one told record takes (Raft's `messageIds` bound, the same for refs). */
-const TOLD_REFS_MAX = 100;
-
-/**
- * The chat's references, told to Raft (`POST /assistant/told { refs, via: "chat" }`), which resolves each within its
- * channel with the owner's visibility and skips what it cannot. Nothing is kept here. One
- * `raft.assistant_chat_told` row: how many refs were sent, recorded and skipped, and Raft's status on a failure; never
- * a ref. A failure costs only the record: the chat's send has already gone.
- */
-async function toldToRaft(ctx: PluginContext, content: string, api: AssistantApi): Promise<number> {
-  const refs = [...new Set([...content.matchAll(REF_IN_TEXT)].map((m) => m[0]))].slice(0, TOLD_REFS_MAX);
-  if (!refs.length) return 0;
-  const out = await api(ctx, "POST", "/assistant/told", { refs, via: "chat" });
-  const recorded = out.ok && typeof out.data.recorded === "number" ? out.data.recorded : 0;
-  const attrs = out.ok
-    ? { told: recorded, refs: refs.length, skipped: typeof out.data.skipped === "number" ? out.data.skipped : 0, forwarded: 1 }
-    : { told: 0, refs: refs.length, forwarded: 1, ...(out.status !== null ? { http_status: out.status } : {}), code: codeOf(out.code, out.status === null ? "no_answer" : "http") };
-  if (!out.ok && out.code === NOT_ENABLED) await pauseOn(ctx, new Error(NOT_ENABLED));
-  ctx.trace?.({ kind: "raft.assistant_chat_told", status: out.ok ? "told" : "told_failed", verdict: out.ok ? "ok" : "failed", attrs });
-  return recorded;
 }
 
 // ---- the chat's reply, when the model left it in its closing text ----------------------------------------------------
