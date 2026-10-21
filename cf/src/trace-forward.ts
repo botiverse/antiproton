@@ -5,8 +5,9 @@
  *   Logs, which drops an object's lines (#980; docs/runbook.md, "Logs and what an object did"), to
  *   `/api/external/github-refresh`.
  * - `agent.trace` (`AGENT_TRACE_LANE`): the kinds that say how a turn went (model calls and failed attempts, tool calls
- *   and refusals, turn timing and stops, the assistant's wakes and notifies, Raft's answer to a turn's end), so they can
- *   be read next to Raft's own telemetry, to `/api/external/antiproton-trace`.
+ *   and refusals, turn timing and stops, turn ends a pass could not record, a rebuild's measured outcome, the
+ *   assistant's wakes, checks, notifies, rules, chat tellings and sends as its owner, Raft's answer to a turn's end), so
+ *   they can be read next to Raft's own telemetry, to `/api/external/antiproton-trace`.
  * Off until the deployment names the endpoint and its token (`forwardConfigOf`); off, nothing here runs and no table is
  * made. One configuration turns on both lanes; a lane the receiver does not have yet answers 404 and pauses alone.
  *
@@ -223,13 +224,13 @@ const OPAQUE_SESSION = new RegExp(`^${SESSION}$`);
 const OPAQUE_TURN = new RegExp(`^tt_${SESSION}@[0-9]{1,16}$`);
 /**
  * A span id, readable only in the shapes its writers mint: `<prefix>_<hex>` (a job `mj_`, an operation `op_`, a
- * session), a turn, `refused_<ms>` / `js_<ms>`, a provider's tool call id (`toolu_…`, `call_…`, `call_…|fc_…`: random
+ * session), a turn, `refused_<ms>` / `js_<ms>` / `turn_end:<ms>`, a provider's tool call id (`toolu_…`, `call_…`, `call_…|fc_…`: random
  * base62 the provider makes). A plugin row's `mount:<alias>` is sent as `mount` and `wake:<alias>:<ms>` as `wake:<ms>`:
  * the alias is a name someone typed, never sent (the row's `mount_index` says which mount). Any other span is left out:
  * `span_id` is optional to the receiver, which keys a row by its `seq`.
  */
 const OPAQUE_SPAN = [
-  /^[a-z]{1,8}_[0-9a-f]{8,64}$/, OPAQUE_TURN, /^(?:refused|js)_[0-9]{1,16}$/,
+  /^[a-z]{1,8}_[0-9a-f]{8,64}$/, OPAQUE_TURN, /^(?:refused|js)_[0-9]{1,16}$/, /^turn_end:[0-9]{1,16}$/,
   /^(?:toolu|call|fc)_[A-Za-z0-9]{8,64}(?:\|fc_[A-Za-z0-9_-]{8,60})?$/,
 ];
 function spanOf(v: unknown): string | null {
@@ -244,28 +245,51 @@ function spanOf(v: unknown): string | null {
  * `session`, `turn`, `task`: ids this side mints, accepted only in the shapes it mints them (`OPAQUE_SESSION`), so a
  * field the receiver types `id` can never carry a name: its id shape takes `alice` as readily as `sess_1f…`.
  */
-type FieldType = "id" | "code" | "count" | "int" | "bool" | "flag" | "session" | "turn" | "task" | "mount" | readonly string[];
-/** Where a field comes from: an attr by name, or the row's own `status` or `ms`. */
-type Source = string | { row: "status" | "ms" };
+type FieldType = "id" | "code" | "count" | "int" | "bool" | "flag" | "session" | "turn" | "task" | "mount" | "check" | "minted"
+  | readonly string[];
+/**
+ * Where a field comes from: an attr by name, the row's own `status` or `ms`, or (`rest`) the sum of every count attr
+ * named `<prefix><word>` but those `known` names: a notify's drops by a reason no field of its own carries.
+ */
+type Source = string | { row: "status" | "ms" } | { rest: string; known: readonly string[] };
 /** wire name → [source, type]. */
 type FieldSpec = Readonly<Record<string, readonly [Source, FieldType]>>;
 
 const STATUS = { row: "status" } as const;
 const MS = { row: "ms" } as const;
 
+/** A check's id as Raft mints it and the plugin accepts it (src/plugins/raft-assistant-check.ts `CHECK_ID`). */
+const CHECK_ID = /^[0-9A-Za-z][0-9A-Za-z-]{0,63}$/;
+/** An id this side mints as `<prefix>_<hex>` (a rebuild decision's `rb_…`, src/runtime/rebuild.ts). */
+const MINTED = /^[a-z]{1,8}_[0-9a-f]{8,64}$/;
+
+/** The notify drop reasons that are fields of their own (`dropped_<reason>`); any other is summed into `dropped_other`. */
+const NOTIFY_DROPS = ["already_told", "rule_mute", "decisions_in_brief", "not_confirmed", "not_in_check", "other"] as const;
+/** Raft's counts on a check's wake (src/plugins/raft-assistant-check.ts `CHECK_COUNT_KEYS`), each a field by its own name. */
+const CHECK_COUNTS = ["conversations", "items", "truncated", "told", "skipped", "muted", "digest", "always", "dm", "mention", "thread", "named",
+  "default_out", "night_held"] as const;
+/** A contact rule's `<effect>_<scope>` counts on a rules row (src/plugins/raft-assistant-rules.ts `rulesAttrs`). */
+const RULE_COUNTS = ["mute", "always", "digest"].flatMap((effect) => ["channel", "thread", "person", "kind", "dms", "legacy"].map((scope) => `${effect}_${scope}`));
+const counts = (names: readonly string[]): Record<string, readonly [Source, FieldType]> =>
+  Object.fromEntries(names.map((n) => [n, [n, "count"] as const]));
+
 /**
  * Per kind, every field an `agent.trace` row carries beyond its envelope, and where each comes from: the receiver's
- * fields (`ANTIPROTON_TRACE_KINDS`), by its names and types, and nothing else. Deliberately absent: tool.call's `error`
+ * names and types (`ANTIPROTON_TRACE_KINDS`), and nothing else. A field the receiver does not keep yet is listed in
+ * test/trace-forward.ts `PROPOSED` (the table sent to the receiving side); until it lands there the receiver drops that
+ * field and keeps the row. Deliberately absent: tool.call's `error`
  * (a tool's own sentence, redacted but free text), its `name` and `callId`; model.call's `limit` (a sentence) and
- * `prefix` (an object); a wake's `error` (a message) and every mount alias (tool.call's
- * `mount` is the mount's type, `MountsView`); turn.stop's `errorClass` (a
- * sentence for people; `trigger` says the same); turn.timing's raw instants. Attrs written that the receiver has no field
- * for, so not sent: tool.refused's `task`, a wake's `inbox_lagging` and `reason`, turn_ended's `snapshotMismatches`.
+ * `prefix` (an object); every mount alias (tool.call's `mount` is the mount's type, `MountsView`); turn.stop's
+ * `errorClass` (a sentence for people; `trigger` says the same); turn.timing's raw instants; rebuild.outcome's `rule` (a
+ * name from the agent's rebuild policy, which an operator writes) and `hitRate` (a fraction: `cache_read` / `input` says
+ * it). Attrs written that the receiver has no field for, so not sent: tool.refused's `task`, a wake's `inbox_lagging`,
+ * `rules_total`, `person_rule_unenforced`, `quiet_custom` and the legacy check's other rule counts (`muted_<scope>`,
+ * `own_dm`, `anytime_night`, `default_chatter`, `chatter_unfiltered`), turn_ended's `snapshotMismatches`.
  *
  * An id-typed field carries an opaque id or a name from code or configuration (a tool's, a model's, a mount's TYPE), never a
  * name a person or a conversation has: where the receiver takes `id` or `code` and this side knows the vocabulary, the
- * field is that list (`by`, `trigger`, `outcome`, `stop_reason`); a session, turn or task must be in a shape this side
- * mints. Two receiver fields are left unfilled because their value is whatever the model wrote, which can be any word:
+ * field is that list (`by`, `trigger`, `outcome`, `stop_reason`, `reason`, …); a session, turn or task must be in a shape this side
+ * mints, a check's id in the shape Raft mints it (`CHECK_ID`). Two receiver fields are left unfilled because their value is whatever the model wrote, which can be any word:
  * model.call's `first_tool` (the first tool the answer asked for, as the model spelled it) and tool.refused's `tool`
  * (the name a refused call was made by, which by definition named no tool there is).
  */
@@ -298,21 +322,76 @@ export const AGENT_TRACE_FIELDS: Readonly<Partial<Record<TraceKind, FieldSpec>>>
   "turn.stop": {
     trigger: ["trigger", ["provider_stop", "admin_cancel", "delete"]], turn: ["turn", "turn"],
   },
+  // cf/src/runtime.ts `#turnEndsUnrecorded`.
+  "turn.end_unrecorded": {
+    stage: ["stage", ["read", "record"]], error_class: ["error_class", "id"],
+  },
+  // src/runtime/rebuild.ts `settleRebuildOutcome`: the row's span is the answering job, its status the agreement.
+  "rebuild.outcome": {
+    decision: ["decision", "minted"], trigger: ["trigger", ["window", "cold-wake", "operator"]], strategy: ["strategy", ["summary", "briefing"]],
+    agreement: ["agreement", ["agree", "false-cold", "false-warm", "expected-cold", "unmeasured"]],
+    would_rebuild: ["wouldRebuild", "bool"], predicted_cold: ["predictedCold", "bool"], expected_cold: ["expectedCold", "bool"],
+    measured_cold: ["measuredCold", "bool"], input: ["input", "count"], cache_read: ["cacheRead", "count"],
+    since_decision_ms: ["sinceDecisionMs", "count"],
+  },
+  // src/plugins/raft-assistant.ts `record` (this file's own check, and Raft's: `raftCheckWake`, `raftIdleWake`),
+  // `refusedCheck`; cf/src/runtime.ts's wake of a pd assistant (`reason: engine_pd_unsupported`).
   "raft.assistant_wake": {
-    result: [STATUS, ["skipped_empty", "skipped_filtered", "invoked", "unreadable", "paused", "night_deferred", "failed", "inbox_lagging"]],
-    trigger: ["trigger", ["doorbell", "brief"]], conversations: ["conversations", "count"], candidates: ["candidates", "count"],
+    result: [STATUS, ["skipped_empty", "skipped_filtered", "invoked", "unreadable", "paused", "night_deferred", "failed", "inbox_lagging",
+      "check_refused", "skipped_no_check"]],
+    trigger: ["trigger", ["doorbell", "brief"]], candidates: ["candidates", "count"],
     seen: ["seen", "count"], unreadable: ["unreadable", "count"], lag_retry: ["lagRetry", "count"], caught_up: ["caught_up", "bool"],
     caught_up_via: ["caught_up_via", ["unread", "all", "mixed"]], caught_up_rule: ["caught_up_rule", ["seq", "time"]],
-    muted: ["muted", "count"], told: ["told", "count"], held: ["held", "count"], said: ["said", "count"],
+    held: ["held", "count"], said: ["said", "count"],
     // The receiver types it a count; the plugin writes `true` (src/plugins/raft-assistant.ts `lag`), so it is sent as 1.
     inbox_lagging_gave_up: ["inbox_lagging_gave_up", "flag"],
+    // A failed wake's code (`wakeFailureAttrs`) and the HTTP status of the refused read.
+    error_code: ["error", ["inbox_refused", "inbox_shape", "not_enabled", "unexpected"]], http_status: ["status", "count"],
+    check_id: ["check_id", "check"], raft_check: ["raft_check", "bool"],
+    reason: ["reason", ["malformed", "version", "instruction_too_large", "no_notify", "raft_check_off", "engine_pd_unsupported"]],
+    instruction_bytes: ["instruction_bytes", "count"], tools_offered: ["tools_offered", "count"], tools_dropped: ["tools_dropped", "count"],
+    placeholders_unknown: ["placeholders_unknown", "count"], placeholders_unoffered: ["placeholders_unoffered", "count"],
+    // Raft's counts on a check's wake; `conversations`, `told`, `muted`, `digest`, `always`, `dm` and `night_held` are
+    // the legacy check's counts by the same names too.
+    ...counts(CHECK_COUNTS),
   },
+  // src/plugins/raft-assistant.ts `notifyAttrs` (this file's own check) and `notifyRaft` (Raft's).
   "raft.assistant_notify": {
-    state: [STATUS, ["sent", "nothing_to_send", "kept_for_brief", "not_sent"]],
-    items_in: ["given", "count"], items_sent: ["sent", "count"], dropped: ["dropped", "count"],
-    dropped_already_told: ["dropped_already_told", "count"], dropped_rule: ["dropped_rule", "count"],
-    dropped_not_confirmed: ["dropped_not_confirmed", "count"], dropped_decisions_in_brief: ["dropped_decisions_in_brief", "count"],
-    dropped_other: ["dropped_other", "count"],
+    state: ["notifyState", ["sent", "duplicate", "nothing_to_send", "kept_for_brief", "not_sent", "unknown"]],
+    items_in: ["given", "count"], items_sent: ["sent", "count"], held_back: ["held_back", "count"], kept_for_brief: ["kept_for_brief", "count"],
+    dropped: ["dropped", "count"], dropped_already_told: ["dropped_already_told", "count"],
+    // The receiver's name for a drop by a mute rule (`dropCategory`'s `rule_mute`).
+    dropped_rule: ["dropped_rule_mute", "count"],
+    dropped_decisions_in_brief: ["dropped_decisions_in_brief", "count"], dropped_not_confirmed: ["dropped_not_confirmed", "count"],
+    dropped_not_in_check: ["dropped_not_in_check", "count"],
+    dropped_other: [{ rest: "dropped_", known: NOTIFY_DROPS.filter((r) => r !== "other").map((r) => `dropped_${r}`) }, "count"],
+    check_id: ["check_id", "check"], trigger: ["trigger", ["doorbell", "brief"]], forwarded: ["forwarded", "count"],
+    code: ["code", "code"], http_status: ["http_status", "count"],
+  },
+  // src/plugins/raft-assistant.ts `pushBriefImport` (`import_*`) and `checkEnded` (`turn_ended`).
+  "raft.assistant_check": {
+    check_id: ["check_id", "check"], trigger: ["trigger", ["doorbell", "brief"]], outcome: ["outcome", ["completed", "failed", "cancelled"]],
+    error_code: ["error_code", "code"], attempts: ["attempts", "count"], http_status: ["http_status", "count"], code: ["code", "code"],
+  },
+  // src/plugins/raft-assistant.ts `noteToldInChat` / `toldToRaft` (`told`, `told_failed`) and `replyFallback`.
+  "raft.assistant_chat_told": {
+    refs: ["refs", "count"], told: ["told", "count"], skipped: ["skipped", "count"], forwarded: ["forwarded", "count"],
+    http_status: ["http_status", "count"], code: ["code", "code"], reply_fallback: ["reply_fallback", "count"],
+    result: ["result", ["sent", "held", "failed"]], failed_turn: ["failed_turn", "count"],
+  },
+  // src/plugins/raft-assistant.ts `traceRules` (with src/plugins/raft-assistant-rules.ts `rulesAttrs`) and `preferencesRaft`.
+  "raft.assistant_rules": {
+    action: ["action", ["add", "mute", "unmute", "remove", "list", "quiet", "timezone", "other"]],
+    // `listed`, `added`, `removed_partial`, … or `refused:<code>`, every code from code or Raft's (`codeOf`).
+    result: ["result", "code"], effect: ["effect", ["mute", "always", "digest"]], scope: ["scope", ["channel", "thread", "person", "kind", "dms"]],
+    via: ["via", ["raft"]], removed: ["removed", "count"], left: ["left", "count"], code: ["code", "code"], rules_total: ["rules_total", "count"],
+    ...counts(RULE_COUNTS),
+  },
+  // src/plugins/raft-assistant.ts `sendAsOwner`.
+  "raft.assistant_send_as_owner": {
+    // `sent`, `uncertain`, `failed` or `refused:<code>` (`SendResult`).
+    result: ["result", "code"], target_kind: ["target_kind", ["message", "channel", "dm", "channel_id", "other"]],
+    in_thread: ["in_thread", "bool"], chars: ["chars", "count"], http_status: ["http_status", "count"],
   },
   "raft.turn_ended": {
     result: [STATUS, ["settled", "skipped", "unreadable"]], reason: ["reason", "code"], conversations: ["targets", "count"],
@@ -353,8 +432,21 @@ function fieldOf(v: unknown, type: FieldType, mounts: MountsView): string | numb
     case "task": return typeof v === "string" && OPAQUE_SESSION.test(v) ? v : null;
     // An alias in, the mount's type out (`MountsView`); nothing when the alias names no mount now.
     case "mount": return typeof v === "string" ? mounts.get(v)?.plugin ?? null : null;
+    case "check": return typeof v === "string" && CHECK_ID.test(v) ? v : null;
+    case "minted": return typeof v === "string" && MINTED.test(v) ? v : null;
   }
   return null;
+}
+
+/** The sum of the count attrs `<prefix><word>` other than `known`, or undefined when there are none. */
+function restOf(a: Record<string, unknown>, prefix: string, known: readonly string[]): number | undefined {
+  let sum: number | undefined;
+  for (const [k, v] of Object.entries(a)) {
+    if (!k.startsWith(prefix) || known.includes(k) || !/^[a-z0-9_]+$/.test(k.slice(prefix.length))) continue;
+    const n = countOf(v);
+    if (n !== null) sum = (sum ?? 0) + n;
+  }
+  return sum;
 }
 
 /**
@@ -379,7 +471,8 @@ export function agentTraceRow(r: TraceOutboxRow, env: ForwardEnv, mounts: Mounts
   const ms = countOf(r.ms);
   if (ms !== null) out.ms = ms;
   for (const [name, [source, type]] of Object.entries(spec)) {
-    const raw = typeof source === "string" ? (Object.prototype.hasOwnProperty.call(a, source) ? a[source] : undefined) : r[source.row];
+    const raw = typeof source === "string" ? (Object.prototype.hasOwnProperty.call(a, source) ? a[source] : undefined)
+      : "row" in source ? r[source.row] : restOf(a, source.rest, source.known);
     const v = fieldOf(raw, type, mounts);
     if (v !== null) out[name] = v;
   }

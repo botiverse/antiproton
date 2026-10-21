@@ -213,8 +213,9 @@ backoff and counts:
 - **`github.refresh`**: the `github.refresh` rows (above, "In the trace"), so a renewal's outcome can be alerted on from
   the trace instead of from Workers Logs, which drops an object's lines (#980). Route `/api/external/github-refresh`.
 - **`agent.trace`**: `model.call`, `model.attempt`, `tool.call`, `tool.refused`, `turn.timing`, `turn.stop`,
-  `raft.assistant_wake`, `raft.assistant_notify` and `raft.turn_ended`, so a turn's timing, its model attempts and an
-  assistant's wakes can be read next to Raft's own telemetry. Route `/api/external/antiproton-trace`
+  `turn.end_unrecorded`, `rebuild.outcome`, `raft.assistant_wake`, `raft.assistant_check`, `raft.assistant_notify`,
+  `raft.assistant_chat_told`, `raft.assistant_rules`, `raft.assistant_send_as_owner` and `raft.turn_ended`, so a turn's
+  timing, its model attempts and an assistant's wakes, checks and sends can be read next to Raft's own telemetry. Route `/api/external/antiproton-trace`
   (botiverse/slock#10530); the rows land as `antiproton.<kind>`.
 
 **It is off** unless both of these are set on the deployment; with either missing nothing is sent, nothing is staged and
@@ -245,11 +246,12 @@ have a lane's route yet answers 404, which pauses that lane only (below).
 attr the row does not have is `null`. No span id, no verdict, no other attr, no token and no reason text. A row's
 identity is (`tenant_id`, `agent_id`, `seq`), the same on every resend, and the receiver dedupes on it.
 
-**What is sent, `agent.trace`.** Rows of the nine kinds above only, as `POST <base>/api/external/antiproton-trace`.
+**What is sent, `agent.trace`.** Rows of the fifteen kinds above only, as `POST <base>/api/external/antiproton-trace`.
 Each row has an envelope (`seq`, `at`, `kind`, `tenant_id`, `agent_id`, `env`, and when there are ones that fit,
 `span_id`, `status`, `verdict`, `ms`) and then its kind's fields, each named and typed as the receiver's
-(`ANTIPROTON_TRACE_KINDS` there, `AGENT_TRACE_FIELDS` here) and built from one attr; an attr that is not a field there
-is never sent, and a value that is not its field's shape (an id, a code, a listed value, a non-negative integer, a
+(`ANTIPROTON_TRACE_KINDS` there, `AGENT_TRACE_FIELDS` here) and built from one attr (a notify's `dropped_other` sums
+the drops by a reason without a field of its own); a field the receiver does not keep yet is dropped by it, the row
+kept, until it does (test/trace-forward.ts `PROPOSED` lists them); an attr that is not a field here is never sent, and a value that is not its field's shape (an id, a code, a listed value, a non-negative integer, a
 boolean) is left out rather than rewritten. So no message text, prompt, tool argument, error sentence, rule or
 conversation name leaves: a `tool.call` row's `error` (the tool's own sentence), a `model.call`'s `limit`, a wake's
 `error` are never fields. Nor is a name a person or a conversation has: the receiver's id shape takes `alice` as
@@ -258,7 +260,8 @@ readily as an id, so an id field here carries only an opaque id this side mints 
 or a name from code or configuration (a tool, a model, a mount's type); a mount's alias is a name someone typed, so it
 is never sent: `mount` is the mount's plugin type (`raft`, `github`, …), `mount_index` its ordinal in the agent's mount
 list, and a plugin row's span `mount:<alias>` goes as `mount`, `wake:<alias>:<ms>` as `wake:<ms>`. Where the vocabulary is known (`by`, `trigger`,
-`outcome`, `stop_reason`) it is that list. `model.call`'s `first_tool` and `tool.refused`'s `tool` are never filled:
+`outcome`, `stop_reason`, a wake's `reason`, a rules row's `action`, …) it is that list; a check's `check_id` is sent only
+in the shape Raft mints it. `model.call`'s `first_tool` and `tool.refused`'s `tool` are never filled:
 they are whatever the model wrote. A row's identity at the receiver is (`tenant_id`, `agent_id`, `seq`), the same on every resend;
 a span id is not unique per row (a wake's and a turn end's are the mount's). A row whose tenant or agent is not an id
 is not sent but counted (`unsendable`).

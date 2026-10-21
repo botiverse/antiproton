@@ -18,7 +18,9 @@ import { TRACE_KINDS, type TraceKind } from "../src/trace/outbox.ts";
 import { modelAttemptRow, modelCallRow, toolCallRow, toolRefusedRow } from "../src/trace/seams.ts";
 import { turnStopRow } from "../src/runtime/turn-stop.ts";
 import { closeTurn, turnInbound, turnSaid, turnStepStart, turnToolRan } from "../src/runtime/turn-timing.ts";
-import { ASSISTANT_STORE, OWNER_KEY, assistantWake, notifyAttrs, notifyOwner } from "../src/plugins/raft-assistant.ts";
+import { ASSISTANT_STORE, OWNER_KEY, assistantWake, checkEnded, notifyAttrs, notifyOwner } from "../src/plugins/raft-assistant.ts";
+import { checkTurnKey } from "../src/plugins/raft-assistant-check.ts";
+import { PLUGIN_TRACE_KINDS } from "../src/trace/outbox.ts";
 import { raftPlugin } from "../src/plugins/raft.ts";
 import { PluginDbTables } from "../src/store/plugin-db.ts";
 import { openPluginDatabase } from "../src/runtime/plugin-db.ts";
@@ -385,29 +387,70 @@ await check("the export never prunes a row the forward has not staged, and a fai
 console.log(`\n  agent.trace forward\n  ${"─".repeat(56)}`);
 
 /**
- * The receiver's fields per kind and their types, as botiverse/slock#10530 (9c64dc15) has them in
- * the trace-upload worker's `antiprotonTrace.ts`, `ANTIPROTON_TRACE_KINDS`. Pinned here so a drift on either side shows.
+ * The receiver's fields per kind and their types, as the trace-upload worker's `antiprotonTrace.ts`
+ * (`ANTIPROTON_TRACE_KINDS`) has them at botiverse/slock 2d91205. Pinned here so a drift on either side shows.
+ * `mount_index` is this side's envelope (any row about a mount), so it is checked apart from the kind's fields.
  */
 const ENUM = (...v: string[]) => v.join("|");
+const RULE_COUNT_FIELDS = Object.fromEntries(["mute", "always", "digest"].flatMap((effect) =>
+  ["channel", "thread", "person", "kind", "dms", "legacy"].map((scope) => [`${effect}_${scope}`, "count"])));
 const WORKER_FIELDS: Record<string, Record<string, string>> = {
   "model.call": { model: "id", stop_reason: "code", input: "count", output: "count", cache_read: "count", cache_write: "count", reasoning: "count",
     first_tool: "id", turn: "id", session: "id" },
   "model.attempt": { attempt: "count", phase: ENUM("take", "admit", "call", "deliver"), outcome: "code", http_status: "count", error_class: "id",
     total_ms: "count", provider_ms: "count", model: "id" },
-  "tool.call": { tool: "id", mount: "id", task: "id", run_ms: "count", exit_code: "int", denied: "bool", error_code: "code", http_status: "count" },
+  "tool.call": { mount_index: "count", tool: "id", mount: "id", task: "id", run_ms: "count", exit_code: "int", denied: "bool", error_code: "code", http_status: "count" },
   "tool.refused": { tool: "id", code: "code", by: "id", from: ENUM("model", "program") },
   "turn.timing": { inbound_to_start_ms: "count", start_to_first_job_ms: "count", model_ms: "count", between_jobs_ms: "count", tool_ms: "count",
     last_answer_to_reply_ms: "count", model_jobs: "count", tools: "count", messages: "count", first_call_prompt_tokens: "count",
     first_call_cached_tokens: "count", client_wait_ms: "count", client_pauses: "count", prep_ms: "count" },
   "turn.stop": { trigger: "code", turn: "id" },
-  "raft.assistant_wake": { result: ENUM("skipped_empty", "skipped_filtered", "invoked", "unreadable", "paused", "night_deferred", "failed", "inbox_lagging"),
+  "raft.assistant_wake": { mount_index: "count",
+    result: ENUM("skipped_empty", "skipped_filtered", "invoked", "unreadable", "paused", "night_deferred", "failed", "inbox_lagging"),
     trigger: "code", conversations: "count", candidates: "count", seen: "count", unreadable: "count", lag_retry: "count", caught_up: "bool",
     caught_up_via: ENUM("unread", "all", "mixed"), caught_up_rule: ENUM("seq", "time"), muted: "count", told: "count", held: "count", said: "count",
     inbox_lagging_gave_up: "count" },
-  "raft.assistant_notify": { state: ENUM("sent", "nothing_to_send", "kept_for_brief", "not_sent"), items_in: "count", items_sent: "count", dropped: "count",
+  "raft.assistant_notify": { mount_index: "count", state: ENUM("sent", "nothing_to_send", "kept_for_brief", "not_sent"), items_in: "count", items_sent: "count", dropped: "count",
     dropped_already_told: "count", dropped_rule: "count", dropped_not_confirmed: "count", dropped_decisions_in_brief: "count", dropped_other: "count" },
-  "raft.turn_ended": { result: ENUM("settled", "skipped", "unreadable"), reason: "code", conversations: "count", outcome: ENUM("completed", "interrupted", "failed") },
+  "raft.assistant_rules": { action: ENUM("add", "mute", "unmute", "remove", "list", "quiet", "timezone", ""), result: "code",
+    effect: ENUM("mute", "always", "digest"), scope: ENUM("channel", "thread", "person", "kind", "dms"), removed: "count", rules_total: "count",
+    ...RULE_COUNT_FIELDS },
+  "raft.assistant_chat_told": { told: "count", reply_fallback: "count", failed_turn: "count", result: ENUM("sent", "held", "failed"), code: "code" },
+  "raft.assistant_send_as_owner": { result: "code", target_kind: ENUM("message", "channel", "dm", "channel_id"), in_thread: "bool", chars: "count",
+    http_status: "count" },
+  "raft.turn_ended": { mount_index: "count", result: ENUM("settled", "skipped", "unreadable"), reason: "code", conversations: "count", outcome: ENUM("completed", "interrupted", "failed") },
 };
+/**
+ * What this side sends that the receiver does not keep yet, by the receiver's types: new kinds, new fields, and enums
+ * widened (a value outside the receiver's list is dropped by it, the row kept). The field table sent to the receiving
+ * side is this; when the receiver takes an entry, it moves to WORKER_FIELDS.
+ */
+const PROPOSED: Record<string, Record<string, string>> = {
+  "turn.end_unrecorded": { stage: ENUM("read", "record"), error_class: "id" },
+  "rebuild.outcome": { decision: "id", trigger: ENUM("window", "cold-wake", "operator"), strategy: ENUM("summary", "briefing"),
+    agreement: ENUM("agree", "false-cold", "false-warm", "expected-cold", "unmeasured"), would_rebuild: "bool", predicted_cold: "bool",
+    expected_cold: "bool", measured_cold: "bool", input: "count", cache_read: "count", since_decision_ms: "count" },
+  "raft.assistant_wake": {
+    result: ENUM("skipped_empty", "skipped_filtered", "invoked", "unreadable", "paused", "night_deferred", "failed", "inbox_lagging", "check_refused", "skipped_no_check"),
+    error_code: ENUM("inbox_refused", "inbox_shape", "not_enabled", "unexpected"), http_status: "count",
+    check_id: "id", raft_check: "bool",
+    reason: ENUM("malformed", "version", "instruction_too_large", "no_notify", "raft_check_off", "engine_pd_unsupported"),
+    instruction_bytes: "count", tools_offered: "count", tools_dropped: "count", placeholders_unknown: "count", placeholders_unoffered: "count",
+    items: "count", truncated: "count", skipped: "count", digest: "count", always: "count", dm: "count", mention: "count", thread: "count",
+    named: "count", default_out: "count", night_held: "count" },
+  "raft.assistant_check": { mount_index: "count", check_id: "id", trigger: ENUM("doorbell", "brief"), outcome: ENUM("completed", "failed", "cancelled"),
+    error_code: "code", attempts: "count", http_status: "count", code: "code" },
+  "raft.assistant_notify": { state: ENUM("sent", "duplicate", "nothing_to_send", "kept_for_brief", "not_sent", "unknown"),
+    held_back: "count", kept_for_brief: "count", dropped_not_in_check: "count", check_id: "id", trigger: ENUM("doorbell", "brief"),
+    forwarded: "count", code: "code", http_status: "count" },
+  "raft.assistant_chat_told": { mount_index: "count", refs: "count", skipped: "count", forwarded: "count", http_status: "count" },
+  "raft.assistant_rules": { mount_index: "count", action: ENUM("add", "mute", "unmute", "remove", "list", "quiet", "timezone", "other"),
+    via: ENUM("raft"), left: "count", code: "code" },
+  "raft.assistant_send_as_owner": { mount_index: "count", target_kind: ENUM("message", "channel", "dm", "channel_id", "other") },
+};
+/** The receiver's fields once PROPOSED lands: what this side's fields are pinned to. */
+const CONTRACT: Record<string, Record<string, string>> = Object.fromEntries([...new Set([...Object.keys(WORKER_FIELDS), ...Object.keys(PROPOSED)])]
+  .map((k) => [k, { ...WORKER_FIELDS[k], ...PROPOSED[k] }]));
 const ENVELOPE = ["seq", "at", "kind", "tenant_id", "agent_id", "span_id", "env", "status", "verdict", "ms", "mount_index"];
 
 const ATR = (sql: any): number[] => sql.exec("SELECT seq FROM atr_forward_queue ORDER BY seq").toArray().map((r: any) => Number(r.seq));
@@ -478,6 +521,129 @@ function everyKind(sql: any): void {
     attrs: { mount: "raft", outcome: "completed", targets: 3, reason: "snapshot_stale", snapshotMismatches: 1 } }]);
 }
 
+/**
+ * A plugin context on the mount `assistant` whose trace rows are kept as the gateway writes them (src/runtime/gateway.ts
+ * `trace`: the operation's span, else the mount's; the mount first in attrs), with an owner kept and the session's key.
+ */
+function assistantCtx(at: number, turnKey?: string, span: string | null = null) {
+  const tables = new PluginDbTables(sqliteHost()).ensure();
+  const rows: TraceRow[] = [];
+  const ctx = {
+    caller: { tenantId: OWNER.tenantId, agentId: OWNER.agentId, taskId: "iso_0123456789abcdef", ...(turnKey ? { turnKey } : {}) }, alias: "assistant",
+    db: openPluginDatabase(tables, { tenantId: OWNER.tenantId, agentId: OWNER.agentId, alias: "assistant", plugin: raftPlugin.id }, raftPlugin.database),
+    trace: (row: any) => rows.push({ at, ...OWNER, kind: row.kind, spanId: span ?? "mount:assistant", status: row.status, verdict: row.verdict,
+      attrs: { mount: "assistant", ...row.attrs } }),
+  } as any;
+  return { ctx, rows };
+}
+const CHECK = "0f1e2d3c-4b5a-4968-8776-655443322110";
+
+/**
+ * One row of each kind added since the first nine, and the new shapes of two of those (a wake and a notify while Raft
+ * runs the check), seq 10 on, after `everyKind`'s: from the writers where they can be called here, else with the exact
+ * attrs their writer sets (file and function named on each).
+ */
+async function newKinds(sql: any): Promise<void> {
+  const t = { ...OWNER };
+  // cf/src/runtime.ts `#turnEndsUnrecorded`.
+  appendTrace(sql, [{ at: T0 + 10, ...t, kind: "turn.end_unrecorded", spanId: `turn_end:${T0 + 10}`, status: "failed", verdict: "failed",
+    attrs: { stage: "record", error_class: "SqliteError" } }]);
+  // src/runtime/rebuild.ts `settleRebuildOutcome`.
+  appendTrace(sql, [{ at: T0 + 11, ...t, kind: "rebuild.outcome", spanId: "mj_00000000000000000000000b", parentId: "rb_0123456789abcdef0123", status: "agree", verdict: "ok",
+    attrs: { decision: "rb_0123456789abcdef0123", trigger: "cold-wake", strategy: "briefing", wouldRebuild: true, predictedCold: true, expectedCold: false,
+      rule: "alice-team-rule", input: 5000, cacheRead: 100, hitRate: 0.02, measuredCold: true, agreement: "agree", sinceDecisionMs: 1234 } }]);
+  // src/plugins/raft-assistant.ts `raftCheckWake` (invoked), `refusedCheck` (check_refused), `raftIdleWake` (skipped_no_check), `record` of a failure.
+  appendTrace(sql, [
+    { at: T0 + 12, ...t, kind: "raft.assistant_wake", spanId: "mount:assistant", status: "invoked", verdict: "ok",
+      attrs: { mount: "assistant", trigger: "brief", check_id: CHECK, raft_check: true, tools_offered: 1, tools_dropped: 2, placeholders_unknown: 1,
+        placeholders_unoffered: 0, conversations: 5, items: 3, truncated: 0, told: 1, skipped: 1, muted: 2, digest: 1, always: 0, dm: 1, mention: 1,
+        thread: 0, named: 0, default_out: 2, night_held: 0 } },
+    { at: T0 + 13, ...t, kind: "raft.assistant_wake", spanId: "mount:assistant", status: "check_refused", verdict: "ok",
+      attrs: { mount: "assistant", trigger: "doorbell", check_id: CHECK, raft_check: true, reason: "instruction_too_large", instruction_bytes: 20000 } },
+    { at: T0 + 14, ...t, kind: "raft.assistant_wake", spanId: "mount:assistant", status: "skipped_no_check", verdict: "ok",
+      attrs: { mount: "assistant", trigger: "doorbell", raft_check: true } },
+    { at: T0 + 15, ...t, kind: "raft.assistant_wake", spanId: "mount:assistant", status: "failed", verdict: "failed",
+      attrs: { mount: "assistant", trigger: "doorbell", error: "inbox_refused", status: 503 } },
+  ]);
+  // The real notify while Raft runs the check (`notifyRaft`), in the check's short session: Raft drops three, one for a
+  // reason this side has no field for and one for a reason that is not a code.
+  const key = checkTurnKey({ id: CHECK, trigger: "doorbell" });
+  const n = assistantCtx(T0 + 16, key, "op_00000000000000000010");
+  await n.ctx.db.put(ASSISTANT_STORE, { userId: "owner-1", timezone: "Europe/Berlin", dmTarget: "dm:@owner", raftCheck: true }, OWNER_KEY);
+  const api = async () => ({ ok: true as const, data: { outcome: "sent", shown: 2, more: 1, dropped: [
+    { channelId: "c-1", reason: "not_in_check" }, { channelId: "c-2", reason: "rule_mute" }, { channelId: "c-3", reason: "made_up_reason" },
+    { channelId: "c-4", reason: "Not A Code!" }] } });
+  await notifyOwner({ items: [1, 2, 3, 4, 5, 6].map((i) => ({ channelId: `c-${i}`, summary: `alice said ${i}` })) }, n.ctx,
+    { api, send: async () => ({ sent: true as const }), recheck: async () => null });
+  // The same, refused by Raft with a 5xx.
+  const n2 = assistantCtx(T0 + 17, key, "op_00000000000000000011");
+  await n2.ctx.db.put(ASSISTANT_STORE, { userId: "owner-1", timezone: "Europe/Berlin", dmTarget: "dm:@owner", raftCheck: true }, OWNER_KEY);
+  await notifyOwner({ items: [{ channelId: "c-1", summary: "x" }] }, n2.ctx,
+    { api: async () => ({ ok: false as const, status: 502, code: null }), send: async () => ({ sent: true as const }), recheck: async () => null });
+  // The real check's end (`checkEnded`).
+  const c = assistantCtx(T0 + 18);
+  checkEnded(c.ctx, { turnKey: key, outcome: "failed", errorCode: "output_limit", isolated: true });
+  appendTrace(sql, [...n.rows, ...n2.rows, ...c.rows]);
+  appendTrace(sql, [
+    // `pushBriefImport`'s failure.
+    { at: T0 + 19, ...t, kind: "raft.assistant_check", spanId: "mount:assistant", status: "import_failed", verdict: "failed",
+      attrs: { mount: "assistant", attempts: 3, http_status: 502, code: "http" } },
+    // `toldToRaft`'s failure and `replyFallback`'s.
+    { at: T0 + 20, ...t, kind: "raft.assistant_chat_told", spanId: "op_00000000000000000012", status: "told_failed", verdict: "failed",
+      attrs: { mount: "assistant", told: 0, refs: 2, forwarded: 1, http_status: 503, code: "http" } },
+    { at: T0 + 21, ...t, kind: "raft.assistant_chat_told", spanId: "mount:assistant", status: "reply_fallback", verdict: "failed",
+      attrs: { mount: "assistant", reply_fallback: 0, result: "failed", code: "send_failed", failed_turn: 1 } },
+    // `preferencesRaft`'s partial removal, and the legacy `traceRules` with `rulesAttrs`.
+    { at: T0 + 22, ...t, kind: "raft.assistant_rules", spanId: "op_00000000000000000013", status: "removed_partial", verdict: "ok",
+      attrs: { mount: "assistant", action: "remove", via: "raft", result: "removed_partial", removed: 2, left: 1, code: "http_502" } },
+    { at: T0 + 23, ...t, kind: "raft.assistant_rules", spanId: "op_00000000000000000014", status: "added", verdict: "ok",
+      attrs: { mount: "assistant", action: "add", effect: "mute", scope: "channel", result: "added", rules_total: 2, mute_channel: 1, always_person: 1 } },
+    // `sendAsOwner`.
+    { at: T0 + 24, ...t, kind: "raft.assistant_send_as_owner", spanId: "op_00000000000000000015", status: "refused:channel_not_found", verdict: "blocked",
+      attrs: { mount: "assistant", result: "refused:channel_not_found", target_kind: "channel", in_thread: false, chars: 42, http_status: 404 } },
+  ]);
+}
+
+const env0 = (seq: number, kind: string, at: number, extra: Record<string, unknown>) =>
+  ({ seq, at: new Date(at).toISOString(), kind, tenant_id: "raft_t1", agent_id: "raft_a1", env: "preview", ...extra });
+/** The rows `newKinds` writes, by seq, as they must go out. */
+const GOLDEN_NEW: Record<number, Record<string, unknown>> = {
+  10: env0(10, "turn.end_unrecorded", T0 + 10, { span_id: `turn_end:${T0 + 10}`, status: "failed", verdict: "failed", stage: "record", error_class: "SqliteError" }),
+  11: env0(11, "rebuild.outcome", T0 + 11, { span_id: "mj_00000000000000000000000b", status: "agree", verdict: "ok", decision: "rb_0123456789abcdef0123",
+    trigger: "cold-wake", strategy: "briefing", agreement: "agree", would_rebuild: true, predicted_cold: true, expected_cold: false, measured_cold: true,
+    input: 5000, cache_read: 100, since_decision_ms: 1234 }),
+  12: env0(12, "raft.assistant_wake", T0 + 12, { span_id: "mount", mount_index: 0, status: "invoked", verdict: "ok", result: "invoked", trigger: "brief",
+    check_id: CHECK, raft_check: true, tools_offered: 1, tools_dropped: 2, placeholders_unknown: 1, placeholders_unoffered: 0, conversations: 5, items: 3,
+    truncated: 0, told: 1, skipped: 1, muted: 2, digest: 1, always: 0, dm: 1, mention: 1, thread: 0, named: 0, default_out: 2, night_held: 0 }),
+  13: env0(13, "raft.assistant_wake", T0 + 13, { span_id: "mount", mount_index: 0, status: "check_refused", verdict: "ok", result: "check_refused",
+    trigger: "doorbell", check_id: CHECK, raft_check: true, reason: "instruction_too_large", instruction_bytes: 20000 }),
+  14: env0(14, "raft.assistant_wake", T0 + 14, { span_id: "mount", mount_index: 0, status: "skipped_no_check", verdict: "ok", result: "skipped_no_check",
+    trigger: "doorbell", raft_check: true }),
+  15: env0(15, "raft.assistant_wake", T0 + 15, { span_id: "mount", mount_index: 0, status: "failed", verdict: "failed", result: "failed", trigger: "doorbell",
+    error_code: "inbox_refused", http_status: 503 }),
+  // given 6, shown 2, one held back; dropped 4: not_in_check 1, rule_mute 1 (the receiver's `dropped_rule`), and two
+  // summed into dropped_other (`made_up_reason`, and the one that is not a code, which the plugin counts as `other`).
+  16: env0(16, "raft.assistant_notify", T0 + 16, { span_id: "op_00000000000000000010", mount_index: 0, status: "sent", verdict: "ok", state: "sent",
+    items_in: 6, items_sent: 2, held_back: 1, dropped: 4, dropped_not_in_check: 1, dropped_rule: 1, dropped_other: 2, check_id: CHECK,
+    trigger: "doorbell", forwarded: 1 }),
+  17: env0(17, "raft.assistant_notify", T0 + 17, { span_id: "op_00000000000000000011", mount_index: 0, status: "not_sent", verdict: "failed", state: "not_sent",
+    items_in: 1, items_sent: 0, check_id: CHECK, trigger: "doorbell", forwarded: 1, code: "failed", http_status: 502 }),
+  18: env0(18, "raft.assistant_check", T0 + 18, { span_id: "mount", mount_index: 0, status: "turn_ended", verdict: "failed", check_id: CHECK,
+    trigger: "doorbell", outcome: "failed", error_code: "output_limit" }),
+  19: env0(19, "raft.assistant_check", T0 + 19, { span_id: "mount", mount_index: 0, status: "import_failed", verdict: "failed", attempts: 3,
+    http_status: 502, code: "http" }),
+  20: env0(20, "raft.assistant_chat_told", T0 + 20, { span_id: "op_00000000000000000012", mount_index: 0, status: "told_failed", verdict: "failed",
+    told: 0, refs: 2, forwarded: 1, http_status: 503, code: "http" }),
+  21: env0(21, "raft.assistant_chat_told", T0 + 21, { span_id: "mount", mount_index: 0, status: "reply_fallback", verdict: "failed",
+    reply_fallback: 0, result: "failed", code: "send_failed", failed_turn: 1 }),
+  22: env0(22, "raft.assistant_rules", T0 + 22, { span_id: "op_00000000000000000013", mount_index: 0, status: "removed_partial", verdict: "ok",
+    action: "remove", via: "raft", result: "removed_partial", removed: 2, left: 1, code: "http_502" }),
+  23: env0(23, "raft.assistant_rules", T0 + 23, { span_id: "op_00000000000000000014", mount_index: 0, status: "added", verdict: "ok",
+    action: "add", effect: "mute", scope: "channel", result: "added", rules_total: 2, mute_channel: 1, always_person: 1 }),
+  24: env0(24, "raft.assistant_send_as_owner", T0 + 24, { span_id: "op_00000000000000000015", mount_index: 0, status: "refused:channel_not_found",
+    verdict: "blocked", result: "refused:channel_not_found", target_kind: "channel", in_thread: false, chars: 42, http_status: 404 }),
+};
+
 const GOLDEN: Record<string, Record<string, unknown>> = {
   "model.call": { seq: 1, at: new Date(T0).toISOString(), kind: "model.call", tenant_id: "raft_t1", agent_id: "raft_a1", span_id: "mj_0123456789abcdef01234567", env: "preview",
     status: "toolUse", verdict: "ok", ms: 4000, model: "anthropic/claude-sonnet-4.5", stop_reason: "toolUse", input: 1200, output: 80,
@@ -511,8 +677,17 @@ const sameRow = (a: Record<string, unknown>, b: Record<string, unknown>) => {
   return ka.join(",") === kb.join(",") && ka.every((k) => a[k] === b[k]);
 };
 
-await check("the agent.trace lane is the nine kinds the receiver takes, every one a trace kind, and none of github.refresh's", async () => {
-  must(AGENT_TRACE_KINDS.slice().sort().join(",") === Object.keys(WORKER_FIELDS).sort().join(","), `kinds: ${AGENT_TRACE_KINDS}`);
+await check("the agent.trace lane is the receiver's kinds and the proposed ones, every one a trace kind, and none of github.refresh's", async () => {
+  must(AGENT_TRACE_KINDS.slice().sort().join(",") === Object.keys(CONTRACT).sort().join(","), `kinds: ${AGENT_TRACE_KINDS}`);
+  must(AGENT_TRACE_KINDS.length === 15, `kinds: ${AGENT_TRACE_KINDS.length}`);
+  // Every proposal is new to the receiver: a field it already keeps as it is moves to WORKER_FIELDS, not here.
+  for (const [kind, fields] of Object.entries(PROPOSED)) {
+    for (const [f, type] of Object.entries(fields)) must(WORKER_FIELDS[kind]?.[f] !== type, `${kind}.${f} is proposed but the receiver has it`);
+  }
+  // A plugin's row is about its mount, so it carries `mount_index` (the envelope's), and the receiver is to keep it.
+  for (const kind of AGENT_TRACE_KINDS) {
+    if ((PLUGIN_TRACE_KINDS as readonly string[]).includes(kind)) must(CONTRACT[kind]!.mount_index === "count", `${kind} has no mount_index in the contract`);
+  }
   for (const k of AGENT_TRACE_KINDS) must((TRACE_KINDS as readonly string[]).includes(k), `${k} is not a trace kind`);
   must(!AGENT_TRACE_KINDS.includes("github.refresh") && GITHUB_REFRESH_LANE.kinds.join() === "github.refresh", "the lanes overlap");
   must(AGENT_TRACE_LANE.path === TRACE_PATH && GITHUB_REFRESH_LANE.path === GHR_PATH, "paths");
@@ -524,8 +699,9 @@ const RECEIVER_ID = /^[A-Za-z0-9_.:@/|-]{1,128}$/, RECEIVER_CODE = /^[A-Za-z0-9_
 
 await check("the fields per kind are the receiver's names and types, or narrower: a known list for an id or code, a minted shape for an id", async () => {
   const diff: string[] = [], unfilled: string[] = [];
-  for (const [kind, fields] of Object.entries(WORKER_FIELDS)) {
+  for (const [kind, all] of Object.entries(CONTRACT)) {
     const ours = AGENT_TRACE_FIELDS[kind as TraceKind]!;
+    const fields = Object.fromEntries(Object.entries(all).filter(([f]) => f !== "mount_index"));
     for (const [f, type] of Object.entries(fields)) {
       const mine = ours[f]?.[1];
       if (mine === undefined) { unfilled.push(`${kind}.${f}`); continue; }
@@ -533,7 +709,7 @@ await check("the fields per kind are the receiver's names and types, or narrower
       const ok = Array.isArray(mine)
         ? mine.join("|") === type || (type === "id" && mine.every((v) => RECEIVER_ID.test(v))) || (type === "code" && mine.every((v) => RECEIVER_CODE.test(v)))
         : mine === "flag" ? type === "count"
-        : mine === "session" || mine === "turn" || mine === "task" || mine === "mount" ? type === "id"
+        : mine === "session" || mine === "turn" || mine === "task" || mine === "mount" || mine === "check" || mine === "minted" ? type === "id"
         : mine === type;
       if (!ok) diff.push(`${kind}.${f}: receiver ${type}, here ${Array.isArray(mine) ? mine.join("|") : mine}`);
     }
@@ -554,12 +730,63 @@ for (const kind of Object.keys(GOLDEN)) {
   });
 }
 
+for (const [seq, want] of Object.entries(GOLDEN_NEW)) {
+  await check(`golden: ${want.kind} (${want.status}) goes out as exactly these fields`, async () => {
+    const { sql } = sqliteHost(); const e = routes();
+    everyKind(sql); await newKinds(sql);
+    await lanePass(sql, e);
+    const row = traced(e).find((r) => r.seq === Number(seq));
+    must(row, `no row ${seq} was sent: ${JSON.stringify(traced(e).map((r) => `${r.seq}:${r.kind}`))}`);
+    must(sameRow(row, want), `${seq}:\n      sent ${JSON.stringify(row)}\n      want ${JSON.stringify(want)}`);
+  });
+}
+
+await check("every kind and every proposed field is exercised by a golden row", async () => {
+  const sent = new Map<string, Set<string>>();
+  for (const r of [...Object.values(GOLDEN), ...Object.values(GOLDEN_NEW)]) {
+    const k = String(r.kind);
+    if (!sent.has(k)) sent.set(k, new Set());
+    for (const f of Object.keys(r)) sent.get(k)!.add(f);
+  }
+  const missing: string[] = [];
+  for (const kind of AGENT_TRACE_KINDS) if (!sent.has(kind)) missing.push(kind);
+  for (const [kind, fields] of Object.entries(PROPOSED)) for (const f of Object.keys(fields)) if (!sent.get(kind)?.has(f)) missing.push(`${kind}.${f}`);
+  // Raft's own notify answers say `duplicate` or a state this build does not know; the night's `kept_for_brief` count is the legacy check's.
+  const notShown = ["raft.assistant_notify.kept_for_brief", "raft.assistant_chat_told.skipped"];
+  must(missing.filter((m) => !notShown.includes(m)).length === 0, `no golden row has: ${missing}`);
+});
+
+await check("the new kinds' fields hold their shapes: a check id, a decision id, a reason or an action outside its list is left out", async () => {
+  const { sql } = sqliteHost(); const e = routes();
+  withMounts(sql, [["assistant", "raft"]]);
+  const row = (n: number, kind: TraceKind, status: string, attrs: Record<string, unknown>): TraceRow =>
+    ({ at: T0 + n, ...OWNER, kind, spanId: "mount:assistant", status, verdict: "ok", attrs: { mount: "assistant", ...attrs } });
+  appendTrace(sql, [
+    row(1, "raft.assistant_wake", "check_refused", { check_id: "alice_peer", reason: "the instruction said alice", raft_check: "yes", tools_dropped: -1 }),
+    row(2, "rebuild.outcome", "agree", { decision: "alice", trigger: "nightly", rule: "alice-rule", hitRate: 0.5 }),
+    row(3, "raft.assistant_rules", "refused:effect", { action: "please mute alice", result: "refused:effect", scope: "alice", via: "elsewhere" }),
+    // `dropped` is the total, not a reason; a non-count and a name-like key are not summed.
+    row(4, "raft.assistant_notify", "sent", { notifyState: "sent", dropped: 5, dropped_other: 1, dropped_x: 2, dropped_y: "3", "dropped_Alice Smith": 4 }),
+    row(5, "raft.assistant_send_as_owner", "sent", { result: "sent", target_kind: "#alice", chars: 3.6 }),
+    row(6, "turn.end_unrecorded", "failed", { stage: "write", error_class: "has spaces in it" }),
+  ]);
+  await lanePass(sql, e);
+  const [w, r, rules, n, so, te] = traced(e);
+  must(w.check_id === undefined && w.reason === undefined && w.raft_check === undefined && w.tools_dropped === undefined && w.result === "check_refused", JSON.stringify(w));
+  must(r.decision === undefined && r.trigger === undefined && !("rule" in r) && !("hit_rate" in r) && r.agreement === undefined && r.status === "agree", JSON.stringify(r));
+  must(rules.action === undefined && rules.scope === undefined && rules.via === undefined && rules.result === "refused:effect", JSON.stringify(rules));
+  must(n.dropped === 5 && n.dropped_other === 3 && n.state === "sent", JSON.stringify(n));
+  must(so.target_kind === undefined && so.chars === 4 && so.result === "sent", JSON.stringify(so));
+  must(te.stage === undefined && te.error_class === undefined, JSON.stringify(te));
+  must(!e.requests.map((q) => q.text).join("").includes("alice") && !e.requests.map((q) => q.text).join("").includes("Alice"), "a name was sent");
+});
+
 await check("an agent.trace row carries the envelope and its kind's fields, nothing else, and no free text", async () => {
   const { sql } = sqliteHost(); const e = routes();
-  everyKind(sql);
+  everyKind(sql); await newKinds(sql);
   await lanePass(sql, e);
   const rows = traced(e);
-  must(rows.length === 9, `rows: ${rows.length}`);
+  must(rows.length === 24, `rows: ${rows.length}`);
   for (const r of rows) {
     const allowed = new Set([...ENVELOPE, ...Object.keys(AGENT_TRACE_FIELDS[r.kind as TraceKind]!)]);
     const extra = Object.keys(r).filter((k) => !allowed.has(k));
@@ -570,7 +797,8 @@ await check("an agent.trace row carries the envelope and its kind's fields, noth
     }
   }
   const text = e.requests.map((r) => r.text).join("\n");
-  for (const leak of ["secret-plans", "alice@example.com", "daily limit", "overloaded", '"error":', '"name":', '"callId":', '"limit":', '"prefix":', '"mount":"assistant"', '"engine":']) {
+  for (const leak of ["secret-plans", "alice@example.com", "daily limit", "overloaded", '"error":', '"name":', '"callId":', '"limit":', '"prefix":', '"mount":"assistant"', '"engine":',
+    "alice", "c-1", "c-3", "made_up_reason", "Not A Code", "owner-1", "dm:@owner", '"rule":', "hitRate", '"hit_rate"', "turnKey"]) {
     must(!text.includes(leak), `the body has ${leak}`);
   }
 });
