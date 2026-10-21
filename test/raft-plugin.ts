@@ -1,6 +1,6 @@
 import { createHmac } from "node:crypto";
 import { createRaft, isInterrupted, RAFT_OPERATIONS } from "@botiverse/raft-sdk";
-import { raftPlugin as raftWithoutStorage, EXCLUDED, EVENTS_LIMIT, GENERATED, handOver, INBOX_STORE, KEY_LIFETIME_MS, PAGE_ROWS, PUSH_KEY, PUSH_STORE, originOf, pagingArg, toolOf, offeredTerms, escapeMarks, unescapeMarks, createRaftPlugin, downloadAttachment, ATTACHMENT_MAX_BYTES, toolsBasisOf, WITHHELD_ARGUMENTS, FEATURES_BASIS, wakeInstruction, renderInboxSummary, INBOX_SUMMARY, RAFTBENCH_TOOL, RAFTBENCH_READER_BASIS, isRaftbenchReader } from "../src/plugins/raft.ts";
+import { raftPlugin as raftWithoutStorage, EXCLUDED, EVENTS_LIMIT, GENERATED, handOver, INBOX_STORE, KEY_LIFETIME_MS, PAGE_ROWS, PUSH_KEY, PUSH_STORE, originOf, pagingArg, toolOf, offeredTerms, escapeMarks, unescapeMarks, createRaftPlugin, downloadAttachment, ATTACHMENT_MAX_BYTES, toolsBasisOf, WITHHELD_ARGUMENTS, PARAMETER_DESCRIPTIONS, FEATURES_BASIS, wakeInstruction, renderInboxSummary, INBOX_SUMMARY, RAFTBENCH_TOOL, RAFTBENCH_READER_BASIS, isRaftbenchReader } from "../src/plugins/raft.ts";
 import { activityEvents, turnEnds } from "../src/runtime/activity.ts";
 import { readFileSync } from "node:fs";
 import { PARK_BYTES } from "../src/plugins/artifacts.ts";
@@ -1979,7 +1979,7 @@ await check("messages_search offers cursor, and the cursor the SDK's text hands 
 /** The operations whose result the manifest says may be large and that page by `limit`: the ones capped here. */
 // users.info's limit is how many visible channels it inspects for memberships: capped, it bounds the result (and,
 // since 0.12.0 asks Raft for one window in one request, how many rosters Raft reads for one call).
-const CAPPED = ["raftbench.findings", "inbox.list", "messages.read", "messages.search", "attachments.comments", "mentions.pending", "server.info", "users.info"];
+const CAPPED = ["inbox.list", "messages.read", "messages.search", "attachments.comments", "mentions.pending", "server.info", "users.info", "raftbench.findings"];
 
 await check("a paged result stays under the parking line: limit is capped and defaulted on every operation that pages by it", async () => {
   if (PAGE_ROWS < 1 || PAGE_ROWS * 400 > PARK_BYTES) throw new Error(`PAGE_ROWS=${PAGE_ROWS} against PARK_BYTES=${PARK_BYTES}`);
@@ -2117,6 +2117,52 @@ await check("raftbench_findings (SDK 0.26.0) is generated from the manifest: a r
   one(json(403, { error: "raftbench_grant_required" }));
   const refused = await failure(() => raftPlugin.invoke("raftbench_findings", {}, reader()));
   if (!/403/.test(refused.message)) throw new Error(refused.message);
+});
+
+await check("raftbench_findings (SDK 0.28.0): a page with a nextCursor ends with the next page's call, the same filters and limit with the cursor; the last page gains nothing", async () => {
+  const reader = () => inTurn({ ...ctx(), offered: [RAFTBENCH_TOOL] });
+  const page = (nextCursor: string | null) => json(200, { revision: 3, findings: [], total: 12, nextCursor, coverage: { historyFrom: null, scannedThroughAt: null, note: "n" } });
+  one(page("c2"));
+  const first: any = await raftPlugin.invoke(RAFTBENCH_TOOL, { kind: "repeated_attempt" }, reader());
+  const line = String(first.text).split("\n").at(-1)!;
+  must(first.state === "page" && line.startsWith(`Next page: ${RAFTBENCH_TOOL}(${JSON.stringify({ kind: "repeated_attempt", limit: PAGE_ROWS, cursor: "c2" })})`) &&
+    /read the next page only if more examples would change the answer/.test(line), `page: ${JSON.stringify(first)}`);
+  // The call it names is the next page: the cursor goes out with the first page's filters and limit.
+  const calls = one(page(null));
+  const last: any = await raftPlugin.invoke(RAFTBENCH_TOOL, JSON.parse(line.slice(`Next page: ${RAFTBENCH_TOOL}(`.length, line.indexOf(")"))), reader());
+  const asked = new URL(calls[0]!.url).searchParams;
+  must(asked.get("cursor") === "c2" && asked.get("kind") === "repeated_attempt" && asked.get("limit") === String(PAGE_ROWS), `asked: ${calls[0]!.url}`);
+  must(last.state === "last_page" && !/Next page/.test(last.text), `last: ${JSON.stringify(last)}`);
+});
+
+await check("raftbench_findings failures say what the SDK's raftbenchFailureKind means: findings_changed reads again from the first page, findings_unavailable stops and is not retried", async () => {
+  const reader = () => inTurn({ ...ctx(), offered: [RAFTBENCH_TOOL] });
+  // The Server's own next action, where it sends one, is replaced: it cannot say which of the three to do here.
+  one(json(409, { error: "changed", code: "raftbench_findings_changed", suggestedNextAction: "Read the current state." }));
+  const changed = await failure(() => raftPlugin.invoke(RAFTBENCH_TOOL, { cursor: "c2" }, reader()));
+  must(/raftbench_findings_changed/.test(changed.message) && /read them again from the first page/.test(changed.message) &&
+    /same filters and no cursor/.test(changed.message) && !/Read the current state/.test(changed.message), `changed: ${changed.message}`);
+  for (const status of [403, 503]) {
+    one(json(status, { error: "unavailable", code: "raftbench_findings_unavailable" }));
+    const gone = await failure(() => raftPlugin.invoke(RAFTBENCH_TOOL, {}, reader()));
+    must(/raftbench_findings_unavailable/.test(gone.message) && /do not retry/.test(gone.message) && /tell the person who asked/.test(gone.message) &&
+      gone.transient === false && gone.retryable === false, `unavailable ${status}: ${gone.message} ${JSON.stringify(gone)}`);
+  }
+  // Control: a failure the SDK has no kind for keeps the next action it came with.
+  one(json(400, { error: "bad", code: "bad_filter", suggestedNextAction: "Fix the filter." }));
+  const other = await failure(() => raftPlugin.invoke(RAFTBENCH_TOOL, {}, reader()));
+  must(/Fix the filter\./.test(other.message) && !/first page|do not retry/.test(other.message), `other: ${other.message}`);
+});
+
+await check("every operation and argument PARAMETER_DESCRIPTIONS names is in the manifest, and its tool carries the description written here", async () => {
+  for (const [name, args] of Object.entries(PARAMETER_DESCRIPTIONS)) {
+    const op = RAFT_OPERATIONS.find((o) => o.name === name);
+    must(op, `PARAMETER_DESCRIPTIONS names ${name}, which the manifest does not have`);
+    for (const [arg, description] of Object.entries(args)) {
+      must(Object.hasOwn(op!.inputSchema.properties ?? {}, arg), `PARAMETER_DESCRIPTIONS names ${name}'s ${arg}, which its manifest schema does not have`);
+      must((toolOf(op!).parameters as any).properties[arg].description === description, `${name}.${arg}: ${JSON.stringify((toolOf(op!).parameters as any).properties[arg])}`);
+    }
+  }
 });
 
 /** The credential context with the agent's `raftbenchReader` as given (slock #10609), or left out when `undefined`. */
