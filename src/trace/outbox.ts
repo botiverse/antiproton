@@ -89,7 +89,7 @@ export const TRACE_KINDS = ["model.call", "tool.call", "approval.wait", "contain
   "turn.stop", "js.run",
   "rebuild.decision", "rebuild.outcome", "rebuild.behaviour", "session.needs_reset", "turn.timing", "import.hold", "model.prewarm",
   "agent.ready", "mount.settings", "subagent.start", "subagent.turn", "subagent.model_changed", "github.refresh", "raft.held", "raft.held_answer", "raft.state_failed", "raft.state_save_failed", "raft.mcp_call",
-  "raft.assistant_wake", "raft.assistant_notify", "raft.turn_ended"] as const;
+  "raft.assistant_wake", "raft.assistant_notify", "raft.assistant_rules", "raft.assistant_chat_told", "raft.turn_ended"] as const;
 export type TraceKind = (typeof TRACE_KINDS)[number];
 
 /**
@@ -104,11 +104,16 @@ export type TraceKind = (typeof TRACE_KINDS)[number];
  * `night_deferred` or `failed` — with counts (`unreadable`: conversations no read of which succeeded), never content
  * (src/plugins/raft-assistant.ts). `raft.assistant_notify` is one notify call's end, on the call's span: its state
  * (`sent`, `nothing_to_send`, `kept_for_brief`, `not_sent`) and counts of the items given, sent and dropped by
- * category, never an item, a reference or a rule (src/plugins/raft-assistant.ts `notifyAttrs`). `raft.turn_ended` is
+ * category, never an item, a reference or a rule (src/plugins/raft-assistant.ts `notifyAttrs`). `raft.assistant_rules` is one
+ * call of the assistant's preferences tool: its action, effect, subject kind and result (`added`, `exists`, `removed`,
+ * `refused:<code>`…) and the rules' counts per effect and subject kind, never a name, an id or a note
+ * (src/plugins/raft-assistant-rules.ts `rulesAttrs`). `raft.assistant_chat_told` counts the references an assistant's
+ * chat reply to its owner recorded as told (`noteToldInChat`), never which. `raft.turn_ended` is
  * Raft's answer to one turn's `turnEnded` report: `settled`, `skipped` (with Raft's reason) or `unreadable`, and how many
  * conversations the report named, never which (src/plugins/raft.ts `reportTurnEnd`).
  */
-export const PLUGIN_TRACE_KINDS = ["raft.held", "raft.held_answer", "raft.state_failed", "raft.mcp_call", "raft.assistant_wake", "raft.assistant_notify", "raft.turn_ended"] as const satisfies readonly TraceKind[];
+export const PLUGIN_TRACE_KINDS = ["raft.held", "raft.held_answer", "raft.state_failed", "raft.mcp_call", "raft.assistant_wake", "raft.assistant_notify",
+  "raft.assistant_rules", "raft.assistant_chat_told", "raft.turn_ended"] as const satisfies readonly TraceKind[];
 export type PluginTraceKind = (typeof PLUGIN_TRACE_KINDS)[number];
 
 export const TRACE_VERDICTS = ["ok", "failed", "blocked", "cancelled"] as const;

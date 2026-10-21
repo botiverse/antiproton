@@ -11,9 +11,10 @@ import { createHmac } from "node:crypto";
 import { PUSH_KEY, PUSH_STORE, raftPlugin, wakeInstruction } from "../src/plugins/raft.ts";
 import { activityEvents, turnEnds } from "../src/runtime/activity.ts";
 import {
-  ASSISTANT_STORE, CHAT_TOOLS, CHECK_TOOLS, COUNTS_KEY, DEFERRED_KEY, DM_ITEMS_MAX, INBOX_LAG_RETRY_MS, OWNER_KEY, REMINDED_STORE, RETRY_BACKOFF_MS, REVIEWED_KEY, SUMMARY_MAX, UNREADABLE_KEY,
+  ASSISTANT_STORE, CHAT_TOOLS, CHECK_KEY, CHECK_TOOLS, COUNTS_KEY, DEFERRED_KEY, DM_ITEMS_MAX, INBOX_LAG_RETRY_MS, OWNER_KEY, REMINDED_STORE, RETRY_BACKOFF_MS, REVIEWED_KEY, SUMMARY_MAX, UNREADABLE_KEY,
   assistantCheckPrompt, assistantMountOf, assistantPrompt, assistantWake, assistantWakeInstruction, compose, confirmRef, isQuietHours, itemOf, localDay, nextBriefAt, noteDoorbell, zoneOf,
 } from "../src/plugins/raft-assistant.ts";
+import { confirmLine, matches, ruleLine, rulesOf, winningRule, type ContactRule } from "../src/plugins/raft-assistant-rules.ts";
 import { setLogSink } from "../src/core/log.ts";
 import { askWake } from "../src/runtime/plugin-wakes.ts";
 import { recordedEngine } from "../src/runtime/durable-agent.ts";
@@ -132,13 +133,18 @@ const conv = (n: number, o: Record<string, unknown> = {}) => ({
 });
 
 /** Raft as an assistant's credential meets it: its context, its owner DM, its events, the owner inbox. */
-function raft(o: { zone?: unknown; owner?: boolean; dm?: unknown } = {}) {
+function raft(o: { zone?: unknown; owner?: boolean; dm?: unknown; name?: string } = {}) {
   const r = {
     owner: o.owner ?? true, zone: "zone" in o ? o.zone : "Europe/Berlin", dm: o.dm, contextStatus: 200,
     sends: [] as any[], send: "sent" as "sent" | "held", events: [] as unknown[], inbox: 200, contexts: 0,
     unread: [] as unknown[], all: [] as unknown[], inboxReads: [] as string[],
     /** Conversations whose owner-messages answer fails Raft's shape (the message names no conversation), and every read of one. */
     broken: new Set<string>(), messageReads: [] as string[],
+    /**
+     * Raft's person read by name: a person, "unknown" (Raft's 404 for the name), or, with no entry for the name while
+     * `resolveRoute` is false (the default), the route missing (the generic 404 every unknown path gets); `resolves` every read.
+     */
+    people: {} as Record<string, { id: string; type: string; name: string } | "unknown" | 500>, resolveRoute: false, resolves: [] as string[],
     /** Doorbell events by their address (`agent-event:<id8>`), as `GET /history` answers one; every such read. */
     bellEvents: {} as Record<string, unknown>, historyReads: [] as string[],
   };
@@ -151,7 +157,7 @@ function raft(o: { zone?: unknown; owner?: boolean; dm?: unknown } = {}) {
       if (r.contextStatus !== 200) return json(r.contextStatus, { error: "no", code: "forbidden" });
       return json(200, {
         agent: { id: "agent-1", name: "ada-assistant", displayName: null, description: null, runtime: "external", external: true,
-          assistantOf: r.owner ? { userId: OWNER, ...(r.zone !== undefined ? { timezone: r.zone } : {}), ...(r.dm !== undefined ? { dmTarget: r.dm } : {}) } : null },
+          assistantOf: r.owner ? { userId: OWNER, ...(r.zone !== undefined ? { timezone: r.zone } : {}), ...(r.dm !== undefined ? { dmTarget: r.dm } : {}), ...(o.name ? { name: o.name } : {}) } : null },
         server: { id: "server-1", slug: "s", name: "S" }, credential: { capabilities: ["read", "send", "reactions"] }, prompt: null,
       });
     }
@@ -182,6 +188,13 @@ function raft(o: { zone?: unknown; owner?: boolean; dm?: unknown } = {}) {
       const m = { seq: 1, id: `aaaaaaa${channelId.slice(-1)}-1111-4222-8333-444455556666`, timestamp: "2026-10-20T09:50:00.000Z", sender_type: "human",
         sender_name: "bob", content: "can you pick a date?", ...(r.broken.has(channelId) ? {} : { channel_type: "channel", channel_name: `ch${channelId.slice(-1)}` }) };
       return json(200, { owner: { userId: OWNER }, channelId, messages: [m], hasMore: false, hasOlder: false, hasNewer: false });
+    }
+    if (path === "/assistant/owner-resolve" && r.resolveRoute) {
+      const name = u.searchParams.get("name") ?? "";
+      r.resolves.push(name);
+      const p = r.people[name];
+      if (p === 500) return json(500, { error: "boom" });
+      return p && p !== "unknown" ? json(200, p) : json(404, { error: "No such person", code: "person_not_found" });
     }
     if (path === "/assistant/owner-inbox") {
       const filter = u.searchParams.get("filter") ?? "unread";
@@ -235,6 +248,14 @@ const DAY = "2026-10-20T10:00:00Z"; // 12:00 in Berlin
 const NIGHT = "2026-10-20T21:00:00Z"; // 23:00 in Berlin
 /** A brief turn posted today, as the timer leaves it, so `brief: true` counts. */
 const briefPosted = (a: { read: any; write: any }, day: string) => a.write(ASSISTANT_STORE, OWNER_KEY, { ...a.read(ASSISTANT_STORE, OWNER_KEY), lastBrief: day });
+/** What a check read before notify, as its wake keeps it (`CHECK_KEY`): these inbox rows, each showing its first unread message. */
+const checkRead = (a: { write: any }, rows: Array<ReturnType<typeof conv>>) => a.write(ASSISTANT_STORE, CHECK_KEY, {
+  at: 1, unreadable: [], rows: rows.map((r) => ({
+    channelId: r.channelId, channelName: r.channelName, firstUnreadMessageId: r.firstUnreadMessageId, parentMessageId: r.parentMessageId, ids: [],
+    mention: r.hasMention, dm: r.channelType === "dm", parentChannelId: r.parentChannelId, thread: r.kind === "thread",
+    ...("latestSenderId" in r && (r.channelType === "dm" || r.unread <= 1) ? { senderId: (r as any).latestSenderId } : {}),
+  })),
+});
 
 await check("the listing keeps the owner with Raft's zone and DM; an invalid or missing zone or DM is null; no owner drops the record", async () => {
   const a = await assistant(raft({ zone: "Europe/Berlin", dm: "dm:@ada" }));
@@ -303,22 +324,32 @@ await check("with no DM from Raft and none learnt, notify refuses and says why, 
     `the learnt DM is used, and the same items go under the same key: ${show(a.r.sends)}`);
 });
 
-await check("reminder rules: a muted channel, sender or kind is dropped in code; unmute lets it through; list shows them", async () => {
+await check("the older mute/unmute still work: a channel kept by its id, a sender as a person, a kind; a muted one dropped in code; list shows them", async () => {
   const a = await assistant(raft({ dm: "dm:@ada" }));
+  a.r.all = [conv(1, { channelName: "launch" }), conv(3, { channelName: "ops" })];
+  // What the check that preceded notify read: the conversations its items are from.
+  checkRead(a, [conv(1, { channelName: "launch" }), conv(3, { channelName: "ops" }), conv(7, { channelName: "eng" })]);
   const pref = (args: unknown) => raftPlugin.invoke("assistant_preferences", args, a.ctx) as Promise<any>;
-  const added = await pref({ action: "mute", channel: "#launch", note: "launch is not mine" });
-  must(added.state === "added" && added.rule.channel === "launch" && added.rule.id === "r1", show(added));
-  must((await pref({ action: "mute", sender: "@cy", kind: "review" })).rule.id === "r2", "second rule");
-  must((await pref({ action: "mute", channel: "launch" })).state === "exists", "the same rule twice is one");
-  const out = await atTime(DAY, () => notify(a.ctx, { items: [...ITEMS, { ref: "#ops:ccccccc3", summary: "Cy wants a review", kind: "review", sender: "cy" }] }));
-  must(out.state === "sent" && out.items === 1 && out.dropped["#launch:aaaaaaa1"] === "rule r1" && out.dropped["#ops:ccccccc3"] === "rule r2", show(out));
+  const added = await atTime(DAY, () => pref({ action: "mute", channel: "#launch", note: "launch is not mine" }));
+  must(added.state === "added" && added.id === "r1" && added.confirm === "General chat in #launch won't notify you anymore; @mentions of you still will.", show(added));
+  const kept = a.read(ASSISTANT_STORE, "rules");
+  must(kept[0].subject.kind === "channel" && kept[0].subject.id === conv(1).channelId && kept[0].effect === "mute", `kept by its id: ${show(kept)}`);
+  const kind = await atTime(DAY, () => pref({ action: "mute", kind: "review" }));
+  must(kind.id === "r2" && kind.confirm === "I won't tell you about review requests anymore.", show(kind));
+  must((await atTime(DAY, () => pref({ action: "mute", channel: "launch" }))).state === "exists", "the same rule twice is one");
+  const out = await atTime(DAY, () => notify(a.ctx, { items: [...ITEMS, { ref: "#ops:aaaaaaa3", summary: "Cy wants a review", kind: "review", sender: "cy" }] }));
+  must(out.state === "sent" && out.items === 1 && out.dropped["#launch:aaaaaaa1"] === "rule r1" && out.dropped["#ops:aaaaaaa3"] === "rule r2", show(out));
   must((await pref({ action: "unmute", id: "r1" })).state === "removed", "unmute");
-  const listed = await pref({ action: "list" });
-  must(listed.rules.length === 1 && listed.rules[0].id === "r2", show(listed));
+  const listed = await atTime(DAY, () => pref({ action: "list" }));
+  must(show(listed.rules) === show([{ id: "r2", line: "r2 · mute kind review" }]) && listed.quiet === "quiet 22:00-08:00 Europe/Berlin" && /By default/.test(listed.defaults), show(listed));
   const later = await atTime(DAY, () => notify(a.ctx, { items: [ITEMS[0]] }));
   must(later.state === "sent" && a.r.sends.length === 2, show(later));
-  for (const bad of [{ action: "mute" }, { action: "mute", kind: "fyi" }, { action: "unmute", id: "r9" }, { action: "timezone", timezone: "Nowhere/Land" }]) {
-    must(await pref(bad).then(() => false, () => true), `accepted: ${show(bad)}`);
+  // A sender is a person, kept without an id while Raft gives none: listed, and the model's to apply.
+  const person = await atTime(DAY, () => pref({ action: "mute", sender: "@cy" }));
+  must(person.state === "added" && /apply this rule yourself/.test(person.note) && a.read(ASSISTANT_STORE, "rules").at(-1).subject.id === null, show(person));
+  for (const bad of [{ action: "mute" }, { action: "mute", kind: "fyi" }, { action: "mute", sender: "@cy", kind: "review" }, { action: "unmute", id: "r9" },
+    { action: "timezone", timezone: "Nowhere/Land" }, { action: "mute", channel: "#nowhere" }]) {
+    must(await atTime(DAY, () => pref(bad)).then(() => false, () => true), `accepted: ${show(bad)}`);
   }
 });
 
@@ -426,14 +457,17 @@ await check("a push that is only the doorbell asks the plugin's wake and gives t
 await check("a doorbell whose activity is all told, muted or already looked at ends in code: no turn, counted skipped_filtered", async () => {
   const a = await assistant();
   a.write(REMINDED_STORE, "msg:aaaaaaa1", { at: 1 });
-  await raftPlugin.invoke("assistant_preferences", { action: "mute", channel: "ch2" }, a.ctx);
+  a.r.all = [conv(1), conv(2)];
+  await raftPlugin.invoke("assistant_preferences", { action: "add", effect: "mute", channel: "ch2" }, a.ctx);
+  a.r.inboxReads.length = 0;
   a.r.unread = [conv(1), conv(2)];
   await atTime(DAY, async () => { await (await import("../src/plugins/raft-assistant.ts")).noteDoorbell(a.ctx); });
   const out = await atTime(DAY, () => wake(a.ctx));
   must(out && out.turn === undefined && out.wakeAt === at("2026-10-21T06:00:00Z"), `filtered: ${show(out)}`);
   must(show(a.r.inboxReads) === show(["unread"]), `reads: ${show(a.r.inboxReads)}`);
   const row = a.traced.find((t) => t.kind === "raft.assistant_wake");
-  must(row?.status === "skipped_filtered" && row.attrs.trigger === "doorbell" && row.attrs.told === 1 && row.attrs.muted === 1 && row.attrs.candidates === 0, show(a.traced));
+  must(row?.status === "skipped_filtered" && row.attrs.trigger === "doorbell" && row.attrs.told === 1 && row.attrs.muted === 1 && row.attrs.muted_channel === 1 &&
+    row.attrs.candidates === 0 && row.attrs.rules_total === 1, show(a.traced));
   must(counted(a, "2026-10-20")["doorbell.skipped_filtered"] === 1, show(a.read(ASSISTANT_STORE, COUNTS_KEY)));
   // An empty inbox is skipped_empty; a wake with no doorbell kept and no brief due reads nothing at all.
   a.r.unread = [];
@@ -784,6 +818,423 @@ await check("a notify call that sends nothing says so on its trace row: its stat
   await atTime(DAY, () => notify(b.ctx, { items: ITEMS }));
   const sent = b.traced.filter((t) => t.kind === "raft.assistant_notify").at(-1);
   must(show(sent?.attrs) === show({ notifyState: "sent", given: 2, sent: 1, dropped: 1, dropped_already_told: 1 }), show(sent));
+});
+
+// ---- contact rules (src/plugins/raft-assistant-rules.ts) --------------------------------------------------------------
+
+const RULE_AT = "2026-10-20T08:00:00.000Z";
+const rule = (id: string, effect: ContactRule["effect"], subject: ContactRule["subject"], o: Partial<ContactRule> = {}): ContactRule =>
+  ({ id, effect, subject, anytime: false, until: null, note: null, createdAt: RULE_AT, ...o });
+const pref = (a: { ctx: unknown }, args: unknown, when = DAY) => atTime(when, () => raftPlugin.invoke("assistant_preferences", args, a.ctx as never) as Promise<any>);
+const ANA = "u-ana-0000-0001";
+const ITEM_ORDER = ["question", "review", "decision", "task", "mention", "decided"];
+/** A wake on a doorbell at `when`; its check's input, or undefined. */
+const bell = async (a: { ctx: unknown }, when = DAY) => { await atTime(when, () => noteDoorbell(a.ctx as never)); return atTime(when, () => wake(a.ctx)); };
+const lastWake = (a: { traced: any[] }) => a.traced.filter((t) => t.kind === "raft.assistant_wake").at(-1);
+
+await check("precedence: thread > person > channel > kind, whichever was said first; at equal specificity the newer rule wins; an expired rule is ignored", () => {
+  const ch = { kind: "channel", id: "C-random", name: "random" } as const, th = { kind: "thread", id: "T-1", channelId: "C-random", ref: "#random:abcdef12" } as const;
+  const ana = { kind: "person", id: ANA, type: "human", name: "ana" } as const, question = { kind: "kind", value: "question" } as const;
+  const inThread = { channelId: "T-1", parentChannelId: "C-random", thread: true, dm: false, mention: false, senderId: ANA, kind: "question" as const };
+  const now = at(DAY);
+  const older = { createdAt: "2026-10-19T00:00:00.000Z" }, newer = { createdAt: "2026-10-20T09:00:00.000Z" };
+  must(winningRule([rule("r1", "mute", question, newer), rule("r2", "always", ch, older)], inThread, now)?.id === "r2", "channel over kind");
+  must(winningRule([rule("r1", "mute", ch, newer), rule("r2", "always", ana, older)], inThread, now)?.id === "r2", "person over channel");
+  must(winningRule([rule("r1", "mute", ana, newer), rule("r2", "always", th, older)], inThread, now)?.id === "r2", "thread over person");
+  must(winningRule([rule("r1", "always", th, newer), rule("r2", "mute", ana, older)], inThread, now)?.id === "r1", "thread over person, the other way round");
+  // The same subject twice: the owner's latest sentence.
+  const inChannel = { ...inThread, channelId: "C-random", parentChannelId: null, thread: false };
+  must(winningRule([rule("r1", "mute", ch, older), rule("r2", "always", ch, newer)], inChannel, now)?.effect === "always", "tie: the newer (always)");
+  must(winningRule([rule("r1", "mute", ch, newer), rule("r2", "always", ch, older)], inChannel, now)?.effect === "mute", "tie: the newer (mute)");
+  // A rule kept from before times is older than any with one; between two of those, the later id.
+  must(winningRule([rule("r9", "always", ch, { createdAt: null }), rule("r1", "mute", ch, older)], inChannel, now)?.id === "r1", "a migrated rule is the older");
+  must(winningRule([rule("r2", "always", ch, { createdAt: null }), rule("r3", "mute", ch, { createdAt: null })], inChannel, now)?.id === "r3", "two migrated: the later id");
+  must(winningRule([rule("r1", "mute", ch, { until: "2026-10-20T09:00:00.000Z" })], inChannel, now) === null, "an expired rule applies");
+  must(winningRule([rule("r1", "mute", ch, { until: "2026-10-20T11:00:00.000Z" })], inChannel, now)?.id === "r1", "control: an unexpired rule applies");
+});
+
+await check("a channel's mute is its general chat: an @mention of the owner there still comes, a DM is never in a channel; a person's mute covers both", () => {
+  const ch = rule("r1", "mute", { kind: "channel", id: "C-random", name: "random" });
+  const chat = { channelId: "C-random", parentChannelId: null, thread: false, dm: false, mention: false };
+  must(matches(ch, chat), "control: the channel's chat is muted");
+  must(!matches(ch, { ...chat, mention: true }), "an @mention in a muted channel was muted");
+  must(!matches(ch, { ...chat, dm: true }), "a DM was covered by a channel mute");
+  must(!matches(rule("r2", "digest", { kind: "channel", id: "C-random", name: "random" }), { ...chat, mention: true }), "an @mention in a digest channel waits for the brief");
+  must(matches(rule("r3", "always", { kind: "channel", id: "C-random", name: "random" }), { ...chat, mention: true }), "always covers a mention too");
+  const thread = rule("r4", "mute", { kind: "thread", id: "T-1", channelId: "C-random", ref: "#random:abcdef12" });
+  must(matches(thread, { ...chat, channelId: "T-1", parentChannelId: "C-random", thread: true }) && !matches(thread, { ...chat, channelId: "T-1", thread: true, mention: true }), "a thread's mute");
+  const ana = rule("r5", "mute", { kind: "person", id: ANA, type: "human", name: "ana" });
+  must(matches(ana, { ...chat, mention: true, senderId: ANA }) && matches(ana, { ...chat, dm: true, senderId: ANA }), "a person's mute covers their @mentions and DMs");
+  must(!matches(ana, { ...chat, senderId: undefined }) && !matches(ana, { ...chat, senderId: null }) && !matches(ana, { ...chat, senderId: "u-other" }), "a person matched without their id");
+  must(!matches(rule("r6", "mute", { kind: "person", id: null, type: null, name: "ana" }), { ...chat, senderId: ANA }), "a person rule with no id matched by name");
+});
+
+await check("mute #random and always @ana, end to end: @ana's chat in #random gets through, bob's does not, bob's @mention there does; ids, not names", async () => {
+  const a = await assistant(raft({ dm: "dm:@ada" }));
+  const random = (o: Record<string, unknown> = {}) => conv(1, { channelName: "random", latestSenderName: "bob", latestSenderId: "u-bob", ...o });
+  a.r.all = [random({ latestSenderName: "ana", latestSenderId: ANA })];
+  const muted = await pref(a, { action: "add", effect: "mute", channel: "#random" });
+  const always = await pref(a, { action: "add", effect: "always", person: "@ana" });
+  must(muted.state === "added" && always.state === "added" && !("note" in always), `added: ${show([muted, always])}`);
+  const kept = a.read(ASSISTANT_STORE, "rules");
+  must(kept[1].subject.id === ANA && kept[1].subject.name === "ana", `ana kept by her id: ${show(kept)}`);
+  must(always.confirm === `I'll tell you right away about @ana, except during your quiet hours (22:00-08:00); say "even at night" to change that.`, always.confirm);
+  a.r.unread = [random({ latestSenderName: "ana", latestSenderId: ANA })];
+  const fromAna = await bell(a);
+  must(fromAna.isolated === true && fromAna.turn.includes(conv(1).channelId) && /"why":"always"/.test(fromAna.turn), `ana: ${show(fromAna)}`);
+  must(lastWake(a).attrs.always === 1 && !("person_rule_unenforced" in lastWake(a).attrs), show(lastWake(a)));
+  a.r.unread = [random({ latestAt: "2026-10-20T09:55:00.000Z" })];
+  const fromBob = await bell(a);
+  must(fromBob.turn === undefined && lastWake(a).attrs.muted_channel === 1, `bob: ${show(fromBob)} ${show(lastWake(a))}`);
+  a.r.unread = [random({ latestAt: "2026-10-20T09:56:00.000Z", hasMention: true })];
+  const mention = await bell(a);
+  must(mention.isolated === true && /"why":"mention"/.test(mention.turn), `bob's @mention in a muted channel: ${show(mention)}`);
+  // Renamed: the same person under another name is still matched by id; someone new under her old name is not.
+  a.r.unread = [random({ latestAt: "2026-10-20T09:57:00.000Z", latestSenderName: "ana-renamed", latestSenderId: ANA })];
+  must((await bell(a)).isolated === true, "ana renamed was not let through");
+  a.r.unread = [random({ latestAt: "2026-10-20T09:58:00.000Z", latestSenderName: "ana", latestSenderId: "u-impostor" })];
+  must((await bell(a)).turn === undefined, "a new person named ana got ana's rule");
+});
+
+await check("a person's mute drops their @mentions and DMs in code when rows carry ids; a row with several unread messages is not dropped on its last sender", async () => {
+  const a = await assistant(raft({ dm: "dm:@ada" }));
+  a.r.all = [conv(1, { latestSenderName: "cy", latestSenderId: "u-cy" })];
+  const added = await pref(a, { action: "add", effect: "mute", person: "cy" });
+  must(added.confirm === "Nothing from @cy will notify you anymore, @mentions and DMs included.", added.confirm);
+  a.r.unread = [conv(1, { hasMention: true, latestSenderName: "cy", latestSenderId: "u-cy" }),
+    conv(2, { kind: "channel", channelType: "dm", channelName: "cy", peer: { id: "u-cy", type: "user" }, latestSenderName: "ada", latestSenderId: OWNER, latestSenderType: "user", unread: 3 }),
+    conv(3, { unread: 2, latestSenderName: "cy", latestSenderId: "u-cy" })];
+  const out = await bell(a);
+  must(out.isolated === true && out.turn.includes(conv(3).channelId) && !out.turn.includes(conv(1).channelId) && !out.turn.includes(conv(2).channelId), show(out));
+  must(lastWake(a).attrs.muted_person === 2, show(lastWake(a)));
+  // In notify too: an item is held to the id on the row it came from, never to the sender name the model wrote.
+  checkRead(a, [conv(1, { latestSenderName: "cy", latestSenderId: "u-cy" }), conv(3, { unread: 2, latestSenderName: "cy", latestSenderId: "u-cy" })]);
+  const n = await atTime(DAY, () => notify(a.ctx, { items: [{ ref: "#ch1:aaaaaaa1", summary: "s", kind: "question", sender: "@someone" }, { ref: "#ch3:aaaaaaa3", summary: "t", kind: "question", sender: "@cy" }] }));
+  must(n.state === "sent" && n.items === 1 && n.dropped["#ch1:aaaaaaa1"] === "rule r1" && a.r.sends[0].content === "t: #ch3:aaaaaaa3", `${show(n)} ${show(a.r.sends)}`);
+});
+
+await check("a DM to the owner goes to the model like a mention, first in the DM, and no channel rule covers it; the DM with the assistant itself never does", async () => {
+  const a = await assistant(raft({ dm: "dm:@ada" }));
+  // A rule kept from before ids, named like the DM's other person: bound only to a channel, never to the DM.
+  a.write(ASSISTANT_STORE, "rules", [{ id: "r1", channel: "cy", sender: null, kind: null, note: null }]);
+  a.r.unread = [conv(2, { channelType: "dm", channelName: "cy", latestSenderName: "cy" }), conv(3, { channelType: "dm", channelName: "ada-assistant~agent", latestSenderName: "ada-assistant" })];
+  const out = await bell(a);
+  must(out.isolated === true && out.turn.includes(conv(2).channelId) && /"why":"dm"/.test(out.turn) && !out.turn.includes(conv(3).channelId), show(out));
+  must(lastWake(a).attrs.dm === 1 && lastWake(a).attrs.own_dm === 1 && !("muted" in lastWake(a).attrs && lastWake(a).attrs.muted), show(lastWake(a)));
+  must(a.read(ASSISTANT_STORE, "rules")[0].channel === "cy", "the kept rule was bound to a DM");
+});
+
+await check("general chat: sent to the model while Raft gives no owner name (counted); with the name, dropped in code unless it names the owner or a rule asks", async () => {
+  const a = await assistant(raft({ dm: "dm:@ada" }));
+  must(a.read(ASSISTANT_STORE, OWNER_KEY).ownerName === null, "control: no name from Raft");
+  a.r.unread = [conv(1, { latestPreview: "lunch at noon?" })];
+  const off = await bell(a);
+  must(off.isolated === true && /"why":"chat"/.test(off.turn) && lastWake(a).attrs.chatter_unfiltered === 1, `name unknown: ${show(off)}`);
+  const b = await assistant(raft({ dm: "dm:@ada", name: "ada" }));
+  must(b.read(ASSISTANT_STORE, OWNER_KEY).ownerName === "ada", show(b.read(ASSISTANT_STORE, OWNER_KEY)));
+  b.r.unread = [conv(1, { latestPreview: "lunch at noon?" }), conv(2, { latestPreview: "Ada, can you decide?" }), conv(3, { latestPreview: "adam says hi" })];
+  const on = await bell(b);
+  must(on.isolated === true && on.turn.includes(conv(2).channelId) && /"why":"named"/.test(on.turn) && !on.turn.includes(conv(1).channelId) && !on.turn.includes(conv(3).channelId), `name known: ${show(on)}`);
+  must(lastWake(b).attrs.default_chatter === 2, show(lastWake(b)));
+  b.r.unread = [conv(1, { latestPreview: "lunch at noon?", latestAt: "2026-10-20T09:59:00.000Z" })];
+  must((await bell(b)).turn === undefined && lastWake(b).status === "skipped_filtered", "chatter alone made a model call");
+  b.r.all = [conv(1)];
+  await pref(b, { action: "add", effect: "always", channel: "#ch1" });
+  b.r.unread = [conv(1, { latestPreview: "lunch at noon?", latestAt: "2026-10-20T09:59:30.000Z" })];
+  must((await bell(b)).isolated === true, "always #ch1 did not let its chat through");
+});
+
+await check("digest #design: a doorbell leaves it for the brief with no model call, notify keeps it for the brief, the brief sends it; an @mention there still comes", async () => {
+  const a = await assistant(raft({ dm: "dm:@ada" }));
+  a.r.all = [conv(1, { channelName: "design" })];
+  const added = await pref(a, { action: "add", effect: "digest", channel: "#design" });
+  must(added.confirm === "General chat in #design goes in your morning brief only; @mentions of you still come right away.", added.confirm);
+  a.r.unread = [conv(1, { channelName: "design" })];
+  must((await bell(a)).turn === undefined && lastWake(a).attrs.digest === 1, show(lastWake(a)));
+  a.r.unread = [conv(1, { channelName: "design", hasMention: true, latestAt: "2026-10-20T09:59:00.000Z" })];
+  must((await bell(a)).isolated === true, "an @mention in a digest channel was held");
+  // notify outside the brief: a digest item is kept, a mention from there is sent.
+  checkRead(a, [conv(1, { channelName: "design" })]);
+  const kept = await atTime(DAY, () => notify(a.ctx, { items: [{ ref: "#design:aaaaaaa1", summary: "@ka wants a look", kind: "review" }] }));
+  must(kept.state === "kept_for_brief" && kept.kept === 1 && a.r.sends.length === 0 && a.read(ASSISTANT_STORE, DEFERRED_KEY)?.length === 1, show(kept));
+  must(a.read(ASSISTANT_STORE, DEFERRED_KEY)[0].at.channelId === conv(1).channelId, "kept without where it was from");
+  const row = a.traced.filter((t) => t.kind === "raft.assistant_notify").at(-1);
+  must(row?.attrs.kept_for_brief === 1, show(row));
+  // The brief: the digest row is in its input, and the kept item goes out.
+  a.r.unread = [conv(1, { channelName: "design" })];
+  const morning = await atTime("2026-10-21T06:00:05Z", () => wake(a.ctx));
+  must(morning.turnKey === "assistant.brief" && morning.turn.includes(conv(1).channelId), show(morning));
+  const brief = await atTime("2026-10-21T06:01:00Z", () => notify(a.ctx, { brief: true, items: [] }));
+  must(brief.state === "sent" && a.r.sends[0].content === "Morning. @ka wants a look: #design:aaaaaaa1", show(a.r.sends));
+});
+
+await check("quiet hours are a setting: 23:00-07:00 moves the night for the wake and notify, off has none, across the DST change; the default is 22:00-08:00", async () => {
+  const q = { from: "23:00", to: "07:00" };
+  // Berlin: 2026-10-24 is CEST (UTC+2), 2026-10-25 from 03:00 CET (UTC+1).
+  for (const [iso, quiet] of [["2026-10-20T20:30:00Z", false], ["2026-10-20T21:00:00Z", true], ["2026-10-24T04:59:00Z", true], ["2026-10-24T05:00:00Z", false],
+    ["2026-10-25T05:59:00Z", true], ["2026-10-25T06:00:00Z", false]] as const) {
+    must(isQuietHours(at(iso), "Europe/Berlin", q) === quiet, `${iso}: ${!quiet}`);
+  }
+  must(!isQuietHours(at("2026-10-20T23:00:00Z"), "UTC", null) && isQuietHours(at("2026-10-20T23:00:00Z"), "UTC"), "off, and the default");
+  const a = await assistant(raft({ dm: "dm:@ada" }));
+  for (const bad of [{ from: "23:00" }, { from: "25:00", to: "07:00" }, { from: "7:00", to: "23:00" }, { from: "23:00", to: "23:00" }]) {
+    must(await pref(a, { action: "quiet", ...bad }).then(() => false, () => true), `accepted: ${show(bad)}`);
+  }
+  const set = await pref(a, { action: "quiet", from: "23:00", to: "07:00" });
+  must(set.confirm === "Quiet from 23:00 to 07:00 your time (Europe/Berlin); anything then waits for your morning brief.", show(set));
+  // 22:30 Berlin: a night under the default, not under theirs.
+  a.r.unread = [conv(1)];
+  const evening = await bell(a, "2026-10-20T20:30:00Z");
+  must(evening.isolated === true && lastWake(a).attrs.quiet_custom === true, `22:30: ${show(evening)} ${show(lastWake(a))}`);
+  checkRead(a, [conv(1)]);
+  must((await atTime("2026-10-20T20:30:00Z", () => notify(a.ctx, { items: [{ ref: "#ch1:aaaaaaa1", summary: "s", kind: "question" }] }))).state === "sent", "22:30 notify held");
+  a.r.unread = [conv(1, { latestAt: "2026-10-20T21:10:00.000Z" })];
+  must((await bell(a, "2026-10-20T21:30:00Z")).turn === undefined && lastWake(a).status === "night_deferred", "23:30 read the inbox");
+  checkRead(a, [conv(6)]);
+  must((await atTime("2026-10-20T21:30:00Z", () => notify(a.ctx, { items: [{ ref: "#ch6:aaaaaaa6", summary: "s", kind: "question" }] }))).state === "kept_for_brief", "23:30 notify sent");
+  const off = await pref(a, { action: "quiet", off: true });
+  must(/No quiet hours/.test(off.confirm) && (await pref(a, { action: "list" })).quiet === "no quiet hours (Europe/Berlin)", show(off));
+  a.r.unread = [conv(7)];
+  must((await bell(a, "2026-10-20T22:30:00Z")).isolated === true, "with no quiet hours a night doorbell read nothing");
+});
+
+await check("always … anytime: in quiet hours the doorbell reads the inbox and lets only what such a rule covers through, and notify sends it; the rest waits, not looked at", async () => {
+  const a = await assistant(raft({ dm: "dm:@ada" }));
+  a.r.all = [conv(1, { channelName: "oncall" }), conv(2)];
+  const night = await pref(a, { action: "add", effect: "always", channel: "#oncall", anytime: true });
+  must(night.confirm === "I'll tell you right away about #oncall, nights included.", night.confirm);
+  must(await pref(a, { action: "add", effect: "mute", channel: "#oncall", anytime: true }).then(() => false, () => true), "anytime on a mute");
+  a.r.unread = [conv(1, { channelName: "oncall" }), conv(2, { hasMention: true })];
+  const out = await bell(a, NIGHT);
+  must(out.isolated === true && out.turn.includes(conv(1).channelId) && !out.turn.includes(conv(2).channelId), show(out));
+  must(lastWake(a).attrs.anytime_night === 1 && lastWake(a).attrs.night_held === 1, show(lastWake(a)));
+  const reviewed = a.read(ASSISTANT_STORE, REVIEWED_KEY);
+  must(conv(1).channelId in reviewed && !(conv(2).channelId in reviewed), `what waited was recorded as looked at: ${show(reviewed)}`);
+  // The check's model gives both (a check whose input was only #oncall could not): only the one the rule covers goes now.
+  checkRead(a, [conv(1, { channelName: "oncall" }), conv(2, { hasMention: true })]);
+  const sent = await atTime(NIGHT, () => notify(a.ctx, { items: [{ ref: "#oncall:aaaaaaa1", summary: "@pager the db is down", kind: "question" }, { ref: "#ch2:aaaaaaa2", summary: "s", kind: "mention" }] }));
+  must(sent.state === "sent" && sent.items === 1 && sent.kept === 1 && a.r.sends[0].content === "@pager the db is down: #oncall:aaaaaaa1", `${show(sent)} ${show(a.r.sends)}`);
+  // Without anytime the same rule waits for the morning.
+  const b = await assistant(raft({ dm: "dm:@ada" }));
+  b.r.all = [conv(1, { channelName: "oncall" })];
+  await pref(b, { action: "add", effect: "always", channel: "#oncall" });
+  b.r.unread = [conv(1, { channelName: "oncall" })];
+  must((await bell(b, NIGHT)).turn === undefined && lastWake(b).status === "night_deferred" && b.r.inboxReads.length === 1, `not anytime: ${show(b.r.inboxReads)}`);
+});
+
+await check("rules from before read as this version's, ids kept: a channel bound to its id at the next wake, a sender a person, a combined rule kept and still applied", async () => {
+  const a = await assistant(raft({ dm: "dm:@ada" }));
+  a.write(ASSISTANT_STORE, "rules", [
+    { id: "r3", channel: "ch1", sender: null, kind: null, note: "noisy" }, { id: "r5", channel: null, sender: "cy", kind: null, note: null },
+    { id: "r7", channel: "ch2", sender: "bo", kind: "review", note: null }, { id: "r8", channel: null, sender: null, kind: "task", note: null },
+  ]);
+  const read = rulesOf(a.read(ASSISTANT_STORE, "rules"));
+  must(show(read.map((r) => [r.id, r.effect, r.subject.kind])) === show([["r3", "mute", "channel"], ["r5", "mute", "person"], ["r7", "mute", "legacy"], ["r8", "mute", "kind"]]), show(read));
+  const listed = await pref(a, { action: "list" });
+  must(show(listed.rules.map((r: any) => r.line)) === show(["r3 · mute #ch1 (chat only; @mentions still come)", "r5 · mute @cy", "r7 · mute #ch2 + @bo + review requests (an older rule; say it again to replace it)", "r8 · mute kind task"]), show(listed));
+  must(a.read(ASSISTANT_STORE, "rules")[0].channel === "ch1", "a list wrote the rules");
+  a.r.unread = [conv(1), conv(2)];
+  const out = await bell(a);
+  must(out.isolated === true && !out.turn.includes(conv(1).channelId) && out.turn.includes(conv(2).channelId) && lastWake(a).attrs.muted_channel === 1, show(out));
+  const bound = a.read(ASSISTANT_STORE, "rules");
+  must(bound[0].id === "r3" && bound[0].subject.id === conv(1).channelId && bound[0].note === "noisy", `bound: ${show(bound)}`);
+  // The combined rule, by name as before, in notify.
+  const n = await atTime(DAY, () => notify(a.ctx, { items: [{ ref: "#ch2:aaaaaaa2", summary: "s", kind: "review", sender: "@bo" }] }));
+  must(n.state === "nothing_to_send" && n.dropped["#ch2:aaaaaaa2"] === "rule r7", show(n));
+  const k = await atTime(DAY, () => notify(a.ctx, { items: [{ ref: "#ch2:aaaaaaa2", summary: "t", kind: "task" }] }));
+  must(k.state === "nothing_to_send" && k.dropped["#ch2:aaaaaaa2"] === "rule r8", show(k));
+  const added = await pref(a, { action: "add", effect: "mute", kind: "question" });
+  must(added.id === "r9", `ids continue after the kept ones: ${show(added)}`);
+  must((await pref(a, { action: "unmute", id: "r3" })).confirm === "Removed: mute #ch1 (chat only; @mentions still come).", "unmute of a kept rule");
+  must((await pref(a, { action: "remove", all: true })).state === "removed" && show(a.read(ASSISTANT_STORE, "rules")) === "[]", "remove all");
+});
+
+await check("validation: one subject, a known effect, anytime only with always, until in the future and within 90 days, a channel or thread that exists; each refusal traced as a code", async () => {
+  const a = await assistant(raft({ dm: "dm:@ada" }));
+  a.r.all = [conv(1), conv(4, { kind: "thread", channelName: "ch1", channelId: "c0ffee00-0000-4000-8000-0000000000aa", parentChannelId: conv(1).channelId, parentMessageId: "deadbeef-1111-4222-8333-444455556666" })];
+  for (const [args, code] of [
+    [{ action: "add", effect: "mute" }, "scope"], [{ action: "add", effect: "mute", channel: "#ch1", kind: "task" }, "scope"], [{ action: "add", effect: "loud", kind: "task" }, "effect"],
+    [{ action: "add", effect: "digest", kind: "task", anytime: true }, "anytime"], [{ action: "add", effect: "mute", kind: "task", until: "2026-10-19T00:00:00Z" }, "until"],
+    [{ action: "add", effect: "mute", kind: "task", until: "2027-03-01T00:00:00Z" }, "until"], [{ action: "add", effect: "mute", channel: "#nope" }, "channel_unknown"],
+    [{ action: "add", effect: "mute", thread: "#ch1:abcdef12" }, "thread_unknown"], [{ action: "add", effect: "mute", thread: "ch1" }, "thread_ref"],
+    [{ action: "add", effect: "mute", person: "two words" }, "person"], [{ action: "remove", id: "r9" }, "no_such_rule"], [{ action: "dance" }, "action"],
+  ] as const) {
+    const refused = await pref(a, args).then(() => null, (e) => e as Error);
+    must(refused, `accepted: ${show(args)}`);
+    must(a.traced.filter((t) => t.kind === "raft.assistant_rules").at(-1)?.status === `refused:${code}`, `${show(args)}: ${show(a.traced.at(-1))}`);
+  }
+  const thread = await pref(a, { action: "add", effect: "mute", thread: "#ch1:deadbeef" });
+  must(thread.state === "added" && a.read(ASSISTANT_STORE, "rules")[0].subject.id === "c0ffee00-0000-4000-8000-0000000000aa", show(a.read(ASSISTANT_STORE, "rules")));
+  must(thread.confirm === "General chat in the thread #ch1:deadbeef won't notify you anymore; @mentions of you still will.", thread.confirm);
+  for (let n = 0; n < 49; n++) await pref(a, { action: "add", effect: "mute", kind: ITEM_ORDER[n % 6], until: new Date(at(DAY) + (n + 1) * 3_600_000).toISOString() });
+  must((await pref(a, { action: "add", effect: "mute", dms: true }).then(() => null, (e) => e as Error)) !== null, "a 51st rule was kept");
+});
+
+await check("each effect's confirm and list line is written from the stored rule; until is said in the owner's time; an expired rule stops applying and is dropped at the next write", async () => {
+  const zone = "Europe/Berlin", quiet = { from: "22:00", to: "08:00" };
+  const c = (r: ContactRule) => confirmLine(r, { zone, quiet });
+  must(c(rule("r1", "mute", { kind: "dms" })) === "I won't tell you about your DMs anymore.", c(rule("r1", "mute", { kind: "dms" })));
+  must(c(rule("r1", "digest", { kind: "person", id: ANA, type: "human", name: "ana" })) === "@ana goes in your morning brief only.", "digest person");
+  must(c(rule("r1", "always", { kind: "kind", value: "task" }, { anytime: true })) === "I'll tell you right away about tasks assigned to you, nights included.", "always anytime");
+  must(confirmLine(rule("r1", "always", { kind: "dms" }), { zone, quiet: null }) === "I'll tell you right away about your DMs, any time of day.", "always with no quiet hours");
+  const until = rule("r1", "mute", { kind: "channel", id: "C", name: "random" }, { until: "2026-10-20T16:00:00.000Z" });
+  must(c(until) === "General chat in #random won't notify you anymore, until Tue 18:00; @mentions of you still will.", c(until));
+  must(ruleLine(rule("r2", "always", { kind: "person", id: ANA, type: "human", name: "ana" }), zone) === "r2 · always @ana (not at night)", "list line");
+  must(ruleLine(until, zone) === "r1 · mute #random (chat only; @mentions still come) until Tue 18:00", ruleLine(until, zone));
+  const a = await assistant(raft({ dm: "dm:@ada" }));
+  a.r.all = [conv(1)];
+  await pref(a, { action: "add", effect: "mute", channel: "#ch1", until: "2026-10-20T11:00:00.000Z" });
+  a.r.unread = [conv(1)];
+  must((await bell(a)).turn === undefined && lastWake(a).attrs.muted === 1, "control: muted before it ends");
+  a.r.unread = [conv(1, { latestAt: "2026-10-20T11:30:00.000Z" })];
+  must((await bell(a, "2026-10-20T12:00:00Z")).isolated === true, "an expired mute still applied");
+  must((await pref(a, { action: "list" }, "2026-10-20T12:00:00Z")).rules.length === 0, "an expired rule listed");
+  await pref(a, { action: "add", effect: "mute", kind: "task" }, "2026-10-20T12:00:00Z");
+  must(a.read(ASSISTANT_STORE, "rules").length === 1, `the expired rule was kept at the write: ${show(a.read(ASSISTANT_STORE, "rules"))}`);
+});
+
+await check("a person rule code cannot apply yet (no ids on rows): counted person_rule_unenforced on the wake, and given to the check's model to apply", async () => {
+  const a = await assistant(raft({ dm: "dm:@ada" }));
+  a.r.all = [conv(1)];
+  const added = await pref(a, { action: "add", effect: "mute", person: "@cy" });
+  must(added.state === "added" && a.read(ASSISTANT_STORE, "rules")[0].subject.id === null, show(a.read(ASSISTANT_STORE, "rules")));
+  a.r.unread = [conv(1, { latestSenderName: "cy" })];
+  const out = await bell(a);
+  must(out.isolated === true && out.turn.includes(conv(1).channelId), `no id: the row goes to the model: ${show(out)}`);
+  must(/rules about people, which code cannot apply yet, so you do: leave out anything from @cy/.test(out.turn), out.turn);
+  must(lastWake(a).attrs.person_rule_unenforced === 1, show(lastWake(a)));
+  // With ids on the rows and the rule, nothing is left to the model.
+  const b = await assistant(raft({ dm: "dm:@ada" }));
+  b.r.all = [conv(1, { latestSenderName: "cy", latestSenderId: "u-cy" })];
+  await pref(b, { action: "add", effect: "mute", person: "@cy" });
+  b.r.unread = [conv(2, { latestSenderName: "bo", latestSenderId: "u-bo" })];
+  const ok = await bell(b);
+  must(ok.isolated === true && !/rules about people/.test(ok.turn) && !("person_rule_unenforced" in lastWake(b).attrs), show(lastWake(b)));
+  // Two people under one name are not guessed between.
+  const c = await assistant(raft({ dm: "dm:@ada" }));
+  c.r.all = [conv(1, { latestSenderName: "sam", latestSenderId: "u-sam-1" }), conv(2, { latestSenderName: "sam", latestSenderId: "u-sam-2" })];
+  must(/say @sam~human or @sam~agent/.test((await pref(c, { action: "add", effect: "mute", person: "@sam" }).then(() => null, (e) => e as Error))?.message ?? ""), "ambiguous name kept");
+});
+
+await check("what the assistant cites to its owner in chat (\"more\") counts as told: the next wake does not bring it back; a send elsewhere records nothing", async () => {
+  const a = await assistant(raft({ dm: "dm:@ada" }));
+  // An always rule does not make it say a thing twice: facts first.
+  a.r.all = [conv(2)];
+  await pref(a, { action: "add", effect: "always", channel: "#ch2" });
+  const sent = await raftPlugin.invoke("messages_send", { target: "dm:@ada", content: "@p2 needs your OK: #ch2:aaaaaaa2\n@p3 asks for a review: #ch3:AAAAAAA3-1111" }, a.ctx);
+  must(sent && a.r.sends.length === 1, `control: sent ${show(sent)}`);
+  must(a.read(REMINDED_STORE, "msg:aaaaaaa2")?.via === "chat" && a.read(REMINDED_STORE, "msg:aaaaaaa3")?.via === "chat", "cited in chat, not recorded as told");
+  must(a.traced.filter((t) => t.kind === "raft.assistant_chat_told").at(-1)?.attrs.told === 2 && !/ch2|aaaaaaa/.test(show(a.traced.filter((t) => t.kind === "raft.assistant_chat_told"))), show(a.traced));
+  a.r.unread = [conv(2), conv(3), conv(4)];
+  const out = await bell(a);
+  must(out.isolated === true && out.turn.includes(conv(4).channelId) && !out.turn.includes(conv(2).channelId) && !out.turn.includes(conv(3).channelId) && lastWake(a).attrs.told === 2, show(out));
+  // A send that is not to the owner's DM records nothing.
+  await raftPlugin.invoke("messages_send", { target: "#general", content: "see #ch4:aaaaaaa4" }, a.ctx).catch(() => null);
+  must(a.read(REMINDED_STORE, "msg:aaaaaaa4") === undefined, "a send elsewhere was recorded as told");
+  // And notify drops what chat already said.
+  checkRead(a, [conv(2)]);
+  const n = await atTime(DAY, () => notify(a.ctx, { items: [{ ref: "#ch2:aaaaaaa2", summary: "s", kind: "question" }] }));
+  must(n.state === "nothing_to_send" && n.dropped["#ch2:aaaaaaa2"] === "already told", show(n));
+});
+
+await check("items the night held beyond the brief's 3 come back at the next wake; one whose conversation the brief's check did not read, or the owner read meanwhile, does not", async () => {
+  const a = await assistant(raft({ dm: "dm:@ada" }));
+  const evening = "2026-10-20T19:59:00Z"; // 21:59 Berlin: the check runs, its notify lands in quiet hours
+  const old5 = conv(5, { latestAt: "2026-10-19T20:00:00.000Z" });
+  a.r.unread = [conv(1), conv(2), conv(3), conv(4), old5];
+  must((await bell(a, evening)).isolated === true, "control: the evening check");
+  const items = [1, 2, 3, 4, 5].map((n) => ({ ref: `#ch${n}:aaaaaaa${n}`, summary: `@p${n} asks you something`, kind: "question" }));
+  const kept = await atTime("2026-10-20T20:01:00Z", () => notify(a.ctx, { items }));
+  must(kept.state === "kept_for_brief" && kept.kept === 5, show(kept));
+  // Morning: the owner has read #ch5 meanwhile (no longer unread, and quiet for over a day, so not in the brief's reads).
+  a.r.unread = [conv(1), conv(2), conv(3), conv(4)];
+  a.r.all = [conv(1), conv(2), conv(3), conv(4), old5];
+  must((await atTime("2026-10-21T06:00:05Z", () => wake(a.ctx))).turnKey === "assistant.brief", "control: the brief");
+  const brief = await atTime("2026-10-21T06:01:00Z", () => notify(a.ctx, { brief: true, items: [] }));
+  must(brief.state === "sent" && brief.items === 3 && brief.more === 2, show(brief));
+  const reviewed = a.read(ASSISTANT_STORE, REVIEWED_KEY);
+  // `lookAgain` clears only what the brief's check read: #ch4, not #ch5.
+  must(!(conv(4).channelId in reviewed) && conv(5).channelId in reviewed, `reviewed: ${show(reviewed)}`);
+  const next = await bell(a, "2026-10-21T06:10:00Z");
+  must(next.isolated === true && next.turn.includes(conv(4).channelId) && [1, 2, 3, 5].every((n) => !next.turn.includes(conv(n).channelId)), `next: ${show(next)}`);
+  // Even unread again, #ch5's activity is still counted as looked at: it does not come back.
+  a.r.unread = [old5];
+  must((await bell(a, "2026-10-21T06:20:00Z")).turn === undefined && lastWake(a).attrs.seen === 1, show(lastWake(a)));
+});
+
+await check("Raft's person fields: latestSenderType user is a human, a system sender is no person, a DM's other person is peer { id, type }", async () => {
+  const a = await assistant(raft({ dm: "dm:@ada" }));
+  a.r.all = [conv(1, { latestSenderName: "bo", latestSenderId: "u-bo", latestSenderType: "user" }),
+    conv(2, { channelType: "dm", channelName: "kit", peer: { id: "u-kit", type: "agent" }, latestSenderName: "ada", latestSenderId: OWNER, latestSenderType: "user" }),
+    conv(3, { latestSenderName: "deploybot", latestSenderId: "u-sys", latestSenderType: "system" })];
+  await pref(a, { action: "add", effect: "mute", person: "@bo" });
+  await pref(a, { action: "add", effect: "mute", person: "@kit" });
+  await pref(a, { action: "add", effect: "mute", person: "@deploybot" });
+  const kept = a.read(ASSISTANT_STORE, "rules").map((r: any) => [r.subject.name, r.subject.id, r.subject.type]);
+  must(show(kept) === show([["bo", "u-bo", "human"], ["kit", "u-kit", "agent"], ["deploybot", null, null]]), `user→human, the peer object, system ignored: ${show(kept)}`);
+  // On a wake: bo's channel row and kit's DM (whoever wrote last in it) are muted by id; a system row's id matches nothing.
+  a.r.unread = [conv(1, { latestSenderName: "bo", latestSenderId: "u-bo", latestSenderType: "user" }),
+    conv(2, { channelType: "dm", channelName: "kit", peer: { id: "u-kit", type: "agent" }, latestSenderName: "ada", latestSenderId: OWNER, latestSenderType: "user" }),
+    conv(4, { kind: "thread", channelType: "dm", channelName: "kit", parentChannelId: conv(2).channelId, peer: { id: "u-kit", type: "agent" }, latestSenderId: OWNER, latestSenderType: "user" }),
+    conv(3, { latestSenderName: "deploybot", latestSenderId: "u-sys", latestSenderType: "system" })];
+  const out = await bell(a);
+  must(out.isolated === true && out.turn.includes(conv(3).channelId) && [1, 2, 4].every((n) => !out.turn.includes(conv(n).channelId)), show(out));
+  must(lastWake(a).attrs.muted_person === 3 && lastWake(a).attrs.person_rule_unenforced === 1, show(lastWake(a)));
+});
+
+await check("a person named by the owner is resolved by Raft's owner-resolve read at once; its 404 for the name refuses; a Raft without the route falls back to the inbox rows", async () => {
+  const a = await assistant(raft({ dm: "dm:@ada" }));
+  a.r.resolveRoute = true;
+  a.r.people = { "sam~human": { id: "u-sam-1", type: "user", name: "sam" }, ghost: "unknown", bot: { id: "u-sys", type: "system", name: "bot" }, flaky: 500 };
+  const added = await pref(a, { action: "add", effect: "always", person: "@sam~human" });
+  must(added.state === "added" && !("note" in added) && show(a.r.resolves) === show(["sam~human"]) && show(a.r.inboxReads) === "[]", `resolved: ${show(added)} ${show(a.r)}`);
+  must(show(a.read(ASSISTANT_STORE, "rules")[0].subject) === show({ kind: "person", id: "u-sam-1", type: "human", name: "sam" }), show(a.read(ASSISTANT_STORE, "rules")));
+  must(/right away about @sam,/.test(added.confirm), added.confirm);
+  for (const [who, code, said] of [["@ghost", "person_unknown", /can see no one called @ghost/], ["@bot", "person_not_a_person", /not a person/], ["@flaky", "resolve", /try again shortly/]] as const) {
+    const e = await pref(a, { action: "add", effect: "mute", person: who }).then(() => null, (x) => x as Error);
+    must(e && said.test(e.message), `${who}: ${e?.message}`);
+    must(a.traced.filter((t) => t.kind === "raft.assistant_rules").at(-1)?.status === `refused:${code}`, `${who}: ${show(a.traced.at(-1))}`);
+  }
+  must(a.read(ASSISTANT_STORE, "rules").length === 1, "a refused person was kept");
+  // The query names the person: no log line or trace row does.
+  must(!show(a.traced).includes("ghost") && !show(a.traced).includes("u-sam-1"), show(a.traced));
+  // A Raft without the route: the generic 404, and the inbox rows are asked instead.
+  const b = await assistant(raft({ dm: "dm:@ada" }));
+  b.r.all = [conv(1, { latestSenderName: "sam", latestSenderId: "u-sam-1", latestSenderType: "user" })];
+  const fallback = await pref(b, { action: "add", effect: "mute", person: "@sam" });
+  must(fallback.state === "added" && b.r.resolves.length === 0 && b.r.inboxReads.includes("all") && b.read(ASSISTANT_STORE, "rules")[0].subject.id === "u-sam-1", `fallback: ${show(fallback)}`);
+});
+
+await check("privacy: no channel's or person's name or id reaches a trace row or a log line, whatever the rules, wakes and notify calls do", async () => {
+  const CHAN = "zz-secret", PEER = "zz-peer", PEER_ID = "u-zz-peer-0001";
+  const lines: string[] = [];
+  setLogSink((l) => lines.push(l));
+  try {
+    const a = await assistant(raft({ dm: "dm:@ada" }));
+    const secret = conv(1, { channelName: CHAN, latestSenderName: PEER, latestSenderId: PEER_ID, latestPreview: `${PEER} asks` });
+    const dm = conv(2, { channelType: "dm", channelName: PEER, peer: { id: PEER_ID, type: "user" }, latestSenderName: PEER, latestSenderId: PEER_ID, latestSenderType: "user" });
+    a.r.all = [secret, dm];
+    for (const args of [{ action: "add", effect: "mute", channel: `#${CHAN}`, note: `${CHAN} is noise` }, { action: "add", effect: "always", person: `@${PEER}`, anytime: true },
+      { action: "add", effect: "digest", thread: `#${CHAN}:abcdef12` }, { action: "add", effect: "mute", channel: `#${CHAN}-nope` }, { action: "list" },
+      { action: "quiet", from: "23:00", to: "06:00" }, { action: "remove", id: "r1" }, { action: "add", effect: "mute", channel: `#${CHAN}` }]) {
+      await pref(a, args).catch(() => null);
+    }
+    a.r.unread = [secret, dm, conv(3, { channelType: "dm", channelName: "ada-assistant", latestSenderName: "ada-assistant" })];
+    await bell(a);
+    await bell(a, NIGHT);
+    checkRead(a, [secret, dm]);
+    await atTime(DAY, () => notify(a.ctx, { items: [{ ref: `#${CHAN}:aaaaaaa1`, summary: `@${PEER} asks`, kind: "question", sender: `@${PEER}` }, { ref: `#${PEER}:aaaaaaa2`, summary: "x", kind: "question" }] }));
+    await raftPlugin.invoke("messages_send", { target: "dm:@ada", content: `see #${CHAN}:aaaaaaa1` }, a.ctx);
+    const kinds = new Set(a.traced.map((t) => t.kind));
+    must(["raft.assistant_rules", "raft.assistant_wake", "raft.assistant_notify"].every((k) => kinds.has(k)), `control: the rows were written: ${show([...kinds])}`);
+    must(lines.some((l) => l.includes("raft.assistant_rules")) && lines.some((l) => l.includes("raft.assistant_wake")), "control: the log lines were caught");
+    const rulesRow = a.traced.filter((t) => t.kind === "raft.assistant_rules").at(-1);
+    must(rulesRow?.attrs.mute_channel === 1 && rulesRow.attrs.always_person === 1 && Number(rulesRow.attrs.rules_total) >= 2, `counts per effect and subject: ${show(rulesRow)}`);
+    for (const s of [CHAN, PEER, PEER_ID, conv(1).channelId, conv(2).channelId, "ada-assistant"]) {
+      must(!show(a.traced).includes(s), `the trace carries ${s}: ${show(a.traced.filter((t) => show(t).includes(s)))}`);
+      must(!lines.some((l) => l.includes(s)), `a log line carries ${s}: ${show(lines.filter((l) => l.includes(s)))}`);
+    }
+  } finally { setLogSink(null); }
 });
 
 // ---- the doorbell and an inbox that lags it -----------------------------------------------------------------------------
