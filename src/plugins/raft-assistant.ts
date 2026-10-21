@@ -959,6 +959,28 @@ function answered(kept: AssistantReply, dm: string): boolean {
   return kept.sent || kept.asOwner || (owner !== null && kept.dms.some((d) => sameDm(d, owner)));
 }
 
+/**
+ * The notices from Raft that woke the owner's chat (`noteChatNotice`, one row): `last` is the latest one's id, and
+ * `failedTold` the notice a failed turn's line (`FAILED_TURN_LINE`) was last sent for. A turn's end does not say which
+ * message started it, and one owner message can end in more than one failed run: the overflow backstop
+ * (cf/src/runtime.ts `#overflowBackstop`) starts a new run, with a new turn id, for the input of one that failed. So the
+ * line is sent once per notice: never again until a new one arrives. Before any notice (`last` null) only the turn's
+ * own once applies.
+ */
+export const CHAT_NOTICE_KEY = "chat_notice";
+interface ChatNotice { last: string | null; failedTold: string | null }
+
+function chatNoticeOf(v: unknown): ChatNotice {
+  const o = v && typeof v === "object" && !Array.isArray(v) ? v as Record<string, unknown> : {};
+  return { last: typeof o.last === "string" ? o.last : null, failedTold: typeof o.failedTold === "string" ? o.failedTold : null };
+}
+
+/** A notice from Raft delivered to the owner's chat (src/plugins/raft.ts `receiveNotice`): its id is kept as `last`. */
+export async function noteChatNotice(ctx: PluginContext, noticeId: string): Promise<void> {
+  const kept = chatNoticeOf(await ctx.db.get(ASSISTANT_STORE, CHAT_NOTICE_KEY));
+  if (kept.last !== noticeId) await ctx.db.put(ASSISTANT_STORE, { ...kept, last: noticeId } as unknown as Json, CHAT_NOTICE_KEY);
+}
+
 /** What the owner is told when their chat's turn failed before answering them: the code's words, never the model's. */
 export const FAILED_TURN_LINE = "Something went wrong on my side and I couldn't finish that. Ask me again in a bit.";
 
@@ -975,7 +997,7 @@ const OWN_TURN_KEYS: ReadonlySet<string> = new Set(["assistant.check", "assistan
  * it as it holds the model's, and nothing is sent. Nothing either for a completed turn with no text (or only
  * whitespace), one that was cancelled (stopped on purpose), or a turn the assistant's code asked for. A chat turn that
  * failed and answered no one gets `FAILED_TURN_LINE` instead, under the same rules: a fixed line, never the model's
- * partial text. The idempotency key is the turn's, so a second telling of the same end that gets this far is the same
+ * partial text, and once per notice that woke the chat (`CHAT_NOTICE_KEY`). The idempotency key is the turn's, so a second telling of the same end that gets this far is the same
  * send. One `raft.assistant_chat_told` row per send tried, status `reply_fallback`: `reply_fallback` 1 when it was
  * sent, else 0, `result` (`sent`, `held`, `failed` with the error's `code`) and, for a failed turn, `failed_turn` 1;
  * never the text.
@@ -998,6 +1020,11 @@ export async function replyFallback(
     await done();
     return "skipped";
   }
+  const notice = failedTurn ? chatNoticeOf(await ctx.db.get(ASSISTANT_STORE, CHAT_NOTICE_KEY)) : null;
+  if (notice?.last != null && notice.failedTold === notice.last) {
+    await done();
+    return "skipped";
+  }
   const key = `assistant-reply-${createHash("sha256").update(end.turnId).digest("hex").slice(0, 32)}`;
   let result: "sent" | "held" | "failed", code: string | undefined;
   try {
@@ -1010,6 +1037,7 @@ export async function replyFallback(
   const attrs = { reply_fallback: result === "sent" ? 1 : 0, result, ...(code ? { code } : {}), ...(failedTurn ? { failed_turn: 1 } : {}) };
   ctx.trace?.({ kind: "raft.assistant_chat_told", status: "reply_fallback", verdict: result === "sent" ? "ok" : result === "held" ? "blocked" : "failed", attrs });
   logEvent("raft.assistant_reply_fallback", { tenantId: ctx.caller.tenantId, agentId: ctx.caller.agentId, mount: ctx.alias, ...attrs });
+  if (notice?.last != null && result === "sent") await ctx.db.put(ASSISTANT_STORE, { ...notice, failedTold: notice.last } as unknown as Json, CHAT_NOTICE_KEY);
   await done();
   return result;
 }

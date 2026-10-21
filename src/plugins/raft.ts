@@ -25,7 +25,7 @@ import { internalHost } from "./http.ts";
 import {
   ASSISTANT_OWN_TOOLS, ASSISTANT_STORE, CONTACT_KEY, DEFERRED_KEY, NOTIFY_TOOL, OWNER_KEY, PREFERENCES_TOOL, REMINDED_STORE, RULES_KEY, SEND_AS_OWNER_TOOL,
   sendAsOwner, type SendAsOwnerAnswer, assistantWake, assistantWakeInstruction, doorbellOf, isDoorbellTarget, keepOwnerFromContext, learnDm, loadOwner, mergeSources, noteDoorbell,
-  notifyOwner, noteOwnerReply, noteToldInChat, pauseOn, replyFallback, preferences, type PersonResolve, type AssistantOwner, type ChangeSources, type OwnerContext, type OwnerSend,
+  notifyOwner, noteChatNotice, noteOwnerReply, noteToldInChat, pauseOn, replyFallback, preferences, type PersonResolve, type AssistantOwner, type ChangeSources, type OwnerContext, type OwnerSend,
 } from "./raft-assistant.ts";
 import { callMcp, isMcpTool, keptMcpOf, leftOut, listMcp, mcpClock, mcpLines, MCP_CALL_TIMEOUT_MS, MCP_CAPABILITY, MCP_KEY, MCP_PREFIX } from "./raft-mcp.ts";
 import { modelToolName } from "../runtime/pi-tools.ts";
@@ -3605,6 +3605,8 @@ async function receiveNotice(payload: ObjectValue, inbound: InboundEvent, ctx: P
   if (bell && payload.targets.every(isDoorbellTarget)) {
     return { deliver: false, wake: true, reason: "an assistant's doorbell, for its code to check", dedupeKey: payload.noticeId };
   }
+  // The owner's chat is woken by this notice: kept so a failed turn's line is sent once for it (`noteChatNotice`).
+  if (assistant) await noteChatNotice(ctx, payload.noticeId);
   return {
     deliver: true,
     ...(bell ? { wake: true as const } : {}),
