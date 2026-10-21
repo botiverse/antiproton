@@ -132,7 +132,7 @@ await check("a call lost on the way holds the run up for the wall-time budget, n
 
 // Not 暂停不计时: node does not enforce the Worker's cpuMs, so it would pass here whatever the code did.
 const PAUSE_ROWS = new Set(["暂停", "暂停不可吞", "暂停数据", "暂停于审批", "暂停于未等的调用", "其它状态照旧", "统一入口", "单一通道",
-  "暂停续行", "暂停取消", "暂停后的挂起"]);
+  "暂停续行", "暂停取消", "暂停后的挂起", "拒绝告知宿主"]);
 const results = await executorSpec(exec, (row) => PAUSE_ROWS.has(row));
 for (const r of results) console.log(`${r.ok ? "ok " : "FAIL"} ${r.row} ${r.name}${r.error ? ` — ${r.error}` : ""}`);
 for (const r of extra) console.log(`${r.ok ? "ok " : "FAIL"} ${r.row} ${r.name}${r.error ? ` — ${r.error}` : ""}`);

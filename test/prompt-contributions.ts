@@ -10,7 +10,7 @@
 import { SqliteStore } from "../src/store/sqlite.ts";
 import { ToolGateway } from "../src/runtime/gateway.ts";
 import type { Plugin } from "../src/plugins/types.ts";
-import { limitForCall, offloadLimit, parkResult, parkedReader, tooLargeResult, withLimitNote } from "../cf/src/runtime.ts";
+import { limitForCall, mountedToolEntries, offloadLimit, parkResult, parkedReader, tooLargeResult, withLimitNote } from "../cf/src/runtime.ts";
 import { artifactsPlugin } from "../src/plugins/artifacts.ts";
 import { systemPrompt } from "../src/runtime/pi-prompt.ts";
 import { statePlugin } from "../src/plugins/state.ts";
@@ -258,6 +258,45 @@ await check("a page read back from a parked result is not parked again at 4 KB",
   const reader = { name: "artifacts__read", address: "artifacts.read" };
   must(10_000 <= limitForCall("artifacts.read", reader), `a 10 KB page read back must arrive whole (limit ${limitForCall("artifacts.read", reader)})`);
   must(10_000 > limitForCall("http.get", reader), `any other 10 KB result is still parked (limit ${limitForCall("http.get", reader)})`);
+});
+
+await check("the agent's own stored value is returned whole up to the read-back line, not parked at 4 KB", async () => {
+  // Parked, an 8.9 KB playbook read with state.get came back as a preview and a
+  // note, and the agent's next call read the same bytes back whole: one more
+  // model call and nothing kept out of the conversation.
+  const reader = { name: "artifacts__read", address: "artifacts.read" };
+  const playbook = 8_868;
+  must(playbook <= limitForCall("state.get", reader, "own-state"), `an 8.9 KB own value must arrive whole (limit ${limitForCall("state.get", reader, "own-state")})`);
+  must(limitForCall("state.get", reader, "own-state") === limitForCall("artifacts.read", reader),
+    "the own-state line is the reader's line, not a third number");
+  // The declaration is what widens it, not the address: an undeclared tool at the same address, and any other tool, park.
+  must(playbook > limitForCall("state.get", reader), `state.get without its declaration is parked (limit ${limitForCall("state.get", reader)})`);
+  must(playbook > limitForCall("http.get", reader, undefined), "an undeclared tool's 8.9 KB result is still parked");
+  // secret_get is held to the parking line by name, even were it to declare own-state, under any mount alias.
+  for (const address of ["state.secret_get", "my-state.secret_get"]) {
+    must(limitForCall(address, reader, "own-state") === limitForCall("http.get", reader), `${address} got the own-state line (limit ${limitForCall(address, reader, "own-state")})`);
+  }
+  must(limitForCall("my-state.get", reader, "own-state") === limitForCall("artifacts.read", reader), "control: a declared get under another alias is widened");
+  // Without a reader nothing parks, so the declaration changes nothing there.
+  must(limitForCall("state.get", null, "own-state") === offloadLimit(null), "without a reader the line is the one it always was");
+
+  // The descriptions follow the lines: state.get is told the read-back line, every other tool the parking line.
+  const tools = [
+    { name: "gh__api_get", address: "gh.api_get", description: "Read any GitHub REST endpoint." },
+    { name: "state__get", address: "state.get", description: "Read a key back.", reads: "own-state" },
+  ];
+  const noted = withLimitNote(tools, reader);
+  must(noted[0]!.description.includes(`over ${offloadLimit("artifacts__read") / 1024} KB`), `gh: ${noted[0]!.description}`);
+  must(noted[1]!.description.includes(`over ${offloadLimit(null) / 1024} KB`), `state.get: ${noted[1]!.description}`);
+
+  // And the real plugin declares it, on `get` alone: a secret is not a value to put in the conversation whole, and
+  // everything above is about fixtures, which pass whatever the plugin says.
+  const declaring = statePlugin(null as any, null as any, "local").tools.filter((t) => t.reads === "own-state").map((t) => t.name);
+  must(JSON.stringify(declaring) === JSON.stringify(["get"]), `state must declare own-state on get alone, got ${JSON.stringify(declaring)}`);
+  // Carried to the offered tool the call site looks it up on, by address, under whatever alias the mount has.
+  const state = statePlugin(null as any, null as any, "local");
+  const entries = mountedToolEntries([{ alias: "notes", plugin: state.id } as any], new Map([[state.id, state]]));
+  must(entries.find((e) => e.address === "notes.get")?.reads === "own-state", `not carried: ${JSON.stringify(entries.map((e) => [e.address, e.reads]))}`);
 });
 
 await check("run_js' missing fetch is stated as run_js' own, not as true of every place code runs", async () => {

@@ -64,8 +64,9 @@ export interface MountedTool {
   /** Carried from {@link ToolSchema}: this tool can hand back a result the
    *  runtime parked. Carried rather than re-derived, because the runtime used
    *  to find the reader by rebuilding the string `artifacts` + `.read`, which
-   *  a rename of either silently broke. */
-  reads?: "parked-result";
+   *  a rename of either silently broke. `"own-state"`: it reads the agent's
+   *  own stored values, which the runtime holds to the read-back line. */
+  reads?: "parked-result" | "own-state";
   /** Carried from {@link ToolSchema}: `"never"` overrides everything else
    *  `replayPolicy` would conclude. */
   replay?: "never";
@@ -429,7 +430,7 @@ async function cancelQuietly(host: ToolHost, i: ToolInterrupt): Promise<string |
  * lost must not be repeated on the agent's behalf.
  */
 export interface Sandbox {
-  execute(source: string, host: { invoke(call: any): Promise<any> }, limits?: unknown): Promise<{
+  execute(source: string, host: { invoke(call: any): Promise<any>; refused?(call: { tool: string | null; code: string }): void }, limits?: unknown): Promise<{
     /** An execution's own vocabulary (`ExecutionResult`), which is not a tool
      *  call's. A `string` here let this tool test for a tool call's
      *  "succeeded" — a word no executor has ever returned — so every script
@@ -935,6 +936,10 @@ export function runJsTool(
      *  name their tools (a session older than the change), and the truthful
      *  answer is the reason, not "no such tool, try a neighbour". */
     unoffered?: Array<{ alias: string; plugin: string; reason: "switched_off" | "plugin_unavailable" }>;
+    /** A program's host call refused before it reached the gateway: here, on the model's behalf, or by the executor
+     *  (`ExecutorHost.refused`). For its `tool.refused` trace row; at most REFUSALS_TOLD a run (gateway refusals are the
+     *  gateway's own rows, bounded by the host-call budget instead), and never awaited. */
+    onRefused?: (r: { tool: string | null; code: string; callId: string; by: "run_js" | "executor" }) => void;
   } = {},
 ): AgentHarnessTool<undefined> {
   let seq = 0;
@@ -995,12 +1000,25 @@ export function runJsTool(
       const countRun = async (run: RunEnd) => {
         try { await opts.onRun?.(run); } catch { /* the count is lost, the run is not */ }
       };
+      // The refusals the gateway never sees, told for the trace; the gateway writes its own (`ToolGateway.#refused`).
+      let told = 0;
+      const tell = (tool: unknown, code: string, by: "run_js" | "executor") => {
+        if (told >= REFUSALS_TOLD) return;
+        told++;
+        try { opts.onRefused?.({ tool: typeof tool === "string" ? tool : null, code, callId: toolCallId, by }); }
+        catch { /* the row is lost, the run is not */ }
+      };
       let r: Awaited<ReturnType<Sandbox["execute"]>>;
       try {
         r = await sandbox.execute(String(params.source), {
+        refused: (c: { tool: string | null; code: string }) => tell(c.tool, c.code, "executor"),
         // A stable key per call inside one execution, so a repeat reaches the
         // same operation rather than minting a new one.
         invoke: (call: any) => {
+          const refuse = <R extends { status: "rejected"; error: { code: string } }>(res: R) => {
+            tell(call.tool, res.error.code, "run_js");
+            return Promise.resolve(res);
+          };
           // A name in the model's own form (no dot) that is not in its list is
           // answered here, where that list is known. Passed on, the gateway —
           // which only speaks addresses — called it "not a tool name", though
@@ -1011,7 +1029,7 @@ export function runJsTool(
           // A pause asks the model, so only the model answers it: a program that
           // could call resume could take the decision it was stopping to ask for.
           if (call.tool === "resume") {
-            return Promise.resolve({
+            return refuse({
               status: "rejected" as const,
               error: { code: "not_from_a_program", message: "resume is yours to call, not a program's: a program cannot resume or cancel a paused run" },
             });
@@ -1023,7 +1041,7 @@ export function runJsTool(
             const owner = aliasOf(call.tool);
             const u = owner === null || offeredAliases.has(owner) ? undefined : unoffered.get(owner);
             if (u !== undefined) {
-              return Promise.resolve({
+              return refuse({
                 status: "rejected" as const,
                 error: u.reason === "switched_off"
                   ? { code: "plugin_disabled", message: switchedOffMessage(u.alias) }
@@ -1035,7 +1053,7 @@ export function runJsTool(
             // same way turn after turn. Say the list is empty, so the next move
             // is to do the work in the script (Piper, Dora, 2026-09-13).
             if (offered.length === 0) {
-              return Promise.resolve({
+              return refuse({
                 status: "rejected" as const,
                 error: {
                   code: "no_tools",
@@ -1047,7 +1065,7 @@ export function runJsTool(
             // message is what reaches the model on every path, while the field
             // is only seen if the script prints it (Dora).
             const candidates = closestNames(call.tool, offered);
-            return Promise.resolve({
+            return refuse({
               status: "rejected" as const,
               error: {
                 code: "unknown_tool",
@@ -1064,7 +1082,7 @@ export function runJsTool(
           // what holds the line (`fromProgram` below), since only it resolves every name a program can write;
           // this is the early answer for a name the model was offered, in the model's own words.
           if (target?.modelOnly) {
-            return Promise.resolve({
+            return refuse({
               status: "rejected" as const,
               error: {
                 code: "not_from_a_program",
@@ -1121,6 +1139,18 @@ export function runJsTool(
     },
   } as AgentHarnessTool<undefined>;
 }
+
+/**
+ * How many of one run's refused calls are told for the trace (`onRefused`). A program that loops past its host-call
+ * budget is refused on every turn of the loop until its wall time ends; the first few say what happened, and the
+ * run's own `js.run` row says how it ended.
+ *
+ * It counts only the refusals run_js and the executor tell (`by: "run_js"`, `"executor"`). A program's call the gateway
+ * refuses has its row written by the gateway (`ToolGateway.#refused`) and is not counted here; it reached the gateway
+ * as a host call, though, and each host call counts against the run's budget (`maxHostCalls`, 64, src/core/execution.ts)
+ * before it is made, so one run writes at most 64 gateway rows and 16 of these: 80 tool.refused rows in all.
+ */
+const REFUSALS_TOLD = 16;
 
 /**
  * The offered names a mistyped one most likely meant, best first, at most ten.

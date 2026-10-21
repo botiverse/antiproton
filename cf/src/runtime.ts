@@ -43,7 +43,7 @@ import {
   withholdTools,
   refuseWithheld, type RunEnd,
 } from "../../src/runtime/pi-tools.ts";
-import { jsRunRow } from "../../src/trace/seams.ts";
+import { jsRunRow, modelAttemptRow, toolRefusedRow } from "../../src/trace/seams.ts";
 import { agentDeletedAt, logTurnStop, markAgentDeleted, turnStopRow, type StopTrigger, type StopTurnOutcome } from "../../src/runtime/turn-stop.ts";
 import { explainUnavailableTool } from "../../src/runtime/unavailable-tool.ts";
 import {
@@ -444,12 +444,29 @@ export function offloadLimit(readBack: string | null): number {
  * is held to the line where nothing parks instead; a page bigger than that is
  * still parked, and fewer fields or a smaller limit reads it.
  *
+ * A tool that returns the agent's own stored value (`reads: "own-state"`,
+ * state's `get`) is held to the same line. The parking line keeps the
+ * conversation small by leaving out what the agent may never read; a value
+ * the agent asked for by its key is one it is about to read, and parked it is
+ * read back whole through the reader anyway, so the conversation is no smaller
+ * and the agent has paid one more model call for it (an onboarding agent's
+ * playbook and FAQ, 2026-10-20). Only that declaration widens the line: any
+ * other tool's result, however small the step to read it back, stays at 4 KiB.
+ *
  * Compared by address, because that is what reaches the host: both the
- * bridge and run_js resolve the offered name before they invoke.
+ * bridge and run_js resolve the offered name before they invoke. `reads` is
+ * the called tool's own declaration, found by that address.
+ *
+ * `secret_get` never gets the wider line, whatever it declares (`NEVER_OWN_STATE`): a secret's value is the one stored
+ * value that must not sit in the conversation any longer than it has to, and a declaration added to it by mistake (it
+ * lives beside state.get in the same plugin) must not be what decides that.
  */
-export function limitForCall(tool: string, reader: { name: string; address: string } | null): number {
-  return reader && tool === reader.address ? offloadLimit(null) : offloadLimit(reader?.name ?? null);
+export function limitForCall(tool: string, reader: { name: string; address: string } | null, reads?: string): number {
+  const ownState = reads === "own-state" && !NEVER_OWN_STATE.has(tool.slice(tool.lastIndexOf(".") + 1));
+  return reader && (tool === reader.address || ownState) ? offloadLimit(null) : offloadLimit(reader?.name ?? null);
 }
+/** Tools, by bare name, held to the parking line even when they declare `reads: "own-state"` (`limitForCall`). */
+const NEVER_OWN_STATE: ReadonlySet<string> = new Set(["secret_get"]);
 
 /**
  * What the model gets instead of a result too big to put in the conversation.
@@ -573,16 +590,17 @@ export function parkedReader(tools: MountedTool[]): { name: string; address: str
   return t ? { name: t.name, address: t.address } : null;
 }
 
-export function withLimitNote<T extends { description: string; address: string }>(
+export function withLimitNote<T extends { description: string; address: string; reads?: string }>(
   tools: T[],
   reader: { name: string; address: string } | null,
 ): T[] {
-  const kb = offloadLimit(reader?.name ?? null) / 1024;
-  const sentence = reader
+  // Each tool's own line (`limitForCall`), so a tool held to the read-back line is not told the parking line.
+  const sentence = (kb: number) => reader
     ? ` A result over ${kb} KB comes back as a summary (preview) and a note with the ${reader.name} call that reads all of it.`
     : ` A result over ${kb} KB comes back as a summary (preview); the rest is discarded.`;
   return tools.map((t) =>
-    reader && t.address === reader.address ? t : { ...t, description: `${t.description ?? ""}${sentence}` });
+    reader && t.address === reader.address ? t
+      : { ...t, description: `${t.description ?? ""}${sentence(limitForCall(t.address, reader, t.reads) / 1024)}` });
 }
 
 /**
@@ -2412,7 +2430,7 @@ export class AgentRuntime {
         // parked result as to a whole one. A result without the field is decided on exactly as before.
         const { view, rest } = splitView(res.result);
         const body = JSON.stringify(rest);
-        const limit = limitForCall(call.tool, reader);
+        const limit = limitForCall(call.tool, reader, offered.find((t) => t.address === call.tool)?.reads);
         if (body.length <= limit) return res;
         // What a personal assistant reads of its owner's Raft is never stored outside its conversation with them: cut,
         // never parked, whatever reader is mounted (src/plugins/raft-assistant.ts `isOwnerReadAddress`).
@@ -3486,6 +3504,16 @@ export class AgentRuntime {
         // resume beside run_js answers its programs and every tool's question.
         ? runJsTools(this.#executor as any, host, {
             ...counting,
+            // A program's call refused before the gateway saw it, which writes no `tool.call` row and, without this, nothing.
+            // A reading, as `js.run` is: a failure to write it is logged only.
+            onRefused: (r) => {
+              try {
+                appendTrace(this.#deps.ctx.storage.sql, [toolRefusedRow({
+                  tenantId, agentId, at: Date.now(), tool: r.tool, code: r.code, callId: r.callId, by: r.by, fromProgram: true,
+                  task: session === MAIN_SESSION ? LEGACY_TASK : session,
+                })]);
+              } catch (e) { console.error(`the tool.refused row of ${tenantId}/${agentId} could not be written:`, e); }
+            },
             // So a script names a tool the way the model's own list names it.
             tools: offered,
             // So a stale name for a mount that cannot be offered is answered with
@@ -6318,6 +6346,22 @@ export class AgentRuntime {
     await this.ready();
     try { return recordImageAttempt(this.#deps.ctx.storage.sql, jobId, attempt); }
     catch (e) { console.error(`recording the image evidence of ${jobId} failed:`, e); return false; }
+  }
+
+  /**
+   * One queued attempt at the call `jobId` that failed and goes back to the queue, from the consumer
+   * (cf/src/model-queue.ts `FailedAttempt`): a `model.attempt` trace row (`modelAttemptRow`), whose fields are checked
+   * there. For this object's own agent only, which the object checks before it asks. A failure is logged and answered
+   * false: the row never fails the retry it describes, and the consumer waits on it at most ATTEMPT_TRACE_BOUND_MS
+   * (cf/src/model-queue.ts) before retrying without it.
+   */
+  async recordModelAttempt(tenantId: string, agentId: string, jobId: string, attempt: unknown): Promise<boolean> {
+    if (typeof jobId !== "string" || !jobId || !attempt || typeof attempt !== "object") return false;
+    await this.ready();
+    try {
+      appendTrace(this.#deps.ctx.storage.sql, [modelAttemptRow({ tenantId, agentId, jobId, at: Date.now() }, attempt as Record<string, unknown>)]);
+      return true;
+    } catch (e) { console.error(`recording the failed attempt of ${jobId} failed:`, e); return false; }
   }
 
   /**

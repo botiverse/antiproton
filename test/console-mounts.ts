@@ -133,6 +133,17 @@ await check("only mcp declares readsOwnerSecrets, the grant the gateway reads", 
   must(show(granted) === show(["mcp.ts"]), `plugins that declare readsOwnerSecrets: ${show(granted)}`);
 });
 
+// The runtime trusts the declaration and lifts the parking line for it (cf/src/runtime.ts `limitForCall`), without
+// looking at what the tool returns: so only the agent's own stored values may claim it.
+await check("only state.get declares reads: own-state, the line limitForCall lifts", async () => {
+  const declared = await pluginFilesMatching(/reads\s*:\s*"own-state"/);
+  must(show(declared) === show(["state.ts"]), `plugins that declare reads: "own-state": ${show(declared)}`);
+  const { readFileSync } = await import("node:fs");
+  const src = readFileSync(new URL("state.ts", pluginsDir), "utf8");
+  const count = src.match(/reads\s*:\s*"own-state"/g)?.length ?? 0;
+  must(count === 1, `state.ts declares reads: "own-state" ${count} times; only get may`);
+});
+
 await check("only statePlugin is handed the sealing key or the secret resolver, only it and builtin the raw store, and state.ts never names the owner's prefix", async () => {
   // The key, not an import, is what decrypts: read where the deployment hands it out.
   const entries = await deployedPluginEntries();

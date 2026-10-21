@@ -67,6 +67,14 @@ const TABLE = "CREATE TABLE IF NOT EXISTS trace_outbox(" +
 // import lifted it, `valve` when no import came in time and it lifted on its own. Activity and status skip it.
 // `model.prewarm` is the prompt-cache prewarm after an import (src/runtime/prewarm.ts): `warmed`, `skipped` or
 // `failed`, with its tokens. Activity and status skip it.
+// `tool.refused` is one host call refused before an operation existed, by the gateway, by run_js or by the executor
+// running a program (`toolRefusedRow`, src/trace/seams.ts): `status` the refusal's code, `attrs` the name the caller
+// wrote, the code, who refused it and whether a program made the call; never its arguments. A call refused after its
+// operation was recorded (a policy's denial) has its `tool.call` row instead. Activity and status skip it.
+// `model.attempt` is one queued model call's attempt that failed and was sent back to the queue (cf/src/model-queue.ts,
+// `modelAttemptRow` in src/trace/seams.ts): its span the job, `attrs` the delivery number, the step that failed, the
+// outcome as an HTTP status, a timeout or an error's class, and the provider's time; never the error's text. The job's
+// `model.call` row still closes it. Activity and status skip it.
 // `agent.ready` is a provisioned agent ready before its first turn, once per agent (src/runtime/ready.ts): its status
 // is `online`, a status-only activity event.
 // `mount.settings` is an operator's in-place change of a mount's settings (`PATCH /admin/mounts`, cf/src/runtime.ts
@@ -89,7 +97,7 @@ const TABLE = "CREATE TABLE IF NOT EXISTS trace_outbox(" +
 // status skip them. `raft.state_save_failed` is no longer written (it is `raft.state_failed` now) and stays here only so
 // a row of that kind still in an outbox is drained and read as a row, not dropped as damage.
 export const TRACE_KINDS = ["model.call", "tool.call", "approval.wait", "container.lease", "inbound", "mount.seeded", "harness.open",
-  "turn.stop", "js.run",
+  "turn.stop", "js.run", "tool.refused", "model.attempt",
   "rebuild.decision", "rebuild.outcome", "rebuild.behaviour", "session.needs_reset", "turn.timing", "turn.end_unrecorded", "import.hold", "model.prewarm",
   "agent.ready", "mount.settings", "subagent.start", "subagent.turn", "subagent.model_changed", "github.refresh", "raft.held", "raft.held_answer", "raft.state_failed", "raft.state_save_failed", "raft.mcp_call",
   "raft.assistant_wake", "raft.assistant_notify", "raft.assistant_rules", "raft.assistant_chat_told", "raft.assistant_send_as_owner", "raft.turn_ended", "raft.assistant_check"] as const;

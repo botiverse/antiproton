@@ -226,6 +226,38 @@ export function modelCallRow(m: {
 }
 
 /**
+ * The model.attempt row for one provider attempt that failed and is retried by the queue (cf/src/model-queue.ts
+ * `FailedAttempt`). Its span is the job, so it joins `pi_model_jobs` and sits beside the `model.call` row the job's
+ * final answer writes; a job retried twice has two of these and one `model.call`. Built from what came over the RPC,
+ * so each field is checked rather than trusted: a phase or outcome outside the vocabulary, a status that is not an
+ * HTTP status, a class that is not an identifier, is left out. No message, ever: a provider's error message carries
+ * its response body.
+ */
+export function modelAttemptRow(o: { tenantId: string; agentId: string; jobId: string; at: number }, a: Record<string, unknown>): TraceRow {
+  const num = (v: unknown) => typeof v === "number" && Number.isFinite(v) && v >= 0 ? Math.round(v) : undefined;
+  const oneOf = <T extends string>(v: unknown, set: readonly T[]) => set.find((x) => x === v);
+  const phase = oneOf(a.phase, ["take", "admit", "call", "deliver"] as const);
+  const outcome = oneOf(a.outcome, ["http", "timeout", "transport_error"] as const);
+  const attempt = typeof a.attempt === "number" && Number.isInteger(a.attempt) && a.attempt > 0 ? a.attempt : undefined;
+  const http = typeof a.httpStatus === "number" && Number.isInteger(a.httpStatus) && a.httpStatus >= 100 && a.httpStatus <= 599 ? a.httpStatus : undefined;
+  const errorClass = typeof a.errorClass === "string" && /^[A-Za-z_$][A-Za-z0-9_$]{0,63}$/.test(a.errorClass) ? a.errorClass : undefined;
+  const model = typeof a.model === "string" && /^[A-Za-z0-9._:/@-]{1,120}$/.test(a.model) ? a.model : undefined;
+  const ms = num(a.ms), providerMs = num(a.providerMs);
+  return {
+    at: o.at, tenantId: o.tenantId, agentId: o.agentId,
+    kind: "model.attempt", spanId: o.jobId,
+    // The queue's decision, verbatim: this attempt is over and the message goes back for another.
+    status: "retried", verdict: "failed",
+    ...(ms === undefined ? {} : { ms }),
+    attrs: {
+      ...(attempt === undefined ? {} : { attempt }), ...(phase ? { phase } : {}), ...(outcome ? { outcome } : {}),
+      ...(http === undefined ? {} : { httpStatus: http }), ...(errorClass ? { errorClass } : {}),
+      ...(providerMs === undefined ? {} : { providerMs }), ...(model ? { model } : {}),
+    },
+  };
+}
+
+/**
  * The name of the first tool call in an answer's content, as the model called it (`raft__messages_resolve`, `run_js`),
  * or null when it asked for none. A `run_js` call is named as itself: which host tools its program will call is in the
  * program, and reading it out of the source would be a guess.
@@ -324,5 +356,70 @@ export function jsRunRow(o: {
     status, verdict: o.run.code === "cancelled" ? "cancelled" : o.run.ok ? "ok" : "failed",
     ms: Math.max(0, o.run.ms),
     attrs: { ...(o.run.code ? { code: o.run.code } : {}), hostCalls: o.run.hostCalls, session: o.session, ...(o.run.resumed ? { resumed: true } : {}) },
+  };
+}
+
+/** A tool name as a caller may write one: an address (`gh.api_get`) or the model's form (`gh__api_get`). */
+const REFUSED_TOOL = /^[A-Za-z0-9_.:-]{1,128}$/;
+/**
+ * A credential's shape anywhere in a tool name: the token prefixes `redactCredentialShapes` knows, after the start or
+ * any character that is not a letter or digit (`_`, `.`, `-`, `:` included). `redactCredentialShapes` wants a word
+ * boundary before them, which `_` is not, so `x_ghp_…` passed it as a name.
+ */
+const NAME_TOKEN = /(?:^|[^A-Za-z0-9])(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{16,}|sk_(?:agent|machine|computer|daemon)_[A-Za-z0-9_-]{16,}|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|eyJ[A-Za-z0-9_-]{10,}|rmc\.[A-Za-z0-9._-]{10,})/;
+/**
+ * An opaque run inside a name: 32 or more hex digits, or 24 or more letters and digits with a digit among them, with
+ * no separator between. A tool's own name is words joined by `_`, `.` or `-` (`list_pull_request_review_comments`), so
+ * it never has one; a key, a hash or a token does.
+ */
+function opaqueRun(name: string): boolean {
+  if (/[0-9a-f]{32,}/i.test(name)) return true;
+  return (name.match(/[A-Za-z0-9]{24,}/g) ?? []).some((run) => /[0-9]/.test(run));
+}
+/** Whether a name a refused call was made by may be written: shaped like a name, and carrying nothing shaped like a credential. */
+export function refusedToolName(name: unknown): string | null {
+  if (typeof name !== "string" || !REFUSED_TOOL.test(name)) return null;
+  if (NAME_TOKEN.test(name) || opaqueRun(name)) return null;
+  // Whatever else the shared redaction recognizes (a placeholder, `key=value`); its `<blob>` is not used here, since a
+  // long name of words is a blob to it (an MCP tool's often is), and `opaqueRun` is the narrower test for that.
+  return /<(secret|redacted|placeholder)>/.test(redactCredentialShapes(name)) ? null : name;
+}
+
+/**
+ * The tool.refused row for a host call refused before an operation existed: by the gateway (a name that resolves to no
+ * mount, a mount switched off, a tool the mount does not have, a model-only tool from a program: src/runtime/gateway.ts
+ * `#refused`), by run_js on the model's behalf (src/runtime/pi-tools.ts `runJsTool`), or by the executor itself (a
+ * template that does not parse, the host-call budget: `ExecutorHost.refused`, src/core/execution.ts). A refused call
+ * that had an operation already has its `tool.call` row, ended `rejected`; these had none, so before this nothing in the
+ * trace said they were made (three in an onboarding agent's turn, 2026-10-20, whose reason no record kept).
+ *
+ * The name the caller wrote and the refusal's code, and nothing the caller passed: no arguments, no values, not the
+ * refusal's sentence, which can quote the name back inside other words. A name or code that is not shaped like one is
+ * left out, and so is a name shaped like a credential, so a program cannot write a value into the row by calling a
+ * tool named after it. Its span is the model's
+ * call, as `js.run`'s is, so a program's refusals sit under its run.
+ */
+export function toolRefusedRow(o: {
+  tenantId: string; agentId: string; at: number;
+  tool: string | null; code: string;
+  /** The model's call this one serves: the run_js call for a program's, the call itself for the model's own. */
+  callId?: string | null;
+  /** Who refused it: the gateway, run_js, or the executor running the program. */
+  by: "gateway" | "run_js" | "executor";
+  /** The call came from a run_js program rather than from the model directly. */
+  fromProgram: boolean;
+  /** The task the call was made under, as a `tool.call` row names it (`task`), when the writer knows it. */
+  task?: string | null;
+}): TraceRow {
+  const code = ERROR_CODE.test(o.code) ? o.code : "refused";
+  const tool = refusedToolName(o.tool);
+  return {
+    at: o.at, tenantId: o.tenantId, agentId: o.agentId, kind: "tool.refused",
+    spanId: o.callId || `refused_${o.at}`,
+    status: code, verdict: "blocked",
+    attrs: {
+      ...(tool ? { tool } : {}), code, by: o.by, from: o.fromProgram ? "program" : "model",
+      ...(o.callId ? { callId: o.callId } : {}), ...(o.task ? { task: o.task } : {}),
+    },
   };
 }

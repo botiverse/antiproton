@@ -1,7 +1,7 @@
 import { parseTemplateCall } from "../core/tools.ts";
 import type { ToolResult } from "../core/tools.ts";
 import type { Json } from "../core/types.ts";
-import { CANCELLED_NAME, DEFAULT_LIMITS, PAUSE_FACTORY, holdFrom, pauseFrom } from "../core/execution.ts";
+import { CANCELLED_NAME, DEFAULT_LIMITS, PAUSE_FACTORY, holdFrom, pauseFrom, tellRefused } from "../core/execution.ts";
 import type { Continuation, ExecutionLimits, ExecutionResult, ExecutorHost, HeldCall, JsExecutor, Paused } from "../core/execution.ts";
 
 export interface WorkerCode {
@@ -96,14 +96,19 @@ export async function handleSandboxCall(
     return { status: "rejected", error: { code: "execution_paused", message: `run_js paused: ${state.hold.reason}` } };
   }
   const parsed = parseTemplateCall(strings, values);
-  if ("error" in parsed) return { status: "rejected", error: parsed.error };
+  if ("error" in parsed) {
+    tellRefused(state.host, strings[0]?.trim() || null, parsed.error.code);
+    return { status: "rejected", error: parsed.error };
+  }
   if (state.hostCalls >= state.limits.maxHostCalls) {
+    tellRefused(state.host, parsed.name, "host_call_budget_exceeded");
     return {
       status: "rejected",
       error: { code: "host_call_budget_exceeded", message: `limit ${state.limits.maxHostCalls}` },
     };
   }
   if (state.inFlight >= state.limits.maxConcurrentHostCalls) {
+    tellRefused(state.host, parsed.name, "too_many_concurrent_calls");
     return {
       status: "rejected",
       error: { code: "too_many_concurrent_calls", message: `limit ${state.limits.maxConcurrentHostCalls}` },

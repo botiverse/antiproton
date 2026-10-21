@@ -761,6 +761,16 @@ export class AgentDO extends DurableObject<Env> {
     catch (e) { console.error(`recording the image evidence of ${jobId} failed:`, e); return false; }
   }
 
+  /**
+   * One failed attempt from the queue consumer (cf/src/model-queue.ts `FailedAttempt`), as a trace row, for this object's
+   * own agent only. Never throws: the consumer's retry must not fail on its record.
+   */
+  async recordModelAttempt(tenantId: string, agentId: string, jobId: string, attempt: unknown): Promise<boolean> {
+    if (!this.#isAgent(tenantId, agentId)) return false;
+    try { return await this.#activeRuntime().recordModelAttempt(tenantId, agentId, jobId, attempt); }
+    catch (e) { console.error(`recording the failed attempt of ${jobId} failed:`, e); return false; }
+  }
+
   /** A taker's failed call gives its take back, so the queue's retry can take the job (cf/src/model-queue.ts). */
   async releaseJob(tenantId: string, agentId: string, jobId: string, taker: string) {
     return replyingUnknownJob(() => this.#activeRuntime().releaseJob(tenantId, agentId, jobId, taker));
