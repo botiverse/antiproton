@@ -109,6 +109,19 @@ await check("a program's calls refused before any operation existed each leave a
   must(!activityEvents("a", rows).length, "tool.refused rows became activity events");
 });
 
+await check("a program refused in a loop leaves at most 16 tool.refused rows from run_js, and still runs to its end", async () => {
+  // A program looping past refusals is refused on every iteration; the trace keeps the first 16 (REFUSALS_TOLD).
+  const source = `const codes = [];
+    for (let k = 0; k < 40; k++) { const a = await tool\`ghost__read \${ { k } }\`; codes.push(a.error.code); }
+    output(codes.length);`;
+  const { host, i } = await drive([runJs(0, source), say("done")]);
+  must(i === 2, `the turn did not run its script: ${i} calls`);
+  const all = pendingTrace(host.sql as any, 0).rows;
+  const rows = all.filter((r) => r.kind === "tool.refused" && r.attrs.by === "run_js");
+  must(rows.length === 16, `run_js tool.refused rows: ${rows.length}`);
+  must(all.find((r) => r.kind === "js.run")?.status === "completed", `js.run: ${show(all.find((r) => r.kind === "js.run"))}`);
+});
+
 await check("tool.refused keeps a name only when it is shaped like one and not like a credential", async () => {
   const at = 1;
   const row = (tool: string | null, code = "unknown_tool") =>
