@@ -276,8 +276,7 @@ export interface AssistantOwner {
   /** Whether a brief has asked the owner for their time zone, which it does once while none is known. */
   askedTimezone: boolean;
   /**
-   * The owner's name or handle as Raft gives it (`assistantOf.name`, else `assistantOf.handle`: requested, not in SDK
-   * 0.25.0, read when present), or null. Only with it can code tell a channel's general chat from a message that names
+   * The owner's handle as Raft gives it (`assistantOf.name`, typed since SDK 0.26.0; null on older Servers), or null. Only with it can code tell a channel's general chat from a message that names
    * the owner without an @, so `default_chatter` is dropped in code only while it is known (`prefilter`).
    */
   ownerName: string | null;
@@ -355,9 +354,10 @@ export async function keepOwnerFromContext(ctx: PluginContext, context: OwnerCon
   // Raft's DM target and zone (SDK 0.25.0 types both, null until known and on older Servers). Each is still checked
   // here: the contract says a string, not a zone `Intl` knows or a DM target this tool can send to.
   const dm = of.dmTarget && DM_TARGET.test(of.dmTarget.trim()) ? of.dmTarget.trim() : null;
-  // Fields Raft may add to `assistantOf` (the SDK keeps unknown fields): the owner's name or handle, when it is text.
+  // The owner's handle (SDK 0.26.0 types `name`, without `@`; null on older Servers), when it is usable text.
+  const name = typeof of.name === "string" && of.name.trim().length > 0 && of.name.trim().length <= 64 ? of.name.trim().replace(/^@/, "") : null;
+  // `raftCheck` is not typed by the SDK yet (it keeps unknown fields).
   const extra = of as Record<string, unknown>;
-  const name = [extra.name, extra.handle].find((v): v is string => typeof v === "string" && v.trim().length > 0 && v.trim().length <= 64)?.trim().replace(/^@/, "") ?? null;
   const owner: AssistantOwner = {
     userId: of.userId, timezone: validZone(of.timezone ?? null), statedTimezone: same?.statedTimezone ?? null,
     serverId: context.server.id, pausedAt: null,
@@ -400,7 +400,7 @@ export async function noteMode(ctx: PluginContext, owner: AssistantOwner, raftCh
 
 /** The part of the credential context (`routes.agent.context`) the owner is kept from. */
 export interface OwnerContext {
-  agent: { name?: string; assistantOf?: (Pick<RaftAssistantOf, "userId"> & Partial<Pick<RaftAssistantOf, "timezone" | "dmTarget">>) | null };
+  agent: { name?: string; assistantOf?: (Pick<RaftAssistantOf, "userId"> & Partial<Pick<RaftAssistantOf, "name" | "timezone" | "dmTarget">>) | null };
   server: { id: string };
 }
 
