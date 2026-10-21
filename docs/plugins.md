@@ -916,11 +916,11 @@ The generated `raftbench_findings` (SDK 0.26.0) is gated the same way: listed on
 to a mount with no snapshot, refused as an unknown tool where the mount's list lacks it, and a 403 from Raft has the
 mount listed again at the next turn so a revoked grant drops it (`isRaftbenchReader`, `RAFTBENCH_READER_BASIS`).
 Since SDK 0.28.0 a page with a `nextCursor` ends with its next page as a call (the SDK's `next`: the same filters
-and limit with the cursor), and a failure's next action is what the SDK's `raftbenchFailureKind` means rather than
-the Server's text: `reread` (`raftbench_findings_changed`, a stale cursor) reads again from the first page with no
-cursor, `stop` (`raftbench_findings_unavailable`, a reader no longer allowed) is not retried and is told to the person
-who asked (`findingsFailure`, `findingsText`). Its `channelId` is described without naming `channels_info`, which a
-reader's `read` credential may lack (`PARAMETER_DESCRIPTIONS`).
+and limit with the cursor, `findingsText`). A failure's next action is the Server's `suggestedNextAction` as it came
+(slock #10733: read the first page again without a cursor, or tell the person who asked); a failure the SDK's
+`raftbenchFailureKind` calls `stop` (`raftbench_findings_unavailable`, a reader no longer allowed) is marked as one
+that will not clear, even on a 503 (`findingsFailure`). Its `channelId` is described without naming `channels_info`,
+which a reader's `read` credential may lack (`PARAMETER_DESCRIPTIONS`), until the SDK's own wording changes.
 
 Such an agent is also proactive (Raft RFC 075 §4.2, `src/plugins/raft-assistant.ts`),
 and code decides before any model is asked. A push notice that names RFC 074's

@@ -2135,23 +2135,32 @@ await check("raftbench_findings (SDK 0.28.0): a page with a nextCursor ends with
   must(last.state === "last_page" && !/Next page/.test(last.text), `last: ${JSON.stringify(last)}`);
 });
 
-await check("raftbench_findings failures say what the SDK's raftbenchFailureKind means: findings_changed reads again from the first page, findings_unavailable stops and is not retried", async () => {
+/** Raft's own refusals of a findings read, as its route sends them: slock e706c2b (#10733), its server's raftbench readers. */
+const FINDINGS_CHANGED_NEXT = "Read the first page again without a cursor.";
+const FINDINGS_UNAVAILABLE_NEXT = "Tell the person who asked that an administrator needs to review the RaftBench settings. Retrying will not help until then.";
+const READER_NOT_ALLOWED_NEXT = "A server owner or administrator has to allow this agent in RaftBench settings. Tell the person who asked; retrying, or using another agent's identity, will not help.";
+
+await check("raftbench_findings failures pass Raft's suggestedNextAction through unchanged; a kind the SDK's raftbenchFailureKind calls stop is marked as one that will not clear", async () => {
   const reader = () => inTurn({ ...ctx(), offered: [RAFTBENCH_TOOL] });
-  // The Server's own next action, where it sends one, is replaced: it cannot say which of the three to do here.
-  one(json(409, { error: "changed", code: "raftbench_findings_changed", suggestedNextAction: "Read the current state." }));
+  one(json(409, { error: "RaftBench access or analysis changed while reading.", code: "raftbench_findings_changed", suggestedNextAction: FINDINGS_CHANGED_NEXT }));
   const changed = await failure(() => raftPlugin.invoke(RAFTBENCH_TOOL, { cursor: "c2" }, reader()));
-  must(/raftbench_findings_changed/.test(changed.message) && /read them again from the first page/.test(changed.message) &&
-    /same filters and no cursor/.test(changed.message) && !/Read the current state/.test(changed.message), `changed: ${changed.message}`);
-  for (const status of [403, 503]) {
-    one(json(status, { error: "unavailable", code: "raftbench_findings_unavailable" }));
+  must(changed.message.endsWith(` — ${FINDINGS_CHANGED_NEXT}`) && /raftbench_findings_changed/.test(changed.message), `changed: ${changed.message}`);
+  const stops: Array<[number, string, string, string]> = [
+    [409, "raftbench_findings_unavailable", "RaftBench analysis settings changed (its administrator, service agent or source channels) and need an administrator's review.", FINDINGS_UNAVAILABLE_NEXT],
+    [403, "raftbench_reader_not_authorized", "This agent does not have a current RaftBench reader grant.", READER_NOT_ALLOWED_NEXT],
+    // A 503 is retryable to the SDK by its HTTP class; the stop kind is what decides.
+    [503, "raftbench_findings_unavailable", "unavailable", FINDINGS_UNAVAILABLE_NEXT],
+  ];
+  for (const [status, code, error, next] of stops) {
+    one(json(status, { error, code, suggestedNextAction: next }));
     const gone = await failure(() => raftPlugin.invoke(RAFTBENCH_TOOL, {}, reader()));
-    must(/raftbench_findings_unavailable/.test(gone.message) && /do not retry/.test(gone.message) && /tell the person who asked/.test(gone.message) &&
-      gone.transient === false && gone.retryable === false, `unavailable ${status}: ${gone.message} ${JSON.stringify(gone)}`);
+    must(gone.message.endsWith(` — ${next}`) && gone.message.includes(code) && gone.transient === false && gone.retryable === false,
+      `${code} ${status}: ${gone.message} ${JSON.stringify(gone)}`);
   }
-  // Control: a failure the SDK has no kind for keeps the next action it came with.
-  one(json(400, { error: "bad", code: "bad_filter", suggestedNextAction: "Fix the filter." }));
-  const other = await failure(() => raftPlugin.invoke(RAFTBENCH_TOOL, {}, reader()));
-  must(/Fix the filter\./.test(other.message) && !/first page|do not retry/.test(other.message), `other: ${other.message}`);
+  // Control: the same 503 with a code the SDK has no stop for stays one that may clear.
+  one(json(503, { error: "down", code: "raftbench_unavailable", suggestedNextAction: "Retry in a moment." }));
+  const down = await failure(() => raftPlugin.invoke(RAFTBENCH_TOOL, {}, reader()));
+  must(down.transient === true && down.message.endsWith(" — Retry in a moment."), `control: ${down.message} ${JSON.stringify(down)}`);
 });
 
 await check("every operation and argument PARAMETER_DESCRIPTIONS names is in the manifest, and its tool carries the description written here", async () => {

@@ -610,26 +610,14 @@ function joinFailure(out: RaftFailure): RaftFailure {
 }
 
 /**
- * What the model does after a `raftbench_findings` failure, by the SDK's `raftbenchFailureKind` (0.28.0), in place of
- * the next action the failure came with: that is the Server's own text or the SDK's default for the HTTP class ("Read
- * the current state before repeating this operation" for a 409), neither of which says whether to page on, start
- * over or give up. `reread` (`raftbench_findings_changed`, a stale or invalid cursor) starts again from the first
- * page; `stop` (`raftbench_findings_unavailable`, a reader no longer allowed, a capability the credential lacks) is
- * not retried and is told to the person who asked. A failure to repeat later (`retry_identical`) or one the SDK has
- * no kind for keeps the next action it came with.
+ * A `raftbench_findings` failure the SDK's `raftbenchFailureKind` (0.28.0) calls `stop` (`raftbench_findings_unavailable`,
+ * `raftbench_reader_not_authorized`, a capability the credential lacks) is marked as one that will not clear, whatever
+ * its HTTP class says (a 503 is `retryable` to the SDK). What the model is told to do is left as it came: the Server's
+ * `suggestedNextAction` (slock #10733) says it — read the first page again for `raftbench_findings_changed`, tell the
+ * person who asked for a stop — so the wording stays Raft's.
  */
-const FINDINGS_NEXT_ACTION: Readonly<Partial<Record<NonNullable<ReturnType<typeof raftbenchFailureKind>>, string>>> = {
-  reread: "These pages cannot be continued (the findings changed, or the cursor is no longer valid): read them again from the first page, calling raftbench_findings " +
-    "with the same filters and no cursor, and go by that read rather than by the pages before it.",
-  stop: "Do not call raftbench_findings again for this, and do not retry: tell the person who asked that RaftBench findings are " +
-    "not available to you now; a server owner or administrator has to act.",
-};
-
 function findingsFailure(out: RaftFailure): RaftFailure {
-  const kind = raftbenchFailureKind(out);
-  const said = kind ? FINDINGS_NEXT_ACTION[kind] : undefined;
-  // A stop is not a failure that may clear, whatever its HTTP class says (a 503 is `retryable` to the SDK).
-  return said ? { ...out, error: { ...out.error, nextAction: said, ...(kind === "stop" ? { retryable: false } : {}) } } : out;
+  return raftbenchFailureKind(out) === "stop" ? { ...out, error: { ...out.error, retryable: false } } : out;
 }
 
 /**
