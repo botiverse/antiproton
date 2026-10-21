@@ -2328,6 +2328,33 @@ await check("reply fallback: one owner message whose turn fails twice (a new run
   a.r.send = "sent";
   await afterTurn(a.ctx, ended("r7", { outcome: "failed", error: "x" }));
   must(a.r.sends.length === 5 && a.r.sends[4].content === FAILED_TURN_LINE && fallbackRows(a).at(-1)!.attrs.result === "sent", `after a held line: ${show(a.r.sends)}`);
+
+  // A run the runtime is rebuilding (`TurnEnd.rebuilding`, the overflow backstop) runs again for the same input: its
+  // end sends nothing, neither the line nor its text, and the rebuilt run's end is the one acted on.
+  const rebuildingEnds = [{ outcome: "failed", error: "x", rebuilding: true }, { outcome: "completed", rebuilding: true }] as const;
+  const b = await assistant(raft({ dm: "dm:@ada" }));
+  await ownerWrites(b.ctx, "ntc_dddddddddddddddd");
+  await afterTurn(b.ctx, ended("s1", rebuildingEnds[0]));
+  await afterTurn(b.ctx, ended("s1", rebuildingEnds[0]));
+  await afterTurn(b.ctx, ended("s1b", rebuildingEnds[1]));
+  must(b.r.sends.length === 0 && fallbackRows(b).length === 0, `a rebuilding end was acted on: ${show(b.r.sends)}`);
+  await afterTurn(b.ctx, ended("s2"));
+  await afterTurn(b.ctx, ended("s2"));
+  must(b.r.sends.length === 1 && b.r.sends[0].content === TEXT, `the rebuilt run's answer, once: ${show(b.r.sends)}`);
+  // The rebuilt run fails too: the line, once, for that message.
+  const c = await assistant(raft({ dm: "dm:@ada" }));
+  await ownerWrites(c.ctx, "ntc_eeeeeeeeeeeeeeee");
+  await afterTurn(c.ctx, ended("t1", rebuildingEnds[0]));
+  must(c.r.sends.length === 0, `a rebuilding end was acted on: ${show(c.r.sends)}`);
+  await afterTurn(c.ctx, ended("t2", { outcome: "failed", error: "x" }));
+  await afterTurn(c.ctx, ended("t2", { outcome: "failed", error: "x" }));
+  must(c.r.sends.length === 1 && c.r.sends[0].content === FAILED_TURN_LINE && fallbackRows(c).length === 1, `the rebuilt run failed: ${show(c.r.sends)}`);
+  // What the rebuilt run's predecessor already sent the owner answers the input: the rebuilt run's end adds nothing.
+  const d = await assistant(raft({ dm: "dm:@ada" }));
+  await raftPlugin.invoke("messages_send", { target: "dm:@ada", content: "Friday works." }, d.ctx);
+  await afterTurn(d.ctx, ended("u1", rebuildingEnds[0]));
+  await afterTurn(d.ctx, ended("u2"));
+  must(d.r.sends.length === 1 && fallbackRows(d).length === 0, `answered before the rebuild: ${show(d.r.sends)}`);
 });
 
 await check("reply fallback: a check's or the brief's failed turn sends nothing", async () => {

@@ -997,15 +997,19 @@ const OWN_TURN_KEYS: ReadonlySet<string> = new Set(["assistant.check", "assistan
  * it as it holds the model's, and nothing is sent. Nothing either for a completed turn with no text (or only
  * whitespace), one that was cancelled (stopped on purpose), or a turn the assistant's code asked for. A chat turn that
  * failed and answered no one gets `FAILED_TURN_LINE` instead, under the same rules: a fixed line, never the model's
- * partial text, and once per notice that woke the chat (`CHAT_NOTICE_KEY`). The idempotency key is the turn's, so a second telling of the same end that gets this far is the same
+ * partial text, and once per notice that woke the chat (`CHAT_NOTICE_KEY`). Nothing at all for the end of a run the runtime
+ * is rebuilding (`TurnEnd.rebuilding`), which runs again for the same input: the rebuilt run's end is the one acted on. The idempotency key is the turn's, so a second telling of the same end that gets this far is the same
  * send. One `raft.assistant_chat_told` row per send tried, status `reply_fallback`: `reply_fallback` 1 when it was
  * sent, else 0, `result` (`sent`, `held`, `failed` with the error's `code`) and, for a failed turn, `failed_turn` 1;
  * never the text.
  */
 export async function replyFallback(
-  ctx: PluginContext, end: Pick<TurnEnd, "turnId" | "turnKey" | "finalText" | "outcome">,
+  ctx: PluginContext, end: Pick<TurnEnd, "turnId" | "turnKey" | "finalText" | "outcome" | "rebuilding">,
   send: (ctx: PluginContext, target: string, content: string, key: string) => Promise<OwnerSend>,
 ): Promise<"sent" | "held" | "failed" | "skipped"> {
+  // A run being rebuilt runs again for the same input (`TurnEnd.rebuilding`): its end is not the turn's answer, and the
+  // reply row is left as it is, so the rebuilt run's end is judged with whatever this one already sent.
+  if (end.rebuilding) return "skipped";
   // An assistant's chat alone: the mount offers its preferences tool exactly when Raft names an owner.
   if (!ctx.offered?.includes(PREFERENCES_TOOL)) return "skipped";
   const owner = await loadOwner(ctx);

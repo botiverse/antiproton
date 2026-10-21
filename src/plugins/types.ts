@@ -2375,6 +2375,13 @@ export interface TurnEnd {
    * `output_limit` when the call spent its whole output cap before writing any answer. Absent for every other failure.
    */
   errorCode?: AnswerErrorCode;
+  /**
+   * This run is being rebuilt and will run again for the same input, as a new turn whose end is told in its turn: set
+   * on the end of a run of the main conversation that overflowed its context and was rebuilt (the overflow backstop,
+   * cf/src/runtime.ts `#overflowBackstop`), never on the rebuilt run's own end. A plugin acting on a turn's outcome
+   * waits for that next end rather than taking this one as final. Absent on every other end.
+   */
+  rebuilding?: true;
 }
 
 /** What a plugin's code asks the runtime to do next, answering {@link Plugin.afterTurn} or {@link Plugin.wake}. */
