@@ -1261,6 +1261,21 @@ export function savesState(op: Pick<RaftOperationSpec, "consumes">, ctx: Pick<Pl
   return !op.consumes.model.includes("seen") && !isSubagentSession(ctx.caller.taskId);
 }
 
+/**
+ * The text of `identity.whoami` as the model reads it. The SDK writes the identity line and then, when the Server sends
+ * one, its operating guide: the long-form manual for an external agent driving the Raft CLI (some 26 KB), which an
+ * agent with this mount's general tools can use. A personal assistant (`agent.assistantOf`, `isAssistantOf`, the same
+ * reading the listing makes) has no CLI and is offered a handful of tools the guide does not describe; given the guide,
+ * the result was parked and read back whole, and none of it applied. It gets the identity line alone — who it is, on
+ * which Server, with which capabilities. Every other operation, and whoami for any other agent, is the SDK's text.
+ */
+export function whoamiText(op: Pick<RaftOperationSpec, "name">, text: string, data: Record<string, unknown> | undefined): string {
+  if (op.name !== "identity.whoami" || !isAssistantOf(object(data?.agent).assistantOf)) return text;
+  const guide = data?.guide;
+  if (typeof guide !== "string" || !guide || !text.endsWith(guide)) return text;
+  return text.slice(0, text.length - guide.length).trimEnd();
+}
+
 /** One operation, run through the SDK's `invoke` under the caller's origin and context. */
 async function runOperation(
   op: RaftOperationSpec, args: unknown, ctx: PluginContext, unoffered: ReadonlySet<string>,
@@ -1309,7 +1324,7 @@ async function runOperation(
   // the tool offers since the manifest does. Read as `empty`, it would tell the model nothing matches.
   const data = (out as { data?: unknown }).data as Record<string, unknown> | undefined;
   const messages = [...(Array.isArray(data?.messages) ? data.messages : []), data?.message].filter(isMessage);
-  let text = out.text.trim();
+  let text = whoamiText(op, out.text, data).trim();
   for (const m of messages) text = text.replace(m.text, modelLine(m, unoffered));
   const result = { state: out.state, text: offeredTerms(text, unoffered, quotedCalls(data, unofferedPattern(unoffered))) };
   if (op.consumes.model.includes("seen")) await keepShown(raft, ctx, result);

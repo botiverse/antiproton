@@ -54,6 +54,7 @@ import {
 import { credentialRedactor, agentSecretValues } from "./eval-read.ts";
 import { logicalMain, physicalSession } from "./fresh-context.ts";
 import { assistantSystemPrompt, profilePrompt, systemPrompt } from "../../src/runtime/pi-prompt.ts";
+import { returnToolsChange, takeToolsChange, type ToolsChange } from "../../src/runtime/tools-seen.ts";
 import { assistantMountOf, assistantTools, isOwnerReadAddress } from "../../src/plugins/raft-assistant.ts";
 import { forgetIsolated, isIsolatedSession, isolatedSessions, newIsolatedSessionId, recordIsolated } from "../../src/runtime/isolated-session.ts";
 import { profileOf, profileSpec } from "../../src/runtime/agent-profile.ts";
@@ -1005,6 +1006,14 @@ export type OfferedToolsExport = {
 };
 
 /**
+ * Whether this mount's list was taken under another basis than its plugin declares now (one with none differs): the
+ * half of `snapshotStale` a deploy moves, as opposed to a list its plugin says is due again (`toolsDue`).
+ */
+export function basisMoved(m: MountRecord, p: Pick<Plugin, "snapshotTools" | "toolsBasis"> | undefined): boolean {
+  return !!p?.snapshotTools && !!m.toolSnapshot && p.toolsBasis !== undefined && m.toolSnapshot.basis !== p.toolsBasis;
+}
+
+/**
  * Whether a turn's start re-takes this mount's tool list (`AgentRuntime.retakeStaleSnapshots`): its plugin lists its
  * own tools, the mount has a snapshot, and either the plugin declares a basis the snapshot was not taken under (one
  * with none differs) or the plugin says the list is due again (`Plugin.toolsDue`: part of it comes from a far end and
@@ -1015,7 +1024,7 @@ export function snapshotStale(
   m: MountRecord, p: Pick<Plugin, "snapshotTools" | "toolsBasis" | "toolsDue"> | undefined, now = Date.now(),
 ): boolean {
   if (!p?.snapshotTools || !m.toolSnapshot) return false;
-  if (p.toolsBasis !== undefined && m.toolSnapshot.basis !== p.toolsBasis) return true;
+  if (basisMoved(m, p)) return true;
   try { return p.toolsDue?.(m, now) === true; } catch { return false; }
 }
 
@@ -1084,6 +1093,17 @@ export const MESSAGE_REFUSED = "message refused by the lane";
  * calls may take (raft.ts `DEFAULT_TIMEOUT_MS`). Running out keeps the old list, which still works, minus the new tools.
  */
 export const RETAKE_TIMEOUT_MS = 3_000;
+
+/**
+ * `p` settled, or "timeout" once `ms` passed first; the timer is cleared either way, so a settled wait leaves nothing
+ * keeping the isolate awake. `p` is not cancelled: a caller that stops waiting hands it to `waitUntil` itself.
+ */
+export async function boundedWait(p: Promise<unknown>, ms: number): Promise<"settled" | "timeout"> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timedOut = new Promise<"timeout">((resolve) => { timer = setTimeout(() => resolve("timeout"), ms); });
+  try { return await Promise.race([p.then(() => "settled" as const, () => "settled" as const), timedOut]); }
+  finally { clearTimeout(timer); }
+}
 /**
  * How long after a re-take that failed the same mount is not tried again for the same basis. Without it a Raft that
  * stays down would cost every turn the timeout above; with it the cost is one timeout per mount per ten minutes, and
@@ -1656,7 +1676,7 @@ export class AgentRuntime {
       const row = claimPendingInbound(sql, head, Date.now());
       try {
         await this.postMessage(tenantId, agentId, row.message, "prompt", MAIN_SESSION,
-          { retake: "background", beforeSay: () => markPostingInbound(sql, row.seq) });
+          { retake: "basis", beforeSay: () => markPostingInbound(sql, row.seq) });
       } catch (e: any) {
         const error = String(e?.message ?? e).slice(0, 300);
         out.error = error;
@@ -2913,6 +2933,19 @@ export class AgentRuntime {
   }
 
   /**
+   * Whether a mount of a switched-on plugin holds a list taken under a basis that is not its plugin's now (`basisMoved`):
+   * what makes an inbound turn wait for the re-take (`postMessage`). One read of the mounts, and of the choices only when
+   * one has.
+   */
+  async #basisMoved(tenantId: string, agentId: string): Promise<boolean> {
+    const byId = new Map(this.#plugins.map((p) => [p.id, p]));
+    const moved = (await this.store.listMounts(tenantId, agentId)).filter((m) => basisMoved(m, byId.get(m.plugin)));
+    if (!moved.length) return false;
+    const choices = await this.store.pluginChoices(tenantId, agentId);
+    return moved.some((m) => pluginEnabled(SEEDED_PLUGINS.has(m.plugin), choices[m.plugin]));
+  }
+
+  /**
    * Re-take, at the start of a turn, every tool list taken under a basis that is not its plugin's now
    * (`Plugin.toolsBasis`, `ToolSnapshot.basis`), and every list its plugin says is due again (`Plugin.toolsDue`). A snapshot is otherwise taken only when a mount is added, its
    * credential changes or an operator refreshes it, so a deploy that adds a tool would never reach a mount whose list
@@ -2932,7 +2965,7 @@ export class AgentRuntime {
    * an Agents API input, an inbound event, a finished background job), never in `agent`: that also opens the harness
    * behind a steer, a job's take and delivery, a status read and a transcript read, none of which may wait on a far
    * end's listing. Two turn starts at once share one pass (`#retaking`), so a mount is listed once, not once per caller.
-   * An inbound event's turn starts the pass without waiting for it (`postMessage`'s `retake: "background"`). The pass
+   * A turn start waits for the pass, at most `RETAKE_TIMEOUT_MS` in all (`postMessage`); an inbound event's only when a basis moved. The pass
    * is forgotten when it settles either way (`finally`), so one that threw does not stand in for every later one.
    *
    * Public so a test can ask for exactly this step.
@@ -3517,7 +3550,11 @@ export class AgentRuntime {
     const profile = profileOf(record);
     // An assistant's prompt is its own: the persona's name and description, then what it is for. Not the default core,
     // the sandbox page or the mounts' paragraphs, which describe tools it is not offered.
-    const prompt = profile ? profilePrompt(profile) : assistant ? assistantSystemPrompt(personaOf(record), assistant, isIsolatedSession(session) ? "check" : "chat") : systemPrompt({
+    // The assistant's prompt names only the tools on its raft mount this harness offers: a list taken by an older build
+    // lacks what this build's prompt would otherwise send the model to.
+    const onAssistant = assistant ? (offered as MountedTool[]).filter((t) => t.address.startsWith(`${assistant}.`))
+      .map((t) => t.address.slice(assistant.length + 1)) : [];
+    const prompt = profile ? profilePrompt(profile) : assistant ? assistantSystemPrompt(personaOf(record), assistant, isIsolatedSession(session) ? "check" : "chat", onAssistant) : systemPrompt({
       // The agent's own record: a person named and described it at creation,
       // and that is the first thing the prompt says after the core.
       persona: personaOf(record),
@@ -4218,7 +4255,11 @@ export class AgentRuntime {
     mode: "prompt" | "steer" | "followUp" = "prompt",
     session: string = MAIN_SESSION,
     opts: {
-      retake?: "await" | "background"; beforeSay?: () => void; pendingOnly?: true;
+      /**
+       * "basis": wait for the start's re-take only when a mount's list was taken under another basis (an inbound push);
+       * otherwise it runs in the background. Absent: wait for it whatever made it due (a person's message).
+       */
+      retake?: "basis"; beforeSay?: () => void; pendingOnly?: true;
       /** When the object took the message in, for the turn's timing (src/runtime/turn-timing.ts); now when absent. */
       receivedAt?: number;
       /** The message's own id, where the engine keeps one (`AgentEngine.say`): what a post that must land once is checked by. */
@@ -4262,16 +4303,28 @@ export class AgentRuntime {
     // with the new tools (or, if one is still running and this lands as a steer, the next one is). Not for a steer or
     // a follow-up, which add to a turn rather than start one.
     //
-    // `retake: "background"` starts it without waiting, for a caller that must answer someone promptly — a service's
-    // push at an inbound hook (`receiveHook`), whose request would otherwise wait out the listing's timeout. That turn
-    // runs on the list as it stands; the re-take shares the same pass (`#retaking`), and when it writes, the moved hash
-    // rebuilds the harness for the turn after. Either way a re-take that throws is logged and never fails the turn.
+    //
+    // A person's turn waits for it. An inbound push's (`retake: "basis"`) waits only when a mount's list was taken under
+    // another basis — a deploy that moved the plugin's tool set: the system prompt is built from this build's code, so
+    // a turn opened on the list an older build took tells the model of a tool it is not offered (an assistant told to
+    // send as its owner without the tool, which then refused). A push's turn starts in the alarm pass, after the service
+    // was answered (`hookReceive`), so nobody waits on it but the push's own reader. A list due only because its managed
+    // catalogue aged (`Plugin.toolsDue`) changes no basis and is re-taken in the background, as every turn after a quiet
+    // spell would otherwise pay for it; when it writes, the moved hash rebuilds the harness for the turn after.
+    // Any wait is bounded as a whole by `RETAKE_TIMEOUT_MS` (each mount's listing is too, inside the pass): past it the
+    // turn runs on the list as it stands, the pass goes on under `waitUntil`, and `tools.retake_timeout` is logged. A
+    // re-take that throws is logged and never fails the turn.
     if (mode === "prompt") {
       await this.ready();
+      const wait = opts.retake !== "basis" || await this.#basisMoved(tenantId, agentId)
+        .catch((e) => { console.error(`reading ${tenantId}/${agentId}'s tool list bases failed:`, e); return false; });
       const retake = this.retakeStaleSnapshots(tenantId, agentId)
         .catch((e) => console.error(`re-taking ${tenantId}/${agentId}'s tool lists failed:`, e));
-      if (opts.retake === "background") this.#deps.ctx.waitUntil?.(retake);
-      else await retake;
+      if (!wait) this.#deps.ctx.waitUntil?.(retake);
+      else if (await boundedWait(retake, RETAKE_TIMEOUT_MS) === "timeout") {
+        this.#deps.ctx.waitUntil?.(retake);
+        logEvent("tools.retake_timeout", { tenantId, agentId, session, ms: RETAKE_TIMEOUT_MS });
+      }
     }
     const agent = await this.agent(tenantId, agentId, session);
     // A conversation that has just been spoken to has work until a step says
@@ -4291,9 +4344,22 @@ export class AgentRuntime {
     const moved = mode === "followUp" || this.#isPd() || profiled ? null
       : await this.#takeContextChange(tenantId, agentId, session)
         .catch((e) => { console.error(`reading what moved in ${tenantId}/${agentId}'s prompt failed:`, e); return null; });
-    const lines = [...(told?.lines ?? []), ...(moved ? [moved.change.notice] : [])];
+    // Tools this conversation's harness offers that the one before it did not (src/runtime/tools-seen.ts): a list
+    // re-taken since its last message, typically after a deploy. Not for a follow-up or a profile, as above; a tool a
+    // capability line above already names is recorded and not told twice. A reading: a failure is logged only.
+    const toolsOwner = `${tenantId}/${agentId}`, toolsConversation = this.#isPd() ? session : this.#conversationOf(session);
+    let toolsChange: ToolsChange | null = null;
+    if (mode !== "followUp" && !profiled) {
+      try {
+        const named = new Set((told?.rows ?? []).map((r) => `${r.alias}__`));
+        toolsChange = takeToolsChange(this.#deps.ctx.storage.sql, toolsOwner, toolsConversation,
+          (await agent.tools()).map((t) => t.name), HARNESS_NOTICE, (n) => [...named].some((p) => n.startsWith(p)));
+      } catch (e) { console.error(`reading which tools ${tenantId}/${agentId}#${session} was offered failed:`, e); }
+    }
+    const lines = [...(told?.lines ?? []), ...(toolsChange ? [toolsChange.notice] : []), ...(moved ? [moved.change.notice] : [])];
     const giveBack = async () => {
       if (told) await this.store.returnSeedNotices(tenantId, agentId, told.rows).catch(() => {});
+      if (toolsChange) { try { returnToolsChange(this.#deps.ctx.storage.sql, toolsOwner, toolsConversation, toolsChange); } catch {} }
       if (moved) returnContextChange(this.#deps.ctx.storage.sql, moved.owner, moved.conversation, moved.change);
     };
     // The turn this message opens or joins (src/runtime/turn-timing.ts), pi085 only. With the lane idle, the record

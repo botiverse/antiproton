@@ -536,6 +536,28 @@ await check("arguments: at most one anchor, limits within Raft's bounds, a known
   must(JSON.stringify(asked.inbox) === JSON.stringify([{ filter: "unread_mentions", limit: 50, offset: 40 }, { filter: "unread", limit: 10 }]), `inbox asked: ${JSON.stringify(asked.inbox)}`);
 });
 
+// ---- whoami ------------------------------------------------------------------------------------------------------------
+
+await check("identity_whoami for an assistant is its identity and capabilities alone; any other agent still gets the Server's operating guide", async () => {
+  const GUIDE = "# Raft CLI operating guide\n\nThis is the long-form operating guide for an agent using the Raft CLI. " + "x".repeat(20_000);
+  const whoami = async (agent: Record<string, unknown>) => {
+    const urls = answering(() => context(CAPS, agent, { prompt: { audience: "self-hosted-runner", text: GUIDE } }));
+    const out: any = await createRaftPlugin().invoke("identity_whoami", {}, ctx().ctx);
+    must(urls.length === 1 && new URL(urls[0]!).pathname === "/internal/agent-api/context", `requests: ${JSON.stringify(urls)}`);
+    return out;
+  };
+  const mine = await whoami({ assistantOf: OWNER });
+  must(mine.state === "identity", `assistant: ${JSON.stringify(mine).slice(0, 300)}`);
+  must(mine.text === "You are @ada-assistant on S. Credential capabilities: read, send.", `assistant text: ${JSON.stringify(String(mine.text).slice(0, 300))}`);
+  must(!String(mine.text).includes("operating guide"), "the assistant was handed the guide");
+  // Control: the same answer for an agent that is nobody's assistant keeps the guide, as the SDK wrote it.
+  for (const agent of [{ assistantOf: null }, {}]) {
+    const plain = await whoami(agent);
+    must(String(plain.text).startsWith("You are @ada-assistant on S. Credential capabilities: read, send.\n\n# Raft CLI operating guide") &&
+      String(plain.text).endsWith("x".repeat(100)), `plain (${JSON.stringify(agent)}): ${String(plain.text).slice(0, 200)}`);
+  }
+});
+
 globalThis.fetch = originalFetch;
 console.log(`\n  raft assistant\n  ${"─".repeat(56)}`);
 for (const result of results) {
