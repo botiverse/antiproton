@@ -871,9 +871,10 @@ const REF_IN_TEXT = /#([^\s:#]{1,80}):([0-9A-Za-z-]{8,36})/g;
 export async function noteToldInChat(ctx: PluginContext, target: unknown, content: unknown, now = Date.now()): Promise<number> {
   if (typeof target !== "string" || typeof content !== "string") return 0;
   const owner = await loadOwner(ctx);
-  const dm = owner ? dmOf(owner) : null;
-  // The DM itself or one of its threads (`dm:@ada:abcdef12`).
-  if (!dm || (target !== dm && !target.startsWith(`${dm}:`))) return 0;
+  const dm = owner ? dmPeerOf(dmOf(owner)) : null;
+  // The DM itself or one of its threads (`dm:@ada:abcdef12`), in Raft's form (`~human`) or the inbox's (`sameDm`).
+  const to = dmPeerOf(target);
+  if (!dm || !to || !sameDm(to, dm)) return 0;
   let fresh = 0;
   for (const m of content.matchAll(REF_IN_TEXT)) {
     const key = `msg:${short8(m[2]!)}`;
@@ -888,34 +889,73 @@ export async function noteToldInChat(ctx: PluginContext, target: unknown, conten
 // ---- the chat's reply, when the model left it in its closing text ----------------------------------------------------
 
 /**
- * Whether the owner's chat has been answered in their DM since its last turn ended (`AssistantReply`, one row): set by
- * every send to the owner's DM (or a thread of it) that Raft accepted, made in the chat (`noteOwnerReply`), and read and
- * cleared at each end of a chat turn (`replyFallback`), which keeps there the turn it last handled, so a turn's end told
- * twice (`Plugin.afterTurn` is at least once) is acted on once.
+ * What the owner's chat sent since its last turn ended (`AssistantReply`, one row), read and cleared at each end of a
+ * chat turn (`replyFallback`), which keeps there the turn it last handled, so a turn's end told twice
+ * (`Plugin.afterTurn` is at least once) is acted on once. `dms` are the DMs (or threads of one) every send Raft accepted
+ * went to (`noteOwnerReply`), each as its peer (`dmPeerOf`), and are matched against the owner's DM only at the turn's
+ * end: on a brand-new assistant the DM is known to no one when the chat sends to it (Raft gives `dmTarget` only once
+ * the DM exists, `learnDm` only after a pull), and Raft's form of it (`dm:@ada~human`) is not the inbox's (`dm:@ada`),
+ * which is the one the model copies. `asOwner` is a send as the owner that Raft posted, or that may have landed
+ * (`noteSentAsOwner`): Raft shows the owner a receipt, which is that turn's answer. `sent` is the row as it was kept
+ * before `dms` (a send already matched to the owner's DM), read so a row from then still counts.
  */
 export const REPLY_KEY = "reply";
-interface AssistantReply { sent: boolean; handled: string | null }
+interface AssistantReply { sent: boolean; handled: string | null; dms: string[]; asOwner: boolean }
+/** How many distinct DMs one turn's row keeps: a chat turn sends to a handful at most. */
+const REPLY_DMS_MAX = 16;
 
 function replyOf(v: unknown): AssistantReply {
   const o = v && typeof v === "object" && !Array.isArray(v) ? v as Record<string, unknown> : {};
-  return { sent: o.sent === true, handled: typeof o.handled === "string" ? o.handled : null };
-}
-
-/** Whether `target` is the owner's DM or one of its threads (`dm:@ada:abcdef12`). */
-function toOwnerDm(owner: AssistantOwner | null, target: unknown): boolean {
-  const dm = owner ? dmOf(owner) : null;
-  return !!dm && typeof target === "string" && (target === dm || target.startsWith(`${dm}:`));
+  return {
+    sent: o.sent === true, handled: typeof o.handled === "string" ? o.handled : null,
+    dms: Array.isArray(o.dms) ? o.dms.filter((d): d is string => typeof d === "string") : [], asOwner: o.asOwner === true,
+  };
 }
 
 /**
- * A send Raft accepted (not held): when it went to the owner's DM from the chat — never from a short session — the chat
- * turn it was made in has answered its owner, so that turn's end posts nothing more (`replyFallback`).
+ * The peer a DM send target names, as `name` or `name~kind`, lowercased, without a thread's suffix (`dm:@ada:abcdef12`)
+ * or Raft's `DM:` prefix; null for any other target. `~human` / `~agent` is kept, since it tells two people apart.
+ */
+export function dmPeerOf(target: unknown): string | null {
+  if (typeof target !== "string") return null;
+  const m = /^dm:@([^:\s~]+)(~(?:human|agent))?(?::\S*)?$/i.exec(target.trim());
+  return m ? `${m[1]!.toLowerCase()}${m[2]?.toLowerCase() ?? ""}` : null;
+}
+
+/**
+ * Whether two DM peers (`dmPeerOf`) are the same DM: the same name, and the same kind where both carry one. Raft names a
+ * DM with no kind only when no human and agent share the name (a bare name that could be either is refused), so a send
+ * to `dm:@ada` that Raft accepted is the DM with `ada~human` when that is the owner.
+ */
+function sameDm(a: string, b: string): boolean {
+  const [an, ak] = a.split("~"), [bn, bk] = b.split("~");
+  return an === bn && (!ak || !bk || ak === bk);
+}
+
+/**
+ * A send Raft accepted (not held), made in the chat — never from a short session: the DM it went to is kept for the
+ * turn's end (`replyFallback`), which decides then whether it was the owner's. Any other target is not kept.
  */
 export async function noteOwnerReply(ctx: PluginContext, target: unknown): Promise<void> {
   if (isIsolatedSession(ctx.caller.taskId)) return;
-  if (!toOwnerDm(await loadOwner(ctx), target)) return;
+  const peer = dmPeerOf(target);
+  if (!peer) return;
   const kept = replyOf(await ctx.db.get(ASSISTANT_STORE, REPLY_KEY));
-  if (!kept.sent) await ctx.db.put(ASSISTANT_STORE, { ...kept, sent: true } as unknown as Json, REPLY_KEY);
+  if (kept.dms.includes(peer) || kept.dms.length >= REPLY_DMS_MAX) return;
+  await ctx.db.put(ASSISTANT_STORE, { ...kept, dms: [...kept.dms, peer] } as unknown as Json, REPLY_KEY);
+}
+
+/** A send as the owner that Raft posted, or that may have landed (`uncertain`): the chat turn it was made in is answered. */
+export async function noteSentAsOwner(ctx: PluginContext): Promise<void> {
+  if (isIsolatedSession(ctx.caller.taskId)) return;
+  const kept = replyOf(await ctx.db.get(ASSISTANT_STORE, REPLY_KEY));
+  if (!kept.asOwner) await ctx.db.put(ASSISTANT_STORE, { ...kept, asOwner: true } as unknown as Json, REPLY_KEY);
+}
+
+/** Whether the turn whose row is `kept` answered its owner: a send to their DM (`dm`, as known at its end) or as them. */
+function answered(kept: AssistantReply, dm: string): boolean {
+  const owner = dmPeerOf(dm);
+  return kept.sent || kept.asOwner || (owner !== null && kept.dms.some((d) => sameDm(d, owner)));
 }
 
 /** The turns the assistant's own code asks for, each in a short session: never the owner's chat. */
@@ -925,7 +965,8 @@ const OWN_TURN_KEYS: ReadonlySet<string> = new Set(["assistant.check", "assistan
  * The end of a turn of the owner's chat (`Plugin.afterTurn`, which the runtime calls for the main conversation only,
  * never a short session's or a subagent's). The chat answers in the owner's DM with `messages_send`; a model that wrote
  * its answer only as its closing text answered no one. So when a completed chat turn sent nothing the Server accepted
- * to the owner's DM, its closing text is sent there, through the same send the model's would take (`send`, the
+ * to the owner's DM (as that DM is known at the turn's end, `answered`), and posted nothing as the owner (Raft's receipt
+ * answers that turn), its closing text is sent there, through the same send the model's would take (`send`, the
  * notify tool's: `messages.send` attesting what the chat has seen), so a DM with messages the chat has not read holds
  * it as it holds the model's, and nothing is sent. Nothing either for a turn with no text (or only whitespace), one
  * that failed or was cancelled, or a turn the assistant's code asked for. The idempotency key is the turn's, so a
@@ -944,9 +985,9 @@ export async function replyFallback(
   if (!dm) return "skipped";
   const kept = replyOf(await ctx.db.get(ASSISTANT_STORE, REPLY_KEY));
   if (kept.handled === end.turnId) return "skipped";
-  const done = () => ctx.db.put(ASSISTANT_STORE, { sent: false, handled: end.turnId } as unknown as Json, REPLY_KEY);
+  const done = () => ctx.db.put(ASSISTANT_STORE, { sent: false, handled: end.turnId, dms: [], asOwner: false } as unknown as Json, REPLY_KEY);
   const text = end.finalText ?? "";
-  if (kept.sent || end.outcome !== "completed" || !text.trim() || (end.turnKey !== null && OWN_TURN_KEYS.has(end.turnKey))) {
+  if (answered(kept, dm) || end.outcome !== "completed" || !text.trim() || (end.turnKey !== null && OWN_TURN_KEYS.has(end.turnKey))) {
     await done();
     return "skipped";
   }
@@ -1403,6 +1444,7 @@ export async function sendAsOwner(args: unknown, ctx: PluginContext, deps: SendA
     : Promise.resolve();
   if (out.ok) {
     await noteSent();
+    await noteSentAsOwner(ctx).catch(() => {});
     trace("sent");
     return {
       state: "sent", where: resolved.where,
@@ -1410,7 +1452,7 @@ export async function sendAsOwner(args: unknown, ctx: PluginContext, deps: SendA
     };
   }
   const result = raftResult(out);
-  if (result === "uncertain") await noteSent();
+  if (result === "uncertain") { await noteSent(); await noteSentAsOwner(ctx).catch(() => {}); }
   if (result === "rate_limited") await ctx.db.put(ASSISTANT_STORE, { key: sendKey, at: now } as unknown as Json, SEND_LIMITED_KEY);
   if (result === "assistant_not_enabled") await pauseOn(ctx, new Error(NOT_ENABLED));
   return notSent(result, out.status !== null ? { http_status: out.status } : {});

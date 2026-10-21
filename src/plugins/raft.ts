@@ -2869,9 +2869,9 @@ export function createRaftPlugin(deps: {
     return out instanceof Interrupt ? { sent: false, held: "your owner's DM has messages this conversation has not read" } : { sent: true };
   };
   /**
-   * An assistant's send to its owner's DM that Raft accepted: what it cited counts as told (`noteToldInChat`), so the
-   * next wake does not bring it up again, and the chat turn it was made in has answered its owner (`noteOwnerReply`),
-   * so its end sends nothing more (`afterTurn`). A failure to record costs only that, never the send's result.
+   * An assistant's send that Raft accepted: what it cited in its owner's DM counts as told (`noteToldInChat`), so the
+   * next wake does not bring it up again, and the DM it went to is kept for the turn's end (`noteOwnerReply`), which
+   * sends nothing more when that was the owner's DM (`afterTurn`). A failure to record costs only that, never the send's result.
    */
   const toldInChat = async (op: RaftOperationSpec, args: unknown, result: unknown, ctx: PluginContext) => {
     if (op.name !== "messages.send" || result instanceof Interrupt || !ctx.offered?.includes(PREFERENCES_TOOL)) return;
