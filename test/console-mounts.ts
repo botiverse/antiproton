@@ -142,6 +142,11 @@ await check("only state.get declares reads: own-state, the line limitForCall lif
   const src = readFileSync(new URL("state.ts", pluginsDir), "utf8");
   const count = src.match(/reads\s*:\s*"own-state"/g)?.length ?? 0;
   must(count === 1, `state.ts declares reads: "own-state" ${count} times; only get may`);
+  // And that one is get's, read off the plugin itself: the runtime never looks at the name, so secret_get, whose value
+  // must not sit in the conversation longer than it has to, is held to the parking line only by not declaring it.
+  const { statePlugin } = await import("../src/plugins/state.ts");
+  const declaring = statePlugin({} as never, null, "local").tools.filter((t) => t.reads !== undefined).map((t) => `${t.name}:${t.reads}`);
+  must(show(declaring) === show(["get:own-state"]), `state tools that declare reads: ${show(declaring)}`);
 });
 
 await check("only statePlugin is handed the sealing key or the secret resolver, only it and builtin the raw store, and state.ts never names the owner's prefix", async () => {
