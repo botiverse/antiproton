@@ -20,7 +20,7 @@ import {
 import { confirmLine, matches, ruleLine, rulesOf, winningRule, type ContactRule } from "../src/plugins/raft-assistant-rules.ts";
 import { setLogSink } from "../src/core/log.ts";
 import { askWake } from "../src/runtime/plugin-wakes.ts";
-import { CONTACT_KEY } from "../src/plugins/raft-assistant.ts";
+import { CONTACT_KEY, type SendAsOwnerDeps } from "../src/plugins/raft-assistant.ts";
 import { recordedEngine } from "../src/runtime/durable-agent.ts";
 import { AgentRuntime } from "../cf/src/runtime.ts";
 import { operatorModelOf } from "../cf/src/model-request.ts";
@@ -1536,10 +1536,10 @@ await check("send as owner: an owner dropped by a recheck while the mount's list
 await check("send as owner: the implementation with no owner record refuses every target before reading or posting anything", async () => {
   const a = mount(ALL_TOOLS);
   const used: string[] = [];
-  const deps = {
-    inbox: async () => { used.push("inbox"); return { ok: true, data: { items: sendRows0() } }; },
-    messages: async () => { used.push("messages"); return { ok: false, status: 404 }; },
-    post: async () => { used.push("post"); return { ok: true, status: 200, data: {} }; },
+  const deps: SendAsOwnerDeps = {
+    inbox: async () => { used.push("inbox"); return { ok: true as const, data: { items: sendRows0() } }; },
+    messages: async () => { used.push("messages"); return { ok: false as const, status: 404 }; },
+    post: async () => { used.push("post"); return { ok: true as const }; },
   };
   for (const target of ["#ch1", "@bob", "#ch1:aaaaaaa1", conv(1).channelId]) {
     const e = await sendAsOwner({ target, content: "Friday works." }, a.ctx, deps).catch((x) => x as Error);
