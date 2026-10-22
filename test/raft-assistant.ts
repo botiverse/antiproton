@@ -219,7 +219,7 @@ await check("mountTools: a mount with no snapshot is not offered them; a snapsho
   const offeredTools = toolsOf(plugin, { ...base, toolSnapshot: assistantSnap });
   for (const name of ["assistant_notify_owner", "assistant_preferences", "assistant_send_as_owner"]) {
     const w = offeredTools.find((t) => t.name === name);
-    must(w?.sideEffects === "write" && w.modelOnly === true, `${name} declaration: ${JSON.stringify(w)}`);
+    must(w?.sideEffects === "write" && w.modelOnly === true, `${name}: sideEffects=${w?.sideEffects} modelOnly=${w?.modelOnly}`);
   }
 });
 
