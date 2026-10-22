@@ -434,8 +434,10 @@ export function raftReminderRoute(where: string): string {
  * mount under provisioning's alias, so this one names no alias and no model-facing name.
  */
 export const RAFT_REMINDER_ROUTE_ANY_MOUNT = raftReminderRoute(`${LIST_TOOL} on your Raft mount`);
-export const ON_RAFT = "This agent is on Raft, so this reminder mount does not set its reminders: they reach it through Raft, and a " +
-  `second way to wake it here would deliver each one twice. Nothing was set. ${raftReminderRoute(`${LIST_TOOL} on the ${RAFT_ALIAS} mount (${RAFT_ALIAS}__${LIST_TOOL})`)}`;
+// Says only what `onRaft` knows: the agent is hosted on Raft. Not that a reminder reaches it through Raft now: with the
+// raft mount switched off or pinned to another version, nothing from Raft reaches it, reminders included.
+export const ON_RAFT = "This agent is hosted on Raft, so its reminders are Raft's to set and deliver, and this reminder mount " +
+  `does not set them: a second way to wake it here would deliver each one twice. Nothing was set. ${raftReminderRoute(`${LIST_TOOL} on the ${RAFT_ALIAS} mount (${RAFT_ALIAS}__${LIST_TOOL})`)}`;
 
 /**
  * Whether this agent is hosted on Raft, which wakes it through its own channel: a second wake-up path through a

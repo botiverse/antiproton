@@ -736,6 +736,8 @@ await check("the refusal on Raft says where a reminder is set instead: the Remin
   must(/marked official whose purpose is reminders/.test(ON_RAFT) && /create-reminder/.test(ON_RAFT), `the app and its action are not named: ${ON_RAFT}`);
   must(!/named Reminder/.test(ON_RAFT), `steers by the app's own name: ${ON_RAFT}`);
   // A Server's install of the app has its own service id; one written here would be wrong everywhere else.
+  // `onRaft` sees the mount, not whether Raft delivers now (switched off, or pinned to another version): no claim that it does.
+  must(!/reach(es)? it through Raft/.test(ON_RAFT), `claims Raft delivers now: ${ON_RAFT}`);
   must(!/reminder-[0-9a-f]{6}/.test(ON_RAFT) && !/remove the reminder mount/.test(ON_RAFT), `a fixed id or the old advice: ${ON_RAFT}`);
 });
 
@@ -786,7 +788,7 @@ await check("through the gateway: an agent whose raft mount provisioning made ca
     real.seen.length = 0;
     const r: any = await real.rt.gateway().invoke({ tenantId: "t", agentId: "a", taskId: "k" }, "rem.create", { delayMinutes: 5, note: "n" });
     must(r.ok === false || r.status === "failed", `create went through: ${JSON.stringify(r)}`);
-    must(JSON.stringify(r).includes("This agent is on Raft"), `refused with ${JSON.stringify(r)}`);
+    must(JSON.stringify(r).includes(JSON.stringify(ON_RAFT).slice(1, -1)), `refused with ${JSON.stringify(r)}`);
     must(real.seen.length === 0, `requests reached reminder-app: ${JSON.stringify(real.seen.map((x) => x.url))}`);
     must((await real.directory.list("t", "a")).length === 0, "an inbound hook was created");
   } finally { real.done(); }
