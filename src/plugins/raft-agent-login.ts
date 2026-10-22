@@ -296,12 +296,21 @@ async function loadSession(ctx: PluginContext, service: ServiceRecord): Promise<
   const row = obj(await ctx.db.get(SESSION_STORE, service.id)) as Partial<StoredSession>;
   if (row.v !== 1 || row.serviceId !== service.id || row.clientId !== service.clientId || row.returnUrl !== (service.returnUrl ?? "") ||
       typeof row.iv !== "string" || typeof row.ciphertext !== "string") return null;
-  let cookies: unknown;
+  // A kept session that does not open is "no session", and the agent signs in again; the row says why, so an app that
+  // keeps asking for a login has somewhere to be looked into. The reason only, never the row or the key.
+  const unsealable = (reason: "no_credential" | "does_not_decrypt" | "not_json" | "not_a_list") => {
+    ctx.trace?.({ kind: "raft.session_unsealable", status: reason, verdict: "failed", attrs: { service: service.id } });
+    return null;
+  };
+  let key: Awaited<ReturnType<typeof sealingKey>>;
+  try { key = await sealingKey(ctx); } catch { return unsealable("no_credential"); }
+  let pt: ArrayBuffer;
   try {
-    const pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv: unb64(row.iv), additionalData: enc.encode(service.id) }, await sealingKey(ctx), unb64(row.ciphertext));
-    cookies = JSON.parse(dec.decode(pt));
-  } catch { return null; }
-  if (!Array.isArray(cookies)) return null;
+    pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv: unb64(row.iv), additionalData: enc.encode(service.id) }, key, unb64(row.ciphertext));
+  } catch { return unsealable("does_not_decrypt"); }
+  let cookies: unknown;
+  try { cookies = JSON.parse(dec.decode(pt)); } catch { return unsealable("not_json"); }
+  if (!Array.isArray(cookies)) return unsealable("not_a_list");
   const fresh = freshCookies(cookies.filter((c): c is SessionCookie => typeof obj(c).pair === "string" && typeof obj(c).host === "string" && typeof obj(c).path === "string"));
   return fresh.length ? { cookies: fresh, row: row as StoredSession } : null;
 }

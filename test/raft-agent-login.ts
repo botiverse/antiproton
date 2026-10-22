@@ -617,8 +617,14 @@ await check("a session kept under one credential does not open under another: th
   // The same database, another credential (the fake Raft answers it too).
   w.accept(OTHER);
   const other = mount(OTHER, tables);
+  const rows: any[] = [];
+  other.ctx.trace = (r: unknown) => rows.push(r);
   const listed = await other.plugin.invoke("integrations_actions", { service: "reminder-app" }, other.ctx) as any;
   must(listed.session?.status === "none", `the old session opened under another credential: ${JSON.stringify(listed.session)}`);
+  // It says why it did not open, and nothing of the session.
+  must(rows.length === 1 && rows[0].kind === "raft.session_unsealable" && rows[0].status === "does_not_decrypt" && rows[0].attrs.service === SERVICE.id,
+    `the unopened session left no row saying why: ${JSON.stringify(rows)}`);
+  must(!JSON.stringify(rows).includes(m.row().ciphertext) && !JSON.stringify(rows).includes(OTHER), `the row carries the session or the credential: ${JSON.stringify(rows)}`);
   await other.plugin.invoke("integrations_invoke", { service: "reminder-app", action: "list-reminders" }, other.ctx);
   must(w.logins.length === 2 && w.actions().length === 1, `the other credential did not sign in for itself: logins ${w.logins.length}`);
 });
