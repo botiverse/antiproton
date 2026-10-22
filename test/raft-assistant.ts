@@ -214,8 +214,13 @@ await check("mountTools: a mount with no snapshot is not offered them; a snapsho
   // its result is refused too (applyApproval's backstop). Without the flag a held send-as-owner would be approved by
   // a person and sent as the owner with nobody reading what came back, and nothing else in the suite would notice.
   // Found by Ward's access review of 66c8614.
-  const send = toolsOf(plugin, { ...base, toolSnapshot: assistantSnap }).find((t) => t.name === "assistant_send_as_owner");
-  must(send?.sideEffects === "write" && send.modelOnly === true, `send-as-owner declaration: ${JSON.stringify(send)}`);
+  // The same holds for every assistant tool that writes (notify writes to the owner, preferences to their rules): each
+  // is pinned on its own line so a missing flag fails on that tool's name.
+  const offeredTools = toolsOf(plugin, { ...base, toolSnapshot: assistantSnap });
+  for (const name of ["assistant_notify_owner", "assistant_preferences", "assistant_send_as_owner"]) {
+    const w = offeredTools.find((t) => t.name === name);
+    must(w?.sideEffects === "write" && w.modelOnly === true, `${name} declaration: ${JSON.stringify(w)}`);
+  }
 });
 
 await check("a call on a mount that does not offer the tool is refused without reaching the wire", async () => {
