@@ -495,6 +495,11 @@ export interface PluginContext {
    * would have to ask the model for the second credential, which is the leak
    * config-time binding exists to prevent. Scoped to this agent's own mounts,
    * so it grants nothing the agent was not already configured to use.
+   *
+   * And only a mount the agent can call: one whose plugin is not installed, is
+   * switched off for this agent, or is pinned to another version than the
+   * registry's answers null, as a missing one does — its calls are refused, so
+   * its credential is not handed out by this route either.
    */
   sibling(alias: string): Promise<{
     credential: string | null;
