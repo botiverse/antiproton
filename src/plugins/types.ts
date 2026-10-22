@@ -4,6 +4,9 @@ import type { PluginTraceKind, TraceVerdict } from "../trace/outbox.ts";
 import type { AnswerErrorCode } from "../model/pi-bridge.ts";
 import type { TurnEndEvent } from "../runtime/activity.ts";
 
+/** What a tool declares it reads back (`ToolSchema.reads`); the one place the values are listed. */
+export type ToolReads = "parked-result" | "own-state";
+
 export interface ToolSchema {
   name: string;
   summary: string;
@@ -32,9 +35,11 @@ export interface ToolSchema {
    * notes, a workspace file it was given). Not a reader of parked results; its
    * answer is held to the read-back line rather than the parking line
    * (`limitForCall`, cf/src/runtime.ts), because parking it only makes the
-   * agent read the same bytes back with one more call.
+   * agent read the same bytes back with one more call. The runtime trusts the
+   * declaration and never looks at what the tool returns, so only the state
+   * plugin's `get` declares it (pinned in test/console-mounts.ts).
    */
-  reads?: "parked-result" | "own-state";
+  reads?: ToolReads;
   /**
    * `"never"`: do not run this tool again on its own after an interruption,
    * whatever `sideEffects` and `idempotency` say.

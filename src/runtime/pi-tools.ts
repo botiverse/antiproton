@@ -24,6 +24,7 @@ import { splitView, viewContent, type ViewHost, type ViewMarker } from "./tool-v
 import type { Json } from "../core/types.ts";
 import type { Continuation, HeldCall, Paused } from "../core/execution.ts";
 import type { ToolInterrupt } from "../core/tools.ts";
+import type { ToolReads } from "../plugins/types.ts";
 import {
   answerProblem, answerSpecOf, type AnswerSpec, type InterruptHost, type RunJsContinuations,
 } from "./run-js-resume.ts";
@@ -66,7 +67,7 @@ export interface MountedTool {
    *  to find the reader by rebuilding the string `artifacts` + `.read`, which
    *  a rename of either silently broke. `"own-state"`: it reads the agent's
    *  own stored values, which the runtime holds to the read-back line. */
-  reads?: "parked-result" | "own-state";
+  reads?: ToolReads;
   /** Carried from {@link ToolSchema}: `"never"` overrides everything else
    *  `replayPolicy` would conclude. */
   replay?: "never";

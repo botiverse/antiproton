@@ -382,7 +382,7 @@ import { markReady } from "../../src/runtime/ready.ts";
 import { toAgentRef } from "../../src/store/refs.ts";
 import { attachViewImage, splitView, withView, type ViewMarker } from "../../src/runtime/tool-view.ts";
 import { acceptsImages } from "../../src/model/context-windows.ts";
-import type { Plugin, PluginChoice } from "../../src/plugins/types.ts";
+import type { Plugin, PluginChoice, ToolReads } from "../../src/plugins/types.ts";
 import type { SeedPassResult, SeedPlan } from "../../src/store/seed-record.ts";
 import type { ToolInterrupt, ToolResult } from "../../src/core/tools.ts";
 import type { Json } from "../../src/core/types.ts";
@@ -455,18 +455,15 @@ export function offloadLimit(readBack: string | null): number {
  *
  * Compared by address, because that is what reaches the host: both the
  * bridge and run_js resolve the offered name before they invoke. `reads` is
- * the called tool's own declaration, found by that address.
- *
- * `secret_get` never gets the wider line, whatever it declares (`NEVER_OWN_STATE`): a secret's value is the one stored
- * value that must not sit in the conversation any longer than it has to, and a declaration added to it by mistake (it
- * lives beside state.get in the same plugin) must not be what decides that.
+ * the called tool's own declaration, found by that address. Only the
+ * declaration is read, never the tool's name: which tools may declare it is
+ * pinned where they are declared (test/console-mounts.ts), and state's
+ * `secret_get`, whose value must not sit in the conversation longer than it
+ * has to, is pinned there as one that does not.
  */
-export function limitForCall(tool: string, reader: { name: string; address: string } | null, reads?: string): number {
-  const ownState = reads === "own-state" && !NEVER_OWN_STATE.has(tool.slice(tool.lastIndexOf(".") + 1));
-  return reader && (tool === reader.address || ownState) ? offloadLimit(null) : offloadLimit(reader?.name ?? null);
+export function limitForCall(tool: string, reader: { name: string; address: string } | null, reads?: ToolReads): number {
+  return reader && (tool === reader.address || reads === "own-state") ? offloadLimit(null) : offloadLimit(reader?.name ?? null);
 }
-/** Tools, by bare name, held to the parking line even when they declare `reads: "own-state"` (`limitForCall`). */
-const NEVER_OWN_STATE: ReadonlySet<string> = new Set(["secret_get"]);
 
 /**
  * What the model gets instead of a result too big to put in the conversation.
@@ -590,7 +587,7 @@ export function parkedReader(tools: MountedTool[]): { name: string; address: str
   return t ? { name: t.name, address: t.address } : null;
 }
 
-export function withLimitNote<T extends { description: string; address: string; reads?: string }>(
+export function withLimitNote<T extends { description: string; address: string; reads?: ToolReads }>(
   tools: T[],
   reader: { name: string; address: string } | null,
 ): T[] {
@@ -998,7 +995,7 @@ export type OfferedTool = {
   name: string; description: string; parameters: Json;
   source: "mount" | "harness" | "caller"; alias: string | null; plugin: string | null; tool: string | null;
   sideEffects?: "read" | "write"; idempotency?: string; replay?: "never" | "safe";
-  modelOnly?: true; reads?: string; exclusive?: true;
+  modelOnly?: true; reads?: ToolReads; exclusive?: true;
 };
 
 /** One of the agent's mounts, offered or not, and its tool list's provenance. */

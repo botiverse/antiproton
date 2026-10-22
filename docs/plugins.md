@@ -443,6 +443,16 @@ reference, and the runtime finds the tool that opens one by this declaration —
 not by the plugin id plus a tool name. Without it, a large result is truncated
 instead of parked, and nothing says why.
 
+**`reads: "own-state"` is the state plugin's `get`, and nobody else's.** It
+says the tool returns a value the agent itself stored, so the runtime holds
+its result to the read-back line instead of parking it at 4 KiB: parked, the
+agent only reads the same bytes back with one more call (`limitForCall`,
+`cf/src/runtime.ts`). The runtime trusts the declaration and never looks at
+what the tool returns or what it is called, so `test/console-mounts.ts` pins
+the exact list of tools that declare it; `secret_get` stays parked by not
+declaring it. Adding a second declarer means changing that list, with a
+reason.
+
 **Show the model an image with a `view` field, never with its bytes.** A result
 object may carry one reserved top-level field, `view: { ref, mimeType, width?,
 height?, bytes }`: `ref` an `artifact://` reference the calling agent can read,
