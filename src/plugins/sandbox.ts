@@ -1,6 +1,6 @@
 import type { Json } from "../core/types.ts";
 import type { CredentialRefKind, HeldFiles, Plugin, PluginContext, MountActivity, MountUsage, Released, SandboxForm } from "./types.ts";
-import { backgrounded, LEASE_KEY, markReleased, releaseRetryMs } from "./types.ts";
+import { backgrounded, identityNote, LEASE_KEY, markIdentity, markReleased, releaseRetryMs } from "./types.ts";
 import type { R2Artifacts } from "../store/artifacts.ts";
 import { AGENT_REF, keyForRef, toAgentRef } from "../store/refs.ts";
 import { spanText } from "../runtime/idle-lease.ts";
@@ -554,7 +554,7 @@ function cfgOf(ctx: PluginContext) {
  * one place that knows how to talk to run9 rather than three that agree.
  */
 function apiFor(cfg: ReturnType<typeof cfgOf>, ctx: PluginContext) {
-  if (!ctx.credential) throw new Error("run9 mount has no credential");
+  if (!ctx.credential) throw markIdentity(new Error(`the run9 API needs an account, and this call had none — ${identityNote(ctx)}`), ctx);
   const cred = JSON.parse(ctx.credential) as Run9Credential;
   const auth = "Basic " + btoa(`${cred.ak}:${cred.sk}`);
   return async (method: string, path: string, body?: unknown) => {
@@ -2607,7 +2607,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       };
     }
 
-    if (!ctx.credential) throw new Error("run9 mount has no credential");
+    if (!ctx.credential) throw markIdentity(new Error(`the run9 API needs an account, and this call had none — ${identityNote(ctx)}`), ctx);
     const cred = JSON.parse(ctx.credential) as Run9Credential;
     const auth = "Basic " + btoa(`${cred.ak}:${cred.sk}`);
 

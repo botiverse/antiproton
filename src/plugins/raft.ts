@@ -35,7 +35,7 @@ import { isSubagentSession } from "../runtime/subagent-session.ts";
 import type { TurnEndEvent, TurnOutcome } from "../runtime/activity.ts";
 import { AGENT_REF, keyForRef, toAgentRef } from "../store/refs.ts";
 import {
-  interrupt, originProblem,
+  identityNote, interrupt, markIdentity, originProblem,
   type ActivityEvent, type InboundEvent, type InboundResult, Interrupt, type ListedTools, type Plugin, type PluginContext,
   type PluginErrorFields, type ToolSchema,
 } from "./types.ts";
@@ -142,7 +142,7 @@ function baseUrl(ctx: PluginContext): URL {
 }
 
 function requireCredential(ctx: PluginContext): string {
-  if (!ctx.credential) throw new Error("raft needs an account: a person must attach an agent credential to this mount");
+  if (!ctx.credential) throw markIdentity(new Error(`raft needs an account: ${identityNote(ctx)}`), ctx);
   return ctx.credential;
 }
 
