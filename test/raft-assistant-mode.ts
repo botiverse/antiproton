@@ -1540,7 +1540,7 @@ await check("send as owner: the implementation with no owner record refuses ever
     inbox: async () => { used.push("inbox"); return { ok: true, data: { items: sendRows0() } }; },
     messages: async () => { used.push("messages"); return { ok: false, status: 404 }; },
     post: async () => { used.push("post"); return { ok: true, status: 200, data: {} }; },
-  } as never;
+  };
   for (const target of ["#ch1", "@bob", "#ch1:aaaaaaa1", conv(1).channelId]) {
     const e = await sendAsOwner({ target, content: "Friday works." }, a.ctx, deps).catch((x) => x as Error);
     must(e instanceof Error && (e as Error & { retryable?: unknown }).retryable === false, `${target}: ${show(e)} ${(e as Error)?.message}`);
