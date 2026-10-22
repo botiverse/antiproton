@@ -865,7 +865,7 @@ await check("MODEL_PICKER_ENFORCE: only exactly \"1\" enforces; no wrangler conf
     must(modelPickerEnforced({ MODEL_PICKER_ENFORCE: v }) === on, `${show(v)} read as ${!on ? "on" : "off"}`);
   }
   // Comment lines dropped (test/eval-seed.ts `varsOf` reads the configs the same way); the name anywhere else is set.
-  for (const file of ["wrangler.jsonc", "wrangler.preview.jsonc"]) {
+  for (const file of ["wrangler.jsonc", "wrangler.preview.jsonc", "wrangler.canary.jsonc"]) {
     const code = readFileSync(new URL(`../cf/${file}`, import.meta.url), "utf8").split("\n").filter((l) => !l.trim().startsWith("//")).join("\n");
     must(!code.includes("MODEL_PICKER_ENFORCE"), `cf/${file} sets MODEL_PICKER_ENFORCE: Raft does not set every server's switch yet`);
   }

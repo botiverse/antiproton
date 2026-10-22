@@ -217,6 +217,12 @@ export interface Env {
    */
   EVAL_SEED_ROUTES?: string;
   /**
+   * "1" lets POST /admin/provider-tokens register a token by its hash, so the holder keeps the plaintext
+   * (cf/src/admin-provider-tokens.ts). Set in cf/wrangler.preview.jsonc and cf/wrangler.canary.jsonc only;
+   * test/provider-tokens.ts fails if cf/wrangler.jsonc sets it. Anything else: a `hash` field is refused with 403.
+   */
+  PROVIDER_TOKEN_HASH_REGISTRATION?: string;
+  /**
    * "1" applies each Raft server's model-picker switch (PUT /provision/servers/:id/model-picker): with it off, a provider
    * pick of another model than the default is 403 model_picker_disabled (cf/src/provision/handlers.ts `pickerProblem`).
    * Anything else, or unset: the switch is stored and reported but refuses nothing. Set in no wrangler config until Raft
@@ -4031,7 +4037,7 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
     // The operator's service tokens (task #7): identities, so before any object as well.
     if (url.pathname === "/admin/service-tokens") return adminServiceTokens(request, env.AUTOMATION_TOKEN, d1ServiceTokens(env.CONTROL_DB), url, d1ProvisionedAgents(env.CONTROL_DB));
     // A Raft server's provider tokens, and the agents it provisions with them (raft-agent-provider.v1).
-    if (url.pathname === "/admin/provider-tokens") return adminProviderTokens(request, env.AUTOMATION_TOKEN, d1ProviderTokens(env.CONTROL_DB), url);
+    if (url.pathname === "/admin/provider-tokens") return adminProviderTokens(request, env.AUTOMATION_TOKEN, d1ProviderTokens(env.CONTROL_DB), url, { hashRegistration: env.PROVIDER_TOKEN_HASH_REGISTRATION === "1" });
     // Every tenant's estimated cost (credits phase 1: accounting, nothing enforced). The operator's token, or a
     // signed-in admin as /admin/spend-limits takes, so the admin host's page can read it. Someone signed in who
     // is not an admin is told nothing, as there; no identity at all keeps the route's own 401.
