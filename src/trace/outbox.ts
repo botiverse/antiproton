@@ -104,7 +104,8 @@ export const TRACE_KINDS = ["model.call", "tool.call", "approval.wait", "contain
   "turn.stop", "js.run", "tool.refused", "model.attempt",
   "rebuild.decision", "rebuild.outcome", "rebuild.behaviour", "session.needs_reset", "turn.timing", "turn.end_unrecorded", "import.hold", "model.prewarm",
   "agent.ready", "mount.settings", "subagent.start", "subagent.turn", "subagent.model_changed", "github.refresh", "raft.held", "raft.held_answer", "raft.state_failed", "raft.state_save_failed", "raft.mcp_call",
-  "raft.assistant_wake", "raft.assistant_notify", "raft.assistant_rules", "raft.assistant_chat_told", "raft.assistant_send_as_owner", "raft.turn_ended", "raft.assistant_check", "raft.session_unsealable"] as const;
+  "raft.assistant_wake", "raft.assistant_notify", "raft.assistant_rules", "raft.assistant_chat_told", "raft.assistant_send_as_owner", "raft.turn_ended", "raft.assistant_check", "raft.session_unsealable",
+  "raft.assistant_reminder"] as const;
 export type TraceKind = (typeof TRACE_KINDS)[number];
 
 /**
@@ -137,11 +138,14 @@ export type TraceKind = (typeof TRACE_KINDS)[number];
  * Raft's status and code (`pushBriefImport`); never text. `raft.session_unsealable` is an Agent Login session kept for an
  * app that did not open, so the agent signs in again: why (`no_credential`, `does_not_decrypt` — sealed under another
  * credential, or damaged — `not_json`, `not_a_list`) and the Raft service id, never the row or the key
- * (src/plugins/raft-agent-login.ts `loadSession`).
+ * (src/plugins/raft-agent-login.ts `loadSession`). `raft.assistant_reminder` is one call of the assistant's
+ * Reminder tool: `action`, the action's name only when the app's manifest has it, and `outcome` (`actions`, `result`,
+ * `approval_required`, `install_required`, `unavailable`, `refused:<why>` or `error:<SDK code>`), never the params, the
+ * app's answer or its session (src/plugins/raft-assistant-reminder.ts).
  */
 export const PLUGIN_TRACE_KINDS = ["raft.held", "raft.held_answer", "raft.state_failed", "raft.mcp_call", "raft.assistant_wake", "raft.assistant_notify",
   "raft.assistant_rules", "raft.assistant_chat_told", "raft.assistant_send_as_owner", "raft.turn_ended", "raft.assistant_check",
-  "raft.session_unsealable"] as const satisfies readonly TraceKind[];
+  "raft.session_unsealable", "raft.assistant_reminder"] as const satisfies readonly TraceKind[];
 export type PluginTraceKind = (typeof PLUGIN_TRACE_KINDS)[number];
 
 export const TRACE_VERDICTS = ["ok", "failed", "blocked", "cancelled"] as const;
