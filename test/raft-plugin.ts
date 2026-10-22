@@ -146,7 +146,7 @@ const OWN = ["receive_events", "enable_push", "disable_push", "push_status", "in
  * by a snapshot that lists them, never by the no-snapshot fallback (test/raft-assistant.ts and
  * test/raft-assistant-mode.ts hold them).
  */
-const ASSISTANT = ["assistant_owner_inbox", "assistant_owner_messages", "assistant_notify_owner", "assistant_preferences", "assistant_send_as_owner"];
+const ASSISTANT = ["assistant_owner_inbox", "assistant_owner_messages", "assistant_notify_owner", "assistant_preferences", "assistant_send_as_owner", "assistant_reminder"];
 /** The image view: hand-written, and offered exactly where the download is (test/raft-attachments-view.ts holds it). */
 const VIEW = "attachments_view";
 /** The upload: hand-written, offered with storage to a credential holding `send` (test/raft-attachments-upload.ts holds it). */
@@ -1282,7 +1282,7 @@ await check("a version-2 mount's cursor and frontier become the SDK's state: the
   const since = new URL(calls[0]!.url).searchParams.get("since");
   if (since !== "41") throw new Error(`the carried-over batch was not the one acknowledged: since=${since}`);
   const st = tables.get(scope, "inbox", "state") as any;
-  if (tables.version(scope) !== 6 || st?.schema !== "raft-sdk-state.v1" || st.frontier?.targets?.["#general"]?.upTo !== 30) {
+  if (tables.version(scope) !== 7 || st?.schema !== "raft-sdk-state.v1" || st.frontier?.targets?.["#general"]?.upTo !== 30) {
     throw new Error(`upgrade: version ${tables.version(scope)}, state ${JSON.stringify(st)}`);
   }
   if (tables.get(scope, "inbox", "cursor") !== undefined || tables.get(scope, "inbox", "frontier") !== undefined) throw new Error("version-2 keys survived");

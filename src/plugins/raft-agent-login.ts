@@ -251,7 +251,7 @@ const unb64 = (s: string) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
  * none of the sessions kept under the old one, and the next call signs in again as the new account, which is right:
  * those sessions belonged to the identity the old credential named.
  */
-async function sealingKey(ctx: PluginContext): Promise<Awaited<ReturnType<typeof crypto.subtle.deriveKey>>> {
+async function sealingKey(ctx: PluginContext, info = "antiproton raft agent-login session v1"): Promise<Awaited<ReturnType<typeof crypto.subtle.deriveKey>>> {
   // Not reachable through any tool today, and kept so that stays true: `loadSession` swallows this throw (a kept
   // session that does not open is "no session", not a failure), and `storeSession` runs only after a Raft call that
   // needs the credential itself, so every Agent Login tool fails first at raft.ts `requireCredential` — which reports
@@ -260,9 +260,29 @@ async function sealingKey(ctx: PluginContext): Promise<Awaited<ReturnType<typeof
   if (!ctx.credential) throw markIdentity(fail(`raft needs an account: ${identityNote(ctx)}`), ctx);
   const material = await crypto.subtle.importKey("raw", enc.encode(ctx.credential), "HKDF", false, ["deriveKey"]);
   return crypto.subtle.deriveKey(
-    { name: "HKDF", hash: "SHA-256", salt: enc.encode(`${ctx.caller.tenantId}\u0000${ctx.caller.agentId}\u0000${ctx.alias}`), info: enc.encode("antiproton raft agent-login session v1") },
+    { name: "HKDF", hash: "SHA-256", salt: enc.encode(`${ctx.caller.tenantId}\u0000${ctx.caller.agentId}\u0000${ctx.alias}`), info: enc.encode(info) },
     material, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"],
   );
+}
+
+/**
+ * `plaintext` sealed as this module seals a session, under a key of its own (`info`, so no row of one store opens as
+ * another's) and bound to `aad`: for another store of app sessions in the mount's database (the Raft SDK's
+ * `integrationSessions`, src/plugins/raft-assistant-reminder.ts). The same rules as the sessions here: only this
+ * mount's Raft credential opens it, and a replaced or removed credential opens nothing kept under the old one.
+ */
+export async function seal(ctx: PluginContext, info: string, aad: string, plaintext: string): Promise<{ iv: string; ciphertext: string }> {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv, additionalData: enc.encode(aad) }, await sealingKey(ctx, info), enc.encode(plaintext));
+  return { iv: b64(iv), ciphertext: b64(new Uint8Array(ct)) };
+}
+
+/** What {@link seal} sealed, or null when it does not open under this mount's key and `aad` (or there is no credential). */
+export async function unseal(ctx: PluginContext, info: string, aad: string, sealed: { iv: string; ciphertext: string }): Promise<string | null> {
+  try {
+    const pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv: unb64(sealed.iv), additionalData: enc.encode(aad) }, await sealingKey(ctx, info), unb64(sealed.ciphertext));
+    return dec.decode(pt);
+  } catch { return null; }
 }
 
 interface StoredSession {
