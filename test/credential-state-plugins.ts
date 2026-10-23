@@ -22,6 +22,7 @@ import { join } from "node:path";
 import { appworldPlugins, type Catalogue } from "../src/plugins/appworld.ts";
 import { exaPlugin } from "../src/plugins/exa.ts";
 import { githubPlugin } from "../src/plugins/github.ts";
+import { stampPlugin } from "../src/plugins/stamp.ts";
 import { raftPlugin } from "../src/plugins/raft.ts";
 import { SESSION_STORE } from "../src/plugins/raft-agent-login.ts";
 import { PluginDbTables } from "../src/store/plugin-db.ts";
@@ -71,6 +72,7 @@ const CREDENTIAL_PLUGINS: Record<string, Case> = {
   exa: { plugin: exaPlugin, tool: "search", args: { query: "anything" }, config: {} },
   github: { plugin: githubPlugin, tool: "issue_create",
     args: { owner: "botiverse", repo: "antiproton", title: "t", body: "b" }, config: {} },
+  stamp: { plugin: stampPlugin, tool: "whoami", args: {}, config: {} },
   raft: { plugin: raftPlugin, tool: "receive_events", args: {}, config: { serverUrl: "https://api.raft.build" } },
   // AppWorld's catalogue is gitignored and a mount does not need it: one app with one API is enough to
   // build the plugin and call it, the same stand-in `test/mount-config.ts` uses.

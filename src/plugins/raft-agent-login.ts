@@ -243,15 +243,22 @@ const dec = new TextDecoder();
 const b64 = (u: Uint8Array) => btoa(String.fromCharCode(...u));
 const unb64 = (s: string) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
 
+/** The `info` this module seals its own cookie sessions under; see {@link sealingKeyFor}. */
+const SEAL_INFO = "antiproton raft agent-login session v1";
+
 /**
- * The key a mount's sessions are sealed under: HKDF-SHA-256 of the mount's Raft credential, salted with the mount's
- * place (tenant, agent, alias). Derived rather than taken from the Worker's SECRET_KEK because no plugin but `state` is
+ * The key a mount's secrets are sealed under: HKDF-SHA-256 of the mount's credential, salted with the mount's
+ * place (tenant, agent, alias) and separated by `info` (one kind of secret per value), so two plugins under one
+ * mount never open each other's rows. Derived rather than taken from the Worker's SECRET_KEK because no plugin but `state` is
  * handed that key (src/plugins/types.ts `readsOwnerSecrets`, test/console-mounts.ts), and the credential is itself kept
  * sealed under it: reading a session needs what reading the credential needs. A credential replaced or removed opens
  * none of the sessions kept under the old one, and the next call signs in again as the new account, which is right:
  * those sessions belonged to the identity the old credential named.
  */
-async function sealingKey(ctx: PluginContext): Promise<Awaited<ReturnType<typeof crypto.subtle.deriveKey>>> {
+/** A key `sealingKeyFor` derives (node's types declare no global `CryptoKey`). */
+type SealingKey = Awaited<ReturnType<typeof crypto.subtle.deriveKey>>;
+
+export async function sealingKeyFor(ctx: PluginContext, info: string): Promise<SealingKey> {
   // Not reachable through any tool today, and kept so that stays true: `loadSession` swallows this throw (a kept
   // session that does not open is "no session", not a failure), and `storeSession` runs only after a Raft call that
   // needs the credential itself, so every Agent Login tool fails first at raft.ts `requireCredential` — which reports
@@ -260,9 +267,49 @@ async function sealingKey(ctx: PluginContext): Promise<Awaited<ReturnType<typeof
   if (!ctx.credential) throw markIdentity(fail(`raft needs an account: ${identityNote(ctx)}`), ctx);
   const material = await crypto.subtle.importKey("raw", enc.encode(ctx.credential), "HKDF", false, ["deriveKey"]);
   return crypto.subtle.deriveKey(
-    { name: "HKDF", hash: "SHA-256", salt: enc.encode(`${ctx.caller.tenantId}\u0000${ctx.caller.agentId}\u0000${ctx.alias}`), info: enc.encode("antiproton raft agent-login session v1") },
+    { name: "HKDF", hash: "SHA-256", salt: enc.encode(`${ctx.caller.tenantId}\u0000${ctx.caller.agentId}\u0000${ctx.alias}`), info: enc.encode(info) },
     material, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"],
   );
+}
+
+/** The key {@link storeSession} seals under. */
+function sealingKey(ctx: PluginContext): Promise<SealingKey> {
+  return sealingKeyFor(ctx, SEAL_INFO);
+}
+
+/**
+ * Seal a string under this mount's key, for a plugin that keeps a session of
+ * its own in the same way (a Connected App's session, which is this module's
+ * subject, or an agent session another service issued — `stamp.ts`).
+ *
+ * `info` separates one kind of secret from another even under one mount, and
+ * `additionalData` binds the ciphertext to what it belongs to, so a row copied
+ * under another id does not open. Both must be the same on the way out.
+ */
+export async function sealText(
+  ctx: PluginContext, info: string, plaintext: string, additionalData: string,
+): Promise<{ iv: string; ciphertext: string }> {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv, additionalData: enc.encode(additionalData) },
+    await sealingKeyFor(ctx, info), enc.encode(plaintext),
+  );
+  return { iv: b64(iv), ciphertext: b64(new Uint8Array(ct)) };
+}
+
+/** The other half of {@link sealText}: the plaintext, or null when this mount's key does not open it. */
+export async function openText(
+  ctx: PluginContext, info: string, sealed: { iv: string; ciphertext: string }, additionalData: string,
+): Promise<string | null> {
+  let key: SealingKey;
+  try { key = await sealingKeyFor(ctx, info); } catch { return null; }
+  try {
+    const pt = await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: unb64(sealed.iv), additionalData: enc.encode(additionalData) },
+      key, unb64(sealed.ciphertext),
+    );
+    return dec.decode(pt);
+  } catch { return null; }
 }
 
 interface StoredSession {
