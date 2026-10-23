@@ -13,6 +13,7 @@ import { AgentRuntime, SEEDED_PLUGINS } from "../cf/src/runtime.ts";
 import { capabilityTags } from "../scripts/plugin-capabilities.ts";
 import { policyFor } from "../src/runtime/gateway.ts";
 import { githubPlugin } from "../src/plugins/github.ts";
+import { stampPlugin } from "../src/plugins/stamp.ts";
 import { sandboxPlugin, execArgv, execOutput, sessionOf, activityOf, providerOf, keepSessions, usageOf, asBoxState, segmentsOf, keptNote, savedNote, notAReasonToRelease } from "../src/plugins/sandbox.ts";
 import { httpPlugin } from "../src/plugins/http.ts";
 import { exaPlugin } from "../src/plugins/exa.ts";
@@ -227,7 +228,7 @@ const CREDENTIAL_SHAPED = /token|secret|key|password|credential|auth|bearer/i;
 // deliberately absent: it declares no settings, credential or hooks, so no
 // check below has anything to read. Add it when it gains any of them.
 const everyPlugin: Plugin[] = [
-  githubPlugin, httpPlugin, exaPlugin, demoPlugin, run9,
+  githubPlugin, stampPlugin, httpPlugin, exaPlugin, demoPlugin, run9,
   statePlugin(null as any, null, "local"),
   artifactsPlugin(null as any, "local"),
   raftPlugin,
