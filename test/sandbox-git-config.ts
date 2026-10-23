@@ -25,7 +25,7 @@ const github = githubPlugin.sandboxForm!;
 // `Authorization: Bearer`), declared at index 0 the way github declares its own.
 const header: SandboxForm = {
   summary: "git over HTTPS to stamp.build",
-  egress: [{ name: "STAMP_SESSION", header: "authorization", hosts: ["stamp.build"], value: (t: string) => `Bearer ${t}` }] as any,
+  egress: [{ name: "STAMP_SESSION", header: "authorization", hosts: ["stamp.build"], value: (t) => `Bearer ${t}`, placeholder: (p) => `Bearer ${p}` }],
   env: (p) => ({
     GIT_CONFIG_COUNT: "1",
     GIT_CONFIG_KEY_0: "http.https://stamp.build/.extraHeader",

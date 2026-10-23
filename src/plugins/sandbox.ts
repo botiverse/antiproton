@@ -1409,7 +1409,9 @@ export function claimedNames(form: SandboxForm): string[] {
  *
  * One limit worth knowing: two forms setting the same config key both apply,
  * in this order. For a multi-valued key (`credential.helper`) that is what git
- * does anyway; for a single-valued one the later mount wins.
+ * does anyway; for a single-valued one git takes the first, so the mount wired
+ * first wins and the other is ignored without a word (two mounts of one origin
+ * would push as the first account: git 2.39.5, two `http.<url>.extraHeader`).
  */
 export function envFor(state: BoxState | null): Record<string, string> {
   const env: Record<string, string> = {};
