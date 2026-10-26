@@ -1,0 +1,3652 @@
+{
+ "the plugin as declared: tools, settings and credential, with and without a lease": [
+  {
+   "id": "sandbox",
+   "version": "1.0.0",
+   "provides": [
+    "container"
+   ],
+   "database": {
+    "version": 1,
+    "stores": {
+     "box": {
+      "listed": [
+       "state"
+      ]
+     }
+    }
+   },
+   "credential": {
+    "required": true,
+    "summary": "run9 access and secret keys, as JSON.",
+    "shape": {
+     "keys": [
+      {
+       "name": "ak",
+       "summary": "run9 access key, from the run9 console."
+      },
+      {
+       "name": "sk",
+       "summary": "run9 secret key, issued with the access key."
+      }
+     ]
+    },
+    "grants": "starting and destroying containers, which are billed by the second.",
+    "docs": "https://run.sys9.ai"
+   },
+   "config": [
+    {
+     "name": "provider",
+     "type": "string",
+     "choices": [
+      "run9"
+     ],
+     "default": "run9",
+     "summary": "Which sandbox provider runs the container. Only run9 today."
+    },
+    {
+     "name": "image",
+     "type": "string",
+     "summary": "Container image to start from.",
+     "default": "public.ecr.aws/docker/library/node:24-bookworm"
+    },
+    {
+     "name": "workdir",
+     "type": "string",
+     "summary": "Where scripts run and npm installs land. They must match, or Node resolves modules from somewhere npm did not install to.",
+     "default": "/work"
+    },
+    {
+     "name": "shape",
+     "type": "string",
+     "summary": "Machine size, e.g. 2c4g. Larger costs more per second."
+    },
+    {
+     "name": "shell",
+     "type": "string",
+     "summary": "Shell the shell tool runs commands in.",
+     "default": "/bin/sh"
+    },
+    {
+     "name": "shellPrefix",
+     "type": "string",
+     "summary": "Prepended to every shell command — for images whose toolchain lives in an environment a plain shell never enters."
+    },
+    {
+     "name": "network",
+     "type": "string",
+     "choices": [
+      "open",
+      "none"
+     ],
+     "default": "open",
+     "summary": "\"open\" or \"none\". With none every command runs in an empty network namespace: no route out, not even DNS."
+    },
+    {
+     "name": "timeoutMs",
+     "type": "number",
+     "summary": "How long one request to the provider may take.",
+     "default": 120000
+    },
+    {
+     "name": "graceMs",
+     "type": "number",
+     "default": 5000,
+     "summary": "How long a command may run before it is handed over as a background job. Short commands still answer in the call; longer ones return a job and the agent carries on."
+    },
+    {
+     "name": "maxOutputBytes",
+     "type": "number",
+     "summary": "Output longer than this is cut and the rest discarded, not kept anywhere. A command whose output matters should write it to a file and save that.",
+     "default": 24000
+    },
+    {
+     "name": "accounts",
+     "type": "string",
+     "choices": [
+      "all",
+      "none"
+     ],
+     "default": "all",
+     "summary": "\"all\" lets tools in the container act as this agent's other accounts: every mount whose plugin can (GitHub: gh and git) and that holds a credential. The container holds a placeholder that run9 swaps for the credential only on requests to that service's hosts, so nothing in it can read the credential. \"none\" turns this off."
+    },
+    {
+     "name": "github",
+     "type": "string",
+     "summary": "Replaced by accounts. An empty value still turns wiring off, as it did; any other value does nothing."
+    },
+    {
+     "name": "maxQuietMinutes",
+     "type": "number",
+     "default": 60,
+     "summary": "Longest a single postponement of the release may be. The quiet tool refuses a larger one rather than shortening it: an agent that asks for a day and is silently given an hour believes it has a day."
+    },
+    {
+     "name": "keepStoppedDays",
+     "type": "number",
+     "default": 7,
+     "summary": "Days a container switched off for being idle keeps its disk before it is deleted; the agent is told a day before (at most half of this)."
+    },
+    {
+     "name": "maxMachines",
+     "type": "number",
+     "default": 3,
+     "summary": "How many machines (separate named containers) an agent may have on this mount at once, the default one included. Switched-off ones count, since each keeps a disk; one more is refused until one is released."
+    },
+    {
+     "name": "project",
+     "type": "string",
+     "summary": "run9 project the boxes belong to.",
+     "default": "default"
+    },
+    {
+     "name": "endpoint",
+     "type": "string",
+     "summary": "API endpoint.",
+     "default": "https://api.run.sys9.ai"
+    },
+    {
+     "name": "verifyWith",
+     "type": "string",
+     "choices": [
+      "provider",
+      "endpoint"
+     ],
+     "default": "provider",
+     "summary": "Who answers whether the credential works: the provider's own API, or the endpoint's `/credential`."
+    }
+   ],
+   "holdsTools": {
+    "release": "release",
+    "postpone": "quiet"
+   },
+   "tools": [
+    {
+     "name": "run",
+     "summary": "LAST RESORT for JavaScript. Prefer an ordinary code block, which is instant and free; this starts a container that is billed for every second it exists, and it cannot call your other tools. Use it only when you genuinely need npm packages, a real filesystem, or more than a few seconds of compute. The container is NOT the per-execution sandbox: every call in this turn uses the same one, so installs and files survive from one call to the next — do not reinstall. It is handed back when the turn ends, so a later turn starts a new container unless you saved this one's filesystem with `keep`. Work in as few calls as you can, save what matters with `save`, and release it. Everything inside is destroyed when it is released. Every call uses the mount's one machine unless you pass `machine`: another short name is a separate container with its own files, directory and idle schedule, created on first use and released on its own. Use one unless you need two at once; at most a few (3 unless the operator set `maxMachines`) may exist at once, switched-off ones included, and `machines` lists them.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "code": {
+        "type": "string",
+        "description": "JavaScript, run with `node -e`"
+       },
+       "machine": {
+        "type": "string",
+        "description": "which of this mount's machines: omit for the default one (\"main\"); another short name (lowercase letters, digits, dashes) uses that separate machine, creating it on first use"
+       },
+       "install": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        },
+        "description": "npm packages to install first, e.g. ['zod']"
+       }
+      },
+      "required": [
+       "code"
+      ]
+     },
+     "sideEffects": "write",
+     "idempotency": "none"
+    },
+    {
+     "name": "shell",
+     "summary": "Shell in the same billed-by-the-second container as `run`, and the same one for every call in this turn — state, installed packages and files carry over from one call to the next, and the container is handed back when the turn ends. Each call starts in the directory the previous call ended in, like one terminal session, and its result says where that is (`cwd`); the first starts in the working directory. Pass `workdir` to run one command in another directory instead of starting it with `cd`. Exported variables and aliases do not carry over, so set them in the command that needs them, and a command handed over as a job does not move the directory. Only for what needs a real machine (builds, tests, git). The default image is node:24-bookworm (Debian): Node, npm, git, curl, make, gcc/g++, Python 3, bash, ssh and apt-get are present; pip, jq, rg and gh are NOT, and `apt-get update && apt-get install -y <pkg>` installs more. An operator may have configured a different image; every result reports which one this container started from, so read that instead of probing for it. Save anything worth keeping, then release. Every call uses the mount's one machine unless you pass `machine`: another short name is a separate container with its own files, directory and idle schedule, created on first use and released on its own. Use one unless you need two at once; at most a few (3 unless the operator set `maxMachines`) may exist at once, switched-off ones included, and `machines` lists them.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "command": {
+        "type": "string"
+       },
+       "machine": {
+        "type": "string",
+        "description": "which of this mount's machines: omit for the default one (\"main\"); another short name (lowercase letters, digits, dashes) uses that separate machine, creating it on first use"
+       },
+       "workdir": {
+        "type": "string",
+        "description": "directory to run this command in; relative paths start from the current one. Omit it to start where the previous command ended"
+       }
+      },
+      "required": [
+       "command"
+      ]
+     },
+     "sideEffects": "write",
+     "idempotency": "none"
+    },
+    {
+     "name": "save",
+     "summary": "Copy a file out of the container into durable storage before it is destroyed. Returns an r2:// reference the artifacts mount can read back, and that outlives the box. Set archive for a directory. Do this for anything worth keeping — a build output, a report, a diff — the moment it exists, not at the end. A copy outliving the container is not a reason to release it early: it is handed back when the turn ends anyway, and until then it is still the machine you are working on.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string",
+        "description": "absolute path inside the box"
+       },
+       "archive": {
+        "type": "boolean",
+        "description": "true to take a directory as a tar"
+       },
+       "machine": {
+        "type": "string",
+        "description": "which of this mount's machines: omit for the default one (\"main\"); another short name (lowercase letters, digits, dashes) uses that separate machine, creating it on first use"
+       }
+      },
+      "required": [
+       "path"
+      ]
+     },
+     "sideEffects": "write",
+     "idempotency": "none"
+    },
+    {
+     "name": "put",
+     "summary": "Copy a stored file into the container, so a command there can work on it. `ref` is an artifact:// reference of yours: what an attachment download or `save` returned. The usual way to process an attachment is: download it (attachments_download_url), `put` it here, work on it with `shell` or `run`, `save` the result, then view or upload what `save` returned. No URLs: anything from outside arrives through a download first. At most 25 MiB. Returns the path, size and sha256 as the container has it. An existing file at the path is replaced.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "ref": {
+        "type": "string",
+        "description": "artifact:// reference to copy in"
+       },
+       "path": {
+        "type": "string",
+        "description": "where the file goes, inside the working directory; relative paths start there, e.g. \"in/photo.jpg\""
+       },
+       "machine": {
+        "type": "string",
+        "description": "which of this mount's machines: omit for the default one (\"main\"); another short name (lowercase letters, digits, dashes) uses that separate machine, creating it on first use"
+       }
+      },
+      "required": [
+       "ref",
+       "path"
+      ]
+     },
+     "sideEffects": "write",
+     "idempotency": "none"
+    },
+    {
+     "name": "keep",
+     "summary": "Save this container's filesystem under a name, so a later task can start from it instead of installing everything again. Use it once the environment is set up — interpreter, packages, a cloned repository — not for the results, which belong in `save`. The container keeps running; the snapshot is independent of it. A copy outliving the container is not a reason to release it early: it is handed back when the turn ends anyway, and until then it is still the machine you are working on.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "name": {
+        "type": "string",
+        "description": "short name you will recognise later, e.g. 'py-scipy'"
+       },
+       "note": {
+        "type": "string",
+        "description": "one line on what is in it"
+       },
+       "machine": {
+        "type": "string",
+        "description": "which of this mount's machines: omit for the default one (\"main\"); another short name (lowercase letters, digits, dashes) uses that separate machine, creating it on first use"
+       }
+      },
+      "required": [
+       "name"
+      ]
+     },
+     "sideEffects": "write",
+     "idempotency": "none"
+    },
+    {
+     "name": "start_from",
+     "summary": "Begin from an environment kept earlier instead of a bare image. Naming one releases the current container if there is one; the next run or shell starts from the snapshot. Call with no name to see what has been kept, which releases nothing. Setting up a machine is usually the slowest and most expensive part of using one, and this is how you stop paying for it twice. Pass `machine` to start that machine from it instead of the default one; kept environments are shared by all of the mount's machines.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "name": {
+        "type": "string",
+        "description": "the kept environment to start from; omit to list them"
+       },
+       "machine": {
+        "type": "string",
+        "description": "which of this mount's machines: omit for the default one (\"main\"); another short name (lowercase letters, digits, dashes) uses that separate machine, creating it on first use"
+       }
+      }
+     },
+     "sideEffects": "write",
+     "idempotency": "none"
+    },
+    {
+     "name": "release",
+     "summary": "Destroy the container and everything in it, stopping the meter. Pass save to copy files out first, in the same call. It is handed back when the turn ends anyway, so release it sooner once this machine will not be needed again in this turn. A later turn starts a fresh machine: what it needs has to be kept or saved before this turn ends.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "save": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        },
+        "description": "absolute paths to keep before destroying the box"
+       },
+       "machine": {
+        "type": "string",
+        "description": "which of this mount's machines: omit for the default one (\"main\"); another short name (lowercase letters, digits, dashes) uses that separate machine, creating it on first use"
+       }
+      }
+     },
+     "sideEffects": "write",
+     "idempotency": "native"
+    },
+    {
+     "name": "quiet",
+     "summary": "Has no effect here: this mount has no idle release to put off, and the container is handed back when the turn ends whatever you ask. To carry work into a later turn, keep or save it.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "minutes": {
+        "type": "number",
+        "description": "how many more minutes to keep the container, from now; a request over the mount's limit is refused, not shortened"
+       },
+       "machine": {
+        "type": "string",
+        "description": "which of this mount's machines: omit for the default one (\"main\"); another short name (lowercase letters, digits, dashes) uses that separate machine, creating it on first use"
+       }
+      },
+      "required": [
+       "minutes"
+      ]
+     },
+     "sideEffects": "write",
+     "idempotency": "none"
+    },
+    {
+     "name": "machines",
+     "summary": "List this mount's machines: each one's name, whether it is running or switched off, its image, when it was created and last used, and when it will be switched off or deleted if nothing uses it. Reads the record only; starts, wakes and bills nothing.",
+     "parameters": {
+      "type": "object",
+      "properties": {}
+     },
+     "sideEffects": "read",
+     "idempotency": "native"
+    }
+   ]
+  },
+  {
+   "id": "sandbox",
+   "version": "1.0.0",
+   "provides": [
+    "container"
+   ],
+   "database": {
+    "version": 1,
+    "stores": {
+     "box": {
+      "listed": [
+       "state"
+      ]
+     }
+    }
+   },
+   "credential": {
+    "required": true,
+    "summary": "run9 access and secret keys, as JSON.",
+    "shape": {
+     "keys": [
+      {
+       "name": "ak",
+       "summary": "run9 access key, from the run9 console."
+      },
+      {
+       "name": "sk",
+       "summary": "run9 secret key, issued with the access key."
+      }
+     ]
+    },
+    "grants": "starting and destroying containers, which are billed by the second.",
+    "docs": "https://run.sys9.ai"
+   },
+   "config": [
+    {
+     "name": "provider",
+     "type": "string",
+     "choices": [
+      "run9"
+     ],
+     "default": "run9",
+     "summary": "Which sandbox provider runs the container. Only run9 today."
+    },
+    {
+     "name": "image",
+     "type": "string",
+     "summary": "Container image to start from.",
+     "default": "public.ecr.aws/docker/library/node:24-bookworm"
+    },
+    {
+     "name": "workdir",
+     "type": "string",
+     "summary": "Where scripts run and npm installs land. They must match, or Node resolves modules from somewhere npm did not install to.",
+     "default": "/work"
+    },
+    {
+     "name": "shape",
+     "type": "string",
+     "summary": "Machine size, e.g. 2c4g. Larger costs more per second."
+    },
+    {
+     "name": "shell",
+     "type": "string",
+     "summary": "Shell the shell tool runs commands in.",
+     "default": "/bin/sh"
+    },
+    {
+     "name": "shellPrefix",
+     "type": "string",
+     "summary": "Prepended to every shell command — for images whose toolchain lives in an environment a plain shell never enters."
+    },
+    {
+     "name": "network",
+     "type": "string",
+     "choices": [
+      "open",
+      "none"
+     ],
+     "default": "open",
+     "summary": "\"open\" or \"none\". With none every command runs in an empty network namespace: no route out, not even DNS."
+    },
+    {
+     "name": "timeoutMs",
+     "type": "number",
+     "summary": "How long one request to the provider may take.",
+     "default": 120000
+    },
+    {
+     "name": "graceMs",
+     "type": "number",
+     "default": 5000,
+     "summary": "How long a command may run before it is handed over as a background job. Short commands still answer in the call; longer ones return a job and the agent carries on."
+    },
+    {
+     "name": "maxOutputBytes",
+     "type": "number",
+     "summary": "Output longer than this is cut and the rest discarded, not kept anywhere. A command whose output matters should write it to a file and save that.",
+     "default": 24000
+    },
+    {
+     "name": "accounts",
+     "type": "string",
+     "choices": [
+      "all",
+      "none"
+     ],
+     "default": "all",
+     "summary": "\"all\" lets tools in the container act as this agent's other accounts: every mount whose plugin can (GitHub: gh and git) and that holds a credential. The container holds a placeholder that run9 swaps for the credential only on requests to that service's hosts, so nothing in it can read the credential. \"none\" turns this off."
+    },
+    {
+     "name": "github",
+     "type": "string",
+     "summary": "Replaced by accounts. An empty value still turns wiring off, as it did; any other value does nothing."
+    },
+    {
+     "name": "maxQuietMinutes",
+     "type": "number",
+     "default": 60,
+     "summary": "Longest a single postponement of the release may be. The quiet tool refuses a larger one rather than shortening it: an agent that asks for a day and is silently given an hour believes it has a day."
+    },
+    {
+     "name": "keepStoppedDays",
+     "type": "number",
+     "default": 7,
+     "summary": "Days a container switched off for being idle keeps its disk before it is deleted; the agent is told a day before (at most half of this)."
+    },
+    {
+     "name": "maxMachines",
+     "type": "number",
+     "default": 3,
+     "summary": "How many machines (separate named containers) an agent may have on this mount at once, the default one included. Switched-off ones count, since each keeps a disk; one more is refused until one is released."
+    },
+    {
+     "name": "project",
+     "type": "string",
+     "summary": "run9 project the boxes belong to.",
+     "default": "default"
+    },
+    {
+     "name": "endpoint",
+     "type": "string",
+     "summary": "API endpoint.",
+     "default": "https://api.run.sys9.ai"
+    },
+    {
+     "name": "verifyWith",
+     "type": "string",
+     "choices": [
+      "provider",
+      "endpoint"
+     ],
+     "default": "provider",
+     "summary": "Who answers whether the credential works: the provider's own API, or the endpoint's `/credential`."
+    }
+   ],
+   "holdsTools": {
+    "release": "release",
+    "postpone": "quiet"
+   },
+   "tools": [
+    {
+     "name": "run",
+     "summary": "LAST RESORT for JavaScript. Prefer an ordinary code block, which is instant and free; this starts a container that is billed for every second it exists, and it cannot call your other tools. Use it only when you genuinely need npm packages, a real filesystem, or more than a few seconds of compute. The container is NOT the per-execution sandbox: every call uses the same one, in this turn and later ones, so installs and files survive from one call to the next — do not reinstall. It stays until you release it; after 30 idle minutes it is switched off, and the next call switches it back on with its files intact (running processes do not survive); it is deleted, with everything on its disk, only after 7 days switched off and unused, and you are told 24 hours before that; `quiet` postpones either by as long as you choose, within the mount's limit; files under /tmp do not survive while it sits idle, so keep your work in the working directory. Work in as few calls as you can, save what matters with `save`, and release it once the machine will not be needed again. Releasing deletes it and everything on its disk. Every call uses the mount's one machine unless you pass `machine`: another short name is a separate container with its own files, directory and idle schedule, created on first use and released on its own. Use one unless you need two at once; at most a few (3 unless the operator set `maxMachines`) may exist at once, switched-off ones included, and `machines` lists them.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "code": {
+        "type": "string",
+        "description": "JavaScript, run with `node -e`"
+       },
+       "machine": {
+        "type": "string",
+        "description": "which of this mount's machines: omit for the default one (\"main\"); another short name (lowercase letters, digits, dashes) uses that separate machine, creating it on first use"
+       },
+       "install": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        },
+        "description": "npm packages to install first, e.g. ['zod']"
+       }
+      },
+      "required": [
+       "code"
+      ]
+     },
+     "sideEffects": "write",
+     "idempotency": "none"
+    },
+    {
+     "name": "shell",
+     "summary": "Shell in the same container as `run`, billed by the second while it runs, and the same one for every call, in this turn and later ones — state, installed packages and files carry over — until you release it; after 30 idle minutes it is switched off, and the next call switches it back on with its files intact (running processes do not survive); it is deleted, with everything on its disk, only after 7 days switched off and unused, and you are told 24 hours before that; `quiet` postpones either by as long as you choose, within the mount's limit; files under /tmp do not survive while it sits idle, so keep your work in the working directory. Each call starts in the directory the previous call ended in, like one terminal session, and its result says where that is (`cwd`); the first starts in the working directory. Pass `workdir` to run one command in another directory instead of starting it with `cd`. Exported variables and aliases do not carry over, so set them in the command that needs them, and a command handed over as a job does not move the directory. Only for what needs a real machine (builds, tests, git). The default image is node:24-bookworm (Debian): Node, npm, git, curl, make, gcc/g++, Python 3, bash, ssh and apt-get are present; pip, jq, rg and gh are NOT, and `apt-get update && apt-get install -y <pkg>` installs more. An operator may have configured a different image; every result reports which one this container started from, so read that instead of probing for it. Save anything worth keeping, then release. Every call uses the mount's one machine unless you pass `machine`: another short name is a separate container with its own files, directory and idle schedule, created on first use and released on its own. Use one unless you need two at once; at most a few (3 unless the operator set `maxMachines`) may exist at once, switched-off ones included, and `machines` lists them.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "command": {
+        "type": "string"
+       },
+       "machine": {
+        "type": "string",
+        "description": "which of this mount's machines: omit for the default one (\"main\"); another short name (lowercase letters, digits, dashes) uses that separate machine, creating it on first use"
+       },
+       "workdir": {
+        "type": "string",
+        "description": "directory to run this command in; relative paths start from the current one. Omit it to start where the previous command ended"
+       }
+      },
+      "required": [
+       "command"
+      ]
+     },
+     "sideEffects": "write",
+     "idempotency": "none"
+    },
+    {
+     "name": "save",
+     "summary": "Copy a file out of the container into durable storage before it is destroyed. Returns an r2:// reference the artifacts mount can read back, and that outlives the box. Set archive for a directory. Do this for anything worth keeping — a build output, a report, a diff — the moment it exists, not at the end. A copy outliving the container is not a reason to release it: if you or the person you are working for will come back to this machine, leave it running — idle, it is only switched off, and the next call brings it back with its files.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string",
+        "description": "absolute path inside the box"
+       },
+       "archive": {
+        "type": "boolean",
+        "description": "true to take a directory as a tar"
+       },
+       "machine": {
+        "type": "string",
+        "description": "which of this mount's machines: omit for the default one (\"main\"); another short name (lowercase letters, digits, dashes) uses that separate machine, creating it on first use"
+       }
+      },
+      "required": [
+       "path"
+      ]
+     },
+     "sideEffects": "write",
+     "idempotency": "none"
+    },
+    {
+     "name": "put",
+     "summary": "Copy a stored file into the container, so a command there can work on it. `ref` is an artifact:// reference of yours: what an attachment download or `save` returned. The usual way to process an attachment is: download it (attachments_download_url), `put` it here, work on it with `shell` or `run`, `save` the result, then view or upload what `save` returned. No URLs: anything from outside arrives through a download first. At most 25 MiB. Returns the path, size and sha256 as the container has it. An existing file at the path is replaced.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "ref": {
+        "type": "string",
+        "description": "artifact:// reference to copy in"
+       },
+       "path": {
+        "type": "string",
+        "description": "where the file goes, inside the working directory; relative paths start there, e.g. \"in/photo.jpg\""
+       },
+       "machine": {
+        "type": "string",
+        "description": "which of this mount's machines: omit for the default one (\"main\"); another short name (lowercase letters, digits, dashes) uses that separate machine, creating it on first use"
+       }
+      },
+      "required": [
+       "ref",
+       "path"
+      ]
+     },
+     "sideEffects": "write",
+     "idempotency": "none"
+    },
+    {
+     "name": "keep",
+     "summary": "Save this container's filesystem under a name, so a later task can start from it instead of installing everything again. Use it once the environment is set up — interpreter, packages, a cloned repository — not for the results, which belong in `save`. The container keeps running; the snapshot is independent of it. A copy outliving the container is not a reason to release it: if you or the person you are working for will come back to this machine, leave it running — idle, it is only switched off, and the next call brings it back with its files.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "name": {
+        "type": "string",
+        "description": "short name you will recognise later, e.g. 'py-scipy'"
+       },
+       "note": {
+        "type": "string",
+        "description": "one line on what is in it"
+       },
+       "machine": {
+        "type": "string",
+        "description": "which of this mount's machines: omit for the default one (\"main\"); another short name (lowercase letters, digits, dashes) uses that separate machine, creating it on first use"
+       }
+      },
+      "required": [
+       "name"
+      ]
+     },
+     "sideEffects": "write",
+     "idempotency": "none"
+    },
+    {
+     "name": "start_from",
+     "summary": "Begin from an environment kept earlier instead of a bare image. Naming one releases the current container if there is one; the next run or shell starts from the snapshot. Call with no name to see what has been kept, which releases nothing. Setting up a machine is usually the slowest and most expensive part of using one, and this is how you stop paying for it twice. Pass `machine` to start that machine from it instead of the default one; kept environments are shared by all of the mount's machines.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "name": {
+        "type": "string",
+        "description": "the kept environment to start from; omit to list them"
+       },
+       "machine": {
+        "type": "string",
+        "description": "which of this mount's machines: omit for the default one (\"main\"); another short name (lowercase letters, digits, dashes) uses that separate machine, creating it on first use"
+       }
+      }
+     },
+     "sideEffects": "write",
+     "idempotency": "none"
+    },
+    {
+     "name": "release",
+     "summary": "Delete the container now: the machine and everything on its disk are destroyed, and the meter stops. Pass save to copy files out first, in the same call. If you or the person you are working for will come back to it, leave it running, even after keeping or saving what is in it. Release it only when this machine will not be needed again. Leaving it costs little: an idle container is only switched off on its own, and the next call brings it back with its files intact; it is deleted on its own only after days switched off, you are told before that, and `quiet` keeps it longer — while releasing it early saves little and makes the next visit start over. A kept environment or a saved file is for starting a fresh machine later, not a reason to destroy one someone will use again.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "save": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        },
+        "description": "absolute paths to keep before destroying the box"
+       },
+       "machine": {
+        "type": "string",
+        "description": "which of this mount's machines: omit for the default one (\"main\"); another short name (lowercase letters, digits, dashes) uses that separate machine, creating it on first use"
+       }
+      }
+     },
+     "sideEffects": "write",
+     "idempotency": "native"
+    },
+    {
+     "name": "quiet",
+     "summary": "Postpone what happens next to this container while it sits unused: switching it off, while it is running; deleting it, once it is switched off. It is kept as it is for at least `minutes` more from now, and you are not told about it again until shortly before then. Use it when you are coming back to the machine — a build you are waiting on, work you return to after reading something. The limit is the mount's while it runs and much longer once it is switched off. Running, it is billed for every second either way; if you are done with it, `release` is the cheaper answer, and it can save files out in the same call.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "minutes": {
+        "type": "number",
+        "description": "how many more minutes to keep the container, from now; a request over the mount's limit is refused, not shortened"
+       },
+       "machine": {
+        "type": "string",
+        "description": "which of this mount's machines: omit for the default one (\"main\"); another short name (lowercase letters, digits, dashes) uses that separate machine, creating it on first use"
+       }
+      },
+      "required": [
+       "minutes"
+      ]
+     },
+     "sideEffects": "write",
+     "idempotency": "none"
+    },
+    {
+     "name": "machines",
+     "summary": "List this mount's machines: each one's name, whether it is running or switched off, its image, when it was created and last used, and when it will be switched off or deleted if nothing uses it. Reads the record only; starts, wakes and bills nothing.",
+     "parameters": {
+      "type": "object",
+      "properties": {}
+     },
+     "sideEffects": "read",
+     "idempotency": "native"
+    }
+   ]
+  }
+ ],
+ "create, shell, run, save, keep, a credential replaced, release": [
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": {
+    "json": {
+     "box_id": "h-t-a-mywpiww0",
+     "source_image_ref": "public.ecr.aws/docker/library/node:24-bookworm",
+     "network_mode": "managed",
+     "description": "antiproton t/a"
+    }
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/secrets",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": {
+    "json": {
+     "name": "GH_TOKEN",
+     "value": "token ghp_first",
+     "placeholder": "token __AP_GITHUB_mywpiww0_<fresh>__",
+     "inject_header_name": "authorization",
+     "allowed_hosts": [
+      "api.github.com"
+     ]
+    }
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/secrets",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": {
+    "json": {
+     "name": "GH_TOKEN_GIT",
+     "value": "Basic eDpnaHBfZmlyc3Q=",
+     "placeholder": "Basic <x:__AP_GITHUB_mywpiww0_<fresh>__>",
+     "inject_header_name": "authorization",
+     "allowed_hosts": [
+      "github.com"
+     ]
+    }
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/background-execs",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": {
+    "json": {
+     "command": [
+      "/bin/sh",
+      "-lc",
+      "export GH_TOKEN='__AP_GITHUB_mywpiww0_<fresh>__'; mkdir -p /work && cd /work || exit 1\necho hello\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+     ]
+    }
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/execs/e1",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "step": "shell creates the box and wires the account",
+   "result": {
+    "state": "succeeded",
+    "exitCode": 0,
+    "cwd": "/work",
+    "output": "hello",
+    "truncated": false,
+    "box": "h-t-a-mywpiww0",
+    "image": "public.ecr.aws/docker/library/node:24-bookworm",
+    "accounts": {
+     "github": "gh and git act as the agent's GitHub account. The credential here is a placeholder swapped in on the way out, so nothing in this container, you included, can read it."
+    }
+   }
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/background-execs",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": {
+    "json": {
+     "command": [
+      "/bin/sh",
+      "-lc",
+      "export GH_TOKEN='__AP_GITHUB_mywpiww0_<fresh>__'; ls\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+     ],
+     "workdir": "/work/src"
+    }
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/execs/e2",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "step": "shell again, in a directory of its own",
+   "result": {
+    "state": "succeeded",
+    "exitCode": 0,
+    "cwd": "/work",
+    "output": "hello",
+    "truncated": false,
+    "box": "h-t-a-mywpiww0",
+    "image": "public.ecr.aws/docker/library/node:24-bookworm",
+    "accounts": {
+     "github": "gh and git act as the agent's GitHub account. The credential here is a placeholder swapped in on the way out, so nothing in this container, you included, can read it."
+    }
+   }
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/background-execs",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": {
+    "json": {
+     "command": [
+      "/bin/sh",
+      "-lc",
+      "export GH_TOKEN='__AP_GITHUB_mywpiww0_<fresh>__'; mkdir -p /work && cd /work && npm install --prefix /work --no-audit --no-fund --silent 'zod' >/dev/null 2>&1; echo 'aW1wb3J0IHggZnJvbSAnem9kJzsgY29uc29sZS5sb2coMSk=' | base64 -d > /work/run.mjs && node /work/run.mjs"
+     ]
+    }
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/execs/e3",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "step": "run with an install",
+   "result": {
+    "state": "succeeded",
+    "exitCode": 0,
+    "cwd": "/work",
+    "output": "hello",
+    "truncated": false,
+    "box": "h-t-a-mywpiww0",
+    "image": "public.ecr.aws/docker/library/node:24-bookworm",
+    "accounts": {
+     "github": "gh and git act as the agent's GitHub account. The credential here is a placeholder swapped in on the way out, so nothing in this container, you included, can read it."
+    }
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/files/download?box_abs_path=%2Fwork%2Fout.txt",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "step": "save a file",
+   "result": {
+    "path": "/work/out.txt",
+    "ref": "artifact://sandbox/h-t-a-mywpiww0/work/out.txt",
+    "bytes": 22,
+    "note": "kept outside the box, for later. A copy outliving the container is not a reason to release it early: it is handed back when the turn ends anyway, and until then it is still the machine you are working on."
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/files/download?box_abs_path=%2Fwork%2Fdist&archive=tar",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "step": "save a directory as tar",
+   "result": {
+    "path": "/work/dist",
+    "ref": "artifact://sandbox/h-t-a-mywpiww0/work/dist.tar",
+    "bytes": 26,
+    "note": "kept outside the box, for later. A copy outliving the container is not a reason to release it early: it is handed back when the turn ends anyway, and until then it is still the machine you are working on."
+   }
+  },
+  {
+   "step": "save a relative path is refused",
+   "threw": "path must be absolute inside the box: out.txt"
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/stop",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/boxes",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/snaps/s-h-t-a-mywpiww0/fork",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": {
+    "json": {
+     "description": "antiproton t/a py-env"
+    }
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "step": "keep the environment",
+   "result": {
+    "kept": "py-env",
+    "snapshot": "kept-1",
+    "note": "independent of this container; start a fresh machine from it later with `start_from`. A copy outliving the container is not a reason to release it early: it is handed back when the turn ends anyway, and until then it is still the machine you are working on."
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/secrets",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "method": "DELETE",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/secrets/sec1",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "method": "DELETE",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/secrets/sec2",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/secrets",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": {
+    "json": {
+     "name": "GH_TOKEN",
+     "value": "token ghp_second",
+     "placeholder": "token __AP_GITHUB_mywpiww0_<fresh>__",
+     "inject_header_name": "authorization",
+     "allowed_hosts": [
+      "api.github.com"
+     ]
+    }
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/secrets",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": {
+    "json": {
+     "name": "GH_TOKEN_GIT",
+     "value": "Basic eDpnaHBfc2Vjb25k",
+     "placeholder": "Basic <x:__AP_GITHUB_mywpiww0_<fresh>__>",
+     "inject_header_name": "authorization",
+     "allowed_hosts": [
+      "github.com"
+     ]
+    }
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/background-execs",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": {
+    "json": {
+     "command": [
+      "/bin/sh",
+      "-lc",
+      "export GH_TOKEN='__AP_GITHUB_mywpiww0_<fresh>__'; gh auth status\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+     ],
+     "workdir": "/work"
+    }
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/execs/e4",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "step": "shell after the credential was replaced",
+   "result": {
+    "state": "succeeded",
+    "exitCode": 0,
+    "cwd": "/work",
+    "output": "hello",
+    "truncated": false,
+    "box": "h-t-a-mywpiww0",
+    "image": "public.ecr.aws/docker/library/node:24-bookworm",
+    "kept": [
+     "py-env"
+    ],
+    "accounts": {
+     "github": "gh and git act as the agent's GitHub account. The credential here is a placeholder swapped in on the way out, so nothing in this container, you included, can read it."
+    }
+   }
+  },
+  {
+   "step": "machines",
+   "result": {
+    "machines": [
+     {
+      "machine": "main",
+      "state": "running",
+      "box": "h-t-a-mywpiww0",
+      "image": "public.ecr.aws/docker/library/node:24-bookworm",
+      "created": "2027-01-15T08:00:01.000Z",
+      "lastUsed": "2027-01-15T08:00:20.000Z",
+      "cwd": "/work"
+     }
+    ],
+    "limit": 3,
+    "note": "a running machine is handed back when the turn ends. 1 of at most 3 exist; a switched-off one counts until it is released."
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/files/download?box_abs_path=%2Fwork%2Fout.txt",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/stop",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 20000
+  },
+  {
+   "method": "DELETE",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 30000
+  },
+  {
+   "step": "release, saving first",
+   "result": {
+    "released": true,
+    "box": "h-t-a-mywpiww0",
+    "liveMs": 23000,
+    "saved": [
+     {
+      "path": "/work/out.txt",
+      "ref": "artifact://sandbox/h-t-a-mywpiww0/work/out.txt",
+      "bytes": 22
+     }
+    ],
+    "__ap_lease__": {
+     "id": "h-t-a-mywpiww0",
+     "startedAt": 1800000001000,
+     "endedAt": 1800000024000,
+     "status": "freed"
+    },
+    "note": "the container and its files are gone; anything saved above is not"
+   }
+  },
+  {
+   "step": "release again",
+   "result": {
+    "released": false,
+    "note": "nothing was running"
+   }
+  },
+  {
+   "stored": [
+    "t/t/a/sandbox/h-t-a-mywpiww0/work/out.txt application/octet-stream 22",
+    "t/t/a/sandbox/h-t-a-mywpiww0/work/dist.tar application/x-tar 26",
+    "t/t/a/sandbox/h-t-a-mywpiww0/work/out.txt application/octet-stream 22"
+   ],
+   "used": [
+    "github",
+    "github"
+   ]
+  },
+  {
+   "record": {
+    "machines": {},
+    "sessions": [
+     {
+      "boxId": "h-t-a-mywpiww0",
+      "startedAt": 1800000001000,
+      "endedAt": 1800000024000,
+      "lastUsedAt": 1800000022000,
+      "execs": 4,
+      "saved": [
+       "artifact://sandbox/h-t-a-mywpiww0/work/out.txt",
+       "artifact://sandbox/h-t-a-mywpiww0/work/dist.tar",
+       "artifact://sandbox/h-t-a-mywpiww0/work/out.txt"
+      ],
+      "credentialRef": "operator"
+     }
+    ],
+    "envs": [
+     {
+      "name": "py-env",
+      "snapId": "kept-1",
+      "savedAt": 1800000014000,
+      "image": "public.ecr.aws/docker/library/node:24-bookworm",
+      "note": "python and git"
+     }
+    ]
+   }
+  }
+ ],
+ "put a stored file into the box": [
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": {
+    "json": {
+     "box_id": "h-t-a-mywpiww0",
+     "source_image_ref": "public.ecr.aws/docker/library/node:24-bookworm",
+     "description": "antiproton t/a"
+    }
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/background-execs",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": {
+    "json": {
+     "command": [
+      "sh",
+      "-c",
+      "mkdir -p -- \"$(dirname -- \"$1\")\" 2>/dev/null || exit 5; test -d \"$1\" && exit 6; exit 0",
+      "sh",
+      "/work/in/photo.jpg"
+     ]
+    }
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/execs/e1",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/files/upload?box_abs_path=%2Fwork%2Fin%2Fphoto.jpg",
+   "authorization": "Basic QUs6U0s=",
+   "body": {
+    "form": [
+     {
+      "name": "file",
+      "filename": "photo.jpg",
+      "size": 21,
+      "sha256": "0def0041adb95f563cd32c30827eab6cd9c9a87482a618c48db200f2d89d524b"
+     }
+    ]
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/data-transfers/active?box_id=h-t-a-mywpiww0",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/background-execs",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": {
+    "json": {
+     "command": [
+      "sh",
+      "-c",
+      "test -f \"$1\" || exit 3; stat -c %s -- \"$1\"; sha256sum -- \"$1\" 2>/dev/null | cut -d \" \" -f 1",
+      "sh",
+      "/work/in/photo.jpg"
+     ]
+    }
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/execs/e2",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "step": "put",
+   "result": {
+    "path": "/work/in/photo.jpg",
+    "bytes": 21,
+    "sha256": "0def0041adb95f563cd32c30827eab6cd9c9a87482a618c48db200f2d89d524b",
+    "ref": "artifact://raft/attachments/7/photo.jpg",
+    "checked": "sha256",
+    "note": "in the container now; work on it with `shell` or `run`, and `save` what you make from it"
+   }
+  },
+  {
+   "step": "put outside the working directory",
+   "threw": "path must name a file inside the working directory /work; \"/etc/x\" is /etc/x"
+  },
+  {
+   "record": {
+    "machines": {
+     "main": {
+      "boxId": "h-t-a-mywpiww0",
+      "createdAt": 1800000001000,
+      "lastUsedAt": 1800000007000,
+      "execs": 0,
+      "saved": [],
+      "credentialRef": "operator",
+      "image": "public.ecr.aws/docker/library/node:24-bookworm"
+     }
+    },
+    "sessions": []
+   }
+  }
+ ],
+ "a command handed over as a job, polled and cancelled": [
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": {
+    "json": {
+     "box_id": "h-t-a-mywpiww0",
+     "source_image_ref": "public.ecr.aws/docker/library/node:24-bookworm",
+     "description": "antiproton t/a"
+    }
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/background-execs",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": {
+    "json": {
+     "command": [
+      "/bin/sh",
+      "-lc",
+      "mkdir -p /work && cd /work || exit 1\nsleep 100\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+     ]
+    }
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/execs/e1",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "step": "shell is handed over",
+   "result": {
+    "backgrounded": {
+     "handle": {
+      "boxId": "h-t-a-mywpiww0",
+      "execId": "e1"
+     },
+     "note": "running in the container; its result arrives on its own, and `jobs` lists what is running"
+    }
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/execs/e1",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "step": "poll while it runs",
+   "result": {
+    "done": false,
+    "progress": {
+     "state": "running"
+    }
+   }
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/execs/e1/kill",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/execs/e1",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "step": "cancel"
+  },
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/execs/e1",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "step": "poll once it is cancelled",
+   "result": {
+    "done": true,
+    "result": {
+     "state": "cancelled",
+     "exitCode": null,
+     "output": "",
+     "truncated": false,
+     "box": "h-t-a-mywpiww0",
+     "image": "public.ecr.aws/docker/library/node:24-bookworm"
+    }
+   }
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/background-execs",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": {
+    "json": {
+     "command": [
+      "/bin/sh",
+      "-lc",
+      "mkdir -p /work && cd /work || exit 1\ntrue\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+     ]
+    }
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/execs/e2",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "step": "a second command finishes in the call",
+   "result": {
+    "state": "succeeded",
+    "exitCode": 0,
+    "output": "done\n",
+    "truncated": false,
+    "box": "h-t-a-mywpiww0",
+    "image": "public.ecr.aws/docker/library/node:24-bookworm"
+   }
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/background-execs",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": {
+    "json": {
+     "command": [
+      "/bin/sh",
+      "-lc",
+      "mkdir -p /work && cd /work || exit 1\nsleep 100\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+     ]
+    }
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/execs/e3",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "step": "a third is handed over",
+   "result": {
+    "backgrounded": {
+     "handle": {
+      "boxId": "h-t-a-mywpiww0",
+      "execId": "e3"
+     },
+     "note": "running in the container; its result arrives on its own, and `jobs` lists what is running"
+    }
+   }
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/execs/e3/kill",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/execs/e3",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "step": "a refused kill is not confirmed",
+   "threw": "could not confirm exec e3 stopped: run9 POST /projects/p/workspace/execs/e3/kill -> 400: {\"error\":\"exec is not background mode\"}; state running"
+  },
+  {
+   "record": {
+    "machines": {
+     "main": {
+      "boxId": "h-t-a-mywpiww0",
+      "createdAt": 1800000001000,
+      "lastUsedAt": 1800000010000,
+      "execs": 3,
+      "saved": [],
+      "credentialRef": "operator",
+      "image": "public.ecr.aws/docker/library/node:24-bookworm"
+     }
+    },
+    "sessions": []
+   }
+  }
+ ],
+ "the idle lease switches a box off, a command brings it back, and release deletes it": [
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": {
+    "json": {
+     "box_id": "h-t-a-mywpiww0",
+     "source_image_ref": "public.ecr.aws/docker/library/node:24-bookworm",
+     "description": "antiproton t/a"
+    }
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/background-execs",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": {
+    "json": {
+     "command": [
+      "/bin/sh",
+      "-lc",
+      "mkdir -p /work && cd /work || exit 1\necho hi\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+     ]
+    }
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/execs/e1",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "step": "shell",
+   "result": {
+    "state": "succeeded",
+    "exitCode": 0,
+    "cwd": "/work",
+    "output": "hello",
+    "truncated": false,
+    "box": "h-t-a-mywpiww0",
+    "image": "public.ecr.aws/docker/library/node:24-bookworm"
+   }
+  },
+  {
+   "step": "activities while running",
+   "result": [
+    {
+     "live": {
+      "id": "h-t-a-mywpiww0",
+      "startedAt": 1800000001000,
+      "lastUsedAt": 1800000002000,
+      "credentialRef": "operator",
+      "lease": {
+       "warnMs": 0
+      }
+     },
+     "quietUntil": null,
+     "billing": "billed for every second it exists, not per call"
+    }
+   ]
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/stop",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 30000
+  },
+  {
+   "step": "idle release switches it off",
+   "result": {
+    "id": "h-t-a-mywpiww0",
+    "startedAt": 1800000001000,
+    "endedAt": 1800000004000,
+    "status": "freed"
+   }
+  },
+  {
+   "step": "activities while off",
+   "result": [
+    {
+     "live": {
+      "id": "h-t-a-mywpiww0",
+      "startedAt": 1800000001000,
+      "lastUsedAt": 1800000004000,
+      "credentialRef": "operator",
+      "lease": {
+       "maxMs": 604800000,
+       "warnMs": 86400000,
+       "consequence": "the stopped machine and everything on its disk will be deleted",
+       "advice": "Before then, `save` the files you need or `keep` the environment, or run anything in it to switch it back on.",
+       "maxPostponeMinutes": 10080
+      }
+     },
+     "quietUntil": null,
+     "billing": "stopped: no compute is billed; only its disk is kept until it is deleted"
+    }
+   ]
+  },
+  {
+   "step": "quiet while off",
+   "result": {
+    "quiet": true,
+    "box": "h-t-a-mywpiww0",
+    "minutes": 600,
+    "until": "2027-01-15T18:00:04.000Z",
+    "note": "it stays switched off; this postpones its deletion"
+   }
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/background-execs",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": {
+    "json": {
+     "command": [
+      "/bin/sh",
+      "-lc",
+      "echo back\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+     ],
+     "workdir": "/work"
+    }
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/execs/e2",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "step": "shell brings it back",
+   "result": {
+    "state": "succeeded",
+    "exitCode": 0,
+    "cwd": "/work",
+    "output": "hello",
+    "truncated": false,
+    "box": "h-t-a-mywpiww0",
+    "image": "public.ecr.aws/docker/library/node:24-bookworm"
+   }
+  },
+  {
+   "step": "quiet while running",
+   "result": {
+    "quiet": true,
+    "box": "h-t-a-mywpiww0",
+    "minutes": 30,
+    "until": "2027-01-15T08:30:06.000Z"
+   }
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/stop",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 30000
+  },
+  {
+   "step": "a stop run9 refuses",
+   "threw": "run9 box h-t-a-mywpiww0 not switched off: stop returned 503: busy",
+   "released": {
+    "id": "h-t-a-mywpiww0",
+    "startedAt": 1800000004000,
+    "endedAt": 1800000007000,
+    "status": "error",
+    "error": "stop returned 503: busy"
+   }
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/stop",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 30000
+  },
+  {
+   "step": "idle release switches it off again",
+   "result": {
+    "id": "h-t-a-mywpiww0",
+    "startedAt": 1800000004000,
+    "endedAt": 1800000008000,
+    "status": "freed"
+   }
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/stop",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 20000
+  },
+  {
+   "method": "DELETE",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 30000
+  },
+  {
+   "step": "idle release of a switched-off box deletes it",
+   "result": {
+    "id": "h-t-a-mywpiww0",
+    "startedAt": 1800000008000,
+    "endedAt": 1800000010000,
+    "status": "freed"
+   }
+  },
+  {
+   "step": "usage",
+   "result": [
+    {
+     "id": "h-t-a-mywpiww0",
+     "startedAt": 1800000004000,
+     "endedAt": 1800000008000,
+     "lastUsedAt": 1800000005000,
+     "uses": 1,
+     "kept": [],
+     "credentialRef": "operator"
+    },
+    {
+     "id": "h-t-a-mywpiww0",
+     "startedAt": 1800000001000,
+     "endedAt": 1800000004000,
+     "lastUsedAt": 1800000002000,
+     "uses": 1,
+     "kept": [],
+     "credentialRef": "operator"
+    }
+   ]
+  },
+  {
+   "record": {
+    "machines": {},
+    "sessions": [
+     {
+      "boxId": "h-t-a-mywpiww0",
+      "startedAt": 1800000004000,
+      "endedAt": 1800000008000,
+      "lastUsedAt": 1800000005000,
+      "execs": 1,
+      "saved": [],
+      "credentialRef": "operator"
+     },
+     {
+      "boxId": "h-t-a-mywpiww0",
+      "startedAt": 1800000001000,
+      "endedAt": 1800000004000,
+      "lastUsedAt": 1800000002000,
+      "execs": 1,
+      "saved": [],
+      "credentialRef": "operator"
+     }
+    ]
+   }
+  }
+ ],
+ "the workspace view lists and reads only an awake box": [
+  {
+   "step": "list with no box",
+   "result": {
+    "running": false
+   }
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": {
+    "json": {
+     "box_id": "h-t-a-mywpiww0",
+     "source_image_ref": "public.ecr.aws/docker/library/node:24-bookworm",
+     "description": "antiproton t/a"
+    }
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/background-execs",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": {
+    "json": {
+     "command": [
+      "/bin/sh",
+      "-lc",
+      "mkdir -p /work && cd /work || exit 1\necho hi > out.txt\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+     ]
+    }
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/execs/e1",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "step": "shell",
+   "result": {
+    "state": "succeeded",
+    "exitCode": 0,
+    "cwd": "/work",
+    "output": "hello",
+    "truncated": false,
+    "box": "h-t-a-mywpiww0",
+    "image": "public.ecr.aws/docker/library/node:24-bookworm"
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/boxes",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 10000
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/background-execs",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": {
+    "json": {
+     "command": [
+      "sh",
+      "-c",
+      "root=$(realpath -e -- \"$2\") || exit 3; r=$(realpath -e -- \"$1\") || exit 3; case \"$r\" in \"$root\"|\"$root\"/*) ;; *) exit 4;; esac; test -d \"$r\" || exit 5; n=$(find \"$r\" -mindepth 1 -maxdepth 1 -printf . | wc -c); find \"$r\" -mindepth 1 -maxdepth 1 -printf '%y\\t%s\\t%T@\\t%f\\n' | head -n 1000; printf '#total\\t%s\\n' \"$n\"",
+      "sh",
+      "/work",
+      "/work"
+     ]
+    }
+   },
+   "timeoutMs": 9000
+  },
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/execs/e2",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 8000
+  },
+  {
+   "step": "list",
+   "result": {
+    "running": true,
+    "found": true,
+    "entries": [
+     {
+      "name": "out.txt",
+      "isDirectory": false,
+      "size": 5,
+      "modifiedAt": 1700000000500
+     },
+     {
+      "name": "src",
+      "isDirectory": true,
+      "size": 0,
+      "modifiedAt": 1700000001000
+     }
+    ],
+    "truncated": false
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/boxes",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 20000
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/background-execs",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": {
+    "json": {
+     "command": [
+      "sh",
+      "-c",
+      "root=$(realpath -e -- \"$2\") || exit 3; r=$(realpath -e -- \"$1\") || exit 3; case \"$r\" in \"$root\"|\"$root\"/*) ;; *) exit 4;; esac; find \"$r\" -maxdepth 0 -printf '%y\\t%s\\t%T@\\t'; printf '%s\\n' \"$r\"",
+      "sh",
+      "/work/out.txt",
+      "/work"
+     ]
+    }
+   },
+   "timeoutMs": 19000
+  },
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/execs/e3",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 18000
+  },
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/boxes",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 17000
+  },
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/files/download?box_abs_path=%2Fwork%2Fout.txt",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 16000
+  },
+  {
+   "step": "read",
+   "result": {
+    "running": true,
+    "found": true,
+    "kind": "file",
+    "size": 22,
+    "modifiedAt": 1700000002250,
+    "bytes": {
+     "bytes": "bytes of /work/out.txt"
+    }
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/boxes",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 20000
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/background-execs",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": {
+    "json": {
+     "command": [
+      "sh",
+      "-c",
+      "root=$(realpath -e -- \"$2\") || exit 3; r=$(realpath -e -- \"$1\") || exit 3; case \"$r\" in \"$root\"|\"$root\"/*) ;; *) exit 4;; esac; find \"$r\" -maxdepth 0 -printf '%y\\t%s\\t%T@\\t'; printf '%s\\n' \"$r\"",
+      "sh",
+      "/work/out.txt",
+      "/work"
+     ]
+    }
+   },
+   "timeoutMs": 19000
+  },
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/execs/e4",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 18000
+  },
+  {
+   "step": "read over the cap",
+   "result": {
+    "running": true,
+    "found": true,
+    "kind": "file",
+    "size": 13,
+    "modifiedAt": 1700000002250,
+    "bytes": null
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/boxes",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 20000
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/background-execs",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": {
+    "json": {
+     "command": [
+      "sh",
+      "-c",
+      "root=$(realpath -e -- \"$2\") || exit 3; r=$(realpath -e -- \"$1\") || exit 3; case \"$r\" in \"$root\"|\"$root\"/*) ;; *) exit 4;; esac; find \"$r\" -maxdepth 0 -printf '%y\\t%s\\t%T@\\t'; printf '%s\\n' \"$r\"",
+      "sh",
+      "/work/out.txt",
+      "/work"
+     ]
+    }
+   },
+   "timeoutMs": 19000
+  },
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/execs/e5",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 18000
+  },
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/boxes",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 17000
+  },
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/files/download?box_abs_path=%2Fwork%2Fout.txt",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 16000
+  },
+  {
+   "step": "a download run9 refuses",
+   "threw": "run9 download of /work/out.txt -> 404: no such file"
+  },
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/files/download?box_abs_path=%2Fwork%2Fout.txt",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "step": "save that run9 refuses",
+   "threw": "could not read /work/out.txt: 404 no such file"
+  },
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/boxes",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 10000
+  },
+  {
+   "step": "list when run9 does not list it",
+   "result": {
+    "running": false
+   }
+  }
+ ],
+ "credential checks and the account": [
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/boxes/b_credential_check_only",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "step": "good keys",
+   "result": {
+    "ok": true,
+    "account": "p"
+   }
+  },
+  {
+   "step": "no keys",
+   "result": {
+    "ok": false,
+    "kind": "rejected",
+    "reason": "no keys: this mount cannot start a container"
+   }
+  },
+  {
+   "step": "not JSON",
+   "result": {
+    "ok": false,
+    "kind": "rejected",
+    "reason": "the stored value is not JSON; run9 needs an object with ak and sk"
+   }
+  },
+  {
+   "step": "no sk",
+   "result": {
+    "ok": false,
+    "kind": "rejected",
+    "reason": "run9 needs both ak and sk; one of them is missing"
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/credential",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "step": "verified by the endpoint",
+   "result": {
+    "ok": true,
+    "account": "p"
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/boxes/b_credential_check_only",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "step": "run9 answers 401 {\"error\":\"invalid api key\"}",
+   "result": {
+    "ok": false,
+    "kind": "rejected",
+    "reason": "run9 rejected these keys"
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/credential",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "step": "the endpoint answers 401",
+   "result": {
+    "ok": false,
+    "kind": "rejected",
+    "reason": "this key was not accepted"
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/boxes/b_credential_check_only",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "step": "run9 answers 400 {\"error\":\"project not found\"}",
+   "result": {
+    "ok": false,
+    "kind": "rejected",
+    "reason": "the keys work, but project \"p\" does not exist"
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/credential",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "step": "the endpoint answers 400",
+   "result": {
+    "ok": false,
+    "kind": "unreachable",
+    "reason": "the sandbox service answered 400: {\"error\":\"project not found\"}"
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/boxes/b_credential_check_only",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "step": "run9 answers 400 {\"error\":\"project_cid must match [a-z0-9_-]{3,20}\"}",
+   "result": {
+    "ok": false,
+    "kind": "rejected",
+    "reason": "\"p\" is not a usable project name: run9 wants 3 to 20 characters of a-z, 0-9, dash or underscore"
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/credential",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "step": "the endpoint answers 400",
+   "result": {
+    "ok": false,
+    "kind": "unreachable",
+    "reason": "the sandbox service answered 400: {\"error\":\"project_cid must match [a-z0-9_-]{3,20}\"}"
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/boxes/b_credential_check_only",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "step": "run9 answers 500 oops",
+   "result": {
+    "ok": false,
+    "kind": "unreachable",
+    "reason": "run9 answered 500: oops"
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/credential",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "step": "the endpoint answers 500",
+   "result": {
+    "ok": false,
+    "kind": "unreachable",
+    "reason": "the sandbox service answered 500: oops"
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/boxes/b_credential_check_only",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "step": "run9 answers 200 {}",
+   "result": {
+    "ok": true,
+    "account": "p"
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/credential",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "step": "the endpoint answers 200",
+   "result": {
+    "ok": true,
+    "account": "p"
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/whoami",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "step": "account",
+   "result": "org-1/p"
+  },
+  {
+   "step": "account behind an endpoint",
+   "result": null
+  },
+  {
+   "step": "account of no keys",
+   "result": null
+  },
+  {
+   "step": "account of keys that are not JSON",
+   "result": null
+  },
+  {
+   "method": "GET",
+   "path": "/whoami",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "step": "account when /whoami answers 503",
+   "threw": "run9 answered 503 to /whoami"
+  },
+  {
+   "method": "GET",
+   "path": "/whoami",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "step": "account when /whoami answers 429",
+   "threw": "run9 answered 429 to /whoami"
+  },
+  {
+   "method": "GET",
+   "path": "/whoami",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "step": "account when /whoami answers 401",
+   "result": null
+  },
+  {
+   "method": "GET",
+   "path": "/whoami",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "step": "account with no org id",
+   "result": null
+  }
+ ],
+ "a create whose answer was lost is adopted; one that was not is refused": [
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": {
+    "json": {
+     "box_id": "h-t-a-mywpiww0",
+     "source_image_ref": "public.ecr.aws/docker/library/node:24-bookworm",
+     "description": "antiproton t/a"
+    }
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/boxes",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/background-execs",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": {
+    "json": {
+     "command": [
+      "/bin/sh",
+      "-lc",
+      "mkdir -p /work && cd /work || exit 1\necho hi\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+     ]
+    }
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/execs/e1",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "step": "shell whose create answered duplicate key",
+   "result": {
+    "state": "succeeded",
+    "exitCode": 0,
+    "cwd": "/work",
+    "output": "hello",
+    "truncated": false,
+    "box": "h-t-a-mywpiww0",
+    "image": "public.ecr.aws/docker/library/node:24-bookworm"
+   }
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/stop",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 20000
+  },
+  {
+   "method": "DELETE",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 30000
+  },
+  {
+   "step": "release",
+   "result": {
+    "released": true,
+    "box": "h-t-a-mywpiww0",
+    "liveMs": 4000,
+    "saved": [],
+    "__ap_lease__": {
+     "id": "h-t-a-mywpiww0",
+     "startedAt": 1800000002000,
+     "endedAt": 1800000006000,
+     "status": "freed"
+    },
+    "note": "the container and its files are gone; anything saved above is not"
+   }
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": {
+    "json": {
+     "box_id": "h-t-a-mywpj1io",
+     "source_image_ref": "public.ecr.aws/docker/library/node:24-bookworm",
+     "description": "antiproton t/a"
+    }
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/boxes",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "step": "shell whose create is refused and not listed",
+   "threw": "run9 POST /projects/p/workspace/boxes -> 400: {\"error\":\"box already exists\"}"
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": {
+    "json": {
+     "box_id": "h-t-a-mywpj328",
+     "source_image_ref": "public.ecr.aws/docker/library/node:24-bookworm",
+     "description": "antiproton t/a"
+    }
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "step": "shell whose create is rate limited",
+   "threw": "run9 POST /projects/p/workspace/boxes -> 429: slow down"
+  },
+  {
+   "record": {
+    "machines": {},
+    "sessions": [
+     {
+      "boxId": "h-t-a-mywpiww0",
+      "startedAt": 1800000002000,
+      "endedAt": 1800000006000,
+      "lastUsedAt": 1800000003000,
+      "execs": 1,
+      "saved": [],
+      "credentialRef": "operator"
+     }
+    ]
+   }
+  }
+ ],
+ "a delete run9 refuses keeps the box, and forget drops it only after a definitive refusal": [
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": {
+    "json": {
+     "box_id": "h-t-a-mywpiww0",
+     "source_image_ref": "public.ecr.aws/docker/library/node:24-bookworm",
+     "description": "antiproton t/a"
+    }
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/background-execs",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": {
+    "json": {
+     "command": [
+      "/bin/sh",
+      "-lc",
+      "mkdir -p /work && cd /work || exit 1\necho hi\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+     ]
+    }
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/execs/e1",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "step": "shell",
+   "result": {
+    "state": "succeeded",
+    "exitCode": 0,
+    "cwd": "/work",
+    "output": "hello",
+    "truncated": false,
+    "box": "h-t-a-mywpiww0",
+    "image": "public.ecr.aws/docker/library/node:24-bookworm"
+   }
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/stop",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 20000
+  },
+  {
+   "method": "DELETE",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 30000
+  },
+  {
+   "step": "release refused by an outage",
+   "threw": "run9 box h-t-a-mywpiww0 not released: delete returned 503: {\"error\":\"try later\"}",
+   "released": {
+    "id": "h-t-a-mywpiww0",
+    "startedAt": 1800000001000,
+    "endedAt": 1800000005000,
+    "status": "error",
+    "error": "delete returned 503: {\"error\":\"try later\"}"
+   }
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/stop",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 20000
+  },
+  {
+   "method": "DELETE",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 30000
+  },
+  {
+   "step": "forget after an outage does not forget",
+   "threw": "run9 box h-t-a-mywpiww0 not released: delete returned 503: {\"error\":\"try later\"}",
+   "released": []
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/stop",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 20000
+  },
+  {
+   "method": "DELETE",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 30000
+  },
+  {
+   "step": "the agent's release refused outright",
+   "result": {
+    "released": false,
+    "box": "h-t-a-mywpiww0",
+    "error": "delete returned 403: {\"error\":\"forbidden\"}",
+    "saved": []
+   }
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/stop",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 20000
+  },
+  {
+   "method": "DELETE",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 30000
+  },
+  {
+   "step": "forget after a definitive refusal",
+   "result": {
+    "id": "h-t-a-mywpiww0",
+    "startedAt": 1800000001000,
+    "endedAt": 1800000011000,
+    "status": "error",
+    "error": "forgotten on an operator's request; run9 refused the delete (delete returned 403: {\"error\":\"forbidden\"}), so it may still be alive"
+   }
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": {
+    "json": {
+     "box_id": "h-t-a-mywpj5dk",
+     "source_image_ref": "public.ecr.aws/docker/library/node:24-bookworm",
+     "description": "antiproton t/a"
+    }
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpj5dk/background-execs",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": {
+    "json": {
+     "command": [
+      "/bin/sh",
+      "-lc",
+      "mkdir -p /work && cd /work || exit 1\necho hi\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+     ]
+    }
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/execs/e2",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "step": "shell makes a new box",
+   "result": {
+    "state": "succeeded",
+    "exitCode": 0,
+    "cwd": "/work",
+    "output": "hello",
+    "truncated": false,
+    "box": "h-t-a-mywpj5dk",
+    "image": "public.ecr.aws/docker/library/node:24-bookworm"
+   }
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpj5dk/stop",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 20000
+  },
+  {
+   "method": "DELETE",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpj5dk",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 30000
+  },
+  {
+   "step": "already gone is believed for the key that made it",
+   "result": {
+    "id": "h-t-a-mywpj5dk",
+    "startedAt": 1800000012000,
+    "endedAt": 1800000016000,
+    "status": "freed"
+   }
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": {
+    "json": {
+     "box_id": "h-t-a-mywpj98g",
+     "source_image_ref": "public.ecr.aws/docker/library/node:24-bookworm",
+     "description": "antiproton t/a"
+    }
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpj98g/background-execs",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": {
+    "json": {
+     "command": [
+      "/bin/sh",
+      "-lc",
+      "mkdir -p /work && cd /work || exit 1\necho hi\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+     ]
+    }
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/execs/e3",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "step": "shell",
+   "result": {
+    "state": "succeeded",
+    "exitCode": 0,
+    "cwd": "/work",
+    "output": "hello",
+    "truncated": false,
+    "box": "h-t-a-mywpj98g",
+    "image": "public.ecr.aws/docker/library/node:24-bookworm"
+   }
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpj98g/stop",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 20000
+  },
+  {
+   "method": "DELETE",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpj98g",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 30000
+  },
+  {
+   "step": "a stop that fails before the delete does not stop the delete",
+   "result": {
+    "id": "h-t-a-mywpj98g",
+    "startedAt": 1800000017000,
+    "endedAt": 1800000021000,
+    "status": "freed"
+   }
+  },
+  {
+   "record": {
+    "machines": {},
+    "sessions": [
+     {
+      "boxId": "h-t-a-mywpj98g",
+      "startedAt": 1800000017000,
+      "endedAt": 1800000021000,
+      "lastUsedAt": 1800000018000,
+      "execs": 1,
+      "saved": [],
+      "credentialRef": "operator"
+     },
+     {
+      "boxId": "h-t-a-mywpj5dk",
+      "startedAt": 1800000012000,
+      "endedAt": 1800000016000,
+      "lastUsedAt": 1800000013000,
+      "execs": 1,
+      "saved": [],
+      "credentialRef": "operator"
+     },
+     {
+      "boxId": "h-t-a-mywpiww0",
+      "startedAt": 1800000001000,
+      "endedAt": 1800000011000,
+      "lastUsedAt": 1800000002000,
+      "execs": 1,
+      "saved": [],
+      "credentialRef": "operator"
+     }
+    ]
+   }
+  }
+ ],
+ "start_from a kept environment, and a named machine": [
+  {
+   "step": "start_from lists nothing",
+   "result": {
+    "kept": [],
+    "released": false,
+    "note": "this only lists; nothing kept yet, and `keep` saves one"
+   }
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": {
+    "json": {
+     "box_id": "h-t-a-mywpiww0",
+     "source_image_ref": "public.ecr.aws/docker/library/node:24-bookworm",
+     "description": "antiproton t/a"
+    }
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/background-execs",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": {
+    "json": {
+     "command": [
+      "/bin/sh",
+      "-lc",
+      "mkdir -p /work && cd /work || exit 1\necho hi\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+     ]
+    }
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/execs/e1",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "step": "shell",
+   "result": {
+    "state": "succeeded",
+    "exitCode": 0,
+    "cwd": "/work",
+    "output": "hello",
+    "truncated": false,
+    "box": "h-t-a-mywpiww0",
+    "image": "public.ecr.aws/docker/library/node:24-bookworm"
+   }
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/stop",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/boxes",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/snaps/s-h-t-a-mywpiww0/fork",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": {
+    "json": {
+     "description": "antiproton t/a base"
+    }
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "step": "keep",
+   "result": {
+    "kept": "base",
+    "snapshot": "kept-1",
+    "note": "independent of this container; start a fresh machine from it later with `start_from`. A copy outliving the container is not a reason to release it early: it is handed back when the turn ends anyway, and until then it is still the machine you are working on."
+   }
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/stop",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 20000
+  },
+  {
+   "method": "DELETE",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 30000
+  },
+  {
+   "step": "start_from base releases the box",
+   "result": {
+    "startingFrom": "base",
+    "note": "the next run or shell starts from this environment",
+    "released": true,
+    "__ap_lease__": {
+     "id": "h-t-a-mywpiww0",
+     "startedAt": 1800000001000,
+     "endedAt": 1800000008000,
+     "status": "freed"
+    },
+    "releasedPrevious": "h-t-a-mywpiww0"
+   }
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": {
+    "json": {
+     "box_id": "h-t-a-mywpj328",
+     "source_snap_id": "kept-1",
+     "description": "antiproton t/a"
+    }
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpj328/background-execs",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": {
+    "json": {
+     "command": [
+      "/bin/sh",
+      "-lc",
+      "mkdir -p /work && cd /work || exit 1\necho from\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+     ]
+    }
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/execs/e2",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "step": "shell starts from the snapshot",
+   "result": {
+    "state": "succeeded",
+    "exitCode": 0,
+    "cwd": "/work",
+    "output": "hello",
+    "truncated": false,
+    "box": "h-t-a-mywpj328",
+    "image": "public.ecr.aws/docker/library/node:24-bookworm",
+    "kept": [
+     "base"
+    ]
+   }
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": {
+    "json": {
+     "box_id": "h-t-a-two-mywpj5dk",
+     "source_image_ref": "public.ecr.aws/docker/library/node:24-bookworm",
+     "description": "antiproton t/a"
+    }
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes/h-t-a-two-mywpj5dk/background-execs",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": {
+    "json": {
+     "command": [
+      "/bin/sh",
+      "-lc",
+      "mkdir -p /work && cd /work || exit 1\necho two\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+     ]
+    }
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/execs/e3",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "step": "shell on a named machine",
+   "result": {
+    "state": "succeeded",
+    "exitCode": 0,
+    "cwd": "/work",
+    "output": "hello",
+    "truncated": false,
+    "box": "h-t-a-two-mywpj5dk",
+    "machine": "two",
+    "image": "public.ecr.aws/docker/library/node:24-bookworm",
+    "kept": [
+     "base"
+    ]
+   }
+  },
+  {
+   "step": "keep from a machine that does not exist",
+   "threw": "there is no machine \"three\" to keep from; `machines` lists the ones that exist"
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpj328/stop",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/boxes",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "step": "keep when run9 lists no filesystem",
+   "threw": "the container reports no filesystem to keep"
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpj328/stop",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/boxes",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/snaps/s-h-t-a-mywpj328/fork",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": {
+    "json": {
+     "description": "antiproton t/a z"
+    }
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "step": "keep when the fork returns no snapshot",
+   "threw": "fork returned no snapshot: {\"nope\":true}"
+  },
+  {
+   "step": "activity",
+   "result": {
+    "live": {
+     "id": "h-t-a-two-mywpj5dk",
+     "startedAt": 1800000012000,
+     "lastUsedAt": 1800000013000,
+     "credentialRef": "operator",
+     "lease": {
+      "warnMs": 0
+     },
+     "name": "two",
+     "args": {
+      "machine": "two"
+     }
+    },
+    "quietUntil": null,
+    "billing": "billed for every second it exists, not per call"
+   }
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpj328/stop",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 20000
+  },
+  {
+   "method": "DELETE",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpj328",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 30000
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes/h-t-a-two-mywpj5dk/stop",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 20000
+  },
+  {
+   "method": "DELETE",
+   "path": "/projects/p/workspace/boxes/h-t-a-two-mywpj5dk",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 30000
+  },
+  {
+   "step": "release all",
+   "result": [
+    {
+     "id": "h-t-a-mywpj328",
+     "startedAt": 1800000009000,
+     "endedAt": 1800000021000,
+     "status": "freed"
+    },
+    {
+     "id": "h-t-a-two-mywpj5dk",
+     "startedAt": 1800000012000,
+     "endedAt": 1800000023000,
+     "status": "freed"
+    }
+   ]
+  },
+  {
+   "record": {
+    "machines": {},
+    "sessions": [
+     {
+      "machine": "two",
+      "boxId": "h-t-a-two-mywpj5dk",
+      "startedAt": 1800000012000,
+      "endedAt": 1800000023000,
+      "lastUsedAt": 1800000013000,
+      "execs": 1,
+      "saved": [],
+      "credentialRef": "operator"
+     },
+     {
+      "boxId": "h-t-a-mywpj328",
+      "startedAt": 1800000009000,
+      "endedAt": 1800000021000,
+      "lastUsedAt": 1800000010000,
+      "execs": 1,
+      "saved": [],
+      "credentialRef": "operator"
+     },
+     {
+      "boxId": "h-t-a-mywpiww0",
+      "startedAt": 1800000001000,
+      "endedAt": 1800000008000,
+      "lastUsedAt": 1800000006000,
+      "execs": 1,
+      "saved": [],
+      "credentialRef": "operator"
+     }
+    ],
+    "envs": [
+     {
+      "name": "base",
+      "snapId": "kept-1",
+      "savedAt": 1800000006000,
+      "image": "public.ecr.aws/docker/library/node:24-bookworm"
+     }
+    ]
+   }
+  }
+ ],
+ "a stranded box is deleted with the new key, whose not-found is not believed": [
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": {
+    "json": {
+     "box_id": "h-t-a-mywpiww0",
+     "source_image_ref": "public.ecr.aws/docker/library/node:24-bookworm",
+     "description": "antiproton t/a"
+    }
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/background-execs",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": {
+    "json": {
+     "command": [
+      "/bin/sh",
+      "-lc",
+      "mkdir -p /work && cd /work || exit 1\necho hi\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+     ]
+    }
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/execs/e1",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "step": "shell",
+   "result": {
+    "state": "succeeded",
+    "exitCode": 0,
+    "cwd": "/work",
+    "output": "hello",
+    "truncated": false,
+    "box": "h-t-a-mywpiww0",
+    "image": "public.ecr.aws/docker/library/node:24-bookworm"
+   }
+  },
+  {
+   "step": "strand it",
+   "result": true
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/stop",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 20000
+  },
+  {
+   "method": "DELETE",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 30000
+  },
+  {
+   "step": "release: not found is not believed",
+   "threw": "run9 box h-t-a-mywpiww0 (stranded) not released: delete returned 400: {\"error\":\"box not found\"}",
+   "released": {
+    "id": "h-t-a-mywpiww0",
+    "startedAt": 1800000001000,
+    "endedAt": 1800000005000,
+    "status": "error",
+    "error": "delete returned 400: {\"error\":\"box not found\"}"
+   }
+  },
+  {
+   "step": "release again before the retry is due",
+   "threw": "run9 box h-t-a-mywpiww0 (stranded) not released: not retried before 2027-01-15T08:05:05.000Z; last: delete returned 400: {\"error\":\"box not found\"}",
+   "released": []
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/stop",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 20000
+  },
+  {
+   "method": "DELETE",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 30000
+  },
+  {
+   "step": "forget after a definitive refusal",
+   "result": {
+    "id": "h-t-a-mywpiww0",
+    "startedAt": 1800000001000,
+    "endedAt": 1800000007000,
+    "status": "error",
+    "error": "forgotten on an operator's request; run9 refused the delete (delete returned 400: {\"error\":\"box not found\"}), so it may still be alive"
+   }
+  },
+  {
+   "record": {
+    "machines": {},
+    "sessions": [
+     {
+      "machine": "stranded",
+      "boxId": "h-t-a-mywpiww0",
+      "startedAt": 1800000001000,
+      "endedAt": 1800000007000,
+      "lastUsedAt": 1800000002000,
+      "execs": 1,
+      "saved": [],
+      "credentialRef": "operator"
+     }
+    ]
+   }
+  }
+ ],
+ "a working directory run9 cannot start in": [
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": {
+    "json": {
+     "box_id": "h-t-a-mywpiww0",
+     "source_image_ref": "public.ecr.aws/docker/library/node:24-bookworm",
+     "description": "antiproton t/a"
+    }
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/background-execs",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": {
+    "json": {
+     "command": [
+      "/bin/sh",
+      "-lc",
+      "mkdir -p /work && cd /work || exit 1\nmkdir -p /tmp/x && cd /tmp/x\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+     ]
+    }
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/execs/e1",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "step": "shell",
+   "result": {
+    "state": "succeeded",
+    "exitCode": 0,
+    "cwd": "/work",
+    "output": "hello",
+    "truncated": false,
+    "box": "h-t-a-mywpiww0",
+    "image": "public.ecr.aws/docker/library/node:24-bookworm"
+   }
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/background-execs",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": {
+    "json": {
+     "command": [
+      "/bin/sh",
+      "-lc",
+      "cd /tmp/x\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+     ],
+     "workdir": "/work"
+    }
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/execs/e2",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "step": "shell ends under /tmp",
+   "result": {
+    "state": "succeeded",
+    "exitCode": 0,
+    "cwd": "/tmp/x",
+    "cwdNote": "files under /tmp do not survive while the container sits idle; keep work in the working directory",
+    "output": "",
+    "truncated": false,
+    "box": "h-t-a-mywpiww0",
+    "image": "public.ecr.aws/docker/library/node:24-bookworm"
+   }
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/background-execs",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": {
+    "json": {
+     "command": [
+      "/bin/sh",
+      "-lc",
+      "pwd\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+     ],
+     "workdir": "/tmp/x"
+    }
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/execs/e3",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/background-execs",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": {
+    "json": {
+     "command": [
+      "/bin/sh",
+      "-lc",
+      "mkdir -p /work && cd /work || exit 1\npwd\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+     ]
+    }
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/execs/e4",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "step": "the remembered directory is gone",
+   "result": {
+    "state": "succeeded",
+    "exitCode": 0,
+    "cwd": "/work",
+    "output": "hello",
+    "truncated": false,
+    "box": "h-t-a-mywpiww0",
+    "image": "public.ecr.aws/docker/library/node:24-bookworm",
+    "note": "/tmp/x no longer exists, so this command started in /work"
+   }
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/background-execs",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": {
+    "json": {
+     "command": [
+      "/bin/sh",
+      "-lc",
+      "pwd\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+     ],
+     "workdir": "/nope"
+    }
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/execs/e5",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "step": "an asked directory that does not exist",
+   "result": {
+    "state": "error",
+    "exitCode": null,
+    "error": "failed to start: chdir /nope: no such file or directory",
+    "output": "",
+    "truncated": false,
+    "box": "h-t-a-mywpiww0",
+    "image": "public.ecr.aws/docker/library/node:24-bookworm",
+    "note": "/nope does not exist in the container; create it first, or leave workdir out"
+   }
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/background-execs",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": {
+    "json": {
+     "command": [
+      "/bin/sh",
+      "-lc",
+      "pwd\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+     ],
+     "workdir": "/work"
+    }
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/execs/e6",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "step": "an exec that errs otherwise",
+   "result": {
+    "state": "error",
+    "exitCode": null,
+    "error": "platform trouble",
+    "output": "",
+    "truncated": false,
+    "box": "h-t-a-mywpiww0",
+    "image": "public.ecr.aws/docker/library/node:24-bookworm"
+   }
+  },
+  {
+   "method": "POST",
+   "path": "/projects/p/workspace/boxes/h-t-a-mywpiww0/background-execs",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": {
+    "json": {
+     "command": [
+      "/bin/sh",
+      "-lc",
+      "mkdir -p /work && cd /work || exit 1\npwd\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+     ]
+    }
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/projects/p/workspace/execs/e7",
+   "contentType": "application/json",
+   "authorization": "Basic QUs6U0s=",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "step": "an exec status run9 cannot answer",
+   "threw": "run9 GET /projects/p/workspace/execs/e7 -> 502: <html>bad gateway</html>"
+  },
+  {
+   "step": "no credential",
+   "threw": "the run9 API needs an account, and this call had none — the `sandbox` mount names a credential this deployment holds for everyone, and this deployment does not have it, so whoever deploys has to configure it there, and attaching an account to the mount will not fix it"
+  },
+  {
+   "step": "poll with no credential",
+   "threw": "the run9 API needs an account, and this call had none — the `sandbox` mount names a credential this deployment holds for everyone, and this deployment does not have it, so whoever deploys has to configure it there, and attaching an account to the mount will not fix it"
+  },
+  {
+   "record": {
+    "machines": {
+     "main": {
+      "boxId": "h-t-a-mywpiww0",
+      "createdAt": 1800000001000,
+      "lastUsedAt": 1800000014000,
+      "execs": 6,
+      "saved": [],
+      "credentialRef": "operator",
+      "image": "public.ecr.aws/docker/library/node:24-bookworm"
+     }
+    },
+    "sessions": []
+   }
+  }
+ ]
+}
