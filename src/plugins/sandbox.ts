@@ -1378,20 +1378,66 @@ export function registrationsFor(form: SandboxForm, credential: string, placehol
 }
 
 /**
- * Every name a form takes in a container: its registrations and its environment
- * variables. git's helper is configured through `GIT_CONFIG_COUNT` and
- * `GIT_CONFIG_KEY_0`, so a second plugin with a git helper would clash with
- * github and both would be left out, though git takes several helpers. When
- * that plugin arrives, number the helpers across forms instead of claiming
- * index 0.
+ * git's config slots. A container has one set of them and they carry an
+ * unbounded list, so this is not a name a form can claim: every plugin that
+ * wants a git setting would ask for `GIT_CONFIG_COUNT` and `_0` and they would
+ * all be left out of the container. `envFor` collects each form's entries and
+ * numbers them again across the container instead.
  */
-function claimedNames(form: SandboxForm): string[] {
-  return [...new Set([...form.egress.map((e) => e.name), ...Object.keys(form.env(""))])];
+const GIT_CONFIG_SLOT = /^GIT_CONFIG_(COUNT|KEY_\d+|VALUE_\d+)$/;
+
+/**
+ * Every name a form takes in a container: its registrations and its environment
+ * variables, except git's config slots (above). What is left is a name two
+ * forms cannot both have — a container has one `GH_TOKEN` — so a clash on one
+ * of those still leaves both out and says why.
+ */
+export function claimedNames(form: SandboxForm): string[] {
+  return [...new Set([...form.egress.map((e) => e.name), ...Object.keys(form.env(""))])]
+    .filter((n) => !GIT_CONFIG_SLOT.test(n));
 }
 
-/** The environment a command runs with: every wired mount's, which names placeholders only. */
-function envFor(state: BoxState | null): Record<string, string> {
-  return Object.assign({}, ...(state?.wired ?? []).map((w) => w.env ?? {}));
+/**
+ * The environment a command runs with: every wired mount's, which names
+ * placeholders only, plus git's config list numbered across all of them.
+ *
+ * Each form declares its git settings the way git itself takes them from the
+ * environment — `GIT_CONFIG_KEY_i` with `GIT_CONFIG_VALUE_i` — and the index a
+ * form writes is ignored: entries are collected in the order the mounts were
+ * wired and numbered 0..n-1, so GitHub's credential helper and a second
+ * service's own header coexist instead of colliding on `_0`.
+ *
+ * One limit worth knowing: two forms setting the same config key both apply,
+ * in this order. For a multi-valued key (`credential.helper`) that is what git
+ * does anyway; for a single-valued one (`user.name`) the mount wired last wins.
+ * `http.<url>.extraHeader` is multi-valued, so two mounts of one origin send
+ * both headers, and a server that takes one `Authorization` refuses the request
+ * (stamp.build answers 400): measured on git 2.39.5 and 2.53.0.
+ */
+export function envFor(state: BoxState | null): Record<string, string> {
+  const env: Record<string, string> = {};
+  const entries: Array<{ key: string; value: string }> = [];
+  for (const w of state?.wired ?? []) {
+    const wenv = w.env ?? {};
+    for (const [name, value] of Object.entries(wenv)) {
+      const m = /^GIT_CONFIG_KEY_(\d+)$/.exec(name);
+      if (m) {
+        const v = wenv[`GIT_CONFIG_VALUE_${m[1]}`];
+        if (v !== undefined) entries.push({ key: value, value: v });
+        continue;
+      }
+      if (GIT_CONFIG_SLOT.test(name)) continue;
+      env[name] = value;
+    }
+  }
+  if (entries.length) {
+    env.GIT_CONFIG_COUNT = String(entries.length);
+    entries.forEach((e, i) => {
+      env[`GIT_CONFIG_KEY_${i}`] = e.key;
+      env[`GIT_CONFIG_VALUE_${i}`] = e.value;
+    });
+  }
+  return env;
 }
 
 /** What the model is told about the accounts this container acts as, and the ones it does not. */
