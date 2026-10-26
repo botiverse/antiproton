@@ -3121,6 +3121,138 @@
   },
   {}
  ],
+ "release still deletes a machine whose configuration is now refused": [
+  {
+   "step": "shell with the network open",
+   "result": {
+    "state": "succeeded",
+    "exitCode": 0,
+    "cwd": "/data/home/work",
+    "output": "hello",
+    "truncated": false,
+    "box": "m_1",
+    "image": "universal"
+   }
+  },
+  {
+   "step": "release under network none and no image",
+   "result": {
+    "released": true,
+    "box": "m_1",
+    "liveMs": 4000,
+    "saved": [],
+    "__ap_lease__": {
+     "id": "m_1",
+     "startedAt": 1800000002000,
+     "endedAt": 1800000006000,
+     "status": "freed"
+    },
+    "note": "the container and its files are gone; anything saved above is not"
+   }
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines",
+   "idem": "create-h-t-a-mywpiww0",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "name": "h-t-a-mywpiww0",
+    "templateId": "universal",
+    "vcpus": 2,
+    "memMiB": 4096,
+    "metadata": {
+     "tenant": "t",
+     "agent": "a",
+     "mount": "sandbox",
+     "machine": "main"
+    },
+    "deleteAfterSeconds": 86400,
+    "maxRunMinutes": 480,
+    "failFast": true,
+    "secrets": [],
+    "envSecrets": [],
+    "vault": false
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/operations/op_1?wait=25s",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 40000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpiyfk0b30557a\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
+     "ap",
+     "",
+     "/bin/sh",
+     "-lc",
+     "mkdir -p /data/home/work && cd /data/home/work || exit 1\necho up\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpiyfk0b30557a\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "ap",
+     "262144"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "DELETE",
+   "path": "/v1/machines/m_1",
+   "idem": "delete-m_1-mywpizz4-9fc4e90e",
+   "confirm": "m_1",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 30000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/operations/op_2?wait=25s",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 40000
+  },
+  {
+   "record": {
+    "machines": {},
+    "sessions": [
+     {
+      "boxId": "m_1",
+      "startedAt": 1800000002000,
+      "endedAt": 1800000006000,
+      "lastUsedAt": 1800000003000,
+      "execs": 1,
+      "saved": [],
+      "credentialRef": "agent"
+     }
+    ]
+   }
+  }
+ ],
  "a mount naming instabox is run by the InstaBox adapter, and a network left unset is open": [
   {
    "step": "shell",

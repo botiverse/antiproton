@@ -618,6 +618,23 @@ const SCENARIOS: Record<string, (out: unknown[]) => Promise<void>> = {
     must(!f.reqs.some((r) => r.path.includes("/secrets")), "a credential was registered with InstaBox");
   },
 
+  // The refusal must not lock the way out: a machine that exists under a configuration now refused (made before the
+  // refusal, or under another setting) is still let go by release, or it would go on being billed with no way to stop it.
+  async "release still deletes a machine whose configuration is now refused"(out) {
+    const f = fake();
+    const m = mount();
+    await step("shell with the network open", () => m.plugin.invoke("shell", { command: "echo up" }, m.ctx), out);
+    m.ctx.publicConfig.network = "none";
+    f.reqs.length = 0;
+    const at = out.length;
+    await step("release under network none and no image", () => m.plugin.invoke("release", {}, m.ctx), out);
+    const r = out[at] as any;
+    out.push(...f.log, { record: m.record() });
+    invariants(f);
+    must(r && !("threw" in r) && r.result?.released === true, `release did not let the machine go under the refused configuration: ${JSON.stringify(r)}`);
+    must(f.reqs.some((q) => q.method === "DELETE" && q.path.startsWith("/v1/machines/")), `release sent no DELETE for the machine: ${f.reqs.map((q) => `${q.method} ${q.path}`).join(", ")}`);
+  },
+
   async "a mount naming instabox is run by the InstaBox adapter, and a network left unset is open"(out) {
     const f = fake();
     const m = mount();
