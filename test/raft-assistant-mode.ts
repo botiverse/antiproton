@@ -3331,20 +3331,25 @@ await check("reminder: a session row sealed for one app does not open under anot
   must((await store.get(other)) === null, "a session sealed for one app opened under another app's client id");
 });
 
-await check("reminder: a cookie value under four characters is not cut from what the model reads (the SDK's sensitiveValues rule); a session value is", async () => {
+await check("reminder: a common cookie value is not cut from what the model reads, so ids, dates and JSON survive; the whole pair and a session-length value are", async () => {
   const a = await assistant();
   const seen: string[] = [];
   const store = integrationSessionStore(a.ctx as never, seen);
   const cookie = (pair: string) => ({ pair, host: "reminder.example", path: "/", secure: true });
+  const token = "s3ss10n-0123456789abcdefABCDEF";
   await store.set({ agentId: "agent-1", clientId: REMINDER_SERVICE.clientId }, {
     returnUrl: "https://reminder.example/", updatedAt: "2026-10-26T00:00:00Z",
-    cookies: [cookie("reminder_session=abc123xyz"), cookie("lang=en"), cookie("consent=1")],
+    cookies: [cookie(`reminder_session=${token}`), cookie("lang=en"), cookie("consent=true"), cookie("consent=1"), cookie("sid=0123456789ab"), cookie("state=disabled")],
   });
-  must(!seen.includes("en") && !seen.includes("1") && seen.includes("abc123xyz"), show(seen));
+  must(!seen.includes("en") && !seen.includes("true") && !seen.includes("1") && !seen.includes("disabled") && seen.includes(token) && seen.includes("0123456789ab"), show(seen));
+  must(withheld("sid 0123456789ab", seen) === "sid [withheld]", show(withheld("sid 0123456789ab", seen)));
   const text = "rem-1234 is set for 2026-10-27 at 09:00";
   must(withheld(text, seen) === text, show(withheld(text, seen)));
-  const echoed = withheld("session abc123xyz", seen);
-  must(echoed === "session [withheld]", show(echoed));
+  const json = '{"ok":true,"result":{"done":true,"id":"rem-1234","enabled":true}}';
+  const out = withheld(json, seen);
+  must(out === json && JSON.parse(out).result.done === true, `the app's JSON was changed: ${out}`);
+  must(withheld(`session ${token}`, seen) === "session [withheld]", show(withheld(`session ${token}`, seen)));
+  must(withheld("cookie consent=true was set", seen) === "cookie [withheld] was set", show(withheld("cookie consent=true was set", seen)));
 });
 
 await check("reminder: the model is told to check list-reminders after a failed create-reminder, and to retry with the same requestId", () => {

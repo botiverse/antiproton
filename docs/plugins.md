@@ -1097,8 +1097,10 @@ database in the agent's Durable Object, store `integrationSessions`, one row per
 the Raft agent id it belongs to, sealed (AES-GCM) under a key derived from the mount's Raft credential
 and bound to both ids, listed nowhere; a row for another agent, or one that does not open, reads as
 none and the SDK logs in again. Removing the mount's credential (an agent's delete does) clears the
-store. Every value of the session four characters or longer (the SDK's own rule) is cut from what the
-model reads, should the app echo one. Each call writes a `raft.assistant_reminder` row and log line:
+store. Every cookie pair of the session, and every cookie value that looks like a token (8 or more
+characters mixing letters and digits, or 16 or more), is cut from what the model reads, should the app
+echo one; a common value such as `true` or `en` is not, so the app's ids, dates and JSON reach the model
+intact. Each call writes a `raft.assistant_reminder` row and log line:
 `action` (the action's name, only when the manifest has it) and `outcome` (`actions`, `result`,
 `approval_required`, `install_required`, `unavailable`, `refused:<why>` or `error:<SDK code>`); that row
 and the log never carry the params, the app's answer, the session or the login code. The gateway's own

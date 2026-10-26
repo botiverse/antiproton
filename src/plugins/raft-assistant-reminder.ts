@@ -17,7 +17,7 @@
  *   `approval_required` / `install_required` the SDK's sentence saying who has to act; a failure is the SDK's message
  *   and next action (`APP_ERROR`'s message quotes the app; its next action is always the SDK's). The SDK's mentions
  *   of its own `integrations.*` methods are said as this tool (`asThisTool`), and every value of the app's session
- *   cookies four characters or longer is cut out of it (`withheld`), should an app ever echo one.
+ *   cookie pair, and of a cookie value that looks like a token, is cut out of it (`withheld`), should an app ever echo one.
  * - The app's session (its cookies: the agent's credential at that app) is kept in the mount's own database, in the
  *   agent's Durable Object, sealed under a key only this mount's Raft credential yields
  *   (`integrationSessionStore`, src/plugins/raft-agent-login.ts `sealText`), one row per app client id with the Raft
@@ -94,17 +94,26 @@ function sessionOf(text: string | null): RaftIntegrationSession | null {
  * The SDK's session store over this mount's database: a row per app client id holding the Raft agent id it belongs
  * to and the session sealed (src/plugins/raft-agent-login.ts `sealText`) and bound to both. A row for another agent id,
  * one that does not open under this mount's credential, or one that is not a session reads as none, and the SDK logs
- * in again. `seen` collects every cookie value read or written (four characters or longer), for the caller to cut out
- * of what the model reads.
+ * in again. `seen` collects every cookie read or written (the whole pair, and the bare value when it looks like a token:
+ * 8 or more characters mixing letters and digits, or 16 or more), for the caller to cut out of what the model reads.
  */
+/** A cookie value that may be a session token rather than a common word (`integrationSessionStore`). */
+function looksLikeToken(v: string): boolean {
+  return v.length >= 16 || (v.length >= 8 && /[A-Za-z]/.test(v) && /[0-9]/.test(v));
+}
+
 export function integrationSessionStore(ctx: PluginContext, seen: string[] = []): RaftIntegrationSessionStore {
   const note = (s: RaftIntegrationSession) => {
     for (const c of s.cookies) {
       const value = c.pair.slice(c.pair.indexOf("=") + 1);
-      // The SDK's own rule for what it cuts from an app's text (`sensitiveValues`, @botiverse/raft-sdk 0.29.1
-      // dist/esm/credential-C86GW-F2.js, kept when `value.length >= 4`): a shorter value such as `lang=en`'s `en` would
-      // cut the middle out of ids and dates the model reads and sends back.
-      for (const v of [c.pair, value]) if (v.length >= 4) seen.push(v);
+      // The whole `name=value` is always cut: an app that echoes its cookie usually echoes it whole. The bare value
+      // only when it looks like a token: 8 characters or longer mixing letters and digits, or 16 or longer. `seen` is
+      // cut from everything the model reads, every turn, so a common value (`true`, `en`, `pending`, `disabled`) would
+      // cut ids, dates and JSON the model reads and sends back. What this leaves uncut is a bare value of 8 to 15
+      // characters of only letters or only digits; its whole pair is still cut. Neither rule guesses from the cookie's
+      // name, which the app chooses.
+      if (c.pair) seen.push(c.pair);
+      if (looksLikeToken(value)) seen.push(value);
     }
   };
   return {
