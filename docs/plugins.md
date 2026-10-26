@@ -1073,10 +1073,44 @@ without the text, since it may have landed. Each call writes a `raft.assistant_s
 `target_kind` (`message`, `channel`, `dm`, `channel_id`), `in_thread`, `chars` (the message's length)
 and Raft's HTTP status as `http_status`; never the message, a name or an id.
 
+An assistant's one Raft app is the Reminder app (Raft offers an assistant no other, slock#10764), used
+through `assistant_reminder`, offered in the chat only (`src/plugins/raft-assistant-reminder.ts`) and
+built on the Raft SDK's `raft.integrations` (SDK 0.29). It takes an `action` and its `params`, nothing
+else: called with no action it returns the app's actions and their parameters from its manifest
+(`integrations.actions`, no login); with one it calls it (`integrations.call`, which logs in through
+Raft, opens the app's callback for its session cookie, and calls the action on the app's registered
+origin, never following a redirect). Code keeps, whatever the model does: the app is never the model's
+to name. A `service` (or any other argument) is refused, and the Reminder app is found in Raft's list
+(`integrations.list`), picked by Raft's official mark with a purpose about reminders, else by its name,
+and called by the service id Raft gave; no Reminder app listed (a deployment with none configured)
+answers `unavailable` once, with nothing logged in or called. Only an action the manifest names is
+called, and its params only as the manifest declares them (no parameter it does not name, every one it
+requires, each of its type); anything else is refused before anything reaches the app. A call from a
+short session (a check or the brief) or a program is refused in code, and the tool is not offered there
+either. What the model reads is the SDK's: the app's answer, marked as the app's data (`result`), the
+SDK's sentence for `approval_required` or `install_required` (a person has to act; nothing ran), or a
+failure's text and next action (Raft's refusal such as `assistant_integration_not_allowed` with Raft's
+next action, an app's refusal as `APP_ERROR` with the app's words quoted), with the SDK's mentions of
+its own `integrations.*` methods said as this tool; nothing is retried. The app's session cookies are
+the agent's credential at that app: they are kept (the SDK's `integrationSessions`) in the mount's own
+database in the agent's Durable Object, store `integrationSessions`, one row per app client id holding
+the Raft agent id it belongs to, sealed (AES-GCM) under a key derived from the mount's Raft credential
+and bound to both ids, listed nowhere; a row for another agent, or one that does not open, reads as
+none and the SDK logs in again. Removing the mount's credential (an agent's delete does) clears the
+store. Every cookie pair of the session, and every cookie value that looks like a token (8 or more
+characters mixing letters and digits, or 16 or more), is cut from what the model reads, should the app
+echo one; a common value such as `true` or `en` is not, so the app's ids, dates and JSON reach the model
+intact. Each call writes a `raft.assistant_reminder` row and log line:
+`action` (the action's name, only when the manifest has it) and `outcome` (`actions`, `result`,
+`approval_required`, `install_required`, `unavailable`, `refused:<why>` or `error:<SDK code>`); that row
+and the log never carry the params, the app's answer, the session or the login code. The gateway's own
+`tool.call` row for a failed call carries the error message's first 200 characters, as for every tool
+(`TOOL_ERROR_MAX`, `src/trace/seams.ts`), so an `APP_ERROR` there quotes the app's words.
+
 A `403 assistant_not_enabled` from any call
 pauses the checks, the brief and the notify tool until Raft's context names the
 owner again. The chat is offered the owner DM, attachments, the reads, the
-preferences and send-as-owner (plus `resume` and the parked-result reader), with no run_js, jobs
+preferences, send-as-owner and the Reminder app (plus `resume` and the parked-result reader), with no run_js, jobs
 or subagents, under a prompt of its own (`assistantSystemPrompt`,
 `src/runtime/pi-prompt.ts`, the one entry point for it).
 

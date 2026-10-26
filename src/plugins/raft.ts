@@ -15,6 +15,7 @@ import type { Json, MountRecord } from "../core/types.ts";
 import {
   createRaft, describeRaftRoute, hashRaftSendContent, isInterrupted, projectRaftMessage, raftbenchFailureKind, raftbenchRunAssignment, RAFT_OPERATIONS, RAFT_STATE_SCHEMA, SeenFrontier,
   type Raft, type RaftInboxBatch, type RaftInboxListing, type RaftInterrupt, type RaftMessage, type RaftOperationSpec, type RaftState, type RaftStateStore, type RaftFailure,
+  type RaftIntegrationSessionStore,
 } from "@botiverse/raft-sdk";
 import { PARK_BYTES } from "./artifacts.ts";
 import {
@@ -29,6 +30,7 @@ import {
   checkEnded, pushBriefImport, type AssistantApi, type RaftAnswer,
 } from "./raft-assistant.ts";
 import type { RaftCheck, RefusedCheck } from "./raft-assistant-check.ts";
+import { clearIntegrationSessions, INTEGRATION_SESSIONS_STORE, REMINDER_TOOL, reminderTool } from "./raft-assistant-reminder.ts";
 import { callMcp, isMcpTool, keptMcpOf, leftOut, listMcp, mcpClock, mcpLines, MCP_CALL_TIMEOUT_MS, MCP_CAPABILITY, MCP_KEY, MCP_PREFIX } from "./raft-mcp.ts";
 import { modelToolName } from "../runtime/pi-tools.ts";
 import { isSubagentSession } from "../runtime/subagent-session.ts";
@@ -517,11 +519,18 @@ function raftFor(ctx: PluginContext, options: {
    * left in `refused` for the caller to say.
    */
   presigned?: { refused?: PresignedProblem };
+  /**
+   * Where `raft.integrations.call` keeps the apps' sessions (the assistant's Reminder tool,
+   * src/plugins/raft-assistant-reminder.ts `integrationSessionStore`). Absent, the SDK's default keeps them in memory
+   * for this client alone, which here is one call, so every call would log in again.
+   */
+  integrationSessions?: RaftIntegrationSessionStore;
 } = {}): Raft {
   const last: { state?: RaftState } = {};
   return createRaft({
     serverUrl: baseUrl(ctx).origin, credential: requireCredential(ctx), hints: "tool",
     ...(cardsOn(ctx) ? { conversationCards: true } : {}),
+    ...(options.integrationSessions ? { integrationSessions: options.integrationSessions } : {}),
     // Redirects stay manual, as on every other request here, so a 3xx never carries the credential elsewhere.
     fetch: async (input, init) => {
       const started = Date.now();
@@ -3014,8 +3023,10 @@ export function createRaftPlugin(deps: {
       // Version 5 added the Server's flags as the listing last read them (`CONTEXT_STORE`); nothing to carry over.
       // Version 6 added a personal assistant's owner, rules, held items and what it has told them
       // (src/plugins/raft-assistant.ts); nothing to carry over.
-      version: 6, stores: {
-        [PUSH_STORE]: { listed: [PUSH_KEY] }, [INBOX_STORE]: { listed: [STATE_KEY, SINCE_KEY] }, [SESSION_STORE]: {},
+      // Version 7 added the Raft SDK's app sessions (`INTEGRATION_SESSIONS_STORE`, the assistant's Reminder tool): one
+      // sealed row per app, none listed, since each is a credential; nothing to carry over.
+      version: 7, stores: {
+        [PUSH_STORE]: { listed: [PUSH_KEY] }, [INBOX_STORE]: { listed: [STATE_KEY, SINCE_KEY] }, [SESSION_STORE]: {}, [INTEGRATION_SESSIONS_STORE]: {},
         [CONTEXT_STORE]: { listed: [FEATURES_KEY, MCP_KEY] },
         [ASSISTANT_STORE]: { listed: [OWNER_KEY, RULES_KEY, CONTACT_KEY, DEFERRED_KEY] }, [REMINDED_STORE]: {},
       },
@@ -3128,6 +3139,9 @@ export function createRaftPlugin(deps: {
      */
     async snapshotTools(ctx: PluginContext): Promise<ListedTools> {
       if (!ctx.credential) {
+        // The apps' sessions belonged to the account the removed credential named (an agent's delete removes it):
+        // sealed under it, they no longer open, and they go too.
+        await clearIntegrationSessions(ctx);
         return { tools: [], skipped: [{ name: EVERY_OPERATION, reason: "this mount has no Raft credential, so it has no capabilities", every: true }] };
       }
       const raft = raftFor(ctx, { state: false });
@@ -3327,6 +3341,11 @@ export function createRaftPlugin(deps: {
         if (!ctx.offered?.includes(name)) throw ownerRefusal(`${name} is not offered on this mount: its Raft account is not a personal assistant`);
         return name === NOTIFY_TOOL ? notifyOwner(args, ctx, { send: sendToOwner, recheck: recheckOwner, api: assistantApi })
           : preferences(args, ctx, { inbox: (c, r) => assistant.ownerInbox(c, r), resolve: resolveOwnerPerson, api: assistantApi });
+      }
+      if (name === REMINDER_TOOL) {
+        if (!ctx.offered?.includes(name)) throw ownerRefusal(`${name} is not offered on this mount: its Raft account is not a personal assistant`);
+        // A client with no saved state: an app call books nothing as seen.
+        return reminderTool(args, ctx, { raft: (sessions) => raftFor(ctx, { state: false, integrationSessions: sessions }) });
       }
       if (name === SEND_AS_OWNER_TOOL) {
         if (!ctx.offered?.includes(name)) throw ownerRefusal(`${name} is not offered on this mount: its Raft account is not a personal assistant`);
