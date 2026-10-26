@@ -2204,7 +2204,18 @@ export interface Plugin {
    * selects the policy half and nothing else.
    */
   classify?(tool: string, args: Json): "read" | "write" | undefined;
-
+  /**
+   * What a mount of this plugin may do without a human when the mount's own
+   * policy does not say. Read by {@link policyFor} (src/runtime/gateway.ts)
+   * and nowhere else.
+   *
+   * An absent mount policy allows everything, which is right for most plugins
+   * and wrong for one whose tool cannot be undone by trying again — approving
+   * or merging a pull request. Such a plugin names those tools here, and the
+   * mount's own per-tool entry is the only thing that lifts one: a mount-wide
+   * `write: "allow"` set for some other reason does not.
+   */
+  defaultPolicy?: MountPolicy;
 
 
   /**

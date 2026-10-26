@@ -5,10 +5,14 @@
  * nowhere else; it is kept sealed and rotated before it expires; one rotation is
  * shared by concurrent calls, because a refresh token is single-use; a rotation
  * that cannot be stored fails the call rather than being used; `refresh_reused`
- * is reported as what it is and not retried; a path cannot reach another host;
- * and the container form offers only a placeholder.
+ * is reported as what it is and not retried; a path cannot reach another host
+ * or climb out of the API; there is no container form; a kept session is never
+ * replaced by the spent credential; and approving, merging and `api` wait for a
+ * person on a mount that sets no policy (#1051).
  */
-import { stampPlugin, SESSION_STORE, parseSession } from "../src/plugins/stamp.ts";
+import { stampPlugin, SESSION_STORE, parseSession, loadSession } from "../src/plugins/stamp.ts";
+import { SqliteStore } from "../src/store/sqlite.ts";
+import { ToolGateway } from "../src/runtime/gateway.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void> | void) {
@@ -22,6 +26,8 @@ function must(c: unknown, m: string): asserts c { if (!c) throw new Error(m); }
 type Seen = { method: string; path: string; auth: string | undefined; body: string };
 let seen: Seen[] = [];
 let refreshes = 0;
+/** Refresh tokens the fake gateway has rotated: presenting one again is `refresh_reused`, as on Stamp. */
+let spentRefresh = new Set<string>();
 let refreshAnswer: () => Response = () => new Response("{}", { status: 500 });
 let failNextStore = false;
 const replies: Record<string, unknown> = {
@@ -57,7 +63,13 @@ globalThis.fetch = (async (input: any, init: any) => {
   seen.push({ method, path, auth: init?.headers?.authorization, body: init?.body ?? "" });
   if (url.pathname === "/api/auth/agent/refresh") {
     refreshes++;
-    return refreshAnswer();
+    const presented = String(JSON.parse(init?.body ?? "{}").refresh_token);
+    if (spentRefresh.has(presented)) {
+      return new Response(JSON.stringify({ error: "refresh_reused" }), { status: 401, headers: { "content-type": "application/json" } });
+    }
+    const answer = refreshAnswer();
+    if (answer.ok) spentRefresh.add(presented);
+    return answer;
   }
   const status = statuses[key] ?? (key in replies ? 200 : 404);
   const body = key in replies ? replies[key] : { errorCode: "NOT_FOUND", message: "no such route" };
@@ -84,7 +96,18 @@ function makeCtx(credential: string | null = session()) {
 }
 
 const invoke = (tool: string, args: any, ctx: any) => stampPlugin.invoke(tool, args, ctx) as Promise<any>;
-const reset = () => { seen = []; refreshes = 0; };
+const reset = () => { seen = []; refreshes = 0; spentRefresh = new Set(); };
+const HEAD = "a".repeat(40);
+const BASE = "b".repeat(40);
+const expired = () => session({ access_expires_at: new Date(Date.now() - 1000).toISOString() });
+const rotatesTo = (n: number) => () => new Response(JSON.stringify({
+  schema: "raft-cli-agent-session.v1", access_token: `ACCESS-${n}`, refresh_token: `REFRESH-${n}`,
+  access_expires_at: new Date(Date.now() + 15 * 60_000).toISOString(),
+}), { status: 200, headers: { "content-type": "application/json" } });
+async function refusal(p: Promise<unknown>): Promise<string> {
+  try { await p; } catch (e) { return String((e as Error).message); }
+  return "";
+}
 
 // ---- the cases --------------------------------------------------------------
 
@@ -149,18 +172,18 @@ await check("pr_create sends the receipt, base and title, and keeps the idempote
 
 await check("an approval names the exact head and base it is about", async () => {
   reset();
-  await invoke("pr_approve", { repo: "o/r", number: 7, head: "H", base: "B", note: "looks right" }, makeCtx().ctx);
+  await invoke("pr_approve", { repo: "o/r", number: 7, head: HEAD, base: BASE, note: "looks right" }, makeCtx().ctx);
   must(seen[0].method === "POST" && seen[0].path === "/v1/repositories/o/r/pulls/7/approve", `${seen[0].method} ${seen[0].path}`);
   const sent = JSON.parse(seen[0].body);
-  must(sent.expectedHead === "H" && sent.expectedBase === "B" && sent.body === "looks right", JSON.stringify(sent));
+  must(sent.expectedHead === HEAD && sent.expectedBase === BASE && sent.body === "looks right", JSON.stringify(sent));
 });
 
 await check("merge defaults to auto-merge, which returns instead of waiting", async () => {
   reset();
-  await invoke("pr_merge", { repo: "o/r", number: 7, head: "H", base: "B" }, makeCtx().ctx);
+  await invoke("pr_merge", { repo: "o/r", number: 7, head: HEAD, base: BASE }, makeCtx().ctx);
   must(seen[0].method === "PUT" && seen[0].path === "/v1/repositories/o/r/pulls/7/auto-merge", `${seen[0].method} ${seen[0].path}`);
   reset();
-  await invoke("pr_merge", { repo: "o/r", number: 7, head: "H", base: "B", auto: false, method: "squash" }, makeCtx().ctx);
+  await invoke("pr_merge", { repo: "o/r", number: 7, head: HEAD, base: BASE, auto: false, method: "squash" }, makeCtx().ctx);
   const direct: string = seen[0].path;
   must(direct === "/v1/repositories/o/r/pulls/7/merge", direct);
   must(JSON.parse(seen[0].body).mergeMethod === "squash", seen[0].body);
@@ -189,18 +212,11 @@ await check("a credential that is not a session is refused by name", async () =>
   must(parseSession(session())?.refresh_token === "REFRESH-1", "a real session did not parse");
 });
 
-await check("the container form offers the session as a placeholder, at index 0", async () => {
-  const form = stampPlugin.sandboxForm!;
-  must(form.egress.length === 1 && form.egress[0].name === "STAMP_SESSION", JSON.stringify(form.egress));
-  const reg = form.egress[0];
-  must(reg.header === "authorization", reg.header);
-  must(reg.hosts.length === 1 && reg.hosts[0] === "stamp.build", JSON.stringify(reg.hosts));
-  must(reg.value("REAL-SESSION") === "Bearer REAL-SESSION", reg.value("REAL-SESSION"));
-  must(reg.placeholder("__AP__") === "Bearer __AP__", reg.placeholder("__AP__"));
-  const env = form.env("__AP__");
-  must(env.GIT_CONFIG_KEY_0 === "http.https://stamp.build/.extraHeader", env.GIT_CONFIG_KEY_0);
-  must(env.GIT_CONFIG_VALUE_0 === "Authorization: Bearer __AP__", env.GIT_CONFIG_VALUE_0);
-  must(!JSON.stringify(env).includes("REAL-SESSION"), "the real session reached the container's env");
+// #1051 finding 1. The form handed the egress proxy the mount's credential, which
+// is the whole session JSON: `Bearer {"access_token":…,"refresh_token":…}`.
+// The old case only checked `value("REAL-SESSION")`, so it passed on that.
+await check("there is no container form: it would carry the refresh token, and a credential that never rotates", async () => {
+  must(stampPlugin.sandboxForm === undefined, "stamp declares a sandboxForm again");
 });
 
 await check("tools declare what the gateway needs to gate them", async () => {
@@ -258,11 +274,15 @@ await check("a rotation that cannot be stored fails the call and is not used", a
     schema: "raft-cli-agent-session.v1", access_token: "ACCESS-4", refresh_token: "REFRESH-4",
     access_expires_at: new Date(Date.now() + 15 * 60_000).toISOString(),
   }), { status: 200, headers: { "content-type": "application/json" } });
+  // Sealed first, so the write that fails is the rotation's and not the first-use seal.
+  await loadSession(ctx);
+  const before = JSON.stringify(rows.get("session"));
   failNextStore = true;
   let threw = "";
   try { await invoke("whoami", {}, ctx); } catch (e) { threw = String((e as Error).message); }
+  must(refreshes === 1, `refreshes: ${refreshes}`);
   must(threw.includes("write refused by the test"), `message: ${threw}`);
-  must(rows.size === 0, "a session was kept anyway");
+  must(JSON.stringify(rows.get("session")) === before, "a rotated session was kept anyway");
   must(!seen.some((s) => s.auth === "Bearer ACCESS-4"), "the unkeepable session was used");
 });
 
@@ -302,6 +322,247 @@ await check("a 401 rotates once and retries once, with the new token", async () 
   must(refreshes === 1, `refreshes: ${refreshes}`);
   must(seen.at(-1)?.auth === "Bearer ACCESS-5", `retry sent: ${seen.at(-1)?.auth}`);
   must(rows.size === 1, "the rotated session was not kept");
+});
+
+// ---- #1051: the spent credential is never sent again --------------------------
+
+// Finding 2. After the first rotation the credential's refresh token is spent,
+// and sending it again is `refresh_reused`: every token the agent holds, revoked.
+
+await check("the credential is sealed on first use, and read from the row after that", async () => {
+  reset();
+  const { ctx, rows } = makeCtx();
+  await invoke("whoami", {}, ctx);
+  must(rows.size === 1, `rows after first use: ${rows.size}`);
+  const row: any = rows.get("session");
+  must(typeof row?.ciphertext === "string" && !JSON.stringify(row).includes("REFRESH-1"), `row: ${JSON.stringify(row)}`);
+  // The mount still holds the original credential; what is sent comes from the row.
+  const rotated = makeCtx(expired());
+  refreshAnswer = rotatesTo(20);
+  await invoke("whoami", {}, rotated.ctx);
+  reset();
+  await invoke("whoami", {}, rotated.ctx);
+  must(refreshes === 0 && seen[0].auth === "Bearer ACCESS-20", `after rotation: refreshes=${refreshes}, sent ${seen[0]?.auth}`);
+});
+
+await check("a renamed mount still opens its session, rather than refreshing with the spent credential", async () => {
+  reset();
+  const { ctx } = makeCtx(expired());
+  refreshAnswer = rotatesTo(21);
+  await invoke("whoami", {}, ctx);
+  must(refreshes === 1, `refreshes: ${refreshes}`);
+  // `renameMount` moves the database with the alias; the credential is the same.
+  const renamed = { ...ctx, alias: "stamp-renamed" };
+  seen = [];
+  const threw = await refusal(invoke("whoami", {}, renamed));
+  must(threw === "", `the renamed mount failed: ${threw}`);
+  must(refreshes === 1, `the renamed mount refreshed again (${refreshes}), with a spent token`);
+  must(seen.at(-1)?.auth === "Bearer ACCESS-21", `sent: ${seen.at(-1)?.auth}`);
+});
+
+await check("a kept session that does not open is a sign-in, never the spent credential", async () => {
+  reset();
+  const { ctx, rows } = makeCtx(expired());
+  refreshAnswer = rotatesTo(22);
+  await invoke("whoami", {}, ctx);
+  const row: any = rows.get("session");
+  rows.set("session", { ...row, ciphertext: row.ciphertext.slice(4) + "AAAA" });
+  seen = [];
+  // The same session with an access token not yet due, so a fallback would send it at once rather than refresh first.
+  const threw = await refusal(invoke("whoami", {}, { ...ctx, credential: session() }));
+  must(threw.includes("sign-in again"), `message: ${threw}`);
+  must(refreshes === 1 && seen.length === 0, `sent anyway: refreshes=${refreshes}, requests=${seen.length}`);
+});
+
+await check("a database read that fails is an error, never the spent credential", async () => {
+  reset();
+  const { ctx } = makeCtx(expired());
+  refreshAnswer = rotatesTo(23);
+  await invoke("whoami", {}, ctx);
+  const broken = { ...ctx, db: { ...ctx.db, async get() { throw new Error("storage hiccup"); } } };
+  seen = [];
+  const threw = await refusal(invoke("whoami", {}, broken));
+  must(threw.includes("could not read this mount's session") && threw.includes("storage hiccup"), `message: ${threw}`);
+  must(refreshes === 1 && seen.length === 0, `sent anyway: refreshes=${refreshes}, requests=${seen.length}`);
+});
+
+await check("checking a candidate credential neither refreshes it nor overwrites the live session", async () => {
+  reset();
+  const { ctx, rows } = makeCtx(expired());
+  refreshAnswer = rotatesTo(24);
+  await invoke("whoami", {}, ctx);
+  const live = JSON.stringify(rows.get("session"));
+  // What `checkMount` does with a value a person is pasting: the mount's context, another credential.
+  refreshAnswer = rotatesTo(25);
+  const candidate = { ...ctx, credential: session({ access_token: "ACCESS-C", refresh_token: "REFRESH-C",
+    access_expires_at: new Date(Date.now() - 1000).toISOString() }) };
+  const checked: any = await stampPlugin.checkCredential!(candidate);
+  must(checked.ok === false && checked.kind === "unreachable", `expired candidate: ${JSON.stringify(checked)}`);
+  must(refreshes === 1, `the check refreshed the candidate (${refreshes})`);
+  must(JSON.stringify(rows.get("session")) === live, "the check overwrote the live session");
+  seen = [];
+  await invoke("whoami", {}, ctx);
+  must(refreshes === 1 && seen.at(-1)?.auth === "Bearer ACCESS-24", `live mount after the check: refreshes=${refreshes}, sent ${seen.at(-1)?.auth}`);
+  // A fresh candidate is checked with its own access token, and still writes nothing.
+  seen = [];
+  const fresh: any = await stampPlugin.checkCredential!({ ...ctx, credential: session({ access_token: "ACCESS-D", refresh_token: "REFRESH-D" }) });
+  must(fresh.ok === true && fresh.account === "@eleanor", JSON.stringify(fresh));
+  must(seen.length === 1 && seen[0].auth === "Bearer ACCESS-D", `check sent: ${JSON.stringify(seen)}`);
+  must(JSON.stringify(rows.get("session")) === live, "a passing check overwrote the live session");
+});
+
+await check("a credential a person replaced is used, and the spent one is refused by name", async () => {
+  reset();
+  const { ctx } = makeCtx(expired());
+  refreshAnswer = rotatesTo(26);
+  await invoke("whoami", {}, ctx);
+  // The positive control for the refusals above: a new session is not a lost one.
+  seen = [];
+  const replaced = { ...ctx, credential: session({ access_token: "ACCESS-N", refresh_token: "REFRESH-N" }) };
+  await invoke("whoami", {}, replaced);
+  must(seen.at(-1)?.auth === "Bearer ACCESS-N", `sent: ${seen.at(-1)?.auth}`);
+  // And the spent one pasted back is not new: same refresh token, so the row it cannot open is its own.
+  const back = await stampPlugin.checkCredential!({ ...ctx, credential: expired() }) as any;
+  must(back.ok === false && back.kind === "rejected" && /sign-in again/.test(back.reason), JSON.stringify(back));
+});
+
+// Finding 3. B reads S1; A rotates S1 to S2 and finishes; B then rotates S1.
+
+await check("a call that read the session before another rotated it uses the newer one, not the spent token", async () => {
+  reset();
+  const { ctx: a } = makeCtx(expired());
+  refreshAnswer = rotatesTo(27);
+  await loadSession(a);
+  let open!: () => void;
+  const gate = new Promise<void>((r) => { open = r; });
+  let held = true;
+  const b = { ...a, db: { ...a.db, async get(store: string, key: string) {
+    const v = await a.db.get(store, key);
+    if (held) { held = false; await gate; }
+    return v;
+  } } };
+  const late = invoke("whoami", {}, b);
+  await invoke("whoami", {}, a);
+  must(refreshes === 1, `refreshes after A: ${refreshes}`);
+  open();
+  const threw = await refusal(late);
+  must(threw === "", `B failed: ${threw}`);
+  must(refreshes === 1, `B rotated again (${refreshes}): a spent refresh token was sent`);
+  must(seen.at(-1)?.auth === "Bearer ACCESS-27", `B sent: ${seen.at(-1)?.auth}`);
+});
+
+// Finding 4. `new URL` resolves dot segments, `%2e` included.
+
+await check("api cannot climb out of /v1/ or /api/v3/ to /api/auth", async () => {
+  const { ctx } = makeCtx();
+  const climbs = [
+    "/v1/../api/auth/agent/refresh",
+    "/v1/%2e%2e/api/auth/agent/refresh",
+    "/v1/%2E%2E/api/auth/agent/refresh",
+    "/v1/.%2e/api/auth/agent/refresh",
+    "/v1/%252e%252e/api/auth/agent/refresh",
+    "/v1/..\\api\\auth\\agent\\refresh",
+    "/api/v3/../../api/auth/agent/refresh",
+    "/api/v3/%2e%2e/%2E%2E/api/auth/agent/refresh",
+    "/api/v3/repos/..%2f..%2f..%2fapi/auth/agent/refresh",
+    "/api/v3/%25252e%25252e/api/auth/agent/refresh",
+    // `URL` drops tabs and newlines before it resolves, so these are dot segments only once parsed.
+    "/v1/\t../api/auth/agent/refresh",
+    "/v1/.\n./api/auth/agent/refresh",
+  ];
+  for (const path of climbs) {
+    reset();
+    for (const [tool, args] of [["api_get", { path }], ["api", { path, method: "POST", body: {} }]] as const) {
+      const threw = await refusal(invoke(tool, args, ctx));
+      must(/path must|carries no escapes/.test(threw), `${tool} ${path} was not refused: ${threw}`);
+    }
+    must(seen.length === 0, `${path} reached ${seen.map((x) => x.path).join(", ")}`);
+  }
+  reset();
+  await invoke("api_get", { path: "/v1/repositories/o/r/pulls" }, ctx);
+  await invoke("api_get", { path: "/api/v3/repos/o/r/issues" }, ctx).catch(() => {});
+  must(seen[0]?.path === "/v1/repositories/o/r/pulls" && seen[1]?.path === "/api/v3/repos/o/r/issues", `forwarded: ${seen.map((x) => x.path)}`);
+  reset();
+  await invoke("api_get", { path: "/api/v3/repos/o/r/labels/good%20first%20issue" }, ctx).catch(() => {});
+  const label: string | undefined = seen[0]?.path;
+  must(label === "/api/v3/repos/o/r/labels/good%20first%20issue", `an escaped label: ${label}`);
+});
+
+await check("a repo of dot segments is refused before any request", async () => {
+  for (const repo of ["../..", "o/..", "./r", "../r", "o/."]) {
+    reset();
+    const threw = await refusal(invoke("pr_view", { repo, number: 1 }, makeCtx().ctx));
+    must(threw.includes('must be "owner/name"'), `${repo}: ${threw}`);
+    must(seen.length === 0, `${repo} reached ${seen.map((x) => x.path)}`);
+  }
+});
+
+// Finding 5. A missing head was sent as "undefined"; an issue number was not checked.
+
+await check("approve, unapprove and merge need both full SHAs, and never send \"undefined\"", async () => {
+  const cases: Array<Record<string, unknown>> = [
+    { base: BASE }, { head: HEAD }, { head: "H", base: BASE }, { head: HEAD, base: "main" }, { head: HEAD.slice(1), base: BASE },
+  ];
+  for (const tool of ["pr_approve", "pr_unapprove", "pr_merge"]) {
+    for (const c of cases) {
+      reset();
+      const threw = await refusal(invoke(tool, { repo: "o/r", number: 7, ...c }, makeCtx().ctx));
+      must(/(head|base) must be the full 40-character commit SHA/.test(threw), `${tool} ${JSON.stringify(c)}: ${threw}`);
+      must(seen.length === 0, `${tool} ${JSON.stringify(c)} sent ${seen.map((x) => x.body)}`);
+    }
+  }
+});
+
+await check("issue_comment needs an issue number", async () => {
+  for (const number of [undefined, "abc", 0, -1, 1.5, true]) {
+    reset();
+    const threw = await refusal(invoke("issue_comment", { repo: "o/r", number, body: "hi" }, makeCtx().ctx));
+    must(threw.includes("number must be an issue number"), `${JSON.stringify(number)}: ${threw}`);
+    must(seen.length === 0, `${JSON.stringify(number)} sent ${seen.map((x) => x.path)}`);
+  }
+});
+
+// Finding 5. Through the gateway, the way a call actually arrives: a mount with no
+// policy allowed everything, so approve, merge and `api` ran with nobody there.
+
+/** A stamp mount behind a real gateway, under `policy`. */
+async function gatewayMount(policy: unknown) {
+  const store = new SqliteStore(":memory:");
+  await store.init();
+  await store.createAgent("t", "a");
+  await store.addMount({
+    tenantId: "t", agentId: "a", alias: "stamp", plugin: "stamp", installationId: "i", connectionId: null,
+    toolVersion: stampPlugin.version, publicConfig: {}, secretRef: "agent:stamp", policy: policy as any,
+  });
+  const credential = session();
+  const gw = new ToolGateway(store, [stampPlugin], new Set(["stamp"]), { async resolve() { return credential; } });
+  return (tool: string, args: Json) => gw.invoke({ tenantId: "t", agentId: "a", taskId: "k" }, `stamp.${tool}`, args) as Promise<any>;
+}
+type Json = any;
+const MERGE = { repo: "o/r", number: 7, head: HEAD, base: BASE };
+
+await check("with no mount policy, approve, merge and api wait for a person; reads and comments do not", async () => {
+  const call = await gatewayMount(null);
+  for (const [tool, args] of [["pr_approve", MERGE], ["pr_merge", MERGE], ["api", { path: "/v1/repositories/o/r/pulls/7/approve", method: "POST", body: {} }]] as const) {
+    reset();
+    const r = await call(tool, args);
+    must(r.status === "pending" && r.error?.code === "awaiting_approval", `${tool}: ${JSON.stringify(r)}`);
+    must(seen.length === 0, `${tool} reached the gateway: ${seen.map((x) => x.path)}`);
+  }
+  reset();
+  const read = await call("pr_view", { repo: "o/r", number: 7 });
+  must(read.status === "succeeded", `pr_view: ${JSON.stringify(read)}`);
+});
+
+await check("only the mount naming the tool lifts the hold: a mount-wide write allow does not", async () => {
+  const wide = await gatewayMount({ write: "allow" });
+  reset();
+  const held = await wide("pr_merge", MERGE);
+  must(held.status === "pending" && seen.length === 0, `write:allow merged: ${JSON.stringify(held)}`);
+  const named = await gatewayMount({ tools: { pr_merge: "allow" } });
+  reset();
+  const ran = await named("pr_merge", MERGE);
+  must(ran.status === "succeeded" && seen.at(-1)?.path === "/v1/repositories/o/r/pulls/7/auto-merge", `named: ${JSON.stringify(ran)}`);
 });
 
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.error ? `\n    ${r.error}` : ""}`);

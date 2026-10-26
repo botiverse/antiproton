@@ -124,7 +124,9 @@ name from `ctx.alias`, not from the plugin id.
 
 **Declare side effects truthfully.** `sideEffects` decides which half of the
 mount's policy (`read` or `write`) applies to a tool that has no policy of its
-own. A write declared as a read escapes an operator's "writes need approval".
+own. A tool whose misuse cannot be undone is named in `defaultPolicy` on the
+plugin (`{ tools: { merge: "approval" } }`): a person signs it on a mount whose
+policy does not name it, where an absent policy would otherwise allow it. A write declared as a read escapes an operator's "writes need approval".
 It also decides replay: a read may be repeated after an interruption, and a
 write is repeated only when its `idempotency` is `native` (`replayPolicy` in
 `src/runtime/pi-tools.ts`). Declare `native` only when calling the tool twice

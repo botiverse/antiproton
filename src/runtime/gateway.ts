@@ -209,16 +209,22 @@ function sameSnapshot(a: ToolSnapshot | null | undefined, b: ToolSnapshot | null
  * the operator has just deliberately created should work. The check lives here,
  * at the same choke point that holds credentials, so no harness and no sandbox
  * can route around it.
+ *
+ * `defaults` is the plugin's `Plugin.defaultPolicy`, for the few tools whose
+ * plugin says a person signs them unless the mount says otherwise. Its per-tool
+ * entries sit below the mount's per-tool entries and above the mount's
+ * side-effect halves, so only naming the tool lifts one.
  */
 export function policyFor(
   policy: MountPolicy | null | undefined,
   tool: string,
   sideEffects: "read" | "write",
+  defaults?: MountPolicy | null,
 ): PolicyDecision {
-  if (!policy) return "allow";
-  const perTool = policy.tools?.[tool];
+  const perTool = policy?.tools?.[tool] ?? defaults?.tools?.[tool];
   if (perTool) return perTool;
-  return (sideEffects === "write" ? policy.write : policy.read) ?? "allow";
+  const half = (p: MountPolicy | null | undefined) => (sideEffects === "write" ? p?.write : p?.read);
+  return half(policy) ?? half(defaults) ?? "allow";
 }
 
 export class ToolGateway {
@@ -916,7 +922,7 @@ export class ToolGateway {
     const facts = () => (opts.callId === undefined ? {} : { callId: opts.callId });
     // A declared write may be a read for the policy, per call, when the plugin says so (`Plugin.classify`).
     const verdict = opts.approved ? "allow" : confirm ? "approval"
-      : policyFor(r.mount.policy, r.tool, callSideEffects(plugin, r.tool, args, schema.sideEffects));
+      : policyFor(r.mount.policy, r.tool, callSideEffects(plugin, r.tool, args, schema.sideEffects), plugin.defaultPolicy);
     if (verdict === "deny") {
       // The operation was recorded above, before the policy was asked, so a
       // refusal has to end it or the row stays "pending" for ever — an attempt

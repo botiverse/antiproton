@@ -179,7 +179,8 @@ export interface MountRecord {
   publicConfig: Record<string, Json>;
   secretRef: string | null;
   /** Absent means allow everything, which is the only sane default for a
-   *  mount the operator has just deliberately created. */
+   *  mount the operator has just deliberately created — except the tools its
+   *  plugin's `defaultPolicy` names (`policyFor`). */
   policy?: MountPolicy | null;
   /** What a remote server listed for this mount; see `ToolSnapshot`. Absent
    *  for every plugin whose tools are its own. */
