@@ -21,7 +21,7 @@ import type { ModelResponse } from "../src/model/types.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { setLogSink } from "../src/core/log.ts";
 import type { HookRow } from "../cf/src/control-plane.ts";
-import { MAX_CALLS, OUTPUT_ENFORCEMENT, RAFTBENCH_INSTRUCTIONS, RAFTBENCH_MAX_TOKENS, RETRY_DELAYS_MS, RUN_DEADLINE_MS } from "../src/plugins/raftbench.ts";
+import { FIXUP_SOURCES_CAP, fixupSourcesOf, fixupTurnText, MAX_CALLS, OUTPUT_ENFORCEMENT, RAFTBENCH_INSTRUCTIONS, RAFTBENCH_MAX_TOKENS, RETRY_DELAYS_MS, RUN_DEADLINE_MS } from "../src/plugins/raftbench.ts";
 import { BASE_SYSTEM } from "../src/runtime/pi-prompt.ts";
 import { modelToolName } from "../src/runtime/pi-tools.ts";
 
@@ -559,6 +559,119 @@ await check("a result the Server refuses (evidence not read) also gets its one f
   must(/patterns\.0\.evidence\.0|patterns\[0\]\.evidence\[0\]/.test(fix) && /not read in this run/.test(fix), fix);
   await answer(w, goodResult());
   must(w.raft.accepted.size === 1 && w.raft.submits().length === 2, "the fixed result was not accepted");
+});
+
+// ---- the fix-up turn's rules and references -----------------------------------------------------------------
+
+/**
+ * A model that does only what its fix-up turn tells it, as deepseek-flash does with no schema enforcement: a reference
+ * it is not sure of is copied from the fix-up's list only if the list carries an id it contains, dropped only if the
+ * turn says to drop what it cannot support, and kept as it was otherwise; a field the turn says to make a list is one.
+ */
+function followsOnlyWhatItIsTold(first: any, fix: string, material = ""): string {
+  const allowed = new Set<string>();
+  for (const line of fix.split("\n")) {
+    const m = /^(\S+): ([0-9a-f-]+(?:, [0-9a-f-]+)*)$/i.exec(line);
+    if (m) for (const id of m[2]!.split(", ")) allowed.add(`${m[1]} ${id}`);
+  }
+  const drop = /drop that reference|Drop a reference only when/.test(fix);
+  // Told the list is partial and the material is the allowed set, it keeps an id that is on a line of the material.
+  const materialCounts = /A partial list/.test(fix) && /from its line in the full material/.test(fix);
+  const fixRef = (r: any) => {
+    if (allowed.has(`${r.target} ${r.messageId}`)) return r;
+    const listed = [...allowed].map((k) => k.split(" ")).find(([t, id]) => t === r.target && String(r.messageId).includes(id!));
+    if (listed) return { target: r.target, messageId: listed[1] };
+    if (materialCounts && material.includes(`[target=${r.target} msg=${r.messageId} `)) return r;
+    return drop ? null : r;
+  };
+  const patterns = first.patterns.map((p: any, i: number) => {
+    const toldList = (f: string) => fix.includes(`patterns.${i}.${f}: Use a list here.`) || new RegExp(`"${f}" are always lists`).test(fix) || /"evidence" and "counterevidence" are always lists/.test(fix);
+    const asList = (v: any, f: string) => Array.isArray(v) ? v : toldList(f) ? (v && typeof v === "object" ? [v] : []) : v;
+    const ev = asList(p.evidence, "evidence"), cev = asList(p.counterevidence, "counterevidence");
+    return { ...p, evidence: Array.isArray(ev) ? ev.map(fixRef).filter(Boolean) : ev, counterevidence: Array.isArray(cev) ? cev.map(fixRef).filter(Boolean) : cev };
+  }).filter((p: any) => !(drop && Array.isArray(p.evidence) && p.evidence.length === 0));
+  return JSON.stringify({ ...first, patterns });
+}
+/** The first answer of the failures seen live: a msg id not copied as given, a made-up one, and counterevidence not a list. */
+const MALFORMED = {
+  runId: "copied-by-the-model", revision: 1, status: "complete",
+  patterns: [{
+    kind: "repeated_clarification", explanation: "同一请求被重复说明。",
+    evidence: [{ target: "#eng", messageId: `msg=${MSG[2]}` }, { target: "#eng", messageId: "ffffffff" }],
+    counterevidence: "无", evidenceLevel: "conversation_only", intent: "active", suggestion: "引用之前的请求。",
+  }],
+};
+/** Every message's text in TWO_PAGES: what follows its `] ` header. None of it belongs in a fix-up turn. */
+const BODIES = TWO_PAGES.flatMap((p) => p.sourceText.split("\n\n").map((l) => l.slice(l.indexOf("] ") + 2).replace(/…⟨.*$/, "")));
+
+await check("fix-up: the turn lists the run's allowed target/messageId pairs, the list rule and the drop rule, and no message text", async () => {
+  const w = await world();
+  await assign(w);
+  await answer(w, JSON.stringify(MALFORMED));
+  must(w.sent.length === 2 && w.raft.submits().length === 0, `calls ${w.sent.length}, submits ${w.raft.submits().length}`);
+  const fix = lastUserText(await w.rt.takeJob("t", SERVICE, w.sent[1]!));
+  must(fix.split("\n").includes(`#eng: ${MSG.join(", ")}`), `the allowed pairs are not listed:\n${fix}`);
+  must(fix.includes('"evidence" and "counterevidence" are always lists') && fix.includes("write [] for none"), `no list rule:\n${fix}`);
+  must(/drop that reference/.test(fix) && /never make up, shorten or change an id/.test(fix), `no drop rule:\n${fix}`);
+  for (const b of BODIES) must(!fix.includes(b), `the fix-up carries message text: ${b}`);
+  must(!fix.includes("@ana") && !fix.includes("@bot"), "the fix-up carries a sender");
+});
+
+await check("fix-up: a model that follows only what it is told turns the malformed answer into a valid one, accepted", async () => {
+  const w = await world();
+  await assign(w);
+  await answer(w, JSON.stringify(MALFORMED));
+  const fix = lastUserText(await w.rt.takeJob("t", SERVICE, w.sent[1]!));
+  await answer(w, followsOnlyWhatItIsTold(MALFORMED, fix));
+  const submits = w.raft.submits();
+  must(w.raft.accepted.size === 1 && submits.length === 1 && submits[0]!.body.failure === undefined, `not accepted: ${show(submits.map((s) => s.body.reason ?? s.body.patterns))}`);
+  const [p] = submits[0]!.body.patterns;
+  must(show(p.evidence) === show([{ target: "#eng", messageId: MSG[2] }]) && show(p.counterevidence) === show([]), show(p));
+});
+
+await check("fix-up: an id still not allowed is never replaced — it is submitted as written, refused, and the run fails", async () => {
+  const w = await world();
+  await assign(w);
+  await answer(w, JSON.stringify(MALFORMED));
+  // Shapes fixed, the made-up id kept: the plugin sends it as the model wrote it, and nothing picks a nearer one.
+  const still = { ...MALFORMED, patterns: [{ ...MALFORMED.patterns[0]!, evidence: [{ target: "#eng", messageId: "ffffffff" }], counterevidence: [] }] };
+  await answer(w, JSON.stringify(still));
+  for (let i = 0; i < 2; i++) await pass(w);
+  const submits = w.raft.submits();
+  must(w.sent.length === 2 && submits.length === 2, `calls ${w.sent.length}, submits ${submits.length}`);
+  must(show(submits[0]!.body.patterns[0].evidence) === show([{ target: "#eng", messageId: "ffffffff" }]), submits[0]!.raw);
+  must(submits[1]!.body.failure === true && /^validation failed: /.test(submits[1]!.body.reason) && /not read in this run/.test(submits[1]!.body.reason) && submits[1]!.body.patterns.length === 0, show(submits[1]!.body));
+  must([...w.raft.accepted.values()].every((a) => JSON.parse(a.body).failure === true), "a result with an id never read was accepted");
+});
+
+await check("fix-up: past the cap the list stops, says how many it left out and where they are, and stays bounded", async () => {
+  const many = Array.from({ length: FIXUP_SOURCES_CAP + 50 }, (_, i) => ({ target: `#c${i % 3}`, messageId: `${String(i).padStart(8, "0")}-0000-4000-8000-000000000000` }));
+  const text = fixupTurnText("The result was not saved. Fix every item below in one go:\n- x: y\nReply with the complete corrected result, not only the changes.", fixupSourcesOf([...many, many[0]!]));
+  const listed = text.split("\n").filter((l) => /^#c\d: /.test(l)).flatMap((l) => l.slice(5).split(", "));
+  must(listed.length === FIXUP_SOURCES_CAP && new Set(listed).size === FIXUP_SOURCES_CAP, `listed ${listed.length}`);
+  must(text.includes(`A partial list of the pairs you may cite (${FIXUP_SOURCES_CAP} of ${FIXUP_SOURCES_CAP + 50}; the other 50 are valid too`), text.slice(-300));
+  must(text.length < 13_000 && text.endsWith("Reply with the complete corrected result, not only the changes."), `length ${text.length}`);
+});
+
+await check("fix-up: past the cap the list is labelled partial, and valid evidence beyond it is kept and accepted", async () => {
+  const w = await world();
+  const n = FIXUP_SOURCES_CAP + 40;
+  const ids = Array.from({ length: n }, (_, i) => `c0ffee00-0000-4000-8000-${String(i).padStart(12, "0")}`);
+  w.raft.pages = [{ sourceText: ids.map((id, i) => `[target=#big msg=${id} time=2026-10-17 09:00:00Z type=human] @ana: line ${i}`).join("\n\n"),
+    sources: ids.map((messageId) => ({ target: "#big", messageId })), fetched: n, exhausted: true, stopReason: "window_end" }];
+  const beyond = ids[n - 5]!;
+  await assign(w);
+  // Valid evidence the cap leaves out; the answer is invalid only for its counterevidence, so it gets its fix-up.
+  const first = { ...MALFORMED, patterns: [{ ...MALFORMED.patterns[0]!, evidence: [{ target: "#big", messageId: beyond }] }] };
+  await answer(w, JSON.stringify(first));
+  must(w.sent.length === 2 && w.raft.submits().length === 0, `calls ${w.sent.length}, submits ${w.raft.submits().length}`);
+  const fix = lastUserText(await w.rt.takeJob("t", SERVICE, w.sent[1]!));
+  must(fix.includes(`A partial list of the pairs you may cite (${FIXUP_SOURCES_CAP} of ${n};`) && !fix.includes(beyond), `not labelled partial:\n${fix.slice(0, 1200)}`);
+  must(fix.includes("copied exactly from its line in the full material above") && fix.includes("not because its id is missing from a list"), `no copy-from-material rule:\n${fix.slice(0, 1200)}`);
+  await answer(w, followsOnlyWhatItIsTold(first, fix, w.raft.pages[0]!.sourceText));
+  const submits = w.raft.submits();
+  must(w.raft.accepted.size === 1 && submits.length === 1 && submits[0]!.body.failure === undefined, `not accepted: ${show(submits.map((s) => s.body.reason ?? s.body.patterns))}`);
+  must(show(submits[0]!.body.patterns[0]?.evidence) === show([{ target: "#big", messageId: beyond }]), show(submits[0]!.body.patterns));
 });
 
 await check("a read that fails submits the plugin's failure with the reason, and the model is never called", async () => {

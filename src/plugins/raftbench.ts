@@ -12,10 +12,11 @@
  * 2. **The material.** Every page of the run (`raft.raftbench.readAll`), which the SDK returns as one text: the
  *    coverage block, then the messages. The model's first turn is that text and one line asking for the result.
  * 3. **The result** (`afterTurn`). The model's last text is parsed and submitted (`raft.raftbench.submit`, which checks
- *    it locally first). An invalid result gets one fix-up turn with the SDK's list of what is wrong; a second invalid
- *    one ends the run through the plugin's own failure (`sendFailure`), "validation failed", with the problems. A call
- *    that spent its whole output cap without writing anything takes that same slot instead: the same request again,
- *    with reasoning off (`askAgainWithoutReasoning`), whose result is then treated as a fix-up's.
+ *    it locally first). An invalid result gets one fix-up turn with the SDK's list of what is wrong, the list and
+ *    citation rules, and the read's references it may cite (`fixupTurnText`); a second invalid one ends the run
+ *    through the plugin's own failure (`sendFailure`), "validation failed", with the problems. A call that spent its
+ *    whole output cap without writing anything takes that same slot instead: the same request again, with reasoning off
+ *    (`askAgainWithoutReasoning`), whose result is then treated as a fix-up's.
  *
  * The plugin's own results — a read that failed, a model that failed, a cancelled turn, the deadline, invalid output
  * after the fix-up — all go through `sendFailure`, and nothing else does: a result the model wrote, `incomplete`
@@ -103,9 +104,61 @@ export function firstTurnText(material: RaftbenchMaterial): string {
   return `${material.text}\n\nReply with the result for runId=${material.runId} revision=${material.revision} as one JSON object.`;
 }
 
-/** The fix-up turn: the SDK's list of what is wrong, as it is. It already says what to answer with. */
-export function fixupTurnText(invalid: string): string {
-  return invalid;
+/**
+ * How many message references the fix-up turn lists. Every one is also on its own line in the material, which stays
+ * in the conversation, so past the cap the turn labels the list partial and points at the material as the allowed set
+ * rather than repeat them: at about 40 characters a reference this bounds the list near 12k characters, whatever the
+ * window held.
+ */
+export const FIXUP_SOURCES_CAP = 300;
+
+/** The run's citable references for the fix-up turn, grouped by target: at most `FIXUP_SOURCES_CAP`, and how many there were. */
+export interface FixupSources { byTarget: Array<[target: string, messageIds: string[]]>; total: number }
+
+/** The read's `sources` (the SDK's, from every page), kept as ids and targets only, never a message's text. */
+export function fixupSourcesOf(sources: RaftbenchMaterial["sources"]): FixupSources {
+  const byTarget = new Map<string, string[]>();
+  const seen = new Set<string>();
+  let kept = 0;
+  for (const s of sources) {
+    const key = `${s.target}\n${s.messageId}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    if (kept >= FIXUP_SOURCES_CAP) continue;
+    kept++;
+    const ids = byTarget.get(s.target);
+    if (ids) ids.push(s.messageId); else byTarget.set(s.target, [s.messageId]);
+  }
+  return { byTarget: [...byTarget], total: seen.size };
+}
+
+/** The SDK's closing line of its list (`raft.raftbench.submit`'s `text`), kept last so the turn still ends with it. */
+const SDK_CLOSING = "Reply with the complete corrected result, not only the changes.";
+
+/**
+ * The fix-up turn: the SDK's list of what is wrong, as it is, then the two rules a model without schema enforcement
+ * breaks most (a reference not copied from the material, a counterevidence that is not a list) and the references it
+ * may cite. Nothing here repairs the result: an id still not allowed is refused again, and the run fails as before.
+ */
+export function fixupTurnText(invalid: string, sources: FixupSources | undefined): string {
+  const listed = sources ? sources.byTarget.reduce((n, [, ids]) => n + ids.length, 0) : 0;
+  const partial = !!sources && sources.total > listed;
+  const lines = [
+    "Rules for the corrected result:",
+    '- "evidence" and "counterevidence" are always lists of {"target", "messageId"} objects, also when there is nothing to put there: write [] for none, never a string, an object or null.',
+    // The list is the allowed set only when it is whole. Cut at the cap, or missing (a run kept before its read
+    // recorded the references), the allowed set is the material's lines, and an id the list left out is still valid.
+    sources && !partial
+      ? "- Cite only a target and messageId pair listed below, copied exactly as written. If you cannot support a claim with a listed pair, drop that reference, and drop the pattern if it is left with no evidence; never make up, shorten or change an id."
+      : "- Cite only a target and msg pair copied exactly from its line in the full material above; any message line there is valid, listed below or not. Drop a reference only when no message in the material supports the claim, not because its id is missing from a list, and drop the pattern if it is left with no evidence; never make up, shorten or change an id.",
+    ...!sources ? [] : listed === 0 ? ["No message of this run can be cited: the patterns list must be []."]
+      : partial ? [`A partial list of the pairs you may cite (${listed} of ${sources.total}; the other ${sources.total - listed} are valid too, on their own lines in the material as target= and msg=):`]
+      : ["The pairs you may cite (target: messageIds):"],
+    ...(sources?.byTarget ?? []).map(([target, ids]) => `${target}: ${ids.join(", ")}`),
+  ];
+  const trimmed = invalid.trimEnd();
+  const head = trimmed.endsWith(SDK_CLOSING) ? trimmed.slice(0, -SDK_CLOSING.length).trimEnd() : trimmed;
+  return `${head}\n\n${lines.join("\n")}\n\n${trimmed.endsWith(SDK_CLOSING) ? SDK_CLOSING : "Reply with the complete corrected result as one JSON object."}`;
 }
 
 /**
@@ -171,6 +224,8 @@ interface RunState {
   calls: number;
   /** What the last read covered, for the reason a timeout gives, and the gaps the model's result is given. */
   coverage?: { fetched: number; exhausted: boolean; gaps: RaftbenchReport["gaps"] };
+  /** The last read's citable references (ids and targets, no text), for the fix-up turn to list (`fixupSourcesOf`). */
+  sources?: FixupSources;
   /** When the deadline was found passing during a turn, which was then cancelled: that turn's end is the timeout. */
   timedOut?: number;
   /**
@@ -308,6 +363,7 @@ async function read(ctx: PluginContext, raft: Raft, run: RunState): Promise<Plug
   // A reread starts over: what the last read's result held goes with it.
   const reading: RunState = { ...run, phase: "reading", reads: run.reads + 1, readCalls: 0 };
   delete reading.body;
+  delete reading.sources;
   delete reading.from;
   delete reading.reason;
   delete reading.failure;
@@ -333,6 +389,7 @@ async function resumeRead(ctx: PluginContext, raft: Raft, reading: RunState): Pr
     coverage: {
       fetched: material.data.coverage.fetchedMessages, exhausted: material.data.coverage.exhausted, gaps: raftbenchGapsFromCoverage(material.data.coverage),
     },
+    sources: fixupSourcesOf(material.data.sources),
   };
   log(ctx, run, "read", { pages: material.data.pages, fetched: run.coverage!.fetched, stopReason: material.data.coverage.stopReason });
   if (Date.now() >= run.deadline) return timeout(ctx, raft, run);
@@ -407,11 +464,12 @@ async function send(ctx: PluginContext, raft: Raft, run: RunState): Promise<Plug
     const issues = r.data.issues;
     if (run.from !== "model") return end(ctx, raft, run, "refused: the plugin's own result was invalid", { issues: issues.length });
     if (run.readCalls < MAX_CALLS_PER_READ && run.calls < MAX_CALLS && Date.now() < run.deadline) {
-      log(ctx, run, "fixup", { issues: issues.length });
+      // Counts only: how many references the turn lists of how many the read had, never which.
+      log(ctx, run, "fixup", { issues: issues.length, listed: run.sources?.byTarget.reduce((n, [, ids]) => n + ids.length, 0) ?? null, sources: run.sources?.total ?? null });
       const fixing: RunState = { ...run, fixups: (run.fixups ?? 0) + 1 };
       delete fixing.from;
       delete fixing.body;
-      return ask(ctx, fixing, fixupTurnText(r.text), false);
+      return ask(ctx, fixing, fixupTurnText(r.text, run.sources), false);
     }
     return submitFailed(ctx, raft, run, validationFailed(issues), "validation_failed");
   }
@@ -462,6 +520,7 @@ function timeout(ctx: PluginContext, raft: Raft, run: RunState): Promise<PluginN
  */
 async function end(ctx: PluginContext, raft: Raft, run: RunState, outcome: string, extra: Record<string, unknown>): Promise<PluginNext | void> {
   const done: RunState = { ...run, phase: "done", outcome, forgetPending: true };
+  delete done.sources;
   delete done.body;
   delete done.reason;
   delete done.retryAt;
