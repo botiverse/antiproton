@@ -44,24 +44,19 @@ export interface SandboxBackend {
 }
 
 /**
- * What a provider can do, declared so the plugin can ask rather than assume. The plugin reads `pause` (which idle
- * schedule a box is on), `snapshot` (whether `keep` may wake a box) and `boxSecrets` (whether accounts are wired).
+ * What a provider can do, declared so the plugin can ask rather than assume. Every member has a reader in the plugin:
+ * `pause` (which idle schedule a box is on), `snapshot` (whether `keep` may wake a box), `billing` (what the tools say
+ * a box costs) and `boxSecrets` (whether accounts are wired). One is added with the code that reads it, never ahead
+ * of it (test/sandbox-provider-caps.ts). Whether commands can reach the network is not one: it is `isolateNetwork`,
+ * which the plugin applies to every command.
  */
 export interface ProviderCaps {
   /** What switching an idle box off keeps: its memory (resumes where it was) or only its disk. */
   pause: "memory" | "disk";
   /** Whether a filesystem can be kept while the box runs, only once it is stopped, or not at all. */
   snapshot: "live" | "stopped" | null;
-  /** Whether the provider runs a command detached and lets it be killed, or the adapter has to emulate that. */
-  backgroundExec: "native" | "emulated";
-  /** Whether a port in the box can be reached from outside. */
-  publicPorts: boolean;
-  /** Whether the provider can restrict where a box connects to. */
-  egressPolicy: boolean;
   /** What a box is billed for: every second it exists (run9), or compute only while running and storage otherwise. */
   billing: "exists" | "running";
-  /** Whether held time is the provider's own reading or our estimate from when the box existed. */
-  usageMeter: "provider" | "estimate";
   /**
    * Whether a credential can be registered for one box only, swapped in on its way out (`addSecret`). Without it
    * no account is wired into a container.
