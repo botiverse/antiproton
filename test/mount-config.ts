@@ -13,7 +13,6 @@ import { AgentRuntime, SEEDED_PLUGINS } from "../cf/src/runtime.ts";
 import { capabilityTags } from "../scripts/plugin-capabilities.ts";
 import { policyFor } from "../src/runtime/gateway.ts";
 import { githubPlugin } from "../src/plugins/github.ts";
-import { stampPlugin } from "../src/plugins/stamp.ts";
 import { sandboxPlugin, execArgv, execOutput, sessionOf, activityOf, providerOf, keepSessions, usageOf, asBoxState, segmentsOf, keptNote, savedNote, notAReasonToRelease } from "../src/plugins/sandbox.ts";
 import { httpPlugin } from "../src/plugins/http.ts";
 import { exaPlugin } from "../src/plugins/exa.ts";
@@ -226,9 +225,10 @@ await check("a credential field carries a label and says which part is secret", 
 const CREDENTIAL_SHAPED = /token|secret|key|password|credential|auth|bearer/i;
 // The bench's `retail` plugin (an extraPlugins entry, not registered here) is
 // deliberately absent: it declares no settings, credential or hooks, so no
-// check below has anything to read. Add it when it gains any of them.
+// check below has anything to read. Add it when it gains any of them. stamp is
+// absent because the runtime does not register it (#1051).
 const everyPlugin: Plugin[] = [
-  githubPlugin, stampPlugin, httpPlugin, exaPlugin, demoPlugin, run9,
+  githubPlugin, httpPlugin, exaPlugin, demoPlugin, run9,
   statePlugin(null as any, null, "local"),
   artifactsPlugin(null as any, "local"),
   raftPlugin,
