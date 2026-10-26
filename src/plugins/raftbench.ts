@@ -396,10 +396,11 @@ async function resumeRead(ctx: PluginContext, raft: Raft, reading: RunState): Pr
     },
     sources: fixupSourcesOf(material.data.sources),
   };
-  // The window the material came from (the last page's `from`/`to`, as the Server sent them; the SDK refuses a page
-  // without them), so a run can be matched to its material later. The context response carries no `sourceKind` and no
-  // page's starting cursor, and `readAll` pages inside the SDK and returns no cursor, so those three are logged as null
-  // and named in `missing`, never inferred from the counts.
+  // The run's window, `from`/`to` as the Server sent them (every page carries the same run window, not the range of
+  // that page's messages; the SDK refuses a page without them), so a run can be matched to its material later. What
+  // this line cannot say is where reading started and where each page ended: the context response carries no
+  // `sourceKind` and no starting cursor, and `readAll` pages inside the SDK and returns no cursor, so those three are
+  // logged as null and named in `missing`, never inferred from the counts.
   log(ctx, run, "read", {
     pages: material.data.pages, fetched: run.coverage!.fetched, stopReason: material.data.coverage.stopReason,
     coverageFrom: material.data.coverage.from, coverageTo: material.data.coverage.to,
