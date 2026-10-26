@@ -18,16 +18,23 @@
    },
    "credential": {
     "required": true,
-    "summary": "run9 access and secret keys, as JSON.",
+    "summary": "For run9: the access and secret keys (ak, sk). For InstaBox: the API key (apiKey). As JSON.",
     "shape": {
      "keys": [
       {
        "name": "ak",
-       "summary": "run9 access key, from the run9 console."
+       "summary": "run9 access key, from the run9 console. run9 mounts only.",
+       "required": false
       },
       {
        "name": "sk",
-       "summary": "run9 secret key, issued with the access key."
+       "summary": "run9 secret key, issued with the access key. run9 mounts only.",
+       "required": false
+      },
+      {
+       "name": "apiKey",
+       "summary": "InstaBox API key (ibk_...), from the InstaBox dashboard. InstaBox mounts only.",
+       "required": false
       }
      ]
     },
@@ -39,10 +46,35 @@
      "name": "provider",
      "type": "string",
      "choices": [
-      "run9"
+      "run9",
+      "instabox"
      ],
      "default": "run9",
-     "summary": "Which sandbox provider runs the container. Only run9 today."
+     "summary": "Which sandbox provider runs the container: run9 or instabox. On InstaBox the working directory defaults to /data/home/work, the size to 2c4g, and `image`, `project` and `verifyWith` do not apply."
+    },
+    {
+     "name": "template",
+     "type": "string",
+     "default": "universal",
+     "summary": "InstaBox only: the template a new machine starts from (GET /v1/templates lists them)."
+    },
+    {
+     "name": "keepPausedMinutes",
+     "type": "number",
+     "default": 30,
+     "summary": "InstaBox only: minutes an idle machine stays paused, memory and processes kept, before it is switched off (files kept, processes end)."
+    },
+    {
+     "name": "maxLifetimeHours",
+     "type": "number",
+     "default": 24,
+     "summary": "InstaBox only: hours after creation at which InstaBox deletes a machine whatever it is doing, a backstop against one nothing releases. At most 24, InstaBox's limit; it cannot be moved once the machine exists."
+    },
+    {
+     "name": "maxRunMinutes",
+     "type": "number",
+     "default": 480,
+     "summary": "InstaBox only: minutes a machine may run without a break before InstaBox pauses it."
     },
     {
      "name": "image",
@@ -387,16 +419,23 @@
    },
    "credential": {
     "required": true,
-    "summary": "run9 access and secret keys, as JSON.",
+    "summary": "For run9: the access and secret keys (ak, sk). For InstaBox: the API key (apiKey). As JSON.",
     "shape": {
      "keys": [
       {
        "name": "ak",
-       "summary": "run9 access key, from the run9 console."
+       "summary": "run9 access key, from the run9 console. run9 mounts only.",
+       "required": false
       },
       {
        "name": "sk",
-       "summary": "run9 secret key, issued with the access key."
+       "summary": "run9 secret key, issued with the access key. run9 mounts only.",
+       "required": false
+      },
+      {
+       "name": "apiKey",
+       "summary": "InstaBox API key (ibk_...), from the InstaBox dashboard. InstaBox mounts only.",
+       "required": false
       }
      ]
     },
@@ -408,10 +447,35 @@
      "name": "provider",
      "type": "string",
      "choices": [
-      "run9"
+      "run9",
+      "instabox"
      ],
      "default": "run9",
-     "summary": "Which sandbox provider runs the container. Only run9 today."
+     "summary": "Which sandbox provider runs the container: run9 or instabox. On InstaBox the working directory defaults to /data/home/work, the size to 2c4g, and `image`, `project` and `verifyWith` do not apply."
+    },
+    {
+     "name": "template",
+     "type": "string",
+     "default": "universal",
+     "summary": "InstaBox only: the template a new machine starts from (GET /v1/templates lists them)."
+    },
+    {
+     "name": "keepPausedMinutes",
+     "type": "number",
+     "default": 30,
+     "summary": "InstaBox only: minutes an idle machine stays paused, memory and processes kept, before it is switched off (files kept, processes end)."
+    },
+    {
+     "name": "maxLifetimeHours",
+     "type": "number",
+     "default": 24,
+     "summary": "InstaBox only: hours after creation at which InstaBox deletes a machine whatever it is doing, a backstop against one nothing releases. At most 24, InstaBox's limit; it cannot be moved once the machine exists."
+    },
+    {
+     "name": "maxRunMinutes",
+     "type": "number",
+     "default": 480,
+     "summary": "InstaBox only: minutes a machine may run without a break before InstaBox pauses it."
     },
     {
      "name": "image",

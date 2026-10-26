@@ -1,5 +1,5 @@
-import type { Json } from "../core/types.ts";
-import type { CredentialRefKind, HeldFiles, Plugin, PluginContext, MountActivity, MountUsage, Released, SandboxForm } from "./types.ts";
+import type { Json, MountRecord } from "../core/types.ts";
+import type { CredentialRefKind, HeldFiles, Plugin, PluginContext, MountActivity, MountUsage, Released, SandboxForm, ToolSchema } from "./types.ts";
 import { backgrounded, identityNote, LEASE_KEY, markIdentity, markReleased, releaseRetryMs } from "./types.ts";
 import type { R2Artifacts } from "../store/artifacts.ts";
 import { AGENT_REF, keyForRef, toAgentRef } from "../store/refs.ts";
@@ -7,6 +7,7 @@ import { spanText } from "../runtime/idle-lease.ts";
 import { ProviderError, TERMINAL_EXEC_STATES } from "./sandbox/provider.ts";
 import type { BoxState as ProviderBoxState, EgressSecret, ExecStatus, SandboxBackend, SandboxProvider } from "./sandbox/provider.ts";
 import { run9 } from "./sandbox/providers/run9.ts";
+import { instabox, INSTABOX_ENDPOINT, shapeOf } from "./sandbox/providers/instabox.ts";
 
 export { AWAKE_STATES, PUT_SETTLE_MS } from "./sandbox/providers/run9.ts";
 
@@ -30,8 +31,23 @@ export { AWAKE_STATES, PUT_SETTLE_MS } from "./sandbox/providers/run9.ts";
  * one call is still there for the next.
  */
 export interface SandboxConfig {
-  /** Which provider runs the container. Only "run9" is implemented. */
+  /** Which provider runs the container: "run9" (the default) or "instabox". */
   provider?: string;
+  /** InstaBox: the template a new machine starts from, in place of `image`. */
+  template?: string;
+  /**
+   * InstaBox: how long an idle machine stays paused, in minutes, before it is switched off. Paused keeps its
+   * memory and running processes; switched off keeps only its disks.
+   */
+  keepPausedMinutes?: number;
+  /**
+   * InstaBox: hours after creation at which InstaBox deletes the machine whatever it is doing
+   * (`deleteAfterSeconds`), so a machine nothing releases cannot outlive this. At most 24: InstaBox refuses more,
+   * and the time cannot be moved once the machine exists.
+   */
+  maxLifetimeHours?: number;
+  /** InstaBox: minutes a machine may run without a pause before InstaBox pauses it (`maxRunMinutes`). */
+  maxRunMinutes?: number;
   endpoint?: string;
   /** Any image with node on the PATH. */
   image?: string;
@@ -220,6 +236,17 @@ interface BoxState {
    * while it only keeps a disk. Cleared by the next command that runs in it.
    */
   parkedAt?: number;
+  /**
+   * "paused" when the idle lease paused the box with its memory kept (a provider whose `caps.pause` is "memory",
+   * InstaBox) rather than switching it off: a third state, with its own step to switching off. Absent: switched
+   * off, or running. Read only through `pausedOf`.
+   */
+  parkedAs?: string;
+  /**
+   * When the provider deletes this box on its own, whatever it is doing (InstaBox's `deleteAt`, set at creation
+   * and not movable). The stopped schedule never runs past it.
+   */
+  deleteAt?: number;
   /**
    * The directory the last `shell` command ended in, so the next one starts
    * there. Each run9 exec is a fresh process: a `cd` does not carry over, and
@@ -437,10 +464,15 @@ const leaseMinutes = (ms: number) => Math.max(1, Math.round(ms / 60_000));
  * and saved the archive, I could release the container". The note it had just been handed was the last thing it
  * read before deciding, so the copy's survival is said together with what it is not.
  */
-export function notAReasonToRelease(lease: BoxLease | null): string {
+export function notAReasonToRelease(lease: BoxLease | null, terms?: IdleTerms): string {
   // "Leave it running" is only something an agent can do under a lease: without one the box is handed back
   // when the turn ends whatever it decides, so that half would be a promise nothing keeps (from the #327 review).
   // Under the lease, leaving it is cheap because idle only switches it off, which is why the sentence says so.
+  if (lease && terms?.provider === "instabox") {
+    return "A copy outliving the container is not a reason to release it: if you or the person you are working for " +
+      "will come back to this machine, leave it running — idle, it is only paused, and the next call resumes it " +
+      "with its files and running processes.";
+  }
   return lease
     ? "A copy outliving the container is not a reason to release it: if you or the person you are working for " +
       "will come back to this machine, leave it running — idle, it is only switched off, and the next call " +
@@ -448,9 +480,21 @@ export function notAReasonToRelease(lease: BoxLease | null): string {
     : "A copy outliving the container is not a reason to release it early: it is handed back when the turn " +
       "ends anyway, and until then it is still the machine you are working on.";
 }
-export const keptNote = (lease: BoxLease | null) =>
-  "independent of this container; start a fresh machine from it later with `start_from`. " + notAReasonToRelease(lease);
-export const savedNote = (lease: BoxLease | null) => "kept outside the box, for later. " + notAReasonToRelease(lease);
+export const keptNote = (lease: BoxLease | null, terms?: IdleTerms) =>
+  "independent of this container; start a fresh machine from it later with `start_from`. " + notAReasonToRelease(lease, terms);
+export const savedNote = (lease: BoxLease | null, terms?: IdleTerms) => "kept outside the box, for later. " + notAReasonToRelease(lease, terms);
+
+/**
+ * What a mount's provider makes true of an idle box, for the sentences the model reads about it: run9 switches an
+ * idle box off; InstaBox pauses it with its memory kept, switches it off later, and deletes every box a fixed time
+ * after creation whatever it is doing (`maxLifetimeHours`).
+ */
+export interface IdleTerms {
+  provider: "run9" | "instabox";
+  keepStoppedDays: number;
+  keepPausedMinutes: number;
+  maxLifetimeHours: number;
+}
 
 /**
  * What happens to an idle box under a lease, said once for the reminder, `run` and `shell`.
@@ -469,6 +513,27 @@ export function leaseTerms(lease: BoxLease, keepStoppedDays: number = DEFAULTS.k
 }
 
 const DAY = 86_400_000;
+
+/**
+ * `leaseTerms` for an InstaBox box. Paused keeps memory and processes (measured 2026-10-26: resume in 1.4-2 s,
+ * the same PID still running, /tmp intact); switched off keeps both disks but not /tmp or processes (start in
+ * about 5 s). The creation-time deletion is said whenever it comes before the stopped schedule would, since it
+ * then decides how long the machine lives.
+ */
+export function instaboxLeaseTerms(lease: BoxLease, t: IdleTerms): string {
+  const lifetimeMs = t.maxLifetimeHours * 3_600_000;
+  const deletion = lifetimeMs < t.keepStoppedDays * DAY
+    ? `it is deleted, with everything on its disk, ${spanText(lifetimeMs)} after it was created whatever it is doing, `
+      + "and nothing postpones that: `keep` the environment or `save` the files you will want after then; "
+    : `it is deleted, with everything on its disk, after ${spanText(t.keepStoppedDays * DAY)} switched off and unused, `
+      + `and you are told ${spanText(stoppedWarnMs(t.keepStoppedDays))} before that, and in any case ${spanText(lifetimeMs)} `
+      + "after it was created, which nothing postpones; ";
+  return `after ${leaseMinutes(lease.maxMs)} idle minutes it is paused, keeping its memory, running processes and `
+    + `files, and the next call resumes it where it was in a few seconds; after ${t.keepPausedMinutes} minutes paused `
+    + "it is switched off, which keeps its files but ends running processes and empties /tmp, and the next call "
+    + `starts it again; ${deletion}\`quiet\` postpones the idle steps by as long as you choose, within the mount's `
+    + "limit; files under /tmp do not survive being switched off, so keep your work in the working directory";
+}
 
 /**
  * How long before a switched-off container is deleted its agent is told: a
@@ -533,10 +598,41 @@ const TERMINAL = TERMINAL_EXEC_STATES;
 
 /** This mount's settings, defaults filled in. */
 function cfgOf(ctx: PluginContext) {
+  return cfgFrom(ctx.publicConfig as SandboxConfig);
+}
+
+/**
+ * Settings, defaults filled in: the plugin's, then the provider's own where they differ, then the mount's. Never
+ * throws, for a provider it does not know either: the readers of the record (activity, usage) must still answer
+ * for such a mount, and every path that talks to a provider refuses it there (`backendFor`).
+ */
+function cfgFrom(config: SandboxConfig | null | undefined) {
   // No written return type: the spread of a partial over the defaults is the
   // truth here, and an annotation beside it would be a second statement of the
   // same thing, free to disagree with it.
-  return { ...DEFAULTS, ...(ctx.publicConfig as SandboxConfig) };
+  return { ...DEFAULTS, ...(config?.provider === "instabox" ? INSTABOX_DEFAULTS : {}), ...(config ?? {}) };
+}
+
+/** The idle terms a mount's provider makes true (`IdleTerms`). */
+function idleTermsOf(cfg: ReturnType<typeof cfgOf>): IdleTerms {
+  const hours = Number(cfg.maxLifetimeHours);
+  const paused = Number(cfg.keepPausedMinutes);
+  return {
+    provider: cfg.provider === "instabox" ? "instabox" : "run9",
+    keepStoppedDays: keepDaysOf(cfg),
+    keepPausedMinutes: Number.isFinite(paused) && paused > 0 ? paused : DEFAULTS.keepPausedMinutes,
+    maxLifetimeHours: Number.isFinite(hours) && hours > 0 ? Math.min(24, hours) : DEFAULTS.maxLifetimeHours,
+  };
+}
+
+/** How long an idle InstaBox box stays paused before it is switched off; null on a provider without the step. */
+function pausedMsOf(cfg: ReturnType<typeof cfgOf>): number | null {
+  return cfg.provider === "instabox" ? idleTermsOf(cfg).keepPausedMinutes * 60_000 : null;
+}
+
+/** The provider's name as a reader is shown it, for one this plugin does not know too. */
+function providerName(cfg: { provider?: string }): string {
+  return cfg.provider === "instabox" ? instabox.name : run9.name;
 }
 
 /**
@@ -545,8 +641,9 @@ function cfgOf(ctx: PluginContext) {
  * same way wherever it comes from.
  */
 function openProvider(cfg: ReturnType<typeof cfgOf>, ctx: PluginContext): SandboxProvider {
-  if (!ctx.credential) throw markIdentity(new Error(`the run9 API needs an account, and this call had none — ${identityNote(ctx)}`), ctx);
-  return backendFor(cfg).open(cfg, ctx.credential);
+  const backend = backendFor(cfg);
+  if (!ctx.credential) throw markIdentity(new Error(`the ${backend.name} API needs an account, and this call had none — ${identityNote(ctx)}`), ctx);
+  return backend.open(cfg, ctx.credential);
 }
 
 /**
@@ -811,22 +908,35 @@ const SESSIONS_KEPT = 20;
  * happen to implement, because "it ran on run9" would then be the answer to
  * "run it on something else".
  */
-export function providerOf(cfg: { provider?: string }): "run9" {
+export function providerOf(cfg: { provider?: string }): SandboxBackend["id"] {
   const asked = cfg.provider ?? "run9";
-  if (asked !== "run9") {
-    throw new Error(`this sandbox mount asks for the "${asked}" provider, and run9 is the only one implemented`);
+  if (!Object.hasOwn(BACKENDS, asked)) {
+    throw new Error(`this sandbox mount asks for the "${asked}" provider, and only ${Object.keys(BACKENDS).join(" and ")} are implemented`);
   }
-  return "run9";
+  return asked as SandboxBackend["id"];
 }
 
+/** Every provider implemented, by the name a mount's `provider` setting uses. */
+const BACKENDS: Record<SandboxBackend["id"], SandboxBackend> = { run9, instabox };
+/** The names the `provider` setting may take. */
+export const PROVIDERS = Object.keys(BACKENDS) as Array<SandboxBackend["id"]>;
+
 /**
- * The adapter that runs this mount's containers. It does not ask `providerOf`: only the release paths
- * (`deleteBox`, `parkBox`) do, so a mount whose `provider` names one we do not have is refused there and is
- * run on run9 by every other path.
+ * The adapter that runs this mount's containers, by its `provider` setting, on every path: a mount naming one we
+ * do not have is refused by each (`providerOf`), never run on another.
  */
-function backendFor(_cfg: { provider?: string }): SandboxBackend {
-  return run9;
+function backendFor(cfg: { provider?: string }): SandboxBackend {
+  return BACKENDS[providerOf(cfg)];
 }
+
+/** Where an InstaBox mount's defaults differ from the plugin's. */
+const INSTABOX_DEFAULTS = {
+  endpoint: INSTABOX_ENDPOINT,
+  // Commands run as the box's user, whose HOME is /data/home: a directory at the root needs sudo to make.
+  workdir: "/data/home/work",
+  // The smallest size InstaBox sells (Pro and up): 2 vCPUs, 4 GiB.
+  shape: "2c4g",
+};
 
 const DEFAULTS = {
   provider: "run9",
@@ -847,6 +957,10 @@ const DEFAULTS = {
   maxQuietMinutes: 60,
   keepStoppedDays: 7,
   maxMachines: 3,
+  template: "universal",
+  keepPausedMinutes: 30,
+  maxLifetimeHours: 24,
+  maxRunMinutes: 480,
 };
 
 /**
@@ -862,8 +976,7 @@ const DEFAULTS = {
  * key could be shown the box at all.
  */
 async function deleteBox(ctx: PluginContext, boxId: string, believeGone: boolean): Promise<{ error?: string; definitive: boolean }> {
-  const cfg = { ...DEFAULTS, ...(ctx.publicConfig as SandboxConfig) };
-  providerOf(cfg);
+  const cfg = cfgOf(ctx);
   const provider = backendFor(cfg).open(cfg, ctx.credential!);
   try {
     await provider.delete(boxId);
@@ -911,7 +1024,7 @@ async function stopBox(
       lease: first ? { id: state.boxId, startedAt: stoppedAt ?? session.startedAt, endedAt, status: "error", error } : null,
     };
   }
-  const forgotten = error ? `forgotten on an operator's request; run9 refused the delete (${error}), so it may still be alive` : undefined;
+  const forgotten = error ? `forgotten on an operator's request; ${providerName(cfgOf(ctx))} refused the delete (${error}), so it may still be alive` : undefined;
   // The record goes once the box has, but the session survives it. A container is the one thing here
   // billed for merely existing, so how long it lived outlives the box.
   //
@@ -980,11 +1093,15 @@ async function stopBox(
 async function parkBox(ctx: PluginContext, machine: string, state: BoxState): Promise<Released | false> {
   if (!ctx.credential) return false;
   const cfg = cfgOf(ctx);
-  providerOf(cfg);
-  const provider = backendFor(cfg).open(cfg, ctx.credential);
+  const backend = backendFor(cfg);
+  const provider = backend.open(cfg, ctx.credential);
+  // A provider that keeps memory across a pause (InstaBox) pauses an idle box; it is switched off later, on its
+  // own step (`switchOffPaused`). Everything else is switched off now.
+  const pausing = backend.caps.pause === "memory" && typeof provider.pause === "function";
   let error: string | undefined;
   try {
-    await provider.stop(state.boxId);
+    if (pausing) await provider.pause!(state.boxId);
+    else await provider.stop(state.boxId);
   } catch (e) {
     error = e instanceof ProviderError ? e.message : String((e as Error)?.message ?? e).slice(0, 160);
   }
@@ -994,7 +1111,7 @@ async function parkBox(ctx: PluginContext, machine: string, state: BoxState): Pr
     id: state.boxId, startedAt: session.startedAt, endedAt,
     status: error ? "error" : "freed", ...(error ? { error } : {}),
   };
-  if (error) throw markReleased(new Error(`run9 box ${state.boxId} not switched off: ${error}`), fact);
+  if (error) throw markReleased(new Error(`${backend.name} box ${state.boxId} not ${pausing ? "paused" : "switched off"}: ${error}`), fact);
   // Read again before writing, for the reason `stopBox` does: a command may
   // have recorded another box meanwhile, and that one is running.
   const now = await readView(ctx, machine);
@@ -1002,7 +1119,41 @@ async function parkBox(ctx: PluginContext, machine: string, state: BoxState): Pr
     // A postponement is spent by the time this runs (the pass waits for the later of the two), and one left
     // in the record would hold off the deletion schedule by its old instant.
     const { quietUntil: _q, ...rest } = now;
-    await writeView(ctx, machine, { ...rest, parkedAt: endedAt, sessions: keepSessions(now.sessions, session) });
+    await writeView(ctx, machine, { ...rest, parkedAt: endedAt, ...(pausing ? { parkedAs: "paused" } : {}), sessions: keepSessions(now.sessions, session) });
+  }
+  return fact;
+}
+
+/** Whether the idle lease paused this box with its memory kept, rather than switching it off (`parkedAs`). */
+function pausedOf(state: { parkedAt?: unknown; parkedAs?: unknown } | null | undefined): boolean {
+  return parkedAt(state) !== null && state?.parkedAs === "paused";
+}
+
+/**
+ * The idle lease's step for a paused box: switch it off, keeping its disks. Its compute session ended when it
+ * was paused; the span reported here is the time it sat paused, and the deletion that may follow reports the
+ * time it then sat switched off, so the two cover its life after compute without overlapping. From here it is on
+ * the stopped schedule, counted from now.
+ */
+async function switchOffPaused(ctx: PluginContext, machine: string, state: BoxState): Promise<Released | false> {
+  if (!ctx.credential) return false;
+  const cfg = cfgOf(ctx);
+  const backend = backendFor(cfg);
+  const provider = backend.open(cfg, ctx.credential);
+  const startedAt = parkedAt(state)!;
+  let error: string | undefined;
+  try {
+    await provider.stop(state.boxId);
+  } catch (e) {
+    error = e instanceof ProviderError ? e.message : String((e as Error)?.message ?? e).slice(0, 160);
+  }
+  const endedAt = Date.now();
+  const fact: Released = { id: state.boxId, startedAt, endedAt, status: error ? "error" : "freed", ...(error ? { error } : {}) };
+  if (error) throw markReleased(new Error(`${backend.name} box ${state.boxId} not switched off: ${error}`), fact);
+  const now = await readView(ctx, machine);
+  if (now.boxId === state.boxId && pausedOf(now)) {
+    const { quietUntil: _q, parkedAs: _a, ...rest } = now;
+    await writeView(ctx, machine, { ...rest, parkedAt: endedAt });
   }
   return fact;
 }
@@ -1047,6 +1198,8 @@ export function activityOf(
   keepStoppedDays: number = DEFAULTS.keepStoppedDays,
   /** How the agent names this machine, when the mount has several or it is not the default one. */
   label: { name?: string; args?: Record<string, Json> } = {},
+  /** How long a paused box stays paused before it is switched off (`pausedMsOf`); null where no box is paused. */
+  pausedMs: number | null = null,
 ): MountActivity {
   const billing = "billed for every second it exists, not per call";
   if (!state?.boxId) return { live: null, billing, ...(unreadable ? { unreadable } : {}) };
@@ -1054,21 +1207,40 @@ export function activityOf(
   // rule the release record follows, so the two agree about its age.
   const used = state.lastUsedAt || state.createdAt;
   const stopped = parkedAt(state);
+  if (stopped !== null && pausedOf(state)) {
+    // Paused with its memory kept: the next step switches it off and keeps its disks, losing only running
+    // processes and /tmp, so it is taken without a warning, as switching a running box off is.
+    return {
+      live: {
+        id: state.boxId, startedAt: state.createdAt, lastUsedAt: Math.max(stopped, used), ...createdUnder(state),
+        lease: { maxMs: pausedMs ?? DEFAULTS.keepPausedMinutes * 60_000, warnMs: 0 },
+        ...label,
+      },
+      quietUntil: state.quietUntil ?? null,
+      ...(unreadable ? { unreadable } : {}),
+      billing: "paused: no compute is billed; its memory and disk are kept",
+    };
+  }
   if (stopped !== null) {
     // Switched off: the next step deletes the disk, which loses files, so this
     // one waits days and is announced. Idle from when it was switched off, or
     // from a later touch (`keep` stamps one without starting it).
     const days = keepDaysOf({ keepStoppedDays });
-    const maxMs = days * DAY;
+    const idleFrom = Math.max(stopped, used);
+    // A provider that deletes the box on its own at a set time (`deleteAt`) does it then whatever this says, so
+    // the schedule ends there, and the warning comes before it.
+    const until = typeof state.deleteAt === "number" && Number.isFinite(state.deleteAt) ? state.deleteAt - idleFrom : Infinity;
+    const maxMs = until === Infinity ? days * DAY : Math.max(60_000, Math.min(days * DAY, until));
+    const warnMs = Math.min(stoppedWarnMs(days), maxMs / 2);
     return {
       live: {
         id: state.boxId,
         startedAt: state.createdAt,
-        lastUsedAt: Math.max(stopped, used),
+        lastUsedAt: idleFrom,
         ...createdUnder(state),
         lease: {
           maxMs,
-          warnMs: stoppedWarnMs(days),
+          warnMs,
           consequence: "the stopped machine and everything on its disk will be deleted",
           advice: "Before then, `save` the files you need or `keep` the environment, or run anything in it to "
             + "switch it back on.",
@@ -1115,12 +1287,12 @@ function labelOf(machine: string, several: boolean): { name?: string; args?: Rec
  * activity when none has. What `holds.activities` answers.
  */
 export function activitiesOf(
-  mount: MountState | null, unreadable = 0, keepStoppedDays: number = DEFAULTS.keepStoppedDays,
+  mount: MountState | null, unreadable = 0, keepStoppedDays: number = DEFAULTS.keepStoppedDays, pausedMs: number | null = null,
 ): MountActivity[] {
   const names = boxedMachines(mount);
   const aside = Object.values(mount?.stranded ?? {}).map(strandedActivity);
   if (!names.length) return aside.length ? aside : [activityOf(null, unreadable, keepStoppedDays)];
-  return [...names.map((n) => activityOf(viewOf(mount, n), unreadable, keepStoppedDays, labelOf(n, names.length > 1))), ...aside];
+  return [...names.map((n) => activityOf(viewOf(mount, n), unreadable, keepStoppedDays, labelOf(n, names.length > 1), pausedMs)), ...aside];
 }
 
 /**
@@ -1150,7 +1322,7 @@ function strandedActivity(b: StrandedBox): MountActivity {
  * a single answer must not hide.
  */
 export function summaryActivity(
-  mount: MountState | null, unreadable = 0, keepStoppedDays: number = DEFAULTS.keepStoppedDays,
+  mount: MountState | null, unreadable = 0, keepStoppedDays: number = DEFAULTS.keepStoppedDays, pausedMs: number | null = null,
 ): MountActivity {
   const names = boxedMachines(mount);
   const used = (n: string) => { const b = mount!.machines[n]!; return b.lastUsedAt || b.createdAt; };
@@ -1158,7 +1330,7 @@ export function summaryActivity(
   const pick = [...names].sort((a, b) => off(a) - off(b) || used(b) - used(a))[0];
   const one = pick === undefined
     ? activityOf(null, unreadable, keepStoppedDays)
-    : activityOf(viewOf(mount, pick), unreadable, keepStoppedDays, labelOf(pick, names.length > 1));
+    : activityOf(viewOf(mount, pick), unreadable, keepStoppedDays, labelOf(pick, names.length > 1), pausedMs);
   // Set-aside boxes beside it: still held and billed, so the console lists them and usage counts them.
   const aside = Object.values(mount?.stranded ?? {}).map((b) => ({ id: b.boxId, startedAt: b.createdAt, since: b.strandedAt, ...createdUnder(b) }));
   return aside.length ? { ...one, aside } : one;
@@ -1247,7 +1419,7 @@ export function execOutput(out: string, maxOutputBytes: number): {
 }
 
 export function execArgv(
-  cfg: { shell: string; shellPrefix?: string; network?: "open" | "none" },
+  cfg: { shell: string; shellPrefix?: string; network?: "open" | "none"; isolate?: readonly string[] },
   command: string,
   env: Record<string, string> = {},
 ): string[] {
@@ -1255,7 +1427,8 @@ export function execArgv(
   const line = exports + (cfg.shellPrefix ? `${cfg.shellPrefix}${command}` : command);
   const argv = [cfg.shell, "-lc", line];
   const open = cfg.network === undefined || cfg.network === "open";
-  return open ? argv : ["unshare", "-n", "--", ...argv];
+  // The prefix is the provider's (`SandboxBackend.isolateNetwork`); run9's when none is given.
+  return open ? argv : [...(cfg.isolate ?? ["unshare", "-n", "--"]), ...argv];
 }
 
 /**
@@ -1282,6 +1455,16 @@ export const MEASURED_IMAGES: Record<string, {
     command: "for t in node npm git curl make gcc g++ python3 bash ssh apt-get pip3 jq rg gh; do " +
       "command -v $t >/dev/null && echo \"present $t\" || echo \"missing $t\"; done",
   },
+  // InstaBox's `universal` template (version 2026-10-25.23, the one marked latest), measured on a fresh 2c4g
+  // machine; commands run as the user `user`, with passwordless sudo.
+  "instabox:universal": {
+    measured: "2026-10-26", os: "Debian 13",
+    present: ["Node", "npm", "git", "curl", "make", "gcc/g++", "Python 3", "pip", "jq", "gh", "Go", "Docker", "bash", "ssh", "apt-get", "sudo"],
+    missing: ["rg"],
+    install: "sudo apt-get update && sudo apt-get install -y <pkg>",
+    command: "for t in node npm git curl make gcc g++ python3 pip3 bash ssh apt-get jq rg gh go docker sudo; do " +
+      "command -v $t >/dev/null && echo \"present $t\" || echo \"missing $t\"; done",
+  },
 };
 
 const listed = (xs: string[]) => xs.length > 1 ? `${xs.slice(0, -1).join(", ")} and ${xs.at(-1)}` : (xs[0] ?? "");
@@ -1292,6 +1475,14 @@ export function defaultImageSentence(image: string): string {
   const m = MEASURED_IMAGES[image];
   if (!m) return `The default image is ${tag}; what it contains has not been measured, so check for a tool before relying on it.`;
   return `The default image is ${tag} (${m.os}): ${listed(m.present)} are present; ${listed(m.missing)} are NOT, ` +
+    `and \`${m.install}\` installs more.`;
+}
+
+/** The shell description's sentence about an InstaBox template, from its measurement (`instabox:<template>`). */
+export function templateSentence(template: string): string {
+  const m = MEASURED_IMAGES[`instabox:${template}`];
+  if (!m) return `The default template is ${template}; what it contains has not been measured, so check for a tool before relying on it.`;
+  return `The default template is ${template} (${m.os}): ${listed(m.present)} are present; ${listed(m.missing)} are NOT, ` +
     `and \`${m.install}\` installs more.`;
 }
 
@@ -1434,6 +1625,15 @@ async function accountsWanted(ctx: PluginContext, cfg: ReturnType<typeof cfgOf>)
   const open = cfg.network === undefined || cfg.network === "open";
   const off = cfg.accounts === "none" || cfg.github === "";
   const found = open && !off ? (await ctx.sandboxForms()).filter((f) => f.credential) : [];
+  // A provider that cannot hold a credential for one box only (InstaBox's are org-wide secrets, which every
+  // machine of the org could be given) wires nothing in, and says so for each mount that would have been.
+  const backend = backendFor(cfg);
+  if (!backend.caps.boxSecrets) {
+    return {
+      wire: [] as Array<Candidate & { credential: string; digest: string }>,
+      leftOut: found.map((f) => ({ alias: f.alias, why: `${backend.name} cannot hold a credential for one container only` })),
+    };
+  }
   const claims = new Map<string, string[]>();
   for (const f of found) for (const n of claimedNames(f.form)) claims.set(n, [...(claims.get(n) ?? []), f.alias]);
   const wire: Array<Candidate & { credential: string; digest: string }> = [];
@@ -1521,11 +1721,12 @@ async function releaseMachine(
   if (lease && reason === "idle") {
     const state = await readView(ctx, machine);
     if (state.boxId && parkedAt(state) === null) return parkBox(ctx, machine, state);
+    if (state.boxId && pausedOf(state)) return switchOffPaused(ctx, machine, state);
   }
   const r = await stopBox(ctx, machine, { forget });
   if (r === null) return false;
   if (!r.freed) {
-    const e = new Error(`run9 box ${r.boxId} not released: ${r.error ?? "unknown"}`);
+    const e = new Error(`${providerName(cfgOf(ctx))} box ${r.boxId} not released: ${r.error ?? "unknown"}`);
     throw r.lease ? markReleased(e, r.lease) : e;
   }
   return r.lease ?? false;
@@ -1551,7 +1752,7 @@ async function releaseStranded(ctx: PluginContext, id: string, forget: boolean):
   } else if (!forget && (b.nextTryAt ?? 0) > now) {
     // Retried on the shared schedule (`releaseRetryMs`) whichever path asks — the idle pass, or a release after
     // every settled turn where the deployment has no idle lease — not on every ask. Its error lease is reported.
-    throw new Error(`run9 box ${id} (stranded) not released: not retried before ${new Date(b.nextTryAt!).toISOString()}; last: ${b.lastError ?? "unknown"}`);
+    throw new Error(`${providerName(cfgOf(ctx))} box ${id} (stranded) not released: not retried before ${new Date(b.nextTryAt!).toISOString()}; last: ${b.lastError ?? "unknown"}`);
   } else {
     ({ error, definitive } = await deleteBox(ctx, id, false));
   }
@@ -1566,7 +1767,7 @@ async function releaseStranded(ctx: PluginContext, id: string, forget: boolean):
       rest[id] = { ...cur, deleteFailedAt: cur.deleteFailedAt ?? endedAt, tries, nextTryAt: endedAt + releaseRetryMs(tries), lastError: error.slice(0, 200) };
       await writeMount(ctx, { ...after, stranded: rest });
     }
-    const e = new Error(`run9 box ${id} (stranded) not released: ${error}`);
+    const e = new Error(`${providerName(cfgOf(ctx))} box ${id} (stranded) not released: ${error}`);
     throw first ? markReleased(e, { id, startedAt: b.createdAt, endedAt, status: "error", error } as Released) : e;
   }
   delete rest[id];
@@ -1575,7 +1776,7 @@ async function releaseStranded(ctx: PluginContext, id: string, forget: boolean):
   // its compute session when it was switched off.
   const sessions = parkedAt(b) === null ? keepSessions(after.sessions, sessionOf(b, endedAt, `stranded`)) : after.sessions;
   await writeMount(ctx, { ...after, stranded: rest, ...(sessions ? { sessions } : {}) });
-  const forgotten = error ? `forgotten on an operator's request; ${error.startsWith("the mount has no") ? error : `run9 refused the delete (${error})`}, so it may still be alive` : undefined;
+  const forgotten = error ? `forgotten on an operator's request; ${error.startsWith("the mount has no") ? error : `${providerName(cfgOf(ctx))} refused the delete (${error})`}, so it may still be alive` : undefined;
   return forgotten
     ? { id, startedAt: b.createdAt, endedAt, status: "error", error: forgotten }
     : { id, startedAt: b.createdAt, endedAt, status: "freed" };
@@ -1591,7 +1792,7 @@ async function releaseStranded(ctx: PluginContext, id: string, forget: boolean):
  * a lease there is no schedule: a box is handed back when the turn ends.
  */
 export function machinesList(
-  mount: MountState | null, cfg: { keepStoppedDays?: unknown; maxMachines?: unknown }, lease: BoxLease | null,
+  mount: MountState | null, cfg: { keepStoppedDays?: unknown; maxMachines?: unknown; provider?: unknown; keepPausedMinutes?: unknown }, lease: BoxLease | null,
 ): Json {
   const iso = (t: number | null | undefined) => typeof t === "number" && t > 0 ? new Date(t).toISOString() : null;
   const names = [...new Set([MAIN_MACHINE, ...Object.keys(mount?.machines ?? {})])]
@@ -1603,24 +1804,32 @@ export function machinesList(
       const from = box?.startFrom ? mount?.envs?.find((e) => e.snapId === box.startFrom)?.name ?? null : null;
       return { machine: name, state: "none", ...(from ? { startsFrom: from } : {}) };
     }
-    const live = activityOf(viewOf(mount, name), 0, days).live!;
+    const pausedMs = pausedMsOf(cfgFrom(cfg as SandboxConfig));
+    const live = activityOf(viewOf(mount, name), 0, days, {}, pausedMs).live!;
     const stopped = parkedAt(box) !== null;
+    const paused = pausedOf(box);
     const at = lease
       ? new Date(Math.max(
           live.lastUsedAt + (stopped ? live.lease!.maxMs! : lease.maxMs),
           box.quietUntil ?? 0,
         )).toISOString()
       : null;
+    // What the idle schedule does next: a running box on a provider that pauses (InstaBox) is paused, a paused
+    // one switched off, a switched-off one deleted. The keys of a run9 box are what they always were.
+    const next = !at ? {} : paused ? { switchedOffAfter: at } : stopped ? { deletedAfter: at }
+      : pausedMs !== null ? { pausedAfter: at } : { switchedOffAfter: at };
     return {
       machine: name,
-      state: stopped ? "switched off" : "running",
+      state: paused ? "paused" : stopped ? "switched off" : "running",
       box: box.boxId,
       image: box.image ?? null,
       created: iso(box.createdAt),
       lastUsed: iso(box.lastUsedAt || box.createdAt),
-      ...(stopped ? { switchedOff: iso(box.parkedAt) } : {}),
+      ...(paused ? { paused: iso(box.parkedAt) } : stopped ? { switchedOff: iso(box.parkedAt) } : {}),
       ...(box.cwd ? { cwd: box.cwd } : {}),
-      ...(at ? (stopped ? { deletedAfter: at } : { switchedOffAfter: at }) : {}),
+      ...next,
+      // The provider's own deletion, which nothing here postpones.
+      ...(typeof box.deleteAt === "number" ? { deletedBy: iso(box.deleteAt) } : {}),
     };
   });
   const exist = rows.filter((r) => r.state !== "none").length;
@@ -1651,7 +1860,8 @@ async function awakeBox(ctx: PluginContext, deadline: number): Promise<Box | nul
   const box = (await readMount(ctx))?.machines[MAIN_MACHINE];
   if (!box?.boxId || parkedAt(box) !== null || !ctx.credential) return null;
   const cfg = cfgOf(ctx);
-  const b: Box = { boxId: box.boxId, cfg, provider: backendFor(cfg).open(cfg, ctx.credential), deadline };
+  // Never woken from here: a look at a box that is not running answers "not running".
+  const b: Box = { boxId: box.boxId, cfg, provider: backendFor(cfg).open(cfg, ctx.credential, { wake: false }), deadline };
   const state: ProviderBoxState = await b.provider.status(box.boxId, { deadline });
   return state === "running" ? b : null;
 }
@@ -1829,10 +2039,13 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
   // `run` and `shell` state the same lifetime: with a lease, the box stays until
   // the agent releases it, is switched off when idle and deleted only after days
   // switched off; without one, a settled turn hands it back.
+  // The tools, with the sentences about an idle box's life taken from its provider: `t` null is run9's text.
+  const toolsFor = (t: IdleTerms | null): ToolSchema[] => {
+  const termsOf = (l: BoxLease) => t?.provider === "instabox" ? instaboxLeaseTerms(l, t) : leaseTerms(l);
   const runLifetime = lease
     ? "The container is NOT the per-execution sandbox: every call uses the same one, in this turn and later " +
       "ones, so installs and files survive from one call to the next — do not reinstall. It stays until you " +
-      `release it; ${leaseTerms(lease)}. Work in as few calls as you can, save what matters with \`save\`, and ` +
+      `release it; ${termsOf(lease)}. Work in as few calls as you can, save what matters with \`save\`, and ` +
       "release it once the machine will not be needed again. Releasing deletes it and everything on its disk."
     : "The container is NOT the per-execution sandbox: every call in this " +
       "turn uses the same one, so installs and files survive from one call to the next — do not " +
@@ -1842,7 +2055,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
   const shellLifetime = lease
     ? "Shell in the same container as `run`, billed by the second while it runs, and the same one for every call, in this " +
       "turn and later ones — state, installed packages and files carry over — until you release it; " +
-      `${leaseTerms(lease)}.`
+      `${termsOf(lease)}.`
     : "Shell in the same billed-by-the-second container as `run`, and the same one for every call " +
       "in this turn — state, installed packages and files carry over from one call to the next, and " +
       "the container is handed back when the turn ends.";
@@ -1854,6 +2067,242 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     "container with its own files, directory and idle schedule, created on first use and released on its " +
     "own. Use one unless you need two at once; at most a few (3 unless the operator set `maxMachines`) may " +
     "exist at once, switched-off ones included, and `machines` lists them.";
+  return [
+    {
+      name: "run",
+      summary:
+        "LAST RESORT for JavaScript. Prefer an ordinary code block, which is instant and free; this " +
+        "starts a container that is billed for every second it exists, and it cannot call your other " +
+        "tools. Use it only when you genuinely need npm packages, a real filesystem, or more than a " +
+        "few seconds of compute. " + runLifetime + " " + machinesSentence,
+      parameters: {
+        type: "object",
+        properties: {
+          code: { type: "string", description: "JavaScript, run with `node -e`" },
+          machine: MACHINE_PARAM,
+          install: {
+            type: "array", items: { type: "string" },
+            description: "npm packages to install first, e.g. ['zod']",
+          },
+        },
+        required: ["code"],
+      },
+      // Arbitrary code with network and a filesystem: whether that needs a
+      // person is the operator's call, and this is where they make it.
+      sideEffects: "write",
+      idempotency: "none",
+    },
+    {
+      name: "shell",
+      summary:
+        shellLifetime + " Each call starts in the directory the previous call ended in, like one terminal " +
+        "session, and its result says where that is (`cwd`); the first starts in the working directory. " +
+        "Pass `workdir` to run one command in another directory instead of starting it with `cd`. " +
+        "Exported variables and aliases do not carry over, so set them in the command that needs them, " +
+        "and a command handed over as a job does not move the directory. Only for what needs a real " +
+        "machine (builds, tests, git). " + (t ? templateSentence(DEFAULTS.template) : defaultImageSentence(DEFAULTS.image)) + " An operator may have configured a " +
+        "different image; every result reports which one this container started from, so read that " +
+        "instead of probing for it. Save anything worth keeping, then release. " + machinesSentence,
+      parameters: {
+        type: "object",
+        properties: {
+          command: { type: "string" },
+          machine: MACHINE_PARAM,
+          workdir: {
+            type: "string",
+            description: "directory to run this command in; relative paths start from the current one. Omit it to start where the previous command ended",
+          },
+        },
+        required: ["command"],
+      },
+      sideEffects: "write",
+      idempotency: "none",
+    },
+    {
+      name: "save",
+      summary:
+        "Copy a file out of the container into durable storage before it is destroyed. Returns an " +
+        "r2:// reference the artifacts mount can read back, and that outlives the box. Set " +
+        "archive for a directory. Do this for anything worth keeping — a build output, a report, a " +
+        "diff — the moment it exists, not at the end. " + notAReasonToRelease(lease, t ?? undefined),
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "absolute path inside the box" },
+          archive: { type: "boolean", description: "true to take a directory as a tar" },
+          machine: MACHINE_PARAM,
+        },
+        required: ["path"],
+      },
+      // It reads from the box and writes to object storage, and the write is
+      // the part with consequences: a durable object that is billed and
+      // outlives the container. An operator who wants it free of approval says
+      // so per tool; the declaration's job is to be true.
+      sideEffects: "write",
+      idempotency: "none",
+    },
+    {
+      name: "put",
+      summary:
+        "Copy a stored file into the container, so a command there can work on it. `ref` is an artifact:// " +
+        "reference of yours: what an attachment download or `save` returned. The usual way to process an " +
+        "attachment is: download it (attachments_download_url), `put` it here, work on it with `shell` or `run`, " +
+        "`save` the result, then view or upload what `save` returned. No URLs: anything from outside arrives " +
+        `through a download first. At most ${PUT_MAX_BYTES / 1024 / 1024} MiB. Returns the path, size and sha256 ` +
+        "as the container has it. An existing file at the path is replaced.",
+      parameters: {
+        type: "object",
+        properties: {
+          ref: { type: "string", description: "artifact:// reference to copy in" },
+          path: {
+            type: "string",
+            description: "where the file goes, inside the working directory; relative paths start there, e.g. \"in/photo.jpg\"",
+          },
+          machine: MACHINE_PARAM,
+        },
+        required: ["ref", "path"],
+      },
+      // It writes into the container, replacing whatever was at the path.
+      sideEffects: "write",
+      idempotency: "none",
+    },
+    {
+      name: "keep",
+      summary:
+        "Save this container's filesystem under a name, so a later task can start from it instead " +
+        "of installing everything again. Use it once the environment is set up — interpreter, " +
+        "packages, a cloned repository — not for the results, which belong in `save`. The " +
+        "container keeps running; the snapshot is independent of it. " + notAReasonToRelease(lease, t ?? undefined),
+      parameters: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "short name you will recognise later, e.g. 'py-scipy'" },
+          note: { type: "string", description: "one line on what is in it" },
+          machine: MACHINE_PARAM,
+        },
+        required: ["name"],
+      },
+      sideEffects: "write",
+      idempotency: "none",
+    },
+    {
+      name: "start_from",
+      summary:
+        "Begin from an environment kept earlier instead of a bare image. Naming one releases the " +
+        "current container if there is one; the next run or shell starts from the snapshot. Call " +
+        "with no name to see what has been kept, which releases nothing. Setting up a machine is usually the slowest and most " +
+        "expensive part of using one, and this is how you stop paying for it twice. Pass `machine` to start that " +
+        "machine from it instead of the default one; kept environments are shared by all of the mount's machines.",
+      parameters: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "the kept environment to start from; omit to list them" },
+          machine: MACHINE_PARAM,
+        },
+      },
+      sideEffects: "write",
+      idempotency: "none",
+    },
+    {
+      name: "release",
+      // Which advice is true depends on the lease, as it does for `run` and
+      // `shell`: without one a box is handed back when the turn ends, so
+      // "leave it running" and "`quiet` keeps it longer" would be promises
+      // nothing keeps (the SWE-bench runner, or a Worker without the two
+      // settings). No number here: the minutes are said where they are read.
+      summary: lease && t?.provider === "instabox"
+        ? "Delete the container now: the machine and everything on its disk are destroyed, and the meter " +
+          "stops. Pass save to copy files out first, in the same call. If you or the person you are working for " +
+          "will come back to it, leave it running, even after keeping or saving what is in it. Release it only " +
+          "when this machine will not be needed again. Leaving it costs little: an idle container is only " +
+          "paused on its own, and the next call resumes it where it was; it is deleted on its own " +
+          `${spanText(t.maxLifetimeHours * 3_600_000)} after it was created at the latest, which nothing postpones — while ` +
+          "releasing it early saves little and makes the next visit start over. A kept environment or a saved " +
+          "file is for starting a fresh machine later, not a reason to destroy one someone will use again."
+        : lease
+        ? "Delete the container now: the machine and everything on its disk are destroyed, and the meter " +
+          "stops. Pass save to copy files out first, in the same call. If you or the person you are working for " +
+          "will come back to it, leave it running, even after keeping or saving what is in it. Release it only " +
+          "when this machine will not be needed again. Leaving it costs little: an idle container is only " +
+          "switched off on its own, and the next call brings it back with its files intact; it is deleted on " +
+          "its own only after days switched off, you are told before that, and `quiet` keeps it longer — while " +
+          "releasing it early saves little and makes the next visit start over. A kept environment or a saved " +
+          "file is for starting a fresh machine later, not a reason to destroy one someone will use again."
+        : "Destroy the container and everything in it, stopping the meter. Pass save to copy files out " +
+          "first, in the same call. It is handed back when the turn ends anyway, so release it sooner once " +
+          "this machine will not be needed again in this turn. A later turn starts a fresh machine: what it " +
+          "needs has to be kept or saved before this turn ends.",
+      parameters: {
+        type: "object",
+        properties: {
+          save: {
+            type: "array", items: { type: "string" },
+            description: "absolute paths to keep before destroying the box",
+          },
+          machine: MACHINE_PARAM,
+        },
+      },
+      // Irreversible, and declared as what it is. `sideEffects` is what the
+      // gateway maps to a mount's policy: read falls to `policy.read`, so
+      // declaring this a read meant an operator who gated writes had every
+      // ordinary command held for approval and the one call that destroys
+      // everything let straight through. Releasing twice is still safe, which
+      // is what `idempotency` says and is a different question.
+      sideEffects: "write",
+      idempotency: "native",
+    },
+    {
+      name: "quiet",
+      summary: lease && t?.provider === "instabox"
+        ? "Postpone what happens next to this container while it sits unused: pausing it, while it is running; " +
+          "switching it off, once it is paused; deleting it, once it is switched off. It is kept as it is for at " +
+          "least `minutes` more from now, and you are not told about it again until shortly before then. It does " +
+          `not postpone the deletion ${spanText(t.maxLifetimeHours * 3_600_000)} after the container was created. Use it ` +
+          "when you are coming back to the machine — a build you are waiting on, work you return to after reading " +
+          "something. The limit is the mount's while it runs and much longer once it is switched off. Running, it " +
+          "is billed for every second either way; if you are done with it, `release` is the cheaper answer, and it " +
+          "can save files out in the same call."
+        : lease
+        ? "Postpone what happens next to this container while it sits unused: switching it off, while it is " +
+          "running; deleting it, once it is switched off. It is kept as it is for at least `minutes` more from " +
+          "now, and you are not told about it again until shortly before then. Use it when you are coming back " +
+          "to the machine — a build you are waiting on, work you return to after reading something. The limit " +
+          "is the mount's while it runs and much longer once it is switched off. Running, it is billed for " +
+          "every second either way; if you are done with it, `release` is the cheaper answer, and it can save " +
+          "files out in the same call."
+        : "Has no effect here: this mount has no idle release to put off, and the container is handed " +
+          "back when the turn ends whatever you ask. To carry work into a later turn, keep or save it.",
+      parameters: {
+        type: "object",
+        properties: {
+          minutes: {
+            type: "number",
+            description: "how many more minutes to keep the container, from now; a request over the mount's limit is refused, not shortened",
+          },
+          machine: MACHINE_PARAM,
+        },
+        required: ["minutes"],
+      },
+      // A write: it changes when the box is released, which changes what the
+      // box costs. Not idempotent, because each call moves the instant.
+      sideEffects: "write",
+      idempotency: "none",
+    },
+    {
+      name: "machines",
+      summary: t?.provider === "instabox"
+        ? "List this mount's machines: each one's name, whether it is running, paused or switched off, its " +
+          "template, when it was created and last used, when it will be paused, switched off or deleted if nothing " +
+          "uses it, and when it is deleted regardless. Reads the record only; starts, wakes and bills nothing."
+        : "List this mount's machines: each one's name, whether it is running or switched off, its image, " +
+          "when it was created and last used, and when it will be switched off or deleted if nothing uses it. " +
+          "Reads the record only; starts, wakes and bills nothing.",
+      parameters: { type: "object", properties: {} },
+      sideEffects: "read",
+      idempotency: "native",
+    },
+  ];
+  };
   return {
   id: "sandbox",
   /** The box record: that a mount has one is listable; the box id, the kept environments and the sessions are not. */
@@ -1877,12 +2326,14 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
      *  else: no credential, no call to run9. */
     async activity(ctx: PluginContext): Promise<MountActivity> {
       const raw = await ctx.db.get(BOX_STORE, BOX_KEY);
-      return summaryActivity(asMountState(raw), unreadableEntries(raw), keepDaysOf(cfgOf(ctx)));
+      const cfg = cfgOf(ctx);
+      return summaryActivity(asMountState(raw), unreadableEntries(raw), keepDaysOf(cfg), pausedMsOf(cfg));
     },
     /** Each machine on its own: its own schedule, postponement and cost (see `Holding.activities`). */
     async activities(ctx: PluginContext): Promise<MountActivity[]> {
       const raw = await ctx.db.get(BOX_STORE, BOX_KEY);
-      return activitiesOf(asMountState(raw), unreadableEntries(raw), keepDaysOf(cfgOf(ctx)));
+      const cfg = cfgOf(ctx);
+      return activitiesOf(asMountState(raw), unreadableEntries(raw), keepDaysOf(cfg), pausedMsOf(cfg));
     },
     /** The window this mount still holds. Bounded on purpose, which is why it is
      *  the console's history and not anybody's ledger. */
@@ -2047,7 +2498,10 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
 
   credential: {
     required: true,
-    summary: "run9 access and secret keys, as JSON.",
+    // One declaration for every mount of the plugin, whichever provider it names, so it lists both forms and
+    // none of the fields is required by the form itself: each provider's `checkCredential` refuses a credential
+    // missing what that provider needs, by name, before it is kept.
+    summary: "For run9: the access and secret keys (ak, sk). For InstaBox: the API key (apiKey). As JSON.",
     // A `secrets` setting once let a mount name further secrets to wire into
     // the container, and the credential carried a value per name. Both are
     // gone (#360): no mount could configure it — the validator's `typeOf`
@@ -2058,8 +2512,9 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     // GitHub's, which checks the sibling's plugin and its policy before
     // registering anything, so a future injected secret starts there.
     shape: { keys: [
-      { name: "ak", summary: "run9 access key, from the run9 console." },
-      { name: "sk", summary: "run9 secret key, issued with the access key." },
+      { name: "ak", summary: "run9 access key, from the run9 console. run9 mounts only.", required: false },
+      { name: "sk", summary: "run9 secret key, issued with the access key. run9 mounts only.", required: false },
+      { name: "apiKey", summary: "InstaBox API key (ibk_...), from the InstaBox dashboard. InstaBox mounts only.", required: false },
     ] },
     grants: "starting and destroying containers, which are billed by the second.",
     docs: "https://run.sys9.ai",
@@ -2070,8 +2525,17 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     // statement the mount validator can check, and so a mount asking for a
     // provider we do not have is refused at the page rather than at the first
     // call. Every setting below this line belongs to the run9 provider.
-    { name: "provider", type: "string", choices: ["run9"], default: "run9",
-      summary: "Which sandbox provider runs the container. Only run9 today." },
+    { name: "provider", type: "string", choices: PROVIDERS, default: "run9",
+      summary: "Which sandbox provider runs the container: run9 or instabox. On InstaBox the working directory " +
+        "defaults to /data/home/work, the size to 2c4g, and `image`, `project` and `verifyWith` do not apply." },
+    { name: "template", type: "string", default: DEFAULTS.template,
+      summary: "InstaBox only: the template a new machine starts from (GET /v1/templates lists them)." },
+    { name: "keepPausedMinutes", type: "number", default: DEFAULTS.keepPausedMinutes,
+      summary: "InstaBox only: minutes an idle machine stays paused, memory and processes kept, before it is switched off (files kept, processes end)." },
+    { name: "maxLifetimeHours", type: "number", default: DEFAULTS.maxLifetimeHours,
+      summary: "InstaBox only: hours after creation at which InstaBox deletes a machine whatever it is doing, a backstop against one nothing releases. At most 24, InstaBox's limit; it cannot be moved once the machine exists." },
+    { name: "maxRunMinutes", type: "number", default: DEFAULTS.maxRunMinutes,
+      summary: "InstaBox only: minutes a machine may run without a break before InstaBox pauses it." },
     { name: "image", type: "string", summary: "Container image to start from.",
       default: DEFAULTS.image },
     { name: "workdir", type: "string", summary: "Where scripts run and npm installs land. They must match, or Node resolves modules from somewhere npm did not install to.", default: "/work" },
@@ -2106,227 +2570,34 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       summary: "Who answers whether the credential works: the provider's own API, or the endpoint's `/credential`." },
   ],
   version: "1.0.0",
-  tools: [
-    {
-      name: "run",
-      summary:
-        "LAST RESORT for JavaScript. Prefer an ordinary code block, which is instant and free; this " +
-        "starts a container that is billed for every second it exists, and it cannot call your other " +
-        "tools. Use it only when you genuinely need npm packages, a real filesystem, or more than a " +
-        "few seconds of compute. " + runLifetime + " " + machinesSentence,
-      parameters: {
-        type: "object",
-        properties: {
-          code: { type: "string", description: "JavaScript, run with `node -e`" },
-          machine: MACHINE_PARAM,
-          install: {
-            type: "array", items: { type: "string" },
-            description: "npm packages to install first, e.g. ['zod']",
-          },
-        },
-        required: ["code"],
-      },
-      // Arbitrary code with network and a filesystem: whether that needs a
-      // person is the operator's call, and this is where they make it.
-      sideEffects: "write",
-      idempotency: "none",
-    },
-    {
-      name: "shell",
-      summary:
-        shellLifetime + " Each call starts in the directory the previous call ended in, like one terminal " +
-        "session, and its result says where that is (`cwd`); the first starts in the working directory. " +
-        "Pass `workdir` to run one command in another directory instead of starting it with `cd`. " +
-        "Exported variables and aliases do not carry over, so set them in the command that needs them, " +
-        "and a command handed over as a job does not move the directory. Only for what needs a real " +
-        "machine (builds, tests, git). " + defaultImageSentence(DEFAULTS.image) + " An operator may have configured a " +
-        "different image; every result reports which one this container started from, so read that " +
-        "instead of probing for it. Save anything worth keeping, then release. " + machinesSentence,
-      parameters: {
-        type: "object",
-        properties: {
-          command: { type: "string" },
-          machine: MACHINE_PARAM,
-          workdir: {
-            type: "string",
-            description: "directory to run this command in; relative paths start from the current one. Omit it to start where the previous command ended",
-          },
-        },
-        required: ["command"],
-      },
-      sideEffects: "write",
-      idempotency: "none",
-    },
-    {
-      name: "save",
-      summary:
-        "Copy a file out of the container into durable storage before it is destroyed. Returns an " +
-        "r2:// reference the artifacts mount can read back, and that outlives the box. Set " +
-        "archive for a directory. Do this for anything worth keeping — a build output, a report, a " +
-        "diff — the moment it exists, not at the end. " + notAReasonToRelease(lease),
-      parameters: {
-        type: "object",
-        properties: {
-          path: { type: "string", description: "absolute path inside the box" },
-          archive: { type: "boolean", description: "true to take a directory as a tar" },
-          machine: MACHINE_PARAM,
-        },
-        required: ["path"],
-      },
-      // It reads from the box and writes to object storage, and the write is
-      // the part with consequences: a durable object that is billed and
-      // outlives the container. An operator who wants it free of approval says
-      // so per tool; the declaration's job is to be true.
-      sideEffects: "write",
-      idempotency: "none",
-    },
-    {
-      name: "put",
-      summary:
-        "Copy a stored file into the container, so a command there can work on it. `ref` is an artifact:// " +
-        "reference of yours: what an attachment download or `save` returned. The usual way to process an " +
-        "attachment is: download it (attachments_download_url), `put` it here, work on it with `shell` or `run`, " +
-        "`save` the result, then view or upload what `save` returned. No URLs: anything from outside arrives " +
-        `through a download first. At most ${PUT_MAX_BYTES / 1024 / 1024} MiB. Returns the path, size and sha256 ` +
-        "as the container has it. An existing file at the path is replaced.",
-      parameters: {
-        type: "object",
-        properties: {
-          ref: { type: "string", description: "artifact:// reference to copy in" },
-          path: {
-            type: "string",
-            description: "where the file goes, inside the working directory; relative paths start there, e.g. \"in/photo.jpg\"",
-          },
-          machine: MACHINE_PARAM,
-        },
-        required: ["ref", "path"],
-      },
-      // It writes into the container, replacing whatever was at the path.
-      sideEffects: "write",
-      idempotency: "none",
-    },
-    {
-      name: "keep",
-      summary:
-        "Save this container's filesystem under a name, so a later task can start from it instead " +
-        "of installing everything again. Use it once the environment is set up — interpreter, " +
-        "packages, a cloned repository — not for the results, which belong in `save`. The " +
-        "container keeps running; the snapshot is independent of it. " + notAReasonToRelease(lease),
-      parameters: {
-        type: "object",
-        properties: {
-          name: { type: "string", description: "short name you will recognise later, e.g. 'py-scipy'" },
-          note: { type: "string", description: "one line on what is in it" },
-          machine: MACHINE_PARAM,
-        },
-        required: ["name"],
-      },
-      sideEffects: "write",
-      idempotency: "none",
-    },
-    {
-      name: "start_from",
-      summary:
-        "Begin from an environment kept earlier instead of a bare image. Naming one releases the " +
-        "current container if there is one; the next run or shell starts from the snapshot. Call " +
-        "with no name to see what has been kept, which releases nothing. Setting up a machine is usually the slowest and most " +
-        "expensive part of using one, and this is how you stop paying for it twice. Pass `machine` to start that " +
-        "machine from it instead of the default one; kept environments are shared by all of the mount's machines.",
-      parameters: {
-        type: "object",
-        properties: {
-          name: { type: "string", description: "the kept environment to start from; omit to list them" },
-          machine: MACHINE_PARAM,
-        },
-      },
-      sideEffects: "write",
-      idempotency: "none",
-    },
-    {
-      name: "release",
-      // Which advice is true depends on the lease, as it does for `run` and
-      // `shell`: without one a box is handed back when the turn ends, so
-      // "leave it running" and "`quiet` keeps it longer" would be promises
-      // nothing keeps (the SWE-bench runner, or a Worker without the two
-      // settings). No number here: the minutes are said where they are read.
-      summary: lease
-        ? "Delete the container now: the machine and everything on its disk are destroyed, and the meter " +
-          "stops. Pass save to copy files out first, in the same call. If you or the person you are working for " +
-          "will come back to it, leave it running, even after keeping or saving what is in it. Release it only " +
-          "when this machine will not be needed again. Leaving it costs little: an idle container is only " +
-          "switched off on its own, and the next call brings it back with its files intact; it is deleted on " +
-          "its own only after days switched off, you are told before that, and `quiet` keeps it longer — while " +
-          "releasing it early saves little and makes the next visit start over. A kept environment or a saved " +
-          "file is for starting a fresh machine later, not a reason to destroy one someone will use again."
-        : "Destroy the container and everything in it, stopping the meter. Pass save to copy files out " +
-          "first, in the same call. It is handed back when the turn ends anyway, so release it sooner once " +
-          "this machine will not be needed again in this turn. A later turn starts a fresh machine: what it " +
-          "needs has to be kept or saved before this turn ends.",
-      parameters: {
-        type: "object",
-        properties: {
-          save: {
-            type: "array", items: { type: "string" },
-            description: "absolute paths to keep before destroying the box",
-          },
-          machine: MACHINE_PARAM,
-        },
-      },
-      // Irreversible, and declared as what it is. `sideEffects` is what the
-      // gateway maps to a mount's policy: read falls to `policy.read`, so
-      // declaring this a read meant an operator who gated writes had every
-      // ordinary command held for approval and the one call that destroys
-      // everything let straight through. Releasing twice is still safe, which
-      // is what `idempotency` says and is a different question.
-      sideEffects: "write",
-      idempotency: "native",
-    },
-    {
-      name: "quiet",
-      summary: lease
-        ? "Postpone what happens next to this container while it sits unused: switching it off, while it is " +
-          "running; deleting it, once it is switched off. It is kept as it is for at least `minutes` more from " +
-          "now, and you are not told about it again until shortly before then. Use it when you are coming back " +
-          "to the machine — a build you are waiting on, work you return to after reading something. The limit " +
-          "is the mount's while it runs and much longer once it is switched off. Running, it is billed for " +
-          "every second either way; if you are done with it, `release` is the cheaper answer, and it can save " +
-          "files out in the same call."
-        : "Has no effect here: this mount has no idle release to put off, and the container is handed " +
-          "back when the turn ends whatever you ask. To carry work into a later turn, keep or save it.",
-      parameters: {
-        type: "object",
-        properties: {
-          minutes: {
-            type: "number",
-            description: "how many more minutes to keep the container, from now; a request over the mount's limit is refused, not shortened",
-          },
-          machine: MACHINE_PARAM,
-        },
-        required: ["minutes"],
-      },
-      // A write: it changes when the box is released, which changes what the
-      // box costs. Not idempotent, because each call moves the instant.
-      sideEffects: "write",
-      idempotency: "none",
-    },
-    {
-      name: "machines",
-      summary:
-        "List this mount's machines: each one's name, whether it is running or switched off, its image, " +
-        "when it was created and last used, and when it will be switched off or deleted if nothing uses it. " +
-        "Reads the record only; starts, wakes and bills nothing.",
-      parameters: { type: "object", properties: {} },
-      sideEffects: "read",
-      idempotency: "native",
-    },
-  ],
+  tools: toolsFor(null),
+  /**
+   * An InstaBox mount's tools: the same tools, with the sentences about what happens to an idle box true of
+   * InstaBox (`instaboxLeaseTerms`). Every other mount gets `tools`, whose text is run9's.
+   */
+  mountTools(mount: MountRecord): ToolSchema[] {
+    const config = (mount.publicConfig ?? {}) as SandboxConfig;
+    return config.provider === "instabox" ? toolsFor(idleTermsOf(cfgFrom(config))) : toolsFor(null);
+  },
 
 
   /** Does this key work, asked when a person pastes it (the provider's `checkCredential`). */
   async checkCredential(ctx) {
     if (!ctx.credential) return { ok: false as const, kind: "rejected" as const, reason: "no keys: this mount cannot start a container" };
-    const cfg = { ...DEFAULTS, ...(ctx.publicConfig as SandboxConfig) };
+    const cfg = cfgOf(ctx);
     return backendFor(cfg).checkCredential(cfg, ctx.credential);
+  },
+
+  /** Settings one provider cannot use, refused when the mount is made rather than at its first call. */
+  configProblem(config) {
+    const c = config as SandboxConfig;
+    if (c.provider !== "instabox") return undefined;
+    if (c.shape !== undefined && !shapeOf(c.shape)) return `shape must read like 2c4g (vCPUs, then GiB of memory) on InstaBox; got ${JSON.stringify(c.shape)}`;
+    if (typeof c.endpoint === "string" && /run\.sys9\.ai/.test(c.endpoint)) return "endpoint names run9, and this mount asks for InstaBox; leave it out for api.instabox.sh";
+    if (c.maxLifetimeHours !== undefined && !(typeof c.maxLifetimeHours === "number" && c.maxLifetimeHours >= 1 && c.maxLifetimeHours <= 24)) {
+      return "maxLifetimeHours must be between 1 and 24: InstaBox deletes a machine at most a day after it is created";
+    }
+    return undefined;
   },
 
   /** The account these keys act on (the provider's `account`), so a replaced key on the same one keeps the boxes. */
@@ -2379,7 +2650,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       // Not deleted, the old container is still the machine (`stopBox` keeps naming it), so the choice would not
       // apply to anything: refused, with the release fact the recorder needs for a box still billing.
       if (released && !released.freed) {
-        const e = new Error(`run9 box ${released.boxId} not released, so ${env.name} was not chosen: ${released.error ?? "unknown"}`);
+        const e = new Error(`${providerName(cfgOf(ctx))} box ${released.boxId} not released, so ${env.name} was not chosen: ${released.error ?? "unknown"}`);
         throw released.lease ? markReleased(e, released.lease) : e;
       }
       const after = await readView(ctx, machine);
@@ -2396,7 +2667,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
         ...(released ? { releasedPrevious: released.boxId } : {}),
       };
     }
-    const cfg = { ...DEFAULTS, ...(ctx.publicConfig as SandboxConfig) };
+    const cfg = cfgOf(ctx);
 
     // Before the credential check on purpose: postponing a release calls
     // nothing at run9, so a mount whose key was removed can still answer it.
@@ -2444,6 +2715,8 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     }
 
     const provider = openProvider(cfg, ctx);
+    const backend = backendFor(cfg);
+    const terms = idleTermsOf(cfg);
 
     // Everything about the file is settled before a container is asked for, so a reference that is not this
     // agent's, a path outside the working directory, or a file too large starts and wakes nothing.
@@ -2504,38 +2777,46 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       // only come from the record read at the top of this call. `BoxState`
       // declares the field, so there is nothing here to cast around either.
       const from = prior.startFrom;
-      // What every result will report this container as: the setting, or the
+      // What every result will report this container as: the setting (InstaBox's template), or the
       // image the kept environment itself started from. Unknown stays unknown.
-      const image = from ? kept.find((e) => e.snapId === from)?.image : cfg.image;
+      const image = from ? kept.find((e) => e.snapId === from)?.image : backend.id === "instabox" ? cfg.template : cfg.image;
       // The agent's other accounts this container acts as (`SandboxForm`). Asked
       // at creation because the provider registers credentials per box, and read
       // again before every later command (reconcileAccounts).
       const want = await accountsWanted(ctx, cfg);
+      const spec = {
+        id: boxId,
+        // Who and what the box is for, carried at the provider, so it can be found again without listing
+        // everything the account holds.
+        labels: { tenant: ctx.caller.tenantId, agent: ctx.caller.agentId, mount: ctx.alias, machine },
+        // An environment kept earlier, or the bare image. Starting from a
+        // snapshot is the whole point of having kept one.
+        ...(from ? { fromSnapshot: from } : {}),
+        image: cfg.image,
+        egressSecrets: want.wire.length > 0,
+        ...(cfg.shape ? { shape: cfg.shape } : {}),
+        description: `antiproton ${ctx.caller.tenantId}/${ctx.caller.agentId}`,
+      };
+      // The provider's id for the box, which is what the record names: the minted one where the provider takes
+      // ours (run9), its own where it mints them (InstaBox).
+      let made: { id: string; deleteAt?: number };
       try {
-        await provider.create({
-          id: boxId,
-          // An environment kept earlier, or the bare image. Starting from a
-          // snapshot is the whole point of having kept one.
-          ...(from ? { fromSnapshot: from } : {}),
-          image: cfg.image,
-          egressSecrets: want.wire.length > 0,
-          ...(cfg.shape ? { shape: cfg.shape } : {}),
-          description: `antiproton ${ctx.caller.tenantId}/${ctx.caller.agentId}`,
-        });
+        made = await provider.create(spec);
       } catch (e) {
-        // Seen twice in one benchmark run: run9 answered 400 "already exists"
-        // (once as its own database's duplicate-key error) for an id this call
-        // had just minted. The box existed; only the answer was lost. Throwing
-        // here failed the agent's first command and leaked the box, since no
-        // record of it was ever written. If the box is there, it is ours.
+        // A create answered "already exists" for a name this call had just minted: the box existed and only the
+        // answer was lost. Throwing here failed the agent's first command and leaked the box, since no record of
+        // it was ever written. If the box is there, it is ours (`SandboxProvider.adopt`).
         if (!(e instanceof ProviderError && e.code === "conflict")) throw e;
-        if ((await provider.status(boxId)) === "gone") throw e;
+        const adopted = await provider.adopt(spec);
+        if (adopted === null) throw e;
+        made = { id: adopted };
       }
       // Recorded before anything else can fail: the box exists and is billed, so
       // a registration that throws must not leave it with no record naming it.
       // The record gains each placeholder only once the provider has accepted it.
       state = {
-        boxId, createdAt: Date.now(), lastUsedAt: Date.now(), execs: 0, saved: [],
+        boxId: made.id, createdAt: Date.now(), lastUsedAt: Date.now(), execs: 0, saved: [],
+        ...(made.deleteAt !== undefined ? { deleteAt: made.deleteAt } : {}),
         // Whose account this box is on, for as long as it lives (`BoxState.credentialRef`).
         ...(ctx.credentialRefKind ? { credentialRef: ctx.credentialRefKind } : {}),
         sessions: history,
@@ -2557,11 +2838,16 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     // so it has to be back on the short idle schedule even if this call fails. A new compute session starts
     // (the last one was recorded when it was switched off), and a postponement of its deletion does not carry
     // over to hold off switching it off. `save` included: reading a file out of a stopped box may start it.
-    if (!created && parkedAt(state) !== null && (tool === "run" || tool === "shell" || tool === "save" || tool === "put")) {
-      const { parkedAt: _p, quietUntil: _q, ...running } = state;
+    // `keep` too where the provider snapshots a running box (InstaBox), which it wakes to do so.
+    const wakes = tool === "run" || tool === "shell" || tool === "save" || tool === "put"
+      || (tool === "keep" && backend.caps.snapshot === "live");
+    if (!created && parkedAt(state) !== null && wakes) {
+      const { parkedAt: _p, quietUntil: _q, parkedAs: _a, ...running } = state;
       const t = Date.now();
       state = { ...running, createdAt: t, lastUsedAt: t, execs: 0, saved: [] };
       await writeView(ctx, machine, state);
+      // A provider that does not wake a box on use is asked to, before the command goes out.
+      if (provider.wake) await provider.wake(state.boxId);
     }
 
     /**
@@ -2616,18 +2902,29 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
         ...(state!.image ? { image: state!.image } : {}),
         ...(typeof (args as any)?.note === "string" ? { note: String((args as any).note).slice(0, 200) } : {}),
       };
-      const envs = [env, ...(state!.envs ?? []).filter((e) => e.name !== name)].slice(0, 20);
+      const before = state!.envs ?? [];
+      const envs = [env, ...before.filter((e) => e.name !== name)].slice(0, 20);
       state = { ...state!, envs, lastUsedAt: Date.now() };
       await writeView(ctx, machine, state);
+      // A snapshot no name refers to any more (replaced under its name, or past the 20 kept) is deleted where the
+      // provider can, since its storage is billed and counted against a limit (InstaBox). Best effort: the
+      // environment is kept either way, and one left behind is said.
+      let notDeleted: string[] = [];
+      if (provider.deleteSnapshot) {
+        for (const gone of before.filter((e) => !envs.includes(e) && !envs.some((k) => k.snapId === e.snapId))) {
+          try { await provider.deleteSnapshot(gone.snapId); } catch { notDeleted = [...notDeleted, gone.snapId]; }
+        }
+      }
       return {
         kept: name, snapshot: snapId, ...named,
-        note: keptNote(lease),
+        note: keptNote(lease, terms),
+        ...(notDeleted.length ? { notDeleted } : {}),
       };
     }
 
     if (tool === "save") {
       const r = await saveOut(String((args as any)?.path ?? ""), (args as any)?.archive === true);
-      return { ...r, note: savedNote(lease) };
+      return { ...r, note: savedNote(lease, terms) };
     }
 
     if (tool === "put") {
@@ -2654,7 +2951,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
 
       // Read back from the box itself: the provider's answer says a transfer ended, this says the file is the one sent.
       const got = await script(PUT_CHECK_SCRIPT, "read the file back");
-      if (got.exit === 3) throw new Error(`run9 accepted the upload, but ${p.path} is not a file in the container`);
+      if (got.exit === 3) throw new Error(`${backend.name} accepted the upload, but ${p.path} is not a file in the container`);
       if (got.exit !== 0) throw new Error(`could not read ${p.path} back: exit ${got.exit} ${got.out.slice(0, 120)}`);
       const [sizeLine, hashLine] = got.out.trim().split("\n").map((l) => l.trim());
       const boxSize = Number(sizeLine);
@@ -2752,7 +3049,8 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     const start = (argv: string[], workdir: string | null) => provider.execBackground(state!.boxId, { argv, workdir });
     // The box just created was wired from the mount a moment ago; any other is checked again.
     if (!created) state = await reconcileAccounts(ctx, state!, provider, await accountsWanted(ctx, cfg), machine);
-    let execId = await start(execArgv(cfg, command, envFor(state)), startIn);
+    const argvCfg = { ...cfg, isolate: backend.isolateNetwork };
+    let execId = await start(execArgv(argvCfg, command, envFor(state)), startIn);
     let movedFrom: string | null = null;
 
     // The work has begun. From here the call may finish it or hand it over,
@@ -2781,7 +3079,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       // A remembered one that vanished: once, start again in the working directory, and say so.
       if (rec.couldNotStart && startIn && !askedDir && !movedFrom) {
         movedFrom = startIn;
-        execId = await start(execArgv(cfg, withCwdTrailer(`mkdir -p ${wd} && cd ${wd} || exit 1\n${a.command}`), envFor(state)), null);
+        execId = await start(execArgv(argvCfg, withCwdTrailer(`mkdir -p ${wd} && cd ${wd} || exit 1\n${a.command}`), envFor(state)), null);
         continue;
       }
       if (TERMINAL.includes(rec.state)) {

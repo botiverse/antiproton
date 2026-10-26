@@ -1,0 +1,3255 @@
+{
+ "an InstaBox mount's tools say what InstaBox does with an idle box; run9's text is untouched": [
+  {
+   "lease": [
+    {
+     "name": "run",
+     "summary": "LAST RESORT for JavaScript. Prefer an ordinary code block, which is instant and free; this starts a container that is billed for every second it exists, and it cannot call your other tools. Use it only when you genuinely need npm packages, a real filesystem, or more than a few seconds of compute. The container is NOT the per-execution sandbox: every call uses the same one, in this turn and later ones, so installs and files survive from one call to the next — do not reinstall. It stays until you release it; after 30 idle minutes it is paused, keeping its memory, running processes and files, and the next call resumes it where it was in a few seconds; after 30 minutes paused it is switched off, which keeps its files but ends running processes and empties /tmp, and the next call starts it again; it is deleted, with everything on its disk, 24 hours after it was created whatever it is doing, and nothing postpones that: `keep` the environment or `save` the files you will want after then; `quiet` postpones the idle steps by as long as you choose, within the mount's limit; files under /tmp do not survive being switched off, so keep your work in the working directory. Work in as few calls as you can, save what matters with `save`, and release it once the machine will not be needed again. Releasing deletes it and everything on its disk. Every call uses the mount's one machine unless you pass `machine`: another short name is a separate container with its own files, directory and idle schedule, created on first use and released on its own. Use one unless you need two at once; at most a few (3 unless the operator set `maxMachines`) may exist at once, switched-off ones included, and `machines` lists them."
+    },
+    {
+     "name": "shell",
+     "summary": "Shell in the same container as `run`, billed by the second while it runs, and the same one for every call, in this turn and later ones — state, installed packages and files carry over — until you release it; after 30 idle minutes it is paused, keeping its memory, running processes and files, and the next call resumes it where it was in a few seconds; after 30 minutes paused it is switched off, which keeps its files but ends running processes and empties /tmp, and the next call starts it again; it is deleted, with everything on its disk, 24 hours after it was created whatever it is doing, and nothing postpones that: `keep` the environment or `save` the files you will want after then; `quiet` postpones the idle steps by as long as you choose, within the mount's limit; files under /tmp do not survive being switched off, so keep your work in the working directory. Each call starts in the directory the previous call ended in, like one terminal session, and its result says where that is (`cwd`); the first starts in the working directory. Pass `workdir` to run one command in another directory instead of starting it with `cd`. Exported variables and aliases do not carry over, so set them in the command that needs them, and a command handed over as a job does not move the directory. Only for what needs a real machine (builds, tests, git). The default template is universal (Debian 13): Node, npm, git, curl, make, gcc/g++, Python 3, pip, jq, gh, Go, Docker, bash, ssh, apt-get and sudo are present; rg are NOT, and `sudo apt-get update && sudo apt-get install -y <pkg>` installs more. An operator may have configured a different image; every result reports which one this container started from, so read that instead of probing for it. Save anything worth keeping, then release. Every call uses the mount's one machine unless you pass `machine`: another short name is a separate container with its own files, directory and idle schedule, created on first use and released on its own. Use one unless you need two at once; at most a few (3 unless the operator set `maxMachines`) may exist at once, switched-off ones included, and `machines` lists them."
+    },
+    {
+     "name": "save",
+     "summary": "Copy a file out of the container into durable storage before it is destroyed. Returns an r2:// reference the artifacts mount can read back, and that outlives the box. Set archive for a directory. Do this for anything worth keeping — a build output, a report, a diff — the moment it exists, not at the end. A copy outliving the container is not a reason to release it: if you or the person you are working for will come back to this machine, leave it running — idle, it is only paused, and the next call resumes it with its files and running processes."
+    },
+    {
+     "name": "put",
+     "summary": "Copy a stored file into the container, so a command there can work on it. `ref` is an artifact:// reference of yours: what an attachment download or `save` returned. The usual way to process an attachment is: download it (attachments_download_url), `put` it here, work on it with `shell` or `run`, `save` the result, then view or upload what `save` returned. No URLs: anything from outside arrives through a download first. At most 25 MiB. Returns the path, size and sha256 as the container has it. An existing file at the path is replaced."
+    },
+    {
+     "name": "keep",
+     "summary": "Save this container's filesystem under a name, so a later task can start from it instead of installing everything again. Use it once the environment is set up — interpreter, packages, a cloned repository — not for the results, which belong in `save`. The container keeps running; the snapshot is independent of it. A copy outliving the container is not a reason to release it: if you or the person you are working for will come back to this machine, leave it running — idle, it is only paused, and the next call resumes it with its files and running processes."
+    },
+    {
+     "name": "start_from",
+     "summary": "Begin from an environment kept earlier instead of a bare image. Naming one releases the current container if there is one; the next run or shell starts from the snapshot. Call with no name to see what has been kept, which releases nothing. Setting up a machine is usually the slowest and most expensive part of using one, and this is how you stop paying for it twice. Pass `machine` to start that machine from it instead of the default one; kept environments are shared by all of the mount's machines."
+    },
+    {
+     "name": "release",
+     "summary": "Delete the container now: the machine and everything on its disk are destroyed, and the meter stops. Pass save to copy files out first, in the same call. If you or the person you are working for will come back to it, leave it running, even after keeping or saving what is in it. Release it only when this machine will not be needed again. Leaving it costs little: an idle container is only paused on its own, and the next call resumes it where it was; it is deleted on its own 24 hours after it was created at the latest, which nothing postpones — while releasing it early saves little and makes the next visit start over. A kept environment or a saved file is for starting a fresh machine later, not a reason to destroy one someone will use again."
+    },
+    {
+     "name": "quiet",
+     "summary": "Postpone what happens next to this container while it sits unused: pausing it, while it is running; switching it off, once it is paused; deleting it, once it is switched off. It is kept as it is for at least `minutes` more from now, and you are not told about it again until shortly before then. It does not postpone the deletion 24 hours after the container was created. Use it when you are coming back to the machine — a build you are waiting on, work you return to after reading something. The limit is the mount's while it runs and much longer once it is switched off. Running, it is billed for every second either way; if you are done with it, `release` is the cheaper answer, and it can save files out in the same call."
+    },
+    {
+     "name": "machines",
+     "summary": "List this mount's machines: each one's name, whether it is running, paused or switched off, its template, when it was created and last used, when it will be paused, switched off or deleted if nothing uses it, and when it is deleted regardless. Reads the record only; starts, wakes and bills nothing."
+    }
+   ]
+  },
+  {
+   "noLease": [
+    {
+     "name": "run",
+     "summary": "LAST RESORT for JavaScript. Prefer an ordinary code block, which is instant and free; this starts a container that is billed for every second it exists, and it cannot call your other tools. Use it only when you genuinely need npm packages, a real filesystem, or more than a few seconds of compute. The container is NOT the per-execution sandbox: every call in this turn uses the same one, so installs and files survive from one call to the next — do not reinstall. It is handed back when the turn ends, so a later turn starts a new container unless you saved this one's filesystem with `keep`. Work in as few calls as you can, save what matters with `save`, and release it. Everything inside is destroyed when it is released. Every call uses the mount's one machine unless you pass `machine`: another short name is a separate container with its own files, directory and idle schedule, created on first use and released on its own. Use one unless you need two at once; at most a few (3 unless the operator set `maxMachines`) may exist at once, switched-off ones included, and `machines` lists them."
+    },
+    {
+     "name": "shell",
+     "summary": "Shell in the same billed-by-the-second container as `run`, and the same one for every call in this turn — state, installed packages and files carry over from one call to the next, and the container is handed back when the turn ends. Each call starts in the directory the previous call ended in, like one terminal session, and its result says where that is (`cwd`); the first starts in the working directory. Pass `workdir` to run one command in another directory instead of starting it with `cd`. Exported variables and aliases do not carry over, so set them in the command that needs them, and a command handed over as a job does not move the directory. Only for what needs a real machine (builds, tests, git). The default template is universal (Debian 13): Node, npm, git, curl, make, gcc/g++, Python 3, pip, jq, gh, Go, Docker, bash, ssh, apt-get and sudo are present; rg are NOT, and `sudo apt-get update && sudo apt-get install -y <pkg>` installs more. An operator may have configured a different image; every result reports which one this container started from, so read that instead of probing for it. Save anything worth keeping, then release. Every call uses the mount's one machine unless you pass `machine`: another short name is a separate container with its own files, directory and idle schedule, created on first use and released on its own. Use one unless you need two at once; at most a few (3 unless the operator set `maxMachines`) may exist at once, switched-off ones included, and `machines` lists them."
+    },
+    {
+     "name": "save",
+     "summary": "Copy a file out of the container into durable storage before it is destroyed. Returns an r2:// reference the artifacts mount can read back, and that outlives the box. Set archive for a directory. Do this for anything worth keeping — a build output, a report, a diff — the moment it exists, not at the end. A copy outliving the container is not a reason to release it early: it is handed back when the turn ends anyway, and until then it is still the machine you are working on."
+    },
+    {
+     "name": "put",
+     "summary": "Copy a stored file into the container, so a command there can work on it. `ref` is an artifact:// reference of yours: what an attachment download or `save` returned. The usual way to process an attachment is: download it (attachments_download_url), `put` it here, work on it with `shell` or `run`, `save` the result, then view or upload what `save` returned. No URLs: anything from outside arrives through a download first. At most 25 MiB. Returns the path, size and sha256 as the container has it. An existing file at the path is replaced."
+    },
+    {
+     "name": "keep",
+     "summary": "Save this container's filesystem under a name, so a later task can start from it instead of installing everything again. Use it once the environment is set up — interpreter, packages, a cloned repository — not for the results, which belong in `save`. The container keeps running; the snapshot is independent of it. A copy outliving the container is not a reason to release it early: it is handed back when the turn ends anyway, and until then it is still the machine you are working on."
+    },
+    {
+     "name": "start_from",
+     "summary": "Begin from an environment kept earlier instead of a bare image. Naming one releases the current container if there is one; the next run or shell starts from the snapshot. Call with no name to see what has been kept, which releases nothing. Setting up a machine is usually the slowest and most expensive part of using one, and this is how you stop paying for it twice. Pass `machine` to start that machine from it instead of the default one; kept environments are shared by all of the mount's machines."
+    },
+    {
+     "name": "release",
+     "summary": "Destroy the container and everything in it, stopping the meter. Pass save to copy files out first, in the same call. It is handed back when the turn ends anyway, so release it sooner once this machine will not be needed again in this turn. A later turn starts a fresh machine: what it needs has to be kept or saved before this turn ends."
+    },
+    {
+     "name": "quiet",
+     "summary": "Has no effect here: this mount has no idle release to put off, and the container is handed back when the turn ends whatever you ask. To carry work into a later turn, keep or save it."
+    },
+    {
+     "name": "machines",
+     "summary": "List this mount's machines: each one's name, whether it is running, paused or switched off, its template, when it was created and last used, when it will be paused, switched off or deleted if nothing uses it, and when it is deleted regardless. Reads the record only; starts, wakes and bills nothing."
+    }
+   ]
+  },
+  {
+   "longerLife": "Shell in the same container as `run`, billed by the second while it runs, and the same one for every call, in this turn and later ones — state, installed packages and files carry over — until you release it; after 30 idle minutes it is paused, keeping its memory, running processes and files, and the next call resumes it where it was in a few seconds; after 30 minutes paused it is switched off, which keeps its files but ends running processes and empties /tmp, and the next call starts it again; it is deleted, with everything on its disk, after 12 hours switched off and unused, and you are told 6 hours before that, and in any case 24 hours after it was created, which nothing postpones; `quiet` postpones the idle steps by as long as you choose, within the mount's limit; files under /tmp do not survive being switched off, so keep your work in the working directory. Each call starts in the directory the previous call ended in, like one terminal session, and its result says where that is (`cwd`); the first starts in the working directory. Pass `workdir` to run one command in another directory instead of starting it with `cd`. Exported variables and aliases do not carry over, so set them in the command that needs them, and a command handed over as a job does not move the directory. Only for what needs a real machine (builds, tests, git). The default template is universal (Debian 13): Node, npm, git, curl, make, gcc/g++, Python 3, pip, jq, gh, Go, Docker, bash, ssh, apt-get and sudo are present; rg are NOT, and `sudo apt-get update && sudo apt-get install -y <pkg>` installs more. An operator may have configured a different image; every result reports which one this container started from, so read that instead of probing for it. Save anything worth keeping, then release. Every call uses the mount's one machine unless you pass `machine`: another short name is a separate container with its own files, directory and idle schedule, created on first use and released on its own. Use one unless you need two at once; at most a few (3 unless the operator set `maxMachines`) may exist at once, switched-off ones included, and `machines` lists them."
+  }
+ ],
+ "create, shell, run, put, save, keep, start_from, release": [
+  {
+   "step": "shell creates the machine",
+   "result": {
+    "state": "succeeded",
+    "exitCode": 0,
+    "cwd": "/data/home/work",
+    "output": "hello",
+    "truncated": false,
+    "box": "m_1",
+    "image": "universal",
+    "accounts": {
+     "github": "Not wired in: InstaBox cannot hold a credential for one container only. Use that mount's own tools."
+    }
+   }
+  },
+  {
+   "step": "shell again, in a directory of its own",
+   "result": {
+    "state": "succeeded",
+    "exitCode": 0,
+    "cwd": "/data/home/work",
+    "output": "hello",
+    "truncated": false,
+    "box": "m_1",
+    "image": "universal",
+    "accounts": {
+     "github": "Not wired in: InstaBox cannot hold a credential for one container only. Use that mount's own tools."
+    }
+   }
+  },
+  {
+   "step": "run",
+   "result": {
+    "state": "succeeded",
+    "exitCode": 0,
+    "cwd": "/data/home/work",
+    "output": "hello",
+    "truncated": false,
+    "box": "m_1",
+    "image": "universal",
+    "accounts": {
+     "github": "Not wired in: InstaBox cannot hold a credential for one container only. Use that mount's own tools."
+    }
+   }
+  },
+  {
+   "step": "put",
+   "result": {
+    "path": "/data/home/work/in/photo.jpg",
+    "bytes": 21,
+    "sha256": "0def0041adb95f563cd32c30827eab6cd9c9a87482a618c48db200f2d89d524b",
+    "ref": "artifact://raft/attachments/7/photo.jpg",
+    "checked": "sha256",
+    "note": "in the container now; work on it with `shell` or `run`, and `save` what you make from it"
+   }
+  },
+  {
+   "step": "save a file",
+   "result": {
+    "path": "/data/home/work/in/photo.jpg",
+    "ref": "artifact://sandbox/m_1/data/home/work/in/photo.jpg",
+    "bytes": 21,
+    "note": "kept outside the box, for later. A copy outliving the container is not a reason to release it: if you or the person you are working for will come back to this machine, leave it running — idle, it is only paused, and the next call resumes it with its files and running processes."
+   }
+  },
+  {
+   "step": "save a directory as tar",
+   "result": {
+    "path": "/data/home/work/in",
+    "ref": "artifact://sandbox/m_1/data/home/work/in.tar",
+    "bytes": 25,
+    "note": "kept outside the box, for later. A copy outliving the container is not a reason to release it: if you or the person you are working for will come back to this machine, leave it running — idle, it is only paused, and the next call resumes it with its files and running processes."
+   }
+  },
+  {
+   "step": "keep",
+   "result": {
+    "kept": "py-env",
+    "snapshot": "sn_1",
+    "note": "independent of this container; start a fresh machine from it later with `start_from`. A copy outliving the container is not a reason to release it: if you or the person you are working for will come back to this machine, leave it running — idle, it is only paused, and the next call resumes it with its files and running processes."
+   }
+  },
+  {
+   "step": "keep under the same name replaces and deletes the old snapshot",
+   "result": {
+    "kept": "py-env",
+    "snapshot": "sn_2",
+    "note": "independent of this container; start a fresh machine from it later with `start_from`. A copy outliving the container is not a reason to release it: if you or the person you are working for will come back to this machine, leave it running — idle, it is only paused, and the next call resumes it with its files and running processes."
+   }
+  },
+  {
+   "step": "start_from releases the machine",
+   "result": {
+    "startingFrom": "py-env",
+    "note": "the next run or shell starts from this environment",
+    "released": true,
+    "__ap_lease__": {
+     "id": "m_1",
+     "startedAt": 1800000002000,
+     "endedAt": 1800000030000,
+     "status": "freed"
+    },
+    "releasedPrevious": "m_1"
+   }
+  },
+  {
+   "step": "shell creates from the snapshot",
+   "result": {
+    "state": "succeeded",
+    "exitCode": 0,
+    "cwd": "/data/home/work",
+    "output": "hello",
+    "truncated": false,
+    "box": "m_2",
+    "image": "universal",
+    "kept": [
+     "py-env"
+    ],
+    "accounts": {
+     "github": "Not wired in: InstaBox cannot hold a credential for one container only. Use that mount's own tools."
+    }
+   }
+  },
+  {
+   "step": "machines",
+   "result": {
+    "machines": [
+     {
+      "machine": "main",
+      "state": "running",
+      "box": "m_2",
+      "image": "universal",
+      "created": "2027-01-15T08:00:32.000Z",
+      "lastUsed": "2027-01-15T08:00:33.000Z",
+      "cwd": "/data/home/work",
+      "pausedAfter": "2027-01-15T08:30:33.000Z",
+      "deletedBy": "2027-01-16T08:00:31.000Z"
+     }
+    ],
+    "limit": 3,
+    "note": "times are when it happens if nothing uses the machine before then; any use moves them. 1 of at most 3 exist; a switched-off one counts until it is released."
+   }
+  },
+  {
+   "step": "release, saving first",
+   "result": {
+    "released": true,
+    "box": "m_2",
+    "liveMs": 5000,
+    "saved": [
+     {
+      "path": "/data/home/work/out.txt",
+      "ref": "artifact://sandbox/m_2/data/home/work/out.txt",
+      "bytes": 32
+     }
+    ],
+    "__ap_lease__": {
+     "id": "m_2",
+     "startedAt": 1800000032000,
+     "endedAt": 1800000037000,
+     "status": "freed"
+    },
+    "note": "the container and its files are gone; anything saved above is not"
+   }
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines",
+   "idem": "create-h-t-a-mywpiww0",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "name": "h-t-a-mywpiww0",
+    "templateId": "universal",
+    "vcpus": 2,
+    "memMiB": 4096,
+    "metadata": {
+     "tenant": "t",
+     "agent": "a",
+     "mount": "sandbox",
+     "machine": "main"
+    },
+    "deleteAfterSeconds": 86400,
+    "maxRunMinutes": 480,
+    "failFast": true,
+    "secrets": [],
+    "envSecrets": [],
+    "vault": false
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/operations/op_1?wait=25s",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 40000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpiyfk0b30557a\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
+     "ap",
+     "",
+     "/bin/sh",
+     "-lc",
+     "mkdir -p /data/home/work && cd /data/home/work || exit 1\necho hello\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpiyfk0b30557a\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "ap",
+     "262144"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpizz49fc4e90e\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
+     "ap",
+     "/data/home/work/src",
+     "/bin/sh",
+     "-lc",
+     "ls\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpizz49fc4e90e\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "ap",
+     "262144"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpj1io33587da2\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
+     "ap",
+     "",
+     "/bin/sh",
+     "-lc",
+     "mkdir -p /data/home/work && cd /data/home/work && echo 'Y29uc29sZS5sb2coMSk=' | base64 -d > /data/home/work/run.cjs && node /data/home/work/run.cjs"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpj1io33587da2\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "ap",
+     "262144"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpj328c7ec1136\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
+     "ap",
+     "",
+     "sh",
+     "-c",
+     "mkdir -p -- \"$(dirname -- \"$1\")\" 2>/dev/null || exit 5; test -d \"$1\" && exit 6; exit 0",
+     "sh",
+     "/data/home/work/in/photo.jpg"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpj328c7ec1136\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "ap",
+     "262144"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "PUT",
+   "path": "/v1/machines/m_1/files?path=%2Fdata%2Fhome%2Fwork%2Fin%2Fphoto.jpg&parents=true",
+   "contentType": "application/octet-stream",
+   "key": "ok",
+   "body": {
+    "bytes": 21,
+    "sha256": "0def0041adb95f563cd32c30827eab6cd9c9a87482a618c48db200f2d89d524b"
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpj5dk5b80a5ca\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
+     "ap",
+     "",
+     "sh",
+     "-c",
+     "test -f \"$1\" || exit 3; stat -c %s -- \"$1\"; sha256sum -- \"$1\" 2>/dev/null | cut -d \" \" -f 1",
+     "sh",
+     "/data/home/work/in/photo.jpg"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpj5dk5b80a5ca\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "ap",
+     "262144"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/machines/m_1/files/content?path=%2Fdata%2Fhome%2Fwork%2Fin%2Fphoto.jpg",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "t=\"$HOME/.antiproton/save-$2.tar\"; mkdir -p \"$HOME/.antiproton\" && tar -cf \"$t\" -C \"$(dirname -- \"$1\")\" -- \"$(basename -- \"$1\")\" && printf %s \"$t\"",
+     "ap",
+     "/data/home/work/in",
+     "ef14395e"
+    ],
+    "timeoutSeconds": 600
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/machines/m_1/files/content?path=%2Fdata%2Fhome%2F.antiproton%2Fsave-ef14395e.tar",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "rm",
+     "-f",
+     "--",
+     "/data/home/.antiproton/save-ef14395e.tar"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/snapshots",
+   "idem": "ap-mywpja08-83a8cdf2",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "name": "ap-mywpja08-83a8cdf2",
+    "description": "antiproton t/a py-env"
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/snapshots/sn_1",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/snapshots/sn_1",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/snapshots",
+   "idem": "ap-mywpjdv4-173c6186",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "name": "ap-mywpjdv4-173c6186",
+    "description": "antiproton t/a py-env"
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/snapshots/sn_2",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/snapshots/sn_2",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "method": "DELETE",
+   "path": "/v1/snapshots/sn_1",
+   "idem": "delete-sn_1-mywpjhq0-abd0f51a",
+   "confirm": "sn_1",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "method": "DELETE",
+   "path": "/v1/machines/m_1",
+   "idem": "delete-m_1-mywpjihs-3f6489ae",
+   "confirm": "m_1",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 30000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/operations/op_2?wait=25s",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 40000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines",
+   "idem": "create-h-t-a-mywpjk1c",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "name": "h-t-a-mywpjk1c",
+    "snapshotId": "sn_2",
+    "metadata": {
+     "tenant": "t",
+     "agent": "a",
+     "mount": "sandbox",
+     "machine": "main"
+    },
+    "deleteAfterSeconds": 86400,
+    "maxRunMinutes": 480,
+    "failFast": true,
+    "secrets": [],
+    "envSecrets": [],
+    "vault": false
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/operations/op_3?wait=25s",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 40000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_2/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpjlkwd3f81d42\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
+     "ap",
+     "",
+     "/bin/sh",
+     "-lc",
+     "mkdir -p /data/home/work && cd /data/home/work || exit 1\necho from\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_2/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpjlkwd3f81d42\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "ap",
+     "262144"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/machines/m_2/files/content?path=%2Fdata%2Fhome%2Fwork%2Fout.txt",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "method": "DELETE",
+   "path": "/v1/machines/m_2",
+   "idem": "delete-m_2-mywpjnw8-678cb1d6",
+   "confirm": "m_2",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 30000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/operations/op_4?wait=25s",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 40000
+  },
+  {
+   "stored": [
+    "t/t/a/sandbox/m_1/data/home/work/in/photo.jpg application/octet-stream 21",
+    "t/t/a/sandbox/m_1/data/home/work/in.tar application/x-tar 25",
+    "t/t/a/sandbox/m_2/data/home/work/out.txt application/octet-stream 32"
+   ]
+  },
+  {
+   "record": {
+    "machines": {},
+    "sessions": [
+     {
+      "boxId": "m_2",
+      "startedAt": 1800000032000,
+      "endedAt": 1800000037000,
+      "lastUsedAt": 1800000035000,
+      "execs": 1,
+      "saved": [
+       "artifact://sandbox/m_2/data/home/work/out.txt"
+      ],
+      "credentialRef": "agent"
+     },
+     {
+      "boxId": "m_1",
+      "startedAt": 1800000002000,
+      "endedAt": 1800000030000,
+      "lastUsedAt": 1800000027000,
+      "execs": 3,
+      "saved": [
+       "artifact://sandbox/m_1/data/home/work/in/photo.jpg",
+       "artifact://sandbox/m_1/data/home/work/in.tar"
+      ],
+      "credentialRef": "agent"
+     }
+    ],
+    "envs": [
+     {
+      "name": "py-env",
+      "snapId": "sn_2",
+      "savedAt": 1800000027000,
+      "image": "universal"
+     }
+    ]
+   }
+  }
+ ],
+ "a command handed over as a job, polled, cancelled; one finishing on its own": [
+  {
+   "step": "shell is handed over",
+   "result": {
+    "backgrounded": {
+     "handle": {
+      "boxId": "m_1",
+      "execId": "m_1/jmywpiyfk0b30557a"
+     },
+     "note": "running in the container; its result arrives on its own, and `jobs` lists what is running"
+    }
+   }
+  },
+  {
+   "step": "poll while it runs",
+   "result": {
+    "done": false,
+    "progress": {
+     "state": "running"
+    }
+   }
+  },
+  {
+   "step": "cancel"
+  },
+  {
+   "step": "poll once cancelled",
+   "result": {
+    "done": true,
+    "result": {
+     "state": "cancelled",
+     "exitCode": null,
+     "output": "",
+     "truncated": false,
+     "box": "m_1",
+     "image": "universal"
+    }
+   }
+  },
+  {
+   "step": "a second is handed over",
+   "result": {
+    "backgrounded": {
+     "handle": {
+      "boxId": "m_1",
+      "execId": "m_1/jmywpj3289fc4e90e"
+     },
+     "note": "running in the container; its result arrives on its own, and `jobs` lists what is running"
+    }
+   }
+  },
+  {
+   "step": "poll: running",
+   "result": {
+    "done": true,
+    "result": {
+     "state": "succeeded",
+     "exitCode": 0,
+     "cwd": "/data/home/work",
+     "output": "done",
+     "truncated": false,
+     "box": "m_1",
+     "image": "universal"
+    }
+   }
+  },
+  {
+   "step": "poll: done",
+   "result": {
+    "done": true,
+    "result": {
+     "state": "succeeded",
+     "exitCode": 0,
+     "cwd": "/data/home/work",
+     "output": "done",
+     "truncated": false,
+     "box": "m_1",
+     "image": "universal"
+    }
+   }
+  },
+  {
+   "step": "a directory that does not exist",
+   "result": {
+    "state": "error",
+    "exitCode": null,
+    "error": "failed to start: chdir /nope: no such file or directory",
+    "output": "",
+    "truncated": false,
+    "box": "m_1",
+    "image": "universal",
+    "note": "/nope does not exist in the container; create it first, or leave workdir out"
+   }
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines",
+   "idem": "create-h-t-a-mywpiww0",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "name": "h-t-a-mywpiww0",
+    "templateId": "universal",
+    "vcpus": 2,
+    "memMiB": 4096,
+    "metadata": {
+     "tenant": "t",
+     "agent": "a",
+     "mount": "sandbox",
+     "machine": "main"
+    },
+    "deleteAfterSeconds": 86400,
+    "maxRunMinutes": 480,
+    "failFast": true,
+    "secrets": [],
+    "envSecrets": [],
+    "vault": false
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/operations/op_1?wait=25s",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 40000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpiyfk0b30557a\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
+     "ap",
+     "",
+     "/bin/sh",
+     "-lc",
+     "mkdir -p /data/home/work && cd /data/home/work || exit 1\nsleep 100\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpiyfk0b30557a\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "ap",
+     "262144"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpiyfk0b30557a\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "ap",
+     "262144"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpiyfk0b30557a\" \"$@\"; d=$1; p=$(cat \"$d/pid\" 2>/dev/null) || exit 3; [ -f \"$d/rc\" ] && exit 0; : > \"$d/killed\"; k() { sudo -n kill \"$@\" 2>/dev/null || kill \"$@\" 2>/dev/null; }; k -TERM -- \"-$p\"; i=0; while [ -d \"/proc/$p\" ] && [ $i -lt 20 ]; do sleep 0.1; i=$((i+1)); done; k -KILL -- \"-$p\"; exit 0",
+     "ap"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpiyfk0b30557a\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "ap",
+     "262144"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpiyfk0b30557a\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "ap",
+     "262144"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpj3289fc4e90e\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
+     "ap",
+     "",
+     "/bin/sh",
+     "-lc",
+     "mkdir -p /data/home/work && cd /data/home/work || exit 1\nsleep 2\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpj3289fc4e90e\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "ap",
+     "262144"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpj3289fc4e90e\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "ap",
+     "262144"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpj3289fc4e90e\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "ap",
+     "262144"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpj65c33587da2\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
+     "ap",
+     "/nope",
+     "/bin/sh",
+     "-lc",
+     "pwd\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpj65c33587da2\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "ap",
+     "262144"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "record": {
+    "machines": {
+     "main": {
+      "boxId": "m_1",
+      "createdAt": 1800000002000,
+      "lastUsedAt": 1800000013000,
+      "execs": 3,
+      "saved": [],
+      "deleteAt": 1800086401000,
+      "credentialRef": "agent",
+      "image": "universal"
+     }
+    },
+    "sessions": []
+   }
+  }
+ ],
+ "idle: paused, resumed by a call; paused, switched off, started by a call; deleted on the stopped schedule": [
+  {
+   "step": "shell",
+   "result": {
+    "state": "succeeded",
+    "exitCode": 0,
+    "cwd": "/data/home/work",
+    "output": "hello",
+    "truncated": false,
+    "box": "m_1",
+    "image": "universal"
+   }
+  },
+  {
+   "step": "idle release pauses it",
+   "result": {
+    "id": "m_1",
+    "startedAt": 1800000002000,
+    "endedAt": 1800000006000,
+    "status": "freed"
+   }
+  },
+  {
+   "step": "activities while paused",
+   "result": [
+    {
+     "live": {
+      "id": "m_1",
+      "startedAt": 1800000002000,
+      "lastUsedAt": 1800000006000,
+      "credentialRef": "agent",
+      "lease": {
+       "maxMs": 1800000,
+       "warnMs": 0
+      }
+     },
+     "quietUntil": null,
+     "billing": "paused: no compute is billed; its memory and disk are kept"
+    }
+   ]
+  },
+  {
+   "step": "machines while paused",
+   "result": {
+    "machines": [
+     {
+      "machine": "main",
+      "state": "paused",
+      "box": "m_1",
+      "image": "universal",
+      "created": "2027-01-15T08:00:02.000Z",
+      "lastUsed": "2027-01-15T08:00:03.000Z",
+      "paused": "2027-01-15T08:00:06.000Z",
+      "cwd": "/data/home/work",
+      "switchedOffAfter": "2027-01-15T08:30:06.000Z",
+      "deletedBy": "2027-01-16T08:00:01.000Z"
+     }
+    ],
+    "limit": 3,
+    "note": "times are when it happens if nothing uses the machine before then; any use moves them. 1 of at most 3 exist; a switched-off one counts until it is released."
+   }
+  },
+  {
+   "step": "the workspace view does not wake it",
+   "result": {
+    "running": false
+   }
+  },
+  {
+   "step": "shell resumes it",
+   "result": {
+    "state": "succeeded",
+    "exitCode": 0,
+    "cwd": "/data/home/work",
+    "output": "hello",
+    "truncated": false,
+    "box": "m_1",
+    "image": "universal"
+   }
+  },
+  {
+   "step": "idle release pauses it again",
+   "result": {
+    "id": "m_1",
+    "startedAt": 1800000006000,
+    "endedAt": 1800000015000,
+    "status": "freed"
+   }
+  },
+  {
+   "step": "the next idle step switches it off",
+   "result": {
+    "id": "m_1",
+    "startedAt": 1800000015000,
+    "endedAt": 1800000020000,
+    "status": "freed"
+   }
+  },
+  {
+   "step": "activities while off",
+   "result": [
+    {
+     "live": {
+      "id": "m_1",
+      "startedAt": 1800000006000,
+      "lastUsedAt": 1800000020000,
+      "credentialRef": "agent",
+      "lease": {
+       "maxMs": 86381000,
+       "warnMs": 43190500,
+       "consequence": "the stopped machine and everything on its disk will be deleted",
+       "advice": "Before then, `save` the files you need or `keep` the environment, or run anything in it to switch it back on.",
+       "maxPostponeMinutes": 1439
+      }
+     },
+     "quietUntil": null,
+     "billing": "stopped: no compute is billed; only its disk is kept until it is deleted"
+    }
+   ]
+  },
+  {
+   "step": "shell starts it",
+   "result": {
+    "state": "succeeded",
+    "exitCode": 0,
+    "cwd": "/data/home/work",
+    "output": "hello",
+    "truncated": false,
+    "box": "m_1",
+    "image": "universal"
+   }
+  },
+  {
+   "step": "idle: pause",
+   "result": {
+    "id": "m_1",
+    "startedAt": 1800000020000,
+    "endedAt": 1800000029000,
+    "status": "freed"
+   }
+  },
+  {
+   "step": "idle: switch off",
+   "result": {
+    "id": "m_1",
+    "startedAt": 1800000029000,
+    "endedAt": 1800000034000,
+    "status": "freed"
+   }
+  },
+  {
+   "step": "idle: delete",
+   "result": {
+    "id": "m_1",
+    "startedAt": 1800000034000,
+    "endedAt": 1800000036000,
+    "status": "freed"
+   }
+  },
+  {
+   "step": "usage",
+   "result": [
+    {
+     "id": "m_1",
+     "startedAt": 1800000020000,
+     "endedAt": 1800000029000,
+     "lastUsedAt": 1800000026000,
+     "uses": 1,
+     "kept": [],
+     "credentialRef": "agent"
+    },
+    {
+     "id": "m_1",
+     "startedAt": 1800000006000,
+     "endedAt": 1800000015000,
+     "lastUsedAt": 1800000012000,
+     "uses": 1,
+     "kept": [],
+     "credentialRef": "agent"
+    },
+    {
+     "id": "m_1",
+     "startedAt": 1800000002000,
+     "endedAt": 1800000006000,
+     "lastUsedAt": 1800000003000,
+     "uses": 1,
+     "kept": [],
+     "credentialRef": "agent"
+    }
+   ]
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines",
+   "idem": "create-h-t-a-mywpiww0",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "name": "h-t-a-mywpiww0",
+    "templateId": "universal",
+    "vcpus": 2,
+    "memMiB": 4096,
+    "metadata": {
+     "tenant": "t",
+     "agent": "a",
+     "mount": "sandbox",
+     "machine": "main"
+    },
+    "deleteAfterSeconds": 86400,
+    "maxRunMinutes": 480,
+    "failFast": true,
+    "secrets": [],
+    "envSecrets": [],
+    "vault": false
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/operations/op_1?wait=25s",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 40000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpiyfk0b30557a\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
+     "ap",
+     "",
+     "/bin/sh",
+     "-lc",
+     "mkdir -p /data/home/work && cd /data/home/work || exit 1\necho hi\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpiyfk0b30557a\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "ap",
+     "262144"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/suspend",
+   "idem": "suspend-m_1-mywpizz4-9fc4e90e",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/operations/op_2?wait=25s",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 40000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/machines/m_1",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/resume",
+   "idem": "resume-m_1-mywpj2ag-33587da2",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/operations/op_3?wait=25s",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 40000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/machines/m_1",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpj5dkc7ec1136\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
+     "ap",
+     "/data/home/work",
+     "/bin/sh",
+     "-lc",
+     "echo back\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpj5dkc7ec1136\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "ap",
+     "262144"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/suspend",
+   "idem": "suspend-m_1-mywpj6x4-5b80a5ca",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/operations/op_4?wait=25s",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 40000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/machines/m_1",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/resume",
+   "idem": "resume-m_1-mywpj98g-ef14395e",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/operations/op_5?wait=25s",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 40000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/stop",
+   "idem": "stop-m_1-mywpjas0-83a8cdf2",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "timeoutSeconds": 10
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/operations/op_6?wait=25s",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 40000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/machines/m_1",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/start",
+   "idem": "start-m_1-mywpjd3c-173c6186",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/operations/op_7?wait=25s",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 40000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/machines/m_1",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpjg6gabd0f51a\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
+     "ap",
+     "/data/home/work",
+     "/bin/sh",
+     "-lc",
+     "echo started\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpjg6gabd0f51a\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "ap",
+     "262144"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/suspend",
+   "idem": "suspend-m_1-mywpjhq0-3f6489ae",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/operations/op_8?wait=25s",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 40000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/machines/m_1",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/resume",
+   "idem": "resume-m_1-mywpjk1c-d3f81d42",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/operations/op_9?wait=25s",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 40000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/stop",
+   "idem": "stop-m_1-mywpjlkw-678cb1d6",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "timeoutSeconds": 10
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/operations/op_10?wait=25s",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 40000
+  },
+  {
+   "method": "DELETE",
+   "path": "/v1/machines/m_1",
+   "idem": "delete-m_1-mywpjn4g-fb20456a",
+   "confirm": "m_1",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 30000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/operations/op_11?wait=25s",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 40000
+  },
+  {
+   "record": {
+    "machines": {},
+    "sessions": [
+     {
+      "boxId": "m_1",
+      "startedAt": 1800000020000,
+      "endedAt": 1800000029000,
+      "lastUsedAt": 1800000026000,
+      "execs": 1,
+      "saved": [],
+      "credentialRef": "agent"
+     },
+     {
+      "boxId": "m_1",
+      "startedAt": 1800000006000,
+      "endedAt": 1800000015000,
+      "lastUsedAt": 1800000012000,
+      "execs": 1,
+      "saved": [],
+      "credentialRef": "agent"
+     },
+     {
+      "boxId": "m_1",
+      "startedAt": 1800000002000,
+      "endedAt": 1800000006000,
+      "lastUsedAt": 1800000003000,
+      "execs": 1,
+      "saved": [],
+      "credentialRef": "agent"
+     }
+    ]
+   }
+  }
+ ],
+ "a create InstaBox has no room for is asked again, with a new key after a failed operation": [
+  {
+   "step": "shell after one no_capacity",
+   "result": {
+    "state": "succeeded",
+    "exitCode": 0,
+    "cwd": "/data/home/work",
+    "output": "hello",
+    "truncated": false,
+    "box": "m_1",
+    "image": "universal"
+   }
+  },
+  {
+   "step": "release",
+   "result": {
+    "released": true,
+    "box": "m_1",
+    "liveMs": 4000,
+    "saved": [],
+    "__ap_lease__": {
+     "id": "m_1",
+     "startedAt": 1800000063000,
+     "endedAt": 1800000067000,
+     "status": "freed"
+    },
+    "note": "the container and its files are gone; anything saved above is not"
+   }
+  },
+  {
+   "step": "shell after a gateway error on the create",
+   "result": {
+    "state": "succeeded",
+    "exitCode": 0,
+    "cwd": "/data/home/work",
+    "output": "hello",
+    "truncated": false,
+    "box": "m_2",
+    "image": "universal"
+   }
+  },
+  {
+   "step": "release",
+   "result": {
+    "released": true,
+    "box": "m_2",
+    "liveMs": 4000,
+    "saved": [],
+    "__ap_lease__": {
+     "id": "m_2",
+     "startedAt": 1800000072000,
+     "endedAt": 1800000076000,
+     "status": "freed"
+    },
+    "note": "the container and its files are gone; anything saved above is not"
+   }
+  },
+  {
+   "step": "shell after a failed create operation",
+   "result": {
+    "state": "succeeded",
+    "exitCode": 0,
+    "cwd": "/data/home/work",
+    "output": "hello",
+    "truncated": false,
+    "box": "m_4",
+    "image": "universal"
+   }
+  },
+  {
+   "step": "release",
+   "result": {
+    "released": true,
+    "box": "m_4",
+    "liveMs": 4000,
+    "saved": [],
+    "__ap_lease__": {
+     "id": "m_4",
+     "startedAt": 1800000110000,
+     "endedAt": 1800000114000,
+     "status": "freed"
+    },
+    "note": "the container and its files are gone; anything saved above is not"
+   }
+  },
+  {
+   "step": "shell when there is never room",
+   "threw": "InstaBox POST /v1/machines -> 503: no_capacity: no host has room"
+  },
+  {
+   "step": "shell when rate limited throughout",
+   "threw": "InstaBox POST /v1/machines -> 429: rate_limited: 3 starts a minute"
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines",
+   "idem": "create-h-t-a-mywpiww0",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "name": "h-t-a-mywpiww0",
+    "templateId": "universal",
+    "vcpus": 2,
+    "memMiB": 4096,
+    "metadata": {
+     "tenant": "t",
+     "agent": "a",
+     "mount": "sandbox",
+     "machine": "main"
+    },
+    "deleteAfterSeconds": 86400,
+    "maxRunMinutes": 480,
+    "failFast": true,
+    "secrets": [],
+    "envSecrets": [],
+    "vault": false
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines",
+   "idem": "create-h-t-a-mywpiww0-1",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "name": "h-t-a-mywpiww0",
+    "templateId": "universal",
+    "vcpus": 2,
+    "memMiB": 4096,
+    "metadata": {
+     "tenant": "t",
+     "agent": "a",
+     "mount": "sandbox",
+     "machine": "main"
+    },
+    "deleteAfterSeconds": 86400,
+    "maxRunMinutes": 480,
+    "failFast": true,
+    "secrets": [],
+    "envSecrets": [],
+    "vault": false
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/operations/op_1?wait=25s",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 40000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpk9i00b30557a\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
+     "ap",
+     "",
+     "/bin/sh",
+     "-lc",
+     "mkdir -p /data/home/work && cd /data/home/work || exit 1\necho hi\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpk9i00b30557a\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "ap",
+     "262144"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "DELETE",
+   "path": "/v1/machines/m_1",
+   "idem": "delete-m_1-mywpkb1k-9fc4e90e",
+   "confirm": "m_1",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 30000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/operations/op_2?wait=25s",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 40000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines",
+   "idem": "create-h-t-a-mywpkcl4",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "name": "h-t-a-mywpkcl4",
+    "templateId": "universal",
+    "vcpus": 2,
+    "memMiB": 4096,
+    "metadata": {
+     "tenant": "t",
+     "agent": "a",
+     "mount": "sandbox",
+     "machine": "main"
+    },
+    "deleteAfterSeconds": 86400,
+    "maxRunMinutes": 480,
+    "failFast": true,
+    "secrets": [],
+    "envSecrets": [],
+    "vault": false
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines",
+   "idem": "create-h-t-a-mywpkcl4",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "name": "h-t-a-mywpkcl4",
+    "templateId": "universal",
+    "vcpus": 2,
+    "memMiB": 4096,
+    "metadata": {
+     "tenant": "t",
+     "agent": "a",
+     "mount": "sandbox",
+     "machine": "main"
+    },
+    "deleteAfterSeconds": 86400,
+    "maxRunMinutes": 480,
+    "failFast": true,
+    "secrets": [],
+    "envSecrets": [],
+    "vault": false
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/operations/op_3?wait=25s",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 40000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_2/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpkgg033587da2\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
+     "ap",
+     "",
+     "/bin/sh",
+     "-lc",
+     "mkdir -p /data/home/work && cd /data/home/work || exit 1\necho hi\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_2/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpkgg033587da2\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "ap",
+     "262144"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "DELETE",
+   "path": "/v1/machines/m_2",
+   "idem": "delete-m_2-mywpkhzk-c7ec1136",
+   "confirm": "m_2",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 30000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/operations/op_4?wait=25s",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 40000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines",
+   "idem": "create-h-t-a-mywpkjj4",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "name": "h-t-a-mywpkjj4",
+    "templateId": "universal",
+    "vcpus": 2,
+    "memMiB": 4096,
+    "metadata": {
+     "tenant": "t",
+     "agent": "a",
+     "mount": "sandbox",
+     "machine": "main"
+    },
+    "deleteAfterSeconds": 86400,
+    "maxRunMinutes": 480,
+    "failFast": true,
+    "secrets": [],
+    "envSecrets": [],
+    "vault": false
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/operations/op_5?wait=25s",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 40000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines",
+   "idem": "create-h-t-a-mywpkjj4-1",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "name": "h-t-a-mywpkjj4",
+    "templateId": "universal",
+    "vcpus": 2,
+    "memMiB": 4096,
+    "metadata": {
+     "tenant": "t",
+     "agent": "a",
+     "mount": "sandbox",
+     "machine": "main"
+    },
+    "deleteAfterSeconds": 86400,
+    "maxRunMinutes": 480,
+    "failFast": true,
+    "secrets": [],
+    "envSecrets": [],
+    "vault": false
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/operations/op_6?wait=25s",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 40000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_4/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpl9rk5b80a5ca\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
+     "ap",
+     "",
+     "/bin/sh",
+     "-lc",
+     "mkdir -p /data/home/work && cd /data/home/work || exit 1\necho hi\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_4/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpl9rk5b80a5ca\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "ap",
+     "262144"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "DELETE",
+   "path": "/v1/machines/m_4",
+   "idem": "delete-m_4-mywplbb4-ef14395e",
+   "confirm": "m_4",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 30000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/operations/op_7?wait=25s",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 40000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines",
+   "idem": "create-h-t-a-mywplcuo",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "name": "h-t-a-mywplcuo",
+    "templateId": "universal",
+    "vcpus": 2,
+    "memMiB": 4096,
+    "metadata": {
+     "tenant": "t",
+     "agent": "a",
+     "mount": "sandbox",
+     "machine": "main"
+    },
+    "deleteAfterSeconds": 86400,
+    "maxRunMinutes": 480,
+    "failFast": true,
+    "secrets": [],
+    "envSecrets": [],
+    "vault": false
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines",
+   "idem": "create-h-t-a-mywplcuo-1",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "name": "h-t-a-mywplcuo",
+    "templateId": "universal",
+    "vcpus": 2,
+    "memMiB": 4096,
+    "metadata": {
+     "tenant": "t",
+     "agent": "a",
+     "mount": "sandbox",
+     "machine": "main"
+    },
+    "deleteAfterSeconds": 86400,
+    "maxRunMinutes": 480,
+    "failFast": true,
+    "secrets": [],
+    "envSecrets": [],
+    "vault": false
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines",
+   "idem": "create-h-t-a-mywplcuo-2",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "name": "h-t-a-mywplcuo",
+    "templateId": "universal",
+    "vcpus": 2,
+    "memMiB": 4096,
+    "metadata": {
+     "tenant": "t",
+     "agent": "a",
+     "mount": "sandbox",
+     "machine": "main"
+    },
+    "deleteAfterSeconds": 86400,
+    "maxRunMinutes": 480,
+    "failFast": true,
+    "secrets": [],
+    "envSecrets": [],
+    "vault": false
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines",
+   "idem": "create-h-t-a-mywpnzrc",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "name": "h-t-a-mywpnzrc",
+    "templateId": "universal",
+    "vcpus": 2,
+    "memMiB": 4096,
+    "metadata": {
+     "tenant": "t",
+     "agent": "a",
+     "mount": "sandbox",
+     "machine": "main"
+    },
+    "deleteAfterSeconds": 86400,
+    "maxRunMinutes": 480,
+    "failFast": true,
+    "secrets": [],
+    "envSecrets": [],
+    "vault": false
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines",
+   "idem": "create-h-t-a-mywpnzrc-1",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "name": "h-t-a-mywpnzrc",
+    "templateId": "universal",
+    "vcpus": 2,
+    "memMiB": 4096,
+    "metadata": {
+     "tenant": "t",
+     "agent": "a",
+     "mount": "sandbox",
+     "machine": "main"
+    },
+    "deleteAfterSeconds": 86400,
+    "maxRunMinutes": 480,
+    "failFast": true,
+    "secrets": [],
+    "envSecrets": [],
+    "vault": false
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines",
+   "idem": "create-h-t-a-mywpnzrc-2",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "name": "h-t-a-mywpnzrc",
+    "templateId": "universal",
+    "vcpus": 2,
+    "memMiB": 4096,
+    "metadata": {
+     "tenant": "t",
+     "agent": "a",
+     "mount": "sandbox",
+     "machine": "main"
+    },
+    "deleteAfterSeconds": 86400,
+    "maxRunMinutes": 480,
+    "failFast": true,
+    "secrets": [],
+    "envSecrets": [],
+    "vault": false
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "record": {
+    "machines": {},
+    "sessions": [
+     {
+      "boxId": "m_4",
+      "startedAt": 1800000110000,
+      "endedAt": 1800000114000,
+      "lastUsedAt": 1800000111000,
+      "execs": 1,
+      "saved": [],
+      "credentialRef": "agent"
+     },
+     {
+      "boxId": "m_2",
+      "startedAt": 1800000072000,
+      "endedAt": 1800000076000,
+      "lastUsedAt": 1800000073000,
+      "execs": 1,
+      "saved": [],
+      "credentialRef": "agent"
+     },
+     {
+      "boxId": "m_1",
+      "startedAt": 1800000063000,
+      "endedAt": 1800000067000,
+      "lastUsedAt": 1800000064000,
+      "execs": 1,
+      "saved": [],
+      "credentialRef": "agent"
+     }
+    ]
+   }
+  }
+ ],
+ "a machine InstaBox paused on its own is resumed, and the command sent once more": [
+  {
+   "step": "shell",
+   "result": {
+    "state": "succeeded",
+    "exitCode": 0,
+    "cwd": "/data/home/work",
+    "output": "hello",
+    "truncated": false,
+    "box": "m_1",
+    "image": "universal"
+   }
+  },
+  {
+   "step": "shell finds it paused",
+   "result": {
+    "state": "succeeded",
+    "exitCode": 0,
+    "cwd": "/data/home/work",
+    "output": "hello",
+    "truncated": false,
+    "box": "m_1",
+    "image": "universal"
+   }
+  },
+  {
+   "step": "save finds it paused",
+   "result": {
+    "path": "/data/home/work/out.txt",
+    "ref": "artifact://sandbox/m_1/data/home/work/out.txt",
+    "bytes": 32,
+    "note": "kept outside the box, for later. A copy outliving the container is not a reason to release it early: it is handed back when the turn ends anyway, and until then it is still the machine you are working on."
+   }
+  },
+  {
+   "step": "an exec answered by a gateway error",
+   "threw": "InstaBox POST /v1/machines/m_1/exec -> 502: <html>bad gateway</html>"
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines",
+   "idem": "create-h-t-a-mywpiww0",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "name": "h-t-a-mywpiww0",
+    "templateId": "universal",
+    "vcpus": 2,
+    "memMiB": 4096,
+    "metadata": {
+     "tenant": "t",
+     "agent": "a",
+     "mount": "sandbox",
+     "machine": "main"
+    },
+    "deleteAfterSeconds": 86400,
+    "maxRunMinutes": 480,
+    "failFast": true,
+    "secrets": [],
+    "envSecrets": [],
+    "vault": false
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/operations/op_1?wait=25s",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 40000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpiyfk0b30557a\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
+     "ap",
+     "",
+     "/bin/sh",
+     "-lc",
+     "mkdir -p /data/home/work && cd /data/home/work || exit 1\necho hi\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpiyfk0b30557a\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "ap",
+     "262144"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpizz49fc4e90e\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
+     "ap",
+     "/data/home/work",
+     "/bin/sh",
+     "-lc",
+     "echo again\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/machines/m_1",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/resume",
+   "idem": "resume-m_1-mywpj1io-33587da2",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/operations/op_2?wait=25s",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 40000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/machines/m_1",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpizz49fc4e90e\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
+     "ap",
+     "/data/home/work",
+     "/bin/sh",
+     "-lc",
+     "echo again\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpizz49fc4e90e\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "ap",
+     "262144"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/machines/m_1/files/content?path=%2Fdata%2Fhome%2Fwork%2Fout.txt",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/machines/m_1",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/resume",
+   "idem": "resume-m_1-mywpj7ow-c7ec1136",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/operations/op_3?wait=25s",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 40000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/machines/m_1",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/machines/m_1/files/content?path=%2Fdata%2Fhome%2Fwork%2Fout.txt",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpjbjs5b80a5ca\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
+     "ap",
+     "/data/home/work",
+     "/bin/sh",
+     "-lc",
+     "echo once\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "record": {
+    "machines": {
+     "main": {
+      "boxId": "m_1",
+      "createdAt": 1800000002000,
+      "lastUsedAt": 1800000019000,
+      "execs": 2,
+      "saved": [
+       "artifact://sandbox/m_1/data/home/work/out.txt"
+      ],
+      "deleteAt": 1800086401000,
+      "credentialRef": "agent",
+      "image": "universal",
+      "cwd": "/data/home/work"
+     }
+    },
+    "sessions": []
+   }
+  }
+ ],
+ "a release deletes with the machine's own id as confirmation; refusals keep the record": [
+  {
+   "step": "shell",
+   "result": {
+    "state": "succeeded",
+    "exitCode": 0,
+    "cwd": "/data/home/work",
+    "output": "hello",
+    "truncated": false,
+    "box": "m_1",
+    "image": "universal"
+   }
+  },
+  {
+   "step": "release refused by an outage",
+   "threw": "InstaBox box m_1 not released: InstaBox DELETE /v1/machines/m_1 -> 503: host_unavailable: try later",
+   "released": {
+    "id": "m_1",
+    "startedAt": 1800000002000,
+    "endedAt": 1800000005000,
+    "status": "error",
+    "error": "InstaBox DELETE /v1/machines/m_1 -> 503: host_unavailable: try later"
+   }
+  },
+  {
+   "step": "release refused for the confirmation",
+   "result": {
+    "released": false,
+    "box": "m_1",
+    "error": "InstaBox DELETE /v1/machines/m_1 -> 409: delete_confirmation_required: confirm",
+    "saved": []
+   }
+  },
+  {
+   "step": "release",
+   "result": {
+    "released": true,
+    "box": "m_1",
+    "liveMs": 6000,
+    "saved": [],
+    "__ap_lease__": {
+     "id": "m_1",
+     "startedAt": 1800000002000,
+     "endedAt": 1800000008000,
+     "status": "freed"
+    },
+    "note": "the container and its files are gone; anything saved above is not"
+   }
+  },
+  {
+   "step": "shell makes a new machine",
+   "result": {
+    "state": "succeeded",
+    "exitCode": 0,
+    "cwd": "/data/home/work",
+    "output": "hello",
+    "truncated": false,
+    "box": "m_2",
+    "image": "universal"
+   }
+  },
+  {
+   "step": "already gone is believed for the key that made it",
+   "result": {
+    "id": "m_2",
+    "startedAt": 1800000010000,
+    "endedAt": 1800000013000,
+    "status": "freed"
+   }
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines",
+   "idem": "create-h-t-a-mywpiww0",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "name": "h-t-a-mywpiww0",
+    "templateId": "universal",
+    "vcpus": 2,
+    "memMiB": 4096,
+    "metadata": {
+     "tenant": "t",
+     "agent": "a",
+     "mount": "sandbox",
+     "machine": "main"
+    },
+    "deleteAfterSeconds": 86400,
+    "maxRunMinutes": 480,
+    "failFast": true,
+    "secrets": [],
+    "envSecrets": [],
+    "vault": false
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/operations/op_1?wait=25s",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 40000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpiyfk0b30557a\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
+     "ap",
+     "",
+     "/bin/sh",
+     "-lc",
+     "mkdir -p /data/home/work && cd /data/home/work || exit 1\necho hi\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpiyfk0b30557a\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "ap",
+     "262144"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "DELETE",
+   "path": "/v1/machines/m_1",
+   "idem": "delete-m_1-mywpizz4-9fc4e90e",
+   "confirm": "m_1",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 30000
+  },
+  {
+   "method": "DELETE",
+   "path": "/v1/machines/m_1",
+   "idem": "delete-m_1-mywpj0qw-33587da2",
+   "confirm": "m_1",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 30000
+  },
+  {
+   "method": "DELETE",
+   "path": "/v1/machines/m_1",
+   "idem": "delete-m_1-mywpj1io-c7ec1136",
+   "confirm": "m_1",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 30000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/operations/op_2?wait=25s",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 40000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines",
+   "idem": "create-h-t-a-mywpj328",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "name": "h-t-a-mywpj328",
+    "templateId": "universal",
+    "vcpus": 2,
+    "memMiB": 4096,
+    "metadata": {
+     "tenant": "t",
+     "agent": "a",
+     "mount": "sandbox",
+     "machine": "main"
+    },
+    "deleteAfterSeconds": 86400,
+    "maxRunMinutes": 480,
+    "failFast": true,
+    "secrets": [],
+    "envSecrets": [],
+    "vault": false
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/operations/op_3?wait=25s",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 40000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_2/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpj4ls5b80a5ca\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
+     "ap",
+     "",
+     "/bin/sh",
+     "-lc",
+     "mkdir -p /data/home/work && cd /data/home/work || exit 1\necho hi\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_2/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpj4ls5b80a5ca\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "ap",
+     "262144"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "DELETE",
+   "path": "/v1/machines/m_2",
+   "idem": "delete-m_2-mywpj65c-ef14395e",
+   "confirm": "m_2",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 30000
+  },
+  {
+   "record": {
+    "machines": {},
+    "sessions": [
+     {
+      "boxId": "m_2",
+      "startedAt": 1800000010000,
+      "endedAt": 1800000013000,
+      "lastUsedAt": 1800000011000,
+      "execs": 1,
+      "saved": [],
+      "credentialRef": "agent"
+     },
+     {
+      "boxId": "m_1",
+      "startedAt": 1800000002000,
+      "endedAt": 1800000008000,
+      "lastUsedAt": 1800000003000,
+      "execs": 1,
+      "saved": [],
+      "credentialRef": "agent"
+     }
+    ]
+   }
+  }
+ ],
+ "a create whose name is taken adopts the machine found by its labels": [
+  {
+   "step": "shell whose create answered conflict",
+   "result": {
+    "state": "succeeded",
+    "exitCode": 0,
+    "cwd": "/data/home/work",
+    "output": "hello",
+    "truncated": false,
+    "box": "m_1",
+    "image": "universal"
+   }
+  },
+  {
+   "step": "release",
+   "result": {
+    "released": true,
+    "box": "m_1",
+    "liveMs": 6000,
+    "saved": [],
+    "__ap_lease__": {
+     "id": "m_1",
+     "startedAt": 1800000002000,
+     "endedAt": 1800000008000,
+     "status": "freed"
+    },
+    "note": "the container and its files are gone; anything saved above is not"
+   }
+  },
+  {
+   "step": "shell whose create conflicts and nothing carries its labels",
+   "threw": "InstaBox POST /v1/machines -> 409: operation_conflict: name taken"
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines",
+   "idem": "create-h-t-a-mywpiww0",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "name": "h-t-a-mywpiww0",
+    "templateId": "universal",
+    "vcpus": 2,
+    "memMiB": 4096,
+    "metadata": {
+     "tenant": "t",
+     "agent": "a",
+     "mount": "sandbox",
+     "machine": "main"
+    },
+    "deleteAfterSeconds": 86400,
+    "maxRunMinutes": 480,
+    "failFast": true,
+    "secrets": [],
+    "envSecrets": [],
+    "vault": false
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/machines?metadata=tenant%3At&metadata=agent%3Aa&metadata=mount%3Asandbox&metadata=machine%3Amain",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpiyfk0b30557a\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
+     "ap",
+     "",
+     "/bin/sh",
+     "-lc",
+     "mkdir -p /data/home/work && cd /data/home/work || exit 1\necho hi\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/machines/m_1",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpiyfk0b30557a\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
+     "ap",
+     "",
+     "/bin/sh",
+     "-lc",
+     "mkdir -p /data/home/work && cd /data/home/work || exit 1\necho hi\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpiyfk0b30557a\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "ap",
+     "262144"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "DELETE",
+   "path": "/v1/machines/m_1",
+   "idem": "delete-m_1-mywpj1io-9fc4e90e",
+   "confirm": "m_1",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 30000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/operations/op_2?wait=25s",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 40000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines",
+   "idem": "create-h-t-a-mywpj328",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "name": "h-t-a-mywpj328",
+    "templateId": "universal",
+    "vcpus": 2,
+    "memMiB": 4096,
+    "metadata": {
+     "tenant": "t",
+     "agent": "a",
+     "mount": "sandbox",
+     "machine": "main"
+    },
+    "deleteAfterSeconds": 86400,
+    "maxRunMinutes": 480,
+    "failFast": true,
+    "secrets": [],
+    "envSecrets": [],
+    "vault": false
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/machines?metadata=tenant%3At&metadata=agent%3Aa&metadata=mount%3Asandbox&metadata=machine%3Amain",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "record": {
+    "machines": {},
+    "sessions": [
+     {
+      "boxId": "m_1",
+      "startedAt": 1800000002000,
+      "endedAt": 1800000008000,
+      "lastUsedAt": 1800000005000,
+      "execs": 1,
+      "saved": [],
+      "credentialRef": "agent"
+     }
+    ]
+   }
+  }
+ ],
+ "network none, accounts, credentials and the account": [
+  {
+   "step": "shell with no network",
+   "result": {
+    "state": "succeeded",
+    "exitCode": 0,
+    "cwd": "/data/home/work",
+    "output": "hello",
+    "truncated": false,
+    "box": "m_1",
+    "image": "universal"
+   }
+  },
+  {
+   "step": "good key",
+   "result": {
+    "ok": true,
+    "account": "instabox:user:42"
+   }
+  },
+  {
+   "step": "run9 keys on an InstaBox mount",
+   "result": {
+    "ok": false,
+    "kind": "rejected",
+    "reason": "InstaBox needs an object with apiKey, as JSON"
+   }
+  },
+  {
+   "step": "account",
+   "result": "instabox:user:42"
+  },
+  {
+   "step": "check when /v1/me answers 401",
+   "result": {
+    "ok": false,
+    "kind": "rejected",
+    "reason": "InstaBox rejected this key: invalid_key"
+   }
+  },
+  {
+   "step": "account when /v1/me answers 401",
+   "result": null
+  },
+  {
+   "step": "check when /v1/me answers 503",
+   "result": {
+    "ok": false,
+    "kind": "unreachable",
+    "reason": "InstaBox answered 503: {\"error\":{\"code\":\"unavailable\",\"message\":\"no\"}}"
+   }
+  },
+  {
+   "step": "account when /v1/me answers 503",
+   "threw": "InstaBox answered 503 to /v1/me"
+  },
+  {
+   "configProblems": [
+    "shape must read like 2c4g (vCPUs, then GiB of memory) on InstaBox; got \"big\"",
+    "endpoint names run9, and this mount asks for InstaBox; leave it out for api.instabox.sh",
+    "maxLifetimeHours must be between 1 and 24: InstaBox deletes a machine at most a day after it is created",
+    null,
+    null
+   ]
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines",
+   "idem": "create-h-t-a-mywpiww0",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "name": "h-t-a-mywpiww0",
+    "templateId": "universal",
+    "vcpus": 2,
+    "memMiB": 4096,
+    "metadata": {
+     "tenant": "t",
+     "agent": "a",
+     "mount": "sandbox",
+     "machine": "main"
+    },
+    "deleteAfterSeconds": 86400,
+    "maxRunMinutes": 480,
+    "failFast": true,
+    "secrets": [],
+    "envSecrets": [],
+    "vault": false
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/operations/op_1?wait=25s",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 40000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpiyfk0b30557a\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
+     "ap",
+     "",
+     "unshare",
+     "--user",
+     "--map-current-user",
+     "--net",
+     "--",
+     "/bin/sh",
+     "-lc",
+     "mkdir -p /data/home/work && cd /data/home/work || exit 1\ncurl example.com\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpiyfk0b30557a\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "ap",
+     "262144"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/me",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/me",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/me",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/me",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/me",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/me",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "record": {
+    "machines": {
+     "main": {
+      "boxId": "m_1",
+      "createdAt": 1800000002000,
+      "lastUsedAt": 1800000003000,
+      "execs": 1,
+      "saved": [],
+      "deleteAt": 1800086401000,
+      "credentialRef": "agent",
+      "image": "universal",
+      "cwd": "/data/home/work"
+     }
+    },
+    "sessions": []
+   }
+  }
+ ]
+}
