@@ -563,6 +563,9 @@ export const instabox: SandboxBackend = {
     backgroundExec: "emulated",
     publicPorts: true,
     egressPolicy: false,
+    // From InstaBox pricing (https://instabox.sh/llms-full.txt): runtime per second while running; a paused or
+    // stopped machine pays storage only.
+    billing: "running",
     // `usage()` reads InstaBox's own meter, but held time is still the plugin's estimate until metering reads it.
     usageMeter: "estimate",
     boxSecrets: false,

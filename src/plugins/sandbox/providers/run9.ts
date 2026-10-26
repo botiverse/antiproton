@@ -407,6 +407,7 @@ export const run9: SandboxBackend = {
     backgroundExec: "native",
     publicPorts: false,
     egressPolicy: false,
+    billing: "exists",
     usageMeter: "estimate",
     boxSecrets: true,
   },

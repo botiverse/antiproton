@@ -56,6 +56,8 @@ export interface ProviderCaps {
   publicPorts: boolean;
   /** Whether the provider can restrict where a box connects to. */
   egressPolicy: boolean;
+  /** What a box is billed for: every second it exists (run9), or compute only while running and storage otherwise. */
+  billing: "exists" | "running";
   /** Whether held time is the provider's own reading or our estimate from when the box existed. */
   usageMeter: "provider" | "estimate";
   /**

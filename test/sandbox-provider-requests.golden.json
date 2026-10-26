@@ -59,12 +59,6 @@
      "summary": "InstaBox only: the template a new machine starts from (GET /v1/templates lists them)."
     },
     {
-     "name": "keepPausedMinutes",
-     "type": "number",
-     "default": 30,
-     "summary": "InstaBox only: minutes an idle machine stays paused, memory and processes kept, before it is switched off (files kept, processes end)."
-    },
-    {
      "name": "maxLifetimeHours",
      "type": "number",
      "default": 24,
@@ -140,7 +134,7 @@
       "none"
      ],
      "default": "all",
-     "summary": "\"all\" lets tools in the container act as this agent's other accounts: every mount whose plugin can (GitHub: gh and git) and that holds a credential. The container holds a placeholder that run9 swaps for the credential only on requests to that service's hosts, so nothing in it can read the credential. \"none\" turns this off."
+     "summary": "\"all\" lets tools in the container act as this agent's other accounts: every mount whose plugin can (GitHub: gh and git) and that holds a credential. The container holds a placeholder that the provider swaps for the credential only on requests to that service's hosts, so nothing in it can read the credential. A provider that cannot hold a credential for one container only (InstaBox) wires in none, and says so. \"none\" turns this off."
     },
     {
      "name": "github",
@@ -460,12 +454,6 @@
      "summary": "InstaBox only: the template a new machine starts from (GET /v1/templates lists them)."
     },
     {
-     "name": "keepPausedMinutes",
-     "type": "number",
-     "default": 30,
-     "summary": "InstaBox only: minutes an idle machine stays paused, memory and processes kept, before it is switched off (files kept, processes end)."
-    },
-    {
      "name": "maxLifetimeHours",
      "type": "number",
      "default": 24,
@@ -541,7 +529,7 @@
       "none"
      ],
      "default": "all",
-     "summary": "\"all\" lets tools in the container act as this agent's other accounts: every mount whose plugin can (GitHub: gh and git) and that holds a credential. The container holds a placeholder that run9 swaps for the credential only on requests to that service's hosts, so nothing in it can read the credential. \"none\" turns this off."
+     "summary": "\"all\" lets tools in the container act as this agent's other accounts: every mount whose plugin can (GitHub: gh and git) and that holds a credential. The container holds a placeholder that the provider swaps for the credential only on requests to that service's hosts, so nothing in it can read the credential. A provider that cannot hold a credential for one container only (InstaBox) wires in none, and says so. \"none\" turns this off."
     },
     {
      "name": "github",

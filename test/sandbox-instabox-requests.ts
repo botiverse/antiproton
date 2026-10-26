@@ -427,7 +427,7 @@ const SCENARIOS: Record<string, (out: unknown[]) => Promise<void>> = {
       "a job was started without its output redirected away from the exec");
   },
 
-  async "idle: paused, resumed by a call; paused, switched off, started by a call; deleted on the stopped schedule"(out) {
+  async "idle: paused, resumed by a call; paused again, then deleted with a warning; never switched off"(out) {
     const f = fake();
     const m = mount({ lease: LEASE });
     await step("shell", () => m.plugin.invoke("shell", { command: "echo hi" }, m.ctx), out);
@@ -435,21 +435,23 @@ const SCENARIOS: Record<string, (out: unknown[]) => Promise<void>> = {
     await step("activities while paused", () => m.plugin.holds!.activities!(m.ctx), out);
     await step("machines while paused", () => m.plugin.invoke("machines", {}, m.ctx), out);
     await step("the workspace view does not wake it", () => m.plugin.holds!.files!.list(m.ctx, "", locked), out);
+    await step("quiet while paused", () => m.plugin.invoke("quiet", { minutes: 600 }, m.ctx), out);
     await step("shell resumes it", () => m.plugin.invoke("shell", { command: "echo back" }, m.ctx), out);
+    await step("machines while running", () => m.plugin.invoke("machines", {}, m.ctx), out);
     await step("idle release pauses it again", () => m.plugin.holds!.release(m.ctx, { reason: "idle" }), out);
-    await step("the next idle step switches it off", () => m.plugin.holds!.release(m.ctx, { reason: "idle" }), out);
-    await step("activities while off", () => m.plugin.holds!.activities!(m.ctx), out);
-    await step("shell starts it", () => m.plugin.invoke("shell", { command: "echo started" }, m.ctx), out);
-    await step("idle: pause", () => m.plugin.holds!.release(m.ctx, { reason: "idle" }), out);
-    await step("idle: switch off", () => m.plugin.holds!.release(m.ctx, { reason: "idle" }), out);
-    await step("idle: delete", () => m.plugin.holds!.release(m.ctx, { reason: "idle" }), out);
+    await step("the next idle step deletes it", () => m.plugin.holds!.release(m.ctx, { reason: "idle" }), out);
+    // A machine InstaBox itself switched off (an archive time, say) is started by the next call.
+    await step("shell makes a new machine", () => m.plugin.invoke("shell", { command: "echo new" }, m.ctx), out);
+    f.machines.get("m_2")!.state = "stopped";
+    await step("shell starts one InstaBox switched off", () => m.plugin.invoke("shell", { command: "echo started" }, m.ctx), out);
     await step("usage", () => m.plugin.holds!.usage!(m.ctx), out);
     out.push(...f.log, { record: m.record() });
     invariants(f);
-    const verbs = f.reqs.filter((r) => r.method === "POST" && /\/(suspend|resume|start|stop)$/.test(r.path)).map((r) => r.path.split("/").pop());
-    must(JSON.stringify(verbs) === JSON.stringify(["suspend", "resume", "suspend", "resume", "stop", "start", "suspend", "resume", "stop"]),
-      `the lifecycle calls were not pause, resume, pause, (resume, stop), start, pause, (resume, stop): ${verbs.join(",")}`);
-    must(f.machines.size === 0, "the machine was not deleted");
+    const verbs = f.reqs.filter((r) => (r.method === "POST" && /\/(suspend|resume|start|stop)$/.test(r.path)) || r.method === "DELETE").map((r) => r.method === "DELETE" ? "delete" : r.path.split("/").pop());
+    must(JSON.stringify(verbs) === JSON.stringify(["suspend", "resume", "suspend", "delete", "start"]),
+      `the lifecycle calls were not pause, resume, pause, delete (and a start for the one InstaBox stopped): ${verbs.join(",")}`);
+    const paused = (out.find((e: any) => e.step === "activities while paused") as any).result[0].live.lease;
+    must(paused.warnMs > 0 && /paused machine/.test(paused.consequence), `a paused machine is not on the warned deletion schedule: ${JSON.stringify(paused)}`);
   },
 
   async "a create InstaBox has no room for is asked again, with a new key after a failed operation"(out) {
