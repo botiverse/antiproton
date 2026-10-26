@@ -202,8 +202,8 @@ const CITED_SHA = /`([0-9a-f]{7,40})`/g;
  *
  * `shallow` is the same shape from the other side: in a shallow clone the
  * history stops at a cut, so a real commit below it reads exactly like a dead
- * address. @Ward got 10/11 from a 76-commit clone, naming four correct commits
- * in files the change under review never touched. A gate that goes red for the
+ * address. A 76-commit clone once read 10/11, naming four correct commits in
+ * files the change under review never touched. A gate that goes red for the
  * runner's machine teaches people to ignore it, so this case still fails there,
  * but it says the clone cannot answer instead of listing commits as dead.
  */
@@ -245,17 +245,20 @@ check("every commit a comment cites is reachable from this history", () => {
       }
     });
   }
+  // Two sections, each under its own heading: the shallow list must not sit
+  // under "dead address", which is the claim it exists to withhold.
+  const sections: string[] = [];
   if (cut.length > 0) {
     // Where the clone stops, so the reader can see the red is about the machine.
     const commits = execFileSync("git", ["rev-list", "--count", "HEAD"], { encoding: "utf8" }).trim();
     const shallowFile = execFileSync("git", ["rev-parse", "--git-path", "shallow"], { encoding: "utf8" }).trim();
     const edge = readFileSync(shallowFile, "utf8").split("\n").filter(Boolean).map((s) => s.slice(0, 8)).join(", ");
-    bad.unshift(
-      `this clone is shallow (${commits} commits, cut at ${edge}), so these cannot be judged — run \`git fetch --unshallow\` and rerun:`,
-      ...cut.map((c) => `  ${c}`),
+    sections.push(
+      `cannot judge cited commits in this clone: it is shallow (${commits} commits, cut at ${edge}) — run \`git fetch --unshallow\` and rerun:\n      ${cut.join("\n      ")}`,
     );
   }
-  if (bad.length > 0) throw new Error(`a dead address is worse than none:\n      ${bad.join("\n      ")}`);
+  if (bad.length > 0) sections.push(`a dead address is worse than none:\n      ${bad.join("\n      ")}`);
+  if (sections.length > 0) throw new Error(sections.join("\n    "));
 });
 
 check("unreachable, reachable, ahead and shallow are told apart, each from a real commit", () => {
