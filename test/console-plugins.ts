@@ -338,7 +338,7 @@ check("the mount list names each mount, its plugin and its credential state, and
  * catalogue widens to everything, because they are still in it. The
  * opt-in rows are what notice that direction.
  */
-check("the real catalogue reaches the page: eight rows say default, five say opt-in", () => {
+check("the real catalogue reaches the page: eight rows say default, four say opt-in", () => {
   const rt = new AgentRuntime({
     ctx: { storage: {} } as any, bucket: {} as any, bucketName: "b",
     models: { resolve: () => null } as any,
@@ -350,7 +350,7 @@ check("the real catalogue reaches the page: eight rows say default, five say opt
   const optIn = rows.filter((r) => !r.defaultForAllAgents).map((r) => r.id).sort();
   must(seeded.join() === "artifacts,exa,github,http,reminder,sandbox,state,tools",
     `the seeded rows are ${seeded.join()}`);
-  must(optIn.join() === "demo,mcp,raft,raftbench,stamp", `the opt-in rows are ${optIn.join()}`);
+  must(optIn.join() === "demo,mcp,raft,raftbench", `the opt-in rows are ${optIn.join()}`);
 
   // And the words, read out of the rendered page rather than the payload.
   //
