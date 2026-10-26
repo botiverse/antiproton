@@ -100,8 +100,8 @@ function assignmentEvent(run: { runId: string; revision: number }, source = "sys
   };
 }
 
-// The Server's coverage as Bencher read it in slock staging `cb1f240` (packages/server/src/raftbench/service.ts, :37-39
-// and :161), still so at #11340 (`eedd93cf`): a reading, not a contract. Every page carries the run's window, the same
+// The Server's coverage as Bencher read it in slock staging `cb1f240` (the raftbench service's `runCoverage` and its
+// context response), still so at #11340 (`eedd93cf`): a reading, not a contract. Every page carries the run's window, the same
 // `from`/`to`, not its own messages' range; `fetchedMessages` is the run's count so far, deduplicated, so a page
 // replayed does not raise it; `exhausted` is true only for a read from the start with nothing in the window skipped.
 // This fixture cannot notice the Server changing that; Bencher's reconciling of the trace against the Server's records
