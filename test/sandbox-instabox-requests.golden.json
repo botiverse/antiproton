@@ -4,11 +4,11 @@
    "lease": [
     {
      "name": "run",
-     "summary": "LAST RESORT for JavaScript. Prefer an ordinary code block, which is instant and free; this starts a container that is billed for every second it exists, and it cannot call your other tools. Use it only when you genuinely need npm packages, a real filesystem, or more than a few seconds of compute. The container is NOT the per-execution sandbox: every call uses the same one, in this turn and later ones, so installs and files survive from one call to the next — do not reinstall. It stays until you release it; after 30 idle minutes it is paused, keeping its memory, running processes and files, and the next call resumes it where it was in a few seconds; after 30 minutes paused it is switched off, which keeps its files but ends running processes and empties /tmp, and the next call starts it again; it is deleted, with everything on its disk, 24 hours after it was created whatever it is doing, and nothing postpones that: `keep` the environment or `save` the files you will want after then; `quiet` postpones the idle steps by as long as you choose, within the mount's limit; files under /tmp do not survive being switched off, so keep your work in the working directory. Work in as few calls as you can, save what matters with `save`, and release it once the machine will not be needed again. Releasing deletes it and everything on its disk. Every call uses the mount's one machine unless you pass `machine`: another short name is a separate container with its own files, directory and idle schedule, created on first use and released on its own. Use one unless you need two at once; at most a few (3 unless the operator set `maxMachines`) may exist at once, switched-off ones included, and `machines` lists them."
+     "summary": "LAST RESORT for JavaScript. Prefer an ordinary code block, which is instant and free; this starts a container that is billed by the second while it runs and only for its storage while it is paused, and it cannot call your other tools. Use it only when you genuinely need npm packages, a real filesystem, or more than a few seconds of compute. The container is NOT the per-execution sandbox: every call uses the same one, in this turn and later ones, so installs and files survive from one call to the next — do not reinstall. It stays until you release it; after 30 idle minutes it is paused, keeping its memory, running processes and files, and billed only for its storage until the next call resumes it where it was; it is deleted, with everything on its disk, 24 hours after it was created whatever it is doing, and nothing postpones that: `keep` the environment or `save` the files you will want after then; `quiet` postpones the pause by as long as you choose, within the mount's limit. Work in as few calls as you can, save what matters with `save`, and release it once the machine will not be needed again. Releasing deletes it and everything on its disk. Every call uses the mount's one machine unless you pass `machine`: another short name is a separate container with its own files, directory and idle schedule, created on first use and released on its own. Use one unless you need two at once; at most a few (3 unless the operator set `maxMachines`) may exist at once, switched-off ones included, and `machines` lists them."
     },
     {
      "name": "shell",
-     "summary": "Shell in the same container as `run`, billed by the second while it runs, and the same one for every call, in this turn and later ones — state, installed packages and files carry over — until you release it; after 30 idle minutes it is paused, keeping its memory, running processes and files, and the next call resumes it where it was in a few seconds; after 30 minutes paused it is switched off, which keeps its files but ends running processes and empties /tmp, and the next call starts it again; it is deleted, with everything on its disk, 24 hours after it was created whatever it is doing, and nothing postpones that: `keep` the environment or `save` the files you will want after then; `quiet` postpones the idle steps by as long as you choose, within the mount's limit; files under /tmp do not survive being switched off, so keep your work in the working directory. Each call starts in the directory the previous call ended in, like one terminal session, and its result says where that is (`cwd`); the first starts in the working directory. Pass `workdir` to run one command in another directory instead of starting it with `cd`. Exported variables and aliases do not carry over, so set them in the command that needs them, and a command handed over as a job does not move the directory. Only for what needs a real machine (builds, tests, git). The default template is universal (Debian 13): Node, npm, git, curl, make, gcc/g++, Python 3, pip, jq, gh, Go, Docker, bash, ssh, apt-get and sudo are present; rg are NOT, and `sudo apt-get update && sudo apt-get install -y <pkg>` installs more. An operator may have configured a different image; every result reports which one this container started from, so read that instead of probing for it. Save anything worth keeping, then release. Every call uses the mount's one machine unless you pass `machine`: another short name is a separate container with its own files, directory and idle schedule, created on first use and released on its own. Use one unless you need two at once; at most a few (3 unless the operator set `maxMachines`) may exist at once, switched-off ones included, and `machines` lists them."
+     "summary": "Shell in the same container as `run`, billed by the second while it runs, and the same one for every call, in this turn and later ones — state, installed packages and files carry over — until you release it; after 30 idle minutes it is paused, keeping its memory, running processes and files, and billed only for its storage until the next call resumes it where it was; it is deleted, with everything on its disk, 24 hours after it was created whatever it is doing, and nothing postpones that: `keep` the environment or `save` the files you will want after then; `quiet` postpones the pause by as long as you choose, within the mount's limit. Each call starts in the directory the previous call ended in, like one terminal session, and its result says where that is (`cwd`); the first starts in the working directory. Pass `workdir` to run one command in another directory instead of starting it with `cd`. Exported variables and aliases do not carry over, so set them in the command that needs them, and a command handed over as a job does not move the directory. Only for what needs a real machine (builds, tests, git). The default template is universal (Debian 13): Node, npm, git, curl, make, gcc/g++, Python 3, pip, jq, gh, Go, Docker, bash, ssh, apt-get and sudo are present; rg are NOT, and `sudo apt-get update && sudo apt-get install -y <pkg>` installs more. An operator may have configured a different image; every result reports which one this container started from, so read that instead of probing for it. Save anything worth keeping, then release. Every call uses the mount's one machine unless you pass `machine`: another short name is a separate container with its own files, directory and idle schedule, created on first use and released on its own. Use one unless you need two at once; at most a few (3 unless the operator set `maxMachines`) may exist at once, switched-off ones included, and `machines` lists them."
     },
     {
      "name": "save",
@@ -32,11 +32,11 @@
     },
     {
      "name": "quiet",
-     "summary": "Postpone what happens next to this container while it sits unused: pausing it, while it is running; switching it off, once it is paused; deleting it, once it is switched off. It is kept as it is for at least `minutes` more from now, and you are not told about it again until shortly before then. It does not postpone the deletion 24 hours after the container was created. Use it when you are coming back to the machine — a build you are waiting on, work you return to after reading something. The limit is the mount's while it runs and much longer once it is switched off. Running, it is billed for every second either way; if you are done with it, `release` is the cheaper answer, and it can save files out in the same call."
+     "summary": "Postpone what happens next to this container while it sits unused: pausing it, while it is running; deleting it, once it is paused. It is kept as it is for at least `minutes` more from now, and you are not told about it again until shortly before then. It does not postpone the deletion 24 hours after the container was created. Use it when you are coming back to the machine — a build you are waiting on, work you return to after reading something. The limit is the mount's while it runs and much longer once it is paused. Running, it is billed for every second either way; if you are done with it, `release` is the cheaper answer, and it can save files out in the same call."
     },
     {
      "name": "machines",
-     "summary": "List this mount's machines: each one's name, whether it is running, paused or switched off, its template, when it was created and last used, when it will be paused, switched off or deleted if nothing uses it, and when it is deleted regardless. Reads the record only; starts, wakes and bills nothing."
+     "summary": "List this mount's machines: each one's name, whether it is running or paused, its template, when it was created and last used, when it will be paused or deleted if nothing uses it, and when it is deleted regardless. Reads the record only; starts, wakes and bills nothing."
     }
    ]
   },
@@ -44,7 +44,7 @@
    "noLease": [
     {
      "name": "run",
-     "summary": "LAST RESORT for JavaScript. Prefer an ordinary code block, which is instant and free; this starts a container that is billed for every second it exists, and it cannot call your other tools. Use it only when you genuinely need npm packages, a real filesystem, or more than a few seconds of compute. The container is NOT the per-execution sandbox: every call in this turn uses the same one, so installs and files survive from one call to the next — do not reinstall. It is handed back when the turn ends, so a later turn starts a new container unless you saved this one's filesystem with `keep`. Work in as few calls as you can, save what matters with `save`, and release it. Everything inside is destroyed when it is released. Every call uses the mount's one machine unless you pass `machine`: another short name is a separate container with its own files, directory and idle schedule, created on first use and released on its own. Use one unless you need two at once; at most a few (3 unless the operator set `maxMachines`) may exist at once, switched-off ones included, and `machines` lists them."
+     "summary": "LAST RESORT for JavaScript. Prefer an ordinary code block, which is instant and free; this starts a container that is billed by the second while it runs and only for its storage while it is paused, and it cannot call your other tools. Use it only when you genuinely need npm packages, a real filesystem, or more than a few seconds of compute. The container is NOT the per-execution sandbox: every call in this turn uses the same one, so installs and files survive from one call to the next — do not reinstall. It is handed back when the turn ends, so a later turn starts a new container unless you saved this one's filesystem with `keep`. Work in as few calls as you can, save what matters with `save`, and release it. Everything inside is destroyed when it is released. Every call uses the mount's one machine unless you pass `machine`: another short name is a separate container with its own files, directory and idle schedule, created on first use and released on its own. Use one unless you need two at once; at most a few (3 unless the operator set `maxMachines`) may exist at once, switched-off ones included, and `machines` lists them."
     },
     {
      "name": "shell",
@@ -76,12 +76,12 @@
     },
     {
      "name": "machines",
-     "summary": "List this mount's machines: each one's name, whether it is running, paused or switched off, its template, when it was created and last used, when it will be paused, switched off or deleted if nothing uses it, and when it is deleted regardless. Reads the record only; starts, wakes and bills nothing."
+     "summary": "List this mount's machines: each one's name, whether it is running or paused, its template, when it was created and last used, when it will be paused or deleted if nothing uses it, and when it is deleted regardless. Reads the record only; starts, wakes and bills nothing."
     }
    ]
   },
   {
-   "longerLife": "Shell in the same container as `run`, billed by the second while it runs, and the same one for every call, in this turn and later ones — state, installed packages and files carry over — until you release it; after 30 idle minutes it is paused, keeping its memory, running processes and files, and the next call resumes it where it was in a few seconds; after 30 minutes paused it is switched off, which keeps its files but ends running processes and empties /tmp, and the next call starts it again; it is deleted, with everything on its disk, after 12 hours switched off and unused, and you are told 6 hours before that, and in any case 24 hours after it was created, which nothing postpones; `quiet` postpones the idle steps by as long as you choose, within the mount's limit; files under /tmp do not survive being switched off, so keep your work in the working directory. Each call starts in the directory the previous call ended in, like one terminal session, and its result says where that is (`cwd`); the first starts in the working directory. Pass `workdir` to run one command in another directory instead of starting it with `cd`. Exported variables and aliases do not carry over, so set them in the command that needs them, and a command handed over as a job does not move the directory. Only for what needs a real machine (builds, tests, git). The default template is universal (Debian 13): Node, npm, git, curl, make, gcc/g++, Python 3, pip, jq, gh, Go, Docker, bash, ssh, apt-get and sudo are present; rg are NOT, and `sudo apt-get update && sudo apt-get install -y <pkg>` installs more. An operator may have configured a different image; every result reports which one this container started from, so read that instead of probing for it. Save anything worth keeping, then release. Every call uses the mount's one machine unless you pass `machine`: another short name is a separate container with its own files, directory and idle schedule, created on first use and released on its own. Use one unless you need two at once; at most a few (3 unless the operator set `maxMachines`) may exist at once, switched-off ones included, and `machines` lists them."
+   "longerLife": "Shell in the same container as `run`, billed by the second while it runs, and the same one for every call, in this turn and later ones — state, installed packages and files carry over — until you release it; after 30 idle minutes it is paused, keeping its memory, running processes and files, and billed only for its storage until the next call resumes it where it was; it is deleted, with everything on its disk, after 12 hours paused and unused, and you are told 6 hours before that, and in any case 24 hours after it was created, which nothing postpones; `quiet` postpones the pause by as long as you choose, within the mount's limit. Each call starts in the directory the previous call ended in, like one terminal session, and its result says where that is (`cwd`); the first starts in the working directory. Pass `workdir` to run one command in another directory instead of starting it with `cd`. Exported variables and aliases do not carry over, so set them in the command that needs them, and a command handed over as a job does not move the directory. Only for what needs a real machine (builds, tests, git). The default template is universal (Debian 13): Node, npm, git, curl, make, gcc/g++, Python 3, pip, jq, gh, Go, Docker, bash, ssh, apt-get and sudo are present; rg are NOT, and `sudo apt-get update && sudo apt-get install -y <pkg>` installs more. An operator may have configured a different image; every result reports which one this container started from, so read that instead of probing for it. Save anything worth keeping, then release. Every call uses the mount's one machine unless you pass `machine`: another short name is a separate container with its own files, directory and idle schedule, created on first use and released on its own. Use one unless you need two at once; at most a few (3 unless the operator set `maxMachines`) may exist at once, switched-off ones included, and `machines` lists them."
   }
  ],
  "create, shell, run, put, save, keep, start_from, release": [
@@ -1102,7 +1102,7 @@
    }
   }
  ],
- "idle: paused, resumed by a call; paused, switched off, started by a call; deleted on the stopped schedule": [
+ "idle: paused, resumed by a call; paused again, then deleted with a warning; never switched off": [
   {
    "step": "shell",
    "result": {
@@ -1134,12 +1134,15 @@
       "lastUsedAt": 1800000006000,
       "credentialRef": "agent",
       "lease": {
-       "maxMs": 1800000,
-       "warnMs": 0
+       "maxMs": 86395000,
+       "warnMs": 43197500,
+       "consequence": "the paused machine and everything on its disk will be deleted",
+       "advice": "Before then, `save` the files you need or `keep` the environment, or run anything in it to resume it.",
+       "maxPostponeMinutes": 1439
       }
      },
      "quietUntil": null,
-     "billing": "paused: no compute is billed; its memory and disk are kept"
+     "billing": "paused: no compute is billed; its memory and disk are kept, and billed as storage, until it is deleted"
     }
    ]
   },
@@ -1156,7 +1159,7 @@
       "lastUsed": "2027-01-15T08:00:03.000Z",
       "paused": "2027-01-15T08:00:06.000Z",
       "cwd": "/data/home/work",
-      "switchedOffAfter": "2027-01-15T08:30:06.000Z",
+      "deletedAfter": "2027-01-16T08:00:01.000Z",
       "deletedBy": "2027-01-16T08:00:01.000Z"
      }
     ],
@@ -1168,6 +1171,16 @@
    "step": "the workspace view does not wake it",
    "result": {
     "running": false
+   }
+  },
+  {
+   "step": "quiet while paused",
+   "result": {
+    "quiet": true,
+    "box": "m_1",
+    "minutes": 600,
+    "until": "2027-01-15T18:00:06.000Z",
+    "note": "it stays paused; this postpones its deletion"
    }
   },
   {
@@ -1183,6 +1196,26 @@
    }
   },
   {
+   "step": "machines while running",
+   "result": {
+    "machines": [
+     {
+      "machine": "main",
+      "state": "running",
+      "box": "m_1",
+      "image": "universal",
+      "created": "2027-01-15T08:00:06.000Z",
+      "lastUsed": "2027-01-15T08:00:12.000Z",
+      "cwd": "/data/home/work",
+      "pausedAfter": "2027-01-15T08:30:12.000Z",
+      "deletedBy": "2027-01-16T08:00:01.000Z"
+     }
+    ],
+    "limit": 3,
+    "note": "times are when it happens if nothing uses the machine before then; any use moves them. 1 of at most 3 exist; a switched-off one counts until it is released."
+   }
+  },
+  {
    "step": "idle release pauses it again",
    "result": {
     "id": "m_1",
@@ -1192,87 +1225,41 @@
    }
   },
   {
-   "step": "the next idle step switches it off",
+   "step": "the next idle step deletes it",
    "result": {
     "id": "m_1",
     "startedAt": 1800000015000,
-    "endedAt": 1800000020000,
+    "endedAt": 1800000017000,
     "status": "freed"
    }
   },
   {
-   "step": "activities while off",
-   "result": [
-    {
-     "live": {
-      "id": "m_1",
-      "startedAt": 1800000006000,
-      "lastUsedAt": 1800000020000,
-      "credentialRef": "agent",
-      "lease": {
-       "maxMs": 86381000,
-       "warnMs": 43190500,
-       "consequence": "the stopped machine and everything on its disk will be deleted",
-       "advice": "Before then, `save` the files you need or `keep` the environment, or run anything in it to switch it back on.",
-       "maxPostponeMinutes": 1439
-      }
-     },
-     "quietUntil": null,
-     "billing": "stopped: no compute is billed; only its disk is kept until it is deleted"
-    }
-   ]
-  },
-  {
-   "step": "shell starts it",
+   "step": "shell makes a new machine",
    "result": {
     "state": "succeeded",
     "exitCode": 0,
     "cwd": "/data/home/work",
     "output": "hello",
     "truncated": false,
-    "box": "m_1",
+    "box": "m_2",
     "image": "universal"
    }
   },
   {
-   "step": "idle: pause",
+   "step": "shell starts one InstaBox switched off",
    "result": {
-    "id": "m_1",
-    "startedAt": 1800000020000,
-    "endedAt": 1800000029000,
-    "status": "freed"
-   }
-  },
-  {
-   "step": "idle: switch off",
-   "result": {
-    "id": "m_1",
-    "startedAt": 1800000029000,
-    "endedAt": 1800000034000,
-    "status": "freed"
-   }
-  },
-  {
-   "step": "idle: delete",
-   "result": {
-    "id": "m_1",
-    "startedAt": 1800000034000,
-    "endedAt": 1800000036000,
-    "status": "freed"
+    "state": "succeeded",
+    "exitCode": 0,
+    "cwd": "/data/home/work",
+    "output": "hello",
+    "truncated": false,
+    "box": "m_2",
+    "image": "universal"
    }
   },
   {
    "step": "usage",
    "result": [
-    {
-     "id": "m_1",
-     "startedAt": 1800000020000,
-     "endedAt": 1800000029000,
-     "lastUsedAt": 1800000026000,
-     "uses": 1,
-     "kept": [],
-     "credentialRef": "agent"
-    },
     {
      "id": "m_1",
      "startedAt": 1800000006000,
@@ -1460,19 +1447,13 @@
    "timeoutMs": 40000
   },
   {
-   "method": "GET",
+   "method": "DELETE",
    "path": "/v1/machines/m_1",
+   "idem": "delete-m_1-mywpj8go-ef14395e",
+   "confirm": "m_1",
    "key": "ok",
    "body": null,
-   "timeoutMs": 120000
-  },
-  {
-   "method": "POST",
-   "path": "/v1/machines/m_1/resume",
-   "idem": "resume-m_1-mywpj98g-ef14395e",
-   "key": "ok",
-   "body": null,
-   "timeoutMs": 120000
+   "timeoutMs": 30000
   },
   {
    "method": "GET",
@@ -1483,12 +1464,27 @@
   },
   {
    "method": "POST",
-   "path": "/v1/machines/m_1/stop",
-   "idem": "stop-m_1-mywpjas0-83a8cdf2",
+   "path": "/v1/machines",
+   "idem": "create-h-t-a-mywpja08",
    "contentType": "application/json",
    "key": "ok",
    "body": {
-    "timeoutSeconds": 10
+    "name": "h-t-a-mywpja08",
+    "templateId": "universal",
+    "vcpus": 2,
+    "memMiB": 4096,
+    "metadata": {
+     "tenant": "t",
+     "agent": "a",
+     "mount": "sandbox",
+     "machine": "main"
+    },
+    "deleteAfterSeconds": 86400,
+    "maxRunMinutes": 480,
+    "failFast": true,
+    "secrets": [],
+    "envSecrets": [],
+    "vault": false
    },
    "timeoutMs": 120000
   },
@@ -1500,16 +1496,73 @@
    "timeoutMs": 40000
   },
   {
+   "method": "POST",
+   "path": "/v1/machines/m_2/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpjbjs83a8cdf2\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
+     "ap",
+     "",
+     "/bin/sh",
+     "-lc",
+     "mkdir -p /data/home/work && cd /data/home/work || exit 1\necho new\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_2/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpjbjs83a8cdf2\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "ap",
+     "262144"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_2/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpjd3c173c6186\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
+     "ap",
+     "/data/home/work",
+     "/bin/sh",
+     "-lc",
+     "echo started\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
    "method": "GET",
-   "path": "/v1/machines/m_1",
+   "path": "/v1/machines/m_2",
    "key": "ok",
    "body": null,
    "timeoutMs": 120000
   },
   {
    "method": "POST",
-   "path": "/v1/machines/m_1/start",
-   "idem": "start-m_1-mywpjd3c-173c6186",
+   "path": "/v1/machines/m_2/start",
+   "idem": "start-m_2-mywpjemw-abd0f51a",
    "key": "ok",
    "body": null,
    "timeoutMs": 120000
@@ -1523,21 +1576,21 @@
   },
   {
    "method": "GET",
-   "path": "/v1/machines/m_1",
+   "path": "/v1/machines/m_2",
    "key": "ok",
    "body": null,
    "timeoutMs": 120000
   },
   {
    "method": "POST",
-   "path": "/v1/machines/m_1/exec",
+   "path": "/v1/machines/m_2/exec",
    "contentType": "application/json",
    "key": "ok",
    "body": {
     "argv": [
      "sh",
      "-c",
-     "set -- \"$HOME/.antiproton/jobs/jmywpjg6gabd0f51a\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
+     "set -- \"$HOME/.antiproton/jobs/jmywpjd3c173c6186\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
      "ap",
      "/data/home/work",
      "/bin/sh",
@@ -1550,14 +1603,14 @@
   },
   {
    "method": "POST",
-   "path": "/v1/machines/m_1/exec",
+   "path": "/v1/machines/m_2/exec",
    "contentType": "application/json",
    "key": "ok",
    "body": {
     "argv": [
      "sh",
      "-c",
-     "set -- \"$HOME/.antiproton/jobs/jmywpjg6gabd0f51a\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "set -- \"$HOME/.antiproton/jobs/jmywpjd3c173c6186\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
      "ap",
      "262144"
     ],
@@ -1566,89 +1619,21 @@
    "timeoutMs": 120000
   },
   {
-   "method": "POST",
-   "path": "/v1/machines/m_1/suspend",
-   "idem": "suspend-m_1-mywpjhq0-3f6489ae",
-   "key": "ok",
-   "body": null,
-   "timeoutMs": 120000
-  },
-  {
-   "method": "GET",
-   "path": "/v1/operations/op_8?wait=25s",
-   "key": "ok",
-   "body": null,
-   "timeoutMs": 40000
-  },
-  {
-   "method": "GET",
-   "path": "/v1/machines/m_1",
-   "key": "ok",
-   "body": null,
-   "timeoutMs": 120000
-  },
-  {
-   "method": "POST",
-   "path": "/v1/machines/m_1/resume",
-   "idem": "resume-m_1-mywpjk1c-d3f81d42",
-   "key": "ok",
-   "body": null,
-   "timeoutMs": 120000
-  },
-  {
-   "method": "GET",
-   "path": "/v1/operations/op_9?wait=25s",
-   "key": "ok",
-   "body": null,
-   "timeoutMs": 40000
-  },
-  {
-   "method": "POST",
-   "path": "/v1/machines/m_1/stop",
-   "idem": "stop-m_1-mywpjlkw-678cb1d6",
-   "contentType": "application/json",
-   "key": "ok",
-   "body": {
-    "timeoutSeconds": 10
-   },
-   "timeoutMs": 120000
-  },
-  {
-   "method": "GET",
-   "path": "/v1/operations/op_10?wait=25s",
-   "key": "ok",
-   "body": null,
-   "timeoutMs": 40000
-  },
-  {
-   "method": "DELETE",
-   "path": "/v1/machines/m_1",
-   "idem": "delete-m_1-mywpjn4g-fb20456a",
-   "confirm": "m_1",
-   "key": "ok",
-   "body": null,
-   "timeoutMs": 30000
-  },
-  {
-   "method": "GET",
-   "path": "/v1/operations/op_11?wait=25s",
-   "key": "ok",
-   "body": null,
-   "timeoutMs": 40000
-  },
-  {
    "record": {
-    "machines": {},
-    "sessions": [
-     {
-      "boxId": "m_1",
-      "startedAt": 1800000020000,
-      "endedAt": 1800000029000,
-      "lastUsedAt": 1800000026000,
-      "execs": 1,
+    "machines": {
+     "main": {
+      "boxId": "m_2",
+      "createdAt": 1800000019000,
+      "lastUsedAt": 1800000028000,
+      "execs": 2,
       "saved": [],
-      "credentialRef": "agent"
-     },
+      "deleteAt": 1800086418000,
+      "credentialRef": "agent",
+      "image": "universal",
+      "cwd": "/data/home/work"
+     }
+    },
+    "sessions": [
      {
       "boxId": "m_1",
       "startedAt": 1800000006000,
