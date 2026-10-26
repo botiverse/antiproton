@@ -24,6 +24,7 @@ import { Backgrounded } from "../src/plugins/types.ts";
 import { PluginDbTables } from "../src/store/plugin-db.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { openPluginDatabase } from "../src/runtime/plugin-db.ts";
+import { execFileSync } from "node:child_process";
 
 const GOLDEN = new URL("./sandbox-instabox-requests.golden.json", import.meta.url);
 const UPDATE = process.argv.includes("--update");
@@ -688,6 +689,16 @@ const SCENARIOS: Record<string, (out: unknown[]) => Promise<void>> = {
     invariants(f);
   },
 };
+
+// ---- the scripts as a shell reads them: the fake only recognises them, so a quoting slip would pass it
+
+await check("every script the adapter sends parses as sh", () => {
+  for (const [name, script] of Object.entries({ LAUNCH, POLL, KILL, SETUP, IN_CONTAINER, CP_IN, CP_OUT })) {
+    try { execFileSync("sh", ["-n", "-c", script], { stdio: "pipe" }); } catch (e) {
+      throw new Error(`${name} does not parse: ${String((e as any).stderr ?? e).trim()}`);
+    }
+  }
+});
 
 // ---- compare
 

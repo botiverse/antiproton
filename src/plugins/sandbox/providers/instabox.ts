@@ -93,7 +93,8 @@ export const CONTAINER = "ap";
 /** How long bringing the container up may take, the image's pull included (measured 16-20 s for a 1.1 GB SWE-bench image). */
 const SETUP_BUDGET_MS = 1_200_000;
 /** What `IN_CONTAINER` says on stderr, with exit 125, when the container is not there to run in. */
-export const NO_CONTAINER = "ap-container: the machine's container is not there and could not be started";
+// No quote in it: it goes into `IN_CONTAINER` inside single quotes.
+export const NO_CONTAINER = "ap-container: the container is not there and could not be started";
 
 /**
  * Brings the box's container up, run on the machine as its user: `$1` the image, `$2` the Docker network, `$3`

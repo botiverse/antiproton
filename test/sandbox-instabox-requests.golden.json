@@ -3466,7 +3466,7 @@
     "argv": [
      "sh",
      "-c",
-     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the machine's container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
+     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
      "ap",
      "sh",
      "-c",
@@ -3490,7 +3490,7 @@
     "argv": [
      "sh",
      "-c",
-     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the machine's container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
+     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
      "ap",
      "sh",
      "-c",
@@ -3511,7 +3511,7 @@
     "argv": [
      "sh",
      "-c",
-     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the machine's container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
+     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
      "ap",
      "sh",
      "-c",
@@ -3535,7 +3535,7 @@
     "argv": [
      "sh",
      "-c",
-     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the machine's container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
+     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
      "ap",
      "sh",
      "-c",
@@ -3556,7 +3556,7 @@
     "argv": [
      "sh",
      "-c",
-     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the machine's container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
+     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
      "ap",
      "sh",
      "-c",
@@ -3582,7 +3582,7 @@
     "argv": [
      "sh",
      "-c",
-     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the machine's container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
+     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
      "ap",
      "sh",
      "-c",
@@ -3632,7 +3632,7 @@
     "argv": [
      "sh",
      "-c",
-     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the machine's container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
+     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
      "ap",
      "sh",
      "-c",
@@ -3658,7 +3658,7 @@
     "argv": [
      "sh",
      "-c",
-     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the machine's container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
+     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
      "ap",
      "sh",
      "-c",
@@ -3763,7 +3763,7 @@
     "argv": [
      "sh",
      "-c",
-     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the machine's container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
+     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
      "ap",
      "sh",
      "-c",
@@ -3787,7 +3787,7 @@
     "argv": [
      "sh",
      "-c",
-     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the machine's container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
+     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
      "ap",
      "sh",
      "-c",
@@ -3808,7 +3808,7 @@
     "argv": [
      "sh",
      "-c",
-     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the machine's container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
+     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
      "ap",
      "sh",
      "-c",
@@ -3829,7 +3829,7 @@
     "argv": [
      "sh",
      "-c",
-     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the machine's container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
+     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
      "ap",
      "sh",
      "-c",
@@ -3849,7 +3849,7 @@
     "argv": [
      "sh",
      "-c",
-     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the machine's container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
+     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
      "ap",
      "sh",
      "-c",
@@ -3877,7 +3877,7 @@
     "argv": [
      "sh",
      "-c",
-     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the machine's container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
+     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
      "ap",
      "sh",
      "-c",
@@ -3904,7 +3904,7 @@
     "argv": [
      "sh",
      "-c",
-     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the machine's container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
+     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
      "ap",
      "sh",
      "-c",
@@ -4039,7 +4039,7 @@
     "argv": [
      "sh",
      "-c",
-     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the machine's container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
+     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
      "ap",
      "sh",
      "-c",
@@ -4063,7 +4063,7 @@
     "argv": [
      "sh",
      "-c",
-     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the machine's container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
+     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
      "ap",
      "sh",
      "-c",
@@ -4508,7 +4508,7 @@
     "argv": [
      "sh",
      "-c",
-     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the machine's container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
+     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
      "ap",
      "sh",
      "-c",
@@ -4532,7 +4532,7 @@
     "argv": [
      "sh",
      "-c",
-     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the machine's container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
+     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
      "ap",
      "sh",
      "-c",
@@ -4643,7 +4643,7 @@
     "argv": [
      "sh",
      "-c",
-     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the machine's container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
+     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
      "ap",
      "sh",
      "-c",
@@ -4667,7 +4667,7 @@
     "argv": [
      "sh",
      "-c",
-     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the machine's container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
+     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
      "ap",
      "sh",
      "-c",
@@ -4778,7 +4778,7 @@
     "argv": [
      "sh",
      "-c",
-     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the machine's container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
+     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
      "ap",
      "sh",
      "-c",
@@ -4802,7 +4802,7 @@
     "argv": [
      "sh",
      "-c",
-     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the machine's container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
+     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
      "ap",
      "sh",
      "-c",
@@ -4913,7 +4913,7 @@
     "argv": [
      "sh",
      "-c",
-     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the machine's container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
+     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
      "ap",
      "sh",
      "-c",
@@ -4937,7 +4937,7 @@
     "argv": [
      "sh",
      "-c",
-     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the machine's container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
+     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
      "ap",
      "sh",
      "-c",
@@ -5155,7 +5155,7 @@
     "argv": [
      "sh",
      "-c",
-     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the machine's container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
+     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
      "ap",
      "sh",
      "-c",
@@ -5179,7 +5179,7 @@
     "argv": [
      "sh",
      "-c",
-     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the machine's container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
+     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
      "ap",
      "sh",
      "-c",
@@ -5200,7 +5200,7 @@
     "argv": [
      "sh",
      "-c",
-     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the machine's container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
+     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
      "ap",
      "sh",
      "-c",
