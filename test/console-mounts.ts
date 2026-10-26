@@ -733,12 +733,23 @@ await check("route: an anonymous viewer is refused every new write and /ui/plugi
   const choicesBefore = show(await store.pluginChoices(T, A));
   const mountsBefore = (await store.listMounts(T, A)).length;
   for (const [path, fields] of [
+    // First: these five have no refusal of their own, so the route-level check is the only thing in their way, and the
+    // credential pair is the one it exists for (it changes what the agent is authorised as).
+    ["/ui/credential", { alias: "anon", value: VALUE }],
+    ["/ui/credential/remove", { alias: "anon" }],
+    ["/ui/message", { text: "anon" }],
+    ["/ui/decide", { id: "anon", decision: "allow" }],
+    ["/ui/compact", {}],
     ["/ui/mount/add", { plugin: "mcp", alias: "anon", url: MCP_URL }],
     ["/ui/mount/refresh", { alias: "flaky" }],
     ["/ui/mount/remove", { alias: "flaky" }],
     ["/ui/secret", { name: "anon", value: VALUE }],
     ["/ui/secret/remove", { name: "anon" }],
     ["/ui/plugin/choice", { plugin: "mcp", choice: "disable" }],
+    // These also refuse in their own handlers, behind the route-level check.
+    ["/ui/agent", { name: "anon" }],
+    ["/ui/api-keys/new", { label: "anon" }],
+    ["/ui/api-keys/revoke", { id: "anon" }],
   ] as const) {
     const r = await post(path, fields, { cookie: null });
     must(r.status === 403 && /read-only/.test(r.text), `${path} anonymously: ${r.status} ${r.text}`);
