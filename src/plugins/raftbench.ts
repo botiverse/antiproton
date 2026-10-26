@@ -323,7 +323,7 @@ async function resumeRead(ctx: PluginContext, raft: Raft, reading: RunState): Pr
     const kind = raftbenchFailureKind(material);
     const code = material.error.serverCode ?? material.error.code;
     log(ctx, reading, "read_failed", { kind, code });
-    if (kind === "stop") return end(ctx, raft, reading, `stopped: ${code}`, {});
+    if (kind === "stop") return end(ctx, raft, reading, `stopped: ${code}`, { code });
     if (kind === "reread") return read(ctx, raft, reading);
     return submitFailed(ctx, raft, reading, `The run's material could not be read: ${material.error.message}`, "read_failed");
   }
@@ -443,7 +443,7 @@ async function sendFailed(ctx: PluginContext, raft: Raft, run: RunState, failure
   // A refusal the contract does not name, of the model's result: the run failed, which Raft is told, so it tries the
   // material again. Of the plugin's own failure, or a `stop`, there is nothing left to send that Raft would take.
   if (kind === null && run.from === "model") return submitFailed(ctx, raft, run, `Raft refused the result: ${code}`, "raft_refused");
-  return end(ctx, raft, run, `stopped: ${code}`, { kind });
+  return end(ctx, raft, run, `stopped: ${code}`, { kind, code });
 }
 
 /** The deadline: the run ends as "timeout", with what had been read by then. */
@@ -478,7 +478,7 @@ async function end(ctx: PluginContext, raft: Raft, run: RunState, outcome: strin
  * The run's end as a trace row (`raftbench.run_done`) beside its `done` log line, since Workers Logs can drop a line and
  * the trace is kept with the agent's other spans. Ids, fixed codes and counts only: never the result, its findings,
  * the model's text or a failure's reason. `outcome` is the outcome's fixed head (`accepted`, `refused`, `gave_up`,
- * `stopped`); an accepted result of the plugin's own (`from: "plugin"`) is a failed run, `failure` saying which.
+ * `stopped`), a stop's or a give-up's `code` the Server's or the SDK's fixed code; an accepted result of the plugin's own (`from: "plugin"`) is a failed run, `failure` saying which.
  */
 function traceDone(ctx: PluginContext, run: RunState, outcome: string, extra: Record<string, unknown>) {
   const head = outcome.split(":")[0]!;

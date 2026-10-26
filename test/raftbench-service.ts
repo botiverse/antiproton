@@ -733,6 +733,18 @@ await check("two runs: the fix-up keeps its run's material and answer; the next 
   must(w.raft.accepted.size === 2, `accepted ${w.raft.accepted.size}`);
 });
 
+await check("an assignment that arrives while a run is under way is queued behind it, its log line saying the output is prompt-only", async () => {
+  const w = await world();
+  const first = w.raft.run;
+  await assign(w);
+  must(w.sent.length === 1, `run 1's calls: ${w.sent.length}`);
+  logs.length = 0;
+  await assign(w, { runId: randomUUID(), revision: 4 });
+  const queued = runLogs("queued");
+  must(queued.length === 1 && queued[0].behind === first.runId && queued[0].output === "prompt_only", show(queued));
+  must(w.sent.length === 1 && runLogs("assigned").length === 0, "the queued run started beside the first");
+});
+
 await check("a turn the run did not ask for is never its answer: a stray end is ignored, and the run's own is submitted", async () => {
   const w = await world();
   await assign(w);
@@ -989,6 +1001,20 @@ await check("retention: every terminal path leaves no copy — timeout, read fai
       must(whereIs(w, ANSWER_MARK).length === 0, `the first read's answer outlived its reread: ${show(whereIs(w, ANSWER_MARK))}`);
       await answer(w, markedAnswer());
     },
+    "a refusal the contract does not name": async (w) => { w.raft.inject.set("/internal/agent-api/raftbench/submit", [refusal(400, "raftbench_unnamed_refusal")]); await answer(w, markedAnswer()); },
+  };
+  // Each path's `raftbench.run_done` row: the outcome's fixed head, whose result was sent, the plugin failure's code,
+  // and a stop's fixed code. A stop's outcome is only its head, never the text after the colon.
+  const ends: Record<string, { outcome: string; from: string; failure?: string; code?: string }> = {
+    timeout: { outcome: "accepted", from: "plugin", failure: "timeout" },
+    "read failure on a reread": { outcome: "accepted", from: "plugin", failure: "read_failed" },
+    stop: { outcome: "stopped", from: "model", code: "raftbench_read_permission_revoked" },
+    "model failure (its error quoting the material)": { outcome: "accepted", from: "plugin", failure: "model_failed" },
+    overflow: { outcome: "accepted", from: "plugin", failure: "model_failed" },
+    cancel: { outcome: "accepted", from: "plugin", failure: "cancelled" },
+    "an empty reply at the cap, twice": { outcome: "accepted", from: "plugin", failure: "model_failed" },
+    reread: { outcome: "accepted", from: "model" },
+    "a refusal the contract does not name": { outcome: "accepted", from: "plugin", failure: "raft_refused" },
   };
   for (const [name, path] of Object.entries(paths)) {
     const w = await world();
@@ -998,6 +1024,12 @@ await check("retention: every terminal path leaves no copy — timeout, read fai
     await path(w);
     must(runLogs("done").length > 0 && w.raft.submits().length + runLogs("done").length > 0, `${name}: the run did not end`);
     mustBeGone(w, name);
+    const rows = traceRows(w, "raftbench.run_done"), want = ends[name]!;
+    must(rows.length === 1, `${name}: run_done rows ${show(rows)}`);
+    const a = rows[0]!.attrs;
+    must(rows[0]!.status === want.outcome && a.outcome === want.outcome && !String(a.outcome).includes(":") && a.from === want.from &&
+      a.failure === want.failure && a.code === want.code && a.output === "prompt_only", `${name}: ${show(rows[0])}`);
+    must(Object.keys(a).every((k) => RUN_DONE_KEYS.has(k)) && !show(a).includes(MATERIAL_MARK) && !show(a).includes(ANSWER_MARK), `${name}: ${show(a)}`);
     logs.length = 0;
   }
 });
