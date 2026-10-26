@@ -108,6 +108,16 @@ export function fixupTurnText(invalid: string): string {
   return invalid;
 }
 
+/**
+ * How the result's shape reaches the model: described in the prompt (`RAFTBENCH_INSTRUCTIONS`), never enforced by the
+ * model's API, so a reply can be any text and is checked only by the SDK and the Server, with one fix-up turn. The
+ * profile's model (deepseek-flash) has no strict schema mode: `response_format` `json_schema` is refused with HTTP 400,
+ * `json_object` gives JSON that ignores the schema, and strict tools on DeepSeek's /beta broke the schema in 2 of 3
+ * calls (measured 2026-10-26). Said on the run's first and last log lines and on its `raftbench.run_done` trace row, so
+ * no reading of a run takes its result for one a schema held the model to.
+ */
+export const OUTPUT_ENFORCEMENT = "prompt_only";
+
 /** Output tokens of every model call of a run (the profile's, src/runtime/agent-profile.ts). */
 export const RAFTBENCH_MAX_TOKENS = 8192;
 /** Reads of a run's material: the first, and one reread after a revision conflict. */
@@ -139,6 +149,9 @@ export function wakeBackoffMs(failures: number): number {
   return Math.min(60_000 * 2 ** Math.max(0, failures - 1), 6 * 3_600_000);
 }
 
+/** Which of the plugin's own failures a run ended with: fixed codes, for the trace row, where the reason is free text. */
+type FailureCode = "read_failed" | "calls_spent" | "validation_failed" | "raft_refused" | "timeout" | "cancelled" | "model_failed";
+
 type Phase = "reading" | "turn" | "submitting" | "done";
 /** One run's progress, written before every step that leaves the object. */
 interface RunState {
@@ -167,6 +180,10 @@ interface RunState {
   from?: "model" | "empty" | "plugin";
   body?: string;
   reason?: string;
+  /** While `submitting` the plugin's own failure, and while `done` after one: which failure it is, a fixed code. */
+  failure?: FailureCode;
+  /** Fix-up turns asked for in the whole run, for the run's trace row. */
+  fixups?: number;
   /** Later sends after Raft could not confirm one (`RETRY_DELAYS_MS`), and when the next is due. */
   retries: number;
   retryAt?: number;
@@ -293,6 +310,7 @@ async function read(ctx: PluginContext, raft: Raft, run: RunState): Promise<Plug
   delete reading.body;
   delete reading.from;
   delete reading.reason;
+  delete reading.failure;
   delete reading.retryAt;
   await save(ctx, CURRENT, reading);
   return resumeRead(ctx, raft, reading);
@@ -307,7 +325,7 @@ async function resumeRead(ctx: PluginContext, raft: Raft, reading: RunState): Pr
     log(ctx, reading, "read_failed", { kind, code });
     if (kind === "stop") return end(ctx, raft, reading, `stopped: ${code}`, {});
     if (kind === "reread") return read(ctx, raft, reading);
-    return submitFailed(ctx, raft, reading, `The run's material could not be read: ${material.error.message}`);
+    return submitFailed(ctx, raft, reading, `The run's material could not be read: ${material.error.message}`, "read_failed");
   }
   // The Server's run and revision are the ones the result answers for.
   const run: RunState = {
@@ -321,7 +339,7 @@ async function resumeRead(ctx: PluginContext, raft: Raft, reading: RunState): Pr
   // Nothing was read: there is nothing for a model to analyse, and nothing failed. An ordinary `incomplete`, sent with
   // `submit`, not the run's failure, which Raft would try again and count towards its limit.
   if (material.state === "empty") return submitResult(ctx, raft, run, raftbenchEmptyWindowReport(material.data), "empty");
-  if (run.calls >= MAX_CALLS) return submitFailed(ctx, raft, run, `the run's ${MAX_CALLS} model calls are spent`);
+  if (run.calls >= MAX_CALLS) return submitFailed(ctx, raft, run, `the run's ${MAX_CALLS} model calls are spent`, "calls_spent");
   return ask(ctx, run, firstTurnText(material.data), true);
 }
 
@@ -362,14 +380,15 @@ async function submitModel(ctx: PluginContext, raft: Raft, run: RunState, result
 async function submitResult(ctx: PluginContext, raft: Raft, run: RunState, result: unknown, from: "model" | "empty"): Promise<PluginNext | void> {
   const pending: RunState = { ...run, phase: "submitting", from, body: JSON.stringify(result), retries: 0 };
   delete pending.reason;
+  delete pending.failure;
   delete pending.retryAt;
   await save(ctx, CURRENT, pending);
   return send(ctx, raft, pending);
 }
 
 /** End the run with the plugin's own result (`sendFailure`), kept as its reason so every send is the same one. */
-async function submitFailed(ctx: PluginContext, raft: Raft, run: RunState, reason: string): Promise<PluginNext | void> {
-  const pending: RunState = { ...run, phase: "submitting", from: "plugin", reason, retries: 0 };
+async function submitFailed(ctx: PluginContext, raft: Raft, run: RunState, reason: string, failure: FailureCode): Promise<PluginNext | void> {
+  const pending: RunState = { ...run, phase: "submitting", from: "plugin", reason, failure, retries: 0 };
   delete pending.body;
   delete pending.retryAt;
   await save(ctx, CURRENT, pending);
@@ -389,12 +408,12 @@ async function send(ctx: PluginContext, raft: Raft, run: RunState): Promise<Plug
     if (run.from !== "model") return end(ctx, raft, run, "refused: the plugin's own result was invalid", { issues: issues.length });
     if (run.readCalls < MAX_CALLS_PER_READ && run.calls < MAX_CALLS && Date.now() < run.deadline) {
       log(ctx, run, "fixup", { issues: issues.length });
-      const fixing: RunState = { ...run };
+      const fixing: RunState = { ...run, fixups: (run.fixups ?? 0) + 1 };
       delete fixing.from;
       delete fixing.body;
       return ask(ctx, fixing, fixupTurnText(r.text), false);
     }
-    return submitFailed(ctx, raft, run, validationFailed(issues));
+    return submitFailed(ctx, raft, run, validationFailed(issues), "validation_failed");
   }
   return sendFailed(ctx, raft, run, r as RaftFailure);
 }
@@ -423,7 +442,7 @@ async function sendFailed(ctx: PluginContext, raft: Raft, run: RunState, failure
   }
   // A refusal the contract does not name, of the model's result: the run failed, which Raft is told, so it tries the
   // material again. Of the plugin's own failure, or a `stop`, there is nothing left to send that Raft would take.
-  if (kind === null && run.from === "model") return submitFailed(ctx, raft, run, `Raft refused the result: ${code}`);
+  if (kind === null && run.from === "model") return submitFailed(ctx, raft, run, `Raft refused the result: ${code}`, "raft_refused");
   return end(ctx, raft, run, `stopped: ${code}`, { kind });
 }
 
@@ -433,7 +452,7 @@ function timeout(ctx: PluginContext, raft: Raft, run: RunState): Promise<PluginN
     ? `${run.coverage.fetched} message${run.coverage.fetched === 1 ? "" : "s"} read, ${run.coverage.exhausted ? "the whole window" : "not the whole window"}`
     : "nothing read";
   log(ctx, run, "timeout");
-  return submitFailed(ctx, raft, run, `timeout (${read})`);
+  return submitFailed(ctx, raft, run, `timeout (${read})`, "timeout");
 }
 
 /**
@@ -447,11 +466,33 @@ async function end(ctx: PluginContext, raft: Raft, run: RunState, outcome: strin
   delete done.reason;
   delete done.retryAt;
   await save(ctx, CURRENT, done);
-  log(ctx, run, "done", { outcome, ...extra });
+  log(ctx, run, "done", { outcome, output: OUTPUT_ENFORCEMENT, ...extra });
+  traceDone(ctx, run, outcome, extra);
   const next = await load(ctx, NEXT);
   if (!next) return { forget: true };
   await ctx.db.delete(STORE, NEXT);
   return { ...(await read(ctx, raft, next) ?? {}), forget: true };
+}
+
+/**
+ * The run's end as a trace row (`raftbench.run_done`) beside its `done` log line, since Workers Logs can drop a line and
+ * the trace is kept with the agent's other spans. Ids, fixed codes and counts only: never the result, its findings,
+ * the model's text or a failure's reason. `outcome` is the outcome's fixed head (`accepted`, `refused`, `gave_up`,
+ * `stopped`); an accepted result of the plugin's own (`from: "plugin"`) is a failed run, `failure` saying which.
+ */
+function traceDone(ctx: PluginContext, run: RunState, outcome: string, extra: Record<string, unknown>) {
+  const head = outcome.split(":")[0]!;
+  const ok = head === "accepted" && run.from !== "plugin";
+  ctx.trace?.({
+    kind: "raftbench.run_done", status: head, verdict: ok ? "ok" : "failed",
+    attrs: {
+      runId: run.runId, revision: run.revision, outcome: head, output: OUTPUT_ENFORCEMENT,
+      ...(run.from ? { from: run.from } : {}), ...(run.from === "plugin" && run.failure ? { failure: run.failure } : {}),
+      fixups: run.fixups ?? 0, calls: run.calls, reads: run.reads, retries: run.retries,
+      ...(typeof extra.receiptId === "string" ? { receiptId: extra.receiptId } : {}),
+      ...(typeof extra.code === "string" ? { code: extra.code } : {}),
+    },
+  });
 }
 
 /** The model's last text as the result it is meant to be: one JSON object, or a single fenced JSON block. */
@@ -552,9 +593,9 @@ async function woken(ctx: PluginContext): Promise<PluginNext | void> {
       log(ctx, pulled, "assignment_repeated");
     } else if (run && run.phase !== "done") {
       await save(ctx, NEXT, assigned(pulled, pulled.receivedAt));
-      log(ctx, pulled, "queued", { behind: run.runId });
+      log(ctx, pulled, "queued", { behind: run.runId, output: OUTPUT_ENFORCEMENT });
     } else {
-      log(ctx, pulled, "assigned");
+      log(ctx, pulled, "assigned", { output: OUTPUT_ENFORCEMENT });
       await save(ctx, CURRENT, assigned(pulled, pulled.receivedAt));
     }
     await ctx.db.delete(STORE, PULLED);
@@ -581,7 +622,7 @@ async function turnEnded(ctx: PluginContext, end: TurnEnd): Promise<PluginNext |
   if (run.phase === "submitting") return answer(ctx, await send(ctx, raft, run));
   if (run.phase === "reading") return answer(ctx, run.reads > 0 ? await resumeRead(ctx, raft, run) : undefined);
   if (run.timedOut !== undefined || Date.now() >= run.deadline) return answer(ctx, await timeout(ctx, raft, run));
-  if (end.outcome === "cancelled") return answer(ctx, await submitFailed(ctx, raft, run, "The analysis turn was cancelled before it gave a result."));
+  if (end.outcome === "cancelled") return answer(ctx, await submitFailed(ctx, raft, run, "The analysis turn was cancelled before it gave a result.", "cancelled"));
   if (end.outcome === "failed") {
     // An empty reply at the cap is the reasoning having used it all, not an answer: asked once more with none, in the
     // read's fix-up slot. A second one, or one with the slot spent, fails the run as any model failure does.
@@ -589,7 +630,7 @@ async function turnEnded(ctx: PluginContext, end: TurnEnd): Promise<PluginNext |
       log(ctx, run, "retry_without_reasoning");
       return answer(ctx, await askAgainWithoutReasoning(ctx, run));
     }
-    return answer(ctx, await submitFailed(ctx, raft, run, `The model failed before giving a result: ${end.error ?? "no reason was given"}`));
+    return answer(ctx, await submitFailed(ctx, raft, run, `The model failed before giving a result: ${end.error ?? "no reason was given"}`, "model_failed"));
   }
   return answer(ctx, await submitModel(ctx, raft, run, resultOf(end.finalText, run)));
 }

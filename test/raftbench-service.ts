@@ -21,7 +21,7 @@ import type { ModelResponse } from "../src/model/types.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { setLogSink } from "../src/core/log.ts";
 import type { HookRow } from "../cf/src/control-plane.ts";
-import { MAX_CALLS, RAFTBENCH_INSTRUCTIONS, RAFTBENCH_MAX_TOKENS, RETRY_DELAYS_MS, RUN_DEADLINE_MS } from "../src/plugins/raftbench.ts";
+import { MAX_CALLS, OUTPUT_ENFORCEMENT, RAFTBENCH_INSTRUCTIONS, RAFTBENCH_MAX_TOKENS, RETRY_DELAYS_MS, RUN_DEADLINE_MS } from "../src/plugins/raftbench.ts";
 import { BASE_SYSTEM } from "../src/runtime/pi-prompt.ts";
 import { modelToolName } from "../src/runtime/pi-tools.ts";
 
@@ -311,6 +311,11 @@ const GAPS = ["missing_tool_outcomes"];
 /** What the model was given, as the cases below saw it, for RAFTBENCH_PROMPTS_DIR. */
 const exported: { system?: string; firstTurn?: string; fixup?: string } = {};
 const runLogs = (step: string) => logs.filter((l) => l.evt === "raftbench.run" && l.step === step);
+/** Trace rows of a kind, as the agent's outbox holds them. */
+const traceRows = (w: World, kind: string) => (w.host.sql.exec("SELECT status, verdict, attrs FROM trace_outbox WHERE kind = ? ORDER BY seq", kind).toArray() as any[])
+  .map((r) => ({ status: String(r.status), verdict: String(r.verdict), attrs: JSON.parse(String(r.attrs)) }));
+/** Every key a `raftbench.run_done` row may carry: ids, fixed codes and counts, nothing of the result or the model's text. */
+const RUN_DONE_KEYS = new Set(["mount", "runId", "revision", "outcome", "output", "from", "failure", "fixups", "calls", "reads", "retries", "receiptId", "code"]);
 
 // ---- the profile ---------------------------------------------------------------------------------------------
 
@@ -436,6 +441,28 @@ await check("a valid result is submitted once, as the model wrote it, with the r
   must(runLogs("done").some((l) => l.outcome === "accepted"), show(runLogs("done")));
 });
 
+await check("the output format is said to be the prompt's only, never enforced: on the assigned and done log lines and the run's trace row", async () => {
+  const w = await world();
+  logs.length = 0;
+  await assign(w);
+  await answer(w, goodResult());
+  must(OUTPUT_ENFORCEMENT === "prompt_only", OUTPUT_ENFORCEMENT);
+  const assigned = runLogs("assigned"), done = runLogs("done");
+  must(assigned.length === 1 && assigned[0].output === "prompt_only", show(assigned));
+  must(done.length === 1 && done[0].output === "prompt_only", show(done));
+  const rows = traceRows(w, "raftbench.run_done");
+  must(rows.length === 1, `run_done rows: ${show(rows)}`);
+  const [row] = rows;
+  const receiptId = [...w.raft.accepted.values()][0]?.receiptId;
+  must(typeof receiptId === "string", "no receipt");
+  must(row!.status === "accepted" && row!.verdict === "ok", show(row));
+  must(canon(row!.attrs) === canon({ mount: "raftbench", runId: w.raft.run.runId, revision: 3, outcome: "accepted", output: "prompt_only", from: "model",
+    fixups: 0, calls: 1, reads: 1, retries: 0, receiptId }), show(row!.attrs));
+  must(Object.keys(row!.attrs).every((k) => RUN_DONE_KEYS.has(k)), show(row!.attrs));
+  for (let i = 0; i < 2; i++) await pass(w);
+  must(traceRows(w, "raftbench.run_done").length === 1, "a later pass wrote the run's end again");
+});
+
 await check("the model's own incomplete is submitted as it wrote it, through submit, never as the plugin's failure", async () => {
   const w = await world();
   await assign(w);
@@ -500,6 +527,12 @@ await check("invalid output gets exactly one fix-up turn with the SDK's list; in
   must(/^validation failed: /.test(submits[0]!.body.reason) && /status/.test(submits[0]!.body.reason) && /messageId/.test(submits[0]!.body.reason), submits[0]!.body.reason);
   for (let i = 0; i < 2; i++) await pass(w);
   must(w.sent.length === 2 && w.raft.submits().length === 1, "something ran after the run ended");
+  // The run's end, in the trace too: a failed run of the plugin's own, its one fix-up counted, none of the reason.
+  const rows = traceRows(w, "raftbench.run_done");
+  must(rows.length === 1 && rows[0]!.status === "accepted" && rows[0]!.verdict === "failed", show(rows));
+  const a = rows[0]!.attrs;
+  must(a.from === "plugin" && a.failure === "validation_failed" && a.fixups === 1 && a.calls === 2 && a.output === "prompt_only" && typeof a.receiptId === "string", show(a));
+  must(Object.keys(a).every((k) => RUN_DONE_KEYS.has(k)) && !show(a).includes("messageId") && !show(a).includes("validation failed"), show(a));
 });
 
 await check("a model that writes failure itself is refused locally, sends nothing, and gets its one fix-up", async () => {
