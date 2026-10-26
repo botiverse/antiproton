@@ -1409,9 +1409,10 @@ export function claimedNames(form: SandboxForm): string[] {
  *
  * One limit worth knowing: two forms setting the same config key both apply,
  * in this order. For a multi-valued key (`credential.helper`) that is what git
- * does anyway; for a single-valued one git takes the first, so the mount wired
- * first wins and the other is ignored without a word (two mounts of one origin
- * would push as the first account: git 2.39.5, two `http.<url>.extraHeader`).
+ * does anyway; for a single-valued one (`user.name`) the mount wired last wins.
+ * `http.<url>.extraHeader` is multi-valued, so two mounts of one origin send
+ * both headers, and a server that takes one `Authorization` refuses the request
+ * (stamp.build answers 400): measured on git 2.39.5 and 2.53.0.
  */
 export function envFor(state: BoxState | null): Record<string, string> {
   const env: Record<string, string> = {};
