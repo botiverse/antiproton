@@ -404,11 +404,7 @@ export const run9: SandboxBackend = {
   caps: {
     pause: "disk",
     snapshot: "stopped",
-    backgroundExec: "native",
-    publicPorts: false,
-    egressPolicy: false,
     billing: "exists",
-    usageMeter: "estimate",
     boxSecrets: true,
   },
   // A run9 box runs commands as root with the full capability set, so a plain `unshare -n` makes the namespace.

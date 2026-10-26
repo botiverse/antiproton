@@ -700,14 +700,9 @@ export const instabox: SandboxBackend = {
   caps: {
     pause: "memory",
     snapshot: "live",
-    backgroundExec: "emulated",
-    publicPorts: true,
-    egressPolicy: false,
     // From InstaBox pricing (https://instabox.sh/llms-full.txt): runtime per second while running; a paused or
     // stopped machine pays storage only.
     billing: "running",
-    // `usage()` reads InstaBox's own meter, but held time is still the plugin's estimate until metering reads it.
-    usageMeter: "estimate",
     boxSecrets: false,
   },
   // Commands run as the box's user (uid 1000), not root, so `unshare -n` alone is refused. A user namespace that
