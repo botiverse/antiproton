@@ -5,7 +5,7 @@ import type { R2Artifacts } from "../store/artifacts.ts";
 import { AGENT_REF, keyForRef, toAgentRef } from "../store/refs.ts";
 import { spanText } from "../runtime/idle-lease.ts";
 import { ProviderError, TERMINAL_EXEC_STATES } from "./sandbox/provider.ts";
-import type { BoxState as ProviderBoxState, ExecStatus, SandboxBackend, SandboxProvider } from "./sandbox/provider.ts";
+import type { BoxState as ProviderBoxState, EgressSecret, ExecStatus, SandboxBackend, SandboxProvider } from "./sandbox/provider.ts";
 import { run9 } from "./sandbox/providers/run9.ts";
 
 export { AWAKE_STATES, PUT_SETTLE_MS } from "./sandbox/providers/run9.ts";
@@ -1316,9 +1316,6 @@ interface LeftOut { alias: string; why: string }
 /** A wiring this record cannot account for; the next command clears the box and wires again. */
 const UNKNOWN_WIRING: Wired = { alias: "", plugin: "", placeholder: "", digest: "", names: null };
 
-/** One credential registered with run9's egress for one box. */
-interface Registration { name: string; value: string; placeholder: string; header: string; hosts: string[] }
-
 /**
  * What stands for a mount's credential in one container. Qualified by box,
  * because run9 requires a placeholder to be unique across the project, and
@@ -1334,8 +1331,8 @@ export function placeholderFor(
   return `__AP_${tag(alias).toUpperCase()}_${tag(boxId.slice(-8))}_${fresh}__`;
 }
 
-/** A form's registrations for one credential and placeholder: the value goes to run9's egress, never into the box. */
-export function registrationsFor(form: SandboxForm, credential: string, placeholder: string): Registration[] {
+/** A form's registrations for one credential and placeholder: the value goes to the provider's egress, never into the box. */
+export function registrationsFor(form: SandboxForm, credential: string, placeholder: string): EgressSecret[] {
   return form.egress.map((e) => ({
     name: e.name, value: e.value(credential), placeholder: e.placeholder(placeholder), header: e.header, hosts: [...e.hosts],
   }));
