@@ -424,6 +424,10 @@ await check("the read log line carries the run and the window (coverage from/to)
     && read[0].coverageFrom === "2026-10-16T01:02:03.004Z" && read[0].coverageTo === "2026-10-17T05:06:07.008Z", show(read));
   // Neither the context response nor `readAll` gives these: logged as missing, not made up.
   must(read[0].sourceKind === null && read[0].start === null && read[0].nextCursor === null && read[0].missing === "sourceKind,start,nextCursor", show(read));
+  // The line holds ids, cursors, times and counts only: a key outside this set (the material's text, evidence, a whole
+  // response) is a leak the "no text" rule depends on catching.
+  const READ_KEYS = ["agentId", "coverageFrom", "coverageTo", "evt", "fetched", "missing", "mount", "nextCursor", "pages", "revision", "runId", "sourceKind", "start", "step", "stopReason", "tenantId"];
+  must(JSON.stringify(Object.keys(read[0]).sort()) === JSON.stringify(READ_KEYS), `the read line carries other keys: ${JSON.stringify(Object.keys(read[0]).sort())}`);
   const w2 = await world();
   w2.raft.newer = { page: {}, coverage: { from: undefined, to: undefined } };
   logs.length = 0;

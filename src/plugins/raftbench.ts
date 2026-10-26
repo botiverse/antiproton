@@ -560,8 +560,11 @@ function traceDone(ctx: PluginContext, run: RunState, outcome: string, extra: Re
     attrs: {
       runId: run.runId, revision: run.revision, outcome: head, output: OUTPUT_ENFORCEMENT,
       ...(run.from ? { from: run.from } : {}),
-      // The `from === "plugin"` half is redundant today: `failure` is only written by `submitFailed`, together with
-      // `from: "plugin"`. If `failure` ever gets a second writer, this half becomes load-bearing and needs its own test.
+      // `from` and `failure` are load-bearing here: on a give-up and on a stop in `send` they say which submission was
+      // in flight, and the retention case and the stop and give-up cases redden without them. Only the
+      // `from === "plugin"` half of the condition below is redundant today: `failure` is only written by `submitFailed`,
+      // together with `from: "plugin"`. If `failure` ever gets a second writer, that half becomes load-bearing and needs
+      // its own test.
       ...(run.from === "plugin" && run.failure ? { failure: run.failure } : {}),
       fixups: run.fixups ?? 0, calls: run.calls, reads: run.reads, retries: run.retries,
       ...(typeof extra.receiptId === "string" ? { receiptId: extra.receiptId } : {}),
