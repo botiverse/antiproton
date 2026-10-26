@@ -17,10 +17,11 @@
  * agent access token lives 15 minutes and every refresh rotates both tokens
  * (botiverse/stamp `internal/store/crypto.go`, `agentAccessTTL`, as of server-v0.1.191), so a mount that sends one fixed credential stops
  * working a quarter of an hour after it is supplied. The session is therefore
- * kept sealed in this mount's own database, refreshed here, and written back
- * before it is used — the same rule `@botiverse/stamp-sdk/client`'s
- * `injectedAgentAuth` enforces, done here because the sealing key is
- * `raft-agent-login.ts`'s and the rotation has to survive the mount.
+ * kept sealed in this mount's own database and handed to
+ * `@botiverse/stamp-sdk/client`'s `injectedAgentAuth`, which refreshes it and
+ * gives every rotated one back to be stored before it is used. The sealing is
+ * here, because its key is `raft-agent-login.ts`'s; the requests, the refresh
+ * and its single-flight are the SDK's, so they move with Stamp's own client.
  *
  * **A refresh token is single-use, and reusing a rotated one is destructive:**
  * the gateway answers `refresh_reused` and revokes *every* refresh token that
@@ -32,6 +33,8 @@
  * container `git` over Stamp's HTTPS endpoint, with the session swapped in by
  * the egress proxy, so the container never holds it.
  */
+/// <reference path="./stamp-sdk.d.ts" />
+import { AgentError, ApiError, injectedAgentAuth, makeClient } from "@botiverse/stamp-sdk/client";
 import type { Json } from "../core/types.ts";
 import { openText, sealText } from "./raft-agent-login.ts";
 import type { CredentialCheck, Plugin, PluginContext, ToolSchema } from "./types.ts";
@@ -46,8 +49,6 @@ export const SESSION_STORE = "stampSession";
 const SESSION_KEY = "session";
 /** Separates this mount's seal from the Connected App sessions the same key seals. */
 const SEAL_INFO = "antiproton stamp agent session v1";
-/** An access token this close to expiry is refreshed before it is sent, as the SDK does. */
-export const REFRESH_SKEW_MS = 60_000;
 
 /**
  * `raft-cli-agent-session.v1`: what `stamp login` keeps, and what a person hands
@@ -78,24 +79,6 @@ export function parseSession(value: unknown): AgentSession | null {
   return s as AgentSession;
 }
 
-/** Whether a session's access token is close enough to expiry to refresh first. */
-function needsRefresh(session: AgentSession, now: number, skewMs: number): boolean {
-  const at = Date.parse(String(session.access_expires_at ?? ""));
-  // No expiry named: use it. A wrong guess costs one refused call, and that call
-  // already retries through a rotation.
-  if (!Number.isFinite(at)) return false;
-  return at - now <= skewMs;
-}
-
-/**
- * Rotations in flight, one per mount. A refresh token is single-use, so two
- * concurrent calls that both rotated would make one of them `refresh_reused` —
- * which revokes every token that agent holds. Keyed by the mount's place rather
- * than by the object, because the same plugin serves every mount in the isolate.
- */
-const inflight = new Map<string, Promise<AgentSession>>();
-const inlineKey = (ctx: PluginContext) => `${ctx.caller.tenantId}\u0000${ctx.caller.agentId}\u0000${ctx.alias}`;
-
 /**
  * The session this mount acts with: the rotated one it keeps, else the one its
  * credential carries.
@@ -123,58 +106,6 @@ async function storeSession(ctx: PluginContext, session: AgentSession): Promise<
 }
 
 /**
- * One rotation, shared by every call that needs it.
- *
- * `POST /api/auth/agent/refresh` is a closed body — no session header, no Raft
- * credential (`agentRefresh` in botiverse/stamp `internal/gateway/agent_cli_login.go`, as of server-v0.1.191) — so a
- * mount that holds a refresh token can rotate without a person present.
- */
-async function rotate(ctx: PluginContext, used: AgentSession): Promise<AgentSession> {
-  const key = inlineKey(ctx);
-  const running = inflight.get(key);
-  if (running) return running;
-
-  const job = (async () => {
-    const res = await fetch(new URL("/api/auth/agent/refresh", ORIGIN), {
-      method: "POST",
-      headers: { accept: "application/json", "content-type": "application/json", "user-agent": "antiproton/0.1" },
-      body: JSON.stringify({ schema: "raft-cli-agent-refresh.v1", refresh_token: used.refresh_token }),
-      signal: AbortSignal.timeout(30_000),
-      redirect: "error",
-    });
-    const text = await res.text();
-    let body: Record<string, unknown> = {};
-    try { body = text ? JSON.parse(text) as Record<string, unknown> : {}; } catch { body = { text: text.slice(0, 500) }; }
-
-    if (!res.ok) {
-      const code = String(body.error ?? body.code ?? body.errorCode ?? "");
-      // Not retried, and said in the only terms that help: somebody has to act.
-      if (code === "refresh_reused" || code === "refresh_revoked") {
-        throw new Error(
-          `stamp: this session's refresh token was already used elsewhere or has been revoked (${code}), and the gateway ` +
-          "revokes every token that agent holds for the service when that happens — including other machines. " +
-          "A person needs to sign in again for this mount alone and give it that session; do not retry.",
-        );
-      }
-      throw new Error(`stamp: could not refresh the session (${res.status}${code ? ` ${code}` : ""}) — ` +
-        `${String(body.message ?? body.text ?? "").slice(0, 300)}`.trim());
-    }
-
-    const next = parseSession({ ...body, access_token: body.access_token ?? (body as any).accessToken,
-      refresh_token: body.refresh_token ?? (body as any).refreshToken });
-    if (!next) throw new Error("stamp: the refresh answered something that is not a session; nothing was stored");
-
-    // Before it is used, always: a rotation that cannot be kept would leave the
-    // caller holding a token the next call cannot rotate again.
-    await storeSession(ctx, next);
-    return next;
-  })().finally(() => { inflight.delete(key); });
-
-  inflight.set(key, job);
-  return job;
-}
-
-/**
  * Why there is nothing to act as, in the terms the mount's own state calls for: the state goes in
  * the fields and the sentence together (markIdentity, identityNote), as every plugin with a
  * credential reports it. An attached credential that is not a session is told what it is not; a
@@ -193,19 +124,50 @@ function noSession(ctx: PluginContext): Error {
   return markIdentity(new Error(`stamp: nothing to act as — ${identityNote(ctx)}${what ? `. ${what}` : ""}`), ctx);
 }
 
-/** The access token to send now, rotating first when it is due. */
-async function accessToken(ctx: PluginContext, fresh: boolean): Promise<{ token: string; session: AgentSession }> {
-  const session = await loadSession(ctx);
-  if (!session) {
-    throw noSession(ctx);
-  }
-  if (!fresh && !needsRefresh(session, Date.now(), REFRESH_SKEW_MS)) {
-    return { token: session.access_token, session };
-  }
-  const next = await rotate(ctx, session);
-  return { token: next.access_token, session: next };
-}
+/**
+ * One SDK client per mount, kept for the isolate's life: the auth holds the
+ * rotation in flight and the last one it made, and a refresh token is
+ * single-use, so two clients for one mount could both rotate and the second
+ * would be `refresh_reused` — which revokes every token that agent holds.
+ * Keyed by the mount's place rather than by the object, because the same
+ * plugin serves every mount in the isolate. The context is the latest call's,
+ * since the store is reached through it.
+ */
+const clients = new Map<string, { ctx: PluginContext; api: (method: string, path: string, body?: unknown) => Promise<any> }>();
+const mountKey = (ctx: PluginContext) => `${ctx.caller.tenantId}\u0000${ctx.caller.agentId}\u0000${ctx.alias}`;
 
+/**
+ * Every request leaves with this plugin's agent, a deadline, and no redirect
+ * followed unless the SDK asked otherwise (the refresh reads a 3xx itself).
+ * `fetch` is looked up per request, not captured, so the global in force is
+ * the one used.
+ */
+const send = (url: string | URL, init: RequestInit = {}) => fetch(url, {
+  ...init,
+  headers: { ...(init.headers as Record<string, string> | undefined), "user-agent": "antiproton/0.1" },
+  signal: init.signal ?? AbortSignal.timeout(30_000),
+  redirect: init.redirect ?? "error",
+});
+
+function clientFor(ctx: PluginContext) {
+  const key = mountKey(ctx);
+  let entry = clients.get(key);
+  if (!entry) {
+    const holder: { ctx: PluginContext; api: any } = { ctx, api: null };
+    const auth = injectedAgentAuth({
+      apiBase: ORIGIN,
+      getSession: () => loadSession(holder.ctx),
+      onSession: (session: AgentSession) => storeSession(holder.ctx, session),
+      fetchImpl: send,
+    });
+    // Reads are not retried here: the tools declare their own idempotency.
+    holder.api = makeClient(auth, send, { retryReads: false });
+    entry = holder;
+    clients.set(key, entry);
+  }
+  entry.ctx = ctx;
+  return entry.api;
+}
 /**
  * Tools whose answer is a list of pull requests or receipts: the fields an
  * agent asks the next question with, and not the whole gateway object.
@@ -277,46 +239,39 @@ const prBase = (a: Record<string, any>) => {
 
 /**
  * One request to the gateway, with the mount's session attached here and never
- * in the JS sandbox. A 401 rotates once and retries once: the token may have
- * been rotated by another call between reading it and sending it.
+ * in the JS sandbox. The SDK refreshes an access token due to expire, and on a
+ * 401 rotates once and retries once; what it refuses is said here in the terms
+ * a caller acts on.
  */
 async function call(method: string, path: string, ctx: PluginContext, body?: unknown): Promise<any> {
-  const send = async (token: string) => {
-    const headers: Record<string, string> = { accept: "application/json", "user-agent": "antiproton/0.1" };
-    headers.authorization = `Bearer ${token}`;
-    if (body !== undefined) headers["content-type"] = "application/json";
-    return fetch(new URL(ORIGIN + path), {
-      method, headers,
-      body: body === undefined ? undefined : JSON.stringify(body),
-      signal: AbortSignal.timeout(30_000),
-      redirect: "error",
-    });
-  };
-
-  let { token } = await accessToken(ctx, false);
-  let res = await send(token);
-  if (res.status === 401) {
-    const rotated = await accessToken(ctx, true);
-    if (rotated.token !== token) {
-      token = rotated.token;
-      res = await send(token);
+  try {
+    return await clientFor(ctx)(method, path, body);
+  } catch (e) {
+    if (e instanceof ApiError) {
+      // The gateway's own stable code (SESSION_REQUIRED, AGENT_PRINCIPAL_REQUIRED,
+      // SELF_APPROVAL_NOT_ALLOWED …) is what a caller branches on, so it goes into
+      // the message verbatim rather than being flattened into "HTTP 4xx".
+      const b = e.body as any;
+      const code = b?.errorCode ?? b?.error ?? b?.code;
+      const detail = typeof code === "string" ? `${code}: ` : "";
+      // A body that is not JSON (a proxy's page) has only the SDK's summary of its text.
+      const message = b?.message ?? b?.error_description ?? (b == null ? e.message : "");
+      throw new Error(`${method} ${path} refused ${e.status}: ${detail}${String(message).slice(0, 300)}`);
     }
+    if (e instanceof AgentError) {
+      if (e.code === "injected_session_missing") throw noSession(ctx);
+      // Not retried, and said in the only terms that help: somebody has to act.
+      if (e.code === "refresh_lost") {
+        throw new Error(
+          `stamp: this session's refresh token was already used elsewhere, has been revoked or has expired (${e.details?.code}), ` +
+          "and a reused one makes the gateway revoke every token that agent holds for the service — including other machines. " +
+          "A person needs to sign in again for this mount alone and give it that session; do not retry.",
+        );
+      }
+      if (String(e.code).startsWith("refresh_")) throw new Error(`stamp: could not refresh the session — ${e.message}`);
+    }
+    throw e;
   }
-
-  const text = await res.text();
-  let parsed: any = null;
-  try { parsed = text ? JSON.parse(text) : null; } catch { parsed = { text: text.slice(0, 2_000) }; }
-
-  if (!res.ok) {
-    // The gateway's own stable code (SESSION_REQUIRED, AGENT_PRINCIPAL_REQUIRED,
-    // SELF_APPROVAL_NOT_ALLOWED …) is what a caller branches on, so it goes into
-    // the message verbatim rather than being flattened into "HTTP 4xx".
-    const code = parsed?.errorCode ?? parsed?.error ?? parsed?.code;
-    const detail = typeof code === "string" ? `${code}: ` : "";
-    const message = parsed?.message ?? parsed?.error_description ?? parsed?.text ?? "";
-    throw new Error(`${method} ${path} refused ${res.status}: ${detail}${String(message).slice(0, 300)}`);
-  }
-  return parsed;
 }
 
 const t = (

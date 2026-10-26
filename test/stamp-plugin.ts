@@ -64,7 +64,13 @@ globalThis.fetch = (async (input: any, init: any) => {
   return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 }) as any;
 
-/** A mount's database: one store, in memory, so a test can look at what was kept. */
+/**
+ * A mount's database: one store, in memory, so a test can look at what was kept.
+ * Each call is a different mount (its own agent), because the plugin keeps one
+ * client per mount for the isolate's life and a case must not inherit another's
+ * rotation.
+ */
+let mounts = 0;
 function makeCtx(credential: string | null = session()) {
   const rows = new Map<string, any>();
   const db = {
@@ -79,7 +85,7 @@ function makeCtx(credential: string | null = session()) {
   };
   return {
     rows,
-    ctx: { credential, alias: "stamp", publicConfig: {}, caller: { tenantId: "t", agentId: "a" }, db } as any,
+    ctx: { credential, alias: "stamp", publicConfig: {}, caller: { tenantId: "t", agentId: `a${++mounts}` }, db } as any,
   };
 }
 
@@ -222,8 +228,8 @@ await check("the rotated session is kept sealed, not as plaintext", async () => 
   reset();
   const { ctx, rows } = makeCtx(session({ access_expires_at: new Date(Date.now() - 1000).toISOString() }));
   refreshAnswer = () => new Response(JSON.stringify({
-    schema: "raft-cli-agent-session.v1", access_token: "ACCESS-2", refresh_token: "REFRESH-2",
-    access_expires_at: new Date(Date.now() + 15 * 60_000).toISOString(),
+    schema: "raft-cli-agent-session.v1", token_type: "Bearer", access_token: "ACCESS-2", refresh_token: "REFRESH-2",
+    access_expires_at: new Date(Date.now() + 15 * 60_000).toISOString(), refresh_expires_at: null,
   }), { status: 200, headers: { "content-type": "application/json" } });
   await invoke("whoami", {}, ctx);
   must(refreshes === 1, `refreshes: ${refreshes}`);
@@ -244,19 +250,36 @@ await check("concurrent calls share one rotation, because a refresh token is sin
   reset();
   const { ctx } = makeCtx(session({ access_expires_at: new Date(Date.now() - 1000).toISOString() }));
   refreshAnswer = () => new Response(JSON.stringify({
-    schema: "raft-cli-agent-session.v1", access_token: "ACCESS-3", refresh_token: "REFRESH-3",
-    access_expires_at: new Date(Date.now() + 15 * 60_000).toISOString(),
+    schema: "raft-cli-agent-session.v1", token_type: "Bearer", access_token: "ACCESS-3", refresh_token: "REFRESH-3",
+    access_expires_at: new Date(Date.now() + 15 * 60_000).toISOString(), refresh_expires_at: null,
   }), { status: 200, headers: { "content-type": "application/json" } });
   await Promise.all([invoke("whoami", {}, ctx), invoke("whoami", {}, ctx), invoke("whoami", {}, ctx)]);
   must(refreshes === 1, `refreshes: ${refreshes} (three calls must share one)`);
+});
+
+// A tool call gets a fresh context object each time, so the shared rotation has
+// to be found by the mount, not by the object: two contexts of one mount,
+// calling at once, must not both spend the single-use refresh token.
+await check("two contexts of one mount share one rotation", async () => {
+  reset();
+  const { ctx } = makeCtx(session({ access_expires_at: new Date(Date.now() - 1000).toISOString() }));
+  const again = { ...ctx };
+  refreshAnswer = () => new Response(JSON.stringify({
+    schema: "raft-cli-agent-session.v1", token_type: "Bearer", access_token: "ACCESS-6", refresh_token: "REFRESH-6",
+    access_expires_at: new Date(Date.now() + 15 * 60_000).toISOString(), refresh_expires_at: null,
+  }), { status: 200, headers: { "content-type": "application/json" } });
+  await Promise.all([invoke("whoami", {}, ctx), invoke("whoami", {}, again)]);
+  must(refreshes === 1, `refreshes: ${refreshes} (one mount, one rotation)`);
+  const me = seen.filter((r) => r.path === "/v1/me");
+  must(me.length === 2 && me.every((r) => r.auth === "Bearer ACCESS-6"), `sent: ${me.map((r) => r.auth).join(", ")}`);
 });
 
 await check("a rotation that cannot be stored fails the call and is not used", async () => {
   reset();
   const { ctx, rows } = makeCtx(session({ access_expires_at: new Date(Date.now() - 1000).toISOString() }));
   refreshAnswer = () => new Response(JSON.stringify({
-    schema: "raft-cli-agent-session.v1", access_token: "ACCESS-4", refresh_token: "REFRESH-4",
-    access_expires_at: new Date(Date.now() + 15 * 60_000).toISOString(),
+    schema: "raft-cli-agent-session.v1", token_type: "Bearer", access_token: "ACCESS-4", refresh_token: "REFRESH-4",
+    access_expires_at: new Date(Date.now() + 15 * 60_000).toISOString(), refresh_expires_at: null,
   }), { status: 200, headers: { "content-type": "application/json" } });
   failNextStore = true;
   let threw = "";
@@ -293,8 +316,8 @@ await check("a 401 rotates once and retries once, with the new token", async () 
     return inner(input, init);
   }) as any;
   refreshAnswer = () => new Response(JSON.stringify({
-    schema: "raft-cli-agent-session.v1", access_token: "ACCESS-5", refresh_token: "REFRESH-5",
-    access_expires_at: new Date(Date.now() + 15 * 60_000).toISOString(),
+    schema: "raft-cli-agent-session.v1", token_type: "Bearer", access_token: "ACCESS-5", refresh_token: "REFRESH-5",
+    access_expires_at: new Date(Date.now() + 15 * 60_000).toISOString(), refresh_expires_at: null,
   }), { status: 200, headers: { "content-type": "application/json" } });
   const me = await invoke("whoami", {}, ctx);
   globalThis.fetch = inner;
