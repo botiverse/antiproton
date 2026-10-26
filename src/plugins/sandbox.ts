@@ -2476,7 +2476,8 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     // call. Every setting below this line belongs to the run9 provider.
     { name: "provider", type: "string", choices: PROVIDERS, default: "run9",
       summary: "Which sandbox provider runs the container: run9 or instabox. On InstaBox the working directory " +
-        "defaults to /data/home/work, the size to 2c4g, and `image`, `project` and `verifyWith` do not apply." },
+        "defaults to /data/home/work, the size to 2c4g, and `project` and `verifyWith` do not apply. On InstaBox an `image` " +
+        "runs as a Docker container inside the machine, and every command and file goes into it; without one, commands run on the machine." },
     { name: "template", type: "string", default: DEFAULTS.template,
       summary: "InstaBox only: the template a new machine starts from (GET /v1/templates lists them)." },
     { name: "maxLifetimeHours", type: "number", default: DEFAULTS.maxLifetimeHours,
