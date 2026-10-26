@@ -359,15 +359,20 @@ function assigned(a: { runId: string; revision: number }, receivedAt: number): R
 
 /** Read the run's material (again, on a reread) and hand the model its first turn. */
 async function read(ctx: PluginContext, raft: Raft, run: RunState): Promise<PluginNext | void> {
-  if (run.reads >= MAX_READS) return end(ctx, raft, run, "stopped: the run's material changed again after it was read again", {});
-  // A reread starts over: what the last read's result held goes with it.
-  const reading: RunState = { ...run, phase: "reading", reads: run.reads + 1, readCalls: 0 };
+  // A reread starts over: what the last read's result held goes with it. The stop below ends from that same state and
+  // before the count moves, so its `run_done` row carries no `from` or `failure` of the last read's result and counts
+  // only the reads that happened.
+  const reading: RunState = { ...run, phase: "reading", readCalls: 0 };
   delete reading.body;
   delete reading.sources;
   delete reading.from;
   delete reading.reason;
   delete reading.failure;
   delete reading.retryAt;
+  if (reading.reads >= MAX_READS) {
+    return end(ctx, raft, reading, "stopped: the run's material changed again after it was read again", { code: "material_changed_again" });
+  }
+  reading.reads += 1;
   await save(ctx, CURRENT, reading);
   return resumeRead(ctx, raft, reading);
 }
@@ -537,7 +542,7 @@ async function end(ctx: PluginContext, raft: Raft, run: RunState, outcome: strin
  * The run's end as a trace row (`raftbench.run_done`) beside its `done` log line, since Workers Logs can drop a line and
  * the trace is kept with the agent's other spans. Ids, fixed codes and counts only: never the result, its findings,
  * the model's text or a failure's reason. `outcome` is the outcome's fixed head (`accepted`, `refused`, `gave_up`,
- * `stopped`), a stop's or a give-up's `code` the Server's or the SDK's fixed code; an accepted result of the plugin's own (`from: "plugin"`) is a failed run, `failure` saying which.
+ * `stopped`), a stop's or a give-up's `code` the Server's, the SDK's or the plugin's own fixed code (`material_changed_again`); an accepted result of the plugin's own (`from: "plugin"`) is a failed run, `failure` saying which.
  */
 function traceDone(ctx: PluginContext, run: RunState, outcome: string, extra: Record<string, unknown>) {
   const head = outcome.split(":")[0]!;
