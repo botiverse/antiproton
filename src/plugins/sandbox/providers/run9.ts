@@ -129,6 +129,16 @@ function open(settings: ProviderSettings, credential: string): SandboxProvider {
         ...(spec.shape ? { desired_shape: spec.shape } : {}),
         description: spec.description,
       });
+      return { id: spec.id };
+    },
+
+    /**
+     * A create answered "already exists" for an id the plugin had just minted (seen twice in one benchmark run,
+     * once as run9's own database's duplicate-key error): the box is there and only the answer was lost, so it is
+     * this spec's when the project lists it.
+     */
+    async adopt(spec: BoxSpec) {
+      return (await this.status(spec.id)) === "gone" ? null : spec.id;
     },
 
     /**
@@ -390,14 +400,19 @@ async function account(settings: ProviderSettings, credential: string): Promise<
 
 export const run9: SandboxBackend = {
   id: "run9",
+  name: "run9",
   caps: {
     pause: "disk",
     snapshot: "stopped",
     backgroundExec: "native",
     publicPorts: false,
     egressPolicy: false,
+    billing: "exists",
     usageMeter: "estimate",
+    boxSecrets: true,
   },
+  // A run9 box runs commands as root with the full capability set, so a plain `unshare -n` makes the namespace.
+  isolateNetwork: ["unshare", "-n", "--"],
   open,
   checkCredential,
   account,
