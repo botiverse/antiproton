@@ -21,7 +21,8 @@ import { confirmLine, matches, ruleLine, rulesOf, winningRule, type ContactRule 
 import { setLogSink } from "../src/core/log.ts";
 import { askWake } from "../src/runtime/plugin-wakes.ts";
 import { CONTACT_KEY, type SendAsOwnerDeps } from "../src/plugins/raft-assistant.ts";
-import { INTEGRATION_SESSIONS_STORE, REMINDER_TOOL, paramsProblem, reminderServiceOf } from "../src/plugins/raft-assistant-reminder.ts";
+import { INTEGRATION_SESSIONS_STORE, REMINDER_TOOL, REMINDER_TOOL_SCHEMA, integrationSessionStore, paramsProblem, reminderServiceOf } from "../src/plugins/raft-assistant-reminder.ts";
+import { withheld } from "../src/plugins/raft-agent-login.ts";
 import { recordedEngine } from "../src/runtime/durable-agent.ts";
 import { AgentRuntime } from "../cf/src/runtime.ts";
 import { operatorModelOf } from "../cf/src/model-request.ts";
@@ -3315,6 +3316,41 @@ await check("reminder: the app's session is kept sealed in the mount's database,
   must(a.read(INTEGRATION_SESSIONS_STORE, REMINDER_SERVICE.clientId), "control: a session is kept");
   await raftPlugin.snapshotTools!({ ...a.ctx, credential: undefined });
   must(a.read(INTEGRATION_SESSIONS_STORE, REMINDER_SERVICE.clientId) === undefined, "the session outlived the credential");
+});
+
+await check("reminder: a session row sealed for one app does not open under another app's client id, even with both ids written to match", async () => {
+  const a = await assistant();
+  await remind(a.ctx, CREATE);
+  const store = integrationSessionStore(a.ctx as never);
+  const mine = { agentId: "agent-1", clientId: REMINDER_SERVICE.clientId };
+  const row = a.read(INTEGRATION_SESSIONS_STORE, REMINDER_SERVICE.clientId);
+  must(row?.agentId === mine.agentId && (await store.get(mine)) !== null, "control: the app's own row opens");
+  // The sealed bytes moved under another app's row, its ids written to pass get()'s own check: only the AAD binds them.
+  const other = { agentId: "agent-1", clientId: VAULT_SERVICE.clientId };
+  a.write(INTEGRATION_SESSIONS_STORE, other.clientId, { v: 1, agentId: other.agentId, clientId: other.clientId, iv: row.iv, ciphertext: row.ciphertext });
+  must((await store.get(other)) === null, "a session sealed for one app opened under another app's client id");
+});
+
+await check("reminder: a cookie value under four characters is not cut from what the model reads (the SDK's sensitiveValues rule); a session value is", async () => {
+  const a = await assistant();
+  const seen: string[] = [];
+  const store = integrationSessionStore(a.ctx as never, seen);
+  const cookie = (pair: string) => ({ pair, host: "reminder.example", path: "/", secure: true });
+  await store.set({ agentId: "agent-1", clientId: REMINDER_SERVICE.clientId }, {
+    returnUrl: "https://reminder.example/", updatedAt: "2026-10-26T00:00:00Z",
+    cookies: [cookie("reminder_session=abc123xyz"), cookie("lang=en"), cookie("consent=1")],
+  });
+  must(!seen.includes("en") && !seen.includes("1") && seen.includes("abc123xyz"), show(seen));
+  const text = "rem-1234 is set for 2026-10-27 at 09:00";
+  must(withheld(text, seen) === text, show(withheld(text, seen)));
+  const echoed = withheld("session abc123xyz", seen);
+  must(echoed === "session [withheld]", show(echoed));
+});
+
+await check("reminder: the model is told to check list-reminders after a failed create-reminder, and to retry with the same requestId", () => {
+  const said = REMINDER_TOOL_SCHEMA.summary;
+  must(/If create-reminder fails, first use list-reminders to see whether it was created/.test(said), said);
+  must(/to retry, reuse the same requestId as the failed call \(a new requestId only for a genuinely new reminder\)/.test(said), said);
 });
 
 await check("reminder: the trace and the log carry the action's name and the outcome only: never params, the app's answer, the session or the login code", async () => {

@@ -1097,11 +1097,13 @@ database in the agent's Durable Object, store `integrationSessions`, one row per
 the Raft agent id it belongs to, sealed (AES-GCM) under a key derived from the mount's Raft credential
 and bound to both ids, listed nowhere; a row for another agent, or one that does not open, reads as
 none and the SDK logs in again. Removing the mount's credential (an agent's delete does) clears the
-store. Every value of the session is cut from what the model reads, should the app echo one. Each call
-writes a `raft.assistant_reminder` row and log line: `action` (the action's name, only when the manifest
-has it) and `outcome` (`actions`, `result`, `approval_required`, `install_required`, `unavailable`,
-`refused:<why>` or `error:<SDK code>`); never the params, the app's answer, the session or the login
-code.
+store. Every value of the session four characters or longer (the SDK's own rule) is cut from what the
+model reads, should the app echo one. Each call writes a `raft.assistant_reminder` row and log line:
+`action` (the action's name, only when the manifest has it) and `outcome` (`actions`, `result`,
+`approval_required`, `install_required`, `unavailable`, `refused:<why>` or `error:<SDK code>`); that row
+and the log never carry the params, the app's answer, the session or the login code. The gateway's own
+`tool.call` row for a failed call carries the error message's first 200 characters, as for every tool
+(`TOOL_ERROR_MAX`, `src/trace/seams.ts`), so an `APP_ERROR` there quotes the app's words.
 
 A `403 assistant_not_enabled` from any call
 pauses the checks, the brief and the notify tool until Raft's context names the
