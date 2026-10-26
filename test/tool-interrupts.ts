@@ -312,6 +312,44 @@ await check("resume after the mount is gone (renamed away) is refused, and nothi
   must(/`db` mount no longer exists/.test(why) && f.db.ran.length === 0 && f.db.resumes.length === 0, `gone: ${why}`);
 });
 
+// Removal marks the mount before its cleanup runs and deletes it only after (`markRemoving`), so while the mark is
+// held the mount is still found: only the mark keeps an answer from acting on it and reading its credential.
+await check("resume on a mount being removed is refused: no operation, nothing resolved, the plugin not reached", async () => {
+  const resumed: unknown[] = [];
+  const asker: Plugin = {
+    id: "asker", version: "1.0.0",
+    tools: [{ name: "ask", summary: "", parameters: { type: "object" }, sideEffects: "write", idempotency: "none" }],
+    async invoke() { return interrupt({ question: "go?", answer: { kind: "yes_no" } }); },
+    interrupts: { async resume(_t, _s, _a, c) { resumed.push(c.credential); return { ok: true }; } },
+  };
+  const store = new SqliteStore(":memory:");
+  await store.init();
+  await store.createAgent("t", "a");
+  await store.addMount({ tenantId: "t", agentId: "a", alias: "acct", plugin: "asker", installationId: "i", connectionId: null,
+    toolVersion: "1.0.0", publicConfig: {}, secretRef: "ref:acct", policy: null });
+  const resolved: string[] = [];
+  const gw = new ToolGateway(store, [asker], new Set(["asker"]), {
+    async resolve(ref: string) { resolved.push(ref); return `secret-of-${ref}`; },
+  } as any);
+  let recorded = 0;
+  const record = store.recordOperation.bind(store);
+  store.recordOperation = async (op) => { recorded++; return record(op); };
+  const operations = async () => recorded;
+  const asked: any = await gw.invoke(CTX, "acct.ask", {});
+  must(asked.status === "interrupted", `asked: ${JSON.stringify(asked)}`);
+  const opsBefore = await operations();
+  resolved.length = 0;
+  const unmark = gw.markRemoving("t", "a", "acct");
+  const r: any = await gw.resumeInterrupt(CTX, asked.interrupt, true);
+  must(r.status === "rejected" && r.error?.code === "not_mounted" && /being removed/.test(r.error?.message), `resumed while being removed: ${JSON.stringify(r)}`);
+  must(!resolved.includes("ref:acct"), `its credential was resolved while it is being removed: ${JSON.stringify(resolved)}`);
+  must(resumed.length === 0, `the plugin's resume ran while the mount is being removed: ${JSON.stringify(resumed)}`);
+  must((await operations()) === opsBefore, `an operation was recorded while the mount is being removed: ${opsBefore} -> ${await operations()}`);
+  unmark();
+  const again: any = await gw.resumeInterrupt(CTX, asked.interrupt, true);
+  must(again.status === "succeeded" && resumed.length === 1, `control: after the mark is lifted the answer goes on: ${JSON.stringify(again)} ${JSON.stringify(resumed)}`);
+});
+
 await check("on a mount that holds something, the answer waits its turn behind a call already running there", async () => {
   const order: string[] = [];
   let open!: () => void;
