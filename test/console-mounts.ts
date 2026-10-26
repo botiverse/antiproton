@@ -739,6 +739,10 @@ await check("route: an anonymous viewer is refused every new write and /ui/plugi
     ["/ui/secret", { name: "anon", value: VALUE }],
     ["/ui/secret/remove", { name: "anon" }],
     ["/ui/plugin/choice", { plugin: "mcp", choice: "disable" }],
+    // Also in UI_WRITE_ROUTES; their handlers check again, so the route-level refusal is the one these pin.
+    ["/ui/agent", { name: "anon" }],
+    ["/ui/api-keys/new", { label: "anon" }],
+    ["/ui/api-keys/revoke", { id: "anon" }],
   ] as const) {
     const r = await post(path, fields, { cookie: null });
     must(r.status === 403 && /read-only/.test(r.text), `${path} anonymously: ${r.status} ${r.text}`);

@@ -3942,7 +3942,7 @@ function tenantOf(v: Viewer): string {
 
 async function requireViewer(request: Request, env: Env): Promise<{ who: string; agentId: string; tenantId: string; viewer: Viewer } | Response> {
   // The anonymous switch opens the page to look at; the write routes refuse
-  // that identity by name further down.
+  // that identity by its `source` further down, never by the display name.
   const v = await viewer(request, env, true);
   if (v) return { who: v.email, agentId: agentOf(v), tenantId: tenantOf(v), viewer: v };
   // A page navigation goes to the sign-in page; a fragment request tells htmx
@@ -4139,7 +4139,7 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
       // A route in the set that also answers a read (`/ui/agent/model`) writes only when it is posted to; a GET
       // there is a read, open to whoever may read the agent.
       const writes = UI_WRITE_ROUTES.has(url.pathname) && !(url.pathname === "/ui/agent/model" && request.method === "GET");
-      if (who.startsWith("anonymous") && writes) {
+      if (gate.viewer.source === "anonymous" && writes) {
         return new Response("read-only: the console is open to anonymous viewers, but not for writes", { status: 403 });
       }
       if (writes) {
@@ -4609,7 +4609,7 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
           const gate = await requireViewer(request, env);
           if (gate instanceof Response) return gate;
           if (request.method !== "POST") return new Response("POST", { status: 405 });
-          if (gate.who.startsWith("anonymous")) return new Response("read-only", { status: 403 });
+          if (gate.viewer.source === "anonymous") return new Response("read-only", { status: 403 });
           const form = await formOf(request);
           if (!form) return new Response("expected a form body", { status: 400 });
           const home = gate.agentId;
@@ -4798,7 +4798,7 @@ async function route(request: Request, env: Env, ctx?: ExecutionContext): Promis
           let issued: { key: string; label: string } | null = null, error: string | null = null;
           if (url.pathname !== "/ui/api-keys") {
             if (request.method !== "POST") return new Response("POST", { status: 405 });
-            if (gate.who.startsWith("anonymous")) return new Response("read-only", { status: 403 });
+            if (gate.viewer.source === "anonymous") return new Response("read-only", { status: 403 });
             const form = await formOf(request);
             if (!form) return new Response("expected a form body", { status: 400 });
             if (url.pathname === "/ui/api-keys/new") {
