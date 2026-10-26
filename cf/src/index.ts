@@ -80,7 +80,7 @@ import { adminMigrateEngine, type MigrateOp } from "./admin-migrate.ts";
 import { readDiagnosis } from "./diagnose-read.ts";
 import { agentObjectName } from "./object-name.ts";
 import { readTranscript, transcriptEvents, approvalsByOp, isPd, type TranscriptEvents } from "./transcript-read.ts";
-import { operatorCredentials } from "./operator-ref.ts";
+import { OPERATOR_INSTABOX_REF, operatorCredentials } from "./operator-ref.ts";
 import { agentSecretValues, credentialRedactor, evalTranscript, localTrace, readTraceWindow, redactCredentials, type EvalTranscript } from "./eval-read.ts";
 import { appendTrace, type TraceOutboxRow } from "../../src/trace/outbox.ts";
 import { readEngineStorage } from "./engine-read.ts";
@@ -190,6 +190,9 @@ export interface Env {
   /** JSON {"ak","sk"} for the operator's run9 account. Absent means the `node`
    *  mount exists but cannot start a container. */
   RUN9?: string;
+  /** The operator's InstaBox account, JSON {"apiKey"} or the bare key, behind `operator:instabox`. Only a SWE-bench
+   *  task the runner starts on InstaBox names it (`benchSweStart`); absent, such a start is refused. */
+  INSTABOX?: string;
   /** The operator's Exa key: the default `search` mount's credential. Absent means that mount cannot search. */
   EXA_API_KEY?: string;
   /** reminder-app's origin (https), where the `reminder` plugin sends this deployment's client credential. */
@@ -977,16 +980,26 @@ export class AgentDO extends DurableObject<Env> {
   /**
    * One SWE-bench instance, inside this object.
    *
-   * The agent gets a real machine (the run9 mount, from the instance's own
+   * The agent gets a real machine (the sandbox mount, from the instance's own
    * published image) and the tools plugin, nothing else — what the Node runner
-   * mounted. The container is held open past the agent's finish because the
+   * mounted. The machine is on run9 unless the runner asks for `provider:
+   * "instabox"`, where the image runs as a container inside an InstaBox
+   * machine. The container is held open past the agent's finish because the
    * grader has to run in it; `benchSweShell` is the runner's way in and
    * `benchSweRelease` is how the machine comes back. Nothing here polls.
    */
   async benchSweStart(taskId: string, o: {
     policy: string; image: string; workdir?: string; shape?: string; timeoutMs?: number;
     shell?: string; shellPrefix?: string; offload?: boolean; network?: "open" | "none"; engine?: string;
+    provider?: string;
   }) {
+    // Refused before anything is touched: a start on a provider this deployment has no account for would otherwise
+    // run the agent's whole turn against tools that refuse every call, and grade a zero.
+    const provider = o.provider ?? "run9";
+    if (provider !== "run9" && provider !== "instabox") throw new Error(`provider must be run9 or instabox; got ${JSON.stringify(o.provider)}`);
+    if (provider === "instabox" && !operatorCredentials(this.env).operatorInstabox) {
+      throw new Error("provider instabox: this deployment holds no InstaBox account (Worker secret INSTABOX)");
+    }
     await this.setOffload(o.offload !== false);
     return this.#busy("benchSweStart", async () => {
       const agentId = `b_${taskId}`;
@@ -1013,6 +1026,13 @@ export class AgentDO extends DurableObject<Env> {
         installationId: "inst-node", connectionId: null,
         toolVersion: rt.pluginVersion("sandbox") ?? "1.0.0",
         publicConfig: {
+          // Named only for InstaBox, so a run9 task's mount is the record it always was.
+          ...(provider === "instabox" ? {
+            provider,
+            // A backstop, not a limit a task meets: InstaBox deletes the machine this long after creating it,
+            // whatever happens to the release. A task holds it for the budget plus grading, under an hour.
+            maxLifetimeHours: 3,
+          } : {}),
           account: "container",
           image: o.image,
           workdir: o.workdir ?? "/testbed",
@@ -1025,11 +1045,11 @@ export class AgentDO extends DurableObject<Env> {
           // retrieval, and in one run six of nine transcripts did exactly that.
           network: o.network ?? "none",
         },
-        secretRef: OPERATOR_RUN9_REF, policy: null,
+        secretRef: provider === "instabox" ? OPERATOR_INSTABOX_REF : OPERATOR_RUN9_REF, policy: null,
       });
       // Last, so a start that fails part way (the name's mounts still there) leaves a finished task finished.
       this.sql.exec("DELETE FROM bench_config WHERE k=?", `ended:${agentId}`);
-      return { taskId, agentId, offload: this.#offloadOn(), mode: "swe", network: o.network ?? "none", engine };
+      return { taskId, agentId, offload: this.#offloadOn(), mode: "swe", network: o.network ?? "none", engine, provider };
     });
   }
 

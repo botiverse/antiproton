@@ -435,7 +435,7 @@ function walkRedacting(value: unknown, exact: RegExp[] | null): Redacted {
  * than sent without that scrub.
  */
 export async function agentSecretValues(
-  sql: Sql, tenantId: string, agentId: string, env: { SECRET_KEK?: string; RUN9?: string; EXA_API_KEY?: string },
+  sql: Sql, tenantId: string, agentId: string, env: { SECRET_KEK?: string; RUN9?: string; INSTABOX?: string; EXA_API_KEY?: string },
 ): Promise<{ ok: true; values: string[] } | { ok: false; message: string }> {
   const values: string[] = [];
   if (hasTable(sql as never, "secrets")) {

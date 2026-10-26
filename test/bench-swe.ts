@@ -53,7 +53,7 @@ const run9 = {
   boxes: new Map<string, { image: string }>(),
   /** `doneAt` Infinity is a command that never ends by itself (HANG); `killable` false is one a kill does not stop (UNKILLABLE). */
   execs: new Map<string, { doneAt: number; output: string; killable: boolean; killed?: boolean }>(),
-  ops: [] as Array<{ method: string; path: string; body: string }>,
+  ops: [] as Array<{ method: string; path: string; body: string; host: string; headers: unknown }>,
   /** Run, not awaited, when a command containing FINISH starts: the runner ending the task while the agent's call
    *  is in flight. Not awaited because the runner's request is its own event, not part of the call: a cancel
    *  waits for the running turn, and the turn is waiting on this call. */
@@ -71,9 +71,12 @@ globalThis.fetch = (async (input: any, init?: any) => {
   const method = String(init?.method ?? "GET");
   const path = url.pathname;
   const body = typeof init?.body === "string" ? init.body : "";
-  run9.ops.push({ method, path, body });
+  run9.ops.push({ method, path, body, host: url.host, headers: init?.headers ?? null });
   const json = (v: unknown, status = 200) => new Response(JSON.stringify(v), { status, headers: { "content-type": "application/json" } });
   let m: RegExpExecArray | null;
+  // InstaBox is not faked beyond refusing the key, definitively, so the adapter does not retry: the provider
+  // cases only need to see where a call went and with what.
+  if (url.host === "api.instabox.sh") return json({ error: { code: "invalid_key", message: "faked InstaBox refuses every key" } }, 401);
   if (method === "POST" && /\/workspace\/boxes$/.test(path)) {
     const b = JSON.parse(body);
     run9.boxes.set(b.box_id, { image: b.source_image_ref });
@@ -128,7 +131,7 @@ const NO_D1 = {
 let program: Array<{ tool: string; args: Record<string, unknown> }> = [];
 
 /** One bench object as bench/objects.ts names it, with the operator's run9 account configured. */
-function object() {
+function object(extraEnv: Record<string, string> = {}) {
   const raw = sqliteHost();
   const jobs: string[] = [];
   const state = { alarmAt: null as number | null };
@@ -154,6 +157,7 @@ function object() {
     DEEPSEEK_BASE_URL: "https://model.example/v1", DEEPSEEK_API_KEY: "k",
     SECRET_KEK: Buffer.from(new Uint8Array(32).fill(3)).toString("base64"),
     RUN9: JSON.stringify({ ak: "ak", sk: "sk" }),
+    ...extraEnv,
     // A Worker Loader whose every program is `program`: it makes its host calls through the binding the
     // executor hands it, exactly as a loaded program's `tools` would, and ends.
     LOADER: {
@@ -533,6 +537,72 @@ await check("pi085: a task name started again after purge is not born ended, and
   const r = resultOf(next.job, "c_ls");
   must(r && !r.isError, `the new run's shell call was refused: ${show(r).slice(0, 300)}`);
   o.raw.dispose();
+});
+
+// ------------------------------------------------------------ which provider the machine is on
+
+/** The task's sandbox mount as the object stored it. */
+const sandboxMount = (o: ReturnType<typeof object>, agentId: string) => {
+  // A start refused before the runtime was built has not made the table yet: no mount either.
+  if (!o.raw.sql.exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name='mounts'").toArray().length) return null;
+  const r = o.raw.sql.exec("SELECT public_config AS c, secret_ref AS ref FROM mounts WHERE tenant_id='bench' AND agent_id=? AND plugin='sandbox'", agentId).toArray()[0] as any;
+  return r ? { config: JSON.parse(String(r.c)), ref: String(r.ref) } : null;
+};
+const SWE_START = {
+  policy: "fix it", image: IMAGE, workdir: "/testbed", shape: "2c4g", timeoutMs: 300_000, shell: "/bin/bash",
+  shellPrefix: "source /opt/miniconda3/etc/profile.d/conda.sh && conda activate testbed && ", engine: "pd",
+};
+
+await check("a start that names no provider mounts run9 exactly as before: no provider key, the run9 reference", async () => {
+  const o = object();
+  run9.reset();
+  const started = await o.D.benchSweStart("swe_r9", SWE_START);
+  must(started.provider === "run9", `answered ${show(started)}`);
+  const m = sandboxMount(o, "b_swe_r9");
+  must(m?.ref === "operator:run9", `reference ${m?.ref}`);
+  // The record a run9 task always had, key for key: anything added here changes what run9 runs.
+  must(show(m!.config) === show({
+    account: "container", image: IMAGE, workdir: "/testbed", shape: "2c4g", timeoutMs: 300_000, shell: "/bin/bash",
+    shellPrefix: SWE_START.shellPrefix, network: "none",
+  }), `config ${show(m!.config)}`);
+  o.raw.dispose();
+});
+
+const IBX_KEY = "ibk_test_0123456789abcdef";
+for (const [label, secret] of [["JSON", JSON.stringify({ apiKey: IBX_KEY })], ["bare", `${IBX_KEY}\n`]] as const) {
+  await check(`provider instabox (secret as ${label}): the mount names InstaBox, the image, network none, and the operator's InstaBox key reaches InstaBox and nothing the runner reads`, async () => {
+    const o = object({ INSTABOX: secret });
+    run9.reset();
+    const started = await o.D.benchSweStart("swe_ib", { ...SWE_START, provider: "instabox" });
+    must(started.provider === "instabox" && started.network === "none", `answered ${show(started)}`);
+    const m = sandboxMount(o, "b_swe_ib");
+    must(m?.ref === "operator:instabox", `reference ${m?.ref}`);
+    const c = m!.config;
+    must(c.provider === "instabox" && c.image === IMAGE && c.network === "none" && c.shape === "2c4g" &&
+      c.workdir === "/testbed" && c.shell === "/bin/bash" && c.shellPrefix === SWE_START.shellPrefix &&
+      c.maxLifetimeHours === 3, `config ${show(c)}`);
+    must(!show(c).includes(IBX_KEY), "the key is in the mount's public config");
+    // The grader's way in: the call goes to InstaBox with the key (the fake answers 404 to every InstaBox path).
+    const answer = await o.D.benchSweShell("swe_ib", "true");
+    const ibx = run9.ops.filter((r) => r.host === "api.instabox.sh");
+    must(ibx.length > 0, `nothing reached InstaBox: ${show(run9.ops.map((r) => r.host + r.path))}`);
+    must(!run9.ops.some((r) => r.host.includes("sys9")), "an InstaBox task called run9");
+    must(ibx.every((r) => new Headers(r.headers as HeadersInit).get("x-api-key") === IBX_KEY), "a request to InstaBox did not carry the operator's key as it is held");
+    must(!show(answer).includes(IBX_KEY), `the shell's answer holds the key: ${show(answer).slice(0, 300)}`);
+    const stats = await o.D.benchSweStats("swe_ib", 1000).catch((e: any) => ({ error: String(e?.message ?? e) }));
+    must(!show(stats).includes(IBX_KEY), "the task's stats hold the key");
+    o.raw.dispose();
+  });
+}
+
+await check("provider instabox with no InstaBox account, or an unknown provider, is refused before anything is mounted", async () => {
+  for (const [env, provider] of [[{}, "instabox"], [{ INSTABOX: "{\"key\":\"x\"}" }, "instabox"], [{ INSTABOX: "k" }, "fly"]] as const) {
+    const o = object(env as Record<string, string>);
+    const r = await o.D.benchSweStart("swe_no", { ...SWE_START, provider }).then(() => null, (e: any) => String(e?.message ?? e));
+    must(r, `${provider} with ${show(Object.keys(env))} started`);
+    must(!sandboxMount(o, "b_swe_no"), `a refused start left a mount: ${r}`);
+    o.raw.dispose();
+  }
 });
 
 await check("a withheld address is refused at dispatch, and nothing else is", () => {

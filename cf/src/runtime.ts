@@ -708,7 +708,7 @@ export class BoundArtifacts {
 
 /** Whether a binding spends the operator's model account, through any provider. */
 export const isOperatorModelRef = (ref: string) => providerOfRef(ref) !== null;
-export { OPERATOR_RUN9_REF, OPERATOR_EXA_REF } from "./operator-ref.ts";
+export { OPERATOR_RUN9_REF, OPERATOR_INSTABOX_REF, OPERATOR_EXA_REF } from "./operator-ref.ts";
 
 export interface RuntimeDeps {
   ctx: any;
@@ -730,6 +730,9 @@ export interface RuntimeDeps {
    *  `node` mount resolves to no credential and its tools refuse to run, which
    *  is the right failure: a deployment without keys should not start boxes. */
   operatorRun9?: { ak: string; sk: string };
+  /** The operator's InstaBox account, behind OPERATOR_INSTABOX_REF (cf/src/operator-ref.ts). Absent means a mount
+   *  naming that reference resolves to no credential, and its tools refuse to run. */
+  operatorInstabox?: { apiKey: string };
   /** The operator's Exa key, behind OPERATOR_EXA_REF. Absent means the `search`
    *  mount resolves to no credential and says it cannot search. */
   operatorExa?: string;
