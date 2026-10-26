@@ -106,8 +106,9 @@ export function firstTurnText(material: RaftbenchMaterial): string {
 
 /**
  * How many message references the fix-up turn lists. Every one is also on its own line in the material, which stays
- * in the conversation, so past the cap the turn says how many it left out and where they are rather than repeat them:
- * at about 40 characters a reference this bounds the list near 12k characters, whatever the window held.
+ * in the conversation, so past the cap the turn labels the list partial and points at the material as the allowed set
+ * rather than repeat them: at about 40 characters a reference this bounds the list near 12k characters, whatever the
+ * window held.
  */
 export const FIXUP_SOURCES_CAP = 300;
 
@@ -141,16 +142,19 @@ const SDK_CLOSING = "Reply with the complete corrected result, not only the chan
  */
 export function fixupTurnText(invalid: string, sources: FixupSources | undefined): string {
   const listed = sources ? sources.byTarget.reduce((n, [, ids]) => n + ids.length, 0) : 0;
+  const partial = !!sources && sources.total > listed;
   const lines = [
     "Rules for the corrected result:",
     '- "evidence" and "counterevidence" are always lists of {"target", "messageId"} objects, also when there is nothing to put there: write [] for none, never a string, an object or null.',
-    // A run kept before its read recorded the references has no list: the rule then points at the material's lines.
-    sources
+    // The list is the allowed set only when it is whole. Cut at the cap, or missing (a run kept before its read
+    // recorded the references), the allowed set is the material's lines, and an id the list left out is still valid.
+    sources && !partial
       ? "- Cite only a target and messageId pair listed below, copied exactly as written. If you cannot support a claim with a listed pair, drop that reference, and drop the pattern if it is left with no evidence; never make up, shorten or change an id."
-      : "- Cite only a target and msg pair copied exactly from its line in the material. If you cannot support a claim with such a pair, drop that reference, and drop the pattern if it is left with no evidence; never make up, shorten or change an id.",
-    ...!sources ? [] : listed === 0 ? ["No message of this run can be cited: the patterns list must be []."] : ["The pairs you may cite (target: messageIds):"],
+      : "- Cite only a target and msg pair copied exactly from its line in the full material above; any message line there is valid, listed below or not. Drop a reference only when no message in the material supports the claim, not because its id is missing from a list, and drop the pattern if it is left with no evidence; never make up, shorten or change an id.",
+    ...!sources ? [] : listed === 0 ? ["No message of this run can be cited: the patterns list must be []."]
+      : partial ? [`A partial list of the pairs you may cite (${listed} of ${sources.total}; the other ${sources.total - listed} are valid too, on their own lines in the material as target= and msg=):`]
+      : ["The pairs you may cite (target: messageIds):"],
     ...(sources?.byTarget ?? []).map(([target, ids]) => `${target}: ${ids.join(", ")}`),
-    ...sources && sources.total > listed ? [`(${listed} of ${sources.total} listed; the other ${sources.total - listed} are on their own lines in the material, as target= and msg=.)`] : [],
   ];
   const trimmed = invalid.trimEnd();
   const head = trimmed.endsWith(SDK_CLOSING) ? trimmed.slice(0, -SDK_CLOSING.length).trimEnd() : trimmed;

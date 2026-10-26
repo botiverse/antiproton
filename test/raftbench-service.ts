@@ -568,17 +568,20 @@ await check("a result the Server refuses (evidence not read) also gets its one f
  * it is not sure of is copied from the fix-up's list only if the list carries an id it contains, dropped only if the
  * turn says to drop what it cannot support, and kept as it was otherwise; a field the turn says to make a list is one.
  */
-function followsOnlyWhatItIsTold(first: any, fix: string): string {
+function followsOnlyWhatItIsTold(first: any, fix: string, material = ""): string {
   const allowed = new Set<string>();
   for (const line of fix.split("\n")) {
     const m = /^(\S+): ([0-9a-f-]+(?:, [0-9a-f-]+)*)$/i.exec(line);
     if (m) for (const id of m[2]!.split(", ")) allowed.add(`${m[1]} ${id}`);
   }
-  const drop = /drop that reference/.test(fix);
+  const drop = /drop that reference|Drop a reference only when/.test(fix);
+  // Told the list is partial and the material is the allowed set, it keeps an id that is on a line of the material.
+  const materialCounts = /A partial list/.test(fix) && /from its line in the full material/.test(fix);
   const fixRef = (r: any) => {
     if (allowed.has(`${r.target} ${r.messageId}`)) return r;
     const listed = [...allowed].map((k) => k.split(" ")).find(([t, id]) => t === r.target && String(r.messageId).includes(id!));
     if (listed) return { target: r.target, messageId: listed[1] };
+    if (materialCounts && material.includes(`[target=${r.target} msg=${r.messageId} `)) return r;
     return drop ? null : r;
   };
   const patterns = first.patterns.map((p: any, i: number) => {
@@ -646,8 +649,29 @@ await check("fix-up: past the cap the list stops, says how many it left out and 
   const text = fixupTurnText("The result was not saved. Fix every item below in one go:\n- x: y\nReply with the complete corrected result, not only the changes.", fixupSourcesOf([...many, many[0]!]));
   const listed = text.split("\n").filter((l) => /^#c\d: /.test(l)).flatMap((l) => l.slice(5).split(", "));
   must(listed.length === FIXUP_SOURCES_CAP && new Set(listed).size === FIXUP_SOURCES_CAP, `listed ${listed.length}`);
-  must(text.includes(`(${FIXUP_SOURCES_CAP} of ${FIXUP_SOURCES_CAP + 50} listed; the other 50 are on their own lines in the material`), text.slice(-300));
+  must(text.includes(`A partial list of the pairs you may cite (${FIXUP_SOURCES_CAP} of ${FIXUP_SOURCES_CAP + 50}; the other 50 are valid too`), text.slice(-300));
   must(text.length < 13_000 && text.endsWith("Reply with the complete corrected result, not only the changes."), `length ${text.length}`);
+});
+
+await check("fix-up: past the cap the list is labelled partial, and valid evidence beyond it is kept and accepted", async () => {
+  const w = await world();
+  const n = FIXUP_SOURCES_CAP + 40;
+  const ids = Array.from({ length: n }, (_, i) => `c0ffee00-0000-4000-8000-${String(i).padStart(12, "0")}`);
+  w.raft.pages = [{ sourceText: ids.map((id, i) => `[target=#big msg=${id} time=2026-10-17 09:00:00Z type=human] @ana: line ${i}`).join("\n\n"),
+    sources: ids.map((messageId) => ({ target: "#big", messageId })), fetched: n, exhausted: true, stopReason: "window_end" }];
+  const beyond = ids[n - 5]!;
+  await assign(w);
+  // Valid evidence the cap leaves out; the answer is invalid only for its counterevidence, so it gets its fix-up.
+  const first = { ...MALFORMED, patterns: [{ ...MALFORMED.patterns[0]!, evidence: [{ target: "#big", messageId: beyond }] }] };
+  await answer(w, JSON.stringify(first));
+  must(w.sent.length === 2 && w.raft.submits().length === 0, `calls ${w.sent.length}, submits ${w.raft.submits().length}`);
+  const fix = lastUserText(await w.rt.takeJob("t", SERVICE, w.sent[1]!));
+  must(fix.includes(`A partial list of the pairs you may cite (${FIXUP_SOURCES_CAP} of ${n};`) && !fix.includes(beyond), `not labelled partial:\n${fix.slice(0, 1200)}`);
+  must(fix.includes("copied exactly from its line in the full material above") && fix.includes("not because its id is missing from a list"), `no copy-from-material rule:\n${fix.slice(0, 1200)}`);
+  await answer(w, followsOnlyWhatItIsTold(first, fix, w.raft.pages[0]!.sourceText));
+  const submits = w.raft.submits();
+  must(w.raft.accepted.size === 1 && submits.length === 1 && submits[0]!.body.failure === undefined, `not accepted: ${show(submits.map((s) => s.body.reason ?? s.body.patterns))}`);
+  must(show(submits[0]!.body.patterns[0]?.evidence) === show([{ target: "#big", messageId: beyond }]), show(submits[0]!.body.patterns));
 });
 
 await check("a read that fails submits the plugin's failure with the reason, and the model is never called", async () => {
