@@ -361,7 +361,9 @@ function assigned(a: { runId: string; revision: number }, receivedAt: number): R
 async function read(ctx: PluginContext, raft: Raft, run: RunState): Promise<PluginNext | void> {
   // A reread starts over: what the last read's result held goes with it. The stop below ends from that same state and
   // before the count moves, so its `run_done` row carries no `from` or `failure` of the last read's result and counts
-  // only the reads that happened.
+  // only the reads that happened. The last read's coverage goes too: this state is saved before the material comes
+  // back, and a deadline that finds it there (an eviction inside the read, then the alarm) sends `timeout` with what it
+  // says was read, which would be the material that changed, not this read's.
   const reading: RunState = { ...run, phase: "reading", readCalls: 0 };
   delete reading.body;
   delete reading.sources;
@@ -369,6 +371,7 @@ async function read(ctx: PluginContext, raft: Raft, run: RunState): Promise<Plug
   delete reading.reason;
   delete reading.failure;
   delete reading.retryAt;
+  delete reading.coverage;
   if (reading.reads >= MAX_READS) {
     return end(ctx, raft, reading, "stopped: the run's material changed again after it was read again", { code: "material_changed_again" });
   }
