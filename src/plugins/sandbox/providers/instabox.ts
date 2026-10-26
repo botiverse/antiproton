@@ -224,12 +224,16 @@ function open(settings: ProviderSettings, credential: string, o: { wake?: boolea
       if (state === "gone") throw new ProviderError(`InstaBox machine ${id} is gone`, { code: "not_found", definitive: true });
       if (state === "paused" || state === "stopped") {
         try {
+          // A resume or start that succeeded has the machine running: no second look, and no wait before one
+          // (a fixed second here was the only time the wake added to InstaBox's own, measured 2026-10-26).
           await lifecycle(id, state === "paused" ? "resume" : "start");
+          return;
         } catch (e) {
           // Another operation on the machine (its own idle pause, say) is a reason to look again, not a verdict.
           if (!(e instanceof ProviderError && e.code === "conflict")) throw e;
         }
       }
+      // Starting, resuming or pausing already: looked at again shortly.
       await instaboxTiming.sleep(1000);
     }
     throw new ProviderError(`InstaBox machine ${id} did not come back to running`, { code: "transient", definitive: false });

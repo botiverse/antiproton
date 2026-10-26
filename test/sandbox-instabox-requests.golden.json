@@ -1205,9 +1205,9 @@
       "box": "m_1",
       "image": "universal",
       "created": "2027-01-15T08:00:06.000Z",
-      "lastUsed": "2027-01-15T08:00:12.000Z",
+      "lastUsed": "2027-01-15T08:00:10.000Z",
       "cwd": "/data/home/work",
-      "pausedAfter": "2027-01-15T08:30:12.000Z",
+      "pausedAfter": "2027-01-15T08:30:10.000Z",
       "deletedBy": "2027-01-16T08:00:01.000Z"
      }
     ],
@@ -1220,7 +1220,7 @@
    "result": {
     "id": "m_1",
     "startedAt": 1800000006000,
-    "endedAt": 1800000015000,
+    "endedAt": 1800000013000,
     "status": "freed"
    }
   },
@@ -1228,8 +1228,8 @@
    "step": "the next idle step deletes it",
    "result": {
     "id": "m_1",
-    "startedAt": 1800000015000,
-    "endedAt": 1800000017000,
+    "startedAt": 1800000013000,
+    "endedAt": 1800000015000,
     "status": "freed"
    }
   },
@@ -1263,8 +1263,8 @@
     {
      "id": "m_1",
      "startedAt": 1800000006000,
-     "endedAt": 1800000015000,
-     "lastUsedAt": 1800000012000,
+     "endedAt": 1800000013000,
+     "lastUsedAt": 1800000010000,
      "uses": 1,
      "kept": [],
      "credentialRef": "agent"
@@ -1388,13 +1388,6 @@
    "timeoutMs": 40000
   },
   {
-   "method": "GET",
-   "path": "/v1/machines/m_1",
-   "key": "ok",
-   "body": null,
-   "timeoutMs": 120000
-  },
-  {
    "method": "POST",
    "path": "/v1/machines/m_1/exec",
    "contentType": "application/json",
@@ -1403,7 +1396,7 @@
     "argv": [
      "sh",
      "-c",
-     "set -- \"$HOME/.antiproton/jobs/jmywpj5dkc7ec1136\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
+     "set -- \"$HOME/.antiproton/jobs/jmywpj3u0c7ec1136\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
      "ap",
      "/data/home/work",
      "/bin/sh",
@@ -1423,7 +1416,7 @@
     "argv": [
      "sh",
      "-c",
-     "set -- \"$HOME/.antiproton/jobs/jmywpj5dkc7ec1136\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "set -- \"$HOME/.antiproton/jobs/jmywpj3u0c7ec1136\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
      "ap",
      "262144"
     ],
@@ -1434,7 +1427,7 @@
   {
    "method": "POST",
    "path": "/v1/machines/m_1/suspend",
-   "idem": "suspend-m_1-mywpj6x4-5b80a5ca",
+   "idem": "suspend-m_1-mywpj5dk-5b80a5ca",
    "key": "ok",
    "body": null,
    "timeoutMs": 120000
@@ -1449,7 +1442,7 @@
   {
    "method": "DELETE",
    "path": "/v1/machines/m_1",
-   "idem": "delete-m_1-mywpj8go-ef14395e",
+   "idem": "delete-m_1-mywpj6x4-ef14395e",
    "confirm": "m_1",
    "key": "ok",
    "body": null,
@@ -1465,11 +1458,11 @@
   {
    "method": "POST",
    "path": "/v1/machines",
-   "idem": "create-h-t-a-mywpja08",
+   "idem": "create-h-t-a-mywpj8go",
    "contentType": "application/json",
    "key": "ok",
    "body": {
-    "name": "h-t-a-mywpja08",
+    "name": "h-t-a-mywpj8go",
     "templateId": "universal",
     "vcpus": 2,
     "memMiB": 4096,
@@ -1504,7 +1497,7 @@
     "argv": [
      "sh",
      "-c",
-     "set -- \"$HOME/.antiproton/jobs/jmywpjbjs83a8cdf2\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
+     "set -- \"$HOME/.antiproton/jobs/jmywpja0883a8cdf2\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
      "ap",
      "",
      "/bin/sh",
@@ -1524,7 +1517,7 @@
     "argv": [
      "sh",
      "-c",
-     "set -- \"$HOME/.antiproton/jobs/jmywpjbjs83a8cdf2\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "set -- \"$HOME/.antiproton/jobs/jmywpja0883a8cdf2\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
      "ap",
      "262144"
     ],
@@ -1541,7 +1534,7 @@
     "argv": [
      "sh",
      "-c",
-     "set -- \"$HOME/.antiproton/jobs/jmywpjd3c173c6186\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
+     "set -- \"$HOME/.antiproton/jobs/jmywpjbjs173c6186\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
      "ap",
      "/data/home/work",
      "/bin/sh",
@@ -1562,7 +1555,7 @@
   {
    "method": "POST",
    "path": "/v1/machines/m_2/start",
-   "idem": "start-m_2-mywpjemw-abd0f51a",
+   "idem": "start-m_2-mywpjd3c-abd0f51a",
    "key": "ok",
    "body": null,
    "timeoutMs": 120000
@@ -1575,13 +1568,6 @@
    "timeoutMs": 40000
   },
   {
-   "method": "GET",
-   "path": "/v1/machines/m_2",
-   "key": "ok",
-   "body": null,
-   "timeoutMs": 120000
-  },
-  {
    "method": "POST",
    "path": "/v1/machines/m_2/exec",
    "contentType": "application/json",
@@ -1590,7 +1576,7 @@
     "argv": [
      "sh",
      "-c",
-     "set -- \"$HOME/.antiproton/jobs/jmywpjd3c173c6186\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
+     "set -- \"$HOME/.antiproton/jobs/jmywpjbjs173c6186\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
      "ap",
      "/data/home/work",
      "/bin/sh",
@@ -1610,7 +1596,7 @@
     "argv": [
      "sh",
      "-c",
-     "set -- \"$HOME/.antiproton/jobs/jmywpjd3c173c6186\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "set -- \"$HOME/.antiproton/jobs/jmywpjbjs173c6186\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
      "ap",
      "262144"
     ],
@@ -1623,11 +1609,11 @@
     "machines": {
      "main": {
       "boxId": "m_2",
-      "createdAt": 1800000019000,
-      "lastUsedAt": 1800000028000,
+      "createdAt": 1800000017000,
+      "lastUsedAt": 1800000024000,
       "execs": 2,
       "saved": [],
-      "deleteAt": 1800086418000,
+      "deleteAt": 1800086416000,
       "credentialRef": "agent",
       "image": "universal",
       "cwd": "/data/home/work"
@@ -1637,8 +1623,8 @@
      {
       "boxId": "m_1",
       "startedAt": 1800000006000,
-      "endedAt": 1800000015000,
-      "lastUsedAt": 1800000012000,
+      "endedAt": 1800000013000,
+      "lastUsedAt": 1800000010000,
       "execs": 1,
       "saved": [],
       "credentialRef": "agent"
@@ -2434,13 +2420,6 @@
    "timeoutMs": 40000
   },
   {
-   "method": "GET",
-   "path": "/v1/machines/m_1",
-   "key": "ok",
-   "body": null,
-   "timeoutMs": 120000
-  },
-  {
    "method": "POST",
    "path": "/v1/machines/m_1/exec",
    "contentType": "application/json",
@@ -2494,7 +2473,7 @@
   {
    "method": "POST",
    "path": "/v1/machines/m_1/resume",
-   "idem": "resume-m_1-mywpj7ow-c7ec1136",
+   "idem": "resume-m_1-mywpj65c-c7ec1136",
    "key": "ok",
    "body": null,
    "timeoutMs": 120000
@@ -2505,13 +2484,6 @@
    "key": "ok",
    "body": null,
    "timeoutMs": 40000
-  },
-  {
-   "method": "GET",
-   "path": "/v1/machines/m_1",
-   "key": "ok",
-   "body": null,
-   "timeoutMs": 120000
   },
   {
    "method": "GET",
@@ -2529,7 +2501,7 @@
     "argv": [
      "sh",
      "-c",
-     "set -- \"$HOME/.antiproton/jobs/jmywpjbjs5b80a5ca\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
+     "set -- \"$HOME/.antiproton/jobs/jmywpj8go5b80a5ca\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
      "ap",
      "/data/home/work",
      "/bin/sh",
@@ -2546,7 +2518,7 @@
      "main": {
       "boxId": "m_1",
       "createdAt": 1800000002000,
-      "lastUsedAt": 1800000019000,
+      "lastUsedAt": 1800000015000,
       "execs": 2,
       "saved": [
        "artifact://sandbox/m_1/data/home/work/out.txt"
