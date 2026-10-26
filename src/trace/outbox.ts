@@ -105,7 +105,7 @@ export const TRACE_KINDS = ["model.call", "tool.call", "approval.wait", "contain
   "rebuild.decision", "rebuild.outcome", "rebuild.behaviour", "session.needs_reset", "turn.timing", "turn.end_unrecorded", "import.hold", "model.prewarm",
   "agent.ready", "mount.settings", "subagent.start", "subagent.turn", "subagent.model_changed", "github.refresh", "raft.held", "raft.held_answer", "raft.state_failed", "raft.state_save_failed", "raft.mcp_call",
   "raft.assistant_wake", "raft.assistant_notify", "raft.assistant_rules", "raft.assistant_chat_told", "raft.assistant_send_as_owner", "raft.turn_ended", "raft.assistant_check", "raft.session_unsealable",
-  "appworld.sibling_unset"] as const;
+  "appworld.sibling_unset", "raftbench.run_done"] as const;
 export type TraceKind = (typeof TRACE_KINDS)[number];
 
 /**
@@ -141,11 +141,15 @@ export type TraceKind = (typeof TRACE_KINDS)[number];
  * (src/plugins/raft-agent-login.ts `loadSession`). `appworld.sibling_unset` is a second account's token an AppWorld
  * call left unset, the call going ahead without it: `not_callable` (`ctx.sibling` answered null for that mount; when
  * it does is PluginContext.sibling's) or `no_credential`, with the parameter and the other mount's alias, never a
- * token or a credential (src/plugins/appworld.ts `invoke`).
+ * token or a credential (src/plugins/appworld.ts `invoke`). `raftbench.run_done` is one RaftBench run's end: its id
+ * and revision, the outcome's fixed head (`accepted`, `refused`, `gave_up`, `stopped`), whose result was sent (`from`),
+ * a plugin failure's fixed code (`failure`), the receipt's id, counts of fix-ups, model calls, reads and retries, and
+ * how the result's shape was held to (`output`, `prompt_only`); never the result, a finding, the model's text or a
+ * reason (src/plugins/raftbench.ts `traceDone`). It is not forwarded (cf/src/trace-forward.ts has no field for it).
  */
 export const PLUGIN_TRACE_KINDS = ["raft.held", "raft.held_answer", "raft.state_failed", "raft.mcp_call", "raft.assistant_wake", "raft.assistant_notify",
   "raft.assistant_rules", "raft.assistant_chat_told", "raft.assistant_send_as_owner", "raft.turn_ended", "raft.assistant_check",
-  "raft.session_unsealable", "appworld.sibling_unset"] as const satisfies readonly TraceKind[];
+  "raft.session_unsealable", "appworld.sibling_unset", "raftbench.run_done"] as const satisfies readonly TraceKind[];
 export type PluginTraceKind = (typeof PLUGIN_TRACE_KINDS)[number];
 
 export const TRACE_VERDICTS = ["ok", "failed", "blocked", "cancelled"] as const;
