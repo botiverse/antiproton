@@ -3208,5 +3208,2030 @@
     "sessions": []
    }
   }
+ ],
+ "an image runs as a container in the machine: set up at create, and every command, file and job goes into it": [
+  {
+   "step": "shell creates the machine and its container",
+   "result": {
+    "state": "succeeded",
+    "exitCode": 0,
+    "cwd": "/data/home/work",
+    "output": "hello",
+    "truncated": false,
+    "box": "m_1",
+    "image": "docker.io/swebench/sweb.eval.x86_64.astropy_1776_astropy-12907:latest"
+   }
+  },
+  {
+   "step": "shell again",
+   "result": {
+    "state": "succeeded",
+    "exitCode": 0,
+    "cwd": "/data/home/work",
+    "output": "hello",
+    "truncated": false,
+    "box": "m_1",
+    "image": "docker.io/swebench/sweb.eval.x86_64.astropy_1776_astropy-12907:latest"
+   }
+  },
+  {
+   "step": "put",
+   "result": {
+    "path": "/testbed/in/photo.jpg",
+    "bytes": 21,
+    "sha256": "0def0041adb95f563cd32c30827eab6cd9c9a87482a618c48db200f2d89d524b",
+    "ref": "artifact://raft/attachments/7/photo.jpg",
+    "checked": "sha256",
+    "note": "in the container now; work on it with `shell` or `run`, and `save` what you make from it"
+   }
+  },
+  {
+   "step": "save a file",
+   "result": {
+    "path": "/testbed/in/photo.jpg",
+    "ref": "artifact://sandbox/m_1/testbed/in/photo.jpg",
+    "bytes": 21,
+    "note": "kept outside the box, for later. A copy outliving the container is not a reason to release it: if you or the person you are working for will come back to this machine, leave it running — idle, it is only paused, and the next call resumes it with its files and running processes."
+   }
+  },
+  {
+   "step": "save a directory as tar",
+   "result": {
+    "path": "/testbed/in",
+    "ref": "artifact://sandbox/m_1/testbed/in.tar",
+    "bytes": 18,
+    "note": "kept outside the box, for later. A copy outliving the container is not a reason to release it: if you or the person you are working for will come back to this machine, leave it running — idle, it is only paused, and the next call resumes it with its files and running processes."
+   }
+  },
+  {
+   "step": "a command handed over as a job",
+   "result": {
+    "backgrounded": {
+     "handle": {
+      "boxId": "m_1",
+      "execId": "m_1/jmywpjcbkabd0f51a"
+     },
+     "note": "running in the container; its result arrives on its own, and `jobs` lists what is running"
+    }
+   }
+  },
+  {
+   "step": "poll it",
+   "result": {
+    "done": false,
+    "progress": {
+     "state": "running"
+    }
+   }
+  },
+  {
+   "step": "cancel it"
+  },
+  {
+   "step": "the workspace view lists the container's working directory",
+   "result": {
+    "running": true,
+    "found": true,
+    "entries": [
+     {
+      "name": "out.txt",
+      "isDirectory": false,
+      "size": 5,
+      "modifiedAt": 1700000000500
+     },
+     {
+      "name": "src",
+      "isDirectory": true,
+      "size": 0,
+      "modifiedAt": 1700000001000
+     }
+    ],
+    "truncated": false
+   }
+  },
+  {
+   "step": "keep",
+   "result": {
+    "kept": "env",
+    "snapshot": "sn_1",
+    "note": "independent of this container; start a fresh machine from it later with `start_from`. A copy outliving the container is not a reason to release it: if you or the person you are working for will come back to this machine, leave it running — idle, it is only paused, and the next call resumes it with its files and running processes."
+   }
+  },
+  {
+   "step": "start_from",
+   "result": {
+    "startingFrom": "env",
+    "note": "the next run or shell starts from this environment",
+    "released": true,
+    "__ap_lease__": {
+     "id": "m_1",
+     "startedAt": 1800000004000,
+     "endedAt": 1800000035000,
+     "status": "freed"
+    },
+    "releasedPrevious": "m_1"
+   }
+  },
+  {
+   "step": "shell creates from the snapshot, starting the container kept in it",
+   "result": {
+    "state": "succeeded",
+    "exitCode": 0,
+    "cwd": "/data/home/work",
+    "output": "hello",
+    "truncated": false,
+    "box": "m_2",
+    "image": "docker.io/swebench/sweb.eval.x86_64.astropy_1776_astropy-12907:latest",
+    "kept": [
+     "env"
+    ]
+   }
+  },
+  {
+   "step": "machines",
+   "result": {
+    "machines": [
+     {
+      "machine": "main",
+      "state": "running",
+      "box": "m_2",
+      "image": "docker.io/swebench/sweb.eval.x86_64.astropy_1776_astropy-12907:latest",
+      "created": "2027-01-15T08:00:39.000Z",
+      "lastUsed": "2027-01-15T08:00:40.000Z",
+      "cwd": "/data/home/work",
+      "pausedAfter": "2027-01-15T08:30:40.000Z",
+      "deletedBy": "2027-01-16T08:00:36.000Z"
+     }
+    ],
+    "limit": 3,
+    "note": "times are when it happens if nothing uses the machine before then; any use moves them. 1 of at most 3 exist; a switched-off one counts until it is released."
+   }
+  },
+  {
+   "step": "release",
+   "result": {
+    "released": true,
+    "box": "m_2",
+    "liveMs": 4000,
+    "saved": [],
+    "__ap_lease__": {
+     "id": "m_2",
+     "startedAt": 1800000039000,
+     "endedAt": 1800000043000,
+     "status": "freed"
+    },
+    "note": "the container and its files are gone; anything saved above is not"
+   }
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines",
+   "idem": "create-h-t-a-mywpiww0",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "name": "h-t-a-mywpiww0",
+    "templateId": "universal",
+    "vcpus": 2,
+    "memMiB": 4096,
+    "metadata": {
+     "tenant": "t",
+     "agent": "a",
+     "mount": "sandbox",
+     "machine": "main"
+    },
+    "deleteAfterSeconds": 86400,
+    "maxRunMinutes": 480,
+    "failFast": true,
+    "secrets": [],
+    "envSecrets": [],
+    "vault": false
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/operations/op_1?wait=25s",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 40000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/setup-0b30557a\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
+     "ap",
+     "",
+     "sh",
+     "-c",
+     "c=ap; i=$1; n=$2; w=$3; if docker container inspect \"$c\" >/dev/null 2>&1; then m=$(docker container inspect -f \"{{.HostConfig.NetworkMode}}\" \"$c\"); if [ \"$m\" != \"$n\" ]; then echo \"the kept container has network $m, and this mount asks for $n\"; exit 6; fi; docker start \"$c\" >/dev/null || exit 3; echo \"started the container already there\"; exit 0; fi; if docker image inspect \"$i\" >/dev/null 2>&1; then echo \"image already there\"; else s=$(date +%s); docker pull -q \"$i\" >/dev/null || exit 4; echo \"pulled the image in $(( $(date +%s) - s )) s\"; fi; docker run -d --name \"$c\" --init --restart unless-stopped --network \"$n\" -w \"$w\" --entrypoint sleep \"$i\" infinity >/dev/null || exit 5",
+     "ap-setup",
+     "docker.io/swebench/sweb.eval.x86_64.astropy_1776_astropy-12907:latest",
+     "none",
+     "/testbed"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/setup-0b30557a\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "ap",
+     "4096"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the machine's container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
+     "ap",
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpizz49fc4e90e\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
+     "ap",
+     "",
+     "/bin/bash",
+     "-lc",
+     "source /opt/miniconda3/etc/profile.d/conda.sh && conda activate testbed && mkdir -p /testbed && cd /testbed || exit 1\npython -V\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the machine's container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
+     "ap",
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpizz49fc4e90e\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "ap",
+     "262144"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the machine's container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
+     "ap",
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpj1io33587da2\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
+     "ap",
+     "/data/home/work",
+     "/bin/bash",
+     "-lc",
+     "source /opt/miniconda3/etc/profile.d/conda.sh && conda activate testbed && git status\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the machine's container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
+     "ap",
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpj1io33587da2\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "ap",
+     "262144"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the machine's container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
+     "ap",
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpj328c7ec1136\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
+     "ap",
+     "",
+     "sh",
+     "-c",
+     "mkdir -p -- \"$(dirname -- \"$1\")\" 2>/dev/null || exit 5; test -d \"$1\" && exit 6; exit 0",
+     "sh",
+     "/testbed/in/photo.jpg"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the machine's container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
+     "ap",
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpj328c7ec1136\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "ap",
+     "262144"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "PUT",
+   "path": "/v1/machines/m_1/files?path=%2Ftmp%2F.ap-in-5b80a5ca&parents=true",
+   "contentType": "application/octet-stream",
+   "key": "ok",
+   "body": {
+    "bytes": 21,
+    "sha256": "0def0041adb95f563cd32c30827eab6cd9c9a87482a618c48db200f2d89d524b"
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "docker cp \"$1\" \"ap:$2\" >/dev/null; r=$?; rm -f -- \"$1\"; exit $r",
+     "ap",
+     "/tmp/.ap-in-5b80a5ca",
+     "/testbed/in/photo.jpg"
+    ],
+    "timeoutSeconds": 300
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the machine's container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
+     "ap",
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpj65cef14395e\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
+     "ap",
+     "",
+     "sh",
+     "-c",
+     "test -f \"$1\" || exit 3; stat -c %s -- \"$1\"; sha256sum -- \"$1\" 2>/dev/null | cut -d \" \" -f 1",
+     "sh",
+     "/testbed/in/photo.jpg"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the machine's container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
+     "ap",
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpj65cef14395e\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "ap",
+     "262144"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "c=ap; t=\"$HOME/.antiproton/out-$2\"; mkdir -p \"$HOME/.antiproton\" || exit 1; if [ \"$3\" = tar ]; then docker cp \"$c:$1\" - > \"$t\" || { rm -f \"$t\"; exit 1; }; else docker cp -L \"$c:$1\" \"$t\" >/dev/null || exit 1; if [ ! -f \"$t\" ] || [ -L \"$t\" ]; then rm -rf -- \"$t\"; echo \"not a file\" >&2; exit 6; fi; fi; printf %s \"$t\"",
+     "ap",
+     "/testbed/in/photo.jpg",
+     "83a8cdf2",
+     ""
+    ],
+    "timeoutSeconds": 600
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/machines/m_1/files/content?path=%2Fdata%2Fhome%2F.antiproton%2Fout-83a8cdf2",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "rm",
+     "-f",
+     "--",
+     "/data/home/.antiproton/out-83a8cdf2"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "c=ap; t=\"$HOME/.antiproton/out-$2\"; mkdir -p \"$HOME/.antiproton\" || exit 1; if [ \"$3\" = tar ]; then docker cp \"$c:$1\" - > \"$t\" || { rm -f \"$t\"; exit 1; }; else docker cp -L \"$c:$1\" \"$t\" >/dev/null || exit 1; if [ ! -f \"$t\" ] || [ -L \"$t\" ]; then rm -rf -- \"$t\"; echo \"not a file\" >&2; exit 6; fi; fi; printf %s \"$t\"",
+     "ap",
+     "/testbed/in",
+     "173c6186",
+     "tar"
+    ],
+    "timeoutSeconds": 600
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/machines/m_1/files/content?path=%2Fdata%2Fhome%2F.antiproton%2Fout-173c6186",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "rm",
+     "-f",
+     "--",
+     "/data/home/.antiproton/out-173c6186"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the machine's container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
+     "ap",
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpjcbkabd0f51a\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
+     "ap",
+     "/data/home/work",
+     "/bin/bash",
+     "-lc",
+     "source /opt/miniconda3/etc/profile.d/conda.sh && conda activate testbed && sleep 100\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the machine's container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
+     "ap",
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpjcbkabd0f51a\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "ap",
+     "262144"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the machine's container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
+     "ap",
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpjcbkabd0f51a\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "ap",
+     "262144"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the machine's container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
+     "ap",
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpjcbkabd0f51a\" \"$@\"; d=$1; p=$(cat \"$d/pid\" 2>/dev/null) || exit 3; [ -f \"$d/rc\" ] && exit 0; : > \"$d/killed\"; k() { sudo -n kill \"$@\" 2>/dev/null || kill \"$@\" 2>/dev/null; }; k -TERM -- \"-$p\"; i=0; while [ -d \"/proc/$p\" ] && [ $i -lt 20 ]; do sleep 0.1; i=$((i+1)); done; k -KILL -- \"-$p\"; exit 0",
+     "ap"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the machine's container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
+     "ap",
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpjcbkabd0f51a\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "ap",
+     "262144"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/machines/m_1",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 10000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the machine's container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
+     "ap",
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpjgy83f6489ae\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
+     "ap",
+     "",
+     "sh",
+     "-c",
+     "root=$(realpath -e -- \"$2\") || exit 3; r=$(realpath -e -- \"$1\") || exit 3; case \"$r\" in \"$root\"|\"$root\"/*) ;; *) exit 4;; esac; test -d \"$r\" || exit 5; n=$(find \"$r\" -mindepth 1 -maxdepth 1 -printf . | wc -c); find \"$r\" -mindepth 1 -maxdepth 1 -printf '%y\\t%s\\t%T@\\t%f\\n' | head -n 1000; printf '#total\\t%s\\n' \"$n\"",
+     "sh",
+     "/testbed",
+     "/testbed"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 9000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the machine's container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
+     "ap",
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpjgy83f6489ae\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "ap",
+     "262144"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 8000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/snapshots",
+   "idem": "ap-mywpjihs-d3f81d42",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "name": "ap-mywpjihs-d3f81d42",
+    "description": "antiproton t/a env"
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/snapshots/sn_1",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/snapshots/sn_1",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 120000
+  },
+  {
+   "method": "DELETE",
+   "path": "/v1/machines/m_1",
+   "idem": "delete-m_1-mywpjmco-678cb1d6",
+   "confirm": "m_1",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 30000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/operations/op_2?wait=25s",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 40000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines",
+   "idem": "create-h-t-a-mywpjnw8",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "name": "h-t-a-mywpjnw8",
+    "snapshotId": "sn_1",
+    "metadata": {
+     "tenant": "t",
+     "agent": "a",
+     "mount": "sandbox",
+     "machine": "main"
+    },
+    "deleteAfterSeconds": 86400,
+    "maxRunMinutes": 480,
+    "failFast": true,
+    "secrets": [],
+    "envSecrets": [],
+    "vault": false
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/operations/op_3?wait=25s",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 40000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_2/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/setup-fb20456a\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
+     "ap",
+     "",
+     "sh",
+     "-c",
+     "c=ap; i=$1; n=$2; w=$3; if docker container inspect \"$c\" >/dev/null 2>&1; then m=$(docker container inspect -f \"{{.HostConfig.NetworkMode}}\" \"$c\"); if [ \"$m\" != \"$n\" ]; then echo \"the kept container has network $m, and this mount asks for $n\"; exit 6; fi; docker start \"$c\" >/dev/null || exit 3; echo \"started the container already there\"; exit 0; fi; if docker image inspect \"$i\" >/dev/null 2>&1; then echo \"image already there\"; else s=$(date +%s); docker pull -q \"$i\" >/dev/null || exit 4; echo \"pulled the image in $(( $(date +%s) - s )) s\"; fi; docker run -d --name \"$c\" --init --restart unless-stopped --network \"$n\" -w \"$w\" --entrypoint sleep \"$i\" infinity >/dev/null || exit 5",
+     "ap-setup",
+     "docker.io/swebench/sweb.eval.x86_64.astropy_1776_astropy-12907:latest",
+     "none",
+     "/testbed"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_2/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/setup-fb20456a\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "ap",
+     "4096"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_2/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the machine's container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
+     "ap",
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpjqzc8fb4d9fe\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
+     "ap",
+     "",
+     "/bin/bash",
+     "-lc",
+     "source /opt/miniconda3/etc/profile.d/conda.sh && conda activate testbed && mkdir -p /testbed && cd /testbed || exit 1\necho from\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_2/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the machine's container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
+     "ap",
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpjqzc8fb4d9fe\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "ap",
+     "262144"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "DELETE",
+   "path": "/v1/machines/m_2",
+   "idem": "delete-m_2-mywpjsiw-23486d92",
+   "confirm": "m_2",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 30000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/operations/op_4?wait=25s",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 40000
+  },
+  {
+   "stored": [
+    "t/t/a/sandbox/m_1/testbed/in/photo.jpg application/octet-stream 21",
+    "t/t/a/sandbox/m_1/testbed/in.tar application/x-tar 18"
+   ]
+  },
+  {
+   "inContainer": [
+    [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpizz49fc4e90e\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
+     "ap",
+     "",
+     "/bin/bash",
+     "-lc",
+     "source /opt/miniconda3/etc/profile.d/conda.sh && conda activate testbed && mkdir -p /testbed && cd /testbed || exit 1\npython -V\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+    ],
+    [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpizz49fc4e90e\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "ap",
+     "262144"
+    ],
+    [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpj1io33587da2\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
+     "ap",
+     "/data/home/work",
+     "/bin/bash",
+     "-lc",
+     "source /opt/miniconda3/etc/profile.d/conda.sh && conda activate testbed && git status\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+    ],
+    [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpj1io33587da2\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "ap",
+     "262144"
+    ],
+    [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpj328c7ec1136\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
+     "ap",
+     "",
+     "sh",
+     "-c",
+     "mkdir -p -- \"$(dirname -- \"$1\")\" 2>/dev/null || exit 5; test -d \"$1\" && exit 6; exit 0",
+     "sh",
+     "/testbed/in/photo.jpg"
+    ],
+    [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpj328c7ec1136\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "ap",
+     "262144"
+    ],
+    [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpj65cef14395e\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
+     "ap",
+     "",
+     "sh",
+     "-c",
+     "test -f \"$1\" || exit 3; stat -c %s -- \"$1\"; sha256sum -- \"$1\" 2>/dev/null | cut -d \" \" -f 1",
+     "sh",
+     "/testbed/in/photo.jpg"
+    ],
+    [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpj65cef14395e\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "ap",
+     "262144"
+    ],
+    [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpjcbkabd0f51a\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
+     "ap",
+     "/data/home/work",
+     "/bin/bash",
+     "-lc",
+     "source /opt/miniconda3/etc/profile.d/conda.sh && conda activate testbed && sleep 100\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+    ],
+    [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpjcbkabd0f51a\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "ap",
+     "262144"
+    ],
+    [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpjcbkabd0f51a\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "ap",
+     "262144"
+    ],
+    [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpjcbkabd0f51a\" \"$@\"; d=$1; p=$(cat \"$d/pid\" 2>/dev/null) || exit 3; [ -f \"$d/rc\" ] && exit 0; : > \"$d/killed\"; k() { sudo -n kill \"$@\" 2>/dev/null || kill \"$@\" 2>/dev/null; }; k -TERM -- \"-$p\"; i=0; while [ -d \"/proc/$p\" ] && [ $i -lt 20 ]; do sleep 0.1; i=$((i+1)); done; k -KILL -- \"-$p\"; exit 0",
+     "ap"
+    ],
+    [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpjcbkabd0f51a\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "ap",
+     "262144"
+    ],
+    [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpjgy83f6489ae\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
+     "ap",
+     "",
+     "sh",
+     "-c",
+     "root=$(realpath -e -- \"$2\") || exit 3; r=$(realpath -e -- \"$1\") || exit 3; case \"$r\" in \"$root\"|\"$root\"/*) ;; *) exit 4;; esac; test -d \"$r\" || exit 5; n=$(find \"$r\" -mindepth 1 -maxdepth 1 -printf . | wc -c); find \"$r\" -mindepth 1 -maxdepth 1 -printf '%y\\t%s\\t%T@\\t%f\\n' | head -n 1000; printf '#total\\t%s\\n' \"$n\"",
+     "sh",
+     "/testbed",
+     "/testbed"
+    ],
+    [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpjgy83f6489ae\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "ap",
+     "262144"
+    ],
+    [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpjqzc8fb4d9fe\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
+     "ap",
+     "",
+     "/bin/bash",
+     "-lc",
+     "source /opt/miniconda3/etc/profile.d/conda.sh && conda activate testbed && mkdir -p /testbed && cd /testbed || exit 1\necho from\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+    ],
+    [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpjqzc8fb4d9fe\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "ap",
+     "262144"
+    ]
+   ]
+  },
+  {
+   "record": {
+    "machines": {},
+    "sessions": [
+     {
+      "boxId": "m_2",
+      "startedAt": 1800000039000,
+      "endedAt": 1800000043000,
+      "lastUsedAt": 1800000040000,
+      "execs": 1,
+      "saved": [],
+      "credentialRef": "agent"
+     },
+     {
+      "boxId": "m_1",
+      "startedAt": 1800000004000,
+      "endedAt": 1800000035000,
+      "lastUsedAt": 1800000033000,
+      "execs": 3,
+      "saved": [
+       "artifact://sandbox/m_1/testbed/in/photo.jpg",
+       "artifact://sandbox/m_1/testbed/in.tar"
+      ],
+      "credentialRef": "agent"
+     }
+    ],
+    "envs": [
+     {
+      "name": "env",
+      "snapId": "sn_1",
+      "savedAt": 1800000033000,
+      "image": "docker.io/swebench/sweb.eval.x86_64.astropy_1776_astropy-12907:latest"
+     }
+    ]
+   }
+  }
+ ],
+ "an image's container: the network open or closed by the setting, a container that cannot come up, one gone": [
+  {
+   "step": "shell with network \"open\"",
+   "result": {
+    "state": "succeeded",
+    "exitCode": 0,
+    "cwd": "/data/home/work",
+    "output": "hello",
+    "truncated": false,
+    "box": "m_1",
+    "image": "docker.io/library/python:3.12"
+   }
+  },
+  {
+   "step": "release",
+   "result": {
+    "released": true,
+    "box": "m_1",
+    "liveMs": 4000,
+    "saved": [],
+    "__ap_lease__": {
+     "id": "m_1",
+     "startedAt": 1800000004000,
+     "endedAt": 1800000008000,
+     "status": "freed"
+    },
+    "note": "the container and its files are gone; anything saved above is not"
+   }
+  },
+  {
+   "step": "shell with network undefined",
+   "result": {
+    "state": "succeeded",
+    "exitCode": 0,
+    "cwd": "/data/home/work",
+    "output": "hello",
+    "truncated": false,
+    "box": "m_2",
+    "image": "docker.io/library/python:3.12"
+   }
+  },
+  {
+   "step": "release",
+   "result": {
+    "released": true,
+    "box": "m_2",
+    "liveMs": 4000,
+    "saved": [],
+    "__ap_lease__": {
+     "id": "m_2",
+     "startedAt": 1800000012000,
+     "endedAt": 1800000016000,
+     "status": "freed"
+    },
+    "note": "the container and its files are gone; anything saved above is not"
+   }
+  },
+  {
+   "step": "shell with network \"none\"",
+   "result": {
+    "state": "succeeded",
+    "exitCode": 0,
+    "cwd": "/data/home/work",
+    "output": "hello",
+    "truncated": false,
+    "box": "m_3",
+    "image": "docker.io/library/python:3.12"
+   }
+  },
+  {
+   "step": "release",
+   "result": {
+    "released": true,
+    "box": "m_3",
+    "liveMs": 4000,
+    "saved": [],
+    "__ap_lease__": {
+     "id": "m_3",
+     "startedAt": 1800000020000,
+     "endedAt": 1800000024000,
+     "status": "freed"
+    },
+    "note": "the container and its files are gone; anything saved above is not"
+   }
+  },
+  {
+   "step": "shell with network \"None\"",
+   "result": {
+    "state": "succeeded",
+    "exitCode": 0,
+    "cwd": "/data/home/work",
+    "output": "hello",
+    "truncated": false,
+    "box": "m_4",
+    "image": "docker.io/library/python:3.12"
+   }
+  },
+  {
+   "step": "release",
+   "result": {
+    "released": true,
+    "box": "m_4",
+    "liveMs": 4000,
+    "saved": [],
+    "__ap_lease__": {
+     "id": "m_4",
+     "startedAt": 1800000028000,
+     "endedAt": 1800000032000,
+     "status": "freed"
+    },
+    "note": "the container and its files are gone; anything saved above is not"
+   }
+  },
+  {
+   "nets": {
+    "open": "bridge",
+    "absent": "bridge",
+    "none": "none",
+    "typo": "none"
+   }
+  },
+  {
+   "step": "shell when the image cannot be pulled",
+   "threw": "InstaBox could not bring up a container from docker.io/nobody/nothing:latest: exit 4: Error response from daemon: pull access denied"
+  },
+  {
+   "step": "shell",
+   "result": {
+    "state": "succeeded",
+    "exitCode": 0,
+    "cwd": "/data/home/work",
+    "output": "hello",
+    "truncated": false,
+    "box": "m_6",
+    "image": "docker.io/library/python:3.12"
+   }
+  },
+  {
+   "step": "shell when the container cannot be started",
+   "threw": "InstaBox machine m_6: its container is not there and could not be started"
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines",
+   "idem": "create-h-t-a-mywpiww0",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "name": "h-t-a-mywpiww0",
+    "templateId": "universal",
+    "vcpus": 2,
+    "memMiB": 4096,
+    "metadata": {
+     "tenant": "t",
+     "agent": "a",
+     "mount": "sandbox",
+     "machine": "main"
+    },
+    "deleteAfterSeconds": 86400,
+    "maxRunMinutes": 480,
+    "failFast": true,
+    "secrets": [],
+    "envSecrets": [],
+    "vault": false
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/operations/op_1?wait=25s",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 40000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/setup-0b30557a\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
+     "ap",
+     "",
+     "sh",
+     "-c",
+     "c=ap; i=$1; n=$2; w=$3; if docker container inspect \"$c\" >/dev/null 2>&1; then m=$(docker container inspect -f \"{{.HostConfig.NetworkMode}}\" \"$c\"); if [ \"$m\" != \"$n\" ]; then echo \"the kept container has network $m, and this mount asks for $n\"; exit 6; fi; docker start \"$c\" >/dev/null || exit 3; echo \"started the container already there\"; exit 0; fi; if docker image inspect \"$i\" >/dev/null 2>&1; then echo \"image already there\"; else s=$(date +%s); docker pull -q \"$i\" >/dev/null || exit 4; echo \"pulled the image in $(( $(date +%s) - s )) s\"; fi; docker run -d --name \"$c\" --init --restart unless-stopped --network \"$n\" -w \"$w\" --entrypoint sleep \"$i\" infinity >/dev/null || exit 5",
+     "ap-setup",
+     "docker.io/library/python:3.12",
+     "bridge",
+     "/data/home/work"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/setup-0b30557a\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "ap",
+     "4096"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the machine's container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
+     "ap",
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpizz49fc4e90e\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
+     "ap",
+     "",
+     "/bin/sh",
+     "-lc",
+     "mkdir -p /data/home/work && cd /data/home/work || exit 1\ntrue\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_1/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the machine's container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
+     "ap",
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpizz49fc4e90e\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "ap",
+     "262144"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "DELETE",
+   "path": "/v1/machines/m_1",
+   "idem": "delete-m_1-mywpj1io-33587da2",
+   "confirm": "m_1",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 30000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/operations/op_2?wait=25s",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 40000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines",
+   "idem": "create-h-t-a-mywpj328",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "name": "h-t-a-mywpj328",
+    "templateId": "universal",
+    "vcpus": 2,
+    "memMiB": 4096,
+    "metadata": {
+     "tenant": "t",
+     "agent": "a",
+     "mount": "sandbox",
+     "machine": "main"
+    },
+    "deleteAfterSeconds": 86400,
+    "maxRunMinutes": 480,
+    "failFast": true,
+    "secrets": [],
+    "envSecrets": [],
+    "vault": false
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/operations/op_3?wait=25s",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 40000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_2/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/setup-c7ec1136\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
+     "ap",
+     "",
+     "sh",
+     "-c",
+     "c=ap; i=$1; n=$2; w=$3; if docker container inspect \"$c\" >/dev/null 2>&1; then m=$(docker container inspect -f \"{{.HostConfig.NetworkMode}}\" \"$c\"); if [ \"$m\" != \"$n\" ]; then echo \"the kept container has network $m, and this mount asks for $n\"; exit 6; fi; docker start \"$c\" >/dev/null || exit 3; echo \"started the container already there\"; exit 0; fi; if docker image inspect \"$i\" >/dev/null 2>&1; then echo \"image already there\"; else s=$(date +%s); docker pull -q \"$i\" >/dev/null || exit 4; echo \"pulled the image in $(( $(date +%s) - s )) s\"; fi; docker run -d --name \"$c\" --init --restart unless-stopped --network \"$n\" -w \"$w\" --entrypoint sleep \"$i\" infinity >/dev/null || exit 5",
+     "ap-setup",
+     "docker.io/library/python:3.12",
+     "bridge",
+     "/data/home/work"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_2/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/setup-c7ec1136\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "ap",
+     "4096"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_2/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the machine's container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
+     "ap",
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpj65c5b80a5ca\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
+     "ap",
+     "",
+     "/bin/sh",
+     "-lc",
+     "mkdir -p /data/home/work && cd /data/home/work || exit 1\ntrue\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_2/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the machine's container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
+     "ap",
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpj65c5b80a5ca\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "ap",
+     "262144"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "DELETE",
+   "path": "/v1/machines/m_2",
+   "idem": "delete-m_2-mywpj7ow-ef14395e",
+   "confirm": "m_2",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 30000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/operations/op_4?wait=25s",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 40000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines",
+   "idem": "create-h-t-a-mywpj98g",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "name": "h-t-a-mywpj98g",
+    "templateId": "universal",
+    "vcpus": 2,
+    "memMiB": 4096,
+    "metadata": {
+     "tenant": "t",
+     "agent": "a",
+     "mount": "sandbox",
+     "machine": "main"
+    },
+    "deleteAfterSeconds": 86400,
+    "maxRunMinutes": 480,
+    "failFast": true,
+    "secrets": [],
+    "envSecrets": [],
+    "vault": false
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/operations/op_5?wait=25s",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 40000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_3/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/setup-83a8cdf2\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
+     "ap",
+     "",
+     "sh",
+     "-c",
+     "c=ap; i=$1; n=$2; w=$3; if docker container inspect \"$c\" >/dev/null 2>&1; then m=$(docker container inspect -f \"{{.HostConfig.NetworkMode}}\" \"$c\"); if [ \"$m\" != \"$n\" ]; then echo \"the kept container has network $m, and this mount asks for $n\"; exit 6; fi; docker start \"$c\" >/dev/null || exit 3; echo \"started the container already there\"; exit 0; fi; if docker image inspect \"$i\" >/dev/null 2>&1; then echo \"image already there\"; else s=$(date +%s); docker pull -q \"$i\" >/dev/null || exit 4; echo \"pulled the image in $(( $(date +%s) - s )) s\"; fi; docker run -d --name \"$c\" --init --restart unless-stopped --network \"$n\" -w \"$w\" --entrypoint sleep \"$i\" infinity >/dev/null || exit 5",
+     "ap-setup",
+     "docker.io/library/python:3.12",
+     "none",
+     "/data/home/work"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_3/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/setup-83a8cdf2\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "ap",
+     "4096"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_3/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the machine's container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
+     "ap",
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpjcbk173c6186\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
+     "ap",
+     "",
+     "/bin/sh",
+     "-lc",
+     "mkdir -p /data/home/work && cd /data/home/work || exit 1\ntrue\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_3/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the machine's container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
+     "ap",
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpjcbk173c6186\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "ap",
+     "262144"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "DELETE",
+   "path": "/v1/machines/m_3",
+   "idem": "delete-m_3-mywpjdv4-abd0f51a",
+   "confirm": "m_3",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 30000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/operations/op_6?wait=25s",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 40000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines",
+   "idem": "create-h-t-a-mywpjfeo",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "name": "h-t-a-mywpjfeo",
+    "templateId": "universal",
+    "vcpus": 2,
+    "memMiB": 4096,
+    "metadata": {
+     "tenant": "t",
+     "agent": "a",
+     "mount": "sandbox",
+     "machine": "main"
+    },
+    "deleteAfterSeconds": 86400,
+    "maxRunMinutes": 480,
+    "failFast": true,
+    "secrets": [],
+    "envSecrets": [],
+    "vault": false
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/operations/op_7?wait=25s",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 40000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_4/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/setup-3f6489ae\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
+     "ap",
+     "",
+     "sh",
+     "-c",
+     "c=ap; i=$1; n=$2; w=$3; if docker container inspect \"$c\" >/dev/null 2>&1; then m=$(docker container inspect -f \"{{.HostConfig.NetworkMode}}\" \"$c\"); if [ \"$m\" != \"$n\" ]; then echo \"the kept container has network $m, and this mount asks for $n\"; exit 6; fi; docker start \"$c\" >/dev/null || exit 3; echo \"started the container already there\"; exit 0; fi; if docker image inspect \"$i\" >/dev/null 2>&1; then echo \"image already there\"; else s=$(date +%s); docker pull -q \"$i\" >/dev/null || exit 4; echo \"pulled the image in $(( $(date +%s) - s )) s\"; fi; docker run -d --name \"$c\" --init --restart unless-stopped --network \"$n\" -w \"$w\" --entrypoint sleep \"$i\" infinity >/dev/null || exit 5",
+     "ap-setup",
+     "docker.io/library/python:3.12",
+     "none",
+     "/data/home/work"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_4/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/setup-3f6489ae\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "ap",
+     "4096"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_4/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the machine's container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
+     "ap",
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpjihsd3f81d42\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
+     "ap",
+     "",
+     "/bin/sh",
+     "-lc",
+     "mkdir -p /data/home/work && cd /data/home/work || exit 1\ntrue\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_4/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the machine's container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
+     "ap",
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpjihsd3f81d42\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "ap",
+     "262144"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "DELETE",
+   "path": "/v1/machines/m_4",
+   "idem": "delete-m_4-mywpjk1c-678cb1d6",
+   "confirm": "m_4",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 30000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/operations/op_8?wait=25s",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 40000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines",
+   "idem": "create-h-t-a-mywpjlkw",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "name": "h-t-a-mywpjlkw",
+    "templateId": "universal",
+    "vcpus": 2,
+    "memMiB": 4096,
+    "metadata": {
+     "tenant": "t",
+     "agent": "a",
+     "mount": "sandbox",
+     "machine": "main"
+    },
+    "deleteAfterSeconds": 86400,
+    "maxRunMinutes": 480,
+    "failFast": true,
+    "secrets": [],
+    "envSecrets": [],
+    "vault": false
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/operations/op_9?wait=25s",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 40000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_5/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/setup-fb20456a\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
+     "ap",
+     "",
+     "sh",
+     "-c",
+     "c=ap; i=$1; n=$2; w=$3; if docker container inspect \"$c\" >/dev/null 2>&1; then m=$(docker container inspect -f \"{{.HostConfig.NetworkMode}}\" \"$c\"); if [ \"$m\" != \"$n\" ]; then echo \"the kept container has network $m, and this mount asks for $n\"; exit 6; fi; docker start \"$c\" >/dev/null || exit 3; echo \"started the container already there\"; exit 0; fi; if docker image inspect \"$i\" >/dev/null 2>&1; then echo \"image already there\"; else s=$(date +%s); docker pull -q \"$i\" >/dev/null || exit 4; echo \"pulled the image in $(( $(date +%s) - s )) s\"; fi; docker run -d --name \"$c\" --init --restart unless-stopped --network \"$n\" -w \"$w\" --entrypoint sleep \"$i\" infinity >/dev/null || exit 5",
+     "ap-setup",
+     "docker.io/nobody/nothing:latest",
+     "bridge",
+     "/data/home/work"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_5/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/setup-fb20456a\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "ap",
+     "4096"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_5/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/setup-fb20456a\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "ap",
+     "4096"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "DELETE",
+   "path": "/v1/machines/m_5",
+   "idem": "delete-m_5-mywpjqzc-8fb4d9fe",
+   "confirm": "m_5",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 30000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/operations/op_10?wait=25s",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 40000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines",
+   "idem": "create-h-t-a-mywpjsiw",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "name": "h-t-a-mywpjsiw",
+    "templateId": "universal",
+    "vcpus": 2,
+    "memMiB": 4096,
+    "metadata": {
+     "tenant": "t",
+     "agent": "a",
+     "mount": "sandbox",
+     "machine": "main"
+    },
+    "deleteAfterSeconds": 86400,
+    "maxRunMinutes": 480,
+    "failFast": true,
+    "secrets": [],
+    "envSecrets": [],
+    "vault": false
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "GET",
+   "path": "/v1/operations/op_11?wait=25s",
+   "key": "ok",
+   "body": null,
+   "timeoutMs": 40000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_6/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/setup-23486d92\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
+     "ap",
+     "",
+     "sh",
+     "-c",
+     "c=ap; i=$1; n=$2; w=$3; if docker container inspect \"$c\" >/dev/null 2>&1; then m=$(docker container inspect -f \"{{.HostConfig.NetworkMode}}\" \"$c\"); if [ \"$m\" != \"$n\" ]; then echo \"the kept container has network $m, and this mount asks for $n\"; exit 6; fi; docker start \"$c\" >/dev/null || exit 3; echo \"started the container already there\"; exit 0; fi; if docker image inspect \"$i\" >/dev/null 2>&1; then echo \"image already there\"; else s=$(date +%s); docker pull -q \"$i\" >/dev/null || exit 4; echo \"pulled the image in $(( $(date +%s) - s )) s\"; fi; docker run -d --name \"$c\" --init --restart unless-stopped --network \"$n\" -w \"$w\" --entrypoint sleep \"$i\" infinity >/dev/null || exit 5",
+     "ap-setup",
+     "docker.io/library/python:3.12",
+     "bridge",
+     "/data/home/work"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_6/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/setup-23486d92\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "ap",
+     "4096"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_6/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the machine's container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
+     "ap",
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpjvm0b7dc0126\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
+     "ap",
+     "",
+     "/bin/sh",
+     "-lc",
+     "mkdir -p /data/home/work && cd /data/home/work || exit 1\ntrue\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_6/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the machine's container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
+     "ap",
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpjvm0b7dc0126\" \"$@\"; d=$1; m=$2; [ -d \"$d\" ] || { echo missing; exit 0; }; if [ -f \"$d/nostart\" ]; then echo nostart; cat \"$d/nostart\"; exit 0; fi; p=$(cat \"$d/pid\" 2>/dev/null); if [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -n \"$p\" ] && [ -d \"/proc/$p\" ]; then echo running; exit 0; elif [ -f \"$d/rc\" ]; then echo \"rc $(cat \"$d/rc\")\"; elif [ -f \"$d/killed\" ]; then echo killed; else echo lost; fi; s=$(stat -c %s \"$d/out\" 2>/dev/null || echo 0); echo \"size $s\"; if [ \"$s\" -le \"$m\" ]; then cat \"$d/out\" 2>/dev/null; else h=$((m/2)); head -c \"$h\" \"$d/out\"; printf '\\n... (%s bytes omitted) ...\\n' $((s-m)); tail -c \"$h\" \"$d/out\"; fi",
+     "ap",
+     "262144"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "method": "POST",
+   "path": "/v1/machines/m_6/exec",
+   "contentType": "application/json",
+   "key": "ok",
+   "body": {
+    "argv": [
+     "sh",
+     "-c",
+     "c=ap; [ \"$(docker container inspect -f '{{.State.Running}}' \"$c\" 2>/dev/null)\" = true ] || docker start \"$c\" >/dev/null 2>&1 || { echo 'ap-container: the machine's container is not there and could not be started' >&2; exit 125; }; exec docker exec \"$c\" \"$@\"",
+     "ap",
+     "sh",
+     "-c",
+     "set -- \"$HOME/.antiproton/jobs/jmywpjx5k4b7095ba\" \"$@\"; d=$1; w=$2; shift 2; mkdir -p -- \"$d\" || exit 90; if [ -n \"$w\" ] && ! cd -- \"$w\" 2>/dev/null; then printf 'failed to start: chdir %s: no such file or directory\\n' \"$w\" > \"$d/nostart\"; exit 0; fi; setsid nohup sh -c 'd=$1; shift; \"$@\"; echo $? > \"$d/rc.tmp\"; mv -f \"$d/rc.tmp\" \"$d/rc\"' ap-job \"$d\" \"$@\" > \"$d/out\" 2>&1 < /dev/null & echo $! > \"$d/pid\"",
+     "ap",
+     "/data/home/work",
+     "/bin/sh",
+     "-lc",
+     "true\n__ap_rc=$?; printf '\\n__AP_CWD__%s\\n' \"$PWD\"; exit $__ap_rc"
+    ],
+    "timeoutSeconds": 60
+   },
+   "timeoutMs": 120000
+  },
+  {
+   "record": {
+    "machines": {
+     "main": {
+      "boxId": "m_6",
+      "createdAt": 1800000045000,
+      "lastUsedAt": 1800000046000,
+      "execs": 1,
+      "saved": [],
+      "deleteAt": 1800086442000,
+      "credentialRef": "agent",
+      "image": "docker.io/library/python:3.12",
+      "cwd": "/data/home/work"
+     }
+    },
+    "sessions": []
+   }
+  }
  ]
 }
