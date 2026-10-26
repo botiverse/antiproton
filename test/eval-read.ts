@@ -9,7 +9,7 @@
 import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { agentSecretValues, credentialRedactor, readTraceWindow, redactCredentials, TRACE_OBJECTS_SCAN, type TraceSource } from "../cf/src/eval-read.ts";
-import { OPERATOR_EXA_REF, OPERATOR_RUN9_REF, operatorCredentials, resolveOperatorRef } from "../cf/src/operator-ref.ts";
+import { OPERATOR_EXA_REF, OPERATOR_INSTABOX_REF, OPERATOR_RUN9_REF, operatorCredentials, resolveOperatorRef } from "../cf/src/operator-ref.ts";
 import { traceBody, traceKey, traceKeyRange, tracePrefix } from "../cf/src/trace-r2.ts";
 import type { TraceOutboxRow } from "../src/trace/outbox.ts";
 
@@ -403,6 +403,30 @@ await check("agentSecretValues adds the operator's credential a mount names, as 
   must(none.ok && none.values.length === 0, `a deployment without them: ${show(none)}`);
   const bad = await agentSecretValues(sql, T, A, { RUN9: "{not json" });
   must(!bad.ok, `an unreadable run9 account: ${show(bad)}`);
+});
+
+await check("operator:instabox resolves the INSTABOX secret, JSON or bare, as {apiKey}, and the export scrubs the key", async () => {
+  const db = new DatabaseSync(":memory:");
+  const sql = { exec: (q: string, ...b: unknown[]) => ({ toArray: () => db.prepare(q).all(...(b as never[])) as any[] }) };
+  db.exec("CREATE TABLE mounts (tenant_id TEXT, agent_id TEXT, alias TEXT, secret_ref TEXT)");
+  db.prepare("INSERT INTO mounts VALUES (?, ?, ?, ?)").run(T, A, "sandbox", OPERATOR_INSTABOX_REF);
+  const KEY = "ibk_live_9f8e7d6c5b4a3210";
+  for (const held of [JSON.stringify({ apiKey: KEY }), KEY, ` ${KEY}\n`]) {
+    const v = await resolveOperatorRef(OPERATOR_INSTABOX_REF, operatorCredentials({ INSTABOX: held }), async () => "fallback");
+    must(v === JSON.stringify({ apiKey: KEY }), `${JSON.stringify(held.slice(0, 3))}... resolved to another value`);
+    const got = await agentSecretValues(sql, T, A, { INSTABOX: held });
+    must(got.ok && got.values.includes(KEY), `the export would not scrub the key held as ${held === KEY ? "bare" : "JSON or padded"}`);
+    must(redactCredentials(`curl -H x-api-key:${KEY}`, { secrets: got.values }).value === "curl -H x-api-key:<redacted:agent-secret>", "the key survived the scrub");
+  }
+  // Unset, empty, or JSON without a key: no account, and nothing else is handed to the mount (not the fallback either).
+  for (const held of [undefined, "", "{\"key\":\"x\"}", "{not json"]) {
+    const creds = operatorCredentials({ INSTABOX: held });
+    must(!("operatorInstabox" in creds), `${JSON.stringify(held)} read as an account`);
+    must((await resolveOperatorRef(OPERATOR_INSTABOX_REF, creds, async () => "fallback")) === null, `${JSON.stringify(held)} resolved to something`);
+  }
+  // The run9 account is not read for it, nor it for run9.
+  const both = operatorCredentials({ RUN9: JSON.stringify({ ak: "a", sk: "s" }), INSTABOX: KEY });
+  must((await resolveOperatorRef(OPERATOR_RUN9_REF, both, async () => null)) === JSON.stringify({ ak: "a", sk: "s" }), "run9 resolved differently beside InstaBox");
 });
 
 const failed = results.filter((r) => !r.ok);

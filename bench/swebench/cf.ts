@@ -25,6 +25,7 @@
  *   N=1 node bench/swebench/cf.ts
  *   N=10 OBJ=swe2 node bench/swebench/cf.ts
  */
+import { startedAs } from "./started.ts";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { ratesFromEnv, meterLine, type Meter } from "../meter.ts";
@@ -56,6 +57,9 @@ const TRACE = process.env.TRACE === "1";
 const OBJ = process.env.OBJ ?? "swe1";
 // Which kernel runs the agent, and so whether each instance needs an object of its own (bench/objects.ts).
 const ENGINE = benchEngine(process.env.ENGINE);
+/** Where the task's machine runs: run9 (the default) or instabox (the Worker needs its INSTABOX secret). */
+const PROVIDER = process.env.PROVIDER ?? "run9";
+if (PROVIDER !== "run9" && PROVIDER !== "instabox") throw new Error(`PROVIDER must be run9 or instabox; got ${PROVIDER}`);
 const OBJECTS = objectsShape(ENGINE, process.env.OBJECTS);
 /** The object an instance runs in: the run's own, or the instance's (OBJECTS=per-task, and always on pd). */
 const objOf = (taskId: string) => taskObject(OBJ, OBJECTS, taskId);
@@ -176,10 +180,10 @@ async function runOne(inst: Instance) {
     ...(process.env.NETWORK ? { network: process.env.NETWORK } : {}),
     // Named only when it is not the default, so a pi085 run sends what it always sent.
     ...(ENGINE === "pi085" ? {} : { engine: ENGINE }),
+    // Named only when it is not run9, so a run9 run sends what it always sent.
+    ...(PROVIDER === "run9" ? {} : { provider: PROVIDER }),
   }, undefined, obj);
-  // What the object says it runs, not what was asked: an older Worker ignores `engine` and answers without one.
-  const engine = started?.engine ?? (ENGINE === "pi085" ? "pi085" : null);
-  if (engine !== ENGINE) throw new Error(`asked for ${ENGINE}, the object runs ${engine ?? "an engine it did not name"}`);
+  const { provider, engine } = startedAs(started, { provider: PROVIDER, engine: ENGINE });
   const network = String(started?.network ?? "open");
   if (TRACE) console.log(`    started ${JSON.stringify(started)}`);
 
@@ -239,7 +243,7 @@ async function runOne(inst: Instance) {
     .reduce((a: number, k: any) => a + Number(k.ms), 0);
   const objectMs = Number(act?.activeMs ?? 0);
   return {
-    id: inst.instance_id, taskId, engine, object: `bench-${obj}`,
+    id: inst.instance_id, taskId, engine, provider, object: `bench-${obj}`,
     // Per task, the run's activity is the sum of its objects' (bench/objects.ts), so each one's is kept.
     ...(OBJECTS === "per-task" ? { activity: act } : {}),
     resolved: grade.resolved === true,
@@ -263,7 +267,7 @@ if (OBJECTS === "shared") await api("/bench/activity/reset", { method: "POST" })
 const run = beginRun("swebench", OBJ);
 teeRun(run);
 console.log(`\n  SWE-bench Verified — ${instances.length} instance(s), inside the deployed object, container network ${process.env.NETWORK ?? "none"}` +
-  `, engine ${ENGINE}\n  on ${BASE} ${OBJECTS === "shared" ? `object bench-${OBJ}` : `one object per instance, bench-${OBJ}-<task>`}\n  ${"─".repeat(80)}`);
+  `, engine ${ENGINE}, provider ${PROVIDER}\n  on ${BASE} ${OBJECTS === "shared" ? `object bench-${OBJ}` : `one object per instance, bench-${OBJ}-<task>`}\n  ${"─".repeat(80)}`);
 const out: any[] = [];
 const t0Run = Date.now();
 const RATES = ratesFromEnv();
@@ -272,7 +276,7 @@ for (const inst of instances) {
   let r: any;
   try { r = await runOne(inst); }
   catch (e) {
-    r = { id: inst.instance_id, engine: ENGINE, resolved: false, error: (e as Error).message.slice(0, 200),
+    r = { id: inst.instance_id, engine: ENGINE, provider: PROVIDER, resolved: false, error: (e as Error).message.slice(0, 200),
           seconds: 0, calls: 0, prompt: 0, out: 0, cached: 0, byTool: {} };
   }
   out.push(r);
@@ -325,7 +329,7 @@ if (act) {
     (grading ? `, of which ${(grading / 1000).toFixed(1)}s is this runner grading` : ""));
 }
 const recorded = recordRun(run, {
-  bench: "swebench-verified", base: BASE, build: await workerBuild(BASE), driver: driverCommit(), object: OBJECTS === "shared" ? `bench-${OBJ}` : `bench-${OBJ}-<task>`, engine: ENGINE, objects: OBJECTS, offset: OFFSET, n: instances.length,
+  bench: "swebench-verified", base: BASE, build: await workerBuild(BASE), driver: driverCommit(), object: OBJECTS === "shared" ? `bench-${OBJ}` : `bench-${OBJ}-<task>`, engine: ENGINE, provider: PROVIDER, objects: OBJECTS, offset: OFFSET, n: instances.length,
   network: out.map((r: any) => r.network).find(Boolean) ?? null,
   startedAt: new Date(t0Run).toISOString(), results: out, totals, activity: act,
 });
