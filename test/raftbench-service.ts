@@ -414,6 +414,28 @@ await check("the coverage block says when the window was not read in full, and w
   must(/2 messages read; NOT the whole window: reading stopped at the character limit\. Your result must have status incomplete/.test(head), head);
 });
 
+await check("the read log line carries the run and the window (coverage from/to) exactly as the Server sent it, marks what no response carries as missing; a page without its window is refused, not logged", async () => {
+  const w = await world();
+  w.raft.newer = { page: {}, coverage: { from: "2026-10-16T01:02:03.004Z", to: "2026-10-17T05:06:07.008Z" } };
+  logs.length = 0;
+  await assign(w);
+  const read = runLogs("read");
+  must(read.length === 1 && read[0].runId === w.raft.run.runId && read[0].revision === 3
+    && read[0].coverageFrom === "2026-10-16T01:02:03.004Z" && read[0].coverageTo === "2026-10-17T05:06:07.008Z", show(read));
+  // Neither the context response nor `readAll` gives these: logged as missing, not made up.
+  must(read[0].sourceKind === null && read[0].start === null && read[0].nextCursor === null && read[0].missing === "sourceKind,start,nextCursor", show(read));
+  // The line holds ids, cursors, times and counts only: a key outside this set (the material's text, evidence, a whole
+  // response) is a leak the "no text" rule depends on catching.
+  const READ_KEYS = ["agentId", "coverageFrom", "coverageTo", "evt", "fetched", "missing", "mount", "nextCursor", "pages", "revision", "runId", "sourceKind", "start", "step", "stopReason", "tenantId"];
+  must(JSON.stringify(Object.keys(read[0]).sort()) === JSON.stringify(READ_KEYS), `the read line carries other keys: ${JSON.stringify(Object.keys(read[0]).sort())}`);
+  const w2 = await world();
+  w2.raft.newer = { page: {}, coverage: { from: undefined, to: undefined } };
+  logs.length = 0;
+  await assign(w2);
+  // The SDK refuses a page without its window, so there is no read line to fill one in on.
+  must(runLogs("read").length === 0 && runLogs("read_failed").some((l) => l.code === "INVALID_RESPONSE"), show(logs.filter((l) => l.evt === "raftbench.run")));
+});
+
 await check("a non-profile agent drops an assignment from receive_events, logs it, and never calls RaftBench", async () => {
   const w = await world();
   must((await adoptProvisionedAgent(w.rt, "t", "raft_plain", { name: "Cody", instructions: "", raftOrigin: ORIGIN, avatar: "00", toolConfig: null, profile: null })).ok, "plain adopt");
