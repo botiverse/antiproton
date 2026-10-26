@@ -501,7 +501,7 @@ export interface PluginContext {
    * another version than the registry's answers null, as a missing one does — its calls are refused, so
    * its credential is not handed out by this route either. Callers that want
    * the sibling's credential read null as "not there"; reminder's `onRaft`
-   * reads it as "not hosted on Raft".
+   * reads it as "not hosted on Raft", and its comment says what that costs.
    */
   sibling(alias: string): Promise<{
     credential: string | null;
