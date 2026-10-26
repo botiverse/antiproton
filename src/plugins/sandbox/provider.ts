@@ -23,6 +23,8 @@ export interface SandboxBackend {
    * puts it in an empty network namespace, as the box's own user can.
    */
   isolateNetwork: readonly string[];
+  /** The prefix for a mount with these settings, where it is not always `isolateNetwork`. */
+  isolateNetworkFor?(settings: ProviderSettings): readonly string[];
   /**
    * The provider bound to a mount's settings and credential. Throws when the stored credential does not parse:
    * that is a broken mount, and the caller reports it rather than talking to the provider with nothing.
@@ -75,6 +77,12 @@ export interface ProviderSettings {
   shape?: string;
   /** InstaBox: the template a new box starts from. */
   template?: string;
+  /** InstaBox: the image the box's commands run in, as a container inside the machine; empty or absent: none. */
+  image?: string;
+  /** InstaBox, with an image: the container's network, closed unless "open". */
+  network?: string;
+  /** InstaBox, with an image: the container's working directory. */
+  workdir?: string;
   /** InstaBox: the server-side deletion every box is created with, in hours (at most 24, the API's limit). */
   maxLifetimeHours?: number;
   /** InstaBox: the longest a box runs without a pause, in minutes, enforced by InstaBox. */

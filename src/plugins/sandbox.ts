@@ -33,7 +33,7 @@ export { AWAKE_STATES, PUT_SETTLE_MS } from "./sandbox/providers/run9.ts";
 export interface SandboxConfig {
   /** Which provider runs the container: "run9" (the default) or "instabox". */
   provider?: string;
-  /** InstaBox: the template a new machine starts from, in place of `image`. */
+  /** InstaBox: the template a new machine starts from. A mount's `image` then runs as a container inside it. */
   template?: string;
   /**
    * InstaBox: hours after creation at which InstaBox deletes the machine whatever it is doing
@@ -923,6 +923,8 @@ const INSTABOX_DEFAULTS = {
   workdir: "/data/home/work",
   // The smallest size InstaBox sells (Pro and up): 2 vCPUs, 4 GiB.
   shape: "2c4g",
+  // No container: commands run on the machine, from its template. A mount's `image` runs as a container in it.
+  image: "",
 };
 
 const DEFAULTS = {
@@ -2676,9 +2678,9 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       // only come from the record read at the top of this call. `BoxState`
       // declares the field, so there is nothing here to cast around either.
       const from = prior.startFrom;
-      // What every result will report this container as: the setting (InstaBox's template), or the
-      // image the kept environment itself started from. Unknown stays unknown.
-      const image = from ? kept.find((e) => e.snapId === from)?.image : backend.id === "instabox" ? cfg.template : cfg.image;
+      // What every result will report this container as: the setting (on InstaBox the template when no image is
+      // set), or the image the kept environment itself started from. Unknown stays unknown.
+      const image = from ? kept.find((e) => e.snapId === from)?.image : backend.id === "instabox" && !cfg.image ? cfg.template : cfg.image;
       // The agent's other accounts this container acts as (`SandboxForm`). Asked
       // at creation because the provider registers credentials per box, and read
       // again before every later command (reconcileAccounts).
@@ -2948,7 +2950,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     const start = (argv: string[], workdir: string | null) => provider.execBackground(state!.boxId, { argv, workdir });
     // The box just created was wired from the mount a moment ago; any other is checked again.
     if (!created) state = await reconcileAccounts(ctx, state!, provider, await accountsWanted(ctx, cfg), machine);
-    const argvCfg = { ...cfg, isolate: backend.isolateNetwork };
+    const argvCfg = { ...cfg, isolate: backend.isolateNetworkFor?.(cfg) ?? backend.isolateNetwork };
     let execId = await start(execArgv(argvCfg, command, envFor(state)), startIn);
     let movedFrom: string | null = null;
 

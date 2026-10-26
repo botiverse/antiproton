@@ -18,7 +18,7 @@ import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
 import { BOX_KEY, BOX_STORE, sandboxPlugin } from "../src/plugins/sandbox.ts";
 import type { BoxLease } from "../src/plugins/sandbox.ts";
-import { instaboxTiming, KILL, LAUNCH, POLL } from "../src/plugins/sandbox/providers/instabox.ts";
+import { CP_IN, CP_OUT, IN_CONTAINER, instaboxTiming, KILL, LAUNCH, NO_CONTAINER, POLL, SETUP } from "../src/plugins/sandbox/providers/instabox.ts";
 import type { SandboxForm } from "../src/plugins/types.ts";
 import { Backgrounded } from "../src/plugins/types.ts";
 import { PluginDbTables } from "../src/store/plugin-db.ts";
@@ -71,6 +71,10 @@ interface Fake {
   jobs: JobAnswer[][];
   /** Checked before the defaults: the first that answers wins. */
   overrides: Array<(r: Req) => Answer | undefined>;
+  /** Each command run in a machine's container (`IN_CONTAINER`), as the container got it. */
+  inContainer: string[][];
+  /** Whether the container is there to run in; false: `IN_CONTAINER` answers as it does when it cannot start one. */
+  container: boolean;
 }
 
 function headersOf(h: unknown): Record<string, string> {
@@ -80,7 +84,7 @@ function headersOf(h: unknown): Record<string, string> {
 }
 
 function fake(): Fake {
-  const f: Fake = { log: [], reqs: [], machines: new Map(), jobs: [], overrides: [] };
+  const f: Fake = { log: [], reqs: [], machines: new Map(), jobs: [], overrides: [], inContainer: [], container: true };
   const ops = new Map<string, any>();
   const opByKey = new Map<string, string>();
   const snaps = new Map<string, { id: string; name: string; reads: number; from: string }>();
@@ -225,8 +229,23 @@ function fake(): Fake {
     /** The adapter's scripts, recognised by what they contain; anything else is a plain command. */
     function execOf(argv: string[]): Record<string, unknown> {
       const script = argv[0] === "sh" && argv[1] === "-c" ? argv[2]! : "";
-      const job = /jobs\/(j[a-z0-9]+)/.exec(script)?.[1];
       const args = argv.slice(4);
+      if (script === IN_CONTAINER) {
+        if (!f.container) return { exitCode: 125, stdout: "", stderr: `${NO_CONTAINER}\n` };
+        f.inContainer.push(args);
+        return execOf(args);
+      }
+      if (script === CP_IN) {
+        files.set(args[1]!, files.get(args[0]!) ?? new Uint8Array());
+        files.delete(args[0]!);
+        return { exitCode: 0, stdout: "", stderr: "" };
+      }
+      if (script === CP_OUT) {
+        const at = `/data/home/.antiproton/out-${args[1]}`;
+        files.set(at, args[2] === "tar" ? new TextEncoder().encode(`tar of ${args[0]}`) : files.get(args[0]!) ?? new TextEncoder().encode(`bytes of ${args[0]}`));
+        return { exitCode: 0, stdout: at };
+      }
+      const job = /jobs\/([A-Za-z0-9_-]+)/.exec(script)?.[1];
       if (script.endsWith(LAUNCH) && job) {
         const [workdir, ...cmd] = args;
         const nostart = workdir && workdir.startsWith("/nope") ? `failed to start: chdir ${workdir}: no such file or directory` : null;
@@ -271,6 +290,7 @@ function answer(a: Answer): Response {
 /** What a job nobody scripted ends with: each kind of command the plugin sends gets its own. */
 function defaultJob(argv: string[], files: Map<string, Uint8Array>): JobAnswer {
   const line = argv.join(" ");
+  if (argv[2] === SETUP) return { rc: 0, output: "pulled the image in 16 s\n" };
   if (line.includes("#total")) return { rc: 0, output: "f\t5\t1700000000.5\tout.txt\nd\t0\t1700000001\tsrc\n#total\t2\n" };
   if (line.includes("realpath") && line.includes("-maxdepth 0")) return { rc: 0, output: "f\t13\t1700000002.25\t/data/home/work/out.txt\n" };
   if (line.includes("sha256sum")) {
@@ -588,6 +608,84 @@ const SCENARIOS: Record<string, (out: unknown[]) => Promise<void>> = {
     const argv = (launch.body as any).argv as string[];
     must(argv.slice(5, 10).join(" ") === "unshare --user --map-current-user --net --", `the command was not started in a user and network namespace: ${argv.slice(4, 12).join(" ")}`);
     must(!f.reqs.some((r) => r.path.includes("/secrets")), "a credential was registered with InstaBox");
+  },
+
+  async "an image runs as a container in the machine: set up at create, and every command, file and job goes into it"(out) {
+    const f = fake();
+    const IMAGE = "docker.io/swebench/sweb.eval.x86_64.astropy_1776_astropy-12907:latest";
+    const m = mount({ lease: LEASE, config: { image: IMAGE, workdir: "/testbed", network: "none", shell: "/bin/bash",
+      shellPrefix: "source /opt/miniconda3/etc/profile.d/conda.sh && conda activate testbed && " } });
+    await step("shell creates the machine and its container", () => m.plugin.invoke("shell", { command: "python -V" }, m.ctx), out);
+    await step("shell again", () => m.plugin.invoke("shell", { command: "git status" }, m.ctx), out);
+    await step("put", () => m.plugin.invoke("put", { ref: "artifact://raft/attachments/7/photo.jpg", path: "in/photo.jpg" }, m.ctx), out);
+    await step("save a file", () => m.plugin.invoke("save", { path: "/testbed/in/photo.jpg" }, m.ctx), out);
+    await step("save a directory as tar", () => m.plugin.invoke("save", { path: "/testbed/in", archive: true }, m.ctx), out);
+    m.ctx.publicConfig.graceMs = 0;
+    f.jobs.push([{ state: "running" }]);
+    const bg: any = await step("a command handed over as a job", () => m.plugin.invoke("shell", { command: "sleep 100" }, m.ctx), out);
+    await step("poll it", () => m.plugin.background!.poll(bg?.handle, m.ctx), out);
+    await step("cancel it", () => m.plugin.background!.cancel(bg?.handle, m.ctx), out);
+    m.ctx.publicConfig.graceMs = 3_000;
+    await step("the workspace view lists the container's working directory", () => m.plugin.holds!.files!.list(m.ctx, "", locked), out);
+    await step("keep", () => m.plugin.invoke("keep", { name: "env" }, m.ctx), out);
+    await step("start_from", () => m.plugin.invoke("start_from", { name: "env" }, m.ctx), out);
+    f.jobs.push([{ rc: 0, output: "started the container already there\n" }]);
+    await step("shell creates from the snapshot, starting the container kept in it", () => m.plugin.invoke("shell", { command: "echo from" }, m.ctx), out);
+    await step("machines", () => m.plugin.invoke("machines", {}, m.ctx), out);
+    await step("release", () => m.plugin.invoke("release", {}, m.ctx), out);
+    out.push(...f.log, { stored: m.stored }, { inContainer: f.inContainer }, { record: m.record() });
+    invariants(f);
+    const argvs = execs(f).map((e) => (e.body as any).argv as string[]);
+    const setups = argvs.filter((a) => a[2]!.endsWith(LAUNCH) && a.includes(SETUP));
+    must(setups.length === 2, `expected the container set up once per machine, got ${setups.length}`);
+    for (const a of setups) {
+      const at = a.indexOf(SETUP);
+      must(JSON.stringify(a.slice(at + 2, at + 5)) === JSON.stringify([IMAGE, "none", "/testbed"]), `the container was not asked for with the image, no network and the working directory: ${a.slice(at + 2).join(" ")}`);
+    }
+    // On the machine itself only the setup, its polls, the copies in and out and their clean-up: nothing the agent wrote.
+    const onMachine = argvs.filter((a) => a[2] !== IN_CONTAINER);
+    for (const a of onMachine) {
+      const ok = a.includes(SETUP) || /jobs\/setup-/.test(a[2]!) || a[2] === CP_IN || a[2] === CP_OUT || (a[0] === "rm" && /\.antiproton\/out-/.test(a[3]!));
+      must(ok, `a command ran on the machine, outside the container: ${a.join(" ").slice(0, 200)}`);
+    }
+    must(!argvs.some((a) => a.includes("unshare")), "a command was put in a namespace the container refuses; its network is Docker's");
+    must(f.inContainer.some((a) => a[2]!.endsWith(LAUNCH) && a.some((x) => x.includes("source /opt/miniconda3/etc/profile.d/conda.sh && conda activate testbed && mkdir -p /testbed"))),
+      "the agent's command did not reach the container with its prefix");
+    must(f.inContainer.some((a) => a[2]!.endsWith(KILL)), "the job was not killed in the container");
+    const puts = f.reqs.filter((r) => r.method === "PUT");
+    must(puts.length === 1 && /path=%2Ftmp%2F\.ap-in-/.test(puts[0]!.path), `the upload did not go to the machine's /tmp on its way into the container: ${puts.map((r) => r.path).join(", ")}`);
+    must(!f.reqs.some((r) => r.method === "GET" && r.path.includes("/files/content") && !r.path.includes(".antiproton%2Fout-")), "a file was read from the machine rather than copied out of the container");
+    must(m.record().envs?.[0]?.image === IMAGE, "the kept environment does not record the image");
+  },
+
+  async "an image's container: the network open or closed by the setting, a container that cannot come up, one gone"(out) {
+    const f = fake();
+    const IMAGE = "docker.io/library/python:3.12";
+    const network = async (value: unknown) => {
+      const m = mount({ config: { image: IMAGE, ...(value === undefined ? {} : { network: value }) } });
+      await step(`shell with network ${JSON.stringify(value)}`, () => m.plugin.invoke("shell", { command: "true" }, m.ctx), out);
+      const a = execs(f).map((e) => (e.body as any).argv as string[]).reverse().find((x) => x.includes(SETUP))!;
+      await step("release", () => m.plugin.invoke("release", {}, m.ctx), out);
+      return a[a.indexOf(SETUP) + 3];
+    };
+    const nets = { open: await network("open"), absent: await network(undefined), none: await network("none"), typo: await network("None") };
+    out.push({ nets });
+    must(nets.open === "bridge" && nets.absent === "bridge" && nets.none === "none" && nets.typo === "none", `the container's network did not follow the setting, closed unless open: ${JSON.stringify(nets)}`);
+    // A container that will not come up (an image that cannot be pulled): the machine is deleted, and nothing recorded.
+    const m = mount({ config: { image: "docker.io/nobody/nothing:latest" } });
+    f.jobs.push([{ state: "running" }, { rc: 4, output: "Error response from daemon: pull access denied\n" }]);
+    const before = f.machines.size;
+    await step("shell when the image cannot be pulled", () => m.plugin.invoke("shell", { command: "true" }, m.ctx), out);
+    must(f.machines.size === before, "the machine whose container did not come up was left behind");
+    must(!m.record()?.machines?.main, "a machine whose container did not come up was recorded");
+    // A container that is gone and cannot be started again: said, not read as the command's own failure.
+    const g = mount({ config: { image: IMAGE } });
+    await step("shell", () => g.plugin.invoke("shell", { command: "true" }, g.ctx), out);
+    f.container = false;
+    await step("shell when the container cannot be started", () => g.plugin.invoke("shell", { command: "true" }, g.ctx), out);
+    f.container = true;
+    out.push(...f.log, { record: g.record() });
+    invariants(f);
   },
 };
 

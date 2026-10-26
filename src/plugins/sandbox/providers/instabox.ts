@@ -19,6 +19,9 @@ import type {
  *   redirects its output to a file in the job's directory, and polled and killed by further execs (`LAUNCH`).
  * - Files are read only with `GET /files/content`, which runs as the box's user. `GET /files` reads as root
  *   (measured 2026-10-26: it returned /etc/shadow, which `/files/content` refused with 403).
+ * - InstaBox cannot start a machine from an OCI image, so a mount's `image` runs as a Docker container inside the
+ *   machine (`CONTAINER`, set up by `SETUP`), and every command and file goes into it (`IN_CONTAINER`, `docker cp`).
+ *   The machine's own user, who holds the Docker socket, is never the one the agent's commands run as.
  */
 
 interface InstaboxCredential { apiKey: string }
@@ -84,6 +87,52 @@ export const KILL = 'd=$1; p=$(cat "$d/pid" 2>/dev/null) || exit 3; [ -f "$d/rc"
 /** A directory as a tar under HOME, for `download` with `archive`; the path of the tar on stdout. */
 const TAR = 't="$HOME/.antiproton/save-$2.tar"; mkdir -p "$HOME/.antiproton" && ' +
   'tar -cf "$t" -C "$(dirname -- "$1")" -- "$(basename -- "$1")" && printf %s "$t"';
+
+/** The container a box with an `image` runs everything in: one per machine, so one name. */
+export const CONTAINER = "ap";
+/** How long bringing the container up may take, the image's pull included (measured 16-20 s for a 1.1 GB SWE-bench image). */
+const SETUP_BUDGET_MS = 1_200_000;
+/** What `IN_CONTAINER` says on stderr, with exit 125, when the container is not there to run in. */
+export const NO_CONTAINER = "ap-container: the machine's container is not there and could not be started";
+
+/**
+ * Brings the box's container up, run on the machine as its user: `$1` the image, `$2` the Docker network, `$3`
+ * the working directory. A container already there (a box from a snapshot) is started, not made again, so what
+ * was kept in it is what the agent finds, and the image the snapshot carries is not pulled again. Its network
+ * must be the one asked for: a kept container made with a network is refused for a mount that has none.
+ * `--init` reaps the jobs' processes, which `sleep` as PID 1 would leave as zombies that `POLL` reads as alive;
+ * `--restart unless-stopped` brings it back when the machine is started cold (measured 2026-10-26).
+ * Its first line says which of those it did.
+ */
+export const SETUP = `c=${CONTAINER}; i=$1; n=$2; w=$3; ` +
+  'if docker container inspect "$c" >/dev/null 2>&1; then ' +
+  'm=$(docker container inspect -f "{{.HostConfig.NetworkMode}}" "$c"); ' +
+  'if [ "$m" != "$n" ]; then echo "the kept container has network $m, and this mount asks for $n"; exit 6; fi; ' +
+  'docker start "$c" >/dev/null || exit 3; echo "started the container already there"; exit 0; fi; ' +
+  'if docker image inspect "$i" >/dev/null 2>&1; then echo "image already there"; ' +
+  'else s=$(date +%s); docker pull -q "$i" >/dev/null || exit 4; echo "pulled the image in $(( $(date +%s) - s )) s"; fi; ' +
+  'docker run -d --name "$c" --init --restart unless-stopped --network "$n" -w "$w" --entrypoint sleep "$i" infinity >/dev/null || exit 5';
+
+/**
+ * Runs `$@` in the box's container, as the image's own user, after starting the container if it is not running
+ * (measured: inspecting costs about 16 ms, the exec about 40 ms). Exit 125 and `NO_CONTAINER` when it cannot be.
+ */
+export const IN_CONTAINER = `c=${CONTAINER}; [ "$(docker container inspect -f '{{.State.Running}}' "$c" 2>/dev/null)" = true ] || ` +
+  `docker start "$c" >/dev/null 2>&1 || { echo '${NO_CONTAINER}' >&2; exit 125; }; exec docker exec "$c" "$@"`;
+
+/**
+ * A file out of the container to the machine, for `download`: `$1` the path in the container, `$2` a tag. With
+ * `$3` = tar, the path as a tar (`docker cp ... -`); otherwise the file itself, its links followed in the
+ * container (`-L`), so what the machine holds is a plain file and not a link resolved on the machine. The path
+ * on the machine on stdout; exit 6 when the path is not a file.
+ */
+export const CP_OUT = `c=${CONTAINER}; t="$HOME/.antiproton/out-$2"; mkdir -p "$HOME/.antiproton" || exit 1; ` +
+  'if [ "$3" = tar ]; then docker cp "$c:$1" - > "$t" || { rm -f "$t"; exit 1; }; ' +
+  'else docker cp -L "$c:$1" "$t" >/dev/null || exit 1; ' +
+  'if [ ! -f "$t" ] || [ -L "$t" ]; then rm -rf -- "$t"; echo "not a file" >&2; exit 6; fi; fi; printf %s "$t"';
+
+/** A file uploaded to the machine (`$1`) into the container at `$2`; the machine's copy is removed either way. */
+export const CP_IN = `docker cp "$1" "${CONTAINER}:$2" >/dev/null; r=$?; rm -f -- "$1"; exit $r`;
 
 /** InstaBox's machine states, in the plugin's vocabulary. */
 export function boxStateOf(state: unknown): BoxState {
@@ -252,9 +301,52 @@ function open(settings: ProviderSettings, credential: string, o: { wake?: boolea
     }
   };
 
-  const exec = (id: string, argv: string[], within?: Within & { timeoutSeconds?: number }) =>
+  /** A command on the machine itself, as the machine's user. */
+  const onMachine = (id: string, argv: string[], within?: Within & { timeoutSeconds?: number }) =>
     running(id, () => api("POST", `${m(id)}/exec`, { argv, timeoutSeconds: within?.timeoutSeconds ?? 60 }, within)) as
       Promise<{ stdout?: string; stderr?: string; exitCode?: number; timedOut?: boolean }>;
+
+  // The mount's image, run as the box's container; none: commands run on the machine, as before images.
+  const image = settings.image || "";
+  // Closed unless the setting says open, the rule `execArgv` keeps for the namespace it would otherwise use.
+  const network = settings.network === undefined || settings.network === "open" ? "bridge" : "none";
+
+  /** A command where the agent's commands run: in the container when the mount has an image, else on the machine. */
+  const exec = async (id: string, argv: string[], within?: Within & { timeoutSeconds?: number }) => {
+    if (!image) return onMachine(id, argv, within);
+    const r = await onMachine(id, ["sh", "-c", IN_CONTAINER, "ap", ...argv], within);
+    if (r.exitCode === 125 && String(r.stderr ?? "").includes(NO_CONTAINER)) {
+      throw new ProviderError(`InstaBox machine ${id}: its container is not there and could not be started`, { code: "transient", definitive: false, detail: String(r.stderr ?? "") });
+    }
+    return r;
+  };
+
+  /**
+   * The box's container up (`SETUP`), detached on the machine and polled, since a pull may outlast one exec
+   * (600 s at most). What it did, in its own words; a `ProviderError` when it could not.
+   */
+  const setUp = async (id: string): Promise<string> => {
+    const dir = `$HOME/${JOBS}/setup-${randomTag()}`;
+    const r = await onMachine(id, inJob(LAUNCH, dir, "", "sh", "-c", SETUP, "ap-setup", image, network, settings.workdir || "/"));
+    if (r.exitCode !== 0) {
+      throw new ProviderError(`InstaBox could not start setting up the container: exit ${r.exitCode} ${String(r.stderr ?? "").slice(0, 160)}`, { code: "transient", definitive: false });
+    }
+    const until = Date.now() + SETUP_BUDGET_MS;
+    for (;;) {
+      const out = String((await onMachine(id, inJob(POLL, dir, "4096"))).stdout ?? "");
+      const head = out.split("\n", 1)[0]!;
+      if (head !== "running") {
+        const said = out.split("\n").slice(head.startsWith("rc ") ? 2 : 1).join("\n").trim();
+        if (head === "rc 0") return said;
+        throw new ProviderError(`InstaBox could not bring up a container from ${image}: ${head.startsWith("rc ") ? `exit ${head.slice(3)}` : head}: ${said.slice(0, 200)}`,
+          { code: ["rc 4", "rc 6"].includes(head) ? "refused" : "transient", definitive: false, detail: said });
+      }
+      if (Date.now() > until) {
+        throw new ProviderError(`InstaBox: the container from ${image} was still being set up after ${SETUP_BUDGET_MS / 1000} s`, { code: "transient", definitive: false });
+      }
+      await instaboxTiming.sleep(2000);
+    }
+  };
 
   /** `m_.../jobid` -> both halves. */
   const jobOf = (execId: string) => {
@@ -295,11 +387,12 @@ function open(settings: ProviderSettings, credential: string, o: { wake?: boolea
       for (;;) {
         const key = spent === 0 ? `create-${spec.id}` : `create-${spec.id}-${spent}`;
         let op: any;
+        let made: { id: string; deleteAt?: number };
         try {
           op = await api("POST", "/v1/machines", body, { idem: key });
           const done = await waitOp(op, `create of ${spec.id}`);
           const deleteAt = Date.parse(String(done.machine?.deleteAt ?? ""));
-          return { id: String(done.machineId ?? op.machineId), ...(Number.isFinite(deleteAt) ? { deleteAt } : {}) };
+          made = { id: String(done.machineId ?? op.machineId), ...(Number.isFinite(deleteAt) ? { deleteAt } : {}) };
         } catch (e) {
           if (!(e instanceof ProviderError)) throw e;
           if (op || e.code === "no_capacity" || e.code === "rate_limited") spent += 1;
@@ -311,14 +404,28 @@ function open(settings: ProviderSettings, credential: string, o: { wake?: boolea
           const wait = e.retryAfterMs ?? (e.code === "transient" ? 2_000 : 30_000);
           if (!again || Date.now() + wait > until) throw e;
           await instaboxTiming.sleep(wait);
+          continue;
         }
+        if (!image) return made;
+        // Outside the create's retries: the machine exists, and a container that will not come up is not a reason
+        // to make another. The machine is deleted then, since no record will name it.
+        try {
+          await setUp(made.id);
+        } catch (e) {
+          await provider.delete(made.id).catch(() => {});
+          throw e;
+        }
+        return made;
       }
     },
 
     /** The box with this name among those carrying the spec's labels: never a listing of the whole account. */
     async adopt(spec: BoxSpec) {
       const found = (await provider.list!(spec.labels)).find((b) => b.name === spec.id && b.state !== "gone");
-      return found ? found.id : null;
+      if (!found) return null;
+      // The create whose answer was lost may not have reached its container: set up again, which starts one there.
+      if (image) await setUp(found.id);
+      return found.id;
     },
 
     async status(id: string, within?: Within): Promise<BoxState> {
@@ -376,13 +483,21 @@ function open(settings: ProviderSettings, credential: string, o: { wake?: boolea
     },
 
     async upload(id: string, path: string, bytes: Uint8Array) {
+      // Into the container: to the machine first, then `docker cp`, which is binary-safe and took 1.3 s for 8 MiB
+      // (measured 2026-10-26; exec with base64 is capped at 1 MiB of output).
+      const at = image ? `/tmp/.ap-in-${randomTag()}` : path;
       await running(id, async () => {
-        const res = await send("PUT", `${m(id)}/files?path=${encodeURIComponent(path)}&parents=true`, {
+        const res = await send("PUT", `${m(id)}/files?path=${encodeURIComponent(at)}&parents=true`, {
           body: bytes as Uint8Array<ArrayBuffer>, headers: { "content-type": "application/octet-stream" }, timeoutMs: settings.timeoutMs,
         });
         const text = await res.text();
         if (!res.ok) throw refusal(`upload to ${path}`, res.status, text, res.headers.get("retry-after"));
       });
+      if (!image) return;
+      const r = await onMachine(id, ["sh", "-c", CP_IN, "ap", at, path], { timeoutSeconds: 300 });
+      if (r.exitCode !== 0) {
+        throw new ProviderError(`InstaBox could not copy ${path} into the container: exit ${r.exitCode} ${String(r.stderr ?? "").slice(0, 160)}`, { code: "transient", definitive: false });
+      }
     },
 
     async download(id: string, path: string, o: { archive?: boolean; timeoutMs: number }): Promise<Response> {
@@ -394,6 +509,21 @@ function open(settings: ProviderSettings, credential: string, o: { wake?: boolea
         }
         return res;
       });
+      if (image) {
+        // Out of the container to the machine, read from there, and removed.
+        const made = await onMachine(id, ["sh", "-c", CP_OUT, "ap", path, randomTag(), o.archive ? "tar" : ""], { timeoutSeconds: 600 });
+        if (made.exitCode !== 0) {
+          throw new ProviderError(`InstaBox could not copy ${path} out of the container: exit ${made.exitCode} ${String(made.stderr ?? "").slice(0, 160)}`,
+            { code: "refused", definitive: true, status: made.exitCode === 6 ? 409 : 404, detail: String(made.stderr ?? "") });
+        }
+        const at = String(made.stdout ?? "");
+        try {
+          const res = await get(at);
+          return new Response(new Uint8Array(await res.arrayBuffer()), { status: 200 });
+        } finally {
+          await onMachine(id, ["rm", "-f", "--", at]).catch(() => {});
+        }
+      }
       if (!o.archive) return get(path);
       // No archive route: the directory is put in a tar in the box, read back, and the tar removed.
       const tag = randomTag();
@@ -558,6 +688,8 @@ async function account(settings: ProviderSettings, credential: string): Promise<
   return accountOf(await res.json().catch(() => null));
 }
 
+const ISOLATE = ["unshare", "--user", "--map-current-user", "--net", "--"] as const;
+
 export const instabox: SandboxBackend = {
   id: "instabox",
   name: "InstaBox",
@@ -576,7 +708,10 @@ export const instabox: SandboxBackend = {
   },
   // Commands run as the box's user (uid 1000), not root, so `unshare -n` alone is refused. A user namespace that
   // maps that user to itself gives the empty network namespace without sudo and leaves the uid the same.
-  isolateNetwork: ["unshare", "--user", "--map-current-user", "--net", "--"],
+  isolateNetwork: ISOLATE,
+  // With an image the container is started with Docker's `--network none` (`SETUP`), which nothing inside it can
+  // undo, and `unshare` is refused inside the container (measured 2026-10-26: Operation not permitted), so no prefix.
+  isolateNetworkFor: (settings) => settings.image ? [] : ISOLATE,
   open,
   checkCredential,
   account,
