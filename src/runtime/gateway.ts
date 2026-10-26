@@ -321,7 +321,7 @@ export class ToolGateway {
    * Refuse calls and pushed events for this mount until the returned function is called. `AgentRuntime.removeMount`
    * holds it from the moment its refusals have passed until the store's delete, so nothing reaches the plugin while
    * `unmount` runs or after: a tool call would act on a mount whose cleanup has begun, and a push would wake the
-   * agent for a mount that is going (`#invoke`, `#receiveGate`). A call already queued behind the mount's lock is
+   * agent for a mount that is going (`#invoke`, `#receiveGate`, `resumeInterrupt`). A call already queued behind the mount's lock is
    * refused when its turn comes, by the same check.
    */
   markRemoving(tenantId: string, agentId: string, alias: string): () => void {
@@ -1138,8 +1138,8 @@ export class ToolGateway {
    * The answer has been checked against the question's spec by the caller
    * (pi-tools.ts `resume`), which holds the token; this only delivers it. The
    * mount is looked up again, because time has passed: a mount switched off,
-   * re-pinned or removed since the question was asked is refused, as a call
-   * would be. Policy is not asked again — the call it continues was admitted,
+   * re-pinned, removed or being removed since the question was asked is
+   * refused, as a call would be. Policy is not asked again — the call it continues was admitted,
    * and a held call never reaches its plugin, so never asks. Behind the mount's
    * lock like a call, for the reason a call is.
    */
@@ -1162,7 +1162,12 @@ export class ToolGateway {
     }
     const resuming = interruptsOf(plugin);
     if (!resuming) return { status: "rejected", error: { code: "not_resumable", message: `${plugin.id} cannot take an answer` } };
-    const go = async () => {
+    const go = async (): Promise<ToolResult> => {
+      // Checked when the resume runs, behind the mount's lock where it takes it, as a call is (`markRemoving`):
+      // a mount whose cleanup has begun records no operation and never sees its credential again.
+      if (this.#removing.has(`${ctx.tenantId}/${ctx.agentId}/${mount.alias}`)) {
+        return { status: "rejected", error: { code: "not_mounted", message: `the \`${mount.alias}\` mount is being removed, so the tool cannot go on` } };
+      }
       const operationId = `op_${randomUUID().replace(/-/g, "").slice(0, 20)}`;
       await this.#store.recordOperation({
         operationId, tenantId: ctx.tenantId, agentId: ctx.agentId, taskId: ctx.taskId,
