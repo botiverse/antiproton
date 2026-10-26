@@ -3343,6 +3343,14 @@ await check("reminder: a common cookie value is not cut from what the model read
   });
   must(!seen.includes("en") && !seen.includes("true") && !seen.includes("1") && !seen.includes("disabled") && seen.includes(token) && seen.includes("0123456789ab"), show(seen));
   must(withheld("sid 0123456789ab", seen) === "sid [withheld]", show(withheld("sid 0123456789ab", seen)));
+  // Letters only and 16 or longer: the one value that only the length branch of `looksLikeToken` takes (a token
+  // that mixes in a digit is also taken by the other branch, so it would not tell the two apart). Keep it letters only.
+  const alpha = "abcdefabcdefabcdefabcdef";
+  const seen2: string[] = [];
+  await integrationSessionStore(a.ctx as never, seen2).set({ agentId: "agent-1", clientId: REMINDER_SERVICE.clientId }, {
+    returnUrl: "https://reminder.example/", updatedAt: "2026-10-26T00:00:00Z", cookies: [cookie(`tok=${alpha}`)],
+  });
+  must(seen2.includes(alpha) && withheld(`token ${alpha}`, seen2) === "token [withheld]", show({ seen2, out: withheld(`token ${alpha}`, seen2) }));
   const text = "rem-1234 is set for 2026-10-27 at 09:00";
   must(withheld(text, seen) === text, show(withheld(text, seen)));
   const json = '{"ok":true,"result":{"done":true,"id":"rem-1234","enabled":true}}';
