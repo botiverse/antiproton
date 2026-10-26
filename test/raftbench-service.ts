@@ -100,6 +100,12 @@ function assignmentEvent(run: { runId: string; revision: number }, source = "sys
   };
 }
 
+// The Server's coverage as Bencher read it in slock staging `cb1f240` (packages/server/src/raftbench/service.ts, :37-39
+// and :161), still so at #11340 (`eedd93cf`): a reading, not a contract. Every page carries the run's window, the same
+// `from`/`to`, not its own messages' range; `fetchedMessages` is the run's count so far, deduplicated, so a page
+// replayed does not raise it; `exhausted` is true only for a read from the start with nothing in the window skipped.
+// This fixture cannot notice the Server changing that; Bencher's reconciling of the trace against the Server's records
+// would, since the `read` line's `coverageFrom`/`coverageTo` would then name the last page's range.
 function coverageOf(p: Page) {
   return { from: "2026-10-17T08:00:00.000Z", to: "2026-10-18T08:00:00.000Z", fetchedMessages: p.fetched, exhausted: p.exhausted, stopReason: p.stopReason, notRead: NOT_READ };
 }
@@ -1380,6 +1386,42 @@ await check("timeout: a result already waiting for its retry is not replaced at 
   try { for (let i = 0; i < 3; i++) await pass(w); } finally { skew = 0; }
   const submits = w.raft.submits();
   must(submits.length === 2 && new Set(submits.map((s) => s.raw)).size === 1 && !submits.some((s) => s.body.status === "incomplete"), `submits ${submits.length}, distinct ${new Set(submits.map((s) => s.raw)).size}`);
+});
+
+await check("timeout: a reread an eviction cut short, overtaken by the deadline, says nothing was read, not the last read's count", async () => {
+  const w = await world();
+  logs.length = 0;
+  await assign(w);
+  must(runLogs("read").length === 1 && runLogs("read")[0].fetched === 3, `the first read: ${show(runLogs("read"))}`);
+  // The model's result is not confirmed, so it waits for its retry; the retry, in the alarm's wake, meets a revision
+  // conflict, and the run reads again.
+  w.raft.inject.set("/internal/agent-api/raftbench/submit", [refusal(503, "raftbench_unavailable"), refusal(409, "raftbench_revision_conflict")]);
+  await answer(w, goodResult());
+  // The object is evicted inside that read: after the reread's state (phase "reading", reads 2) is saved, before its
+  // material comes back. The pass that was reading never ends, and its wake is not dropped.
+  let reached = false;
+  w.raft.inject.set("/internal/agent-api/raftbench/context", [(() => { reached = true; return new Promise<Response>(() => {}); }) as never]);
+  skew += RETRY_DELAYS_MS[0]! + 1_000;
+  void pass(w);
+  for (let i = 0; i < 100 && !reached; i++) await new Promise((r) => setTimeout(r, 5));
+  try {
+    must(reached, "the reread never asked for its material");
+    const kept = JSON.parse(String(w.host.sql.exec(`SELECT value FROM plugin_db WHERE key = 'current'`).toArray()[0]!.value));
+    must(kept.phase === "reading" && kept.reads === 2, `the reread's state: ${show(kept)}`);
+    // The next alarm, past the deadline, on a new runtime over the same storage.
+    skew = RUN_DEADLINE_MS + 1_000;
+    const fresh = newRuntime(w.host, w.sent);
+    await fresh.ready();
+    await fresh.deliverPendingInbound("t", SERVICE);
+    for (let i = 0; i < 3; i++) await fresh.step("t", SERVICE);
+  } finally { skew = 0; }
+  const submits = w.raft.submits();
+  // The wake ends the run as the timeout, with what the reread had read by then: nothing, not the first read's count.
+  must(runLogs("timeout").length === 1 && runLogs("read").length === 1, `the wake read again or did not time out: ${show(runLogs("read"))}`);
+  const last = submits[submits.length - 1]!.body;
+  must(submits.length === 3 && last.failure === true && last.reason === "timeout (nothing read)", `the timeout: ${show(last)}`);
+  const rows = traceRows(w, "raftbench.run_done");
+  must(rows.length === 1 && rows[0]!.attrs.failure === "timeout" && rows[0]!.attrs.reads === 2, show(rows));
 });
 
 // ---- the exported prompts -----------------------------------------------------------------------------------
