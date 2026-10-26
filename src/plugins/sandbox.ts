@@ -916,6 +916,28 @@ function backendFor(cfg: { provider?: string }): SandboxBackend {
   return BACKENDS[providerOf(cfg)];
 }
 
+/**
+ * Settings one provider cannot use (`Plugin.configProblem`): asked when the mount is made, and by `invoke` before a
+ * machine is made or used, so a mount saved before a rule existed is refused too.
+ */
+function configProblemOf(c: SandboxConfig): string | undefined {
+  if (c.provider !== "instabox") return undefined;
+  if (c.shape !== undefined && !shapeOf(c.shape)) return `shape must read like 2c4g (vCPUs, then GiB of memory) on InstaBox; got ${JSON.stringify(c.shape)}`;
+  if (typeof c.endpoint === "string" && /run\.sys9\.ai/.test(c.endpoint)) return "endpoint names run9, and this mount asks for InstaBox; leave it out for api.instabox.sh";
+  if (c.maxLifetimeHours !== undefined && !(typeof c.maxLifetimeHours === "number" && c.maxLifetimeHours >= 1 && c.maxLifetimeHours <= 24)) {
+    return "maxLifetimeHours must be between 1 and 24: InstaBox deletes a machine at most a day after it is created";
+  }
+  // Without an image, commands run on the machine as its user, who holds the Docker socket. The empty network
+  // namespace `network: none` puts a command in does not cut off Unix sockets, and through that one a container
+  // started on the host's network reaches the internet (measured 2026-10-26). With an image, the command is in a
+  // container Docker made without a network, with no Docker socket in it.
+  if (c.network !== undefined && c.network !== "open" && !c.image) {
+    return "on InstaBox, network none needs an image: without one, commands run on the machine itself, where Docker " +
+      "can start a container on the host's network; set image, or leave network open";
+  }
+  return undefined;
+}
+
 /** Where an InstaBox mount's defaults differ from the plugin's. */
 const INSTABOX_DEFAULTS = {
   endpoint: INSTABOX_ENDPOINT,
@@ -1078,7 +1100,7 @@ async function stopBox(
  * provider refused is thrown with its fact, as `stopBox` does: a box still
  * running must not read as switched off.
  */
-async function parkBox(ctx: PluginContext, machine: string, state: BoxState): Promise<Released | false> {
+async function parkBox(ctx: PluginContext, machine: string, state: BoxState): Promise<Released | false | "gone"> {
   if (!ctx.credential) return false;
   const cfg = cfgOf(ctx);
   const backend = backendFor(cfg);
@@ -1091,6 +1113,8 @@ async function parkBox(ctx: PluginContext, machine: string, state: BoxState): Pr
     if (pausing) await provider.pause!(state.boxId);
     else await provider.stop(state.boxId);
   } catch (e) {
+    // Deleted by InstaBox already: nothing to pause, and the caller lets it go as gone (`releaseMachine`).
+    if (await goneAfter(backend, provider, state, e)) return "gone";
     error = e instanceof ProviderError ? e.message : String((e as Error)?.message ?? e).slice(0, 160);
   }
   const endedAt = Date.now();
@@ -1115,6 +1139,45 @@ async function parkBox(ctx: PluginContext, machine: string, state: BoxState): Pr
 /** Whether the idle lease paused this box with its memory kept, rather than switching it off (`parkedAs`). */
 function pausedOf(state: { parkedAt?: unknown; parkedAs?: unknown } | null | undefined): boolean {
   return parkedAt(state) !== null && state?.parkedAs === "paused";
+}
+
+/** Whether the provider's own deletion time (`BoxState.deleteAt`) has come: the box is gone then, whatever it was doing. */
+function pastDeleteAt(state: { deleteAt?: unknown }, now = Date.now()): boolean {
+  return typeof state.deleteAt === "number" && Number.isFinite(state.deleteAt) && state.deleteAt <= now;
+}
+
+/**
+ * Whether an InstaBox box that a request just failed on has been deleted by InstaBox: its `deleteAt` has come, or
+ * the request was answered `not_found` and InstaBox, asked about the machine, does not have it. The second look is
+ * needed because a `not_found` may be about something else (a file a download named). Only InstaBox deletes a box
+ * on its own, so a run9 box is never judged here, and no request is added on run9's paths.
+ */
+async function goneAfter(backend: SandboxBackend, provider: SandboxProvider, state: BoxState, e: unknown): Promise<boolean> {
+  if (backend.id !== "instabox" || !state.boxId) return false;
+  if (pastDeleteAt(state)) return true;
+  if (!(e instanceof ProviderError && e.code === "not_found")) return false;
+  return (await provider.status(state.boxId).catch(() => null)) === "gone";
+}
+
+/**
+ * Deletes, where the provider can, the snapshots among these that nothing of the mount refers to any more: no kept
+ * environment names it, and no machine is waiting to start from it (`startFrom`, which `start_from` set). Its
+ * storage is billed and counted against a limit (InstaBox). One a machine is waiting on is left, and deleted when
+ * that machine has been made from it or has chosen another (`invoke`, `start_from`). The ones it could not delete.
+ */
+async function dropSnapshots(ctx: PluginContext, provider: SandboxProvider, snapIds: Array<string | undefined>): Promise<string[]> {
+  if (!provider.deleteSnapshot) return [];
+  const mount = await readMount(ctx);
+  const used = new Set([
+    ...(mount?.envs ?? []).map((e) => e.snapId),
+    ...Object.values(mount?.machines ?? {}).map((b) => b.startFrom),
+  ]);
+  let notDeleted: string[] = [];
+  for (const snapId of new Set(snapIds)) {
+    if (!snapId || used.has(snapId)) continue;
+    try { await provider.deleteSnapshot(snapId); } catch { notDeleted = [...notDeleted, snapId]; }
+  }
+  return notDeleted;
 }
 
 /**
@@ -1667,7 +1730,11 @@ async function releaseMachine(
 ): Promise<Released | false> {
   if (lease && reason === "idle") {
     const state = await readView(ctx, machine);
-    if (state.boxId && parkedAt(state) === null) return parkBox(ctx, machine, state);
+    // A box past its provider's own deletion time is not there to pause: it is let go as a deleted one is.
+    if (state.boxId && parkedAt(state) === null && !pastDeleteAt(state)) {
+      const parked = await parkBox(ctx, machine, state);
+      if (parked !== "gone") return parked;
+    }
   }
   const r = await stopBox(ctx, machine, { forget });
   if (r === null) return false;
@@ -2491,7 +2558,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     { name: "shell", type: "string", summary: "Shell the shell tool runs commands in.", default: "/bin/sh" },
     { name: "shellPrefix", type: "string", summary: "Prepended to every shell command — for images whose toolchain lives in an environment a plain shell never enters." },
     { name: "network", type: "string", choices: ["open", "none"], default: "open",
-      summary: "\"open\" or \"none\". With none every command runs in an empty network namespace: no route out, not even DNS. Only the network is taken away: without an image, commands still run on the machine itself, with its files." },
+      summary: "\"open\" or \"none\". With none every command runs in an empty network namespace: no route out, not even DNS. Only the network is taken away: without an image, commands still run on the machine itself, with its files. On InstaBox, network none needs an image." },
     { name: "timeoutMs", type: "number", summary: "How long one request to the provider may take.", default: 120000 },
     { name: "graceMs", type: "number", default: 5000,
       summary: "How long a command may run before it is handed over as a background job. Short commands still answer in the call; longer ones return a job and the agent carries on." },
@@ -2536,16 +2603,9 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     return backendFor(cfg).checkCredential(cfg, ctx.credential);
   },
 
-  /** Settings one provider cannot use, refused when the mount is made rather than at its first call. */
+  /** Settings one provider cannot use, refused when the mount is made, and again before a call uses a machine. */
   configProblem(config) {
-    const c = config as SandboxConfig;
-    if (c.provider !== "instabox") return undefined;
-    if (c.shape !== undefined && !shapeOf(c.shape)) return `shape must read like 2c4g (vCPUs, then GiB of memory) on InstaBox; got ${JSON.stringify(c.shape)}`;
-    if (typeof c.endpoint === "string" && /run\.sys9\.ai/.test(c.endpoint)) return "endpoint names run9, and this mount asks for InstaBox; leave it out for api.instabox.sh";
-    if (c.maxLifetimeHours !== undefined && !(typeof c.maxLifetimeHours === "number" && c.maxLifetimeHours >= 1 && c.maxLifetimeHours <= 24)) {
-      return "maxLifetimeHours must be between 1 and 24: InstaBox deletes a machine at most a day after it is created";
-    }
-    return undefined;
+    return configProblemOf(config as SandboxConfig);
   },
 
   /** The account these keys act on (the provider's `account`), so a replaced key on the same one keeps the boxes. */
@@ -2603,6 +2663,11 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       }
       const after = await readView(ctx, machine);
       await writeView(ctx, machine, { ...after, startFrom: env.snapId });
+      // What it was waiting to start from before, if no environment names it any more (`dropSnapshots`).
+      if (after.startFrom && after.startFrom !== env.snapId && ctx.credential) {
+        const c = cfgOf(ctx);
+        await dropSnapshots(ctx, backendFor(c).open(c, ctx.credential), [after.startFrom]);
+      }
       return {
         startingFrom: env.name, ...named,
         note: machine === MAIN_MACHINE
@@ -2662,9 +2727,44 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       };
     }
 
+    // A mount this plugin would not have accepted makes and uses no machine; a release still lets one go.
+    if (tool !== "release") {
+      const problem = configProblemOf(ctx.publicConfig as SandboxConfig);
+      if (problem) throw new Error(`\`${ctx.alias}\` cannot run commands as it is set up: ${problem}`);
+    }
     const provider = openProvider(cfg, ctx);
     const backend = backendFor(cfg);
     const terms = idleTermsOf(cfg);
+
+    /**
+     * A machine its provider deleted on its own (InstaBox, at `deleteAt` or otherwise): let go of here as a release
+     * would (`stopBox`, which records its session and keeps the kept environments), and the call refused with what
+     * happened, so the agent knows its files and processes are gone before it plans on them. The next call finds
+     * no machine and starts a fresh one.
+     */
+    const expired = async (box: BoxState): Promise<never> => {
+      const r = await stopBox(ctx, machine);
+      const at = pastDeleteAt(box)
+        ? `${backend.name} deleted it at ${new Date(box.deleteAt!).toISOString()}, as it deletes every machine at most ` +
+          `${terms.maxLifetimeHours} hours after creating it, whatever it is doing`
+        : `${backend.name} no longer has it`;
+      const said = `machine "${machine}" (${box.boxId}) no longer exists: ${at}. Its files and running processes went with it, ` +
+        "and nothing was done in it. The next call starts a fresh machine" +
+        ((box.envs ?? []).length ? ", or `start_from` an environment you kept." : ".");
+      if (r && !r.freed) {
+        const e = new Error(`${said} Letting it go here failed too: ${r.error ?? "unknown"}`);
+        throw r.lease ? markReleased(e, r.lease) : e;
+      }
+      const e = new Error(said);
+      throw r?.lease ? markReleased(e, r.lease) : e;
+    };
+    /** A request about the machine in use; one that fails because the provider deleted the machine is `expired`. */
+    const onBox = async <T>(fn: () => Promise<T>): Promise<T> => {
+      try { return await fn(); } catch (e) {
+        if (state?.boxId && await goneAfter(backend, provider, state, e)) await expired(state);
+        throw e;
+      }
+    };
 
     // Everything about the file is settled before a container is asked for, so a reference that is not this
     // agent's, a path outside the working directory, or a file too large starts and wakes nothing.
@@ -2699,6 +2799,9 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     const history = state.sessions ?? [];
     const kept = state.envs ?? [];
     if (!state.boxId) state = null;
+    // Past its provider's own deletion time the machine is gone: said before anything is asked of it. A release
+    // goes on to let it go as it is.
+    if (state && tool !== "release" && backend.id === "instabox" && pastDeleteAt(state)) await expired(state);
     let created = false;
     if (!state) {
       // The limit counts boxes that exist, switched-off ones included: each keeps a disk. Checked before
@@ -2772,6 +2875,8 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
         ...(kept.length ? { envs: kept } : {}),
       };
       await writeView(ctx, machine, state);
+      // The snapshot it was made from, if it was kept only for this machine to start from (`dropSnapshots`).
+      if (from) await dropSnapshots(ctx, provider, [from]);
       // The value never enters the box and never reaches the model: only the
       // placeholder does, and run9 swaps it in on the way out.
       // `envs` above: release carries them over because a snapshot outlives its
@@ -2787,15 +2892,17 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     // (the last one was recorded when it was switched off), and a postponement of its deletion does not carry
     // over to hold off switching it off. `save` included: reading a file out of a stopped box may start it.
     // `keep` too where the provider snapshots a running box (InstaBox), which it wakes to do so.
+    // A provider that does not wake a box on use (InstaBox) is asked to first, and the record says running only
+    // once it is: a wake that fails leaves the box on its parked schedule, and one that finds it deleted lets it go.
     const wakes = tool === "run" || tool === "shell" || tool === "save" || tool === "put"
       || (tool === "keep" && backend.caps.snapshot === "live");
     if (!created && parkedAt(state) !== null && wakes) {
-      const { parkedAt: _p, quietUntil: _q, parkedAs: _a, ...running } = state;
+      // Its compute session starts when it is asked to wake, which is when it starts to bill.
       const t = Date.now();
+      if (provider.wake) await onBox(() => provider.wake!(state!.boxId));
+      const { parkedAt: _p, quietUntil: _q, parkedAs: _a, ...running } = state;
       state = { ...running, createdAt: t, lastUsedAt: t, execs: 0, saved: [] };
       await writeView(ctx, machine, state);
-      // A provider that does not wake a box on use is asked to, before the command goes out.
-      if (provider.wake) await provider.wake(state.boxId);
     }
 
     /**
@@ -2807,7 +2914,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       if (!artifacts) throw new Error("no object storage is mounted, so nothing can be saved out");
       let res: Response;
       try {
-        res = await provider.download(state!.boxId, path, { archive, timeoutMs: cfg.timeoutMs });
+        res = await onBox(() => provider.download(state!.boxId, path, { archive, timeoutMs: cfg.timeoutMs }));
       } catch (e) {
         if (e instanceof ProviderError && e.status !== undefined) {
           throw new Error(`could not read ${path}: ${e.status} ${e.detail.slice(0, 160)}`);
@@ -2844,7 +2951,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
         throw new Error("name must be short, and letters, digits, dot, dash or underscore");
       }
       // The provider may stop the box to fork it (`caps.snapshot`); the next call then wakes it with its files.
-      const snapId = await provider.snapshot(state!.boxId, `antiproton ${ctx.caller.tenantId}/${ctx.caller.agentId} ${name}`);
+      const snapId = await onBox(() => provider.snapshot(state!.boxId, `antiproton ${ctx.caller.tenantId}/${ctx.caller.agentId} ${name}`));
       const env: Env = {
         name, snapId, savedAt: Date.now(),
         ...(state!.image ? { image: state!.image } : {}),
@@ -2855,14 +2962,9 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       state = { ...state!, envs, lastUsedAt: Date.now() };
       await writeView(ctx, machine, state);
       // A snapshot no name refers to any more (replaced under its name, or past the 20 kept) is deleted where the
-      // provider can, since its storage is billed and counted against a limit (InstaBox). Best effort: the
+      // provider can, unless a machine is waiting to start from it (`dropSnapshots`). Best effort: the
       // environment is kept either way, and one left behind is said.
-      let notDeleted: string[] = [];
-      if (provider.deleteSnapshot) {
-        for (const gone of before.filter((e) => !envs.includes(e) && !envs.some((k) => k.snapId === e.snapId))) {
-          try { await provider.deleteSnapshot(gone.snapId); } catch { notDeleted = [...notDeleted, gone.snapId]; }
-        }
-      }
+      const notDeleted = await dropSnapshots(ctx, provider, before.filter((e) => !envs.includes(e)).map((e) => e.snapId));
       return {
         kept: name, snapshot: snapId, ...named,
         note: keptNote(lease, terms),
@@ -2880,7 +2982,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       // A short script on the box, waited for: its exit code and output. Not the agent's shell, so its
       // directory and the agent's command count are left alone.
       const script = async (body: string, what: string): Promise<{ exit: number; out: string }> => {
-        const execId = await provider.execBackground(state!.boxId, { argv: ["sh", "-c", body, "sh", p.path] });
+        const execId = await onBox(() => provider.execBackground(state!.boxId, { argv: ["sh", "-c", body, "sh", p.path] }));
         const until = Date.now() + cfg.timeoutMs;
         for (;;) {
           const rec = await provider.poll(execId);
@@ -2895,7 +2997,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       if (ready.exit === 5) throw new Error(`could not make the directory for ${p.path}: something on the way there is a file`);
       if (ready.exit !== 0) throw new Error(`could not make the directory for ${p.path}: exit ${ready.exit} ${ready.out.slice(0, 120)}`);
 
-      await provider.upload(state!.boxId, p.path, p.bytes);
+      await onBox(() => provider.upload(state!.boxId, p.path, p.bytes));
 
       // Read back from the box itself: the provider's answer says a transfer ended, this says the file is the one sent.
       const got = await script(PUT_CHECK_SCRIPT, "read the file back");
@@ -2994,7 +3096,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     // which is what lets `finished` stay one function (checked live: exit 3 and
     // both streams came back identically).
     const startIn = tool === "shell" ? (askedDir ?? state.cwd ?? null) : null;
-    const start = (argv: string[], workdir: string | null) => provider.execBackground(state!.boxId, { argv, workdir });
+    const start = (argv: string[], workdir: string | null) => onBox(() => provider.execBackground(state!.boxId, { argv, workdir }));
     // The box just created was wired from the mount a moment ago; any other is checked again.
     if (!created) state = await reconcileAccounts(ctx, state!, provider, await accountsWanted(ctx, cfg), machine);
     const argvCfg = { ...cfg, isolate: backend.isolateNetworkFor?.(cfg) ?? backend.isolateNetwork };

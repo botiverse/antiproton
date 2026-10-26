@@ -583,11 +583,12 @@ const SCENARIOS: Record<string, (out: unknown[]) => Promise<void>> = {
     must(lists.length === 2 && lists.every((r) => r.path.includes("metadata=machine%3Amain")), "adoption did not list by every label");
   },
 
-  async "network none, accounts, credentials and the account"(out) {
+  async "network none without an image is refused, at the mount and at use; accounts, credentials and the account"(out) {
     const f = fake();
     const m = mount({ config: { network: "none" }, forms: true });
-    await step("shell with no network", () => m.plugin.invoke("shell", { command: "curl example.com" }, m.ctx), out);
-    const launch = execs(f).find((e) => String((e.body as any).argv[2]).endsWith(LAUNCH))!;
+    await step("shell with no network and no image", () => m.plugin.invoke("shell", { command: "curl example.com" }, m.ctx), out);
+    must(f.reqs.length === 0, `a mount with network none and no image reached InstaBox: ${f.reqs.map((r) => `${r.method} ${r.path}`).join(", ")}`);
+    await step("release still answers", () => m.plugin.invoke("release", {}, m.ctx), out);
     const ask = (credential: string | null) => {
       const x = mount({ credential });
       return { check: () => x.plugin.checkCredential!(x.ctx), account: () => x.plugin.credentialAccount!(x.ctx) };
@@ -603,12 +604,114 @@ const SCENARIOS: Record<string, (out: unknown[]) => Promise<void>> = {
     }
     f.overrides.length = 0;
     const p = sandboxPlugin(null, "bucket");
-    out.push({ configProblems: [{ provider: "instabox", shape: "big" }, { provider: "instabox", endpoint: "https://api.run.sys9.ai" }, { provider: "instabox", maxLifetimeHours: 48 }, { provider: "instabox" }, { shape: "big" }].map((c) => p.configProblem!(c as any) ?? null) });
+    const configs = [{ provider: "instabox", shape: "big" }, { provider: "instabox", endpoint: "https://api.run.sys9.ai" }, { provider: "instabox", maxLifetimeHours: 48 }, { provider: "instabox" }, { shape: "big" },
+      { provider: "instabox", network: "none" }, { provider: "instabox", network: "none", image: "" }, { provider: "instabox", network: "none", image: "docker.io/library/python:3.12" },
+      { provider: "instabox", network: "open" }, { network: "none" }];
+    const problems = configs.map((c) => p.configProblem!(c as any) ?? null);
+    out.push({ configProblems: problems });
     out.push(...f.log, { record: m.record() });
     invariants(f);
-    const argv = (launch.body as any).argv as string[];
-    must(argv.slice(5, 10).join(" ") === "unshare --user --map-current-user --net --", `the command was not started in a user and network namespace: ${argv.slice(4, 12).join(" ")}`);
+    must(/network none needs an image/.test(String(problems[5])) && /network none needs an image/.test(String(problems[6])), "InstaBox network none without an image was accepted");
+    must(problems[7] === null && problems[8] === null && problems[9] === null, "network none was refused with an image, network open, or on run9");
+    const refused = (out[0] as any).threw;
+    must(/network none needs an image/.test(String(refused)), `the call was not refused for network none without an image: ${refused}`);
     must(!f.reqs.some((r) => r.path.includes("/secrets")), "a credential was registered with InstaBox");
+  },
+
+  async "a mount naming instabox is run by the InstaBox adapter, and a network left unset is open"(out) {
+    const f = fake();
+    const m = mount();
+    await step("shell", () => m.plugin.invoke("shell", { command: "curl example.com" }, m.ctx), out);
+    await step("release", () => m.plugin.invoke("release", {}, m.ctx), out);
+    out.push(...f.log, { record: m.record() });
+    invariants(f);
+    const first = f.reqs[0];
+    must(first?.method === "POST" && first.path === "/v1/machines" && first.headers["x-api-key"] === KEY,
+      `the first request was not InstaBox's create: ${first?.method} ${first?.path}`);
+    const launch = execs(f).find((e) => String((e.body as any).argv[2]).endsWith(LAUNCH));
+    must(launch, "no command was launched");
+    must(!((launch.body as any).argv as string[]).includes("unshare"), "a mount with network unset ran its command without a network");
+  },
+
+  async "a machine InstaBox deleted is let go and said, and the next call makes a fresh one; a wake that fails keeps the pause"(out) {
+    const f = fake();
+    const m = mount({ lease: LEASE });
+    const main = () => m.record()?.machines?.main;
+    await step("shell makes m_1", () => m.plugin.invoke("shell", { command: "echo hi" }, m.ctx), out);
+    // InstaBox deletes the machine at its deleteAt, whatever it is doing.
+    now = main().deleteAt + 1000;
+    f.machines.delete("m_1");
+    let from = f.reqs.length;
+    await step("shell past the machine's deleteAt", () => m.plugin.invoke("shell", { command: "echo again" }, m.ctx), out);
+    const pastDeleteAt = out.at(-1) as any;
+    must(!f.reqs.slice(from).some((r) => r.method === "POST" && r.path.startsWith("/v1/machines/m_1/")), "a command was sent to a machine past its deleteAt");
+    must(/no longer exists: InstaBox deleted it at .*files and running processes went with it.*next call starts a fresh machine/.test(String(pastDeleteAt.threw)),
+      `the agent was not told the machine expired: ${pastDeleteAt.threw}`);
+    must(pastDeleteAt.released?.status === "freed", "letting the expired machine go reported no release");
+    must(!main(), "the record still names a machine InstaBox deleted");
+    await step("the next shell makes m_2", () => m.plugin.invoke("shell", { command: "echo fresh" }, m.ctx), out);
+    must(main()?.boxId === "m_2", "the next call did not make a fresh machine");
+    // Deleted before its deleteAt (by someone at InstaBox): the command's answer says so, and InstaBox confirms it.
+    f.machines.delete("m_2");
+    await step("shell on a machine InstaBox no longer has", () => m.plugin.invoke("shell", { command: "echo gone" }, m.ctx), out);
+    must(/no longer exists: InstaBox no longer has it/.test(String((out.at(-1) as any).threw)), `a machine InstaBox no longer has was not said to be gone: ${(out.at(-1) as any).threw}`);
+    must(!main(), "the record still names a machine InstaBox no longer has");
+    await step("shell makes m_3", () => m.plugin.invoke("shell", { command: "echo hi" }, m.ctx), out);
+    await step("idle release pauses m_3", () => m.plugin.holds!.release(m.ctx, { reason: "idle" }), out);
+    f.machines.delete("m_3");
+    await step("shell on a paused machine InstaBox deleted", () => m.plugin.invoke("shell", { command: "echo hi" }, m.ctx), out);
+    must(/no longer exists/.test(String((out.at(-1) as any).threw)) && !main(), "a paused machine InstaBox deleted was not let go when woken");
+    // A wake InstaBox refuses for a while: the machine stays on its paused schedule.
+    await step("shell makes m_4", () => m.plugin.invoke("shell", { command: "echo hi" }, m.ctx), out);
+    await step("idle release pauses m_4", () => m.plugin.holds!.release(m.ctx, { reason: "idle" }), out);
+    f.overrides.push((r) => r.method === "POST" && r.path.endsWith("/resume") ? { status: 503, json: { error: { code: "host_unavailable", message: "try later", retryable: true } } } : undefined);
+    await step("shell when the resume fails", () => m.plugin.invoke("shell", { command: "echo hi" }, m.ctx), out);
+    f.overrides.length = 0;
+    must(main()?.boxId === "m_4" && typeof main()?.parkedAt === "number" && main()?.parkedAs === "paused",
+      `a wake that failed left the record off its paused schedule: ${JSON.stringify(main())}`);
+    await step("shell resumes m_4", () => m.plugin.invoke("shell", { command: "echo back" }, m.ctx), out);
+    must(main()?.parkedAt === undefined, "the resumed machine is still recorded as paused");
+    // The idle pass reaching a running machine past its deleteAt does not ask to pause it.
+    now = main().deleteAt + 1000;
+    f.machines.delete("m_4");
+    from = f.reqs.length;
+    await step("idle release past the machine's deleteAt", () => m.plugin.holds!.release(m.ctx, { reason: "idle" }), out);
+    must(!f.reqs.slice(from).some((r) => r.path.endsWith("/suspend")), "a pause was asked of a machine past its deleteAt");
+    must((out.at(-1) as any).result?.status === "freed" && !main(), "the idle pass did not let go of a machine past its deleteAt");
+    // ...nor one InstaBox no longer has, which its pause finds.
+    await step("shell makes m_5", () => m.plugin.invoke("shell", { command: "echo hi" }, m.ctx), out);
+    f.machines.delete("m_5");
+    await step("idle release of a machine InstaBox no longer has", () => m.plugin.holds!.release(m.ctx, { reason: "idle" }), out);
+    must((out.at(-1) as any).result?.status === "freed" && !main(), "the idle pass did not let go of a machine InstaBox no longer has");
+    out.push(...f.log, { record: m.record() });
+    invariants(f);
+  },
+
+  async "a snapshot a machine waits to start from outlives keep, and goes once nothing refers to it"(out) {
+    const f = fake();
+    const m = mount();
+    const deleted = (id: string) => f.reqs.some((r) => r.method === "DELETE" && r.path === `/v1/snapshots/${id}`);
+    await step("shell on main", () => m.plugin.invoke("shell", { command: "echo hi" }, m.ctx), out);
+    await step("keep env (sn_1)", () => m.plugin.invoke("keep", { name: "env" }, m.ctx), out);
+    await step("machine b chooses env", () => m.plugin.invoke("start_from", { name: "env", machine: "b" }, m.ctx), out);
+    await step("keep env again (sn_2), while b waits on sn_1", () => m.plugin.invoke("keep", { name: "env" }, m.ctx), out);
+    must(!deleted("sn_1"), "keep deleted the snapshot machine b is waiting to start from");
+    must(m.record().machines.b.startFrom === "sn_1", "machine b lost what it starts from");
+    await step("shell on b makes it from sn_1", () => m.plugin.invoke("shell", { command: "echo b", machine: "b" }, m.ctx), out);
+    const create = f.reqs.filter((r) => r.method === "POST" && r.path === "/v1/machines").at(-1)!;
+    must((create.body as any).snapshotId === "sn_1", "machine b was not made from the snapshot it chose");
+    must(deleted("sn_1"), "the snapshot nothing refers to once b was made from it was not deleted");
+    await step("keep other (sn_3)", () => m.plugin.invoke("keep", { name: "other" }, m.ctx), out);
+    await step("machine c chooses env (sn_2)", () => m.plugin.invoke("start_from", { name: "env", machine: "c" }, m.ctx), out);
+    await step("keep env again (sn_4), while c waits on sn_2", () => m.plugin.invoke("keep", { name: "env" }, m.ctx), out);
+    must(!deleted("sn_2"), "keep deleted the snapshot machine c is waiting to start from");
+    await step("machine c chooses other instead", () => m.plugin.invoke("start_from", { name: "other", machine: "c" }, m.ctx), out);
+    must(deleted("sn_2"), "the snapshot c no longer waits on, and no environment names, was not deleted");
+    must(!deleted("sn_3") && !deleted("sn_4"), "a kept environment's snapshot was deleted");
+    await step("release b", () => m.plugin.invoke("release", { machine: "b" }, m.ctx), out);
+    await step("release main", () => m.plugin.invoke("release", {}, m.ctx), out);
+    out.push(...f.log, { record: m.record() });
+    invariants(f);
   },
 
   async "an image runs as a container in the machine: set up at create, and every command, file and job goes into it"(out) {

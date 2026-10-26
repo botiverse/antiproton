@@ -21,7 +21,9 @@ import type {
  *   (measured 2026-10-26: it returned /etc/shadow, which `/files/content` refused with 403).
  * - InstaBox cannot start a machine from an OCI image, so a mount's `image` runs as a Docker container inside the
  *   machine (`CONTAINER`, set up by `SETUP`), and every command and file goes into it (`IN_CONTAINER`, `docker cp`).
- *   The machine's own user, who holds the Docker socket, is never the one the agent's commands run as.
+ *   With an image, the machine's own user, who holds the Docker socket, is never the one the agent's commands run
+ *   as. Without one they run on the machine as that user (`onMachine`), socket and all, which is why the plugin
+ *   refuses network none without an image here (src/plugins/sandbox.ts `configProblemOf`).
  */
 
 interface InstaboxCredential { apiKey: string }
@@ -309,7 +311,8 @@ function open(settings: ProviderSettings, credential: string, o: { wake?: boolea
 
   // The mount's image, run as the box's container; none: commands run on the machine, as before images.
   const image = settings.image || "";
-  // Closed unless the setting says open, the rule `execArgv` keeps for the namespace it would otherwise use.
+  // Open when the setting is absent or "open" (the declared default, as on run9); any other value is closed, the
+  // rule `execArgv` keeps for the namespace it would otherwise use.
   const network = settings.network === undefined || settings.network === "open" ? "bridge" : "none";
 
   /** A command where the agent's commands run: in the container when the mount has an image, else on the machine. */
@@ -708,7 +711,10 @@ export const instabox: SandboxBackend = {
     boxSecrets: false,
   },
   // Commands run as the box's user (uid 1000), not root, so `unshare -n` alone is refused. A user namespace that
-  // maps that user to itself gives the empty network namespace without sudo and leaves the uid the same.
+  // maps that user to itself gives the empty network namespace without sudo and leaves the uid the same. It does
+  // not cut off Unix sockets, the Docker socket the user holds among them, through which a container on the host's
+  // network reaches out (measured 2026-10-26), so src/plugins/sandbox.ts (`configProblemOf`) refuses network none
+  // without an image on InstaBox, and a mount it accepts never runs a command under this prefix.
   isolateNetwork: ISOLATE,
   // With an image the container is started with Docker's `--network none` (`SETUP`), which nothing inside it can
   // undo, and `unshare` is refused inside the container (measured 2026-10-26: Operation not permitted), so no prefix.
