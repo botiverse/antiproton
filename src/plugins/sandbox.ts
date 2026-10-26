@@ -4,6 +4,11 @@ import { backgrounded, identityNote, LEASE_KEY, markIdentity, markReleased, rele
 import type { R2Artifacts } from "../store/artifacts.ts";
 import { AGENT_REF, keyForRef, toAgentRef } from "../store/refs.ts";
 import { spanText } from "../runtime/idle-lease.ts";
+import { ProviderError, TERMINAL_EXEC_STATES } from "./sandbox/provider.ts";
+import type { BoxState as ProviderBoxState, EgressSecret, ExecStatus, SandboxBackend, SandboxProvider } from "./sandbox/provider.ts";
+import { run9 } from "./sandbox/providers/run9.ts";
+
+export { AWAKE_STATES, PUT_SETTLE_MS } from "./sandbox/providers/run9.ts";
 
 /**
  * A real Node runtime, as a mount.
@@ -90,11 +95,6 @@ export interface SandboxConfig {
    * switched back on by an upgrade. Any other value does nothing.
    */
   github?: string;
-}
-
-interface Run9Credential {
-  ak: string;
-  sk: string;
 }
 
 /** A saved filesystem, under a name the agent chose rather than an id. */
@@ -528,15 +528,8 @@ export function segmentsOf(path: string): string[] {
   return out;
 }
 
-/**
- * The states run9 reports for an execution that will not change again.
- *
- * `error` included: run9 documents it as platform trouble rather than an app
- * exit, and an exec that could not start (a working directory that does not
- * exist, measured 2026-09-15) sits in it for good. Left out, such an exec was
- * never finished: the call handed it over as a job and every poll said "not yet".
- */
-const TERMINAL = ["succeeded", "failed", "killed", "cancelled", "timeout", "error"];
+/** The states of an execution that will not change again (`TERMINAL_EXEC_STATES`). */
+const TERMINAL = TERMINAL_EXEC_STATES;
 
 /** This mount's settings, defaults filled in. */
 function cfgOf(ctx: PluginContext) {
@@ -547,29 +540,13 @@ function cfgOf(ctx: PluginContext) {
 }
 
 /**
- * A caller for run9's API under this mount's credential.
- *
- * Lifted out of `invoke` because polling and cancelling happen outside a call
- * and need the same door — with the same credential resolution, so there is
- * one place that knows how to talk to run9 rather than three that agree.
+ * This mount's provider under its credential, for a call that needs one: a tool call, or polling and cancelling
+ * a job outside one. One door, with the same credential resolution, so a call with no account is refused the
+ * same way wherever it comes from.
  */
-function apiFor(cfg: ReturnType<typeof cfgOf>, ctx: PluginContext) {
+function openProvider(cfg: ReturnType<typeof cfgOf>, ctx: PluginContext): SandboxProvider {
   if (!ctx.credential) throw markIdentity(new Error(`the run9 API needs an account, and this call had none — ${identityNote(ctx)}`), ctx);
-  const cred = JSON.parse(ctx.credential) as Run9Credential;
-  const auth = "Basic " + btoa(`${cred.ak}:${cred.sk}`);
-  return async (method: string, path: string, body?: unknown) => {
-    const res = await fetch(cfg.endpoint + path, {
-      method,
-      headers: { authorization: auth, "content-type": "application/json" },
-      body: body === undefined ? undefined : JSON.stringify(body),
-      signal: AbortSignal.timeout(cfg.timeoutMs),
-    });
-    const text = await res.text();
-    let parsed: any = text;
-    try { parsed = JSON.parse(text); } catch { /* plain text error */ }
-    if (!res.ok) throw new Error(`run9 ${method} ${path} -> ${res.status}: ${String(text).slice(0, 200)}`);
-    return parsed;
-  };
+  return backendFor(cfg).open(cfg, ctx.credential);
 }
 
 /**
@@ -581,16 +558,16 @@ function apiFor(cfg: ReturnType<typeof cfgOf>, ctx: PluginContext) {
  * the pair would drift the first time either was edited (#291).
  */
 export function finished(
-  rec: any,
+  rec: ExecStatus,
   cfg: ReturnType<typeof cfgOf>,
   state: BoxState | null,
   machine: string = MAIN_MACHINE,
 ): Record<string, unknown> {
   // A `shell` command reports where it ended; the report is ours, not the command's output.
-  const { output: out, cwd } = splitCwd(String(rec.output_summary ?? ""));
+  const { output: out, cwd } = splitCwd(String(rec.output ?? ""));
   return {
     state: rec.state,
-    exitCode: rec.exit_code ?? null,
+    exitCode: rec.exitCode ?? null,
     ...(cwd ? { cwd } : {}),
     // Allowed, not refused: an agent may need to look in /tmp. But work left there is gone after an idle
     // spell (tmpfs, measured 2026-09-15), so the result says so while the agent is still standing in it.
@@ -842,6 +819,15 @@ export function providerOf(cfg: { provider?: string }): "run9" {
   return "run9";
 }
 
+/**
+ * The adapter that runs this mount's containers. It does not ask `providerOf`: only the release paths
+ * (`deleteBox`, `parkBox`) do, so a mount whose `provider` names one we do not have is refused there and is
+ * run on run9 by every other path.
+ */
+function backendFor(_cfg: { provider?: string }): SandboxBackend {
+  return run9;
+}
+
 const DEFAULTS = {
   provider: "run9",
   verifyWith: "provider" as const,
@@ -864,46 +850,29 @@ const DEFAULTS = {
 };
 
 /**
- * Hand the box back for real.
- *
- * `stop` is not release: it returns 200, halts the runtime, and leaves the box
- * and its storage in place — the state stays `ready` and storage keeps being
- * billed, which is the largest component of the quota. Only `DELETE` actually
- * frees it. Stopping first is a courtesy so nothing is killed mid-write.
+ * Delete one box at its provider with the mount's credential (`SandboxProvider.delete`). `error` when it is not
+ * gone; `definitive` when the provider's refusal is one a retry will not change — the only refusal an operator's
+ * `forget` acts on.
  *
  * Failures are reported rather than swallowed. An earlier version buried them
  * on the theory that "the box stops itself eventually"; the result was thirteen
  * live boxes and a release path that had been announcing success the whole time.
- */
-/**
- * Stop, then delete, one box at run9 with the mount's credential. `error` when it is not gone; `definitive` when
- * run9 answered with a refusal that a retry will not change (a 4xx other than 408 timeout, 409 conflict and 429
- * rate limit, which are run9 busy, not a verdict) — the only refusal an operator's `forget` acts on.
  *
- * Already gone is what a delete is for. run9 answers a GET for a box it does not have with 400 "box not found"
- * (measured for `checkCredential`, which relies on it); that a DELETE answers the same is assumed from that, not
- * measured, and a 404 is read the same way. Believed only when `believeGone`: the caller knows whether this key
- * could be shown the box at all.
+ * Already gone is what a delete is for, and is believed only when `believeGone`: the caller knows whether this
+ * key could be shown the box at all.
  */
 async function deleteBox(ctx: PluginContext, boxId: string, believeGone: boolean): Promise<{ error?: string; definitive: boolean }> {
   const cfg = { ...DEFAULTS, ...(ctx.publicConfig as SandboxConfig) };
   providerOf(cfg);
-  const cred = JSON.parse(ctx.credential!) as Run9Credential;
-  const auth = "Basic " + btoa(`${cred.ak}:${cred.sk}`);
-  const base = `${cfg.endpoint}/projects/${cfg.project}/workspace/boxes/${boxId}`;
+  const provider = backendFor(cfg).open(cfg, ctx.credential!);
   try {
-    await fetch(`${base}/stop`, { method: "POST", headers: { authorization: auth },
-      signal: AbortSignal.timeout(20_000) }).catch(() => {});
-    const res = await fetch(base, { method: "DELETE", headers: { authorization: auth },
-      signal: AbortSignal.timeout(30_000) });
-    if (res.ok) return { definitive: false };
-    const said = (await res.text()).slice(0, 120);
-    if (believeGone && (res.status === 404 || /box not found/i.test(said))) return { definitive: false };
-    return {
-      error: `delete returned ${res.status}: ${said}`,
-      definitive: res.status >= 400 && res.status < 500 && ![408, 409, 429].includes(res.status),
-    };
+    await provider.delete(boxId);
+    return { definitive: false };
   } catch (e) {
+    if (e instanceof ProviderError) {
+      if (believeGone && e.code === "not_found") return { definitive: false };
+      return { error: e.message, definitive: e.definitive };
+    }
     return { error: String((e as Error)?.message ?? e).slice(0, 160), definitive: false };
   }
 }
@@ -997,32 +966,27 @@ async function stopBox(
 /**
  * Switch an idle box off and keep it: the idle lease's step for a running box.
  *
- * `stop` halts the runtime and keeps the box and its disk; the next exec on the
- * same id starts it again with its files (measured 2026-10-01: about two
- * seconds, /work intact, processes gone). So an idle machine stops billing
+ * `SandboxProvider.stop` keeps the box and its disk, and the next exec on the
+ * same id starts it again with its files. So an idle machine stops billing
  * compute without its agent losing anything, which is why no warning comes
  * before this step and one does come before the deletion that follows much
  * later (`activityOf`).
  *
  * The compute session ends here and is recorded the way `stopBox` records one,
- * because the next use starts a new one (`createdAt` moves then). A stop run9
- * refused is thrown with its fact, as `stopBox` does: a box still running must
- * not read as switched off.
+ * because the next use starts a new one (`createdAt` moves then). A stop the
+ * provider refused is thrown with its fact, as `stopBox` does: a box still
+ * running must not read as switched off.
  */
 async function parkBox(ctx: PluginContext, machine: string, state: BoxState): Promise<Released | false> {
   if (!ctx.credential) return false;
   const cfg = cfgOf(ctx);
   providerOf(cfg);
-  const cred = JSON.parse(ctx.credential) as Run9Credential;
-  const auth = "Basic " + btoa(`${cred.ak}:${cred.sk}`);
+  const provider = backendFor(cfg).open(cfg, ctx.credential);
   let error: string | undefined;
   try {
-    const res = await fetch(`${cfg.endpoint}/projects/${cfg.project}/workspace/boxes/${state.boxId}/stop`, {
-      method: "POST", headers: { authorization: auth }, signal: AbortSignal.timeout(30_000),
-    });
-    if (!res.ok) error = `stop returned ${res.status}: ${(await res.text()).slice(0, 120)}`;
+    await provider.stop(state.boxId);
   } catch (e) {
-    error = String((e as Error)?.message ?? e).slice(0, 160);
+    error = e instanceof ProviderError ? e.message : String((e as Error)?.message ?? e).slice(0, 160);
   }
   const endedAt = Date.now();
   const session = sessionOf(state, endedAt, machine);
@@ -1352,9 +1316,6 @@ interface LeftOut { alias: string; why: string }
 /** A wiring this record cannot account for; the next command clears the box and wires again. */
 const UNKNOWN_WIRING: Wired = { alias: "", plugin: "", placeholder: "", digest: "", names: null };
 
-/** One credential registered with run9's egress for one box. */
-interface Registration { name: string; value: string; placeholder: string; header: string; hosts: string[] }
-
 /**
  * What stands for a mount's credential in one container. Qualified by box,
  * because run9 requires a placeholder to be unique across the project, and
@@ -1370,8 +1331,8 @@ export function placeholderFor(
   return `__AP_${tag(alias).toUpperCase()}_${tag(boxId.slice(-8))}_${fresh}__`;
 }
 
-/** A form's registrations for one credential and placeholder: the value goes to run9's egress, never into the box. */
-export function registrationsFor(form: SandboxForm, credential: string, placeholder: string): Registration[] {
+/** A form's registrations for one credential and placeholder: the value goes to the provider's egress, never into the box. */
+export function registrationsFor(form: SandboxForm, credential: string, placeholder: string): EgressSecret[] {
   return form.egress.map((e) => ({
     name: e.name, value: e.value(credential), placeholder: e.placeholder(placeholder), header: e.header, hosts: [...e.hosts],
   }));
@@ -1454,8 +1415,6 @@ function accountsNote(state: BoxState | null): Record<string, Json> {
   return { accounts };
 }
 
-type Run9Api = (method: string, path: string, body?: unknown) => Promise<any>;
-
 /** A credential's identity, to notice it changed without keeping it: SHA-256, hex. */
 async function tokenDigest(token: string): Promise<string> {
   const bytes = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(token)));
@@ -1490,15 +1449,10 @@ async function accountsWanted(ctx: PluginContext, cfg: ReturnType<typeof cfgOf>)
   return { wire, leftOut };
 }
 
-async function register(api: Run9Api, project: string, boxId: string, c: Candidate & { credential: string; digest: string }): Promise<Wired> {
+async function register(provider: SandboxProvider, boxId: string, c: Candidate & { credential: string; digest: string }): Promise<Wired> {
   const placeholder = placeholderFor(c.alias, boxId);
   const regs = registrationsFor(c.form, c.credential, placeholder);
-  for (const g of regs) {
-    await api("POST", `/projects/${project}/workspace/boxes/${boxId}/secrets`, {
-      name: g.name, value: g.value, placeholder: g.placeholder,
-      inject_header_name: g.header, allowed_hosts: g.hosts,
-    });
-  }
+  for (const g of regs) await provider.addSecret(boxId, g);
   await c.used();
   return {
     alias: c.alias, plugin: c.plugin, placeholder, digest: c.digest, names: regs.map((g) => g.name),
@@ -1520,7 +1474,7 @@ async function register(api: Run9Api, project: string, boxId: string, c: Candida
  * running it would use access the mounts no longer grant.
  */
 async function reconcileAccounts(
-  ctx: PluginContext, cfg: ReturnType<typeof cfgOf>, state: BoxState, api: Run9Api,
+  ctx: PluginContext, state: BoxState, provider: SandboxProvider,
   want: Awaited<ReturnType<typeof accountsWanted>>, machine: string,
 ): Promise<BoxState> {
   const had = state.wired ?? [];
@@ -1533,12 +1487,10 @@ async function reconcileAccounts(
   if (!drop.length && !add.length && leftSame) return state;
   const next: BoxState = { ...state, wired: keep, leftOut: want.leftOut };
   if (drop.length) {
-    const base = `/projects/${cfg.project}/workspace/boxes/${state.boxId}/secrets`;
     const everything = drop.some((w) => w.names === null);
-    const names = new Set(drop.flatMap((w) => w.names ?? []));
-    const listed = await api("GET", base);
-    for (const s of Array.isArray(listed) ? listed : []) {
-      if (everything || names.has(s?.name)) await api("DELETE", `${base}/${s.secret_id}`);
+    const names = new Set<unknown>(drop.flatMap((w) => w.names ?? []));
+    for (const s of await provider.listSecrets(state.boxId)) {
+      if (everything || names.has(s.name)) await provider.removeSecret(state.boxId, s.id);
     }
   }
   // Recorded as gone before registering again, so a registration that fails
@@ -1547,7 +1499,7 @@ async function reconcileAccounts(
   if (!next.leftOut!.length) delete next.leftOut;
   await writeView(ctx, machine, next);
   for (const c of add) {
-    next.wired = [...(next.wired ?? []), await register(api, cfg.project, state.boxId, c)];
+    next.wired = [...(next.wired ?? []), await register(provider, state.boxId, c)];
     await writeView(ctx, machine, next);
   }
   return next;
@@ -1683,59 +1635,25 @@ export function machinesList(
   } as unknown as Json;
 }
 
-/**
- * The states in which run9 says a box is awake. Its docs (https://run.sys9.ai/docs/box, read
- * 2026-10-02): "ready: the box exists, but it is not awake yet. idle: the box is awake and waiting
- * for the next exec or file transfer. running: an exec or file transfer is active." and "Boxes wake
- * when used and can sleep when idle." (https://run.sys9.ai/docs/execute-commands: "The box wakes for
- * the command. When it is idle, run9 can let it sleep."). So `idle` and `running` are awake;
- * `ready`, anything else, or a state this code has never seen is not.
- *
- * **What this cannot close.** run9 sleeps an idle box on its own schedule, which nothing here can
- * hold off, so a box listed `idle` may go to sleep in the one round trip before the read's command
- * reaches it, and that command then wakes it. Our own release cannot land there (the mount's lock
- * covers the check and the start), only run9's sleep can. run9 documents file reads that never wake
- * a box (https://run.sys9.ai/docs/file-transfer: "These commands do not start a transfer job or wake
- * a stopped box", for `sys9 run box file ls/stat/cat`), but the HTTP API behind them is not in its
- * swagger (https://api.run.sys9.ai/swagger.yaml, read 2026-10-02, has only `files/download` and
- * `files/upload`, and a `file_access_url` field without a protocol), so it is not used until it is
- * documented or measured.
- */
-export const AWAKE_STATES: readonly string[] = ["idle", "running"];
-
 /** The longest a look may take, end to end: a person is waiting, and a look is never worth more. */
 export const LOOK_LIST_MS = 10_000;
 export const LOOK_READ_MS = 20_000;
 
-type Box = { boxId: string; cfg: ReturnType<typeof cfgOf>; auth: string; deadline: number };
-
-/** run9's API with the look's deadline as every request's limit. */
-async function run9Call(box: Box, method: string, path: string, body?: unknown): Promise<any> {
-  const left = box.deadline - Date.now();
-  if (left <= 0) throw new Error(`run9 ${method} ${path}: the look ran out of time`);
-  const res = await fetch(box.cfg.endpoint + path, {
-    method, headers: { authorization: box.auth, "content-type": "application/json" },
-    body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(left),
-  });
-  const text = await res.text();
-  if (!res.ok) throw new Error(`run9 ${method} ${path} -> ${res.status}: ${text.slice(0, 200)}`);
-  try { return JSON.parse(text); } catch { return text; }
-}
+/** A box a look is reading, and the deadline every request of the look shares. */
+type Box = { boxId: string; cfg: ReturnType<typeof cfgOf>; provider: SandboxProvider; deadline: number };
 
 /**
  * The main machine's box, only if it is running by both records: this mount's own (a box, not
- * switched off by the idle lease) and run9's list, which is a read and starts nothing. Null for
- * anything less, without a call to run9 when our own record already says no.
+ * switched off by the idle lease) and the provider's, read without starting anything. Null for
+ * anything less, without a call to the provider when our own record already says no.
  */
 async function awakeBox(ctx: PluginContext, deadline: number): Promise<Box | null> {
   const box = (await readMount(ctx))?.machines[MAIN_MACHINE];
   if (!box?.boxId || parkedAt(box) !== null || !ctx.credential) return null;
   const cfg = cfgOf(ctx);
-  const cred = JSON.parse(ctx.credential) as Run9Credential;
-  const b: Box = { boxId: box.boxId, cfg, auth: "Basic " + btoa(`${cred.ak}:${cred.sk}`), deadline };
-  const boxes = await run9Call(b, "GET", `/projects/${cfg.project}/workspace/boxes`);
-  const listed = Array.isArray(boxes) ? boxes.find((x: any) => x?.box_id === box.boxId) : null;
-  return listed && AWAKE_STATES.includes(String(listed.state)) ? b : null;
+  const b: Box = { boxId: box.boxId, cfg, provider: backendFor(cfg).open(cfg, ctx.credential), deadline };
+  const state: ProviderBoxState = await b.provider.status(box.boxId, { deadline });
+  return state === "running" ? b : null;
 }
 
 /**
@@ -1754,20 +1672,17 @@ export const STAT_SCRIPT = RESOLVE + "find \"$r\" -maxdepth 0 -printf '%y\\t%s\\
 /** Start a script on an awake box; its exec id. */
 async function startLook(box: Box, script: string, path: string): Promise<string> {
   const root = "/" + segmentsOf(box.cfg.workdir).join("/");
-  const started = await run9Call(box, "POST", `/projects/${box.cfg.project}/workspace/boxes/${box.boxId}/background-execs`, {
-    command: ["sh", "-c", script, "sh", path, root],
-  });
-  return String(started.exec_id);
+  return String(await box.provider.execBackground(box.boxId, { argv: ["sh", "-c", script, "sh", path, root] }, { deadline: box.deadline }));
 }
 
 /** Wait for a look's command; its exit code and output. */
 async function finishLook(box: Box, execId: string): Promise<{ exit: number; out: string }> {
   for (;;) {
-    const rec = await run9Call(box, "GET", `/projects/${box.cfg.project}/workspace/execs/${execId}`);
+    const rec = await box.provider.poll(execId, { deadline: box.deadline });
     if (TERMINAL.includes(rec.state)) {
-      const exit = Number(rec.exit_code);
+      const exit = Number(rec.exitCode);
       if (rec.state !== "succeeded" && ![3, 4, 5].includes(exit)) throw new Error(`a look in ${box.boxId}: ${rec.state} ${String(rec.reason ?? "").slice(0, 120)}`);
-      return { exit, out: String(rec.output_summary ?? "") };
+      return { exit, out: String(rec.output ?? "") };
     }
     if (Date.now() + 200 > box.deadline) throw new Error(`a look in ${box.boxId} did not finish in time`);
     await new Promise((r) => setTimeout(r, 200));
@@ -1851,10 +1766,7 @@ const sandboxFiles: HeldFiles = {
     const body = await locked(async () => {
       const box = await awakeBox(ctx, deadline);
       if (!box) return null;
-      const res = await fetch(`${box.cfg.endpoint}/projects/${box.cfg.project}/workspace/boxes/${box.boxId}/files/download?box_abs_path=${encodeURIComponent(real)}`, {
-        headers: { authorization: box.auth }, signal: AbortSignal.timeout(Math.max(1, deadline - Date.now())),
-      });
-      if (!res.ok) throw new Error(`run9 download of ${real} -> ${res.status}: ${(await res.text()).slice(0, 160)}`);
+      const res = await box.provider.download(box.boxId, real, { timeoutMs: Math.max(1, deadline - Date.now()) });
       return readCapped(res, maxBytes);
     });
     if (!body) return { running: false };
@@ -1875,14 +1787,6 @@ function boxPathOf(cfg: ReturnType<typeof cfgOf>, path: string): string {
  * is held in the agent's isolate while it goes out, which a larger one would crowd.
  */
 export const PUT_MAX_BYTES = 25 * 1024 * 1024;
-/**
- * How long `put` waits for run9 to finish the transfer it accepted. run9 answers an upload with a "prepared
- * transfer session" (swagger `uploadBoxFiles`, `DataTransferPrepareView`, https://api.run.sys9.ai/swagger.yaml
- * read 2026-10-17), which carries a `state` but no id to read it back by; the one place a transfer's progress is
- * documented is `GET /workspace/data-transfers/active` (`pending` / `running` / `succeeded` / `error` /
- * `cancelled`). So the call waits there until no upload into the box is still active, and then checks the file.
- */
-export const PUT_SETTLE_MS = 60_000;
 
 /**
  * Where `put` writes: `path` resolved like a filesystem would (`.` and `..` applied), relative ones from the
@@ -2068,8 +1972,8 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       const cfg = cfgOf(ctx);
       const h = handle as { boxId?: string; execId?: string; machine?: string };
       if (!h?.execId) throw new Error("not an execution handle");
-      const api = apiFor(cfg, ctx);
-      const rec = await api("GET", `/projects/${cfg.project}/workspace/execs/${h.execId}`);
+      const provider = openProvider(cfg, ctx);
+      const rec = await provider.poll(h.execId);
       if (!TERMINAL.includes(rec.state)) return { done: false, progress: { state: rec.state } };
       // The box as it was when the work started: this runs outside the call, and
       // writing the box record from here would race a second job finishing at
@@ -2110,11 +2014,10 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       const cfg = cfgOf(ctx);
       const h = handle as { execId?: string };
       if (!h?.execId) return;
-      const api = apiFor(cfg, ctx);
-      const path = `/projects/${cfg.project}/workspace/execs/${h.execId}`;
+      const provider = openProvider(cfg, ctx);
       let why: string;
       try {
-        await api("POST", `${path}/kill`);
+        await provider.kill(h.execId);
         why = "kill accepted";
       } catch (e) {
         why = e instanceof Error ? e.message : String(e);
@@ -2125,7 +2028,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       // the kill succeeded or failed.
       let state: string | null = null;
       try {
-        state = String((await api("GET", path)).state);
+        state = String((await provider.poll(h.execId)).state);
       } catch (e) {
         why += `; state unreadable: ${e instanceof Error ? e.message : String(e)}`;
       }
@@ -2419,131 +2322,18 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
   ],
 
 
-  /**
-   * Does this key work, asked when a person pastes it rather than when an
-   * agent needs it.
-   *
-   * Listing the project's boxes is the cheapest authenticated call run9 has,
-   * and it checks the two things that are actually wrong when a run9 mount is
-   * wrong: the keys, and whether the configured project exists. A 401 and a
-   * missing project are different mistakes with the same symptom otherwise —
-   * the agent's first command failing — and a person who has just pasted a key
-   * cannot tell them apart from that.
-   *
-   * It names the project as the account, because that is the thing these keys
-   * grant and the thing a person can recognise on the page.
-   */
+  /** Does this key work, asked when a person pastes it (the provider's `checkCredential`). */
   async checkCredential(ctx) {
     if (!ctx.credential) return { ok: false as const, kind: "rejected" as const, reason: "no keys: this mount cannot start a container" };
     const cfg = { ...DEFAULTS, ...(ctx.publicConfig as SandboxConfig) };
-    let cred: Run9Credential;
-    try {
-      cred = JSON.parse(ctx.credential) as Run9Credential;
-    } catch {
-      return { ok: false as const, kind: "rejected" as const, reason: "the stored value is not JSON; run9 needs an object with ak and sk" };
-    }
-    if (!cred.ak || !cred.sk) {
-      return { ok: false as const, kind: "rejected" as const, reason: "run9 needs both ak and sk; one of them is missing" };
-    }
-    try {
-      // The endpoint answers for itself when it is not the provider.
-      //
-      // Once our own service sits in front, the mount holds a token we issued,
-      // and asking run9 about it proves nothing: the provider has never seen
-      // it. Worse, passing the question through would make the service answer
-      // whether an id the caller does not own exists, which is the thing it was
-      // put there to refuse.
-      if (cfg.verifyWith === "endpoint") {
-        const res = await fetch(`${cfg.endpoint}/credential`, {
-          headers: { authorization: "Basic " + btoa(`${cred.ak}:${cred.sk}`) },
-          signal: AbortSignal.timeout(cfg.timeoutMs),
-        });
-        if (res.ok) return { ok: true as const, account: cfg.project };
-        const said = (await res.text()).slice(0, 200);
-        if (res.status === 401 || res.status === 403) {
-          return { ok: false as const, kind: "rejected" as const, reason: "this key was not accepted" };
-        }
-        // Anything else is the service having trouble, not a verdict on the key:
-        // the difference `checkCredential` exists to keep (#45).
-        return { ok: false as const, kind: "unreachable" as const, reason: `the sandbox service answered ${res.status}: ${said.slice(0, 120)}` };
-      }
-      // Asks about one box that cannot exist, rather than listing the project.
-      //
-      // Verifying a key by listing every box means the answer to "does this key
-      // work" arrives with everyone else's containers attached — under a shared
-      // account that is every other tenant's. Nothing here read that list, but
-      // the boundary was our filter rather than their refusal (cody, 2026-09-12,
-      // `57b93840`),
-      // and a broker in front of run9 would refuse this call outright, so the
-      // narrow question is also the one that keeps working.
-      //
-      // Measured against the live API, like the statuses below, because the
-      // first version of this file guessed and was wrong:
-      //
-      //   keys good, box absent   400  {"error":"box not found"}      ← reached and authorised
-      //   keys bad                401  {"error":"invalid api key"}
-      //   project absent          400  {"error":"project not found"}
-      const res = await fetch(
-        `${cfg.endpoint}/projects/${cfg.project}/workspace/boxes/b_credential_check_only`, {
-          headers: { authorization: "Basic " + btoa(`${cred.ak}:${cred.sk}`) },
-          signal: AbortSignal.timeout(cfg.timeoutMs),
-        });
-      if (res.ok) return { ok: true as const, account: cfg.project };
-      const body = (await res.text()).slice(0, 200);
-      // The box is not there because nothing by that name ever is: reaching
-      // that answer means the keys were accepted and the project exists, which
-      // is the whole question.
-      if (/box not found/i.test(body)) return { ok: true as const, account: cfg.project };
-      // Status alone cannot separate a bad key from a bad project name — both
-      // arrive as 400 — so the body is what decides, and the name rule is
-      // quoted from run9's own message: project_cid must match [a-z0-9_-]{3,20}.
-      if (res.status === 401 || res.status === 403) {
-        return { ok: false as const, kind: "rejected" as const, reason: "run9 rejected these keys" };
-      }
-      if (/project not found/i.test(body)) {
-        return { ok: false as const, kind: "rejected" as const, reason: `the keys work, but project "${cfg.project}" does not exist` };
-      }
-      if (/project_cid must match/i.test(body)) {
-        return {
-          ok: false as const,
-          kind: "rejected" as const,
-          reason: `"${cfg.project}" is not a usable project name: run9 wants 3 to 20 characters of a-z, 0-9, dash or underscore`,
-        };
-      }
-      // Reached but with no verdict: a 500 says nothing about the keys.
-      return { ok: false as const, kind: "unreachable" as const, reason: `run9 answered ${res.status}: ${body.slice(0, 120)}` };
-    } catch (e) {
-      // Nothing answered — a timeout, a refused connection, DNS. No verdict.
-      return { ok: false as const, kind: "unreachable" as const, reason: String((e as Error)?.message ?? e) };
-    }
+    return backendFor(cfg).checkCredential(cfg, ctx.credential);
   },
 
-  /**
-   * The run9 organisation these keys act on, by run9's `GET /whoami` (`org.org_id`), with the project the mount
-   * names: a box lives in a project of an organisation, and keys of the same organisation reach the same project.
-   * The access key is not it — each key of one account has its own.
-   *
-   * Null for an endpoint that is not run9 itself (`verifyWith: "endpoint"`): what a service in front answers for
-   * `/whoami` is its own business, and could be one identity for every tenant — a "same" that is not.
-   */
+  /** The account these keys act on (the provider's `account`), so a replaced key on the same one keeps the boxes. */
   async credentialAccount(ctx) {
     if (!ctx.credential) return null;
     const cfg = cfgOf(ctx);
-    if (cfg.verifyWith === "endpoint") return null;
-    let cred: Run9Credential;
-    try { cred = JSON.parse(ctx.credential) as Run9Credential; } catch { return null; }
-    if (!cred.ak || !cred.sk) return null;
-    // A network failure throws through: nobody answered, which is not "no account" (`Plugin.credentialAccount`).
-    const res = await fetch(`${cfg.endpoint}/whoami`, {
-      headers: { authorization: "Basic " + btoa(`${cred.ak}:${cred.sk}`) },
-      signal: AbortSignal.timeout(cfg.timeoutMs),
-    });
-    // Busy is not an answer either: a timeout, a conflict, a rate limit, or a server error. Thrown, so the change
-    // waits rather than reading "no account" and deleting machines a same-account key would have kept.
-    if (res.status >= 500 || [408, 409, 429].includes(res.status)) throw new Error(`run9 answered ${res.status} to /whoami`);
-    if (!res.ok) return null;
-    const org = (await res.json().catch(() => null) as { org?: { org_id?: unknown } } | null)?.org?.org_id;
-    return typeof org === "string" && org ? `${org}/${cfg.project}` : null;
+    return backendFor(cfg).account(cfg, ctx.credential);
   },
 
 
@@ -2653,23 +2443,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       };
     }
 
-    if (!ctx.credential) throw markIdentity(new Error(`the run9 API needs an account, and this call had none — ${identityNote(ctx)}`), ctx);
-    const cred = JSON.parse(ctx.credential) as Run9Credential;
-    const auth = "Basic " + btoa(`${cred.ak}:${cred.sk}`);
-
-    const api = async (method: string, path: string, body?: unknown) => {
-      const res = await fetch(cfg.endpoint + path, {
-        method,
-        headers: { authorization: auth, "content-type": "application/json" },
-        body: body === undefined ? undefined : JSON.stringify(body),
-        signal: AbortSignal.timeout(cfg.timeoutMs),
-      });
-      const text = await res.text();
-      let parsed: any = text;
-      try { parsed = JSON.parse(text); } catch { /* plain text error */ }
-      if (!res.ok) throw new Error(`run9 ${method} ${path} -> ${res.status}: ${String(text).slice(0, 200)}`);
-      return parsed;
-    };
+    const provider = openProvider(cfg, ctx);
 
     // Everything about the file is settled before a container is asked for, so a reference that is not this
     // agent's, a path outside the working directory, or a file too large starts and wakes nothing.
@@ -2734,20 +2508,18 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       // image the kept environment itself started from. Unknown stays unknown.
       const image = from ? kept.find((e) => e.snapId === from)?.image : cfg.image;
       // The agent's other accounts this container acts as (`SandboxForm`). Asked
-      // at creation because run9 registers credentials per box, and read again
-      // before every later command (reconcileAccounts).
+      // at creation because the provider registers credentials per box, and read
+      // again before every later command (reconcileAccounts).
       const want = await accountsWanted(ctx, cfg);
       try {
-        await api("POST", `/projects/${cfg.project}/workspace/boxes`, {
-          box_id: boxId,
+        await provider.create({
+          id: boxId,
           // An environment kept earlier, or the bare image. Starting from a
           // snapshot is the whole point of having kept one.
-          ...(from ? { source_snap_id: from } : { source_image_ref: cfg.image }),
-          // Injection happens on run9's egress proxy, which only exists in
-          // managed mode. Measured: under `normal` the placeholder goes out
-          // unchanged, which would look like a working credential and not be one.
-          ...(want.wire.length ? { network_mode: "managed" } : {}),
-          ...(cfg.shape ? { desired_shape: cfg.shape } : {}),
+          ...(from ? { fromSnapshot: from } : {}),
+          image: cfg.image,
+          egressSecrets: want.wire.length > 0,
+          ...(cfg.shape ? { shape: cfg.shape } : {}),
           description: `antiproton ${ctx.caller.tenantId}/${ctx.caller.agentId}`,
         });
       } catch (e) {
@@ -2756,13 +2528,12 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
         // had just minted. The box existed; only the answer was lost. Throwing
         // here failed the agent's first command and leaked the box, since no
         // record of it was ever written. If the box is there, it is ours.
-        if (!/already exists|duplicate key/i.test(String(e))) throw e;
-        const boxes = await api("GET", `/projects/${cfg.project}/workspace/boxes`);
-        if (!(Array.isArray(boxes) && boxes.some((b: any) => b.box_id === boxId))) throw e;
+        if (!(e instanceof ProviderError && e.code === "conflict")) throw e;
+        if ((await provider.status(boxId)) === "gone") throw e;
       }
       // Recorded before anything else can fail: the box exists and is billed, so
       // a registration that throws must not leave it with no record naming it.
-      // The record gains each placeholder only once run9 has accepted it.
+      // The record gains each placeholder only once the provider has accepted it.
       state = {
         boxId, createdAt: Date.now(), lastUsedAt: Date.now(), execs: 0, saved: [],
         // Whose account this box is on, for as long as it lives (`BoxState.credentialRef`).
@@ -2777,7 +2548,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       // `envs` above: release carries them over because a snapshot outlives its
       // box, and a new record written without them erased the list on the next
       // container's first command, stranding the snapshots in run9.
-      state = await reconcileAccounts(ctx, cfg, state, api, want, machine);
+      state = await reconcileAccounts(ctx, state, provider, want, machine);
       await writeView(ctx, machine, state);
     }
 
@@ -2800,13 +2571,14 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     const saveOut = async (path: string, archive: boolean) => {
       if (!path.startsWith("/")) throw new Error(`path must be absolute inside the box: ${path}`);
       if (!artifacts) throw new Error("no object storage is mounted, so nothing can be saved out");
-      const url = `${cfg.endpoint}/projects/${cfg.project}/workspace/boxes/${state!.boxId}` +
-        `/files/download?box_abs_path=${encodeURIComponent(path)}${archive ? "&archive=tar" : ""}`;
-      const res = await fetch(url, {
-        headers: { authorization: auth }, signal: AbortSignal.timeout(cfg.timeoutMs),
-      });
-      if (!res.ok) {
-        throw new Error(`could not read ${path}: ${res.status} ${(await res.text()).slice(0, 160)}`);
+      let res: Response;
+      try {
+        res = await provider.download(state!.boxId, path, { archive, timeoutMs: cfg.timeoutMs });
+      } catch (e) {
+        if (e instanceof ProviderError && e.status !== undefined) {
+          throw new Error(`could not read ${path}: ${e.status} ${e.detail.slice(0, 160)}`);
+        }
+        throw e;
       }
       const body = new Uint8Array(await res.arrayBuffer());
       // The name is where the file was, resolved the way the box itself
@@ -2837,21 +2609,8 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name)) {
         throw new Error("name must be short, and letters, digits, dot, dash or underscore");
       }
-      // run9 will not fork a box's filesystem while the box is awake: "the Box
-      // must already be stopped with persistence settled; this operation never
-      // stops it implicitly". So stop, fork, and let the next call wake it —
-      // waking preserves the filesystem, so the agent does not lose its machine
-      // by keeping a copy of it.
-      await api("POST", `/projects/${cfg.project}/workspace/boxes/${state!.boxId}/stop`);
-      const box = (await api("GET", `/projects/${cfg.project}/workspace/boxes`))
-        .find((b: any) => b.box_id === state!.boxId);
-      const source = box?.box_snap_id;
-      if (!source) throw new Error("the container reports no filesystem to keep");
-      const forked = await api("POST", `/projects/${cfg.project}/workspace/snaps/${source}/fork`, {
-        description: `antiproton ${ctx.caller.tenantId}/${ctx.caller.agentId} ${name}`,
-      });
-      const snapId = forked?.snap_id;
-      if (!snapId) throw new Error(`fork returned no snapshot: ${JSON.stringify(forked).slice(0, 160)}`);
+      // The provider may stop the box to fork it (`caps.snapshot`); the next call then wakes it with its files.
+      const snapId = await provider.snapshot(state!.boxId, `antiproton ${ctx.caller.tenantId}/${ctx.caller.agentId} ${name}`);
       const env: Env = {
         name, snapId, savedAt: Date.now(),
         ...(state!.image ? { image: state!.image } : {}),
@@ -2873,15 +2632,14 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
 
     if (tool === "put") {
       const p = putting!;
-      const boxPath = `/projects/${cfg.project}/workspace/boxes/${state!.boxId}`;
       // A short script on the box, waited for: its exit code and output. Not the agent's shell, so its
       // directory and the agent's command count are left alone.
       const script = async (body: string, what: string): Promise<{ exit: number; out: string }> => {
-        const started = await api("POST", `${boxPath}/background-execs`, { command: ["sh", "-c", body, "sh", p.path] });
+        const execId = await provider.execBackground(state!.boxId, { argv: ["sh", "-c", body, "sh", p.path] });
         const until = Date.now() + cfg.timeoutMs;
         for (;;) {
-          const rec = await api("GET", `/projects/${cfg.project}/workspace/execs/${started.exec_id}`);
-          if (rec.state === "succeeded" || rec.state === "failed") return { exit: Number(rec.exit_code ?? -1), out: String(rec.output_summary ?? "") };
+          const rec = await provider.poll(execId);
+          if (rec.state === "succeeded" || rec.state === "failed") return { exit: Number(rec.exitCode ?? -1), out: String(rec.output ?? "") };
           if (TERMINAL.includes(rec.state)) throw new Error(`could not ${what} for ${p.path}: ${rec.state} ${String(rec.reason ?? "").slice(0, 120)}`);
           if (Date.now() > until) throw new Error(`could not ${what} for ${p.path}: the command did not finish in time`);
           await new Promise((r) => setTimeout(r, 300));
@@ -2892,40 +2650,9 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       if (ready.exit === 5) throw new Error(`could not make the directory for ${p.path}: something on the way there is a file`);
       if (ready.exit !== 0) throw new Error(`could not make the directory for ${p.path}: exit ${ready.exit} ${ready.out.slice(0, 120)}`);
 
-      // `box_abs_path` as a query parameter, the one place run9 accepts it for both of its upload modes.
-      const form = new FormData();
-      form.append("file", new Blob([p.bytes as Uint8Array<ArrayBuffer>]), p.path.split("/").at(-1) ?? "file");
-      const res = await fetch(`${cfg.endpoint}${boxPath}/files/upload?box_abs_path=${encodeURIComponent(p.path)}`, {
-        method: "POST", headers: { authorization: auth }, body: form, signal: AbortSignal.timeout(cfg.timeoutMs),
-      });
-      const text = await res.text();
-      if (!res.ok) throw new Error(`run9 refused the upload to ${p.path}: ${res.status} ${text.slice(0, 160)}`);
-      let view: any = null;
-      try { view = JSON.parse(text); } catch { /* checked below by reading the file */ }
-      const said = String(view?.state ?? "").toLowerCase();
-      const failure = String(view?.failure_code ?? "");
-      if (failure || ["error", "cancelled", "failed"].includes(said)) {
-        throw new Error(`run9 did not complete the upload to ${p.path}: ${[said, failure, view?.reason].filter(Boolean).join(", ")}`);
-      }
-      // Anything short of finished is waited for where run9 reports transfers (see `PUT_SETTLE_MS`).
-      if (said !== "succeeded") {
-        const settleBy = Date.now() + PUT_SETTLE_MS;
-        for (;;) {
-          const active = await api("GET", `/projects/${cfg.project}/workspace/data-transfers/active?box_id=${encodeURIComponent(state!.boxId)}`);
-          const uploads = (Array.isArray(active) ? active : [])
-            .filter((t: any) => (!t?.box_id || t.box_id === state!.boxId) && t?.direction === "upload");
-          const broken = uploads.find((t: any) => t?.state === "error" || t?.state === "cancelled");
-          if (broken) throw new Error(`run9 did not complete the upload to ${p.path}: ${broken.state}${broken.reason ? `, ${String(broken.reason).slice(0, 120)}` : ""}`);
-          if (!uploads.some((t: any) => t?.state !== "succeeded")) break;
-          if (Date.now() > settleBy) {
-            throw new Error(`run9 had not finished the upload to ${p.path} after ${PUT_SETTLE_MS / 1000} s; ` +
-              "it may still land, so check the file before using it, or put it again");
-          }
-          await new Promise((r) => setTimeout(r, 500));
-        }
-      }
+      await provider.upload(state!.boxId, p.path, p.bytes);
 
-      // Read back from the box itself: run9's answer says a transfer ended, this says the file is the one sent.
+      // Read back from the box itself: the provider's answer says a transfer ended, this says the file is the one sent.
       const got = await script(PUT_CHECK_SCRIPT, "read the file back");
       if (got.exit === 3) throw new Error(`run9 accepted the upload, but ${p.path} is not a file in the container`);
       if (got.exit !== 0) throw new Error(`could not read ${p.path} back: exit ${got.exit} ${got.out.slice(0, 120)}`);
@@ -3022,12 +2749,9 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     // which is what lets `finished` stay one function (checked live: exit 3 and
     // both streams came back identically).
     const startIn = tool === "shell" ? (askedDir ?? state.cwd ?? null) : null;
-    const start = async (argv: string[], workdir: string | null) => (await api(
-      "POST", `/projects/${cfg.project}/workspace/boxes/${state!.boxId}/background-execs`,
-      { command: argv, ...(workdir ? { workdir } : {}) },
-    )).exec_id as string;
+    const start = (argv: string[], workdir: string | null) => provider.execBackground(state!.boxId, { argv, workdir });
     // The box just created was wired from the mount a moment ago; any other is checked again.
-    if (!created) state = await reconcileAccounts(ctx, cfg, state!, api, await accountsWanted(ctx, cfg), machine);
+    if (!created) state = await reconcileAccounts(ctx, state!, provider, await accountsWanted(ctx, cfg), machine);
     let execId = await start(execArgv(cfg, command, envFor(state)), startIn);
     let movedFrom: string | null = null;
 
@@ -3043,19 +2767,19 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
 
     const grace = Date.now() + cfg.graceMs;
     for (;;) {
-      const rec = await api("GET", `/projects/${cfg.project}/workspace/execs/${execId}`);
-      // run9 does not start an exec in a directory that is gone (it may have been
+      const rec = await provider.poll(execId);
+      // The provider does not start an exec in a directory that is gone (it may have been
       // removed, or lived under /tmp, which does not survive an idle box).
       // A directory the agent named is its own answer: say it does not exist
       // rather than run the command somewhere it did not ask for.
-      if (rec.state === "error" && askedDir && /failed to start/i.test(String(rec.reason ?? ""))) {
+      if (rec.couldNotStart && askedDir) {
         return {
           ...finished(rec, cfg, state, machine),
           note: `${askedDir} does not exist in the container; create it first, or leave workdir out`,
         };
       }
       // A remembered one that vanished: once, start again in the working directory, and say so.
-      if (rec.state === "error" && startIn && !askedDir && !movedFrom && /failed to start/i.test(String(rec.reason ?? ""))) {
+      if (rec.couldNotStart && startIn && !askedDir && !movedFrom) {
         movedFrom = startIn;
         execId = await start(execArgv(cfg, withCwdTrailer(`mkdir -p ${wd} && cd ${wd} || exit 1\n${a.command}`), envFor(state)), null);
         continue;
@@ -3065,7 +2789,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
         // Only the call that ran the command writes the directory: a job finished
         // later through the poll must not write the box record (see pollBackground),
         // so a command handed over does not move the shell, as `&` would not.
-        const cwd = tool === "shell" ? splitCwd(String(rec.output_summary ?? "")).cwd : null;
+        const cwd = tool === "shell" ? splitCwd(String(rec.output ?? "")).cwd : null;
         const moved = movedFrom !== null && (state.cwd ?? null) !== null;
         if (tool === "shell" && (cwd ?? null) !== (state.cwd ?? null)) {
           await writeView(ctx, machine, { ...afterStart, cwd: cwd ?? undefined });
