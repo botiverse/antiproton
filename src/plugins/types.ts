@@ -494,7 +494,9 @@ export interface PluginContext {
    * And only a mount the agent can call: one whose plugin is not installed, is
    * switched off for this agent, or is pinned to another version than the
    * registry's answers null, as a missing one does — its calls are refused, so
-   * its credential is not handed out by this route either.
+   * its credential is not handed out by this route either. Callers that want
+   * the sibling's credential read null as "not there"; reminder's `onRaft`
+   * reads it as "not hosted on Raft".
    */
   sibling(alias: string): Promise<{
     credential: string | null;

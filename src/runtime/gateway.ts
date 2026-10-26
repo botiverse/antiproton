@@ -1269,10 +1269,10 @@ export class ToolGateway {
         // Only this agent's own mounts: never a lookup by tenant or by plugin.
         const other = await store.getMountByAlias(ctx.tenantId, ctx.agentId, alias);
         if (!other) return null;
-        // Only a mount the agent could call: the same two gates as `invoke` and `sandboxForms`. A mount whose
+        // Only a mount the agent could call: the same three checks as `invoke` and `sandboxForms`. A mount whose
         // plugin is not installed, is switched off, or is pinned to another version than the registry's has its
         // calls refused, and its credential must not reach it by another plugin's route. Refused as "no such
-        // mount" — not even the plugin's name — since every caller already reads null as "not there".
+        // mount" — not even the plugin's name — since every caller already handles null (PluginContext.sibling).
         const otherPlugin = this.#plugins.get(other.plugin);
         if (!otherPlugin) return null;
         const choices = await store.pluginChoices(ctx.tenantId, ctx.agentId);
