@@ -9,7 +9,7 @@ import type { BoxState as ProviderBoxState, EgressSecret, ExecStatus, SandboxBac
 import { run9 } from "./sandbox/providers/run9.ts";
 import { instabox, INSTABOX_ENDPOINT, shapeOf } from "./sandbox/providers/instabox.ts";
 
-export { AWAKE_STATES, PUT_SETTLE_MS } from "./sandbox/providers/run9.ts";
+export { PUT_SETTLE_MS } from "./sandbox/providers/run9.ts";
 
 /**
  * A real Node runtime, as a mount.
@@ -2491,7 +2491,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     { name: "shell", type: "string", summary: "Shell the shell tool runs commands in.", default: "/bin/sh" },
     { name: "shellPrefix", type: "string", summary: "Prepended to every shell command — for images whose toolchain lives in an environment a plain shell never enters." },
     { name: "network", type: "string", choices: ["open", "none"], default: "open",
-      summary: "\"open\" or \"none\". With none every command runs in an empty network namespace: no route out, not even DNS." },
+      summary: "\"open\" or \"none\". With none every command runs in an empty network namespace: no route out, not even DNS. Only the network is taken away: without an image, commands still run on the machine itself, with its files." },
     { name: "timeoutMs", type: "number", summary: "How long one request to the provider may take.", default: 120000 },
     { name: "graceMs", type: "number", default: 5000,
       summary: "How long a command may run before it is handed over as a background job. Short commands still answer in the call; longer ones return a job and the agent carries on." },

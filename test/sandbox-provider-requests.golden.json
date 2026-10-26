@@ -106,7 +106,7 @@
       "none"
      ],
      "default": "open",
-     "summary": "\"open\" or \"none\". With none every command runs in an empty network namespace: no route out, not even DNS."
+     "summary": "\"open\" or \"none\". With none every command runs in an empty network namespace: no route out, not even DNS. Only the network is taken away: without an image, commands still run on the machine itself, with its files."
     },
     {
      "name": "timeoutMs",
@@ -501,7 +501,7 @@
       "none"
      ],
      "default": "open",
-     "summary": "\"open\" or \"none\". With none every command runs in an empty network namespace: no route out, not even DNS."
+     "summary": "\"open\" or \"none\". With none every command runs in an empty network namespace: no route out, not even DNS. Only the network is taken away: without an image, commands still run on the machine itself, with its files."
     },
     {
      "name": "timeoutMs",
