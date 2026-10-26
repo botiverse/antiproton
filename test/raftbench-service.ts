@@ -316,6 +316,8 @@ const traceRows = (w: World, kind: string) => (w.host.sql.exec("SELECT status, v
   .map((r) => ({ status: String(r.status), verdict: String(r.verdict), attrs: JSON.parse(String(r.attrs)) }));
 /** Every key a `raftbench.run_done` row may carry: ids, fixed codes and counts, nothing of the result or the model's text. */
 const RUN_DONE_KEYS = new Set(["mount", "runId", "revision", "outcome", "output", "from", "failure", "fixups", "calls", "reads", "retries", "receiptId", "code"]);
+/** A `run_done` row's `code`, where it has one, is a fixed identifier: never prose, never a reason. */
+const codeIsFixed = (a: Record<string, unknown>) => a.code === undefined || (typeof a.code === "string" && /^[A-Za-z0-9_.:-]{1,64}$/.test(a.code));
 
 // ---- the profile ---------------------------------------------------------------------------------------------
 
@@ -804,6 +806,12 @@ await check("limits: a revision conflict rereads once; four model calls at most,
   must(w.sent.length === MAX_CALLS, `a fifth model call: ${w.sent.length}`);
   must(w.raft.calls.filter((c) => c.path === "/internal/agent-api/raftbench/context" && !c.query.cursor).length === 2, "the material was read a third time");
   must(runLogs("done").some((l) => /^stopped: /.test(l.outcome)), show(runLogs("done")));
+  // The stop ends from the reread's cleaned state: nothing of the second read's failed result is on its row.
+  const rows = traceRows(w, "raftbench.run_done");
+  must(rows.length === 1, `run_done rows: ${show(rows)}`);
+  must(rows.every((r) => codeIsFixed(r.attrs)), `a code that is not a fixed identifier: ${show(rows)}`);
+  const a = rows[0]!.attrs;
+  must(a.outcome === "stopped" && a.code === "material_changed_again" && a.failure === undefined && a.from === undefined && a.reads === 2, show(rows[0]));
 });
 
 // ---- one run, one conversation ------------------------------------------------------------------------------
@@ -1082,7 +1090,7 @@ await check("a wake that keeps failing backs off, doubling to six hours, and a w
   must(!runLogs("wake_failed").some((l) => l.failures === 4) && w.host.sql.exec(`SELECT 1 AS x FROM plugin_db WHERE key = 'wake_failures'`).toArray().length === 0, "the count was not reset");
 });
 
-await check("retention: every terminal path leaves no copy — timeout, read failure, stop, model failure, overflow, cancel, reread", async () => {
+await check("retention: every terminal path leaves no copy — timeout, read failure, stop, model failure, overflow, cancel, reread, give-up", async () => {
   const paths: Record<string, (w: World) => Promise<void>> = {
     timeout: async (w) => { skew += RUN_DEADLINE_MS + 1_000; try { for (let i = 0; i < 3; i++) await pass(w); } finally { skew = 0; } },
     "read failure on a reread": async (w) => {
@@ -1115,6 +1123,18 @@ await check("retention: every terminal path leaves no copy — timeout, read fai
       await answer(w, markedAnswer());
     },
     "a refusal the contract does not name": async (w) => { w.raft.inject.set("/internal/agent-api/raftbench/submit", [refusal(400, "raftbench_unnamed_refusal")]); await answer(w, markedAnswer()); },
+    // The plugin's own failure in flight when the run ends: its row names that submission, not a cleaned state.
+    "a stop on the plugin's own failure": async (w) => {
+      await answer(w, goodResult({ status: "maybe" }));
+      w.raft.inject.set("/internal/agent-api/raftbench/submit", [refusal(403, "raftbench_read_permission_revoked")]);
+      await answer(w, goodResult({ status: "maybe" }));
+    },
+    "a give-up on the plugin's own failure": async (w) => {
+      await answer(w, goodResult({ status: "maybe" }));
+      w.raft.inject.set("/internal/agent-api/raftbench/submit", Array.from({ length: RETRY_DELAYS_MS.length + 1 }, () => refusal(503, "raftbench_unavailable")));
+      await answer(w, goodResult({ status: "maybe" }));
+      try { for (const delay of RETRY_DELAYS_MS) { skew += delay + 1_000; await pass(w); } } finally { skew = 0; }
+    },
   };
   // Each path's `raftbench.run_done` row: the outcome's fixed head, whose result was sent, the plugin failure's code,
   // and a stop's fixed code. A stop's outcome is only its head, never the text after the colon.
@@ -1128,6 +1148,8 @@ await check("retention: every terminal path leaves no copy — timeout, read fai
     "an empty reply at the cap, twice": { outcome: "accepted", from: "plugin", failure: "model_failed" },
     reread: { outcome: "accepted", from: "model" },
     "a refusal the contract does not name": { outcome: "accepted", from: "plugin", failure: "raft_refused" },
+    "a stop on the plugin's own failure": { outcome: "stopped", from: "plugin", failure: "validation_failed", code: "raftbench_read_permission_revoked" },
+    "a give-up on the plugin's own failure": { outcome: "gave_up", from: "plugin", failure: "validation_failed", code: "raftbench_unavailable" },
   };
   for (const [name, path] of Object.entries(paths)) {
     const w = await world();
@@ -1140,6 +1162,7 @@ await check("retention: every terminal path leaves no copy — timeout, read fai
     const rows = traceRows(w, "raftbench.run_done"), want = ends[name]!;
     must(rows.length === 1, `${name}: run_done rows ${show(rows)}`);
     const a = rows[0]!.attrs;
+    must(codeIsFixed(a), `${name}: a code that is not a fixed identifier: ${show(a)}`);
     must(rows[0]!.status === want.outcome && a.outcome === want.outcome && !String(a.outcome).includes(":") && a.from === want.from &&
       a.failure === want.failure && a.code === want.code && a.output === "prompt_only", `${name}: ${show(rows[0])}`);
     must(Object.keys(a).every((k) => RUN_DONE_KEYS.has(k)) && !show(a).includes(MATERIAL_MARK) && !show(a).includes(ANSWER_MARK), `${name}: ${show(a)}`);
@@ -1252,6 +1275,9 @@ await check("retry_identical: after the cap the run is given up with an admin lo
   const submits = w.raft.submits();
   must(submits.length === RETRY_DELAYS_MS.length + 1 && new Set(submits.map((s) => s.raw)).size === 1, `submits ${submits.length}, distinct ${new Set(submits.map((s) => s.raw)).size}`);
   must(runLogs("done").some((l) => /^gave_up/.test(l.outcome) && l.admin === true), show(runLogs("done").slice(-2)));
+  const rows = traceRows(w, "raftbench.run_done");
+  must(rows.length === 1 && rows[0]!.attrs.outcome === "gave_up" && rows[0]!.attrs.from === "model" && rows[0]!.attrs.failure === undefined &&
+    rows[0]!.attrs.code === "raftbench_unavailable" && codeIsFixed(rows[0]!.attrs), show(rows));
   must(!submits.some((s) => s.body.status === "incomplete"), "an incomplete result was sent after giving up");
 });
 
