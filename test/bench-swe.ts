@@ -19,6 +19,7 @@ import { register } from "node:module";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { refuseWithheld } from "../src/runtime/pi-tools.ts";
 import { handleSandboxCall } from "../src/runtime/dynamic-worker-executor.ts";
+import { startedAs } from "../bench/swebench/started.ts";
 import { settleShell, type ShellAnswer } from "../bench/swebench/grade.ts";
 import { decideFromPoll } from "../bench/poll-fallback.ts";
 import { BACKGROUND_MAX_MS, BACKGROUND_STOP_GRACE_MS } from "../src/runtime/background-jobs.ts";
@@ -611,6 +612,20 @@ await check("a withheld address is refused at dispatch, and nothing else is", ()
   must(r?.status === "rejected" && r.error.code === "withheld", `not refused: ${show(r)}`);
   must(refuseWithheld("sandbox.shell", held) === null, "a tool that is not withheld was refused");
   must(refuseWithheld("sandbox.release", new Set()) === null, "an agent withholding nothing was refused");
+});
+
+// The runner's guard against a Worker that ignores what it was asked (bench/swebench/started.ts): its only reason to
+// exist is the mismatch, so the mismatch is what is driven here.
+await check("the runner refuses an object that runs another provider or engine than it asked for", () => {
+  const threw = (f: () => unknown) => { try { f(); return null; } catch (e) { return String((e as Error).message); } };
+  must(/asked for provider instabox, the object runs run9/.test(threw(() => startedAs({ provider: "run9", engine: "pd" }, { provider: "instabox", engine: "pd" })) ?? ""),
+    "an InstaBox arm was accepted on an object that runs run9");
+  must(/asked for provider instabox, the object runs run9/.test(threw(() => startedAs({ engine: "pd" }, { provider: "instabox", engine: "pd" })) ?? ""),
+    "an older Worker that names no provider was taken for InstaBox");
+  must(/asked for pd, the object runs pi085/.test(threw(() => startedAs({ provider: "run9", engine: "pi085" }, { provider: "run9", engine: "pd" })) ?? ""),
+    "a pd arm was accepted on an object that runs pi085");
+  must(threw(() => startedAs({ provider: "instabox", engine: "pd" }, { provider: "instabox", engine: "pd" })) === null, "a matching InstaBox start was refused");
+  must(threw(() => startedAs({ engine: "pd" }, { provider: "run9", engine: "pd" })) === null, "a run9 start that names no provider was refused");
 });
 
 globalThis.fetch = realFetch;

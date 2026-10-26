@@ -25,6 +25,7 @@
  *   N=1 node bench/swebench/cf.ts
  *   N=10 OBJ=swe2 node bench/swebench/cf.ts
  */
+import { startedAs } from "./started.ts";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { ratesFromEnv, meterLine, type Meter } from "../meter.ts";
@@ -182,13 +183,7 @@ async function runOne(inst: Instance) {
     // Named only when it is not run9, so a run9 run sends what it always sent.
     ...(PROVIDER === "run9" ? {} : { provider: PROVIDER }),
   }, undefined, obj);
-  // An older Worker ignores `provider` and starts the machine on run9 without saying so: an arm that measured the
-  // wrong provider would read as a result. It answers without `provider`, which is run9.
-  const provider = started?.provider ?? "run9";
-  if (provider !== PROVIDER) throw new Error(`asked for provider ${PROVIDER}, the object runs ${provider}`);
-  // What the object says it runs, not what was asked: an older Worker ignores `engine` and answers without one.
-  const engine = started?.engine ?? (ENGINE === "pi085" ? "pi085" : null);
-  if (engine !== ENGINE) throw new Error(`asked for ${ENGINE}, the object runs ${engine ?? "an engine it did not name"}`);
+  const { provider, engine } = startedAs(started, { provider: PROVIDER, engine: ENGINE });
   const network = String(started?.network ?? "open");
   if (TRACE) console.log(`    started ${JSON.stringify(started)}`);
 
