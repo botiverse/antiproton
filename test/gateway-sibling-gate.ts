@@ -99,6 +99,64 @@ await check("a sibling whose plugin is switched off is refused, as its call is",
 await check("a sibling never switched on (not seeded, no choice) is refused, as its call is", () => refusedBoth("dormant", "plugin_disabled"));
 await check("a sibling whose plugin is not installed is refused, as its call is", () => refusedBoth("ghost", "plugin_unavailable"));
 
+// Being removed is the fourth refusal a call has (`markRemoving`, set by `AgentRuntime.removeMount`): the mount
+// still exists in the store while its unmount runs, so only the mark stops its credential being handed out.
+await check("a sibling being removed is refused, as its call is", async () => {
+  const { gw, peek, resolved } = await fixture();
+  const before = await peek("ok");
+  assert(before.ok?.credential === "secret-of-ref:ok", `control: before the mark, sibling("ok") answered ${JSON.stringify(before.ok)}`);
+  resolved.length = 0;
+  const unmark = gw.markRemoving("t", "a", "ok");
+  const direct: any = await gw.invoke(ctx, "ok.run", {});
+  assert(direct.status === "rejected" && direct.error?.code === "not_mounted", `control: the direct call answered ${JSON.stringify(direct)}`);
+  const got = await peek("ok");
+  assert(got.ok === null, `sibling("ok") answered ${JSON.stringify(got.ok)} while it is being removed`);
+  assert(!resolved.includes("ref:ok"), `sibling("ok") resolved its credential while it is being removed: ${JSON.stringify(resolved)}`);
+  unmark();
+  const after = await peek("ok");
+  assert(after.ok?.credential === "secret-of-ref:ok", `after the mark is lifted, sibling("ok") answered ${JSON.stringify(after.ok)}`);
+});
+
+await check("a mount being removed is not wired into the container (sandboxForms)", async () => {
+  const store = new SqliteStore(":memory:");
+  await store.init();
+  await store.createAgent("t", "a");
+  await store.createTask("t", "a", "k", {});
+  for (const [alias, plugin] of [["box", "boxsvc"], ["gh", "formsvc"]] as const) {
+    await store.addMount({
+      tenantId: "t", agentId: "a", alias, plugin, installationId: `i-${alias}`, connectionId: null,
+      toolVersion: "1.0.0", publicConfig: {}, secretRef: `ref:${alias}`, policy: null,
+    });
+  }
+  const resolved: string[] = [];
+  const box: Plugin = {
+    id: "boxsvc", version: "1.0.0",
+    tools: [{ name: "forms", summary: "", parameters: {}, sideEffects: "read", idempotency: "native" }],
+    async invoke(_t, _a, c) { return { aliases: (await c.sandboxForms()).map((f) => f.alias) } as any; },
+  };
+  const withForm: Plugin = {
+    ...service("formsvc"),
+    sandboxForm: { summary: "", egress: [], env: () => ({}) },
+  };
+  const gw = new ToolGateway(store, [box, withForm], new Set(["boxsvc", "formsvc"]), {
+    async resolve(ref: string) { resolved.push(ref); return `secret-of-${ref}`; },
+  } as any);
+  const forms = async () => {
+    const r: any = await gw.invoke(ctx, "box.forms", {});
+    assert(r.status === "succeeded", `the probe did not run: ${JSON.stringify(r)}`);
+    return (r.result as { aliases: string[] }).aliases;
+  };
+  const before = await forms();
+  assert(before.includes("gh"), `control: before the mark, sandboxForms listed ${JSON.stringify(before)}`);
+  resolved.length = 0;
+  const unmark = gw.markRemoving("t", "a", "gh");
+  const during = await forms();
+  assert(!during.includes("gh"), `sandboxForms listed ${JSON.stringify(during)} while gh is being removed`);
+  assert(!resolved.includes("ref:gh"), `sandboxForms resolved gh's credential while it is being removed: ${JSON.stringify(resolved)}`);
+  unmark();
+  assert((await forms()).includes("gh"), "after the mark is lifted, sandboxForms no longer lists gh");
+});
+
 await check("a missing sibling is still null", async () => {
   const { peek } = await fixture();
   const got = await peek("nope");
