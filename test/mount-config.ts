@@ -13,7 +13,7 @@ import { AgentRuntime, SEEDED_PLUGINS } from "../cf/src/runtime.ts";
 import { capabilityTags } from "../scripts/plugin-capabilities.ts";
 import { policyFor } from "../src/runtime/gateway.ts";
 import { githubPlugin } from "../src/plugins/github.ts";
-import { sandboxPlugin, execArgv, execOutput, sessionOf, activityOf, providerOf, keepSessions, usageOf, asBoxState, segmentsOf, keptNote, savedNote, notAReasonToRelease } from "../src/plugins/sandbox.ts";
+import { sandboxPlugin, execArgv, execOutput, sessionOf, activityOf, providerOf, PROVIDERS, keepSessions, usageOf, asBoxState, segmentsOf, keptNote, savedNote, notAReasonToRelease } from "../src/plugins/sandbox.ts";
 import { httpPlugin } from "../src/plugins/http.ts";
 import { exaPlugin } from "../src/plugins/exa.ts";
 import { demoPlugin } from "../src/plugins/demo.ts";
@@ -390,8 +390,9 @@ await check("every credential shape answers the same question, including the one
     throw new Error("the plugin's own words were thrown away for a generic label");
   }
   const pair = credentialForm(run9.credential);
-  if (pair.kind !== "fields" || pair.fields.map((f) => f.name).join() !== "ak,sk") {
-    throw new Error(`expected two fields: ${JSON.stringify(pair)}`);
+  // One declaration for both providers: run9's pair, then InstaBox's key.
+  if (pair.kind !== "fields" || pair.fields.map((f) => f.name).join() !== "ak,sk,apiKey") {
+    throw new Error(`expected run9's two fields and InstaBox's one: ${JSON.stringify(pair)}`);
   }
   const none = credentialForm(httpPlugin.credential);
   if (none.kind !== "none") throw new Error("a plugin that needs no account should ask for nothing");
@@ -1437,8 +1438,9 @@ await check("a mount is renamable only while nothing is running under it", async
 await check("a sandbox mount asking for a provider we do not have is refused, not quietly run on run9", async () => {
   if (providerOf({}) !== "run9") throw new Error("the default provider is not run9");
   if (providerOf({ provider: "run9" }) !== "run9") throw new Error("run9 was not accepted by name");
+  if (providerOf({ provider: "instabox" }) !== "instabox") throw new Error("instabox was not accepted by name");
 
-  for (const asked of ["fly", "e2b", "", "RUN9"]) {
+  for (const asked of ["fly", "e2b", "", "RUN9", "toString", "constructor"]) {
     let refused = "";
     try { providerOf({ provider: asked }); } catch (e) { refused = String((e as Error).message); }
     if (!refused) throw new Error(`the "${asked}" provider was accepted, and would have run on run9`);
@@ -1449,7 +1451,7 @@ await check("a sandbox mount asking for a provider we do not have is refused, no
   // validator refuse the same values without repeating them.
   const field = (run9.config ?? []).find((f) => f.name === "provider");
   if (!field) throw new Error("the plugin no longer declares which provider a mount may ask for");
-  if (JSON.stringify(field.choices) !== JSON.stringify(["run9"])) {
+  if (JSON.stringify(field.choices) !== JSON.stringify(PROVIDERS) || JSON.stringify(PROVIDERS) !== JSON.stringify(["run9", "instabox"])) {
     throw new Error(`the declared choices and the implemented providers disagree: ${JSON.stringify(field.choices)}`);
   }
 });

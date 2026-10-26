@@ -14,13 +14,24 @@ import type { CredentialCheck } from "../types.ts";
  * release facts carry as they always have.
  */
 export interface SandboxBackend {
-  id: "run9";
+  id: "run9" | "instabox";
+  /** How results and refusals name the provider to a reader. */
+  name: string;
   caps: ProviderCaps;
+  /**
+   * What a command is started under when the mount has no network (`network: "none"`): a prefix of the argv that
+   * puts it in an empty network namespace, as the box's own user can.
+   */
+  isolateNetwork: readonly string[];
   /**
    * The provider bound to a mount's settings and credential. Throws when the stored credential does not parse:
    * that is a broken mount, and the caller reports it rather than talking to the provider with nothing.
+   *
+   * `wake: false` for a caller that must never start a box (the workspace view): a box that is not running is
+   * then refused rather than woken. Otherwise a provider that does not wake a box on use (InstaBox) wakes it
+   * itself when a request finds it paused or stopped.
    */
-  open(settings: ProviderSettings, credential: string): SandboxProvider;
+  open(settings: ProviderSettings, credential: string, o?: { wake?: boolean }): SandboxProvider;
   /** Does this credential work, asked when a person pastes it (`Plugin.checkCredential`). */
   checkCredential(settings: ProviderSettings, credential: string): Promise<CredentialCheck>;
   /**
@@ -30,7 +41,10 @@ export interface SandboxBackend {
   account(settings: ProviderSettings, credential: string): Promise<string | null>;
 }
 
-/** What a provider can do, declared so the plugin can ask rather than assume. Nothing reads these yet. */
+/**
+ * What a provider can do, declared so the plugin can ask rather than assume. The plugin reads `pause` (which idle
+ * schedule a box is on), `snapshot` (whether `keep` may wake a box) and `boxSecrets` (whether accounts are wired).
+ */
 export interface ProviderCaps {
   /** What switching an idle box off keeps: its memory (resumes where it was) or only its disk. */
   pause: "memory" | "disk";
@@ -44,12 +58,25 @@ export interface ProviderCaps {
   egressPolicy: boolean;
   /** Whether held time is the provider's own reading or our estimate from when the box existed. */
   usageMeter: "provider" | "estimate";
+  /**
+   * Whether a credential can be registered for one box only, swapped in on its way out (`addSecret`). Without it
+   * no account is wired into a container.
+   */
+  boxSecrets: boolean;
 }
 
 /** The mount settings an adapter reads; the plugin's config with its defaults filled in. */
 export interface ProviderSettings {
   endpoint: string;
   project: string;
+  /** The machine size, as `<vcpus>c<GiB>g`; absent: the provider's default. */
+  shape?: string;
+  /** InstaBox: the template a new box starts from. */
+  template?: string;
+  /** InstaBox: the server-side deletion every box is created with, in hours (at most 24, the API's limit). */
+  maxLifetimeHours?: number;
+  /** InstaBox: the longest a box runs without a pause, in minutes, enforced by InstaBox. */
+  maxRunMinutes?: number;
   /** How long one request may take. */
   timeoutMs: number;
   /** Who answers whether the credential works: the provider's API, or the endpoint's own `/credential`. */
@@ -89,12 +116,15 @@ export class ProviderError extends Error {
   readonly status?: number;
   /** What the provider said, untrimmed; the message carries the part a reader is shown. */
   readonly detail: string;
-  constructor(message: string, o: { code: ProviderErrorCode; definitive: boolean; status?: number; detail?: string }) {
+  /** How long the provider asked to wait before asking again, when it said. */
+  readonly retryAfterMs?: number;
+  constructor(message: string, o: { code: ProviderErrorCode; definitive: boolean; status?: number; detail?: string; retryAfterMs?: number }) {
     super(message);
     this.code = o.code;
     this.definitive = o.definitive;
     if (o.status !== undefined) this.status = o.status;
     this.detail = o.detail ?? "";
+    if (o.retryAfterMs !== undefined) this.retryAfterMs = o.retryAfterMs;
   }
 }
 
@@ -126,8 +156,13 @@ export interface EgressSecret { name: string; value: string; placeholder: string
 
 /** What a new box starts from and how it is set up. */
 export interface BoxSpec {
-  /** The box's id, chosen by the plugin. */
+  /**
+   * The plugin's name for the box, unique per creation. run9 takes it as the box's id; InstaBox mints its own id
+   * and takes this as the machine's name and the create's idempotency key.
+   */
   id: string;
+  /** Labels the box carries at the provider (tenant, agent, mount, machine), by which it can be found again. */
+  labels: Record<string, string>;
   /** A kept filesystem to start from, or else `image`. */
   fromSnapshot?: string;
   image: string;
@@ -145,8 +180,13 @@ export interface Within { deadline?: number; timeoutMs?: number }
  * `ProviderError`; a failure to reach it at all (a timeout, a refused connection) is thrown as it came.
  */
 export interface SandboxProvider {
-  /** Creates the box. A box that already exists under this id is a `conflict`. */
-  create(spec: BoxSpec): Promise<void>;
+  /**
+   * Creates the box: its id at the provider, which the plugin records, and when the provider will delete it on
+   * its own, if it will. A box that already exists under this name is a `conflict`.
+   */
+  create(spec: BoxSpec): Promise<{ id: string; deleteAt?: number }>;
+  /** After a create answered `conflict`: the id of the box this spec made, when one is there, else null. */
+  adopt(spec: BoxSpec): Promise<string | null>;
   /** Where the box is, read without waking it. */
   status(id: string, within?: Within): Promise<BoxState>;
   /** Starts a command, detached so it can be killed; its execution id. */
@@ -159,10 +199,20 @@ export interface SandboxProvider {
   download(id: string, path: string, o: { archive?: boolean; timeoutMs: number }): Promise<Response>;
   /** Switches the box off, keeping it to be started again. */
   stop(id: string): Promise<void>;
+  /** Pauses the box with its memory kept (`caps.pause` "memory"); absent where the provider cannot. */
+  pause?(id: string): Promise<void>;
+  /** Brings a paused or stopped box back; absent where the next request does that by itself (run9). */
+  wake?(id: string): Promise<void>;
   /** Deletes the box: what actually frees it. */
   delete(id: string): Promise<void>;
   /** Keeps the box's filesystem under a new snapshot id; `caps.snapshot` says whether the box stays up. */
   snapshot(id: string, description: string): Promise<string>;
+  /** Deletes a kept snapshot; absent where the plugin has never deleted one (run9). */
+  deleteSnapshot?(snapId: string): Promise<void>;
+  /** The boxes carrying every one of these labels: never the whole account. */
+  list?(labels: Record<string, string>): Promise<Array<{ id: string; name: string; state: BoxState; labels: Record<string, string> }>>;
+  /** What the provider metered for this box, where it meters one. */
+  usage?(id: string): Promise<{ runningSeconds: number; vcpuSeconds: number; memGiBSeconds: number; diskGiBSeconds: number }>;
   addSecret(id: string, secret: EgressSecret): Promise<void>;
   listSecrets(id: string): Promise<Array<{ name: unknown; id: unknown }>>;
   removeSecret(id: string, secretId: unknown): Promise<void>;
