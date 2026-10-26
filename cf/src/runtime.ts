@@ -366,7 +366,6 @@ export function seedKey(
 }
 import { credentialForm, pluginEnabled, renameSafety, isExclusive, backgroundOf, interruptsOf, toolsOf } from "../../src/plugins/types.ts";
 import { githubPlugin } from "../../src/plugins/github.ts";
-import { stampPlugin } from "../../src/plugins/stamp.ts";
 import { demoPlugin } from "../../src/plugins/demo.ts";
 import { httpPlugin } from "../../src/plugins/http.ts";
 import { exaPlugin } from "../../src/plugins/exa.ts";
@@ -1274,7 +1273,8 @@ export class AgentRuntime {
     const plugins: Plugin[] = [];
     plugins.push(
       githubPlugin,
-      stampPlugin,
+      // stampPlugin is not installed until its session and container handling are fixed (#1051): a mount of it could
+      // hand its refresh token to the container, get every Stamp token of the agent revoked, or merge without a person.
       demoPlugin,
       httpPlugin,
       exaPlugin,
