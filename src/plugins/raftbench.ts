@@ -396,7 +396,15 @@ async function resumeRead(ctx: PluginContext, raft: Raft, reading: RunState): Pr
     },
     sources: fixupSourcesOf(material.data.sources),
   };
-  log(ctx, run, "read", { pages: material.data.pages, fetched: run.coverage!.fetched, stopReason: material.data.coverage.stopReason });
+  // The window the material came from (the last page's `from`/`to`, as the Server sent them; the SDK refuses a page
+  // without them), so a run can be matched to its material later. The context response carries no `sourceKind` and no
+  // page's starting cursor, and `readAll` pages inside the SDK and returns no cursor, so those three are logged as null
+  // and named in `missing`, never inferred from the counts.
+  log(ctx, run, "read", {
+    pages: material.data.pages, fetched: run.coverage!.fetched, stopReason: material.data.coverage.stopReason,
+    coverageFrom: material.data.coverage.from, coverageTo: material.data.coverage.to,
+    sourceKind: null, start: null, nextCursor: null, missing: "sourceKind,start,nextCursor",
+  });
   if (Date.now() >= run.deadline) return timeout(ctx, raft, run);
   // Nothing was read: there is nothing for a model to analyse, and nothing failed. An ordinary `incomplete`, sent with
   // `submit`, not the run's failure, which Raft would try again and count towards its limit.
@@ -551,7 +559,10 @@ function traceDone(ctx: PluginContext, run: RunState, outcome: string, extra: Re
     kind: "raftbench.run_done", status: head, verdict: ok ? "ok" : "failed",
     attrs: {
       runId: run.runId, revision: run.revision, outcome: head, output: OUTPUT_ENFORCEMENT,
-      ...(run.from ? { from: run.from } : {}), ...(run.from === "plugin" && run.failure ? { failure: run.failure } : {}),
+      ...(run.from ? { from: run.from } : {}),
+      // The `from === "plugin"` half is redundant today: `failure` is only written by `submitFailed`, together with
+      // `from: "plugin"`. If `failure` ever gets a second writer, this half becomes load-bearing and needs its own test.
+      ...(run.from === "plugin" && run.failure ? { failure: run.failure } : {}),
       fixups: run.fixups ?? 0, calls: run.calls, reads: run.reads, retries: run.retries,
       ...(typeof extra.receiptId === "string" ? { receiptId: extra.receiptId } : {}),
       ...(typeof extra.code === "string" ? { code: extra.code } : {}),
