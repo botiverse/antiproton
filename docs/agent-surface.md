@@ -820,7 +820,9 @@ botiverse/slock#10130 and #10134). Every other Raft POST leaves it out.
   read in this window; nothing was analyzed.", through `submit`, so it is not a failure Raft retries). The model's
   answer is submitted as it wrote it, `incomplete` included, except for its run id, revision and
   `gaps`, which the plugin sets (the gaps from what the read covered; the model is never asked for them). An invalid answer gets one
-  fix-up turn with the list of what is wrong. A call that spent its whole output cap without writing anything takes
+  fix-up turn with the list of what is wrong, the rule that `evidence` and `counterevidence` are always lists (`[]`
+  for none), and the read's citable `target`/`messageId` pairs (ids only, at most 300, the rest pointed at in the
+  material) with the rule to drop a reference it cannot support from them; nothing in the answer is repaired for it. A call that spent its whole output cap without writing anything takes
   that slot instead: the same request is sent once more, in a conversation of its own, with reasoning off (DeepSeek
   `thinking: { type: "disabled" }`), and its result is then treated as a fix-up's; a second empty reply at the cap fails
   the run; a second invalid one, a read that failed, a model that failed, a
