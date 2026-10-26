@@ -2746,7 +2746,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       const r = await stopBox(ctx, machine);
       const at = pastDeleteAt(box)
         ? `${backend.name} deleted it at ${new Date(box.deleteAt!).toISOString()}, as it deletes every machine at most ` +
-          `${terms.maxLifetimeHours} hours after creating it, whatever it is doing`
+          `${terms.maxLifetimeHours} hour${terms.maxLifetimeHours === 1 ? "" : "s"} after creating it, whatever it is doing`
         : `${backend.name} no longer has it`;
       const said = `machine "${machine}" (${box.boxId}) no longer exists: ${at}. Its files and running processes went with it, ` +
         "and nothing was done in it. The next call starts a fresh machine" +
