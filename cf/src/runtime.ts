@@ -366,6 +366,7 @@ export function seedKey(
 }
 import { credentialForm, pluginEnabled, renameSafety, isExclusive, backgroundOf, interruptsOf, toolsOf } from "../../src/plugins/types.ts";
 import { githubPlugin } from "../../src/plugins/github.ts";
+import { stampPlugin } from "../../src/plugins/stamp.ts";
 import { demoPlugin } from "../../src/plugins/demo.ts";
 import { httpPlugin } from "../../src/plugins/http.ts";
 import { exaPlugin } from "../../src/plugins/exa.ts";
@@ -1273,6 +1274,7 @@ export class AgentRuntime {
     const plugins: Plugin[] = [];
     plugins.push(
       githubPlugin,
+      stampPlugin,
       demoPlugin,
       httpPlugin,
       exaPlugin,
