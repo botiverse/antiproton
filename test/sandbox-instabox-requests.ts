@@ -618,6 +618,27 @@ const SCENARIOS: Record<string, (out: unknown[]) => Promise<void>> = {
     must(!f.reqs.some((r) => r.path.includes("/secrets")), "a credential was registered with InstaBox");
   },
 
+  // `not_found` is not only about the machine: a file a download names answers it too. Only InstaBox, asked about the
+  // machine, says whether the machine is gone; a live machine must stay in the record with its files.
+  async "a file InstaBox does not have is not taken for a deleted machine"(out) {
+    const f = fake();
+    const m = mount();
+    await step("shell", () => m.plugin.invoke("shell", { command: "echo up" }, m.ctx), out);
+    const before = JSON.stringify(m.record());
+    f.overrides.push((r) => r.method === "GET" && r.path.includes("/files/content")
+      ? { status: 404, json: { error: { code: "not_found", message: "no such file" } } } : undefined);
+    f.reqs.length = 0;
+    const at = out.length;
+    await step("save a file that is not there", () => m.plugin.invoke("save", { path: "/data/home/work/missing.txt" }, m.ctx), out);
+    const r = out[at] as any;
+    f.overrides.length = 0;
+    out.push(...f.log, { record: m.record() });
+    invariants(f);
+    must(!/no longer exists|files and running processes are gone/.test(JSON.stringify(r)), `a missing file was reported as a deleted machine: ${JSON.stringify(r)}`);
+    must(!f.reqs.some((q) => q.method === "DELETE"), `a missing file let a live machine go: ${f.reqs.map((q) => `${q.method} ${q.path}`).join(", ")}`);
+    must(JSON.stringify(m.record()) === before, "the record changed because a file was missing");
+  },
+
   // The refusal must not lock the way out: a machine that exists under a configuration now refused (made before the
   // refusal, or under another setting) is still let go by release, or it would go on being billed with no way to stop it.
   async "release still deletes a machine whose configuration is now refused"(out) {
