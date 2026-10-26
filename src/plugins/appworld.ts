@@ -246,7 +246,13 @@ export function appworldPlugins(catalogue: Catalogue, cfg: AppWorldConfig): Plug
         // mount, not from the model.
         for (const [param, otherApp] of siblingTokens(doc)) {
           const other = await ctx.sibling(otherApp);
-          if (!other?.credential) continue; // optional parameter; leave it unset
+          if (!other?.credential) {
+            // Optional, so it is left unset and the call goes ahead. Why is said in the trace, never in the result:
+            // the result is the API's own answer, which the evaluation reads.
+            ctx.trace?.({ kind: "appworld.sibling_unset", status: other ? "no_credential" : "not_callable", verdict: "failed",
+              attrs: { param, sibling: otherApp } });
+            continue;
+          }
           const cached = (await other.db.get(SESSION_STORE, SESSION_KEY)) as Session | undefined;
           let t = cached?.token;
           if (!t) {

@@ -210,7 +210,10 @@ async function save(ctx: PluginContext, key: string, run: RunState) {
 async function raftOf(ctx: PluginContext): Promise<Raft> {
   const alias = typeof ctx.publicConfig.raftMount === "string" ? ctx.publicConfig.raftMount : "raft";
   const sibling = await ctx.sibling(alias);
-  if (!sibling || sibling.plugin !== "raft") throw new Error(`no raft mount named ${alias} on this agent`);
+  // `sibling` answers null alike for a missing mount and for one the agent cannot call, and says which cannot be
+  // called in its contract (PluginContext.sibling): the message points there rather than claim the mount is absent.
+  if (!sibling) throw new Error(`the ${alias} mount is not callable (see PluginContext.sibling)`);
+  if (sibling.plugin !== "raft") throw new Error(`the ${alias} mount is not a raft mount`);
   if (!sibling.credential) throw new Error(`the ${alias} mount has no Raft credential`);
   const origin = new URL(String(ctx.publicConfig.serverUrl)).origin;
   const timeoutMs = typeof ctx.publicConfig.timeoutMs === "number" ? Math.max(1_000, Math.min(60_000, ctx.publicConfig.timeoutMs)) : DEFAULT_TIMEOUT_MS;

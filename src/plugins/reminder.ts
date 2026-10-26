@@ -442,8 +442,11 @@ export const ON_RAFT = "This agent is hosted on Raft, so its reminders are Raft'
 /**
  * Whether this agent is hosted on Raft, which wakes it through its own channel: a second wake-up path through a
  * reminder hook would deliver every reminder twice over two routes. Asked as the mount under provisioning's alias AND
- * its plugin, since an operator may give the alias to anything. The known limit: the signal is provisioning's alias,
- * so a Raft mount renamed to another alias is not seen.
+ * its plugin, since an operator may give the alias to anything. The known limits: the signal is provisioning's alias,
+ * so a Raft mount renamed to another alias is not seen; and whatever `ctx.sibling` answers null for reads as "not on
+ * Raft" here (its contract is in types.ts). That includes a raft mount switched off or pinned to another
+ * version, so then this mount sets the reminder itself; whether, once raft is switched back on, a reminder may then arrive
+ * twice is not verified.
  */
 async function onRaft(ctx: PluginContext): Promise<boolean> {
   return (await ctx.sibling(RAFT_ALIAS))?.plugin === "raft";
