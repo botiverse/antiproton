@@ -1265,10 +1265,19 @@ export class ToolGateway {
       // A mount's own hooks, and only for a plugin that can take what they carry.
       ...(this.#inbound && plugin?.receive
         ? { inbound: this.#inbound(ctx.tenantId, ctx.agentId, mount.alias) } : {}),
-      async sibling(alias: string) {
+      sibling: async (alias: string) => {
         // Only this agent's own mounts: never a lookup by tenant or by plugin.
         const other = await store.getMountByAlias(ctx.tenantId, ctx.agentId, alias);
         if (!other) return null;
+        // Only a mount the agent could call: the same three checks as `invoke` and `sandboxForms`. A mount whose
+        // plugin is not installed, is switched off, or is pinned to another version than the registry's has its
+        // calls refused, and its credential must not reach it by another plugin's route. Refused as "no such
+        // mount" — not even the plugin's name — since every caller already handles null (PluginContext.sibling).
+        const otherPlugin = this.#plugins.get(other.plugin);
+        if (!otherPlugin) return null;
+        const choices = await store.pluginChoices(ctx.tenantId, ctx.agentId);
+        if (!pluginEnabled(this.#seeded.has(other.plugin), choices[other.plugin])) return null;
+        if (otherPlugin.version !== other.toolVersion) return null;
         return {
           credential: other.secretRef
             ? await secrets.resolve(other.secretRef, { tenantId: other.tenantId, agentId: other.agentId })
