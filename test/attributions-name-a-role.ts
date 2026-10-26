@@ -199,8 +199,15 @@ const CITED_SHA = /`([0-9a-f]{7,40})`/g;
  * #461 merged (`git fetch` moves `origin/master`, not the tree you stand in),
  * and a red naming the wrong cause sends the next reader to edit a comment that
  * is correct.
+ *
+ * `shallow` is the same shape from the other side: in a shallow clone the
+ * history stops at a cut, so a real commit below it reads exactly like a dead
+ * address. @Ward got 10/11 from a 76-commit clone, naming four correct commits
+ * in files the change under review never touched. A gate that goes red for the
+ * runner's machine teaches people to ignore it, so this case still fails there,
+ * but it says the clone cannot answer instead of listing commits as dead.
  */
-function standing(sha: string, at: string, cwd?: string): "ok" | "ahead" | "unreachable" {
+function standing(sha: string, at: string, cwd?: string): "ok" | "ahead" | "unreachable" | "shallow" {
   const ask = (a: string, b: string) => {
     try {
       execFileSync("git", [...(cwd ? ["-C", cwd] : []), "merge-base", "--is-ancestor", a, b], { stdio: "ignore" });
@@ -208,7 +215,9 @@ function standing(sha: string, at: string, cwd?: string): "ok" | "ahead" | "unre
     } catch { return false; }
   };
   if (ask(sha, at)) return "ok";
-  return ask(at, sha) ? "ahead" : "unreachable";
+  if (ask(at, sha)) return "ahead";
+  const shallow = execFileSync("git", [...(cwd ? ["-C", cwd] : []), "rev-parse", "--is-shallow-repository"], { encoding: "utf8" }).trim();
+  return shallow === "true" ? "shallow" : "unreachable";
 }
 
 check("every commit a comment cites is reachable from this history", () => {
@@ -219,6 +228,7 @@ check("every commit a comment cites is reachable from this history", () => {
   // is gone here and never existed in a fresh clone. Reachability from HEAD is
   // what makes the address open for the next reader rather than for me.
   const bad: string[] = [];
+  const cut: string[] = [];
   for (const f of FILES) {
     readFileSync(f, "utf8").split("\n").forEach((line, i) => {
       if (!COMMENT.test(line)) return;
@@ -227,16 +237,28 @@ check("every commit a comment cites is reachable from this history", () => {
         const where = standing(sha, "HEAD");
         if (where === "ahead") {
           bad.push(`${f}:${i + 1} — \`${sha}\` is AHEAD of this checkout: the comment is fine and this working tree is stale (\`git fetch\` moves \`origin/master\`, not the tree you are in)`);
+        } else if (where === "shallow") {
+          cut.push(`${f}:${i + 1} — \`${sha}\``);
         } else if (where === "unreachable") {
           bad.push(`${f}:${i + 1} — \`${sha}\` is not reachable from HEAD, so it opens for whoever wrote it and nobody else`);
         }
       }
     });
   }
+  if (cut.length > 0) {
+    // Where the clone stops, so the reader can see the red is about the machine.
+    const commits = execFileSync("git", ["rev-list", "--count", "HEAD"], { encoding: "utf8" }).trim();
+    const shallowFile = execFileSync("git", ["rev-parse", "--git-path", "shallow"], { encoding: "utf8" }).trim();
+    const edge = readFileSync(shallowFile, "utf8").split("\n").filter(Boolean).map((s) => s.slice(0, 8)).join(", ");
+    bad.unshift(
+      `this clone is shallow (${commits} commits, cut at ${edge}), so these cannot be judged — run \`git fetch --unshallow\` and rerun:`,
+      ...cut.map((c) => `  ${c}`),
+    );
+  }
   if (bad.length > 0) throw new Error(`a dead address is worse than none:\n      ${bad.join("\n      ")}`);
 });
 
-check("unreachable, reachable and ahead are told apart, each from a real commit", () => {
+check("unreachable, reachable, ahead and shallow are told apart, each from a real commit", () => {
   // The two states have to be told apart, or the case above would accept
   // whatever this clone happens to hold.
   //
@@ -261,6 +283,7 @@ check("unreachable, reachable and ahead are told apart, each from a real commit"
     // stale worktree was in.
     git("commit", "-q", "--allow-empty", "-m", "newer");
     const newer = git("rev-parse", "HEAD");
+    git("branch", "-q", "newer-tip");
     git("checkout", "-q", base);
 
     // UNREACHABLE: a root of its own, so neither commit can reach the other.
@@ -278,6 +301,14 @@ check("unreachable, reachable and ahead are told apart, each from a real commit"
     if (standing(unrelated, "HEAD", dir) !== "unreachable") {
       throw new Error("a commit on an unrelated root was not called unreachable, so the case above cannot fail");
     }
+
+    // SHALLOW: a depth-1 clone of `newer` does not hold `base`, which is a real
+    // ancestor. It must not be called unreachable; the unrelated root above is
+    // still called unreachable in the full repository, so the new answer did
+    // not eat the old one.
+    const cut = join(dir, "cut");
+    execFileSync("git", ["clone", "-q", "--depth", "1", "--branch", "newer-tip", `file://${dir}`, cut], { stdio: "ignore" });
+    if (standing(base, "HEAD", cut) !== "shallow") throw new Error("a real ancestor below a shallow cut was not called shallow");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
