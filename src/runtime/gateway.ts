@@ -1269,10 +1269,11 @@ export class ToolGateway {
         // Only this agent's own mounts: never a lookup by tenant or by plugin.
         const other = await store.getMountByAlias(ctx.tenantId, ctx.agentId, alias);
         if (!other) return null;
-        // Only a mount the agent could call: the same three checks as `invoke` and `sandboxForms`. A mount whose
-        // plugin is not installed, is switched off, or is pinned to another version than the registry's has its
-        // calls refused, and its credential must not reach it by another plugin's route. Refused as "no such
-        // mount" — not even the plugin's name — since every caller already handles null (PluginContext.sibling).
+        // Only a mount the agent could call: refused as `invoke` refuses it. A mount being removed, or whose plugin
+        // is not installed, is switched off, or is pinned to another version than the registry's, has its calls
+        // refused, and its credential must not reach it by another plugin's route. Refused as "no such mount" —
+        // not even the plugin's name — since every caller already handles null (PluginContext.sibling).
+        if (this.#removing.has(`${ctx.tenantId}/${ctx.agentId}/${alias}`)) return null;
         const otherPlugin = this.#plugins.get(other.plugin);
         if (!otherPlugin) return null;
         const choices = await store.pluginChoices(ctx.tenantId, ctx.agentId);
@@ -1297,8 +1298,10 @@ export class ToolGateway {
           const plugin = this.#plugins.get(m.plugin);
           const form = plugin?.sandboxForm;
           if (!form || !pluginEnabled(this.#seeded.has(m.plugin), choices[m.plugin])) continue;
-          // A mount whose calls are refused for a version mismatch must not act from the container either.
+          // A mount whose calls are refused for a version mismatch, or because it is being removed, must not act
+          // from the container either.
           if (plugin.version !== m.toolVersion) continue;
+          if (this.#removing.has(`${m.tenantId}/${m.agentId}/${m.alias}`)) continue;
           const scope = { tenantId: m.tenantId, agentId: m.agentId };
           out.push({
             alias: m.alias, plugin: m.plugin, form,
@@ -1382,10 +1385,10 @@ export class ToolGateway {
    * the agent should read. Never a tool: the model cannot call it, and the
    * context is the one a call on this mount would get, with no task.
    *
-   * The same two gates as a call, because this is a way into the agent too:
-   * a plugin a person switched off is not woken by strangers, and a mount
-   * pinned to another version is not handed to code it was not set up for
-   * (Piper, #377 review). `skipped` says why nothing was asked.
+   * Refused as a call is, because this is a way into the agent too: a mount
+   * being removed is not woken, a plugin a person switched off is not woken
+   * by strangers, and a mount pinned to another version is not handed to code
+   * it was not set up for. `skipped` says why nothing was asked.
    */
   async receive(tenantId: string, agentId: string, alias: string, event: InboundEvent, secret: string):
     Promise<{ skipped: string } | { result: InboundResult }> {
