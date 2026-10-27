@@ -140,7 +140,7 @@ async function exclusive<T>(ctx: PluginContext, fn: () => Promise<T>): Promise<T
  * credential is `replaced` only when no mount of this agent has been given it
  * before (`GIVEN_STORE`).
  */
-type Kept = { kind: "none" } | { kind: "open"; session: AgentSession } | { kind: "spent" } | { kind: "replaced" } | { kind: "unfinished" };
+type Kept = { kind: "none" } | { kind: "open"; session: AgentSession } | { kind: "spent" } | { kind: "replaced" } | { kind: "unfinished"; refused?: string };
 
 /**
  * Every session a person has given this agent's stamp mounts, by the digest of
@@ -188,7 +188,9 @@ async function readKept(ctx: PluginContext): Promise<Kept> {
   if (typeof sealed.iv === "string" && typeof sealed.ciphertext === "string") {
     const plain = await openText(sealPlace(ctx), SEAL_INFO, { iv: sealed.iv, ciphertext: sealed.ciphertext }, SESSION_KEY);
     const s = plain === null ? null : parseSession(plain);
-    if (s && typeof sealed.rotating === "string" && sealed.rotating === await digest(s.refresh_token)) return { kind: "unfinished" };
+    if (s && typeof sealed.rotating === "string" && sealed.rotating === await digest(s.refresh_token)) {
+      return { kind: "unfinished", ...(typeof sealed.refused === "string" ? { refused: sealed.refused } : {}) };
+    }
     if (s) return { kind: "open", session: s };
   }
   const from = await lineage(ctx.credential);
@@ -217,10 +219,12 @@ const spentSession = () => new SpentSession(
   "It needs sign-in again: a person signs in for this mount alone and gives it that session.",
 );
 /** A mount whose last rotation was started and never kept: the gateway may have spent its refresh token. */
-const unfinishedRotation = () => new SpentSession(
-  "stamp: a person needs to sign in again for this mount: its last refresh did not finish, so the gateway may have " +
-  "rotated the session without this side keeping the new one. Nothing was sent — presenting that refresh token again " +
-  "makes Stamp revoke every token this agent holds, on every machine. A person signs in for this mount alone and gives it that session.",
+const unfinishedRotation = (refused?: string) => new SpentSession(refused
+  ? `stamp: a person needs to sign in again for this mount: the gateway refused its refresh token (${refused}) and will ` +
+    "not refresh it again. Nothing was sent. A person signs in for this mount alone and gives it that session."
+  : "stamp: a person needs to sign in again for this mount: its last refresh did not finish, so the gateway may have " +
+    "rotated the session without this side keeping the new one. Nothing was sent — presenting that refresh token again " +
+    "makes Stamp revoke every token this agent holds, on every machine. A person signs in for this mount alone and gives it that session.",
 );
 /** A credential some mount of this agent was already given: it may have been rotated, so it is never sealed again. */
 const givenBefore = () => new SpentSession(
@@ -230,7 +234,7 @@ const givenBefore = () => new SpentSession(
 );
 const refuseUnusable = (kept: Kept) => {
   if (kept.kind === "spent") throw spentSession();
-  if (kept.kind === "unfinished") throw unfinishedRotation();
+  if (kept.kind === "unfinished") throw unfinishedRotation(kept.refused);
 };
 
 /**
@@ -298,9 +302,9 @@ export async function loadSession(ctx: PluginContext, keep = true): Promise<Agen
  * the digest of the refresh token about to be presented, written before it is:
  * a row that still carries it afterwards reads as `unfinished`.
  */
-async function storeSession(ctx: PluginContext, session: AgentSession, rotating?: string): Promise<void> {
+async function storeSession(ctx: PluginContext, session: AgentSession, rotating?: string, refused?: string): Promise<void> {
   const sealed = await sealText(sealPlace(ctx), SEAL_INFO, JSON.stringify(session), SESSION_KEY);
-  const row = { ...sealed, from: await lineage(ctx.credential), ...(rotating ? { rotating } : {}) };
+  const row = { ...sealed, from: await lineage(ctx.credential), ...(rotating ? { rotating } : {}), ...(rotating && refused ? { refused } : {}) };
   await ctx.db.put(SESSION_STORE, row as unknown as Json, SESSION_KEY);
 }
 
@@ -359,6 +363,10 @@ async function rotate(ctx: PluginContext, used: AgentSession): Promise<AgentSess
       // also ends every live session the agent holds for the service, so the
       // agent's other stamp mounts answer `refresh_revoked` next.
       if (code === "refresh_reused" || code === "refresh_revoked" || code === "refresh_expired" || code === "refresh_invalid") {
+        // The code goes beside the mark, so the calls after this one say what the
+        // gateway said rather than "did not finish". If that write fails, the
+        // mark is still there and only the wording is lost.
+        try { await storeSession(ctx, used, marking, code); } catch { /* the mark stands */ }
         throw new Error(code === "refresh_expired" || code === "refresh_invalid"
           ? `stamp: the gateway will never refresh this session's refresh token (${code}). ` +
             "A person needs to sign in again for this mount alone and give it that session; do not retry."
@@ -367,8 +375,8 @@ async function rotate(ctx: PluginContext, used: AgentSession): Promise<AgentSess
             "A person needs to sign in again for this mount alone and give it that session; do not retry.",
         );
       }
-      const said = `stamp: could not refresh the session (${res.status}${code ? ` ${code}` : ""}) — ` +
-        `${String(body.message ?? body.text ?? "").slice(0, 300)}`.trim();
+      const detail = String(body.message ?? body.text ?? "").slice(0, 300).trim();
+      const said = `stamp: could not refresh the session (${res.status}${code ? ` ${code}` : ""})${detail ? ` — ${detail}` : ""}`;
       // A 5xx may come after the gateway committed the rotation — its own 503
       // when the commit fails or a concurrent refresh won, a proxy's 502/504 —
       // so the mark stays. Any other 4xx (`invalid_schema`: this plugin's
@@ -380,6 +388,10 @@ async function rotate(ctx: PluginContext, used: AgentSession): Promise<AgentSess
           "present that refresh token again: a person needs to sign in again for this mount alone and give it that session.");
       }
       await storeSession(ctx, used);
+      if (code === "invalid_schema") {
+        throw new Error(`${said}. This is a bug in the stamp plugin's refresh request, not a problem with the session: ` +
+          "the session is unchanged and nothing was spent. Report it to whoever maintains this plugin; retrying will not help.");
+      }
       throw new Error(said);
     }
 
@@ -530,13 +542,14 @@ function gatewayPath(raw: unknown, allowed: readonly string[]): string {
  * dropped, any case — so a
  * spelling that reaches the same route is the same route. Null: not held.
  */
-function heldRoute(path: string, body: unknown): "an approval" | "a merge" | null {
+function heldRoute(method: string, path: string, body: unknown): "an approval" | "a merge" | null {
   let p = path.split("?", 1)[0];
   try { p = decodeURIComponent(p); } catch { /* gatewayPath already refused what would matter */ }
   // Empty segments collapsed: `pulls/7//merge` must meet the hold, not a redirect further on.
   p = p.replace(/\/{2,}/g, "/").replace(/\/+$/, "").toLowerCase();
   if (/^\/v1\/repositories\/[^/]+\/[^/]+\/pulls\/[^/]+\/approve$/.test(p)) return "an approval";
-  if (/^\/v1\/repositories\/[^/]+\/[^/]+\/pulls\/[^/]+\/(merge|auto-merge|queue(\/[^/]+)?)$/.test(p)) return "a merge";
+  // DELETE on these is leaving the queue or cancelling auto-merge: undoing a merge request, not making one.
+  if (method !== "DELETE" && /^\/v1\/repositories\/[^/]+\/[^/]+\/pulls\/[^/]+\/(merge|auto-merge|queue(\/[^/]+)?)$/.test(p)) return "a merge";
   if (/^\/api\/v3\/repos\/[^/]+\/[^/]+\/(pulls\/[^/]+\/merge|merges)$/.test(p)) return "a merge";
   if (/^\/api\/v3\/repos\/[^/]+\/[^/]+\/pulls\/[^/]+\/reviews(\/[^/]+\/events)?$/.test(p)) {
     const event = body && typeof body === "object" ? String((body as Record<string, unknown>).event ?? "") : "";
@@ -727,7 +740,7 @@ export const stampPlugin: Plugin = {
     // to a commit that arrived after the review, and both are held for a person
     // by `defaultPolicy` above unless the mount's own policy names them.
     t("pr_approve", "Approve the exact head of a pull request, which is what lets it merge. An approval counts for one commit. Approving a pull request this agent opened is refused unless evidence is supplied, which this tool does not do — the refusal names why.",
-      { ...REPO_ARG, ...PR_NUMBER, ...HEAD_ARG, note: { type: "string", description: "why, for the record" } },
+      { ...REPO_ARG, ...PR_NUMBER, ...HEAD_ARG, note: { type: "string", description: "why, for the record: posted as a comment after the approval (Stamp does not take a body on an agent's approval)" } },
       ["repo", "number", "head", "base"], "write", "native"),
     t("pr_unapprove", "Withdraw this agent's approval at the exact head.",
       { ...REPO_ARG, ...PR_NUMBER, ...HEAD_ARG }, ["repo", "number", "head", "base"], "write", "native"),
@@ -874,9 +887,18 @@ export const stampPlugin: Plugin = {
         return (await call("POST", `${prBase(a)}/comments`, ctx, { body: String(a.body) })) as Json;
 
       case "pr_approve": {
-        const body: Record<string, unknown> = { expectedHead: sha(a, "head"), expectedBase: sha(a, "base") };
-        if (a.note !== undefined) body.body = String(a.note);
-        return (await call("POST", `${prBase(a)}/approve`, ctx, body)) as Json;
+        // Stamp refuses an agent's approval that carries a body
+        // (`PR_APPROVE_BODY_NOT_SUPPORTED`): the reason goes in a comment after
+        // the approval, never with it. The approval stands if the comment fails.
+        const approved = (await call("POST", `${prBase(a)}/approve`, ctx,
+          { expectedHead: sha(a, "head"), expectedBase: sha(a, "base") })) as Json;
+        if (a.note === undefined || String(a.note).trim() === "") return approved;
+        try {
+          const comment = (await call("POST", `${prBase(a)}/comments`, ctx, { body: String(a.note) })) as Json;
+          return { approval: approved, comment };
+        } catch (e) {
+          return { approval: approved, commentError: `the approval stands; the note was not posted: ${String((e as Error)?.message ?? e).slice(0, 300)}` };
+        }
       }
       case "pr_unapprove":
         return (await call("POST", `${prBase(a)}/unapprove`, ctx,
@@ -934,7 +956,7 @@ export const stampPlugin: Plugin = {
           throw new Error(`method must be one of POST, PATCH, PUT, DELETE, got ${JSON.stringify(method).slice(0, 20)}`);
         }
         const path = gatewayPath(a.path, API_PREFIXES);
-        const held = heldRoute(path, a.body);
+        const held = heldRoute(method, path, a.body);
         if (held) {
           throw new Error(`stamp: ${held} goes through ${held === "a merge" ? "pr_merge" : "pr_approve"}, not api — ` +
             "that is the tool a person signs for this mount, and api would be a way around it");
