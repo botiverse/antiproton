@@ -337,6 +337,33 @@ check("the typecheck is under the limit too, in both gates, and refused like a s
   if (!/^after typecheck: fails=0 timeouts=0$/m.test(bok.stdout)) throw new Error(`branch gate, clean typecheck: ${JSON.stringify(bok.stdout)}`);
 });
 
+check("the typecheck's verdict is its own line, wherever npm writes around it, in both gates", () => {
+  // npm's update notice, as npm 11 writes it to stderr: at exit, after the
+  // script's output, ending in a bare "npm notice" that a gate reading the
+  // last line took for new errors (2026-10-27).
+  const notice = 'printf "npm notice\\nnpm notice New major version of npm available! 11.16.0 -> 12.2.1\\nnpm notice\\n" >&2';
+  const header = 'printf "\\n> typecheck\\n> node scripts/typecheck.mjs\\n\\n"';
+  const programs = (worker: number) =>
+    `echo "typecheck node: 6 error signature(s), 6 in baseline, 0 new, 0 cleared"; echo "typecheck worker: 2 error signature(s), 2 in baseline, ${worker} new, 0 cleared"`;
+  const total = (fresh: number) => `echo "typecheck: 8 error signature(s) in 2 programs, 8 in baseline, ${fresh} new, 0 cleared"`;
+  const cases: Array<[string, string, boolean]> = [
+    ["notice after the verdict", `${header}; ${programs(0)}; ${total(0)}; ${notice}`, true],
+    ["notice before the verdict", `${notice}; ${header}; ${programs(0)}; ${total(0)}`, true],
+    ["new errors, notice after", `${header}; ${programs(1)}; ${total(1)}; ${notice}; exit 1`, false],
+    // A per-program line says ", 0 new" too; without the total the run is not a verdict.
+    ["only a per-program line, notice after", `${header}; echo "typecheck node: 6 error signature(s), 6 in baseline, 0 new, 0 cleared"; ${notice}; exit 1`, false],
+  ];
+  for (const [what, npm, clean] of cases) {
+    const d = gateTypecheck("cf/scripts/verify-and-deploy.sh", DEPLOY, npm);
+    const deployed = d.status === 0 && d.stdout.includes("WOULD DEPLOY");
+    if (deployed !== clean) throw new Error(`deploy gate, ${what}: ${clean ? "refused" : "went on"} (${d.status}): ${JSON.stringify(d.stdout)}`);
+    if (!clean && !/^typecheck: new errors$/m.test(d.stdout)) throw new Error(`deploy gate, ${what}: no refusal line: ${JSON.stringify(d.stdout)}`);
+    const b = gateTypecheck("cf/scripts/gate.sh", BRANCH, npm);
+    const want = `after typecheck: fails=${clean ? 0 : 1} timeouts=0`;
+    if (!b.stdout.split("\n").includes(want)) throw new Error(`branch gate, ${what}: not "${want}": ${JSON.stringify(b.stdout)}`);
+  }
+});
+
 check("both gates refuse a bad limit from inside run_suite too", () => {
   const b = gateRunSuite("cf/scripts/gate.sh", BRANCH, fake('echo "  1 passed, 0 failed"').script, { GATE_SUITE_LIMIT_fake_suite: "abc" });
   if (!/^fake-suite +FAIL \(limit 'abc'/m.test(b.stdout) || !/fails=1 timeouts=0$/m.test(b.stdout)) throw new Error(`branch gate: ${JSON.stringify(b.stdout)}`);

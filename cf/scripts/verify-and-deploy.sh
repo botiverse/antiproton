@@ -134,7 +134,7 @@ run_suite control-plane-d1 bash test/control-plane-d1.sh
 # Under the same limit as a suite, and for the same reason.
 limit=$(suite_limit typecheck); file=$(mktemp)
 suite_run_bounded "$limit" "$file" npm run typecheck || true
-tc=$(tail -1 "$file") || true; rm -f "$file"
+tc=$(typecheck_result "$file"); rm -f "$file"
 if [ -n "$SUITE_TIMED_OUT" ]; then echo "typecheck: TIMEOUT (still running after ${limit}s; killed)"; exit 1; fi
 if [ -n "$SUITE_ERROR" ]; then echo "typecheck: FAIL ($SUITE_ERROR)"; exit 1; fi
 echo "$tc"
