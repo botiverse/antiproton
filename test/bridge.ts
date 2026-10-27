@@ -9,8 +9,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { SqliteStore } from "../src/store/sqlite.ts";
-import { ToolGateway } from "../src/runtime/gateway.ts";
+import { ToolGateway, redactedError } from "../src/runtime/gateway.ts";
 import type { BridgeDecl, BridgeRequest, BridgeResponse, Plugin, RouteEntry } from "../src/plugins/types.ts";
+import { UNJUDGED_BODY } from "../src/plugins/types.ts";
 import type { MountPolicy } from "../src/core/types.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
@@ -33,6 +34,8 @@ const ROUTES: RouteEntry[] = [
   { methods: ["POST"], path: /^\/v1\/repos\/[^/]+\/[^/]+\/pulls\/\d+\/reviews$/, key: "pr_comment" },
   { methods: ["POST"], path: /^\/v1\/repos\/[^/]+\/[^/]+\/pulls\/\d+\/comments$/, key: "pr_comment" },
   { methods: ["GET"], path: /^\/v1\/secret$/, key: "secret_read" },
+  // A key row with a body check: a draft is a comment, allowed where comments are.
+  { methods: ["POST"], path: /^\/v1\/drafts$/, body: (b) => b?.draft === true, key: "pr_comment" },
 ];
 
 const STORED = "stored-credential-abcdef";
@@ -53,8 +56,20 @@ function fixture(routes: RouteEntry[] = ROUTES, extra: Partial<Plugin> = {}) {
       return m ? { repo: m[1], ...(m[2] ? { pr: Number(m[2]) } : {}) } : {};
     },
     responseHeaders: ["stamp-cli-latest"],
-    async send(ctx, req): Promise<BridgeResponse> {
+    async send(ctx, req, io): Promise<BridgeResponse> {
       sent.push(req);
+      // A send that fails after it minted a token from the stored session, quoting both back.
+      if (req.path.startsWith("/v1/throw")) {
+        const session = (() => { try { return JSON.parse(ctx.credential ?? ""); } catch { return null; } })();
+        const shown = session?.access_token ?? ctx.credential;
+        io.used(MINTED);
+        const said = `upstream said: bad token ${shown} and ${MINTED}`;
+        if (req.path === "/v1/throw-string") throw said;
+        const e = new Error(said) as Error & { code?: string };
+        e.code = `E_${MINTED}`;
+        e.stack = `Error: ${said}\n    at send (${ctx.credential})`;
+        throw e;
+      }
       if (req.path === "/v1/boom") throw new Error("upstream unreachable");
       // An upstream that echoes what it was sent: the stored credential, and a token minted from it for this request.
       if (req.path === "/v1/echo") {
@@ -94,9 +109,12 @@ async function gatewayWith(policy: MountPolicy | null, plugin: Plugin, opts: { c
     toolVersion: "1.0.0", publicConfig: {}, secretRef: opts.credential ? "env:SVC_TOKEN" : null, policy,
   });
   const db = new DatabaseSync(path);
+  // Every row of every table, as text: what a store or trace kept of a call.
+  const everything = () => (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>)
+    .map((t) => JSON.stringify(db.prepare(`SELECT * FROM "${t.name}"`).all())).join("\n");
   const ops = () => db.prepare("SELECT operation_id, tool, status FROM operations").all() as Array<{ operation_id: string; tool: string; status: string }>;
   const secrets = { async resolve() { return opts.credential ?? null; } };
-  return { gw: new ToolGateway(store, [plugin], new Set(["svc"]), secrets), store, ops };
+  return { gw: new ToolGateway(store, [plugin], new Set(["svc"]), secrets), store, ops, everything };
 }
 
 const req = (method: string, path: string, body: string | null = null, headers: Record<string, string> = {}) => ({ method, path, body, headers });
@@ -156,9 +174,9 @@ await check("a refused route ends rejected before any verdict, with one operatio
   const { gw, ops } = await gatewayWith({ write: "allow", tools: { request: "allow", "svc.write": "allow" } }, f.plugin);
   const r: any = await gw.invoke(caller, "svc.request", req("POST", "/v1/repos/o/r/pulls/7/merge/"), program);
   must(r.status === "rejected" && r.error?.code === "route_refused" && /pr_merge/.test(r.error.message), `a merge was not refused: ${JSON.stringify(r)}`);
-  const approve: any = await gw.invoke(caller, "svc.request", req("POST", "/v1/repos/o/r/pulls/7/reviews", '{"event":"approve"}'), program);
+  const approve: any = await gw.invoke(caller, "svc.request", req("POST", "/v1/repos/o/r/pulls/7/reviews", '{"event":"approve"}', { "content-type": "application/json" }), program);
   must(approve.status === "rejected" && approve.error?.code === "route_refused" && /pr_approve/.test(approve.error.message), `an approval review was not refused: ${JSON.stringify(approve)}`);
-  const comment: any = await gw.invoke(caller, "svc.request", req("POST", "/v1/repos/o/r/pulls/7/reviews", '{"event":"COMMENT"}'), program);
+  const comment: any = await gw.invoke(caller, "svc.request", req("POST", "/v1/repos/o/r/pulls/7/reviews", '{"event":"COMMENT"}', { "content-type": "application/json" }), program);
   must(comment.status === "succeeded", `a comment review was refused or held: ${JSON.stringify(comment)}`);
   must(f.sent.length === 1, `${f.sent.length} requests reached send; only the comment review should`);
   const rows = ops();
@@ -341,26 +359,205 @@ await check("confirm never lifts a deny: request: deny, or the route key's deny,
   must(r.status === "pending" && f.sent.length === 0, `allow + confirm is not a card: ${JSON.stringify(r)}`);
 });
 
-// A row with a body check is asked only about a JSON object: any other body would skip it and reach the comment row,
-// which this mount allows, and an approval would run with no person.
+// A refuse row with a body check refuses any body it cannot read as a JSON object: holding it instead would let a
+// mount that allows unlisted writes run it, and skipping it would reach the comment row, which this mount allows.
 const COMMENTS_OPEN: MountPolicy = { tools: { request: "allow", pr_comment: "allow" } };
 for (const [what, body, expect] of [
-  ["a byte-order mark before the JSON", '\uFEFF{"event":"APPROVE"}', "pending"],
-  ["a form-encoded body", "event=APPROVE", "pending"],
-  ["a JSON array", '[{"event":"APPROVE"}]', "pending"],
-  ["a bare JSON string", '"APPROVE"', "pending"],
+  ["a byte-order mark before the JSON", '\uFEFF{"event":"APPROVE"}', "refused"],
+  ["a form-encoded body", "event=APPROVE", "refused"],
+  ["a JSON array", '[{"event":"APPROVE"}]', "refused"],
+  ["a bare JSON string", '"APPROVE"', "refused"],
   ["the key spelled Event", '{"Event":"APPROVE"}', "refused"],
   ["a comment review", '{"event":"COMMENT"}', "ran"],
 ] as const) {
   await check(`a review with ${what} where comments are allowed: ${expect}`, async () => {
     const f = fixture();
     const { gw } = await gatewayWith(COMMENTS_OPEN, f.plugin);
-    const r: any = await gw.invoke(caller, "svc.request", req("POST", "/v1/repos/o/r/pulls/7/reviews", body), program);
+    const r: any = await gw.invoke(caller, "svc.request", req("POST", "/v1/repos/o/r/pulls/7/reviews", body, { "content-type": "application/json" }), program);
     const got = r.status === "pending" ? "pending" : r.error?.code === "route_refused" ? "refused" : r.status === "succeeded" ? "ran" : JSON.stringify(r);
     must(got === expect, `expected ${expect}, got ${got}`);
     must((expect === "ran") === (f.sent.length === 1), `send was reached ${f.sent.length} times`);
   });
 }
+
+// How the body was sent decides whether a row's "not this row" can be trusted: upstream reads a body that is not
+// sent as JSON its own way.
+for (const [what, contentType, body, expect] of [
+  ["a comment review sent as text/plain", "text/plain", '{"event":"COMMENT"}', "refused"],
+  ["a comment review with no content-type", null, '{"event":"COMMENT"}', "refused"],
+  ["a comment review sent as form data", "application/x-www-form-urlencoded", '{"event":"COMMENT"}', "refused"],
+  ["an approval review sent as text/plain", "text/plain", '{"event":"APPROVE"}', "refused"],
+  ["a comment review sent as a +json type with a charset", "application/vnd.api+json; charset=utf-8", '{"event":"COMMENT"}', "ran"],
+] as const) {
+  await check(`${what} where comments are allowed: ${expect}`, async () => {
+    const f = fixture();
+    const { gw } = await gatewayWith(COMMENTS_OPEN, f.plugin);
+    const r: any = await gw.invoke(caller, "svc.request",
+      req("POST", "/v1/repos/o/r/pulls/7/reviews", body, contentType ? { "content-type": contentType } : {}), program);
+    const got = r.status === "pending" ? "pending" : r.error?.code === "route_refused" ? "refused" : r.status === "succeeded" ? "ran" : JSON.stringify(r);
+    must(got === expect, `expected ${expect}, got ${got}`);
+  });
+}
+
+// An approval sent every way upstream might read it, on a mount where every unlisted write runs: none reaches send.
+for (const [what, contentType, body] of [
+  ["as JSON", "application/json", '{"event":"APPROVE"}'],
+  ["form-encoded", "application/x-www-form-urlencoded", "event=APPROVE"],
+  ["with no content-type", null, "event=APPROVE"],
+  ["as JSON labelled text/plain", "text/plain", '{"event":"APPROVE"}'],
+] as const) {
+  for (const [mount, policy] of [["a default mount", null], ["a mount that allows unlisted writes", OPEN]] as const) {
+  await check(`an approval review ${what}, on ${mount}, is refused (not held) and never sent`, async () => {
+    const f = fixture();
+    const { gw } = await gatewayWith(policy, f.plugin);
+    const r: any = await gw.invoke(caller, "svc.request",
+      req("POST", "/v1/repos/o/r/pulls/7/reviews", body, contentType ? { "content-type": contentType } : {}), program);
+    must(r.status === "rejected" && r.error?.code === "route_refused", `it was not refused: ${JSON.stringify(r)}`);
+    must(f.sent.length === 0, "it reached send");
+  });
+  }
+}
+
+await check("a refusal for a body the row could not judge says so, and does not name the row's remedy; a matched one does", async () => {
+  const f = fixture();
+  const { gw } = await gatewayWith(OPEN, f.plugin);
+  for (const contentType of [null, "text/plain"]) {
+    const r: any = await gw.invoke(caller, "svc.request",
+      req("POST", "/v1/repos/o/r/pulls/7/reviews", '{"event":"COMMENT"}', contentType ? { "content-type": contentType } : {}), program);
+    must(r.status === "rejected" && r.error?.code === "route_refused" && r.error.message === UNJUDGED_BODY && !/pr_approve/.test(r.error.message),
+      `${contentType}: ${JSON.stringify(r)}`);
+  }
+  const approve: any = await gw.invoke(caller, "svc.request",
+    req("POST", "/v1/repos/o/r/pulls/7/reviews", '{"event":"APPROVE"}', { "content-type": "application/json" }), program);
+  must(approve.error?.message === "approving is refused on the bridge: call pr_approve", `a matched approval: ${JSON.stringify(approve)}`);
+  must(f.sent.length === 0, "a refused review reached send");
+  const custom = fixture([{ ...ROUTES[1]!, unsure: "send reviews as JSON" } as RouteEntry, ...ROUTES]);
+  const c = await gatewayWith(OPEN, custom.plugin);
+  const r: any = await c.gw.invoke(caller, "svc.request", req("POST", "/v1/repos/o/r/pulls/7/reviews", "event=COMMENT"), program);
+  must(r.error?.message === "send reviews as JSON", `the row's own unsure message: ${JSON.stringify(r)}`);
+});
+
+await check("an answer that cannot be redacted is withheld: the call fails and nothing of the text reaches the result or store", async () => {
+  const f = fixture();
+  f.decl.send = async () => {
+    const headers: Record<string, string> = {};
+    Object.defineProperty(headers, "content-type", { enumerable: true, get() { throw new Error("header getter failed"); } });
+    return { status: 200, headers, text: "ORIGINAL_ANSWER_TEXT" };
+  };
+  const { gw, everything } = await gatewayWith(null, f.plugin);
+  const r: any = await gw.invoke(caller, "svc.request", req("GET", "/v1/x"), program);
+  must(r.status === "failed" && r.error?.message === "the answer could not be redacted, so it was withheld", `the call reads ${JSON.stringify(r)}`);
+  must(!(JSON.stringify(r) + everything()).includes("ORIGINAL_ANSWER_TEXT"), "the answer's text reached the result or the store");
+});
+
+await check("a key row with a body check applies to JSON sent as JSON, and holds the same body sent as text/plain", async () => {
+  const f = fixture();
+  const { gw } = await gatewayWith(COMMENTS_OPEN, f.plugin);
+  const json: any = await gw.invoke(caller, "svc.request", req("POST", "/v1/drafts", '{"draft":true}', { "content-type": "application/json" }), program);
+  must(json.status === "succeeded" && f.sent.length === 1, `the key did not apply to JSON: ${JSON.stringify(json)}`);
+  const text: any = await gw.invoke(caller, "svc.request", req("POST", "/v1/drafts", '{"draft":true}', { "content-type": "text/plain" }), program);
+  must(text.status === "pending" && f.sent.length === 1, `text/plain was not held: ${JSON.stringify(text)}`);
+});
+
+await check("two secrets that overlap in the text are both redacted, and a secret is redacted as a JSON string shows it", async () => {
+  const f = fixture();
+  const quoted = 'pa"ss\\word-123';
+  f.decl.send = async (_ctx, req, io) => {
+    io.used("AAAAAAAAbbbb"); io.used("bbbbCCCCCCCC"); io.used(quoted);
+    return { status: 200, headers: {}, text: req.path === "/v1/a" ? "x AAAAAAAAbbbbCCCCCCCC y" : JSON.stringify({ t: quoted }) };
+  };
+  const { gw } = await gatewayWith(null, f.plugin);
+  const a: any = await gw.invoke(caller, "svc.request", req("GET", "/v1/a"), program);
+  must(a.result.text === "x [redacted] y", `overlap: ${JSON.stringify(a.result.text)}`);
+  const b: any = await gw.invoke(caller, "svc.request", req("GET", "/v1/b"), program);
+  must(b.result.text === '{"t":"[redacted]"}', `JSON-escaped: ${JSON.stringify(b.result.text)}`);
+});
+
+for (const [what, thrown] of [
+  ["a message getter that throws", () => ({ get message(): string { throw new Error(`getter saw ${STORED}`); }, toString() { return `obj ${STORED}`; } })],
+  ["a toString that throws", () => ({ toString(): string { throw new Error(`toString saw ${STORED}`); } })],
+  ["an Error whose message getter throws", () => { const e = new Error("x"); Object.defineProperty(e, "message", { get() { throw new Error(`getter saw ${STORED}`); } }); return e; }],
+] as const) {
+  await check(`a send that throws a value with ${what}: the credential reaches neither the result nor the store`, async () => {
+    const f = fixture();
+    f.decl.send = async () => { throw thrown(); };
+    const { gw, everything } = await gatewayWith(null, f.plugin, { credential: STORED });
+    let r: any;
+    try { r = await gw.invoke(caller, "svc.request", req("GET", "/v1/x"), program); } catch (e) { throw new Error(`it escaped the gateway: ${String((e as Error)?.message)}`); }
+    must(r.status === "failed", `the call reads ${JSON.stringify(r)}`);
+    must(!(JSON.stringify(r) + everything()).includes(STORED), "the credential reached the result or the store");
+  });
+}
+
+await check("a JSON answer that spells a secret with escapes, as a value or a key, holds none once the box parses it", async () => {
+  const f = fixture();
+  const secret = "abcdefgh/1234/ijkl";
+  f.decl.send = async (_ctx, _req, io) => {
+    io.used(secret);
+    return { status: 200, headers: { "content-type": "application/json; charset=utf-8" },
+      text: '{"token":"abcdefgh\\/1234\\/ijkl","k":"\\u0061bcdefgh/1234/ijkl","abcdefgh\\/1234\\/ijkl":1,"n":[1.50]}' };
+  };
+  const { gw } = await gatewayWith(null, f.plugin);
+  const r: any = await gw.invoke(caller, "svc.request", req("GET", "/v1/x"), program);
+  must(!r.result.text.includes("\\/1234"), `the escaped spelling was handed over: ${r.result.text}`);
+  const parsed = JSON.parse(r.result.text);
+  must(!JSON.stringify(parsed).includes(secret) && parsed.token === "[redacted]" && parsed.k === "[redacted]" && parsed["[redacted]"] === 1,
+    `after parsing: ${JSON.stringify(parsed)}`);
+});
+
+await check("a JSON answer that does not parse, and a text answer, are redacted as they stand", async () => {
+  const f = fixture();
+  f.decl.send = async (_ctx, req) => ({ status: 200, headers: { "content-type": req.path === "/v1/a" ? "application/json" : "text/plain" },
+    text: `{"broken": "${STORED}` });
+  const { gw } = await gatewayWith(null, f.plugin, { credential: STORED });
+  for (const path of ["/v1/a", "/v1/b"]) {
+    const r: any = await gw.invoke(caller, "svc.request", req("GET", path), program);
+    must(r.result.text === '{"broken": "[redacted]', `${path}: ${JSON.stringify(r.result.text)}`);
+  }
+});
+
+await check("an error whose message cannot be read leaves only a fixed sentence: no original message, no original field", async () => {
+  const f = fixture();
+  f.decl.send = async () => {
+    const e = Object.assign(new Error("x"), { code: "ORIG_CODE", httpStatus: 418, detail: "ORIG_DETAIL" });
+    Object.defineProperty(e, "message", { get() { throw new Error(`ORIG_GETTER saw ${STORED}`); } });
+    throw e;
+  };
+  const { gw, everything } = await gatewayWith(null, f.plugin, { credential: STORED });
+  const r: any = await gw.invoke(caller, "svc.request", req("GET", "/v1/x"), program);
+  must(r.status === "failed" && r.error?.message === "the request failed, and its error could not be read", `the call reads ${JSON.stringify(r)}`);
+  const kept = JSON.stringify(r) + everything();
+  must(!/ORIG_|\\?"httpStatus\\?":418/.test(kept) && !kept.includes(STORED), `an original field or the message reached the record: ${kept.match(/.{40}(ORIG_|httpStatus).{40}/)?.[0]}`);
+});
+
+await check("a secret that begins with another is redacted whole, longest first", async () => {
+  const f = fixture();
+  const longer = "prefix-token-1-extended-XYZ";
+  f.decl.send = async (_ctx, _req, io) => { io.used(longer); return { status: 200, headers: {}, text: `echo ${longer}` }; };
+  const { gw } = await gatewayWith(null, f.plugin, { credential: "prefix-token-1" });
+  const r: any = await gw.invoke(caller, "svc.request", req("GET", "/v1/x"), program);
+  must(r.result.text === "echo [redacted]", `the longer secret's rest was handed over: ${JSON.stringify(r.result.text)}`);
+});
+
+await check("registration refuses a defaultPolicy decision that is not allow, approval or deny", async () => {
+  for (const defaultPolicy of [{ tools: { "svc.write": "alow" } }, { write: "Deny" }]) {
+    const f = fixture(ROUTES, { defaultPolicy: defaultPolicy as any });
+    let threw = "";
+    try { await gatewayWith(null, f.plugin); } catch (e) { threw = String((e as Error).message); }
+    must(/a decision is allow, approval or deny/.test(threw), `${JSON.stringify(defaultPolicy)} was accepted: ${threw}`);
+  }
+});
+
+await check("the body cap counts UTF-8 bytes: a CJK body of a third of a MiB in characters is past it", async () => {
+  const f = fixture();
+  const { gw, store } = await gatewayWith(null, f.plugin);
+  const over: any = await gw.invoke(caller, "svc.request", req("POST", "/v1/x", "\u4e2d".repeat(349526)), program);
+  must(over.status === "rejected" && over.error?.code === "bad_request" && /bytes as UTF-8, got 1048578/.test(over.error.message),
+    `a 1048578-byte body was taken: ${JSON.stringify(over).slice(0, 200)}`);
+  const under: any = await gw.invoke(caller, "svc.request", req("POST", "/v1/x", "\u4e2d".repeat(349525)), program);
+  must(under.status === "pending", `a 1048575-byte body was refused: ${JSON.stringify(under).slice(0, 200)}`);
+  must((await store.listApprovals("t", "pending")).length === 1, "the refused body was carded");
+});
 
 await check("the mount's credential and a token minted for the request never reach the box: text and header values redacted", async () => {
   const f = fixture();
@@ -371,6 +568,38 @@ await check("the mount's credential and a token minted for the request never rea
   must(!seen.includes(STORED) && !seen.includes(MINTED), `a credential reached the box: ${seen}`);
   must(r.result.text === "bad token [redacted] or [redacted]" && r.result.headers["x-request-id"] === "rq [redacted]", `redaction: ${seen}`);
   must(!("authorization" in r.result.headers) && !("www-authenticate" in r.result.headers), `credential headers reached the box: ${seen}`);
+});
+
+const SESSION = JSON.stringify({ access_token: "access-abcdefgh123", refresh_token: "refresh-ijklmnop456", expires: 3600 });
+for (const [label, credential, hidden] of [
+  ["a bare stored token", STORED, [STORED, MINTED]],
+  ["a stored JSON session", SESSION, ["access-abcdefgh123", "refresh-ijklmnop456", MINTED]],
+] as const) {
+  for (const path of ["/v1/throw", "/v1/throw-string"]) {
+    await check(`a send that throws (${path}) with ${label} and a token it registered: neither reaches the result, the store or the trace`, async () => {
+      const f = fixture();
+      const { gw, everything } = await gatewayWith(null, f.plugin, { credential });
+      const r: any = await gw.invoke(caller, "svc.request", req("GET", path), program);
+      must(r.status === "failed" && /^upstream said: bad token \[redacted\] and \[redacted\]$/.test(r.error?.message ?? ""),
+        `the failure reads ${JSON.stringify(r)}`);
+      const kept = JSON.stringify(r) + "\n" + everything();
+      for (const x of hidden) must(!kept.includes(x), `${x} reached the result, the store or the trace`);
+      // The trace applies its own redaction on top (a token after "token" reads `<redacted>` there); either marker will do.
+      must(/upstream said: bad token [<[]redacted[>\]] and [<[]redacted[>\]]/.test(everything()), "the redacted failure is not on the record");
+      // The error the gateway hands on in place of the plugin's carries nothing else of it: no field, however named.
+      const original = Object.assign(new Error(`bad ${credential}`), { code: "E", httpStatus: 500, retryable: true, original: credential, extra: { credential } });
+      const own = Object.getOwnPropertyNames(redactedError(original, [credential]));
+      must(own.every((k) => ["message", "name", "stack", "code", "httpStatus", "retryable"].includes(k)), `the error carries ${JSON.stringify(own)}`);
+    });
+  }
+}
+
+await check("a stored JSON session's fields are redacted from an answer, not only the whole record", async () => {
+  const f = fixture();
+  f.decl.send = async (ctx) => ({ status: 200, headers: { "x-request-id": "refresh-ijklmnop456" }, text: `token access-abcdefgh123 of ${ctx.credential}` });
+  const { gw } = await gatewayWith(null, f.plugin, { credential: SESSION });
+  const r: any = await gw.invoke(caller, "svc.request", req("GET", "/v1/x"), program);
+  must(r.result.text === "token [redacted] of [redacted]" && r.result.headers["x-request-id"] === "[redacted]", `answer: ${JSON.stringify(r.result)}`);
 });
 
 await check("a credential header is dropped at the answer too, not only at registration: a list changed afterwards", async () => {
@@ -401,6 +630,20 @@ await check("a path with ; or a character outside ASCII is refused", async () =>
     must(r.status === "rejected" && r.error?.code === "bad_request" && /outside printable ASCII/.test(r.error.message), `${path}: ${JSON.stringify(r)}`);
   }
   must(f.sent.length === 0, "one reached send");
+});
+
+await check("a query may carry ; and characters outside ASCII: it takes no part in routing, and reaches send as sent", async () => {
+  const f = fixture();
+  f.decl.normalize = undefined;
+  const { gw } = await gatewayWith(null, f.plugin);
+  for (const path of ["/v1/search?q=a;b", "/v1/search?q=a&sort=desc;x", "/v1/search?q=caf\u00e9"]) {
+    const r: any = await gw.invoke(caller, "svc.request", req("GET", path), program);
+    must(r.status === "succeeded", `${path}: ${JSON.stringify(r)}`);
+  }
+  must(JSON.stringify(f.sent.map((x) => x.path)) === JSON.stringify(["/v1/search?q=a;b", "/v1/search?q=a&sort=desc;x", "/v1/search?q=caf\u00e9"]),
+    `send was handed ${JSON.stringify(f.sent.map((x) => x.path))}`);
+  const r: any = await gw.invoke(caller, "svc.request", req("GET", "/v1/search?q=a b"), program);
+  must(r.status === "rejected" && r.error?.code === "bad_request", `whitespace in a query was taken: ${JSON.stringify(r)}`);
 });
 
 await check("a header with CR or LF, a path past 2048 characters and a body past 1 MiB are refused, and no card keeps them", async () => {

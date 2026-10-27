@@ -92,15 +92,21 @@ Recorded so the design is not read as a description of today:
   `await import("sdk:<alias>")` (or `sdk:<plugin>` where that names one mount), and the SDK's
   `fetch` makes each request **one host call** of `<alias>.request` through the gateway — the same
   policy, approval, operation and trace row, host-call budget and pause on a hold as any tool call.
-  No credential or network is in the box: only `content-type` and `accept` cross from it, and the
-  answer reaches it with the mount's credential redacted and no header that carries one.
-  - The core first refuses a path that names a host, carries a backslash, whitespace, `;`, a
-    percent-escape or anything outside printable ASCII, or has an empty, `.` or `..` segment, and
-    a path past 2048 characters, a body past 1 MiB or a header value with CR or LF; it drops a
-    GET's or HEAD's body.
+  No credential or network is in the box, which is the defence: only `content-type` and `accept`
+  cross from it, no header that carries a credential comes back, and the mount's credential (each
+  field of a stored session) and the tokens `send` names are replaced in the answer, or in the
+  message of a `send` that throws, where they appear (values of 8 or more characters; a JSON
+  answer is parsed, redacted string by string and written out again, so its bytes may differ).
+  - The core first refuses a path that names a host, carries a backslash, whitespace or a control
+    character, or whose path part carries `;`, a percent-escape or anything outside printable
+    ASCII, or has an empty, `.` or `..` segment; a path past 2048 characters; a body past 1 MiB
+    of UTF-8 (CJK text is three bytes a character, so about a third as many characters); and a
+    header value with CR or LF. It drops a GET's or HEAD's body.
   - The plugin's route table then classifies the request, on the path its `normalize` answers
-    (without the query or a trailing slash, case-insensitively) and the body as sent. A body a row
-    checks that is not a JSON object is an unlisted write.
+    (without the query or a trailing slash, case-insensitively) and the body as sent. A row with a
+    body check that cannot judge the body — not sent as JSON (`application/json`, `…+json`), or
+    not a JSON object — refuses it if it is a `refuse` row, and otherwise holds it as an unlisted
+    write.
   - A listed route is decided under its policy key and the bridge tool's own entry, the stricter
     of the two (a key only tightens, `Plugin.policyKey`); an unlisted read follows the mount's read
     policy; an unlisted write is decided under the plugin's `unlistedWriteKey`, at least `approval`

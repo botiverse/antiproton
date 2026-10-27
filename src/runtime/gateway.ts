@@ -11,7 +11,7 @@ import { Backgrounded, Interrupt, interruptsOf } from "../plugins/types.ts";
 import { answerSpecOf } from "./run-js-resume.ts";
 import { keyedOperationId } from "./operation-id.ts";
 import type { PluginErrorFields, ToolSnapshot } from "../plugins/types.ts";
-import { callSideEffects, pluginEnabled, LEASE_KEY, toolsOf, BRIDGE_TOOL, classifyRoute, policyKeyOf, stricter } from "../plugins/types.ts";
+import { callSideEffects, pluginEnabled, LEASE_KEY, toolsOf, BRIDGE_TOOL, classifyRoute, isJsonContentType, policyKeyOf, stricter } from "../plugins/types.ts";
 import type { BridgeDecl, ToolSchema } from "../plugins/types.ts";
 import { admitTools } from "./mount-tools.ts";
 import { isReleased, leaseRow, releasedFacts, toolRefusedRow } from "../trace/seams.ts";
@@ -213,6 +213,7 @@ const RAFT_LOGIN_ALIAS = "raft";
  * a tool's name would make a mount's entry for one setting both: allowing unlisted writes would allow that tool.
  */
 function checkBridge(p: Plugin): void {
+  checkDefaultPolicy(p);
   const b = p.bridge;
   if (!b) return;
   const names = new Set(p.tools.map((t) => t.name));
@@ -232,6 +233,21 @@ function checkBridge(p: Plugin): void {
   }
 }
 
+/**
+ * Refuse a plugin whose `defaultPolicy` names a decision that is not one: `policyFor` compares decisions by strictness,
+ * and a misspelt one (`"alow"`) has none, so it would neither hold nor refuse and read as no default at all.
+ */
+function checkDefaultPolicy(p: Plugin): void {
+  const d = p.defaultPolicy;
+  if (!d) return;
+  const ok = (v: unknown) => v === undefined || v === "allow" || v === "approval" || v === "deny";
+  const bad = [["read", d.read], ["write", d.write], ...Object.entries(d.tools ?? {}).map(([k, v]) => [`tools.${k}`, v])]
+    .filter(([, v]) => !ok(v));
+  if (bad.length) {
+    throw new Error(`plugin ${p.id}'s defaultPolicy names ${bad.map(([k, v]) => `${k}: ${JSON.stringify(v)}`).join(", ")}; a decision is allow, approval or deny`);
+  }
+}
+
 /** Headers the box may send upstream; every other one is dropped, the credential being the plugin's to add. */
 const BRIDGE_REQUEST_HEADERS = new Set(["content-type", "accept"]);
 
@@ -242,13 +258,17 @@ const BRIDGE_REQUEST_HEADERS = new Set(["content-type", "accept"]);
 const NEVER_TO_BOX = new Set(["set-cookie", "set-cookie2", "cookie", "authorization", "proxy-authorization", "www-authenticate", "proxy-authenticate"]);
 
 /**
- * The largest bridged request taken, as String.length: a path of 2048 (the common limit of servers and proxies; a
+ * The largest bridged request taken: a path of 2048 characters (the common limit of servers and proxies; a
  * longer one is not a route anyone listed) and a body of 1 MiB (an API write is JSON, and run_js caps what a program
  * prints at 64 KiB; past this a request is a transfer, the sandbox mount's work). Larger is refused, not cut: a cut
  * request is a different request, and a held one would put a person's signature under bytes nobody shows them.
  */
 const BRIDGE_PATH_MAX = 2048;
-const BRIDGE_BODY_MAX = 1024 * 1024;
+/**
+ * In UTF-8 bytes, unlike the `…Bytes` caps elsewhere (String.length): it bounds what goes over the wire, and a body of
+ * CJK text is three bytes a character, so its limit in characters is about a third of an ASCII body's.
+ */
+const BRIDGE_BODY_MAX_UTF8 = 1024 * 1024;
 
 /** What replaces a mount's credential in an answer before the box reads it (`redact`). */
 export const REDACTED = "[redacted]";
@@ -273,8 +293,10 @@ function bridgeArgs(args: Json): { method: string; path: string; body: string | 
   const path = bridgePath(a.path);
   if (typeof path !== "string") return path.error;
   if (a.body !== undefined && a.body !== null && typeof a.body !== "string") return "a bridged request's body is the text as sent";
-  if (typeof a.body === "string" && a.body.length > BRIDGE_BODY_MAX) {
-    return `a bridged request's body is at most ${BRIDGE_BODY_MAX} characters, got ${a.body.length}`;
+  if (typeof a.body === "string") {
+    // Counted only past the point it could matter: a string of n code units is at most 3n bytes.
+    const bytes = a.body.length * 3 > BRIDGE_BODY_MAX_UTF8 ? new TextEncoder().encode(a.body).length : 0;
+    if (bytes > BRIDGE_BODY_MAX_UTF8) return `a bridged request's body is at most ${BRIDGE_BODY_MAX_UTF8} bytes as UTF-8, got ${bytes}`;
   }
   const method = a.method.toUpperCase();
   const headers: Record<string, string> = {};
@@ -305,12 +327,12 @@ function bridgePath(raw: string): string | { error: string } {
   if (raw.length > BRIDGE_PATH_MAX) return bad(`is at most ${BRIDGE_PATH_MAX} characters`);
   if (!raw.startsWith("/") || raw.startsWith("//")) return bad("starts with one / and names no host");
   if (/[\\\s\u0000-\u001f\u007f]/.test(raw)) return bad("carries no backslash, whitespace or control character");
-  // A matrix parameter (`merge;x`) and a character outside ASCII (a full-width `ｍerge`) are spellings a server may
-  // route as the listed path while a pattern does not see it.
-  if (/[;]|[^\x21-\x7e]/.test(raw)) return bad("carries no ; and nothing outside printable ASCII");
   const noFragment = raw.split("#", 1)[0]!;
   const q = noFragment.indexOf("?");
   const pathPart = q < 0 ? noFragment : noFragment.slice(0, q);
+  // A matrix parameter (`merge;x`) and a character outside ASCII (a full-width `ｍerge`) are spellings a server may
+  // route as the listed path while a pattern does not see it. The path only: the query takes no part in routing.
+  if (/[;]|[^\x21-\x7e]/.test(pathPart)) return bad("carries no ; and nothing outside printable ASCII");
   let decoded: string;
   try { decoded = decodeURIComponent(pathPart); } catch { decoded = ""; }
   if (decoded !== pathPart) return bad("carries no percent-escapes");
@@ -345,12 +367,103 @@ function boxHeaders(decl: BridgeDecl, headers: Record<string, string>, secrets: 
 /**
  * Every occurrence of each secret replaced by REDACTED: an upstream that echoes the token it was sent (an error that
  * quotes the request, a debug header) must not hand it to the box. Values shorter than 8 characters are not matched,
- * since a credential that short is not one and replacing it would rewrite ordinary text.
+ * since a credential that short is not one and replacing it would rewrite ordinary text. Marked, then replaced: a
+ * secret that begins with a shorter one, or overlaps another, would otherwise be cut where the first replacement
+ * ended, and its rest handed over.
  */
 function redact(text: string, secrets: readonly string[]): string {
-  let out = text;
-  for (const s of secrets) if (s.length >= 8) out = out.split(s).join(REDACTED);
+  // Each secret as sent, and as it reads inside a JSON string (a quote or a backslash in it escaped): how an
+  // upstream that quotes it in a JSON body shows it.
+  const forms = new Set<string>();
+  for (const s of secrets) {
+    if (typeof s !== "string" || s.length < 8) continue;
+    forms.add(s);
+    forms.add(JSON.stringify(s).slice(1, -1));
+  }
+  // Every occurrence of every form is marked before anything is replaced, so two secrets that overlap in the text —
+  // one ending where the other begins — are both covered; a run of marked characters becomes one REDACTED.
+  const marked = new Uint8Array(text.length);
+  for (const f of forms) {
+    for (let i = text.indexOf(f); i >= 0; i = text.indexOf(f, i + 1)) marked.fill(1, i, i + f.length);
+  }
+  let out = "";
+  for (let i = 0; i < text.length; i++) {
+    if (!marked[i]) out += text[i];
+    else if (i === 0 || !marked[i - 1]) out += REDACTED;
+  }
   return out;
+}
+
+/**
+ * The values to redact for a stored credential: the whole string, and, when it is JSON (a stored session), every
+ * string in it at any depth, since an upstream echoes the token it was sent, not the record it came from. Every one
+ * counts as a secret, not only the fields that look like one: a session's `token_url` or account name is redacted
+ * too where it appears, and that over-redaction is accepted, a field list being one more thing to keep right.
+ */
+function credentialValues(credential: string | null): string[] {
+  if (typeof credential !== "string") return [];
+  const out = [credential];
+  const walk = (v: unknown): void => {
+    if (typeof v === "string") out.push(v);
+    else if (Array.isArray(v)) v.forEach(walk);
+    else if (v && typeof v === "object") Object.values(v).forEach(walk);
+  };
+  try { walk(JSON.parse(credential)); } catch { /* a bare token */ }
+  return out;
+}
+
+/**
+ * A `send` failure as the box may see it: a fresh error carrying only the redacted message, the code and whether it
+ * may have landed, so that no other path — `String(e)`, its stack, its fields serialised — carries what the plugin's
+ * error held. A thrown non-error is its text.
+ */
+export function redactedError(e: unknown, secrets: readonly string[]): Error {
+  // Total: any throw while reading the thrown value — a getter, a `toString` — ends in a fixed sentence and nothing
+  // else of it, since that throw's own error, and whatever it says, would otherwise pass here unredacted.
+  const unreadable = () => {
+    const out = new Error("the request failed, and its error could not be read");
+    out.stack = `Error: ${out.message}`;
+    return out;
+  };
+  try {
+    const src = (e ?? {}) as Error & PluginErrorFields & { retryable?: boolean };
+    const m = e instanceof Error ? src.message : e;
+    const text = typeof m === "string" ? m : String(m ?? "");
+    const out = new Error(redact(text, secrets)) as Error & PluginErrorFields & { retryable?: boolean };
+    out.stack = `Error: ${out.message}`;
+    const code = src.code, status = src.httpStatus, retryable = src.retryable;
+    if (typeof code === "string") out.code = redact(code, secrets);
+    if (typeof status === "number") out.httpStatus = status;
+    if (retryable === true) out.retryable = true;
+    return out;
+  } catch {
+    return unreadable();
+  }
+}
+
+/**
+ * An answer's text with the secrets taken out. A JSON answer is read and every string in it, key or value, redacted,
+ * then written out again: an escape (`\/`, `\u0061`) spells a secret the text does not contain literally, and the
+ * box will parse it. Written out again means the bytes change — whitespace, numbers as JavaScript spells them, and
+ * integer-like keys moved first — so the box must not rely on upstream's exact text. Text that is not JSON, or does
+ * not parse, is redacted as it stands; the result is redacted as text once more either way.
+ */
+function redactBody(text: string, contentType: string | undefined, secrets: readonly string[]): string {
+  if (isJsonContentType(contentType ?? null)) {
+    let parsed: unknown;
+    let ok = true;
+    try { parsed = JSON.parse(text); } catch { ok = false; }
+    if (ok) {
+      const walk = (v: unknown): unknown => {
+        if (typeof v === "string") return redact(v, secrets);
+        if (Array.isArray(v)) return v.map(walk);
+        if (v && typeof v === "object") return Object.fromEntries(Object.entries(v).map(([k, x]) => [redact(k, secrets), walk(x)]));
+        return v;
+      };
+      return redact(JSON.stringify(walk(parsed)), secrets);
+    }
+  }
+  return redact(text, secrets);
 }
 
 /** What the approval card shows of a held bridged request: method, path, what `describe` names, and a write's body. */
@@ -1096,7 +1209,7 @@ export class ToolGateway {
           refusal = { code: "bad_request", message: String((e as Error)?.message ?? e).slice(0, 300) };
         }
       }
-      const c = route ? classifyRoute(bridge, route.method, routePath(route.path), route.body) : null;
+      const c = route ? classifyRoute(bridge, route.method, routePath(route.path), route.body, route.headers["content-type"] ?? null) : null;
       if (c?.kind === "refused") refusal = { code: "route_refused", message: c.message };
       if (refusal || !c || c.kind === "refused") {
         await this.#store.completeOperation(ctx.tenantId, operationId, "rejected", null, undefined, facts());
@@ -1185,11 +1298,27 @@ export class ToolGateway {
       // upstream status is an answer, so the SDK in the box shapes its own errors from it.
       const req = route;
       return this.#run(ctx, r, plugin, operationId, facts, async (context) => {
-        const res = await bridge.send(context, { method: req.method, path: req.path, body: req.body, headers: { ...req.headers } });
-        // The mount's credential as stored, and what `send` says it derived from it for this request (an access token
-        // minted from a refresh token, a rotated one): the core cannot know the second, so the plugin names it.
-        const secrets = [context.credential, ...(Array.isArray(res.secrets) ? res.secrets : [])].filter((x): x is string => typeof x === "string");
-        return { status: Number(res.status), headers: boxHeaders(bridge, res.headers, secrets), text: redact(String(res.text ?? ""), secrets) };
+        // The mount's credential as stored (each of its fields, when it is a session), and what `send` says the request
+        // carried besides (a token minted from it, a rotated one), which the core cannot know: `used` before it sends,
+        // or `secrets` with the answer.
+        const secrets = credentialValues(context.credential);
+        const io = { used(secret: string) { if (typeof secret === "string") secrets.push(secret); } };
+        let res: Awaited<ReturnType<typeof bridge.send>>;
+        try {
+          res = await bridge.send(context, { method: req.method, path: req.path, body: req.body, headers: { ...req.headers } }, io);
+        } catch (e) {
+          // Redacted here, where it was caught, before anything formats it: what `#run` makes of an error — the
+          // message on the result and the trace row, its code — is read from this one, never from the plugin's.
+          throw redactedError(e, secrets);
+        }
+        // Total: an answer that cannot be redacted is withheld, never handed over as it came.
+        try {
+          if (Array.isArray(res.secrets)) for (const x of res.secrets) io.used(x);
+          const headers = boxHeaders(bridge, res.headers, secrets);
+          return { status: Number(res.status), headers, text: redactBody(String(res.text ?? ""), headers["content-type"], secrets) };
+        } catch {
+          throw new Error("the answer could not be redacted, so it was withheld");
+        }
       }, opts.fromProgram === true);
     }
     // `fromProgram` reaches the plugin as `caller.fromProgram`, so a plugin can tell a program's call from the

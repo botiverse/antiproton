@@ -2609,15 +2609,26 @@ export interface BridgeRequest {
   headers: Record<string, string>;
 }
 
+/**
+ * What the core hands `BridgeDecl.send` besides the request: `used` registers a credential value the request is about
+ * to carry that the core cannot see (a token minted from the stored session), so that whatever comes back — an answer,
+ * or the message of an error `send` throws — has it replaced before the box reads it. Call it before sending: a token
+ * named only in the answer's `secrets` is lost when `send` throws.
+ */
+export interface BridgeIo {
+  used(secret: string): void;
+}
+
 /** What `BridgeDecl.send` answers. Any status is an answer: a 4xx or 5xx reaches the box as a `Response` like a 200. */
 export interface BridgeResponse {
   status: number;
   headers: Record<string, string>;
   text: string;
   /**
-   * Credential values this request used besides the mount's stored one (`PluginContext.credential`, which the core
-   * redacts on its own): a token minted or rotated for it. Each is replaced in the text and the header values before
-   * the box reads them, since an upstream may echo what it was sent.
+   * Every credential value the request carried that the core cannot see: the core redacts the mount's stored
+   * credential on its own (`PluginContext.credential`, and each string field of it when it is a JSON object), and
+   * nothing else. A token minted, rotated or read from elsewhere for this request goes here, or to `BridgeIo.used`
+   * before it is sent, which also covers a `send` that throws. Each is replaced in the text and header values.
    */
   secrets?: readonly string[];
 }
@@ -2630,19 +2641,24 @@ export type RouteEntry = {
   methods: readonly string[];
   path: RegExp;
   /**
-   * Whether the row applies, asked of the body as a JSON object, or null when the request has none. A body that is
-   * present and is not a JSON object — not JSON at all (form-encoded, a byte-order mark before the JSON), an array, a
-   * bare value — is never handed over: the request is an unlisted write, held for a person, since a predicate cannot
-   * say "not this row" about a body it cannot read, and a later, looser row must not take it. A predicate that throws
-   * is held the same way. False on an object moves on to the next row, so the predicate has to be as robust as
+   * Whether the row applies, asked of the body as a JSON object, or null when the request has none. The row cannot
+   * judge a request whose content-type is not JSON (`application/json`, `…+json`; none counts as not), which upstream
+   * reads its own way; nor a body that is not a JSON object (form-encoded, a byte-order mark before the JSON, an
+   * array, a bare value — never handed over); nor one the predicate throws on. Then a `refuse` row refuses — it
+   * refuses whenever it cannot rule the body out — and a `key` row does not apply but holds the request as an
+   * unlisted write; neither passes it to a later, looser row. False on a JSON object sent as JSON moves on, so the predicate has to be as robust as
    * upstream is about spelling — key and value case, aliases — or a spelling it missed reaches a later row.
    */
   body?: (body: { [k: string]: Json } | null) => boolean;
 } & (
   /** Decided under this key and the bridge tool's own entry, the stricter of the two (`Plugin.policyKey`). */
   | { key: string; refuse?: undefined }
-  /** Never run on the bridge, approved or not: the message says what to use instead. */
-  | { refuse: string; key?: undefined }
+  /**
+   * Never run on the bridge, approved or not: the message says what to use instead. `unsure` is what a refusal
+   * says when the row could not judge the body (`body`) rather than matched it — the row's own message would name
+   * a remedy for a request that may not be the one it refuses; absent, UNJUDGED_BODY.
+   */
+  | { refuse: string; unsure?: string; key?: undefined }
 );
 
 /**
@@ -2668,8 +2684,11 @@ export interface BridgeDecl {
    * it names `request`. Must not be the name of a real tool (`ToolGateway` refuses the plugin).
    */
   unlistedWriteKey: string;
-  /** Make the request upstream, adding the mount's credential. A throw is a failed call, which the box sees as a network error. */
-  send(ctx: PluginContext, req: BridgeRequest): Promise<BridgeResponse>;
+  /**
+   * Make the request upstream, adding the mount's credential. A throw is a failed call, which the box sees as a
+   * network error; its message reaches the program redacted as an answer is (`BridgeIo.used`).
+   */
+  send(ctx: PluginContext, req: BridgeRequest, io: BridgeIo): Promise<BridgeResponse>;
   /** The path as upstream will route it (folded, decoded, `..` refused by a throw), before the table is asked. */
   normalize?(path: string): string;
   /** What the approval card names besides method and path. Absent, or a throw: method and path only. */
@@ -2681,6 +2700,15 @@ export interface BridgeDecl {
   responseHeaders?: readonly string[];
 }
 
+/** What a refuse row says when it refused a body it could not judge (`RouteEntry.body`), unless the row says otherwise. */
+export const UNJUDGED_BODY = "the body of this request could not be read as a JSON object, so this route refuses it; " +
+  "send it as a JSON object with content-type: application/json";
+
+/** Whether a content-type says JSON: `application/json`, or `application/<anything>+json`, with any parameters. */
+export function isJsonContentType(contentType: string | null | undefined): boolean {
+  return typeof contentType === "string" && /^application\/(json|[^\s;/]+\+json)\s*(;|$)/i.test(contentType.trim());
+}
+
 /** How a bridge's table decides one request: a listed key, a refusal, or the fail-closed answer for an unlisted one. */
 export type RouteClass =
   | { kind: "listed"; key: string }
@@ -2690,11 +2718,15 @@ export type RouteClass =
 
 /**
  * Classify one request against a bridge's table. `path` is already normalized, without its query or a trailing slash
- * (the gateway's `routePath`), and matched case-insensitively; `body` is as sent.
+ * (the gateway's `routePath`), and matched case-insensitively; `body` is as sent, and `contentType` is how it was sent:
+ * a row with a body check that does not match a body not sent as JSON holds it (`RouteEntry.body`).
  */
-export function classifyRoute(decl: Pick<BridgeDecl, "routes" | "unlistedWriteKey">, method: string, path: string, body: string | null): RouteClass {
+export function classifyRoute(
+  decl: Pick<BridgeDecl, "routes" | "unlistedWriteKey">, method: string, path: string, body: string | null, contentType: string | null = null,
+): RouteClass {
   const m = method.toUpperCase();
   const held: RouteClass = { kind: "unlisted-write", key: decl.unlistedWriteKey };
+  const json = isJsonContentType(contentType);
   // `undefined`: present, and not a JSON object (see `RouteEntry.body`).
   let parsed: { [k: string]: Json } | null | undefined = null;
   if (body !== null) {
@@ -2707,10 +2739,16 @@ export function classifyRoute(decl: Pick<BridgeDecl, "routes" | "unlistedWriteKe
     // Case-insensitive, as upstream routes are (`…/MERGE` is a merge), and never on a `g` or `y` regex's last index.
     if (!row.methods.some((x) => x.toUpperCase() === m) || !new RegExp(row.path.source, row.path.flags.replace(/[gyi]/g, "") + "i").test(path)) continue;
     if (row.body) {
-      if (parsed === undefined) return held;
+      // What a row does with a body it cannot judge: a refusal stays a refusal (holding it would let a mount that
+      // allows unlisted writes run what the row exists to stop), and a key row holds it for a person.
+      const unsure: RouteClass = row.refuse !== undefined ? { kind: "refused", message: row.unsure ?? UNJUDGED_BODY } : held;
+      // A body not sent as JSON is read by upstream some other way, so the predicate's answer — yes or no — is
+      // about a reading upstream may not share: a refuse row refuses, and a key row does not apply but holds.
+      if (!json) return unsure;
+      if (parsed === undefined) return unsure;
       let hit = false;
-      // A predicate that throws on a body it did not expect has not said the row does not apply; held, not skipped.
-      try { hit = row.body(parsed); } catch { return held; }
+      // A predicate that throws on a body it did not expect has not said the row does not apply.
+      try { hit = row.body(parsed); } catch { return unsure; }
       if (!hit) continue;
     }
     return row.refuse !== undefined ? { kind: "refused", message: row.refuse } : { kind: "listed", key: row.key! };
