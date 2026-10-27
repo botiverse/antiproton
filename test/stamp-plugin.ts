@@ -882,6 +882,22 @@ await check("a first seal reported failed after it landed keeps its record", asy
   must(/already given/.test(await refusal(invoke("whoami", {}, readded))), "a removed mount's session was accepted again");
 });
 
+await check("a first seal that fails and then cannot be read back keeps its record", async () => {
+  reset();
+  const { ctx, agentDb } = makeCtx();
+  failNextStoreLate = true;
+  let reads = 0;
+  const blind = { ...ctx, db: { ...ctx.db, async get(store: string, key: string) {
+    // The read before the seal answers; the one after the failed seal does not.
+    if (++reads > 2) throw new Error("read refused by the test");
+    return ctx.db.get(store, key);
+  } } };
+  await refusal(invoke("whoami", {}, blind));
+  must(agentDb!.rows.size === 1, "the record was taken back although the row could not be read to say");
+  const { ctx: readded } = makeCtx(session(), agentDb);
+  must(/already given/.test(await refusal(invoke("whoami", {}, readded))), "a removed mount's session was accepted again");
+});
+
 // A plugin default may tighten a mount's policy, never loosen it: an operator who
 // denied writes did not ask for a card whose one click merges.
 await check("a mount-wide write deny stays a refusal, not an approval", async () => {

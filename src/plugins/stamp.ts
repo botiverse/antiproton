@@ -284,7 +284,7 @@ export async function loadSession(ctx: PluginContext, keep = true): Promise<Agen
     try { await storeSession(ctx, given); } catch (e) {
       let kept: Kept | null = null;
       try { kept = await readKept(ctx); } catch { /* unread: keep the record */ }
-      if (kept?.kind !== "open") {
+      if (kept !== null && kept.kind !== "open") {
         try { await givenDb(ctx).delete(GIVEN_STORE, d); } catch { /* kept: the safe side */ }
       }
       throw e;
