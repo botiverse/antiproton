@@ -67,7 +67,7 @@ globalThis.fetch = (async (input: any, init: any) => {
     refreshes++;
     const presented = String(JSON.parse(init?.body ?? "{}").refresh_token);
     if (spentRefresh.has(presented)) {
-      return new Response(JSON.stringify({ error: "refresh_reused" }), { status: 401, headers: { "content-type": "application/json" } });
+      return new Response(JSON.stringify({ error: "refresh_reused" }), { status: 409, headers: { "content-type": "application/json" } });
     }
     const answer = refreshAnswer();
     if (answer.ok) spentRefresh.add(presented);
@@ -78,8 +78,20 @@ globalThis.fetch = (async (input: any, init: any) => {
   return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 }) as any;
 
+/** An agent-level database (`ctx.agentDb`): what every mount of one agent shares, and what outlives a mount. */
+function makeAgentDb() {
+  const rows = new Map<string, any>();
+  return {
+    rows,
+    async get(store: string, key: string) { return rows.get(`${store}\u0000${key}`) ?? null; },
+    async put(store: string, value: any, key: string) { rows.set(`${store}\u0000${key}`, value); return key; },
+    async delete() {}, async getAll() { return []; }, async getAllFromIndex() { return []; },
+    async count() { return 0; }, async transaction(_s: any, _m: any, fn: any) { return fn(this); },
+  };
+}
+
 /** A mount's database: one store, in memory, so a test can look at what was kept. */
-function makeCtx(credential: string | null = session()) {
+function makeCtx(credential: string | null = session(), agentDb: ReturnType<typeof makeAgentDb> | null = makeAgentDb(), alias = "stamp") {
   const rows = new Map<string, any>();
   const db = {
     async get(store: string, key: string) { return store === SESSION_STORE ? rows.get(key) ?? null : null; },
@@ -94,7 +106,8 @@ function makeCtx(credential: string | null = session()) {
   };
   return {
     rows,
-    ctx: { credential, alias: "stamp", publicConfig: {}, caller: { tenantId: "t", agentId: "a" }, db } as any,
+    agentDb,
+    ctx: { credential, alias, publicConfig: {}, caller: { tenantId: "t", agentId: "a" }, db, ...(agentDb ? { agentDb } : {}) } as any,
   };
 }
 
@@ -283,7 +296,7 @@ await check("a rotation that cannot be stored fails the call and is not used", a
   let threw = "";
   try { await invoke("whoami", {}, ctx); } catch (e) { threw = String((e as Error).message); }
   must(refreshes === 1, `refreshes: ${refreshes}`);
-  must(threw.includes("write refused by the test"), `message: ${threw}`);
+  must(threw.includes("write refused by the test") && /sign in again/.test(threw), `message: ${threw}`);
   // The row is still the one marked before the refresh went out: not the rotation, and not usable.
   must(rows.get("session")?.rotating !== undefined, "the row was not left marked");
   must(/sign in again/.test(await refusal(loadSession(ctx))), "the marked row opened as usable");
@@ -293,7 +306,7 @@ await check("a rotation that cannot be stored fails the call and is not used", a
 await check("refresh_reused is reported as a person's job, and not retried", async () => {
   reset();
   const { ctx } = makeCtx(session({ access_expires_at: new Date(Date.now() - 1000).toISOString() }));
-  refreshAnswer = () => new Response(JSON.stringify({ error: "refresh_reused" }), { status: 401, headers: { "content-type": "application/json" } });
+  refreshAnswer = () => new Response(JSON.stringify({ error: "refresh_reused" }), { status: 409, headers: { "content-type": "application/json" } });
   let threw = "";
   try { await invoke("whoami", {}, ctx); } catch (e) { threw = String((e as Error).message); }
   must(/already used elsewhere|revoked/.test(threw) && threw.includes("refresh_reused"), `message: ${threw}`);
@@ -622,7 +635,7 @@ await check("a refresh whose answer was lost after the gateway rotated is not re
 await check("a token the gateway called spent is not presented by the calls after it", async () => {
   reset();
   const { ctx } = makeCtx(expired());
-  refreshAnswer = () => new Response(JSON.stringify({ error: "refresh_reused" }), { status: 401, headers: { "content-type": "application/json" } });
+  refreshAnswer = () => new Response(JSON.stringify({ error: "refresh_reused" }), { status: 409, headers: { "content-type": "application/json" } });
   const said: string[] = [];
   for (let i = 0; i < 3; i++) {
     try { await invoke("whoami", {}, ctx); said.push("ok"); } catch (e) { said.push(String((e as Error).message).slice(0, 60)); }
@@ -686,6 +699,155 @@ await check("a credential a person gave is still refused after more rotations th
   const before = refreshes;
   const back = await refusal(invoke("whoami", {}, { ...ctx, credential: expired() }));
   must(refreshes === before && /sign-in again/.test(back), `pasted back after 40 rotations: refreshes ${before}→${refreshes}; ${back}`);
+});
+
+// ---- round 3 (cody's review of a9068c8a) ----
+
+// The row goes with its mount (`removeMount`), so a mount removed and added back
+// with the same session JSON finds no row; the agent-level record still knows it.
+await check("a session given to a removed mount is not sealed again by a new one", async () => {
+  reset();
+  const { ctx, agentDb } = makeCtx(expired());
+  refreshAnswer = rotatesTo(40);
+  await invoke("whoami", {}, ctx);
+  must(refreshes === 1, `first mount: ${refreshes}`);
+  const { ctx: again, rows } = makeCtx(expired(), agentDb);
+  const threw = await refusal(invoke("whoami", {}, again));
+  must(sent() === 1, `re-added mount sent a refresh: ${sent()}`);
+  must(/sign-in again/.test(threw) && /already given/.test(threw), `re-added: ${threw}`);
+  must(rows.size === 0, "the re-added mount sealed the old session");
+  // And a credential check of it says so before it is saved.
+  const checked: any = await stampPlugin.checkCredential!(again);
+  must(checked.ok === false && checked.kind === "rejected", `check: ${JSON.stringify(checked)}`);
+});
+
+await check("two stamp mounts of one agent cannot share one session", async () => {
+  reset();
+  const { ctx: one, agentDb } = makeCtx(expired());
+  refreshAnswer = rotatesTo(41);
+  await invoke("whoami", {}, one);
+  const { ctx: two } = makeCtx(expired(), agentDb, "stamp-two");
+  const threw = await refusal(invoke("whoami", {}, two));
+  must(sent() === 1 && /already given/.test(threw), `second mount: refreshes=${sent()}; ${threw}`);
+});
+
+await check("without an agent-level record a credential is not sealed and nothing is sent", async () => {
+  reset();
+  const { ctx, rows } = makeCtx(session(), null);
+  const threw = await refusal(invoke("whoami", {}, ctx));
+  must(/no agent-level record/.test(threw) && seen.length === 0 && rows.size === 0, `${threw}; sent ${seen.length}, rows ${rows.size}`);
+});
+
+// `refresh_expired` will never rotate again: terminal, like `refresh_reused`.
+await check("an expired refresh token is reported once and not presented again", async () => {
+  reset();
+  const { ctx } = makeCtx(expired());
+  refreshAnswer = () => new Response(JSON.stringify({ error: "refresh_expired" }), { status: 409, headers: { "content-type": "application/json" } });
+  const said: string[] = [];
+  for (let i = 0; i < 3; i++) said.push(await refusal(invoke("whoami", {}, ctx)));
+  must(refreshes === 1, `three calls made ${refreshes} refresh requests`);
+  must(said.every((x) => /sign in again/.test(x)), `said: ${JSON.stringify(said)}`);
+});
+
+// `loadSession`'s second read, in the queue: B read "no row" before A sealed and
+// rotated; B must then use A's session, not seal the original over it.
+await check("a first use that read no row before another call sealed and rotated uses the newer session", async () => {
+  reset();
+  const { ctx: a } = makeCtx(expired());
+  refreshAnswer = rotatesTo(42);
+  let open!: () => void;
+  const gate = new Promise<void>((r) => { open = r; });
+  let held = true;
+  const b = { ...a, db: { ...a.db, async get(store: string, key: string) {
+    const v = await a.db.get(store, key);
+    if (held) { held = false; await gate; }
+    return v;
+  } } };
+  const late = invoke("whoami", {}, b);
+  await invoke("whoami", {}, a);
+  must(sent() === 1, `after A: ${sent()}`);
+  open();
+  const threw = await refusal(late);
+  must(threw === "" && sent() === 1 && seen.at(-1)?.auth === "Bearer ACCESS-42", `B: ${threw}; refreshes=${sent()}; sent ${seen.at(-1)?.auth}`);
+});
+
+// A rename while a call is running: the old name's call and the new name's call
+// share one row, so they must share one queue.
+await check("a call under a mount's new name waits for the rotation still running under its old name", async () => {
+  reset();
+  const { ctx: before, rows } = makeCtx(expired());
+  await loadSession(before);
+  let release!: () => void;
+  const held = new Promise<void>((r) => { release = r; });
+  refreshAnswer = rotatesTo(43);
+  const inner = globalThis.fetch as any;
+  let first = true;
+  globalThis.fetch = (async (input: any, init: any) => {
+    if (first && String(input).includes("/api/auth/agent/refresh")) { first = false; await held; }
+    return inner(input, init);
+  }) as any;
+  try {
+    const old = refusal(invoke("whoami", {}, before));
+    await new Promise((r) => setTimeout(r, 10));
+    const renamed = { ...before, alias: "stamp-renamed", db: { ...before.db, rows } };
+    const now = refusal(invoke("whoami", {}, renamed));
+    await new Promise((r) => setTimeout(r, 10));
+    release();
+    const [x, y] = [await old, await now];
+    must(x === "" && y === "", `old: ${x}; new: ${y}`);
+    must(sent() === 1 && seen.at(-1)?.auth === "Bearer ACCESS-43", `refreshes=${sent()}, sent ${seen.at(-1)?.auth}`);
+  } finally { globalThis.fetch = inner; }
+});
+
+// `api` is not a way around the hold on pr_approve and pr_merge.
+await check("api refuses the approve and merge routes, however they are spelled", async () => {
+  reset();
+  const { ctx } = makeCtx();
+  const held: Array<[string, string, unknown?]> = [
+    ["POST", "/v1/repositories/o/r/pulls/7/approve"],
+    ["PUT", "/v1/repositories/o/r/pulls/7/merge"],
+    ["PUT", "/v1/repositories/o/r/pulls/7/auto-merge/"],
+    ["PUT", "/v1/repositories/o/r/pulls/7/MERGE"],
+    ["PUT", "/api/v3/repos/o/r/pulls/7/merge"],
+    ["PUT", "/api/v3/repos/o/r/pulls/7/%6derge"],
+    ["POST", "/api/v3/repos/o/r/merges"],
+    ["POST", "/api/v3/repos/o/r/pulls/7/reviews", { event: "APPROVE" }],
+    ["POST", "/api/v3/repos/o/r/pulls/7/reviews/9/events", { event: "approve" }],
+  ];
+  for (const [method, path, body] of held) {
+    const threw = await refusal(invoke("api", { method, path, body }, ctx));
+    must(/goes through pr_(approve|merge), not api/.test(threw), `${method} ${path}: ${threw}`);
+  }
+  must(seen.length === 0, `reached the gateway: ${JSON.stringify(seen.map((x) => x.path))}`);
+  // Not every write under a pull request is held: a comment review is not an approval.
+  const ok = await refusal(invoke("api", { method: "POST", path: "/api/v3/repos/o/r/pulls/7/reviews", body: { event: "COMMENT" } }, ctx));
+  must(!/not api/.test(ok), `a comment review was refused: ${ok}`);
+});
+
+// Through the real gateway and store: the agent-level record is handed to a
+// call and to a credential check, and a removed mount does not take it along.
+await check("through the gateway, a mount removed and added back with the same session is refused", async () => {
+  reset();
+  const store = new SqliteStore(":memory:");
+  await store.init();
+  await store.createAgent("t", "a");
+  const add = () => store.addMount({
+    tenantId: "t", agentId: "a", alias: "stamp", plugin: "stamp", installationId: "i", connectionId: null,
+    toolVersion: stampPlugin.version, publicConfig: {}, secretRef: "agent:stamp", policy: null,
+  });
+  await add();
+  const credential = session();
+  const gw = new ToolGateway(store, [stampPlugin], new Set(["stamp"]), { async resolve() { return credential; } });
+  const caller = { tenantId: "t", agentId: "a", taskId: "k" };
+  const first: any = await gw.invoke(caller, "stamp.whoami", {});
+  must(first.status === "succeeded", `first: ${JSON.stringify(first)}`);
+  must(await store.removeMount("t", "a", "stamp", null), "the mount was not removed");
+  await add();
+  seen = [];
+  const again: any = await gw.invoke(caller, "stamp.whoami", {});
+  must(again.status !== "succeeded" && /already given/.test(JSON.stringify(again)) && seen.length === 0, `re-added: ${JSON.stringify(again)}`);
+  const checked: any = await gw.checkMount("t", "a", "stamp", credential);
+  must(JSON.stringify(checked).includes("already given"), `check: ${JSON.stringify(checked)}`);
 });
 
 // A plugin default may tighten a mount's policy, never loosen it: an operator who

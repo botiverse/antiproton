@@ -466,6 +466,21 @@ export interface PluginContext {
    */
   db: PluginDatabase;
   /**
+   * The plugin's database for this agent rather than this mount: the same
+   * declaration (`Plugin.database`), shared by every mount of the plugin, and
+   * kept when a mount is removed or renamed — `db` is deleted with its mount
+   * and moves with a rename. For what must outlive one mount: stamp keeps here
+   * which sessions a person has already given this agent, so one removed and
+   * pasted into a new mount is not presented again.
+   *
+   * Never another agent's, another tenant's or another plugin's. Set on the
+   * contexts the gateway builds for a mount's calls and for a credential check
+   * (`#contextFor`, `#credentialContext`); absent elsewhere (a prompt
+   * contribution, usage, a diagnosis). A plugin that needs it treats absence as
+   * a refusal, never as "nothing kept".
+   */
+  agentDb?: PluginDatabase;
+  /**
    * This mount's inbound hooks. Present only for a plugin that implements
    * `receive`, on a deployment that can take pushed events.
    *

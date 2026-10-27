@@ -16,6 +16,7 @@ import { admitTools } from "./mount-tools.ts";
 import { isReleased, leaseRow, releasedFacts, toolRefusedRow } from "../trace/seams.ts";
 import { PLUGIN_TRACE_KINDS } from "../trace/outbox.ts";
 import { openPluginDatabase } from "./plugin-db.ts";
+import { AGENT_SCOPE_ALIAS } from "../store/plugin-db.ts";
 import { payerKey, toolCallRows } from "../usage/outbox.ts";
 
 /** One mount's answer to a plugin hook the runtime called (`ToolGateway.afterTurn`, `wake`). */
@@ -1236,6 +1237,22 @@ export class ToolGateway {
   }
 
   /**
+   * The plugin's agent-level database (`PluginContext.agentDb`): the same
+   * declaration, filed under `AGENT_SCOPE_ALIAS` instead of the mount's alias,
+   * so every mount of the plugin shares it and no mount's removal or rename
+   * reaches it. Never another plugin's or another agent's: the scope is the
+   * same four columns as a mount's.
+   */
+  #agentDb(ctx: { tenantId: string; agentId: string }, mount: MountRecord, lease?: Lease) {
+    return openPluginDatabase(
+      this.#store.pluginDb,
+      { tenantId: ctx.tenantId, agentId: ctx.agentId, alias: AGENT_SCOPE_ALIAS, plugin: mount.plugin },
+      this.#plugins.get(mount.plugin)?.database,
+      lease ? { lease } : {},
+    );
+  }
+
+  /**
    * What a plugin is handed for one of this agent's mounts. One construction
    * for the call and for everything that comes back to the same work later —
    * a poll or a cancel sees exactly the context the call saw, credential
@@ -1279,6 +1296,8 @@ export class ToolGateway {
       // Scoped to the mount, not the plugin: two accounts of the same service
       // must never see each other's session.
       db: db(mount),
+      // Scoped to the agent and the plugin, for what must outlive one mount.
+      agentDb: this.#agentDb(ctx, mount, lease),
       // A mount's own hooks, and only for a plugin that can take what they carry.
       ...(this.#inbound && plugin?.receive
         ? { inbound: this.#inbound(ctx.tenantId, ctx.agentId, mount.alias) } : {}),
@@ -1739,6 +1758,7 @@ export class ToolGateway {
       caller: { tenantId, agentId, taskId: "credential-check" },
       alias: mount.alias,
       credential, publicConfig: mount.publicConfig, db: this.#db({ tenantId, agentId }, mount),
+      agentDb: this.#agentDb({ tenantId, agentId }, mount),
       async sibling() { return null; },
       async sandboxForms() { return []; },
       async agentSecret() { return null; },

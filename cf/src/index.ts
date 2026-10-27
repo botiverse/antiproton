@@ -1773,7 +1773,11 @@ export class AgentDO extends DurableObject<Env> {
       // what it is instead of which plugin it is: the containers panel picks
       // "container" without ever naming the plugin that declares it.
       mounts: rows("SELECT alias, plugin, tool_version, public_config, secret_ref, policy FROM mounts WHERE tenant_id=? AND agent_id=?",
-        tenantId, agentId).map((m) => ({ ...m, provides: rt.plugins().find((p) => p.id === m.plugin)?.provides ?? [] })),
+        tenantId, agentId).map((m) => {
+          const plugin = rt.plugins().find((p) => p.id === m.plugin);
+          // The plugin's own holds, so a mount with no policy of its own is not shown as open when it is not.
+          return { ...m, provides: plugin?.provides ?? [], ...(plugin?.defaultPolicy ? { default_policy: JSON.stringify(plugin.defaultPolicy) } : {}) };
+        }),
       // Per (mount, plugin, store): how many keys and when the last changed.
       // Never a key or a value: which keys may be named is the plugin's
       // declaration (`listed`), read by the diagnosis, not by this page.

@@ -260,6 +260,21 @@ come back `unknown`: verify the shape and fail to empty, because the data
 outlives the code that wrote it. The full rules are on `DbSpec` in
 `src/plugins/types.ts`.
 
+**What must outlive one mount goes in `ctx.agentDb`.** The same declaration,
+opened for the agent instead of the mount: every mount of your plugin on that
+agent shares it, and removing or renaming a mount never touches it (`ctx.db` is
+deleted with its mount and moves with a rename). It is still one agent's, one
+tenant's and one plugin's — the rows are filed under a reserved alias that no
+mount can take (`AGENT_SCOPE_ALIAS`, `src/store/plugin-db.ts`), and the
+operator's storage page shows them as agent-level. The gateway hands it to a
+mount's calls and to a credential check; it is absent elsewhere (a prompt
+contribution, usage, a diagnosis), and a plugin that needs it must treat
+absence as a refusal, not as "nothing kept". Like a mount's rows, these stay
+when the agent is deleted: a deleted agent's object is kept as a record. Stamp
+uses it to remember every session a person has given the agent, so one pasted
+into a new mount after the old one was removed is refused instead of presented
+again (`test/stamp-plugin.ts`, `test/plugin-db.ts`).
+
 **The version is a pin.** Mounts record the registry's `version`, and the
 gateway refuses a call when a mount's pin and the registry disagree. Only raise
 the version, never lower it. Removing a plugin id makes every existing mount of

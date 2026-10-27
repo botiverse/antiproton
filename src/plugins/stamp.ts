@@ -89,7 +89,7 @@ function needsRefresh(session: AgentSession, now: number, skewMs: number): boole
 }
 
 /**
- * One queue per mount for everything that writes its session: sealing the
+ * One queue for everything that writes a stamp mount's session: sealing the
  * credential on first use, and each rotation. A refresh token is single-use, so
  * two calls that both rotated would make one of them `refresh_reused` — which
  * revokes every token that agent holds — and sharing one rotation in flight is
@@ -127,29 +127,29 @@ async function exclusive<T>(ctx: PluginContext, fn: () => Promise<T>): Promise<T
  * - `spent`: a row that descends from this credential's session and no longer
  *   opens — it is damaged, or the key it was sealed under is gone. Its refresh
  *   token may have been used already, so nothing is sent with it.
+ * - `unfinished`: the row opens, but to a session whose rotation was started and
+ *   never finished (`rotating`, below). The gateway may have rotated it already
+ *   and the answer never been kept, so its refresh token is treated as spent.
  *
  * A row that does not open is told apart by `from`, kept beside the ciphertext:
  * a digest of the refresh token of the credential it descends from. A row
  * without one reads as `spent`, since the safe guess is the one that sends
- * nothing. Beside it, `spent` lists digests of every refresh token this mount
- * has rotated away from, so a spent session pasted back after another one is
- * still recognised, and `given` lists digests of every credential a person has
- * given this mount.
- * - `unfinished`: the row opens, but to a session whose rotation was started and
- *   never finished (`rotating`, below). The gateway may have rotated it already
- *   and the answer never been kept, so its refresh token is treated as spent.
+ * nothing — that includes every row #1045 wrote, renamed or not; removing the
+ * mount deletes it, and a new mount with a fresh sign-in starts clean. A
+ * credential is `replaced` only when no mount of this agent has been given it
+ * before (`GIVEN_STORE`).
  */
-type Kept = ({ kind: "none" } | { kind: "open"; session: AgentSession } | { kind: "spent" } | { kind: "replaced" } | { kind: "unfinished" }) & Lists;
-type Lists = { spent: string[]; given: string[] };
+type Kept = { kind: "none" } | { kind: "open"; session: AgentSession } | { kind: "spent" } | { kind: "replaced" } | { kind: "unfinished" };
 
 /**
- * How many rotated-away refresh tokens a row remembers. Capped because a rotation
- * every quarter hour would otherwise grow the row without end; what may not fall
- * off is a credential a person gave, since that is the one that can be pasted
- * back, so those are kept apart in `given` and never dropped. `given` grows only
- * when a person signs in again.
+ * Every session a person has given this agent's stamp mounts, by the digest of
+ * its refresh token, in the agent-level database (`ctx.agentDb`): kept when a
+ * mount is removed or renamed, and shared by every stamp mount of the agent.
+ * Written before a credential is first sealed, so a session that has ever been
+ * used here — by a removed mount, by another mount — is refused rather than
+ * presented again. Grows only when a person signs in.
  */
-const SPENT_KEPT = 32;
+const GIVEN_STORE = "stampGiven";
 
 /** A refresh token as a row may name it: a digest, never the token. */
 async function digest(refreshToken: string): Promise<string> {
@@ -182,20 +182,30 @@ async function readKept(ctx: PluginContext): Promise<Kept> {
     throw new Error(`stamp: could not read this mount's session (${String((e as Error)?.message ?? e).slice(0, 200)}). ` +
       "It is not replaced by the one the mount was given, whose refresh token may already be spent; try again.");
   }
-  if (row === null || row === undefined) return { kind: "none", spent: [], given: [] };
+  if (row === null || row === undefined) return { kind: "none" };
   const sealed = typeof row === "object" && !Array.isArray(row) ? row as Record<string, unknown> : {};
-  const strings = (v: unknown) => Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
-  const lists = { spent: strings(sealed.spent), given: strings(sealed.given) };
   if (typeof sealed.iv === "string" && typeof sealed.ciphertext === "string") {
     const plain = await openText(sealPlace(ctx), SEAL_INFO, { iv: sealed.iv, ciphertext: sealed.ciphertext }, SESSION_KEY);
     const s = plain === null ? null : parseSession(plain);
-    if (s && typeof sealed.rotating === "string" && sealed.rotating === await digest(s.refresh_token)) return { kind: "unfinished", ...lists };
-    if (s) return { kind: "open", session: s, ...lists };
+    if (s && typeof sealed.rotating === "string" && sealed.rotating === await digest(s.refresh_token)) return { kind: "unfinished" };
+    if (s) return { kind: "open", session: s };
   }
   const from = await lineage(ctx.credential);
-  const fresh = typeof sealed.from === "string" && from !== null && sealed.from !== from &&
-    !lists.spent.includes(from) && !lists.given.includes(from);
-  return { kind: fresh ? "replaced" : "spent", ...lists };
+  const fresh = typeof sealed.from === "string" && from !== null && sealed.from !== from && !(await wasGiven(ctx, from));
+  return { kind: fresh ? "replaced" : "spent" };
+}
+
+/** The agent-level record, or a refusal: without it a removed mount's session would look new. */
+function givenDb(ctx: PluginContext) {
+  if (!ctx.agentDb) {
+    throw new Error("stamp: this context keeps no agent-level record of the sessions this agent was given, so a new one " +
+      "cannot be told from one already used; nothing was sent");
+  }
+  return ctx.agentDb;
+}
+async function wasGiven(ctx: PluginContext, d: string): Promise<boolean> {
+  const row = await givenDb(ctx).get(GIVEN_STORE, d);
+  return row !== null && row !== undefined;
 }
 
 /** A mount whose kept session is lost: what it was given may be spent, so only a person can go on. */
@@ -210,6 +220,12 @@ const unfinishedRotation = () => new SpentSession(
   "stamp: a person needs to sign in again for this mount: its last refresh did not finish, so the gateway may have " +
   "rotated the session without this side keeping the new one. Nothing was sent — presenting that refresh token again " +
   "makes Stamp revoke every token this agent holds, on every machine. A person signs in for this mount alone and gives it that session.",
+);
+/** A credential some mount of this agent was already given: it may have been rotated, so it is never sealed again. */
+const givenBefore = () => new SpentSession(
+  "stamp: this session was already given to this agent — to a mount since removed, or to another stamp mount — and may " +
+  "have been refreshed there, which spends it; presenting it would make Stamp revoke every token this agent holds. " +
+  "It needs sign-in again: a person signs in for this mount alone and gives it that new session.",
 );
 const refuseUnusable = (kept: Kept) => {
   if (kept.kind === "spent") throw spentSession();
@@ -235,10 +251,20 @@ const refuseUnusable = (kept: Kept) => {
 export async function loadSession(ctx: PluginContext, keep = true): Promise<AgentSession | null> {
   const given = parseSession(ctx.credential);
   if (!given) return null;
-  const kept = await readKept(ctx);
+  let kept = await readKept(ctx);
+  // A mark read outside the queue may be a rotation still running here: wait
+  // for it, then read again. A mark still there inside the queue is one nobody
+  // here is finishing.
+  if (kept.kind === "unfinished") kept = await exclusive(ctx, () => readKept(ctx));
   if (kept.kind === "open") return kept.session;
   refuseUnusable(kept);
-  if (!keep) return given;
+  const d = await digest(given.refresh_token);
+  // Asked here only for a check; a call asks in the queue, after the read that
+  // sees a seal another call made since the read above.
+  if (!keep) {
+    if (await wasGiven(ctx, d)) throw givenBefore();
+    return given;
+  }
   // Read again in the queue: another call may have sealed it, and rotated it,
   // since the read above, and sealing `given` over that would bring the spent
   // token back.
@@ -246,7 +272,11 @@ export async function loadSession(ctx: PluginContext, keep = true): Promise<Agen
     const again = await readKept(ctx);
     if (again.kind === "open") return again.session;
     refuseUnusable(again);
-    await storeSession(ctx, given, again);
+    if (await wasGiven(ctx, d)) throw givenBefore();
+    // Recorded before it is sealed: a seal that fails after this costs a sign-in,
+    // a record that never happened would let a removed mount's session back in.
+    await givenDb(ctx).put(GIVEN_STORE, { at: new Date().toISOString() }, d);
+    await storeSession(ctx, given);
     return given;
   });
 }
@@ -256,11 +286,9 @@ export async function loadSession(ctx: PluginContext, keep = true): Promise<Agen
  * the digest of the refresh token about to be presented, written before it is:
  * a row that still carries it afterwards reads as `unfinished`.
  */
-async function storeSession(ctx: PluginContext, session: AgentSession, lists: Lists, rotating?: string): Promise<void> {
+async function storeSession(ctx: PluginContext, session: AgentSession, rotating?: string): Promise<void> {
   const sealed = await sealText(sealPlace(ctx), SEAL_INFO, JSON.stringify(session), SESSION_KEY);
-  const from = await lineage(ctx.credential);
-  const given = from === null || lists.given.includes(from) ? lists.given : [...lists.given, from];
-  const row = { ...sealed, from, spent: lists.spent.slice(-SPENT_KEPT), given, ...(rotating ? { rotating } : {}) };
+  const row = { ...sealed, from: await lineage(ctx.credential), ...(rotating ? { rotating } : {}) };
   await ctx.db.put(SESSION_STORE, row as unknown as Json, SESSION_KEY);
 }
 
@@ -289,7 +317,7 @@ async function rotate(ctx: PluginContext, used: AgentSession): Promise<AgentSess
     // rotate clears it; every other end leaves it for a person, the side that
     // sends nothing. If the mark cannot be written, nothing is sent at all.
     const marking = await digest(used.refresh_token);
-    await storeSession(ctx, used, kept, marking);
+    await storeSession(ctx, used, marking);
 
     let res: Response;
     let text: string;
@@ -313,12 +341,14 @@ async function rotate(ctx: PluginContext, used: AgentSession): Promise<AgentSess
     if (!res.ok) {
       const code = String(body.error ?? body.code ?? body.errorCode ?? "");
       // Not retried, and said in the only terms that help: somebody has to act.
-      // The mark stays: the gateway has said this token is spent.
-      if (code === "refresh_reused" || code === "refresh_revoked") {
-        throw new Error(
-          `stamp: this session's refresh token was already used elsewhere or has been revoked (${code}), and the gateway ` +
-          "revokes every token that agent holds for the service when that happens — including other machines. " +
-          "A person needs to sign in again for this mount alone and give it that session; do not retry.",
+      // The mark stays: the gateway has said this token is spent, or will never rotate again.
+      if (code === "refresh_reused" || code === "refresh_revoked" || code === "refresh_expired") {
+        throw new Error(code === "refresh_expired"
+          ? "stamp: this session's refresh token has expired (refresh_expired), so it can never be refreshed again. " +
+            "A person needs to sign in again for this mount alone and give it that session; do not retry."
+          : `stamp: this session's refresh token was already used elsewhere or has been revoked (${code}), and the gateway ` +
+            "revokes every token that agent holds for the service when that happens — including other machines. " +
+            "A person needs to sign in again for this mount alone and give it that session; do not retry.",
         );
       }
       const said = `stamp: could not refresh the session (${res.status}${code ? ` ${code}` : ""}) — ` +
@@ -331,7 +361,7 @@ async function rotate(ctx: PluginContext, used: AgentSession): Promise<AgentSess
         throw new Error(`${said}. The gateway may have rotated the session before failing, so this mount will not ` +
           "present that refresh token again: a person needs to sign in again for this mount alone and give it that session.");
       }
-      await storeSession(ctx, used, kept);
+      await storeSession(ctx, used);
       throw new Error(said);
     }
 
@@ -344,7 +374,11 @@ async function rotate(ctx: PluginContext, used: AgentSession): Promise<AgentSess
 
     // Before it is used, always: a rotation that cannot be kept would leave the
     // caller holding a token the next call cannot rotate again.
-    await storeSession(ctx, next, { spent: [...kept.spent, marking], given: kept.given });
+    try { await storeSession(ctx, next); } catch (e) {
+      throw new Error(`stamp: the gateway rotated this mount's session, but the new one could not be kept ` +
+        `(${String((e as Error)?.message ?? e).slice(0, 200)}). The refresh token this mount holds is now spent, so it ` +
+        "will not be sent again: a person needs to sign in again for this mount alone and give it that session.");
+    }
     return next;
   });
 }
@@ -470,6 +504,27 @@ function gatewayPath(raw: unknown, allowed: readonly string[]): string {
   return url.pathname + url.search;
 }
 
+/**
+ * What `api` must not do, because a dedicated tool does it and that tool is held
+ * for a person by default (`defaultPolicy`): a mount that lifted `api` for some
+ * other write would otherwise approve or merge through it. Matched on the path
+ * as Stamp will route it — decoded, without a trailing slash, any case — so a
+ * spelling that reaches the same route is the same route. Null: not held.
+ */
+function heldRoute(path: string, body: unknown): "an approval" | "a merge" | null {
+  let p = path.split("?", 1)[0];
+  try { p = decodeURIComponent(p); } catch { /* gatewayPath already refused what would matter */ }
+  p = p.replace(/\/+$/, "").toLowerCase();
+  if (/^\/v1\/repositories\/[^/]+\/[^/]+\/pulls\/[^/]+\/approve$/.test(p)) return "an approval";
+  if (/^\/v1\/repositories\/[^/]+\/[^/]+\/pulls\/[^/]+\/(merge|auto-merge|queue)$/.test(p)) return "a merge";
+  if (/^\/api\/v3\/repos\/[^/]+\/[^/]+\/(pulls\/[^/]+\/merge|merges)$/.test(p)) return "a merge";
+  if (/^\/api\/v3\/repos\/[^/]+\/[^/]+\/pulls\/[^/]+\/reviews(\/[^/]+\/events)?$/.test(p)) {
+    const event = body && typeof body === "object" ? String((body as Record<string, unknown>).event ?? "") : "";
+    if (event.toUpperCase() === "APPROVE") return "an approval";
+  }
+  return null;
+}
+
 /** A path segment from an argument: a name, never `.` or `..`, which `URL` would resolve. */
 const NAME = /^(?!\.\.?$)[A-Za-z0-9._-]+$/;
 
@@ -579,7 +634,7 @@ export const stampPlugin: Plugin = {
    * The rotating session. Not `listed`: it exists, and that it exists is
    * listable, never what is in it.
    */
-  database: { version: 1, stores: { [SESSION_STORE]: {} } },
+  database: { version: 2, stores: { [SESSION_STORE]: {}, [GIVEN_STORE]: {} } },
   credential: {
     required: true,
     summary: "A Stamp agent session: the JSON `stamp login` keeps (access_token, refresh_token, access_expires_at), signed in for this mount alone.",
@@ -858,7 +913,13 @@ export const stampPlugin: Plugin = {
         if (!["POST", "PATCH", "PUT", "DELETE"].includes(method)) {
           throw new Error(`method must be one of POST, PATCH, PUT, DELETE, got ${JSON.stringify(method).slice(0, 20)}`);
         }
-        return (await call(method, gatewayPath(a.path, API_PREFIXES), ctx, a.body)) as Json;
+        const path = gatewayPath(a.path, API_PREFIXES);
+        const held = heldRoute(path, a.body);
+        if (held) {
+          throw new Error(`stamp: ${held} goes through ${held === "a merge" ? "pr_merge" : "pr_approve"}, not api — ` +
+            "that is the tool a person signs for this mount, and api would be a way around it");
+        }
+        return (await call(method, path, ctx, a.body)) as Json;
       }
 
       default:
