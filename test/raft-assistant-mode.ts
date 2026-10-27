@@ -602,6 +602,31 @@ await check("a context read that changes the owner record writes one raft.assist
   for (const secret of [OWNER, "ada"]) must(!show(rows(a)).includes(secret), `a row carries ${secret}: ${show(rows(a))}`);
 });
 
+await check("a paused assistant's recheck that un-pauses writes a raft.assistant_owner row with via recheck; a context naming no owner drops the record with one dropped row, and a second such read writes none", async () => {
+  const rows = (a: { traced: any[] }) => a.traced.filter((t) => t.kind === "raft.assistant_owner");
+  const a = await assistant(raft({ language: "zh-CN", dm: "dm:@ada~human" }));
+  // 403 assistant_not_enabled pauses (`pauseOn`, which writes no row); the next notify asks Raft's context again.
+  a.r.inbox = 403;
+  await raftPlugin.invoke("assistant_owner_inbox", {}, a.ctx).then(() => null, (e) => e);
+  must(typeof a.read(ASSISTANT_STORE, OWNER_KEY).pausedAt === "number", "control: paused");
+  const before = rows(a).length;
+  a.r.inbox = 200;
+  const resumed = await atTime(DAY, () => notify(a.ctx, { items: ITEMS }));
+  must(resumed.state === "sent" && a.read(ASSISTANT_STORE, OWNER_KEY).pausedAt === null, `control: un-paused: ${show(resumed)}`);
+  const rechecked = rows(a).slice(before);
+  must(rechecked.length === 1 && rechecked[0].status === "kept" && rechecked[0].attrs.via === "recheck" && rechecked[0].attrs.first === false &&
+    rechecked[0].attrs.language === "zh-CN" && rechecked[0].attrs.language_changed === false, `the recheck: ${show(rechecked)}`);
+  // The context names no owner: the record goes, with one row that carries only how it was read.
+  a.r.owner = false;
+  const kept = rows(a).length;
+  await raftPlugin.snapshotTools!(a.ctx);
+  must(a.read(ASSISTANT_STORE, OWNER_KEY) === undefined, `control: dropped: ${show(a.read(ASSISTANT_STORE, OWNER_KEY))}`);
+  const dropped = rows(a).slice(kept);
+  must(dropped.length === 1 && dropped[0].status === "dropped" && dropped[0].verdict === "ok" && show(dropped[0].attrs) === show({ via: "listing" }), `dropped: ${show(dropped)}`);
+  await raftPlugin.snapshotTools!(a.ctx);
+  must(rows(a).length === kept + 1, `a second read with no owner: ${show(rows(a).slice(kept))}`);
+});
+
 await check("the owner's chat is told to write to them in Raft's language, else in their latest message's; a send as them keeps the conversation's, in every case, and both give way to the owner", async () => {
   const secret = "push-secret-0123456789";
   const DM = { target: "dm:@ada", channelType: "dm", pendingCount: 1, latestSenderName: "ada", latestSenderType: "human", flags: [] };
