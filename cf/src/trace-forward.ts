@@ -311,7 +311,7 @@ const counts = (names: readonly string[]): Record<string, readonly [Source, Fiel
  * it). Attrs written that the receiver has no field for, so not sent: tool.refused's `task`, a wake's `inbox_lagging`,
  * `rules_total`, `person_rule_unenforced`, `quiet_custom` and the legacy check's other rule counts (`muted_<scope>`,
  * `own_dm`, `anytime_night`, `default_chatter`, `chatter_unfiltered`), turn_ended's `snapshotMismatches`, a send as the
- * owner's `resolved_by`, `rows_read`, `pages_read` and `bound_hit`.
+ * owner's `resolved_by`, `rows_read`, `pages_read`, `bound_hit` and `resolve_status`.
  *
  * An id-typed field carries an opaque id or a name from code or configuration (a tool's, a model's, a mount's TYPE), never a
  * name a person or a conversation has: where the receiver takes `id` or `code` and this side knows the vocabulary, the

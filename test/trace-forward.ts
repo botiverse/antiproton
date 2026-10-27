@@ -782,6 +782,21 @@ await check("the new kinds' fields hold their shapes: a check id, a decision id,
   must(!e.requests.map((q) => q.text).join("").includes("alice") && !e.requests.map((q) => q.text).join("").includes("Alice"), "a name was sent");
 });
 
+await check("a send as the owner's resolution attrs stay local: resolved_by, rows_read, pages_read, bound_hit and resolve_status are not forwarded", async () => {
+  // The forwarder picks attrs by key name alone, so staying local is a property of these names: a rename to a listed key,
+  // or adding them to the kind's fields, sends them.
+  const { sql } = sqliteHost(); const e = routes();
+  withMounts(sql, [["assistant", "raft"]]);
+  const local = { resolved_by: "inbox", rows_read: 240, pages_read: 5, bound_hit: false, resolve_status: 404 };
+  appendTrace(sql, [{ at: T0 + 1, ...OWNER, kind: "raft.assistant_send_as_owner", spanId: "mount:assistant", status: "failed", verdict: "failed",
+    attrs: { mount: "assistant", result: "failed", target_kind: "channel", in_thread: false, chars: 3, http_status: 400, ...local } }]);
+  await lanePass(sql, e);
+  const [so] = traced(e);
+  must(so?.result === "failed" && so.target_kind === "channel" && so.http_status === 400 && so.chars === 3, `control: the listed fields went: ${JSON.stringify(so)}`);
+  const sent = Object.keys(local).filter((k) => k in so!);
+  must(!sent.length, `forwarded: ${sent} in ${JSON.stringify(so)}`);
+});
+
 await check("an agent.trace row carries the envelope and its kind's fields, nothing else, and no free text", async () => {
   const { sql } = sqliteHost(); const e = routes();
   everyKind(sql); await newKinds(sql);

@@ -1628,6 +1628,7 @@ await check("send as owner: a #channel Raft's read by name finds is sent to the 
   must(show(a.r.resolves) === show(["#qa-x"]) && !a.r.inboxReads.includes("all"), `reads: ${show(a.r.resolves)} ${show(a.r.inboxReads)}`);
   const row = sendRows(a).at(-1)!;
   must(row.status === "sent" && row.attrs.resolved_by === "resolve" && !("rows_read" in row.attrs) && !("bound_hit" in row.attrs), show(row));
+  must(row.attrs.resolve_status === 200, `resolve_status on a hit: ${show(row)}`);
   // A message in it: the channel by Raft's read, the message's full id by a read around its short id.
   const reply = await asOwner(a, { target: "#qa-x:aaaaaaa9", content: "Friday." });
   must(reply.state === "sent" && show(a.r.asOwner.at(-1)) === show({ channelId: QA_ID, content: "Friday.", parentMessageId: "aaaaaaa9-1111-4222-8333-444455556666" }), `thread: ${show(reply)} ${show(a.r.asOwner.at(-1))}`);
@@ -1643,6 +1644,8 @@ await check("send as owner: a Raft that reads #name as a person's name (its 404)
   must(show(a.r.resolves) === show(["#qa-x"]), `asked Raft first: ${show(a.r.resolves)}`);
   const row = sendRows(a).at(-1)!;
   must(row.attrs.resolved_by === "inbox" && row.attrs.rows_read === 240 && Number(row.attrs.rows_read) > 200 && row.attrs.pages_read === 5 && row.attrs.bound_hit === false, show(row));
+  // What Raft answered, which `inbox` alone does not say: its 404.
+  must(row.attrs.resolve_status === 404, `resolve_status on the 404 fallback: ${show(row)}`);
 });
 
 await check("send as owner: a #channel neither Raft's read nor the owner's inbox finds is not sent, said as a channel they cannot see in this server", async () => {
@@ -1689,6 +1692,7 @@ await check("send as owner: Raft's read by name failing (a 500) is resolve_faile
   must(a.r.asOwner.length === 0 && !a.r.inboxReads.includes("all"), `sent ${show(a.r.asOwner)}, reads ${show(a.r.inboxReads)}`);
   const row = sendRows(a).at(-1)!;
   must(row.status === "resolve_failed" && row.verdict === "failed" && row.attrs.resolved_by === "none", show(row));
+  must(row.attrs.resolve_status === 500, `resolve_status on a 500: ${show(row)}`);
 });
 
 await check("send as owner: a lookup Raft refuses with a 4xx other than 403 or 429 is a miss, read from the inbox; a 403 or a 429 is resolve_failed", async () => {
@@ -1699,12 +1703,14 @@ await check("send as owner: a lookup Raft refuses with a 4xx other than 403 or 4
   const out = await asOwner(a, { target: "#ch1", content: "Hi." });
   must(out.state === "sent" && a.r.asOwner.length === 1 && a.r.inboxReads.includes("all"), `a 400: ${show(out)} reads ${show(a.r.inboxReads)}`);
   must(sendRows(a).at(-1)?.attrs.resolved_by === "inbox", show(sendRows(a).at(-1)));
+  must(sendRows(a).at(-1)?.attrs.resolve_status === 400, `resolve_status on the 400 fallback: ${show(sendRows(a).at(-1))}`);
   for (const status of [403, 429]) {
     const b = await sender();
     b.r.resolveRoute = true;
     b.r.people = { "#ch1": status };
     const refused = await asOwner(b, { target: "#ch1", content: "Hi." });
     must(refused.state === "not_sent" && refused.code === "resolve_failed" && b.r.asOwner.length === 0 && !b.r.inboxReads.includes("all"), `a ${status}: ${show(refused)} reads ${show(b.r.inboxReads)}`);
+    must(sendRows(b).at(-1)?.attrs.resolve_status === status, `resolve_status on a ${status}: ${show(sendRows(b).at(-1))}`);
   }
 });
 
@@ -1715,6 +1721,8 @@ await check("send as owner: a channelId target is taken as it is: neither Raft's
   must(out.state === "sent" && show(a.r.asOwner) === show([{ channelId: QA_ID, content: "Hi." }]), show(out));
   must(a.r.resolves.length === 0 && a.r.inboxReads.length === 0, `reads: ${show(a.r.resolves)} ${show(a.r.inboxReads)}`);
   must(sendRows(a).at(-1)?.attrs.resolved_by === "id", show(sendRows(a).at(-1)));
+  // Raft was not asked: null, said, not left out.
+  must(sendRows(a).at(-1)?.attrs.resolve_status === null, `resolve_status on a channelId: ${show(sendRows(a).at(-1))}`);
 });
 
 await check("send as owner: a 403 assistant_not_enabled pauses the assistant, as every call's does", async () => {
