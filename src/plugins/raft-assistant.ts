@@ -360,7 +360,7 @@ export function zoneOf(owner: Pick<AssistantOwner, "timezone" | "statedTimezone"
  * Called by the listing and by every check a paused assistant makes (`via`). A read that changes the record writes
  * one `raft.assistant_owner` row (`traceOwnerKept`); one that changes nothing writes none.
  */
-export async function keepOwnerFromContext(ctx: PluginContext, context: OwnerContext, via: OwnerRead = "listing"): Promise<AssistantOwner | null> {
+export async function keepOwnerFromContext(ctx: PluginContext, context: OwnerContext, via: OwnerRead): Promise<AssistantOwner | null> {
   const of = context.agent.assistantOf ?? null;
   if (!of || !of.userId) {
     // Read first: nearly every agent is no one's assistant, and its every listing need not be a write.
