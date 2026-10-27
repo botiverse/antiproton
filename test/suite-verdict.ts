@@ -126,7 +126,9 @@ check("the gate's output names the tree it measured", () => {
     { encoding: "utf8" }).trim();
 
   const clean = provenance();
-  if (clean !== `gate: ${sha} (tree ${tree})`) throw new Error(`a clean tree printed ${JSON.stringify(clean)}`);
+  if (!new RegExp(`^gate: ${sha} \\(tree ${tree}\\) at \\d{4}-\\d\\d-\\d\\dT\\d\\d:\\d\\d:\\d\\dZ$`).test(clean)) {
+    throw new Error(`a clean tree printed ${JSON.stringify(clean)}`);
+  }
 
   // Dirty is the case that most needs saying: what ran is a tree git never
   // stored, so the line must refuse to give it HEAD's name as if it were one.
@@ -134,7 +136,7 @@ check("the gate's output names the tree it measured", () => {
   const dirty = provenance();
   if (!/UNCOMMITTED CHANGES/.test(dirty)) throw new Error(`a dirty tree printed ${JSON.stringify(dirty)}`);
   if (dirty === clean) throw new Error("a dirty tree reported exactly what the clean one did");
-  if (new RegExp(`\\(tree ${tree}\\)$`).test(dirty)) {
+  if (new RegExp(`\\(tree ${tree}\\)( at \\S+)?$`, "m").test(dirty)) {
     throw new Error(`a dirty run claimed to be tree ${tree}, which is a tree it is not`);
   }
 });
@@ -145,6 +147,21 @@ check("both gates say it, so neither can print numbers with no subject", () => {
     const src = execFileSync("cat", [f], { encoding: "utf8" });
     if (!/^\s*gate_provenance\s*$/m.test(src)) throw new Error(`${f} does not call gate_provenance`);
   }
+});
+
+check("the deploy gate says it before the suites and again before the deploy", () => {
+  // Said only at the end, the line named whatever HEAD was by then: on
+  // 2026-10-27 HEAD moved during the suites and the one line named the new
+  // commit, which no suite had run on. Order by position, not only a count:
+  // two calls both after the loop would count two and still say nothing first.
+  const src = execFileSync("cat", ["cf/scripts/verify-and-deploy.sh"], { encoding: "utf8" });
+  const calls = [...src.matchAll(/^\s*gate_provenance\s*$/gm)].map((m) => m.index!);
+  const loop = src.indexOf("for f in test/*.ts");
+  const deploy = src.search(/^[^#\n]*bash cf\/scripts\/deploy\.sh/m);
+  if (loop < 0 || deploy < 0) throw new Error(`cannot find the suite loop (${loop}) or the deploy (${deploy}); the check is looking for the wrong text`);
+  if (!(calls.length >= 2)) throw new Error(`verify-and-deploy.sh calls gate_provenance ${calls.length} time(s); it needs one before the suites and one before the deploy`);
+  if (!calls.some((i) => i < loop)) throw new Error("no gate_provenance before the suite loop");
+  if (!calls.some((i) => i > loop && i < deploy)) throw new Error("no gate_provenance between the suites and the deploy");
 });
 
 for (const r of results) {

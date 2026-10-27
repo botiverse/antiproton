@@ -14,8 +14,30 @@ cd "$(dirname "$0")/../.."
 # verification run of an unmerged branch reached production; the first version
 # of this check then allowed any merged commit, including an older one (Piper).
 . cf/scripts/deploy-guard.sh
+. cf/scripts/suite-verdict.sh
+# The commit and tree the suites are about to run on, read once, before any of
+# them, and compared again just before deploying (below). A provenance line
+# printed only at the end named whatever HEAD was by then: on 2026-10-27 a
+# `git pull` in this shared checkout moved HEAD from d720378 to 0897622 while
+# the suites ran, and the end-of-run line and the deploy both read the new
+# HEAD, so a commit no suite had run on shipped stamped as verified. Printed
+# first and last, as the branch gate does, and checked rather than only printed.
+gate_provenance
+gated_sha=$(git rev-parse HEAD)
+gated_tree=$(git rev-parse 'HEAD^{tree}')
+# A dirty tree (untracked files included; cf/scripts/suite-verdict.sh,
+# gate_tree_clean) means the suites run on a tree git never stored: HEAD names
+# something else, so two identical readings of it would prove nothing. A shared
+# checkout often holds untracked files, so a deploy from one is refused here;
+# cf/scripts/deploy-pinned.sh deploys from a fresh worktree instead.
+if ! gate_tree_clean; then
+  echo "refusing to deploy: the working tree is not HEAD's (uncommitted or untracked files), so no commit names what the suites would run on."
+  gate_dirty_files
+  gate_dirty_advice
+  exit 1
+fi
 git fetch -q origin master
-refusal=$(deploy_refusal "$(git rev-parse HEAD)" "$(git rev-parse origin/master)" "$@")
+refusal=$(deploy_refusal "$gated_sha" "$(git rev-parse origin/master)" "$@")
 if [ -n "$refusal" ]; then echo "$refusal"; exit 1; fi
 # Every suite, minus the ones named here with the reason they cannot run here.
 # It used to be a list of 17 that someone had to remember to extend: 20 of the
@@ -27,7 +49,6 @@ if [ -n "$refusal" ]; then echo "$refusal"; exit 1; fi
 # exits 0 too. And every suite in the commit production runs now must still be
 # here, unless test/removed-suites.txt names it, so a deleted one is refused
 # instead of skipped (Piper, Rex, 2026-09-13; cf/scripts/suite-verdict.sh).
-. cf/scripts/suite-verdict.sh
 # A suite time limit that is not a number would limit nothing (question 3 there).
 if ! problem=$(suite_limits_problem); then echo "$problem"; exit 1; fi
 # Which commit production runs is asked of production — so, left alone, a
@@ -123,6 +144,26 @@ case "$tc" in *", 0 new"*) ;; *) echo "typecheck: new errors"; exit 1;; esac
 # above is a fact about one tree, and a deploy log that does not name it cannot
 # later answer "what was actually verified before this went out".
 gate_provenance
+# The green above is about the tree read at the start. If anything moved this
+# checkout since, what would ship is not what was verified: refused, naming
+# both, rather than deployed under the first one's name.
+now_sha=$(git rev-parse HEAD)
+now_tree=$(git rev-parse 'HEAD^{tree}')
+if [ "$now_sha" != "$gated_sha" ] || [ "$now_tree" != "$gated_tree" ]; then
+  echo "refusing to deploy: the suites ran on $gated_sha (tree $gated_tree) but HEAD is now $now_sha (tree $now_tree); someone moved this checkout during the gate."
+  echo "Deploy with cf/scripts/deploy-pinned.sh (a fresh worktree nobody else can move)."
+  exit 1
+fi
+if ! gate_tree_clean; then
+  echo "refusing to deploy: the suites ran on $gated_sha (tree $gated_tree) but the working tree is no longer HEAD's (uncommitted or untracked files); someone modified this checkout during the gate."
+  gate_dirty_files
+  gate_dirty_advice
+  exit 1
+fi
 echo "--- all green; deploying ---"
-set -a; . ~/.secrets/antiproton.env; set +a
-bash cf/scripts/deploy.sh "$@"
+# The secrets file is a path that can be named, so a gate run from a fixture
+# never reads the real one.
+set -a; . "${ANTIPROTON_ENV_FILE:-$HOME/.secrets/antiproton.env}"; set +a
+# The commit is handed over, not re-read: deploy.sh reading HEAD itself was the
+# second late read on 2026-10-27, and it refuses to deploy if HEAD is not this.
+ANTIPROTON_DEPLOY_COMMIT="$gated_sha" bash cf/scripts/deploy.sh "$@"

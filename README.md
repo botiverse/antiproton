@@ -368,9 +368,12 @@ Antiproton is designed to run as a Cloudflare Worker backed by Durable Objects:
 
 3. **Deploy to Cloudflare Workers:**
    ```bash
-   ./deploy.sh
+   cf/scripts/deploy-pinned.sh             # production: the full gate (cf/scripts/verify-and-deploy.sh), then the deploy
+   cf/scripts/deploy-pinned.sh --preview   # the preview Worker (cf/wrangler.preview.jsonc)
    ```
-   The deployment script executes verification gates before uploading the Worker and running smoke checks.
+   It deploys origin/master from a fresh worktree of its own and then reads the live build. That is the way to deploy
+   from a machine where others share the checkout: a checkout moved or modified while the gate runs in it would ship
+   a tree the suites never ran on, so the gate refuses to deploy from one that moved or holds untracked files.
 
 ---
 
