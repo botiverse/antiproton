@@ -1,4 +1,4 @@
-import { createHmac } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import { createRaft, isInterrupted, RAFT_OPERATIONS } from "@botiverse/raft-sdk";
 import { raftPlugin as raftWithoutStorage, EXCLUDED, EVENTS_LIMIT, GENERATED, handOver, INBOX_STORE, KEY_LIFETIME_MS, PAGE_ROWS, PUSH_KEY, PUSH_STORE, originOf, pagingArg, toolOf, offeredTerms, escapeMarks, unescapeMarks, createRaftPlugin, downloadAttachment, ATTACHMENT_MAX_BYTES, toolsBasisOf, WITHHELD_ARGUMENTS, FEATURES_BASIS, wakeInstruction, renderInboxSummary, INBOX_SUMMARY, RAFTBENCH_TOOL, RAFTBENCH_READER_BASIS, isRaftbenchReader } from "../src/plugins/raft.ts";
 import { activityEvents, turnEnds } from "../src/runtime/activity.ts";
@@ -78,6 +78,12 @@ function freshDb() {
 function mount(initial: unknown = null, inbound = fakeInbound()) {
   const fresh = freshDb();
   if (initial !== null) fresh.tables.put(fresh.scope, PUSH_STORE, PUSH_KEY, initial, null);
+  // Which Raft agent the credential is, as a listing keeps it (src/plugins/raft-identity.ts): a mount that has listed
+  // once has it, so a pull here asks Raft for nothing else and these cases see only the requests they script.
+  fresh.tables.put(fresh.scope, "context", "identity", {
+    agentId: "agent-1", serverId: "server-1", at: Date.now(),
+    credential: createHash("sha256").update("antiproton raft identity v1\u0000sk_agent_test_1234567890").digest("hex"),
+  }, null);
   return {
     ctx: { ...ctx(), db: fresh.db, inbound: inbound.api } as any,
     state: fresh.state,
@@ -1819,6 +1825,11 @@ async function raftBehindGateway(policy: unknown = null) {
     installationId: "raft-test", connectionId: null, toolVersion: raftPlugin.version,
     publicConfig: { serverUrl: "https://raft.example" }, secretRef: "secret:raft", policy: policy as any,
   });
+  // Listed once, so its identity is kept and a pull asks Raft for nothing else (see `mount`).
+  store.pluginDb.put({ tenantId: "tenant", agentId: "agent", alias: "inbox", plugin: "raft" }, "context", "identity", {
+    agentId: "agent-1", serverId: "server-1", at: Date.now(),
+    credential: createHash("sha256").update("antiproton raft identity v1\u0000sk_agent_test_1234567890").digest("hex"),
+  }, null);
   const gateway = new ToolGateway(store, [raftPlugin], new Set([raftPlugin.id]), { async resolve() { return "sk_agent_test_1234567890"; } });
   const ctx = { tenantId: "tenant", agentId: "agent", taskId: "task" };
   // The runtime's host makes every call in the session's turn, so each carries the turn's context id (`inTurn`).
