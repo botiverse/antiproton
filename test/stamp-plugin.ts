@@ -44,6 +44,8 @@ const replies: Record<string, unknown> = {
   "GET /v1/inbox/pull-requests": [{ number: 9, title: "Mine" }],
   "POST /v1/pull-requests": { number: 11, url: "https://github.com/o/r/pull/11", state: "open" },
   "POST /v1/repositories/o/r/pulls/7/approve": { approved: true },
+  "POST /v1/repositories/o/r/pulls/7/comments": { id: "c1" },
+  "DELETE /v1/repositories/o/r/pulls/7/queue/req_1": { left: true },
   "PUT /v1/repositories/o/r/pulls/7/auto-merge": { registered: true },
   "PUT /v1/repositories/o/r/pulls/7/merge": { merged: true },
   "GET /api/v3/repos/o/r/issues": [{ number: 1, title: "I" }],
@@ -74,6 +76,10 @@ globalThis.fetch = (async (input: any, init: any) => {
     const answer = refreshAnswer();
     if (answer.ok) spentRefresh.add(presented);
     return answer;
+  }
+  // As Stamp answers an agent: an approval carries no body.
+  if (key.endsWith("/approve") && method === "POST" && JSON.parse(init?.body ?? "{}").body !== undefined) {
+    return new Response(JSON.stringify({ errorCode: "PR_APPROVE_BODY_NOT_SUPPORTED", message: "use stamp pr comment" }), { status: 400, headers: { "content-type": "application/json" } });
   }
   const status = statuses[key] ?? (key in replies ? 200 : 404);
   const body = key in replies ? replies[key] : { errorCode: "NOT_FOUND", message: "no such route" };
@@ -110,7 +116,9 @@ function makeCtx(credential: string | null = session(), agentDb: ReturnType<type
   return {
     rows,
     agentDb,
-    ctx: { credential, alias, publicConfig: {}, caller: { tenantId: "t", agentId: "a" }, db, ...(agentDb ? { agentDb } : {}) } as any,
+    ctx: { credential, alias, publicConfig: {}, caller: { tenantId: "t", agentId: "a" }, db, ...(agentDb ? { agentDb } : {}),
+      // This mount as `sibling` reports it, with no policy of its own.
+      async sibling(name: string) { return name === alias ? { credential, db, plugin: "stamp", policy: null } : null; } } as any,
   };
 }
 
@@ -189,12 +197,34 @@ await check("pr_create sends the receipt, base and title, and keeps the idempote
   must(pr.number === 11 && pr.opened === true, JSON.stringify(pr));
 });
 
-await check("an approval names the exact head and base it is about", async () => {
+await check("an approval names the exact head and base it is about, and its note follows as a comment", async () => {
   reset();
-  await invoke("pr_approve", { repo: "o/r", number: 7, head: HEAD, base: BASE, note: "looks right" }, makeCtx().ctx);
+  const r: any = await invoke("pr_approve", { repo: "o/r", number: 7, head: HEAD, base: BASE, note: "looks right" }, makeCtx().ctx);
   must(seen[0].method === "POST" && seen[0].path === "/v1/repositories/o/r/pulls/7/approve", `${seen[0].method} ${seen[0].path}`);
   const sent = JSON.parse(seen[0].body);
-  must(sent.expectedHead === HEAD && sent.expectedBase === BASE && sent.body === "looks right", JSON.stringify(sent));
+  must(sent.expectedHead === HEAD && sent.expectedBase === BASE && sent.body === undefined, JSON.stringify(sent));
+  must(seen[1]?.path === "/v1/repositories/o/r/pulls/7/comments" && JSON.parse(seen[1].body).body === "looks right", JSON.stringify(seen[1]));
+  must(r.approval?.approved === true && r.comment?.id === "c1", JSON.stringify(r));
+});
+
+await check("an approval answers in one shape, with or without a note", async () => {
+  reset();
+  const bare: any = await invoke("pr_approve", { repo: "o/r", number: 7, head: HEAD, base: BASE }, makeCtx().ctx);
+  must(bare.approval?.approved === true && Object.keys(bare).join() === "approval", JSON.stringify(bare));
+  must(seen.length === 1, `a bare approval sent ${seen.length} requests`);
+});
+
+await check("an approval whose note cannot be posted still stands, and says so", async () => {
+  reset();
+  const { ctx } = makeCtx();
+  const inner = globalThis.fetch as any;
+  globalThis.fetch = (async (input: any, init: any) => String(input).endsWith("/comments")
+    ? new Response(JSON.stringify({ errorCode: "INTERNAL" }), { status: 500, headers: { "content-type": "application/json" } })
+    : inner(input, init)) as any;
+  try {
+    const r: any = await invoke("pr_approve", { repo: "o/r", number: 7, head: HEAD, base: BASE, note: "why" }, ctx);
+    must(r.approval?.approved === true && /approval stands/.test(r.commentError ?? ""), JSON.stringify(r));
+  } finally { globalThis.fetch = inner; }
 });
 
 await check("merge defaults to auto-merge, which returns instead of waiting", async () => {
@@ -784,19 +814,27 @@ await check("a call under a mount's new name waits for the rotation still runnin
   await loadSession(before);
   let release!: () => void;
   const held = new Promise<void>((r) => { release = r; });
+  let reached!: () => void;
+  const atRefresh = new Promise<void>((r) => { reached = r; });
   refreshAnswer = rotatesTo(43);
   const inner = globalThis.fetch as any;
   let first = true;
   globalThis.fetch = (async (input: any, init: any) => {
-    if (first && String(input).includes("/api/auth/agent/refresh")) { first = false; await held; }
+    if (first && String(input).includes("/api/auth/agent/refresh")) { first = false; reached(); await held; }
     return inner(input, init);
   }) as any;
   try {
     const old = refusal(invoke("whoami", {}, before));
-    await new Promise((r) => setTimeout(r, 10));
-    const renamed = { ...before, alias: "stamp-renamed", db: { ...before.db, rows } };
-    const now = refusal(invoke("whoami", {}, renamed));
-    await new Promise((r) => setTimeout(r, 10));
+    // The old name's refresh is in flight, so its mark is on the row.
+    await atRefresh;
+    let reads = 0;
+    let settled = false;
+    const renamed = { ...before, alias: "stamp-renamed", db: { ...before.db, rows,
+      async get(store: string, key: string) { reads++; return before.db.get(store, key); } } };
+    const now = refusal(invoke("whoami", {}, renamed)).then((v) => { settled = true; return v; });
+    // Until the new name's call decides — a second read, or an answer — or plainly
+    // waits. A fixed 10 ms let a wrong answer through about 1 run in 12.
+    for (const until = Date.now() + 500; !settled && reads < 2 && Date.now() < until;) await new Promise((r) => setTimeout(r, 5));
     release();
     const [x, y] = [await old, await now];
     must(x === "" && y === "", `old: ${x}; new: ${y}`);
@@ -830,6 +868,9 @@ await check("api refuses the approve and merge routes, however they are spelled"
     must(/goes through pr_(approve|merge), not api/.test(threw), `${method} ${path}: ${threw}`);
   }
   must(seen.length === 0, `reached the gateway: ${JSON.stringify(seen.map((x) => x.path))}`);
+  // Leaving the merge queue is not a merge.
+  const left = await refusal(invoke("api", { method: "DELETE", path: "/v1/repositories/o/r/pulls/7/queue/req_1" }, ctx));
+  must(left === "" && seen.at(-1)?.method === "DELETE", `leaving the queue: ${left}`);
   // Not every write under a pull request is held: a comment review is not an approval.
   const ok = await refusal(invoke("api", { method: "POST", path: "/api/v3/repos/o/r/pulls/7/reviews", body: { event: "COMMENT" } }, ctx));
   must(!/not api/.test(ok), `a comment review was refused: ${ok}`);
@@ -899,6 +940,71 @@ await check("a first seal that fails and then cannot be read back keeps its reco
   must(agentDb!.rows.size === 1, "the record was taken back although the row could not be read to say");
   const { ctx: readded } = makeCtx(session(), agentDb);
   must(/already given/.test(await refusal(invoke("whoami", {}, readded))), "a removed mount's session was accepted again");
+});
+
+// What later calls say once the gateway refused the token: its code, not "did not finish".
+await check("calls after a refused refresh name the gateway's code", async () => {
+  reset();
+  const { ctx } = makeCtx(expired());
+  refreshAnswer = () => new Response(JSON.stringify({ error: "refresh_reused" }), { status: 409, headers: { "content-type": "application/json" } });
+  await refusal(invoke("whoami", {}, ctx));
+  const later = await refusal(invoke("whoami", {}, ctx));
+  must(refreshes === 1 && later.includes("refresh_reused") && !later.includes("did not finish"), `later: ${later}`);
+});
+
+await check("invalid_schema is reported as this plugin's bug, with the session unchanged", async () => {
+  reset();
+  const { ctx } = makeCtx(expired());
+  refreshAnswer = () => new Response(JSON.stringify({ error: "invalid_schema" }), { status: 400, headers: { "content-type": "application/json" } });
+  const said = await refusal(invoke("whoami", {}, ctx));
+  must(/bug in the stamp plugin/.test(said) && /unchanged/.test(said), said);
+});
+
+await check("a refusal with no message has no dangling dash", async () => {
+  reset();
+  const { ctx } = makeCtx(expired());
+  refreshAnswer = () => new Response("", { status: 503 });
+  const said = await refusal(invoke("whoami", {}, ctx));
+  must(said.startsWith("stamp: could not refresh the session (503). ") && !said.includes("— ."), said);
+});
+
+// The note's comment is a write of its own: `pr_comment`'s policy decides it,
+// not whatever lifted `pr_approve`.
+await check("an approval the mount lets run does not post its note where pr_comment is refused", async () => {
+  const call = await gatewayMount({ tools: { pr_approve: "allow", pr_comment: "deny" } });
+  reset();
+  const r = await call("pr_approve", { ...MERGE, note: "why" });
+  must(r.status === "succeeded", `approve: ${JSON.stringify(r)}`);
+  const out = r.result ?? r.output ?? r;
+  must(seen.length === 1 && seen[0].path.endsWith("/approve"), `sent: ${JSON.stringify(seen.map((x) => x.path))}`);
+  must(/not posted: pr_comment is refused/.test(JSON.stringify(out)) && JSON.stringify(out).includes('"note":"why"'), JSON.stringify(r));
+  const held = await gatewayMount({ tools: { pr_approve: "allow", pr_comment: "approval" } });
+  reset();
+  const h = await held("pr_approve", { ...MERGE, note: "why" });
+  must(seen.length === 1 && /needs a person's approval on this mount; call pr_comment/.test(JSON.stringify(h)), JSON.stringify(h));
+  const open = await gatewayMount({ tools: { pr_approve: "allow" } });
+  reset();
+  await open("pr_approve", { ...MERGE, note: "why" });
+  const paths = seen.map((x) => x.path);
+  must(paths.length === 2 && paths[1].endsWith("/comments"), `allowed: ${JSON.stringify(paths)}`);
+});
+
+await check("an approval's note is not posted where a mount-wide write deny covers pr_comment, nor when the mount cannot be read", async () => {
+  const denied = await gatewayMount({ write: "deny", tools: { pr_approve: "allow" } });
+  reset();
+  const r = await denied("pr_approve", { ...MERGE, note: "why" });
+  must(r.status === "succeeded" && seen.length === 1 && /not posted: pr_comment is refused/.test(JSON.stringify(r)), JSON.stringify(r));
+  reset();
+  const { ctx } = makeCtx();
+  const blind = { ...ctx, async sibling() { return null; } };
+  const b: any = await invoke("pr_approve", { repo: "o/r", number: 7, head: HEAD, base: BASE, note: "why" }, blind);
+  must(seen.length === 1 && /policy could not be read/.test(b.commentSkipped ?? "") && !/refused/.test(b.commentSkipped ?? ""), JSON.stringify(b));
+});
+
+// A replayed call must not post its note twice: the harness replays only what is declared idempotent.
+await check("pr_approve is not declared idempotent, since its note is a comment", async () => {
+  const tool = stampPlugin.tools.find((t) => t.name === "pr_approve");
+  must(tool?.idempotency === "none", `pr_approve idempotency: ${tool?.idempotency}`);
 });
 
 // A plugin default may tighten a mount's policy, never loosen it: an operator who
