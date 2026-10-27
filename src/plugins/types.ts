@@ -2258,6 +2258,26 @@ export interface Plugin {
    * stays a refusal.
    */
   defaultPolicy?: MountPolicy;
+  /**
+   * A second name this call is decided under, besides its tool's own: for one tool whose calls have effects a mount
+   * owner may want to set apart (botiverse/antiproton#1092). Read through {@link policyKeyOf}, never directly.
+   *
+   * **A key only tightens, never loosens.** The gateway asks {@link policyFor} for the tool and for the key and takes
+   * the {@link stricter} of the two, so a mount's `tools.<tool>: "deny"` stays a refusal whatever the key's entry says,
+   * and a call runs unattended only when both allow it. Looking the key up alone would skip the tool's own entry, its
+   * `deny` as well as its `allow`. The key goes through the same lookup as a tool name — the mount's per-tool entry,
+   * then `defaultPolicy.tools` — so it must not be the name of another real tool, or setting it would set that tool.
+   *
+   * `undefined`, or the tool's own name: the tool's policy alone, as before. A throw holds the call for a person (at
+   * least `approval`): a key the plugin could not name is not read as no key. Synchronous and local, like `classify`.
+   */
+  policyKey?(tool: string, args: Json): string | undefined;
+  /**
+   * The plugin's SDK, importable in a run_js program as `sdk:<alias>` (and `sdk:<plugin id>` where that names one
+   * mount alone), with every request it makes forwarded through the gateway as a call of `<alias>.request`. See
+   * {@link BridgeDecl}. A plugin that declares it may not have a tool of its own named `request`.
+   */
+  bridge?: BridgeDecl;
 
 
   /**
@@ -2557,6 +2577,117 @@ export function policyFor(
 }
 
 const STRICTNESS: Record<PolicyDecision, number> = { allow: 0, approval: 1, deny: 2 };
+
+/** The stricter of two decisions: `deny` over `approval` over `allow`. How a policy key tightens (`Plugin.policyKey`). */
+export function stricter(a: PolicyDecision, b: PolicyDecision): PolicyDecision {
+  return STRICTNESS[b] > STRICTNESS[a] ? b : a;
+}
+
+/**
+ * The key `Plugin.policyKey` names for this call: `null` when there is none or it is the tool's own name, `false`
+ * when the hook threw or answered something that is not a non-empty string, which the gateway holds for a person.
+ */
+export function policyKeyOf(p: Pick<Plugin, "policyKey">, tool: string, args: Json): string | null | false {
+  if (!p.policyKey) return null;
+  let key: unknown;
+  try { key = p.policyKey.call(p, tool, args); } catch { return false; }
+  if (key === undefined || key === tool) return null;
+  return typeof key === "string" && key !== "" ? key : false;
+}
+
+/** The tool a bridge's requests are calls of, on every mount whose plugin declares one: `<alias>.request`. */
+export const BRIDGE_TOOL = "request";
+
+/** What the core hands a plugin's `BridgeDecl.send`: the request as the box made it, with only two of its headers. */
+export interface BridgeRequest {
+  method: string;
+  /** The path as the plugin's `normalize` answered it (as sent, without one): what the route table was matched on. */
+  path: string;
+  body: string | null;
+  /** Only `content-type` and `accept`, lower-cased, when the box sent them; the plugin adds its own credential. */
+  headers: Record<string, string>;
+}
+
+/** What `BridgeDecl.send` answers. Any status is an answer: a 4xx or 5xx reaches the box as a `Response` like a 200. */
+export interface BridgeResponse {
+  status: number;
+  headers: Record<string, string>;
+  text: string;
+}
+
+/**
+ * One row of a bridge's route table: a method and path pattern (and, where it matters, the body as sent) to a policy
+ * key, or to a refusal. The first row that matches decides; `path` is tested on the path after `normalize`.
+ */
+export type RouteEntry = {
+  methods: readonly string[];
+  path: RegExp;
+  /** The body parsed as JSON where it parses, else the text as sent, or null for none. */
+  body?: (body: Json | string | null) => boolean;
+} & (
+  /** Decided under this key and the bridge tool's own entry, the stricter of the two (`Plugin.policyKey`). */
+  | { key: string; refuse?: undefined }
+  /** Never run on the bridge, approved or not: the message says what to use instead. */
+  | { refuse: string; key?: undefined }
+);
+
+/**
+ * A plugin's SDK in the run_js box, and the table that decides each request it makes (botiverse/antiproton#1092).
+ *
+ * The box holds no credential and no network (`globalOutbound: null`): the SDK is handed a `fetch` that turns each
+ * request into one host call of `<alias>.request` — so policy, approval, the operation and its trace row, the
+ * host-call budget and the pause on a hold are the ones every tool call has. The core owns the box loader, that tool,
+ * the header filter and the classification; the plugin owns the module, the table and `send`.
+ */
+export interface BridgeDecl {
+  /**
+   * The SDK's files, shipped into the box under `sdk/<plugin id>/`, so they import one another by relative path.
+   * `entry`'s default export is called once per mount with the gateway-backed `fetch` and returns the module's
+   * exports; `exports` names the ones the program's `import("sdk:…")` gets (identifiers, so they can be named exports).
+   */
+  box: { files: Readonly<Record<string, string>>; entry: string; exports: readonly string[] };
+  routes: readonly RouteEntry[];
+  /**
+   * The policy key of a write no row matches. Fails closed: with no entry for it on the mount, it should be
+   * `approval` in the plugin's `defaultPolicy`, so a route the table forgot costs a person's click, not a silent
+   * write. A read no row matches is decided under the bridge tool's own name, which is the mount's read half unless
+   * it names `request`. Must not be the name of a real tool (`ToolGateway` refuses the plugin).
+   */
+  unlistedWriteKey: string;
+  /** Make the request upstream, adding the mount's credential. A throw is a failed call, which the box sees as a network error. */
+  send(ctx: PluginContext, req: BridgeRequest): Promise<BridgeResponse>;
+  /** The path as upstream will route it (folded, decoded, `..` refused by a throw), before the table is asked. */
+  normalize?(path: string): string;
+  /** What the approval card names besides method and path. Absent, or a throw: method and path only. */
+  describe?(path: string): { repo?: string; pr?: number | string };
+  /** Response headers the box sees besides `content-type` and `x-request-id`; a trailing `*` matches a prefix. */
+  responseHeaders?: readonly string[];
+}
+
+/** How a bridge's table decides one request: a listed key, a refusal, or the fail-closed answer for an unlisted one. */
+export type RouteClass =
+  | { kind: "listed"; key: string }
+  | { kind: "refused"; message: string }
+  | { kind: "unlisted-read" }
+  | { kind: "unlisted-write"; key: string };
+
+/** Classify one request against a bridge's table. `path` is already normalized; `body` is as sent. */
+export function classifyRoute(decl: Pick<BridgeDecl, "routes" | "unlistedWriteKey">, method: string, path: string, body: string | null): RouteClass {
+  const m = method.toUpperCase();
+  let parsed: Json | string | null = body;
+  if (typeof body === "string") { try { parsed = JSON.parse(body) as Json; } catch { /* matched as the text */ } }
+  for (const row of decl.routes) {
+    if (!row.methods.some((x) => x.toUpperCase() === m) || !row.path.test(path)) continue;
+    if (row.body) {
+      let hit = false;
+      // A predicate that throws on a body it did not expect has not said the row does not apply; held, not skipped.
+      try { hit = row.body(parsed); } catch { return { kind: "unlisted-write", key: decl.unlistedWriteKey }; }
+      if (!hit) continue;
+    }
+    return row.refuse !== undefined ? { kind: "refused", message: row.refuse } : { kind: "listed", key: row.key! };
+  }
+  return m === "GET" || m === "HEAD" ? { kind: "unlisted-read" } : { kind: "unlisted-write", key: decl.unlistedWriteKey };
+}
 
 /** What `PluginContext.agentLogin` answers (botiverse/antiproton#1084). */
 export type AgentLoginAnswer =
