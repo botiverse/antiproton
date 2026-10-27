@@ -1282,7 +1282,7 @@ await check("a version-2 mount's cursor and frontier become the SDK's state: the
   const since = new URL(calls[0]!.url).searchParams.get("since");
   if (since !== "41") throw new Error(`the carried-over batch was not the one acknowledged: since=${since}`);
   const st = tables.get(scope, "inbox", "state") as any;
-  if (tables.version(scope) !== 7 || st?.schema !== "raft-sdk-state.v1" || st.frontier?.targets?.["#general"]?.upTo !== 30) {
+  if (tables.version(scope) !== raftPlugin.database!.version || st?.schema !== "raft-sdk-state.v1" || st.frontier?.targets?.["#general"]?.upTo !== 30) {
     throw new Error(`upgrade: version ${tables.version(scope)}, state ${JSON.stringify(st)}`);
   }
   if (tables.get(scope, "inbox", "cursor") !== undefined || tables.get(scope, "inbox", "frontier") !== undefined) throw new Error("version-2 keys survived");

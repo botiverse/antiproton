@@ -156,6 +156,15 @@ type Kept = { kind: "none" } | { kind: "open"; session: AgentSession; owner?: st
  */
 const GIVEN_STORE = "stampGiven";
 
+/**
+ * Sessions whose owner a credential check has confirmed while their access token was fresh, by the digest of the
+ * refresh token: `{ owner: "agentId@serverId", at }`. Whose a session is does not change with time, so a first use
+ * that comes after the access token expired may refresh a session found here — the ordinary case of a person
+ * attaching a session in the console and the agent first using it hours later. Written only after a check passed;
+ * read only for the refresh token it names, and only while this agent's Raft identity is still that owner.
+ */
+const VERIFIED_STORE = "stampVerified";
+
 /** A refresh token as a row may name it: a digest, never the token. */
 async function digest(refreshToken: string): Promise<string> {
   const d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`${SEAL_INFO}\u0000${refreshToken}`));
@@ -241,13 +250,33 @@ const refuseUnusable = (kept: Kept) => {
   if (kept.kind === "unfinished") throw unfinishedRotation(kept.refused);
 };
 
-/** A session refused at the door: whose it is cannot be shown to be this agent's. Nothing was kept or sent with it. */
+/** A session refused at the door: it is not this agent's. Nothing was kept or sent with it. */
 class NotThisAgent extends SpentSession {}
 const notThisAgent = (why: string) => new NotThisAgent(
   `stamp: this session cannot be given to this agent — ${why}. Nothing was kept, and its refresh token was not used. ` +
   "A session belongs to one agent only: given to two, both refresh it and Stamp revokes every token of that identity, " +
   "on every machine. A person signs in to Stamp as this agent, for this mount alone, and gives it that session at once.",
 );
+/**
+ * Whose a session is could not be told just now: not a refusal of the session, which may be this agent's. Nothing was
+ * kept or sent; the same session works once the cause clears, so the advice is to try again, never to sign in.
+ * A credential check reports it as `unreachable` (kept unverified), a call as an error.
+ */
+class OwnerUnknown extends Error {}
+const ownerUnknown = (why: string) => new OwnerUnknown(
+  `stamp: whose this session is cannot be checked right now — ${why}. Nothing was kept, and its refresh token was not ` +
+  "used. This is not a reason to sign in again: the same session works once this is cleared; try again shortly.",
+);
+
+/** This agent's Raft identity as `agentId@serverId`, or an `OwnerUnknown` naming why it cannot be read. */
+async function thisAgent(ctx: PluginContext): Promise<string> {
+  const me = await raftIdentityOf(ctx);
+  if (!me) {
+    throw ownerUnknown("which Raft agent this agent is cannot be read from its Raft mount yet (it has none, or it has " +
+      "not listed its tools since its credential was set); that happens at the start of the agent's next turn");
+  }
+  return `${me.agentId}@${me.serverId}`;
+}
 
 /**
  * Whose session this is, checked against which Raft agent this antiproton agent is, before the session is kept:
@@ -256,14 +285,19 @@ const notThisAgent = (why: string) => new NotThisAgent(
  * match and the principal must be an agent (a `stamp agent login` CLI agent's `cli_…` id never matches a Raft one).
  *
  * Read-only, and never a refresh: an access token already expired is refused rather than refreshed, because the
- * refresh itself would spend the token another holder has. Sent with `send`, not `call`: `call` goes back through
- * `loadSession` and its queue, which this runs inside. Every doubt is a refusal: wrongly refused costs a sign-in,
- * wrongly kept costs every token of that identity.
+ * refresh itself would spend the token another holder has (a check that passed earlier is the exception: see
+ * `VERIFIED_STORE`). Sent with `send`, not `call`: `call` goes back through `loadSession` and its queue, which this
+ * runs inside. Not this agent's is `NotThisAgent`; cannot tell is `OwnerUnknown`.
  */
 async function ownerOf(ctx: PluginContext, given: AgentSession): Promise<string> {
+  return (await askOwner(ctx, given)).owner;
+}
+/** `ownerOf`, with the handle Stamp named, for a credential check to report without asking twice. */
+async function askOwner(ctx: PluginContext, given: AgentSession): Promise<{ owner: string; handle: string | null }> {
   if (needsRefresh(given, Date.now(), 0)) {
     throw notThisAgent("its access token has already expired, and checking whose it is would mean refreshing it first");
   }
+  const mine = await thisAgent(ctx);
   let res: Response;
   let body: Record<string, unknown> = {};
   try {
@@ -271,21 +305,41 @@ async function ownerOf(ctx: PluginContext, given: AgentSession): Promise<string>
     res = await send("GET", "/v1/me?purpose=owner-check", given.access_token);
     body = (await res.json().catch(() => ({}))) as Record<string, unknown>;
   } catch (e) {
-    throw notThisAgent(`Stamp could not be asked whose it is (${String((e as Error)?.message ?? e).slice(0, 120)})`);
+    throw ownerUnknown(`Stamp could not be asked (${String((e as Error)?.message ?? e).slice(0, 120)})`);
   }
-  if (!res.ok) throw notThisAgent(`Stamp refused to say whose it is (HTTP ${res.status})`);
+  if (res.status === 401) throw notThisAgent("Stamp does not accept this session (HTTP 401)");
+  if (!res.ok) throw ownerUnknown(`Stamp answered HTTP ${res.status}`);
   const agentId = typeof body.agentId === "string" ? body.agentId : "";
   const serverId = typeof body.serverId === "string" ? body.serverId : "";
   const name = typeof body.name === "string" && body.name ? body.name : agentId;
-  if (body.principalType !== "agent" || !agentId || !serverId) {
-    throw notThisAgent(`it is not a Raft agent's session (Stamp says ${JSON.stringify(String(body.principalType ?? "nothing")).slice(0, 40)})`);
+  if (body.principalType === undefined || !agentId || !serverId) {
+    throw ownerUnknown("Stamp's answer did not say whose it is (no principalType, agentId or serverId)");
   }
-  const me = await raftIdentityOf(ctx);
-  if (!me) throw notThisAgent("which Raft agent this agent is cannot be read from its Raft mount (none, or not listed since its credential changed)");
-  if (me.agentId !== agentId || me.serverId !== serverId) {
-    throw notThisAgent(`it belongs to the Stamp agent ${JSON.stringify(name).slice(0, 60)} (${agentId}@${serverId}), and this agent is ${me.agentId}@${me.serverId}`);
+  if (body.principalType !== "agent") {
+    throw notThisAgent(`it is not an agent's session (Stamp says ${JSON.stringify(String(body.principalType)).slice(0, 40)})`);
   }
-  return `${agentId}@${serverId}`;
+  if (`${agentId}@${serverId}` !== mine) {
+    throw notThisAgent(`it belongs to the Stamp agent ${JSON.stringify(name).slice(0, 60)} (${agentId}@${serverId}), and this agent is ${mine}`);
+  }
+  const handle = typeof body.handle === "string" && body.handle ? body.handle : typeof body.name === "string" && body.name ? body.name : null;
+  return { owner: mine, handle };
+}
+
+/**
+ * The owner a passed check recorded for this refresh token, if it is still this agent: only the digest of the
+ * refresh token being kept, and only while the Raft mount still says this agent is that owner. Null: no record.
+ */
+async function verifiedOwner(ctx: PluginContext, d: string): Promise<string | null> {
+  const row = await givenDb(ctx).get(VERIFIED_STORE, d) as Record<string, unknown> | null | undefined;
+  if (!row || typeof row.owner !== "string") return null;
+  const mine = await thisAgent(ctx);
+  if (row.owner !== mine) throw notThisAgent(`a check found it belongs to ${row.owner}, and this agent is ${mine}`);
+  return row.owner;
+}
+
+/** Whose this session is: a passed check's record for its refresh token, else asked now (fresh access token only). */
+async function ownerFor(ctx: PluginContext, given: AgentSession, d: string): Promise<string> {
+  return (await verifiedOwner(ctx, d)) ?? await ownerOf(ctx, given);
 }
 
 /**
@@ -319,7 +373,12 @@ export async function loadSession(ctx: PluginContext, keep = true): Promise<Agen
   // sees a seal another call made since the read above.
   if (!keep) {
     if (await wasGiven(ctx, d)) throw givenBefore();
-    await ownerOf(ctx, given);
+    // A check that passes records it, so a first use after the access token expired may refresh (`VERIFIED_STORE`);
+    // a check that fails writes nothing.
+    if (!(await verifiedOwner(ctx, d))) {
+      const { owner, handle } = await askOwner(ctx, given);
+      await givenDb(ctx).put(VERIFIED_STORE, { owner, ...(handle ? { handle } : {}), at: new Date().toISOString() }, d);
+    }
     return given;
   }
   // Read again in the queue: another call may have sealed it, and rotated it,
@@ -333,7 +392,7 @@ export async function loadSession(ctx: PluginContext, keep = true): Promise<Agen
     // Whose session this is, asked once, before anything is kept or refreshed:
     // the conclusion is sealed with it (`owner`) and never asked again, since a
     // later whoami answers with a rotated token.
-    const owner = await ownerOf(ctx, given);
+    const owner = await ownerFor(ctx, given, d);
     // Recorded before it is sealed: a record that never happened would let a
     // removed mount's session back in. If the seal then fails, the record is
     // taken back — it is this call's own (`wasGiven` was false a moment ago)
@@ -744,7 +803,8 @@ export const stampPlugin: Plugin = {
    * The rotating session. Not `listed`: it exists, and that it exists is
    * listable, never what is in it.
    */
-  database: { version: 2, stores: { [SESSION_STORE]: {}, [GIVEN_STORE]: {} } },
+  // Version 3 added `VERIFIED_STORE` (agent-level); nothing to carry over.
+  database: { version: 3, stores: { [SESSION_STORE]: {}, [GIVEN_STORE]: {}, [VERIFIED_STORE]: {} } },
   credential: {
     required: true,
     summary: "A Stamp agent session: the JSON `stamp login` keeps (access_token, refresh_token, access_expires_at), signed in for this mount alone.",
@@ -865,19 +925,27 @@ export const stampPlugin: Plugin = {
         reason: "not a Stamp agent session — this mount needs the JSON `stamp login` keeps, with access_token and refresh_token (a cookie or a GitHub token is not one)",
       };
     }
-    // Never rotates, so never writes. The value checked is often a candidate the
-    // mount does not hold yet (`checkMount`), sharing the mount's one session
-    // row: storing its rotation would put a session the live credential cannot
-    // open over the one it can, and the next call would be `spent`; rotating
-    // without storing would spend the candidate's refresh token before it is
-    // kept. So the check asks with the access token it has, and an expired one
-    // is left unchecked rather than refreshed.
+    // Never rotates, and never touches the session row. The value checked is
+    // often a candidate the mount does not hold yet (`checkMount`), sharing the
+    // mount's one session row: storing its rotation would put a session the live
+    // credential cannot open over the one it can, and the next call would be
+    // `spent`; rotating without storing would spend the candidate's refresh token
+    // before it is kept. So the check asks with the access token it has. Its one
+    // write is the agent-level record that whose it is was checked and passed
+    // (`VERIFIED_STORE`), and only when it passed.
     let session: AgentSession | null;
     try { session = await loadSession(ctx, false); } catch (e) {
-      if (e instanceof SpentSession) return { ok: false, kind: "rejected", reason: e.message.slice(0, 300) };
+      if (e instanceof SpentSession) return { ok: false, kind: "rejected", reason: e.message.slice(0, 400) };
+      if (e instanceof OwnerUnknown) return { ok: false, kind: "unreachable", reason: e.message.slice(0, 400) };
       throw e;
     }
     if (!session) throw noSession(ctx);
+    // A candidate whose owner this check confirmed (or an earlier one did) is answered from that record: Stamp was
+    // asked once already, with this session's own access token, and an expired one is not refreshed to ask again.
+    if (ctx.credential && parseSession(ctx.credential)?.refresh_token === session.refresh_token && ctx.agentDb) {
+      const rec = await ctx.agentDb.get(VERIFIED_STORE, await digest(session.refresh_token)).catch(() => null) as Record<string, unknown> | null;
+      if (rec && typeof rec.owner === "string") return { ok: true, account: typeof rec.handle === "string" ? `@${rec.handle}` : undefined };
+    }
     if (needsRefresh(session, Date.now(), 0)) {
       return {
         ok: false, kind: "unreachable",

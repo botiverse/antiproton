@@ -17,8 +17,13 @@ import { keepRaftIdentity } from "../src/plugins/raft-identity.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void> | void) {
-  try { await fn(); results.push({ name, ok: true }); }
+  // A case that never settles is a deadlock (a call waiting on the queue it holds): it fails here, by name, instead
+  // of draining the event loop and ending the file with no result. Ten seconds is far past any case's real time.
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const stuck = new Promise<never>((_, no) => { timer = setTimeout(() => no(new Error("did not finish in 10 s: a call is waiting on something that never comes (a queue it holds?)")), 10_000); });
+  try { await Promise.race([Promise.resolve().then(fn), stuck]); results.push({ name, ok: true }); }
   catch (e) { results.push({ name, ok: false, error: String((e as Error)?.message ?? e) }); }
+  finally { clearTimeout(timer); }
 }
 function must(c: unknown, m: string): asserts c { if (!c) throw new Error(m); }
 
@@ -483,11 +488,13 @@ await check("checking a candidate credential neither refreshes it nor overwrites
   seen = [];
   await invoke("whoami", {}, ctx);
   must(refreshes === 1 && seen.at(-1)?.auth === "Bearer ACCESS-24", `live mount after the check: refreshes=${refreshes}, sent ${seen.at(-1)?.auth}`);
-  // A fresh candidate is checked with its own access token, and still writes nothing.
+  // A fresh candidate is checked with its own access token, once — the owner check is the whoami — and writes no
+  // session row (only the agent-level record that the check passed).
   seen = [];
+  ownerChecks = [];
   const fresh: any = await stampPlugin.checkCredential!({ ...ctx, credential: session({ access_token: "ACCESS-D", refresh_token: "REFRESH-D" }) });
   must(fresh.ok === true && fresh.account === "@eleanor", JSON.stringify(fresh));
-  must(seen.length === 1 && seen[0].auth === "Bearer ACCESS-D", `check sent: ${JSON.stringify(seen)}`);
+  must(seen.length === 0 && ownerChecks.length === 1 && ownerChecks[0] === "Bearer ACCESS-D", `check sent: ${JSON.stringify(seen)}, owner checks ${JSON.stringify(ownerChecks)}`);
   must(JSON.stringify(rows.get("session")) === live, "a passing check overwrote the live session");
 });
 
@@ -1086,7 +1093,7 @@ for (const [what, me, why] of [
   ["another agent", { agentId: "ra-2" }, /belongs to the Stamp agent/],
   ["another server", { serverId: "rs-2" }, /belongs to the Stamp agent/],
   ["a CLI agent", { agentId: "cli_7", principalType: "agent" }, /belongs to the Stamp agent/],
-  ["not an agent", { principalType: "human" }, /not a Raft agent's session/],
+  ["not an agent", { principalType: "human" }, /not an agent's session/],
 ] as const) {
   await check(`a session of ${what} is refused, and nothing is kept or refreshed`, async () => {
     reset();
@@ -1130,6 +1137,124 @@ await check("a 401 or no answer from Stamp's whoami is refused, and nothing is k
     const down = await refusal(invoke("whoami", {}, ctx));
     must(/could not be asked/.test(down) && rows.size === 0 && agentDb!.rows.size === 0 && refreshes === 0, down);
   } finally { globalThis.fetch = inner; }
+});
+
+// ---- a check that passed lets a first use refresh (cody, Eleanor) ----
+
+/** Run `fn` an hour later, as far as the plugin's clock is concerned. */
+async function anHourLater<T>(fn: () => Promise<T>): Promise<T> {
+  const real = Date.now;
+  Date.now = () => real() + 3_600_000;
+  try { return await fn(); } finally { Date.now = real; }
+}
+const verifiedRows = (agentDb: any) => [...agentDb.rows.keys()].filter((k: string) => k.startsWith("stampVerified\u0000"));
+
+await check("a session checked while fresh is refreshed at its first use after its access token expired, once", async () => {
+  reset();
+  const { ctx, rows, agentDb } = makeCtx(session());
+  const checked: any = await stampPlugin.checkCredential!(ctx);
+  must(checked.ok === true && verifiedRows(agentDb).length === 1 && rows.size === 0, `check: ${JSON.stringify(checked)}; rows ${rows.size}`);
+  const before = ownerChecks.length;
+  refreshAnswer = rotatesTo(60);
+  await anHourLater(async () => {
+    await invoke("whoami", {}, ctx);
+    await invoke("whoami", {}, ctx);
+  });
+  must(refreshes === 1 && seen.at(-1)?.auth === "Bearer ACCESS-60", `refreshes=${refreshes}, sent ${seen.at(-1)?.auth}`);
+  must(rows.get("session")?.owner === `${RAFT_AGENT}@${RAFT_SERVER}` && ownerChecks.length === before, `owner ${rows.get("session")?.owner}; asked again: ${ownerChecks.length - before}`);
+});
+
+await check("a check's record does not outlive this agent's Raft identity: changed since, the first use refuses", async () => {
+  reset();
+  const { ctx, rows, agentDb } = makeCtx(session());
+  must((await stampPlugin.checkCredential!(ctx) as any).ok === true, "not checked");
+  const other = await raftMountDb("ra-9", RAFT_SERVER);
+  const moved = { ...ctx, async sibling(name: string) {
+    return name === "raft" ? { credential: RAFT_CREDENTIAL, db: other, plugin: "raft", policy: null } : ctx.sibling(name);
+  } };
+  const said = await anHourLater(() => refusal(invoke("whoami", {}, moved)));
+  must(/a check found it belongs to ra-1@rs-1, and this agent is ra-9@rs-1/.test(said) && refreshes === 0 && rows.size === 0, `${said}; refreshes=${refreshes}`);
+  must(verifiedRows(agentDb).length === 1, "the record went");
+});
+
+await check("a check of one session does not let another be refreshed", async () => {
+  reset();
+  const { ctx, rows } = makeCtx(session({ refresh_token: "REFRESH-S" }));
+  must((await stampPlugin.checkCredential!(ctx) as any).ok === true, "S was not checked");
+  const t = { ...ctx, credential: session({ access_token: "ACCESS-T", refresh_token: "REFRESH-T" }) };
+  const said = await anHourLater(() => refusal(invoke("whoami", {}, t)));
+  must(/already expired/.test(said) && refreshes === 0 && rows.size === 0, `${said}; refreshes=${refreshes}`);
+});
+
+await check("a check that fails writes nothing: another agent's session, a 401, no Raft identity", async () => {
+  for (const [what, me, status, raft, kind] of [
+    ["another agent", { agentId: "ra-2" }, 200, undefined, "rejected"],
+    ["a 401", null, 401, undefined, "rejected"],
+    ["no Raft identity", null, 200, null, "unreachable"],
+  ] as const) {
+    reset();
+    const { ctx, rows, agentDb } = makeCtx(session(), makeAgentDb(), "stamp", raft === undefined ? { db: RAFT_DB, credential: RAFT_CREDENTIAL } : raft);
+    const checked: any = await withMe(me, status, () => stampPlugin.checkCredential!(ctx));
+    must(checked.ok === false && checked.kind === kind, `${what}: ${JSON.stringify(checked)}`);
+    must(agentDb!.rows.size === 0 && rows.size === 0 && refreshes === 0, `${what} wrote: agentDb ${agentDb!.rows.size}, rows ${rows.size}`);
+  }
+});
+
+await check("a call that cannot read this agent's Raft identity says to try again, not to sign in", async () => {
+  reset();
+  const { ctx, rows } = makeCtx(expired(), makeAgentDb(), "stamp", null);
+  const said = await refusal(invoke("whoami", {}, ctx));
+  must(/try again shortly/.test(said) && /not a reason to sign in again/.test(said) && rows.size === 0 && refreshes === 0, said);
+});
+
+await check("Stamp's answer without whose it is is told as not knowing, not as another's session", async () => {
+  reset();
+  const { ctx, rows } = makeCtx(expired());
+  const was = replies["GET /v1/me"];
+  replies["GET /v1/me"] = { handle: "x" };
+  try {
+    const said = await refusal(invoke("whoami", {}, ctx));
+    must(/did not say whose it is/.test(said) && !/cannot be given/.test(said) && rows.size === 0, said);
+  } finally { replies["GET /v1/me"] = was; }
+});
+
+// The console's path end to end: this agent's own session passes a check through the gateway.
+await check("through the gateway, a check of this agent's own session passes and is recorded", async () => {
+  reset();
+  const store = await gatewayStore();
+  await store.addMount({
+    tenantId: "t", agentId: "a", alias: "stamp", plugin: "stamp", installationId: "i", connectionId: null,
+    toolVersion: stampPlugin.version, publicConfig: {}, secretRef: "agent:stamp", policy: null,
+  });
+  const credential = session();
+  const checked: any = await gatewayOver(store, credential).checkMount("t", "a", "stamp", credential);
+  must(JSON.stringify(checked).includes('"ok":true'), `check: ${JSON.stringify(checked)}`);
+  must(ownerChecks.length === 1, `owner checks: ${ownerChecks.length}`);
+});
+
+// The check's context reads siblings through the same lookup a call's does: this agent's mounts and no other's.
+await check("a credential check's sibling sees this agent's mounts, and no other agent's", async () => {
+  const store = await gatewayStore();
+  await store.createAgent("t", "b");
+  await store.addMount({
+    tenantId: "t", agentId: "b", alias: "elsewhere", plugin: "raft", installationId: "i-b", connectionId: null,
+    toolVersion: RAFT_STUB.version, publicConfig: {}, secretRef: "agent:raft", policy: null,
+  });
+  const seenBy: Record<string, boolean> = {};
+  const probe = { id: "probe", version: "1.0.0", tools: [], async invoke() { return {}; },
+    async checkCredential(ctx: any) {
+      seenBy.raft = (await ctx.sibling("raft")) !== null;
+      seenBy.elsewhere = (await ctx.sibling("elsewhere")) !== null;
+      return { ok: true };
+    } } as any;
+  await store.addMount({
+    tenantId: "t", agentId: "a", alias: "probe", plugin: "probe", installationId: "i-p", connectionId: null,
+    toolVersion: "1.0.0", publicConfig: {}, secretRef: null, policy: null,
+  });
+  const gw = new ToolGateway(store, [stampPlugin, RAFT_STUB, probe], new Set(["stamp", "raft", "probe"]),
+    { async resolve(ref: string) { return ref === "agent:raft" ? RAFT_CREDENTIAL : null; } });
+  await gw.checkMount("t", "a", "probe", "candidate");
+  must(seenBy.raft === true && seenBy.elsewhere === false, JSON.stringify(seenBy));
 });
 
 // A plugin default may tighten a mount's policy, never loosen it: an operator who

@@ -9,7 +9,7 @@
  * runtime's plumbing rather than Raft operations. The Raft credential stays in the host plugin and is
  * attached only to the operator-configured Raft origin.
  */
-import { keepRaftIdentity, RAFT_CONTEXT_STORE } from "./raft-identity.ts";
+import { keepRaftIdentity, raftIdentityKept, RAFT_CONTEXT_STORE } from "./raft-identity.ts";
 import { createHash } from "node:crypto";
 import { clip, logEvent, routeOf } from "../core/log.ts";
 import type { Json, MountRecord } from "../core/types.ts";
@@ -403,6 +403,9 @@ export const FEATURES_TIMEOUT_MS = 2_000;
 
 /** The mounts with a refresh in flight in this isolate, by tenant, agent and alias: one request per mount at a time. */
 const refreshing = new Set<string>();
+/** When each mount in this isolate last asked Raft for a missing identity, and how soon it may ask again. */
+const identityTried = new Map<string, number>();
+const IDENTITY_RETRY_MS = 60_000;
 
 /**
  * Read the flags again when the kept ones are older than `FEATURES_REFRESH_MS`, in the background: the caller does
@@ -415,6 +418,11 @@ const refreshing = new Set<string>();
  * refresh the object's eviction cuts short only waits for the next hour, its attempt already written. A mount with
  * none kept is left to the listing, which records them and which the runtime re-takes for every mount listed before
  * this build (`FEATURES_BASIS`).
+ *
+ * The same answer says which Raft agent the credential is (src/plugins/raft-identity.ts), and a mount listed before
+ * that was kept has none: so the identity is also read here when it is missing or was kept under a credential since
+ * replaced, whatever the age of the flags, at most once a minute per mount in this isolate (`IDENTITY_RETRY_MS`).
+ * Without this a running mount would wait for a listing nothing asks for, and stamp would refuse every first use.
  */
 function refreshFeatures(ctx: PluginContext): void {
   const key = `${ctx.caller.tenantId}/${ctx.caller.agentId}/${ctx.alias}`;
@@ -423,10 +431,16 @@ function refreshFeatures(ctx: PluginContext): void {
   void (async () => {
     try {
       const kept = object(await ctx.db.get(CONTEXT_STORE, FEATURES_KEY));
-      if (typeof kept.at !== "number" || Date.now() - kept.at < FEATURES_REFRESH_MS) return;
-      await ctx.db.put(CONTEXT_STORE, { ...featuresOf(kept), at: Date.now() }, FEATURES_KEY);
+      const flagsDue = typeof kept.at === "number" && Date.now() - kept.at >= FEATURES_REFRESH_MS;
+      const identityDue = Date.now() - (identityTried.get(key) ?? 0) >= IDENTITY_RETRY_MS && !(await raftIdentityKept(ctx));
+      if (!flagsDue && !identityDue) return;
+      if (flagsDue) await ctx.db.put(CONTEXT_STORE, { ...featuresOf(kept), at: Date.now() }, FEATURES_KEY);
+      if (identityDue) identityTried.set(key, Date.now());
       const me = await raftFor(ctx, { state: false, timeoutMs: FEATURES_TIMEOUT_MS }).routes.agent.context();
-      if (me.ok) await keepFeatures(ctx, me.data.features);
+      if (me.ok) {
+        if (flagsDue) await keepFeatures(ctx, me.data.features);
+        await keepRaftIdentity(ctx, me.data.agent?.id, me.data.server?.id);
+      }
     } catch (e) {
       console.warn(`raft features could not be read again for mount ${ctx.alias}: ${String((e as Error)?.message ?? e)}`);
     } finally {

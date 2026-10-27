@@ -38,6 +38,14 @@ export async function keepRaftIdentity(ctx: PluginContext, agentId: unknown, ser
   }
 }
 
+/** Whether this Raft mount has an identity kept under the credential it holds now (read from its own database). */
+export async function raftIdentityKept(ctx: PluginContext): Promise<boolean> {
+  if (!ctx.credential) return true;
+  const row = await ctx.db.get(RAFT_CONTEXT_STORE, RAFT_IDENTITY_KEY).catch(() => null) as Record<string, unknown> | null;
+  return !!row && typeof row.agentId === "string" && typeof row.serverId === "string" &&
+    row.credential === await credentialDigest(ctx.credential);
+}
+
 /**
  * This agent's Raft identity, from its Raft mount, or null when it cannot be told: no mount named `raft`, a mount of
  * another plugin under that name, no credential, no kept row, or a row kept under a credential since replaced.
