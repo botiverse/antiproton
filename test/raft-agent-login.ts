@@ -840,6 +840,27 @@ await check("through the gateway, the session cookie appears in no tool result, 
 
 globalThis.fetch = originalFetch;
 console.log(`\n  raft agent login\n  ${"─".repeat(56)}`);
+// ---- grantAgentLogin's not-installed fallback, end to end (cody's follow-up to #1086) ----
+
+await check("grantAgentLogin on an app this Server has not installed answers Raft's install_required, through a real sign-in", async () => {
+  const w = world({ list: { body: { services: [], activeLogins: [] } }, login: "install" });
+  w.install();
+  const m = mount();
+  const out = await m.plugin.grantAgentLogin!(m.ctx, SERVICE.id, "CHALLENGE", "#general") as any;
+  must(out.status === "install_required" && out.detail?.actionCardMessageId === "msg_card_2" && out.detail?.target === "#general", JSON.stringify(out));
+  must(w.logins.length === 1 && w.logins[0].service === SERVICE.id && w.logins[0].target === "#general", JSON.stringify(w.logins));
+  must(w.actions().length === 0, "an action was sent to the app");
+});
+
+// Only the not-installed miss falls back to Agent Login; any other failure of the invoke is the caller's, untouched.
+await check("grantAgentLogin rethrows a failure that is not the app being uninstalled, and signs in for nothing", async () => {
+  const w = world({ list: { status: 503 } });
+  w.install();
+  const m = mount();
+  const e = await failure(() => m.plugin.grantAgentLogin!(m.ctx, SERVICE.id, "CHALLENGE"));
+  must(/did not list this agent's apps/.test(e.message) && w.logins.length === 0, `${e.message}; logins ${w.logins.length}`);
+});
+
 for (const r of results) console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);
 const passed = results.filter((r) => r.ok).length;
 console.log(`  ${"─".repeat(56)}\n  ${passed} passed, ${results.length - passed} failed\n`);
