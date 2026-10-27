@@ -1,5 +1,5 @@
 import { createHash, createHmac } from "node:crypto";
-import { createRaft, isInterrupted, RAFT_OPERATIONS } from "@botiverse/raft-sdk";
+import { createRaft, isInterrupted, RAFT_OPERATIONS, type RaftOperationSpec } from "@botiverse/raft-sdk";
 import { raftPlugin as raftWithoutStorage, EXCLUDED, EVENTS_LIMIT, GENERATED, handOver, INBOX_STORE, KEY_LIFETIME_MS, PAGE_ROWS, PUSH_KEY, PUSH_STORE, originOf, pagingArg, toolOf, offeredTerms, escapeMarks, unescapeMarks, createRaftPlugin, downloadAttachment, ATTACHMENT_MAX_BYTES, toolsBasisOf, WITHHELD_ARGUMENTS, FEATURES_BASIS, wakeInstruction, renderInboxSummary, INBOX_SUMMARY, RAFTBENCH_TOOL, RAFTBENCH_READER_BASIS, isRaftbenchReader, appOf, enabledApps } from "../src/plugins/raft.ts";
 import { activityEvents, turnEnds } from "../src/runtime/activity.ts";
 import { readFileSync } from "node:fs";
@@ -2270,6 +2270,14 @@ await check("the Artifacts app's tools are listed only where the context's featu
     must(!toolsOf(raftPlugin, { ...base, toolSnapshot: missing }).some((t) => appTools.includes(t.name)), `no snapshot (${missing}) offered them`);
   }
   must(raftPlugin.tools.some((t) => t.name === "artifacts_list"), "the catalogue lost it");
+});
+
+await check("an operation's app is the manifest's `app`, not its name's namespace: artifacts.x without `app` is Raft's own, and an op with `app` outside the namespace is the app's", async () => {
+  const { app: _, ...listSpec } = RAFT_OPERATIONS.find((op) => op.name === "artifacts.list")!;
+  const spec = (name: string, app?: string): RaftOperationSpec => ({ ...listSpec, name, ...(app === undefined ? {} : { app }) });
+  must(appOf(spec("artifacts.x")) === null, "artifacts.x with no app was taken for an app's operation");
+  must(appOf(spec("messages.x", "artifacts")) === "artifacts", "an op marked app: artifacts was not taken for the app's");
+  must(appOf(spec("artifacts.x", "notes")) === "notes", "the app named by the manifest was not the one returned");
 });
 
 await check("a grant revoked (raftbenchReader true -> absent) drops raftbench_findings at the next listing, a grant added brings it back, and a call while not offered is refused as an unknown tool", async () => {

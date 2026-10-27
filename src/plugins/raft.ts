@@ -2182,14 +2182,13 @@ export function isRaftbenchReader(agent: unknown): boolean {
 }
 
 /**
- * The Raft first-party app an operation belongs to (SDK 0.31.0's `artifacts.*`), named by the id the credential
- * context's `features.enabledApps` lists when the Server has it on; null for Raft's own operations. The manifest marks
- * no app, so the app is the operation's namespace, for the namespaces listed here.
+ * The Raft first-party app an operation belongs to, by the id the credential context's `features.enabledApps` lists
+ * when the Server has it on; null for Raft's own operations. Read from the manifest's `app` (SDK 0.32.0), not the
+ * name's namespace: the SDK states which operations an app owns, so a new app, or an app operation outside its
+ * namespace, needs no change here.
  */
-const APP_NAMESPACES: ReadonlySet<string> = new Set(["artifacts"]);
-export function appOf(op: Pick<RaftOperationSpec, "name">): string | null {
-  const ns = op.name.split(".")[0]!;
-  return APP_NAMESPACES.has(ns) ? ns : null;
+export function appOf(op: Pick<RaftOperationSpec, "app">): string | null {
+  return op.app ?? null;
 }
 
 /** The apps the credential context says are on for this Server (`features.enabledApps`); none when absent (an older Server). */
