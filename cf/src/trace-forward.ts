@@ -310,7 +310,8 @@ const counts = (names: readonly string[]): Record<string, readonly [Source, Fiel
  * name from the agent's rebuild policy, which an operator writes) and `hitRate` (a fraction: `cache_read` / `input` says
  * it). Attrs written that the receiver has no field for, so not sent: tool.refused's `task`, a wake's `inbox_lagging`,
  * `rules_total`, `person_rule_unenforced`, `quiet_custom` and the legacy check's other rule counts (`muted_<scope>`,
- * `own_dm`, `anytime_night`, `default_chatter`, `chatter_unfiltered`), turn_ended's `snapshotMismatches`.
+ * `own_dm`, `anytime_night`, `default_chatter`, `chatter_unfiltered`), turn_ended's `snapshotMismatches`, a send as the
+ * owner's `resolved_by`, `rows_read`, `pages_read` and `bound_hit`.
  *
  * An id-typed field carries an opaque id or a name from code or configuration (a tool's, a model's, a mount's TYPE), never a
  * name a person or a conversation has: where the receiver takes `id` or `code` and this side knows the vocabulary, the
@@ -419,7 +420,7 @@ export const AGENT_TRACE_FIELDS: Readonly<Partial<Record<TraceKind, FieldSpec>>>
   },
   // src/plugins/raft-assistant.ts `sendAsOwner`.
   "raft.assistant_send_as_owner": {
-    // `sent`, `uncertain`, `failed` or `refused:<code>` (`SendResult`).
+    // `sent`, `uncertain`, `failed`, `resolve_failed` or `refused:<code>` (`SendResult`).
     result: ["result", "code"], target_kind: ["target_kind", ["message", "channel", "dm", "channel_id", "other"]],
     in_thread: ["in_thread", "bool"], chars: ["chars", "count"], http_status: ["http_status", "count"],
   },

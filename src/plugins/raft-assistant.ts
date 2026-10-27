@@ -1339,6 +1339,14 @@ export function checkEnded(ctx: PluginContext, end: Pick<TurnEnd, "turnKey" | "o
 export type PersonResolve = (ctx: PluginContext, name: string) =>
   Promise<{ ok: true; id: string; type: unknown; name: string | null } | { ok: false; reason: "unknown" | "unavailable" | "failed" }>;
 
+/**
+ * Raft's read by the name the owner gave (`GET /assistant/owner-resolve?name=`), its body as Raft sent it: what the body
+ * names is the caller's to check. `unknown` is Raft's 404 for the name, `unavailable` the route not being there (a Raft
+ * from before it), `failed` any other failure.
+ */
+export type OwnerResolveRead = (ctx: PluginContext, name: string) =>
+  Promise<{ ok: true; data: Record<string, unknown> } | { ok: false; reason: "unknown" | "unavailable" | "failed"; httpStatus?: number }>;
+
 export interface PreferencesDeps {
   /** The owner inbox read a channel, a thread or a person is resolved against, to its id. */
   inbox: InboxRead;
@@ -1349,22 +1357,34 @@ export interface PreferencesDeps {
   now?: () => number;
 }
 
-/** How many rows of the owner's inbox a rule's subject is looked for in: four pages. */
+/** How many rows of the owner's inbox a rule's subject, or a send's `@name`, is looked for in: four pages. */
 const RESOLVE_PAGES = 4;
+/**
+ * How far a send's `#channel` is looked for in the owner's inbox once Raft's read by name has not found it: every page,
+ * up to this many (2,500 rows) as a bound on a runaway listing, never as the size of an owner's inbox.
+ */
+export const SEND_CHANNEL_PAGES = 50;
 
-/** Every conversation of the owner's, as far as `RESOLVE_PAGES` pages go; null when the read failed. */
-async function allConversations(ctx: PluginContext, inbox: InboxRead): Promise<InboxItem[] | null> {
-  const out: InboxItem[] = [];
-  for (let page = 0; page < RESOLVE_PAGES; page++) {
+/** The owner's conversations as far as `pages` pages go, with how much was read; `more` when the last page read said there were more. */
+async function readConversations(ctx: PluginContext, inbox: InboxRead, pages: number): Promise<{ rows: InboxItem[]; pages: number; more: boolean } | null> {
+  const rows: InboxItem[] = [];
+  let read = 0, more = false;
+  for (let page = 0; page < pages; page++) {
     const r = await inbox(ctx, { filter: "all", limit: INBOX_LIMIT, ...(page ? { offset: page * INBOX_LIMIT } : {}) });
     if (!r.ok) { await pauseOn(ctx, new Error(`${r.status}${r.code ? ` ${r.code}` : ""}`)); return null; }
     const items = inboxItemsOf(r.data);
     if (!items) return null;
-    out.push(...items);
-    const d = r.data as { hasMore?: unknown };
-    if (d.hasMore !== true) break;
+    rows.push(...items);
+    read++;
+    more = (r.data as { hasMore?: unknown }).hasMore === true;
+    if (!more) break;
   }
-  return out;
+  return { rows, pages: read, more };
+}
+
+/** Every conversation of the owner's, as far as `RESOLVE_PAGES` pages go; null when the read failed. */
+async function allConversations(ctx: PluginContext, inbox: InboxRead): Promise<InboxItem[] | null> {
+  return (await readConversations(ctx, inbox, RESOLVE_PAGES))?.rows ?? null;
 }
 
 /** What one preferences call did, for its trace row (`raft.assistant_rules`): words and counts only, never a name, an id or a note. */
@@ -1700,8 +1720,10 @@ export type SendAsOwnerAnswer =
   | { ok: false; status: number | null; code: string | null };
 
 export interface SendAsOwnerDeps {
-  /** The owner inbox read a `#channel`, a `#channel:msgid` or an `@name` is resolved against. */
+  /** The owner inbox read an `@name` is resolved against, and a `#channel` Raft's read by name did not find. */
   inbox: InboxRead;
+  /** Raft's read by name, asked first for a `#channel`; with none, the channel is looked for in the inbox alone. */
+  resolve?: OwnerResolveRead;
   /** The owner messages read, around a message's short id, to find its full id. */
   messages(ctx: PluginContext, request: { channelId: string; around: string; limit: number }): Promise<{ ok: true; data: unknown } | { ok: false; status: number; code?: string }>;
   /** The send itself. Called at most once per tool call: never retried here, whatever it answers. */
@@ -1734,7 +1756,9 @@ type SendResult =
   | "assistant_send_as_owner_off" | "channel_not_found" | "message_not_found" | "owner_cannot_post" | "mass_mention_not_allowed"
   | "invalid_content" | "rate_limited" | "channel_archived" | "assistant_not_enabled" | "unavailable" | "failed"
   /** Refused here, before Raft was asked. */
-  | "mass_mention_local" | "repeat_rate_limited" | "channel_unknown" | "dm_unknown" | "dm_ambiguous" | "message_unknown" | "inbox_unreadable";
+  | "mass_mention_local" | "repeat_rate_limited" | "channel_unknown" | "channel_beyond_read" | "dm_unknown" | "dm_ambiguous" | "message_unknown" | "inbox_unreadable"
+  /** Raft's read of a `#channel` by name failed (not its 404): nothing was sent, and nothing says the channel is not there. */
+  | "resolve_failed";
 
 /**
  * What the owner is told when nothing was sent, one line in the assistant's voice: what happened first, then what they
@@ -1756,7 +1780,9 @@ const TELL: Record<Exclude<SendResult, "sent">, { line: string; text: boolean }>
   unavailable: { line: "I didn't send it: sending as you isn't available on this Raft yet.", text: true },
   failed: { line: "I didn't send it: Raft gave an error. Ask me again in a bit.", text: true },
   uncertain: { line: "I couldn't tell whether it went through. Check the conversation before I send it again.", text: false },
-  channel_unknown: { line: "I didn't send it: I can't find that channel among your conversations.", text: true },
+  channel_unknown: { line: "I didn't send it: there's no channel by that name that you can see in this server.", text: true },
+  channel_beyond_read: { line: "I didn't send it: I couldn't find a channel by that name, but you have more conversations than I could look through.", text: true },
+  resolve_failed: { line: "I didn't send it: Raft couldn't look up that channel just now. Ask me again in a bit.", text: true },
   dm_unknown: { line: "I didn't send it: I can't find a DM of yours with that person.", text: true },
   dm_ambiguous: { line: "I didn't send it: more than one person has that name. Which one did you mean?", text: false },
   message_unknown: { line: "I didn't send it: I couldn't find that message in the channel.", text: true },
@@ -1780,37 +1806,84 @@ function raftResult(a: Extract<SendAsOwnerAnswer, { ok: false }>): Exclude<SendR
 type Resolved = { channelId: string; parentMessageId?: string; where: string };
 
 /**
- * A target as the model gives it, resolved to Raft's ids against the owner's inbox: a channelId is taken as it is (Raft
- * decides whether the owner can post there); `#channel` and `#channel:msgid` by the channel's name among the owner's
- * conversations, a message's full id from a thread row whose root it is or else a read around its short id; `@name` by
- * a DM row of that person. A string is the local refusal's code.
+ * How a target was resolved, for the trace row: `resolved_by` (`id`, `resolve` for Raft's read by name, `inbox`, or
+ * `none` when it was not), and for an inbox read how much was read and whether the read stopped at its bound with more
+ * left. Counts and words only, never a name or an id.
  */
-async function resolveTarget(target: string, inThread: boolean, ctx: PluginContext, deps: SendAsOwnerDeps, selfName: string | null): Promise<Resolved | SendResult> {
-  if (UUID.test(target)) return { channelId: target, where: "that conversation" };
-  const rows = await allConversations(ctx, deps.inbox);
-  if (!rows) return "inbox_unreadable";
+type HowResolved = { resolved_by: "id" | "resolve" | "inbox" | "none"; rows_read?: number; pages_read?: number; bound_hit?: boolean };
+
+/** A channel's id from Raft's read by name, when the body is a channel's: any other type, or no well-formed id, is not one. */
+function channelOfResolve(data: Record<string, unknown>): { id: string; name: string | null } | null {
+  if (data.type !== "channel" || typeof data.id !== "string" || !UUID.test(data.id)) return null;
+  return { id: data.id, name: typeof data.name === "string" && CHANNEL_TARGET.test(`#${data.name.replace(/^#/, "")}`) ? data.name.replace(/^#/, "") : null };
+}
+
+/**
+ * A target as the model gives it, resolved to Raft's ids: a channelId is taken as it is (Raft decides whether the owner
+ * can post there); `@name` by a DM row of that person in the owner's inbox. `#channel` and `#channel:msgid` name their
+ * channel: Raft's read by name first (`deps.resolve`, `#name` as given), which answers for every channel the owner can
+ * see in the assistant's server, however many conversations they have. Its 404, or a 200 that is not a channel's, is a
+ * miss and not a refusal: a Raft from before channels were read by name answers `#name` as a person's 404. A miss is
+ * looked for in the owner's inbox, every page up to `SEND_CHANNEL_PAGES`; any other failure of the read is
+ * `resolve_failed`, never `channel_unknown`. A message's full id comes from a thread row whose root it is, when the inbox
+ * was read, or else a read around its short id. A string is the local refusal's code.
+ */
+async function resolveTarget(target: string, inThread: boolean, ctx: PluginContext, deps: SendAsOwnerDeps, selfName: string | null): Promise<{ to: Resolved | SendResult; how: HowResolved }> {
+  if (UUID.test(target)) return { to: { channelId: target, where: "that conversation" }, how: { resolved_by: "id" } };
   const nameOfRow = (r: InboxItem) => r.channelName?.replace(/^#/, "").toLowerCase() ?? null;
+  const counts = (read: { rows: InboxItem[]; pages: number; more: boolean }, pages: number) =>
+    ({ rows_read: read.rows.length, pages_read: read.pages, bound_hit: read.more && read.pages >= pages });
   const person = PERSON_TARGET.exec(target);
   if (person) {
+    const read = await readConversations(ctx, deps.inbox, RESOLVE_PAGES);
+    if (!read) return { to: "inbox_unreadable", how: { resolved_by: "none" } };
     const name = person[1]!.toLowerCase();
     const bare = (n: string | null) => n?.replace(/^@/, "").toLowerCase() ?? null;
-    const dms = rows.filter((r) => r.channelType === "dm" && r.kind !== "thread" && (bare(r.channelName) === name || bare(r.channelName)?.replace(/~(human|agent)$/, "") === name));
+    const dms = read.rows.filter((r) => r.channelType === "dm" && r.kind !== "thread" && (bare(r.channelName) === name || bare(r.channelName)?.replace(/~(human|agent)$/, "") === name));
     // The DM between the assistant and its owner is never one of theirs to send in (Raft refuses it too).
     const theirs = dms.filter((r) => selfName === null || bare(r.channelName)?.replace(/~(human|agent)$/, "") !== selfName.replace(/^@/, "").toLowerCase());
-    if (!theirs.length) return "dm_unknown";
-    if (new Set(theirs.map((r) => r.channelId)).size > 1) return "dm_ambiguous";
-    return { channelId: theirs[0]!.channelId, where: `your DM with @${person[1]}` };
+    const found = theirs.length > 0 && new Set(theirs.map((r) => r.channelId)).size === 1;
+    const how: HowResolved = { resolved_by: found ? "inbox" : "none", ...counts(read, RESOLVE_PAGES) };
+    if (!theirs.length) return { to: "dm_unknown", how };
+    if (!found) return { to: "dm_ambiguous", how };
+    return { to: { channelId: theirs[0]!.channelId, where: `your DM with @${person[1]}` }, how };
   }
   const channel = CHANNEL_TARGET.exec(target);
   const ref = channel ? null : MESSAGE_REF.exec(target);
-  const name = (channel?.[1] ?? ref?.[1] ?? "").toLowerCase();
-  const row = rows.find((r) => r.channelType !== "dm" && nameOfRow(r) === name && (r.kind !== "thread" || r.parentChannelId));
-  if (!row) return "channel_unknown";
-  const channelId = row.kind === "thread" ? row.parentChannelId! : row.channelId;
-  if (!ref || !inThread) return { channelId, where: `#${name}` };
-  const id = ref[2]!.toLowerCase();
+  const given = channel?.[1] ?? ref?.[1] ?? "";
+  let name = given.toLowerCase();
+  let channelId: string, rows: InboxItem[] | null = null, how: HowResolved;
+  const said = deps.resolve ? await deps.resolve(ctx, `#${given}`) : { ok: false as const, reason: "unavailable" as const };
+  // A refusal of the lookup itself (403, which pauses, or 429) or no answer is a failure. Any other 4xx is a miss: a
+  // Raft from before channels were read may refuse a `#name` other than with a 404, and a miss never sends; it only
+  // falls back to the inbox rows.
+  const refusedLookup = !said.ok && said.reason === "failed" &&
+    !(typeof said.httpStatus === "number" && said.httpStatus >= 400 && said.httpStatus < 500 && said.httpStatus !== 403 && said.httpStatus !== 429);
+  if (refusedLookup) return { to: "resolve_failed", how: { resolved_by: "none" } };
+  const hit = said.ok ? channelOfResolve(said.data) : null;
+  if (hit) {
+    channelId = hit.id;
+    name = hit.name ?? name;
+    how = { resolved_by: "resolve" };
+  } else {
+    const read = await readConversations(ctx, deps.inbox, SEND_CHANNEL_PAGES);
+    if (!read) return { to: "inbox_unreadable", how: { resolved_by: "none" } };
+    rows = read.rows;
+    const row = rows.find((r) => r.channelType !== "dm" && nameOfRow(r) === name && (r.kind !== "thread" || r.parentChannelId));
+    how = { resolved_by: row ? "inbox" : "none", ...counts(read, SEND_CHANNEL_PAGES) };
+    // Stopped at the bound with more left: the channel may be past it, so this is not said to be no channel.
+    if (!row) return { to: how.bound_hit ? "channel_beyond_read" : "channel_unknown", how };
+    channelId = row.kind === "thread" ? row.parentChannelId! : row.channelId;
+  }
+  const to = await threadOf(ctx, deps, channelId, name, ref && inThread ? ref[2]!.toLowerCase() : null, rows);
+  return { to, how };
+}
+
+/** The place in `#name` to send to: the channel itself, or the thread under the message `id` names (full, or short). */
+async function threadOf(ctx: PluginContext, deps: SendAsOwnerDeps, channelId: string, name: string, id: string | null, rows: readonly InboxItem[] | null): Promise<Resolved | SendResult> {
+  if (id === null) return { channelId, where: `#${name}` };
   if (UUID.test(id)) return { channelId, parentMessageId: id, where: `a thread in #${name}` };
-  const root = rows.find((r) => r.kind === "thread" && r.parentChannelId === channelId && r.parentMessageId?.toLowerCase().startsWith(id));
+  const root = rows?.find((r) => r.kind === "thread" && r.parentChannelId === channelId && r.parentMessageId?.toLowerCase().startsWith(id));
   if (root) return { channelId, parentMessageId: root.parentMessageId!, where: `a thread in #${name}` };
   const read = await deps.messages(ctx, { channelId, around: id.slice(0, 8), limit: 5 });
   const messages = read.ok && read.data && typeof read.data === "object" && Array.isArray((read.data as { messages?: unknown }).messages)
@@ -1832,7 +1905,8 @@ async function resolveTarget(target: string, inThread: boolean, ctx: PluginConte
  * - a refusal is answered, not thrown: `not_sent` with Raft's code and the one line the owner is to get (`TELL`), and
  *   the message where they could send it themselves.
  * Its trace row (`raft.assistant_send_as_owner`) and log line say only the result's code, the target's form, whether it
- * went to a thread, the HTTP status and the message's length: never the message, a name or an id.
+ * went to a thread, the HTTP status, the message's length and how the target was resolved (`HowResolved`): never the
+ * message, a name or an id.
  */
 export async function sendAsOwner(args: unknown, ctx: PluginContext, deps: SendAsOwnerDeps): Promise<Json> {
   const a = args && typeof args === "object" && !Array.isArray(args) ? args as Record<string, unknown> : {};
@@ -1865,7 +1939,7 @@ export async function sendAsOwner(args: unknown, ctx: PluginContext, deps: SendA
     throw refusal(`${SEND_AS_OWNER_TOOL}: this agent is not anyone's assistant now`);
   }
   const notSent = (result: Exclude<SendResult, "sent">, extra: Record<string, number | string | boolean> = {}): Json => {
-    trace(result === "uncertain" || result === "failed" ? result : `refused:${result}`, extra);
+    trace(result === "uncertain" || result === "failed" || result === "resolve_failed" ? result : `refused:${result}`, extra);
     const t = TELL[result];
     return {
       state: "not_sent", code: result,
@@ -1874,17 +1948,17 @@ export async function sendAsOwner(args: unknown, ctx: PluginContext, deps: SendA
     };
   };
   if (MASS_MENTION.test(content)) return notSent("mass_mention_local");
-  const resolved = await resolveTarget(target, inThread, ctx, deps, owner.selfName);
-  if (typeof resolved === "string") return notSent(resolved as Exclude<SendResult, "sent">);
+  const { to: resolved, how } = await resolveTarget(target, inThread, ctx, deps, owner.selfName);
+  if (typeof resolved === "string") return notSent(resolved as Exclude<SendResult, "sent">, how);
   const now = (deps.now ?? Date.now)();
   const sendKey = createHash("sha256").update(JSON.stringify([resolved.channelId, resolved.parentMessageId ?? "", content])).digest("hex").slice(0, 32);
   const limited = await ctx.db.get(ASSISTANT_STORE, SEND_LIMITED_KEY) as { key?: unknown; at?: unknown } | undefined;
-  if (limited && limited.key === sendKey && typeof limited.at === "number" && now - limited.at < SEND_LIMITED_HOLD_MS) return notSent("repeat_rate_limited");
+  if (limited && limited.key === sendKey && typeof limited.at === "number" && now - limited.at < SEND_LIMITED_HOLD_MS) return notSent("repeat_rate_limited", how);
   const turn = ctx.caller.turnId ?? null;
   const kept = await ctx.db.get(ASSISTANT_STORE, SENT_IN_TURN_KEY) as { turn?: unknown; keys?: unknown } | undefined;
   const sentThisTurn = turn !== null && kept?.turn === turn && Array.isArray(kept.keys) ? kept.keys.filter((k): k is string => typeof k === "string") : [];
   if (sentThisTurn.includes(sendKey)) {
-    trace("refused:duplicate_in_turn");
+    trace("refused:duplicate_in_turn", how);
     return {
       state: "not_sent", code: "duplicate_in_turn",
       note: `You already sent this exact message there in this turn, and it was posted once. Do not call ${SEND_AS_OWNER_TOOL} again for it, and do not confirm it: Raft showed your owner a receipt.`,
@@ -1899,7 +1973,7 @@ export async function sendAsOwner(args: unknown, ctx: PluginContext, deps: SendA
   if (out.ok) {
     await noteSent();
     await noteSentAsOwner(ctx).catch(() => {});
-    trace("sent");
+    trace("sent", how);
     return {
       state: "sent", where: resolved.where,
       note: "Raft posted it as your owner, labelled as sent by you on their behalf, and showed them a receipt with a delete button: do not send them a confirmation of your own.",
@@ -1909,7 +1983,7 @@ export async function sendAsOwner(args: unknown, ctx: PluginContext, deps: SendA
   if (result === "uncertain") { await noteSent(); await noteSentAsOwner(ctx).catch(() => {}); }
   if (result === "rate_limited") await ctx.db.put(ASSISTANT_STORE, { key: sendKey, at: now } as unknown as Json, SEND_LIMITED_KEY);
   if (result === "assistant_not_enabled") await pauseOn(ctx, new Error(NOT_ENABLED));
-  return notSent(result, out.status !== null ? { http_status: out.status } : {});
+  return notSent(result, { ...how, ...(out.status !== null ? { http_status: out.status } : {}) });
 }
 
 // ---- the doorbell ----------------------------------------------------------------------------------------------------

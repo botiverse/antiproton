@@ -20,7 +20,7 @@ import {
 import { confirmLine, matches, ruleLine, rulesOf, winningRule, type ContactRule } from "../src/plugins/raft-assistant-rules.ts";
 import { setLogSink } from "../src/core/log.ts";
 import { askWake } from "../src/runtime/plugin-wakes.ts";
-import { CONTACT_KEY, type SendAsOwnerDeps } from "../src/plugins/raft-assistant.ts";
+import { CONTACT_KEY, SEND_CHANNEL_PAGES, type SendAsOwnerDeps } from "../src/plugins/raft-assistant.ts";
 import { INTEGRATION_SESSIONS_STORE, REMINDER_TOOL, REMINDER_TOOL_SCHEMA, integrationSessionStore, paramsProblem, reminderServiceOf } from "../src/plugins/raft-assistant-reminder.ts";
 import { withheld } from "../src/plugins/raft-agent-login.ts";
 import { recordedEngine } from "../src/runtime/durable-agent.ts";
@@ -192,10 +192,11 @@ function raft(o: { zone?: unknown; owner?: boolean; dm?: unknown; name?: string;
     /** Conversations whose owner-messages answer fails Raft's shape (the message names no conversation), and every read of one. */
     broken: new Set<string>(), messageReads: [] as string[],
     /**
-     * Raft's person read by name: a person, "unknown" (Raft's 404 for the name), or, with no entry for the name while
-     * `resolveRoute` is false (the default), the route missing (the generic 404 every unknown path gets); `resolves` every read.
+     * Raft's read by name: a person, or a channel by `#name`, "unknown" (Raft's 404 for the name), or, with no entry for
+     * the name while `resolveRoute` is false (the default), the route missing (the generic 404 every unknown path gets).
+     * With the route and no entry, a `#name` is the 404 a Raft gives that reads it as a person's name. `resolves` every read.
      */
-    people: {} as Record<string, { id: string; type: string; name: string } | "unknown" | 500>, resolveRoute: false, resolves: [] as string[],
+    people: {} as Record<string, { id?: unknown; type: string; name: string } | "unknown" | number>, resolveRoute: false, resolves: [] as string[],
     /** Doorbell events by their address (`agent-event:<id8>`), as `GET /history` answers one; every such read. */
     bellEvents: {} as Record<string, unknown>, historyReads: [] as string[],
     /** Every send-as-owner body, and how Raft answers the next ones: sent, a refusal (status and code), or no answer (`drop`). */
@@ -314,7 +315,7 @@ function raft(o: { zone?: unknown; owner?: boolean; dm?: unknown; name?: string;
       const name = u.searchParams.get("name") ?? "";
       r.resolves.push(name);
       const p = r.people[name];
-      if (p === 500) return json(500, { error: "boom" });
+      if (typeof p === "number") return json(p, { error: "refused", code: `status_${p}` });
       return p && p !== "unknown" ? json(200, p) : json(404, { error: "No such person", code: "person_not_found" });
     }
     if (path === "/integrations" && (init?.method ?? "GET") === "GET") return json(200, { services: r.services, activeLogins: [] });
@@ -335,8 +336,12 @@ function raft(o: { zone?: unknown; owner?: boolean; dm?: unknown; name?: string;
     if (path === "/assistant/owner-inbox") {
       const filter = u.searchParams.get("filter") ?? "unread";
       r.inboxReads.push(filter);
-      return r.inbox === 200 ? json(200, { owner: { userId: OWNER }, filter, items: filter === "all" ? r.all : r.unread, hasMore: false, nextOffset: null })
-        : json(r.inbox, { code: "assistant_not_enabled" });
+      if (r.inbox !== 200) return json(r.inbox, { code: "assistant_not_enabled" });
+      if (filter !== "all") return json(200, { owner: { userId: OWNER }, filter, items: r.unread, hasMore: false, nextOffset: null });
+      // `all` in pages, as Raft gives it: `limit` rows from `offset`.
+      const offset = Number(u.searchParams.get("offset") ?? 0), limit = Number(u.searchParams.get("limit") ?? 50);
+      const more = offset + limit < r.all.length;
+      return json(200, { owner: { userId: OWNER }, filter, items: r.all.slice(offset, offset + limit), hasMore: more, nextOffset: more ? offset + limit : null });
     }
     return json(404, { error: "not found", code: "NOT_FOUND" });
   }) as any;
@@ -1605,6 +1610,111 @@ await check("send as owner: what cannot be resolved is not sent, with the owner'
     must(e !== null, `accepted: ${show(args)}`);
   }
   must(/ask them in one short question/.test(String((await asOwner(a, { target: "#ch1", content: "" }).catch((x) => x)).message)), "empty content says to ask");
+});
+
+/** A channel Raft's read by name answers for, and none of the fixture's inbox rows: `#qa-x`. */
+const QA_ID = "9a000000-0000-4000-8000-000000000009";
+/** `n` conversations of the owner's that are none of the fixture's names, then the rest given. */
+const filler = (n: number, ...rest: unknown[]) => [...Array.from({ length: n }, (_, i) =>
+  conv(1, { channelId: `f0000000-0000-4000-8000-${String(i).padStart(12, "0")}`, channelName: `filler-${i}` })), ...rest];
+
+await check("send as owner: a #channel Raft's read by name finds is sent to the id it gives, with no inbox read, and traced resolved_by resolve", async () => {
+  const a = await sender();
+  a.r.resolveRoute = true;
+  a.r.people = { "#qa-x": { id: QA_ID, type: "channel", name: "qa-x" } };
+  const out = await asOwner(a, { target: "#qa-x", content: "On it." });
+  must(out.state === "sent" && out.where === "#qa-x" && show(a.r.asOwner) === show([{ channelId: QA_ID, content: "On it." }]), `sent: ${show(out)} ${show(a.r.asOwner)}`);
+  // The name goes as `#qa-x`, encoded: an unencoded `#` would end the URL's query and Raft would read an empty name.
+  must(show(a.r.resolves) === show(["#qa-x"]) && !a.r.inboxReads.includes("all"), `reads: ${show(a.r.resolves)} ${show(a.r.inboxReads)}`);
+  const row = sendRows(a).at(-1)!;
+  must(row.status === "sent" && row.attrs.resolved_by === "resolve" && !("rows_read" in row.attrs) && !("bound_hit" in row.attrs), show(row));
+  // A message in it: the channel by Raft's read, the message's full id by a read around its short id.
+  const reply = await asOwner(a, { target: "#qa-x:aaaaaaa9", content: "Friday." });
+  must(reply.state === "sent" && show(a.r.asOwner.at(-1)) === show({ channelId: QA_ID, content: "Friday.", parentMessageId: "aaaaaaa9-1111-4222-8333-444455556666" }), `thread: ${show(reply)} ${show(a.r.asOwner.at(-1))}`);
+  must(!show(a.traced).includes("qa-x") && !show(a.traced).includes(QA_ID), `a name or an id in the trace: ${show(sendRows(a))}`);
+});
+
+await check("send as owner: a Raft that reads #name as a person's name (its 404) falls back to the inbox, every page: a channel on page 5 is found", async () => {
+  const a = await sender();
+  a.r.resolveRoute = true;
+  a.r.all = filler(230, conv(9, { channelName: "qa-x" }), ...filler(9));
+  const out = await asOwner(a, { target: "#qa-x", content: "On it." });
+  must(out.state === "sent" && show(a.r.asOwner) === show([{ channelId: conv(9).channelId, content: "On it." }]), `sent: ${show(out)} ${show(a.r.asOwner)}`);
+  must(show(a.r.resolves) === show(["#qa-x"]), `asked Raft first: ${show(a.r.resolves)}`);
+  const row = sendRows(a).at(-1)!;
+  must(row.attrs.resolved_by === "inbox" && row.attrs.rows_read === 240 && Number(row.attrs.rows_read) > 200 && row.attrs.pages_read === 5 && row.attrs.bound_hit === false, show(row));
+});
+
+await check("send as owner: a #channel neither Raft's read nor the owner's inbox finds is not sent, said as a channel they cannot see in this server", async () => {
+  const a = await sender();
+  a.r.resolveRoute = true;
+  const out = await asOwner(a, { target: "#nope", content: "Hi." });
+  must(out.state === "not_sent" && out.code === "channel_unknown" && a.r.asOwner.length === 0, show(out));
+  must(out.tell.split("\n")[0] === "I didn't send it: there's no channel by that name that you can see in this server." && !/among your conversations/.test(out.tell), show(out.tell));
+  const row = sendRows(a).at(-1)!;
+  must(row.status === "refused:channel_unknown" && row.attrs.resolved_by === "none" && row.attrs.rows_read === sendRows0().length && row.attrs.pages_read === 1 && row.attrs.bound_hit === false, show(row));
+});
+
+await check("send as owner: an inbox read that stops at its bound with more left does not say there is no such channel", async () => {
+  const a = await sender();
+  a.r.resolveRoute = true;
+  a.r.all = filler(SEND_CHANNEL_PAGES * 50 + 10);
+  const out = await asOwner(a, { target: "#nope", content: "Hi." });
+  must(out.state === "not_sent" && out.code === "channel_beyond_read" && /more conversations than I could look through/.test(out.tell) && a.r.asOwner.length === 0, show(out));
+  const row = sendRows(a).at(-1)!;
+  must(row.attrs.bound_hit === true && row.attrs.pages_read === SEND_CHANNEL_PAGES && row.attrs.rows_read === SEND_CHANNEL_PAGES * 50, show(row));
+});
+
+await check("send as owner: a 200 from Raft's read that is not a channel's (a person, an id that is not one) is never sent to: the inbox decides", async () => {
+  for (const [what, said] of [["a person", { id: "9b000000-0000-4000-8000-000000000001", type: "user", name: "nope" }],
+    ["a channel with a bad id", { id: "not-an-id", type: "channel", name: "nope" }], ["a channel with no id", { type: "channel", name: "nope" }]] as const) {
+    const a = await sender();
+    a.r.resolveRoute = true;
+    a.r.people = { "#nope": said, "#ch1": said };
+    const out = await asOwner(a, { target: "#nope", content: "Hi." });
+    must(out.state === "not_sent" && out.code === "channel_unknown" && a.r.asOwner.length === 0, `${what}: ${show(out)} ${show(a.r.asOwner)}`);
+    must(sendRows(a).at(-1)?.attrs.resolved_by === "none", `${what}: ${show(sendRows(a).at(-1))}`);
+    // The same answer for a name the inbox has: sent to the inbox's channel, not to what Raft's read named.
+    const there = await asOwner(a, { target: "#ch1", content: "Hi." });
+    must(there.state === "sent" && show(a.r.asOwner) === show([{ channelId: conv(1).channelId, content: "Hi." }]) && sendRows(a).at(-1)?.attrs.resolved_by === "inbox", `${what}: ${show(a.r.asOwner)}`);
+  }
+});
+
+await check("send as owner: Raft's read by name failing (a 500) is resolve_failed, not channel_unknown: no inbox read, nothing sent", async () => {
+  const a = await sender();
+  a.r.resolveRoute = true;
+  a.r.people = { "#ch1": 500 };
+  const out = await asOwner(a, { target: "#ch1", content: "Hi." });
+  must(out.state === "not_sent" && out.code === "resolve_failed" && /Raft couldn't look up that channel just now\. Ask me again in a bit\./.test(out.tell), show(out));
+  must(a.r.asOwner.length === 0 && !a.r.inboxReads.includes("all"), `sent ${show(a.r.asOwner)}, reads ${show(a.r.inboxReads)}`);
+  const row = sendRows(a).at(-1)!;
+  must(row.status === "resolve_failed" && row.verdict === "failed" && row.attrs.resolved_by === "none", show(row));
+});
+
+await check("send as owner: a lookup Raft refuses with a 4xx other than 403 or 429 is a miss, read from the inbox; a 403 or a 429 is resolve_failed", async () => {
+  // A Raft from before channels were read may refuse a `#name` with a 400 rather than a 404.
+  const a = await sender();
+  a.r.resolveRoute = true;
+  a.r.people = { "#ch1": 400 };
+  const out = await asOwner(a, { target: "#ch1", content: "Hi." });
+  must(out.state === "sent" && a.r.asOwner.length === 1 && a.r.inboxReads.includes("all"), `a 400: ${show(out)} reads ${show(a.r.inboxReads)}`);
+  must(sendRows(a).at(-1)?.attrs.resolved_by === "inbox", show(sendRows(a).at(-1)));
+  for (const status of [403, 429]) {
+    const b = await sender();
+    b.r.resolveRoute = true;
+    b.r.people = { "#ch1": status };
+    const refused = await asOwner(b, { target: "#ch1", content: "Hi." });
+    must(refused.state === "not_sent" && refused.code === "resolve_failed" && b.r.asOwner.length === 0 && !b.r.inboxReads.includes("all"), `a ${status}: ${show(refused)} reads ${show(b.r.inboxReads)}`);
+  }
+});
+
+await check("send as owner: a channelId target is taken as it is: neither Raft's read by name nor the inbox is asked", async () => {
+  const a = await sender();
+  a.r.resolveRoute = true;
+  const out = await asOwner(a, { target: QA_ID, content: "Hi." });
+  must(out.state === "sent" && show(a.r.asOwner) === show([{ channelId: QA_ID, content: "Hi." }]), show(out));
+  must(a.r.resolves.length === 0 && a.r.inboxReads.length === 0, `reads: ${show(a.r.resolves)} ${show(a.r.inboxReads)}`);
+  must(sendRows(a).at(-1)?.attrs.resolved_by === "id", show(sendRows(a).at(-1)));
 });
 
 await check("send as owner: a 403 assistant_not_enabled pauses the assistant, as every call's does", async () => {
