@@ -392,7 +392,7 @@ export async function keepOwnerFromContext(ctx: PluginContext, context: OwnerCon
   };
   const next = same ? await modeChanged(ctx, same.raftCheck, owner, Date.now()) : owner;
   await saveOwner(ctx, next);
-  traceOwnerKept(ctx, same, next, via);
+  traceOwnerKept(ctx, kept, next, via);
   if (owner.raftCheck && !same?.raftCheck) await askBriefImport(ctx, owner);
   return next;
 }
@@ -408,7 +408,9 @@ export type OwnerRead = "listing" | "recheck";
  * text; the rest are booleans and the fixed `via`. Never the owner's id, handle or DM target: the row says what changed,
  * not whose.
  */
-function traceOwnerKept(ctx: PluginContext, before: AssistantOwner | null, after: AssistantOwner, via: OwnerRead): void {
+function traceOwnerKept(ctx: PluginContext, stored: AssistantOwner | null, after: AssistantOwner, via: OwnerRead): void {
+  // Another owner's record is no "before" for this one: `first` is what tells the trace when this owner was first kept.
+  const before = stored?.userId === after.userId ? stored : null;
   const changed = !before || (Object.keys(after) as Array<keyof AssistantOwner>).some((k) => JSON.stringify(before[k]) !== JSON.stringify(after[k]));
   if (!changed) return;
   ctx.trace?.({

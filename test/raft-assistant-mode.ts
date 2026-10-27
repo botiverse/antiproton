@@ -184,7 +184,7 @@ function reminderApp(r: any, u: URL, init: any): Response {
 /** Raft as an assistant's credential meets it: its context, its owner DM, its events, the owner inbox. */
 function raft(o: { zone?: unknown; owner?: boolean; dm?: unknown; name?: string; language?: unknown } = {}) {
   const r = {
-    owner: o.owner ?? true, zone: "zone" in o ? o.zone : "Europe/Berlin", dm: o.dm, contextStatus: 200,
+    owner: o.owner ?? true, userId: OWNER as string, zone: "zone" in o ? o.zone : "Europe/Berlin", dm: o.dm, contextStatus: 200,
     /** Raft's `assistantOf.language`: absent from the context while undefined, as an older Server leaves it. */
     language: o.language,
     sends: [] as any[], send: "sent" as "sent" | "held", events: [] as unknown[], inbox: 200, contexts: 0,
@@ -228,7 +228,7 @@ function raft(o: { zone?: unknown; owner?: boolean; dm?: unknown; name?: string;
       if (r.contextStatus !== 200) return json(r.contextStatus, { error: "no", code: "forbidden" });
       return json(200, {
         agent: { id: "agent-1", name: "ada-assistant", displayName: null, description: null, runtime: "external", external: true,
-          assistantOf: r.owner ? { userId: OWNER, ...(r.zone !== undefined ? { timezone: r.zone } : {}), ...(r.dm !== undefined ? { dmTarget: r.dm } : {}), ...(o.name ? { name: o.name } : {}), ...(r.raftCheck !== undefined ? { raftCheck: r.raftCheck } : {}), ...(r.language !== undefined ? { language: r.language } : {}) } : null },
+          assistantOf: r.owner ? { userId: r.userId, ...(r.zone !== undefined ? { timezone: r.zone } : {}), ...(r.dm !== undefined ? { dmTarget: r.dm } : {}), ...(o.name ? { name: o.name } : {}), ...(r.raftCheck !== undefined ? { raftCheck: r.raftCheck } : {}), ...(r.language !== undefined ? { language: r.language } : {}) } : null },
         server: { id: "server-1", slug: "s", name: "S" }, credential: { capabilities: ["read", "send", "reactions"] }, prompt: null,
       });
     }
@@ -600,6 +600,11 @@ await check("a context read that changes the owner record writes one raft.assist
   const kept = a.read(ASSISTANT_STORE, OWNER_KEY);
   must(kept.userId === OWNER && kept.ownerName === "ada" && kept.dmTarget === "dm:@ada~human", `control: ${show(kept)}`);
   for (const secret of [OWNER, "ada"]) must(!show(rows(a)).includes(secret), `a row carries ${secret}: ${show(rows(a))}`);
+  // Another person becomes the owner: the stored record is not theirs, so the row is their first.
+  a.r.userId = "0b1c2d3e-4f50-4617-8899-aabbccddeeff";
+  await raftPlugin.snapshotTools!(a.ctx);
+  const handed = rows(a);
+  must(handed.length === 3 && handed[2].attrs.first === true && handed[2].attrs.language_changed === true, `a new owner: ${show(handed)}`);
 });
 
 await check("a paused assistant's recheck that un-pauses writes a raft.assistant_owner row with via recheck; a context naming no owner drops the record with one dropped row, and a second such read writes none", async () => {
