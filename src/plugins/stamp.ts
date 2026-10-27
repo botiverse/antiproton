@@ -907,7 +907,8 @@ export const stampPlugin: Plugin = {
         // the approval, never with it. The approval stands if the comment fails.
         const approved = (await call("POST", `${prBase(a)}/approve`, ctx,
           { expectedHead: sha(a, "head"), expectedBase: sha(a, "base") })) as Json;
-        if (a.note === undefined || String(a.note).trim() === "") return approved;
+        // One shape whether or not a note was given: `approval`, then what became of the note.
+        if (a.note === undefined || String(a.note).trim() === "") return { approval: approved };
         // The comment is a write of its own: `pr_comment`'s policy decides it,
         // whatever lifted `pr_approve`. Held or refused, the note comes back
         // unposted and the approval stands.

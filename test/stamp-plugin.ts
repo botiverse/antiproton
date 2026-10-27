@@ -207,6 +207,13 @@ await check("an approval names the exact head and base it is about, and its note
   must(r.approval?.approved === true && r.comment?.id === "c1", JSON.stringify(r));
 });
 
+await check("an approval answers in one shape, with or without a note", async () => {
+  reset();
+  const bare: any = await invoke("pr_approve", { repo: "o/r", number: 7, head: HEAD, base: BASE }, makeCtx().ctx);
+  must(bare.approval?.approved === true && Object.keys(bare).join() === "approval", JSON.stringify(bare));
+  must(seen.length === 1, `a bare approval sent ${seen.length} requests`);
+});
+
 await check("an approval whose note cannot be posted still stands, and says so", async () => {
   reset();
   const { ctx } = makeCtx();
