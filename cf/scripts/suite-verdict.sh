@@ -62,15 +62,56 @@ suite_removals() {
 # line's accuracy would rest on .gitignore and on staging rules, which is more
 # to get wrong than the case is worth. Saying "this run cannot be referred to
 # again" is the whole content of the warning.
+#
+# Each line carries the time it was read (UTC): a gate prints it first and
+# last, and the two times are what show a log's readings bracket the run, or
+# the deploy, they describe.
 gate_provenance() {
   local sha tree
   sha=$(git rev-parse --verify --quiet HEAD) || { echo "gate: not a git worktree"; return; }
   tree=$(git rev-parse --verify --quiet "HEAD^{tree}")
-  if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
-    echo "gate: $sha + UNCOMMITTED CHANGES (so this run is of no stored tree; HEAD's is $tree)"
+  if ! gate_tree_clean; then
+    echo "gate: $sha + UNCOMMITTED CHANGES (so this run is of no stored tree; HEAD's is $tree) at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    gate_dirty_files
   else
-    echo "gate: $sha (tree $tree)"
+    echo "gate: $sha (tree $tree) at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   fi
+}
+
+# gate_tree_clean: succeeds when the working copy is exactly HEAD's tree, the
+# one condition under which HEAD's tree names what a gate ran on. Untracked
+# files count: the loops pick up an untracked test/*.ts, and an untracked source
+# file is bundled if tracked code imports it. Ignored files do not (node_modules,
+# build output). A status that cannot be read is not clean. One definition, so
+# the provenance line and the deploy gate's refusal cannot disagree about it.
+gate_tree_clean() {
+  local s
+  s=$(git status --porcelain 2>/dev/null) || return 1
+  [ -z "$s" ]
+}
+
+# gate_dirty_files: the status lines that make the tree dirty, at most 20 and
+# then a count. Every refusal on gate_tree_clean prints them: the check covers
+# the whole repository (bench/, docs/, report/ as well as cf/, src/, test/), so
+# a reader looking only where the code is would find nothing to explain it.
+# The listing stops at 20 on purpose: a checkout with thousands of stray files
+# would otherwise bury the refusal it explains; the count says how many more.
+gate_dirty_files() {
+  local s n
+  s=$(git status --porcelain 2>&1) || { echo "  (git status failed: $s)"; return; }
+  # sed reads to the end rather than `head` closing the pipe early, which under
+  # a caller's `set -o pipefail` would fail the refusal before it is printed.
+  n=$(printf '%s\n' "$s" | grep -c . || true)
+  printf '%s\n' "$s" | sed -n '1,20s/^/  /p'
+  if [ "$n" -gt 20 ]; then echo "  and $((n - 20)) more"; fi
+}
+
+# gate_dirty_advice: the next step after a refusal on gate_tree_clean. It
+# names no cleaning command: the ignored files in a checkout include
+# credentials (.dev.vars, .secrets), and the cleaning that also removes
+# ignored files would delete them.
+gate_dirty_advice() {
+  echo "Deploy with cf/scripts/deploy-pinned.sh (a fresh worktree), or commit or move the listed files."
 }
 
 # suite_name: the name column of a gate's output line.
