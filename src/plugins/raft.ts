@@ -21,7 +21,7 @@ import {
 import { PARK_BYTES } from "./artifacts.ts";
 import {
   ACTIONS_TOOL, AGENT_LOGIN_TOOLS, INVOKE_TOOL, LIST_TOOL, LOGIN_TOOL, SESSION_STORE, integrationsActions, integrationsInvoke, integrationsList, integrationsLogin,
-  type AgentLoginDeps, type ManifestCache,
+  notInstalled, type AgentLoginDeps, type ManifestCache,
 } from "./raft-agent-login.ts";
 import { internalHost } from "./http.ts";
 import {
@@ -2947,7 +2947,10 @@ export interface RaftArtifacts {
  */
 export function createRaftPlugin(deps: {
   artifacts?: RaftArtifacts | null; excluded?: Readonly<Record<string, string>>; assistant?: AssistantWire;
+  /** Agent Login's invoke and login, for a test that records exactly what `grantAgentLogin` asks for. */
+  agentLoginCalls?: { invoke: typeof integrationsInvoke; login: typeof integrationsLogin };
 } = {}): Plugin {
+  const loginCalls = deps.agentLoginCalls ?? { invoke: integrationsInvoke, login: integrationsLogin };
   const excluded = deps.excluded ?? EXCLUDED;
   const assistant = deps.assistant ?? RAFT_ASSISTANT_WIRE;
   const artifacts = deps.artifacts ?? null;
@@ -3167,11 +3170,27 @@ export function createRaftPlugin(deps: {
      * — so the hook cannot be turned into a way to run any action of any app.
      */
     async grantAgentLogin(ctx: PluginContext, service: string, codeChallenge: string, target?: string): Promise<AgentLoginAnswer> {
-      const out = await integrationsInvoke({
-        service, action: AGENT_LOGIN_ACTION, ...(target ? { target } : {}),
-        params: { schema: AGENT_LOGIN_REQUEST_SCHEMA, code_challenge: codeChallenge, code_challenge_method: "S256" },
-      }, ctx, agentLogin(ctx), manifests) as Record<string, any>;
-      if (out?.status === "approval_required" || out?.status === "install_required") return { status: out.status, detail: out as Json };
+      let out: Record<string, any>;
+      try {
+        out = await loginCalls.invoke({
+          service, action: AGENT_LOGIN_ACTION, ...(target ? { target } : {}),
+          params: { schema: AGENT_LOGIN_REQUEST_SCHEMA, code_challenge: codeChallenge, code_challenge_method: "S256" },
+        }, ctx, agentLogin(ctx), manifests) as Record<string, any>;
+      } catch (e) {
+        // Not installed: Agent Login says so in Raft's own terms (`install_required`, a card where `target` names one).
+        if (!notInstalled(e)) throw e;
+        out = await loginCalls.login({ service, ...(target ? { target } : {}) }, ctx, agentLogin(ctx)) as Record<string, any>;
+        if (out?.status !== "approval_required" && out?.status !== "install_required") throw e;
+      }
+      // Who acts next, without Raft's own `next` (which names this plugin's tools, not the caller's).
+      if (out?.status === "install_required") {
+        const i = out.installation ?? {};
+        return { status: "install_required", detail: { serverName: i.serverName ?? null, marketplaceUrl: i.marketplaceUrl ?? null, target: i.target ?? null, actionCardMessageId: i.actionCardMessageId ?? null } };
+      }
+      if (out?.status === "approval_required") {
+        const a = out.approval ?? {};
+        return { status: "approval_required", detail: { requestId: a.requestId ?? null, target: a.target ?? null, actionCardMessageId: a.actionCardMessageId ?? null } };
+      }
       const r = out?.result as Record<string, unknown> | undefined;
       if (!r || r.schema !== AGENT_LOGIN_GRANT_SCHEMA || typeof r.grant !== "string" || !r.grant) {
         throw new Error(`raft: ${service} answered agent-login with something that is not a ${AGENT_LOGIN_GRANT_SCHEMA}`);

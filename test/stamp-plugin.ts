@@ -14,6 +14,7 @@ import { stampPlugin, SESSION_STORE, parseSession, loadSession, queuedMounts, ga
 import { SqliteStore } from "../src/store/sqlite.ts";
 import { ToolGateway } from "../src/runtime/gateway.ts";
 import { keepRaftIdentity } from "../src/plugins/raft-identity.ts";
+import { createRaftPlugin } from "../src/plugins/raft.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void> | void) {
@@ -1706,6 +1707,75 @@ await check("a tool call with no session does not log in by itself", async () =>
   const { ctx } = makeCtx(null);
   const said = await refusal(invoke("whoami", {}, { ...ctx, async agentLogin(...a: any[]) { asked++; return agentLoginGrants(a[0], a[1]); } }));
   must(asked === 0 && exchanges.length === 0 && /stamp_login/.test(said), `${said}; asked ${asked}`);
+});
+
+// ---- cody's review of #1086: the request the raft side makes, the listing context, and what a trace row holds ----
+
+await check("the raft side asks for exactly the agent-login action with the three closed fields, and nothing else", async () => {
+  const calls: any[] = [];
+  const raft = createRaftPlugin({ agentLoginCalls: {
+    async invoke(args: any) { calls.push(args); return { service: {}, action: "agent-login", result: { schema: "raft-cli-agent-login-grant.v1", grant: "g-1", expires_at: "2026-10-27T10:00:00Z" } } as any; },
+    async login() { throw new Error("not called"); },
+  } });
+  const ctx = { credential: "sk", alias: "raft", caller: { tenantId: "t", agentId: "a" }, publicConfig: { serverUrl: "https://raft.example" } } as any;
+  const out = await raft.grantAgentLogin!(ctx, "stamp", "CHALLENGE", "#general");
+  must(out.status === "grant" && (out as any).grant === "g-1", JSON.stringify(out));
+  must(JSON.stringify(calls) === JSON.stringify([{ service: "stamp", action: "agent-login", target: "#general",
+    params: { schema: "raft-cli-agent-login-request.v1", code_challenge: "CHALLENGE", code_challenge_method: "S256" } }]), JSON.stringify(calls));
+  // Not installed: Agent Login's own install_required, with who acts next and no tool name of the raft plugin's.
+  const uninstalled = createRaftPlugin({ agentLoginCalls: {
+    async invoke() { throw Object.assign(new Error("No app installed on this Server matched \"stamp\""), { notInstalled: true }); },
+    async login() { return { status: "install_required", installation: { serverName: "S", marketplaceUrl: "https://m", target: "#c", actionCardMessageId: "m1" }, next: "call integrations_login again" } as any; },
+  } });
+  const inst: any = await uninstalled.grantAgentLogin!(ctx, "stamp", "CHALLENGE");
+  must(inst.status === "install_required" && inst.detail?.actionCardMessageId === "m1" && !JSON.stringify(inst).includes("integrations_"), JSON.stringify(inst));
+  const approval = createRaftPlugin({ agentLoginCalls: {
+    async invoke() { return { status: "approval_required", approval: { requestId: "r1", target: "#c", actionCardMessageId: "m2" }, next: "call integrations_invoke again" } as any; },
+    async login() { throw new Error("not called"); },
+  } });
+  const appr: any = await approval.grantAgentLogin!(ctx, "stamp", "CHALLENGE");
+  must(appr.status === "approval_required" && appr.detail?.requestId === "r1" && !JSON.stringify(appr).includes("integrations_"), JSON.stringify(appr));
+});
+
+await check("a listing context has no agentLogin, even for a plugin that declares it", async () => {
+  const store = await gatewayStore();
+  let listed: string | undefined;
+  const probe = { id: "probe", version: "1.0.0", agentLogin: { services: ["stamp"] }, tools: [],
+    async invoke() { return {}; },
+    async snapshotTools(c: any) { listed = typeof c.agentLogin; return { tools: [] }; } } as any;
+  await store.addMount({ tenantId: "t", agentId: "a", alias: "probe", plugin: "probe", installationId: "i-p", connectionId: null,
+    toolVersion: "1.0.0", publicConfig: {}, secretRef: null, policy: null });
+  const gw = new ToolGateway(store, [RAFT_STUB, probe], new Set(["raft", "probe"]), { async resolve() { return null; } });
+  await gw.refreshMountTools("t", "a", "probe");
+  must(listed === "undefined", `listing context agentLogin: ${listed}`);
+});
+
+await check("a stamp_login trace row holds only mount, service, owner and whether a session was issued", async () => {
+  const rows: any[] = [];
+  const allowed = new Set(["mount", "service", "owner", "issued"]);
+  reset(); exchanges = [];
+  const { ctx } = makeCtx(null);
+  await invoke("stamp_login", {}, { ...ctx, agentLogin: agentLoginGrants, trace: (r: any) => rows.push(r) });
+  // A failure after Stamp issued a session: the owner check refuses it (another agent's), and it is still traced.
+  const other = makeCtx(null).ctx;
+  await withMe({ agentId: "ra-2" }, 200, () => refusal(invoke("stamp_login", {}, { ...other, agentLogin: agentLoginGrants, trace: (r: any) => rows.push(r) })));
+  must(rows.length === 2 && rows[0].status === "sealed" && rows[1].status === "failed_after_issue" && rows[1].attrs.issued === true, JSON.stringify(rows));
+  for (const r of rows) {
+    const extra = Object.keys(r.attrs).filter((k) => !allowed.has(k));
+    must(extra.length === 0 && !/REFRESH|ACCESS|grant-|verifier/.test(JSON.stringify(r)), `trace row: ${JSON.stringify(r)}`);
+  }
+});
+
+await check("a self-login session whose refresh is refused points at stamp_login, not at a person", async () => {
+  reset(); exchanges = [];
+  const { ctx } = makeCtx(null);
+  const logged = { ...ctx, agentLogin: agentLoginGrants };
+  await invoke("stamp_login", {}, logged);
+  refreshAnswer = () => new Response(JSON.stringify({ error: "refresh_reused" }), { status: 409, headers: { "content-type": "application/json" } });
+  const first = await anHourLater(() => refusal(invoke("whoami", {}, logged)));
+  const later = await anHourLater(() => refusal(invoke("whoami", {}, logged)));
+  for (const said of [first, later]) must(/stamp_login/.test(said) && !/person needs to sign in/.test(said), said);
+  must(refreshes === 1, `refreshes: ${refreshes}`);
 });
 
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.error ? `\n    ${r.error}` : ""}`);

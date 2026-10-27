@@ -126,6 +126,11 @@ function fail(message: string, marks: { transient?: boolean; mayHaveLanded?: boo
   return e;
 }
 
+/** Whether `e` is `findService` finding no installed app: Agent Login (`integrationsLogin`) says what installing it takes. */
+export function notInstalled(e: unknown): boolean {
+  return !!e && typeof e === "object" && (e as { notInstalled?: unknown }).notInstalled === true;
+}
+
 /** What the plugin hands this module: a Raft client for the mount, and the mount's request timeout. */
 export interface AgentLoginDeps {
   raft: () => Raft;
@@ -836,8 +841,11 @@ async function listed(deps: AgentLoginDeps): Promise<Obj> {
 async function findService(deps: AgentLoginDeps, query: string): Promise<ServiceRecord> {
   const services = (obj(await listed(deps)).services as unknown[]).map(serviceOf).filter((s): s is ServiceRecord => s !== null);
   const q = query.trim().toLowerCase();
-  const found = services.find((s) => s.id === query || s.clientId.toLowerCase() === q || s.name.toLowerCase() === q);
-  if (!found) throw fail(`No app installed on this Server matched ${JSON.stringify(query)}. ${LIST_TOOL} shows the installed apps; ${LOGIN_TOOL} says whether one needs installing.`);
+  // An exact service id first: another app named like it must not stand in for it.
+  const found = services.find((s) => s.id === query) ?? services.find((s) => s.clientId.toLowerCase() === q || s.name.toLowerCase() === q);
+  if (!found) {
+    throw Object.assign(fail(`No app installed on this Server matched ${JSON.stringify(query)}. ${LIST_TOOL} shows the installed apps; ${LOGIN_TOOL} says whether one needs installing.`), { notInstalled: true });
+  }
   return found;
 }
 

@@ -156,7 +156,7 @@ async function exclusive<T>(ctx: PluginContext, fn: () => Promise<T>): Promise<T
  * before (`GIVEN_STORE`).
  */
 type Kept = { kind: "none" } | { kind: "open"; session: AgentSession; owner?: string; source?: typeof SELF_LOGIN } |
-  { kind: "relogin"; why: string } | { kind: "spent" } | { kind: "replaced" } | { kind: "unfinished"; refused?: string };
+  { kind: "relogin"; why: string } | { kind: "spent" } | { kind: "replaced" } | { kind: "unfinished"; refused?: string; source?: typeof SELF_LOGIN };
 
 /**
  * Every session a person has given this agent's stamp mounts, by the digest of
@@ -245,7 +245,7 @@ async function readKept(ctx: PluginContext): Promise<Kept> {
     const s = plain === null ? null : parseSession(plain);
     if (!s) return { kind: "relogin", why: "the raft mount's credential has changed since this mount logged in" };
     if (typeof sealed.rotating === "string" && sealed.rotating === await digest(s.refresh_token)) {
-      return { kind: "unfinished", ...(typeof sealed.refused === "string" ? { refused: sealed.refused } : {}) };
+      return { kind: "unfinished", source: SELF_LOGIN, ...(typeof sealed.refused === "string" ? { refused: sealed.refused } : {}) };
     }
     return { kind: "open", session: s, source: SELF_LOGIN, ...(typeof sealed.owner === "string" ? { owner: sealed.owner } : {}) };
   }
@@ -283,12 +283,18 @@ const spentSession = () => new SpentSession(
   "It needs sign-in again: a person signs in for this mount alone and gives it that session.",
 );
 /** A mount whose last rotation was started and never kept: the gateway may have spent its refresh token. */
-const unfinishedRotation = (refused?: string) => new SpentSession(refused
-  ? `stamp: a person needs to sign in again for this mount: the gateway refused its refresh token (${refused}) and will ` +
-    "not refresh it again. Nothing was sent. A person signs in for this mount alone and gives it that session."
-  : "stamp: a person needs to sign in again for this mount: its last refresh did not finish, so the gateway may have " +
-    "rotated the session without this side keeping the new one. Nothing was sent — presenting that refresh token again " +
-    "makes Stamp revoke every token this agent holds, on every machine. A person signs in for this mount alone and gives it that session.",
+const unfinishedRotation = (refused?: string, source?: unknown) => new SpentSession(source === SELF_LOGIN
+  ? (refused
+    ? `stamp: this mount's own login cannot be refreshed: the gateway refused its refresh token (${refused}) and will not refresh it again. Nothing was sent. ${signInAgain(source, true)}.`
+    : "stamp: this mount's own login cannot be used: its last refresh did not finish, so the gateway may have rotated the session " +
+      "without this side keeping the new one. Nothing was sent — presenting that refresh token again makes Stamp revoke every " +
+      `token this agent holds. ${signInAgain(source, true)}.`)
+  : refused
+    ? `stamp: a person needs to sign in again for this mount: the gateway refused its refresh token (${refused}) and will ` +
+      "not refresh it again. Nothing was sent. A person signs in for this mount alone and gives it that session."
+    : "stamp: a person needs to sign in again for this mount: its last refresh did not finish, so the gateway may have " +
+      "rotated the session without this side keeping the new one. Nothing was sent — presenting that refresh token again " +
+      "makes Stamp revoke every token this agent holds, on every machine. A person signs in for this mount alone and gives it that session.",
 );
 /** A credential some mount of this agent was already given: it may have been rotated, so it is never sealed again. */
 const givenBefore = () => new SpentSession(
@@ -299,8 +305,16 @@ const givenBefore = () => new SpentSession(
 const refuseUnusable = (kept: Kept) => {
   if (kept.kind === "relogin") throw reloginNeeded(kept.why);
   if (kept.kind === "spent") throw spentSession();
-  if (kept.kind === "unfinished") throw unfinishedRotation(kept.refused);
+  if (kept.kind === "unfinished") throw unfinishedRotation(kept.refused, kept.source);
 };
+
+/**
+ * Who makes this mount usable again, in the words its kept session calls for: a session a person gave needs a person
+ * to sign in again; one this mount logged in for itself (`source`) needs only `stamp_login` (cody, #1086).
+ */
+const signInAgain = (source: unknown, capital = false): string => source === SELF_LOGIN
+  ? `${capital ? "Log" : "log"} in again with ${LOGIN_TOOL} (a person approves it unless this mount's policy allows it)`
+  : `${capital ? "A" : "a"} person needs to sign in again for this mount alone and give it that session`;
 
 /** A session this mount logged in for itself that cannot be opened now: the agent logs in again, no person needed. */
 const reloginNeeded = (why: string) => new SpentSession(
@@ -585,7 +599,7 @@ async function rotate(ctx: PluginContext, used: AgentSession): Promise<AgentSess
     } catch (e) {
       throw new Error(`stamp: the refresh got no answer (${String((e as Error)?.message ?? e).slice(0, 200)}). ` +
         "The gateway may have rotated the session, so this mount will not present that refresh token again: " +
-        "a person needs to sign in again for this mount alone and give it that session.");
+        `${signInAgain(source)}.`);
     }
     let body: Record<string, unknown> = {};
     try { body = text ? JSON.parse(text) as Record<string, unknown> : {}; } catch { body = { text: text.slice(0, 500) }; }
@@ -605,10 +619,10 @@ async function rotate(ctx: PluginContext, used: AgentSession): Promise<AgentSess
         try { await storeSession(ctx, used, { owner, source, rotating: marking, refused: code }); } catch { /* the mark stands */ }
         throw new Error(code === "refresh_expired" || code === "refresh_invalid"
           ? `stamp: the gateway will never refresh this session's refresh token (${code}). ` +
-            "A person needs to sign in again for this mount alone and give it that session; do not retry."
+            `${signInAgain(source, true)}; do not retry.`
           : `stamp: this session's refresh token was already used elsewhere or has been revoked (${code}), and the gateway ` +
             "revokes every token that agent holds for the service when that happens — including other machines. " +
-            "A person needs to sign in again for this mount alone and give it that session; do not retry.",
+            `${signInAgain(source, true)}; do not retry.`,
         );
       }
       const detail = String(body.message ?? body.text ?? "").slice(0, 300).trim();
@@ -621,7 +635,7 @@ async function rotate(ctx: PluginContext, used: AgentSession): Promise<AgentSess
       // which only costs a sign-in.
       if (res.status >= 500) {
         throw new Error(`${said}. The gateway may have rotated the session before failing, so this mount will not ` +
-          "present that refresh token again: a person needs to sign in again for this mount alone and give it that session.");
+          `present that refresh token again: ${signInAgain(source)}.`);
       }
       await storeSession(ctx, used, { owner, source });
       if (code === "invalid_schema") {
@@ -635,7 +649,7 @@ async function rotate(ctx: PluginContext, used: AgentSession): Promise<AgentSess
       refresh_token: body.refresh_token ?? (body as any).refreshToken });
     if (!next) {
       throw new Error("stamp: the refresh answered something that is not a session; nothing was stored. The gateway may " +
-        "have rotated the session, so a person needs to sign in again for this mount alone and give it that session.");
+        `have rotated the session, so ${signInAgain(source)}.`);
     }
 
     // Before it is used, always: a rotation that cannot be kept would leave the
@@ -643,7 +657,7 @@ async function rotate(ctx: PluginContext, used: AgentSession): Promise<AgentSess
     try { await storeSession(ctx, next, { owner, source }); } catch (e) {
       throw new Error(`stamp: the gateway rotated this mount's session, but the new one could not be kept ` +
         `(${String((e as Error)?.message ?? e).slice(0, 200)}). The refresh token this mount holds is now spent, so it ` +
-        "will not be sent again: a person needs to sign in again for this mount alone and give it that session.");
+        `will not be sent again: ${signInAgain(source)}.`);
     }
     return next;
   });
@@ -685,8 +699,27 @@ function noSession(ctx: PluginContext): Error {
  * In the queue, so two calls cannot both log in. One trace row per attempt, never a token.
  */
 async function selfLogin(ctx: PluginContext, target?: string): Promise<Record<string, Json>> {
-  const trace = (status: string, verdict: "ok" | "failed" | "blocked", attrs: Record<string, unknown> = {}) =>
-    ctx.trace?.({ kind: "stamp.agent_login", status, verdict, attrs: { mount: ctx.alias, service: STAMP_SERVICE, ...attrs } });
+  // One row per attempt, whatever ends it: a throw nothing below traced writes a `failed` row before it is rethrown,
+  // which matters most after Stamp has issued a session (the owner check, the seal). Only these keys, never a token.
+  let traced = false;
+  let issued = false;
+  const trace = (status: string, verdict: "ok" | "failed" | "blocked", attrs: { owner?: string } = {}) => {
+    traced = true;
+    ctx.trace?.({ kind: "stamp.agent_login", status, verdict,
+      attrs: { mount: ctx.alias, service: STAMP_SERVICE, ...(attrs.owner ? { owner: attrs.owner } : {}), issued } });
+  };
+  try {
+    return await selfLoginAttempt(ctx, target, trace, () => { issued = true; });
+  } catch (e) {
+    if (!traced) trace(issued ? "failed_after_issue" : "failed", "failed");
+    throw e;
+  }
+}
+
+async function selfLoginAttempt(
+  ctx: PluginContext, target: string | undefined,
+  trace: (status: string, verdict: "ok" | "failed" | "blocked", attrs?: { owner?: string }) => void, markIssued: () => void,
+): Promise<Record<string, Json>> {
   if (typeof ctx.agentLogin !== "function") {
     trace("unavailable", "blocked");
     return { status: "unavailable", reason: "this context cannot log in for the agent; give the mount a session `stamp login` made instead" };
@@ -734,6 +767,7 @@ async function selfLogin(ctx: PluginContext, target?: string): Promise<Record<st
           ? `stamp: Stamp failed the exchange (HTTP ${res.status}${code ? ` ${code}` : ""}); a session may have been issued and is lost. Nothing was kept. Call ${LOGIN_TOOL} again; it starts over with a new grant.`
           : `stamp: Stamp refused the exchange (${code || `HTTP ${res.status}`}). Nothing was kept. Call ${LOGIN_TOOL} again; it starts over with a new grant.`);
     }
+    markIssued();
     const session = parseSession(body);
     if (!session) {
       trace("exchange_failed:not_a_session", "failed");
