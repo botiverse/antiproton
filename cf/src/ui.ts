@@ -1081,7 +1081,7 @@ export function approvals(rows: ApprovalRecord[]): string {
         const what = route
           ? `<div><span class="badge">${esc(String(route.method ?? ""))}</span> <code>${esc(String(route.path ?? ""))}</code>${
               route.repo ? ` <span class="hint">${esc(String(route.repo))}${route.pr !== undefined ? ` #${esc(String(route.pr))}` : ""}</span>` : ""}</div>${
-              typeof route.body === "string" ? `<pre>${esc(route.body)}</pre>${route.bodyTruncated ? `<div class="hint">body truncated: first ${route.body.length} of ${esc(String(route.bodySize))} characters shown</div>` : ""}` : ""}`
+              typeof route.body === "string" ? `${route.contentType ? `<div class="hint">sent as <code>${esc(String(route.contentType))}</code></div>` : ""}<pre>${esc(route.body)}</pre>${route.bodyTruncated ? `<div class="hint">body truncated: first ${route.body.length} of ${esc(String(route.bodySize))} characters shown</div>` : ""}` : ""}`
           : `<pre>${esc(JSON.stringify(req?.args ?? {}, null, 2))}</pre>`;
         return `<div class="card">
   <div><span class="tool">${esc(a.mountAlias)}.${esc(a.tool)}</span>${req?.heldBy === "agent" ? ` <span class="badge warn">the agent asked you to confirm</span>` : ""}</div>

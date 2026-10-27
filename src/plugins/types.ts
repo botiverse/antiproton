@@ -2614,6 +2614,12 @@ export interface BridgeResponse {
   status: number;
   headers: Record<string, string>;
   text: string;
+  /**
+   * Credential values this request used besides the mount's stored one (`PluginContext.credential`, which the core
+   * redacts on its own): a token minted or rotated for it. Each is replaced in the text and the header values before
+   * the box reads them, since an upstream may echo what it was sent.
+   */
+  secrets?: readonly string[];
 }
 
 /**
@@ -2623,8 +2629,15 @@ export interface BridgeResponse {
 export type RouteEntry = {
   methods: readonly string[];
   path: RegExp;
-  /** The body parsed as JSON where it parses, else the text as sent, or null for none. */
-  body?: (body: Json | string | null) => boolean;
+  /**
+   * Whether the row applies, asked of the body as a JSON object, or null when the request has none. A body that is
+   * present and is not a JSON object — not JSON at all (form-encoded, a byte-order mark before the JSON), an array, a
+   * bare value — is never handed over: the request is an unlisted write, held for a person, since a predicate cannot
+   * say "not this row" about a body it cannot read, and a later, looser row must not take it. A predicate that throws
+   * is held the same way. False on an object moves on to the next row, so the predicate has to be as robust as
+   * upstream is about spelling — key and value case, aliases — or a spelling it missed reaches a later row.
+   */
+  body?: (body: { [k: string]: Json } | null) => boolean;
 } & (
   /** Decided under this key and the bridge tool's own entry, the stricter of the two (`Plugin.policyKey`). */
   | { key: string; refuse?: undefined }
@@ -2649,9 +2662,9 @@ export interface BridgeDecl {
   box: { files: Readonly<Record<string, string>>; entry: string; exports: readonly string[] };
   routes: readonly RouteEntry[];
   /**
-   * The policy key of a write no row matches. Fails closed: with no entry for it on the mount, it should be
-   * `approval` in the plugin's `defaultPolicy`, so a route the table forgot costs a person's click, not a silent
-   * write. A read no row matches is decided under the bridge tool's own name, which is the mount's read half unless
+   * The policy key of a write no row matches. Fails closed: with no entry for it on the mount it is `approval`, and the
+   * plugin's `defaultPolicy` may tighten that to `deny` but not loosen it, so a route the table forgot costs a person's
+   * click, not a silent write; only the mount's own entry lifts it. A read no row matches is decided under the bridge tool's own name, which is the mount's read half unless
    * it names `request`. Must not be the name of a real tool (`ToolGateway` refuses the plugin).
    */
   unlistedWriteKey: string;
@@ -2661,7 +2674,10 @@ export interface BridgeDecl {
   normalize?(path: string): string;
   /** What the approval card names besides method and path. Absent, or a throw: method and path only. */
   describe?(path: string): { repo?: string; pr?: number | string };
-  /** Response headers the box sees besides `content-type` and `x-request-id`; a trailing `*` matches a prefix. */
+  /**
+   * Response headers the box sees besides `content-type` and `x-request-id`, by exact name (a pattern is refused).
+   * A header that carries a credential (`set-cookie`, `authorization`, …) is never handed over, listed or not.
+   */
   responseHeaders?: readonly string[];
 }
 
@@ -2678,20 +2694,28 @@ export type RouteClass =
  */
 export function classifyRoute(decl: Pick<BridgeDecl, "routes" | "unlistedWriteKey">, method: string, path: string, body: string | null): RouteClass {
   const m = method.toUpperCase();
-  let parsed: Json | string | null = body;
-  if (typeof body === "string") { try { parsed = JSON.parse(body) as Json; } catch { /* matched as the text */ } }
+  const held: RouteClass = { kind: "unlisted-write", key: decl.unlistedWriteKey };
+  // `undefined`: present, and not a JSON object (see `RouteEntry.body`).
+  let parsed: { [k: string]: Json } | null | undefined = null;
+  if (body !== null) {
+    try {
+      const v = JSON.parse(body) as Json;
+      parsed = v !== null && typeof v === "object" && !Array.isArray(v) ? v as { [k: string]: Json } : undefined;
+    } catch { parsed = undefined; }
+  }
   for (const row of decl.routes) {
     // Case-insensitive, as upstream routes are (`…/MERGE` is a merge), and never on a `g` or `y` regex's last index.
     if (!row.methods.some((x) => x.toUpperCase() === m) || !new RegExp(row.path.source, row.path.flags.replace(/[gyi]/g, "") + "i").test(path)) continue;
     if (row.body) {
+      if (parsed === undefined) return held;
       let hit = false;
       // A predicate that throws on a body it did not expect has not said the row does not apply; held, not skipped.
-      try { hit = row.body(parsed); } catch { return { kind: "unlisted-write", key: decl.unlistedWriteKey }; }
+      try { hit = row.body(parsed); } catch { return held; }
       if (!hit) continue;
     }
     return row.refuse !== undefined ? { kind: "refused", message: row.refuse } : { kind: "listed", key: row.key! };
   }
-  return m === "GET" || m === "HEAD" ? { kind: "unlisted-read" } : { kind: "unlisted-write", key: decl.unlistedWriteKey };
+  return m === "GET" || m === "HEAD" ? { kind: "unlisted-read" } : held;
 }
 
 /** What `PluginContext.agentLogin` answers (botiverse/antiproton#1084). */

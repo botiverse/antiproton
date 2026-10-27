@@ -125,6 +125,18 @@ await check("an approved replay of a keyed call runs it once", async () => {
   must(done.ok && done.executed && done.result?.status === "succeeded" && f.ran.length === 1, `the replay did not run once: ${JSON.stringify(done)}`);
 });
 
+await check("confirm on an ordinary tool: a denied tool stays denied, an allowed one becomes a card", async () => {
+  const f = fixture();
+  const { gw, store } = await gatewayWith({ tools: { api: "deny" } }, f.plugin);
+  const r: any = await gw.invoke(caller, "svc.api", { listed: true }, { confirm: true });
+  must(r.status === "rejected" && r.error?.code === "policy_denied" && f.ran.length === 0, `deny + confirm: ${JSON.stringify(r)}`);
+  must((await store.listApprovals("t", "pending")).length === 0, "a card was made for a denied call");
+  const g = fixture();
+  const ok = await gatewayWith({ tools: { api: "allow" } }, g.plugin);
+  const r2: any = await ok.gw.invoke(caller, "svc.api", { listed: true }, { confirm: true });
+  must(r2.status === "pending" && g.ran.length === 0, `allow + confirm is not a card: ${JSON.stringify(r2)}`);
+});
+
 for (const r of results) {
   console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);
 }

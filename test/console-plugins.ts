@@ -486,14 +486,15 @@ check("a held bridged request's card shows method, path, repo and PR, the cut bo
   const html = approvals([{
     operationId: "op-b", mountAlias: "stamp", tool: "request", state: "pending",
     request: { args: { method: "POST", path: "/v1/x", headers: { accept: "a" } }, heldBy: "policy", policyKey: "stamp.write",
-      route: { method: "POST", path: "/v1/repos/o/r/pulls/7/labels", repo: "o/r", pr: 7, body: "<b>x</b>", bodyTruncated: true, bodySize: 5000 } },
+      route: { method: "POST", path: "/v1/repos/o/r/pulls/7/labels", repo: "o/r", pr: 7, contentType: "application/json", body: "<b>x</b>", bodyTruncated: true, bodySize: 5000 } },
   } as any]);
   must(/>POST</.test(html) && html.includes("<code>/v1/repos/o/r/pulls/7/labels</code>") && html.includes("o/r #7"), "method, path, repo and PR are shown");
   must(html.includes("&lt;b&gt;x&lt;/b&gt;") && /first 8 of 5000 characters/.test(html), "the body is escaped, and its cut is said with the full size");
+  must(html.includes("sent as <code>application/json</code>"), "the body's content-type, which the replay sends, is shown");
   must(html.includes("<code>stamp.write</code>") && !html.includes('"headers"'), "the policy key is named, and the SDK's arguments are not dumped");
   const bare = approvals([{ operationId: "op-c", mountAlias: "stamp", tool: "request", state: "pending",
     request: { args: {}, route: { method: "GET", path: "/v1/me" } } } as any]);
-  must(bare.includes("<code>/v1/me</code>") && !/#\d/.test(bare) && !/truncated/.test(bare) && !/decided under/.test(bare),
+  must(bare.includes("<code>/v1/me</code>") && !/#\d/.test(bare) && !/truncated/.test(bare) && !/decided under/.test(bare) && !/sent as/.test(bare),
     "with nothing described, method and path only");
 });
 

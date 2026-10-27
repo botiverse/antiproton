@@ -10,7 +10,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { SqliteStore } from "../src/store/sqlite.ts";
 import { ToolGateway } from "../src/runtime/gateway.ts";
-import type { BridgeDecl, BridgeRequest, Plugin, RouteEntry } from "../src/plugins/types.ts";
+import type { BridgeDecl, BridgeRequest, BridgeResponse, Plugin, RouteEntry } from "../src/plugins/types.ts";
 import type { MountPolicy } from "../src/core/types.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
@@ -25,10 +25,18 @@ const program = { fromProgram: true as const };
 
 const ROUTES: RouteEntry[] = [
   { methods: ["POST"], path: /^\/v1\/repos\/[^/]+\/[^/]+\/pulls\/\d+\/merge$/, refuse: "merging is refused on the bridge: call pr_merge" },
-  { methods: ["POST"], path: /^\/v1\/repos\/[^/]+\/[^/]+\/pulls\/\d+\/reviews$/, body: (b) => String((b as any)?.event ?? "").toUpperCase() === "APPROVE", refuse: "approving is refused on the bridge: call pr_approve" },
+  // As upstream reads it: the key `event` in any case, the value in any case.
+  { methods: ["POST"], path: /^\/v1\/repos\/[^/]+\/[^/]+\/pulls\/\d+\/reviews$/,
+    body: (b) => Object.entries(b ?? {}).some(([k, v]) => k.toLowerCase() === "event" && String(v).toUpperCase() === "APPROVE"),
+    refuse: "approving is refused on the bridge: call pr_approve" },
+  // Any other review is a comment: the looser row a body the predicate above could not read must not fall through to.
+  { methods: ["POST"], path: /^\/v1\/repos\/[^/]+\/[^/]+\/pulls\/\d+\/reviews$/, key: "pr_comment" },
   { methods: ["POST"], path: /^\/v1\/repos\/[^/]+\/[^/]+\/pulls\/\d+\/comments$/, key: "pr_comment" },
   { methods: ["GET"], path: /^\/v1\/secret$/, key: "secret_read" },
 ];
+
+const STORED = "stored-credential-abcdef";
+const MINTED = "minted-token-1234567";
 
 function fixture(routes: RouteEntry[] = ROUTES, extra: Partial<Plugin> = {}) {
   const sent: BridgeRequest[] = [];
@@ -44,10 +52,17 @@ function fixture(routes: RouteEntry[] = ROUTES, extra: Partial<Plugin> = {}) {
       const m = /^\/v1\/repos\/([^/]+\/[^/]+)(?:\/pulls\/(\d+))?/.exec(p);
       return m ? { repo: m[1], ...(m[2] ? { pr: Number(m[2]) } : {}) } : {};
     },
-    responseHeaders: ["stamp-cli-*"],
-    async send(_ctx, req) {
+    responseHeaders: ["stamp-cli-latest"],
+    async send(ctx, req): Promise<BridgeResponse> {
       sent.push(req);
       if (req.path === "/v1/boom") throw new Error("upstream unreachable");
+      // An upstream that echoes what it was sent: the stored credential, and a token minted from it for this request.
+      if (req.path === "/v1/echo") {
+        return {
+          status: 401, text: `bad token ${ctx.credential} or ${MINTED}`, secrets: [MINTED],
+          headers: { "content-type": "text/plain", "x-request-id": `rq ${MINTED}`, authorization: `Bearer ${MINTED}`, "www-authenticate": "Bearer" },
+        };
+      }
       return {
         status: req.path === "/v1/missing" ? 404 : 200,
         headers: { "content-type": "application/json", "x-request-id": "rq", "stamp-cli-latest": "1.2.3", "set-cookie": "s=1" },
@@ -69,18 +84,19 @@ function fixture(routes: RouteEntry[] = ROUTES, extra: Partial<Plugin> = {}) {
   return { plugin, sent, decl };
 }
 
-async function gatewayWith(policy: MountPolicy | null, plugin: Plugin) {
+async function gatewayWith(policy: MountPolicy | null, plugin: Plugin, opts: { credential?: string } = {}) {
   const path = join(mkdtempSync(join(tmpdir(), "bridge-")), "s.sqlite");
   const store = new SqliteStore(path);
   await store.init();
   await store.createAgent("t", "a");
   await store.addMount({
     tenantId: "t", agentId: "a", alias: "svc", plugin: "svc", installationId: "i", connectionId: null,
-    toolVersion: "1.0.0", publicConfig: {}, secretRef: null, policy,
+    toolVersion: "1.0.0", publicConfig: {}, secretRef: opts.credential ? "env:SVC_TOKEN" : null, policy,
   });
   const db = new DatabaseSync(path);
   const ops = () => db.prepare("SELECT operation_id, tool, status FROM operations").all() as Array<{ operation_id: string; tool: string; status: string }>;
-  return { gw: new ToolGateway(store, [plugin], new Set(["svc"]), { async resolve() { return null; } }), store, ops };
+  const secrets = { async resolve() { return opts.credential ?? null; } };
+  return { gw: new ToolGateway(store, [plugin], new Set(["svc"]), secrets), store, ops };
 }
 
 const req = (method: string, path: string, body: string | null = null, headers: Record<string, string> = {}) => ({ method, path, body, headers });
@@ -222,7 +238,7 @@ await check("the request tool's own deny holds though the route's key allows: st
 await check("a refused route is refused on an approved replay too", async () => {
   const routes = [...ROUTES];
   const f = fixture(routes);
-  const { gw } = await gatewayWith(null, f.plugin);
+  const { gw, ops } = await gatewayWith(null, f.plugin);
   const held: any = await gw.invoke(caller, "svc.request", req("POST", "/v1/repos/o/r/pulls/7/close"), program);
   must(held.status === "pending", `not held: ${JSON.stringify(held)}`);
   // The table now refuses what was held: the replay runs the table again, and a person's approval does not lift it.
@@ -230,6 +246,7 @@ await check("a refused route is refused on an approved replay too", async () => 
   const done: any = await gw.applyApproval("t", held.operationId, "approved", "person");
   must(done.ok && done.result?.status === "rejected" && done.result.error?.code === "route_refused", `the replay was not refused: ${JSON.stringify(done)}`);
   must(f.sent.length === 0, "the refused replay reached send");
+  must(ops().length === 1 && ops()[0]!.status === "rejected", `the refused replay is not recorded as rejected: ${JSON.stringify(ops())}`);
 });
 
 await check("an approved replay of a held write runs it once", async () => {
@@ -308,6 +325,125 @@ await check("registration refuses a bridge beside a tool of its own named reques
   threw = "";
   try { await gatewayWith(null, clash.plugin); } catch (e) { threw = String((e as Error).message); }
   must(/not a tool's name/.test(threw), `an unlisted-write key naming a tool was accepted: ${threw}`);
+});
+
+await check("confirm never lifts a deny: request: deny, or the route key's deny, with confirm is refused, not carded", async () => {
+  for (const policy of [{ tools: { request: "deny" as const, pr_comment: "allow" as const } }, { tools: { request: "allow" as const, pr_comment: "deny" as const } }]) {
+    const f = fixture();
+    const { gw, store } = await gatewayWith(policy, f.plugin);
+    const r: any = await gw.invoke(caller, "svc.request", req("POST", "/v1/repos/o/r/pulls/7/comments", "{}"), { ...program, confirm: true });
+    must(r.status === "rejected" && r.error?.code === "policy_denied", `${JSON.stringify(policy)} + confirm: ${JSON.stringify(r)}`);
+    must((await store.listApprovals("t", "pending")).length === 0 && f.sent.length === 0, "a card was made, or it ran");
+  }
+  const f = fixture();
+  const { gw } = await gatewayWith({ tools: { request: "allow", pr_comment: "allow" } }, f.plugin);
+  const r: any = await gw.invoke(caller, "svc.request", req("POST", "/v1/repos/o/r/pulls/7/comments", "{}"), { ...program, confirm: true });
+  must(r.status === "pending" && f.sent.length === 0, `allow + confirm is not a card: ${JSON.stringify(r)}`);
+});
+
+// A row with a body check is asked only about a JSON object: any other body would skip it and reach the comment row,
+// which this mount allows, and an approval would run with no person.
+const COMMENTS_OPEN: MountPolicy = { tools: { request: "allow", pr_comment: "allow" } };
+for (const [what, body, expect] of [
+  ["a byte-order mark before the JSON", '\uFEFF{"event":"APPROVE"}', "pending"],
+  ["a form-encoded body", "event=APPROVE", "pending"],
+  ["a JSON array", '[{"event":"APPROVE"}]', "pending"],
+  ["a bare JSON string", '"APPROVE"', "pending"],
+  ["the key spelled Event", '{"Event":"APPROVE"}', "refused"],
+  ["a comment review", '{"event":"COMMENT"}', "ran"],
+] as const) {
+  await check(`a review with ${what} where comments are allowed: ${expect}`, async () => {
+    const f = fixture();
+    const { gw } = await gatewayWith(COMMENTS_OPEN, f.plugin);
+    const r: any = await gw.invoke(caller, "svc.request", req("POST", "/v1/repos/o/r/pulls/7/reviews", body), program);
+    const got = r.status === "pending" ? "pending" : r.error?.code === "route_refused" ? "refused" : r.status === "succeeded" ? "ran" : JSON.stringify(r);
+    must(got === expect, `expected ${expect}, got ${got}`);
+    must((expect === "ran") === (f.sent.length === 1), `send was reached ${f.sent.length} times`);
+  });
+}
+
+await check("the mount's credential and a token minted for the request never reach the box: text and header values redacted", async () => {
+  const f = fixture();
+  const { gw } = await gatewayWith(null, f.plugin, { credential: STORED });
+  const r: any = await gw.invoke(caller, "svc.request", req("GET", "/v1/echo"), program);
+  must(r.status === "succeeded" && r.result.status === 401, `not answered: ${JSON.stringify(r)}`);
+  const seen = JSON.stringify(r.result);
+  must(!seen.includes(STORED) && !seen.includes(MINTED), `a credential reached the box: ${seen}`);
+  must(r.result.text === "bad token [redacted] or [redacted]" && r.result.headers["x-request-id"] === "rq [redacted]", `redaction: ${seen}`);
+  must(!("authorization" in r.result.headers) && !("www-authenticate" in r.result.headers), `credential headers reached the box: ${seen}`);
+});
+
+await check("a credential header is dropped at the answer too, not only at registration: a list changed afterwards", async () => {
+  const f = fixture();
+  const { gw } = await gatewayWith(null, f.plugin, { credential: STORED });
+  // The declaration is a plain object; registration read it once, and the answer is filtered on what it says now.
+  f.decl.responseHeaders = ["stamp-cli-latest", "authorization", "www-authenticate"];
+  const r: any = await gw.invoke(caller, "svc.request", req("GET", "/v1/echo"), program);
+  must(!("authorization" in r.result.headers) && !("www-authenticate" in r.result.headers), `credential headers reached the box: ${JSON.stringify(r.result.headers)}`);
+});
+
+await check("registration refuses a response-header pattern and a credential header, even listed by name", async () => {
+  for (const names of [["stamp-cli-*"], ["set-cookie"], ["Authorization"]]) {
+    const f = fixture();
+    f.decl.responseHeaders = names;
+    let threw = "";
+    try { await gatewayWith(null, f.plugin); } catch (e) { threw = String((e as Error).message); }
+    must(/exact header names only/.test(threw), `${JSON.stringify(names)} was accepted: ${threw}`);
+  }
+});
+
+await check("a path with ; or a character outside ASCII is refused", async () => {
+  const f = fixture();
+  f.decl.normalize = undefined;
+  const { gw } = await gatewayWith(OPEN, f.plugin);
+  for (const path of ["/v1/repos/o/r/pulls/7/merge;x", "/v1/repos/o/r/pulls/7/\uFF4Derge", "/v1/caf\u00e9"]) {
+    const r: any = await gw.invoke(caller, "svc.request", req("POST", path), program);
+    must(r.status === "rejected" && r.error?.code === "bad_request" && /outside printable ASCII/.test(r.error.message), `${path}: ${JSON.stringify(r)}`);
+  }
+  must(f.sent.length === 0, "one reached send");
+});
+
+await check("a header with CR or LF, a path past 2048 characters and a body past 1 MiB are refused, and no card keeps them", async () => {
+  const f = fixture();
+  const { gw, store, ops } = await gatewayWith(null, f.plugin);
+  const cases: Array<[ReturnType<typeof req>, RegExp]> = [
+    [req("POST", "/v1/x", "{}", { "content-type": "application/json\r\nX-Evil: 1" }), /printable ASCII/],
+    [req("GET", "/v1/" + "a".repeat(2045)), /at most 2048/],
+    [req("POST", "/v1/x", "x".repeat(1024 * 1024 + 1)), /at most 1048576/],
+  ];
+  for (const [r0, why] of cases) {
+    const r: any = await gw.invoke(caller, "svc.request", r0, program);
+    must(r.status === "rejected" && r.error?.code === "bad_request" && why.test(r.error.message), `${why}: ${JSON.stringify(r).slice(0, 300)}`);
+  }
+  must((await store.listApprovals("t", "pending")).length === 0 && f.sent.length === 0, "a refused request was carded or sent");
+  must(ops().length === 3 && ops().every((o) => o.status === "rejected"), `operations: ${JSON.stringify(ops())}`);
+  const atCap: any = await gw.invoke(caller, "svc.request", req("POST", "/v1/x", "x".repeat(1024 * 1024)), program);
+  must(atCap.status === "pending", `a body at the cap was not taken: ${JSON.stringify(atCap).slice(0, 200)}`);
+  const pathAtCap: any = await gw.invoke(caller, "svc.request", req("GET", "/v1/" + "a".repeat(2044)), program);
+  must(pathAtCap.status === "succeeded", `a path at the cap was not taken: ${JSON.stringify(pathAtCap).slice(0, 200)}`);
+});
+
+await check("the card names the content-type the replay sends a held write with", async () => {
+  const f = fixture();
+  const { gw, store } = await gatewayWith(null, f.plugin);
+  await gw.invoke(caller, "svc.request", req("POST", "/v1/x", "a=1", { "content-type": "application/x-www-form-urlencoded" }), program);
+  const [a] = await store.listApprovals("t", "pending");
+  must((a!.request as any).route.contentType === "application/x-www-form-urlencoded", `card: ${JSON.stringify(a!.request)}`);
+});
+
+await check("the unlisted-write floor is absolute: a plugin default of allow still holds, deny refuses, only the mount lifts it", async () => {
+  const loose = fixture(ROUTES, { defaultPolicy: { tools: { "svc.write": "allow" } } });
+  const a = await gatewayWith(null, loose.plugin);
+  const r1: any = await a.gw.invoke(caller, "svc.request", req("POST", "/v1/repos/o/r/labels", "{}"), program);
+  must(r1.status === "pending" && loose.sent.length === 0, `a plugin default of allow let an unlisted write run: ${JSON.stringify(r1)}`);
+  const strict = fixture(ROUTES, { defaultPolicy: { tools: { "svc.write": "deny" } } });
+  const b = await gatewayWith(null, strict.plugin);
+  const r2: any = await b.gw.invoke(caller, "svc.request", req("POST", "/v1/repos/o/r/labels", "{}"), program);
+  must(r2.status === "rejected" && r2.error?.code === "policy_denied", `a plugin default of deny was loosened: ${JSON.stringify(r2)}`);
+  const owner = fixture(ROUTES, { defaultPolicy: { tools: { "svc.write": "deny" } } });
+  const c = await gatewayWith({ tools: { request: "allow", "svc.write": "allow" } }, owner.plugin);
+  const r3: any = await c.gw.invoke(caller, "svc.request", req("POST", "/v1/repos/o/r/labels", "{}"), program);
+  must(r3.status === "succeeded" && owner.sent.length === 1, `the mount's allow did not lift it: ${JSON.stringify(r3)}`);
 });
 
 for (const r of results) {

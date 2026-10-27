@@ -91,18 +91,25 @@ Recorded so the design is not read as a description of today:
 - A plugin can put its SDK in the box (`Plugin.bridge`, #1092): a program imports it as
   `await import("sdk:<alias>")` (or `sdk:<plugin>` where that names one mount), and the SDK's
   `fetch` makes each request **one host call** of `<alias>.request` through the gateway — the same
-  policy, approval, operation and trace row, host-call budget and pause on a hold as any tool call;
-  no credential or network is in the box, and only `content-type` and `accept` cross from it. The
-  plugin's route table classifies each request (on the path its `normalize` answers, without its
-  query or a trailing slash and case-insensitively, and the body as sent; the core first refuses a
-  path that names a host, carries a backslash, whitespace or a percent-escape, or has an empty,
-  `.` or `..` segment, and drops a GET's or HEAD's body): a listed route is decided under its policy key and the bridge tool's own entry, the
-  stricter of the two (a key only tightens, `Plugin.policyKey`); an unlisted read follows the
-  mount's read policy; an unlisted write is decided under the plugin's `unlistedWriteKey`, which is
-  `approval` unless the mount allows it; a `refuse` row ends the call rejected, approved or not.
-  A held request ends the program as above, even when the SDK's caller catches the throw, and the
-  model sends a new program after the approval; there is no resume, which waits on #596. Only the
-  dynamic worker executor loads these modules; QuickJS refuses the import (`bridge_unavailable`).
+  policy, approval, operation and trace row, host-call budget and pause on a hold as any tool call.
+  No credential or network is in the box: only `content-type` and `accept` cross from it, and the
+  answer reaches it with the mount's credential redacted and no header that carries one.
+  - The core first refuses a path that names a host, carries a backslash, whitespace, `;`, a
+    percent-escape or anything outside printable ASCII, or has an empty, `.` or `..` segment, and
+    a path past 2048 characters, a body past 1 MiB or a header value with CR or LF; it drops a
+    GET's or HEAD's body.
+  - The plugin's route table then classifies the request, on the path its `normalize` answers
+    (without the query or a trailing slash, case-insensitively) and the body as sent. A body a row
+    checks that is not a JSON object is an unlisted write.
+  - A listed route is decided under its policy key and the bridge tool's own entry, the stricter
+    of the two (a key only tightens, `Plugin.policyKey`); an unlisted read follows the mount's read
+    policy; an unlisted write is decided under the plugin's `unlistedWriteKey`, at least `approval`
+    unless the mount itself allows it; a `refuse` row ends the call rejected, approved or not.
+    `confirm` adds a person and never lifts a refusal.
+  - A held request ends the program as above, even when the SDK's caller catches the throw, and
+    the model sends a new program after the approval; there is no resume, which waits on #596.
+    Only the dynamic worker executor loads these modules; QuickJS refuses the import
+    (`bridge_unavailable`).
 - A program can stop itself and ask: `const answer = await pause(question, data, expected?)`.
   That pause is resumable — the result is `yielded`, with a token, and the model answers with the
   one static `resume` tool (or cancels); the program continues from that line. `expected`
