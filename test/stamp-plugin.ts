@@ -989,6 +989,24 @@ await check("an approval the mount lets run does not post its note where pr_comm
   must(paths.length === 2 && paths[1].endsWith("/comments"), `allowed: ${JSON.stringify(paths)}`);
 });
 
+await check("an approval's note is not posted where a mount-wide write deny covers pr_comment, nor when the mount cannot be read", async () => {
+  const denied = await gatewayMount({ write: "deny", tools: { pr_approve: "allow" } });
+  reset();
+  const r = await denied("pr_approve", { ...MERGE, note: "why" });
+  must(r.status === "succeeded" && seen.length === 1 && /not posted: pr_comment is refused/.test(JSON.stringify(r)), JSON.stringify(r));
+  reset();
+  const { ctx } = makeCtx();
+  const blind = { ...ctx, async sibling() { return null; } };
+  const b: any = await invoke("pr_approve", { repo: "o/r", number: 7, head: HEAD, base: BASE, note: "why" }, blind);
+  must(seen.length === 1 && /not posted/.test(b.commentSkipped ?? ""), JSON.stringify(b));
+});
+
+// A replayed call must not post its note twice: the harness replays only what is declared idempotent.
+await check("pr_approve is not declared idempotent, since its note is a comment", async () => {
+  const tool = stampPlugin.tools.find((t) => t.name === "pr_approve");
+  must(tool?.idempotency === "none", `pr_approve idempotency: ${tool?.idempotency}`);
+});
+
 // A plugin default may tighten a mount's policy, never loosen it: an operator who
 // denied writes did not ask for a card whose one click merges.
 await check("a mount-wide write deny stays a refusal, not an approval", async () => {

@@ -756,7 +756,8 @@ export const stampPlugin: Plugin = {
     // by `defaultPolicy` above unless the mount's own policy names them.
     t("pr_approve", "Approve the exact head of a pull request, which is what lets it merge. An approval counts for one commit. Approving a pull request this agent opened is refused unless evidence is supplied, which this tool does not do — the refusal names why.",
       { ...REPO_ARG, ...PR_NUMBER, ...HEAD_ARG, note: { type: "string", description: "why, for the record: posted as a comment after the approval (Stamp does not take a body on an agent's approval)" } },
-      ["repo", "number", "head", "base"], "write", "native"),
+      // Not "native": a replayed call would post its note a second time; an approval alone is idempotent, its comment is not.
+      ["repo", "number", "head", "base"], "write", "none"),
     t("pr_unapprove", "Withdraw this agent's approval at the exact head.",
       { ...REPO_ARG, ...PR_NUMBER, ...HEAD_ARG }, ["repo", "number", "head", "base"], "write", "native"),
     t("pr_merge", "Merge a pull request that is approved at this exact head. `auto` (the default) registers auto-merge and returns at once, which is the usual path: Stamp merges when the head is approved and checks pass, so nothing polls. Otherwise the merge is attempted now.",
