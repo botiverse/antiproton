@@ -33,6 +33,8 @@
  * can carry the session's *current access token*; see the note where
  * `sandboxForm` would be, in the plugin below.
  */
+/// <reference path="./stamp-sdk.d.ts" />
+import { ApiError, NetworkError, makeClient } from "@botiverse/stamp-sdk/client";
 import type { Json, MountPolicy } from "../core/types.ts";
 import { openText, sealText } from "./raft-agent-login.ts";
 import { RAFT_MOUNT_ALIAS, raftIdentityOf } from "./raft-identity.ts";
@@ -786,39 +788,70 @@ function send(method: string, path: string, token: string, body?: unknown): Prom
 }
 
 /**
- * One request to the gateway, with the mount's session attached here and never
- * in the JS sandbox. A 401 rotates once and retries once: the token may have
- * been rotated by another call between reading it and sending it.
+ * The fetch the SDK's client sends with: the same checks `send` makes, applied to the URL the client built — this
+ * host and a gateway path only (`gatewayPath`), a 30 s bound (the client sets none), no redirects, this plugin's
+ * user agent. The SDK builds `${apiBase}${path}`, so a path that escapes is refused here as well as before the call.
  */
-async function call(method: string, path: string, ctx: PluginContext, body?: unknown): Promise<any> {
-  let { token } = await accessToken(ctx, false);
-  let res = await send(method, path, token, body);
-  if (res.status === 401) {
-    const rotated = await accessToken(ctx, true);
-    if (rotated.token !== token) {
-      token = rotated.token;
-      res = await send(method, path, token, body);
-    }
-  }
-  return answer(method, path, res);
+async function gatewayFetch(url: string | URL, init?: RequestInit): Promise<Response> {
+  const u = new URL(String(url));
+  if (u.origin !== ORIGIN) throw new Error(`stamp: the client asked for ${u.origin}, and this plugin talks only to ${ORIGIN}`);
+  const headers: Record<string, string> = { ...(init?.headers as Record<string, string> | undefined), "user-agent": "antiproton/0.1" };
+  if (init?.body === undefined) delete headers["content-type"];
+  return fetch(new URL(ORIGIN + gatewayPath(u.pathname + u.search, API_PREFIXES)), {
+    ...init, headers, signal: AbortSignal.timeout(30_000), redirect: "error",
+  });
 }
 
-/** A gateway answer as a value, or its refusal as an error carrying the gateway's own code. */
-async function answer(method: string, path: string, res: Response): Promise<any> {
-  const text = await res.text();
-  let parsed: any = null;
-  try { parsed = text ? JSON.parse(text) : null; } catch { parsed = { text: text.slice(0, 2_000) }; }
+/**
+ * The SDK's client for one call, over this mount's session. The SDK sends, retries a 401 once and shapes its
+ * errors; the session stays this file's: `token()` is `accessToken`, so sealing, the rotation mark, `unfinished`,
+ * the given and verified records and the queue all apply exactly as they did, and nothing of the SDK's own session
+ * handling (`injectedAgentAuth`) is used. `retryToken(used)` rotates only when `used` is the token this client
+ * handed out (another call may have rotated since), and answers null — no retry — when the rotation gave the same
+ * token back. Reads are not retried by the client (`retryReads: false`): every tool declares its own idempotency,
+ * and a write is never resent.
+ */
+function clientFor(ctx: PluginContext) {
+  let handed = "";
+  return makeClient({
+    mode: "agent",
+    apiBase: ORIGIN,
+    async token() { handed = (await accessToken(ctx, false)).token; return handed; },
+    async retryToken(used: string) {
+      if (used !== handed) return handed;
+      const next = (await accessToken(ctx, true)).token;
+      if (next === used) return null;
+      handed = next;
+      return next;
+    },
+  }, gatewayFetch, { retryReads: false });
+}
 
-  if (!res.ok) {
-    // The gateway's own stable code (SESSION_REQUIRED, AGENT_PRINCIPAL_REQUIRED,
-    // SELF_APPROVAL_NOT_ALLOWED …) is what a caller branches on, so it goes into
-    // the message verbatim rather than being flattened into "HTTP 4xx".
-    const code = parsed?.errorCode ?? parsed?.error ?? parsed?.code;
-    const detail = typeof code === "string" ? `${code}: ` : "";
-    const message = parsed?.message ?? parsed?.error_description ?? parsed?.text ?? "";
-    throw new Error(`${method} ${path} refused ${res.status}: ${detail}${String(message).slice(0, 300)}`);
+/**
+ * One request to the gateway through the SDK's client, with the mount's session attached here and never in the JS
+ * sandbox. A refusal keeps the gateway's own stable code (SESSION_REQUIRED, SELF_APPROVAL_NOT_ALLOWED …) with the
+ * method and path, since that is what a caller branches on; a transport failure is said as one, never as a refusal,
+ * and a write's outcome is then unknown.
+ */
+async function call(method: string, path: string, ctx: PluginContext, body?: unknown): Promise<any> {
+  const checked = gatewayPath(path, API_PREFIXES);
+  try {
+    return await clientFor(ctx)(method, checked, body);
+  } catch (e) {
+    if (e instanceof ApiError) {
+      const parsed = (e.body ?? null) as any;
+      const code = parsed?.errorCode ?? parsed?.error ?? parsed?.code;
+      const detail = typeof code === "string" ? `${code}: ` : "";
+      const message = parsed?.message ?? parsed?.error_description ?? parsed?.text ?? "";
+      throw new Error(`${method} ${checked} refused ${e.status}: ${detail}${String(message).slice(0, 300)}`);
+    }
+    if (e instanceof NetworkError) {
+      throw new Error(`stamp: ${method} ${checked} did not reach Stamp (${String(e.details?.cause ?? e.message).slice(0, 120)}). ` +
+        (method === "GET" ? "Nothing was changed; it is safe to try again." :
+          "Whether it took effect is unknown: read the resource before doing it again."));
+    }
+    throw e;
   }
-  return parsed;
 }
 
 const t = (
@@ -1002,13 +1035,19 @@ export const stampPlugin: Plugin = {
         reason: "not checked: this session's access token has expired, and checking it would spend its refresh token. The first call refreshes it",
       };
     }
-    try {
-      const me = await answer("GET", "/v1/me", await send("GET", "/v1/me", session.access_token));
-      const handle = me?.handle ?? me?.principal?.handle;
-      return { ok: true, account: typeof handle === "string" ? `@${handle}` : undefined };
-    } catch (e) {
-      return { ok: false, kind: "rejected", reason: String((e as Error)?.message ?? e).slice(0, 300) };
+    // With the candidate's own access token and `send`, never the mount's client: the value checked may not be the
+    // mount's credential yet.
+    let res: Response;
+    try { res = await send("GET", "/v1/me", session.access_token); } catch (e) {
+      return { ok: false, kind: "unreachable", reason: `not checked: Stamp could not be asked (${String((e as Error)?.message ?? e).slice(0, 200)})` };
     }
+    const me = await res.json().catch(() => null) as any;
+    if (!res.ok) {
+      const code = me?.errorCode ?? me?.error ?? me?.code;
+      return { ok: false, kind: "rejected", reason: `GET /v1/me refused ${res.status}${typeof code === "string" ? `: ${code}` : ""}`.slice(0, 300) };
+    }
+    const handle = me?.handle ?? me?.principal?.handle;
+    return { ok: true, account: typeof handle === "string" ? `@${handle}` : undefined };
   },
 
   async invoke(name, args, ctx): Promise<Json> {
