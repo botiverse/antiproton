@@ -33,10 +33,10 @@
  * can carry the session's *current access token*; see the note where
  * `sandboxForm` would be, in the plugin below.
  */
-import type { Json } from "../core/types.ts";
+import type { Json, MountPolicy } from "../core/types.ts";
 import { openText, sealText } from "./raft-agent-login.ts";
 import type { CredentialCheck, Plugin, PluginContext, ToolSchema } from "./types.ts";
-import { credentialState, identityNote, markIdentity } from "./types.ts";
+import { credentialState, identityNote, markIdentity, policyFor } from "./types.ts";
 
 /** The one host this plugin talks to. Not a setting: nothing here has been tried against a self-hosted Stamp. */
 const ORIGIN = "https://stamp.build";
@@ -558,6 +558,21 @@ function heldRoute(method: string, path: string, body: unknown): "an approval" |
   return null;
 }
 
+/** What a person signs for unless the mount names the tool: see `defaultPolicy` below. */
+const DEFAULT_POLICY: MountPolicy = { tools: { pr_approve: "approval", pr_merge: "approval", api: "approval" } };
+
+/**
+ * Whether this mount lets `tool` run without a person — asked by a tool that
+ * makes that write by another route (`pr_approve`'s note is a `pr_comment`), so
+ * the route does not skip the mount's own policy. Anything but a plain "allow",
+ * or a mount that cannot be read, is "no".
+ */
+async function mountAllows(ctx: PluginContext, tool: string): Promise<"allow" | "approval" | "deny"> {
+  const mine = typeof ctx.sibling === "function" ? await ctx.sibling(ctx.alias).catch(() => null) : null;
+  if (!mine) return "deny";
+  return policyFor(mine.policy, tool, "write", DEFAULT_POLICY);
+}
+
 /** A path segment from an argument: a name, never `.` or `..`, which `URL` would resolve. */
 const NAME = /^(?!\.\.?$)[A-Za-z0-9._-]+$/;
 
@@ -705,7 +720,7 @@ export const stampPlugin: Plugin = {
    * policy allows everything (`policyFor`), so without this they would run
    * unattended on every mount that did not think to say.
    */
-  defaultPolicy: { tools: { pr_approve: "approval", pr_merge: "approval", api: "approval" } },
+  defaultPolicy: DEFAULT_POLICY,
   tools: [
     t("whoami", "Which agent this mount acts as on Stamp: handle, server, the commit email a push must be committed by, and whether this instance serves git over HTTPS.",
       {}, [], "read"),
@@ -893,6 +908,14 @@ export const stampPlugin: Plugin = {
         const approved = (await call("POST", `${prBase(a)}/approve`, ctx,
           { expectedHead: sha(a, "head"), expectedBase: sha(a, "base") })) as Json;
         if (a.note === undefined || String(a.note).trim() === "") return approved;
+        // The comment is a write of its own: `pr_comment`'s policy decides it,
+        // whatever lifted `pr_approve`. Held or refused, the note comes back
+        // unposted and the approval stands.
+        const comment = await mountAllows(ctx, "pr_comment");
+        if (comment !== "allow") {
+          return { approval: approved, note: String(a.note),
+            commentSkipped: `the note was not posted: pr_comment ${comment === "deny" ? "is refused" : "needs a person's approval"} on this mount` };
+        }
         try {
           const comment = (await call("POST", `${prBase(a)}/comments`, ctx, { body: String(a.note) })) as Json;
           return { approval: approved, comment };

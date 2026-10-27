@@ -1,4 +1,4 @@
-import type { Json, MountPolicy, MountRecord } from "../core/types.ts";
+import type { Json, MountPolicy, MountRecord, PolicyDecision } from "../core/types.ts";
 import type { AnswerSpec } from "../core/execution.ts";
 import type { PluginTraceKind, TraceVerdict } from "../trace/outbox.ts";
 import type { AnswerErrorCode } from "../model/pi-bridge.ts";
@@ -2221,7 +2221,7 @@ export interface Plugin {
   classify?(tool: string, args: Json): "read" | "write" | undefined;
   /**
    * What a mount of this plugin may do without a human when the mount's own
-   * policy does not say. Read by {@link policyFor} (src/runtime/gateway.ts)
+   * policy does not say. Read by {@link policyFor} (below; the gateway applies it)
    * and nowhere else.
    *
    * An absent mount policy allows everything, which is right for most plugins
@@ -2500,3 +2500,35 @@ export interface PluginNext {
    */
   cancelTurn?: true;
 }
+
+/**
+ * What a mount may do without a human.
+ *
+ * Per-tool beats the side-effect default, and an absent policy allows — a mount
+ * the operator has just deliberately created should work. The check lives here,
+ * at the same choke point that holds credentials, so no harness and no sandbox
+ * can route around it. A plugin whose tool makes a second write by another
+ * route asks it too (stamp's `pr_approve` note, as a `pr_comment`).
+ *
+ * `defaults` is the plugin's `Plugin.defaultPolicy`, for the few tools whose
+ * plugin says a person signs them unless the mount says otherwise. The mount's
+ * own per-tool entry is the only thing that lifts one; against the mount's
+ * side-effect half a default only ever tightens, so a mount-wide `write:
+ * "allow"` does not lift the hold and a mount-wide `write: "deny"` is not
+ * loosened into an approval card that one click runs.
+ */
+export function policyFor(
+  policy: MountPolicy | null | undefined,
+  tool: string,
+  sideEffects: "read" | "write",
+  defaults?: MountPolicy | null,
+): PolicyDecision {
+  const own = policy?.tools?.[tool];
+  if (own) return own;
+  const half = (p: MountPolicy | null | undefined) => (sideEffects === "write" ? p?.write : p?.read);
+  const mount = half(policy) ?? "allow";
+  const fallback = defaults?.tools?.[tool] ?? half(defaults);
+  return fallback && STRICTNESS[fallback] > STRICTNESS[mount] ? fallback : mount;
+}
+
+const STRICTNESS: Record<PolicyDecision, number> = { allow: 0, approval: 1, deny: 2 };

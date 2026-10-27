@@ -116,7 +116,9 @@ function makeCtx(credential: string | null = session(), agentDb: ReturnType<type
   return {
     rows,
     agentDb,
-    ctx: { credential, alias, publicConfig: {}, caller: { tenantId: "t", agentId: "a" }, db, ...(agentDb ? { agentDb } : {}) } as any,
+    ctx: { credential, alias, publicConfig: {}, caller: { tenantId: "t", agentId: "a" }, db, ...(agentDb ? { agentDb } : {}),
+      // This mount as `sibling` reports it, with no policy of its own.
+      async sibling(name: string) { return name === alias ? { credential, db, plugin: "stamp", policy: null } : null; } } as any,
   };
 }
 
@@ -957,6 +959,27 @@ await check("a refusal with no message has no dangling dash", async () => {
   refreshAnswer = () => new Response("", { status: 503 });
   const said = await refusal(invoke("whoami", {}, ctx));
   must(said.startsWith("stamp: could not refresh the session (503). ") && !said.includes("— ."), said);
+});
+
+// The note's comment is a write of its own: `pr_comment`'s policy decides it,
+// not whatever lifted `pr_approve`.
+await check("an approval the mount lets run does not post its note where pr_comment is refused", async () => {
+  const call = await gatewayMount({ tools: { pr_approve: "allow", pr_comment: "deny" } });
+  reset();
+  const r = await call("pr_approve", { ...MERGE, note: "why" });
+  must(r.status === "succeeded", `approve: ${JSON.stringify(r)}`);
+  const out = r.result ?? r.output ?? r;
+  must(seen.length === 1 && seen[0].path.endsWith("/approve"), `sent: ${JSON.stringify(seen.map((x) => x.path))}`);
+  must(/not posted: pr_comment is refused/.test(JSON.stringify(out)) && JSON.stringify(out).includes('"note":"why"'), JSON.stringify(r));
+  const held = await gatewayMount({ tools: { pr_approve: "allow", pr_comment: "approval" } });
+  reset();
+  const h = await held("pr_approve", { ...MERGE, note: "why" });
+  must(seen.length === 1 && /needs a person's approval/.test(JSON.stringify(h)), JSON.stringify(h));
+  const open = await gatewayMount({ tools: { pr_approve: "allow" } });
+  reset();
+  await open("pr_approve", { ...MERGE, note: "why" });
+  const paths = seen.map((x) => x.path);
+  must(paths.length === 2 && paths[1].endsWith("/comments"), `allowed: ${JSON.stringify(paths)}`);
 });
 
 // A plugin default may tighten a mount's policy, never loosen it: an operator who
