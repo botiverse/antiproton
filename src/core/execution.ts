@@ -28,6 +28,32 @@ export interface ExecutorHost {
    * throw, and the executor does not wait for it.
    */
   refused?(call: { tool: string | null; code: string }): void;
+  /**
+   * The SDK modules a program may import, one per mount whose plugin declares a bridge (`Plugin.bridge`), each
+   * answered by this host's `invoke` as `<alias>.request`: carried here because they are only good with a host that
+   * answers those calls. An executor that cannot load them refuses the import (`bridge_unavailable`).
+   */
+  bridges?: readonly BridgeModule[];
+}
+
+/** One mount's SDK for the box (`ExecutorHost.bridges`), built from its plugin's `BridgeDecl.box`. */
+export interface BridgeModule {
+  /** What the program imports: `sdk:<alias>`, and `sdk:<plugin id>` when that names this mount alone. */
+  specifiers: string[];
+  /** The mount whose `<alias>.request` each request is a call of. */
+  alias: string;
+  /** Its plugin's id: the files ship under `sdk/<plugin>/`, once however many mounts share them. */
+  plugin: string;
+  files: Readonly<Record<string, string>>;
+  entry: string;
+  exports: readonly string[];
+}
+
+/** What an executor without the bridge says to a program's `import("sdk:…")`. */
+export const BRIDGE_UNAVAILABLE = "bridge_unavailable";
+export function bridgeUnavailableMessage(specifier: string): string {
+  return `${specifier} cannot be imported here: this run_js executor has no SDK bridge; ` +
+    "only the dynamic worker executor (Cloudflare Dynamic Workers) loads sdk: modules. Call the mount's tools instead.";
 }
 
 /** Tells `host` of a call the executor refused (`ExecutorHost.refused`); a throw there is the host's and is dropped. */

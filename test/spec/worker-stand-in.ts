@@ -24,10 +24,44 @@
  * and a call still in transit, or whose result is still coming back, when
  * the handler returns is dropped, as if the context had been torn down.
  */
+import { registerHooks } from "node:module";
+import { posix } from "node:path";
 import { handleSandboxCall, handleSandboxSuspend } from "../../src/runtime/dynamic-worker-executor.ts";
 import type { WorkerLoader } from "../../src/runtime/dynamic-worker-executor.ts";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * A load with more than `main.js` (the SDK bridge's modules) is evaluated from a module map, as the platform's loader
+ * resolves it: a bare name is looked up as it is (`bridge.js`, `sdk:svc`), a relative one against the importer's
+ * directory (an SDK file importing its sibling), and a name the map lacks fails, as there is nothing else to load.
+ */
+const loads = new Map<string, Record<string, string | { js: string }>>();
+let hooked = false;
+function hookModuleMaps(): void {
+  if (hooked) return;
+  hooked = true;
+  const parse = (url: string) => {
+    const m = /^standin:\/\/([^/]+)\/(.*)$/.exec(url);
+    return m ? { id: m[1]!, name: decodeURIComponent(m[2]!) } : null;
+  };
+  registerHooks({
+    resolve(specifier, context, next) {
+      const from = context.parentURL ? parse(context.parentURL) : null;
+      if (!from) return next(specifier, context);
+      const name = specifier.startsWith("./") || specifier.startsWith("../")
+        ? posix.normalize(posix.join(posix.dirname(from.name), specifier)) : specifier;
+      if (!(name in (loads.get(from.id) ?? {}))) throw new Error(`No such module "${name}" (imported from "${from.name}")`);
+      return { url: `standin://${from.id}/${encodeURIComponent(name)}`, shortCircuit: true };
+    },
+    load(url, context, next) {
+      const at = parse(url);
+      if (!at) return next(url, context);
+      const src = loads.get(at.id)?.[at.name];
+      return { format: "module", source: typeof src === "string" ? src : src!.js, shortCircuit: true };
+    },
+  });
+}
 
 export function standInLoader(opts: {
   callHopMs?: number;
@@ -54,7 +88,15 @@ export function standInLoader(opts: {
             live.set(execId, true);
             try {
               const src = code.modules[code.mainModule] as string;
-              const mod = await import(`data:text/javascript;base64,${Buffer.from(src).toString("base64")}`);
+              let mod;
+              if (Object.keys(code.modules).length > 1) {
+                hookModuleMaps();
+                const id = crypto.randomUUID();
+                loads.set(id, code.modules);
+                mod = await import(`standin://${id}/${encodeURIComponent(code.mainModule)}`);
+              } else {
+                mod = await import(`data:text/javascript;base64,${Buffer.from(src).toString("base64")}`);
+              }
               return await mod.default.fetch(req, code.env);
             } finally {
               live.set(execId, false);

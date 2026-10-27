@@ -39,7 +39,7 @@ import {
   admitBackground, jobsTool, mountsWithRunningJobs, recordBackgroundJob, refuseOverCap, runBackgroundPass, runningBackgroundJobs, startedResult, stopSessionJobs,
 } from "../../src/runtime/background-jobs.ts";
 import {
-  bridgeTools, harnessTools, offeredToolName, offersPlugin, replayPolicy, offersCapability, qualifyMountedTools, resumeTool, runJsTools, type MountedTool,
+  bridgeTools, bridgeModulesFor, harnessTools, offeredToolName, offersPlugin, replayPolicy, offersCapability, qualifyMountedTools, resumeTool, runJsTools, type MountedTool,
   withholdTools,
   refuseWithheld, type RunEnd,
 } from "../../src/runtime/pi-tools.ts";
@@ -3521,6 +3521,9 @@ export class AgentRuntime {
             // So a stale name for a mount that cannot be offered is answered with
             // the reason, not as a typo.
             unoffered,
+            // The SDKs of the offered mounts that declare a bridge; none in a subagent's session, whose dispatch
+            // refuses `<alias>.request` anyway, the catalogue not listing it (`childMayCall`).
+            bridges: child ? [] : bridgeModulesFor(records, offered as MountedTool[], (id) => this.#plugins.find((pl) => pl.id === id)),
             continuations: this.#continuations,
             scope: session,
           })

@@ -2,7 +2,7 @@ import { getQuickJS, type QuickJSContext, type QuickJSHandle } from "quickjs-ems
 import { parseTemplateCall } from "../core/tools.ts";
 import type { ToolResult } from "../core/tools.ts";
 import type { Json } from "../core/types.ts";
-import { CANCELLED_NAME, DEFAULT_LIMITS as LIMITS, PAUSE_FACTORY, holdFrom, pauseFrom, tellRefused } from "../core/execution.ts";
+import { BRIDGE_UNAVAILABLE, CANCELLED_NAME, DEFAULT_LIMITS as LIMITS, PAUSE_FACTORY, bridgeUnavailableMessage, holdFrom, pauseFrom, tellRefused } from "../core/execution.ts";
 import type { Continuation, ExecutionLimits, ExecutionResult, ExecutorHost, HeldCall, JsExecutor, Paused } from "../core/execution.ts";
 
 export { DEFAULT_LIMITS } from "../core/execution.ts";
@@ -42,6 +42,16 @@ export class QuickJsExecutor implements JsExecutor {
       else if (Date.now() - start - suspendedMs > limits.wallTimeMs) interrupted ??= "wall_time_exceeded";
       return interrupted !== null;
     });
+
+    // An SDK module (`ExecutorHost.bridges`) is the dynamic worker's to load: here `import("sdk:…")` rejects with a
+    // message saying so, and a program that does not catch it ends with `bridge_unavailable` rather than `uncaught`.
+    let bridgeAsked: string | null = null;
+    runtime.setModuleLoader((name) => {
+      if (!name.startsWith("sdk:")) return { error: new Error(`could not load module '${name}'`) };
+      bridgeAsked = bridgeUnavailableMessage(name);
+      return { error: new Error(bridgeAsked) };
+    });
+    const uncaught = (message: string) => (bridgeAsked !== null && message.includes(bridgeAsked) ? BRIDGE_UNAVAILABLE : "uncaught");
 
     const ctx = runtime.newContext();
     const outputs: Json[] = [];
@@ -294,7 +304,7 @@ export class QuickJsExecutor implements JsExecutor {
             outputs,
             acceptedOperationIds,
             hostCalls,
-            error: { code: interrupted ?? "uncaught", message: String(err?.message ?? err) },
+            error: { code: interrupted ?? uncaught(String(err?.message ?? err)), message: String(err?.message ?? err) },
           };
         } else {
           settled.value.dispose();

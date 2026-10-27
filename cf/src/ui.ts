@@ -1075,9 +1075,17 @@ export function approvals(rows: ApprovalRecord[]): string {
   return pending.length
     ? pending.map((a) => {
         const req = a.request as any;
+        // A bridged SDK request (`route`) is shown as what it does upstream — method, path, and the repository and pull
+        // request when the plugin named them — rather than as the SDK's arguments, with a write's body as far as kept.
+        const route = req?.route && typeof req.route === "object" ? req.route : null;
+        const what = route
+          ? `<div><span class="badge">${esc(String(route.method ?? ""))}</span> <code>${esc(String(route.path ?? ""))}</code>${
+              route.repo ? ` <span class="hint">${esc(String(route.repo))}${route.pr !== undefined ? ` #${esc(String(route.pr))}` : ""}</span>` : ""}</div>${
+              typeof route.body === "string" ? `${route.contentType ? `<div class="hint">sent as <code>${esc(String(route.contentType))}</code></div>` : ""}<pre>${esc(route.body)}</pre>${route.bodyTruncated ? `<div class="hint">body truncated: first ${route.body.length} of ${esc(String(route.bodySize))} characters shown</div>` : ""}` : ""}`
+          : `<pre>${esc(JSON.stringify(req?.args ?? {}, null, 2))}</pre>`;
         return `<div class="card">
   <div><span class="tool">${esc(a.mountAlias)}.${esc(a.tool)}</span>${req?.heldBy === "agent" ? ` <span class="badge warn">the agent asked you to confirm</span>` : ""}</div>
-  <pre>${esc(JSON.stringify(req?.args ?? {}, null, 2))}</pre>
+  ${what}${typeof req?.policyKey === "string" ? `<div class="hint">decided under the mount's policy for <code>${esc(req.policyKey)}</code> as well as <code>${esc(a.tool)}</code></div>` : ""}
   <div class="row">
     <button hx-post="/ui/decide" hx-target="#approvals" hx-swap="innerHTML"
       hx-vals='${esc(JSON.stringify({ operationId: a.operationId, decision: "approved" }))}'>approve</button>

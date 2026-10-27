@@ -11,7 +11,8 @@ import { Backgrounded, Interrupt, interruptsOf } from "../plugins/types.ts";
 import { answerSpecOf } from "./run-js-resume.ts";
 import { keyedOperationId } from "./operation-id.ts";
 import type { PluginErrorFields, ToolSnapshot } from "../plugins/types.ts";
-import { callSideEffects, pluginEnabled, LEASE_KEY, toolsOf } from "../plugins/types.ts";
+import { callSideEffects, pluginEnabled, LEASE_KEY, toolsOf, BRIDGE_TOOL, classifyRoute, policyKeyOf, stricter } from "../plugins/types.ts";
+import type { BridgeDecl, ToolSchema } from "../plugins/types.ts";
 import { admitTools } from "./mount-tools.ts";
 import { isReleased, leaseRow, releasedFacts, toolRefusedRow } from "../trace/seams.ts";
 import { PLUGIN_TRACE_KINDS } from "../trace/outbox.ts";
@@ -206,6 +207,170 @@ function sameSnapshot(a: ToolSnapshot | null | undefined, b: ToolSnapshot | null
 /** The mount `PluginContext.agentLogin` signs in through: where provisioning puts an agent's Raft mount. */
 const RAFT_LOGIN_ALIAS = "raft";
 
+/**
+ * Refuse a plugin whose bridge would be ambiguous (`Plugin.bridge`), when the gateway is built rather than on the
+ * first call. A tool of its own named `request` would be shadowed by the bridge's, and an `unlistedWriteKey` that is
+ * a tool's name would make a mount's entry for one setting both: allowing unlisted writes would allow that tool.
+ */
+function checkBridge(p: Plugin): void {
+  const b = p.bridge;
+  if (!b) return;
+  const names = new Set(p.tools.map((t) => t.name));
+  if (names.has(BRIDGE_TOOL)) {
+    throw new Error(`plugin ${p.id} declares a bridge and a tool of its own named "${BRIDGE_TOOL}"; the bridge reserves that name`);
+  }
+  if (!b.unlistedWriteKey || names.has(b.unlistedWriteKey) || b.unlistedWriteKey === BRIDGE_TOOL) {
+    throw new Error(`plugin ${p.id}'s bridge names unlistedWriteKey ${JSON.stringify(b.unlistedWriteKey)}, which must be non-empty and not a tool's name`);
+  }
+  // Exact names only: a pattern is how a header nobody reviewed — a cookie, a token echoed back — reaches the box.
+  const named = b.responseHeaders ?? [];
+  if (named.some((h) => !/^[a-z0-9-]+$/i.test(h) || NEVER_TO_BOX.has(h.toLowerCase()))) {
+    throw new Error(`plugin ${p.id}'s bridge names responseHeaders ${JSON.stringify(named)}: exact header names only, none that carries a credential`);
+  }
+  if (!b.box.files[b.box.entry] || b.box.exports.some((e) => !/^[A-Za-z_$][\w$]*$/.test(e) || e === "default")) {
+    throw new Error(`plugin ${p.id}'s bridge box needs its entry among its files and identifiers for exports`);
+  }
+}
+
+/** Headers the box may send upstream; every other one is dropped, the credential being the plugin's to add. */
+const BRIDGE_REQUEST_HEADERS = new Set(["content-type", "accept"]);
+
+/**
+ * Response headers never handed to the box, whatever the plugin names: each carries or asks for a credential, and the
+ * box is the one place the design keeps credentials out of (`Plugin.bridge`).
+ */
+const NEVER_TO_BOX = new Set(["set-cookie", "set-cookie2", "cookie", "authorization", "proxy-authorization", "www-authenticate", "proxy-authenticate"]);
+
+/**
+ * The largest bridged request taken, as String.length: a path of 2048 (the common limit of servers and proxies; a
+ * longer one is not a route anyone listed) and a body of 1 MiB (an API write is JSON, and run_js caps what a program
+ * prints at 64 KiB; past this a request is a transfer, the sandbox mount's work). Larger is refused, not cut: a cut
+ * request is a different request, and a held one would put a person's signature under bytes nobody shows them.
+ */
+const BRIDGE_PATH_MAX = 2048;
+const BRIDGE_BODY_MAX = 1024 * 1024;
+
+/** What replaces a mount's credential in an answer before the box reads it (`redact`). */
+export const REDACTED = "[redacted]";
+
+/** How much of a held write's body the approval card carries (2 KiB, as String.length). */
+const CARD_BODY_BYTES = 2048;
+
+/** The bridge tool's schema: a write by declaration, lowered to a read for GET and HEAD (`#invoke`). */
+const BRIDGE_SCHEMA: ToolSchema = {
+  name: BRIDGE_TOOL,
+  summary: "One request of the mount's SDK, from a run_js program (`import(\"sdk:<alias>\")`).",
+  parameters: { type: "object", properties: { method: { type: "string" }, path: { type: "string" }, body: {}, headers: { type: "object" } }, required: ["method", "path"] },
+  sideEffects: "write",
+  idempotency: "none",
+};
+
+/** The request a bridge call carries, read from its arguments; an error message when they do not make one. */
+function bridgeArgs(args: Json): { method: string; path: string; body: string | null; headers: Record<string, string> } | string {
+  const a = (args && typeof args === "object" && !Array.isArray(args) ? args : {}) as Record<string, unknown>;
+  if (typeof a.method !== "string" || !/^[A-Za-z]+$/.test(a.method)) return "a bridged request needs its method as a word";
+  if (typeof a.path !== "string") return "a bridged request needs a path that starts with /";
+  const path = bridgePath(a.path);
+  if (typeof path !== "string") return path.error;
+  if (a.body !== undefined && a.body !== null && typeof a.body !== "string") return "a bridged request's body is the text as sent";
+  if (typeof a.body === "string" && a.body.length > BRIDGE_BODY_MAX) {
+    return `a bridged request's body is at most ${BRIDGE_BODY_MAX} characters, got ${a.body.length}`;
+  }
+  const method = a.method.toUpperCase();
+  const headers: Record<string, string> = {};
+  if (a.headers && typeof a.headers === "object" && !Array.isArray(a.headers)) {
+    for (const [k, v] of Object.entries(a.headers as Record<string, unknown>)) {
+      if (typeof v !== "string" || !BRIDGE_REQUEST_HEADERS.has(k.toLowerCase())) continue;
+      // Refused rather than dropped: a CR or LF in a value is a second header, or a second request, upstream.
+      if (!/^[\t\x20-\x7e]*$/.test(v)) return `a bridged request's ${k.toLowerCase()} header is printable ASCII`;
+      headers[k.toLowerCase()] = v;
+    }
+  }
+  // A read carries no body: one sent with a GET is not what upstream acts on, and not what the table was asked about.
+  const body = method === "GET" || method === "HEAD" ? null : (a.body as string | null | undefined) ?? null;
+  return { method, path, body, headers };
+}
+
+/**
+ * The path a bridged request may name, in the one spelling the route table is asked about, whatever the plugin's own
+ * `normalize` does: a table row is only as good as the spellings that cannot reach upstream without meeting it.
+ * Refused: anything that could leave the origin (`//host`, a backslash, whitespace or a control character), a
+ * percent-escape in the path (`%6Derge` is `merge` upstream and not to a pattern), `;` and anything outside printable
+ * ASCII, `.`, `..` and empty segments, and a path past BRIDGE_PATH_MAX.
+ * The fragment never leaves a client, so it is dropped; the query is kept for upstream (a list's page, a filter) and
+ * is never part of what the table matches (`routePath`).
+ */
+function bridgePath(raw: string): string | { error: string } {
+  const bad = (why: string) => ({ error: `a bridged request's path ${why}, got ${JSON.stringify(raw).slice(0, 80)}` });
+  if (raw.length > BRIDGE_PATH_MAX) return bad(`is at most ${BRIDGE_PATH_MAX} characters`);
+  if (!raw.startsWith("/") || raw.startsWith("//")) return bad("starts with one / and names no host");
+  if (/[\\\s\u0000-\u001f\u007f]/.test(raw)) return bad("carries no backslash, whitespace or control character");
+  // A matrix parameter (`merge;x`) and a character outside ASCII (a full-width `ｍerge`) are spellings a server may
+  // route as the listed path while a pattern does not see it.
+  if (/[;]|[^\x21-\x7e]/.test(raw)) return bad("carries no ; and nothing outside printable ASCII");
+  const noFragment = raw.split("#", 1)[0]!;
+  const q = noFragment.indexOf("?");
+  const pathPart = q < 0 ? noFragment : noFragment.slice(0, q);
+  let decoded: string;
+  try { decoded = decodeURIComponent(pathPart); } catch { decoded = ""; }
+  if (decoded !== pathPart) return bad("carries no percent-escapes");
+  const segments = pathPart.slice(1).split("/");
+  // A trailing slash is the one empty segment allowed: the table is asked about the path without it (`routePath`).
+  if (segments.some((x, i) => x === "." || x === ".." || (x === "" && i < segments.length - 1))) {
+    return bad("has no empty, . or .. segments");
+  }
+  return noFragment;
+}
+
+/** What the route table matches: the path without its query or a trailing slash (`bridgePath`). */
+function routePath(path: string): string {
+  const p = path.split(/[?#]/, 1)[0]!;
+  return p.length > 1 ? p.replace(/\/+$/, "") : p;
+}
+
+/**
+ * The response headers a bridge hands back to the box: `content-type`, `x-request-id`, and the exact names the plugin
+ * lists, never one in NEVER_TO_BOX; each value redacted as the text is.
+ */
+function boxHeaders(decl: BridgeDecl, headers: Record<string, string>, secrets: readonly string[]): Record<string, string> {
+  const named = new Set(["content-type", "x-request-id", ...(decl.responseHeaders ?? []).map((h) => h.toLowerCase())]);
+  const kept: Record<string, string> = {};
+  for (const [k, v] of Object.entries(headers ?? {})) {
+    const name = k.toLowerCase();
+    if (typeof v === "string" && named.has(name) && !NEVER_TO_BOX.has(name)) kept[name] = redact(v, secrets);
+  }
+  return kept;
+}
+
+/**
+ * Every occurrence of each secret replaced by REDACTED: an upstream that echoes the token it was sent (an error that
+ * quotes the request, a debug header) must not hand it to the box. Values shorter than 8 characters are not matched,
+ * since a credential that short is not one and replacing it would rewrite ordinary text.
+ */
+function redact(text: string, secrets: readonly string[]): string {
+  let out = text;
+  for (const s of secrets) if (s.length >= 8) out = out.split(s).join(REDACTED);
+  return out;
+}
+
+/** What the approval card shows of a held bridged request: method, path, what `describe` names, and a write's body. */
+function routeCard(decl: BridgeDecl, req: { method: string; path: string; body: string | null; headers: Record<string, string> }): Json {
+  let named: { repo?: string; pr?: number | string } = {};
+  try { named = decl.describe?.(req.path) ?? {}; } catch { /* method and path only */ }
+  const write = req.method !== "GET" && req.method !== "HEAD";
+  const body = write && req.body !== null ? req.body : null;
+  return {
+    method: req.method, path: req.path,
+    // What the replay sends it as: a body is read by upstream according to it.
+    ...(write && req.headers["content-type"] ? { contentType: req.headers["content-type"] } : {}),
+    ...(typeof named.repo === "string" ? { repo: named.repo } : {}),
+    ...(typeof named.pr === "number" || typeof named.pr === "string" ? { pr: named.pr } : {}),
+    ...(body === null ? {} : body.length > CARD_BODY_BYTES
+      ? { body: body.slice(0, CARD_BODY_BYTES), bodyTruncated: true, bodySize: body.length }
+      : { body }),
+  };
+}
+
 /** Moved beside `Plugin.defaultPolicy` (src/plugins/types.ts), where a plugin can read it too; kept importable from here. */
 export { policyFor } from "../plugins/types.ts";
 import { policyFor } from "../plugins/types.ts";
@@ -286,6 +451,7 @@ export class ToolGateway {
     inbound?: (tenantId: string, agentId: string, alias: string) => InboundHooks,
     opts: { credentialRejected?: CredentialRejected } = {},
   ) {
+    for (const p of plugins) checkBridge(p);
     this.#store = store;
     this.#plugins = new Map(plugins.map((p) => [p.id, p]));
     this.#secrets = secrets;
@@ -435,8 +601,10 @@ export class ToolGateway {
         },
       };
     }
+    // A replay the gateway refused (a route the table refuses now, a request it no longer takes) never ran: recorded
+    // as the refusal it was, not as a failure of something that ran.
     await this.#store.completeOperation(
-      tenantId, operationId, result.status === "succeeded" ? "succeeded" : "failed", null, result as Json,
+      tenantId, operationId, result.status === "succeeded" ? "succeeded" : result.status === "rejected" ? "rejected" : "failed", null, result as Json,
     );
     return { ok: true, executed: true, result };
   }
@@ -819,7 +987,8 @@ export class ToolGateway {
       return this.#refused(ctx, raw, opts, { code: "not_mounted", message: `the \`${r.mount.alias}\` mount is being removed` });
     }
     // The agent's own hold: a call sent with `opts.confirm` is held exactly as
-    // a policy hold would be, and the person decides. It is an option, not an
+    // a policy hold would be, and the person decides — unless the policy
+    // refuses it, which confirm does not lift. It is an option, not an
     // argument, so the plugin's parameter names stay its own (appworld
     // forwards every argument it receives to an API whose names nobody here
     // chose). The model can only write arguments; the bridge lifts the field
@@ -861,7 +1030,16 @@ export class ToolGateway {
     }
     // This mount's tools, not the plugin's: for a plugin whose tools come from
     // a remote server the two differ, and the catalogue offered the mount's.
-    const schema = toolsOf(plugin, r.mount).find((t) => t.name === r.tool);
+    // A bridge's request (`Plugin.bridge`) is a tool of every mount whose plugin declares one, offered to no model:
+    // only a program's SDK makes it, or the replay of one a person approved.
+    const bridge = r.tool === BRIDGE_TOOL ? plugin.bridge : undefined;
+    const schema = bridge ? BRIDGE_SCHEMA : toolsOf(plugin, r.mount).find((t) => t.name === r.tool);
+    if (bridge && opts.fromProgram !== true && opts.approved !== true) {
+      return this.#refused(ctx, raw, opts, {
+        code: "program_only",
+        message: `${r.mount.alias}.${BRIDGE_TOOL} is the mount's SDK transport: call it from run_js through \`await import("sdk:${r.mount.alias}")\``,
+      });
+    }
     if (!schema) {
       return this.#refused(ctx, raw, opts, { code: "unknown_tool", message: unknownToolMessage(r.mount.alias, r.tool) });
     }
@@ -903,9 +1081,48 @@ export class ToolGateway {
     });
 
     const facts = () => (opts.callId === undefined ? {} : { callId: opts.callId });
-    // A declared write may be a read for the policy, per call, when the plugin says so (`Plugin.classify`).
-    const verdict = opts.approved ? "allow" : confirm ? "approval"
-      : policyFor(r.mount.policy, r.tool, callSideEffects(plugin, r.tool, args, schema.sideEffects), plugin.defaultPolicy);
+    // A bridged request is classified on its route before any verdict: a refused route ends here, approved or not,
+    // since what a person approved was a request the table now refuses — or one it never should have held.
+    let route: { method: string; path: string; body: string | null; headers: Record<string, string> } | null = null;
+    let key: string | null | false;
+    let side: "read" | "write";
+    if (bridge) {
+      const parsed = bridgeArgs(args);
+      let refusal: ToolError | null = typeof parsed === "string" ? { code: "bad_request", message: parsed } : null;
+      if (typeof parsed !== "string") {
+        try {
+          route = { ...parsed, path: bridge.normalize ? bridge.normalize(parsed.path) : parsed.path };
+        } catch (e) {
+          refusal = { code: "bad_request", message: String((e as Error)?.message ?? e).slice(0, 300) };
+        }
+      }
+      const c = route ? classifyRoute(bridge, route.method, routePath(route.path), route.body) : null;
+      if (c?.kind === "refused") refusal = { code: "route_refused", message: c.message };
+      if (refusal || !c || c.kind === "refused") {
+        await this.#store.completeOperation(ctx.tenantId, operationId, "rejected", null, undefined, facts());
+        return { status: "rejected", error: refusal! };
+      }
+      key = c.kind === "unlisted-read" ? null : c.key;
+      side = route!.method === "GET" || route!.method === "HEAD" ? "read" : "write";
+    } else {
+      key = policyKeyOf(plugin, r.tool, args);
+      // A declared write may be a read for the policy, per call, when the plugin says so (`Plugin.classify`).
+      side = callSideEffects(plugin, r.tool, args, schema.sideEffects);
+    }
+    // A policy key only tightens (`Plugin.policyKey`): the tool's own decision and the key's, the stricter of the two,
+    // so a mount's `deny` on the tool is never weakened by the key, nor its `allow` widened. A key the plugin could not
+    // name holds the call for a person.
+    const own = policyFor(r.mount.policy, r.tool, side, plugin.defaultPolicy);
+    // An unlisted write's key is at least `approval` by default, whatever the plugin's own defaults say: they may
+    // tighten it to `deny`, never loosen it, so a table that forgot a route fails closed. Only the mount's own entry for
+    // the key lifts it (`policyFor` reads that first), which is the owner's decision, not the plugin's.
+    const defaults = bridge ? { ...plugin.defaultPolicy, tools: { ...plugin.defaultPolicy?.tools,
+      [bridge.unlistedWriteKey]: stricter(plugin.defaultPolicy?.tools?.[bridge.unlistedWriteKey] ?? "approval", "approval") } } : plugin.defaultPolicy;
+    const decided = key === null || key === r.tool ? own
+      : stricter(own, key === false ? "approval" : policyFor(r.mount.policy, key, side, defaults));
+    // `confirm` can only add a person, never take one away nor lift a refusal: a confirmed call the policy denies is
+    // denied, since an approval card for it would let one click run what the mount owner closed.
+    const verdict = opts.approved ? "allow" : confirm ? stricter(decided, "approval") : decided;
     if (verdict === "deny") {
       // The operation was recorded above, before the policy was asked, so a
       // refusal has to end it or the row stays "pending" for ever — an attempt
@@ -943,8 +1160,14 @@ export class ToolGateway {
       await this.#store.requireApproval({
         tenantId: ctx.tenantId, operationId, agentId: ctx.agentId, taskId: ctx.taskId,
         mountAlias: r.mount.alias, tool: r.tool,
-        // `heldBy` tells the card who asked for it: a policy, or the agent.
-        request: { tool: raw, args, heldBy: confirm ? "agent" : "policy" },
+        // `heldBy` tells the card who asked for it: a policy, or the agent. `policyKey` is the second name the call was
+        // decided under, so an owner who allowed the tool sees which setting is still missing; `route` is what a person
+        // signs for a bridged request, since its arguments are an SDK's, not a sentence.
+        request: {
+          tool: raw, args, heldBy: confirm ? "agent" : "policy",
+          ...(typeof key === "string" && key !== r.tool ? { policyKey: key } : {}),
+          ...(bridge && route ? { route: routeCard(bridge, route) } : {}),
+        },
       });
       return {
         status: "pending",
@@ -956,6 +1179,19 @@ export class ToolGateway {
       } as ToolResult;
     }
 
+    if (bridge && route) {
+      // The core makes the request, not the plugin's `invoke`: what reaches `send` is the box's request with only
+      // the headers it may set, and what reaches the box is the answer with only the headers it may read. Any
+      // upstream status is an answer, so the SDK in the box shapes its own errors from it.
+      const req = route;
+      return this.#run(ctx, r, plugin, operationId, facts, async (context) => {
+        const res = await bridge.send(context, { method: req.method, path: req.path, body: req.body, headers: { ...req.headers } });
+        // The mount's credential as stored, and what `send` says it derived from it for this request (an access token
+        // minted from a refresh token, a rotated one): the core cannot know the second, so the plugin names it.
+        const secrets = [context.credential, ...(Array.isArray(res.secrets) ? res.secrets : [])].filter((x): x is string => typeof x === "string");
+        return { status: Number(res.status), headers: boxHeaders(bridge, res.headers, secrets), text: redact(String(res.text ?? ""), secrets) };
+      }, opts.fromProgram === true);
+    }
     // `fromProgram` reaches the plugin as `caller.fromProgram`, so a plugin can tell a program's call from the
     // model's own without declaring the tool model-only.
     return this.#run(ctx, r, plugin, operationId, facts, (context) => plugin.invoke(r.tool, args, context), opts.fromProgram === true);
