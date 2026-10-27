@@ -26,7 +26,7 @@ import { internalHost } from "./http.ts";
 import {
   ASSISTANT_OWN_TOOLS, ASSISTANT_STORE, CONTACT_KEY, DEFERRED_KEY, NOTIFY_TOOL, OWNER_KEY, PREFERENCES_TOOL, REMINDED_STORE, RULES_KEY, SEND_AS_OWNER_TOOL,
   sendAsOwner, type SendAsOwnerAnswer, assistantWake, assistantWakeInstruction, doorbellOf, isDoorbellTarget, keepOwnerFromContext, learnDm, loadOwner, mergeSources, noteDoorbell,
-  notifyOwner, noteChatNotice, noteOwnerReply, noteToldInChat, pauseOn, replyFallback, preferences, type PersonResolve, type AssistantOwner, type ChangeSources, type OwnerContext, type OwnerSend,
+  notifyOwner, noteChatNotice, noteOwnerReply, noteToldInChat, pauseOn, replyFallback, preferences, type PersonResolve, type OwnerResolveRead, type AssistantOwner, type ChangeSources, type OwnerContext, type OwnerSend,
   checkEnded, pushBriefImport, type AssistantApi, type RaftAnswer,
 } from "./raft-assistant.ts";
 import type { RaftCheck, RefusedCheck } from "./raft-assistant-check.ts";
@@ -3350,7 +3350,7 @@ export function createRaftPlugin(deps: {
       if (name === SEND_AS_OWNER_TOOL) {
         if (!ctx.offered?.includes(name)) throw ownerRefusal(`${name} is not offered on this mount: its Raft account is not a personal assistant`);
         return sendAsOwner(args, ctx, {
-          inbox: (c, r) => assistant.ownerInbox(c, r), post: postAsOwner,
+          inbox: (c, r) => assistant.ownerInbox(c, r), post: postAsOwner, resolve: readOwnerResolve,
           messages: (c, r) => assistant.ownerMessages(c, { channelId: r.channelId, around: r.around, limit: r.limit }),
         });
       }
@@ -3646,24 +3646,33 @@ export function createRaftPlugin(deps: {
 }
 
 /**
- * Raft's person read for an assistant (`GET /assistant/owner-resolve?name=`, beside the owner inbox; no SDK route yet,
- * so it goes through this plugin's own `call` on the mount's credential, which logs the route and never the query).
- * A 404 is told apart by its code: none, or the Server's generic `NOT_FOUND`, is the route not being there (a Raft from
- * before it), and the preferences tool then looks in the inbox rows instead; a 404 with a code of its own is Raft saying
- * the owner can see no one of that name. A 403 `assistant_not_enabled` pauses, as every assistant read's does.
+ * Raft's read by name for an assistant (`GET /assistant/owner-resolve?name=`, beside the owner inbox; no SDK route yet,
+ * so it goes through this plugin's own `call` on the mount's credential, which logs the route and never the query): a
+ * person by `alice` or `alice~human`, a channel by `#name` (a Raft from before channels were read answers that as a
+ * person's 404). A 404 is told apart by its code: none, or the Server's generic `NOT_FOUND`, is the route not being there
+ * (a Raft from before it), and the caller then looks in the inbox rows instead; a 404 with a code of its own is Raft
+ * saying the owner can see nothing of that name. Any other failure pauses where it is a 403 `assistant_not_enabled`, as
+ * every assistant read's does, and is `failed`.
  */
 export const OWNER_RESOLVE_PATH = "/internal/agent-api/assistant/owner-resolve";
-export const resolveOwnerPerson: PersonResolve = async (ctx, name) => {
+export const readOwnerResolve: OwnerResolveRead = async (ctx, name) => {
   try {
     const { data } = await call(ctx, "GET", `${OWNER_RESOLVE_PATH}?name=${encodeURIComponent(name)}`);
-    if (typeof data.id !== "string" || !data.id) return { ok: false, reason: "failed" };
-    return { ok: true, id: data.id, type: data.type, name: typeof data.name === "string" ? data.name : null };
+    return { ok: true, data };
   } catch (e) {
     const err = e as { httpStatus?: unknown; code?: unknown };
     if (err.httpStatus === 404) return { ok: false, reason: err.code === undefined || err.code === "NOT_FOUND" ? "unavailable" : "unknown" };
     await pauseOn(ctx, e).catch(() => {});
     return { ok: false, reason: "failed" };
   }
+};
+/** The person read: `readOwnerResolve`, its body a person only with an id; any other body is `failed`. */
+export const resolveOwnerPerson: PersonResolve = async (ctx, name) => {
+  const r = await readOwnerResolve(ctx, name);
+  if (!r.ok) return r;
+  const { data } = r;
+  if (typeof data.id !== "string" || !data.id) return { ok: false, reason: "failed" };
+  return { ok: true, id: data.id, type: data.type, name: typeof data.name === "string" ? data.name : null };
 };
 
 /**

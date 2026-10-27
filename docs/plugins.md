@@ -1059,9 +1059,18 @@ button, so the assistant sends no confirmation of its own. The prompt has it sen
 to approve, ask one short question only when what to send or to whom is unclear, and never send as the
 owner unasked. The tool takes a `target` (`#channel:msgid`, which replies in that message's thread, or
 with `inThread: false` posts in its channel; `#channel`; `@name` for the owner's DM with that person; or
-a `channelId` from the owner inbox, a thread's own posting in that thread) and the `content`. Names are
-resolved against the owner's inbox (a message's full id from a thread row whose root it is, else a read
-around its short id). Code keeps, whatever the model does: a call from a short session (a check or the
+a `channelId` from the owner inbox, a thread's own posting in that thread) and the `content`. A
+`channelId` is taken as it is, with no read. A `#channel` (alone or in `#channel:msgid`) is asked of
+Raft's `GET /assistant/owner-resolve?name=%23<name>` first, which answers a channel the owner can see in
+the assistant's server, public, private or joint, however many conversations they have: a 200 whose
+`type` is `channel` with a UUID `id` is sent to; any other 200 (a person, a body with no such id) and the
+404 are a miss, never a place to send. A Raft from before channels were read by name answers `#name` as a
+person's 404, so on a miss the channel is looked for in the owner's inbox, every page, bounded at 50
+pages (2,500 rows); stopped at that bound with more left, the answer is `channel_beyond_read`, not
+`channel_unknown`. Any other failure of the read (a 5xx, no answer) is `resolve_failed`, with no inbox
+read and nothing sent. An `@name` is the owner's DM row with that person in the first four pages of the
+inbox. A message's full id comes from a thread row whose root it is, when the inbox was read, else a read
+around its short id. Code keeps, whatever the model does: a call from a short session (a check or the
 brief) or from a program is refused before anything is read, and the tool is not offered there either;
 `@everyone` and `@here` are refused before anything is read; one request per call, never retried, and
 after a `rate_limited` the same message to the same place is not sent again for ten minutes; within one
@@ -1069,13 +1078,17 @@ turn (`caller.turnId`) the same message to the same place is posted once (an `un
 since it may have landed), a second call answered
 `not_sent` / `duplicate_in_turn` without a request (traced `refused:duplicate_in_turn`). A refusal
 (`assistant_send_as_owner_off`, `channel_not_found`, `message_not_found`, `owner_cannot_post`,
-`mass_mention_not_allowed`, `invalid_content`, `rate_limited`, `channel_archived`, a missing route, or a
-target the inbox cannot resolve) is answered `not_sent` with the code and a `tell` line for the owner,
+`mass_mention_not_allowed`, `invalid_content`, `rate_limited`, `channel_archived`, a missing route, a
+target that cannot be resolved, `channel_unknown` being "there's no channel by that name that you can see
+in this server", or `resolve_failed`) is answered `not_sent` with the code and a `tell` line for the owner,
 followed by the message where they could send it themselves; no answer, or a 5xx, is `uncertain`,
 without the text, since it may have landed. Each call writes a `raft.assistant_send_as_owner` row:
-`result` (`sent`, `uncertain`, `failed` or `refused:<code>`, `refused:proactive` among them),
-`target_kind` (`message`, `channel`, `dm`, `channel_id`), `in_thread`, `chars` (the message's length)
-and Raft's HTTP status as `http_status`; never the message, a name or an id.
+`result` (`sent`, `uncertain`, `failed`, `resolve_failed` or `refused:<code>`, `refused:proactive` among
+them), `target_kind` (`message`, `channel`, `dm`, `channel_id`), `in_thread`, `chars` (the message's
+length), Raft's HTTP status as `http_status`, and how the target was resolved: `resolved_by` (`id`,
+`resolve`, `inbox`, or `none` when it was not), with `rows_read`, `pages_read` and `bound_hit` wherever
+the inbox was read; never the message, a name or an id. The trace export forwards only the fields the
+receiver keeps, which do not include these four yet.
 
 An assistant's one Raft app is the Reminder app (Raft offers an assistant no other, slock#10764), used
 through `assistant_reminder`, offered in the chat only (`src/plugins/raft-assistant-reminder.ts`) and
