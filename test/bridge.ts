@@ -689,6 +689,24 @@ await check("the unlisted-write floor is absolute: a plugin default of allow sti
   must(r3.status === "succeeded" && owner.sent.length === 1, `the mount's allow did not lift it: ${JSON.stringify(r3)}`);
 });
 
+await check("a withQuery row applies only when the request's path carried a query, and never reads it", async () => {
+  const { classifyRoute } = await import("../src/plugins/types.ts");
+  const decl = { unlistedWriteKey: "svc.write", routes: [
+    { methods: ["POST"], path: /^\/v1\/x$/, withQuery: true as const, refuse: "no query here" },
+    { methods: ["POST"], path: /^\/v1\/x$/, key: "pr_comment" },
+  ] };
+  must(classifyRoute(decl, "POST", "/v1/x", null, null, true).kind === "refused", "a query did not reach the withQuery row");
+  must(JSON.stringify(classifyRoute(decl, "POST", "/v1/x", null, null, false)) === '{"kind":"listed","key":"pr_comment"}', "no query matched the withQuery row");
+  must(JSON.stringify(classifyRoute(decl, "POST", "/v1/x", null)) === '{"kind":"listed","key":"pr_comment"}', "hasQuery does not default to false");
+  // Through the gateway: the path as sent decides, an empty query included.
+  const f = fixture([...decl.routes, ...ROUTES]);
+  const { gw } = await gatewayWith(OPEN, f.plugin);
+  const r: any = await gw.invoke(caller, "svc.request", req("POST", "/v1/x?", "{}"), program);
+  must(r.status === "rejected" && r.error?.code === "route_refused" && r.error.message === "no query here", `through the gateway: ${JSON.stringify(r)}`);
+  const ok: any = await gw.invoke(caller, "svc.request", req("POST", "/v1/x", "{}"), program);
+  must(ok.status === "succeeded" && f.sent.length === 1, `without a query: ${JSON.stringify(ok)}`);
+});
+
 for (const r of results) {
   console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);
 }

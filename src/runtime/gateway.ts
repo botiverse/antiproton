@@ -1220,7 +1220,8 @@ export class ToolGateway {
           refusal = { code: "bad_request", message: String((e as Error)?.message ?? e).slice(0, 300) };
         }
       }
-      const c = route ? classifyRoute(bridge, route.method, routePath(route.path), route.body, route.headers["content-type"] ?? null) : null;
+      const c = route ? classifyRoute(bridge, route.method, routePath(route.path), route.body, route.headers["content-type"] ?? null,
+        route.path.includes("?")) : null;
       if (c?.kind === "refused") refusal = { code: "route_refused", message: c.message };
       if (refusal || !c || c.kind === "refused") {
         await this.#store.completeOperation(ctx.tenantId, operationId, "rejected", null, undefined, facts());

@@ -1186,8 +1186,9 @@ const NOT_ON_BRIDGE = "a program's request through sdk:stamp may not";
  * It lists the routes known to approve or merge, and a few by name for their key: it is not a list of every spelling
  * upstream accepts. A write it does not name is held under `stamp.write` (`unlistedWriteKey`); a read passes. That
  * includes writes Stamp's own proxy refuses for an agent — updating a branch, branch protection, `git/refs`,
- * `contents` — so on a mount that sets `stamp.write: allow` those rest on Stamp's proxy alone. The query is never
- * judged (`?event=APPROVE` on a POST reads as no event), which is Stamp's own rule as well.
+ * `contents` — so on a mount that sets `stamp.write: allow` those rest on Stamp's proxy alone. A query's content is
+ * never judged; a review write that carries one at all is refused, so `?event=APPROVE` cannot ride beside a body that
+ * says nothing. GitHub's `/repositories/<id>` alias is refused whole, since every row here is written for owner/repo.
  */
 export const STAMP_ROUTES: readonly RouteEntry[] = [
   // The session endpoints are this plugin's own (`rotate`, `selfLogin`): a program never signs in or refreshes.
@@ -1205,6 +1206,13 @@ export const STAMP_ROUTES: readonly RouteEntry[] = [
     refuse: `${NOT_ON_BRIDGE} merge through GitHub's API: call pr_merge, which names the exact head a person signs for` },
   // A GraphQL mutation can approve or merge, and its body is not something a row can judge.
   { methods: ANY, path: /^\/api\/v3\/graphql$/, refuse: `${NOT_ON_BRIDGE} use GitHub's GraphQL API, which can approve or merge: use the REST paths, or the stamp tools` },
+  // GitHub's repository-id alias reaches every route below under another spelling; the table is written for owner/repo.
+  { methods: ANY, path: /^\/api\/v3\/repositories(\/|$)/,
+    refuse: `${NOT_ON_BRIDGE} use GitHub's /repositories/<id> paths: name the repository as /api/v3/repos/<owner>/<repo>, or use the pr_* tools` },
+  // A review write with a query: the table matches the path without it, so whatever upstream reads there (an `event`)
+  // is something no row can judge.
+  { methods: WRITES, path: re(`${V3_REPO}/pulls/${SEG}/reviews(/${SEG}(/events)?)?$`), withQuery: true,
+    refuse: `${NOT_ON_BRIDGE} write a review with a query string, which this table cannot judge: put every field in the JSON body` },
   // Every write to a review, not only POST: which methods upstream reads an `event` on is not this table's to guess.
   { methods: WRITES, path: re(`${V3_REPO}/pulls/${SEG}/reviews(/${SEG}(/events)?)?$`),
     body: (b, raw) => reviewEvent(b, raw).includes("APPROVE"),

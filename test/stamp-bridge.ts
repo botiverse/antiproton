@@ -546,6 +546,33 @@ await check("a path refusal thrown by gatewayFetch inside send keeps its own wor
   must(seen.length === 0, "it reached upstream");
 });
 
+await check("GitHub's /repositories/<id> alias is refused for every method: merge, an APPROVE review, a read", async () => {
+  const m = await mount(OPEN);
+  for (const [method, path, body] of [
+    ["PUT", "/api/v3/repositories/123/pulls/7/merge", "{}"],
+    ["POST", "/api/v3/repositories/123/pulls/7/reviews", '{"event":"APPROVE"}'],
+    ["GET", "/api/v3/repositories/123", null],
+    ["DELETE", "/API/V3/Repositories/123/git/refs/heads/x", null],
+  ] as const) {
+    const r = await m.request(method, path, body, body ? "application/json" : null);
+    must(r.status === "rejected" && r.error?.code === "route_refused" && /repos\/<owner>\/<repo>/.test(r.error.message), `${method} ${path}: ${JSON.stringify(r)}`);
+  }
+  must(seen.length === 0, `reached upstream: ${JSON.stringify(seen)}`);
+});
+
+await check("a review write that carries a query is refused, whatever the body; without one, and a read with one, it runs", async () => {
+  const m = await mount(OPEN);
+  for (const [method, path] of [["POST", `${REVIEW}?event=APPROVE`], ["POST", `${REVIEW}?`], ["PUT", `${REVIEW}/55?x=1`],
+    ["POST", `${REVIEW}/55/events?event=approve`], ["DELETE", `${REVIEW}/55?a`], ["POST", `${REVIEW}/?event=APPROVE`]] as const) {
+    const r = await m.request(method, path, "{}");
+    must(r.status === "rejected" && r.error?.code === "route_refused" && /query/.test(r.error.message), `${method} ${path}: ${JSON.stringify(r)}`);
+  }
+  must(seen.length === 0, `reached upstream: ${JSON.stringify(seen)}`);
+  const plain = await m.request("POST", REVIEW, '{"event":"COMMENT","body":"hi"}');
+  const read = await m.request("GET", `${REVIEW}?per_page=5`, null, null);
+  must(plain.status === "succeeded" && read.status === "succeeded" && (seen.length as number) === 2, `without a query: ${JSON.stringify(plain)}; a read: ${JSON.stringify(read)}`);
+});
+
 await check("describe names the repository and number on v1 and v3 pull and issue paths, and nothing elsewhere", () => {
   const d = stampPlugin.bridge!.describe!;
   must(JSON.stringify(d("/v1/repositories/o/r/pulls/7/comments")) === '{"repo":"o/r","pr":7}', "v1 pull");

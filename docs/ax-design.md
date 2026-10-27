@@ -141,8 +141,11 @@ Recorded so the design is not read as a description of today:
   unless the mount allows it. Unlisted includes writes Stamp's own proxy refuses for an agent
   (updating a branch, branch protection, `git/refs`, `contents`): a mount that sets
   `stamp.write: allow` relies on that proxy for them. The table judges a review's body, never
-  its query (`?event=APPROVE` on a POST reads as no event), as Stamp's proxy does; a body that
-  names `event` twice, in any case, cannot be judged and is refused. The core's refusal of any `%` in a path stands, so a name that
+  the content of a query: a review write that carries any query (`?event=APPROVE`) is refused
+  (a row may ask only whether a query is present, `RouteEntry.withQuery`), and a body that names
+  `event` twice, in any case, cannot be judged and is refused. GitHub's repository-id alias
+  (`/api/v3/repositories/<id>/…`) is refused for every method, since the table is written for
+  `/api/v3/repos/<owner>/<repo>`. The core's refusal of any `%` in a path stands, so a name that
   needs an encoded separator (`contents/docs%2Freadme.md`, `commits/feature%2Fx`) goes through a
   query form where upstream has one (`commits?sha=feature/x`), or through the `api_get` / `api`
   tools.
