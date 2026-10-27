@@ -403,6 +403,20 @@ await check("a path with ; or a character outside ASCII is refused", async () =>
   must(f.sent.length === 0, "one reached send");
 });
 
+await check("a query may carry ; and characters outside ASCII: it takes no part in routing, and reaches send as sent", async () => {
+  const f = fixture();
+  f.decl.normalize = undefined;
+  const { gw } = await gatewayWith(null, f.plugin);
+  for (const path of ["/v1/search?q=a;b", "/v1/search?q=a&sort=desc;x", "/v1/search?q=caf\u00e9"]) {
+    const r: any = await gw.invoke(caller, "svc.request", req("GET", path), program);
+    must(r.status === "succeeded", `${path}: ${JSON.stringify(r)}`);
+  }
+  must(JSON.stringify(f.sent.map((x) => x.path)) === JSON.stringify(["/v1/search?q=a;b", "/v1/search?q=a&sort=desc;x", "/v1/search?q=caf\u00e9"]),
+    `send was handed ${JSON.stringify(f.sent.map((x) => x.path))}`);
+  const r: any = await gw.invoke(caller, "svc.request", req("GET", "/v1/search?q=a b"), program);
+  must(r.status === "rejected" && r.error?.code === "bad_request", `whitespace in a query was taken: ${JSON.stringify(r)}`);
+});
+
 await check("a header with CR or LF, a path past 2048 characters and a body past 1 MiB are refused, and no card keeps them", async () => {
   const f = fixture();
   const { gw, store, ops } = await gatewayWith(null, f.plugin);

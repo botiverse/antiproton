@@ -305,12 +305,12 @@ function bridgePath(raw: string): string | { error: string } {
   if (raw.length > BRIDGE_PATH_MAX) return bad(`is at most ${BRIDGE_PATH_MAX} characters`);
   if (!raw.startsWith("/") || raw.startsWith("//")) return bad("starts with one / and names no host");
   if (/[\\\s\u0000-\u001f\u007f]/.test(raw)) return bad("carries no backslash, whitespace or control character");
-  // A matrix parameter (`merge;x`) and a character outside ASCII (a full-width `ｍerge`) are spellings a server may
-  // route as the listed path while a pattern does not see it.
-  if (/[;]|[^\x21-\x7e]/.test(raw)) return bad("carries no ; and nothing outside printable ASCII");
   const noFragment = raw.split("#", 1)[0]!;
   const q = noFragment.indexOf("?");
   const pathPart = q < 0 ? noFragment : noFragment.slice(0, q);
+  // A matrix parameter (`merge;x`) and a character outside ASCII (a full-width `ｍerge`) are spellings a server may
+  // route as the listed path while a pattern does not see it. The path only: the query takes no part in routing.
+  if (/[;]|[^\x21-\x7e]/.test(pathPart)) return bad("carries no ; and nothing outside printable ASCII");
   let decoded: string;
   try { decoded = decodeURIComponent(pathPart); } catch { decoded = ""; }
   if (decoded !== pathPart) return bad("carries no percent-escapes");
