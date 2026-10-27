@@ -1388,6 +1388,131 @@ await check("a check of a session whose refresh token has already expired leaves
   must(agentRows(agentDb!, "stampVerified").length === 0, JSON.stringify(agentRows(agentDb!, "stampVerified")));
 });
 
+// ---- the SDK swap, pinned: what it sends, how often, and the words it keeps ----
+
+// The SDK retries a read twice by default when the transport fails. This
+// plugin's tools declare their own idempotency, so a read that cannot reach the
+// gateway is one attempt here: the caller decides, and knows what happened.
+await check("a read whose transport fails is one attempt, not the SDK's retries", async () => {
+  reset();
+  const { ctx } = makeCtx();
+  const inner = globalThis.fetch as any;
+  let attempts = 0;
+  globalThis.fetch = (async (input: any, init: any) => {
+    const u = new URL(String(input));
+    // The owner check a first use makes is not the call under test.
+    if (u.pathname === "/v1/me" && !u.searchParams.has("purpose")) {
+      attempts++;
+      const e = new TypeError("fetch failed");
+      (e as any).cause = { code: "ECONNRESET" };
+      throw e;
+    }
+    return inner(input, init);
+  }) as any;
+  let said = "";
+  try { said = await refusal(invoke("whoami", {}, ctx)); } finally { globalThis.fetch = inner; }
+  must(attempts === 1, `attempts: ${attempts} (the SDK would make three)`);
+  must(said !== "" && !/refused \d/.test(said), `reads as a refusal: ${said}`);
+});
+
+// A write is never retried either, and this one is not idempotent: an unclear
+// answer means read the pull request, never resend. A 5xx is one request, and
+// a transport failure on a write is one attempt too — the outcome is unknown.
+await check("a refused write is one request", async () => {
+  reset();
+  const { ctx } = makeCtx();
+  statuses["POST /v1/pull-requests"] = 500;
+  try {
+    const said = await refusal(invoke("pr_create", { receipt: "rec_1" }, ctx));
+    must(seen.filter((r) => r.method === "POST" && r.path === "/v1/pull-requests").length === 1, `posts: ${seen.length}`);
+    must(said.includes("500"), `said: ${said}`);
+  } finally { delete statuses["POST /v1/pull-requests"]; }
+  const inner = globalThis.fetch as any;
+  let attempts = 0;
+  globalThis.fetch = (async (input: any, init: any) => {
+    if (new URL(String(input)).pathname === "/v1/pull-requests") {
+      attempts++;
+      const e = new TypeError("fetch failed");
+      (e as any).cause = { code: "ECONNRESET" };
+      throw e;
+    }
+    return inner(input, init);
+  }) as any;
+  try { await refusal(invoke("pr_create", { receipt: "rec_1" }, ctx)); } finally { globalThis.fetch = inner; }
+  must(attempts === 1, `write attempts: ${attempts} (an unknown outcome is never resent)`);
+});
+
+// One 401: rotate once, retry once, and the retry carries the token just issued
+// — the transport swap must not turn this into two refusals.
+await check("a 401 rotates once and the retry carries the new token", async () => {
+  reset();
+  const { ctx } = makeCtx(session({ access_expires_at: new Date(Date.now() + 10 * 60_000).toISOString() }));
+  refreshAnswer = rotatesTo(60);
+  const inner = globalThis.fetch as any;
+  // The gateway's own rule: the token it has not issued yet is the only one it refuses.
+  globalThis.fetch = (async (input: any, init: any) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/v1/me" && !url.searchParams.has("purpose") && init?.headers?.authorization === "Bearer ACCESS-1") {
+      seen.push({ method: "GET", path: "/v1/me", auth: init?.headers?.authorization, body: "" });
+      return new Response(JSON.stringify({ errorCode: "SESSION_REQUIRED" }), { status: 401, headers: { "content-type": "application/json" } });
+    }
+    return inner(input, init);
+  }) as any;
+  try {
+    await invoke("whoami", {}, ctx);
+  } finally { globalThis.fetch = inner; }
+  const me = seen.filter((r) => r.path === "/v1/me");
+  must(refreshes === 1, `refreshes: ${refreshes}`);
+  must(me.length === 2, `requests: ${me.length}`);
+  must(me[0].auth === "Bearer ACCESS-1" && me[1].auth === "Bearer ACCESS-60", `sent: ${me.map((r) => r.auth).join(" then ")}`);
+});
+
+// The gateway's own code is what a caller branches on: it has to survive the
+// SDK's ApiError, with the method and path that were refused.
+await check("a refusal keeps the gateway's code and the request that was refused", async () => {
+  reset();
+  const { ctx } = makeCtx();
+  statuses["POST /v1/repositories/o/r/pulls/7/approve"] = 403;
+  replies["POST /v1/repositories/o/r/pulls/7/approve"] = { errorCode: "SELF_APPROVAL_NOT_ALLOWED", message: "an author cannot approve" };
+  try {
+    const said = await refusal(invoke("pr_approve", { repo: "o/r", number: 7, head: HEAD, base: BASE }, ctx));
+    must(said.includes("SELF_APPROVAL_NOT_ALLOWED"), `code lost: ${said}`);
+    must(said.includes("POST /v1/repositories/o/r/pulls/7/approve"), `path lost: ${said}`);
+    must(said.includes("403"), `status lost: ${said}`);
+  } finally {
+    delete statuses["POST /v1/repositories/o/r/pulls/7/approve"];
+    replies["POST /v1/repositories/o/r/pulls/7/approve"] = { approved: true };
+  }
+});
+
+// A transport that cannot be reached is not a refusal by the gateway: nothing
+// here may read like "the gateway said no".
+await check("an unreachable gateway is not reported as a refusal", async () => {
+  reset();
+  const { ctx } = makeCtx();
+  // Kept first, so the failure below is the call's and not the first use's owner check.
+  await invoke("whoami", {}, ctx);
+  const inner = globalThis.fetch as any;
+  globalThis.fetch = (async () => { throw new TypeError("fetch failed"); }) as any;
+  try {
+    const said = await refusal(invoke("whoami", {}, ctx));
+    must(said !== "", "the call succeeded with no gateway");
+    must(!/refused \d/.test(said), `reads as a refusal: ${said}`);
+  } finally { globalThis.fetch = inner; }
+});
+
+// The path check is this plugin's, and it runs before the SDK builds the URL:
+// an escape must be no request at all, not one the transport then explains.
+await check("a path that escapes is refused before the SDK sends it", async () => {
+  reset();
+  const { ctx } = makeCtx();
+  for (const path of ["/v1/../api/auth/agent/refresh", "/v1/x/../../api/auth/agent/refresh", "/api/v3/../api/auth/session"]) {
+    const said = await refusal(invoke("api", { method: "POST", path, body: {} }, ctx));
+    must(/must not climb out|must start with/.test(said), `${path}: ${said}`);
+  }
+  must(seen.length === 0, `reached the gateway: ${JSON.stringify(seen.map((r) => r.path))}`);
+});
+
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.error ? `\n    ${r.error}` : ""}`);
 const failed = results.filter((r) => !r.ok).length;
 console.log(`${results.length - failed}/${results.length} passed`);
