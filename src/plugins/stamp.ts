@@ -102,7 +102,8 @@ function needsRefresh(session: AgentSession, now: number, skewMs: number): boole
  * rename moves the row and changes the alias, and a queue keyed by the alias
  * would let a call under the new name rotate beside one still running under the
  * old. With the alias held fixed, an agent's stamp mounts share one queue, which
- * costs a wait on a rotation every quarter hour and nothing else.
+ * costs a wait on a rotation every quarter hour and nothing else: at most one
+ * refresh timeout (30 s) when another mount's refresh hangs.
  */
 const queues = new Map<string, Promise<unknown>>();
 const inlineKey = (ctx: PluginContext) => {
@@ -273,10 +274,21 @@ export async function loadSession(ctx: PluginContext, keep = true): Promise<Agen
     if (again.kind === "open") return again.session;
     refuseUnusable(again);
     if (await wasGiven(ctx, d)) throw givenBefore();
-    // Recorded before it is sealed: a seal that fails after this costs a sign-in,
-    // a record that never happened would let a removed mount's session back in.
+    // Recorded before it is sealed: a record that never happened would let a
+    // removed mount's session back in. If the seal then fails, the record is
+    // taken back — it is this call's own (`wasGiven` was false a moment ago)
+    // and nothing has been sent — unless the row turns out to hold the session
+    // after all (a write that failed late), or cannot be read to say: then it
+    // stays, and the cost is a sign-in.
     await givenDb(ctx).put(GIVEN_STORE, { at: new Date().toISOString() }, d);
-    await storeSession(ctx, given);
+    try { await storeSession(ctx, given); } catch (e) {
+      let kept: Kept | null = null;
+      try { kept = await readKept(ctx); } catch { /* unread: keep the record */ }
+      if (kept?.kind !== "open") {
+        try { await givenDb(ctx).delete(GIVEN_STORE, d); } catch { /* kept: the safe side */ }
+      }
+      throw e;
+    }
     return given;
   });
 }
@@ -514,13 +526,15 @@ function gatewayPath(raw: unknown, allowed: readonly string[]): string {
  * What `api` must not do, because a dedicated tool does it and that tool is held
  * for a person by default (`defaultPolicy`): a mount that lifted `api` for some
  * other write would otherwise approve or merge through it. Matched on the path
- * as Stamp will route it — decoded, without a trailing slash, any case — so a
+ * as Stamp will route it — decoded, empty segments and a trailing slash
+ * dropped, any case — so a
  * spelling that reaches the same route is the same route. Null: not held.
  */
 function heldRoute(path: string, body: unknown): "an approval" | "a merge" | null {
   let p = path.split("?", 1)[0];
   try { p = decodeURIComponent(p); } catch { /* gatewayPath already refused what would matter */ }
-  p = p.replace(/\/+$/, "").toLowerCase();
+  // Empty segments collapsed: `pulls/7//merge` must meet the hold, not a redirect further on.
+  p = p.replace(/\/{2,}/g, "/").replace(/\/+$/, "").toLowerCase();
   if (/^\/v1\/repositories\/[^/]+\/[^/]+\/pulls\/[^/]+\/approve$/.test(p)) return "an approval";
   if (/^\/v1\/repositories\/[^/]+\/[^/]+\/pulls\/[^/]+\/(merge|auto-merge|queue)$/.test(p)) return "a merge";
   if (/^\/api\/v3\/repos\/[^/]+\/[^/]+\/(pulls\/[^/]+\/merge|merges)$/.test(p)) return "a merge";

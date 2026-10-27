@@ -32,6 +32,8 @@ let refreshAnswer: () => Response = () => new Response("{}", { status: 500 });
 let failNextStore = false;
 /** Fail the first session write after the gateway has been asked to rotate: the write that keeps the rotation. */
 let failStoreAfterRefresh = false;
+/** Keep the next session write and then report it failed: a write whose answer is lost after it landed. */
+let failNextStoreLate = false;
 const replies: Record<string, unknown> = {
   "GET /v1/me": { handle: "eleanor", principalType: "agent", serverName: "raft", commitEmail: "raft+eleanor@agents.stamp.build", gitHTTPSURLTemplate: "https://stamp.build/github/{owner}/{repo}.git" },
   "GET /v1/repositories/o/r/pulls": [{ number: 7, title: "T", state: "open", url: "https://github.com/o/r/pull/7", headSha: "abc" }],
@@ -85,7 +87,7 @@ function makeAgentDb() {
     rows,
     async get(store: string, key: string) { return rows.get(`${store}\u0000${key}`) ?? null; },
     async put(store: string, value: any, key: string) { rows.set(`${store}\u0000${key}`, value); return key; },
-    async delete() {}, async getAll() { return []; }, async getAllFromIndex() { return []; },
+    async delete(store: string, key: string) { rows.delete(`${store}\u0000${key}`); }, async getAll() { return []; }, async getAllFromIndex() { return []; },
     async count() { return 0; }, async transaction(_s: any, _m: any, fn: any) { return fn(this); },
   };
 }
@@ -99,6 +101,7 @@ function makeCtx(credential: string | null = session(), agentDb: ReturnType<type
       if (failNextStore) { failNextStore = false; throw new Error("write refused by the test"); }
       if (failStoreAfterRefresh && refreshes > 0) { failStoreAfterRefresh = false; throw new Error("write refused by the test"); }
       if (store === SESSION_STORE) rows.set(key, value);
+      if (failNextStoreLate) { failNextStoreLate = false; throw new Error("write reported failed after it landed"); }
       return key;
     },
     async delete() {}, async getAll() { return []; }, async getAllFromIndex() { return []; },
@@ -815,6 +818,9 @@ await check("api refuses the approve and merge routes, however they are spelled"
     ["POST", "/api/v3/repos/o/r/merges"],
     ["POST", "/api/v3/repos/o/r/pulls/7/reviews", { event: "APPROVE" }],
     ["POST", "/api/v3/repos/o/r/pulls/7/reviews/9/events", { event: "approve" }],
+    ["PUT", "/v1/repositories/o/r/pulls/7//merge"],
+    ["POST", "/v1/repositories/o/r/pulls/7///approve"],
+    ["PUT", "/api/v3/repos/o//r/pulls/7//merge"],
   ];
   for (const [method, path, body] of held) {
     const threw = await refusal(invoke("api", { method, path, body }, ctx));
@@ -850,6 +856,30 @@ await check("through the gateway, a mount removed and added back with the same s
   must(again.status !== "succeeded" && /already given/.test(JSON.stringify(again)) && seen.length === 0, `re-added: ${JSON.stringify(again)}`);
   const checked: any = await gw.checkMount("t", "a", "stamp", credential);
   must(JSON.stringify(checked).includes("already given"), `check: ${JSON.stringify(checked)}`);
+});
+
+// A first seal that fails is not a session used: the record it wrote first is
+// taken back, so the same session can be given again. Unless the write landed.
+await check("a first seal that fails takes back its record, so the same session works next time", async () => {
+  reset();
+  const { ctx, agentDb } = makeCtx();
+  failNextStore = true;
+  const first = await refusal(invoke("whoami", {}, ctx));
+  must(first.includes("write refused by the test"), `first: ${first}`);
+  must(agentDb!.rows.size === 0, "the record of a session never sealed stayed");
+  const checked: any = await stampPlugin.checkCredential!(ctx);
+  must(checked.ok === true, `check after the failed seal: ${JSON.stringify(checked)}`);
+  must((await refusal(invoke("whoami", {}, ctx))) === "", "the same session was refused after a failed first seal");
+});
+
+await check("a first seal reported failed after it landed keeps its record", async () => {
+  reset();
+  const { ctx, agentDb } = makeCtx();
+  failNextStoreLate = true;
+  await refusal(invoke("whoami", {}, ctx));
+  must(agentDb!.rows.size === 1, "the record was taken back although the row holds the session");
+  const { ctx: readded } = makeCtx(session(), agentDb);
+  must(/already given/.test(await refusal(invoke("whoami", {}, readded))), "a removed mount's session was accepted again");
 });
 
 // A plugin default may tighten a mount's policy, never loosen it: an operator who
