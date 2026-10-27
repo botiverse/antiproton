@@ -98,9 +98,17 @@ function needsRefresh(session: AgentSession, now: number, skewMs: number): boole
  * the session again before acting (`rotate`, `loadSession`). Keyed by the
  * mount's place rather than by the object, because the same plugin serves every
  * mount in the isolate; one isolate per agent is what makes it the only queue.
+ * The place is the one the row is sealed under (`sealPlace`), not the alias: a
+ * rename moves the row and changes the alias, and a queue keyed by the alias
+ * would let a call under the new name rotate beside one still running under the
+ * old. With the alias held fixed, an agent's stamp mounts share one queue, which
+ * costs a wait on a rotation every quarter hour and nothing else.
  */
 const queues = new Map<string, Promise<unknown>>();
-const inlineKey = (ctx: PluginContext) => `${ctx.caller.tenantId}\u0000${ctx.caller.agentId}\u0000${ctx.alias}`;
+const inlineKey = (ctx: PluginContext) => {
+  const place = sealPlace(ctx);
+  return `${place.caller.tenantId}\u0000${place.caller.agentId}\u0000${place.alias}`;
+};
 
 async function exclusive<T>(ctx: PluginContext, fn: () => Promise<T>): Promise<T> {
   const key = inlineKey(ctx);
@@ -125,11 +133,22 @@ async function exclusive<T>(ctx: PluginContext, fn: () => Promise<T>): Promise<T
  * without one reads as `spent`, since the safe guess is the one that sends
  * nothing. Beside it, `spent` lists digests of every refresh token this mount
  * has rotated away from, so a spent session pasted back after another one is
- * still recognised.
+ * still recognised, and `given` lists digests of every credential a person has
+ * given this mount.
+ * - `unfinished`: the row opens, but to a session whose rotation was started and
+ *   never finished (`rotating`, below). The gateway may have rotated it already
+ *   and the answer never been kept, so its refresh token is treated as spent.
  */
-type Kept = ({ kind: "none" } | { kind: "open"; session: AgentSession } | { kind: "spent" } | { kind: "replaced" }) & { spent: string[] };
+type Kept = ({ kind: "none" } | { kind: "open"; session: AgentSession } | { kind: "spent" } | { kind: "replaced" } | { kind: "unfinished" }) & Lists;
+type Lists = { spent: string[]; given: string[] };
 
-/** How many spent refresh tokens a row remembers. */
+/**
+ * How many rotated-away refresh tokens a row remembers. Capped because a rotation
+ * every quarter hour would otherwise grow the row without end; what may not fall
+ * off is a credential a person gave, since that is the one that can be pasted
+ * back, so those are kept apart in `given` and never dropped. `given` grows only
+ * when a person signs in again.
+ */
 const SPENT_KEPT = 32;
 
 /** A refresh token as a row may name it: a digest, never the token. */
@@ -163,17 +182,20 @@ async function readKept(ctx: PluginContext): Promise<Kept> {
     throw new Error(`stamp: could not read this mount's session (${String((e as Error)?.message ?? e).slice(0, 200)}). ` +
       "It is not replaced by the one the mount was given, whose refresh token may already be spent; try again.");
   }
-  if (row === null || row === undefined) return { kind: "none", spent: [] };
+  if (row === null || row === undefined) return { kind: "none", spent: [], given: [] };
   const sealed = typeof row === "object" && !Array.isArray(row) ? row as Record<string, unknown> : {};
-  const spent = Array.isArray(sealed.spent) ? sealed.spent.filter((x): x is string => typeof x === "string") : [];
+  const strings = (v: unknown) => Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
+  const lists = { spent: strings(sealed.spent), given: strings(sealed.given) };
   if (typeof sealed.iv === "string" && typeof sealed.ciphertext === "string") {
     const plain = await openText(sealPlace(ctx), SEAL_INFO, { iv: sealed.iv, ciphertext: sealed.ciphertext }, SESSION_KEY);
     const s = plain === null ? null : parseSession(plain);
-    if (s) return { kind: "open", session: s, spent };
+    if (s && typeof sealed.rotating === "string" && sealed.rotating === await digest(s.refresh_token)) return { kind: "unfinished", ...lists };
+    if (s) return { kind: "open", session: s, ...lists };
   }
   const from = await lineage(ctx.credential);
-  const fresh = typeof sealed.from === "string" && from !== null && sealed.from !== from && !spent.includes(from);
-  return { kind: fresh ? "replaced" : "spent", spent };
+  const fresh = typeof sealed.from === "string" && from !== null && sealed.from !== from &&
+    !lists.spent.includes(from) && !lists.given.includes(from);
+  return { kind: fresh ? "replaced" : "spent", ...lists };
 }
 
 /** A mount whose kept session is lost: what it was given may be spent, so only a person can go on. */
@@ -183,6 +205,16 @@ const spentSession = () => new SpentSession(
   "already — sending a spent refresh token makes Stamp revoke every token this agent holds, on every machine. " +
   "It needs sign-in again: a person signs in for this mount alone and gives it that session.",
 );
+/** A mount whose last rotation was started and never kept: the gateway may have spent its refresh token. */
+const unfinishedRotation = () => new SpentSession(
+  "stamp: a person needs to sign in again for this mount: its last refresh did not finish, so the gateway may have " +
+  "rotated the session without this side keeping the new one. Nothing was sent — presenting that refresh token again " +
+  "makes Stamp revoke every token this agent holds, on every machine. A person signs in for this mount alone and gives it that session.",
+);
+const refuseUnusable = (kept: Kept) => {
+  if (kept.kind === "spent") throw spentSession();
+  if (kept.kind === "unfinished") throw unfinishedRotation();
+};
 
 /**
  * The session this mount acts with, and only ever the kept one.
@@ -205,7 +237,7 @@ export async function loadSession(ctx: PluginContext, keep = true): Promise<Agen
   if (!given) return null;
   const kept = await readKept(ctx);
   if (kept.kind === "open") return kept.session;
-  if (kept.kind === "spent") throw spentSession();
+  refuseUnusable(kept);
   if (!keep) return given;
   // Read again in the queue: another call may have sealed it, and rotated it,
   // since the read above, and sealing `given` over that would bring the spent
@@ -213,16 +245,22 @@ export async function loadSession(ctx: PluginContext, keep = true): Promise<Agen
   return exclusive(ctx, async () => {
     const again = await readKept(ctx);
     if (again.kind === "open") return again.session;
-    if (again.kind === "spent") throw spentSession();
-    await storeSession(ctx, given, again.spent);
+    refuseUnusable(again);
+    await storeSession(ctx, given, again);
     return given;
   });
 }
 
-/** Keep a session, or refuse to go on: it is never used unstored. */
-async function storeSession(ctx: PluginContext, session: AgentSession, spent: string[]): Promise<void> {
+/**
+ * Keep a session, or refuse to go on: it is never used unstored. `rotating` is
+ * the digest of the refresh token about to be presented, written before it is:
+ * a row that still carries it afterwards reads as `unfinished`.
+ */
+async function storeSession(ctx: PluginContext, session: AgentSession, lists: Lists, rotating?: string): Promise<void> {
   const sealed = await sealText(sealPlace(ctx), SEAL_INFO, JSON.stringify(session), SESSION_KEY);
-  const row = { ...sealed, from: await lineage(ctx.credential), spent: spent.slice(-SPENT_KEPT) };
+  const from = await lineage(ctx.credential);
+  const given = from === null || lists.given.includes(from) ? lists.given : [...lists.given, from];
+  const row = { ...sealed, from, spent: lists.spent.slice(-SPENT_KEPT), given, ...(rotating ? { rotating } : {}) };
   await ctx.db.put(SESSION_STORE, row as unknown as Json, SESSION_KEY);
 }
 
@@ -239,24 +277,43 @@ async function rotate(ctx: PluginContext, used: AgentSession): Promise<AgentSess
     // another call rotated it holds a spent refresh token, and sending it is
     // the `refresh_reused` this file opens with. A newer session is used as it is.
     const kept = await readKept(ctx);
-    if (kept.kind === "spent") throw spentSession();
+    refuseUnusable(kept);
     if (kept.kind !== "open") throw new Error("stamp: this mount's session changed while it was being refreshed; nothing was sent — try again");
     if (kept.session.refresh_token !== used.refresh_token) return kept.session;
 
-    const res = await fetch(new URL("/api/auth/agent/refresh", ORIGIN), {
-      method: "POST",
-      headers: { accept: "application/json", "content-type": "application/json", "user-agent": "antiproton/0.1" },
-      body: JSON.stringify({ schema: "raft-cli-agent-refresh.v1", refresh_token: used.refresh_token }),
-      signal: AbortSignal.timeout(30_000),
-      redirect: "error",
-    });
-    const text = await res.text();
+    // Marked before it is sent. From the moment the POST leaves, the gateway may
+    // rotate and the answer may never be kept — a timeout, a dropped connection,
+    // a proxy that fails after the commit, a write that fails — and the row would
+    // still open to the token just spent. The mark makes that row `unfinished`,
+    // so nothing sends it again. Only an answer that shows the gateway did not
+    // rotate clears it; every other end leaves it for a person, the side that
+    // sends nothing. If the mark cannot be written, nothing is sent at all.
+    const marking = await digest(used.refresh_token);
+    await storeSession(ctx, used, kept, marking);
+
+    let res: Response;
+    let text: string;
+    try {
+      res = await fetch(new URL("/api/auth/agent/refresh", ORIGIN), {
+        method: "POST",
+        headers: { accept: "application/json", "content-type": "application/json", "user-agent": "antiproton/0.1" },
+        body: JSON.stringify({ schema: "raft-cli-agent-refresh.v1", refresh_token: used.refresh_token }),
+        signal: AbortSignal.timeout(30_000),
+        redirect: "error",
+      });
+      text = await res.text();
+    } catch (e) {
+      throw new Error(`stamp: the refresh got no answer (${String((e as Error)?.message ?? e).slice(0, 200)}). ` +
+        "The gateway may have rotated the session, so this mount will not present that refresh token again: " +
+        "a person needs to sign in again for this mount alone and give it that session.");
+    }
     let body: Record<string, unknown> = {};
     try { body = text ? JSON.parse(text) as Record<string, unknown> : {}; } catch { body = { text: text.slice(0, 500) }; }
 
     if (!res.ok) {
       const code = String(body.error ?? body.code ?? body.errorCode ?? "");
       // Not retried, and said in the only terms that help: somebody has to act.
+      // The mark stays: the gateway has said this token is spent.
       if (code === "refresh_reused" || code === "refresh_revoked") {
         throw new Error(
           `stamp: this session's refresh token was already used elsewhere or has been revoked (${code}), and the gateway ` +
@@ -264,17 +321,30 @@ async function rotate(ctx: PluginContext, used: AgentSession): Promise<AgentSess
           "A person needs to sign in again for this mount alone and give it that session; do not retry.",
         );
       }
-      throw new Error(`stamp: could not refresh the session (${res.status}${code ? ` ${code}` : ""}) — ` +
-        `${String(body.message ?? body.text ?? "").slice(0, 300)}`.trim());
+      const said = `stamp: could not refresh the session (${res.status}${code ? ` ${code}` : ""}) — ` +
+        `${String(body.message ?? body.text ?? "").slice(0, 300)}`.trim();
+      // A 5xx may come from a proxy after the gateway committed the rotation, so
+      // the mark stays. A 4xx is the gateway refusing before it rotates, so the
+      // token is as it was and the mark comes off; if that write fails the mark
+      // stays, which only costs a sign-in.
+      if (res.status >= 500) {
+        throw new Error(`${said}. The gateway may have rotated the session before failing, so this mount will not ` +
+          "present that refresh token again: a person needs to sign in again for this mount alone and give it that session.");
+      }
+      await storeSession(ctx, used, kept);
+      throw new Error(said);
     }
 
     const next = parseSession({ ...body, access_token: body.access_token ?? (body as any).accessToken,
       refresh_token: body.refresh_token ?? (body as any).refreshToken });
-    if (!next) throw new Error("stamp: the refresh answered something that is not a session; nothing was stored");
+    if (!next) {
+      throw new Error("stamp: the refresh answered something that is not a session; nothing was stored. The gateway may " +
+        "have rotated the session, so a person needs to sign in again for this mount alone and give it that session.");
+    }
 
     // Before it is used, always: a rotation that cannot be kept would leave the
     // caller holding a token the next call cannot rotate again.
-    await storeSession(ctx, next, [...kept.spent, await digest(used.refresh_token)]);
+    await storeSession(ctx, next, { spent: [...kept.spent, marking], given: kept.given });
     return next;
   });
 }

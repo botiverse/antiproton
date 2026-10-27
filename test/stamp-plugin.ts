@@ -30,6 +30,8 @@ let refreshes = 0;
 let spentRefresh = new Set<string>();
 let refreshAnswer: () => Response = () => new Response("{}", { status: 500 });
 let failNextStore = false;
+/** Fail the first session write after the gateway has been asked to rotate: the write that keeps the rotation. */
+let failStoreAfterRefresh = false;
 const replies: Record<string, unknown> = {
   "GET /v1/me": { handle: "eleanor", principalType: "agent", serverName: "raft", commitEmail: "raft+eleanor@agents.stamp.build", gitHTTPSURLTemplate: "https://stamp.build/github/{owner}/{repo}.git" },
   "GET /v1/repositories/o/r/pulls": [{ number: 7, title: "T", state: "open", url: "https://github.com/o/r/pull/7", headSha: "abc" }],
@@ -83,6 +85,7 @@ function makeCtx(credential: string | null = session()) {
     async get(store: string, key: string) { return store === SESSION_STORE ? rows.get(key) ?? null : null; },
     async put(store: string, value: any, key: string) {
       if (failNextStore) { failNextStore = false; throw new Error("write refused by the test"); }
+      if (failStoreAfterRefresh && refreshes > 0) { failStoreAfterRefresh = false; throw new Error("write refused by the test"); }
       if (store === SESSION_STORE) rows.set(key, value);
       return key;
     },
@@ -274,15 +277,16 @@ await check("a rotation that cannot be stored fails the call and is not used", a
     schema: "raft-cli-agent-session.v1", access_token: "ACCESS-4", refresh_token: "REFRESH-4",
     access_expires_at: new Date(Date.now() + 15 * 60_000).toISOString(),
   }), { status: 200, headers: { "content-type": "application/json" } });
-  // Sealed first, so the write that fails is the rotation's and not the first-use seal.
+  // Sealed first, and the write refused is the one that keeps the rotation.
   await loadSession(ctx);
-  const before = JSON.stringify(rows.get("session"));
-  failNextStore = true;
+  failStoreAfterRefresh = true;
   let threw = "";
   try { await invoke("whoami", {}, ctx); } catch (e) { threw = String((e as Error).message); }
   must(refreshes === 1, `refreshes: ${refreshes}`);
   must(threw.includes("write refused by the test"), `message: ${threw}`);
-  must(JSON.stringify(rows.get("session")) === before, "a rotated session was kept anyway");
+  // The row is still the one marked before the refresh went out: not the rotation, and not usable.
+  must(rows.get("session")?.rotating !== undefined, "the row was not left marked");
+  must(/sign in again/.test(await refusal(loadSession(ctx))), "the marked row opened as usable");
   must(!seen.some((s) => s.auth === "Bearer ACCESS-4"), "the unkeepable session was used");
 });
 
@@ -563,6 +567,135 @@ await check("only the mount naming the tool lifts the hold: a mount-wide write a
   reset();
   const ran = await named("pr_merge", MERGE);
   must(ran.status === "succeeded" && seen.at(-1)?.path === "/v1/repositories/o/r/pulls/7/auto-merge", `named: ${JSON.stringify(ran)}`);
+});
+
+// ---- the reverse cases for the fix that follows: each one fails at 3f660140 ----
+
+// Stamp rotated and this side never kept it: the row still opens to the session
+// whose refresh token the gateway has just spent. Presenting it again is
+// `refresh_reused`, which revokes every token the agent holds.
+await check("a rotation the gateway completed but this side could not store is not sent again", async () => {
+  reset();
+  const { ctx } = makeCtx(expired());
+  refreshAnswer = rotatesTo(30);
+  // Sealed first, and the write refused is the one after the gateway answered:
+  // the one that keeps the rotation.
+  await loadSession(ctx);
+  failStoreAfterRefresh = true;
+  let first = "";
+  try { await invoke("whoami", {}, ctx); } catch (e) { first = String((e as Error).message); }
+  must(first.includes("write refused by the test"), `first call: ${first}`);
+  const after = refreshes;
+  let second = "";
+  try { await invoke("whoami", {}, ctx); } catch (e) { second = String((e as Error).message); }
+  must(refreshes === after, `the spent refresh token was presented again: ${refreshes} refresh requests`);
+  must(/sign in again|already used|revoked/.test(second), `second call: ${second}`);
+});
+
+// The same case as it actually happens over a network: the gateway completed the
+// rotation and the answer never arrived.
+await check("a refresh whose answer was lost after the gateway rotated is not retried", async () => {
+  reset();
+  const { ctx } = makeCtx(expired());
+  refreshAnswer = rotatesTo(31);
+  await loadSession(ctx);
+  const inner = globalThis.fetch as any;
+  let drop = true;
+  globalThis.fetch = (async (input: any, init: any) => {
+    const res = await inner(input, init);
+    if (drop && String(input).includes("/api/auth/agent/refresh") && res.ok) { drop = false; throw new TypeError("fetch failed: socket hang up"); }
+    return res;
+  }) as any;
+  let first = "";
+  try { await invoke("whoami", {}, ctx); } catch (e) { first = String((e as Error).message); }
+  let second = "";
+  try { await invoke("whoami", {}, ctx); } catch (e) { second = String((e as Error).message); }
+  globalThis.fetch = inner;
+  must(first.includes("socket hang up"), `first call: ${first}`);
+  must(refreshes === 1, `the spent refresh token was presented again: ${refreshes} refresh requests`);
+  must(/sign in again|already used|revoked/.test(second), `second call: ${second}`);
+});
+
+// Once the gateway has said a token is spent, no later call may send it again:
+// the message already tells the reader not to retry, and every retry is another
+// chance to hit the gateway's revoke-everything path.
+await check("a token the gateway called spent is not presented by the calls after it", async () => {
+  reset();
+  const { ctx } = makeCtx(expired());
+  refreshAnswer = () => new Response(JSON.stringify({ error: "refresh_reused" }), { status: 401, headers: { "content-type": "application/json" } });
+  const said: string[] = [];
+  for (let i = 0; i < 3; i++) {
+    try { await invoke("whoami", {}, ctx); said.push("ok"); } catch (e) { said.push(String((e as Error).message).slice(0, 60)); }
+  }
+  must(refreshes === 1, `three calls made ${refreshes} refresh requests, all of a token the gateway had already refused`);
+  must(said.every((x) => /already used|revoked|sign in again/.test(x)), `said: ${JSON.stringify(said)}`);
+});
+
+/** The refresh count, read through a call so a comparison earlier in a case does not narrow it. */
+const sent = () => refreshes;
+
+// The other side of the mark: if it cannot be written, nothing is sent, so the
+// token is not spent and the next call rotates it as usual.
+await check("a rotation whose mark cannot be written sends nothing, and the next call rotates once", async () => {
+  reset();
+  const { ctx } = makeCtx(expired());
+  refreshAnswer = rotatesTo(32);
+  await loadSession(ctx);
+  failNextStore = true;
+  const first = await refusal(invoke("whoami", {}, ctx));
+  must(first.includes("write refused by the test") && refreshes === 0, `first: ${first}, refreshes=${refreshes}`);
+  seen = [];
+  await invoke("whoami", {}, ctx);
+  must(sent() === 1 && seen.at(-1)?.auth === "Bearer ACCESS-32", `second: refreshes=${refreshes}, sent ${seen.at(-1)?.auth}`);
+});
+
+// A 5xx may come after the gateway committed, so it is kept as unfinished; a 4xx
+// is a refusal before any rotation, so the token is still good to present.
+await check("a 5xx refresh is not retried, a 4xx one is", async () => {
+  reset();
+  const { ctx } = makeCtx(expired());
+  refreshAnswer = () => new Response(JSON.stringify({ error: "upstream" }), { status: 502, headers: { "content-type": "application/json" } });
+  const a = await refusal(invoke("whoami", {}, ctx));
+  const b = await refusal(invoke("whoami", {}, ctx));
+  must(refreshes === 1 && /sign in again/.test(a) && /sign in again/.test(b), `5xx: refreshes=${refreshes}; ${a} / ${b}`);
+
+  reset();
+  const { ctx: c } = makeCtx(expired());
+  refreshAnswer = () => new Response(JSON.stringify({ error: "bad_request" }), { status: 400, headers: { "content-type": "application/json" } });
+  await refusal(invoke("whoami", {}, c));
+  refreshAnswer = rotatesTo(33);
+  seen = [];
+  await invoke("whoami", {}, c);
+  must(sent() === 2 && seen.at(-1)?.auth === "Bearer ACCESS-33", `4xx: refreshes=${refreshes}, sent ${seen.at(-1)?.auth}`);
+});
+
+// A credential a person gave can be pasted back however many rotations later;
+// the capped list of rotated-away tokens is not what recognises it.
+await check("a credential a person gave is still refused after more rotations than the spent list keeps", async () => {
+  reset();
+  const { ctx } = makeCtx(expired());
+  let n = 100;
+  refreshAnswer = () => new Response(JSON.stringify({
+    schema: "raft-cli-agent-session.v1", access_token: `ACCESS-${n}`, refresh_token: `REFRESH-${n++}`,
+    access_expires_at: new Date(Date.now() - 1000).toISOString(),
+  }), { status: 200, headers: { "content-type": "application/json" } });
+  await invoke("whoami", {}, ctx);
+  const replaced = { ...ctx, credential: session({ access_token: "ACCESS-N", refresh_token: "REFRESH-N",
+    access_expires_at: new Date(Date.now() - 1000).toISOString() }) };
+  for (let i = 0; i < 40; i++) await invoke("whoami", {}, replaced);
+  const before = refreshes;
+  const back = await refusal(invoke("whoami", {}, { ...ctx, credential: expired() }));
+  must(refreshes === before && /sign-in again/.test(back), `pasted back after 40 rotations: refreshes ${before}→${refreshes}; ${back}`);
+});
+
+// A plugin default may tighten a mount's policy, never loosen it: an operator who
+// denied writes did not ask for a card whose one click merges.
+await check("a mount-wide write deny stays a refusal, not an approval", async () => {
+  const denied = await gatewayMount({ write: "deny" });
+  reset();
+  const r = await denied("pr_merge", MERGE);
+  must(r.status === "rejected" && r.error?.code === "policy_denied", `pr_merge on write:deny: ${JSON.stringify(r)}`);
+  must(seen.length === 0, "it reached the gateway");
 });
 
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.error ? `\n    ${r.error}` : ""}`);

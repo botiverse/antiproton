@@ -211,9 +211,11 @@ function sameSnapshot(a: ToolSnapshot | null | undefined, b: ToolSnapshot | null
  * can route around it.
  *
  * `defaults` is the plugin's `Plugin.defaultPolicy`, for the few tools whose
- * plugin says a person signs them unless the mount says otherwise. Its per-tool
- * entries sit below the mount's per-tool entries and above the mount's
- * side-effect halves, so only naming the tool lifts one.
+ * plugin says a person signs them unless the mount says otherwise. The mount's
+ * own per-tool entry is the only thing that lifts one; against the mount's
+ * side-effect half a default only ever tightens, so a mount-wide `write:
+ * "allow"` does not lift the hold and a mount-wide `write: "deny"` is not
+ * loosened into an approval card that one click runs.
  */
 export function policyFor(
   policy: MountPolicy | null | undefined,
@@ -221,11 +223,15 @@ export function policyFor(
   sideEffects: "read" | "write",
   defaults?: MountPolicy | null,
 ): PolicyDecision {
-  const perTool = policy?.tools?.[tool] ?? defaults?.tools?.[tool];
-  if (perTool) return perTool;
+  const own = policy?.tools?.[tool];
+  if (own) return own;
   const half = (p: MountPolicy | null | undefined) => (sideEffects === "write" ? p?.write : p?.read);
-  return half(policy) ?? half(defaults) ?? "allow";
+  const mount = half(policy) ?? "allow";
+  const fallback = defaults?.tools?.[tool] ?? half(defaults);
+  return fallback && STRICTNESS[fallback] > STRICTNESS[mount] ? fallback : mount;
 }
+
+const STRICTNESS: Record<PolicyDecision, number> = { allow: 0, approval: 1, deny: 2 };
 
 export class ToolGateway {
   #store: StorageAdapter;

@@ -2213,7 +2213,9 @@ export interface Plugin {
    * and wrong for one whose tool cannot be undone by trying again — approving
    * or merging a pull request. Such a plugin names those tools here, and the
    * mount's own per-tool entry is the only thing that lifts one: a mount-wide
-   * `write: "allow"` set for some other reason does not.
+   * `write: "allow"` set for some other reason does not. Against the mount's
+   * read/write setting a default only tightens: a mount-wide `write: "deny"`
+   * stays a refusal.
    */
   defaultPolicy?: MountPolicy;
 
