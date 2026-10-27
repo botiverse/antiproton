@@ -88,6 +88,19 @@ Recorded so the design is not read as a description of today:
   gets the outputs so far, the call count and the held operation, and the rest does not run.
   There is no resume or cancel token for a hold yet: approval runs the held call alone, and the
   model continues with a new program.
+- A plugin can put its SDK in the box (`Plugin.bridge`, #1092): a program imports it as
+  `await import("sdk:<alias>")` (or `sdk:<plugin>` where that names one mount), and the SDK's
+  `fetch` makes each request **one host call** of `<alias>.request` through the gateway — the same
+  policy, approval, operation and trace row, host-call budget and pause on a hold as any tool call;
+  no credential or network is in the box, and only `content-type` and `accept` cross from it. The
+  plugin's route table classifies each request (on the path its `normalize` answers, and the body
+  as sent): a listed route is decided under its policy key and the bridge tool's own entry, the
+  stricter of the two (a key only tightens, `Plugin.policyKey`); an unlisted read follows the
+  mount's read policy; an unlisted write is decided under the plugin's `unlistedWriteKey`, which is
+  `approval` unless the mount allows it; a `refuse` row ends the call rejected, approved or not.
+  A held request ends the program as above, even when the SDK's caller catches the throw, and the
+  model sends a new program after the approval; there is no resume, which waits on #596. Only the
+  dynamic worker executor loads these modules; QuickJS refuses the import (`bridge_unavailable`).
 - A program can stop itself and ask: `const answer = await pause(question, data, expected?)`.
   That pause is resumable — the result is `yielded`, with a token, and the model answers with the
   one static `resume` tool (or cancels); the program continues from that line. `expected`
