@@ -2641,12 +2641,12 @@ export type RouteEntry = {
   methods: readonly string[];
   path: RegExp;
   /**
-   * Whether the row applies, asked of the body as a JSON object, or null when the request has none. A body that is
-   * present and is not a JSON object — not JSON at all (form-encoded, a byte-order mark before the JSON), an array, a
-   * bare value — is never handed over: the request is an unlisted write, held for a person, since a predicate cannot
-   * say "not this row" about a body it cannot read, and a later, looser row must not take it. A predicate that throws
-   * is held the same way, and so is false on a body whose content-type is not JSON (`application/json`, `…+json`).
-   * False on an object sent as JSON moves on to the next row, so the predicate has to be as robust as
+   * Whether the row applies, asked of the body as a JSON object, or null when the request has none. The row cannot
+   * judge a request whose content-type is not JSON (`application/json`, `…+json`; none counts as not), which upstream
+   * reads its own way; nor a body that is not a JSON object (form-encoded, a byte-order mark before the JSON, an
+   * array, a bare value — never handed over); nor one the predicate throws on. Then a `refuse` row refuses — it
+   * refuses whenever it cannot rule the body out — and a `key` row does not apply but holds the request as an
+   * unlisted write; neither passes it to a later, looser row. False on a JSON object sent as JSON moves on, so the predicate has to be as robust as
    * upstream is about spelling — key and value case, aliases — or a spelling it missed reaches a later row.
    */
   body?: (body: { [k: string]: Json } | null) => boolean;
@@ -2696,6 +2696,11 @@ export interface BridgeDecl {
   responseHeaders?: readonly string[];
 }
 
+/** Whether a content-type says JSON: `application/json`, or `application/<anything>+json`, with any parameters. */
+export function isJsonContentType(contentType: string | null | undefined): boolean {
+  return typeof contentType === "string" && /^application\/(json|[^\s;/]+\+json)\s*(;|$)/i.test(contentType.trim());
+}
+
 /** How a bridge's table decides one request: a listed key, a refusal, or the fail-closed answer for an unlisted one. */
 export type RouteClass =
   | { kind: "listed"; key: string }
@@ -2713,7 +2718,7 @@ export function classifyRoute(
 ): RouteClass {
   const m = method.toUpperCase();
   const held: RouteClass = { kind: "unlisted-write", key: decl.unlistedWriteKey };
-  const json = contentType !== null && /^application\/(json|[^\s;/]+\+json)\s*(;|$)/i.test(contentType.trim());
+  const json = isJsonContentType(contentType);
   // `undefined`: present, and not a JSON object (see `RouteEntry.body`).
   let parsed: { [k: string]: Json } | null | undefined = null;
   if (body !== null) {
@@ -2726,13 +2731,16 @@ export function classifyRoute(
     // Case-insensitive, as upstream routes are (`…/MERGE` is a merge), and never on a `g` or `y` regex's last index.
     if (!row.methods.some((x) => x.toUpperCase() === m) || !new RegExp(row.path.source, row.path.flags.replace(/[gyi]/g, "") + "i").test(path)) continue;
     if (row.body) {
-      if (parsed === undefined) return held;
+      // What a row does with a body it cannot judge: a refusal stays a refusal (holding it would let a mount that
+      // allows unlisted writes run what the row exists to stop), and a key row holds it for a person.
+      const unsure: RouteClass = row.refuse !== undefined ? { kind: "refused", message: row.refuse } : held;
+      // A body not sent as JSON is read by upstream some other way, so the predicate's answer — yes or no — is
+      // about a reading upstream may not share: a refuse row refuses, and a key row does not apply but holds.
+      if (!json) return unsure;
+      if (parsed === undefined) return unsure;
       let hit = false;
-      // A predicate that throws on a body it did not expect has not said the row does not apply; held, not skipped.
-      try { hit = row.body(parsed); } catch { return held; }
-      // A body not sent as JSON is read by upstream some other way, so "not this row" was said about a reading
-      // upstream may not share: held rather than passed on. A row it does match still applies, being the stricter.
-      if (!hit && !json) return held;
+      // A predicate that throws on a body it did not expect has not said the row does not apply.
+      try { hit = row.body(parsed); } catch { return unsure; }
       if (!hit) continue;
     }
     return row.refuse !== undefined ? { kind: "refused", message: row.refuse } : { kind: "listed", key: row.key! };

@@ -11,7 +11,7 @@ import { Backgrounded, Interrupt, interruptsOf } from "../plugins/types.ts";
 import { answerSpecOf } from "./run-js-resume.ts";
 import { keyedOperationId } from "./operation-id.ts";
 import type { PluginErrorFields, ToolSnapshot } from "../plugins/types.ts";
-import { callSideEffects, pluginEnabled, LEASE_KEY, toolsOf, BRIDGE_TOOL, classifyRoute, policyKeyOf, stricter } from "../plugins/types.ts";
+import { callSideEffects, pluginEnabled, LEASE_KEY, toolsOf, BRIDGE_TOOL, classifyRoute, isJsonContentType, policyKeyOf, stricter } from "../plugins/types.ts";
 import type { BridgeDecl, ToolSchema } from "../plugins/types.ts";
 import { admitTools } from "./mount-tools.ts";
 import { isReleased, leaseRow, releasedFacts, toolRefusedRow } from "../trace/seams.ts";
@@ -367,18 +367,38 @@ function boxHeaders(decl: BridgeDecl, headers: Record<string, string>, secrets: 
 /**
  * Every occurrence of each secret replaced by REDACTED: an upstream that echoes the token it was sent (an error that
  * quotes the request, a debug header) must not hand it to the box. Values shorter than 8 characters are not matched,
- * since a credential that short is not one and replacing it would rewrite ordinary text. Longest first: a secret that
- * begins with a shorter one would otherwise be cut at the shorter one's end, and its rest handed over.
+ * since a credential that short is not one and replacing it would rewrite ordinary text. Marked, then replaced: a
+ * secret that begins with a shorter one, or overlaps another, would otherwise be cut where the first replacement
+ * ended, and its rest handed over.
  */
 function redact(text: string, secrets: readonly string[]): string {
-  let out = text;
-  for (const s of [...new Set(secrets)].sort((a, b) => b.length - a.length)) if (s.length >= 8) out = out.split(s).join(REDACTED);
+  // Each secret as sent, and as it reads inside a JSON string (a quote or a backslash in it escaped): how an
+  // upstream that quotes it in a JSON body shows it.
+  const forms = new Set<string>();
+  for (const s of secrets) {
+    if (typeof s !== "string" || s.length < 8) continue;
+    forms.add(s);
+    forms.add(JSON.stringify(s).slice(1, -1));
+  }
+  // Every occurrence of every form is marked before anything is replaced, so two secrets that overlap in the text —
+  // one ending where the other begins — are both covered; a run of marked characters becomes one REDACTED.
+  const marked = new Uint8Array(text.length);
+  for (const f of forms) {
+    for (let i = text.indexOf(f); i >= 0; i = text.indexOf(f, i + 1)) marked.fill(1, i, i + f.length);
+  }
+  let out = "";
+  for (let i = 0; i < text.length; i++) {
+    if (!marked[i]) out += text[i];
+    else if (i === 0 || !marked[i - 1]) out += REDACTED;
+  }
   return out;
 }
 
 /**
  * The values to redact for a stored credential: the whole string, and, when it is JSON (a stored session), every
- * string in it at any depth, since an upstream echoes the token it was sent, not the record it came from.
+ * string in it at any depth, since an upstream echoes the token it was sent, not the record it came from. Every one
+ * counts as a secret, not only the fields that look like one: a session's `token_url` or account name is redacted
+ * too where it appears, and that over-redaction is accepted, a field list being one more thing to keep right.
  */
 function credentialValues(credential: string | null): string[] {
   if (typeof credential !== "string") return [];
@@ -397,15 +417,53 @@ function credentialValues(credential: string | null): string[] {
  * may have landed, so that no other path — `String(e)`, its stack, its fields serialised — carries what the plugin's
  * error held. A thrown non-error is its text.
  */
-function redactedError(e: unknown, secrets: readonly string[]): Error {
-  const src = (e ?? {}) as Error & PluginErrorFields & { retryable?: boolean };
-  const text = e instanceof Error ? String(src.message ?? "") : String(e);
-  const out = new Error(redact(text, secrets)) as Error & PluginErrorFields & { retryable?: boolean };
-  out.stack = `Error: ${out.message}`;
-  if (typeof src.code === "string") out.code = redact(src.code, secrets);
-  if (typeof src.httpStatus === "number") out.httpStatus = src.httpStatus;
-  if (src.retryable === true) out.retryable = true;
-  return out;
+export function redactedError(e: unknown, secrets: readonly string[]): Error {
+  // Total: any throw while reading the thrown value — a getter, a `toString` — ends in a fixed sentence and nothing
+  // else of it, since that throw's own error, and whatever it says, would otherwise pass here unredacted.
+  const unreadable = () => {
+    const out = new Error("the request failed, and its error could not be read");
+    out.stack = `Error: ${out.message}`;
+    return out;
+  };
+  try {
+    const src = (e ?? {}) as Error & PluginErrorFields & { retryable?: boolean };
+    const m = e instanceof Error ? src.message : e;
+    const text = typeof m === "string" ? m : String(m ?? "");
+    const out = new Error(redact(text, secrets)) as Error & PluginErrorFields & { retryable?: boolean };
+    out.stack = `Error: ${out.message}`;
+    const code = src.code, status = src.httpStatus, retryable = src.retryable;
+    if (typeof code === "string") out.code = redact(code, secrets);
+    if (typeof status === "number") out.httpStatus = status;
+    if (retryable === true) out.retryable = true;
+    return out;
+  } catch {
+    return unreadable();
+  }
+}
+
+/**
+ * An answer's text with the secrets taken out. A JSON answer is read and every string in it, key or value, redacted,
+ * then written out again: an escape (`\/`, `\u0061`) spells a secret the text does not contain literally, and the
+ * box will parse it. Written out again means the bytes change — whitespace, numbers as JavaScript spells them, and
+ * integer-like keys moved first — so the box must not rely on upstream's exact text. Text that is not JSON, or does
+ * not parse, is redacted as it stands; the result is redacted as text once more either way.
+ */
+function redactBody(text: string, contentType: string | undefined, secrets: readonly string[]): string {
+  if (isJsonContentType(contentType ?? null)) {
+    let parsed: unknown;
+    let ok = true;
+    try { parsed = JSON.parse(text); } catch { ok = false; }
+    if (ok) {
+      const walk = (v: unknown): unknown => {
+        if (typeof v === "string") return redact(v, secrets);
+        if (Array.isArray(v)) return v.map(walk);
+        if (v && typeof v === "object") return Object.fromEntries(Object.entries(v).map(([k, x]) => [redact(k, secrets), walk(x)]));
+        return v;
+      };
+      return redact(JSON.stringify(walk(parsed)), secrets);
+    }
+  }
+  return redact(text, secrets);
 }
 
 /** What the approval card shows of a held bridged request: method, path, what `describe` names, and a write's body. */
@@ -1253,8 +1311,14 @@ export class ToolGateway {
           // message on the result and the trace row, its code — is read from this one, never from the plugin's.
           throw redactedError(e, secrets);
         }
-        if (Array.isArray(res.secrets)) for (const x of res.secrets) io.used(x);
-        return { status: Number(res.status), headers: boxHeaders(bridge, res.headers, secrets), text: redact(String(res.text ?? ""), secrets) };
+        // Total: an answer that cannot be redacted is withheld, never handed over as it came.
+        try {
+          if (Array.isArray(res.secrets)) for (const x of res.secrets) io.used(x);
+          const headers = boxHeaders(bridge, res.headers, secrets);
+          return { status: Number(res.status), headers, text: redactBody(String(res.text ?? ""), headers["content-type"], secrets) };
+        } catch {
+          throw new Error("the answer could not be redacted, so it was withheld");
+        }
       }, opts.fromProgram === true);
     }
     // `fromProgram` reaches the plugin as `caller.fromProgram`, so a plugin can tell a program's call from the
