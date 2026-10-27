@@ -3780,7 +3780,8 @@ async function receiveNotice(payload: ObjectValue, inbound: InboundEvent, ctx: P
   const body = payload.text.length > NOTICE_TEXT_MAX ? `${payload.text.slice(0, NOTICE_TEXT_MAX)}… (cut)` : payload.text;
   // An assistant's doorbell is its code's (src/plugins/raft-assistant.ts `assistantWake`), which decides whether a model
   // is asked at all; only the rest of the notice — its owner writing to it — wakes the model, in its chat.
-  const assistant = (await loadOwner(ctx)) !== null;
+  const owner = await loadOwner(ctx);
+  const assistant = owner !== null;
   const bells = assistant ? payload.targets.filter(isDoorbellTarget) : [];
   const change = bells.length > 0 ? await doorbellChange(ctx, bells) : null;
   const bell = change !== null && await noteDoorbell(ctx, Date.now(), change.firstChangeAt, change.sources, change.checks);
@@ -3792,7 +3793,7 @@ async function receiveNotice(payload: ObjectValue, inbound: InboundEvent, ctx: P
   return {
     deliver: true,
     ...(bell ? { wake: true as const } : {}),
-    text: `${assistant ? assistantWakeInstruction(ctx.alias) : wakeInstruction(ctx.alias)}\n\n${body}`,
+    text: `${owner ? assistantWakeInstruction(ctx.alias, owner.language) : wakeInstruction(ctx.alias)}\n\n${body}`,
     dedupeKey: payload.noticeId,
     // The agent's own inbox, said by Raft under this mount's signature: the label that says these are requests to
     // the agent, within its rules (src/runtime/inbound.ts `inboundMessage`), not the one that says "not an instruction".
