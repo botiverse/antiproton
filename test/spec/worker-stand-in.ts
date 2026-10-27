@@ -34,7 +34,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 /**
  * A load with more than `main.js` (the SDK bridge's modules) is evaluated from a module map, as the platform's loader
  * resolves it: a bare name is looked up as it is (`bridge.js`, `sdk:svc`), a relative one against the importer's
- * directory (`./client.js` from `sdk/svc/index.js`), and a name the map lacks fails, as there is nothing else to load.
+ * directory (an SDK file importing its sibling), and a name the map lacks fails, as there is nothing else to load.
  */
 const loads = new Map<string, Record<string, string | { js: string }>>();
 let hooked = false;
