@@ -2609,15 +2609,26 @@ export interface BridgeRequest {
   headers: Record<string, string>;
 }
 
+/**
+ * What the core hands `BridgeDecl.send` besides the request: `used` registers a credential value the request is about
+ * to carry that the core cannot see (a token minted from the stored session), so that whatever comes back — an answer,
+ * or the message of an error `send` throws — has it replaced before the box reads it. Call it before sending: a token
+ * named only in the answer's `secrets` is lost when `send` throws.
+ */
+export interface BridgeIo {
+  used(secret: string): void;
+}
+
 /** What `BridgeDecl.send` answers. Any status is an answer: a 4xx or 5xx reaches the box as a `Response` like a 200. */
 export interface BridgeResponse {
   status: number;
   headers: Record<string, string>;
   text: string;
   /**
-   * Credential values this request used besides the mount's stored one (`PluginContext.credential`, which the core
-   * redacts on its own): a token minted or rotated for it. Each is replaced in the text and the header values before
-   * the box reads them, since an upstream may echo what it was sent.
+   * Every credential value the request carried that the core cannot see: the core redacts the mount's stored
+   * credential on its own (`PluginContext.credential`, and each string field of it when it is a JSON object), and
+   * nothing else. A token minted, rotated or read from elsewhere for this request goes here, or to `BridgeIo.used`
+   * before it is sent, which also covers a `send` that throws. Each is replaced in the text and header values.
    */
   secrets?: readonly string[];
 }
@@ -2668,8 +2679,11 @@ export interface BridgeDecl {
    * it names `request`. Must not be the name of a real tool (`ToolGateway` refuses the plugin).
    */
   unlistedWriteKey: string;
-  /** Make the request upstream, adding the mount's credential. A throw is a failed call, which the box sees as a network error. */
-  send(ctx: PluginContext, req: BridgeRequest): Promise<BridgeResponse>;
+  /**
+   * Make the request upstream, adding the mount's credential. A throw is a failed call, which the box sees as a
+   * network error; its message reaches the program redacted as an answer is (`BridgeIo.used`).
+   */
+  send(ctx: PluginContext, req: BridgeRequest, io: BridgeIo): Promise<BridgeResponse>;
   /** The path as upstream will route it (folded, decoded, `..` refused by a throw), before the table is asked. */
   normalize?(path: string): string;
   /** What the approval card names besides method and path. Absent, or a throw: method and path only. */

@@ -53,8 +53,20 @@ function fixture(routes: RouteEntry[] = ROUTES, extra: Partial<Plugin> = {}) {
       return m ? { repo: m[1], ...(m[2] ? { pr: Number(m[2]) } : {}) } : {};
     },
     responseHeaders: ["stamp-cli-latest"],
-    async send(ctx, req): Promise<BridgeResponse> {
+    async send(ctx, req, io): Promise<BridgeResponse> {
       sent.push(req);
+      // A send that fails after it minted a token from the stored session, quoting both back.
+      if (req.path.startsWith("/v1/throw")) {
+        const session = (() => { try { return JSON.parse(ctx.credential ?? ""); } catch { return null; } })();
+        const shown = session?.access_token ?? ctx.credential;
+        io.used(MINTED);
+        const said = `upstream said: bad token ${shown} and ${MINTED}`;
+        if (req.path === "/v1/throw-string") throw said;
+        const e = new Error(said) as Error & { code?: string };
+        e.code = `E_${MINTED}`;
+        e.stack = `Error: ${said}\n    at send (${ctx.credential})`;
+        throw e;
+      }
       if (req.path === "/v1/boom") throw new Error("upstream unreachable");
       // An upstream that echoes what it was sent: the stored credential, and a token minted from it for this request.
       if (req.path === "/v1/echo") {
@@ -94,9 +106,12 @@ async function gatewayWith(policy: MountPolicy | null, plugin: Plugin, opts: { c
     toolVersion: "1.0.0", publicConfig: {}, secretRef: opts.credential ? "env:SVC_TOKEN" : null, policy,
   });
   const db = new DatabaseSync(path);
+  // Every row of every table, as text: what a store or trace kept of a call.
+  const everything = () => (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>)
+    .map((t) => JSON.stringify(db.prepare(`SELECT * FROM "${t.name}"`).all())).join("\n");
   const ops = () => db.prepare("SELECT operation_id, tool, status FROM operations").all() as Array<{ operation_id: string; tool: string; status: string }>;
   const secrets = { async resolve() { return opts.credential ?? null; } };
-  return { gw: new ToolGateway(store, [plugin], new Set(["svc"]), secrets), store, ops };
+  return { gw: new ToolGateway(store, [plugin], new Set(["svc"]), secrets), store, ops, everything };
 }
 
 const req = (method: string, path: string, body: string | null = null, headers: Record<string, string> = {}) => ({ method, path, body, headers });
@@ -371,6 +386,34 @@ await check("the mount's credential and a token minted for the request never rea
   must(!seen.includes(STORED) && !seen.includes(MINTED), `a credential reached the box: ${seen}`);
   must(r.result.text === "bad token [redacted] or [redacted]" && r.result.headers["x-request-id"] === "rq [redacted]", `redaction: ${seen}`);
   must(!("authorization" in r.result.headers) && !("www-authenticate" in r.result.headers), `credential headers reached the box: ${seen}`);
+});
+
+const SESSION = JSON.stringify({ access_token: "access-abcdefgh123", refresh_token: "refresh-ijklmnop456", expires: 3600 });
+for (const [label, credential, hidden] of [
+  ["a bare stored token", STORED, [STORED, MINTED]],
+  ["a stored JSON session", SESSION, ["access-abcdefgh123", "refresh-ijklmnop456", MINTED]],
+] as const) {
+  for (const path of ["/v1/throw", "/v1/throw-string"]) {
+    await check(`a send that throws (${path}) with ${label} and a token it registered: neither reaches the result, the store or the trace`, async () => {
+      const f = fixture();
+      const { gw, everything } = await gatewayWith(null, f.plugin, { credential });
+      const r: any = await gw.invoke(caller, "svc.request", req("GET", path), program);
+      must(r.status === "failed" && /^upstream said: bad token \[redacted\] and \[redacted\]$/.test(r.error?.message ?? ""),
+        `the failure reads ${JSON.stringify(r)}`);
+      const kept = JSON.stringify(r) + "\n" + everything();
+      for (const x of hidden) must(!kept.includes(x), `${x} reached the result, the store or the trace`);
+      // The trace applies its own redaction on top (a token after "token" reads `<redacted>` there); either marker will do.
+      must(/upstream said: bad token [<[]redacted[>\]] and [<[]redacted[>\]]/.test(everything()), "the redacted failure is not on the record");
+    });
+  }
+}
+
+await check("a stored JSON session's fields are redacted from an answer, not only the whole record", async () => {
+  const f = fixture();
+  f.decl.send = async (ctx) => ({ status: 200, headers: { "x-request-id": "refresh-ijklmnop456" }, text: `token access-abcdefgh123 of ${ctx.credential}` });
+  const { gw } = await gatewayWith(null, f.plugin, { credential: SESSION });
+  const r: any = await gw.invoke(caller, "svc.request", req("GET", "/v1/x"), program);
+  must(r.result.text === "token [redacted] of [redacted]" && r.result.headers["x-request-id"] === "[redacted]", `answer: ${JSON.stringify(r.result)}`);
 });
 
 await check("a credential header is dropped at the answer too, not only at registration: a list changed afterwards", async () => {

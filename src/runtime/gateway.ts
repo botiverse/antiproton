@@ -353,6 +353,38 @@ function redact(text: string, secrets: readonly string[]): string {
   return out;
 }
 
+/**
+ * The values to redact for a stored credential: the whole string, and, when it is JSON (a stored session), every
+ * string in it at any depth, since an upstream echoes the token it was sent, not the record it came from.
+ */
+function credentialValues(credential: string | null): string[] {
+  if (typeof credential !== "string") return [];
+  const out = [credential];
+  const walk = (v: unknown): void => {
+    if (typeof v === "string") out.push(v);
+    else if (Array.isArray(v)) v.forEach(walk);
+    else if (v && typeof v === "object") Object.values(v).forEach(walk);
+  };
+  try { walk(JSON.parse(credential)); } catch { /* a bare token */ }
+  return out;
+}
+
+/**
+ * A `send` failure as the box may see it: a fresh error carrying only the redacted message, the code and whether it
+ * may have landed, so that no other path — `String(e)`, its stack, its fields serialised — carries what the plugin's
+ * error held. A thrown non-error is its text.
+ */
+function redactedError(e: unknown, secrets: readonly string[]): Error {
+  const src = (e ?? {}) as Error & PluginErrorFields & { retryable?: boolean };
+  const text = e instanceof Error ? String(src.message ?? "") : String(e);
+  const out = new Error(redact(text, secrets)) as Error & PluginErrorFields & { retryable?: boolean };
+  out.stack = `Error: ${out.message}`;
+  if (typeof src.code === "string") out.code = redact(src.code, secrets);
+  if (typeof src.httpStatus === "number") out.httpStatus = src.httpStatus;
+  if (src.retryable === true) out.retryable = true;
+  return out;
+}
+
 /** What the approval card shows of a held bridged request: method, path, what `describe` names, and a write's body. */
 function routeCard(decl: BridgeDecl, req: { method: string; path: string; body: string | null; headers: Record<string, string> }): Json {
   let named: { repo?: string; pr?: number | string } = {};
@@ -1185,10 +1217,20 @@ export class ToolGateway {
       // upstream status is an answer, so the SDK in the box shapes its own errors from it.
       const req = route;
       return this.#run(ctx, r, plugin, operationId, facts, async (context) => {
-        const res = await bridge.send(context, { method: req.method, path: req.path, body: req.body, headers: { ...req.headers } });
-        // The mount's credential as stored, and what `send` says it derived from it for this request (an access token
-        // minted from a refresh token, a rotated one): the core cannot know the second, so the plugin names it.
-        const secrets = [context.credential, ...(Array.isArray(res.secrets) ? res.secrets : [])].filter((x): x is string => typeof x === "string");
+        // The mount's credential as stored (each of its fields, when it is a session), and what `send` says the request
+        // carried besides (a token minted from it, a rotated one), which the core cannot know: `used` before it sends,
+        // or `secrets` with the answer.
+        const secrets = credentialValues(context.credential);
+        const io = { used(secret: string) { if (typeof secret === "string") secrets.push(secret); } };
+        let res: Awaited<ReturnType<typeof bridge.send>>;
+        try {
+          res = await bridge.send(context, { method: req.method, path: req.path, body: req.body, headers: { ...req.headers } }, io);
+        } catch (e) {
+          // Redacted here, where it was caught, before anything formats it: what `#run` makes of an error — the
+          // message on the result and the trace row, its code — is read from this one, never from the plugin's.
+          throw redactedError(e, secrets);
+        }
+        if (Array.isArray(res.secrets)) for (const x of res.secrets) io.used(x);
         return { status: Number(res.status), headers: boxHeaders(bridge, res.headers, secrets), text: redact(String(res.text ?? ""), secrets) };
       }, opts.fromProgram === true);
     }

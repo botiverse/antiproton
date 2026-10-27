@@ -93,9 +93,9 @@ Recorded so the design is not read as a description of today:
   `fetch` makes each request **one host call** of `<alias>.request` through the gateway — the same
   policy, approval, operation and trace row, host-call budget and pause on a hold as any tool call.
   No credential or network is in the box, which is the defence: only `content-type` and `accept`
-  cross from it, no header that carries a credential comes back, and the mount's credential and the
-  tokens `send` names are replaced in the answer where they appear literally (values of 8 or more
-  characters).
+  cross from it, no header that carries a credential comes back, and the mount's credential (each
+  field of a stored session) and the tokens `send` names are replaced in the answer, or in the
+  message of a `send` that throws, where they appear literally (values of 8 or more characters).
   - The core first refuses a path that names a host, carries a backslash, whitespace or a control
     character, or whose path part carries `;`, a percent-escape or anything outside printable
     ASCII, or has an empty, `.` or `..` segment, and
