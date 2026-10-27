@@ -819,6 +819,9 @@ await check("api refuses the approve and merge routes, however they are spelled"
     ["POST", "/api/v3/repos/o/r/pulls/7/reviews", { event: "APPROVE" }],
     ["POST", "/api/v3/repos/o/r/pulls/7/reviews/9/events", { event: "approve" }],
     ["PUT", "/v1/repositories/o/r/pulls/7//merge"],
+    // Joining the merge queue is Stamp's PUT .../queue/{requestID}.
+    ["PUT", "/v1/repositories/o/r/pulls/7/queue/req_1"],
+    ["PUT", "/v1/repositories/o/r/pulls/7/queue/req_1/"],
     ["POST", "/v1/repositories/o/r/pulls/7///approve"],
     ["PUT", "/api/v3/repos/o//r/pulls/7//merge"],
   ];

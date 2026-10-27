@@ -536,7 +536,7 @@ function heldRoute(path: string, body: unknown): "an approval" | "a merge" | nul
   // Empty segments collapsed: `pulls/7//merge` must meet the hold, not a redirect further on.
   p = p.replace(/\/{2,}/g, "/").replace(/\/+$/, "").toLowerCase();
   if (/^\/v1\/repositories\/[^/]+\/[^/]+\/pulls\/[^/]+\/approve$/.test(p)) return "an approval";
-  if (/^\/v1\/repositories\/[^/]+\/[^/]+\/pulls\/[^/]+\/(merge|auto-merge|queue)$/.test(p)) return "a merge";
+  if (/^\/v1\/repositories\/[^/]+\/[^/]+\/pulls\/[^/]+\/(merge|auto-merge|queue(\/[^/]+)?)$/.test(p)) return "a merge";
   if (/^\/api\/v3\/repos\/[^/]+\/[^/]+\/(pulls\/[^/]+\/merge|merges)$/.test(p)) return "a merge";
   if (/^\/api\/v3\/repos\/[^/]+\/[^/]+\/pulls\/[^/]+\/reviews(\/[^/]+\/events)?$/.test(p)) {
     const event = body && typeof body === "object" ? String((body as Record<string, unknown>).event ?? "") : "";
