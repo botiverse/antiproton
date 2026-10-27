@@ -1302,7 +1302,23 @@ for (const engine of (process.env.ENGINES ?? "pi085,pd").split(",").filter((e) =
     must(parentSend.every((e) => e.toolUseId === "c_ev") && parentSend[1]?.ok === true, `the parent's send_to_agent toolUseId / ok: ${show(parentSend)}`);
     must(!JSON.stringify(on).includes("SECRET"), "an event carries task or report text");
     must(marked.every((e) => e.status === undefined), "a child's event carries the agent's status");
-    must(show(on.filter((e) => !e.subagent && e.toolName !== SUBAGENT_TOOL)) === show(off), "turning it on changed the agent's own events");
+    // A status rides on the agent's own event of the same instant, else goes alone (`activityEvents`). On, the
+    // send_to_agent step is such an event, so when it lands on the millisecond of a status change (the model call
+    // asking for it, or the next one starting) the status moves onto it: what the service is told, and when, is the
+    // same. So the events are compared without their status, and the statuses as the timeline they make.
+    const own = (es: typeof on) => es.filter((e) => e.hookEventName !== undefined)
+      .map(({ status: _s, detail: _d, ...e }) => e);
+    const statuses = (es: typeof on) => es.filter((e) => e.status !== undefined)
+      .map((e) => ({ at: e.occurredAt, status: e.status, detail: e.detail })).sort((a, b) => a.at.localeCompare(b.at));
+    // As run, and with the spawn on the very millisecond the model asked for it, which a fast run gives at random.
+    const asked = rows.find((r) => r.kind === "model.call" && r.status === "toolUse" && r.attrs.session === "main")!;
+    const same = rows.map((r) => r.kind === "subagent.start" ? { ...r, at: asked.at } : r);
+    for (const [label, rs] of [["as run", rows], ["spawn on the call's millisecond", same]] as const) {
+      const offR = activityEvents("a", rs);
+      const onOwn = activityEvents("a", rs, subagentActivityFor(w.raw.sql as never, { SUBAGENT_ACTIVITY: "1" })).filter((e) => !e.subagent);
+      must(show(own(onOwn.filter((e) => e.toolName !== SUBAGENT_TOOL))) === show(own(offR)), `${label}: turning it on changed the agent's own events: ${show(onOwn)} vs ${show(offR)}`);
+      must(show(statuses(onOwn)) === show(statuses(offR)), `${label}: turning it on changed the agent's statuses: ${show(statuses(onOwn))} vs ${show(statuses(offR))}`);
+    }
   });
 
   for (const how of ["the agent's setting", "the deployment's kill switch"] as const) {
