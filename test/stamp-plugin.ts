@@ -959,6 +959,61 @@ await check("api refuses the approve and merge routes, however they are spelled"
   must(!/not api/.test(ok), `a comment review was refused: ${ok}`);
 });
 
+// botiverse/antiproton#1092: the bridge will route through this same table, so each
+// spelling below is pinned on its own, as is the mount policy that names api. The table
+// lists the routes known to approve or merge; a route not on it is not held.
+await check("api: escaped slashes, a mixed-case event, a trailing slash and DELETE on /api/v3 are still held", async () => {
+  reset();
+  const { ctx } = makeCtx();
+  const held: Array<[string, string, unknown?]> = [
+    ["PUT", "/api/v3/repos/o/r/pulls/7%2Fmerge"],
+    ["PUT", "/api/v3/repos/o/r/pulls/7%2fmerge"],
+    ["PUT", "/api/v3/repos/o/r/pulls%2F7%2Fmerge"],
+    ["PUT", "/api/v3/repos/o/r/pulls/7%252Fmerge"],
+    ["PUT", "/api/v3/repos/o/r/pulls/7/merge?x=1"],
+    // DELETE passes only on /v1/ auto-merge and queue; /api/v3 has no DELETE merge, so it stays held.
+    ["DELETE", "/api/v3/repos/o/r/pulls/7/merge"],
+    ["PATCH", "/v1/repositories/o/r/pulls/7/approve"],
+    ["PUT", "/api/v3/repos/o/r/pulls/7/merge/"],
+    ["POST", "/api/v3/repos/o/r/pulls/7/reviews", { event: "Approve" }],
+    ["POST", "/api/v3/repos/o/r/pulls/7/REVIEWS", { event: "APPROVE" }],
+    ["POST", "/api/v3/repos/o/r/pulls/7/reviews/", { event: "APPROVE" }],
+  ];
+  for (const [method, path, body] of held) {
+    const threw = await refusal(invoke("api", { method, path, body }, ctx));
+    must(/goes through pr_(approve|merge), not api/.test(threw), `${method} ${path}: ${threw}`);
+  }
+  // /v1/ takes no escapes at all, so an escaped slash there never reaches the table.
+  for (const path of ["/v1/repositories/o/r/pulls/7%2Fmerge", "/v1/repositories/o/r/pulls/7%2Fapprove"]) {
+    const threw = await refusal(invoke("api", { method: "PUT", path }, ctx));
+    must(/carries no escapes/.test(threw), `${path}: ${threw}`);
+  }
+  must(seen.length === 0, `reached the gateway: ${JSON.stringify(seen.map((x) => x.path))}`);
+  // Cancelling auto-merge is not a merge.
+  const cancelled = await refusal(invoke("api", { method: "DELETE", path: "/v1/repositories/o/r/pulls/7/auto-merge" }, ctx));
+  must(!/not api/.test(cancelled) && seen.at(-1)?.method === "DELETE" && seen.at(-1)?.path === "/v1/repositories/o/r/pulls/7/auto-merge",
+    `cancelling auto-merge: ${cancelled}`);
+});
+
+await check("a mount that allows api still cannot approve or merge through it", async () => {
+  const call = await gatewayMount({ tools: { api: "allow" } });
+  for (const [method, path, body] of [
+    ["POST", "/v1/repositories/o/r/pulls/7/approve", {}],
+    ["PUT", "/v1/repositories/o/r/pulls/7/merge", {}],
+    ["PUT", "/api/v3/repos/o/r/pulls/7%2Fmerge", {}],
+    ["POST", "/api/v3/repos/o/r/pulls/7/reviews", { event: "APPROVE" }],
+  ] as const) {
+    reset();
+    const r = await call("api", { method, path, body });
+    must(r.status !== "succeeded" && /goes through pr_(approve|merge), not api/.test(JSON.stringify(r)), `${method} ${path}: ${JSON.stringify(r)}`);
+    must(seen.length === 0, `${path} reached the gateway`);
+  }
+  // The allow is real: a write the table does not hold goes straight through.
+  reset();
+  const ok = await call("api", { method: "POST", path: "/v1/repositories/o/r/pulls/7/comments", body: { body: "hi" } });
+  must(ok.status === "succeeded" && seen.at(-1)?.path === "/v1/repositories/o/r/pulls/7/comments", `comment: ${JSON.stringify(ok)}`);
+});
+
 // Through the real gateway and store: the agent-level record is handed to a
 // call and to a credential check, and a removed mount does not take it along.
 await check("through the gateway, a mount removed and added back with the same session is refused", async () => {
