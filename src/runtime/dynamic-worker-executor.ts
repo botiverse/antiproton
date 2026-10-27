@@ -203,8 +203,8 @@ export async function untilCallsSettle(state: ExecutionState, sent: number, ms: 
  * that catches the throw changes nothing, since the supervisor recorded the hold and the box refuses what follows.
  *
  * It answers a real `Response`, for the SDK to read as it reads any: an upstream status with the headers the gateway
- * kept; a refusal (policy, route, budget) as a 403 whose JSON body carries the gateway's `error`; a call that failed
- * as a rejected fetch (a TypeError), which an SDK reports as a network error.
+ * kept; a refusal (policy, route, budget) as a 403 whose JSON body carries the gateway's `error` and its `message` as
+ * a top-level string; a call that failed as a rejected fetch (a TypeError), which an SDK reports as a network error.
  *
  * `main.js` imports `bindBox` on its last line, after the program, so the program's lines stay where `PROGRAM_LINE`
  * says they are; an import is hoisted wherever it sits.
@@ -245,7 +245,10 @@ export function gatewayFetch(alias) {
       return new Response(NO_BODY.includes(r.status) ? null : r.text, { status: r.status, headers: r.headers || {} });
     }
     if (res && res.status === "rejected") {
-      return new Response(JSON.stringify({ error: res.error }), { status: 403, headers: { "content-type": "application/json" } });
+      // A string \`message\` beside \`error\`: an SDK that builds its error's text from a top-level field reads a sentence,
+      // not "[object Object]", and one that branches on \`error.code\` still finds it.
+      const said = res.error && typeof res.error.message === "string" ? res.error.message : "the request was refused";
+      return new Response(JSON.stringify({ error: res.error, message: said }), { status: 403, headers: { "content-type": "application/json" } });
     }
     throw new TypeError((res && res.error && res.error.message) || "the bridged request failed");
   };
@@ -257,13 +260,14 @@ export const BRIDGE_SPECIFIER = /^sdk:[A-Za-z0-9_.-]+$/;
 
 /**
  * The modules the box gets besides `main.js` for these bridges: the shim, each plugin's files under `sdk/<plugin>/`,
- * and one `sdk:…` module per specifier that hands the SDK's exports, made with that mount's `fetch`. A specifier
- * module is an object with `js`, since the loader takes a bare string only for a name ending in `.js`.
+ * and one `sdk:…` module per specifier that hands the SDK's exports, made with that mount's `fetch`. Every module
+ * but the shim is an object with `js`: workerd takes a bare string only for a name ending in `.js`, and a plugin's
+ * files keep the names its package gives them (`client.mjs`), so a bare string there fails the load in production.
  */
 export function bridgeModules(bridges: readonly BridgeModule[]): Record<string, string | { js: string }> {
   const modules: Record<string, string | { js: string }> = { "bridge.js": BRIDGE_SHIM };
   for (const b of bridges) {
-    for (const [name, src] of Object.entries(b.files)) modules[`sdk/${b.plugin}/${name}`] = src;
+    for (const [name, src] of Object.entries(b.files)) modules[`sdk/${b.plugin}/${name}`] = { js: src };
     const made = `import { gatewayFetch } from "bridge.js";\n` +
       `import make from ${JSON.stringify(`sdk/${b.plugin}/${b.entry}`)};\n` +
       `const made = make(gatewayFetch(${JSON.stringify(b.alias)}));\n` +

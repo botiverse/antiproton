@@ -89,12 +89,13 @@ await check("the answer is a real Response: status, ok, text() and headers.get()
 await check("a refused call reaches the SDK as a 403 carrying the gateway's code; a failed one as a rejected fetch", async () => {
   const r = await exec.execute(`const { svc } = await import("sdk:svc");
     const refused = await svc.raw("https://svc.example/v1/merge", { method: "POST" });
-    output([refused.status, JSON.parse(await refused.text()).error.code]);
+    const said = JSON.parse(await refused.text());
+    output([refused.status, said.error.code, said.message]);
     try { await svc.raw("https://svc.example/v1/x"); output("no throw"); } catch (e) { output([e.name, e.message]); }`,
   host((c) => c.args.path === "/v1/merge"
     ? { status: "rejected", error: { code: "route_refused", message: "use pr_merge" } }
     : { status: "failed", operationId: "op_f", error: { code: "tool_error", message: "upstream unreachable" } }));
-  must(JSON.stringify(r.outputs[0]) === '[403,"route_refused"]', `the refusal read as ${JSON.stringify(r.outputs[0])}`);
+  must(JSON.stringify(r.outputs[0]) === '[403,"route_refused","use pr_merge"]', `the refusal read as ${JSON.stringify(r.outputs[0])}`);
   must(JSON.stringify(r.outputs[1]) === '["TypeError","upstream unreachable"]', `the failure read as ${JSON.stringify(r.outputs[1])}`);
 });
 
@@ -129,6 +130,35 @@ await check("a held request ends the run paused even when the SDK's caller catch
     `the pause does not name the held request: ${JSON.stringify(r.pause)} ${JSON.stringify(r.held)}`);
   must(JSON.stringify(r.outputs) === '["before"]', `outputs after the hold were kept: ${JSON.stringify(r.outputs)}`);
   must(calls.length === 1, `a request after the hold reached the host: ${calls.map((c) => c.args.path)}`);
+});
+
+// workerd takes a bare string only for a module named `….js`; an SDK's files keep their package's names (`.mjs`).
+const MJS = {
+  "index.mjs": `import { ApiError } from "./errors.mjs";
+export default function make(fetchImpl) { return { svc: { async get(p) { return (await fetchImpl("https://svc.example" + p)).text(); } }, ApiError }; }`,
+  "errors.mjs": `export class ApiError extends Error {}`,
+};
+
+await check("an SDK whose files are named .mjs loads and runs: every SDK file is shipped as { js }", async () => {
+  const mjs: BridgeModule = { ...bridge, files: MJS, entry: "index.mjs" };
+  const r = await exec.execute(`const { svc, ApiError } = await import("sdk:svc"); output([await svc.get("/v1/a"), typeof ApiError]);`,
+    { bridges: [mjs], async invoke() { return ok(200, "fine"); } } as any);
+  must(r.status === "completed" && JSON.stringify(r.outputs) === '[["fine","function"]]', `the .mjs SDK did not run: ${JSON.stringify(r)}`);
+  const { bridgeModules } = await import("../src/runtime/dynamic-worker-executor.ts");
+  const mods = bridgeModules([mjs]);
+  const bare = Object.entries(mods).filter(([n, v]) => typeof v === "string" && !n.endsWith(".js")).map(([n]) => n);
+  must(bare.length === 0, `modules shipped as a bare string under a name workerd will not take: ${bare}`);
+});
+
+await check("the stand-in refuses what workerd refuses: a bare string for a module whose name does not end in .js", async () => {
+  const load = (modules: Record<string, unknown>) => {
+    try { standIn.loader.load({ compatibilityDate: "2026-01-01", mainModule: "main.js", modules: modules as any }); return "loaded"; }
+    catch (e) { return String((e as Error).message); }
+  };
+  must(/bare string/.test(load({ "main.js": "export default {}", "sdk/p/client.mjs": "export const x = 1;" })), "a bare .mjs string was taken");
+  must(/bare string/.test(load({ "main.js": "export default {}", "sdk:svc": "export const x = 1;" })), "a bare sdk: string was taken");
+  must(load({ "main.js": "export default {}", "sdk/p/client.mjs": { js: "export const x = 1;" }, "bridge.js": "export {}" }) === "loaded",
+    "a { js } .mjs module, or a bare .js one, was refused");
 });
 
 await check("without a bridge the box loads main.js alone, and an sdk: import fails", async () => {
