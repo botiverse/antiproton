@@ -4,7 +4,7 @@ import type { Json, MountPolicy, MountRecord, OperationStatus, PolicyDecision } 
 import { AGENT_REF, agentRef, isAgentRef, KEPT_NAME, KEPT_PREFIX, OWNER_PREFIX, secretRefKind } from "./secrets.ts";
 import type { ToolError, ToolResult } from "../core/tools.ts";
 import { parseToolRef } from "../core/tools.ts";
-import type { Plugin, PluginContext, PluginDatabase, PluginNext, PromptPart, MountActivity, MountUsage, InboundEvent, InboundHooks, InboundResult, HeldListing, HeldRead, ListedTools, TurnEnd } from "../plugins/types.ts";
+import type { AgentLoginAnswer, Plugin, PluginContext, PluginDatabase, PluginNext, PromptPart, MountActivity, MountUsage, InboundEvent, InboundHooks, InboundResult, HeldListing, HeldRead, ListedTools, TurnEnd } from "../plugins/types.ts";
 import type { TurnEndEvent } from "./activity.ts";
 import { type ActivityEvent, type SandboxForm, holdingOf, backgroundOf, isExclusive } from "../plugins/types.ts";
 import { Backgrounded, Interrupt, interruptsOf } from "../plugins/types.ts";
@@ -202,6 +202,9 @@ function sameSnapshot(a: ToolSnapshot | null | undefined, b: ToolSnapshot | null
   if (!a || !b) return !a && !b;
   return a.hash === b.hash && a.takenAt === b.takenAt && !!a.withoutCredential === !!b.withoutCredential && a.basis === b.basis;
 }
+
+/** The mount `PluginContext.agentLogin` signs in through: where provisioning puts an agent's Raft mount. */
+const RAFT_LOGIN_ALIAS = "raft";
 
 /** Moved beside `Plugin.defaultPolicy` (src/plugins/types.ts), where a plugin can read it too; kept importable from here. */
 export { policyFor } from "../plugins/types.ts";
@@ -1275,6 +1278,10 @@ export class ToolGateway {
       ...(this.#inbound && plugin?.receive
         ? { inbound: this.#inbound(ctx.tenantId, ctx.agentId, mount.alias) } : {}),
       sibling: (alias: string) => this.#sibling(ctx, alias, db),
+      // Only for a plugin that declares the services it may log in to (botiverse/antiproton#1084).
+      ...(plugin?.agentLogin?.services?.length && !listing ? {
+        agentLogin: (service: string, codeChallenge: string, target?: string) => this.#agentLogin(ctx, plugin, service, codeChallenge, target, operationId),
+      } : {}),
       // Found by what each plugin declares, so the container never matches a plugin's name or an alias.
       sandboxForms: async () => {
         const choices = await store.pluginChoices(ctx.tenantId, ctx.agentId);
@@ -1693,6 +1700,27 @@ export class ToolGateway {
       // A throw is the plugin saying nobody answered (`Plugin.credentialAccount`), not that the key has no account.
       return { kind: "unreachable", reason: String((e as Error)?.message ?? e).slice(0, 200) };
     }
+  }
+
+  /**
+   * `PluginContext.agentLogin` (botiverse/antiproton#1084): a one-time Agent Login grant for `service`, obtained by
+   * the agent's raft mount on its own context — its credential, its server, its stored app session — so the asking
+   * plugin never holds any of them. Refused for a service the plugin did not declare. The raft mount is the one named
+   * `raft`, found by the same lookup as a sibling (this agent's, not being removed, installed, switched on, at the
+   * registry's version), and its plugin must implement `grantAgentLogin`; otherwise the answer is `unavailable`.
+   */
+  async #agentLogin(ctx: CallContext, asking: Plugin, service: string, codeChallenge: string, target?: string, operationId?: string): Promise<AgentLoginAnswer> {
+    if (!asking.agentLogin?.services.includes(service)) {
+      throw new Error(`${asking.id} may not log in to ${JSON.stringify(service).slice(0, 60)}: it declares ${JSON.stringify(asking.agentLogin?.services ?? [])}`);
+    }
+    const usable = await this.#sibling(ctx, RAFT_LOGIN_ALIAS, (m) => this.#db(ctx, m));
+    const mount = usable ? await this.#store.getMountByAlias(ctx.tenantId, ctx.agentId, RAFT_LOGIN_ALIAS) : null;
+    const raft = mount ? this.#plugins.get(mount.plugin) : undefined;
+    if (!mount || !raft?.grantAgentLogin) {
+      return { status: "unavailable", reason: `this agent has no usable mount named \`${RAFT_LOGIN_ALIAS}\` of a plugin that can log in for it` };
+    }
+    if (!usable!.credential) return { status: "unavailable", reason: `this agent's \`${RAFT_LOGIN_ALIAS}\` mount has no Raft credential` };
+    return raft.grantAgentLogin(this.#contextFor(ctx, mount, usable!.credential, false, operationId), service, codeChallenge, target);
   }
 
   /**

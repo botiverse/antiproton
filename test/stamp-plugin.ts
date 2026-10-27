@@ -14,6 +14,8 @@ import { stampPlugin, SESSION_STORE, parseSession, loadSession, queuedMounts, ga
 import { SqliteStore } from "../src/store/sqlite.ts";
 import { ToolGateway } from "../src/runtime/gateway.ts";
 import { keepRaftIdentity } from "../src/plugins/raft-identity.ts";
+import { createRaftPlugin } from "../src/plugins/raft.ts";
+import { sealText } from "./../src/plugins/raft-agent-login.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void> | void) {
@@ -31,6 +33,16 @@ function must(c: unknown, m: string): asserts c { if (!c) throw new Error(m); }
 
 type Seen = { method: string; path: string; auth: string | undefined; body: string };
 let seen: Seen[] = [];
+/** Grants the fake raft mount issued (challenge, used), and the Authorization of every exchange (none expected). */
+const grants = new Map<string, { challenge: string; used: boolean }>();
+let exchanges: Array<string | undefined> = [];
+/** A stand-in for the gateway's `ctx.agentLogin`: a grant per call, bound to the challenge, as Stamp's agent/login does. */
+const agentLoginGrants = async (service: string, challenge: string) => {
+  if (service !== "stamp") throw new Error(`asked for ${service}`);
+  const grant = `grant-${grants.size + 1}`;
+  grants.set(grant, { challenge, used: false });
+  return { status: "grant" as const, grant, expiresAt: null };
+};
 /** The Authorization of every owner check (`GET /v1/me?purpose=owner-check`) since `reset`. */
 let ownerChecks: Array<string | undefined> = [];
 let refreshes = 0;
@@ -92,6 +104,20 @@ globalThis.fetch = (async (input: any, init: any) => {
   // The owner check a first use makes is kept apart, so a test counts the calls it is about.
   if (url.searchParams.get("purpose") === "owner-check") ownerChecks.push(init?.headers?.authorization);
   else seen.push({ method, path, auth: init?.headers?.authorization, body: init?.body ?? "" });
+  // Stamp's exchange (botiverse/stamp agentExchange): a grant this fake issued, once, for the verifier of its challenge.
+  if (url.pathname === "/api/auth/agent/exchange") {
+    exchanges.push(init?.headers?.authorization);
+    const b = JSON.parse(init?.body ?? "{}");
+    const g = grants.get(b.grant);
+    const json = (status: number, body: unknown) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+    if (!g) return json(400, { code: "grant_invalid" });
+    if (g.used) return json(409, { code: "grant_consumed" });
+    g.used = true;
+    const d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(String(b.code_verifier)));
+    const challenge = btoa(String.fromCharCode(...new Uint8Array(d))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    if (challenge !== g.challenge) return json(400, { code: "grant_proof_mismatch" });
+    return json(200, JSON.parse(session({ access_token: "ACCESS-SELF", refresh_token: "REFRESH-SELF" })));
+  }
   if (url.pathname === "/api/auth/agent/refresh") {
     refreshes++;
     const presented = String(JSON.parse(init?.body ?? "{}").refresh_token);
@@ -1561,6 +1587,389 @@ await check("a request that outlives its 30 s bound is said as a timeout, not as
     must(/no answer from Stamp within 30 s/.test(write) && /unknown/.test(write), write);
   } finally { globalThis.fetch = inner; }
 });
+
+// ---- stamp_login: the mount logs in with the agent's own Raft identity (botiverse/antiproton#1084) ----
+
+await check("stamp_login seals a session of this agent under the raft key, and the mount then acts with it", async () => {
+  reset(); exchanges = [];
+  const { ctx, rows, agentDb } = makeCtx(null);
+  const logged = { ...ctx, agentLogin: agentLoginGrants };
+  const out: any = await invoke("stamp_login", {}, logged);
+  must(out.status === "signed_in" && out.owner === `${RAFT_AGENT}@${RAFT_SERVER}`, JSON.stringify(out));
+  const row = rows.get("session");
+  must(row?.source === "agent-login" && typeof row?.nonce === "string" && row?.from === undefined, JSON.stringify(row));
+  must(!JSON.stringify(row).includes("REFRESH-SELF"), "the session is kept in the clear");
+  must(agentDb!.rows.size === 0, `self-login wrote agent-level records: ${agentDb!.rows.size}`);
+  must(exchanges.length === 1 && exchanges[0] === undefined, `the exchange carried a session: ${JSON.stringify(exchanges)}`);
+  seen = [];
+  await invoke("whoami", {}, logged);
+  must(seen.at(-1)?.auth === "Bearer ACCESS-SELF", `acted with ${seen.at(-1)?.auth}`);
+});
+
+await check("stamp_login refuses a mount that already works, or holds a person's session, and sends nothing", async () => {
+  reset(); exchanges = [];
+  const { ctx } = makeCtx(null);
+  const logged = { ...ctx, agentLogin: agentLoginGrants };
+  await invoke("stamp_login", {}, logged);
+  const again = await refusal(invoke("stamp_login", {}, logged));
+  must(/already has a working session/.test(again) && exchanges.length === 1, `${again}; exchanges ${exchanges.length}`);
+  const pasted = { ...makeCtx(session()).ctx, agentLogin: agentLoginGrants };
+  const said = await refusal(invoke("stamp_login", {}, pasted));
+  must(/given a session by a person/.test(said) && exchanges.length === 1, said);
+});
+
+await check("a self-login row whose raft credential changed reads as log in again, with nothing sent", async () => {
+  reset(); exchanges = [];
+  const { ctx, rows } = makeCtx(null);
+  await invoke("stamp_login", {}, { ...ctx, agentLogin: agentLoginGrants });
+  const otherRaft = await raftMountDb(RAFT_AGENT, RAFT_SERVER, "another-raft-credential");
+  const moved = { ...ctx, agentLogin: agentLoginGrants, async sibling(name: string) {
+    return name === "raft" ? { credential: "another-raft-credential", db: otherRaft, plugin: "raft", policy: null } : ctx.sibling(name);
+  } };
+  seen = [];
+  const said = await refusal(invoke("whoami", {}, moved));
+  must(/Log in again with stamp_login/.test(said) && !/a person signs in/.test(said) && seen.length === 0 && refreshes === 0, said);
+  // And stamp_login may replace it: the row is not working.
+  const out: any = await invoke("stamp_login", {}, moved);
+  must(out.status === "signed_in" && rows.get("session")?.source === "agent-login", JSON.stringify(out));
+});
+
+await check("with no credential, a row that is not this mount's own login is not used", async () => {
+  reset();
+  const { ctx, rows } = makeCtx(session());
+  await invoke("whoami", {}, ctx);
+  must(rows.get("session") && rows.get("session").source === undefined, "no pasted row to test with");
+  const bare = { ...ctx, credential: null };
+  seen = [];
+  const said = await refusal(invoke("whoami", {}, bare));
+  must(/nothing to act as/.test(said) && seen.length === 0, said);
+});
+
+await check("a person's session pasted onto a self-login mount takes over", async () => {
+  reset();
+  const { ctx } = makeCtx(null);
+  await invoke("stamp_login", {}, { ...ctx, agentLogin: agentLoginGrants });
+  const pasted = { ...ctx, credential: session({ access_token: "ACCESS-P", refresh_token: "REFRESH-P" }) };
+  seen = [];
+  await invoke("whoami", {}, pasted);
+  must(seen.at(-1)?.auth === "Bearer ACCESS-P", `acted with ${seen.at(-1)?.auth}`);
+});
+
+await check("Raft's approval or install answer comes back as it is, with nothing kept", async () => {
+  reset(); exchanges = [];
+  const { ctx, rows } = makeCtx(null);
+  for (const status of ["approval_required", "install_required"] as const) {
+    const out: any = await invoke("stamp_login", {}, { ...ctx, async agentLogin() { return { status, detail: { card: "c1" } }; } });
+    must(out.status === status && out.detail?.card === "c1" && rows.size === 0 && exchanges.length === 0, JSON.stringify(out));
+  }
+});
+
+// Through the gateway (cody): who gets the method, which services, and the default hold.
+await check("through the gateway: only a declaring plugin gets agentLogin, for its declared service, and stamp_login waits for a person", async () => {
+  const store = await gatewayStore();
+  await store.addMount({
+    tenantId: "t", agentId: "a", alias: "stamp", plugin: "stamp", installationId: "i", connectionId: null,
+    toolVersion: stampPlugin.version, publicConfig: {}, secretRef: null, policy: null,
+  });
+  const seenBy: Record<string, unknown> = {};
+  const probe = { id: "probe", version: "1.0.0", agentLogin: { services: ["stamp"] },
+    tools: [{ name: "go", summary: "", parameters: {}, sideEffects: "read", idempotency: "native" }],
+    async invoke(_n: string, _a: unknown, c: any) {
+      seenBy.has = typeof c.agentLogin;
+      try { await c.agentLogin("github", "x"); seenBy.other = "allowed"; } catch (e) { seenBy.other = String((e as Error).message); }
+      return {};
+    } } as any;
+  const silent = { id: "silent", version: "1.0.0", tools: [{ name: "go", summary: "", parameters: {}, sideEffects: "read", idempotency: "native" }],
+    async invoke(_n: string, _a: unknown, c: any) { seenBy.silent = typeof c.agentLogin; return {}; } } as any;
+  for (const [alias, plugin] of [["probe", "probe"], ["silent", "silent"]]) {
+    await store.addMount({ tenantId: "t", agentId: "a", alias, plugin, installationId: `i-${alias}`, connectionId: null,
+      toolVersion: "1.0.0", publicConfig: {}, secretRef: null, policy: null });
+  }
+  const gw = new ToolGateway(store, [stampPlugin, RAFT_STUB, probe, silent], new Set(["stamp", "raft", "probe", "silent"]),
+    { async resolve(ref: string) { return ref === "agent:raft" ? RAFT_CREDENTIAL : null; } });
+  const caller = { tenantId: "t", agentId: "a", taskId: "k" };
+  await gw.invoke(caller, "probe.go", {});
+  await gw.invoke(caller, "silent.go", {});
+  must(seenBy.has === "function" && /may not log in to "github"/.test(String(seenBy.other)) && seenBy.silent === "undefined", JSON.stringify(seenBy));
+  reset(); exchanges = [];
+  const held: any = await gw.invoke(caller, "stamp.stamp_login", {});
+  must(held.status === "pending" && held.error?.code === "awaiting_approval" && exchanges.length === 0, JSON.stringify(held));
+});
+
+await check("a mount can turn stamp_login off", async () => {
+  const call = await gatewayMount({ tools: { stamp_login: "deny" } });
+  reset(); exchanges = [];
+  const r = await call("stamp_login", {});
+  must(r.status === "rejected" && r.error?.code === "policy_denied" && exchanges.length === 0, JSON.stringify(r));
+});
+
+// cody: a call that needs a session and has none never logs in by itself.
+await check("a tool call with no session does not log in by itself", async () => {
+  reset(); exchanges = [];
+  let asked = 0;
+  const { ctx } = makeCtx(null);
+  const said = await refusal(invoke("whoami", {}, { ...ctx, async agentLogin(...a: any[]) { asked++; return agentLoginGrants(a[0], a[1]); } }));
+  must(asked === 0 && exchanges.length === 0 && /stamp_login/.test(said), `${said}; asked ${asked}`);
+});
+
+// ---- cody's review of #1086: the request the raft side makes, the listing context, and what a trace row holds ----
+
+await check("the raft side asks for exactly the agent-login action with the three closed fields, and nothing else", async () => {
+  const calls: any[] = [];
+  const raft = createRaftPlugin({ agentLoginCalls: {
+    async invoke(args: any) { calls.push(args); return { service: {}, action: "agent-login", result: { schema: "raft-cli-agent-login-grant.v1", grant: "g-1", expires_at: "2026-10-27T10:00:00Z" } } as any; },
+    async login() { throw new Error("not called"); },
+  } });
+  const ctx = { credential: "sk", alias: "raft", caller: { tenantId: "t", agentId: "a" }, publicConfig: { serverUrl: "https://raft.example" } } as any;
+  const out = await raft.grantAgentLogin!(ctx, "stamp", "CHALLENGE", "#general");
+  must(out.status === "grant" && (out as any).grant === "g-1", JSON.stringify(out));
+  must(JSON.stringify(calls) === JSON.stringify([{ service: "stamp", action: "agent-login", target: "#general",
+    params: { schema: "raft-cli-agent-login-request.v1", code_challenge: "CHALLENGE", code_challenge_method: "S256" } }]), JSON.stringify(calls));
+  // Not installed: Agent Login's own install_required, with who acts next and no tool name of the raft plugin's.
+  const uninstalled = createRaftPlugin({ agentLoginCalls: {
+    async invoke() { throw Object.assign(new Error("No app installed on this Server matched \"stamp\""), { notInstalled: true }); },
+    async login() { return { status: "install_required", installation: { serverName: "S", marketplaceUrl: "https://m", target: "#c", actionCardMessageId: "m1" }, next: "call integrations_login again" } as any; },
+  } });
+  const inst: any = await uninstalled.grantAgentLogin!(ctx, "stamp", "CHALLENGE");
+  must(inst.status === "install_required" && inst.detail?.actionCardMessageId === "m1" && !JSON.stringify(inst).includes("integrations_"), JSON.stringify(inst));
+  const approval = createRaftPlugin({ agentLoginCalls: {
+    async invoke() { return { status: "approval_required", approval: { requestId: "r1", target: "#c", actionCardMessageId: "m2" }, next: "call integrations_invoke again" } as any; },
+    async login() { throw new Error("not called"); },
+  } });
+  const appr: any = await approval.grantAgentLogin!(ctx, "stamp", "CHALLENGE");
+  must(appr.status === "approval_required" && appr.detail?.requestId === "r1" && !JSON.stringify(appr).includes("integrations_"), JSON.stringify(appr));
+});
+
+await check("a listing context has no agentLogin, even for a plugin that declares it", async () => {
+  const store = await gatewayStore();
+  let listed: string | undefined;
+  const probe = { id: "probe", version: "1.0.0", agentLogin: { services: ["stamp"] }, tools: [],
+    async invoke() { return {}; },
+    async snapshotTools(c: any) { listed = typeof c.agentLogin; return { tools: [] }; } } as any;
+  await store.addMount({ tenantId: "t", agentId: "a", alias: "probe", plugin: "probe", installationId: "i-p", connectionId: null,
+    toolVersion: "1.0.0", publicConfig: {}, secretRef: null, policy: null });
+  const gw = new ToolGateway(store, [RAFT_STUB, probe], new Set(["raft", "probe"]), { async resolve() { return null; } });
+  await gw.refreshMountTools("t", "a", "probe");
+  must(listed === "undefined", `listing context agentLogin: ${listed}`);
+});
+
+await check("a stamp_login trace row holds only mount, service, owner and whether a session was issued", async () => {
+  const rows: any[] = [];
+  const allowed = new Set(["mount", "service", "owner", "issued"]);
+  reset(); exchanges = [];
+  const { ctx } = makeCtx(null);
+  await invoke("stamp_login", {}, { ...ctx, agentLogin: agentLoginGrants, trace: (r: any) => rows.push(r) });
+  // A failure after Stamp issued a session: the owner check refuses it (another agent's), and it is still traced.
+  const other = makeCtx(null).ctx;
+  await withMe({ agentId: "ra-2" }, 200, () => refusal(invoke("stamp_login", {}, { ...other, agentLogin: agentLoginGrants, trace: (r: any) => rows.push(r) })));
+  must(rows.length === 2 && rows[0].status === "sealed" && rows[1].status === "failed_after_issue" && rows[1].attrs.issued === true, JSON.stringify(rows));
+  for (const r of rows) {
+    const extra = Object.keys(r.attrs).filter((k) => !allowed.has(k));
+    must(extra.length === 0 && !/REFRESH|ACCESS|grant-|verifier/.test(JSON.stringify(r)), `trace row: ${JSON.stringify(r)}`);
+  }
+});
+
+await check("a self-login session whose refresh is refused points at stamp_login, not at a person", async () => {
+  reset(); exchanges = [];
+  const { ctx } = makeCtx(null);
+  const logged = { ...ctx, agentLogin: agentLoginGrants };
+  await invoke("stamp_login", {}, logged);
+  refreshAnswer = () => new Response(JSON.stringify({ error: "refresh_reused" }), { status: 409, headers: { "content-type": "application/json" } });
+  const first = await anHourLater(() => refusal(invoke("whoami", {}, logged)));
+  const later = await anHourLater(() => refusal(invoke("whoami", {}, logged)));
+  for (const said of [first, later]) must(/stamp_login/.test(said) && !/person needs to sign in/.test(said), said);
+  must(refreshes === 1, `refreshes: ${refreshes}`);
+});
+
+
+// ---- the edges of stamp_login that its nine cases do not reach (Eleanor, botiverse/antiproton#1084) ----
+
+/** What the raft mount was asked for, per call: the service and the challenge. */
+let loginAsk: Array<{ service: string; challenge: string }> = [];
+const askLogin = async (service: string, challenge: string) => { loginAsk.push({ service, challenge }); return agentLoginGrants(service, challenge); };
+/** Trace rows this plugin wrote (the fake context hands over a collector). */
+const traces: any[] = [];
+const withTrace = (ctx: any) => ({ ...ctx, trace: (row: any) => traces.push(row) });
+/** A session of this mount's own login that is already due, so the next call rotates it. */
+const expiringExchange = (rt: string) => session({ access_token: `ACCESS-${rt}`, refresh_token: rt, access_expires_at: new Date(Date.now() + 30_000).toISOString() });
+
+// The pair has to be the shape Stamp accepts, not merely random-looking: `isValidS256Challenge` decodes with
+// RawURLEncoding and requires exactly 32 bytes, so a padded or short challenge is answered `invalid_challenge` — which
+// reads like a Stamp bug. The verifier is 32 bytes too (43 characters), which is what `codeVerifierRe` takes.
+await check("stamp_login's PKCE pair is the shape Stamp accepts, and a second attempt makes a new one", async () => {
+  reset(); loginAsk = [];
+  const { ctx } = makeCtx(null);
+  await invoke("stamp_login", {}, { ...ctx, agentLogin: askLogin });
+  must(loginAsk.length === 1 && loginAsk[0].service === "stamp", JSON.stringify(loginAsk));
+  const challenge = loginAsk[0].challenge;
+  must(/^[A-Za-z0-9_-]{43}$/.test(challenge), `challenge is not 43 characters of raw base64url: ${challenge}`);
+  const raw = Uint8Array.from(atob(challenge.replace(/-/g, "+").replace(/_/g, "/")), (c) => c.charCodeAt(0));
+  must(raw.length === 32, `the challenge decoded to ${raw.length} bytes, and Stamp wants 32`);
+  // A fresh mount, so the first attempt's session is not in the way: this is about the pair, not the refusal.
+  const gone = { ...makeCtx(null).ctx, async agentLogin(service: string, ch: string) { loginAsk.push({ service, challenge: ch }); return { status: "unavailable" as const, reason: "no raft mount" }; } };
+  await invoke("stamp_login", {}, gone);
+  const asked = (): number => loginAsk.length;
+  must(asked() === 2 && loginAsk[1].challenge !== challenge, `the second attempt reused the challenge: ${JSON.stringify(loginAsk)}`);
+});
+
+// A 5xx at the exchange may have minted a session, so it is never retried with the same grant: the next call asks the
+// raft mount for a fresh one. One exchange per attempt, always.
+await check("a failed exchange is not retried with the same grant; the next call starts over", async () => {
+  reset(); exchanges = []; loginAsk = [];
+  const { ctx } = makeCtx(null);
+  const inner = globalThis.fetch as any;
+  let fail = 1;
+  // Every exchange the plugin makes is counted here, whether it is the one that fails or a retry of it. Read through
+  // a function so a comparison earlier in the case cannot narrow the count to a literal.
+  let tries = 0;
+  const exchangesMade = (): number => tries;
+  globalThis.fetch = (async (input: any, init: any) => {
+    const u = new URL(String(input));
+    if (u.pathname === "/api/auth/agent/exchange") tries++;
+    if (u.pathname === "/api/auth/agent/exchange" && fail > 0) {
+      fail--;
+      return new Response(JSON.stringify({ code: "temporarily_unavailable" }), { status: 503, headers: { "content-type": "application/json" } });
+    }
+    return inner(input, init);
+  }) as any;
+  try {
+    const first = await refusal(invoke("stamp_login", {}, { ...ctx, agentLogin: askLogin }));
+    must(/may have been issued/.test(first) && /starts over/.test(first), first);
+    must(exchangesMade() === 1, `one attempt made ${exchangesMade()} exchanges, and a grant is presented once`);
+    const out: any = await invoke("stamp_login", {}, { ...ctx, agentLogin: askLogin });
+    must(out.status === "signed_in", JSON.stringify(out));
+    must(exchangesMade() === 2, `two attempts made ${exchangesMade()} exchanges (the failed one must not be resent)`);
+    must(loginAsk.length === 2, `the raft mount was asked ${loginAsk.length} times`);
+    // A transport failure - no answer at all - follows the same rule, said as the unknown outcome it is.
+    const { ctx: lost, rows: lostRows } = makeCtx(null);
+    let thrown = 0;
+    globalThis.fetch = (async (input: any, init: any) => {
+      if (new URL(String(input)).pathname === "/api/auth/agent/exchange") {
+        tries++;
+        thrown++;
+        const e = new TypeError("fetch failed");
+        (e as any).cause = { code: "ECONNRESET" };
+        throw e;
+      }
+      return inner(input, init);
+    }) as any;
+    const before = exchangesMade();
+    const cut = await refusal(invoke("stamp_login", {}, { ...lost, agentLogin: agentLoginGrants }));
+    must(/no answer came back/.test(cut) && /starts over/.test(cut), cut);
+    must(exchangesMade() - before === 1 && thrown === 1, `a lost answer was sent ${exchangesMade() - before} times`);
+    must(lostRows.size === 0, "a session was kept after a lost answer");
+  } finally { globalThis.fetch = inner; }
+});
+
+// A grant the gateway has already spent is the agent's cue to start over, not a bug in the plugin: the two are said
+// differently, and only the second tells someone to stop trying.
+await check("a spent grant is answered as start over, not as this plugin's bug", async () => {
+  reset(); exchanges = [];
+  const { ctx, rows } = makeCtx(null);
+  const inner = globalThis.fetch as any;
+  let n = 0;
+  globalThis.fetch = (async (input: any, init: any) => {
+    const u = new URL(String(input));
+    if (u.pathname !== "/api/auth/agent/exchange") return inner(input, init);
+    exchanges.push(init?.headers?.authorization);
+    n++;
+    const json = (status: number, body: unknown) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+    // The first answer is not a session but the grant is spent all the same; the second presents it again.
+    return n === 1 ? json(200, { schema: "not-a-session" }) : json(409, { code: "grant_consumed" });
+  }) as any;
+  try {
+    const first = await refusal(invoke("stamp_login", {}, { ...ctx, agentLogin: agentLoginGrants }));
+    must(/not a session/.test(first), first);
+    const second = await refusal(invoke("stamp_login", {}, { ...ctx, agentLogin: agentLoginGrants }));
+    must(/grant_consumed/.test(second) && /starts over/.test(second) && !/bug in this plugin/.test(second), second);
+    must(rows.size === 0, `a session was kept: ${JSON.stringify([...rows.keys()])}`);
+  } finally { globalThis.fetch = inner; }
+});
+
+// Two seals never share a key: every seal of a self-login session takes a fresh nonce, so a rotation rewrites the row
+// under a new one and carries `source`, `owner` and the raft seal with it.
+await check("a self-login session rotates under a fresh nonce, still as this agent's own login", async () => {
+  reset();
+  const inner = globalThis.fetch as any;
+  globalThis.fetch = (async (input: any, init: any) => new URL(String(input)).pathname === "/api/auth/agent/exchange"
+    ? new Response(expiringExchange("REFRESH-SELF"), { status: 200, headers: { "content-type": "application/json" } })
+    : inner(input, init)) as any;
+  try {
+    const { ctx, rows } = makeCtx(null);
+    await invoke("stamp_login", {}, { ...ctx, agentLogin: agentLoginGrants });
+    const first = rows.get("session");
+    must(first?.source === "agent-login" && typeof first?.nonce === "string", JSON.stringify(first));
+    refreshAnswer = rotatesTo(90);
+    seen = [];
+    await invoke("whoami", {}, ctx);
+    must(refreshes === 1 && seen.at(-1)?.auth === "Bearer ACCESS-90", `refreshes ${refreshes}, sent ${seen.at(-1)?.auth}`);
+    const rotated = rows.get("session");
+    must(rotated?.source === "agent-login", `the rotation lost the source: ${JSON.stringify(rotated)}`);
+    must(rotated?.owner === `${RAFT_AGENT}@${RAFT_SERVER}`, JSON.stringify(rotated));
+    must(rotated?.from === undefined, `a self-login row grew a from: ${JSON.stringify(rotated)}`);
+    must(typeof rotated?.nonce === "string" && rotated.nonce !== first.nonce, "two seals shared a nonce");
+    // And it still opens: the key follows the nonce, not the seal it replaced.
+    seen = [];
+    await invoke("whoami", {}, ctx);
+    must(seen.at(-1)?.auth === "Bearer ACCESS-90", `after the rotation it acted with ${seen.at(-1)?.auth}`);
+  } finally { globalThis.fetch = inner; }
+});
+
+// The one dangerous branch of a self-login mount: with no usable credential, `loadSession` reads the row before it
+// concludes there is no session. Only a row this mount logged in for itself may come back — a row sealed under a
+// credential that is not a session (a cookie, a GitHub token) must not, or a mount given a wrong value would act with
+// whatever session was left behind.
+await check("with a credential that is not a session, only this mount's own login is actable", async () => {
+  reset();
+  const { ctx, rows } = makeCtx("ghp_not_a_session");
+  const sealed = await sealText({ ...ctx, alias: "stamp-session" } as any, "antiproton stamp agent session v1",
+    session({ access_token: "ACCESS-LEFT", refresh_token: "REFRESH-LEFT" }), "session");
+  rows.set("session", { ...sealed, from: "some-digest" });
+  seen = [];
+  const said = await refusal(invoke("whoami", {}, ctx));
+  must(/nothing to act as|not a Stamp agent session/.test(said), said);
+  must(seen.length === 0, `a request went out: ${JSON.stringify(seen)}`);
+});
+
+// A self-login row that cannot be opened for its own reasons — no nonce, a damaged seal, no raft mount — asks for a
+// login and sends nothing on the way. The difference between "log in again" and "a person signs in" is the point.
+await check("a self-login row that cannot be opened asks for a login and sends nothing", async () => {
+  for (const row of [{ source: "agent-login", owner: `${RAFT_AGENT}@${RAFT_SERVER}` },
+    { source: "agent-login", nonce: "n1", iv: "AAAA", ciphertext: "BBBB" }]) {
+    reset();
+    const { ctx, rows } = makeCtx(null);
+    rows.set("session", row);
+    seen = [];
+    const said = await refusal(invoke("whoami", {}, ctx));
+    must(/stamp_login/.test(said) && !/a person signs in/.test(said), `${JSON.stringify(row)}: ${said}`);
+    must(seen.length === 0 && refreshes === 0, `a request went out: ${JSON.stringify(seen)}`);
+  }
+  // And with no raft mount at all, the same answer: it cannot read its own key, so it logs in again once there is one.
+  reset();
+  const { ctx } = makeCtx(null);
+  await invoke("stamp_login", {}, { ...ctx, agentLogin: agentLoginGrants });
+  const orphan = { ...ctx, async sibling() { return null; } };
+  seen = [];
+  const said = await refusal(invoke("whoami", {}, orphan));
+  must(/stamp_login/.test(said) && seen.length === 0 && refreshes === 0, said);
+});
+
+// Trace: one row per attempt, and no token, grant or verifier in it — the attributes are what an operator reads.
+await check("every stamp_login attempt writes one trace row, and it carries no secret", async () => {
+  reset(); loginAsk = []; traces.length = 0;
+  const { ctx } = makeCtx(null);
+  await invoke("stamp_login", {}, { ...withTrace(ctx), agentLogin: askLogin });
+  must(traces.length === 1 && traces[0].kind === "stamp.agent_login", JSON.stringify(traces));
+  must(traces[0].status === "sealed" && traces[0].verdict === "ok", JSON.stringify(traces[0]));
+  const text = JSON.stringify(traces[0]);
+  // Not the session, not the challenge, and not the grant: a trace is read by people who are not the agent.
+  for (const word of ["REFRESH-SELF", "ACCESS-SELF", loginAsk[0].challenge, ...[...grants.keys()]]) must(!text.includes(word), `the trace carries ${word}`);
+  traces.length = 0;
+  const { ctx: busy } = makeCtx(session());
+  await refusal(invoke("stamp_login", {}, { ...withTrace(busy), agentLogin: askLogin }));
+  must(traces.length === 1 && traces[0].status === "refused_credential" && traces[0].verdict === "blocked", JSON.stringify(traces));
+});
+
 
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.error ? `\n    ${r.error}` : ""}`);
 const failed = results.filter((r) => !r.ok).length;
