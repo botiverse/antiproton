@@ -310,7 +310,10 @@ export function validZone(value: unknown): string | null {
 /** A language tag such as "zh-CN" or "en". 35 is the length RFC 5646 §4.4.1 asks a tag's reader to take. */
 const LANGUAGE_TAG = /^[A-Za-z]{2,3}(-[A-Za-z0-9]{1,8})*$/;
 
-/** A language tag, or null: Raft's field is not typed by the SDK yet, and it reaches the model's input, so it is read defensively. */
+/**
+ * A language tag, or null. The SDK types the field (0.31.0) only as a string, and it reaches the model's input, so a
+ * value that is not a tag is still dropped here.
+ */
 export function validLanguage(value: unknown): string | null {
   return typeof value === "string" && value.length <= 35 && LANGUAGE_TAG.test(value) ? value : null;
 }
@@ -378,17 +381,15 @@ export async function keepOwnerFromContext(ctx: PluginContext, context: OwnerCon
   const dm = of.dmTarget && DM_TARGET.test(of.dmTarget.trim()) ? of.dmTarget.trim() : null;
   // The owner's handle (SDK 0.26.0 types `name`, without `@`; null on older Servers), when it is usable text.
   const name = typeof of.name === "string" && of.name.trim().length > 0 && of.name.trim().length <= 64 ? of.name.trim().replace(/^@/, "") : null;
-  // `raftCheck` and `language` are not typed by the SDK yet (it keeps unknown fields). The language is Raft's as it
-  // stands, as the zone is: a context without it (an older Server) or with null leaves none, and the owner's own
-  // messages decide.
-  const extra = of as Record<string, unknown>;
+  // The language is Raft's as it stands, as the zone is: a context without it (an older Server) or with null leaves
+  // none, and the owner's own messages decide.
   const owner: AssistantOwner = {
     userId: of.userId, timezone: validZone(of.timezone ?? null), statedTimezone: same?.statedTimezone ?? null,
-    language: validLanguage(extra.language), serverId: context.server.id, pausedAt: null,
+    language: validLanguage(of.language), serverId: context.server.id, pausedAt: null,
     dmTarget: dm, learnedDm: same?.learnedDm ?? null, doorbellAt: same?.doorbellAt ?? null, lastCheckAt: same?.lastCheckAt ?? null,
     changeAt: same?.changeAt ?? null, changeSources: same?.changeSources ?? {}, lagReads: same?.lagReads ?? 0, lastBrief: same?.lastBrief ?? null, briefSent: same?.briefSent ?? null, askedTimezone: same?.askedTimezone ?? false,
     ownerName: name, selfName: typeof context.agent.name === "string" && context.agent.name ? context.agent.name : null,
-    raftCheck: extra.raftCheck === true,
+    raftCheck: of.raftCheck === true,
   };
   const next = same ? await modeChanged(ctx, same.raftCheck, owner, Date.now()) : owner;
   await saveOwner(ctx, next);
@@ -447,7 +448,7 @@ export async function noteMode(ctx: PluginContext, owner: AssistantOwner, raftCh
 
 /** The part of the credential context (`routes.agent.context`) the owner is kept from. */
 export interface OwnerContext {
-  agent: { name?: string; assistantOf?: (Pick<RaftAssistantOf, "userId"> & Partial<Pick<RaftAssistantOf, "name" | "timezone" | "dmTarget">>) | null };
+  agent: { name?: string; assistantOf?: (Pick<RaftAssistantOf, "userId"> & Partial<Pick<RaftAssistantOf, "name" | "raftCheck" | "timezone" | "language" | "dmTarget">>) | null };
   server: { id: string };
 }
 

@@ -1,6 +1,6 @@
 import { createHash, createHmac } from "node:crypto";
 import { createRaft, isInterrupted, RAFT_OPERATIONS } from "@botiverse/raft-sdk";
-import { raftPlugin as raftWithoutStorage, EXCLUDED, EVENTS_LIMIT, GENERATED, handOver, INBOX_STORE, KEY_LIFETIME_MS, PAGE_ROWS, PUSH_KEY, PUSH_STORE, originOf, pagingArg, toolOf, offeredTerms, escapeMarks, unescapeMarks, createRaftPlugin, downloadAttachment, ATTACHMENT_MAX_BYTES, toolsBasisOf, WITHHELD_ARGUMENTS, FEATURES_BASIS, wakeInstruction, renderInboxSummary, INBOX_SUMMARY, RAFTBENCH_TOOL, RAFTBENCH_READER_BASIS, isRaftbenchReader } from "../src/plugins/raft.ts";
+import { raftPlugin as raftWithoutStorage, EXCLUDED, EVENTS_LIMIT, GENERATED, handOver, INBOX_STORE, KEY_LIFETIME_MS, PAGE_ROWS, PUSH_KEY, PUSH_STORE, originOf, pagingArg, toolOf, offeredTerms, escapeMarks, unescapeMarks, createRaftPlugin, downloadAttachment, ATTACHMENT_MAX_BYTES, toolsBasisOf, WITHHELD_ARGUMENTS, FEATURES_BASIS, wakeInstruction, renderInboxSummary, INBOX_SUMMARY, RAFTBENCH_TOOL, RAFTBENCH_READER_BASIS, isRaftbenchReader, appOf, enabledApps } from "../src/plugins/raft.ts";
 import { activityEvents, turnEnds } from "../src/runtime/activity.ts";
 import { readFileSync } from "node:fs";
 import { PARK_BYTES } from "../src/plugins/artifacts.ts";
@@ -158,7 +158,8 @@ const VIEW = "attachments_view";
 /** The upload: hand-written, offered with storage to a credential holding `send` (test/raft-attachments-upload.ts holds it). */
 const UPLOAD = "attachments_upload";
 /** What a mount with no snapshot is offered: every tool of the plugin but the assistant's. */
-const fallbackNames = () => raftPlugin.tools.map((t) => t.name).filter((n) => !ASSISTANT.includes(n) && n !== RAFTBENCH_TOOL);
+const APP_TOOLS = GENERATED.filter((op) => appOf(op) !== null).map((op) => op.toolName);
+const fallbackNames = () => raftPlugin.tools.map((t) => t.name).filter((n) => !ASSISTANT.includes(n) && n !== RAFTBENCH_TOOL && !APP_TOOLS.includes(n));
 const toolNamed = (name: string) => raftPlugin.tools.find((t) => t.name === name);
 const opNamed = (name: string) => RAFT_OPERATIONS.find((op) => op.name === name)!;
 /**
@@ -212,6 +213,9 @@ const EXPECTED_GENERATED = [
   "tasks.updateStatus", "tasks.amend", "tasks.history", "tasks.show", "tasks.convert", "tasks.delete", "channels.create", "channels.update", "channels.archive", "channels.unarchive", "channels.addMember", "channels.removeMember", "channels.join", "channels.leave",
   "channels.mute", "channels.unmute", "channels.members", "channels.info", "threads.list", "threads.unfollow", "server.info", "server.update", "labs.list", "labs.setAccess", "labs.setEnrollment", "users.info",
   "profile.show", "profile.update",
+  // SDK 0.31.0: the Artifacts app's operations, listed only where the Server has the app on (`appOf`).
+  "artifacts.list", "artifacts.read", "artifacts.comments", "artifacts.fileContent", "artifacts.publish", "artifacts.comment",
+  "artifacts.follow", "artifacts.unfollow", "artifacts.move", "artifacts.delete", "artifacts.import", "artifacts.saveAttachment",
 ];
 
 await check("every manifest operation is a generated tool or in the exclusion table, never both, and every exclusion names a real operation", async () => {
@@ -434,6 +438,10 @@ const HELD = () => json(200, { ok: true, state: "held", newMessageCount: 1, seen
 // The Server's held envelope as it is sent today: the message, with no conversation fields of its own.
 const HELD_BARE = (extra: Record<string, unknown> = {}) => json(200, { ok: true, state: "held", newMessageCount: 1, seenUpToSeq: 20, omittedMessageCount: 0,
   freshnessContextMode: "inline", heldMessages: [{ seq: 20, id: "abcdef12-0000", channelId: "c-1", content: "a DM body", sender_type: "agent", sender_name: "cody" }], ...extra });
+// A hold whose window leaves one of its two messages out: since SDK 0.31.0 the held text names the read only then
+// (or when bodies are withheld), so this is the hold a check of how that read is written needs.
+const HELD_PARTIAL = () => json(200, { ok: true, state: "held", newMessageCount: 2, seenUpToSeq: 20, omittedMessageCount: 1, freshnessContextMode: "inline",
+  heldMessages: [{ seq: 20, id: "abcdef12-0000", content: "wait, one more thing", sender_type: "human", sender_name: "tygg", channel_name: "general", channel_type: "channel", timestamp: "2026-09-28T10:00:00Z" }] });
 const SENT = (n = 21) => json(200, { ok: true, state: "sent", messageId: `m-${n}`, messageSeq: n });
 
 /**
@@ -510,9 +518,10 @@ await check("a held send is a question for the agent: the SDK's held text as it 
     throw new Error(`the question: ${JSON.stringify(held)}`);
   }
   // What the SDK's text says, so "verbatim" is not satisfied by two empty strings: its opening line, the message, the
-  // read call in tool form; and none of the wording this plugin used to build.
+  // key a resend goes under; and none of the wording this plugin used to build. It names no read: the question shows
+  // every new message, and since SDK 0.31.0 the held text points to a read only when it leaves something out.
   if (!held.question.startsWith("Held — 1 unread message in #general.") || !held.question.includes("wait, one more thing") ||
-      !held.question.includes('messages_read({ target: "#general" })') || /newer message|anyway\?/.test(held.question)) {
+      !held.question.includes('idempotencyKey "k-held"') || held.question.includes("messages_read(") || /newer message|anyway\?/.test(held.question)) {
     throw new Error(`the SDK's held text: ${held.question}`);
   }
   const st = held.state as any;
@@ -649,7 +658,8 @@ await check("the held send's question is the SDK's held text in tool form: what 
   // SDK's. The CLI-style client's text names `raft message read`; the tool-style one, as this plugin makes its
   // clients, names messages_read instead.
   const SENTINEL = "Note: 7341 of these messages formally @mention you.";
-  const held = () => json(200, { ok: true, state: "held", newMessageCount: 1, seenUpToSeq: 20, omittedMessageCount: 0, freshnessContextMode: "inline",
+  // One of the two new messages left out, so the text names the read (SDK 0.31.0 names it only then).
+  const held = () => json(200, { ok: true, state: "held", newMessageCount: 2, seenUpToSeq: 20, omittedMessageCount: 1, freshnessContextMode: "inline",
     mentionAnnotation: { formalMentionCount: 7341 },
     heldMessages: [{ seq: 20, id: "abcdef12-0000", content: "wait, one more thing", sender_type: "human", sender_name: "tygg", channel_name: "general", channel_type: "channel", timestamp: "2026-09-28T10:00:00Z" }] });
   one(held());
@@ -664,7 +674,7 @@ await check("the held send's question is the SDK's held text in tool form: what 
   const asked = await raftPlugin.invoke("messages_send", { target: "#general", content: "done", idempotencyKey: "k-context" }, inTurn(m.ctx)) as any;
   if (!(asked instanceof Interrupt)) throw new Error(`not held: ${JSON.stringify(asked)}`);
   if (asked.question !== sdk.context || !asked.question.includes(SENTINEL) || asked.question.includes("raft message read") ||
-      !asked.question.includes('messages_read({ target: "#general" })')) {
+      !asked.question.includes('messages_read({ target: "#general", before: 20 })')) {
     throw new Error(`the question: ${JSON.stringify(asked.question)}`);
   }
 });
@@ -1958,7 +1968,11 @@ const CONTINUE = /Next \(search older messages\): messages_search\(\{[^\n]*\bcur
 await check("a search Raft stopped with nothing found reaches the model as the SDK's incomplete state and text, with the call that continues it, not as no results", async () => {
   const calls = one(stoppedSearch([]));
   const out = await raftPlugin.invoke("messages_search", { query: "launch plan", sort: "recent" }, inTurn(ctx())) as any;
-  must(calls.length === 1 && new URL(calls[0]!.url).pathname.endsWith("/search"), `request: ${JSON.stringify(calls.map((c) => c.url))}`);
+  // One search; beside it, since SDK 0.31.0, a text search asks whether one artifact matches (`limit=1`), and any
+  // answer but a match (this fake's spent body included) only leaves out the line saying so.
+  const paths = calls.map((c) => new URL(c.url));
+  must(paths[0]?.pathname.endsWith("/search") && paths.filter((u) => u.pathname.endsWith("/search")).length === 1 &&
+    paths.slice(1).every((u) => u.pathname.endsWith("/artifacts") && u.searchParams.get("limit") === "1"), `request: ${JSON.stringify(calls.map((c) => c.url))}`);
   must(out.state === "incomplete", `state: ${JSON.stringify(out)}`);
   must(/^Search incomplete: no matches in the messages searched so far \(stopped after reading 10,000 messages, back to [^)]+\)\. Older messages were not searched, so this does NOT mean no message matches\./.test(out.text),
     `the SDK's sentence: ${out.text}`);
@@ -1997,7 +2011,7 @@ await check("messages_search offers cursor, and the cursor the SDK's text hands 
 /** The operations whose result the manifest says may be large and that page by `limit`: the ones capped here. */
 // users.info's limit is how many visible channels it inspects for memberships: capped, it bounds the result (and,
 // since 0.12.0 asks Raft for one window in one request, how many rosters Raft reads for one call).
-const CAPPED = ["inbox.list", "messages.read", "messages.search", "attachments.comments", "mentions.pending", "server.info", "users.info", "raftbench.findings"];
+const CAPPED = ["inbox.list", "messages.read", "messages.search", "attachments.comments", "artifacts.list", "mentions.pending", "server.info", "users.info", "raftbench.findings"];
 
 await check("a paged result stays under the parking line: limit is capped and defaulted on every operation that pages by it", async () => {
   if (PAGE_ROWS < 1 || PAGE_ROWS * 400 > PARK_BYTES) throw new Error(`PAGE_ROWS=${PAGE_ROWS} against PARK_BYTES=${PARK_BYTES}`);
@@ -2224,6 +2238,40 @@ await check("raftbench_findings is listed only for an agent whose context says r
   must(raftPlugin.tools.some((t) => t.name === RAFTBENCH_TOOL), "the catalogue lost it");
 });
 
+await check("the Artifacts app's tools are listed only where the context's features.enabledApps names artifacts; elsewhere, or on an older Server, quietly none", async () => {
+  const appTools = GENERATED.filter((op) => appOf(op) === "artifacts").map((op) => op.toolName);
+  must(appTools.length === 12 && GENERATED.every((op) => appOf(op) === (op.name.startsWith("artifacts.") ? "artifacts" : null)), `control: ${appTools.join(", ")}`);
+  const listedUnder = async (features: unknown, capabilities = ["read", "send"]) => {
+    one(json(200, {
+      agent: { id: "agent-1", name: "raft-bot", displayName: null, description: null, runtime: "external", external: true },
+      server: { id: "server-1", slug: "s", name: "S" }, credential: { capabilities }, prompt: null,
+      ...(features === undefined ? {} : { features }),
+    }));
+    const listed = await raftPlugin.snapshotTools!(ctx());
+    return { names: listed.tools.map((t) => t.name), skipped: listed.skipped ?? [] };
+  };
+  const on = await listedUnder({ reminderApp: false, vaultApp: false, enabledApps: ["artifacts"] });
+  must(appTools.every((n) => on.names.includes(n)), `on: ${on.names.join(", ")}`);
+  for (const features of [undefined, { reminderApp: false, vaultApp: false }, { reminderApp: true, vaultApp: true, enabledApps: [] }, { reminderApp: false, vaultApp: false, enabledApps: ["artifact", "reminders"] }]) {
+    const off = await listedUnder(features);
+    must(!off.names.some((n) => appTools.includes(n)), `${JSON.stringify(features)}: listed ${off.names.filter((n) => appTools.includes(n)).join(", ")}`);
+    must(!off.skipped.some((x) => appTools.includes(x.name)), `${JSON.stringify(features)}: skipped ${JSON.stringify(off.skipped)}`);
+    // Only the app's tools moved.
+    must(JSON.stringify(off.names) === JSON.stringify(on.names.filter((n) => !appTools.includes(n))), `${JSON.stringify(features)}: ${off.names.join(", ")}`);
+  }
+  // The capability filter still applies with the app on: without send, the app's writes are skipped as any write is.
+  const readOnly = await listedUnder({ reminderApp: false, vaultApp: false, enabledApps: ["artifacts"] }, ["read"]);
+  must(readOnly.names.includes("artifacts_list") && !readOnly.names.includes("artifacts_publish") &&
+    readOnly.skipped.some((x) => x.name === "artifacts_publish"), `read only: ${readOnly.names.join(", ")}`);
+  must(enabledApps({ enabledApps: ["artifacts", 7] }).has("artifacts") && enabledApps(null).size === 0 && enabledApps({ enabledApps: "artifacts" }).size === 0, "enabledApps");
+  // A mount with no snapshot never read the features, so it is not offered them (the fallback).
+  const base: any = { tenantId: "t", agentId: "a", alias: "raft", plugin: "raft" };
+  for (const missing of [null, undefined]) {
+    must(!toolsOf(raftPlugin, { ...base, toolSnapshot: missing }).some((t) => appTools.includes(t.name)), `no snapshot (${missing}) offered them`);
+  }
+  must(raftPlugin.tools.some((t) => t.name === "artifacts_list"), "the catalogue lost it");
+});
+
 await check("a grant revoked (raftbenchReader true -> absent) drops raftbench_findings at the next listing, a grant added brings it back, and a call while not offered is refused as an unknown tool", async () => {
   const store = new SqliteStore(":memory:");
   await store.init();
@@ -2433,7 +2481,7 @@ function context(capabilities: string[]) {
  * tools they reach but `raftbench_findings`, and attachments_view after them wherever the download is.
  */
 const allowedBy = (caps: string[]) => {
-  const generated = GENERATED.filter((op) => op.capability.every((c) => caps.includes(c))).map((op) => op.toolName).filter((n) => n !== RAFTBENCH_TOOL);
+  const generated = GENERATED.filter((op) => appOf(op) === null && op.capability.every((c) => caps.includes(c))).map((op) => op.toolName).filter((n) => n !== RAFTBENCH_TOOL);
   const withView = generated.includes("attachments_download_url") ? [...generated, VIEW] : generated;
   return caps.includes("send") ? [...withView, UPLOAD] : withView;
 };
@@ -2514,7 +2562,8 @@ function hintingServer() {
   globalThis.fetch = (async (url: any) => {
     const path = new URL(String(url)).pathname.replace("/internal/agent-api", "");
     if (path === "/history") return history([historyMessage(41, "one", { attachments: [{ id: "att-9", filename: "plan.pdf" }] })], { has_older: true, target: "#ops" });
-    if (path === "/v2/send" || path === "/tasks/claim" || path === "/tasks/status") return HELD();
+    // Holds that leave a message out: a hold that shows everything names no read (SDK 0.31.0), so no hint to check.
+    if (path === "/v2/send" || path === "/tasks/claim" || path === "/tasks/status") return HELD_PARTIAL();
     if (path === "/server") return server([{ id: "c1", name: "ops", joined: true, type: "channel", description: "Ops" }]);
     if (path === "/channel-members") return json(200, { channel: { ref: "#ops", type: "channel" }, agents: [{ name: "piper", status: "online" }], humans: [{ name: "tygg", role: "owner" }] });
     if (path === "/tasks") return json(200, { tasks: [] });
