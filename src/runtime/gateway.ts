@@ -1696,11 +1696,6 @@ export class ToolGateway {
   }
 
   /**
-   * The context a credential is judged in: the one a call would get, minus a task. `candidate` stands in for the
-   * mount's stored credential, so a value can be judged before anything is written — and before anything that
-   * depends on the stored one, like releasing what it made, has happened.
-   */
-  /**
    * Another of this agent's mounts, as `PluginContext.sibling` hands it: the one lookup, for a call's context and a
    * credential check's alike, so a check sees exactly what a call would and nothing more.
    */
@@ -1732,6 +1727,11 @@ export class ToolGateway {
     };
   }
 
+  /**
+   * The context a credential is judged in: the one a call would get, minus a task. `candidate` stands in for the
+   * mount's stored credential, so a value can be judged before anything is written — and before anything that
+   * depends on the stored one, like releasing what it made, has happened.
+   */
   async #credentialContext(tenantId: string, agentId: string, mount: MountRecord, candidate?: string): Promise<PluginContext> {
     const credential = candidate !== undefined ? candidate
       : mount.secretRef ? await this.#secrets.resolve(mount.secretRef, { tenantId, agentId }) : null;

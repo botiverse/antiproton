@@ -1259,6 +1259,18 @@ await check("a credential check's sibling sees this agent's mounts, and no other
   must(seenBy.raft === true && seenBy.elsewhere === false, JSON.stringify(seenBy));
 });
 
+// A record settles whose a session is, not whether Stamp still takes it (cody): a later check of a fresh session asks.
+await check("a session checked once and revoked at Stamp since does not read as ok at the next check", async () => {
+  reset();
+  const { ctx } = makeCtx(session());
+  must((await stampPlugin.checkCredential!(ctx) as any).ok === true, "the first check did not pass");
+  const again: any = await withMe(null, 401, () => stampPlugin.checkCredential!(ctx));
+  must(again.ok === false && again.kind === "rejected", `after revocation: ${JSON.stringify(again)}`);
+  // And once its access token has expired, the record answers whose it is, and nothing is refreshed to ask.
+  const later: any = await anHourLater(() => stampPlugin.checkCredential!(ctx));
+  must(later.ok === false && later.kind === "unreachable" && refreshes === 0, `expired: ${JSON.stringify(later)}`);
+});
+
 // A plugin default may tighten a mount's policy, never loosen it: an operator who
 // denied writes did not ask for a card whose one click merges.
 await check("a mount-wide write deny stays a refusal, not an approval", async () => {

@@ -963,6 +963,13 @@ export const stampPlugin: Plugin = {
     // before it is kept. So the check asks with the access token it has. Its one
     // write is the agent-level record that whose it is was checked and passed
     // (`VERIFIED_STORE`), and only when it passed.
+    // Whether a record of whose it is existed before this check: one this check writes was settled by asking Stamp
+    // just now; one found already settles ownership only, and says nothing about whether Stamp still takes it.
+    const candidate = parseSession(ctx.credential);
+    const recordOf = async () => candidate && ctx.agentDb
+      ? await ctx.agentDb.get(VERIFIED_STORE, await digest(candidate.refresh_token)).catch(() => null) as Record<string, unknown> | null
+      : null;
+    const before = await recordOf();
     let session: AgentSession | null;
     try { session = await loadSession(ctx, false); } catch (e) {
       if (e instanceof SpentSession) return { ok: false, kind: "rejected", reason: e.message.slice(0, 400) };
@@ -970,10 +977,11 @@ export const stampPlugin: Plugin = {
       throw e;
     }
     if (!session) throw noSession(ctx);
-    // A candidate whose owner this check confirmed (or an earlier one did) is answered from that record: Stamp was
-    // asked once already, with this session's own access token, and an expired one is not refreshed to ask again.
-    if (ctx.credential && parseSession(ctx.credential)?.refresh_token === session.refresh_token && ctx.agentDb) {
-      const rec = await ctx.agentDb.get(VERIFIED_STORE, await digest(session.refresh_token)).catch(() => null) as Record<string, unknown> | null;
+    // A record this check just wrote came from asking Stamp with this session's own access token a moment ago:
+    // answered from it, without asking twice. An older one settles only whose the session is, so a fresh access token
+    // is still put to Stamp below (a session revoked there since must not read as "ok").
+    if (candidate?.refresh_token === session.refresh_token && !before) {
+      const rec = await recordOf();
       if (rec && typeof rec.owner === "string") return { ok: true, account: typeof rec.handle === "string" ? `@${rec.handle}` : undefined };
     }
     if (needsRefresh(session, Date.now(), 0)) {
