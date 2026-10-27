@@ -7,7 +7,7 @@
 // would refuse first.
 //
 //   node test/raft-assistant.ts
-import { GENERATED, RAFTBENCH_TOOL, UNTOLD_UNKNOWN, createRaftPlugin, isAssistantOf, OWNER_ERROR_TEXT_MAX, type AssistantWire, type OwnerAnswer, type OwnerInboxRequest, type OwnerMessagesRequest } from "../src/plugins/raft.ts";
+import { GENERATED, RAFTBENCH_TOOL, appOf, UNTOLD_UNKNOWN, createRaftPlugin, isAssistantOf, OWNER_ERROR_TEXT_MAX, type AssistantWire, type OwnerAnswer, type OwnerInboxRequest, type OwnerMessagesRequest } from "../src/plugins/raft.ts";
 import { toolsOf, type PluginErrorFields } from "../src/plugins/types.ts";
 import { admitTools } from "../src/runtime/mount-tools.ts";
 import { ToolGateway } from "../src/runtime/gateway.ts";
@@ -90,8 +90,8 @@ const firstLine = (s: unknown) => String(s).split("\n")[0];
 
 const CAPS = ["read", "send"];
 /** What a credential with `caps` is listed, on a plugin built with no object storage (so no attachment download). */
-const allowedBy = (caps: string[]) => GENERATED.filter((op) => op.capability.every((c) => caps.includes(c)))
-  // raftbench_findings too: `context` here names no RaftBench reader.
+const allowedBy = (caps: string[]) => GENERATED.filter((op) => appOf(op) === null && op.capability.every((c) => caps.includes(c)))
+  // raftbench_findings too: `context` here names no RaftBench reader; and an app's tools, since it names no app on.
   .map((op) => op.toolName).filter((n) => n !== "attachments_download_url" && n !== RAFTBENCH_TOOL);
 
 /** A message as Raft's history answers carry it (snake_case envelope). */

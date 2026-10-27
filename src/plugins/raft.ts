@@ -2180,6 +2180,23 @@ export const RAFTBENCH_TOOL = "raftbench_findings";
 export function isRaftbenchReader(agent: unknown): boolean {
   return object(agent).raftbenchReader === true;
 }
+
+/**
+ * The Raft first-party app an operation belongs to (SDK 0.31.0's `artifacts.*`), named by the id the credential
+ * context's `features.enabledApps` lists when the Server has it on; null for Raft's own operations. The manifest marks
+ * no app, so the app is the operation's namespace, for the namespaces listed here.
+ */
+const APP_NAMESPACES: ReadonlySet<string> = new Set(["artifacts"]);
+export function appOf(op: Pick<RaftOperationSpec, "name">): string | null {
+  const ns = op.name.split(".")[0]!;
+  return APP_NAMESPACES.has(ns) ? ns : null;
+}
+
+/** The apps the credential context says are on for this Server (`features.enabledApps`); none when absent (an older Server). */
+export function enabledApps(features: unknown): ReadonlySet<string> {
+  const apps = object(features).enabledApps;
+  return new Set(Array.isArray(apps) ? apps.filter((a): a is string => typeof a === "string") : []);
+}
 /**
  * An entry in the basis for the gate: snapshots taken before it listed `raftbench_findings` for every `read`
  * credential, so the entry moves every such mount's basis and the runtime re-takes its list at the next turn, which
@@ -2980,10 +2997,12 @@ export function createRaftPlugin(deps: {
   /** Every tool but a personal assistant's, in the order a mount is offered them. */
   const everyTool: ToolSchema[] = [...OWN_TOOLS, ...generatedTools, ...viewTools, ...uploadTools];
   /**
-   * What a mount with no snapshot is offered: every tool but a personal assistant's (`ASSISTANT_TOOLS`) and
-   * `raftbench_findings`, which a snapshot lists only for a RaftBench reader (`isRaftbenchReader`).
+   * What a mount with no snapshot is offered: every tool but a personal assistant's (`ASSISTANT_TOOLS`),
+   * `raftbench_findings`, which a snapshot lists only for a RaftBench reader (`isRaftbenchReader`), and an app's, which
+   * a snapshot lists only where the Server has the app on (`appOf`): such a mount never read the context that says so.
    */
-  const allTools: ToolSchema[] = everyTool.filter((t) => t.name !== RAFTBENCH_TOOL);
+  const appTools = new Set(generated.filter((op) => appOf(op) !== null).map((op) => op.toolName));
+  const allTools: ToolSchema[] = everyTool.filter((t) => t.name !== RAFTBENCH_TOOL && !appTools.has(t.name));
   /**
    * What this call's mount does not offer, for the hints and the attachment suffix: `unoffered`, plus every generated
    * tool the kernel says this mount is not offered right now (`PluginContext.offered`) — one its credential lacks the
@@ -3226,11 +3245,16 @@ export function createRaftPlugin(deps: {
       const capabilities = new Set(me.data.credential.capabilities);
       // Only literal true counts (`isRaftbenchReader`).
       const reader = isRaftbenchReader(me.data.agent);
+      const apps = enabledApps(me.data.features);
       const tools: ToolSchema[] = [];
       const skipped: Array<{ name: string; reason: string }> = [];
       for (const op of offerable) {
         // Left out with no `skipped` entry, as an assistant's reads are: nearly every agent is not a reader.
         if (op.name === RAFTBENCH_OP && !reader) continue;
+        // An app's operations only where the Server has the app on: elsewhere Raft refuses every call, and the tools
+        // would only take room in the list. No `skipped` entry, as above: it is the Server's setting, not the credential.
+        const app = appOf(op);
+        if (app !== null && !apps.has(app)) continue;
         const missing = op.capability.filter((c) => !capabilities.has(c));
         const named = op.name === DOWNLOAD_OP ? [op.toolName, ...viewTools.map((t) => t.name)] : [op.toolName];
         if (missing.length) for (const name of named) skipped.push({ name, reason: `the credential lacks the Raft capability ${missing.join(", ")}` });
@@ -3779,7 +3803,7 @@ async function readRaftCheck(ctx: PluginContext): Promise<boolean | null> {
   if (!ctx.credential) return null;
   const me = await raftFor(ctx, { state: false }).routes.agent.context();
   if (!me.ok) return null;
-  const of = me.data.agent.assistantOf as Record<string, unknown> | null | undefined;
+  const of = me.data.agent.assistantOf;
   return !!of && of.raftCheck === true;
 }
 
