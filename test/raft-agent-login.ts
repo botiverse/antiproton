@@ -859,6 +859,17 @@ await check("grantAgentLogin rethrows a failure that is not the app being uninst
   must(/did not list this agent's apps/.test(e.message) && w.logins.length === 0, `${e.message}; logins ${w.logins.length}`);
 });
 
+// A miss that Raft answers with a sign-in rather than approval/install is still the caller's not-installed error: the
+// fallback exists for the two answers that name a person's next step, not as a way past a real failure.
+await check("a not-installed miss whose sign-in answers anything else rethrows the not-installed error", async () => {
+  const w = world({ list: { body: { services: [], activeLogins: [] } }, login: "ok" });
+  w.install();
+  const m = mount();
+  const e = await failure(() => m.plugin.grantAgentLogin!(m.ctx, SERVICE.id, "CHALLENGE") as any);
+  must(/No app installed on this Server matched/.test(e.message), e.message);
+  must(w.logins.length === 1 && w.logins[0].service === SERVICE.id, JSON.stringify(w.logins));
+});
+
 globalThis.fetch = originalFetch;
 console.log(`\n  raft agent login\n  ${"─".repeat(56)}`);
 for (const r of results) console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);
