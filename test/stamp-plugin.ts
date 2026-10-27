@@ -960,14 +960,20 @@ await check("api refuses the approve and merge routes, however they are spelled"
 });
 
 // botiverse/antiproton#1092: the bridge will route through this same table, so each
-// spelling below is pinned on its own, as is the mount policy that names api.
-await check("api: an escaped slash, a mixed-case event and a trailing slash are still held", async () => {
+// spelling below is pinned on its own, as is the mount policy that names api. The table
+// lists the routes known to approve or merge; a route not on it is not held.
+await check("api: escaped slashes, a mixed-case event, a trailing slash and DELETE on /api/v3 are still held", async () => {
   reset();
   const { ctx } = makeCtx();
   const held: Array<[string, string, unknown?]> = [
     ["PUT", "/api/v3/repos/o/r/pulls/7%2Fmerge"],
     ["PUT", "/api/v3/repos/o/r/pulls/7%2fmerge"],
     ["PUT", "/api/v3/repos/o/r/pulls%2F7%2Fmerge"],
+    ["PUT", "/api/v3/repos/o/r/pulls/7%252Fmerge"],
+    ["PUT", "/api/v3/repos/o/r/pulls/7/merge?x=1"],
+    // DELETE passes only on /v1/ auto-merge and queue; /api/v3 has no DELETE merge, so it stays held.
+    ["DELETE", "/api/v3/repos/o/r/pulls/7/merge"],
+    ["PATCH", "/v1/repositories/o/r/pulls/7/approve"],
     ["PUT", "/api/v3/repos/o/r/pulls/7/merge/"],
     ["POST", "/api/v3/repos/o/r/pulls/7/reviews", { event: "Approve" }],
     ["POST", "/api/v3/repos/o/r/pulls/7/REVIEWS", { event: "APPROVE" }],

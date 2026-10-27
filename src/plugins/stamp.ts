@@ -895,7 +895,10 @@ function gatewayPath(raw: unknown, allowed: readonly string[]): string {
  */
 function heldRoute(method: string, path: string, body: unknown): "an approval" | "a merge" | null {
   let p = path.split("?", 1)[0];
-  try { p = decodeURIComponent(p); } catch { /* gatewayPath already refused what would matter */ }
+  // Decoded as many times as gatewayPath does: `%252F` is a slash to anything that decodes twice.
+  for (let i = 0; i < 4 && p.includes("%"); i++) {
+    try { p = decodeURIComponent(p); } catch { break; /* gatewayPath already refused what would matter */ }
+  }
   // Empty segments collapsed: `pulls/7//merge` must meet the hold, not a redirect further on.
   p = p.replace(/\/{2,}/g, "/").replace(/\/+$/, "").toLowerCase();
   if (/^\/v1\/repositories\/[^/]+\/[^/]+\/pulls\/[^/]+\/approve$/.test(p)) return "an approval";
