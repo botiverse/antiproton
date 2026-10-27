@@ -981,7 +981,7 @@ await check("an approval the mount lets run does not post its note where pr_comm
   const held = await gatewayMount({ tools: { pr_approve: "allow", pr_comment: "approval" } });
   reset();
   const h = await held("pr_approve", { ...MERGE, note: "why" });
-  must(seen.length === 1 && /needs a person's approval/.test(JSON.stringify(h)), JSON.stringify(h));
+  must(seen.length === 1 && /needs a person's approval on this mount; call pr_comment/.test(JSON.stringify(h)), JSON.stringify(h));
   const open = await gatewayMount({ tools: { pr_approve: "allow" } });
   reset();
   await open("pr_approve", { ...MERGE, note: "why" });
@@ -998,7 +998,7 @@ await check("an approval's note is not posted where a mount-wide write deny cove
   const { ctx } = makeCtx();
   const blind = { ...ctx, async sibling() { return null; } };
   const b: any = await invoke("pr_approve", { repo: "o/r", number: 7, head: HEAD, base: BASE, note: "why" }, blind);
-  must(seen.length === 1 && /not posted/.test(b.commentSkipped ?? ""), JSON.stringify(b));
+  must(seen.length === 1 && /policy could not be read/.test(b.commentSkipped ?? "") && !/refused/.test(b.commentSkipped ?? ""), JSON.stringify(b));
 });
 
 // A replayed call must not post its note twice: the harness replays only what is declared idempotent.

@@ -564,12 +564,13 @@ const DEFAULT_POLICY: MountPolicy = { tools: { pr_approve: "approval", pr_merge:
 /**
  * Whether this mount lets `tool` run without a person — asked by a tool that
  * makes that write by another route (`pr_approve`'s note is a `pr_comment`), so
- * the route does not skip the mount's own policy. Anything but a plain "allow",
- * or a mount that cannot be read, is "no".
+ * the route does not skip the mount's own policy. Anything but a plain "allow"
+ * is "no"; a mount that cannot be read is "unread", told apart because the
+ * caller's next step differs (try again, not ask a person).
  */
-async function mountAllows(ctx: PluginContext, tool: string): Promise<"allow" | "approval" | "deny"> {
+async function mountAllows(ctx: PluginContext, tool: string): Promise<"allow" | "approval" | "deny" | "unread"> {
   const mine = typeof ctx.sibling === "function" ? await ctx.sibling(ctx.alias).catch(() => null) : null;
-  if (!mine) return "deny";
+  if (!mine) return "unread";
   return policyFor(mine.policy, tool, "write", DEFAULT_POLICY);
 }
 
@@ -916,7 +917,11 @@ export const stampPlugin: Plugin = {
         const comment = await mountAllows(ctx, "pr_comment");
         if (comment !== "allow") {
           return { approval: approved, note: String(a.note),
-            commentSkipped: `the note was not posted: pr_comment ${comment === "deny" ? "is refused" : "needs a person's approval"} on this mount` };
+            commentSkipped: comment === "deny"
+              ? "the note was not posted: pr_comment is refused on this mount"
+              : comment === "approval"
+                ? "the note was not posted: pr_comment needs a person's approval on this mount; call pr_comment with it, and a person is asked"
+                : "the note was not posted: this mount's policy could not be read just now; call pr_comment with it to try again" };
         }
         try {
           const comment = (await call("POST", `${prBase(a)}/comments`, ctx, { body: String(a.note) })) as Json;
