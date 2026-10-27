@@ -838,9 +838,7 @@ await check("through the gateway, the session cookie appears in no tool result, 
   must(w.seen.every((r) => !r.headers.authorization || new URL(r.url).origin === RAFT), "the Raft credential left for another host");
 });
 
-globalThis.fetch = originalFetch;
-console.log(`\n  raft agent login\n  ${"─".repeat(56)}`);
-// ---- grantAgentLogin's not-installed fallback, end to end (cody's follow-up to #1086) ----
+// ---- grantAgentLogin's not-installed fallback, end to end (#1086) ----
 
 await check("grantAgentLogin on an app this Server has not installed answers Raft's install_required, through a real sign-in", async () => {
   const w = world({ list: { body: { services: [], activeLogins: [] } }, login: "install" });
@@ -861,6 +859,8 @@ await check("grantAgentLogin rethrows a failure that is not the app being uninst
   must(/did not list this agent's apps/.test(e.message) && w.logins.length === 0, `${e.message}; logins ${w.logins.length}`);
 });
 
+globalThis.fetch = originalFetch;
+console.log(`\n  raft agent login\n  ${"─".repeat(56)}`);
 for (const r of results) console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);
 const passed = results.filter((r) => r.ok).length;
 console.log(`  ${"─".repeat(56)}\n  ${passed} passed, ${results.length - passed} failed\n`);
