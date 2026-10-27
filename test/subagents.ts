@@ -340,9 +340,17 @@ for (const engine of (process.env.ENGINES ?? "pi085,pd").split(",").filter((e) =
     for (let i = 0; i < 6; i++) await pass(w);
     const rows = rowsOf(w);
     must(rows.length === SUBAGENT_CAP && rows.every((r) => r.state === "running"), show(rows));
-    const results = w.requests.filter((r) => r.session === "main")[1]!.req.messages.filter((m: any) => m.role === "tool").map((m: any) => JSON.stringify(m.content));
-    must(results.length === 4 && results.filter((t) => /status\\+":\\+"started/.test(t)).length === 3, show(results));
-    must(/already running, the most this agent may have at once/.test(results[3]!), `the fourth: ${results[3]}`);
+    const results = w.requests.filter((r) => r.session === "main")[1]!.req.messages.filter((m: any) => m.role === "tool")
+      .map((m: any) => ({ call: String(m.tool_call_id), text: JSON.stringify(m.content) }));
+    // A turn's calls run concurrently and each awaits (the child's id digest, the kill switch) before it reaches the cap
+    // in `#sendToAgent` (cf/src/runtime.ts), so the refused one is whichever arrives last, not necessarily c4: the result
+    // is matched to its call by id, and that call must have no row.
+    const started = results.filter((r) => /status\\+":\\+"started/.test(r.text));
+    const refused = results.filter((r) => /already running, the most this agent may have at once/.test(r.text));
+    must(results.length === 4 && started.length === 3 && refused.length === 1, show(results));
+    must(new Set(results.map((r) => r.call)).size === 4 && results.every((r) => /^c[1-4]$/.test(r.call)), `call ids: ${show(results)}`);
+    const rowCalls = rows.map((r) => String(r.call_id)).sort();
+    must(show(rowCalls) === show(started.map((r) => r.call).sort()) && !rowCalls.includes(refused[0]!.call), `rows ${show(rowCalls)}, refused ${refused[0]!.call}`);
   });
 
   await check(`${engine}: a follow-up to the same subagent keeps its history`, async () => {
