@@ -792,15 +792,27 @@ function send(method: string, path: string, token: string, body?: unknown): Prom
  * host and a gateway path only (`gatewayPath`), a 30 s bound (the client sets none), no redirects, this plugin's
  * user agent. The SDK builds `${apiBase}${path}`, so a path that escapes is refused here as well as before the call.
  */
-async function gatewayFetch(url: string | URL, init?: RequestInit): Promise<Response> {
+export async function gatewayFetch(url: string | URL, init?: RequestInit): Promise<Response> {
   const u = new URL(String(url));
   if (u.origin !== ORIGIN) throw new Error(`stamp: the client asked for ${u.origin}, and this plugin talks only to ${ORIGIN}`);
   const headers: Record<string, string> = { ...(init?.headers as Record<string, string> | undefined), "user-agent": "antiproton/0.1" };
   if (init?.body === undefined) delete headers["content-type"];
-  return fetch(new URL(ORIGIN + gatewayPath(u.pathname + u.search, API_PREFIXES)), {
-    ...init, headers, signal: AbortSignal.timeout(30_000), redirect: "error",
-  });
+  try {
+    return await fetch(new URL(ORIGIN + gatewayPath(u.pathname + u.search, API_PREFIXES)), {
+      ...init, headers, signal: AbortSignal.timeout(GATEWAY_TIMEOUT_MS), redirect: "error",
+    });
+  } catch (e) {
+    // The bound is ours, so it is said as ours: the SDK would report the abort by its DOMException number ("23").
+    if ((e as Error)?.name === "TimeoutError") {
+      throw Object.assign(new TypeError("fetch failed"), { cause: { code: GATEWAY_TIMEOUT_CODE } });
+    }
+    throw e;
+  }
 }
+
+/** How long one request to the gateway may take, and the code its expiry is reported under. */
+const GATEWAY_TIMEOUT_MS = 30_000;
+const GATEWAY_TIMEOUT_CODE = "TIMEOUT_30S";
 
 /**
  * The SDK's client for one call, over this mount's session. The SDK sends, retries a 401 once and shapes its
@@ -843,7 +855,11 @@ async function call(method: string, path: string, ctx: PluginContext, body?: unk
       throw new Error(`${method} ${checked} refused ${e.status}: ${detail}${String(message).slice(0, 300)}`);
     }
     if (e instanceof NetworkError) {
-      throw new Error(`stamp: ${method} ${checked} did not reach Stamp (${String(e.details?.cause ?? e.message).slice(0, 120)}). ` +
+      const cause = String(e.details?.cause ?? e.message);
+      const what = cause === GATEWAY_TIMEOUT_CODE
+        ? `got no answer from Stamp within ${GATEWAY_TIMEOUT_MS / 1000} s`
+        : `did not reach Stamp (${cause.slice(0, 120)})`;
+      throw new Error(`stamp: ${method} ${checked} ${what}. ` +
         (method === "GET" ? "Nothing was changed; it is safe to try again." :
           "Whether it took effect is unknown: read the resource before doing it again."));
     }
