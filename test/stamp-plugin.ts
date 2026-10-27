@@ -10,7 +10,7 @@
  * replaced by the spent credential; and approving, merging and `api` wait for a
  * person on a mount that sets no policy (#1051).
  */
-import { stampPlugin, SESSION_STORE, parseSession, loadSession, queuedMounts } from "../src/plugins/stamp.ts";
+import { stampPlugin, SESSION_STORE, parseSession, loadSession, queuedMounts, gatewayFetch } from "../src/plugins/stamp.ts";
 import { SqliteStore } from "../src/store/sqlite.ts";
 import { ToolGateway } from "../src/runtime/gateway.ts";
 import { keepRaftIdentity } from "../src/plugins/raft-identity.ts";
@@ -1511,6 +1511,55 @@ await check("a path that escapes is refused before the SDK sends it", async () =
     must(/must not climb out|must start with/.test(said), `${path}: ${said}`);
   }
   must(seen.length === 0, `reached the gateway: ${JSON.stringify(seen.map((r) => r.path))}`);
+});
+
+// ---- gatewayFetch, the fetch the SDK's client sends with (cody, #1053 follow-ups) ----
+
+await check("the client's fetch never follows a redirect", async () => {
+  reset();
+  const { ctx } = makeCtx();
+  await invoke("whoami", {}, ctx);
+  const inner = globalThis.fetch as any;
+  const asked: string[] = [];
+  globalThis.fetch = (async (input: any, init: any) => {
+    asked.push(String(init?.redirect));
+    // What a real fetch does with redirect "error" on a 3xx; with anything else it would follow.
+    if (init?.redirect === "error") throw new TypeError("fetch failed: unexpected redirect");
+    return new Response("{}", { status: 200 });
+  }) as any;
+  try {
+    const said = await refusal(invoke("pr_view", { repo: "o/r", number: 7 }, ctx));
+    must(asked.length === 1 && asked[0] === "error", `redirect modes: ${JSON.stringify(asked)}`);
+    must(/did not reach Stamp/.test(said), said);
+  } finally { globalThis.fetch = inner; }
+});
+
+await check("the client's fetch refuses any host but the gateway, before sending", async () => {
+  reset();
+  let sent = 0;
+  const inner = globalThis.fetch as any;
+  globalThis.fetch = (async () => { sent++; return new Response("{}"); }) as any;
+  try {
+    for (const url of ["https://evil.example/v1/me", "http://stamp.build/v1/me", "https://stamp.build.evil.example/v1/me"]) {
+      const said = await refusal(gatewayFetch(url, { method: "GET" }));
+      must(/talks only to https:\/\/stamp\.build/.test(said), `${url}: ${said}`);
+    }
+    must(sent === 0, `sent ${sent}`);
+  } finally { globalThis.fetch = inner; }
+});
+
+await check("a request that outlives its 30 s bound is said as a timeout, not as a code", async () => {
+  reset();
+  const { ctx } = makeCtx();
+  await invoke("whoami", {}, ctx);
+  const inner = globalThis.fetch as any;
+  globalThis.fetch = (async () => { throw new DOMException("The operation timed out.", "TimeoutError"); }) as any;
+  try {
+    const read = await refusal(invoke("pr_view", { repo: "o/r", number: 7 }, ctx));
+    must(/no answer from Stamp within 30 s/.test(read) && !/\(23\)/.test(read) && /safe to try again/.test(read), read);
+    const write = await refusal(invoke("pr_comment", { repo: "o/r", number: 7, body: "x" }, ctx));
+    must(/no answer from Stamp within 30 s/.test(write) && /unknown/.test(write), write);
+  } finally { globalThis.fetch = inner; }
 });
 
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.error ? `\n    ${r.error}` : ""}`);
