@@ -153,9 +153,9 @@ type Kept = { kind: "none" } | { kind: "open"; session: AgentSession; owner?: st
  * Written before a credential is first sealed, so a session that has ever been
  * used here — by a removed mount, by another mount — is refused rather than
  * presented again. Grows only when a person signs in, and is never pruned:
- * Stamp checks reuse before expiry (botiverse/stamp `RotateAgentRefreshToken`,
- * `internal/store/agent_cli_login_store.go`, main e3013451) and keeps spent
- * token rows, so a used refresh token presented after it expired is still
+ * Stamp checks reuse before expiry, and keeps spent token rows
+ * (botiverse/stamp `internal/store/agent_cli_login_store.go` `RotateAgentRefreshToken`, as of server-v0.1.194),
+ * so a used refresh token presented after it expired is still
  * `refresh_reused`, which revokes every token of that identity. Past a token's
  * expiry this record is what keeps it from being presented, not the gateway.
  */
