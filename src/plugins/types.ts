@@ -2653,8 +2653,12 @@ export type RouteEntry = {
 } & (
   /** Decided under this key and the bridge tool's own entry, the stricter of the two (`Plugin.policyKey`). */
   | { key: string; refuse?: undefined }
-  /** Never run on the bridge, approved or not: the message says what to use instead. */
-  | { refuse: string; key?: undefined }
+  /**
+   * Never run on the bridge, approved or not: the message says what to use instead. `unsure` is what a refusal
+   * says when the row could not judge the body (`body`) rather than matched it — the row's own message would name
+   * a remedy for a request that may not be the one it refuses; absent, UNJUDGED_BODY.
+   */
+  | { refuse: string; unsure?: string; key?: undefined }
 );
 
 /**
@@ -2696,6 +2700,10 @@ export interface BridgeDecl {
   responseHeaders?: readonly string[];
 }
 
+/** What a refuse row says when it refused a body it could not judge (`RouteEntry.body`), unless the row says otherwise. */
+export const UNJUDGED_BODY = "the body of this request could not be read as a JSON object, so this route refuses it; " +
+  "send it as a JSON object with content-type: application/json";
+
 /** Whether a content-type says JSON: `application/json`, or `application/<anything>+json`, with any parameters. */
 export function isJsonContentType(contentType: string | null | undefined): boolean {
   return typeof contentType === "string" && /^application\/(json|[^\s;/]+\+json)\s*(;|$)/i.test(contentType.trim());
@@ -2733,7 +2741,7 @@ export function classifyRoute(
     if (row.body) {
       // What a row does with a body it cannot judge: a refusal stays a refusal (holding it would let a mount that
       // allows unlisted writes run what the row exists to stop), and a key row holds it for a person.
-      const unsure: RouteClass = row.refuse !== undefined ? { kind: "refused", message: row.refuse } : held;
+      const unsure: RouteClass = row.refuse !== undefined ? { kind: "refused", message: row.unsure ?? UNJUDGED_BODY } : held;
       // A body not sent as JSON is read by upstream some other way, so the predicate's answer — yes or no — is
       // about a reading upstream may not share: a refuse row refuses, and a key row does not apply but holds.
       if (!json) return unsure;

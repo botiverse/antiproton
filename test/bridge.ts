@@ -11,6 +11,7 @@ import { DatabaseSync } from "node:sqlite";
 import { SqliteStore } from "../src/store/sqlite.ts";
 import { ToolGateway, redactedError } from "../src/runtime/gateway.ts";
 import type { BridgeDecl, BridgeRequest, BridgeResponse, Plugin, RouteEntry } from "../src/plugins/types.ts";
+import { UNJUDGED_BODY } from "../src/plugins/types.ts";
 import type { MountPolicy } from "../src/core/types.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
@@ -173,7 +174,7 @@ await check("a refused route ends rejected before any verdict, with one operatio
   const { gw, ops } = await gatewayWith({ write: "allow", tools: { request: "allow", "svc.write": "allow" } }, f.plugin);
   const r: any = await gw.invoke(caller, "svc.request", req("POST", "/v1/repos/o/r/pulls/7/merge/"), program);
   must(r.status === "rejected" && r.error?.code === "route_refused" && /pr_merge/.test(r.error.message), `a merge was not refused: ${JSON.stringify(r)}`);
-  const approve: any = await gw.invoke(caller, "svc.request", req("POST", "/v1/repos/o/r/pulls/7/reviews", '{"event":"approve"}'), program);
+  const approve: any = await gw.invoke(caller, "svc.request", req("POST", "/v1/repos/o/r/pulls/7/reviews", '{"event":"approve"}', { "content-type": "application/json" }), program);
   must(approve.status === "rejected" && approve.error?.code === "route_refused" && /pr_approve/.test(approve.error.message), `an approval review was not refused: ${JSON.stringify(approve)}`);
   const comment: any = await gw.invoke(caller, "svc.request", req("POST", "/v1/repos/o/r/pulls/7/reviews", '{"event":"COMMENT"}', { "content-type": "application/json" }), program);
   must(comment.status === "succeeded", `a comment review was refused or held: ${JSON.stringify(comment)}`);
@@ -416,6 +417,38 @@ for (const [what, contentType, body] of [
   });
   }
 }
+
+await check("a refusal for a body the row could not judge says so, and does not name the row's remedy; a matched one does", async () => {
+  const f = fixture();
+  const { gw } = await gatewayWith(OPEN, f.plugin);
+  for (const contentType of [null, "text/plain"]) {
+    const r: any = await gw.invoke(caller, "svc.request",
+      req("POST", "/v1/repos/o/r/pulls/7/reviews", '{"event":"COMMENT"}', contentType ? { "content-type": contentType } : {}), program);
+    must(r.status === "rejected" && r.error?.code === "route_refused" && r.error.message === UNJUDGED_BODY && !/pr_approve/.test(r.error.message),
+      `${contentType}: ${JSON.stringify(r)}`);
+  }
+  const approve: any = await gw.invoke(caller, "svc.request",
+    req("POST", "/v1/repos/o/r/pulls/7/reviews", '{"event":"APPROVE"}', { "content-type": "application/json" }), program);
+  must(approve.error?.message === "approving is refused on the bridge: call pr_approve", `a matched approval: ${JSON.stringify(approve)}`);
+  must(f.sent.length === 0, "a refused review reached send");
+  const custom = fixture([{ ...ROUTES[1]!, unsure: "send reviews as JSON" } as RouteEntry, ...ROUTES]);
+  const c = await gatewayWith(OPEN, custom.plugin);
+  const r: any = await c.gw.invoke(caller, "svc.request", req("POST", "/v1/repos/o/r/pulls/7/reviews", "event=COMMENT"), program);
+  must(r.error?.message === "send reviews as JSON", `the row's own unsure message: ${JSON.stringify(r)}`);
+});
+
+await check("an answer that cannot be redacted is withheld: the call fails and nothing of the text reaches the result or store", async () => {
+  const f = fixture();
+  f.decl.send = async () => {
+    const headers: Record<string, string> = {};
+    Object.defineProperty(headers, "content-type", { enumerable: true, get() { throw new Error("header getter failed"); } });
+    return { status: 200, headers, text: "ORIGINAL_ANSWER_TEXT" };
+  };
+  const { gw, everything } = await gatewayWith(null, f.plugin);
+  const r: any = await gw.invoke(caller, "svc.request", req("GET", "/v1/x"), program);
+  must(r.status === "failed" && r.error?.message === "the answer could not be redacted, so it was withheld", `the call reads ${JSON.stringify(r)}`);
+  must(!(JSON.stringify(r) + everything()).includes("ORIGINAL_ANSWER_TEXT"), "the answer's text reached the result or the store");
+});
 
 await check("a key row with a body check applies to JSON sent as JSON, and holds the same body sent as text/plain", async () => {
   const f = fixture();
