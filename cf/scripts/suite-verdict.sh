@@ -22,6 +22,19 @@ suite_passed_count() {
   sed 's/\x1b\[[0-9;]*m//g' | grep -oE '^[[:space:]]*[0-9]+(/[0-9]+)? passed' | tail -1 | grep -oE '[0-9]+' | head -1 || true
 }
 
+# typecheck_result FILE: prints the last line of `npm run typecheck`'s output
+# that scripts/typecheck.mjs wrote as its verdict ("typecheck: ..."), or nothing.
+# Not the file's last line: npm writes into the same stream, and its update
+# notice is printed at exit, after the script's output, ending in a bare
+# "npm notice" line that read as "new errors" and stopped a deploy whose
+# typecheck said 0 new (2026-10-27). Whether it appears depends on npm's
+# registry check finishing before the script does. The per-program lines
+# ("typecheck node: ...") also say ", 0 new" and do not match: only the total
+# speaks for both programs.
+typecheck_result() {
+  grep '^typecheck: ' "$1" | tail -1 || true
+}
+
 # suite_removals PREVIOUS_NAMES_FILE ACKNOWLEDGED_FILE WHERE CURRENT_NAMES...
 # prints one line per suite in PREVIOUS that is not in CURRENT and not
 # acknowledged, nothing otherwise. Blank lines and "#" comments are ignored.

@@ -25,8 +25,9 @@
 //   npm run typecheck -- --update worker     rewrite one
 //
 // The last line is the total, and says ", 0 new" only when every program does
-// and the boundary below holds: cf/scripts/verify-and-deploy.sh reads nothing
-// else.
+// and the boundary below holds. Both gates (cf/scripts/verify-and-deploy.sh,
+// cf/scripts/gate.sh) read nothing else: the last line beginning "typecheck: ",
+// found by typecheck_result in cf/scripts/suite-verdict.sh.
 import { spawnSync } from "node:child_process";
 import { readFileSync, writeFileSync, existsSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -202,8 +203,7 @@ const sources = ROOTS.flatMap((r) => (existsSync(r) ? readdirSync(r, { recursive
 const problems = boundary(Object.fromEntries(results.map((r) => [r.name, r])), sources);
 const broken = () => {
   for (const p of problems) console.log(`  BOUNDARY ${p}`);
-  // Deliberately without ", 0 new": the deploy gate greps the last line for
-  // it, and a boundary that is wrong means the counts above mean nothing.
+  // Deliberately without ", 0 new": the gates read this line for it, and a boundary that is wrong means the counts above mean nothing.
   console.log(`typecheck: program boundary broken, ${problems.length} problem(s), not compared`);
   process.exit(1);
 };
