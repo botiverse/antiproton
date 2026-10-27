@@ -9,6 +9,7 @@
  * runtime's plumbing rather than Raft operations. The Raft credential stays in the host plugin and is
  * attached only to the operator-configured Raft origin.
  */
+import { keepRaftIdentity, RAFT_CONTEXT_STORE } from "./raft-identity.ts";
 import { createHash } from "node:crypto";
 import { clip, logEvent, routeOf } from "../core/log.ts";
 import type { Json, MountRecord } from "../core/types.ts";
@@ -372,7 +373,7 @@ const SINCE_KEY = "since";
  * without anyone refreshing the mount. A change then reaches a conversation already under way as a notice, never by
  * rewriting its prompt (src/runtime/prompt-context.ts). Listed: flags, not a credential.
  */
-export const CONTEXT_STORE = "context";
+export const CONTEXT_STORE = RAFT_CONTEXT_STORE;
 export const FEATURES_KEY = "features";
 /**
  * How old the kept flags may grow before a pull reads them again. They are rollout flags, flipped rarely; an hour
@@ -3025,7 +3026,9 @@ export function createRaftPlugin(deps: {
       // (src/plugins/raft-assistant.ts); nothing to carry over.
       // Version 7 added the Raft SDK's app sessions (`INTEGRATION_SESSIONS_STORE`, the assistant's Reminder tool): one
       // sealed row per app, none listed, since each is a credential; nothing to carry over.
-      version: 7, stores: {
+      // Version 8 added which Raft agent the credential is (`RAFT_IDENTITY_KEY` in `CONTEXT_STORE`,
+      // src/plugins/raft-identity.ts); nothing to carry over: the next listing writes it.
+      version: 8, stores: {
         [PUSH_STORE]: { listed: [PUSH_KEY] }, [INBOX_STORE]: { listed: [STATE_KEY, SINCE_KEY] }, [SESSION_STORE]: {}, [INTEGRATION_SESSIONS_STORE]: {},
         [CONTEXT_STORE]: { listed: [FEATURES_KEY, MCP_KEY] },
         [ASSISTANT_STORE]: { listed: [OWNER_KEY, RULES_KEY, CONTACT_KEY, DEFERRED_KEY] }, [REMINDED_STORE]: {},
@@ -3157,6 +3160,9 @@ export function createRaftPlugin(deps: {
       }
       // The same answer carries the Server's flags; kept for the prompt paragraph, which has no credential to ask with.
       await keepFeatures(ctx, me.data.features);
+      // And which Raft agent this credential is, for a plugin that must check a credential it is handed against it
+      // (src/plugins/raft-identity.ts: stamp refuses a session that belongs to another agent).
+      await keepRaftIdentity(ctx, me.data.agent?.id, me.data.server?.id);
       // And whose assistant this is, with the owner's zone, for the brief and the night (src/plugins/raft-assistant.ts).
       await keepOwner(ctx, me.data);
       const capabilities = new Set(me.data.credential.capabilities);

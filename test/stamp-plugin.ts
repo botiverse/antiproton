@@ -10,9 +10,10 @@
  * replaced by the spent credential; and approving, merging and `api` wait for a
  * person on a mount that sets no policy (#1051).
  */
-import { stampPlugin, SESSION_STORE, parseSession, loadSession } from "../src/plugins/stamp.ts";
+import { stampPlugin, SESSION_STORE, parseSession, loadSession, queuedMounts } from "../src/plugins/stamp.ts";
 import { SqliteStore } from "../src/store/sqlite.ts";
 import { ToolGateway } from "../src/runtime/gateway.ts";
+import { keepRaftIdentity } from "../src/plugins/raft-identity.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void> | void) {
@@ -25,6 +26,8 @@ function must(c: unknown, m: string): asserts c { if (!c) throw new Error(m); }
 
 type Seen = { method: string; path: string; auth: string | undefined; body: string };
 let seen: Seen[] = [];
+/** The Authorization of every owner check (`GET /v1/me?purpose=owner-check`) since `reset`. */
+let ownerChecks: Array<string | undefined> = [];
 let refreshes = 0;
 /** Refresh tokens the fake gateway has rotated: presenting one again is `refresh_reused`, as on Stamp. */
 let spentRefresh = new Set<string>();
@@ -34,8 +37,23 @@ let failNextStore = false;
 let failStoreAfterRefresh = false;
 /** Keep the next session write and then report it failed: a write whose answer is lost after it landed. */
 let failNextStoreLate = false;
+/** Which Raft agent this antiproton agent is, as its Raft mount keeps it; Stamp's /v1/me answers the same by default. */
+const RAFT_AGENT = "ra-1";
+const RAFT_SERVER = "rs-1";
+const RAFT_CREDENTIAL = "raft-mount-credential";
+/** A Raft mount's database holding what `GET /context` said, written the way the raft plugin writes it. */
+async function raftMountDb(agentId = RAFT_AGENT, serverId = RAFT_SERVER, credential = RAFT_CREDENTIAL) {
+  const rows = new Map<string, any>();
+  const db: any = {
+    async get(store: string, key: string) { return rows.get(`${store}\u0000${key}`) ?? null; },
+    async put(store: string, value: any, key: string) { rows.set(`${store}\u0000${key}`, value); return key; },
+  };
+  await keepRaftIdentity({ credential, alias: "raft", db } as any, agentId, serverId);
+  return db;
+}
+const RAFT_DB = await raftMountDb();
 const replies: Record<string, unknown> = {
-  "GET /v1/me": { handle: "eleanor", principalType: "agent", serverName: "raft", commitEmail: "raft+eleanor@agents.stamp.build", gitHTTPSURLTemplate: "https://stamp.build/github/{owner}/{repo}.git" },
+  "GET /v1/me": { handle: "eleanor", name: "eleanor", agentId: RAFT_AGENT, serverId: RAFT_SERVER, principalType: "agent", serverName: "raft", commitEmail: "raft+eleanor@agents.stamp.build", gitHTTPSURLTemplate: "https://stamp.build/github/{owner}/{repo}.git" },
   "GET /v1/repositories/o/r/pulls": [{ number: 7, title: "T", state: "open", url: "https://github.com/o/r/pull/7", headSha: "abc" }],
   "GET /v1/repositories/o/r/pulls/7": { number: 7, title: "T", state: "open", body: "why", headSha: "abc", verdict: "NEEDS_REVIEW", stale_url: "x", receipts: [{ id: "z" }] },
   "GET /v1/repositories/o/r/pulls/7/diff": { files: [{ path: "a.ts", additions: 3, deletions: 1, status: "modified", patch: "@@ big @@" }] },
@@ -66,7 +84,9 @@ globalThis.fetch = (async (input: any, init: any) => {
   const method = init?.method ?? "GET";
   const path = url.pathname + (url.search || "");
   const key = `${method} ${url.pathname}`;
-  seen.push({ method, path, auth: init?.headers?.authorization, body: init?.body ?? "" });
+  // The owner check a first use makes is kept apart, so a test counts the calls it is about.
+  if (url.searchParams.get("purpose") === "owner-check") ownerChecks.push(init?.headers?.authorization);
+  else seen.push({ method, path, auth: init?.headers?.authorization, body: init?.body ?? "" });
   if (url.pathname === "/api/auth/agent/refresh") {
     refreshes++;
     const presented = String(JSON.parse(init?.body ?? "{}").refresh_token);
@@ -99,7 +119,10 @@ function makeAgentDb() {
 }
 
 /** A mount's database: one store, in memory, so a test can look at what was kept. */
-function makeCtx(credential: string | null = session(), agentDb: ReturnType<typeof makeAgentDb> | null = makeAgentDb(), alias = "stamp") {
+function makeCtx(
+  credential: string | null = session(), agentDb: ReturnType<typeof makeAgentDb> | null = makeAgentDb(), alias = "stamp",
+  raft: { db: any; credential: string } | null = { db: RAFT_DB, credential: RAFT_CREDENTIAL },
+) {
   const rows = new Map<string, any>();
   const db = {
     async get(store: string, key: string) { return store === SESSION_STORE ? rows.get(key) ?? null : null; },
@@ -118,15 +141,21 @@ function makeCtx(credential: string | null = session(), agentDb: ReturnType<type
     agentDb,
     ctx: { credential, alias, publicConfig: {}, caller: { tenantId: "t", agentId: "a" }, db, ...(agentDb ? { agentDb } : {}),
       // This mount as `sibling` reports it, with no policy of its own.
-      async sibling(name: string) { return name === alias ? { credential, db, plugin: "stamp", policy: null } : null; } } as any,
+      async sibling(name: string) {
+        if (name === alias) return { credential, db, plugin: "stamp", policy: null };
+        return name === "raft" && raft ? { credential: raft.credential, db: raft.db, plugin: "raft", policy: null } : null;
+      } } as any,
   };
 }
 
 const invoke = (tool: string, args: any, ctx: any) => stampPlugin.invoke(tool, args, ctx) as Promise<any>;
-const reset = () => { seen = []; refreshes = 0; spentRefresh = new Set(); };
+const reset = () => { seen = []; ownerChecks = []; refreshes = 0; spentRefresh = new Set(); };
 const HEAD = "a".repeat(40);
 const BASE = "b".repeat(40);
-const expired = () => session({ access_expires_at: new Date(Date.now() - 1000).toISOString() });
+/** Due for a refresh (inside the 60 s skew) but not yet expired, so a first use can still ask whose it is. */
+const expired = () => session({ access_expires_at: new Date(Date.now() + 30_000).toISOString() });
+/** Past its expiry: a first use refuses it rather than refresh before knowing whose it is. */
+const pastExpiry = () => session({ access_expires_at: new Date(Date.now() - 1000).toISOString() });
 const rotatesTo = (n: number) => () => new Response(JSON.stringify({
   schema: "raft-cli-agent-session.v1", access_token: `ACCESS-${n}`, refresh_token: `REFRESH-${n}`,
   access_expires_at: new Date(Date.now() + 15 * 60_000).toISOString(),
@@ -285,7 +314,7 @@ await check("tools declare what the gateway needs to gate them", async () => {
 
 await check("the rotated session is kept sealed, not as plaintext", async () => {
   reset();
-  const { ctx, rows } = makeCtx(session({ access_expires_at: new Date(Date.now() - 1000).toISOString() }));
+  const { ctx, rows } = makeCtx(expired());
   refreshAnswer = () => new Response(JSON.stringify({
     schema: "raft-cli-agent-session.v1", access_token: "ACCESS-2", refresh_token: "REFRESH-2",
     access_expires_at: new Date(Date.now() + 15 * 60_000).toISOString(),
@@ -307,7 +336,7 @@ await check("an access token that is still good is not refreshed", async () => {
 
 await check("concurrent calls share one rotation, because a refresh token is single-use", async () => {
   reset();
-  const { ctx } = makeCtx(session({ access_expires_at: new Date(Date.now() - 1000).toISOString() }));
+  const { ctx } = makeCtx(expired());
   refreshAnswer = () => new Response(JSON.stringify({
     schema: "raft-cli-agent-session.v1", access_token: "ACCESS-3", refresh_token: "REFRESH-3",
     access_expires_at: new Date(Date.now() + 15 * 60_000).toISOString(),
@@ -318,7 +347,7 @@ await check("concurrent calls share one rotation, because a refresh token is sin
 
 await check("a rotation that cannot be stored fails the call and is not used", async () => {
   reset();
-  const { ctx, rows } = makeCtx(session({ access_expires_at: new Date(Date.now() - 1000).toISOString() }));
+  const { ctx, rows } = makeCtx(expired());
   refreshAnswer = () => new Response(JSON.stringify({
     schema: "raft-cli-agent-session.v1", access_token: "ACCESS-4", refresh_token: "REFRESH-4",
     access_expires_at: new Date(Date.now() + 15 * 60_000).toISOString(),
@@ -338,7 +367,7 @@ await check("a rotation that cannot be stored fails the call and is not used", a
 
 await check("refresh_reused is reported as a person's job, and not retried", async () => {
   reset();
-  const { ctx } = makeCtx(session({ access_expires_at: new Date(Date.now() - 1000).toISOString() }));
+  const { ctx } = makeCtx(expired());
   refreshAnswer = () => new Response(JSON.stringify({ error: "refresh_reused" }), { status: 409, headers: { "content-type": "application/json" } });
   let threw = "";
   try { await invoke("whoami", {}, ctx); } catch (e) { threw = String((e as Error).message); }
@@ -447,7 +476,8 @@ await check("checking a candidate credential neither refreshes it nor overwrites
   const candidate = { ...ctx, credential: session({ access_token: "ACCESS-C", refresh_token: "REFRESH-C",
     access_expires_at: new Date(Date.now() - 1000).toISOString() }) };
   const checked: any = await stampPlugin.checkCredential!(candidate);
-  must(checked.ok === false && checked.kind === "unreachable", `expired candidate: ${JSON.stringify(checked)}`);
+  // Whose it is cannot be asked without refreshing it, so it is refused, not refreshed.
+  must(checked.ok === false && checked.kind === "rejected" && /already expired/.test(checked.reason), `expired candidate: ${JSON.stringify(checked)}`);
   must(refreshes === 1, `the check refreshed the candidate (${refreshes})`);
   must(JSON.stringify(rows.get("session")) === live, "the check overwrote the live session");
   seen = [];
@@ -575,17 +605,35 @@ await check("issue_comment needs an issue number", async () => {
 // Finding 5. Through the gateway, the way a call actually arrives: a mount with no
 // policy allowed everything, so approve, merge and `api` ran with nobody there.
 
-/** A stamp mount behind a real gateway, under `policy`. */
-async function gatewayMount(policy: unknown) {
+/** The raft plugin as a sibling sees it: its id, its version pin and its context store; nothing it calls. */
+const RAFT_STUB = { id: "raft", version: "1.0.0", tools: [], async invoke() { return {}; },
+  database: { version: 8, stores: { context: {} } } } as any;
+
+/** A store with this agent's Raft mount, its identity kept as the raft plugin keeps it. */
+async function gatewayStore() {
   const store = new SqliteStore(":memory:");
   await store.init();
   await store.createAgent("t", "a");
+  await store.addMount({
+    tenantId: "t", agentId: "a", alias: "raft", plugin: "raft", installationId: "i-raft", connectionId: null,
+    toolVersion: RAFT_STUB.version, publicConfig: {}, secretRef: "agent:raft", policy: null,
+  });
+  const db = { async put(st: string, value: any, key: string) { store.pluginDb.put({ tenantId: "t", agentId: "a", alias: "raft", plugin: "raft" }, st, key, value, null); return key; } };
+  await keepRaftIdentity({ credential: RAFT_CREDENTIAL, alias: "raft", db } as any, RAFT_AGENT, RAFT_SERVER);
+  return store;
+}
+const gatewayOver = (store: SqliteStore, credential: string) => new ToolGateway(store, [stampPlugin, RAFT_STUB], new Set(["stamp", "raft"]),
+  { async resolve(ref: string) { return ref === "agent:raft" ? RAFT_CREDENTIAL : credential; } });
+
+/** A stamp mount behind a real gateway, under `policy`. */
+async function gatewayMount(policy: unknown) {
+  const store = await gatewayStore();
   await store.addMount({
     tenantId: "t", agentId: "a", alias: "stamp", plugin: "stamp", installationId: "i", connectionId: null,
     toolVersion: stampPlugin.version, publicConfig: {}, secretRef: "agent:stamp", policy: policy as any,
   });
   const credential = session();
-  const gw = new ToolGateway(store, [stampPlugin], new Set(["stamp"]), { async resolve() { return credential; } });
+  const gw = gatewayOver(store, credential);
   return (tool: string, args: Json) => gw.invoke({ tenantId: "t", agentId: "a", taskId: "k" }, `stamp.${tool}`, args) as Promise<any>;
 }
 type Json = any;
@@ -727,7 +775,7 @@ await check("a credential a person gave is still refused after more rotations th
   }), { status: 200, headers: { "content-type": "application/json" } });
   await invoke("whoami", {}, ctx);
   const replaced = { ...ctx, credential: session({ access_token: "ACCESS-N", refresh_token: "REFRESH-N",
-    access_expires_at: new Date(Date.now() - 1000).toISOString() }) };
+    access_expires_at: new Date(Date.now() + 30_000).toISOString() }) };
   for (let i = 0; i < 40; i++) await invoke("whoami", {}, replaced);
   const before = refreshes;
   const back = await refusal(invoke("whoami", {}, { ...ctx, credential: expired() }));
@@ -880,16 +928,14 @@ await check("api refuses the approve and merge routes, however they are spelled"
 // call and to a credential check, and a removed mount does not take it along.
 await check("through the gateway, a mount removed and added back with the same session is refused", async () => {
   reset();
-  const store = new SqliteStore(":memory:");
-  await store.init();
-  await store.createAgent("t", "a");
+  const store = await gatewayStore();
   const add = () => store.addMount({
     tenantId: "t", agentId: "a", alias: "stamp", plugin: "stamp", installationId: "i", connectionId: null,
     toolVersion: stampPlugin.version, publicConfig: {}, secretRef: "agent:stamp", policy: null,
   });
   await add();
   const credential = session();
-  const gw = new ToolGateway(store, [stampPlugin], new Set(["stamp"]), { async resolve() { return credential; } });
+  const gw = gatewayOver(store, credential);
   const caller = { tenantId: "t", agentId: "a", taskId: "k" };
   const first: any = await gw.invoke(caller, "stamp.whoami", {});
   must(first.status === "succeeded", `first: ${JSON.stringify(first)}`);
@@ -996,7 +1042,8 @@ await check("an approval's note is not posted where a mount-wide write deny cove
   must(r.status === "succeeded" && seen.length === 1 && /not posted: pr_comment is refused/.test(JSON.stringify(r)), JSON.stringify(r));
   reset();
   const { ctx } = makeCtx();
-  const blind = { ...ctx, async sibling() { return null; } };
+  // Its own mount cannot be read; its Raft mount can, so the session itself is kept.
+  const blind = { ...ctx, async sibling(name: string) { return name === "stamp" ? null : ctx.sibling(name); } };
   const b: any = await invoke("pr_approve", { repo: "o/r", number: 7, head: HEAD, base: BASE, note: "why" }, blind);
   must(seen.length === 1 && /policy could not be read/.test(b.commentSkipped ?? "") && !/refused/.test(b.commentSkipped ?? ""), JSON.stringify(b));
 });
@@ -1005,6 +1052,84 @@ await check("an approval's note is not posted where a mount-wide write deny cove
 await check("pr_approve is not declared idempotent, since its note is a comment", async () => {
   const tool = stampPlugin.tools.find((t) => t.name === "pr_approve");
   must(tool?.idempotency === "none", `pr_approve idempotency: ${tool?.idempotency}`);
+});
+
+// ---- whose session it is (Ward, Piper, Rex): checked once, before it is kept ----
+
+/** Run `fn` with Stamp's /v1/me answering `me` (or `status`), then put it back. */
+async function withMe<T>(me: Record<string, unknown> | null, status: number, fn: () => Promise<T>): Promise<T> {
+  const was = replies["GET /v1/me"];
+  const st = statuses["GET /v1/me"];
+  if (me) replies["GET /v1/me"] = { ...(was as object), ...me };
+  statuses["GET /v1/me"] = status;
+  try { return await fn(); } finally { replies["GET /v1/me"] = was; if (st === undefined) delete statuses["GET /v1/me"]; else statuses["GET /v1/me"] = st; }
+}
+
+await check("a session whose agent and server are this agent's is kept, with whose it is, and the queue is left empty", async () => {
+  reset();
+  const { ctx, rows } = makeCtx(expired());
+  refreshAnswer = rotatesTo(50);
+  // Bounded only so a deadlock fails this case instead of hanging the file; the assertion is the queue.
+  const done = await Promise.race([invoke("whoami", {}, ctx).then(() => "done"), new Promise((r) => setTimeout(() => r("stuck"), 2000))]);
+  must(done === "done", "the first use did not finish: the owner check waited on the queue it runs in");
+  must(ownerChecks.length === 1 && ownerChecks[0] === "Bearer ACCESS-1", `owner checks: ${JSON.stringify(ownerChecks)}`);
+  must(rows.get("session")?.owner === `${RAFT_AGENT}@${RAFT_SERVER}`, `owner kept: ${rows.get("session")?.owner}`);
+  must(queuedMounts() === 0, `queues left behind: ${queuedMounts()}`);
+  // Never asked again, rotations included: a later whoami answers for a rotated token.
+  await withMe({ agentId: "someone-else" }, 200, async () => {
+    for (let i = 0; i < 3; i++) await invoke("whoami", {}, ctx);
+  });
+  must(ownerChecks.length === 1 && rows.get("session")?.owner === `${RAFT_AGENT}@${RAFT_SERVER}`, `asked again: ${ownerChecks.length}`);
+});
+
+for (const [what, me, why] of [
+  ["another agent", { agentId: "ra-2" }, /belongs to the Stamp agent/],
+  ["another server", { serverId: "rs-2" }, /belongs to the Stamp agent/],
+  ["a CLI agent", { agentId: "cli_7", principalType: "agent" }, /belongs to the Stamp agent/],
+  ["not an agent", { principalType: "human" }, /not a Raft agent's session/],
+] as const) {
+  await check(`a session of ${what} is refused, and nothing is kept or refreshed`, async () => {
+    reset();
+    const { ctx, rows, agentDb } = makeCtx(expired());
+    refreshAnswer = rotatesTo(51);
+    const said = await withMe(me, 200, () => refusal(invoke("whoami", {}, ctx)));
+    must(why.test(said) && /cannot be given to this agent/.test(said), said);
+    must(refreshes === 0 && rows.size === 0 && agentDb!.rows.size === 0 && seen.length === 0, `kept or sent: refreshes=${refreshes}, rows=${rows.size}, given=${agentDb!.rows.size}, sent=${seen.length}`);
+  });
+}
+
+await check("without this agent's Raft identity a session is refused: no Raft mount, or one whose credential changed", async () => {
+  for (const [what, raft] of [
+    ["no raft mount", null],
+    ["a replaced raft credential", { db: RAFT_DB, credential: "another-raft-credential" }],
+  ] as const) {
+    reset();
+    const { ctx, rows } = makeCtx(expired(), makeAgentDb(), "stamp", raft as any);
+    const said = await refusal(invoke("whoami", {}, ctx));
+    must(/cannot be read from its Raft mount/.test(said) && refreshes === 0 && rows.size === 0, `${what}: ${said}`);
+  }
+});
+
+await check("a session already past its expiry is refused without a refresh or an owner check", async () => {
+  reset();
+  const { ctx, rows } = makeCtx(pastExpiry());
+  refreshAnswer = rotatesTo(52);
+  const said = await refusal(invoke("whoami", {}, ctx));
+  must(/already expired/.test(said) && refreshes === 0 && ownerChecks.length === 0 && rows.size === 0, `${said}; refreshes=${refreshes}, checks=${ownerChecks.length}`);
+});
+
+await check("a 401 or no answer from Stamp's whoami is refused, and nothing is kept", async () => {
+  reset();
+  const { ctx, rows, agentDb } = makeCtx(expired());
+  const r401 = await withMe(null, 401, () => refusal(invoke("whoami", {}, ctx)));
+  must(/HTTP 401/.test(r401) && rows.size === 0 && agentDb!.rows.size === 0 && refreshes === 0, r401);
+  const inner = globalThis.fetch as any;
+  globalThis.fetch = (async (input: any, init: any) => String(input).includes("purpose=owner-check")
+    ? Promise.reject(new TypeError("fetch failed: connection refused")) : inner(input, init)) as any;
+  try {
+    const down = await refusal(invoke("whoami", {}, ctx));
+    must(/could not be asked/.test(down) && rows.size === 0 && agentDb!.rows.size === 0 && refreshes === 0, down);
+  } finally { globalThis.fetch = inner; }
 });
 
 // A plugin default may tighten a mount's policy, never loosen it: an operator who

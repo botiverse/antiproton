@@ -6,6 +6,7 @@
  * flag that flips mid-conversation reaches the model as a notice, never by rewriting the prompt
  * (src/runtime/prompt-context.ts). Also the 0.16.0 tool-schema change the generated `actions_prepare` picks up.
  */
+import { raftIdentityOf } from "../src/plugins/raft-identity.ts";
 import {
   CONTEXT_STORE, FEATURES_KEY, FEATURES_REFRESH_MS, FEATURES_TIMEOUT_MS, VAULT_LINE, createRaftPlugin, featuresOf, featuresParagraph, raftPlugin as raftWithoutStorage,
 } from "../src/plugins/raft.ts";
@@ -94,6 +95,20 @@ await check("the listing keeps the flags from the context it already reads, and 
     const said = await raftPlugin.promptContribution!(ctx(db));
     must(said === expect, `features ${JSON.stringify(features)}: ${JSON.stringify(said)}`);
   }
+});
+
+// Which Raft agent the credential is, kept from the same answer for a plugin that checks a credential against it
+// (src/plugins/raft-identity.ts; stamp refuses a session of another agent). Read back the way stamp reads it.
+await check("the listing keeps which Raft agent its credential is, readable only under that credential", async () => {
+  const { db } = mountDb();
+  serve(() => context());
+  await raftPlugin.snapshotTools!(ctx(db));
+  const asSibling = (credential: string) => ({ alias: "stamp", async sibling(name: string) {
+    return name === "raft" ? { credential, db, plugin: "raft", policy: null } : null;
+  } }) as any;
+  const me = await raftIdentityOf(asSibling(CREDENTIAL));
+  must(me?.agentId === "agent-1" && me?.serverId === "server-1", `kept: ${JSON.stringify(me)}`);
+  must(await raftIdentityOf(asSibling("sk_agent_another")) === null, "an identity kept under one credential was read under another");
 });
 
 const tick = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
