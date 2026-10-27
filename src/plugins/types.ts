@@ -589,6 +589,19 @@ export interface PluginContext {
    */
   ownerSecret?(name: string): Promise<string | null>;
   /**
+   * A one-time Agent Login grant for `service`, obtained through this agent's raft mount: the raft plugin signs in to
+   * the app with this agent's Raft identity (Raft Agent Login, reusing an app session it already holds) and asks the
+   * app for a PKCE grant bound to `codeChallenge`. The caller exchanges the grant itself; it never holds the Raft
+   * credential, the app session or the Raft origin (botiverse/antiproton#1084).
+   *
+   * Present only for a plugin that declares the service (`Plugin.agentLogin`); a service it did not declare is
+   * refused. An agent with no usable raft mount answers `unavailable`, and Raft's own `approval_required` /
+   * `install_required` come back as they are; `target` (a channel or thread) is where Raft posts its card for them,
+ * as `integrations_login` does. A thrown error is a failure the caller reports, with
+   * `mayHaveLanded` when the app may have issued a grant.
+   */
+  agentLogin?(service: string, codeChallenge: string, target?: string): Promise<AgentLoginAnswer>;
+  /**
    * Write one trace row of this plugin's own (src/trace/outbox.ts, `PLUGIN_TRACE_KINDS`): a fact only the plugin
    * sees, kept with the agent's other spans and exported with them, where a console line from the object can be
    * dropped. The gateway fills in the time, the agent, the span (this context's operation id, or the mount when it
@@ -2151,6 +2164,18 @@ export interface Plugin {
    * elsewhere such as an `extraPlugins` entry, is outside what it sees).
    */
   readsOwnerSecrets?: true;
+  /**
+   * The services this plugin may obtain an Agent Login grant for (`PluginContext.agentLogin`). Absent: none, and
+   * its contexts have no such method. stamp declares `["stamp"]` and nothing else.
+   */
+  agentLogin?: { services: readonly string[] };
+  /**
+   * Issue the grant `PluginContext.agentLogin` asks for, from this plugin's own credential (the raft plugin). Called
+   * by the gateway only, on the raft mount's own context, with a service the requesting plugin declared. The request
+   * it makes is closed: the app's `agent-login` action with `{schema, code_challenge, code_challenge_method}` and
+   * nothing a caller chose.
+   */
+  grantAgentLogin?(ctx: PluginContext, service: string, codeChallenge: string, target?: string): Promise<AgentLoginAnswer>;
   /** The database each mount of this plugin keeps; see {@link DbSpec}. */
   database?: DbSpec;
   /** What credential it needs, if any. Absent means it never uses one. */
@@ -2532,3 +2557,9 @@ export function policyFor(
 }
 
 const STRICTNESS: Record<PolicyDecision, number> = { allow: 0, approval: 1, deny: 2 };
+
+/** What `PluginContext.agentLogin` answers (botiverse/antiproton#1084). */
+export type AgentLoginAnswer =
+  | { status: "grant"; grant: string; expiresAt: string | null }
+  | { status: "approval_required" | "install_required"; detail: Json }
+  | { status: "unavailable"; reason: string };

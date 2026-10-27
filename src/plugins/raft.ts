@@ -40,7 +40,7 @@ import { AGENT_REF, keyForRef, toAgentRef } from "../store/refs.ts";
 import {
   identityNote, interrupt, markIdentity, originProblem,
   type ActivityEvent, type InboundEvent, type InboundResult, Interrupt, type ListedTools, type Plugin, type PluginContext,
-  type PluginErrorFields, type ToolSchema,
+  type AgentLoginAnswer, type PluginErrorFields, type ToolSchema,
 } from "./types.ts";
 
 const DEFAULT_TIMEOUT_MS = 15_000;
@@ -374,6 +374,11 @@ const SINCE_KEY = "since";
  * rewriting its prompt (src/runtime/prompt-context.ts). Listed: flags, not a credential.
  */
 export const CONTEXT_STORE = RAFT_CONTEXT_STORE;
+
+/** The app action `grantAgentLogin` runs, and the shapes of its request and answer (botiverse/stamp `agentLogin`). */
+const AGENT_LOGIN_ACTION = "agent-login";
+const AGENT_LOGIN_REQUEST_SCHEMA = "raft-cli-agent-login-request.v1";
+const AGENT_LOGIN_GRANT_SCHEMA = "raft-cli-agent-login-grant.v1";
 export const FEATURES_KEY = "features";
 /**
  * How old the kept flags may grow before a pull reads them again. They are rollout flags, flipped rarely; an hour
@@ -3154,6 +3159,26 @@ export function createRaftPlugin(deps: {
      * have in every agent's `mounts` answer. A call to one is still refused (the gateway's unknown tool, and
      * `ownerRead`'s own check behind it).
      */
+    /**
+     * The grant another plugin's `ctx.agentLogin` asks for (botiverse/antiproton#1084), on this mount's own context:
+     * the app's `agent-login` action through Agent Login (`integrationsInvoke`), which uses the app session this mount
+     * already keeps and signs in only when it has none, so Raft's `approval_required` / `install_required` appear the
+     * first time and not every time. The request is closed — this action, these three fields, nothing a caller chose
+     * — so the hook cannot be turned into a way to run any action of any app.
+     */
+    async grantAgentLogin(ctx: PluginContext, service: string, codeChallenge: string, target?: string): Promise<AgentLoginAnswer> {
+      const out = await integrationsInvoke({
+        service, action: AGENT_LOGIN_ACTION, ...(target ? { target } : {}),
+        params: { schema: AGENT_LOGIN_REQUEST_SCHEMA, code_challenge: codeChallenge, code_challenge_method: "S256" },
+      }, ctx, agentLogin(ctx), manifests) as Record<string, any>;
+      if (out?.status === "approval_required" || out?.status === "install_required") return { status: out.status, detail: out as Json };
+      const r = out?.result as Record<string, unknown> | undefined;
+      if (!r || r.schema !== AGENT_LOGIN_GRANT_SCHEMA || typeof r.grant !== "string" || !r.grant) {
+        throw new Error(`raft: ${service} answered agent-login with something that is not a ${AGENT_LOGIN_GRANT_SCHEMA}`);
+      }
+      return { status: "grant", grant: r.grant, expiresAt: typeof r.expires_at === "string" ? r.expires_at : null };
+    },
+
     async snapshotTools(ctx: PluginContext): Promise<ListedTools> {
       if (!ctx.credential) {
         // The apps' sessions belonged to the account the removed credential named (an agent's delete removes it):
