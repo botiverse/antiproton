@@ -118,7 +118,9 @@ function makeAgentDb() {
     rows,
     async get(store: string, key: string) { return rows.get(`${store}\u0000${key}`) ?? null; },
     async put(store: string, value: any, key: string) { rows.set(`${store}\u0000${key}`, value); return key; },
-    async delete(store: string, key: string) { rows.delete(`${store}\u0000${key}`); }, async getAll() { return []; }, async getAllFromIndex() { return []; },
+    async delete(store: string, key: string) { rows.delete(`${store}\u0000${key}`); },
+    async getAll(store: string) { return [...rows].filter(([k]) => k.startsWith(`${store}\u0000`)).map(([, v]) => v); },
+    async getAllFromIndex() { return []; },
     async count() { return 0; }, async transaction(_s: any, _m: any, fn: any) { return fn(this); },
   };
 }

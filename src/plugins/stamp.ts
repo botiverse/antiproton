@@ -152,7 +152,11 @@ type Kept = { kind: "none" } | { kind: "open"; session: AgentSession; owner?: st
  * mount is removed or renamed, and shared by every stamp mount of the agent.
  * Written before a credential is first sealed, so a session that has ever been
  * used here — by a removed mount, by another mount — is refused rather than
- * presented again. Grows only when a person signs in.
+ * presented again. Grows only when a person signs in, and a record whose
+ * refresh token has expired is dropped at the next write (`keepRecord`): such a
+ * session pasted back is still refused here, by its own expired access token
+ * (nothing is refreshed to check whose it is), and could only ever be answered
+ * `refresh_expired` by the gateway, which revokes nothing.
  */
 const GIVEN_STORE = "stampGiven";
 
@@ -337,6 +341,32 @@ async function verifiedOwner(ctx: PluginContext, d: string): Promise<string | nu
   return row.owner;
 }
 
+/**
+ * Write one agent-level record for a session (`GIVEN_STORE`, `VERIFIED_STORE`), then drop that store's records whose
+ * session can no longer be refreshed. Each carries its digest (`d`, the key, so a pruned read can name it) and its
+ * refresh token's expiry (`until`, from `refresh_expires_at`). A record is dropped only when `until` is present and
+ * past: a refresh token past it is answered `refresh_expired`, which is terminal and revokes nothing, so the record no
+ * longer protects anything. A session that names no expiry keeps its record for good, the safe side. Called only after
+ * a write the caller decided to make — a failed check writes nothing, so it prunes nothing either. A failed prune is
+ * left for the next write.
+ */
+async function keepRecord(ctx: PluginContext, store: string, d: string, session: AgentSession, extra: Record<string, unknown>): Promise<void> {
+  const until = typeof session.refresh_expires_at === "string" && Number.isFinite(Date.parse(session.refresh_expires_at))
+    ? session.refresh_expires_at : undefined;
+  const db = givenDb(ctx);
+  await db.put(store, { ...extra, d, at: new Date().toISOString(), ...(until ? { until } : {}) } as unknown as Json, d);
+  try {
+    const now = Date.now();
+    for (const row of await db.getAll(store) as Array<Record<string, unknown>>) {
+      if (typeof row?.d !== "string" || row.d === d || typeof row.until !== "string") continue;
+      const at = Date.parse(row.until);
+      if (Number.isFinite(at) && at < now) await db.delete(store, row.d);
+    }
+  } catch (e) {
+    console.warn(`stamp: old ${store} records were not pruned for mount ${ctx.alias}: ${String((e as Error)?.message ?? e).slice(0, 200)}`);
+  }
+}
+
 /** Whose this session is: a passed check's record for its refresh token, else asked now (fresh access token only). */
 async function ownerFor(ctx: PluginContext, given: AgentSession, d: string): Promise<string> {
   return (await verifiedOwner(ctx, d)) ?? await ownerOf(ctx, given);
@@ -377,7 +407,7 @@ export async function loadSession(ctx: PluginContext, keep = true): Promise<Agen
     // a check that fails writes nothing.
     if (!(await verifiedOwner(ctx, d))) {
       const { owner, handle } = await askOwner(ctx, given);
-      await givenDb(ctx).put(VERIFIED_STORE, { owner, ...(handle ? { handle } : {}), at: new Date().toISOString() }, d);
+      await keepRecord(ctx, VERIFIED_STORE, d, given, { owner, ...(handle ? { handle } : {}) });
     }
     return given;
   }
@@ -399,7 +429,7 @@ export async function loadSession(ctx: PluginContext, keep = true): Promise<Agen
     // and nothing has been sent — unless the row turns out to hold the session
     // after all (a write that failed late), or cannot be read to say: then it
     // stays, and the cost is a sign-in.
-    await givenDb(ctx).put(GIVEN_STORE, { at: new Date().toISOString() }, d);
+    await keepRecord(ctx, GIVEN_STORE, d, given, {});
     try { await storeSession(ctx, given, { owner }); } catch (e) {
       let kept: Kept | null = null;
       try { kept = await readKept(ctx); } catch { /* unread: keep the record */ }
