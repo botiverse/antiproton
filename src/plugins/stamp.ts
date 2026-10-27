@@ -806,23 +806,20 @@ async function gatewayFetch(url: string | URL, init?: RequestInit): Promise<Resp
  * The SDK's client for one call, over this mount's session. The SDK sends, retries a 401 once and shapes its
  * errors; the session stays this file's: `token()` is `accessToken`, so sealing, the rotation mark, `unfinished`,
  * the given and verified records and the queue all apply exactly as they did, and nothing of the SDK's own session
- * handling (`injectedAgentAuth`) is used. `retryToken(used)` rotates only when `used` is the token this client
- * handed out (another call may have rotated since), and answers null — no retry — when the rotation gave the same
- * token back. Reads are not retried by the client (`retryReads: false`): every tool declares its own idempotency,
- * and a write is never resent.
+ * handling (`injectedAgentAuth`) is used. `retryToken(used)` rotates through `accessToken(ctx, true)` and answers
+ * null — no retry — when that gives the same token back. Another call having rotated in the meantime is not this
+ * function's to handle: `rotate` re-reads the session inside the queue (`exclusive`) and returns the newer one
+ * without sending anything. Reads are not retried by the client (`retryReads: false`): every tool declares its own
+ * idempotency, and a write is never resent.
  */
 function clientFor(ctx: PluginContext) {
-  let handed = "";
   return makeClient({
     mode: "agent",
     apiBase: ORIGIN,
-    async token() { handed = (await accessToken(ctx, false)).token; return handed; },
+    async token() { return (await accessToken(ctx, false)).token; },
     async retryToken(used: string) {
-      if (used !== handed) return handed;
       const next = (await accessToken(ctx, true)).token;
-      if (next === used) return null;
-      handed = next;
-      return next;
+      return next === used ? null : next;
     },
   }, gatewayFetch, { retryReads: false });
 }
