@@ -105,7 +105,7 @@ export const TRACE_KINDS = ["model.call", "tool.call", "approval.wait", "contain
   "rebuild.decision", "rebuild.outcome", "rebuild.behaviour", "session.needs_reset", "turn.timing", "turn.end_unrecorded", "import.hold", "model.prewarm",
   "agent.ready", "mount.settings", "subagent.start", "subagent.turn", "subagent.model_changed", "github.refresh", "raft.held", "raft.held_answer", "raft.state_failed", "raft.state_save_failed", "raft.mcp_call",
   "raft.assistant_wake", "raft.assistant_notify", "raft.assistant_rules", "raft.assistant_chat_told", "raft.assistant_send_as_owner", "raft.turn_ended", "raft.assistant_check", "raft.session_unsealable",
-  "appworld.sibling_unset", "raftbench.run_done", "raft.assistant_reminder"] as const;
+  "appworld.sibling_unset", "raftbench.run_done", "raft.assistant_reminder", "raft.assistant_owner"] as const;
 export type TraceKind = (typeof TRACE_KINDS)[number];
 
 /**
@@ -149,11 +149,15 @@ export type TraceKind = (typeof TRACE_KINDS)[number];
  * `raft.assistant_reminder` is one call of the assistant's
  * Reminder tool: `action`, the action's name only when the app's manifest has it, and `outcome` (`actions`, `result`,
  * `approval_required`, `install_required`, `unavailable`, `refused:<why>` or `error:<SDK code>`), never the params, the
- * app's answer or its session (src/plugins/raft-assistant-reminder.ts).
+ * app's answer or its session (src/plugins/raft-assistant-reminder.ts). `raft.assistant_owner` is a credential context
+ * read that changed the assistant's owner record: `kept` (a first record, or any field changed) with `via` (`listing`,
+ * `recheck`), `first`, the stored `language` tag or null, `language_changed`, `timezone_set` and `raftCheck`; or
+ * `dropped` (the context names no owner and a record was there). A read that changes nothing writes none. Never the
+ * owner's id, handle or DM target (src/plugins/raft-assistant.ts `traceOwnerKept`). It is not forwarded.
  */
 export const PLUGIN_TRACE_KINDS = ["raft.held", "raft.held_answer", "raft.state_failed", "raft.mcp_call", "raft.assistant_wake", "raft.assistant_notify",
   "raft.assistant_rules", "raft.assistant_chat_told", "raft.assistant_send_as_owner", "raft.turn_ended", "raft.assistant_check",
-  "raft.session_unsealable", "appworld.sibling_unset", "raftbench.run_done", "raft.assistant_reminder"] as const satisfies readonly TraceKind[];
+  "raft.session_unsealable", "appworld.sibling_unset", "raftbench.run_done", "raft.assistant_reminder", "raft.assistant_owner"] as const satisfies readonly TraceKind[];
 export type PluginTraceKind = (typeof PLUGIN_TRACE_KINDS)[number];
 
 export const TRACE_VERDICTS = ["ok", "failed", "blocked", "cancelled"] as const;

@@ -3713,7 +3713,7 @@ async function readRaftCheck(ctx: PluginContext): Promise<boolean | null> {
 /** Kept by the listing; a failure to keep it must not fail the listing, and leaves the last record as it was. */
 async function keepOwner(ctx: PluginContext, context: OwnerContext): Promise<void> {
   try {
-    await keepOwnerFromContext(ctx, context);
+    await keepOwnerFromContext(ctx, context, "listing");
     // Raft's flag seen on by this listing: the switch-over import goes now, not at the next wake, which may be Raft's
     // first brief (`pushBriefImport`; a failure is kept for the wakes to retry, and never fails the listing).
     await pushBriefImport(ctx, assistantApi, Date.now()).catch(() => null);
@@ -3730,7 +3730,7 @@ async function recheckOwner(ctx: PluginContext): Promise<AssistantOwner | null> 
   if (!ctx.credential) return loadOwner(ctx);
   const me = await raftFor(ctx, { state: false }).routes.agent.context();
   if (!me.ok) return loadOwner(ctx);
-  return keepOwnerFromContext(ctx, me.data);
+  return keepOwnerFromContext(ctx, me.data, "recheck");
 }
 
 /** The plugin as most of the codebase names it: the exclusion table as written, and no object storage, so no download. */

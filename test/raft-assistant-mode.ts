@@ -184,7 +184,7 @@ function reminderApp(r: any, u: URL, init: any): Response {
 /** Raft as an assistant's credential meets it: its context, its owner DM, its events, the owner inbox. */
 function raft(o: { zone?: unknown; owner?: boolean; dm?: unknown; name?: string; language?: unknown } = {}) {
   const r = {
-    owner: o.owner ?? true, zone: "zone" in o ? o.zone : "Europe/Berlin", dm: o.dm, contextStatus: 200,
+    owner: o.owner ?? true, userId: OWNER as string, zone: "zone" in o ? o.zone : "Europe/Berlin", dm: o.dm, contextStatus: 200,
     /** Raft's `assistantOf.language`: absent from the context while undefined, as an older Server leaves it. */
     language: o.language,
     sends: [] as any[], send: "sent" as "sent" | "held", events: [] as unknown[], inbox: 200, contexts: 0,
@@ -228,7 +228,7 @@ function raft(o: { zone?: unknown; owner?: boolean; dm?: unknown; name?: string;
       if (r.contextStatus !== 200) return json(r.contextStatus, { error: "no", code: "forbidden" });
       return json(200, {
         agent: { id: "agent-1", name: "ada-assistant", displayName: null, description: null, runtime: "external", external: true,
-          assistantOf: r.owner ? { userId: OWNER, ...(r.zone !== undefined ? { timezone: r.zone } : {}), ...(r.dm !== undefined ? { dmTarget: r.dm } : {}), ...(o.name ? { name: o.name } : {}), ...(r.raftCheck !== undefined ? { raftCheck: r.raftCheck } : {}), ...(r.language !== undefined ? { language: r.language } : {}) } : null },
+          assistantOf: r.owner ? { userId: r.userId, ...(r.zone !== undefined ? { timezone: r.zone } : {}), ...(r.dm !== undefined ? { dmTarget: r.dm } : {}), ...(o.name ? { name: o.name } : {}), ...(r.raftCheck !== undefined ? { raftCheck: r.raftCheck } : {}), ...(r.language !== undefined ? { language: r.language } : {}) } : null },
         server: { id: "server-1", slug: "s", name: "S" }, credential: { capabilities: ["read", "send", "reactions"] }, prompt: null,
       });
     }
@@ -580,6 +580,56 @@ await check("the listing keeps Raft's language when it is a tag; null, absent (a
   a.r.language = undefined;
   await raftPlugin.snapshotTools!(a.ctx);
   must(a.read(ASSISTANT_STORE, OWNER_KEY).language === null, `after a context without it: ${show(a.read(ASSISTANT_STORE, OWNER_KEY))}`);
+});
+
+await check("a context read that changes the owner record writes one raft.assistant_owner row with the language kept; one that changes nothing writes none; no row names the owner", async () => {
+  const rows = (a: { traced: any[] }) => a.traced.filter((t) => t.kind === "raft.assistant_owner");
+  const a = await assistant(raft({ language: "zh-CN", dm: "dm:@ada~human", name: "ada" }));
+  const first = rows(a);
+  must(first.length === 1 && first[0].status === "kept" && first[0].verdict === "ok", `first listing: ${show(first)}`);
+  must(show(first[0].attrs) === show({ via: "listing", first: true, language: "zh-CN", language_changed: true, timezone_set: true, raftCheck: false }), `first row: ${show(first[0].attrs)}`);
+  // The same context again: the record is the same, so no row.
+  await raftPlugin.snapshotTools!(a.ctx);
+  must(rows(a).length === 1, `an identical listing: ${show(rows(a))}`);
+  // Raft's language moves: one row, with the new tag.
+  a.r.language = "en";
+  await raftPlugin.snapshotTools!(a.ctx);
+  const moved = rows(a);
+  must(moved.length === 2 && moved[1].attrs.language === "en" && moved[1].attrs.language_changed === true && moved[1].attrs.first === false, `a changed language: ${show(moved)}`);
+  // Control: the owner's id, handle and DM are in the stored record the rows describe, and in none of the rows.
+  const kept = a.read(ASSISTANT_STORE, OWNER_KEY);
+  must(kept.userId === OWNER && kept.ownerName === "ada" && kept.dmTarget === "dm:@ada~human", `control: ${show(kept)}`);
+  for (const secret of [OWNER, "ada"]) must(!show(rows(a)).includes(secret), `a row carries ${secret}: ${show(rows(a))}`);
+  // Another person becomes the owner: the stored record is not theirs, so the row is their first.
+  a.r.userId = "0b1c2d3e-4f50-4617-8899-aabbccddeeff";
+  await raftPlugin.snapshotTools!(a.ctx);
+  const handed = rows(a);
+  must(handed.length === 3 && handed[2].attrs.first === true && handed[2].attrs.language_changed === true, `a new owner: ${show(handed)}`);
+});
+
+await check("a paused assistant's recheck that un-pauses writes a raft.assistant_owner row with via recheck; a context naming no owner drops the record with one dropped row, and a second such read writes none", async () => {
+  const rows = (a: { traced: any[] }) => a.traced.filter((t) => t.kind === "raft.assistant_owner");
+  const a = await assistant(raft({ language: "zh-CN", dm: "dm:@ada~human" }));
+  // 403 assistant_not_enabled pauses (`pauseOn`, which writes no row); the next notify asks Raft's context again.
+  a.r.inbox = 403;
+  await raftPlugin.invoke("assistant_owner_inbox", {}, a.ctx).then(() => null, (e) => e);
+  must(typeof a.read(ASSISTANT_STORE, OWNER_KEY).pausedAt === "number", "control: paused");
+  const before = rows(a).length;
+  a.r.inbox = 200;
+  const resumed = await atTime(DAY, () => notify(a.ctx, { items: ITEMS }));
+  must(resumed.state === "sent" && a.read(ASSISTANT_STORE, OWNER_KEY).pausedAt === null, `control: un-paused: ${show(resumed)}`);
+  const rechecked = rows(a).slice(before);
+  must(rechecked.length === 1 && rechecked[0].status === "kept" && rechecked[0].attrs.via === "recheck" && rechecked[0].attrs.first === false &&
+    rechecked[0].attrs.language === "zh-CN" && rechecked[0].attrs.language_changed === false, `the recheck: ${show(rechecked)}`);
+  // The context names no owner: the record goes, with one row that carries only how it was read.
+  a.r.owner = false;
+  const kept = rows(a).length;
+  await raftPlugin.snapshotTools!(a.ctx);
+  must(a.read(ASSISTANT_STORE, OWNER_KEY) === undefined, `control: dropped: ${show(a.read(ASSISTANT_STORE, OWNER_KEY))}`);
+  const dropped = rows(a).slice(kept);
+  must(dropped.length === 1 && dropped[0].status === "dropped" && dropped[0].verdict === "ok" && show(dropped[0].attrs) === show({ via: "listing" }), `dropped: ${show(dropped)}`);
+  await raftPlugin.snapshotTools!(a.ctx);
+  must(rows(a).length === kept + 1, `a second read with no owner: ${show(rows(a).slice(kept))}`);
 });
 
 await check("the owner's chat is told to write to them in Raft's language, else in their latest message's; a send as them keeps the conversation's, in every case, and both give way to the owner", async () => {
