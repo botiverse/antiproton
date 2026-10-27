@@ -22,9 +22,9 @@ import { pluginUnavailableMessage, switchedOffMessage } from "./gateway.ts";
 import { programCallKey } from "./operation-id.ts";
 import { splitView, viewContent, type ViewHost, type ViewMarker } from "./tool-view.ts";
 import type { Json } from "../core/types.ts";
-import type { Continuation, HeldCall, Paused } from "../core/execution.ts";
+import type { BridgeModule, Continuation, HeldCall, Paused } from "../core/execution.ts";
 import type { ToolInterrupt } from "../core/tools.ts";
-import type { ToolReads } from "../plugins/types.ts";
+import type { Plugin, ToolReads } from "../plugins/types.ts";
 import {
   answerProblem, answerSpecOf, type AnswerSpec, type InterruptHost, type RunJsContinuations,
 } from "./run-js-resume.ts";
@@ -250,6 +250,30 @@ export function offersCapability(
   });
 }
 
+/**
+ * The SDK modules a program in this turn may import (`ExecutorHost.bridges`): one per mount the model is offered a
+ * tool of whose plugin declares a bridge (`Plugin.bridge`), so what a program can reach follows what the model can. A
+ * mount is imported as `sdk:<alias>`, and as `sdk:<plugin id>` too where it is the one mount of that plugin offered
+ * and no alias already takes that name — the gateway's own rule for `plugin.tool` (`ToolGateway.resolve`).
+ */
+export function bridgeModulesFor(
+  records: Array<{ alias: string; plugin: string }>,
+  tools: MountedTool[],
+  pluginOf: (id: string) => Pick<Plugin, "bridge"> | undefined,
+): BridgeModule[] {
+  const offered = new Set(tools.map((t) => t.address.split(".")[0]!));
+  const mounts = records.filter((m) => offered.has(m.alias) && pluginOf(m.plugin)?.bridge);
+  const aliases = new Set(mounts.map((m) => m.alias));
+  return mounts.map((m) => {
+    const box = pluginOf(m.plugin)!.bridge!.box;
+    const alone = mounts.filter((o) => o.plugin === m.plugin).length === 1 && (m.plugin === m.alias || !aliases.has(m.plugin));
+    return {
+      specifiers: [`sdk:${m.alias}`, ...(alone && m.plugin !== m.alias ? [`sdk:${m.plugin}`] : [])],
+      alias: m.alias, plugin: m.plugin, files: box.files, entry: box.entry, exports: box.exports,
+    };
+  });
+}
+
 export function qualifyMountedTools<T extends MountedTool>(tools: T[]): T[] {
   const used = new Set<string>();
   return tools.map((t) => {
@@ -431,7 +455,7 @@ async function cancelQuietly(host: ToolHost, i: ToolInterrupt): Promise<string |
  * lost must not be repeated on the agent's behalf.
  */
 export interface Sandbox {
-  execute(source: string, host: { invoke(call: any): Promise<any>; refused?(call: { tool: string | null; code: string }): void }, limits?: unknown): Promise<{
+  execute(source: string, host: { invoke(call: any): Promise<any>; refused?(call: { tool: string | null; code: string }): void; bridges?: readonly BridgeModule[] }, limits?: unknown): Promise<{
     /** An execution's own vocabulary (`ExecutionResult`), which is not a tool
      *  call's. A `string` here let this tool test for a tool call's
      *  "succeeded" — a word no executor has ever returned — so every script
@@ -941,6 +965,8 @@ export function runJsTool(
      *  (`ExecutorHost.refused`). For its `tool.refused` trace row; at most REFUSALS_TOLD a run (gateway refusals are the
      *  gateway's own rows, bounded by the host-call budget instead), and never awaited. */
     onRefused?: (r: { tool: string | null; code: string; callId: string; by: "run_js" | "executor" }) => void;
+    /** The SDK modules a program may import (`bridgeModulesFor`); each request is a host call of `<alias>.request`. */
+    bridges?: readonly BridgeModule[];
   } = {},
 ): AgentHarnessTool<undefined> {
   let seq = 0;
@@ -1013,6 +1039,7 @@ export function runJsTool(
       try {
         r = await sandbox.execute(String(params.source), {
         refused: (c: { tool: string | null; code: string }) => tell(c.tool, c.code, "executor"),
+        ...(opts.bridges?.length ? { bridges: opts.bridges } : {}),
         // A stable key per call inside one execution, so a repeat reaches the
         // same operation rather than minting a new one.
         invoke: (call: any) => {

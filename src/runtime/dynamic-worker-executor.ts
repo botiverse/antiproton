@@ -2,13 +2,14 @@ import { parseTemplateCall } from "../core/tools.ts";
 import type { ToolResult } from "../core/tools.ts";
 import type { Json } from "../core/types.ts";
 import { CANCELLED_NAME, DEFAULT_LIMITS, PAUSE_FACTORY, holdFrom, pauseFrom, tellRefused } from "../core/execution.ts";
-import type { Continuation, ExecutionLimits, ExecutionResult, ExecutorHost, HeldCall, JsExecutor, Paused } from "../core/execution.ts";
+import type { BridgeModule, Continuation, ExecutionLimits, ExecutionResult, ExecutorHost, HeldCall, JsExecutor, Paused } from "../core/execution.ts";
 
 export interface WorkerCode {
   compatibilityDate: string;
   compatibilityFlags?: string[];
   mainModule: string;
-  modules: Record<string, string>;
+  /** A bare string for a name ending in `.js`; `{ js }` for any other name (an `sdk:` specifier). */
+  modules: Record<string, string | { js: string }>;
   env?: Record<string, unknown>;
   globalOutbound?: unknown;
   limits?: { cpuMs?: number; subRequests?: number };
@@ -194,7 +195,86 @@ export async function untilCallsSettle(state: ExecutionState, sent: number, ms: 
   }
 }
 
-const RUNNER = (source: string, maxOutputBytes: number, settleMs: number) => `
+/**
+ * The box's side of the SDK bridge (`ExecutorHost.bridges`): a `fetch` that makes each request one call of
+ * `<alias>.request` through the program's own `tool` tag, bound once by the runner before the program starts. Through
+ * the tag, not `env.TOOLS`, so a bridged call is a host call like any other: counted against the budget, refused after
+ * a pause, and ending the run when it comes back held — the tag throws before this code sees the answer, and an SDK
+ * that catches the throw changes nothing, since the supervisor recorded the hold and the box refuses what follows.
+ *
+ * It answers a real `Response`, for the SDK to read as it reads any: an upstream status with the headers the gateway
+ * kept; a refusal (policy, route, budget) as a 403 whose JSON body carries the gateway's `error`; a call that failed
+ * as a rejected fetch (a TypeError), which an SDK reports as a network error.
+ *
+ * `main.js` imports `bindBox` on its last line, after the program, so the program's lines stay where `PROGRAM_LINE`
+ * says they are; an import is hoisted wherever it sits.
+ */
+const BRIDGE_SHIM = `
+let tag = null;
+export function bindBox(tool) {
+  if (tag) throw new Error("the SDK bridge is already bound");
+  tag = tool;
+}
+const NO_BODY = [101, 204, 205, 304];
+export function gatewayFetch(alias) {
+  const name = [alias + ".request ", ""];
+  return async function fetch(input, init) {
+    init = init || {};
+    let method = "GET", url, body = null;
+    const headers = {};
+    if (typeof Request !== "undefined" && input instanceof Request) {
+      method = input.method;
+      url = input.url;
+      input.headers.forEach((v, k) => { headers[k] = v; });
+      if (method !== "GET" && method !== "HEAD") body = await input.text();
+    } else {
+      url = String(input);
+    }
+    if (init.method) method = String(init.method);
+    if (init.headers) new Headers(init.headers).forEach((v, k) => { headers[k] = v; });
+    if (init.body !== undefined && init.body !== null) {
+      body = typeof init.body === "string" ? init.body : await new Response(init.body).text();
+    }
+    // The path as the SDK wrote it, origin dropped: the gateway owns the host, and folding or decoding is its to do.
+    const path = url.replace(/^[a-z][a-z0-9+.-]*:\\/\\/[^/?#]*/i, "") || "/";
+    if (!tag) throw new TypeError("the SDK bridge is not bound");
+    const res = await tag(name, { method: method.toUpperCase(), path, body, headers });
+    if (res && res.status === "succeeded" && res.result && typeof res.result.status === "number") {
+      const r = res.result;
+      if (r.status < 200 || r.status > 599) throw new TypeError("upstream answered status " + r.status);
+      return new Response(NO_BODY.includes(r.status) ? null : r.text, { status: r.status, headers: r.headers || {} });
+    }
+    if (res && res.status === "rejected") {
+      return new Response(JSON.stringify({ error: res.error }), { status: 403, headers: { "content-type": "application/json" } });
+    }
+    throw new TypeError((res && res.error && res.error.message) || "the bridged request failed");
+  };
+}
+`;
+
+/** Whether a specifier is one the bridge answers: `sdk:` and a name. */
+export const BRIDGE_SPECIFIER = /^sdk:[A-Za-z0-9_.-]+$/;
+
+/**
+ * The modules the box gets besides `main.js` for these bridges: the shim, each plugin's files under `sdk/<plugin>/`,
+ * and one `sdk:…` module per specifier that hands the SDK's exports, made with that mount's `fetch`. A specifier
+ * module is an object with `js`, since the loader takes a bare string only for a name ending in `.js`.
+ */
+export function bridgeModules(bridges: readonly BridgeModule[]): Record<string, string | { js: string }> {
+  const modules: Record<string, string | { js: string }> = { "bridge.js": BRIDGE_SHIM };
+  for (const b of bridges) {
+    for (const [name, src] of Object.entries(b.files)) modules[`sdk/${b.plugin}/${name}`] = src;
+    const made = `import { gatewayFetch } from "bridge.js";\n` +
+      `import make from ${JSON.stringify(`sdk/${b.plugin}/${b.entry}`)};\n` +
+      `const made = make(gatewayFetch(${JSON.stringify(b.alias)}));\n` +
+      `export default made;\n` +
+      b.exports.map((e) => `export const ${e} = made[${JSON.stringify(e)}];\n`).join("");
+    for (const s of b.specifiers) if (BRIDGE_SPECIFIER.test(s)) modules[s] = { js: made };
+  }
+  return modules;
+}
+
+const RUNNER = (source: string, maxOutputBytes: number, settleMs: number, bridged = false) => `
 // The program is a module-level function, so it sees its three globals and
 // nothing of fetch's scope: not env (it could call TOOLS around the tool tag),
 // not the state below (it could unset a pause).
@@ -305,7 +385,7 @@ ${source}
 
 export default {
   async fetch(request, env) {
-    const box = makeBox(env.TOOLS);
+    const box = makeBox(env.TOOLS);${bridged ? " bindBox(box.tool);" : ""}
     try {
       await program(box.tool, box.output, box.pause);
     } catch (e) {
@@ -313,7 +393,7 @@ export default {
     }
     return await box.answer(true);
   }
-};`;
+};${bridged ? '\nimport { bindBox } from "bridge.js";' : ""}`;
 
 /**
  * Whether a load failed because the script itself does not parse: reported as
@@ -427,12 +507,16 @@ export class DynamicWorkerExecutor implements JsExecutor {
       return finish({ status: "interrupted", outputs: [], error: { code, message } });
     };
 
+    const bridged = (host.bridges?.length ?? 0) > 0;
     let running: Promise<Response>;
     try {
       const stub = this.#loader.load({
         compatibilityDate: this.#compatibilityDate,
         mainModule: "main.js",
-        modules: { "main.js": RUNNER(source, limits.maxOutputBytes, limits.wallTimeMs) },
+        modules: {
+          "main.js": RUNNER(source, limits.maxOutputBytes, limits.wallTimeMs, bridged),
+          ...(bridged ? bridgeModules(host.bridges!) : {}),
+        },
         globalOutbound: null,
         env: { TOOLS: this.#makeToolBinding(execId) },
         limits: {
