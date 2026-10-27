@@ -473,6 +473,32 @@ await check("a held write pauses the program; the card names method, path, repos
   must(seen.length === 0, "a held write reached upstream");
 });
 
+await check("a method outside GET, HEAD, POST, PUT, PATCH, DELETE is a bad request, on a refused path and an unlisted one alike", async () => {
+  const m = await mount(OPEN);
+  for (const method of ["FOO", "PROPFIND", "foo", "OPTIONS"]) {
+    for (const path of ["/api/auth/session", "/api/v3/repos/o/r/labels"]) {
+      const r = await m.request(method, path, "{}");
+      must(r.status === "rejected" && r.error?.code === "bad_request" && /method/.test(r.error.message), `${method} ${path}: ${JSON.stringify(r)}`);
+    }
+  }
+  must(seen.length === 0 && (await m.store.listApprovals("t", "pending")).length === 0, `reached upstream or held: ${JSON.stringify(seen)}`);
+  must(/"status":"rejected"/.test(m.everything()) && !/"status":"pending"/.test(m.everything()), "the operations were not ended rejected");
+});
+
+await check("a held request is kept with only the headers that leave the box, and the approved replay runs from it", async () => {
+  const m = await mount(null);
+  const r = await run(m, PROLOGUE + `await stamp("POST", "/api/v3/repos/o/r/labels", { name: "x" });`);
+  must(r.status === "paused", `run: ${JSON.stringify(r)}`);
+  const a = await m.store.listApprovals("t", "pending");
+  const args = (a[0]!.request as any).args;
+  must(JSON.stringify(Object.keys(args.headers).sort()) === '["accept","content-type"]', `the kept headers: ${JSON.stringify(args.headers)}`);
+  must(!JSON.stringify(a).includes("authorization") && !m.everything().includes("Bearer bridge"), "the box's authorization was kept");
+  const done: any = await m.gw.applyApproval("t", a[0]!.operationId, "approved", "owner");
+  must(done.ok && done.executed && done.result?.status === "succeeded", `the replay: ${JSON.stringify(done)}`);
+  must(seen.length === 1 && seen[0]!.method === "POST" && seen[0]!.ct === "application/json" && seen[0]!.auth === `Bearer ${ACCESS_1}`
+    && JSON.parse(seen[0]!.body!).name === "x", `upstream saw ${JSON.stringify(seen)}`);
+});
+
 await check("describe names the repository and number on v1 and v3 pull and issue paths, and nothing elsewhere", () => {
   const d = stampPlugin.bridge!.describe!;
   must(JSON.stringify(d("/v1/repositories/o/r/pulls/7/comments")) === '{"repo":"o/r","pr":7}', "v1 pull");

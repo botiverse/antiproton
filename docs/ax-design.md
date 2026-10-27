@@ -101,7 +101,9 @@ Recorded so the design is not read as a description of today:
     character, or whose path part carries `;`, a percent-escape or anything outside printable
     ASCII, or has an empty, `.` or `..` segment; a path past 2048 characters; a body past 1 MiB
     of UTF-8 (CJK text is three bytes a character, so about a third as many characters); and a
-    header value with CR or LF. It drops a GET's or HEAD's body.
+    header value with CR or LF; and a method other than GET, HEAD, POST, PUT, PATCH or DELETE. It
+    drops a GET's or HEAD's body, and a held request is kept, shown and replayed with only the
+    headers that may leave the box.
   - The plugin's route table then classifies the request, on the path its `normalize` answers
     (without the query or a trailing slash, case-insensitively) and the body as sent. A row with a
     body check that cannot judge the body — not sent as JSON (`application/json`, `…+json`), or

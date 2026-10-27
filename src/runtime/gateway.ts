@@ -285,6 +285,9 @@ const BRIDGE_SCHEMA: ToolSchema = {
   idempotency: "none",
 };
 
+/** The methods a bridged request may use, upper-cased (`bridgeArgs`). */
+const BRIDGE_METHODS = new Set(["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"]);
+
 /** The request a bridge call carries, read from its arguments; an error message when they do not make one. */
 function bridgeArgs(args: Json): { method: string; path: string; body: string | null; headers: Record<string, string> } | string {
   const a = (args && typeof args === "object" && !Array.isArray(args) ? args : {}) as Record<string, unknown>;
@@ -299,6 +302,9 @@ function bridgeArgs(args: Json): { method: string; path: string; body: string | 
     if (bytes > BRIDGE_BODY_MAX_UTF8) return `a bridged request's body is at most ${BRIDGE_BODY_MAX_UTF8} bytes as UTF-8, got ${bytes}`;
   }
   const method = a.method.toUpperCase();
+  // Only the methods an HTTP API routes: a made-up word (`FOO`, `PROPFIND`) is matched by no row, so on a path a table
+  // refuses whole it would be held as an unlisted write rather than refused, and upstream may still act on it.
+  if (!BRIDGE_METHODS.has(method)) return `a bridged request's method is one of ${[...BRIDGE_METHODS].join(", ")}, got ${JSON.stringify(a.method).slice(0, 20)}`;
   const headers: Record<string, string> = {};
   if (a.headers && typeof a.headers === "object" && !Array.isArray(a.headers)) {
     for (const [k, v] of Object.entries(a.headers as Record<string, unknown>)) {
@@ -1197,12 +1203,17 @@ export class ToolGateway {
     // A bridged request is classified on its route before any verdict: a refused route ends here, approved or not,
     // since what a person approved was a request the table now refuses — or one it never should have held.
     let route: { method: string; path: string; body: string | null; headers: Record<string, string> } | null = null;
+    // What a held bridged request is kept as, and replayed from: the request as `bridgeArgs` read it, with only the
+    // headers that may leave the box, so the card and the replay never carry what the box sent besides (a
+    // placeholder `authorization`). The path as the box wrote it: the replay normalizes it again.
+    let kept: Json = args;
     let key: string | null | false;
     let side: "read" | "write";
     if (bridge) {
       const parsed = bridgeArgs(args);
       let refusal: ToolError | null = typeof parsed === "string" ? { code: "bad_request", message: parsed } : null;
       if (typeof parsed !== "string") {
+        kept = { method: parsed.method, path: parsed.path, body: parsed.body, headers: { ...parsed.headers } };
         try {
           route = { ...parsed, path: bridge.normalize ? bridge.normalize(parsed.path) : parsed.path };
         } catch (e) {
@@ -1277,7 +1288,7 @@ export class ToolGateway {
         // decided under, so an owner who allowed the tool sees which setting is still missing; `route` is what a person
         // signs for a bridged request, since its arguments are an SDK's, not a sentence.
         request: {
-          tool: raw, args, heldBy: confirm ? "agent" : "policy",
+          tool: raw, args: kept, heldBy: confirm ? "agent" : "policy",
           ...(typeof key === "string" && key !== r.tool ? { policyKey: key } : {}),
           ...(bridge && route ? { route: routeCard(bridge, route) } : {}),
         },

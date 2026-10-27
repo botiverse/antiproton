@@ -1113,8 +1113,8 @@ const SEG = "[^/]+";
 const V1_REPO = `^/v1/repositories/${SEG}/${SEG}`;
 const V3_REPO = `^/api/v3/repos/${SEG}/${SEG}`;
 const re = (s: string) => new RegExp(s);
-/** Every method a row that refuses a whole path means: an unusual method word no row lists is an unlisted write. */
-const ANY = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "TRACE", "CONNECT"] as const;
+/** Every method a row that refuses a whole path means: the six the core lets a bridged request use (`bridgeArgs`). */
+const ANY = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"] as const;
 const WRITES = ["POST", "PUT", "PATCH", "DELETE"] as const;
 
 /**
