@@ -1344,7 +1344,8 @@ export type PersonResolve = (ctx: PluginContext, name: string) =>
 /**
  * Raft's read by the name the owner gave (`GET /assistant/owner-resolve?name=`), its body as Raft sent it: what the body
  * names is the caller's to check. `unknown` is Raft's 404 for the name, `unavailable` the route not being there (a Raft
- * from before it), `failed` any other failure.
+ * from before it), `failed` any other failure; `httpStatus` is Raft's status for a failure that had one, the 404s'
+ * included.
  */
 export type OwnerResolveRead = (ctx: PluginContext, name: string) =>
   Promise<{ ok: true; data: Record<string, unknown> } | { ok: false; reason: "unknown" | "unavailable" | "failed"; httpStatus?: number }>;
@@ -1810,9 +1811,12 @@ type Resolved = { channelId: string; parentMessageId?: string; where: string };
 /**
  * How a target was resolved, for the trace row: `resolved_by` (`id`, `resolve` for Raft's read by name, `inbox`, or
  * `none` when it was not), and for an inbox read how much was read and whether the read stopped at its bound with more
- * left. Counts and words only, never a name or an id.
+ * left. `resolve_status`, for a `#name` or `#name:id` target and a channelId, is the HTTP status Raft answered its read
+ * by name with (200 for any answer that came back), and null when Raft was not asked (a channelId, no such read) or the
+ * failure had no status: it tells apart what `inbox` merges, a 404, another 4xx, and no read at all. Counts and words
+ * only, never a name or an id.
  */
-type HowResolved = { resolved_by: "id" | "resolve" | "inbox" | "none"; rows_read?: number; pages_read?: number; bound_hit?: boolean };
+type HowResolved = { resolved_by: "id" | "resolve" | "inbox" | "none"; rows_read?: number; pages_read?: number; bound_hit?: boolean; resolve_status?: number | null };
 
 /** A channel's id from Raft's read by name, when the body is a channel's: any other type, or no well-formed id, is not one. */
 function channelOfResolve(data: Record<string, unknown>): { id: string; name: string | null } | null {
@@ -1831,7 +1835,7 @@ function channelOfResolve(data: Record<string, unknown>): { id: string; name: st
  * was read, or else a read around its short id. A string is the local refusal's code.
  */
 async function resolveTarget(target: string, inThread: boolean, ctx: PluginContext, deps: SendAsOwnerDeps, selfName: string | null): Promise<{ to: Resolved | SendResult; how: HowResolved }> {
-  if (UUID.test(target)) return { to: { channelId: target, where: "that conversation" }, how: { resolved_by: "id" } };
+  if (UUID.test(target)) return { to: { channelId: target, where: "that conversation" }, how: { resolved_by: "id", resolve_status: null } };
   const nameOfRow = (r: InboxItem) => r.channelName?.replace(/^#/, "").toLowerCase() ?? null;
   const counts = (read: { rows: InboxItem[]; pages: number; more: boolean }, pages: number) =>
     ({ rows_read: read.rows.length, pages_read: read.pages, bound_hit: read.more && read.pages >= pages });
@@ -1861,18 +1865,19 @@ async function resolveTarget(target: string, inThread: boolean, ctx: PluginConte
   // falls back to the inbox rows.
   const refusedLookup = !said.ok && said.reason === "failed" &&
     !(typeof said.httpStatus === "number" && said.httpStatus >= 400 && said.httpStatus < 500 && said.httpStatus !== 403 && said.httpStatus !== 429);
-  if (refusedLookup) return { to: "resolve_failed", how: { resolved_by: "none" } };
+  const resolve_status = said.ok ? 200 : said.httpStatus ?? null;
+  if (refusedLookup) return { to: "resolve_failed", how: { resolved_by: "none", resolve_status } };
   const hit = said.ok ? channelOfResolve(said.data) : null;
   if (hit) {
     channelId = hit.id;
     name = hit.name ?? name;
-    how = { resolved_by: "resolve" };
+    how = { resolved_by: "resolve", resolve_status };
   } else {
     const read = await readConversations(ctx, deps.inbox, SEND_CHANNEL_PAGES);
-    if (!read) return { to: "inbox_unreadable", how: { resolved_by: "none" } };
+    if (!read) return { to: "inbox_unreadable", how: { resolved_by: "none", resolve_status } };
     rows = read.rows;
     const row = rows.find((r) => r.channelType !== "dm" && nameOfRow(r) === name && (r.kind !== "thread" || r.parentChannelId));
-    how = { resolved_by: row ? "inbox" : "none", ...counts(read, SEND_CHANNEL_PAGES) };
+    how = { resolved_by: row ? "inbox" : "none", ...counts(read, SEND_CHANNEL_PAGES), resolve_status };
     // Stopped at the bound with more left: the channel may be past it, so this is not said to be no channel.
     if (!row) return { to: how.bound_hit ? "channel_beyond_read" : "channel_unknown", how };
     channelId = row.kind === "thread" ? row.parentChannelId! : row.channelId;
@@ -1916,7 +1921,7 @@ export async function sendAsOwner(args: unknown, ctx: PluginContext, deps: SendA
   const content = typeof a.content === "string" ? a.content : "";
   const kind = UUID.test(target) ? "channel_id" : MESSAGE_REF.test(target) ? "message" : CHANNEL_TARGET.test(target) ? "channel" : PERSON_TARGET.test(target) ? "dm" : "other";
   const inThread = kind === "message" && a.inThread !== false;
-  const trace = (result: string, extra: Record<string, number | string | boolean> = {}) => {
+  const trace = (result: string, extra: Record<string, number | string | boolean | null> = {}) => {
     const row = { result, target_kind: kind, in_thread: inThread, chars: content.length, ...extra };
     const verdict = result === "sent" ? "ok" : result.startsWith("refused:") ? "blocked" : "failed";
     ctx.trace?.({ kind: "raft.assistant_send_as_owner", status: result, verdict, attrs: row });
@@ -1940,7 +1945,7 @@ export async function sendAsOwner(args: unknown, ctx: PluginContext, deps: SendA
     trace("refused:no_owner");
     throw refusal(`${SEND_AS_OWNER_TOOL}: this agent is not anyone's assistant now`);
   }
-  const notSent = (result: Exclude<SendResult, "sent">, extra: Record<string, number | string | boolean> = {}): Json => {
+  const notSent = (result: Exclude<SendResult, "sent">, extra: Record<string, number | string | boolean | null> = {}): Json => {
     trace(result === "uncertain" || result === "failed" || result === "resolve_failed" ? result : `refused:${result}`, extra);
     const t = TELL[result];
     return {
@@ -1985,6 +1990,8 @@ export async function sendAsOwner(args: unknown, ctx: PluginContext, deps: SendA
   if (result === "uncertain") { await noteSent(); await noteSentAsOwner(ctx).catch(() => {}); }
   if (result === "rate_limited") await ctx.db.put(ASSISTANT_STORE, { key: sendKey, at: now } as unknown as Json, SEND_LIMITED_KEY);
   if (result === "assistant_not_enabled") await pauseOn(ctx, new Error(NOT_ENABLED));
+  // `how` never carries `http_status`: that key is the POST's status, and this spread would let it replace any status of
+  // the read by name put there without a word, which is why that one has its own name, `resolve_status`.
   return notSent(result, { ...how, ...(out.status !== null ? { http_status: out.status } : {}) });
 }
 

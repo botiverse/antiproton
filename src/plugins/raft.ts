@@ -3661,7 +3661,7 @@ export const readOwnerResolve: OwnerResolveRead = async (ctx, name) => {
     return { ok: true, data };
   } catch (e) {
     const err = e as { httpStatus?: unknown; code?: unknown };
-    if (err.httpStatus === 404) return { ok: false, reason: err.code === undefined || err.code === "NOT_FOUND" ? "unavailable" : "unknown" };
+    if (err.httpStatus === 404) return { ok: false, reason: err.code === undefined || err.code === "NOT_FOUND" ? "unavailable" : "unknown", httpStatus: 404 };
     await pauseOn(ctx, e).catch(() => {});
     return { ok: false, reason: "failed", ...(typeof err.httpStatus === "number" ? { httpStatus: err.httpStatus } : {}) };
   }

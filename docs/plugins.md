@@ -1090,8 +1090,10 @@ without the text, since it may have landed. Each call writes a `raft.assistant_s
 them), `target_kind` (`message`, `channel`, `dm`, `channel_id`), `in_thread`, `chars` (the message's
 length), Raft's HTTP status as `http_status`, and how the target was resolved: `resolved_by` (`id`,
 `resolve`, `inbox`, or `none` when it was not), with `rows_read`, `pages_read` and `bound_hit` wherever
-the inbox was read; never the message, a name or an id. The trace export forwards only the fields the
-receiver keeps, which do not include these four yet.
+the inbox was read, and for a `#channel` target or a channelId `resolve_status`: the HTTP status Raft
+answered its read by name with (200 for any answer), null when Raft was not asked or gave no status; never
+the message, a name or an id. The trace export forwards only the fields the receiver keeps, which do not
+include these five yet.
 
 An assistant's one Raft app is the Reminder app (Raft offers an assistant no other, slock#10764), used
 through `assistant_reminder`, offered in the chat only (`src/plugins/raft-assistant-reminder.ts`) and
