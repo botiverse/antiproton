@@ -409,8 +409,7 @@ export type OwnerRead = "listing" | "recheck";
  * not whose.
  */
 function traceOwnerKept(ctx: PluginContext, before: AssistantOwner | null, after: AssistantOwner, via: OwnerRead): void {
-  const was = before as unknown as Record<string, unknown> | null;
-  const changed = !was || Object.entries(after).some(([k, v]) => JSON.stringify(was[k]) !== JSON.stringify(v));
+  const changed = !before || (Object.keys(after) as Array<keyof AssistantOwner>).some((k) => JSON.stringify(before[k]) !== JSON.stringify(after[k]));
   if (!changed) return;
   ctx.trace?.({
     kind: "raft.assistant_owner", status: "kept", verdict: "ok",
