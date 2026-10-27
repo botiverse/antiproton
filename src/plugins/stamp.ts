@@ -892,10 +892,16 @@ function gatewayPath(raw: unknown, allowed: readonly string[]): string {
  * as Stamp will route it — decoded, empty segments and a trailing slash
  * dropped, any case — so a
  * spelling that reaches the same route is the same route. Null: not held.
+ * The list is of routes known to approve or merge, not of every spelling: one that
+ * stays encoded past Stamp's routing (`merge%3Fx`, `merge%2520`) is a different
+ * route there and is not held. `..` in any spelling never gets here: gatewayPath
+ * refuses a path that climbs out.
  */
 function heldRoute(method: string, path: string, body: unknown): "an approval" | "a merge" | null {
   let p = path.split("?", 1)[0];
-  // Decoded as many times as gatewayPath does: `%252F` is a slash to anything that decodes twice.
+  // Decoded at least as many times as anything upstream would, so `%252F` cannot slip past
+  // as a slash decoded twice. gatewayPath decodes four times for its own dot-segment
+  // check; the counts match, but neither one depends on the other.
   for (let i = 0; i < 4 && p.includes("%"); i++) {
     try { p = decodeURIComponent(p); } catch { break; /* gatewayPath already refused what would matter */ }
   }
