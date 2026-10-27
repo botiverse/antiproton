@@ -363,7 +363,7 @@ async function keepRecord(ctx: PluginContext, store: string, d: string, session:
       if (Number.isFinite(at) && at < now) await db.delete(store, row.d);
     }
   } catch (e) {
-    console.warn(`stamp: old ${store} records were not pruned for mount ${ctx.alias}: ${String((e as Error)?.message ?? e).slice(0, 200)}`);
+    console.warn(`stamp: old ${store} records were not pruned for this agent (agent-level, every stamp mount): ${String((e as Error)?.message ?? e).slice(0, 200)}`);
   }
 }
 
