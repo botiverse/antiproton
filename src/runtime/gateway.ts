@@ -4,7 +4,7 @@ import type { Json, MountPolicy, MountRecord, OperationStatus, PolicyDecision } 
 import { AGENT_REF, agentRef, isAgentRef, KEPT_NAME, KEPT_PREFIX, OWNER_PREFIX, secretRefKind } from "./secrets.ts";
 import type { ToolError, ToolResult } from "../core/tools.ts";
 import { parseToolRef } from "../core/tools.ts";
-import type { Plugin, PluginContext, PluginNext, PromptPart, MountActivity, MountUsage, InboundEvent, InboundHooks, InboundResult, HeldListing, HeldRead, ListedTools, TurnEnd } from "../plugins/types.ts";
+import type { Plugin, PluginContext, PluginDatabase, PluginNext, PromptPart, MountActivity, MountUsage, InboundEvent, InboundHooks, InboundResult, HeldListing, HeldRead, ListedTools, TurnEnd } from "../plugins/types.ts";
 import type { TurnEndEvent } from "./activity.ts";
 import { type ActivityEvent, type SandboxForm, holdingOf, backgroundOf, isExclusive } from "../plugins/types.ts";
 import { Backgrounded, Interrupt, interruptsOf } from "../plugins/types.ts";
@@ -1274,31 +1274,7 @@ export class ToolGateway {
       // A mount's own hooks, and only for a plugin that can take what they carry.
       ...(this.#inbound && plugin?.receive
         ? { inbound: this.#inbound(ctx.tenantId, ctx.agentId, mount.alias) } : {}),
-      sibling: async (alias: string) => {
-        // Only this agent's own mounts: never a lookup by tenant or by plugin.
-        const other = await store.getMountByAlias(ctx.tenantId, ctx.agentId, alias);
-        if (!other) return null;
-        // Only a mount the agent could call: refused as `invoke` refuses it. A mount being removed, or whose plugin
-        // is not installed, is switched off, or is pinned to another version than the registry's, has its calls
-        // refused, and its credential must not reach it by another plugin's route. Refused as "no such mount" —
-        // not even the plugin's name — since every caller already handles null (PluginContext.sibling).
-        if (this.#removing.has(`${ctx.tenantId}/${ctx.agentId}/${alias}`)) return null;
-        const otherPlugin = this.#plugins.get(other.plugin);
-        if (!otherPlugin) return null;
-        const choices = await store.pluginChoices(ctx.tenantId, ctx.agentId);
-        if (!pluginEnabled(this.#seeded.has(other.plugin), choices[other.plugin])) return null;
-        if (otherPlugin.version !== other.toolVersion) return null;
-        return {
-          credential: other.secretRef
-            ? await secrets.resolve(other.secretRef, { tenantId: other.tenantId, agentId: other.agentId })
-            : null,
-          // The sibling's null is ambiguous in exactly the same three ways as this mount's.
-          credentialRefKind: secretRefKind(other.secretRef),
-          db: db(other),
-          plugin: other.plugin,
-          policy: other.policy ?? null,
-        };
-      },
+      sibling: (alias: string) => this.#sibling(ctx, alias, db),
       // Found by what each plugin declares, so the container never matches a plugin's name or an alias.
       sandboxForms: async () => {
         const choices = await store.pluginChoices(ctx.tenantId, ctx.agentId);
@@ -1724,6 +1700,38 @@ export class ToolGateway {
    * mount's stored credential, so a value can be judged before anything is written — and before anything that
    * depends on the stored one, like releasing what it made, has happened.
    */
+  /**
+   * Another of this agent's mounts, as `PluginContext.sibling` hands it: the one lookup, for a call's context and a
+   * credential check's alike, so a check sees exactly what a call would and nothing more.
+   */
+  async #sibling(ctx: { tenantId: string; agentId: string }, alias: string, db: (m: MountRecord) => PluginDatabase) {
+    const store = this.#store;
+    const secrets = this.#secrets;
+    // Only this agent's own mounts: never a lookup by tenant or by plugin.
+    const other = await store.getMountByAlias(ctx.tenantId, ctx.agentId, alias);
+    if (!other) return null;
+    // Only a mount the agent could call: refused as `invoke` refuses it. A mount being removed, or whose plugin
+    // is not installed, is switched off, or is pinned to another version than the registry's, has its calls
+    // refused, and its credential must not reach it by another plugin's route. Refused as "no such mount" —
+    // not even the plugin's name — since every caller already handles null (PluginContext.sibling).
+    if (this.#removing.has(`${ctx.tenantId}/${ctx.agentId}/${alias}`)) return null;
+    const otherPlugin = this.#plugins.get(other.plugin);
+    if (!otherPlugin) return null;
+    const choices = await store.pluginChoices(ctx.tenantId, ctx.agentId);
+    if (!pluginEnabled(this.#seeded.has(other.plugin), choices[other.plugin])) return null;
+    if (otherPlugin.version !== other.toolVersion) return null;
+    return {
+      credential: other.secretRef
+        ? await secrets.resolve(other.secretRef, { tenantId: other.tenantId, agentId: other.agentId })
+        : null,
+      // The sibling's null is ambiguous in exactly the same three ways as this mount's.
+      credentialRefKind: secretRefKind(other.secretRef),
+      db: db(other),
+      plugin: other.plugin,
+      policy: other.policy ?? null,
+    };
+  }
+
   async #credentialContext(tenantId: string, agentId: string, mount: MountRecord, candidate?: string): Promise<PluginContext> {
     const credential = candidate !== undefined ? candidate
       : mount.secretRef ? await this.#secrets.resolve(mount.secretRef, { tenantId, agentId }) : null;
@@ -1732,7 +1740,9 @@ export class ToolGateway {
       alias: mount.alias,
       credential, publicConfig: mount.publicConfig, db: this.#db({ tenantId, agentId }, mount),
       agentDb: this.#agentDb({ tenantId, agentId }, mount),
-      async sibling() { return null; },
+      // The same lookup a call's context has (`#sibling`): a check may need to read another of this agent's mounts
+      // (stamp reads which Raft agent this is from the raft mount), and it sees no more than a call would.
+      sibling: (alias: string) => this.#sibling({ tenantId, agentId }, alias, (m) => this.#db({ tenantId, agentId }, m)),
       async sandboxForms() { return []; },
       async agentSecret() { return null; },
     };

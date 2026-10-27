@@ -6,6 +6,7 @@
  * flag that flips mid-conversation reaches the model as a notice, never by rewriting the prompt
  * (src/runtime/prompt-context.ts). Also the 0.16.0 tool-schema change the generated `actions_prepare` picks up.
  */
+import { keepRaftIdentity, raftIdentityOf } from "../src/plugins/raft-identity.ts";
 import {
   CONTEXT_STORE, FEATURES_KEY, FEATURES_REFRESH_MS, FEATURES_TIMEOUT_MS, VAULT_LINE, createRaftPlugin, featuresOf, featuresParagraph, raftPlugin as raftWithoutStorage,
 } from "../src/plugins/raft.ts";
@@ -51,9 +52,11 @@ function mountDb() {
   const scope = { tenantId: "tenant", agentId: "agent", alias: "raft", plugin: raftPlugin.id };
   return { tables, scope, db: openPluginDatabase(tables, scope, raftPlugin.database) };
 }
-function ctx(db: unknown) {
+/** A mount whose identity is already kept under its credential, so a pull asks Raft only for the flags' sake. */
+async function withIdentity(db: any) { await keepRaftIdentity({ credential: CREDENTIAL, alias: "raft", db } as any, "agent-1", "server-1"); return db; }
+function ctx(db: unknown, agentId = "agent") {
   return {
-    caller: { tenantId: "tenant", agentId: "agent", taskId: "task" }, alias: "raft", credential: CREDENTIAL,
+    caller: { tenantId: "tenant", agentId, taskId: "task" }, alias: "raft", credential: CREDENTIAL,
     publicConfig: { serverUrl: "https://raft.example" }, db, sibling: async () => null, sandboxForms: async () => [],
   } as any;
 }
@@ -96,6 +99,44 @@ await check("the listing keeps the flags from the context it already reads, and 
   }
 });
 
+// Which Raft agent the credential is, kept from the same answer for a plugin that checks a credential against it
+// (src/plugins/raft-identity.ts; stamp refuses a session of another agent). Read back the way stamp reads it.
+await check("the listing keeps which Raft agent its credential is, readable only under that credential", async () => {
+  const { db } = mountDb();
+  serve(() => context());
+  await raftPlugin.snapshotTools!(ctx(db));
+  const asSibling = (credential: string) => ({ alias: "stamp", async sibling(name: string) {
+    return name === "raft" ? { credential, db, plugin: "raft", policy: null } : null;
+  } }) as any;
+  const me = await raftIdentityOf(asSibling(CREDENTIAL));
+  must(me?.agentId === "agent-1" && me?.serverId === "server-1", `kept: ${JSON.stringify(me)}`);
+  must(await raftIdentityOf(asSibling("sk_agent_another")) === null, "an identity kept under one credential was read under another");
+  // Only a mount of the raft plugin speaks for the identity: another plugin's mount named `raft` does not.
+  const impostor = { alias: "stamp", async sibling(name: string) { return name === "raft" ? { credential: CREDENTIAL, db, plugin: "demo", policy: null } : null; } } as any;
+  must(await raftIdentityOf(impostor) === null, "a mount of another plugin named raft was read as the identity");
+});
+
+// Version 8 only adds a key: a mount's rows written under version 7 (an assistant's owner, the inbox state, the
+// sessions, the kept flags) open under 8 exactly as they were, and the version is recorded.
+await check("a raft mount's version-7 rows open unchanged under version 8", async () => {
+  const spec = raftPlugin.database!;
+  must(spec.version === 8, `raft database version ${spec.version}`);
+  const tables = new PluginDbTables(sqliteHost()).ensure();
+  const scope = { tenantId: "tenant", agentId: "agent", alias: "raft", plugin: raftPlugin.id };
+  const old = openPluginDatabase(tables, scope, { ...spec, version: 7 });
+  const stores = Object.keys(spec.stores);
+  // Named, so a store added without this test seeing it fails here rather than going unchecked.
+  must(JSON.stringify([...stores].sort()) === JSON.stringify(["agentLogin", "assistant", "assistant_reminded", "context", "inbox", "integrationSessions", "push"].sort()), `stores: ${stores.join(", ")}`);
+  for (const store of stores) await old.put(store, { kept: store, n: 7 }, `row-${store}`);
+  must(tables.version(scope) === 7, `written at ${tables.version(scope)}`);
+  const now = openPluginDatabase(tables, scope, spec);
+  for (const store of stores) {
+    const row = await now.get(store, `row-${store}`) as any;
+    must(row?.kept === store && row?.n === 7, `${store} after the upgrade: ${JSON.stringify(row)}`);
+  }
+  must(tables.version(scope) === 8, `recorded ${tables.version(scope)}`);
+});
+
 const tick = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 async function until(cond: () => unknown | Promise<unknown>, why: string, ms = 3_000) {
   const end = Date.now() + ms;
@@ -107,6 +148,7 @@ const contextAsked = (asked: string[]) => asked.filter((p) => p.endsWith("/conte
 
 await check("a pull reads the flags again in the background once they are older than the refresh age, and fresh ones not at all", async () => {
   const { tables, scope, db } = mountDb();
+  await withIdentity(db);
   tables.put(scope, CONTEXT_STORE, FEATURES_KEY, { reminderApp: false, vaultApp: false, at: Date.now() }, null);
   let asked = serve((p) => (p.endsWith("/context") ? context({ reminderApp: true, vaultApp: false }) : EMPTY_PULL()));
   await raftPlugin.invoke("receive_events", {}, ctx(db));
@@ -119,8 +161,36 @@ await check("a pull reads the flags again in the background once they are older 
   must(contextAsked(asked) === 1, `old flags were not read once: ${asked.join(", ")}`);
 });
 
+// A mount listed before the identity was kept has none, and nothing lists it again: a pull reads it, whatever the
+// age of the flags, and a minute's backoff keeps a Raft that does not answer from being asked on every pull.
+await check("a pull keeps the identity a running mount is missing, fresh flags or not, and does not ask again within a minute", async () => {
+  const { tables, scope, db } = mountDb();
+  tables.put(scope, CONTEXT_STORE, FEATURES_KEY, { reminderApp: false, vaultApp: false, at: Date.now() }, null);
+  const asSibling = { alias: "stamp", async sibling(name: string) { return name === "raft" ? { credential: CREDENTIAL, db, plugin: "raft", policy: null } : null; } } as any;
+  must(await raftIdentityOf(asSibling) === null, "an identity was there before the pull");
+  let asked = serve((p) => (p.endsWith("/context") ? context() : EMPTY_PULL()));
+  await raftPlugin.invoke("receive_events", {}, ctx(db, "agent-id-1"));
+  await until(async () => (await raftIdentityOf(asSibling))?.agentId === "agent-1", "the pull did not keep the identity");
+  must(contextAsked(asked) === 1, `asked: ${asked.join(", ")}`);
+  // Kept now: the next pull, fresh flags and all, does not ask.
+  asked = serve((p) => (p.endsWith("/context") ? context() : EMPTY_PULL()));
+  await raftPlugin.invoke("receive_events", {}, ctx(db, "agent-id-1"));
+  await tick(30);
+  must(contextAsked(asked) === 0, `asked again: ${asked.join(", ")}`);
+  // A Raft that does not answer is asked once a minute at most.
+  const { db: other } = mountDb();
+  tables.put(scope, CONTEXT_STORE, FEATURES_KEY, { reminderApp: false, vaultApp: false, at: Date.now() }, null);
+  asked = serve((p) => (p.endsWith("/context") ? json(503, {}) : EMPTY_PULL()));
+  await raftPlugin.invoke("receive_events", {}, ctx(other, "agent-id-2"));
+  await tick(30);
+  await raftPlugin.invoke("receive_events", {}, ctx(other, "agent-id-2"));
+  await tick(30);
+  must(contextAsked(asked) === 1, `a refusing Raft was asked ${contextAsked(asked)} times`);
+});
+
 await check("a refresh that fails keeps the flags and backs off for the same hour: the next pull does not ask again", async () => {
   const { tables, scope, db } = mountDb();
+  await withIdentity(db);
   tables.put(scope, CONTEXT_STORE, FEATURES_KEY, { reminderApp: true, vaultApp: false, at: OLD() }, null);
   const asked = serve((p) => (p.endsWith("/context") ? json(503, { error: "down" }) : EMPTY_PULL()));
   const started = Date.now();
@@ -140,6 +210,7 @@ await check("a refresh that fails keeps the flags and backs off for the same hou
 
 await check("concurrent pulls on one mount send one refresh request", async () => {
   const { tables, scope, db } = mountDb();
+  await withIdentity(db);
   tables.put(scope, CONTEXT_STORE, FEATURES_KEY, { reminderApp: false, vaultApp: false, at: OLD() }, null);
   const asked = serve(async (p) => {
     if (!p.endsWith("/context")) return EMPTY_PULL();
