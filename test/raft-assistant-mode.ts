@@ -582,6 +582,26 @@ await check("the listing keeps Raft's language when it is a tag; null, absent (a
   must(a.read(ASSISTANT_STORE, OWNER_KEY).language === null, `after a context without it: ${show(a.read(ASSISTANT_STORE, OWNER_KEY))}`);
 });
 
+await check("a context read that changes the owner record writes one raft.assistant_owner row with the language kept; one that changes nothing writes none; no row names the owner", async () => {
+  const rows = (a: { traced: any[] }) => a.traced.filter((t) => t.kind === "raft.assistant_owner");
+  const a = await assistant(raft({ language: "zh-CN", dm: "dm:@ada~human", name: "ada" }));
+  const first = rows(a);
+  must(first.length === 1 && first[0].status === "kept" && first[0].verdict === "ok", `first listing: ${show(first)}`);
+  must(show(first[0].attrs) === show({ via: "listing", first: true, language: "zh-CN", language_changed: true, timezone_set: true, raftCheck: false }), `first row: ${show(first[0].attrs)}`);
+  // The same context again: the record is the same, so no row.
+  await raftPlugin.snapshotTools!(a.ctx);
+  must(rows(a).length === 1, `an identical listing: ${show(rows(a))}`);
+  // Raft's language moves: one row, with the new tag.
+  a.r.language = "en";
+  await raftPlugin.snapshotTools!(a.ctx);
+  const moved = rows(a);
+  must(moved.length === 2 && moved[1].attrs.language === "en" && moved[1].attrs.language_changed === true && moved[1].attrs.first === false, `a changed language: ${show(moved)}`);
+  // Control: the owner's id, handle and DM are in the stored record the rows describe, and in none of the rows.
+  const kept = a.read(ASSISTANT_STORE, OWNER_KEY);
+  must(kept.userId === OWNER && kept.ownerName === "ada" && kept.dmTarget === "dm:@ada~human", `control: ${show(kept)}`);
+  for (const secret of [OWNER, "ada"]) must(!show(rows(a)).includes(secret), `a row carries ${secret}: ${show(rows(a))}`);
+});
+
 await check("the owner's chat is told to write to them in Raft's language, else in their latest message's; a send as them keeps the conversation's, in every case, and both give way to the owner", async () => {
   const secret = "push-secret-0123456789";
   const DM = { target: "dm:@ada", channelType: "dm", pendingCount: 1, latestSenderName: "ada", latestSenderType: "human", flags: [] };

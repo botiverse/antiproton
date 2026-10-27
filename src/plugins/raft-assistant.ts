@@ -357,13 +357,17 @@ export function zoneOf(owner: Pick<AssistantOwner, "timezone" | "statedTimezone"
 /**
  * What a context answer says about the owner, kept: `assistantOf` naming an owner keeps (and un-pauses) the record;
  * none drops it, and with it the brief, while the rules and what was already said stay for an owner who comes back.
- * Called by the listing and by every check a paused assistant makes.
+ * Called by the listing and by every check a paused assistant makes (`via`). A read that changes the record writes
+ * one `raft.assistant_owner` row (`traceOwnerKept`); one that changes nothing writes none.
  */
-export async function keepOwnerFromContext(ctx: PluginContext, context: OwnerContext): Promise<AssistantOwner | null> {
+export async function keepOwnerFromContext(ctx: PluginContext, context: OwnerContext, via: OwnerRead = "listing"): Promise<AssistantOwner | null> {
   const of = context.agent.assistantOf ?? null;
   if (!of || !of.userId) {
     // Read first: nearly every agent is no one's assistant, and its every listing need not be a write.
-    if (await ctx.db.get(ASSISTANT_STORE, OWNER_KEY) !== undefined) await ctx.db.delete(ASSISTANT_STORE, OWNER_KEY);
+    if (await ctx.db.get(ASSISTANT_STORE, OWNER_KEY) !== undefined) {
+      await ctx.db.delete(ASSISTANT_STORE, OWNER_KEY);
+      ctx.trace?.({ kind: "raft.assistant_owner", status: "dropped", verdict: "ok", attrs: { via } });
+    }
     return null;
   }
   const kept = await loadOwner(ctx);
@@ -388,8 +392,30 @@ export async function keepOwnerFromContext(ctx: PluginContext, context: OwnerCon
   };
   const next = same ? await modeChanged(ctx, same.raftCheck, owner, Date.now()) : owner;
   await saveOwner(ctx, next);
+  traceOwnerKept(ctx, same, next, via);
   if (owner.raftCheck && !same?.raftCheck) await askBriefImport(ctx, owner);
   return next;
+}
+
+/** Which context read kept the owner: the listing's (`snapshotTools`), or a paused assistant's check asking again. */
+export type OwnerRead = "listing" | "recheck";
+
+/**
+ * The owner record as a context read left it, on a `raft.assistant_owner` row, so when Raft's language (or zone, or
+ * flag) reached the record is read from the trace rather than inferred: written for a record kept for the first time
+ * (none before, or another owner's) and for one any field of which the read changed, never for a read that changed
+ * nothing, which is nearly every listing. The language is the validated tag (`validLanguage`), so it is never Raft's
+ * text; the rest are booleans and the fixed `via`. Never the owner's id, handle or DM target: the row says what changed,
+ * not whose.
+ */
+function traceOwnerKept(ctx: PluginContext, before: AssistantOwner | null, after: AssistantOwner, via: OwnerRead): void {
+  const was = before as unknown as Record<string, unknown> | null;
+  const changed = !was || Object.entries(after).some(([k, v]) => JSON.stringify(was[k]) !== JSON.stringify(v));
+  if (!changed) return;
+  ctx.trace?.({
+    kind: "raft.assistant_owner", status: "kept", verdict: "ok",
+    attrs: { via, first: !before, language: after.language, language_changed: !before || before.language !== after.language, timezone_set: after.timezone !== null, raftCheck: after.raftCheck },
+  });
 }
 
 /**
