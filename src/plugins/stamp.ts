@@ -35,7 +35,7 @@
  */
 import type { Json, MountPolicy } from "../core/types.ts";
 import { openText, sealText } from "./raft-agent-login.ts";
-import { raftIdentityOf } from "./raft-identity.ts";
+import { RAFT_MOUNT_ALIAS, raftIdentityOf } from "./raft-identity.ts";
 import type { CredentialCheck, Plugin, PluginContext, ToolSchema } from "./types.ts";
 import { credentialState, identityNote, markIdentity, policyFor } from "./types.ts";
 
@@ -152,7 +152,12 @@ type Kept = { kind: "none" } | { kind: "open"; session: AgentSession; owner?: st
  * mount is removed or renamed, and shared by every stamp mount of the agent.
  * Written before a credential is first sealed, so a session that has ever been
  * used here — by a removed mount, by another mount — is refused rather than
- * presented again. Grows only when a person signs in.
+ * presented again. Grows only when a person signs in, and is never pruned:
+ * Stamp checks reuse before expiry, and keeps spent token rows
+ * (botiverse/stamp `internal/store/agent_cli_login_store.go` `RotateAgentRefreshToken`, as of server-v0.1.194),
+ * so a used refresh token presented after it expired is still
+ * `refresh_reused`, which revokes every token of that identity. Past a token's
+ * expiry this record is what keeps it from being presented, not the gateway.
  */
 const GIVEN_STORE = "stampGiven";
 
@@ -272,8 +277,14 @@ const ownerUnknown = (why: string) => new OwnerUnknown(
 async function thisAgent(ctx: PluginContext): Promise<string> {
   const me = await raftIdentityOf(ctx);
   if (!me) {
-    throw ownerUnknown("which Raft agent this agent is cannot be read from its Raft mount yet (it has none, or it has " +
-      "not listed its tools since its credential was set); that happens at the start of the agent's next turn");
+    // Told apart, because the two are fixed by different people: a mount to add or rename, or a moment to wait.
+    const raft = typeof ctx.sibling === "function" ? await ctx.sibling(RAFT_MOUNT_ALIAS).catch(() => null) : null;
+    if (!raft || raft.plugin !== "raft") {
+      throw ownerUnknown(`this agent has no mount named \`${RAFT_MOUNT_ALIAS}\` of the raft plugin, which is where stamp reads ` +
+        "which Raft agent this is; give it one under that name (or rename its Raft mount to it)");
+    }
+    throw ownerUnknown("which Raft agent this agent is cannot be read from its Raft mount yet (it has not listed its tools " +
+      "since its credential was set); that happens at the start of the agent's next turn");
   }
   return `${me.agentId}@${me.serverId}`;
 }
@@ -332,9 +343,40 @@ async function askOwner(ctx: PluginContext, given: AgentSession): Promise<{ owne
 async function verifiedOwner(ctx: PluginContext, d: string): Promise<string | null> {
   const row = await givenDb(ctx).get(VERIFIED_STORE, d) as Record<string, unknown> | null | undefined;
   if (!row || typeof row.owner !== "string") return null;
+  // Past its refresh token's expiry a record permits nothing, pruned yet or not: the session must prove itself again,
+  // and an expired access token or a 401 refuses it.
+  if (typeof row.until === "string" && Number.isFinite(Date.parse(row.until)) && Date.parse(row.until) < Date.now()) return null;
   const mine = await thisAgent(ctx);
   if (row.owner !== mine) throw notThisAgent(`a check found it belongs to ${row.owner}, and this agent is ${mine}`);
   return row.owner;
+}
+
+/**
+ * Write one agent-level record for a session, carrying its digest (`d`, the key, so a pruned read can name it) and its
+ * refresh token's expiry (`until`, from `refresh_expires_at`). With `prune`, then drop that store's records whose
+ * `until` is present and past — only for `VERIFIED_STORE`, whose record is a permission to refresh and is ignored past
+ * `until` anyway (`verifiedOwner`); never for `GIVEN_STORE`, see there. A session that names no expiry keeps its record
+ * for good. Called only after a write the caller decided to make — a failed check writes nothing, so it prunes nothing
+ * either. A failed prune is left for the next write.
+ */
+async function keepRecord(
+  ctx: PluginContext, store: string, d: string, session: AgentSession, extra: Record<string, unknown>, prune: boolean,
+): Promise<void> {
+  const until = typeof session.refresh_expires_at === "string" && Number.isFinite(Date.parse(session.refresh_expires_at))
+    ? session.refresh_expires_at : undefined;
+  const db = givenDb(ctx);
+  await db.put(store, { ...extra, d, at: new Date().toISOString(), ...(until ? { until } : {}) } as unknown as Json, d);
+  if (!prune) return;
+  try {
+    const now = Date.now();
+    for (const row of await db.getAll(store) as Array<Record<string, unknown>>) {
+      if (typeof row?.d !== "string" || typeof row.until !== "string") continue;
+      const at = Date.parse(row.until);
+      if (Number.isFinite(at) && at < now) await db.delete(store, row.d);
+    }
+  } catch (e) {
+    console.warn(`stamp: old ${store} records were not pruned for this agent (agent-level, every stamp mount): ${String((e as Error)?.message ?? e).slice(0, 200)}`);
+  }
 }
 
 /** Whose this session is: a passed check's record for its refresh token, else asked now (fresh access token only). */
@@ -377,7 +419,7 @@ export async function loadSession(ctx: PluginContext, keep = true): Promise<Agen
     // a check that fails writes nothing.
     if (!(await verifiedOwner(ctx, d))) {
       const { owner, handle } = await askOwner(ctx, given);
-      await givenDb(ctx).put(VERIFIED_STORE, { owner, ...(handle ? { handle } : {}), at: new Date().toISOString() }, d);
+      await keepRecord(ctx, VERIFIED_STORE, d, given, { owner, ...(handle ? { handle } : {}) }, true);
     }
     return given;
   }
@@ -399,7 +441,7 @@ export async function loadSession(ctx: PluginContext, keep = true): Promise<Agen
     // and nothing has been sent — unless the row turns out to hold the session
     // after all (a write that failed late), or cannot be read to say: then it
     // stays, and the cost is a sign-in.
-    await givenDb(ctx).put(GIVEN_STORE, { at: new Date().toISOString() }, d);
+    await keepRecord(ctx, GIVEN_STORE, d, given, {}, false);
     try { await storeSession(ctx, given, { owner }); } catch (e) {
       let kept: Kept | null = null;
       try { kept = await readKept(ctx); } catch { /* unread: keep the record */ }
@@ -933,6 +975,13 @@ export const stampPlugin: Plugin = {
     // before it is kept. So the check asks with the access token it has. Its one
     // write is the agent-level record that whose it is was checked and passed
     // (`VERIFIED_STORE`), and only when it passed.
+    // Whether a record of whose it is existed before this check: one this check writes was settled by asking Stamp
+    // just now; one found already settles ownership only, and says nothing about whether Stamp still takes it.
+    const candidate = parseSession(ctx.credential);
+    const recordOf = async () => candidate && ctx.agentDb
+      ? await ctx.agentDb.get(VERIFIED_STORE, await digest(candidate.refresh_token)).catch(() => null) as Record<string, unknown> | null
+      : null;
+    const before = await recordOf();
     let session: AgentSession | null;
     try { session = await loadSession(ctx, false); } catch (e) {
       if (e instanceof SpentSession) return { ok: false, kind: "rejected", reason: e.message.slice(0, 400) };
@@ -940,10 +989,11 @@ export const stampPlugin: Plugin = {
       throw e;
     }
     if (!session) throw noSession(ctx);
-    // A candidate whose owner this check confirmed (or an earlier one did) is answered from that record: Stamp was
-    // asked once already, with this session's own access token, and an expired one is not refreshed to ask again.
-    if (ctx.credential && parseSession(ctx.credential)?.refresh_token === session.refresh_token && ctx.agentDb) {
-      const rec = await ctx.agentDb.get(VERIFIED_STORE, await digest(session.refresh_token)).catch(() => null) as Record<string, unknown> | null;
+    // A record this check just wrote came from asking Stamp with this session's own access token a moment ago:
+    // answered from it, without asking twice. An older one settles only whose the session is, so a fresh access token
+    // is still put to Stamp below (a session revoked there since must not read as "ok").
+    if (candidate?.refresh_token === session.refresh_token && !before) {
+      const rec = await recordOf();
       if (rec && typeof rec.owner === "string") return { ok: true, account: typeof rec.handle === "string" ? `@${rec.handle}` : undefined };
     }
     if (needsRefresh(session, Date.now(), 0)) {

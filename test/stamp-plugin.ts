@@ -118,7 +118,9 @@ function makeAgentDb() {
     rows,
     async get(store: string, key: string) { return rows.get(`${store}\u0000${key}`) ?? null; },
     async put(store: string, value: any, key: string) { rows.set(`${store}\u0000${key}`, value); return key; },
-    async delete(store: string, key: string) { rows.delete(`${store}\u0000${key}`); }, async getAll() { return []; }, async getAllFromIndex() { return []; },
+    async delete(store: string, key: string) { rows.delete(`${store}\u0000${key}`); },
+    async getAll(store: string) { return [...rows].filter(([k]) => k.startsWith(`${store}\u0000`)).map(([, v]) => v); },
+    async getAllFromIndex() { return []; },
     async count() { return 0; }, async transaction(_s: any, _m: any, fn: any) { return fn(this); },
   };
 }
@@ -1113,7 +1115,9 @@ await check("without this agent's Raft identity a session is refused: no Raft mo
     reset();
     const { ctx, rows } = makeCtx(expired(), makeAgentDb(), "stamp", raft as any);
     const said = await refusal(invoke("whoami", {}, ctx));
-    must(/cannot be read from its Raft mount/.test(said) && refreshes === 0 && rows.size === 0, `${what}: ${said}`);
+    // No raft mount names the mount to add; a replaced credential is a listing to wait for.
+    const why = raft === null ? /no mount named `raft`/ : /cannot be read from its Raft mount/;
+    must(why.test(said) && refreshes === 0 && rows.size === 0, `${what}: ${said}`);
   }
 });
 
@@ -1257,6 +1261,18 @@ await check("a credential check's sibling sees this agent's mounts, and no other
   must(seenBy.raft === true && seenBy.elsewhere === false, JSON.stringify(seenBy));
 });
 
+// A record settles whose a session is, not whether Stamp still takes it (cody): a later check of a fresh session asks.
+await check("a session checked once and revoked at Stamp since does not read as ok at the next check", async () => {
+  reset();
+  const { ctx } = makeCtx(session());
+  must((await stampPlugin.checkCredential!(ctx) as any).ok === true, "the first check did not pass");
+  const again: any = await withMe(null, 401, () => stampPlugin.checkCredential!(ctx));
+  must(again.ok === false && again.kind === "rejected", `after revocation: ${JSON.stringify(again)}`);
+  // And once its access token has expired, the record answers whose it is, and nothing is refreshed to ask.
+  const later: any = await anHourLater(() => stampPlugin.checkCredential!(ctx));
+  must(later.ok === false && later.kind === "unreachable" && refreshes === 0, `expired: ${JSON.stringify(later)}`);
+});
+
 // A plugin default may tighten a mount's policy, never loosen it: an operator who
 // denied writes did not ask for a card whose one click merges.
 await check("a mount-wide write deny stays a refusal, not an approval", async () => {
@@ -1265,6 +1281,111 @@ await check("a mount-wide write deny stays a refusal, not an approval", async ()
   const r = await denied("pr_merge", MERGE);
   must(r.status === "rejected" && r.error?.code === "policy_denied", `pr_merge on write:deny: ${JSON.stringify(r)}`);
   must(seen.length === 0, "it reached the gateway");
+});
+
+// ---- the agent-level records a session leaves behind go when that session can no longer be refreshed ----
+
+/** A row in the agent-level fake, as `getAll` returns it. */
+const agentRows = (db: ReturnType<typeof makeAgentDb>, store: string) =>
+  [...db.rows].filter(([k]) => k.startsWith(`${store}\u0000`)).map(([, v]) => v as any);
+/** Put a row the way the plugin writes one, so a case can seed an older one. */
+const seedRow = (db: ReturnType<typeof makeAgentDb>, store: string, key: string, row: Record<string, unknown>) =>
+  db.rows.set(`${store}\u0000${key}`, { d: key, at: new Date().toISOString(), ...row });
+const longAgo = () => new Date(Date.now() - 86_400_000).toISOString();
+const soon = () => new Date(Date.now() + 86_400_000).toISOString();
+
+// A check records whose the session is, and when that session can no longer be refreshed, so the record can go.
+await check("a passed check records its session's refresh expiry, so the record has a life", async () => {
+  reset();
+  const until = soon();
+  const { ctx, agentDb } = makeCtx(session({ refresh_expires_at: until }));
+  const checked: any = await stampPlugin.checkCredential!(ctx);
+  must(checked.ok === true, `check: ${JSON.stringify(checked)}`);
+  const rows = agentRows(agentDb!, "stampVerified");
+  must(rows.length === 1, `rows: ${JSON.stringify(rows)}`);
+  must(rows[0].until === until && rows[0].owner === `${RAFT_AGENT}@${RAFT_SERVER}`, JSON.stringify(rows[0]));
+});
+
+// The row is dropped once its own session's refresh token has expired — and only then.
+await check("an expired record goes at the next check, and one still refreshable stays", async () => {
+  reset();
+  const { ctx, agentDb } = makeCtx(session({ refresh_expires_at: soon() }));
+  seedRow(agentDb!, "stampVerified", "digest-of-a-session-gone", { owner: `${RAFT_AGENT}@${RAFT_SERVER}`, until: longAgo() });
+  seedRow(agentDb!, "stampVerified", "digest-of-a-session-alive", { owner: `${RAFT_AGENT}@${RAFT_SERVER}`, until: soon() });
+  seedRow(agentDb!, "stampVerified", "digest-with-no-expiry", { owner: `${RAFT_AGENT}@${RAFT_SERVER}` });
+  await stampPlugin.checkCredential!(ctx);
+  const left = agentRows(agentDb!, "stampVerified").map((r) => (r as any).d).sort();
+  must(left.includes("digest-of-a-session-alive"), `an unexpired record was dropped: ${JSON.stringify(left)}`);
+  must(left.includes("digest-with-no-expiry"), `a record with no expiry was dropped: ${JSON.stringify(left)}`);
+  must(!left.includes("digest-of-a-session-gone"), `the expired record stayed: ${JSON.stringify(left)}`);
+});
+
+// The same rule on the other store: a session a person gave is recorded until it can no longer be refreshed.
+// `stampGiven` is never pruned (cody, against Stamp main e3013451): Stamp checks reuse before expiry and keeps spent
+// rows, so a used token presented after its expiry is still `refresh_reused`. Only `stampVerified` is pruned.
+await check("a given session's record is never pruned, expired or not; only a check's record is", async () => {
+  reset();
+  const { ctx, agentDb } = makeCtx(session({ refresh_expires_at: soon() }));
+  seedRow(agentDb!, "stampGiven", "digest-of-a-session-gone", { until: longAgo() });
+  seedRow(agentDb!, "stampGiven", "digest-of-a-session-alive", { until: soon() });
+  await invoke("whoami", {}, ctx);
+  const left = agentRows(agentDb!, "stampGiven").map((r) => (r as any).d);
+  must(left.includes("digest-of-a-session-alive") && left.includes("digest-of-a-session-gone"), JSON.stringify(left));
+  must(agentRows(agentDb!, "stampVerified").length === 0, "a first use wrote a stampVerified row");
+});
+
+// A check that fails writes nothing, so it must prune nothing either: the expired row is somebody's old check, and
+// this call has no business tidying it.
+await check("a check that fails prunes nothing", async () => {
+  reset();
+  const { ctx, agentDb } = makeCtx(session({ refresh_expires_at: soon() }));
+  seedRow(agentDb!, "stampVerified", "digest-of-a-session-gone", { owner: `${RAFT_AGENT}@${RAFT_SERVER}`, until: longAgo() });
+  const checked: any = await withMe({ agentId: "someone-else" }, 200, () => stampPlugin.checkCredential!(ctx));
+  must(checked.ok === false && checked.kind === "rejected", `check: ${JSON.stringify(checked)}`);
+  const left = agentRows(agentDb!, "stampVerified").map((r) => (r as any).d);
+  must(left.includes("digest-of-a-session-gone"), `a failed check pruned a row: ${JSON.stringify(left)}`);
+  must(!left.some((d) => d !== "digest-of-a-session-gone"), `a failed check wrote a row: ${JSON.stringify(left)}`);
+});
+
+const digestOf = async (t: string) => {
+  const d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`antiproton stamp agent session v1\u0000${t}`));
+  return Array.from(new Uint8Array(d), (b) => b.toString(16).padStart(2, "0")).join("");
+};
+
+// cody's P2: a session given here and used, whose refresh token has expired, pasted back while its access token is
+// still fresh. Stamp would answer the refresh `refresh_reused`; the kept given record refuses it before anything goes.
+await check("a used session pasted back after its refresh expiry is refused by its record, with nothing sent", async () => {
+  reset();
+  const { ctx, agentDb } = makeCtx(session({ access_token: "ACCESS-NEW", refresh_token: "REFRESH-NEW" }));
+  seedRow(agentDb!, "stampGiven", await digestOf("REFRESH-OLD"), { until: longAgo() });
+  await invoke("whoami", {}, ctx);
+  // Into a new mount of the same agent, as it would be pasted: the mount has no row, so only the given record speaks.
+  const { ctx: back } = makeCtx(session({ access_token: "ACCESS-OLD", refresh_token: "REFRESH-OLD",
+    refresh_expires_at: new Date(Date.now() - 60_000).toISOString() }), agentDb, "stamp-new");
+  const said = await refusal(invoke("whoami", {}, back));
+  must(/already given/.test(said) && refreshes === 0 && ownerChecks.length === 1, `${said}; refreshes=${refreshes}, owner checks=${ownerChecks.length}`);
+});
+
+// cody's P1: a check's record that outlived its refresh token permits nothing. Built without the given record (as a
+// store pruned by an older build would leave it), so only the `until` read in verifiedOwner stands between the
+// pasted-back session and a refresh.
+await check("a check's record past its refresh expiry does not let an expired session refresh", async () => {
+  reset();
+  const { ctx, rows } = makeCtx(session({ access_token: "ACCESS-S", refresh_token: "REFRESH-S",
+    access_expires_at: new Date(Date.now() - 3_600_000).toISOString(), refresh_expires_at: new Date(Date.now() - 60_000).toISOString() }));
+  seedRow((ctx as any).agentDb, "stampVerified", await digestOf("REFRESH-S"), { owner: `${RAFT_AGENT}@${RAFT_SERVER}`, until: longAgo() });
+  refreshAnswer = rotatesTo(70);
+  const said = await refusal(invoke("whoami", {}, ctx));
+  must(/already expired/.test(said) && refreshes === 0 && rows.size === 0, `${said}; refreshes=${refreshes}`);
+});
+
+// The pruning of `stampVerified` covers the row just written too: a session checked with an expired refresh token
+// leaves no record, and permits nothing either way.
+await check("a check of a session whose refresh token has already expired leaves no record behind", async () => {
+  reset();
+  const { ctx, agentDb } = makeCtx(session({ refresh_expires_at: longAgo() }));
+  await stampPlugin.checkCredential!(ctx);
+  must(agentRows(agentDb!, "stampVerified").length === 0, JSON.stringify(agentRows(agentDb!, "stampVerified")));
 });
 
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.error ? `\n    ${r.error}` : ""}`);
