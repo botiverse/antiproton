@@ -93,8 +93,10 @@ Recorded so the design is not read as a description of today:
   `fetch` makes each request **one host call** of `<alias>.request` through the gateway — the same
   policy, approval, operation and trace row, host-call budget and pause on a hold as any tool call;
   no credential or network is in the box, and only `content-type` and `accept` cross from it. The
-  plugin's route table classifies each request (on the path its `normalize` answers, and the body
-  as sent): a listed route is decided under its policy key and the bridge tool's own entry, the
+  plugin's route table classifies each request (on the path its `normalize` answers, without its
+  query or a trailing slash and case-insensitively, and the body as sent; the core first refuses a
+  path that names a host, carries a backslash, whitespace or a percent-escape, or has an empty,
+  `.` or `..` segment, and drops a GET's or HEAD's body): a listed route is decided under its policy key and the bridge tool's own entry, the
   stricter of the two (a key only tightens, `Plugin.policyKey`); an unlisted read follows the
   mount's read policy; an unlisted write is decided under the plugin's `unlistedWriteKey`, which is
   `approval` unless the mount allows it; a `refuse` row ends the call rejected, approved or not.

@@ -2601,7 +2601,8 @@ export const BRIDGE_TOOL = "request";
 /** What the core hands a plugin's `BridgeDecl.send`: the request as the box made it, with only two of its headers. */
 export interface BridgeRequest {
   method: string;
-  /** The path as the plugin's `normalize` answered it (as sent, without one): what the route table was matched on. */
+  /** The path as the plugin's `normalize` answered it (as sent, without one), query kept and fragment dropped; the
+   *  route table was matched on it without the query or a trailing slash. */
   path: string;
   body: string | null;
   /** Only `content-type` and `accept`, lower-cased, when the box sent them; the plugin adds its own credential. */
@@ -2671,13 +2672,17 @@ export type RouteClass =
   | { kind: "unlisted-read" }
   | { kind: "unlisted-write"; key: string };
 
-/** Classify one request against a bridge's table. `path` is already normalized; `body` is as sent. */
+/**
+ * Classify one request against a bridge's table. `path` is already normalized, without its query or a trailing slash
+ * (the gateway's `routePath`), and matched case-insensitively; `body` is as sent.
+ */
 export function classifyRoute(decl: Pick<BridgeDecl, "routes" | "unlistedWriteKey">, method: string, path: string, body: string | null): RouteClass {
   const m = method.toUpperCase();
   let parsed: Json | string | null = body;
   if (typeof body === "string") { try { parsed = JSON.parse(body) as Json; } catch { /* matched as the text */ } }
   for (const row of decl.routes) {
-    if (!row.methods.some((x) => x.toUpperCase() === m) || !row.path.test(path)) continue;
+    // Case-insensitive, as upstream routes are (`…/MERGE` is a merge), and never on a `g` or `y` regex's last index.
+    if (!row.methods.some((x) => x.toUpperCase() === m) || !new RegExp(row.path.source, row.path.flags.replace(/[gyi]/g, "") + "i").test(path)) continue;
     if (row.body) {
       let hit = false;
       // A predicate that throws on a body it did not expect has not said the row does not apply; held, not skipped.

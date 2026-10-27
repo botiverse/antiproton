@@ -37,7 +37,7 @@ function fixture(routes: RouteEntry[] = ROUTES, extra: Partial<Plugin> = {}) {
     routes,
     unlistedWriteKey: "svc.write",
     normalize: (p) => {
-      if (p.includes("..")) throw new Error("path must not climb");
+      if (p.startsWith("/v1/outside")) throw new Error("path must stay under the service's prefixes");
       return p.replace(/\/{2,}/g, "/").replace(/\/+$/, "");
     },
     describe: (p) => {
@@ -138,7 +138,7 @@ await check("a listed route is decided under its key and the request tool, the s
 await check("a refused route ends rejected before any verdict, with one operation row, even where every key is allowed", async () => {
   const f = fixture();
   const { gw, ops } = await gatewayWith({ write: "allow", tools: { request: "allow", "svc.write": "allow" } }, f.plugin);
-  const r: any = await gw.invoke(caller, "svc.request", req("POST", "/v1/repos/o/r/pulls/7//merge/"), program);
+  const r: any = await gw.invoke(caller, "svc.request", req("POST", "/v1/repos/o/r/pulls/7/merge/"), program);
   must(r.status === "rejected" && r.error?.code === "route_refused" && /pr_merge/.test(r.error.message), `a merge was not refused: ${JSON.stringify(r)}`);
   const approve: any = await gw.invoke(caller, "svc.request", req("POST", "/v1/repos/o/r/pulls/7/reviews", '{"event":"approve"}'), program);
   must(approve.status === "rejected" && approve.error?.code === "route_refused" && /pr_approve/.test(approve.error.message), `an approval review was not refused: ${JSON.stringify(approve)}`);
@@ -148,6 +148,75 @@ await check("a refused route ends rejected before any verdict, with one operatio
   const rows = ops();
   must(rows.length === 3 && rows.filter((o) => o.status === "rejected").length === 2 && rows.every((o) => o.tool === "svc.request"),
     `operations: ${JSON.stringify(rows)}`);
+});
+
+// Every spelling of a refused route that upstream would route the same way meets the refusal, or is refused as a
+// path, whatever the plugin's own normalize does: here the fixture has none, so the core's rules alone decide.
+const MERGE_SPELLINGS: Array<[string, string]> = [
+  ["/v1/repos/o/r/pulls/7/merge?x=1", "route_refused"],
+  ["/v1/repos/o/r/pulls/7/merge#", "route_refused"],
+  ["/v1/repos/o/r/pulls/7/MERGE/", "route_refused"],
+  ["/v1/repos/o/r/pulls/7/%6Derge", "bad_request"],
+  ["/v1/repos/o/r/pulls/7/merge/.", "bad_request"],
+  ["/v1/repos/o/r/pulls/7//merge", "bad_request"],
+  ["/v1/repos/o/r/pulls/7/m%65rge?x", "bad_request"],
+];
+const OPEN: MountPolicy = { write: "allow", tools: { request: "allow", "svc.write": "allow", pr_comment: "allow" } };
+
+for (const [path, code] of MERGE_SPELLINGS) {
+  await check(`a merge spelled ${path} does not run where unlisted writes are allowed: ${code}`, async () => {
+    const f = fixture();
+    f.decl.normalize = undefined;
+    const { gw, ops } = await gatewayWith(OPEN, f.plugin);
+    const r: any = await gw.invoke(caller, "svc.request", req("POST", path), program);
+    must(r.status === "rejected" && r.error?.code === code, `it was not refused as ${code}: ${JSON.stringify(r)}`);
+    must(f.sent.length === 0 && ops().length === 1 && ops()[0]!.status === "rejected", `it reached send, or its row: ${JSON.stringify(ops())}`);
+  });
+  await check(`a merge spelled ${path}, held before and approved, is refused on the replay: ${code}`, async () => {
+    const f = fixture();
+    f.decl.normalize = undefined;
+    const { gw, store } = await gatewayWith(OPEN, f.plugin);
+    // A held request as an earlier table would have left it: the replay runs today's rules, not the hold's.
+    await store.requireApproval({
+      tenantId: "t", operationId: `op_held_${code}`, agentId: "a", taskId: "k", mountAlias: "svc", tool: "request",
+      request: { tool: "svc.request", args: req("POST", path) as any, heldBy: "policy" },
+    });
+    const done: any = await gw.applyApproval("t", `op_held_${code}`, "approved", "person");
+    must(done.ok && done.result?.status === "rejected" && done.result.error?.code === code, `the replay was not refused: ${JSON.stringify(done)}`);
+    must(f.sent.length === 0, "the replay reached send");
+  });
+}
+
+await check("a path that could leave the origin is refused before anything: //host, a backslash, whitespace", async () => {
+  const f = fixture();
+  f.decl.normalize = undefined;
+  const { gw } = await gatewayWith(OPEN, f.plugin);
+  // Each refused by the rule meant for it, not by another that happens to catch it too (`//host` is an empty segment).
+  const cases: Array<[string, RegExp]> = [["//evil.com/x", /names no host/], ["/\\evil.com/x", /backslash/], ["/v1/a b", /whitespace/],
+    ["/v1/a\tb", /whitespace/], ["/v1/a\u0000", /control/]];
+  for (const [path, why] of cases) {
+    const r: any = await gw.invoke(caller, "svc.request", req("GET", path), program);
+    must(r.status === "rejected" && r.error?.code === "bad_request" && why.test(r.error.message),
+      `${JSON.stringify(path)} was not refused for ${why}: ${JSON.stringify(r)}`);
+  }
+  must(f.sent.length === 0, `${f.sent.length} reached send`);
+});
+
+await check("send gets the query but never the fragment, and a GET or HEAD no body", async () => {
+  const f = fixture();
+  f.decl.normalize = undefined;
+  const { gw } = await gatewayWith(null, f.plugin);
+  await gw.invoke(caller, "svc.request", req("GET", "/v1/repos/o/r/issues?page=2#top", "a body"), program);
+  await gw.invoke(caller, "svc.request", req("HEAD", "/v1/repos/o/r", "a body"), program);
+  must(f.sent.length === 2 && f.sent[0]!.path === "/v1/repos/o/r/issues?page=2" && f.sent[0]!.body === null && f.sent[1]!.body === null,
+    `send was handed ${JSON.stringify(f.sent)}`);
+});
+
+await check("the request tool's own deny holds though the route's key allows: stricter, not the key alone", async () => {
+  const f = fixture();
+  const { gw } = await gatewayWith({ tools: { request: "deny", pr_comment: "allow" } }, f.plugin);
+  const r: any = await gw.invoke(caller, "svc.request", req("POST", "/v1/repos/o/r/pulls/7/comments", "{}"), program);
+  must(r.status === "rejected" && r.error?.code === "policy_denied" && f.sent.length === 0, `request: deny was lifted by the key: ${JSON.stringify(r)}`);
 });
 
 await check("a refused route is refused on an approved replay too", async () => {
@@ -190,8 +259,8 @@ await check("a send that throws is a failed call; a path normalize refuses is re
   const { gw, ops } = await gatewayWith(null, f.plugin);
   const r1: any = await gw.invoke(caller, "svc.request", req("GET", "/v1/boom"), program);
   must(r1.status === "failed", `a throwing send: ${JSON.stringify(r1)}`);
-  const r2: any = await gw.invoke(caller, "svc.request", req("GET", "/v1/a/../b"), program);
-  must(r2.status === "rejected" && r2.error?.code === "bad_request", `a climbing path: ${JSON.stringify(r2)}`);
+  const r2: any = await gw.invoke(caller, "svc.request", req("GET", "/v1/outside/b"), program);
+  must(r2.status === "rejected" && r2.error?.code === "bad_request" && /prefixes/.test(r2.error.message), `a path normalize refuses: ${JSON.stringify(r2)}`);
   must(ops().length === 2, `operations: ${JSON.stringify(ops())}`);
 });
 

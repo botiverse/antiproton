@@ -246,15 +246,52 @@ const BRIDGE_SCHEMA: ToolSchema = {
 function bridgeArgs(args: Json): { method: string; path: string; body: string | null; headers: Record<string, string> } | string {
   const a = (args && typeof args === "object" && !Array.isArray(args) ? args : {}) as Record<string, unknown>;
   if (typeof a.method !== "string" || !/^[A-Za-z]+$/.test(a.method)) return "a bridged request needs its method as a word";
-  if (typeof a.path !== "string" || !a.path.startsWith("/")) return "a bridged request needs a path that starts with /";
+  if (typeof a.path !== "string") return "a bridged request needs a path that starts with /";
+  const path = bridgePath(a.path);
+  if (typeof path !== "string") return path.error;
   if (a.body !== undefined && a.body !== null && typeof a.body !== "string") return "a bridged request's body is the text as sent";
+  const method = a.method.toUpperCase();
   const headers: Record<string, string> = {};
   if (a.headers && typeof a.headers === "object" && !Array.isArray(a.headers)) {
     for (const [k, v] of Object.entries(a.headers as Record<string, unknown>)) {
       if (typeof v === "string" && BRIDGE_REQUEST_HEADERS.has(k.toLowerCase())) headers[k.toLowerCase()] = v;
     }
   }
-  return { method: a.method.toUpperCase(), path: a.path, body: (a.body as string | null | undefined) ?? null, headers };
+  // A read carries no body: one sent with a GET is not what upstream acts on, and not what the table was asked about.
+  const body = method === "GET" || method === "HEAD" ? null : (a.body as string | null | undefined) ?? null;
+  return { method, path, body, headers };
+}
+
+/**
+ * The path a bridged request may name, in the one spelling the route table is asked about, whatever the plugin's own
+ * `normalize` does: a table row is only as good as the spellings that cannot reach upstream without meeting it.
+ * Refused: anything that could leave the origin (`//host`, a backslash, whitespace or a control character), a
+ * percent-escape in the path (`%6Derge` is `merge` upstream and not to a pattern), and `.`, `..` and empty segments.
+ * The fragment never leaves a client, so it is dropped; the query is kept for upstream (a list's page, a filter) and
+ * is never part of what the table matches (`routePath`).
+ */
+function bridgePath(raw: string): string | { error: string } {
+  const bad = (why: string) => ({ error: `a bridged request's path ${why}, got ${JSON.stringify(raw).slice(0, 80)}` });
+  if (!raw.startsWith("/") || raw.startsWith("//")) return bad("starts with one / and names no host");
+  if (/[\\\s\u0000-\u001f\u007f]/.test(raw)) return bad("carries no backslash, whitespace or control character");
+  const noFragment = raw.split("#", 1)[0]!;
+  const q = noFragment.indexOf("?");
+  const pathPart = q < 0 ? noFragment : noFragment.slice(0, q);
+  let decoded: string;
+  try { decoded = decodeURIComponent(pathPart); } catch { decoded = ""; }
+  if (decoded !== pathPart) return bad("carries no percent-escapes");
+  const segments = pathPart.slice(1).split("/");
+  // A trailing slash is the one empty segment allowed: the table is asked about the path without it (`routePath`).
+  if (segments.some((x, i) => x === "." || x === ".." || (x === "" && i < segments.length - 1))) {
+    return bad("has no empty, . or .. segments");
+  }
+  return noFragment;
+}
+
+/** What the route table matches: the path without its query or a trailing slash (`bridgePath`). */
+function routePath(path: string): string {
+  const p = path.split(/[?#]/, 1)[0]!;
+  return p.length > 1 ? p.replace(/\/+$/, "") : p;
 }
 
 /** The response headers a bridge hands back to the box: `content-type`, `x-request-id`, and what the plugin names. */
@@ -1006,7 +1043,7 @@ export class ToolGateway {
           refusal = { code: "bad_request", message: String((e as Error)?.message ?? e).slice(0, 300) };
         }
       }
-      const c = route ? classifyRoute(bridge, route.method, route.path, route.body) : null;
+      const c = route ? classifyRoute(bridge, route.method, routePath(route.path), route.body) : null;
       if (c?.kind === "refused") refusal = { code: "route_refused", message: c.message };
       if (refusal || !c || c.kind === "refused") {
         await this.#store.completeOperation(ctx.tenantId, operationId, "rejected", null, undefined, facts());
