@@ -1118,11 +1118,55 @@ const ANY = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"] as const;
 const WRITES = ["POST", "PUT", "PATCH", "DELETE"] as const;
 
 /**
+ * The keys of a JSON object's top level as the text spells them, repeats kept, which `JSON.parse` drops (the last one
+ * wins). Asked only of text `JSON.parse` has already read as an object, so it only has to find where each key and
+ * value ends, not check them.
+ */
+export function topLevelKeys(text: string): string[] {
+  const keys: string[] = [];
+  let i = 0;
+  const skipSpace = () => { while (i < text.length && " \t\n\r".includes(text[i]!)) i++; };
+  const readString = (): string => {
+    const start = i++;
+    while (i < text.length && text[i] !== '"') i += text[i] === "\\" ? 2 : 1;
+    i++;
+    return JSON.parse(text.slice(start, i)) as string;
+  };
+  skipSpace();
+  if (text[i] !== "{") throw new Error("not a JSON object");
+  i++;
+  skipSpace();
+  if (text[i] === "}") return keys;
+  for (;;) {
+    skipSpace();
+    keys.push(readString());
+    skipSpace();
+    i++; // the colon
+    // The value: to the comma or brace that closes it at this depth, strings skipped whole.
+    let depth = 0;
+    while (i < text.length) {
+      const c = text[i]!;
+      if (c === '"') { readString(); continue; }
+      if (c === "{" || c === "[") depth++;
+      else if (c === "}" || c === "]") { if (depth === 0) break; depth--; }
+      else if (c === "," && depth === 0) break;
+      i++;
+    }
+    if (i >= text.length || text[i] === "}") return keys;
+    i++; // the comma
+  }
+}
+
+/**
  * A review's `event`, as GitHub reads it: the key in any case, the value in any case and around whitespace. A value
  * that is not a string throws, so the APPROVE row refuses rather than reading it as "not an approval" — what upstream
- * makes of `["APPROVE"]` or `{"APPROVE":1}` is not something this table can know.
+ * makes of `["APPROVE"]` or `{"APPROVE":1}` is not something this table can know. So does `event` given twice, in any
+ * case, which parsers settle differently (`JSON.parse` keeps the last): Stamp's own proxy refuses it as unreadable too.
  */
-function reviewEvent(body: { [k: string]: Json } | null): string[] {
+function reviewEvent(body: { [k: string]: Json } | null, raw: string | null): string[] {
+  if (raw !== null && topLevelKeys(raw).filter((k) => k.toLowerCase() === "event").length > 1) {
+    throw new Error("a review event given more than once");
+  }
   const out: string[] = [];
   for (const [k, v] of Object.entries(body ?? {})) {
     if (k.toLowerCase() !== "event") continue;
@@ -1140,7 +1184,10 @@ const NOT_ON_BRIDGE = "a program's request through sdk:stamp may not";
  * that holds or refuses that tool holds or refuses the request too; where no tool has the effect, `stamp.write`.
  *
  * It lists the routes known to approve or merge, and a few by name for their key: it is not a list of every spelling
- * upstream accepts. A write it does not name is held under `stamp.write` (`unlistedWriteKey`); a read passes.
+ * upstream accepts. A write it does not name is held under `stamp.write` (`unlistedWriteKey`); a read passes. That
+ * includes writes Stamp's own proxy refuses for an agent — updating a branch, branch protection, `git/refs`,
+ * `contents` — so on a mount that sets `stamp.write: allow` those rest on Stamp's proxy alone. The query is never
+ * judged (`?event=APPROVE` on a POST reads as no event), which is Stamp's own rule as well.
  */
 export const STAMP_ROUTES: readonly RouteEntry[] = [
   // The session endpoints are this plugin's own (`rotate`, `selfLogin`): a program never signs in or refreshes.
@@ -1158,15 +1205,16 @@ export const STAMP_ROUTES: readonly RouteEntry[] = [
     refuse: `${NOT_ON_BRIDGE} merge through GitHub's API: call pr_merge, which names the exact head a person signs for` },
   // A GraphQL mutation can approve or merge, and its body is not something a row can judge.
   { methods: ANY, path: /^\/api\/v3\/graphql$/, refuse: `${NOT_ON_BRIDGE} use GitHub's GraphQL API, which can approve or merge: use the REST paths, or the stamp tools` },
-  { methods: ["POST"], path: re(`${V3_REPO}/pulls/${SEG}/reviews(/${SEG}/events)?$`),
-    body: (b) => reviewEvent(b).includes("APPROVE"),
+  // Every write to a review, not only POST: which methods upstream reads an `event` on is not this table's to guess.
+  { methods: WRITES, path: re(`${V3_REPO}/pulls/${SEG}/reviews(/${SEG}(/events)?)?$`),
+    body: (b, raw) => reviewEvent(b, raw).includes("APPROVE"),
     refuse: `${NOT_ON_BRIDGE} approve through a review: call pr_approve, which names the exact head a person signs for`,
     unsure: "this review's body could not be read as a JSON object with a string `event` (sent with content-type: " +
       "application/json), so it may be an approval and is refused. Send it as JSON, or use the tools: pr_comment to " +
       "comment, pr_approve to approve" },
   // Requesting changes blocks a merge and no tool does it, so it is held under the write key, not run as a comment.
-  { methods: ["POST"], path: re(`${V3_REPO}/pulls/${SEG}/reviews(/${SEG}/events)?$`),
-    body: (b) => reviewEvent(b).includes("REQUEST_CHANGES"), key: UNLISTED_WRITE_KEY },
+  { methods: WRITES, path: re(`${V3_REPO}/pulls/${SEG}/reviews(/${SEG}(/events)?)?$`),
+    body: (b, raw) => reviewEvent(b, raw).includes("REQUEST_CHANGES"), key: UNLISTED_WRITE_KEY },
   // Any other review (COMMENT, a pending one), and editing one: a comment.
   { methods: ["POST", "PUT", "PATCH"], path: re(`${V3_REPO}/pulls/${SEG}/reviews(/${SEG}(/events)?)?$`), key: "pr_comment" },
   { methods: ["POST"], path: re(`${V3_REPO}/pulls/(${SEG}/comments(/${SEG}/replies)?)$`), key: "pr_comment" },

@@ -2648,8 +2648,10 @@ export type RouteEntry = {
    * refuses whenever it cannot rule the body out — and a `key` row does not apply but holds the request as an
    * unlisted write; neither passes it to a later, looser row. False on a JSON object sent as JSON moves on, so the predicate has to be as robust as
    * upstream is about spelling — key and value case, aliases — or a spelling it missed reaches a later row.
+   * `raw` is the body as sent, for what parsing loses: a key given twice, which `JSON.parse` keeps the last of and
+   * another parser may not.
    */
-  body?: (body: { [k: string]: Json } | null) => boolean;
+  body?: (body: { [k: string]: Json } | null, raw: string | null) => boolean;
 } & (
   /** Decided under this key and the bridge tool's own entry, the stricter of the two (`Plugin.policyKey`). */
   | { key: string; refuse?: undefined }
@@ -2748,7 +2750,7 @@ export function classifyRoute(
       if (parsed === undefined) return unsure;
       let hit = false;
       // A predicate that throws on a body it did not expect has not said the row does not apply.
-      try { hit = row.body(parsed); } catch { return unsure; }
+      try { hit = row.body(parsed, body); } catch { return unsure; }
       if (!hit) continue;
     }
     return row.refuse !== undefined ? { kind: "refused", message: row.refuse } : { kind: "listed", key: row.key! };

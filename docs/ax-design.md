@@ -138,7 +138,11 @@ Recorded so the design is not read as a description of today:
   (`pr_comment` for comments, COMMENT reviews and review edits; `pr_unapprove`, `pr_create`,
   `issue_create`, `issue_comment`), and where no tool has it — requesting changes, cancelling
   auto-merge, leaving the queue, anything unlisted — under `stamp.write`, held for a person
-  unless the mount allows it. The core's refusal of any `%` in a path stands, so a name that
+  unless the mount allows it. Unlisted includes writes Stamp's own proxy refuses for an agent
+  (updating a branch, branch protection, `git/refs`, `contents`): a mount that sets
+  `stamp.write: allow` relies on that proxy for them. The table judges a review's body, never
+  its query (`?event=APPROVE` on a POST reads as no event), as Stamp's proxy does; a body that
+  names `event` twice, in any case, cannot be judged and is refused. The core's refusal of any `%` in a path stands, so a name that
   needs an encoded separator (`contents/docs%2Freadme.md`, `commits/feature%2Fx`) goes through a
   query form where upstream has one (`commits?sha=feature/x`), or through the `api_get` / `api`
   tools.

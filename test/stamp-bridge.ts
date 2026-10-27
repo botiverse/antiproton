@@ -53,6 +53,8 @@ type Seen = { method: string; path: string; auth: string | null; ct: string | nu
 /** What reached the upstream, owner checks and refreshes aside. */
 let seen: Seen[] = [];
 let refreshes = 0;
+/** The access token a refresh answers: by default a new one; set to ACCESS_1 for a rotation that gives the same back. */
+let refreshAccess = ACCESS_2;
 const json = (status: number, body: unknown, headers: Record<string, string> = {}) =>
   new Response(typeof body === "string" ? body : JSON.stringify(body), { status, headers: { "content-type": "application/json", ...headers } });
 let upstream: (s: Seen) => Response | Promise<Response> = (s) => json(200, { seen: s.path });
@@ -64,7 +66,7 @@ globalThis.fetch = (async (input: any, init: any) => {
   }
   if (url.pathname === "/api/auth/agent/refresh") {
     refreshes++;
-    return json(200, { schema: "raft-cli-agent-session.v1", access_token: ACCESS_2, refresh_token: REFRESH_2,
+    return json(200, { schema: "raft-cli-agent-session.v1", access_token: refreshAccess, refresh_token: REFRESH_2,
       access_expires_at: new Date(Date.now() + 15 * 60_000).toISOString() });
   }
   const h = new Headers(init?.headers);
@@ -74,7 +76,7 @@ globalThis.fetch = (async (input: any, init: any) => {
   return upstream(s);
 }) as any;
 
-const reset = () => { seen = []; refreshes = 0; upstream = (s) => json(200, { seen: s.path }); };
+const reset = () => { seen = []; refreshes = 0; refreshAccess = ACCESS_2; upstream = (s) => json(200, { seen: s.path }); };
 
 // ---- a stamp mount behind a real gateway --------------------------------------------------------------------------
 
@@ -369,10 +371,11 @@ await check("item 9: a token minted by a 401 rotation, echoed back, is redacted 
 await check("item 9: the kept session's token, rotated by an earlier call and in no credential, is redacted on the next", async () => {
   const m = await mount(null);
   let n = 0;
-  upstream = (s) => (n++ === 0 ? json(401, { error: "expired" }) : json(200, { you_sent: s.auth }));
+  // The second call echoes only what is not in the mount's credential: the kept session's tokens.
+  upstream = (s) => (n++ === 0 ? json(401, { error: "expired" }) : n === 2 ? json(200, {}) : json(200, { you_sent: s.auth, refresh: REFRESH_2 }));
   const r = await run(m, PROLOGUE + `await stamp("GET", "/v1/me"); output(await stamp("GET", "/v1/me"));`);
   must(r.status === "completed" && seen.length === 3 && seen[2]!.auth === `Bearer ${ACCESS_2}`, `run: ${JSON.stringify(r)} ${JSON.stringify(seen)}`);
-  must(JSON.stringify(r.outputs) === '[{"you_sent":"Bearer [redacted]"}]', `the second call read ${JSON.stringify(r.outputs)}`);
+  must(JSON.stringify(r.outputs) === '[{"you_sent":"Bearer [redacted]","refresh":"[redacted]"}]', `the second call read ${JSON.stringify(r.outputs)}`);
 });
 
 await check("item 9: a send that throws after the rotation reaches the box with the minted token redacted", async () => {
@@ -499,12 +502,59 @@ await check("a held request is kept with only the headers that leave the box, an
     && JSON.parse(seen[0]!.body!).name === "x", `upstream saw ${JSON.stringify(seen)}`);
 });
 
+await check("item 1: a review that names event twice is refused as unjudged, whatever the last one says; any case counts", async () => {
+  const m = await mount(OPEN);
+  const unsure = (STAMP_ROUTES.find((r) => r.refuse !== undefined && r.unsure) as { unsure: string }).unsure;
+  for (const body of ['{"event":"APPROVE","event":"COMMENT"}', '{"event":"COMMENT","body":"x","Event":"COMMENT"}',
+    '{"body":{"event":"a","event":"b"},"event":"COMMENT","event":"COMMENT"}']) {
+    const r = await m.request("POST", REVIEW, body);
+    must(r.status === "rejected" && r.error?.code === "route_refused" && r.error.message === unsure, `${body}: ${JSON.stringify(r)}`);
+  }
+  // A key repeated deeper down, or a string that only looks like one, is not a repeated event.
+  for (const body of ['{"comments":[{"event":"a"},{"event":"b"}],"event":"COMMENT"}', '{"body":"\\"event\\":1, event","event":"COMMENT"}']) {
+    const r = await m.request("POST", REVIEW, body);
+    must(r.status === "succeeded", `${body}: ${JSON.stringify(r)}`);
+  }
+  must(seen.length === 2, `upstream saw ${seen.length}`);
+});
+
+await check("item 1: the APPROVE check applies to every write to a review: PUT, PATCH and DELETE with event APPROVE are refused", async () => {
+  const m = await mount(OPEN);
+  for (const [method, path] of [["PUT", `${REVIEW}/55`], ["PATCH", `${REVIEW}/55`], ["PUT", `${REVIEW}/55/events`], ["DELETE", `${REVIEW}/55`], ["PATCH", REVIEW]] as const) {
+    const r = await m.request(method, path, '{"event":"APPROVE"}');
+    must(r.status === "rejected" && r.error?.code === "route_refused" && /pr_approve/.test(r.error.message), `${method} ${path}: ${JSON.stringify(r)}`);
+  }
+  must(seen.length === 0, `reached upstream: ${JSON.stringify(seen)}`);
+});
+
+await check("a 401 the rotation cannot change is not resent with the same token: one request upstream, the 401 reaches the box", async () => {
+  const m = await mount(null);
+  refreshAccess = ACCESS_1;
+  upstream = () => json(401, { error: "unauthorized" });
+  const r = await m.request("GET", "/v1/me", null, null);
+  must(r.status === "succeeded" && r.result.status === 401, `result: ${JSON.stringify(r)}`);
+  must(refreshes === 1 && seen.length === 1, `refreshes ${refreshes}, upstream saw ${seen.length}: ${JSON.stringify(seen.map((x) => x.auth))}`);
+});
+
+await check("a path refusal thrown by gatewayFetch inside send keeps its own words; it is not reported as a network failure", async () => {
+  // A table with no rows, so the request reaches send: what is left to stop it is gatewayFetch's own prefix check.
+  const bare = { ...stampPlugin, bridge: { ...stampPlugin.bridge!, routes: [] } };
+  const m = await mount(null, bare);
+  const r = await m.request("GET", "/api/auth/agent/session", null, null);
+  must(r.status === "failed" && /path must start with \/v1\/ or \/api\/v3\//.test(r.error?.message) && !/fetch failed/.test(r.error?.message),
+    `result: ${JSON.stringify(r)}`);
+  must(seen.length === 0, "it reached upstream");
+});
+
 await check("describe names the repository and number on v1 and v3 pull and issue paths, and nothing elsewhere", () => {
   const d = stampPlugin.bridge!.describe!;
   must(JSON.stringify(d("/v1/repositories/o/r/pulls/7/comments")) === '{"repo":"o/r","pr":7}', "v1 pull");
   must(JSON.stringify(d("/api/v3/repos/o/r/issues/3/comments?x=1")) === '{"repo":"o/r","pr":3}', "v3 issue");
   must(JSON.stringify(d("/api/v3/repos/o/r/labels")) === '{"repo":"o/r"}', "repo only");
   must(JSON.stringify(d("/v1/pull-requests")) === "{}", "no repo");
+  // In any case, as the table matches: the card must name what a person signs for however the program spelled it.
+  must(JSON.stringify(d("/V1/Repositories/o/r/PULLS/7")) === '{"repo":"o/r","pr":7}', "v1 in another case");
+  must(JSON.stringify(d("/API/V3/REPOS/o/r/ISSUES/3")) === '{"repo":"o/r","pr":3}', "v3 in another case");
 });
 
 for (const r of results) {
