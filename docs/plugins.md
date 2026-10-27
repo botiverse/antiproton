@@ -995,7 +995,7 @@ says told state is unavailable. Each chat turn's input says which language to wr
 none), else the language of the owner's latest message; whatever is sent as the owner in another conversation, the
 language of that conversation's recent messages. The `assistant_send_as_owner` summary has the assistant read them first
 with `assistant_owner_messages`, by the `channelId` of the conversation's `assistant_owner_inbox` line (`filter` `all`:
-a quiet conversation is not among the unread), and ask the owner which language when it cannot read them or the conversation has no messages yet, rather than
+a quiet conversation is not among the unread), and ask the owner which language when it cannot read them or they show no language (an empty conversation shows none), rather than
 write in theirs. Both defaults give way to the owner: a language they ask for, and words they gave to send in their chat, which
 go out as they are. A check's and the brief's summaries are asked for in Raft's language when it gives one.
 

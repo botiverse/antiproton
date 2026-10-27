@@ -1871,7 +1871,7 @@ await check("the send-as-owner tool's own summary binds the ask to the owner's c
   // has it read the conversation first, by the channelId the read takes, and ask rather than default to the owner's.
   must(summary.includes("Unless they gave you the words to send, first read the conversation's recent messages with assistant_owner_messages, " +
     "by the channelId of its assistant_owner_inbox line (filter all), and write in the language they use; " +
-    "if you cannot read them or it has none yet, ask your owner which language to write in rather than using theirs."), summary);
+    "if you cannot read them, or they show no language, ask your owner which language to write in rather than using theirs."), summary);
 });
 
 await check("the chat prompt sends as the owner only when asked, directly, with no draft to approve; the check prompt never mentions it", () => {
