@@ -993,7 +993,8 @@ only from the read's `total` minus the lines of that reply ("at least" that many
 says told state is unavailable. Each chat turn's input says which language to write in: to the owner, Raft's
 `assistantOf.language` (a tag such as `zh-CN`, used only when it reads as one; null, or absent on an older Server, leaves
 none), else the language of the owner's latest message; whatever is sent as the owner in another conversation, that
-conversation's language. A check's and the brief's summaries are asked for in Raft's language when it gives one.
+conversation's language. Both give way to the owner: a language they ask for, and words they gave to send, which
+go out as they are. A check's and the brief's summaries are asked for in Raft's language when it gives one.
 
 When Raft runs the check (RFC 077 step 2), it says so in the credential context, `assistantOf.raftCheck: true`, and
 that flag is the only switch: read at every listing, when the brief's timer fires and when a check arrives on a stale
