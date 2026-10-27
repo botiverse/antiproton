@@ -16,6 +16,7 @@ import { admitTools } from "./mount-tools.ts";
 import { isReleased, leaseRow, releasedFacts, toolRefusedRow } from "../trace/seams.ts";
 import { PLUGIN_TRACE_KINDS } from "../trace/outbox.ts";
 import { openPluginDatabase } from "./plugin-db.ts";
+import { AGENT_SCOPE_ALIAS } from "../store/plugin-db.ts";
 import { payerKey, toolCallRows } from "../usage/outbox.ts";
 
 /** One mount's answer to a plugin hook the runtime called (`ToolGateway.afterTurn`, `wake`). */
@@ -209,17 +210,29 @@ function sameSnapshot(a: ToolSnapshot | null | undefined, b: ToolSnapshot | null
  * the operator has just deliberately created should work. The check lives here,
  * at the same choke point that holds credentials, so no harness and no sandbox
  * can route around it.
+ *
+ * `defaults` is the plugin's `Plugin.defaultPolicy`, for the few tools whose
+ * plugin says a person signs them unless the mount says otherwise. The mount's
+ * own per-tool entry is the only thing that lifts one; against the mount's
+ * side-effect half a default only ever tightens, so a mount-wide `write:
+ * "allow"` does not lift the hold and a mount-wide `write: "deny"` is not
+ * loosened into an approval card that one click runs.
  */
 export function policyFor(
   policy: MountPolicy | null | undefined,
   tool: string,
   sideEffects: "read" | "write",
+  defaults?: MountPolicy | null,
 ): PolicyDecision {
-  if (!policy) return "allow";
-  const perTool = policy.tools?.[tool];
-  if (perTool) return perTool;
-  return (sideEffects === "write" ? policy.write : policy.read) ?? "allow";
+  const own = policy?.tools?.[tool];
+  if (own) return own;
+  const half = (p: MountPolicy | null | undefined) => (sideEffects === "write" ? p?.write : p?.read);
+  const mount = half(policy) ?? "allow";
+  const fallback = defaults?.tools?.[tool] ?? half(defaults);
+  return fallback && STRICTNESS[fallback] > STRICTNESS[mount] ? fallback : mount;
 }
+
+const STRICTNESS: Record<PolicyDecision, number> = { allow: 0, approval: 1, deny: 2 };
 
 export class ToolGateway {
   #store: StorageAdapter;
@@ -916,7 +929,7 @@ export class ToolGateway {
     const facts = () => (opts.callId === undefined ? {} : { callId: opts.callId });
     // A declared write may be a read for the policy, per call, when the plugin says so (`Plugin.classify`).
     const verdict = opts.approved ? "allow" : confirm ? "approval"
-      : policyFor(r.mount.policy, r.tool, callSideEffects(plugin, r.tool, args, schema.sideEffects));
+      : policyFor(r.mount.policy, r.tool, callSideEffects(plugin, r.tool, args, schema.sideEffects), plugin.defaultPolicy);
     if (verdict === "deny") {
       // The operation was recorded above, before the policy was asked, so a
       // refusal has to end it or the row stays "pending" for ever — an attempt
@@ -1224,6 +1237,22 @@ export class ToolGateway {
   }
 
   /**
+   * The plugin's agent-level database (`PluginContext.agentDb`): the same
+   * declaration, filed under `AGENT_SCOPE_ALIAS` instead of the mount's alias,
+   * so every mount of the plugin shares it and no mount's removal or rename
+   * reaches it. Never another plugin's or another agent's: the scope is the
+   * same four columns as a mount's.
+   */
+  #agentDb(ctx: { tenantId: string; agentId: string }, mount: MountRecord, lease?: Lease) {
+    return openPluginDatabase(
+      this.#store.pluginDb,
+      { tenantId: ctx.tenantId, agentId: ctx.agentId, alias: AGENT_SCOPE_ALIAS, plugin: mount.plugin },
+      this.#plugins.get(mount.plugin)?.database,
+      lease ? { lease } : {},
+    );
+  }
+
+  /**
    * What a plugin is handed for one of this agent's mounts. One construction
    * for the call and for everything that comes back to the same work later —
    * a poll or a cancel sees exactly the context the call saw, credential
@@ -1267,6 +1296,8 @@ export class ToolGateway {
       // Scoped to the mount, not the plugin: two accounts of the same service
       // must never see each other's session.
       db: db(mount),
+      // Scoped to the agent and the plugin, for what must outlive one mount.
+      agentDb: this.#agentDb(ctx, mount, lease),
       // A mount's own hooks, and only for a plugin that can take what they carry.
       ...(this.#inbound && plugin?.receive
         ? { inbound: this.#inbound(ctx.tenantId, ctx.agentId, mount.alias) } : {}),
@@ -1727,6 +1758,7 @@ export class ToolGateway {
       caller: { tenantId, agentId, taskId: "credential-check" },
       alias: mount.alias,
       credential, publicConfig: mount.publicConfig, db: this.#db({ tenantId, agentId }, mount),
+      agentDb: this.#agentDb({ tenantId, agentId }, mount),
       async sibling() { return null; },
       async sandboxForms() { return []; },
       async agentSecret() { return null; },

@@ -14,10 +14,15 @@
  *   declared one is never lowered;
  * - a `transaction` callback is atomic, a readonly one cannot write, and a
  *   read-only opening (a diagnosis) neither writes nor upgrades;
+ * - the agent-level database (`AGENT_SCOPE_ALIAS`, `PluginContext.agentDb`)
+ *   outlives every mount: removing or renaming a mount never reaches it, no
+ *   mount may take its name, and it is still one agent's, one tenant's and one
+ *   plugin's;
  * - no plugin in the tree lists a credential-class key name: `listed` names
  *   what a diagnosis may show exists, and a name is the only thing it shows.
  */
-import { PluginDbTables } from "../src/store/plugin-db.ts";
+import { AGENT_SCOPE_ALIAS, PluginDbTables } from "../src/store/plugin-db.ts";
+import { SqliteStore } from "../src/store/sqlite.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { openPluginDatabase } from "../src/runtime/plugin-db.ts";
 import { KeyRange, type DbSpec, type Plugin } from "../src/plugins/types.ts";
@@ -296,6 +301,45 @@ await check("no plugin in the tree lists a credential-class key name, and every 
   }
   // The guard reads: a listing that names a token is caught by name.
   must(CREDENTIAL_CLASS.test("accessToken"), "the credential-class pattern does not match a token name");
+});
+
+await check("the agent-level database outlives every mount, and no mount can be named for it", async () => {
+  const tables = new PluginDbTables(sqliteHost()).ensure();
+  const agent = openPluginDatabase(tables, scope({ alias: AGENT_SCOPE_ALIAS }), SPEC);
+  const mount = openPluginDatabase(tables, scope(), SPEC);
+  await agent.put("notes", { kept: true }, "given");
+  await mount.put("notes", { mine: true }, "row");
+  tables.rename("t", "a", "m", "m2");
+  must((await agent.get("notes", "given")) !== null, "a rename reached the agent-level rows");
+  tables.remove("t", "a", "m2");
+  must((await agent.get("notes", "given")) !== null, "a mount's removal deleted the agent-level rows");
+  must(tables.get(scope({ alias: "m2" }), "notes", "row") === null || tables.get(scope({ alias: "m2" }), "notes", "row") === undefined, "the mount's own rows outlived it");
+  // Still one agent's, one tenant's, one plugin's.
+  for (const [what, other] of [
+    ["another agent", { ...scope({ alias: AGENT_SCOPE_ALIAS }), agentId: "b" }],
+    ["another tenant", { ...scope({ alias: AGENT_SCOPE_ALIAS }), tenantId: "u" }],
+    ["another plugin", scope({ alias: AGENT_SCOPE_ALIAS, plugin: "q" })],
+  ] as const) {
+    const seen = await openPluginDatabase(tables, other, SPEC).get("notes", "given");
+    must(seen === null || seen === undefined, `${what} read the agent-level rows`);
+  }
+  // The storage page says what it is rather than showing a mount with no name.
+  const line = tables.summary("t", "a").find((r) => r.alias === AGENT_SCOPE_ALIAS);
+  must(line?.agentLevel === true, `summary: ${JSON.stringify(tables.summary("t", "a"))}`);
+  // And no mount can be filed under it.
+  const store = new SqliteStore(":memory:");
+  await store.init();
+  await store.createAgent("t", "a");
+  await refused(() => store.addMount({
+    tenantId: "t", agentId: "a", alias: AGENT_SCOPE_ALIAS, plugin: "p", installationId: "i", connectionId: null,
+    toolVersion: "1.0.0", publicConfig: {}, secretRef: null, policy: null,
+  }), /agent-level/, "a mount named for the agent-level database");
+  await store.addMount({
+    tenantId: "t", agentId: "a", alias: "m", plugin: "p", installationId: "i", connectionId: null,
+    toolVersion: "1.0.0", publicConfig: {}, secretRef: null, policy: null,
+  });
+  const r = await store.renameMount("t", "a", "m", AGENT_SCOPE_ALIAS, null);
+  must(!r.ok, "a mount was renamed to the agent-level database's name");
 });
 
 for (const r of results) {

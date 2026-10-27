@@ -1512,11 +1512,12 @@ ${table(["kind", "state", "age"], (d.outbox ?? []).map((o: any) =>
 <h3>mounts</h3>
 ${table(["alias", "plugin", "config", "credential", "policy"], (d.mounts ?? []).map((m: any) =>
       [m.alias, m.plugin, cfg(m.public_config), m.secret_ref ?? "—",
-       m.policy ? cfg(m.policy) : "open"]))}
+       [m.policy ? cfg(m.policy) : m.default_policy ? "" : "open",
+        m.default_policy ? `plugin default ${cfg(m.default_policy)}` : ""].filter(Boolean).join("; ")]))}
 
 <h3>databases</h3>
 ${table(["mount", "plugin", "store", "keys", "updated"], (d.databases ?? []).map((c: any) =>
-      [c.alias, c.plugin, c.store, String(c.keys), ago(Number(c.updatedAt))]))}
+      [c.agentLevel ? "agent-level (every mount of this plugin)" : c.alias, c.plugin, c.store, String(c.keys), ago(Number(c.updatedAt))]))}
 
 <h3>operations</h3>
 ${table(["tool", "status", "parked to", "when"], (d.operations ?? []).map((o: any) =>

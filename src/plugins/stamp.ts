@@ -28,16 +28,17 @@
  * this mount must be a dedicated login that no CLI keeps using, and those two
  * codes are reported as what they are rather than retried.
  *
- * **Push is not here.** It needs a working tree; `sandboxForm` below gives the
- * container `git` over Stamp's HTTPS endpoint, with the session swapped in by
- * the egress proxy, so the container never holds it.
+ * **Push is not here, and neither is `git` in the container.** It needs a
+ * working tree, and the container form that would give one is left out until it
+ * can carry the session's *current access token*; see the note where
+ * `sandboxForm` would be, in the plugin below.
  */
 import type { Json } from "../core/types.ts";
 import { openText, sealText } from "./raft-agent-login.ts";
 import type { CredentialCheck, Plugin, PluginContext, ToolSchema } from "./types.ts";
 import { credentialState, identityNote, markIdentity } from "./types.ts";
 
-/** The one host this plugin talks to. See `sandboxForm` for why it is not a setting. */
+/** The one host this plugin talks to. Not a setting: nothing here has been tried against a self-hosted Stamp. */
 const ORIGIN = "https://stamp.build";
 /** Stamp caps page size itself; clamping makes the limit visible in the schema. */
 const MAX_LIMIT = 100;
@@ -88,90 +89,316 @@ function needsRefresh(session: AgentSession, now: number, skewMs: number): boole
 }
 
 /**
- * Rotations in flight, one per mount. A refresh token is single-use, so two
- * concurrent calls that both rotated would make one of them `refresh_reused` —
- * which revokes every token that agent holds. Keyed by the mount's place rather
- * than by the object, because the same plugin serves every mount in the isolate.
+ * One queue for everything that writes a stamp mount's session: sealing the
+ * credential on first use, and each rotation. A refresh token is single-use, so
+ * two calls that both rotated would make one of them `refresh_reused` — which
+ * revokes every token that agent holds — and sharing one rotation in flight is
+ * not enough: a call that read the session before another rotated it and
+ * finished still holds the spent token. So whoever is next in the queue reads
+ * the session again before acting (`rotate`, `loadSession`). Keyed by the
+ * mount's place rather than by the object, because the same plugin serves every
+ * mount in the isolate; one isolate per agent is what makes it the only queue.
+ * The place is the one the row is sealed under (`sealPlace`), not the alias: a
+ * rename moves the row and changes the alias, and a queue keyed by the alias
+ * would let a call under the new name rotate beside one still running under the
+ * old. With the alias held fixed, an agent's stamp mounts share one queue, which
+ * costs a wait on a rotation every quarter hour and nothing else: at most one
+ * refresh timeout (30 s) when another mount's refresh hangs.
  */
-const inflight = new Map<string, Promise<AgentSession>>();
-const inlineKey = (ctx: PluginContext) => `${ctx.caller.tenantId}\u0000${ctx.caller.agentId}\u0000${ctx.alias}`;
+const queues = new Map<string, Promise<unknown>>();
+const inlineKey = (ctx: PluginContext) => {
+  const place = sealPlace(ctx);
+  return `${place.caller.tenantId}\u0000${place.caller.agentId}\u0000${place.alias}`;
+};
+
+async function exclusive<T>(ctx: PluginContext, fn: () => Promise<T>): Promise<T> {
+  const key = inlineKey(ctx);
+  const run = (queues.get(key) ?? Promise.resolve()).then(fn, fn);
+  const tail = run.then(() => {}, () => {});
+  queues.set(key, tail);
+  try { return await run; } finally { if (queues.get(key) === tail) queues.delete(key); }
+}
 
 /**
- * The session this mount acts with: the rotated one it keeps, else the one its
- * credential carries.
+ * What this mount keeps, as far as `ctx` can tell:
+ * - `none`: no row. The mount has never used its credential.
+ * - `open`: the session, which this credential's key opens.
+ * - `replaced`: a row that descends from some other session, so a person has
+ *   supplied a new one since, and that one has never been used here.
+ * - `spent`: a row that descends from this credential's session and no longer
+ *   opens — it is damaged, or the key it was sealed under is gone. Its refresh
+ *   token may have been used already, so nothing is sent with it.
+ * - `unfinished`: the row opens, but to a session whose rotation was started and
+ *   never finished (`rotating`, below). The gateway may have rotated it already
+ *   and the answer never been kept, so its refresh token is treated as spent.
  *
- * The stored row is sealed under a key derived from the *credential*, so a
- * credential replaced or removed opens none of the rows kept under it and the
- * mount falls back to the new value — which is right: the old session belonged
- * to the identity the old credential named.
+ * A row that does not open is told apart by `from`, kept beside the ciphertext:
+ * a digest of the refresh token of the credential it descends from. A row
+ * without one reads as `spent`, since the safe guess is the one that sends
+ * nothing — that includes every row #1045 wrote, renamed or not; removing the
+ * mount deletes it, and a new mount with a fresh sign-in starts clean. A
+ * credential is `replaced` only when no mount of this agent has been given it
+ * before (`GIVEN_STORE`).
  */
-export async function loadSession(ctx: PluginContext): Promise<AgentSession | null> {
-  const row = await ctx.db.get(SESSION_STORE, SESSION_KEY).catch(() => null);
-  const sealed = row && typeof row === "object" ? row as Record<string, unknown> : null;
-  if (sealed && typeof sealed.iv === "string" && typeof sealed.ciphertext === "string") {
-    const plain = await openText(ctx, SEAL_INFO, { iv: sealed.iv, ciphertext: sealed.ciphertext }, SESSION_KEY);
-    const s = plain === null ? null : parseSession(plain);
-    if (s) return s;
-  }
-  return parseSession(ctx.credential);
+type Kept = { kind: "none" } | { kind: "open"; session: AgentSession } | { kind: "spent" } | { kind: "replaced" } | { kind: "unfinished" };
+
+/**
+ * Every session a person has given this agent's stamp mounts, by the digest of
+ * its refresh token, in the agent-level database (`ctx.agentDb`): kept when a
+ * mount is removed or renamed, and shared by every stamp mount of the agent.
+ * Written before a credential is first sealed, so a session that has ever been
+ * used here — by a removed mount, by another mount — is refused rather than
+ * presented again. Grows only when a person signs in.
+ */
+const GIVEN_STORE = "stampGiven";
+
+/** A refresh token as a row may name it: a digest, never the token. */
+async function digest(refreshToken: string): Promise<string> {
+  const d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`${SEAL_INFO}\u0000${refreshToken}`));
+  return Array.from(new Uint8Array(d), (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-/** Keep a rotated session, or refuse to go on: it is never used unstored. */
-async function storeSession(ctx: PluginContext, session: AgentSession): Promise<void> {
-  const sealed = await sealText(ctx, SEAL_INFO, JSON.stringify(session), SESSION_KEY);
-  await ctx.db.put(SESSION_STORE, sealed as unknown as Json, SESSION_KEY);
+/** Which session a kept row descends from, without keeping any of it. */
+async function lineage(credential: string | null): Promise<string | null> {
+  const s = parseSession(credential);
+  return s ? digest(s.refresh_token) : null;
 }
 
 /**
- * One rotation, shared by every call that needs it.
+ * The context the session is sealed under: this mount's, with the alias held
+ * fixed. `sealingKeyFor` salts with tenant, agent and alias, and an alias can be
+ * renamed (cf/src/runtime.ts `renameMount`, which moves this database with it):
+ * under the real alias, a rename would leave a row no key opens beside a
+ * credential whose refresh token is spent. The alias only separates mounts,
+ * and each mount's row already lives in its own database; `SEAL_INFO` keeps
+ * this seal apart from every other kind.
+ */
+const sealPlace = (ctx: PluginContext): PluginContext => ({ ...ctx, alias: "stamp-session" });
+
+async function readKept(ctx: PluginContext): Promise<Kept> {
+  let row: unknown;
+  // Not swallowed: an unread row and an absent one look the same from here, and
+  // reading it as absent is what sends the spent refresh token.
+  try { row = await ctx.db.get(SESSION_STORE, SESSION_KEY); } catch (e) {
+    throw new Error(`stamp: could not read this mount's session (${String((e as Error)?.message ?? e).slice(0, 200)}). ` +
+      "It is not replaced by the one the mount was given, whose refresh token may already be spent; try again.");
+  }
+  if (row === null || row === undefined) return { kind: "none" };
+  const sealed = typeof row === "object" && !Array.isArray(row) ? row as Record<string, unknown> : {};
+  if (typeof sealed.iv === "string" && typeof sealed.ciphertext === "string") {
+    const plain = await openText(sealPlace(ctx), SEAL_INFO, { iv: sealed.iv, ciphertext: sealed.ciphertext }, SESSION_KEY);
+    const s = plain === null ? null : parseSession(plain);
+    if (s && typeof sealed.rotating === "string" && sealed.rotating === await digest(s.refresh_token)) return { kind: "unfinished" };
+    if (s) return { kind: "open", session: s };
+  }
+  const from = await lineage(ctx.credential);
+  const fresh = typeof sealed.from === "string" && from !== null && sealed.from !== from && !(await wasGiven(ctx, from));
+  return { kind: fresh ? "replaced" : "spent" };
+}
+
+/** The agent-level record, or a refusal: without it a removed mount's session would look new. */
+function givenDb(ctx: PluginContext) {
+  if (!ctx.agentDb) {
+    throw new Error("stamp: this context keeps no agent-level record of the sessions this agent was given, so a new one " +
+      "cannot be told from one already used; nothing was sent");
+  }
+  return ctx.agentDb;
+}
+async function wasGiven(ctx: PluginContext, d: string): Promise<boolean> {
+  const row = await givenDb(ctx).get(GIVEN_STORE, d);
+  return row !== null && row !== undefined;
+}
+
+/** A mount whose kept session is lost: what it was given may be spent, so only a person can go on. */
+class SpentSession extends Error {}
+const spentSession = () => new SpentSession(
+  "stamp: this mount's session is kept but cannot be opened, and the session it was given may have been refreshed " +
+  "already — sending a spent refresh token makes Stamp revoke every token this agent holds, on every machine. " +
+  "It needs sign-in again: a person signs in for this mount alone and gives it that session.",
+);
+/** A mount whose last rotation was started and never kept: the gateway may have spent its refresh token. */
+const unfinishedRotation = () => new SpentSession(
+  "stamp: a person needs to sign in again for this mount: its last refresh did not finish, so the gateway may have " +
+  "rotated the session without this side keeping the new one. Nothing was sent — presenting that refresh token again " +
+  "makes Stamp revoke every token this agent holds, on every machine. A person signs in for this mount alone and gives it that session.",
+);
+/** A credential some mount of this agent was already given: it may have been rotated, so it is never sealed again. */
+const givenBefore = () => new SpentSession(
+  "stamp: this session was already given to this agent — to a mount since removed, or to another stamp mount — and may " +
+  "have been refreshed there, which spends it; presenting it would make Stamp revoke every token this agent holds. " +
+  "It needs sign-in again: a person signs in for this mount alone and gives it that new session.",
+);
+const refuseUnusable = (kept: Kept) => {
+  if (kept.kind === "spent") throw spentSession();
+  if (kept.kind === "unfinished") throw unfinishedRotation();
+};
+
+/**
+ * The session this mount acts with, and only ever the kept one.
+ *
+ * The credential is used once: the first time the mount has no row, or the
+ * first time after a person replaced it, it is sealed into the row before
+ * anything is sent, and every read after that is the row's. **Never the
+ * credential once the row exists**, because the credential's refresh token is
+ * spent by the first rotation and the gateway answers a spent one by revoking
+ * every token the agent holds; so a row that cannot be read or opened is an
+ * error a person resolves, not a reason to fall back.
+ *
+ * `keep: false` reads without sealing, for a credential check: the value checked
+ * there may be a candidate the mount does not hold yet (`checkMount`), and
+ * sealing it would put a row the live credential cannot open over the one it
+ * can.
+ */
+export async function loadSession(ctx: PluginContext, keep = true): Promise<AgentSession | null> {
+  const given = parseSession(ctx.credential);
+  if (!given) return null;
+  let kept = await readKept(ctx);
+  // A mark read outside the queue may be a rotation still running here: wait
+  // for it, then read again. A mark still there inside the queue is one nobody
+  // here is finishing.
+  if (kept.kind === "unfinished") kept = await exclusive(ctx, () => readKept(ctx));
+  if (kept.kind === "open") return kept.session;
+  refuseUnusable(kept);
+  const d = await digest(given.refresh_token);
+  // Asked here only for a check; a call asks in the queue, after the read that
+  // sees a seal another call made since the read above.
+  if (!keep) {
+    if (await wasGiven(ctx, d)) throw givenBefore();
+    return given;
+  }
+  // Read again in the queue: another call may have sealed it, and rotated it,
+  // since the read above, and sealing `given` over that would bring the spent
+  // token back.
+  return exclusive(ctx, async () => {
+    const again = await readKept(ctx);
+    if (again.kind === "open") return again.session;
+    refuseUnusable(again);
+    if (await wasGiven(ctx, d)) throw givenBefore();
+    // Recorded before it is sealed: a record that never happened would let a
+    // removed mount's session back in. If the seal then fails, the record is
+    // taken back — it is this call's own (`wasGiven` was false a moment ago)
+    // and nothing has been sent — unless the row turns out to hold the session
+    // after all (a write that failed late), or cannot be read to say: then it
+    // stays, and the cost is a sign-in.
+    await givenDb(ctx).put(GIVEN_STORE, { at: new Date().toISOString() }, d);
+    try { await storeSession(ctx, given); } catch (e) {
+      let kept: Kept | null = null;
+      try { kept = await readKept(ctx); } catch { /* unread: keep the record */ }
+      if (kept !== null && kept.kind !== "open") {
+        try { await givenDb(ctx).delete(GIVEN_STORE, d); } catch { /* kept: the safe side */ }
+      }
+      throw e;
+    }
+    return given;
+  });
+}
+
+/**
+ * Keep a session, or refuse to go on: it is never used unstored. `rotating` is
+ * the digest of the refresh token about to be presented, written before it is:
+ * a row that still carries it afterwards reads as `unfinished`.
+ */
+async function storeSession(ctx: PluginContext, session: AgentSession, rotating?: string): Promise<void> {
+  const sealed = await sealText(sealPlace(ctx), SEAL_INFO, JSON.stringify(session), SESSION_KEY);
+  const row = { ...sealed, from: await lineage(ctx.credential), ...(rotating ? { rotating } : {}) };
+  await ctx.db.put(SESSION_STORE, row as unknown as Json, SESSION_KEY);
+}
+
+/**
+ * One rotation at a time per mount (`exclusive`), and none when another call has rotated already.
  *
  * `POST /api/auth/agent/refresh` is a closed body — no session header, no Raft
  * credential (`agentRefresh` in botiverse/stamp `internal/gateway/agent_cli_login.go`, as of server-v0.1.191) — so a
  * mount that holds a refresh token can rotate without a person present.
  */
 async function rotate(ctx: PluginContext, used: AgentSession): Promise<AgentSession> {
-  const key = inlineKey(ctx);
-  const running = inflight.get(key);
-  if (running) return running;
+  return exclusive(ctx, async () => {
+    // Read again here, in the queue: a call that read the session before
+    // another call rotated it holds a spent refresh token, and sending it is
+    // the `refresh_reused` this file opens with. A newer session is used as it is.
+    const kept = await readKept(ctx);
+    refuseUnusable(kept);
+    if (kept.kind !== "open") throw new Error("stamp: this mount's session changed while it was being refreshed; nothing was sent — try again");
+    if (kept.session.refresh_token !== used.refresh_token) return kept.session;
 
-  const job = (async () => {
-    const res = await fetch(new URL("/api/auth/agent/refresh", ORIGIN), {
-      method: "POST",
-      headers: { accept: "application/json", "content-type": "application/json", "user-agent": "antiproton/0.1" },
-      body: JSON.stringify({ schema: "raft-cli-agent-refresh.v1", refresh_token: used.refresh_token }),
-      signal: AbortSignal.timeout(30_000),
-      redirect: "error",
-    });
-    const text = await res.text();
+    // Marked before it is sent. From the moment the POST leaves, the gateway may
+    // rotate and the answer may never be kept — a timeout, a dropped connection,
+    // a proxy that fails after the commit, a write that fails — and the row would
+    // still open to the token just spent. The mark makes that row `unfinished`,
+    // so nothing sends it again. Only an answer that shows the gateway did not
+    // rotate clears it; every other end leaves it for a person, the side that
+    // sends nothing. If the mark cannot be written, nothing is sent at all.
+    const marking = await digest(used.refresh_token);
+    await storeSession(ctx, used, marking);
+
+    let res: Response;
+    let text: string;
+    try {
+      res = await fetch(new URL("/api/auth/agent/refresh", ORIGIN), {
+        method: "POST",
+        headers: { accept: "application/json", "content-type": "application/json", "user-agent": "antiproton/0.1" },
+        body: JSON.stringify({ schema: "raft-cli-agent-refresh.v1", refresh_token: used.refresh_token }),
+        signal: AbortSignal.timeout(30_000),
+        redirect: "error",
+      });
+      text = await res.text();
+    } catch (e) {
+      throw new Error(`stamp: the refresh got no answer (${String((e as Error)?.message ?? e).slice(0, 200)}). ` +
+        "The gateway may have rotated the session, so this mount will not present that refresh token again: " +
+        "a person needs to sign in again for this mount alone and give it that session.");
+    }
     let body: Record<string, unknown> = {};
     try { body = text ? JSON.parse(text) as Record<string, unknown> : {}; } catch { body = { text: text.slice(0, 500) }; }
 
     if (!res.ok) {
       const code = String(body.error ?? body.code ?? body.errorCode ?? "");
       // Not retried, and said in the only terms that help: somebody has to act.
-      if (code === "refresh_reused" || code === "refresh_revoked") {
-        throw new Error(
-          `stamp: this session's refresh token was already used elsewhere or has been revoked (${code}), and the gateway ` +
-          "revokes every token that agent holds for the service when that happens — including other machines. " +
-          "A person needs to sign in again for this mount alone and give it that session; do not retry.",
+      // The mark stays: the gateway has said this token is spent, or will never
+      // rotate again (botiverse/stamp `agentRefresh`: 409 for the first three,
+      // 400 `refresh_invalid` for a token it does not know). `refresh_reused`
+      // also ends every live session the agent holds for the service, so the
+      // agent's other stamp mounts answer `refresh_revoked` next.
+      if (code === "refresh_reused" || code === "refresh_revoked" || code === "refresh_expired" || code === "refresh_invalid") {
+        throw new Error(code === "refresh_expired" || code === "refresh_invalid"
+          ? `stamp: the gateway will never refresh this session's refresh token (${code}). ` +
+            "A person needs to sign in again for this mount alone and give it that session; do not retry."
+          : `stamp: this session's refresh token was already used elsewhere or has been revoked (${code}), and the gateway ` +
+            "revokes every token that agent holds for the service when that happens — including other machines. " +
+            "A person needs to sign in again for this mount alone and give it that session; do not retry.",
         );
       }
-      throw new Error(`stamp: could not refresh the session (${res.status}${code ? ` ${code}` : ""}) — ` +
-        `${String(body.message ?? body.text ?? "").slice(0, 300)}`.trim());
+      const said = `stamp: could not refresh the session (${res.status}${code ? ` ${code}` : ""}) — ` +
+        `${String(body.message ?? body.text ?? "").slice(0, 300)}`.trim();
+      // A 5xx may come after the gateway committed the rotation — its own 503
+      // when the commit fails or a concurrent refresh won, a proxy's 502/504 —
+      // so the mark stays. Any other 4xx (`invalid_schema`: this plugin's
+      // request is wrong) is refused before anything rotates, so the token is
+      // as it was and the mark comes off; if that write fails the mark stays,
+      // which only costs a sign-in.
+      if (res.status >= 500) {
+        throw new Error(`${said}. The gateway may have rotated the session before failing, so this mount will not ` +
+          "present that refresh token again: a person needs to sign in again for this mount alone and give it that session.");
+      }
+      await storeSession(ctx, used);
+      throw new Error(said);
     }
 
     const next = parseSession({ ...body, access_token: body.access_token ?? (body as any).accessToken,
       refresh_token: body.refresh_token ?? (body as any).refreshToken });
-    if (!next) throw new Error("stamp: the refresh answered something that is not a session; nothing was stored");
+    if (!next) {
+      throw new Error("stamp: the refresh answered something that is not a session; nothing was stored. The gateway may " +
+        "have rotated the session, so a person needs to sign in again for this mount alone and give it that session.");
+    }
 
     // Before it is used, always: a rotation that cannot be kept would leave the
     // caller holding a token the next call cannot rotate again.
-    await storeSession(ctx, next);
+    try { await storeSession(ctx, next); } catch (e) {
+      throw new Error(`stamp: the gateway rotated this mount's session, but the new one could not be kept ` +
+        `(${String((e as Error)?.message ?? e).slice(0, 200)}). The refresh token this mount holds is now spent, so it ` +
+        "will not be sent again: a person needs to sign in again for this mount alone and give it that session.");
+    }
     return next;
-  })().finally(() => { inflight.delete(key); });
-
-  inflight.set(key, job);
-  return job;
+  });
 }
 
 /**
@@ -245,35 +472,127 @@ function receiptOut(r: any): Record<string, Json> {
   };
 }
 
+/** Where a request may go: the gateway's own API, and GitHub's through it. Never `/api/auth/*`. */
+const API_PREFIXES = ["/v1/", "/api/v3/"] as const;
+
 /**
  * A path in this gateway, never a URL: the host is ours to decide, so no
  * argument can reach another origin. `stamp api` is the one tool that forwards
  * to GitHub's own API, and it is held to the same rule.
+ *
+ * **The prefix is checked on what is sent, not on what was typed.** `new URL`
+ * resolves dot segments, `%2e` included, so `/v1/../api/auth/…` passes a check
+ * on the string and reaches the session endpoints with the Bearer token. So the
+ * path is resolved first and its `pathname` is what must start with a prefix;
+ * and a segment that is a dot segment once percent-decoded, however many times
+ * (`%252e%252e`), is refused outright, because a server or proxy that decodes
+ * once more than `URL` does would resolve it after this check.
+ *
+ * Under /v1/ no `%` at all: every /v1/ route Stamp serves takes ids, numbers,
+ * owner and repository names in its path, never free text (the route table in
+ * botiverse/stamp `internal/gateway`, read at 6526607d), so an escape there is
+ * only ever a way to say something else. Under /api/v3/ an escape is how a
+ * label or file name with a space is named, and Stamp's proxy decodes the path
+ * once and refuses dot segments and a `%` left after that (`apiSafeSegment`),
+ * so there only what decodes to a dot segment is refused here.
  */
 function gatewayPath(raw: unknown, allowed: readonly string[]): string {
   const path = String(raw ?? "");
   if (!path.startsWith("/") || path.startsWith("//") || /^[a-z]+:/i.test(path)) {
     throw new Error(`path must start with ${allowed.join(" or ")} and carry no host, got ${JSON.stringify(path).slice(0, 60)}`);
   }
-  if (!allowed.some((p) => path.startsWith(p))) {
+  const bare = path.split(/[?#]/, 1)[0];
+  if (bare.startsWith("/v1/") && bare.includes("%")) {
+    throw new Error(`a /v1/ path carries no escapes, got ${JSON.stringify(path).slice(0, 60)}`);
+  }
+  for (const segment of bare.split("/")) {
+    let s = segment;
+    for (let i = 0; i < 4 && s.includes("%"); i++) {
+      try { s = decodeURIComponent(s); } catch { break; }
+    }
+    // Split again on what decoding produced: `..%2f..` is one segment as sent and two after one more decode.
+    if (s.split(/[\\/]/).some((piece) => piece === "." || piece === "..")) {
+      throw new Error(`path must not climb out of ${allowed.join(" or ")}, got ${JSON.stringify(path).slice(0, 60)}`);
+    }
+  }
+  const url = new URL(ORIGIN + path);
+  if (url.origin !== ORIGIN || !allowed.some((p) => url.pathname.startsWith(p))) {
     throw new Error(`path must start with ${allowed.join(" or ")}, got ${JSON.stringify(path).slice(0, 60)}`);
   }
-  return path;
+  return url.pathname + url.search;
 }
+
+/**
+ * What `api` must not do, because a dedicated tool does it and that tool is held
+ * for a person by default (`defaultPolicy`): a mount that lifted `api` for some
+ * other write would otherwise approve or merge through it. Matched on the path
+ * as Stamp will route it — decoded, empty segments and a trailing slash
+ * dropped, any case — so a
+ * spelling that reaches the same route is the same route. Null: not held.
+ */
+function heldRoute(path: string, body: unknown): "an approval" | "a merge" | null {
+  let p = path.split("?", 1)[0];
+  try { p = decodeURIComponent(p); } catch { /* gatewayPath already refused what would matter */ }
+  // Empty segments collapsed: `pulls/7//merge` must meet the hold, not a redirect further on.
+  p = p.replace(/\/{2,}/g, "/").replace(/\/+$/, "").toLowerCase();
+  if (/^\/v1\/repositories\/[^/]+\/[^/]+\/pulls\/[^/]+\/approve$/.test(p)) return "an approval";
+  if (/^\/v1\/repositories\/[^/]+\/[^/]+\/pulls\/[^/]+\/(merge|auto-merge|queue(\/[^/]+)?)$/.test(p)) return "a merge";
+  if (/^\/api\/v3\/repos\/[^/]+\/[^/]+\/(pulls\/[^/]+\/merge|merges)$/.test(p)) return "a merge";
+  if (/^\/api\/v3\/repos\/[^/]+\/[^/]+\/pulls\/[^/]+\/reviews(\/[^/]+\/events)?$/.test(p)) {
+    const event = body && typeof body === "object" ? String((body as Record<string, unknown>).event ?? "") : "";
+    if (event.toUpperCase() === "APPROVE") return "an approval";
+  }
+  return null;
+}
+
+/** A path segment from an argument: a name, never `.` or `..`, which `URL` would resolve. */
+const NAME = /^(?!\.\.?$)[A-Za-z0-9._-]+$/;
 
 function repoOf(args: Record<string, any>): { owner: string; repo: string } {
   const full = String(args.repo ?? "");
-  const m = /^([A-Za-z0-9._-]+)\/([A-Za-z0-9._-]+)$/.exec(full);
-  if (!m) throw new Error(`repo must be "owner/name", got ${JSON.stringify(full).slice(0, 40)}`);
-  return { owner: m[1], repo: m[2] };
+  const [owner, repo, ...rest] = full.split("/");
+  if (rest.length || !NAME.test(owner ?? "") || !NAME.test(repo ?? "")) {
+    throw new Error(`repo must be "owner/name", got ${JSON.stringify(full).slice(0, 40)}`);
+  }
+  return { owner, repo };
+}
+
+/** A commit an approval or merge is about: the full SHA, so a missing one is refused rather than sent as "undefined". */
+function sha(args: Record<string, any>, key: "head" | "base"): string {
+  const v = args[key];
+  if (typeof v !== "string" || !/^[0-9a-f]{40}$/i.test(v)) {
+    throw new Error(`${key} must be the full 40-character commit SHA, got ${JSON.stringify(v ?? null).slice(0, 50)}`);
+  }
+  return v.toLowerCase();
+}
+
+/** An issue or pull request number, refused before any request when it is not one. */
+function numberOf(args: Record<string, any>, what: string): number {
+  const n = Number(args.number);
+  if (typeof args.number === "boolean" || !Number.isInteger(n) || n <= 0) {
+    throw new Error(`number must be ${what} number, got ${JSON.stringify(args.number ?? null)}`);
+  }
+  return n;
 }
 
 const prBase = (a: Record<string, any>) => {
   const { owner, repo } = repoOf(a);
-  const n = Number(a.number);
-  if (!Number.isInteger(n) || n <= 0) throw new Error(`number must be a pull request number, got ${JSON.stringify(a.number)}`);
-  return `/v1/repositories/${owner}/${repo}/pulls/${n}`;
+  return `/v1/repositories/${owner}/${repo}/pulls/${numberOf(a, "a pull request")}`;
 };
+
+/** One request with one access token, nothing rotated: what `call` sends, and all a credential check sends. */
+function send(method: string, path: string, token: string, body?: unknown): Promise<Response> {
+  const headers: Record<string, string> = { accept: "application/json", "user-agent": "antiproton/0.1" };
+  headers.authorization = `Bearer ${token}`;
+  if (body !== undefined) headers["content-type"] = "application/json";
+  // Every path again, whoever built it: an argument reaches most of them (a receipt id, a repo).
+  return fetch(new URL(ORIGIN + gatewayPath(path, API_PREFIXES)), {
+    method, headers,
+    body: body === undefined ? undefined : JSON.stringify(body),
+    signal: AbortSignal.timeout(30_000),
+    redirect: "error",
+  });
+}
 
 /**
  * One request to the gateway, with the mount's session attached here and never
@@ -281,28 +600,20 @@ const prBase = (a: Record<string, any>) => {
  * been rotated by another call between reading it and sending it.
  */
 async function call(method: string, path: string, ctx: PluginContext, body?: unknown): Promise<any> {
-  const send = async (token: string) => {
-    const headers: Record<string, string> = { accept: "application/json", "user-agent": "antiproton/0.1" };
-    headers.authorization = `Bearer ${token}`;
-    if (body !== undefined) headers["content-type"] = "application/json";
-    return fetch(new URL(ORIGIN + path), {
-      method, headers,
-      body: body === undefined ? undefined : JSON.stringify(body),
-      signal: AbortSignal.timeout(30_000),
-      redirect: "error",
-    });
-  };
-
   let { token } = await accessToken(ctx, false);
-  let res = await send(token);
+  let res = await send(method, path, token, body);
   if (res.status === 401) {
     const rotated = await accessToken(ctx, true);
     if (rotated.token !== token) {
       token = rotated.token;
-      res = await send(token);
+      res = await send(method, path, token, body);
     }
   }
+  return answer(method, path, res);
+}
 
+/** A gateway answer as a value, or its refusal as an error carrying the gateway's own code. */
+async function answer(method: string, path: string, res: Response): Promise<any> {
   const text = await res.text();
   let parsed: any = null;
   try { parsed = text ? JSON.parse(text) : null; } catch { parsed = { text: text.slice(0, 2_000) }; }
@@ -343,7 +654,7 @@ export const stampPlugin: Plugin = {
    * The rotating session. Not `listed`: it exists, and that it exists is
    * listable, never what is in it.
    */
-  database: { version: 1, stores: { [SESSION_STORE]: {} } },
+  database: { version: 2, stores: { [SESSION_STORE]: {}, [GIVEN_STORE]: {} } },
   credential: {
     required: true,
     summary: "A Stamp agent session: the JSON `stamp login` keeps (access_token, refresh_token, access_expires_at), signed in for this mount alone.",
@@ -354,43 +665,34 @@ export const stampPlugin: Plugin = {
     docs: "https://docs.stamp.build/agents/setup.md",
   },
   config: [],
-  /**
-   * `git` in the agent's container, as this mount's agent, over Stamp's HTTPS
-   * git endpoint.
+  /*
+   * No `sandboxForm`, so no `git` over Stamp's HTTPS endpoint in the container.
    *
-   * Measured on stamp.build 2026-10-23: `git ls-remote` with `credential.helper`
-   * emptied and only `http.https://stamp.build/.extraHeader=Authorization:
-   * Bearer <session>` succeeds, and `info/refs?service=git-receive-pack` answers
-   * 200 with that header and 401 without it. The egress proxy substitutes the
-   * session for the placeholder on the way out, so the container never holds it.
+   * A form hands the egress proxy the mount's *credential* (gateway
+   * `sandboxForms`), and here that is the whole session JSON: the header went out
+   * as `Bearer {"access_token":…,"refresh_token":…}` (#1051), which git cannot
+   * authenticate with and which registered the refresh token as a container
+   * egress secret. Sending only `access_token` would not fix it: the credential
+   * never changes while the session this mount rotates lives in its database, so
+   * the container would hold the first access token and get 401 fifteen minutes
+   * later.
    *
-   * The `_0` index below is not a claim on that slot: `sandbox.ts` numbers every
-   * wired form's git settings again across the container, which is what lets
-   * this form sit beside github's credential helper.
-   *
-   * **The host is fixed, and that is a limitation.** `sandboxForm` is static, so
-   * a mount of a self-hosted Stamp would claim `stamp.build` and reach nothing.
-   * Supporting one needs `sandboxForm` to be a function of the mount; until it
-   * is, this plugin speaks to stamp.build only, which is why it has no `url`
-   * setting (a setting the container form cannot honour is worse than none).
+   * What would bring it back: a form whose egress value is read when each request
+   * leaves — this mount's current access token, rotated here first when due, and
+   * never the refresh token — rather than derived once from the credential. The
+   * measured part still holds (stamp.build 2026-10-23: `git ls-remote` with only
+   * `http.https://stamp.build/.extraHeader=Authorization: Bearer <access token>`
+   * succeeds; `info/refs?service=git-receive-pack` answers 200 with it, 401
+   * without).
    */
-  sandboxForm: {
-    summary:
-      "git over HTTPS to stamp.build works here as this agent's Stamp identity: `git clone https://stamp.build/github/OWNER/REPO.git`, " +
-      "and `git push` from a checkout prepared with `stamp repo use --https` (install the CLI from https://stamp.build/install.sh if it is missing).",
-    egress: [{
-      name: "STAMP_SESSION",
-      header: "authorization",
-      hosts: ["stamp.build"],
-      value: (session: string) => `Bearer ${session}`,
-      placeholder: (p: string) => `Bearer ${p}`,
-    }],
-    env: (p) => ({
-      GIT_CONFIG_COUNT: "1",
-      GIT_CONFIG_KEY_0: "http.https://stamp.build/.extraHeader",
-      GIT_CONFIG_VALUE_0: `Authorization: Bearer ${p}`,
-    }),
-  },
+  /**
+   * The tools a person signs unless the mount names them otherwise. Approving
+   * and merging cannot be undone by trying again, and `api` writes to anything
+   * under /v1/ or GitHub's API — including approving and merging. An absent mount
+   * policy allows everything (`policyFor`), so without this they would run
+   * unattended on every mount that did not think to say.
+   */
+  defaultPolicy: { tools: { pr_approve: "approval", pr_merge: "approval", api: "approval" } },
   tools: [
     t("whoami", "Which agent this mount acts as on Stamp: handle, server, the commit email a push must be committed by, and whether this instance serves git over HTTPS.",
       {}, [], "read"),
@@ -422,8 +724,8 @@ export const stampPlugin: Plugin = {
 
     // The two tools whose misuse cannot be undone by trying again. Both name the
     // exact head and base they are about, so an approval cannot silently attach
-    // to a commit that arrived after the review, and both are documented to sit
-    // behind the mount's `approval` policy: a person signs each one.
+    // to a commit that arrived after the review, and both are held for a person
+    // by `defaultPolicy` above unless the mount's own policy names them.
     t("pr_approve", "Approve the exact head of a pull request, which is what lets it merge. An approval counts for one commit. Approving a pull request this agent opened is refused unless evidence is supplied, which this tool does not do — the refusal names why.",
       { ...REPO_ARG, ...PR_NUMBER, ...HEAD_ARG, note: { type: "string", description: "why, for the record" } },
       ["repo", "number", "head", "base"], "write", "native"),
@@ -472,8 +774,27 @@ export const stampPlugin: Plugin = {
         reason: "not a Stamp agent session — this mount needs the JSON `stamp login` keeps, with access_token and refresh_token (a cookie or a GitHub token is not one)",
       };
     }
+    // Never rotates, so never writes. The value checked is often a candidate the
+    // mount does not hold yet (`checkMount`), sharing the mount's one session
+    // row: storing its rotation would put a session the live credential cannot
+    // open over the one it can, and the next call would be `spent`; rotating
+    // without storing would spend the candidate's refresh token before it is
+    // kept. So the check asks with the access token it has, and an expired one
+    // is left unchecked rather than refreshed.
+    let session: AgentSession | null;
+    try { session = await loadSession(ctx, false); } catch (e) {
+      if (e instanceof SpentSession) return { ok: false, kind: "rejected", reason: e.message.slice(0, 300) };
+      throw e;
+    }
+    if (!session) throw noSession(ctx);
+    if (needsRefresh(session, Date.now(), 0)) {
+      return {
+        ok: false, kind: "unreachable",
+        reason: "not checked: this session's access token has expired, and checking it would spend its refresh token. The first call refreshes it",
+      };
+    }
     try {
-      const me = await call("GET", "/v1/me", ctx);
+      const me = await answer("GET", "/v1/me", await send("GET", "/v1/me", session.access_token));
       const handle = me?.handle ?? me?.principal?.handle;
       return { ok: true, account: typeof handle === "string" ? `@${handle}` : undefined };
     } catch (e) {
@@ -553,15 +874,15 @@ export const stampPlugin: Plugin = {
         return (await call("POST", `${prBase(a)}/comments`, ctx, { body: String(a.body) })) as Json;
 
       case "pr_approve": {
-        const body: Record<string, unknown> = { expectedHead: String(a.head), expectedBase: String(a.base) };
+        const body: Record<string, unknown> = { expectedHead: sha(a, "head"), expectedBase: sha(a, "base") };
         if (a.note !== undefined) body.body = String(a.note);
         return (await call("POST", `${prBase(a)}/approve`, ctx, body)) as Json;
       }
       case "pr_unapprove":
         return (await call("POST", `${prBase(a)}/unapprove`, ctx,
-          { expectedHead: String(a.head), expectedBase: String(a.base) })) as Json;
+          { expectedHead: sha(a, "head"), expectedBase: sha(a, "base") })) as Json;
       case "pr_merge": {
-        const body: Record<string, unknown> = { expectedHead: String(a.head), expectedBase: String(a.base) };
+        const body: Record<string, unknown> = { expectedHead: sha(a, "head"), expectedBase: sha(a, "base") };
         if (a.method !== undefined) body.mergeMethod = String(a.method);
         // Auto-merge is the default because the alternative is polling: Stamp
         // merges when the head is approved and checks pass, whoever asks.
@@ -588,7 +909,7 @@ export const stampPlugin: Plugin = {
       }
       case "issue_comment": {
         const { owner, repo } = repoOf(a);
-        const c = await call("POST", `/v1/repositories/${owner}/${repo}/issues/${Number(a.number)}/comments`, ctx,
+        const c = await call("POST", `/v1/repositories/${owner}/${repo}/issues/${numberOf(a, "an issue")}/comments`, ctx,
           { body: String(a.body) });
         return { id: c?.id ?? null, url: c?.url ?? c?.htmlUrl ?? null } as Json;
       }
@@ -605,14 +926,20 @@ export const stampPlugin: Plugin = {
       }
 
       case "api_get":
-        return (await call("GET", gatewayPath(a.path, ["/v1/", "/api/v3/"]), ctx)) as Json;
+        return (await call("GET", gatewayPath(a.path, API_PREFIXES), ctx)) as Json;
 
       case "api": {
         const method = String(a.method ?? "");
         if (!["POST", "PATCH", "PUT", "DELETE"].includes(method)) {
           throw new Error(`method must be one of POST, PATCH, PUT, DELETE, got ${JSON.stringify(method).slice(0, 20)}`);
         }
-        return (await call(method, gatewayPath(a.path, ["/v1/", "/api/v3/"]), ctx, a.body)) as Json;
+        const path = gatewayPath(a.path, API_PREFIXES);
+        const held = heldRoute(path, a.body);
+        if (held) {
+          throw new Error(`stamp: ${held} goes through ${held === "a merge" ? "pr_merge" : "pr_approve"}, not api — ` +
+            "that is the tool a person signs for this mount, and api would be a way around it");
+        }
+        return (await call(method, path, ctx, a.body)) as Json;
       }
 
       default:

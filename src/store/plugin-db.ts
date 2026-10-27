@@ -19,6 +19,15 @@ import type { Json } from "../core/types.ts";
 import type { DbKey, DbKeyRange, DbQuery } from "../plugins/types.ts";
 import type { SqlHost } from "./pi-storage.ts";
 
+/**
+ * The alias an agent-level database is filed under (`PluginContext.agentDb`): one
+ * per (agent, plugin), shared by every mount of that plugin. No mount can be
+ * named this (`addMount` refuses it, `MOUNT_ALIAS` never matches it, a rename to
+ * it is refused), so `remove` and `rename`, which act on one named alias, never
+ * reach these rows.
+ */
+export const AGENT_SCOPE_ALIAS = "";
+
 export interface DbScope {
   tenantId: string;
   agentId: string;
@@ -149,11 +158,16 @@ export class PluginDbTables {
    * may be named is the plugin's declaration to make (`listed`), and a page that
    * printed the rest would be reading past it.
    */
-  summary(tenantId: string, agentId: string): Array<{ alias: string; plugin: string; store: string; keys: number; updatedAt: number }> {
+  summary(tenantId: string, agentId: string): Array<{ alias: string; agentLevel?: true; plugin: string; store: string; keys: number; updatedAt: number }> {
     return this.#all(
       `SELECT alias, plugin, store, COUNT(*) AS keys, MAX(updated_at) AS updated_at FROM plugin_db
        WHERE tenant_id=? AND agent_id=? GROUP BY alias, plugin, store ORDER BY alias, plugin, store`,
       tenantId, agentId,
-    ).map((r) => ({ alias: String(r.alias), plugin: String(r.plugin), store: String(r.store), keys: Number(r.keys), updatedAt: Number(r.updated_at) }));
+    ).map((r) => ({
+      alias: String(r.alias),
+      // Not a mount: the plugin's agent-level database, which no mount's removal deletes.
+      ...(String(r.alias) === AGENT_SCOPE_ALIAS ? { agentLevel: true as const } : {}),
+      plugin: String(r.plugin), store: String(r.store), keys: Number(r.keys), updatedAt: Number(r.updated_at),
+    }));
   }
 }

@@ -1,6 +1,6 @@
 import type { StorageAdapter, StateEntry } from "../core/store.ts";
 import type { PluginChoice, ToolSnapshot } from "../plugins/types.ts";
-import { PluginDbTables } from "./plugin-db.ts";
+import { AGENT_SCOPE_ALIAS, PluginDbTables } from "./plugin-db.ts";
 import { appendUsage, type UsageRow } from "../usage/outbox.ts";
 import { completedPayload, type CompletedFacts } from "./operation-event.ts";
 import type {
@@ -735,6 +735,7 @@ export class DurableObjectStore implements StorageAdapter {
   }
 
   async addMount(m: MountRecord) {
+    if (m.alias === AGENT_SCOPE_ALIAS) throw new Error("a mount needs a name: the empty one is where agent-level plugin data is kept");
     this.#sql.exec(
       `INSERT INTO mounts(tenant_id, agent_id, alias, installation_id, connection_id, plugin,
          tool_version, public_config, secret_ref, policy, tool_snapshot) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,

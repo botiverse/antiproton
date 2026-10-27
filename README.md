@@ -164,6 +164,12 @@ a second opinion. Nothing stops a second alias being added — that is what moun
 are for — so the property to check is the agent's whole mount set, not the policy
 on the mount you are looking at.
 
+A plugin can name tools a person signs even then (`Plugin.defaultPolicy`):
+`stamp` holds `pr_approve`, `pr_merge` and `api` for approval on a mount whose
+policy does not name them, because approving or merging cannot be undone by
+trying again. Only the mount's own per-tool entry lifts one; a mount-wide
+`write: "allow"` does not.
+
 The parking matters more than it sounds. Answering a held call with an error
 made the agent announce it could not proceed and stop; told instead that it is
 paused and a decision is coming, the same task went from a 75s failure to a
