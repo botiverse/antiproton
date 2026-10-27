@@ -3663,7 +3663,7 @@ export const readOwnerResolve: OwnerResolveRead = async (ctx, name) => {
     const err = e as { httpStatus?: unknown; code?: unknown };
     if (err.httpStatus === 404) return { ok: false, reason: err.code === undefined || err.code === "NOT_FOUND" ? "unavailable" : "unknown" };
     await pauseOn(ctx, e).catch(() => {});
-    return { ok: false, reason: "failed" };
+    return { ok: false, reason: "failed", ...(typeof err.httpStatus === "number" ? { httpStatus: err.httpStatus } : {}) };
   }
 };
 /** The person read: `readOwnerResolve`, its body a person only with an id; any other body is `failed`. */

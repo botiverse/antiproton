@@ -196,7 +196,7 @@ function raft(o: { zone?: unknown; owner?: boolean; dm?: unknown; name?: string;
      * the name while `resolveRoute` is false (the default), the route missing (the generic 404 every unknown path gets).
      * With the route and no entry, a `#name` is the 404 a Raft gives that reads it as a person's name. `resolves` every read.
      */
-    people: {} as Record<string, { id?: unknown; type: string; name: string } | "unknown" | 500>, resolveRoute: false, resolves: [] as string[],
+    people: {} as Record<string, { id?: unknown; type: string; name: string } | "unknown" | number>, resolveRoute: false, resolves: [] as string[],
     /** Doorbell events by their address (`agent-event:<id8>`), as `GET /history` answers one; every such read. */
     bellEvents: {} as Record<string, unknown>, historyReads: [] as string[],
     /** Every send-as-owner body, and how Raft answers the next ones: sent, a refusal (status and code), or no answer (`drop`). */
@@ -315,7 +315,7 @@ function raft(o: { zone?: unknown; owner?: boolean; dm?: unknown; name?: string;
       const name = u.searchParams.get("name") ?? "";
       r.resolves.push(name);
       const p = r.people[name];
-      if (p === 500) return json(500, { error: "boom" });
+      if (typeof p === "number") return json(p, { error: "refused", code: `status_${p}` });
       return p && p !== "unknown" ? json(200, p) : json(404, { error: "No such person", code: "person_not_found" });
     }
     if (path === "/integrations" && (init?.method ?? "GET") === "GET") return json(200, { services: r.services, activeLogins: [] });
@@ -1689,6 +1689,23 @@ await check("send as owner: Raft's read by name failing (a 500) is resolve_faile
   must(a.r.asOwner.length === 0 && !a.r.inboxReads.includes("all"), `sent ${show(a.r.asOwner)}, reads ${show(a.r.inboxReads)}`);
   const row = sendRows(a).at(-1)!;
   must(row.status === "resolve_failed" && row.verdict === "failed" && row.attrs.resolved_by === "none", show(row));
+});
+
+await check("send as owner: a lookup Raft refuses with a 4xx other than 403 or 429 is a miss, read from the inbox; a 403 or a 429 is resolve_failed", async () => {
+  // A Raft from before channels were read may refuse a `#name` with a 400 rather than a 404.
+  const a = await sender();
+  a.r.resolveRoute = true;
+  a.r.people = { "#ch1": 400 };
+  const out = await asOwner(a, { target: "#ch1", content: "Hi." });
+  must(out.state === "sent" && a.r.asOwner.length === 1 && a.r.inboxReads.includes("all"), `a 400: ${show(out)} reads ${show(a.r.inboxReads)}`);
+  must(sendRows(a).at(-1)?.attrs.resolved_by === "inbox", show(sendRows(a).at(-1)));
+  for (const status of [403, 429]) {
+    const b = await sender();
+    b.r.resolveRoute = true;
+    b.r.people = { "#ch1": status };
+    const refused = await asOwner(b, { target: "#ch1", content: "Hi." });
+    must(refused.state === "not_sent" && refused.code === "resolve_failed" && b.r.asOwner.length === 0 && !b.r.inboxReads.includes("all"), `a ${status}: ${show(refused)} reads ${show(b.r.inboxReads)}`);
+  }
 });
 
 await check("send as owner: a channelId target is taken as it is: neither Raft's read by name nor the inbox is asked", async () => {

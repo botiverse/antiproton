@@ -1345,7 +1345,7 @@ export type PersonResolve = (ctx: PluginContext, name: string) =>
  * from before it), `failed` any other failure.
  */
 export type OwnerResolveRead = (ctx: PluginContext, name: string) =>
-  Promise<{ ok: true; data: Record<string, unknown> } | { ok: false; reason: "unknown" | "unavailable" | "failed" }>;
+  Promise<{ ok: true; data: Record<string, unknown> } | { ok: false; reason: "unknown" | "unavailable" | "failed"; httpStatus?: number }>;
 
 export interface PreferencesDeps {
   /** The owner inbox read a channel, a thread or a person is resolved against, to its id. */
@@ -1854,7 +1854,12 @@ async function resolveTarget(target: string, inThread: boolean, ctx: PluginConte
   let name = given.toLowerCase();
   let channelId: string, rows: InboxItem[] | null = null, how: HowResolved;
   const said = deps.resolve ? await deps.resolve(ctx, `#${given}`) : { ok: false as const, reason: "unavailable" as const };
-  if (!said.ok && said.reason === "failed") return { to: "resolve_failed", how: { resolved_by: "none" } };
+  // A refusal of the lookup itself (403, which pauses, or 429) or no answer is a failure. Any other 4xx is a miss: a
+  // Raft from before channels were read may refuse a `#name` other than with a 404, and a miss never sends; it only
+  // falls back to the inbox rows.
+  const refusedLookup = !said.ok && said.reason === "failed" &&
+    !(typeof said.httpStatus === "number" && said.httpStatus >= 400 && said.httpStatus < 500 && said.httpStatus !== 403 && said.httpStatus !== 429);
+  if (refusedLookup) return { to: "resolve_failed", how: { resolved_by: "none" } };
   const hit = said.ok ? channelOfResolve(said.data) : null;
   if (hit) {
     channelId = hit.id;
