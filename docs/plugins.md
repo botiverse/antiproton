@@ -992,8 +992,11 @@ and "what's new" from an inbox read with `untold` from the start (no offset: wha
 only from the read's `total` minus the lines of that reply ("at least" that many when the read says so), never from its own count or memory, and with no number when the read
 says told state is unavailable. Each chat turn's input says which language to write in: to the owner, Raft's
 `assistantOf.language` as last read (a tag such as `zh-CN`, used only when it reads as one; null, or absent on an older Server, leaves
-none), else the language of the owner's latest message; whatever is sent as the owner in another conversation, that
-conversation's language. Both give way to the owner: a language they ask for, and words they gave to send in their chat, which
+none), else the language of the owner's latest message; whatever is sent as the owner in another conversation, the
+language of that conversation's recent messages. The `assistant_send_as_owner` summary has the assistant read them first
+with `assistant_owner_messages`, by the `channelId` of the conversation's `assistant_owner_inbox` line (`filter` `all`:
+a quiet conversation is not among the unread), and ask the owner which language when it cannot read them, rather than
+write in theirs. Both defaults give way to the owner: a language they ask for, and words they gave to send in their chat, which
 go out as they are. A check's and the brief's summaries are asked for in Raft's language when it gives one.
 
 When Raft runs the check (RFC 077 step 2), it says so in the credential context, `assistantOf.raftCheck: true`, and
