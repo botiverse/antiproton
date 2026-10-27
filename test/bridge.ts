@@ -370,12 +370,60 @@ for (const [what, body, expect] of [
   await check(`a review with ${what} where comments are allowed: ${expect}`, async () => {
     const f = fixture();
     const { gw } = await gatewayWith(COMMENTS_OPEN, f.plugin);
-    const r: any = await gw.invoke(caller, "svc.request", req("POST", "/v1/repos/o/r/pulls/7/reviews", body), program);
+    const r: any = await gw.invoke(caller, "svc.request", req("POST", "/v1/repos/o/r/pulls/7/reviews", body, { "content-type": "application/json" }), program);
     const got = r.status === "pending" ? "pending" : r.error?.code === "route_refused" ? "refused" : r.status === "succeeded" ? "ran" : JSON.stringify(r);
     must(got === expect, `expected ${expect}, got ${got}`);
     must((expect === "ran") === (f.sent.length === 1), `send was reached ${f.sent.length} times`);
   });
 }
+
+// How the body was sent decides whether a row's "not this row" can be trusted: upstream reads a body that is not
+// sent as JSON its own way.
+for (const [what, contentType, body, expect] of [
+  ["a comment review sent as text/plain", "text/plain", '{"event":"COMMENT"}', "pending"],
+  ["a comment review with no content-type", null, '{"event":"COMMENT"}', "pending"],
+  ["a comment review sent as form data", "application/x-www-form-urlencoded", '{"event":"COMMENT"}', "pending"],
+  ["an approval review sent as text/plain", "text/plain", '{"event":"APPROVE"}', "refused"],
+  ["a comment review sent as a +json type with a charset", "application/vnd.api+json; charset=utf-8", '{"event":"COMMENT"}', "ran"],
+] as const) {
+  await check(`${what} where comments are allowed: ${expect}`, async () => {
+    const f = fixture();
+    const { gw } = await gatewayWith(COMMENTS_OPEN, f.plugin);
+    const r: any = await gw.invoke(caller, "svc.request",
+      req("POST", "/v1/repos/o/r/pulls/7/reviews", body, contentType ? { "content-type": contentType } : {}), program);
+    const got = r.status === "pending" ? "pending" : r.error?.code === "route_refused" ? "refused" : r.status === "succeeded" ? "ran" : JSON.stringify(r);
+    must(got === expect, `expected ${expect}, got ${got}`);
+  });
+}
+
+await check("a secret that begins with another is redacted whole, longest first", async () => {
+  const f = fixture();
+  const longer = "prefix-token-1-extended-XYZ";
+  f.decl.send = async (_ctx, _req, io) => { io.used(longer); return { status: 200, headers: {}, text: `echo ${longer}` }; };
+  const { gw } = await gatewayWith(null, f.plugin, { credential: "prefix-token-1" });
+  const r: any = await gw.invoke(caller, "svc.request", req("GET", "/v1/x"), program);
+  must(r.result.text === "echo [redacted]", `the longer secret's rest was handed over: ${JSON.stringify(r.result.text)}`);
+});
+
+await check("registration refuses a defaultPolicy decision that is not allow, approval or deny", async () => {
+  for (const defaultPolicy of [{ tools: { "svc.write": "alow" } }, { write: "Deny" }]) {
+    const f = fixture(ROUTES, { defaultPolicy: defaultPolicy as any });
+    let threw = "";
+    try { await gatewayWith(null, f.plugin); } catch (e) { threw = String((e as Error).message); }
+    must(/a decision is allow, approval or deny/.test(threw), `${JSON.stringify(defaultPolicy)} was accepted: ${threw}`);
+  }
+});
+
+await check("the body cap counts UTF-8 bytes: a CJK body of a third of a MiB in characters is past it", async () => {
+  const f = fixture();
+  const { gw, store } = await gatewayWith(null, f.plugin);
+  const over: any = await gw.invoke(caller, "svc.request", req("POST", "/v1/x", "\u4e2d".repeat(349526)), program);
+  must(over.status === "rejected" && over.error?.code === "bad_request" && /bytes as UTF-8, got 1048578/.test(over.error.message),
+    `a 1048578-byte body was taken: ${JSON.stringify(over).slice(0, 200)}`);
+  const under: any = await gw.invoke(caller, "svc.request", req("POST", "/v1/x", "\u4e2d".repeat(349525)), program);
+  must(under.status === "pending", `a 1048575-byte body was refused: ${JSON.stringify(under).slice(0, 200)}`);
+  must((await store.listApprovals("t", "pending")).length === 1, "the refused body was carded");
+});
 
 await check("the mount's credential and a token minted for the request never reach the box: text and header values redacted", async () => {
   const f = fixture();

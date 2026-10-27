@@ -2645,7 +2645,8 @@ export type RouteEntry = {
    * present and is not a JSON object — not JSON at all (form-encoded, a byte-order mark before the JSON), an array, a
    * bare value — is never handed over: the request is an unlisted write, held for a person, since a predicate cannot
    * say "not this row" about a body it cannot read, and a later, looser row must not take it. A predicate that throws
-   * is held the same way. False on an object moves on to the next row, so the predicate has to be as robust as
+   * is held the same way, and so is false on a body whose content-type is not JSON (`application/json`, `…+json`).
+   * False on an object sent as JSON moves on to the next row, so the predicate has to be as robust as
    * upstream is about spelling — key and value case, aliases — or a spelling it missed reaches a later row.
    */
   body?: (body: { [k: string]: Json } | null) => boolean;
@@ -2704,11 +2705,15 @@ export type RouteClass =
 
 /**
  * Classify one request against a bridge's table. `path` is already normalized, without its query or a trailing slash
- * (the gateway's `routePath`), and matched case-insensitively; `body` is as sent.
+ * (the gateway's `routePath`), and matched case-insensitively; `body` is as sent, and `contentType` is how it was sent:
+ * a row with a body check that does not match a body not sent as JSON holds it (`RouteEntry.body`).
  */
-export function classifyRoute(decl: Pick<BridgeDecl, "routes" | "unlistedWriteKey">, method: string, path: string, body: string | null): RouteClass {
+export function classifyRoute(
+  decl: Pick<BridgeDecl, "routes" | "unlistedWriteKey">, method: string, path: string, body: string | null, contentType: string | null = null,
+): RouteClass {
   const m = method.toUpperCase();
   const held: RouteClass = { kind: "unlisted-write", key: decl.unlistedWriteKey };
+  const json = contentType !== null && /^application\/(json|[^\s;/]+\+json)\s*(;|$)/i.test(contentType.trim());
   // `undefined`: present, and not a JSON object (see `RouteEntry.body`).
   let parsed: { [k: string]: Json } | null | undefined = null;
   if (body !== null) {
@@ -2725,6 +2730,9 @@ export function classifyRoute(decl: Pick<BridgeDecl, "routes" | "unlistedWriteKe
       let hit = false;
       // A predicate that throws on a body it did not expect has not said the row does not apply; held, not skipped.
       try { hit = row.body(parsed); } catch { return held; }
+      // A body not sent as JSON is read by upstream some other way, so "not this row" was said about a reading
+      // upstream may not share: held rather than passed on. A row it does match still applies, being the stricter.
+      if (!hit && !json) return held;
       if (!hit) continue;
     }
     return row.refuse !== undefined ? { kind: "refused", message: row.refuse } : { kind: "listed", key: row.key! };

@@ -213,6 +213,7 @@ const RAFT_LOGIN_ALIAS = "raft";
  * a tool's name would make a mount's entry for one setting both: allowing unlisted writes would allow that tool.
  */
 function checkBridge(p: Plugin): void {
+  checkDefaultPolicy(p);
   const b = p.bridge;
   if (!b) return;
   const names = new Set(p.tools.map((t) => t.name));
@@ -232,6 +233,21 @@ function checkBridge(p: Plugin): void {
   }
 }
 
+/**
+ * Refuse a plugin whose `defaultPolicy` names a decision that is not one: `policyFor` compares decisions by strictness,
+ * and a misspelt one (`"alow"`) has none, so it would neither hold nor refuse and read as no default at all.
+ */
+function checkDefaultPolicy(p: Plugin): void {
+  const d = p.defaultPolicy;
+  if (!d) return;
+  const ok = (v: unknown) => v === undefined || v === "allow" || v === "approval" || v === "deny";
+  const bad = [["read", d.read], ["write", d.write], ...Object.entries(d.tools ?? {}).map(([k, v]) => [`tools.${k}`, v])]
+    .filter(([, v]) => !ok(v));
+  if (bad.length) {
+    throw new Error(`plugin ${p.id}'s defaultPolicy names ${bad.map(([k, v]) => `${k}: ${JSON.stringify(v)}`).join(", ")}; a decision is allow, approval or deny`);
+  }
+}
+
 /** Headers the box may send upstream; every other one is dropped, the credential being the plugin's to add. */
 const BRIDGE_REQUEST_HEADERS = new Set(["content-type", "accept"]);
 
@@ -242,13 +258,17 @@ const BRIDGE_REQUEST_HEADERS = new Set(["content-type", "accept"]);
 const NEVER_TO_BOX = new Set(["set-cookie", "set-cookie2", "cookie", "authorization", "proxy-authorization", "www-authenticate", "proxy-authenticate"]);
 
 /**
- * The largest bridged request taken, as String.length: a path of 2048 (the common limit of servers and proxies; a
+ * The largest bridged request taken: a path of 2048 characters (the common limit of servers and proxies; a
  * longer one is not a route anyone listed) and a body of 1 MiB (an API write is JSON, and run_js caps what a program
  * prints at 64 KiB; past this a request is a transfer, the sandbox mount's work). Larger is refused, not cut: a cut
  * request is a different request, and a held one would put a person's signature under bytes nobody shows them.
  */
 const BRIDGE_PATH_MAX = 2048;
-const BRIDGE_BODY_MAX = 1024 * 1024;
+/**
+ * In UTF-8 bytes, unlike the `…Bytes` caps elsewhere (String.length): it bounds what goes over the wire, and a body of
+ * CJK text is three bytes a character, so its limit in characters is about a third of an ASCII body's.
+ */
+const BRIDGE_BODY_MAX_UTF8 = 1024 * 1024;
 
 /** What replaces a mount's credential in an answer before the box reads it (`redact`). */
 export const REDACTED = "[redacted]";
@@ -273,8 +293,10 @@ function bridgeArgs(args: Json): { method: string; path: string; body: string | 
   const path = bridgePath(a.path);
   if (typeof path !== "string") return path.error;
   if (a.body !== undefined && a.body !== null && typeof a.body !== "string") return "a bridged request's body is the text as sent";
-  if (typeof a.body === "string" && a.body.length > BRIDGE_BODY_MAX) {
-    return `a bridged request's body is at most ${BRIDGE_BODY_MAX} characters, got ${a.body.length}`;
+  if (typeof a.body === "string") {
+    // Counted only past the point it could matter: a string of n code units is at most 3n bytes.
+    const bytes = a.body.length * 3 > BRIDGE_BODY_MAX_UTF8 ? new TextEncoder().encode(a.body).length : 0;
+    if (bytes > BRIDGE_BODY_MAX_UTF8) return `a bridged request's body is at most ${BRIDGE_BODY_MAX_UTF8} bytes as UTF-8, got ${bytes}`;
   }
   const method = a.method.toUpperCase();
   const headers: Record<string, string> = {};
@@ -345,11 +367,12 @@ function boxHeaders(decl: BridgeDecl, headers: Record<string, string>, secrets: 
 /**
  * Every occurrence of each secret replaced by REDACTED: an upstream that echoes the token it was sent (an error that
  * quotes the request, a debug header) must not hand it to the box. Values shorter than 8 characters are not matched,
- * since a credential that short is not one and replacing it would rewrite ordinary text.
+ * since a credential that short is not one and replacing it would rewrite ordinary text. Longest first: a secret that
+ * begins with a shorter one would otherwise be cut at the shorter one's end, and its rest handed over.
  */
 function redact(text: string, secrets: readonly string[]): string {
   let out = text;
-  for (const s of secrets) if (s.length >= 8) out = out.split(s).join(REDACTED);
+  for (const s of [...new Set(secrets)].sort((a, b) => b.length - a.length)) if (s.length >= 8) out = out.split(s).join(REDACTED);
   return out;
 }
 
@@ -1128,7 +1151,7 @@ export class ToolGateway {
           refusal = { code: "bad_request", message: String((e as Error)?.message ?? e).slice(0, 300) };
         }
       }
-      const c = route ? classifyRoute(bridge, route.method, routePath(route.path), route.body) : null;
+      const c = route ? classifyRoute(bridge, route.method, routePath(route.path), route.body, route.headers["content-type"] ?? null) : null;
       if (c?.kind === "refused") refusal = { code: "route_refused", message: c.message };
       if (refusal || !c || c.kind === "refused") {
         await this.#store.completeOperation(ctx.tenantId, operationId, "rejected", null, undefined, facts());
