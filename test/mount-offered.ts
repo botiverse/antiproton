@@ -25,6 +25,32 @@ async function check(name: string, fn: () => Promise<void>) {
 }
 function must(cond: unknown, msg: string): void { if (!cond) throw new Error(msg); }
 const show = (v: unknown) => JSON.stringify(v);
+/**
+ * Reads `observe` until `reached` holds for what it reads, for at most `UNTIL_MS`, and answers the value and the time
+ * waited; past the bound it fails with `failure`, given the value last read and the time, so the message states what
+ * was seen rather than what was hoped for. Every wait in this file for something in flight is a poll, not a timer:
+ * a mount with a credential resolves it through WebCrypto (AES-GCM, `open` in src/runtime/secrets.ts), which completes
+ * on the libuv threadpool, so on a loaded host a fixed 20 ms timer fired before the held listing had been asked for.
+ * A path that only awaits promises cannot be overtaken by a timer today, but that is a property of the code under
+ * test, not of the test, so those waits are written the same way.
+ */
+const UNTIL_MS = 2_000;
+async function until<T>(observe: () => T, reached: (v: T) => boolean, failure: (v: T, ms: number) => string): Promise<{ value: T; ms: number }> {
+  const started = performance.now();
+  for (;;) {
+    const value = observe();
+    const ms = Math.round(performance.now() - started);
+    if (reached(value)) return { value, ms };
+    if (ms >= UNTIL_MS) throw new Error(failure(value, ms));
+    await new Promise((r) => setTimeout(r, 1));
+  }
+}
+/** Waits until the lister holds a listing under `fail: "hold"`, then asserts it holds exactly `want`, for `why`. */
+async function held(w: { l: { s: { release: unknown[] } } }, why: string, want = 1): Promise<void> {
+  const says = (n: number, ms: number) => `the lister was asked ${n} time(s) after ${ms} ms (expected ${want}: ${why})`;
+  const { value, ms } = await until(() => w.l.s.release.length, (n) => n >= want, says);
+  must(value === want, says(value, ms));
+}
 
 const tool = (name: string): ToolSchema =>
   ({ name, summary: `Tool ${name}.`, parameters: { type: "object", properties: {} }, sideEffects: "read", idempotency: "none" }) as never;
@@ -330,8 +356,7 @@ await check("two turns starting at once share one listing", async () => {
   w.l.s.basis = "basis-2";
   w.l.s.fail = "hold";
   const both = Promise.all([w.rt.retakeStaleSnapshots("t", "a"), w.rt.retakeStaleSnapshots("t", "a")]);
-  await new Promise((r) => setTimeout(r, 20));
-  must(w.l.s.release.length === 1, `listings in flight: ${w.l.s.release.length}`);
+  await held(w, "the two re-takes share one listing");
   w.l.s.fail = null;
   w.l.s.release.splice(0).forEach((go) => go());
   await both;
@@ -340,8 +365,7 @@ await check("two turns starting at once share one listing", async () => {
   w.l.s.basis = "basis-3";
   w.l.s.fail = "hold";
   const turns = Promise.all([w.turn("one"), w.turn("two")]);
-  await new Promise((r) => setTimeout(r, 20));
-  must(w.l.s.release.length === 1, `turns' listings in flight: ${w.l.s.release.length}`);
+  await held(w, "the two turns' re-takes share one listing");
   w.l.s.fail = null;
   w.l.s.release.splice(0).forEach((go) => go());
   await turns;
@@ -357,8 +381,7 @@ for (const change of ["replaced", "removed"] as const) {
     w.l.s.basis = "basis-2";
     w.l.s.fail = "hold";
     const retake = w.rt.retakeStaleSnapshots("t", "a");
-    await new Promise((r) => setTimeout(r, 20));
-    must(w.l.s.release.length === 1, `control: the re-take is in flight: ${w.l.s.release.length}`);
+    await held(w, "control: the re-take under the first credential is held before the credential changes");
     // Meanwhile the credential changes, and its own listing lands.
     w.l.s.fail = null;
     // As raft lists: the new credential reaches more; no credential lists nothing.
@@ -376,8 +399,6 @@ for (const change of ["replaced", "removed"] as const) {
   });
 }
 
-
-const settle = () => new Promise((r) => setTimeout(r, 20));
 
 await check("a re-take pass that throws is forgotten: the prompt goes on, and the next prompt re-takes as usual", async () => {
   const w = await runtimeWorld();
@@ -398,8 +419,12 @@ await check("a stale answer is no failure: it sets no back-off, so the mount is 
   const w = await runtimeWorld();
   w.l.s.basis = "basis-2";
   w.l.s.fail = "hold";
+  const asked = w.l.s.listings;
   const retake = w.rt.retakeStaleSnapshots("t", "a");
-  await settle();
+  // The held re-take must have asked before the refresh lands, or the refresh writes the list it would have answered
+  // and nothing below tells a stale answer from no answer.
+  await until(() => w.l.s.listings - asked, (n) => n >= 1, (n, ms) =>
+    `${n === 0 ? "the lister was never asked for the held re-take" : `the lister was asked ${n} time(s) for the held re-take`} after ${ms} ms (expected 1, before the operator's refresh)`);
   // Someone else's listing lands while the held one runs: the held one comes back stale.
   w.l.s.fail = null;
   w.l.s.listed = ["a", "b"];
@@ -431,8 +456,7 @@ for (const field of ["takenAt", "withoutCredential"] as const) {
     w.l.s.listed = ["a", "c"];
     w.l.s.fail = "hold";
     const retake = w.rt.retakeStaleSnapshots("t", "a");
-    await settle();
-    must(w.l.s.release.length === 1, "control: the re-take is in flight");
+    await held(w, "control: the re-take is held before the newer list is written");
     // The newer list: back to the first basis and the first names, so only the one field tells it apart.
     w.l.s.fail = null;
     w.l.s.basis = "basis-1";
@@ -482,7 +506,7 @@ await check("an inbound push is answered at once; when a deploy moved the basis,
   // The pass that posts it (the alarm's): its turn's start waits on the listing rather than opening on the old list.
   let done = false;
   const pass = w.rt.deliverPendingInbound("t", "a").then((p) => { done = true; return p; });
-  await settle();
+  await held(w, "the push's turn starts the re-take and waits on it");
   must(!done && w.l.s.release.length === 1, `the push's turn did not wait for the re-take: done=${done}, in flight ${w.l.s.release.length}`);
   w.l.s.fail = null;
   w.l.s.release.splice(0).forEach((go) => go());
@@ -520,7 +544,7 @@ await check("an inbound push whose list is due only because it aged (basis uncha
   await w.rt.stopTurn("t", "a", "admin_cancel");
   let done = false;
   const prompt = w.turn("from a person").then(() => { done = true; });
-  await settle();
+  await held(w, "the person's prompt starts the re-take and waits on it");
   must(!done && w.l.s.release.length === 1, `the person's prompt did not wait: done=${done}`);
   w.l.s.release.splice(0).forEach((go) => go());
   await prompt;
@@ -566,7 +590,10 @@ await check("a re-take that throws at an inbound turn's start is caught and logg
     w.l.s.basis = "basis-2";
     w.l.s.basisThrows = true;
     const r = await push();
-    await settle();
+    // The pass under `waitUntil` ends in its catch, which logs; the checks below are about that pass having ended.
+    const failedLine = /re-taking .*tool lists failed/;
+    await until(() => logged.filter((a) => failedLine.test(String(a[0]))).length, (n) => n >= 1, (n, ms) =>
+      `the background re-take logged its failure ${n} time(s) after ${ms} ms (expected 1); logged: ${show(logged.map((a) => String(a[0])))}`);
     must(r.outcome === "delivered", `the push: ${show(r)}`);
     // The basis could not be read, so the push's turn did not wait: the pass went to `waitUntil`, caught, so it resolves.
     must(w.waited.length === 1, `promises handed to waitUntil: ${w.waited.length}`);
